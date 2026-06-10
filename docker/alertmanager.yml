@@ -1,0 +1,18 @@
+global:
+  resolve_timeout: 1m
+
+route:
+  receiver: alertint-agent
+  group_by: [alertname, cluster, namespace, service]
+  group_wait: 10s
+  group_interval: 30s
+  repeat_interval: 4h
+
+receivers:
+  - name: alertint-agent
+    webhook_configs:
+      - url: "http://agent:9911/webhook/alertmanager"
+        send_resolved: true
+        http_config:
+          authorization:
+            credentials_file: /tmp/alertint_token

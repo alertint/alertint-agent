@@ -1,0 +1,99 @@
+version: 2
+
+project_name: alertint
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: alertint
+    main: ./cmd/alertint
+    binary: alertint
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    flags:
+      - -trimpath
+
+archives:
+  - id: alertint
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - tar.gz
+    files:
+      - config.example.yaml
+      - examples/**/*
+      - docs/**/*.md
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: SHA256SUMS
+  algorithm: sha256
+
+dockers:
+  - id: alertint-amd64
+    goos: linux
+    goarch: amd64
+    image_templates:
+      - "ghcr.io/alertint/alertint-agent:{{ .Tag }}-amd64"
+      - "ghcr.io/alertint/alertint-agent:latest-amd64"
+    dockerfile: Dockerfile.goreleaser
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title=alertint-agent"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.source=https://github.com/alertint/alertint-agent"
+
+  - id: alertint-arm64
+    goos: linux
+    goarch: arm64
+    image_templates:
+      - "ghcr.io/alertint/alertint-agent:{{ .Tag }}-arm64"
+      - "ghcr.io/alertint/alertint-agent:latest-arm64"
+    dockerfile: Dockerfile.goreleaser
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title=alertint-agent"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.source=https://github.com/alertint/alertint-agent"
+
+docker_manifests:
+  - name_template: "ghcr.io/alertint/alertint-agent:{{ .Tag }}"
+    image_templates:
+      - "ghcr.io/alertint/alertint-agent:{{ .Tag }}-amd64"
+      - "ghcr.io/alertint/alertint-agent:{{ .Tag }}-arm64"
+
+  - name_template: "ghcr.io/alertint/alertint-agent:latest"
+    image_templates:
+      - "ghcr.io/alertint/alertint-agent:latest-amd64"
+      - "ghcr.io/alertint/alertint-agent:latest-arm64"
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - Merge pull request
+      - Merge branch
+
+release:
+  github:
+    owner: alertint
+    name: alertint-agent
+  name_template: "v{{ .Version }}"
+  draft: false
+  prerelease: auto

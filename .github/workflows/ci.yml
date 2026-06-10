@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }} / ${{ matrix.goarch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            goarch: amd64
+            runner: ubuntu-latest
+          - os: linux
+            goarch: arm64
+            runner: ubuntu-latest
+          - os: darwin
+            goarch: arm64
+            runner: macos-14
+    env:
+      GOOS: ${{ matrix.os }}
+      GOARCH: ${{ matrix.goarch }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.3"
+          check-latest: false
+
+      - name: Show toolchain
+        run: go version
+
+      - name: Build
+        run: go build -trimpath ./...
+
+      # Tests run only on native architectures (cross-compiled binaries can't
+      # execute on the runner). The linux/arm64 matrix entry validates that
+      # the cross-compile target stays green.
+      - name: Test
+        if: ${{ !(matrix.os == 'linux' && matrix.goarch == 'arm64') }}
+        env:
+          GOOS: ""
+          GOARCH: ""
+        run: go test -race -count=1 ./...
+
+      - name: Vet
+        env:
+          GOOS: ""
+          GOARCH: ""
+        run: go vet ./...
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.3"
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.12.2
+          args: --timeout=5m

@@ -1,0 +1,14 @@
+# syntax=docker/dockerfile:1
+# Used by GoReleaser — the binary is pre-built and injected by GoReleaser;
+# this stage only packages it into the final image.
+FROM scratch
+
+ARG TARGETOS
+ARG TARGETARCH
+
+COPY alertint /alertint
+COPY --from=golang:1.26-alpine /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+
+EXPOSE 9911 9912
+ENTRYPOINT ["/alertint"]
+CMD ["serve", "--config", "/etc/alertint/config.yaml"]
