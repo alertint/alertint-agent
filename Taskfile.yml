@@ -105,6 +105,11 @@ tasks:
       - rm -f .alertint_fake_alert_state.json
       - echo "✓ Tracking state purged. Fresh alerts can now be generated."
 
+  docs:validate:
+    desc: Validate docs frontmatter, slugs, and sections against docs/meta.yaml
+    cmds:
+      - go run ./docs/scripts
+
   tidy:
     desc: Run go mod tidy
     cmds:

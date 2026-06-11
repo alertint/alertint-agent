@@ -1,0 +1,16 @@
+# Global docs configuration for alertint.com/docs.
+# The website repo reads this file at build time to order the sidebar.
+site_title: "AlertINT Docs"
+sections:
+  - id: getting-started
+    title: "Getting started"
+    order: 1
+  - id: concepts
+    title: "Concepts"
+    order: 2
+  - id: integrations
+    title: "Integrations"
+    order: 3
+  - id: notifications
+    title: "Notifications"
+    order: 4
