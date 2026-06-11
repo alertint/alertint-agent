@@ -42,6 +42,14 @@ type Notifier struct {
 	auditor *audit.Auditor
 }
 
+// Probe verifies the bot token against the Slack auth.test API. Used by
+// the integration health check; a failure means the token is invalid,
+// revoked, or Slack is unreachable.
+func Probe(ctx context.Context, botToken string) error {
+	_, err := slacklib.New(botToken).AuthTestContext(ctx)
+	return err
+}
+
 // New constructs a Slack Notifier using a bot token (xoxb-...).
 func New(botToken, channel string, store ThreadStore, auditor *audit.Auditor) *Notifier {
 	return &Notifier{

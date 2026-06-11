@@ -32,6 +32,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/alertint/alertint-agent/internal/audit"
+	"github.com/alertint/alertint-agent/internal/health"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -59,6 +60,7 @@ type Webhook struct {
 	sink    AlertSink
 	token   []byte
 	logger  *slog.Logger
+	health  *health.Registry
 	now     func() time.Time
 	newID   func() string
 }
@@ -70,6 +72,9 @@ type Options struct {
 	Sink    AlertSink    // optional
 	Token   string       // bearer token; required
 	Logger  *slog.Logger // optional; defaults to slog.Default()
+	// Health is optional; when set, GET /health includes per-integration
+	// connectivity statuses (cached by the registry's TTL).
+	Health *health.Registry
 }
 
 // New constructs a Webhook. It returns an error if any required field is
@@ -94,6 +99,7 @@ func New(opts Options) (*Webhook, error) {
 		sink:    opts.Sink,
 		token:   []byte(opts.Token),
 		logger:  logger,
+		health:  opts.Health,
 		now:     func() time.Time { return time.Now().UTC() },
 		newID:   uuid.NewString,
 	}, nil
@@ -103,9 +109,12 @@ func New(opts Options) (*Webhook, error) {
 // caller's responsibility; the handler maps POST /webhook/alertmanager
 // to the receiver and returns 405 / 404 for everything else.
 //
-// GET /health is unauthenticated and pings the SQLite store; it returns
-// {"status":"ok"} (200) when reachable or {"status":"degraded"} (503)
-// when not.
+// GET /health is unauthenticated. The top-level status reflects liveness
+// (SQLite reachable): {"status":"ok"} (200) or {"status":"degraded"}
+// (503). When a health registry is wired, the response also carries
+// per-integration connectivity statuses — informational only, so a Slack
+// or Prometheus outage never makes a container orchestrator restart the
+// agent.
 func (h *Webhook) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /webhook/alertmanager", h.handlePost)
@@ -115,12 +124,25 @@ func (h *Webhook) Handler() http.Handler {
 
 func (h *Webhook) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+
+	status := "ok"
+	code := http.StatusOK
 	if err := h.store.DB().PingContext(r.Context()); err != nil {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte(`{"status":"degraded"}`))
-		return
+		status = "degraded"
+		code = http.StatusServiceUnavailable
 	}
-	_, _ = w.Write([]byte(`{"status":"ok"}`))
+
+	body := struct {
+		Status       string          `json:"status"`
+		Integrations []health.Status `json:"integrations,omitempty"`
+	}{
+		Status:       status,
+		Integrations: h.health.Run(r.Context()),
+	}
+	w.WriteHeader(code)
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		h.logger.Warn("ingress: encode health response", "err", err)
+	}
 }
 
 // AlertmanagerPayload is the v4 webhook envelope. Fields we don't

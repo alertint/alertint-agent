@@ -31,6 +31,7 @@ import (
 	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/config"
 	"github.com/alertint/alertint-agent/internal/correlator"
+	"github.com/alertint/alertint-agent/internal/health"
 	"github.com/alertint/alertint-agent/internal/ingress"
 	llmanthropic "github.com/alertint/alertint-agent/internal/llm/anthropic"
 	"github.com/alertint/alertint-agent/internal/logging"
@@ -199,7 +200,14 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 	defer cor.Stop()
 
-	webhookSrv, webhookErrCh, err := startWebhook(cfg, st, auditor, cor, logger)
+	// Probe enabled integrations once at startup (and on /health, cached)
+	// so a bad token or unreachable endpoint is visible immediately.
+	healthReg := buildHealthChecks(cfg, prom)
+	go func() {
+		health.LogStatuses(logger, healthReg.Run(ctx))
+	}()
+
+	webhookSrv, webhookErrCh, err := startWebhook(cfg, st, auditor, cor, healthReg, logger)
 	if err != nil {
 		return err
 	}
@@ -244,7 +252,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 // also serves GET /health, so a deployment with alertmanager disabled has
 // no health endpoint. Returns (nil, nil, nil) when disabled — the nil
 // error channel never fires in runServe's select.
-func startWebhook(cfg *config.Config, st *store.Store, auditor *audit.Auditor, cor *correlator.Correlator, logger *slog.Logger) (*http.Server, <-chan error, error) {
+func startWebhook(cfg *config.Config, st *store.Store, auditor *audit.Auditor, cor *correlator.Correlator, healthReg *health.Registry, logger *slog.Logger) (*http.Server, <-chan error, error) {
 	if !cfg.Alertmanager.Enabled {
 		logger.Info("alertmanager webhook receiver disabled; /health endpoint not served")
 		return nil, nil, nil
@@ -259,6 +267,7 @@ func startWebhook(cfg *config.Config, st *store.Store, auditor *audit.Auditor, c
 		Token:   token,
 		Logger:  logger,
 		Sink:    cor.Accept,
+		Health:  healthReg,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -410,6 +419,41 @@ func resolveDBPath(cfgPath, dbPathFlag string) (string, error) {
 		return "", err
 	}
 	return cfg.Storage.SQLitePath, nil
+}
+
+// buildHealthChecks assembles connectivity probes for every enabled
+// integration. Returns nil (a no-op registry) when nothing is enabled.
+func buildHealthChecks(cfg *config.Config, prom *promclient.Client) *health.Registry {
+	var checks []health.Check
+	if cfg.Prometheus.Enabled && prom != nil {
+		checks = append(checks, health.Check{
+			Name:   "prometheus",
+			Detail: cfg.Prometheus.BaseURL,
+			Probe: func(ctx context.Context) error {
+				// A trivial instant query proves the API is reachable,
+				// authorized, and serving query results.
+				_, err := prom.QueryInstant(ctx, "vector(1)", time.Now())
+				return err
+			},
+		})
+	}
+	if cfg.Notify.Slack.Enabled {
+		checks = append(checks, health.Check{
+			Name:   "slack",
+			Detail: cfg.Notify.Slack.Channel,
+			Probe: func(ctx context.Context) error {
+				token, err := cfg.SlackBotToken()
+				if err != nil {
+					return err
+				}
+				return notifyslack.Probe(ctx, token)
+			},
+		})
+	}
+	if len(checks) == 0 {
+		return nil
+	}
+	return health.NewRegistry(health.DefaultTTL, checks...)
 }
 
 // buildNotifier constructs the notify.Multi from the loaded config.

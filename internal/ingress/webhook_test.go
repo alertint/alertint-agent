@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/audit"
+	"github.com/alertint/alertint-agent/internal/health"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -444,6 +445,43 @@ func TestHealth(t *testing.T) {
 	}
 	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+}
+
+func TestHealth_IncludesIntegrationStatuses(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	reg := health.NewRegistry(time.Minute,
+		health.Check{Name: "prometheus", Detail: "http://prom:9090", Probe: func(context.Context) error { return nil }},
+		health.Check{Name: "slack", Detail: "#alerts", Probe: func(context.Context) error { return errors.New("invalid_auth") }},
+	)
+	w, err := New(Options{Store: s, Auditor: audit.New(s.DB()), Token: testToken, Health: reg})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(w.Handler())
+	t.Cleanup(srv.Close)
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/health", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200 (integration failures are informational)", resp.StatusCode)
+	}
+	body := mustReadBody(t, resp)
+	for _, want := range []string{`"prometheus"`, `"ok":true`, `"slack"`, `"invalid_auth"`, `"ok":false`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body %q should contain %s", body, want)
+		}
 	}
 }
 

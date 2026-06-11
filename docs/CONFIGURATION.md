@@ -153,3 +153,24 @@ prometheus:
 
 log_level: info
 ```
+
+---
+
+## Integration health
+
+At startup the agent probes every **enabled** integration (Prometheus via a
+trivial instant query, Slack via `auth.test`) and logs one line per
+integration:
+
+```
+level=INFO  msg="integration health: OK"     integration=prometheus detail=http://prometheus:9090
+level=WARN  msg="integration health: FAILED" integration=slack      detail=#alerts err="invalid_auth"
+```
+
+`GET /health` includes the same statuses (cached for 60 s). The top-level
+`status` field reflects only agent liveness — a failing integration is
+informational and never makes an orchestrator restart the agent:
+
+```json
+{"status":"ok","integrations":[{"name":"prometheus","detail":"http://prometheus:9090","ok":true,"checked_at":"..."}]}
+```
