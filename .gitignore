@@ -52,8 +52,5 @@ go.work.sum
 .idea/
 .vscode/
 
-# Internal build guide — must not ship in the public repo
-docs/MCP_PROMETHEUS_BUILD_PLAN.md
-
 .claude
 CLAUDE.md

@@ -173,7 +173,27 @@ func LoadFrom(r io.Reader, path string) (*Config, error) {
 // the Must* accessors at the moment of need.
 func (c *Config) Validate() error {
 	var errs []string
+	errs = append(errs, c.validateServing()...)
+	errs = append(errs, c.validateStorage()...)
+	errs = append(errs, c.validateLLM()...)
+	errs = append(errs, c.validateCorrelator()...)
+	errs = append(errs, c.validateNotify()...)
+	errs = append(errs, c.validatePrometheus()...)
 
+	if !validLogLevel(c.LogLevel) {
+		errs = append(errs, fmt.Sprintf("log_level %q must be one of debug, info, warn, error", c.LogLevel))
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("invalid config:\n  - %s", strings.Join(errs, "\n  - "))
+	}
+	return nil
+}
+
+// validateServing covers the two listener integrations (alertmanager webhook
+// receiver and MCP server) and the requirement that at least one is enabled.
+func (c *Config) validateServing() []string {
+	var errs []string
 	if c.Alertmanager.Enabled {
 		if strings.TrimSpace(c.Alertmanager.WebhookAddr) == "" {
 			errs = append(errs, "alertmanager.webhook_addr is required when alertmanager is enabled")
@@ -182,16 +202,32 @@ func (c *Config) Validate() error {
 			errs = append(errs, "alertmanager.webhook_token_env is required when alertmanager is enabled (env var name holding the bearer token)")
 		}
 	}
+	if c.MCP.Enabled {
+		if strings.TrimSpace(c.MCP.Addr) == "" {
+			errs = append(errs, "mcp.addr is required when mcp is enabled")
+		}
+		if strings.TrimSpace(c.MCP.TokenEnv) == "" {
+			errs = append(errs, "mcp.token_env is required when mcp is enabled")
+		}
+	}
 	if !c.Alertmanager.Enabled && !c.MCP.Enabled {
 		errs = append(errs, "nothing to serve: enable at least one of alertmanager or mcp")
 	}
+	return errs
+}
 
+func (c *Config) validateStorage() []string {
 	if strings.TrimSpace(c.Storage.SQLitePath) == "" {
-		errs = append(errs, "storage.sqlite_path is required")
-	} else if err := checkSQLitePathWritable(c.Storage.SQLitePath); err != nil {
-		errs = append(errs, fmt.Sprintf("storage.sqlite_path: %v", err))
+		return []string{"storage.sqlite_path is required"}
 	}
+	if err := checkSQLitePathWritable(c.Storage.SQLitePath); err != nil {
+		return []string{fmt.Sprintf("storage.sqlite_path: %v", err)}
+	}
+	return nil
+}
 
+func (c *Config) validateLLM() []string {
+	var errs []string
 	switch strings.ToLower(c.LLM.Provider) {
 	case "anthropic":
 		// ok
@@ -206,7 +242,11 @@ func (c *Config) Validate() error {
 	if strings.TrimSpace(c.LLM.Model) == "" {
 		errs = append(errs, "llm.model is required")
 	}
+	return errs
+}
 
+func (c *Config) validateCorrelator() []string {
+	var errs []string
 	if c.Correlator.WindowSeconds <= 0 {
 		errs = append(errs, "correlator.window_seconds must be > 0")
 	}
@@ -222,7 +262,11 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	return errs
+}
 
+func (c *Config) validateNotify() []string {
+	var errs []string
 	if c.Notify.Slack.Enabled {
 		if strings.TrimSpace(c.Notify.Slack.BotTokenEnv) == "" {
 			errs = append(errs, "notify.slack.bot_token_env is required when slack is enabled")
@@ -234,36 +278,24 @@ func (c *Config) Validate() error {
 	if !c.Notify.Stdout && !c.Notify.Slack.Enabled {
 		errs = append(errs, "at least one notifier must be enabled (notify.stdout or notify.slack.enabled)")
 	}
+	return errs
+}
 
-	if c.MCP.Enabled {
-		if strings.TrimSpace(c.MCP.Addr) == "" {
-			errs = append(errs, "mcp.addr is required when mcp is enabled")
-		}
-		if strings.TrimSpace(c.MCP.TokenEnv) == "" {
-			errs = append(errs, "mcp.token_env is required when mcp is enabled")
-		}
+func (c *Config) validatePrometheus() []string {
+	var errs []string
+	if !c.Prometheus.Enabled {
+		return nil
 	}
-
-	if c.Prometheus.Enabled {
-		if strings.TrimSpace(c.Prometheus.BaseURL) == "" {
-			errs = append(errs, "prometheus.base_url is required when prometheus is enabled")
-		}
-		if c.Prometheus.TimeoutSeconds <= 0 {
-			errs = append(errs, "prometheus.timeout_seconds must be > 0")
-		}
-		if c.Prometheus.DefaultRangeMinutes <= 0 {
-			errs = append(errs, "prometheus.default_range_minutes must be > 0")
-		}
+	if strings.TrimSpace(c.Prometheus.BaseURL) == "" {
+		errs = append(errs, "prometheus.base_url is required when prometheus is enabled")
 	}
-
-	if !validLogLevel(c.LogLevel) {
-		errs = append(errs, fmt.Sprintf("log_level %q must be one of debug, info, warn, error", c.LogLevel))
+	if c.Prometheus.TimeoutSeconds <= 0 {
+		errs = append(errs, "prometheus.timeout_seconds must be > 0")
 	}
-
-	if len(errs) > 0 {
-		return fmt.Errorf("invalid config:\n  - %s", strings.Join(errs, "\n  - "))
+	if c.Prometheus.DefaultRangeMinutes <= 0 {
+		errs = append(errs, "prometheus.default_range_minutes must be > 0")
 	}
-	return nil
+	return errs
 }
 
 // WebhookToken returns the bearer token for the inbound webhook receiver,
