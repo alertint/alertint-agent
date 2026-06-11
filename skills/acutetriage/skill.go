@@ -13,6 +13,7 @@ import (
 	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/notify"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
+	"github.com/alertint/alertint-agent/internal/rules"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -32,6 +33,10 @@ type Config struct {
 	// Prometheus is an optional read-only client used to enrich the LLM prompt
 	// with live metric values at incident time. nil = no metric enrichment.
 	Prometheus *promclient.Client
+	// Rules is the rule engine. It selects the analysis prompt template
+	// (storm / single_alert / correlated) and can short-circuit the LLM
+	// for known-issue rules. nil = built-in correlated prompt only.
+	Rules *rules.Engine
 }
 
 // Skill orchestrates the full acute-triage pipeline for a single ready
@@ -105,16 +110,26 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 		return nil
 	}
 
-	// 2. Build evidence pack and enrich with live Prometheus metrics.
+	// 2. Evaluate the rule engine: it may pick a specialized analysis
+	// template or short-circuit the LLM entirely for known issues.
+	decision := s.cfg.Rules.EvaluateIncident(alerts)
+	if decision.Rule != nil {
+		s.logger.Info("acutetriage: rule matched",
+			"incident_id", inc.ID,
+			"rule_id", decision.Rule.ID,
+			"short_circuit", decision.ShortCircuit,
+			"suppress", decision.Suppress,
+		)
+	}
+
+	// 3. Build evidence pack and enrich with live Prometheus metrics.
 	pack := BuildEvidencePack(inc, alerts, s.cfg.WindowSeconds)
 	packJSON, err := json.Marshal(pack)
 	if err != nil {
 		return fmt.Errorf("acutetriage: marshal evidence pack: %w", err)
 	}
-	metrics := FetchMetrics(ctx, s.cfg.Prometheus, alerts, inc.FirstAlertAt)
-	userPrompt := UserPrompt(pack, string(packJSON), metrics)
 
-	// 3. Audit: incident analysis started.
+	// 4. Audit: incident analysis started.
 	if s.auditor != nil {
 		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.analysis_started", map[string]any{
 			"incident_id": inc.ID,
@@ -122,20 +137,14 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 		})
 	}
 
-	// 4. Call LLM.
-	raw, err := s.llm.Complete(ctx, SystemPrompt, userPrompt, RequiredKeys)
+	// 5. Produce the analysis: from the matched rule (short-circuit) or
+	// from the LLM with the pack-selected system prompt.
+	raw, err := s.analysis(ctx, inc, alerts, decision, pack, packJSON)
 	if err != nil {
-		s.logger.Error("acutetriage: llm failed", "incident_id", inc.ID, "err", err)
-		if s.auditor != nil {
-			_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.analysis_failed", map[string]any{
-				"incident_id": inc.ID,
-				"error":       err.Error(),
-			})
-		}
-		return fmt.Errorf("acutetriage: llm: %w", err)
+		return err
 	}
 
-	// 5. Parse response.
+	// 6. Parse response.
 	var resp llmResponse
 	if err := json.Unmarshal(raw, &resp); err != nil {
 		return fmt.Errorf("acutetriage: parse llm response: %w", err)
@@ -220,6 +229,88 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 		"confidence", resp.Confidence,
 	)
 	return nil
+}
+
+// analysis produces the raw finding JSON, either synthesized from a
+// matched known-issue rule (short-circuit, no LLM call) or from the LLM
+// with the pack-selected system prompt.
+func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store.Alert, decision rules.Decision, pack EvidencePack, packJSON []byte) (json.RawMessage, error) {
+	if decision.ShortCircuit {
+		raw, err := shortCircuitResponse(decision, alerts)
+		if err != nil {
+			return nil, fmt.Errorf("acutetriage: short-circuit response: %w", err)
+		}
+		if s.auditor != nil {
+			_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.short_circuited", map[string]any{
+				"incident_id": inc.ID,
+				"rule_id":     decision.Rule.ID,
+			})
+		}
+		return raw, nil
+	}
+
+	metrics := FetchMetrics(ctx, s.cfg.Prometheus, alerts, inc.FirstAlertAt)
+	userPrompt := UserPrompt(pack, string(packJSON), metrics)
+	raw, err := s.llm.Complete(ctx, s.systemPrompt(decision, len(alerts)), userPrompt, RequiredKeys)
+	if err != nil {
+		s.logger.Error("acutetriage: llm failed", "incident_id", inc.ID, "err", err)
+		if s.auditor != nil {
+			_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.analysis_failed", map[string]any{
+				"incident_id": inc.ID,
+				"error":       err.Error(),
+			})
+		}
+		return nil, fmt.Errorf("acutetriage: llm: %w", err)
+	}
+	return raw, nil
+}
+
+// systemPrompt picks the analysis prompt: the rule-selected template when
+// one matched, otherwise single_alert/correlated from the pack by alert
+// count, falling back to the built-in prompt when no engine is wired.
+func (s *Skill) systemPrompt(decision rules.Decision, alertCount int) string {
+	name := decision.TemplateName
+	if name == "" {
+		if alertCount == 1 {
+			name = "single_alert"
+		} else {
+			name = "correlated"
+		}
+	}
+	if s.cfg.Rules != nil {
+		if t, ok := s.cfg.Rules.Template(name); ok {
+			return t
+		}
+		s.logger.Warn("acutetriage: prompt template not found in any pack; using built-in", "template", name)
+	}
+	return SystemPrompt
+}
+
+// shortCircuitResponse synthesizes the analysis JSON from a known-issue
+// rule without calling the LLM. The shape matches llmResponse so the rest
+// of the pipeline (persist, roles, notify) is identical.
+func shortCircuitResponse(d rules.Decision, alerts []store.Alert) (json.RawMessage, error) {
+	name := d.Rule.Description
+	if name == "" {
+		name = d.Rule.ID
+	}
+	severity := d.Rule.Then.Severity
+	if severity == "" {
+		severity = "medium"
+	}
+	findings := append([]string{"Matched known-issue rule " + d.Rule.ID}, d.References...)
+	out := llmResponse{
+		AnalysisName:        name,
+		OverallIssue:        d.RootCauseHint,
+		CorrelationFindings: findings,
+		Severity:            severity,
+		Confidence:          1.0,
+		Alerts:              make([]alertOutput, 0, len(alerts)),
+	}
+	for _, a := range alerts {
+		out.Alerts = append(out.Alerts, alertOutput{AlertID: a.ID, RoleInIncident: "correlated"})
+	}
+	return json.Marshal(out)
 }
 
 func clampConfidence(c *float64) {

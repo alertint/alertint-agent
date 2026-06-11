@@ -1,0 +1,11 @@
+# Same volume as a storm but spread over 20 minutes: the 5m window must
+# keep the storm rule from matching a slow burn.
+name: slow-burn-not-a-storm
+description: High alert count outside the storm window is not a storm.
+alerts:
+  - labels: {alertname: HighLatency, cluster: prod, service: svc}
+    repeat: 24
+    spread: [service]
+  - labels: {alertname: HighLatency, cluster: prod, service: late}
+    offset_seconds: 1200
+expect: {}

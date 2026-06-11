@@ -1,0 +1,15 @@
+name: baseline
+version: 0.1.0
+updated: 2026-06-11
+description: >
+  Generic, vendor-neutral rules and analysis templates embedded in the
+  AlertINT binary. The runtime works with zero rules configuration using
+  only this pack. Curated, component-specific intelligence ships in
+  separate packs loaded through the same RuleSource interface.
+
+defaults:
+  # Generic flap detection: an alert that transitions firing -> resolved
+  # at least min_transitions times within window_seconds is flapping.
+  flap:
+    window_seconds: 600
+    min_transitions: 4

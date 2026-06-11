@@ -13,9 +13,10 @@ import (
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
-// SystemPrompt is the fixed system prompt sent to the LLM for every
-// acute-triage analysis. It instructs the model to return strict JSON
-// matching ResponseSchema.
+// SystemPrompt is the built-in fallback prompt, used only when no rule
+// engine is wired or a pack template is missing. The shipped prompts live
+// in packs/baseline/templates/ (correlated, single_alert, storm, recovery)
+// and are selected per incident by the rule engine.
 const SystemPrompt = `You are an expert SRE analyzing a correlated group of firing alerts.
 Your task is to identify the underlying issue, determine how alerts correlate and connect,
 assign severity, and rank alerts by their role in the incident.

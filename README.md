@@ -15,6 +15,7 @@ Open-core and in active development (v0.1.0-rc). AlertINT runs self-hosted: it r
 
 - Ingests Alertmanager webhook payloads and stores alerts and incidents locally
 - Correlates related alerts within a time window using shared labels
+- Applies an open-schema rule engine (storm collapse, known-issue short-circuits, prompt selection) driven by an embedded baseline pack — see [`docs/rules-spec.md`](docs/rules-spec.md)
 - Produces an AI finding for each incident with the built-in `acute-triage` skill, backed by Anthropic Claude
 - Delivers the finding to stdout and optionally Slack
 - Exposes incidents, alerts, evidence packs, findings, and audit verification to your AI agent over MCP
@@ -109,7 +110,9 @@ alertint-agent/
 │   ├── mcp/                   # HTTP MCP server (:9912/mcp, started inside serve)
 │   ├── notify/                # Notifier interface; console, resolution, slack, stdout
 │   ├── prometheus/            # read-only Prometheus HTTP client (MCP tools)
+│   ├── rules/                 # open rule schema, RuleSource, engine (docs/rules-spec.md)
 │   └── store/                 # SQLite store (alerts, incidents, audit_log)
+├── packs/baseline/            # embedded baseline rule pack + prompt templates
 ├── skills/acutetriage/        # acute-triage LLM skill
 ├── docker/                    # Docker Compose local dev stack
 ├── docs/                      # QUICKSTART, CONFIGURATION, ARCHITECTURE, LIMITS

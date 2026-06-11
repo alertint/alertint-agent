@@ -41,7 +41,9 @@ import (
 	notifyslack "github.com/alertint/alertint-agent/internal/notify/slack"
 	notifystdout "github.com/alertint/alertint-agent/internal/notify/stdout"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
+	"github.com/alertint/alertint-agent/internal/rules"
 	"github.com/alertint/alertint-agent/internal/store"
+	"github.com/alertint/alertint-agent/packs"
 	"github.com/alertint/alertint-agent/skills/acutetriage"
 )
 
@@ -141,6 +143,13 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 
 	auditor := audit.New(st.DB())
 
+	// Load the rule engine. The embedded baseline pack needs zero
+	// configuration; future sources (signed feed packs) plug in here.
+	ruleEngine, err := rules.NewEngine(ctx, logger, rules.NewEmbeddedSource(packs.BaselineFS(), "embedded:baseline", 0))
+	if err != nil {
+		return err
+	}
+
 	apiKey, err := cfg.LLMAPIKey()
 	if err != nil {
 		return err
@@ -171,6 +180,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 			WindowSeconds: cfg.Correlator.WindowSeconds,
 			MinAlerts:     cfg.Correlator.MinAlerts,
 			Prometheus:    prom,
+			Rules:         ruleEngine,
 		},
 		st, llmClient, auditor, notifier, logger,
 	)
@@ -189,85 +199,14 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 	defer cor.Stop()
 
-	// Start the Alertmanager webhook receiver when enabled. It also serves
-	// GET /health, so a deployment with alertmanager disabled has no health
-	// endpoint.
-	var webhookSrv *http.Server
-	var webhookErrCh <-chan error
-	if cfg.Alertmanager.Enabled {
-		token, err := cfg.WebhookToken()
-		if err != nil {
-			return err
-		}
-		hook, err := ingress.New(ingress.Options{
-			Store:   st,
-			Auditor: auditor,
-			Token:   token,
-			Logger:  logger,
-			Sink:    cor.Accept,
-		})
-		if err != nil {
-			return err
-		}
-
-		webhookSrv = &http.Server{
-			Addr:              cfg.Alertmanager.WebhookAddr,
-			Handler:           hook.Handler(),
-			ReadTimeout:       ingress.DefaultReadTimeout,
-			ReadHeaderTimeout: ingress.DefaultReadTimeout,
-			WriteTimeout:      ingress.DefaultWriteTimeout,
-			IdleTimeout:       ingress.DefaultIdleTimeout,
-		}
-
-		ch := make(chan error, 1)
-		webhookErrCh = ch
-		go func() {
-			logger.Info("webhook listening",
-				slog.String("addr", cfg.Alertmanager.WebhookAddr),
-				slog.String("path", "/webhook/alertmanager"),
-			)
-			if err := webhookSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				ch <- err
-			}
-			close(ch)
-		}()
-	} else {
-		logger.Info("alertmanager webhook receiver disabled; /health endpoint not served")
+	webhookSrv, webhookErrCh, err := startWebhook(cfg, st, auditor, cor, logger)
+	if err != nil {
+		return err
 	}
 
-	// Start the MCP HTTP server when enabled. MCP clients connect by URL
-	// (e.g. http://host:9912/mcp) — no subprocess or shared file needed.
-	var mcpHTTPSrv *http.Server
-	var mcpErrCh <-chan error
-	if cfg.MCP.Enabled {
-		mcpToken, err := cfg.MCPToken()
-		if err != nil {
-			return err
-		}
-		mcpSrv := internalmcp.NewServer(internalmcp.Config{
-			Token:         mcpToken,
-			WindowSeconds: cfg.Correlator.WindowSeconds,
-			Prometheus:    prom,
-		}, st, auditor)
-		mcpHTTPSrv = &http.Server{
-			Addr:    cfg.MCP.Addr,
-			Handler: mcpSrv.Handler(),
-			// WriteTimeout 0: MCP uses long-lived SSE streams for streaming responses.
-			ReadTimeout: ingress.DefaultReadTimeout,
-			IdleTimeout: ingress.DefaultIdleTimeout,
-		}
-		ch := make(chan error, 1)
-		mcpErrCh = ch
-		go func() {
-			logger.Info("MCP HTTP listening",
-				slog.String("addr", cfg.MCP.Addr),
-				slog.String("endpoint", cfg.MCP.Addr+"/mcp"),
-			)
-			if err := mcpHTTPSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				ch <- err
-			}
-			close(ch)
-		}()
+	mcpHTTPSrv, mcpErrCh, err := startMCP(cfg, st, auditor, prom, logger)
+	if err != nil {
+		return err
 	}
 
 	select {
@@ -299,6 +238,90 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 	logger.Info("alertint stopped", slog.String("reason", "signal"))
 	return nil
+}
+
+// startWebhook starts the Alertmanager webhook receiver when enabled. It
+// also serves GET /health, so a deployment with alertmanager disabled has
+// no health endpoint. Returns (nil, nil, nil) when disabled — the nil
+// error channel never fires in runServe's select.
+func startWebhook(cfg *config.Config, st *store.Store, auditor *audit.Auditor, cor *correlator.Correlator, logger *slog.Logger) (*http.Server, <-chan error, error) {
+	if !cfg.Alertmanager.Enabled {
+		logger.Info("alertmanager webhook receiver disabled; /health endpoint not served")
+		return nil, nil, nil
+	}
+	token, err := cfg.WebhookToken()
+	if err != nil {
+		return nil, nil, err
+	}
+	hook, err := ingress.New(ingress.Options{
+		Store:   st,
+		Auditor: auditor,
+		Token:   token,
+		Logger:  logger,
+		Sink:    cor.Accept,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	srv := &http.Server{
+		Addr:              cfg.Alertmanager.WebhookAddr,
+		Handler:           hook.Handler(),
+		ReadTimeout:       ingress.DefaultReadTimeout,
+		ReadHeaderTimeout: ingress.DefaultReadTimeout,
+		WriteTimeout:      ingress.DefaultWriteTimeout,
+		IdleTimeout:       ingress.DefaultIdleTimeout,
+	}
+
+	ch := make(chan error, 1)
+	go func() {
+		logger.Info("webhook listening",
+			slog.String("addr", cfg.Alertmanager.WebhookAddr),
+			slog.String("path", "/webhook/alertmanager"),
+		)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			ch <- err
+		}
+		close(ch)
+	}()
+	return srv, ch, nil
+}
+
+// startMCP starts the MCP HTTP server when enabled. MCP clients connect by
+// URL (e.g. http://host:9912/mcp) — no subprocess or shared file needed.
+// Returns (nil, nil, nil) when disabled.
+func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom *promclient.Client, logger *slog.Logger) (*http.Server, <-chan error, error) {
+	if !cfg.MCP.Enabled {
+		return nil, nil, nil
+	}
+	mcpToken, err := cfg.MCPToken()
+	if err != nil {
+		return nil, nil, err
+	}
+	mcpSrv := internalmcp.NewServer(internalmcp.Config{
+		Token:         mcpToken,
+		WindowSeconds: cfg.Correlator.WindowSeconds,
+		Prometheus:    prom,
+	}, st, auditor)
+	srv := &http.Server{
+		Addr:    cfg.MCP.Addr,
+		Handler: mcpSrv.Handler(),
+		// WriteTimeout 0: MCP uses long-lived SSE streams for streaming responses.
+		ReadTimeout: ingress.DefaultReadTimeout,
+		IdleTimeout: ingress.DefaultIdleTimeout,
+	}
+	ch := make(chan error, 1)
+	go func() {
+		logger.Info("MCP HTTP listening",
+			slog.String("addr", cfg.MCP.Addr),
+			slog.String("endpoint", cfg.MCP.Addr+"/mcp"),
+		)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			ch <- err
+		}
+		close(ch)
+	}()
+	return srv, ch, nil
 }
 
 func runVerifyAudit(args []string, stdout, stderr io.Writer) error {
