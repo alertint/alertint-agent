@@ -1,0 +1,45 @@
+name: Bug report
+description: Something is broken or behaving unexpectedly
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Runtime version
+      description: Output of `alertint version`
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: input
+    id: pack-version
+    attributes:
+      label: Rule pack version
+      description: From the startup log line `rules: pack loaded ... version=...`
+      placeholder: baseline 0.1.0
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: payload
+    attributes:
+      label: Sanitized alert payload (if ingestion-related)
+      description: >-
+        The Alertmanager webhook payload that triggers the problem.
+        IMPORTANT: remove or replace hostnames, IPs, tokens, and any other
+        internal details before posting.
+      render: json
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Run with --log-level debug if possible. Sanitize before posting.
+      render: text
+  - type: textarea
+    id: config
+    attributes:
+      label: Config (sanitized)
+      description: Your YAML config with secrets-bearing env var names left as-is (they contain no secrets).
+      render: yaml

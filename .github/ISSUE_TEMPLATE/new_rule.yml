@@ -1,0 +1,30 @@
+name: New rule proposal
+description: Propose a detection rule for packs/community/
+labels: [rule-proposal]
+body:
+  - type: textarea
+    id: scenario
+    attributes:
+      label: What does this rule detect?
+      description: The failure mode or alert pattern, and why it deserves a curated rule.
+    validations:
+      required: true
+  - type: textarea
+    id: rule
+    attributes:
+      label: Draft rule (open schema)
+      description: See docs/rules-spec.md. A draft is fine — maintainers will help polish.
+      render: yaml
+    validations:
+      required: true
+  - type: textarea
+    id: fixture
+    attributes:
+      label: Example alert stream
+      description: A sanitized/synthetic alert sequence the rule should match (and one it should not, if relevant).
+      render: yaml
+  - type: input
+    id: applies-to
+    attributes:
+      label: Component / version constraints
+      placeholder: e.g. cni 1.2.x, postgres >= 14
