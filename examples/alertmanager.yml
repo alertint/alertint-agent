@@ -1,0 +1,29 @@
+# Minimal Alertmanager config that forwards every alert to AlertINT.
+#
+# Adapt the pieces you need into your existing alertmanager.yml:
+# the `alertint-agent` receiver and a route (top-level, as here, or a
+# child route with `continue: true` to keep your current paging intact).
+#
+# The bearer token must match the value of the env var named by
+# alertmanager.webhook_token_env in the agent config (default
+# ALERTINT_WEBHOOK_TOKEN). Prefer credentials_file over an inline
+# credential so the token is not stored in this file.
+
+route:
+  receiver: alertint-agent
+  group_by: [alertname, cluster, namespace, service]
+  group_wait: 10s
+  group_interval: 30s
+  repeat_interval: 4h
+
+receivers:
+  - name: alertint-agent
+    webhook_configs:
+      - url: "http://alertint-host:9911/webhook/alertmanager"
+        send_resolved: true
+        http_config:
+          authorization:
+            # File containing only the token value:
+            credentials_file: /etc/alertmanager/alertint_token
+            # ...or inline (avoid committing this file if you do):
+            # credentials: "<token>"
