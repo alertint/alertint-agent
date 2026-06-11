@@ -40,6 +40,50 @@ func writeConfig(t *testing.T, body string) string {
 	return path
 }
 
+func TestValidate_RulesLocalPackDir(t *testing.T) {
+	base := Defaults()
+	base.Alertmanager.WebhookTokenEnv = "ALERTINT_WEBHOOK_TOKEN"
+	base.LLM.APIKeyEnv = "ANTHROPIC_API_KEY"
+	base.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
+
+	t.Run("empty is valid", func(t *testing.T) {
+		cfg := base
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate: %v", err)
+		}
+	})
+
+	t.Run("missing directory rejected", func(t *testing.T) {
+		cfg := base
+		cfg.Rules.LocalPackDir = filepath.Join(t.TempDir(), "nope")
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "rules.local_pack_dir") {
+			t.Fatalf("Validate = %v, want rules.local_pack_dir error", err)
+		}
+	})
+
+	t.Run("directory without pack.yaml rejected", func(t *testing.T) {
+		cfg := base
+		cfg.Rules.LocalPackDir = t.TempDir()
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "pack.yaml") {
+			t.Fatalf("Validate = %v, want pack.yaml error", err)
+		}
+	})
+
+	t.Run("directory with pack.yaml accepted", func(t *testing.T) {
+		cfg := base
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "pack.yaml"), []byte("name: local\nversion: \"1\"\nupdated: \"2026-06-11\"\n"), 0o600); err != nil {
+			t.Fatalf("write pack.yaml: %v", err)
+		}
+		cfg.Rules.LocalPackDir = dir
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate: %v", err)
+		}
+	})
+}
+
 func TestLoad_MinimalValidConfig(t *testing.T) {
 	// Place the SQLite file inside a writable temp dir.
 	yaml := strings.Replace(minimalValidYAML, "./alertint-agent.db", filepath.Join(t.TempDir(), "agent.db"), 1)

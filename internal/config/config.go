@@ -38,7 +38,16 @@ type Config struct {
 	Notify       NotifyConfig       `yaml:"notify"`
 	MCP          MCPConfig          `yaml:"mcp"`
 	Prometheus   PrometheusConfig   `yaml:"prometheus"`
+	Rules        RulesConfig        `yaml:"rules"`
 	LogLevel     string             `yaml:"log_level"`
+}
+
+// RulesConfig configures rule pack loading. The embedded baseline pack is
+// always loaded; local_pack_dir optionally adds one local pack directory
+// (pack.yaml + rules/*.yaml + templates/*.md) whose rules and templates
+// override baseline entries with the same id or name.
+type RulesConfig struct {
+	LocalPackDir string `yaml:"local_pack_dir,omitempty"`
 }
 
 // PrometheusConfig configures the optional Prometheus read connector.
@@ -181,6 +190,7 @@ func (c *Config) Validate() error {
 	errs = append(errs, c.validateCorrelator()...)
 	errs = append(errs, c.validateNotify()...)
 	errs = append(errs, c.validatePrometheus()...)
+	errs = append(errs, c.validateRules()...)
 
 	if !validLogLevel(c.LogLevel) {
 		errs = append(errs, fmt.Sprintf("log_level %q must be one of debug, info, warn, error", c.LogLevel))
@@ -298,6 +308,24 @@ func (c *Config) validatePrometheus() []string {
 		errs = append(errs, "prometheus.default_range_minutes must be > 0")
 	}
 	return errs
+}
+
+func (c *Config) validateRules() []string {
+	dir := strings.TrimSpace(c.Rules.LocalPackDir)
+	if dir == "" {
+		return nil
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return []string{fmt.Sprintf("rules.local_pack_dir: %v", err)}
+	}
+	if !info.IsDir() {
+		return []string{fmt.Sprintf("rules.local_pack_dir %s is not a directory", dir)}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "pack.yaml")); err != nil {
+		return []string{fmt.Sprintf("rules.local_pack_dir %s does not contain pack.yaml: %v", dir, err)}
+	}
+	return nil
 }
 
 // WebhookToken returns the bearer token for the inbound webhook receiver,

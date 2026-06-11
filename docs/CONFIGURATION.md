@@ -102,6 +102,21 @@ prometheus:
 
 ---
 
+## `rules`
+
+The embedded baseline rule pack always loads. `local_pack_dir` optionally adds
+one local pack directory whose rules and templates override baseline entries
+with the same id or name. The directory must follow the standard pack layout
+(`pack.yaml`, `rules/*.yaml`, `templates/*.md`) described in
+[`rules-spec.md`](rules-spec.md); see [`examples/rules/`](../examples/rules/)
+for a working starter pack.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `local_pack_dir` | string | — | Optional path to a local rule pack directory. Must exist and contain `pack.yaml`. |
+
+---
+
 ## `log_level`
 
 One of `debug`, `info`, `warn`, `error`. Default: `info`.
@@ -144,6 +159,9 @@ mcp:
   enabled: false
   addr: "0.0.0.0:9912"
   token_env: ALERTINT_MCP_TOKEN
+
+rules:
+  local_pack_dir: /etc/alertint/rules
 
 prometheus:
   enabled: false

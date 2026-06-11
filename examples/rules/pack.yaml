@@ -1,0 +1,7 @@
+name: example-local
+version: 0.1.0
+updated: "2026-06-11"
+description: >-
+  Starter local rule pack. Point rules.local_pack_dir at this directory
+  (or a copy of it) and the agent merges these rules on top of the
+  embedded baseline pack. Full schema reference: docs/rules-spec.md.

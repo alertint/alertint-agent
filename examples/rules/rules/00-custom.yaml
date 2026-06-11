@@ -1,0 +1,67 @@
+# Example custom rules. Schema reference: docs/rules-spec.md.
+# Rules here override baseline rules with the same id; new ids are added.
+rules:
+  # 1. Known-issue rule: when a specific alert fires, attach the root-cause
+  #    hint and runbook link to the finding so the LLM (and the reader)
+  #    start from tribal knowledge instead of rediscovering it.
+  - id: example.redis-maxmemory
+    kind: known_issue
+    description: Redis evictions after maxmemory is reached — known capacity ceiling.
+    when:
+      all:
+        - label: alertname
+          op: equals
+          value: RedisKeyEvictions
+    then:
+      action: annotate
+      root_cause_hint: >-
+        Redis reached maxmemory and started evicting keys. Long-standing
+        capacity ceiling on the cache tier; bump maxmemory or shrink the
+        hot set.
+      references:
+        - https://runbooks.example.com/redis-maxmemory
+    updated: "2026-06-11"
+
+  # 2. Correlation rule: database alerts and the API error-rate alerts they
+  #    cause within two minutes are one incident, analyzed with the
+  #    baseline "correlated" template.
+  - id: example.db-cascade
+    kind: correlation
+    description: Collapse DB saturation plus downstream API errors into one incident.
+    priority: 50
+    window: 2m
+    when:
+      all:
+        - label: alertname
+          op: regex
+          value: "^(DBConnectionsSaturated|DBHighLatency)$"
+        - label: alertname
+          op: equals
+          value: APIHighErrorRate
+    then:
+      action: collapse
+      analysis_template: correlated
+      root_cause_hint: Database saturation cascading into API error rates.
+    updated: "2026-06-11"
+
+  # 3. Override a baseline rule by reusing its id: storm collapse, but
+  #    tuned for a smaller fleet (10 alerts across 3 services).
+  - id: baseline.alert-storm-collapse
+    kind: correlation
+    description: Storm collapse tuned down for a small fleet.
+    priority: 100
+    window: 5m
+    when:
+      min_alerts: 10
+      min_distinct:
+        label: service
+        count: 3
+    then:
+      action: collapse
+      suppress: true
+      analysis_template: storm
+      root_cause_hint: >-
+        Alert storm: a shared dependency (network, DNS, control plane, or
+        datastore) is the likely common cause; individual alerts are
+        symptoms.
+    updated: "2026-06-11"

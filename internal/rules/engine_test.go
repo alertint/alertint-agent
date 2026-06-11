@@ -4,6 +4,7 @@ package rules_test
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -57,6 +58,95 @@ func TestEmbeddedBaseline_LoadsWithZeroConfig(t *testing.T) {
 		if !strings.Contains(labels, want) {
 			t.Errorf("GroupLabels() = %q, want it to include %q", labels, want)
 		}
+	}
+}
+
+// TestLocalDirSource_OverridesBaseline loads an on-disk pack next to the
+// embedded baseline and checks that its higher priority wins per rule id.
+func TestLocalDirSource_OverridesBaseline(t *testing.T) {
+	dir := t.TempDir()
+	writeFile := func(rel, body string) {
+		t.Helper()
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile("pack.yaml", "name: local-test\nversion: \"0.0.1\"\nupdated: \"2026-06-11\"\n")
+	writeFile("rules/00-custom.yaml", `rules:
+  - id: baseline.alert-storm-collapse
+    kind: correlation
+    description: Override the baseline storm threshold.
+    priority: 100
+    window: 5m
+    when:
+      min_alerts: 50
+    then:
+      action: collapse
+      suppress: true
+    updated: "2026-06-11"
+  - id: local.db-saturation
+    kind: known_issue
+    description: Known issue rule from a local pack.
+    when:
+      all:
+        - label: alertname
+          op: equals
+          value: DBConnectionsSaturated
+    then:
+      action: annotate
+      root_cause_hint: Connection pool ceiling, see runbook.
+    updated: "2026-06-11"
+`)
+
+	e, err := rules.NewEngine(context.Background(), nil,
+		rules.NewEmbeddedSource(packs.BaselineFS(), "embedded:baseline", 0),
+		rules.NewLocalDirSource(dir, 100),
+	)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+
+	var storm *rules.Rule
+	found := false
+	for i, r := range e.Rules() {
+		if r.ID == "baseline.alert-storm-collapse" {
+			storm = &e.Rules()[i]
+		}
+		if r.ID == "local.db-saturation" {
+			found = true
+		}
+	}
+	if storm == nil || storm.When.MinAlerts != 50 {
+		t.Errorf("local pack did not override baseline storm rule: %+v", storm)
+	}
+	if !found {
+		t.Error("local pack rule local.db-saturation not loaded")
+	}
+	if len(e.Packs()) != 2 {
+		t.Errorf("Packs() = %d, want 2", len(e.Packs()))
+	}
+}
+
+// TestExamplePack_LoadsCleanly guards examples/rules against schema drift:
+// the starter pack we tell users to copy must always validate.
+func TestExamplePack_LoadsCleanly(t *testing.T) {
+	dir := filepath.Join("..", "..", "examples", "rules")
+	if _, err := os.Stat(dir); err != nil {
+		t.Skipf("examples/rules not present: %v", err)
+	}
+	e, err := rules.NewEngine(context.Background(), nil,
+		rules.NewEmbeddedSource(packs.BaselineFS(), "embedded:baseline", 0),
+		rules.NewLocalDirSource(dir, 100),
+	)
+	if err != nil {
+		t.Fatalf("example pack failed to load: %v", err)
+	}
+	if len(e.Packs()) != 2 {
+		t.Fatalf("Packs() = %d, want 2", len(e.Packs()))
 	}
 }
 

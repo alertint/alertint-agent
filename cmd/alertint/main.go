@@ -145,8 +145,13 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	auditor := audit.New(st.DB())
 
 	// Load the rule engine. The embedded baseline pack needs zero
-	// configuration; future sources (signed feed packs) plug in here.
-	ruleEngine, err := rules.NewEngine(ctx, logger, rules.NewEmbeddedSource(packs.BaselineFS(), "embedded:baseline", 0))
+	// configuration; an optional local pack dir overrides it, and future
+	// sources (signed feed packs) plug in the same way.
+	ruleSources := []rules.RuleSource{rules.NewEmbeddedSource(packs.BaselineFS(), "embedded:baseline", 0)}
+	if dir := cfg.Rules.LocalPackDir; dir != "" {
+		ruleSources = append(ruleSources, rules.NewLocalDirSource(dir, 100))
+	}
+	ruleEngine, err := rules.NewEngine(ctx, logger, ruleSources...)
 	if err != nil {
 		return err
 	}

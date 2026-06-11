@@ -190,7 +190,13 @@ The engine merges packs from every configured `RuleSource` in priority
 order; a higher-priority source overrides a lower one per rule `id` and
 per template name.
 
-- **EmbeddedSource** (today): `packs/baseline/` compiled into the binary.
+- **EmbeddedSource**: `packs/baseline/` compiled into the binary. Always
+  loads, priority 0.
+- **Local pack directory**: set `rules.local_pack_dir` in the agent config
+  to a directory with the standard pack layout (`pack.yaml`, `rules/*.yaml`,
+  `templates/*.md`). Loads at a higher priority than the baseline, so your
+  rules and templates override baseline ones with the same id/name. A
+  working starter pack lives in [`examples/rules/`](../examples/rules/).
 - **FeedSource** (planned): HTTPS fetch → ed25519 signature verification
   (`VerifyPackSignature`, already in the engine) → local cache → hot
   reload. Slots in without engine changes.

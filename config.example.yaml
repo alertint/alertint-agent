@@ -34,6 +34,12 @@ mcp:
   addr: "0.0.0.0:9912"
   token_env: ALERTINT_MCP_TOKEN
 
+# Rule packs — the embedded baseline pack always loads; point local_pack_dir
+# at a directory (pack.yaml + rules/*.yaml + templates/*.md) to add or
+# override rules. See docs/rules-spec.md and examples/rules/.
+rules:
+  # local_pack_dir: ./my-rules
+
 # Prometheus read connector — MCP tools can run PromQL queries for metric context.
 prometheus:
   enabled: false

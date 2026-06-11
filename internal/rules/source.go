@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"os"
 	"path"
 	"sort"
 	"strings"
@@ -88,6 +89,14 @@ type EmbeddedSource struct {
 // uses priority 0 so every other source can override it.
 func NewEmbeddedSource(fsys fs.FS, name string, priority int) *EmbeddedSource {
 	return &EmbeddedSource{fsys: fsys, name: name, priority: priority}
+}
+
+// NewLocalDirSource loads a pack from a directory on disk with the same
+// layout as the embedded pack. Operator-supplied packs (rules.local_pack_dir
+// in the agent config) load at a higher priority than the embedded baseline,
+// so their rules and templates override baseline ones with the same id/name.
+func NewLocalDirSource(dir string, priority int) *EmbeddedSource {
+	return &EmbeddedSource{fsys: os.DirFS(dir), name: "local:" + dir, priority: priority}
 }
 
 func (s *EmbeddedSource) Name() string  { return s.name }
