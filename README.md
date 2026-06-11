@@ -1,6 +1,7 @@
 # alertint-agent
 
-[![status: v0.1.0-rc](https://img.shields.io/badge/status-v0.1.0--rc-yellow)](#status)
+[![CI](https://github.com/alertint/alertint-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/alertint/alertint-agent/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/alertint/alertint-agent?include_prereleases)](https://github.com/alertint/alertint-agent/releases)
 [![license](https://img.shields.io/badge/license-FSL--1.1--ALv2-blue)](LICENSE)
 
 **Self-hosted, open-core agent runtime for Alertmanager, Slack, MCP clients, and Prometheus context.** Receives webhook payloads, correlates related alerts within a time window, produces an AI finding, and exposes incident context to your AI coding agent over MCP.

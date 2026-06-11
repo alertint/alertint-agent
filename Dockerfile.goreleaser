@@ -1,13 +1,22 @@
 # syntax=docker/dockerfile:1
 # Used by GoReleaser — the binary is pre-built and injected by GoReleaser;
 # this stage only packages it into the final image.
+FROM golang:1.26-alpine AS prep
+RUN mkdir -p /data
+
 FROM scratch
 
 ARG TARGETOS
 ARG TARGETARCH
 
 COPY alertint /alertint
-COPY --from=golang:1.26-alpine /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=prep /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+# /data ships owned by the runtime user so named volumes mounted there
+# (e.g. for the SQLite store) are writable without manual chown.
+COPY --from=prep --chown=65532:65532 /data /data
+
+# Run as the conventional non-root UID (distroless "nonroot").
+USER 65532:65532
 
 EXPOSE 9911 9912
 ENTRYPOINT ["/alertint"]
