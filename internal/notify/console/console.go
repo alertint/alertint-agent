@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 // Package console implements a human-readable console notifier for incident
 // analysis findings. Prints 3-line compact format.
 package console

@@ -24,8 +24,13 @@ profile.cov
 go.work
 go.work.sum
 
-# env file
-.env
+# env files (never commit secrets); the committed example is allowed
+.env*
+!.env.example
+
+# key material
+*.key
+*.pem
 
 # Build artifacts
 /bin/
@@ -34,6 +39,9 @@ go.work.sum
 # Task runner cache
 /.task/
 
+# Local config (copy of config.example.yaml)
+/config.yaml
+
 # SQLite state (default path from config.example.yaml)
 *.db
 *.db-journal
@@ -41,8 +49,8 @@ go.work.sum
 *.db-wal
 
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
 
 # Internal build guide — must not ship in the public repo
 docs/MCP_PROMETHEUS_BUILD_PLAN.md

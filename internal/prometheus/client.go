@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 // Package prometheus provides a read-only HTTP client for the Prometheus
 // HTTP API v1. It is used by the MCP server to run PromQL queries on behalf
 // of AI coding agents investigating incidents.

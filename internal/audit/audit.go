@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 // Package audit implements the agent's hash-chained audit log.
 //
 // Every action in the agent appends a row to the audit_log table. Each

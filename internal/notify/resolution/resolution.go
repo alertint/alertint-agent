@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 // Package resolution implements a resolution notifier that wraps existing
 // notifiers to send incident resolved notifications.
 package resolution

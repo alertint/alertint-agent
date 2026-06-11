@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 package config
 
 import (
@@ -8,7 +10,7 @@ import (
 )
 
 const minimalValidYAML = `
-listen:
+alertmanager:
   webhook_addr: ":9911"
   webhook_token_env: ALERTINT_WEBHOOK_TOKEN
 storage:
@@ -47,8 +49,8 @@ func TestLoad_MinimalValidConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Listen.WebhookAddr != ":9911" {
-		t.Errorf("WebhookAddr = %q", cfg.Listen.WebhookAddr)
+	if cfg.Alertmanager.WebhookAddr != ":9911" {
+		t.Errorf("WebhookAddr = %q", cfg.Alertmanager.WebhookAddr)
 	}
 	if cfg.Correlator.MinAlerts != 2 {
 		t.Errorf("MinAlerts = %d, want 2", cfg.Correlator.MinAlerts)
@@ -60,7 +62,7 @@ func TestLoad_MinimalValidConfig(t *testing.T) {
 
 func TestLoad_AppliesDefaultsForOmittedFields(t *testing.T) {
 	yaml := `
-listen:
+alertmanager:
   webhook_addr: ":9000"
   webhook_token_env: TOK
 llm:
@@ -115,10 +117,50 @@ func TestValidate_RequiresWebhookToken(t *testing.T) {
 	}
 }
 
+func TestDefaults_OnlyAlertmanagerEnabled(t *testing.T) {
+	cfg := Defaults()
+	if !cfg.Alertmanager.Enabled {
+		t.Error("alertmanager should be enabled by default")
+	}
+	if cfg.Notify.Slack.Enabled || cfg.MCP.Enabled || cfg.Prometheus.Enabled {
+		t.Errorf("slack/mcp/prometheus should be disabled by default, got %v/%v/%v",
+			cfg.Notify.Slack.Enabled, cfg.MCP.Enabled, cfg.Prometheus.Enabled)
+	}
+}
+
+func TestValidate_AlertmanagerDisabledSkipsRequiredFields(t *testing.T) {
+	cfg := Defaults()
+	cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
+	cfg.LLM.APIKeyEnv = "KEY"
+	cfg.Alertmanager.Enabled = false
+	cfg.Alertmanager.WebhookAddr = ""
+	// WebhookTokenEnv intentionally unset; keep something to serve.
+	cfg.MCP.Enabled = true
+	cfg.MCP.TokenEnv = "ALERTINT_MCP_TOKEN"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("disabled alertmanager should not require webhook fields: %v", err)
+	}
+
+	tok, err := cfg.WebhookToken()
+	if err != nil || tok != "" {
+		t.Errorf("WebhookToken() with alertmanager disabled = %q, %v; want empty, nil", tok, err)
+	}
+}
+
+func TestValidate_RejectsNothingToServe(t *testing.T) {
+	cfg := Defaults()
+	cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
+	cfg.LLM.APIKeyEnv = "KEY"
+	cfg.Alertmanager.Enabled = false
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "nothing to serve") {
+		t.Fatalf("want nothing-to-serve error, got %v", err)
+	}
+}
+
 func TestValidate_RejectsNonAnthropicProvider(t *testing.T) {
 	cfg := Defaults()
 	cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
-	cfg.Listen.WebhookTokenEnv = "TOK"
+	cfg.Alertmanager.WebhookTokenEnv = "TOK"
 	cfg.LLM.APIKeyEnv = "KEY"
 	cfg.LLM.Provider = "openai"
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "anthropic") {
@@ -141,7 +183,7 @@ func TestValidate_RejectsBadCorrelatorBounds(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := Defaults()
 			cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
-			cfg.Listen.WebhookTokenEnv = "TOK"
+			cfg.Alertmanager.WebhookTokenEnv = "TOK"
 			cfg.LLM.APIKeyEnv = "KEY"
 			tc.mut(&cfg)
 			err := cfg.Validate()
@@ -156,7 +198,7 @@ func TestValidate_SlackEnabledRequiresBotTokenAndChannel(t *testing.T) {
 	base := func() Config {
 		cfg := Defaults()
 		cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
-		cfg.Listen.WebhookTokenEnv = "TOK"
+		cfg.Alertmanager.WebhookTokenEnv = "TOK"
 		cfg.LLM.APIKeyEnv = "KEY"
 		cfg.Notify.Slack.Enabled = true
 		return cfg
@@ -181,7 +223,7 @@ func TestValidate_SlackEnabledRequiresBotTokenAndChannel(t *testing.T) {
 func TestValidate_RejectsAllNotifiersDisabled(t *testing.T) {
 	cfg := Defaults()
 	cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
-	cfg.Listen.WebhookTokenEnv = "TOK"
+	cfg.Alertmanager.WebhookTokenEnv = "TOK"
 	cfg.LLM.APIKeyEnv = "KEY"
 	cfg.Notify.Stdout = false
 	cfg.Notify.Slack.Enabled = false
@@ -193,7 +235,7 @@ func TestValidate_RejectsAllNotifiersDisabled(t *testing.T) {
 func TestValidate_RejectsBadLogLevel(t *testing.T) {
 	cfg := Defaults()
 	cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
-	cfg.Listen.WebhookTokenEnv = "TOK"
+	cfg.Alertmanager.WebhookTokenEnv = "TOK"
 	cfg.LLM.APIKeyEnv = "KEY"
 	cfg.LogLevel = "loud"
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "log_level") {
@@ -204,7 +246,7 @@ func TestValidate_RejectsBadLogLevel(t *testing.T) {
 func TestValidate_RejectsUnwritableSQLitePath(t *testing.T) {
 	cfg := Defaults()
 	cfg.Storage.SQLitePath = "/this/path/does/not/exist/agent.db"
-	cfg.Listen.WebhookTokenEnv = "TOK"
+	cfg.Alertmanager.WebhookTokenEnv = "TOK"
 	cfg.LLM.APIKeyEnv = "KEY"
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "sqlite_path") {
 		t.Fatalf("want sqlite_path error, got %v", err)
@@ -218,7 +260,7 @@ func TestAccessors_ResolveSecretsFromEnv(t *testing.T) {
 
 	cfg := Defaults()
 	cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
-	cfg.Listen.WebhookTokenEnv = "WEBHOOK_TOKEN_X"
+	cfg.Alertmanager.WebhookTokenEnv = "WEBHOOK_TOKEN_X"
 	cfg.LLM.APIKeyEnv = "ANTHROPIC_KEY_X"
 	cfg.Notify.Slack.Enabled = true
 	cfg.Notify.Slack.BotTokenEnv = "SLACK_BOT_TOKEN_X"
@@ -256,7 +298,7 @@ func TestSlackBotToken_DisabledReturnsEmpty(t *testing.T) {
 
 func TestAccessors_MissingEnvVarErrors(t *testing.T) {
 	cfg := Defaults()
-	cfg.Listen.WebhookTokenEnv = "DEFINITELY_NOT_SET_ALERTINT_TEST_VAR"
+	cfg.Alertmanager.WebhookTokenEnv = "DEFINITELY_NOT_SET_ALERTINT_TEST_VAR"
 	if _, err := cfg.WebhookToken(); err == nil {
 		t.Fatal("expected error when env var is unset")
 	}

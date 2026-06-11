@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 // Package config defines the on-disk YAML configuration for the alertint
 // agent and provides loading, defaulting, and validation.
 //
@@ -24,15 +26,19 @@ import (
 )
 
 // Config is the full agent configuration loaded from YAML.
+//
+// Each integration section (alertmanager, notify.slack, mcp, prometheus)
+// carries its own enabled flag so deployments can mix and match sources and
+// sinks. Only the Alertmanager webhook receiver is enabled by default.
 type Config struct {
-	Listen     ListenConfig     `yaml:"listen"`
-	Storage    StorageConfig    `yaml:"storage"`
-	LLM        LLMConfig        `yaml:"llm"`
-	Correlator CorrelatorConfig `yaml:"correlator"`
-	Notify     NotifyConfig     `yaml:"notify"`
-	MCP        MCPConfig        `yaml:"mcp"`
-	Prometheus PrometheusConfig `yaml:"prometheus"`
-	LogLevel   string           `yaml:"log_level"`
+	Alertmanager AlertmanagerConfig `yaml:"alertmanager"`
+	Storage      StorageConfig      `yaml:"storage"`
+	LLM          LLMConfig          `yaml:"llm"`
+	Correlator   CorrelatorConfig   `yaml:"correlator"`
+	Notify       NotifyConfig       `yaml:"notify"`
+	MCP          MCPConfig          `yaml:"mcp"`
+	Prometheus   PrometheusConfig   `yaml:"prometheus"`
+	LogLevel     string             `yaml:"log_level"`
 }
 
 // PrometheusConfig configures the optional Prometheus read connector.
@@ -55,8 +61,10 @@ type MCPConfig struct {
 	TokenEnv string `yaml:"token_env"`
 }
 
-// ListenConfig configures the inbound webhook server.
-type ListenConfig struct {
+// AlertmanagerConfig configures the inbound Alertmanager webhook receiver.
+// It also serves GET /health, so disabling it removes that endpoint too.
+type AlertmanagerConfig struct {
+	Enabled         bool   `yaml:"enabled"`
 	WebhookAddr     string `yaml:"webhook_addr"`
 	WebhookTokenEnv string `yaml:"webhook_token_env"`
 }
@@ -98,7 +106,8 @@ type SlackConfig struct {
 // represents the sensible baseline that Load merges user input into.
 func Defaults() Config {
 	return Config{
-		Listen: ListenConfig{
+		Alertmanager: AlertmanagerConfig{
+			Enabled:     true,
 			WebhookAddr: ":9911",
 		},
 		Storage: StorageConfig{
@@ -165,11 +174,16 @@ func LoadFrom(r io.Reader, path string) (*Config, error) {
 func (c *Config) Validate() error {
 	var errs []string
 
-	if strings.TrimSpace(c.Listen.WebhookAddr) == "" {
-		errs = append(errs, "listen.webhook_addr is required")
+	if c.Alertmanager.Enabled {
+		if strings.TrimSpace(c.Alertmanager.WebhookAddr) == "" {
+			errs = append(errs, "alertmanager.webhook_addr is required when alertmanager is enabled")
+		}
+		if strings.TrimSpace(c.Alertmanager.WebhookTokenEnv) == "" {
+			errs = append(errs, "alertmanager.webhook_token_env is required when alertmanager is enabled (env var name holding the bearer token)")
+		}
 	}
-	if strings.TrimSpace(c.Listen.WebhookTokenEnv) == "" {
-		errs = append(errs, "listen.webhook_token_env is required (env var name holding the bearer token)")
+	if !c.Alertmanager.Enabled && !c.MCP.Enabled {
+		errs = append(errs, "nothing to serve: enable at least one of alertmanager or mcp")
 	}
 
 	if strings.TrimSpace(c.Storage.SQLitePath) == "" {
@@ -253,9 +267,13 @@ func (c *Config) Validate() error {
 }
 
 // WebhookToken returns the bearer token for the inbound webhook receiver,
-// resolved from the env var named by Listen.WebhookTokenEnv.
+// resolved from the env var named by Alertmanager.WebhookTokenEnv.
+// Returns an empty string and nil error when the receiver is disabled.
 func (c *Config) WebhookToken() (string, error) {
-	return requireEnv(c.Listen.WebhookTokenEnv, "listen.webhook_token_env")
+	if !c.Alertmanager.Enabled {
+		return "", nil
+	}
+	return requireEnv(c.Alertmanager.WebhookTokenEnv, "alertmanager.webhook_token_env")
 }
 
 // LLMAPIKey returns the LLM API key, resolved from the env var named by

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 // Command alertint is the AlertINT agent binary.
 //
 // Subcommands:
@@ -82,7 +84,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	fs := flag.NewFlagSet("alertint serve", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cfgPath := fs.String("config", "", "path to alertint YAML config")
-	webhookAddr := fs.String("webhook-addr", "", "override listen.webhook_addr from config (e.g. 0.0.0.0:9911)")
+	webhookAddr := fs.String("webhook-addr", "", "override alertmanager.webhook_addr from config (e.g. 0.0.0.0:9911)")
 	mcpAddr := fs.String("mcp-addr", "", "override mcp.addr from config (e.g. 0.0.0.0:9912)")
 	logLevel := fs.String("log-level", "info", "log level: debug, info, warn, error")
 	logFormat := fs.String("log-format", "json", "log format: json or text")
@@ -125,15 +127,10 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 
 	if *webhookAddr != "" {
-		cfg.Listen.WebhookAddr = *webhookAddr
+		cfg.Alertmanager.WebhookAddr = *webhookAddr
 	}
 	if *mcpAddr != "" {
 		cfg.MCP.Addr = *mcpAddr
-	}
-
-	token, err := cfg.WebhookToken()
-	if err != nil {
-		return err
 	}
 
 	st, err := store.Open(ctx, cfg.Storage.SQLitePath)
@@ -192,37 +189,51 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 	defer cor.Stop()
 
-	hook, err := ingress.New(ingress.Options{
-		Store:   st,
-		Auditor: auditor,
-		Token:   token,
-		Logger:  logger,
-		Sink:    cor.Accept,
-	})
-	if err != nil {
-		return err
-	}
-
-	webhookSrv := &http.Server{
-		Addr:              cfg.Listen.WebhookAddr,
-		Handler:           hook.Handler(),
-		ReadTimeout:       ingress.DefaultReadTimeout,
-		ReadHeaderTimeout: ingress.DefaultReadTimeout,
-		WriteTimeout:      ingress.DefaultWriteTimeout,
-		IdleTimeout:       ingress.DefaultIdleTimeout,
-	}
-
-	webhookErrCh := make(chan error, 1)
-	go func() {
-		logger.Info("webhook listening",
-			slog.String("addr", cfg.Listen.WebhookAddr),
-			slog.String("path", "/webhook/alertmanager"),
-		)
-		if err := webhookSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			webhookErrCh <- err
+	// Start the Alertmanager webhook receiver when enabled. It also serves
+	// GET /health, so a deployment with alertmanager disabled has no health
+	// endpoint.
+	var webhookSrv *http.Server
+	var webhookErrCh <-chan error
+	if cfg.Alertmanager.Enabled {
+		token, err := cfg.WebhookToken()
+		if err != nil {
+			return err
 		}
-		close(webhookErrCh)
-	}()
+		hook, err := ingress.New(ingress.Options{
+			Store:   st,
+			Auditor: auditor,
+			Token:   token,
+			Logger:  logger,
+			Sink:    cor.Accept,
+		})
+		if err != nil {
+			return err
+		}
+
+		webhookSrv = &http.Server{
+			Addr:              cfg.Alertmanager.WebhookAddr,
+			Handler:           hook.Handler(),
+			ReadTimeout:       ingress.DefaultReadTimeout,
+			ReadHeaderTimeout: ingress.DefaultReadTimeout,
+			WriteTimeout:      ingress.DefaultWriteTimeout,
+			IdleTimeout:       ingress.DefaultIdleTimeout,
+		}
+
+		ch := make(chan error, 1)
+		webhookErrCh = ch
+		go func() {
+			logger.Info("webhook listening",
+				slog.String("addr", cfg.Alertmanager.WebhookAddr),
+				slog.String("path", "/webhook/alertmanager"),
+			)
+			if err := webhookSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				ch <- err
+			}
+			close(ch)
+		}()
+	} else {
+		logger.Info("alertmanager webhook receiver disabled; /health endpoint not served")
+	}
 
 	// Start the MCP HTTP server when enabled. MCP clients connect by URL
 	// (e.g. http://host:9912/mcp) — no subprocess or shared file needed.
@@ -262,7 +273,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	select {
 	case <-ctx.Done():
 		logger.Info("shutdown signal received; draining in-flight requests")
-	case err := <-webhookErrCh:
+	case err := <-webhookErrCh: // nil channel never fires when alertmanager is disabled
 		if err != nil {
 			return err
 		}
@@ -276,8 +287,10 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), ingress.DefaultShutdownTimeout)
 	defer cancel()
-	if err := webhookSrv.Shutdown(shutdownCtx); err != nil {
-		logger.Error("webhook graceful shutdown failed", slog.String("err", err.Error()))
+	if webhookSrv != nil {
+		if err := webhookSrv.Shutdown(shutdownCtx); err != nil {
+			logger.Error("webhook graceful shutdown failed", slog.String("err", err.Error()))
+		}
 	}
 	if mcpHTTPSrv != nil {
 		if err := mcpHTTPSrv.Shutdown(shutdownCtx); err != nil {

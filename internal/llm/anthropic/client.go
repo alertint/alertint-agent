@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 // Package anthropic provides a minimal client for the Anthropic Messages
 // API (https://docs.anthropic.com/en/api/messages).
 //

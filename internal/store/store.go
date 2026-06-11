@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 // Package store wraps the embedded SQLite database that backs the
 // AlertINT agent.
 //

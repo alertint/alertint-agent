@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 // Package logging provides the agent's structured logging baseline.
 //
 // All runtime logs flow through a single *slog.Logger configured here:

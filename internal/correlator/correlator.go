@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 // Package correlator implements the fixed-window time-window correlator
 // described in Slice 05 of the AlertINT agent plan.
 //

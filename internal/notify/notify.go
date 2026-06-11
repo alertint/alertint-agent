@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 // Package notify defines the Notifier interface and a multi-notifier
 // implementation. Concrete notifiers live in sub-packages (stdout, slack).
 package notify

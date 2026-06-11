@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 // Package acutetriage implements the acute-triage skill (Slice 07).
 // This file contains the system prompt and the evidence-pack builder.
 package acutetriage

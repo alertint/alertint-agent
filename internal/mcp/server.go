@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 // Package mcp implements the AlertINT HTTP MCP server.
 //
 // alertint serve starts this server alongside the webhook receiver when

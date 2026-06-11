@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 // Package ingress implements the Alertmanager v4 webhook receiver.
 //
 // The receiver is intentionally narrow:

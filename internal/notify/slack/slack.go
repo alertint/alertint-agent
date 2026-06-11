@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 // Package slack implements a Notifier that uses the Slack Bot Token API to
 // post structured Block Kit messages with a clear per-incident timeline:
 //

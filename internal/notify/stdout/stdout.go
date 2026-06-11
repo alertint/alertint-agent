@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 // Package stdout implements a Notifier that writes one canonical JSON line
 // per Finding to an io.Writer (typically os.Stdout).
 package stdout

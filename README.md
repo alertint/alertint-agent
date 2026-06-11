@@ -1,13 +1,13 @@
 # alertint-agent
 
 [![status: v0.1.0-rc](https://img.shields.io/badge/status-v0.1.0--rc-yellow)](#status)
-[![license](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+[![license](https://img.shields.io/badge/license-FSL--1.1--ALv2-blue)](LICENSE)
 
 **Self-hosted, open-core agent runtime for Alertmanager, Slack, MCP clients, and Prometheus context.** Receives webhook payloads, correlates related alerts within a time window, produces an AI finding, and exposes incident context to your AI coding agent over MCP.
 
 ## Status
 
-Open-core and in active development (v0.1.0-rc). AlertINT runs self-hosted: it receives Alertmanager webhooks, correlates related alerts, produces an AI finding, and exposes incident plus read-only Prometheus context to your AI coding agent over MCP. The core runtime is open source; enterprise features come later, on top.
+Open-core and in active development (v0.1.0-rc). AlertINT runs self-hosted: it receives Alertmanager webhooks, correlates related alerts, produces an AI finding, and exposes incident plus read-only Prometheus context to your AI coding agent over MCP. The core runtime is source-available under [FSL-1.1-ALv2](LICENSE); enterprise features come later, on top.
 
 → **[QUICKSTART](docs/QUICKSTART.md)** · **[CONFIGURATION](docs/CONFIGURATION.md)** · **[ARCHITECTURE](docs/ARCHITECTURE.md)** · **[LIMITS](docs/LIMITS.md)**
 
@@ -26,7 +26,7 @@ Open-core and in active development (v0.1.0-rc). AlertINT runs self-hosted: it r
 
 - **Read-only by design** — AlertINT observes and reports; it never touches your infrastructure.
 - **Self-hosted and local** — your alert data and incident context stay on your machine.
-- **Open-core** — the core runtime is open source; enterprise features come later, on top.
+- **Open-core** — the core runtime is source-available under [FSL-1.1-ALv2](LICENSE); enterprise features come later, on top.
 
 What it does **not** do: remediation, silences, or routing changes; Alertmanager, Kubernetes, or infrastructure writes; ticketing/paging integrations (PagerDuty, Jira, Linear); web UI; multi-tenancy; or multi-provider LLM routing. Operator-controlled, approval-gated write workflows are a far-future direction. See [`docs/LIMITS.md`](docs/LIMITS.md).
 
@@ -106,7 +106,9 @@ alertint-agent/
 │   ├── ingress/               # Alertmanager webhook receiver
 │   ├── llm/anthropic/         # Anthropic Messages API client
 │   ├── logging/               # slog baseline
-│   ├── notify/                # Notifier interface, stdout + Slack
+│   ├── mcp/                   # HTTP MCP server (:9912/mcp, started inside serve)
+│   ├── notify/                # Notifier interface; console, resolution, slack, stdout
+│   ├── prometheus/            # read-only Prometheus HTTP client (MCP tools)
 │   └── store/                 # SQLite store (alerts, incidents, audit_log)
 ├── skills/acutetriage/        # acute-triage LLM skill
 ├── docker/                    # Docker Compose local dev stack
@@ -119,4 +121,9 @@ alertint-agent/
 
 ## License
 
-Apache 2.0. See [LICENSE](LICENSE).
+[Functional Source License, Version 1.1, ALv2 Future License](LICENSE) (FSL-1.1-ALv2).
+
+Free for any internal use and self-hosting at any scale. Each release converts to
+Apache 2.0 two years after publication. The only restriction is offering the
+software to others as a competing commercial product or service. See
+[fsl.software](https://fsl.software) for details.

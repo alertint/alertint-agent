@@ -6,12 +6,19 @@ Secrets are **never** stored inline. Fields named `*_env` hold the **name** of t
 
 ---
 
-## `listen`
+## `alertmanager`
+
+The inbound Alertmanager webhook receiver. Enabled by default — it is the
+only integration that is. Every integration section carries an `enabled`
+flag; when a section is enabled, its required fields must be set or the
+agent refuses to start. At least one of `alertmanager` or `mcp` must be
+enabled.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
+| `enabled` | bool | `true` | Run the webhook receiver (also serves `GET /health`) |
 | `webhook_addr` | string | `"0.0.0.0:9911"` | TCP address the HTTP server binds to |
-| `webhook_token_env` | string | — | **Required.** Env var name holding the webhook bearer token |
+| `webhook_token_env` | string | — | **Required when enabled.** Env var name holding the webhook bearer token |
 
 The agent returns `401` for any request missing or mismatching the token.
 
@@ -104,7 +111,8 @@ One of `debug`, `info`, `warn`, `error`. Default: `info`.
 ## Full example
 
 ```yaml
-listen:
+alertmanager:
+  enabled: true
   webhook_addr: "0.0.0.0:9911"
   webhook_token_env: ALERTINT_WEBHOOK_TOKEN
 

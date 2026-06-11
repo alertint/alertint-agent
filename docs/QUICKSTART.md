@@ -51,7 +51,7 @@ cp config.example.yaml config.yaml
 
 Open `config.yaml` and set at minimum:
 
-- `listen.webhook_token_env` — name of the env var that holds your bearer token
+- `alertmanager.webhook_token_env` — name of the env var that holds your bearer token
 - `llm.api_key_env` — name of the env var that holds your Anthropic API key
 
 ### Step 3 — Set secrets in env
@@ -70,7 +70,7 @@ alertint serve --config config.yaml
 You should see:
 
 ```
-level=INFO msg="alertint agent starting" version=... addr=0.0.0.0:9911
+level=INFO msg="alertint starting" version=... addr=0.0.0.0:9911
 ```
 
 ---
