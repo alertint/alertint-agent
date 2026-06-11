@@ -77,7 +77,7 @@ func run(docsDir string) []string {
 	slugSeen := make(map[string]string) // slug -> first file that used it
 	pages := 0
 
-	walkErr := filepath.WalkDir(docsDir, func(path string, d os.DirEntry, err error) error {
+	walkErr := filepath.WalkDir(docsDir, func(path string, d os.DirEntry, err error) error { // #nosec G703 -- docs dir comes from the CLI argument; this is a repo-local lint tool
 		if err != nil {
 			return err
 		}
@@ -110,7 +110,7 @@ func run(docsDir string) []string {
 }
 
 func loadMeta(path string) (*meta, []string) {
-	raw, err := os.ReadFile(path) // #nosec G304 -- path is derived from the docs dir argument, not untrusted input
+	raw, err := os.ReadFile(path) // #nosec G304 G703 -- path is derived from the docs dir argument, not untrusted input
 	if err != nil {
 		return nil, []string{err.Error()}
 	}
