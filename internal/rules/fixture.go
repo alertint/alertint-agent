@@ -47,7 +47,7 @@ type Expectation struct {
 
 // LoadStreamFixture reads one fixture file.
 func LoadStreamFixture(path string) (*StreamFixture, error) {
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(path) // #nosec G304 -- test/QA harness reads caller-chosen fixture files by design
 	if err != nil {
 		return nil, fmt.Errorf("fixture %s: %w", path, err)
 	}

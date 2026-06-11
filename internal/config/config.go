@@ -129,7 +129,9 @@ func Defaults() Config {
 			},
 		},
 		MCP: MCPConfig{
-			Addr: ":9912",
+			// Localhost-only by default: exposing MCP beyond the host is
+			// an explicit operator decision (set addr to 0.0.0.0:9912).
+			Addr: "127.0.0.1:9912",
 		},
 		Prometheus: PrometheusConfig{
 			TimeoutSeconds:      10,
@@ -142,7 +144,7 @@ func Defaults() Config {
 // Load reads a YAML config from path, applies defaults for missing fields,
 // and validates the result.
 func Load(path string) (*Config, error) {
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- path is the operator-supplied --config flag; reading it is the point
 	if err != nil {
 		return nil, fmt.Errorf("config: open %s: %w", path, err)
 	}

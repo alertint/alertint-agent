@@ -31,7 +31,7 @@ notify:
 # Set ALERTINT_MCP_TOKEN to a long random secret before enabling.
 mcp:
   enabled: false
-  addr: ":9912"
+  addr: "127.0.0.1:9912"   # localhost-only by default; set 0.0.0.0:9912 to expose beyond the host
   token_env: ALERTINT_MCP_TOKEN
 
 # Prometheus read connector — MCP tools can run PromQL queries for metric context.
