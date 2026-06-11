@@ -30,7 +30,6 @@ version; coordinated disclosure is appreciated and credited.
   logs, or the database.
 - The Alertmanager webhook requires a bearer token; the agent refuses to
   start without one when the receiver is enabled.
-- The MCP server is disabled by default; when enabled it binds to
-  localhost only unless explicitly configured otherwise, and requires a
-  bearer token.
+- The MCP server is disabled by default; when enabled it requires a
+  bearer token on every request.
 - Outbound TLS verification is never disabled.

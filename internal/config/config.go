@@ -129,9 +129,9 @@ func Defaults() Config {
 			},
 		},
 		MCP: MCPConfig{
-			// Localhost-only by default: exposing MCP beyond the host is
-			// an explicit operator decision (set addr to 0.0.0.0:9912).
-			Addr: "127.0.0.1:9912",
+			// Binds all interfaces: the agent targets shared environments
+			// and MCP access is gated by the mandatory bearer token.
+			Addr: "0.0.0.0:9912",
 		},
 		Prometheus: PrometheusConfig{
 			TimeoutSeconds:      10,

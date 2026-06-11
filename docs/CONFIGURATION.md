@@ -70,7 +70,7 @@ When enabled, `alertint serve` starts a second HTTP listener — a Streamable HT
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | bool | `false` | Start the MCP HTTP server inside `serve` |
-| `addr` | string | `"127.0.0.1:9912"` | TCP address the MCP server binds to (localhost-only by default; set `0.0.0.0:9912` to expose beyond the host). Endpoint is `http://host:9912/mcp` |
+| `addr` | string | `"0.0.0.0:9912"` | TCP address the MCP server binds to. Endpoint is `http://host:9912/mcp` |
 | `token_env` | string | — | Env var name holding the MCP bearer token. Default env var is `ALERTINT_MCP_TOKEN` |
 
 Clients authenticate with `Authorization: Bearer <token>`. See [`examples/mcp-clients/`](../examples/mcp-clients/) for copy-paste client configs.
@@ -142,7 +142,7 @@ notify:
 
 mcp:
   enabled: false
-  addr: "127.0.0.1:9912"   # localhost-only by default; set 0.0.0.0:9912 to expose beyond the host
+  addr: "0.0.0.0:9912"
   token_env: ALERTINT_MCP_TOKEN
 
 prometheus:
