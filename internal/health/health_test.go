@@ -3,8 +3,12 @@
 package health
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -57,5 +61,86 @@ func TestRegistry_NilSafe(t *testing.T) {
 	var r *Registry
 	if got := r.Run(context.Background()); got != nil {
 		t.Errorf("nil registry must return nil, got %v", got)
+	}
+	r.Watch(context.Background(), nil) // must return immediately, not panic
+}
+
+// watchHarness runs Watch against a scripted probe sequence (the last
+// result repeats once exhausted), cancels after the whole sequence has
+// been consumed, and returns the captured log output.
+func watchHarness(t *testing.T, r *Registry, results []error) string {
+	t.Helper()
+	var mu sync.Mutex
+	call := 0
+	consumed := make(chan struct{})
+	r.checks[0].Probe = func(context.Context) error {
+		mu.Lock()
+		defer mu.Unlock()
+		err := results[min(call, len(results)-1)]
+		call++
+		if call == len(results) {
+			close(consumed)
+		}
+		return err
+	}
+	r.watchMin, r.watchSteady = time.Millisecond, 2*time.Millisecond
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		r.Watch(ctx, logger)
+		close(done)
+	}()
+
+	select {
+	case <-consumed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watch never consumed the scripted probe results")
+	}
+	cancel()
+	<-done
+	return buf.String()
+}
+
+func TestRegistry_WatchRetriesStartupFailure(t *testing.T) {
+	r := NewRegistry(time.Hour, Check{Name: "prometheus", Detail: "http://prom:9090"})
+	logs := watchHarness(t, r, []error{
+		errors.New("connection refused"),
+		errors.New("connection refused"),
+		nil,
+	})
+	for _, want := range []string{
+		"integration health: FAILED",
+		"integration health: retry failed",
+		"integration health: connection restored",
+	} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("logs missing %q:\n%s", want, logs)
+		}
+	}
+	// The watcher must seed the cache so /health reflects the recovery.
+	statuses := r.Run(context.Background())
+	if len(statuses) != 1 || !statuses[0].OK {
+		t.Errorf("cached status after recovery: %+v", statuses)
+	}
+}
+
+func TestRegistry_WatchLogsConnectionLossAndRecovery(t *testing.T) {
+	r := NewRegistry(time.Hour, Check{Name: "prometheus", Detail: "http://prom:9090"})
+	logs := watchHarness(t, r, []error{
+		nil,
+		errors.New("connection refused"),
+		nil,
+	})
+	for _, want := range []string{
+		"integration health: OK",
+		"integration health: connection lost; retrying",
+		"integration health: connection restored",
+	} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("logs missing %q:\n%s", want, logs)
+		}
 	}
 }

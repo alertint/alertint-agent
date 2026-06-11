@@ -200,12 +200,12 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 	defer cor.Stop()
 
-	// Probe enabled integrations once at startup (and on /health, cached)
-	// so a bad token or unreachable endpoint is visible immediately.
+	// Probe enabled integrations in the background: quickly (with backoff)
+	// while one is failing — at startup a co-deployed dependency may still
+	// be booting — then at a steady pace, logging losses and recoveries.
+	// Results are cached for GET /health.
 	healthReg := buildHealthChecks(cfg, prom)
-	go func() {
-		health.LogStatuses(logger, healthReg.Run(ctx))
-	}()
+	go healthReg.Watch(ctx, logger)
 
 	webhookSrv, webhookErrCh, err := startWebhook(cfg, st, auditor, cor, healthReg, logger)
 	if err != nil {
