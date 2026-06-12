@@ -1,6 +1,6 @@
 ---
 title: "Quickstart"
-description: "Get AlertINT running as a single self-hosted binary."
+description: "Install the agent, feed it your alerts, and connect your first MCP client."
 section: "Getting started"
 order: 1
 slug: "quickstart"
@@ -8,9 +8,11 @@ slug: "quickstart"
 
 # Quickstart
 
-Get AlertINT running as a single self-hosted binary, then connect your AI
-agent over the Model Context Protocol (MCP) to start analyzing incidents
-with production context.
+This guide takes you from zero to a working setup: you'll get AlertINT
+running as a single self-hosted binary (or as a bundled Docker Compose
+stack), point Alertmanager at it, and connect your AI agent over the
+Model Context Protocol (MCP). At the end, your agent can analyze live
+incidents with production context.
 
 ## Prerequisites
 
@@ -65,7 +67,11 @@ cp config.example.yaml config.yaml
 At minimum, set:
 
 - `alertmanager.webhook_token_env` — name of the env var holding your
-  webhook bearer token
+  webhook bearer token. There is nothing to obtain anywhere: you make
+  this secret up yourself — any long random string works, and the export
+  below generates one with `openssl rand -hex 32`. Alertmanager will
+  present the same token with every webhook it sends (step 4), and the
+  agent rejects requests without it.
 - `llm.api_key_env` — name of the env var holding your Anthropic API key
 
 Secrets are never written into the config file — fields ending in `_env`

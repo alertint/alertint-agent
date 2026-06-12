@@ -42,7 +42,13 @@ The agent returns `401` for any request missing or mismatching the token.
 |---|---|---|---|
 | `provider` | string | `anthropic` | Only `anthropic` is supported today |
 | `api_key_env` | string | — | **Required.** Env var name holding the Anthropic API key |
-| `model` | string | `claude-haiku-4-5-20251001` | Anthropic model ID |
+| `model` | string | `claude-haiku-4-5-20251001` | Anthropic model ID used for incident analysis |
+
+This is the model that triages your incidents and writes the finding
+summaries, so every dispatched incident consumes Anthropic API tokens.
+The Haiku default keeps per-incident cost low; if you switch to a larger
+model, keep an eye on your spend in the Anthropic console — the agent
+does not yet meter or cap usage (budget tracking is planned).
 
 ## `correlator`
 
@@ -51,6 +57,11 @@ The agent returns `401` for any request missing or mismatching the token.
 | `window_seconds` | int | `90` | Alerts sharing the same group key within this window form one incident |
 | `min_alerts` | int | `2` | Minimum alerts before the incident is dispatched to the skill. Set to `1` for single-alert triage. |
 | `group_labels` | list | `[alertname, cluster, namespace, service]` | Label names used to compute the group key. Two alerts are correlated when all of these labels match. |
+
+`window_seconds` is a tradeoff. A lower value reacts faster, but an
+incident may be analyzed with only the first alert or two of a burst
+grouped in; a higher value waits to gather more related alerts — more
+context for the analysis — at the cost of a slower first finding.
 
 ## `notify`
 
@@ -93,6 +104,12 @@ triage prompts and exposes PromQL tools over MCP. See
 | `bearer_token_env` | string | — | Optional env var name holding a bearer token for Prometheus |
 | `timeout_seconds` | int | `10` | Timeout for Prometheus HTTP requests |
 | `default_range_minutes` | int | `60` | Default lookback window for range queries |
+
+Set `bearer_token_env` only when your Prometheus requires authentication
+— for example, when it sits behind an auth proxy or ingress that expects
+an `Authorization: Bearer <token>` header. Name the env var that holds
+that token and export it before starting the agent. A plain,
+unauthenticated Prometheus needs only `base_url`.
 
 ## `rules`
 
