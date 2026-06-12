@@ -66,3 +66,11 @@ go run ./docs/scripts
 It checks frontmatter completeness, slug uniqueness, that each `section`
 exists in `meta.yaml` and matches the directory the file lives in, the
 single-H1 rule, and that fenced code blocks declare a language.
+
+## Deployment
+
+When a change under `docs/` lands on `main`, the `Docs Deploy` workflow
+re-runs the validator and triggers a rebuild of <https://alertint.com/docs>.
+No manual step is needed; the site picks up the new content within a few
+minutes. The workflow can also be started by hand from the Actions tab
+(`workflow_dispatch`) to force a redeploy without a docs change.
