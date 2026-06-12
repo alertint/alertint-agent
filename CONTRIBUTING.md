@@ -1,8 +1,8 @@
 # Contributing to AlertINT
 
 Thanks for considering a contribution! This document covers the practical
-bits: building, testing, contributing rules, style, and the sign-off
-requirement.
+bits: building, testing, contributing rules and docs, style, and the
+sign-off requirement.
 
 ## Build and test
 
@@ -32,6 +32,19 @@ welcome in **`packs/community/`**. A good rule contribution:
 
 Accepted community rules may also be curated into the maintained
 intelligence feed (with attribution preserved via git history).
+
+## Contributing documentation
+
+The `/docs` tree in this repo is the canonical source for
+<https://alertint.com/docs> — the website fetches and renders it at build
+time, so a docs PR here updates the published docs. The structure,
+frontmatter requirements, and formatting rules (plain CommonMark, one H1
+per page, code blocks with a language) are described in
+[`docs/README.md`](docs/README.md). Validate before opening a PR:
+
+```bash
+task docs:validate
+```
 
 ## Code style
 

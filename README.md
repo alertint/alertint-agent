@@ -1,133 +1,79 @@
-# alertint-agent
+<p align="center">
+  <img src="docs/assets/alertint-logo.svg" alt="AlertINT" width="110">
+</p>
 
-[![CI](https://github.com/alertint/alertint-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/alertint/alertint-agent/actions/workflows/ci.yml)
-[![release](https://img.shields.io/github/v/release/alertint/alertint-agent?include_prereleases)](https://github.com/alertint/alertint-agent/releases)
-[![license](https://img.shields.io/badge/license-FSL--1.1--ALv2-blue)](LICENSE)
+<h1 align="center">AlertINT</h1>
 
-**Self-hosted, open-core agent runtime for Alertmanager, Slack, MCP clients, and Prometheus context.** Receives webhook payloads, correlates related alerts within a time window, produces an AI finding, and exposes incident context to your AI coding agent over MCP.
+<p align="center"><strong>Infrastructure Alerts, Decoded</strong></p>
 
-## Status
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-blue" alt="license"></a>
+  <a href="https://github.com/alertint/alertint-agent/releases"><img src="https://img.shields.io/github/v/release/alertint/alertint-agent?include_prereleases" alt="release"></a>
+  <a href="https://github.com/alertint/alertint-agent/actions/workflows/ci.yml"><img src="https://github.com/alertint/alertint-agent/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+</p>
 
-Open-core and in active development (v0.1.0-rc). AlertINT runs self-hosted: it receives Alertmanager webhooks, correlates related alerts, produces an AI finding, and exposes incident plus read-only Prometheus context to your AI coding agent over MCP. The core runtime is source-available under [FSL-1.1-ALv2](LICENSE); enterprise features come later, on top.
+> AlertINT is a self-hosted, open-core agent runtime that turns infrastructure alerts into incident context your AI agent reads directly over MCP.
 
-→ **[QUICKSTART](docs/QUICKSTART.md)** · **[CONFIGURATION](docs/CONFIGURATION.md)** · **[ARCHITECTURE](docs/ARCHITECTURE.md)** · **[LIMITS](docs/LIMITS.md)**
+A single Go binary that sits between Alertmanager and your AI agent. It ingests alert webhooks, correlates them into incidents through an open rule engine, runs an LLM triage skill, posts structured findings to Slack, and exposes the resulting incident state — plus read-only Prometheus access — to any MCP client. Read-only by design. Local state. You bring the LLM key.
 
-## What it does
+**Full documentation: [alertint.com/docs](https://alertint.com/docs)**
 
-- Ingests Alertmanager webhook payloads and stores alerts and incidents locally
-- Correlates related alerts within a time window using shared labels
-- Applies an open-schema rule engine (storm collapse, known-issue short-circuits, prompt selection) driven by an embedded baseline pack — see [`docs/rules-spec.md`](docs/rules-spec.md)
-- Produces an AI finding for each incident with the built-in `acute-triage` skill, backed by Anthropic Claude
-- Delivers the finding to stdout and optionally Slack
-- Exposes incidents, alerts, evidence packs, findings, and audit verification to your AI agent over MCP
-- Answers read-only Prometheus instant and range queries over MCP for deeper metric context
-- Records every action in a hash-chained audit log
-- Ships as one self-hosted binary with SQLite state
+## Quickstart
 
-## Scope and principles
+1. **[Install](https://alertint.com/docs/getting-started/quickstart)** — grab a binary from [Releases](https://github.com/alertint/alertint-agent/releases), or:
 
-- **Read-only by design** — AlertINT observes and reports; it never touches your infrastructure.
-- **Self-hosted and local** — your alert data and incident context stay on your machine.
-- **Open-core** — the core runtime is source-available under [FSL-1.1-ALv2](LICENSE); enterprise features come later, on top.
+   ```bash
+   go install github.com/alertint/alertint-agent/cmd/alertint@latest
+   ```
 
-What it does **not** do: remediation, silences, or routing changes; Alertmanager, Kubernetes, or infrastructure writes; ticketing/paging integrations (PagerDuty, Jira, Linear); web UI; multi-tenancy; or multi-provider LLM routing. Operator-controlled, approval-gated write workflows are a far-future direction. See [`docs/LIMITS.md`](docs/LIMITS.md).
+2. **[Configure](https://alertint.com/docs/getting-started/configuration)** — copy the example and point it at your env vars:
 
-## Quickstart — Docker Compose (60 seconds)
+   ```bash
+   cp config.example.yaml config.yaml
+   export ALERTINT_WEBHOOK_TOKEN="$(openssl rand -hex 32)" ANTHROPIC_API_KEY="sk-ant-..."
+   ```
 
-**Prerequisites:** Docker with Compose v2, an [Anthropic API key](https://console.anthropic.com/).
+3. **[Run](https://alertint.com/docs/getting-started/quickstart)** — one process, SQLite state, no other dependencies:
 
-```bash
-# 1. Clone and enter the repo
-git clone https://github.com/alertint/alertint-agent
-cd alertint-agent
+   ```bash
+   alertint serve --config config.yaml
+   ```
 
-# 2. Create your .env file
-cp .env.example .env
-# Edit .env — set ALERTINT_WEBHOOK_TOKEN and ANTHROPIC_API_KEY
+4. **[Point Alertmanager at it](https://alertint.com/docs/getting-started/quickstart)** — add a webhook receiver:
 
-# 3. Start the stack (Alertmanager + agent)
-docker compose -f docker/docker-compose.yaml --env-file .env up --build
+   ```yaml
+   webhook_configs:
+     - url: "http://<agent-host>:9911/webhook/alertmanager"
+   ```
+
+5. **[Connect an MCP client](https://alertint.com/docs/integrations/mcp-clients)** — Claude Code, Cursor, or Windsurf:
+
+   ```text
+   http://<agent-host>:9912/mcp
+   ```
+
+## How it works
+
+```mermaid
+flowchart LR
+    AM[Alertmanager] -->|webhook| ING[Ingest + dedup]
+    ING --> COR[Correlation<br/>rule engine]
+    COR --> AI[AI synthesis<br/>Claude]
+    AI --> SLK[Slack finding]
+    COR --> MCP[MCP server]
+    MCP --> AGT[Your AI agent<br/>investigation tools]
 ```
 
-The agent listens on **:9911** (webhook) and **:9912** (MCP); Alertmanager on **:9093**.
+## Documentation
 
-**Send a test alert** — POST an Alertmanager-style payload straight to the agent (no extra tooling):
+- **[Docs home](https://alertint.com/docs)** — quickstart, configuration reference
+- **[Architecture](https://alertint.com/docs/concepts/architecture)** — how the pipeline is built
+- **[Integrations](https://alertint.com/docs/integrations/mcp-clients)** — MCP clients, [Prometheus](https://alertint.com/docs/integrations/prometheus), [Slack](https://alertint.com/docs/notifications/slack)
+- **[Scope and limits](https://alertint.com/docs/concepts/scope-and-limits)** — what it will and won't do
+- **[FAQ](https://alertint.com/docs/concepts/faq)**
 
-```bash
-curl -sS -X POST http://localhost:9911/webhook/alertmanager \
-  -H "Authorization: Bearer $ALERTINT_WEBHOOK_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "version": "4",
-    "status": "firing",
-    "alerts": [
-      {
-        "status": "firing",
-        "labels": {"alertname":"DiskFull","cluster":"local","namespace":"default","service":"api","severity":"critical"},
-        "annotations": {"summary":"Disk at 95% on web1"},
-        "startsAt": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"
-      }
-    ]
-  }'
-```
-
-Within ~90 seconds you will see a JSON finding line in the agent container stdout. See [QUICKSTART](docs/QUICKSTART.md) for hooking up a real Alertmanager.
-
-**Stop the stack:**
-
-```bash
-docker compose -f docker/docker-compose.yaml down
-```
-
-## Development
-
-Requirements:
-
-- Go 1.26+ (toolchain pin: `go1.26.3`)
-- [Task](https://taskfile.dev) for the developer workflow
-
-Common tasks:
-
-```bash
-task            # list tasks
-task build      # build ./bin/alertint
-task test       # go test -race ./...
-task lint       # go vet ./...
-task run        # build and run
-```
-
-## Layout
-
-```
-alertint-agent/
-├── cmd/alertint/              # binary entrypoint (serve, health, verify-audit, version)
-├── internal/
-│   ├── audit/                 # hash-chained audit log
-│   ├── config/                # YAML config loading + validation
-│   ├── correlator/            # fixed-window alert correlator
-│   ├── ingress/               # Alertmanager webhook receiver
-│   ├── llm/anthropic/         # Anthropic Messages API client
-│   ├── logging/               # slog baseline
-│   ├── mcp/                   # HTTP MCP server (:9912/mcp, started inside serve)
-│   ├── notify/                # Notifier interface; console, resolution, slack, stdout
-│   ├── prometheus/            # read-only Prometheus HTTP client (MCP tools)
-│   ├── rules/                 # open rule schema, RuleSource, engine (docs/rules-spec.md)
-│   └── store/                 # SQLite store (alerts, incidents, audit_log)
-├── packs/baseline/            # embedded baseline rule pack + prompt templates
-├── skills/acutetriage/        # acute-triage LLM skill
-├── docker/                    # Docker Compose local dev stack
-├── docs/                      # QUICKSTART, CONFIGURATION, ARCHITECTURE, LIMITS
-├── config.example.yaml
-├── Dockerfile
-├── go.mod
-└── Taskfile.yml
-```
+The [`/docs`](docs/) folder in this repo is the canonical source for those pages — the website renders it at build time. Documentation PRs are welcome here; see [`docs/README.md`](docs/README.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-[Functional Source License, Version 1.1, ALv2 Future License](LICENSE) (FSL-1.1-ALv2).
-
-Free for any internal use and self-hosting at any scale. Each release converts to
-Apache 2.0 two years after publication. The only restriction is offering the
-software to others as a competing commercial product or service. See
-[fsl.software](https://fsl.software) for details.
+[FSL-1.1-ALv2](LICENSE) (Functional Source License). Free to use, modify, and self-host at any scale. The only restriction is offering the software to others as a competing commercial product or service. Each release converts to Apache 2.0 two years after publication. See [fsl.software](https://fsl.software) for details.
