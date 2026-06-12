@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 // Command validate checks the docs tree against the conventions documented
 // in docs/README.md:
 //
