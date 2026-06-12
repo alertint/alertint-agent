@@ -8,8 +8,6 @@ slug: "faq"
 
 # FAQ
 
-Short answers for the decisions that matter before you install it.
-
 ## Do I have to host it myself?
 
 Yes — **AlertINT** is self-hosted. It runs as a single binary with local
