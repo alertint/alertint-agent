@@ -1,0 +1,39 @@
+name: Docs Deploy
+
+# Redeploys the docs site when docs content lands on main. PR-time validation
+# of docs/** is covered by the docs job in ci.yml; this workflow re-validates
+# as a guard before triggering the production rebuild.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: validate and deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.4"
+
+      - name: Validate docs
+        run: go run ./docs/scripts
+
+      - name: Trigger Vercel deploy
+        env:
+          DEPLOY_HOOK: ${{ secrets.VERCEL_DOCS_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$DEPLOY_HOOK" ]; then
+            echo "::error::VERCEL_DOCS_DEPLOY_HOOK secret is not set"
+            exit 1
+          fi
+          curl --fail --silent --show-error -X POST "$DEPLOY_HOOK"
