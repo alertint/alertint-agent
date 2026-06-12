@@ -8,7 +8,7 @@ slug: "prometheus"
 
 # Prometheus
 
-AlertINT integrates with the Prometheus ecosystem in two places:
+**AlertINT** integrates with the Prometheus ecosystem in two places:
 **Alertmanager** is the alert source — it forwards a webhook copy of every
 alert to the agent — and the optional **Prometheus connector** enriches
 LLM triage with live metric values at incident time and powers PromQL
@@ -47,7 +47,7 @@ Notes:
   `ALERTINT_WEBHOOK_TOKEN`). Prefer `credentials_file` over an inline
   credential so the token is not stored in `alertmanager.yml`.
 - `send_resolved: true` is required for resolution tracking — it lets
-  AlertINT close incidents and update Slack messages when alerts recover.
+  **AlertINT** close incidents and update Slack messages when alerts recover.
 - To keep your existing paging intact, add `alertint-agent` as a child
   route with `continue: true` instead of replacing your top-level
   receiver.
@@ -56,7 +56,7 @@ Notes:
 
 ### How it works
 
-When an incident is ready for analysis, AlertINT queries
+When an incident is ready for analysis, **AlertINT** queries
 `{instance="X"}` at the incident start time for each unique `instance`
 label in the alert group. Up to 10 non-system metric values per instance
 are appended to the LLM prompt as a *Live metrics* section. The model uses
@@ -94,7 +94,7 @@ MCP client:
 
 ### Example queries
 
-Ask your agent in natural language — AlertINT handles the PromQL via MCP:
+Ask your agent in natural language — **AlertINT** handles the PromQL via MCP:
 
 ```text
 Query CPU usage for instance api-1 right now.

@@ -8,7 +8,7 @@ slug: "configuration"
 
 # Configuration
 
-AlertINT runs from a single YAML file plus environment-based secrets.
+**AlertINT** runs from a single YAML file plus environment-based secrets.
 Start from `config.example.yaml` at the repo root.
 
 Secrets are **never** stored inline. Fields named `*_env` hold the

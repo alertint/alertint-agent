@@ -8,29 +8,25 @@ slug: "scope-and-limits"
 
 # Scope and limits
 
-These are deliberate boundaries, not missing features. Understanding where
-the agent does well — and where it doesn't — saves you from misconfigured
+**AlertINT** is deliberately focused. The boundaries below are design
+decisions, not gaps — knowing them up front saves you from misconfigured
 expectations.
 
 ## Design principles
 
-- **Read-only by design** — AlertINT observes and reports. It never
+- **Read-only by design** — **AlertINT** observes and reports. It never
   touches your infrastructure, so teams can adopt it without risk.
 - **Self-hosted and local** — your alert data and incident context stay on
   your machine.
 - **Open-core** — the core runtime is open source; enterprise features
   come later, on top.
 
-## What it does not do
+## Today's boundaries
 
-- No remediation, silences, or routing changes.
-- No Alertmanager, Kubernetes, or infrastructure writes.
-- No script or runbook execution.
-- No ticketing or paging integrations (PagerDuty, Jira, Linear).
-
-Remediation actions, if added in the future, will require explicit
-operator approval flows. This is a far-future direction, not something
-AlertINT does today.
+**AlertINT** triages — it doesn't act. It won't remediate, silence, or
+re-route alerts, run scripts or runbooks, or page ticketing systems for
+you. Several of these are natural future directions — remediation, if it
+lands, will be gated behind explicit operator approval flows.
 
 ## Known weaknesses
 
@@ -89,18 +85,19 @@ connected agent or operator must still choose useful queries.
 latency, and error rate around the incident window. Automatic query
 suggestions are on the roadmap.
 
-## Out of scope today
+## Where it's heading
 
-The following are out of scope today and tracked on the roadmap:
+The roadmap grows the same core rather than bolting on side products.
+Currently being explored:
 
 - Pattern / slow-burn rollups (repeated alerts over hours or days)
+- More LLM providers and more skills beyond acute triage
+- Cost metering and budget caps
 - Multi-tenancy and RBAC
-- Multiple LLM providers (only Anthropic today)
-- Multiple skill types (only acute triage today)
 - Pull-based Alertmanager reconciliation on startup
-- Alertmanager API control, silences, or routing changes
-- Kubernetes API integration
-- PagerDuty, Jira, Linear, or ticketing integrations
-- Cryptographic signing of audit rows (hash chain only today)
-- Cost metering and per-org budget caps
-- Web UI
+- A web UI
+
+Missing something you need?
+[Open a feature request](https://github.com/alertint/alertint-agent/issues)
+— real-world use cases shape what gets built next, and we'd love to hear
+yours.

@@ -8,26 +8,26 @@ slug: "slack"
 
 # Slack
 
-AlertINT posts structured Block Kit messages to Slack after every
+**AlertINT** posts structured Block Kit messages to Slack after every
 completed incident analysis. When alerts recover, the original message is
 updated in-place and a thread reply is posted — one message per incident,
 no channel noise.
 
 ## Setup — Slack app with bot token
 
-Bot tokens let AlertINT track the message it posted. When an incident
-fires, AlertINT posts a rich Block Kit message and records its position in
+Bot tokens let **AlertINT** track the message it posted. When an incident
+fires, **AlertINT** posts a rich Block Kit message and records its position in
 the channel. When all alerts recover, it updates that message in-place
 (🔴 → ✅, a duration field appears) and posts a short resolution note in
 the thread.
 
 1. **Create a Slack app.** Go to <https://api.slack.com/apps> and click
-   **Create New App → From scratch**. Name it *AlertINT* and select your
+   **Create New App → From scratch**. Name it **AlertINT** and select your
    workspace.
 
 2. **Add the `chat:write` scope.** In the left sidebar, click
    **OAuth & Permissions**, scroll to **Bot Token Scopes**, and add
-   `chat:write`. That is the only permission AlertINT needs.
+   `chat:write`. That is the only permission **AlertINT** needs.
 
 3. **Install to your workspace.** Scroll to the top of
    **OAuth & Permissions** and click **Install to Workspace → Allow**.

@@ -1,6 +1,6 @@
 ---
 title: "Architecture"
-description: "How alerts flow from Alertmanager through triage to findings and notifications."
+description: "One self-hosted binary sits between Alertmanager and your AI agent, and turns raw alerts into context worth investigating."
 section: "Concepts"
 order: 1
 slug: "architecture"
@@ -25,7 +25,7 @@ AI agent (Claude Code, …) ◀──MCP──▶ MCP server ──▶ Prometheu
 
 ### 1. Webhook transmission
 
-Alertmanager fires a POST to the AlertINT webhook receiver over HTTP(S).
+Alertmanager fires a POST to the **AlertINT** webhook receiver over HTTP(S).
 The payload is the standard Alertmanager webhook JSON — no custom format
 required.
 
@@ -53,7 +53,7 @@ re-evaluated as new alerts arrive.
 
 ### 4. AI synthesis
 
-Once an incident's window closes, AlertINT builds an evidence pack (shared
+Once an incident's window closes, **AlertINT** builds an evidence pack (shared
 labels, timeline, annotations — optionally enriched with live Prometheus
 metric values) and sends it to the configured LLM (Anthropic Claude). The
 model returns a structured finding: probable cause, severity assessment,
@@ -67,7 +67,7 @@ alongside the incident.
 ### 5. Outbound notification
 
 The finding is emitted as one JSON line on stdout and, when configured,
-posted to a Slack channel. When all alerts recover, AlertINT updates the
+posted to a Slack channel. When all alerts recover, **AlertINT** updates the
 original Slack message in-place (🔴 → ✅) and posts a short resolution
 note in the thread.
 
@@ -79,7 +79,7 @@ note in the thread.
 ### 6. Agent entry via MCP
 
 An engineer opens their MCP-capable AI client (Claude Code, Cursor,
-Windsurf, or any MCP-compatible tool) pointed at the AlertINT MCP server,
+Windsurf, or any MCP-compatible tool) pointed at the **AlertINT** MCP server,
 which runs as part of the same binary — no separate daemon.
 
 - **Transport:** Streamable HTTP, `http://host:9912/mcp`
@@ -87,7 +87,7 @@ which runs as part of the same binary — no separate daemon.
 
 ### 7. Evidence query
 
-The agent calls AlertINT MCP tools to list recent incidents, retrieve
+The agent calls **AlertINT** MCP tools to list recent incidents, retrieve
 alert payloads, evidence packs, and stored findings. All data is served
 from local state — no external calls at this stage.
 
@@ -97,7 +97,7 @@ from local state — no external calls at this stage.
 
 ### 8. Telemetry context
 
-The agent issues PromQL queries through AlertINT MCP tools. AlertINT
+The agent issues PromQL queries through **AlertINT** MCP tools. **AlertINT**
 proxies the query to the configured Prometheus instance and returns the
 result — CPU, memory, latency, error rate, or any metric stored in
 Prometheus, scoped to the incident time window.
@@ -110,13 +110,13 @@ Prometheus, scoped to the incident time window.
 The agent synthesizes alert payloads, the stored finding, and live metric
 context into a response. The engineer decides the next action — re-query,
 escalate, or begin remediation — with full context already in the
-conversation. AlertINT's role ends at providing context; the next step is
+conversation. **AlertINT**'s role ends at providing context; the next step is
 engineer-controlled.
 
 ## MCP-first investigation
 
 The MCP server is the primary way you and your agent interact with
-AlertINT — there is no web UI. Typical prompts:
+**AlertINT** — there is no web UI. Typical prompts:
 
 ```text
 List recent AlertINT incidents.

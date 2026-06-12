@@ -8,7 +8,7 @@ slug: "mcp-clients"
 
 # MCP clients
 
-AlertINT runs a persistent MCP Streamable HTTP server on port 9912,
+**AlertINT** runs a persistent MCP Streamable HTTP server on port 9912,
 started inside `alertint serve` when `mcp.enabled: true`. Any MCP-capable
 AI agent can connect to it and query incidents, evidence packs, and live
 metrics in natural language.
@@ -88,6 +88,6 @@ restart Windsurf and check **Settings → MCP Servers**:
 | `prometheus_query` | Instant PromQL query against the connected Prometheus (requires Prometheus enabled). |
 | `prometheus_query_range` | Range PromQL query with auto-stepped resolution (requires Prometheus enabled). |
 
-All tools read local AlertINT state; the Prometheus tools additionally
+All tools read local **AlertINT** state; the Prometheus tools additionally
 issue queries to the configured Prometheus instance — see
 [Prometheus](prometheus.md).

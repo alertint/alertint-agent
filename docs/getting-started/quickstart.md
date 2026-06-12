@@ -8,7 +8,7 @@ slug: "quickstart"
 
 # Quickstart
 
-This guide takes you from zero to a working setup: you'll get AlertINT
+This guide takes you from zero to a working setup: you'll get **AlertINT**
 running as a single self-hosted binary (or as a bundled Docker Compose
 stack), point Alertmanager at it, and connect your AI agent over the
 Model Context Protocol (MCP). At the end, your agent can analyze live
@@ -24,7 +24,7 @@ incidents with production context.
 
 ## Option A — Docker Compose
 
-The fastest first run. The bundled stack starts AlertINT together with
+The fastest first run. The bundled stack starts **AlertINT** together with
 Prometheus and Alertmanager, already wired together:
 
 ```bash
@@ -42,7 +42,7 @@ With the stack running, skip straight to
 
 ### 1. Install the binary
 
-AlertINT is distributed as a static Go binary with zero external
+**AlertINT** is distributed as a static Go binary with zero external
 dependencies:
 
 ```bash
@@ -131,7 +131,7 @@ for enabling live metric context.
 
 ### 5. Connect an MCP client
 
-AlertINT runs a persistent MCP HTTP server on port 9912 (enable it with
+**AlertINT** runs a persistent MCP HTTP server on port 9912 (enable it with
 `mcp.enabled: true` and set the `ALERTINT_MCP_TOKEN` env var). Open your
 preferred MCP-capable tool — Claude Code, Cursor, or Windsurf — and point
 it at the endpoint; copy-paste configs are in
