@@ -1,0 +1,26 @@
+rules:
+  # Mirrors the MVP correlator defaults: alerts sharing topology labels
+  # within the correlation window form one incident.
+  - id: baseline.group-by-topology
+    kind: grouping
+    description: Group alerts by alertname and cluster/namespace/service topology labels.
+    when:
+      sharing_labels: [cluster, namespace, service]
+    then:
+      action: group
+      group_by: [alertname, cluster, namespace, service]
+    updated: "2026-06-11"
+
+  # Keep environments apart: dev noise must never join a prod incident.
+  - id: baseline.split-environments
+    kind: grouping
+    description: Alerts from different env values never share an incident.
+    priority: 10
+    when:
+      all:
+        - label: env
+          op: exists
+    then:
+      action: group
+      group_by: [env]
+    updated: "2026-06-11"

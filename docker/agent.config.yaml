@@ -1,0 +1,46 @@
+alertmanager:
+  enabled: true
+  webhook_addr: "0.0.0.0:9911"
+  webhook_token_env: ALERTINT_WEBHOOK_TOKEN
+
+storage:
+  sqlite_path: /data/alertint-agent.db
+
+llm:
+  provider: anthropic
+  api_key_env: ANTHROPIC_API_KEY
+  model: claude-haiku-4-5-20251001
+
+correlator:
+  window_seconds: 90
+  min_alerts: 2
+  group_labels:
+    - cluster
+
+notify:
+  stdout: true
+  # To deliver findings to Slack: set enabled: true, put a bot token
+  # (xoxb-…, chat:write scope) in SLACK_BOT_TOKEN in your .env, and set
+  # your channel. The demo runs fine without Slack — findings go to stdout.
+  slack:
+    enabled: false
+    bot_token_env: SLACK_BOT_TOKEN
+    channel: "#alerts"
+
+# MCP HTTP server — AI coding agents (Claude Code, Cursor, Windsurf) connect
+# to this endpoint over the network.
+# Connect with: http://host:9912/mcp  (or localhost:9912/mcp for local Docker)
+mcp:
+  enabled: true
+  addr: "0.0.0.0:9912"
+  token_env: ALERTINT_MCP_TOKEN
+
+# Prometheus read connector — queries this for metric context during incident
+# investigation. Use push-synthetic-metrics.sh to populate test data.
+prometheus:
+  enabled: true
+  base_url: http://prometheus:9090
+  timeout_seconds: 10
+  default_range_minutes: 60
+
+log_level: info

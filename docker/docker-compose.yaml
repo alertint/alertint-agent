@@ -1,0 +1,92 @@
+services:
+
+  # ── Alertmanager ────────────────────────────────────────────────────────────
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: alertint-alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml.template:ro
+      - alertmanager-data:/alertmanager
+    environment:
+      ALERTINT_WEBHOOK_TOKEN: ${ALERTINT_WEBHOOK_TOKEN:?ALERTINT_WEBHOOK_TOKEN is required}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        printf '%s' "$$ALERTINT_WEBHOOK_TOKEN" > /tmp/alertint_token
+        exec /bin/alertmanager \
+          --config.file=/etc/alertmanager/alertmanager.yml.template \
+          --storage.path=/alertmanager \
+          --log.level=debug
+    depends_on:
+      agent:
+        condition: service_healthy
+
+  # ── AlertINT Agent ───────────────────────────────────────────────────────────
+  agent:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: alertint-agent
+    ports:
+      - "${ALERTINT_WEBHOOK_PORT:-9911}:${ALERTINT_WEBHOOK_PORT:-9911}"   # Alertmanager webhook receiver
+      - "${ALERTINT_MCP_PORT:-9912}:${ALERTINT_MCP_PORT:-9912}"           # MCP HTTP server (Claude Code, Cursor, Windsurf)
+    volumes:
+      - ./agent.config.yaml:/etc/alertint/config.yaml:ro
+      - agent-data:/data
+    environment:
+      ALERTINT_WEBHOOK_TOKEN: ${ALERTINT_WEBHOOK_TOKEN:?ALERTINT_WEBHOOK_TOKEN is required}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY is required}
+      ALERTINT_MCP_TOKEN: ${ALERTINT_MCP_TOKEN:?ALERTINT_MCP_TOKEN is required}
+      # Optional: only used when notify.slack.enabled is true in agent.config.yaml
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
+    command:
+      - "serve"
+      - "--config"
+      - "/etc/alertint/config.yaml"
+      - "--webhook-addr"
+      - "0.0.0.0:${ALERTINT_WEBHOOK_PORT:-9911}"
+      - "--mcp-addr"
+      - "0.0.0.0:${ALERTINT_MCP_PORT:-9912}"
+    healthcheck:
+      test: ["CMD", "/alertint", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── Prometheus ───────────────────────────────────────────────────────────────
+  # Scrapes pushgateway + itself. AlertINT agent reads metrics via MCP tools.
+  # Optional demo convenience: populate it with sample metrics via
+  # ./push-synthetic-metrics.sh
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: alertint-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=7d'
+    restart: unless-stopped
+
+  # ── Pushgateway ──────────────────────────────────────────────────────────────
+  # Local-demo convenience only: lets push-synthetic-metrics.sh seed sample
+  # metrics so the Prometheus MCP tools have something to query. Not required
+  # to run the agent against a real Prometheus.
+  pushgateway:
+    image: prom/pushgateway:v1.9.0
+    container_name: alertint-pushgateway
+    ports:
+      - "9091:9091"
+    restart: unless-stopped
+
+volumes:
+  agent-data:
+  alertmanager-data:
+  prometheus-data:

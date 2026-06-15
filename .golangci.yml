@@ -1,0 +1,45 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: all
+  disable:
+    # Pedantic style linters that don't affect correctness
+    - depguard
+    - exhaustruct
+    - godox
+    - varnamelen
+    - wrapcheck
+    - wsl
+    - wsl_v5
+    - nlreturn
+    - paralleltest
+    - testpackage
+    - funcorder
+    - gochecknoglobals
+    - tagliatelle      # JSON/YAML naming conventions - would change wire format
+    - cyclop           # Complexity - requires refactoring, not lint fixes
+    - ireturn          # Interface returns - design choice
+    - mnd              # Magic numbers - design choice
+    - goconst          # String literals - minor
+    - noinlineerr      # Style preference
+    - intrange         # Go 1.22+ syntax - optional modernization
+    - modernize        # Optional modernization
+    - funlen           # Function length limits - requires refactoring
+    - revive           # Style/consistency - too pedantic (unused-param, context-as-arg, comments)
+    - lll              # Line length limits - would require breaking long lines
+    - err113           # Dynamic errors - design choice to use fmt.Errorf for context
+    - gosec            # G304 file inclusion - we control config paths
+    - nonamedreturns   # Named returns are used intentionally in some functions
+    - perfsprint       # fmt.Errorf vs errors.New is a micro-optimization
+    - errorlint        # errors.Is() comparisons - would require significant refactoring
+    - nilerr           # MCP tool handlers intentionally return (result, nil) when err != nil — errors become tool result payloads, not transport errors
+    - gocognit         # runServe and Config.Validate are hub functions that are naturally dense; extracting helpers would obscure control flow
+    - maintidx         # same reason as gocognit — maintainability index penalises the top-level wiring function
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

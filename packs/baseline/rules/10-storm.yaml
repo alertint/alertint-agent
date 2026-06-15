@@ -1,0 +1,23 @@
+rules:
+  # Generic alert storm: many alerts across many services in a short
+  # window almost always share one upstream cause. Collapse them into a
+  # single incident-level finding and suppress individual paging.
+  - id: baseline.alert-storm-collapse
+    kind: correlation
+    description: Collapse alert storms (>=20 alerts across >=5 services within 5m) into one finding.
+    priority: 100
+    window: 5m
+    when:
+      min_alerts: 20
+      min_distinct:
+        label: service
+        count: 5
+    then:
+      action: collapse
+      suppress: true
+      analysis_template: storm
+      root_cause_hint: >-
+        Alert storm: a shared dependency (network, DNS, control plane, or
+        datastore) is the likely common cause; individual alerts are
+        symptoms.
+    updated: "2026-06-11"

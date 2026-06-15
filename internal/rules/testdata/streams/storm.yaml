@@ -1,0 +1,12 @@
+# 24 alerts across 24 distinct services within ~24s: storm.
+name: storm-collapse
+description: A burst across many services must collapse into one storm finding.
+alerts:
+  - labels: {alertname: HighErrorRate, cluster: prod, env: prod, service: svc}
+    annotations: {summary: "error rate above 5%"}
+    repeat: 24
+    spread: [service]
+expect:
+  rule_id: baseline.alert-storm-collapse
+  template: storm
+  suppress: true

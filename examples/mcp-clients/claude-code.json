@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "alertint": {
+      "type": "http",
+      "url": "http://localhost:9912/mcp",
+      "headers": {
+        "Authorization": "Bearer REPLACE_WITH_YOUR_ALERTINT_MCP_TOKEN"
+      }
+    }
+  }
+}

@@ -1,0 +1,51 @@
+alertmanager:
+  enabled: true
+  webhook_addr: "0.0.0.0:9911"
+  webhook_token_env: ALERTINT_WEBHOOK_TOKEN   # name of the env var holding the bearer token
+
+storage:
+  sqlite_path: ./alertint-agent.db
+
+llm:
+  provider: anthropic
+  api_key_env: ANTHROPIC_API_KEY              # name of the env var holding the Anthropic key
+  model: claude-haiku-4-5-20251001
+
+correlator:
+  window_seconds: 90       # group alerts arriving within this window
+  min_alerts: 1            # minimum alerts to form an incident (1 = single-alert triage)
+  group_labels:
+    - alertname
+    - cluster
+    - namespace
+    - service
+
+notify:
+  stdout: true             # always emit one JSON line per finding to stdout
+  slack:
+    enabled: false
+    bot_token_env: SLACK_BOT_TOKEN   # xoxb- bot token (requires chat:write scope)
+    channel: "#alerts"               # channel name or ID
+
+# MCP HTTP server — AI coding agents connect to http://host:9912/mcp
+# Set ALERTINT_MCP_TOKEN to a long random secret before enabling.
+mcp:
+  enabled: false
+  addr: "0.0.0.0:9912"
+  token_env: ALERTINT_MCP_TOKEN
+
+# Rule packs — the embedded baseline pack always loads; point local_pack_dir
+# at a directory (pack.yaml + rules/*.yaml + templates/*.md) to add or
+# override rules. See docs/rules-spec.md and examples/rules/.
+rules:
+  # local_pack_dir: ./my-rules
+
+# Prometheus read connector — MCP tools can run PromQL queries for metric context.
+prometheus:
+  enabled: false
+  base_url: http://localhost:9090
+  # bearer_token_env: PROMETHEUS_BEARER_TOKEN  # only if Prometheus requires auth
+  timeout_seconds: 10
+  default_range_minutes: 60
+
+log_level: info            # debug | info | warn | error

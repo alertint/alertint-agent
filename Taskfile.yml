@@ -1,0 +1,121 @@
+version: "3"
+
+vars:
+  BIN_DIR: ./bin
+  BIN_NAME: alertint
+  PKG: ./...
+  VERSION:
+    sh: git describe --tags --always --dirty 2>/dev/null || echo dev
+  LDFLAGS: -s -w -X main.version={{.VERSION}}
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+
+  build:
+    desc: Build the alertint binary into ./bin
+    cmds:
+      - mkdir -p {{.BIN_DIR}}
+      - go build -trimpath -ldflags "{{.LDFLAGS}}" -o {{.BIN_DIR}}/{{.BIN_NAME}} ./cmd/alertint
+    sources:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+    generates:
+      - "{{.BIN_DIR}}/{{.BIN_NAME}}"
+
+  test:
+    desc: Run unit tests
+    cmds:
+      - go test -race -count=1 {{.PKG}}
+
+  lint:
+    desc: Run go vet (golangci-lint added in CI separately)
+    cmds:
+      - go vet {{.PKG}}
+
+  run:
+    desc: Run the agent via Docker Compose (foreground)
+    cmds:
+      - docker compose -f docker/docker-compose.yaml --env-file .env up
+
+  docker:build:
+    desc: Build all Docker containers (alertint-agent and alertmanager)
+    cmds:
+      - docker compose -f docker/docker-compose.yaml --env-file .env build --no-cache
+
+  docker:up:
+    desc: Start all Docker containers in detached mode
+    cmds:
+      - docker compose -f docker/docker-compose.yaml --env-file .env up -d
+
+  docker:down:
+    desc: Stop and remove all Docker containers and volumes (clean state)
+    cmds:
+      - docker compose -f docker/docker-compose.yaml --env-file .env down -v
+
+  docker:stop:
+    desc: Stop all Docker containers (alias for docker:down)
+    cmds:
+      - task: docker:down
+
+  docker:restart:
+    desc: Restart all Docker containers (down + up in detached mode)
+    cmds:
+      - task: docker:down
+      - task: docker:up
+
+  verify-audit:
+    desc: 'Verify the hash chain of the live audit log. Pass DB or CONFIG, e.g. `task verify-audit DB=./alertint-agent.db`'
+    deps: [build]
+    vars:
+      DB: '{{.DB | default ""}}'
+      CONFIG: '{{.CONFIG | default ""}}'
+    cmds:
+      - |
+        args=""
+        if [ -n "{{.DB}}" ]; then args="$args --db {{.DB}}"; fi
+        if [ -n "{{.CONFIG}}" ]; then args="$args --config {{.CONFIG}}"; fi
+        if [ -z "$args" ]; then
+          echo "Usage: task verify-audit DB=./alertint-agent.db" >&2
+          echo "   or: task verify-audit CONFIG=./config.yaml" >&2
+          exit 64
+        fi
+        {{.BIN_DIR}}/{{.BIN_NAME}} verify-audit $args
+
+  alerts:fire:
+    desc: Fire a burst of fake alerts at the local agent
+    dir: ../fake_alert_generator
+    cmds:
+      - python3 fake_alert_generator.py --config configs/LOCAL_AGENT.txt scenario burst
+
+  alerts:resolve:
+    desc: Resolve all fake alerts on the local agent
+    dir: ../fake_alert_generator
+    cmds:
+      - python3 fake_alert_generator.py --config configs/LOCAL_AGENT.txt resolve-all
+
+  alerts:purge:
+    desc: Purge local fake alert tracking state (clean slate for testing)
+    dir: ../fake_alert_generator
+    cmds:
+      - echo "Removing fake alert tracking state..."
+      - rm -f .alertint_fake_alert_state.json
+      - echo "✓ Tracking state purged. Fresh alerts can now be generated."
+
+  docs:validate:
+    desc: Validate docs frontmatter, slugs, and sections against docs/meta.yaml
+    cmds:
+      - go run ./docs/scripts
+
+  tidy:
+    desc: Run go mod tidy
+    cmds:
+      - go mod tidy
+
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - rm -rf {{.BIN_DIR}}
