@@ -43,4 +43,44 @@ prometheus:
   timeout_seconds: 10
   default_range_minutes: 60
 
+# Log enrichment (Loki) — pulls recent log lines at triage time and powers the
+# read-only loki_query_range MCP tool. Seed the demo Loki with fake lines:
+#   task logs:push:local   (local)   /   task logs:push:cloud   (Grafana Cloud)
+logs:
+  enabled: true
+  provider: loki
+  timeout_seconds: 10
+  default_range_minutes: 15
+  max_lines: 50
+  loki:
+    base_url: http://loki:3100
+    auth:
+      mode: none
+    # The demo's Loki streams are labelled `app` (not `service`) and `instance`.
+    # Map the alert label `service` -> stream label `app`; drop `instance` (no
+    # stream-label equivalent is needed — there's one instance per app here).
+    # Example: the worker incident's selector {service="worker"} becomes the
+    # LogQL matcher {app="worker"}.
+    label_map:
+      service: app
+      instance: ""
+    # line_filter is omitted, so the error-biased default applies:
+    #   |~ "(?i)(error|warn|fatal|panic|fail)"
+
+  # ── Grafana Cloud Logs variant ──────────────────────────────────────────────
+  # To read from Grafana Cloud instead of the local Loki: comment out the `loki:`
+  # block above, uncomment this one, set GRAFANA_CLOUD_LOKI_TOKEN in .env, and
+  # seed cloud with `task logs:push:cloud`. Get base_url + username from the
+  # Grafana Cloud Portal → your stack → Loki → "Send Logs" (see
+  # docs/integrations/loki.md). The values below are placeholders.
+  # loki:
+  #   base_url: https://logs-prod-006.grafana.net   # your Grafana Cloud Logs URL
+  #   auth:
+  #     mode: basic
+  #     username: "123456"                          # your numeric instance/user ID
+  #     password_env: GRAFANA_CLOUD_LOKI_TOKEN      # access-policy token (logs:read)
+  #   label_map:
+  #     service: app
+  #     instance: ""
+
 log_level: info

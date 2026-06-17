@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/audit"
+	"github.com/alertint/alertint-agent/internal/logs"
 	"github.com/alertint/alertint-agent/internal/notify"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/rules"
@@ -37,6 +38,12 @@ type Config struct {
 	// (storm / single_alert / correlated) and can short-circuit the LLM
 	// for known-issue rules. nil = built-in correlated prompt only.
 	Rules *rules.Engine
+	// LogSource is an optional read-only log backend used to enrich the LLM
+	// prompt with recent log lines at incident time. nil = no log enrichment.
+	LogSource logs.Source
+	// LogParams carries the generic enrichment tunables (window, timeout, line
+	// limit) from the logs config section.
+	LogParams LogParams
 }
 
 // Skill orchestrates the full acute-triage pipeline for a single ready
@@ -138,8 +145,9 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 	}
 
 	// 5. Produce the analysis: from the matched rule (short-circuit) or
-	// from the LLM with the pack-selected system prompt.
-	raw, err := s.analysis(ctx, inc, alerts, decision, pack, packJSON)
+	// from the LLM with the pack-selected system prompt. enrichment is the
+	// log snapshot the LLM saw (nil on the short-circuit path).
+	raw, enrichment, err := s.analysis(ctx, inc, alerts, decision, pack, packJSON)
 	if err != nil {
 		return err
 	}
@@ -151,12 +159,15 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 	}
 	clampConfidence(&resp.Confidence)
 
-	// 6. Persist output.
+	// 6. Persist output, including the log-enrichment snapshot so the evidence
+	// pack can replay exactly what the model saw (empty on the short-circuit /
+	// logs-disabled path → stored NULL).
 	outputJSON := string(raw)
+	enrichmentJSON := marshalEnrichment(enrichment, s.logger, inc.ID)
 	if err := s.st.SaveIncidentOutput(ctx,
 		inc.ID, outputJSON,
 		resp.AnalysisName, resp.OverallIssue,
-		resp.Confidence,
+		resp.Confidence, enrichmentJSON,
 	); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			s.logger.Warn("acutetriage: incident no longer in ready/processing state", "incident_id", inc.ID)
@@ -223,6 +234,18 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 		})
 	}
 
+	// 10. Audit: enrichment digest (when logs were attempted). A digest only —
+	// source, query, and line count — never the log text, so the hash-chained
+	// payload stays small.
+	if s.auditor != nil && enrichment != nil {
+		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.enriched", map[string]any{
+			"incident_id": inc.ID,
+			"source":      enrichment.Source,
+			"query":       enrichment.Query,
+			"line_count":  len(enrichment.Lines),
+		})
+	}
+
 	s.logger.Info("acutetriage: done",
 		"incident_id", inc.ID,
 		"analysis_name", resp.AnalysisName,
@@ -233,12 +256,14 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 
 // analysis produces the raw finding JSON, either synthesized from a
 // matched known-issue rule (short-circuit, no LLM call) or from the LLM
-// with the pack-selected system prompt.
-func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store.Alert, decision rules.Decision, pack EvidencePack, packJSON []byte) (json.RawMessage, error) {
+// with the pack-selected system prompt. On the LLM path it also returns the
+// log-enrichment snapshot (nil on the short-circuit path) so the caller can
+// persist exactly what the model saw.
+func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store.Alert, decision rules.Decision, pack EvidencePack, packJSON []byte) (json.RawMessage, *LogEnrichment, error) {
 	if decision.ShortCircuit {
 		raw, err := shortCircuitResponse(decision, alerts)
 		if err != nil {
-			return nil, fmt.Errorf("acutetriage: short-circuit response: %w", err)
+			return nil, nil, fmt.Errorf("acutetriage: short-circuit response: %w", err)
 		}
 		if s.auditor != nil {
 			_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.short_circuited", map[string]any{
@@ -246,11 +271,14 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 				"rule_id":     decision.Rule.ID,
 			})
 		}
-		return raw, nil
+		return raw, nil, nil
 	}
 
 	metrics := FetchMetrics(ctx, s.cfg.Prometheus, alerts, inc.FirstAlertAt)
-	userPrompt := UserPrompt(pack, string(packJSON), metrics)
+	// Best-effort log enrichment: never blocks or fails triage. end=now so a
+	// still-firing incident captures the freshest lines around analysis time.
+	enrichment := FetchLogs(ctx, s.cfg.LogSource, s.cfg.LogParams, alerts, inc.FirstAlertAt, time.Now().UTC(), s.logger)
+	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment)
 	raw, err := s.llm.Complete(ctx, s.systemPrompt(decision, len(alerts)), userPrompt, RequiredKeys)
 	if err != nil {
 		s.logger.Error("acutetriage: llm failed", "incident_id", inc.ID, "err", err)
@@ -260,9 +288,9 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 				"error":       err.Error(),
 			})
 		}
-		return nil, fmt.Errorf("acutetriage: llm: %w", err)
+		return nil, enrichment, fmt.Errorf("acutetriage: llm: %w", err)
 	}
-	return raw, nil
+	return raw, enrichment, nil
 }
 
 // systemPrompt picks the analysis prompt: the rule-selected template when
@@ -311,6 +339,22 @@ func shortCircuitResponse(d rules.Decision, alerts []store.Alert) (json.RawMessa
 		out.Alerts = append(out.Alerts, alertOutput{AlertID: a.ID, RoleInIncident: "correlated"})
 	}
 	return json.Marshal(out)
+}
+
+// marshalEnrichment serializes the log-enrichment snapshot for persistence.
+// Returns "" when there is nothing to persist (logs disabled / short-circuit)
+// or on a marshal error — both store SQL NULL, so the evidence pack omits the
+// logs section. A marshal failure is logged but never blocks triage.
+func marshalEnrichment(e *LogEnrichment, logger *slog.Logger, incidentID string) string {
+	if e == nil {
+		return ""
+	}
+	b, err := json.Marshal(e)
+	if err != nil {
+		logger.Warn("acutetriage: marshal log enrichment failed", "incident_id", incidentID, "err", err)
+		return ""
+	}
+	return string(b)
 }
 
 func clampConfidence(c *float64) {

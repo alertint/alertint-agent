@@ -35,6 +35,8 @@ import (
 	"github.com/alertint/alertint-agent/internal/ingress"
 	llmanthropic "github.com/alertint/alertint-agent/internal/llm/anthropic"
 	"github.com/alertint/alertint-agent/internal/logging"
+	"github.com/alertint/alertint-agent/internal/logs"
+	"github.com/alertint/alertint-agent/internal/logs/loki"
 	internalmcp "github.com/alertint/alertint-agent/internal/mcp"
 	"github.com/alertint/alertint-agent/internal/notify"
 	notifyconsole "github.com/alertint/alertint-agent/internal/notify/console"
@@ -181,12 +183,50 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		logger.Info("prometheus connector enabled", slog.String("base_url", cfg.Prometheus.BaseURL))
 	}
 
+	// Build the log source when enabled. The provider switch lives here in
+	// package main (not internal/logs) to avoid an internal/logs ↔
+	// internal/logs/loki import cycle. Passed into both the triage skill (prompt
+	// enrichment) and the MCP server (native-query passthrough). Unknown
+	// provider fails loud at startup.
+	var logSrc logs.Source
+	if cfg.Logs.Enabled {
+		lokiSecret, err := cfg.LokiAuthSecret()
+		if err != nil {
+			return err
+		}
+		switch cfg.Logs.Provider {
+		case "loki":
+			logSrc = loki.NewClient(loki.Config{
+				BaseURL:        cfg.Logs.Loki.BaseURL,
+				AuthMode:       cfg.Logs.Loki.Auth.Mode,
+				Username:       cfg.Logs.Loki.Auth.Username,
+				Secret:         lokiSecret,
+				OrgID:          cfg.Logs.Loki.OrgID,
+				LineFilter:     cfg.Logs.Loki.LineFilter,
+				LabelMap:       cfg.Logs.Loki.LabelMap,
+				TimeoutSeconds: cfg.Logs.TimeoutSeconds,
+			})
+		default:
+			return fmt.Errorf("logs: unknown provider %q", cfg.Logs.Provider)
+		}
+		logger.Info("logs connector enabled",
+			slog.String("provider", cfg.Logs.Provider),
+			slog.String("base_url", cfg.Logs.Loki.BaseURL),
+		)
+	}
+
 	skill := acutetriage.New(
 		acutetriage.Config{
 			WindowSeconds: cfg.Correlator.WindowSeconds,
 			MinAlerts:     cfg.Correlator.MinAlerts,
 			Prometheus:    prom,
 			Rules:         ruleEngine,
+			LogSource:     logSrc,
+			LogParams: acutetriage.LogParams{
+				DefaultRangeMinutes: cfg.Logs.DefaultRangeMinutes,
+				TimeoutSeconds:      cfg.Logs.TimeoutSeconds,
+				MaxLines:            cfg.Logs.MaxLines,
+			},
 		},
 		st, llmClient, auditor, notifier, logger,
 	)
@@ -209,7 +249,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	// while one is failing — at startup a co-deployed dependency may still
 	// be booting — then at a steady pace, logging losses and recoveries.
 	// Results are cached for GET /health.
-	healthReg := buildHealthChecks(cfg, prom)
+	healthReg := buildHealthChecks(cfg, prom, logSrc)
 	go healthReg.Watch(ctx, logger)
 
 	webhookSrv, webhookErrCh, err := startWebhook(cfg, st, auditor, cor, healthReg, logger)
@@ -217,7 +257,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		return err
 	}
 
-	mcpHTTPSrv, mcpErrCh, err := startMCP(cfg, st, auditor, prom, logger)
+	mcpHTTPSrv, mcpErrCh, err := startMCP(cfg, st, auditor, prom, logSrc, logger)
 	if err != nil {
 		return err
 	}
@@ -304,7 +344,7 @@ func startWebhook(cfg *config.Config, st *store.Store, auditor *audit.Auditor, c
 // startMCP starts the MCP HTTP server when enabled. MCP clients connect by
 // URL (e.g. http://host:9912/mcp) — no subprocess or shared file needed.
 // Returns (nil, nil, nil) when disabled.
-func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom *promclient.Client, logger *slog.Logger) (*http.Server, <-chan error, error) {
+func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom *promclient.Client, logSrc logs.Source, logger *slog.Logger) (*http.Server, <-chan error, error) {
 	if !cfg.MCP.Enabled {
 		return nil, nil, nil
 	}
@@ -313,9 +353,11 @@ func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom 
 		return nil, nil, err
 	}
 	mcpSrv := internalmcp.NewServer(internalmcp.Config{
-		Token:         mcpToken,
-		WindowSeconds: cfg.Correlator.WindowSeconds,
-		Prometheus:    prom,
+		Token:                   mcpToken,
+		WindowSeconds:           cfg.Correlator.WindowSeconds,
+		Prometheus:              prom,
+		Logs:                    logSrc,
+		LogsDefaultRangeMinutes: cfg.Logs.DefaultRangeMinutes,
 	}, st, auditor)
 	srv := &http.Server{
 		Addr:    cfg.MCP.Addr,
@@ -428,7 +470,7 @@ func resolveDBPath(cfgPath, dbPathFlag string) (string, error) {
 
 // buildHealthChecks assembles connectivity probes for every enabled
 // integration. Returns nil (a no-op registry) when nothing is enabled.
-func buildHealthChecks(cfg *config.Config, prom *promclient.Client) *health.Registry {
+func buildHealthChecks(cfg *config.Config, prom *promclient.Client, logSrc logs.Source) *health.Registry {
 	var checks []health.Check
 	if cfg.Prometheus.Enabled && prom != nil {
 		checks = append(checks, health.Check{
@@ -438,6 +480,20 @@ func buildHealthChecks(cfg *config.Config, prom *promclient.Client) *health.Regi
 				// A trivial instant query proves the API is reachable,
 				// authorized, and serving query results.
 				_, err := prom.QueryInstant(ctx, "vector(1)", time.Now())
+				return err
+			},
+		})
+	}
+	if cfg.Logs.Enabled && logSrc != nil {
+		checks = append(checks, health.Check{
+			Name:   logSrc.Name(),
+			Detail: cfg.Logs.Loki.BaseURL,
+			Probe: func(ctx context.Context) error {
+				// A trivial metric LogQL range query proves the API is
+				// reachable, authorized, and serving — without needing any
+				// stream-label knowledge.
+				now := time.Now()
+				_, err := logSrc.QueryRange(ctx, "vector(1)", now.Add(-time.Minute), now, 1, "backward")
 				return err
 			},
 		})

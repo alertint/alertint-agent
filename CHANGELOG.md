@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Loki log-enrichment connector** — optional read-only Loki/Grafana-Cloud-Logs client.
+  At triage time it enriches the LLM prompt with the most relevant recent log lines
+  (error-biased filtered query, with one unfiltered fallback), translating the incident's
+  shared alert labels into LogQL via a configurable `label_map`. The exact lines the model
+  saw are persisted with the finding and replayed by `alertint_get_evidence_pack`.
+- **`loki_query_range` MCP tool** — read-only native-LogQL range query, registered when the
+  Loki connector is enabled, so an investigating agent can drill into logs over MCP.
+- **Demo log stack** — bundled Loki service in the Docker Compose dev stack plus
+  `docker/push-synthetic-logs.py` (`task logs:push:local` / `task logs:push:cloud`) to seed
+  fake multi-level log lines for local Loki or Grafana Cloud.
+
 ## [0.1.0] - 2026-06-10
 
 ### Added

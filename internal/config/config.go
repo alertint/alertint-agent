@@ -38,6 +38,7 @@ type Config struct {
 	Notify       NotifyConfig       `yaml:"notify"`
 	MCP          MCPConfig          `yaml:"mcp"`
 	Prometheus   PrometheusConfig   `yaml:"prometheus"`
+	Logs         LogsConfig         `yaml:"logs,omitempty"`
 	Rules        RulesConfig        `yaml:"rules"`
 	LogLevel     string             `yaml:"log_level"`
 }
@@ -59,6 +60,40 @@ type PrometheusConfig struct {
 	BearerTokenEnv      string `yaml:"bearer_token_env,omitempty"`
 	TimeoutSeconds      int    `yaml:"timeout_seconds"`
 	DefaultRangeMinutes int    `yaml:"default_range_minutes"`
+}
+
+// LogsConfig configures the optional log-enrichment connector. When enabled,
+// the acute-triage skill pulls recent log lines into the triage prompt and the
+// MCP server exposes a native-query passthrough tool. Generic enrichment knobs
+// live at the top; provider connection details nest under the named provider
+// (only loki in v1). Read-only: the connector never writes logs.
+type LogsConfig struct {
+	Enabled             bool       `yaml:"enabled"`
+	Provider            string     `yaml:"provider"`              // only "loki" in v1
+	TimeoutSeconds      int        `yaml:"timeout_seconds"`       // TOTAL budget for the whole fetch (filtered + fallback share it)
+	DefaultRangeMinutes int        `yaml:"default_range_minutes"` // window before the first alert
+	MaxLines            int        `yaml:"max_lines"`             // backend query limit
+	Loki                LokiConfig `yaml:"loki,omitempty"`
+}
+
+// LokiConfig holds Loki/Grafana-Cloud connection details. The provider owns all
+// translation of the generic selector into LogQL via LabelMap and LineFilter.
+type LokiConfig struct {
+	BaseURL    string            `yaml:"base_url"`
+	Auth       LokiAuthConfig    `yaml:"auth,omitempty"`
+	OrgID      string            `yaml:"org_id,omitempty"`      // optional X-Scope-OrgID (self-hosted multi-tenant only)
+	LineFilter string            `yaml:"line_filter,omitempty"` // default error-biased; "" disables filtering
+	LabelMap   map[string]string `yaml:"label_map,omitempty"`   // alert-label key → stream-label key ("" = drop)
+}
+
+// LokiAuthConfig selects the Loki auth mode and names the env vars holding any
+// secrets. Secrets are never inline; username (basic mode) is an account
+// identifier, not a secret, so it is read inline.
+type LokiAuthConfig struct {
+	Mode        string `yaml:"mode"`                   // none | bearer | basic (default none)
+	TokenEnv    string `yaml:"token_env,omitempty"`    // bearer mode: env var holding the token
+	Username    string `yaml:"username,omitempty"`     // basic mode: user/instance ID (not a secret)
+	PasswordEnv string `yaml:"password_env,omitempty"` // basic mode: env var holding the token/password
 }
 
 // MCPConfig configures the HTTP MCP server exposed by alertint serve.
@@ -146,6 +181,19 @@ func Defaults() Config {
 			TimeoutSeconds:      10,
 			DefaultRangeMinutes: 60,
 		},
+		Logs: LogsConfig{
+			TimeoutSeconds:      10,
+			DefaultRangeMinutes: 15,
+			MaxLines:            50,
+			Loki: LokiConfig{
+				Auth: LokiAuthConfig{Mode: "none"},
+				// Error-biased default: operators who omit line_filter get this;
+				// setting line_filter: "" explicitly disables filtering. Because
+				// the default lives here, that distinction survives the YAML merge
+				// (an explicit "" overwrites; an omission keeps this value).
+				LineFilter: `|~ "(?i)(error|warn|fatal|panic|fail)"`,
+			},
+		},
 		LogLevel: "info",
 	}
 }
@@ -190,6 +238,7 @@ func (c *Config) Validate() error {
 	errs = append(errs, c.validateCorrelator()...)
 	errs = append(errs, c.validateNotify()...)
 	errs = append(errs, c.validatePrometheus()...)
+	errs = append(errs, c.validateLogs()...)
 	errs = append(errs, c.validateRules()...)
 
 	if !validLogLevel(c.LogLevel) {
@@ -310,6 +359,63 @@ func (c *Config) validatePrometheus() []string {
 	return errs
 }
 
+func (c *Config) validateLogs() []string {
+	if !c.Logs.Enabled {
+		return nil
+	}
+	var errs []string
+	switch c.Logs.Provider {
+	case "loki":
+		// ok
+	case "":
+		errs = append(errs, "logs.provider is required when logs is enabled")
+	default:
+		errs = append(errs, fmt.Sprintf("logs.provider: unknown provider %q (only \"loki\" in v1)", c.Logs.Provider))
+	}
+	if c.Logs.TimeoutSeconds <= 0 {
+		errs = append(errs, "logs.timeout_seconds must be > 0")
+	}
+	if c.Logs.DefaultRangeMinutes <= 0 {
+		errs = append(errs, "logs.default_range_minutes must be > 0")
+	}
+	if c.Logs.MaxLines <= 0 {
+		errs = append(errs, "logs.max_lines must be > 0")
+	}
+	if c.Logs.Provider == "loki" {
+		errs = append(errs, c.validateLoki()...)
+	}
+	return errs
+}
+
+func (c *Config) validateLoki() []string {
+	var errs []string
+	if strings.TrimSpace(c.Logs.Loki.BaseURL) == "" {
+		errs = append(errs, "logs.loki.base_url is required when logs provider is loki")
+	}
+	mode := c.Logs.Loki.Auth.Mode
+	if mode == "" {
+		mode = "none"
+	}
+	switch mode {
+	case "none":
+		// no secret fields required
+	case "bearer":
+		if strings.TrimSpace(c.Logs.Loki.Auth.TokenEnv) == "" {
+			errs = append(errs, "logs.loki.auth.token_env is required when auth mode is bearer")
+		}
+	case "basic":
+		if strings.TrimSpace(c.Logs.Loki.Auth.Username) == "" {
+			errs = append(errs, "logs.loki.auth.username is required when auth mode is basic")
+		}
+		if strings.TrimSpace(c.Logs.Loki.Auth.PasswordEnv) == "" {
+			errs = append(errs, "logs.loki.auth.password_env is required when auth mode is basic")
+		}
+	default:
+		errs = append(errs, fmt.Sprintf("logs.loki.auth.mode %q must be one of none, bearer, basic", mode))
+	}
+	return errs
+}
+
 func (c *Config) validateRules() []string {
 	dir := strings.TrimSpace(c.Rules.LocalPackDir)
 	if dir == "" {
@@ -361,6 +467,31 @@ func (c *Config) PrometheusToken() (string, error) {
 		return "", nil
 	}
 	return requireEnv(c.Prometheus.BearerTokenEnv, "prometheus.bearer_token_env")
+}
+
+// LokiAuthSecret resolves the secret needed for the configured Loki auth mode,
+// mirroring PrometheusToken. It reads no secret for none mode, the bearer token
+// for bearer mode, and the password for basic mode — each loud if the named env
+// var is unset. The basic-mode username is an account identifier, not a secret,
+// and is read inline from config (not here).
+//
+//	none   → ("", nil)
+//	bearer → resolve token_env
+//	basic  → resolve password_env
+func (c *Config) LokiAuthSecret() (string, error) {
+	if !c.Logs.Enabled {
+		return "", nil
+	}
+	switch c.Logs.Loki.Auth.Mode {
+	case "", "none":
+		return "", nil
+	case "bearer":
+		return requireEnv(c.Logs.Loki.Auth.TokenEnv, "logs.loki.auth.token_env")
+	case "basic":
+		return requireEnv(c.Logs.Loki.Auth.PasswordEnv, "logs.loki.auth.password_env")
+	default:
+		return "", fmt.Errorf("logs.loki.auth.mode %q is not supported", c.Logs.Loki.Auth.Mode)
+	}
 }
 
 // SlackBotToken returns the Slack bot token when Slack is enabled,
