@@ -42,7 +42,12 @@ Rules:
 - role_in_incident should be one of: primary, downstream, correlated, noise.
 - If you cannot determine a role, use "unknown".
 - If a "Live metrics" section is present, use those values to calibrate severity and
-  confidence — actual metric values take precedence over numeric claims in annotations.`
+  confidence — actual metric values take precedence over numeric claims in annotations.
+- If a "Recent logs" section has lines, use them to identify the concrete error at
+  incident time — quoted log lines are stronger evidence than annotation text, and the
+  lines are listed most-recent-first. If that section instead says the backend returned
+  no lines or failed, treat it as a gap in evidence — do NOT infer the service is healthy
+  from absent logs.`
 
 // RequiredKeys lists the top-level keys that must be present in a valid
 // LLM response. Passed to llm.Client.Complete for structural validation.
@@ -110,8 +115,10 @@ func BuildEvidencePack(inc store.Incident, alerts []store.Alert, windowSeconds i
 }
 
 // UserPrompt renders the evidence pack into the user-turn message sent to the
-// LLM. metrics is optional — pass nil when Prometheus is not available.
-func UserPrompt(pack EvidencePack, packJSON string, metrics []MetricSnapshot) string {
+// LLM. metrics is optional — pass nil when Prometheus is not available. logs is
+// optional — pass nil when no log source is configured; when non-nil it always
+// renders a "Recent logs" section (lines, or a note explaining their absence).
+func UserPrompt(pack EvidencePack, packJSON string, metrics []MetricSnapshot, logs *LogEnrichment) string {
 	var b strings.Builder
 	fmt.Fprintf(&b,
 		"Analyze the following correlated incident.\n\nEvidence:\n%s\n\nShared labels: %s\nAlert count: %d\nWindow: %ds",
@@ -126,8 +133,37 @@ func UserPrompt(pack EvidencePack, packJSON string, metrics []MetricSnapshot) st
 			fmt.Fprintf(&b, "\n  %s{instance=%q} = %s", m.Metric, m.Instance, m.Value)
 		}
 	}
+	renderLogs(&b, logs)
 	b.WriteString("\n\nRespond with JSON only.")
 	return b.String()
+}
+
+// renderLogs appends the "Recent logs" section. When the enrichment carries
+// lines they render newest-first; when it is empty (queried-empty / timeout /
+// error / no-selector) the note renders instead — so the operator and the LLM
+// both see that logs were attempted. The section is omitted only when logs are
+// not configured (enrichment is nil).
+func renderLogs(b *strings.Builder, e *LogEnrichment) {
+	if e == nil {
+		return
+	}
+	if len(e.Lines) > 0 {
+		fmt.Fprintf(b, "\n\nRecent logs (%s, most recent first, around incident time):", e.Source)
+		for _, ln := range e.Lines {
+			fmt.Fprintf(b, "\n  %s  %s", ln.Timestamp.UTC().Format(time.RFC3339), ln.Line)
+		}
+		return
+	}
+	note := e.Note
+	if note == "" {
+		note = "no log lines available"
+	}
+	fmt.Fprintf(b, "\n\nRecent logs (%s): %s", e.Source, note)
+	if e.Query != "" {
+		fmt.Fprintf(b, "\n  (query: %s). Treat this as missing evidence, not as \"no errors\".", e.Query)
+	} else {
+		b.WriteString("\n  Treat this as missing evidence, not as \"no errors\".")
+	}
 }
 
 // sharedLabels returns labels whose key AND value are identical across all

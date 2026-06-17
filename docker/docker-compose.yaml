@@ -41,6 +41,8 @@ services:
       ALERTINT_MCP_TOKEN: ${ALERTINT_MCP_TOKEN:?ALERTINT_MCP_TOKEN is required}
       # Optional: only used when notify.slack.enabled is true in agent.config.yaml
       SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
+      # Optional: only used when logs.loki points at Grafana Cloud (basic auth)
+      GRAFANA_CLOUD_LOKI_TOKEN: ${GRAFANA_CLOUD_LOKI_TOKEN:-}
     command:
       - "serve"
       - "--config"
@@ -86,7 +88,24 @@ services:
       - "9091:9091"
     restart: unless-stopped
 
+  # ── Loki ─────────────────────────────────────────────────────────────────────
+  # Single-binary, filesystem-backed Loki for the log-enrichment demo. The image's
+  # default local-config runs with auth_enabled: false, so pushes and queries need
+  # no token. AlertINT reads it via the log connector (logs.loki in
+  # agent.config.yaml) and exposes the read-only loki_query_range MCP tool.
+  # Seed it with fake multi-level lines: task logs:push:local
+  loki:
+    image: grafana/loki:3.0.0
+    container_name: alertint-loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - loki-data:/loki
+    restart: unless-stopped
+
 volumes:
   agent-data:
   alertmanager-data:
   prometheus-data:
+  loki-data:

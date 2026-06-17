@@ -47,6 +47,7 @@ type frontmatter struct {
 var skipDirs = map[string]bool{
 	"assets":  true,
 	"scripts": true,
+	"adr":     true, // architecture decision records — internal, not rendered docs pages
 }
 
 func main() {

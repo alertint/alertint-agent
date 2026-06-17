@@ -24,6 +24,7 @@ import (
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
 	"github.com/alertint/alertint-agent/internal/audit"
+	"github.com/alertint/alertint-agent/internal/logs"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/skills/acutetriage"
@@ -34,6 +35,12 @@ type Config struct {
 	Token         string             // resolved bearer token (not the env var name)
 	WindowSeconds int                // correlator window size, forwarded into evidence packs
 	Prometheus    *promclient.Client // nil = prometheus tools disabled
+	// Logs is the configured read-only log source. nil = the log passthrough
+	// tool is not registered. The tool is named <Logs.Name()>_query_range.
+	Logs logs.Source
+	// LogsDefaultRangeMinutes is the default look-back for the log range tool
+	// when start is omitted (config's logs.default_range_minutes).
+	LogsDefaultRangeMinutes int
 }
 
 // Server is the AlertINT MCP HTTP server. Construct with NewServer; start
@@ -60,6 +67,13 @@ func NewServer(cfg Config, st *store.Store, auditor *audit.Auditor) *Server {
 	ms.AddTool(s.toolVerifyAudit())
 	ms.AddTool(s.toolPrometheusQuery())
 	ms.AddTool(s.toolPrometheusQueryRange())
+
+	// Log passthrough tool, registered only when a log source is configured.
+	// Named after the active backend (loki_query_range) so multiple sources can
+	// coexist additively later — see ADR-0003.
+	if s.cfg.Logs != nil {
+		ms.AddTool(s.toolLogsQueryRange())
+	}
 
 	// StreamableHTTPServer mounts internally at /mcp. Final client URL:
 	// http://host:<mcp_addr>/mcp
@@ -369,15 +383,25 @@ func (s *Server) handleGetEvidencePack(ctx context.Context, req mcplib.CallToolR
 	pack := acutetriage.BuildEvidencePack(*inc, alerts, s.cfg.WindowSeconds)
 	metrics := acutetriage.FetchMetrics(ctx, s.cfg.Prometheus, alerts, inc.FirstAlertAt)
 
-	// Embed metrics alongside the evidence pack fields using a thin wrapper.
-	type packWithMetrics struct {
+	// Logs are REPLAYED from the persisted snapshot, never re-queried — so the
+	// pack reflects the exact lines the LLM saw, even after Loki retention has
+	// rotated them (ADR-0001). Absent (pre-migration / short-circuited / logs
+	// disabled) → the section is omitted. Metrics remain a live re-query in v1.
+	var logsSnapshot json.RawMessage
+	if inc.EnrichmentJSON != "" {
+		logsSnapshot = json.RawMessage(inc.EnrichmentJSON)
+	}
+
+	type packWithEnrichment struct {
 		acutetriage.EvidencePack
 
 		Metrics []acutetriage.MetricSnapshot `json:"metrics,omitempty"`
+		Logs    json.RawMessage              `json:"logs,omitempty"`
 	}
-	result, err := mcplib.NewToolResultJSON(packWithMetrics{
+	result, err := mcplib.NewToolResultJSON(packWithEnrichment{
 		EvidencePack: pack,
 		Metrics:      metrics,
+		Logs:         logsSnapshot,
 	})
 	if err != nil {
 		return errResult("failed to serialize evidence pack: " + err.Error()), nil
@@ -541,6 +565,92 @@ func (s *Server) handlePrometheusQueryRange(ctx context.Context, req mcplib.Call
 	var parsed any
 	if err := json.Unmarshal(data, &parsed); err != nil {
 		return errResult("failed to parse prometheus response: " + err.Error()), nil
+	}
+	result, err := mcplib.NewToolResultJSON(parsed)
+	if err != nil {
+		return errResult("failed to serialize result: " + err.Error()), nil
+	}
+	return result, nil
+}
+
+// toolLogsQueryRange builds the log passthrough tool. Its name and description
+// are derived from the active source's Name() at construction time, e.g.
+// "loki_query_range", because the tool exposes that backend's native query
+// language (LogQL). For logs, range subsumes instant — a range query returns the
+// lines an instant query would plus surrounding context — so v1 ships only the
+// range tool (KISS).
+func (s *Server) toolLogsQueryRange() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
+	name := s.cfg.Logs.Name() + "_query_range"
+	desc := fmt.Sprintf("Range-query the configured log backend (%s) using its native query language (LogQL). "+
+		"Use this to drill into or around an incident: widen the time window, change the label selector, "+
+		"or grep for new patterns. Read-only.", s.cfg.Logs.Name())
+	tool := mcplib.NewTool(name,
+		mcplib.WithDescription(desc),
+		mcplib.WithString("query",
+			mcplib.Description("Native query in the backend's language (LogQL for loki), e.g. {app=\"api\"} |= \"panic\"."),
+			mcplib.Required(),
+		),
+		mcplib.WithString("start",
+			mcplib.Description("Range start (RFC3339). Defaults to now minus the configured default_range_minutes."),
+		),
+		mcplib.WithString("end",
+			mcplib.Description("Range end (RFC3339). Defaults to now."),
+		),
+		mcplib.WithInteger("limit",
+			mcplib.Description("Maximum number of log lines to return."),
+		),
+		mcplib.WithString("direction",
+			mcplib.Description(`Scan direction: "backward" (newest first, default) or "forward".`),
+		),
+	)
+	return tool, s.handleLogsQueryRange
+}
+
+func (s *Server) handleLogsQueryRange(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	if s.cfg.Logs == nil {
+		return errResult("logs source is not configured"), nil
+	}
+
+	query := mcplib.ParseString(req, "query", "")
+	if query == "" {
+		return errResult("query is required"), nil
+	}
+
+	now := time.Now().UTC()
+	end := now
+	start := now.Add(-time.Duration(s.cfg.LogsDefaultRangeMinutes) * time.Minute)
+	if startStr := mcplib.ParseString(req, "start", ""); startStr != "" {
+		parsed, err := time.Parse(time.RFC3339, startStr)
+		if err != nil {
+			return errResult("invalid start: must be RFC3339 (e.g. 2026-06-05T14:00:00Z)"), nil
+		}
+		start = parsed
+	}
+	if endStr := mcplib.ParseString(req, "end", ""); endStr != "" {
+		parsed, err := time.Parse(time.RFC3339, endStr)
+		if err != nil {
+			return errResult("invalid end: must be RFC3339"), nil
+		}
+		end = parsed
+	}
+	if start.After(end) {
+		return errResult("start must be before end"), nil
+	}
+
+	limit := mcplib.ParseInt(req, "limit", 100)
+	dir := mcplib.ParseString(req, "direction", "backward")
+	if dir != "backward" && dir != "forward" {
+		return errResult(`direction must be "backward" or "forward"`), nil
+	}
+
+	data, err := s.cfg.Logs.QueryRange(ctx, query, start, end, limit, dir)
+	if err != nil {
+		return errResult("logs range query failed: " + err.Error()), nil
+	}
+
+	var parsed any
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return errResult("failed to parse logs response: " + err.Error()), nil
 	}
 	result, err := mcplib.NewToolResultJSON(parsed)
 	if err != nil {

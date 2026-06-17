@@ -39,6 +39,10 @@ go.work.sum
 # Task runner cache
 /.task/
 
+# Python bytecode (docker/push-synthetic-logs.py is a convenience script)
+__pycache__/
+*.pyc
+
 # Local config (copy of config.example.yaml)
 /config.yaml
 
@@ -52,5 +56,17 @@ go.work.sum
 .idea/
 .vscode/
 
+# macOS
+.DS_Store
+
 .claude
 CLAUDE.md
+.agents/
+
+# Internal agent/decision docs — kept local, NOT pushed to the public repo.
+# Agents read them from the working tree (see .agents/domain.md); none render
+# on alertint.com/docs. The public, user-facing counterpart is docs/integrations/*.
+/CONTEXT.md
+/docs/adr/
+/specs/
+/plans/

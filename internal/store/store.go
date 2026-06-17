@@ -357,8 +357,12 @@ type Incident struct {
 	RootCause  string
 	Confidence float64
 	OutputJSON string
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	// EnrichmentJSON is the marshaled log-enrichment snapshot persisted with
+	// the finding so the MCP evidence pack can replay the exact lines the LLM
+	// saw. Empty when logs are not configured or on the short-circuit path.
+	EnrichmentJSON string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // InsertIncident creates a new incident row in status "collecting".
@@ -448,6 +452,7 @@ func (s *Store) GetRecentIncidentByGroupKey(ctx context.Context, groupKey string
 		       first_alert_at, last_alert_at, ready_at, alert_count,
 		       COALESCE(summary,''), COALESCE(root_cause,''),
 		       COALESCE(confidence,0.0), COALESCE(output_json,''),
+		       COALESCE(enrichment_json,''),
 		       created_at, updated_at
 		FROM incidents
 		WHERE group_key = ?
@@ -602,18 +607,26 @@ func (s *Store) GetIncidentAlerts(ctx context.Context, incidentID string) ([]Ale
 
 // SaveIncidentOutput persists LLM output on a ready/processing incident,
 // denormalizes summary/root_cause/confidence, and sets status="analyzed".
-func (s *Store) SaveIncidentOutput(ctx context.Context, incidentID, outputJSON, summary, rootCause string, confidence float64) error {
+// enrichmentJSON is the log-enrichment snapshot (§3.7); pass "" when logs are
+// not configured or on the short-circuit path, which stores SQL NULL so the
+// evidence pack omits the logs section.
+func (s *Store) SaveIncidentOutput(ctx context.Context, incidentID, outputJSON, summary, rootCause string, confidence float64, enrichmentJSON string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	var enrichment any
+	if enrichmentJSON != "" {
+		enrichment = enrichmentJSON
+	}
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE incidents
-		SET status      = 'analyzed',
-		    output_json = ?,
-		    summary     = ?,
-		    root_cause  = ?,
-		    confidence  = ?,
-		    updated_at  = ?
+		SET status          = 'analyzed',
+		    output_json     = ?,
+		    summary         = ?,
+		    root_cause      = ?,
+		    confidence      = ?,
+		    enrichment_json = ?,
+		    updated_at      = ?
 		WHERE id = ? AND status IN ('ready','processing')
-	`, outputJSON, summary, rootCause, confidence, now, incidentID)
+	`, outputJSON, summary, rootCause, confidence, enrichment, now, incidentID)
 	if err != nil {
 		return fmt.Errorf("store: save incident output: %w", err)
 	}
@@ -730,6 +743,7 @@ func (s *Store) ListRecentIncidents(ctx context.Context, limit int) ([]Incident,
 		       first_alert_at, last_alert_at, ready_at, alert_count,
 		       COALESCE(summary,''), COALESCE(root_cause,''),
 		       COALESCE(confidence,0.0), COALESCE(output_json,''),
+		       COALESCE(enrichment_json,''),
 		       created_at, updated_at
 		FROM incidents
 		ORDER BY created_at DESC
@@ -759,6 +773,7 @@ func (s *Store) GetIncidentByID(ctx context.Context, id string) (*Incident, erro
 		       first_alert_at, last_alert_at, ready_at, alert_count,
 		       COALESCE(summary,''), COALESCE(root_cause,''),
 		       COALESCE(confidence,0.0), COALESCE(output_json,''),
+		       COALESCE(enrichment_json,''),
 		       created_at, updated_at
 		FROM incidents
 		WHERE id = ?
@@ -877,9 +892,10 @@ func (s *Store) GetIncidentAlertsWithRoles(ctx context.Context, incidentID strin
 	return out, rows.Err()
 }
 
-// scanIncidentFull scans a row that SELECTs all 13 incident columns including
-// the nullable LLM output fields (summary, root_cause, confidence, output_json).
-// Callers must use COALESCE on the nullable columns before scanning.
+// scanIncidentFull scans a row that SELECTs all 14 incident columns including
+// the nullable LLM output fields (summary, root_cause, confidence, output_json)
+// and the log-enrichment snapshot (enrichment_json). Callers must use COALESCE
+// on the nullable columns before scanning.
 func scanIncidentFull(s scanner) (*Incident, error) {
 	var (
 		inc        Incident
@@ -893,6 +909,7 @@ func scanIncidentFull(s scanner) (*Incident, error) {
 		&inc.ID, &inc.GroupKey, &inc.Status,
 		&firstStr, &lastStr, &readyStr, &inc.AlertCount,
 		&inc.Summary, &inc.RootCause, &inc.Confidence, &inc.OutputJSON,
+		&inc.EnrichmentJSON,
 		&createdStr, &updatedStr,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

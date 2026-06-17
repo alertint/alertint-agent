@@ -68,7 +68,7 @@ tasks:
       - task: docker:up
 
   verify-audit:
-    desc: 'Verify the hash chain of the live audit log. Pass DB or CONFIG, e.g. `task verify-audit DB=./alertint-agent.db`'
+    desc: "Verify the hash chain of the live audit log. Pass DB or CONFIG, e.g. `task verify-audit DB=./alertint-agent.db`"
     deps: [build]
     vars:
       DB: '{{.DB | default ""}}'
@@ -104,6 +104,17 @@ tasks:
       - echo "Removing fake alert tracking state..."
       - rm -f .alertint_fake_alert_state.json
       - echo "✓ Tracking state purged. Fresh alerts can now be generated."
+
+  logs:push:local:
+    desc: Seed the local demo Loki with fake multi-level log lines (run before alerts:fire)
+    cmds:
+      - python3 docker/push-synthetic-logs.py --target local
+
+  logs:push:cloud:
+    desc: Push the same fake log lines to Grafana Cloud Logs (reads GRAFANA_CLOUD_LOKI_* from .env)
+    dotenv: [".env"]
+    cmds:
+      - python3 docker/push-synthetic-logs.py --target cloud
 
   docs:validate:
     desc: Validate docs frontmatter, slugs, and sections against docs/meta.yaml

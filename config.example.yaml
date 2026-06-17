@@ -48,4 +48,31 @@ prometheus:
   timeout_seconds: 10
   default_range_minutes: 60
 
+# Log enrichment connector (Loki / Grafana Cloud) — pulls recent log lines into
+# the triage prompt and exposes a read-only loki_query_range MCP tool.
+#
+# IMPORTANT: alert labels are NOT Loki stream labels. `service` is often `app`;
+# `job`/`instance` usually have no stream-label equivalent. Map them with
+# label_map or the selector matches zero streams (you'll see an info log
+# "returned no lines — check loki.label_map"). See docs/integrations/loki.md →
+# "Map your labels".
+logs:
+  enabled: false
+  provider: loki
+  timeout_seconds: 10        # TOTAL budget for the whole fetch (filtered + fallback)
+  default_range_minutes: 15  # look-back window before the first alert
+  max_lines: 50
+  loki:
+    base_url: http://loki:3100             # or https://logs-prod-006.grafana.net (Grafana Cloud)
+    auth:
+      mode: none                           # none | bearer | basic
+      # token_env: LOKI_BEARER_TOKEN       # bearer mode
+      # username: "123456"                 # basic mode: Grafana Cloud user/instance ID
+      # password_env: GRAFANA_CLOUD_LOKI_TOKEN  # basic mode: Access Policy token (logs:read)
+    # org_id: "tenant-a"                    # optional X-Scope-OrgID (self-hosted multi-tenant)
+    # line_filter: '|~ "(?i)(error|warn|fatal|panic|fail)"'  # default; set "" to disable
+    label_map:                             # alert-label key → Loki stream-label key
+      service: app                         #   alert `service` → stream `app`
+      instance: ""                         #   drop: no stream-label equivalent
+
 log_level: info            # debug | info | warn | error
