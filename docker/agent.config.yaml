@@ -84,3 +84,11 @@ logs:
   #     instance: ""
 
 log_level: info
+# Log output format: auto | console | json.
+#   console — human-readable, colorized lines (this is what CLICOLOR_FORCE in
+#             docker-compose.yaml colors); best for reading `docker logs`.
+#   json    — structured, one object per line; best for machine ingestion.
+#   auto    — console on a TTY, json otherwise. In a container stderr is NOT a
+#             TTY, so auto would resolve to json — hence the demo sets console
+#             explicitly to keep the logs readable.
+log_format: console

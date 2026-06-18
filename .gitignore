@@ -46,6 +46,11 @@ __pycache__/
 # Local config (copy of config.example.yaml)
 /config.yaml
 
+# Local Docker config overrides — copies of docker/agent.config.yaml that you
+# tweak per-machine and select via ALERTINT_CONFIG_FILE in .env. The committed
+# docker/agent.config.yaml stays the canonical demo config.
+docker/*.local.yaml
+
 # SQLite state (default path from config.example.yaml)
 *.db
 *.db-journal
