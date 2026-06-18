@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -380,6 +381,44 @@ func TestPost_EmptyAlertList_204AndAuditRow(t *testing.T) {
 	_ = h.store.DB().QueryRow(`SELECT COUNT(*) FROM audit_log WHERE kind='alert.received'`).Scan(&n)
 	if n != 1 {
 		t.Errorf("audit rows = %d, want 1", n)
+	}
+}
+
+// TestPost_WebhookReceivedLine verifies one INFO "webhook received" line per
+// POST (alerts + group) and that per-alert detail is at DEBUG.
+func TestPost_WebhookReceivedLine(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	w, err := New(Options{Store: s, Auditor: audit.New(s.DB()), Token: testToken, Logger: logger})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(w.Handler())
+	t.Cleanup(srv.Close)
+
+	resp := postPayload(t, srv, mustMarshal(t, samplePayload()), nil)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "webhook received") || !strings.Contains(out, "alerts=1") {
+		t.Errorf("missing webhook received INFO line with alert count: %s", out)
+	}
+	if !strings.Contains(out, "group=") {
+		t.Errorf("webhook received line must carry group: %s", out)
+	}
+	// Per-alert detail lives at DEBUG, not INFO.
+	if !strings.Contains(out, "alert upserted") || !strings.Contains(out, "fingerprint=fp-1") {
+		t.Errorf("missing per-alert DEBUG detail line: %s", out)
 	}
 }
 

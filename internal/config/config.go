@@ -41,6 +41,7 @@ type Config struct {
 	Logs         LogsConfig         `yaml:"logs,omitempty"`
 	Rules        RulesConfig        `yaml:"rules"`
 	LogLevel     string             `yaml:"log_level"`
+	LogFormat    string             `yaml:"log_format"`
 }
 
 // RulesConfig configures rule pack loading. The embedded baseline pack is
@@ -194,7 +195,8 @@ func Defaults() Config {
 				LineFilter: `|~ "(?i)(error|warn|fatal|panic|fail)"`,
 			},
 		},
-		LogLevel: "info",
+		LogLevel:  "info",
+		LogFormat: "auto",
 	}
 }
 
@@ -243,6 +245,9 @@ func (c *Config) Validate() error {
 
 	if !validLogLevel(c.LogLevel) {
 		errs = append(errs, fmt.Sprintf("log_level %q must be one of debug, info, warn, error", c.LogLevel))
+	}
+	if !validLogFormat(c.LogFormat) {
+		errs = append(errs, fmt.Sprintf("log_format %q must be one of auto, console, json", c.LogFormat))
 	}
 
 	if len(errs) > 0 {
@@ -518,6 +523,19 @@ func requireEnv(name, field string) (string, error) {
 func validLogLevel(s string) bool {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "debug", "info", "warn", "warning", "error":
+		return true
+	}
+	return false
+}
+
+// validLogFormat accepts the format selector set. "text" was removed (it was
+// slog's raw key=value renderer); an unknown value — including "text" — fails
+// loud at startup rather than silently re-rendering, which would break a
+// key=value parser. Resolution of "auto" to a concrete handler happens in
+// package logging, off the log writer's TTY-ness.
+func validLogFormat(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "auto", "console", "json":
 		return true
 	}
 	return false

@@ -287,6 +287,36 @@ func TestValidate_RejectsBadLogLevel(t *testing.T) {
 	}
 }
 
+func TestDefaults_LogFormatIsAuto(t *testing.T) {
+	if got := Defaults().LogFormat; got != "auto" {
+		t.Errorf("default log_format = %q, want auto", got)
+	}
+}
+
+func TestLoad_DefaultsLogFormatToAuto(t *testing.T) {
+	yaml := strings.Replace(minimalValidYAML, "./alertint-agent.db", filepath.Join(t.TempDir(), "agent.db"), 1)
+	cfg, err := Load(writeConfig(t, yaml))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.LogFormat != "auto" {
+		t.Errorf("omitted log_format should default to auto, got %q", cfg.LogFormat)
+	}
+}
+
+func TestValidate_RejectsBadLogFormat(t *testing.T) {
+	cfg := Defaults()
+	cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
+	cfg.Alertmanager.WebhookTokenEnv = "TOK"
+	cfg.LLM.APIKeyEnv = "KEY"
+	// "text" was removed from the allowed set — it must fail loud, not alias.
+	cfg.LogFormat = "text"
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "log_format") {
+		t.Fatalf("want log_format error, got %v", err)
+	}
+}
+
 func TestValidate_RejectsUnwritableSQLitePath(t *testing.T) {
 	cfg := Defaults()
 	cfg.Storage.SQLitePath = "/this/path/does/not/exist/agent.db"

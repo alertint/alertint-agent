@@ -51,6 +51,19 @@ tasks:
     cmds:
       - docker compose -f docker/docker-compose.yaml --env-file .env up -d
 
+  docker:logs:
+    desc: Follow the alertint-agent container logs (colored console output, no prefix)
+    cmds:
+      # docker logs (not `compose logs`) keeps the raw bytes — ANSI color intact,
+      # no `service |` line prefix — so the console trail stays clean.
+      - docker logs -f alertint-agent
+
+  docker:up:logs:
+    desc: Start all containers detached, then follow the agent logs (one command)
+    cmds:
+      - task: docker:up
+      - task: docker:logs
+
   docker:down:
     desc: Stop and remove all Docker containers and volumes (clean state)
     cmds:

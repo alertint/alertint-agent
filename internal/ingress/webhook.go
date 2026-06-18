@@ -205,6 +205,15 @@ func (h *Webhook) handlePost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("unsupported alertmanager payload version %q (want \"4\")", payload.Version), http.StatusBadRequest)
 		return
 	}
+
+	// One INFO line per accepted POST so a quiet-but-receiving agent is
+	// unambiguous; per-alert dedup/upsert detail stays at DEBUG (persistAlerts).
+	h.logger.Info("webhook received",
+		slog.Int("alerts", len(payload.Alerts)),
+		slog.String("group", payload.GroupKey),
+		slog.String("status", payload.Status),
+	)
+
 	if len(payload.Alerts) == 0 {
 		// Empty alert lists are technically valid AM payloads, but they
 		// give us nothing to do. Accept them with 204 and an audit row.
@@ -287,6 +296,12 @@ func (h *Webhook) persistAlerts(ctx context.Context, in []AlertmanagerAlert) ([]
 			continue
 		}
 		persisted = append(persisted, stored)
+		// Per-alert detail is DEBUG: the per-POST "webhook received" INFO line
+		// is the action-trail entry; this is troubleshooting depth.
+		h.logger.Debug("alert upserted",
+			slog.String("fingerprint", stored.Fingerprint),
+			slog.String("status", stored.Status),
+		)
 	}
 	return persisted, errs
 }

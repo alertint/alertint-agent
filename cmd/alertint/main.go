@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
@@ -39,7 +40,6 @@ import (
 	"github.com/alertint/alertint-agent/internal/logs/loki"
 	internalmcp "github.com/alertint/alertint-agent/internal/mcp"
 	"github.com/alertint/alertint-agent/internal/notify"
-	notifyconsole "github.com/alertint/alertint-agent/internal/notify/console"
 	notifyresolution "github.com/alertint/alertint-agent/internal/notify/resolution"
 	notifyslack "github.com/alertint/alertint-agent/internal/notify/slack"
 	notifystdout "github.com/alertint/alertint-agent/internal/notify/stdout"
@@ -91,38 +91,40 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	cfgPath := fs.String("config", "", "path to alertint YAML config")
 	webhookAddr := fs.String("webhook-addr", "", "override alertmanager.webhook_addr from config (e.g. 0.0.0.0:9911)")
 	mcpAddr := fs.String("mcp-addr", "", "override mcp.addr from config (e.g. 0.0.0.0:9912)")
-	logLevel := fs.String("log-level", "info", "log level: debug, info, warn, error")
-	logFormat := fs.String("log-format", "json", "log format: json or text")
+	// Empty sentinel defaults: an unset flag falls through to config, so
+	// precedence is CLI flag > config > built-in default (info / auto).
+	logLevel := fs.String("log-level", "", "log level: debug, info, warn, error (overrides config log_level)")
+	logFormat := fs.String("log-format", "", "log format: auto, console, json (overrides config log_format)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	logger, err := logging.New(logging.Options{
-		Level:  *logLevel,
-		Format: logging.Format(*logFormat),
-		Writer: stderr,
-	})
+	// Bootstrap logger from flags/built-in defaults. It covers errors that
+	// occur before config is available and the no-config idle path; the real
+	// logger is rebuilt once config is loaded so config-driven level/format
+	// reach the very first "alertint starting" line.
+	bootstrap, level, format, err := buildLogger(*logLevel, *logFormat, "", "", stderr)
 	if err != nil {
 		return err
 	}
-	logging.SetDefault(logger)
+	logging.SetDefault(bootstrap)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	logger.Info("alertint starting",
-		slog.String("version", resolveVersion()),
-		slog.String("log_level", *logLevel),
-		slog.String("log_format", *logFormat),
-	)
-
 	if *cfgPath == "" {
-		// Without config we can't open the store or know the listen
-		// address. v1 keeps the placeholder behavior so existing tests
-		// (no flags) still exercise signal handling.
-		logger.Warn("--config not provided; running idle until signaled (no webhook)")
+		// Without config we can't open the store or know the listen address.
+		// v1 keeps the placeholder behavior so existing tests (no flags) still
+		// exercise signal handling; the bootstrap logger renders the startup
+		// line for parity with the configured path.
+		bootstrap.Info("alertint starting",
+			slog.String("version", resolveVersion()),
+			slog.String("log_level", level),
+			slog.String("log_format", format),
+		)
+		bootstrap.Warn("--config not provided; running idle until signaled (no webhook)")
 		<-ctx.Done()
-		logger.Info("alertint stopped", slog.String("reason", ctx.Err().Error()))
+		bootstrap.Info("alertint stopped", slog.String("reason", ctx.Err().Error()))
 		return nil
 	}
 
@@ -130,6 +132,20 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+
+	// Rebuild the logger now that config is known, applying precedence
+	// CLI flag > config > default and resolving auto off stderr's TTY-ness.
+	logger, level, format, err := buildLogger(*logLevel, *logFormat, cfg.LogLevel, cfg.LogFormat, stderr)
+	if err != nil {
+		return err
+	}
+	logging.SetDefault(logger)
+
+	logger.Info("alertint starting",
+		slog.String("version", resolveVersion()),
+		slog.String("log_level", level),
+		slog.String("log_format", format),
+	)
 
 	if *webhookAddr != "" {
 		cfg.Alertmanager.WebhookAddr = *webhookAddr
@@ -164,7 +180,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 	llmClient := llmanthropic.New(llmanthropicCfg(cfg), auditor, logger)
 
-	notifier := buildNotifier(cfg, st, auditor)
+	notifier := buildNotifier(cfg, st, auditor, logger, strings.EqualFold(level, "debug"))
 
 	// Build Prometheus client when enabled. Passed into both the triage skill
 	// (metric enrichment for the LLM prompt) and the MCP server (PromQL tools).
@@ -180,7 +196,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 			TimeoutSeconds:      cfg.Prometheus.TimeoutSeconds,
 			DefaultRangeMinutes: cfg.Prometheus.DefaultRangeMinutes,
 		})
-		logger.Info("prometheus connector enabled", slog.String("base_url", cfg.Prometheus.BaseURL))
+		logger.Info("prometheus connected", slog.String("base_url", cfg.Prometheus.BaseURL))
 	}
 
 	// Build the log source when enabled. The provider switch lives here in
@@ -209,7 +225,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		default:
 			return fmt.Errorf("logs: unknown provider %q", cfg.Logs.Provider)
 		}
-		logger.Info("logs connector enabled",
+		logger.Info("logs connected",
 			slog.String("provider", cfg.Logs.Provider),
 			slog.String("base_url", cfg.Logs.Loki.BaseURL),
 		)
@@ -368,7 +384,7 @@ func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom 
 	}
 	ch := make(chan error, 1)
 	go func() {
-		logger.Info("MCP HTTP listening",
+		logger.Info("mcp listening",
 			slog.String("addr", cfg.MCP.Addr),
 			slog.String("endpoint", cfg.MCP.Addr+"/mcp"),
 		)
@@ -386,14 +402,14 @@ func runVerifyAudit(args []string, stdout, stderr io.Writer) error {
 	cfgPath := fs.String("config", "", "path to alertint YAML config")
 	dbPathFlag := fs.String("db", "", "path to SQLite database (overrides config.storage.sqlite_path)")
 	logLevel := fs.String("log-level", "warn", "log level: debug, info, warn, error")
-	logFormat := fs.String("log-format", "text", "log format: json or text")
+	logFormat := fs.String("log-format", "auto", "log format: auto, console, json")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
 	logger, err := logging.New(logging.Options{
 		Level:  *logLevel,
-		Format: logging.Format(*logFormat),
+		Format: logging.Resolve(logging.Format(*logFormat), stderr, nil),
 		Writer: stderr,
 	})
 	if err != nil {
@@ -517,19 +533,38 @@ func buildHealthChecks(cfg *config.Config, prom *promclient.Client, logSrc logs.
 	return health.NewRegistry(health.DefaultTTL, checks...)
 }
 
-// buildNotifier constructs the notify.Multi from the loaded config.
-// stdout (JSON) and console (human-readable) are always included; Slack is added when enabled.
-func buildNotifier(cfg *config.Config, st *store.Store, auditor *audit.Auditor) notify.Notifier {
-	nn := []notify.Notifier{
-		notifystdout.New(os.Stdout, auditor),  // JSON output for parsing
-		notifyconsole.New(os.Stderr, auditor), // Human-readable output
+// buildNotifier constructs the notify.Multi from the loaded config and logs the
+// active sinks at startup. The human-readable one-line finding summary and the
+// per-sink "notified" outcome line are owned by Multi (both at INFO, both
+// formats). The sinks themselves:
+//
+//   - stdout: always an active sink when notify.stdout is set, so a send is
+//     confirmed (notified · stdout=ok) at INFO. Its verbose full JSON line is
+//     written only at debug level (consistently, in every format).
+//   - slack: when enabled and a bot token resolves.
+func buildNotifier(cfg *config.Config, st *store.Store, auditor *audit.Auditor, logger *slog.Logger, debug bool) notify.Notifier {
+	var nn []notify.Notifier
+	var sinks []string
+	slackWired := false
+	if cfg.Notify.Stdout {
+		nn = append(nn, notifystdout.New(os.Stdout, auditor, debug))
+		sinks = append(sinks, "stdout")
 	}
 	if cfg.Notify.Slack.Enabled {
 		if token, err := cfg.SlackBotToken(); err == nil && token != "" {
 			nn = append(nn, notifyslack.New(token, cfg.Notify.Slack.Channel, st, auditor))
+			sinks = append(sinks, "slack")
+			slackWired = true
 		}
 	}
-	return notify.NewMulti(nn...)
+
+	attrs := []any{slog.String("sinks", strings.Join(sinks, ","))}
+	if slackWired {
+		attrs = append(attrs, slog.String("slack_channel", cfg.Notify.Slack.Channel))
+	}
+	logger.Info("notifiers ready", attrs...)
+
+	return notify.NewMulti(logger, nn...)
 }
 
 // llmanthropicCfg builds an llm/anthropic.Config from the loaded config.
@@ -548,6 +583,37 @@ type incidentSink struct {
 
 func (s incidentSink) OnIncidentReady(ctx context.Context, inc store.Incident) error {
 	return s.skill.Run(ctx, inc)
+}
+
+// buildLogger constructs the runtime logger applying precedence
+// CLI flag > config > built-in default (info / auto) for both level and format,
+// resolves the auto format against the writer's TTY-ness, and returns the
+// logger plus the concrete level/format strings for the startup line. Passing
+// "" for cfgLevel/cfgFormat (the bootstrap case) falls straight through to the
+// built-in defaults.
+func buildLogger(flagLevel, flagFormat, cfgLevel, cfgFormat string, w io.Writer) (*slog.Logger, string, string, error) {
+	level := firstNonEmpty(flagLevel, cfgLevel, "info")
+	format := firstNonEmpty(flagFormat, cfgFormat, string(logging.FormatAuto))
+	resolved := logging.Resolve(logging.Format(format), w, nil)
+	logger, err := logging.New(logging.Options{
+		Level:  level,
+		Format: resolved,
+		Writer: w,
+	})
+	if err != nil {
+		return nil, "", "", err
+	}
+	return logger, level, string(resolved), nil
+}
+
+// firstNonEmpty returns the first argument that is not empty after trimming.
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func resolveVersion() string {

@@ -79,17 +79,28 @@ func TestSuccess(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv.URL, nil)
-	raw, err := c.Complete(context.Background(), "sys", "user", []string{"analysis_name", "confidence"})
+	comp, err := c.Complete(context.Background(), "sys", "user", []string{"analysis_name", "confidence"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := json.Unmarshal(comp.Raw, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	if got["analysis_name"] != "test" {
 		t.Errorf("analysis_name = %v, want test", got["analysis_name"])
+	}
+	// The Completion carries the usage the audit log uses, for the caller's
+	// "llm responded" line.
+	if comp.Model != "claude-test" {
+		t.Errorf("Model = %q, want claude-test", comp.Model)
+	}
+	if comp.InputTokens != 10 || comp.OutputTokens != 20 {
+		t.Errorf("tokens = (%d,%d), want (10,20)", comp.InputTokens, comp.OutputTokens)
+	}
+	if comp.Latency < 0 {
+		t.Errorf("Latency should be non-negative, got %v", comp.Latency)
 	}
 }
 
@@ -103,12 +114,12 @@ func TestMarkdownFenceStripped(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv.URL, nil)
-	raw, err := c.Complete(context.Background(), "sys", "user", []string{"key"})
+	comp, err := c.Complete(context.Background(), "sys", "user", []string{"key"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := json.Unmarshal(comp.Raw, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	if got["key"] != "val" {
@@ -132,7 +143,7 @@ func TestRetryOn429(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv.URL, nil)
-	raw, err := c.Complete(context.Background(), "sys", "user", []string{"result"})
+	comp, err := c.Complete(context.Background(), "sys", "user", []string{"result"})
 	if err != nil {
 		t.Fatalf("unexpected error after retries: %v", err)
 	}
@@ -140,7 +151,7 @@ func TestRetryOn429(t *testing.T) {
 		t.Errorf("expected 3 total calls (2 retries + 1 success), got %d", calls.Load())
 	}
 	var got map[string]any
-	_ = json.Unmarshal(raw, &got)
+	_ = json.Unmarshal(comp.Raw, &got)
 	if got["result"] != "ok" {
 		t.Errorf("result = %v, want ok", got["result"])
 	}

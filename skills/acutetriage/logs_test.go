@@ -61,7 +61,7 @@ func bufLogger() (*slog.Logger, *bytes.Buffer) {
 }
 
 func TestFetchLogs_NilSourceReturnsNil(t *testing.T) {
-	if got := FetchLogs(context.Background(), nil, LogParams{}, alertsWith(map[string]string{"namespace": "p"}), time.Now(), time.Now(), nil); got != nil {
+	if got := FetchLogs(context.Background(), nil, LogParams{}, alertsWith(map[string]string{"namespace": "p"}), time.Now(), time.Now(), "inc-test", nil); got != nil {
 		t.Fatalf("nil source must yield nil enrichment, got %+v", got)
 	}
 }
@@ -75,7 +75,7 @@ func TestFetchLogs_SelectorIsAllowlistIntersection(t *testing.T) {
 		"alertname": "HighCPU", "severity": "critical", "prometheus": "mon/k8s",
 	}
 	logger, _ := bufLogger()
-	FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 10, MaxLines: 50}, alertsWith(labels), time.Now(), time.Now(), logger)
+	FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 10, MaxLines: 50}, alertsWith(labels), time.Now(), time.Now(), "inc-test", logger)
 
 	for _, k := range logs.AllowedSelectorKeys {
 		if src.gotSel.Labels[k] != labels[k] {
@@ -96,7 +96,7 @@ func TestFetchLogs_WindowAndLimitAndDeadline(t *testing.T) {
 	src := &fakeSource{name: "loki", fetched: logs.Fetched{Lines: []logs.Line{{Timestamp: time.Unix(1, 0), Line: "x"}}}}
 	first := time.Date(2026, 6, 17, 14, 0, 0, 0, time.UTC)
 	last := time.Date(2026, 6, 17, 14, 5, 0, 0, time.UTC)
-	FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 10, MaxLines: 42}, alertsWith(map[string]string{"namespace": "p"}), first, last, nil)
+	FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 10, MaxLines: 42}, alertsWith(map[string]string{"namespace": "p"}), first, last, "inc-test", nil)
 
 	if !src.gotStart.Equal(first.Add(-15 * time.Minute)) {
 		t.Errorf("start = %v, want first-15m", src.gotStart)
@@ -123,7 +123,7 @@ func TestFetchLogs_EmptySelectorNoteNoQueryNoCall(t *testing.T) {
 	logger, buf := bufLogger()
 	// No allowlisted labels shared → empty selector.
 	e := FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 10, MaxLines: 50},
-		alertsWith(map[string]string{"alertname": "X", "severity": "high"}), time.Now(), time.Now(), logger)
+		alertsWith(map[string]string{"alertname": "X", "severity": "high"}), time.Now(), time.Now(), "inc-test", logger)
 	if e == nil {
 		t.Fatal("logs enabled: must return non-nil note enrichment, not nil")
 	}
@@ -136,13 +136,38 @@ func TestFetchLogs_EmptySelectorNoteNoQueryNoCall(t *testing.T) {
 	if !strings.Contains(buf.String(), "empty selector") {
 		t.Errorf("missing empty-selector info breadcrumb: %s", buf.String())
 	}
+	if !strings.Contains(buf.String(), "incident=inc-test") {
+		t.Errorf("empty-selector line must carry incident: %s", buf.String())
+	}
+}
+
+func TestFetchLogs_SuccessEmitsLokiFetched(t *testing.T) {
+	src := &fakeSource{name: "loki", fetched: logs.Fetched{
+		Lines: []logs.Line{{Timestamp: time.Unix(1, 0), Line: "boom"}},
+		Query: `{namespace="prod"} |~ "(?i)error"`,
+	}}
+	logger, buf := bufLogger()
+	e := FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 10, MaxLines: 50},
+		alertsWith(map[string]string{"namespace": "prod"}), time.Now(), time.Now(), "inc-42", logger)
+	if e == nil || len(e.Lines) == 0 {
+		t.Fatalf("want enrichment with lines, got %+v", e)
+	}
+	s := buf.String()
+	if !strings.Contains(s, "loki fetched") {
+		t.Errorf("missing loki fetched success line: %s", s)
+	}
+	for _, tok := range []string{"lines=1", "range=15m", "incident=inc-42"} {
+		if !strings.Contains(s, tok) {
+			t.Errorf("loki fetched missing %q: %s", tok, s)
+		}
+	}
 }
 
 func TestFetchLogs_QueriedEmptyNoteAndInfoLog(t *testing.T) {
 	src := &fakeSource{name: "loki", fetched: logs.Fetched{Lines: nil, Query: `{namespace="prod",app="api"}`}}
 	logger, buf := bufLogger()
 	e := FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 10, MaxLines: 50},
-		alertsWith(map[string]string{"namespace": "prod"}), time.Now(), time.Now(), logger)
+		alertsWith(map[string]string{"namespace": "prod"}), time.Now(), time.Now(), "inc-test", logger)
 	if e == nil || len(e.Lines) != 0 || e.Note == "" {
 		t.Fatalf("want note enrichment, got %+v", e)
 	}
@@ -158,7 +183,7 @@ func TestFetchLogs_ErrorNoteAndWarnLogTriageProceeds(t *testing.T) {
 	src := &fakeSource{name: "loki", err: context.DeadlineExceeded, fetched: logs.Fetched{Query: `{namespace="prod"}`}}
 	logger, buf := bufLogger()
 	e := FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 10, MaxLines: 50},
-		alertsWith(map[string]string{"namespace": "prod"}), time.Now(), time.Now(), logger)
+		alertsWith(map[string]string{"namespace": "prod"}), time.Now(), time.Now(), "inc-test", logger)
 	if e == nil || e.Note == "" || len(e.Lines) != 0 {
 		t.Fatalf("error path must yield note enrichment, got %+v", e)
 	}
@@ -178,7 +203,7 @@ func TestFetchLogs_NormalizeCapsEnforced(t *testing.T) {
 	}
 	src := &fakeSource{name: "loki", fetched: logs.Fetched{Lines: in, Query: "{x}"}}
 	e := FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 10, MaxLines: 60},
-		alertsWith(map[string]string{"namespace": "p"}), time.Now(), time.Now(), nil)
+		alertsWith(map[string]string{"namespace": "p"}), time.Now(), time.Now(), "inc-test", nil)
 	if e == nil || len(e.Lines) == 0 {
 		t.Fatal("want lines")
 	}

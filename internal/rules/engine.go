@@ -58,7 +58,7 @@ func NewEngine(ctx context.Context, logger *slog.Logger, sources ...RuleSource) 
 			e.defaults.Flap = pack.Defaults.Flap
 		}
 		e.packs = append(e.packs, pack.Meta)
-		logger.Info("rules: pack loaded",
+		logger.Info("rules loaded",
 			slog.String("source", src.Name()),
 			slog.String("pack", pack.Meta.Name),
 			slog.String("version", pack.Meta.Version),

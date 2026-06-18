@@ -4,6 +4,7 @@ package acutetriage
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -47,7 +48,12 @@ type LogParams struct {
 // last (the caller passes now for a still-firing incident). The whole fetch
 // (filtered + fallback) shares ONE timeout_seconds deadline, so the worst-case
 // latency added to triage is timeout_seconds, not 2×.
-func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []store.Alert, first, last time.Time, logger *slog.Logger) *LogEnrichment {
+//
+// incidentID rides every outcome line so the operator action trail (the success
+// "loki fetched" line and the three absence breadcrumbs) stands alone. The Loki
+// client itself stays logger-free and incident-unaware: this generic layer owns
+// the meaning and the logging (ADR 0004 / ADR 0002).
+func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []store.Alert, first, last time.Time, incidentID string, logger *slog.Logger) *LogEnrichment {
 	if src == nil {
 		return nil
 	}
@@ -55,6 +61,7 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 		logger = slog.Default()
 	}
 	source := src.Name()
+	rangeLabel := fmt.Sprintf("%dm", params.DefaultRangeMinutes)
 	start := first.Add(-time.Duration(params.DefaultRangeMinutes) * time.Minute)
 	end := last
 
@@ -64,7 +71,7 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 	if len(sel.Labels) == 0 {
 		shared := formatLabels(sharedLabels(alerts))
 		logger.Info("acutetriage: logs: empty selector — no usable log labels for this incident",
-			"source", source, "shared_labels", shared)
+			"source", source, "shared_labels", shared, "incident", incidentID)
 		return &LogEnrichment{
 			Source: source,
 			Start:  start,
@@ -77,11 +84,13 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(params.TimeoutSeconds)*time.Second)
 	defer cancel()
 
+	fetchStart := time.Now()
 	fetched, err := src.FetchRecent(ctx, sel, start, end, params.MaxLines)
+	dur := time.Since(fetchStart)
 	if err != nil {
 		// Timeout / network / non-200 / decode — record the gap, keep triaging.
 		logger.Warn("acutetriage: logs: backend query failed",
-			"source", source, "query", fetched.Query, "err", err)
+			"source", source, "query", fetched.Query, "err", err, "incident", incidentID)
 		return &LogEnrichment{
 			Source: source,
 			Query:  fetched.Query,
@@ -96,7 +105,7 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 		// Queried but empty — the most likely first-run failure (selector/schema
 		// mismatch). Name the real query so the operator can fix loki.label_map.
 		logger.Info("acutetriage: logs: query returned no lines — check label_map / line_filter",
-			"source", source, "query", fetched.Query)
+			"source", source, "query", fetched.Query, "incident", incidentID)
 		return &LogEnrichment{
 			Source: source,
 			Query:  fetched.Query,
@@ -105,6 +114,16 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 			Note:   "log backend returned no lines for this query",
 		}
 	}
+
+	// Action-trail success line: one INFO per fetch that returned lines, the
+	// happy-path sibling of the three absence breadcrumbs above.
+	logger.Info("loki fetched",
+		"lines", len(lines),
+		"dur", dur,
+		"selector", fetched.Query,
+		"range", rangeLabel,
+		"incident", incidentID,
+	)
 
 	return &LogEnrichment{
 		Source: source,

@@ -66,6 +66,11 @@ func NewWithClient(client SlackClient, channel string, store ThreadStore, audito
 	return &Notifier{client: client, channel: channel, store: store, auditor: auditor}
 }
 
+// Name returns the stable sink label used in the notify outcome line. The
+// channel rides the wrapped error on failure (and the startup "slack connected"
+// line), never the label, so the label stays constant across findings.
+func (n *Notifier) Name() string { return "slack" }
+
 // Notify dispatches to notifyFiring or notifyResolved based on f.Status.
 func (n *Notifier) Notify(ctx context.Context, f notify.Finding) error {
 	if f.Status == "resolved" {
@@ -81,7 +86,7 @@ func (n *Notifier) notifyFiring(ctx context.Context, f notify.Finding) error {
 		slacklib.MsgOptionBlocks(firingMainBlocks(f)...),
 	)
 	if err != nil {
-		return fmt.Errorf("slack: post message: %w", err)
+		return fmt.Errorf("channel %s: post message: %w", n.channel, err)
 	}
 	if n.store != nil && ts != "" {
 		_ = n.store.SetIncidentSlackThread(ctx, f.IncidentID, ts, ch)
@@ -110,7 +115,7 @@ func (n *Notifier) notifyResolved(ctx context.Context, f notify.Finding) error {
 		slacklib.MsgOptionBlocks(resolvedMainBlocks(f)...),
 	)
 	if err != nil {
-		return fmt.Errorf("slack: post resolved message: %w", err)
+		return fmt.Errorf("channel %s: post resolved message: %w", n.channel, err)
 	}
 	n.audit(ctx, f.IncidentID, "resolved")
 	return nil
@@ -128,7 +133,7 @@ func (n *Notifier) updateAndThread(ctx context.Context, f notify.Finding, origin
 		slacklib.MsgOptionText(resolvedFallback(f), false),
 		slacklib.MsgOptionBlocks(resolvedMainBlocks(f)...),
 	); err != nil {
-		return fmt.Errorf("slack: update message: %w", err)
+		return fmt.Errorf("channel %s: update message: %w", channel, err)
 	}
 
 	// Post full resolution details as a thread reply.
@@ -137,7 +142,7 @@ func (n *Notifier) updateAndThread(ctx context.Context, f notify.Finding, origin
 		slacklib.MsgOptionTS(originalTS),
 		slacklib.MsgOptionBlocks(resolvedThreadBlocks(f)...),
 	); err != nil {
-		return fmt.Errorf("slack: post thread reply: %w", err)
+		return fmt.Errorf("channel %s: post thread reply: %w", channel, err)
 	}
 
 	n.audit(ctx, f.IncidentID, "resolved")
