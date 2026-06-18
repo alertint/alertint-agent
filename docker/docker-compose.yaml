@@ -33,7 +33,14 @@ services:
       - "${ALERTINT_WEBHOOK_PORT:-9911}:${ALERTINT_WEBHOOK_PORT:-9911}"   # Alertmanager webhook receiver
       - "${ALERTINT_MCP_PORT:-9912}:${ALERTINT_MCP_PORT:-9912}"           # MCP HTTP server (Claude Code, Cursor, Windsurf)
     volumes:
-      - ./agent.config.yaml:/etc/alertint/config.yaml:ro
+      # Which config file to mount. Defaults to the committed demo config so the
+      # repo runs out of the box. To run with your own tweaks (e.g. Slack on,
+      # Grafana Cloud Logs) WITHOUT editing the committed file, copy it and point
+      # ALERTINT_CONFIG_FILE at the copy in your .env:
+      #   cp docker/agent.config.yaml docker/agent.config.local.yaml
+      #   echo 'ALERTINT_CONFIG_FILE=./agent.config.local.yaml' >> .env
+      # The path is relative to this docker/ directory; *.local.yaml is gitignored.
+      - ${ALERTINT_CONFIG_FILE:-./agent.config.yaml}:/etc/alertint/config.yaml:ro
       - agent-data:/data
     environment:
       ALERTINT_WEBHOOK_TOKEN: ${ALERTINT_WEBHOOK_TOKEN:?ALERTINT_WEBHOOK_TOKEN is required}
