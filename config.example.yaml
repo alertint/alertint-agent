@@ -76,3 +76,4 @@ logs:
       instance: ""                         #   drop: no stream-label equivalent
 
 log_level: info            # debug | info | warn | error
+log_format: auto           # auto | console | json (auto → console on a TTY, json otherwise)

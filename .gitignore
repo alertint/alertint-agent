@@ -70,3 +70,5 @@ CLAUDE.md
 /docs/adr/
 /specs/
 /plans/
+.scratch/
+/planning/

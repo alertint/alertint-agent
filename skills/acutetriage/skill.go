@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/audit"
+	llm "github.com/alertint/alertint-agent/internal/llm/anthropic"
 	"github.com/alertint/alertint-agent/internal/logs"
 	"github.com/alertint/alertint-agent/internal/notify"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
@@ -19,9 +20,12 @@ import (
 )
 
 // LLMClient is the interface the skill uses to call the model. The real
-// implementation is llm.Client; tests inject a fake.
+// implementation is anthropic.Client; tests inject a fake. Complete returns a
+// llm.Completion (raw JSON plus model/token/latency usage) so the skill can emit
+// its own "llm responded" action-trail line — the incident-aware caller owns
+// that line, not the read-only client (ADR 0004).
 type LLMClient interface {
-	Complete(ctx context.Context, system, user string, requiredKeys []string) (json.RawMessage, error)
+	Complete(ctx context.Context, system, user string, requiredKeys []string) (llm.Completion, error)
 }
 
 // Config holds skill tunables.
@@ -90,7 +94,8 @@ type alertOutput struct {
 // Run executes the full triage pipeline for the given incident.
 // It is safe to call from the IncidentSink goroutine.
 func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
-	s.logger.Info("acutetriage: starting", "incident_id", inc.ID, "alert_count", inc.AlertCount)
+	start := time.Now()
+	s.logger.Info("triage started", "incident", inc.ID, "alerts", inc.AlertCount)
 
 	// 1. Load member alerts.
 	alerts, err := s.st.GetIncidentAlerts(ctx, inc.ID)
@@ -108,11 +113,11 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 		minAlerts = 2 // Default: require at least 2 alerts
 	}
 	if len(alerts) < minAlerts {
-		s.logger.Info("acutetriage: skipping analysis - insufficient alerts",
-			"incident_id", inc.ID,
-			"alert_count", len(alerts),
+		s.logger.Info("triage skipped",
+			"incident", inc.ID,
+			"alerts", len(alerts),
 			"min_required", minAlerts,
-			"group_key", inc.GroupKey,
+			"group", inc.GroupKey,
 		)
 		return nil
 	}
@@ -121,9 +126,9 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 	// template or short-circuit the LLM entirely for known issues.
 	decision := s.cfg.Rules.EvaluateIncident(alerts)
 	if decision.Rule != nil {
-		s.logger.Info("acutetriage: rule matched",
-			"incident_id", inc.ID,
-			"rule_id", decision.Rule.ID,
+		s.logger.Info("rule matched",
+			"incident", inc.ID,
+			"rule", decision.Rule.ID,
 			"short_circuit", decision.ShortCircuit,
 			"suppress", decision.Suppress,
 		)
@@ -200,7 +205,7 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 		}
 		if allResolved {
 			incidentStatus = "resolved"
-			s.logger.Info("acutetriage: incident resolved - all alerts recovered", "incident_id", inc.ID, "alert_count", len(incAlerts))
+			s.logger.Info("incident resolved", "incident", inc.ID, "alerts", len(incAlerts))
 		}
 	}
 
@@ -220,9 +225,11 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 			OutputJSON:          raw,
 			Status:              incidentStatus,
 		}
-		if notifyErr := s.notifier.Notify(ctx, f); notifyErr != nil {
-			s.logger.Warn("acutetriage: notify failed", "incident_id", inc.ID, "err", notifyErr)
-		}
+		// Multi owns the per-sink notify outcome line(s): a quiet "notified" on
+		// success, a "notify partial"/"notify failed" summary plus one "notify
+		// sink failed" detail line per failing sink. The aggregated error it
+		// returns is already surfaced there, so we don't re-log it here.
+		_ = s.notifier.Notify(ctx, f)
 	}
 
 	// 9. Audit: incident analyzed.
@@ -246,10 +253,16 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 		})
 	}
 
-	s.logger.Info("acutetriage: done",
-		"incident_id", inc.ID,
-		"analysis_name", resp.AnalysisName,
-		"confidence", resp.Confidence,
+	ruleID := "none"
+	if decision.Rule != nil {
+		ruleID = decision.Rule.ID
+	}
+	s.logger.Info("triage done",
+		"incident", inc.ID,
+		"severity", resp.Severity,
+		"alerts", len(alerts),
+		"rule", ruleID,
+		"dur", time.Since(start),
 	)
 	return nil
 }
@@ -277,11 +290,11 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 	metrics := FetchMetrics(ctx, s.cfg.Prometheus, alerts, inc.FirstAlertAt)
 	// Best-effort log enrichment: never blocks or fails triage. end=now so a
 	// still-firing incident captures the freshest lines around analysis time.
-	enrichment := FetchLogs(ctx, s.cfg.LogSource, s.cfg.LogParams, alerts, inc.FirstAlertAt, time.Now().UTC(), s.logger)
+	enrichment := FetchLogs(ctx, s.cfg.LogSource, s.cfg.LogParams, alerts, inc.FirstAlertAt, time.Now().UTC(), inc.ID, s.logger)
 	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment)
-	raw, err := s.llm.Complete(ctx, s.systemPrompt(decision, len(alerts)), userPrompt, RequiredKeys)
+	comp, err := s.llm.Complete(ctx, s.systemPrompt(decision, len(alerts)), userPrompt, RequiredKeys)
 	if err != nil {
-		s.logger.Error("acutetriage: llm failed", "incident_id", inc.ID, "err", err)
+		s.logger.Error("llm failed", "incident", inc.ID, "err", err)
 		if s.auditor != nil {
 			_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.analysis_failed", map[string]any{
 				"incident_id": inc.ID,
@@ -290,7 +303,17 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		}
 		return nil, enrichment, fmt.Errorf("acutetriage: llm: %w", err)
 	}
-	return raw, enrichment, nil
+	// Action-trail success line, sibling to "llm failed" above: emitted by the
+	// incident-aware caller so it carries the incident ID and the usage the
+	// client already computed for the audit log.
+	s.logger.Info("llm responded",
+		"model", comp.Model,
+		"dur", comp.Latency,
+		"tokens_in", comp.InputTokens,
+		"tokens_out", comp.OutputTokens,
+		"incident", inc.ID,
+	)
+	return comp.Raw, enrichment, nil
 }
 
 // systemPrompt picks the analysis prompt: the rule-selected template when

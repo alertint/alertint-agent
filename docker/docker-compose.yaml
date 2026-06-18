@@ -43,6 +43,10 @@ services:
       SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
       # Optional: only used when logs.loki points at Grafana Cloud (basic auth)
       GRAFANA_CLOUD_LOKI_TOKEN: ${GRAFANA_CLOUD_LOKI_TOKEN:-}
+      # Force ANSI color in the console log format even though the container's
+      # stderr is not a TTY — `docker logs`/`docker compose logs` replays the
+      # captured bytes to your (color-capable) terminal. Set NO_COLOR to override.
+      CLICOLOR_FORCE: "1"
     command:
       - "serve"
       - "--config"

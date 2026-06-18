@@ -19,6 +19,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Demo log stack** — bundled Loki service in the Docker Compose dev stack plus
   `docker/push-synthetic-logs.py` (`task logs:push:local` / `task logs:push:cloud`) to seed
   fake multi-level log lines for local Loki or Grafana Cloud.
+- **Human-readable `console` log format** — a colored, one-line-per-event format
+  (`HH:MM:SS LEVEL  message · key=value …`) for live watching, plus an `auto` default that
+  resolves to `console` on a terminal and `json` otherwise (keyed off stderr). Selectable
+  via `log_format: auto | console | json` (config) or `--log-format`, with precedence
+  CLI flag > config > default. `CLICOLOR_FORCE` forces color when the stream is not a TTY
+  (e.g. `docker logs`); `NO_COLOR` always disables it.
+- **Operator action trail** — every meaningful action emits one INFO line that stands alone
+  with incident context: `webhook received`, `loki fetched`, `llm responded`, `finding`,
+  `notified` / `notify partial` / `notify failed`, `triage done`, plus a `notifiers ready`
+  line at startup listing the active sinks (and the Slack channel).
+- **Per-sink notification outcomes** — `Notifier.Name()` and a `Multi`-owned outcome line
+  name each sink `ok`/`FAIL`; any failure additionally logs one detail line per failing sink
+  carrying the full wrapped error (Slack includes the channel). Closes the silent-Slack-send
+  gap.
+- **Dev convenience** — `task docker:logs` / `task docker:up:logs` follow the agent container
+  with color intact; `CLICOLOR_FORCE=1` is set in the Compose dev stack.
+
+### Changed
+
+- **Default log format** flips from JSON to `auto` (console on a terminal, json otherwise);
+  non-TTY deployments (compose, pipes, journald) are unchanged.
+- **Log level/format are now config-driven** — the previously-dead `log_level` config value
+  is applied, and config loads before the logger is built so the first `alertint starting`
+  line honors it.
+- **Cleaner INFO view** — chatty internals (per-alert upsert, correlator bookkeeping,
+  selector derivation) moved to DEBUG; the default view reads as the action trail.
+- **Finding output** — the full machine-readable JSON finding to stdout is reserved for
+  `--log-level=debug`; at INFO the finding shows as a one-line `finding` summary while the
+  stdout sink still confirms delivery on the `notified` line.
+- **Anthropic client** — `Complete` now returns token usage and latency so the caller emits
+  `llm responded` without re-deriving them.
+
+### Removed
+
+- **`text` log format** (breaking) — removed and not aliased; an unknown `log_format`
+  (including `text`) fails loud at startup. The slog `TextHandler` and the separate 3-line
+  "card" finding notifier are gone — the finding is now the one-line `finding` summary.
 
 ## [0.1.0] - 2026-06-10
 

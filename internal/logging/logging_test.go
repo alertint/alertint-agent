@@ -5,7 +5,7 @@ package logging
 import (
 	"bytes"
 	"encoding/json"
-	"strings"
+	"io"
 	"testing"
 )
 
@@ -29,15 +29,28 @@ func TestNew_JSONHandlerEmitsStructuredOutput(t *testing.T) {
 	}
 }
 
-func TestNew_TextHandlerEmitsTextOutput(t *testing.T) {
-	var buf bytes.Buffer
-	logger, err := New(Options{Format: FormatText, Writer: &buf})
-	if err != nil {
-		t.Fatalf("New: %v", err)
+func TestNew_RejectsTextFormat(t *testing.T) {
+	// "text" was removed (no alias): a loud error beats silently re-rendering
+	// raw key=value output as console and breaking a parser.
+	if _, err := New(Options{Format: Format("text")}); err == nil {
+		t.Fatal("expected error for removed 'text' format")
 	}
-	logger.Info("hello")
-	if !strings.Contains(buf.String(), "msg=hello") {
-		t.Errorf("text output missing msg=hello: %q", buf.String())
+}
+
+func TestResolve_AutoOffTTY(t *testing.T) {
+	var buf bytes.Buffer
+	if got := Resolve(FormatAuto, &buf, func(io.Writer) bool { return true }); got != FormatConsole {
+		t.Errorf("auto on TTY = %q, want console", got)
+	}
+	if got := Resolve(FormatAuto, &buf, func(io.Writer) bool { return false }); got != FormatJSON {
+		t.Errorf("auto on non-TTY = %q, want json", got)
+	}
+	// Concrete formats pass through unchanged regardless of TTY-ness.
+	if got := Resolve(FormatConsole, &buf, func(io.Writer) bool { return false }); got != FormatConsole {
+		t.Errorf("console passthrough = %q, want console", got)
+	}
+	if got := Resolve(FormatJSON, &buf, func(io.Writer) bool { return true }); got != FormatJSON {
+		t.Errorf("json passthrough = %q, want json", got)
 	}
 }
 

@@ -67,10 +67,22 @@ context for the analysis — at the cost of a slower first finding.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `stdout` | bool | `true` | Emit one JSON line per finding to stdout. Recommended to leave on. |
+| `stdout` | bool | `true` | Deliver the finding to **stdout** as one JSON line. The full JSON is verbose detail: it is written **only at `--log-level=debug`** (consistently, in every format). At `info` the sink is still active — a send is confirmed on the `notified` line — but no JSON is written; the result shows as the one-line `finding` summary instead. Recommended to leave on. |
 | `slack.enabled` | bool | `false` | Post a Block Kit message to a Slack channel via the bot-token API (message updated in-place on resolve) |
 | `slack.bot_token_env` | string | — | Required when `slack.enabled: true`. Env var name holding the Slack bot token (`xoxb-…`, requires the `chat:write` scope) |
 | `slack.channel` | string | — | Required when `slack.enabled: true`. Channel name (e.g. `#alerts`) or ID (e.g. `C1234567890`) |
+
+At startup the agent logs one `notifiers ready` line listing the active sinks
+(and the Slack channel) so you can see where findings will go. Every analysis
+then logs, at INFO regardless of format:
+
+- one human-readable `finding` summary (severity, confidence, alert count,
+  incident id, analysis name) — the live-watch view of the result; and
+- one `notified` line confirming delivery per sink (`notified · stdout=ok
+  slack=ok …`), so a send — or a sink-specific failure — is never silent.
+
+The full JSON finding (`notify.stdout`, above) is the verbose machine
+representation, reserved for `--log-level=debug`.
 
 See [Slack](../notifications/slack.md) for the full setup walkthrough.
 
@@ -127,6 +139,54 @@ pack layout (`pack.yaml`, `rules/*.yaml`, `templates/*.md`); see
 
 One of `debug`, `info`, `warn`, `error`. Default: `info`.
 
+## `log_format`
+
+How log records are rendered. One of `auto`, `console`, `json`. Default:
+`auto`.
+
+| Value | Behavior |
+|---|---|
+| `auto` | Resolves to `console` when the log stream (stderr) is a terminal, `json` otherwise — so an interactive run is readable while a container or pipe stays machine-parseable. |
+| `console` | One human-readable, colored line per record (`HH:MM:SS LEVEL message · key=value …`). Color is emitted only on a TTY with `NO_COLOR` unset; redirected to a file it is plain text. |
+| `json` | One compact JSON object per record, for log shipping and aggregation. The stdout JSON finding line is unaffected by this setting. |
+
+> The legacy `text` format (slog's raw `key=value`) was **removed**. It is not
+> aliased — setting `log_format: text` fails loudly at startup rather than
+> silently re-rendering as `console` and breaking a `key=value` parser.
+
+Resolution keys off **stderr** (the log stream), not stdout, so a redirect
+like `alertint serve > out.txt` still shows the colored action trail on your
+terminal. To capture findings as machine-readable JSON for piping, run with
+`--log-level=debug` — see [`notify.stdout`](#notify). At `info` (any format) the
+finding appears as a one-line summary in the trail plus a `notified` line.
+
+When the colored console stream is captured and replayed to a terminal — e.g.
+`docker logs` / `docker compose logs`, where the container's stderr is not a
+TTY — set `CLICOLOR_FORCE=1` in the environment to force color on anyway.
+`NO_COLOR` still overrides it.
+
+### Level × format
+
+The two axes are orthogonal — level controls *how much* is logged, format
+controls *how it is rendered*:
+
+| | `console` | `json` |
+|---|---|---|
+| `info` (default) | clean one-line action trail — the live-watch view | compact JSON for shipping |
+| `debug` | action trail plus extra detail lines | full verbose JSON for troubleshooting |
+
+### Precedence and overrides
+
+The `--log-level` and `--log-format` CLI flags override the config values,
+which override the built-in defaults (`info` / `auto`):
+
+```text
+CLI flag  >  config (log_level / log_format)  >  built-in default
+```
+
+An unset flag (the default) falls through to config, so the flags are for
+one-off overrides — e.g. `alertint serve --config alertint.yaml --log-format json`.
+
 ## Full example
 
 ```yaml
@@ -175,6 +235,7 @@ prometheus:
   default_range_minutes: 60
 
 log_level: info
+log_format: auto
 ```
 
 ## Integration health
@@ -184,9 +245,12 @@ a trivial instant query, Slack via `auth.test`) and logs one line per
 integration:
 
 ```text
-level=INFO  msg="integration health: OK"     integration=prometheus detail=http://prometheus:9090
-level=WARN  msg="integration health: FAILED" integration=slack      detail=#alerts err="invalid_auth"
+15:04:05 INFO  integration health: OK · integration=prometheus detail=http://prometheus:9090
+15:04:05 WARN  integration health: FAILED · integration=slack detail=#alerts err=invalid_auth
 ```
+
+(shown in the default `console` format; with `log_format: json` the same
+records render as one JSON object per line.)
 
 `GET /health` includes the same statuses (cached for 60 s). The top-level
 `status` field reflects only agent liveness — a failing integration is

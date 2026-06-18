@@ -26,3 +26,34 @@ func TestRun_RejectsUnknownLogLevel(t *testing.T) {
 		t.Fatal("expected error for unknown log level")
 	}
 }
+
+// TestBuildLogger_Precedence verifies CLI flag > config > built-in default for
+// both level and format, and that auto resolves to json on a non-TTY writer
+// (a bytes.Buffer). The returned strings are what the startup line reports.
+func TestBuildLogger_Precedence(t *testing.T) {
+	cases := []struct {
+		name                                       string
+		flagLevel, flagFormat, cfgLevel, cfgFormat string
+		wantLevel, wantFormat                      string
+	}{
+		{"defaults when all empty", "", "", "", "", "info", "json"},
+		{"config applied over default", "", "", "debug", "json", "debug", "json"},
+		{"flag overrides config", "warn", "json", "debug", "console", "warn", "json"},
+		{"config format auto resolves to json off-tty", "", "", "", "auto", "info", "json"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			_, level, format, err := buildLogger(tc.flagLevel, tc.flagFormat, tc.cfgLevel, tc.cfgFormat, &buf)
+			if err != nil {
+				t.Fatalf("buildLogger: %v", err)
+			}
+			if level != tc.wantLevel {
+				t.Errorf("level = %q, want %q", level, tc.wantLevel)
+			}
+			if format != tc.wantFormat {
+				t.Errorf("format = %q, want %q", format, tc.wantFormat)
+			}
+		})
+	}
+}

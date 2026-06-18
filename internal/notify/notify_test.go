@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -39,7 +40,7 @@ func sampleFinding() notify.Finding {
 
 func TestStdoutWritesJSON(t *testing.T) {
 	var buf bytes.Buffer
-	n := stdout.New(&buf, nil)
+	n := stdout.New(&buf, nil, true)
 
 	if err := n.Notify(context.Background(), sampleFinding()); err != nil {
 		t.Fatalf("Notify: %v", err)
@@ -60,7 +61,7 @@ func TestStdoutWritesJSON(t *testing.T) {
 
 func TestStdoutContainsIncidentID(t *testing.T) {
 	var buf bytes.Buffer
-	n := stdout.New(&buf, nil)
+	n := stdout.New(&buf, nil, true)
 
 	f := sampleFinding()
 	f.IncidentID = "unique-test-id-999"
@@ -68,6 +69,19 @@ func TestStdoutContainsIncidentID(t *testing.T) {
 
 	if !strings.Contains(buf.String(), "unique-test-id-999") {
 		t.Errorf("output does not contain incident_id\noutput: %s", buf.String())
+	}
+}
+
+// TestStdoutNonVerboseWritesNothing verifies the stdout sink is silent (but
+// succeeds) when not verbose — the full JSON is reserved for debug level.
+func TestStdoutNonVerboseWritesNothing(t *testing.T) {
+	var buf bytes.Buffer
+	n := stdout.New(&buf, nil, false)
+	if err := n.Notify(context.Background(), sampleFinding()); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("non-verbose stdout should write nothing, got: %q", buf.String())
 	}
 }
 
@@ -189,22 +203,158 @@ func TestSlackClientErrorPropagates(t *testing.T) {
 // Multi notifier tests
 // --------------------------------------------------------------------------
 
+// fakeNotifier is a controllable Notifier for testing Multi's outcome lines.
+type fakeNotifier struct {
+	name string
+	err  error
+}
+
+func (f *fakeNotifier) Name() string                                 { return f.name }
+func (f *fakeNotifier) Notify(context.Context, notify.Finding) error { return f.err }
+
+// testLogger returns a logger writing text records to buf so tests can assert
+// on the rendered notify outcome lines.
+func testLogger(buf *bytes.Buffer) *slog.Logger {
+	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
+
 func TestMultiCallsBoth(t *testing.T) {
 	client := &mockSlackClient{returnTS: "ts", returnCh: "C1"}
 	store := &mockThreadStore{err: errors.New("not found")}
 
-	var buf bytes.Buffer
-	sn := stdout.New(&buf, nil)
+	var out bytes.Buffer
+	sn := stdout.New(&out, nil, true)
 	sk := slack.NewWithClient(client, "#alerts", store, nil)
-	m := notify.NewMulti(sn, sk)
+	var logBuf bytes.Buffer
+	m := notify.NewMulti(testLogger(&logBuf), sn, sk)
 
 	if err := m.Notify(context.Background(), sampleFinding()); err != nil {
 		t.Fatalf("Multi.Notify: %v", err)
 	}
-	if buf.Len() == 0 {
+	if out.Len() == 0 {
 		t.Error("stdout notifier was not called")
 	}
 	if client.postCalls == 0 {
 		t.Error("slack notifier was not called")
+	}
+}
+
+// TestMultiLogsFindingSummary verifies Multi emits one human-readable "finding"
+// summary line per analysis (the live-watch view of the result), even when no
+// delivery sinks are wired.
+func TestMultiLogsFindingSummary(t *testing.T) {
+	var logBuf bytes.Buffer
+	m := notify.NewMulti(testLogger(&logBuf)) // no sinks: console/info live view
+	if err := m.Notify(context.Background(), sampleFinding()); err != nil {
+		t.Fatalf("Multi.Notify: %v", err)
+	}
+	s := logBuf.String()
+	if !strings.Contains(s, "msg=finding") {
+		t.Fatalf("missing finding summary line: %s", s)
+	}
+	for _, tok := range []string{"severity=high", "confidence=85%", "alerts=3", "incident=inc-001"} {
+		if !strings.Contains(s, tok) {
+			t.Errorf("finding summary missing %q: %s", tok, s)
+		}
+	}
+	// With no sinks there is nothing to deliver, so no per-sink outcome line.
+	if strings.Contains(s, "notified") || strings.Contains(s, "notify ") {
+		t.Errorf("no sinks should yield no notify outcome line: %s", s)
+	}
+}
+
+// TestMultiAllOKLogsOneNotified verifies a fully-successful fan-out logs a
+// single "notified" summary with one ok token per sink and no detail lines.
+func TestMultiAllOKLogsOneNotified(t *testing.T) {
+	var logBuf bytes.Buffer
+	m := notify.NewMulti(testLogger(&logBuf),
+		&fakeNotifier{name: "stdout"},
+		&fakeNotifier{name: "card"},
+		&fakeNotifier{name: "slack"},
+	)
+	if err := m.Notify(context.Background(), sampleFinding()); err != nil {
+		t.Fatalf("Multi.Notify: %v", err)
+	}
+	s := logBuf.String()
+	if !strings.Contains(s, "msg=notified") {
+		t.Errorf("missing notified summary: %s", s)
+	}
+	for _, tok := range []string{"stdout=ok", "card=ok", "slack=ok", "incident=inc-001"} {
+		if !strings.Contains(s, tok) {
+			t.Errorf("summary missing %q: %s", tok, s)
+		}
+	}
+	if strings.Contains(s, "notify sink failed") {
+		t.Errorf("success path must not emit a sink-failed detail line: %s", s)
+	}
+}
+
+// TestMultiPartialLogsSummaryAndDetail verifies one failing sink yields a
+// "notify partial" WARN summary plus a "notify sink failed" detail line naming
+// the sink and carrying its full wrapped error, and the aggregated error is
+// still returned.
+func TestMultiPartialLogsSummaryAndDetail(t *testing.T) {
+	var logBuf bytes.Buffer
+	wrapped := errors.New("channel #alerts: post message: invalid_auth")
+	m := notify.NewMulti(testLogger(&logBuf),
+		&fakeNotifier{name: "stdout"},
+		&fakeNotifier{name: "card"},
+		&fakeNotifier{name: "slack", err: wrapped},
+	)
+	err := m.Notify(context.Background(), sampleFinding())
+	if err == nil {
+		t.Fatal("expected aggregated error, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid_auth") {
+		t.Errorf("aggregated error should be the failing sink's: %v", err)
+	}
+	s := logBuf.String()
+	if !strings.Contains(s, `msg="notify partial"`) {
+		t.Errorf("missing notify partial summary: %s", s)
+	}
+	if !strings.Contains(s, "slack=FAIL") || !strings.Contains(s, "stdout=ok") || !strings.Contains(s, "card=ok") {
+		t.Errorf("partial summary tokens wrong: %s", s)
+	}
+	if !strings.Contains(s, `msg="notify sink failed"`) || !strings.Contains(s, "sink=slack") {
+		t.Errorf("missing per-sink detail line: %s", s)
+	}
+	if !strings.Contains(s, "channel #alerts: post message: invalid_auth") {
+		t.Errorf("detail line must carry the full wrapped error: %s", s)
+	}
+}
+
+// TestMultiAllFailLogsError verifies that when every sink fails the summary is
+// an ERROR "notify failed" and the aggregated error is still returned.
+func TestMultiAllFailLogsError(t *testing.T) {
+	var logBuf bytes.Buffer
+	m := notify.NewMulti(testLogger(&logBuf),
+		&fakeNotifier{name: "stdout", err: errors.New("stdout: write: broken pipe")},
+		&fakeNotifier{name: "slack", err: errors.New("channel #alerts: post message: invalid_auth")},
+	)
+	if err := m.Notify(context.Background(), sampleFinding()); err == nil {
+		t.Fatal("expected aggregated error, got nil")
+	}
+	s := logBuf.String()
+	if !strings.Contains(s, "level=ERROR") || !strings.Contains(s, `msg="notify failed"`) {
+		t.Errorf("all-fail must log ERROR notify failed: %s", s)
+	}
+	// One detail line per failing sink.
+	if strings.Count(s, "notify sink failed") != 2 {
+		t.Errorf("want 2 per-sink detail lines, got: %s", s)
+	}
+}
+
+// TestMultiResolvedStatusFlows verifies a resolved Finding carries status=resolved
+// into the outcome line (the path the resolution notifier relies on).
+func TestMultiResolvedStatusFlows(t *testing.T) {
+	var logBuf bytes.Buffer
+	m := notify.NewMulti(testLogger(&logBuf), &fakeNotifier{name: "stdout"})
+	f := sampleFinding()
+	f.Status = "resolved"
+	if err := m.Notify(context.Background(), f); err != nil {
+		t.Fatalf("Multi.Notify: %v", err)
+	}
+	if !strings.Contains(logBuf.String(), "status=resolved") {
+		t.Errorf("resolved finding should log status=resolved: %s", logBuf.String())
 	}
 }

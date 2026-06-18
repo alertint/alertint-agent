@@ -3,11 +3,14 @@
 package acutetriage_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,9 +31,15 @@ type fakeLLM struct {
 	calls    int
 }
 
-func (f *fakeLLM) Complete(_ context.Context, _, _ string, _ []string) (json.RawMessage, error) {
+func (f *fakeLLM) Complete(_ context.Context, _, _ string, _ []string) (llm.Completion, error) {
 	f.calls++
-	return f.response, f.err
+	return llm.Completion{
+		Raw:          f.response,
+		Model:        "fake-model",
+		InputTokens:  11,
+		OutputTokens: 22,
+		Latency:      5 * time.Millisecond,
+	}, f.err
 }
 
 // --------------------------------------------------------------------------
@@ -158,6 +167,35 @@ func TestRunPersistsOutput(t *testing.T) {
 	var raw map[string]any
 	if err := json.Unmarshal([]byte(outputJSON), &raw); err != nil {
 		t.Errorf("output_json not valid JSON: %v", err)
+	}
+}
+
+// TestRunEmitsLLMResponded verifies the skill emits the "llm responded"
+// action-trail line on the happy path, carrying model, token counts, and the
+// incident ID (the success sibling of the "llm failed" error line).
+func TestRunEmitsLLMResponded(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	a1 := insertTestAlert(t, st, ctx, inc.ID, "fp-lr1", map[string]string{"alertname": "DiskFull"})
+	a2 := insertTestAlert(t, st, ctx, inc.ID, "fp-lr2", map[string]string{"alertname": "DiskFull"})
+
+	fllm := &fakeLLM{response: validLLMResponse([]string{a1.ID, a2.ID})}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	skill := acutetriage.New(acutetriage.Config{MinAlerts: 2}, st, fllm, nil, nil, logger)
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	s := buf.String()
+	if !strings.Contains(s, "llm responded") {
+		t.Fatalf("missing llm responded line: %s", s)
+	}
+	for _, tok := range []string{"model=fake-model", "tokens_in=11", "tokens_out=22", "incident=" + inc.ID} {
+		if !strings.Contains(s, tok) {
+			t.Errorf("llm responded missing %q: %s", tok, s)
+		}
 	}
 }
 

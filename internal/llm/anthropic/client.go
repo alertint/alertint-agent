@@ -112,20 +112,33 @@ func NewWithHTTPClient(cfg Config, auditor *audit.Auditor, logger *slog.Logger, 
 	}
 }
 
-// Complete sends systemPrompt + userPrompt to the model and returns the
-// raw JSON extracted from the assistant's first text content block.
+// Completion is the result of a Complete call: the validated raw JSON plus the
+// usage figures the client already computes for the audit log. Returning them
+// (rather than discarding them) lets the incident-aware caller emit an "llm
+// responded" action-trail line without re-deriving anything — see ADR 0004.
+type Completion struct {
+	Raw          json.RawMessage // validated model JSON (nil on error)
+	Model        string          // the model that served the request
+	InputTokens  int
+	OutputTokens int
+	Latency      time.Duration
+}
+
+// Complete sends systemPrompt + userPrompt to the model and returns a
+// Completion whose Raw is the JSON extracted from the assistant's first text
+// content block, alongside the model, token usage, and latency.
 //
 // requiredKeys is a list of top-level JSON keys that must be present in
 // the parsed response object. If any key is missing, ErrSchemaViolation
 // is returned along with the raw response for debugging.
 //
-// The caller is responsible for unmarshaling the returned json.RawMessage
-// into their target type.
+// The caller is responsible for unmarshaling Completion.Raw into their target
+// type.
 func (c *Client) Complete(
 	ctx context.Context,
 	systemPrompt, userPrompt string,
 	requiredKeys []string,
-) (json.RawMessage, error) {
+) (Completion, error) {
 	start := c.now()
 
 	reqHash := promptHash(systemPrompt, userPrompt)
@@ -137,13 +150,13 @@ func (c *Client) Complete(
 	}
 
 	raw, inputTokens, outputTokens, err := c.callWithRetry(ctx, systemPrompt, userPrompt)
-	latencyMs := c.now().Sub(start).Milliseconds()
+	latency := c.now().Sub(start)
 
 	if c.auditor != nil {
 		payload := map[string]any{
 			"model":         c.cfg.Model,
 			"prompt_hash":   reqHash,
-			"latency_ms":    latencyMs,
+			"latency_ms":    latency.Milliseconds(),
 			"input_tokens":  inputTokens,
 			"output_tokens": outputTokens,
 		}
@@ -153,14 +166,20 @@ func (c *Client) Complete(
 		_ = c.auditor.Append(ctx, "llm.anthropic", "llm.response", payload)
 	}
 
+	comp := Completion{
+		Raw:          raw,
+		Model:        c.cfg.Model,
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+		Latency:      latency,
+	}
 	if err != nil {
-		return nil, err
+		return comp, err
 	}
-
 	if err := validateKeys(raw, requiredKeys); err != nil {
-		return raw, err
+		return comp, err
 	}
-	return raw, nil
+	return comp, nil
 }
 
 // ----------------------------------------------------------------------
