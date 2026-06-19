@@ -3,11 +3,15 @@
 package ingress
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/alertint/alertint-agent/internal/store"
 )
@@ -91,4 +95,79 @@ func synthTitle(kind string, labels map[string]string, version string) string {
 		parts = append(parts, v)
 	}
 	return strings.Join(parts, " ")
+}
+
+// changeReceiver wraps ParseChange → store.InsertChange. It has NO correlator
+// sink — that distinct sink is the entire reason changes are a separate receiver:
+// a change enriches incidents but must never spawn one.
+type changeReceiver struct {
+	store         *store.Store
+	token         []byte
+	retentionDays int
+	logger        *slog.Logger
+	now           func() time.Time
+	newID         func() string
+}
+
+// NewChangeReceiver builds the change-event receiver. retentionDays bounds the
+// append-only changes table: it prunes on insert (plus the one-shot startup
+// prune in runServe) so the table stays bounded regardless of uptime.
+func NewChangeReceiver(st *store.Store, token string, retentionDays int, logger *slog.Logger) Receiver {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &changeReceiver{
+		store:         st,
+		token:         []byte(token),
+		retentionDays: retentionDays,
+		logger:        logger,
+		now:           func() time.Time { return time.Now().UTC() },
+		newID:         uuid.NewString,
+	}
+}
+
+func (r *changeReceiver) Route() string { return "POST /webhook/change" }
+func (r *changeReceiver) Name() string  { return "change" }
+func (r *changeReceiver) Token() []byte { return r.token }
+
+func (r *changeReceiver) Ingest(ctx context.Context, body []byte) (Summary, error) {
+	changes, err := ParseChange(body, r.now())
+	if err != nil {
+		return Summary{}, err // → 400
+	}
+
+	ids := make([]string, 0, len(changes))
+	for i := range changes {
+		changes[i].ID = r.newID()
+		if err := r.store.InsertChange(ctx, changes[i]); err != nil {
+			// Logged + swallowed: like the alert path, failing the response would
+			// only trigger pointless retries. The audit row still records intent.
+			r.logger.Error("insert change failed",
+				slog.String("change_id", changes[i].ID),
+				slog.String("err", err.Error()),
+			)
+			continue
+		}
+		ids = append(ids, changes[i].ID)
+	}
+
+	// Prune on insert (spec §4.3): bound the append-only table continuously.
+	// Sparse webhooks → negligible cost; logged-and-swallowed like the insert.
+	if r.retentionDays > 0 {
+		cutoff := r.now().AddDate(0, 0, -r.retentionDays)
+		if _, err := r.store.PruneChanges(ctx, cutoff); err != nil {
+			r.logger.Warn("change prune failed", slog.String("err", err.Error()))
+		}
+	}
+
+	r.logger.Info("change received",
+		slog.Int("changes", len(changes)),
+		slog.Int("persisted", len(ids)),
+	)
+
+	return Summary{Kind: "change.received", Audit: map[string]any{
+		"received":   len(changes),
+		"persisted":  len(ids),
+		"change_ids": ids,
+	}}, nil
 }

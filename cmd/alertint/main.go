@@ -160,6 +160,18 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 	defer func() { _ = st.Close() }()
 
+	// One-shot startup prune: the per-insert prune bounds the table while the
+	// agent runs; this handles the gap where it was stopped while changes aged
+	// out past retention.
+	if cfg.Changes.Ingress.Enabled || cfg.Changes.Enrichment.Enabled {
+		cutoff := time.Now().UTC().AddDate(0, 0, -cfg.Changes.RetentionDays)
+		if n, err := st.PruneChanges(ctx, cutoff); err != nil {
+			logger.Warn("changes startup prune failed", slog.String("err", err.Error()))
+		} else if n > 0 {
+			logger.Info("changes pruned at startup", slog.Int64("removed", n), slog.Int("retention_days", cfg.Changes.RetentionDays))
+		}
+	}
+
 	auditor := audit.New(st.DB())
 
 	// Load the rule engine. The embedded baseline pack needs zero
@@ -321,7 +333,13 @@ func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor,
 		}
 		receivers = append(receivers, ingress.NewAlertReceiver(st, token, cor.Accept, logger))
 	}
-	// Task 5 appends the changeReceiver here, gated on cfg.Changes.Ingress.Enabled.
+	if cfg.Changes.Ingress.Enabled {
+		token, err := cfg.ChangesWebhookToken()
+		if err != nil {
+			return nil, nil, err
+		}
+		receivers = append(receivers, ingress.NewChangeReceiver(st, token, cfg.Changes.RetentionDays, logger))
+	}
 
 	if len(receivers) == 0 {
 		logger.Info("no inbound receivers enabled; /health endpoint not served")

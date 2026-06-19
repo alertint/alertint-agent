@@ -3,8 +3,16 @@
 package ingress
 
 import (
+	"context"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/alertint/alertint-agent/internal/audit"
+	"github.com/alertint/alertint-agent/internal/store"
 )
 
 func TestParseChange_HappyPath(t *testing.T) {
@@ -88,4 +96,73 @@ func TestParseChange_Rejects(t *testing.T) {
 			t.Fatalf("%s: want error", name)
 		}
 	}
+}
+
+func TestChangeReceiver_PersistsAndAudits(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	auditor := audit.New(st.DB())
+
+	// A sink that must NEVER be called by the change route.
+	alertSinkCalled := false
+	sink := func(context.Context, store.Alert) error { alertSinkCalled = true; return nil }
+
+	host, err := New(Options{
+		Store:   st,
+		Auditor: auditor,
+		Receivers: []Receiver{
+			NewAlertReceiver(st, "alert-tok", sink, slog.Default()),
+			NewChangeReceiver(st, "change-tok", 30, slog.Default()),
+		},
+		Logger: slog.Default(),
+	})
+	if err != nil {
+		t.Fatalf("host: %v", err)
+	}
+	srv := httptest.NewServer(host.Handler())
+	defer srv.Close()
+
+	body := `{"source":"github-actions","kind":"deploy","labels":{"service":"checkout"},"occurred_at":"2026-06-18T10:42:00Z"}`
+	req, _ := http.NewRequest("POST", srv.URL+"/webhook/change", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer change-tok")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+
+	got, _ := st.ChangesInWindow(ctx, time.Date(2026, 6, 18, 10, 0, 0, 0, time.UTC), time.Date(2026, 6, 18, 11, 0, 0, 0, time.UTC))
+	if len(got) != 1 || got[0].ID == "" {
+		t.Fatalf("want 1 stored change with stamped ID, got %#v", got)
+	}
+	if alertSinkCalled {
+		t.Fatal("change route must not invoke the alert sink / correlator")
+	}
+
+	// Audit row recorded under kind=change.received.
+	var n int
+	if err := st.DB().QueryRow(`SELECT COUNT(*) FROM audit_log WHERE kind='change.received'`).Scan(&n); err != nil {
+		t.Fatalf("count audit: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("change.received audit rows = %d, want 1", n)
+	}
+
+	// Per-route token isolation: alert token must not authorize the change route.
+	req2, _ := http.NewRequest("POST", srv.URL+"/webhook/change", strings.NewReader(body))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Authorization", "Bearer alert-tok")
+	resp2, _ := http.DefaultClient.Do(req2)
+	if resp2.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("cross-token status = %d, want 401", resp2.StatusCode)
+	}
+	_ = resp2.Body.Close()
 }
