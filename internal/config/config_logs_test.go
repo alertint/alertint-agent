@@ -203,7 +203,6 @@ func TestLogs_LineFilterEmptyVsOmitted(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "agent.db")
 	base := `
 alertmanager:
-  webhook_addr: ":9911"
   webhook_token_env: ALERTINT_WEBHOOK_TOKEN
 llm:
   api_key_env: ANTHROPIC_API_KEY
@@ -238,7 +237,6 @@ func TestLogs_RejectsUnknownKeyUnderLoki(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "agent.db")
 	yaml := `
 alertmanager:
-  webhook_addr: ":9911"
   webhook_token_env: ALERTINT_WEBHOOK_TOKEN
 llm:
   api_key_env: ANTHROPIC_API_KEY
@@ -262,7 +260,6 @@ func TestLogs_LabelMapParses(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "agent.db")
 	yaml := `
 alertmanager:
-  webhook_addr: ":9911"
   webhook_token_env: ALERTINT_WEBHOOK_TOKEN
 llm:
   api_key_env: ANTHROPIC_API_KEY

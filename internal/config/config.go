@@ -31,7 +31,9 @@ import (
 // carries its own enabled flag so deployments can mix and match sources and
 // sinks. Only the Alertmanager webhook receiver is enabled by default.
 type Config struct {
+	Receivers    ReceiversConfig    `yaml:"receivers"`
 	Alertmanager AlertmanagerConfig `yaml:"alertmanager"`
+	Changes      ChangesConfig      `yaml:"changes,omitempty"`
 	Storage      StorageConfig      `yaml:"storage"`
 	LLM          LLMConfig          `yaml:"llm"`
 	Correlator   CorrelatorConfig   `yaml:"correlator"`
@@ -106,12 +108,42 @@ type MCPConfig struct {
 	TokenEnv string `yaml:"token_env"`
 }
 
-// AlertmanagerConfig configures the inbound Alertmanager webhook receiver.
-// It also serves GET /health, so disabling it removes that endpoint too.
+// AlertmanagerConfig configures the inbound Alertmanager webhook receiver. Its
+// listen address is the shared receivers.address (see ReceiversConfig).
 type AlertmanagerConfig struct {
 	Enabled         bool   `yaml:"enabled"`
-	WebhookAddr     string `yaml:"webhook_addr"`
 	WebhookTokenEnv string `yaml:"webhook_token_env"`
+}
+
+// ReceiversConfig holds settings shared by every inbound webhook receiver. The
+// listen address is a server concern, not a per-receiver one, so all receivers
+// (alertmanager, change, later zabbix) mount on this single address.
+type ReceiversConfig struct {
+	Address string `yaml:"address"`
+}
+
+// ChangesConfig is the dual-role change-events namespace: Ingress receives
+// change webhooks (write surface); Enrichment uses stored changes (triage +
+// MCP). RetentionDays bounds the append-only changes table.
+type ChangesConfig struct {
+	Ingress       ChangesIngressConfig    `yaml:"ingress"`
+	Enrichment    ChangesEnrichmentConfig `yaml:"enrichment"`
+	RetentionDays int                     `yaml:"retention_days"`
+}
+
+// ChangesIngressConfig configures the inbound change-event webhook receiver
+// (write surface).
+type ChangesIngressConfig struct {
+	Enabled         bool   `yaml:"enabled"`
+	WebhookTokenEnv string `yaml:"webhook_token_env"`
+}
+
+// ChangesEnrichmentConfig configures using stored changes at triage time and
+// over MCP (read surface).
+type ChangesEnrichmentConfig struct {
+	Enabled       bool `yaml:"enabled"`
+	WindowMinutes int  `yaml:"window_minutes"`
+	MaxEvents     int  `yaml:"max_events"`
 }
 
 // StorageConfig configures the SQLite store.
@@ -151,9 +183,18 @@ type SlackConfig struct {
 // represents the sensible baseline that Load merges user input into.
 func Defaults() Config {
 	return Config{
+		Receivers: ReceiversConfig{
+			Address: ":9911",
+		},
 		Alertmanager: AlertmanagerConfig{
-			Enabled:     true,
-			WebhookAddr: ":9911",
+			Enabled: true,
+		},
+		Changes: ChangesConfig{
+			Enrichment: ChangesEnrichmentConfig{
+				WindowMinutes: 120,
+				MaxEvents:     10,
+			},
+			RetentionDays: 30,
 		},
 		Storage: StorageConfig{
 			SQLitePath: "./alertint-agent.db",
@@ -241,6 +282,7 @@ func (c *Config) Validate() error {
 	errs = append(errs, c.validateNotify()...)
 	errs = append(errs, c.validatePrometheus()...)
 	errs = append(errs, c.validateLogs()...)
+	errs = append(errs, c.validateChanges()...)
 	errs = append(errs, c.validateRules()...)
 
 	if !validLogLevel(c.LogLevel) {
@@ -256,16 +298,25 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// validateServing covers the two listener integrations (alertmanager webhook
-// receiver and MCP server) and the requirement that at least one is enabled.
+// validateServing covers the inbound webhook host (all receivers share
+// receivers.address), the MCP server, and the requirement that at least one of
+// them is enabled. NOTE: when the Zabbix integration lands it adds
+// `|| c.Zabbix.Ingress.Enabled` to inboundEnabled and the nothing-to-serve
+// check — the two specs compose.
 func (c *Config) validateServing() []string {
 	var errs []string
+	inboundEnabled := c.Alertmanager.Enabled || c.Changes.Ingress.Enabled
+	if inboundEnabled && strings.TrimSpace(c.Receivers.Address) == "" {
+		errs = append(errs, "receivers.address is required when any receiver is enabled (alertmanager or changes.ingress)")
+	}
 	if c.Alertmanager.Enabled {
-		if strings.TrimSpace(c.Alertmanager.WebhookAddr) == "" {
-			errs = append(errs, "alertmanager.webhook_addr is required when alertmanager is enabled")
-		}
 		if strings.TrimSpace(c.Alertmanager.WebhookTokenEnv) == "" {
 			errs = append(errs, "alertmanager.webhook_token_env is required when alertmanager is enabled (env var name holding the bearer token)")
+		}
+	}
+	if c.Changes.Ingress.Enabled {
+		if strings.TrimSpace(c.Changes.Ingress.WebhookTokenEnv) == "" {
+			errs = append(errs, "changes: ingress: webhook_token_env is required when enabled (env var name holding the bearer token)")
 		}
 	}
 	if c.MCP.Enabled {
@@ -276,8 +327,26 @@ func (c *Config) validateServing() []string {
 			errs = append(errs, "mcp.token_env is required when mcp is enabled")
 		}
 	}
-	if !c.Alertmanager.Enabled && !c.MCP.Enabled {
-		errs = append(errs, "nothing to serve: enable at least one of alertmanager or mcp")
+	if !c.Alertmanager.Enabled && !c.Changes.Ingress.Enabled && !c.MCP.Enabled {
+		errs = append(errs, "nothing to serve: enable at least one of alertmanager, changes.ingress, or mcp")
+	}
+	return errs
+}
+
+// validateChanges checks the enrichment tunables and retention. Ingress-token
+// validation lives in validateServing (it gates the inbound server).
+func (c *Config) validateChanges() []string {
+	var errs []string
+	if c.Changes.Enrichment.Enabled {
+		if c.Changes.Enrichment.WindowMinutes <= 0 {
+			errs = append(errs, "changes: enrichment: window_minutes must be > 0")
+		}
+		if c.Changes.Enrichment.MaxEvents <= 0 {
+			errs = append(errs, "changes: enrichment: max_events must be > 0")
+		}
+	}
+	if (c.Changes.Ingress.Enabled || c.Changes.Enrichment.Enabled) && c.Changes.RetentionDays <= 0 {
+		errs = append(errs, "changes: retention_days must be > 0 when changes are enabled")
 	}
 	return errs
 }
@@ -447,6 +516,16 @@ func (c *Config) WebhookToken() (string, error) {
 		return "", nil
 	}
 	return requireEnv(c.Alertmanager.WebhookTokenEnv, "alertmanager.webhook_token_env")
+}
+
+// ChangesWebhookToken returns the bearer token for the change webhook receiver,
+// resolved from the env var named by Changes.Ingress.WebhookTokenEnv. Returns
+// an empty string and nil error when change ingestion is disabled.
+func (c *Config) ChangesWebhookToken() (string, error) {
+	if !c.Changes.Ingress.Enabled {
+		return "", nil
+	}
+	return requireEnv(c.Changes.Ingress.WebhookTokenEnv, "changes.ingress.webhook_token_env")
 }
 
 // LLMAPIKey returns the LLM API key, resolved from the env var named by

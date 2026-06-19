@@ -89,7 +89,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	fs := flag.NewFlagSet("alertint serve", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cfgPath := fs.String("config", "", "path to alertint YAML config")
-	webhookAddr := fs.String("webhook-addr", "", "override alertmanager.webhook_addr from config (e.g. 0.0.0.0:9911)")
+	receiversAddr := fs.String("receivers-addr", "", "override receivers.address from config (e.g. 0.0.0.0:9911)")
 	mcpAddr := fs.String("mcp-addr", "", "override mcp.addr from config (e.g. 0.0.0.0:9912)")
 	// Empty sentinel defaults: an unset flag falls through to config, so
 	// precedence is CLI flag > config > built-in default (info / auto).
@@ -147,8 +147,8 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		slog.String("log_format", format),
 	)
 
-	if *webhookAddr != "" {
-		cfg.Alertmanager.WebhookAddr = *webhookAddr
+	if *receiversAddr != "" {
+		cfg.Receivers.Address = *receiversAddr
 	}
 	if *mcpAddr != "" {
 		cfg.MCP.Addr = *mcpAddr
@@ -335,7 +335,7 @@ func startWebhook(cfg *config.Config, st *store.Store, auditor *audit.Auditor, c
 	}
 
 	srv := &http.Server{
-		Addr:              cfg.Alertmanager.WebhookAddr,
+		Addr:              cfg.Receivers.Address,
 		Handler:           hook.Handler(),
 		ReadTimeout:       ingress.DefaultReadTimeout,
 		ReadHeaderTimeout: ingress.DefaultReadTimeout,
@@ -346,7 +346,7 @@ func startWebhook(cfg *config.Config, st *store.Store, auditor *audit.Auditor, c
 	ch := make(chan error, 1)
 	go func() {
 		logger.Info("webhook listening",
-			slog.String("addr", cfg.Alertmanager.WebhookAddr),
+			slog.String("addr", cfg.Receivers.Address),
 			slog.String("path", "/webhook/alertmanager"),
 		)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

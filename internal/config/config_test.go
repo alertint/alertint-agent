@@ -10,8 +10,9 @@ import (
 )
 
 const minimalValidYAML = `
+receivers:
+  address: ":9911"
 alertmanager:
-  webhook_addr: ":9911"
   webhook_token_env: ALERTINT_WEBHOOK_TOKEN
 storage:
   sqlite_path: "./alertint-agent.db"
@@ -93,8 +94,8 @@ func TestLoad_MinimalValidConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Alertmanager.WebhookAddr != ":9911" {
-		t.Errorf("WebhookAddr = %q", cfg.Alertmanager.WebhookAddr)
+	if cfg.Receivers.Address != ":9911" {
+		t.Errorf("Receivers.Address = %q", cfg.Receivers.Address)
 	}
 	if cfg.Correlator.MinAlerts != 2 {
 		t.Errorf("MinAlerts = %d, want 2", cfg.Correlator.MinAlerts)
@@ -106,8 +107,9 @@ func TestLoad_MinimalValidConfig(t *testing.T) {
 
 func TestLoad_AppliesDefaultsForOmittedFields(t *testing.T) {
 	yaml := `
+receivers:
+  address: ":9000"
 alertmanager:
-  webhook_addr: ":9000"
   webhook_token_env: TOK
 llm:
   api_key_env: ANTHROPIC_API_KEY
@@ -177,7 +179,6 @@ func TestValidate_AlertmanagerDisabledSkipsRequiredFields(t *testing.T) {
 	cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
 	cfg.LLM.APIKeyEnv = "KEY"
 	cfg.Alertmanager.Enabled = false
-	cfg.Alertmanager.WebhookAddr = ""
 	// WebhookTokenEnv intentionally unset; keep something to serve.
 	cfg.MCP.Enabled = true
 	cfg.MCP.TokenEnv = "ALERTINT_MCP_TOKEN"

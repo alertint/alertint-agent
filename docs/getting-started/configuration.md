@@ -14,21 +14,49 @@ Start from `config.example.yaml` at the repo root.
 Secrets are **never** stored inline. Fields named `*_env` hold the
 **name** of an environment variable; the value is read at startup.
 
-## `alertmanager`
+## `receivers`
 
-The inbound Alertmanager webhook receiver. Enabled by default — it is the
-only integration that is. Every integration section carries an `enabled`
-flag; when a section is enabled, its required fields must be set or the
-agent refuses to start. At least one of `alertmanager` or `mcp` must be
-enabled.
+Settings shared by **every** inbound webhook receiver. The listen address is a
+server concern, not a per-receiver one, so all receivers (alertmanager, change,
+…) mount on this single address.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | bool | `true` | Run the webhook receiver (also serves `GET /health`) |
-| `webhook_addr` | string | `"0.0.0.0:9911"` | TCP address the HTTP server binds to |
+| `address` | string | `":9911"` | TCP address the inbound webhook HTTP server binds to (also serves `GET /health`). Required when any receiver is enabled. |
+
+> Renamed from `alertmanager.webhook_addr` (and the `--webhook-addr` flag → `--receivers-addr`). Strict config rejects the old key, so a stale `alertmanager.webhook_addr` fails loud at startup.
+
+## `alertmanager`
+
+The inbound Alertmanager webhook receiver, mounted on `receivers.address`.
+Enabled by default — it is the only integration that is. Every integration
+section carries an `enabled` flag; when a section is enabled, its required
+fields must be set or the agent refuses to start. At least one of
+`alertmanager`, `changes.ingress`, or `mcp` must be enabled.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `true` | Run the Alertmanager webhook receiver |
 | `webhook_token_env` | string | — | **Required when enabled.** Env var name holding the webhook bearer token |
 
 The agent returns `401` for any request missing or mismatching the token.
+
+## `changes`
+
+The change-events namespace — receive deploy/config/flag events over a webhook
+and feed the ones overlapping an incident's labels into triage. Dual-role:
+`ingress` is the write surface (receive), `enrichment` is the read surface
+(triage prompt + the `alertint_recent_changes` MCP tool). See the
+[change-event integration guide](../integrations/changes.md).
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `ingress.enabled` | bool | `false` | Mount `POST /webhook/change` on `receivers.address` |
+| `ingress.webhook_token_env` | string | — | **Required when `ingress.enabled`.** Env var name holding the change webhook bearer token |
+| `enrichment.enabled` | bool | `false` | Attach recent changes to triage and register the MCP tool |
+| `enrichment.window_minutes` | int | `120` | Look-back before the first alert when correlating changes (must be `> 0`) |
+| `enrichment.max_events` | int | `10` | Cap on ranked changes attached to a prompt (must be `> 0`) |
+| `retention_days` | int | `30` | Prune changes older than this; required `> 0` when changes are enabled |
 
 ## `storage`
 
@@ -190,9 +218,11 @@ one-off overrides — e.g. `alertint serve --config alertint.yaml --log-format j
 ## Full example
 
 ```yaml
+receivers:
+  address: "0.0.0.0:9911"
+
 alertmanager:
   enabled: true
-  webhook_addr: "0.0.0.0:9911"
   webhook_token_env: ALERTINT_WEBHOOK_TOKEN
 
 storage:
