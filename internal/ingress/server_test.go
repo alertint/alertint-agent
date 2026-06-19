@@ -24,7 +24,7 @@ import (
 const testToken = "secret-test-token"
 
 type harness struct {
-	hook    *Webhook
+	host    *Server
 	store   *store.Store
 	server  *httptest.Server
 	sinkMu  sync.Mutex
@@ -44,22 +44,22 @@ func newHarness(t *testing.T) *harness {
 	a := audit.New(s.DB())
 
 	h := &harness{store: s}
-	w, err := New(Options{
-		Store:   s,
-		Auditor: a,
-		Token:   testToken,
-		Sink: func(ctx context.Context, alert store.Alert) error {
-			h.sinkMu.Lock()
-			defer h.sinkMu.Unlock()
-			h.sinkIn = append(h.sinkIn, alert)
-			return h.sinkErr
-		},
+	sink := func(ctx context.Context, alert store.Alert) error {
+		h.sinkMu.Lock()
+		defer h.sinkMu.Unlock()
+		h.sinkIn = append(h.sinkIn, alert)
+		return h.sinkErr
+	}
+	host, err := New(Options{
+		Store:     s,
+		Auditor:   a,
+		Receivers: []Receiver{NewAlertReceiver(s, testToken, sink, nil)},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	h.hook = w
-	h.server = httptest.NewServer(w.Handler())
+	h.host = host
+	h.server = httptest.NewServer(host.Handler())
 	t.Cleanup(h.server.Close)
 	return h
 }
@@ -396,11 +396,11 @@ func TestPost_WebhookReceivedLine(t *testing.T) {
 
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	w, err := New(Options{Store: s, Auditor: audit.New(s.DB()), Token: testToken, Logger: logger})
+	host, err := New(Options{Store: s, Auditor: audit.New(s.DB()), Logger: logger, Receivers: []Receiver{NewAlertReceiver(s, testToken, nil, logger)}})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	srv := httptest.NewServer(w.Handler())
+	srv := httptest.NewServer(host.Handler())
 	t.Cleanup(srv.Close)
 
 	resp := postPayload(t, srv, mustMarshal(t, samplePayload()), nil)
@@ -427,14 +427,15 @@ func TestNew_ValidatesRequiredFields(t *testing.T) {
 	s, _ := store.Open(ctx, ":memory:")
 	defer func() { _ = s.Close() }()
 	a := audit.New(s.DB())
+	rcv := NewAlertReceiver(s, "x", nil, nil)
 
 	cases := []struct {
 		name string
 		opts Options
 	}{
-		{"missing store", Options{Auditor: a, Token: "x"}},
-		{"missing auditor", Options{Store: s, Token: "x"}},
-		{"missing token", Options{Store: s, Auditor: a}},
+		{"missing store", Options{Auditor: a, Receivers: []Receiver{rcv}}},
+		{"missing auditor", Options{Store: s, Receivers: []Receiver{rcv}}},
+		{"missing receivers", Options{Store: s, Auditor: a}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -499,11 +500,11 @@ func TestHealth_IncludesIntegrationStatuses(t *testing.T) {
 		health.Check{Name: "prometheus", Detail: "http://prom:9090", Probe: func(context.Context) error { return nil }},
 		health.Check{Name: "slack", Detail: "#alerts", Probe: func(context.Context) error { return errors.New("invalid_auth") }},
 	)
-	w, err := New(Options{Store: s, Auditor: audit.New(s.DB()), Token: testToken, Health: reg})
+	host, err := New(Options{Store: s, Auditor: audit.New(s.DB()), Health: reg, Receivers: []Receiver{NewAlertReceiver(s, testToken, nil, nil)}})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	srv := httptest.NewServer(w.Handler())
+	srv := httptest.NewServer(host.Handler())
 	t.Cleanup(srv.Close)
 
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/health", nil)
@@ -521,6 +522,70 @@ func TestHealth_IncludesIntegrationStatuses(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("body %q should contain %s", body, want)
 		}
+	}
+}
+
+// stubReceiver is a minimal second receiver used to assert per-route token
+// isolation: one receiver's token must not authorize another's route.
+type stubReceiver struct {
+	route string
+	name  string
+	token []byte
+}
+
+func (s *stubReceiver) Route() string { return s.route }
+func (s *stubReceiver) Name() string  { return s.name }
+func (s *stubReceiver) Token() []byte { return s.token }
+func (s *stubReceiver) Ingest(_ context.Context, _ []byte) (Summary, error) {
+	return Summary{Kind: "stub.received", Audit: map[string]any{}}, nil
+}
+
+func TestServer_PerRouteTokenIsolation(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	host, err := New(Options{
+		Store:   s,
+		Auditor: audit.New(s.DB()),
+		Receivers: []Receiver{
+			NewAlertReceiver(s, "alert-tok", nil, nil),
+			&stubReceiver{route: "POST /webhook/stub", name: "stub", token: []byte("stub-tok")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(host.Handler())
+	t.Cleanup(srv.Close)
+
+	// The alert token must NOT authorize the stub route.
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/webhook/stub", strings.NewReader("{}"))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer alert-tok")
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("cross-token status = %d, want 401", resp.StatusCode)
+	}
+
+	// The stub's own token authorizes its own route → 204.
+	req2, _ := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/webhook/stub", strings.NewReader("{}"))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Authorization", "Bearer stub-tok")
+	resp2, err := srv.Client().Do(req2)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer func() { _ = resp2.Body.Close() }()
+	if resp2.StatusCode != http.StatusNoContent {
+		t.Fatalf("own-token status = %d, want 204", resp2.StatusCode)
 	}
 }
 

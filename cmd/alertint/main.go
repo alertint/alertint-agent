@@ -268,7 +268,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	healthReg := buildHealthChecks(cfg, prom, logSrc)
 	go healthReg.Watch(ctx, logger)
 
-	webhookSrv, webhookErrCh, err := startWebhook(cfg, st, auditor, cor, healthReg, logger)
+	recvSrv, recvErrCh, err := startReceivers(cfg, st, auditor, cor, healthReg, logger)
 	if err != nil {
 		return err
 	}
@@ -281,7 +281,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	select {
 	case <-ctx.Done():
 		logger.Info("shutdown signal received; draining in-flight requests")
-	case err := <-webhookErrCh: // nil channel never fires when alertmanager is disabled
+	case err := <-recvErrCh: // nil channel never fires when no receiver is enabled
 		if err != nil {
 			return err
 		}
@@ -295,9 +295,9 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), ingress.DefaultShutdownTimeout)
 	defer cancel()
-	if webhookSrv != nil {
-		if err := webhookSrv.Shutdown(shutdownCtx); err != nil {
-			logger.Error("webhook graceful shutdown failed", slog.String("err", err.Error()))
+	if recvSrv != nil {
+		if err := recvSrv.Shutdown(shutdownCtx); err != nil {
+			logger.Error("receivers graceful shutdown failed", slog.String("err", err.Error()))
 		}
 	}
 	if mcpHTTPSrv != nil {
@@ -309,26 +309,31 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	return nil
 }
 
-// startWebhook starts the Alertmanager webhook receiver when enabled. It
-// also serves GET /health, so a deployment with alertmanager disabled has
-// no health endpoint. Returns (nil, nil, nil) when disabled — the nil
-// error channel never fires in runServe's select.
-func startWebhook(cfg *config.Config, st *store.Store, auditor *audit.Auditor, cor *correlator.Correlator, healthReg *health.Registry, logger *slog.Logger) (*http.Server, <-chan error, error) {
-	if !cfg.Alertmanager.Enabled {
-		logger.Info("alertmanager webhook receiver disabled; /health endpoint not served")
+// startReceivers starts the inbound webhook host when at least one receiver is
+// enabled. The host also serves GET /health. Returns (nil, nil, nil) when no
+// receiver is enabled — the nil error channel never fires in runServe's select.
+func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor, cor *correlator.Correlator, healthReg *health.Registry, logger *slog.Logger) (*http.Server, <-chan error, error) {
+	var receivers []ingress.Receiver
+	if cfg.Alertmanager.Enabled {
+		token, err := cfg.WebhookToken()
+		if err != nil {
+			return nil, nil, err
+		}
+		receivers = append(receivers, ingress.NewAlertReceiver(st, token, cor.Accept, logger))
+	}
+	// Task 5 appends the changeReceiver here, gated on cfg.Changes.Ingress.Enabled.
+
+	if len(receivers) == 0 {
+		logger.Info("no inbound receivers enabled; /health endpoint not served")
 		return nil, nil, nil
 	}
-	token, err := cfg.WebhookToken()
-	if err != nil {
-		return nil, nil, err
-	}
-	hook, err := ingress.New(ingress.Options{
-		Store:   st,
-		Auditor: auditor,
-		Token:   token,
-		Logger:  logger,
-		Sink:    cor.Accept,
-		Health:  healthReg,
+
+	host, err := ingress.New(ingress.Options{
+		Store:     st,
+		Auditor:   auditor,
+		Receivers: receivers,
+		Logger:    logger,
+		Health:    healthReg,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -336,18 +341,22 @@ func startWebhook(cfg *config.Config, st *store.Store, auditor *audit.Auditor, c
 
 	srv := &http.Server{
 		Addr:              cfg.Receivers.Address,
-		Handler:           hook.Handler(),
+		Handler:           host.Handler(),
 		ReadTimeout:       ingress.DefaultReadTimeout,
 		ReadHeaderTimeout: ingress.DefaultReadTimeout,
 		WriteTimeout:      ingress.DefaultWriteTimeout,
 		IdleTimeout:       ingress.DefaultIdleTimeout,
 	}
 
+	routes := make([]string, 0, len(receivers))
+	for _, r := range receivers {
+		routes = append(routes, r.Route())
+	}
 	ch := make(chan error, 1)
 	go func() {
-		logger.Info("webhook listening",
+		logger.Info("receivers listening",
 			slog.String("addr", cfg.Receivers.Address),
-			slog.String("path", "/webhook/alertmanager"),
+			slog.String("routes", strings.Join(routes, ", ")),
 		)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			ch <- err
