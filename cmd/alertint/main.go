@@ -160,17 +160,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 	defer func() { _ = st.Close() }()
 
-	// One-shot startup prune: the per-insert prune bounds the table while the
-	// agent runs; this handles the gap where it was stopped while changes aged
-	// out past retention.
-	if cfg.Changes.Ingress.Enabled || cfg.Changes.Enrichment.Enabled {
-		cutoff := time.Now().UTC().AddDate(0, 0, -cfg.Changes.RetentionDays)
-		if n, err := st.PruneChanges(ctx, cutoff); err != nil {
-			logger.Warn("changes startup prune failed", slog.String("err", err.Error()))
-		} else if n > 0 {
-			logger.Info("changes pruned at startup", slog.Int64("removed", n), slog.Int("retention_days", cfg.Changes.RetentionDays))
-		}
-	}
+	pruneChangesAtStartup(ctx, cfg, st, logger)
 
 	auditor := audit.New(st.DB())
 
@@ -324,6 +314,22 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 	logger.Info("alertint stopped", slog.String("reason", "signal"))
 	return nil
+}
+
+// pruneChangesAtStartup runs a one-shot retention prune so a long-stopped agent
+// doesn't carry stale changes. The per-insert prune in changeReceiver bounds the
+// table while the agent runs; this closes the gap where it was stopped while
+// changes aged out past retention. No-op when changes are disabled.
+func pruneChangesAtStartup(ctx context.Context, cfg *config.Config, st *store.Store, logger *slog.Logger) {
+	if !cfg.Changes.Ingress.Enabled && !cfg.Changes.Enrichment.Enabled {
+		return
+	}
+	cutoff := time.Now().UTC().AddDate(0, 0, -cfg.Changes.RetentionDays)
+	if n, err := st.PruneChanges(ctx, cutoff); err != nil {
+		logger.Warn("changes startup prune failed", slog.String("err", err.Error()))
+	} else if n > 0 {
+		logger.Info("changes pruned at startup", slog.Int64("removed", n), slog.Int("retention_days", cfg.Changes.RetentionDays))
+	}
 }
 
 // startReceivers starts the inbound webhook host when at least one receiver is

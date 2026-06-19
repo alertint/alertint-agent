@@ -127,7 +127,7 @@ func TestChangeReceiver_PersistsAndAudits(t *testing.T) {
 	defer srv.Close()
 
 	body := `{"source":"github-actions","kind":"deploy","labels":{"service":"checkout"},"occurred_at":"2026-06-18T10:42:00Z"}`
-	req, _ := http.NewRequest("POST", srv.URL+"/webhook/change", strings.NewReader(body))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/webhook/change", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer change-tok")
 	resp, err := http.DefaultClient.Do(req)
@@ -157,7 +157,7 @@ func TestChangeReceiver_PersistsAndAudits(t *testing.T) {
 	}
 
 	// Per-route token isolation: alert token must not authorize the change route.
-	req2, _ := http.NewRequest("POST", srv.URL+"/webhook/change", strings.NewReader(body))
+	req2, _ := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/webhook/change", strings.NewReader(body))
 	req2.Header.Set("Content-Type", "application/json")
 	req2.Header.Set("Authorization", "Bearer alert-tok")
 	resp2, _ := http.DefaultClient.Do(req2)
