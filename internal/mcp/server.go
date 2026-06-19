@@ -383,25 +383,25 @@ func (s *Server) handleGetEvidencePack(ctx context.Context, req mcplib.CallToolR
 	pack := acutetriage.BuildEvidencePack(*inc, alerts, s.cfg.WindowSeconds)
 	metrics := acutetriage.FetchMetrics(ctx, s.cfg.Prometheus, alerts, inc.FirstAlertAt)
 
-	// Logs are REPLAYED from the persisted snapshot, never re-queried — so the
-	// pack reflects the exact lines the LLM saw, even after Loki retention has
-	// rotated them (ADR-0001). Absent (pre-migration / short-circuited / logs
-	// disabled) → the section is omitted. Metrics remain a live re-query in v1.
-	var logsSnapshot json.RawMessage
+	// Enrichment is REPLAYED from the persisted envelope, never re-queried — the
+	// pack reflects exactly what the LLM saw (ADR-0001). Absent (short-circuited
+	// / disabled) → omitted. After migration 0006 every non-null value is the
+	// uniform {"logs":…,"changes":…} envelope, so this stays an opaque passthrough.
+	var enrichmentSnapshot json.RawMessage
 	if inc.EnrichmentJSON != "" {
-		logsSnapshot = json.RawMessage(inc.EnrichmentJSON)
+		enrichmentSnapshot = json.RawMessage(inc.EnrichmentJSON)
 	}
 
 	type packWithEnrichment struct {
 		acutetriage.EvidencePack
 
-		Metrics []acutetriage.MetricSnapshot `json:"metrics,omitempty"`
-		Logs    json.RawMessage              `json:"logs,omitempty"`
+		Metrics    []acutetriage.MetricSnapshot `json:"metrics,omitempty"`
+		Enrichment json.RawMessage              `json:"enrichment,omitempty"`
 	}
 	result, err := mcplib.NewToolResultJSON(packWithEnrichment{
 		EvidencePack: pack,
 		Metrics:      metrics,
-		Logs:         logsSnapshot,
+		Enrichment:   enrichmentSnapshot,
 	})
 	if err != nil {
 		return errResult("failed to serialize evidence pack: " + err.Error()), nil

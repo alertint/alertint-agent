@@ -168,7 +168,11 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 	// pack can replay exactly what the model saw (empty on the short-circuit /
 	// logs-disabled path → stored NULL).
 	outputJSON := string(raw)
-	enrichmentJSON := marshalEnrichment(enrichment, s.logger, inc.ID)
+	sources := map[string]any{}
+	if enrichment != nil {
+		sources["logs"] = enrichment
+	}
+	enrichmentJSON := marshalEnrichments(sources, s.logger, inc.ID)
 	if err := s.st.SaveIncidentOutput(ctx,
 		inc.ID, outputJSON,
 		resp.AnalysisName, resp.OverallIssue,
@@ -364,17 +368,18 @@ func shortCircuitResponse(d rules.Decision, alerts []store.Alert) (json.RawMessa
 	return json.Marshal(out)
 }
 
-// marshalEnrichment serializes the log-enrichment snapshot for persistence.
-// Returns "" when there is nothing to persist (logs disabled / short-circuit)
-// or on a marshal error — both store SQL NULL, so the evidence pack omits the
-// logs section. A marshal failure is logged but never blocks triage.
-func marshalEnrichment(e *LogEnrichment, logger *slog.Logger, incidentID string) string {
-	if e == nil {
+// marshalEnrichments serializes the keyed multi-source enrichment envelope for
+// persistence: {"logs": {...}, "changes": {...}}. Callers add only non-nil
+// sources. Returns "" when there is nothing to persist (all sources absent) or
+// on a marshal error — both store SQL NULL, so the evidence pack omits the
+// section. A marshal failure is logged but never blocks triage.
+func marshalEnrichments(sources map[string]any, logger *slog.Logger, incidentID string) string {
+	if len(sources) == 0 {
 		return ""
 	}
-	b, err := json.Marshal(e)
+	b, err := json.Marshal(sources)
 	if err != nil {
-		logger.Warn("acutetriage: marshal log enrichment failed", "incident_id", incidentID, "err", err)
+		logger.Warn("acutetriage: marshal enrichment envelope failed", "incident_id", incidentID, "err", err)
 		return ""
 	}
 	return string(b)

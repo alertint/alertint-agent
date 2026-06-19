@@ -4,6 +4,8 @@ package store
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,6 +101,53 @@ func TestSaveIncidentOutput_EmptyEnrichmentPersistsNull(t *testing.T) {
 	}
 	if inc.EnrichmentJSON != "" {
 		t.Fatalf("EnrichmentJSON = %q, want empty", inc.EnrichmentJSON)
+	}
+}
+
+func TestMigration0006_WrapsLegacyBareRow(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	// Seed an incident, then force a legacy bare-LogEnrichment enrichment_json.
+	id := readyIncident(t, s, "test=mig6")
+	if _, err := s.db.ExecContext(ctx, `UPDATE incidents SET enrichment_json=? WHERE id=?`,
+		`{"source":"loki","query":"{app=\"x\"}","lines":[]}`, id); err != nil {
+		t.Fatalf("seed legacy: %v", err)
+	}
+
+	// Apply the guarded wrap (MUST be kept identical to 0006_enrichment_envelope.sql).
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE incidents
+		SET enrichment_json = '{"logs":' || enrichment_json || '}'
+		WHERE enrichment_json IS NOT NULL AND json_valid(enrichment_json)
+		  AND json_extract(enrichment_json,'$.source') IS NOT NULL
+		  AND json_extract(enrichment_json,'$.logs') IS NULL
+		  AND json_extract(enrichment_json,'$.changes') IS NULL
+	`); err != nil {
+		t.Fatalf("wrap: %v", err)
+	}
+
+	var got string
+	_ = s.db.QueryRowContext(ctx, `SELECT enrichment_json FROM incidents WHERE id=?`, id).Scan(&got)
+	var env map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(got), &env); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if _, ok := env["logs"]; !ok {
+		t.Fatalf("want logs envelope, got %s", got)
+	}
+	// Idempotent: re-running must NOT double-wrap.
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE incidents SET enrichment_json = '{"logs":' || enrichment_json || '}'
+		WHERE json_valid(enrichment_json)
+		  AND json_extract(enrichment_json,'$.source') IS NOT NULL
+		  AND json_extract(enrichment_json,'$.logs') IS NULL
+		  AND json_extract(enrichment_json,'$.changes') IS NULL`); err != nil {
+		t.Fatalf("rewrap: %v", err)
+	}
+	_ = s.db.QueryRowContext(ctx, `SELECT enrichment_json FROM incidents WHERE id=?`, id).Scan(&got)
+	if strings.Count(got, `"logs"`) != 1 {
+		t.Fatalf("double-wrapped: %s", got)
 	}
 }
 
