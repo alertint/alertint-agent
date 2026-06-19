@@ -77,5 +77,17 @@ logs:
       service: app                         #   alert `service` → stream `app`
       instance: ""                         #   drop: no stream-label equivalent
 
+# Change events: push deploy/config/flag events over a webhook so triage can
+# answer "what changed right before this?". See docs/integrations/changes.md.
+changes:
+  ingress:                                 # Role A: receive change webhooks (write surface)
+    enabled: false
+    webhook_token_env: ALERTINT_CHANGES_WEBHOOK_TOKEN
+  enrichment:                              # Role B: use stored changes (triage prompt + MCP)
+    enabled: false
+    window_minutes: 120                    # look-back before the first alert
+    max_events: 10                         # cap on ranked changes attached to a prompt
+  retention_days: 30                       # prune changes older than this
+
 log_level: info            # debug | info | warn | error
 log_format: auto           # auto | console | json (auto → console on a TTY, json otherwise)
