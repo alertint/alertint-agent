@@ -406,6 +406,8 @@ func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom 
 		Prometheus:              prom,
 		Logs:                    logSrc,
 		LogsDefaultRangeMinutes: cfg.Logs.DefaultRangeMinutes,
+		ChangesEnabled:          cfg.Changes.Enrichment.Enabled,
+		ChangesWindowMinutes:    cfg.Changes.Enrichment.WindowMinutes,
 	}, st, auditor)
 	srv := &http.Server{
 		Addr:    cfg.MCP.Addr,
