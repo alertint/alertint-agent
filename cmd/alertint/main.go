@@ -255,6 +255,11 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 				TimeoutSeconds:      cfg.Logs.TimeoutSeconds,
 				MaxLines:            cfg.Logs.MaxLines,
 			},
+			ChangeParams: acutetriage.ChangeParams{
+				Enabled:       cfg.Changes.Enrichment.Enabled,
+				WindowMinutes: cfg.Changes.Enrichment.WindowMinutes,
+				MaxEvents:     cfg.Changes.Enrichment.MaxEvents,
+			},
 		},
 		st, llmClient, auditor, notifier, logger,
 	)

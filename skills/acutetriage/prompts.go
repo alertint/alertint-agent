@@ -47,7 +47,10 @@ Rules:
   incident time — quoted log lines are stronger evidence than annotation text, and the
   lines are listed most-recent-first. If that section instead says the backend returned
   no lines or failed, treat it as a gap in evidence — do NOT infer the service is healthy
-  from absent logs.`
+  from absent logs.
+- If a "Recent changes" section is present, a deploy/config/flag change shortly
+  before the incident is a prime root-cause candidate — weigh its Δ-before-incident
+  timing. Absence of changes is NOT proof nothing changed (the emitter may not be wired).`
 
 // RequiredKeys lists the top-level keys that must be present in a valid
 // LLM response. Passed to llm.Client.Complete for structural validation.
@@ -118,7 +121,7 @@ func BuildEvidencePack(inc store.Incident, alerts []store.Alert, windowSeconds i
 // LLM. metrics is optional — pass nil when Prometheus is not available. logs is
 // optional — pass nil when no log source is configured; when non-nil it always
 // renders a "Recent logs" section (lines, or a note explaining their absence).
-func UserPrompt(pack EvidencePack, packJSON string, metrics []MetricSnapshot, logs *LogEnrichment) string {
+func UserPrompt(pack EvidencePack, packJSON string, metrics []MetricSnapshot, logs *LogEnrichment, changes *ChangeEnrichment) string {
 	var b strings.Builder
 	fmt.Fprintf(&b,
 		"Analyze the following correlated incident.\n\nEvidence:\n%s\n\nShared labels: %s\nAlert count: %d\nWindow: %ds",
@@ -134,8 +137,40 @@ func UserPrompt(pack EvidencePack, packJSON string, metrics []MetricSnapshot, lo
 		}
 	}
 	renderLogs(&b, logs)
+	renderChanges(&b, changes)
 	b.WriteString("\n\nRespond with JSON only.")
 	return b.String()
+}
+
+// renderChanges appends the "Recent changes" section. With matched changes they
+// render most-relevant-first, each carrying its Δ-before-incident hint — the
+// single highest-signal fact for the LLM. When empty the Note renders instead
+// (so the model sees we looked). Omitted only when changes is nil (disabled).
+func renderChanges(b *strings.Builder, e *ChangeEnrichment) {
+	if e == nil {
+		return
+	}
+	if len(e.Changes) > 0 {
+		b.WriteString("\n\nRecent changes (most relevant first, matched on incident labels):")
+		for _, c := range e.Changes {
+			fmt.Fprintf(b, "\n  %s  [%s] %s", c.DeltaBeforeIncident, c.Kind, c.Title)
+			if c.Version != "" {
+				fmt.Fprintf(b, " (%s)", c.Version)
+			}
+			if len(c.MatchedOn) > 0 {
+				fmt.Fprintf(b, "  {matched: %s}", formatLabels(c.MatchedOn))
+			}
+			if c.Link != "" {
+				fmt.Fprintf(b, "  %s", c.Link)
+			}
+		}
+		return
+	}
+	note := e.Note
+	if note == "" {
+		note = "no recent changes available"
+	}
+	fmt.Fprintf(b, "\n\nRecent changes: %s", note)
 }
 
 // renderLogs appends the "Recent logs" section. When the enrichment carries
