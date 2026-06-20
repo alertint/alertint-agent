@@ -150,7 +150,9 @@ func TestEvidencePack_ReplaysEnrichmentNoLokiCall(t *testing.T) {
 	if err := st.MarkIncidentReady(ctx, id); err != nil {
 		t.Fatal(err)
 	}
-	snapshot := `{"source":"loki","query":"{namespace=\"prod\",app=\"api\"}","lines":[{"timestamp":"2026-06-17T14:03:11Z","line":"ERROR boom"}]}`
+	// Post-migration 0006 shape: the persisted blob is the keyed envelope
+	// {"logs": {...LogEnrichment...}}, replayed opaquely under the "enrichment" key.
+	snapshot := `{"logs":{"source":"loki","query":"{namespace=\"prod\",app=\"api\"}","lines":[{"timestamp":"2026-06-17T14:03:11Z","line":"ERROR boom"}]}}`
 	if err := st.SaveIncidentOutput(ctx, id, `{"ok":true}`, "n", "i", 0.9, snapshot); err != nil {
 		t.Fatal(err)
 	}
@@ -165,8 +167,8 @@ func TestEvidencePack_ReplaysEnrichmentNoLokiCall(t *testing.T) {
 		t.Fatalf("evidence pack errored: %s", resultText(t, res))
 	}
 	out := resultText(t, res)
-	if !strings.Contains(out, "ERROR boom") || !strings.Contains(out, `"logs"`) {
-		t.Fatalf("evidence pack did not replay the stored logs snapshot: %s", out)
+	if !strings.Contains(out, "ERROR boom") || !strings.Contains(out, `"enrichment"`) || !strings.Contains(out, `"logs"`) {
+		t.Fatalf("evidence pack did not replay the stored enrichment envelope: %s", out)
 	}
 	if spy.fetchCalled || spy.queryCalled {
 		t.Fatal("evidence pack must NOT call the log backend (replay only)")
@@ -193,7 +195,7 @@ func TestEvidencePack_OmitsLogsWhenAbsent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(resultText(t, res), `"logs"`) {
-		t.Fatalf("logs section must be omitted when enrichment is absent: %s", resultText(t, res))
+	if strings.Contains(resultText(t, res), `"enrichment"`) {
+		t.Fatalf("enrichment section must be omitted when absent: %s", resultText(t, res))
 	}
 }

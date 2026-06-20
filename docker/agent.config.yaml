@@ -1,6 +1,8 @@
+receivers:
+  address: "0.0.0.0:9911"   # shared inbound webhook bind address; ALL receivers mount here
+
 alertmanager:
   enabled: true
-  webhook_addr: "0.0.0.0:9911"
   webhook_token_env: ALERTINT_WEBHOOK_TOKEN
 
 storage:

@@ -89,7 +89,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	fs := flag.NewFlagSet("alertint serve", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cfgPath := fs.String("config", "", "path to alertint YAML config")
-	webhookAddr := fs.String("webhook-addr", "", "override alertmanager.webhook_addr from config (e.g. 0.0.0.0:9911)")
+	receiversAddr := fs.String("receivers-addr", "", "override receivers.address from config (e.g. 0.0.0.0:9911)")
 	mcpAddr := fs.String("mcp-addr", "", "override mcp.addr from config (e.g. 0.0.0.0:9912)")
 	// Empty sentinel defaults: an unset flag falls through to config, so
 	// precedence is CLI flag > config > built-in default (info / auto).
@@ -147,8 +147,8 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		slog.String("log_format", format),
 	)
 
-	if *webhookAddr != "" {
-		cfg.Alertmanager.WebhookAddr = *webhookAddr
+	if *receiversAddr != "" {
+		cfg.Receivers.Address = *receiversAddr
 	}
 	if *mcpAddr != "" {
 		cfg.MCP.Addr = *mcpAddr
@@ -159,6 +159,8 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		return err
 	}
 	defer func() { _ = st.Close() }()
+
+	pruneChangesAtStartup(ctx, cfg, st, logger)
 
 	auditor := audit.New(st.DB())
 
@@ -243,6 +245,11 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 				TimeoutSeconds:      cfg.Logs.TimeoutSeconds,
 				MaxLines:            cfg.Logs.MaxLines,
 			},
+			ChangeParams: acutetriage.ChangeParams{
+				Enabled:       cfg.Changes.Enrichment.Enabled,
+				WindowMinutes: cfg.Changes.Enrichment.WindowMinutes,
+				MaxEvents:     cfg.Changes.Enrichment.MaxEvents,
+			},
 		},
 		st, llmClient, auditor, notifier, logger,
 	)
@@ -268,7 +275,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	healthReg := buildHealthChecks(cfg, prom, logSrc)
 	go healthReg.Watch(ctx, logger)
 
-	webhookSrv, webhookErrCh, err := startWebhook(cfg, st, auditor, cor, healthReg, logger)
+	recvSrv, recvErrCh, err := startReceivers(cfg, st, auditor, cor, healthReg, logger)
 	if err != nil {
 		return err
 	}
@@ -281,7 +288,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	select {
 	case <-ctx.Done():
 		logger.Info("shutdown signal received; draining in-flight requests")
-	case err := <-webhookErrCh: // nil channel never fires when alertmanager is disabled
+	case err := <-recvErrCh: // nil channel never fires when no receiver is enabled
 		if err != nil {
 			return err
 		}
@@ -295,9 +302,9 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), ingress.DefaultShutdownTimeout)
 	defer cancel()
-	if webhookSrv != nil {
-		if err := webhookSrv.Shutdown(shutdownCtx); err != nil {
-			logger.Error("webhook graceful shutdown failed", slog.String("err", err.Error()))
+	if recvSrv != nil {
+		if err := recvSrv.Shutdown(shutdownCtx); err != nil {
+			logger.Error("receivers graceful shutdown failed", slog.String("err", err.Error()))
 		}
 	}
 	if mcpHTTPSrv != nil {
@@ -309,45 +316,76 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	return nil
 }
 
-// startWebhook starts the Alertmanager webhook receiver when enabled. It
-// also serves GET /health, so a deployment with alertmanager disabled has
-// no health endpoint. Returns (nil, nil, nil) when disabled — the nil
-// error channel never fires in runServe's select.
-func startWebhook(cfg *config.Config, st *store.Store, auditor *audit.Auditor, cor *correlator.Correlator, healthReg *health.Registry, logger *slog.Logger) (*http.Server, <-chan error, error) {
-	if !cfg.Alertmanager.Enabled {
-		logger.Info("alertmanager webhook receiver disabled; /health endpoint not served")
+// pruneChangesAtStartup runs a one-shot retention prune so a long-stopped agent
+// doesn't carry stale changes. The per-insert prune in changeReceiver bounds the
+// table while the agent runs; this closes the gap where it was stopped while
+// changes aged out past retention. No-op when changes are disabled.
+func pruneChangesAtStartup(ctx context.Context, cfg *config.Config, st *store.Store, logger *slog.Logger) {
+	if !cfg.Changes.Ingress.Enabled && !cfg.Changes.Enrichment.Enabled {
+		return
+	}
+	cutoff := time.Now().UTC().AddDate(0, 0, -cfg.Changes.RetentionDays)
+	if n, err := st.PruneChanges(ctx, cutoff); err != nil {
+		logger.Warn("changes startup prune failed", slog.String("err", err.Error()))
+	} else if n > 0 {
+		logger.Info("changes pruned at startup", slog.Int64("removed", n), slog.Int("retention_days", cfg.Changes.RetentionDays))
+	}
+}
+
+// startReceivers starts the inbound webhook host when at least one receiver is
+// enabled. The host also serves GET /health. Returns (nil, nil, nil) when no
+// receiver is enabled — the nil error channel never fires in runServe's select.
+func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor, cor *correlator.Correlator, healthReg *health.Registry, logger *slog.Logger) (*http.Server, <-chan error, error) {
+	var receivers []ingress.Receiver
+	if cfg.Alertmanager.Enabled {
+		token, err := cfg.WebhookToken()
+		if err != nil {
+			return nil, nil, err
+		}
+		receivers = append(receivers, ingress.NewAlertReceiver(st, token, cor.Accept, logger))
+	}
+	if cfg.Changes.Ingress.Enabled {
+		token, err := cfg.ChangesWebhookToken()
+		if err != nil {
+			return nil, nil, err
+		}
+		receivers = append(receivers, ingress.NewChangeReceiver(st, token, cfg.Changes.RetentionDays, logger))
+	}
+
+	if len(receivers) == 0 {
+		logger.Info("no inbound receivers enabled; /health endpoint not served")
 		return nil, nil, nil
 	}
-	token, err := cfg.WebhookToken()
-	if err != nil {
-		return nil, nil, err
-	}
-	hook, err := ingress.New(ingress.Options{
-		Store:   st,
-		Auditor: auditor,
-		Token:   token,
-		Logger:  logger,
-		Sink:    cor.Accept,
-		Health:  healthReg,
+
+	host, err := ingress.New(ingress.Options{
+		Store:     st,
+		Auditor:   auditor,
+		Receivers: receivers,
+		Logger:    logger,
+		Health:    healthReg,
 	})
 	if err != nil {
 		return nil, nil, err
 	}
 
 	srv := &http.Server{
-		Addr:              cfg.Alertmanager.WebhookAddr,
-		Handler:           hook.Handler(),
+		Addr:              cfg.Receivers.Address,
+		Handler:           host.Handler(),
 		ReadTimeout:       ingress.DefaultReadTimeout,
 		ReadHeaderTimeout: ingress.DefaultReadTimeout,
 		WriteTimeout:      ingress.DefaultWriteTimeout,
 		IdleTimeout:       ingress.DefaultIdleTimeout,
 	}
 
+	routes := make([]string, 0, len(receivers))
+	for _, r := range receivers {
+		routes = append(routes, r.Route())
+	}
 	ch := make(chan error, 1)
 	go func() {
-		logger.Info("webhook listening",
-			slog.String("addr", cfg.Alertmanager.WebhookAddr),
-			slog.String("path", "/webhook/alertmanager"),
+		logger.Info("receivers listening",
+			slog.String("addr", cfg.Receivers.Address),
+			slog.String("routes", strings.Join(routes, ", ")),
 		)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			ch <- err
@@ -374,6 +412,8 @@ func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom 
 		Prometheus:              prom,
 		Logs:                    logSrc,
 		LogsDefaultRangeMinutes: cfg.Logs.DefaultRangeMinutes,
+		ChangesEnabled:          cfg.Changes.Enrichment.Enabled,
+		ChangesWindowMinutes:    cfg.Changes.Enrichment.WindowMinutes,
 	}, st, auditor)
 	srv := &http.Server{
 		Addr:    cfg.MCP.Addr,

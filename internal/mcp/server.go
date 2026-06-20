@@ -41,6 +41,11 @@ type Config struct {
 	// LogsDefaultRangeMinutes is the default look-back for the log range tool
 	// when start is omitted (config's logs.default_range_minutes).
 	LogsDefaultRangeMinutes int
+	// ChangesEnabled registers alertint_recent_changes when true (gated on
+	// changes.enrichment.enabled). ChangesWindowMinutes is the default look-back
+	// when neither window nor start/end is supplied.
+	ChangesEnabled       bool
+	ChangesWindowMinutes int
 }
 
 // Server is the AlertINT MCP HTTP server. Construct with NewServer; start
@@ -73,6 +78,11 @@ func NewServer(cfg Config, st *store.Store, auditor *audit.Auditor) *Server {
 	// coexist additively later — see ADR-0003.
 	if s.cfg.Logs != nil {
 		ms.AddTool(s.toolLogsQueryRange())
+	}
+
+	// Change-events tool, registered only when change enrichment is enabled.
+	if s.cfg.ChangesEnabled {
+		ms.AddTool(s.toolRecentChanges())
 	}
 
 	// StreamableHTTPServer mounts internally at /mcp. Final client URL:
@@ -383,25 +393,25 @@ func (s *Server) handleGetEvidencePack(ctx context.Context, req mcplib.CallToolR
 	pack := acutetriage.BuildEvidencePack(*inc, alerts, s.cfg.WindowSeconds)
 	metrics := acutetriage.FetchMetrics(ctx, s.cfg.Prometheus, alerts, inc.FirstAlertAt)
 
-	// Logs are REPLAYED from the persisted snapshot, never re-queried — so the
-	// pack reflects the exact lines the LLM saw, even after Loki retention has
-	// rotated them (ADR-0001). Absent (pre-migration / short-circuited / logs
-	// disabled) → the section is omitted. Metrics remain a live re-query in v1.
-	var logsSnapshot json.RawMessage
+	// Enrichment is REPLAYED from the persisted envelope, never re-queried — the
+	// pack reflects exactly what the LLM saw (ADR-0001). Absent (short-circuited
+	// / disabled) → omitted. After migration 0006 every non-null value is the
+	// uniform {"logs":…,"changes":…} envelope, so this stays an opaque passthrough.
+	var enrichmentSnapshot json.RawMessage
 	if inc.EnrichmentJSON != "" {
-		logsSnapshot = json.RawMessage(inc.EnrichmentJSON)
+		enrichmentSnapshot = json.RawMessage(inc.EnrichmentJSON)
 	}
 
 	type packWithEnrichment struct {
 		acutetriage.EvidencePack
 
-		Metrics []acutetriage.MetricSnapshot `json:"metrics,omitempty"`
-		Logs    json.RawMessage              `json:"logs,omitempty"`
+		Metrics    []acutetriage.MetricSnapshot `json:"metrics,omitempty"`
+		Enrichment json.RawMessage              `json:"enrichment,omitempty"`
 	}
 	result, err := mcplib.NewToolResultJSON(packWithEnrichment{
 		EvidencePack: pack,
 		Metrics:      metrics,
-		Logs:         logsSnapshot,
+		Enrichment:   enrichmentSnapshot,
 	})
 	if err != nil {
 		return errResult("failed to serialize evidence pack: " + err.Error()), nil
@@ -657,6 +667,115 @@ func (s *Server) handleLogsQueryRange(ctx context.Context, req mcplib.CallToolRe
 		return errResult("failed to serialize result: " + err.Error()), nil
 	}
 	return result, nil
+}
+
+func (s *Server) toolRecentChanges() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
+	tool := mcplib.NewTool("alertint_recent_changes",
+		mcplib.WithDescription("List recent change events (deploys, config edits, flag flips) "+
+			"newest-first. Use this to answer \"what changed?\" during investigation — widen the "+
+			"window or pivot services. Read-only."),
+		mcplib.WithObject("selector",
+			mcplib.Description("Optional exact label AND-match, e.g. {\"service\":\"checkout\",\"namespace\":\"prod\"}. "+
+				"Every key/value must be present on a change for it to match. Omit to return all recent changes."),
+		),
+		mcplib.WithInteger("window",
+			mcplib.Description("Look-back in minutes from now (used when start/end are omitted)."),
+		),
+		mcplib.WithString("start",
+			mcplib.Description("Range start (RFC3339). Overrides window."),
+		),
+		mcplib.WithString("end",
+			mcplib.Description("Range end (RFC3339). Defaults to now."),
+		),
+		mcplib.WithInteger("limit",
+			mcplib.Description("Maximum number of changes to return (default 50)."),
+		),
+	)
+	return tool, s.handleRecentChanges
+}
+
+func (s *Server) handleRecentChanges(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	if !s.cfg.ChangesEnabled {
+		return errResult("change enrichment is not configured (changes.enrichment.enabled is false)"), nil
+	}
+
+	now := time.Now().UTC()
+	end := now
+	window := s.cfg.ChangesWindowMinutes
+	if w := mcplib.ParseInt(req, "window", 0); w > 0 {
+		window = w
+	}
+	start := now.Add(-time.Duration(window) * time.Minute)
+	if startStr := mcplib.ParseString(req, "start", ""); startStr != "" {
+		t, err := time.Parse(time.RFC3339, startStr)
+		if err != nil {
+			return errResult("invalid start: must be RFC3339 (e.g. 2026-06-05T14:00:00Z)"), nil
+		}
+		start = t
+	}
+	if endStr := mcplib.ParseString(req, "end", ""); endStr != "" {
+		t, err := time.Parse(time.RFC3339, endStr)
+		if err != nil {
+			return errResult("invalid end: must be RFC3339"), nil
+		}
+		end = t
+	}
+	if start.After(end) {
+		return errResult("start must be before end"), nil
+	}
+
+	// Exact AND-match selector — deliberate difference from triage's any-overlap:
+	// the interactive agent supplies the selector deliberately, so precision wins.
+	selector := map[string]string{}
+	for k, v := range mcplib.ParseStringMap(req, "selector", nil) {
+		selector[k] = fmt.Sprintf("%v", v)
+	}
+	limit := mcplib.ParseInt(req, "limit", 50)
+
+	all, err := s.st.ChangesInWindow(ctx, start, end) // newest-first
+	if err != nil {
+		return errResult("failed to query changes: " + err.Error()), nil
+	}
+
+	type row struct {
+		ID         string            `json:"id"`
+		Source     string            `json:"source"`
+		Kind       string            `json:"kind"`
+		Title      string            `json:"title"`
+		Labels     map[string]string `json:"labels"`
+		Version    string            `json:"version,omitempty"`
+		Link       string            `json:"link,omitempty"`
+		OccurredAt time.Time         `json:"occurred_at"`
+	}
+	rows := make([]row, 0, limit)
+	for _, c := range all {
+		if !matchesAll(c.Labels, selector) {
+			continue
+		}
+		rows = append(rows, row{
+			ID: c.ID, Source: c.Source, Kind: c.Kind, Title: c.Title,
+			Labels: c.Labels, Version: c.Version, Link: c.Link, OccurredAt: c.OccurredAt,
+		})
+		if len(rows) >= limit {
+			break
+		}
+	}
+
+	result, err := mcplib.NewToolResultJSON(map[string]any{"changes": rows})
+	if err != nil {
+		return errResult("failed to serialize changes: " + err.Error()), nil
+	}
+	return result, nil
+}
+
+// matchesAll reports whether every selector key/value is present on labels.
+func matchesAll(labels, selector map[string]string) bool {
+	for k, v := range selector {
+		if labels[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 // -----------------------------------------------------------------------------

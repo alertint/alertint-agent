@@ -58,7 +58,7 @@ services:
       - "serve"
       - "--config"
       - "/etc/alertint/config.yaml"
-      - "--webhook-addr"
+      - "--receivers-addr"
       - "0.0.0.0:${ALERTINT_WEBHOOK_PORT:-9911}"
       - "--mcp-addr"
       - "0.0.0.0:${ALERTINT_MCP_PORT:-9912}"
