@@ -570,6 +570,11 @@ func startSentryPoller(ctx context.Context, cfg *config.Config, st *store.Store,
 		slog.String("base_url", cfg.Sentry.BaseURL),
 		slog.String("org", cfg.Sentry.Org),
 	)
+	if !cfg.Changes.Enrichment.Enabled {
+		// The poller writes change rows, but only changes.enrichment surfaces them
+		// at triage and over MCP — warn so this misconfiguration isn't silent.
+		logger.Warn("sentry poller is enabled but changes.enrichment is disabled; polled changes will be stored but not surfaced at triage or over MCP")
+	}
 	poller := newSentryPoller(cfg, client, st, logger)
 	poller.Start(ctx)
 	logger.Info("sentry release/deploy poller started",

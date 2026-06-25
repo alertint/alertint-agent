@@ -23,6 +23,10 @@ const connectorStateName = "sentry-releases"
 // The horizon stop normally ends pagination long before this.
 const maxReleasePages = 100
 
+// futureSkew is how far ahead of now a change's OccurredAt may be before it is
+// treated as bad data (clock skew) and dropped, so it can't poison the watermark.
+const futureSkew = 2 * time.Minute
+
 // releaseSource is the narrow read surface the poller needs, satisfied by
 // *Client (U2). The poller depends on this interface so poller_test.go injects a
 // fake with no HTTP; the wire behavior is covered by the client tests.
@@ -60,6 +64,7 @@ type Poller struct {
 	now func() time.Time
 
 	once   sync.Once
+	cancel context.CancelFunc // cancels the in-flight cycle on Stop
 	stopCh chan struct{}
 	doneCh chan struct{}
 }
@@ -79,21 +84,30 @@ func NewPoller(src releaseSource, st *store.Store, cfg PollerConfig, logger *slo
 		cfg:    cfg,
 		logger: logger,
 		now:    time.Now,
+		cancel: func() {}, // replaced in Start; no-op so Stop-before-Start can't nil-panic
 		stopCh: make(chan struct{}),
 		doneCh: make(chan struct{}),
 	}
 }
 
 // Start launches the background poll loop and returns immediately. It runs one
-// cycle right away, then on every PollInterval tick. Call exactly once.
+// cycle right away, then on every PollInterval tick. Call exactly once. The loop
+// runs under a child context that Stop cancels, so an in-flight cycle's network
+// I/O aborts promptly even when the parent context is still live.
 func (p *Poller) Start(ctx context.Context) {
-	p.once.Do(func() { go p.loop(ctx) })
+	p.once.Do(func() {
+		cctx, cancel := context.WithCancel(ctx)
+		p.cancel = cancel
+		go p.loop(cctx)
+	})
 }
 
-// Stop signals the loop to exit and waits for the in-flight cycle to finish.
-// Must be called after Start.
+// Stop signals the loop to exit, cancels any in-flight cycle so its blocking
+// Sentry calls / backoff abort, and waits for the loop to drain. Must be called
+// after Start.
 func (p *Poller) Stop() {
 	close(p.stopCh)
+	p.cancel()
 	<-p.doneCh
 }
 
@@ -120,9 +134,11 @@ func (p *Poller) loop(ctx context.Context) {
 
 // runCycle runs one poll cycle, isolating its failure: an error skips the cycle
 // (logged WARN per R26) and the loop retries on the next tick — the process
-// never crashes (R10).
+// never crashes (R10). A cycle that fails purely because the context was
+// cancelled (shutdown) is not a real failure, so its error is swallowed silently
+// rather than logged as a spurious WARN.
 func (p *Poller) runCycle(ctx context.Context) {
-	if err := p.pollOnce(ctx); err != nil {
+	if err := p.pollOnce(ctx); err != nil && ctx.Err() == nil {
 		p.logger.Warn("sentry poll cycle failed; skipping, will retry next tick", "err", err)
 	}
 }
@@ -148,6 +164,7 @@ func (p *Poller) pollOnce(ctx context.Context) error {
 			return err
 		}
 	}
+	candidates = p.finalizeBatch(candidates, now)
 
 	switch {
 	case len(candidates) > 0:
@@ -194,21 +211,25 @@ func (p *Poller) scanProject(ctx context.Context, project string, wm watermark, 
 			}
 		}
 		if next == "" {
-			break
+			return nil
 		}
 		cursor = next
 	}
+	// Reached the page cap with more pages outstanding: surface the truncation
+	// rather than silently under-scanning (a misconfigured huge horizon).
+	p.logger.Warn("sentry: release pagination hit page cap; some in-horizon releases not scanned this cycle",
+		"project", project, "max_pages", maxReleasePages)
 	return nil
 }
 
 // scanRelease decides, for one release, whether to spend the per-release deploys
-// call. The inline lastDeploy gate uses the SAME shouldEmit predicate as the
-// per-candidate guard: it fires only when the newest deploy is newer than the
-// watermark (or equal-but-unseen at the boundary), so quiescent releases cost no
-// extra request (KTD3). A release with no deploys at all falls back to one
+// call. A release with deploy activity newer than the watermark (or, defensively,
+// one reporting deploys but no inline lastDeploy hint) gets a deploys call; the
+// per-deploy shouldEmit guard then does the exact dedup. Quiescent releases cost
+// no extra request (KTD3). A release with no deploys at all falls back to one
 // release change.
 func (p *Poller) scanRelease(ctx context.Context, project string, r Release, wm watermark, emit func(store.Change)) error {
-	if r.LastDeploy != nil && wm.shouldEmit(r.LastDeploy.DateFinished, deployKey(r.LastDeploy.ID)) {
+	if hasNewDeployActivity(r, wm) {
 		deploys, err := p.src.ListDeploys(ctx, project, r.Version)
 		if err != nil {
 			return err
@@ -240,6 +261,40 @@ func (p *Poller) scanRelease(ctx context.Context, project string, r Release, wm 
 		}
 	}
 	return nil
+}
+
+// finalizeBatch makes the candidate slice safe to hand to the single-transaction
+// batch insert. It drops two classes of poison that would otherwise wedge the
+// poller permanently — because a failed batch never advances the watermark, so
+// the same bad batch re-forms every cycle:
+//
+//   - Duplicate change IDs. changes.id is a PRIMARY KEY; two candidates sharing
+//     an ID (a degenerate multi-project/empty-version collision, or a buggy
+//     Sentry response with a repeated deploy id) would violate it and roll the
+//     whole cycle back. Keep the first, WARN on the rest.
+//   - Future-dated changes. advanceWatermark takes max(OccurredAt); one deploy
+//     dated in the future (clock skew / bad data) would push the watermark past
+//     real time and silently drop every real deploy until that instant arrives.
+//     Skew-tolerant drop + WARN, mirroring the change receiver's future-clamp.
+//
+// Dropped items are simply re-evaluated next cycle, so a transient bad value
+// self-heals without corrupting state.
+func (p *Poller) finalizeBatch(candidates []store.Change, now time.Time) []store.Change {
+	cutoff := now.Add(futureSkew)
+	seen := make(map[string]bool, len(candidates))
+	out := candidates[:0] // reuse backing array; we only ever shrink
+	for _, c := range candidates {
+		switch {
+		case c.OccurredAt.After(cutoff):
+			p.logger.Warn("sentry: dropping change dated in the future", "id", c.ID, "occurred_at", c.OccurredAt)
+		case seen[c.ID]:
+			p.logger.Warn("sentry: dropping duplicate change id within batch", "id", c.ID)
+		default:
+			seen[c.ID] = true
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // stamp fills the acquisition timestamp the mapping leaves zero.
@@ -378,6 +433,23 @@ func advanceWatermark(prev watermark, emitted []store.Change) watermark {
 	}
 	sort.Strings(ids)
 	return watermark{LastEmittedAt: maxT.UTC(), BoundaryDeployIDs: ids}
+}
+
+// hasNewDeployActivity decides whether a release warrants the per-release deploys
+// call. It trusts deployCount as authoritative: a release with no deploys never
+// gets one; a release reporting deploys but no inline lastDeploy summary is
+// checked anyway (the missing hint must not be read as "nothing new", which would
+// silently skip a real deploy); otherwise the inline lastDeploy gates the call so
+// quiescent releases cost nothing.
+func hasNewDeployActivity(r Release, wm watermark) bool {
+	switch {
+	case r.DeployCount == 0:
+		return false
+	case r.LastDeploy == nil:
+		return true
+	default:
+		return wm.shouldEmit(r.LastDeploy.DateFinished, deployKey(r.LastDeploy.ID))
+	}
 }
 
 func deployKey(id string) string { return "deploy:" + id }

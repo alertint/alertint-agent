@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,23 +18,43 @@ import (
 // fakeSource is a no-HTTP releaseSource the poller tests drive directly. Fields
 // are mutated between cycles to simulate new deploys arriving.
 type fakeSource struct {
-	mu          sync.Mutex
-	releases    []Release
-	deploys     map[string][]Deploy
-	releasesErr error
-	deploysErr  error
-	relCalls    int
-	depCalls    []string
+	mu       sync.Mutex
+	releases []Release // returned for any project unless releasesByProject is set
+	// releasesByProject, when non-nil, returns per-project release lists so
+	// multi-project fan-out is exercised; the projects arg selects the list.
+	releasesByProject map[string][]Release
+	deploys           map[string][]Deploy
+	releasesErr       error
+	deploysErr        error
+	// forcePages > 0 makes ListReleases always return a non-empty next cursor,
+	// forcing scanProject onto the page-cap path.
+	forcePages      bool
+	relCalls        int
+	depCalls        []string
+	projectsQueried []string
 }
 
-func (f *fakeSource) ListReleases(_ context.Context, _ []string, _ string) ([]Release, string, error) {
+func (f *fakeSource) ListReleases(_ context.Context, projects []string, _ string) ([]Release, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.relCalls++
+	f.projectsQueried = append(f.projectsQueried, projects...)
 	if f.releasesErr != nil {
 		return nil, "", f.releasesErr
 	}
-	return f.releases, "", nil
+	next := ""
+	if f.forcePages {
+		next = "cursor-next"
+	}
+	rels := f.releases
+	if f.releasesByProject != nil {
+		key := ""
+		if len(projects) > 0 {
+			key = projects[0]
+		}
+		rels = f.releasesByProject[key]
+	}
+	return rels, next, nil
 }
 
 func (f *fakeSource) ListDeploys(_ context.Context, _, version string) ([]Deploy, error) {
@@ -464,4 +485,263 @@ func decodeWM(t *testing.T, val string) watermark {
 		t.Fatalf("decode watermark %q: %v", val, err)
 	}
 	return wm
+}
+
+// --- regression tests for the code-review fixes ---
+
+// TestPoller_DuplicateChangeIDDeduped guards the poison-pill: two candidates
+// sharing a Change.ID must not fail the batch's PK constraint and wedge the
+// poller — finalizeBatch drops the duplicate, the batch commits, and the
+// watermark advances so the next cycle proceeds.
+func TestPoller_DuplicateChangeIDDeduped(t *testing.T) {
+	now := mustTime(t)
+	finished := now.Add(-5 * time.Minute)
+	// Two deploys with the SAME id (a degenerate/buggy response) → same Change.ID.
+	src := &fakeSource{
+		releases: []Release{{Version: "v", DateCreated: now.Add(-time.Hour), DeployCount: 2,
+			LastDeploy: &Deploy{ID: "dup", Environment: strptr("production"), DateFinished: finished}}},
+		deploys: map[string][]Deploy{"v": {
+			{ID: "dup", Environment: strptr("staging"), DateFinished: finished},
+			{ID: "dup", Environment: strptr("production"), DateFinished: finished},
+		}},
+	}
+	p, st := newTestPoller(t, src, now, nil)
+	if err := p.pollOnce(context.Background()); err != nil {
+		t.Fatalf("pollOnce wedged on duplicate id: %v", err)
+	}
+	start, end := wideWindow(now)
+	got, _ := st.ChangesInWindow(context.Background(), start, end)
+	if len(got) != 1 {
+		t.Fatalf("duplicate id produced %d rows, want 1 (deduped)", len(got))
+	}
+	// Watermark advanced → next cycle is not wedged.
+	if _, found, _ := st.LoadConnectorState(context.Background(), connectorStateName); !found {
+		t.Fatal("watermark did not advance after deduped batch")
+	}
+	if err := p.pollOnce(context.Background()); err != nil {
+		t.Fatalf("second cycle failed (poller wedged): %v", err)
+	}
+}
+
+// TestPoller_FutureDatedChangeDropped guards the watermark against a future
+// timestamp: a deploy dated well ahead of now is dropped (not emitted) and must
+// not poison the watermark, so a later real deploy still lands.
+func TestPoller_FutureDatedChangeDropped(t *testing.T) {
+	now := mustTime(t)
+	future := now.Add(time.Hour) // well beyond futureSkew
+	src := &fakeSource{
+		releases: []Release{{Version: "v", DateCreated: now.Add(-time.Hour), DeployCount: 1,
+			LastDeploy: &Deploy{ID: "d-future", Environment: strptr("production"), DateFinished: future}}},
+		deploys: map[string][]Deploy{"v": {{ID: "d-future", Environment: strptr("production"), DateFinished: future}}},
+	}
+	p, st := newTestPoller(t, src, now, nil)
+	if err := p.pollOnce(context.Background()); err != nil {
+		t.Fatalf("pollOnce: %v", err)
+	}
+	start, end := wideWindow(now)
+	if got, _ := st.ChangesInWindow(context.Background(), start, end); len(got) != 0 {
+		t.Fatalf("future-dated deploy was emitted: %+v", got)
+	}
+	// Watermark must NOT have been pushed into the future. A real deploy at
+	// now-5m on the next cycle should therefore still emit.
+	src.mu.Lock()
+	realFinish := now.Add(-5 * time.Minute)
+	src.releases = []Release{{Version: "v2", DateCreated: now.Add(-time.Hour), DeployCount: 1,
+		LastDeploy: &Deploy{ID: "d-real", Environment: strptr("production"), DateFinished: realFinish}}}
+	src.deploys = map[string][]Deploy{"v2": {{ID: "d-real", Environment: strptr("production"), DateFinished: realFinish}}}
+	src.mu.Unlock()
+	if err := p.pollOnce(context.Background()); err != nil {
+		t.Fatalf("second pollOnce: %v", err)
+	}
+	got, _ := st.ChangesInWindow(context.Background(), start, end)
+	if len(got) != 1 || got[0].ID != "deploy:d-real" {
+		t.Fatalf("real deploy not emitted after a future-dated one — watermark poisoned: %+v", got)
+	}
+}
+
+// TestPoller_DeployCountWithNilLastDeployFetchesDeploys guards the gate gap: a
+// release reporting deploys but no inline lastDeploy must still be polled.
+func TestPoller_DeployCountWithNilLastDeployFetchesDeploys(t *testing.T) {
+	now := mustTime(t)
+	finished := now.Add(-5 * time.Minute)
+	src := &fakeSource{
+		releases: []Release{{Version: "v", DateCreated: now.Add(-time.Hour), DeployCount: 1, LastDeploy: nil}},
+		deploys:  map[string][]Deploy{"v": {{ID: "d-1", Environment: strptr("production"), DateFinished: finished}}},
+	}
+	p, st := newTestPoller(t, src, now, nil)
+	if err := p.pollOnce(context.Background()); err != nil {
+		t.Fatalf("pollOnce: %v", err)
+	}
+	if src.deployCallCount() != 1 {
+		t.Errorf("ListDeploys called %d times, want 1 (nil lastDeploy must not be read as 'nothing new')", src.deployCallCount())
+	}
+	start, end := wideWindow(now)
+	if got, _ := st.ChangesInWindow(context.Background(), start, end); len(got) != 1 {
+		t.Fatalf("deploy not emitted for DeployCount>0 / nil lastDeploy: %+v", got)
+	}
+}
+
+// TestPoller_MultiProjectFanOut exercises the per-project iteration: each
+// configured project is queried and its deploys accumulate into one batch + one
+// watermark advance.
+func TestPoller_MultiProjectFanOut(t *testing.T) {
+	now := mustTime(t)
+	fin := now.Add(-5 * time.Minute)
+	src := &fakeSource{
+		releasesByProject: map[string][]Release{
+			"alpha": {{Version: "va", DateCreated: now.Add(-time.Hour), DeployCount: 1,
+				LastDeploy: &Deploy{ID: "da", Environment: strptr("production"), DateFinished: fin}}},
+			"beta": {{Version: "vb", DateCreated: now.Add(-time.Hour), DeployCount: 1,
+				LastDeploy: &Deploy{ID: "db", Environment: strptr("production"), DateFinished: fin}}},
+		},
+		deploys: map[string][]Deploy{
+			"va": {{ID: "da", Environment: strptr("production"), DateFinished: fin}},
+			"vb": {{ID: "db", Environment: strptr("production"), DateFinished: fin}},
+		},
+	}
+	p, st := newTestPoller(t, src, now, func(c *PollerConfig) { c.Projects = []string{"alpha", "beta"} })
+	if err := p.pollOnce(context.Background()); err != nil {
+		t.Fatalf("pollOnce: %v", err)
+	}
+	start, end := wideWindow(now)
+	got, _ := st.ChangesInWindow(context.Background(), start, end)
+	if len(got) != 2 {
+		t.Fatalf("multi-project produced %d changes, want 2", len(got))
+	}
+	src.mu.Lock()
+	queried := append([]string(nil), src.projectsQueried...)
+	src.mu.Unlock()
+	seen := map[string]bool{}
+	for _, q := range queried {
+		seen[q] = true
+	}
+	if !seen["alpha"] || !seen["beta"] {
+		t.Errorf("projects queried = %v, want both alpha and beta", queried)
+	}
+	ids := map[string]bool{}
+	for _, c := range got {
+		ids[c.Labels["project"]] = true
+	}
+	if !ids["alpha"] || !ids["beta"] {
+		t.Errorf("change project labels = %v, want alpha+beta", ids)
+	}
+}
+
+// TestPoller_ReleasePageCapWarns asserts scanProject surfaces a WARN (no silent
+// truncation) when pagination hits the page cap.
+func TestPoller_ReleasePageCapWarns(t *testing.T) {
+	now := mustTime(t)
+	capH := &capturingHandler{}
+	src := &fakeSource{
+		forcePages: true, // ListReleases always returns a next cursor
+		releases:   []Release{{Version: "v", DateCreated: now.Add(-time.Hour), DeployCount: 0}},
+		deploys:    map[string][]Deploy{},
+	}
+	st, err := store.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	p := NewPoller(src, st, PollerConfig{
+		BaseURL: "https://sentry.io", Org: "acme", Projects: []string{"checkout"},
+		InitialLookback: time.Hour, ReleaseScanHorizon: 365 * 24 * time.Hour, RetentionDays: 30,
+	}, slog.New(capH))
+	p.now = func() time.Time { return now }
+	if err := p.pollOnce(context.Background()); err != nil {
+		t.Fatalf("pollOnce: %v", err)
+	}
+	if src.releaseCallCount() != maxReleasePages {
+		t.Errorf("ListReleases called %d times, want the %d-page cap", src.releaseCallCount(), maxReleasePages)
+	}
+	if !capH.contains("page cap") {
+		t.Errorf("expected a page-cap WARN; captured: %v", capH.messages())
+	}
+}
+
+// TestPoller_StopCancelsInFlightCycle proves Stop aborts a slow in-flight cycle
+// even when the parent context is still live (the error-driven shutdown path):
+// ListReleases blocks until the cycle context is cancelled by Stop.
+func TestPoller_StopCancelsInFlightCycle(t *testing.T) {
+	now := mustTime(t)
+	src := &blockingSource{entered: make(chan struct{}, 1)}
+	st, err := store.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	p := NewPoller(src, st, PollerConfig{
+		BaseURL: "https://sentry.io", Org: "acme", Projects: []string{"checkout"},
+		PollInterval: time.Hour, InitialLookback: time.Hour, ReleaseScanHorizon: 30 * 24 * time.Hour,
+	}, slog.New(slog.DiscardHandler))
+	p.now = func() time.Time { return now }
+
+	// Parent context stays live; only Stop's internal cancel can unblock the cycle.
+	p.Start(context.Background())
+	select {
+	case <-src.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("poll cycle never entered ListReleases")
+	}
+
+	done := make(chan struct{})
+	go func() { p.Stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return; in-flight cycle was not cancelled")
+	}
+}
+
+// blockingSource.ListReleases blocks until its context is cancelled.
+type blockingSource struct {
+	entered chan struct{}
+}
+
+func (b *blockingSource) ListReleases(ctx context.Context, _ []string, _ string) ([]Release, string, error) {
+	select {
+	case b.entered <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	return nil, "", ctx.Err()
+}
+
+func (b *blockingSource) ListDeploys(_ context.Context, _, _ string) ([]Deploy, error) {
+	return nil, nil
+}
+
+// capturingHandler is a minimal slog.Handler that records log messages for
+// assertions.
+type capturingHandler struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (h *capturingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *capturingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.msgs = append(h.msgs, r.Message)
+	return nil
+}
+
+func (h *capturingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *capturingHandler) WithGroup(string) slog.Handler      { return h }
+
+func (h *capturingHandler) contains(sub string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, m := range h.msgs {
+		if strings.Contains(m, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *capturingHandler) messages() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.msgs...)
 }
