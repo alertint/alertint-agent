@@ -12,10 +12,12 @@ import (
 )
 
 // Change is the in-memory representation of a row in the changes table. A
-// change is a point-in-time event (deploy/config/flag/scale/rollback) pushed in
-// over a webhook; it enriches incident triage and is never correlated into an
-// incident of its own. Labels share the alert-label vocabulary so they can be
-// matched against an incident's shared labels.
+// change is a point-in-time event (deploy/release/config/flag/scale/rollback).
+// It is acquisition-agnostic: a change may be pushed in over a webhook by the
+// change Receiver, or pulled and synthesized by a Change source (e.g. the Sentry
+// release/deploy poller). Either way it enriches incident triage and is never
+// correlated into an incident of its own. Labels carry alert-label vocabulary or
+// a source's own keys so they can be matched against an incident's shared labels.
 type Change struct {
 	ID         string
 	Source     string // "" is normalized to "unknown" at parse time
@@ -28,9 +30,26 @@ type Change struct {
 	ReceivedAt time.Time
 }
 
+// execer is the ExecContext-only seam satisfied by both *sql.DB and *sql.Tx, so
+// the single change-INSERT path serves both the append-only InsertChange (on the
+// db) and the transactional batch insert (on a tx) without SQL drift.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 // InsertChange persists one change. Changes are append-only (no upsert): every
-// POST is a distinct event.
+// acquired change — a received webhook or a polled deploy/release — is a
+// distinct event. Idempotency (not re-acquiring the same source event) is the
+// acquirer's job, not the store's.
 func (s *Store) InsertChange(ctx context.Context, c Change) error {
+	return insertChange(ctx, s.db, c)
+}
+
+// insertChange is the one place a change row is written. It validates, marshals
+// labels, and runs the 9-column INSERT against any execer. InsertChange passes
+// s.db (byte-identical to the pre-extraction behavior, R17); the Sentry batch
+// method passes its tx so the batch and the watermark advance commit atomically.
+func insertChange(ctx context.Context, e execer, c Change) error {
 	if err := validateChange(c); err != nil {
 		return err
 	}
@@ -45,7 +64,7 @@ func (s *Store) InsertChange(ctx context.Context, c Change) error {
 	if c.Link != "" {
 		link = c.Link
 	}
-	_, err = s.db.ExecContext(ctx, `
+	_, err = e.ExecContext(ctx, `
 		INSERT INTO changes (id, source, kind, title, labels_json, version, link, occurred_at, received_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
