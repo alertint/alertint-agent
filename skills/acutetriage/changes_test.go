@@ -34,7 +34,7 @@ func TestFetchChanges_RanksByMatchCountThenRecency(t *testing.T) {
 	ins("two-a", -8, map[string]string{"service": "checkout", "namespace": "prod"})                       // 2 matches
 	ins("two-b", -10, map[string]string{"service": "payments", "namespace": "prod", "region": "us-east"}) // 2 matches (namespace,region)
 	ins("one", -5, map[string]string{"region": "us-east"})                                                // 1 match, most recent
-	ins("zero", -3, map[string]string{"team": "infra"})                                                   // 0 matches → excluded
+	ins("zero", -3, map[string]string{"team": "infra"})                                                   // 0 matches → ADR-0005: now INCLUDED, ranked last
 
 	shared := map[string]string{"service": "checkout", "namespace": "prod", "region": "us-east"}
 	got := FetchChanges(ctx, st, ChangeParams{Enabled: true, WindowMinutes: 120, MaxEvents: 10},
@@ -43,13 +43,17 @@ func TestFetchChanges_RanksByMatchCountThenRecency(t *testing.T) {
 	if got == nil {
 		t.Fatal("want non-nil enrichment")
 	}
-	if len(got.Changes) != 3 {
-		t.Fatalf("want 3 matched (zero excluded), got %d: %#v", len(got.Changes), got.Changes)
+	// ADR-0005: the 0-match "zero" change is no longer excluded — all 4 surface.
+	if len(got.Changes) != 4 {
+		t.Fatalf("want 4 (incl. the 0-match change), got %d: %#v", len(got.Changes), got.Changes)
 	}
-	// match-count primary: the two 2-match changes outrank the 1-match "one",
-	// even though "one" is more recent.
-	if got.Changes[0].MatchCount != 2 || got.Changes[1].MatchCount != 2 || got.Changes[2].Title != "one" {
-		t.Fatalf("ranking wrong: %#v", got.Changes)
+	// match-count primary: the two 2-match changes outrank "one" (1) which
+	// outranks "zero" (0), even though "zero" is the most recent.
+	if got.Changes[0].MatchCount != 2 || got.Changes[1].MatchCount != 2 {
+		t.Fatalf("top two should be 2-match: %#v", got.Changes)
+	}
+	if got.Changes[2].Title != "one" || got.Changes[3].Title != "zero" {
+		t.Fatalf("ranking wrong, want one then zero last: %#v", got.Changes)
 	}
 	// recency tiebreak among the two 2-match changes: two-a (-8) newer than two-b (-10).
 	if got.Changes[0].Title != "two-a" {
@@ -57,19 +61,98 @@ func TestFetchChanges_RanksByMatchCountThenRecency(t *testing.T) {
 	}
 }
 
-func TestFetchChanges_MaxEventsCap(t *testing.T) {
+// TestFetchChanges_AE6_UnmatchedIncludedAfterMatched pins the ADR-0005 shift: an
+// in-window change sharing NO label with the incident is surfaced (not dropped),
+// ranked after the matched one.
+func TestFetchChanges_AE6_UnmatchedIncludedAfterMatched(t *testing.T) {
+	ctx := context.Background()
+	st, _ := store.Open(ctx, ":memory:")
+	defer func() { _ = st.Close() }()
+
+	first := time.Date(2026, 6, 18, 10, 50, 0, 0, time.UTC)
+	ins := func(id string, mins int, labels map[string]string) {
+		ts := first.Add(time.Duration(mins) * time.Minute)
+		_ = st.InsertChange(ctx, store.Change{ID: id, Source: "sentry", Kind: "deploy", Title: id, Labels: labels, OccurredAt: ts, ReceivedAt: ts})
+	}
+	ins("matched", -10, map[string]string{"service": "checkout"}) // shares service
+	ins("unmatched", -2, map[string]string{"project": "billing"}) // shares nothing, more recent
+
+	got := FetchChanges(ctx, st, ChangeParams{Enabled: true, WindowMinutes: 120, MaxEvents: 10},
+		alertsWithLabels(map[string]string{"service": "checkout"}), first, first, "inc1", slog.Default())
+	if got == nil || len(got.Changes) != 2 {
+		t.Fatalf("want both changes surfaced, got %#v", got)
+	}
+	// Match-first preserved: matched ranks before the more-recent unmatched.
+	if got.Changes[0].Title != "matched" || got.Changes[1].Title != "unmatched" {
+		t.Fatalf("ordering wrong, want matched then unmatched: %#v", got.Changes)
+	}
+	if got.Changes[0].MatchCount != 1 || len(got.Changes[0].MatchedOn) != 1 {
+		t.Errorf("matched change lost its MatchedOn: %#v", got.Changes[0])
+	}
+	if got.Changes[1].MatchCount != 0 || len(got.Changes[1].MatchedOn) != 0 {
+		t.Errorf("unmatched change should have empty MatchedOn: %#v", got.Changes[1])
+	}
+}
+
+// TestFetchChanges_AE7_NoSharedLabelsStillSurfaces pins that an incident whose
+// alerts share no labels still receives recent in-window changes by recency
+// (the old len(shared)==0 early-return is gone).
+func TestFetchChanges_AE7_NoSharedLabelsStillSurfaces(t *testing.T) {
+	ctx := context.Background()
+	st, _ := store.Open(ctx, ":memory:")
+	defer func() { _ = st.Close() }()
+
+	first := time.Date(2026, 6, 18, 10, 50, 0, 0, time.UTC)
+	ins := func(id string, mins int) {
+		ts := first.Add(time.Duration(mins) * time.Minute)
+		_ = st.InsertChange(ctx, store.Change{ID: id, Source: "sentry", Kind: "deploy", Title: id, Labels: map[string]string{"project": "checkout"}, OccurredAt: ts, ReceivedAt: ts})
+	}
+	ins("older", -20)
+	ins("newer", -3)
+
+	// Alerts share NO label (different service values).
+	noShared := []store.Alert{
+		{ID: "a1", Fingerprint: "f1", Status: "firing", Labels: map[string]string{"service": "a"}, StartsAt: first, ReceivedAt: first},
+		{ID: "a2", Fingerprint: "f2", Status: "firing", Labels: map[string]string{"service": "b"}, StartsAt: first, ReceivedAt: first},
+	}
+	got := FetchChanges(ctx, st, ChangeParams{Enabled: true, WindowMinutes: 120, MaxEvents: 10}, noShared, first, first, "inc1", slog.Default())
+	if got == nil {
+		t.Fatal("want non-nil enrichment")
+	}
+	if len(got.Changes) != 2 {
+		t.Fatalf("want both changes by recency, got %#v", got.Changes)
+	}
+	if got.Changes[0].Title != "newer" { // recency order, no match to rank on
+		t.Errorf("want newest first, got %#v", got.Changes)
+	}
+	if got.Note != "no shared labels; showing recent changes by recency" {
+		t.Errorf("want no-shared-labels note, got %q", got.Note)
+	}
+}
+
+func TestFetchChanges_MaxEventsCapOnMixedSet(t *testing.T) {
 	ctx := context.Background()
 	st, _ := store.Open(ctx, ":memory:")
 	defer func() { _ = st.Close() }()
 	first := time.Date(2026, 6, 18, 10, 50, 0, 0, time.UTC)
-	for i := 0; i < 5; i++ {
-		ts := first.Add(time.Duration(-i-1) * time.Minute)
-		_ = st.InsertChange(ctx, store.Change{ID: string(rune('a' + i)), Source: "ci", Kind: "deploy", Title: "t", Labels: map[string]string{"service": "checkout"}, OccurredAt: ts, ReceivedAt: ts})
+	ins := func(id string, mins int, labels map[string]string) {
+		ts := first.Add(time.Duration(mins) * time.Minute)
+		_ = st.InsertChange(ctx, store.Change{ID: id, Source: "ci", Kind: "deploy", Title: id, Labels: labels, OccurredAt: ts, ReceivedAt: ts})
 	}
+	// One matched + several unmatched; cap=2 keeps the matched + one unmatched.
+	ins("matched", -15, map[string]string{"service": "checkout"})
+	ins("u1", -1, map[string]string{"x": "1"})
+	ins("u2", -2, map[string]string{"x": "2"})
+	ins("u3", -3, map[string]string{"x": "3"})
+
 	got := FetchChanges(ctx, st, ChangeParams{Enabled: true, WindowMinutes: 120, MaxEvents: 2},
 		alertsWithLabels(map[string]string{"service": "checkout"}), first, first, "inc1", slog.Default())
 	if len(got.Changes) != 2 {
 		t.Fatalf("cap not applied: %d", len(got.Changes))
+	}
+	// Matched retained first; the single unmatched kept is the most recent (u1).
+	if got.Changes[0].Title != "matched" || got.Changes[1].Title != "u1" {
+		t.Fatalf("cap dropped the wrong items: %#v", got.Changes)
 	}
 }
 
@@ -79,22 +162,14 @@ func TestFetchChanges_VisibilityNotes(t *testing.T) {
 	defer func() { _ = st.Close() }()
 	first := time.Now().UTC()
 
-	// disabled → nil
+	// Contract unchanged: disabled → nil ("we never looked").
 	if FetchChanges(ctx, st, ChangeParams{Enabled: false}, alertsWithLabels(map[string]string{"a": "b"}), first, first, "i", slog.Default()) != nil {
 		t.Fatal("disabled must return nil")
 	}
-	// enabled, no shared labels → note
-	noShared := []store.Alert{
-		{ID: "a1", Fingerprint: "f1", Status: "firing", Labels: map[string]string{"service": "a"}, StartsAt: first, ReceivedAt: first},
-		{ID: "a2", Fingerprint: "f2", Status: "firing", Labels: map[string]string{"service": "b"}, StartsAt: first, ReceivedAt: first},
-	}
-	e := FetchChanges(ctx, st, ChangeParams{Enabled: true, WindowMinutes: 120, MaxEvents: 10}, noShared, first, first, "i", slog.Default())
-	if e == nil || e.Note != "no shared labels to match changes for this incident" {
-		t.Fatalf("want no-shared-labels note, got %#v", e)
-	}
-	// enabled, shared labels, empty window → "no changes in window"
-	e2 := FetchChanges(ctx, st, ChangeParams{Enabled: true, WindowMinutes: 120, MaxEvents: 10}, alertsWithLabels(map[string]string{"service": "a"}), first, first, "i", slog.Default())
-	if e2 == nil || e2.Note != "no changes in window" {
-		t.Fatalf("want no-changes note, got %#v", e2)
+	// Genuinely empty window (no changes at all) → "no changes in window",
+	// regardless of whether the incident had shared labels.
+	e := FetchChanges(ctx, st, ChangeParams{Enabled: true, WindowMinutes: 120, MaxEvents: 10}, alertsWithLabels(map[string]string{"service": "a"}), first, first, "i", slog.Default())
+	if e == nil || e.Note != "no changes in window" {
+		t.Fatalf("want no-changes note, got %#v", e)
 	}
 }
