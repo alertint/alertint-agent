@@ -211,29 +211,40 @@ func (c *Client) doGET(ctx context.Context, path string, query url.Values) (*htt
 	return nil, lastErr
 }
 
-// backoffDelay picks the wait before the next retry. For a 429 it honors
-// X-Sentry-Rate-Limit-Reset (UTC epoch seconds) first, then Retry-After if
-// present — the Sentry REST API documents the former but does not reliably send
-// the latter (KTD4). For a 5xx (or a 429 with no usable header) it falls back to
-// exponential backoff. Every delay is capped at maxBackoff.
+// backoffDelay picks the wait before the next retry. For a 429 it honors the
+// rate-limit headers (KTD4); for a 5xx — or a 429 with no usable header — it
+// falls back to exponential backoff. Every delay is capped at maxBackoff.
 func (c *Client) backoffDelay(resp *http.Response, attempt int) time.Duration {
 	if resp.StatusCode == http.StatusTooManyRequests {
-		if reset := resp.Header.Get("X-Sentry-Rate-Limit-Reset"); reset != "" {
-			if epoch, err := strconv.ParseInt(reset, 10, 64); err == nil {
-				if d := time.Unix(epoch, 0).Sub(c.clk.Now()); d > 0 {
-					return capBackoff(d)
-				}
-				return 0 // reset already in the past — retry immediately
-			}
-		}
-		if ra := resp.Header.Get("Retry-After"); ra != "" {
-			if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
-				return capBackoff(time.Duration(secs) * time.Second)
-			}
+		if d, ok := rateLimitWait(resp, c.clk.Now()); ok {
+			return capBackoff(d)
 		}
 	}
 	// 5xx, or 429 without a usable header: exponential backoff 0.5s, 1s, 2s, …
 	return capBackoff((500 * time.Millisecond) << attempt)
+}
+
+// rateLimitWait derives the wait from a 429's headers: X-Sentry-Rate-Limit-Reset
+// (UTC epoch seconds) first, then Retry-After — the Sentry REST API documents the
+// former but does not reliably send the latter (KTD4). ok is false when neither
+// yields a usable delay, leaving the caller on exponential backoff. A reset
+// already in the past returns (0, true) to retry immediately.
+func rateLimitWait(resp *http.Response, now time.Time) (time.Duration, bool) {
+	if reset := resp.Header.Get("X-Sentry-Rate-Limit-Reset"); reset != "" {
+		if epoch, err := strconv.ParseInt(reset, 10, 64); err == nil {
+			d := time.Unix(epoch, 0).Sub(now)
+			if d < 0 {
+				d = 0
+			}
+			return d, true
+		}
+	}
+	if ra := resp.Header.Get("Retry-After"); ra != "" {
+		if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
+			return time.Duration(secs) * time.Second, true
+		}
+	}
+	return 0, false
 }
 
 func capBackoff(d time.Duration) time.Duration {

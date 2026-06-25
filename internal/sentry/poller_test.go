@@ -5,7 +5,6 @@ package sentry
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -61,11 +60,11 @@ func (f *fakeSource) releaseCallCount() int {
 
 const t0 = "2026-06-25T12:00:00Z"
 
-func mustTime(t *testing.T, s string) time.Time {
+func mustTime(t *testing.T) time.Time {
 	t.Helper()
-	tm, err := time.Parse(time.RFC3339, s)
+	tm, err := time.Parse(time.RFC3339, t0)
 	if err != nil {
-		t.Fatalf("parse time %q: %v", s, err)
+		t.Fatalf("parse time %q: %v", t0, err)
 	}
 	return tm.UTC()
 }
@@ -92,7 +91,7 @@ func newTestPoller(t *testing.T, src releaseSource, now time.Time, mutate func(*
 	if mutate != nil {
 		mutate(&cfg)
 	}
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	logger := slog.New(slog.DiscardHandler)
 	p := NewPoller(src, st, cfg, logger)
 	p.now = func() time.Time { return now }
 	return p, st
@@ -103,7 +102,7 @@ func wideWindow(now time.Time) (time.Time, time.Time) {
 }
 
 func TestPoller_AE1_NewDeployEmittedAndWatermarkAdvances(t *testing.T) {
-	now := mustTime(t, t0)
+	now := mustTime(t)
 	finished := now.Add(-5 * time.Minute)
 	src := &fakeSource{
 		releases: []Release{{
@@ -138,7 +137,7 @@ func TestPoller_AE1_NewDeployEmittedAndWatermarkAdvances(t *testing.T) {
 }
 
 func TestPoller_AE2_RepeatPollNoDuplicate(t *testing.T) {
-	now := mustTime(t, t0)
+	now := mustTime(t)
 	finished := now.Add(-5 * time.Minute)
 	src := &fakeSource{
 		releases: []Release{{
@@ -166,7 +165,7 @@ func TestPoller_AE2_RepeatPollNoDuplicate(t *testing.T) {
 }
 
 func TestPoller_AE3_RestartNoReEmitNoLoss(t *testing.T) {
-	now := mustTime(t, t0)
+	now := mustTime(t)
 	finished := now.Add(-5 * time.Minute)
 	rel := Release{Version: "v1", DateCreated: now.Add(-time.Hour), DeployCount: 1,
 		LastDeploy: &Deploy{ID: "d-1", Environment: strptr("production"), DateFinished: finished}}
@@ -180,7 +179,7 @@ func TestPoller_AE3_RestartNoReEmitNoLoss(t *testing.T) {
 	}
 
 	// Simulate a restart: a brand-new poller against the SAME persisted store.
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	logger := slog.New(slog.DiscardHandler)
 	p2 := NewPoller(src, st, p.cfg, logger)
 	p2.now = func() time.Time { return now }
 	if err := p2.pollOnce(context.Background()); err != nil {
@@ -195,7 +194,7 @@ func TestPoller_AE3_RestartNoReEmitNoLoss(t *testing.T) {
 }
 
 func TestPoller_AE4_ClientErrorSkipsCycleNoCrash(t *testing.T) {
-	now := mustTime(t, t0)
+	now := mustTime(t)
 	src := &fakeSource{releasesErr: &APIError{StatusCode: http.StatusTooManyRequests, Body: "rate limited"}}
 	p, st := newTestPoller(t, src, now, nil)
 
@@ -213,7 +212,7 @@ func TestPoller_AE4_ClientErrorSkipsCycleNoCrash(t *testing.T) {
 }
 
 func TestPoller_AE5_ReleaseWithoutDeployEmitsReleaseChange(t *testing.T) {
-	now := mustTime(t, t0)
+	now := mustTime(t)
 	src := &fakeSource{
 		releases: []Release{{Version: "v2", DateCreated: now.Add(-30 * time.Minute), DeployCount: 0}},
 		deploys:  map[string][]Deploy{},
@@ -233,7 +232,7 @@ func TestPoller_AE5_ReleaseWithoutDeployEmitsReleaseChange(t *testing.T) {
 }
 
 func TestPoller_AE9_MultiEnvDeploysEmitDistinctChanges(t *testing.T) {
-	now := mustTime(t, t0)
+	now := mustTime(t)
 	staging := now.Add(-6 * time.Minute)
 	prod := now.Add(-5 * time.Minute)
 	src := &fakeSource{
@@ -263,7 +262,7 @@ func TestPoller_AE9_MultiEnvDeploysEmitDistinctChanges(t *testing.T) {
 }
 
 func TestPoller_FirstRunSeedBackfillsWithinLookback(t *testing.T) {
-	now := mustTime(t, t0)
+	now := mustTime(t)
 	withinLookback := now.Add(-30 * time.Minute) // inside the 60m seed window
 	beforeLookback := now.Add(-90 * time.Minute) // older than the seed → excluded
 	src := &fakeSource{
@@ -286,7 +285,7 @@ func TestPoller_FirstRunSeedBackfillsWithinLookback(t *testing.T) {
 }
 
 func TestPoller_KTD3_OldReleaseWithinHorizonGetsNewDeploy(t *testing.T) {
-	now := mustTime(t, t0)
+	now := mustTime(t)
 	// Release created 25d ago (inside the 30d horizon) but deployed today.
 	src := &fakeSource{
 		releases: []Release{{Version: "old-rel", DateCreated: now.AddDate(0, 0, -25), DeployCount: 1,
@@ -305,7 +304,7 @@ func TestPoller_KTD3_OldReleaseWithinHorizonGetsNewDeploy(t *testing.T) {
 }
 
 func TestPoller_KTD3_LastDeployGateSkipsQuiescentRelease(t *testing.T) {
-	now := mustTime(t, t0)
+	now := mustTime(t)
 	// Persist a watermark 10m old; the release's lastDeploy is 20m old (older).
 	seed := `{"last_emitted_at":"` + now.Add(-10*time.Minute).Format(time.RFC3339Nano) + `","boundary_deploy_ids":[]}`
 	src := &fakeSource{
@@ -330,7 +329,7 @@ func TestPoller_KTD3_LastDeployGateSkipsQuiescentRelease(t *testing.T) {
 }
 
 func TestPoller_KTD3_ReleaseOlderThanHorizonNotScanned(t *testing.T) {
-	now := mustTime(t, t0)
+	now := mustTime(t)
 	// Created 40d ago (past the 30d horizon) with a fresh deploy today.
 	src := &fakeSource{
 		releases: []Release{{Version: "ancient", DateCreated: now.AddDate(0, 0, -40), DeployCount: 1,
@@ -351,7 +350,7 @@ func TestPoller_KTD3_ReleaseOlderThanHorizonNotScanned(t *testing.T) {
 }
 
 func TestPoller_R9_EqualTimestampBoundaryAcrossCycles(t *testing.T) {
-	now := mustTime(t, t0)
+	now := mustTime(t)
 	tEq := now.Add(-5 * time.Minute)
 	src := &fakeSource{
 		releases: []Release{{Version: "v", DateCreated: now.Add(-time.Hour), DeployCount: 1,
@@ -390,7 +389,7 @@ func TestPoller_R9_EqualTimestampBoundaryAcrossCycles(t *testing.T) {
 }
 
 func TestPoller_PruneRunsWithRetentionCutoff(t *testing.T) {
-	now := mustTime(t, t0)
+	now := mustTime(t)
 	ctx := context.Background()
 	src := &fakeSource{releases: nil} // nothing new this cycle
 	p, st := newTestPoller(t, src, now, nil)
@@ -414,7 +413,7 @@ func TestPoller_PruneRunsWithRetentionCutoff(t *testing.T) {
 }
 
 func TestPoller_ZeroLabelReleaseDropped(t *testing.T) {
-	now := mustTime(t, t0)
+	now := mustTime(t)
 	// Org-wide (no project filter): a release with no deploys maps to a change
 	// with no labels, which must be dropped rather than fail the batch insert.
 	src := &fakeSource{
@@ -432,7 +431,7 @@ func TestPoller_ZeroLabelReleaseDropped(t *testing.T) {
 }
 
 func TestPoller_StartStopGraceful(t *testing.T) {
-	now := mustTime(t, t0)
+	now := mustTime(t)
 	src := &fakeSource{releases: nil}
 	p, _ := newTestPoller(t, src, now, func(c *PollerConfig) { c.PollInterval = 5 * time.Millisecond })
 

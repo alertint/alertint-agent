@@ -238,22 +238,11 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	// egress path (also probed by the health check); the poller turns new
 	// deploys/releases into change rows in the background. Disabled → nothing
 	// constructed, no Sentry calls (zero-config triage unaffected).
-	sentryClient, err := newSentryClient(cfg)
+	sentryClient, stopSentry, err := startSentryPoller(ctx, cfg, st, logger)
 	if err != nil {
 		return err
 	}
-	if sentryClient != nil {
-		logger.Info("sentry connected",
-			slog.String("base_url", cfg.Sentry.BaseURL),
-			slog.String("org", cfg.Sentry.Org),
-		)
-		poller := newSentryPoller(cfg, sentryClient, st, logger)
-		poller.Start(ctx)
-		defer poller.Stop()
-		logger.Info("sentry release/deploy poller started",
-			slog.Int("interval_seconds", cfg.Sentry.Releases.PollIntervalSeconds),
-		)
-	}
+	defer stopSentry()
 
 	skill := acutetriage.New(
 		acutetriage.Config{
@@ -551,7 +540,7 @@ func resolveDBPath(cfgPath, dbPathFlag string) (string, error) {
 // (nil, nil) when disabled so callers can skip all Sentry wiring.
 func newSentryClient(cfg *config.Config) (*sentry.Client, error) {
 	if !cfg.Sentry.Releases.Enabled {
-		return nil, nil
+		return nil, nil //nolint:nilnil // a disabled connector legitimately has no client and no error; callers branch on nil
 	}
 	token, err := cfg.SentryToken()
 	if err != nil {
@@ -563,6 +552,30 @@ func newSentryClient(cfg *config.Config) (*sentry.Client, error) {
 		Token:          token,
 		TimeoutSeconds: cfg.Sentry.TimeoutSeconds,
 	}), nil
+}
+
+// startSentryPoller builds the Sentry client and starts the release/deploy
+// poller when enabled, returning the client (for the health check) and a stop
+// func to defer. When disabled it returns (nil, no-op, nil) so the caller can
+// defer unconditionally. Keeps runServe's branching low.
+func startSentryPoller(ctx context.Context, cfg *config.Config, st *store.Store, logger *slog.Logger) (*sentry.Client, func(), error) {
+	client, err := newSentryClient(cfg)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	if client == nil {
+		return nil, func() {}, nil
+	}
+	logger.Info("sentry connected",
+		slog.String("base_url", cfg.Sentry.BaseURL),
+		slog.String("org", cfg.Sentry.Org),
+	)
+	poller := newSentryPoller(cfg, client, st, logger)
+	poller.Start(ctx)
+	logger.Info("sentry release/deploy poller started",
+		slog.Int("interval_seconds", cfg.Sentry.Releases.PollIntervalSeconds),
+	)
+	return client, poller.Stop, nil
 }
 
 // newSentryPoller builds the release/deploy poller from config and the shared

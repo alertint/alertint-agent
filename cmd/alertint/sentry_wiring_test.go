@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -129,7 +128,7 @@ func TestSentryWiring_PollerStartStop(t *testing.T) {
 
 	cfg := sentryEnabledConfig(srv.URL)
 	client := sentry.NewClient(sentry.Config{BaseURL: srv.URL, Org: "acme", Token: "t"})
-	poller := newSentryPoller(cfg, client, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	poller := newSentryPoller(cfg, client, st, slog.New(slog.DiscardHandler))
 	if poller == nil {
 		t.Fatal("newSentryPoller(enabled) returned nil")
 	}

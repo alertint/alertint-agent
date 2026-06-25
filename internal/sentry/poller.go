@@ -329,16 +329,17 @@ func (wm *watermark) buildSeen() {
 
 // persistable returns a copy with a non-nil BoundaryDeployIDs so the seed
 // serializes as [] rather than null.
-func (wm watermark) persistable() watermark {
-	if wm.BoundaryDeployIDs == nil {
-		wm.BoundaryDeployIDs = []string{}
+func (wm *watermark) persistable() watermark {
+	out := *wm
+	if out.BoundaryDeployIDs == nil {
+		out.BoundaryDeployIDs = []string{}
 	}
-	return wm
+	return out
 }
 
 // shouldEmit is the KTD2 guard: emit when the event is strictly newer than the
 // watermark, or exactly at the boundary instant but not already seen there.
-func (wm watermark) shouldEmit(occurred time.Time, key string) bool {
+func (wm *watermark) shouldEmit(occurred time.Time, key string) bool {
 	switch {
 	case occurred.After(wm.LastEmittedAt):
 		return true
