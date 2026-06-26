@@ -45,17 +45,20 @@ func (s *Store) InsertChange(ctx context.Context, c Change) error {
 	return insertChange(ctx, s.db, c)
 }
 
-// insertChange is the one place a change row is written. It validates, marshals
-// labels, and runs the 9-column INSERT against any execer. InsertChange passes
-// s.db (byte-identical to the pre-extraction behavior, R17); the Sentry batch
-// method passes its tx so the batch and the watermark advance commit atomically.
-func insertChange(ctx context.Context, e execer, c Change) error {
+// changeColumns is the shared column list so the append-only and batch insert
+// paths can't drift.
+const changeColumns = `(id, source, kind, title, labels_json, version, link, occurred_at, received_at)`
+
+// changeRowArgs validates c, marshals its labels, and builds the positional args
+// for a changes INSERT — shared by both insert paths so the column order stays in
+// lockstep with changeColumns.
+func changeRowArgs(c Change) ([]any, error) {
 	if err := validateChange(c); err != nil {
-		return err
+		return nil, err
 	}
 	labelsJSON, err := json.Marshal(c.Labels)
 	if err != nil {
-		return fmt.Errorf("store: marshal change labels: %w", err)
+		return nil, fmt.Errorf("store: marshal change labels: %w", err)
 	}
 	var version, link any
 	if c.Version != "" {
@@ -64,14 +67,42 @@ func insertChange(ctx context.Context, e execer, c Change) error {
 	if c.Link != "" {
 		link = c.Link
 	}
-	_, err = e.ExecContext(ctx, `
-		INSERT INTO changes (id, source, kind, title, labels_json, version, link, occurred_at, received_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`,
+	return []any{
 		c.ID, c.Source, c.Kind, c.Title, string(labelsJSON), version, link,
 		c.OccurredAt.UTC().Format(time.RFC3339Nano), c.ReceivedAt.UTC().Format(time.RFC3339Nano),
-	)
+	}, nil
+}
+
+// insertChange is the append-only single-row write used by InsertChange (the
+// change Receiver): a plain INSERT where a duplicate id is a real fault. It
+// passes s.db, byte-identical to the pre-extraction behavior (R17).
+func insertChange(ctx context.Context, e execer, c Change) error {
+	args, err := changeRowArgs(c)
 	if err != nil {
+		return err
+	}
+	if _, err := e.ExecContext(ctx,
+		`INSERT INTO changes `+changeColumns+` VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, args...); err != nil {
+		return fmt.Errorf("store: insert change: %w", err)
+	}
+	return nil
+}
+
+// insertChangeIgnoreDup is the batch write used only by the poller's
+// InsertChangesAndAdvanceWatermark: identical to insertChange but treats an
+// existing id as a no-op (ON CONFLICT(id) DO NOTHING) rather than an error. The
+// watermark is the idempotency authority, so a change already on disk — a re-emit
+// whose OccurredAt advanced, or a re-scan after the watermark was lost or
+// reseeded — must not collide and roll the whole cycle back (which never advances
+// the watermark and would wedge the poller permanently). The append-only
+// InsertChange stays strict (R17).
+func insertChangeIgnoreDup(ctx context.Context, e execer, c Change) error {
+	args, err := changeRowArgs(c)
+	if err != nil {
+		return err
+	}
+	if _, err := e.ExecContext(ctx,
+		`INSERT INTO changes `+changeColumns+` VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`, args...); err != nil {
 		return fmt.Errorf("store: insert change: %w", err)
 	}
 	return nil

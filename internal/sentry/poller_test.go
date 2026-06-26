@@ -264,6 +264,86 @@ func TestPoller_DeploysErrorSkipsCycleNoChange(t *testing.T) {
 	p.runCycle(context.Background())
 }
 
+// TestPoller_ReleaseDateReleasedAdvances_NoWedge is the end-to-end guard for the
+// cross-cycle PK-collision wedge: a release-without-deploy is emitted once at its
+// DateCreated, then re-surfaces with an advanced DateReleased (still zero
+// deploys). The second cycle re-emits the same stable id at the newer timestamp;
+// before the idempotent batch insert this PK-collided and rolled back, never
+// advancing the watermark and wedging the poller forever. It must now commit
+// cleanly, persist exactly one row, and converge.
+func TestPoller_ReleaseDateReleasedAdvances_NoWedge(t *testing.T) {
+	now := mustTime(t)
+	created := now.Add(-30 * time.Minute)
+	src := &fakeSource{releases: []Release{{Version: "v1", DateCreated: created, DeployCount: 0}}}
+	p, st := newTestPoller(t, src, now, nil)
+
+	// Cycle 1: release-without-deploy emits one release change at DateCreated.
+	if err := p.pollOnce(context.Background()); err != nil {
+		t.Fatalf("cycle 1: %v", err)
+	}
+
+	// The release is later marked released at a newer instant (still zero deploys).
+	released := now.Add(-10 * time.Minute)
+	src.releases = []Release{{Version: "v1", DateCreated: created, DateReleased: &released, DeployCount: 0}}
+
+	// Cycle 2: re-emits the same id at the advanced timestamp — must not wedge.
+	if err := p.pollOnce(context.Background()); err != nil {
+		t.Fatalf("cycle 2 must not wedge on the duplicate id: %v", err)
+	}
+	start, end := wideWindow(now)
+	got, _ := st.ChangesInWindow(context.Background(), start, end)
+	if len(got) != 1 {
+		t.Fatalf("got %d release changes, want exactly 1 (duplicate id skipped)", len(got))
+	}
+
+	// Cycle 3: watermark now sits at the advanced instant with the id seen, so it
+	// is a clean no-op — the poller has converged, not stalled.
+	if err := p.pollOnce(context.Background()); err != nil {
+		t.Fatalf("cycle 3: %v", err)
+	}
+	if got, _ = st.ChangesInWindow(context.Background(), start, end); len(got) != 1 {
+		t.Fatalf("after cycle 3 got %d changes, want still 1", len(got))
+	}
+}
+
+// TestPoller_CorruptWatermarkReseeds covers #6: a non-JSON connector_state value
+// must make the poller reseed (self-heal) rather than fail decode every cycle.
+// The reseed overwrites the corrupt row with valid JSON, and the idempotent batch
+// insert keeps the resulting re-scan safe against any already-persisted rows.
+func TestPoller_CorruptWatermarkReseeds(t *testing.T) {
+	now := mustTime(t)
+	finished := now.Add(-5 * time.Minute)
+	src := &fakeSource{
+		releases: []Release{{Version: "v1", DateCreated: now.Add(-30 * time.Minute), DeployCount: 1,
+			LastDeploy: &Deploy{ID: "d-1", Environment: strptr("production"), DateFinished: finished}}},
+		deploys: map[string][]Deploy{"v1": {{ID: "d-1", Environment: strptr("production"), DateFinished: finished}}},
+	}
+	p, st := newTestPoller(t, src, now, nil)
+
+	// Persist a corrupt (non-JSON) watermark value.
+	if err := st.SaveConnectorState(context.Background(), connectorStateName, "{not valid json"); err != nil {
+		t.Fatalf("seed corrupt state: %v", err)
+	}
+
+	if err := p.pollOnce(context.Background()); err != nil {
+		t.Fatalf("corrupt watermark must reseed, not error: %v", err)
+	}
+	// Reseed window is now−60m; the deploy at −5m is inside it, so it still emits.
+	start, end := wideWindow(now)
+	got, _ := st.ChangesInWindow(context.Background(), start, end)
+	if len(got) != 1 {
+		t.Fatalf("got %d changes after reseed, want 1", len(got))
+	}
+	// The corrupt row was overwritten with valid JSON.
+	v, found, _ := st.LoadConnectorState(context.Background(), connectorStateName)
+	if !found {
+		t.Fatal("watermark row missing after reseed")
+	}
+	if err := json.Unmarshal([]byte(v), &watermark{}); err != nil {
+		t.Errorf("watermark still not valid JSON after reseed: %v (value=%q)", err, v)
+	}
+}
+
 func TestPoller_AE5_ReleaseWithoutDeployEmitsReleaseChange(t *testing.T) {
 	now := mustTime(t)
 	src := &fakeSource{

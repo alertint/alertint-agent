@@ -98,6 +98,48 @@ func TestInsertChangesAndAdvanceWatermark_AtomicCommit(t *testing.T) {
 	}
 }
 
+// TestInsertChangesAndAdvanceWatermark_DuplicateIDIsNoOpNotError proves the batch
+// path is idempotent on id: a change already on disk (from a prior cycle) must be
+// silently skipped, not roll the whole tx back on a PK collision — otherwise the
+// watermark never advances and the poller wedges permanently. The append-only
+// InsertChange path stays strict (covered separately).
+func TestInsertChangesAndAdvanceWatermark_DuplicateIDIsNoOpNotError(t *testing.T) {
+	ctx := context.Background()
+	st, _ := Open(ctx, ":memory:")
+	defer func() { _ = st.Close() }()
+
+	base := time.Date(2026, 6, 25, 10, 0, 0, 0, time.UTC)
+	// A change already persisted by an earlier cycle.
+	if err := st.InsertChange(ctx, sentryChange("release:checkout:v1", base)); err != nil {
+		t.Fatalf("seed insert: %v", err)
+	}
+
+	// A later cycle re-emits that same id (its dateReleased advanced) alongside a
+	// genuinely new change. The batch must commit and advance the watermark.
+	batch := []Change{
+		sentryChange("release:checkout:v1", base.Add(5*time.Minute)), // duplicate id, newer occurred_at
+		sentryChange("deploy:d-9", base.Add(6*time.Minute)),          // brand new
+	}
+	const wm = `{"last_emitted_at":"2026-06-25T10:06:00Z","boundary_event_ids":["deploy:d-9"]}`
+	if err := st.InsertChangesAndAdvanceWatermark(ctx, batch, "sentry-releases", wm); err != nil {
+		t.Fatalf("batch with a duplicate id must not error: %v", err)
+	}
+
+	got, _ := st.ChangesInWindow(ctx, base.Add(-time.Hour), base.Add(time.Hour))
+	if len(got) != 2 {
+		t.Fatalf("got %d changes, want 2 (duplicate skipped, new inserted)", len(got))
+	}
+	// DO NOTHING leaves the pre-existing row untouched (original occurred_at).
+	for _, c := range got {
+		if c.ID == "release:checkout:v1" && !c.OccurredAt.Equal(base) {
+			t.Errorf("duplicate-id row occurred_at = %v, want unchanged %v", c.OccurredAt, base)
+		}
+	}
+	if v, found, _ := st.LoadConnectorState(ctx, "sentry-releases"); !found || v != wm {
+		t.Errorf("watermark = (%q, %v), want advanced (%q, true)", v, found, wm)
+	}
+}
+
 func TestInsertChangesAndAdvanceWatermark_RollsBackOnBadChange(t *testing.T) {
 	ctx := context.Background()
 	st, _ := Open(ctx, ":memory:")

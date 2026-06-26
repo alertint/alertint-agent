@@ -351,16 +351,29 @@ func (p *Poller) loadWatermark(ctx context.Context) (watermark, bool, error) {
 		return watermark{}, false, err
 	}
 	if !found {
-		seed := watermark{LastEmittedAt: p.now().UTC().Add(-p.cfg.InitialLookback)}
-		seed.buildSeen()
-		return seed, true, nil
+		return p.seedWatermark(), true, nil
 	}
 	var wm watermark
 	if err := json.Unmarshal([]byte(val), &wm); err != nil {
-		return watermark{}, false, fmt.Errorf("sentry: decode watermark: %w", err)
+		// A corrupt watermark (e.g. an operator hand-edited the connector_state
+		// row) would otherwise fail decode every cycle forever. Re-seed instead so
+		// the poller self-heals — the firstRun seed-save overwrites the bad row,
+		// and the idempotent batch insert (ON CONFLICT DO NOTHING) makes the
+		// resulting re-scan safe against changes already on disk. Bounded re-emit
+		// within the lookback window is the cost; a permanent stall is the bug.
+		p.logger.Warn("sentry: connector_state watermark is corrupt; reseeding from the lookback window", "err", err)
+		return p.seedWatermark(), true, nil
 	}
 	wm.buildSeen()
 	return wm, false, nil
+}
+
+// seedWatermark builds the first-run / recovery watermark anchored at
+// now − InitialLookback, with its seen set initialized.
+func (p *Poller) seedWatermark() watermark {
+	seed := watermark{LastEmittedAt: p.now().UTC().Add(-p.cfg.InitialLookback)}
+	seed.buildSeen()
+	return seed
 }
 
 // watermark is the persisted idempotency cursor (KTD2). LastEmittedAt is the

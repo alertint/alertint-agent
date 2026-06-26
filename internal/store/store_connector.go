@@ -54,9 +54,12 @@ func saveConnectorState(ctx context.Context, e execer, name, value string) error
 // whole batch rolls back, so a crash mid-cycle can never leave changes persisted
 // against a stale watermark (which would re-emit them) nor an advanced watermark
 // with missing changes (which would drop them) — the poller's zero-duplicate /
-// zero-loss guarantee. The append-only InsertChange path is reused verbatim via
-// the shared insertChange helper, so a malformed change in the batch fails the
-// whole tx exactly as a single InsertChange would.
+// zero-loss guarantee. Inserts go through insertChangeIgnoreDup: a change whose
+// id is already on disk (a re-emit whose OccurredAt advanced, or a re-scan after
+// the watermark was lost/reseeded) is a no-op rather than a PK collision that
+// would roll the cycle back and wedge the poller. A malformed change still fails
+// the whole tx (validation runs before the INSERT) — finalizeBatch/keep guard
+// against that. The append-only InsertChange stays strict (R17).
 func (s *Store) InsertChangesAndAdvanceWatermark(ctx context.Context, changes []Change, name, value string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -65,7 +68,7 @@ func (s *Store) InsertChangesAndAdvanceWatermark(ctx context.Context, changes []
 	defer func() { _ = tx.Rollback() }()
 
 	for _, c := range changes {
-		if err := insertChange(ctx, tx, c); err != nil {
+		if err := insertChangeIgnoreDup(ctx, tx, c); err != nil {
 			return err // rolls back via the deferred Rollback
 		}
 	}
