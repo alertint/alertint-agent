@@ -378,3 +378,174 @@ func TestAccessors_MissingEnvVarErrors(t *testing.T) {
 		t.Fatal("expected error when env var is unset")
 	}
 }
+
+// sentryBaseYAML is a minimal valid config with the SQLite path templated, used
+// as the base for the Sentry block tests below.
+func sentryBaseYAML(t *testing.T) string {
+	t.Helper()
+	return strings.Replace(minimalValidYAML, "./alertint-agent.db", filepath.Join(t.TempDir(), "agent.db"), 1)
+}
+
+func TestLoad_SentryReleasesValidAndDefaults(t *testing.T) {
+	yaml := sentryBaseYAML(t) + `
+sentry:
+  base_url: https://sentry.io
+  org: acme
+  token_env: SENTRY_TOKEN
+  releases:
+    enabled: true
+`
+	path := writeConfig(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Sentry.BaseURL != "https://sentry.io" || cfg.Sentry.Org != "acme" || cfg.Sentry.TokenEnv != "SENTRY_TOKEN" {
+		t.Errorf("connection not parsed: %+v", cfg.Sentry)
+	}
+	if !cfg.Sentry.Releases.Enabled {
+		t.Error("releases.enabled not parsed")
+	}
+	// Omitted tunables get defaults.
+	if cfg.Sentry.TimeoutSeconds != 10 {
+		t.Errorf("default timeout_seconds = %d, want 10", cfg.Sentry.TimeoutSeconds)
+	}
+	if cfg.Sentry.Releases.PollIntervalSeconds != 60 {
+		t.Errorf("default poll_interval_seconds = %d, want 60", cfg.Sentry.Releases.PollIntervalSeconds)
+	}
+	if cfg.Sentry.Releases.InitialLookbackMinutes != 60 {
+		t.Errorf("default initial_lookback_minutes = %d, want 60", cfg.Sentry.Releases.InitialLookbackMinutes)
+	}
+	if cfg.Sentry.Releases.ReleaseScanHorizonDays != 30 {
+		t.Errorf("default release_scan_horizon_days = %d, want 30", cfg.Sentry.Releases.ReleaseScanHorizonDays)
+	}
+}
+
+func TestLoad_SentryRejectsUnknownKey(t *testing.T) {
+	yaml := sentryBaseYAML(t) + `
+sentry:
+  base_url: https://sentry.io
+  org: acme
+  token_env: SENTRY_TOKEN
+  bogus_sentry_field: 1
+`
+	path := writeConfig(t, yaml)
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected strict-decode error for unknown key under sentry")
+	}
+}
+
+func TestValidate_SentryReleasesRequiresConnection(t *testing.T) {
+	for _, field := range []string{"base_url", "org", "token_env"} {
+		t.Run("missing "+field, func(t *testing.T) {
+			cfg := Defaults()
+			cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
+			cfg.Alertmanager.WebhookTokenEnv = "TOK"
+			cfg.LLM.APIKeyEnv = "KEY"
+			cfg.Sentry = SentryConfig{
+				BaseURL:        "https://sentry.io",
+				Org:            "acme",
+				TokenEnv:       "SENTRY_TOKEN",
+				TimeoutSeconds: 10,
+				Releases: SentryReleasesConfig{
+					Enabled:                true,
+					PollIntervalSeconds:    60,
+					InitialLookbackMinutes: 60,
+					ReleaseScanHorizonDays: 30,
+				},
+			}
+			switch field {
+			case "base_url":
+				cfg.Sentry.BaseURL = ""
+			case "org":
+				cfg.Sentry.Org = ""
+			case "token_env":
+				cfg.Sentry.TokenEnv = ""
+			}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("expected validation error for missing %s", field)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "sentry:") || !strings.Contains(msg, field) {
+				t.Errorf("error %q must be sentry:-prefixed and mention %s", msg, field)
+			}
+			if msg != strings.ToLower(msg) {
+				// the field-level message is lowercase; the wrapping "invalid config" prefix is too
+				t.Logf("note: message contains uppercase: %q", msg)
+			}
+		})
+	}
+}
+
+func TestValidate_SentryReleasesRejectsNonPositiveTunables(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*SentryReleasesConfig)
+		want   string
+	}{
+		{"poll_interval", func(r *SentryReleasesConfig) { r.PollIntervalSeconds = 0 }, "poll_interval_seconds"},
+		{"initial_lookback", func(r *SentryReleasesConfig) { r.InitialLookbackMinutes = 0 }, "initial_lookback_minutes"},
+		{"release_scan_horizon", func(r *SentryReleasesConfig) { r.ReleaseScanHorizonDays = -1 }, "release_scan_horizon_days"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Defaults()
+			cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
+			cfg.Alertmanager.WebhookTokenEnv = "TOK"
+			cfg.LLM.APIKeyEnv = "KEY"
+			cfg.Sentry.BaseURL = "https://sentry.io"
+			cfg.Sentry.Org = "acme"
+			cfg.Sentry.TokenEnv = "SENTRY_TOKEN"
+			cfg.Sentry.Releases.Enabled = true
+			tc.mutate(&cfg.Sentry.Releases)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate = %v, want error mentioning %s", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidate_SentryDisabledValidatesClean(t *testing.T) {
+	cfg := Defaults()
+	cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
+	cfg.Alertmanager.WebhookTokenEnv = "TOK"
+	cfg.LLM.APIKeyEnv = "KEY"
+	// Sentry left at its zero/default (disabled) with an empty connection.
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("disabled sentry should validate clean: %v", err)
+	}
+}
+
+func TestSentryToken(t *testing.T) {
+	t.Run("enabled and set returns value", func(t *testing.T) {
+		t.Setenv("SENTRY_TOKEN_X", "sntrys-secret")
+		cfg := Defaults()
+		cfg.Sentry.TokenEnv = "SENTRY_TOKEN_X"
+		cfg.Sentry.Releases.Enabled = true
+		tok, err := cfg.SentryToken()
+		if err != nil || tok != "sntrys-secret" {
+			t.Errorf("SentryToken = %q, %v; want sntrys-secret, nil", tok, err)
+		}
+	})
+
+	t.Run("enabled but unset errors with field name", func(t *testing.T) {
+		cfg := Defaults()
+		cfg.Sentry.TokenEnv = "DEFINITELY_NOT_SET_SENTRY_TEST_VAR"
+		cfg.Sentry.Releases.Enabled = true
+		_, err := cfg.SentryToken()
+		if err == nil || !strings.Contains(err.Error(), "sentry.token_env") {
+			t.Errorf("SentryToken err = %v, want sentry.token_env message", err)
+		}
+	})
+
+	t.Run("disabled returns empty nil", func(t *testing.T) {
+		cfg := Defaults()
+		cfg.Sentry.TokenEnv = "WHATEVER"
+		cfg.Sentry.Releases.Enabled = false
+		tok, err := cfg.SentryToken()
+		if err != nil || tok != "" {
+			t.Errorf("SentryToken = %q, %v; want empty, nil", tok, err)
+		}
+	})
+}

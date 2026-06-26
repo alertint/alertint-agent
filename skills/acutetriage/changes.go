@@ -45,15 +45,20 @@ type ChangeEnrichment struct {
 	Note          string            `json:"note,omitempty"`
 }
 
-// FetchChanges selects recent changes overlapping the incident's shared labels,
-// ranked by (match-count desc, recency desc), capped at MaxEvents. It mirrors
-// FetchLogs, but reads LOCAL SQLite (reliable mid-incident — no timeout dance).
+// FetchChanges surfaces recent changes in the incident's window, ranked by
+// (match-count desc, recency desc), capped at MaxEvents. It mirrors FetchLogs,
+// but reads LOCAL SQLite (reliable mid-incident — no timeout dance).
 //
-// Correlation departs from logs on purpose: NO allowlist — match on ANY shared
-// label. A deploy emitter doesn't send alert-metadata (alertname/severity), so
-// those incident labels self-drop (nothing to match); meanwhile an allowlist
-// would hide useful keys (region/cluster/env). The LLM judges relevance from the
-// title+labels; the match step's only job is not to hide candidates.
+// ADR-0005 — surface regardless of label match: every in-window change is a
+// candidate. Label overlap is computed for RANKING only (matched changes sort
+// first), never as an inclusion filter, and a no-shared-labels incident is NOT
+// short-circuited — it still gets recent changes by recency. Overshoot beats
+// undershoot here because changes are a low-volume trickle (unlike logs, where
+// ADR-0002's selector exists precisely because logs are high-volume); MaxEvents
+// is the noise bound. Correlation still departs from logs on the matching itself:
+// NO allowlist — overlap on ANY shared label, since a deploy emitter doesn't send
+// alert-metadata (alertname/severity) and an allowlist would hide useful keys
+// (region/cluster/env). The LLM judges relevance from title+labels.
 //
 // Visibility over silence: returns nil ONLY when disabled. When enabled it
 // always returns non-nil — with Changes, or with Changes empty and a Note — so
@@ -72,48 +77,43 @@ func FetchChanges(ctx context.Context, st *store.Store, params ChangeParams, ale
 	end := last
 
 	shared := sharedLabels(alerts)
-	if len(shared) == 0 {
-		logger.Info("no shared labels to match changes for this incident", "incident", incidentID)
-		return &ChangeEnrichment{Start: start, End: end, Note: "no shared labels to match changes for this incident"}
-	}
 
 	all, err := st.ChangesInWindow(ctx, start, end)
 	if err != nil {
 		logger.Warn("change query failed", "err", err, "incident", incidentID)
 		return &ChangeEnrichment{Start: start, End: end, MatchedLabels: shared, Note: "change query failed: " + err.Error()}
 	}
-
-	type ranked struct {
-		c         store.Change
-		matchedOn map[string]string
-	}
-	matched := make([]ranked, 0, len(all))
-	for _, c := range all {
-		m := overlap(c.Labels, shared)
-		if len(m) > 0 {
-			matched = append(matched, ranked{c: c, matchedOn: m})
-		}
-	}
-	if len(matched) == 0 {
+	if len(all) == 0 {
+		// Genuinely empty window — keep the original note so absence of changes
+		// is never silently mistaken for "nothing changed".
 		logger.Info("no changes in window", "window", fmt.Sprintf("%dm", params.WindowMinutes), "incident", incidentID)
 		return &ChangeEnrichment{Start: start, End: end, MatchedLabels: shared, Note: "no changes in window"}
 	}
 
-	// (match-count desc, recency desc). Relevance-primary so a flood of
-	// barely-related recent changes can't push out the highly-related one;
-	// recency breaks ties.
-	sort.SliceStable(matched, func(i, j int) bool {
-		if len(matched[i].matchedOn) != len(matched[j].matchedOn) {
-			return len(matched[i].matchedOn) > len(matched[j].matchedOn)
+	// Rank ALL in-window changes: overlap drives the sort key but no longer
+	// gates inclusion. (match-count desc, recency desc) so a highly-related
+	// change can't be pushed out by a flood of barely-related recent ones;
+	// recency breaks ties and orders the unmatched tail.
+	type ranked struct {
+		c         store.Change
+		matchedOn map[string]string
+	}
+	cands := make([]ranked, 0, len(all))
+	for _, c := range all {
+		cands = append(cands, ranked{c: c, matchedOn: overlap(c.Labels, shared)})
+	}
+	sort.SliceStable(cands, func(i, j int) bool {
+		if len(cands[i].matchedOn) != len(cands[j].matchedOn) {
+			return len(cands[i].matchedOn) > len(cands[j].matchedOn)
 		}
-		return matched[i].c.OccurredAt.After(matched[j].c.OccurredAt)
+		return cands[i].c.OccurredAt.After(cands[j].c.OccurredAt)
 	})
-	if len(matched) > params.MaxEvents {
-		matched = matched[:params.MaxEvents]
+	if len(cands) > params.MaxEvents {
+		cands = cands[:params.MaxEvents]
 	}
 
-	views := make([]ChangeView, 0, len(matched))
-	for _, m := range matched {
+	views := make([]ChangeView, 0, len(cands))
+	for _, m := range cands {
 		views = append(views, ChangeView{
 			Source:              m.c.Source,
 			Kind:                m.c.Kind,
@@ -123,12 +123,19 @@ func FetchChanges(ctx context.Context, st *store.Store, params ChangeParams, ale
 			Link:                m.c.Link,
 			OccurredAt:          m.c.OccurredAt,
 			MatchCount:          len(m.matchedOn),
-			MatchedOn:           m.matchedOn,
+			MatchedOn:           m.matchedOn, // empty for the unmatched tail
 			DeltaBeforeIncident: deltaHint(m.c.OccurredAt, first),
 		})
 	}
+
+	enr := &ChangeEnrichment{Start: start, End: end, MatchedLabels: shared, Changes: views}
+	if len(shared) == 0 {
+		// Incident had no shared labels to match on, but the window had changes —
+		// show them by recency rather than returning nothing (ADR-0005).
+		enr.Note = "no shared labels; showing recent changes by recency"
+	}
 	logger.Info("changes fetched", "changes", len(views), "window", fmt.Sprintf("%dm", params.WindowMinutes), "incident", incidentID)
-	return &ChangeEnrichment{Start: start, End: end, MatchedLabels: shared, Changes: views}
+	return enr
 }
 
 // overlap returns the keys (with values) present in both maps with equal

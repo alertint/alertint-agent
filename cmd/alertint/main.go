@@ -45,6 +45,7 @@ import (
 	notifystdout "github.com/alertint/alertint-agent/internal/notify/stdout"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/rules"
+	"github.com/alertint/alertint-agent/internal/sentry"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/packs"
 	"github.com/alertint/alertint-agent/skills/acutetriage"
@@ -233,6 +234,16 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		)
 	}
 
+	// Build the Sentry change source when enabled. The client is the shared
+	// egress path (also probed by the health check); the poller turns new
+	// deploys/releases into change rows in the background. Disabled → nothing
+	// constructed, no Sentry calls (zero-config triage unaffected).
+	sentryClient, stopSentry, err := startSentryPoller(ctx, cfg, st, logger)
+	if err != nil {
+		return err
+	}
+	defer stopSentry()
+
 	skill := acutetriage.New(
 		acutetriage.Config{
 			WindowSeconds: cfg.Correlator.WindowSeconds,
@@ -272,7 +283,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	// while one is failing — at startup a co-deployed dependency may still
 	// be booting — then at a steady pace, logging losses and recoveries.
 	// Results are cached for GET /health.
-	healthReg := buildHealthChecks(cfg, prom, logSrc)
+	healthReg := buildHealthChecks(cfg, prom, logSrc, sentryClient)
 	go healthReg.Watch(ctx, logger)
 
 	recvSrv, recvErrCh, err := startReceivers(cfg, st, auditor, cor, healthReg, logger)
@@ -524,9 +535,76 @@ func resolveDBPath(cfgPath, dbPathFlag string) (string, error) {
 	return cfg.Storage.SQLitePath, nil
 }
 
+// newSentryClient builds the shared read-only Sentry client when the release
+// poller is enabled, resolving the token from its named env var. Returns
+// (nil, nil) when disabled so callers can skip all Sentry wiring.
+func newSentryClient(cfg *config.Config) (*sentry.Client, error) {
+	if !cfg.Sentry.Releases.Enabled {
+		return nil, nil //nolint:nilnil // a disabled connector legitimately has no client and no error; callers branch on nil
+	}
+	token, err := cfg.SentryToken()
+	if err != nil {
+		return nil, err
+	}
+	return sentry.NewClient(sentry.Config{
+		BaseURL:        cfg.Sentry.BaseURL,
+		Org:            cfg.Sentry.Org,
+		Token:          token,
+		TimeoutSeconds: cfg.Sentry.TimeoutSeconds,
+	}), nil
+}
+
+// startSentryPoller builds the Sentry client and starts the release/deploy
+// poller when enabled, returning the client (for the health check) and a stop
+// func to defer. When disabled it returns (nil, no-op, nil) so the caller can
+// defer unconditionally. Keeps runServe's branching low.
+func startSentryPoller(ctx context.Context, cfg *config.Config, st *store.Store, logger *slog.Logger) (*sentry.Client, func(), error) {
+	client, err := newSentryClient(cfg)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	if client == nil {
+		return nil, func() {}, nil
+	}
+	logger.Info("sentry connected",
+		slog.String("base_url", cfg.Sentry.BaseURL),
+		slog.String("org", cfg.Sentry.Org),
+	)
+	if !cfg.Changes.Enrichment.Enabled {
+		// The poller writes change rows, but only changes.enrichment surfaces them
+		// at triage and over MCP — warn so this misconfiguration isn't silent.
+		logger.Warn("sentry poller is enabled but changes.enrichment is disabled; polled changes will be stored but not surfaced at triage or over MCP")
+	}
+	poller := newSentryPoller(cfg, client, st, logger)
+	poller.Start(ctx)
+	logger.Info("sentry release/deploy poller started",
+		slog.Int("interval_seconds", cfg.Sentry.Releases.PollIntervalSeconds),
+	)
+	return client, poller.Stop, nil
+}
+
+// newSentryPoller builds the release/deploy poller from config and the shared
+// client. Returns nil when the client is nil (poller disabled). Retention reuses
+// the existing change-retention setting (no Sentry-specific retention).
+func newSentryPoller(cfg *config.Config, client *sentry.Client, st *store.Store, logger *slog.Logger) *sentry.Poller {
+	if client == nil {
+		return nil
+	}
+	rel := cfg.Sentry.Releases
+	return sentry.NewPoller(client, st, sentry.PollerConfig{
+		BaseURL:            client.BaseURL(),
+		Org:                client.Org(),
+		Projects:           rel.Projects,
+		PollInterval:       time.Duration(rel.PollIntervalSeconds) * time.Second,
+		InitialLookback:    time.Duration(rel.InitialLookbackMinutes) * time.Minute,
+		ReleaseScanHorizon: time.Duration(rel.ReleaseScanHorizonDays) * 24 * time.Hour,
+		RetentionDays:      cfg.Changes.RetentionDays,
+	}, logger)
+}
+
 // buildHealthChecks assembles connectivity probes for every enabled
 // integration. Returns nil (a no-op registry) when nothing is enabled.
-func buildHealthChecks(cfg *config.Config, prom *promclient.Client, logSrc logs.Source) *health.Registry {
+func buildHealthChecks(cfg *config.Config, prom *promclient.Client, logSrc logs.Source, sentryClient *sentry.Client) *health.Registry {
 	var checks []health.Check
 	if cfg.Prometheus.Enabled && prom != nil {
 		checks = append(checks, health.Check{
@@ -550,6 +628,18 @@ func buildHealthChecks(cfg *config.Config, prom *promclient.Client, logSrc logs.
 				// stream-label knowledge.
 				now := time.Now()
 				_, err := logSrc.QueryRange(ctx, "vector(1)", now.Add(-time.Minute), now, 1, "backward")
+				return err
+			},
+		})
+	}
+	if cfg.Sentry.Releases.Enabled && sentryClient != nil {
+		checks = append(checks, health.Check{
+			Name:   "sentry",
+			Detail: cfg.Sentry.BaseURL,
+			Probe: func(ctx context.Context) error {
+				// A releases listing proves the API is reachable, the token is
+				// valid, and project:read is granted — a read-only GET.
+				_, _, err := sentryClient.ListReleases(ctx, cfg.Sentry.Releases.Projects, "")
 				return err
 			},
 		})

@@ -41,6 +41,7 @@ type Config struct {
 	MCP          MCPConfig          `yaml:"mcp"`
 	Prometheus   PrometheusConfig   `yaml:"prometheus"`
 	Logs         LogsConfig         `yaml:"logs,omitempty"`
+	Sentry       SentryConfig       `yaml:"sentry,omitempty"`
 	Rules        RulesConfig        `yaml:"rules"`
 	LogLevel     string             `yaml:"log_level"`
 	LogFormat    string             `yaml:"log_format"`
@@ -97,6 +98,33 @@ type LokiAuthConfig struct {
 	TokenEnv    string `yaml:"token_env,omitempty"`    // bearer mode: env var holding the token
 	Username    string `yaml:"username,omitempty"`     // basic mode: user/instance ID (not a secret)
 	PasswordEnv string `yaml:"password_env,omitempty"` // basic mode: env var holding the token/password
+}
+
+// SentryConfig configures the optional Sentry change source. The top-level
+// fields are the shared read-only connection (base URL, org, token env var,
+// timeout) reused by every Sentry feature; per-feature pollers nest under their
+// own sub-block. v1 ships the releases/deploys poller (Releases); later specs
+// add sibling sub-blocks (e.g. issues) that reuse this same connection. Mirrors
+// the logs/loki nesting: shared connection at the top, opt-in poller below.
+type SentryConfig struct {
+	BaseURL        string               `yaml:"base_url"`        // host root, e.g. https://sentry.io, https://de.sentry.io, or a self-hosted host
+	Org            string               `yaml:"org"`             // organization slug
+	TokenEnv       string               `yaml:"token_env"`       // env var holding the Internal-Integration token (project:read scope)
+	TimeoutSeconds int                  `yaml:"timeout_seconds"` // HTTP timeout per request
+	Releases       SentryReleasesConfig `yaml:"releases,omitempty"`
+}
+
+// SentryReleasesConfig configures the release/deploy poller: its own enabled
+// flag (per-feature opt-in), poll interval, first-run look-back, the
+// release-scan horizon bounding how old a release can be and still have its new
+// deploys detected, and an optional project-slug filter. When disabled the
+// poller is never constructed and no Sentry calls are made.
+type SentryReleasesConfig struct {
+	Enabled                bool     `yaml:"enabled"`
+	PollIntervalSeconds    int      `yaml:"poll_interval_seconds"`
+	InitialLookbackMinutes int      `yaml:"initial_lookback_minutes"`
+	ReleaseScanHorizonDays int      `yaml:"release_scan_horizon_days"`
+	Projects               []string `yaml:"projects,omitempty"` // optional project-slug filter; empty = org-wide
 }
 
 // MCPConfig configures the HTTP MCP server exposed by alertint serve.
@@ -236,6 +264,14 @@ func Defaults() Config {
 				LineFilter: `|~ "(?i)(error|warn|fatal|panic|fail)"`,
 			},
 		},
+		Sentry: SentryConfig{
+			TimeoutSeconds: 10,
+			Releases: SentryReleasesConfig{
+				PollIntervalSeconds:    60,
+				InitialLookbackMinutes: 60,
+				ReleaseScanHorizonDays: 30,
+			},
+		},
 		LogLevel:  "info",
 		LogFormat: "auto",
 	}
@@ -282,6 +318,7 @@ func (c *Config) Validate() error {
 	errs = append(errs, c.validateNotify()...)
 	errs = append(errs, c.validatePrometheus()...)
 	errs = append(errs, c.validateLogs()...)
+	errs = append(errs, c.validateSentry()...)
 	errs = append(errs, c.validateChanges()...)
 	errs = append(errs, c.validateRules()...)
 
@@ -490,6 +527,41 @@ func (c *Config) validateLoki() []string {
 	return errs
 }
 
+// validateSentry checks the Sentry change-source config. Like validatePrometheus
+// it gates entirely on the feature flag: a disabled block (the zero value, or an
+// explicit releases.enabled: false) validates clean even with an empty
+// connection, so zero-config triage is unaffected. When the releases poller is
+// enabled the shared connection (base_url, org, token_env) and the poller
+// tunables must be present and positive.
+func (c *Config) validateSentry() []string {
+	if !c.Sentry.Releases.Enabled {
+		return nil
+	}
+	var errs []string
+	if strings.TrimSpace(c.Sentry.BaseURL) == "" {
+		errs = append(errs, "sentry: base_url is required when sentry.releases is enabled")
+	}
+	if strings.TrimSpace(c.Sentry.Org) == "" {
+		errs = append(errs, "sentry: org is required when sentry.releases is enabled")
+	}
+	if strings.TrimSpace(c.Sentry.TokenEnv) == "" {
+		errs = append(errs, "sentry: token_env is required when sentry.releases is enabled (env var name holding the token)")
+	}
+	if c.Sentry.TimeoutSeconds <= 0 {
+		errs = append(errs, "sentry: timeout_seconds must be > 0")
+	}
+	if c.Sentry.Releases.PollIntervalSeconds <= 0 {
+		errs = append(errs, "sentry: releases: poll_interval_seconds must be > 0")
+	}
+	if c.Sentry.Releases.InitialLookbackMinutes <= 0 {
+		errs = append(errs, "sentry: releases: initial_lookback_minutes must be > 0")
+	}
+	if c.Sentry.Releases.ReleaseScanHorizonDays <= 0 {
+		errs = append(errs, "sentry: releases: release_scan_horizon_days must be > 0")
+	}
+	return errs
+}
+
 func (c *Config) validateRules() []string {
 	dir := strings.TrimSpace(c.Rules.LocalPackDir)
 	if dir == "" {
@@ -551,6 +623,17 @@ func (c *Config) PrometheusToken() (string, error) {
 		return "", nil
 	}
 	return requireEnv(c.Prometheus.BearerTokenEnv, "prometheus.bearer_token_env")
+}
+
+// SentryToken returns the Internal-Integration token for the Sentry change
+// source, resolved from the env var named by Sentry.TokenEnv. Returns an empty
+// string and nil error when the releases poller is disabled (mirrors
+// PrometheusToken / WebhookToken: the agent never holds a secret it isn't using).
+func (c *Config) SentryToken() (string, error) {
+	if !c.Sentry.Releases.Enabled {
+		return "", nil
+	}
+	return requireEnv(c.Sentry.TokenEnv, "sentry.token_env")
 }
 
 // LokiAuthSecret resolves the secret needed for the configured Loki auth mode,
