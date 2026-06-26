@@ -77,3 +77,15 @@ CLAUDE.md
 /plans/
 .scratch/
 /planning/
+
+.compound-engineering/
+/.ce/
+/STRATEGY.md
+/CONCEPTS.md
+/docs/brainstorms/
+/docs/plans/
+/docs/ideation/
+/docs/solutions/
+/docs/pulse-reports/
+/docs/residual-review-findings/
+/docs/dogfood-reports/
