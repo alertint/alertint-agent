@@ -364,30 +364,30 @@ func (p *Poller) loadWatermark(ctx context.Context) (watermark, bool, error) {
 }
 
 // watermark is the persisted idempotency cursor (KTD2). LastEmittedAt is the
-// newest occurred_at emitted so far; BoundaryDeployIDs are the boundary keys at
+// newest occurred_at emitted so far; BoundaryEventIDs are the boundary keys at
 // exactly that instant, so a same-timestamp event that wasn't yet seen still
 // gets emitted while already-seen ones don't. seen is the lookup form, rebuilt
 // after load (not serialized).
 type watermark struct {
-	LastEmittedAt     time.Time `json:"last_emitted_at"`
-	BoundaryDeployIDs []string  `json:"boundary_deploy_ids"`
+	LastEmittedAt    time.Time `json:"last_emitted_at"`
+	BoundaryEventIDs []string  `json:"boundary_event_ids"`
 
 	seen map[string]bool
 }
 
 func (wm *watermark) buildSeen() {
-	wm.seen = make(map[string]bool, len(wm.BoundaryDeployIDs))
-	for _, id := range wm.BoundaryDeployIDs {
+	wm.seen = make(map[string]bool, len(wm.BoundaryEventIDs))
+	for _, id := range wm.BoundaryEventIDs {
 		wm.seen[id] = true
 	}
 }
 
-// persistable returns a copy with a non-nil BoundaryDeployIDs so the seed
+// persistable returns a copy with a non-nil BoundaryEventIDs so the seed
 // serializes as [] rather than null.
 func (wm *watermark) persistable() watermark {
 	out := *wm
-	if out.BoundaryDeployIDs == nil {
-		out.BoundaryDeployIDs = []string{}
+	if out.BoundaryEventIDs == nil {
+		out.BoundaryEventIDs = []string{}
 	}
 	return out
 }
@@ -432,7 +432,7 @@ func advanceWatermark(prev watermark, emitted []store.Change) watermark {
 		ids = append(ids, k)
 	}
 	sort.Strings(ids)
-	return watermark{LastEmittedAt: maxT.UTC(), BoundaryDeployIDs: ids}
+	return watermark{LastEmittedAt: maxT.UTC(), BoundaryEventIDs: ids}
 }
 
 // hasNewDeployActivity decides whether a release warrants the per-release deploys

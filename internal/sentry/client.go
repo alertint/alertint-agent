@@ -36,6 +36,12 @@ const maxBackoff = 60 * time.Second
 // maxErrBody bounds how much of a non-200 body we read into an error message.
 const maxErrBody = 4 << 10
 
+// maxRespBody bounds how much of a 200 body we buffer before decoding, so a
+// compromised or buggy upstream can't OOM the single-binary agent by streaming
+// an unbounded JSON body within the request timeout (the http.Client Timeout
+// caps time, not bytes). 8 MiB is far above any realistic releases/deploys page.
+const maxRespBody = 8 << 20
+
 // Release is one entry from the org releases-list endpoint. Only the fields the
 // poller reads are decoded. There is no permalink/url worth trusting (KTD6), so
 // the change Link is built from the host-root base URL instead.
@@ -107,11 +113,14 @@ func (c *Client) BaseURL() string { return c.baseURL }
 // Org returns the organization slug.
 func (c *Client) Org() string { return c.org }
 
-// ListReleases lists releases for the org, newest-first (Sentry's default sort),
-// optionally filtered to the given project slugs, one page per call. Pass the
-// returned next cursor to fetch the following page; next is "" on the last page.
+// ListReleases lists releases for the org, newest-first, optionally filtered to
+// the given project slugs, one page per call. Pass the returned next cursor to
+// fetch the following page; next is "" on the last page. sort=date is sent
+// explicitly so the poller's date-descending paginate-stop never silently relies
+// on a server-side default that could change.
 func (c *Client) ListReleases(ctx context.Context, projects []string, cursor string) (releases []Release, next string, err error) {
 	q := url.Values{}
+	q.Set("sort", "date")
 	for _, p := range projects {
 		if p != "" {
 			q.Add("project", p)
@@ -127,7 +136,7 @@ func (c *Client) ListReleases(ctx context.Context, projects []string, cursor str
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRespBody))
 	if err != nil {
 		return nil, "", fmt.Errorf("sentry: read releases: %w", err)
 	}
@@ -154,7 +163,7 @@ func (c *Client) ListDeploys(ctx context.Context, project, version string) ([]De
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRespBody))
 	if err != nil {
 		return nil, fmt.Errorf("sentry: read deploys: %w", err)
 	}
@@ -176,8 +185,10 @@ func (c *Client) doGET(ctx context.Context, path string, query url.Values) (*htt
 		target += "?" + enc
 	}
 
-	var lastErr error
-	for attempt := 0; attempt <= c.maxRetries; attempt++ {
+	// Unconditional loop: every path out is a return (success, non-retryable,
+	// retries exhausted, or cancelled mid-backoff), so there is no reachable
+	// post-loop exit to handle.
+	for attempt := 0; ; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 		if err != nil {
 			return nil, err
@@ -196,7 +207,7 @@ func (c *Client) doGET(ctx context.Context, path string, query url.Values) (*htt
 		apiErr := &APIError{StatusCode: resp.StatusCode, Body: snippet(body)}
 
 		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
-		if !retryable || attempt == c.maxRetries {
+		if !retryable || attempt >= c.maxRetries {
 			_ = resp.Body.Close()
 			return nil, apiErr
 		}
@@ -206,9 +217,7 @@ func (c *Client) doGET(ctx context.Context, path string, query url.Values) (*htt
 		if err := c.clk.Sleep(ctx, delay); err != nil {
 			return nil, err // context cancelled mid-backoff (e.g. shutdown)
 		}
-		lastErr = apiErr
 	}
-	return nil, lastErr
 }
 
 // backoffDelay picks the wait before the next retry. For a 429 it honors the

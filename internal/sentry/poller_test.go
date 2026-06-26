@@ -232,6 +232,38 @@ func TestPoller_AE4_ClientErrorSkipsCycleNoCrash(t *testing.T) {
 	p.runCycle(context.Background())
 }
 
+// TestPoller_DeploysErrorSkipsCycleNoChange covers the deploys-endpoint failure
+// path — the symmetric counterpart to AE4's releases failure. A release with new
+// deploy activity drives the ListDeploys call; when that errors, the cycle aborts
+// without persisting changes or advancing/seeding the watermark, and retries next
+// tick.
+func TestPoller_DeploysErrorSkipsCycleNoChange(t *testing.T) {
+	now := mustTime(t)
+	src := &fakeSource{
+		releases: []Release{{Version: "v1", DateCreated: now.Add(-time.Hour), DeployCount: 1,
+			LastDeploy: &Deploy{ID: "d-1", Environment: strptr("production"), DateFinished: now.Add(-5 * time.Minute)}}},
+		deploysErr: &APIError{StatusCode: http.StatusTooManyRequests, Body: "rate limited"},
+	}
+	p, st := newTestPoller(t, src, now, nil)
+
+	if err := p.pollOnce(context.Background()); err == nil {
+		t.Fatal("expected error from failing ListDeploys")
+	}
+	if src.deployCallCount() == 0 {
+		t.Fatal("ListDeploys was never called; test does not exercise the deploys path")
+	}
+	start, end := wideWindow(now)
+	got, _ := st.ChangesInWindow(context.Background(), start, end)
+	if len(got) != 0 {
+		t.Errorf("a failed deploys cycle persisted %d changes, want 0", len(got))
+	}
+	if _, found, _ := st.LoadConnectorState(context.Background(), connectorStateName); found {
+		t.Error("watermark was advanced/seeded despite a failed cycle")
+	}
+	// runCycle must swallow the error (no panic/crash) and keep going.
+	p.runCycle(context.Background())
+}
+
 func TestPoller_AE5_ReleaseWithoutDeployEmitsReleaseChange(t *testing.T) {
 	now := mustTime(t)
 	src := &fakeSource{
@@ -327,7 +359,7 @@ func TestPoller_KTD3_OldReleaseWithinHorizonGetsNewDeploy(t *testing.T) {
 func TestPoller_KTD3_LastDeployGateSkipsQuiescentRelease(t *testing.T) {
 	now := mustTime(t)
 	// Persist a watermark 10m old; the release's lastDeploy is 20m old (older).
-	seed := `{"last_emitted_at":"` + now.Add(-10*time.Minute).Format(time.RFC3339Nano) + `","boundary_deploy_ids":[]}`
+	seed := `{"last_emitted_at":"` + now.Add(-10*time.Minute).Format(time.RFC3339Nano) + `","boundary_event_ids":[]}`
 	src := &fakeSource{
 		releases: []Release{{Version: "v", DateCreated: now.Add(-time.Hour), DeployCount: 1,
 			LastDeploy: &Deploy{ID: "d-old", Environment: strptr("production"), DateFinished: now.Add(-20 * time.Minute)}}},

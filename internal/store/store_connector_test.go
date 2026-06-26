@@ -38,7 +38,7 @@ func TestConnectorState_SaveLoadRoundTrip(t *testing.T) {
 		t.Fatalf("Load missing = (%q, %v, %v), want (\"\", false, nil)", v, found, err)
 	}
 
-	const payload = `{"last_emitted_at":"2026-06-25T10:00:00Z","boundary_deploy_ids":["deploy:d-1"]}`
+	const payload = `{"last_emitted_at":"2026-06-25T10:00:00Z","boundary_event_ids":["deploy:d-1"]}`
 	if err := st.SaveConnectorState(ctx, "sentry-releases", payload); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestConnectorState_SaveLoadRoundTrip(t *testing.T) {
 	}
 
 	// Upsert overwrites.
-	const payload2 = `{"last_emitted_at":"2026-06-25T11:00:00Z","boundary_deploy_ids":[]}`
+	const payload2 = `{"last_emitted_at":"2026-06-25T11:00:00Z","boundary_event_ids":[]}`
 	if err := st.SaveConnectorState(ctx, "sentry-releases", payload2); err != nil {
 		t.Fatalf("Save 2: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestInsertChangesAndAdvanceWatermark_AtomicCommit(t *testing.T) {
 		sentryChange("deploy:d-1", base.Add(1*time.Minute)),
 		sentryChange("deploy:d-2", base.Add(2*time.Minute)),
 	}
-	const wm = `{"last_emitted_at":"2026-06-25T10:02:00Z","boundary_deploy_ids":["deploy:d-2"]}`
+	const wm = `{"last_emitted_at":"2026-06-25T10:02:00Z","boundary_event_ids":["deploy:d-2"]}`
 	if err := st.InsertChangesAndAdvanceWatermark(ctx, batch, "sentry-releases", wm); err != nil {
 		t.Fatalf("batch insert: %v", err)
 	}
@@ -104,7 +104,7 @@ func TestInsertChangesAndAdvanceWatermark_RollsBackOnBadChange(t *testing.T) {
 	defer func() { _ = st.Close() }()
 
 	// Seed an existing watermark so we can prove it does NOT advance on failure.
-	const seed = `{"last_emitted_at":"2026-06-25T09:00:00Z","boundary_deploy_ids":[]}`
+	const seed = `{"last_emitted_at":"2026-06-25T09:00:00Z","boundary_event_ids":[]}`
 	if err := st.SaveConnectorState(ctx, "sentry-releases", seed); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
