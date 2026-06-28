@@ -13,7 +13,12 @@ import (
 	"github.com/alertint/alertint-agent/internal/health"
 	"github.com/alertint/alertint-agent/internal/sentry"
 	"github.com/alertint/alertint-agent/internal/store"
+	"github.com/alertint/alertint-agent/skills/acutetriage"
 )
+
+// The shared *sentry.Client must satisfy the Error-source reader the triage skill
+// injects — a compile-time guard for the U6 wiring assignment.
+var _ acutetriage.SentryReader = (*sentry.Client)(nil)
 
 func sentryEnabledConfig(baseURL string) *config.Config {
 	cfg := config.Defaults()
@@ -24,9 +29,11 @@ func sentryEnabledConfig(baseURL string) *config.Config {
 	return &cfg
 }
 
-func statusByName(reg *health.Registry, name string) *health.Status {
+// sentryStatus returns the "sentry" health probe's status from the registry, or
+// nil when it is not registered. These tests only ever assert on the sentry check.
+func sentryStatus(reg *health.Registry) *health.Status {
 	for _, s := range reg.Run(context.Background()) {
-		if s.Name == name {
+		if s.Name == "sentry" {
 			s := s
 			return &s
 		}
@@ -47,7 +54,7 @@ func TestSentryWiring_DisabledIsSilent(t *testing.T) {
 		t.Error("newSentryPoller(nil client) should be nil")
 	}
 	reg := buildHealthChecks(&cfg, nil, nil, nil)
-	if statusByName(reg, "sentry") != nil {
+	if sentryStatus(reg) != nil {
 		t.Error("sentry health check registered while disabled")
 	}
 }
@@ -81,7 +88,7 @@ func TestSentryWiring_HealthCheckProbeOK(t *testing.T) {
 	client := sentry.NewClient(sentry.Config{BaseURL: srv.URL, Org: "acme", Token: "t"})
 	reg := buildHealthChecks(cfg, nil, nil, client)
 
-	s := statusByName(reg, "sentry")
+	s := sentryStatus(reg)
 	if s == nil {
 		t.Fatal("sentry check not registered while enabled")
 	}
@@ -106,9 +113,102 @@ func TestSentryWiring_HealthCheckProbeFailed(t *testing.T) {
 	client := sentry.NewClient(sentry.Config{BaseURL: srv.URL, Org: "acme", Token: "bad"})
 	reg := buildHealthChecks(cfg, nil, nil, client)
 
-	s := statusByName(reg, "sentry")
+	s := sentryStatus(reg)
 	if s == nil || s.OK {
 		t.Fatalf("sentry probe = %#v, want FAILED", s)
+	}
+}
+
+// issuesOnlyConfig enables the Error source with releases OFF, exercising the
+// decoupled gating (KTD7).
+func issuesOnlyConfig(baseURL string) *config.Config {
+	cfg := config.Defaults()
+	cfg.Sentry.BaseURL = baseURL
+	cfg.Sentry.Org = "acme"
+	cfg.Sentry.TokenEnv = "SENTRY_WIRING_TOK"
+	cfg.Sentry.Issues.Enabled = true // releases stays disabled
+	return &cfg
+}
+
+// TestSentryWiring_IssuesOnlyBuildsClientNoPoller covers KTD7: the Error source
+// gets the shared client even when release polling is off, and NO release poller
+// goroutine runs (the poller would hit the server on its immediate first cycle —
+// the request count stays 0).
+func TestSentryWiring_IssuesOnlyBuildsClientNoPoller(t *testing.T) {
+	t.Setenv("SENTRY_WIRING_TOK", "sntrys-secret")
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	cfg := issuesOnlyConfig(srv.URL)
+	if !cfg.AnySentryEnabled() {
+		t.Fatal("AnySentryEnabled should be true for issues-only")
+	}
+
+	st, err := store.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	client, stop, err := startSentryPoller(context.Background(), cfg, st, slog.New(slog.DiscardHandler))
+	if err != nil || client == nil {
+		t.Fatalf("startSentryPoller(issues-only) = %v, %v; want a shared client", client, err)
+	}
+	defer stop()
+	if hits != 0 {
+		t.Errorf("no release poller should run for issues-only, but the server got %d request(s)", hits)
+	}
+}
+
+// TestSentryWiring_IssuesOnlyRegistersHealthCheck: the health probe registers
+// when either feature is on (KTD7).
+func TestSentryWiring_IssuesOnlyRegistersHealthCheck(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	cfg := issuesOnlyConfig(srv.URL)
+	client := sentry.NewClient(sentry.Config{BaseURL: srv.URL, Org: "acme", Token: "t"})
+	reg := buildHealthChecks(cfg, nil, nil, client)
+	if sentryStatus(reg) == nil {
+		t.Fatal("sentry health check must be registered for issues-only")
+	}
+}
+
+// TestSentryErrorSource_TypedNilSafety pins KTD7's typed-nil trap avoidance: the
+// injected SentryReader is a TRUE nil interface unless issues is on with a live
+// client, so FetchSentry's r == nil guard fires for disabled/releases-only/no-client.
+func TestSentryErrorSource_TypedNilSafety(t *testing.T) {
+	client := sentry.NewClient(sentry.Config{BaseURL: "https://x", Org: "acme", Token: "t"})
+
+	// Both features disabled → true nil interface, params off.
+	cfg := config.Defaults()
+	if r, p := sentryErrorSource(&cfg, nil); r != nil || p.Enabled {
+		t.Errorf("disabled: reader=%v params.Enabled=%v; want nil, false", r, p.Enabled)
+	}
+
+	// Releases-only (issues off) with a live client → still a nil reader.
+	relCfg := config.Defaults()
+	relCfg.Sentry.Releases.Enabled = true
+	if r, _ := sentryErrorSource(&relCfg, client); r != nil {
+		t.Error("releases-only must not inject the Error-source reader")
+	}
+
+	// Issues-on with a live client → non-nil reader + enabled params.
+	issCfg := config.Defaults()
+	issCfg.Sentry.Issues.Enabled = true
+	if r, p := sentryErrorSource(&issCfg, client); r == nil || !p.Enabled {
+		t.Errorf("issues-on: reader=%v params.Enabled=%v; want a reader, true", r, p.Enabled)
+	}
+
+	// Issues-on but no client (construction absent) → still a true nil reader.
+	if r, _ := sentryErrorSource(&issCfg, nil); r != nil {
+		t.Error("issues-on with nil client must still yield a true nil reader")
 	}
 }
 

@@ -25,6 +25,12 @@ Read-only by design: AlertINT only issues `GET` requests against Sentry. It neve
 writes, mutates, resolves issues, or touches Seer — read-only is structural, not
 a setting.
 
+The connector plays **two read-only roles over one shared connection and token**:
+a **Change source** — the release/deploy poller documented next — and an **Error
+source** that enriches triage with the actual exception, its `file:line`, and its
+blast radius ([jump to it](#error-source--issue-enrichment-at-triage)). Enable
+either independently, or both.
+
 ## Enable it
 
 ```yaml
@@ -53,8 +59,9 @@ at triage time and over MCP. Enable both. Sentry changes are ordinary change
 rows, so they are pruned by the shared `changes.retention_days` — there is no
 Sentry-specific retention.
 
-Disabled by default. With `sentry.releases.enabled: false` (or the block omitted)
-the poller is never started and AlertINT makes no Sentry calls at all.
+Disabled by default. With both `sentry.releases` and `sentry.issues` disabled (or
+the `sentry` block omitted) no poller starts, no client is built, and AlertINT
+makes no Sentry calls at all.
 
 ## The token and scope
 
@@ -64,7 +71,8 @@ read scope the poller needs:
 
 | Scope | Why |
 |---|---|
-| `project:read` | List releases and their deploys. Sufficient for both calls; no write or `event:read` scope is required for release/deploy polling. |
+| `project:read` | List releases and their deploys (the **Change source**). Sufficient for release/deploy polling on its own. |
+| `event:read` | List issues and read an issue's latest event — the exception type and stacktrace `file:line` (the **Error source**). Add this scope when `sentry.issues` is enabled. |
 
 Supply the token through the named environment variable, never inline in config:
 
@@ -117,3 +125,82 @@ to the release in Sentry. When change enrichment is on, the read-only
 `alertint_recent_changes` MCP tool returns them too, so an investigating AI agent
 can widen the window or pivot projects beyond what auto-enrichment attached to the
 finding.
+
+## Error source — issue enrichment at triage
+
+Beyond polling deploys, the Sentry connector answers a second question at triage
+time: *which application errors are firing for this service right now, and is any
+of them new?* This is the **Error source** — a bounded, read-only query run once
+per incident that reaches LLM analysis, contributing a distilled **`sentry`
+section** to the triage prompt alongside metrics, changes, and logs. Where the
+Change source names what *shipped*, the Error source names the **exception** — the
+one signal that points an AI coding agent straight at a `file:line`.
+
+For each incident it makes **one issue search plus at most `max_issues` event
+detail fetches** — `1 + K` Sentry calls total, regardless of how many events
+Sentry recorded — and renders the highest-signal issues:
+
+- **Exception + `file:line`** — the exception type and the deepest in-app stack
+  frame, so the model (and your coding agent) can jump straight to the line.
+- **Blast radius** — severity level, affected-user count, and the in-window event
+  rate, to calibrate severity.
+- **NEW vs chronic** — an issue first seen *inside* the incident window is flagged
+  **NEW** (a likely cause); one first seen earlier is **chronic** (more likely a
+  symptom).
+
+It is **query-at-triage**, not a poller: it runs in the triage evidence fan-out,
+never per Sentry event, and a known-issue rule short-circuit skips it along with
+the rest of the fan-out. The distilled result is persisted with the finding, so
+the evidence pack replays exactly what the LLM saw and the read-only incident
+evidence MCP tool exposes it — no extra query. A successful search that matches
+**no** issues is itself recorded as a signal: evidence the incident is likely not
+application-code-driven.
+
+### Enable it
+
+```yaml
+sentry:
+  base_url: https://sentry.io
+  org: my-org-slug
+  token_env: SENTRY_AUTH_TOKEN
+  issues:
+    enabled: true
+    lookback_minutes: 30        # W = [first_alert − lookback, now]; reaches a precursor error
+    max_issues: 3               # the K of the 1+K budget — how many top issues to render
+    fetch_timeout_seconds: 15   # bounds the WHOLE 1+K fetch; on timeout the section degrades
+    include_message: true       # include the exception message (default; see privacy below)
+```
+
+The Error source is **independent of the release poller**: enable `sentry.issues`
+with `sentry.releases` off and AlertINT builds the shared client for triage
+queries but starts no poller. Both roles share the connection (`base_url` / `org` /
+`token_env`); add the `event:read` scope to the token for issue/event reads.
+
+### Scoping
+
+The query is **project-required, environment-optional**. The project slug is taken
+**directly** from the incident's shared labels — the first of `service`,
+`project`, `app`, `job` — and the environment from `environment` or `env` when
+shared. A label value that matches no Sentry project surfaces as an explicit *no
+issues for this scope* note (not a silent omission); an incident with no derivable
+project is skipped with a logged reason rather than queried with a guess. Robust,
+configurable label mapping across sources is a later step — for now the scope
+rides your existing label vocabulary.
+
+### What this connector sends to your LLM and stores
+
+The Error source is **distilled at the source**: only a strict allowlist of
+structured fields ever crosses Sentry's API boundary into the three surfaces — the
+LLM prompt, the at-rest SQLite store, and the evidence-pack MCP tool:
+
+- exception **type**, **culprit**, and the in-app **`file:line`**;
+- severity **level**, **affected-user count**, **event rate**, first/last-seen
+  **timestamps**, and the NEW flag;
+- the exception **message**, *only* when `include_message: true` (the default).
+
+It **never** fetches or stores local variables, request bodies, breadcrumbs, or
+user/context entries — the privacy boundary is the **shape** of what is requested,
+not a downstream scrubber. Setting `include_message: false` strips the exception
+message from **all three** surfaces at once. All three sit inside your own trust
+boundary — your BYO LLM, your local database, your locally-gated MCP server — the
+same boundary your alert labels already flow through.
