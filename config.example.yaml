@@ -89,5 +89,29 @@ changes:
     max_events: 10                         # cap on ranked changes attached to a prompt
   retention_days: 30                       # prune changes older than this
 
+# Sentry connector — two read-only roles over one shared connection/token:
+#   releases  → Change source: polls deploys/releases into the change plane
+#   issues    → Error source: at triage, attaches the exception + file:line,
+#               blast radius, and NEW-in-window flag for the incident's service.
+# Disabled by default; with both off, AlertINT makes no Sentry calls.
+# See docs/integrations/sentry.md.
+sentry:
+  base_url: https://sentry.io                # host root (SaaS EU: https://de.sentry.io)
+  org: my-org-slug                           # your Sentry organization slug
+  token_env: SENTRY_AUTH_TOKEN               # env var holding the token (never inline)
+  timeout_seconds: 10                        # per-request HTTP timeout
+  releases:                                  # Change source (needs project:read)
+    enabled: false
+    poll_interval_seconds: 60
+    initial_lookback_minutes: 60             # first run seeds the watermark this far back
+    release_scan_horizon_days: 30            # oldest release still scanned for new deploys
+    # projects: ["checkout", "payments"]     # optional; omit for org-wide
+  issues:                                    # Error source (needs event:read)
+    enabled: false
+    lookback_minutes: 30                     # W = [first_alert − lookback, now]
+    max_issues: 3                            # top issues rendered (the K of the 1+K budget)
+    fetch_timeout_seconds: 15                # bounds the WHOLE 1+K fetch
+    include_message: true                    # include the exception message across prompt/SQLite/MCP
+
 log_level: info            # debug | info | warn | error
 log_format: auto           # auto | console | json (auto → console on a TTY, json otherwise)

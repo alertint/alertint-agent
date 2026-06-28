@@ -50,7 +50,13 @@ Rules:
   from absent logs.
 - If a "Recent changes" section is present, a deploy/config/flag change shortly
   before the incident is a prime root-cause candidate — weigh its Δ-before-incident
-  timing. Absence of changes is NOT proof nothing changed (the emitter may not be wired).`
+  timing. Absence of changes is NOT proof nothing changed (the emitter may not be wired).
+- If a "Sentry issues" section is present, a NEW-in-window issue (first seen inside the
+  incident window) is a prime root-cause candidate and its file:line is where to look
+  first; a chronic issue (first seen before the window) is more likely a symptom than the
+  cause. The affected-user count and event rate calibrate severity. A "no Sentry issues …
+  in window" note is evidence the incident is likely NOT application-code-driven (e.g.
+  infra/network) — it is NOT proof of health. The section is distilled, not exhaustive.`
 
 // RequiredKeys lists the top-level keys that must be present in a valid
 // LLM response. Passed to llm.Client.Complete for structural validation.
@@ -121,7 +127,7 @@ func BuildEvidencePack(inc store.Incident, alerts []store.Alert, windowSeconds i
 // LLM. metrics is optional — pass nil when Prometheus is not available. logs is
 // optional — pass nil when no log source is configured; when non-nil it always
 // renders a "Recent logs" section (lines, or a note explaining their absence).
-func UserPrompt(pack EvidencePack, packJSON string, metrics []MetricSnapshot, logs *LogEnrichment, changes *ChangeEnrichment) string {
+func UserPrompt(pack EvidencePack, packJSON string, metrics []MetricSnapshot, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment) string {
 	var b strings.Builder
 	fmt.Fprintf(&b,
 		"Analyze the following correlated incident.\n\nEvidence:\n%s\n\nShared labels: %s\nAlert count: %d\nWindow: %ds",
@@ -138,8 +144,70 @@ func UserPrompt(pack EvidencePack, packJSON string, metrics []MetricSnapshot, lo
 	}
 	renderLogs(&b, logs)
 	renderChanges(&b, changes)
+	renderSentry(&b, sentry)
 	b.WriteString("\n\nRespond with JSON only.")
 	return b.String()
+}
+
+// renderSentry appends the "Sentry issues" Error-source section. With issues
+// they render most-relevant-first (NEW before chronic, then blast radius), each
+// carrying its file:line (or culprit fallback), level, affected-user count, and
+// in-window rate, plus the exception message when the toggle kept it. When the
+// match set is empty the Note renders instead (so the model sees we looked and
+// found nothing / the project was unknown / the backend failed). Omitted only
+// when sentry is nil (disabled / unconfigured / no scope). Mirrors renderChanges.
+func renderSentry(b *strings.Builder, e *SentryEnrichment) {
+	if e == nil {
+		return
+	}
+	if len(e.Issues) > 0 {
+		fmt.Fprintf(b, "\n\nSentry issues (at triage time, %s, most relevant first):", scopeLabel(e.Project, e.Environment))
+		for _, iss := range e.Issues {
+			renderSentryIssue(b, iss)
+		}
+		if e.MoreCount > 0 {
+			fmt.Fprintf(b, "\n  +%d more matched", e.MoreCount)
+		}
+		return
+	}
+	note := e.Note
+	if note == "" {
+		note = "no Sentry issues available"
+	}
+	fmt.Fprintf(b, "\n\nSentry issues (at triage time): %s", note)
+}
+
+// renderSentryIssue renders one distilled issue line (plus its message line when
+// present): "[NEW|chronic] <type> @ <file:line|culprit> · <level> · <N> users · <rate>".
+func renderSentryIssue(b *strings.Builder, iss SentryIssueView) {
+	novelty := "chronic"
+	if iss.New {
+		novelty = "NEW"
+	}
+	fmt.Fprintf(b, "\n  [%s] %s", novelty, iss.ExceptionType)
+	if loc := issueLocation(iss); loc != "" {
+		fmt.Fprintf(b, " @ %s", loc)
+	}
+	if iss.Level != "" {
+		fmt.Fprintf(b, " · %s", iss.Level)
+	}
+	fmt.Fprintf(b, " · %d users", iss.UserCount)
+	if iss.RatePerMin != "" {
+		fmt.Fprintf(b, " · %s", iss.RatePerMin)
+	}
+	if iss.Message != "" {
+		fmt.Fprintf(b, "\n    %s", iss.Message)
+	}
+}
+
+// issueLocation is the jump-to target for an issue: the deepest in-app file:line
+// when one was recovered, else the issue culprit (a vendored/framework trace or a
+// frame fetch that degraded). Empty when neither is known.
+func issueLocation(iss SentryIssueView) string {
+	if iss.FileLine != "" {
+		return iss.FileLine
+	}
+	return iss.Culprit
 }
 
 // renderChanges appends the "Recent changes" section. With matched changes they

@@ -244,6 +244,10 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 	defer stopSentry()
 
+	// Inject the Sentry Error source (true nil interface unless issues is on with
+	// a live client — KTD7).
+	sentryReader, sentryParams := sentryErrorSource(cfg, sentryClient)
+
 	skill := acutetriage.New(
 		acutetriage.Config{
 			WindowSeconds: cfg.Correlator.WindowSeconds,
@@ -261,6 +265,8 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 				WindowMinutes: cfg.Changes.Enrichment.WindowMinutes,
 				MaxEvents:     cfg.Changes.Enrichment.MaxEvents,
 			},
+			Sentry:       sentryReader,
+			SentryParams: sentryParams,
 		},
 		st, llmClient, auditor, notifier, logger,
 	)
@@ -535,11 +541,31 @@ func resolveDBPath(cfgPath, dbPathFlag string) (string, error) {
 	return cfg.Storage.SQLitePath, nil
 }
 
-// newSentryClient builds the shared read-only Sentry client when the release
-// poller is enabled, resolving the token from its named env var. Returns
-// (nil, nil) when disabled so callers can skip all Sentry wiring.
+// sentryErrorSource resolves the triage Error-source reader and params from
+// config. It returns a TRUE nil SentryReader interface (not a typed-nil
+// *sentry.Client) unless the issues feature is enabled with a live shared client,
+// so FetchSentry's r == nil guard fires and unconfigured/releases-only triage is
+// unchanged (KTD7). The params carry through regardless (Enabled gates the fetch).
+func sentryErrorSource(cfg *config.Config, client *sentry.Client) (acutetriage.SentryReader, acutetriage.SentryParams) {
+	params := acutetriage.SentryParams{
+		Enabled:             cfg.Sentry.Issues.Enabled,
+		LookbackMinutes:     cfg.Sentry.Issues.LookbackMinutes,
+		MaxIssues:           cfg.Sentry.Issues.MaxIssues,
+		FetchTimeoutSeconds: cfg.Sentry.Issues.FetchTimeoutSeconds,
+		IncludeMessage:      cfg.Sentry.Issues.MessageIncluded(),
+	}
+	if cfg.Sentry.Issues.Enabled && client != nil {
+		return client, params
+	}
+	return nil, params
+}
+
+// newSentryClient builds the shared read-only Sentry client when ANY Sentry
+// feature is enabled (the release Change source OR the issue Error source),
+// resolving the token from its named env var. Returns (nil, nil) when the whole
+// connector is disabled so callers can skip all Sentry wiring (KTD7).
 func newSentryClient(cfg *config.Config) (*sentry.Client, error) {
-	if !cfg.Sentry.Releases.Enabled {
+	if !cfg.AnySentryEnabled() {
 		return nil, nil //nolint:nilnil // a disabled connector legitimately has no client and no error; callers branch on nil
 	}
 	token, err := cfg.SentryToken()
@@ -554,10 +580,12 @@ func newSentryClient(cfg *config.Config) (*sentry.Client, error) {
 	}), nil
 }
 
-// startSentryPoller builds the Sentry client and starts the release/deploy
-// poller when enabled, returning the client (for the health check) and a stop
-// func to defer. When disabled it returns (nil, no-op, nil) so the caller can
-// defer unconditionally. Keeps runServe's branching low.
+// startSentryPoller builds the shared Sentry client when any feature is enabled
+// and starts the release/deploy poller ONLY when releases is enabled, returning
+// the client (for the Error source + the health check) and a stop func to defer.
+// When the whole connector is disabled it returns (nil, no-op, nil) so the caller
+// can defer unconditionally. An issues-only deployment gets the shared client
+// with no poller goroutine (KTD7). Keeps runServe's branching low.
 func startSentryPoller(ctx context.Context, cfg *config.Config, st *store.Store, logger *slog.Logger) (*sentry.Client, func(), error) {
 	client, err := newSentryClient(cfg)
 	if err != nil {
@@ -570,6 +598,11 @@ func startSentryPoller(ctx context.Context, cfg *config.Config, st *store.Store,
 		slog.String("base_url", cfg.Sentry.BaseURL),
 		slog.String("org", cfg.Sentry.Org),
 	)
+	if !cfg.Sentry.Releases.Enabled {
+		// Error source only: the shared client is built for triage-time issue
+		// enrichment, but no release/deploy poller runs.
+		return client, func() {}, nil
+	}
 	if !cfg.Changes.Enrichment.Enabled {
 		// The poller writes change rows, but only changes.enrichment surfaces them
 		// at triage and over MCP — warn so this misconfiguration isn't silent.
@@ -632,13 +665,14 @@ func buildHealthChecks(cfg *config.Config, prom *promclient.Client, logSrc logs.
 			},
 		})
 	}
-	if cfg.Sentry.Releases.Enabled && sentryClient != nil {
+	if cfg.AnySentryEnabled() && sentryClient != nil {
 		checks = append(checks, health.Check{
 			Name:   "sentry",
 			Detail: cfg.Sentry.BaseURL,
 			Probe: func(ctx context.Context) error {
 				// A releases listing proves the API is reachable, the token is
-				// valid, and project:read is granted — a read-only GET.
+				// valid, and project:read is granted — a read-only GET valid for
+				// the Error source (issues-only) too.
 				_, _, err := sentryClient.ListReleases(ctx, cfg.Sentry.Releases.Projects, "")
 				return err
 			},

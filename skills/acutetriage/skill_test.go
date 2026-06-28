@@ -10,12 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/audit"
 	llm "github.com/alertint/alertint-agent/internal/llm/anthropic"
+	"github.com/alertint/alertint-agent/internal/sentry"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/skills/acutetriage"
 	"github.com/google/uuid"
@@ -343,6 +345,159 @@ func TestRunSchemaViolation(t *testing.T) {
 	}
 	if status == "analyzed" {
 		t.Error("incident was marked analyzed despite schema violation")
+	}
+}
+
+// --------------------------------------------------------------------------
+// Sentry Error-source integration (U5)
+// --------------------------------------------------------------------------
+
+// fakeSentryReader is an external-package SentryReader: it builds sentry.Issue
+// values via JSON (the count-decode type is unexported) and records call counts.
+type fakeSentryReader struct {
+	issues     []sentry.Issue
+	err        error
+	events     map[string]sentry.IssueEvent
+	listCalls  int
+	eventCalls int
+}
+
+func (f *fakeSentryReader) ListIssues(_ context.Context, _, _ string, _, _ time.Time, _ string) ([]sentry.Issue, error) {
+	f.listCalls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.issues, nil
+}
+
+func (f *fakeSentryReader) LatestEvent(_ context.Context, issueID string) (sentry.IssueEvent, error) {
+	f.eventCalls++
+	return f.events[issueID], nil
+}
+
+// recentIssue builds a JSON-decoded issue whose first/last-seen sit just inside
+// W relative to wall-clock now, so it is active+NEW regardless of when the test
+// runs (W is computed from the live incident time).
+func recentIssue(t *testing.T, id, typ, culprit, message string, userCount int) sentry.Issue {
+	t.Helper()
+	ts := time.Now().UTC().Add(-1 * time.Minute).Format(time.RFC3339)
+	raw := fmt.Sprintf(`{"id":%q,"level":"error","userCount":%d,"count":"10","firstSeen":%q,"lastSeen":%q,"metadata":{"type":%q,"value":%q},"culprit":%q}`,
+		id, userCount, ts, ts, typ, message, culprit)
+	var iss sentry.Issue
+	if err := json.Unmarshal([]byte(raw), &iss); err != nil {
+		t.Fatalf("decode issue: %v", err)
+	}
+	return iss
+}
+
+func sentryEnabledParams() acutetriage.SentryParams {
+	return acutetriage.SentryParams{Enabled: true, LookbackMinutes: 30, MaxIssues: 3, FetchTimeoutSeconds: 15, IncludeMessage: true}
+}
+
+func scopedAlerts(t *testing.T, st *store.Store, ctx context.Context, incID string) []string {
+	t.Helper()
+	a1 := insertTestAlert(t, st, ctx, incID, "fp-s1", map[string]string{"alertname": "DiskFull", "service": "checkout", "environment": "production"})
+	a2 := insertTestAlert(t, st, ctx, incID, "fp-s2", map[string]string{"alertname": "DiskFull", "service": "checkout", "environment": "production"})
+	return []string{a1.ID, a2.ID}
+}
+
+func TestRunPersistsSentryEnrichment(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	ids := scopedAlerts(t, st, ctx, inc.ID)
+
+	reader := &fakeSentryReader{
+		issues: []sentry.Issue{recentIssue(t, "100", "KeyError", "app.checkout in pay", "missing tenant_id", 7)},
+		events: map[string]sentry.IssueEvent{},
+	}
+	fllm := &fakeLLM{response: validLLMResponse(ids)}
+	skill := acutetriage.New(acutetriage.Config{MinAlerts: 2, Sentry: reader, SentryParams: sentryEnabledParams()}, st, fllm, nil, nil, nil)
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if reader.listCalls != 1 {
+		t.Errorf("want exactly one ListIssues call, got %d", reader.listCalls)
+	}
+
+	var enrichmentJSON sql.NullString
+	if err := st.DB().QueryRowContext(ctx, `SELECT enrichment_json FROM incidents WHERE id = ?`, inc.ID).Scan(&enrichmentJSON); err != nil {
+		t.Fatalf("scan enrichment_json: %v", err)
+	}
+	if !enrichmentJSON.Valid {
+		t.Fatal("enrichment_json is NULL; the sentry section was not persisted")
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(enrichmentJSON.String), &envelope); err != nil {
+		t.Fatalf("envelope not valid JSON: %v", err)
+	}
+	sec, ok := envelope["sentry"]
+	if !ok {
+		t.Fatalf("envelope missing the sentry key: %s", enrichmentJSON.String)
+	}
+	if !strings.Contains(string(sec), `"exception_type":"KeyError"`) || !strings.Contains(string(sec), `"project":"checkout"`) {
+		t.Errorf("persisted sentry section missing distilled fields: %s", sec)
+	}
+}
+
+func TestRunSentryDegradedDoesNotAbort(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	ids := scopedAlerts(t, st, ctx, inc.ID)
+
+	reader := &fakeSentryReader{err: &sentry.APIError{StatusCode: http.StatusTooManyRequests, Body: "rate limited"}}
+	fllm := &fakeLLM{response: validLLMResponse(ids)}
+	skill := acutetriage.New(acutetriage.Config{MinAlerts: 2, Sentry: reader, SentryParams: sentryEnabledParams()}, st, fllm, nil, nil, nil)
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run must complete despite a degraded Sentry fetch: %v", err)
+	}
+
+	var status string
+	var enrichmentJSON sql.NullString
+	if err := st.DB().QueryRowContext(ctx, `SELECT status, enrichment_json FROM incidents WHERE id = ?`, inc.ID).Scan(&status, &enrichmentJSON); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if status != "analyzed" {
+		t.Errorf("status = %q, want analyzed (degraded Sentry must not block the finding)", status)
+	}
+	if !enrichmentJSON.Valid || !strings.Contains(enrichmentJSON.String, "rate-limited") {
+		t.Errorf("degraded note not persisted: %v", enrichmentJSON)
+	}
+}
+
+func TestRunSentryAuditDigestIsCountsOnly(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	ids := scopedAlerts(t, st, ctx, inc.ID)
+
+	reader := &fakeSentryReader{
+		issues: []sentry.Issue{recentIssue(t, "100", "KeyError", "app.checkout in pay", "secret tenant id 42", 7)},
+		events: map[string]sentry.IssueEvent{},
+	}
+	fllm := &fakeLLM{response: validLLMResponse(ids)}
+	auditor := audit.New(st.DB())
+	skill := acutetriage.New(acutetriage.Config{MinAlerts: 2, Sentry: reader, SentryParams: sentryEnabledParams()}, st, fllm, auditor, nil, nil)
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var payload string
+	if err := st.DB().QueryRowContext(ctx, `SELECT payload_json FROM audit_log WHERE kind = 'incident.sentry_enriched'`).Scan(&payload); err != nil {
+		t.Fatalf("no incident.sentry_enriched audit row: %v", err)
+	}
+	if !strings.Contains(payload, "checkout") || !strings.Contains(payload, "issue_count") {
+		t.Errorf("digest should carry project + issue_count: %s", payload)
+	}
+	// The digest must NOT leak exception text, message, culprit, or file:line.
+	for _, leak := range []string{"KeyError", "secret tenant id 42", "app.checkout in pay"} {
+		if strings.Contains(payload, leak) {
+			t.Errorf("audit digest leaked %q: %s", leak, payload)
+		}
 	}
 }
 

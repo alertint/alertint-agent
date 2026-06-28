@@ -51,6 +51,15 @@ type Config struct {
 	// ChangeParams carries the change-enrichment tunables (enabled, window,
 	// max_events) from the changes.enrichment config section.
 	ChangeParams ChangeParams
+	// Sentry is an optional read-only Sentry Error source used to enrich the
+	// LLM prompt with the distilled issue section at incident time. nil = no
+	// Sentry enrichment (the consumer owns the field it reads; serve wiring
+	// assigns it). Pass a TRUE nil interface when unconfigured to avoid the
+	// typed-nil trap.
+	Sentry SentryReader
+	// SentryParams carries the Error-source tunables (enabled, lookback,
+	// max_issues, fetch timeout, message toggle) from the sentry.issues section.
+	SentryParams SentryParams
 }
 
 // Skill orchestrates the full acute-triage pipeline for a single ready
@@ -155,7 +164,7 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 	// 5. Produce the analysis: from the matched rule (short-circuit) or
 	// from the LLM with the pack-selected system prompt. enrichment is the
 	// log snapshot the LLM saw (nil on the short-circuit path).
-	raw, enrichment, changes, err := s.analysis(ctx, inc, alerts, decision, pack, packJSON)
+	raw, enrichment, changes, sentry, err := s.analysis(ctx, inc, alerts, decision, pack, packJSON)
 	if err != nil {
 		return err
 	}
@@ -177,6 +186,11 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 	}
 	if changes != nil {
 		sources["changes"] = changes
+	}
+	if sentry != nil {
+		// Already distilled + toggle-applied in FetchSentry (KTD2/KTD8), so the
+		// at-rest envelope never holds a raw frame or untoggled PII.
+		sources["sentry"] = sentry
 	}
 	enrichmentJSON := marshalEnrichments(sources, s.logger, inc.ID)
 	if err := s.st.SaveIncidentOutput(ctx,
@@ -273,6 +287,18 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 		})
 	}
 
+	// Sentry digest (when the Error source was attempted): scope + issue count
+	// only, never exception text, culprit, message, or file:line — keeps the
+	// hash-chained payload small and PII-free (R16).
+	if s.auditor != nil && sentry != nil {
+		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.sentry_enriched", map[string]any{
+			"incident_id": inc.ID,
+			"project":     sentry.Project,
+			"environment": sentry.Environment,
+			"issue_count": len(sentry.Issues),
+		})
+	}
+
 	ruleID := "none"
 	if decision.Rule != nil {
 		ruleID = decision.Rule.ID
@@ -292,11 +318,11 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 // with the pack-selected system prompt. On the LLM path it also returns the
 // log-enrichment snapshot (nil on the short-circuit path) so the caller can
 // persist exactly what the model saw.
-func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store.Alert, decision rules.Decision, pack EvidencePack, packJSON []byte) (json.RawMessage, *LogEnrichment, *ChangeEnrichment, error) {
+func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store.Alert, decision rules.Decision, pack EvidencePack, packJSON []byte) (json.RawMessage, *LogEnrichment, *ChangeEnrichment, *SentryEnrichment, error) {
 	if decision.ShortCircuit {
 		raw, err := shortCircuitResponse(decision, alerts)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("acutetriage: short-circuit response: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("acutetriage: short-circuit response: %w", err)
 		}
 		if s.auditor != nil {
 			_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.short_circuited", map[string]any{
@@ -304,7 +330,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 				"rule_id":     decision.Rule.ID,
 			})
 		}
-		return raw, nil, nil, nil
+		return raw, nil, nil, nil, nil
 	}
 
 	metrics := FetchMetrics(ctx, s.cfg.Prometheus, alerts, inc.FirstAlertAt)
@@ -313,7 +339,9 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 	enrichment := FetchLogs(ctx, s.cfg.LogSource, s.cfg.LogParams, alerts, inc.FirstAlertAt, time.Now().UTC(), inc.ID, s.logger)
 	// Change enrichment reads local SQLite — reliable mid-incident, no timeout.
 	changes := FetchChanges(ctx, s.st, s.cfg.ChangeParams, alerts, inc.FirstAlertAt, time.Now().UTC(), inc.ID, s.logger)
-	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment, changes)
+	// Sentry Error source: a bounded 1+K query-at-triage, best-effort, never blocks.
+	sentry := FetchSentry(ctx, s.cfg.Sentry, s.cfg.SentryParams, alerts, inc.FirstAlertAt, time.Now().UTC(), inc.ID, s.logger)
+	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment, changes, sentry)
 	comp, err := s.llm.Complete(ctx, s.systemPrompt(decision, len(alerts)), userPrompt, RequiredKeys)
 	if err != nil {
 		s.logger.Error("llm failed", "incident", inc.ID, "err", err)
@@ -323,7 +351,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 				"error":       err.Error(),
 			})
 		}
-		return nil, enrichment, changes, fmt.Errorf("acutetriage: llm: %w", err)
+		return nil, enrichment, changes, sentry, fmt.Errorf("acutetriage: llm: %w", err)
 	}
 	// Action-trail success line, sibling to "llm failed" above: emitted by the
 	// incident-aware caller so it carries the incident ID and the usage the
@@ -335,7 +363,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		"tokens_out", comp.OutputTokens,
 		"incident", inc.ID,
 	)
-	return comp.Raw, enrichment, changes, nil
+	return comp.Raw, enrichment, changes, sentry, nil
 }
 
 // systemPrompt picks the analysis prompt: the rule-selected template when

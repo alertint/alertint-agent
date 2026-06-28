@@ -109,9 +109,10 @@ type LokiAuthConfig struct {
 type SentryConfig struct {
 	BaseURL        string               `yaml:"base_url"`        // host root, e.g. https://sentry.io, https://de.sentry.io, or a self-hosted host
 	Org            string               `yaml:"org"`             // organization slug
-	TokenEnv       string               `yaml:"token_env"`       // env var holding the Internal-Integration token (project:read scope)
+	TokenEnv       string               `yaml:"token_env"`       // env var holding the Internal-Integration token (project:read for releases, event:read for issues)
 	TimeoutSeconds int                  `yaml:"timeout_seconds"` // HTTP timeout per request
 	Releases       SentryReleasesConfig `yaml:"releases,omitempty"`
+	Issues         SentryIssuesConfig   `yaml:"issues,omitempty"`
 }
 
 // SentryReleasesConfig configures the release/deploy poller: its own enabled
@@ -125,6 +126,33 @@ type SentryReleasesConfig struct {
 	InitialLookbackMinutes int      `yaml:"initial_lookback_minutes"`
 	ReleaseScanHorizonDays int      `yaml:"release_scan_horizon_days"`
 	Projects               []string `yaml:"projects,omitempty"` // optional project-slug filter; empty = org-wide
+}
+
+// SentryIssuesConfig configures the Error source: the bounded query-at-triage
+// that contributes the distilled `sentry` enrichment section (exception +
+// file:line, blast radius, NEW-in-window). Like the releases poller it has its
+// own enabled flag (per-feature opt-in) but reuses the shared SentryConfig
+// connection. LookbackMinutes sets W = [first_alert − lookback, now]; MaxIssues
+// caps the K of the 1+K call budget; FetchTimeoutSeconds bounds the WHOLE 1+K
+// fetch (distinct from the per-request timeout_seconds), so one slow event fetch
+// can't starve the rest. IncludeMessage is a *bool so default-on survives the
+// YAML merge (an omitted key keeps the default; an explicit false overrides),
+// the same explicit-vs-omitted reasoning as Loki's LineFilter — resolve it via
+// MessageIncluded.
+type SentryIssuesConfig struct {
+	Enabled             bool  `yaml:"enabled"`
+	LookbackMinutes     int   `yaml:"lookback_minutes"`
+	MaxIssues           int   `yaml:"max_issues"`
+	FetchTimeoutSeconds int   `yaml:"fetch_timeout_seconds"`
+	IncludeMessage      *bool `yaml:"include_message,omitempty"`
+}
+
+// MessageIncluded resolves the include_message toggle to a plain bool: an
+// omitted key (nil) defaults ON (R14), an explicit value is honored. Off strips
+// the exception message from all three surfaces (prompt, at-rest SQLite,
+// evidence-pack MCP).
+func (s SentryIssuesConfig) MessageIncluded() bool {
+	return s.IncludeMessage == nil || *s.IncludeMessage
 }
 
 // MCPConfig configures the HTTP MCP server exposed by alertint serve.
@@ -270,6 +298,14 @@ func Defaults() Config {
 				PollIntervalSeconds:    60,
 				InitialLookbackMinutes: 60,
 				ReleaseScanHorizonDays: 30,
+			},
+			Issues: SentryIssuesConfig{
+				// W reaches a precursor error that started minutes before the
+				// storm — decoupled from the 90s correlator window (KTD6).
+				LookbackMinutes:     30,
+				MaxIssues:           3, // the K of the 1+K call budget (KTD5)
+				FetchTimeoutSeconds: 15,
+				// IncludeMessage left nil → defaults ON via MessageIncluded (R14).
 			},
 		},
 		LogLevel:  "info",
@@ -527,37 +563,59 @@ func (c *Config) validateLoki() []string {
 	return errs
 }
 
-// validateSentry checks the Sentry change-source config. Like validatePrometheus
-// it gates entirely on the feature flag: a disabled block (the zero value, or an
-// explicit releases.enabled: false) validates clean even with an empty
-// connection, so zero-config triage is unaffected. When the releases poller is
-// enabled the shared connection (base_url, org, token_env) and the poller
-// tunables must be present and positive.
+// AnySentryEnabled reports whether any Sentry feature is on (the release/deploy
+// Change source OR the issue-enrichment Error source). It gates the shared
+// connection: the client, token resolution, shared-connection validation, and
+// the health check all key off this, while each feature's own work (the poller,
+// the triage query) stays gated on its own enabled flag (KTD7).
+func (c *Config) AnySentryEnabled() bool {
+	return c.Sentry.Releases.Enabled || c.Sentry.Issues.Enabled
+}
+
+// validateSentry checks the Sentry connector config. Like validatePrometheus it
+// gates on the feature flags: a fully-disabled block validates clean even with
+// an empty connection, so zero-config triage is unaffected. The SHARED
+// connection (base_url, org, token_env, timeout) is required when EITHER feature
+// is enabled (KTD7); the releases- and issues-specific tunables are each gated
+// on their own flag.
 func (c *Config) validateSentry() []string {
-	if !c.Sentry.Releases.Enabled {
+	if !c.AnySentryEnabled() {
 		return nil
 	}
 	var errs []string
 	if strings.TrimSpace(c.Sentry.BaseURL) == "" {
-		errs = append(errs, "sentry: base_url is required when sentry.releases is enabled")
+		errs = append(errs, "sentry: base_url is required when sentry is enabled")
 	}
 	if strings.TrimSpace(c.Sentry.Org) == "" {
-		errs = append(errs, "sentry: org is required when sentry.releases is enabled")
+		errs = append(errs, "sentry: org is required when sentry is enabled")
 	}
 	if strings.TrimSpace(c.Sentry.TokenEnv) == "" {
-		errs = append(errs, "sentry: token_env is required when sentry.releases is enabled (env var name holding the token)")
+		errs = append(errs, "sentry: token_env is required when sentry is enabled (env var name holding the token)")
 	}
 	if c.Sentry.TimeoutSeconds <= 0 {
 		errs = append(errs, "sentry: timeout_seconds must be > 0")
 	}
-	if c.Sentry.Releases.PollIntervalSeconds <= 0 {
-		errs = append(errs, "sentry: releases: poll_interval_seconds must be > 0")
+	if c.Sentry.Releases.Enabled {
+		if c.Sentry.Releases.PollIntervalSeconds <= 0 {
+			errs = append(errs, "sentry: releases: poll_interval_seconds must be > 0")
+		}
+		if c.Sentry.Releases.InitialLookbackMinutes <= 0 {
+			errs = append(errs, "sentry: releases: initial_lookback_minutes must be > 0")
+		}
+		if c.Sentry.Releases.ReleaseScanHorizonDays <= 0 {
+			errs = append(errs, "sentry: releases: release_scan_horizon_days must be > 0")
+		}
 	}
-	if c.Sentry.Releases.InitialLookbackMinutes <= 0 {
-		errs = append(errs, "sentry: releases: initial_lookback_minutes must be > 0")
-	}
-	if c.Sentry.Releases.ReleaseScanHorizonDays <= 0 {
-		errs = append(errs, "sentry: releases: release_scan_horizon_days must be > 0")
+	if c.Sentry.Issues.Enabled {
+		if c.Sentry.Issues.LookbackMinutes <= 0 {
+			errs = append(errs, "sentry: issues: lookback_minutes must be > 0")
+		}
+		if c.Sentry.Issues.MaxIssues <= 0 {
+			errs = append(errs, "sentry: issues: max_issues must be > 0")
+		}
+		if c.Sentry.Issues.FetchTimeoutSeconds <= 0 {
+			errs = append(errs, "sentry: issues: fetch_timeout_seconds must be > 0")
+		}
 	}
 	return errs
 }
@@ -625,12 +683,13 @@ func (c *Config) PrometheusToken() (string, error) {
 	return requireEnv(c.Prometheus.BearerTokenEnv, "prometheus.bearer_token_env")
 }
 
-// SentryToken returns the Internal-Integration token for the Sentry change
-// source, resolved from the env var named by Sentry.TokenEnv. Returns an empty
-// string and nil error when the releases poller is disabled (mirrors
-// PrometheusToken / WebhookToken: the agent never holds a secret it isn't using).
+// SentryToken returns the Internal-Integration token for the Sentry connector,
+// resolved from the env var named by Sentry.TokenEnv. Returns an empty string
+// and nil error when NO Sentry feature is enabled (mirrors PrometheusToken /
+// WebhookToken: the agent never holds a secret it isn't using). It resolves for
+// an issues-only deployment too, since the Error source shares this token (KTD7).
 func (c *Config) SentryToken() (string, error) {
-	if !c.Sentry.Releases.Enabled {
+	if !c.AnySentryEnabled() {
 		return "", nil
 	}
 	return requireEnv(c.Sentry.TokenEnv, "sentry.token_env")

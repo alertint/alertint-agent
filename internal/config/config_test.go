@@ -478,31 +478,37 @@ func TestValidate_SentryReleasesRequiresConnection(t *testing.T) {
 	}
 }
 
+// assertSentryTunableRejected seeds the shared connection, applies mutate (which
+// enables the relevant feature and zeroes one tunable), and asserts Validate
+// rejects it with a sentry: <field> message. Shared by the releases and issues
+// non-positive-tunable tables.
+func assertSentryTunableRejected(t *testing.T, mutate func(*Config), want string) {
+	t.Helper()
+	cfg := Defaults()
+	cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
+	cfg.Alertmanager.WebhookTokenEnv = "TOK"
+	cfg.LLM.APIKeyEnv = "KEY"
+	cfg.Sentry.BaseURL = "https://sentry.io"
+	cfg.Sentry.Org = "acme"
+	cfg.Sentry.TokenEnv = "SENTRY_TOKEN"
+	mutate(&cfg)
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("Validate = %v, want error mentioning %s", err, want)
+	}
+}
+
 func TestValidate_SentryReleasesRejectsNonPositiveTunables(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
-		mutate func(*SentryReleasesConfig)
+		mutate func(*Config)
 		want   string
 	}{
-		{"poll_interval", func(r *SentryReleasesConfig) { r.PollIntervalSeconds = 0 }, "poll_interval_seconds"},
-		{"initial_lookback", func(r *SentryReleasesConfig) { r.InitialLookbackMinutes = 0 }, "initial_lookback_minutes"},
-		{"release_scan_horizon", func(r *SentryReleasesConfig) { r.ReleaseScanHorizonDays = -1 }, "release_scan_horizon_days"},
+		{"poll_interval", func(c *Config) { c.Sentry.Releases.Enabled = true; c.Sentry.Releases.PollIntervalSeconds = 0 }, "poll_interval_seconds"},
+		{"initial_lookback", func(c *Config) { c.Sentry.Releases.Enabled = true; c.Sentry.Releases.InitialLookbackMinutes = 0 }, "initial_lookback_minutes"},
+		{"release_scan_horizon", func(c *Config) { c.Sentry.Releases.Enabled = true; c.Sentry.Releases.ReleaseScanHorizonDays = -1 }, "release_scan_horizon_days"},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := Defaults()
-			cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
-			cfg.Alertmanager.WebhookTokenEnv = "TOK"
-			cfg.LLM.APIKeyEnv = "KEY"
-			cfg.Sentry.BaseURL = "https://sentry.io"
-			cfg.Sentry.Org = "acme"
-			cfg.Sentry.TokenEnv = "SENTRY_TOKEN"
-			cfg.Sentry.Releases.Enabled = true
-			tc.mutate(&cfg.Sentry.Releases)
-			err := cfg.Validate()
-			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("Validate = %v, want error mentioning %s", err, tc.want)
-			}
-		})
+		t.Run(tc.name, func(t *testing.T) { assertSentryTunableRejected(t, tc.mutate, tc.want) })
 	}
 }
 
@@ -548,4 +554,156 @@ func TestSentryToken(t *testing.T) {
 			t.Errorf("SentryToken = %q, %v; want empty, nil", tok, err)
 		}
 	})
+
+	t.Run("issues-only enabled resolves the shared token", func(t *testing.T) {
+		t.Setenv("SENTRY_TOKEN_ISSUES", "sntrys-issues")
+		cfg := Defaults()
+		cfg.Sentry.TokenEnv = "SENTRY_TOKEN_ISSUES"
+		cfg.Sentry.Issues.Enabled = true // releases stays off
+		tok, err := cfg.SentryToken()
+		if err != nil || tok != "sntrys-issues" {
+			t.Errorf("SentryToken (issues-only) = %q, %v; want sntrys-issues, nil", tok, err)
+		}
+	})
+}
+
+// --------------------------------------------------------------------------
+// Sentry Error source (issues) — Spec 2
+// --------------------------------------------------------------------------
+
+func TestLoad_SentryIssuesValidAndDefaults(t *testing.T) {
+	// Issues enabled with releases OFF: the shared connection is required and
+	// the block validates, exercising the decoupled gating (KTD7).
+	yaml := sentryBaseYAML(t) + `
+sentry:
+  base_url: https://sentry.io
+  org: acme
+  token_env: SENTRY_TOKEN
+  issues:
+    enabled: true
+`
+	path := writeConfig(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Sentry.Issues.Enabled || cfg.Sentry.Releases.Enabled {
+		t.Fatalf("want issues-only enabled, got %+v", cfg.Sentry)
+	}
+	if !cfg.AnySentryEnabled() {
+		t.Error("AnySentryEnabled should be true with issues on")
+	}
+	if cfg.Sentry.Issues.LookbackMinutes != 30 {
+		t.Errorf("default lookback_minutes = %d, want 30", cfg.Sentry.Issues.LookbackMinutes)
+	}
+	if cfg.Sentry.Issues.MaxIssues != 3 {
+		t.Errorf("default max_issues = %d, want 3", cfg.Sentry.Issues.MaxIssues)
+	}
+	if cfg.Sentry.Issues.FetchTimeoutSeconds != 15 {
+		t.Errorf("default fetch_timeout_seconds = %d, want 15", cfg.Sentry.Issues.FetchTimeoutSeconds)
+	}
+	if !cfg.Sentry.Issues.MessageIncluded() {
+		t.Error("include_message must default ON (R14)")
+	}
+}
+
+func TestLoad_SentryIssuesIncludeMessageToggle(t *testing.T) {
+	yaml := sentryBaseYAML(t) + `
+sentry:
+  base_url: https://sentry.io
+  org: acme
+  token_env: SENTRY_TOKEN
+  issues:
+    enabled: true
+    include_message: false
+`
+	path := writeConfig(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Sentry.Issues.IncludeMessage == nil || *cfg.Sentry.Issues.IncludeMessage {
+		t.Errorf("explicit include_message: false must round-trip as off, got %v", cfg.Sentry.Issues.IncludeMessage)
+	}
+	if cfg.Sentry.Issues.MessageIncluded() {
+		t.Error("MessageIncluded should resolve to false when explicitly disabled")
+	}
+}
+
+func TestLoad_SentryIssuesRejectsUnknownKey(t *testing.T) {
+	yaml := sentryBaseYAML(t) + `
+sentry:
+  base_url: https://sentry.io
+  org: acme
+  token_env: SENTRY_TOKEN
+  issues:
+    enabled: true
+    bogus_issue_field: 1
+`
+	path := writeConfig(t, yaml)
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected strict-decode error for unknown key under sentry.issues")
+	}
+}
+
+func TestValidate_SentryIssuesRequiresConnection(t *testing.T) {
+	for _, field := range []string{"base_url", "org", "token_env"} {
+		t.Run("missing "+field, func(t *testing.T) {
+			cfg := Defaults()
+			cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
+			cfg.Alertmanager.WebhookTokenEnv = "TOK"
+			cfg.LLM.APIKeyEnv = "KEY"
+			cfg.Sentry.BaseURL = "https://sentry.io"
+			cfg.Sentry.Org = "acme"
+			cfg.Sentry.TokenEnv = "SENTRY_TOKEN"
+			cfg.Sentry.Issues.Enabled = true // releases off — only issues drives the requirement
+			switch field {
+			case "base_url":
+				cfg.Sentry.BaseURL = ""
+			case "org":
+				cfg.Sentry.Org = ""
+			case "token_env":
+				cfg.Sentry.TokenEnv = ""
+			}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("expected validation error for missing %s with issues enabled", field)
+			}
+			if msg := err.Error(); !strings.Contains(msg, "sentry:") || !strings.Contains(msg, field) {
+				t.Errorf("error %q must be sentry:-prefixed and mention %s", msg, field)
+			}
+		})
+	}
+}
+
+func TestValidate_SentryIssuesRejectsNonPositiveTunables(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{"lookback", func(c *Config) { c.Sentry.Issues.Enabled = true; c.Sentry.Issues.LookbackMinutes = 0 }, "lookback_minutes"},
+		{"max_issues", func(c *Config) { c.Sentry.Issues.Enabled = true; c.Sentry.Issues.MaxIssues = 0 }, "max_issues"},
+		{"fetch_timeout", func(c *Config) { c.Sentry.Issues.Enabled = true; c.Sentry.Issues.FetchTimeoutSeconds = -1 }, "fetch_timeout_seconds"},
+	} {
+		t.Run(tc.name, func(t *testing.T) { assertSentryTunableRejected(t, tc.mutate, tc.want) })
+	}
+}
+
+func TestAnySentryEnabled_BothDisabledIsZeroConfig(t *testing.T) {
+	cfg := Defaults()
+	cfg.Sentry.TokenEnv = "WHATEVER"
+	if cfg.AnySentryEnabled() {
+		t.Error("AnySentryEnabled should be false with both features off")
+	}
+	tok, err := cfg.SentryToken()
+	if err != nil || tok != "" {
+		t.Errorf("SentryToken with both off = %q, %v; want empty, nil", tok, err)
+	}
+	cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
+	cfg.Alertmanager.WebhookTokenEnv = "TOK"
+	cfg.LLM.APIKeyEnv = "KEY"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("both-disabled sentry should validate clean: %v", err)
+	}
 }

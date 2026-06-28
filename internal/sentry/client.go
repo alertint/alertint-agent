@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: FSL-1.1-ALv2
 
-// Package sentry is the read-only Sentry change source: a shared egress-only
-// REST client plus a background poller (poller.go) that turns new Sentry
-// deploys/releases into store.Change rows. It parallels internal/prometheus and
-// internal/logs/loki — GET-only, configurable timeout, host-root base URL — but
-// unlike a log source it produces Changes (not log lines), runs a background
-// poller, and never touches the correlator. In CONTEXT.md terms it is the first
-// Change source. Reads only: no write/mutating calls, no Seer/sentry-mcp.
+// Package sentry is the read-only Sentry connector — both a Change source and an
+// Error source over one shared egress-only REST client. The Change source
+// (poller.go) turns new Sentry deploys/releases into store.Change rows in the
+// background; the Error source (issues.go) answers a bounded query-at-triage for
+// the exception, file:line, blast radius, and NEW-in-window flag behind an
+// incident (ADR-0010). It parallels internal/prometheus and internal/logs/loki —
+// GET-only, configurable timeout, host-root base URL — but produces Changes and
+// distilled issue facts, not log lines, and never touches the correlator. In
+// CONTEXT.md terms it is the first Change source and the first Error source.
+// Reads only: no write/mutating calls, no Seer/sentry-mcp.
 package sentry
 
 import (
@@ -84,7 +87,7 @@ type Client struct {
 type Config struct {
 	BaseURL        string // host root, e.g. https://sentry.io, https://de.sentry.io, or a self-hosted host
 	Org            string // organization slug
-	Token          string // Internal-Integration token (project:read scope)
+	Token          string // Internal-Integration token (project:read for releases, event:read for issues)
 	TimeoutSeconds int
 }
 
