@@ -38,13 +38,16 @@ type SentryParams struct {
 }
 
 // SentryIssueView is one distilled, rendered-and-persisted issue. It is a strict
-// allowlist of benign fields — exception type, culprit, file:line, level, blast
-// radius, NEW flag — plus the optional exception message. Local variables,
-// request bodies, breadcrumbs, and user/context entries are NEVER mapped here:
-// the privacy boundary is the SHAPE of this struct, not a downstream filter
-// (KTD8/R13). Message is included only when IncludeMessage is on (R14), so the
-// toggle strips it from all three persisted surfaces at once.
+// allowlist of benign fields — issue id, exception type, culprit, file:line,
+// level, blast radius, NEW flag — plus the optional exception message. Local
+// variables, request bodies, breadcrumbs, and user/context entries are NEVER
+// mapped here: the privacy boundary is the SHAPE of this struct, not a downstream
+// filter (KTD8/R13). Message is included only when IncludeMessage is on (R14), so
+// the toggle strips it from all three persisted surfaces at once. ID is the stable
+// Sentry issue id — an opaque identifier, safe by shape (no redaction gate); it is
+// persist-only and never rendered into the prompt (KTD3).
 type SentryIssueView struct {
+	ID            string `json:"id,omitempty"`
 	ExceptionType string `json:"exception_type"`
 	Culprit       string `json:"culprit,omitempty"`
 	FileLine      string `json:"file_line,omitempty"`
@@ -54,6 +57,21 @@ type SentryIssueView struct {
 	New           bool   `json:"new"`
 	Message       string `json:"message,omitempty"`
 }
+
+// SentryOutcome is the structured result of one FetchSentry query — the
+// machine-readable marker the reconciliation verdict reads instead of parsing the
+// free-text Note (KTD1). A conclusive look (issues returned OR a genuine
+// zero/all-chronic result) is "ok"; an unresolved project slug is
+// "unknown_project"; a rate-limit/timeout/API error after the bounded retry is
+// "degraded". The empty zero-value is fail-safe: a FetchSentry path that forgets
+// to set Outcome yields no verdict, never a wrong one. Only "ok" produces a tag.
+type SentryOutcome string
+
+const (
+	outcomeOK             SentryOutcome = "ok"
+	outcomeUnknownProject SentryOutcome = "unknown_project"
+	outcomeDegraded       SentryOutcome = "degraded"
+)
 
 // SentryEnrichment is the distilled Sentry Error-source context attached to a
 // triage prompt and persisted under the "sentry" envelope key (R10). The same
@@ -67,7 +85,41 @@ type SentryEnrichment struct {
 	Issues      []SentryIssueView `json:"issues,omitempty"`
 	MoreCount   int               `json:"more_count,omitempty"` // matches beyond the top-K cap (R8)
 	Note        string            `json:"note,omitempty"`       // zero-match / unknown-project / degraded
+	Outcome     SentryOutcome     `json:"outcome,omitempty"`    // structured fetch result (KTD1)
+
+	// Reconciliation is the zero-LLM cross-source verdict (matched / infra-only),
+	// computed at the triage seam by reconcile() and set only on a conclusive look
+	// (Outcome == ok). nil on degraded/unknown/disabled — which is exactly what
+	// gates the headline off (R6) and keeps the disabled path byte-identical (R7).
+	Reconciliation *Reconciliation `json:"reconciliation,omitempty"`
+
+	// corroboratingIDs and chronicInWindow are the FULL pre-cap novelty breakdown,
+	// captured before the MaxIssues render truncation so the verdict counts the true
+	// match set, never the rendered top-K (KTD2/KTD4). Unexported in-process carries
+	// from FetchSentry to reconcile, which copies them onto the persisted
+	// Reconciliation verdict (the single source the headline renders from).
+	corroboratingIDs []string // new-in-window issue ids (firstSeen ∈ W)
+	chronicInWindow  int      // in-window non-NEW (chronic) issue count
 }
+
+// Reconciliation is the persisted cross-source verdict and the single source the
+// headline renders from. Tag is "matched" (≥1 corroborating error) or "infra-only"
+// (the source looked, found no new error). CorroboratingIssueIDs is the FULL
+// new-in-window id set for a matched tag — forward-investment for chunk 02's MCP
+// tools and the deferred incident-memory feature (KTD2/KTD3). ChronicCount is the
+// FULL pre-cap in-window chronic count, persisted so the infra-only headline and an
+// evidence-pack replay reconstruct identically (ADR-0001 fidelity). Opaque ids +
+// integer counts; no PII.
+type Reconciliation struct {
+	Tag                   string   `json:"tag"`
+	CorroboratingIssueIDs []string `json:"corroborating_issue_ids,omitempty"`
+	ChronicCount          int      `json:"chronic_count,omitempty"`
+}
+
+const (
+	tagMatched   = "matched"
+	tagInfraOnly = "infra-only"
+)
 
 // FetchSentry runs the bounded query-at-triage Error source for one incident: it
 // derives a project(+env) scope from conventional labels, queries issues active
@@ -120,11 +172,11 @@ func FetchSentry(ctx context.Context, r SentryReader, params SentryParams, alert
 		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
 			note := "no Sentry project " + project + " (label value did not match a Sentry project slug)"
 			logger.Warn("sentry fetched", "outcome", "unknown_project", "scope", scope, "incident", incidentID)
-			return &SentryEnrichment{Project: project, Environment: env, Start: start, End: end, Note: note}
+			return &SentryEnrichment{Project: project, Environment: env, Start: start, End: end, Note: note, Outcome: outcomeUnknownProject}
 		}
 		note := degradedNote(err)
 		logger.Warn("sentry fetched", "outcome", "degraded", "scope", scope, "err", err, "incident", incidentID)
-		return &SentryEnrichment{Project: project, Environment: env, Start: start, End: end, Note: note}
+		return &SentryEnrichment{Project: project, Environment: env, Start: start, End: end, Note: note, Outcome: outcomeDegraded}
 	}
 
 	// Defensive in-window activity filter: the API scopes by start/end, but keep
@@ -142,11 +194,25 @@ func FetchSentry(ctx context.Context, r SentryReader, params SentryParams, alert
 		// not application-code-driven (R11/AE2).
 		note := "no Sentry issues for " + scope + " in window"
 		logger.Info("sentry fetched", "issues", 0, "scope", scope, "incident", incidentID)
-		return &SentryEnrichment{Project: project, Environment: env, Start: start, End: end, Note: note}
+		return &SentryEnrichment{Project: project, Environment: env, Start: start, End: end, Note: note, Outcome: outcomeOK}
 	}
 
 	windowMinutes := end.Sub(start).Minutes()
 	rankIssues(active, start, end)
+
+	// Capture the FULL new-in-window corroborating id set and chronic count over
+	// the whole active match set, BEFORE the MaxIssues truncation below — so the
+	// verdict (U2) and headline (U3) reflect the true counts, never the rendered
+	// top-K (KTD2/KTD4). The truncation that follows caps only the rendered Issues.
+	corroboratingIDs := make([]string, 0, len(active))
+	chronicInWindow := 0
+	for _, iss := range active {
+		if inWindow(iss.FirstSeen, start, end) {
+			corroboratingIDs = append(corroboratingIDs, iss.ID)
+		} else {
+			chronicInWindow++
+		}
+	}
 
 	more := 0
 	if len(active) > params.MaxIssues {
@@ -164,8 +230,43 @@ func FetchSentry(ctx context.Context, r SentryReader, params SentryParams, alert
 		"window", fmt.Sprintf("%dm", params.LookbackMinutes), "incident", incidentID)
 	return &SentryEnrichment{
 		Project: project, Environment: env, Start: start, End: end,
-		Issues: views, MoreCount: more,
+		Issues: views, MoreCount: more, Outcome: outcomeOK,
+		corroboratingIDs: corroboratingIDs, chronicInWindow: chronicInWindow,
 	}
+}
+
+// reconcile sets the zero-LLM cross-source verdict on the enrichment, in place at
+// the triage seam (KTD5) — never in the rule engine (R3). It is a pure read of the
+// structured Outcome marker plus the FULL pre-cap new-in-window set FetchSentry
+// captured: a conclusive look with ≥1 corroborating error → matched (carrying the
+// full id set R2/R4); a conclusive look with none (genuine zero or all-chronic) →
+// infra-only. It leaves Reconciliation nil on any inconclusive/absent look
+// (degraded, unknown-project) or a nil enrichment (disabled / no scope), which
+// gates the headline off (R6) and keeps the disabled path byte-identical (R7).
+func reconcile(e *SentryEnrichment) {
+	if e == nil || e.Outcome != outcomeOK {
+		return
+	}
+	if len(e.corroboratingIDs) > 0 {
+		// Copy the carry slice so the persisted verdict owns its backing array — a
+		// future in-package append to corroboratingIDs cannot then mutate the
+		// at-rest CorroboratingIssueIDs.
+		ids := append([]string(nil), e.corroboratingIDs...)
+		e.Reconciliation = &Reconciliation{Tag: tagMatched, CorroboratingIssueIDs: ids, ChronicCount: e.chronicInWindow}
+		return
+	}
+	e.Reconciliation = &Reconciliation{Tag: tagInfraOnly, ChronicCount: e.chronicInWindow}
+}
+
+// reconciliationDigestFields reads the PII-free verdict fields for the audit digest
+// (KTD6), defaulting to empty/zero on an inconclusive look (Reconciliation nil) so
+// the digest never derefs a nil verdict — the digest fires for every non-nil
+// enrichment, including the degraded / unknown-project paths.
+func reconciliationDigestFields(e *SentryEnrichment) (tag string, corroborating int) {
+	if e.Reconciliation != nil {
+		return e.Reconciliation.Tag, len(e.Reconciliation.CorroboratingIssueIDs)
+	}
+	return "", 0
 }
 
 // distill turns one ranked issue into the allowlist view-model. It makes the
@@ -177,6 +278,7 @@ func FetchSentry(ctx context.Context, r SentryReader, params SentryParams, alert
 // only when includeMessage is on (R14).
 func distill(ctx context.Context, r SentryReader, iss sentry.Issue, start, end time.Time, windowMinutes float64, includeMessage bool, incidentID string, logger *slog.Logger) SentryIssueView {
 	v := SentryIssueView{
+		ID:            iss.ID,
 		ExceptionType: exceptionType(iss, includeMessage),
 		Culprit:       iss.Culprit,
 		Level:         iss.Level,

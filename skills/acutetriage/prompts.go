@@ -160,6 +160,7 @@ func renderSentry(b *strings.Builder, e *SentryEnrichment) {
 	if e == nil {
 		return
 	}
+	renderReconciliationHeadline(b, e)
 	if len(e.Issues) > 0 {
 		fmt.Fprintf(b, "\n\nSentry issues (at triage time, %s, most relevant first):", scopeLabel(e.Project, e.Environment))
 		for _, iss := range e.Issues {
@@ -175,6 +176,30 @@ func renderSentry(b *strings.Builder, e *SentryEnrichment) {
 		note = "no Sentry issues available"
 	}
 	fmt.Fprintf(b, "\n\nSentry issues (at triage time): %s", note)
+}
+
+// renderReconciliationHeadline prepends the one neutral cross-source headline
+// above the Sentry issue render. It is derived ENTIRELY from the persisted verdict
+// — counts and scope only, never a Sentry-controlled string (title/message/culprit)
+// — so per ADR-0011 it is a presented signal the model weighs, not a directive
+// (KTD4). N (matched) and M (chronic) both read from Reconciliation, which carries
+// the FULL pre-cap counts, never the truncated render, so a busy service reports
+// the true count rather than a constant MaxIssues. It renders only on a conclusive
+// look (Reconciliation != nil), so it is naturally inert on the degraded /
+// unknown-project / disabled paths (R5/R6/R7).
+func renderReconciliationHeadline(b *strings.Builder, e *SentryEnrichment) {
+	if e.Reconciliation == nil {
+		return
+	}
+	switch e.Reconciliation.Tag {
+	case tagMatched:
+		fmt.Fprintf(b, "\n\nSentry: %d new in-window error(s) correlated", len(e.Reconciliation.CorroboratingIssueIDs))
+	case tagInfraOnly:
+		b.WriteString("\n\nSentry: no new in-window errors for this scope")
+		if e.Reconciliation.ChronicCount > 0 {
+			fmt.Fprintf(b, " (%d chronic present)", e.Reconciliation.ChronicCount)
+		}
+	}
 }
 
 // renderSentryIssue renders one distilled issue line (plus its message line when

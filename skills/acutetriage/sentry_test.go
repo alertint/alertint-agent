@@ -135,6 +135,22 @@ func TestFetchSentry_MembershipNoveltyRanking(t *testing.T) {
 	if fk.listedProject != "checkout" || fk.listedEnv != "production" {
 		t.Errorf("scope passed = %q/%q, want checkout/production", fk.listedProject, fk.listedEnv)
 	}
+	// A conclusive look that returned issues → Outcome ok (KTD1).
+	if got.Outcome != outcomeOK {
+		t.Errorf("Outcome = %q, want ok", got.Outcome)
+	}
+	// The stable issue id rides each distilled view, including the NEW-ranked-first one (KTD3).
+	if got.Issues[0].ID != "A" || got.Issues[1].ID != "B" {
+		t.Errorf("issue ids = %q/%q, want A/B", got.Issues[0].ID, got.Issues[1].ID)
+	}
+	// Only A is new-in-window (C was dropped as not active in W) → corroborating set [A],
+	// chronic count 1 (B). These are the pre-cap counts the verdict/headline read.
+	if len(got.corroboratingIDs) != 1 || got.corroboratingIDs[0] != "A" {
+		t.Errorf("corroboratingIDs = %v, want [A]", got.corroboratingIDs)
+	}
+	if got.chronicInWindow != 1 {
+		t.Errorf("chronicInWindow = %d, want 1", got.chronicInWindow)
+	}
 }
 
 func TestFetchSentry_ZeroMatchesNegativeSignal(t *testing.T) {
@@ -151,6 +167,14 @@ func TestFetchSentry_ZeroMatchesNegativeSignal(t *testing.T) {
 	if fk.listCalls != 1 || fk.eventCalls != 0 {
 		t.Errorf("calls: list=%d event=%d, want 1 + 0", fk.listCalls, fk.eventCalls)
 	}
+	// A genuine zero-match IS a conclusive look → Outcome ok (NOT degraded), with an
+	// empty corroborating set — this is the infra-only signal the verdict reads (KTD1).
+	if got.Outcome != outcomeOK {
+		t.Errorf("Outcome = %q, want ok on a genuine zero-match", got.Outcome)
+	}
+	if len(got.corroboratingIDs) != 0 || got.chronicInWindow != 0 {
+		t.Errorf("zero-match must carry no corroborating ids / chronic, got %v / %d", got.corroboratingIDs, got.chronicInWindow)
+	}
 }
 
 func TestFetchSentry_RateLimitedDegrades(t *testing.T) {
@@ -160,6 +184,9 @@ func TestFetchSentry_RateLimitedDegrades(t *testing.T) {
 		scopeFirst, scopeLast, "inc1", slog.Default())
 	if got == nil || !strings.Contains(got.Note, "rate-limited") {
 		t.Fatalf("want rate-limited degraded note, got %#v", got)
+	}
+	if got.Outcome != outcomeDegraded {
+		t.Errorf("Outcome = %q, want degraded — an inconclusive look must never yield a verdict (R6)", got.Outcome)
 	}
 	if fk.eventCalls != 0 {
 		t.Errorf("no LatestEvent calls expected on degrade, got %d", fk.eventCalls)
@@ -179,6 +206,9 @@ func TestFetchSentry_UnknownProject404(t *testing.T) {
 	}
 	if !strings.Contains(got.Note, "typo-slug") || !strings.Contains(got.Note, "did not match") {
 		t.Errorf("want unknown-project note mentioning the slug, got %q", got.Note)
+	}
+	if got.Outcome != outcomeUnknownProject {
+		t.Errorf("Outcome = %q, want unknown_project — no verdict on an unresolved scope (R6)", got.Outcome)
 	}
 	if fk.eventCalls != 0 {
 		t.Errorf("no LatestEvent calls on unknown project, got %d", fk.eventCalls)
@@ -278,6 +308,96 @@ func TestFetchSentry_NoMetadataTypeTitleFallbackRespectsToggle(t *testing.T) {
 	})
 }
 
+// The stable issue id is mapped onto every distilled view and is NOT a PII
+// field-path: it must be present whether include_message is on or off (KTD3).
+func TestFetchSentry_IssueIDPopulatedAcrossToggle(t *testing.T) {
+	raw := `{"id":"abc123","level":"error","userCount":2,"count":"10",
+		"firstSeen":"2026-06-26T11:55:00Z","lastSeen":"2026-06-26T12:06:00Z","metadata":{"type":"KeyError"}}`
+	for _, includeMsg := range []bool{true, false} {
+		fk := &fakeSentry{issues: []sentry.Issue{mkIssue(t, raw)}, events: map[string]sentry.IssueEvent{}}
+		got := FetchSentry(context.Background(), fk, sentryParams(includeMsg),
+			alertsWithLabels(map[string]string{"service": "checkout"}),
+			scopeFirst, scopeLast, "inc1", slog.Default())
+		if got == nil || len(got.Issues) != 1 {
+			t.Fatalf("include=%v: want one issue, got %#v", includeMsg, got)
+		}
+		if got.Issues[0].ID != "abc123" {
+			t.Errorf("include=%v: issue id = %q, want abc123 (id is not a PII field-path)", includeMsg, got.Issues[0].ID)
+		}
+	}
+}
+
+// The corroborating id set and chronic count are captured over the FULL active
+// match set BEFORE the MaxIssues truncation — so a service with more new-in-window
+// errors than the render cap reports the true count, never a constant MaxIssues
+// (KTD2/KTD4). The rendered Issues list stays capped; the corroboration set does not.
+func TestFetchSentry_CorroborationUncappedBeyondMaxIssues(t *testing.T) {
+	issues := make([]sentry.Issue, 0, 5)
+	for _, id := range []string{"n1", "n2", "n3", "n4", "n5"} {
+		issues = append(issues, mkIssue(t, `{"id":"`+id+`","level":"error","userCount":1,"count":"3",
+			"firstSeen":"2026-06-26T11:55:00Z","lastSeen":"2026-06-26T12:06:00Z","metadata":{"type":"E"}}`))
+	}
+	fk := &fakeSentry{issues: issues, events: map[string]sentry.IssueEvent{}}
+	got := FetchSentry(context.Background(), fk, sentryParams(true),
+		alertsWithLabels(map[string]string{"service": "checkout"}),
+		scopeFirst, scopeLast, "inc1", slog.Default())
+	if got == nil {
+		t.Fatal("want non-nil enrichment")
+	}
+	// Rendered list capped at MaxIssues (3) with +2 more...
+	if len(got.Issues) != 3 || got.MoreCount != 2 {
+		t.Fatalf("rendered Issues should cap at 3 + MoreCount 2, got %d issues / more %d", len(got.Issues), got.MoreCount)
+	}
+	// ...but ALL 5 new-in-window ids are captured for the verdict.
+	if len(got.corroboratingIDs) != 5 {
+		t.Errorf("corroboratingIDs = %v, want all 5 new-in-window ids (uncapped)", got.corroboratingIDs)
+	}
+	if got.chronicInWindow != 0 {
+		t.Errorf("chronicInWindow = %d, want 0 (all new)", got.chronicInWindow)
+	}
+}
+
+// A fetch mixing more new-in-window AND chronic issues than the MaxIssues render
+// cap: the rendered Issues list caps at MaxIssues, but BOTH full pre-cap counts ride
+// the verdict — N (corroborating ids) counts every new issue, ChronicCount every
+// chronic one — so neither headline number collapses to a constant MaxIssues.
+func TestFetchSentry_MixedNoveltyUncappedCounts(t *testing.T) {
+	issues := make([]sentry.Issue, 0, 7)
+	for _, id := range []string{"n1", "n2", "n3", "n4"} { // new-in-window (firstSeen ∈ W)
+		issues = append(issues, mkIssue(t, `{"id":"`+id+`","level":"error","userCount":1,"count":"3",
+			"firstSeen":"2026-06-26T11:55:00Z","lastSeen":"2026-06-26T12:06:00Z","metadata":{"type":"E"}}`))
+	}
+	for _, id := range []string{"c1", "c2", "c3"} { // chronic (firstSeen < W start, still active in W)
+		issues = append(issues, mkIssue(t, `{"id":"`+id+`","level":"error","userCount":1,"count":"3",
+			"firstSeen":"2026-06-05T09:00:00Z","lastSeen":"2026-06-26T12:05:00Z","metadata":{"type":"E"}}`))
+	}
+	fk := &fakeSentry{issues: issues, events: map[string]sentry.IssueEvent{}}
+	got := FetchSentry(context.Background(), fk, sentryParams(true),
+		alertsWithLabels(map[string]string{"service": "checkout"}),
+		scopeFirst, scopeLast, "inc1", slog.Default())
+	if got == nil {
+		t.Fatal("want non-nil enrichment")
+	}
+	reconcile(got)
+	// Rendered list caps at MaxIssues (3); 4 of the 7 active spill into MoreCount.
+	if len(got.Issues) != 3 || got.MoreCount != 4 {
+		t.Fatalf("rendered Issues should cap at 3 + MoreCount 4, got %d issues / more %d", len(got.Issues), got.MoreCount)
+	}
+	// Full pre-cap counts survive truncation.
+	if len(got.corroboratingIDs) != 4 || got.chronicInWindow != 3 {
+		t.Errorf("pre-cap counts: corroborating=%d chronic=%d, want 4 / 3", len(got.corroboratingIDs), got.chronicInWindow)
+	}
+	if got.Reconciliation == nil || got.Reconciliation.Tag != tagMatched {
+		t.Fatalf("want matched verdict, got %#v", got.Reconciliation)
+	}
+	if len(got.Reconciliation.CorroboratingIssueIDs) != 4 {
+		t.Errorf("headline N (corroborating ids) = %d, want 4 (not capped at MaxIssues)", len(got.Reconciliation.CorroboratingIssueIDs))
+	}
+	if got.Reconciliation.ChronicCount != 3 {
+		t.Errorf("persisted ChronicCount = %d, want 3 (not capped at MaxIssues)", got.Reconciliation.ChronicCount)
+	}
+}
+
 func TestFetchSentry_BudgetOnePlusK(t *testing.T) {
 	issues := make([]sentry.Issue, 0, 5)
 	for _, id := range []string{"i1", "i2", "i3", "i4", "i5"} {
@@ -331,6 +451,116 @@ func TestFetchSentry_DeepestFrameAndCulpritFallback(t *testing.T) {
 	}
 	if !sawCulpritFallback {
 		t.Errorf("no-frame issue should fall back to culprit with empty FileLine: %#v", got.Issues)
+	}
+}
+
+// reconcile derives the verdict from the structured Outcome + the pre-cap
+// new-in-window set. These exercise the branch table directly (KTD5).
+func TestReconcile_Verdict(t *testing.T) {
+	t.Run("Covers AE1: matched on >=1 new-in-window, carrying the FULL id set", func(t *testing.T) {
+		// More than MaxIssues (3) new ids → the verdict carries all of them, never
+		// the capped render (guards the MaxIssues cap).
+		e := &SentryEnrichment{Outcome: outcomeOK, corroboratingIDs: []string{"A", "B", "C", "D", "E"}}
+		reconcile(e)
+		if e.Reconciliation == nil || e.Reconciliation.Tag != tagMatched {
+			t.Fatalf("want matched verdict, got %#v", e.Reconciliation)
+		}
+		if len(e.Reconciliation.CorroboratingIssueIDs) != 5 {
+			t.Errorf("want full corroborating set of 5, got %v", e.Reconciliation.CorroboratingIssueIDs)
+		}
+		// The persisted verdict owns its slice: mutating the carry must not corrupt it.
+		e.corroboratingIDs[0] = "MUTATED"
+		if e.Reconciliation.CorroboratingIssueIDs[0] != "A" {
+			t.Errorf("verdict slice aliases the carry; want an independent copy, got %v", e.Reconciliation.CorroboratingIssueIDs)
+		}
+	})
+	t.Run("Covers AE3: infra-only on a conclusive zero look, no ids", func(t *testing.T) {
+		e := &SentryEnrichment{Outcome: outcomeOK}
+		reconcile(e)
+		if e.Reconciliation == nil || e.Reconciliation.Tag != tagInfraOnly {
+			t.Fatalf("want infra-only, got %#v", e.Reconciliation)
+		}
+		if len(e.Reconciliation.CorroboratingIssueIDs) != 0 {
+			t.Errorf("infra-only carries no ids, got %v", e.Reconciliation.CorroboratingIssueIDs)
+		}
+	})
+	t.Run("Covers AE2: all-chronic look is infra-only (chronic is not corroborating)", func(t *testing.T) {
+		e := &SentryEnrichment{Outcome: outcomeOK, chronicInWindow: 3} // no corroboratingIDs
+		reconcile(e)
+		if e.Reconciliation == nil || e.Reconciliation.Tag != tagInfraOnly {
+			t.Fatalf("chronic-only must be infra-only, got %#v", e.Reconciliation)
+		}
+		// The full pre-cap chronic count rides the persisted verdict (single render source).
+		if e.Reconciliation.ChronicCount != 3 {
+			t.Errorf("ChronicCount = %d, want 3", e.Reconciliation.ChronicCount)
+		}
+	})
+	t.Run("Covers AE5: degraded yields no verdict (R6)", func(t *testing.T) {
+		e := &SentryEnrichment{Outcome: outcomeDegraded, corroboratingIDs: []string{"A"}}
+		reconcile(e)
+		if e.Reconciliation != nil {
+			t.Errorf("degraded must not produce a verdict, got %#v", e.Reconciliation)
+		}
+	})
+	t.Run("unknown_project yields no verdict (R6)", func(t *testing.T) {
+		e := &SentryEnrichment{Outcome: outcomeUnknownProject}
+		reconcile(e)
+		if e.Reconciliation != nil {
+			t.Errorf("unknown_project must not produce a verdict, got %#v", e.Reconciliation)
+		}
+	})
+	t.Run("Covers AE4: nil enrichment is a safe no-op", func(t *testing.T) {
+		reconcile(nil) // must not panic
+	})
+}
+
+// Covers AE2 through the real fetch: issues present but all chronic (firstSeen < W,
+// still active in W) → a conclusive look that reconciles to infra-only, with the
+// chronic issue still distilled and counted.
+func TestReconcile_ChronicOnlyThroughFetch(t *testing.T) {
+	fk := &fakeSentry{
+		issues: []sentry.Issue{
+			mkIssue(t, `{"id":"B","level":"error","userCount":50,"count":"900",
+				"firstSeen":"2026-06-05T09:00:00Z","lastSeen":"2026-06-26T12:05:00Z","metadata":{"type":"TimeoutError"}}`),
+		},
+		events: map[string]sentry.IssueEvent{},
+	}
+	got := FetchSentry(context.Background(), fk, sentryParams(true),
+		alertsWithLabels(map[string]string{"service": "checkout"}),
+		scopeFirst, scopeLast, "inc1", slog.Default())
+	reconcile(got)
+	if got == nil || got.Reconciliation == nil || got.Reconciliation.Tag != tagInfraOnly {
+		t.Fatalf("chronic-only conclusive look must be infra-only, got %#v", got)
+	}
+	if len(got.Reconciliation.CorroboratingIssueIDs) != 0 {
+		t.Errorf("chronic issue must not corroborate, got %v", got.Reconciliation.CorroboratingIssueIDs)
+	}
+	if got.chronicInWindow != 1 || len(got.Issues) != 1 {
+		t.Errorf("chronic issue should still be counted (1) and distilled (1), got chronic=%d issues=%d", got.chronicInWindow, len(got.Issues))
+	}
+	if got.Reconciliation.ChronicCount != 1 {
+		t.Errorf("persisted verdict ChronicCount = %d, want 1", got.Reconciliation.ChronicCount)
+	}
+}
+
+// R3: reconcile is a pure read at the triage seam — it adds NO Sentry call beyond
+// Spec 2's single fetch.
+func TestReconcile_AddsNoSentryCall(t *testing.T) {
+	fk := &fakeSentry{
+		issues: []sentry.Issue{mkIssue(t, `{"id":"NEW1","level":"error","userCount":3,"count":"40",
+			"firstSeen":"2026-06-26T11:55:00Z","lastSeen":"2026-06-26T12:06:00Z","metadata":{"type":"KeyError"}}`)},
+		events: map[string]sentry.IssueEvent{},
+	}
+	got := FetchSentry(context.Background(), fk, sentryParams(true),
+		alertsWithLabels(map[string]string{"service": "checkout"}),
+		scopeFirst, scopeLast, "inc1", slog.Default())
+	callsAfterFetch := fk.listCalls
+	reconcile(got)
+	if fk.listCalls != callsAfterFetch {
+		t.Errorf("reconcile must make no Sentry call; listCalls went %d → %d", callsAfterFetch, fk.listCalls)
+	}
+	if got.Reconciliation == nil || got.Reconciliation.Tag != tagMatched {
+		t.Fatalf("want matched verdict, got %#v", got.Reconciliation)
 	}
 }
 

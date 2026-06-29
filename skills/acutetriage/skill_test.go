@@ -493,11 +493,153 @@ func TestRunSentryAuditDigestIsCountsOnly(t *testing.T) {
 	if !strings.Contains(payload, "checkout") || !strings.Contains(payload, "issue_count") {
 		t.Errorf("digest should carry project + issue_count: %s", payload)
 	}
+	// The digest also carries the verdict — a fixed enum tag + an integer count
+	// (KTD6). recentIssue is NEW-in-window, so this look reconciles to matched/1.
+	if !strings.Contains(payload, `"tag":"matched"`) || !strings.Contains(payload, `"corroborating":1`) {
+		t.Errorf("digest should carry the matched verdict (tag + corroborating count): %s", payload)
+	}
 	// The digest must NOT leak exception text, message, culprit, or file:line.
 	for _, leak := range []string{"KeyError", "secret tenant id 42", "app.checkout in pay"} {
 		if strings.Contains(payload, leak) {
 			t.Errorf("audit digest leaked %q: %s", leak, payload)
 		}
+	}
+}
+
+// TestRunPersistsReconciliationVerdict covers AE6: a NEW-in-window error makes the
+// look reconcile to `matched`, and the verdict (outcome + tag + corroborating ids)
+// persists in the sentry envelope — riding the exact enrichment_json path the
+// evidence-pack MCP replays verbatim, so no internal/mcp change is needed.
+func TestRunPersistsReconciliationVerdict(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	ids := scopedAlerts(t, st, ctx, inc.ID)
+
+	reader := &fakeSentryReader{
+		issues: []sentry.Issue{recentIssue(t, "issue-777", "KeyError", "app.checkout in pay", "missing tenant_id", 7)},
+		events: map[string]sentry.IssueEvent{},
+	}
+	fllm := &fakeLLM{response: validLLMResponse(ids)}
+	skill := acutetriage.New(acutetriage.Config{MinAlerts: 2, Sentry: reader, SentryParams: sentryEnabledParams()}, st, fllm, nil, nil, nil)
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var enrichmentJSON sql.NullString
+	if err := st.DB().QueryRowContext(ctx, `SELECT enrichment_json FROM incidents WHERE id = ?`, inc.ID).Scan(&enrichmentJSON); err != nil {
+		t.Fatalf("scan enrichment_json: %v", err)
+	}
+	if !enrichmentJSON.Valid {
+		t.Fatal("enrichment_json is NULL; the reconciliation verdict was not persisted")
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(enrichmentJSON.String), &envelope); err != nil {
+		t.Fatalf("envelope not valid JSON: %v", err)
+	}
+	var sec struct {
+		Outcome        string `json:"outcome"`
+		Reconciliation *struct {
+			Tag                   string   `json:"tag"`
+			CorroboratingIssueIDs []string `json:"corroborating_issue_ids"`
+		} `json:"reconciliation"`
+	}
+	if err := json.Unmarshal(envelope["sentry"], &sec); err != nil {
+		t.Fatalf("sentry block not valid JSON: %v", err)
+	}
+	if sec.Outcome != "ok" {
+		t.Errorf("persisted outcome = %q, want ok", sec.Outcome)
+	}
+	if sec.Reconciliation == nil || sec.Reconciliation.Tag != "matched" {
+		t.Fatalf("want matched verdict persisted, got %#v", sec.Reconciliation)
+	}
+	if len(sec.Reconciliation.CorroboratingIssueIDs) != 1 || sec.Reconciliation.CorroboratingIssueIDs[0] != "issue-777" {
+		t.Errorf("want corroborating id [issue-777] persisted, got %v", sec.Reconciliation.CorroboratingIssueIDs)
+	}
+}
+
+// TestRunSentryDegradedAuditDigestSafe guards KTD6's nil-guard: the digest fires on
+// the degraded path too (Reconciliation nil), and must emit safely with empty tag /
+// zero count rather than deref a nil verdict and panic the triage goroutine.
+func TestRunSentryDegradedAuditDigestSafe(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	ids := scopedAlerts(t, st, ctx, inc.ID)
+
+	reader := &fakeSentryReader{err: &sentry.APIError{StatusCode: http.StatusTooManyRequests, Body: "rate limited"}}
+	fllm := &fakeLLM{response: validLLMResponse(ids)}
+	auditor := audit.New(st.DB())
+	skill := acutetriage.New(acutetriage.Config{MinAlerts: 2, Sentry: reader, SentryParams: sentryEnabledParams()}, st, fllm, auditor, nil, nil)
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run must complete on a degraded fetch: %v", err)
+	}
+
+	var payload string
+	if err := st.DB().QueryRowContext(ctx, `SELECT payload_json FROM audit_log WHERE kind = 'incident.sentry_enriched'`).Scan(&payload); err != nil {
+		t.Fatalf("no sentry digest row on the degraded path: %v", err)
+	}
+	if !strings.Contains(payload, `"tag":""`) || !strings.Contains(payload, `"corroborating":0`) {
+		t.Errorf("degraded digest should carry empty tag / zero count (no nil deref), got %s", payload)
+	}
+}
+
+// TestRunPersistsInfraOnlyVerdict covers AE3 end-to-end (the counterpart to
+// TestRunPersistsReconciliationVerdict's matched path): a conclusive zero-match look
+// drives the full Run() → marshalEnrichments → SaveIncidentOutput → DB chain and the
+// audit digest, and the persisted sentry block carries outcome=ok + tag=infra-only
+// with no corroborating ids.
+func TestRunPersistsInfraOnlyVerdict(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	ids := scopedAlerts(t, st, ctx, inc.ID)
+
+	reader := &fakeSentryReader{issues: nil, events: map[string]sentry.IssueEvent{}} // conclusive zero-match look
+	fllm := &fakeLLM{response: validLLMResponse(ids)}
+	auditor := audit.New(st.DB())
+	skill := acutetriage.New(acutetriage.Config{MinAlerts: 2, Sentry: reader, SentryParams: sentryEnabledParams()}, st, fllm, auditor, nil, nil)
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var enrichmentJSON sql.NullString
+	if err := st.DB().QueryRowContext(ctx, `SELECT enrichment_json FROM incidents WHERE id = ?`, inc.ID).Scan(&enrichmentJSON); err != nil {
+		t.Fatalf("scan enrichment_json: %v", err)
+	}
+	if !enrichmentJSON.Valid {
+		t.Fatal("enrichment_json is NULL; the infra-only verdict was not persisted")
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(enrichmentJSON.String), &envelope); err != nil {
+		t.Fatalf("envelope not valid JSON: %v", err)
+	}
+	var sec struct {
+		Outcome        string `json:"outcome"`
+		Reconciliation *struct {
+			Tag                   string   `json:"tag"`
+			CorroboratingIssueIDs []string `json:"corroborating_issue_ids"`
+		} `json:"reconciliation"`
+	}
+	if err := json.Unmarshal(envelope["sentry"], &sec); err != nil {
+		t.Fatalf("sentry block not valid JSON: %v", err)
+	}
+	if sec.Outcome != "ok" {
+		t.Errorf("persisted outcome = %q, want ok on a conclusive zero-match look", sec.Outcome)
+	}
+	if sec.Reconciliation == nil || sec.Reconciliation.Tag != "infra-only" {
+		t.Fatalf("want infra-only verdict persisted, got %#v", sec.Reconciliation)
+	}
+	if len(sec.Reconciliation.CorroboratingIssueIDs) != 0 {
+		t.Errorf("infra-only verdict must carry no corroborating ids, got %v", sec.Reconciliation.CorroboratingIssueIDs)
+	}
+
+	var payload string
+	if err := st.DB().QueryRowContext(ctx, `SELECT payload_json FROM audit_log WHERE kind = 'incident.sentry_enriched'`).Scan(&payload); err != nil {
+		t.Fatalf("no sentry digest row: %v", err)
+	}
+	if !strings.Contains(payload, `"tag":"infra-only"`) || !strings.Contains(payload, `"corroborating":0`) {
+		t.Errorf("audit digest should carry the infra-only tag / zero count, got %s", payload)
 	}
 }
 
