@@ -287,15 +287,22 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 		})
 	}
 
-	// Sentry digest (when the Error source was attempted): scope + issue count
-	// only, never exception text, culprit, message, or file:line — keeps the
-	// hash-chained payload small and PII-free (R16).
+	// Sentry digest (when the Error source was attempted): scope + issue count +
+	// the reconciliation verdict (a fixed enum tag and an integer count) only —
+	// never exception text, culprit, message, or file:line — keeps the hash-chained
+	// payload small and PII-free (R16/KTD6). The digest fires for EVERY non-nil
+	// enrichment, including the degraded / unknown-project paths where the verdict
+	// is nil, so tag/count are read only when Reconciliation is present (a naive
+	// deref would panic the triage goroutine on a routine rate-limit or 404).
 	if s.auditor != nil && sentry != nil {
+		tag, corroborating := reconciliationDigestFields(sentry)
 		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.sentry_enriched", map[string]any{
-			"incident_id": inc.ID,
-			"project":     sentry.Project,
-			"environment": sentry.Environment,
-			"issue_count": len(sentry.Issues),
+			"incident_id":   inc.ID,
+			"project":       sentry.Project,
+			"environment":   sentry.Environment,
+			"issue_count":   len(sentry.Issues),
+			"tag":           tag,
+			"corroborating": corroborating,
 		})
 	}
 
@@ -341,6 +348,10 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 	changes := FetchChanges(ctx, s.st, s.cfg.ChangeParams, alerts, inc.FirstAlertAt, time.Now().UTC(), inc.ID, s.logger)
 	// Sentry Error source: a bounded 1+K query-at-triage, best-effort, never blocks.
 	sentry := FetchSentry(ctx, s.cfg.Sentry, s.cfg.SentryParams, alerts, inc.FirstAlertAt, time.Now().UTC(), inc.ID, s.logger)
+	// Zero-LLM cross-source verdict, computed downstream of the rule engine at the
+	// triage seam (KTD5/R3): sets sentry.Reconciliation in place on a conclusive
+	// look, inert (no-op) when sentry is nil or the query was inconclusive.
+	reconcile(sentry)
 	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment, changes, sentry)
 	comp, err := s.llm.Complete(ctx, s.systemPrompt(decision, len(alerts)), userPrompt, RequiredKeys)
 	if err != nil {
