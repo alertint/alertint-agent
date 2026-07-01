@@ -91,7 +91,7 @@ retention has rotated the source lines.
 
 ```yaml
 logs:
-  enabled: true
+  # enabled: false            # optional force-off; omitted = ON when loki.base_url is set
   provider: loki
   timeout_seconds: 10         # TOTAL budget for the whole fetch (filtered + fallback)
   default_range_minutes: 15   # look-back window before the first alert
@@ -108,7 +108,7 @@ logs:
 
 | Field | Description |
 |---|---|
-| `enabled` | Set to `true` to activate the Loki connector. |
+| `enabled` | Optional. Omitted = on when `loki.base_url` is set (presence-based); `false` forces off. |
 | `provider` | Only `loki` in v1. |
 | `timeout_seconds` | Total budget for the whole fetch (both passes share it). Default `10`. |
 | `default_range_minutes` | Look-back window before the first alert. Default `15`. |

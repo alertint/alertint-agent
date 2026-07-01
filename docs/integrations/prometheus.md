@@ -67,16 +67,19 @@ precedence over text annotations.
 
 ```yaml
 prometheus:
-  enabled: true
-  base_url: http://localhost:9090
+  base_url: http://localhost:9090            # setting this turns the connector ON
+  # enabled: false                           # uncomment to force OFF despite base_url
   bearer_token_env: PROMETHEUS_BEARER_TOKEN  # optional
   timeout_seconds: 10                        # default
   default_range_minutes: 60                  # default
 ```
 
+Enablement is presence-based: setting `base_url` turns the connector on
+automatically; an explicit `enabled: false` forces it off.
+
 | Field | Description |
 |---|---|
-| `enabled` | Set to `true` to activate the Prometheus connector. |
+| `enabled` | Optional. Omitted = on when `base_url` is set; `false` forces off. |
 | `base_url` | Base URL of your Prometheus instance, e.g. `http://localhost:9090`. |
 | `bearer_token_env` | Optional. Name of the env var holding the Prometheus bearer token. |
 | `timeout_seconds` | HTTP timeout for Prometheus queries. Default: `10`. |

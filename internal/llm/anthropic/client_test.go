@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -101,6 +102,42 @@ func TestSuccess(t *testing.T) {
 	}
 	if comp.Latency < 0 {
 		t.Errorf("Latency should be non-negative, got %v", comp.Latency)
+	}
+}
+
+// TestDefaultModelAndThinkingDisabled verifies (1) an empty Config.Model
+// resolves to DefaultModel on the wire, and (2) every request explicitly
+// disables extended thinking — on models that default thinking ON when the
+// field is omitted (claude-sonnet-5+), thinking output would count against
+// max_tokens and truncate the required-keys JSON reply.
+func TestDefaultModelAndThinkingDisabled(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, responseBody(`{"analysis_name":"t"}`, 1, 1))
+	}))
+	defer srv.Close()
+
+	c := llm.NewWithHTTPClient(llm.Config{APIKey: "k"}, nil, nil, srv.URL)
+	if _, err := c.Complete(context.Background(), "sys", "user", []string{"analysis_name"}); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if body["model"] != llm.DefaultModel {
+		t.Errorf("model on the wire = %v, want DefaultModel %q", body["model"], llm.DefaultModel)
+	}
+	thinking, ok := body["thinking"].(map[string]any)
+	if !ok || thinking["type"] != "disabled" {
+		t.Errorf("thinking on the wire = %v, want {type: disabled}", body["thinking"])
+	}
+}
+
+// TestDefaultModelIsCurrentSonnet pins the default triage model: Sonnet for
+// first-finding quality, with Haiku as the documented config opt-in.
+func TestDefaultModelIsCurrentSonnet(t *testing.T) {
+	if llm.DefaultModel != "claude-sonnet-5" {
+		t.Errorf("DefaultModel = %q, want claude-sonnet-5", llm.DefaultModel)
 	}
 }
 

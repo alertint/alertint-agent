@@ -122,7 +122,7 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 	// Check minimum alert threshold.
 	minAlerts := s.cfg.MinAlerts
 	if minAlerts <= 0 {
-		minAlerts = 2 // Default: require at least 2 alerts
+		minAlerts = 1 // Default: a lone first alert still produces a finding
 	}
 	if len(alerts) < minAlerts {
 		s.logger.Info("triage skipped",
@@ -164,7 +164,7 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 	// 5. Produce the analysis: from the matched rule (short-circuit) or
 	// from the LLM with the pack-selected system prompt. enrichment is the
 	// log snapshot the LLM saw (nil on the short-circuit path).
-	raw, enrichment, changes, sentry, err := s.analysis(ctx, inc, alerts, decision, pack, packJSON)
+	raw, metrics, enrichment, changes, sentry, err := s.analysis(ctx, inc, alerts, decision, pack, packJSON)
 	if err != nil {
 		return err
 	}
@@ -175,6 +175,7 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 		return fmt.Errorf("acutetriage: parse llm response: %w", err)
 	}
 	clampConfidence(&resp.Confidence)
+	s.applyEvidenceCap(&resp, decision, metrics, enrichment, changes, sentry, inc.ID)
 
 	// 6. Persist output, including the log-enrichment snapshot so the evidence
 	// pack can replay exactly what the model saw (empty on the short-circuit /
@@ -323,13 +324,14 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 // analysis produces the raw finding JSON, either synthesized from a
 // matched known-issue rule (short-circuit, no LLM call) or from the LLM
 // with the pack-selected system prompt. On the LLM path it also returns the
-// log-enrichment snapshot (nil on the short-circuit path) so the caller can
-// persist exactly what the model saw.
-func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store.Alert, decision rules.Decision, pack EvidencePack, packJSON []byte) (json.RawMessage, *LogEnrichment, *ChangeEnrichment, *SentryEnrichment, error) {
+// metric and log-enrichment snapshots (nil on the short-circuit path) so the
+// caller can persist exactly what the model saw and judge the evidence basis
+// for the deterministic confidence cap.
+func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store.Alert, decision rules.Decision, pack EvidencePack, packJSON []byte) (json.RawMessage, []MetricSnapshot, *LogEnrichment, *ChangeEnrichment, *SentryEnrichment, error) {
 	if decision.ShortCircuit {
 		raw, err := shortCircuitResponse(decision, alerts)
 		if err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("acutetriage: short-circuit response: %w", err)
+			return nil, nil, nil, nil, nil, fmt.Errorf("acutetriage: short-circuit response: %w", err)
 		}
 		if s.auditor != nil {
 			_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.short_circuited", map[string]any{
@@ -337,7 +339,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 				"rule_id":     decision.Rule.ID,
 			})
 		}
-		return raw, nil, nil, nil, nil
+		return raw, nil, nil, nil, nil, nil
 	}
 
 	metrics := FetchMetrics(ctx, s.cfg.Prometheus, alerts, inc.FirstAlertAt)
@@ -362,7 +364,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 				"error":       err.Error(),
 			})
 		}
-		return nil, enrichment, changes, sentry, fmt.Errorf("acutetriage: llm: %w", err)
+		return nil, metrics, enrichment, changes, sentry, fmt.Errorf("acutetriage: llm: %w", err)
 	}
 	// Action-trail success line, sibling to "llm failed" above: emitted by the
 	// incident-aware caller so it carries the incident ID and the usage the
@@ -374,7 +376,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		"tokens_out", comp.OutputTokens,
 		"incident", inc.ID,
 	)
-	return comp.Raw, enrichment, changes, sentry, nil
+	return comp.Raw, metrics, enrichment, changes, sentry, nil
 }
 
 // systemPrompt picks the analysis prompt: the rule-selected template when
@@ -440,6 +442,25 @@ func marshalEnrichments(sources map[string]any, logger *slog.Logger, incidentID 
 		return ""
 	}
 	return string(b)
+}
+
+// applyEvidenceCap is the deterministic calibration backstop: the prompt-side
+// rule (renderEvidenceBasis) asks the model to keep annotations-only confidence
+// at or below maxMetadataOnlyConfidence; this guarantees it regardless of model
+// compliance. Short-circuit findings are exempt — they carry rule evidence, not
+// model judgment. The persisted output_json keeps the model's original number;
+// the incident row and every notification carry the capped one.
+func (s *Skill) applyEvidenceCap(resp *llmResponse, decision rules.Decision, metrics []MetricSnapshot, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, incidentID string) {
+	if decision.ShortCircuit || hasLiveEvidence(metrics, logs, changes, sentry) ||
+		resp.Confidence <= maxMetadataOnlyConfidence {
+		return
+	}
+	s.logger.Info("confidence capped: annotations-only evidence basis",
+		"incident", incidentID,
+		"model_confidence", resp.Confidence,
+		"capped_to", maxMetadataOnlyConfidence,
+	)
+	resp.Confidence = maxMetadataOnlyConfidence
 }
 
 func clampConfidence(c *float64) {

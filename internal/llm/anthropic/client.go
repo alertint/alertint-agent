@@ -34,8 +34,10 @@ import (
 )
 
 const (
-	// DefaultModel is used when Config.Model is empty.
-	DefaultModel = "claude-haiku-4-5-20251001"
+	// DefaultModel is used when Config.Model is empty. Sonnet is the default
+	// so the first finding is built by the strongest reasoning tier the price
+	// class allows; claude-haiku-4-5 remains a one-line config opt-in for cost.
+	DefaultModel = "claude-sonnet-5"
 
 	// messagesEndpoint is the Anthropic Messages API URL.
 	messagesEndpoint = "https://api.anthropic.com/v1/messages"
@@ -188,10 +190,20 @@ func (c *Client) Complete(
 
 // messagesRequest is the body sent to POST /v1/messages.
 type messagesRequest struct {
-	Model     string    `json:"model"`
-	MaxTokens int       `json:"max_tokens"`
-	System    string    `json:"system"`
-	Messages  []message `json:"messages"`
+	Model     string          `json:"model"`
+	MaxTokens int             `json:"max_tokens"`
+	System    string          `json:"system"`
+	Messages  []message       `json:"messages"`
+	Thinking  *thinkingConfig `json:"thinking,omitempty"`
+}
+
+// thinkingConfig is the extended-thinking selector on the Messages API.
+// Triage is a single-shot JSON extraction, so thinking is always disabled
+// explicitly: on models where an omitted thinking field means "adaptive
+// thinking on" (claude-sonnet-5 and newer), thinking output would count
+// against MaxTokens and truncate the required-keys JSON reply.
+type thinkingConfig struct {
+	Type string `json:"type"`
 }
 
 type message struct {
@@ -257,6 +269,7 @@ func (c *Client) doRequest(ctx context.Context, system, user string) (json.RawMe
 		MaxTokens: c.cfg.MaxTokens,
 		System:    system,
 		Messages:  []message{{Role: "user", Content: user}},
+		Thinking:  &thinkingConfig{Type: "disabled"},
 	}
 	encoded, err := json.Marshal(body)
 	if err != nil {

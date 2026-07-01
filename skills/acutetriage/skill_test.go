@@ -163,12 +163,66 @@ func TestRunPersistsOutput(t *testing.T) {
 	if summary != "DiskFull on web1" {
 		t.Errorf("summary = %q, want DiskFull on web1", summary)
 	}
-	if confidence != 0.85 {
-		t.Errorf("confidence = %v, want 0.85", confidence)
+	// The fake LLM claims 0.85, but this fixture carries no live evidence
+	// (no metrics/logs/changes/sentry), so the deterministic metadata-only
+	// cap lowers the persisted confidence to 0.6.
+	if confidence != 0.6 {
+		t.Errorf("confidence = %v, want 0.6 (metadata-only cap)", confidence)
 	}
 	var raw map[string]any
 	if err := json.Unmarshal([]byte(outputJSON), &raw); err != nil {
 		t.Errorf("output_json not valid JSON: %v", err)
+	}
+}
+
+// TestRunNoCapWithLiveEvidence verifies the metadata-only confidence cap does
+// NOT fire when any live evidence reached the prompt (here: a Sentry issue) —
+// the model's own confidence passes through.
+func TestRunNoCapWithLiveEvidence(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	ids := scopedAlerts(t, st, ctx, inc.ID)
+
+	reader := &fakeSentryReader{
+		issues: []sentry.Issue{recentIssue(t, "101", "ValueError", "app.checkout in refund", "missing tenant_id", 3)},
+		events: map[string]sentry.IssueEvent{},
+	}
+	fllm := &fakeLLM{response: validLLMResponse(ids)}
+	skill := acutetriage.New(acutetriage.Config{MinAlerts: 2, Sentry: reader, SentryParams: sentryEnabledParams()}, st, fllm, nil, nil, nil)
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var confidence float64
+	if err := st.DB().QueryRowContext(ctx, `SELECT confidence FROM incidents WHERE id = ?`, inc.ID).Scan(&confidence); err != nil {
+		t.Fatalf("scan confidence: %v", err)
+	}
+	if confidence != 0.85 {
+		t.Errorf("confidence = %v, want 0.85 (no cap with live evidence)", confidence)
+	}
+}
+
+// TestRunSingleAlertAnalyzedByDefault verifies the min_alerts fallback is 1:
+// with MinAlerts unset (zero), a lone first alert still produces a finding.
+func TestRunSingleAlertAnalyzedByDefault(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	a1 := insertTestAlert(t, st, ctx, inc.ID, "fp-solo", map[string]string{"alertname": "DiskFull", "host": "web1"})
+
+	fllm := &fakeLLM{response: validLLMResponse([]string{a1.ID})}
+	skill := acutetriage.New(acutetriage.Config{}, st, fllm, nil, nil, nil)
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var status string
+	if err := st.DB().QueryRowContext(ctx, `SELECT status FROM incidents WHERE id = ?`, inc.ID).Scan(&status); err != nil {
+		t.Fatalf("scan status: %v", err)
+	}
+	if status != "analyzed" {
+		t.Errorf("status = %q, want analyzed (single alert must triage by default)", status)
 	}
 }
 

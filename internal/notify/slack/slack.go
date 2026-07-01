@@ -36,10 +36,11 @@ type SlackClient interface {
 
 // Notifier posts and updates Slack messages via the Bot Token API.
 type Notifier struct {
-	client  SlackClient
-	channel string
-	store   ThreadStore
-	auditor *audit.Auditor
+	client      SlackClient
+	channel     string
+	store       ThreadStore
+	auditor     *audit.Auditor
+	minSeverity string // findings below this severity are not posted ("" = low = post everything)
 }
 
 // Probe verifies the bot token against the Slack auth.test API. Used by
@@ -50,20 +51,22 @@ func Probe(ctx context.Context, botToken string) error {
 	return err
 }
 
-// New constructs a Slack Notifier using a bot token (xoxb-...).
-func New(botToken, channel string, store ThreadStore, auditor *audit.Auditor) *Notifier {
+// New constructs a Slack Notifier using a bot token (xoxb-...). minSeverity
+// is the channel noise gate (low | medium | high; "" means low).
+func New(botToken, channel, minSeverity string, store ThreadStore, auditor *audit.Auditor) *Notifier {
 	return &Notifier{
-		client:  slacklib.New(botToken),
-		channel: channel,
-		store:   store,
-		auditor: auditor,
+		client:      slacklib.New(botToken),
+		channel:     channel,
+		store:       store,
+		auditor:     auditor,
+		minSeverity: minSeverity,
 	}
 }
 
 // NewWithClient constructs a Notifier with a custom SlackClient, enabling
 // injection of a mock in tests.
-func NewWithClient(client SlackClient, channel string, store ThreadStore, auditor *audit.Auditor) *Notifier {
-	return &Notifier{client: client, channel: channel, store: store, auditor: auditor}
+func NewWithClient(client SlackClient, channel, minSeverity string, store ThreadStore, auditor *audit.Auditor) *Notifier {
+	return &Notifier{client: client, channel: channel, minSeverity: minSeverity, store: store, auditor: auditor}
 }
 
 // Name returns the stable sink label used in the notify outcome line. The
@@ -80,6 +83,13 @@ func (n *Notifier) Notify(ctx context.Context, f notify.Finding) error {
 }
 
 func (n *Notifier) notifyFiring(ctx context.Context, f notify.Finding) error {
+	// Severity gate: below-threshold findings never reach the channel (stdout
+	// still emits them). Skipping records an audit row so the suppression is
+	// visible in the hash-chained trail, not silent.
+	if n.belowMinSeverity(f) {
+		n.auditSkipped(ctx, f)
+		return nil
+	}
 	// Post brief main-channel message: headline + root cause only.
 	ch, ts, err := n.client.PostMessageContext(ctx, n.channel,
 		slacklib.MsgOptionText(firingFallback(f), false),
@@ -109,7 +119,14 @@ func (n *Notifier) notifyResolved(ctx context.Context, f notify.Finding) error {
 			return n.updateAndThread(ctx, f, ts, ch)
 		}
 	}
-	// Fallback: no prior thread recorded — post a fresh resolved message.
+	// No prior thread recorded. When the firing post was suppressed by the
+	// severity gate, suppress the resolution too — otherwise a fresh resolved
+	// card would leak the gated incident into the channel after all.
+	if n.belowMinSeverity(f) {
+		n.auditSkipped(ctx, f)
+		return nil
+	}
+	// Fallback: post a fresh resolved message.
 	_, _, err := n.client.PostMessageContext(ctx, n.channel,
 		slacklib.MsgOptionText(resolvedFallback(f), false),
 		slacklib.MsgOptionBlocks(resolvedMainBlocks(f)...),
@@ -147,6 +164,48 @@ func (n *Notifier) updateAndThread(ctx context.Context, f notify.Finding, origin
 
 	n.audit(ctx, f.IncidentID, "resolved")
 	return nil
+}
+
+// belowMinSeverity reports whether the finding's severity ranks below the
+// configured gate. A finding whose severity isn't on the ladder (empty or
+// unexpected model output) always posts: the gate exists to drop known-low
+// noise, never to hide the unclassifiable.
+func (n *Notifier) belowMinSeverity(f notify.Finding) bool {
+	sev := severityRank(f.Severity)
+	if sev == 0 {
+		return false
+	}
+	return sev < severityRank(n.minSeverity)
+}
+
+// severityRank orders the severity ladder for the min_severity gate:
+// low=1, medium=2, high=3; anything else (including empty) is 0. Callers
+// interpret 0 per side: an off-ladder finding severity always posts, and an
+// empty gate value means low (config validation rejects other gate values).
+func severityRank(s string) int {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "low":
+		return 1
+	case "medium":
+		return 2
+	case "high":
+		return 3
+	default:
+		return 0
+	}
+}
+
+// auditSkipped records a severity-gate suppression in the audit trail.
+func (n *Notifier) auditSkipped(ctx context.Context, f notify.Finding) {
+	if n.auditor == nil {
+		return
+	}
+	_ = n.auditor.Append(ctx, "notify.slack", "notify.skipped", map[string]any{
+		"incident_id":  f.IncidentID,
+		"severity":     f.Severity,
+		"min_severity": n.minSeverity,
+		"recipient":    "slack",
+	})
 }
 
 func (n *Notifier) audit(ctx context.Context, incidentID, event string) {
@@ -188,6 +247,17 @@ func firingMainBlocks(f notify.Finding) []slacklib.Block {
 				f.FirstAlertAt.UTC().Format("15:04")),
 			false, false),
 	))
+	// The MCP handoff is the differentiator, so it rides the headline card as
+	// a one-paste action (full incident ID — the downstream alertint_get_incident
+	// call must resolve unambiguously). The thread keeps the raw tool hint.
+	// Resolved cards drop this block: the handoff is for active incidents.
+	if f.IncidentID != "" {
+		blocks = append(blocks, slacklib.NewContextBlock("",
+			slacklib.NewTextBlockObject(slacklib.MarkdownType,
+				fmt.Sprintf(":robot_face: *Investigate in your AI agent* — paste: `investigate incident %s using alertint`", f.IncidentID),
+				false, false),
+		))
+	}
 	return blocks
 }
 

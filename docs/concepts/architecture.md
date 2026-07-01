@@ -60,7 +60,7 @@ model returns a structured finding: probable cause, severity assessment,
 confidence, and suggested next checks. The finding is stored locally
 alongside the incident.
 
-- **Model:** Anthropic Claude (`claude-haiku-4-5-20251001` by default)
+- **Model:** Anthropic Claude (`claude-sonnet-5` by default; `claude-haiku-4-5` as the lower-cost option)
 - **Auth:** `ANTHROPIC_API_KEY` env var
 - **Output:** structured finding, persisted in local state
 

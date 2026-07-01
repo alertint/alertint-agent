@@ -53,7 +53,7 @@ and feed the ones overlapping an incident's labels into triage. Dual-role:
 |---|---|---|---|
 | `ingress.enabled` | bool | `false` | Mount `POST /webhook/change` on `receivers.address` |
 | `ingress.webhook_token_env` | string | — | **Required when `ingress.enabled`.** Env var name holding the change webhook bearer token |
-| `enrichment.enabled` | bool | `false` | Attach recent changes to triage and register the MCP tool |
+| `enrichment.enabled` | bool | auto | Attach recent changes to triage and register the MCP tool. Omitted = **on automatically** when a change source exists (`ingress.enabled` or the Sentry releases poller); set `false` to force off. |
 | `enrichment.window_minutes` | int | `120` | Look-back before the first alert when correlating changes (must be `> 0`) |
 | `enrichment.max_events` | int | `10` | Cap on ranked changes attached to a prompt (must be `> 0`) |
 | `retention_days` | int | `30` | Prune changes older than this; required `> 0` when changes are enabled |
@@ -70,20 +70,22 @@ and feed the ones overlapping an incident's labels into triage. Dual-role:
 |---|---|---|---|
 | `provider` | string | `anthropic` | Only `anthropic` is supported today |
 | `api_key_env` | string | — | **Required.** Env var name holding the Anthropic API key |
-| `model` | string | `claude-haiku-4-5-20251001` | Anthropic model ID used for incident analysis |
+| `model` | string | `claude-sonnet-5` | Anthropic model ID used for incident analysis |
 
 This is the model that triages your incidents and writes the finding
 summaries, so every dispatched incident consumes Anthropic API tokens.
-The Haiku default keeps per-incident cost low; if you switch to a larger
-model, keep an eye on your spend in the Anthropic console — the agent
-does not yet meter or cap usage (budget tracking is planned).
+The Sonnet default gives the strongest analysis in its price class; set
+`model: claude-haiku-4-5` to cut per-incident cost when volume matters
+more than finding depth. Keep an eye on your spend in the Anthropic
+console — the agent does not yet meter or cap usage (budget tracking is
+planned).
 
 ## `correlator`
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `window_seconds` | int | `90` | Alerts sharing the same group key within this window form one incident |
-| `min_alerts` | int | `2` | Minimum alerts before the incident is dispatched to the skill. Set to `1` for single-alert triage. |
+| `min_alerts` | int | `1` | Minimum alerts before the incident is dispatched to the skill. The default `1` triages a lone alert too — use `notify.slack.min_severity` to control channel noise instead of dropping triage. |
 | `group_labels` | list | `[alertname, cluster, namespace, service]` | Label names used to compute the group key. Two alerts are correlated when all of these labels match. |
 
 `window_seconds` is a tradeoff. A lower value reacts faster, but an
@@ -99,6 +101,7 @@ context for the analysis — at the cost of a slower first finding.
 | `slack.enabled` | bool | `false` | Post a Block Kit message to a Slack channel via the bot-token API (message updated in-place on resolve) |
 | `slack.bot_token_env` | string | — | Required when `slack.enabled: true`. Env var name holding the Slack bot token (`xoxb-…`, requires the `chat:write` scope) |
 | `slack.channel` | string | — | Required when `slack.enabled: true`. Channel name (e.g. `#alerts`) or ID (e.g. `C1234567890`) |
+| `slack.min_severity` | string | `low` | Findings below this severity (`low` \| `medium` \| `high`) are not posted to Slack; stdout always emits. An incident suppressed at firing is also suppressed at resolution. The default posts everything. |
 
 At startup the agent logs one `notifiers ready` line listing the active sinks
 (and the Slack channel) so you can see where findings will go. Every analysis
@@ -134,12 +137,14 @@ configs.
 ## `prometheus`
 
 Optional read connector. When enabled it adds live metric values to LLM
-triage prompts and exposes PromQL tools over MCP. See
+triage prompts and exposes PromQL tools over MCP. Enablement is
+presence-based: setting `base_url` turns the connector on; an explicit
+`enabled: false` forces it off. See
 [Prometheus](../integrations/prometheus.md) for details.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | bool | `false` | Activate the Prometheus connector |
+| `enabled` | bool | auto | Omitted = on when `base_url` is set (presence-based); set `false` to force off |
 | `base_url` | string | — | Prometheus HTTP API base URL, e.g. `http://localhost:9090` |
 | `bearer_token_env` | string | — | Optional env var name holding a bearer token for Prometheus |
 | `timeout_seconds` | int | `10` | Timeout for Prometheus HTTP requests |
@@ -231,7 +236,7 @@ storage:
 llm:
   provider: anthropic
   api_key_env: ANTHROPIC_API_KEY
-  model: claude-haiku-4-5-20251001
+  model: claude-sonnet-5
 
 correlator:
   window_seconds: 90
