@@ -623,19 +623,20 @@ func (s *Store) IncidentMemberStatusCounts(ctx context.Context, ids []string) (m
 	if len(ids) == 0 {
 		return out, nil
 	}
-	placeholders := make([]string, len(ids))
-	args := make([]any, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		args[i] = id
+	// Bind the id set as a single JSON-array parameter and expand it with
+	// json_each. This keeps the SQL string fully static (no per-id placeholder
+	// concatenation) while still filtering by a variable-length id list.
+	idsJSON, err := json.Marshal(ids)
+	if err != nil {
+		return nil, fmt.Errorf("store: marshal incident ids: %w", err)
 	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT ia.incident_id, a.status, COUNT(*)
 		FROM incident_alerts ia
 		JOIN alerts a ON a.id = ia.alert_id
-		WHERE ia.incident_id IN (`+strings.Join(placeholders, ",")+`)
+		WHERE ia.incident_id IN (SELECT value FROM json_each(?))
 		GROUP BY ia.incident_id, a.status
-	`, args...)
+	`, string(idsJSON))
 	if err != nil {
 		return nil, fmt.Errorf("store: incident member status counts: %w", err)
 	}
