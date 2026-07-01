@@ -605,6 +605,64 @@ func (s *Store) GetIncidentAlerts(ctx context.Context, incidentID string) ([]Ale
 	return scanAlertRows(rows)
 }
 
+// MemberStatusCounts holds per-incident member-alert status tallies used to
+// derive a recovery signal (how many members are firing vs resolved).
+type MemberStatusCounts struct {
+	Firing   int
+	Resolved int
+	Total    int
+}
+
+// IncidentMemberStatusCounts returns, for each incident id, the tally of its
+// member alerts by status — the raw material for a recovery signal that tells
+// an active incident from a recovering/recovered one. It runs ONE GROUP BY query
+// for the whole id set (no N+1). Incidents with no members are absent from the
+// returned map; an empty id list yields an empty map.
+func (s *Store) IncidentMemberStatusCounts(ctx context.Context, ids []string) (map[string]MemberStatusCounts, error) {
+	out := make(map[string]MemberStatusCounts, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	// Bind the id set as a single JSON-array parameter and expand it with
+	// json_each. This keeps the SQL string fully static (no per-id placeholder
+	// concatenation) while still filtering by a variable-length id list.
+	idsJSON, err := json.Marshal(ids)
+	if err != nil {
+		return nil, fmt.Errorf("store: marshal incident ids: %w", err)
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT ia.incident_id, a.status, COUNT(*)
+		FROM incident_alerts ia
+		JOIN alerts a ON a.id = ia.alert_id
+		WHERE ia.incident_id IN (SELECT value FROM json_each(?))
+		GROUP BY ia.incident_id, a.status
+	`, string(idsJSON))
+	if err != nil {
+		return nil, fmt.Errorf("store: incident member status counts: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var id, status string
+		var n int
+		if err := rows.Scan(&id, &status, &n); err != nil {
+			return nil, fmt.Errorf("store: scan status count: %w", err)
+		}
+		c := out[id]
+		switch status {
+		case "firing":
+			c.Firing += n
+		case "resolved":
+			c.Resolved += n
+		}
+		c.Total += n
+		out[id] = c
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: status count rows: %w", err)
+	}
+	return out, nil
+}
+
 // SaveIncidentOutput persists LLM output on a ready/processing incident,
 // denormalizes summary/root_cause/confidence, and sets status="analyzed".
 // enrichmentJSON is the log-enrichment snapshot (§3.7); pass "" when logs are

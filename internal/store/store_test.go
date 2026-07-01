@@ -305,6 +305,56 @@ func TestMarkIncidentResolved_RejectsCollecting(t *testing.T) {
 	}
 }
 
+// TestIncidentMemberStatusCounts covers the batch recovery-signal query: it
+// tallies member alerts by status per incident in one round trip, omits unknown
+// ids, and handles the empty-id case.
+func TestIncidentMemberStatusCounts(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	idA := uuid.NewString() // 2 firing, 1 resolved
+	idB := uuid.NewString() // all resolved
+	for _, id := range []string{idA, idB} {
+		if err := s.InsertIncident(ctx, Incident{ID: id, GroupKey: "g=" + id, FirstAlertAt: now, LastAlertAt: now, ReadyAt: now}); err != nil {
+			t.Fatalf("insert %s: %v", id, err)
+		}
+	}
+	add := func(incID, fp, status string) {
+		a := Alert{ID: uuid.NewString(), Fingerprint: fp, Status: status, Labels: map[string]string{}, Annotations: map[string]string{}, StartsAt: now, ReceivedAt: now}
+		if _, err := s.UpsertAlertByFingerprint(ctx, a); err != nil {
+			t.Fatalf("upsert %s: %v", fp, err)
+		}
+		if err := s.AddAlertToIncident(ctx, incID, a.ID, now); err != nil {
+			t.Fatalf("add %s: %v", fp, err)
+		}
+	}
+	add(idA, "a-1", "firing")
+	add(idA, "a-2", "firing")
+	add(idA, "a-3", "resolved")
+	add(idB, "b-1", "resolved")
+	add(idB, "b-2", "resolved")
+
+	counts, err := s.IncidentMemberStatusCounts(ctx, []string{idA, idB})
+	if err != nil {
+		t.Fatalf("counts: %v", err)
+	}
+	if got := counts[idA]; got.Firing != 2 || got.Resolved != 1 || got.Total != 3 {
+		t.Errorf("incident A counts = %+v, want {Firing:2 Resolved:1 Total:3}", got)
+	}
+	if got := counts[idB]; got.Firing != 0 || got.Resolved != 2 || got.Total != 2 {
+		t.Errorf("incident B counts = %+v, want {Firing:0 Resolved:2 Total:2}", got)
+	}
+	if _, ok := counts["nonexistent"]; ok {
+		t.Error("unknown id must be absent from counts map")
+	}
+
+	empty, err := s.IncidentMemberStatusCounts(ctx, nil)
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("empty ids: got %v, %v; want empty map, nil", empty, err)
+	}
+}
+
 func TestLoadMigrations_DiscoversInitMigration(t *testing.T) {
 	ms, err := loadMigrations()
 	if err != nil {

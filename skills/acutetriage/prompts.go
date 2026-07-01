@@ -145,8 +145,48 @@ func UserPrompt(pack EvidencePack, packJSON string, metrics []MetricSnapshot, lo
 	renderLogs(&b, logs)
 	renderChanges(&b, changes)
 	renderSentry(&b, sentry)
+	renderEvidenceBasis(&b, metrics, logs, changes, sentry)
 	b.WriteString("\n\nRespond with JSON only.")
 	return b.String()
+}
+
+// renderEvidenceBasis appends a calibration directive when NO live evidence
+// (log lines, metric values, changes, or Sentry issues) was retrieved for the
+// incident — i.e. the analysis rests on alert labels/annotations alone. It
+// counters BUG-2: an authoritative-but-unverified finding (a confident, wrong
+// causal direction) anchors the downstream AI agent on the wrong fix, so an
+// annotations-only analysis must hedge and lower confidence. When any live
+// evidence is present the per-section guidance already governs and this is silent.
+// A section that was attempted but empty (a note, zero lines) is NOT live
+// evidence — the note alone does not lift the annotations-only basis.
+func renderEvidenceBasis(b *strings.Builder, metrics []MetricSnapshot, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment) {
+	if hasLiveEvidence(metrics, logs, changes, sentry) {
+		return
+	}
+	b.WriteString("\n\nEvidence basis: ANNOTATIONS ONLY — no live logs, metrics, " +
+		"deploy/config changes, or Sentry errors were retrieved for this incident, so " +
+		"every conclusion below rests on alert labels and annotations alone. Treat any " +
+		"root-cause or causal-direction claim (which alert is primary vs downstream) as an " +
+		"unverified hypothesis: prefer the \"correlated\" role over confident \"primary\"/" +
+		"\"downstream\" assignments unless the ordering is self-evident from the annotations, " +
+		"and keep confidence at or below 0.6.")
+}
+
+// hasLiveEvidence reports whether any enrichment source returned actual data
+// (not just an attempted-but-empty note) for the incident.
+func hasLiveEvidence(metrics []MetricSnapshot, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment) bool {
+	switch {
+	case len(metrics) > 0:
+		return true
+	case logs != nil && len(logs.Lines) > 0:
+		return true
+	case changes != nil && len(changes.Changes) > 0:
+		return true
+	case sentry != nil && len(sentry.Issues) > 0:
+		return true
+	default:
+		return false
+	}
 }
 
 // renderSentry appends the "Sentry issues" Error-source section. With issues

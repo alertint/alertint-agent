@@ -92,9 +92,12 @@ func TestNormalize_PreservesOrder(t *testing.T) {
 }
 
 func TestSelectorRoundTrip(t *testing.T) {
-	sel := Selector{Labels: map[string]string{"namespace": "prod", "service": "api"}}
-	if sel.Labels["namespace"] != "prod" || sel.Labels["service"] != "api" {
-		t.Fatal("selector did not carry labels")
+	sel := Selector{Labels: map[string][]string{"namespace": {"prod"}, "service": {"api", "db-proxy"}}}
+	if len(sel.Labels["namespace"]) != 1 || sel.Labels["namespace"][0] != "prod" {
+		t.Fatal("selector did not carry single-value label")
+	}
+	if len(sel.Labels["service"]) != 2 {
+		t.Fatal("selector did not carry multi-value label")
 	}
 }
 

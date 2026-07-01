@@ -20,6 +20,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -155,11 +156,14 @@ func (c *Client) queryRangeLines(ctx context.Context, query string, start, end t
 
 // buildMatcher translates the generic selector into a LogQL stream matcher.
 // It applies label_map (rename, or drop on ""), AND-combines the survivors, and
-// renders {k="v",…} with keys sorted for a deterministic query string. Returns
-// "" when no label survives translation.
+// renders {k="v",…} with keys sorted for a deterministic query string. A key
+// carrying several values (a correlated multi-service incident) renders as an
+// anchored regex alternation k=~"v1|v2"; when two source keys map to the same
+// stream key their value sets are merged. Returns "" when no label survives
+// translation.
 func (c *Client) buildMatcher(sel logs.Selector) string {
-	translated := make(map[string]string, len(sel.Labels))
-	for k, v := range sel.Labels {
+	translated := make(map[string][]string, len(sel.Labels))
+	for k, vs := range sel.Labels {
 		nk := k
 		if c.labelMap != nil {
 			if mapped, ok := c.labelMap[k]; ok {
@@ -169,12 +173,7 @@ func (c *Client) buildMatcher(sel logs.Selector) string {
 				nk = mapped
 			}
 		}
-		if _, exists := translated[nk]; !exists {
-			translated[nk] = v
-		}
-	}
-	if len(translated) == 0 {
-		return ""
+		translated[nk] = append(translated[nk], vs...)
 	}
 	keys := make([]string, 0, len(translated))
 	for k := range translated {
@@ -183,9 +182,54 @@ func (c *Client) buildMatcher(sel logs.Selector) string {
 	sort.Strings(keys)
 	parts := make([]string, 0, len(keys))
 	for _, k := range keys {
-		parts = append(parts, fmt.Sprintf("%s=%q", k, translated[k]))
+		if term := matcherTerm(k, translated[k]); term != "" {
+			parts = append(parts, term)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
 	}
 	return "{" + strings.Join(parts, ",") + "}"
+}
+
+// matcherTerm renders one LogQL label matcher for key k over its value set: an
+// exact matcher k="v" for a single value, or an anchored regex alternation
+// k=~"v1|v2" for several. Values are regexp-escaped (so a value's own regex
+// metacharacters stay literal) and deduped+sorted for a deterministic query.
+// Loki anchors =~ matchers as ^(?:…)$, so the alternation matches each value
+// exactly. Returns "" when no non-empty value survives.
+func matcherTerm(k string, values []string) string {
+	uniq := dedupeSorted(values)
+	switch len(uniq) {
+	case 0:
+		return ""
+	case 1:
+		return fmt.Sprintf("%s=%q", k, uniq[0])
+	default:
+		escaped := make([]string, len(uniq))
+		for i, v := range uniq {
+			escaped[i] = regexp.QuoteMeta(v)
+		}
+		return fmt.Sprintf("%s=~%q", k, strings.Join(escaped, "|"))
+	}
+}
+
+// dedupeSorted returns the distinct non-empty values of in, sorted.
+func dedupeSorted(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // apiGet issues a GET to path?params, sets auth and tenancy headers, unwraps the

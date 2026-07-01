@@ -78,8 +78,9 @@ func TestFetchLogs_SelectorIsAllowlistIntersection(t *testing.T) {
 	FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 10, MaxLines: 50}, alertsWith(labels), time.Now(), time.Now(), "inc-test", logger)
 
 	for _, k := range logs.AllowedSelectorKeys {
-		if src.gotSel.Labels[k] != labels[k] {
-			t.Errorf("selector missing allowlisted key %q", k)
+		got := src.gotSel.Labels[k]
+		if len(got) != 1 || got[0] != labels[k] {
+			t.Errorf("selector allowlisted key %q = %v, want [%q]", k, got, labels[k])
 		}
 	}
 	for _, noise := range []string{"alertname", "severity", "prometheus"} {
@@ -90,6 +91,80 @@ func TestFetchLogs_SelectorIsAllowlistIntersection(t *testing.T) {
 	if len(src.gotSel.Labels) != 6 {
 		t.Errorf("selector has %d keys, want 6 (no cap, all allowlist keys present)", len(src.gotSel.Labels))
 	}
+}
+
+// TestFetchLogs_MultiServiceIncidentBuildsSelector is the BUG-1 regression: a
+// correlated multi-service incident whose members share the KEYS service/instance
+// but with different VALUES must still build a usable selector and fetch lines.
+// The old shared-label intersection dropped every discriminating key, produced an
+// empty selector, and never hit the backend — exactly on the incidents AlertINT
+// exists to correlate.
+func TestFetchLogs_MultiServiceIncidentBuildsSelector(t *testing.T) {
+	src := &fakeSource{name: "loki", fetched: logs.Fetched{
+		Lines: []logs.Line{{Timestamp: time.Unix(1, 0), Line: "boom"}}, Query: "{...}"}}
+	alerts := []store.Alert{
+		{ID: "a1", Labels: map[string]string{"cluster": "prod", "service": "api", "instance": "api-1"}},
+		{ID: "a2", Labels: map[string]string{"cluster": "prod", "service": "api", "instance": "api-2"}},
+		{ID: "a3", Labels: map[string]string{"cluster": "prod", "service": "db-proxy", "instance": "db-proxy-1"}},
+	}
+	e := FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 10, MaxLines: 50},
+		alerts, time.Now(), time.Now(), "inc-multi", nil)
+	if src.calls != 1 {
+		t.Fatalf("correlated multi-service incident must build a usable log selector and hit the backend; calls=%d (empty-selector regression, BUG-1)", src.calls)
+	}
+	if e == nil || len(e.Lines) == 0 {
+		t.Fatalf("want log lines for multi-service incident, got %+v", e)
+	}
+	// Each allowlisted key present on all members carries the UNION of its values
+	// (sorted), not a single one — that is what lets the matcher span every stream.
+	if got := src.gotSel.Labels["service"]; !sliceEq(got, []string{"api", "db-proxy"}) {
+		t.Errorf("service selector = %v, want union [api db-proxy]", got)
+	}
+	if got := src.gotSel.Labels["instance"]; !sliceEq(got, []string{"api-1", "api-2", "db-proxy-1"}) {
+		t.Errorf("instance selector = %v, want union of all three instances", got)
+	}
+	// A shared-but-non-allowlisted key (cluster) must not leak into the selector.
+	if _, ok := src.gotSel.Labels["cluster"]; ok {
+		t.Errorf("non-allowlisted key cluster leaked into selector: %v", src.gotSel.Labels)
+	}
+}
+
+// TestFetchLogs_PartialKeyCoverageDropsNonUniversalKey proves the selector never
+// over-constrains: a key present on only SOME members (here instance, missing on
+// the db-proxy member) is dropped, while a key universal to all (service) is kept
+// and unioned. AND-combining a non-universal key would exclude the members that
+// lack it.
+func TestFetchLogs_PartialKeyCoverageDropsNonUniversalKey(t *testing.T) {
+	src := &fakeSource{name: "loki", fetched: logs.Fetched{
+		Lines: []logs.Line{{Timestamp: time.Unix(1, 0), Line: "boom"}}, Query: "{...}"}}
+	alerts := []store.Alert{
+		{ID: "a1", Labels: map[string]string{"service": "api", "instance": "api-1"}},
+		{ID: "a2", Labels: map[string]string{"service": "db-proxy"}}, // no instance label
+	}
+	e := FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 10, MaxLines: 50},
+		alerts, time.Now(), time.Now(), "inc-partial", nil)
+	if e == nil || len(e.Lines) == 0 {
+		t.Fatalf("want log lines, got %+v", e)
+	}
+	if got := src.gotSel.Labels["service"]; !sliceEq(got, []string{"api", "db-proxy"}) {
+		t.Errorf("service (universal) = %v, want [api db-proxy]", got)
+	}
+	if got, ok := src.gotSel.Labels["instance"]; ok {
+		t.Errorf("instance (not on every member) must be dropped, got %v", got)
+	}
+}
+
+// sliceEq reports whether a and b hold the same elements in the same order.
+func sliceEq(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestFetchLogs_WindowAndLimitAndDeadline(t *testing.T) {

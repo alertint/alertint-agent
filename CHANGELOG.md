@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-01
+
+### Fixed
+
+- **Log enrichment for multi-service incidents** — triage now fetches logs for correlated
+  incidents whose alerts span several services or instances. The log selector previously used
+  only labels shared *identically* by every member alert, so a multi-service cascade (exactly
+  the kind AlertINT correlates) yielded an empty selector and no logs at all. It now unions each
+  member's values for labels present on all of them, e.g. `{service=~"api|db-proxy"}`, and the
+  Loki provider renders multi-value labels as anchored regex alternations.
+- **Confidence calibrated to evidence** — when a finding is produced with no live evidence (no
+  log lines, metrics, deploy/config changes, or Sentry errors), the triage prompt now flags the
+  analysis as annotations-only and instructs the model to treat causal direction as a hypothesis
+  and lower its confidence, so an unverified root cause no longer reads as authoritative.
+- **Incident recovery visible over MCP** — `alertint_get_incident` and `alertint_list_incidents`
+  now include a `recovery` object (firing/resolved member counts, `fully_resolved`, and
+  `resolved_at`) so an investigating agent can tell an active incident from a recovering or
+  recovered one without a second query for member statuses.
+- **Empty query results are self-explaining** — `prometheus_query` and the `<backend>_query_range`
+  log tool now attach a `hint` when a query matched nothing, so an empty result is distinguishable
+  from a misconfigured selector or wrong metric name.
+
 ## [0.5.0] - 2026-07-01
 
 ### Added
@@ -139,7 +161,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single static binary** — pure-Go SQLite (no CGO), no external runtime dependencies.
   Multi-platform builds: `linux/amd64`, `linux/arm64`, `darwin/arm64`.
 
-[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/alertint/alertint-agent/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/alertint/alertint-agent/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/alertint/alertint-agent/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/alertint/alertint-agent/compare/v0.2.0...v0.3.0
