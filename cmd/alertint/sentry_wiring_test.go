@@ -212,6 +212,33 @@ func TestSentryErrorSource_TypedNilSafety(t *testing.T) {
 	}
 }
 
+// TestSentryErrorSource_ResolvedEnvelopeForMCP guards KTD8 at the resolution
+// boundary: the params startMCP threads VERBATIM into the MCP Config must carry the
+// configured non-zero FetchTimeoutSeconds (a lone-scalar wiring would leave the
+// live deadline 0, expiring every live call) and the resolved IncludeMessage.
+func TestSentryErrorSource_ResolvedEnvelopeForMCP(t *testing.T) {
+	client := sentry.NewClient(sentry.Config{BaseURL: "https://x", Org: "acme", Token: "t"})
+
+	cfg := config.Defaults()
+	cfg.Sentry.Issues.Enabled = true // defaults: FetchTimeoutSeconds 15, include_message ON
+	r, p := sentryErrorSource(&cfg, client)
+	if r == nil {
+		t.Fatal("issues-on with a client must inject the reader the live tools share")
+	}
+	if p.FetchTimeoutSeconds == 0 || p.FetchTimeoutSeconds != cfg.Sentry.Issues.FetchTimeoutSeconds {
+		t.Errorf("resolved params must carry the non-zero FetchTimeoutSeconds (KTD8), got %d", p.FetchTimeoutSeconds)
+	}
+	if !p.IncludeMessage {
+		t.Error("include_message default ON must reach the resolved params")
+	}
+
+	off := false
+	cfg.Sentry.Issues.IncludeMessage = &off
+	if _, p := sentryErrorSource(&cfg, client); p.IncludeMessage {
+		t.Error("explicit include_message:false must reach the resolved params the MCP tools read")
+	}
+}
+
 // TestSentryWiring_PollerStartStop exercises the cmd-level poller wiring through
 // a clean start/stop, standing in for the serve lifecycle's graceful shutdown.
 func TestSentryWiring_PollerStartStop(t *testing.T) {

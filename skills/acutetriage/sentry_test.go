@@ -31,11 +31,12 @@ type fakeSentry struct {
 	listCtxHadDeadline bool
 	listedProject      string
 	listedEnv          string
+	listedQuery        string
 }
 
-func (f *fakeSentry) ListIssues(ctx context.Context, project, env string, _, _ time.Time, _ string) ([]sentry.Issue, error) {
+func (f *fakeSentry) ListIssues(ctx context.Context, project, env string, _, _ time.Time, query string) ([]sentry.Issue, error) {
 	f.listCalls++
-	f.listedProject, f.listedEnv = project, env
+	f.listedProject, f.listedEnv, f.listedQuery = project, env, query
 	_, f.listCtxHadDeadline = ctx.Deadline()
 	if f.listErr != nil {
 		return nil, f.listErr

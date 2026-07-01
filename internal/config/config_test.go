@@ -602,8 +602,31 @@ sentry:
 	if cfg.Sentry.Issues.FetchTimeoutSeconds != 15 {
 		t.Errorf("default fetch_timeout_seconds = %d, want 15", cfg.Sentry.Issues.FetchTimeoutSeconds)
 	}
+	if cfg.Sentry.Issues.LiveWindowMinutes != 60 {
+		t.Errorf("default live_window_minutes = %d, want 60", cfg.Sentry.Issues.LiveWindowMinutes)
+	}
 	if !cfg.Sentry.Issues.MessageIncluded() {
 		t.Error("include_message must default ON (R14)")
+	}
+}
+
+func TestLoad_SentryIssuesLiveWindowExplicit(t *testing.T) {
+	yaml := sentryBaseYAML(t) + `
+sentry:
+  base_url: https://sentry.io
+  org: acme
+  token_env: SENTRY_TOKEN
+  issues:
+    enabled: true
+    live_window_minutes: 180
+`
+	path := writeConfig(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Sentry.Issues.LiveWindowMinutes != 180 {
+		t.Errorf("explicit live_window_minutes = %d, want 180", cfg.Sentry.Issues.LiveWindowMinutes)
 	}
 }
 
@@ -685,6 +708,7 @@ func TestValidate_SentryIssuesRejectsNonPositiveTunables(t *testing.T) {
 		{"lookback", func(c *Config) { c.Sentry.Issues.Enabled = true; c.Sentry.Issues.LookbackMinutes = 0 }, "lookback_minutes"},
 		{"max_issues", func(c *Config) { c.Sentry.Issues.Enabled = true; c.Sentry.Issues.MaxIssues = 0 }, "max_issues"},
 		{"fetch_timeout", func(c *Config) { c.Sentry.Issues.Enabled = true; c.Sentry.Issues.FetchTimeoutSeconds = -1 }, "fetch_timeout_seconds"},
+		{"live_window", func(c *Config) { c.Sentry.Issues.Enabled = true; c.Sentry.Issues.LiveWindowMinutes = 0 }, "live_window_minutes"},
 	} {
 		t.Run(tc.name, func(t *testing.T) { assertSentryTunableRejected(t, tc.mutate, tc.want) })
 	}
