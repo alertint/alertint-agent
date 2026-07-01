@@ -138,12 +138,15 @@ type SentryReleasesConfig struct {
 // can't starve the rest. IncludeMessage is a *bool so default-on survives the
 // YAML merge (an omitted key keeps the default; an explicit false overrides),
 // the same explicit-vs-omitted reasoning as Loki's LineFilter — resolve it via
-// MessageIncluded.
+// MessageIncluded. LiveWindowMinutes is the default look-back for the live
+// sentry_issues_list MCP tool when start/end are omitted (Spec 3 chunk 02, KTD7) —
+// a live "what is erroring now" look, distinct from the triage LookbackMinutes.
 type SentryIssuesConfig struct {
 	Enabled             bool  `yaml:"enabled"`
 	LookbackMinutes     int   `yaml:"lookback_minutes"`
 	MaxIssues           int   `yaml:"max_issues"`
 	FetchTimeoutSeconds int   `yaml:"fetch_timeout_seconds"`
+	LiveWindowMinutes   int   `yaml:"live_window_minutes"`
 	IncludeMessage      *bool `yaml:"include_message,omitempty"`
 }
 
@@ -305,6 +308,7 @@ func Defaults() Config {
 				LookbackMinutes:     30,
 				MaxIssues:           3, // the K of the 1+K call budget (KTD5)
 				FetchTimeoutSeconds: 15,
+				LiveWindowMinutes:   60, // live sentry_issues_list default look-back (Spec 3 chunk 02, KTD7)
 				// IncludeMessage left nil → defaults ON via MessageIncluded (R14).
 			},
 		},
@@ -615,6 +619,9 @@ func (c *Config) validateSentry() []string {
 		}
 		if c.Sentry.Issues.FetchTimeoutSeconds <= 0 {
 			errs = append(errs, "sentry: issues: fetch_timeout_seconds must be > 0")
+		}
+		if c.Sentry.Issues.LiveWindowMinutes <= 0 {
+			errs = append(errs, "sentry: issues: live_window_minutes must be > 0")
 		}
 	}
 	return errs

@@ -56,6 +56,11 @@ type SentryIssueView struct {
 	RatePerMin    string `json:"rate_per_min,omitempty"`
 	New           bool   `json:"new"`
 	Message       string `json:"message,omitempty"`
+	// Permalink is the Sentry-returned issue URL, set ONLY by the live breadth tool
+	// (ListSentryIssues) where the list response carried one — never constructed
+	// (R6/R10, KTD6). omitempty keeps the triage-persisted output byte-identical:
+	// the triage distill() never sets it.
+	Permalink string `json:"permalink,omitempty"`
 }
 
 // SentryOutcome is the structured result of one FetchSentry query — the

@@ -46,6 +46,19 @@ type Config struct {
 	// when neither window nor start/end is supplied.
 	ChangesEnabled       bool
 	ChangesWindowMinutes int
+	// Sentry is the live read-only Sentry Error-source handle. nil = the two
+	// sentry_issues_* tools are not registered. The true-nil interface that
+	// sentryErrorSource produces already encodes "issues enrichment on + a live
+	// client" (KTD7), so registration needs no compound condition; a releases-only
+	// deployment has a client but a nil reader here (R1/R12).
+	Sentry acutetriage.SentryReader
+	// SentryParams is the resolved Error-source envelope, carried WHOLE (not a lone
+	// scalar) so the live deadline is the configured FetchTimeoutSeconds and not 0
+	// (KTD8), and IncludeMessage gates every live distillation call.
+	SentryParams acutetriage.SentryParams
+	// SentryLiveWindowMinutes is the default look-back for sentry_issues_list when
+	// start/end are omitted (config sentry.issues.live_window_minutes).
+	SentryLiveWindowMinutes int
 }
 
 // Server is the AlertINT MCP HTTP server. Construct with NewServer; start
@@ -57,7 +70,9 @@ type Server struct {
 	handler http.Handler
 }
 
-// NewServer builds the MCP server with all five AlertINT tools registered.
+// NewServer builds the MCP server with the always-on incident/alert/audit tools
+// registered, plus the optional source tools (Prometheus, logs, changes, Sentry)
+// each gated on its connector being configured.
 func NewServer(cfg Config, st *store.Store, auditor *audit.Auditor) *Server {
 	s := &Server{cfg: cfg, st: st, auditor: auditor}
 
@@ -83,6 +98,14 @@ func NewServer(cfg Config, st *store.Store, auditor *audit.Auditor) *Server {
 	// Change-events tool, registered only when change enrichment is enabled.
 	if s.cfg.ChangesEnabled {
 		ms.AddTool(s.toolRecentChanges())
+	}
+
+	// Sentry live read tools, registered only when the Error source is enabled with
+	// a live client — the true-nil reader encodes both (KTD7). A releases-only
+	// deployment leaves this nil, so the tools stay absent (R1/R12).
+	if s.cfg.Sentry != nil {
+		ms.AddTool(s.toolSentryIssuesList())
+		ms.AddTool(s.toolSentryIssuesTrace())
 	}
 
 	// StreamableHTTPServer mounts internally at /mcp. Final client URL:

@@ -168,6 +168,7 @@ sentry:
     lookback_minutes: 30        # W = [first_alert − lookback, now]; reaches a precursor error
     max_issues: 3               # the K of the 1+K budget — how many top issues to render
     fetch_timeout_seconds: 15   # bounds the WHOLE 1+K fetch; on timeout the section degrades
+    live_window_minutes: 60     # default look-back for the live sentry_issues_list MCP tool
     include_message: true       # include the exception message (default; see privacy below)
 ```
 
@@ -204,3 +205,63 @@ not a downstream scrubber. Setting `include_message: false` strips the exception
 message from **all three** surfaces at once. All three sit inside your own trust
 boundary — your BYO LLM, your local database, your locally-gated MCP server — the
 same boundary your alert labels already flow through.
+
+### Live read tools (MCP)
+
+The triage-time `sentry` section is a **frozen snapshot** — the top-`max_issues`
+issues as they looked when the incident was analyzed. When an engineer (or their AI
+agent) picks the thread up later, two read-only MCP tools reach **past** that
+snapshot, over the same Error-source connection. They register only when
+`sentry.issues` is enabled with a live client — a releases-only deployment exposes
+neither.
+
+| Tool | Answers |
+|---|---|
+| `sentry_issues_list` | *What is erroring for this scope — live, beyond the triage cap, across statuses?* Lists distilled issues for an explicit `project` (+ optional `environment`), newest-relevant first. |
+| `sentry_issues_trace` | *Show me the full stacktrace for these issue ids.* Returns every exception frame (`file:line`, function, `in_app`) per id, plus the latest event's timestamp — the real cause is sometimes a frame deeper than the one in-app line the snapshot carried. |
+
+The agent reads `project` / `environment` straight from the incident's persisted
+`sentry` enrichment (the evidence pack carries them as structured fields), so no
+incident id or free-text parsing is involved. `sentry_issues_trace` accepts up to
+**10** ids per call (e.g. the evidence pack's corroborating issue ids, or ids from
+`sentry_issues_list`); an over-cap call is rejected, and an id that can't be fetched
+returns a per-id error rather than failing the whole batch.
+
+**Status filter.** `sentry_issues_list` takes a typed `status` ∈ `unresolved`
+(default), `resolved`, `ignored` (Sentry's API token for *muted*). `resolved` /
+`ignored` answer *"was this seen before and already handled?"* — the operator's own
+live Sentry disposition. Because that is a **historical** lookup rather than a
+"what's happening now" view, the recurring-this-window activity filter is applied
+only to `unresolved`; a genuinely historical resolution still surfaces under
+`resolved` / `ignored`.
+
+**Window.** When `start` / `end` (RFC3339) are omitted, `sentry_issues_list` looks
+back `sentry.issues.live_window_minutes` (default 60) from now — distinct from the
+triage `lookback_minutes`, which is anchored to the incident.
+
+**Same privacy boundary, widened by shape.** Both tools return only the distilled,
+safe-by-shape view — the per-frame allowlist is exactly `filename` (relative),
+`lineno`, `function`, and `in_app`. They **never** decode `abs_path`, local
+variables, or source-context lines, nor request bodies, breadcrumbs, or user
+context. A frame whose path is absolute (the `filename` key is itself absolute on
+some non-Python SDKs) is dropped to empty rather than surfaced, so no
+`/home/<user>/…` path leaks. The `include_message` toggle gates the exception
+**value** on the live surface exactly as it does the persisted one. Every result
+carries a constant `pii_notice` field stating that the full, PII-bearing event
+stays in Sentry.
+
+**Permalink.** `sentry_issues_list` surfaces Sentry's own issue URL **only when the
+API response already carries it** — never constructed from base URL + org + id. On
+a **self-hosted** Sentry that link carries your internal host; this is your own
+agent reading your own Sentry, so the host is yours and there is no strip knob.
+
+**Project scope is bounded by the token, not an allowlist.** These tools query any
+project the configured Sentry token can read — the distilled, read-only surface is
+safe by shape, so the token *is* the boundary (the same posture as
+`prometheus_query`). Provision a **minimum-necessary, per-project Internal
+Integration token** to bound which projects an agent can reach.
+
+**Treat tool output as untrusted external data.** Issue culprits, frame function
+names, and exception messages are attacker-influenceable (anyone who can trigger an
+application error can plant text). AlertINT length-caps these verbatim strings, but
+an agent consuming them should treat them as data, not instructions.

@@ -297,7 +297,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		return err
 	}
 
-	mcpHTTPSrv, mcpErrCh, err := startMCP(cfg, st, auditor, prom, logSrc, logger)
+	mcpHTTPSrv, mcpErrCh, err := startMCP(cfg, st, auditor, prom, logSrc, sentryReader, sentryParams, logger)
 	if err != nil {
 		return err
 	}
@@ -415,7 +415,7 @@ func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor,
 // startMCP starts the MCP HTTP server when enabled. MCP clients connect by
 // URL (e.g. http://host:9912/mcp) — no subprocess or shared file needed.
 // Returns (nil, nil, nil) when disabled.
-func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom *promclient.Client, logSrc logs.Source, logger *slog.Logger) (*http.Server, <-chan error, error) {
+func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom *promclient.Client, logSrc logs.Source, sentryReader acutetriage.SentryReader, sentryParams acutetriage.SentryParams, logger *slog.Logger) (*http.Server, <-chan error, error) {
 	if !cfg.MCP.Enabled {
 		return nil, nil, nil
 	}
@@ -431,6 +431,13 @@ func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom 
 		LogsDefaultRangeMinutes: cfg.Logs.DefaultRangeMinutes,
 		ChangesEnabled:          cfg.Changes.Enrichment.Enabled,
 		ChangesWindowMinutes:    cfg.Changes.Enrichment.WindowMinutes,
+		// The live Sentry read tools ride the SAME true-nil reader the triage Error
+		// source uses (nil for disabled/releases-only → tools off), and the WHOLE
+		// resolved params envelope so the live deadline is the configured value, not
+		// zero (KTD8). Never pass a lone IncludeMessage scalar.
+		Sentry:                  sentryReader,
+		SentryParams:            sentryParams,
+		SentryLiveWindowMinutes: cfg.Sentry.Issues.LiveWindowMinutes,
 	}, st, auditor)
 	srv := &http.Server{
 		Addr:    cfg.MCP.Addr,
