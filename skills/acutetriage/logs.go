@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/logs"
@@ -134,15 +135,62 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 	}
 }
 
-// buildLogSelector intersects an incident's shared alert labels with the generic
-// allowlist, dropping alert-metadata noise no log backend labels streams by.
+// buildLogSelector builds the incident's generic log selector: for each
+// allowlisted label key present on EVERY member alert, the set of distinct values
+// that key takes across members. Unlike a shared-label intersection it keeps a key
+// whose VALUE differs across members (service=api vs service=db-proxy), unioning
+// the values — so a correlated multi-service incident still selects its streams
+// instead of degrading to an empty selector (BUG-1). Keeping only keys universal
+// to all members means the provider's AND-combined matcher never over-constrains a
+// member's stream out; per-backend renaming/dropping to a real stream-label schema
+// stays the provider's job (ADR-0002).
 func buildLogSelector(alerts []store.Alert) logs.Selector {
-	shared := sharedLabels(alerts)
-	out := make(map[string]string)
+	shared := sharedLabelValues(alerts)
+	out := make(map[string][]string)
 	for _, k := range logs.AllowedSelectorKeys {
-		if v, ok := shared[k]; ok && v != "" {
-			out[k] = v
+		if vs, ok := shared[k]; ok && len(vs) > 0 {
+			out[k] = vs
 		}
 	}
 	return logs.Selector{Labels: out}
+}
+
+// sharedLabelValues returns, for each label key present with a non-empty value on
+// EVERY member alert, the sorted set of distinct values that key takes across
+// members. A key maps to one value for a homogeneous incident and to several for a
+// correlated multi-service one. Keys absent (or empty) on any member are dropped,
+// so a matcher AND-combining them never requires a value a member's stream cannot
+// have. Empty when no alerts are provided.
+func sharedLabelValues(alerts []store.Alert) map[string][]string {
+	if len(alerts) == 0 {
+		return map[string][]string{}
+	}
+	// Seed candidate keys from the first alert's non-empty labels.
+	values := make(map[string]map[string]struct{})
+	for k, v := range alerts[0].Labels {
+		if v != "" {
+			values[k] = map[string]struct{}{v: {}}
+		}
+	}
+	// Intersect key-presence across the rest, unioning values as we go: a key
+	// missing (or empty) on any member is dropped entirely.
+	for _, a := range alerts[1:] {
+		for k := range values {
+			if v, ok := a.Labels[k]; ok && v != "" {
+				values[k][v] = struct{}{}
+			} else {
+				delete(values, k)
+			}
+		}
+	}
+	out := make(map[string][]string, len(values))
+	for k, set := range values {
+		vs := make([]string, 0, len(set))
+		for v := range set {
+			vs = append(vs, v)
+		}
+		sort.Strings(vs)
+		out[k] = vs
+	}
+	return out
 }

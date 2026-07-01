@@ -61,11 +61,16 @@ type Fetched struct {
 	Query string // e.g. `{namespace="prod",app="api"} |~ "(?i)(error|…)"`
 }
 
-// Selector is provider-agnostic: it carries the incident's shared ALERT
-// labels (Alertmanager vocabulary), already filtered to AllowedSelectorKeys.
-// Each Source translates it into its own native query.
+// Selector is provider-agnostic: it carries the incident's ALERT labels
+// (Alertmanager vocabulary), already filtered to AllowedSelectorKeys. Each key
+// maps to the set of DISTINCT values that key takes across the incident's member
+// alerts — one value for a homogeneous incident, several for a correlated
+// multi-service one (e.g. {"service":{"api","db-proxy"}}). Only keys present on
+// EVERY member are carried, so a provider AND-combining them never over-constrains
+// a member's stream out. Each Source translates it into its own native query,
+// rendering a multi-value key as a regex alternation.
 type Selector struct {
-	Labels map[string]string // e.g. {"namespace":"prod","service":"api"}
+	Labels map[string][]string // e.g. {"namespace":{"prod"},"service":{"api","db-proxy"}}
 }
 
 // AllowedSelectorKeys is the generic allowlist of alert-label keys that

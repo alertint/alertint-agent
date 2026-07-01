@@ -72,9 +72,9 @@ func stream(values ...[2]string) string {
 }
 
 func sel(kv ...string) logs.Selector {
-	m := map[string]string{}
+	m := map[string][]string{}
 	for i := 0; i+1 < len(kv); i += 2 {
-		m[kv[i]] = kv[i+1]
+		m[kv[i]] = append(m[kv[i]], kv[i+1])
 	}
 	return logs.Selector{Labels: m}
 }
@@ -186,6 +186,62 @@ func TestFetchRecent_LabelMapTranslation(t *testing.T) {
 	// Deterministic sorted matcher.
 	if got != `{app="api",namespace="prod"}` {
 		t.Errorf("matcher = %q, want {app=\"api\",namespace=\"prod\"}", got)
+	}
+}
+
+func TestFetchRecent_MultiValueSelectorRendersRegexAlternation(t *testing.T) {
+	rec := &recorder{}
+	srv := newServer(t, rec, streamsBody(stream([2]string{"1", "x"})))
+	c := NewClient(Config{BaseURL: srv.URL, LineFilter: ""})
+	s := logs.Selector{Labels: map[string][]string{
+		"service":   {"db-proxy", "api"}, // out of order → must sort
+		"instance":  {"api-1", "api-2", "db-proxy-1"},
+		"namespace": {"prod"}, // single value → exact matcher, not regex
+	}}
+	if _, err := c.FetchRecent(context.Background(), s, time.Unix(0, 0), time.Now(), 50); err != nil {
+		t.Fatal(err)
+	}
+	// Keys sorted (instance,namespace,service); multi-value → anchored regex
+	// alternation with sorted values; single-value → exact matcher.
+	want := `{instance=~"api-1|api-2|db-proxy-1",namespace="prod",service=~"api|db-proxy"}`
+	if rec.queries[0] != want {
+		t.Errorf("matcher = %q, want %q", rec.queries[0], want)
+	}
+}
+
+func TestFetchRecent_MultiValueSelectorEscapesRegexMeta(t *testing.T) {
+	rec := &recorder{}
+	srv := newServer(t, rec, streamsBody(stream([2]string{"1", "x"})))
+	c := NewClient(Config{BaseURL: srv.URL})
+	s := logs.Selector{Labels: map[string][]string{
+		"instance": {"10.0.0.1:9100", "10.0.0.2:9100"},
+	}}
+	if _, err := c.FetchRecent(context.Background(), s, time.Unix(0, 0), time.Now(), 50); err != nil {
+		t.Fatal(err)
+	}
+	// Regex metacharacters (dots) must be escaped so they match literally. The
+	// value renders inside a double-quoted LogQL literal, so QuoteMeta's `\.`
+	// is written as `\\.` (LogQL unescapes it back to `\.` for the regex engine).
+	if !strings.Contains(rec.queries[0], `10\\.0\\.0\\.1:9100|10\\.0\\.0\\.2:9100`) {
+		t.Errorf("regex metacharacters not escaped for double-quoted LogQL: %q", rec.queries[0])
+	}
+}
+
+// TestFetchRecent_LabelMapMergesValuesOnRename proves that when two alert keys
+// rename to the same stream key, their value sets merge into one alternation.
+func TestFetchRecent_LabelMapMergesValuesOnRename(t *testing.T) {
+	rec := &recorder{}
+	srv := newServer(t, rec, streamsBody(stream([2]string{"1", "x"})))
+	c := NewClient(Config{BaseURL: srv.URL, LabelMap: map[string]string{"service": "app", "job": "app"}})
+	s := logs.Selector{Labels: map[string][]string{
+		"service": {"api"},
+		"job":     {"worker"},
+	}}
+	if _, err := c.FetchRecent(context.Background(), s, time.Unix(0, 0), time.Now(), 50); err != nil {
+		t.Fatal(err)
+	}
+	if rec.queries[0] != `{app=~"api|worker"}` {
+		t.Errorf("merged rename should union values: got %q, want {app=~\"api|worker\"}", rec.queries[0])
 	}
 }
 
