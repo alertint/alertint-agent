@@ -206,6 +206,29 @@ message from **all three** surfaces at once. All three sit inside your own trust
 boundary — your BYO LLM, your local database, your locally-gated MCP server — the
 same boundary your alert labels already flow through.
 
+### Cross-source reconciliation
+
+With two independent observers of the same system — infrastructure
+(Alertmanager/Prometheus) and application errors (Sentry) — the signal neither
+stream carries alone is the **reconciliation between them**. When the Error source
+is enabled, AlertINT tags each analyzed incident with a zero-LLM cross-source
+verdict and prepends **one neutral headline line** to the `sentry` section:
+
+- **`matched`** — at least one *new-in-window* Sentry error coincides with the infra
+  alert. Headline: *"Sentry: N new in-window error(s) correlated."* The corroborating
+  issue ids are persisted with the finding.
+- **`infra-only`** — the Error source looked and found no new error (zero issues, or
+  only chronic ones). Headline: *"Sentry: no new in-window errors for this scope"*
+  (with *"(M chronic present)"* appended when chronic issues exist).
+
+The tag is **presented evidence, never a directive** — it states a count and lets the
+model weigh it, rather than steering it toward or away from a cause class. It is
+persisted with the finding (so the evidence pack and the incident-evidence MCP tool
+replay it) and rides the Error source's enablement; there is **no separate flag**.
+When Sentry is disabled, or the query degraded (rate-limited, timeout, unknown
+project), **no tag and no headline** are emitted — so `infra-only` always means *"we
+looked and found nothing new,"* never *"Sentry isn't configured."*
+
 ### Live read tools (MCP)
 
 The triage-time `sentry` section is a **frozen snapshot** — the top-`max_issues`
