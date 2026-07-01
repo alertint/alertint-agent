@@ -87,6 +87,8 @@ restart Windsurf and check **Settings → MCP Servers**:
 | `alertint_verify_audit` | Verify the hash-chained audit log and report any tampering. |
 | `prometheus_query` | Instant PromQL query against the connected Prometheus (requires Prometheus enabled). |
 | `prometheus_query_range` | Range PromQL query with auto-stepped resolution (requires Prometheus enabled). |
+| `sentry_issues_list` | List live, distilled Sentry issues for a project (+ optional environment) by status (`unresolved`/`resolved`/`ignored`); requires the Sentry Error source enabled. |
+| `sentry_issues_trace` | Return full distilled stacktraces (`file:line`, function, `in_app`) for up to 10 Sentry issue ids; requires the Sentry Error source enabled. |
 
 All tools read local **AlertINT** state; the Prometheus tools additionally
 issue queries to the configured Prometheus instance — see

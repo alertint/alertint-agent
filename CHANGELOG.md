@@ -7,18 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-01
+
 ### Added
 
-- **Loki log-enrichment connector** — optional read-only Loki/Grafana-Cloud-Logs client.
-  At triage time it enriches the LLM prompt with the most relevant recent log lines
-  (error-biased filtered query, with one unfiltered fallback), translating the incident's
-  shared alert labels into LogQL via a configurable `label_map`. The exact lines the model
-  saw are persisted with the finding and replayed by `alertint_get_evidence_pack`.
-- **`loki_query_range` MCP tool** — read-only native-LogQL range query, registered when the
-  Loki connector is enabled, so an investigating agent can drill into logs over MCP.
-- **Demo log stack** — bundled Loki service in the Docker Compose dev stack plus
-  `docker/push-synthetic-logs.py` (`task logs:push:local` / `task logs:push:cloud`) to seed
-  fake multi-level log lines for local Loki or Grafana Cloud.
+- **Sentry connector** — optional read-only, egress-only Sentry integration over one shared
+  connection and token, playing four roles you enable independently:
+  - **Change source** — a background poller records new releases/deploys as change events on
+    the shared change plane (beside pushed CI deploys), answering *"what shipped right before
+    this?"* Surfaces in the triage *Recent changes* block and via `alertint_recent_changes`.
+  - **Error source** — a bounded read-only query-at-triage (`1+K` Sentry calls per incident)
+    that distills the top issues into a `sentry` prompt section: exception type + deepest in-app
+    `file:line`, blast radius (level / affected users / in-window rate), and a NEW-vs-chronic
+    flag. Persisted with the finding and replayed by `alertint_get_evidence_pack`.
+  - **Cross-source reconciliation tag** — a zero-LLM verdict (`matched` / `infra-only`)
+    prepended to the `sentry` section as one neutral headline the model weighs; persisted, and
+    inert when Sentry is disabled or the query degrades.
+  - **`sentry_issues_list` / `sentry_issues_trace` MCP tools** — live, read-only distilled
+    issue lookups (by project/status; full stacktraces for up to 10 issue ids), registered when
+    the Error source is enabled.
+  Distillation is the privacy boundary: only an allowlist of structured fields crosses Sentry's
+  API into the prompt, at-rest SQLite, and MCP surfaces — never local variables, request bodies,
+  or breadcrumbs. `include_message: false` strips the exception message from all three at once.
+
+## [0.4.0] - 2026-06-20
+
+### Added
+
+- **Change-event enrichment** — a universal webhook ingester accepts pushed **change events**
+  (deploys, config changes) on the same receiver port as Alertmanager alerts. At triage the LLM
+  prompt gains a *Recent changes* block answering *"what changed right before this incident?"*,
+  and the read-only `alertint_recent_changes` MCP tool exposes them to an investigating agent.
+  This is the change plane the Sentry **Change source** (v0.5.0) later feeds. (#6)
+- **Selectable agent config** — `ALERTINT_CONFIG_FILE` chooses which config file the container
+  loads at startup; the demo stack gains a `log_format` toggle.
+
+### Changed
+
+- **Breaking — receiver config unified:** `alertmanager.webhook_addr` becomes `receivers.address`,
+  and the `--webhook-addr` flag becomes `--receivers-addr`, reflecting the single ingester that
+  now receives both alerts and change events.
+
+## [0.3.0] - 2026-06-18
+
+### Added
+
 - **Human-readable `console` log format** — a colored, one-line-per-event format
   (`HH:MM:SS LEVEL  message · key=value …`) for live watching, plus an `auto` default that
   resolves to `console` on a terminal and `json` otherwise (keyed off stderr). Selectable
@@ -57,6 +90,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (including `text`) fails loud at startup. The slog `TextHandler` and the separate 3-line
   "card" finding notifier are gone — the finding is now the one-line `finding` summary.
 
+## [0.2.0] - 2026-06-17
+
+### Added
+
+- **Loki log-enrichment connector** — optional read-only Loki/Grafana-Cloud-Logs client.
+  At triage time it enriches the LLM prompt with the most relevant recent log lines
+  (error-biased filtered query, with one unfiltered fallback), translating the incident's
+  shared alert labels into LogQL via a configurable `label_map`. The exact lines the model
+  saw are persisted with the finding and replayed by `alertint_get_evidence_pack`.
+- **`loki_query_range` MCP tool** — read-only native-LogQL range query, registered when the
+  Loki connector is enabled, so an investigating agent can drill into logs over MCP.
+- **Demo log stack** — bundled Loki service in the Docker Compose dev stack plus
+  `docker/push-synthetic-logs.py` (`task logs:push:local` / `task logs:push:cloud`) to seed
+  fake multi-level log lines for local Loki or Grafana Cloud.
+
 ## [0.1.0] - 2026-06-10
 
 ### Added
@@ -91,5 +139,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single static binary** — pure-Go SQLite (no CGO), no external runtime dependencies.
   Multi-platform builds: `linux/amd64`, `linux/arm64`, `darwin/arm64`.
 
-[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/alertint/alertint-agent/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/alertint/alertint-agent/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/alertint/alertint-agent/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/alertint/alertint-agent/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/alertint/alertint-agent/releases/tag/v0.1.0
