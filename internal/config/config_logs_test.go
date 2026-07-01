@@ -8,6 +8,9 @@ import (
 	"testing"
 )
 
+// boolPtr returns a pointer to b, for setting the tri-state Enabled fields.
+func boolPtr(b bool) *bool { return &b }
+
 // validBaseConfig returns a Config that passes validation, so logs tests can
 // toggle only the Logs section.
 func validBaseConfig(t *testing.T) Config {
@@ -40,7 +43,7 @@ func TestLogs_Defaults(t *testing.T) {
 
 func TestValidateLogs_DisabledSkipsChecks(t *testing.T) {
 	cfg := validBaseConfig(t)
-	cfg.Logs.Enabled = false
+	cfg.Logs.Enabled = boolPtr(false)
 	cfg.Logs.Provider = "" // would be invalid if enabled
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("disabled logs must not validate: %v", err)
@@ -49,7 +52,7 @@ func TestValidateLogs_DisabledSkipsChecks(t *testing.T) {
 
 func TestValidateLogs_ValidLokiNoneAuth(t *testing.T) {
 	cfg := validBaseConfig(t)
-	cfg.Logs.Enabled = true
+	cfg.Logs.Enabled = boolPtr(true)
 	cfg.Logs.Provider = "loki"
 	cfg.Logs.Loki.BaseURL = "http://loki:3100"
 	cfg.Logs.Loki.Auth.Mode = "none"
@@ -60,7 +63,7 @@ func TestValidateLogs_ValidLokiNoneAuth(t *testing.T) {
 
 func TestValidateLogs_UnknownProvider(t *testing.T) {
 	cfg := validBaseConfig(t)
-	cfg.Logs.Enabled = true
+	cfg.Logs.Enabled = boolPtr(true)
 	cfg.Logs.Provider = "splunk"
 	cfg.Logs.Loki.BaseURL = "http://loki:3100"
 	err := cfg.Validate()
@@ -71,7 +74,7 @@ func TestValidateLogs_UnknownProvider(t *testing.T) {
 
 func TestValidateLogs_MissingProvider(t *testing.T) {
 	cfg := validBaseConfig(t)
-	cfg.Logs.Enabled = true
+	cfg.Logs.Enabled = boolPtr(true)
 	cfg.Logs.Provider = ""
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "logs.provider is required") {
@@ -81,7 +84,7 @@ func TestValidateLogs_MissingProvider(t *testing.T) {
 
 func TestValidateLogs_LokiRequiresBaseURL(t *testing.T) {
 	cfg := validBaseConfig(t)
-	cfg.Logs.Enabled = true
+	cfg.Logs.Enabled = boolPtr(true)
 	cfg.Logs.Provider = "loki"
 	cfg.Logs.Loki.BaseURL = ""
 	err := cfg.Validate()
@@ -92,7 +95,7 @@ func TestValidateLogs_LokiRequiresBaseURL(t *testing.T) {
 
 func TestValidateLogs_BadTunables(t *testing.T) {
 	cfg := validBaseConfig(t)
-	cfg.Logs.Enabled = true
+	cfg.Logs.Enabled = boolPtr(true)
 	cfg.Logs.Provider = "loki"
 	cfg.Logs.Loki.BaseURL = "http://loki:3100"
 	cfg.Logs.TimeoutSeconds = 0
@@ -129,7 +132,7 @@ func TestValidateLogs_AuthMatrix(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := validBaseConfig(t)
-			cfg.Logs.Enabled = true
+			cfg.Logs.Enabled = boolPtr(true)
 			cfg.Logs.Provider = "loki"
 			cfg.Logs.Loki.BaseURL = "http://loki:3100"
 			cfg.Logs.Loki.Auth = LokiAuthConfig{
@@ -158,7 +161,7 @@ func TestLokiAuthSecret_ResolvesPerMode(t *testing.T) {
 
 	mk := func(mode string) *Config {
 		cfg := Defaults()
-		cfg.Logs.Enabled = true
+		cfg.Logs.Enabled = boolPtr(true)
 		cfg.Logs.Provider = "loki"
 		cfg.Logs.Loki.BaseURL = "http://loki:3100"
 		cfg.Logs.Loki.Auth = LokiAuthConfig{Mode: mode, TokenEnv: "LOKI_BEARER_X", Username: "123", PasswordEnv: "LOKI_PASS_X"}
@@ -178,7 +181,7 @@ func TestLokiAuthSecret_ResolvesPerMode(t *testing.T) {
 
 func TestLokiAuthSecret_MissingEnvErrors(t *testing.T) {
 	cfg := Defaults()
-	cfg.Logs.Enabled = true
+	cfg.Logs.Enabled = boolPtr(true)
 	cfg.Logs.Provider = "loki"
 	cfg.Logs.Loki.BaseURL = "http://loki:3100"
 	cfg.Logs.Loki.Auth = LokiAuthConfig{Mode: "bearer", TokenEnv: "DEFINITELY_UNSET_LOKI_TOKEN"}

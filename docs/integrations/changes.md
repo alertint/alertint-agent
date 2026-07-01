@@ -35,7 +35,7 @@ changes:
     enabled: true
     webhook_token_env: ALERTINT_CHANGES_WEBHOOK_TOKEN
   enrichment:                     # Role B: use stored changes (triage prompt + MCP)
-    enabled: true
+    # enabled: false              # optional force-off; omitted = ON when a change source is on
     window_minutes: 120           # look-back before the first alert
     max_events: 10                # cap on ranked changes attached to a prompt
   retention_days: 30              # prune changes older than this
@@ -49,7 +49,10 @@ export ALERTINT_CHANGES_WEBHOOK_TOKEN="$(openssl rand -hex 24)"
 
 `ingress` and `enrichment` are independent: a satellite deployment can receive
 changes (`ingress.enabled`) while a central one reads them, or one agent can do
-both. See the [configuration reference](../getting-started/configuration.md#changes).
+both. Enrichment is presence-based: it turns on automatically when any change
+source is active (`ingress.enabled` or the Sentry releases poller); an explicit
+`enrichment.enabled: false` forces it off. See the
+[configuration reference](../getting-started/configuration.md#changes).
 
 ## The change body
 

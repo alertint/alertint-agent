@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Default triage model is now `claude-sonnet-5`** (was `claude-haiku-4-5-20251001`).
+  The first finding is built by the strongest reasoning tier in its price class;
+  `model: claude-haiku-4-5` remains a one-line opt-in for cost-sensitive deployments.
+  Every LLM request now also disables extended thinking explicitly, so models that
+  default thinking on cannot consume the output budget of the JSON reply.
+- **Presence-based enrichment enablement** — Prometheus, log (Loki), and change
+  enrichment now turn on automatically when they are configured: setting
+  `prometheus.base_url` or `logs.loki.base_url`, or activating any change source
+  (`changes.ingress` or the Sentry releases poller), enables the corresponding
+  read-only connector. An explicit `enabled: false` still forces a connector off.
+  `logs.provider` now defaults to `loki`.
+- **Single-alert triage by default** — `correlator.min_alerts` defaults to `1`
+  (was `2`), so a lone first alert still produces a finding.
+
+### Added
+
+- **`notify.slack.min_severity`** (`low` | `medium` | `high`, default `low`) — a
+  Slack noise gate: findings below the threshold are not posted (stdout always
+  emits, and a suppressed incident's resolution is suppressed too). Suppressions
+  are recorded in the audit trail as `notify.skipped`.
+- **Agent-handoff prompt on the Slack incident card** — the firing card now
+  carries a copy-pasteable `investigate incident <id> using alertint` prompt with
+  the full incident ID, so the MCP handoff is a one-paste action.
+- **Deterministic confidence cap for metadata-only findings** — when triage had no
+  live evidence (no metrics, logs, changes, or Sentry issues), the persisted and
+  notified confidence is capped at 0.6 regardless of what the model returned,
+  backing the existing prompt-side calibration directive.
+
 ## [0.5.2] - 2026-07-01
 
 ### Fixed

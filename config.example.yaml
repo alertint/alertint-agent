@@ -11,7 +11,8 @@ storage:
 llm:
   provider: anthropic
   api_key_env: ANTHROPIC_API_KEY              # name of the env var holding the Anthropic key
-  model: claude-haiku-4-5-20251001
+  model: claude-sonnet-5                      # default: strongest reasoning in its price class
+  # model: claude-haiku-4-5                   # faster + cheaper alternative for cost-sensitive setups
 
 correlator:
   window_seconds: 90       # group alerts arriving within this window
@@ -28,6 +29,7 @@ notify:
     enabled: false
     bot_token_env: SLACK_BOT_TOKEN   # xoxb- bot token (requires chat:write scope)
     channel: "#alerts"               # channel name or ID
+    min_severity: low                # low | medium | high — raise to suppress lower-severity findings on Slack (stdout always emits)
 
 # MCP HTTP server — AI coding agents connect to http://host:9912/mcp
 # Set ALERTINT_MCP_TOKEN to a long random secret before enabling.
@@ -42,11 +44,13 @@ mcp:
 rules:
   # local_pack_dir: ./my-rules
 
-# Prometheus read connector — MCP tools can run PromQL queries for metric context.
+# Prometheus read connector — enriches triage prompts with live metric values
+# and exposes read-only PromQL MCP tools. Presence-based: setting base_url
+# turns it ON automatically.
 prometheus:
-  enabled: false
-  base_url: http://localhost:9090
-  # bearer_token_env: PROMETHEUS_BEARER_TOKEN  # only if Prometheus requires auth
+  # base_url: http://localhost:9090            # set this and Prometheus enrichment turns ON automatically
+  # enabled: false                              # uncomment to force OFF even when base_url is set
+  # bearer_token_env: PROMETHEUS_BEARER_TOKEN   # only if Prometheus requires auth
   timeout_seconds: 10
   default_range_minutes: 60
 
@@ -58,14 +62,15 @@ prometheus:
 # label_map or the selector matches zero streams (you'll see an info log
 # "returned no lines — check loki.label_map"). See docs/integrations/loki.md →
 # "Map your labels".
+# Presence-based: setting loki.base_url turns log enrichment ON automatically.
 logs:
-  enabled: false
+  # enabled: false           # uncomment to force OFF even when loki.base_url is set
   provider: loki
   timeout_seconds: 10        # TOTAL budget for the whole fetch (filtered + fallback)
   default_range_minutes: 15  # look-back window before the first alert
   max_lines: 50
   loki:
-    base_url: http://loki:3100             # or https://logs-prod-006.grafana.net (Grafana Cloud)
+    # base_url: http://loki:3100           # set this and log enrichment turns ON (or https://logs-prod-006.grafana.net for Grafana Cloud)
     auth:
       mode: none                           # none | bearer | basic
       # token_env: LOKI_BEARER_TOKEN       # bearer mode
@@ -79,12 +84,14 @@ logs:
 
 # Change events: push deploy/config/flag events over a webhook so triage can
 # answer "what changed right before this?". See docs/integrations/changes.md.
+# Enrichment is presence-based: it turns ON automatically as soon as a change
+# source exists (changes.ingress or the Sentry releases poller below).
 changes:
   ingress:                                 # Role A: receive change webhooks (write surface)
     enabled: false
     webhook_token_env: ALERTINT_CHANGES_WEBHOOK_TOKEN
   enrichment:                              # Role B: use stored changes (triage prompt + MCP)
-    enabled: false
+    # enabled: false                       # uncomment to force OFF even when a change source is on
     window_minutes: 120                    # look-back before the first alert
     max_events: 10                         # cap on ranked changes attached to a prompt
   retention_days: 30                       # prune changes older than this

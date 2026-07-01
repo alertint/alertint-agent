@@ -130,7 +130,7 @@ func TestSlackFiringPostsMessage(t *testing.T) {
 	client := &mockSlackClient{returnTS: "1234567890.000001", returnCh: "C123"}
 	store := &mockThreadStore{err: errors.New("not found")}
 
-	n := slack.NewWithClient(client, "#alerts", store, nil)
+	n := slack.NewWithClient(client, "#alerts", "low", store, nil)
 	if err := n.Notify(context.Background(), sampleFinding()); err != nil {
 		t.Fatalf("Notify: %v", err)
 	}
@@ -152,7 +152,7 @@ func TestSlackResolvedWithThread(t *testing.T) {
 	client := &mockSlackClient{returnTS: "1234567890.000002", returnCh: "C123"}
 	store := &mockThreadStore{ts: "1234567890.000001", ch: "C123"}
 
-	n := slack.NewWithClient(client, "#alerts", store, nil)
+	n := slack.NewWithClient(client, "#alerts", "low", store, nil)
 	f := sampleFinding()
 	f.Status = "resolved"
 	if err := n.Notify(context.Background(), f); err != nil {
@@ -172,7 +172,7 @@ func TestSlackResolvedNoThreadFallback(t *testing.T) {
 	client := &mockSlackClient{returnTS: "1234567890.000003", returnCh: "C123"}
 	store := &mockThreadStore{err: errors.New("not found")}
 
-	n := slack.NewWithClient(client, "#alerts", store, nil)
+	n := slack.NewWithClient(client, "#alerts", "low", store, nil)
 	f := sampleFinding()
 	f.Status = "resolved"
 	if err := n.Notify(context.Background(), f); err != nil {
@@ -187,12 +187,66 @@ func TestSlackResolvedNoThreadFallback(t *testing.T) {
 	}
 }
 
+// TestSlackFiringSuppressedBelowMinSeverity verifies the severity gate: a
+// low-severity finding never reaches Slack when min_severity is high.
+func TestSlackFiringSuppressedBelowMinSeverity(t *testing.T) {
+	client := &mockSlackClient{returnTS: "ts", returnCh: "C1"}
+	store := &mockThreadStore{err: errors.New("not found")}
+
+	n := slack.NewWithClient(client, "#alerts", "high", store, nil)
+	f := sampleFinding()
+	f.Severity = "low"
+	if err := n.Notify(context.Background(), f); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	if client.postCalls != 0 {
+		t.Errorf("PostMessageContext calls = %d, want 0 (suppressed)", client.postCalls)
+	}
+}
+
+// TestSlackResolvedNoThreadSuppressedBelowMinSeverity verifies the resolved
+// fallback path is gated too: when the firing post was suppressed (no thread
+// recorded), the resolution must not leak a fresh card into the channel.
+func TestSlackResolvedNoThreadSuppressedBelowMinSeverity(t *testing.T) {
+	client := &mockSlackClient{returnTS: "ts", returnCh: "C1"}
+	store := &mockThreadStore{err: errors.New("not found")}
+
+	n := slack.NewWithClient(client, "#alerts", "high", store, nil)
+	f := sampleFinding()
+	f.Severity = "low"
+	f.Status = "resolved"
+	if err := n.Notify(context.Background(), f); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	if client.postCalls != 0 || client.updateCalls != 0 {
+		t.Errorf("post/update calls = %d/%d, want 0/0 (suppressed)", client.postCalls, client.updateCalls)
+	}
+}
+
+// TestSlackResolvedWithThreadNotGated verifies an already-posted incident is
+// always resolved in place, regardless of the severity gate.
+func TestSlackResolvedWithThreadNotGated(t *testing.T) {
+	client := &mockSlackClient{returnTS: "ts", returnCh: "C1"}
+	store := &mockThreadStore{ts: "1234567890.000001", ch: "C1"}
+
+	n := slack.NewWithClient(client, "#alerts", "high", store, nil)
+	f := sampleFinding()
+	f.Severity = "low"
+	f.Status = "resolved"
+	if err := n.Notify(context.Background(), f); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	if client.updateCalls != 1 {
+		t.Errorf("UpdateMessageContext calls = %d, want 1 (in-place resolve is never gated)", client.updateCalls)
+	}
+}
+
 // TestSlackClientErrorPropagates verifies that a client error is returned.
 func TestSlackClientErrorPropagates(t *testing.T) {
 	client := &mockSlackClient{postErr: errors.New("slack API error")}
 	store := &mockThreadStore{err: errors.New("not found")}
 
-	n := slack.NewWithClient(client, "#alerts", store, nil)
+	n := slack.NewWithClient(client, "#alerts", "low", store, nil)
 	err := n.Notify(context.Background(), sampleFinding())
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -224,7 +278,7 @@ func TestMultiCallsBoth(t *testing.T) {
 
 	var out bytes.Buffer
 	sn := stdout.New(&out, nil, true)
-	sk := slack.NewWithClient(client, "#alerts", store, nil)
+	sk := slack.NewWithClient(client, "#alerts", "low", store, nil)
 	var logBuf bytes.Buffer
 	m := notify.NewMulti(testLogger(&logBuf), sn, sk)
 

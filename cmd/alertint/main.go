@@ -188,7 +188,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	// Build Prometheus client when enabled. Passed into both the triage skill
 	// (metric enrichment for the LLM prompt) and the MCP server (PromQL tools).
 	var prom *promclient.Client
-	if cfg.Prometheus.Enabled {
+	if cfg.PrometheusEnabled() {
 		promToken, err := cfg.PrometheusToken()
 		if err != nil {
 			return err
@@ -208,7 +208,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	// enrichment) and the MCP server (native-query passthrough). Unknown
 	// provider fails loud at startup.
 	var logSrc logs.Source
-	if cfg.Logs.Enabled {
+	if cfg.LogsEnabled() {
 		lokiSecret, err := cfg.LokiAuthSecret()
 		if err != nil {
 			return err
@@ -261,7 +261,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 				MaxLines:            cfg.Logs.MaxLines,
 			},
 			ChangeParams: acutetriage.ChangeParams{
-				Enabled:       cfg.Changes.Enrichment.Enabled,
+				Enabled:       cfg.ChangesEnrichmentEnabled(),
 				WindowMinutes: cfg.Changes.Enrichment.WindowMinutes,
 				MaxEvents:     cfg.Changes.Enrichment.MaxEvents,
 			},
@@ -338,7 +338,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 // table while the agent runs; this closes the gap where it was stopped while
 // changes aged out past retention. No-op when changes are disabled.
 func pruneChangesAtStartup(ctx context.Context, cfg *config.Config, st *store.Store, logger *slog.Logger) {
-	if !cfg.Changes.Ingress.Enabled && !cfg.Changes.Enrichment.Enabled {
+	if !cfg.Changes.Ingress.Enabled && !cfg.ChangesEnrichmentEnabled() {
 		return
 	}
 	cutoff := time.Now().UTC().AddDate(0, 0, -cfg.Changes.RetentionDays)
@@ -429,7 +429,7 @@ func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom 
 		Prometheus:              prom,
 		Logs:                    logSrc,
 		LogsDefaultRangeMinutes: cfg.Logs.DefaultRangeMinutes,
-		ChangesEnabled:          cfg.Changes.Enrichment.Enabled,
+		ChangesEnabled:          cfg.ChangesEnrichmentEnabled(),
 		ChangesWindowMinutes:    cfg.Changes.Enrichment.WindowMinutes,
 		// The live Sentry read tools ride the SAME true-nil reader the triage Error
 		// source uses (nil for disabled/releases-only → tools off), and the WHOLE
@@ -610,7 +610,7 @@ func startSentryPoller(ctx context.Context, cfg *config.Config, st *store.Store,
 		// enrichment, but no release/deploy poller runs.
 		return client, func() {}, nil
 	}
-	if !cfg.Changes.Enrichment.Enabled {
+	if !cfg.ChangesEnrichmentEnabled() {
 		// The poller writes change rows, but only changes.enrichment surfaces them
 		// at triage and over MCP — warn so this misconfiguration isn't silent.
 		logger.Warn("sentry poller is enabled but changes.enrichment is disabled; polled changes will be stored but not surfaced at triage or over MCP")
@@ -646,7 +646,7 @@ func newSentryPoller(cfg *config.Config, client *sentry.Client, st *store.Store,
 // integration. Returns nil (a no-op registry) when nothing is enabled.
 func buildHealthChecks(cfg *config.Config, prom *promclient.Client, logSrc logs.Source, sentryClient *sentry.Client) *health.Registry {
 	var checks []health.Check
-	if cfg.Prometheus.Enabled && prom != nil {
+	if cfg.PrometheusEnabled() && prom != nil {
 		checks = append(checks, health.Check{
 			Name:   "prometheus",
 			Detail: cfg.Prometheus.BaseURL,
@@ -658,7 +658,7 @@ func buildHealthChecks(cfg *config.Config, prom *promclient.Client, logSrc logs.
 			},
 		})
 	}
-	if cfg.Logs.Enabled && logSrc != nil {
+	if cfg.LogsEnabled() && logSrc != nil {
 		checks = append(checks, health.Check{
 			Name:   logSrc.Name(),
 			Detail: cfg.Logs.Loki.BaseURL,
@@ -723,7 +723,7 @@ func buildNotifier(cfg *config.Config, st *store.Store, auditor *audit.Auditor, 
 	}
 	if cfg.Notify.Slack.Enabled {
 		if token, err := cfg.SlackBotToken(); err == nil && token != "" {
-			nn = append(nn, notifyslack.New(token, cfg.Notify.Slack.Channel, st, auditor))
+			nn = append(nn, notifyslack.New(token, cfg.Notify.Slack.Channel, cfg.Notify.Slack.MinSeverity, st, auditor))
 			sinks = append(sinks, "slack")
 			slackWired = true
 		}

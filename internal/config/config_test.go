@@ -124,13 +124,13 @@ storage:
 	if cfg.LLM.Provider != "anthropic" {
 		t.Errorf("default provider not applied: %q", cfg.LLM.Provider)
 	}
-	if cfg.LLM.Model != "claude-haiku-4-5-20251001" {
+	if cfg.LLM.Model != "claude-sonnet-5" {
 		t.Errorf("default model not applied: %q", cfg.LLM.Model)
 	}
 	if cfg.Correlator.WindowSeconds != 90 {
 		t.Errorf("default window_seconds not applied: %d", cfg.Correlator.WindowSeconds)
 	}
-	if cfg.Correlator.MinAlerts != 2 {
+	if cfg.Correlator.MinAlerts != 1 {
 		t.Errorf("default min_alerts not applied: %d", cfg.Correlator.MinAlerts)
 	}
 	if !cfg.Notify.Stdout {
@@ -168,9 +168,9 @@ func TestDefaults_OnlyAlertmanagerEnabled(t *testing.T) {
 	if !cfg.Alertmanager.Enabled {
 		t.Error("alertmanager should be enabled by default")
 	}
-	if cfg.Notify.Slack.Enabled || cfg.MCP.Enabled || cfg.Prometheus.Enabled {
+	if cfg.Notify.Slack.Enabled || cfg.MCP.Enabled || cfg.PrometheusEnabled() {
 		t.Errorf("slack/mcp/prometheus should be disabled by default, got %v/%v/%v",
-			cfg.Notify.Slack.Enabled, cfg.MCP.Enabled, cfg.Prometheus.Enabled)
+			cfg.Notify.Slack.Enabled, cfg.MCP.Enabled, cfg.PrometheusEnabled())
 	}
 }
 

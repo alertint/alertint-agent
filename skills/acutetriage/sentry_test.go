@@ -579,14 +579,14 @@ func TestAnalysis_ShortCircuitSkipsSentry(t *testing.T) {
 		RootCauseHint: "boom",
 	}
 	alerts := alertsWithLabels(map[string]string{"service": "checkout"})
-	raw, logEnr, chg, sen, err := s.analysis(context.Background(), store.Incident{ID: "i1"}, alerts, decision, EvidencePack{}, []byte("{}"))
+	raw, mets, logEnr, chg, sen, err := s.analysis(context.Background(), store.Incident{ID: "i1"}, alerts, decision, EvidencePack{}, []byte("{}"))
 	if err != nil {
 		t.Fatalf("analysis: %v", err)
 	}
 	if len(raw) == 0 {
 		t.Error("short-circuit should still synthesize a finding")
 	}
-	if logEnr != nil || chg != nil || sen != nil {
+	if mets != nil || logEnr != nil || chg != nil || sen != nil {
 		t.Errorf("short-circuit must return nil enrichments, got sentry=%v", sen)
 	}
 	if fk.listCalls != 0 {

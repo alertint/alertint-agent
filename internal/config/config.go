@@ -58,8 +58,12 @@ type RulesConfig struct {
 // PrometheusConfig configures the optional Prometheus read connector.
 // When enabled, MCP tools can run instant and range PromQL queries against
 // the configured Prometheus instance.
+//
+// Enabled is a *bool so presence-based enablement survives the YAML merge:
+// an omitted key (nil) means "on when base_url is set", an explicit value is
+// honored either way. Resolve it via Config.PrometheusEnabled, never directly.
 type PrometheusConfig struct {
-	Enabled             bool   `yaml:"enabled"`
+	Enabled             *bool  `yaml:"enabled,omitempty"`
 	BaseURL             string `yaml:"base_url"`
 	BearerTokenEnv      string `yaml:"bearer_token_env,omitempty"`
 	TimeoutSeconds      int    `yaml:"timeout_seconds"`
@@ -71,8 +75,12 @@ type PrometheusConfig struct {
 // MCP server exposes a native-query passthrough tool. Generic enrichment knobs
 // live at the top; provider connection details nest under the named provider
 // (only loki in v1). Read-only: the connector never writes logs.
+//
+// Enabled is a *bool for presence-based enablement: an omitted key (nil)
+// means "on when loki.base_url is set", an explicit value is honored either
+// way. Resolve it via Config.LogsEnabled, never directly.
 type LogsConfig struct {
-	Enabled             bool       `yaml:"enabled"`
+	Enabled             *bool      `yaml:"enabled,omitempty"`
 	Provider            string     `yaml:"provider"`              // only "loki" in v1
 	TimeoutSeconds      int        `yaml:"timeout_seconds"`       // TOTAL budget for the whole fetch (filtered + fallback share it)
 	DefaultRangeMinutes int        `yaml:"default_range_minutes"` // window before the first alert
@@ -199,10 +207,15 @@ type ChangesIngressConfig struct {
 
 // ChangesEnrichmentConfig configures using stored changes at triage time and
 // over MCP (read surface).
+//
+// Enabled is a *bool for presence-based enablement: an omitted key (nil)
+// means "on when a change source is producing events" (changes.ingress or the
+// Sentry releases poller), an explicit value is honored either way. Resolve
+// it via Config.ChangesEnrichmentEnabled, never directly.
 type ChangesEnrichmentConfig struct {
-	Enabled       bool `yaml:"enabled"`
-	WindowMinutes int  `yaml:"window_minutes"`
-	MaxEvents     int  `yaml:"max_events"`
+	Enabled       *bool `yaml:"enabled,omitempty"`
+	WindowMinutes int   `yaml:"window_minutes"`
+	MaxEvents     int   `yaml:"max_events"`
 }
 
 // StorageConfig configures the SQLite store.
@@ -230,11 +243,15 @@ type NotifyConfig struct {
 	Slack  SlackConfig `yaml:"slack"`
 }
 
-// SlackConfig configures the optional Slack Bot Token notifier.
+// SlackConfig configures the optional Slack Bot Token notifier. MinSeverity
+// is the channel noise gate: findings whose severity ranks below it are not
+// posted to Slack (stdout always emits). The default "low" posts everything —
+// visibility over obscurity; raising it later is the off-switch.
 type SlackConfig struct {
 	Enabled     bool   `yaml:"enabled"`
 	BotTokenEnv string `yaml:"bot_token_env"` // env var holding the xoxb- bot token
 	Channel     string `yaml:"channel"`       // e.g. "#alerts" or "C1234567890"
+	MinSeverity string `yaml:"min_severity"`  // low | medium | high (default low = post everything)
 }
 
 // Defaults returns a Config populated with v1 defaults. The result is not
@@ -260,17 +277,23 @@ func Defaults() Config {
 		},
 		LLM: LLMConfig{
 			Provider: "anthropic",
-			Model:    "claude-haiku-4-5-20251001",
+			// Sonnet by default: the first finding should come from the
+			// strongest reasoning tier in its price class. claude-haiku-4-5
+			// stays a one-line opt-in for cost-sensitive deployments.
+			Model: "claude-sonnet-5",
 		},
 		Correlator: CorrelatorConfig{
 			WindowSeconds: 90,
-			MinAlerts:     2,
-			GroupLabels:   []string{"cluster", "namespace", "service"},
+			// 1: a lone first alert still produces a finding. Slack noise is
+			// controlled by notify.slack.min_severity, not by dropping triage.
+			MinAlerts:   1,
+			GroupLabels: []string{"cluster", "namespace", "service"},
 		},
 		Notify: NotifyConfig{
 			Stdout: true,
 			Slack: SlackConfig{
-				Enabled: false,
+				Enabled:     false,
+				MinSeverity: "low",
 			},
 		},
 		MCP: MCPConfig{
@@ -283,6 +306,9 @@ func Defaults() Config {
 			DefaultRangeMinutes: 60,
 		},
 		Logs: LogsConfig{
+			// Only loki exists in v1, so defaulting the provider lets
+			// presence-based enablement work from loki.base_url alone.
+			Provider:            "loki",
 			TimeoutSeconds:      10,
 			DefaultRangeMinutes: 15,
 			MaxLines:            50,
@@ -414,7 +440,7 @@ func (c *Config) validateServing() []string {
 // validation lives in validateServing (it gates the inbound server).
 func (c *Config) validateChanges() []string {
 	var errs []string
-	if c.Changes.Enrichment.Enabled {
+	if c.ChangesEnrichmentEnabled() {
 		if c.Changes.Enrichment.WindowMinutes <= 0 {
 			errs = append(errs, "changes: enrichment: window_minutes must be > 0")
 		}
@@ -422,7 +448,7 @@ func (c *Config) validateChanges() []string {
 			errs = append(errs, "changes: enrichment: max_events must be > 0")
 		}
 	}
-	if (c.Changes.Ingress.Enabled || c.Changes.Enrichment.Enabled) && c.Changes.RetentionDays <= 0 {
+	if (c.Changes.Ingress.Enabled || c.ChangesEnrichmentEnabled()) && c.Changes.RetentionDays <= 0 {
 		errs = append(errs, "changes: retention_days must be > 0 when changes are enabled")
 	}
 	return errs
@@ -486,6 +512,9 @@ func (c *Config) validateNotify() []string {
 		if strings.TrimSpace(c.Notify.Slack.Channel) == "" {
 			errs = append(errs, "notify.slack.channel is required when slack is enabled")
 		}
+		if !validSeverity(c.Notify.Slack.MinSeverity) {
+			errs = append(errs, fmt.Sprintf("notify.slack.min_severity %q must be one of low, medium, high", c.Notify.Slack.MinSeverity))
+		}
 	}
 	if !c.Notify.Stdout && !c.Notify.Slack.Enabled {
 		errs = append(errs, "at least one notifier must be enabled (notify.stdout or notify.slack.enabled)")
@@ -495,7 +524,7 @@ func (c *Config) validateNotify() []string {
 
 func (c *Config) validatePrometheus() []string {
 	var errs []string
-	if !c.Prometheus.Enabled {
+	if !c.PrometheusEnabled() {
 		return nil
 	}
 	if strings.TrimSpace(c.Prometheus.BaseURL) == "" {
@@ -511,7 +540,7 @@ func (c *Config) validatePrometheus() []string {
 }
 
 func (c *Config) validateLogs() []string {
-	if !c.Logs.Enabled {
+	if !c.LogsEnabled() {
 		return nil
 	}
 	var errs []string
@@ -565,6 +594,38 @@ func (c *Config) validateLoki() []string {
 		errs = append(errs, fmt.Sprintf("logs.loki.auth.mode %q must be one of none, bearer, basic", mode))
 	}
 	return errs
+}
+
+// PrometheusEnabled resolves the effective Prometheus on/off state:
+// an explicit enabled value wins; when the key is omitted, a configured
+// base_url turns the read-only connector on (presence-based enablement).
+func (c *Config) PrometheusEnabled() bool {
+	if c.Prometheus.Enabled != nil {
+		return *c.Prometheus.Enabled
+	}
+	return strings.TrimSpace(c.Prometheus.BaseURL) != ""
+}
+
+// LogsEnabled resolves the effective log-enrichment on/off state:
+// an explicit enabled value wins; when the key is omitted, a configured
+// loki.base_url turns the read-only connector on (presence-based enablement).
+func (c *Config) LogsEnabled() bool {
+	if c.Logs.Enabled != nil {
+		return *c.Logs.Enabled
+	}
+	return strings.TrimSpace(c.Logs.Loki.BaseURL) != ""
+}
+
+// ChangesEnrichmentEnabled resolves the effective change-enrichment on/off
+// state: an explicit enabled value wins; when the key is omitted, enrichment
+// turns on as soon as anything can produce change events — the change webhook
+// receiver or the Sentry releases poller. Changes has no base_url of its own,
+// so "a source is present" is its presence signal.
+func (c *Config) ChangesEnrichmentEnabled() bool {
+	if c.Changes.Enrichment.Enabled != nil {
+		return *c.Changes.Enrichment.Enabled
+	}
+	return c.Changes.Ingress.Enabled || c.Sentry.Releases.Enabled
 }
 
 // AnySentryEnabled reports whether any Sentry feature is on (the release/deploy
@@ -684,7 +745,7 @@ func (c *Config) MCPToken() (string, error) {
 // resolved from the env var named by Prometheus.BearerTokenEnv.
 // Returns empty string and nil error when bearer_token_env is unset or prometheus is disabled.
 func (c *Config) PrometheusToken() (string, error) {
-	if !c.Prometheus.Enabled || strings.TrimSpace(c.Prometheus.BearerTokenEnv) == "" {
+	if !c.PrometheusEnabled() || strings.TrimSpace(c.Prometheus.BearerTokenEnv) == "" {
 		return "", nil
 	}
 	return requireEnv(c.Prometheus.BearerTokenEnv, "prometheus.bearer_token_env")
@@ -712,7 +773,7 @@ func (c *Config) SentryToken() (string, error) {
 //	bearer → resolve token_env
 //	basic  → resolve password_env
 func (c *Config) LokiAuthSecret() (string, error) {
-	if !c.Logs.Enabled {
+	if !c.LogsEnabled() {
 		return "", nil
 	}
 	switch c.Logs.Loki.Auth.Mode {
@@ -746,6 +807,16 @@ func requireEnv(name, field string) (string, error) {
 		return "", fmt.Errorf("%s: env var %q is not set", field, name)
 	}
 	return v, nil
+}
+
+// validSeverity accepts the finding-severity ladder used by
+// notify.slack.min_severity. An empty value is valid (treated as "low").
+func validSeverity(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "low", "medium", "high":
+		return true
+	}
+	return false
 }
 
 func validLogLevel(s string) bool {
