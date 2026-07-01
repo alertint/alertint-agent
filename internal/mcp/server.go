@@ -569,6 +569,38 @@ func (s *Server) toolPrometheusQueryRange() (mcplib.Tool, mcpserver.ToolHandlerF
 	return tool, s.handlePrometheusQueryRange
 }
 
+// Discovery hints attached to an empty query result so a consumer can tell "the
+// query ran and matched nothing" from "the selector/metric name is wrong" (BUG-5).
+const (
+	promEmptyHint = "0 series matched — the query ran but returned no data. Verify the metric name and label selector; " +
+		`list available metric names with: group by(__name__)({__name__!=""}).`
+	logsEmptyHint = "0 streams matched — the query ran but returned no lines. Verify the label selector (labels are " +
+		`case-sensitive) and time range; widen with a broader selector such as {job=~".+"}.`
+)
+
+// annotateEmptyResult parses a provider query response and, when it matched
+// nothing (its "result" array is empty), adds a "hint" field so an empty result
+// is distinguishable from a misconfigured selector (BUG-5). Prometheus and Loki
+// both return the {"resultType":..,"result":[..]} envelope this reads; the
+// original fields are preserved, and a non-empty or unexpectedly-shaped payload
+// is returned unchanged.
+func annotateEmptyResult(data json.RawMessage, hint string) (any, error) {
+	var parsed any
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return nil, err
+	}
+	m, ok := parsed.(map[string]any)
+	if !ok {
+		return parsed, nil
+	}
+	res, ok := m["result"].([]any)
+	if !ok || len(res) != 0 {
+		return parsed, nil
+	}
+	m["hint"] = hint
+	return parsed, nil
+}
+
 func (s *Server) handlePrometheusQuery(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 	if s.cfg.Prometheus == nil {
 		return errResult("prometheus is not configured (prometheus.enabled is false in config)"), nil
@@ -593,8 +625,8 @@ func (s *Server) handlePrometheusQuery(ctx context.Context, req mcplib.CallToolR
 		return errResult("prometheus query failed: " + err.Error()), nil
 	}
 
-	var parsed any
-	if err := json.Unmarshal(data, &parsed); err != nil {
+	parsed, err := annotateEmptyResult(data, promEmptyHint)
+	if err != nil {
 		return errResult("failed to parse prometheus response: " + err.Error()), nil
 	}
 	result, err := mcplib.NewToolResultJSON(parsed)
@@ -649,8 +681,8 @@ func (s *Server) handlePrometheusQueryRange(ctx context.Context, req mcplib.Call
 		return errResult("prometheus range query failed: " + err.Error()), nil
 	}
 
-	var parsed any
-	if err := json.Unmarshal(data, &parsed); err != nil {
+	parsed, err := annotateEmptyResult(data, promEmptyHint)
+	if err != nil {
 		return errResult("failed to parse prometheus response: " + err.Error()), nil
 	}
 	result, err := mcplib.NewToolResultJSON(parsed)
@@ -735,8 +767,8 @@ func (s *Server) handleLogsQueryRange(ctx context.Context, req mcplib.CallToolRe
 		return errResult("logs range query failed: " + err.Error()), nil
 	}
 
-	var parsed any
-	if err := json.Unmarshal(data, &parsed); err != nil {
+	parsed, err := annotateEmptyResult(data, logsEmptyHint)
+	if err != nil {
 		return errResult("failed to parse logs response: " + err.Error()), nil
 	}
 	result, err := mcplib.NewToolResultJSON(parsed)
