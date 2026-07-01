@@ -6,6 +6,8 @@
 //   - every page in a section directory has frontmatter with the required
 //     fields (title, description, section, order, slug)
 //   - slugs are unique across the whole tree
+//   - page "order" values are unique within each section, so the sidebar has
+//     a deterministic order
 //   - the frontmatter section matches a section title in meta.yaml, and the
 //     file lives in the directory named by that section's id
 //   - each page has exactly one H1, and it matches the frontmatter title
@@ -77,7 +79,8 @@ func run(docsDir string) []string {
 		titleByDir[s.ID] = s.Title
 	}
 
-	slugSeen := make(map[string]string) // slug -> first file that used it
+	slugSeen := make(map[string]string)  // slug -> first file that used it
+	orderSeen := make(map[string]string) // "section-dir\x00order" -> first file that used it
 	pages := 0
 
 	walkErr := filepath.WalkDir(docsDir, func(path string, d os.DirEntry, err error) error { // #nosec G703 -- docs dir comes from the CLI argument; this is a repo-local lint tool
@@ -100,7 +103,7 @@ func run(docsDir string) []string {
 			return nil
 		}
 		pages++
-		errs = append(errs, checkPage(path, rel, titleByDir, slugSeen)...)
+		errs = append(errs, checkPage(path, rel, titleByDir, slugSeen, orderSeen)...)
 		return nil
 	})
 	if walkErr != nil {
@@ -149,7 +152,7 @@ func loadMeta(path string) (*meta, []string) {
 	return &m, errs
 }
 
-func checkPage(path, rel string, titleByDir map[string]string, slugSeen map[string]string) []string {
+func checkPage(path, rel string, titleByDir map[string]string, slugSeen, orderSeen map[string]string) []string {
 	raw, err := os.ReadFile(path) // #nosec G304 -- path comes from walking the docs tree
 	if err != nil {
 		return []string{err.Error()}
@@ -189,6 +192,17 @@ func checkPage(path, rel string, titleByDir map[string]string, slugSeen map[stri
 		errs = append(errs, fmt.Sprintf("%s: directory %q is not a section id in meta.yaml", path, dir))
 	} else if fm.Section != "" && fm.Section != sectionTitle {
 		errs = append(errs, fmt.Sprintf("%s: frontmatter section %q does not match meta.yaml title %q for directory %q", path, fm.Section, sectionTitle, dir))
+	}
+
+	// Page order must be unique within its section directory, else the sidebar
+	// order between the colliding pages is arbitrary.
+	if fm.Order > 0 {
+		key := fmt.Sprintf("%s\x00%d", dir, fm.Order)
+		if first, dup := orderSeen[key]; dup {
+			errs = append(errs, fmt.Sprintf("%s: order %d already used by %s in section %q", path, fm.Order, first, dir))
+		} else {
+			orderSeen[key] = path
+		}
 	}
 
 	errs = append(errs, checkBody(path, fm.Title, body)...)

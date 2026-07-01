@@ -1,6 +1,6 @@
 ---
 title: "Sentry"
-description: "Poll Sentry releases and deploys into change events so triage can answer \"what shipped right before this?\"."
+description: "Poll Sentry releases and deploys as change events, enrich triage with the firing exceptions and their file:line, and investigate both over MCP."
 section: "Integrations"
 order: 4
 slug: "sentry"
@@ -54,6 +54,20 @@ changes:
   retention_days: 30                   # Sentry changes are pruned by this, like all changes
 ```
 
+| Field | Description |
+|---|---|
+| `base_url` | Sentry host root, e.g. `https://sentry.io` (see [Base URL](#base-url)). AlertINT appends the API path. |
+| `org` | Your Sentry organization slug. |
+| `token_env` | Name of the env var holding the auth token — never inline. |
+| `timeout_seconds` | HTTP timeout for Sentry calls. Default `10`. |
+| `releases.enabled` | Set `true` to run the release/deploy poller (the **Change source**). |
+| `releases.poll_interval_seconds` | How often to poll for new deploys. Default `60`. |
+| `releases.initial_lookback_minutes` | On first run, seed the watermark this far back. Default `60`. |
+| `releases.release_scan_horizon_days` | Oldest a release can be and still have new deploys detected. Default `30`. |
+| `releases.projects` | Optional list of project slugs to scope polling. Omit for org-wide. |
+
+The `changes.*` keys above are the shared change plane, not Sentry-specific — see
+the [change-events configuration](../getting-started/configuration.md#changes).
 The poller writes change events; **`changes.enrichment` is what surfaces them**
 at triage time and over MCP. Enable both. Sentry changes are ordinary change
 rows, so they are pruned by the shared `changes.retention_days` — there is no
@@ -121,10 +135,8 @@ changes (see [change events](changes.md)).
 
 Sentry deploys render in the prompt as part of the **Recent changes** block,
 most-relevant-first, each with a `Δ6m before incident start` hint and a link back
-to the release in Sentry. When change enrichment is on, the read-only
-`alertint_recent_changes` MCP tool returns them too, so an investigating AI agent
-can widen the window or pivot projects beyond what auto-enrichment attached to the
-finding.
+to the release in Sentry. They are also queryable after the fact over MCP — see
+[MCP tools](#mcp-tools).
 
 ## Error source — issue enrichment at triage
 
@@ -156,7 +168,7 @@ evidence MCP tool exposes it — no extra query. A successful search that matche
 **no** issues is itself recorded as a signal: evidence the incident is likely not
 application-code-driven.
 
-### Enable it
+### Enable the Error source
 
 ```yaml
 sentry:
@@ -171,6 +183,15 @@ sentry:
     live_window_minutes: 60     # default look-back for the live sentry_issues_list MCP tool
     include_message: true       # include the exception message (default; see privacy below)
 ```
+
+| Field | Description |
+|---|---|
+| `issues.enabled` | Set `true` to run issue enrichment at triage (the **Error source**). |
+| `issues.lookback_minutes` | Window `W` back from the first alert; reaches a precursor error. Default `30`. |
+| `issues.max_issues` | The `K` in the `1+K` call budget — how many top issues to render. Default `3`. |
+| `issues.fetch_timeout_seconds` | Bounds the whole `1+K` fetch; on timeout the section degrades. Default `15`. |
+| `issues.live_window_minutes` | Default look-back for the live `sentry_issues_list` MCP tool. Default `60`. |
+| `issues.include_message` | Include the exception message across all surfaces. Default `true` (see privacy below). |
 
 The Error source is **independent of the release poller**: enable `sentry.issues`
 with `sentry.releases` off and AlertINT builds the shared client for triage
@@ -229,17 +250,19 @@ When Sentry is disabled, or the query degraded (rate-limited, timeout, unknown
 project), **no tag and no headline** are emitted — so `infra-only` always means *"we
 looked and found nothing new,"* never *"Sentry isn't configured."*
 
-### Live read tools (MCP)
+## MCP tools
 
-The triage-time `sentry` section is a **frozen snapshot** — the top-`max_issues`
-issues as they looked when the incident was analyzed. When an engineer (or their AI
-agent) picks the thread up later, two read-only MCP tools reach **past** that
-snapshot, over the same Error-source connection. They register only when
-`sentry.issues` is enabled with a live client — a releases-only deployment exposes
-neither.
+The Sentry connector contributes three read-only MCP tools, one per role plus the
+shared change-plane tool. The Change source's deploys are queryable through
+`alertint_recent_changes`; the Error source adds two live issue tools that reach
+**past** the triage-time `sentry` section — a **frozen snapshot** of the
+top-`max_issues` issues as they looked when the incident was analyzed. The two
+`sentry_*` tools register only when `sentry.issues` is enabled with a live client —
+a releases-only deployment exposes neither.
 
 | Tool | Answers |
 |---|---|
+| `alertint_recent_changes` | *What shipped near this incident?* Recent change events — including polled Sentry deploys — by label selector and window. Shared with the change-events connector; see [Change events → Investigate over MCP](changes.md#investigate-over-mcp). |
 | `sentry_issues_list` | *What is erroring for this scope — live, beyond the triage cap, across statuses?* Lists distilled issues for an explicit `project` (+ optional `environment`), newest-relevant first. |
 | `sentry_issues_trace` | *Show me the full stacktrace for these issue ids.* Returns every exception frame (`file:line`, function, `in_app`) per id, plus the latest event's timestamp — the real cause is sometimes a frame deeper than the one in-app line the snapshot carried. |
 
@@ -288,3 +311,14 @@ Integration token** to bound which projects an agent can reach.
 names, and exception messages are attacker-influenceable (anyone who can trigger an
 application error can plant text). AlertINT length-caps these verbatim strings, but
 an agent consuming them should treat them as data, not instructions.
+
+### Example queries
+
+Ask your investigating agent in natural language — AlertINT routes to the Sentry
+MCP tools:
+
+```text
+What's still erroring for checkout in prod right now?
+Show me the full stacktrace for the corroborating issue on this incident.
+Was this error for payments seen before and already resolved or muted?
+```
