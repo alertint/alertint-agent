@@ -62,6 +62,20 @@ func newAlert(fp string, labels map[string]string, receivedAt time.Time) store.A
 	}
 }
 
+// waitFor polls cond until it returns true or the timeout elapses, failing the
+// test with msg on timeout.
+func waitFor(t *testing.T, cond func() bool, timeout time.Duration, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", msg)
+}
+
 // startCorrelator creates and starts a Correlator with a fast tick for tests.
 func startCorrelator(t *testing.T, cfg correlator.Config, st *store.Store, sink correlator.IncidentSink) *correlator.Correlator {
 	t.Helper()
@@ -346,5 +360,85 @@ func TestWindowResetAfterFlush(t *testing.T) {
 		if inc.AlertCount < 1 {
 			t.Errorf("incident[%d].alert_count = %d, want >= 1", i, inc.AlertCount)
 		}
+	}
+}
+
+// TestIncidentResolvesWhenAllMembersResolve is the BUG-3 verification: the
+// resolution path only transitions an incident to "resolved" once EVERY member
+// alert is resolved. A partially-recovered incident must stay put; the full
+// recovery must flip status and advance updated_at. This confirms the mechanism
+// (handleResolvedAlert → maybeResolveIncident → MarkIncidentResolved) works, so
+// a lingering "analyzed"/"ready" status in practice means some member was still
+// firing — not a resolution-detection bug.
+func TestIncidentResolvesWhenAllMembersResolve(t *testing.T) {
+	st := newTestStore(t)
+	sink := &captureSink{}
+	cfg := correlator.Config{WindowSeconds: 1, TickInterval: 20 * time.Millisecond}
+	c := startCorrelator(t, cfg, st, sink)
+	ctx := context.Background()
+
+	labels := map[string]string{"alertname": "Cascade", "cluster": "prod"}
+	t0 := time.Now()
+	a1 := newAlert("fp-a1", labels, t0)
+	a2 := newAlert("fp-a2", labels, t0)
+	for _, a := range []store.Alert{a1, a2} {
+		if _, err := st.UpsertAlertByFingerprint(ctx, a); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+		if err := c.Accept(ctx, a); err != nil {
+			t.Fatalf("accept: %v", err)
+		}
+	}
+
+	// Window flushes → incident ready.
+	waitFor(t, func() bool { return sink.len() > 0 }, 3*time.Second, "incident ready")
+	incID := sink.get(0).ID
+	ready, err := st.GetIncidentByID(ctx, incID)
+	if err != nil {
+		t.Fatalf("get ready incident: %v", err)
+	}
+	if ready.Status != "ready" {
+		t.Fatalf("incident status = %q, want ready", ready.Status)
+	}
+
+	// Resolve only the first member (same fingerprint, flipped status) → the
+	// incident must stay ready because not all members are resolved.
+	resolve := func(a store.Alert) {
+		a.Status = "resolved"
+		a.ReceivedAt = time.Now()
+		if _, err := st.UpsertAlertByFingerprint(ctx, a); err != nil {
+			t.Fatalf("upsert resolved %s: %v", a.Fingerprint, err)
+		}
+		if err := c.Accept(ctx, a); err != nil {
+			t.Fatalf("accept resolved %s: %v", a.Fingerprint, err)
+		}
+	}
+	resolve(a1)
+	// Let the drain goroutine process, then assert still-ready (requires ALL).
+	time.Sleep(250 * time.Millisecond)
+	partial, err := st.GetIncidentByID(ctx, incID)
+	if err != nil {
+		t.Fatalf("get incident after partial resolve: %v", err)
+	}
+	if partial.Status != "ready" {
+		t.Fatalf("after resolving 1 of 2 members, status = %q, want ready (resolution requires ALL members)", partial.Status)
+	}
+
+	// Resolve the second member → all resolved → incident transitions to resolved.
+	resolve(a2)
+	waitFor(t, func() bool {
+		g, e := st.GetIncidentByID(ctx, incID)
+		return e == nil && g.Status == "resolved"
+	}, 3*time.Second, "incident resolved")
+
+	final, err := st.GetIncidentByID(ctx, incID)
+	if err != nil {
+		t.Fatalf("get resolved incident: %v", err)
+	}
+	if final.Status != "resolved" {
+		t.Fatalf("after all members resolved, status = %q, want resolved", final.Status)
+	}
+	if !final.UpdatedAt.After(ready.UpdatedAt) {
+		t.Errorf("updated_at did not advance on resolution: ready=%v resolved=%v", ready.UpdatedAt, final.UpdatedAt)
 	}
 }

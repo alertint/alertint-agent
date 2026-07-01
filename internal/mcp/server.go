@@ -210,6 +210,36 @@ func (s *Server) toolVerifyAudit() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 // Handlers
 // -----------------------------------------------------------------------------
 
+// recoveryView is the derived recovery signal attached to every incident MCP
+// payload so a consumer can tell an active incident from a recovering/recovered
+// one WITHOUT a second round trip querying member-alert statuses (BUG-3). It is
+// computed, never stored: member firing/resolved tallies plus resolved_at (the
+// incident's updated_at once its lifecycle status is "resolved").
+type recoveryView struct {
+	FiringAlerts   int        `json:"firing_alerts"`
+	ResolvedAlerts int        `json:"resolved_alerts"`
+	TotalAlerts    int        `json:"total_alerts"`
+	FullyResolved  bool       `json:"fully_resolved"`
+	ResolvedAt     *time.Time `json:"resolved_at,omitempty"`
+}
+
+// buildRecovery assembles the recovery signal. fully_resolved reflects the member
+// alerts (every member recovered), which can lead the incident's own lifecycle
+// status; resolved_at is set only once that status has caught up to "resolved".
+func buildRecovery(firing, resolved, total int, status string, updatedAt time.Time) recoveryView {
+	r := recoveryView{
+		FiringAlerts:   firing,
+		ResolvedAlerts: resolved,
+		TotalAlerts:    total,
+		FullyResolved:  total > 0 && firing == 0,
+	}
+	if status == "resolved" {
+		u := updatedAt
+		r.ResolvedAt = &u
+	}
+	return r
+}
+
 func (s *Server) handleListIncidents(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 	limit := mcplib.ParseInt(req, "limit", 20)
 	if limit < 1 {
@@ -222,20 +252,31 @@ func (s *Server) handleListIncidents(ctx context.Context, req mcplib.CallToolReq
 	}
 
 	type row struct {
-		ID           string    `json:"id"`
-		GroupKey     string    `json:"group_key"`
-		Status       string    `json:"status"`
-		AlertCount   int       `json:"alert_count"`
-		Summary      string    `json:"summary,omitempty"`
-		RootCause    string    `json:"root_cause,omitempty"`
-		Confidence   float64   `json:"confidence,omitempty"`
-		FirstAlertAt time.Time `json:"first_alert_at"`
-		LastAlertAt  time.Time `json:"last_alert_at"`
-		CreatedAt    time.Time `json:"created_at"`
+		ID           string       `json:"id"`
+		GroupKey     string       `json:"group_key"`
+		Status       string       `json:"status"`
+		AlertCount   int          `json:"alert_count"`
+		Summary      string       `json:"summary,omitempty"`
+		RootCause    string       `json:"root_cause,omitempty"`
+		Confidence   float64      `json:"confidence,omitempty"`
+		FirstAlertAt time.Time    `json:"first_alert_at"`
+		LastAlertAt  time.Time    `json:"last_alert_at"`
+		CreatedAt    time.Time    `json:"created_at"`
+		Recovery     recoveryView `json:"recovery"`
+	}
+
+	ids := make([]string, len(incidents))
+	for i, inc := range incidents {
+		ids[i] = inc.ID
+	}
+	counts, err := s.st.IncidentMemberStatusCounts(ctx, ids)
+	if err != nil {
+		return errResult("failed to load recovery counts: " + err.Error()), nil
 	}
 
 	rows := make([]row, 0, len(incidents))
 	for _, inc := range incidents {
+		c := counts[inc.ID]
 		rows = append(rows, row{
 			ID:           inc.ID,
 			GroupKey:     inc.GroupKey,
@@ -247,6 +288,7 @@ func (s *Server) handleListIncidents(ctx context.Context, req mcplib.CallToolReq
 			FirstAlertAt: inc.FirstAlertAt,
 			LastAlertAt:  inc.LastAlertAt,
 			CreatedAt:    inc.CreatedAt,
+			Recovery:     buildRecovery(c.Firing, c.Resolved, c.Total, inc.Status, inc.UpdatedAt),
 		})
 	}
 
@@ -307,6 +349,17 @@ func (s *Server) handleGetIncident(ctx context.Context, req mcplib.CallToolReque
 		})
 	}
 
+	// Derive the recovery signal from the member alerts already loaded above.
+	var firing, resolved int
+	for _, a := range alerts {
+		switch a.Status {
+		case "firing":
+			firing++
+		case "resolved":
+			resolved++
+		}
+	}
+
 	payload := map[string]any{
 		"id":             inc.ID,
 		"group_key":      inc.GroupKey,
@@ -319,6 +372,7 @@ func (s *Server) handleGetIncident(ctx context.Context, req mcplib.CallToolReque
 		"summary":        inc.Summary,
 		"root_cause":     inc.RootCause,
 		"confidence":     inc.Confidence,
+		"recovery":       buildRecovery(firing, resolved, len(alerts), inc.Status, inc.UpdatedAt),
 		"finding":        finding,
 		"alerts":         alertRows,
 	}
