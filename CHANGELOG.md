@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-07-01
+
+### Fixed
+
+- **Sentry integration docs** — the page now documents both connector roles as
+  consistently as the other integration docs. The frontmatter summary covers the
+  Error source alongside the Change source, the `sentry.releases` and `sentry.issues`
+  config blocks each gained a field-reference table, and all three MCP tools
+  (`alertint_recent_changes`, `sentry_issues_list`, `sentry_issues_trace`) now live
+  under one `MCP tools` section with an example-queries block.
+- **Docs sidebar ordering** — `loki` and `mcp-clients` both declared `order: 2`,
+  leaving their relative sidebar position undefined; `mcp-clients` is now `order: 5`.
+
+### Changed
+
+- **Docs validator** — `docs/scripts` now rejects duplicate page `order` values
+  within a section, so the rendered sidebar order stays deterministic.
+
 ## [0.5.1] - 2026-07-01
 
 ### Fixed
@@ -161,7 +179,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single static binary** — pure-Go SQLite (no CGO), no external runtime dependencies.
   Multi-platform builds: `linux/amd64`, `linux/arm64`, `darwin/arm64`.
 
-[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/alertint/alertint-agent/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/alertint/alertint-agent/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/alertint/alertint-agent/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/alertint/alertint-agent/compare/v0.3.0...v0.4.0

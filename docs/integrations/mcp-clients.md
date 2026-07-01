@@ -2,7 +2,7 @@
 title: "MCP clients"
 description: "Query AlertINT findings from Claude and other MCP clients."
 section: "Integrations"
-order: 2
+order: 5
 slug: "mcp-clients"
 ---
 
