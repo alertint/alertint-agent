@@ -16,6 +16,12 @@ tools for MCP-driven investigation. The connector only issues queries; it
 never writes metrics, creates recording rules, or modifies Prometheus
 state.
 
+Prometheus is the **recommended first evidence source**: if you run
+Alertmanager, you almost certainly run Prometheus, and connecting it is
+what lifts findings past the metadata-only confidence cap — with live
+metric values, the triage argues from evidence instead of annotations
+alone.
+
 ## Alertmanager — the alert source
 
 Add an `alertint-agent` receiver to your `alertmanager.yml` and route

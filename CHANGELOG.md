@@ -22,9 +22,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `logs.provider` now defaults to `loki`.
 - **Single-alert triage by default** — `correlator.min_alerts` defaults to `1`
   (was `2`), so a lone first alert still produces a finding.
+- **Example config ships change ingress and MCP enabled** —
+  `config.example.yaml` now has `changes.ingress.enabled: true` (the flagship
+  demo is causal out of the box, and a one-line deploy-time `curl` gives real
+  triage its "what changed" evidence) and `mcp.enabled: true` (the demo's
+  payoff fetch and the product's MCP handoff work without editing config).
+  Copying the example verbatim therefore requires `ALERTINT_CHANGES_WEBHOOK_TOKEN`
+  and `ALERTINT_MCP_TOKEN` at startup (both documented in `.env.example`).
+  Docs positioning updated to match: Prometheus is promoted to the recommended
+  first evidence source; Pushgateway synthetic metrics are demoted to optional
+  compose-stack realism.
 
 ### Added
 
+- **`alertint demo`** — a built-in guided demo: one command fires a synthetic
+  Drill at a running instance and ends at "finding ready". The flagship
+  scenario plants a fake deploy on the change webhook and follows with an
+  overlapping alert burst, producing a causal, uncapped finding that names the
+  deploy; a `--scenario storm` variant exercises storm collapse. Everything is
+  derived from the same config file `serve` reads (receiver/MCP addresses,
+  tokens, `group_labels` adaptation); the console prints progress, then one
+  one-shot MCP fetch renders the finding plus the
+  `investigate incident <id> using alertint` handoff (`--result <id>`
+  re-checks a slow triage). Demo alerts carry the reserved
+  `alertint_demo="true"` label — rendered as a 🧪 DRILL banner on Slack cards
+  and a `drill` flag on the MCP incident list — and the whole `alertint_`
+  label-key prefix is now reserved (rejected in `correlator.group_labels`).
+  Remote targets require confirmation (`--yes`), plain-HTTP remotes an
+  explicit `--allow-insecure-http`, and `--via-alertmanager` optionally
+  validates your AM→AlertINT routing.
+- **`alertint validate <config>`** — an `nginx -t`-style config dry-run: strict
+  parse (unknown keys rejected) plus full validation, skipping
+  machine-coupled filesystem checks so pod-destined configs validate cleanly
+  on a laptop or CI runner; exits 0/1 with actionable errors.
 - **`notify.slack.min_severity`** (`low` | `medium` | `high`, default `low`) — a
   Slack noise gate: findings below the threshold are not posted (stdout always
   emits, and a suppressed incident's resolution is suppressed too). Suppressions

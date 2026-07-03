@@ -38,7 +38,9 @@ mcp:
   token_env: ALERTINT_MCP_TOKEN
 
 # Prometheus read connector — queries this for metric context during incident
-# investigation. Use push-synthetic-metrics.sh to populate test data.
+# investigation. For a guided first run use `alertint demo` (see the
+# quickstart); push-synthetic-metrics.sh is optional extra realism for this
+# compose stack only.
 prometheus:
   enabled: true
   base_url: http://prometheus:9090
