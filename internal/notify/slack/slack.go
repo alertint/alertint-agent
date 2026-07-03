@@ -223,13 +223,31 @@ func (n *Notifier) audit(ctx context.Context, incidentID, event string) {
 // Block Kit payload builders
 // ----------------------------------------------------------------------
 
+// drillMd / drillPlain return the DRILL banner fragment prepended to every
+// rendered surface of a Drill finding (main card, thread detail, fallback):
+// a synthetic card must be unmistakably synthetic in a shared channel
+// (ADR-0013). Empty for real incidents.
+func drillMd(f notify.Finding) string {
+	if f.Drill {
+		return ":test_tube: *DRILL* — "
+	}
+	return ""
+}
+
+func drillPlain(f notify.Finding) string {
+	if f.Drill {
+		return "🧪 DRILL — "
+	}
+	return ""
+}
+
 // firingMainBlocks builds the brief main-channel message posted when an incident
 // fires: headline + root cause only. Keeps the channel timeline scannable.
 func firingMainBlocks(f notify.Finding) []slacklib.Block {
 	blocks := []slacklib.Block{
 		slacklib.NewSectionBlock(
 			slacklib.NewTextBlockObject(slacklib.MarkdownType,
-				fmt.Sprintf(":red_circle: *INCIDENT DETECTED* — %s", f.AnalysisName), false, false),
+				fmt.Sprintf("%s:red_circle: *INCIDENT DETECTED* — %s", drillMd(f), f.AnalysisName), false, false),
 			nil, nil,
 		),
 	}
@@ -269,7 +287,7 @@ func firingDetailBlocks(f notify.Finding) []slacklib.Block {
 
 	blocks := []slacklib.Block{
 		slacklib.NewSectionBlock(
-			slacklib.NewTextBlockObject(slacklib.MarkdownType, "*Analysis details*", false, false),
+			slacklib.NewTextBlockObject(slacklib.MarkdownType, drillMd(f)+"*Analysis details*", false, false),
 			nil, nil,
 		),
 		slacklib.NewSectionBlock(nil, []*slacklib.TextBlockObject{
@@ -312,7 +330,7 @@ func resolvedMainBlocks(f notify.Finding) []slacklib.Block {
 	blocks := []slacklib.Block{
 		slacklib.NewSectionBlock(
 			slacklib.NewTextBlockObject(slacklib.MarkdownType,
-				fmt.Sprintf(":white_check_mark: *INCIDENT RESOLVED* — %s", f.AnalysisName), false, false),
+				fmt.Sprintf("%s:white_check_mark: *INCIDENT RESOLVED* — %s", drillMd(f), f.AnalysisName), false, false),
 			nil, nil,
 		),
 	}
@@ -339,7 +357,7 @@ func resolvedThreadBlocks(f notify.Finding) []slacklib.Block {
 	return []slacklib.Block{
 		slacklib.NewSectionBlock(
 			slacklib.NewTextBlockObject(slacklib.MarkdownType,
-				":white_check_mark: *All clear — all alerts have recovered.*", false, false),
+				drillMd(f)+":white_check_mark: *All clear — all alerts have recovered.*", false, false),
 			nil, nil,
 		),
 		slacklib.NewSectionBlock(nil, []*slacklib.TextBlockObject{
@@ -359,13 +377,13 @@ func resolvedThreadBlocks(f notify.Finding) []slacklib.Block {
 }
 
 func firingFallback(f notify.Finding) string {
-	return fmt.Sprintf("🔴 INCIDENT DETECTED: %s (severity: %s)",
-		f.AnalysisName, strings.ToUpper(f.Severity))
+	return fmt.Sprintf("%s🔴 INCIDENT DETECTED: %s (severity: %s)",
+		drillPlain(f), f.AnalysisName, strings.ToUpper(f.Severity))
 }
 
 func resolvedFallback(f notify.Finding) string {
-	return fmt.Sprintf("✅ INCIDENT RESOLVED: %s (duration: %s)",
-		f.AnalysisName, formatDuration(f.AnalyzedAt.Sub(f.FirstAlertAt)))
+	return fmt.Sprintf("%s✅ INCIDENT RESOLVED: %s (duration: %s)",
+		drillPlain(f), f.AnalysisName, formatDuration(f.AnalyzedAt.Sub(f.FirstAlertAt)))
 }
 
 func shortID(id string) string {

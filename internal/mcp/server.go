@@ -138,7 +138,8 @@ func (s *Server) withBearerAuth(next http.Handler) http.Handler {
 func (s *Server) toolListIncidents() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 	tool := mcplib.NewTool("alertint_list_incidents",
 		mcplib.WithDescription("List recent AlertINT incidents, newest first. "+
-			"Each incident groups one or more related alerts with an AI finding."),
+			"Each incident groups one or more related alerts with an AI finding. "+
+			"Rows with drill=true are synthetic drills fired by `alertint demo`, not real incidents."),
 		mcplib.WithInteger("limit",
 			mcplib.Description("Maximum number of incidents to return (1–100, default 20)."),
 		),
@@ -263,6 +264,9 @@ func (s *Server) handleListIncidents(ctx context.Context, req mcplib.CallToolReq
 		LastAlertAt  time.Time    `json:"last_alert_at"`
 		CreatedAt    time.Time    `json:"created_at"`
 		Recovery     recoveryView `json:"recovery"`
+		// Drill: the incident contains a Demo alert (alertint_demo="true",
+		// ADR-0013) — synthetic, fired by `alertint demo`.
+		Drill bool `json:"drill,omitempty"`
 	}
 
 	ids := make([]string, len(incidents))
@@ -272,6 +276,10 @@ func (s *Server) handleListIncidents(ctx context.Context, req mcplib.CallToolReq
 	counts, err := s.st.IncidentMemberStatusCounts(ctx, ids)
 	if err != nil {
 		return errResult("failed to load recovery counts: " + err.Error()), nil
+	}
+	drills, err := s.st.IncidentDrillFlags(ctx, ids)
+	if err != nil {
+		return errResult("failed to load drill flags: " + err.Error()), nil
 	}
 
 	rows := make([]row, 0, len(incidents))
@@ -289,6 +297,7 @@ func (s *Server) handleListIncidents(ctx context.Context, req mcplib.CallToolReq
 			LastAlertAt:  inc.LastAlertAt,
 			CreatedAt:    inc.CreatedAt,
 			Recovery:     buildRecovery(c.Firing, c.Resolved, c.Total, inc.Status, inc.UpdatedAt),
+			Drill:        drills[inc.ID],
 		})
 	}
 

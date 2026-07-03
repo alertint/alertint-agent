@@ -249,6 +249,7 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 			AnalyzedAt:          time.Now().UTC(),
 			OutputJSON:          raw,
 			Status:              incidentStatus,
+			Drill:               isDrill(alerts),
 		}
 		// Multi owns the per-sink notify outcome line(s): a quiet "notified" on
 		// success, a "notify partial"/"notify failed" summary plus one "notify
@@ -470,4 +471,16 @@ func clampConfidence(c *float64) {
 	if *c > 1 {
 		*c = 1
 	}
+}
+
+// isDrill reports whether any member alert carries the Demo-alert marker
+// (ADR-0013). Any-not-all: a mixed incident stays flagged so a synthetic
+// card never passes as fully real.
+func isDrill(alerts []store.Alert) bool {
+	for _, a := range alerts {
+		if a.Labels[store.DemoMarkerLabel] == store.DemoMarkerValue {
+			return true
+		}
+	}
+	return false
 }

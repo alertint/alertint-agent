@@ -27,6 +27,10 @@ type Finding struct {
 	AnalyzedAt          time.Time       `json:"analyzed_at"`
 	OutputJSON          json.RawMessage `json:"output_json,omitempty"`
 	Status              string          `json:"status,omitempty"` // "ongoing" | "resolved"
+	// Drill marks an incident containing at least one Demo alert
+	// (member label alertint_demo="true", ADR-0013). Renderers must make
+	// a Drill unmistakably synthetic (e.g. the Slack DRILL banner).
+	Drill bool `json:"drill,omitempty"`
 }
 
 // Notifier delivers a Finding to some destination. Name returns a stable,

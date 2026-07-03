@@ -220,6 +220,16 @@ func parseMigrationName(filename string) (int, string, error) {
 // Alert round-trip helpers (Slice 02 minimum surface).
 // ----------------------------------------------------------------------
 
+// The alertint_ label-key prefix is reserved as AlertINT-owned (ADR-0013).
+// Its first citizen is the Demo-alert marker: alerts fired by `alertint demo`
+// carry DemoMarkerLabel=DemoMarkerValue, and an incident containing one is a
+// Drill. The marker is sender-asserted (same door, same token — presented,
+// not authenticated) and never participates in correlator grouping.
+const (
+	DemoMarkerLabel = "alertint_demo"
+	DemoMarkerValue = "true"
+)
+
 // Alert is the in-memory representation of a row in the alerts table.
 type Alert struct {
 	ID          string
@@ -659,6 +669,48 @@ func (s *Store) IncidentMemberStatusCounts(ctx context.Context, ids []string) (m
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("store: status count rows: %w", err)
+	}
+	return out, nil
+}
+
+// IncidentDrillFlags reports, for each incident id, whether any member alert
+// carries the Demo-alert marker label (DemoMarkerLabel=DemoMarkerValue) —
+// i.e. whether the incident is a Drill (ADR-0013). One batch query, same
+// json_each shape as IncidentMemberStatusCounts, so list rendering stays
+// free of per-incident queries. Ids with no marker map to false; an empty
+// id list yields an empty map.
+func (s *Store) IncidentDrillFlags(ctx context.Context, ids []string) (map[string]bool, error) {
+	out := make(map[string]bool, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	for _, id := range ids {
+		out[id] = false
+	}
+	idsJSON, err := json.Marshal(ids)
+	if err != nil {
+		return nil, fmt.Errorf("store: marshal incident ids: %w", err)
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT ia.incident_id
+		FROM incident_alerts ia
+		JOIN alerts a ON a.id = ia.alert_id
+		WHERE ia.incident_id IN (SELECT value FROM json_each(?))
+		  AND json_extract(a.labels_json, '$.`+DemoMarkerLabel+`') = ?
+	`, string(idsJSON), DemoMarkerValue)
+	if err != nil {
+		return nil, fmt.Errorf("store: incident drill flags: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("store: scan drill flag: %w", err)
+		}
+		out[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: drill flag rows: %w", err)
 	}
 	return out, nil
 }
