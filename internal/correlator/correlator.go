@@ -68,7 +68,7 @@ type Config struct {
 }
 
 // DefaultTickInterval is the flush-ticker default, exported so callers that
-// budget around window expiry (e.g. `alertint demo`) reference the real value
+// budget around window expiry (e.g. `alertint drill`) reference the real value
 // instead of hand-copying it.
 const DefaultTickInterval = 5 * time.Second
 

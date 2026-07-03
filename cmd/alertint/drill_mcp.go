@@ -11,7 +11,7 @@ import (
 	"net/http"
 )
 
-// mcpOneShotClient is the demo's minimal MCP client: initialize once, then
+// mcpOneShotClient is the drill's minimal MCP client: initialize once, then
 // tools/call over streamable HTTP. The server's session validation is
 // format-only (stateless session manager), so carrying the id returned by
 // initialize is sufficient — no notifications, no streams, no SSE.
@@ -48,13 +48,13 @@ func newMCPOneShotClient(endpoint, token string, httpClient *http.Client) *mcpOn
 func (c *mcpOneShotClient) post(ctx context.Context, method string, params any) (json.RawMessage, http.Header, error) {
 	body, err := json.Marshal(jsonrpcRequest{JSONRPC: "2.0", ID: c.nextID, Method: method, Params: params})
 	if err != nil {
-		return nil, nil, fmt.Errorf("demo: marshal %s request: %w", method, err)
+		return nil, nil, fmt.Errorf("drill: marshal %s request: %w", method, err)
 	}
 	c.nextID++
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
 	if err != nil {
-		return nil, nil, fmt.Errorf("demo: build %s request: %w", method, err)
+		return nil, nil, fmt.Errorf("drill: build %s request: %w", method, err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/json")
@@ -65,23 +65,23 @@ func (c *mcpOneShotClient) post(ctx context.Context, method string, params any) 
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, nil, fmt.Errorf("demo: mcp %s: %w", method, err)
+		return nil, nil, fmt.Errorf("drill: mcp %s: %w", method, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return nil, nil, fmt.Errorf("demo: read mcp %s response: %w", method, err)
+		return nil, nil, fmt.Errorf("drill: read mcp %s response: %w", method, err)
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		return nil, nil, fmt.Errorf("demo: mcp %s: http %d: %s", method, resp.StatusCode, snippet(raw))
+		return nil, nil, fmt.Errorf("drill: mcp %s: http %d: %s", method, resp.StatusCode, snippet(raw))
 	}
 
 	var rpc jsonrpcResponse
 	if err := json.Unmarshal(raw, &rpc); err != nil {
-		return nil, nil, fmt.Errorf("demo: mcp %s: decode response: %w (%s)", method, err, snippet(raw))
+		return nil, nil, fmt.Errorf("drill: mcp %s: decode response: %w (%s)", method, err, snippet(raw))
 	}
 	if rpc.Error != nil {
-		return nil, nil, fmt.Errorf("demo: mcp %s: rpc error %d: %s", method, rpc.Error.Code, rpc.Error.Message)
+		return nil, nil, fmt.Errorf("drill: mcp %s: rpc error %d: %s", method, rpc.Error.Code, rpc.Error.Message)
 	}
 	return rpc.Result, resp.Header, nil
 }
@@ -91,7 +91,7 @@ func (c *mcpOneShotClient) initialize(ctx context.Context) error {
 	params := map[string]any{
 		"protocolVersion": "2025-03-26",
 		"capabilities":    map[string]any{},
-		"clientInfo":      map[string]any{"name": "alertint-demo", "version": resolveVersion()},
+		"clientInfo":      map[string]any{"name": "alertint-drill", "version": resolveVersion()},
 	}
 	_, header, err := c.post(ctx, "initialize", params)
 	if err != nil {
@@ -118,13 +118,13 @@ func (c *mcpOneShotClient) callTool(ctx context.Context, name string, args map[s
 		} `json:"content"`
 	}
 	if err := json.Unmarshal(result, &tool); err != nil {
-		return nil, fmt.Errorf("demo: mcp %s: decode tool result: %w", name, err)
+		return nil, fmt.Errorf("drill: mcp %s: decode tool result: %w", name, err)
 	}
 	if len(tool.Content) == 0 {
-		return nil, fmt.Errorf("demo: mcp %s: empty tool result", name)
+		return nil, fmt.Errorf("drill: mcp %s: empty tool result", name)
 	}
 	if tool.IsError {
-		return nil, fmt.Errorf("demo: mcp %s: %s", name, tool.Content[0].Text)
+		return nil, fmt.Errorf("drill: mcp %s: %s", name, tool.Content[0].Text)
 	}
 	return json.RawMessage(tool.Content[0].Text), nil
 }

@@ -115,7 +115,7 @@ planned).
 |---|---|---|---|
 | `window_seconds` | int | `90` | Alerts sharing the same group key within this window form one incident |
 | `min_alerts` | int | `1` | Minimum alerts before the incident is dispatched to the skill. The default `1` triages a lone alert too — use `notify.slack.min_severity` to control channel noise instead of dropping triage. |
-| `group_labels` | list | `[alertname, cluster, namespace, service]` | Label names used to compute the group key. Two alerts are correlated when all of these labels match. The `alertint_` label-key prefix is reserved for AlertINT itself (e.g. the `alertint_demo` drill marker) and is rejected here — reserved labels never participate in grouping. |
+| `group_labels` | list | `[alertname, cluster, namespace, service]` | Label names used to compute the group key. Two alerts are correlated when all of these labels match. The `alertint_` label-key prefix is reserved for AlertINT itself (e.g. the `alertint_drill` drill marker) and is rejected here — reserved labels never participate in grouping. |
 
 `window_seconds` is a tradeoff. A lower value reacts faster, but an
 incident may be analyzed with only the first alert or two of a burst

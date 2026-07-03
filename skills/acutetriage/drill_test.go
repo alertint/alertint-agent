@@ -25,7 +25,7 @@ func (c *captureNotifier) Notify(_ context.Context, f notify.Finding) error {
 func (c *captureNotifier) Name() string { return "capture" }
 
 // TestRunSetsDrillOnFinding: an incident whose member alerts carry the
-// Demo-alert marker label produces a Finding with Drill=true; a mixed member
+// Drill-alert marker label produces a Finding with Drill=true; a mixed member
 // set stays flagged (any-not-all, ADR-0013); unmarked incidents stay false.
 func TestRunSetsDrillOnFinding(t *testing.T) {
 	cases := map[string]struct {
@@ -34,15 +34,15 @@ func TestRunSetsDrillOnFinding(t *testing.T) {
 	}{
 		"all members marked": {
 			labels: []map[string]string{
-				{store.DemoMarkerLabel: store.DemoMarkerValue, "service": "demo-checkout"},
-				{store.DemoMarkerLabel: store.DemoMarkerValue, "service": "demo-checkout"},
+				{store.DrillMarkerLabel: store.DrillMarkerValue, "service": "drill-checkout"},
+				{store.DrillMarkerLabel: store.DrillMarkerValue, "service": "drill-checkout"},
 			},
 			want: true,
 		},
 		"mixed members stay flagged": {
 			labels: []map[string]string{
 				{"service": "checkout"},
-				{store.DemoMarkerLabel: store.DemoMarkerValue, "service": "demo-checkout"},
+				{store.DrillMarkerLabel: store.DrillMarkerValue, "service": "drill-checkout"},
 			},
 			want: true,
 		},

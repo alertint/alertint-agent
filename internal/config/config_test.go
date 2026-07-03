@@ -788,7 +788,7 @@ func TestValidate_ReservedGroupLabelPrefix(t *testing.T) {
 	t.Run("alertint_ prefixed group label rejected in both modes", func(t *testing.T) {
 		cfg := base
 		cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
-		cfg.Correlator.GroupLabels = []string{"cluster", "alertint_demo"}
+		cfg.Correlator.GroupLabels = []string{"cluster", "alertint_drill"}
 		for name, validate := range map[string]func() error{"online": cfg.Validate, "offline": cfg.ValidateOffline} {
 			err := validate()
 			if err == nil || !strings.Contains(err.Error(), "reserved alertint_ label prefix") {

@@ -23,7 +23,7 @@ notify:
   stdout: true
   # To deliver findings to Slack: set enabled: true, put a bot token
   # (xoxb-…, chat:write scope) in SLACK_BOT_TOKEN in your .env, and set
-  # your channel. The demo runs fine without Slack — findings go to stdout.
+  # your channel. The stack runs fine without Slack — findings go to stdout.
   slack:
     enabled: false
     bot_token_env: SLACK_BOT_TOKEN
@@ -38,7 +38,7 @@ mcp:
   token_env: ALERTINT_MCP_TOKEN
 
 # Prometheus read connector — queries this for metric context during incident
-# investigation. For a guided first run use `alertint demo` (see the
+# investigation. For a guided first run use `alertint drill` (see the
 # quickstart); push-synthetic-metrics.sh is optional extra realism for this
 # compose stack only.
 prometheus:
@@ -48,7 +48,7 @@ prometheus:
   default_range_minutes: 60
 
 # Log enrichment (Loki) — pulls recent log lines at triage time and powers the
-# read-only loki_query_range MCP tool. Seed the demo Loki with fake lines:
+# read-only loki_query_range MCP tool. Seed the bundled Loki with fake lines:
 #   task logs:push:local   (local)   /   task logs:push:cloud   (Grafana Cloud)
 logs:
   enabled: true
@@ -60,7 +60,7 @@ logs:
     base_url: http://loki:3100
     auth:
       mode: none
-    # The demo's Loki streams are labelled `app` (not `service`) and `instance`.
+    # The bundled Loki's streams are labelled `app` (not `service`) and `instance`.
     # Map the alert label `service` -> stream label `app`; drop `instance` (no
     # stream-label equivalent is needed — there's one instance per app here).
     # Example: the worker incident's selector {service="worker"} becomes the
@@ -93,6 +93,6 @@ log_level: info
 #             docker-compose.yaml colors); best for reading `docker logs`.
 #   json    — structured, one object per line; best for machine ingestion.
 #   auto    — console on a TTY, json otherwise. In a container stderr is NOT a
-#             TTY, so auto would resolve to json — hence the demo sets console
+#             TTY, so auto would resolve to json — hence this stack sets console
 #             explicitly to keep the logs readable.
 log_format: console

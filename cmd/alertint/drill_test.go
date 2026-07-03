@@ -114,8 +114,8 @@ func writeRPC(w http.ResponseWriter, id int, result any) {
 	}
 }
 
-// demoTestCmd builds a demoCmd wired to the fakes with instant sleeps.
-func demoTestCmd(t *testing.T, f *fakeInstance, cfg *config.Config, opts demoOpts) (*demoCmd, *bytes.Buffer) {
+// drillTestCmd builds a drillCmd wired to the fakes with instant sleeps.
+func drillTestCmd(t *testing.T, f *fakeInstance, cfg *config.Config, opts drillOpts) (*drillCmd, *bytes.Buffer) {
 	t.Helper()
 	if opts.target == "" && f != nil {
 		opts.target = f.receiver.URL
@@ -128,7 +128,7 @@ func demoTestCmd(t *testing.T, f *fakeInstance, cfg *config.Config, opts demoOpt
 		cfg.MCP.Addr = u.Host
 	}
 	var out bytes.Buffer
-	d := &demoCmd{
+	d := &drillCmd{
 		cfg:    cfg,
 		opts:   opts,
 		stdout: &out,
@@ -146,7 +146,7 @@ func demoTestCmd(t *testing.T, f *fakeInstance, cfg *config.Config, opts demoOpt
 	return d, &out
 }
 
-func demoTestConfig(t *testing.T) *config.Config {
+func drillTestConfig(t *testing.T) *config.Config {
 	t.Helper()
 	cfg := config.Defaults()
 	cfg.Alertmanager.WebhookTokenEnv = "DEMO_TEST_WH"
@@ -165,23 +165,23 @@ func analyzedIncident(id string) map[string]any {
 	return map[string]any{
 		"id": id, "status": "analyzed", "confidence": 0.9,
 		"finding": map[string]any{
-			"analysis_name":        "Demo checkout regression",
+			"analysis_name":        "Drill checkout regression",
 			"overall_issue":        "The v2.3.1 deploy broke the payment handler",
 			"correlation_findings": []string{"burst started minutes after the deploy"},
 			"severity":             "high",
 		},
-		"alerts": []map[string]any{{"labels": map[string]string{"alertint_demo": "true"}}},
+		"alerts": []map[string]any{{"labels": map[string]string{"alertint_drill": "true"}}},
 	}
 }
 
-// TestDemo_HappyPath: change then burst then one-shot fetch; the console
+// TestDrill_HappyPath: change then burst then one-shot fetch; the console
 // carries the finding and the full-id CTA.
-func TestDemo_HappyPath(t *testing.T) {
+func TestDrill_HappyPath(t *testing.T) {
 	f := newFakeInstance(t)
-	cfg := demoTestConfig(t)
-	d, out := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
+	cfg := drillTestConfig(t)
+	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
 
-	groupKey := "cluster=demo-cluster-t3st01,namespace=demo-shop,service=demo-checkout"
+	groupKey := "cluster=drill-cluster-t3st01,namespace=drill-shop,service=drill-checkout"
 	f.listRows = []map[string]any{
 		{"id": "other", "group_key": "x=y", "status": "analyzed"},
 		{"id": "inc-42", "group_key": groupKey, "status": "analyzed"},
@@ -211,7 +211,7 @@ func TestDemo_HappyPath(t *testing.T) {
 	}
 	s := out.String()
 	for _, want := range []string{
-		"Demo checkout regression",
+		"Drill checkout regression",
 		"investigate incident inc-42 using alertint",
 		"DRILL",
 	} {
@@ -224,16 +224,16 @@ func TestDemo_HappyPath(t *testing.T) {
 	}
 }
 
-// TestDemo_ChangesDisabled: no change POST, enable lines printed, burst still
+// TestDrill_ChangesDisabled: no change POST, enable lines printed, burst still
 // fired, and the capped hint names enabling change ingress as first remedy.
-func TestDemo_ChangesDisabled(t *testing.T) {
+func TestDrill_ChangesDisabled(t *testing.T) {
 	f := newFakeInstance(t)
-	cfg := demoTestConfig(t)
+	cfg := drillTestConfig(t)
 	cfg.Changes.Ingress.Enabled = false
 	cfg.Changes.Ingress.WebhookTokenEnv = "" // realistic: disabled feature, no env named
-	d, out := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
+	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
 
-	groupKey := "cluster=demo-cluster-t3st01,namespace=demo-shop,service=demo-checkout"
+	groupKey := "cluster=drill-cluster-t3st01,namespace=drill-shop,service=drill-checkout"
 	f.listRows = []map[string]any{{"id": "inc-7", "group_key": groupKey, "status": "analyzed"}}
 	capped := analyzedIncident("inc-7")
 	capped["confidence"] = 0.6
@@ -261,14 +261,14 @@ func TestDemo_ChangesDisabled(t *testing.T) {
 	}
 }
 
-// TestDemo_MCPDisabled: fires, prints enable lines and the serve-log pointer,
+// TestDrill_MCPDisabled: fires, prints enable lines and the serve-log pointer,
 // never touches MCP, exits 0.
-func TestDemo_MCPDisabled(t *testing.T) {
+func TestDrill_MCPDisabled(t *testing.T) {
 	f := newFakeInstance(t)
-	cfg := demoTestConfig(t)
+	cfg := drillTestConfig(t)
 	cfg.MCP.Enabled = false
 	cfg.MCP.TokenEnv = "" // realistic: disabled feature, no env named
-	d, out := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
+	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
 
 	if err := d.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
@@ -284,14 +284,14 @@ func TestDemo_MCPDisabled(t *testing.T) {
 	}
 }
 
-// TestDemo_NotAnalyzedYet: a slow triage prints id, state, and the exact
+// TestDrill_NotAnalyzedYet: a slow triage prints id, state, and the exact
 // --result re-check command — never empty-handed, exit 0.
-func TestDemo_NotAnalyzedYet(t *testing.T) {
+func TestDrill_NotAnalyzedYet(t *testing.T) {
 	f := newFakeInstance(t)
-	cfg := demoTestConfig(t)
-	d, out := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
+	cfg := drillTestConfig(t)
+	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
 
-	groupKey := "cluster=demo-cluster-t3st01,namespace=demo-shop,service=demo-checkout"
+	groupKey := "cluster=drill-cluster-t3st01,namespace=drill-shop,service=drill-checkout"
 	f.listRows = []map[string]any{{"id": "inc-9", "group_key": groupKey, "status": "processing"}}
 
 	if err := d.run(context.Background()); err != nil {
@@ -305,11 +305,11 @@ func TestDemo_NotAnalyzedYet(t *testing.T) {
 	}
 }
 
-// TestDemo_ResultMode: --result fetches exactly one incident, list-free.
-func TestDemo_ResultMode(t *testing.T) {
+// TestDrill_ResultMode: --result fetches exactly one incident, list-free.
+func TestDrill_ResultMode(t *testing.T) {
 	f := newFakeInstance(t)
-	cfg := demoTestConfig(t)
-	d, out := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", result: "inc-42"})
+	cfg := drillTestConfig(t)
+	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", result: "inc-42"})
 	f.incident = analyzedIncident("inc-42")
 
 	if err := d.run(context.Background()); err != nil {
@@ -326,13 +326,13 @@ func TestDemo_ResultMode(t *testing.T) {
 	}
 }
 
-// TestDemo_RemoteGuards: remote targets refuse before any request leaves —
+// TestDrill_RemoteGuards: remote targets refuse before any request leaves —
 // plain HTTP needs the explicit override, https needs confirmation.
-func TestDemo_RemoteGuards(t *testing.T) {
-	cfg := demoTestConfig(t)
+func TestDrill_RemoteGuards(t *testing.T) {
+	cfg := drillTestConfig(t)
 
 	t.Run("plain http refused without override", func(t *testing.T) {
-		d, _ := demoTestCmd(t, nil, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship", target: "http://alertint.example:9911"})
+		d, _ := drillTestCmd(t, nil, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship", target: "http://alertint.example:9911"})
 		err := d.run(context.Background())
 		if err == nil || !strings.Contains(err.Error(), "--allow-insecure-http") {
 			t.Fatalf("run = %v, want insecure-http refusal", err)
@@ -340,7 +340,7 @@ func TestDemo_RemoteGuards(t *testing.T) {
 	})
 
 	t.Run("https refused when confirmation declined", func(t *testing.T) {
-		d, _ := demoTestCmd(t, nil, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship", target: "https://alertint.example:9911"})
+		d, _ := drillTestCmd(t, nil, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship", target: "https://alertint.example:9911"})
 		d.confirm = func(string) (bool, error) { return false, nil }
 		err := d.run(context.Background())
 		if err == nil || !strings.Contains(err.Error(), "aborted") {
@@ -349,7 +349,7 @@ func TestDemo_RemoteGuards(t *testing.T) {
 	})
 
 	t.Run("https with --yes proceeds past the guard", func(t *testing.T) {
-		d, _ := demoTestCmd(t, nil, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship", target: "https://alertint.example:9911", yes: true})
+		d, _ := drillTestCmd(t, nil, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship", target: "https://alertint.example:9911", yes: true})
 		d.http = &http.Client{Timeout: 50 * time.Millisecond}
 		err := d.run(context.Background())
 		// The guard passes; the unreachable host then fails the fire step.
@@ -359,12 +359,12 @@ func TestDemo_RemoteGuards(t *testing.T) {
 	})
 }
 
-// TestDemo_MCPUnreachable: a post-fire MCP failure degrades to the fallback
+// TestDrill_MCPUnreachable: a post-fire MCP failure degrades to the fallback
 // pointer and exits 0 (never exits empty-handed after firing).
-func TestDemo_MCPUnreachable(t *testing.T) {
+func TestDrill_MCPUnreachable(t *testing.T) {
 	f := newFakeInstance(t)
-	cfg := demoTestConfig(t)
-	d, out := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
+	cfg := drillTestConfig(t)
+	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
 	t.Setenv("DEMO_TEST_MCP", "wrong-token") // 401 at initialize
 
 	if err := d.run(context.Background()); err != nil {
@@ -376,11 +376,11 @@ func TestDemo_MCPUnreachable(t *testing.T) {
 	}
 }
 
-// TestDemo_StormScenario: storm fires more alerts, no change event.
-func TestDemo_StormScenario(t *testing.T) {
+// TestDrill_StormScenario: storm fires more alerts, no change event.
+func TestDrill_StormScenario(t *testing.T) {
 	f := newFakeInstance(t)
-	cfg := demoTestConfig(t)
-	d, _ := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "storm"})
+	cfg := drillTestConfig(t)
+	d, _ := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "storm"})
 	f.listRows = []map[string]any{}
 
 	if err := d.run(context.Background()); err != nil {
@@ -397,11 +397,11 @@ func TestDemo_StormScenario(t *testing.T) {
 	}
 }
 
-// TestDemo_ViaAlertmanager: the burst goes to AM's v2 API (no fingerprint
+// TestDrill_ViaAlertmanager: the burst goes to AM's v2 API (no fingerprint
 // fields there); the change event still posts direct.
-func TestDemo_ViaAlertmanager(t *testing.T) {
+func TestDrill_ViaAlertmanager(t *testing.T) {
 	f := newFakeInstance(t)
-	cfg := demoTestConfig(t)
+	cfg := drillTestConfig(t)
 
 	var amBodies [][]byte
 	var amMu sync.Mutex
@@ -419,7 +419,7 @@ func TestDemo_ViaAlertmanager(t *testing.T) {
 	}))
 	t.Cleanup(am.Close)
 
-	d, out := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship", viaAlertmanager: am.URL})
+	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship", viaAlertmanager: am.URL})
 	f.listRows = []map[string]any{}
 
 	if err := d.run(context.Background()); err != nil {
@@ -448,41 +448,41 @@ func TestDemo_ViaAlertmanager(t *testing.T) {
 	}
 }
 
-func TestDemo_RequiresConfig(t *testing.T) {
+func TestDrill_RequiresConfig(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	err := run([]string{"demo"}, &stdout, &stderr)
+	err := run([]string{"drill"}, &stdout, &stderr)
 	if err == nil || !strings.Contains(err.Error(), "--config is required") {
 		t.Fatalf("run = %v, want config-required error", err)
 	}
 }
 
-func TestDemo_UnknownScenario(t *testing.T) {
+func TestDrill_UnknownScenario(t *testing.T) {
 	f := newFakeInstance(t)
-	cfg := demoTestConfig(t)
-	d, _ := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "nope"})
+	cfg := drillTestConfig(t)
+	d, _ := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "nope"})
 	err := d.run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "unknown scenario") {
 		t.Fatalf("run = %v, want unknown-scenario error", err)
 	}
 }
 
-// TestDemo_ResultModeInsecureRemote: --result carries the MCP bearer token,
+// TestDrill_ResultModeInsecureRemote: --result carries the MCP bearer token,
 // so a plain-HTTP remote target needs the explicit override too.
-func TestDemo_ResultModeInsecureRemote(t *testing.T) {
-	cfg := demoTestConfig(t)
-	d, _ := demoTestCmd(t, nil, cfg, demoOpts{cfgPath: "cfg.yaml", result: "inc-1", target: "http://alertint.example:9911"})
+func TestDrill_ResultModeInsecureRemote(t *testing.T) {
+	cfg := drillTestConfig(t)
+	d, _ := drillTestCmd(t, nil, cfg, drillOpts{cfgPath: "cfg.yaml", result: "inc-1", target: "http://alertint.example:9911"})
 	err := d.run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "--allow-insecure-http") {
 		t.Fatalf("run = %v, want insecure-http refusal before any token is sent", err)
 	}
 }
 
-// TestDemo_ViaAlertmanagerRemoteGuard: the AM URL is a second remote write
+// TestDrill_ViaAlertmanagerRemoteGuard: the AM URL is a second remote write
 // surface and gets the same guard as the receiver target.
-func TestDemo_ViaAlertmanagerRemoteGuard(t *testing.T) {
+func TestDrill_ViaAlertmanagerRemoteGuard(t *testing.T) {
 	f := newFakeInstance(t)
-	cfg := demoTestConfig(t)
-	d, _ := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship", viaAlertmanager: "https://am.example:9093"})
+	cfg := drillTestConfig(t)
+	d, _ := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship", viaAlertmanager: "https://am.example:9093"})
 	d.confirm = func(string) (bool, error) { return false, nil }
 	err := d.run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "aborted") {
@@ -493,11 +493,11 @@ func TestDemo_ViaAlertmanagerRemoteGuard(t *testing.T) {
 	}
 }
 
-// TestDemo_ViaAlertmanagerNoEmptyAuthHeader: no Authorization header goes to
+// TestDrill_ViaAlertmanagerNoEmptyAuthHeader: no Authorization header goes to
 // the user's Alertmanager (no token is involved).
-func TestDemo_ViaAlertmanagerNoEmptyAuthHeader(t *testing.T) {
+func TestDrill_ViaAlertmanagerNoEmptyAuthHeader(t *testing.T) {
 	f := newFakeInstance(t)
-	cfg := demoTestConfig(t)
+	cfg := drillTestConfig(t)
 	var sawAuth []string
 	am := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := r.Header["Authorization"]; ok {
@@ -506,7 +506,7 @@ func TestDemo_ViaAlertmanagerNoEmptyAuthHeader(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(am.Close)
-	d, _ := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship", viaAlertmanager: am.URL})
+	d, _ := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship", viaAlertmanager: am.URL})
 	f.listRows = []map[string]any{}
 	if err := d.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
@@ -516,14 +516,14 @@ func TestDemo_ViaAlertmanagerNoEmptyAuthHeader(t *testing.T) {
 	}
 }
 
-// TestDemo_MCPMisconfigPreflight: MCP enabled but token env unset must be
+// TestDrill_MCPMisconfigPreflight: MCP enabled but token env unset must be
 // reported before firing, and the run degrades instead of erroring after the
 // full wait.
-func TestDemo_MCPMisconfigPreflight(t *testing.T) {
+func TestDrill_MCPMisconfigPreflight(t *testing.T) {
 	f := newFakeInstance(t)
-	cfg := demoTestConfig(t)
+	cfg := drillTestConfig(t)
 	cfg.MCP.TokenEnv = "DEMO_TEST_MCP_UNSET"
-	d, out := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
+	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
 
 	if err := d.run(context.Background()); err != nil {
 		t.Fatalf("run: %v (mcp misconfig must degrade, not fail)", err)
@@ -537,10 +537,10 @@ func TestDemo_MCPMisconfigPreflight(t *testing.T) {
 	}
 }
 
-// TestDemo_ChangePostRejected: an attempted-but-rejected planted deploy warns
+// TestDrill_ChangePostRejected: an attempted-but-rejected planted deploy warns
 // with the token hint and steers the capped hint to the rejected wording.
-func TestDemo_ChangePostRejected(t *testing.T) {
-	cfg := demoTestConfig(t)
+func TestDrill_ChangePostRejected(t *testing.T) {
+	cfg := drillTestConfig(t)
 	f := newFakeInstance(t)
 
 	rejecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -553,8 +553,8 @@ func TestDemo_ChangePostRejected(t *testing.T) {
 	}))
 	t.Cleanup(rejecting.Close)
 
-	d, out := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship", target: rejecting.URL})
-	groupKey := "cluster=demo-cluster-t3st01,namespace=demo-shop,service=demo-checkout"
+	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship", target: rejecting.URL})
+	groupKey := "cluster=drill-cluster-t3st01,namespace=drill-shop,service=drill-checkout"
 	f.listRows = []map[string]any{{"id": "inc-8", "group_key": groupKey, "status": "analyzed"}}
 	capped := analyzedIncident("inc-8")
 	capped["confidence"] = 0.6
@@ -574,16 +574,16 @@ func TestDemo_ChangePostRejected(t *testing.T) {
 	}
 }
 
-// TestDemo_DriftFallback: when no incident matches the locally-computed group
+// TestDrill_DriftFallback: when no incident matches the locally-computed group
 // key, the newest drill incident is used with a config-drift caveat.
-func TestDemo_DriftFallback(t *testing.T) {
+func TestDrill_DriftFallback(t *testing.T) {
 	f := newFakeInstance(t)
-	cfg := demoTestConfig(t)
-	d, out := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
+	cfg := drillTestConfig(t)
+	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
 
 	f.listRows = []map[string]any{
 		{"id": "real-1", "group_key": "service=checkout", "status": "analyzed", "drill": false},
-		{"id": "drill-9", "group_key": "team=demo-team-x", "status": "analyzed", "drill": true},
+		{"id": "drill-9", "group_key": "team=drill-team-x", "status": "analyzed", "drill": true},
 	}
 	f.incident = analyzedIncident("drill-9")
 
@@ -596,35 +596,35 @@ func TestDemo_DriftFallback(t *testing.T) {
 	}
 }
 
-// TestDemo_ResultUnknownIncident: --result with a bad id must error (exit 1),
+// TestDrill_ResultUnknownIncident: --result with a bad id must error (exit 1),
 // not print a hint recommending the same doomed command.
-func TestDemo_ResultUnknownIncident(t *testing.T) {
+func TestDrill_ResultUnknownIncident(t *testing.T) {
 	f := newFakeInstance(t)
-	cfg := demoTestConfig(t)
+	cfg := drillTestConfig(t)
 	f.mcp.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Mcp-Session-Id", "mcp-session-x")
 		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"incident \"nope\" not found"}]}}`))
 	})
-	d, _ := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", result: "nope"})
+	d, _ := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", result: "nope"})
 	err := d.run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("run = %v, want fetch error surfaced", err)
 	}
 }
 
-// TestDemo_CappedHintProbeWording: with change ingress on and fired, the
+// TestDrill_CappedHintProbeWording: with change ingress on and fired, the
 // Prometheus probe steers the wording between detected and docs-link
 // variants; both stay scoped to real incidents.
-func TestDemo_CappedHintProbeWording(t *testing.T) {
+func TestDrill_CappedHintProbeWording(t *testing.T) {
 	for name, probe := range map[string]bool{"probe hit": true, "probe miss": false} {
 		t.Run(name, func(t *testing.T) {
 			f := newFakeInstance(t)
-			cfg := demoTestConfig(t)
-			d, out := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
+			cfg := drillTestConfig(t)
+			d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
 			d.probePrometheus = func(string, string) bool { return probe }
 
-			groupKey := "cluster=demo-cluster-t3st01,namespace=demo-shop,service=demo-checkout"
+			groupKey := "cluster=drill-cluster-t3st01,namespace=drill-shop,service=drill-checkout"
 			f.listRows = []map[string]any{{"id": "inc-c", "group_key": groupKey, "status": "analyzed"}}
 			capped := analyzedIncident("inc-c")
 			capped["confidence"] = 0.6
@@ -640,19 +640,19 @@ func TestDemo_CappedHintProbeWording(t *testing.T) {
 			if !probe && !strings.Contains(s, "get in touch") {
 				t.Errorf("probe-miss wording missing:\n%s", s)
 			}
-			if !strings.Contains(s, "cannot uncap a demo re-run") {
+			if !strings.Contains(s, "cannot uncap a drill re-run") {
 				t.Errorf("real-incident scoping missing:\n%s", s)
 			}
 		})
 	}
 }
 
-// TestDemo_SanitizesFindingText: control characters in MCP-sourced strings
+// TestDrill_SanitizesFindingText: control characters in MCP-sourced strings
 // never reach the terminal.
-func TestDemo_SanitizesFindingText(t *testing.T) {
+func TestDrill_SanitizesFindingText(t *testing.T) {
 	f := newFakeInstance(t)
-	cfg := demoTestConfig(t)
-	d, out := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", result: "inc-evil"})
+	cfg := drillTestConfig(t)
+	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", result: "inc-evil"})
 	evil := analyzedIncident("inc-evil")
 	finding, ok := evil["finding"].(map[string]any)
 	if !ok {
@@ -673,13 +673,13 @@ func TestDemo_SanitizesFindingText(t *testing.T) {
 	}
 }
 
-// TestDemo_AlertmanagerReceiverDisabled: the demo cannot ingest its burst
+// TestDrill_AlertmanagerReceiverDisabled: the drill cannot ingest its burst
 // without the alert receiver — a pre-fire config error.
-func TestDemo_AlertmanagerReceiverDisabled(t *testing.T) {
+func TestDrill_AlertmanagerReceiverDisabled(t *testing.T) {
 	f := newFakeInstance(t)
-	cfg := demoTestConfig(t)
+	cfg := drillTestConfig(t)
 	cfg.Alertmanager.Enabled = false
-	d, _ := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
+	d, _ := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
 	err := d.run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "alertmanager receiver is disabled") {
 		t.Fatalf("run = %v, want receiver-disabled error", err)
@@ -689,11 +689,11 @@ func TestDemo_AlertmanagerReceiverDisabled(t *testing.T) {
 	}
 }
 
-// TestDemo_ConfirmErrorPath: a failed confirmation read (non-TTY) refuses
+// TestDrill_ConfirmErrorPath: a failed confirmation read (non-TTY) refuses
 // with the --yes instruction.
-func TestDemo_ConfirmErrorPath(t *testing.T) {
-	cfg := demoTestConfig(t)
-	d, _ := demoTestCmd(t, nil, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship", target: "https://alertint.example:9911"})
+func TestDrill_ConfirmErrorPath(t *testing.T) {
+	cfg := drillTestConfig(t)
+	d, _ := drillTestCmd(t, nil, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship", target: "https://alertint.example:9911"})
 	d.confirm = func(string) (bool, error) { return false, io.EOF }
 	err := d.run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "--yes") {

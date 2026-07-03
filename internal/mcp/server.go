@@ -139,7 +139,7 @@ func (s *Server) toolListIncidents() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 	tool := mcplib.NewTool("alertint_list_incidents",
 		mcplib.WithDescription("List recent AlertINT incidents, newest first. "+
 			"Each incident groups one or more related alerts with an AI finding. "+
-			"Rows with drill=true are synthetic drills fired by `alertint demo`, not real incidents."),
+			"Rows with drill=true are synthetic drills fired by `alertint drill`, not real incidents."),
 		mcplib.WithInteger("limit",
 			mcplib.Description("Maximum number of incidents to return (1–100, default 20)."),
 		),
@@ -151,7 +151,7 @@ func (s *Server) toolGetIncident() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 	tool := mcplib.NewTool("alertint_get_incident",
 		mcplib.WithDescription("Get full details for one incident: member alerts with their roles, "+
 			"AI finding (analysis name, overall issue, correlation findings, severity, confidence), "+
-			"and raw LLM output JSON. drill=true marks a synthetic drill fired by `alertint demo`, "+
+			"and raw LLM output JSON. drill=true marks a synthetic drill fired by `alertint drill`, "+
 			"not a real incident."),
 		mcplib.WithString("incident_id",
 			mcplib.Description("Incident ID from alertint_list_incidents."),
@@ -265,8 +265,8 @@ func (s *Server) handleListIncidents(ctx context.Context, req mcplib.CallToolReq
 		LastAlertAt  time.Time    `json:"last_alert_at"`
 		CreatedAt    time.Time    `json:"created_at"`
 		Recovery     recoveryView `json:"recovery"`
-		// Drill: the incident contains a Demo alert (alertint_demo="true",
-		// ADR-0013) — synthetic, fired by `alertint demo`.
+		// Drill: the incident contains a Drill alert (alertint_drill="true",
+		// ADR-0013) — synthetic, fired by `alertint drill`.
 		Drill bool `json:"drill,omitempty"`
 	}
 
@@ -370,7 +370,7 @@ func (s *Server) handleGetIncident(ctx context.Context, req mcplib.CallToolReque
 		case "resolved":
 			resolved++
 		}
-		if a.Labels[store.DemoMarkerLabel] == store.DemoMarkerValue {
+		if a.Labels[store.DrillMarkerLabel] == store.DrillMarkerValue {
 			drill = true
 		}
 	}

@@ -82,7 +82,7 @@ name the environment variable that holds the value. See
 [Configuration](configuration.md) for every option.
 
 The example config ships with the change webhook and the MCP server
-enabled (both are part of the demo below and of everyday use), so their
+enabled (both are part of the drill below and of everyday use), so their
 tokens are required at startup too. Export the secrets before starting:
 
 ```bash
@@ -159,15 +159,15 @@ asking a specific operational question:
 With the agent running, one command takes you to "finding ready":
 
 ```bash
-alertint demo --config config.yaml
+alertint drill --config config.yaml
 ```
 
-The demo reads the same config file serve reads (no extra flags, no token
+The drill reads the same config file serve reads (no extra flags, no token
 pasting), plants a fake deploy on the change webhook, fires a burst of
-obviously fictional demo alerts at the production ingress, waits out the
+obviously fictional drill alerts at the production ingress, waits out the
 correlation window, and prints the resulting finding — a causal analysis
 that names the planted deploy. The synthetic incident is marked end to
-end: every demo alert carries the reserved `alertint_demo="true"` label,
+end: every drill alert carries the reserved `alertint_drill="true"` label,
 the Slack card (if enabled) shows a 🧪 DRILL banner, and the MCP incident
 list flags the row with `drill: true`. The whole `alertint_` label prefix
 is reserved for AlertINT — don't use it in your own alert labels or
@@ -176,7 +176,7 @@ is reserved for AlertINT — don't use it in your own alert labels or
 Drill incidents are regular incidents: they enter through the production
 webhook, live permanently in the store, and appear in the audit log —
 that first entry is your proof the pipeline ran. Finish the loop from
-your MCP client with the command the demo prints:
+your MCP client with the command the drill prints:
 
 > investigate incident `<id>` using alertint
 

@@ -37,7 +37,7 @@ func TestOnIncidentResolved_PreservesDrill(t *testing.T) {
 		labels map[string]string
 		want   bool
 	}{
-		"drill": {labels: map[string]string{store.DemoMarkerLabel: store.DemoMarkerValue}, want: true},
+		"drill": {labels: map[string]string{store.DrillMarkerLabel: store.DrillMarkerValue}, want: true},
 		"real":  {labels: map[string]string{"service": "checkout"}, want: false},
 	}
 	for name, tc := range cases {

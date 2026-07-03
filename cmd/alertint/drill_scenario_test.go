@@ -14,9 +14,9 @@ import (
 
 var defaultGroupLabels = []string{"cluster", "namespace", "service"}
 
-func mustMaterialize(t *testing.T, scenario string, keys []string, runID string) demoRun {
+func mustMaterialize(t *testing.T, scenario string, keys []string, runID string) drillRun {
 	t.Helper()
-	sc, ok := demoScenarios()[scenario]
+	sc, ok := drillScenarios()[scenario]
 	if !ok {
 		t.Fatalf("unknown scenario %q", scenario)
 	}
@@ -33,7 +33,7 @@ func mustMaterialize(t *testing.T, scenario string, keys []string, runID string)
 func TestMaterialize_SingleGroupKey(t *testing.T) {
 	run := mustMaterialize(t, "flagship", defaultGroupLabels, "4f2a1b")
 
-	want := "cluster=demo-cluster-4f2a1b,namespace=demo-shop,service=demo-checkout"
+	want := "cluster=drill-cluster-4f2a1b,namespace=drill-shop,service=drill-checkout"
 	if run.expectedGroupKey != want {
 		t.Errorf("expectedGroupKey = %q, want %q", run.expectedGroupKey, want)
 	}
@@ -46,13 +46,13 @@ func TestMaterialize_SingleGroupKey(t *testing.T) {
 	}
 }
 
-// TestMaterialize_CustomGroupLabels: unknown keys get demo-<key> values on
+// TestMaterialize_CustomGroupLabels: unknown keys get drill-<key> values on
 // every alert; the first configured key is run-salted. A target grouping by
 // alertname still gets one homogeneous incident (group labels win).
 func TestMaterialize_CustomGroupLabels(t *testing.T) {
 	run := mustMaterialize(t, "flagship", []string{"team", "region"}, "aa11bb")
 	for i, a := range run.alerts.Alerts {
-		if a.Labels["team"] != "demo-team-aa11bb" || a.Labels["region"] != "demo-region" {
+		if a.Labels["team"] != "drill-team-aa11bb" || a.Labels["region"] != "drill-region" {
 			t.Errorf("alert[%d] custom group labels = team=%q region=%q", i, a.Labels["team"], a.Labels["region"])
 		}
 	}
@@ -101,7 +101,7 @@ func TestMaterialize_RunScoping(t *testing.T) {
 // backdated occurred_at, and parses through the real change receiver parser.
 func TestMaterialize_ChangeEventOverlapsBurst(t *testing.T) {
 	now := time.Now().UTC()
-	sc := demoScenarios()["flagship"]
+	sc := drillScenarios()["flagship"]
 	run, err := materializeScenario(sc, defaultGroupLabels, "e3f4a5", now)
 	if err != nil {
 		t.Fatalf("materialize: %v", err)
@@ -129,7 +129,7 @@ func TestMaterialize_ChangeEventOverlapsBurst(t *testing.T) {
 	}
 	changes, err := ingress.ParseChange(body, now)
 	if err != nil {
-		t.Fatalf("ParseChange rejects demo change payload: %v", err)
+		t.Fatalf("ParseChange rejects drill change payload: %v", err)
 	}
 	if len(changes) != 1 || changes[0].Kind != "deploy" || !strings.Contains(changes[0].Title, "checkout") {
 		t.Errorf("parsed change = %+v, want one deploy naming checkout", changes)
@@ -137,13 +137,13 @@ func TestMaterialize_ChangeEventOverlapsBurst(t *testing.T) {
 }
 
 // TestMaterialize_ReceiverContract: the burst satisfies the Alertmanager v4
-// receiver contract (version, fingerprint, status, startsAt) and every Demo
+// receiver contract (version, fingerprint, status, startsAt) and every Drill
 // alert carries the reserved marker (ADR-0013).
 func TestMaterialize_ReceiverContract(t *testing.T) {
 	for _, scenario := range []string{"flagship", "storm"} {
 		run := mustMaterialize(t, scenario, defaultGroupLabels, "0d0d0d")
-		if n := len(run.alerts.Alerts); n == 0 || n > maxDemoAlerts {
-			t.Fatalf("%s: %d alerts, want 1..%d", scenario, n, maxDemoAlerts)
+		if n := len(run.alerts.Alerts); n == 0 || n > maxDrillAlerts {
+			t.Fatalf("%s: %d alerts, want 1..%d", scenario, n, maxDrillAlerts)
 		}
 
 		body, err := json.Marshal(run.alerts)
@@ -152,14 +152,14 @@ func TestMaterialize_ReceiverContract(t *testing.T) {
 		}
 		payload, err := ingress.ParseAlertmanager(body)
 		if err != nil {
-			t.Fatalf("%s: ParseAlertmanager rejects demo payload: %v", scenario, err)
+			t.Fatalf("%s: ParseAlertmanager rejects drill payload: %v", scenario, err)
 		}
 		for i, a := range payload.Alerts {
 			if a.Fingerprint == "" || a.Status != "firing" || a.StartsAt.IsZero() {
 				t.Errorf("%s alert[%d] violates receiver contract: %+v", scenario, i, a)
 			}
-			if a.Labels[store.DemoMarkerLabel] != store.DemoMarkerValue {
-				t.Errorf("%s alert[%d] missing demo marker label", scenario, i)
+			if a.Labels[store.DrillMarkerLabel] != store.DrillMarkerValue {
+				t.Errorf("%s alert[%d] missing drill marker label", scenario, i)
 			}
 		}
 	}
@@ -172,7 +172,7 @@ func TestMaterialize_StormAlertsDistinct(t *testing.T) {
 	run := mustMaterialize(t, "storm", defaultGroupLabels, "aabb01")
 	seen := map[string]bool{}
 	for i, a := range run.alerts.Alerts {
-		key := demoGroupKey(a.Labels) // full-label sorted join as identity
+		key := drillGroupKey(a.Labels) // full-label sorted join as identity
 		if seen[key] {
 			t.Fatalf("alert[%d] label set duplicates an earlier alert: %s", i, key)
 		}

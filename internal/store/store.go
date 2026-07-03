@@ -221,13 +221,13 @@ func parseMigrationName(filename string) (int, string, error) {
 // ----------------------------------------------------------------------
 
 // The alertint_ label-key prefix is reserved as AlertINT-owned (ADR-0013).
-// Its first citizen is the Demo-alert marker: alerts fired by `alertint demo`
-// carry DemoMarkerLabel=DemoMarkerValue, and an incident containing one is a
+// Its first citizen is the Drill-alert marker: alerts fired by `alertint drill`
+// carry DrillMarkerLabel=DrillMarkerValue, and an incident containing one is a
 // Drill. The marker is sender-asserted (same door, same token — presented,
 // not authenticated) and never participates in correlator grouping.
 const (
-	DemoMarkerLabel = "alertint_demo"
-	DemoMarkerValue = "true"
+	DrillMarkerLabel = "alertint_drill"
+	DrillMarkerValue = "true"
 )
 
 // Alert is the in-memory representation of a row in the alerts table.
@@ -674,7 +674,7 @@ func (s *Store) IncidentMemberStatusCounts(ctx context.Context, ids []string) (m
 }
 
 // IncidentDrillFlags reports, for each incident id, whether any member alert
-// carries the Demo-alert marker label (DemoMarkerLabel=DemoMarkerValue) —
+// carries the Drill-alert marker label (DrillMarkerLabel=DrillMarkerValue) —
 // i.e. whether the incident is a Drill (ADR-0013). One batch query, same
 // json_each shape as IncidentMemberStatusCounts, so list rendering stays
 // free of per-incident queries. Ids with no marker map to false; an empty
@@ -696,8 +696,8 @@ func (s *Store) IncidentDrillFlags(ctx context.Context, ids []string) (map[strin
 		FROM incident_alerts ia
 		JOIN alerts a ON a.id = ia.alert_id
 		WHERE ia.incident_id IN (SELECT value FROM json_each(?))
-		  AND json_extract(a.labels_json, '$.`+DemoMarkerLabel+`') = ?
-	`, string(idsJSON), DemoMarkerValue)
+		  AND json_extract(a.labels_json, '$.`+DrillMarkerLabel+`') = ?
+	`, string(idsJSON), DrillMarkerValue)
 	if err != nil {
 		return nil, fmt.Errorf("store: incident drill flags: %w", err)
 	}

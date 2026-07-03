@@ -13,7 +13,7 @@ completed incident analysis. When alerts recover, the original message is
 updated in-place and a thread reply is posted — one message per incident,
 no channel noise.
 
-Synthetic incidents fired by `alertint demo` are unmistakable in a shared
+Synthetic incidents fired by `alertint drill` are unmistakable in a shared
 channel: every surface of their card — headline, thread details, and the
 plain-text fallback — carries a 🧪 **DRILL** banner, so a drill never
 reads as a real incident to a teammate scrolling past.

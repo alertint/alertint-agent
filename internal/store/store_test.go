@@ -369,7 +369,7 @@ func TestLoadMigrations_DiscoversInitMigration(t *testing.T) {
 }
 
 // TestIncidentDrillFlags covers the batch drill-detection query: an incident
-// is a Drill when any member alert carries the Demo-alert marker label
+// is a Drill when any member alert carries the Drill-alert marker label
 // (ADR-0013); known ids default to false and the empty-id case short-circuits.
 func TestIncidentDrillFlags(t *testing.T) {
 	s := newTestStore(t)
@@ -393,12 +393,12 @@ func TestIncidentDrillFlags(t *testing.T) {
 			t.Fatalf("add %s: %v", fp, err)
 		}
 	}
-	demo := map[string]string{DemoMarkerLabel: DemoMarkerValue, "service": "demo-checkout"}
+	drill := map[string]string{DrillMarkerLabel: DrillMarkerValue, "service": "drill-checkout"}
 	plain := map[string]string{"service": "checkout"}
-	add(idDrill, "d-1", demo)
-	add(idDrill, "d-2", demo)
+	add(idDrill, "d-1", drill)
+	add(idDrill, "d-2", drill)
 	add(idMixed, "m-1", plain)
-	add(idMixed, "m-2", demo)
+	add(idMixed, "m-2", drill)
 	add(idReal, "r-1", plain)
 
 	flags, err := s.IncidentDrillFlags(ctx, []string{idDrill, idMixed, idReal})

@@ -32,7 +32,7 @@ notify:
     min_severity: low                # low | medium | high — raise to suppress lower-severity findings on Slack (stdout always emits)
 
 # MCP HTTP server — AI coding agents connect to http://host:9912/mcp
-# Enabled here so `alertint demo` can fetch its finding and your agent can
+# Enabled here so `alertint drill` can fetch its finding and your agent can
 # read incidents out of the box. Set ALERTINT_MCP_TOKEN to a long random
 # secret before starting (required when enabled).
 mcp:
@@ -89,7 +89,7 @@ logs:
 # Enrichment is presence-based: it turns ON automatically as soon as a change
 # source exists (changes.ingress or the Sentry releases poller below).
 # Enabled here so a one-line curl at the end of a deploy gives triage causal
-# evidence — and so the flagship `alertint demo` scenario can plant its fake
+# evidence — and so the flagship `alertint drill` scenario can plant its fake
 # deploy. Set ALERTINT_CHANGES_WEBHOOK_TOKEN before starting (required when
 # enabled).
 changes:

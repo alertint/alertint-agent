@@ -473,12 +473,12 @@ func clampConfidence(c *float64) {
 	}
 }
 
-// isDrill reports whether any member alert carries the Demo-alert marker
+// isDrill reports whether any member alert carries the Drill-alert marker
 // (ADR-0013). Any-not-all: a mixed incident stays flagged so a synthetic
 // card never passes as fully real.
 func isDrill(alerts []store.Alert) bool {
 	for _, a := range alerts {
-		if a.Labels[store.DemoMarkerLabel] == store.DemoMarkerValue {
+		if a.Labels[store.DrillMarkerLabel] == store.DrillMarkerValue {
 			return true
 		}
 	}

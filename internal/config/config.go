@@ -538,7 +538,7 @@ func (c *Config) validateCorrelator() []string {
 				errs = append(errs, fmt.Sprintf("correlator.group_labels[%d] %q has surrounding whitespace", i, label))
 			case strings.HasPrefix(strings.ToLower(label), "alertint_"):
 				// The alertint_ label-key prefix is reserved as AlertINT-owned
-				// (e.g. the alertint_demo drill marker) and never participates
+				// (e.g. the alertint_drill drill marker) and never participates
 				// in grouping.
 				errs = append(errs, fmt.Sprintf("correlator.group_labels[%d] %q uses the reserved alertint_ label prefix; alertint_* labels never participate in grouping", i, label))
 			default:

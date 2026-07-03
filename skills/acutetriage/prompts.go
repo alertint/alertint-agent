@@ -151,7 +151,7 @@ func UserPrompt(pack EvidencePack, packJSON string, metrics []MetricSnapshot, lo
 }
 
 // MaxMetadataOnlyConfidence is the confidence ceiling for findings built from
-// alert metadata alone. Exported so surfaces explaining the cap (the demo
+// alert metadata alone. Exported so surfaces explaining the cap (the drill
 // console hint) reference the real value.
 // alert labels/annotations alone (no live metrics, logs, changes, or Sentry
 // issues). It appears in two places that must stay in sync: the prompt

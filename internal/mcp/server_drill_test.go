@@ -29,7 +29,7 @@ func addLabeledMember(t *testing.T, st *store.Store, incID, fp string, labels ma
 }
 
 // TestListIncidents_DrillFlag: list rows carry drill=true only for incidents
-// containing a Demo alert (ADR-0013), derived in one batch query.
+// containing a Drill alert (ADR-0013), derived in one batch query.
 func TestListIncidents_DrillFlag(t *testing.T) {
 	st := newMCPStore(t)
 	ctx := context.Background()
@@ -41,7 +41,7 @@ func TestListIncidents_DrillFlag(t *testing.T) {
 		}
 	}
 	addLabeledMember(t, st, "inc-drill", "d1", map[string]string{
-		store.DemoMarkerLabel: store.DemoMarkerValue, "service": "demo-checkout"})
+		store.DrillMarkerLabel: store.DrillMarkerValue, "service": "drill-checkout"})
 	addLabeledMember(t, st, "inc-real", "r1", map[string]string{"service": "checkout"})
 
 	s := NewServer(Config{}, st, audit.New(st.DB()))
@@ -81,7 +81,7 @@ func TestGetIncident_DrillFlag(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	addLabeledMember(t, st, "gi-drill", "gd1", map[string]string{store.DemoMarkerLabel: store.DemoMarkerValue})
+	addLabeledMember(t, st, "gi-drill", "gd1", map[string]string{store.DrillMarkerLabel: store.DrillMarkerValue})
 	addLabeledMember(t, st, "gi-real", "gr1", map[string]string{"service": "checkout"})
 
 	s := NewServer(Config{}, st, audit.New(st.DB()))
