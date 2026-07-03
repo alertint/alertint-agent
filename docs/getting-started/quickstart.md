@@ -165,8 +165,11 @@ alertint drill --config config.yaml
 The drill reads the same config file serve reads (no extra flags, no token
 pasting), plants a fake deploy on the change webhook, fires a burst of
 obviously fictional drill alerts at the production ingress, waits out the
-correlation window, and prints the resulting finding — a causal analysis
-that names the planted deploy. The synthetic incident is marked end to
+correlation window (`correlator.window_seconds` — lower it for faster
+drills), then polls until triage completes and prints the resulting
+finding — a causal analysis that names the planted deploy. Add `--resolve`
+to close the drill at the end of the run: the same burst is re-sent as
+resolved, and the Slack card (if enabled) flips to resolved in place. The synthetic incident is marked end to
 end: every drill alert carries the reserved `alertint_drill="true"` label,
 the Slack card (if enabled) shows a 🧪 DRILL banner, and the MCP incident
 list flags the row with `drill: true`. The whole `alertint_` label prefix

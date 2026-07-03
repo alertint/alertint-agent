@@ -52,10 +52,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deploy; a `--scenario storm` variant fires a storm-sized burst that lands as
   one incident. Everything is
   derived from the same config file `serve` reads (receiver/MCP addresses,
-  tokens, `group_labels` adaptation); the console prints progress, then one
-  one-shot MCP fetch renders the finding plus the
+  tokens, `group_labels` adaptation); the console prints progress, waits out
+  the correlation window, then polls MCP until the finding is ready (bounded
+  by a triage grace) and renders it plus the
   `investigate incident <id> using alertint` handoff (`--result <id>`
-  re-checks a slow triage). Drill alerts carry the reserved
+  re-checks a slow triage). `--resolve` re-sends the burst as resolved after
+  the run, closing the Drill through the production resolution path (Slack
+  cards update in place). Drill alerts carry the reserved
   `alertint_drill="true"` label — rendered as a 🧪 DRILL banner on Slack cards
   and a `drill` flag on the MCP incident list — and the whole `alertint_`
   label-key prefix is now reserved (rejected in `correlator.group_labels`).
@@ -70,9 +73,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Slack noise gate: findings below the threshold are not posted (stdout always
   emits, and a suppressed incident's resolution is suppressed too). Suppressions
   are recorded in the audit trail as `notify.skipped`.
-- **Agent-handoff prompt on the Slack incident card** — the firing card now
-  carries a copy-pasteable `investigate incident <id> using alertint` prompt with
-  the full incident ID, so the MCP handoff is a one-paste action.
+- **Agent-handoff prompt on the Slack incident card** — the firing card and the
+  analysis thread both carry a copy-pasteable
+  `investigate incident <id> using alertint` prompt with the full incident ID,
+  rendered as a full-size section (not caption text), so the MCP handoff is a
+  prominent one-paste action on every firing surface.
 - **Deterministic confidence cap for metadata-only findings** — when triage had no
   live evidence (no metrics, logs, changes, or Sentry issues), the persisted and
   notified confidence is capped at 0.6 regardless of what the model returned,

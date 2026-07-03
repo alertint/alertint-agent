@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/config"
+	"github.com/alertint/alertint-agent/internal/ingress"
 )
 
 // fakeInstance emulates a running AlertINT: the two webhook receivers and a
@@ -28,6 +29,7 @@ type fakeInstance struct {
 	authSeen     []string
 
 	listRows      []map[string]any
+	listRowsSeq   [][]map[string]any // consumed first, one per list call
 	incident      map[string]any
 	getIncidentID []string
 
@@ -79,7 +81,12 @@ func newFakeInstance(t *testing.T) *fakeInstance {
 			var payload any
 			switch req.Params.Name {
 			case "alertint_list_incidents":
-				payload = map[string]any{"incidents": f.listRows}
+				if len(f.listRowsSeq) > 0 {
+					payload = map[string]any{"incidents": f.listRowsSeq[0]}
+					f.listRowsSeq = f.listRowsSeq[1:]
+				} else {
+					payload = map[string]any{"incidents": f.listRows}
+				}
 			case "alertint_get_incident":
 				id, _ := req.Params.Arguments["incident_id"].(string)
 				f.getIncidentID = append(f.getIncidentID, id)
@@ -698,5 +705,148 @@ func TestDrill_ConfirmErrorPath(t *testing.T) {
 	err := d.run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "--yes") {
 		t.Fatalf("run = %v, want non-interactive instruction", err)
+	}
+}
+
+// TestDrill_PollsUntilAnalyzed: with a multi-poll grace, the payoff returns
+// as soon as a poll sees the analyzed state instead of sleeping out the full
+// triage grace.
+func TestDrill_PollsUntilAnalyzed(t *testing.T) {
+	f := newFakeInstance(t)
+	cfg := drillTestConfig(t)
+	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
+	d.grace = 4 * drillPollInterval // budget for four polls
+
+	var sleeps []time.Duration
+	d.sleep = func(_ context.Context, dur time.Duration) error {
+		sleeps = append(sleeps, dur)
+		return nil
+	}
+
+	groupKey := "cluster=drill-cluster-t3st01,namespace=drill-shop,service=drill-checkout"
+	pending := []map[string]any{{"id": "inc-7", "group_key": groupKey, "status": "ready"}}
+	f.listRowsSeq = [][]map[string]any{pending, pending} // first two polls
+	f.listRows = []map[string]any{{"id": "inc-7", "group_key": groupKey, "status": "analyzed"}}
+	f.incident = analyzedIncident("inc-7")
+
+	if err := d.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !strings.Contains(out.String(), "investigate incident inc-7 using alertint") {
+		t.Errorf("missing finding CTA:\n%s", out.String())
+	}
+	var polls int
+	for _, dur := range sleeps {
+		if dur == drillPollInterval {
+			polls++
+		}
+	}
+	if polls != 2 {
+		t.Errorf("poll sleeps = %d, want 2 (loop must stop as soon as the state is analyzed)", polls)
+	}
+}
+
+// TestDrill_ResolveFlag: --resolve re-sends the burst as resolved after the
+// payoff — same fingerprints so the rows overwrite, endsAt set, payload
+// status resolved.
+func TestDrill_ResolveFlag(t *testing.T) {
+	f := newFakeInstance(t)
+	cfg := drillTestConfig(t)
+	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship", resolve: true})
+
+	groupKey := "cluster=drill-cluster-t3st01,namespace=drill-shop,service=drill-checkout"
+	f.listRows = []map[string]any{{"id": "inc-42", "group_key": groupKey, "status": "analyzed"}}
+	f.incident = analyzedIncident("inc-42")
+
+	if err := d.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(f.alertBodies) != 2 {
+		t.Fatalf("alert posts = %d, want 2 (burst + resolution)", len(f.alertBodies))
+	}
+	var firing, resolved ingress.AlertmanagerPayload
+	if err := json.Unmarshal(f.alertBodies[0], &firing); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(f.alertBodies[1], &resolved); err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Status != "resolved" {
+		t.Errorf("resolution payload status = %q, want resolved", resolved.Status)
+	}
+	if len(resolved.Alerts) != len(firing.Alerts) {
+		t.Fatalf("resolution alerts = %d, want %d", len(resolved.Alerts), len(firing.Alerts))
+	}
+	for i, a := range resolved.Alerts {
+		if a.Status != "resolved" {
+			t.Errorf("alert %d status = %q, want resolved", i, a.Status)
+		}
+		if a.EndsAt.IsZero() {
+			t.Errorf("alert %d endsAt is zero", i)
+		}
+		if a.Fingerprint != firing.Alerts[i].Fingerprint {
+			t.Errorf("alert %d fingerprint changed: %q vs %q — resolution must reuse the firing fingerprints", i, a.Fingerprint, firing.Alerts[i].Fingerprint)
+		}
+	}
+	if !strings.Contains(out.String(), "resolving the drill") {
+		t.Errorf("stdout missing resolution note:\n%s", out.String())
+	}
+}
+
+// TestDrill_ResolveWithResultRejected: --resolve needs a firing run.
+func TestDrill_ResolveWithResultRejected(t *testing.T) {
+	f := newFakeInstance(t)
+	cfg := drillTestConfig(t)
+	d, _ := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", result: "inc-1", resolve: true})
+	err := d.run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "--resolve applies to a firing run") {
+		t.Fatalf("run = %v, want resolve/result conflict error", err)
+	}
+}
+
+// TestDrill_ResolveViaAlertmanager: in --via-alertmanager mode the resolution
+// goes through AM too, as postable alerts with endsAt set.
+func TestDrill_ResolveViaAlertmanager(t *testing.T) {
+	f := newFakeInstance(t)
+	cfg := drillTestConfig(t)
+
+	var amBodies [][]byte
+	var amMu sync.Mutex
+	am := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(r.Body)
+		amMu.Lock()
+		amBodies = append(amBodies, buf.Bytes())
+		amMu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(am.Close)
+
+	d, _ := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship", viaAlertmanager: am.URL, resolve: true})
+	f.listRows = []map[string]any{}
+
+	if err := d.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	amMu.Lock()
+	defer amMu.Unlock()
+	if len(amBodies) != 2 {
+		t.Fatalf("AM posts = %d, want 2 (burst + resolution)", len(amBodies))
+	}
+	var alerts []map[string]any
+	if err := json.Unmarshal(amBodies[1], &alerts); err != nil || len(alerts) == 0 {
+		t.Fatalf("resolution payload not a postable-alert array: %v", err)
+	}
+	for i, a := range alerts {
+		if _, has := a["endsAt"]; !has {
+			t.Errorf("resolution alert %d missing endsAt", i)
+		}
+	}
+	var burst []map[string]any
+	_ = json.Unmarshal(amBodies[0], &burst)
+	for i, a := range burst {
+		if _, has := a["endsAt"]; has {
+			t.Errorf("firing alert %d must not carry endsAt", i)
+		}
 	}
 }

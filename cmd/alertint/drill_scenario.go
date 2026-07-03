@@ -255,6 +255,23 @@ func materializeScenario(sc drillScenario, groupLabelKeys []string, runID string
 	return run, nil
 }
 
+// resolvedPayload re-stamps the run's burst as resolved: identical labels and
+// run-scoped fingerprints (they overwrite the firing rows), endsAt set, both
+// alert and payload status resolved. Fired through the same production door
+// as the burst, it closes the Drill via the normal resolution path.
+func resolvedPayload(run drillRun, now time.Time) ingress.AlertmanagerPayload {
+	p := run.alerts
+	alerts := make([]ingress.AlertmanagerAlert, len(p.Alerts))
+	for i, a := range p.Alerts {
+		a.Status = "resolved"
+		a.EndsAt = now
+		alerts[i] = a
+	}
+	p.Status = "resolved"
+	p.Alerts = alerts
+	return p
+}
+
 // drillGroupKey mirrors internal/correlator groupKey for alerts that carry
 // every configured group label: sorted k=v parts joined with ",".
 func drillGroupKey(labels map[string]string) string {

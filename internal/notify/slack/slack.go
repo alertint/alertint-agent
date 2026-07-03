@@ -266,17 +266,26 @@ func firingMainBlocks(f notify.Finding) []slacklib.Block {
 			false, false),
 	))
 	// The MCP handoff is the differentiator, so it rides the headline card as
-	// a one-paste action (full incident ID — the downstream alertint_get_incident
-	// call must resolve unambiguously). The thread keeps the raw tool hint.
+	// a full-size section (a context block renders as small grey caption text
+	// and gets lost). Full incident ID — the downstream alertint_get_incident
+	// call must resolve unambiguously. The same block appears on the thread
+	// detail so the CTA reads identically on every firing surface.
 	// Resolved cards drop this block: the handoff is for active incidents.
 	if f.IncidentID != "" {
-		blocks = append(blocks, slacklib.NewContextBlock("",
-			slacklib.NewTextBlockObject(slacklib.MarkdownType,
-				fmt.Sprintf(":robot_face: *Investigate in your AI agent* — paste: `investigate incident %s using alertint`", f.IncidentID),
-				false, false),
-		))
+		blocks = append(blocks, agentHandoffBlock(f.IncidentID))
 	}
 	return blocks
+}
+
+// agentHandoffBlock is the one-paste MCP call to action, rendered the same
+// wherever it appears: main firing card and thread detail.
+func agentHandoffBlock(incidentID string) slacklib.Block {
+	return slacklib.NewSectionBlock(
+		slacklib.NewTextBlockObject(slacklib.MarkdownType,
+			fmt.Sprintf(":robot_face: *Investigate in your AI agent* — paste:\n`investigate incident %s using alertint`", incidentID),
+			false, false),
+		nil, nil,
+	)
 }
 
 // firingDetailBlocks builds the immediate thread reply with the full analysis:
@@ -314,6 +323,7 @@ func firingDetailBlocks(f notify.Finding) []slacklib.Block {
 
 	blocks = append(blocks,
 		slacklib.NewDividerBlock(),
+		agentHandoffBlock(f.IncidentID),
 		slacklib.NewContextBlock("",
 			slacklib.NewTextBlockObject(slacklib.MarkdownType,
 				fmt.Sprintf(":mag: `alertint_get_incident(\"%s\")` · `alertint_list_incidents`", f.IncidentID),

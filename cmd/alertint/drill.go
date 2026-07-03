@@ -22,6 +22,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/config"
 	"github.com/alertint/alertint-agent/internal/correlator"
+	"github.com/alertint/alertint-agent/internal/ingress"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/skills/acutetriage"
 )
@@ -31,8 +32,14 @@ import (
 const drillHTTPTimeout = 15 * time.Second
 
 // drillTriageGrace is the bounded LLM-triage budget added on top of the
-// correlation window before the one-shot fetch.
+// correlation window: the drill polls for the finding until it is ready or
+// this budget runs out.
 const drillTriageGrace = 75 * time.Second
+
+// drillPollInterval paces the post-window finding polls. Each poll is one
+// cheap MCP list call; the run ends as soon as triage does instead of
+// sleeping out the full grace.
+const drillPollInterval = 5 * time.Second
 
 // drillOpts are the parsed `alertint drill` flags.
 type drillOpts struct {
@@ -42,6 +49,7 @@ type drillOpts struct {
 	result          string
 	yes             bool
 	allowInsecure   bool
+	resolve         bool
 	viaAlertmanager string
 }
 
@@ -71,6 +79,7 @@ func runDrill(args []string, stdout, stderr io.Writer) error {
 	fs.StringVar(&opts.scenario, "scenario", "flagship", "scenario to fire: flagship | storm")
 	fs.StringVar(&opts.result, "result", "", "skip firing; fetch and print the finding for an incident id")
 	fs.BoolVar(&opts.yes, "yes", false, "skip the remote-target confirmation prompt")
+	fs.BoolVar(&opts.resolve, "resolve", false, "after the run, re-send the burst as resolved so the drill incident closes")
 	fs.BoolVar(&opts.allowInsecure, "allow-insecure-http", false, "allow sending bearer tokens to a plain-http remote target")
 	fs.StringVar(&opts.viaAlertmanager, "via-alertmanager", "", "fire the burst through your Alertmanager (base URL, v2 API) to validate AM→AlertINT routing")
 	if err := fs.Parse(args); err != nil {
@@ -113,6 +122,10 @@ func runDrill(args []string, stdout, stderr io.Writer) error {
 
 func (d *drillCmd) run(ctx context.Context) error {
 	mcpEndpoint, mcpToken, mcpErr := d.mcpEndpoint()
+
+	if d.opts.result != "" && d.opts.resolve {
+		return fmt.Errorf("drill: --resolve applies to a firing run, not --result (re-run the drill with --resolve instead)")
+	}
 
 	// --result: the re-check path. One fetch, one print, done. The transport
 	// guard applies here too — this path carries the MCP bearer token.
@@ -181,20 +194,23 @@ func (d *drillCmd) run(ctx context.Context) error {
 		return err
 	}
 
-	// Wait out the correlation window plus the bounded triage grace, then
-	// fetch exactly once. No polling loop — the --result re-check covers a
-	// slow triage.
+	// Wait out the correlation window — a server-side property of the
+	// target's correlator (tune correlator.window_seconds to shorten it) —
+	// then poll for the finding during the bounded triage grace so the run
+	// ends as soon as triage does.
 	window := time.Duration(d.cfg.Correlator.WindowSeconds)*time.Second + correlator.DefaultTickInterval
 	d.printf("waiting ~%ds for the correlation window…", int(window.Seconds()))
 	if err := d.sleep(ctx, window); err != nil {
 		return err
 	}
-	d.printf("window closed; giving the LLM triage up to %ds…", int(d.grace.Seconds()))
-	if err := d.sleep(ctx, d.grace); err != nil {
-		return err
-	}
 
 	if !mcpAvailable {
+		// Nothing to poll without MCP: give triage its grace blind, then
+		// point at the surfaces that can show the finding.
+		d.printf("window closed; giving the LLM triage up to %ds…", int(d.grace.Seconds()))
+		if err := d.sleep(ctx, d.grace); err != nil {
+			return err
+		}
 		d.printf("")
 		d.printf("fired. mcp is not usable from here, so the finding cannot be fetched — check:")
 		if d.cfg.Notify.Slack.Enabled {
@@ -202,9 +218,37 @@ func (d *drillCmd) run(ctx context.Context) error {
 		}
 		d.printf("  · the `finding` summary line in serve logs (group %s)", run.expectedGroupKey)
 		d.printf("then hand the incident to your agent: investigate the latest drill incident using alertint")
+		return d.maybeResolve(ctx, run, recvBase, webhookToken)
+	}
+	d.printf("window closed; polling for the finding (up to %ds)…", int(d.grace.Seconds()))
+	if err := d.fetchPayoff(ctx, mcpEndpoint, mcpToken, run.expectedGroupKey, capHint); err != nil {
+		return err
+	}
+	return d.maybeResolve(ctx, run, recvBase, webhookToken)
+}
+
+// maybeResolve fires the run's burst again as resolved when --resolve is set:
+// same door, same token, same fingerprints — the instance closes the Drill
+// through the production resolution path (Slack cards update in place).
+// Warn-and-continue: the payoff has already been delivered, and a failed
+// resolution just leaves a firing Drill.
+func (d *drillCmd) maybeResolve(ctx context.Context, run drillRun, recvBase, webhookToken string) error {
+	if !d.opts.resolve {
 		return nil
 	}
-	return d.fetchPayoff(ctx, mcpEndpoint, mcpToken, run.expectedGroupKey, capHint)
+	payload := resolvedPayload(run, d.now())
+	if d.opts.viaAlertmanager != "" {
+		d.printf("resolving the drill via your Alertmanager (delivery rides AM's group_interval)…")
+		if err := d.postAlertmanagerV2(ctx, payload); err != nil {
+			d.printf("warning: alertmanager rejected the resolution: %v — the drill incident stays firing", err)
+		}
+		return nil
+	}
+	d.printf("resolving the drill: %d resolved alerts (group %s)", len(payload.Alerts), run.expectedGroupKey)
+	if err := d.postJSON(ctx, recvBase+"/webhook/alertmanager", webhookToken, payload); err != nil {
+		d.printf("warning: resolution not accepted: %v — the drill incident stays firing", err)
+	}
+	return nil
 }
 
 // printPreflights emits the notify-and-continue setup notes and resolves the
@@ -258,7 +302,7 @@ func (d *drillCmd) fire(ctx context.Context, sc drillScenario, run drillRun, rec
 		d.printf("firing %d drill alerts via your Alertmanager at %s", len(run.alerts.Alerts), d.opts.viaAlertmanager)
 		d.printf("note: delivery now depends on your AM routing matching these labels (group %s)", run.expectedGroupKey)
 		d.printf("      and on AM's group_wait/group_interval; if the fetch below comes up empty, re-check later.")
-		if err := d.postAlertmanagerV2(ctx, run); err != nil {
+		if err := d.postAlertmanagerV2(ctx, run.alerts); err != nil {
 			d.printf("warning: alertmanager rejected the burst: %v", err)
 		}
 		return capHint, nil
@@ -270,8 +314,10 @@ func (d *drillCmd) fire(ctx context.Context, sc drillScenario, run drillRun, rec
 	return capHint, nil
 }
 
-// fetchPayoff is the post-wait one-shot: initialize, locate the incident,
-// print the finding (or the degraded pointer — never empty-handed).
+// fetchPayoff is the post-wait payoff: initialize, then poll the incident
+// list until the finding is analyzed or the triage grace runs out, and print
+// the finding (or the degraded pointer — never empty-handed). Polling is
+// paced by d.sleep so the loop is deterministic under test clocks.
 func (d *drillCmd) fetchPayoff(ctx context.Context, mcpEndpoint, mcpToken, groupKey string, capHint capHintKind) error {
 	client := newMCPOneShotClient(mcpEndpoint, mcpToken, d.http)
 	if err := client.initialize(ctx); err != nil {
@@ -279,26 +325,46 @@ func (d *drillCmd) fetchPayoff(ctx context.Context, mcpEndpoint, mcpToken, group
 		d.printSlackFallback(groupKey)
 		return nil
 	}
-	incidentID, state, drifted, err := d.findIncident(ctx, client, groupKey)
-	if err != nil {
-		d.printf("warning: could not list incidents: %v", err)
-		d.printSlackFallback(groupKey)
-		return nil
-	}
-	if incidentID == "" {
-		d.printf("no incident for group %s yet — the window may still be collecting.", groupKey)
-		d.printSlackFallback(groupKey)
-		return nil
+	polls := int(d.grace / drillPollInterval)
+	var incidentID, state string
+	var drifted bool
+	for attempt := 0; ; attempt++ {
+		var err error
+		incidentID, state, drifted, err = d.findIncident(ctx, client, groupKey)
+		if err != nil {
+			d.printf("warning: could not list incidents: %v", err)
+			d.printSlackFallback(groupKey)
+			return nil
+		}
+		if incidentID != "" && state == "analyzed" {
+			break
+		}
+		if attempt >= polls {
+			// Grace exhausted: report the honest state and the re-check.
+			if incidentID == "" {
+				d.printf("no incident for group %s yet — the window may still be collecting.", groupKey)
+				d.printSlackFallback(groupKey)
+				return nil
+			}
+			if drifted {
+				d.printDrift(groupKey)
+			}
+			d.printNotReady(incidentID, state)
+			return nil
+		}
+		if err := d.sleep(ctx, drillPollInterval); err != nil {
+			return err
+		}
 	}
 	if drifted {
-		d.printf("note: no incident matched group %s — the target's group_labels likely differ", groupKey)
-		d.printf("      from this config file (config drift). Showing the newest drill incident instead.")
-	}
-	if state != "analyzed" {
-		d.printNotReady(incidentID, state)
-		return nil
+		d.printDrift(groupKey)
 	}
 	return d.fetchAndPrintIncident(ctx, client, incidentID, capHint, false)
+}
+
+func (d *drillCmd) printDrift(groupKey string) {
+	d.printf("note: no incident matched group %s — the target's group_labels likely differ", groupKey)
+	d.printf("      from this config file (config drift). Showing the newest drill incident instead.")
 }
 
 // findIncident matches the run's salted group key on the incident list.
@@ -448,7 +514,7 @@ func (d *drillCmd) printCappedHint(confidence float64, kind capHintKind) {
 
 func (d *drillCmd) printNotReady(incidentID, state string) {
 	d.printf("")
-	d.printf("incident %s is not analyzed yet (state: %s) — the drill fires exactly one fetch.", incidentID, state)
+	d.printf("incident %s is not analyzed yet (state: %s).", incidentID, state)
 	d.printf("re-check with:")
 	d.printf("  alertint drill --config %s%s --result %s", d.opts.cfgPath, d.targetFlagSuffix(), incidentID)
 }
@@ -600,18 +666,25 @@ func (d *drillCmd) postJSON(ctx context.Context, url, token string, payload any)
 }
 
 // amPostableAlert is Alertmanager's v2 postable alert: no fingerprint or
-// status fields (AM derives both), so run-uniqueness in --via-alertmanager
-// mode rides entirely on the salted labels.
+// status fields (AM derives both — an endsAt in the past marks the alert
+// resolved), so run-uniqueness in --via-alertmanager mode rides entirely on
+// the salted labels.
 type amPostableAlert struct {
 	Labels      map[string]string `json:"labels"`
 	Annotations map[string]string `json:"annotations"`
 	StartsAt    time.Time         `json:"startsAt"`
+	EndsAt      *time.Time        `json:"endsAt,omitempty"`
 }
 
-func (d *drillCmd) postAlertmanagerV2(ctx context.Context, run drillRun) error {
-	alerts := make([]amPostableAlert, 0, len(run.alerts.Alerts))
-	for _, a := range run.alerts.Alerts {
-		alerts = append(alerts, amPostableAlert{Labels: a.Labels, Annotations: a.Annotations, StartsAt: a.StartsAt})
+func (d *drillCmd) postAlertmanagerV2(ctx context.Context, payload ingress.AlertmanagerPayload) error {
+	alerts := make([]amPostableAlert, 0, len(payload.Alerts))
+	for _, a := range payload.Alerts {
+		pa := amPostableAlert{Labels: a.Labels, Annotations: a.Annotations, StartsAt: a.StartsAt}
+		if !a.EndsAt.IsZero() {
+			t := a.EndsAt
+			pa.EndsAt = &t
+		}
+		alerts = append(alerts, pa)
 	}
 	base := strings.TrimRight(d.opts.viaAlertmanager, "/")
 	return d.postJSON(ctx, base+"/api/v2/alerts", "", alerts)
