@@ -286,7 +286,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 	cor := correlator.New(corCfg, st, incidentSink{skill: skill}, logger)
 
-	cor.SetResolutionNotifier(notifyresolution.New(notifier))
+	cor.SetResolutionNotifier(notifyresolution.New(notifier, st))
 
 	if err := cor.Start(ctx); err != nil {
 		return fmt.Errorf("correlator start: %w", err)

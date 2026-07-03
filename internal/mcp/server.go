@@ -151,7 +151,8 @@ func (s *Server) toolGetIncident() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 	tool := mcplib.NewTool("alertint_get_incident",
 		mcplib.WithDescription("Get full details for one incident: member alerts with their roles, "+
 			"AI finding (analysis name, overall issue, correlation findings, severity, confidence), "+
-			"and raw LLM output JSON."),
+			"and raw LLM output JSON. drill=true marks a synthetic drill fired by `alertint demo`, "+
+			"not a real incident."),
 		mcplib.WithString("incident_id",
 			mcplib.Description("Incident ID from alertint_list_incidents."),
 			mcplib.Required(),
@@ -358,14 +359,19 @@ func (s *Server) handleGetIncident(ctx context.Context, req mcplib.CallToolReque
 		})
 	}
 
-	// Derive the recovery signal from the member alerts already loaded above.
+	// Derive the recovery signal and the drill flag from the member alerts
+	// already loaded above (drill: any member carries the ADR-0013 marker).
 	var firing, resolved int
+	drill := false
 	for _, a := range alerts {
 		switch a.Status {
 		case "firing":
 			firing++
 		case "resolved":
 			resolved++
+		}
+		if a.Labels[store.DemoMarkerLabel] == store.DemoMarkerValue {
+			drill = true
 		}
 	}
 
@@ -382,6 +388,7 @@ func (s *Server) handleGetIncident(ctx context.Context, req mcplib.CallToolReque
 		"root_cause":     inc.RootCause,
 		"confidence":     inc.Confidence,
 		"recovery":       buildRecovery(firing, resolved, len(alerts), inc.Status, inc.UpdatedAt),
+		"drill":          drill,
 		"finding":        finding,
 		"alerts":         alertRows,
 	}

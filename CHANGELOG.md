@@ -32,6 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Docs positioning updated to match: Prometheus is promoted to the recommended
   first evidence source; Pushgateway synthetic metrics are demoted to optional
   compose-stack realism.
+- **`correlator.group_labels` is validated more strictly** — entries using the
+  now-reserved `alertint_` label-key prefix, duplicated keys, and
+  whitespace-padded keys are rejected at config load. Configs that previously
+  carried such entries (silently misbehaving) now fail loud at startup;
+  `alertint validate` catches them ahead of a deploy.
+- **Demo change events never enrich real incidents** — change events carrying
+  the reserved `alertint_demo` marker are excluded from triage change
+  enrichment unless the incident itself is a drill, so a planted demo deploy
+  can neither lift a real incident's confidence cap nor invite a false causal
+  attribution.
 
 ### Added
 
@@ -39,7 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Drill at a running instance and ends at "finding ready". The flagship
   scenario plants a fake deploy on the change webhook and follows with an
   overlapping alert burst, producing a causal, uncapped finding that names the
-  deploy; a `--scenario storm` variant exercises storm collapse. Everything is
+  deploy; a `--scenario storm` variant fires a storm-sized burst that lands as
+  one incident. Everything is
   derived from the same config file `serve` reads (receiver/MCP addresses,
   tokens, `group_labels` adaptation); the console prints progress, then one
   one-shot MCP fetch renders the finding plus the

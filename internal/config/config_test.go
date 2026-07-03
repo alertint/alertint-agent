@@ -806,3 +806,35 @@ func TestValidate_ReservedGroupLabelPrefix(t *testing.T) {
 		}
 	})
 }
+
+func TestValidate_GroupLabelHygiene(t *testing.T) {
+	base := Defaults()
+	base.Alertmanager.WebhookTokenEnv = "ALERTINT_WEBHOOK_TOKEN"
+	base.LLM.APIKeyEnv = "ANTHROPIC_API_KEY"
+
+	cases := map[string]struct {
+		labels []string
+		want   string
+	}{
+		"duplicate key":   {labels: []string{"cluster", "service", "cluster"}, want: "duplicates entry"},
+		"padded key":      {labels: []string{" cluster", "service"}, want: "surrounding whitespace"},
+		"clean labels ok": {labels: []string{"cluster", "service"}, want: ""},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			cfg := base
+			cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
+			cfg.Correlator.GroupLabels = tc.labels
+			err := cfg.Validate()
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("Validate: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate = %v, want error containing %q", err, tc.want)
+			}
+		})
+	}
+}

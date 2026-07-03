@@ -528,14 +528,25 @@ func (c *Config) validateCorrelator() []string {
 	if len(c.Correlator.GroupLabels) == 0 {
 		errs = append(errs, "correlator.group_labels must contain at least one label")
 	} else {
+		seen := make(map[string]int, len(c.Correlator.GroupLabels))
 		for i, label := range c.Correlator.GroupLabels {
-			if strings.TrimSpace(label) == "" {
+			switch {
+			case strings.TrimSpace(label) == "":
 				errs = append(errs, fmt.Sprintf("correlator.group_labels[%d] is empty", i))
-			} else if strings.HasPrefix(strings.ToLower(strings.TrimSpace(label)), "alertint_") {
+			case label != strings.TrimSpace(label):
+				// Padded keys silently never match any alert label.
+				errs = append(errs, fmt.Sprintf("correlator.group_labels[%d] %q has surrounding whitespace", i, label))
+			case strings.HasPrefix(strings.ToLower(label), "alertint_"):
 				// The alertint_ label-key prefix is reserved as AlertINT-owned
 				// (e.g. the alertint_demo drill marker) and never participates
 				// in grouping.
 				errs = append(errs, fmt.Sprintf("correlator.group_labels[%d] %q uses the reserved alertint_ label prefix; alertint_* labels never participate in grouping", i, label))
+			default:
+				if j, dup := seen[label]; dup {
+					// A duplicated key doubles its part in the group key.
+					errs = append(errs, fmt.Sprintf("correlator.group_labels[%d] %q duplicates entry %d", i, label, j))
+				}
+				seen[label] = i
 			}
 		}
 	}

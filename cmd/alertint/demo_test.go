@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -462,5 +463,240 @@ func TestDemo_UnknownScenario(t *testing.T) {
 	err := d.run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "unknown scenario") {
 		t.Fatalf("run = %v, want unknown-scenario error", err)
+	}
+}
+
+// TestDemo_ResultModeInsecureRemote: --result carries the MCP bearer token,
+// so a plain-HTTP remote target needs the explicit override too.
+func TestDemo_ResultModeInsecureRemote(t *testing.T) {
+	cfg := demoTestConfig(t)
+	d, _ := demoTestCmd(t, nil, cfg, demoOpts{cfgPath: "cfg.yaml", result: "inc-1", target: "http://alertint.example:9911"})
+	err := d.run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "--allow-insecure-http") {
+		t.Fatalf("run = %v, want insecure-http refusal before any token is sent", err)
+	}
+}
+
+// TestDemo_ViaAlertmanagerRemoteGuard: the AM URL is a second remote write
+// surface and gets the same guard as the receiver target.
+func TestDemo_ViaAlertmanagerRemoteGuard(t *testing.T) {
+	f := newFakeInstance(t)
+	cfg := demoTestConfig(t)
+	d, _ := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship", viaAlertmanager: "https://am.example:9093"})
+	d.confirm = func(string) (bool, error) { return false, nil }
+	err := d.run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "aborted") {
+		t.Fatalf("run = %v, want user abort on remote AM", err)
+	}
+	if len(f.alertBodies)+len(f.changeBodies) != 0 {
+		t.Error("nothing may fire when the AM guard aborts")
+	}
+}
+
+// TestDemo_ViaAlertmanagerNoEmptyAuthHeader: no Authorization header goes to
+// the user's Alertmanager (no token is involved).
+func TestDemo_ViaAlertmanagerNoEmptyAuthHeader(t *testing.T) {
+	f := newFakeInstance(t)
+	cfg := demoTestConfig(t)
+	var sawAuth []string
+	am := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := r.Header["Authorization"]; ok {
+			sawAuth = append(sawAuth, r.Header.Get("Authorization"))
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(am.Close)
+	d, _ := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship", viaAlertmanager: am.URL})
+	f.listRows = []map[string]any{}
+	if err := d.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(sawAuth) != 0 {
+		t.Fatalf("Alertmanager received Authorization headers: %v", sawAuth)
+	}
+}
+
+// TestDemo_MCPMisconfigPreflight: MCP enabled but token env unset must be
+// reported before firing, and the run degrades instead of erroring after the
+// full wait.
+func TestDemo_MCPMisconfigPreflight(t *testing.T) {
+	f := newFakeInstance(t)
+	cfg := demoTestConfig(t)
+	cfg.MCP.TokenEnv = "DEMO_TEST_MCP_UNSET"
+	d, out := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
+
+	if err := d.run(context.Background()); err != nil {
+		t.Fatalf("run: %v (mcp misconfig must degrade, not fail)", err)
+	}
+	if len(f.alertBodies) != 1 {
+		t.Error("burst must still fire")
+	}
+	s := out.String()
+	if !strings.Contains(s, "mcp is enabled but not usable") || !strings.Contains(s, "--result") {
+		t.Errorf("missing preflight note:\n%s", s)
+	}
+}
+
+// TestDemo_ChangePostRejected: an attempted-but-rejected planted deploy warns
+// with the token hint and steers the capped hint to the rejected wording.
+func TestDemo_ChangePostRejected(t *testing.T) {
+	cfg := demoTestConfig(t)
+	f := newFakeInstance(t)
+
+	rejecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/webhook/change" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		f.record(r, &f.alertBodies)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(rejecting.Close)
+
+	d, out := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship", target: rejecting.URL})
+	groupKey := "cluster=demo-cluster-t3st01,namespace=demo-shop,service=demo-checkout"
+	f.listRows = []map[string]any{{"id": "inc-8", "group_key": groupKey, "status": "analyzed"}}
+	capped := analyzedIncident("inc-8")
+	capped["confidence"] = 0.6
+	f.incident = capped
+
+	if err := d.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	s := out.String()
+	for _, want := range []string{"change event not accepted", "check the DEMO_TEST_CH env var", "rejected at the change webhook"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("stdout missing %q:\n%s", want, s)
+		}
+	}
+	if strings.Contains(s, "enable changes.ingress") {
+		t.Errorf("rejected-POST run must not advise enabling already-enabled ingress:\n%s", s)
+	}
+}
+
+// TestDemo_DriftFallback: when no incident matches the locally-computed group
+// key, the newest drill incident is used with a config-drift caveat.
+func TestDemo_DriftFallback(t *testing.T) {
+	f := newFakeInstance(t)
+	cfg := demoTestConfig(t)
+	d, out := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
+
+	f.listRows = []map[string]any{
+		{"id": "real-1", "group_key": "service=checkout", "status": "analyzed", "drill": false},
+		{"id": "drill-9", "group_key": "team=demo-team-x", "status": "analyzed", "drill": true},
+	}
+	f.incident = analyzedIncident("drill-9")
+
+	if err := d.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	s := out.String()
+	if !strings.Contains(s, "config drift") || !strings.Contains(s, "investigate incident drill-9 using alertint") {
+		t.Errorf("drift fallback missing:\n%s", s)
+	}
+}
+
+// TestDemo_ResultUnknownIncident: --result with a bad id must error (exit 1),
+// not print a hint recommending the same doomed command.
+func TestDemo_ResultUnknownIncident(t *testing.T) {
+	f := newFakeInstance(t)
+	cfg := demoTestConfig(t)
+	f.mcp.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Mcp-Session-Id", "mcp-session-x")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"incident \"nope\" not found"}]}}`))
+	})
+	d, _ := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", result: "nope"})
+	err := d.run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("run = %v, want fetch error surfaced", err)
+	}
+}
+
+// TestDemo_CappedHintProbeWording: with change ingress on and fired, the
+// Prometheus probe steers the wording between detected and docs-link
+// variants; both stay scoped to real incidents.
+func TestDemo_CappedHintProbeWording(t *testing.T) {
+	for name, probe := range map[string]bool{"probe hit": true, "probe miss": false} {
+		t.Run(name, func(t *testing.T) {
+			f := newFakeInstance(t)
+			cfg := demoTestConfig(t)
+			d, out := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
+			d.probePrometheus = func(string, string) bool { return probe }
+
+			groupKey := "cluster=demo-cluster-t3st01,namespace=demo-shop,service=demo-checkout"
+			f.listRows = []map[string]any{{"id": "inc-c", "group_key": groupKey, "status": "analyzed"}}
+			capped := analyzedIncident("inc-c")
+			capped["confidence"] = 0.6
+			f.incident = capped
+
+			if err := d.run(context.Background()); err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			s := out.String()
+			if probe && !strings.Contains(s, "something is answering") {
+				t.Errorf("probe-hit wording missing:\n%s", s)
+			}
+			if !probe && !strings.Contains(s, "get in touch") {
+				t.Errorf("probe-miss wording missing:\n%s", s)
+			}
+			if !strings.Contains(s, "cannot uncap a demo re-run") {
+				t.Errorf("real-incident scoping missing:\n%s", s)
+			}
+		})
+	}
+}
+
+// TestDemo_SanitizesFindingText: control characters in MCP-sourced strings
+// never reach the terminal.
+func TestDemo_SanitizesFindingText(t *testing.T) {
+	f := newFakeInstance(t)
+	cfg := demoTestConfig(t)
+	d, out := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", result: "inc-evil"})
+	evil := analyzedIncident("inc-evil")
+	finding, ok := evil["finding"].(map[string]any)
+	if !ok {
+		t.Fatal("fixture finding is not a map")
+	}
+	finding["analysis_name"] = "evil\x1b[31mred\x07bell"
+	f.incident = evil
+
+	if err := d.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	s := out.String()
+	if strings.ContainsRune(s, '\x1b') || strings.ContainsRune(s, '\x07') {
+		t.Fatalf("control characters leaked to terminal output: %q", s)
+	}
+	if !strings.Contains(s, "evil[31mredbell") {
+		t.Errorf("sanitized text mangled: %q", s)
+	}
+}
+
+// TestDemo_AlertmanagerReceiverDisabled: the demo cannot ingest its burst
+// without the alert receiver — a pre-fire config error.
+func TestDemo_AlertmanagerReceiverDisabled(t *testing.T) {
+	f := newFakeInstance(t)
+	cfg := demoTestConfig(t)
+	cfg.Alertmanager.Enabled = false
+	d, _ := demoTestCmd(t, f, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
+	err := d.run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "alertmanager receiver is disabled") {
+		t.Fatalf("run = %v, want receiver-disabled error", err)
+	}
+	if len(f.alertBodies)+len(f.changeBodies) != 0 {
+		t.Error("nothing may fire without the alert receiver")
+	}
+}
+
+// TestDemo_ConfirmErrorPath: a failed confirmation read (non-TTY) refuses
+// with the --yes instruction.
+func TestDemo_ConfirmErrorPath(t *testing.T) {
+	cfg := demoTestConfig(t)
+	d, _ := demoTestCmd(t, nil, cfg, demoOpts{cfgPath: "cfg.yaml", scenario: "flagship", target: "https://alertint.example:9911"})
+	d.confirm = func(string) (bool, error) { return false, io.EOF }
+	err := d.run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "--yes") {
+		t.Fatalf("run = %v, want non-interactive instruction", err)
 	}
 }

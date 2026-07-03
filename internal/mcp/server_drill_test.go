@@ -68,3 +68,36 @@ func TestListIncidents_DrillFlag(t *testing.T) {
 		}
 	}
 }
+
+// TestGetIncident_DrillFlag: the single-incident payload carries the same
+// derived drill boolean the list rows do.
+func TestGetIncident_DrillFlag(t *testing.T) {
+	st := newMCPStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	for _, id := range []string{"gi-drill", "gi-real"} {
+		if err := st.InsertIncident(ctx, store.Incident{ID: id, GroupKey: "g=" + id, FirstAlertAt: now, LastAlertAt: now, ReadyAt: now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	addLabeledMember(t, st, "gi-drill", "gd1", map[string]string{store.DemoMarkerLabel: store.DemoMarkerValue})
+	addLabeledMember(t, st, "gi-real", "gr1", map[string]string{"service": "checkout"})
+
+	s := NewServer(Config{}, st, audit.New(st.DB()))
+	for id, want := range map[string]bool{"gi-drill": true, "gi-real": false} {
+		res, err := s.handleGetIncident(ctx, reqWith(map[string]any{"incident_id": id}))
+		if err != nil || res.IsError {
+			t.Fatalf("get incident errored: %v %s", err, resultText(t, res))
+		}
+		var payload struct {
+			Drill bool `json:"drill"`
+		}
+		if err := json.Unmarshal([]byte(resultText(t, res)), &payload); err != nil {
+			t.Fatalf("payload not JSON: %v", err)
+		}
+		if payload.Drill != want {
+			t.Errorf("%s drill = %v, want %v", id, payload.Drill, want)
+		}
+	}
+}

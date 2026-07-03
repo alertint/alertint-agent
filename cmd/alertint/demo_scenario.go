@@ -42,8 +42,13 @@ type demoChange struct {
 // values are obviously fictional (distillation privacy boundary: synthetic
 // payloads persist across prompt, SQLite, and MCP).
 type demoAlertTemplate struct {
-	alertname   string
-	severity    string
+	alertname string
+	severity  string
+	// labels are per-alert extras (never group labels). Alertmanager's v2
+	// API identifies alerts by their full label set, so alerts that would
+	// otherwise be label-identical (the storm burst) need one distinguishing
+	// label or --via-alertmanager collapses them into a single alert.
+	labels      map[string]string
 	annotations map[string]string
 }
 
@@ -109,7 +114,7 @@ func demoScenarios() map[string]demoScenario {
 		},
 		"storm": {
 			key:         "storm",
-			description: "alert storm on one service — exercises storm collapse",
+			description: "storm-sized burst on one service — one incident from many near-identical alerts",
 			alerts:      stormTemplates(),
 		},
 	}
@@ -122,6 +127,7 @@ func stormTemplates() []demoAlertTemplate {
 		out = append(out, demoAlertTemplate{
 			alertname: "DemoNodeDiskPressure",
 			severity:  "warning",
+			labels:    map[string]string{"node": fmt.Sprintf("demo-node-%02d", i)},
 			annotations: map[string]string{
 				"summary":     fmt.Sprintf("[demo] node demo-node-%02d under disk pressure (92%% used)", i),
 				"description": "[demo] Synthetic storm: many near-identical alerts from one failure domain.",
@@ -134,8 +140,7 @@ func stormTemplates() []demoAlertTemplate {
 // demoRun is a materialized scenario: concrete payloads bound to one run id
 // and the target's group labels.
 type demoRun struct {
-	scenario demoScenario
-	runID    string
+	runID string
 	// groupLabelValues holds the adapted value for every configured group
 	// label key; identical on every burst alert so the whole Drill lands in
 	// one incident.
@@ -157,6 +162,9 @@ var cannedGroupValues = map[string]string{
 	"alertname": "DemoCheckoutIncident",
 	"host":      "demo-node-01",
 	"instance":  "demo-node-01:9100",
+	// severity is meaning-bearing: a "demo-severity" value would contradict
+	// the alert annotations, so grouping by severity gets a real level.
+	"severity": "warning",
 }
 
 // materializeScenario binds a scenario to the target's group labels and a run
@@ -197,6 +205,9 @@ func materializeScenario(sc demoScenario, groupLabelKeys []string, runID string,
 			"severity":            tpl.severity,
 			store.DemoMarkerLabel: store.DemoMarkerValue,
 		}
+		for k, v := range tpl.labels {
+			labels[k] = v
+		}
 		// Group labels win over template labels: if the target groups by a
 		// key the template also sets (e.g. alertname), the adapted value
 		// keeps the whole burst in one incident.
@@ -213,7 +224,6 @@ func materializeScenario(sc demoScenario, groupLabelKeys []string, runID string,
 	}
 
 	run := demoRun{
-		scenario:         sc,
 		runID:            runID,
 		groupLabelValues: adapted,
 		expectedGroupKey: demoGroupKey(adapted),

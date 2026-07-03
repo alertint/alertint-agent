@@ -17,11 +17,14 @@ import (
 // Notifier wraps existing notifiers to send resolution notifications.
 type Notifier struct {
 	inner notify.Notifier
+	st    *store.Store
 }
 
-// New creates a resolution notifier that wraps an existing notifier.
-func New(inner notify.Notifier) *Notifier {
-	return &Notifier{inner: inner}
+// New creates a resolution notifier that wraps an existing notifier. st may
+// be nil (tests); it is used to re-derive the Drill flag so a resolving
+// drill's in-place card update keeps its DRILL banner (ADR-0013).
+func New(inner notify.Notifier, st *store.Store) *Notifier {
+	return &Notifier{inner: inner, st: st}
 }
 
 // OnIncidentResolved implements correlator.ResolutionNotifier.
@@ -42,6 +45,15 @@ func (n *Notifier) OnIncidentResolved(ctx context.Context, inc store.Incident) e
 		confidence = 1.0
 	}
 
+	drill := false
+	if n.st != nil {
+		// Best-effort: a lookup failure must not block the resolution
+		// notification; the card just loses the banner in that edge.
+		if flags, err := n.st.IncidentDrillFlags(ctx, []string{inc.ID}); err == nil {
+			drill = flags[inc.ID]
+		}
+	}
+
 	f := notify.Finding{
 		IncidentID:   inc.ID,
 		GroupKey:     inc.GroupKey,
@@ -54,6 +66,7 @@ func (n *Notifier) OnIncidentResolved(ctx context.Context, inc store.Incident) e
 		AnalyzedAt:   time.Now().UTC(),
 		OutputJSON:   json.RawMessage(`{"status":"resolved"}`),
 		Status:       "resolved",
+		Drill:        drill,
 	}
 	return n.inner.Notify(ctx, f)
 }

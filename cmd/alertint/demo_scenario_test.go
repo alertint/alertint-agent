@@ -164,3 +164,18 @@ func TestMaterialize_ReceiverContract(t *testing.T) {
 		}
 	}
 }
+
+// TestMaterialize_StormAlertsDistinct: Alertmanager v2 identifies alerts by
+// their full label set, so storm alerts must be pairwise distinct or
+// --via-alertmanager collapses the burst into one alert.
+func TestMaterialize_StormAlertsDistinct(t *testing.T) {
+	run := mustMaterialize(t, "storm", defaultGroupLabels, "aabb01")
+	seen := map[string]bool{}
+	for i, a := range run.alerts.Alerts {
+		key := demoGroupKey(a.Labels) // full-label sorted join as identity
+		if seen[key] {
+			t.Fatalf("alert[%d] label set duplicates an earlier alert: %s", i, key)
+		}
+		seen[key] = true
+	}
+}

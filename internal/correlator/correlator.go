@@ -67,12 +67,17 @@ type Config struct {
 	GroupLabels []string
 }
 
+// DefaultTickInterval is the flush-ticker default, exported so callers that
+// budget around window expiry (e.g. `alertint demo`) reference the real value
+// instead of hand-copying it.
+const DefaultTickInterval = 5 * time.Second
+
 func (c *Config) defaults() {
 	if c.WindowSeconds <= 0 {
 		c.WindowSeconds = 60
 	}
 	if c.TickInterval <= 0 {
-		c.TickInterval = 5 * time.Second
+		c.TickInterval = DefaultTickInterval
 	}
 }
 

@@ -83,6 +83,23 @@ func FetchChanges(ctx context.Context, st *store.Store, params ChangeParams, ale
 		logger.Warn("change query failed", "err", err, "incident", incidentID)
 		return &ChangeEnrichment{Start: start, End: end, MatchedLabels: shared, Note: "change query failed: " + err.Error()}
 	}
+	// Segregate drill artifacts (ADR-0013/0014): a change event carrying the
+	// reserved demo marker is synthetic. It may only enrich a Drill — for a
+	// real incident it would be fictional "live evidence" that lifts the
+	// metadata-only confidence cap and invites a false causal attribution.
+	if !isDrill(alerts) {
+		kept := all[:0]
+		for _, c := range all {
+			if c.Labels[store.DemoMarkerLabel] == store.DemoMarkerValue {
+				continue
+			}
+			kept = append(kept, c)
+		}
+		if dropped := len(all) - len(kept); dropped > 0 {
+			logger.Info("demo changes excluded from real incident", "dropped", dropped, "incident", incidentID)
+		}
+		all = kept
+	}
 	if len(all) == 0 {
 		// Genuinely empty window — keep the original note so absence of changes
 		// is never silently mistaken for "nothing changed".

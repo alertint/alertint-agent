@@ -447,21 +447,21 @@ func marshalEnrichments(sources map[string]any, logger *slog.Logger, incidentID 
 
 // applyEvidenceCap is the deterministic calibration backstop: the prompt-side
 // rule (renderEvidenceBasis) asks the model to keep annotations-only confidence
-// at or below maxMetadataOnlyConfidence; this guarantees it regardless of model
+// at or below MaxMetadataOnlyConfidence; this guarantees it regardless of model
 // compliance. Short-circuit findings are exempt — they carry rule evidence, not
 // model judgment. The persisted output_json keeps the model's original number;
 // the incident row and every notification carry the capped one.
 func (s *Skill) applyEvidenceCap(resp *llmResponse, decision rules.Decision, metrics []MetricSnapshot, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, incidentID string) {
 	if decision.ShortCircuit || hasLiveEvidence(metrics, logs, changes, sentry) ||
-		resp.Confidence <= maxMetadataOnlyConfidence {
+		resp.Confidence <= MaxMetadataOnlyConfidence {
 		return
 	}
 	s.logger.Info("confidence capped: annotations-only evidence basis",
 		"incident", incidentID,
 		"model_confidence", resp.Confidence,
-		"capped_to", maxMetadataOnlyConfidence,
+		"capped_to", MaxMetadataOnlyConfidence,
 	)
-	resp.Confidence = maxMetadataOnlyConfidence
+	resp.Confidence = MaxMetadataOnlyConfidence
 }
 
 func clampConfidence(c *float64) {
