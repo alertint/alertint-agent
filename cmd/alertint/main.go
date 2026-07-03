@@ -8,6 +8,8 @@
 //	alertint health        probe GET /health and exit 0 (ok) or 1 (degraded).
 //	alertint verify-audit  recompute the audit log hash chain and report
 //	                       any tampering. Requires --config.
+//	alertint validate      dry-run a config file (parse + validate, skipping
+//	                       machine-coupled filesystem checks); exit 0/1.
 //	alertint version       print the version. Equivalent to --version.
 //
 // All subcommands accept --log-level and --log-format. The top-level
@@ -79,6 +81,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 			return runHealth(args[1:], stdout, stderr)
 		case "verify-audit":
 			return runVerifyAudit(args[1:], stdout, stderr)
+		case "validate":
+			return runValidate(args[1:], stdout, stderr)
 		case "serve":
 			return runServe(args[1:], stdout, stderr)
 		}
