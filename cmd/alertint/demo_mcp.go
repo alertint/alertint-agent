@@ -42,8 +42,10 @@ func newMCPOneShotClient(endpoint, token string, httpClient *http.Client) *mcpOn
 	return &mcpOneShotClient{endpoint: endpoint, token: token, http: httpClient, nextID: 1}
 }
 
-// post sends one JSON-RPC request and decodes the single JSON response.
-func (c *mcpOneShotClient) post(ctx context.Context, method string, params any) (json.RawMessage, *http.Response, error) {
+// post sends one JSON-RPC request and decodes the single JSON response,
+// returning the result plus the response headers (the body is fully consumed
+// and closed here).
+func (c *mcpOneShotClient) post(ctx context.Context, method string, params any) (json.RawMessage, http.Header, error) {
 	body, err := json.Marshal(jsonrpcRequest{JSONRPC: "2.0", ID: c.nextID, Method: method, Params: params})
 	if err != nil {
 		return nil, nil, fmt.Errorf("demo: marshal %s request: %w", method, err)
@@ -81,7 +83,7 @@ func (c *mcpOneShotClient) post(ctx context.Context, method string, params any) 
 	if rpc.Error != nil {
 		return nil, nil, fmt.Errorf("demo: mcp %s: rpc error %d: %s", method, rpc.Error.Code, rpc.Error.Message)
 	}
-	return rpc.Result, resp, nil
+	return rpc.Result, resp.Header, nil
 }
 
 // initialize performs the MCP handshake and captures the session id header.
@@ -91,11 +93,11 @@ func (c *mcpOneShotClient) initialize(ctx context.Context) error {
 		"capabilities":    map[string]any{},
 		"clientInfo":      map[string]any{"name": "alertint-demo", "version": resolveVersion()},
 	}
-	_, resp, err := c.post(ctx, "initialize", params)
+	_, header, err := c.post(ctx, "initialize", params)
 	if err != nil {
 		return err
 	}
-	if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
+	if sid := header.Get("Mcp-Session-Id"); sid != "" {
 		c.sessionID = sid
 	}
 	return nil
@@ -129,10 +131,10 @@ func (c *mcpOneShotClient) callTool(ctx context.Context, name string, args map[s
 
 // snippet truncates a response body for error messages.
 func snippet(b []byte) string {
-	const max = 200
+	const maxLen = 200
 	s := string(b)
-	if len(s) > max {
-		s = s[:max] + "…"
+	if len(s) > maxLen {
+		s = s[:maxLen] + "…"
 	}
 	return s
 }

@@ -21,10 +21,10 @@ import (
 // streamable-HTTP MCP endpoint (initialize + tools/call, format-only session
 // check — the contract verified against mcp-go v0.54.1).
 type fakeInstance struct {
-	mu          sync.Mutex
-	changeBodies  [][]byte
-	alertBodies [][]byte
-	authSeen    []string
+	mu           sync.Mutex
+	changeBodies [][]byte
+	alertBodies  [][]byte
+	authSeen     []string
 
 	listRows      []map[string]any
 	incident      map[string]any
@@ -108,7 +108,9 @@ func (f *fakeInstance) record(r *http.Request, into *[][]byte) {
 }
 
 func writeRPC(w http.ResponseWriter, id int, result any) {
-	_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": id, "result": result})
+	if err := json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": id, "result": result}); err != nil {
+		panic(err)
+	}
 }
 
 // demoTestCmd builds a demoCmd wired to the fakes with instant sleeps.
@@ -462,4 +464,3 @@ func TestDemo_UnknownScenario(t *testing.T) {
 		t.Fatalf("run = %v, want unknown-scenario error", err)
 	}
 }
-

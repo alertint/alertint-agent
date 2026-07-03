@@ -117,23 +117,21 @@ func TestBelowMinSeverity(t *testing.T) {
 func TestDrillBannerOnAllSurfaces(t *testing.T) {
 	drill := testFinding()
 	drill.Drill = true
-	real := testFinding()
+	regular := testFinding()
 
 	surfaces := map[string]func(notify.Finding) string{
-		"firingMain":     func(f notify.Finding) string { return blocksJSON(t, firingMainBlocks(f)) },
-		"firingDetail":   func(f notify.Finding) string { return blocksJSON(t, firingDetailBlocks(f)) },
-		"resolvedMain":   func(f notify.Finding) string { return blocksJSON(t, resolvedMainBlocks(f)) },
-		"resolvedThread": func(f notify.Finding) string { return blocksJSON(t, resolvedThreadBlocks(f)) },
-		"firingFallback": func(f notify.Finding) string { return firingFallback(f) },
-		"resolvedFallback": func(f notify.Finding) string {
-			return resolvedFallback(f)
-		},
+		"firingMain":       func(f notify.Finding) string { return blocksJSON(t, firingMainBlocks(f)) },
+		"firingDetail":     func(f notify.Finding) string { return blocksJSON(t, firingDetailBlocks(f)) },
+		"resolvedMain":     func(f notify.Finding) string { return blocksJSON(t, resolvedMainBlocks(f)) },
+		"resolvedThread":   func(f notify.Finding) string { return blocksJSON(t, resolvedThreadBlocks(f)) },
+		"firingFallback":   firingFallback,
+		"resolvedFallback": resolvedFallback,
 	}
 	for name, render := range surfaces {
 		if got := render(drill); !strings.Contains(got, "DRILL") {
 			t.Errorf("%s: drill finding missing DRILL banner:\n%s", name, got)
 		}
-		if got := render(real); strings.Contains(got, "DRILL") {
+		if got := render(regular); strings.Contains(got, "DRILL") {
 			t.Errorf("%s: real finding must not carry DRILL banner:\n%s", name, got)
 		}
 	}

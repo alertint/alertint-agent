@@ -394,12 +394,12 @@ func TestIncidentDrillFlags(t *testing.T) {
 		}
 	}
 	demo := map[string]string{DemoMarkerLabel: DemoMarkerValue, "service": "demo-checkout"}
-	real := map[string]string{"service": "checkout"}
+	plain := map[string]string{"service": "checkout"}
 	add(idDrill, "d-1", demo)
 	add(idDrill, "d-2", demo)
-	add(idMixed, "m-1", real)
+	add(idMixed, "m-1", plain)
 	add(idMixed, "m-2", demo)
-	add(idReal, "r-1", real)
+	add(idReal, "r-1", plain)
 
 	flags, err := s.IncidentDrillFlags(ctx, []string{idDrill, idMixed, idReal})
 	if err != nil {
