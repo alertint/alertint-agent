@@ -134,6 +134,16 @@ tasks:
     cmds:
       - go run ./docs/scripts
 
+  release:prep:
+    desc: "Roll CHANGELOG [Unreleased] into a version section before tagging, e.g. `task release:prep VERSION=0.7.0` (see RELEASING.md)"
+    cmds:
+      - ./scripts/release-prep.sh "{{.VERSION}}"
+
+  release:notes:
+    desc: "Preview the release body for a version from CHANGELOG.md, e.g. `task release:notes VERSION=0.6.0`"
+    cmds:
+      - ./scripts/release-notes.sh "{{.VERSION}}"
+
   tidy:
     desc: Run go mod tidy
     cmds:
