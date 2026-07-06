@@ -115,7 +115,7 @@ planned).
 |---|---|---|---|
 | `window_seconds` | int | `90` | Alerts sharing the same group key within this window form one incident |
 | `min_alerts` | int | `1` | Minimum alerts before the incident is dispatched to the skill. The default `1` triages a lone alert too — use `notify.slack.min_severity` to control channel noise instead of dropping triage. |
-| `group_labels` | list | `[alertname, cluster, namespace, service]` | Label names used to compute the group key. Two alerts are correlated when all of these labels match. The `alertint_` label-key prefix is reserved for AlertINT itself (e.g. the `alertint_drill` drill marker) and is rejected here — reserved labels never participate in grouping. |
+| `group_labels` | list | `[cluster, namespace, service]` | Label names used to compute the group key. Two alerts are correlated when all of these labels match. Deliberately excludes `alertname` so related alerts of different types (latency + crash-loop on one service) correlate into one incident; add it only if you want one incident per alert type. The `alertint_` label-key prefix is reserved for AlertINT itself (e.g. the `alertint_drill` drill marker) and is rejected here — reserved labels never participate in grouping. |
 
 `window_seconds` is a tradeoff. A lower value reacts faster, but an
 incident may be analyzed with only the first alert or two of a burst
@@ -151,13 +151,15 @@ See [Slack](../notifications/slack.md) for the full setup walkthrough.
 When enabled, `alertint serve` starts a second HTTP listener — a
 Streamable HTTP MCP server — that AI coding agents (Claude Code, Cursor,
 Windsurf) connect to for incident, alert, evidence, audit, and Prometheus
-tools.
+tools. Enablement is presence-based: setting the bearer-token env var
+(`ALERTINT_MCP_TOKEN` by default) turns the server on; an explicit
+`enabled: false` forces it off.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | bool | `false` | Start the MCP HTTP server inside `serve` |
+| `enabled` | bool | auto | Omitted = on when the env var named by `token_env` holds a token (presence-based); set `false` to force off |
 | `addr` | string | `"0.0.0.0:9912"` | TCP address the MCP server binds to. Endpoint is `http://host:9912/mcp` |
-| `token_env` | string | — | Env var name holding the MCP bearer token. Default env var is `ALERTINT_MCP_TOKEN` |
+| `token_env` | string | `ALERTINT_MCP_TOKEN` | Env var name holding the MCP bearer token |
 
 Clients authenticate with `Authorization: Bearer <token>`. See
 [MCP clients](../integrations/mcp-clients.md) for copy-paste client
@@ -271,7 +273,6 @@ correlator:
   window_seconds: 90
   min_alerts: 1
   group_labels:
-    - alertname
     - cluster
     - namespace
     - service
@@ -284,7 +285,7 @@ notify:
     channel: "#alerts"
 
 mcp:
-  enabled: true
+  # on automatically when ALERTINT_MCP_TOKEN is set
   addr: "0.0.0.0:9912"
   token_env: ALERTINT_MCP_TOKEN
 

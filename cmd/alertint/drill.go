@@ -130,8 +130,8 @@ func (d *drillCmd) run(ctx context.Context) error {
 	// --result: the re-check path. One fetch, one print, done. The transport
 	// guard applies here too — this path carries the MCP bearer token.
 	if d.opts.result != "" {
-		if !d.cfg.MCP.Enabled {
-			return fmt.Errorf("drill: --result needs mcp.enabled: true in the target config")
+		if !d.cfg.MCPEnabled() {
+			return fmt.Errorf("drill: --result needs mcp enabled — set %s (mcp turns on automatically) or remove mcp.enabled: false", orDefault(d.cfg.MCP.TokenEnv, "ALERTINT_MCP_TOKEN"))
 		}
 		if mcpErr != nil {
 			return mcpErr
@@ -254,8 +254,8 @@ func (d *drillCmd) maybeResolve(ctx context.Context, run drillRun, recvBase, web
 // printPreflights emits the notify-and-continue setup notes and resolves the
 // capped-hint kind for this run.
 func (d *drillCmd) printPreflights(sc drillScenario, mcpErr error) (mcpAvailable bool, capHint capHintKind) {
-	mcpAvailable = d.cfg.MCP.Enabled && mcpErr == nil
-	if d.cfg.MCP.Enabled && mcpErr != nil {
+	mcpAvailable = d.cfg.MCPEnabled() && mcpErr == nil
+	if d.cfg.MCPEnabled() && mcpErr != nil {
 		d.printf("note: mcp is enabled but not usable from here (%v) — the drill will fire, but", mcpErr)
 		d.printf("      cannot fetch the finding when it is ready; fix the token/addr and use --result.")
 	}
@@ -271,12 +271,13 @@ func (d *drillCmd) printPreflights(sc drillScenario, mcpErr error) (mcpAvailable
 		d.printf("            enabled: true")
 		d.printf("            webhook_token_env: %s", orDefault(d.cfg.Changes.Ingress.WebhookTokenEnv, "ALERTINT_CHANGES_WEBHOOK_TOKEN"))
 	}
-	if !d.cfg.MCP.Enabled {
+	if !d.cfg.MCPEnabled() {
 		d.printf("note: mcp is disabled, so the drill cannot fetch the finding when it is ready.")
-		d.printf("      enable it to complete the loop:")
-		d.printf("        mcp:")
-		d.printf("          enabled: true")
-		d.printf("          token_env: %s", orDefault(d.cfg.MCP.TokenEnv, "ALERTINT_MCP_TOKEN"))
+		if d.cfg.MCP.Enabled != nil && !*d.cfg.MCP.Enabled {
+			d.printf("      mcp.enabled is false in %s — remove that line to complete the loop.", d.opts.cfgPath)
+		} else {
+			d.printf("      set %s to a long random secret and mcp turns on automatically.", orDefault(d.cfg.MCP.TokenEnv, "ALERTINT_MCP_TOKEN"))
+		}
 	}
 	return mcpAvailable, capHint
 }
@@ -565,7 +566,7 @@ func (d *drillCmd) targetSchemeHost() (scheme, host string) {
 // (and scheme) when firing remotely: MCP listens on its own port next to the
 // receivers.
 func (d *drillCmd) mcpEndpoint() (endpoint, token string, err error) {
-	if !d.cfg.MCP.Enabled {
+	if !d.cfg.MCPEnabled() {
 		return "", "", nil
 	}
 	token, err = d.cfg.MCPToken()

@@ -9,7 +9,8 @@ slug: "mcp-clients"
 # MCP clients
 
 **AlertINT** runs a persistent MCP Streamable HTTP server on port 9912,
-started inside `alertint serve` when `mcp.enabled: true`. Any MCP-capable
+started inside `alertint serve` whenever the `ALERTINT_MCP_TOKEN` env var
+is set (presence-based; `mcp.enabled: false` forces it off). Any MCP-capable
 AI agent can connect to it and query incidents, evidence packs, and live
 metrics in natural language.
 

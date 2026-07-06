@@ -85,6 +85,50 @@ func TestChangesEnrichmentEnabled_TruthTable(t *testing.T) {
 	}
 }
 
+func TestMCPEnabled_TruthTable(t *testing.T) {
+	cases := []struct {
+		name    string
+		enabled *bool
+		token   string // value of the env var named by token_env; "" = absent
+		want    bool
+	}{
+		{"explicit true, no token", boolPtr(true), "", true},
+		{"explicit false, token set", boolPtr(false), "s3cret", false},
+		{"omitted, token set", nil, "s3cret", true},
+		{"omitted, no token", nil, "", false},
+	}
+	for _, tc := range cases {
+		cfg := Defaults()
+		cfg.MCP.Enabled = tc.enabled
+		cfg.MCP.TokenEnv = "MCP_PRESENCE_TEST_TOKEN"
+		t.Setenv("MCP_PRESENCE_TEST_TOKEN", tc.token)
+		if got := cfg.MCPEnabled(); got != tc.want {
+			t.Errorf("%s: MCPEnabled() = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestMCPEnabled_NoTokenEnvName: a blanked token_env can never presence-enable.
+func TestMCPEnabled_NoTokenEnvName(t *testing.T) {
+	cfg := Defaults()
+	cfg.MCP.Enabled = nil
+	cfg.MCP.TokenEnv = ""
+	if cfg.MCPEnabled() {
+		t.Error("MCPEnabled() = true with no token_env name, want false")
+	}
+}
+
+// TestMCPToken_ExplicitOnWithoutToken: enabled: true without the env var set
+// still fails loud at token resolution (unchanged fail-fast behavior).
+func TestMCPToken_ExplicitOnWithoutToken(t *testing.T) {
+	cfg := Defaults()
+	cfg.MCP.Enabled = boolPtr(true)
+	cfg.MCP.TokenEnv = "MCP_PRESENCE_TEST_TOKEN_UNSET"
+	if _, err := cfg.MCPToken(); err == nil || !strings.Contains(err.Error(), "MCP_PRESENCE_TEST_TOKEN_UNSET") {
+		t.Errorf("MCPToken() error = %v, want env-var-not-set error", err)
+	}
+}
+
 // TestLoad_PresenceEnablesPrometheus verifies the end-to-end YAML path: a
 // config that only sets prometheus.base_url validates clean and resolves ON,
 // under strict decoding (KnownFields).

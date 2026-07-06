@@ -153,13 +153,16 @@ func drillTestCmd(t *testing.T, f *fakeInstance, cfg *config.Config, opts drillO
 	return d, &out
 }
 
+// boolPtr returns a pointer to b, for setting the tri-state Enabled fields.
+func boolPtr(b bool) *bool { return &b }
+
 func drillTestConfig(t *testing.T) *config.Config {
 	t.Helper()
 	cfg := config.Defaults()
 	cfg.Alertmanager.WebhookTokenEnv = "DEMO_TEST_WH"
 	cfg.Changes.Ingress.Enabled = true
 	cfg.Changes.Ingress.WebhookTokenEnv = "DEMO_TEST_CH"
-	cfg.MCP.Enabled = true
+	cfg.MCP.Enabled = boolPtr(true)
 	cfg.MCP.TokenEnv = "DEMO_TEST_MCP"
 	cfg.LLM.APIKeyEnv = "DEMO_TEST_LLM"
 	t.Setenv("DEMO_TEST_WH", "wh-token")
@@ -273,7 +276,7 @@ func TestDrill_ChangesDisabled(t *testing.T) {
 func TestDrill_MCPDisabled(t *testing.T) {
 	f := newFakeInstance(t)
 	cfg := drillTestConfig(t)
-	cfg.MCP.Enabled = false
+	cfg.MCP.Enabled = boolPtr(false)
 	cfg.MCP.TokenEnv = "" // realistic: disabled feature, no env named
 	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
 
@@ -284,7 +287,27 @@ func TestDrill_MCPDisabled(t *testing.T) {
 		t.Errorf("burst not fired")
 	}
 	s := out.String()
-	for _, want := range []string{"mcp is disabled", "token_env: ALERTINT_MCP_TOKEN", "`finding` summary line in serve logs"} {
+	for _, want := range []string{"mcp is disabled", "mcp.enabled is false in cfg.yaml", "`finding` summary line in serve logs"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("stdout missing %q:\n%s", want, s)
+		}
+	}
+}
+
+// TestDrill_MCPOffByAbsence: enabled omitted and no token in env — the hint
+// points at the token env var, not at a config edit.
+func TestDrill_MCPOffByAbsence(t *testing.T) {
+	f := newFakeInstance(t)
+	cfg := drillTestConfig(t)
+	cfg.MCP.Enabled = nil
+	cfg.MCP.TokenEnv = "DEMO_TEST_MCP_ABSENT" // never set in env
+	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
+
+	if err := d.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	s := out.String()
+	for _, want := range []string{"mcp is disabled", "set DEMO_TEST_MCP_ABSENT to a long random secret"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("stdout missing %q:\n%s", want, s)
 		}

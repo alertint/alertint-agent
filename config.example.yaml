@@ -17,8 +17,7 @@ llm:
 correlator:
   window_seconds: 90       # group alerts arriving within this window
   min_alerts: 1            # minimum alerts to form an incident (1 = single-alert triage)
-  group_labels:
-    - alertname
+  group_labels:            # deliberately no alertname: different alert types on one service correlate into ONE incident
     - cluster
     - namespace
     - service
@@ -32,11 +31,11 @@ notify:
     min_severity: low                # low | medium | high — raise to suppress lower-severity findings on Slack (stdout always emits)
 
 # MCP HTTP server — AI coding agents connect to http://host:9912/mcp
-# Enabled here so `alertint drill` can fetch its finding and your agent can
-# read incidents out of the box. Set ALERTINT_MCP_TOKEN to a long random
-# secret before starting (required when enabled).
+# Presence-based: set ALERTINT_MCP_TOKEN to a long random secret and the
+# server turns ON automatically, so `alertint drill` can fetch its finding
+# and your agent can read incidents out of the box.
 mcp:
-  enabled: true
+  # enabled: false           # uncomment to force OFF even when the token is set
   addr: "0.0.0.0:9912"
   token_env: ALERTINT_MCP_TOKEN
 

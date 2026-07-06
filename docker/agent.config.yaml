@@ -38,10 +38,10 @@ changes:
     webhook_token_env: ALERTINT_CHANGES_WEBHOOK_TOKEN
 
 # MCP HTTP server — AI coding agents (Claude Code, Cursor, Windsurf) connect
-# to this endpoint over the network.
+# to this endpoint over the network. On automatically: compose guarantees
+# ALERTINT_MCP_TOKEN is set, and the token's presence enables the server.
 # Connect with: http://host:9912/mcp  (or localhost:9912/mcp for local Docker)
 mcp:
-  enabled: true
   addr: "0.0.0.0:9912"
   token_env: ALERTINT_MCP_TOKEN
 
