@@ -46,6 +46,12 @@ the git tag via ldflags.
    git tag v0.7.0 && git push origin v0.7.0
    ```
 
+   Creating the tag by publishing a release from the GitHub UI also works:
+   the UI pre-creates the release, but the workflow replaces its body with
+   the CHANGELOG section (`release.mode: replace`), so whatever the UI's
+   "Generate release notes" produced gets overwritten. Prefer the plain
+   `git tag` path — it's one step fewer and nothing misleading ever exists.
+
 5. **The tag push does the rest.** The release workflow extracts the
    `## [0.7.0]` section into the release body, and GoReleaser builds the
    binaries, archives, and GHCR images and appends the
@@ -62,7 +68,8 @@ the git tag via ldflags.
 
 - Don't use the GitHub UI's "Generate release notes" button for the body —
   it lists merged PR titles only (squash merges collapse everything into
-  one line) and ignores `CHANGELOG.md`.
+  one line) and ignores `CHANGELOG.md`. If you publish from the UI anyway,
+  the workflow overwrites the body with the CHANGELOG section.
 - Don't tag before the changelog roll is on `main` — the workflow will
   fail by design.
 - Don't edit the release body by hand afterwards; fix `CHANGELOG.md`
