@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Docker Compose pulls the released image** — the bundled stack now runs
+  `ghcr.io/alertint/alertint-agent:latest` (multi-arch) instead of
+  compiling the agent from source, cutting minutes off the quickstart's
+  first `docker compose up`. Building from the working tree moved to an
+  opt-in override file (`docker/docker-compose.build.yaml`), which the
+  developer Taskfile targets (`task run`, `task docker:*`) include
+  automatically.
+
 ## [0.6.2] - 2026-07-06
 
 ### Changed

@@ -7,6 +7,10 @@ vars:
   VERSION:
     sh: git describe --tags --always --dirty 2>/dev/null || echo dev
   LDFLAGS: -s -w -X main.version={{.VERSION}}
+  # Dev compose stack: base file + build override, so task targets compile the
+  # agent from the working tree (quickstart users pull the released image via
+  # the base file alone).
+  COMPOSE_DEV: docker compose -f docker/docker-compose.yaml -f docker/docker-compose.build.yaml --env-file .env
 
 tasks:
   default:
@@ -37,19 +41,19 @@ tasks:
       - go vet {{.PKG}}
 
   run:
-    desc: Run the agent via Docker Compose (foreground)
+    desc: Run the agent via Docker Compose (foreground, builds from working tree)
     cmds:
-      - docker compose -f docker/docker-compose.yaml --env-file .env up
+      - "{{.COMPOSE_DEV}} up --build"
 
   docker:build:
     desc: Build all Docker containers (alertint-agent and alertmanager)
     cmds:
-      - docker compose -f docker/docker-compose.yaml --env-file .env build --no-cache
+      - "{{.COMPOSE_DEV}} build --no-cache"
 
   docker:up:
-    desc: Start all Docker containers in detached mode
+    desc: Start all Docker containers in detached mode (builds agent if missing)
     cmds:
-      - docker compose -f docker/docker-compose.yaml --env-file .env up -d
+      - "{{.COMPOSE_DEV}} up -d"
 
   docker:logs:
     desc: Follow the alertint-agent container logs (colored console output, no prefix)
@@ -67,7 +71,7 @@ tasks:
   docker:down:
     desc: Stop and remove all Docker containers and volumes (clean state)
     cmds:
-      - docker compose -f docker/docker-compose.yaml --env-file .env down -v
+      - "{{.COMPOSE_DEV}} down -v"
 
   docker:stop:
     desc: Stop all Docker containers (alias for docker:down)

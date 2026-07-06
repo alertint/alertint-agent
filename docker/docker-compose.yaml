@@ -24,10 +24,11 @@ services:
         condition: service_healthy
 
   # ── AlertINT Agent ───────────────────────────────────────────────────────────
+  # Pulls the released multi-arch image — no local build needed. To build from
+  # the working tree instead (developing against local changes), add the build
+  # override: -f docker/docker-compose.build.yaml (see that file, or task run).
   agent:
-    build:
-      context: ..
-      dockerfile: Dockerfile
+    image: ghcr.io/alertint/alertint-agent:latest
     container_name: alertint-agent
     ports:
       - "${ALERTINT_WEBHOOK_PORT:-9911}:${ALERTINT_WEBHOOK_PORT:-9911}"   # Alertmanager webhook receiver
