@@ -23,46 +23,51 @@ the git tag via ldflags.
    task release:notes VERSION=Unreleased   # preview the pending section
    ```
 
-2. **Roll the changelog** — moves `[Unreleased]` into a dated version
-   section and updates the compare links:
+2. **Release:**
 
    ```bash
-   task release:prep VERSION=0.7.0
+   task release VERSION=0.7.0
    ```
 
-3. **Commit, PR, merge.** The roll is an ordinary change to `main`:
+   This is the whole release. The script verifies you are on a clean,
+   up-to-date `main`, rolls `[Unreleased]` into a dated `0.7.0` section,
+   prints the exact release body, and asks for one confirmation. On yes it
+   commits the roll to `main`, tags `v0.7.0`, and pushes both.
 
-   ```bash
-   git checkout -b chore/changelog-0.7.0
-   git commit -s -am "chore: roll CHANGELOG unreleased into 0.7.0"
-   ```
+   The roll commit is prose-only (`CHANGELOG.md` and nothing else), so it
+   goes straight to `main` under the admin bypass — same policy as
+   docs-only commits. CI still runs on the push. Pass `--yes` to skip the
+   prompt: `./scripts/release.sh 0.7.0 --yes`.
 
-4. **Tag the merged commit** (pull `main` first so the tag lands on the
-   commit that contains the rolled changelog):
-
-   ```bash
-   git checkout main && git pull
-   task release:notes VERSION=0.7.0   # sanity: this is the release body
-   git tag v0.7.0 && git push origin v0.7.0
-   ```
-
-   Creating the tag by publishing a release from the GitHub UI also works:
-   the UI pre-creates the release, but the workflow replaces its body with
-   the CHANGELOG section (`release.mode: replace`), so whatever the UI's
-   "Generate release notes" produced gets overwritten. Prefer the plain
-   `git tag` path — it's one step fewer and nothing misleading ever exists.
-
-5. **The tag push does the rest.** The release workflow extracts the
+3. **The tag push does the rest.** The release workflow extracts the
    `## [0.7.0]` section into the release body, and GoReleaser builds the
    binaries, archives, and GHCR images and appends the
-   `**Full Changelog**` compare link. If the section is missing, the
-   workflow fails before building anything — roll the changelog (steps
-   2–3) and re-push the tag after deleting it
-   (`git tag -d v0.7.0 && git push origin :v0.7.0`).
+   `**Full Changelog**` compare link.
 
-6. **Verify**: the release page shows the changelog prose, assets are
+4. **Verify**: the release page shows the changelog prose, assets are
    attached, and `ghcr.io/alertint/alertint-agent:latest` points at the new
    version.
+
+## Fallback: manual steps
+
+If the direct push to `main` is rejected (no admin bypass), or you want the
+roll reviewed, the pieces run individually — the old PR-based path:
+
+```bash
+task release:prep VERSION=0.7.0          # roll [Unreleased] + compare links
+git checkout -b chore/changelog-0.7.0
+git commit -s -am "chore: roll CHANGELOG unreleased into 0.7.0"
+# push, PR, merge, then tag the merged commit:
+git checkout main && git pull
+task release:notes VERSION=0.7.0         # sanity: this is the release body
+git tag v0.7.0 && git push origin v0.7.0
+```
+
+Creating the tag by publishing a release from the GitHub UI also works: the
+UI pre-creates the release, but the workflow replaces its body with the
+CHANGELOG section (`release.mode: replace`), so whatever the UI's "Generate
+release notes" produced gets overwritten. Prefer the `git tag` path —
+nothing misleading ever exists.
 
 ## Don'ts
 
@@ -71,6 +76,6 @@ the git tag via ldflags.
   one line) and ignores `CHANGELOG.md`. If you publish from the UI anyway,
   the workflow overwrites the body with the CHANGELOG section.
 - Don't tag before the changelog roll is on `main` — the workflow will
-  fail by design.
+  fail by design (and `task release` makes this impossible).
 - Don't edit the release body by hand afterwards; fix `CHANGELOG.md`
   instead and re-run the release if it matters.
