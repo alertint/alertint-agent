@@ -54,6 +54,13 @@ source is active (`ingress.enabled` or the Sentry releases poller); an explicit
 `enrichment.enabled: false` forces it off. See the
 [configuration reference](../getting-started/configuration.md#changes).
 
+This webhook is also how `alertint drill` plants its fake deploy: the
+flagship drill POSTs a synthetic change event through this same door, so
+the drill's finding can causally name "what changed" with zero extra
+infrastructure. Drill events carry the reserved `alertint_drill="true"`
+label — the whole `alertint_` label-key prefix is AlertINT-owned; keep it
+out of your own change and alert labels.
+
 ## The change body
 
 One canonical, source-agnostic JSON object. POST it to `/webhook/change` with a

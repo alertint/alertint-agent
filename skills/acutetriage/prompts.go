@@ -150,12 +150,14 @@ func UserPrompt(pack EvidencePack, packJSON string, metrics []MetricSnapshot, lo
 	return b.String()
 }
 
-// maxMetadataOnlyConfidence is the confidence ceiling for findings built from
+// MaxMetadataOnlyConfidence is the confidence ceiling for findings built from
+// alert metadata alone. Exported so surfaces explaining the cap (the drill
+// console hint) reference the real value.
 // alert labels/annotations alone (no live metrics, logs, changes, or Sentry
 // issues). It appears in two places that must stay in sync: the prompt
 // directive below (the model is asked to respect it) and the deterministic
 // backstop in Skill.Run (which enforces it when the model doesn't).
-const maxMetadataOnlyConfidence = 0.6
+const MaxMetadataOnlyConfidence = 0.6
 
 // renderEvidenceBasis appends a calibration directive when NO live evidence
 // (log lines, metric values, changes, or Sentry issues) was retrieved for the
@@ -176,7 +178,7 @@ func renderEvidenceBasis(b *strings.Builder, metrics []MetricSnapshot, logs *Log
 		"root-cause or causal-direction claim (which alert is primary vs downstream) as an " +
 		"unverified hypothesis: prefer the \"correlated\" role over confident \"primary\"/" +
 		"\"downstream\" assignments unless the ordering is self-evident from the annotations, " +
-		fmt.Sprintf("and keep confidence at or below %.1f.", maxMetadataOnlyConfidence))
+		fmt.Sprintf("and keep confidence at or below %.1f.", MaxMetadataOnlyConfidence))
 }
 
 // hasLiveEvidence reports whether any enrichment source returned actual data

@@ -731,3 +731,110 @@ func TestAnySentryEnabled_BothDisabledIsZeroConfig(t *testing.T) {
 		t.Fatalf("both-disabled sentry should validate clean: %v", err)
 	}
 }
+
+func TestValidateOffline_SkipsFilesystemChecks(t *testing.T) {
+	base := Defaults()
+	base.Alertmanager.WebhookTokenEnv = "ALERTINT_WEBHOOK_TOKEN"
+	base.LLM.APIKeyEnv = "ANTHROPIC_API_KEY"
+
+	t.Run("pod-destined sqlite path passes offline, fails online", func(t *testing.T) {
+		cfg := base
+		cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "nope", "data", "alertint.db")
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("Validate: want storage.sqlite_path error for missing parent dir, got nil")
+		}
+		if err := cfg.ValidateOffline(); err != nil {
+			t.Fatalf("ValidateOffline: %v", err)
+		}
+	})
+
+	t.Run("missing local pack dir passes offline, fails online", func(t *testing.T) {
+		cfg := base
+		cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
+		cfg.Rules.LocalPackDir = filepath.Join(t.TempDir(), "nope")
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("Validate: want rules.local_pack_dir error, got nil")
+		}
+		if err := cfg.ValidateOffline(); err != nil {
+			t.Fatalf("ValidateOffline: %v", err)
+		}
+	})
+
+	t.Run("offline still rejects invalid fields", func(t *testing.T) {
+		cfg := base
+		cfg.Storage.SQLitePath = "/data/alertint.db"
+		cfg.LogLevel = "bogus"
+		err := cfg.ValidateOffline()
+		if err == nil || !strings.Contains(err.Error(), "log_level") {
+			t.Fatalf("ValidateOffline = %v, want log_level error", err)
+		}
+	})
+
+	t.Run("offline still requires sqlite path", func(t *testing.T) {
+		cfg := base
+		cfg.Storage.SQLitePath = "  "
+		err := cfg.ValidateOffline()
+		if err == nil || !strings.Contains(err.Error(), "storage.sqlite_path is required") {
+			t.Fatalf("ValidateOffline = %v, want storage.sqlite_path required error", err)
+		}
+	})
+}
+
+func TestValidate_ReservedGroupLabelPrefix(t *testing.T) {
+	base := Defaults()
+	base.Alertmanager.WebhookTokenEnv = "ALERTINT_WEBHOOK_TOKEN"
+	base.LLM.APIKeyEnv = "ANTHROPIC_API_KEY"
+
+	t.Run("alertint_ prefixed group label rejected in both modes", func(t *testing.T) {
+		cfg := base
+		cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
+		cfg.Correlator.GroupLabels = []string{"cluster", "alertint_drill"}
+		for name, validate := range map[string]func() error{"online": cfg.Validate, "offline": cfg.ValidateOffline} {
+			err := validate()
+			if err == nil || !strings.Contains(err.Error(), "reserved alertint_ label prefix") {
+				t.Fatalf("%s = %v, want reserved-prefix error", name, err)
+			}
+		}
+	})
+
+	t.Run("normal group labels accepted", func(t *testing.T) {
+		cfg := base
+		cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
+		cfg.Correlator.GroupLabels = []string{"cluster", "namespace"}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate: %v", err)
+		}
+	})
+}
+
+func TestValidate_GroupLabelHygiene(t *testing.T) {
+	base := Defaults()
+	base.Alertmanager.WebhookTokenEnv = "ALERTINT_WEBHOOK_TOKEN"
+	base.LLM.APIKeyEnv = "ANTHROPIC_API_KEY"
+
+	cases := map[string]struct {
+		labels []string
+		want   string
+	}{
+		"duplicate key":   {labels: []string{"cluster", "service", "cluster"}, want: "duplicates entry"},
+		"padded key":      {labels: []string{" cluster", "service"}, want: "surrounding whitespace"},
+		"clean labels ok": {labels: []string{"cluster", "service"}, want: ""},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			cfg := base
+			cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
+			cfg.Correlator.GroupLabels = tc.labels
+			err := cfg.Validate()
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("Validate: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate = %v, want error containing %q", err, tc.want)
+			}
+		})
+	}
+}

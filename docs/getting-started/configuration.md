@@ -14,6 +14,35 @@ Start from `config.example.yaml` at the repo root.
 Secrets are **never** stored inline. Fields named `*_env` hold the
 **name** of an environment variable; the value is read at startup.
 
+## Validate before you deploy
+
+`alertint validate <config.yaml>` dry-runs the strict loader — unknown
+keys are rejected, every cross-field rule below is checked — and exits
+`0`/`1` with actionable errors. Filesystem checks that depend on the
+machine you validate on (the SQLite parent-directory write probe, the
+local rule-pack directory) are skipped, so a config destined for a pod
+(`storage.sqlite_path: /data/alertint.db`) validates cleanly on a laptop
+or CI runner. Typical workflow: draft the config from this reference,
+`alertint validate` it locally or in CI, then paste it into your
+ConfigMap — no CrashLoopBackOff from a typo'd key.
+
+Environment variables are **not** read during validation; secret presence
+is checked at serve startup. A working `.env` starting point:
+
+```bash
+# Required
+ALERTINT_WEBHOOK_TOKEN=<openssl rand -hex 32>          # Alertmanager webhook bearer
+ALERTINT_CHANGES_WEBHOOK_TOKEN=<openssl rand -hex 32>  # change webhook bearer
+ALERTINT_MCP_TOKEN=<openssl rand -hex 32>              # MCP client bearer
+ANTHROPIC_API_KEY=sk-ant-...                           # console.anthropic.com — the one real TODO
+
+# Optional integrations (uncomment what you connect)
+# PROMETHEUS_BEARER_TOKEN=...     # https://alertint.com/docs/integrations/prometheus
+# SLACK_BOT_TOKEN=xoxb-...        # https://alertint.com/docs/notifications/slack
+# LOKI_BEARER_TOKEN=...           # https://alertint.com/docs/integrations/loki
+# SENTRY_AUTH_TOKEN=...           # https://alertint.com/docs/integrations/sentry
+```
+
 ## `receivers`
 
 Settings shared by **every** inbound webhook receiver. The listen address is a
@@ -86,7 +115,7 @@ planned).
 |---|---|---|---|
 | `window_seconds` | int | `90` | Alerts sharing the same group key within this window form one incident |
 | `min_alerts` | int | `1` | Minimum alerts before the incident is dispatched to the skill. The default `1` triages a lone alert too — use `notify.slack.min_severity` to control channel noise instead of dropping triage. |
-| `group_labels` | list | `[alertname, cluster, namespace, service]` | Label names used to compute the group key. Two alerts are correlated when all of these labels match. |
+| `group_labels` | list | `[alertname, cluster, namespace, service]` | Label names used to compute the group key. Two alerts are correlated when all of these labels match. The `alertint_` label-key prefix is reserved for AlertINT itself (e.g. the `alertint_drill` drill marker) and is rejected here — reserved labels never participate in grouping. |
 
 `window_seconds` is a tradeoff. A lower value reacts faster, but an
 incident may be analyzed with only the first alert or two of a burst

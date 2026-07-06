@@ -33,7 +33,7 @@ services:
       - "${ALERTINT_WEBHOOK_PORT:-9911}:${ALERTINT_WEBHOOK_PORT:-9911}"   # Alertmanager webhook receiver
       - "${ALERTINT_MCP_PORT:-9912}:${ALERTINT_MCP_PORT:-9912}"           # MCP HTTP server (Claude Code, Cursor, Windsurf)
     volumes:
-      # Which config file to mount. Defaults to the committed demo config so the
+      # Which config file to mount. Defaults to the committed sample config so the
       # repo runs out of the box. To run with your own tweaks (e.g. Slack on,
       # Grafana Cloud Logs) WITHOUT editing the committed file, copy it and point
       # ALERTINT_CONFIG_FILE at the copy in your .env:
@@ -72,7 +72,7 @@ services:
 
   # ── Prometheus ───────────────────────────────────────────────────────────────
   # Scrapes pushgateway + itself. AlertINT agent reads metrics via MCP tools.
-  # Optional demo convenience: populate it with sample metrics via
+  # Optional dev-stack convenience: populate it with sample metrics via
   # ./push-synthetic-metrics.sh
   prometheus:
     image: prom/prometheus:v2.52.0
@@ -89,7 +89,7 @@ services:
     restart: unless-stopped
 
   # ── Pushgateway ──────────────────────────────────────────────────────────────
-  # Local-demo convenience only: lets push-synthetic-metrics.sh seed sample
+  # Local dev-stack convenience only: lets push-synthetic-metrics.sh seed sample
   # metrics so the Prometheus MCP tools have something to query. Not required
   # to run the agent against a real Prometheus.
   pushgateway:
@@ -100,7 +100,7 @@ services:
     restart: unless-stopped
 
   # ── Loki ─────────────────────────────────────────────────────────────────────
-  # Single-binary, filesystem-backed Loki for the log-enrichment demo. The image's
+  # Single-binary, filesystem-backed Loki for log enrichment in the dev stack. The image's
   # default local-config runs with auth_enabled: false, so pushes and queries need
   # no token. AlertINT reads it via the log connector (logs.loki in
   # agent.config.yaml) and exposes the read-only loki_query_range MCP tool.

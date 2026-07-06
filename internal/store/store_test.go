@@ -367,3 +367,54 @@ func TestLoadMigrations_DiscoversInitMigration(t *testing.T) {
 		t.Errorf("first migration = (%d, %q), want (1, %q)", ms[0].version, ms[0].name, "init")
 	}
 }
+
+// TestIncidentDrillFlags covers the batch drill-detection query: an incident
+// is a Drill when any member alert carries the Drill-alert marker label
+// (ADR-0013); known ids default to false and the empty-id case short-circuits.
+func TestIncidentDrillFlags(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	idDrill := uuid.NewString() // all members marked
+	idMixed := uuid.NewString() // one marked member among real ones
+	idReal := uuid.NewString()  // no marker
+	for _, id := range []string{idDrill, idMixed, idReal} {
+		if err := s.InsertIncident(ctx, Incident{ID: id, GroupKey: "g=" + id, FirstAlertAt: now, LastAlertAt: now, ReadyAt: now}); err != nil {
+			t.Fatalf("insert %s: %v", id, err)
+		}
+	}
+	add := func(incID, fp string, labels map[string]string) {
+		a := Alert{ID: uuid.NewString(), Fingerprint: fp, Status: "firing", Labels: labels, Annotations: map[string]string{}, StartsAt: now, ReceivedAt: now}
+		if _, err := s.UpsertAlertByFingerprint(ctx, a); err != nil {
+			t.Fatalf("upsert %s: %v", fp, err)
+		}
+		if err := s.AddAlertToIncident(ctx, incID, a.ID, now); err != nil {
+			t.Fatalf("add %s: %v", fp, err)
+		}
+	}
+	drill := map[string]string{DrillMarkerLabel: DrillMarkerValue, "service": "drill-checkout"}
+	plain := map[string]string{"service": "checkout"}
+	add(idDrill, "d-1", drill)
+	add(idDrill, "d-2", drill)
+	add(idMixed, "m-1", plain)
+	add(idMixed, "m-2", drill)
+	add(idReal, "r-1", plain)
+
+	flags, err := s.IncidentDrillFlags(ctx, []string{idDrill, idMixed, idReal})
+	if err != nil {
+		t.Fatalf("drill flags: %v", err)
+	}
+	want := map[string]bool{idDrill: true, idMixed: true, idReal: false}
+	for id, w := range want {
+		got, ok := flags[id]
+		if !ok || got != w {
+			t.Errorf("flags[%s] = %v (present=%v), want %v", id, got, ok, w)
+		}
+	}
+
+	empty, err := s.IncidentDrillFlags(ctx, nil)
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("empty ids: got %v, %v; want empty map, nil", empty, err)
+	}
+}

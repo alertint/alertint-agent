@@ -412,3 +412,22 @@ func TestMultiResolvedStatusFlows(t *testing.T) {
 		t.Errorf("resolved finding should log status=resolved: %s", logBuf.String())
 	}
 }
+
+// TestFindingJSONDrillKey: the stdout JSON contract carries drill only when
+// set (omitempty), so existing consumers see no noise on real findings.
+func TestFindingJSONDrillKey(t *testing.T) {
+	drill, err := json.Marshal(notify.Finding{IncidentID: "i1", Drill: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(drill), `"drill":true`) {
+		t.Errorf("drill finding JSON missing drill key: %s", drill)
+	}
+	plain, err := json.Marshal(notify.Finding{IncidentID: "i2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain), "drill") {
+		t.Errorf("real finding JSON must omit drill: %s", plain)
+	}
+}

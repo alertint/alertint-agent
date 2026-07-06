@@ -119,7 +119,7 @@ tasks:
       - echo "✓ Tracking state purged. Fresh alerts can now be generated."
 
   logs:push:local:
-    desc: Seed the local demo Loki with fake multi-level log lines (run before alerts:fire)
+    desc: Seed the dev-stack Loki with fake multi-level log lines (run before alerts:fire)
     cmds:
       - python3 docker/push-synthetic-logs.py --target local
 

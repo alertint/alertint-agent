@@ -173,3 +173,47 @@ func TestFetchChanges_VisibilityNotes(t *testing.T) {
 		t.Fatalf("want no-changes note, got %#v", e)
 	}
 }
+
+// TestFetchChanges_DrillChangesExcludedFromRealIncidents pins the drill
+// segregation (ADR-0013/0014): a change event carrying the drill marker never
+// enriches a real incident (it would be fictional live evidence lifting the
+// confidence cap), but still enriches a Drill.
+func TestFetchChanges_DrillChangesExcludedFromRealIncidents(t *testing.T) {
+	ctx := context.Background()
+	st, _ := store.Open(ctx, ":memory:")
+	defer func() { _ = st.Close() }()
+
+	first := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	last := first.Add(5 * time.Minute)
+	drillTS := first.Add(-5 * time.Minute)
+	realTS := first.Add(-10 * time.Minute)
+	_ = st.InsertChange(ctx, store.Change{ID: "drill-deploy", Source: "alertint-drill", Kind: "deploy", Title: "deploy checkout v2.3.1",
+		Labels: map[string]string{"service": "drill-checkout", store.DrillMarkerLabel: store.DrillMarkerValue}, OccurredAt: drillTS, ReceivedAt: drillTS})
+	_ = st.InsertChange(ctx, store.Change{ID: "real-deploy", Source: "ci", Kind: "deploy", Title: "deploy payments v9",
+		Labels: map[string]string{"service": "payments"}, OccurredAt: realTS, ReceivedAt: realTS})
+	params := ChangeParams{Enabled: true, WindowMinutes: 120, MaxEvents: 10}
+
+	t.Run("real incident sees only the real change", func(t *testing.T) {
+		got := FetchChanges(ctx, st, params, alertsWithLabels(map[string]string{"service": "payments"}), first, last, "inc-real", slog.Default())
+		if got == nil || len(got.Changes) != 1 || got.Changes[0].Title != "deploy payments v9" {
+			t.Fatalf("real incident enrichment = %#v, want only the real deploy", got)
+		}
+	})
+
+	t.Run("drill incident still sees the planted deploy", func(t *testing.T) {
+		drillAlerts := alertsWithLabels(map[string]string{"service": "drill-checkout", store.DrillMarkerLabel: store.DrillMarkerValue})
+		got := FetchChanges(ctx, st, params, drillAlerts, first, last, "inc-drill", slog.Default())
+		if got == nil || len(got.Changes) != 2 {
+			t.Fatalf("drill enrichment = %#v, want both changes", got)
+		}
+	})
+
+	t.Run("only drill changes in window notes empty for real incident", func(t *testing.T) {
+		firstNarrow := first.Add(-6 * time.Minute) // window catches only the drill deploy
+		got := FetchChanges(ctx, st, ChangeParams{Enabled: true, WindowMinutes: 3, MaxEvents: 10},
+			alertsWithLabels(map[string]string{"service": "payments"}), firstNarrow, firstNarrow, "inc-real2", slog.Default())
+		if got == nil || len(got.Changes) != 0 || got.Note == "" {
+			t.Fatalf("want empty changes with note, got %#v", got)
+		}
+	})
+}

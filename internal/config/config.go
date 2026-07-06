@@ -346,18 +346,33 @@ func Defaults() Config {
 // Load reads a YAML config from path, applies defaults for missing fields,
 // and validates the result.
 func Load(path string) (*Config, error) {
+	return loadPath(path, false)
+}
+
+// LoadOffline is Load with ValidateOffline instead of Validate: the
+// environment-coupled filesystem checks are skipped, so a config destined
+// for another machine dry-runs cleanly (alertint validate).
+func LoadOffline(path string) (*Config, error) {
+	return loadPath(path, true)
+}
+
+func loadPath(path string, offline bool) (*Config, error) {
 	f, err := os.Open(path) // #nosec G304 -- path is the operator-supplied --config flag; reading it is the point
 	if err != nil {
 		return nil, fmt.Errorf("config: open %s: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
-	return LoadFrom(f, path)
+	return loadFrom(f, path, offline)
 }
 
 // LoadFrom is like Load but reads from an io.Reader. The path argument is
 // only used for error messages and writability checks for storage paths;
 // pass "" if there is no associated path.
 func LoadFrom(r io.Reader, path string) (*Config, error) {
+	return loadFrom(r, path, false)
+}
+
+func loadFrom(r io.Reader, path string, offline bool) (*Config, error) {
 	cfg := Defaults()
 
 	dec := yaml.NewDecoder(r)
@@ -366,7 +381,7 @@ func LoadFrom(r io.Reader, path string) (*Config, error) {
 		return nil, fmt.Errorf("config: parse %s: %w", displayPath(path), err)
 	}
 
-	if err := cfg.Validate(); err != nil {
+	if err := cfg.validate(offline); err != nil {
 		return nil, fmt.Errorf("config: validate %s: %w", displayPath(path), err)
 	}
 	return &cfg, nil
@@ -376,9 +391,23 @@ func LoadFrom(r io.Reader, path string) (*Config, error) {
 // It does not read environment variables; secret presence is checked by
 // the Must* accessors at the moment of need.
 func (c *Config) Validate() error {
+	return c.validate(false)
+}
+
+// ValidateOffline is Validate minus the environment-coupled filesystem
+// checks (the storage.sqlite_path parent-dir write probe and the
+// rules.local_pack_dir stat), so a config destined for another machine —
+// e.g. a pod path like /data/alertint.db — validates cleanly on a laptop
+// or CI runner. The result reflects the config's correctness, not the
+// validating machine's filesystem.
+func (c *Config) ValidateOffline() error {
+	return c.validate(true)
+}
+
+func (c *Config) validate(offline bool) error {
 	var errs []string
 	errs = append(errs, c.validateServing()...)
-	errs = append(errs, c.validateStorage()...)
+	errs = append(errs, c.validateStorage(offline)...)
 	errs = append(errs, c.validateLLM()...)
 	errs = append(errs, c.validateCorrelator()...)
 	errs = append(errs, c.validateNotify()...)
@@ -386,7 +415,9 @@ func (c *Config) Validate() error {
 	errs = append(errs, c.validateLogs()...)
 	errs = append(errs, c.validateSentry()...)
 	errs = append(errs, c.validateChanges()...)
-	errs = append(errs, c.validateRules()...)
+	if !offline {
+		errs = append(errs, c.validateRules()...)
+	}
 
 	if !validLogLevel(c.LogLevel) {
 		errs = append(errs, fmt.Sprintf("log_level %q must be one of debug, info, warn, error", c.LogLevel))
@@ -454,9 +485,12 @@ func (c *Config) validateChanges() []string {
 	return errs
 }
 
-func (c *Config) validateStorage() []string {
+func (c *Config) validateStorage(offline bool) []string {
 	if strings.TrimSpace(c.Storage.SQLitePath) == "" {
 		return []string{"storage.sqlite_path is required"}
+	}
+	if offline {
+		return nil
 	}
 	if err := checkSQLitePathWritable(c.Storage.SQLitePath); err != nil {
 		return []string{fmt.Sprintf("storage.sqlite_path: %v", err)}
@@ -494,9 +528,25 @@ func (c *Config) validateCorrelator() []string {
 	if len(c.Correlator.GroupLabels) == 0 {
 		errs = append(errs, "correlator.group_labels must contain at least one label")
 	} else {
+		seen := make(map[string]int, len(c.Correlator.GroupLabels))
 		for i, label := range c.Correlator.GroupLabels {
-			if strings.TrimSpace(label) == "" {
+			switch {
+			case strings.TrimSpace(label) == "":
 				errs = append(errs, fmt.Sprintf("correlator.group_labels[%d] is empty", i))
+			case label != strings.TrimSpace(label):
+				// Padded keys silently never match any alert label.
+				errs = append(errs, fmt.Sprintf("correlator.group_labels[%d] %q has surrounding whitespace", i, label))
+			case strings.HasPrefix(strings.ToLower(label), "alertint_"):
+				// The alertint_ label-key prefix is reserved as AlertINT-owned
+				// (e.g. the alertint_drill drill marker) and never participates
+				// in grouping.
+				errs = append(errs, fmt.Sprintf("correlator.group_labels[%d] %q uses the reserved alertint_ label prefix; alertint_* labels never participate in grouping", i, label))
+			default:
+				if j, dup := seen[label]; dup {
+					// A duplicated key doubles its part in the group key.
+					errs = append(errs, fmt.Sprintf("correlator.group_labels[%d] %q duplicates entry %d", i, label, j))
+				}
+				seen[label] = i
 			}
 		}
 	}

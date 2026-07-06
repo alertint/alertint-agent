@@ -32,9 +32,11 @@ notify:
     min_severity: low                # low | medium | high — raise to suppress lower-severity findings on Slack (stdout always emits)
 
 # MCP HTTP server — AI coding agents connect to http://host:9912/mcp
-# Set ALERTINT_MCP_TOKEN to a long random secret before enabling.
+# Enabled here so `alertint drill` can fetch its finding and your agent can
+# read incidents out of the box. Set ALERTINT_MCP_TOKEN to a long random
+# secret before starting (required when enabled).
 mcp:
-  enabled: false
+  enabled: true
   addr: "0.0.0.0:9912"
   token_env: ALERTINT_MCP_TOKEN
 
@@ -86,9 +88,13 @@ logs:
 # answer "what changed right before this?". See docs/integrations/changes.md.
 # Enrichment is presence-based: it turns ON automatically as soon as a change
 # source exists (changes.ingress or the Sentry releases poller below).
+# Enabled here so a one-line curl at the end of a deploy gives triage causal
+# evidence — and so the flagship `alertint drill` scenario can plant its fake
+# deploy. Set ALERTINT_CHANGES_WEBHOOK_TOKEN before starting (required when
+# enabled).
 changes:
   ingress:                                 # Role A: receive change webhooks (write surface)
-    enabled: false
+    enabled: true
     webhook_token_env: ALERTINT_CHANGES_WEBHOOK_TOKEN
   enrichment:                              # Role B: use stored changes (triage prompt + MCP)
     # enabled: false                       # uncomment to force OFF even when a change source is on

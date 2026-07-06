@@ -8,6 +8,10 @@
 //	alertint health        probe GET /health and exit 0 (ok) or 1 (degraded).
 //	alertint verify-audit  recompute the audit log hash chain and report
 //	                       any tampering. Requires --config.
+//	alertint validate      dry-run a config file (parse + validate, skipping
+//	                       machine-coupled filesystem checks); exit 0/1.
+//	alertint drill         fire a built-in Drill scenario at a running
+//	                       instance and print the resulting finding.
 //	alertint version       print the version. Equivalent to --version.
 //
 // All subcommands accept --log-level and --log-format. The top-level
@@ -79,6 +83,10 @@ func run(args []string, stdout, stderr io.Writer) error {
 			return runHealth(args[1:], stdout, stderr)
 		case "verify-audit":
 			return runVerifyAudit(args[1:], stdout, stderr)
+		case "validate":
+			return runValidate(args[1:], stdout, stderr)
+		case "drill":
+			return runDrill(args[1:], stdout, stderr)
 		case "serve":
 			return runServe(args[1:], stdout, stderr)
 		}
@@ -278,7 +286,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 	cor := correlator.New(corCfg, st, incidentSink{skill: skill}, logger)
 
-	cor.SetResolutionNotifier(notifyresolution.New(notifier))
+	cor.SetResolutionNotifier(notifyresolution.New(notifier, st))
 
 	if err := cor.Start(ctx); err != nil {
 		return fmt.Errorf("correlator start: %w", err)

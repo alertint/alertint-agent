@@ -138,7 +138,8 @@ func (s *Server) withBearerAuth(next http.Handler) http.Handler {
 func (s *Server) toolListIncidents() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 	tool := mcplib.NewTool("alertint_list_incidents",
 		mcplib.WithDescription("List recent AlertINT incidents, newest first. "+
-			"Each incident groups one or more related alerts with an AI finding."),
+			"Each incident groups one or more related alerts with an AI finding. "+
+			"Rows with drill=true are synthetic drills fired by `alertint drill`, not real incidents."),
 		mcplib.WithInteger("limit",
 			mcplib.Description("Maximum number of incidents to return (1–100, default 20)."),
 		),
@@ -150,7 +151,8 @@ func (s *Server) toolGetIncident() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 	tool := mcplib.NewTool("alertint_get_incident",
 		mcplib.WithDescription("Get full details for one incident: member alerts with their roles, "+
 			"AI finding (analysis name, overall issue, correlation findings, severity, confidence), "+
-			"and raw LLM output JSON."),
+			"and raw LLM output JSON. drill=true marks a synthetic drill fired by `alertint drill`, "+
+			"not a real incident."),
 		mcplib.WithString("incident_id",
 			mcplib.Description("Incident ID from alertint_list_incidents."),
 			mcplib.Required(),
@@ -263,6 +265,9 @@ func (s *Server) handleListIncidents(ctx context.Context, req mcplib.CallToolReq
 		LastAlertAt  time.Time    `json:"last_alert_at"`
 		CreatedAt    time.Time    `json:"created_at"`
 		Recovery     recoveryView `json:"recovery"`
+		// Drill: the incident contains a Drill alert (alertint_drill="true",
+		// ADR-0013) — synthetic, fired by `alertint drill`.
+		Drill bool `json:"drill,omitempty"`
 	}
 
 	ids := make([]string, len(incidents))
@@ -272,6 +277,10 @@ func (s *Server) handleListIncidents(ctx context.Context, req mcplib.CallToolReq
 	counts, err := s.st.IncidentMemberStatusCounts(ctx, ids)
 	if err != nil {
 		return errResult("failed to load recovery counts: " + err.Error()), nil
+	}
+	drills, err := s.st.IncidentDrillFlags(ctx, ids)
+	if err != nil {
+		return errResult("failed to load drill flags: " + err.Error()), nil
 	}
 
 	rows := make([]row, 0, len(incidents))
@@ -289,6 +298,7 @@ func (s *Server) handleListIncidents(ctx context.Context, req mcplib.CallToolReq
 			LastAlertAt:  inc.LastAlertAt,
 			CreatedAt:    inc.CreatedAt,
 			Recovery:     buildRecovery(c.Firing, c.Resolved, c.Total, inc.Status, inc.UpdatedAt),
+			Drill:        drills[inc.ID],
 		})
 	}
 
@@ -349,14 +359,19 @@ func (s *Server) handleGetIncident(ctx context.Context, req mcplib.CallToolReque
 		})
 	}
 
-	// Derive the recovery signal from the member alerts already loaded above.
+	// Derive the recovery signal and the drill flag from the member alerts
+	// already loaded above (drill: any member carries the ADR-0013 marker).
 	var firing, resolved int
+	drill := false
 	for _, a := range alerts {
 		switch a.Status {
 		case "firing":
 			firing++
 		case "resolved":
 			resolved++
+		}
+		if a.Labels[store.DrillMarkerLabel] == store.DrillMarkerValue {
+			drill = true
 		}
 	}
 
@@ -373,6 +388,7 @@ func (s *Server) handleGetIncident(ctx context.Context, req mcplib.CallToolReque
 		"root_cause":     inc.RootCause,
 		"confidence":     inc.Confidence,
 		"recovery":       buildRecovery(firing, resolved, len(alerts), inc.Status, inc.UpdatedAt),
+		"drill":          drill,
 		"finding":        finding,
 		"alerts":         alertRows,
 	}

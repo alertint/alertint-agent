@@ -22,16 +22,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `logs.provider` now defaults to `loki`.
 - **Single-alert triage by default** — `correlator.min_alerts` defaults to `1`
   (was `2`), so a lone first alert still produces a finding.
+- **Example config ships change ingress and MCP enabled** —
+  `config.example.yaml` now has `changes.ingress.enabled: true` (the flagship
+  drill is causal out of the box, and a one-line deploy-time `curl` gives real
+  triage its "what changed" evidence) and `mcp.enabled: true` (the drill's
+  payoff fetch and the product's MCP handoff work without editing config).
+  Copying the example verbatim therefore requires `ALERTINT_CHANGES_WEBHOOK_TOKEN`
+  and `ALERTINT_MCP_TOKEN` at startup (both documented in `.env.example`).
+  Docs positioning updated to match: Prometheus is promoted to the recommended
+  first evidence source; Pushgateway synthetic metrics are demoted to optional
+  compose-stack realism.
+- **`correlator.group_labels` is validated more strictly** — entries using the
+  now-reserved `alertint_` label-key prefix, duplicated keys, and
+  whitespace-padded keys are rejected at config load. Configs that previously
+  carried such entries (silently misbehaving) now fail loud at startup;
+  `alertint validate` catches them ahead of a deploy.
+- **Drill change events never enrich real incidents** — change events carrying
+  the reserved `alertint_drill` marker are excluded from triage change
+  enrichment unless the incident itself is a drill, so a planted drill deploy
+  can neither lift a real incident's confidence cap nor invite a false causal
+  attribution.
 
 ### Added
 
+- **`alertint drill`** — one command fires a synthetic Drill at a running
+  instance and ends at "finding ready". The flagship
+  scenario plants a fake deploy on the change webhook and follows with an
+  overlapping alert burst, producing a causal, uncapped finding that names the
+  deploy; a `--scenario storm` variant fires a storm-sized burst that lands as
+  one incident. Everything is
+  derived from the same config file `serve` reads (receiver/MCP addresses,
+  tokens, `group_labels` adaptation); the console prints progress, waits out
+  the correlation window, then polls MCP until the finding is ready (bounded
+  by a triage grace) and renders it plus the
+  `investigate incident <id> using alertint` handoff (`--result <id>`
+  re-checks a slow triage). `--resolve` re-sends the burst as resolved after
+  the run, closing the Drill through the production resolution path (Slack
+  cards update in place). Drill alerts carry the reserved
+  `alertint_drill="true"` label — rendered as a 🧪 DRILL banner on Slack cards
+  and a `drill` flag on the MCP incident list — and the whole `alertint_`
+  label-key prefix is now reserved (rejected in `correlator.group_labels`).
+  Remote targets require confirmation (`--yes`), plain-HTTP remotes an
+  explicit `--allow-insecure-http`, and `--via-alertmanager` optionally
+  validates your AM→AlertINT routing.
+- **`alertint validate <config>`** — an `nginx -t`-style config dry-run: strict
+  parse (unknown keys rejected) plus full validation, skipping
+  machine-coupled filesystem checks so pod-destined configs validate cleanly
+  on a laptop or CI runner; exits 0/1 with actionable errors.
 - **`notify.slack.min_severity`** (`low` | `medium` | `high`, default `low`) — a
   Slack noise gate: findings below the threshold are not posted (stdout always
   emits, and a suppressed incident's resolution is suppressed too). Suppressions
   are recorded in the audit trail as `notify.skipped`.
-- **Agent-handoff prompt on the Slack incident card** — the firing card now
-  carries a copy-pasteable `investigate incident <id> using alertint` prompt with
-  the full incident ID, so the MCP handoff is a one-paste action.
+- **Agent-handoff prompt on the Slack incident card** — the firing card and the
+  analysis thread both carry a copy-pasteable
+  `investigate incident <id> using alertint` prompt with the full incident ID,
+  rendered as a full-size section (not caption text), so the MCP handoff is a
+  prominent one-paste action on every firing surface.
 - **Deterministic confidence cap for metadata-only findings** — when triage had no
   live evidence (no metrics, logs, changes, or Sentry issues), the persisted and
   notified confidence is capped at 0.6 regardless of what the model returned,
@@ -110,7 +156,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the read-only `alertint_recent_changes` MCP tool exposes them to an investigating agent.
   This is the change plane the Sentry **Change source** (v0.5.0) later feeds. (#6)
 - **Selectable agent config** — `ALERTINT_CONFIG_FILE` chooses which config file the container
-  loads at startup; the demo stack gains a `log_format` toggle.
+  loads at startup; the dev stack gains a `log_format` toggle.
 
 ### Changed
 
@@ -171,7 +217,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   saw are persisted with the finding and replayed by `alertint_get_evidence_pack`.
 - **`loki_query_range` MCP tool** — read-only native-LogQL range query, registered when the
   Loki connector is enabled, so an investigating agent can drill into logs over MCP.
-- **Demo log stack** — bundled Loki service in the Docker Compose dev stack plus
+- **Dev-stack logs** — bundled Loki service in the Docker Compose dev stack plus
   `docker/push-synthetic-logs.py` (`task logs:push:local` / `task logs:push:cloud`) to seed
   fake multi-level log lines for local Loki or Grafana Cloud.
 

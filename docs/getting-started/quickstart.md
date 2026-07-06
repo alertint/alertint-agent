@@ -20,7 +20,9 @@ incidents with production context.
 - An Anthropic API key — create one at <https://console.anthropic.com>
 - A reachable Alertmanager instance (or use the bundled Docker Compose stack)
 - An MCP client such as Claude Code, Cursor, or Windsurf
-- Optional: a reachable Prometheus instance for live metric context
+- Recommended: a reachable Prometheus instance — if you run Alertmanager,
+  you almost certainly have one, and it is the first evidence source worth
+  connecting for live metric context
 
 ## Option A — Docker Compose
 
@@ -31,7 +33,8 @@ Prometheus and Alertmanager, already wired together:
 git clone https://github.com/alertint/alertint-agent
 cd alertint-agent
 cp .env.example .env
-# Edit .env: set ALERTINT_WEBHOOK_TOKEN (any long secret) and ANTHROPIC_API_KEY
+# Edit .env: set ALERTINT_WEBHOOK_TOKEN, ALERTINT_CHANGES_WEBHOOK_TOKEN and
+# ALERTINT_MCP_TOKEN (any long secrets), plus ANTHROPIC_API_KEY
 docker compose -f docker/docker-compose.yaml --env-file .env up --build
 ```
 
@@ -78,11 +81,22 @@ Secrets are never written into the config file — fields ending in `_env`
 name the environment variable that holds the value. See
 [Configuration](configuration.md) for every option.
 
-Export the secrets before starting:
+The example config ships with the change webhook and the MCP server
+enabled (both are part of the drill below and of everyday use), so their
+tokens are required at startup too. Export the secrets before starting:
 
 ```bash
 export ALERTINT_WEBHOOK_TOKEN="$(openssl rand -hex 32)"
+export ALERTINT_CHANGES_WEBHOOK_TOKEN="$(openssl rand -hex 32)"
+export ALERTINT_MCP_TOKEN="$(openssl rand -hex 32)"
 export ANTHROPIC_API_KEY="sk-ant-..."
+```
+
+Check the config before starting it anywhere (CI-friendly — filesystem
+paths meant for another machine are not probed):
+
+```bash
+alertint validate config.yaml
 ```
 
 ### 3. Start the agent
@@ -140,11 +154,41 @@ asking a specific operational question:
 
 > List recent AlertINT incidents and summarize the most critical one.
 
+### 6. Fire a drill
+
+With the agent running, one command takes you to "finding ready":
+
+```bash
+alertint drill --config config.yaml
+```
+
+The drill reads the same config file serve reads (no extra flags, no token
+pasting), plants a fake deploy on the change webhook, fires a burst of
+obviously fictional drill alerts at the production ingress, waits out the
+correlation window (`correlator.window_seconds` — lower it for faster
+drills), then polls until triage completes and prints the resulting
+finding — a causal analysis that names the planted deploy. Add `--resolve`
+to close the drill at the end of the run: the same burst is re-sent as
+resolved, and the Slack card (if enabled) flips to resolved in place. The synthetic incident is marked end to
+end: every drill alert carries the reserved `alertint_drill="true"` label,
+the Slack card (if enabled) shows a 🧪 DRILL banner, and the MCP incident
+list flags the row with `drill: true`. The whole `alertint_` label prefix
+is reserved for AlertINT — don't use it in your own alert labels or
+`correlator.group_labels`.
+
+Drill incidents are regular incidents: they enter through the production
+webhook, live permanently in the store, and appear in the audit log —
+that first entry is your proof the pipeline ran. Finish the loop from
+your MCP client with the command the drill prints:
+
+> investigate incident `<id>` using alertint
+
 ## Next steps
 
-- Enable Slack notifications: see [Slack](../notifications/slack.md)
-- Enable Prometheus metric enrichment and PromQL tools: see
+- Connect Prometheus — the recommended first evidence source; it lifts
+  findings past the metadata-only confidence cap on real incidents: see
   [Prometheus](../integrations/prometheus.md)
+- Enable Slack notifications: see [Slack](../notifications/slack.md)
 - Tune incident grouping (`correlator.window_seconds`,
   `correlator.group_labels`): see [Configuration](configuration.md)
 - Understand what the agent will and won't do:
