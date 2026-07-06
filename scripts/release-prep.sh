@@ -58,5 +58,3 @@ awk -v ver="$version" -v date="$today" -v prev="$prev" -v url="$repo_url" '
 mv "$tmp" "$changelog"
 
 echo "release-prep: rolled [Unreleased] -> [$version] - $today (previous: v$prev)"
-echo "next: commit + PR + merge, then tag the merged commit:"
-echo "  git tag v$version && git push origin v$version"
