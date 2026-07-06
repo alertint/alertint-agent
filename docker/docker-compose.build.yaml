@@ -1,0 +1,15 @@
+# Build override: compile the agent image from the working tree instead of
+# pulling the released ghcr.io image. For developing against local changes:
+#
+#   docker compose -f docker/docker-compose.yaml -f docker/docker-compose.build.yaml \
+#     --env-file .env up --build
+#
+# The Taskfile dev targets (task run, task docker:*) already include this file.
+# The image is tagged alertint-agent:dev so a local build never shadows the
+# pulled ghcr.io/alertint/alertint-agent:latest tag.
+services:
+  agent:
+    image: alertint-agent:dev
+    build:
+      context: ..
+      dockerfile: Dockerfile

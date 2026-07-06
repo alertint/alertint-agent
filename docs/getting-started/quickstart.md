@@ -28,7 +28,9 @@ Protocol (MCP), and then point Alertmanager at it for real alerts.
 ## Option A — Docker Compose
 
 The fastest first run. The bundled stack starts **AlertINT** together with
-Prometheus and Alertmanager, already wired together:
+Prometheus and Alertmanager, already wired together, pulling the released
+multi-arch agent image from GitHub Container Registry — nothing is compiled
+on your machine:
 
 ```bash
 git clone https://github.com/alertint/alertint-agent
@@ -36,8 +38,12 @@ cd alertint-agent
 cp .env.example .env
 # Edit .env: set ALERTINT_WEBHOOK_TOKEN, ALERTINT_CHANGES_WEBHOOK_TOKEN and
 # ALERTINT_MCP_TOKEN (any long secrets), plus ANTHROPIC_API_KEY
-docker compose -f docker/docker-compose.yaml --env-file .env up --build
+docker compose -f docker/docker-compose.yaml --env-file .env up
 ```
+
+(Developing against local changes? Add
+`-f docker/docker-compose.build.yaml` plus `--build` to compile the agent
+from the working tree instead.)
 
 With the stack running, skip straight to
 [firing a drill](#4-fire-a-drill).
