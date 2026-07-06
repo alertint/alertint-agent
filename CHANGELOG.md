@@ -19,10 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **One-command release** — `task release VERSION=x.y.z` now cuts the whole
-  release: it rolls the changelog, previews the release body, and on
-  confirmation commits the roll to `main`, tags, and pushes — replacing the
-  manual branch/PR/merge/tag choreography (see `RELEASING.md`).
+- **One-command release** — `task release -- x.y.z` now cuts the whole
+  release from any branch: it switches to a fast-forwarded `main`, rolls
+  the changelog, previews the release body, and on confirmation commits
+  the roll to `main`, tags, and pushes — replacing the manual
+  branch/PR/merge/tag choreography (see `RELEASING.md`).
 - **Config/docs drift gate** — `go test` now verifies that
   `config.example.yaml` loads through the strict config parser, that the
   defaults documented in the configuration reference match the code's

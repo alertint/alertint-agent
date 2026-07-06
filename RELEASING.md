@@ -26,18 +26,19 @@ the git tag via ldflags.
 2. **Release:**
 
    ```bash
-   task release VERSION=0.7.0
+   task release -- 0.7.0
    ```
 
-   This is the whole release. The script verifies you are on a clean,
-   up-to-date `main`, rolls `[Unreleased]` into a dated `0.7.0` section,
-   prints the exact release body, and asks for one confirmation. On yes it
-   commits the roll to `main`, tags `v0.7.0`, and pushes both.
+   This is the whole release, runnable from any branch: the script
+   requires a clean working tree, switches to `main` and fast-forwards it,
+   rolls `[Unreleased]` into a dated `0.7.0` section, prints the exact
+   release body, and asks for one confirmation. On yes it commits the roll
+   to `main`, tags `v0.7.0`, and pushes both.
 
    The roll commit is prose-only (`CHANGELOG.md` and nothing else), so it
    goes straight to `main` under the admin bypass — same policy as
    docs-only commits. CI still runs on the push. Pass `--yes` to skip the
-   prompt: `./scripts/release.sh 0.7.0 --yes`.
+   prompt: `task release -- 0.7.0 --yes`.
 
 3. **The tag push does the rest.** The release workflow extracts the
    `## [0.7.0]` section into the release body, and GoReleaser builds the

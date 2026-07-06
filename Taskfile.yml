@@ -135,9 +135,9 @@ tasks:
       - go run ./docs/scripts
 
   release:
-    desc: "Cut a release end to end — roll CHANGELOG, confirm, commit to main, tag, push — e.g. `task release VERSION=0.7.0` (see RELEASING.md)"
+    desc: "Cut a release end to end — roll CHANGELOG, confirm, commit to main, tag, push — e.g. `task release -- 0.7.0` (see RELEASING.md)"
     cmds:
-      - ./scripts/release.sh "{{.VERSION}}"
+      - ./scripts/release.sh {{.CLI_ARGS}}
 
   release:prep:
     desc: "Roll CHANGELOG [Unreleased] into a version section before tagging, e.g. `task release:prep VERSION=0.7.0` (see RELEASING.md)"

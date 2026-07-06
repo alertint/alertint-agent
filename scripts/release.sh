@@ -8,28 +8,38 @@
 # triggers the release workflow, which re-validates the CHANGELOG section
 # and runs GoReleaser. See RELEASING.md.
 #
+# Runs from any branch: switches to main and fast-forwards it first.
+#
 # Usage: scripts/release.sh <version|vversion> [--yes]
 set -euo pipefail
 
-version="${1:?usage: release.sh <version> [--yes]}"
+fail() { echo "release: $*" >&2; exit 1; }
+
+version="${1:-}"
+[ -n "$version" ] || fail "usage: release.sh <version> [--yes] — e.g. task release -- 0.7.0"
 version="${version#v}"
 assume_yes="${2:-}"
 
-fail() { echo "release: $*" >&2; exit 1; }
-
 printf '%s' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' \
-  || fail "version must be x.y.z (got \"$version\") — e.g. task release VERSION=0.7.0"
+  || fail "version must be x.y.z (got \"$version\") — e.g. task release -- 0.7.0"
 
-branch="$(git rev-parse --abbrev-ref HEAD)"
-[ "$branch" = "main" ] || fail "must run on main (currently on \"$branch\")"
-[ -z "$(git status --porcelain)" ] || fail "working tree is dirty — commit or stash first"
+[ -z "$(git status --porcelain -uno)" ] \
+  || fail "working tree has uncommitted changes — commit or stash first"
 
 git fetch origin main --tags
-[ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] \
-  || fail "main is not in sync with origin/main — pull (or push) first"
 if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
   fail "tag v$version already exists"
 fi
+
+branch="$(git rev-parse --abbrev-ref HEAD)"
+if [ "$branch" != "main" ]; then
+  echo "release: switching to main (was on \"$branch\")"
+  git checkout -q main
+fi
+git merge --ff-only -q origin/main \
+  || fail "main and origin/main have diverged — reconcile first"
+[ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] \
+  || fail "main is ahead of origin/main — push (or drop) the extra commits first"
 
 ./scripts/release-prep.sh "$version"
 
