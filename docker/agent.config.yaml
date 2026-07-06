@@ -29,6 +29,14 @@ notify:
     bot_token_env: SLACK_BOT_TOKEN
     channel: "#alerts"
 
+# Change-event webhook — receives deploy/config/flag events and stores them as
+# triage context ("what changed before this incident?"). `alertint drill`
+# plants its fake deploy through this door, so it stays enabled in the stack.
+changes:
+  ingress:
+    enabled: true
+    webhook_token_env: ALERTINT_CHANGES_WEBHOOK_TOKEN
+
 # MCP HTTP server — AI coding agents (Claude Code, Cursor, Windsurf) connect
 # to this endpoint over the network.
 # Connect with: http://host:9912/mcp  (or localhost:9912/mcp for local Docker)
