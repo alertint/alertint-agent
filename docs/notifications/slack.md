@@ -81,9 +81,10 @@ and resolved — only the header and fields change on resolution.
 | Main — header | 🔴 INCIDENT DETECTED when firing, updated to ✅ INCIDENT RESOLVED in-place when resolved. |
 | Main — root cause | One-sentence root cause hypothesis, preserved when the message is updated on resolution. |
 | Main — footer | Incident ID, alert count, group key, and start time. Replaced by resolved time and duration on resolution. |
+| Main — agent handoff | `investigate incident <id> using alertint` — the MCP call to action, with the full incident ID. Dropped when the incident resolves. |
 | Thread — analysis | Posted immediately after the main message: severity, confidence, alert count, and group key in a fields grid. |
 | Thread — findings | Bullet list of correlation findings. Only shown when the LLM identified more than one contributing factor. |
-| Thread — MCP hint | Pre-filled `alertint_get_incident()` tool call — paste directly into your AI agent to open the full evidence pack. |
+| Thread — agent handoff | The same handoff block, so the call to action reads identically on every firing surface. |
 | Thread — resolved | Posted when all alerts recover: duration, alert count, and resolved timestamp in a fields grid. |
 
 ## Example — firing
@@ -100,6 +101,9 @@ Root cause: CPU saturation on api-2 is causing request queuing, elevating
 error rates and response latency across the cluster.
 
 Incident a1b2c3d4 · 3 alerts · group cluster=prod · started 14:37 UTC
+
+🤖 Investigate in your AI agent
+investigate incident a1b2c3d4-5e6f-7a8b-9c0d-1e2f3a4b5c6d using alertint
 ```
 
 Thread reply (posted immediately):
@@ -114,7 +118,8 @@ Correlation findings
 • HighCPU (api-2) fired 15 s before HighErrorRate — causal ordering confirmed.
 • HighLatency shares the same instance label, indicating single-host origin.
 
-🔍 alertint_get_incident("a1b2c3d4") · alertint_list_incidents
+🤖 Investigate in your AI agent
+investigate incident a1b2c3d4-5e6f-7a8b-9c0d-1e2f3a4b5c6d using alertint
 ```
 
 ## Example — resolved

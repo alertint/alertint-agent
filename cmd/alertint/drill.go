@@ -475,7 +475,7 @@ func (d *drillCmd) fetchAndPrintIncident(ctx context.Context, client *mcpOneShot
 		d.printf("slack: the DRILL card is in %s", d.cfg.Notify.Slack.Channel)
 	}
 	d.printf("")
-	d.printf("next: open your MCP-connected agent and paste:")
+	d.printf("next: in your MCP-connected agent, run:")
 	d.printf("  investigate incident %s using alertint", inc.ID)
 	return nil
 }

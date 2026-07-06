@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compose-variant command and a `config.example.yaml` fetch for
   binary-only installs. The README's step-by-step quickstart was replaced by
   a pointer to the canonical walkthrough at alertint.com/docs.
+- **One agent handoff per Slack surface** — the analysis thread no longer
+  appends a raw MCP tool-name hint under the handoff block; the
+  `investigate incident <id> using alertint` call to action is the single
+  handoff, and its "paste" phrasing is dropped on Slack and in the drill
+  console.
 
 ## [0.6.0] - 2026-07-06
 

@@ -277,12 +277,12 @@ func firingMainBlocks(f notify.Finding) []slacklib.Block {
 	return blocks
 }
 
-// agentHandoffBlock is the one-paste MCP call to action, rendered the same
-// wherever it appears: main firing card and thread detail.
+// agentHandoffBlock is the MCP call to action, rendered the same wherever it
+// appears: main firing card and thread detail.
 func agentHandoffBlock(incidentID string) slacklib.Block {
 	return slacklib.NewSectionBlock(
 		slacklib.NewTextBlockObject(slacklib.MarkdownType,
-			fmt.Sprintf(":robot_face: *Investigate in your AI agent* — paste:\n`investigate incident %s using alertint`", incidentID),
+			fmt.Sprintf(":robot_face: *Investigate in your AI agent*\n`investigate incident %s using alertint`", incidentID),
 			false, false),
 		nil, nil,
 	)
@@ -324,11 +324,6 @@ func firingDetailBlocks(f notify.Finding) []slacklib.Block {
 	blocks = append(blocks,
 		slacklib.NewDividerBlock(),
 		agentHandoffBlock(f.IncidentID),
-		slacklib.NewContextBlock("",
-			slacklib.NewTextBlockObject(slacklib.MarkdownType,
-				fmt.Sprintf(":mag: `alertint_get_incident(\"%s\")` · `alertint_list_incidents`", f.IncidentID),
-				false, false),
-		),
 	)
 	return blocks
 }
