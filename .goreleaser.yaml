@@ -97,3 +97,9 @@ release:
   name_template: "v{{ .Version }}"
   draft: false
   prerelease: auto
+  # The body comes from CHANGELOG.md via --release-notes (see
+  # .github/workflows/release.yml); this footer appends the compare link.
+  footer: |
+    ---
+
+    **Full Changelog**: https://github.com/alertint/alertint-agent/compare/{{ .PreviousTag }}...{{ .Tag }}

@@ -18,6 +18,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Changelog gate: the GitHub Release body is the CHANGELOG.md section for
+      # this tag. No section -> no release; roll the changelog first with
+      # `task release:prep VERSION=<x.y.z>` (see RELEASING.md).
+      - name: Extract release notes from CHANGELOG.md
+        run: ./scripts/release-notes.sh "${GITHUB_REF_NAME}" > /tmp/release-notes.md
+
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
@@ -41,6 +47,6 @@ jobs:
         uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"
-          args: release --clean
+          args: release --clean --release-notes /tmp/release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
