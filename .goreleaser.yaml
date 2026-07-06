@@ -98,7 +98,11 @@ release:
   draft: false
   prerelease: auto
   # The body comes from CHANGELOG.md via --release-notes (see
-  # .github/workflows/release.yml); this footer appends the compare link.
+  # .github/workflows/release.yml). mode: replace makes that stick even when
+  # the release already exists — e.g. published from the GitHub UI, which
+  # pre-creates the release (with UI-generated notes) before the tag-push
+  # workflow runs; the default keep-existing would silently keep that body.
+  mode: replace
   footer: |
     ---
 
