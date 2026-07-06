@@ -1,6 +1,6 @@
 ---
 title: "Quickstart"
-description: "Install the agent, feed it your alerts, and connect your first MCP client."
+description: "Install the agent, fire a built-in incident drill, and connect your first MCP client."
 section: "Getting started"
 order: 1
 slug: "quickstart"
@@ -8,18 +8,19 @@ slug: "quickstart"
 
 # Quickstart
 
-This guide takes you from zero to a working setup: you'll get **AlertINT**
+This guide takes you from zero to a triaged incident: you'll get **AlertINT**
 running as a single self-hosted binary (or as a bundled Docker Compose
-stack), point Alertmanager at it, and connect your AI agent over the
-Model Context Protocol (MCP). At the end, your agent can analyze live
-incidents with production context.
+stack), fire a built-in incident drill to watch the pipeline produce an
+AI finding end to end, connect your AI agent over the Model Context
+Protocol (MCP), and then point Alertmanager at it for real alerts.
 
 ## Prerequisites
 
 - Go 1.26+ (binary install) **or** Docker with Compose v2
 - An Anthropic API key — create one at <https://console.anthropic.com>
-- A reachable Alertmanager instance (or use the bundled Docker Compose stack)
 - An MCP client such as Claude Code, Cursor, or Windsurf
+- To go live after the drill (step 6): a reachable Alertmanager instance —
+  the drill itself needs nothing beyond the agent
 - Recommended: a reachable Prometheus instance — if you run Alertmanager,
   you almost certainly have one, and it is the first evidence source worth
   connecting for live metric context
@@ -39,7 +40,7 @@ docker compose -f docker/docker-compose.yaml --env-file .env up --build
 ```
 
 With the stack running, skip straight to
-[connecting an MCP client](#5-connect-an-mcp-client).
+[firing a drill](#4-fire-a-drill).
 
 ## Option B — Binary install
 
@@ -61,9 +62,11 @@ alertint version
 
 ### 2. Create the configuration
 
-Copy `config.example.yaml` from the repo root and adjust it:
+Copy `config.example.yaml` from the repo root and adjust it — or, if you
+installed the binary without cloning the repo, fetch it directly:
 
 ```bash
+curl -LO https://raw.githubusercontent.com/alertint/alertint-agent/main/config.example.yaml
 cp config.example.yaml config.yaml
 ```
 
@@ -73,7 +76,7 @@ At minimum, set:
   webhook bearer token. There is nothing to obtain anywhere: you make
   this secret up yourself — any long random string works, and the export
   below generates one with `openssl rand -hex 32`. Alertmanager will
-  present the same token with every webhook it sends (step 4), and the
+  present the same token with every webhook it sends (step 6), and the
   agent rejects requests without it.
 - `llm.api_key_env` — name of the env var holding your Anthropic API key
 
@@ -111,12 +114,64 @@ You should see:
 level=INFO msg="alertint starting" version=... addr=0.0.0.0:9911
 ```
 
-The agent is now listening for Alertmanager webhooks and building incident
-history.
+The agent is now listening for webhooks and building incident history.
 
-### 4. Point Alertmanager at the agent
+### 4. Fire a drill
 
-Add an `alertint-agent` receiver to your `alertmanager.yml` and route
+With the agent running, one command takes you to "finding ready" — no
+Alertmanager and no MCP client needed yet; the drill fires straight at the
+agent's own webhook:
+
+```bash
+alertint drill --config config.yaml
+```
+
+Running the Docker Compose stack instead? The binary lives inside the
+agent container:
+
+```bash
+docker compose -f docker/docker-compose.yaml exec agent /alertint drill --config /etc/alertint/config.yaml
+```
+
+The drill reads the same config file serve reads (no extra flags, no token
+pasting), plants a fake deploy on the change webhook, fires a burst of
+obviously fictional drill alerts at the production ingress, waits out the
+correlation window (`correlator.window_seconds` — lower it for faster
+drills), then polls until triage completes and prints the resulting
+finding — a causal analysis that names the planted deploy. Add `--resolve`
+to close the drill at the end of the run: the same burst is re-sent as
+resolved, and the Slack card (if enabled) flips to resolved in place. The synthetic incident is marked end to
+end: every drill alert carries the reserved `alertint_drill="true"` label,
+the Slack card (if enabled) shows a 🧪 DRILL banner, and the MCP incident
+list flags the row with `drill: true`. The whole `alertint_` label prefix
+is reserved for AlertINT — don't use it in your own alert labels or
+`correlator.group_labels`.
+
+Drill incidents are regular incidents: they enter through the production
+webhook, live permanently in the store, and appear in the audit log —
+that first entry is your proof the pipeline ran. The drill ends by
+printing an MCP handoff command — connect a client next and finish the
+loop.
+
+### 5. Connect an MCP client
+
+**AlertINT** runs a persistent MCP HTTP server on port 9912 (enable it with
+`mcp.enabled: true` and set the `ALERTINT_MCP_TOKEN` env var). Open your
+preferred MCP-capable tool — Claude Code, Cursor, or Windsurf — and point
+it at the endpoint; copy-paste configs are in
+[MCP clients](../integrations/mcp-clients.md). Verify connectivity with
+the command the drill printed:
+
+> investigate incident `<id>` using alertint
+
+or ask a specific operational question:
+
+> List recent AlertINT incidents and summarize the most critical one.
+
+### 6. Point Alertmanager at the agent
+
+The drill proved the pipeline; now feed it real alerts. Add an
+`alertint-agent` receiver to your `alertmanager.yml` and route
 alerts to it. A complete minimal config ships in the repo as
 `examples/alertmanager.yml`; the essential pieces are:
 
@@ -142,46 +197,6 @@ receives a copy of every alert, deduplicates and correlates alerts into
 incidents, and produces an AI finding for each incident. See
 [Prometheus](../integrations/prometheus.md) for integration details and
 for enabling live metric context.
-
-### 5. Connect an MCP client
-
-**AlertINT** runs a persistent MCP HTTP server on port 9912 (enable it with
-`mcp.enabled: true` and set the `ALERTINT_MCP_TOKEN` env var). Open your
-preferred MCP-capable tool — Claude Code, Cursor, or Windsurf — and point
-it at the endpoint; copy-paste configs are in
-[MCP clients](../integrations/mcp-clients.md). Verify connectivity by
-asking a specific operational question:
-
-> List recent AlertINT incidents and summarize the most critical one.
-
-### 6. Fire a drill
-
-With the agent running, one command takes you to "finding ready":
-
-```bash
-alertint drill --config config.yaml
-```
-
-The drill reads the same config file serve reads (no extra flags, no token
-pasting), plants a fake deploy on the change webhook, fires a burst of
-obviously fictional drill alerts at the production ingress, waits out the
-correlation window (`correlator.window_seconds` — lower it for faster
-drills), then polls until triage completes and prints the resulting
-finding — a causal analysis that names the planted deploy. Add `--resolve`
-to close the drill at the end of the run: the same burst is re-sent as
-resolved, and the Slack card (if enabled) flips to resolved in place. The synthetic incident is marked end to
-end: every drill alert carries the reserved `alertint_drill="true"` label,
-the Slack card (if enabled) shows a 🧪 DRILL banner, and the MCP incident
-list flags the row with `drill: true`. The whole `alertint_` label prefix
-is reserved for AlertINT — don't use it in your own alert labels or
-`correlator.group_labels`.
-
-Drill incidents are regular incidents: they enter through the production
-webhook, live permanently in the store, and appear in the audit log —
-that first entry is your proof the pipeline ran. Finish the loop from
-your MCP client with the command the drill prints:
-
-> investigate incident `<id>` using alertint
 
 ## Next steps
 

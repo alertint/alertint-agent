@@ -18,39 +18,22 @@ A single Go binary that sits between Alertmanager and your AI agent. It ingests 
 
 **Full documentation: [alertint.com/docs](https://alertint.com/docs)**
 
-## Quickstart
+## Get started
 
-1. **[Install](https://alertint.com/docs/getting-started/quickstart)** — grab a binary from [Releases](https://github.com/alertint/alertint-agent/releases), or:
+The **[Quickstart](https://alertint.com/docs/getting-started/quickstart)** is
+the canonical walkthrough — install (single binary or bundled Docker Compose
+stack), configure, and prove the whole pipeline with one command:
 
-   ```bash
-   go install github.com/alertint/alertint-agent/cmd/alertint@latest
-   ```
+```bash
+alertint drill --config config.yaml
+```
 
-2. **[Configure](https://alertint.com/docs/getting-started/configuration)** — copy the example and point it at your env vars:
-
-   ```bash
-   cp config.example.yaml config.yaml
-   export ALERTINT_WEBHOOK_TOKEN="$(openssl rand -hex 32)" ANTHROPIC_API_KEY="sk-ant-..."
-   ```
-
-3. **[Run](https://alertint.com/docs/getting-started/quickstart)** — one process, SQLite state, no other dependencies:
-
-   ```bash
-   alertint serve --config config.yaml
-   ```
-
-4. **[Point Alertmanager at it](https://alertint.com/docs/getting-started/quickstart)** — add a webhook receiver:
-
-   ```yaml
-   webhook_configs:
-     - url: "http://<agent-host>:9911/webhook/alertmanager"
-   ```
-
-5. **[Connect an MCP client](https://alertint.com/docs/integrations/mcp-clients)** — Claude Code, Cursor, or Windsurf:
-
-   ```text
-   http://<agent-host>:9912/mcp
-   ```
+The built-in incident drill plants a fake deploy, fires a burst of
+clearly-marked synthetic alerts through the production ingress, and polls
+until triage prints the finding — a causal analysis naming the planted
+deploy. From zero to that finding takes about ten minutes; then connect an
+MCP client to investigate it, and point Alertmanager at the agent for real
+alerts.
 
 ## How it works
 

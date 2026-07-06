@@ -46,6 +46,7 @@ services:
       ALERTINT_WEBHOOK_TOKEN: ${ALERTINT_WEBHOOK_TOKEN:?ALERTINT_WEBHOOK_TOKEN is required}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY is required}
       ALERTINT_MCP_TOKEN: ${ALERTINT_MCP_TOKEN:?ALERTINT_MCP_TOKEN is required}
+      ALERTINT_CHANGES_WEBHOOK_TOKEN: ${ALERTINT_CHANGES_WEBHOOK_TOKEN:?ALERTINT_CHANGES_WEBHOOK_TOKEN is required}
       # Optional: only used when notify.slack.enabled is true in agent.config.yaml
       SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
       # Optional: only used when logs.loki points at Grafana Cloud (basic auth)

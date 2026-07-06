@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Docker Compose stack is drill-ready** — `docker/agent.config.yaml` now
+  ships `changes.ingress` enabled and the compose file passes
+  `ALERTINT_CHANGES_WEBHOOK_TOKEN` into the agent container, so
+  `alertint drill` run inside the stack plants its deploy and produces the
+  causal, uncapped finding. `docker compose up` therefore requires the token
+  in `.env` (already documented in `.env.example`).
+- **Quickstart reordered around the drill** — install → configure → serve →
+  drill → MCP client → Alertmanager: the drill needs neither Alertmanager nor
+  an MCP client, so it now comes right after first start, with a
+  compose-variant command and a `config.example.yaml` fetch for
+  binary-only installs. The README's step-by-step quickstart was replaced by
+  a pointer to the canonical walkthrough at alertint.com/docs.
+
+## [0.6.0] - 2026-07-06
+
+### Changed
+
 - **Default triage model is now `claude-sonnet-5`** (was `claude-haiku-4-5-20251001`).
   The first finding is built by the strongest reasoning tier in its price class;
   `model: claude-haiku-4-5` remains a one-line opt-in for cost-sensitive deployments.
@@ -42,6 +59,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enrichment unless the incident itself is a drill, so a planted drill deploy
   can neither lift a real incident's confidence cap nor invite a false causal
   attribution.
+- **Docs validator** — `docs/scripts` now rejects duplicate page `order` values
+  within a section, so the rendered sidebar order stays deterministic.
 
 ### Added
 
@@ -83,8 +102,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   notified confidence is capped at 0.6 regardless of what the model returned,
   backing the existing prompt-side calibration directive.
 
-## [0.5.2] - 2026-07-01
-
 ### Fixed
 
 - **Sentry integration docs** — the page now documents both connector roles as
@@ -95,11 +112,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under one `MCP tools` section with an example-queries block.
 - **Docs sidebar ordering** — `loki` and `mcp-clients` both declared `order: 2`,
   leaving their relative sidebar position undefined; `mcp-clients` is now `order: 5`.
-
-### Changed
-
-- **Docs validator** — `docs/scripts` now rejects duplicate page `order` values
-  within a section, so the rendered sidebar order stays deterministic.
 
 ## [0.5.1] - 2026-07-01
 
@@ -255,8 +267,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single static binary** — pure-Go SQLite (no CGO), no external runtime dependencies.
   Multi-platform builds: `linux/amd64`, `linux/arm64`, `darwin/arm64`.
 
-[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.5.2...HEAD
-[0.5.2]: https://github.com/alertint/alertint-agent/compare/v0.5.1...v0.5.2
+[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/alertint/alertint-agent/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/alertint/alertint-agent/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/alertint/alertint-agent/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/alertint/alertint-agent/compare/v0.3.0...v0.4.0
