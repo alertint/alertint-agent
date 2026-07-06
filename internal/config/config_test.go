@@ -168,9 +168,10 @@ func TestDefaults_OnlyAlertmanagerEnabled(t *testing.T) {
 	if !cfg.Alertmanager.Enabled {
 		t.Error("alertmanager should be enabled by default")
 	}
-	if cfg.Notify.Slack.Enabled || cfg.MCP.Enabled || cfg.PrometheusEnabled() {
+	t.Setenv("ALERTINT_MCP_TOKEN", "") // hermetic: mcp is presence-based on this env var
+	if cfg.Notify.Slack.Enabled || cfg.MCPEnabled() || cfg.PrometheusEnabled() {
 		t.Errorf("slack/mcp/prometheus should be disabled by default, got %v/%v/%v",
-			cfg.Notify.Slack.Enabled, cfg.MCP.Enabled, cfg.PrometheusEnabled())
+			cfg.Notify.Slack.Enabled, cfg.MCPEnabled(), cfg.PrometheusEnabled())
 	}
 }
 
@@ -180,7 +181,7 @@ func TestValidate_AlertmanagerDisabledSkipsRequiredFields(t *testing.T) {
 	cfg.LLM.APIKeyEnv = "KEY"
 	cfg.Alertmanager.Enabled = false
 	// WebhookTokenEnv intentionally unset; keep something to serve.
-	cfg.MCP.Enabled = true
+	cfg.MCP.Enabled = boolPtr(true)
 	cfg.MCP.TokenEnv = "ALERTINT_MCP_TOKEN"
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("disabled alertmanager should not require webhook fields: %v", err)

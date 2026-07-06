@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **MCP server is now on by default when its token is set** — `mcp.enabled`
+  is presence-based like the Prometheus and Loki connectors: setting the
+  bearer-token env var (`ALERTINT_MCP_TOKEN` by default, now also the
+  `mcp.token_env` default) starts the MCP server inside `alertint serve`;
+  an explicit `enabled: false` forces it off, and an explicit `enabled: true`
+  still fails loud when the token is missing. Existing configs with an
+  explicit `enabled` value keep their behavior.
+
+### Added
+
+- **Config/docs drift gate** — `go test` now verifies that
+  `config.example.yaml` loads through the strict config parser, that the
+  defaults documented in the configuration reference match the code's
+  actual defaults, and that every key shipped in the example config is
+  documented.
+
 ## [0.6.1] - 2026-07-06
 
 ### Changed

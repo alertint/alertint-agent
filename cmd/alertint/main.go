@@ -424,7 +424,7 @@ func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor,
 // URL (e.g. http://host:9912/mcp) — no subprocess or shared file needed.
 // Returns (nil, nil, nil) when disabled.
 func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom *promclient.Client, logSrc logs.Source, sentryReader acutetriage.SentryReader, sentryParams acutetriage.SentryParams, logger *slog.Logger) (*http.Server, <-chan error, error) {
-	if !cfg.MCP.Enabled {
+	if !cfg.MCPEnabled() {
 		return nil, nil, nil
 	}
 	mcpToken, err := cfg.MCPToken()

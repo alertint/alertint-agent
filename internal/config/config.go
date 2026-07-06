@@ -169,8 +169,13 @@ func (s SentryIssuesConfig) MessageIncluded() bool {
 // MCPConfig configures the HTTP MCP server exposed by alertint serve.
 // When enabled, alertint serve starts a second HTTP listener (default :9912)
 // that MCP clients (Claude Code, Cursor, Windsurf) can reach over the network.
+//
+// Enabled is a *bool so presence-based enablement survives the YAML merge:
+// an omitted key (nil) means "on when the env var named by token_env holds a
+// token", an explicit value is honored either way. Resolve it via
+// Config.MCPEnabled, never directly.
 type MCPConfig struct {
-	Enabled  bool   `yaml:"enabled"`
+	Enabled  *bool  `yaml:"enabled,omitempty"`
 	Addr     string `yaml:"addr"`
 	TokenEnv string `yaml:"token_env"`
 }
@@ -300,6 +305,9 @@ func Defaults() Config {
 			// Binds all interfaces: the agent targets shared environments
 			// and MCP access is gated by the mandatory bearer token.
 			Addr: "0.0.0.0:9912",
+			// Named here (not just in the example config) so presence-based
+			// enablement has an env var to probe under zero config.
+			TokenEnv: "ALERTINT_MCP_TOKEN", // #nosec G101 -- env var NAME, not a credential
 		},
 		Prometheus: PrometheusConfig{
 			TimeoutSeconds:      10,
@@ -453,7 +461,7 @@ func (c *Config) validateServing() []string {
 			errs = append(errs, "changes: ingress: webhook_token_env is required when enabled (env var name holding the bearer token)")
 		}
 	}
-	if c.MCP.Enabled {
+	if c.MCPEnabled() {
 		if strings.TrimSpace(c.MCP.Addr) == "" {
 			errs = append(errs, "mcp.addr is required when mcp is enabled")
 		}
@@ -461,7 +469,7 @@ func (c *Config) validateServing() []string {
 			errs = append(errs, "mcp.token_env is required when mcp is enabled")
 		}
 	}
-	if !c.Alertmanager.Enabled && !c.Changes.Ingress.Enabled && !c.MCP.Enabled {
+	if !c.Alertmanager.Enabled && !c.Changes.Ingress.Enabled && !c.MCPEnabled() {
 		errs = append(errs, "nothing to serve: enable at least one of alertmanager, changes.ingress, or mcp")
 	}
 	return errs
@@ -678,6 +686,23 @@ func (c *Config) ChangesEnrichmentEnabled() bool {
 	return c.Changes.Ingress.Enabled || c.Sentry.Releases.Enabled
 }
 
+// MCPEnabled resolves the effective MCP-server on/off state: an explicit
+// enabled value wins; when the key is omitted, a token in the env var named
+// by token_env turns the server on (presence-based enablement). MCP's only
+// prerequisite is its bearer token and secrets live in env, so "the secret
+// exists" is its presence signal — the env-var counterpart of the base_url
+// probes in PrometheusEnabled/LogsEnabled. Like all secret resolution, the
+// result reflects the environment of the process asking.
+func (c *Config) MCPEnabled() bool {
+	if c.MCP.Enabled != nil {
+		return *c.MCP.Enabled
+	}
+	if name := strings.TrimSpace(c.MCP.TokenEnv); name != "" {
+		return strings.TrimSpace(os.Getenv(name)) != ""
+	}
+	return false
+}
+
 // AnySentryEnabled reports whether any Sentry feature is on (the release/deploy
 // Change source OR the issue-enrichment Error source). It gates the shared
 // connection: the client, token resolution, shared-connection validation, and
@@ -785,7 +810,7 @@ func (c *Config) LLMAPIKey() (string, error) {
 // MCPToken returns the bearer token for the MCP HTTP server, resolved from
 // the env var named by MCP.TokenEnv. Returns empty string when MCP is disabled.
 func (c *Config) MCPToken() (string, error) {
-	if !c.MCP.Enabled {
+	if !c.MCPEnabled() {
 		return "", nil
 	}
 	return requireEnv(c.MCP.TokenEnv, "mcp.token_env")

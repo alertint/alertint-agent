@@ -155,8 +155,9 @@ loop.
 
 ### 5. Connect an MCP client
 
-**AlertINT** runs a persistent MCP HTTP server on port 9912 (enable it with
-`mcp.enabled: true` and set the `ALERTINT_MCP_TOKEN` env var). Open your
+**AlertINT** runs a persistent MCP HTTP server on port 9912 (it turns on
+automatically when the `ALERTINT_MCP_TOKEN` env var is set — your `.env`
+from step 1 already covers this). Open your
 preferred MCP-capable tool — Claude Code, Cursor, or Windsurf — and point
 it at the endpoint; copy-paste configs are in
 [MCP clients](../integrations/mcp-clients.md). Verify connectivity with
