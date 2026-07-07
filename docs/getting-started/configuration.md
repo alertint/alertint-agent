@@ -43,6 +43,13 @@ ANTHROPIC_API_KEY=sk-ant-...                           # console.anthropic.com �
 # SENTRY_AUTH_TOKEN=...           # https://alertint.com/docs/integrations/sentry
 ```
 
+Of these, `ALERTINT_MCP_TOKEN` is the one to **save in your team's
+secret store or password manager** when you generate it: the webhook
+tokens are only ever presented machine-to-machine (Alertmanager, your
+CI), but the MCP token is pasted into each teammate's MCP client config
+— and needed again every time someone connects a new client, long after
+the shell or pod that generated it is gone.
+
 ## `receivers`
 
 Settings shared by **every** inbound webhook receiver. The listen address is a
@@ -161,7 +168,12 @@ tools. Enablement is presence-based: setting the bearer-token env var
 | `addr` | string | `"0.0.0.0:9912"` | TCP address the MCP server binds to. Endpoint is `http://host:9912/mcp` |
 | `token_env` | string | `ALERTINT_MCP_TOKEN` | Env var name holding the MCP bearer token |
 
-Clients authenticate with `Authorization: Bearer <token>`. See
+Clients authenticate with `Authorization: Bearer <token>`. Keep the
+token value retrievable (secret store or password manager) — every
+current and future MCP client needs it, so treat it as a shared team
+credential rather than a set-and-forget deployment secret. Lost it?
+Set a new value and restart the agent; existing clients must be
+updated to match. See
 [MCP clients](../integrations/mcp-clients.md) for copy-paste client
 configs.
 

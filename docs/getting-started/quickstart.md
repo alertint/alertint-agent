@@ -41,6 +41,11 @@ cp .env.example .env
 docker compose -f docker/docker-compose.yaml --env-file .env up
 ```
 
+Save the `ALERTINT_MCP_TOKEN` value somewhere your team can reach (a
+password manager or secret store): it's the one secret humans need
+again — every MCP client that connects (step 5) presents it, so it must
+outlive this `.env` file.
+
 (Developing against local changes? Add
 `-f docker/docker-compose.build.yaml` plus `--build` to compile the agent
 from the working tree instead.)
@@ -100,6 +105,14 @@ export ALERTINT_CHANGES_WEBHOOK_TOKEN="$(openssl rand -hex 32)"
 export ALERTINT_MCP_TOKEN="$(openssl rand -hex 32)"
 export ANTHROPIC_API_KEY="sk-ant-..."
 ```
+
+**Save the value of `ALERTINT_MCP_TOKEN`** — in a password manager or
+your team's secret store, not just this shell. The webhook tokens are
+exchanged machine-to-machine and never needed again, but the MCP token
+is what you and every teammate paste into an MCP client config (step 5),
+including long after this shell — or the pod that generated it — is
+gone. If it does get lost, set a new value and restart the agent, then
+update every connected client.
 
 Check the config before starting it anywhere (CI-friendly — filesystem
 paths meant for another machine are not probed):

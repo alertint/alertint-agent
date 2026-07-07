@@ -17,7 +17,14 @@ metrics in natural language.
 **Endpoint:** `http://<host>:9912/mcp`
 
 **Auth:** Bearer token — the value of `ALERTINT_MCP_TOKEN` (or whichever
-env var `mcp.token_env` names in your config).
+env var `mcp.token_env` names in your config). This is a shared team
+credential: every client below presents the same value, so store it
+where teammates can retrieve it (a password manager or secret store) —
+not only in the deployment that set it. In a Kubernetes setup, read it
+back from the Secret if it wasn't saved at creation time
+(`kubectl get secret <name> -o jsonpath='{.data.ALERTINT_MCP_TOKEN}' | base64 -d`).
+If the value is lost entirely, set a new one and restart the agent,
+then update every connected client.
 
 Copy-paste versions of the configs below also ship in the repo under
 `examples/mcp-clients/`.
