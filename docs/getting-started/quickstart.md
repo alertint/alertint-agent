@@ -106,6 +106,12 @@ export ALERTINT_MCP_TOKEN="$(openssl rand -hex 32)"
 export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
+The `openssl rand` commands are just one convenient generator — the
+agent never parses tokens, it only compares bytes, so any long random
+string of printable ASCII works. If your password manager or secrets
+tooling can generate the value, let it: then the copy problem below
+solves itself.
+
 **Save the value of `ALERTINT_MCP_TOKEN`** — in a password manager or
 your team's secret store, not just this shell. The webhook tokens are
 exchanged machine-to-machine and never needed again, but the MCP token

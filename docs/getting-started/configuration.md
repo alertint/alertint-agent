@@ -43,6 +43,10 @@ ANTHROPIC_API_KEY=sk-ant-...                           # console.anthropic.com â
 # SENTRY_AUTH_TOKEN=...           # https://alertint.com/docs/integrations/sentry
 ```
 
+`openssl rand -hex 32` is an example, not a requirement â€” tokens are
+opaque secrets compared byte-for-byte, so any long random string of
+printable ASCII works, whatever tool generates it.
+
 Of these, `ALERTINT_MCP_TOKEN` is the one to **save in your team's
 secret store or password manager** when you generate it: the webhook
 tokens are only ever presented machine-to-machine (Alertmanager, your

@@ -17,7 +17,10 @@ metrics in natural language.
 **Endpoint:** `http://<host>:9912/mcp`
 
 **Auth:** Bearer token — the value of `ALERTINT_MCP_TOKEN` (or whichever
-env var `mcp.token_env` names in your config). This is a shared team
+env var `mcp.token_env` names in your config). The token is an opaque
+secret — the agent compares it byte-for-byte, so any long random string
+of printable ASCII works; `openssl rand -hex 32` in the docs is just
+one way to generate one. This is a shared team
 credential: every client below presents the same value, so store it
 where teammates can retrieve it (a password manager or secret store) —
 not only in the deployment that set it. In a Kubernetes setup, read it
