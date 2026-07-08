@@ -77,6 +77,15 @@ prometheus:
 Enablement is presence-based: setting `base_url` turns the connector on
 automatically; an explicit `enabled: false` forces it off.
 
+The connector speaks the standard Prometheus HTTP query API
+(`/api/v1/query` and `/api/v1/query_range`), so anything implementing
+that API works as `base_url`. A **Thanos Querier** is a drop-in — same
+requests, same responses, same [authentication](#authentication) story
+(Thanos likewise has no built-in auth) — and extends query reach to the
+full retention window across all connected Prometheus instances. Note
+its default HTTP port is 10902, not 9090, and point `base_url` at the
+Querier component, not a Sidecar or Store Gateway.
+
 | Field | Description |
 |---|---|
 | `enabled` | Optional. Omitted = on when `base_url` is set; `false` forces off. |
