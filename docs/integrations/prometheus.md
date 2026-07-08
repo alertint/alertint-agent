@@ -77,13 +77,71 @@ prometheus:
 Enablement is presence-based: setting `base_url` turns the connector on
 automatically; an explicit `enabled: false` forces it off.
 
+The connector speaks the standard Prometheus HTTP query API
+(`/api/v1/query` and `/api/v1/query_range`), so anything implementing
+that API works as `base_url`. A **Thanos Querier** is a drop-in — same
+requests, same responses, same [authentication](#authentication) story
+(Thanos likewise has no built-in auth) — and extends query reach to the
+full retention window across all connected Prometheus instances. Note
+its default HTTP port is 10902, not 9090, and point `base_url` at the
+Querier component, not a Sidecar or Store Gateway.
+
 | Field | Description |
 |---|---|
 | `enabled` | Optional. Omitted = on when `base_url` is set; `false` forces off. |
 | `base_url` | Base URL of your Prometheus instance, e.g. `http://localhost:9090`. |
-| `bearer_token_env` | Optional. Name of the env var holding the Prometheus bearer token. |
+| `bearer_token_env` | Optional. Name of the env var holding the Prometheus bearer token — see [Authentication](#authentication) for when you need one and where it comes from. |
 | `timeout_seconds` | HTTP timeout for Prometheus queries. Default: `10`. |
 | `default_range_minutes` | Default lookback window for range queries. Default: `60`. |
+
+### Authentication
+
+Prometheus itself has **no bearer-token authentication** — there is
+nothing to obtain from Prometheus. A bearer token only exists when
+something *in front of* Prometheus checks it, so start by identifying
+your setup:
+
+```bash
+curl "http://<prometheus-host>:9090/api/v1/query?query=up"
+```
+
+**Answers without credentials — plain Prometheus.** The default for
+most self-hosted setups (including a vanilla kube-prometheus-stack
+inside the cluster network). Omit `bearer_token_env`; `base_url` is the
+whole configuration.
+
+**Rejected, and you run a reverse proxy** (nginx, Traefik,
+oauth2-proxy, …) **in front of Prometheus.** The token is one you make
+up, exactly like the agent's own webhook tokens:
+
+1. Generate a long random secret (any generator works).
+2. Configure the proxy to require it as `Authorization: Bearer <secret>`.
+3. Set `bearer_token_env: PROMETHEUS_BEARER_TOKEN` in the agent config
+   and export `PROMETHEUS_BEARER_TOKEN=<secret>` in the agent's
+   environment.
+
+**Rejected, and the cluster's monitoring stack is managed** (OpenShift
+cluster monitoring, or any Prometheus fronted by kube-rbac-proxy). The
+token is a ServiceAccount token issued by the cluster:
+
+1. Create a ServiceAccount and grant it metrics-read permission — on
+   OpenShift, the `cluster-monitoring-view` cluster role.
+2. Mint a token: `kubectl create token <sa> -n <namespace>
+   --duration=8760h`. The default duration is one hour — too short,
+   because the agent reads the token once at startup.
+3. Point `base_url` at the *authenticated* query endpoint — on
+   OpenShift that is Thanos Querier on port 9091, not Prometheus
+   directly — and wire the token through `bearer_token_env` as above.
+
+Whatever the source, verify the pair before starting the agent:
+
+```bash
+curl -H "Authorization: Bearer $PROMETHEUS_BEARER_TOKEN" \
+  "<base_url>/api/v1/query?query=up"
+```
+
+The token is read once at `serve` startup; after rotating it, update
+the env var and restart the agent.
 
 ### MCP tools
 
