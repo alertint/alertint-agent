@@ -1,0 +1,18 @@
+-- 0009_memory_recall.sql
+-- Incident-memory M2: the contradiction-decay counter.
+--
+-- memory_refute_marks tracks how many times the incident's recalled finding was
+-- refuted by a later re-judgment's memory_verdict since it was last judged or
+-- confirmed (R17). At two marks the finding is demoted from strong recall so a
+-- newer hypothesis displaces the stale one instead of the first mistake
+-- hardening. The counter lives on the incidents row (not derived from the
+-- append-only audit log) because the recall fetch needs it in the same read that
+-- assembles the memoryView, and audit rows are a digest trail, not a queryable
+-- state store.
+--
+-- Reset to 0 when a re-judgment replaces the finding (new hypothesis, clean
+-- slate) and when a memory_verdict confirms it. Incremented on a refute.
+--
+-- Purely additive (like 0003/0004/0007/0008): no drop-and-recreate. NOT NULL
+-- DEFAULT 0 so every existing incident starts at zero marks.
+ALTER TABLE incidents ADD COLUMN memory_refute_marks INTEGER NOT NULL DEFAULT 0;
