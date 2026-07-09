@@ -59,6 +59,10 @@ type Config struct {
 	// SentryLiveWindowMinutes is the default look-back for sentry_issues_list when
 	// start/end are omitted (config sentry.issues.live_window_minutes).
 	SentryLiveWindowMinutes int
+	// MemoryLookbackDays is the recall horizon (config memory.lookback_days) used
+	// to compute the incident-detail memory block from the same memoryView the
+	// triage saw, so the operator's view cannot drift from the prompt (R26).
+	MemoryLookbackDays int
 }
 
 // Server is the AlertINT MCP HTTP server. Construct with NewServer; start
@@ -392,6 +396,18 @@ func (s *Server) handleGetIncident(ctx context.Context, req mcplib.CallToolReque
 	}
 	stats := occ[id]
 
+	// Memory recall: the prior findings this incident's triage saw for its key,
+	// from the same memoryView, so what the operator inspects equals what the LLM
+	// saw (R26). Drill parity, lookback, and exclude-current live in that method.
+	lookback := s.cfg.MemoryLookbackDays
+	if lookback <= 0 {
+		lookback = 90
+	}
+	view, err := s.st.MemoryView(ctx, inc.GroupKey, inc.ID, drill, time.Now().UTC().AddDate(0, 0, -lookback))
+	if err != nil {
+		return errResult("failed to load memory: " + err.Error()), nil
+	}
+
 	payload := map[string]any{
 		"id":             inc.ID,
 		"group_key":      inc.GroupKey,
@@ -413,12 +429,55 @@ func (s *Server) handleGetIncident(ctx context.Context, req mcplib.CallToolReque
 	if stats.Count > 0 {
 		payload["last_occurrence_at"] = stats.LastSeen
 	}
+	if mem := memoryPayload(view, lookback); mem != nil {
+		payload["memory"] = mem
+	}
 
 	result, err := mcplib.NewToolResultJSON(payload)
 	if err != nil {
 		return errResult("failed to serialize incident: " + err.Error()), nil
 	}
 	return result, nil
+}
+
+// memoryPayload projects a store MemoryView onto the incident-detail memory
+// block: the allowlisted prior-finding refs plus the folded episode count and
+// cadence for the key. Returns nil when the key has no recalled history, so an
+// incident with no memory omits the block entirely (the LLM saw nothing either).
+func memoryPayload(view *store.MemoryView, lookbackDays int) map[string]any {
+	if view == nil || len(view.PriorFindings) == 0 {
+		return nil
+	}
+	priors := make([]map[string]any, 0, len(view.PriorFindings))
+	for _, pf := range view.PriorFindings {
+		row := map[string]any{
+			"incident_id":         pf.IncidentID,
+			"analyzed_at":         pf.AnalyzedAt,
+			"confidence":          pf.Confidence,
+			"root_cause":          pf.RootCause,
+			"contradiction_marks": pf.ContradictionMarks,
+			"episodes":            pf.Episodes,
+		}
+		if len(pf.CorroboratingIssueIDs) > 0 {
+			row["corroborating_issue_ids"] = pf.CorroboratingIssueIDs
+		}
+		priors = append(priors, row)
+	}
+	mem := map[string]any{
+		"group_key":        view.GroupKey,
+		"episodes":         view.Episodes,
+		"cadence_median_s": int(view.CadenceMedian.Seconds()),
+		"prior_findings":   priors,
+		"lookback_days":    lookbackDays,
+		"drill_filtered":   view.DrillFiltered,
+	}
+	if !view.FirstSeen.IsZero() {
+		mem["first_seen"] = view.FirstSeen
+	}
+	if !view.LastSeen.IsZero() {
+		mem["last_seen"] = view.LastSeen
+	}
+	return mem
 }
 
 func (s *Server) handleSearchAlerts(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {

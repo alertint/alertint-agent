@@ -41,6 +41,10 @@ func (f *fakeSentryReader) LatestEvent(_ context.Context, id string) (sentry.Iss
 	return f.events[id], nil
 }
 
+func (f *fakeSentryReader) GetIssue(_ context.Context, _ string) (sentry.IssueStatus, error) {
+	return sentry.IssueStatus{}, nil
+}
+
 func mkSentryIssue(t *testing.T, raw string) sentry.Issue {
 	t.Helper()
 	var i sentry.Issue

@@ -460,6 +460,7 @@ func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom 
 		Sentry:                  sentryReader,
 		SentryParams:            sentryParams,
 		SentryLiveWindowMinutes: cfg.Sentry.Issues.LiveWindowMinutes,
+		MemoryLookbackDays:      cfg.Memory.LookbackDays,
 	}, st, auditor)
 	srv := &http.Server{
 		Addr:    cfg.MCP.Addr,
