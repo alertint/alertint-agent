@@ -431,6 +431,10 @@ func (f *fakeSentryReader) LatestEvent(_ context.Context, issueID string) (sentr
 	return f.events[issueID], nil
 }
 
+func (f *fakeSentryReader) GetIssue(_ context.Context, _ string) (sentry.IssueStatus, error) {
+	return sentry.IssueStatus{}, nil
+}
+
 // recentIssue builds a JSON-decoded issue whose first/last-seen sit just inside
 // W relative to wall-clock now, so it is active+NEW regardless of when the test
 // runs (W is computed from the live incident time).

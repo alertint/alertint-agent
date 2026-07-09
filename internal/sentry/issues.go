@@ -286,6 +286,40 @@ func (c *Client) ListIssues(ctx context.Context, project, env string, start, end
 	return issues, nil
 }
 
+// IssueStatus is the safe-by-shape projection of a Sentry issue-detail response
+// for disposition-lite: only the current lifecycle status and its last-seen time,
+// re-derived as a NEW narrow struct rather than widening Issue (re-deriving-the-
+// privacy-boundary — a new read surface re-derives its own allowlist). Status is
+// Sentry's lifecycle enum: unresolved | resolved | ignored | muted.
+type IssueStatus struct {
+	Status   string `json:"status"`
+	LastSeen string `json:"lastSeen"`
+}
+
+// GetIssue fetches one issue's current status via /api/0/issues/{id}/, decoding
+// ONLY the allowlisted status fields (never exception text, culprit, or message).
+// Inherits doGET's auth/retry/backoff/body-cap. Used at triage for disposition-
+// lite: is a recalled finding's corroborating error now resolved (a regression)
+// or ignored (known-tolerated)? Logger-less (ADR-0004).
+func (c *Client) GetIssue(ctx context.Context, issueID string) (IssueStatus, error) {
+	path := "/api/0/issues/" + url.PathEscape(issueID) + "/"
+	resp, err := c.doGET(ctx, path, nil)
+	if err != nil {
+		return IssueStatus{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRespBody))
+	if err != nil {
+		return IssueStatus{}, fmt.Errorf("sentry: read issue: %w", err)
+	}
+	var st IssueStatus
+	if err := json.Unmarshal(body, &st); err != nil {
+		return IssueStatus{}, fmt.Errorf("sentry: decode issue: %w", err)
+	}
+	return st, nil
+}
+
 // LatestEvent fetches the latest event for one issue and decodes ONLY its
 // exception stacktrace entries (KTD8/KTD9) — the second call of the 1+K budget
 // (KTD5), made once per top-K issue to recover the deepest in-app file:line that

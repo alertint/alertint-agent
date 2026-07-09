@@ -17,7 +17,7 @@ func TestRenderChanges_WithChanges(t *testing.T) {
 			DeltaBeforeIncident: "Δ8m before incident start",
 		}},
 	}
-	out := UserPrompt(EvidencePack{}, "{}", nil, nil, e, nil)
+	out := UserPrompt(EvidencePack{}, "{}", nil, nil, e, nil, nil)
 	if !strings.Contains(out, "Recent changes") || !strings.Contains(out, "Δ8m before incident start") || !strings.Contains(out, "deploy") {
 		t.Fatalf("missing change block: %s", out)
 	}
@@ -29,14 +29,14 @@ func TestRenderChanges_WithChanges(t *testing.T) {
 
 func TestRenderChanges_NoteWhenEmpty(t *testing.T) {
 	e := &ChangeEnrichment{Note: "no changes in window"}
-	out := UserPrompt(EvidencePack{}, "{}", nil, nil, e, nil)
+	out := UserPrompt(EvidencePack{}, "{}", nil, nil, e, nil, nil)
 	if !strings.Contains(out, "Recent changes: no changes in window") {
 		t.Fatalf("missing note: %s", out)
 	}
 }
 
 func TestRenderChanges_OmittedWhenNil(t *testing.T) {
-	out := UserPrompt(EvidencePack{}, "{}", nil, nil, nil, nil)
+	out := UserPrompt(EvidencePack{}, "{}", nil, nil, nil, nil, nil)
 	if strings.Contains(out, "Recent changes") {
 		t.Fatalf("changes section must be omitted when nil: %s", out)
 	}

@@ -60,6 +60,14 @@ type Config struct {
 	// SentryParams carries the Error-source tunables (enabled, lookback,
 	// max_issues, fetch timeout, message toggle) from the sentry.issues section.
 	SentryParams SentryParams
+	// Memory is the read-only recall surface (the store) used to inject prior
+	// findings for a recurring key. nil = no recall (the consumer owns the field
+	// it reads; serve wiring assigns *store.Store). Pass a TRUE nil interface
+	// when unconfigured to avoid the typed-nil trap.
+	Memory MemoryReader
+	// MemoryParams carries the recall tunables (lookback) from the memory config
+	// section. Recall is deterministic and default-on; there is no enable knob.
+	MemoryParams MemoryParams
 }
 
 // Skill orchestrates the full acute-triage pipeline for a single ready
@@ -96,6 +104,11 @@ type llmResponse struct {
 	Severity            string        `json:"severity"`
 	Confidence          float64       `json:"confidence"`
 	Alerts              []alertOutput `json:"alerts"`
+	// MemoryVerdict is the model's confirms|refutes|silent judgment on the
+	// recalled root cause. Soft-required: it is NOT in RequiredKeys (a missing
+	// bookkeeping key must not abort a good triage), so absent/invalid is treated
+	// as silent post-parse. Present only when a memory section was rendered.
+	MemoryVerdict string `json:"memory_verdict,omitempty"`
 }
 
 type alertOutput struct {
@@ -219,7 +232,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	// Produce the analysis: from the matched rule (short-circuit) or from the LLM
 	// with the pack-selected system prompt, the span-anchored enrichments, and
 	// (on a re-judgment) the recurrence context prepended.
-	raw, metrics, enrichment, changes, sentry, err := s.analysis(ctx, inc, alerts, decision, pack, packJSON, p.spanStart, p.recurrence)
+	raw, metrics, enrichment, changes, sentry, memory, err := s.analysis(ctx, inc, alerts, decision, pack, packJSON, p.spanStart, p.recurrence)
 	if err != nil {
 		return err
 	}
@@ -247,6 +260,12 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		// at-rest envelope never holds a raw frame or untoggled PII.
 		sources["sentry"] = sentry
 	}
+	if memory != nil {
+		// Already the allowlisted recall (memoryView is the redaction boundary),
+		// so the at-rest envelope carries only distilled prior-finding refs, never
+		// whole findings or raw labels_json. Persist-as-rendered (ADR-0001).
+		sources["memory"] = memory
+	}
 	enrichmentJSON := marshalEnrichments(sources, s.logger, inc.ID)
 	if err := p.persist(ctx,
 		inc.ID, outputJSON,
@@ -272,6 +291,11 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 			)
 		}
 	}
+
+	// Memory bookkeeping (M2): maintain the contradiction-decay marks from the
+	// model's verdict, reset on a replacement, and audit the recall. Best-effort —
+	// a bookkeeping failure never fails a triage that already persisted its finding.
+	s.applyMemoryBookkeeping(ctx, inc, memory, resp.MemoryVerdict, p.rejudge)
 
 	// Check if all alerts are resolved to determine the finding's status label.
 	incidentStatus := "ongoing"
@@ -389,11 +413,11 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 // metric and log-enrichment snapshots (nil on the short-circuit path) so the
 // caller can persist exactly what the model saw and judge the evidence basis
 // for the deterministic confidence cap.
-func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store.Alert, decision rules.Decision, pack EvidencePack, packJSON []byte, spanStart time.Time, recurrence string) (json.RawMessage, []MetricSnapshot, *LogEnrichment, *ChangeEnrichment, *SentryEnrichment, error) {
+func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store.Alert, decision rules.Decision, pack EvidencePack, packJSON []byte, spanStart time.Time, recurrence string) (json.RawMessage, []MetricSnapshot, *LogEnrichment, *ChangeEnrichment, *SentryEnrichment, *MemoryEnrichment, error) {
 	if decision.ShortCircuit {
 		raw, err := shortCircuitResponse(decision, alerts)
 		if err != nil {
-			return nil, nil, nil, nil, nil, fmt.Errorf("acutetriage: short-circuit response: %w", err)
+			return nil, nil, nil, nil, nil, nil, fmt.Errorf("acutetriage: short-circuit response: %w", err)
 		}
 		if s.auditor != nil {
 			_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.short_circuited", map[string]any{
@@ -401,7 +425,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 				"rule_id":     decision.Rule.ID,
 			})
 		}
-		return raw, nil, nil, nil, nil, nil
+		return raw, nil, nil, nil, nil, nil, nil
 	}
 
 	// spanStart anchors the enrichment window on the collapse span: the original
@@ -419,7 +443,16 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 	// triage seam (KTD5/R3): sets sentry.Reconciliation in place on a conclusive
 	// look, inert (no-op) when sentry is nil or the query was inconclusive.
 	reconcile(sentry)
-	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment, changes, sentry)
+	// Recall prior findings for this key (rung-2 exact + rung-3a prefilter). A
+	// local store read, best-effort: a miss/err yields nil and the prompt is
+	// byte-identical to a non-memory triage. Never passed to hasLiveEvidence or
+	// the confidence cap — memory is context, never live evidence (R18).
+	memory := FetchMemory(ctx, s.cfg.Memory, s.cfg.MemoryParams, inc, isDrill(alerts), time.Now().UTC())
+	// Disposition-lite: when a recalled finding carries corroborating Sentry issue
+	// ids, one bounded status read renders the regression/known-tolerated
+	// transition. Best-effort, fail-safe — never blocks the recall.
+	applyDisposition(ctx, s.cfg.Sentry, s.cfg.SentryParams, memory)
+	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment, changes, sentry, memory)
 	// On a re-judgment, prepend the deterministic recurrence context so the model
 	// judges the recurrence with its history rather than as a first-time event.
 	if recurrence != "" {
@@ -434,7 +467,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 				"error":       err.Error(),
 			})
 		}
-		return nil, metrics, enrichment, changes, sentry, fmt.Errorf("acutetriage: llm: %w", err)
+		return nil, metrics, enrichment, changes, sentry, memory, fmt.Errorf("acutetriage: llm: %w", err)
 	}
 	// Action-trail success line, sibling to "llm failed" above: emitted by the
 	// incident-aware caller so it carries the incident ID and the usage the
@@ -446,7 +479,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		"tokens_out", comp.OutputTokens,
 		"incident", inc.ID,
 	)
-	return comp.Raw, metrics, enrichment, changes, sentry, nil
+	return comp.Raw, metrics, enrichment, changes, sentry, memory, nil
 }
 
 // systemPrompt picks the analysis prompt: the rule-selected template when

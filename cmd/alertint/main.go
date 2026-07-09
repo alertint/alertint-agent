@@ -277,6 +277,11 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 			},
 			Sentry:       sentryReader,
 			SentryParams: sentryParams,
+			// Memory recall reads the same store the skill persists to; the
+			// concrete *store.Store is always present, so no typed-nil guard is
+			// needed. Recall is deterministic and default-on.
+			Memory:       st,
+			MemoryParams: acutetriage.MemoryParams{LookbackDays: cfg.Memory.LookbackDays},
 		},
 		st, llmClient, auditor, notifier, logger,
 	)
@@ -455,6 +460,7 @@ func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom 
 		Sentry:                  sentryReader,
 		SentryParams:            sentryParams,
 		SentryLiveWindowMinutes: cfg.Sentry.Issues.LiveWindowMinutes,
+		MemoryLookbackDays:      cfg.Memory.LookbackDays,
 	}, st, auditor)
 	srv := &http.Server{
 		Addr:    cfg.MCP.Addr,

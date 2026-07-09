@@ -127,7 +127,7 @@ func BuildEvidencePack(inc store.Incident, alerts []store.Alert, windowSeconds i
 // LLM. metrics is optional — pass nil when Prometheus is not available. logs is
 // optional — pass nil when no log source is configured; when non-nil it always
 // renders a "Recent logs" section (lines, or a note explaining their absence).
-func UserPrompt(pack EvidencePack, packJSON string, metrics []MetricSnapshot, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment) string {
+func UserPrompt(pack EvidencePack, packJSON string, metrics []MetricSnapshot, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, memory *MemoryEnrichment) string {
 	var b strings.Builder
 	fmt.Fprintf(&b,
 		"Analyze the following correlated incident.\n\nEvidence:\n%s\n\nShared labels: %s\nAlert count: %d\nWindow: %ds",
@@ -145,7 +145,8 @@ func UserPrompt(pack EvidencePack, packJSON string, metrics []MetricSnapshot, lo
 	renderLogs(&b, logs)
 	renderChanges(&b, changes)
 	renderSentry(&b, sentry)
-	renderEvidenceBasis(&b, metrics, logs, changes, sentry)
+	renderMemory(&b, memory)
+	renderEvidenceBasis(&b, metrics, logs, changes, sentry, memory != nil)
 	b.WriteString("\n\nRespond with JSON only.")
 	return b.String()
 }
@@ -167,8 +168,11 @@ const MaxMetadataOnlyConfidence = 0.6
 // annotations-only analysis must hedge and lower confidence. When any live
 // evidence is present the per-section guidance already governs and this is silent.
 // A section that was attempted but empty (a note, zero lines) is NOT live
-// evidence — the note alone does not lift the annotations-only basis.
-func renderEvidenceBasis(b *strings.Builder, metrics []MetricSnapshot, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment) {
+// evidence — the note alone does not lift the annotations-only basis. Nor does a
+// recalled memory section: recalled priors are past hypotheses, so when
+// memoryPresent is true the directive says so explicitly — a recalled prior's
+// confidence must not be smuggled into today's evidence-free re-fire (R18/R20).
+func renderEvidenceBasis(b *strings.Builder, metrics []MetricSnapshot, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, memoryPresent bool) {
 	if hasLiveEvidence(metrics, logs, changes, sentry) {
 		return
 	}
@@ -179,6 +183,11 @@ func renderEvidenceBasis(b *strings.Builder, metrics []MetricSnapshot, logs *Log
 		"unverified hypothesis: prefer the \"correlated\" role over confident \"primary\"/" +
 		"\"downstream\" assignments unless the ordering is self-evident from the annotations, " +
 		fmt.Sprintf("and keep confidence at or below %.1f.", MaxMetadataOnlyConfidence))
+	if memoryPresent {
+		b.WriteString(" Any prior findings recalled in the Memory section are past " +
+			"hypotheses, NOT live evidence — they do not lift this annotations-only basis " +
+			"or raise the confidence ceiling.")
+	}
 }
 
 // hasLiveEvidence reports whether any enrichment source returned actual data
