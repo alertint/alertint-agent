@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/alertint/alertint-agent/internal/store"
 )
 
 // Finding carries the denormalized data needed by every notifier. It is
@@ -143,6 +145,38 @@ func (m *Multi) Notify(ctx context.Context, f Finding) error {
 		}
 	}
 
+	return first
+}
+
+// OccurrenceSink is an optional capability: a Notifier that also renders a
+// recurrence-collapse occurrence attach (deterministic, zero-LLM). Sinks that
+// don't implement it are simply skipped by Multi's fan-out.
+type OccurrenceSink interface {
+	OnOccurrenceAttached(ctx context.Context, inc store.Incident, stats store.OccurrenceStats, drill bool) error
+}
+
+// OnOccurrenceAttached fans an occurrence attach out to every contained notifier
+// that implements OccurrenceSink, and returns the first sink error (nil when all
+// succeeded or none handle occurrences). This makes *Multi satisfy the
+// correlator's occurrence-notifier interface.
+func (m *Multi) OnOccurrenceAttached(ctx context.Context, inc store.Incident, stats store.OccurrenceStats, drill bool) error {
+	var first error
+	for _, n := range m.notifiers {
+		s, ok := n.(OccurrenceSink)
+		if !ok {
+			continue
+		}
+		if err := s.OnOccurrenceAttached(ctx, inc, stats, drill); err != nil {
+			m.logger.Warn("notify occurrence sink failed",
+				slog.String("sink", n.Name()),
+				slog.String("incident", inc.ID),
+				slog.String("err", err.Error()),
+			)
+			if first == nil {
+				first = err
+			}
+		}
+	}
 	return first
 }
 

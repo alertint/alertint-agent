@@ -31,10 +31,12 @@ type fakeLLM struct {
 	response json.RawMessage
 	err      error
 	calls    int
+	lastUser string // captures the last user prompt for assertions
 }
 
-func (f *fakeLLM) Complete(_ context.Context, _, _ string, _ []string) (llm.Completion, error) {
+func (f *fakeLLM) Complete(_ context.Context, _, user string, _ []string) (llm.Completion, error) {
 	f.calls++
+	f.lastUser = user
 	return llm.Completion{
 		Raw:          f.response,
 		Model:        "fake-model",
@@ -716,5 +718,154 @@ func TestEvidencePackSharedLabels(t *testing.T) {
 	}
 	if _, ok := pack.SharedLabels["host"]; ok {
 		t.Error("host should NOT be a shared label (differs per alert)")
+	}
+}
+
+// --------------------------------------------------------------------------
+// Re-judgment (U4)
+// --------------------------------------------------------------------------
+
+func namedLLMResponse(name, issue string, alertIDs []string, confidence float64) json.RawMessage {
+	alerts := make([]map[string]string, len(alertIDs))
+	for i, id := range alertIDs {
+		alerts[i] = map[string]string{"alert_id": id, "role_in_incident": "primary"}
+	}
+	b, err := json.Marshal(map[string]any{
+		"analysis_name":        name,
+		"overall_issue":        issue,
+		"correlation_findings": []string{"recurrence"},
+		"severity":             "high",
+		"confidence":           confidence,
+		"alerts":               alerts,
+	})
+	if err != nil {
+		return json.RawMessage("{}")
+	}
+	return b
+}
+
+// analyzedFixture runs an initial triage so the incident is analyzed, then
+// returns the reloaded incident, the store, the skill, and its fake LLM.
+func analyzedFixture(t *testing.T) (context.Context, *store.Store, *acutetriage.Skill, *fakeLLM, store.Incident, store.Alert) {
+	t.Helper()
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	a1 := insertTestAlert(t, st, ctx, inc.ID, "fp-1", map[string]string{"alertname": "DiskFull", "host": "web1"})
+	fllm := &fakeLLM{response: validLLMResponse([]string{a1.ID})}
+	auditor := audit.New(st.DB())
+	skill := acutetriage.New(acutetriage.Config{}, st, fllm, auditor, nil, nil)
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("setup Run: %v", err)
+	}
+	analyzed, err := st.GetIncidentByID(ctx, inc.ID)
+	if err != nil || analyzed == nil {
+		t.Fatalf("reload analyzed incident: %v", err)
+	}
+	if analyzed.Status != "analyzed" {
+		t.Fatalf("setup: status %q, want analyzed", analyzed.Status)
+	}
+	return ctx, st, skill, fllm, *analyzed, a1
+}
+
+func addOccurrence(t *testing.T, st *store.Store, ctx context.Context, incidentID string, at time.Time) {
+	t.Helper()
+	_, err := st.InsertOccurrence(ctx, store.Occurrence{
+		IncidentID:   incidentID,
+		OccurredAt:   at,
+		LastSeen:     at,
+		Fingerprints: []string{"fp-" + at.Format("150405.000")},
+		Payload:      []store.OccurrenceMember{{Fingerprint: "fp-x", Annotations: map[string]string{"summary": "disk 95%"}}},
+	})
+	if err != nil {
+		t.Fatalf("insert occurrence: %v", err)
+	}
+}
+
+func TestRejudgeReplacesFindingInPlace(t *testing.T) {
+	ctx, st, skill, fllm, analyzed, a1 := analyzedFixture(t)
+	firstJudged := analyzed.LastJudgedAt
+	if firstJudged == nil {
+		t.Fatal("setup: last_judged_at not set by initial triage")
+	}
+	addOccurrence(t, st, ctx, analyzed.ID, time.Now().UTC())
+
+	fllm.response = namedLLMResponse("Recurring disk fill", "same condition, seen repeatedly", []string{a1.ID}, 0.9)
+	time.Sleep(2 * time.Millisecond) // let last_judged_at advance measurably
+	if err := skill.Rejudge(ctx, analyzed, "ceiling"); err != nil {
+		t.Fatalf("Rejudge: %v", err)
+	}
+
+	after, _ := st.GetIncidentByID(ctx, analyzed.ID)
+	if after.Status != "analyzed" {
+		t.Errorf("status = %q, want analyzed (replace keeps status)", after.Status)
+	}
+	if after.Summary != "Recurring disk fill" {
+		t.Errorf("summary = %q, want the replaced finding", after.Summary)
+	}
+	if after.LastJudgedAt == nil || !after.LastJudgedAt.After(*firstJudged) {
+		t.Errorf("last_judged_at not advanced: before=%v after=%v", firstJudged, after.LastJudgedAt)
+	}
+}
+
+func TestRejudgeFailedLLMLeavesPriorFinding(t *testing.T) {
+	ctx, st, skill, fllm, analyzed, _ := analyzedFixture(t)
+	before, _ := st.GetIncidentByID(ctx, analyzed.ID)
+	addOccurrence(t, st, ctx, analyzed.ID, time.Now().UTC())
+
+	fllm.err = errors.New("model timeout")
+	if err := skill.Rejudge(ctx, analyzed, "ceiling"); err == nil {
+		t.Fatal("Rejudge with a failing LLM returned nil, want an error")
+	}
+	after, _ := st.GetIncidentByID(ctx, analyzed.ID)
+	if after.Summary != before.Summary {
+		t.Errorf("summary changed to %q on a failed re-judgment, want prior %q", after.Summary, before.Summary)
+	}
+	if after.Status != "analyzed" {
+		t.Errorf("status = %q, want analyzed unchanged", after.Status)
+	}
+	if before.LastJudgedAt == nil || after.LastJudgedAt == nil || !after.LastJudgedAt.Equal(*before.LastJudgedAt) {
+		t.Errorf("last_judged_at moved on a failed re-judgment: before=%v after=%v", before.LastJudgedAt, after.LastJudgedAt)
+	}
+}
+
+func TestRejudgeResolvedIncidentKeepsStatus(t *testing.T) {
+	ctx, st, skill, fllm, analyzed, a1 := analyzedFixture(t)
+	if err := st.MarkIncidentResolved(ctx, analyzed.ID); err != nil {
+		t.Fatalf("mark resolved: %v", err)
+	}
+	resolved, _ := st.GetIncidentByID(ctx, analyzed.ID)
+	addOccurrence(t, st, ctx, analyzed.ID, time.Now().UTC())
+
+	fllm.response = namedLLMResponse("Regression after recovery", "condition returned", []string{a1.ID}, 0.8)
+	if err := skill.Rejudge(ctx, *resolved, "severity"); err != nil {
+		t.Fatalf("Rejudge: %v", err)
+	}
+	after, _ := st.GetIncidentByID(ctx, analyzed.ID)
+	if after.Status != "resolved" {
+		t.Errorf("status = %q, want resolved (a re-judgment never reverts status)", after.Status)
+	}
+	if after.Summary != "Regression after recovery" {
+		t.Errorf("summary = %q, want the replaced finding", after.Summary)
+	}
+}
+
+func TestRejudgePromptCarriesRecurrenceContext(t *testing.T) {
+	ctx, st, skill, fllm, analyzed, a1 := analyzedFixture(t)
+	// Three occurrences 5 minutes apart -> episodes ×4, cadence ~5m.
+	base := time.Now().UTC().Add(-10 * time.Minute)
+	addOccurrence(t, st, ctx, analyzed.ID, base)
+	addOccurrence(t, st, ctx, analyzed.ID, base.Add(5*time.Minute))
+	addOccurrence(t, st, ctx, analyzed.ID, base.Add(10*time.Minute))
+
+	fllm.response = namedLLMResponse("Recurring", "recurs", []string{a1.ID}, 0.7)
+	if err := skill.Rejudge(ctx, analyzed, "cadence"); err != nil {
+		t.Fatalf("Rejudge: %v", err)
+	}
+	prompt := fllm.lastUser
+	for _, want := range []string{"Recurrence context", "trigger: cadence", "Seen ×4", "roughly every", "Recent occurrences"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("re-judgment prompt missing %q\n---\n%s", want, prompt)
+		}
 	}
 }

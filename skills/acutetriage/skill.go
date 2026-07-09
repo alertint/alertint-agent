@@ -103,13 +103,27 @@ type alertOutput struct {
 	RoleInIncident string `json:"role_in_incident"`
 }
 
-// Run executes the full triage pipeline for the given incident.
+// persistFunc writes a finding to an incident. SaveIncidentOutput (initial
+// triage) and ReplaceIncidentOutput (re-judgment) share this signature, which
+// is what lets Run and Rejudge reuse one pipeline.
+type persistFunc func(ctx context.Context, incidentID, outputJSON, summary, rootCause string, confidence float64, enrichmentJSON string) error
+
+// pipelineParams carry what differs between an initial triage and a
+// re-judgment: the evidence-span anchor, the persist target, and (for a
+// re-judgment) the recurrence prompt context and its trigger.
+type pipelineParams struct {
+	rejudge    bool
+	trigger    string
+	spanStart  time.Time
+	recurrence string
+	persist    persistFunc
+}
+
+// Run executes the full triage pipeline for a newly-ready incident.
 // It is safe to call from the IncidentSink goroutine.
 func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
-	start := time.Now()
 	s.logger.Info("triage started", "incident", inc.ID, "alerts", inc.AlertCount)
 
-	// 1. Load member alerts.
 	alerts, err := s.st.GetIncidentAlerts(ctx, inc.ID)
 	if err != nil {
 		return fmt.Errorf("acutetriage: load alerts: %w", err)
@@ -119,7 +133,8 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 		return nil
 	}
 
-	// Check minimum alert threshold.
+	// Minimum-alert threshold gates the initial triage only (a re-judgment
+	// re-analyzes an incident that already cleared it).
 	minAlerts := s.cfg.MinAlerts
 	if minAlerts <= 0 {
 		minAlerts = 1 // Default: a lone first alert still produces a finding
@@ -134,8 +149,49 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 		return nil
 	}
 
-	// 2. Evaluate the rule engine: it may pick a specialized analysis
-	// template or short-circuit the LLM entirely for known issues.
+	return s.pipeline(ctx, inc, alerts, pipelineParams{
+		spanStart: inc.FirstAlertAt,
+		persist:   s.st.SaveIncidentOutput,
+	})
+}
+
+// Rejudge re-runs the full triage pipeline for an already-judged incident and
+// replaces its finding in place (via ReplaceIncidentOutput), keeping the status
+// untouched. It carries a recurrence context (occurrence count, cadence, span,
+// annotation trajectory) into the prompt so the model judges the recurrence with
+// its history, and anchors the evidence span on the first occurrence. A failure
+// before persist leaves the prior finding standing and last_judged_at unreset —
+// the correlator's next attach re-evaluates the trigger (bounded retry).
+func (s *Skill) Rejudge(ctx context.Context, inc store.Incident, trigger string) error {
+	s.logger.Info("re-judgment started", "incident", inc.ID, "trigger", trigger)
+
+	alerts, err := s.st.GetIncidentAlerts(ctx, inc.ID)
+	if err != nil {
+		return fmt.Errorf("acutetriage: rejudge load alerts: %w", err)
+	}
+	if len(alerts) == 0 {
+		s.logger.Warn("acutetriage: re-judgment incident has no member alerts; skipping", "incident_id", inc.ID)
+		return nil
+	}
+
+	spanStart, recurrence := s.buildRecurrenceContext(ctx, inc, trigger)
+	return s.pipeline(ctx, inc, alerts, pipelineParams{
+		rejudge:    true,
+		trigger:    trigger,
+		spanStart:  spanStart,
+		recurrence: recurrence,
+		persist:    s.st.ReplaceIncidentOutput,
+	})
+}
+
+// pipeline is the shared triage core: rules → evidence → LLM → persist → notify
+// → audit. p selects the initial-triage vs re-judgment differences.
+func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store.Alert, p pipelineParams) error {
+	start := time.Now()
+
+	// Evaluate the rule engine: it may pick a specialized analysis template or
+	// short-circuit the LLM entirely for known issues (correct and consistent on
+	// a re-judgment too — a known-issue rule replacing an LLM finding).
 	decision := s.cfg.Rules.EvaluateIncident(alerts)
 	if decision.Rule != nil {
 		s.logger.Info("rule matched",
@@ -146,30 +202,28 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 		)
 	}
 
-	// 3. Build evidence pack and enrich with live Prometheus metrics.
 	pack := BuildEvidencePack(inc, alerts, s.cfg.WindowSeconds)
 	packJSON, err := json.Marshal(pack)
 	if err != nil {
 		return fmt.Errorf("acutetriage: marshal evidence pack: %w", err)
 	}
 
-	// 4. Audit: incident analysis started.
 	if s.auditor != nil {
-		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.analysis_started", map[string]any{
-			"incident_id": inc.ID,
-			"alert_count": len(alerts),
-		})
+		started := map[string]any{"incident_id": inc.ID, "alert_count": len(alerts)}
+		if p.rejudge {
+			started["trigger"] = p.trigger
+		}
+		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.analysis_started", started)
 	}
 
-	// 5. Produce the analysis: from the matched rule (short-circuit) or
-	// from the LLM with the pack-selected system prompt. enrichment is the
-	// log snapshot the LLM saw (nil on the short-circuit path).
-	raw, metrics, enrichment, changes, sentry, err := s.analysis(ctx, inc, alerts, decision, pack, packJSON)
+	// Produce the analysis: from the matched rule (short-circuit) or from the LLM
+	// with the pack-selected system prompt, the span-anchored enrichments, and
+	// (on a re-judgment) the recurrence context prepended.
+	raw, metrics, enrichment, changes, sentry, err := s.analysis(ctx, inc, alerts, decision, pack, packJSON, p.spanStart, p.recurrence)
 	if err != nil {
 		return err
 	}
 
-	// 6. Parse response.
 	var resp llmResponse
 	if err := json.Unmarshal(raw, &resp); err != nil {
 		return fmt.Errorf("acutetriage: parse llm response: %w", err)
@@ -177,8 +231,8 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 	clampConfidence(&resp.Confidence)
 	s.applyEvidenceCap(&resp, decision, metrics, enrichment, changes, sentry, inc.ID)
 
-	// 6. Persist output, including the log-enrichment snapshot so the evidence
-	// pack can replay exactly what the model saw (empty on the short-circuit /
+	// Persist output, including the log-enrichment snapshot so the evidence pack
+	// can replay exactly what the model saw (empty on the short-circuit /
 	// logs-disabled path → stored NULL).
 	outputJSON := string(raw)
 	sources := map[string]any{}
@@ -194,19 +248,20 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 		sources["sentry"] = sentry
 	}
 	enrichmentJSON := marshalEnrichments(sources, s.logger, inc.ID)
-	if err := s.st.SaveIncidentOutput(ctx,
+	if err := p.persist(ctx,
 		inc.ID, outputJSON,
 		resp.AnalysisName, resp.OverallIssue,
 		resp.Confidence, enrichmentJSON,
 	); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			s.logger.Warn("acutetriage: incident no longer in ready/processing state", "incident_id", inc.ID)
+			s.logger.Warn("acutetriage: incident not in a persistable state; finding dropped",
+				"incident_id", inc.ID, "rejudge", p.rejudge)
 			return nil
 		}
 		return fmt.Errorf("acutetriage: save output: %w", err)
 	}
 
-	// 7. Update per-alert roles.
+	// Update per-alert roles.
 	for _, ao := range resp.Alerts {
 		if err := s.st.SetAlertRole(ctx, inc.ID, ao.AlertID, ao.RoleInIncident); err != nil {
 			s.logger.Warn("acutetriage: set alert role failed",
@@ -218,7 +273,7 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 		}
 	}
 
-	// 8. Check if all alerts are resolved to determine incident status.
+	// Check if all alerts are resolved to determine the finding's status label.
 	incidentStatus := "ongoing"
 	if incAlerts, err := s.st.GetIncidentAlerts(ctx, inc.ID); err == nil {
 		allResolved := len(incAlerts) > 0
@@ -234,7 +289,8 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 		}
 	}
 
-	// 9. Notify.
+	// Notify. On a re-judgment the finding flows the same gate — the Slack
+	// notifier threads the reply on the existing card, or posts a new one if none.
 	if s.notifier != nil {
 		f := notify.Finding{
 			IncidentID:          inc.ID,
@@ -258,18 +314,22 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 		_ = s.notifier.Notify(ctx, f)
 	}
 
-	// 9. Audit: incident analyzed.
+	// Audit: incident analyzed (carrying the trigger on a re-judgment).
 	if s.auditor != nil {
-		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.analyzed", map[string]any{
+		analyzed := map[string]any{
 			"incident_id":   inc.ID,
 			"analysis_name": resp.AnalysisName,
 			"confidence":    resp.Confidence,
-		})
+		}
+		if p.rejudge {
+			analyzed["trigger"] = p.trigger
+		}
+		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.analyzed", analyzed)
 	}
 
-	// 10. Audit: enrichment digest (when logs were attempted). A digest only —
-	// source, query, and line count — never the log text, so the hash-chained
-	// payload stays small.
+	// Enrichment digest (when logs were attempted). A digest only — source,
+	// query, and line count — never the log text, so the hash-chained payload
+	// stays small.
 	if s.auditor != nil && enrichment != nil {
 		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.enriched", map[string]any{
 			"incident_id": inc.ID,
@@ -317,6 +377,7 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 		"severity", resp.Severity,
 		"alerts", len(alerts),
 		"rule", ruleID,
+		"rejudge", p.rejudge,
 		"dur", time.Since(start),
 	)
 	return nil
@@ -328,7 +389,7 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 // metric and log-enrichment snapshots (nil on the short-circuit path) so the
 // caller can persist exactly what the model saw and judge the evidence basis
 // for the deterministic confidence cap.
-func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store.Alert, decision rules.Decision, pack EvidencePack, packJSON []byte) (json.RawMessage, []MetricSnapshot, *LogEnrichment, *ChangeEnrichment, *SentryEnrichment, error) {
+func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store.Alert, decision rules.Decision, pack EvidencePack, packJSON []byte, spanStart time.Time, recurrence string) (json.RawMessage, []MetricSnapshot, *LogEnrichment, *ChangeEnrichment, *SentryEnrichment, error) {
 	if decision.ShortCircuit {
 		raw, err := shortCircuitResponse(decision, alerts)
 		if err != nil {
@@ -343,19 +404,27 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		return raw, nil, nil, nil, nil, nil
 	}
 
-	metrics := FetchMetrics(ctx, s.cfg.Prometheus, alerts, inc.FirstAlertAt)
+	// spanStart anchors the enrichment window on the collapse span: the original
+	// first_alert_at for an initial triage, the first occurrence for a
+	// re-judgment (so metrics/logs cover the recurrence, not a stale window).
+	metrics := FetchMetrics(ctx, s.cfg.Prometheus, alerts, spanStart)
 	// Best-effort log enrichment: never blocks or fails triage. end=now so a
 	// still-firing incident captures the freshest lines around analysis time.
-	enrichment := FetchLogs(ctx, s.cfg.LogSource, s.cfg.LogParams, alerts, inc.FirstAlertAt, time.Now().UTC(), inc.ID, s.logger)
+	enrichment := FetchLogs(ctx, s.cfg.LogSource, s.cfg.LogParams, alerts, spanStart, time.Now().UTC(), inc.ID, s.logger)
 	// Change enrichment reads local SQLite — reliable mid-incident, no timeout.
-	changes := FetchChanges(ctx, s.st, s.cfg.ChangeParams, alerts, inc.FirstAlertAt, time.Now().UTC(), inc.ID, s.logger)
+	changes := FetchChanges(ctx, s.st, s.cfg.ChangeParams, alerts, spanStart, time.Now().UTC(), inc.ID, s.logger)
 	// Sentry Error source: a bounded 1+K query-at-triage, best-effort, never blocks.
-	sentry := FetchSentry(ctx, s.cfg.Sentry, s.cfg.SentryParams, alerts, inc.FirstAlertAt, time.Now().UTC(), inc.ID, s.logger)
+	sentry := FetchSentry(ctx, s.cfg.Sentry, s.cfg.SentryParams, alerts, spanStart, time.Now().UTC(), inc.ID, s.logger)
 	// Zero-LLM cross-source verdict, computed downstream of the rule engine at the
 	// triage seam (KTD5/R3): sets sentry.Reconciliation in place on a conclusive
 	// look, inert (no-op) when sentry is nil or the query was inconclusive.
 	reconcile(sentry)
 	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment, changes, sentry)
+	// On a re-judgment, prepend the deterministic recurrence context so the model
+	// judges the recurrence with its history rather than as a first-time event.
+	if recurrence != "" {
+		userPrompt = recurrence + "\n\n" + userPrompt
+	}
 	comp, err := s.llm.Complete(ctx, s.systemPrompt(decision, len(alerts)), userPrompt, RequiredKeys)
 	if err != nil {
 		s.logger.Error("llm failed", "incident", inc.ID, "err", err)

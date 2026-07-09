@@ -748,7 +748,9 @@ func TestDrill_PollsUntilAnalyzed(t *testing.T) {
 
 	groupKey := "cluster=drill-cluster-t3st01,namespace=drill-shop,service=drill-checkout"
 	pending := []map[string]any{{"id": "inc-7", "group_key": groupKey, "status": "ready"}}
-	f.listRowsSeq = [][]map[string]any{pending, pending} // first two polls
+	// [0] answers the pre-fire rerun scan (no drill candidate → fresh salt); the
+	// next two answer the finding polls.
+	f.listRowsSeq = [][]map[string]any{{}, pending, pending}
 	f.listRows = []map[string]any{{"id": "inc-7", "group_key": groupKey, "status": "analyzed"}}
 	f.incident = analyzedIncident("inc-7")
 
@@ -766,6 +768,41 @@ func TestDrill_PollsUntilAnalyzed(t *testing.T) {
 	}
 	if polls != 2 {
 		t.Errorf("poll sleeps = %d, want 2 (loop must stop as soon as the state is analyzed)", polls)
+	}
+}
+
+// TestDrill_RerunCollapses: a second drill inside the collapse window reuses the
+// prior incident's group salt, so the fire lands as an occurrence — no second
+// triage, no window wait — and the payoff reports "recurred ×2".
+func TestDrill_RerunCollapses(t *testing.T) {
+	f := newFakeInstance(t)
+	cfg := drillTestConfig(t)
+	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
+
+	groupKey := "cluster=drill-cluster-priorsalt,namespace=drill-shop,service=drill-checkout"
+	// A prior drill of this scenario, judged, active 5m ago (inside the 30m window).
+	f.listRows = []map[string]any{{
+		"id": "inc-9", "group_key": groupKey, "status": "analyzed",
+		"drill": true, "last_alert_at": "2026-07-03T11:55:00Z",
+	}}
+	// After the re-fire the incident carries one collapsed occurrence.
+	f.incident = map[string]any{"id": "inc-9", "status": "analyzed", "occurrences": 1}
+
+	if err := d.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	s := out.String()
+	if !strings.Contains(s, "reusing its group key") {
+		t.Errorf("expected a rerun-detected note:\n%s", s)
+	}
+	if !strings.Contains(s, "recurred ×2") {
+		t.Errorf("expected the collapsed payoff recurred ×2:\n%s", s)
+	}
+	if strings.Contains(s, "waiting ~") {
+		t.Errorf("a rerun must skip the correlation-window wait:\n%s", s)
+	}
+	if len(f.getIncidentID) == 0 || f.getIncidentID[len(f.getIncidentID)-1] != "inc-9" {
+		t.Errorf("expected a get_incident poll on inc-9, got %v", f.getIncidentID)
 	}
 }
 

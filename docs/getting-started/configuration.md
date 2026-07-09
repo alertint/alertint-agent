@@ -133,6 +133,29 @@ incident may be analyzed with only the first alert or two of a burst
 grouped in; a higher value waits to gather more related alerts — more
 context for the analysis — at the cost of a slower first finding.
 
+## `memory`
+
+Incident memory stops an unchanged, already-analyzed condition from being
+re-triaged as brand new every time it re-fires. When an alert whose group key
+matches an already-analyzed incident fires again inside the collapse horizon,
+it attaches as a lightweight occurrence — the incident's Slack card edits to
+`recurred ×N` — instead of minting a new incident and spending another LLM
+call. This is deterministic, free, and always on; there is no enable switch,
+only the knobs below.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `attach_window_minutes` | int | `30` | Clock A. A re-fire within this many minutes of the last occurrence attaches instead of re-triaging. A longer window collapses more aggressively. |
+| `judgment_ceiling_hours` | int | `4` | Clock B. A steady flapper that never pauses would slide Clock A forever; once this long has passed since the last analysis, the next re-fire forces a fresh re-judgment (with the accumulated history) even while still collapsing. |
+| `occurrence_cap` | int | `100` | Backstop trigger: force a re-judgment after this many occurrences have attached since the last analysis, regardless of the clocks. |
+| `lookback_days` | int | `90` | How long occurrence rows are retained and how far back recurrence counts and cadence are computed. Older occurrences are pruned on the correlator's normal flush cycle. |
+
+The recurrence key is the verbatim group key with no normalization. If you add
+a volatile per-instance label (such as `pod`, `instance`, or `job_name`) to
+`correlator.group_labels`, the key rarely repeats, so collapse and recall
+seldom match — `alertint validate` and startup emit a warning when they see
+one.
+
 ## `notify`
 
 | Field | Type | Default | Description |

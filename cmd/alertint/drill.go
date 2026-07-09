@@ -184,7 +184,24 @@ func (d *drillCmd) run(ctx context.Context) error {
 	// Preflights: notify-and-continue, never hard-fail.
 	mcpAvailable, capHint := d.printPreflights(sc, mcpErr)
 
-	run, err := materializeScenario(sc, d.cfg.Correlator.GroupLabels, d.newRunID(), d.now())
+	// Recurrence-collapse rerun: if a prior drill of this scenario is still
+	// inside the collapse window, reuse its group salt so this fire lands on it
+	// as an occurrence. It fires with FRESH fingerprints so its alerts are a new
+	// firing episode (a distinct-fingerprint attach), not an unchanged repeat.
+	groupSalt := d.newRunID()
+	fpSeed := groupSalt
+	rerunID := ""
+	if mcpAvailable {
+		if cands, cerr := d.fetchDrillCandidates(ctx, mcpEndpoint, mcpToken); cerr == nil {
+			w := time.Duration(d.cfg.Memory.AttachWindowMinutes) * time.Minute
+			if id, salt, ok := drillRerunSalt(cands, d.cfg.Correlator.GroupLabels, d.now(), w); ok {
+				groupSalt, fpSeed, rerunID = salt, d.newRunID(), id
+				d.printf("rerun: a prior drill (%s) is inside the %dm collapse window — reusing its group key to exercise recurrence collapse", id, d.cfg.Memory.AttachWindowMinutes)
+			}
+		}
+	}
+
+	run, err := materializeScenario(sc, d.cfg.Correlator.GroupLabels, groupSalt, fpSeed, d.now())
 	if err != nil {
 		return err
 	}
@@ -194,7 +211,20 @@ func (d *drillCmd) run(ctx context.Context) error {
 		return err
 	}
 
-	// Wait out the correlation window — a server-side property of the
+	// Rerun payoff: the fire attaches as an occurrence on receipt — no triage,
+	// no window wait. Poll the matched incident's occurrence count instead.
+	if rerunID != "" {
+		if mcpAvailable {
+			if err := d.pollOccurrenceRerun(ctx, mcpEndpoint, mcpToken, rerunID); err != nil {
+				return err
+			}
+		} else {
+			d.printf("fired the rerun; mcp is not usable from here — check the DRILL card edit to \"recurred ×N\".")
+		}
+		return d.maybeResolve(ctx, run, recvBase, webhookToken)
+	}
+
+	// First run: wait out the correlation window — a server-side property of the
 	// target's correlator (tune correlator.window_seconds to shorten it) —
 	// then poll for the finding during the bounded triage grace so the run
 	// ends as soon as triage does.
@@ -372,6 +402,76 @@ func (d *drillCmd) printDrift(groupKey string) {
 // limit 100: newest-first, and a busy instance must not page the drill out.
 // When the exact key is absent (local config drifted from the target's), it
 // falls back to the newest drill-flagged incident and reports drifted=true.
+// fetchDrillCandidates lists the target's incidents over MCP and distills them
+// to the fields the rerun-salt matcher needs. Best-effort: any error means "no
+// candidates" (mint a fresh salt), never a failed drill.
+func (d *drillCmd) fetchDrillCandidates(ctx context.Context, mcpEndpoint, mcpToken string) ([]drillCandidate, error) {
+	client := newMCPOneShotClient(mcpEndpoint, mcpToken, d.http)
+	if err := client.initialize(ctx); err != nil {
+		return nil, err
+	}
+	raw, err := client.callTool(ctx, "alertint_list_incidents", map[string]any{"limit": 100})
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		Incidents []struct {
+			ID          string    `json:"id"`
+			GroupKey    string    `json:"group_key"`
+			Status      string    `json:"status"`
+			Drill       bool      `json:"drill"`
+			LastAlertAt time.Time `json:"last_alert_at"`
+			Occurrences int       `json:"occurrences"`
+		} `json:"incidents"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, fmt.Errorf("drill: decode incident list: %w", err)
+	}
+	out := make([]drillCandidate, 0, len(payload.Incidents))
+	for _, inc := range payload.Incidents {
+		out = append(out, drillCandidate{
+			ID: inc.ID, GroupKey: inc.GroupKey, Status: inc.Status,
+			Drill: inc.Drill, LastAlertAt: inc.LastAlertAt, Occurrences: inc.Occurrences,
+		})
+	}
+	return out, nil
+}
+
+// pollOccurrenceRerun polls the matched incident until its occurrence count
+// registers the collapsed re-fire, then prints the "recurred ×N" payoff. It
+// exits as soon as the count increments; a timeout points at the card edit.
+func (d *drillCmd) pollOccurrenceRerun(ctx context.Context, mcpEndpoint, mcpToken, incidentID string) error {
+	client := newMCPOneShotClient(mcpEndpoint, mcpToken, d.http)
+	if err := client.initialize(ctx); err != nil {
+		d.printf("warning: could not reach MCP to confirm the collapse: %v", err)
+		return nil
+	}
+	d.printf("rerun fired; polling incident %s for the collapsed occurrence (up to %ds)…", incidentID, int(d.grace.Seconds()))
+	polls := int(d.grace / drillPollInterval)
+	if polls < 1 {
+		polls = 1
+	}
+	for i := 0; i < polls; i++ {
+		raw, err := client.callTool(ctx, "alertint_get_incident", map[string]any{"incident_id": incidentID})
+		if err == nil {
+			var p struct {
+				Occurrences int `json:"occurrences"`
+			}
+			if json.Unmarshal(raw, &p) == nil && p.Occurrences > 0 {
+				d.printf("collapsed: incident %s recurred ×%d — no second triage, the existing card edits in place", incidentID, p.Occurrences+1)
+				return nil
+			}
+		}
+		if i < polls-1 {
+			if err := d.sleep(ctx, drillPollInterval); err != nil {
+				return err
+			}
+		}
+	}
+	d.printf("the occurrence has not registered yet; check the DRILL card edit to \"recurred ×N\", or re-run with --result %s", incidentID)
+	return nil
+}
+
 func (d *drillCmd) findIncident(ctx context.Context, client *mcpOneShotClient, groupKey string) (id, state string, drifted bool, err error) {
 	raw, err := client.callTool(ctx, "alertint_list_incidents", map[string]any{"limit": 100})
 	if err != nil {

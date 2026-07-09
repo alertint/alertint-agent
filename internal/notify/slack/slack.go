@@ -13,12 +13,14 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	slacklib "github.com/slack-go/slack"
 
 	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/notify"
+	"github.com/alertint/alertint-agent/internal/severity"
 )
 
 // ThreadStore persists Slack thread coordinates (ts + channel) keyed by incident ID.
@@ -41,6 +43,16 @@ type Notifier struct {
 	store       ThreadStore
 	auditor     *audit.Auditor
 	minSeverity string // findings below this severity are not posted ("" = low = post everything)
+
+	// Occurrence card-edit throttle (recurrence collapse, R10): at most one edit
+	// per incident per occEditThrottle, coalesced, with a trailing flush. now and
+	// after are seams so the throttle is deterministic in tests; occ holds
+	// in-memory per-incident state (lost on restart — the next attach
+	// self-corrects, an accepted gap).
+	now   func() time.Time
+	after func(d time.Duration, fn func()) stopper
+	occMu sync.Mutex
+	occ   map[string]*occThrottle
 }
 
 // Probe verifies the bot token against the Slack auth.test API. Used by
@@ -54,19 +66,26 @@ func Probe(ctx context.Context, botToken string) error {
 // New constructs a Slack Notifier using a bot token (xoxb-...). minSeverity
 // is the channel noise gate (low | medium | high; "" means low).
 func New(botToken, channel, minSeverity string, store ThreadStore, auditor *audit.Auditor) *Notifier {
-	return &Notifier{
-		client:      slacklib.New(botToken),
-		channel:     channel,
-		store:       store,
-		auditor:     auditor,
-		minSeverity: minSeverity,
-	}
+	return newNotifier(slacklib.New(botToken), channel, minSeverity, store, auditor)
 }
 
 // NewWithClient constructs a Notifier with a custom SlackClient, enabling
 // injection of a mock in tests.
 func NewWithClient(client SlackClient, channel, minSeverity string, store ThreadStore, auditor *audit.Auditor) *Notifier {
-	return &Notifier{client: client, channel: channel, minSeverity: minSeverity, store: store, auditor: auditor}
+	return newNotifier(client, channel, minSeverity, store, auditor)
+}
+
+func newNotifier(client SlackClient, channel, minSeverity string, store ThreadStore, auditor *audit.Auditor) *Notifier {
+	return &Notifier{
+		client:      client,
+		channel:     channel,
+		minSeverity: minSeverity,
+		store:       store,
+		auditor:     auditor,
+		now:         time.Now,
+		after:       func(d time.Duration, fn func()) stopper { return time.AfterFunc(d, fn) },
+		occ:         make(map[string]*occThrottle),
+	}
 }
 
 // Name returns the stable sink label used in the notify outcome line. The
@@ -182,17 +201,12 @@ func (n *Notifier) belowMinSeverity(f notify.Finding) bool {
 // low=1, medium=2, high=3; anything else (including empty) is 0. Callers
 // interpret 0 per side: an off-ladder finding severity always posts, and an
 // empty gate value means low (config validation rejects other gate values).
+// Delegates to internal/severity.GateRank — the gate-only ladder — NOT to the
+// full Rank (which the recurrence trigger uses): recognizing warning/info there
+// would narrow the "unclassifiable always posts" rule and silently gate
+// off-ladder findings.
 func severityRank(s string) int {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "low":
-		return 1
-	case "medium":
-		return 2
-	case "high":
-		return 3
-	default:
-		return 0
-	}
+	return severity.GateRank(s)
 }
 
 // auditSkipped records a severity-gate suppression in the audit trail.

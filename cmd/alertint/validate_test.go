@@ -54,6 +54,24 @@ func TestRunValidate_ValidConfig(t *testing.T) {
 	}
 }
 
+func TestRunValidate_PrintsVolatileLabelWarning(t *testing.T) {
+	body := strings.Replace(validYAML,
+		`group_labels: ["cluster", "namespace", "service"]`,
+		`group_labels: ["cluster", "namespace", "pod"]`, 1)
+	path := writeTempConfig(t, body)
+	var stdout, stderr bytes.Buffer
+	if err := run([]string{"validate", path}, &stdout, &stderr); err != nil {
+		t.Fatalf("run = %v, want nil (a volatile label warns, not fails)", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "warning:") || !strings.Contains(out, "pod") || !strings.Contains(out, "rarely match") {
+		t.Fatalf("stdout = %q, want a volatile-label warning naming pod and the consequence", out)
+	}
+	if !strings.Contains(out, "is valid") {
+		t.Fatalf("stdout = %q, want the config still reported valid", out)
+	}
+}
+
 func TestRunValidate_UnknownKeyRejected(t *testing.T) {
 	path := writeTempConfig(t, validYAML+"\nbogus_key: true\n")
 	var stdout, stderr bytes.Buffer

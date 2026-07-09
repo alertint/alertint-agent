@@ -579,7 +579,7 @@ func TestAnalysis_ShortCircuitSkipsSentry(t *testing.T) {
 		RootCauseHint: "boom",
 	}
 	alerts := alertsWithLabels(map[string]string{"service": "checkout"})
-	raw, mets, logEnr, chg, sen, err := s.analysis(context.Background(), store.Incident{ID: "i1"}, alerts, decision, EvidencePack{}, []byte("{}"))
+	raw, mets, logEnr, chg, sen, err := s.analysis(context.Background(), store.Incident{ID: "i1"}, alerts, decision, EvidencePack{}, []byte("{}"), time.Time{}, "")
 	if err != nil {
 		t.Fatalf("analysis: %v", err)
 	}

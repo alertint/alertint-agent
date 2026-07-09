@@ -156,6 +156,8 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		slog.String("log_format", format),
 	)
 
+	logConfigWarnings(logger, cfg)
+
 	if *receiversAddr != "" {
 		cfg.Receivers.Address = *receiversAddr
 	}
@@ -281,12 +283,19 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	_ = apiKey // key is embedded in llmClient via Config.APIKey
 
 	corCfg := correlator.Config{
-		WindowSeconds: cfg.Correlator.WindowSeconds,
-		GroupLabels:   cfg.Correlator.GroupLabels,
+		WindowSeconds:   cfg.Correlator.WindowSeconds,
+		GroupLabels:     cfg.Correlator.GroupLabels,
+		AttachWindow:    time.Duration(cfg.Memory.AttachWindowMinutes) * time.Minute,
+		JudgmentCeiling: time.Duration(cfg.Memory.JudgmentCeilingHours) * time.Hour,
+		OccurrenceCap:   cfg.Memory.OccurrenceCap,
+		Lookback:        time.Duration(cfg.Memory.LookbackDays) * 24 * time.Hour,
 	}
 	cor := correlator.New(corCfg, st, incidentSink{skill: skill}, logger)
 
 	cor.SetResolutionNotifier(notifyresolution.New(notifier, st))
+	cor.SetAuditor(auditor)
+	cor.SetRejudger(skill)
+	cor.SetOccurrenceNotifier(notifier)
 
 	if err := cor.Start(ctx); err != nil {
 		return fmt.Errorf("correlator start: %w", err)
@@ -542,6 +551,14 @@ func runHealth(args []string, stdout, stderr io.Writer) error {
 	return fmt.Errorf("health probe returned status %d", resp.StatusCode)
 }
 
+// logConfigWarnings emits each non-fatal config advisory (e.g. a volatile
+// group label) at WARN so startup surfaces them without blocking.
+func logConfigWarnings(logger *slog.Logger, cfg *config.Config) {
+	for _, w := range cfg.Warnings() {
+		logger.Warn(w)
+	}
+}
+
 func resolveDBPath(cfgPath, dbPathFlag string) (string, error) {
 	if dbPathFlag != "" {
 		return dbPathFlag, nil
@@ -721,7 +738,7 @@ func buildHealthChecks(cfg *config.Config, prom *promclient.Client, logSrc logs.
 //     confirmed (notified · stdout=ok) at INFO. Its verbose full JSON line is
 //     written only at debug level (consistently, in every format).
 //   - slack: when enabled and a bot token resolves.
-func buildNotifier(cfg *config.Config, st *store.Store, auditor *audit.Auditor, logger *slog.Logger, debug bool) notify.Notifier {
+func buildNotifier(cfg *config.Config, st *store.Store, auditor *audit.Auditor, logger *slog.Logger, debug bool) *notify.Multi {
 	var nn []notify.Notifier
 	var sinks []string
 	slackWired := false

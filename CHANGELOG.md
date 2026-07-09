@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Recurrence collapse** — a re-firing alert whose group key matches an
+  already-analyzed incident now attaches to it as an *occurrence* instead of
+  minting a new incident and spending another LLM call. The incident's Slack
+  card edits in place to `recurred ×N · last HH:MM` (throttled to one edit per
+  minute) and one JSON occurrence line is written to stdout; the analysis is
+  only re-run when an escalation trigger fires — a severity rise, a new alert
+  type joining, a cadence spike, or a hard time/occurrence ceiling — and the
+  fresh finding replaces the old one in place. Deterministic, free, and on by
+  default; tune it under the new `memory:` config block
+  (`attach_window_minutes`, `judgment_ceiling_hours`, `occurrence_cap`,
+  `lookback_days`). MCP incident payloads now carry an `occurrences` count, and
+  running `alertint drill` twice inside the window demonstrates the collapse.
+
 ### Changed
 
 - **Docker Compose pulls the released image** — the bundled stack now runs
