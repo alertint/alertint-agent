@@ -144,21 +144,29 @@ const selectPriorCandidatesSQL = `
 	  AND created_at >= ?
 	  AND id != ?`
 
+// queryPriorCandidates runs a prior-candidate SELECT and returns the scanned
+// rows with the result set already closed — so the caller can issue its follow-up
+// queries (occurrence stats, drill flags) without holding a SQLite cursor open on
+// the shared connection.
+func (s *Store) queryPriorCandidates(ctx context.Context, query string, args ...any) ([]priorCandidate, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: query prior candidates: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	return scanPriorCandidates(rows)
+}
+
 // MemoryView computes the exact-key recall for a triage of currentIncidentID on
 // groupKey. since is the lookback cutoff (now - lookback_days). currentIsDrill
 // selects the drill side: a real incident recalls only real priors and a drill
 // incident only drill priors (R27). Returns a zero-value view (no priors) when
 // the key has no judged history — never ErrNotFound.
 func (s *Store) MemoryView(ctx context.Context, groupKey, currentIncidentID string, currentIsDrill bool, since time.Time) (*MemoryView, error) {
-	rows, err := s.db.QueryContext(ctx,
+	candidates, err := s.queryPriorCandidates(ctx,
 		selectPriorCandidatesSQL+` AND group_key = ? ORDER BY created_at DESC`,
 		since.UTC().Format(time.RFC3339Nano), currentIncidentID, groupKey,
 	)
-	if err != nil {
-		return nil, fmt.Errorf("store: memory view candidates: %w", err)
-	}
-	candidates, err := scanPriorCandidates(rows)
-	_ = rows.Close()
 	if err != nil {
 		return nil, err
 	}
@@ -223,15 +231,10 @@ func (s *Store) MemoryPrefilter(ctx context.Context, groupKey, currentIncidentID
 	if limit <= 0 {
 		limit = 3
 	}
-	rows, err := s.db.QueryContext(ctx,
+	candidates, err := s.queryPriorCandidates(ctx,
 		selectPriorCandidatesSQL+` AND group_key != ? ORDER BY created_at DESC`,
 		since.UTC().Format(time.RFC3339Nano), currentIncidentID, groupKey,
 	)
-	if err != nil {
-		return nil, fmt.Errorf("store: memory prefilter candidates: %w", err)
-	}
-	candidates, err := scanPriorCandidates(rows)
-	_ = rows.Close()
 	if err != nil {
 		return nil, err
 	}

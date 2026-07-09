@@ -193,14 +193,14 @@ func TestMemoryView_DrillParityBidirectional(t *testing.T) {
 	seedJudged(t, s, judged{id: "inc_drill", groupKey: key, createdAt: now.AddDate(0, 0, -2), rootCause: "drill", drill: true})
 
 	// A real triage recalls only the real prior, and marks that a drill prior was filtered.
-	real, err := s.MemoryView(ctx, key, "inc_current", false, since)
+	realView, err := s.MemoryView(ctx, key, "inc_current", false, since)
 	if err != nil {
 		t.Fatalf("MemoryView(real): %v", err)
 	}
-	if len(real.PriorFindings) != 1 || real.PriorFindings[0].IncidentID != "inc_real" {
-		t.Errorf("real view must exclude drill priors, got %+v", real.PriorFindings)
+	if len(realView.PriorFindings) != 1 || realView.PriorFindings[0].IncidentID != "inc_real" {
+		t.Errorf("real view must exclude drill priors, got %+v", realView.PriorFindings)
 	}
-	if !real.DrillFiltered {
+	if !realView.DrillFiltered {
 		t.Error("real view should record that a drill prior was filtered")
 	}
 	// A drill triage recalls only the drill prior.

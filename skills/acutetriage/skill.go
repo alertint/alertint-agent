@@ -293,18 +293,9 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	}
 
 	// Memory bookkeeping (M2): maintain the contradiction-decay marks from the
-	// model's verdict and audit the recall. Best-effort — a bookkeeping failure
-	// never fails a triage that already persisted its finding.
-	if memory != nil {
-		s.recordMemoryRecall(ctx, inc, memory, resp.MemoryVerdict)
-	}
-	if p.rejudge {
-		// A re-judgment replaced this incident's finding (new hypothesis): reset
-		// its own contradiction marks so a stale refutation does not linger.
-		if err := s.st.ClearRefuteMarks(ctx, inc.ID); err != nil {
-			s.logger.Warn("acutetriage: reset refute marks on replacement failed", "incident_id", inc.ID, "err", err)
-		}
-	}
+	// model's verdict, reset on a replacement, and audit the recall. Best-effort —
+	// a bookkeeping failure never fails a triage that already persisted its finding.
+	s.applyMemoryBookkeeping(ctx, inc, memory, resp.MemoryVerdict, p.rejudge)
 
 	// Check if all alerts are resolved to determine the finding's status label.
 	incidentStatus := "ongoing"

@@ -69,13 +69,13 @@ type RecalledEntry struct {
 // to hasLiveEvidence or the confidence cap: memory never counts as live evidence
 // (R18).
 type MemoryEnrichment struct {
-	GroupKey       string          `json:"group_key"`
-	Rung           string          `json:"rung"` // "2" exact-key strong present, "3a" prefilter-only
-	PriorCount     int             `json:"prior_count"`
-	Episodes       int             `json:"episodes,omitempty"`
-	FirstSeen      time.Time       `json:"first_seen,omitempty"`
-	LastSeen       time.Time       `json:"last_seen,omitempty"`
-	CadenceMedianS int             `json:"cadence_median_s,omitempty"`
+	GroupKey       string    `json:"group_key"`
+	Rung           string    `json:"rung"` // "2" exact-key strong present, "3a" prefilter-only
+	PriorCount     int       `json:"prior_count"`
+	Episodes       int       `json:"episodes,omitempty"`
+	FirstSeen      time.Time `json:"first_seen,omitempty"`
+	LastSeen       time.Time `json:"last_seen,omitempty"`
+	CadenceMedianS int       `json:"cadence_median_s,omitempty"`
 	// LatestAgo is the age of the most-recent prior finding, phrased once at
 	// fetch time (persist-as-rendered) so the render needs no clock.
 	LatestAgo string          `json:"latest_ago,omitempty"`
@@ -160,6 +160,22 @@ func FetchMemory(ctx context.Context, reader MemoryReader, params MemoryParams, 
 
 // validMemoryVerdicts is the closed enum for the soft-required memory_verdict.
 var validMemoryVerdicts = map[string]bool{"confirms": true, "refutes": true, "silent": true}
+
+// applyMemoryBookkeeping runs the post-persist memory side effects: the recall
+// audit + verdict-driven mark routing (when a memory section was rendered), and
+// the reset-on-replacement (when this was a re-judgment). Best-effort throughout.
+func (s *Skill) applyMemoryBookkeeping(ctx context.Context, inc store.Incident, memory *MemoryEnrichment, verdict string, rejudge bool) {
+	if memory != nil {
+		s.recordMemoryRecall(ctx, inc, memory, verdict)
+	}
+	if rejudge {
+		// A re-judgment replaced this incident's finding (new hypothesis): reset
+		// its own contradiction marks so a stale refutation does not linger.
+		if err := s.st.ClearRefuteMarks(ctx, inc.ID); err != nil {
+			s.logger.Warn("acutetriage: reset refute marks on replacement failed", "incident_id", inc.ID, "err", err)
+		}
+	}
+}
 
 // recordMemoryRecall maintains contradiction-decay marks from the model's
 // memory_verdict and audits every rendered recall (R16/R17/R28). The verdict is
@@ -363,14 +379,14 @@ func writeDisposition(b *strings.Builder, e RecalledEntry) {
 	}
 }
 
-// capText truncates s to at most max runes, appending an ellipsis marker when
+// capText truncates s to at most limit runes, appending an ellipsis marker when
 // it cut. Rune-safe so a multibyte tail never splits.
-func capText(s string, max int) string {
+func capText(s string, limit int) string {
 	r := []rune(s)
-	if len(r) <= max {
+	if len(r) <= limit {
 		return s
 	}
-	return string(r[:max]) + "…"
+	return string(r[:limit]) + "…"
 }
 
 // pluralize renders "1 noun" / "N nouns".
