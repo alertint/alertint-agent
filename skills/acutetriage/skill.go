@@ -457,6 +457,10 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 	// byte-identical to a non-memory triage. Never passed to hasLiveEvidence or
 	// the confidence cap — memory is context, never live evidence (R18).
 	memory := FetchMemory(ctx, s.cfg.Memory, s.cfg.MemoryParams, inc, isDrill(alerts), time.Now().UTC())
+	// Disposition-lite: when a recalled finding carries corroborating Sentry issue
+	// ids, one bounded status read renders the regression/known-tolerated
+	// transition. Best-effort, fail-safe — never blocks the recall.
+	applyDisposition(ctx, s.cfg.Sentry, s.cfg.SentryParams, memory)
 	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment, changes, sentry, memory)
 	// On a re-judgment, prepend the deterministic recurrence context so the model
 	// judges the recurrence with its history rather than as a first-time event.

@@ -26,12 +26,32 @@ type fakeSentry struct {
 	events    map[string]sentry.IssueEvent
 	eventErrs map[string]error
 
+	// Disposition-lite (GetIssue) fixtures, keyed by issue id.
+	issueStatus    map[string]sentry.IssueStatus
+	issueStatusErr map[string]error
+
 	listCalls          int
 	eventCalls         int
+	getCalls           int
+	getCtxHadDeadline  bool
 	listCtxHadDeadline bool
 	listedProject      string
 	listedEnv          string
 	listedQuery        string
+}
+
+func (f *fakeSentry) GetIssue(ctx context.Context, issueID string) (sentry.IssueStatus, error) {
+	f.getCalls++
+	_, f.getCtxHadDeadline = ctx.Deadline()
+	if f.issueStatusErr != nil {
+		if err := f.issueStatusErr[issueID]; err != nil {
+			return sentry.IssueStatus{}, err
+		}
+	}
+	if f.issueStatus != nil {
+		return f.issueStatus[issueID], nil
+	}
+	return sentry.IssueStatus{}, nil
 }
 
 func (f *fakeSentry) ListIssues(ctx context.Context, project, env string, _, _ time.Time, query string) ([]sentry.Issue, error) {

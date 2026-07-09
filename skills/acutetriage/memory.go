@@ -4,10 +4,13 @@ package acutetriage
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/sentry"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -204,6 +207,71 @@ func (s *Skill) recordMemoryRecall(ctx context.Context, inc store.Incident, memo
 		}
 		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.memory_recalled", payload)
 	}
+}
+
+// applyDisposition runs the disposition-lite lookup (R19): for each recalled
+// entry carrying a corroborating Sentry issue id, one bounded query reads the
+// issue's current status and renders the transition. All lookups share one
+// deadline (params.FetchTimeoutSeconds) with the rest of enrichment. Fail-safe: a
+// not-found issue adds no note (outcome "none"); any other error — 5xx, timeout —
+// renders an explicit unavailable note and never blocks the recall. A nil reader
+// (Sentry unconfigured) is a no-op.
+func applyDisposition(ctx context.Context, reader SentryReader, params SentryParams, m *MemoryEnrichment) {
+	if reader == nil || m == nil {
+		return
+	}
+	timeout := params.FetchTimeoutSeconds
+	if timeout <= 0 {
+		timeout = 5
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
+	defer cancel()
+
+	if m.Strong != nil {
+		m.Strong.Disposition = dispositionFor(ctx, reader, m.Strong.CorroboratingIssueIDs)
+	}
+	for i := range m.Weak {
+		m.Weak[i].Disposition = dispositionFor(ctx, reader, m.Weak[i].CorroboratingIssueIDs)
+	}
+}
+
+// dispositionFor resolves the disposition line for one entry from its first
+// corroborating issue id (one bounded query per finding). Empty when there is no
+// id or the issue is simply gone (outcome "none").
+func dispositionFor(ctx context.Context, reader SentryReader, ids []string) string {
+	if len(ids) == 0 {
+		return ""
+	}
+	st, err := reader.GetIssue(ctx, ids[0])
+	if err != nil {
+		var apiErr *sentry.APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			return "" // outcome none: the corroborating error no longer exists
+		}
+		return "corroborating error status unavailable" // outcome unavailable
+	}
+	switch st.Status {
+	case "resolved":
+		if d := issueDate(st.LastSeen); d != "" {
+			return fmt.Sprintf("prior corroborating error was resolved (last seen %s) → now firing = likely regression", d)
+		}
+		return "prior corroborating error was resolved → now firing = likely regression"
+	case "ignored", "muted":
+		return "prior corroborating error is ignored → known-tolerated"
+	case "unresolved":
+		return "prior corroborating error still open"
+	default:
+		return ""
+	}
+}
+
+// issueDate renders an RFC3339 timestamp as a bare date, or "" when unparseable.
+func issueDate(ts string) string {
+	t, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		return ""
+	}
+	return t.Format("2006-01-02")
 }
 
 // recalledFrom projects a store PriorFinding onto the render/persist entry.

@@ -22,6 +22,10 @@ import (
 type SentryReader interface {
 	ListIssues(ctx context.Context, project, env string, start, end time.Time, query string) ([]sentry.Issue, error)
 	LatestEvent(ctx context.Context, issueID string) (sentry.IssueEvent, error)
+	// GetIssue reads one issue's current lifecycle status for disposition-lite
+	// (R19): a recalled finding's corroborating error resolved → regression,
+	// ignored → known-tolerated.
+	GetIssue(ctx context.Context, issueID string) (sentry.IssueStatus, error)
 }
 
 // SentryParams carries the Error-source tunables from config (sentry.issues),

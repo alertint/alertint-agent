@@ -4,10 +4,12 @@ package acutetriage
 
 import (
 	"context"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/sentry"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -198,5 +200,74 @@ func TestUserPrompt_MemoryAnchoringStaysCorrect(t *testing.T) {
 	out = UserPrompt(basePack(), "{}", nil, liveLogs(), nil, nil, mem)
 	if strings.Contains(out, "ANNOTATIONS ONLY") {
 		t.Errorf("with live logs the annotations-only directive must stay silent:\n%s", out)
+	}
+}
+
+// --- disposition-lite (R19) --------------------------------------------------
+
+func TestApplyDisposition_RendersTransitions(t *testing.T) {
+	cases := []struct {
+		name         string
+		status       sentry.IssueStatus
+		err          error
+		want, absent string
+	}{
+		{"resolved is a regression", sentry.IssueStatus{Status: "resolved", LastSeen: "2026-07-06T02:00:00Z"}, nil, "now firing = likely regression", ""},
+		{"resolved carries the last-seen date", sentry.IssueStatus{Status: "resolved", LastSeen: "2026-07-06T02:00:00Z"}, nil, "last seen 2026-07-06", ""},
+		{"ignored is known-tolerated", sentry.IssueStatus{Status: "ignored"}, nil, "known-tolerated", ""},
+		{"muted is known-tolerated", sentry.IssueStatus{Status: "muted"}, nil, "known-tolerated", ""},
+		{"unresolved is still open", sentry.IssueStatus{Status: "unresolved"}, nil, "still open", ""},
+		{"5xx is unavailable, never blocks", sentry.IssueStatus{}, &sentry.APIError{StatusCode: 500}, "status unavailable", ""},
+		{"404 is none, no note", sentry.IssueStatus{}, &sentry.APIError{StatusCode: http.StatusNotFound}, "", "corroborating"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fk := &fakeSentry{issueStatus: map[string]sentry.IssueStatus{"I1": tc.status}}
+			if tc.err != nil {
+				fk.issueStatusErr = map[string]error{"I1": tc.err}
+			}
+			m := &MemoryEnrichment{Strong: &RecalledEntry{IncidentID: "p", CorroboratingIssueIDs: []string{"I1"}}}
+			applyDisposition(context.Background(), fk, SentryParams{FetchTimeoutSeconds: 5}, m)
+
+			got := m.Strong.Disposition
+			if tc.want != "" && !strings.Contains(got, tc.want) {
+				t.Errorf("disposition = %q, want it to contain %q", got, tc.want)
+			}
+			if tc.absent != "" && got != "" && strings.Contains(got, tc.absent) {
+				t.Errorf("disposition = %q, should be empty for this outcome", got)
+			}
+			if !fk.getCtxHadDeadline {
+				t.Error("disposition lookup must run under a shared deadline")
+			}
+			// The disposition renders into the memory section when present.
+			if got != "" {
+				var b strings.Builder
+				m.PriorCount = 1
+				renderMemory(&b, m)
+				if !strings.Contains(b.String(), "disposition: "+got) {
+					t.Errorf("disposition must render into the section:\n%s", b.String())
+				}
+			}
+		})
+	}
+}
+
+func TestApplyDisposition_NoCorroboratingIDsMakesNoCall(t *testing.T) {
+	fk := &fakeSentry{}
+	m := &MemoryEnrichment{Strong: &RecalledEntry{IncidentID: "p"}} // no corroborating ids
+	applyDisposition(context.Background(), fk, SentryParams{FetchTimeoutSeconds: 5}, m)
+	if fk.getCalls != 0 {
+		t.Errorf("a finding without corroborating ids must make no Sentry call, got %d", fk.getCalls)
+	}
+	if m.Strong.Disposition != "" {
+		t.Errorf("no disposition expected, got %q", m.Strong.Disposition)
+	}
+}
+
+func TestApplyDisposition_NilReaderIsNoop(t *testing.T) {
+	m := &MemoryEnrichment{Strong: &RecalledEntry{CorroboratingIssueIDs: []string{"I1"}}}
+	applyDisposition(context.Background(), nil, SentryParams{}, m) // must not panic
+	if m.Strong.Disposition != "" {
+		t.Errorf("nil reader must be a no-op, got %q", m.Strong.Disposition)
 	}
 }
