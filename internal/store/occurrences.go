@@ -112,6 +112,36 @@ func (s *Store) LatestOccurrence(ctx context.Context, incidentID string) (*Occur
 	return scanOccurrence(row)
 }
 
+// ListOccurrences returns an incident's occurrences most-recent-first, capped at
+// limit (limit <= 0 returns all). Used to render the re-judgment prompt's
+// occurrence trajectory from the persisted payload snapshots.
+func (s *Store) ListOccurrences(ctx context.Context, incidentID string, limit int) ([]Occurrence, error) {
+	q := `
+		SELECT id, incident_id, occurred_at, last_seen, fingerprints_json, payload_json, trigger_kind, snapshot_ref
+		FROM incident_occurrences
+		WHERE incident_id = ?
+		ORDER BY occurred_at DESC, id DESC`
+	args := []any{incidentID}
+	if limit > 0 {
+		q += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: list occurrences: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []Occurrence
+	for rows.Next() {
+		occ, err := scanOccurrence(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *occ)
+	}
+	return out, rows.Err()
+}
+
 // GetRecentJudgedIncidentByGroupKey returns the most recent incident (by
 // created_at) for the verbatim group_key whose status is 'analyzed' or
 // 'resolved' — i.e. one carrying a persisted finding — or ErrNotFound. The

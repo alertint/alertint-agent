@@ -475,6 +475,53 @@ func TestPruneOccurrences_NothingOldReturnsZero(t *testing.T) {
 	}
 }
 
+func TestListOccurrences_MostRecentFirstCapped(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 7, 8, 15, 0, 0, 0, time.UTC)
+	seedIncident(t, s, "inc_1", "k", "analyzed", base)
+	for i := 1; i <= 5; i++ {
+		occ := sampleOccurrence("inc_1", base.Add(time.Duration(i)*time.Minute))
+		occ.Payload[0].Annotations = map[string]string{"summary": "episode " + occ.OccurredAt.Format("150405")}
+		if _, err := s.InsertOccurrence(ctx, occ); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+	got, err := s.ListOccurrences(ctx, "inc_1", 3)
+	if err != nil {
+		t.Fatalf("ListOccurrences: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("len = %d, want 3 (capped)", len(got))
+	}
+	// Most recent first.
+	if !got[0].OccurredAt.Equal(base.Add(5 * time.Minute)) {
+		t.Errorf("got[0] = %v, want the newest (%v)", got[0].OccurredAt, base.Add(5*time.Minute))
+	}
+	if got[0].Payload[0].Annotations["summary"] == "" {
+		t.Errorf("payload annotations not round-tripped: %+v", got[0].Payload)
+	}
+}
+
+func TestListOccurrences_ZeroLimitReturnsAll(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	base := time.Now().UTC()
+	seedIncident(t, s, "inc_1", "k", "analyzed", base)
+	for i := 0; i < 4; i++ {
+		if _, err := s.InsertOccurrence(ctx, sampleOccurrence("inc_1", base.Add(time.Duration(i)*time.Minute))); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+	got, err := s.ListOccurrences(ctx, "inc_1", 0)
+	if err != nil {
+		t.Fatalf("ListOccurrences: %v", err)
+	}
+	if len(got) != 4 {
+		t.Errorf("len = %d, want 4 (limit 0 = all)", len(got))
+	}
+}
+
 func TestCountOccurrencesSince(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
