@@ -16,7 +16,7 @@ func TestRenderSentry_PopulatedSection(t *testing.T) {
 		},
 		MoreCount: 2,
 	}
-	out := UserPrompt(basePack(), "{}", nil, nil, nil, e)
+	out := UserPrompt(basePack(), "{}", nil, nil, nil, e, nil)
 	if !strings.Contains(out, "Sentry issues (at triage time, project=checkout env=production") {
 		t.Fatalf("missing headed section: %s", out)
 	}
@@ -42,7 +42,7 @@ func TestRenderSentry_PopulatedSection(t *testing.T) {
 }
 
 func TestRenderSentry_OmittedWhenNil(t *testing.T) {
-	out := UserPrompt(basePack(), "{}", nil, nil, nil, nil)
+	out := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil)
 	if strings.Contains(out, "Sentry issues") {
 		t.Fatalf("section must be omitted when enrichment is nil: %s", out)
 	}
@@ -63,7 +63,7 @@ func TestRenderSentry_MatchedHeadlineAboveIssues(t *testing.T) {
 			{ID: "A", ExceptionType: "KeyError", FileLine: "app/checkout.py:88", Level: "error", UserCount: 7, New: true},
 		},
 	}
-	out := UserPrompt(basePack(), "{}", nil, nil, nil, e)
+	out := UserPrompt(basePack(), "{}", nil, nil, nil, e, nil)
 	headline := "Sentry: 2 new in-window error(s) correlated"
 	iHead := strings.Index(out, headline)
 	if iHead < 0 {
@@ -83,7 +83,7 @@ func TestRenderSentry_InfraOnlyHeadlineNoChronic(t *testing.T) {
 		Reconciliation: &Reconciliation{Tag: tagInfraOnly},
 		Note:           "no Sentry issues for project=checkout in window",
 	}
-	out := UserPrompt(basePack(), "{}", nil, nil, nil, e)
+	out := UserPrompt(basePack(), "{}", nil, nil, nil, e, nil)
 	if !strings.Contains(out, "Sentry: no new in-window errors for this scope") {
 		t.Fatalf("infra-only headline missing: %s", out)
 	}
@@ -102,7 +102,7 @@ func TestRenderSentry_InfraOnlyHeadlineWithChronic(t *testing.T) {
 			{ID: "B", ExceptionType: "TimeoutError", Culprit: "app.svc in call", Level: "error", UserCount: 50, New: false},
 		},
 	}
-	out := UserPrompt(basePack(), "{}", nil, nil, nil, e)
+	out := UserPrompt(basePack(), "{}", nil, nil, nil, e, nil)
 	if !strings.Contains(out, "Sentry: no new in-window errors for this scope (2 chronic present)") {
 		t.Fatalf("infra-only headline with chronic suffix missing/incorrect: %s", out)
 	}
@@ -118,7 +118,7 @@ func TestRenderSentry_NoHeadlineOnDegraded(t *testing.T) {
 		Project: "checkout", Outcome: outcomeDegraded,
 		Note: "Sentry query unavailable (rate-limited)", // Reconciliation nil
 	}
-	out := UserPrompt(basePack(), "{}", nil, nil, nil, e)
+	out := UserPrompt(basePack(), "{}", nil, nil, nil, e, nil)
 	if strings.Contains(out, "no new in-window errors") || strings.Contains(out, "in-window error(s) correlated") {
 		t.Errorf("no reconciliation headline expected on a degraded look: %s", out)
 	}
@@ -140,7 +140,7 @@ func TestRenderSentry_HeadlineCarriesNoSentryControlledStrings(t *testing.T) {
 				Level: "error", UserCount: 1, New: true, Message: "missing tenant_id for " + pii},
 		},
 	}
-	out := UserPrompt(basePack(), "{}", nil, nil, nil, e)
+	out := UserPrompt(basePack(), "{}", nil, nil, nil, e, nil)
 	hStart := strings.Index(out, "Sentry: 1 new in-window error(s) correlated")
 	iStart := strings.Index(out, "Sentry issues (at triage time")
 	if hStart < 0 || iStart < 0 || hStart > iStart {
@@ -167,7 +167,7 @@ func TestRenderSentry_IssueIDNeverRendersIntoPrompt(t *testing.T) {
 			{ID: secretID, ExceptionType: "KeyError", FileLine: "app/x.py:1", Level: "error", UserCount: 1, New: true},
 		},
 	}
-	out := UserPrompt(basePack(), "{}", nil, nil, nil, e)
+	out := UserPrompt(basePack(), "{}", nil, nil, nil, e, nil)
 	if strings.Contains(out, secretID) {
 		t.Errorf("issue id is persist-only (KTD3) and must never render into the prompt: %s", out)
 	}
@@ -187,13 +187,13 @@ func TestSystemPrompt_NoReconciliationDirective(t *testing.T) {
 func TestRenderSentry_NegativeAndDegradedNotes(t *testing.T) {
 	zero := &SentryEnrichment{Project: "checkout", Environment: "production",
 		Note: "no Sentry issues for project=checkout env=production in window"}
-	out := UserPrompt(basePack(), "{}", nil, nil, nil, zero)
+	out := UserPrompt(basePack(), "{}", nil, nil, nil, zero, nil)
 	if !strings.Contains(out, "Sentry issues (at triage time): no Sentry issues for project=checkout env=production in window") {
 		t.Fatalf("negative-signal note not rendered: %s", out)
 	}
 
 	degraded := &SentryEnrichment{Project: "checkout", Note: "Sentry query unavailable (rate-limited)"}
-	out = UserPrompt(basePack(), "{}", nil, nil, nil, degraded)
+	out = UserPrompt(basePack(), "{}", nil, nil, nil, degraded, nil)
 	if !strings.Contains(out, "Sentry query unavailable (rate-limited)") {
 		t.Fatalf("degraded note not rendered: %s", out)
 	}
@@ -204,7 +204,7 @@ func TestRenderSentry_MessageOmittedWhenToggledOff(t *testing.T) {
 		Project: "checkout",
 		Issues:  []SentryIssueView{{ExceptionType: "KeyError", FileLine: "a.py:1", Level: "error", UserCount: 1, New: true}}, // Message empty (toggle off)
 	}
-	out := UserPrompt(basePack(), "{}", nil, nil, nil, e)
+	out := UserPrompt(basePack(), "{}", nil, nil, nil, e, nil)
 	if !strings.Contains(out, "[NEW] KeyError @ a.py:1") {
 		t.Fatalf("issue line missing: %s", out)
 	}

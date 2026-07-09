@@ -26,7 +26,7 @@ func TestUserPrompt_RendersLogLinesNewestFirst(t *testing.T) {
 			{Timestamp: time.Date(2026, 6, 17, 14, 3, 10, 0, time.UTC), Line: "ERROR db refused"},
 		},
 	}
-	out := UserPrompt(basePack(), "{}", nil, e, nil, nil)
+	out := UserPrompt(basePack(), "{}", nil, e, nil, nil, nil)
 	if !strings.Contains(out, "Recent logs (loki, most recent first") {
 		t.Fatalf("missing logs heading: %s", out)
 	}
@@ -43,7 +43,7 @@ func TestUserPrompt_RendersNoteWhenEmpty(t *testing.T) {
 		Query:  `{namespace="prod",app="api"}`,
 		Note:   "log backend returned no lines for this query",
 	}
-	out := UserPrompt(basePack(), "{}", nil, e, nil, nil)
+	out := UserPrompt(basePack(), "{}", nil, e, nil, nil, nil)
 	if !strings.Contains(out, "Recent logs (loki): log backend returned no lines") {
 		t.Fatalf("note not rendered: %s", out)
 	}
@@ -56,7 +56,7 @@ func TestUserPrompt_RendersNoteWhenEmpty(t *testing.T) {
 }
 
 func TestUserPrompt_OmitsSectionWhenNil(t *testing.T) {
-	out := UserPrompt(basePack(), "{}", nil, nil, nil, nil)
+	out := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil)
 	if strings.Contains(out, "Recent logs") {
 		t.Fatalf("logs section must be omitted when enrichment is nil: %s", out)
 	}
