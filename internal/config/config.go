@@ -43,6 +43,7 @@ type Config struct {
 	Logs         LogsConfig         `yaml:"logs,omitempty"`
 	Sentry       SentryConfig       `yaml:"sentry,omitempty"`
 	Rules        RulesConfig        `yaml:"rules"`
+	Memory       MemoryConfig       `yaml:"memory"`
 	LogLevel     string             `yaml:"log_level"`
 	LogFormat    string             `yaml:"log_format"`
 }
@@ -242,6 +243,17 @@ type CorrelatorConfig struct {
 	GroupLabels   []string `yaml:"group_labels"`
 }
 
+// MemoryConfig tunes incident memory: recurrence collapse (M1) and, in later
+// milestones, recall (M2) and the shadow classifier (M3). Collapse and recall
+// are deterministic, free, and default-on — these knobs are the control
+// surface, not an enable switch. The classifier sub-block lands with M3.
+type MemoryConfig struct {
+	AttachWindowMinutes  int `yaml:"attach_window_minutes"`  // Clock A: sliding attach window from the last occurrence
+	JudgmentCeilingHours int `yaml:"judgment_ceiling_hours"` // Clock B: hard ceiling on time since the last LLM judgment
+	OccurrenceCap        int `yaml:"occurrence_cap"`         // re-judge backstop after this many attaches since the last judgment
+	LookbackDays         int `yaml:"lookback_days"`          // occurrence pruning + recall lookback horizon
+}
+
 // NotifyConfig configures notifiers.
 type NotifyConfig struct {
 	Stdout bool        `yaml:"stdout"`
@@ -346,6 +358,12 @@ func Defaults() Config {
 				// IncludeMessage left nil → defaults ON via MessageIncluded (R14).
 			},
 		},
+		Memory: MemoryConfig{
+			AttachWindowMinutes:  30,
+			JudgmentCeilingHours: 4,
+			OccurrenceCap:        100,
+			LookbackDays:         90,
+		},
 		LogLevel:  "info",
 		LogFormat: "auto",
 	}
@@ -423,6 +441,7 @@ func (c *Config) validate(offline bool) error {
 	errs = append(errs, c.validateLogs()...)
 	errs = append(errs, c.validateSentry()...)
 	errs = append(errs, c.validateChanges()...)
+	errs = append(errs, c.validateMemory()...)
 	if !offline {
 		errs = append(errs, c.validateRules()...)
 	}
@@ -559,6 +578,51 @@ func (c *Config) validateCorrelator() []string {
 		}
 	}
 	return errs
+}
+
+// validateMemory checks the incident-memory horizon knobs. All are strictly
+// positive: a zero/negative window, ceiling, cap, or lookback is a
+// misconfiguration, not a disable switch (collapse and recall are always on).
+func (c *Config) validateMemory() []string {
+	var errs []string
+	if c.Memory.AttachWindowMinutes <= 0 {
+		errs = append(errs, "memory: attach_window_minutes: must be > 0")
+	}
+	if c.Memory.JudgmentCeilingHours <= 0 {
+		errs = append(errs, "memory: judgment_ceiling_hours: must be > 0")
+	}
+	if c.Memory.OccurrenceCap <= 0 {
+		errs = append(errs, "memory: occurrence_cap: must be > 0")
+	}
+	if c.Memory.LookbackDays <= 0 {
+		errs = append(errs, "memory: lookback_days: must be > 0")
+	}
+	return errs
+}
+
+// volatileGroupLabels are per-instance identity labels that churn on every pod
+// restart or job run, so a verbatim group_key rarely repeats. Grouping on one
+// means recurrence collapse and recall (which key off group_key) seldom match.
+var volatileGroupLabels = map[string]bool{
+	"pod": true, "pod_name": true, "pod_ip": true, "instance": true,
+	"job_name": true, "container": true, "container_id": true, "uid": true,
+}
+
+// Warnings returns non-fatal configuration advisories, surfaced at serve startup
+// and by `alertint validate`. Unlike validate(), a warning never blocks startup.
+// Today it lints group_labels for volatile per-instance identity (R11): the
+// recurrence key is the verbatim group_key with no normalizer, so a volatile
+// label quietly defeats collapse and recall rather than being rejected.
+func (c *Config) Warnings() []string {
+	var warns []string
+	for _, label := range c.Correlator.GroupLabels {
+		if volatileGroupLabels[strings.ToLower(strings.TrimSpace(label))] {
+			warns = append(warns, fmt.Sprintf(
+				"correlator.group_labels: %q looks volatile (per-instance identity); recurrence collapse and recall will rarely match for these groups",
+				label))
+		}
+	}
+	return warns
 }
 
 func (c *Config) validateNotify() []string {

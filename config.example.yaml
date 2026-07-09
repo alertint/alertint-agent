@@ -22,6 +22,12 @@ correlator:
     - namespace
     - service
 
+memory:                    # incident memory: recurrence collapse (always on, deterministic, free)
+  attach_window_minutes: 30   # Clock A: re-fires within this window of the last one attach instead of re-triaging
+  judgment_ceiling_hours: 4   # Clock B: force a fresh re-judgment once this long since the last one, even if still collapsing
+  occurrence_cap: 100         # backstop: re-judge after this many attaches since the last judgment
+  lookback_days: 90           # occurrence retention + how far back recurrence history is counted
+
 notify:
   stdout: true             # always emit one JSON line per finding to stdout
   slack:

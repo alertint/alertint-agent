@@ -156,6 +156,10 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		slog.String("log_format", format),
 	)
 
+	for _, w := range cfg.Warnings() {
+		logger.Warn(w)
+	}
+
 	if *receiversAddr != "" {
 		cfg.Receivers.Address = *receiversAddr
 	}

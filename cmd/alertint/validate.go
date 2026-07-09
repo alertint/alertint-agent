@@ -39,8 +39,12 @@ func runValidate(args []string, stdout, stderr io.Writer) error {
 		return errors.New("validate: config path required: alertint validate <config.yaml>")
 	}
 
-	if _, err := config.LoadOffline(path); err != nil {
+	cfg, err := config.LoadOffline(path)
+	if err != nil {
 		return err
+	}
+	for _, w := range cfg.Warnings() {
+		_, _ = fmt.Fprintf(stdout, "warning: %s\n", w)
 	}
 	_, _ = fmt.Fprintf(stdout, "configuration %s is valid\n", path)
 	return nil
