@@ -373,6 +373,11 @@ type Incident struct {
 	EnrichmentJSON string
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
+	// LastJudgedAt is when the finding was last produced (initial triage or a
+	// re-judgment); nil until the first judgment succeeds. Clock B and the
+	// re-judgment trigger baselines measure from it. Populated only by the
+	// full-row reads (scanIncidentFull); nil on the lightweight scanIncident path.
+	LastJudgedAt *time.Time
 }
 
 // InsertIncident creates a new incident row in status "collecting".
@@ -463,7 +468,7 @@ func (s *Store) GetRecentIncidentByGroupKey(ctx context.Context, groupKey string
 		       COALESCE(summary,''), COALESCE(root_cause,''),
 		       COALESCE(confidence,0.0), COALESCE(output_json,''),
 		       COALESCE(enrichment_json,''),
-		       created_at, updated_at
+		       created_at, updated_at, last_judged_at
 		FROM incidents
 		WHERE group_key = ?
 		ORDER BY created_at DESC
@@ -716,7 +721,9 @@ func (s *Store) IncidentDrillFlags(ctx context.Context, ids []string) (map[strin
 }
 
 // SaveIncidentOutput persists LLM output on a ready/processing incident,
-// denormalizes summary/root_cause/confidence, and sets status="analyzed".
+// denormalizes summary/root_cause/confidence, sets status="analyzed", and stamps
+// last_judged_at (this initial judgment is Clock B's first baseline; every later
+// re-judgment refreshes it via ReplaceIncidentOutput).
 // enrichmentJSON is the log-enrichment snapshot (§3.7); pass "" when logs are
 // not configured or on the short-circuit path, which stores SQL NULL so the
 // evidence pack omits the logs section.
@@ -734,9 +741,10 @@ func (s *Store) SaveIncidentOutput(ctx context.Context, incidentID, outputJSON, 
 		    root_cause      = ?,
 		    confidence      = ?,
 		    enrichment_json = ?,
+		    last_judged_at  = ?,
 		    updated_at      = ?
 		WHERE id = ? AND status IN ('ready','processing')
-	`, outputJSON, summary, rootCause, confidence, enrichment, now, incidentID)
+	`, outputJSON, summary, rootCause, confidence, enrichment, now, now, incidentID)
 	if err != nil {
 		return fmt.Errorf("store: save incident output: %w", err)
 	}
@@ -854,7 +862,7 @@ func (s *Store) ListRecentIncidents(ctx context.Context, limit int) ([]Incident,
 		       COALESCE(summary,''), COALESCE(root_cause,''),
 		       COALESCE(confidence,0.0), COALESCE(output_json,''),
 		       COALESCE(enrichment_json,''),
-		       created_at, updated_at
+		       created_at, updated_at, last_judged_at
 		FROM incidents
 		ORDER BY created_at DESC
 		LIMIT ?
@@ -884,7 +892,7 @@ func (s *Store) GetIncidentByID(ctx context.Context, id string) (*Incident, erro
 		       COALESCE(summary,''), COALESCE(root_cause,''),
 		       COALESCE(confidence,0.0), COALESCE(output_json,''),
 		       COALESCE(enrichment_json,''),
-		       created_at, updated_at
+		       created_at, updated_at, last_judged_at
 		FROM incidents
 		WHERE id = ?
 	`, id)
@@ -1002,10 +1010,12 @@ func (s *Store) GetIncidentAlertsWithRoles(ctx context.Context, incidentID strin
 	return out, rows.Err()
 }
 
-// scanIncidentFull scans a row that SELECTs all 14 incident columns including
-// the nullable LLM output fields (summary, root_cause, confidence, output_json)
-// and the log-enrichment snapshot (enrichment_json). Callers must use COALESCE
-// on the nullable columns before scanning.
+// scanIncidentFull scans a row that SELECTs all 15 incident columns including
+// the nullable LLM output fields (summary, root_cause, confidence, output_json),
+// the log-enrichment snapshot (enrichment_json), and the nullable last_judged_at.
+// Callers must use COALESCE on the string/number nullable columns before
+// scanning; last_judged_at is scanned raw (nil when NULL) and must be the last
+// selected column.
 func scanIncidentFull(s scanner) (*Incident, error) {
 	var (
 		inc        Incident
@@ -1014,18 +1024,26 @@ func scanIncidentFull(s scanner) (*Incident, error) {
 		readyStr   string
 		createdStr string
 		updatedStr string
+		judgedStr  sql.NullString
 	)
 	if err := s.Scan(
 		&inc.ID, &inc.GroupKey, &inc.Status,
 		&firstStr, &lastStr, &readyStr, &inc.AlertCount,
 		&inc.Summary, &inc.RootCause, &inc.Confidence, &inc.OutputJSON,
 		&inc.EnrichmentJSON,
-		&createdStr, &updatedStr,
+		&createdStr, &updatedStr, &judgedStr,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("store: scan incident full: %w", err)
+	}
+	if judgedStr.Valid {
+		t, err := time.Parse(time.RFC3339Nano, judgedStr.String)
+		if err != nil {
+			return nil, fmt.Errorf("store: parse last_judged_at: %w", err)
+		}
+		inc.LastJudgedAt = &t
 	}
 
 	parse := func(s string) (time.Time, error) {
