@@ -194,13 +194,16 @@ func (s *Store) MemoryView(ctx context.Context, groupKey, currentIncidentID stri
 	}
 
 	// Fold the key's firing episodes: each survivor's first fire plus every
-	// occurrence occurred_at within the lookback. Occurrence times are filtered
-	// in Go (not SQL) to sidestep the fixed-width vs RFC3339Nano lexical edge.
+	// occurrence occurred_at within the lookback. Every survivor's first fire
+	// counts unconditionally — the survivor is already lookback-filtered by
+	// created_at, so a first_alert_at that predates `since` (an alert with an old
+	// StartsAt) is still this incident's founding episode; dropping it rendered a
+	// nonsensical "[folded ×0]" next to a real recalled hypothesis. Occurrence
+	// times are filtered in Go (not SQL) to sidestep the fixed-width vs
+	// RFC3339Nano lexical edge.
 	episodes := make([]time.Time, 0, len(survivors))
 	for i := range survivors {
-		if !survivors[i].firstAlertAt.Before(since) {
-			episodes = append(episodes, survivors[i].firstAlertAt)
-		}
+		episodes = append(episodes, survivors[i].firstAlertAt)
 	}
 	occTimes, err := s.occurrenceTimesByIncidents(ctx, ids)
 	if err != nil {

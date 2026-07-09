@@ -125,6 +125,39 @@ func TestMemoryView_SameKeyFoldsCountsAndCadence(t *testing.T) {
 	}
 }
 
+func TestMemoryView_FirstFireBeforeLookbackStillCountsAsEpisode(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 9, 2, 0, 0, 0, time.UTC)
+	since := now.AddDate(0, 0, -90)
+	key := "cluster=prod,namespace=web,service=api"
+
+	// A prior created inside the lookback but whose first alert (an old StartsAt)
+	// predates the cutoff, with no in-window occurrences. Its founding episode must
+	// still count so the render never shows "[folded ×0]".
+	created := now.AddDate(0, 0, -2)
+	oldFirstFire := since.AddDate(0, 0, -5) // before the cutoff
+	ts := created.UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO incidents (id, group_key, status, first_alert_at, last_alert_at, ready_at, alert_count,
+			summary, root_cause, confidence, output_json, created_at, updated_at, last_judged_at, memory_refute_marks)
+		VALUES ('inc_old_fire', ?, 'analyzed', ?, ?, ?, 1, 's', 'rc', 0.6, '{}', ?, ?, ?, 0)
+	`, key, oldFirstFire.UTC().Format(time.RFC3339Nano), ts, ts, ts, ts, ts); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	v, err := s.MemoryView(ctx, key, "inc_current", false, since)
+	if err != nil {
+		t.Fatalf("MemoryView: %v", err)
+	}
+	if len(v.PriorFindings) != 1 {
+		t.Fatalf("want 1 prior, got %d", len(v.PriorFindings))
+	}
+	if v.Episodes < 1 {
+		t.Errorf("Episodes = %d, want >= 1 (the founding fire must count, never ×0)", v.Episodes)
+	}
+}
+
 func TestMemoryView_KeyWithNoOccurrencesRecallsPriorWithCount1(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

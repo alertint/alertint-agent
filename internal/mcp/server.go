@@ -396,16 +396,20 @@ func (s *Server) handleGetIncident(ctx context.Context, req mcplib.CallToolReque
 	}
 	stats := occ[id]
 
-	// Memory recall: the prior findings this incident's triage saw for its key,
-	// from the same memoryView, so what the operator inspects equals what the LLM
-	// saw (R26). Drill parity, lookback, and exclude-current live in that method.
+	// Memory recall: the recall AlertINT computes for this incident's key now, via
+	// the same memoryView method (and the drill/lookback/exclude-current rules) the
+	// triage uses — so the operator inspects the recall through one code path, not a
+	// divergent reimplementation (R26). The view is computed live and time-relative,
+	// so a historical incident's block reflects the key's current history, not a
+	// frozen snapshot of its own triage-time prompt. Best-effort: a memory error
+	// omits the block rather than failing the whole incident read (as triage does).
 	lookback := s.cfg.MemoryLookbackDays
 	if lookback <= 0 {
 		lookback = 90
 	}
 	view, err := s.st.MemoryView(ctx, inc.GroupKey, inc.ID, drill, time.Now().UTC().AddDate(0, 0, -lookback))
 	if err != nil {
-		return errResult("failed to load memory: " + err.Error()), nil
+		view = nil // omit the memory block; the core incident detail still renders
 	}
 
 	payload := map[string]any{

@@ -130,6 +130,48 @@ func TestGetIncident_NoMemoryOmitsBlock(t *testing.T) {
 	}
 }
 
+// A MemoryView error must omit the memory block, not fail the whole incident
+// detail — the operator read stays available even if recall computation errors.
+func TestGetIncident_MemoryErrorOmitsBlockNotWholeResponse(t *testing.T) {
+	st := newMCPStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	key := "cluster=prod,namespace=web,service=api"
+
+	// Current incident (valid) + a same-key prior with a corrupt first_alert_at,
+	// so scanning the candidate for the memory view fails to parse.
+	if err := st.InsertIncident(ctx, store.Incident{ID: "inc-cur", GroupKey: key, FirstAlertAt: now, LastAlertAt: now, ReadyAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	ts := now.Format(time.RFC3339Nano)
+	if _, err := st.DB().ExecContext(ctx, `
+		INSERT INTO incidents (id, group_key, status, first_alert_at, last_alert_at, ready_at, alert_count,
+			summary, root_cause, confidence, output_json, created_at, updated_at, memory_refute_marks)
+		VALUES ('inc-corrupt', ?, 'analyzed', 'not-a-timestamp', ?, ?, 1, 's', 'rc', 0.6, '{}', ?, ?, 0)
+	`, key, ts, ts, ts, ts); err != nil {
+		t.Fatalf("seed corrupt prior: %v", err)
+	}
+
+	s := NewServer(Config{MemoryLookbackDays: 90}, st, audit.New(st.DB()))
+	res, err := s.handleGetIncident(ctx, reqWith(map[string]any{"incident_id": "inc-cur"}))
+	if err != nil || res.IsError {
+		t.Fatalf("incident detail must still render when recall errors: %v %s", err, resultText(t, res))
+	}
+	var core struct {
+		ID     string `json:"id"`
+		Memory *any   `json:"memory"`
+	}
+	if err := json.Unmarshal([]byte(resultText(t, res)), &core); err != nil {
+		t.Fatalf("payload not JSON: %v", err)
+	}
+	if core.ID != "inc-cur" {
+		t.Errorf("core incident fields must render, got id=%q", core.ID)
+	}
+	if core.Memory != nil {
+		t.Errorf("memory block should be omitted on a recall error, got %v", *core.Memory)
+	}
+}
+
 // A drill incident's detail recalls only drill-side priors, and vice versa (R27).
 func TestGetIncident_MemoryRespectsDrillParity(t *testing.T) {
 	st := newMCPStore(t)

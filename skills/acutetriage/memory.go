@@ -35,6 +35,12 @@ const maxRecallEntryChars = 600
 // rest fold into a "+N more" line (R15, the Sentry MaxIssues+MoreCount idiom).
 const maxWeakEntries = 2
 
+// weakPrefilterScan is how many prefilter candidates FetchMemory pulls so the
+// "+N more" count is accurate — larger than maxWeakEntries but bounded, since the
+// prefilter's candidate scan is the same cost regardless (limit only caps the
+// returned slice). Weak matches beyond this still fold into "+N more".
+const weakPrefilterScan = 25
+
 // demotionThreshold is the contradiction-mark count at which a prior drops from
 // strong recall so a newer finding displaces it (R17).
 const demotionThreshold = 2
@@ -100,10 +106,10 @@ func FetchMemory(ctx context.Context, reader MemoryReader, params MemoryParams, 
 	since := now.AddDate(0, 0, -lookback)
 
 	view, err := reader.MemoryView(ctx, inc.GroupKey, inc.ID, isDrill, since)
-	if err != nil {
-		return nil
+	if err != nil || view == nil {
+		return nil // a recall miss (or a defensive nil view) never blocks triage
 	}
-	weakCandidates, err := reader.MemoryPrefilter(ctx, inc.GroupKey, inc.ID, isDrill, since, maxWeakEntries+1)
+	weakCandidates, err := reader.MemoryPrefilter(ctx, inc.GroupKey, inc.ID, isDrill, since, weakPrefilterScan)
 	if err != nil {
 		weakCandidates = nil // a prefilter miss must not sink the exact-key recall
 	}
@@ -117,7 +123,7 @@ func FetchMemory(ctx context.Context, reader MemoryReader, params MemoryParams, 
 		CadenceMedianS: int(view.CadenceMedian.Seconds()),
 	}
 	if len(view.PriorFindings) > 0 {
-		m.LatestAgo = humanizeAge(now.Sub(view.PriorFindings[0].AnalyzedAt))
+		m.LatestAgo = humanizeAge(now.Sub(latestAnalyzedAt(view.PriorFindings)))
 	}
 
 	// Fold same-key priors: the most-recent non-demoted prior takes the strong
@@ -227,8 +233,10 @@ func (s *Skill) recordMemoryRecall(ctx context.Context, inc store.Incident, memo
 
 // applyDisposition runs the disposition-lite lookup (R19): for each recalled
 // entry carrying a corroborating Sentry issue id, one bounded query reads the
-// issue's current status and renders the transition. All lookups share one
-// deadline (params.FetchTimeoutSeconds) with the rest of enrichment. Fail-safe: a
+// issue's current status and renders the transition. All lookups for this triage
+// share ONE deadline of params.FetchTimeoutSeconds (the same budget the Error
+// source uses), so the total added latency on the correlator loop is capped at a
+// single timeout regardless of how many entries are checked. Fail-safe: a
 // not-found issue adds no note (outcome "none"); any other error — 5xx, timeout —
 // renders an explicit unavailable note and never blocks the recall. A nil reader
 // (Sentry unconfigured) is a no-op.
@@ -334,6 +342,19 @@ func renderMemory(b *strings.Builder, m *MemoryEnrichment) {
 	if m.MoreCount > 0 {
 		fmt.Fprintf(b, "\n\n+%d more weak match(es)", m.MoreCount)
 	}
+	// Ask the model to judge the recalled root cause. This drives the
+	// contradiction-decay flywheel (R16/R17): the verdict is soft-required —
+	// read post-parse, never in the client-enforced RequiredKeys — and requested
+	// only when there is a folded strong entry to judge, so the marks it routes
+	// have a target. Without this request the model never emits the key and the
+	// decay loop is inert.
+	if m.Strong != nil {
+		b.WriteString("\n\nAfter weighing this incident's own evidence, add a \"memory_verdict\" " +
+			"field to your JSON response judging the folded prior hypothesis above: \"confirms\" if " +
+			"this incident's evidence supports that root cause, \"refutes\" if the evidence points to a " +
+			"different cause, or \"silent\" if the evidence is insufficient to tell. Do NOT raise your " +
+			"confidence on the strength of the recalled hypothesis alone.")
+	}
 }
 
 // writeStrongEntry renders the folded exact-key recall: the "[folded ×N]" count
@@ -365,10 +386,35 @@ func writeWeakEntry(b *strings.Builder, e RecalledEntry) {
 
 // writeHypothesis writes the unconfirmed-hypothesis line for one entry, capping
 // the root-cause text. The "(confidence X, unconfirmed)" framing is the R14/R20
-// injection posture: recalled text is a hypothesis, never fact.
+// injection posture: recalled text is a hypothesis, never fact. The text is
+// flattened to a single line first so an attacker-influenced prior cannot forge
+// new prompt lines or sections out of the framed hypothesis.
 func writeHypothesis(b *strings.Builder, e RecalledEntry) {
 	fmt.Fprintf(b, "\n  prior hypothesis (confidence %.2f, unconfirmed): %s",
-		e.Confidence, capText(e.RootCause, maxRecallEntryChars))
+		e.Confidence, capText(flattenRecalled(e.RootCause), maxRecallEntryChars))
+}
+
+// recalledLineBreaks collapses the structural whitespace an attacker could smuggle
+// into a recalled root cause (a prior LLM output paraphrased from alert text) into
+// single spaces, so it stays on the one framed hypothesis line.
+var recalledLineBreaks = strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ", "\t", " ")
+
+// flattenRecalled neutralizes line structure in recalled free text (injection
+// hardening, R20): the render frames each hypothesis on a single line, so a
+// newline in the text must never open an un-indented forged line.
+func flattenRecalled(s string) string { return recalledLineBreaks.Replace(s) }
+
+// latestAnalyzedAt returns the most recent AnalyzedAt across recalled priors.
+// PriorFindings is ordered by created_at, but a prior can be re-judged later than
+// a newer-created one, so the headline age must scan for the true latest.
+func latestAnalyzedAt(priors []store.PriorFinding) time.Time {
+	latest := priors[0].AnalyzedAt
+	for _, pf := range priors[1:] {
+		if pf.AnalyzedAt.After(latest) {
+			latest = pf.AnalyzedAt
+		}
+	}
+	return latest
 }
 
 // writeDisposition appends the disposition-lite transition line when present
