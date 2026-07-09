@@ -174,7 +174,7 @@ var cannedGroupValues = map[string]string{
 // merge into the previous Drill, and discovery matches exactly), fingerprints
 // are run-scoped deterministic hashes, and every alert carries the reserved
 // drill marker (ADR-0013).
-func materializeScenario(sc drillScenario, groupLabelKeys []string, runID string, now time.Time) (drillRun, error) {
+func materializeScenario(sc drillScenario, groupLabelKeys []string, groupSalt, fpSeed string, now time.Time) (drillRun, error) {
 	if len(sc.alerts) == 0 || len(sc.alerts) > maxDrillAlerts {
 		return drillRun{}, fmt.Errorf("drill: scenario %s has %d alerts, want 1..%d (max-fire cap)", sc.key, len(sc.alerts), maxDrillAlerts)
 	}
@@ -182,6 +182,11 @@ func materializeScenario(sc drillScenario, groupLabelKeys []string, runID string
 		return drillRun{}, fmt.Errorf("drill: target config has no correlator.group_labels")
 	}
 
+	// groupSalt sets the run-unique group key (the correlator's collapse key);
+	// fpSeed sets the alert fingerprints. A fresh run passes the same value for
+	// both. A recurrence-collapse rerun reuses groupSalt (so it lands on the
+	// prior incident's key) but takes a FRESH fpSeed, so its alerts are a new
+	// firing episode — a distinct-fingerprint attach, not an unchanged repeat.
 	adapted := make(map[string]string, len(groupLabelKeys))
 	for i, key := range groupLabelKeys {
 		key = strings.TrimSpace(key)
@@ -193,7 +198,7 @@ func materializeScenario(sc drillScenario, groupLabelKeys []string, runID string
 			v = "drill-" + key
 		}
 		if i == 0 {
-			v = v + "-" + runID
+			v = v + "-" + groupSalt
 		}
 		adapted[key] = v
 	}
@@ -219,17 +224,17 @@ func materializeScenario(sc drillScenario, groupLabelKeys []string, runID string
 			Labels:      labels,
 			Annotations: tpl.annotations,
 			StartsAt:    now,
-			Fingerprint: drillFingerprint(runID, tpl.alertname, i),
+			Fingerprint: drillFingerprint(fpSeed, tpl.alertname, i),
 		})
 	}
 
 	run := drillRun{
-		runID:            runID,
+		runID:            groupSalt,
 		groupLabelValues: adapted,
 		expectedGroupKey: drillGroupKey(adapted),
 		alerts: ingress.AlertmanagerPayload{
 			Version:      "4",
-			GroupKey:     "alertint-drill/" + runID,
+			GroupKey:     "alertint-drill/" + fpSeed,
 			Status:       "firing",
 			Receiver:     "alertint-drill",
 			CommonLabels: adapted,

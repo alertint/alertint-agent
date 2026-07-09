@@ -268,6 +268,10 @@ func (s *Server) handleListIncidents(ctx context.Context, req mcplib.CallToolReq
 		// Drill: the incident contains a Drill alert (alertint_drill="true",
 		// ADR-0013) — synthetic, fired by `alertint drill`.
 		Drill bool `json:"drill,omitempty"`
+		// Occurrences is the count of re-fire episodes collapsed into this
+		// incident by recurrence collapse (the incident_occurrences ledger); 0
+		// for a first-time incident. The rendered "recurred ×N" is Occurrences+1.
+		Occurrences int `json:"occurrences,omitempty"`
 	}
 
 	ids := make([]string, len(incidents))
@@ -281,6 +285,10 @@ func (s *Server) handleListIncidents(ctx context.Context, req mcplib.CallToolReq
 	drills, err := s.st.IncidentDrillFlags(ctx, ids)
 	if err != nil {
 		return errResult("failed to load drill flags: " + err.Error()), nil
+	}
+	occ, err := s.st.OccurrenceStatsByIncident(ctx, ids)
+	if err != nil {
+		return errResult("failed to load occurrence counts: " + err.Error()), nil
 	}
 
 	rows := make([]row, 0, len(incidents))
@@ -299,6 +307,7 @@ func (s *Server) handleListIncidents(ctx context.Context, req mcplib.CallToolReq
 			CreatedAt:    inc.CreatedAt,
 			Recovery:     buildRecovery(c.Firing, c.Resolved, c.Total, inc.Status, inc.UpdatedAt),
 			Drill:        drills[inc.ID],
+			Occurrences:  occ[inc.ID].Count,
 		})
 	}
 
@@ -375,6 +384,14 @@ func (s *Server) handleGetIncident(ctx context.Context, req mcplib.CallToolReque
 		}
 	}
 
+	// Occurrence summary (recurrence collapse): the count of re-fire episodes
+	// and when the last one landed, from the same ledger the LLM saw.
+	occ, err := s.st.OccurrenceStatsByIncident(ctx, []string{id})
+	if err != nil {
+		return errResult("failed to load occurrences: " + err.Error()), nil
+	}
+	stats := occ[id]
+
 	payload := map[string]any{
 		"id":             inc.ID,
 		"group_key":      inc.GroupKey,
@@ -389,8 +406,12 @@ func (s *Server) handleGetIncident(ctx context.Context, req mcplib.CallToolReque
 		"confidence":     inc.Confidence,
 		"recovery":       buildRecovery(firing, resolved, len(alerts), inc.Status, inc.UpdatedAt),
 		"drill":          drill,
+		"occurrences":    stats.Count,
 		"finding":        finding,
 		"alerts":         alertRows,
+	}
+	if stats.Count > 0 {
+		payload["last_occurrence_at"] = stats.LastSeen
 	}
 
 	result, err := mcplib.NewToolResultJSON(payload)

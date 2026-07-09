@@ -20,7 +20,7 @@ func mustMaterialize(t *testing.T, scenario string, keys []string, runID string)
 	if !ok {
 		t.Fatalf("unknown scenario %q", scenario)
 	}
-	run, err := materializeScenario(sc, keys, runID, time.Now().UTC())
+	run, err := materializeScenario(sc, keys, runID, runID, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("materialize %s: %v", scenario, err)
 	}
@@ -102,7 +102,7 @@ func TestMaterialize_RunScoping(t *testing.T) {
 func TestMaterialize_ChangeEventOverlapsBurst(t *testing.T) {
 	now := time.Now().UTC()
 	sc := drillScenarios()["flagship"]
-	run, err := materializeScenario(sc, defaultGroupLabels, "e3f4a5", now)
+	run, err := materializeScenario(sc, defaultGroupLabels, "e3f4a5", "e3f4a5", now)
 	if err != nil {
 		t.Fatalf("materialize: %v", err)
 	}
