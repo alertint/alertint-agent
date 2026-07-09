@@ -155,6 +155,57 @@ func FetchMemory(ctx context.Context, reader MemoryReader, params MemoryParams, 
 	return m
 }
 
+// validMemoryVerdicts is the closed enum for the soft-required memory_verdict.
+var validMemoryVerdicts = map[string]bool{"confirms": true, "refutes": true, "silent": true}
+
+// recordMemoryRecall maintains contradiction-decay marks from the model's
+// memory_verdict and audits every rendered recall (R16/R17/R28). The verdict is
+// soft-required — enforced here post-parse, never in the client RequiredKeys, so
+// a missing or invalid verdict is treated as silent and noted rather than
+// aborting a good triage. Marks route onto the recalled prior's incident (the
+// strong entry): refutes increments (demoting at the threshold), confirms clears.
+// All mark writes are best-effort; a bookkeeping failure never fails triage.
+func (s *Skill) recordMemoryRecall(ctx context.Context, inc store.Incident, memory *MemoryEnrichment, verdict string) {
+	effective, note := verdict, ""
+	switch {
+	case verdict == "":
+		effective, note = "silent", "absent"
+	case !validMemoryVerdicts[verdict]:
+		effective, note = "silent", "invalid"
+	}
+
+	if memory.Strong != nil {
+		switch effective {
+		case "refutes":
+			if marks, err := s.st.IncrementRefuteMarks(ctx, memory.Strong.IncidentID); err != nil {
+				s.logger.Warn("acutetriage: increment refute marks failed", "prior", memory.Strong.IncidentID, "err", err)
+			} else if marks >= demotionThreshold {
+				s.logger.Info("memory prior demoted (contradiction decay)", "prior", memory.Strong.IncidentID, "marks", marks)
+			}
+		case "confirms":
+			if err := s.st.ClearRefuteMarks(ctx, memory.Strong.IncidentID); err != nil {
+				s.logger.Warn("acutetriage: clear refute marks failed", "prior", memory.Strong.IncidentID, "err", err)
+			}
+		}
+	}
+
+	if s.auditor != nil {
+		payload := map[string]any{
+			"incident_id":  inc.ID,
+			"rung":         memory.Rung,
+			"folded_count": memory.Episodes,
+			"verdict":      effective,
+		}
+		if note != "" {
+			payload["verdict_note"] = note
+		}
+		if memory.Strong != nil {
+			payload["recalled"] = memory.Strong.IncidentID
+		}
+		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.memory_recalled", payload)
+	}
+}
+
 // recalledFrom projects a store PriorFinding onto the render/persist entry.
 func recalledFrom(pf store.PriorFinding, weak, superseded bool) RecalledEntry {
 	return RecalledEntry{

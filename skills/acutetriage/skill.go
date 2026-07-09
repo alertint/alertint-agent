@@ -104,6 +104,11 @@ type llmResponse struct {
 	Severity            string        `json:"severity"`
 	Confidence          float64       `json:"confidence"`
 	Alerts              []alertOutput `json:"alerts"`
+	// MemoryVerdict is the model's confirms|refutes|silent judgment on the
+	// recalled root cause. Soft-required: it is NOT in RequiredKeys (a missing
+	// bookkeeping key must not abort a good triage), so absent/invalid is treated
+	// as silent post-parse. Present only when a memory section was rendered.
+	MemoryVerdict string `json:"memory_verdict,omitempty"`
 }
 
 type alertOutput struct {
@@ -284,6 +289,20 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 				"role", ao.RoleInIncident,
 				"err", err,
 			)
+		}
+	}
+
+	// Memory bookkeeping (M2): maintain the contradiction-decay marks from the
+	// model's verdict and audit the recall. Best-effort — a bookkeeping failure
+	// never fails a triage that already persisted its finding.
+	if memory != nil {
+		s.recordMemoryRecall(ctx, inc, memory, resp.MemoryVerdict)
+	}
+	if p.rejudge {
+		// A re-judgment replaced this incident's finding (new hypothesis): reset
+		// its own contradiction marks so a stale refutation does not linger.
+		if err := s.st.ClearRefuteMarks(ctx, inc.ID); err != nil {
+			s.logger.Warn("acutetriage: reset refute marks on replacement failed", "incident_id", inc.ID, "err", err)
 		}
 	}
 
