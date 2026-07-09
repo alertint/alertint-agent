@@ -295,6 +295,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	cor.SetResolutionNotifier(notifyresolution.New(notifier, st))
 	cor.SetAuditor(auditor)
 	cor.SetRejudger(skill)
+	cor.SetOccurrenceNotifier(notifier)
 
 	if err := cor.Start(ctx); err != nil {
 		return fmt.Errorf("correlator start: %w", err)
@@ -737,7 +738,7 @@ func buildHealthChecks(cfg *config.Config, prom *promclient.Client, logSrc logs.
 //     confirmed (notified · stdout=ok) at INFO. Its verbose full JSON line is
 //     written only at debug level (consistently, in every format).
 //   - slack: when enabled and a bot token resolves.
-func buildNotifier(cfg *config.Config, st *store.Store, auditor *audit.Auditor, logger *slog.Logger, debug bool) notify.Notifier {
+func buildNotifier(cfg *config.Config, st *store.Store, auditor *audit.Auditor, logger *slog.Logger, debug bool) *notify.Multi {
 	var nn []notify.Notifier
 	var sinks []string
 	slackWired := false

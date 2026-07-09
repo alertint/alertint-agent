@@ -19,7 +19,7 @@ type fakeOccNotifier struct {
 	calls []store.OccurrenceStats
 }
 
-func (f *fakeOccNotifier) OnOccurrenceAttached(_ context.Context, _ store.Incident, stats store.OccurrenceStats) error {
+func (f *fakeOccNotifier) OnOccurrenceAttached(_ context.Context, _ store.Incident, stats store.OccurrenceStats, _ bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, stats)

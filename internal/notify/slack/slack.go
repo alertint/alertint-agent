@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	slacklib "github.com/slack-go/slack"
@@ -42,6 +43,16 @@ type Notifier struct {
 	store       ThreadStore
 	auditor     *audit.Auditor
 	minSeverity string // findings below this severity are not posted ("" = low = post everything)
+
+	// Occurrence card-edit throttle (recurrence collapse, R10): at most one edit
+	// per incident per occEditThrottle, coalesced, with a trailing flush. now and
+	// after are seams so the throttle is deterministic in tests; occ holds
+	// in-memory per-incident state (lost on restart — the next attach
+	// self-corrects, an accepted gap).
+	now   func() time.Time
+	after func(d time.Duration, fn func()) stopper
+	occMu sync.Mutex
+	occ   map[string]*occThrottle
 }
 
 // Probe verifies the bot token against the Slack auth.test API. Used by
@@ -55,19 +66,26 @@ func Probe(ctx context.Context, botToken string) error {
 // New constructs a Slack Notifier using a bot token (xoxb-...). minSeverity
 // is the channel noise gate (low | medium | high; "" means low).
 func New(botToken, channel, minSeverity string, store ThreadStore, auditor *audit.Auditor) *Notifier {
-	return &Notifier{
-		client:      slacklib.New(botToken),
-		channel:     channel,
-		store:       store,
-		auditor:     auditor,
-		minSeverity: minSeverity,
-	}
+	return newNotifier(slacklib.New(botToken), channel, minSeverity, store, auditor)
 }
 
 // NewWithClient constructs a Notifier with a custom SlackClient, enabling
 // injection of a mock in tests.
 func NewWithClient(client SlackClient, channel, minSeverity string, store ThreadStore, auditor *audit.Auditor) *Notifier {
-	return &Notifier{client: client, channel: channel, minSeverity: minSeverity, store: store, auditor: auditor}
+	return newNotifier(client, channel, minSeverity, store, auditor)
+}
+
+func newNotifier(client SlackClient, channel, minSeverity string, store ThreadStore, auditor *audit.Auditor) *Notifier {
+	return &Notifier{
+		client:      client,
+		channel:     channel,
+		minSeverity: minSeverity,
+		store:       store,
+		auditor:     auditor,
+		now:         time.Now,
+		after:       func(d time.Duration, fn func()) stopper { return time.AfterFunc(d, fn) },
+		occ:         make(map[string]*occThrottle),
+	}
 }
 
 // Name returns the stable sink label used in the notify outcome line. The

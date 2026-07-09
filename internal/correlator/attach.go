@@ -314,7 +314,8 @@ func (c *Correlator) attachOccurrence(ctx context.Context, a store.Alert, inc st
 
 	stats := c.occurrenceStats(ctx, inc.ID)
 	if c.occNotifier != nil {
-		if err := c.occNotifier.OnOccurrenceAttached(ctx, inc, stats); err != nil {
+		drill := a.Labels[store.DrillMarkerLabel] == store.DrillMarkerValue
+		if err := c.occNotifier.OnOccurrenceAttached(ctx, inc, stats, drill); err != nil {
 			c.logger.Warn("correlator: occurrence notify failed", "err", err, "incident_id", inc.ID)
 		}
 	}

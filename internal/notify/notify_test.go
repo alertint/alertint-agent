@@ -17,7 +17,35 @@ import (
 	"github.com/alertint/alertint-agent/internal/notify"
 	"github.com/alertint/alertint-agent/internal/notify/slack"
 	"github.com/alertint/alertint-agent/internal/notify/stdout"
+	"github.com/alertint/alertint-agent/internal/store"
 )
+
+// occCapableSink is a Notifier that also implements notify.OccurrenceSink.
+type occCapableSink struct {
+	fakeNotifier
+
+	occ int
+}
+
+func (s *occCapableSink) OnOccurrenceAttached(context.Context, store.Incident, store.OccurrenceStats, bool) error {
+	s.occ++
+	return nil
+}
+
+func TestMulti_OnOccurrenceAttachedFansOutOnlyToCapableSinks(t *testing.T) {
+	occ := &occCapableSink{fakeNotifier: fakeNotifier{name: "occ"}}
+	plain := &fakeNotifier{name: "plain"} // no OnOccurrenceAttached
+	m := notify.NewMulti(slog.Default(), occ, plain)
+
+	if err := m.OnOccurrenceAttached(context.Background(),
+		store.Incident{ID: "i1"}, store.OccurrenceStats{Count: 1}, false); err != nil {
+		t.Fatalf("OnOccurrenceAttached: %v", err)
+	}
+	if occ.occ != 1 {
+		t.Errorf("occurrence-capable sink called %d times, want 1", occ.occ)
+	}
+	// A plain sink is skipped without panicking — reaching here proves it.
+}
 
 func sampleFinding() notify.Finding {
 	return notify.Finding{
