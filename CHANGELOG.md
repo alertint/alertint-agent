@@ -21,6 +21,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`attach_window_minutes`, `judgment_ceiling_hours`, `occurrence_cap`,
   `lookback_days`). MCP incident payloads now carry an `occurrences` count, and
   running `alertint drill` twice inside the window demonstrates the collapse.
+- **Memory recall** — when a new incident matches a past analysis for the same
+  key, the prior findings are injected into the new analysis as a `memory`
+  enrichment section, so the model triages with "we have seen this before" in
+  hand: the recurrence count and cadence as computed facts, and each prior root
+  cause framed as an unconfirmed hypothesis. Recalled findings never count as
+  live evidence, so an evidence-free re-fire stays under the metadata-only
+  confidence cap regardless of the prior's confidence. The model returns a
+  `confirms`/`refutes`/`silent` verdict on the recalled cause; a cause refuted
+  twice is demoted so a newer finding displaces it. When a recalled finding
+  points at an application error, one bounded status check renders the transition
+  (`resolved → now firing = likely regression`, `ignored = known-tolerated`). MCP
+  incident payloads gain a `memory` block showing exactly what the analysis saw.
+  Deterministic and on by default; recall reuses the `memory.lookback_days`
+  horizon. See [Incident memory](docs/concepts/incident-memory.md).
 
 ### Changed
 
