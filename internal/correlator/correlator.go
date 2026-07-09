@@ -54,6 +54,28 @@ type NopIncidentSink struct{}
 
 func (NopIncidentSink) OnIncidentReady(_ context.Context, _ store.Incident) error { return nil }
 
+// OccurrenceNotifier receives a deterministic, zero-LLM notification each time a
+// re-fire attaches as an occurrence (recurrence collapse). The stdout notifier
+// emits one line; the Slack notifier edits the incident's card in place. Wired
+// in U5 — nil means no occurrence notifications.
+type OccurrenceNotifier interface {
+	OnOccurrenceAttached(ctx context.Context, inc store.Incident, stats store.OccurrenceStats) error
+}
+
+// Rejudger runs a fresh triage that replaces an incident's finding in place when
+// an escalation trigger or the Clock B ceiling fires. Implemented by the triage
+// skill and wired in U4 — nil means an escalation records its occurrence and
+// trigger but no re-judgment runs yet.
+type Rejudger interface {
+	Rejudge(ctx context.Context, inc store.Incident, trigger string) error
+}
+
+// Auditor is the subset of internal/audit the correlator uses to record
+// occurrence attaches (incident.occurrence_attached). nil disables auditing.
+type Auditor interface {
+	Append(ctx context.Context, actor, kind string, payload any) error
+}
+
 // Config holds tunables for the Correlator.
 type Config struct {
 	// WindowSeconds is the fixed correlation window duration. Defaults to 60.
@@ -65,6 +87,12 @@ type Config struct {
 	// Only these labels are included in the group key. If empty, all
 	// labels are used (not recommended for production).
 	GroupLabels []string
+
+	// Incident-memory (M1) horizon knobs. Zero values take the defaults below.
+	AttachWindow    time.Duration // Clock A: sliding attach window from the last occurrence (default 30m)
+	JudgmentCeiling time.Duration // Clock B: max time since the last judgment before a forced re-judgment (default 4h)
+	OccurrenceCap   int           // re-judge backstop after this many attaches since the last judgment (default 100)
+	Lookback        time.Duration // occurrence pruning + cadence lookback horizon (default 90d)
 }
 
 // DefaultTickInterval is the flush-ticker default, exported so callers that
@@ -79,6 +107,18 @@ func (c *Config) defaults() {
 	if c.TickInterval <= 0 {
 		c.TickInterval = DefaultTickInterval
 	}
+	if c.AttachWindow <= 0 {
+		c.AttachWindow = 30 * time.Minute
+	}
+	if c.JudgmentCeiling <= 0 {
+		c.JudgmentCeiling = 4 * time.Hour
+	}
+	if c.OccurrenceCap <= 0 {
+		c.OccurrenceCap = 100
+	}
+	if c.Lookback <= 0 {
+		c.Lookback = 90 * 24 * time.Hour
+	}
 }
 
 // Correlator groups incoming store.Alert values into incidents using a
@@ -88,7 +128,15 @@ type Correlator struct {
 	st                 *store.Store
 	sink               IncidentSink
 	resolutionNotifier ResolutionNotifier
+	occNotifier        OccurrenceNotifier
+	rejudger           Rejudger
+	auditor            Auditor
 	logger             *slog.Logger
+
+	// pruneEvery is how many flush ticks pass between occurrence prunes (~hourly
+	// at the default tick). Set in New; tests may override.
+	pruneEvery int
+	flushCount int
 
 	alertCh chan store.Alert
 
@@ -107,14 +155,19 @@ func New(cfg Config, st *store.Store, sink IncidentSink, logger *slog.Logger) *C
 	if logger == nil {
 		logger = slog.Default()
 	}
+	pruneEvery := int(time.Hour / cfg.TickInterval)
+	if pruneEvery < 1 {
+		pruneEvery = 1
+	}
 	return &Correlator{
-		cfg:     cfg,
-		st:      st,
-		sink:    sink,
-		logger:  logger,
-		alertCh: make(chan store.Alert, 256),
-		stopCh:  make(chan struct{}),
-		doneCh:  make(chan struct{}),
+		cfg:        cfg,
+		st:         st,
+		sink:       sink,
+		logger:     logger,
+		pruneEvery: pruneEvery,
+		alertCh:    make(chan store.Alert, 256),
+		stopCh:     make(chan struct{}),
+		doneCh:     make(chan struct{}),
 	}
 }
 
@@ -123,6 +176,15 @@ func New(cfg Config, st *store.Store, sink IncidentSink, logger *slog.Logger) *C
 func (c *Correlator) SetResolutionNotifier(rn ResolutionNotifier) {
 	c.resolutionNotifier = rn
 }
+
+// SetOccurrenceNotifier sets the collapse notifier (U5). Call after New, before Start.
+func (c *Correlator) SetOccurrenceNotifier(n OccurrenceNotifier) { c.occNotifier = n }
+
+// SetRejudger sets the re-judgment runner (U4). Call after New, before Start.
+func (c *Correlator) SetRejudger(r Rejudger) { c.rejudger = r }
+
+// SetAuditor sets the auditor for occurrence-attach events. Call after New, before Start.
+func (c *Correlator) SetAuditor(a Auditor) { c.auditor = a }
 
 // Accept implements ingress.AlertSink. It is safe to call from multiple
 // goroutines and will not block unless the internal channel is full.
@@ -220,6 +282,23 @@ func (c *Correlator) handleAlert(ctx context.Context, a store.Alert) error {
 		handled, handleErr := c.handleResolvedAlert(ctx, a, gk)
 		if handleErr != nil {
 			return handleErr
+		}
+		if handled {
+			return nil
+		}
+	}
+
+	// Recurrence collapse (M1): a firing re-fire with no open window may attach
+	// to an already-judged incident as an occurrence instead of minting a new
+	// incident + LLM call. This is a firing-side mirror of the resolved branch
+	// above. Loop-serialization invariant: re-judgment runs inline on this
+	// goroutine, so attaches arriving mid-flight queue in alertCh behind it —
+	// that gives R7's single-flight and the no-double-mint property for free. A
+	// future async refactor reopens the mid-flight double-mint race.
+	if err == store.ErrNotFound && a.Status == "firing" {
+		handled, attachErr := c.maybeAttachOccurrence(ctx, a, gk)
+		if attachErr != nil {
+			return attachErr
 		}
 		if handled {
 			return nil
@@ -346,6 +425,13 @@ func (c *Correlator) flushExpired(ctx context.Context) error {
 		if err := c.sink.OnIncidentReady(ctx, ready); err != nil {
 			c.logger.Error("correlator: sink error", "incident_id", inc.ID, "err", err)
 		}
+	}
+
+	// Piggyback occurrence pruning on the flush ticker (~hourly at the default
+	// tick), so old occurrence rows are reclaimed without a separate job (R12).
+	c.flushCount++
+	if c.pruneEvery > 0 && c.flushCount%c.pruneEvery == 0 {
+		c.pruneOldOccurrences(ctx)
 	}
 	return nil
 }

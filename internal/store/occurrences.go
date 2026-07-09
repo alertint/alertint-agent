@@ -174,6 +174,39 @@ func (s *Store) ReplaceIncidentOutput(ctx context.Context, incidentID, outputJSO
 	return nil
 }
 
+// CountOccurrencesSince returns how many occurrence rows for an incident have
+// occurred_at strictly after `since` — the "attaches since the last judgment"
+// backing the occurrence-cap trigger. `since` is the incident's last_judged_at,
+// so a re-judgment (which advances last_judged_at) resets the count to zero.
+func (s *Store) CountOccurrencesSince(ctx context.Context, incidentID string, since time.Time) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM incident_occurrences
+		WHERE incident_id = ? AND occurred_at > ?
+	`, incidentID, since.UTC().Format(time.RFC3339Nano)).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("store: count occurrences since: %w", err)
+	}
+	return n, nil
+}
+
+// TouchIncidentActivity slides an incident's last_alert_at forward (MAX
+// semantics) without adding a member or occurrence — the write for an unchanged
+// repeat of the original firing when the incident has no occurrence row yet, so
+// Clock A stays anchored to recent activity for a future new episode.
+func (s *Store) TouchIncidentActivity(ctx context.Context, incidentID string, t time.Time) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE incidents
+		SET last_alert_at = MAX(last_alert_at, ?), updated_at = ?
+		WHERE id = ?
+	`, t.UTC().Format(time.RFC3339Nano), now, incidentID)
+	if err != nil {
+		return fmt.Errorf("store: touch incident activity: %w", err)
+	}
+	return nil
+}
+
 // TouchOccurrenceLastSeen advances last_seen on an existing occurrence without
 // adding a row — the write for an unchanged Alertmanager repeat (same
 // fingerprint + starts_at, still firing), which slides Clock A but is not a new

@@ -475,6 +475,59 @@ func TestPruneOccurrences_NothingOldReturnsZero(t *testing.T) {
 	}
 }
 
+func TestCountOccurrencesSince(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 7, 8, 15, 0, 0, 0, time.UTC)
+	seedIncident(t, s, "inc_1", "k", "analyzed", base)
+	// 2 before the boundary, 3 after.
+	for i := 0; i < 2; i++ {
+		if _, err := s.InsertOccurrence(ctx, sampleOccurrence("inc_1", base.Add(time.Duration(i)*time.Minute))); err != nil {
+			t.Fatalf("insert pre %d: %v", i, err)
+		}
+	}
+	boundary := base.Add(10 * time.Minute)
+	for i := 0; i < 3; i++ {
+		if _, err := s.InsertOccurrence(ctx, sampleOccurrence("inc_1", boundary.Add(time.Duration(i+1)*time.Minute))); err != nil {
+			t.Fatalf("insert post %d: %v", i, err)
+		}
+	}
+	got, err := s.CountOccurrencesSince(ctx, "inc_1", boundary)
+	if err != nil {
+		t.Fatalf("CountOccurrencesSince: %v", err)
+	}
+	if got != 3 {
+		t.Errorf("count since boundary = %d, want 3 (strictly after)", got)
+	}
+}
+
+func TestTouchIncidentActivity_SlidesLastAlertAt(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 7, 8, 15, 0, 0, 0, time.UTC)
+	seedIncident(t, s, "inc_1", "k", "analyzed", base)
+
+	later := base.Add(45 * time.Minute)
+	if err := s.TouchIncidentActivity(ctx, "inc_1", later); err != nil {
+		t.Fatalf("TouchIncidentActivity: %v", err)
+	}
+	got, err := s.GetIncidentByID(ctx, "inc_1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !got.LastAlertAt.Equal(later) {
+		t.Errorf("last_alert_at = %v, want %v", got.LastAlertAt, later)
+	}
+	// An earlier time must not move it backwards (MAX semantics).
+	if err := s.TouchIncidentActivity(ctx, "inc_1", base); err != nil {
+		t.Fatalf("touch earlier: %v", err)
+	}
+	got, _ = s.GetIncidentByID(ctx, "inc_1")
+	if !got.LastAlertAt.Equal(later) {
+		t.Errorf("last_alert_at moved backwards to %v, want %v (MAX)", got.LastAlertAt, later)
+	}
+}
+
 func TestOccurrences_CascadeDeleteWithIncident(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

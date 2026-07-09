@@ -19,6 +19,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/notify"
+	"github.com/alertint/alertint-agent/internal/severity"
 )
 
 // ThreadStore persists Slack thread coordinates (ts + channel) keyed by incident ID.
@@ -182,17 +183,10 @@ func (n *Notifier) belowMinSeverity(f notify.Finding) bool {
 // low=1, medium=2, high=3; anything else (including empty) is 0. Callers
 // interpret 0 per side: an off-ladder finding severity always posts, and an
 // empty gate value means low (config validation rejects other gate values).
+// Delegates to the shared internal/severity ladder so the gate and the
+// recurrence severity-rise trigger rank identically.
 func severityRank(s string) int {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "low":
-		return 1
-	case "medium":
-		return 2
-	case "high":
-		return 3
-	default:
-		return 0
-	}
+	return severity.Rank(s)
 }
 
 // auditSkipped records a severity-gate suppression in the audit trail.
