@@ -35,6 +35,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   incident payloads gain a `memory` block showing exactly what the analysis saw.
   Deterministic and on by default; recall reuses the `memory.lookback_days`
   horizon. See [Incident memory](docs/concepts/incident-memory.md).
+- **Shadow classifier (opt-in)** — recall matches on the verbatim group key; when
+  the key just misses but a prior finding is one label off, an optional small
+  Haiku call can judge whether it is really the same underlying condition. It
+  ships dark: `memory.classifier.mode: shadow` records every verdict in the audit
+  log while the analysis prompt stays byte-identical, so you can measure its
+  precision against memory recall's own confirm/refute ground truth before
+  flipping it to `on` (where a match tags the recall "LLM-matched, probably
+  related"). Off by default; ~$0.0003 per call on Haiku, and it never attaches,
+  suppresses, or skips a triage. See
+  [Shadow classifier](docs/concepts/incident-memory.md#shadow-classifier).
 
 ### Changed
 

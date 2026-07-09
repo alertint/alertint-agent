@@ -193,6 +193,8 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 	llmClient := llmanthropic.New(llmanthropicCfg(cfg), auditor, logger)
 
+	classifierClient := buildClassifierClient(cfg, apiKey, auditor, logger)
+
 	notifier := buildNotifier(cfg, st, auditor, logger, strings.EqualFold(level, "debug"))
 
 	// Build Prometheus client when enabled. Passed into both the triage skill
@@ -282,6 +284,12 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 			// needed. Recall is deterministic and default-on.
 			Memory:       st,
 			MemoryParams: acutetriage.MemoryParams{LookbackDays: cfg.Memory.LookbackDays},
+			// M3 shadow classifier: nil client unless mode is shadow/on. The mode
+			// gates the render/audit split inside the skill; the timeout hard-bounds
+			// the call's time on the triage path (retries and all).
+			Classifier:        classifierClient,
+			ClassifierMode:    string(cfg.Memory.Classifier.Mode),
+			ClassifierTimeout: time.Duration(cfg.Memory.Classifier.TimeoutSeconds) * time.Second,
 		},
 		st, llmClient, auditor, notifier, logger,
 	)
@@ -767,6 +775,25 @@ func buildNotifier(cfg *config.Config, st *store.Store, auditor *audit.Auditor, 
 	logger.Info("notifiers ready", attrs...)
 
 	return notify.NewMulti(logger, nn...)
+}
+
+// buildClassifierClient builds the M3 shadow-classifier LLM client: a second
+// Anthropic client on the same key + auditor, running Haiku with the classifier's
+// seconds-scale timeout. Returns a true nil interface when the mode is off (the
+// default) so nothing is constructed and no classifier call is ever made.
+func buildClassifierClient(cfg *config.Config, apiKey string, auditor *audit.Auditor, logger *slog.Logger) acutetriage.LLMClient {
+	if !cfg.Memory.Classifier.Enabled() {
+		return nil
+	}
+	logger.Info("memory shadow classifier enabled",
+		slog.String("mode", string(cfg.Memory.Classifier.Mode)),
+		slog.String("model", acutetriage.ClassifierModel),
+	)
+	return llmanthropic.New(llmanthropic.Config{
+		APIKey:         apiKey,
+		Model:          acutetriage.ClassifierModel,
+		TimeoutSeconds: cfg.Memory.Classifier.TimeoutSeconds,
+	}, auditor, logger)
 }
 
 // llmanthropicCfg builds an llm/anthropic.Config from the loaded config.

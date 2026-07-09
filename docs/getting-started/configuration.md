@@ -149,6 +149,20 @@ only the knobs below.
 | `judgment_ceiling_hours` | int | `4` | Clock B. A steady flapper that never pauses would slide Clock A forever; once this long has passed since the last analysis, the next re-fire forces a fresh re-judgment (with the accumulated history) even while still collapsing. |
 | `occurrence_cap` | int | `100` | Backstop trigger: force a re-judgment after this many occurrences have attached since the last analysis, regardless of the clocks. |
 | `lookback_days` | int | `90` | How long occurrence rows are retained and how far back recurrence counts and cadence are computed. Older occurrences are pruned on the correlator's normal flush cycle. |
+| `classifier.mode` | string | `off` | Shadow classifier (see below). `off` makes no extra LLM call; `shadow` runs a small fuzzy-match call and records every verdict in the audit log while the recall render stays unchanged; `on` lets a graduated match tag the recall. **Quote the value** — bare `off`/`on` are YAML booleans. |
+| `classifier.timeout_seconds` | int | `10` | Seconds-scale timeout for the classifier's own Haiku call. Only used when `mode` is `shadow` or `on`. |
+
+When the exact recurrence key misses but a prior finding is only one group-label
+value away (for example the same `cluster`/`namespace` but a different
+`service`), the deterministic recall renders it as a weak "one label off" signal.
+The optional **shadow classifier** adds a small second Haiku call that judges
+whether that weak candidate is really the same underlying condition. It ships
+**dark**: at `mode: shadow` the verdict lands only in the audit log
+(`memory.classifier_verdict`) and the prompt the model sees is byte-identical to
+the deterministic recall. You graduate it to `on` — where a match tags the recall
+as "LLM-matched, probably related" — only after your own audit log shows the
+call is accurate enough. See [Incident memory](../concepts/incident-memory.md#shadow-classifier)
+for the per-call cost and the graduation gate query.
 
 The recurrence key is the verbatim group key with no normalization. If you add
 a volatile per-instance label (such as `pod`, `instance`, or `job_name`) to

@@ -56,7 +56,12 @@ const memoryUntrustedNotice = "Prior findings are hypotheses from past analyses 
 // prefilter (one-label-off) candidate. Disposition is filled by the
 // disposition-lite lookup (U10) and is empty until then.
 type RecalledEntry struct {
-	IncidentID            string    `json:"incident_id"`
+	IncidentID string `json:"incident_id"`
+	// GroupKey is the prior incident's group_key, carried transiently so the
+	// shadow classifier can render the shared/differing delta against the current
+	// key (R22). Never persisted or replayed — the render never shows it, so the
+	// at-rest envelope stays byte-identical to a non-classifier triage.
+	GroupKey              string    `json:"-"`
 	AnalyzedAt            time.Time `json:"analyzed_at"`
 	Confidence            float64   `json:"confidence"`
 	RootCause             string    `json:"root_cause"`
@@ -66,6 +71,11 @@ type RecalledEntry struct {
 	Weak                  bool      `json:"weak,omitempty"`
 	CorroboratingIssueIDs []string  `json:"corroborating_issue_ids,omitempty"`
 	Disposition           string    `json:"disposition,omitempty"`
+	// ClassifierMatched marks a rung-3a weak entry the shadow classifier judged as
+	// the same underlying condition, in `on` mode only. It flips the render tag to
+	// "LLM-matched, probably related" and is persisted (persist-as-rendered) so the
+	// at-rest envelope reflects exactly what the model saw. Never set in shadow mode.
+	ClassifierMatched bool `json:"classifier_matched,omitempty"`
 }
 
 // MemoryEnrichment is the recall section: the fourth envelope key beside
@@ -88,6 +98,12 @@ type MemoryEnrichment struct {
 	Strong    *RecalledEntry  `json:"strong,omitempty"`
 	Weak      []RecalledEntry `json:"weak,omitempty"`
 	MoreCount int             `json:"more_count,omitempty"`
+	// topPrefilter is the most-recent rung-3a (one-label-off) prefilter candidate,
+	// retained for the shadow classifier independent of the weak-entry render cap:
+	// a key with several demoted same-key priors can push every prefilter candidate
+	// out of the rendered Weak slots, and the classifier must still be able to judge
+	// one. Transient (never rendered or persisted); nil when there is no candidate.
+	topPrefilter *RecalledEntry
 }
 
 // FetchMemory assembles the recall for a triage of inc: the exact-key strong
@@ -146,6 +162,12 @@ func FetchMemory(ctx context.Context, reader MemoryReader, params MemoryParams, 
 	weak := demoted
 	for _, pf := range weakCandidates {
 		weak = append(weak, recalledFrom(pf, true, false))
+	}
+	// Retain the top prefilter candidate for the classifier before the render cap:
+	// demoted entries can otherwise fill every weak slot and hide it from the render.
+	if len(weakCandidates) > 0 {
+		top := recalledFrom(weakCandidates[0], true, false)
+		m.topPrefilter = &top
 	}
 	if len(weak) > maxWeakEntries {
 		m.MoreCount = len(weak) - maxWeakEntries
@@ -302,6 +324,7 @@ func issueDate(ts string) string {
 func recalledFrom(pf store.PriorFinding, weak, superseded bool) RecalledEntry {
 	return RecalledEntry{
 		IncidentID:            pf.IncidentID,
+		GroupKey:              pf.GroupKey,
 		AnalyzedAt:            pf.AnalyzedAt,
 		Confidence:            pf.Confidence,
 		RootCause:             pf.RootCause,
@@ -372,9 +395,14 @@ func writeStrongEntry(b *strings.Builder, m *MemoryEnrichment) {
 	writeDisposition(b, *e)
 }
 
-// writeWeakEntry renders a rung-3a or demoted entry.
+// writeWeakEntry renders a rung-3a or demoted entry. A graduated shadow-classifier
+// match (on mode) promotes the "one label off" framing to "LLM-matched, probably
+// related"; a demoted same-key prior is never a classifier candidate, so the
+// branches are mutually exclusive.
 func writeWeakEntry(b *strings.Builder, e RecalledEntry) {
 	switch {
+	case e.ClassifierMatched:
+		b.WriteString("- [LLM-matched, probably related]")
 	case e.Superseded:
 		fmt.Fprintf(b, "- [superseded after %d contradictions]", e.ContradictionMarks)
 	default:
