@@ -230,6 +230,12 @@ const (
 	DrillMarkerValue = "true"
 )
 
+// IsDrillAlert reports whether an alert carries the Drill-alert marker (ADR-0013)
+// — the one place the marker check lives, so callers don't re-spell it.
+func IsDrillAlert(a Alert) bool {
+	return a.Labels[DrillMarkerLabel] == DrillMarkerValue
+}
+
 // Alert is the in-memory representation of a row in the alerts table.
 type Alert struct {
 	ID          string

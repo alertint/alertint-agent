@@ -34,6 +34,19 @@ func TestRank_SlackGateValuesPreserved(t *testing.T) {
 	}
 }
 
+func TestGateRank_OnlyLowMediumHigh(t *testing.T) {
+	if GateRank("low") != 1 || GateRank("medium") != 2 || GateRank("high") != 3 {
+		t.Errorf("gate ladder must be low/medium/high=1/2/3; got %d/%d/%d", GateRank("low"), GateRank("medium"), GateRank("high"))
+	}
+	// Everything off the finding-gate ladder ranks 0 (always posts) — the gate
+	// must not gain new below-threshold values as the alert ladder grows.
+	for _, s := range []string{"", "warning", "info", "critical", "error", "page", "bogus"} {
+		if GateRank(s) != 0 {
+			t.Errorf("GateRank(%q) = %d, want 0 (off-ladder always posts)", s, GateRank(s))
+		}
+	}
+}
+
 func TestRank_CaseAndWhitespaceInsensitive(t *testing.T) {
 	if Rank(" Critical ") != Rank("critical") {
 		t.Errorf("Rank must trim and lowercase: %d != %d", Rank(" Critical "), Rank("critical"))

@@ -8,8 +8,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 )
+
+// occurrenceTimeLayout is a fixed-width RFC3339 layout — always nine fractional
+// digits — so occurrence timestamps sort lexicographically in SQL. time.RFC3339Nano
+// trims trailing zeros, which would sort a whole-second time (…00Z) AFTER a
+// sub-second one (…00.5Z) and reverse the occurrence order that the cadence and
+// span math depend on.
+const occurrenceTimeLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
+func fmtOccTime(t time.Time) string { return t.UTC().Format(occurrenceTimeLayout) }
 
 // Occurrence is one firing episode that attached to an already-analyzed
 // incident (a re-fire inside the collapse horizon). One row per attach, 1:1
@@ -80,8 +90,8 @@ func (s *Store) InsertOccurrence(ctx context.Context, occ Occurrence) (int64, er
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`,
 		occ.IncidentID,
-		occ.OccurredAt.UTC().Format(time.RFC3339Nano),
-		lastSeen.UTC().Format(time.RFC3339Nano),
+		fmtOccTime(occ.OccurredAt),
+		fmtOccTime(lastSeen),
 		string(fpsJSON),
 		string(payloadJSON),
 		occ.TriggerKind,
@@ -93,6 +103,90 @@ func (s *Store) InsertOccurrence(ctx context.Context, occ Occurrence) (int64, er
 	id, err := res.LastInsertId()
 	if err != nil {
 		return 0, fmt.Errorf("store: insert occurrence id: %w", err)
+	}
+	return id, nil
+}
+
+// InsertOccurrenceAndAttach records an occurrence AND mirrors its alert into
+// incident_alerts in ONE transaction, so a partial failure can never leave an
+// occurrence row whose alert never became a member (which a redelivery would
+// then re-count as a fresh episode). It mirrors AddAlertToIncident's counter
+// logic: the alert_count / last_alert_at bump runs only when the membership row
+// is newly inserted. Returns the new occurrence id.
+func (s *Store) InsertOccurrenceAndAttach(ctx context.Context, occ Occurrence, alertID string, alertTime time.Time) (int64, error) {
+	if alertID == "" {
+		return 0, errors.New("store: occurrence: alert_id is required")
+	}
+	if occ.IncidentID == "" {
+		return 0, errors.New("store: occurrence: incident_id is required")
+	}
+	if occ.OccurredAt.IsZero() {
+		return 0, errors.New("store: occurrence: occurred_at is required")
+	}
+	if occ.TriggerKind == "" {
+		occ.TriggerKind = "none"
+	}
+	if !validTriggerKinds[occ.TriggerKind] {
+		return 0, fmt.Errorf("store: occurrence: trigger_kind %q invalid", occ.TriggerKind)
+	}
+	lastSeen := occ.LastSeen
+	if lastSeen.IsZero() {
+		lastSeen = occ.OccurredAt
+	}
+	fpsJSON, err := json.Marshal(occ.Fingerprints)
+	if err != nil {
+		return 0, fmt.Errorf("store: occurrence: marshal fingerprints: %w", err)
+	}
+	payloadJSON, err := json.Marshal(occ.Payload)
+	if err != nil {
+		return 0, fmt.Errorf("store: occurrence: marshal payload: %w", err)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("store: begin occurrence tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx, `
+		INSERT INTO incident_occurrences
+			(incident_id, occurred_at, last_seen, fingerprints_json, payload_json, trigger_kind, snapshot_ref)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, occ.IncidentID, fmtOccTime(occ.OccurredAt), fmtOccTime(lastSeen),
+		string(fpsJSON), string(payloadJSON), occ.TriggerKind, occ.SnapshotRef)
+	if err != nil {
+		return 0, fmt.Errorf("store: insert occurrence: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("store: insert occurrence id: %w", err)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	linkRes, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO incident_alerts (incident_id, alert_id, created_at)
+		VALUES (?, ?, ?)
+	`, occ.IncidentID, alertID, now)
+	if err != nil {
+		return 0, fmt.Errorf("store: attach occurrence alert: %w", err)
+	}
+	inserted, err := linkRes.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("store: attach occurrence alert rows: %w", err)
+	}
+	if inserted > 0 {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE incidents
+			SET alert_count  = alert_count + 1,
+			    last_alert_at = MAX(last_alert_at, ?),
+			    updated_at    = ?
+			WHERE id = ?
+		`, alertTime.UTC().Format(time.RFC3339Nano), now, occ.IncidentID); err != nil {
+			return 0, fmt.Errorf("store: attach occurrence alert_count: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("store: commit occurrence tx: %w", err)
 	}
 	return id, nil
 }
@@ -244,7 +338,7 @@ func (s *Store) TouchIncidentActivity(ctx context.Context, incidentID string, t 
 func (s *Store) TouchOccurrenceLastSeen(ctx context.Context, occurrenceID int64, lastSeen time.Time) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE incident_occurrences SET last_seen = ? WHERE id = ?
-	`, lastSeen.UTC().Format(time.RFC3339Nano), occurrenceID)
+	`, fmtOccTime(lastSeen), occurrenceID)
 	if err != nil {
 		return fmt.Errorf("store: touch occurrence last_seen: %w", err)
 	}
@@ -260,6 +354,12 @@ type OccurrenceStats struct {
 	FirstOccurredAt time.Time
 	LastSeen        time.Time
 }
+
+// Episodes is the displayed recurrence count: the occurrence rows (re-fires)
+// plus the incident's own first firing, which is not an occurrence row. This is
+// the "recurred ×N" number — centralized here so stdout, Slack, and the
+// re-judgment prompt can't drift on the +1.
+func (s OccurrenceStats) Episodes() int { return s.Count + 1 }
 
 // OccurrenceStatsByIncident returns occurrence stats for each incident id in one
 // GROUP BY query (no N+1), using the same json_each id-set idiom as
@@ -347,6 +447,10 @@ func (s *Store) KeyEpisodeTimes(ctx context.Context, groupKey string, since time
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("store: episode time rows: %w", err)
 	}
+	// The UNION mixes incident first_alert_at (RFC3339Nano) with occurrence
+	// occurred_at (fixed-width): re-sort by real time so the SQL ORDER BY's
+	// lexicographic mixing of the two formats can't reverse an interval.
+	sort.Slice(out, func(i, j int) bool { return out[i].Before(out[j]) })
 	return out, nil
 }
 

@@ -522,6 +522,44 @@ func TestListOccurrences_ZeroLimitReturnsAll(t *testing.T) {
 	}
 }
 
+// TestOccurrences_WholeSecondOrdering guards the RFC3339Nano trailing-zero trap:
+// a whole-second time must not sort after a later sub-second time.
+func TestOccurrences_WholeSecondOrdering(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC) // whole second (no fraction)
+	seedIncident(t, s, "inc_1", "k", "analyzed", base)
+	t0 := base                             // 10:00:00.000
+	t1 := base.Add(500 * time.Millisecond) // 10:00:00.500 (later in time)
+	if _, err := s.InsertOccurrence(ctx, sampleOccurrence("inc_1", t0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.InsertOccurrence(ctx, sampleOccurrence("inc_1", t1)); err != nil {
+		t.Fatal(err)
+	}
+
+	latest, err := s.LatestOccurrence(ctx, "inc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !latest.OccurredAt.Equal(t1) {
+		t.Errorf("LatestOccurrence = %v, want %v (sub-second must sort after whole-second)", latest.OccurredAt, t1)
+	}
+	stats, _ := s.OccurrenceStatsByIncident(ctx, []string{"inc_1"})
+	if !stats["inc_1"].FirstOccurredAt.Equal(t0) || !stats["inc_1"].LastSeen.Equal(t1) {
+		t.Errorf("stats first/last = %v/%v, want %v/%v", stats["inc_1"].FirstOccurredAt, stats["inc_1"].LastSeen, t0, t1)
+	}
+	times, err := s.KeyEpisodeTimes(ctx, "k", base.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i < len(times); i++ {
+		if times[i].Before(times[i-1]) {
+			t.Errorf("episode times not ascending at %d: %v before %v", i, times[i], times[i-1])
+		}
+	}
+}
+
 func TestCountOccurrencesSince(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

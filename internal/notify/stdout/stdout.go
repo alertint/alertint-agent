@@ -100,7 +100,7 @@ func (n *Notifier) OnOccurrenceAttached(ctx context.Context, inc store.Incident,
 		Kind:        "occurrence",
 		IncidentID:  inc.ID,
 		GroupKey:    inc.GroupKey,
-		Occurrences: stats.Count + 1, // include the incident's own first firing
+		Occurrences: stats.Episodes(),
 		LastSeen:    stats.LastSeen.UTC(),
 		Drill:       drill,
 	}

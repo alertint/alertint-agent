@@ -36,9 +36,7 @@ func (s *Skill) buildRecurrenceContext(ctx context.Context, inc store.Incident, 
 		spanStart = stats.FirstOccurredAt
 	}
 
-	// Displayed episode count includes the incident's own first firing, which is
-	// not an occurrence row (occurrences are the re-fires).
-	episodes := stats.Count + 1
+	episodes := stats.Episodes()
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "## Recurrence context (re-analysis; trigger: %s)\n", trigger)

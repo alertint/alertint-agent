@@ -4,6 +4,7 @@ package slack
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -50,11 +51,16 @@ func (n *Notifier) OnOccurrenceAttached(ctx context.Context, inc store.Incident,
 	}
 	ts, ch, err := n.store.GetIncidentSlackThread(ctx, inc.ID)
 	if err != nil {
-		// No card for this incident — nothing to edit. Not an error.
+		// ErrNotFound is the normal "no card" case (gate-suppressed or never
+		// posted) — a silent no-op. A different error (e.g. a transient DB
+		// failure) is logged, but the attach still self-corrects on the next one.
+		if !errors.Is(err, store.ErrNotFound) {
+			slog.Default().Warn("slack: occurrence thread lookup failed; skipping card edit", "incident_id", inc.ID, "err", err)
+		}
 		return nil
 	}
 
-	occurrences := stats.Count + 1 // include the incident's own first firing
+	occurrences := stats.Episodes()
 	edit := pendingEdit{
 		ts:       ts,
 		channel:  ch,
@@ -104,13 +110,26 @@ func (n *Notifier) flushOccurrence(incidentID string) {
 	edit := st.pending
 	st.pending = nil
 	if edit == nil {
+		delete(n.occ, incidentID) // nothing pending: the burst is over, reclaim
 		n.occMu.Unlock()
 		return
 	}
 	st.last = n.now()
 	n.occMu.Unlock()
 
-	if err := n.editCard(context.Background(), *edit); err != nil {
+	err := n.editCard(context.Background(), *edit)
+
+	// Reclaim the entry once the burst has drained (no new attach re-armed a
+	// timer while we edited). This bounds the throttle map for high-frequency
+	// bursts; a single-attach recurrence leaves one small entry until the next
+	// burst for its incident (an accepted, bounded residual).
+	n.occMu.Lock()
+	if cur := n.occ[incidentID]; cur != nil && cur.pending == nil && cur.timer == nil {
+		delete(n.occ, incidentID)
+	}
+	n.occMu.Unlock()
+
+	if err != nil {
 		slog.Default().Warn("slack: trailing occurrence edit failed", "incident_id", incidentID, "err", err)
 	}
 }

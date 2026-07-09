@@ -201,10 +201,12 @@ func (n *Notifier) belowMinSeverity(f notify.Finding) bool {
 // low=1, medium=2, high=3; anything else (including empty) is 0. Callers
 // interpret 0 per side: an off-ladder finding severity always posts, and an
 // empty gate value means low (config validation rejects other gate values).
-// Delegates to the shared internal/severity ladder so the gate and the
-// recurrence severity-rise trigger rank identically.
+// Delegates to internal/severity.GateRank — the gate-only ladder — NOT to the
+// full Rank (which the recurrence trigger uses): recognizing warning/info there
+// would narrow the "unclassifiable always posts" rule and silently gate
+// off-ladder findings.
 func severityRank(s string) int {
-	return severity.Rank(s)
+	return severity.GateRank(s)
 }
 
 // auditSkipped records a severity-gate suppression in the audit trail.

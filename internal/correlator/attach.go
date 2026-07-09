@@ -168,30 +168,50 @@ func (c *Correlator) maybeAttachOccurrence(ctx context.Context, a store.Alert, g
 		return false, nil
 	}
 
-	// Drill parity: a drill re-fire never attaches to a real incident, or vice
-	// versa (salted drill keys make this near-impossible; the check makes it so).
-	incomingDrill := a.Labels[store.DrillMarkerLabel] == store.DrillMarkerValue
-	flags, err := c.st.IncidentDrillFlags(ctx, []string{candidate.ID})
-	if err != nil {
-		c.logger.Warn("correlator: drill-flag lookup failed; treating as new incident", "err", err)
-		return false, nil
-	}
-	if flags[candidate.ID] != incomingDrill {
-		return false, nil
-	}
-
+	// Load members once: they carry the trigger baselines, membership, and the
+	// candidate's drill-ness — no separate IncidentDrillFlags query needed.
 	members, err := c.st.GetIncidentAlerts(ctx, candidate.ID)
 	if err != nil {
 		c.logger.Warn("correlator: member lookup failed; treating as new incident", "err", err)
 		return false, nil
 	}
-	baselineSev, known, isMember := memberBaselines(members, a.Fingerprint)
+	baselineSev, known, isMember, candidateDrill := memberBaselines(members, a.Fingerprint)
+
+	// Drill parity: a drill re-fire never attaches to a real incident, or vice
+	// versa (salted drill keys make this near-impossible; the check makes it so).
+	if store.IsDrillAlert(a) != candidateDrill {
+		return false, nil
+	}
 
 	latestOcc, err := c.st.LatestOccurrence(ctx, candidate.ID)
 	if err != nil && err != store.ErrNotFound {
 		c.logger.Warn("correlator: latest-occurrence lookup failed; treating as new incident", "err", err)
 		return false, nil
 	}
+
+	// A new episode is a genuine re-fire: the condition recovered and returned
+	// (the candidate fully resolved), or an alert identity new to the incident
+	// joined (rotated fingerprint / new alertname). Otherwise it is an unchanged
+	// repeat of an already-firing member. Ingress upserts the alert before the
+	// correlator sees it, so the alert row's prior status is gone; the incident
+	// status and membership are the durable signals. Bounded gap: a single member
+	// of a multi-alert incident that individually resolves and re-fires under the
+	// same fingerprint reads as a repeat and is not re-examined until the whole
+	// incident resolves (Clock B only fires on a NEW episode, so it does not
+	// cover this member-local case). Severity changes alter the fingerprint, so
+	// a severity escalation is unaffected.
+	isNewEpisode := candidate.Status == "resolved" || !isMember
+
+	// An unchanged repeat only slides last_seen — short-circuit before the
+	// cross-incident count/cadence reads, which the common repeat path never
+	// needs. Clock B is checked only for new episodes, so a repeat never mints.
+	if !isNewEpisode {
+		if latestOcc != nil {
+			return true, c.st.TouchOccurrenceLastSeen(ctx, latestOcc.ID, now)
+		}
+		return true, c.st.TouchIncidentActivity(ctx, candidate.ID, now)
+	}
+
 	lastActivity := candidate.LastAlertAt
 	if latestOcc != nil {
 		lastActivity = latestOcc.LastSeen
@@ -211,23 +231,12 @@ func (c *Correlator) maybeAttachOccurrence(ctx context.Context, a store.Alert, g
 		return false, nil
 	}
 
-	// A new episode is a genuine re-fire: the condition recovered and returned
-	// (the candidate fully resolved), or an alert identity new to the incident
-	// joined (rotated fingerprint / new alertname). Otherwise it is an unchanged
-	// repeat of an already-firing member. Ingress upserts the alert before the
-	// correlator sees it, so the alert row's prior status is gone; the incident
-	// status and membership are the durable signals. (Bounded gap: a single
-	// member of a multi-alert still-analyzed incident that individually resolves
-	// and re-fires under the same fingerprint reads as a repeat — Clock B still
-	// guarantees re-examination.)
-	isNewEpisode := candidate.Status == "resolved" || !isMember
-
 	decision := decideAttach(attachInputs{
 		now:                    now,
 		lastJudgedAt:           lastJudged,
 		lastActivity:           lastActivity,
 		occurrencesSinceJudged: occSince,
-		isNewEpisode:           isNewEpisode,
+		isNewEpisode:           true,
 		incomingSeverityRank:   severity.Rank(a.Labels["severity"]),
 		incomingAlertname:      a.Labels["alertname"],
 		baselineSeverityRank:   baselineSev,
@@ -241,24 +250,24 @@ func (c *Correlator) maybeAttachOccurrence(ctx context.Context, a store.Alert, g
 	switch decision.action {
 	case actionNewIncident:
 		return false, nil
-	case actionRepeatTouch:
-		if latestOcc != nil {
-			return true, c.st.TouchOccurrenceLastSeen(ctx, latestOcc.ID, now)
-		}
-		return true, c.st.TouchIncidentActivity(ctx, candidate.ID, now)
 	case actionAttach, actionRejudge:
 		return true, c.attachOccurrence(ctx, a, *candidate, gk, decision)
+	case actionRepeatTouch:
+		// Unreachable: repeats are short-circuited above before decideAttach runs
+		// (isNewEpisode is forced true here). Fall through to a safe new incident.
+		return false, nil
 	default:
 		return false, nil
 	}
 }
 
-// memberBaselines derives the trigger baselines from an incident's current
-// members: the max severity rank, the set of known alertnames, and whether the
-// incoming fingerprint is already one of them. Because a higher severity or a
-// new alertname always trips a trigger on arrival (advancing last_judged_at),
-// the max over current members equals the max as of the last judgment.
-func memberBaselines(members []store.Alert, incomingFP string) (maxSev int, known map[string]bool, isMember bool) {
+// memberBaselines derives, in one pass over an incident's current members: the
+// max severity rank, the set of known alertnames, whether the incoming
+// fingerprint is already a member, and whether the incident is a drill (any
+// member carries the marker). Because a higher severity or a new alertname
+// always trips a trigger on arrival (advancing last_judged_at), the max over
+// current members equals the max as of the last judgment.
+func memberBaselines(members []store.Alert, incomingFP string) (maxSev int, known map[string]bool, isMember, isDrill bool) {
 	known = make(map[string]bool, len(members))
 	for _, m := range members {
 		if r := severity.Rank(m.Labels["severity"]); r > maxSev {
@@ -270,15 +279,21 @@ func memberBaselines(members []store.Alert, incomingFP string) (maxSev int, know
 		if m.Fingerprint == incomingFP {
 			isMember = true
 		}
+		if store.IsDrillAlert(m) {
+			isDrill = true
+		}
 	}
-	return maxSev, known, isMember
+	return maxSev, known, isMember, isDrill
 }
 
 // attachOccurrence records one occurrence row (with its trigger), mirrors the
 // alert into incident_alerts, audits the attach, fires the collapse notifier,
 // and — for an escalation — runs the re-judgment (U4 wires the rejudger). A
 // re-judgment failure leaves the prior finding standing; last_judged_at is left
-// unreset so the next attach re-evaluates the trigger (bounded retry).
+// unreset, so a subsequent triggering attach re-attempts it. Note this is
+// retry-per-trigger, not a single retry: a persistently failing re-judgment
+// (e.g. a revoked key) re-fires on each new-episode trigger, rate-bounded only
+// by the LLM client's own timeout/backoff.
 func (c *Correlator) attachOccurrence(ctx context.Context, a store.Alert, inc store.Incident, gk string, decision attachDecision) error {
 	occ := store.Occurrence{
 		IncidentID:   inc.ID,
@@ -292,14 +307,14 @@ func (c *Correlator) attachOccurrence(ctx context.Context, a store.Alert, inc st
 		}},
 		TriggerKind: decision.trigger,
 	}
-	if _, err := c.st.InsertOccurrence(ctx, occ); err != nil {
-		return fmt.Errorf("correlator: insert occurrence: %w", err)
-	}
-	// Mirror the resolved branch: the occurrence's alert joins incident_alerts so
-	// the member list and alert_count grow and checkAllAlertsResolved stays
-	// truthful (an actively-firing occurrence cannot be marked resolved).
-	if err := c.st.AddAlertToIncident(ctx, inc.ID, a.ID, a.ReceivedAt); err != nil {
-		return fmt.Errorf("correlator: attach alert to incident: %w", err)
+	// One transaction: the occurrence row and its incident_alerts membership
+	// commit together, so a partial failure can't leave an orphan occurrence a
+	// redelivery would re-count. Mirroring the resolved branch, the alert joins
+	// incident_alerts so the member list and alert_count grow and
+	// checkAllAlertsResolved stays truthful (an actively-firing occurrence cannot
+	// be marked resolved).
+	if _, err := c.st.InsertOccurrenceAndAttach(ctx, occ, a.ID, a.ReceivedAt); err != nil {
+		return fmt.Errorf("correlator: attach occurrence: %w", err)
 	}
 
 	if c.auditor != nil {
@@ -314,8 +329,7 @@ func (c *Correlator) attachOccurrence(ctx context.Context, a store.Alert, inc st
 
 	stats := c.occurrenceStats(ctx, inc.ID)
 	if c.occNotifier != nil {
-		drill := a.Labels[store.DrillMarkerLabel] == store.DrillMarkerValue
-		if err := c.occNotifier.OnOccurrenceAttached(ctx, inc, stats, drill); err != nil {
+		if err := c.occNotifier.OnOccurrenceAttached(ctx, inc, stats, store.IsDrillAlert(a)); err != nil {
 			c.logger.Warn("correlator: occurrence notify failed", "err", err, "incident_id", inc.ID)
 		}
 	}
