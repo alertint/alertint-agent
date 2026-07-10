@@ -803,8 +803,9 @@ func buildClassifierClient(cfg *config.Config, apiKey string, auditor *audit.Aud
 func llmanthropicCfg(cfg *config.Config) llmanthropic.Config {
 	key, _ := cfg.LLMAPIKey()
 	return llmanthropic.Config{
-		APIKey: key,
-		Model:  cfg.LLM.Model,
+		APIKey:    key,
+		Model:     cfg.LLM.Model,
+		MaxTokens: cfg.LLM.MaxTokens,
 	}
 }
 

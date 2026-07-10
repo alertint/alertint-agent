@@ -234,6 +234,12 @@ type LLMConfig struct {
 	Provider  string `yaml:"provider"`
 	APIKeyEnv string `yaml:"api_key_env"`
 	Model     string `yaml:"model"`
+	// MaxTokens is the output-token ceiling for the triage reply. The finding
+	// schema emits one entry per member alert, so a large correlated incident
+	// needs well over the old 1024 default or the JSON is truncated mid-object
+	// and the whole triage fails. Defaults to 4096; raise it for very large
+	// correlations.
+	MaxTokens int `yaml:"max_tokens"`
 }
 
 // CorrelatorConfig configures the time-window correlator.
@@ -338,6 +344,10 @@ func Defaults() Config {
 			// strongest reasoning tier in its price class. claude-haiku-4-5
 			// stays a one-line opt-in for cost-sensitive deployments.
 			Model: "claude-sonnet-5",
+			// 4096: a comfortable ceiling for the per-alert finding JSON. The
+			// old hardcoded 1024 truncated large correlated incidents mid-reply;
+			// this covers realistic incidents and is a config knob for the rest.
+			MaxTokens: 4096,
 		},
 		Correlator: CorrelatorConfig{
 			WindowSeconds: 90,
@@ -586,6 +596,9 @@ func (c *Config) validateLLM() []string {
 	}
 	if strings.TrimSpace(c.LLM.Model) == "" {
 		errs = append(errs, "llm.model is required")
+	}
+	if c.LLM.MaxTokens <= 0 {
+		errs = append(errs, "llm.max_tokens must be > 0")
 	}
 	return errs
 }

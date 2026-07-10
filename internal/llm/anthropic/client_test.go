@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -30,6 +31,26 @@ func responseBody(text string, inputTok, outputTok int) string {
 		"content": []map[string]any{
 			{"type": "text", "text": text},
 		},
+		"usage": map[string]any{
+			"input_tokens":  inputTok,
+			"output_tokens": outputTok,
+		},
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
+}
+
+// responseBodyStop builds a success body carrying a stop_reason (e.g.
+// "max_tokens" for an output-ceiling truncation).
+func responseBodyStop(text, stopReason string, inputTok, outputTok int) string {
+	payload := map[string]any{
+		"content": []map[string]any{
+			{"type": "text", "text": text},
+		},
+		"stop_reason": stopReason,
 		"usage": map[string]any{
 			"input_tokens":  inputTok,
 			"output_tokens": outputTok,
@@ -230,6 +251,34 @@ func TestSchemaViolation(t *testing.T) {
 	}
 	if !errors.Is(err, llm.ErrSchemaViolation) {
 		t.Errorf("expected ErrSchemaViolation, got: %v", err)
+	}
+}
+
+// TestMaxTokensTruncationError verifies that a reply cut off by the output
+// ceiling (stop_reason=max_tokens) yields a clear, actionable
+// ErrResponseTruncated — not the misleading "not valid JSON" the raw parse
+// failure would produce — so the operator's fix (raise llm.max_tokens) is
+// obvious from the log line.
+func TestMaxTokensTruncationError(t *testing.T) {
+	// A JSON object cut off mid-field, exactly what the model emits when it
+	// exhausts the output budget partway through the required-keys reply.
+	truncated := `{"analysis_name":"node OOM cascade","alerts":[{"alert_id":"a1","role_in`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, responseBodyStop(truncated, "max_tokens", 5000, 256))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL, nil)
+	_, err := c.Complete(context.Background(), "sys", "user", []string{"analysis_name"})
+	if err == nil {
+		t.Fatal("expected truncation error, got nil")
+	}
+	if !errors.Is(err, llm.ErrResponseTruncated) {
+		t.Errorf("expected ErrResponseTruncated, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "not valid JSON") {
+		t.Errorf("truncation must not surface as a JSON parse error: %v", err)
 	}
 }
 

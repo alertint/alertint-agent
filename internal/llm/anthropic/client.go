@@ -220,8 +220,9 @@ type message struct {
 
 // messagesResponse is the relevant subset of the Anthropic response.
 type messagesResponse struct {
-	Content []contentBlock `json:"content"`
-	Usage   struct {
+	Content    []contentBlock `json:"content"`
+	StopReason string         `json:"stop_reason"`
+	Usage      struct {
 		InputTokens  int `json:"input_tokens"`
 		OutputTokens int `json:"output_tokens"`
 	} `json:"usage"`
@@ -320,6 +321,16 @@ func (c *Client) doRequest(ctx context.Context, system, user string) (json.RawMe
 		return nil, 0, 0, fmt.Errorf("llm: parse response: %w", err)
 	}
 
+	// A max_tokens stop means the reply was cut off at the output ceiling: the
+	// text is incomplete JSON. Surface it as an actionable truncation error
+	// rather than the raw, misleading "not valid JSON" the parse below would
+	// give — the fix is to raise llm.max_tokens, not to retry (which truncates
+	// identically), so this is returned immediately, not as a RetryableError.
+	if parsed.StopReason == "max_tokens" {
+		return nil, parsed.Usage.InputTokens, parsed.Usage.OutputTokens,
+			fmt.Errorf("%w=%d (raise llm.max_tokens)", ErrResponseTruncated, c.cfg.MaxTokens)
+	}
+
 	text := firstTextBlock(parsed.Content)
 	if text == "" {
 		return nil, parsed.Usage.InputTokens, parsed.Usage.OutputTokens,
@@ -402,6 +413,11 @@ func promptHash(system, user string) string {
 // ErrSchemaViolation is returned when the model's JSON response is
 // missing one or more required top-level keys.
 var ErrSchemaViolation = errors.New("llm: schema violation")
+
+// ErrResponseTruncated is returned when the model stopped at the output-token
+// ceiling (stop_reason=max_tokens), leaving the JSON reply incomplete. The
+// remedy is to raise llm.max_tokens; retrying reproduces the same truncation.
+var ErrResponseTruncated = errors.New("llm: response truncated at max_tokens")
 
 // RetryableError wraps an HTTP status code that warrants a retry.
 type RetryableError struct {
