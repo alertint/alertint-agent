@@ -79,7 +79,7 @@ func TestRenderPhysicalCore_DropsLogicalKeys(t *testing.T) {
 }
 
 func vector(series ...map[string]any) json.RawMessage {
-	b, _ := json.Marshal(map[string]any{"resultType": "vector", "result": series})
+	b, _ := json.Marshal(map[string]any{"resultType": "vector", "result": series}) //nolint:errchkjson // fixture built from literal strings/floats only; cannot fail to marshal
 	return b
 }
 func s(metric map[string]string, val string) map[string]any {

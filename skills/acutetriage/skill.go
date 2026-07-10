@@ -374,57 +374,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.analyzed", analyzed)
 	}
 
-	// Enrichment digest (when logs were attempted). A digest only — source,
-	// query, and line count — never the log text, so the hash-chained payload
-	// stays small.
-	if s.auditor != nil && enrichment != nil {
-		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.enriched", map[string]any{
-			"incident_id": inc.ID,
-			"source":      enrichment.Source,
-			"query":       enrichment.Query,
-			"line_count":  len(enrichment.Lines),
-		})
-	}
-
-	// Changes digest (when change enrichment was attempted): a count + matched
-	// labels only, never change titles — keeps the hash-chained payload small.
-	if s.auditor != nil && changes != nil {
-		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.changes_enriched", map[string]any{
-			"incident_id":    inc.ID,
-			"matched_labels": changes.MatchedLabels,
-			"change_count":   len(changes.Changes),
-		})
-	}
-
-	// Sentry digest (when the Error source was attempted): scope + issue count +
-	// the reconciliation verdict (a fixed enum tag and an integer count) only —
-	// never exception text, culprit, message, or file:line — keeps the hash-chained
-	// payload small and PII-free (R16/KTD6). The digest fires for EVERY non-nil
-	// enrichment, including the degraded / unknown-project paths where the verdict
-	// is nil, so tag/count are read only when Reconciliation is present (a naive
-	// deref would panic the triage goroutine on a routine rate-limit or 404).
-	if s.auditor != nil && sentry != nil {
-		tag, corroborating := reconciliationDigestFields(sentry)
-		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.sentry_enriched", map[string]any{
-			"incident_id":   inc.ID,
-			"project":       sentry.Project,
-			"environment":   sentry.Environment,
-			"issue_count":   len(sentry.Issues),
-			"tag":           tag,
-			"corroborating": corroborating,
-		})
-	}
-
-	// Metrics digest (when a metric fetch was attempted): selector + snapshot
-	// count + outcome only — never metric values — keeps the payload small (R4).
-	if s.auditor != nil && metrics != nil {
-		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.metrics_enriched", map[string]any{
-			"incident_id":    inc.ID,
-			"selector":       metrics.Selector,
-			"snapshot_count": len(metrics.Snapshots),
-			"outcome":        string(metrics.Outcome),
-		})
-	}
+	s.auditEnrichmentDigests(ctx, inc.ID, metrics, enrichment, changes, sentry)
 
 	ruleID := "none"
 	if decision.Rule != nil {
@@ -439,6 +389,56 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		"dur", time.Since(start),
 	)
 	return nil
+}
+
+// auditEnrichmentDigests appends one hash-chained digest row per attempted
+// enrichment source — metrics, logs, changes, Sentry. Each digest carries only
+// counts/identifiers (selector, query, matched labels, reconciliation tag),
+// never raw evidence text or metric values, keeping the payload small and
+// PII-free (R4/R16/KTD6). A source contributes a row only when it was
+// attempted (non-nil); a nil auditor makes every call a no-op.
+func (s *Skill) auditEnrichmentDigests(ctx context.Context, incidentID string, metrics *MetricEnrichment, enrichment *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment) {
+	if s.auditor == nil {
+		return
+	}
+	if metrics != nil {
+		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.metrics_enriched", map[string]any{
+			"incident_id":    incidentID,
+			"selector":       metrics.Selector,
+			"snapshot_count": len(metrics.Snapshots),
+			"outcome":        string(metrics.Outcome),
+		})
+	}
+	if enrichment != nil {
+		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.enriched", map[string]any{
+			"incident_id": incidentID,
+			"source":      enrichment.Source,
+			"query":       enrichment.Query,
+			"line_count":  len(enrichment.Lines),
+		})
+	}
+	if changes != nil {
+		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.changes_enriched", map[string]any{
+			"incident_id":    incidentID,
+			"matched_labels": changes.MatchedLabels,
+			"change_count":   len(changes.Changes),
+		})
+	}
+	// Sentry fires for EVERY non-nil enrichment, including the degraded /
+	// unknown-project paths where the verdict is nil, so tag/count are read only
+	// when Reconciliation is present (a naive deref would panic the triage
+	// goroutine on a routine rate-limit or 404).
+	if sentry != nil {
+		tag, corroborating := reconciliationDigestFields(sentry)
+		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.sentry_enriched", map[string]any{
+			"incident_id":   incidentID,
+			"project":       sentry.Project,
+			"environment":   sentry.Environment,
+			"issue_count":   len(sentry.Issues),
+			"tag":           tag,
+			"corroborating": corroborating,
+		})
+	}
 }
 
 // analysis produces the raw finding JSON, either synthesized from a

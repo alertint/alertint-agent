@@ -107,8 +107,9 @@ func dedupeSortedValues(in []string) []string {
 // it (instance AND'd with pod would filter out node-level series). No-regression
 // guard: correlation must never remove evidence an uncorrelated alert would have.
 func instanceSupplements(alerts []store.Alert) []string {
-	out := make([]string, 0)
-	for _, inst := range uniqueInstances(alerts) {
+	instances := uniqueInstances(alerts)
+	out := make([]string, 0, len(instances))
+	for _, inst := range instances {
 		out = append(out, "{"+promMatcherTerm("instance", []string{inst})+"}")
 	}
 	return out
@@ -164,6 +165,8 @@ type MetricSnapshot struct {
 // ranked by (overlap desc, metric asc, series-identity asc) — a total,
 // response-order-independent order (R11). overlap counts a series' (k,v) label
 // pairs (excluding __name__) that a member alert also carries.
+//
+//nolint:unparam // limit is a general cap parameter exercised directly by unit tests; production callers happen to share one constant (maxSnapshotsPerScope) today.
 func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int) []MetricSnapshot {
 	var d struct {
 		Result []struct {
