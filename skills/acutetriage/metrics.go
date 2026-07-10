@@ -333,7 +333,7 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 
 	memberPairs := memberLabelPairs(alerts)
 	var snapshots []MetricSnapshot
-	anyErr, anyOK := false, false
+	anyErr := false
 	for i, scope := range scopes {
 		data, err := prom.QueryInstant(ctx, scope, t)
 		if err != nil {
@@ -342,7 +342,6 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 				"selector", scope, "err", err, "incident", incidentID)
 			continue
 		}
-		anyOK = true
 		ranked := rankSeries(data, memberPairs, maxSnapshotsPerScope)
 		// R9 physical-core rescue — primary scope only, when it matched nothing and
 		// dropping the logical keys yields a distinct selector.
@@ -366,7 +365,9 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 		enr.Snapshots = snapshots
 		enr.Outcome = OutcomeFetched
 		logger.Info("metrics fetched", "snapshots", len(snapshots), "selector", enr.Selector, "incident", incidentID)
-	case anyErr && !anyOK:
+	case anyErr:
+		// Zero snapshots with at least one scope unreachable: cannot certify a
+		// genuine zero, so surface the failure rather than a clean empty (R8).
 		enr.Note = "metric backend query failed"
 		enr.Outcome = OutcomeFailed
 	default:

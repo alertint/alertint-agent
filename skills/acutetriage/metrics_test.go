@@ -214,3 +214,18 @@ func TestFetchMetrics_Outcomes(t *testing.T) {
 		t.Error("nil querier must yield nil enrichment")
 	}
 }
+
+func TestFetchMetrics_PartialFailureIsNotGenuineEmpty(t *testing.T) {
+	// R8 (unreachable ≠ genuine zero): when one scope errors and another succeeds
+	// matching zero series, the fetch must report OutcomeFailed — never mask the
+	// connector failure as a clean OutcomeEmpty "0 metrics" on the evidence card.
+	now := time.Now()
+	// Two distinct scopes: primary {instance,namespace} and the {instance} supplement.
+	alerts := []store.Alert{alert(map[string]string{"namespace": "n", "instance": "db-01:9100"})}
+	// Primary errors; the supplement succeeds but matches nothing (default vector()).
+	f := &fakeProm{fail: map[string]bool{`{instance="db-01:9100",namespace="n"}`: true}}
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, alerts, now, "i", nil)
+	if enr.Outcome != OutcomeFailed {
+		t.Fatalf("partial failure must report failed, got %q (%+v); calls=%v", enr.Outcome, enr, f.calls)
+	}
+}
