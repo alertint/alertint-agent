@@ -33,6 +33,38 @@ type Finding struct {
 	// (member label alertint_drill="true", ADR-0013). Renderers must make
 	// a Drill unmistakably synthetic (e.g. the Slack DRILL banner).
 	Drill bool `json:"drill,omitempty"`
+	// Evidence is the always-on per-source evidence summary (R6/R7). Every
+	// notifier receives it; Slack renders a line, stdout carries the fields.
+	Evidence EvidenceSummary `json:"evidence"`
+}
+
+// EvidenceState distinguishes a real count (fetched or a genuine zero) from a
+// connector that could not be reached (R8).
+type EvidenceState string
+
+const (
+	EvidenceCounted     EvidenceState = "counted"
+	EvidenceUnreachable EvidenceState = "unreachable"
+)
+
+// SourceEvidence is one enabled enrichment source's contribution to the evidence
+// line: how many items it gave triage, and whether it was reachable.
+type SourceEvidence struct {
+	Source string        `json:"source"`         // display name: Prometheus / Loki / Changes / Sentry
+	Unit   string        `json:"unit,omitempty"` // metrics / lines / issues; "" for changes
+	Count  int           `json:"count"`
+	State  EvidenceState `json:"state"`
+}
+
+// EvidenceSummary is the always-on per-source evidence line carried on every
+// Finding (R6): each notifier renders the same data. Skipped renders one
+// card-level "skipped (known issue)" for a short-circuit finding (R12);
+// NoSources renders "no sources configured" for a zero-connector install (AE9).
+// Skipped and NoSources are mutually exclusive with a populated Sources list.
+type EvidenceSummary struct {
+	Sources   []SourceEvidence `json:"sources,omitempty"`
+	Skipped   bool             `json:"skipped,omitempty"`
+	NoSources bool             `json:"no_sources,omitempty"`
 }
 
 // Notifier delivers a Finding to some destination. Name returns a stable,
