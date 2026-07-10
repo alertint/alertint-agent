@@ -56,12 +56,44 @@ Notes:
 
 ### How it works
 
-When an incident is ready for analysis, **AlertINT** queries
-`{instance="X"}` at the incident start time for each unique `instance`
-label in the alert group. Up to 10 non-system metric values per instance
-are appended to the LLM prompt as a *Live metrics* section. The model uses
-those values to calibrate severity and confidence — actual numbers take
-precedence over text annotations.
+When an incident is ready for analysis, **AlertINT** builds a generic
+PromQL selector from the alert group's shared labels — the same
+allowlist logs use (`namespace`, `service`, `job`, `pod`, `container`,
+`instance`) — and queries it at the incident start time. This is what
+makes Kubernetes-style alerts (labeled by `namespace`/`pod`/`container`,
+often with no `instance` at all) get live metrics instead of falling
+back to annotations-only: the old behavior queried `{instance="X"}`
+alone, which most K8s alerting rules never set.
+
+Two refinements keep the selector from missing evidence:
+
+- **Per-instance supplement.** Any alert that does carry `instance`
+  keeps at least that broad per-instance scope as an extra query, even
+  when the shared selector narrows it away — non-Kubernetes stacks see
+  the same coverage as before.
+- **Physical-core retry.** If the full selector matches zero series
+  (a logical label like `service` or `job` that an alerting rule
+  attaches but no series actually has), AlertINT retries once with only
+  the physical-identity keys (`namespace`, `pod`, `container`,
+  `instance`) before concluding the query is genuinely empty.
+
+Up to 10 non-system metric series are kept per query, ranked by how many
+labels they share with the firing alerts (a series carrying the same
+`pod` as a member alert outranks an unrelated series in the same
+namespace) and appended to the LLM prompt as a *Live metrics* section.
+The model uses those values to calibrate severity and confidence — actual
+numbers take precedence over text annotations.
+
+### Evidence line
+
+Every finding notification carries a per-source evidence summary — how
+many metrics, log lines, changes, and Sentry issues fed the triage, e.g.
+`Prometheus 21 metrics · Loki 0 lines · Changes 2 · Sentry unreachable`.
+A connector that could not be reached renders `unreachable`, distinct
+from a genuine `0`, so a misconfigured or down connector is visible on
+every card instead of silently degrading confidence. See
+[Slack notifications](../notifications/slack.md#message-structure) for
+where it appears on the card.
 
 ### Configuration
 
