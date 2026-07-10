@@ -267,6 +267,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 			Prometheus:    prom,
 			MetricParams: acutetriage.MetricParams{
 				TimeoutSeconds: cfg.Prometheus.TimeoutSeconds,
+				MaxSeries:      cfg.Prometheus.MaxSeries,
 			},
 			Rules:     ruleEngine,
 			LogSource: logSrc,
@@ -695,7 +696,7 @@ func buildHealthChecks(cfg *config.Config, prom *promclient.Client, logSrc logs.
 			Probe: func(ctx context.Context) error {
 				// A trivial instant query proves the API is reachable,
 				// authorized, and serving query results.
-				_, err := prom.QueryInstant(ctx, "vector(1)", time.Now())
+				_, err := prom.QueryInstant(ctx, "vector(1)", time.Now(), 0)
 				return err
 			},
 		})

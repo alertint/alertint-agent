@@ -5,6 +5,7 @@ package acutetriage
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -258,10 +259,21 @@ func uniqueInstances(alerts []store.Alert) []string {
 
 const maxSnapshotsPerScope = 10
 
+// maxInstanceSupplements caps how many per-instance {instance="X"} supplement
+// scopes one incident may query. A storm incident (or a group_key="" mega-merge)
+// can span dozens of nodes; each bare supplement is a full node-series dump, so
+// an unbounded fan-out turns one incident into a thundering herd against the
+// metric backend. The primary scope is always queried; only the per-instance
+// supplements are bounded. Chosen so a normal incident (a handful of instances)
+// is never trimmed while a pathological one stays bounded.
+const maxInstanceSupplements = 5
+
 // MetricParams carries the metric-enrichment tunables from config. Passed in
-// rather than read off the client so the fetch owns the single-deadline budget.
+// rather than read off the client so the fetch owns the per-scope deadline
+// budget and the server-side series bound.
 type MetricParams struct {
 	TimeoutSeconds int
+	MaxSeries      int // server-side per-query series cap (0 = unbounded)
 }
 
 // metricQuerier is the narrow read surface FetchMetrics needs. *prometheus.Client
@@ -269,7 +281,7 @@ type MetricParams struct {
 // caller passes a TRUE nil interface when Prometheus is unconfigured, so the
 // nil check below is not defeated by a typed-nil *prometheus.Client.
 type metricQuerier interface {
-	QueryInstant(ctx context.Context, expr string, t time.Time) (json.RawMessage, error)
+	QueryInstant(ctx context.Context, expr string, t time.Time, limit int) (json.RawMessage, error)
 }
 
 // MetricEnrichment is the live-metric context attached to a triage prompt and
@@ -292,9 +304,16 @@ type MetricEnrichment struct {
 // are deduped across scopes. Best-effort: never blocks or fails triage. Returns
 // nil ONLY when Prometheus is unconfigured (prom == nil) — "we never looked";
 // otherwise a non-nil enrichment carrying an Outcome, so the operator and the LLM
-// can tell fetched / empty / no-selector / backend-failed apart (R4). The whole
-// multi-query fetch shares ONE TimeoutSeconds deadline, so worst-case added
-// latency is one timeout, not N×.
+// can tell fetched / empty / degraded / no-selector / backend-failed apart (R4).
+//
+// Storm safety: each scope query is bounded server-side to params.MaxSeries and
+// runs under its own slice of the TimeoutSeconds budget (perScope), so one slow
+// query times out in isolation instead of starving the rest; the per-instance
+// supplements are capped at maxInstanceSupplements so a mega-incident cannot fan
+// out one heavy query per node. Total added latency stays bounded by
+// TimeoutSeconds. A scope that is reachable-but-slow yields OutcomeDegraded, kept
+// distinct from a genuine outage (OutcomeFailed) so a self-inflicted timeout does
+// not read as "unreachable" or cap confidence.
 func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, alerts []store.Alert, t time.Time, incidentID string, logger *slog.Logger) *MetricEnrichment {
 	if prom == nil {
 		return nil
@@ -308,18 +327,29 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 	physicalFallback := renderPhysicalCore(shared)
 
 	// Ordered, deduped scope list: primary first (it alone gets the retry), then
-	// the per-instance supplements not already equal to the primary.
+	// the per-instance supplements not already equal to the primary, capped at
+	// maxInstanceSupplements so a mega-incident cannot fan out one heavy query
+	// per node.
 	scopes := make([]string, 0)
 	seen := map[string]bool{}
 	if primary != "" {
 		scopes = append(scopes, primary)
 		seen[primary] = true
 	}
-	for _, sup := range instanceSupplements(alerts) {
-		if !seen[sup] {
-			scopes = append(scopes, sup)
-			seen[sup] = true
+	supplements := instanceSupplements(alerts)
+	added := 0
+	for _, sup := range supplements {
+		if seen[sup] {
+			continue
 		}
+		if added >= maxInstanceSupplements {
+			logger.Info("acutetriage: metrics: capping per-instance supplements",
+				"total_instances", len(supplements), "kept", maxInstanceSupplements, "incident", incidentID)
+			break
+		}
+		scopes = append(scopes, sup)
+		seen[sup] = true
+		added++
 	}
 
 	if len(scopes) == 0 {
@@ -328,29 +358,51 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 		return &MetricEnrichment{At: t, Note: "no usable metric selector for this incident", Outcome: OutcomeNoSelector}
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(params.TimeoutSeconds)*time.Second)
+	fetchCtx, cancel := context.WithTimeout(ctx, time.Duration(params.TimeoutSeconds)*time.Second)
 	defer cancel()
+
+	// Give each scope its own slice of the budget: a slow query then times out on
+	// its own sub-deadline instead of consuming the whole budget and starving the
+	// remaining scopes into a false "backend failed" (the storm cascade). The
+	// outer fetchCtx still caps total added latency at ~TimeoutSeconds; this only
+	// shares that budget out so no single scope can monopolize it.
+	perScope := time.Duration(params.TimeoutSeconds) * time.Second / time.Duration(len(scopes))
+	queryScope := func(scope string) (json.RawMessage, error) {
+		scopeCtx, scopeCancel := context.WithTimeout(fetchCtx, perScope)
+		defer scopeCancel()
+		return prom.QueryInstant(scopeCtx, scope, t, params.MaxSeries)
+	}
 
 	memberPairs := memberLabelPairs(alerts)
 	var snapshots []MetricSnapshot
-	anyErr := false
+	// Track the two failure kinds apart: a per-scope deadline (backend reachable
+	// but slow) is a self-inflicted timeout, distinct from a genuine outage
+	// (connection refused / DNS / non-200). classify records each.
+	var anyHardErr, anyTimeout bool
+	classify := func(scope string, err error) {
+		if errors.Is(err, context.DeadlineExceeded) {
+			anyTimeout = true
+			logger.Warn("acutetriage: metrics: backend query timed out",
+				"selector", scope, "per_scope_budget", perScope.String(), "incident", incidentID)
+			return
+		}
+		anyHardErr = true
+		logger.Warn("acutetriage: metrics: backend query failed",
+			"selector", scope, "err", err, "incident", incidentID)
+	}
 	for i, scope := range scopes {
-		data, err := prom.QueryInstant(ctx, scope, t)
+		data, err := queryScope(scope)
 		if err != nil {
-			anyErr = true
-			logger.Warn("acutetriage: metrics: backend query failed",
-				"selector", scope, "err", err, "incident", incidentID)
+			classify(scope, err)
 			continue
 		}
 		ranked := rankSeries(data, memberPairs, maxSnapshotsPerScope)
 		// R9 physical-core rescue — primary scope only, when it matched nothing and
 		// dropping the logical keys yields a distinct selector.
 		if i == 0 && scope == primary && len(ranked) == 0 && physicalFallback != "" && physicalFallback != primary {
-			data2, err2 := prom.QueryInstant(ctx, physicalFallback, t)
+			data2, err2 := queryScope(physicalFallback)
 			if err2 != nil {
-				anyErr = true
-				logger.Warn("acutetriage: metrics: physical-core retry failed",
-					"selector", physicalFallback, "err", err2, "incident", incidentID)
+				classify(physicalFallback, err2)
 			} else {
 				ranked = rankSeries(data2, memberPairs, maxSnapshotsPerScope)
 			}
@@ -365,11 +417,20 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 		enr.Snapshots = snapshots
 		enr.Outcome = OutcomeFetched
 		logger.Info("metrics fetched", "snapshots", len(snapshots), "selector", enr.Selector, "incident", incidentID)
-	case anyErr:
-		// Zero snapshots with at least one scope unreachable: cannot certify a
-		// genuine zero, so surface the failure rather than a clean empty (R8).
+	case anyHardErr:
+		// Zero snapshots with at least one scope genuinely unreachable: cannot
+		// certify a genuine zero, so surface the failure rather than a clean empty
+		// (R8). A hard outage outranks a mere timeout — it is the more actionable
+		// signal.
 		enr.Note = "metric backend query failed"
 		enr.Outcome = OutcomeFailed
+	case anyTimeout:
+		// Reachable but too slow to answer within the per-scope deadline — a
+		// self-inflicted timeout under load, not an outage. Surfaced as degraded
+		// (not unreachable) and exempt from the annotations-only confidence cap.
+		enr.Note = "metric backend too slow to answer within the deadline"
+		enr.Outcome = OutcomeDegraded
+		logger.Info("acutetriage: metrics: degraded (backend slow)", "selector", enr.Selector, "incident", incidentID)
 	default:
 		enr.Note = "no metric series matched the incident selector"
 		enr.Outcome = OutcomeEmpty

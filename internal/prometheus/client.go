@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -55,12 +56,17 @@ func NewClient(cfg Config) *Client {
 func (c *Client) DefaultRangeMinutes() int { return c.defaultRangeMinutes }
 
 // QueryInstant executes an instant PromQL query. A zero t is treated as "now".
-// The returned JSON is the raw "data" field from the Prometheus API response,
-// i.e. {"resultType":"vector","result":[...]}.
-func (c *Client) QueryInstant(ctx context.Context, expr string, t time.Time) (json.RawMessage, error) {
+// A positive limit bounds the number of series the server returns (the
+// Prometheus API's optional "limit" param; 0 = unbounded). The returned JSON is
+// the raw "data" field from the Prometheus API response, i.e.
+// {"resultType":"vector","result":[...]}.
+func (c *Client) QueryInstant(ctx context.Context, expr string, t time.Time, limit int) (json.RawMessage, error) {
 	params := url.Values{"query": {expr}}
 	if !t.IsZero() {
 		params.Set("time", formatTS(t))
+	}
+	if limit > 0 {
+		params.Set("limit", strconv.Itoa(limit))
 	}
 	return c.apiGet(ctx, "/api/v1/query", params)
 }

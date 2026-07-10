@@ -599,7 +599,7 @@ func marshalEnrichments(sources map[string]any, logger *slog.Logger, incidentID 
 // model judgment. The persisted output_json keeps the model's original number;
 // the incident row and every notification carry the capped one.
 func (s *Skill) applyEvidenceCap(resp *llmResponse, decision rules.Decision, metrics *MetricEnrichment, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, incidentID string) {
-	if decision.ShortCircuit || hasLiveEvidence(metrics, logs, changes, sentry) ||
+	if decision.ShortCircuit || !annotationsOnlyBasis(metrics, logs, changes, sentry) ||
 		resp.Confidence <= MaxMetadataOnlyConfidence {
 		return
 	}

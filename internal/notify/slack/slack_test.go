@@ -149,6 +149,9 @@ func TestEvidenceLine(t *testing.T) {
 			{Source: "Changes", Count: 2, State: notify.EvidenceCounted},
 			{Source: "Sentry", Unit: "issues", Count: 0, State: notify.EvidenceUnreachable},
 		}}, "Prometheus 21 metrics · Loki 0 lines · Changes 2 · Sentry unreachable"},
+		{"degraded", notify.EvidenceSummary{Sources: []notify.SourceEvidence{
+			{Source: "Prometheus", Unit: "metrics", Count: 0, State: notify.EvidenceDegraded},
+		}}, "Prometheus slow"},
 		{"skipped", notify.EvidenceSummary{Skipped: true}, "skipped (known issue)"},
 		{"no sources", notify.EvidenceSummary{NoSources: true}, "no sources configured"},
 	}
