@@ -6,13 +6,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/logs"
-	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -240,32 +240,6 @@ func formatSeriesIdentity(m map[string]string) string {
 	return "{" + strings.Join(parts, ",") + "}"
 }
 
-// FetchMetrics queries Prometheus for all non-system metrics on the instances
-// involved in the incident at time t. At most 10 snapshots are returned per
-// instance. Safe to call with a nil prom — returns nil immediately.
-func FetchMetrics(ctx context.Context, prom *promclient.Client, alerts []store.Alert, t time.Time) []MetricSnapshot {
-	if prom == nil {
-		return nil
-	}
-	instances := uniqueInstances(alerts)
-	if len(instances) == 0 {
-		return nil
-	}
-
-	const maxPerInstance = 10
-	memberPairs := memberLabelPairs(alerts)
-	var out []MetricSnapshot
-	for _, inst := range instances {
-		// Query all series for this instance at the incident time.
-		data, err := prom.QueryInstant(ctx, `{instance="`+inst+`"}`, t)
-		if err != nil {
-			continue
-		}
-		out = append(out, rankSeries(data, memberPairs, maxPerInstance)...)
-	}
-	return out
-}
-
 // uniqueInstances returns unique non-empty instance label values from the alerts.
 func uniqueInstances(alerts []store.Alert) []string {
 	seen := map[string]bool{}
@@ -275,6 +249,147 @@ func uniqueInstances(alerts []store.Alert) []string {
 			seen[inst] = true
 			out = append(out, inst)
 		}
+	}
+	return out
+}
+
+const maxSnapshotsPerScope = 10
+
+// MetricParams carries the metric-enrichment tunables from config. Passed in
+// rather than read off the client so the fetch owns the single-deadline budget.
+type MetricParams struct {
+	TimeoutSeconds int
+}
+
+// metricQuerier is the narrow read surface FetchMetrics needs. *prometheus.Client
+// satisfies it; tests inject a fake with no HTTP (mirrors SentryReader). The
+// caller passes a TRUE nil interface when Prometheus is unconfigured, so the
+// nil check below is not defeated by a typed-nil *prometheus.Client.
+type metricQuerier interface {
+	QueryInstant(ctx context.Context, expr string, t time.Time) (json.RawMessage, error)
+}
+
+// MetricEnrichment is the live-metric context attached to a triage prompt and
+// persisted under the "metrics" envelope key. Mirrors LogEnrichment: the same
+// value feeds both the prompt and persistence (one fetch, two uses), and its
+// Outcome makes fetched / queried-empty / no-selector / backend-failed
+// distinguishable in logs, the audit trail, and the notification card (R4/R8).
+type MetricEnrichment struct {
+	At        time.Time        `json:"at"`
+	Selector  string           `json:"selector,omitempty"`  // rendered matcher(s) that ran (breadcrumb/replay)
+	Snapshots []MetricSnapshot `json:"snapshots,omitempty"` // ranked, capped
+	Note      string           `json:"note,omitempty"`      // why Snapshots is empty
+	Outcome   Outcome          `json:"outcome,omitempty"`
+}
+
+// FetchMetrics queries Prometheus for the incident's series at time t using the
+// generic selector (shared allowlisted labels ∩ union values) plus a per-instance
+// supplement, with a physical-core retry on the primary scope (R1/R2/R9). Every
+// scope's series are ranked by member-label overlap and capped (R11); snapshots
+// are deduped across scopes. Best-effort: never blocks or fails triage. Returns
+// nil ONLY when Prometheus is unconfigured (prom == nil) — "we never looked";
+// otherwise a non-nil enrichment carrying an Outcome, so the operator and the LLM
+// can tell fetched / empty / no-selector / backend-failed apart (R4). The whole
+// multi-query fetch shares ONE TimeoutSeconds deadline, so worst-case added
+// latency is one timeout, not N×.
+func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, alerts []store.Alert, t time.Time, incidentID string, logger *slog.Logger) *MetricEnrichment {
+	if prom == nil {
+		return nil
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	shared := buildMetricSelector(alerts)
+	primary := renderPromMatcher(shared)
+	physicalFallback := renderPhysicalCore(shared)
+
+	// Ordered, deduped scope list: primary first (it alone gets the retry), then
+	// the per-instance supplements not already equal to the primary.
+	scopes := make([]string, 0)
+	seen := map[string]bool{}
+	if primary != "" {
+		scopes = append(scopes, primary)
+		seen[primary] = true
+	}
+	for _, sup := range instanceSupplements(alerts) {
+		if !seen[sup] {
+			scopes = append(scopes, sup)
+			seen[sup] = true
+		}
+	}
+
+	if len(scopes) == 0 {
+		logger.Info("acutetriage: metrics: no usable selector for this incident",
+			"shared_labels", formatLabels(sharedLabels(alerts)), "incident", incidentID)
+		return &MetricEnrichment{At: t, Note: "no usable metric selector for this incident", Outcome: OutcomeNoSelector}
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(params.TimeoutSeconds)*time.Second)
+	defer cancel()
+
+	memberPairs := memberLabelPairs(alerts)
+	var snapshots []MetricSnapshot
+	anyErr, anyOK := false, false
+	for i, scope := range scopes {
+		data, err := prom.QueryInstant(ctx, scope, t)
+		if err != nil {
+			anyErr = true
+			logger.Warn("acutetriage: metrics: backend query failed",
+				"selector", scope, "err", err, "incident", incidentID)
+			continue
+		}
+		anyOK = true
+		ranked := rankSeries(data, memberPairs, maxSnapshotsPerScope)
+		// R9 physical-core rescue — primary scope only, when it matched nothing and
+		// dropping the logical keys yields a distinct selector.
+		if i == 0 && scope == primary && len(ranked) == 0 && physicalFallback != "" && physicalFallback != primary {
+			data2, err2 := prom.QueryInstant(ctx, physicalFallback, t)
+			if err2 != nil {
+				anyErr = true
+				logger.Warn("acutetriage: metrics: physical-core retry failed",
+					"selector", physicalFallback, "err", err2, "incident", incidentID)
+			} else {
+				ranked = rankSeries(data2, memberPairs, maxSnapshotsPerScope)
+			}
+		}
+		snapshots = append(snapshots, ranked...)
+	}
+	snapshots = dedupeSnapshots(snapshots)
+
+	enr := &MetricEnrichment{At: t, Selector: strings.Join(scopes, ", ")}
+	switch {
+	case len(snapshots) > 0:
+		enr.Snapshots = snapshots
+		enr.Outcome = OutcomeFetched
+		logger.Info("metrics fetched", "snapshots", len(snapshots), "selector", enr.Selector, "incident", incidentID)
+	case anyErr && !anyOK:
+		enr.Note = "metric backend query failed"
+		enr.Outcome = OutcomeFailed
+	default:
+		enr.Note = "no metric series matched the incident selector"
+		enr.Outcome = OutcomeEmpty
+		logger.Info("acutetriage: metrics: queried, no series matched", "selector", enr.Selector, "incident", incidentID)
+	}
+	return enr
+}
+
+// dedupeSnapshots drops duplicate (Series, Metric) snapshots — the supplement
+// scopes overlap the primary, so the same value can surface twice. First wins
+// (primary-scoped snapshots are appended first).
+func dedupeSnapshots(in []MetricSnapshot) []MetricSnapshot {
+	if len(in) == 0 {
+		return in
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := in[:0]
+	for _, s := range in {
+		key := s.Series + "\x00" + s.Metric
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, s)
 	}
 	return out
 }

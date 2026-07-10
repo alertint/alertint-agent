@@ -3,8 +3,11 @@
 package acutetriage
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/alertint/alertint-agent/internal/store"
 )
@@ -116,5 +119,98 @@ func TestRankSeries_CapKeepsTopN(t *testing.T) {
 	}
 	if got := rankSeries(vector(list...), members, 10); len(got) != 10 {
 		t.Errorf("cap not applied: got %d", len(got))
+	}
+}
+
+type fakeProm struct {
+	// responses maps a matcher string → the instant-vector data blob to return.
+	responses map[string]json.RawMessage
+	// fail matchers error out.
+	fail  map[string]bool
+	calls []string
+}
+
+func (f *fakeProm) QueryInstant(_ context.Context, expr string, _ time.Time) (json.RawMessage, error) {
+	f.calls = append(f.calls, expr)
+	if f.fail[expr] {
+		return nil, errors.New("boom")
+	}
+	if r, ok := f.responses[expr]; ok {
+		return r, nil
+	}
+	return vector(), nil // matched nothing
+}
+
+func TestFetchMetrics_K8sSelectorFetches(t *testing.T) {
+	// AE1: namespace+pod, no instance → generic selector fetches; Outcome fetched.
+	alerts := []store.Alert{alert(map[string]string{"namespace": "checkout", "pod": "api-7f9x", "severity": "critical"})}
+	f := &fakeProm{responses: map[string]json.RawMessage{
+		`{namespace="checkout",pod="api-7f9x"}`: vector(
+			s(map[string]string{"__name__": "cpu", "namespace": "checkout", "pod": "api-7f9x"}, "0.9"),
+		),
+	}}
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, alerts, time.Now(), "inc1", nil)
+	if enr == nil || enr.Outcome != OutcomeFetched || len(enr.Snapshots) != 1 {
+		t.Fatalf("want fetched with 1 snapshot, got %+v", enr)
+	}
+}
+
+func TestFetchMetrics_PhysicalCoreRetry(t *testing.T) {
+	// AE8: service exists on no series → primary AND matches 0, retry with physical core.
+	alerts := []store.Alert{alert(map[string]string{"namespace": "checkout", "pod": "api-7f9x", "service": "checkout-api"})}
+	f := &fakeProm{responses: map[string]json.RawMessage{
+		// primary {namespace,pod,service} returns nothing (default vector()).
+		`{namespace="checkout",pod="api-7f9x"}`: vector(
+			s(map[string]string{"__name__": "cpu", "namespace": "checkout", "pod": "api-7f9x"}, "0.9"),
+		),
+	}}
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, alerts, time.Now(), "inc1", nil)
+	if enr.Outcome != OutcomeFetched || len(enr.Snapshots) != 1 {
+		t.Fatalf("physical-core retry should recover metrics, got %+v", enr)
+	}
+}
+
+func TestFetchMetrics_MixedMembersKeepInstanceSupplement(t *testing.T) {
+	// AE7: {instance,job} + label-sparse member → shared selector empty, but the
+	// instance supplement is still queried.
+	alerts := []store.Alert{
+		alert(map[string]string{"instance": "db-01:9100", "job": "node"}),
+		alert(map[string]string{"alertname": "RecordingRuleFired"}),
+	}
+	f := &fakeProm{responses: map[string]json.RawMessage{
+		`{instance="db-01:9100"}`: vector(
+			s(map[string]string{"__name__": "node_load1", "instance": "db-01:9100"}, "4"),
+		),
+	}}
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, alerts, time.Now(), "inc1", nil)
+	if enr.Outcome != OutcomeFetched || len(enr.Snapshots) != 1 {
+		t.Fatalf("instance supplement should be queried, got %+v; calls=%v", enr, f.calls)
+	}
+}
+
+func TestFetchMetrics_Outcomes(t *testing.T) {
+	now := time.Now()
+	// no usable selector.
+	enr := FetchMetrics(context.Background(), &fakeProm{}, MetricParams{TimeoutSeconds: 5},
+		[]store.Alert{alert(map[string]string{"alertname": "X"})}, now, "i", nil)
+	if enr.Outcome != OutcomeNoSelector {
+		t.Errorf("want no_selector, got %q", enr.Outcome)
+	}
+	// queried, empty.
+	enr = FetchMetrics(context.Background(), &fakeProm{}, MetricParams{TimeoutSeconds: 5},
+		[]store.Alert{alert(map[string]string{"namespace": "n"})}, now, "i", nil)
+	if enr.Outcome != OutcomeEmpty {
+		t.Errorf("want empty, got %q", enr.Outcome)
+	}
+	// backend failed (every scope errors).
+	f := &fakeProm{fail: map[string]bool{`{namespace="n"}`: true}}
+	enr = FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5},
+		[]store.Alert{alert(map[string]string{"namespace": "n"})}, now, "i", nil)
+	if enr.Outcome != OutcomeFailed {
+		t.Errorf("want failed, got %q", enr.Outcome)
+	}
+	// nil querier → nil enrichment (never looked).
+	if FetchMetrics(context.Background(), nil, MetricParams{TimeoutSeconds: 5}, nil, now, "i", nil) != nil {
+		t.Error("nil querier must yield nil enrichment")
 	}
 }
