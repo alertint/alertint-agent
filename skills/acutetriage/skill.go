@@ -68,6 +68,21 @@ type Config struct {
 	// MemoryParams carries the recall tunables (lookback) from the memory config
 	// section. Recall is deterministic and default-on; there is no enable knob.
 	MemoryParams MemoryParams
+	// Classifier is the optional second (Haiku) LLM client for the M3 shadow
+	// classifier — a small fuzzy "same underlying condition?" match on rung-3a
+	// weak-signal recalls. nil disables it entirely (the serve wiring passes nil
+	// unless the mode is shadow or on). Reuses the triage key + auditor.
+	Classifier LLMClient
+	// ClassifierMode is "off" | "shadow" | "on". Even with a Classifier wired,
+	// "off" (or empty) makes no call — the belt to the nil client (AE7). "shadow"
+	// audits the verdict while the recall render stays deterministic; "on" lets a
+	// matched verdict tag the recall render.
+	ClassifierMode string
+	// ClassifierTimeout is the hard wall-clock cap on one classifier call. It is
+	// applied as a context deadline in maybeClassify because the shared Anthropic
+	// client retries 429/529 with backoff, so the per-request HTTP timeout alone
+	// would not bound the total time the call sits on the triage-critical path.
+	ClassifierTimeout time.Duration
 }
 
 // Skill orchestrates the full acute-triage pipeline for a single ready
@@ -452,6 +467,11 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 	// ids, one bounded status read renders the regression/known-tolerated
 	// transition. Best-effort, fail-safe — never blocks the recall.
 	applyDisposition(ctx, s.cfg.Sentry, s.cfg.SentryParams, memory)
+	// Shadow classifier (M3): judge the top rung-3a weak candidate. Runs before the
+	// prompt is rendered so an `on`-mode match both tags what the model sees and is
+	// captured by persist-as-rendered; in `shadow` mode it only audits and leaves
+	// the render byte-identical. A no-op when disabled or there are no candidates.
+	s.maybeClassify(ctx, inc, memory)
 	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment, changes, sentry, memory)
 	// On a re-judgment, prepend the deterministic recurrence context so the model
 	// judges the recurrence with its history rather than as a first-time event.

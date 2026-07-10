@@ -248,10 +248,50 @@ type CorrelatorConfig struct {
 // are deterministic, free, and default-on — these knobs are the control
 // surface, not an enable switch. The classifier sub-block lands with M3.
 type MemoryConfig struct {
-	AttachWindowMinutes  int `yaml:"attach_window_minutes"`  // Clock A: sliding attach window from the last occurrence
-	JudgmentCeilingHours int `yaml:"judgment_ceiling_hours"` // Clock B: hard ceiling on time since the last LLM judgment
-	OccurrenceCap        int `yaml:"occurrence_cap"`         // re-judge backstop after this many attaches since the last judgment
-	LookbackDays         int `yaml:"lookback_days"`          // occurrence pruning + recall lookback horizon
+	AttachWindowMinutes  int              `yaml:"attach_window_minutes"`  // Clock A: sliding attach window from the last occurrence
+	JudgmentCeilingHours int              `yaml:"judgment_ceiling_hours"` // Clock B: hard ceiling on time since the last LLM judgment
+	OccurrenceCap        int              `yaml:"occurrence_cap"`         // re-judge backstop after this many attaches since the last judgment
+	LookbackDays         int              `yaml:"lookback_days"`          // occurrence pruning + recall lookback horizon
+	Classifier           ClassifierConfig `yaml:"classifier"`             // M3 shadow classifier: dark by default
+}
+
+// ClassifierConfig is the M3 shadow-classifier control surface (ADR-0018). The
+// classifier is a second, small Haiku call that judges whether a weak-signal
+// (one-label-off) prefilter candidate is the same underlying condition. It is
+// dark by default: Mode "off" makes no call at all, "shadow" runs the call and
+// records every verdict in the audit log while the rendered recall stays
+// deterministic, and "on" lets a graduated match tag the recall render. Graduation
+// is per-installation — the operator flips shadow→on once their own audit log shows
+// the documented precision gate.
+type ClassifierConfig struct {
+	Mode           ClassifierMode `yaml:"mode"`            // off | shadow | on (default off)
+	TimeoutSeconds int            `yaml:"timeout_seconds"` // seconds-scale budget for the classifier's own client
+}
+
+// ClassifierMode is the off|shadow|on knob. It has a custom scalar decoder
+// because YAML 1.1 resolves bare off/on (and yes/no/true/false) to booleans, so
+// `mode: off` unquoted would otherwise fail with "cannot unmarshal !!bool into
+// string". Keeping the literal scalar lets the mode be written with or without
+// quotes; validateMemory rejects anything outside the enum.
+type ClassifierMode string
+
+const (
+	ClassifierModeOff    ClassifierMode = "off"
+	ClassifierModeShadow ClassifierMode = "shadow"
+	ClassifierModeOn     ClassifierMode = "on"
+)
+
+// UnmarshalYAML keeps the literal scalar text (off, on, shadow, or an invalid
+// value passed through to validation) instead of letting yaml.v3 coerce the
+// bool-keyword forms.
+func (m *ClassifierMode) UnmarshalYAML(value *yaml.Node) error {
+	*m = ClassifierMode(strings.TrimSpace(value.Value))
+	return nil
+}
+
+// Enabled reports whether the classifier runs at all (mode is shadow or on).
+func (c ClassifierConfig) Enabled() bool {
+	return c.Mode == ClassifierModeShadow || c.Mode == ClassifierModeOn
 }
 
 // NotifyConfig configures notifiers.
@@ -363,6 +403,12 @@ func Defaults() Config {
 			JudgmentCeilingHours: 4,
 			OccurrenceCap:        100,
 			LookbackDays:         90,
+			Classifier: ClassifierConfig{
+				// Dark by default (ADR-0018): no classifier call until the operator
+				// opts into gathering their own graduation evidence.
+				Mode:           ClassifierModeOff,
+				TimeoutSeconds: 10,
+			},
 		},
 		LogLevel:  "info",
 		LogFormat: "auto",
@@ -596,6 +642,17 @@ func (c *Config) validateMemory() []string {
 	}
 	if c.Memory.LookbackDays <= 0 {
 		errs = append(errs, "memory: lookback_days: must be > 0")
+	}
+	switch c.Memory.Classifier.Mode {
+	case ClassifierModeOff, ClassifierModeShadow, ClassifierModeOn:
+		// ok
+	default:
+		errs = append(errs, fmt.Sprintf("memory: classifier: mode %q must be one of off, shadow, on", c.Memory.Classifier.Mode))
+	}
+	// The timeout only bounds a call that actually runs, so it is required
+	// positive only when the classifier is enabled (shadow or on).
+	if c.Memory.Classifier.Enabled() && c.Memory.Classifier.TimeoutSeconds <= 0 {
+		errs = append(errs, "memory: classifier: timeout_seconds: must be > 0 when mode is shadow or on")
 	}
 	return errs
 }

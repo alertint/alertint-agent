@@ -116,6 +116,66 @@ FROM audit_log
 WHERE kind = 'incident.memory_recalled';
 ```
 
+## Shadow classifier
+
+Recall matches on the **verbatim** group key. When the key misses but a prior
+finding is only one group-label value away — the same `cluster` and `namespace`,
+a different `service` — the deterministic prefilter still surfaces it as a weak
+"one label off" signal. Whether that weak signal is *actually* the same
+underlying condition is a fuzzy judgment, and the **shadow classifier** is the
+optional, opt-in way to make it: one small extra Haiku call that answers a single
+question — "same underlying condition?" — for the top weak candidate.
+
+It renders only the structured group-key delta (the shared labels and the one
+that differs) plus a short, capped summary of the prior hypothesis — never raw
+alert labels — so the call is ~250 tokens, roughly **$0.0003 on Haiku**. The
+verdict enum is fail-open (`matched` / `no-match` / `unsure-timeout` /
+`unsure-error`): a timeout or a malformed reply can never produce a match.
+
+The classifier ships **dark**, governed by one knob,
+[`memory.classifier.mode`](../getting-started/configuration.md#memory):
+
+- **`off`** (default) — no call is ever made.
+- **`shadow`** — the call runs and every verdict lands in the audit log
+  (`memory.classifier_verdict`), but the analysis prompt is **byte-identical** to
+  the deterministic recall. Nothing the model sees changes; you are only
+  gathering evidence.
+- **`on`** — a `matched` verdict tags the recalled candidate
+  "LLM-matched, probably related" in the analysis prompt.
+
+### Graduating from shadow to on
+
+Because AlertINT is self-hosted with no telemetry, the only evidence that the
+classifier is accurate enough lives in **your** audit log. Fuzzy-match quality is
+per-shop — it depends on your alert-naming vocabulary — so graduation is a local
+decision, not a vendor default. Run `shadow` for a few weeks, then check its
+precision: join each `matched` verdict to the confirm/refute ground truth that
+memory recall already records (`memory_verdict`) for the same prior when it later
+surfaces as an exact-key recall.
+
+```sql
+-- Shadow-classifier precision: of the weak candidates it called `matched`,
+-- how many were later confirmed vs refuted by a full analysis (ground truth).
+-- Graduate off → on once precision ≥ 0.90 over ≥ 100 matched verdicts (ADR-0018).
+SELECT
+  SUM(json_extract(v.payload_json, '$.verdict') = 'confirms') AS confirmed,
+  SUM(json_extract(v.payload_json, '$.verdict') = 'refutes')  AS refuted,
+  ROUND(
+    1.0 * SUM(json_extract(v.payload_json, '$.verdict') = 'confirms')
+        / NULLIF(COUNT(*), 0), 2) AS precision
+FROM audit_log c
+JOIN audit_log v
+  ON  v.kind = 'incident.memory_recalled'
+  AND json_extract(v.payload_json, '$.recalled')
+      = json_extract(c.payload_json, '$.candidates[0]')
+  AND json_extract(v.payload_json, '$.verdict') IN ('confirms', 'refutes')
+WHERE c.kind = 'memory.classifier_verdict'
+  AND json_extract(c.payload_json, '$.verdict') = 'matched';
+```
+
+Flipping to `on` before the gate is met is your prerogative — your key, your
+render — but it is not recommended. The vendor never flips a render remotely.
+
 ## Configuration
 
 Both halves share the [`memory`](../getting-started/configuration.md#memory)

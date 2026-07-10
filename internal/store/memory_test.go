@@ -336,6 +336,32 @@ func TestMemoryPrefilter_DiffersInExactlyOne(t *testing.T) {
 	}
 }
 
+// TestMemoryPrefilter_CarriesGroupKey locks the candidate's group_key onto the
+// returned PriorFinding: the shadow classifier renders the shared/differing
+// group-key delta (R22) from the current key and each candidate's key, so the
+// key must survive the prefilter, not just the internal candidate row.
+func TestMemoryPrefilter_CarriesGroupKey(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 9, 2, 0, 0, 0, time.UTC)
+	since := now.AddDate(0, 0, -90)
+	current := "cluster=prod,namespace=storage,service=nfs-01"
+	candidateKey := "cluster=prod,namespace=storage,service=nfs-02"
+
+	seedJudged(t, s, judged{id: "inc_one", groupKey: candidateKey, createdAt: now.AddDate(0, 0, -2), rootCause: "one-off"})
+
+	got, err := s.MemoryPrefilter(ctx, current, "inc_current", false, since, 3)
+	if err != nil {
+		t.Fatalf("MemoryPrefilter: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 candidate, got %d", len(got))
+	}
+	if got[0].GroupKey != candidateKey {
+		t.Errorf("GroupKey = %q, want %q", got[0].GroupKey, candidateKey)
+	}
+}
+
 func TestMemoryPrefilter_CapAtLimitMostRecent(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

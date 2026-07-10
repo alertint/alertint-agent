@@ -19,7 +19,12 @@ import (
 // incident columns; CorroboratingIssueIDs are lifted from the persisted Sentry
 // enrichment envelope for the disposition-lite lookup (R19).
 type PriorFinding struct {
-	IncidentID            string
+	IncidentID string
+	// GroupKey is the prior incident's verbatim group_key — the sorted group-label
+	// values, already the allowlisted recall key (never raw labels_json). The shadow
+	// classifier renders the shared/differing delta between it and the current key
+	// (R22); the exact-key recall carries it for symmetry.
+	GroupKey              string
 	AnalyzedAt            time.Time // last_judged_at, falling back to created_at
 	Confidence            float64
 	Summary               string // analysis_name
@@ -112,6 +117,7 @@ func scanPriorCandidates(rows *sql.Rows) ([]priorCandidate, error) {
 		); err != nil {
 			return nil, fmt.Errorf("store: scan prior candidate: %w", err)
 		}
+		c.pf.GroupKey = c.groupKey
 		c.pf.CorroboratingIssueIDs = corroboratingIssueIDs(enrichmentJSON)
 		analyzed, err := time.Parse(time.RFC3339Nano, createdStr)
 		if err != nil {
@@ -242,10 +248,10 @@ func (s *Store) MemoryPrefilter(ctx context.Context, groupKey, currentIncidentID
 		return nil, err
 	}
 
-	currentLabels := parseGroupKey(groupKey)
+	currentLabels := ParseGroupKey(groupKey)
 	matched := candidates[:0]
 	for _, c := range candidates {
-		if differsInExactlyOne(currentLabels, parseGroupKey(c.groupKey)) {
+		if differsInExactlyOne(currentLabels, ParseGroupKey(c.groupKey)) {
 			matched = append(matched, c)
 		}
 	}
@@ -405,10 +411,12 @@ func medianInterval(times []time.Time) time.Duration {
 	return (gaps[mid-1] + gaps[mid]) / 2
 }
 
-// parseGroupKey splits a "k1=v1,k2=v2" group_key into a label map. Keys are
+// ParseGroupKey splits a "k1=v1,k2=v2" group_key into a label map. Keys are
 // sorted and values are simple in practice (cluster/namespace/service), so a
-// split on ',' then the first '=' is exact for real keys.
-func parseGroupKey(key string) map[string]string {
+// split on ',' then the first '=' is exact for real keys. Exported so the
+// shadow classifier renders its delta from the same parse the prefilter selects
+// on — one source of truth for the group_key format.
+func ParseGroupKey(key string) map[string]string {
 	out := map[string]string{}
 	if key == "" {
 		return out

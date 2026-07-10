@@ -63,6 +63,10 @@ type Config struct {
 	// BaseRetryDelay is the initial backoff before the first retry.
 	// Defaults to 1 second. Tests may set this much smaller.
 	BaseRetryDelay time.Duration
+	// TimeoutSeconds is the whole-request HTTP timeout. Defaults to 120 (the
+	// value the triage client hardcoded before the shadow classifier needed a
+	// seconds-scale budget on a second client — see ADR-0018).
+	TimeoutSeconds int
 }
 
 func (c *Config) defaults() {
@@ -74,6 +78,9 @@ func (c *Config) defaults() {
 	}
 	if c.BaseRetryDelay <= 0 {
 		c.BaseRetryDelay = time.Second
+	}
+	if c.TimeoutSeconds <= 0 {
+		c.TimeoutSeconds = 120
 	}
 }
 
@@ -106,7 +113,7 @@ func NewWithHTTPClient(cfg Config, auditor *audit.Auditor, logger *slog.Logger, 
 	}
 	return &Client{
 		cfg:      cfg,
-		http:     &http.Client{Timeout: 120 * time.Second},
+		http:     &http.Client{Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second},
 		auditor:  auditor,
 		logger:   logger,
 		now:      func() time.Time { return time.Now().UTC() },
