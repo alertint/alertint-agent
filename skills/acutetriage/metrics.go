@@ -149,11 +149,95 @@ func memberLabelPairs(alerts []store.Alert) map[string]bool {
 	return out
 }
 
-// MetricSnapshot is a single Prometheus metric value at a point in time.
+// MetricSnapshot is a single Prometheus metric value at a point in time. Series
+// is the series' identifying label set rendered as {k="v",…} (excluding
+// __name__) — renamed from the old instance-only Instance field, since scope is
+// no longer instance-only (Outstanding Q3).
 type MetricSnapshot struct {
-	Instance string `json:"instance"`
-	Metric   string `json:"metric"`
-	Value    string `json:"value"`
+	Series string `json:"series"`
+	Metric string `json:"metric"`
+	Value  string `json:"value"`
+}
+
+// rankSeries parses a Prometheus instant-vector data blob (the "data" field of
+// the API envelope), filters system metrics, and returns at most limit snapshots
+// ranked by (overlap desc, metric asc, series-identity asc) — a total,
+// response-order-independent order (R11). overlap counts a series' (k,v) label
+// pairs (excluding __name__) that a member alert also carries.
+func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int) []MetricSnapshot {
+	var d struct {
+		Result []struct {
+			Metric map[string]string `json:"metric"`
+			Value  [2]any            `json:"value"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return nil
+	}
+	type cand struct {
+		snap    MetricSnapshot
+		overlap int
+	}
+	cands := make([]cand, 0, len(d.Result))
+	for _, r := range d.Result {
+		name := r.Metric["__name__"]
+		if name == "" || isSystemMetric(name) {
+			continue
+		}
+		val, ok := r.Value[1].(string)
+		if !ok {
+			continue
+		}
+		overlap := 0
+		for k, v := range r.Metric {
+			if k == "__name__" {
+				continue
+			}
+			if memberPairs[k+"\x00"+v] {
+				overlap++
+			}
+		}
+		cands = append(cands, cand{
+			snap:    MetricSnapshot{Series: formatSeriesIdentity(r.Metric), Metric: name, Value: val},
+			overlap: overlap,
+		})
+	}
+	sort.SliceStable(cands, func(i, j int) bool {
+		if cands[i].overlap != cands[j].overlap {
+			return cands[i].overlap > cands[j].overlap
+		}
+		if cands[i].snap.Metric != cands[j].snap.Metric {
+			return cands[i].snap.Metric < cands[j].snap.Metric
+		}
+		return cands[i].snap.Series < cands[j].snap.Series
+	})
+	if len(cands) > limit {
+		cands = cands[:limit]
+	}
+	out := make([]MetricSnapshot, len(cands))
+	for i, c := range cands {
+		out[i] = c.snap
+	}
+	return out
+}
+
+// formatSeriesIdentity renders a series' identifying labels (all but __name__) as
+// a deterministic {k="v",…} string, doubling as the snapshot's display identity
+// and the ranking tiebreak key.
+func formatSeriesIdentity(m map[string]string) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		if k == "__name__" {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%q", k, m[k]))
+	}
+	return "{" + strings.Join(parts, ",") + "}"
 }
 
 // FetchMetrics queries Prometheus for all non-system metrics on the instances
@@ -169,6 +253,7 @@ func FetchMetrics(ctx context.Context, prom *promclient.Client, alerts []store.A
 	}
 
 	const maxPerInstance = 10
+	memberPairs := memberLabelPairs(alerts)
 	var out []MetricSnapshot
 	for _, inst := range instances {
 		// Query all series for this instance at the incident time.
@@ -176,7 +261,7 @@ func FetchMetrics(ctx context.Context, prom *promclient.Client, alerts []store.A
 		if err != nil {
 			continue
 		}
-		out = append(out, parseInstantVector(data, inst, maxPerInstance)...)
+		out = append(out, rankSeries(data, memberPairs, maxPerInstance)...)
 	}
 	return out
 }
@@ -190,38 +275,6 @@ func uniqueInstances(alerts []store.Alert) []string {
 			seen[inst] = true
 			out = append(out, inst)
 		}
-	}
-	return out
-}
-
-// parseInstantVector extracts MetricSnapshots from a Prometheus instant query
-// data blob (the "data" field of the API envelope). Filters system metrics and
-// returns at most limit results.
-func parseInstantVector(raw json.RawMessage, instance string, limit int) []MetricSnapshot {
-	var d struct {
-		Result []struct {
-			Metric map[string]string `json:"metric"`
-			Value  [2]any            `json:"value"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(raw, &d); err != nil {
-		return nil
-	}
-
-	var out []MetricSnapshot
-	for _, r := range d.Result {
-		if len(out) >= limit {
-			break
-		}
-		name := r.Metric["__name__"]
-		if name == "" || isSystemMetric(name) {
-			continue
-		}
-		val, ok := r.Value[1].(string)
-		if !ok {
-			continue
-		}
-		out = append(out, MetricSnapshot{Instance: instance, Metric: name, Value: val})
 	}
 	return out
 }
