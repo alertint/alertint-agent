@@ -5,12 +5,100 @@ package acutetriage
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"regexp"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/logs"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/store"
 )
+
+// metricPhysicalKeys are the physical-identity allowlist keys — the ones that
+// name a real Prometheus series. The logical keys (service, job) are attached by
+// alerting rules and commonly exist on no series, so the R9 retry drops them.
+var metricPhysicalKeys = map[string]bool{
+	"namespace": true, "pod": true, "container": true, "instance": true,
+}
+
+// buildMetricSelector builds the incident's generic metric selector: for each
+// allowlisted label key present with a value on EVERY member alert, the distinct
+// values that key takes across members, unioned. This is exactly the log-selector
+// rule (ADR-0002/0016) — reusing sharedLabelValues — but with no provider
+// translation layer: for Prometheus, alert labels usually ARE series labels.
+func buildMetricSelector(alerts []store.Alert) map[string][]string {
+	shared := sharedLabelValues(alerts)
+	out := make(map[string][]string)
+	for _, k := range logs.AllowedSelectorKeys {
+		if vs, ok := shared[k]; ok && len(vs) > 0 {
+			out[k] = vs
+		}
+	}
+	return out
+}
+
+// renderPromMatcher renders a selector map into a PromQL stream matcher
+// {k="v",k=~"v1|v2"} with keys sorted for a deterministic query string. Returns
+// "" when no key survives (no usable selector).
+func renderPromMatcher(sel map[string][]string) string {
+	keys := make([]string, 0, len(sel))
+	for k := range sel {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if term := promMatcherTerm(k, sel[k]); term != "" {
+			parts = append(parts, term)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "{" + strings.Join(parts, ",") + "}"
+}
+
+// promMatcherTerm renders one PromQL label matcher for key k over its value set:
+// an exact matcher k="v" for a single value, or an anchored regex alternation
+// k=~"v1|v2" for several. Values are regexp-escaped (so a value's own regex
+// metacharacters stay literal) and %q-quoted (so the PromQL string literal is
+// valid). Prometheus anchors =~ matchers (^(?:…)$), so the alternation matches
+// each value exactly — mirrors internal/logs/loki matcherTerm (R3/AE2).
+func promMatcherTerm(k string, values []string) string {
+	uniq := dedupeSortedValues(values)
+	switch len(uniq) {
+	case 0:
+		return ""
+	case 1:
+		return fmt.Sprintf("%s=%q", k, uniq[0])
+	default:
+		escaped := make([]string, len(uniq))
+		for i, v := range uniq {
+			escaped[i] = regexp.QuoteMeta(v)
+		}
+		return fmt.Sprintf("%s=~%q", k, strings.Join(escaped, "|"))
+	}
+}
+
+// dedupeSortedValues returns the distinct non-empty values of in, sorted.
+func dedupeSortedValues(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // MetricSnapshot is a single Prometheus metric value at a point in time.
 type MetricSnapshot struct {
