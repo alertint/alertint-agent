@@ -38,3 +38,38 @@ func TestBuildMetricSelector_AllowlistIntersectionUnioned(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
+
+func TestInstanceSupplements_PerUniqueInstance(t *testing.T) {
+	alerts := []store.Alert{
+		alert(map[string]string{"instance": "db-01:9100", "job": "node"}),
+		alert(map[string]string{"instance": "db-01:9100", "job": "node"}), // dup
+		alert(map[string]string{"instance": "10.0.0.2:9100"}),
+	}
+	got := instanceSupplements(alerts)
+	// One matcher per UNIQUE instance, each a bare {instance="X"} (AE7).
+	want := []string{`{instance="db-01:9100"}`, `{instance="10.0.0.2:9100"}`}
+	if len(got) != len(want) {
+		t.Fatalf("got %v", got)
+	}
+	seen := map[string]bool{}
+	for _, s := range got {
+		seen[s] = true
+	}
+	for _, w := range want {
+		if !seen[w] {
+			t.Errorf("missing supplement %q in %v", w, got)
+		}
+	}
+}
+
+func TestRenderPhysicalCore_DropsLogicalKeys(t *testing.T) {
+	// service is logical and exists on no series → physical-core drops it (AE8).
+	shared := map[string][]string{"namespace": {"checkout"}, "pod": {"api-7f9x"}, "service": {"checkout-api"}}
+	if got := renderPhysicalCore(shared); got != `{namespace="checkout",pod="api-7f9x"}` {
+		t.Errorf("got %q", got)
+	}
+	// No logical key → no distinct retry.
+	if got := renderPhysicalCore(map[string][]string{"namespace": {"checkout"}}); got != "" {
+		t.Errorf("no-logical-key must yield empty retry, got %q", got)
+	}
+}

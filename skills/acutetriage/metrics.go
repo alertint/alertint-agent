@@ -100,6 +100,55 @@ func dedupeSortedValues(in []string) []string {
 	return out
 }
 
+// instanceSupplements builds one bare {instance="X"} matcher per unique member
+// instance value — the per-instance supplement (R2). It guarantees an alert
+// carrying instance keeps at least its old broad per-instance scope even when
+// the shared intersection drops instance (a label-sparse co-member) or narrows
+// it (instance AND'd with pod would filter out node-level series). No-regression
+// guard: correlation must never remove evidence an uncorrelated alert would have.
+func instanceSupplements(alerts []store.Alert) []string {
+	out := make([]string, 0)
+	for _, inst := range uniqueInstances(alerts) {
+		out = append(out, "{"+promMatcherTerm("instance", []string{inst})+"}")
+	}
+	return out
+}
+
+// renderPhysicalCore renders the R9 retry selector: the shared selector with only
+// physical-identity keys (namespace, pod, container, instance), dropping the
+// logical keys (service, job) that alerting rules attach but that exist on no
+// series. Returns "" when the shared selector has no logical key — a retry would
+// then equal the primary, so there is nothing to rescue.
+func renderPhysicalCore(shared map[string][]string) string {
+	core := make(map[string][]string)
+	hasLogical := false
+	for k, vs := range shared {
+		if metricPhysicalKeys[k] {
+			core[k] = vs
+		} else {
+			hasLogical = true
+		}
+	}
+	if !hasLogical {
+		return ""
+	}
+	return renderPromMatcher(core)
+}
+
+// memberLabelPairs collects every non-empty (key,value) label pair across all
+// member alerts into a set keyed "k\x00v", for the R11 overlap score.
+func memberLabelPairs(alerts []store.Alert) map[string]bool {
+	out := make(map[string]bool)
+	for _, a := range alerts {
+		for k, v := range a.Labels {
+			if v != "" {
+				out[k+"\x00"+v] = true
+			}
+		}
+	}
+	return out
+}
+
 // MetricSnapshot is a single Prometheus metric value at a point in time.
 type MetricSnapshot struct {
 	Instance string `json:"instance"`
