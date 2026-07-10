@@ -175,6 +175,45 @@ func TestEvidencePack_ReplaysEnrichmentNoLokiCall(t *testing.T) {
 	}
 }
 
+func TestEvidencePack_ReplaysMetrics_NoLiveQuery(t *testing.T) {
+	st := newMCPStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	id := "inc-metrics-replay"
+	if err := st.InsertIncident(ctx, store.Incident{ID: id, GroupKey: "g=3", FirstAlertAt: now, LastAlertAt: now, ReadyAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkIncidentReady(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := `{"metrics":{"snapshots":[{"series":"{instance=\"db-01:9100\"}","metric":"cpu","value":"0.9"}],"outcome":"fetched"}}`
+	if err := st.SaveIncidentOutput(ctx, id, `{"ok":true}`, "n", "i", 0.9, snapshot); err != nil {
+		t.Fatal(err)
+	}
+
+	// No Prometheus client wired — a live query would panic/error; the pack must
+	// replay from the envelope instead (AE6).
+	s := NewServer(Config{}, st, audit.New(st.DB()))
+	res, err := s.handleGetEvidencePack(ctx, reqWith(map[string]any{"incident_id": id}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("evidence pack errored: %s", resultText(t, res))
+	}
+	out := resultText(t, res)
+	if !strings.Contains(out, `"enrichment"`) || !strings.Contains(out, `"metrics"`) {
+		t.Fatalf("evidence pack did not replay the persisted metrics envelope: %s", out)
+	}
+	var parsed map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("evidence pack result not valid JSON: %v", err)
+	}
+	if _, ok := parsed["metrics"]; ok {
+		t.Fatalf("evidence pack must not carry a top-level metrics field: %s", out)
+	}
+}
+
 func TestEvidencePack_OmitsLogsWhenAbsent(t *testing.T) {
 	st := newMCPStore(t)
 	ctx := context.Background()

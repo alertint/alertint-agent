@@ -54,9 +54,35 @@ func TestUserPrompt_WithLiveLogsNoCalibration(t *testing.T) {
 }
 
 func TestUserPrompt_WithMetricsNoCalibration(t *testing.T) {
-	metrics := []MetricSnapshot{{Metric: "up", Instance: "api-1", Value: "0"}}
+	metrics := &MetricEnrichment{Outcome: OutcomeFetched, Snapshots: []MetricSnapshot{{Metric: "up", Series: `{instance="api-1"}`, Value: "0"}}}
 	out := UserPrompt(basePack(), "{}", metrics, nil, nil, nil, nil)
 	if strings.Contains(out, "ANNOTATIONS ONLY") {
 		t.Fatalf("live metrics present — calibration directive must be omitted: %s", out)
+	}
+}
+
+func TestRenderMetrics_SeriesAndNote(t *testing.T) {
+	var b strings.Builder
+	renderMetrics(&b, &MetricEnrichment{Outcome: OutcomeFetched, Snapshots: []MetricSnapshot{
+		{Series: `{namespace="checkout",pod="api-7f9x"}`, Metric: "cpu", Value: "0.9"},
+	}})
+	if !strings.Contains(b.String(), `cpu{namespace="checkout",pod="api-7f9x"} = 0.9`) {
+		t.Errorf("metric line missing: %q", b.String())
+	}
+	// Empty + attempted → a note, like logs.
+	b.Reset()
+	renderMetrics(&b, &MetricEnrichment{Outcome: OutcomeEmpty, Note: "no metric series matched the incident selector"})
+	if !strings.Contains(b.String(), "no metric series matched") {
+		t.Errorf("empty note missing: %q", b.String())
+	}
+}
+
+func TestHasLiveEvidence_MetricsPresenceLiftsCap(t *testing.T) {
+	// R10: any snapshot that reaches the prompt is live evidence.
+	if !hasLiveEvidence(&MetricEnrichment{Snapshots: make([]MetricSnapshot, 1)}, nil, nil, nil) {
+		t.Error("one snapshot must count as live evidence")
+	}
+	if hasLiveEvidence(&MetricEnrichment{Outcome: OutcomeEmpty}, nil, nil, nil) {
+		t.Error("queried-empty must NOT lift the cap")
 	}
 }

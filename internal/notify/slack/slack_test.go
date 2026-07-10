@@ -136,3 +136,25 @@ func TestDrillBannerOnAllSurfaces(t *testing.T) {
 		}
 	}
 }
+
+func TestEvidenceLine(t *testing.T) {
+	cases := []struct {
+		name string
+		sum  notify.EvidenceSummary
+		want string
+	}{
+		{"counts+unreachable", notify.EvidenceSummary{Sources: []notify.SourceEvidence{
+			{Source: "Prometheus", Unit: "metrics", Count: 21, State: notify.EvidenceCounted},
+			{Source: "Loki", Unit: "lines", Count: 0, State: notify.EvidenceCounted},
+			{Source: "Changes", Count: 2, State: notify.EvidenceCounted},
+			{Source: "Sentry", Unit: "issues", Count: 0, State: notify.EvidenceUnreachable},
+		}}, "Prometheus 21 metrics · Loki 0 lines · Changes 2 · Sentry unreachable"},
+		{"skipped", notify.EvidenceSummary{Skipped: true}, "skipped (known issue)"},
+		{"no sources", notify.EvidenceSummary{NoSources: true}, "no sources configured"},
+	}
+	for _, tc := range cases {
+		if got := evidenceLine(tc.sum); got != tc.want {
+			t.Errorf("%s: got %q want %q", tc.name, got, tc.want)
+		}
+	}
+}

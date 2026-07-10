@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Kubernetes metric enrichment**: Prometheus metric enrichment now scopes series
+  by the generic label selector (namespace/pod/container/…), so Kubernetes-style
+  alerts get live metrics instead of an annotations-only confidence cap (#24).
+- **Evidence line on every finding**: notifications now carry a per-source evidence
+  summary (e.g. `Prometheus 21 metrics · Loki 0 lines · Changes 2 · Sentry
+  unreachable`), distinguishing an unreachable connector from a genuine zero, with
+  explicit `skipped (known issue)` and `no sources configured` states.
+
 ## [0.7.0] - 2026-07-10
 
 ### Added

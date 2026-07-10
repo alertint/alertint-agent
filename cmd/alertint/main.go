@@ -265,8 +265,11 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 			WindowSeconds: cfg.Correlator.WindowSeconds,
 			MinAlerts:     cfg.Correlator.MinAlerts,
 			Prometheus:    prom,
-			Rules:         ruleEngine,
-			LogSource:     logSrc,
+			MetricParams: acutetriage.MetricParams{
+				TimeoutSeconds: cfg.Prometheus.TimeoutSeconds,
+			},
+			Rules:     ruleEngine,
+			LogSource: logSrc,
 			LogParams: acutetriage.LogParams{
 				DefaultRangeMinutes: cfg.Logs.DefaultRangeMinutes,
 				TimeoutSeconds:      cfg.Logs.TimeoutSeconds,

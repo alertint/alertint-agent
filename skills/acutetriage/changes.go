@@ -43,6 +43,7 @@ type ChangeEnrichment struct {
 	MatchedLabels map[string]string `json:"matched_labels"` // incident shared labels matched on (NOT allowlist-filtered)
 	Changes       []ChangeView      `json:"changes,omitempty"`
 	Note          string            `json:"note,omitempty"`
+	Outcome       Outcome           `json:"outcome,omitempty"` // fetched / empty / failed (R8)
 }
 
 // FetchChanges surfaces recent changes in the incident's window, ranked by
@@ -81,7 +82,7 @@ func FetchChanges(ctx context.Context, st *store.Store, params ChangeParams, ale
 	all, err := st.ChangesInWindow(ctx, start, end)
 	if err != nil {
 		logger.Warn("change query failed", "err", err, "incident", incidentID)
-		return &ChangeEnrichment{Start: start, End: end, MatchedLabels: shared, Note: "change query failed: " + err.Error()}
+		return &ChangeEnrichment{Start: start, End: end, MatchedLabels: shared, Note: "change query failed: " + err.Error(), Outcome: OutcomeFailed}
 	}
 	// Segregate drill artifacts (ADR-0013/0014): a change event carrying the
 	// reserved drill marker is synthetic. It may only enrich a Drill — for a
@@ -104,7 +105,7 @@ func FetchChanges(ctx context.Context, st *store.Store, params ChangeParams, ale
 		// Genuinely empty window — keep the original note so absence of changes
 		// is never silently mistaken for "nothing changed".
 		logger.Info("no changes in window", "window", fmt.Sprintf("%dm", params.WindowMinutes), "incident", incidentID)
-		return &ChangeEnrichment{Start: start, End: end, MatchedLabels: shared, Note: "no changes in window"}
+		return &ChangeEnrichment{Start: start, End: end, MatchedLabels: shared, Note: "no changes in window", Outcome: OutcomeEmpty}
 	}
 
 	// Rank ALL in-window changes: overlap drives the sort key but no longer
@@ -145,7 +146,7 @@ func FetchChanges(ctx context.Context, st *store.Store, params ChangeParams, ale
 		})
 	}
 
-	enr := &ChangeEnrichment{Start: start, End: end, MatchedLabels: shared, Changes: views}
+	enr := &ChangeEnrichment{Start: start, End: end, MatchedLabels: shared, Changes: views, Outcome: OutcomeFetched}
 	if len(shared) == 0 {
 		// Incident had no shared labels to match on, but the window had changes —
 		// show them by recency rather than returning nothing (ADR-0005).

@@ -302,6 +302,32 @@ func agentHandoffBlock(incidentID string) slacklib.Block {
 	)
 }
 
+// evidenceLine renders the always-on evidence summary text (R6/R7/R8/R12). A
+// short-circuit or zero-connector finding renders one card-level state; otherwise
+// each source renders "<Source> <count> <unit>" (unit omitted for changes), or
+// "<Source> unreachable" when the connector could not be reached.
+func evidenceLine(s notify.EvidenceSummary) string {
+	switch {
+	case s.Skipped:
+		return "skipped (known issue)"
+	case s.NoSources:
+		return "no sources configured"
+	}
+	parts := make([]string, 0, len(s.Sources))
+	for _, src := range s.Sources {
+		if src.State == notify.EvidenceUnreachable {
+			parts = append(parts, src.Source+" unreachable")
+			continue
+		}
+		if src.Unit == "" {
+			parts = append(parts, fmt.Sprintf("%s %d", src.Source, src.Count))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s %d %s", src.Source, src.Count, src.Unit))
+		}
+	}
+	return strings.Join(parts, " · ")
+}
+
 // firingDetailBlocks builds the immediate thread reply with the full analysis:
 // severity, confidence, correlation findings, and MCP hint.
 func firingDetailBlocks(f notify.Finding) []slacklib.Block {
@@ -320,6 +346,12 @@ func firingDetailBlocks(f notify.Finding) []slacklib.Block {
 			slacklib.NewTextBlockObject(slacklib.MarkdownType, fmt.Sprintf("*Group*\n`%s`", f.GroupKey), false, false),
 		}, nil),
 	}
+
+	blocks = append(blocks, slacklib.NewSectionBlock(
+		slacklib.NewTextBlockObject(slacklib.MarkdownType,
+			"*Evidence:* "+evidenceLine(f.Evidence), false, false),
+		nil, nil,
+	))
 
 	if len(f.CorrelationFindings) > 0 {
 		var sb strings.Builder

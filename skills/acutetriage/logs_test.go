@@ -270,6 +270,39 @@ func TestFetchLogs_ErrorNoteAndWarnLogTriageProceeds(t *testing.T) {
 	}
 }
 
+func TestFetchLogs_OutcomeTags(t *testing.T) {
+	// no usable selector (alerts with no allowlisted labels).
+	e := FetchLogs(context.Background(), &fakeSource{name: "loki"}, LogParams{DefaultRangeMinutes: 5, TimeoutSeconds: 5, MaxLines: 10},
+		alertsWith(map[string]string{"alertname": "X"}), time.Now(), time.Now(), "i", nil)
+	if e.Outcome != OutcomeNoSelector {
+		t.Errorf("no-selector: got %q", e.Outcome)
+	}
+
+	// backend query failed.
+	src := &fakeSource{name: "loki", err: context.DeadlineExceeded, fetched: logs.Fetched{Query: `{namespace="prod"}`}}
+	e = FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 5, TimeoutSeconds: 5, MaxLines: 10},
+		alertsWith(map[string]string{"namespace": "prod"}), time.Now(), time.Now(), "i", nil)
+	if e.Outcome != OutcomeFailed {
+		t.Errorf("failed: got %q", e.Outcome)
+	}
+
+	// queried but empty.
+	src = &fakeSource{name: "loki", fetched: logs.Fetched{Lines: nil, Query: `{namespace="prod"}`}}
+	e = FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 5, TimeoutSeconds: 5, MaxLines: 10},
+		alertsWith(map[string]string{"namespace": "prod"}), time.Now(), time.Now(), "i", nil)
+	if e.Outcome != OutcomeEmpty {
+		t.Errorf("empty: got %q", e.Outcome)
+	}
+
+	// fetched.
+	src = &fakeSource{name: "loki", fetched: logs.Fetched{Lines: []logs.Line{{Timestamp: time.Unix(1, 0), Line: "x"}}, Query: `{namespace="prod"}`}}
+	e = FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 5, TimeoutSeconds: 5, MaxLines: 10},
+		alertsWith(map[string]string{"namespace": "prod"}), time.Now(), time.Now(), "i", nil)
+	if e.Outcome != OutcomeFetched {
+		t.Errorf("fetched: got %q", e.Outcome)
+	}
+}
+
 func TestFetchLogs_NormalizeCapsEnforced(t *testing.T) {
 	// 60 lines, newest-first, 200 bytes each → byte cap (8192) keeps ~40.
 	var in []logs.Line

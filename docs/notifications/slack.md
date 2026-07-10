@@ -83,6 +83,7 @@ and resolved — only the header and fields change on resolution.
 | Main — footer | Incident ID, alert count, group key, and start time. Replaced by resolved time and duration on resolution. |
 | Main — agent handoff | `investigate incident <id> using alertint` — the MCP call to action, with the full incident ID. Dropped when the incident resolves. |
 | Thread — analysis | Posted immediately after the main message: severity, confidence, alert count, and group key in a fields grid. |
+| Thread — evidence | One line: per-source counts (Prometheus/Loki/Changes/Sentry) that fed the triage, e.g. `Prometheus 21 metrics · Loki 0 lines`. A connector that could not be reached shows `unreachable` instead of a count; a known-issue short-circuit shows `skipped (known issue)`; a zero-connector install shows `no sources configured`. Always present. |
 | Thread — findings | Bullet list of correlation findings. Only shown when the LLM identified more than one contributing factor. |
 | Thread — agent handoff | The same handoff block, so the call to action reads identically on every firing surface. |
 | Thread — resolved | Posted when all alerts recover: duration, alert count, and resolved timestamp in a fields grid. |
@@ -113,6 +114,8 @@ Analysis details
 
 Severity: HIGH        Confidence: 91%
 Alerts: 3             Group: cluster=prod
+
+Evidence: Prometheus 14 metrics · Loki 6 lines · Changes 1 · Sentry 2 issues
 
 Correlation findings
 • HighCPU (api-2) fired 15 s before HighErrorRate — causal ordering confirmed.

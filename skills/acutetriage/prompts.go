@@ -127,7 +127,7 @@ func BuildEvidencePack(inc store.Incident, alerts []store.Alert, windowSeconds i
 // LLM. metrics is optional — pass nil when Prometheus is not available. logs is
 // optional — pass nil when no log source is configured; when non-nil it always
 // renders a "Recent logs" section (lines, or a note explaining their absence).
-func UserPrompt(pack EvidencePack, packJSON string, metrics []MetricSnapshot, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, memory *MemoryEnrichment) string {
+func UserPrompt(pack EvidencePack, packJSON string, metrics *MetricEnrichment, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, memory *MemoryEnrichment) string {
 	var b strings.Builder
 	fmt.Fprintf(&b,
 		"Analyze the following correlated incident.\n\nEvidence:\n%s\n\nShared labels: %s\nAlert count: %d\nWindow: %ds",
@@ -136,12 +136,7 @@ func UserPrompt(pack EvidencePack, packJSON string, metrics []MetricSnapshot, lo
 		pack.AlertCount,
 		pack.WindowSeconds,
 	)
-	if len(metrics) > 0 {
-		b.WriteString("\n\nLive metrics (Prometheus, at incident time):")
-		for _, m := range metrics {
-			fmt.Fprintf(&b, "\n  %s{instance=%q} = %s", m.Metric, m.Instance, m.Value)
-		}
-	}
+	renderMetrics(&b, metrics)
 	renderLogs(&b, logs)
 	renderChanges(&b, changes)
 	renderSentry(&b, sentry)
@@ -172,7 +167,7 @@ const MaxMetadataOnlyConfidence = 0.6
 // recalled memory section: recalled priors are past hypotheses, so when
 // memoryPresent is true the directive says so explicitly — a recalled prior's
 // confidence must not be smuggled into today's evidence-free re-fire (R18/R20).
-func renderEvidenceBasis(b *strings.Builder, metrics []MetricSnapshot, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, memoryPresent bool) {
+func renderEvidenceBasis(b *strings.Builder, metrics *MetricEnrichment, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, memoryPresent bool) {
 	if hasLiveEvidence(metrics, logs, changes, sentry) {
 		return
 	}
@@ -192,9 +187,9 @@ func renderEvidenceBasis(b *strings.Builder, metrics []MetricSnapshot, logs *Log
 
 // hasLiveEvidence reports whether any enrichment source returned actual data
 // (not just an attempted-but-empty note) for the incident.
-func hasLiveEvidence(metrics []MetricSnapshot, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment) bool {
+func hasLiveEvidence(metrics *MetricEnrichment, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment) bool {
 	switch {
-	case len(metrics) > 0:
+	case metrics != nil && len(metrics.Snapshots) > 0:
 		return true
 	case logs != nil && len(logs.Lines) > 0:
 		return true
@@ -205,6 +200,29 @@ func hasLiveEvidence(metrics []MetricSnapshot, logs *LogEnrichment, changes *Cha
 	default:
 		return false
 	}
+}
+
+// renderMetrics appends the "Live metrics" section. When snapshots are present
+// they render as metric{series} = value; when empty (queried-empty / no-selector
+// / backend-failed) the note renders instead, so the model sees metrics were
+// attempted — the same visibility posture logs already have. Omitted only when
+// metrics are not configured (m is nil).
+func renderMetrics(b *strings.Builder, m *MetricEnrichment) {
+	if m == nil {
+		return
+	}
+	if len(m.Snapshots) > 0 {
+		b.WriteString("\n\nLive metrics (Prometheus, at incident time):")
+		for _, s := range m.Snapshots {
+			fmt.Fprintf(b, "\n  %s%s = %s", s.Metric, s.Series, s.Value)
+		}
+		return
+	}
+	note := m.Note
+	if note == "" {
+		note = "no metric values available"
+	}
+	fmt.Fprintf(b, "\n\nLive metrics (Prometheus): %s", note)
 }
 
 // renderSentry appends the "Sentry issues" Error-source section. With issues

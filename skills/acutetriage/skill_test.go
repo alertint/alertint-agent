@@ -11,12 +11,18 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/audit"
 	llm "github.com/alertint/alertint-agent/internal/llm/anthropic"
+	"github.com/alertint/alertint-agent/internal/notify"
+	promclient "github.com/alertint/alertint-agent/internal/prometheus"
+	"github.com/alertint/alertint-agent/internal/rules"
 	"github.com/alertint/alertint-agent/internal/sentry"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/skills/acutetriage"
@@ -871,5 +877,116 @@ func TestRejudgePromptCarriesRecurrenceContext(t *testing.T) {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("re-judgment prompt missing %q\n---\n%s", want, prompt)
 		}
+	}
+}
+
+// capturingNotifier records the last Finding it was asked to notify.
+type capturingNotifier struct {
+	last notify.Finding
+}
+
+func (c *capturingNotifier) Notify(_ context.Context, f notify.Finding) error {
+	c.last = f
+	return nil
+}
+func (c *capturingNotifier) Name() string { return "capture" }
+
+// newLocalRuleEngine builds a rules.Engine from a single-rule known-issue pack
+// written to a temp directory, so a real Run() short-circuit can be exercised
+// through the public API (no internal test seam exists for this).
+func newLocalRuleEngine(t *testing.T) *rules.Engine {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "pack.yaml"), []byte("name: test\nversion: \"0.0.1\"\nupdated: \"2026-07-08\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rulesDir := filepath.Join(dir, "rules")
+	if err := os.MkdirAll(rulesDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ruleYAML := `rules:
+  - id: test.known-disk-issue
+    kind: known_issue
+    description: Known disk issue
+    when:
+      all:
+        - label: alertname
+          op: equals
+          value: KnownDiskIssue
+    then:
+      short_circuit_llm: true
+      root_cause_hint: known disk cleanup job stalled
+      severity: high
+    updated: "2026-07-08"
+`
+	if err := os.WriteFile(filepath.Join(rulesDir, "01-known.yaml"), []byte(ruleYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e, err := rules.NewEngine(context.Background(), nil, rules.NewLocalDirSource(dir, 0))
+	if err != nil {
+		t.Fatalf("build rule engine: %v", err)
+	}
+	return e
+}
+
+// TestPipeline_AttachesEvidenceSummaryAndPersistsMetrics builds a skill with a
+// fake Prometheus backend (an httptest server behind the real client), runs an
+// incident, and asserts the Finding carries a Prometheus evidence entry and the
+// persisted enrichment envelope has a "metrics" key. A second, short-circuited
+// incident asserts the evidence line collapses to the skipped state.
+func TestPipeline_AttachesEvidenceSummaryAndPersistsMetrics(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	promSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[
+			{"metric":{"__name__":"up","service":"checkout"},"value":[0,"1"]}
+		]}}`))
+	}))
+	t.Cleanup(promSrv.Close)
+	prom := promclient.NewClient(promclient.Config{BaseURL: promSrv.URL, TimeoutSeconds: 5})
+
+	notifier := &capturingNotifier{}
+	cfg := acutetriage.Config{
+		MinAlerts:    2,
+		Prometheus:   prom,
+		MetricParams: acutetriage.MetricParams{TimeoutSeconds: 5},
+	}
+
+	// Normal incident: metrics fetched, evidence attached, envelope persisted.
+	inc := insertTestIncident(t, st, ctx)
+	ids := scopedAlerts(t, st, ctx, inc.ID)
+	fllm := &fakeLLM{response: validLLMResponse(ids)}
+	skill := acutetriage.New(cfg, st, fllm, nil, notifier, nil)
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(notifier.last.Evidence.Sources) == 0 || notifier.last.Evidence.Sources[0].Source != "Prometheus" {
+		t.Fatalf("want a Prometheus evidence entry, got %+v", notifier.last.Evidence)
+	}
+	if notifier.last.Evidence.Sources[0].Count != 1 {
+		t.Errorf("want Prometheus count 1, got %+v", notifier.last.Evidence.Sources[0])
+	}
+	var enrichmentJSON string
+	if err := st.DB().QueryRowContext(ctx, `SELECT enrichment_json FROM incidents WHERE id = ?`, inc.ID).Scan(&enrichmentJSON); err != nil {
+		t.Fatalf("scan enrichment_json: %v", err)
+	}
+	if !strings.Contains(enrichmentJSON, `"metrics"`) {
+		t.Errorf("persisted enrichment envelope missing metrics key: %s", enrichmentJSON)
+	}
+
+	// Short-circuit incident: no fetch runs, evidence collapses to skipped.
+	scCfg := cfg
+	scCfg.Rules = newLocalRuleEngine(t)
+	scSkill := acutetriage.New(scCfg, st, fllm, nil, notifier, nil)
+	scInc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, scInc.ID, "fp-known-1", map[string]string{"alertname": "KnownDiskIssue", "host": "web1"})
+	insertTestAlert(t, st, ctx, scInc.ID, "fp-known-2", map[string]string{"alertname": "KnownDiskIssue", "host": "web1"})
+	if err := scSkill.Run(ctx, scInc); err != nil {
+		t.Fatalf("Run (short-circuit): %v", err)
+	}
+	if !notifier.last.Evidence.Skipped {
+		t.Errorf("short-circuit finding must report Evidence.Skipped, got %+v", notifier.last.Evidence)
 	}
 }

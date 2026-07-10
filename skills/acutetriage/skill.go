@@ -83,6 +83,10 @@ type Config struct {
 	// client retries 429/529 with backoff, so the per-request HTTP timeout alone
 	// would not bound the total time the call sits on the triage-critical path.
 	ClassifierTimeout time.Duration
+	// MetricParams carries the metric-enrichment tunables (fetch deadline) from
+	// the prometheus config section. Prometheus above is the client; this is the
+	// single-deadline budget for the multi-scope fetch.
+	MetricParams MetricParams
 }
 
 // Skill orchestrates the full acute-triage pipeline for a single ready
@@ -264,6 +268,9 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	// logs-disabled path → stored NULL).
 	outputJSON := string(raw)
 	sources := map[string]any{}
+	if metrics != nil {
+		sources["metrics"] = metrics
+	}
 	if enrichment != nil {
 		sources["logs"] = enrichment
 	}
@@ -345,6 +352,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 			OutputJSON:          raw,
 			Status:              incidentStatus,
 			Drill:               isDrill(alerts),
+			Evidence:            buildEvidenceSummary(decision.ShortCircuit, metrics, enrichment, changes, sentry),
 		}
 		// Multi owns the per-sink notify outcome line(s): a quiet "notified" on
 		// success, a "notify partial"/"notify failed" summary plus one "notify
@@ -366,46 +374,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.analyzed", analyzed)
 	}
 
-	// Enrichment digest (when logs were attempted). A digest only — source,
-	// query, and line count — never the log text, so the hash-chained payload
-	// stays small.
-	if s.auditor != nil && enrichment != nil {
-		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.enriched", map[string]any{
-			"incident_id": inc.ID,
-			"source":      enrichment.Source,
-			"query":       enrichment.Query,
-			"line_count":  len(enrichment.Lines),
-		})
-	}
-
-	// Changes digest (when change enrichment was attempted): a count + matched
-	// labels only, never change titles — keeps the hash-chained payload small.
-	if s.auditor != nil && changes != nil {
-		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.changes_enriched", map[string]any{
-			"incident_id":    inc.ID,
-			"matched_labels": changes.MatchedLabels,
-			"change_count":   len(changes.Changes),
-		})
-	}
-
-	// Sentry digest (when the Error source was attempted): scope + issue count +
-	// the reconciliation verdict (a fixed enum tag and an integer count) only —
-	// never exception text, culprit, message, or file:line — keeps the hash-chained
-	// payload small and PII-free (R16/KTD6). The digest fires for EVERY non-nil
-	// enrichment, including the degraded / unknown-project paths where the verdict
-	// is nil, so tag/count are read only when Reconciliation is present (a naive
-	// deref would panic the triage goroutine on a routine rate-limit or 404).
-	if s.auditor != nil && sentry != nil {
-		tag, corroborating := reconciliationDigestFields(sentry)
-		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.sentry_enriched", map[string]any{
-			"incident_id":   inc.ID,
-			"project":       sentry.Project,
-			"environment":   sentry.Environment,
-			"issue_count":   len(sentry.Issues),
-			"tag":           tag,
-			"corroborating": corroborating,
-		})
-	}
+	s.auditEnrichmentDigests(ctx, inc.ID, metrics, enrichment, changes, sentry)
 
 	ruleID := "none"
 	if decision.Rule != nil {
@@ -422,13 +391,63 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	return nil
 }
 
+// auditEnrichmentDigests appends one hash-chained digest row per attempted
+// enrichment source — metrics, logs, changes, Sentry. Each digest carries only
+// counts/identifiers (selector, query, matched labels, reconciliation tag),
+// never raw evidence text or metric values, keeping the payload small and
+// PII-free (R4/R16/KTD6). A source contributes a row only when it was
+// attempted (non-nil); a nil auditor makes every call a no-op.
+func (s *Skill) auditEnrichmentDigests(ctx context.Context, incidentID string, metrics *MetricEnrichment, enrichment *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment) {
+	if s.auditor == nil {
+		return
+	}
+	if metrics != nil {
+		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.metrics_enriched", map[string]any{
+			"incident_id":    incidentID,
+			"selector":       metrics.Selector,
+			"snapshot_count": len(metrics.Snapshots),
+			"outcome":        string(metrics.Outcome),
+		})
+	}
+	if enrichment != nil {
+		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.enriched", map[string]any{
+			"incident_id": incidentID,
+			"source":      enrichment.Source,
+			"query":       enrichment.Query,
+			"line_count":  len(enrichment.Lines),
+		})
+	}
+	if changes != nil {
+		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.changes_enriched", map[string]any{
+			"incident_id":    incidentID,
+			"matched_labels": changes.MatchedLabels,
+			"change_count":   len(changes.Changes),
+		})
+	}
+	// Sentry fires for EVERY non-nil enrichment, including the degraded /
+	// unknown-project paths where the verdict is nil, so tag/count are read only
+	// when Reconciliation is present (a naive deref would panic the triage
+	// goroutine on a routine rate-limit or 404).
+	if sentry != nil {
+		tag, corroborating := reconciliationDigestFields(sentry)
+		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.sentry_enriched", map[string]any{
+			"incident_id":   incidentID,
+			"project":       sentry.Project,
+			"environment":   sentry.Environment,
+			"issue_count":   len(sentry.Issues),
+			"tag":           tag,
+			"corroborating": corroborating,
+		})
+	}
+}
+
 // analysis produces the raw finding JSON, either synthesized from a
 // matched known-issue rule (short-circuit, no LLM call) or from the LLM
 // with the pack-selected system prompt. On the LLM path it also returns the
 // metric and log-enrichment snapshots (nil on the short-circuit path) so the
 // caller can persist exactly what the model saw and judge the evidence basis
 // for the deterministic confidence cap.
-func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store.Alert, decision rules.Decision, pack EvidencePack, packJSON []byte, spanStart time.Time, recurrence string) (json.RawMessage, []MetricSnapshot, *LogEnrichment, *ChangeEnrichment, *SentryEnrichment, *MemoryEnrichment, error) {
+func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store.Alert, decision rules.Decision, pack EvidencePack, packJSON []byte, spanStart time.Time, recurrence string) (json.RawMessage, *MetricEnrichment, *LogEnrichment, *ChangeEnrichment, *SentryEnrichment, *MemoryEnrichment, error) {
 	if decision.ShortCircuit {
 		raw, err := shortCircuitResponse(decision, alerts)
 		if err != nil {
@@ -446,7 +465,13 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 	// spanStart anchors the enrichment window on the collapse span: the original
 	// first_alert_at for an initial triage, the first occurrence for a
 	// re-judgment (so metrics/logs cover the recurrence, not a stale window).
-	metrics := FetchMetrics(ctx, s.cfg.Prometheus, alerts, spanStart)
+	// Prometheus is a concrete *promclient.Client (nil when disabled); pass a TRUE
+	// nil interface so FetchMetrics's nil check is not defeated by a typed-nil.
+	var mq metricQuerier
+	if s.cfg.Prometheus != nil {
+		mq = s.cfg.Prometheus
+	}
+	metrics := FetchMetrics(ctx, mq, s.cfg.MetricParams, alerts, spanStart, inc.ID, s.logger)
 	// Best-effort log enrichment: never blocks or fails triage. end=now so a
 	// still-firing incident captures the freshest lines around analysis time.
 	enrichment := FetchLogs(ctx, s.cfg.LogSource, s.cfg.LogParams, alerts, spanStart, time.Now().UTC(), inc.ID, s.logger)
@@ -573,7 +598,7 @@ func marshalEnrichments(sources map[string]any, logger *slog.Logger, incidentID 
 // compliance. Short-circuit findings are exempt — they carry rule evidence, not
 // model judgment. The persisted output_json keeps the model's original number;
 // the incident row and every notification carry the capped one.
-func (s *Skill) applyEvidenceCap(resp *llmResponse, decision rules.Decision, metrics []MetricSnapshot, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, incidentID string) {
+func (s *Skill) applyEvidenceCap(resp *llmResponse, decision rules.Decision, metrics *MetricEnrichment, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, incidentID string) {
 	if decision.ShortCircuit || hasLiveEvidence(metrics, logs, changes, sentry) ||
 		resp.Confidence <= MaxMetadataOnlyConfidence {
 		return
