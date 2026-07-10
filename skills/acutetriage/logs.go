@@ -18,12 +18,13 @@ import (
 // can replay exactly what the LLM saw. The same value feeds both the prompt and
 // persistence — one fetch, two uses.
 type LogEnrichment struct {
-	Source string      `json:"source"`          // src.Name()
-	Query  string      `json:"query,omitempty"` // the native query that ran ("" if none built)
-	Start  time.Time   `json:"start"`
-	End    time.Time   `json:"end"`
-	Lines  []logs.Line `json:"lines,omitempty"` // normalized, newest-first
-	Note   string      `json:"note,omitempty"`  // why Lines is empty (queried-empty / timeout / error / no-selector)
+	Source  string      `json:"source"`          // src.Name()
+	Query   string      `json:"query,omitempty"` // the native query that ran ("" if none built)
+	Start   time.Time   `json:"start"`
+	End     time.Time   `json:"end"`
+	Lines   []logs.Line `json:"lines,omitempty"`   // normalized, newest-first
+	Note    string      `json:"note,omitempty"`    // why Lines is empty (queried-empty / timeout / error / no-selector)
+	Outcome Outcome     `json:"outcome,omitempty"` // fetched / empty / no_selector / failed (R8)
 }
 
 // LogParams carries the generic enrichment tunables from config (the logs
@@ -74,10 +75,11 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 		logger.Info("acutetriage: logs: empty selector — no usable log labels for this incident",
 			"source", source, "shared_labels", shared, "incident", incidentID)
 		return &LogEnrichment{
-			Source: source,
-			Start:  start,
-			End:    end,
-			Note:   "no usable log selector for this incident (shared labels: " + shared + ")",
+			Source:  source,
+			Start:   start,
+			End:     end,
+			Note:    "no usable log selector for this incident (shared labels: " + shared + ")",
+			Outcome: OutcomeNoSelector,
 		}
 	}
 
@@ -93,11 +95,12 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 		logger.Warn("acutetriage: logs: backend query failed",
 			"source", source, "query", fetched.Query, "err", err, "incident", incidentID)
 		return &LogEnrichment{
-			Source: source,
-			Query:  fetched.Query,
-			Start:  start,
-			End:    end,
-			Note:   "log backend query failed: " + err.Error(),
+			Source:  source,
+			Query:   fetched.Query,
+			Start:   start,
+			End:     end,
+			Note:    "log backend query failed: " + err.Error(),
+			Outcome: OutcomeFailed,
 		}
 	}
 
@@ -108,11 +111,12 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 		logger.Info("acutetriage: logs: query returned no lines — check label_map / line_filter",
 			"source", source, "query", fetched.Query, "incident", incidentID)
 		return &LogEnrichment{
-			Source: source,
-			Query:  fetched.Query,
-			Start:  start,
-			End:    end,
-			Note:   "log backend returned no lines for this query",
+			Source:  source,
+			Query:   fetched.Query,
+			Start:   start,
+			End:     end,
+			Note:    "log backend returned no lines for this query",
+			Outcome: OutcomeEmpty,
 		}
 	}
 
@@ -127,11 +131,12 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 	)
 
 	return &LogEnrichment{
-		Source: source,
-		Query:  fetched.Query,
-		Start:  start,
-		End:    end,
-		Lines:  lines,
+		Source:  source,
+		Query:   fetched.Query,
+		Start:   start,
+		End:     end,
+		Lines:   lines,
+		Outcome: OutcomeFetched,
 	}
 }
 

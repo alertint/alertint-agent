@@ -93,10 +93,10 @@ func TestRankSeries_OverlapPreferredWithDeterministicTiebreak(t *testing.T) {
 		alert(map[string]string{"namespace": "checkout", "pod": "api-7f9x"}),
 	})
 	raw := vector(
-		s(map[string]string{"__name__": "http_reqs", "namespace": "checkout"}, "5"),                       // overlap 1
-		s(map[string]string{"__name__": "cpu", "namespace": "checkout", "pod": "api-7f9x"}, "0.9"),          // overlap 2
-		s(map[string]string{"__name__": "go_gc_duration_seconds", "namespace": "checkout"}, "0.1"),          // system → dropped
-		s(map[string]string{"__name__": "mem", "namespace": "checkout", "pod": "api-7f9x"}, "700"),          // overlap 2
+		s(map[string]string{"__name__": "http_reqs", "namespace": "checkout"}, "5"),                // overlap 1
+		s(map[string]string{"__name__": "cpu", "namespace": "checkout", "pod": "api-7f9x"}, "0.9"), // overlap 2
+		s(map[string]string{"__name__": "go_gc_duration_seconds", "namespace": "checkout"}, "0.1"), // system → dropped
+		s(map[string]string{"__name__": "mem", "namespace": "checkout", "pod": "api-7f9x"}, "700"), // overlap 2
 	)
 	got := rankSeries(raw, members, 10)
 	if len(got) != 3 {
