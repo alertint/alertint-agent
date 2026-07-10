@@ -214,6 +214,24 @@ func TestValidate_RejectsNonAnthropicProvider(t *testing.T) {
 	}
 }
 
+func TestDefaults_LLMMaxTokens(t *testing.T) {
+	cfg := Defaults()
+	if cfg.LLM.MaxTokens != 4096 {
+		t.Errorf("default llm.max_tokens = %d, want 4096", cfg.LLM.MaxTokens)
+	}
+}
+
+func TestValidate_RejectsNonPositiveMaxTokens(t *testing.T) {
+	cfg := Defaults()
+	cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
+	cfg.Alertmanager.WebhookTokenEnv = "TOK"
+	cfg.LLM.APIKeyEnv = "KEY"
+	cfg.LLM.MaxTokens = 0
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "max_tokens") {
+		t.Fatalf("expected error mentioning max_tokens, got %v", err)
+	}
+}
+
 func TestValidate_RejectsBadCorrelatorBounds(t *testing.T) {
 	cases := []struct {
 		name string

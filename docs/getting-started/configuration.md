@@ -111,6 +111,7 @@ and feed the ones overlapping an incident's labels into triage. Dual-role:
 | `provider` | string | `anthropic` | Only `anthropic` is supported today |
 | `api_key_env` | string | — | **Required.** Env var name holding the Anthropic API key |
 | `model` | string | `claude-sonnet-5` | Anthropic model ID used for incident analysis |
+| `max_tokens` | int | `4096` | Output-token ceiling for the triage reply. Raise it if a very large correlated incident truncates (the finding JSON carries one entry per member alert) |
 
 This is the model that triages your incidents and writes the finding
 summaries, so every dispatched incident consumes Anthropic API tokens.
@@ -119,6 +120,13 @@ The Sonnet default gives the strongest analysis in its price class; set
 more than finding depth. Keep an eye on your spend in the Anthropic
 console — the agent does not yet meter or cap usage (budget tracking is
 planned).
+
+`max_tokens` bounds the finding reply. The finding JSON lists every member
+alert, so a very large correlated incident can exceed the default and truncate
+mid-reply; when that happens the log names it explicitly
+(`response truncated at max_tokens=…; raise llm.max_tokens`) so the fix is a
+one-line bump. It is a ceiling, not a target — small incidents still emit only
+what they need, so raising it costs nothing for normal traffic.
 
 ## `correlator`
 

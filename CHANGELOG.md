@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Large incidents no longer fail triage with a truncated reply.** The triage
+  output ceiling was hardwired to 1024 tokens; a large correlated incident (whose
+  finding JSON carries one entry per member alert) could exhaust it mid-reply,
+  failing the whole analysis with a misleading `not valid JSON` error and leaving
+  the prior finding standing on every re-judgment. The ceiling is now a
+  configurable `llm.max_tokens` (default 4096), and a reply cut off at the ceiling
+  is reported as an actionable `response truncated at max_tokens=…; raise
+  llm.max_tokens` instead of a JSON parse error.
+
 ## [0.7.1] - 2026-07-10
 
 ### Added
