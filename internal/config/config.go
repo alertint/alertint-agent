@@ -69,6 +69,7 @@ type PrometheusConfig struct {
 	BearerTokenEnv      string `yaml:"bearer_token_env,omitempty"`
 	TimeoutSeconds      int    `yaml:"timeout_seconds"`
 	DefaultRangeMinutes int    `yaml:"default_range_minutes"`
+	MaxSeries           int    `yaml:"max_series"` // server-side per-query series cap for metric enrichment
 }
 
 // LogsConfig configures the optional log-enrichment connector. When enabled,
@@ -374,6 +375,7 @@ func Defaults() Config {
 		Prometheus: PrometheusConfig{
 			TimeoutSeconds:      10,
 			DefaultRangeMinutes: 60,
+			MaxSeries:           1000,
 		},
 		Logs: LogsConfig{
 			// Only loki exists in v1, so defaulting the provider lets
@@ -727,6 +729,9 @@ func (c *Config) validatePrometheus() []string {
 	}
 	if c.Prometheus.DefaultRangeMinutes <= 0 {
 		errs = append(errs, "prometheus.default_range_minutes must be > 0")
+	}
+	if c.Prometheus.MaxSeries <= 0 {
+		errs = append(errs, "prometheus.max_series must be > 0")
 	}
 	return errs
 }

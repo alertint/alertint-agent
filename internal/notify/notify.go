@@ -39,12 +39,17 @@ type Finding struct {
 }
 
 // EvidenceState distinguishes a real count (fetched or a genuine zero) from a
-// connector that could not be reached (R8).
+// connector that could not be reached (unreachable) or one that was reachable
+// but too slow to answer within the deadline (degraded) (R8).
 type EvidenceState string
 
 const (
 	EvidenceCounted     EvidenceState = "counted"
 	EvidenceUnreachable EvidenceState = "unreachable"
+	// EvidenceDegraded: the connector was reachable but too slow to answer within
+	// the deadline — a self-inflicted timeout under load, distinct from a genuine
+	// outage (EvidenceUnreachable) and from a real zero (EvidenceCounted).
+	EvidenceDegraded EvidenceState = "degraded"
 )
 
 // SourceEvidence is one enabled enrichment source's contribution to the evidence

@@ -239,8 +239,17 @@ presence-based: setting `base_url` turns the connector on; an explicit
 | `enabled` | bool | auto | Omitted = on when `base_url` is set (presence-based); set `false` to force off |
 | `base_url` | string | — | Prometheus HTTP API base URL, e.g. `http://localhost:9090` |
 | `bearer_token_env` | string | — | Optional env var name holding a bearer token for Prometheus |
-| `timeout_seconds` | int | `10` | Timeout for Prometheus HTTP requests |
+| `timeout_seconds` | int | `10` | Total budget for one incident's metric enrichment fetch. Shared across every scope queried, each of which gets an equal slice so a slow query cannot starve the rest |
 | `default_range_minutes` | int | `60` | Default lookback window for range queries |
+| `max_series` | int | `1000` | Server-side cap on the number of series each enrichment query may return, bounding the payload a broad selector pulls during an alert storm |
+
+`max_series` keeps metric enrichment from self-inflicting timeouts during a
+storm: a bare `{instance="…"}` selector can otherwise pull every series for a
+node. During a large multi-alert incident the enrichment also caps how many
+per-instance queries it fires and splits `timeout_seconds` into a per-query
+budget, so a backend that is merely slow is reported as `degraded` (metrics
+slow) rather than falsely as `unreachable`, and does not lower the finding's
+confidence.
 
 Set `bearer_token_env` only when your Prometheus requires authentication
 — for example, when it sits behind an auth proxy or ingress that expects
@@ -359,6 +368,7 @@ prometheus:
   bearer_token_env: PROMETHEUS_BEARER_TOKEN
   timeout_seconds: 10
   default_range_minutes: 60
+  max_series: 1000
 
 log_level: info
 log_format: auto

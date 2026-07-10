@@ -61,6 +61,28 @@ func TestUserPrompt_WithMetricsNoCalibration(t *testing.T) {
 	}
 }
 
+// TestUserPrompt_DegradedMetricsExemptFromCap: a metric timeout under load
+// (OutcomeDegraded) means the data very likely exists — the fetch was merely
+// slow — so it must NOT drag the finding into the annotations-only cap the way a
+// genuine outage or empty result does.
+func TestUserPrompt_DegradedMetricsExemptFromCap(t *testing.T) {
+	m := &MetricEnrichment{Outcome: OutcomeDegraded, Note: "metric backend too slow to answer within the deadline"}
+	out := UserPrompt(basePack(), "{}", m, nil, nil, nil, nil)
+	if strings.Contains(out, "ANNOTATIONS ONLY") {
+		t.Fatalf("degraded metrics must NOT trigger the annotations-only cap directive: %s", out)
+	}
+}
+
+// A genuine metric failure (OutcomeFailed) is still annotations-only — a down
+// backend gives us no data and no reason to believe data exists.
+func TestUserPrompt_FailedMetricsStillAnnotationsOnly(t *testing.T) {
+	m := &MetricEnrichment{Outcome: OutcomeFailed, Note: "metric backend query failed"}
+	out := UserPrompt(basePack(), "{}", m, nil, nil, nil, nil)
+	if !strings.Contains(out, "ANNOTATIONS ONLY") {
+		t.Fatalf("failed metrics must still carry the annotations-only directive: %s", out)
+	}
+}
+
 func TestRenderMetrics_SeriesAndNote(t *testing.T) {
 	var b strings.Builder
 	renderMetrics(&b, &MetricEnrichment{Outcome: OutcomeFetched, Snapshots: []MetricSnapshot{
@@ -74,6 +96,28 @@ func TestRenderMetrics_SeriesAndNote(t *testing.T) {
 	renderMetrics(&b, &MetricEnrichment{Outcome: OutcomeEmpty, Note: "no metric series matched the incident selector"})
 	if !strings.Contains(b.String(), "no metric series matched") {
 		t.Errorf("empty note missing: %q", b.String())
+	}
+}
+
+// TestAnnotationsOnlyBasis_DegradedExemptOthersNot locks the single predicate
+// both the prompt directive and the deterministic cap backstop rely on: a
+// degraded (slow) metric fetch is exempt from the cap, while genuine failure,
+// empty, and no-evidence-at-all are not.
+func TestAnnotationsOnlyBasis_DegradedExemptOthersNot(t *testing.T) {
+	if annotationsOnlyBasis(&MetricEnrichment{Outcome: OutcomeDegraded}, nil, nil, nil) {
+		t.Error("degraded (slow) metrics must be exempt from the annotations-only cap")
+	}
+	if !annotationsOnlyBasis(&MetricEnrichment{Outcome: OutcomeFailed}, nil, nil, nil) {
+		t.Error("a genuine metric failure is annotations-only")
+	}
+	if !annotationsOnlyBasis(&MetricEnrichment{Outcome: OutcomeEmpty}, nil, nil, nil) {
+		t.Error("a queried-empty metric result is annotations-only")
+	}
+	if !annotationsOnlyBasis(nil, nil, nil, nil) {
+		t.Error("no evidence at all is annotations-only")
+	}
+	if annotationsOnlyBasis(&MetricEnrichment{Snapshots: make([]MetricSnapshot, 1)}, nil, nil, nil) {
+		t.Error("live snapshots lift the cap")
 	}
 }
 

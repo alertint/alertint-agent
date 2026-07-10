@@ -31,6 +31,15 @@ func TestBuildEvidenceSummary_UniformMapping(t *testing.T) {
 	}
 }
 
+func TestBuildEvidenceSummary_MetricDegradedIsNeitherZeroNorUnreachable(t *testing.T) {
+	// A metric timeout under load is degraded: the card must not read it as a
+	// genuine zero (EvidenceCounted) nor as an outage (EvidenceUnreachable).
+	sum := buildEvidenceSummary(false, &MetricEnrichment{Outcome: OutcomeDegraded}, nil, nil, nil)
+	if len(sum.Sources) != 1 || sum.Sources[0].State != notify.EvidenceDegraded {
+		t.Fatalf("degraded metric must map to EvidenceDegraded, got %+v", sum.Sources)
+	}
+}
+
 func TestBuildEvidenceSummary_ShortCircuitAndNoSources(t *testing.T) {
 	// R12: short-circuit → one skipped state, never per-source zeros.
 	if sum := buildEvidenceSummary(true, nil, nil, nil, nil); !sum.Skipped || len(sum.Sources) != 0 {

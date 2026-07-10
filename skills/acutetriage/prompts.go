@@ -168,7 +168,7 @@ const MaxMetadataOnlyConfidence = 0.6
 // memoryPresent is true the directive says so explicitly — a recalled prior's
 // confidence must not be smuggled into today's evidence-free re-fire (R18/R20).
 func renderEvidenceBasis(b *strings.Builder, metrics *MetricEnrichment, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, memoryPresent bool) {
-	if hasLiveEvidence(metrics, logs, changes, sentry) {
+	if !annotationsOnlyBasis(metrics, logs, changes, sentry) {
 		return
 	}
 	b.WriteString("\n\nEvidence basis: ANNOTATIONS ONLY — no live logs, metrics, " +
@@ -183,6 +183,24 @@ func renderEvidenceBasis(b *strings.Builder, metrics *MetricEnrichment, logs *Lo
 			"hypotheses, NOT live evidence — they do not lift this annotations-only basis " +
 			"or raise the confidence ceiling.")
 	}
+}
+
+// metricsDegraded reports whether metric enrichment was attempted but the
+// backend was merely too slow to answer within the deadline (OutcomeDegraded) —
+// a self-inflicted timeout under load, not an outage. The metric data very
+// likely exists, so unlike a genuine failure or empty result it must NOT force
+// the annotations-only confidence cap.
+func metricsDegraded(metrics *MetricEnrichment) bool {
+	return metrics != nil && metrics.Outcome == OutcomeDegraded
+}
+
+// annotationsOnlyBasis reports whether the finding rests on alert annotations
+// alone — no live evidence AND no self-inflicted metric timeout to excuse the
+// absence. This is the single condition that triggers the metadata-only
+// confidence cap; both the prompt directive (renderEvidenceBasis) and the
+// deterministic backstop (applyEvidenceCap) route through it so they never drift.
+func annotationsOnlyBasis(metrics *MetricEnrichment, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment) bool {
+	return !hasLiveEvidence(metrics, logs, changes, sentry) && !metricsDegraded(metrics)
 }
 
 // hasLiveEvidence reports whether any enrichment source returned actual data

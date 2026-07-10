@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Metric enrichment no longer self-inflicts "Prometheus unreachable" during
+  alert storms.** A broad `{instance="…"}` selector pulled every series for a
+  node, and all of an incident's scopes shared one query deadline, so under storm
+  load the later queries timed out — falsely reporting a healthy backend as
+  unreachable and capping the finding's confidence. Each enrichment query is now
+  bounded server-side (`prometheus.max_series`, default 1000), the per-instance
+  queries are capped, and the fetch deadline is split per query so one slow query
+  can no longer starve the rest. A backend that is merely slow is reported as
+  `degraded` (metrics slow) rather than `unreachable`, and no longer lowers the
+  finding's confidence.
+
 ## [0.7.2] - 2026-07-10
 
 ### Fixed

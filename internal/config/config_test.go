@@ -232,6 +232,25 @@ func TestValidate_RejectsNonPositiveMaxTokens(t *testing.T) {
 	}
 }
 
+func TestDefaults_PrometheusMaxSeries(t *testing.T) {
+	cfg := Defaults()
+	if cfg.Prometheus.MaxSeries != 1000 {
+		t.Errorf("default prometheus.max_series = %d, want 1000", cfg.Prometheus.MaxSeries)
+	}
+}
+
+func TestValidate_RejectsNonPositiveMaxSeries(t *testing.T) {
+	cfg := Defaults()
+	cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
+	cfg.Alertmanager.WebhookTokenEnv = "TOK"
+	cfg.LLM.APIKeyEnv = "KEY"
+	cfg.Prometheus.BaseURL = "http://prometheus:9090" // enable the connector
+	cfg.Prometheus.MaxSeries = 0
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "max_series") {
+		t.Fatalf("expected error mentioning max_series, got %v", err)
+	}
+}
+
 func TestValidate_RejectsBadCorrelatorBounds(t *testing.T) {
 	cases := []struct {
 		name string

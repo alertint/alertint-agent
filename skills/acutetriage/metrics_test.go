@@ -125,13 +125,28 @@ func TestRankSeries_CapKeepsTopN(t *testing.T) {
 type fakeProm struct {
 	// responses maps a matcher string → the instant-vector data blob to return.
 	responses map[string]json.RawMessage
-	// fail matchers error out.
-	fail  map[string]bool
+	// fail matchers error out with a non-timeout (hard) error.
+	fail map[string]bool
+	// slow matchers block until their query context is cancelled, then return
+	// ctx.Err() — modeling a backend too slow to answer within the deadline.
+	slow  map[string]bool
 	calls []string
+	// limits records the limit argument of each QueryInstant call, in order.
+	limits []int
 }
 
-func (f *fakeProm) QueryInstant(_ context.Context, expr string, _ time.Time) (json.RawMessage, error) {
+func (f *fakeProm) QueryInstant(ctx context.Context, expr string, _ time.Time, limit int) (json.RawMessage, error) {
 	f.calls = append(f.calls, expr)
+	f.limits = append(f.limits, limit)
+	if f.slow[expr] {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	// A real client issues the request under ctx; an already-cancelled ctx fails
+	// immediately rather than returning data.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if f.fail[expr] {
 		return nil, errors.New("boom")
 	}
@@ -185,6 +200,97 @@ func TestFetchMetrics_MixedMembersKeepInstanceSupplement(t *testing.T) {
 	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, alerts, time.Now(), "inc1", nil)
 	if enr.Outcome != OutcomeFetched || len(enr.Snapshots) != 1 {
 		t.Fatalf("instance supplement should be queried, got %+v; calls=%v", enr, f.calls)
+	}
+}
+
+func TestFetchMetrics_CapsInstanceSupplements(t *testing.T) {
+	// A mega-incident spanning many nodes must not fan out one bare per-node
+	// query each — the instance supplements are capped so alertint never becomes
+	// a thundering herd against the metric backend during a storm.
+	alerts := make([]store.Alert, 0, 8)
+	for i := 0; i < 8; i++ {
+		alerts = append(alerts, alert(map[string]string{"namespace": "n", "instance": string(rune('a' + i))}))
+	}
+	f := &fakeProm{}
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, alerts, time.Now(), "inc1", nil)
+	if enr == nil {
+		t.Fatal("nil enrichment")
+	}
+	// One primary (namespace+instance regex) + at most maxInstanceSupplements
+	// bare per-instance scopes — never one per node.
+	if want := 1 + maxInstanceSupplements; len(f.calls) != want {
+		t.Fatalf("queried %d scopes, want %d (1 primary + %d capped supplements); calls=%v",
+			len(f.calls), want, maxInstanceSupplements, f.calls)
+	}
+}
+
+func TestFetchMetrics_PerScopeDeadlinePreventsStarvation(t *testing.T) {
+	// Storm reproduction: the first (primary) scope is slow under load. With one
+	// shared deadline it would consume the whole budget and starve the remaining
+	// scopes — the real per-instance data — into "context deadline exceeded",
+	// yielding a false backend failure. A per-scope deadline isolates the slow
+	// query so the later scopes still run and return their metrics.
+	alerts := []store.Alert{
+		alert(map[string]string{"namespace": "n", "instance": "n1"}),
+		alert(map[string]string{"namespace": "n", "instance": "n2"}),
+	}
+	f := &fakeProm{
+		slow: map[string]bool{`{instance=~"n1|n2",namespace="n"}`: true}, // primary is slow
+		responses: map[string]json.RawMessage{
+			`{instance="n1"}`: vector(s(map[string]string{"__name__": "node_load1", "instance": "n1"}, "1")),
+			`{instance="n2"}`: vector(s(map[string]string{"__name__": "node_load1", "instance": "n2"}, "2")),
+		},
+	}
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 1}, alerts, time.Now(), "inc1", nil)
+	if len(f.calls) != 3 {
+		t.Fatalf("all three scopes must be attempted, got calls=%v", f.calls)
+	}
+	if enr.Outcome != OutcomeFetched || len(enr.Snapshots) != 2 {
+		t.Fatalf("slow primary must not starve the supplements: got outcome=%q snapshots=%d (%+v)",
+			enr.Outcome, len(enr.Snapshots), enr.Snapshots)
+	}
+}
+
+func TestFetchMetrics_PassesMaxSeriesToQuerier(t *testing.T) {
+	// The server-side series bound must reach every enrichment query so a broad
+	// selector can never dump an unbounded node-series payload.
+	alerts := []store.Alert{alert(map[string]string{"namespace": "n", "instance": "db-01:9100"})}
+	f := &fakeProm{}
+	FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5, MaxSeries: 200}, alerts, time.Now(), "i", nil)
+	if len(f.limits) == 0 {
+		t.Fatal("no queries ran")
+	}
+	for i, l := range f.limits {
+		if l != 200 {
+			t.Fatalf("MaxSeries must reach every query; call %d used limit %d (all=%v)", i, l, f.limits)
+		}
+	}
+}
+
+func TestFetchMetrics_TimeoutIsDegraded(t *testing.T) {
+	// A scope that times out under load (backend reachable but slow) yields
+	// OutcomeDegraded, not OutcomeFailed — the metric backend is not down, so the
+	// finding must not be treated as "Prometheus unreachable".
+	alerts := []store.Alert{alert(map[string]string{"namespace": "n"})}
+	f := &fakeProm{slow: map[string]bool{`{namespace="n"}`: true}}
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 1}, alerts, time.Now(), "i", nil)
+	if enr.Outcome != OutcomeDegraded {
+		t.Fatalf("timeout under load must be degraded, got %q", enr.Outcome)
+	}
+}
+
+func TestFetchMetrics_HardErrorBeatsTimeout(t *testing.T) {
+	// When one scope is genuinely unreachable (hard error) and another merely
+	// times out, with no series recovered, report the more actionable outage:
+	// OutcomeFailed wins over OutcomeDegraded.
+	alerts := []store.Alert{alert(map[string]string{"namespace": "n", "instance": "db-01:9100"})}
+	f := &fakeProm{
+		fail: map[string]bool{`{instance="db-01:9100",namespace="n"}`: true}, // primary: hard down
+		slow: map[string]bool{`{instance="db-01:9100"}`: true},               // supplement: slow
+	}
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 1}, alerts, time.Now(), "i", nil)
+	if enr.Outcome != OutcomeFailed {
+		t.Fatalf("hard error must win over timeout, got %q", enr.Outcome)
 	}
 }
 

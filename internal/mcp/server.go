@@ -720,7 +720,9 @@ func (s *Server) handlePrometheusQuery(ctx context.Context, req mcplib.CallToolR
 		t = parsed
 	}
 
-	data, err := s.cfg.Prometheus.QueryInstant(ctx, expr, t)
+	// limit 0: an agent's on-demand query is not storm-driven, so it gets the
+	// full result set (the enrichment path bounds series via MetricParams).
+	data, err := s.cfg.Prometheus.QueryInstant(ctx, expr, t, 0)
 	if err != nil {
 		return errResult("prometheus query failed: " + err.Error()), nil
 	}

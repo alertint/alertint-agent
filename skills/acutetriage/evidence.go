@@ -25,6 +25,11 @@ const (
 	OutcomeNoSelector Outcome = "no_selector"
 	// OutcomeFailed: the backend was unreachable / errored → card renders "unreachable".
 	OutcomeFailed Outcome = "failed"
+	// OutcomeDegraded: the backend was reachable but too slow to answer within the
+	// deadline (a self-inflicted timeout under load, not an outage) → card renders
+	// "slow" and the finding is NOT dragged into the annotations-only confidence
+	// cap, since the metric data very likely exists.
+	OutcomeDegraded Outcome = "degraded"
 )
 
 // buildEvidenceSummary maps the incident's enrichment outcomes into the always-on
@@ -68,12 +73,16 @@ func buildEvidenceSummary(shortCircuit bool, m *MetricEnrichment, l *LogEnrichme
 	return notify.EvidenceSummary{Sources: sources}
 }
 
-// cardState maps a shared enrichment Outcome to a card state: only a backend
-// failure renders as unreachable; queried-empty and no-selector both render as a
-// real 0 (R8).
+// cardState maps a shared enrichment Outcome to a card state: a backend failure
+// renders as unreachable; a load timeout renders as degraded (reachable but
+// slow, not an outage); queried-empty and no-selector both render as a real 0
+// (R8).
 func cardState(o Outcome) notify.EvidenceState {
 	if o == OutcomeFailed {
 		return notify.EvidenceUnreachable
+	}
+	if o == OutcomeDegraded {
+		return notify.EvidenceDegraded
 	}
 	return notify.EvidenceCounted
 }

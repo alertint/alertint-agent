@@ -304,8 +304,9 @@ func agentHandoffBlock(incidentID string) slacklib.Block {
 
 // evidenceLine renders the always-on evidence summary text (R6/R7/R8/R12). A
 // short-circuit or zero-connector finding renders one card-level state; otherwise
-// each source renders "<Source> <count> <unit>" (unit omitted for changes), or
-// "<Source> unreachable" when the connector could not be reached.
+// each source renders "<Source> <count> <unit>" (unit omitted for changes),
+// "<Source> unreachable" when the connector could not be reached, or "<Source>
+// slow" when it was reachable but too slow to answer within the deadline.
 func evidenceLine(s notify.EvidenceSummary) string {
 	switch {
 	case s.Skipped:
@@ -317,6 +318,10 @@ func evidenceLine(s notify.EvidenceSummary) string {
 	for _, src := range s.Sources {
 		if src.State == notify.EvidenceUnreachable {
 			parts = append(parts, src.Source+" unreachable")
+			continue
+		}
+		if src.State == notify.EvidenceDegraded {
+			parts = append(parts, src.Source+" slow")
 			continue
 		}
 		if src.Unit == "" {
