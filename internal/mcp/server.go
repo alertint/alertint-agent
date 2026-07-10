@@ -568,12 +568,14 @@ func (s *Server) handleGetEvidencePack(ctx context.Context, req mcplib.CallToolR
 	}
 
 	pack := acutetriage.BuildEvidencePack(*inc, alerts, s.cfg.WindowSeconds)
-	metrics := acutetriage.FetchMetrics(ctx, s.cfg.Prometheus, alerts, inc.FirstAlertAt)
 
 	// Enrichment is REPLAYED from the persisted envelope, never re-queried — the
 	// pack reflects exactly what the LLM saw (ADR-0001). Absent (short-circuited
 	// / disabled) → omitted. After migration 0006 every non-null value is the
-	// uniform {"logs":…,"changes":…} envelope, so this stays an opaque passthrough.
+	// uniform {"logs":…,"changes":…,"metrics":…} envelope, so this stays an
+	// opaque passthrough. Metrics used to be the one source re-queried live here;
+	// that exception is closed (R5) — a metrics section now appears only when one
+	// was persisted at triage time, exactly like every other source.
 	var enrichmentSnapshot json.RawMessage
 	if inc.EnrichmentJSON != "" {
 		enrichmentSnapshot = json.RawMessage(inc.EnrichmentJSON)
@@ -582,12 +584,10 @@ func (s *Server) handleGetEvidencePack(ctx context.Context, req mcplib.CallToolR
 	type packWithEnrichment struct {
 		acutetriage.EvidencePack
 
-		Metrics    []acutetriage.MetricSnapshot `json:"metrics,omitempty"`
-		Enrichment json.RawMessage              `json:"enrichment,omitempty"`
+		Enrichment json.RawMessage `json:"enrichment,omitempty"`
 	}
 	result, err := mcplib.NewToolResultJSON(packWithEnrichment{
 		EvidencePack: pack,
-		Metrics:      metrics,
 		Enrichment:   enrichmentSnapshot,
 	})
 	if err != nil {
