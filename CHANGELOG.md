@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-07-10
+
 ### Fixed
 
 - **Metric enrichment no longer self-inflicts "Prometheus unreachable" during
@@ -388,7 +390,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single static binary** — pure-Go SQLite (no CGO), no external runtime dependencies.
   Multi-platform builds: `linux/amd64`, `linux/arm64`, `darwin/arm64`.
 
-[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.7.3...HEAD
+[0.7.3]: https://github.com/alertint/alertint-agent/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/alertint/alertint-agent/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/alertint/alertint-agent/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/alertint/alertint-agent/compare/v0.6.2...v0.7.0
