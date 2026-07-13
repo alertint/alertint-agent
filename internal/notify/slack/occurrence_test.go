@@ -59,7 +59,7 @@ func (f *fakeSlack) handle(w http.ResponseWriter, r *http.Request) {
 		if f.updateErr != nil {
 			f.mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, `{"ok":false,"error":"update_failed"}`)
+			_, _ = fmt.Fprint(w, `{"ok":false,"error":"update_failed"}`)
 			return
 		}
 		f.updates = append(f.updates, r.FormValue("text"))
@@ -74,14 +74,14 @@ func (f *fakeSlack) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	f.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprint(w, `{"ok":true,"channel":"chan","ts":"ts-1"}`)
+	_, _ = fmt.Fprint(w, `{"ok":true,"channel":"chan","ts":"ts-1"}`)
 }
 
 func (f *fakeSlack) PostMessageContext(ctx context.Context, channelID string, options ...slacklib.MsgOption) (string, string, error) {
 	return f.client.PostMessageContext(ctx, channelID, options...)
 }
 
-func (f *fakeSlack) postCount() int  { f.mu.Lock(); defer f.mu.Unlock(); return len(f.posts) }
+func (f *fakeSlack) postCount() int { f.mu.Lock(); defer f.mu.Unlock(); return len(f.posts) }
 func (f *fakeSlack) lastPost() postCapture {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -92,11 +92,11 @@ func (f *fakeSlack) lastPost() postCapture {
 }
 
 func (f *fakeSlack) UpdateMessageContext(ctx context.Context, channelID, timestamp string, options ...slacklib.MsgOption) (string, string, string, error) {
-	_, _, _, err := f.client.UpdateMessageContext(ctx, channelID, timestamp, options...)
+	ch, ts, txt, err := f.client.UpdateMessageContext(ctx, channelID, timestamp, options...)
 	if err != nil {
 		return "", "", "", err
 	}
-	return channelID, timestamp, "", nil
+	return ch, ts, txt, nil
 }
 
 func (f *fakeSlack) updateCount() int { f.mu.Lock(); defer f.mu.Unlock(); return len(f.updates) }
