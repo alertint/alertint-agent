@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Slack recurrence updates no longer post to the channel.** The recurrence
+  resurfacing messages introduced in 0.7.4 (real-world-change "why" and
+  milestone nudges) used Slack's "also send to channel" on their thread
+  replies, so every resurface also landed as a new channel message — too
+  noisy in practice. These messages now post as plain thread replies only;
+  the in-place card count edit is unchanged. `notify.slack.recurrence_mode`
+  keeps its meaning (`change-gated` gates the thread replies, `off` silences
+  them).
+
 ## [0.7.4] - 2026-07-13
 
 ### Added

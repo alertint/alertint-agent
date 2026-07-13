@@ -258,7 +258,7 @@ func TestMilestoneHit_Schedule(t *testing.T) {
 	}
 }
 
-// recurEvent builds a RecurrenceEvent for the slack broadcast tests.
+// recurEvent builds a RecurrenceEvent for the slack recurrence-reply tests.
 // recurEvent's Incident.FirstAlertAt (5h before at) predates Stats.FirstOccurredAt
 // (3h before at) — the incident fired once, then went quiet before recurring —
 // so any span computed off the wrong anchor is caught by an exact assertion.
@@ -270,7 +270,7 @@ func recurEvent(trigger string, count int, at time.Time) notify.RecurrenceEvent 
 	}
 }
 
-func TestRecurrence_SeverityBroadcasts(t *testing.T) {
+func TestRecurrence_SeverityPostsThreadReply(t *testing.T) {
 	client := newFakeSlack(t)
 	n, _, _ := occNotifier(t, client, &fakeThreadStore{})
 	ev := recurEvent("severity", 4, time.Unix(1_000_000, 0).UTC())
@@ -282,22 +282,22 @@ func TestRecurrence_SeverityBroadcasts(t *testing.T) {
 		t.Errorf("card updates = %d, want 0 (re-judgment Notify writes the card)", client.updateCount())
 	}
 	if client.postCount() != 1 {
-		t.Fatalf("posts = %d, want 1 (one broadcast)", client.postCount())
+		t.Fatalf("posts = %d, want 1 (one thread reply)", client.postCount())
 	}
 	p := client.lastPost()
-	if !p.broadcast || p.threadTS != "ts-1" {
-		t.Errorf("post = {broadcast:%v thread_ts:%q}, want {true ts-1}", p.broadcast, p.threadTS)
+	if p.broadcast || p.threadTS != "ts-1" {
+		t.Errorf("post = {broadcast:%v thread_ts:%q}, want {false ts-1} (thread-only, never sent to channel)", p.broadcast, p.threadTS)
 	}
 	if !strings.Contains(p.blocks, "Escalated") || !strings.Contains(p.blocks, "CRITICAL") || !strings.Contains(p.blocks, "why: severity") {
-		t.Errorf("severity broadcast blocks missing rung text:\n%s", p.blocks)
+		t.Errorf("severity reply blocks missing rung text:\n%s", p.blocks)
 	}
 }
 
-// TestRecurrence_SeverityBroadcastNoPriorLabel covers a baseline where every
+// TestRecurrence_SeverityReplyNoPriorLabel covers a baseline where every
 // current member's severity is off the ladder (empty/unrecognized), so
-// memberBaselines never records a prior label: the broadcast must drop the
+// memberBaselines never records a prior label: the reply must drop the
 // "(was ...)" clause instead of rendering a blank prior severity.
-func TestRecurrence_SeverityBroadcastNoPriorLabel(t *testing.T) {
+func TestRecurrence_SeverityReplyNoPriorLabel(t *testing.T) {
 	client := newFakeSlack(t)
 	n, _, _ := occNotifier(t, client, &fakeThreadStore{})
 	ev := recurEvent("severity", 1, time.Unix(1_000_000, 0).UTC())
@@ -307,14 +307,14 @@ func TestRecurrence_SeverityBroadcastNoPriorLabel(t *testing.T) {
 	}
 	p := client.lastPost()
 	if strings.Contains(p.blocks, "(was )") {
-		t.Errorf("severity broadcast rendered a blank prior severity:\n%s", p.blocks)
+		t.Errorf("severity reply rendered a blank prior severity:\n%s", p.blocks)
 	}
 	if !strings.Contains(p.blocks, "Escalated") || !strings.Contains(p.blocks, "CRITICAL") {
-		t.Errorf("severity broadcast missing escalation text:\n%s", p.blocks)
+		t.Errorf("severity reply missing escalation text:\n%s", p.blocks)
 	}
 }
 
-func TestRecurrence_NewAlertnameBroadcasts(t *testing.T) {
+func TestRecurrence_NewAlertnamePostsThreadReply(t *testing.T) {
 	client := newFakeSlack(t)
 	n, _, _ := occNotifier(t, client, &fakeThreadStore{})
 	ev := recurEvent("new_alertname", 6, time.Unix(1_000_000, 0).UTC())
@@ -323,15 +323,15 @@ func TestRecurrence_NewAlertnameBroadcasts(t *testing.T) {
 		t.Fatalf("attach: %v", err)
 	}
 	p := client.lastPost()
-	if client.postCount() != 1 || !p.broadcast {
-		t.Fatalf("want one broadcast, got posts=%d broadcast=%v", client.postCount(), p.broadcast)
+	if client.postCount() != 1 || p.broadcast {
+		t.Fatalf("want one thread-only reply, got posts=%d broadcast=%v", client.postCount(), p.broadcast)
 	}
 	if !strings.Contains(p.blocks, "New symptom") || !strings.Contains(p.blocks, "HighErrorRate") || !strings.Contains(p.blocks, "why: new_alertname") {
-		t.Errorf("new_alertname broadcast missing text:\n%s", p.blocks)
+		t.Errorf("new_alertname reply missing text:\n%s", p.blocks)
 	}
 }
 
-func TestRecurrence_CadenceBroadcasts(t *testing.T) {
+func TestRecurrence_CadencePostsThreadReply(t *testing.T) {
 	client := newFakeSlack(t)
 	n, _, _ := occNotifier(t, client, &fakeThreadStore{})
 	ev := recurEvent("cadence", 9, time.Unix(1_000_000, 0).UTC())
@@ -340,8 +340,11 @@ func TestRecurrence_CadenceBroadcasts(t *testing.T) {
 		t.Fatalf("attach: %v", err)
 	}
 	p := client.lastPost()
+	if p.broadcast {
+		t.Error("cadence reply was sent to the channel (reply_broadcast set), want thread-only")
+	}
 	if !strings.Contains(p.blocks, "Firing faster") || !strings.Contains(p.blocks, "why: cadence") {
-		t.Errorf("cadence broadcast missing text:\n%s", p.blocks)
+		t.Errorf("cadence reply missing text:\n%s", p.blocks)
 	}
 }
 
@@ -358,7 +361,7 @@ func TestRecurrence_BackstopsSilent(t *testing.T) {
 	}
 }
 
-func TestRecurrence_MilestoneBroadcasts(t *testing.T) {
+func TestRecurrence_MilestonePostsThreadReply(t *testing.T) {
 	client := newFakeSlack(t)
 	n, now, _ := occNotifier(t, client, &fakeThreadStore{})
 	// Count 4 -> Episodes 5 -> milestone. First attach edits card immediately.
@@ -369,17 +372,17 @@ func TestRecurrence_MilestoneBroadcasts(t *testing.T) {
 		t.Errorf("card updates = %d, want 1 (plain attach edits card)", client.updateCount())
 	}
 	if client.postCount() != 1 {
-		t.Fatalf("posts = %d, want 1 (milestone broadcast)", client.postCount())
+		t.Fatalf("posts = %d, want 1 (milestone thread reply)", client.postCount())
 	}
 	p := client.lastPost()
-	if !p.broadcast || !strings.Contains(p.blocks, "Still recurring") || !strings.Contains(p.blocks, "why: milestone") {
-		t.Errorf("milestone broadcast wrong: broadcast=%v\n%s", p.broadcast, p.blocks)
+	if p.broadcast || !strings.Contains(p.blocks, "Still recurring") || !strings.Contains(p.blocks, "why: milestone") {
+		t.Errorf("milestone reply wrong (want thread-only): broadcast=%v\n%s", p.broadcast, p.blocks)
 	}
 	// Span must anchor on the incident's true start (FirstAlertAt, 5h before
 	// now per recurEvent), not the first occurrence row (FirstOccurredAt, only
 	// 3h before now) — the latter would understate the incident's real age.
 	if !strings.Contains(p.blocks, "over 5h") {
-		t.Errorf("milestone broadcast span anchored on the wrong start time, want \"over 5h\":\n%s", p.blocks)
+		t.Errorf("milestone reply span anchored on the wrong start time, want \"over 5h\":\n%s", p.blocks)
 	}
 }
 
@@ -391,22 +394,22 @@ func TestRecurrence_NonMilestonePlainAttachSilent(t *testing.T) {
 		t.Fatalf("attach: %v", err)
 	}
 	if client.updateCount() != 1 || client.postCount() != 0 {
-		t.Errorf("updates/posts = %d/%d, want 1/0 (card edit only, no broadcast)", client.updateCount(), client.postCount())
+		t.Errorf("updates/posts = %d/%d, want 1/0 (card edit only, no reply)", client.updateCount(), client.postCount())
 	}
 }
 
-func TestRecurrence_ModeOffSilencesBroadcastsButKeepsCardEdit(t *testing.T) {
+func TestRecurrence_ModeOffSilencesRepliesButKeepsCardEdit(t *testing.T) {
 	client := newFakeSlack(t)
 	n, now, _ := occNotifier(t, client, &fakeThreadStore{})
 	n.recurrenceMode = recurrenceOff
-	// A milestone plain attach: card still edits, no broadcast.
+	// A milestone plain attach: card still edits, no reply.
 	if err := n.OnOccurrenceAttached(context.Background(), recurEvent("none", 4, *now)); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
 	if client.updateCount() != 1 || client.postCount() != 0 {
 		t.Errorf("off milestone: updates/posts = %d/%d, want 1/0", client.updateCount(), client.postCount())
 	}
-	// A severity escalation: no broadcast, no card edit (Notify writes card).
+	// A severity escalation: no reply, no card edit (Notify writes card).
 	sev := recurEvent("severity", 5, now.Add(occEditThrottle+time.Second))
 	sev.PriorSeverity, sev.NewSeverity = "warning", "critical"
 	if err := n.OnOccurrenceAttached(context.Background(), sev); err != nil {
@@ -417,7 +420,7 @@ func TestRecurrence_ModeOffSilencesBroadcastsButKeepsCardEdit(t *testing.T) {
 	}
 }
 
-func TestRecurrence_NoThreadSkipsBroadcast(t *testing.T) {
+func TestRecurrence_NoThreadSkipsReply(t *testing.T) {
 	client := newFakeSlack(t)
 	n, _, _ := occNotifier(t, client, &fakeThreadStore{missing: true})
 	ev := recurEvent("severity", 4, time.Unix(1_000_000, 0).UTC())
@@ -430,7 +433,7 @@ func TestRecurrence_NoThreadSkipsBroadcast(t *testing.T) {
 	}
 }
 
-func TestRecurrence_DrillBannerOnBroadcast(t *testing.T) {
+func TestRecurrence_DrillBannerOnReply(t *testing.T) {
 	client := newFakeSlack(t)
 	n, _, _ := occNotifier(t, client, &fakeThreadStore{})
 	ev := recurEvent("severity", 4, time.Unix(1_000_000, 0).UTC())
@@ -440,7 +443,7 @@ func TestRecurrence_DrillBannerOnBroadcast(t *testing.T) {
 	}
 	p := client.lastPost()
 	if !strings.Contains(p.blocks, "DRILL") || !strings.Contains(p.text, "DRILL") {
-		t.Errorf("drill broadcast missing DRILL banner: text=%q\n%s", p.text, p.blocks)
+		t.Errorf("drill reply missing DRILL banner: text=%q\n%s", p.text, p.blocks)
 	}
 }
 

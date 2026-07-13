@@ -158,7 +158,7 @@ func (n *Notifier) notifyFiring(ctx context.Context, f notify.Finding) error {
 
 // updateFiringInPlace edits the incident's existing card with the re-judgment's
 // fresh finding + recurrence line and threads the new analysis as a plain reply
-// (the "why" broadcast, if any, already fired from OnOccurrenceAttached). It
+// (the "why" thread reply, if any, already fired from OnOccurrenceAttached). It
 // preserves slack_ts — the card is the incident's durable anchor.
 func (n *Notifier) updateFiringInPlace(ctx context.Context, f notify.Finding, originalTS, ch string) error {
 	channel := ch
@@ -289,8 +289,8 @@ func (n *Notifier) audit(ctx context.Context, incidentID, event string) {
 
 // drillMarker / drillPlainMarker return the DRILL banner fragment prepended to
 // every rendered surface of a Drill finding or recurrence event (main card,
-// thread detail, fallback, broadcast): a synthetic card must be unmistakably
-// synthetic in a shared channel (ADR-0013). Empty when not a drill.
+// thread detail, fallback, recurrence reply): a synthetic card must be
+// unmistakably synthetic in a shared channel (ADR-0013). Empty when not a drill.
 func drillMarker(drill bool) string {
 	if drill {
 		return ":test_tube: *DRILL* — "

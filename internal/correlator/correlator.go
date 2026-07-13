@@ -57,8 +57,8 @@ func (NopIncidentSink) OnIncidentReady(_ context.Context, _ store.Incident) erro
 
 // OccurrenceNotifier receives a deterministic, zero-LLM notification each time a
 // re-fire attaches as an occurrence (recurrence collapse). The stdout notifier
-// emits one line; the Slack notifier edits the card and/or broadcasts the "why".
-// nil means no occurrence notifications.
+// emits one line; the Slack notifier edits the card and/or posts the "why" as a
+// thread reply. nil means no occurrence notifications.
 type OccurrenceNotifier interface {
 	OnOccurrenceAttached(ctx context.Context, ev notify.RecurrenceEvent) error
 }
