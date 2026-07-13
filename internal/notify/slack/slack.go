@@ -244,23 +244,26 @@ func (n *Notifier) audit(ctx context.Context, incidentID, event string) {
 // Block Kit payload builders
 // ----------------------------------------------------------------------
 
-// drillMd / drillPlain return the DRILL banner fragment prepended to every
-// rendered surface of a Drill finding (main card, thread detail, fallback):
-// a synthetic card must be unmistakably synthetic in a shared channel
-// (ADR-0013). Empty for real incidents.
-func drillMd(f notify.Finding) string {
-	if f.Drill {
+// drillMarker / drillPlainMarker return the DRILL banner fragment prepended to
+// every rendered surface of a Drill finding or recurrence event (main card,
+// thread detail, fallback, broadcast): a synthetic card must be unmistakably
+// synthetic in a shared channel (ADR-0013). Empty when not a drill.
+func drillMarker(drill bool) string {
+	if drill {
 		return ":test_tube: *DRILL* — "
 	}
 	return ""
 }
 
-func drillPlain(f notify.Finding) string {
-	if f.Drill {
+func drillPlainMarker(drill bool) string {
+	if drill {
 		return "🧪 DRILL — "
 	}
 	return ""
 }
+
+func drillMd(f notify.Finding) string    { return drillMarker(f.Drill) }
+func drillPlain(f notify.Finding) string { return drillPlainMarker(f.Drill) }
 
 // firingMainBlocks builds the brief main-channel message posted when an incident
 // fires: headline + root cause only. Keeps the channel timeline scannable.
@@ -296,6 +299,29 @@ func firingMainBlocks(f notify.Finding) []slacklib.Block {
 		blocks = append(blocks, agentHandoffBlock(f.IncidentID))
 	}
 	return blocks
+}
+
+// firingCardBlocks is the single source of truth for the incident's main card
+// body across first firing, occurrence count-edit, and re-judgment edit: the
+// finding (firingMainBlocks) plus a recurrence context line when the finding
+// carries live occurrence stats. Unifying the three renders keeps them from
+// drifting.
+func firingCardBlocks(f notify.Finding) []slacklib.Block {
+	blocks := firingMainBlocks(f)
+	if f.Recurrence != nil {
+		blocks = append(blocks, recurrenceContextBlock(f.Recurrence.Episodes, f.Recurrence.LastSeen))
+	}
+	return blocks
+}
+
+// recurrenceContextBlock is the "recurred ×N · last HH:MM" line appended to a
+// recurring incident's card.
+func recurrenceContextBlock(occurrences int, lastSeen time.Time) slacklib.Block {
+	return slacklib.NewContextBlock("",
+		slacklib.NewTextBlockObject(slacklib.MarkdownType,
+			fmt.Sprintf(":repeat: *recurred ×%d* · last %s UTC", occurrences, lastSeen.UTC().Format("15:04")),
+			false, false),
+	)
 }
 
 // agentHandoffBlock is the MCP call to action, rendered the same wherever it
