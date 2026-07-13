@@ -20,6 +20,17 @@ import (
 // a single trailing flush carrying the final count.
 const occEditThrottle = 60 * time.Second
 
+// recurrenceMode selects how recurrence re-fires resurface (ADR-0020).
+// change-gated broadcasts real-world-change rungs + milestones; off is the
+// count-bump-only escape (no broadcasts). Enum so a future digest/every mode is
+// a non-breaking addition.
+type recurrenceMode string
+
+const (
+	recurrenceChangeGated recurrenceMode = "change-gated"
+	recurrenceOff         recurrenceMode = "off"
+)
+
 // stopper is the minimal timer seam (satisfied by *time.Timer) so the trailing
 // flush is testable without real waits.
 type stopper interface{ Stop() bool }
@@ -43,36 +54,42 @@ type pendingEdit struct {
 // "recurred ×N · last HH:MM" — deterministic, zero LLM tokens. It is a no-op
 // when no thread was recorded (the firing card was gate-suppressed or never
 // posted), so belowMinSeverity is never re-consulted here and R9 stays
-// self-enforcing. Edits are throttled to one per incident per occEditThrottle,
-// coalesced, with a trailing flush that lands the final count.
-func (n *Notifier) OnOccurrenceAttached(ctx context.Context, inc store.Incident, stats store.OccurrenceStats, drill bool) error {
+// self-enforcing.
+func (n *Notifier) OnOccurrenceAttached(ctx context.Context, ev notify.RecurrenceEvent) error {
 	if n.store == nil {
 		return nil
 	}
-	ts, ch, err := n.store.GetIncidentSlackThread(ctx, inc.ID)
+	ts, ch, err := n.store.GetIncidentSlackThread(ctx, ev.Incident.ID)
 	if err != nil {
 		// ErrNotFound is the normal "no card" case (gate-suppressed or never
 		// posted) — a silent no-op. A different error (e.g. a transient DB
 		// failure) is logged, but the attach still self-corrects on the next one.
 		if !errors.Is(err, store.ErrNotFound) {
-			slog.Default().Warn("slack: occurrence thread lookup failed; skipping card edit", "incident_id", inc.ID, "err", err)
+			slog.Default().Warn("slack: occurrence thread lookup failed; skipping card edit", "incident_id", ev.Incident.ID, "err", err)
 		}
 		return nil
 	}
+	return n.editOccurrenceCard(ctx, ev, ts, ch)
+}
 
-	occurrences := stats.Episodes()
+// editOccurrenceCard performs the throttled, coalesced in-place card edit for a
+// plain (non-rejudging) occurrence attach. Edits are throttled to one per
+// incident per occEditThrottle, coalesced, with a trailing flush that lands the
+// final count.
+func (n *Notifier) editOccurrenceCard(ctx context.Context, ev notify.RecurrenceEvent, ts, ch string) error {
+	occurrences := ev.Stats.Episodes()
 	edit := pendingEdit{
 		ts:       ts,
 		channel:  ch,
-		fallback: occurrenceFallback(occurrences, stats.LastSeen),
-		blocks:   occurrenceEditBlocks(inc, occurrences, stats.LastSeen, drill),
+		fallback: occurrenceFallback(occurrences, ev.Stats.LastSeen),
+		blocks:   occurrenceEditBlocks(ev.Incident, occurrences, ev.Stats.LastSeen, ev.Drill),
 	}
 
 	n.occMu.Lock()
-	st := n.occ[inc.ID]
+	st := n.occ[ev.Incident.ID]
 	if st == nil {
 		st = &occThrottle{}
-		n.occ[inc.ID] = st
+		n.occ[ev.Incident.ID] = st
 	}
 	now := n.now()
 	if now.Sub(st.last) >= occEditThrottle {
@@ -86,7 +103,7 @@ func (n *Notifier) OnOccurrenceAttached(ctx context.Context, inc store.Incident,
 	st.pending = &edit
 	if st.timer == nil {
 		wait := occEditThrottle - now.Sub(st.last)
-		id := inc.ID
+		id := ev.Incident.ID
 		// The trailing flush is detached from this request ctx (it fires up to
 		// occEditThrottle later, after ctx is likely canceled), so it uses
 		// context.Background() by design.

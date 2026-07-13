@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/notify"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -18,9 +19,12 @@ func TestOnOccurrenceAttached_WritesLineAlways(t *testing.T) {
 	// collapse signal), unlike the verbose-gated finding line.
 	n := New(&buf, nil, false)
 
-	err := n.OnOccurrenceAttached(context.Background(),
-		store.Incident{ID: "i1", GroupKey: "k"},
-		store.OccurrenceStats{Count: 7, LastSeen: time.Now().UTC()}, true)
+	err := n.OnOccurrenceAttached(context.Background(), notify.RecurrenceEvent{
+		Incident: store.Incident{ID: "i1", GroupKey: "k"},
+		Stats:    store.OccurrenceStats{Count: 7, LastSeen: time.Now().UTC()},
+		Trigger:  "cadence",
+		Drill:    true,
+	})
 	if err != nil {
 		t.Fatalf("OnOccurrenceAttached: %v", err)
 	}
@@ -41,5 +45,8 @@ func TestOnOccurrenceAttached_WritesLineAlways(t *testing.T) {
 	}
 	if line["drill"] != true {
 		t.Errorf("drill = %v, want true", line["drill"])
+	}
+	if line["trigger"] != "cadence" {
+		t.Errorf("trigger = %v, want cadence", line["trigger"])
 	}
 }

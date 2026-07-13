@@ -12,6 +12,7 @@ import (
 
 	slacklib "github.com/slack-go/slack"
 
+	"github.com/alertint/alertint-agent/internal/notify"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -72,7 +73,7 @@ func (noopTimer) Stop() bool { return true }
 // controllable clock + captured trailing-flush timer.
 func occNotifier(t *testing.T, client *fakeSlack, ts *fakeThreadStore) (*Notifier, *time.Time, *func()) {
 	t.Helper()
-	n := NewWithClient(client, "chan", "", ts, nil)
+	n := NewWithClient(client, "chan", "", "change-gated", ts, nil)
 	clockNow := time.Unix(1_000_000, 0).UTC()
 	var flush func()
 	n.now = func() time.Time { return clockNow }
@@ -81,9 +82,10 @@ func occNotifier(t *testing.T, client *fakeSlack, ts *fakeThreadStore) (*Notifie
 }
 
 func attach(n *Notifier, count int, at time.Time) error {
-	return n.OnOccurrenceAttached(context.Background(),
-		store.Incident{ID: "inc1", GroupKey: "k", Summary: "DiskFull"},
-		store.OccurrenceStats{Count: count, LastSeen: at}, false)
+	return n.OnOccurrenceAttached(context.Background(), notify.RecurrenceEvent{
+		Incident: store.Incident{ID: "inc1", GroupKey: "k", Summary: "DiskFull"},
+		Stats:    store.OccurrenceStats{Count: count, LastSeen: at},
+	})
 }
 
 func TestOccurrence_FirstAttachEditsImmediately(t *testing.T) {

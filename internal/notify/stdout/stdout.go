@@ -20,7 +20,6 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/notify"
-	"github.com/alertint/alertint-agent/internal/store"
 )
 
 // Notifier writes a JSON line for every finding when verbose.
@@ -86,6 +85,7 @@ type occurrenceLine struct {
 	Kind        string    `json:"kind"`
 	IncidentID  string    `json:"incident_id"`
 	GroupKey    string    `json:"group_key"`
+	Trigger     string    `json:"trigger"`
 	Occurrences int       `json:"occurrences"`
 	LastSeen    time.Time `json:"last_seen"`
 	Drill       bool      `json:"drill,omitempty"`
@@ -94,15 +94,16 @@ type occurrenceLine struct {
 // OnOccurrenceAttached writes one JSON occurrence line for a recurrence-collapse
 // attach — always (not verbose-gated): the occurrence line IS the visible
 // collapse signal on stdout (the always-on notifier), zero LLM tokens.
-func (n *Notifier) OnOccurrenceAttached(ctx context.Context, inc store.Incident, stats store.OccurrenceStats, drill bool) error {
+func (n *Notifier) OnOccurrenceAttached(ctx context.Context, ev notify.RecurrenceEvent) error {
 	l := occurrenceLine{
 		Ts:          n.now(),
 		Kind:        "occurrence",
-		IncidentID:  inc.ID,
-		GroupKey:    inc.GroupKey,
-		Occurrences: stats.Episodes(),
-		LastSeen:    stats.LastSeen.UTC(),
-		Drill:       drill,
+		IncidentID:  ev.Incident.ID,
+		GroupKey:    ev.Incident.GroupKey,
+		Trigger:     ev.Trigger,
+		Occurrences: ev.Stats.Episodes(),
+		LastSeen:    ev.Stats.LastSeen.UTC(),
+		Drill:       ev.Drill,
 	}
 	b, err := json.Marshal(l)
 	if err != nil {
@@ -113,8 +114,9 @@ func (n *Notifier) OnOccurrenceAttached(ctx context.Context, inc store.Incident,
 	}
 	if n.auditor != nil {
 		_ = n.auditor.Append(ctx, "notify.stdout", "notify.occurrence", map[string]any{
-			"incident_id": inc.ID,
+			"incident_id": ev.Incident.ID,
 			"occurrences": l.Occurrences,
+			"trigger":     ev.Trigger,
 		})
 	}
 	return nil

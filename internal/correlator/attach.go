@@ -8,6 +8,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/notify"
 	"github.com/alertint/alertint-agent/internal/severity"
 	"github.com/alertint/alertint-agent/internal/store"
 )
@@ -73,6 +74,17 @@ type attachDecision struct {
 	trigger string
 }
 
+// recurrenceDelta carries the display-only "why" facts from the impure decision
+// half (maybeAttachOccurrence) to attachOccurrence, which stamps them onto the
+// notify.RecurrenceEvent after reading fresh occurrence stats.
+type recurrenceDelta struct {
+	priorSeverity string
+	newSeverity   string
+	newAlertname  string
+	newInterval   time.Duration
+	priorMedian   time.Duration
+}
+
 // decideAttach is the pure heart of F1. Order is load-bearing: repeat detection
 // precedes the Clock A check; escalation triggers are evaluated inside the
 // horizon before the no-LLM choice; Clock B is the last gate before a plain
@@ -115,8 +127,18 @@ func decideAttach(in attachInputs) attachDecision {
 // key suddenly firing fast (R6). Inactive until 3 intervals exist (cold start);
 // severity, new-alertname, and the ceiling cover that regime.
 func cadenceTriggered(now time.Time, episodeTimes []time.Time) bool {
+	_, _, ok := cadenceDelta(now, episodeTimes)
+	return ok
+}
+
+// cadenceDelta returns the newest inter-episode interval and the trailing-median
+// interval, and whether the cadence trigger fires (newest*8 < median). ok is
+// false (both durations zero) until >=3 historical intervals exist. Split from
+// cadenceTriggered so the impure attach path can render the "faster — now ~Xm
+// (was ~Ym)" delta without recomputing inside decideAttach (which stays pure).
+func cadenceDelta(now time.Time, episodeTimes []time.Time) (newInterval, median time.Duration, ok bool) {
 	if len(episodeTimes) < 4 { // need >= 3 historical intervals
-		return false
+		return 0, 0, false
 	}
 	intervals := make([]time.Duration, 0, len(episodeTimes)-1)
 	for i := 1; i < len(episodeTimes); i++ {
@@ -125,12 +147,12 @@ func cadenceTriggered(now time.Time, episodeTimes []time.Time) bool {
 	if len(intervals) > 20 {
 		intervals = intervals[len(intervals)-20:]
 	}
-	med := medianDuration(intervals)
-	if med <= 0 {
-		return false
+	median = medianDuration(intervals)
+	if median <= 0 {
+		return 0, 0, false
 	}
-	newInterval := now.Sub(episodeTimes[len(episodeTimes)-1])
-	return newInterval*8 < med
+	newInterval = now.Sub(episodeTimes[len(episodeTimes)-1])
+	return newInterval, median, newInterval*8 < median
 }
 
 // medianDuration returns the median of a duration slice (average of the two
@@ -175,7 +197,7 @@ func (c *Correlator) maybeAttachOccurrence(ctx context.Context, a store.Alert, g
 		c.logger.Warn("correlator: member lookup failed; treating as new incident", "err", err)
 		return false, nil
 	}
-	baselineSev, known, isMember, candidateDrill := memberBaselines(members, a.Fingerprint)
+	baselineSev, baselineSevLabel, known, isMember, candidateDrill := memberBaselines(members, a.Fingerprint)
 
 	// Drill parity: a drill re-fire never attaches to a real incident, or vice
 	// versa (salted drill keys make this near-impossible; the check makes it so).
@@ -247,11 +269,25 @@ func (c *Correlator) maybeAttachOccurrence(ctx context.Context, a store.Alert, g
 		occurrenceCap:          c.cfg.OccurrenceCap,
 	})
 
+	// Display-only "why" facts for the recurrence event, derived here in the
+	// impure half where labels and the episode series are in hand. decideAttach
+	// stays pure; these never feed back into the decision.
+	var delta recurrenceDelta
+	switch decision.trigger {
+	case "severity":
+		delta.priorSeverity = baselineSevLabel
+		delta.newSeverity = a.Labels["severity"]
+	case "new_alertname":
+		delta.newAlertname = a.Labels["alertname"]
+	case "cadence":
+		delta.newInterval, delta.priorMedian, _ = cadenceDelta(now, episodeTimes)
+	}
+
 	switch decision.action {
 	case actionNewIncident:
 		return false, nil
 	case actionAttach, actionRejudge:
-		return true, c.attachOccurrence(ctx, a, *candidate, gk, decision)
+		return true, c.attachOccurrence(ctx, a, *candidate, gk, decision, delta)
 	case actionRepeatTouch:
 		// Unreachable: repeats are short-circuited above before decideAttach runs
 		// (isNewEpisode is forced true here). Fall through to a safe new incident.
@@ -267,11 +303,12 @@ func (c *Correlator) maybeAttachOccurrence(ctx context.Context, a store.Alert, g
 // member carries the marker). Because a higher severity or a new alertname
 // always trips a trigger on arrival (advancing last_judged_at), the max over
 // current members equals the max as of the last judgment.
-func memberBaselines(members []store.Alert, incomingFP string) (maxSev int, known map[string]bool, isMember, isDrill bool) {
+func memberBaselines(members []store.Alert, incomingFP string) (maxSev int, maxSevLabel string, known map[string]bool, isMember, isDrill bool) {
 	known = make(map[string]bool, len(members))
 	for _, m := range members {
 		if r := severity.Rank(m.Labels["severity"]); r > maxSev {
 			maxSev = r
+			maxSevLabel = m.Labels["severity"]
 		}
 		if an := m.Labels["alertname"]; an != "" {
 			known[an] = true
@@ -283,7 +320,7 @@ func memberBaselines(members []store.Alert, incomingFP string) (maxSev int, know
 			isDrill = true
 		}
 	}
-	return maxSev, known, isMember, isDrill
+	return maxSev, maxSevLabel, known, isMember, isDrill
 }
 
 // attachOccurrence records one occurrence row (with its trigger), mirrors the
@@ -294,7 +331,7 @@ func memberBaselines(members []store.Alert, incomingFP string) (maxSev int, know
 // retry-per-trigger, not a single retry: a persistently failing re-judgment
 // (e.g. a revoked key) re-fires on each new-episode trigger, rate-bounded only
 // by the LLM client's own timeout/backoff.
-func (c *Correlator) attachOccurrence(ctx context.Context, a store.Alert, inc store.Incident, gk string, decision attachDecision) error {
+func (c *Correlator) attachOccurrence(ctx context.Context, a store.Alert, inc store.Incident, gk string, decision attachDecision, delta recurrenceDelta) error {
 	occ := store.Occurrence{
 		IncidentID:   inc.ID,
 		OccurredAt:   a.ReceivedAt,
@@ -329,7 +366,18 @@ func (c *Correlator) attachOccurrence(ctx context.Context, a store.Alert, inc st
 
 	stats := c.occurrenceStats(ctx, inc.ID)
 	if c.occNotifier != nil {
-		if err := c.occNotifier.OnOccurrenceAttached(ctx, inc, stats, store.IsDrillAlert(a)); err != nil {
+		ev := notify.RecurrenceEvent{
+			Incident:      inc,
+			Stats:         stats,
+			Trigger:       decision.trigger,
+			Drill:         store.IsDrillAlert(a),
+			PriorSeverity: delta.priorSeverity,
+			NewSeverity:   delta.newSeverity,
+			NewAlertname:  delta.newAlertname,
+			NewInterval:   delta.newInterval,
+			PriorMedian:   delta.priorMedian,
+		}
+		if err := c.occNotifier.OnOccurrenceAttached(ctx, ev); err != nil {
 			c.logger.Warn("correlator: occurrence notify failed", "err", err, "incident_id", inc.ID)
 		}
 	}

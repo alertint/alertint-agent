@@ -36,6 +36,39 @@ type Finding struct {
 	// Evidence is the always-on per-source evidence summary (R6/R7). Every
 	// notifier receives it; Slack renders a line, stdout carries the fields.
 	Evidence EvidenceSummary `json:"evidence"`
+	// Recurrence, when non-nil, carries the live occurrence summary (episodes +
+	// last seen) so a re-judgment or resolution render shows the recurrence line
+	// without the notifier reading the store — notifiers stay I/O-free renderers;
+	// producers (triage skill on a re-judgment, resolution notifier at resolve)
+	// own the read. nil on a first firing.
+	Recurrence *Recurrence `json:"recurrence,omitempty"`
+}
+
+// Recurrence is the live occurrence summary carried on a Finding so the Slack
+// card render shows "recurred ×N · last HH:MM" on a re-judgment or resolution
+// update without the notifier touching the store.
+type Recurrence struct {
+	Episodes int       `json:"episodes"`
+	LastSeen time.Time `json:"last_seen"`
+}
+
+// RecurrenceEvent carries everything a sink needs to render a recurrence-collapse
+// attach: the incident, its derived occurrence stats, the trigger rung, and the
+// per-trigger delta facts that name the "why" on a broadcast. The correlator
+// builds it in the impure half of the attach path, where the baselines, incoming
+// labels, and episode series are already in hand. Delta fields are zero except
+// for the trigger they belong to.
+type RecurrenceEvent struct {
+	Incident store.Incident
+	Stats    store.OccurrenceStats
+	Trigger  string // none | severity | new_alertname | cadence | ceiling | cap
+	Drill    bool
+
+	PriorSeverity string        // severity: incident's prior max severity label
+	NewSeverity   string        // severity: the escalating alert's severity label
+	NewAlertname  string        // new_alertname: the alert type that joined
+	NewInterval   time.Duration // cadence: newest inter-episode interval
+	PriorMedian   time.Duration // cadence: trailing-median interval
 }
 
 // EvidenceState distinguishes a real count (fetched or a genuine zero) from a
@@ -189,24 +222,24 @@ func (m *Multi) Notify(ctx context.Context, f Finding) error {
 // recurrence-collapse occurrence attach (deterministic, zero-LLM). Sinks that
 // don't implement it are simply skipped by Multi's fan-out.
 type OccurrenceSink interface {
-	OnOccurrenceAttached(ctx context.Context, inc store.Incident, stats store.OccurrenceStats, drill bool) error
+	OnOccurrenceAttached(ctx context.Context, ev RecurrenceEvent) error
 }
 
 // OnOccurrenceAttached fans an occurrence attach out to every contained notifier
 // that implements OccurrenceSink, and returns the first sink error (nil when all
 // succeeded or none handle occurrences). This makes *Multi satisfy the
 // correlator's occurrence-notifier interface.
-func (m *Multi) OnOccurrenceAttached(ctx context.Context, inc store.Incident, stats store.OccurrenceStats, drill bool) error {
+func (m *Multi) OnOccurrenceAttached(ctx context.Context, ev RecurrenceEvent) error {
 	var first error
 	for _, n := range m.notifiers {
 		s, ok := n.(OccurrenceSink)
 		if !ok {
 			continue
 		}
-		if err := s.OnOccurrenceAttached(ctx, inc, stats, drill); err != nil {
+		if err := s.OnOccurrenceAttached(ctx, ev); err != nil {
 			m.logger.Warn("notify occurrence sink failed",
 				slog.String("sink", n.Name()),
-				slog.String("incident", inc.ID),
+				slog.String("incident", ev.Incident.ID),
 				slog.String("err", err.Error()),
 			)
 			if first == nil {

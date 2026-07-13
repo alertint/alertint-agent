@@ -38,11 +38,12 @@ type SlackClient interface {
 
 // Notifier posts and updates Slack messages via the Bot Token API.
 type Notifier struct {
-	client      SlackClient
-	channel     string
-	store       ThreadStore
-	auditor     *audit.Auditor
-	minSeverity string // findings below this severity are not posted ("" = low = post everything)
+	client         SlackClient
+	channel        string
+	store          ThreadStore
+	auditor        *audit.Auditor
+	minSeverity    string         // findings below this severity are not posted ("" = low = post everything)
+	recurrenceMode recurrenceMode // change-gated (default) | off (ADR-0020)
 
 	// Occurrence card-edit throttle (recurrence collapse, R10): at most one edit
 	// per incident per occEditThrottle, coalesced, with a trailing flush. now and
@@ -64,27 +65,33 @@ func Probe(ctx context.Context, botToken string) error {
 }
 
 // New constructs a Slack Notifier using a bot token (xoxb-...). minSeverity
-// is the channel noise gate (low | medium | high; "" means low).
-func New(botToken, channel, minSeverity string, store ThreadStore, auditor *audit.Auditor) *Notifier {
-	return newNotifier(slacklib.New(botToken), channel, minSeverity, store, auditor)
+// is the channel noise gate (low | medium | high; "" means low). recurrenceMode
+// is "change-gated" | "off" ("" normalizes to change-gated).
+func New(botToken, channel, minSeverity, recurrenceMode string, store ThreadStore, auditor *audit.Auditor) *Notifier {
+	return newNotifier(slacklib.New(botToken), channel, minSeverity, recurrenceMode, store, auditor)
 }
 
 // NewWithClient constructs a Notifier with a custom SlackClient, enabling
 // injection of a mock in tests.
-func NewWithClient(client SlackClient, channel, minSeverity string, store ThreadStore, auditor *audit.Auditor) *Notifier {
-	return newNotifier(client, channel, minSeverity, store, auditor)
+func NewWithClient(client SlackClient, channel, minSeverity, recurrenceMode string, store ThreadStore, auditor *audit.Auditor) *Notifier {
+	return newNotifier(client, channel, minSeverity, recurrenceMode, store, auditor)
 }
 
-func newNotifier(client SlackClient, channel, minSeverity string, store ThreadStore, auditor *audit.Auditor) *Notifier {
+func newNotifier(client SlackClient, channel, minSeverity, recurrenceMode string, store ThreadStore, auditor *audit.Auditor) *Notifier {
+	mode := recurrenceChangeGated
+	if recurrenceMode == string(recurrenceOff) {
+		mode = recurrenceOff
+	}
 	return &Notifier{
-		client:      client,
-		channel:     channel,
-		minSeverity: minSeverity,
-		store:       store,
-		auditor:     auditor,
-		now:         time.Now,
-		after:       func(d time.Duration, fn func()) stopper { return time.AfterFunc(d, fn) },
-		occ:         make(map[string]*occThrottle),
+		client:         client,
+		channel:        channel,
+		minSeverity:    minSeverity,
+		recurrenceMode: mode,
+		store:          store,
+		auditor:        auditor,
+		now:            time.Now,
+		after:          func(d time.Duration, fn func()) stopper { return time.AfterFunc(d, fn) },
+		occ:            make(map[string]*occThrottle),
 	}
 }
 

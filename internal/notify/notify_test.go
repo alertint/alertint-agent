@@ -27,7 +27,7 @@ type occCapableSink struct {
 	occ int
 }
 
-func (s *occCapableSink) OnOccurrenceAttached(context.Context, store.Incident, store.OccurrenceStats, bool) error {
+func (s *occCapableSink) OnOccurrenceAttached(context.Context, notify.RecurrenceEvent) error {
 	s.occ++
 	return nil
 }
@@ -38,7 +38,7 @@ func TestMulti_OnOccurrenceAttachedFansOutOnlyToCapableSinks(t *testing.T) {
 	m := notify.NewMulti(slog.Default(), occ, plain)
 
 	if err := m.OnOccurrenceAttached(context.Background(),
-		store.Incident{ID: "i1"}, store.OccurrenceStats{Count: 1}, false); err != nil {
+		notify.RecurrenceEvent{Incident: store.Incident{ID: "i1"}, Stats: store.OccurrenceStats{Count: 1}}); err != nil {
 		t.Fatalf("OnOccurrenceAttached: %v", err)
 	}
 	if occ.occ != 1 {
@@ -158,7 +158,7 @@ func TestSlackFiringPostsMessage(t *testing.T) {
 	client := &mockSlackClient{returnTS: "1234567890.000001", returnCh: "C123"}
 	store := &mockThreadStore{err: errors.New("not found")}
 
-	n := slack.NewWithClient(client, "#alerts", "low", store, nil)
+	n := slack.NewWithClient(client, "#alerts", "low", "change-gated", store, nil)
 	if err := n.Notify(context.Background(), sampleFinding()); err != nil {
 		t.Fatalf("Notify: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestSlackResolvedWithThread(t *testing.T) {
 	client := &mockSlackClient{returnTS: "1234567890.000002", returnCh: "C123"}
 	store := &mockThreadStore{ts: "1234567890.000001", ch: "C123"}
 
-	n := slack.NewWithClient(client, "#alerts", "low", store, nil)
+	n := slack.NewWithClient(client, "#alerts", "low", "change-gated", store, nil)
 	f := sampleFinding()
 	f.Status = "resolved"
 	if err := n.Notify(context.Background(), f); err != nil {
@@ -200,7 +200,7 @@ func TestSlackResolvedNoThreadFallback(t *testing.T) {
 	client := &mockSlackClient{returnTS: "1234567890.000003", returnCh: "C123"}
 	store := &mockThreadStore{err: errors.New("not found")}
 
-	n := slack.NewWithClient(client, "#alerts", "low", store, nil)
+	n := slack.NewWithClient(client, "#alerts", "low", "change-gated", store, nil)
 	f := sampleFinding()
 	f.Status = "resolved"
 	if err := n.Notify(context.Background(), f); err != nil {
@@ -221,7 +221,7 @@ func TestSlackFiringSuppressedBelowMinSeverity(t *testing.T) {
 	client := &mockSlackClient{returnTS: "ts", returnCh: "C1"}
 	store := &mockThreadStore{err: errors.New("not found")}
 
-	n := slack.NewWithClient(client, "#alerts", "high", store, nil)
+	n := slack.NewWithClient(client, "#alerts", "high", "change-gated", store, nil)
 	f := sampleFinding()
 	f.Severity = "low"
 	if err := n.Notify(context.Background(), f); err != nil {
@@ -239,7 +239,7 @@ func TestSlackResolvedNoThreadSuppressedBelowMinSeverity(t *testing.T) {
 	client := &mockSlackClient{returnTS: "ts", returnCh: "C1"}
 	store := &mockThreadStore{err: errors.New("not found")}
 
-	n := slack.NewWithClient(client, "#alerts", "high", store, nil)
+	n := slack.NewWithClient(client, "#alerts", "high", "change-gated", store, nil)
 	f := sampleFinding()
 	f.Severity = "low"
 	f.Status = "resolved"
@@ -257,7 +257,7 @@ func TestSlackResolvedWithThreadNotGated(t *testing.T) {
 	client := &mockSlackClient{returnTS: "ts", returnCh: "C1"}
 	store := &mockThreadStore{ts: "1234567890.000001", ch: "C1"}
 
-	n := slack.NewWithClient(client, "#alerts", "high", store, nil)
+	n := slack.NewWithClient(client, "#alerts", "high", "change-gated", store, nil)
 	f := sampleFinding()
 	f.Severity = "low"
 	f.Status = "resolved"
@@ -274,7 +274,7 @@ func TestSlackClientErrorPropagates(t *testing.T) {
 	client := &mockSlackClient{postErr: errors.New("slack API error")}
 	store := &mockThreadStore{err: errors.New("not found")}
 
-	n := slack.NewWithClient(client, "#alerts", "low", store, nil)
+	n := slack.NewWithClient(client, "#alerts", "low", "change-gated", store, nil)
 	err := n.Notify(context.Background(), sampleFinding())
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -306,7 +306,7 @@ func TestMultiCallsBoth(t *testing.T) {
 
 	var out bytes.Buffer
 	sn := stdout.New(&out, nil, true)
-	sk := slack.NewWithClient(client, "#alerts", "low", store, nil)
+	sk := slack.NewWithClient(client, "#alerts", "low", "change-gated", store, nil)
 	var logBuf bytes.Buffer
 	m := notify.NewMulti(testLogger(&logBuf), sn, sk)
 
