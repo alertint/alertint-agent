@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-07-13
+
 ### Added
 
 - Change-gated recurrence visibility in Slack: a recurring incident resurfaces in
@@ -400,7 +402,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single static binary** — pure-Go SQLite (no CGO), no external runtime dependencies.
   Multi-platform builds: `linux/amd64`, `linux/arm64`, `darwin/arm64`.
 
-[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.7.3...HEAD
+[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.7.4...HEAD
+[0.7.4]: https://github.com/alertint/alertint-agent/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/alertint/alertint-agent/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/alertint/alertint-agent/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/alertint/alertint-agent/compare/v0.7.0...v0.7.1
