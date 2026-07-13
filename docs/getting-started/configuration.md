@@ -187,6 +187,7 @@ one.
 | `slack.bot_token_env` | string | — | Required when `slack.enabled: true`. Env var name holding the Slack bot token (`xoxb-…`, requires the `chat:write` scope) |
 | `slack.channel` | string | — | Required when `slack.enabled: true`. Channel name (e.g. `#alerts`) or ID (e.g. `C1234567890`) |
 | `slack.min_severity` | string | `low` | Findings below this severity (`low` \| `medium` \| `high`) are not posted to Slack; stdout always emits. An incident suppressed at firing is also suppressed at resolution. The default posts everything. |
+| `slack.recurrence_mode` | string | `change-gated` | How a recurring incident resurfaces in the channel: `change-gated` broadcasts a thread reply only on a real-world change (severity rise, new symptom, faster cadence) or a milestone (×5/×10/×25/×50/×100, then every ×100); `off` keeps recurrence to a silent card count-bump. See [Slack](../notifications/slack.md) for details. |
 
 At startup the agent logs one `notifiers ready` line listing the active sinks
 (and the Slack channel) so you can see where findings will go. Every analysis

@@ -32,6 +32,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/notify"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/google/uuid"
 )
@@ -56,11 +57,10 @@ func (NopIncidentSink) OnIncidentReady(_ context.Context, _ store.Incident) erro
 
 // OccurrenceNotifier receives a deterministic, zero-LLM notification each time a
 // re-fire attaches as an occurrence (recurrence collapse). The stdout notifier
-// emits one line; the Slack notifier edits the incident's card in place. drill
-// carries the incident's drill-ness so a synthetic card stays unmistakably
-// marked on edit. nil means no occurrence notifications.
+// emits one line; the Slack notifier edits the card and/or broadcasts the "why".
+// nil means no occurrence notifications.
 type OccurrenceNotifier interface {
-	OnOccurrenceAttached(ctx context.Context, inc store.Incident, stats store.OccurrenceStats, drill bool) error
+	OnOccurrenceAttached(ctx context.Context, ev notify.RecurrenceEvent) error
 }
 
 // Rejudger runs a fresh triage that replaces an incident's finding in place when

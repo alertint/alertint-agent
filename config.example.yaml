@@ -38,6 +38,7 @@ notify:
     bot_token_env: SLACK_BOT_TOKEN   # xoxb- bot token (requires chat:write scope)
     channel: "#alerts"               # channel name or ID
     min_severity: low                # low | medium | high — raise to suppress lower-severity findings on Slack (stdout always emits)
+    recurrence_mode: change-gated    # change-gated (default) | off — how recurring incidents resurface in the channel; off = silent card count-bump only
 
 # MCP HTTP server — AI coding agents connect to http://host:9912/mcp
 # Presence-based: set ALERTINT_MCP_TOKEN to a long random secret and the

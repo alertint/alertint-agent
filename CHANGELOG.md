@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Change-gated recurrence visibility in Slack: a recurring incident resurfaces in
+  the channel only when a re-fire is a real-world change (severity rise, a new
+  symptom, or accelerating cadence) or crosses a milestone (×5/×10/×25/×50/×100,
+  then every ×100), each stating why it resurfaced. Plain re-fires stay silent —
+  the card's occurrence count edits in place. An escalation now edits the
+  incident's existing card instead of posting a new one, so the whole recurrence
+  reads as one thread. New `notify.slack.recurrence_mode: change-gated | off`.
+
 ## [0.7.3] - 2026-07-10
 
 ### Fixed

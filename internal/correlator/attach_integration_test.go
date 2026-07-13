@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/notify"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/google/uuid"
 )
@@ -16,13 +17,13 @@ import (
 
 type fakeOccNotifier struct {
 	mu    sync.Mutex
-	calls []store.OccurrenceStats
+	calls []notify.RecurrenceEvent
 }
 
-func (f *fakeOccNotifier) OnOccurrenceAttached(_ context.Context, _ store.Incident, stats store.OccurrenceStats, _ bool) error {
+func (f *fakeOccNotifier) OnOccurrenceAttached(_ context.Context, ev notify.RecurrenceEvent) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls = append(f.calls, stats)
+	f.calls = append(f.calls, ev)
 	return nil
 }
 func (f *fakeOccNotifier) count() int { f.mu.Lock(); defer f.mu.Unlock(); return len(f.calls) }
@@ -186,7 +187,7 @@ func TestMaybeAttach_PlainAttach(t *testing.T) {
 	if td.aud.occurrenceAttachedCount() != 1 {
 		t.Errorf("audit rows = %d, want 1", td.aud.occurrenceAttachedCount())
 	}
-	if td.notif.count() != 1 || td.notif.calls[0].Count != 1 {
+	if td.notif.count() != 1 || td.notif.calls[0].Stats.Count != 1 {
 		t.Errorf("notifier calls = %d (%v), want 1 (count=1)", td.notif.count(), td.notif.calls)
 	}
 	if td.rej.count() != 0 {
@@ -491,5 +492,56 @@ func TestFlushExpired_PrunesOnSchedule(t *testing.T) {
 	}
 	if occCount(t, st, "inc_1") != 1 {
 		t.Errorf("occurrences after prune = %d, want 1 (old pruned, recent kept)", occCount(t, st, "inc_1"))
+	}
+}
+
+func TestMaybeAttach_EventCarriesSeverityDelta(t *testing.T) {
+	now := time.Date(2026, 7, 8, 15, 30, 0, 0, time.UTC)
+	_, td := runRejudgeCase(t, firingAlert("fp-new", "DiskFull", "critical", now, false), now.Add(-10*time.Minute))
+	if td.notif.count() != 1 {
+		t.Fatalf("notifier calls = %d, want 1", td.notif.count())
+	}
+	ev := td.notif.calls[0]
+	if ev.Trigger != "severity" || ev.NewSeverity != "critical" || ev.PriorSeverity != "warning" {
+		t.Errorf("severity event = {trigger:%q new:%q prior:%q}, want {severity critical warning}",
+			ev.Trigger, ev.NewSeverity, ev.PriorSeverity)
+	}
+	if ev.Stats.Count != 1 {
+		t.Errorf("stats.Count = %d, want 1", ev.Stats.Count)
+	}
+}
+
+func TestMaybeAttach_EventCarriesNewAlertname(t *testing.T) {
+	now := time.Date(2026, 7, 8, 15, 30, 0, 0, time.UTC)
+	_, td := runRejudgeCase(t, firingAlert("fp-new", "OOMKilled", "warning", now, false), now.Add(-10*time.Minute))
+	ev := td.notif.calls[0]
+	if ev.Trigger != "new_alertname" || ev.NewAlertname != "OOMKilled" {
+		t.Errorf("new_alertname event = {trigger:%q name:%q}, want {new_alertname OOMKilled}", ev.Trigger, ev.NewAlertname)
+	}
+}
+
+func TestMaybeAttach_EventCarriesCadenceDelta(t *testing.T) {
+	st := openStore(t)
+	c, td := newCorrelatorFor(t, st)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 8, 2, 20, 0, 0, time.UTC)
+	base := now.Add(-20 * time.Minute)
+	for i, id := range []string{"inc_n1", "inc_n2", "inc_n3", "inc_n4"} {
+		at := base.Add(-time.Duration(3-i) * 24 * time.Hour)
+		seedJudged(t, st, id, "analyzed", at, at, firingAlert("fp-"+id, "DiskFull", "warning", at, false))
+	}
+	incoming := firingAlert("fp-fast", "DiskFull", "warning", now, false)
+	if _, err := st.UpsertAlertByFingerprint(ctx, incoming); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if _, err := c.maybeAttachOccurrence(ctx, incoming, gkAPI); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	ev := td.notif.calls[0]
+	if ev.Trigger != "cadence" {
+		t.Fatalf("trigger = %q, want cadence", ev.Trigger)
+	}
+	if ev.NewInterval <= 0 || ev.PriorMedian <= 0 || ev.NewInterval*8 >= ev.PriorMedian {
+		t.Errorf("cadence delta = {new:%s median:%s}, want new*8 < median with both > 0", ev.NewInterval, ev.PriorMedian)
 	}
 }

@@ -68,6 +68,15 @@ func (n *Notifier) OnIncidentResolved(ctx context.Context, inc store.Incident) e
 		Status:       "resolved",
 		Drill:        drill,
 	}
+	if n.st != nil {
+		// Best-effort recurrence summary for the resolved card ("resolved after
+		// recurring ×N"). A lookup miss/err just omits it.
+		if m, err := n.st.OccurrenceStatsByIncident(ctx, []string{inc.ID}); err == nil {
+			if s, ok := m[inc.ID]; ok && s.Episodes() > 1 {
+				f.Recurrence = &notify.Recurrence{Episodes: s.Episodes(), LastSeen: s.LastSeen}
+			}
+		}
+	}
 	return n.inner.Notify(ctx, f)
 }
 

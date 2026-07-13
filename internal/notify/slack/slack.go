@@ -11,6 +11,7 @@ package slack
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ import (
 	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/notify"
 	"github.com/alertint/alertint-agent/internal/severity"
+	"github.com/alertint/alertint-agent/internal/store"
 )
 
 // ThreadStore persists Slack thread coordinates (ts + channel) keyed by incident ID.
@@ -38,11 +40,12 @@ type SlackClient interface {
 
 // Notifier posts and updates Slack messages via the Bot Token API.
 type Notifier struct {
-	client      SlackClient
-	channel     string
-	store       ThreadStore
-	auditor     *audit.Auditor
-	minSeverity string // findings below this severity are not posted ("" = low = post everything)
+	client         SlackClient
+	channel        string
+	store          ThreadStore
+	auditor        *audit.Auditor
+	minSeverity    string         // findings below this severity are not posted ("" = low = post everything)
+	recurrenceMode recurrenceMode // change-gated (default) | off (ADR-0020)
 
 	// Occurrence card-edit throttle (recurrence collapse, R10): at most one edit
 	// per incident per occEditThrottle, coalesced, with a trailing flush. now and
@@ -64,27 +67,33 @@ func Probe(ctx context.Context, botToken string) error {
 }
 
 // New constructs a Slack Notifier using a bot token (xoxb-...). minSeverity
-// is the channel noise gate (low | medium | high; "" means low).
-func New(botToken, channel, minSeverity string, store ThreadStore, auditor *audit.Auditor) *Notifier {
-	return newNotifier(slacklib.New(botToken), channel, minSeverity, store, auditor)
+// is the channel noise gate (low | medium | high; "" means low). recurrenceMode
+// is "change-gated" | "off" ("" normalizes to change-gated).
+func New(botToken, channel, minSeverity, recurrenceMode string, store ThreadStore, auditor *audit.Auditor) *Notifier {
+	return newNotifier(slacklib.New(botToken), channel, minSeverity, recurrenceMode, store, auditor)
 }
 
 // NewWithClient constructs a Notifier with a custom SlackClient, enabling
 // injection of a mock in tests.
-func NewWithClient(client SlackClient, channel, minSeverity string, store ThreadStore, auditor *audit.Auditor) *Notifier {
-	return newNotifier(client, channel, minSeverity, store, auditor)
+func NewWithClient(client SlackClient, channel, minSeverity, recurrenceMode string, store ThreadStore, auditor *audit.Auditor) *Notifier {
+	return newNotifier(client, channel, minSeverity, recurrenceMode, store, auditor)
 }
 
-func newNotifier(client SlackClient, channel, minSeverity string, store ThreadStore, auditor *audit.Auditor) *Notifier {
+func newNotifier(client SlackClient, channel, minSeverity, recurrenceMode string, store ThreadStore, auditor *audit.Auditor) *Notifier {
+	mode := recurrenceChangeGated
+	if recurrenceMode == string(recurrenceOff) {
+		mode = recurrenceOff
+	}
 	return &Notifier{
-		client:      client,
-		channel:     channel,
-		minSeverity: minSeverity,
-		store:       store,
-		auditor:     auditor,
-		now:         time.Now,
-		after:       func(d time.Duration, fn func()) stopper { return time.AfterFunc(d, fn) },
-		occ:         make(map[string]*occThrottle),
+		client:         client,
+		channel:        channel,
+		minSeverity:    minSeverity,
+		recurrenceMode: mode,
+		store:          store,
+		auditor:        auditor,
+		now:            time.Now,
+		after:          func(d time.Duration, fn func()) stopper { return time.AfterFunc(d, fn) },
+		occ:            make(map[string]*occThrottle),
 	}
 }
 
@@ -102,17 +111,33 @@ func (n *Notifier) Notify(ctx context.Context, f notify.Finding) error {
 }
 
 func (n *Notifier) notifyFiring(ctx context.Context, f notify.Finding) error {
-	// Severity gate: below-threshold findings never reach the channel (stdout
-	// still emits them). Skipping records an audit row so the suppression is
-	// visible in the hash-chained trail, not silent.
+	// A recorded thread means the incident already has a card: this Notify is a
+	// re-judgment update, not a first firing. Edit the existing card in place
+	// (new finding + recurrence line) and thread the fresh analysis — never post
+	// a new card, never overwrite slack_ts (ADR-0019). An update to an
+	// already-visible incident is not re-gated by min_severity (mirrors resolve).
+	// A non-ErrNotFound lookup error is NOT treated as "no card yet": doing so
+	// would post a duplicate card and clobber slack_ts for an incident that
+	// already has one, so the error is surfaced instead (mirrors
+	// OnOccurrenceAttached's errors.Is(err, store.ErrNotFound) check).
+	if n.store != nil {
+		ts, ch, err := n.store.GetIncidentSlackThread(ctx, f.IncidentID)
+		switch {
+		case err == nil:
+			return n.updateFiringInPlace(ctx, f, ts, ch)
+		case !errors.Is(err, store.ErrNotFound):
+			return fmt.Errorf("channel %s: firing thread lookup: %w", n.channel, err)
+		}
+	}
+	// No thread recorded: first firing (or a previously gate-suppressed incident
+	// now worth showing). Apply the severity gate, then post a new card.
 	if n.belowMinSeverity(f) {
 		n.auditSkipped(ctx, f)
 		return nil
 	}
-	// Post brief main-channel message: headline + root cause only.
 	ch, ts, err := n.client.PostMessageContext(ctx, n.channel,
 		slacklib.MsgOptionText(firingFallback(f), false),
-		slacklib.MsgOptionBlocks(firingMainBlocks(f)...),
+		slacklib.MsgOptionBlocks(firingCardBlocks(f)...),
 	)
 	if err != nil {
 		return fmt.Errorf("channel %s: post message: %w", n.channel, err)
@@ -120,7 +145,6 @@ func (n *Notifier) notifyFiring(ctx context.Context, f notify.Finding) error {
 	if n.store != nil && ts != "" {
 		_ = n.store.SetIncidentSlackThread(ctx, f.IncidentID, ts, ch)
 	}
-	// Post full analysis detail immediately as a thread reply.
 	if ts != "" {
 		_, _, _ = n.client.PostMessageContext(ctx, ch,
 			slacklib.MsgOptionText(firingFallback(f), false),
@@ -129,6 +153,32 @@ func (n *Notifier) notifyFiring(ctx context.Context, f notify.Finding) error {
 		)
 	}
 	n.audit(ctx, f.IncidentID, "firing")
+	return nil
+}
+
+// updateFiringInPlace edits the incident's existing card with the re-judgment's
+// fresh finding + recurrence line and threads the new analysis as a plain reply
+// (the "why" broadcast, if any, already fired from OnOccurrenceAttached). It
+// preserves slack_ts — the card is the incident's durable anchor.
+func (n *Notifier) updateFiringInPlace(ctx context.Context, f notify.Finding, originalTS, ch string) error {
+	channel := ch
+	if channel == "" {
+		channel = n.channel
+	}
+	if _, _, _, err := n.client.UpdateMessageContext(ctx, channel, originalTS,
+		slacklib.MsgOptionText(firingFallback(f), false),
+		slacklib.MsgOptionBlocks(firingCardBlocks(f)...),
+	); err != nil {
+		return fmt.Errorf("channel %s: update firing card: %w", channel, err)
+	}
+	if _, _, err := n.client.PostMessageContext(ctx, channel,
+		slacklib.MsgOptionText(firingFallback(f), false),
+		slacklib.MsgOptionTS(originalTS),
+		slacklib.MsgOptionBlocks(firingDetailBlocks(f)...),
+	); err != nil {
+		return fmt.Errorf("channel %s: post thread reply: %w", channel, err)
+	}
+	n.audit(ctx, f.IncidentID, "rejudge")
 	return nil
 }
 
@@ -237,23 +287,26 @@ func (n *Notifier) audit(ctx context.Context, incidentID, event string) {
 // Block Kit payload builders
 // ----------------------------------------------------------------------
 
-// drillMd / drillPlain return the DRILL banner fragment prepended to every
-// rendered surface of a Drill finding (main card, thread detail, fallback):
-// a synthetic card must be unmistakably synthetic in a shared channel
-// (ADR-0013). Empty for real incidents.
-func drillMd(f notify.Finding) string {
-	if f.Drill {
+// drillMarker / drillPlainMarker return the DRILL banner fragment prepended to
+// every rendered surface of a Drill finding or recurrence event (main card,
+// thread detail, fallback, broadcast): a synthetic card must be unmistakably
+// synthetic in a shared channel (ADR-0013). Empty when not a drill.
+func drillMarker(drill bool) string {
+	if drill {
 		return ":test_tube: *DRILL* — "
 	}
 	return ""
 }
 
-func drillPlain(f notify.Finding) string {
-	if f.Drill {
+func drillPlainMarker(drill bool) string {
+	if drill {
 		return "🧪 DRILL — "
 	}
 	return ""
 }
+
+func drillMd(f notify.Finding) string    { return drillMarker(f.Drill) }
+func drillPlain(f notify.Finding) string { return drillPlainMarker(f.Drill) }
 
 // firingMainBlocks builds the brief main-channel message posted when an incident
 // fires: headline + root cause only. Keeps the channel timeline scannable.
@@ -289,6 +342,29 @@ func firingMainBlocks(f notify.Finding) []slacklib.Block {
 		blocks = append(blocks, agentHandoffBlock(f.IncidentID))
 	}
 	return blocks
+}
+
+// firingCardBlocks is the single source of truth for the incident's main card
+// body across first firing, occurrence count-edit, and re-judgment edit: the
+// finding (firingMainBlocks) plus a recurrence context line when the finding
+// carries live occurrence stats. Unifying the three renders keeps them from
+// drifting.
+func firingCardBlocks(f notify.Finding) []slacklib.Block {
+	blocks := firingMainBlocks(f)
+	if f.Recurrence != nil {
+		blocks = append(blocks, recurrenceContextBlock(f.Recurrence.Episodes, f.Recurrence.LastSeen))
+	}
+	return blocks
+}
+
+// recurrenceContextBlock is the "recurred ×N · last HH:MM" line appended to a
+// recurring incident's card.
+func recurrenceContextBlock(occurrences int, lastSeen time.Time) slacklib.Block {
+	return slacklib.NewContextBlock("",
+		slacklib.NewTextBlockObject(slacklib.MarkdownType,
+			fmt.Sprintf(":repeat: *recurred ×%d* · last %s UTC", occurrences, lastSeen.UTC().Format("15:04")),
+			false, false),
+	)
 }
 
 // agentHandoffBlock is the MCP call to action, rendered the same wherever it
@@ -397,11 +473,14 @@ func resolvedMainBlocks(f notify.Finding) []slacklib.Block {
 			nil, nil,
 		))
 	}
+	ctxText := fmt.Sprintf("Incident `%s` · resolved after %s · %s UTC",
+		shortID(f.IncidentID), duration, f.AnalyzedAt.UTC().Format("15:04"))
+	if f.Recurrence != nil && f.Recurrence.Episodes > 1 {
+		ctxText = fmt.Sprintf("Incident `%s` · resolved after recurring ×%d over %s · %s UTC",
+			shortID(f.IncidentID), f.Recurrence.Episodes, duration, f.AnalyzedAt.UTC().Format("15:04"))
+	}
 	blocks = append(blocks, slacklib.NewContextBlock("",
-		slacklib.NewTextBlockObject(slacklib.MarkdownType,
-			fmt.Sprintf("Incident `%s` · resolved after %s · %s UTC",
-				shortID(f.IncidentID), duration, f.AnalyzedAt.UTC().Format("15:04")),
-			false, false),
+		slacklib.NewTextBlockObject(slacklib.MarkdownType, ctxText, false, false),
 	))
 	return blocks
 }

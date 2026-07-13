@@ -154,3 +154,51 @@ Incident a1b2c3d4 · duration 15m
 The MCP hint in the message footer is a pre-filled tool call. Paste it
 directly into Claude Code, Cursor, or Windsurf to open the full evidence
 pack for that incident — see [MCP clients](../integrations/mcp-clients.md).
+
+## Recurrence resurfacing
+
+When an already-analyzed incident re-fires inside the collapse window, it
+doesn't get a new card — it attaches as another occurrence on the same
+incident, and the card that's already in the channel is what carries the
+update. Whether that update resurfaces in the channel depends on what changed:
+
+- **A plain re-fire** — same symptom, same severity, steady cadence — just
+  bumps the occurrence count on the existing card in place
+  (`🔁 recurred ×N · last HH:MM`). No new channel message.
+- **A real-world change** — severity escalated, a new symptom (alertname)
+  joined, or the cadence sped up markedly — resurfaces the incident: a
+  broadcast thread reply lands in the channel naming exactly why
+  (`why: severity` / `why: new_alertname` / `why: cadence`), and the incident
+  is re-analyzed with the fresh finding edited into the same card — never a
+  new one.
+- **A steady flapper** that never trips one of those changes still resurfaces
+  periodically at milestone counts — ×5, ×10, ×25, ×50, ×100, then every ×100
+  — so a long-running recurring incident doesn't go silent forever even
+  without a qualifying change.
+
+Every resurfaced message states the reason, e.g.:
+
+```text
+Incident a1b2c3d4 · recurred ×9 · last 14:52 UTC · why: cadence
+```
+
+Two backstop triggers — a hard occurrence cap and a periodic re-analysis
+ceiling — force a fresh re-analysis without representing a genuine escalation,
+so they edit the card but never broadcast; they stay silent by design.
+
+Control this with `notify.slack.recurrence_mode`:
+
+```yaml
+notify:
+  slack:
+    recurrence_mode: change-gated   # change-gated (default) | off
+```
+
+- `change-gated` (default) — broadcast on a real-world change or a milestone,
+  as described above.
+- `off` — recurrence never broadcasts; the card's occurrence count still
+  updates in place, silently.
+
+Drill incidents (`alertint drill`) keep their 🧪 DRILL banner on every
+recurrence surface — card edit, broadcast, and fallback text — same as every
+other rendered surface.

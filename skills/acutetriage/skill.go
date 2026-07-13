@@ -149,6 +149,12 @@ type pipelineParams struct {
 	spanStart  time.Time
 	recurrence string
 	persist    persistFunc
+
+	// recurrenceEpisodes / recurrenceLastSeen carry the live occurrence summary
+	// so the Slack card shows "recurred ×N · last HH:MM" on a re-judgment edit.
+	// Zero on an initial triage.
+	recurrenceEpisodes int
+	recurrenceLastSeen time.Time
 }
 
 // Run executes the full triage pipeline for a newly-ready incident.
@@ -206,13 +212,15 @@ func (s *Skill) Rejudge(ctx context.Context, inc store.Incident, trigger string)
 		return nil
 	}
 
-	spanStart, recurrence := s.buildRecurrenceContext(ctx, inc, trigger)
+	spanStart, recurrence, stats := s.buildRecurrenceContext(ctx, inc, trigger)
 	return s.pipeline(ctx, inc, alerts, pipelineParams{
-		rejudge:    true,
-		trigger:    trigger,
-		spanStart:  spanStart,
-		recurrence: recurrence,
-		persist:    s.st.ReplaceIncidentOutput,
+		rejudge:            true,
+		trigger:            trigger,
+		spanStart:          spanStart,
+		recurrence:         recurrence,
+		persist:            s.st.ReplaceIncidentOutput,
+		recurrenceEpisodes: stats.Episodes(),
+		recurrenceLastSeen: stats.LastSeen,
 	})
 }
 
@@ -353,6 +361,9 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 			Status:              incidentStatus,
 			Drill:               isDrill(alerts),
 			Evidence:            buildEvidenceSummary(decision.ShortCircuit, metrics, enrichment, changes, sentry),
+		}
+		if p.rejudge && p.recurrenceEpisodes > 1 && !p.recurrenceLastSeen.IsZero() {
+			f.Recurrence = &notify.Recurrence{Episodes: p.recurrenceEpisodes, LastSeen: p.recurrenceLastSeen}
 		}
 		// Multi owns the per-sink notify outcome line(s): a quiet "notified" on
 		// success, a "notify partial"/"notify failed" summary plus one "notify

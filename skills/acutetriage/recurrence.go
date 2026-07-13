@@ -23,15 +23,15 @@ const maxRecurrenceTrajectory = 5
 // compact annotation trajectory. M1 renders no recalled-finding memory section —
 // that arrives in M2; these are the same class of data (alert annotations)
 // already present in the pack, so they need no untrusted-memory notice.
-func (s *Skill) buildRecurrenceContext(ctx context.Context, inc store.Incident, trigger string) (spanStart time.Time, prompt string) {
+func (s *Skill) buildRecurrenceContext(ctx context.Context, inc store.Incident, trigger string) (spanStart time.Time, prompt string, stats store.OccurrenceStats) {
 	spanStart = inc.FirstAlertAt
 
 	statsMap, err := s.st.OccurrenceStatsByIncident(ctx, []string{inc.ID})
 	if err != nil {
 		s.logger.Warn("acutetriage: occurrence stats for re-judgment failed", "incident_id", inc.ID, "err", err)
-		return spanStart, ""
+		return spanStart, "", store.OccurrenceStats{}
 	}
-	stats := statsMap[inc.ID]
+	stats = statsMap[inc.ID]
 	if !stats.FirstOccurredAt.IsZero() {
 		spanStart = stats.FirstOccurredAt
 	}
@@ -56,7 +56,7 @@ func (s *Skill) buildRecurrenceContext(ctx context.Context, inc store.Incident, 
 			b.WriteString("- " + o.OccurredAt.UTC().Format(time.RFC3339) + ": " + occurrenceSummary(o) + "\n")
 		}
 	}
-	return spanStart, b.String()
+	return spanStart, b.String(), stats
 }
 
 // occurrenceCadence returns a rounded human phrasing of the average

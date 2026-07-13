@@ -27,7 +27,7 @@ type occCapableSink struct {
 	occ int
 }
 
-func (s *occCapableSink) OnOccurrenceAttached(context.Context, store.Incident, store.OccurrenceStats, bool) error {
+func (s *occCapableSink) OnOccurrenceAttached(context.Context, notify.RecurrenceEvent) error {
 	s.occ++
 	return nil
 }
@@ -38,7 +38,7 @@ func TestMulti_OnOccurrenceAttachedFansOutOnlyToCapableSinks(t *testing.T) {
 	m := notify.NewMulti(slog.Default(), occ, plain)
 
 	if err := m.OnOccurrenceAttached(context.Background(),
-		store.Incident{ID: "i1"}, store.OccurrenceStats{Count: 1}, false); err != nil {
+		notify.RecurrenceEvent{Incident: store.Incident{ID: "i1"}, Stats: store.OccurrenceStats{Count: 1}}); err != nil {
 		t.Fatalf("OnOccurrenceAttached: %v", err)
 	}
 	if occ.occ != 1 {
@@ -156,9 +156,9 @@ func (m *mockThreadStore) SetIncidentSlackThread(_ context.Context, _, ts, ch st
 // one to the main channel (brief summary) and one thread reply (full analysis).
 func TestSlackFiringPostsMessage(t *testing.T) {
 	client := &mockSlackClient{returnTS: "1234567890.000001", returnCh: "C123"}
-	store := &mockThreadStore{err: errors.New("not found")}
+	store := &mockThreadStore{err: store.ErrNotFound}
 
-	n := slack.NewWithClient(client, "#alerts", "low", store, nil)
+	n := slack.NewWithClient(client, "#alerts", "low", "change-gated", store, nil)
 	if err := n.Notify(context.Background(), sampleFinding()); err != nil {
 		t.Fatalf("Notify: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestSlackResolvedWithThread(t *testing.T) {
 	client := &mockSlackClient{returnTS: "1234567890.000002", returnCh: "C123"}
 	store := &mockThreadStore{ts: "1234567890.000001", ch: "C123"}
 
-	n := slack.NewWithClient(client, "#alerts", "low", store, nil)
+	n := slack.NewWithClient(client, "#alerts", "low", "change-gated", store, nil)
 	f := sampleFinding()
 	f.Status = "resolved"
 	if err := n.Notify(context.Background(), f); err != nil {
@@ -198,9 +198,9 @@ func TestSlackResolvedWithThread(t *testing.T) {
 // TestSlackResolvedNoThreadFallback posts a fresh message when no thread is stored.
 func TestSlackResolvedNoThreadFallback(t *testing.T) {
 	client := &mockSlackClient{returnTS: "1234567890.000003", returnCh: "C123"}
-	store := &mockThreadStore{err: errors.New("not found")}
+	store := &mockThreadStore{err: store.ErrNotFound}
 
-	n := slack.NewWithClient(client, "#alerts", "low", store, nil)
+	n := slack.NewWithClient(client, "#alerts", "low", "change-gated", store, nil)
 	f := sampleFinding()
 	f.Status = "resolved"
 	if err := n.Notify(context.Background(), f); err != nil {
@@ -219,9 +219,9 @@ func TestSlackResolvedNoThreadFallback(t *testing.T) {
 // low-severity finding never reaches Slack when min_severity is high.
 func TestSlackFiringSuppressedBelowMinSeverity(t *testing.T) {
 	client := &mockSlackClient{returnTS: "ts", returnCh: "C1"}
-	store := &mockThreadStore{err: errors.New("not found")}
+	store := &mockThreadStore{err: store.ErrNotFound}
 
-	n := slack.NewWithClient(client, "#alerts", "high", store, nil)
+	n := slack.NewWithClient(client, "#alerts", "high", "change-gated", store, nil)
 	f := sampleFinding()
 	f.Severity = "low"
 	if err := n.Notify(context.Background(), f); err != nil {
@@ -237,9 +237,9 @@ func TestSlackFiringSuppressedBelowMinSeverity(t *testing.T) {
 // recorded), the resolution must not leak a fresh card into the channel.
 func TestSlackResolvedNoThreadSuppressedBelowMinSeverity(t *testing.T) {
 	client := &mockSlackClient{returnTS: "ts", returnCh: "C1"}
-	store := &mockThreadStore{err: errors.New("not found")}
+	store := &mockThreadStore{err: store.ErrNotFound}
 
-	n := slack.NewWithClient(client, "#alerts", "high", store, nil)
+	n := slack.NewWithClient(client, "#alerts", "high", "change-gated", store, nil)
 	f := sampleFinding()
 	f.Severity = "low"
 	f.Status = "resolved"
@@ -257,7 +257,7 @@ func TestSlackResolvedWithThreadNotGated(t *testing.T) {
 	client := &mockSlackClient{returnTS: "ts", returnCh: "C1"}
 	store := &mockThreadStore{ts: "1234567890.000001", ch: "C1"}
 
-	n := slack.NewWithClient(client, "#alerts", "high", store, nil)
+	n := slack.NewWithClient(client, "#alerts", "high", "change-gated", store, nil)
 	f := sampleFinding()
 	f.Severity = "low"
 	f.Status = "resolved"
@@ -272,9 +272,9 @@ func TestSlackResolvedWithThreadNotGated(t *testing.T) {
 // TestSlackClientErrorPropagates verifies that a client error is returned.
 func TestSlackClientErrorPropagates(t *testing.T) {
 	client := &mockSlackClient{postErr: errors.New("slack API error")}
-	store := &mockThreadStore{err: errors.New("not found")}
+	store := &mockThreadStore{err: store.ErrNotFound}
 
-	n := slack.NewWithClient(client, "#alerts", "low", store, nil)
+	n := slack.NewWithClient(client, "#alerts", "low", "change-gated", store, nil)
 	err := n.Notify(context.Background(), sampleFinding())
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -302,11 +302,11 @@ func testLogger(buf *bytes.Buffer) *slog.Logger {
 
 func TestMultiCallsBoth(t *testing.T) {
 	client := &mockSlackClient{returnTS: "ts", returnCh: "C1"}
-	store := &mockThreadStore{err: errors.New("not found")}
+	store := &mockThreadStore{err: store.ErrNotFound}
 
 	var out bytes.Buffer
 	sn := stdout.New(&out, nil, true)
-	sk := slack.NewWithClient(client, "#alerts", "low", store, nil)
+	sk := slack.NewWithClient(client, "#alerts", "low", "change-gated", store, nil)
 	var logBuf bytes.Buffer
 	m := notify.NewMulti(testLogger(&logBuf), sn, sk)
 
@@ -438,6 +438,66 @@ func TestMultiResolvedStatusFlows(t *testing.T) {
 	}
 	if !strings.Contains(logBuf.String(), "status=resolved") {
 		t.Errorf("resolved finding should log status=resolved: %s", logBuf.String())
+	}
+}
+
+// TestSlackFiringEditsInPlaceWhenThreadExists verifies a re-judgment (thread
+// already recorded) edits the existing card in place and threads the analysis —
+// it never posts a new card and never overwrites slack_ts (ADR-0019).
+func TestSlackFiringEditsInPlaceWhenThreadExists(t *testing.T) {
+	client := &mockSlackClient{returnTS: "should-not-be-stored", returnCh: "C1"}
+	store := &mockThreadStore{ts: "orig-ts", ch: "C1"}
+
+	n := slack.NewWithClient(client, "#alerts", "low", "change-gated", store, nil)
+	if err := n.Notify(context.Background(), sampleFinding()); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	if client.updateCalls != 1 {
+		t.Errorf("UpdateMessageContext calls = %d, want 1 (edit in place)", client.updateCalls)
+	}
+	if client.postCalls != 1 {
+		t.Errorf("PostMessageContext calls = %d, want 1 (thread reply only)", client.postCalls)
+	}
+	if store.ts != "orig-ts" {
+		t.Errorf("slack_ts = %q, want orig-ts (never overwritten on a re-judgment)", store.ts)
+	}
+}
+
+// TestSlackFiringEditNotReGatedByMinSeverity verifies an update to an
+// already-visible incident is not re-suppressed by min_severity.
+func TestSlackFiringEditNotReGatedByMinSeverity(t *testing.T) {
+	client := &mockSlackClient{returnTS: "x", returnCh: "C1"}
+	store := &mockThreadStore{ts: "orig-ts", ch: "C1"}
+
+	n := slack.NewWithClient(client, "#alerts", "high", "change-gated", store, nil)
+	f := sampleFinding()
+	f.Severity = "low" // below the gate, but the incident already has a card
+	if err := n.Notify(context.Background(), f); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	if client.updateCalls != 1 {
+		t.Errorf("UpdateMessageContext calls = %d, want 1 (in-place edit is never re-gated)", client.updateCalls)
+	}
+}
+
+// TestSlackFiringTransientLookupErrorNotTreatedAsNoThread verifies a non-
+// ErrNotFound error from the thread lookup (e.g. a transient store error) is
+// surfaced as a failure rather than treated as "no card yet" — the latter
+// would post a duplicate card and clobber slack_ts for an incident that
+// already has one.
+func TestSlackFiringTransientLookupErrorNotTreatedAsNoThread(t *testing.T) {
+	client := &mockSlackClient{returnTS: "should-not-post", returnCh: "C1"}
+	store := &mockThreadStore{err: errors.New("database is locked")}
+
+	n := slack.NewWithClient(client, "#alerts", "low", "change-gated", store, nil)
+	if err := n.Notify(context.Background(), sampleFinding()); err == nil {
+		t.Fatal("Notify returned nil on a transient store error, want the error surfaced")
+	}
+	if client.postCalls != 0 {
+		t.Errorf("PostMessageContext calls = %d, want 0 (must not post a duplicate card)", client.postCalls)
+	}
+	if client.updateCalls != 0 {
+		t.Errorf("UpdateMessageContext calls = %d, want 0", client.updateCalls)
 	}
 }
 
