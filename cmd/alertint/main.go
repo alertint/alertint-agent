@@ -766,7 +766,7 @@ func buildNotifier(cfg *config.Config, st *store.Store, auditor *audit.Auditor, 
 	}
 	if cfg.Notify.Slack.Enabled {
 		if token, err := cfg.SlackBotToken(); err == nil && token != "" {
-			nn = append(nn, notifyslack.New(token, cfg.Notify.Slack.Channel, cfg.Notify.Slack.MinSeverity, "", st, auditor))
+			nn = append(nn, notifyslack.New(token, cfg.Notify.Slack.Channel, cfg.Notify.Slack.MinSeverity, cfg.Notify.Slack.RecurrenceMode, st, auditor))
 			sinks = append(sinks, "slack")
 			slackWired = true
 		}

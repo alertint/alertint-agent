@@ -316,6 +316,10 @@ type SlackConfig struct {
 	BotTokenEnv string `yaml:"bot_token_env"` // env var holding the xoxb- bot token
 	Channel     string `yaml:"channel"`       // e.g. "#alerts" or "C1234567890"
 	MinSeverity string `yaml:"min_severity"`  // low | medium | high (default low = post everything)
+	// RecurrenceMode gates how recurrence-collapse re-fires resurface in Slack
+	// (ADR-0020): "change-gated" (default) broadcasts real-world-change rungs +
+	// milestones; "off" is the count-bump-only escape. Empty = change-gated.
+	RecurrenceMode string `yaml:"recurrence_mode"` // change-gated | off
 }
 
 // Defaults returns a Config populated with v1 defaults. The result is not
@@ -360,8 +364,9 @@ func Defaults() Config {
 		Notify: NotifyConfig{
 			Stdout: true,
 			Slack: SlackConfig{
-				Enabled:     false,
-				MinSeverity: "low",
+				Enabled:        false,
+				MinSeverity:    "low",
+				RecurrenceMode: "change-gated",
 			},
 		},
 		MCP: MCPConfig{
@@ -709,6 +714,9 @@ func (c *Config) validateNotify() []string {
 		if !validSeverity(c.Notify.Slack.MinSeverity) {
 			errs = append(errs, fmt.Sprintf("notify.slack.min_severity %q must be one of low, medium, high", c.Notify.Slack.MinSeverity))
 		}
+		if !validRecurrenceMode(c.Notify.Slack.RecurrenceMode) {
+			errs = append(errs, fmt.Sprintf("notify.slack.recurrence_mode %q must be one of change-gated, off", c.Notify.Slack.RecurrenceMode))
+		}
 	}
 	if !c.Notify.Stdout && !c.Notify.Slack.Enabled {
 		errs = append(errs, "at least one notifier must be enabled (notify.stdout or notify.slack.enabled)")
@@ -1028,6 +1036,16 @@ func requireEnv(name, field string) (string, error) {
 func validSeverity(s string) bool {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "", "low", "medium", "high":
+		return true
+	}
+	return false
+}
+
+// validRecurrenceMode accepts the two v1 recurrence modes plus empty (which the
+// notifier normalizes to change-gated).
+func validRecurrenceMode(s string) bool {
+	switch s {
+	case "", "change-gated", "off":
 		return true
 	}
 	return false

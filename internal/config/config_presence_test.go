@@ -241,3 +241,28 @@ func TestDefaults_MinSeverityLow(t *testing.T) {
 		t.Errorf("default notify.slack.min_severity = %q, want low", got)
 	}
 }
+
+func TestValidateNotify_RecurrenceMode(t *testing.T) {
+	cfg := validBaseConfig(t)
+	cfg.Notify.Slack.Enabled = true
+	cfg.Notify.Slack.BotTokenEnv = "SLACK_BOT_TOKEN"
+	cfg.Notify.Slack.Channel = "#alerts"
+
+	for _, ok := range []string{"", "change-gated", "off"} {
+		cfg.Notify.Slack.RecurrenceMode = ok
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("recurrence_mode %q should validate, got: %v", ok, err)
+		}
+	}
+	cfg.Notify.Slack.RecurrenceMode = "loud"
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "recurrence_mode") {
+		t.Errorf("recurrence_mode=loud must fail validation, got: %v", err)
+	}
+}
+
+func TestDefaults_RecurrenceModeChangeGated(t *testing.T) {
+	if got := Defaults().Notify.Slack.RecurrenceMode; got != "change-gated" {
+		t.Errorf("default notify.slack.recurrence_mode = %q, want change-gated", got)
+	}
+}
