@@ -11,6 +11,7 @@ package slack
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ import (
 	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/notify"
 	"github.com/alertint/alertint-agent/internal/severity"
+	"github.com/alertint/alertint-agent/internal/store"
 )
 
 // ThreadStore persists Slack thread coordinates (ts + channel) keyed by incident ID.
@@ -114,9 +116,17 @@ func (n *Notifier) notifyFiring(ctx context.Context, f notify.Finding) error {
 	// (new finding + recurrence line) and thread the fresh analysis — never post
 	// a new card, never overwrite slack_ts (ADR-0019). An update to an
 	// already-visible incident is not re-gated by min_severity (mirrors resolve).
+	// A non-ErrNotFound lookup error is NOT treated as "no card yet": doing so
+	// would post a duplicate card and clobber slack_ts for an incident that
+	// already has one, so the error is surfaced instead (mirrors
+	// OnOccurrenceAttached's errors.Is(err, store.ErrNotFound) check).
 	if n.store != nil {
-		if ts, ch, err := n.store.GetIncidentSlackThread(ctx, f.IncidentID); err == nil {
+		ts, ch, err := n.store.GetIncidentSlackThread(ctx, f.IncidentID)
+		switch {
+		case err == nil:
 			return n.updateFiringInPlace(ctx, f, ts, ch)
+		case !errors.Is(err, store.ErrNotFound):
+			return fmt.Errorf("channel %s: firing thread lookup: %w", n.channel, err)
 		}
 	}
 	// No thread recorded: first firing (or a previously gate-suppressed incident

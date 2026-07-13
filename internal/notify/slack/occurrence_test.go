@@ -227,11 +227,10 @@ func TestOccurrence_UpdateErrorNotRetried(t *testing.T) {
 	if err == nil {
 		t.Fatal("OnOccurrenceAttached returned nil on a Slack error, want the error surfaced")
 	}
-	// One attempt, no retry loop.
-	client.mu.Lock()
-	updated := len(client.posts) // updateErr path increments nothing; ensure no storm
-	client.mu.Unlock()
-	_ = updated
+	// One attempt, no retry loop, no fallback post.
+	if posts := client.postCount(); posts != 0 {
+		t.Errorf("posts = %d, want 0 (no fallback post on an update error)", posts)
+	}
 }
 
 func TestOccurrenceEditBlocks_RenderCountAndDrill(t *testing.T) {
@@ -260,9 +259,12 @@ func TestMilestoneHit_Schedule(t *testing.T) {
 }
 
 // recurEvent builds a RecurrenceEvent for the slack broadcast tests.
+// recurEvent's Incident.FirstAlertAt (5h before at) predates Stats.FirstOccurredAt
+// (3h before at) — the incident fired once, then went quiet before recurring —
+// so any span computed off the wrong anchor is caught by an exact assertion.
 func recurEvent(trigger string, count int, at time.Time) notify.RecurrenceEvent {
 	return notify.RecurrenceEvent{
-		Incident: store.Incident{ID: "inc12345678", GroupKey: "k", Summary: "DiskFull", RootCause: "disk 95%"},
+		Incident: store.Incident{ID: "inc12345678", GroupKey: "k", Summary: "DiskFull", RootCause: "disk 95%", FirstAlertAt: at.Add(-5 * time.Hour)},
 		Stats:    store.OccurrenceStats{Count: count, FirstOccurredAt: at.Add(-3 * time.Hour), LastSeen: at},
 		Trigger:  trigger,
 	}
@@ -288,6 +290,27 @@ func TestRecurrence_SeverityBroadcasts(t *testing.T) {
 	}
 	if !strings.Contains(p.blocks, "Escalated") || !strings.Contains(p.blocks, "CRITICAL") || !strings.Contains(p.blocks, "why: severity") {
 		t.Errorf("severity broadcast blocks missing rung text:\n%s", p.blocks)
+	}
+}
+
+// TestRecurrence_SeverityBroadcastNoPriorLabel covers a baseline where every
+// current member's severity is off the ladder (empty/unrecognized), so
+// memberBaselines never records a prior label: the broadcast must drop the
+// "(was ...)" clause instead of rendering a blank prior severity.
+func TestRecurrence_SeverityBroadcastNoPriorLabel(t *testing.T) {
+	client := newFakeSlack(t)
+	n, _, _ := occNotifier(t, client, &fakeThreadStore{})
+	ev := recurEvent("severity", 1, time.Unix(1_000_000, 0).UTC())
+	ev.PriorSeverity, ev.NewSeverity = "", "critical"
+	if err := n.OnOccurrenceAttached(context.Background(), ev); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	p := client.lastPost()
+	if strings.Contains(p.blocks, "(was )") {
+		t.Errorf("severity broadcast rendered a blank prior severity:\n%s", p.blocks)
+	}
+	if !strings.Contains(p.blocks, "Escalated") || !strings.Contains(p.blocks, "CRITICAL") {
+		t.Errorf("severity broadcast missing escalation text:\n%s", p.blocks)
 	}
 }
 
@@ -351,6 +374,12 @@ func TestRecurrence_MilestoneBroadcasts(t *testing.T) {
 	p := client.lastPost()
 	if !p.broadcast || !strings.Contains(p.blocks, "Still recurring") || !strings.Contains(p.blocks, "why: milestone") {
 		t.Errorf("milestone broadcast wrong: broadcast=%v\n%s", p.broadcast, p.blocks)
+	}
+	// Span must anchor on the incident's true start (FirstAlertAt, 5h before
+	// now per recurEvent), not the first occurrence row (FirstOccurredAt, only
+	// 3h before now) — the latter would understate the incident's real age.
+	if !strings.Contains(p.blocks, "over 5h") {
+		t.Errorf("milestone broadcast span anchored on the wrong start time, want \"over 5h\":\n%s", p.blocks)
 	}
 }
 

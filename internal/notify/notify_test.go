@@ -156,7 +156,7 @@ func (m *mockThreadStore) SetIncidentSlackThread(_ context.Context, _, ts, ch st
 // one to the main channel (brief summary) and one thread reply (full analysis).
 func TestSlackFiringPostsMessage(t *testing.T) {
 	client := &mockSlackClient{returnTS: "1234567890.000001", returnCh: "C123"}
-	store := &mockThreadStore{err: errors.New("not found")}
+	store := &mockThreadStore{err: store.ErrNotFound}
 
 	n := slack.NewWithClient(client, "#alerts", "low", "change-gated", store, nil)
 	if err := n.Notify(context.Background(), sampleFinding()); err != nil {
@@ -198,7 +198,7 @@ func TestSlackResolvedWithThread(t *testing.T) {
 // TestSlackResolvedNoThreadFallback posts a fresh message when no thread is stored.
 func TestSlackResolvedNoThreadFallback(t *testing.T) {
 	client := &mockSlackClient{returnTS: "1234567890.000003", returnCh: "C123"}
-	store := &mockThreadStore{err: errors.New("not found")}
+	store := &mockThreadStore{err: store.ErrNotFound}
 
 	n := slack.NewWithClient(client, "#alerts", "low", "change-gated", store, nil)
 	f := sampleFinding()
@@ -219,7 +219,7 @@ func TestSlackResolvedNoThreadFallback(t *testing.T) {
 // low-severity finding never reaches Slack when min_severity is high.
 func TestSlackFiringSuppressedBelowMinSeverity(t *testing.T) {
 	client := &mockSlackClient{returnTS: "ts", returnCh: "C1"}
-	store := &mockThreadStore{err: errors.New("not found")}
+	store := &mockThreadStore{err: store.ErrNotFound}
 
 	n := slack.NewWithClient(client, "#alerts", "high", "change-gated", store, nil)
 	f := sampleFinding()
@@ -237,7 +237,7 @@ func TestSlackFiringSuppressedBelowMinSeverity(t *testing.T) {
 // recorded), the resolution must not leak a fresh card into the channel.
 func TestSlackResolvedNoThreadSuppressedBelowMinSeverity(t *testing.T) {
 	client := &mockSlackClient{returnTS: "ts", returnCh: "C1"}
-	store := &mockThreadStore{err: errors.New("not found")}
+	store := &mockThreadStore{err: store.ErrNotFound}
 
 	n := slack.NewWithClient(client, "#alerts", "high", "change-gated", store, nil)
 	f := sampleFinding()
@@ -272,7 +272,7 @@ func TestSlackResolvedWithThreadNotGated(t *testing.T) {
 // TestSlackClientErrorPropagates verifies that a client error is returned.
 func TestSlackClientErrorPropagates(t *testing.T) {
 	client := &mockSlackClient{postErr: errors.New("slack API error")}
-	store := &mockThreadStore{err: errors.New("not found")}
+	store := &mockThreadStore{err: store.ErrNotFound}
 
 	n := slack.NewWithClient(client, "#alerts", "low", "change-gated", store, nil)
 	err := n.Notify(context.Background(), sampleFinding())
@@ -302,7 +302,7 @@ func testLogger(buf *bytes.Buffer) *slog.Logger {
 
 func TestMultiCallsBoth(t *testing.T) {
 	client := &mockSlackClient{returnTS: "ts", returnCh: "C1"}
-	store := &mockThreadStore{err: errors.New("not found")}
+	store := &mockThreadStore{err: store.ErrNotFound}
 
 	var out bytes.Buffer
 	sn := stdout.New(&out, nil, true)
@@ -477,6 +477,27 @@ func TestSlackFiringEditNotReGatedByMinSeverity(t *testing.T) {
 	}
 	if client.updateCalls != 1 {
 		t.Errorf("UpdateMessageContext calls = %d, want 1 (in-place edit is never re-gated)", client.updateCalls)
+	}
+}
+
+// TestSlackFiringTransientLookupErrorNotTreatedAsNoThread verifies a non-
+// ErrNotFound error from the thread lookup (e.g. a transient store error) is
+// surfaced as a failure rather than treated as "no card yet" — the latter
+// would post a duplicate card and clobber slack_ts for an incident that
+// already has one.
+func TestSlackFiringTransientLookupErrorNotTreatedAsNoThread(t *testing.T) {
+	client := &mockSlackClient{returnTS: "should-not-post", returnCh: "C1"}
+	store := &mockThreadStore{err: errors.New("database is locked")}
+
+	n := slack.NewWithClient(client, "#alerts", "low", "change-gated", store, nil)
+	if err := n.Notify(context.Background(), sampleFinding()); err == nil {
+		t.Fatal("Notify returned nil on a transient store error, want the error surfaced")
+	}
+	if client.postCalls != 0 {
+		t.Errorf("PostMessageContext calls = %d, want 0 (must not post a duplicate card)", client.postCalls)
+	}
+	if client.updateCalls != 0 {
+		t.Errorf("UpdateMessageContext calls = %d, want 0", client.updateCalls)
 	}
 }
 

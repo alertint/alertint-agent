@@ -188,6 +188,14 @@ func (n *Notifier) broadcastMilestone(ctx context.Context, ev notify.RecurrenceE
 func rungHeadline(ev notify.RecurrenceEvent) (headline, rung string) {
 	switch ev.Trigger {
 	case "severity":
+		// PriorSeverity is "" when every current member's severity is off the
+		// ladder (empty or unrecognized) — memberBaselines only records a label
+		// when a member's rank strictly exceeds the running max. Drop the "(was
+		// ...)" clause rather than render a blank prior value.
+		if ev.PriorSeverity == "" {
+			return fmt.Sprintf(":arrow_up: *Escalated* — severity now %s",
+				strings.ToUpper(ev.NewSeverity)), "severity"
+		}
 		return fmt.Sprintf(":arrow_up: *Escalated* — severity now %s (was %s)",
 			strings.ToUpper(ev.NewSeverity), strings.ToUpper(ev.PriorSeverity)), "severity"
 	case "new_alertname":
@@ -204,7 +212,12 @@ func rungHeadline(ev notify.RecurrenceEvent) (headline, rung string) {
 // the average cadence — all computed facts from occurrence timestamps.
 func milestoneHeadline(ev notify.RecurrenceEvent, occurrences int) string {
 	head := fmt.Sprintf(":repeat: *Still recurring* — ×%d", occurrences)
-	if span := ev.Stats.LastSeen.Sub(ev.Stats.FirstOccurredAt); span > 0 {
+	// Anchor the span on the incident's true start (FirstAlertAt), not the first
+	// occurrence row (FirstOccurredAt) — a re-fire can arrive long after the
+	// original firing, and FirstOccurredAt would understate how long the
+	// incident has actually been open. Matches the resolved card's convention
+	// (resolvedMainBlocks: duration anchored on f.FirstAlertAt).
+	if span := ev.Stats.LastSeen.Sub(ev.Incident.FirstAlertAt); span > 0 {
 		head += " over " + formatDuration(span)
 	}
 	if cad := averageCadence(ev.Stats); cad != "" {

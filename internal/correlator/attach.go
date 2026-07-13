@@ -72,6 +72,13 @@ type attachInputs struct {
 type attachDecision struct {
 	action  attachAction
 	trigger string
+
+	// cadenceInterval / cadenceMedian carry the delta decideAttach's cadence
+	// check already computed, so the impure half doesn't re-walk episodeTimes
+	// and re-sort intervals a second time purely for display. Zero unless
+	// trigger == "cadence".
+	cadenceInterval time.Duration
+	cadenceMedian   time.Duration
 }
 
 // recurrenceDelta carries the display-only "why" facts from the impure decision
@@ -108,8 +115,8 @@ func decideAttach(in attachInputs) attachDecision {
 	if in.incomingAlertname != "" && !in.knownAlertnames[in.incomingAlertname] {
 		return attachDecision{action: actionRejudge, trigger: "new_alertname"}
 	}
-	if cadenceTriggered(in.now, in.episodeTimes) {
-		return attachDecision{action: actionRejudge, trigger: "cadence"}
+	if newInterval, median, ok := cadenceDelta(in.now, in.episodeTimes); ok {
+		return attachDecision{action: actionRejudge, trigger: "cadence", cadenceInterval: newInterval, cadenceMedian: median}
 	}
 	if in.occurrencesSinceJudged+1 >= in.occurrenceCap {
 		return attachDecision{action: actionRejudge, trigger: "cap"}
@@ -122,20 +129,14 @@ func decideAttach(in attachInputs) attachDecision {
 	return attachDecision{action: actionAttach, trigger: "none"}
 }
 
-// cadenceTriggered fires when the newest inter-episode interval is below
-// one-eighth of the key's trailing median over its last 20 intervals — a slow
-// key suddenly firing fast (R6). Inactive until 3 intervals exist (cold start);
-// severity, new-alertname, and the ceiling cover that regime.
-func cadenceTriggered(now time.Time, episodeTimes []time.Time) bool {
-	_, _, ok := cadenceDelta(now, episodeTimes)
-	return ok
-}
-
-// cadenceDelta returns the newest inter-episode interval and the trailing-median
-// interval, and whether the cadence trigger fires (newest*8 < median). ok is
-// false (both durations zero) until >=3 historical intervals exist. Split from
-// cadenceTriggered so the impure attach path can render the "faster — now ~Xm
-// (was ~Ym)" delta without recomputing inside decideAttach (which stays pure).
+// cadenceDelta reports whether the cadence trigger fires — the newest
+// inter-episode interval is below one-eighth of the key's trailing median over
+// its last 20 intervals (R6): a slow key suddenly firing fast. ok is false
+// (both durations zero) until >=3 historical intervals exist (cold start);
+// severity, new-alertname, and the ceiling cover that regime. decideAttach
+// calls this once and carries the (newInterval, median) it returns forward on
+// attachDecision, so the impure half never needs to recompute it purely for
+// display.
 func cadenceDelta(now time.Time, episodeTimes []time.Time) (newInterval, median time.Duration, ok bool) {
 	if len(episodeTimes) < 4 { // need >= 3 historical intervals
 		return 0, 0, false
@@ -280,7 +281,7 @@ func (c *Correlator) maybeAttachOccurrence(ctx context.Context, a store.Alert, g
 	case "new_alertname":
 		delta.newAlertname = a.Labels["alertname"]
 	case "cadence":
-		delta.newInterval, delta.priorMedian, _ = cadenceDelta(now, episodeTimes)
+		delta.newInterval, delta.priorMedian = decision.cadenceInterval, decision.cadenceMedian
 	}
 
 	switch decision.action {
