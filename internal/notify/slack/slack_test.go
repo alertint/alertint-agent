@@ -137,6 +137,40 @@ func TestDrillBannerOnAllSurfaces(t *testing.T) {
 	}
 }
 
+func TestFiringCardBlocks_RecurrenceLine(t *testing.T) {
+	f := testFinding()
+	if s := blocksJSON(t, firingCardBlocks(f)); strings.Contains(s, "recurred") {
+		t.Errorf("first-firing card must have no recurrence line:\n%s", s)
+	}
+	f.Recurrence = &notify.Recurrence{Episodes: 7, LastSeen: time.Date(2026, 7, 8, 2, 15, 0, 0, time.UTC)}
+	s := blocksJSON(t, firingCardBlocks(f))
+	if !strings.Contains(s, "recurred ×7") {
+		t.Errorf("re-judgment card missing recurrence line:\n%s", s)
+	}
+}
+
+func TestResolvedMainBlocks_RecurrenceSummary(t *testing.T) {
+	f := testFinding()
+	f.Status = "resolved"
+	if s := blocksJSON(t, resolvedMainBlocks(f)); strings.Contains(s, "recurring ×") {
+		t.Errorf("non-recurring resolve must not claim recurrence:\n%s", s)
+	}
+	f.Recurrence = &notify.Recurrence{Episodes: 14, LastSeen: time.Now()}
+	s := blocksJSON(t, resolvedMainBlocks(f))
+	if !strings.Contains(s, "recurring ×14 over") {
+		t.Errorf("recurring resolve missing summary:\n%s", s)
+	}
+}
+
+func TestResolvedMainBlocks_SingleEpisodeNoSummary(t *testing.T) {
+	f := testFinding()
+	f.Status = "resolved"
+	f.Recurrence = &notify.Recurrence{Episodes: 1, LastSeen: time.Now()}
+	if s := blocksJSON(t, resolvedMainBlocks(f)); strings.Contains(s, "recurring ×") {
+		t.Errorf("Episodes<=1 must not render a recurrence summary:\n%s", s)
+	}
+}
+
 func TestEvidenceLine(t *testing.T) {
 	cases := []struct {
 		name string

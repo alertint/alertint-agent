@@ -109,17 +109,25 @@ func (n *Notifier) Notify(ctx context.Context, f notify.Finding) error {
 }
 
 func (n *Notifier) notifyFiring(ctx context.Context, f notify.Finding) error {
-	// Severity gate: below-threshold findings never reach the channel (stdout
-	// still emits them). Skipping records an audit row so the suppression is
-	// visible in the hash-chained trail, not silent.
+	// A recorded thread means the incident already has a card: this Notify is a
+	// re-judgment update, not a first firing. Edit the existing card in place
+	// (new finding + recurrence line) and thread the fresh analysis — never post
+	// a new card, never overwrite slack_ts (ADR-0019). An update to an
+	// already-visible incident is not re-gated by min_severity (mirrors resolve).
+	if n.store != nil {
+		if ts, ch, err := n.store.GetIncidentSlackThread(ctx, f.IncidentID); err == nil {
+			return n.updateFiringInPlace(ctx, f, ts, ch)
+		}
+	}
+	// No thread recorded: first firing (or a previously gate-suppressed incident
+	// now worth showing). Apply the severity gate, then post a new card.
 	if n.belowMinSeverity(f) {
 		n.auditSkipped(ctx, f)
 		return nil
 	}
-	// Post brief main-channel message: headline + root cause only.
 	ch, ts, err := n.client.PostMessageContext(ctx, n.channel,
 		slacklib.MsgOptionText(firingFallback(f), false),
-		slacklib.MsgOptionBlocks(firingMainBlocks(f)...),
+		slacklib.MsgOptionBlocks(firingCardBlocks(f)...),
 	)
 	if err != nil {
 		return fmt.Errorf("channel %s: post message: %w", n.channel, err)
@@ -127,7 +135,6 @@ func (n *Notifier) notifyFiring(ctx context.Context, f notify.Finding) error {
 	if n.store != nil && ts != "" {
 		_ = n.store.SetIncidentSlackThread(ctx, f.IncidentID, ts, ch)
 	}
-	// Post full analysis detail immediately as a thread reply.
 	if ts != "" {
 		_, _, _ = n.client.PostMessageContext(ctx, ch,
 			slacklib.MsgOptionText(firingFallback(f), false),
@@ -136,6 +143,32 @@ func (n *Notifier) notifyFiring(ctx context.Context, f notify.Finding) error {
 		)
 	}
 	n.audit(ctx, f.IncidentID, "firing")
+	return nil
+}
+
+// updateFiringInPlace edits the incident's existing card with the re-judgment's
+// fresh finding + recurrence line and threads the new analysis as a plain reply
+// (the "why" broadcast, if any, already fired from OnOccurrenceAttached). It
+// preserves slack_ts — the card is the incident's durable anchor.
+func (n *Notifier) updateFiringInPlace(ctx context.Context, f notify.Finding, originalTS, ch string) error {
+	channel := ch
+	if channel == "" {
+		channel = n.channel
+	}
+	if _, _, _, err := n.client.UpdateMessageContext(ctx, channel, originalTS,
+		slacklib.MsgOptionText(firingFallback(f), false),
+		slacklib.MsgOptionBlocks(firingCardBlocks(f)...),
+	); err != nil {
+		return fmt.Errorf("channel %s: update firing card: %w", channel, err)
+	}
+	if _, _, err := n.client.PostMessageContext(ctx, channel,
+		slacklib.MsgOptionText(firingFallback(f), false),
+		slacklib.MsgOptionTS(originalTS),
+		slacklib.MsgOptionBlocks(firingDetailBlocks(f)...),
+	); err != nil {
+		return fmt.Errorf("channel %s: post thread reply: %w", channel, err)
+	}
+	n.audit(ctx, f.IncidentID, "rejudge")
 	return nil
 }
 
@@ -430,11 +463,14 @@ func resolvedMainBlocks(f notify.Finding) []slacklib.Block {
 			nil, nil,
 		))
 	}
+	ctxText := fmt.Sprintf("Incident `%s` · resolved after %s · %s UTC",
+		shortID(f.IncidentID), duration, f.AnalyzedAt.UTC().Format("15:04"))
+	if f.Recurrence != nil && f.Recurrence.Episodes > 1 {
+		ctxText = fmt.Sprintf("Incident `%s` · resolved after recurring ×%d over %s · %s UTC",
+			shortID(f.IncidentID), f.Recurrence.Episodes, duration, f.AnalyzedAt.UTC().Format("15:04"))
+	}
 	blocks = append(blocks, slacklib.NewContextBlock("",
-		slacklib.NewTextBlockObject(slacklib.MarkdownType,
-			fmt.Sprintf("Incident `%s` · resolved after %s · %s UTC",
-				shortID(f.IncidentID), duration, f.AnalyzedAt.UTC().Format("15:04")),
-			false, false),
+		slacklib.NewTextBlockObject(slacklib.MarkdownType, ctxText, false, false),
 	))
 	return blocks
 }

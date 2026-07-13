@@ -441,6 +441,45 @@ func TestMultiResolvedStatusFlows(t *testing.T) {
 	}
 }
 
+// TestSlackFiringEditsInPlaceWhenThreadExists verifies a re-judgment (thread
+// already recorded) edits the existing card in place and threads the analysis —
+// it never posts a new card and never overwrites slack_ts (ADR-0019).
+func TestSlackFiringEditsInPlaceWhenThreadExists(t *testing.T) {
+	client := &mockSlackClient{returnTS: "should-not-be-stored", returnCh: "C1"}
+	store := &mockThreadStore{ts: "orig-ts", ch: "C1"}
+
+	n := slack.NewWithClient(client, "#alerts", "low", "change-gated", store, nil)
+	if err := n.Notify(context.Background(), sampleFinding()); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	if client.updateCalls != 1 {
+		t.Errorf("UpdateMessageContext calls = %d, want 1 (edit in place)", client.updateCalls)
+	}
+	if client.postCalls != 1 {
+		t.Errorf("PostMessageContext calls = %d, want 1 (thread reply only)", client.postCalls)
+	}
+	if store.ts != "orig-ts" {
+		t.Errorf("slack_ts = %q, want orig-ts (never overwritten on a re-judgment)", store.ts)
+	}
+}
+
+// TestSlackFiringEditNotReGatedByMinSeverity verifies an update to an
+// already-visible incident is not re-suppressed by min_severity.
+func TestSlackFiringEditNotReGatedByMinSeverity(t *testing.T) {
+	client := &mockSlackClient{returnTS: "x", returnCh: "C1"}
+	store := &mockThreadStore{ts: "orig-ts", ch: "C1"}
+
+	n := slack.NewWithClient(client, "#alerts", "high", "change-gated", store, nil)
+	f := sampleFinding()
+	f.Severity = "low" // below the gate, but the incident already has a card
+	if err := n.Notify(context.Background(), f); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	if client.updateCalls != 1 {
+		t.Errorf("UpdateMessageContext calls = %d, want 1 (in-place edit is never re-gated)", client.updateCalls)
+	}
+}
+
 // TestFindingJSONDrillKey: the stdout JSON contract carries drill only when
 // set (omitempty), so existing consumers see no noise on real findings.
 func TestFindingJSONDrillKey(t *testing.T) {
