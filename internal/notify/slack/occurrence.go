@@ -22,9 +22,9 @@ import (
 const occEditThrottle = 60 * time.Second
 
 // recurrenceMode selects how recurrence re-fires resurface (ADR-0020).
-// change-gated broadcasts real-world-change rungs + milestones; off is the
-// count-bump-only escape (no broadcasts). Enum so a future digest/every mode is
-// a non-breaking addition.
+// change-gated posts thread replies for real-world-change rungs + milestones
+// (thread-only — never sent to the channel); off is the count-bump-only escape
+// (no replies). Enum so a future digest/every mode is a non-breaking addition.
 type recurrenceMode string
 
 const (
@@ -53,11 +53,13 @@ type pendingEdit struct {
 
 // OnOccurrenceAttached surfaces one recurrence-collapse attach. Single-writer
 // rule (ADR-0019): a plain attach (trigger "none") edits the card in place
-// (throttled) and may broadcast a milestone; a re-judging attach (severity/
-// new_alertname/cadence/cap/ceiling) leaves the card to the re-judgment's
-// Notify, broadcasts the "why" for a real-world change, and cancels any pending
-// count-edit so a stale coalesced render can't overwrite the fresh finding. A
-// gate-suppressed incident (no thread) is a silent no-op. Zero LLM tokens.
+// (throttled) and may post a milestone thread reply; a re-judging attach
+// (severity/new_alertname/cadence/cap/ceiling) leaves the card to the
+// re-judgment's Notify, posts the "why" for a real-world change as a thread
+// reply, and cancels any pending count-edit so a stale coalesced render can't
+// overwrite the fresh finding. All recurrence replies stay in the thread —
+// nothing is sent to the channel. A gate-suppressed incident (no thread) is a
+// silent no-op. Zero LLM tokens.
 func (n *Notifier) OnOccurrenceAttached(ctx context.Context, ev notify.RecurrenceEvent) error {
 	if n.store == nil {
 		return nil
@@ -81,17 +83,17 @@ func (n *Notifier) OnOccurrenceAttached(ctx context.Context, ev notify.Recurrenc
 		if n.recurrenceMode == recurrenceOff {
 			return nil
 		}
-		return n.broadcastRung(ctx, ev, ts, ch)
+		return n.postRungReply(ctx, ev, ts, ch)
 	}
 
-	// Plain attach: edit the card in place (throttled), then broadcast iff the
-	// episode count crossed a milestone. The card edit runs in every mode.
+	// Plain attach: edit the card in place (throttled), then post a thread reply
+	// iff the episode count crossed a milestone. The card edit runs in every mode.
 	occurrences := ev.Stats.Episodes()
 	if err := n.editOccurrenceCard(ctx, ev, ts, ch); err != nil {
 		return err
 	}
 	if n.recurrenceMode != recurrenceOff && milestoneHit(occurrences) {
-		return n.broadcastMilestone(ctx, ev, ts, ch, occurrences)
+		return n.postMilestoneReply(ctx, ev, ts, ch, occurrences)
 	}
 	return nil
 }
@@ -135,25 +137,25 @@ func (n *Notifier) cancelPendingOcc(incidentID string) {
 	}
 }
 
-// postBroadcast posts a channel-broadcast thread reply: a copy lands in the
-// channel (resurfacing the incident) while staying attached to the one thread.
-func (n *Notifier) postBroadcast(ctx context.Context, channel, ts, fallback string, blocks []slacklib.Block) error {
+// postThreadReply posts a recurrence update as a plain thread reply. It stays
+// inside the incident's thread — deliberately never sent to the channel
+// (no reply_broadcast), so recurrence can't spam the channel.
+func (n *Notifier) postThreadReply(ctx context.Context, channel, ts, fallback string, blocks []slacklib.Block) error {
 	if channel == "" {
 		channel = n.channel
 	}
 	if _, _, err := n.client.PostMessageContext(ctx, channel,
 		slacklib.MsgOptionText(fallback, false),
 		slacklib.MsgOptionTS(ts),
-		slacklib.MsgOptionBroadcast(),
 		slacklib.MsgOptionBlocks(blocks...),
 	); err != nil {
-		return fmt.Errorf("channel %s: broadcast recurrence: %w", channel, err)
+		return fmt.Errorf("channel %s: recurrence thread reply: %w", channel, err)
 	}
 	return nil
 }
 
-// broadcastRung emits the self-explaining "why" for a real-world-change re-fire.
-func (n *Notifier) broadcastRung(ctx context.Context, ev notify.RecurrenceEvent, ts, ch string) error {
+// postRungReply emits the self-explaining "why" for a real-world-change re-fire.
+func (n *Notifier) postRungReply(ctx context.Context, ev notify.RecurrenceEvent, ts, ch string) error {
 	headline, rung := rungHeadline(ev)
 	if headline == "" {
 		return nil // unknown trigger: nothing to say (defensive)
@@ -166,12 +168,12 @@ func (n *Notifier) broadcastRung(ctx context.Context, ev notify.RecurrenceEvent,
 		recurrenceFooter(ev, occ, rung),
 	}
 	fallback := fmt.Sprintf("%srecurred ×%d (why: %s)", drillPlainMarker(ev.Drill), occ, rung)
-	return n.postBroadcast(ctx, ch, ts, fallback, blocks)
+	return n.postThreadReply(ctx, ch, ts, fallback, blocks)
 }
 
-// broadcastMilestone emits the "still recurring" nudge on a plain re-fire that
+// postMilestoneReply emits the "still recurring" nudge on a plain re-fire that
 // crossed the milestone schedule.
-func (n *Notifier) broadcastMilestone(ctx context.Context, ev notify.RecurrenceEvent, ts, ch string, occurrences int) error {
+func (n *Notifier) postMilestoneReply(ctx context.Context, ev notify.RecurrenceEvent, ts, ch string, occurrences int) error {
 	blocks := []slacklib.Block{
 		slacklib.NewSectionBlock(
 			slacklib.NewTextBlockObject(slacklib.MarkdownType, drillMarker(ev.Drill)+milestoneHeadline(ev, occurrences), false, false),
@@ -179,11 +181,11 @@ func (n *Notifier) broadcastMilestone(ctx context.Context, ev notify.RecurrenceE
 		recurrenceFooter(ev, occurrences, "milestone"),
 	}
 	fallback := fmt.Sprintf("%sstill recurring ×%d (why: milestone)", drillPlainMarker(ev.Drill), occurrences)
-	return n.postBroadcast(ctx, ch, ts, fallback, blocks)
+	return n.postThreadReply(ctx, ch, ts, fallback, blocks)
 }
 
 // rungHeadline renders the self-explaining "why" headline for a real-world-change
-// broadcast and the rung token used in the footer. Pure function of the event's
+// reply and the rung token used in the footer. Pure function of the event's
 // trigger + delta facts — zero LLM, no store reads.
 func rungHeadline(ev notify.RecurrenceEvent) (headline, rung string) {
 	switch ev.Trigger {
@@ -226,8 +228,8 @@ func milestoneHeadline(ev notify.RecurrenceEvent, occurrences int) string {
 	return head
 }
 
-// recurrenceFooter is the required "why" line on every broadcast: it literally
-// names the rung that sorted the re-fire into the channel.
+// recurrenceFooter is the required "why" line on every recurrence reply: it
+// literally names the rung that produced the re-fire surface.
 func recurrenceFooter(ev notify.RecurrenceEvent, occurrences int, rung string) slacklib.Block {
 	return slacklib.NewContextBlock("",
 		slacklib.NewTextBlockObject(slacklib.MarkdownType,

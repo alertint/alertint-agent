@@ -54,7 +54,7 @@ type Recurrence struct {
 
 // RecurrenceEvent carries everything a sink needs to render a recurrence-collapse
 // attach: the incident, its derived occurrence stats, the trigger rung, and the
-// per-trigger delta facts that name the "why" on a broadcast. The correlator
+// per-trigger delta facts that name the "why" on a thread reply. The correlator
 // builds it in the impure half of the attach path, where the baselines, incoming
 // labels, and episode series are already in hand. Delta fields are zero except
 // for the trigger they belong to.

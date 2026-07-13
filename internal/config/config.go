@@ -317,8 +317,9 @@ type SlackConfig struct {
 	Channel     string `yaml:"channel"`       // e.g. "#alerts" or "C1234567890"
 	MinSeverity string `yaml:"min_severity"`  // low | medium | high (default low = post everything)
 	// RecurrenceMode gates how recurrence-collapse re-fires resurface in Slack
-	// (ADR-0020): "change-gated" (default) broadcasts real-world-change rungs +
-	// milestones; "off" is the count-bump-only escape. Empty = change-gated.
+	// (ADR-0020): "change-gated" (default) posts thread replies for
+	// real-world-change rungs + milestones (thread-only, never sent to the
+	// channel); "off" is the count-bump-only escape. Empty = change-gated.
 	RecurrenceMode string `yaml:"recurrence_mode"` // change-gated | off
 }
 
