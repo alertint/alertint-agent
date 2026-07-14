@@ -84,7 +84,7 @@ func (s *Store) IncidentsInWindow(ctx context.Context, since time.Time,
 		           LIMIT 1
 		       ), '') AS severity
 		FROM incidents ` + where + `
-		ORDER BY last_alert_at DESC`
+		ORDER BY last_alert_at DESC` // #nosec G202 -- severityRankSQL is a static const, where is built from static templates and const labels only; all runtime values bound via ? placeholders in topArgs
 	topArgs := args
 	if limit > 0 {
 		topQuery += " LIMIT ?"
