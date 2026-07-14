@@ -87,6 +87,12 @@ type Config struct {
 	// the prometheus config section. Prometheus above is the client; this is the
 	// single-deadline budget for the multi-scope fetch.
 	MetricParams MetricParams
+	// Verification carries the falsification-round tunables (ADR-0021/0022). When
+	// Enabled, a non-short-circuit triage runs a floor + model-proposed
+	// verification round after the draft verdict and re-judges it in a second LLM
+	// call. The zero value (Enabled=false) is the kill switch: one call, no round,
+	// prompt byte-identical to the pre-feature triage.
+	Verification VerificationParams
 }
 
 // Skill orchestrates the full acute-triage pipeline for a single ready
@@ -259,42 +265,42 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	// Produce the analysis: from the matched rule (short-circuit) or from the LLM
 	// with the pack-selected system prompt, the span-anchored enrichments, and
 	// (on a re-judgment) the recurrence context prepended.
-	raw, metrics, enrichment, changes, sentry, memory, err := s.analysis(ctx, inc, alerts, decision, pack, packJSON, p.spanStart, p.recurrence)
+	ar, err := s.analysis(ctx, inc, alerts, decision, pack, packJSON, p.spanStart, p.recurrence)
 	if err != nil {
 		return err
 	}
 
 	var resp llmResponse
-	if err := json.Unmarshal(raw, &resp); err != nil {
+	if err := json.Unmarshal(ar.raw, &resp); err != nil {
 		return fmt.Errorf("acutetriage: parse llm response: %w", err)
 	}
 	clampConfidence(&resp.Confidence)
-	s.applyEvidenceCap(&resp, decision, metrics, enrichment, changes, sentry, inc.ID)
+	s.applyEvidenceCap(&resp, decision, ar.metrics, ar.logs, ar.changes, ar.sentry, inc.ID)
 
 	// Persist output, including the log-enrichment snapshot so the evidence pack
 	// can replay exactly what the model saw (empty on the short-circuit /
 	// logs-disabled path → stored NULL).
-	outputJSON := string(raw)
+	outputJSON := string(ar.raw)
 	sources := map[string]any{}
-	if metrics != nil {
-		sources["metrics"] = metrics
+	if ar.metrics != nil {
+		sources["metrics"] = ar.metrics
 	}
-	if enrichment != nil {
-		sources["logs"] = enrichment
+	if ar.logs != nil {
+		sources["logs"] = ar.logs
 	}
-	if changes != nil {
-		sources["changes"] = changes
+	if ar.changes != nil {
+		sources["changes"] = ar.changes
 	}
-	if sentry != nil {
+	if ar.sentry != nil {
 		// Already distilled + toggle-applied in FetchSentry (KTD2/KTD8), so the
 		// at-rest envelope never holds a raw frame or untoggled PII.
-		sources["sentry"] = sentry
+		sources["sentry"] = ar.sentry
 	}
-	if memory != nil {
+	if ar.memory != nil {
 		// Already the allowlisted recall (memoryView is the redaction boundary),
 		// so the at-rest envelope carries only distilled prior-finding refs, never
 		// whole findings or raw labels_json. Persist-as-rendered (ADR-0001).
-		sources["memory"] = memory
+		sources["memory"] = ar.memory
 	}
 	enrichmentJSON := marshalEnrichments(sources, s.logger, inc.ID)
 	if err := p.persist(ctx,
@@ -325,7 +331,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	// Memory bookkeeping (M2): maintain the contradiction-decay marks from the
 	// model's verdict, reset on a replacement, and audit the recall. Best-effort —
 	// a bookkeeping failure never fails a triage that already persisted its finding.
-	s.applyMemoryBookkeeping(ctx, inc, memory, resp.MemoryVerdict, p.rejudge)
+	s.applyMemoryBookkeeping(ctx, inc, ar.memory, resp.MemoryVerdict, p.rejudge)
 
 	// Check if all alerts are resolved to determine the finding's status label.
 	incidentStatus := "ongoing"
@@ -357,10 +363,10 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 			AlertCount:          inc.AlertCount,
 			FirstAlertAt:        inc.FirstAlertAt,
 			AnalyzedAt:          time.Now().UTC(),
-			OutputJSON:          raw,
+			OutputJSON:          ar.raw,
 			Status:              incidentStatus,
 			Drill:               isDrill(alerts),
-			Evidence:            buildEvidenceSummary(decision.ShortCircuit, metrics, enrichment, changes, sentry),
+			Evidence:            buildEvidenceSummary(decision.ShortCircuit, ar.metrics, ar.logs, ar.changes, ar.sentry),
 		}
 		if p.rejudge && p.recurrenceEpisodes > 1 && !p.recurrenceLastSeen.IsZero() {
 			f.Recurrence = &notify.Recurrence{Episodes: p.recurrenceEpisodes, LastSeen: p.recurrenceLastSeen}
@@ -385,7 +391,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.analyzed", analyzed)
 	}
 
-	s.auditEnrichmentDigests(ctx, inc.ID, metrics, enrichment, changes, sentry)
+	s.auditEnrichmentDigests(ctx, inc.ID, ar.metrics, ar.logs, ar.changes, ar.sentry)
 
 	ruleID := "none"
 	if decision.Rule != nil {
@@ -452,17 +458,34 @@ func (s *Skill) auditEnrichmentDigests(ctx context.Context, incidentID string, m
 	}
 }
 
+// analysisResult carries everything the first analysis pass produced: the raw
+// finding JSON, each enrichment snapshot (nil on the short-circuit path), and —
+// for the LLM path — the exact system/user prompts sent, kept so the
+// verification round can build the call-2 continuation on a byte-identical
+// prefix. shortCircuit is true when the finding came from a matched known-issue
+// rule (no LLM call, no verification).
+type analysisResult struct {
+	raw          json.RawMessage
+	metrics      *MetricEnrichment
+	logs         *LogEnrichment
+	changes      *ChangeEnrichment
+	sentry       *SentryEnrichment
+	memory       *MemoryEnrichment
+	system, user string // prompts, kept for the call-2 continuation
+	shortCircuit bool
+}
+
 // analysis produces the raw finding JSON, either synthesized from a
 // matched known-issue rule (short-circuit, no LLM call) or from the LLM
 // with the pack-selected system prompt. On the LLM path it also returns the
 // metric and log-enrichment snapshots (nil on the short-circuit path) so the
 // caller can persist exactly what the model saw and judge the evidence basis
 // for the deterministic confidence cap.
-func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store.Alert, decision rules.Decision, pack EvidencePack, packJSON []byte, spanStart time.Time, recurrence string) (json.RawMessage, *MetricEnrichment, *LogEnrichment, *ChangeEnrichment, *SentryEnrichment, *MemoryEnrichment, error) {
+func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store.Alert, decision rules.Decision, pack EvidencePack, packJSON []byte, spanStart time.Time, recurrence string) (analysisResult, error) {
 	if decision.ShortCircuit {
 		raw, err := shortCircuitResponse(decision, alerts)
 		if err != nil {
-			return nil, nil, nil, nil, nil, nil, fmt.Errorf("acutetriage: short-circuit response: %w", err)
+			return analysisResult{}, fmt.Errorf("acutetriage: short-circuit response: %w", err)
 		}
 		if s.auditor != nil {
 			_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.short_circuited", map[string]any{
@@ -470,7 +493,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 				"rule_id":     decision.Rule.ID,
 			})
 		}
-		return raw, nil, nil, nil, nil, nil, nil
+		return analysisResult{raw: raw, shortCircuit: true}, nil
 	}
 
 	// spanStart anchors the enrichment window on the collapse span: the original
@@ -508,13 +531,14 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 	// captured by persist-as-rendered; in `shadow` mode it only audits and leaves
 	// the render byte-identical. A no-op when disabled or there are no candidates.
 	s.maybeClassify(ctx, inc, memory)
-	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment, changes, sentry, memory, VerificationParams{})
+	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment, changes, sentry, memory, s.cfg.Verification)
 	// On a re-judgment, prepend the deterministic recurrence context so the model
 	// judges the recurrence with its history rather than as a first-time event.
 	if recurrence != "" {
 		userPrompt = recurrence + "\n\n" + userPrompt
 	}
-	comp, err := s.llm.Complete(ctx, s.systemPrompt(decision, len(alerts)), userPrompt, RequiredKeys)
+	system := s.systemPrompt(decision, len(alerts))
+	comp, err := s.llm.Complete(ctx, system, userPrompt, RequiredKeys)
 	if err != nil {
 		s.logger.Error("llm failed", "incident", inc.ID, "err", err)
 		if s.auditor != nil {
@@ -523,7 +547,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 				"error":       err.Error(),
 			})
 		}
-		return nil, metrics, enrichment, changes, sentry, memory, fmt.Errorf("acutetriage: llm: %w", err)
+		return analysisResult{}, fmt.Errorf("acutetriage: llm: %w", err)
 	}
 	// Action-trail success line, sibling to "llm failed" above: emitted by the
 	// incident-aware caller so it carries the incident ID and the usage the
@@ -535,7 +559,16 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		"tokens_out", comp.OutputTokens,
 		"incident", inc.ID,
 	)
-	return comp.Raw, metrics, enrichment, changes, sentry, memory, nil
+	return analysisResult{
+		raw:     comp.Raw,
+		metrics: metrics,
+		logs:    enrichment,
+		changes: changes,
+		sentry:  sentry,
+		memory:  memory,
+		system:  system,
+		user:    userPrompt,
+	}, nil
 }
 
 // systemPrompt picks the analysis prompt: the rule-selected template when

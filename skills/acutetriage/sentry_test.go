@@ -599,15 +599,15 @@ func TestAnalysis_ShortCircuitSkipsSentry(t *testing.T) {
 		RootCauseHint: "boom",
 	}
 	alerts := alertsWithLabels(map[string]string{"service": "checkout"})
-	raw, mets, logEnr, chg, sen, mem, err := s.analysis(context.Background(), store.Incident{ID: "i1"}, alerts, decision, EvidencePack{}, []byte("{}"), time.Time{}, "")
+	ar, err := s.analysis(context.Background(), store.Incident{ID: "i1"}, alerts, decision, EvidencePack{}, []byte("{}"), time.Time{}, "")
 	if err != nil {
 		t.Fatalf("analysis: %v", err)
 	}
-	if len(raw) == 0 {
+	if len(ar.raw) == 0 {
 		t.Error("short-circuit should still synthesize a finding")
 	}
-	if mets != nil || logEnr != nil || chg != nil || sen != nil || mem != nil {
-		t.Errorf("short-circuit must return nil enrichments, got sentry=%v memory=%v", sen, mem)
+	if ar.metrics != nil || ar.logs != nil || ar.changes != nil || ar.sentry != nil || ar.memory != nil {
+		t.Errorf("short-circuit must return nil enrichments, got sentry=%v memory=%v", ar.sentry, ar.memory)
 	}
 	if fk.listCalls != 0 {
 		t.Errorf("short-circuit must make no Sentry call, got %d", fk.listCalls)
