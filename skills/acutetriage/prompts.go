@@ -228,7 +228,10 @@ const MaxMetadataOnlyConfidence = 0.6
 // memoryPresent is true the directive says so explicitly — a recalled prior's
 // confidence must not be smuggled into today's evidence-free re-fire (R18/R20).
 func renderEvidenceBasis(b *strings.Builder, metrics *MetricEnrichment, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, memoryPresent bool) {
-	if !annotationsOnlyBasis(metrics, logs, changes, sentry) {
+	// Call 1 renders this before any verification round exists, so it passes nil:
+	// the prompt-side directive is unchanged by verification. Only the
+	// deterministic post-call cap (applyEvidenceCap) sees the executed round.
+	if !annotationsOnlyBasis(metrics, logs, changes, sentry, nil) {
 		return
 	}
 	b.WriteString("\n\nEvidence basis: ANNOTATIONS ONLY — no live logs, metrics, " +
@@ -259,8 +262,12 @@ func metricsDegraded(metrics *MetricEnrichment) bool {
 // absence. This is the single condition that triggers the metadata-only
 // confidence cap; both the prompt directive (renderEvidenceBasis) and the
 // deterministic backstop (applyEvidenceCap) route through it so they never drift.
-func annotationsOnlyBasis(metrics *MetricEnrichment, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment) bool {
-	return !hasLiveEvidence(metrics, logs, changes, sentry) && !metricsDegraded(metrics)
+// A fetched verification up_ratio/promql observation counts as live evidence
+// (verificationLive) — a real read of the infrastructure, R17 — so it lifts the
+// basis too; incidents_in_window never does (own SQLite bookkeeping). ver is nil
+// on the prompt side (the round has not run yet), non-nil at the post-call cap.
+func annotationsOnlyBasis(metrics *MetricEnrichment, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, ver *VerificationEnrichment) bool {
+	return !hasLiveEvidence(metrics, logs, changes, sentry) && !metricsDegraded(metrics) && !verificationLive(ver)
 }
 
 // hasLiveEvidence reports whether any enrichment source returned actual data

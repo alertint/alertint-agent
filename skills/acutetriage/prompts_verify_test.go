@@ -78,7 +78,7 @@ func TestUserPromptVerificationInstructionAbsentWhenDisabled(t *testing.T) {
 	}
 }
 
-// R16: with verification enabled, memory verdict request is NOT in call 1…
+// R16: with verification enabled, memory verdict request is NOT in call 1.
 func TestMemoryVerdictMovesToCallTwo(t *testing.T) {
 	m := strongRecallFixture()
 	c1 := UserPrompt(basePack(), "{}", nil, nil, nil, nil, m, VerificationParams{Enabled: true, MaxQueries: 4})

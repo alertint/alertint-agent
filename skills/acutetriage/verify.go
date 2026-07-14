@@ -69,6 +69,15 @@ type VerificationEnrichment struct {
 	Rounds  []VerificationRound `json:"rounds"`
 }
 
+// Verification-round outcomes (VerificationEnrichment.Outcome). degraded flags a
+// finding that shipped without a full falsification pass — the floor could not
+// fetch, or the re-judge call was lost — and drives Finding.Unverified.
+const (
+	verifyOutcomeSupported = "supported"
+	verifyOutcomeRevised   = "revised"
+	verifyOutcomeDegraded  = "degraded"
+)
+
 // broadScopeKeys are the shared-label keys wide enough to define a peer scope
 // (grill 2026-07-14): the floor drops narrow identity (pod/container/instance)
 // so the ratio covers peers, not just the incident's own targets.
@@ -183,11 +192,8 @@ const defaultWindowMinutes = 60
 // query (R2/R3). Never returns an error — a query's own failure lands in its
 // Outcome/Result, it never aborts the round or the ones after it.
 //
-// logger is only ever nil today because this task's own tests are its only
-// caller; Task 6 wires the real skill logger through here once the pipeline
-// calls it (mirrors rankSeries's limit param, metrics.go:170).
-//
-//nolint:unparam // see above
+// The pipeline (verifyAndRejudge) passes the real skill logger; the runner tests
+// pass nil (defaulted to slog.Default below).
 func runVerification(ctx context.Context, prom metricQuerier, state verifyStateReader,
 	params VerificationParams, inc store.Incident, alerts []store.Alert,
 	draft DraftRef, modelQueries []VerificationQuery, now time.Time, logger *slog.Logger,

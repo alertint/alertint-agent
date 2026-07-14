@@ -294,6 +294,15 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 			Classifier:        classifierClient,
 			ClassifierMode:    string(cfg.Memory.Classifier.Mode),
 			ClassifierTimeout: time.Duration(cfg.Memory.Classifier.TimeoutSeconds) * time.Second,
+			// Verification round (falsification pass, ADR-0021/0022). MaxSeries shares
+			// the metric-enrichment server-side bound (prometheus.max_series) — model
+			// promql runs under the identical cap.
+			Verification: acutetriage.VerificationParams{
+				Enabled:             cfg.VerificationEnabled(),
+				MaxQueries:          cfg.Triage.Verification.MaxQueries,
+				QueryTimeoutSeconds: cfg.Triage.Verification.QueryTimeoutSeconds,
+				MaxSeries:           cfg.Prometheus.MaxSeries,
+			},
 		},
 		st, llmClient, auditor, notifier, logger,
 	)
