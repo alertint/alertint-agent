@@ -118,6 +118,29 @@ func TestParseVerificationPlanMalformed(t *testing.T) {
 	}
 }
 
+// A bare-array verification value — {"verification":[...]} without the
+// {"queries":[...]} wrapper — parses the same as the wrapped shape. This is
+// the shape a model following the plan instruction most literally emits
+// (seen in production on claude-haiku-4-5 under v0.8.0); it must not degrade
+// to floor-only.
+func TestParseVerificationPlanBareArray(t *testing.T) {
+	raw := json.RawMessage(`{"analysis_name":"x","verification":[
+		{"kind":"promql","expr":"up{job=\"db\"}","why":"peers down too?"},
+		{"kind":"incidents_in_window","params":{"window_minutes":30},"why":"anything else firing?"}]}`)
+	got := parseVerificationPlan(raw, 4, nil, "inc1")
+	if len(got) != 2 {
+		t.Fatalf("want 2 queries from bare-array shape, got %d: %+v", len(got), got)
+	}
+	if got[0].Kind != kindPromQL || got[1].Kind != kindIncidentsInWindow {
+		t.Fatalf("kinds mismatch: %+v", got)
+	}
+	for _, q := range got {
+		if q.Source != "model" {
+			t.Fatalf("bare-array query mislabeled: %+v", q)
+		}
+	}
+}
+
 // Cap + closed kind set: unknown kinds dropped, list capped at maxQueries (R3/R4).
 func TestParseVerificationPlanCapAndKinds(t *testing.T) {
 	raw := json.RawMessage(`{"verification":{"queries":[

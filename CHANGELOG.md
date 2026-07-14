@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Model-proposed verification queries were silently dropped when the model
+  emitted the `verification` key as a bare query list instead of the
+  `{"queries": [...]}` envelope — the plan parser rejected the whole block and
+  every such round fell back to floor-only checks (observed on
+  `claude-haiku-4-5` immediately after 0.8.0 went live). The prompt now spells
+  out the exact envelope shape and the parser accepts both shapes, so targeted
+  disprove-queries — including the mandatory ones behind the scope-inflation
+  guard — actually run.
+
 ## [0.8.0] - 2026-07-14
 
 ### Added

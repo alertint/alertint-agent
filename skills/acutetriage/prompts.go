@@ -167,8 +167,9 @@ func renderVerificationInstruction(b *strings.Builder, verify VerificationParams
 		return
 	}
 	fmt.Fprintf(b, "\n\n## Verification plan (required key)\n"+
-		"After forming your verdict, add a \"verification\" key to your JSON: up to %d "+
-		"read-only queries that could DISPROVE your root cause. Allowed kinds:\n"+
+		"After forming your verdict, add a \"verification\" key to your JSON, shaped exactly:\n"+
+		`  "verification": {"queries": [<up to %d queries>]}`+"\n"+
+		"Each query is a read-only check that could DISPROVE your root cause. Allowed kinds:\n"+
 		`  {"kind":"promql","expr":"<instant PromQL>","why":"<what this would refute>"}`+"\n"+
 		`  {"kind":"incidents_in_window","params":{"window_minutes":60},"why":"..."}`+"\n"+
 		"A root cause claiming scope wider than the member alerts (cluster-wide, zonal, "+
