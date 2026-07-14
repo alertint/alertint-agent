@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-14
+
 ### Added
 
 - Verification round: triage now falsifies its own draft verdict before persisting —
@@ -424,7 +426,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single static binary** — pure-Go SQLite (no CGO), no external runtime dependencies.
   Multi-platform builds: `linux/amd64`, `linux/arm64`, `darwin/arm64`.
 
-[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.7.5...HEAD
+[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/alertint/alertint-agent/compare/v0.7.5...v0.8.0
 [0.7.5]: https://github.com/alertint/alertint-agent/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/alertint/alertint-agent/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/alertint/alertint-agent/compare/v0.7.2...v0.7.3
