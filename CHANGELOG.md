@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Verification round: triage now falsifies its own draft verdict before persisting —
+  a deterministic floor (peer-scope up ratio + cross-incident scan) plus up to 4
+  model-chosen read-only checks run on every judged incident, and a second LLM pass
+  revises the verdict against the results. Degraded rounds mark the finding
+  "unverified" and can never raise confidence. Config: `triage.verification`
+  (default on; `enabled: false` restores single-call triage).
+
 ## [0.7.5] - 2026-07-13
 
 ### Changed
