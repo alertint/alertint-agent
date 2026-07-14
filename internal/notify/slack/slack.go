@@ -434,6 +434,13 @@ func firingDetailBlocks(f notify.Finding) []slacklib.Block {
 		nil, nil,
 	))
 
+	if f.Unverified {
+		blocks = append(blocks, slacklib.NewContextBlock("",
+			slacklib.NewTextBlockObject(slacklib.MarkdownType,
+				"⚠ unverified — checks unavailable", false, false),
+		))
+	}
+
 	if len(f.CorrelationFindings) > 0 {
 		var sb strings.Builder
 		sb.WriteString("*Correlation findings*\n")

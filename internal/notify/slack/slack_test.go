@@ -195,3 +195,21 @@ func TestEvidenceLine(t *testing.T) {
 		}
 	}
 }
+
+func TestFiringDetailBlocks_UnverifiedCaveat(t *testing.T) {
+	f := testFinding()
+
+	// Test with Unverified: true
+	f.Unverified = true
+	s := blocksJSON(t, firingDetailBlocks(f))
+	if !strings.Contains(s, "unverified — checks unavailable") {
+		t.Errorf("unverified finding missing caveat in detail blocks:\n%s", s)
+	}
+
+	// Test with Unverified: false (default)
+	f.Unverified = false
+	s = blocksJSON(t, firingDetailBlocks(f))
+	if strings.Contains(s, "unverified") {
+		t.Errorf("verified finding must not contain unverified caveat:\n%s", s)
+	}
+}

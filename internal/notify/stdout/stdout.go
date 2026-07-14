@@ -50,6 +50,7 @@ type line struct {
 	Ts      time.Time      `json:"ts"`
 	Kind    string         `json:"kind"`
 	Finding notify.Finding `json:"finding"`
+	Caveat  string         `json:"caveat,omitempty"`
 }
 
 // Notify writes f as a single JSON line to w when verbose; in all cases it
@@ -61,6 +62,9 @@ func (n *Notifier) Notify(ctx context.Context, f notify.Finding) error {
 			Ts:      n.now(),
 			Kind:    "finding",
 			Finding: f,
+		}
+		if f.Unverified {
+			l.Caveat = "⚠ unverified — checks unavailable"
 		}
 		b, err := json.Marshal(l)
 		if err != nil {

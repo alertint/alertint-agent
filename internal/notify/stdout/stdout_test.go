@@ -50,3 +50,44 @@ func TestOnOccurrenceAttached_WritesLineAlways(t *testing.T) {
 		t.Errorf("trigger = %v, want cadence", line["trigger"])
 	}
 }
+
+func TestNotify_UnverifiedCaveat(t *testing.T) {
+	// Test with Unverified: true
+	var buf bytes.Buffer
+	n := New(&buf, nil, true)
+	f := notify.Finding{
+		IncidentID:   "test-incident",
+		GroupKey:     "test=group",
+		AnalysisName: "Test Analysis",
+		Severity:     "high",
+		Confidence:   0.85,
+		Unverified:   true,
+	}
+
+	if err := n.Notify(context.Background(), f); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+
+	var line map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &line); err != nil {
+		t.Fatalf("line not valid JSON: %v (%q)", err, buf.String())
+	}
+	if line["caveat"] != "⚠ unverified — checks unavailable" {
+		t.Errorf("caveat = %v, want '⚠ unverified — checks unavailable'", line["caveat"])
+	}
+
+	// Test with Unverified: false
+	buf.Reset()
+	f.Unverified = false
+	if err := n.Notify(context.Background(), f); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+
+	line = make(map[string]any) // create a new map for the second test
+	if err := json.Unmarshal(buf.Bytes(), &line); err != nil {
+		t.Fatalf("line not valid JSON: %v (%q)", err, buf.String())
+	}
+	if caveat, exists := line["caveat"]; exists && caveat != nil && caveat != "" {
+		t.Errorf("caveat = %v, want empty/nil for verified finding", caveat)
+	}
+}
