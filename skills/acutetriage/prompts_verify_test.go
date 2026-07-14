@@ -69,6 +69,17 @@ func TestUserPromptVerificationInstruction(t *testing.T) {
 	}
 }
 
+// The instruction must spell out the exact envelope shape the parser expects
+// — "verification": {"queries": [...]} — not just describe the key as "up to
+// N queries". Without it, a model following the text literally emits a bare
+// array and the plan degrades to floor-only (v0.8.0 production regression).
+func TestUserPromptVerificationInstructionShowsEnvelopeShape(t *testing.T) {
+	got := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil, VerificationParams{Enabled: true, MaxQueries: 4})
+	if !strings.Contains(got, `"verification": {"queries": [`) {
+		t.Fatalf("instruction must show the exact envelope shape:\n%s", got)
+	}
+}
+
 // Disabled: no verification instruction at all — the kill switch must be
 // total, not just byte-identical for this one fixture.
 func TestUserPromptVerificationInstructionAbsentWhenDisabled(t *testing.T) {

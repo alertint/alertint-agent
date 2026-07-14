@@ -3,6 +3,7 @@
 package acutetriage
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -118,9 +119,23 @@ func floorPlan(alerts []store.Alert) []VerificationQuery {
 // the model's draft JSON response — just the "verification.queries" slice;
 // every other draft key is ignored here.
 type verificationPlanEnvelope struct {
-	Verification *struct {
-		Queries []VerificationQuery `json:"queries"`
-	} `json:"verification"`
+	Verification *verificationPlan `json:"verification"`
+}
+
+// verificationPlan accepts both shapes models emit for the "verification"
+// value: the documented envelope {"queries":[...]} and a bare [...] list
+// (seen in production under v0.8.0 — a strict object-only unmarshal degraded
+// every such plan to floor-only).
+type verificationPlan struct {
+	Queries []VerificationQuery `json:"queries"`
+}
+
+func (p *verificationPlan) UnmarshalJSON(data []byte) error {
+	if trimmed := bytes.TrimSpace(data); len(trimmed) > 0 && trimmed[0] == '[' {
+		return json.Unmarshal(trimmed, &p.Queries)
+	}
+	type plain verificationPlan // drop the method, avoid recursion
+	return json.Unmarshal(data, (*plain)(p))
 }
 
 // parseVerificationPlan parses and sanitizes the model's own proposed
