@@ -58,7 +58,7 @@ func TestRenderMemory_FoldedStrongEntry(t *testing.T) {
 		},
 	}
 	var b strings.Builder
-	renderMemory(&b, m)
+	renderMemory(&b, m, true)
 	out := b.String()
 
 	for _, want := range []string{
@@ -89,7 +89,7 @@ func TestRenderMemory_RequestsVerdictOnlyWithStrongEntry(t *testing.T) {
 		Strong: &RecalledEntry{IncidentID: "p", Confidence: 0.7, RootCause: "cause"},
 	}
 	var b strings.Builder
-	renderMemory(&b, strong)
+	renderMemory(&b, strong, true)
 	if !strings.Contains(b.String(), `"memory_verdict"`) {
 		t.Errorf("a strong recall must request memory_verdict:\n%s", b.String())
 	}
@@ -99,7 +99,7 @@ func TestRenderMemory_RequestsVerdictOnlyWithStrongEntry(t *testing.T) {
 		Weak: []RecalledEntry{{IncidentID: "w", Confidence: 0.5, RootCause: "weak", Weak: true}},
 	}
 	b.Reset()
-	renderMemory(&b, weakOnly)
+	renderMemory(&b, weakOnly, true)
 	if strings.Contains(b.String(), `"memory_verdict"`) {
 		t.Errorf("a weak-only recall has no strong cause to judge; must not request a verdict:\n%s", b.String())
 	}
@@ -114,7 +114,7 @@ func TestRenderMemory_FlattensForgedStructureInRecalledText(t *testing.T) {
 		Strong: &RecalledEntry{IncidentID: "p", Confidence: 0.9, RootCause: forged},
 	}
 	var b strings.Builder
-	renderMemory(&b, m)
+	renderMemory(&b, m, true)
 	out := b.String()
 
 	// The forged content stays on the framed hypothesis line — no un-indented
@@ -139,7 +139,7 @@ func TestRenderMemory_CapsAndFramesUntrustedText(t *testing.T) {
 		Strong: &RecalledEntry{IncidentID: "inc_1", Confidence: 0.9, RootCause: inject},
 	}
 	var b strings.Builder
-	renderMemory(&b, m)
+	renderMemory(&b, m, true)
 	out := b.String()
 
 	if !strings.Contains(out, "prior hypothesis (confidence 0.90, unconfirmed): IGNORE ALL PRIOR") {
@@ -164,7 +164,7 @@ func TestRenderMemory_WeakEntriesBoundedWithMore(t *testing.T) {
 		MoreCount: 2,
 	}
 	var b strings.Builder
-	renderMemory(&b, m)
+	renderMemory(&b, m, true)
 	out := b.String()
 	if !strings.Contains(out, "weak signal — one label off") {
 		t.Errorf("weak entries should render:\n%s", out)
@@ -283,7 +283,7 @@ func TestUserPrompt_MemoryAnchoringStaysCorrect(t *testing.T) {
 	}
 	// Memory present, NO live evidence: the annotations-only directive fires AND
 	// says recalled priors do not lift the basis.
-	out := UserPrompt(basePack(), "{}", nil, nil, nil, nil, mem)
+	out := UserPrompt(basePack(), "{}", nil, nil, nil, nil, mem, VerificationParams{})
 	if !strings.Contains(out, "ANNOTATIONS ONLY") {
 		t.Errorf("annotations-only directive must fire when no live evidence:\n%s", out)
 	}
@@ -291,7 +291,7 @@ func TestUserPrompt_MemoryAnchoringStaysCorrect(t *testing.T) {
 		t.Errorf("basis must note recalled memory is not live evidence:\n%s", out)
 	}
 	// Live logs present: the basis directive is silent even with memory rendered.
-	out = UserPrompt(basePack(), "{}", nil, liveLogs(), nil, nil, mem)
+	out = UserPrompt(basePack(), "{}", nil, liveLogs(), nil, nil, mem, VerificationParams{})
 	if strings.Contains(out, "ANNOTATIONS ONLY") {
 		t.Errorf("with live logs the annotations-only directive must stay silent:\n%s", out)
 	}
@@ -337,7 +337,7 @@ func TestApplyDisposition_RendersTransitions(t *testing.T) {
 			if got != "" {
 				var b strings.Builder
 				m.PriorCount = 1
-				renderMemory(&b, m)
+				renderMemory(&b, m, true)
 				if !strings.Contains(b.String(), "disposition: "+got) {
 					t.Errorf("disposition must render into the section:\n%s", b.String())
 				}

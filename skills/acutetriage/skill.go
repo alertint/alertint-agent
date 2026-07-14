@@ -508,7 +508,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 	// captured by persist-as-rendered; in `shadow` mode it only audits and leaves
 	// the render byte-identical. A no-op when disabled or there are no candidates.
 	s.maybeClassify(ctx, inc, memory)
-	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment, changes, sentry, memory)
+	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment, changes, sentry, memory, VerificationParams{})
 	// On a re-judgment, prepend the deterministic recurrence context so the model
 	// judges the recurrence with its history rather than as a first-time event.
 	if recurrence != "" {

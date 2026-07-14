@@ -341,8 +341,12 @@ func recalledFrom(pf store.PriorFinding, weak, superseded bool) RecalledEntry {
 // strong entry, and the weak entries — each framed as an unconfirmed hypothesis
 // and length-capped. The "latest Xd ago" phrasing was fixed at fetch time
 // (m.LatestAgo). A nil section renders nothing (the prompt stays byte-identical
-// to a non-memory triage).
-func renderMemory(b *strings.Builder, m *MemoryEnrichment) {
+// to a non-memory triage). requestVerdict gates the memory_verdict request
+// below: false when verification is enabled (R16) — the request moves to
+// callTwoPrompt, since call 2 is where the model re-judges with real evidence
+// in hand rather than its own unverified draft — true on the kill-switch path,
+// where the verdict stays in call 1 exactly as before this task.
+func renderMemory(b *strings.Builder, m *MemoryEnrichment, requestVerdict bool) {
 	if m == nil {
 		return
 	}
@@ -371,7 +375,7 @@ func renderMemory(b *strings.Builder, m *MemoryEnrichment) {
 	// only when there is a folded strong entry to judge, so the marks it routes
 	// have a target. Without this request the model never emits the key and the
 	// decay loop is inert.
-	if m.Strong != nil {
+	if requestVerdict && m.Strong != nil {
 		b.WriteString("\n\nAfter weighing this incident's own evidence, add a \"memory_verdict\" " +
 			"field to your JSON response judging the folded prior hypothesis above: \"confirms\" if " +
 			"this incident's evidence supports that root cause, \"refutes\" if the evidence points to a " +

@@ -515,17 +515,21 @@ func verificationLive(v *VerificationEnrichment) bool {
 }
 
 // renderVerificationResults appends the round's computed-facts section for
-// call 2: one entry per query (floor first, in Queries order) naming its
-// source/kind and why, followed by the SAME Result string runVerification
-// already rendered, flattened, and capped (persist-as-rendered, R8/R13) — this
-// function invents no new text, it only assembles what each VerificationQuery
-// already carries. A nil round (verification disabled, or never ran) renders
-// nothing, so the prompt stays byte-identical to a non-verification triage.
+// call 2 (Task 5's callTwoPrompt is the sole caller): the full "## Verification
+// results (computed, read-only)" header, then one entry per query (floor
+// first, in Queries order) naming its source/kind and why, followed by the
+// SAME Result string runVerification already rendered, flattened, and capped
+// (persist-as-rendered, R8/R13) — this function invents no new text beyond
+// the header, it only assembles what each VerificationQuery already carries.
+// The caller owns no header of its own — writing one there too would
+// duplicate this one. A nil round (verification disabled, or never ran)
+// renders nothing, so the prompt stays byte-identical to a non-verification
+// triage.
 func renderVerificationResults(b *strings.Builder, r *VerificationRound) {
 	if r == nil || len(r.Queries) == 0 {
 		return
 	}
-	b.WriteString("\n\n## Verification results")
+	b.WriteString("\n\n## Verification results (computed, read-only)")
 	for _, q := range r.Queries {
 		fmt.Fprintf(b, "\n\n- [%s/%s]", q.Source, q.Kind)
 		if q.Why != "" {

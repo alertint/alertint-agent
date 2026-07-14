@@ -23,7 +23,7 @@ func liveLogs() *LogEnrichment {
 // model to hedge causal direction and lower confidence.
 func TestUserPrompt_AnnotationsOnlyRendersCalibration(t *testing.T) {
 	// Every enrichment absent → annotations-only.
-	out := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil)
+	out := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil, VerificationParams{})
 	if !strings.Contains(out, "ANNOTATIONS ONLY") {
 		t.Fatalf("annotations-only incident must carry the evidence-basis directive: %s", out)
 	}
@@ -40,14 +40,14 @@ func TestUserPrompt_AnnotationsOnlyRendersCalibration(t *testing.T) {
 // alone is not live evidence.
 func TestUserPrompt_EmptyLogsNoteIsStillAnnotationsOnly(t *testing.T) {
 	e := &LogEnrichment{Source: "loki", Note: "no usable log selector for this incident"}
-	out := UserPrompt(basePack(), "{}", nil, e, nil, nil, nil)
+	out := UserPrompt(basePack(), "{}", nil, e, nil, nil, nil, VerificationParams{})
 	if !strings.Contains(out, "ANNOTATIONS ONLY") {
 		t.Fatalf("empty (note-only) logs must still trigger the calibration directive: %s", out)
 	}
 }
 
 func TestUserPrompt_WithLiveLogsNoCalibration(t *testing.T) {
-	out := UserPrompt(basePack(), "{}", nil, liveLogs(), nil, nil, nil)
+	out := UserPrompt(basePack(), "{}", nil, liveLogs(), nil, nil, nil, VerificationParams{})
 	if strings.Contains(out, "ANNOTATIONS ONLY") {
 		t.Fatalf("live log lines present — calibration directive must be omitted: %s", out)
 	}
@@ -55,7 +55,7 @@ func TestUserPrompt_WithLiveLogsNoCalibration(t *testing.T) {
 
 func TestUserPrompt_WithMetricsNoCalibration(t *testing.T) {
 	metrics := &MetricEnrichment{Outcome: OutcomeFetched, Snapshots: []MetricSnapshot{{Metric: "up", Series: `{instance="api-1"}`, Value: "0"}}}
-	out := UserPrompt(basePack(), "{}", metrics, nil, nil, nil, nil)
+	out := UserPrompt(basePack(), "{}", metrics, nil, nil, nil, nil, VerificationParams{})
 	if strings.Contains(out, "ANNOTATIONS ONLY") {
 		t.Fatalf("live metrics present — calibration directive must be omitted: %s", out)
 	}
@@ -67,7 +67,7 @@ func TestUserPrompt_WithMetricsNoCalibration(t *testing.T) {
 // genuine outage or empty result does.
 func TestUserPrompt_DegradedMetricsExemptFromCap(t *testing.T) {
 	m := &MetricEnrichment{Outcome: OutcomeDegraded, Note: "metric backend too slow to answer within the deadline"}
-	out := UserPrompt(basePack(), "{}", m, nil, nil, nil, nil)
+	out := UserPrompt(basePack(), "{}", m, nil, nil, nil, nil, VerificationParams{})
 	if strings.Contains(out, "ANNOTATIONS ONLY") {
 		t.Fatalf("degraded metrics must NOT trigger the annotations-only cap directive: %s", out)
 	}
@@ -77,7 +77,7 @@ func TestUserPrompt_DegradedMetricsExemptFromCap(t *testing.T) {
 // backend gives us no data and no reason to believe data exists.
 func TestUserPrompt_FailedMetricsStillAnnotationsOnly(t *testing.T) {
 	m := &MetricEnrichment{Outcome: OutcomeFailed, Note: "metric backend query failed"}
-	out := UserPrompt(basePack(), "{}", m, nil, nil, nil, nil)
+	out := UserPrompt(basePack(), "{}", m, nil, nil, nil, nil, VerificationParams{})
 	if !strings.Contains(out, "ANNOTATIONS ONLY") {
 		t.Fatalf("failed metrics must still carry the annotations-only directive: %s", out)
 	}
