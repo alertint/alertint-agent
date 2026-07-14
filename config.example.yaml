@@ -31,6 +31,16 @@ memory:                    # incident memory: recurrence collapse (always on, de
     mode: "off"               # off | shadow | on — quote it; bare off/on are YAML booleans (see docs before flipping to on)
     timeout_seconds: 10       # seconds-scale budget for the classifier's own Haiku call
 
+# Triage pipeline tunables. The verification round adds a second LLM pass that
+# falsifies the draft verdict (a floor + model-proposed disprove-queries)
+# before persisting it. See docs/getting-started/configuration.md#triage.
+triage:
+  verification:
+    enabled: true                # kill-switch; omit or true = on, false = single-call triage (no verification)
+    max_queries: 4                # cap on model-proposed disprove-queries (the deterministic floor always runs)
+    query_timeout_seconds: 10     # budget for the query phase, sliced per query
+    max_rounds: 1                 # reserved for future multi-round verification; only 1 is accepted today
+
 notify:
   stdout: true             # always emit one JSON line per finding to stdout
   slack:

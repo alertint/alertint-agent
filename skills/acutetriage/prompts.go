@@ -5,6 +5,7 @@
 package acutetriage
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -127,7 +128,13 @@ func BuildEvidencePack(inc store.Incident, alerts []store.Alert, windowSeconds i
 // LLM. metrics is optional — pass nil when Prometheus is not available. logs is
 // optional — pass nil when no log source is configured; when non-nil it always
 // renders a "Recent logs" section (lines, or a note explaining their absence).
-func UserPrompt(pack EvidencePack, packJSON string, metrics *MetricEnrichment, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, memory *MemoryEnrichment) string {
+// verify.Enabled gates the verification-plan instruction (R1) and, when true,
+// moves the memory-verdict request out of this call and into callTwoPrompt
+// (R16) — call 2 is where the model re-judges with real evidence in hand, so
+// asking for a verdict here would have it judge the recalled prior against
+// nothing but its own draft. verify.Enabled == false reproduces the pre-Task-5
+// prompt byte-for-byte (the kill switch).
+func UserPrompt(pack EvidencePack, packJSON string, metrics *MetricEnrichment, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, memory *MemoryEnrichment, verify VerificationParams) string {
 	var b strings.Builder
 	fmt.Fprintf(&b,
 		"Analyze the following correlated incident.\n\nEvidence:\n%s\n\nShared labels: %s\nAlert count: %d\nWindow: %ds",
@@ -140,9 +147,62 @@ func UserPrompt(pack EvidencePack, packJSON string, metrics *MetricEnrichment, l
 	renderLogs(&b, logs)
 	renderChanges(&b, changes)
 	renderSentry(&b, sentry)
-	renderMemory(&b, memory)
+	renderMemory(&b, memory, !verify.Enabled)
 	renderEvidenceBasis(&b, metrics, logs, changes, sentry, memory != nil)
+	renderVerificationInstruction(&b, verify)
 	b.WriteString("\n\nRespond with JSON only.")
+	return b.String()
+}
+
+// renderVerificationInstruction appends the "verification" JSON-key request
+// (R1) when verification is enabled — up to verify.MaxQueries model-proposed
+// disprove-queries, from a closed kind set (promql, incidents_in_window; the
+// floor's up_ratio is never model-proposable). A root cause claiming
+// wider-than-member-alert scope MUST include targeted queries (R7 —
+// scope-inflation guard); an empty list is otherwise allowed. Silent when
+// verification is disabled, so the kill switch is total, not just
+// byte-identical for one fixture.
+func renderVerificationInstruction(b *strings.Builder, verify VerificationParams) {
+	if !verify.Enabled {
+		return
+	}
+	fmt.Fprintf(b, "\n\n## Verification plan (required key)\n"+
+		"After forming your verdict, add a \"verification\" key to your JSON: up to %d "+
+		"read-only queries that could DISPROVE your root cause. Allowed kinds:\n"+
+		`  {"kind":"promql","expr":"<instant PromQL>","why":"<what this would refute>"}`+"\n"+
+		`  {"kind":"incidents_in_window","params":{"window_minutes":60},"why":"..."}`+"\n"+
+		"A root cause claiming scope wider than the member alerts (cluster-wide, zonal, "+
+		"regional, infrastructure-wide) MUST include targeted disprove-queries. An empty "+
+		"list is allowed when no check would change your verdict. Two checks always run "+
+		"regardless: a parent-scope up ratio and an incidents-in-window scan — do not "+
+		"duplicate them.", verify.MaxQueries)
+}
+
+// callTwoPrompt builds the full continuation prompt for the second LLM call
+// (R5): call 1's prompt verbatim (byte-identical prefix — the load-bearing
+// property for prompt caching), the model's own draft verdict, the computed
+// verification results, and a re-judge instruction. The verification results
+// are computed facts and OUTRANK the draft, the evidence sections above, and
+// any recalled prior hypotheses — the model is told to revise, not defend.
+// The memory-verdict request (moved here from call 1 per R16 when
+// verification is enabled) is appended only when a strong prior was recalled,
+// so the marks it drives have a target to judge.
+func callTwoPrompt(callOne string, draftRaw json.RawMessage, round *VerificationRound, memory *MemoryEnrichment) string {
+	var b strings.Builder
+	b.WriteString(callOne)
+	b.WriteString("\n\n## Your draft verdict (your own prior output)\n")
+	b.Write(draftRaw)
+	renderVerificationResults(&b, round)
+	b.WriteString("\n\nThese results are computed facts: they outrank the draft, the evidence " +
+		"sections above, and any recalled prior hypotheses. Re-judge your draft against them. " +
+		"If they contradict it, revise — do not defend the draft. A replacement hypothesis " +
+		"formed now is itself unverified: keep its confidence moderate. Respond with the SAME " +
+		"JSON schema as before, complete (do NOT include the \"verification\" key again).")
+	if memory != nil && memory.Strong != nil {
+		b.WriteString("\n\nAfter weighing the verification results, add a \"memory_verdict\" field " +
+			"judging the folded prior hypothesis in the Memory section: \"confirms\", \"refutes\", " +
+			"or \"silent\". Do NOT raise your confidence on the strength of the recalled hypothesis alone.")
+	}
 	return b.String()
 }
 
@@ -168,7 +228,10 @@ const MaxMetadataOnlyConfidence = 0.6
 // memoryPresent is true the directive says so explicitly — a recalled prior's
 // confidence must not be smuggled into today's evidence-free re-fire (R18/R20).
 func renderEvidenceBasis(b *strings.Builder, metrics *MetricEnrichment, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, memoryPresent bool) {
-	if !annotationsOnlyBasis(metrics, logs, changes, sentry) {
+	// Call 1 renders this before any verification round exists, so it passes nil:
+	// the prompt-side directive is unchanged by verification. Only the
+	// deterministic post-call cap (applyEvidenceCap) sees the executed round.
+	if !annotationsOnlyBasis(metrics, logs, changes, sentry, nil) {
 		return
 	}
 	b.WriteString("\n\nEvidence basis: ANNOTATIONS ONLY — no live logs, metrics, " +
@@ -199,8 +262,12 @@ func metricsDegraded(metrics *MetricEnrichment) bool {
 // absence. This is the single condition that triggers the metadata-only
 // confidence cap; both the prompt directive (renderEvidenceBasis) and the
 // deterministic backstop (applyEvidenceCap) route through it so they never drift.
-func annotationsOnlyBasis(metrics *MetricEnrichment, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment) bool {
-	return !hasLiveEvidence(metrics, logs, changes, sentry) && !metricsDegraded(metrics)
+// A fetched verification up_ratio/promql observation counts as live evidence
+// (verificationLive) — a real read of the infrastructure, R17 — so it lifts the
+// basis too; incidents_in_window never does (own SQLite bookkeeping). ver is nil
+// on the prompt side (the round has not run yet), non-nil at the post-call cap.
+func annotationsOnlyBasis(metrics *MetricEnrichment, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, ver *VerificationEnrichment) bool {
+	return !hasLiveEvidence(metrics, logs, changes, sentry) && !metricsDegraded(metrics) && !verificationLive(ver)
 }
 
 // hasLiveEvidence reports whether any enrichment source returned actual data

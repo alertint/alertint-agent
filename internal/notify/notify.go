@@ -42,6 +42,12 @@ type Finding struct {
 	// producers (triage skill on a re-judgment, resolution notifier at resolve)
 	// own the read. nil on a first firing.
 	Recurrence *Recurrence `json:"recurrence,omitempty"`
+	// Unverified marks a finding whose verification round degraded — the floor
+	// checks could not complete (or the re-judge call was lost), so the verdict
+	// shipped without a full falsification pass. The skill sets it; card renderers
+	// surface a caveat off it. False on the kill-switch path and on any
+	// supported/revised round.
+	Unverified bool `json:"unverified,omitempty"`
 }
 
 // Recurrence is the live occurrence summary carried on a Finding so the Slack

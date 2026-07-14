@@ -87,6 +87,12 @@ type Config struct {
 	// the prometheus config section. Prometheus above is the client; this is the
 	// single-deadline budget for the multi-scope fetch.
 	MetricParams MetricParams
+	// Verification carries the falsification-round tunables (ADR-0021/0022). When
+	// Enabled, a non-short-circuit triage runs a floor + model-proposed
+	// verification round after the draft verdict and re-judges it in a second LLM
+	// call. The zero value (Enabled=false) is the kill switch: one call, no round,
+	// prompt byte-identical to the pre-feature triage.
+	Verification VerificationParams
 }
 
 // Skill orchestrates the full acute-triage pipeline for a single ready
@@ -259,44 +265,40 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	// Produce the analysis: from the matched rule (short-circuit) or from the LLM
 	// with the pack-selected system prompt, the span-anchored enrichments, and
 	// (on a re-judgment) the recurrence context prepended.
-	raw, metrics, enrichment, changes, sentry, memory, err := s.analysis(ctx, inc, alerts, decision, pack, packJSON, p.spanStart, p.recurrence)
+	ar, err := s.analysis(ctx, inc, alerts, decision, pack, packJSON, p.spanStart, p.recurrence)
 	if err != nil {
 		return err
 	}
 
 	var resp llmResponse
-	if err := json.Unmarshal(raw, &resp); err != nil {
+	if err := json.Unmarshal(ar.raw, &resp); err != nil {
 		return fmt.Errorf("acutetriage: parse llm response: %w", err)
 	}
 	clampConfidence(&resp.Confidence)
-	s.applyEvidenceCap(&resp, decision, metrics, enrichment, changes, sentry, inc.ID)
+
+	// Verification round (ADR-0021/0022): after the draft verdict, run the floor +
+	// model-proposed queries and re-judge in a second LLM call whose response
+	// becomes the final finding. Skipped on the short-circuit path (rule evidence,
+	// not model judgment) and when disabled (the kill switch — one call, no round).
+	// A verification failure NEVER fails a triage the draft could otherwise ship:
+	// verifyAndRejudge falls back to the draft on any call-2 error.
+	finalRaw := ar.raw
+	var ver *VerificationEnrichment
+	if s.cfg.Verification.Enabled && !ar.shortCircuit {
+		finalRaw, resp, ver = s.verifyAndRejudge(ctx, inc, alerts, ar, resp)
+	}
+	// applyEvidenceCap sees the verification enrichment; live verification PromQL
+	// evidence lifts the annotations-only basis just like live metrics/logs do
+	// (the call-1 prompt-side directive was rendered before the round existed, so
+	// it passed nil — only this deterministic post-call cap sees verification).
+	s.applyEvidenceCap(&resp, decision, ar.metrics, ar.logs, ar.changes, ar.sentry, ver, inc.ID)
 
 	// Persist output, including the log-enrichment snapshot so the evidence pack
 	// can replay exactly what the model saw (empty on the short-circuit /
-	// logs-disabled path → stored NULL).
-	outputJSON := string(raw)
-	sources := map[string]any{}
-	if metrics != nil {
-		sources["metrics"] = metrics
-	}
-	if enrichment != nil {
-		sources["logs"] = enrichment
-	}
-	if changes != nil {
-		sources["changes"] = changes
-	}
-	if sentry != nil {
-		// Already distilled + toggle-applied in FetchSentry (KTD2/KTD8), so the
-		// at-rest envelope never holds a raw frame or untoggled PII.
-		sources["sentry"] = sentry
-	}
-	if memory != nil {
-		// Already the allowlisted recall (memoryView is the redaction boundary),
-		// so the at-rest envelope carries only distilled prior-finding refs, never
-		// whole findings or raw labels_json. Persist-as-rendered (ADR-0001).
-		sources["memory"] = memory
-	}
-	enrichmentJSON := marshalEnrichments(sources, s.logger, inc.ID)
+	// logs-disabled path → stored NULL). On a verification round this is call 2's
+	// finding (or the draft when call 2 was lost).
+	outputJSON := string(finalRaw)
+	enrichmentJSON := marshalEnrichments(enrichmentSources(ar, ver), s.logger, inc.ID)
 	if err := p.persist(ctx,
 		inc.ID, outputJSON,
 		resp.AnalysisName, resp.OverallIssue,
@@ -325,7 +327,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	// Memory bookkeeping (M2): maintain the contradiction-decay marks from the
 	// model's verdict, reset on a replacement, and audit the recall. Best-effort —
 	// a bookkeeping failure never fails a triage that already persisted its finding.
-	s.applyMemoryBookkeeping(ctx, inc, memory, resp.MemoryVerdict, p.rejudge)
+	s.applyMemoryBookkeeping(ctx, inc, ar.memory, resp.MemoryVerdict, p.rejudge)
 
 	// Check if all alerts are resolved to determine the finding's status label.
 	incidentStatus := "ongoing"
@@ -357,10 +359,13 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 			AlertCount:          inc.AlertCount,
 			FirstAlertAt:        inc.FirstAlertAt,
 			AnalyzedAt:          time.Now().UTC(),
-			OutputJSON:          raw,
+			OutputJSON:          finalRaw,
 			Status:              incidentStatus,
 			Drill:               isDrill(alerts),
-			Evidence:            buildEvidenceSummary(decision.ShortCircuit, metrics, enrichment, changes, sentry),
+			Evidence:            buildEvidenceSummary(decision.ShortCircuit, ar.metrics, ar.logs, ar.changes, ar.sentry),
+			// A degraded round (floor unfetchable, or call 2 lost) shipped without a
+			// full falsification pass — card renderers surface a caveat off this.
+			Unverified: ver != nil && ver.Outcome == verifyOutcomeDegraded,
 		}
 		if p.rejudge && p.recurrenceEpisodes > 1 && !p.recurrenceLastSeen.IsZero() {
 			f.Recurrence = &notify.Recurrence{Episodes: p.recurrenceEpisodes, LastSeen: p.recurrenceLastSeen}
@@ -372,7 +377,9 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		_ = s.notifier.Notify(ctx, f)
 	}
 
-	// Audit: incident analyzed (carrying the trigger on a re-judgment).
+	// Audit: incident analyzed (carrying the trigger on a re-judgment and the
+	// verification outcome — R11 — when the round ran; omitted entirely on the
+	// short-circuit / disabled path rather than persisted as an empty string).
 	if s.auditor != nil {
 		analyzed := map[string]any{
 			"incident_id":   inc.ID,
@@ -382,10 +389,13 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		if p.rejudge {
 			analyzed["trigger"] = p.trigger
 		}
+		if ver != nil {
+			analyzed["verification_outcome"] = ver.Outcome
+		}
 		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.analyzed", analyzed)
 	}
 
-	s.auditEnrichmentDigests(ctx, inc.ID, metrics, enrichment, changes, sentry)
+	s.auditEnrichmentDigests(ctx, inc.ID, ar.metrics, ar.logs, ar.changes, ar.sentry)
 
 	ruleID := "none"
 	if decision.Rule != nil {
@@ -452,17 +462,34 @@ func (s *Skill) auditEnrichmentDigests(ctx context.Context, incidentID string, m
 	}
 }
 
+// analysisResult carries everything the first analysis pass produced: the raw
+// finding JSON, each enrichment snapshot (nil on the short-circuit path), and —
+// for the LLM path — the exact system/user prompts sent, kept so the
+// verification round can build the call-2 continuation on a byte-identical
+// prefix. shortCircuit is true when the finding came from a matched known-issue
+// rule (no LLM call, no verification).
+type analysisResult struct {
+	raw          json.RawMessage
+	metrics      *MetricEnrichment
+	logs         *LogEnrichment
+	changes      *ChangeEnrichment
+	sentry       *SentryEnrichment
+	memory       *MemoryEnrichment
+	system, user string // prompts, kept for the call-2 continuation
+	shortCircuit bool
+}
+
 // analysis produces the raw finding JSON, either synthesized from a
 // matched known-issue rule (short-circuit, no LLM call) or from the LLM
 // with the pack-selected system prompt. On the LLM path it also returns the
 // metric and log-enrichment snapshots (nil on the short-circuit path) so the
 // caller can persist exactly what the model saw and judge the evidence basis
 // for the deterministic confidence cap.
-func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store.Alert, decision rules.Decision, pack EvidencePack, packJSON []byte, spanStart time.Time, recurrence string) (json.RawMessage, *MetricEnrichment, *LogEnrichment, *ChangeEnrichment, *SentryEnrichment, *MemoryEnrichment, error) {
+func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store.Alert, decision rules.Decision, pack EvidencePack, packJSON []byte, spanStart time.Time, recurrence string) (analysisResult, error) {
 	if decision.ShortCircuit {
 		raw, err := shortCircuitResponse(decision, alerts)
 		if err != nil {
-			return nil, nil, nil, nil, nil, nil, fmt.Errorf("acutetriage: short-circuit response: %w", err)
+			return analysisResult{}, fmt.Errorf("acutetriage: short-circuit response: %w", err)
 		}
 		if s.auditor != nil {
 			_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.short_circuited", map[string]any{
@@ -470,19 +497,16 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 				"rule_id":     decision.Rule.ID,
 			})
 		}
-		return raw, nil, nil, nil, nil, nil, nil
+		return analysisResult{raw: raw, shortCircuit: true}, nil
 	}
 
 	// spanStart anchors the enrichment window on the collapse span: the original
 	// first_alert_at for an initial triage, the first occurrence for a
 	// re-judgment (so metrics/logs cover the recurrence, not a stale window).
-	// Prometheus is a concrete *promclient.Client (nil when disabled); pass a TRUE
-	// nil interface so FetchMetrics's nil check is not defeated by a typed-nil.
-	var mq metricQuerier
-	if s.cfg.Prometheus != nil {
-		mq = s.cfg.Prometheus
-	}
-	metrics := FetchMetrics(ctx, mq, s.cfg.MetricParams, alerts, spanStart, inc.ID, s.logger)
+	// Prometheus is a concrete *promclient.Client (nil when disabled); promQuerier
+	// yields a TRUE nil interface so FetchMetrics's nil check is not defeated by a
+	// typed-nil. The verification round builds its querier the same way.
+	metrics := FetchMetrics(ctx, s.promQuerier(), s.cfg.MetricParams, alerts, spanStart, inc.ID, s.logger)
 	// Best-effort log enrichment: never blocks or fails triage. end=now so a
 	// still-firing incident captures the freshest lines around analysis time.
 	enrichment := FetchLogs(ctx, s.cfg.LogSource, s.cfg.LogParams, alerts, spanStart, time.Now().UTC(), inc.ID, s.logger)
@@ -508,13 +532,14 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 	// captured by persist-as-rendered; in `shadow` mode it only audits and leaves
 	// the render byte-identical. A no-op when disabled or there are no candidates.
 	s.maybeClassify(ctx, inc, memory)
-	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment, changes, sentry, memory)
+	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment, changes, sentry, memory, s.cfg.Verification)
 	// On a re-judgment, prepend the deterministic recurrence context so the model
 	// judges the recurrence with its history rather than as a first-time event.
 	if recurrence != "" {
 		userPrompt = recurrence + "\n\n" + userPrompt
 	}
-	comp, err := s.llm.Complete(ctx, s.systemPrompt(decision, len(alerts)), userPrompt, RequiredKeys)
+	system := s.systemPrompt(decision, len(alerts))
+	comp, err := s.llm.Complete(ctx, system, userPrompt, RequiredKeys)
 	if err != nil {
 		s.logger.Error("llm failed", "incident", inc.ID, "err", err)
 		if s.auditor != nil {
@@ -523,7 +548,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 				"error":       err.Error(),
 			})
 		}
-		return nil, metrics, enrichment, changes, sentry, memory, fmt.Errorf("acutetriage: llm: %w", err)
+		return analysisResult{}, fmt.Errorf("acutetriage: llm: %w", err)
 	}
 	// Action-trail success line, sibling to "llm failed" above: emitted by the
 	// incident-aware caller so it carries the incident ID and the usage the
@@ -535,7 +560,16 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		"tokens_out", comp.OutputTokens,
 		"incident", inc.ID,
 	)
-	return comp.Raw, metrics, enrichment, changes, sentry, memory, nil
+	return analysisResult{
+		raw:     comp.Raw,
+		metrics: metrics,
+		logs:    enrichment,
+		changes: changes,
+		sentry:  sentry,
+		memory:  memory,
+		system:  system,
+		user:    userPrompt,
+	}, nil
 }
 
 // systemPrompt picks the analysis prompt: the rule-selected template when
@@ -586,6 +620,36 @@ func shortCircuitResponse(d rules.Decision, alerts []store.Alert) (json.RawMessa
 	return json.Marshal(out)
 }
 
+// enrichmentSources collects the non-nil enrichment snapshots into the keyed
+// envelope map persisted under enrichment_json. Each value is already the
+// redaction-safe, persist-as-rendered form its producer emitted: FetchSentry
+// distilled + toggle-applied the Sentry section (KTD2/KTD8, never a raw frame or
+// untoggled PII); memoryView allowlisted the recall (only distilled prior-finding
+// refs, never whole findings or raw labels_json, ADR-0001); verifyAndRejudge
+// carries the executed round byte-identical to what call 2 saw (R8).
+func enrichmentSources(ar analysisResult, ver *VerificationEnrichment) map[string]any {
+	sources := map[string]any{}
+	if ar.metrics != nil {
+		sources["metrics"] = ar.metrics
+	}
+	if ar.logs != nil {
+		sources["logs"] = ar.logs
+	}
+	if ar.changes != nil {
+		sources["changes"] = ar.changes
+	}
+	if ar.sentry != nil {
+		sources["sentry"] = ar.sentry
+	}
+	if ar.memory != nil {
+		sources["memory"] = ar.memory
+	}
+	if ver != nil {
+		sources["verification"] = ver
+	}
+	return sources
+}
+
 // marshalEnrichments serializes the keyed multi-source enrichment envelope for
 // persistence: {"logs": {...}, "changes": {...}}. Callers add only non-nil
 // sources. Returns "" when there is nothing to persist (all sources absent) or
@@ -609,8 +673,8 @@ func marshalEnrichments(sources map[string]any, logger *slog.Logger, incidentID 
 // compliance. Short-circuit findings are exempt — they carry rule evidence, not
 // model judgment. The persisted output_json keeps the model's original number;
 // the incident row and every notification carry the capped one.
-func (s *Skill) applyEvidenceCap(resp *llmResponse, decision rules.Decision, metrics *MetricEnrichment, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, incidentID string) {
-	if decision.ShortCircuit || !annotationsOnlyBasis(metrics, logs, changes, sentry) ||
+func (s *Skill) applyEvidenceCap(resp *llmResponse, decision rules.Decision, metrics *MetricEnrichment, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, ver *VerificationEnrichment, incidentID string) {
+	if decision.ShortCircuit || !annotationsOnlyBasis(metrics, logs, changes, sentry, ver) ||
 		resp.Confidence <= MaxMetadataOnlyConfidence {
 		return
 	}
@@ -629,6 +693,144 @@ func clampConfidence(c *float64) {
 	if *c > 1 {
 		*c = 1
 	}
+}
+
+// promQuerier returns the configured Prometheus client as a true-nil-safe
+// metricQuerier: a nil *prometheus.Client yields a nil interface (not a typed
+// nil), so the downstream nil checks in FetchMetrics and the verification runner
+// hold. Both the analysis fetch and the verification round build their querier
+// through here so they observe the same client (or the same true nil).
+func (s *Skill) promQuerier() metricQuerier {
+	var mq metricQuerier
+	if s.cfg.Prometheus != nil {
+		mq = s.cfg.Prometheus
+	}
+	return mq
+}
+
+// verifyAndRejudge runs one verification round on a non-short-circuit draft and
+// re-judges it in a second LLM call (ADR-0021/0022). It returns the finding that
+// should ship: on success, call 2's raw JSON + parsed response + the executed
+// round; on ANY call-2 failure (LLM error, malformed JSON), the DRAFT unchanged
+// with its memory verdict cleared, so a lost re-judge never fails a triage the
+// draft could otherwise ship (the never-fails invariant) and never moves memory
+// marks on stale grounds (R16). resp is the draft (already clamped).
+func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts []store.Alert, ar analysisResult, resp llmResponse) (json.RawMessage, llmResponse, *VerificationEnrichment) {
+	draft := DraftRef{RootCause: resp.OverallIssue, Confidence: resp.Confidence}
+	modelQ := parseVerificationPlan(ar.raw, s.cfg.Verification.MaxQueries, s.logger, inc.ID)
+	s.auditVerificationPlanned(ctx, inc, alerts, modelQ)
+
+	// The runner shares the SAME true-nil-safe querier the analysis fetch used, and
+	// the store as the incidents_in_window state reader. It never errors: a query's
+	// own failure lands in its Outcome/Result, never aborting the round (R2).
+	round := runVerification(ctx, s.promQuerier(), s.st, s.cfg.Verification, inc, alerts, draft, modelQ, time.Now().UTC(), s.logger)
+
+	// Call 2: the byte-identical call-1 prefix + the draft + the computed round +
+	// the (moved) memory-verdict request. On any failure the draft stands.
+	comp, err := s.llm.Complete(ctx, ar.system, callTwoPrompt(ar.user, ar.raw, round, ar.memory), RequiredKeys)
+	if err != nil {
+		s.logger.Warn("acutetriage: verification re-judge failed; draft stands", "incident", inc.ID, "err", err)
+		return s.degradedDraft(ctx, inc.ID, ar.raw, round, resp)
+	}
+	var resp2 llmResponse
+	if err := json.Unmarshal(comp.Raw, &resp2); err != nil {
+		// A malformed re-judge must not fail a triage that has a valid draft.
+		s.logger.Warn("acutetriage: verification re-judge returned malformed JSON; draft stands", "incident", inc.ID, "err", err)
+		return s.degradedDraft(ctx, inc.ID, ar.raw, round, resp)
+	}
+	clampConfidence(&resp2.Confidence)
+
+	// Clamp rail (R15): a re-judge that leans on unfetched evidence must not raise
+	// confidence above the draft — the missing checks could have refuted it.
+	clamped := false
+	if anyUnfetched(round) && resp2.Confidence > draft.Confidence {
+		s.logger.Info("acutetriage: verification clamp: unfetched evidence, holding re-judged confidence at draft",
+			"incident", inc.ID, "draft_confidence", draft.Confidence, "rejudged_confidence", resp2.Confidence)
+		resp2.Confidence = draft.Confidence
+		clamped = true
+	}
+
+	// Outcome: degraded when the floor could not fetch (the promised minimum did
+	// not run); otherwise revised vs supported by whether the root-cause string
+	// changed — crude but deterministic (no fuzzy diff on model prose).
+	outcome := verifyOutcomeSupported
+	switch {
+	case !floorFetched(round):
+		outcome = verifyOutcomeDegraded
+	case resp2.OverallIssue != resp.OverallIssue:
+		outcome = verifyOutcomeRevised
+	}
+	if outcome == verifyOutcomeDegraded {
+		// R16: a degraded round (the promised floor minimum did not run) must
+		// produce no verdict, even though call 2 itself succeeded and parsed
+		// fine — otherwise a floor-failed-but-call-2-succeeded round would let
+		// call 2's memory_verdict move contradiction marks on stale grounds.
+		// The existing soft-required handling treats an empty verdict as
+		// silent, so this is additive: it clears a field, it never fails the
+		// triage or the round.
+		resp2.MemoryVerdict = ""
+	}
+	s.auditVerificationExecuted(ctx, inc.ID, outcome, round, clamped)
+
+	return comp.Raw, resp2, &VerificationEnrichment{Outcome: outcome, Rounds: []VerificationRound{*round}}
+}
+
+// degradedDraft is the shared call-2-failure return: the draft ships as final —
+// its ORIGINAL bytes preserved (draftRaw, so the persisted output_json is the
+// model's exact draft, verification-plan key and all) with its parsed verdict's
+// memory mark cleared (R16 — a lost call 2 moves no marks), outcome degraded, and
+// the executed round preserved for the envelope. It emits the
+// verification_executed audit so every planned round has a matching executed row.
+func (s *Skill) degradedDraft(ctx context.Context, incidentID string, draftRaw json.RawMessage, round *VerificationRound, draft llmResponse) (json.RawMessage, llmResponse, *VerificationEnrichment) {
+	draft.MemoryVerdict = ""
+	s.auditVerificationExecuted(ctx, incidentID, verifyOutcomeDegraded, round, false)
+	return draftRaw, draft, &VerificationEnrichment{Outcome: verifyOutcomeDegraded, Rounds: []VerificationRound{*round}}
+}
+
+// auditVerificationPlanned records the plan before it runs: the model/floor query
+// counts and each query's kind/source/why — never a metric value (R4/KTD6).
+func (s *Skill) auditVerificationPlanned(ctx context.Context, inc store.Incident, alerts []store.Alert, modelQ []VerificationQuery) {
+	if s.auditor == nil {
+		return
+	}
+	plan := append(floorPlan(alerts), modelQ...)
+	qs := make([]map[string]string, 0, len(plan))
+	for _, q := range plan {
+		qs = append(qs, map[string]string{"kind": q.Kind, "source": q.Source, "why": q.Why})
+	}
+	_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.verification_planned", map[string]any{
+		"incident_id":       inc.ID,
+		"model_query_count": len(modelQ),
+		"floor_query_count": 2,
+		"queries":           qs,
+	})
+}
+
+// auditVerificationExecuted records the round result: outcome, fetched/failed
+// query counts (an empty answer counts as fetched — "asked, nothing there"), and
+// whether the confidence clamp fired. No metric values.
+func (s *Skill) auditVerificationExecuted(ctx context.Context, incidentID, outcome string, round *VerificationRound, clamped bool) {
+	if s.auditor == nil {
+		return
+	}
+	var fetched, failed int
+	for _, q := range round.Queries {
+		switch q.Outcome {
+		case OutcomeFetched, OutcomeEmpty:
+			fetched++
+		case OutcomeFailed, OutcomeDegraded:
+			failed++
+		case OutcomeNoSelector:
+			// Metric-enrichment-only outcome; never set on a verification query.
+		}
+	}
+	_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.verification_executed", map[string]any{
+		"incident_id": incidentID,
+		"outcome":     outcome,
+		"fetched":     fetched,
+		"failed":      failed,
+		"clamped":     clamped,
+	})
 }
 
 // isDrill reports whether any member alert carries the Drill-alert marker

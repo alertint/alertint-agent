@@ -44,6 +44,7 @@ type Config struct {
 	Sentry       SentryConfig       `yaml:"sentry,omitempty"`
 	Rules        RulesConfig        `yaml:"rules"`
 	Memory       MemoryConfig       `yaml:"memory"`
+	Triage       TriageConfig       `yaml:"triage,omitempty"`
 	LogLevel     string             `yaml:"log_level"`
 	LogFormat    string             `yaml:"log_format"`
 }
@@ -54,6 +55,24 @@ type Config struct {
 // override baseline entries with the same id or name.
 type RulesConfig struct {
 	LocalPackDir string `yaml:"local_pack_dir,omitempty"`
+}
+
+// TriageConfig groups triage-pipeline tunables. Verification (the falsification
+// round, ADR-0021/0022) is its first block.
+type TriageConfig struct {
+	Verification VerificationConfig `yaml:"verification"`
+}
+
+// VerificationConfig tunes the verification round. Enabled is a *bool so an
+// omitted key means the default (on) while an explicit false is honored —
+// resolve via Config.VerificationEnabled, never directly (the Prometheus
+// Enabled idiom). max_rounds exists so multi-round is a config change later;
+// only 1 is accepted today (rejected loudly, never silently clamped).
+type VerificationConfig struct {
+	Enabled             *bool `yaml:"enabled,omitempty"`
+	MaxQueries          int   `yaml:"max_queries"`
+	QueryTimeoutSeconds int   `yaml:"query_timeout_seconds"`
+	MaxRounds           int   `yaml:"max_rounds"`
 }
 
 // PrometheusConfig configures the optional Prometheus read connector.
@@ -416,6 +435,13 @@ func Defaults() Config {
 				// IncludeMessage left nil → defaults ON via MessageIncluded (R14).
 			},
 		},
+		Triage: TriageConfig{
+			Verification: VerificationConfig{
+				MaxQueries:          4,
+				QueryTimeoutSeconds: 10,
+				MaxRounds:           1,
+			},
+		},
 		Memory: MemoryConfig{
 			AttachWindowMinutes:  30,
 			JudgmentCeilingHours: 4,
@@ -505,6 +531,7 @@ func (c *Config) validate(offline bool) error {
 	errs = append(errs, c.validateLogs()...)
 	errs = append(errs, c.validateSentry()...)
 	errs = append(errs, c.validateChanges()...)
+	errs = append(errs, c.validateVerification()...)
 	errs = append(errs, c.validateMemory()...)
 	if !offline {
 		errs = append(errs, c.validateRules()...)
@@ -643,6 +670,24 @@ func (c *Config) validateCorrelator() []string {
 				seen[label] = i
 			}
 		}
+	}
+	return errs
+}
+
+// validateVerification checks the verification round config.
+func (c *Config) validateVerification() []string {
+	var errs []string
+	if c.Triage.Verification.MaxRounds > 1 {
+		errs = append(errs, "triage: verification: max_rounds: multi-round not yet supported")
+	}
+	if c.Triage.Verification.MaxRounds < 1 {
+		errs = append(errs, "triage: verification: max_rounds: must be 1")
+	}
+	if c.Triage.Verification.MaxQueries < 0 {
+		errs = append(errs, "triage: verification: max_queries: must be >= 0")
+	}
+	if c.Triage.Verification.QueryTimeoutSeconds <= 0 {
+		errs = append(errs, "triage: verification: query_timeout_seconds: must be > 0")
 	}
 	return errs
 }
@@ -849,6 +894,11 @@ func (c *Config) MCPEnabled() bool {
 		return strings.TrimSpace(os.Getenv(name)) != ""
 	}
 	return false
+}
+
+// VerificationEnabled resolves the tri-state enabled flag: nil = on.
+func (c *Config) VerificationEnabled() bool {
+	return c.Triage.Verification.Enabled == nil || *c.Triage.Verification.Enabled
 }
 
 // AnySentryEnabled reports whether any Sentry feature is on (the release/deploy
