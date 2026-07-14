@@ -327,6 +327,16 @@ func TestVerificationRevisesRegionalVerdict(t *testing.T) {
 		t.Errorf("verification_executed audit rows = %d, want 1", n)
 	}
 
+	// R11: incident.analyzed carries the verification outcome field.
+	var analyzedPayload string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT payload_json FROM audit_log WHERE kind = 'incident.analyzed'`).Scan(&analyzedPayload); err != nil {
+		t.Fatalf("query incident.analyzed audit: %v", err)
+	}
+	if !strings.Contains(analyzedPayload, `"verification_outcome":"revised"`) {
+		t.Errorf("incident.analyzed payload missing verification_outcome=revised: %s", analyzedPayload)
+	}
+
 	// The call-2 "refutes" verdict routes a contradiction mark onto the prior.
 	if got := refuteMarks(t, st, prior.ID); got != 1 {
 		t.Errorf("prior refute marks = %d, want 1 (call-2 refutes routed)", got)
@@ -474,6 +484,58 @@ func TestDraftShipsWhenCallTwoMisses(t *testing.T) {
 	}
 	if got := refuteMarks(t, st, prior.ID); got != 0 {
 		t.Errorf("a lost call 2 must move no marks, got %d", got)
+	}
+}
+
+// --------------------------------------------------------------------------
+// T4(d) — degraded round must discard call 2's verdict (R16)
+// --------------------------------------------------------------------------
+
+// TestDegradedFloorFailsCallTwoVerdictDiscarded: the floor cannot fetch (every
+// Prometheus call fails, so !floorFetched(round)), but call 2 itself succeeds
+// and parses fine, returning a non-empty memory_verdict. This is the path
+// degradedDraft does NOT cover — degradedDraft only runs on a call-2 LLM error
+// or malformed JSON. Per R16, a degraded/unverified round must produce no
+// verdict regardless of why it degraded, so the "refutes" verdict must NOT
+// route a contradiction mark onto the recalled prior.
+func TestDegradedFloorFailsCallTwoVerdictDiscarded(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	auditor := audit.New(st.DB())
+	prior := insertTestIncident(t, st, ctx)
+
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-t4d", map[string]string{"alertname": "DiskFull", "host": "web1"})
+
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "draft", "disk pressure on web1", 0.7, []map[string]any{
+			{"kind": "promql", "expr": "some_metric", "why": "would refute"},
+		})},
+		{raw: callTwoResp(t, "draft", "disk pressure on web1", 0.65, "refutes")},
+	}}
+
+	cfg := verifyConfig(promAllFail(t))
+	cfg.Memory = strongRecallReader(prior.ID)
+	cfg.MemoryParams = acutetriage.MemoryParams{LookbackDays: 90}
+	skill := acutetriage.New(cfg, st, scripted, auditor, nil, nil)
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if scripted.calls != 2 {
+		t.Fatalf("want 2 LLM calls (draft + re-judge), got %d", scripted.calls)
+	}
+
+	f := readFinding(t, st, inc.ID)
+	ver := verificationOf(t, f.enrichment)
+	if ver == nil || ver.Outcome != "degraded" {
+		t.Errorf("outcome = %v, want degraded (floor failed even though call 2 succeeded)", ver)
+	}
+
+	// R16: a degraded round must produce no verdict, even though call 2 parsed
+	// fine and returned "refutes" — the contradiction mark must NOT move.
+	if got := refuteMarks(t, st, prior.ID); got != 0 {
+		t.Errorf("a degraded round's call-2 verdict must move no marks, got %d", got)
 	}
 }
 

@@ -377,7 +377,9 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		_ = s.notifier.Notify(ctx, f)
 	}
 
-	// Audit: incident analyzed (carrying the trigger on a re-judgment).
+	// Audit: incident analyzed (carrying the trigger on a re-judgment and the
+	// verification outcome — R11 — when the round ran; omitted entirely on the
+	// short-circuit / disabled path rather than persisted as an empty string).
 	if s.auditor != nil {
 		analyzed := map[string]any{
 			"incident_id":   inc.ID,
@@ -386,6 +388,9 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		}
 		if p.rejudge {
 			analyzed["trigger"] = p.trigger
+		}
+		if ver != nil {
+			analyzed["verification_outcome"] = ver.Outcome
 		}
 		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.analyzed", analyzed)
 	}
@@ -754,6 +759,16 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 		outcome = verifyOutcomeDegraded
 	case resp2.OverallIssue != resp.OverallIssue:
 		outcome = verifyOutcomeRevised
+	}
+	if outcome == verifyOutcomeDegraded {
+		// R16: a degraded round (the promised floor minimum did not run) must
+		// produce no verdict, even though call 2 itself succeeded and parsed
+		// fine — otherwise a floor-failed-but-call-2-succeeded round would let
+		// call 2's memory_verdict move contradiction marks on stale grounds.
+		// The existing soft-required handling treats an empty verdict as
+		// silent, so this is additive: it clears a field, it never fails the
+		// triage or the round.
+		resp2.MemoryVerdict = ""
 	}
 	s.auditVerificationExecuted(ctx, inc.ID, outcome, round, clamped)
 
