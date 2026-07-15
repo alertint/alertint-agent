@@ -324,6 +324,16 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		}
 	}
 
+	// Bounded itemization: the prompts ask the model to itemize at most
+	// maxItemizedAlerts members (Task 2's templates); every member it omits
+	// gets the neutral default role deterministically, so a storm-sized
+	// incident still exposes a role on every alert over MCP. Skipped on the
+	// short-circuit path — a rule finding carries no model itemization and
+	// its members keep NULL roles, as before this change.
+	if !ar.shortCircuit {
+		s.defaultUnitemizedRoles(ctx, inc.ID, alerts, resp.Alerts)
+	}
+
 	// Memory bookkeeping (M2): maintain the contradiction-decay marks from the
 	// model's verdict, reset on a replacement, and audit the recall. Best-effort —
 	// a bookkeeping failure never fails a triage that already persisted its finding.
@@ -831,6 +841,39 @@ func (s *Skill) auditVerificationExecuted(ctx context.Context, incidentID, outco
 		"failed":      failed,
 		"clamped":     clamped,
 	})
+}
+
+// defaultUnitemizedRole is what an alert omitted from the model's capped
+// alerts array is recorded as. The prompt rule (packs/baseline/templates/*,
+// SystemPrompt) tells the model omission means exactly this, so omission is
+// itself the model's judgment — never an unknown.
+const defaultUnitemizedRole = "correlated"
+
+// defaultUnitemizedRoles writes defaultUnitemizedRole for every member alert
+// absent from the model's itemized alerts array. Best-effort per alert (a
+// single failed write logs and moves on, mirroring the itemized loop above);
+// the total defaulted count is logged so the cap is never silent.
+func (s *Skill) defaultUnitemizedRoles(ctx context.Context, incidentID string, members []store.Alert, itemized []alertOutput) {
+	seen := make(map[string]struct{}, len(itemized))
+	for _, ao := range itemized {
+		seen[ao.AlertID] = struct{}{}
+	}
+	defaulted := 0
+	for _, a := range members {
+		if _, ok := seen[a.ID]; ok {
+			continue
+		}
+		if err := s.st.SetAlertRole(ctx, incidentID, a.ID, defaultUnitemizedRole); err != nil {
+			s.logger.Warn("acutetriage: default alert role failed",
+				"incident_id", incidentID, "alert_id", a.ID, "err", err)
+			continue
+		}
+		defaulted++
+	}
+	if defaulted > 0 {
+		s.logger.Info("acutetriage: defaulted roles for un-itemized alerts",
+			"incident_id", incidentID, "count", defaulted, "role", defaultUnitemizedRole)
+	}
 }
 
 // isDrill reports whether any member alert carries the Drill-alert marker
