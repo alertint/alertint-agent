@@ -850,9 +850,13 @@ func (s *Skill) auditVerificationExecuted(ctx context.Context, incidentID, outco
 const defaultUnitemizedRole = "correlated"
 
 // defaultUnitemizedRoles writes defaultUnitemizedRole for every member alert
-// absent from the model's itemized alerts array. Best-effort per alert (a
-// single failed write logs and moves on, mirroring the itemized loop above);
-// the total defaulted count is logged so the cap is never silent.
+// absent from the model's itemized alerts array. Uses SetAlertRoleIfUnset, not
+// SetAlertRole: on a re-judgment, the current call's (independently capped)
+// itemization omitting an alert is not a fresh "correlated" verdict, so it
+// must never downgrade a role a PRIOR call explicitly assigned (e.g.
+// "primary") — only NULL or already-"correlated" rows are written. Best-effort
+// per alert (a single failed write logs and moves on, mirroring the itemized
+// loop above); the total defaulted count is logged so the cap is never silent.
 func (s *Skill) defaultUnitemizedRoles(ctx context.Context, incidentID string, members []store.Alert, itemized []alertOutput) {
 	seen := make(map[string]struct{}, len(itemized))
 	for _, ao := range itemized {
@@ -863,7 +867,7 @@ func (s *Skill) defaultUnitemizedRoles(ctx context.Context, incidentID string, m
 		if _, ok := seen[a.ID]; ok {
 			continue
 		}
-		if err := s.st.SetAlertRole(ctx, incidentID, a.ID, defaultUnitemizedRole); err != nil {
+		if err := s.st.SetAlertRoleIfUnset(ctx, incidentID, a.ID, defaultUnitemizedRole); err != nil {
 			s.logger.Warn("acutetriage: default alert role failed",
 				"incident_id", incidentID, "alert_id", a.ID, "err", err)
 			continue

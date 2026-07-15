@@ -805,6 +805,23 @@ func (s *Store) SetAlertRole(ctx context.Context, incidentID, alertID, role stri
 	return nil
 }
 
+// SetAlertRoleIfUnset sets the role column on an incident_alerts row only when
+// the row has no role yet or already carries the given role — it never
+// overwrites a different, previously-set role. Used to default a role for an
+// alert the model omitted from its itemization without downgrading a role the
+// model explicitly assigned on an earlier triage/re-judgment.
+func (s *Store) SetAlertRoleIfUnset(ctx context.Context, incidentID, alertID, role string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE incident_alerts
+		SET role = ?
+		WHERE incident_id = ? AND alert_id = ? AND (role IS NULL OR role = ?)
+	`, role, incidentID, alertID, role)
+	if err != nil {
+		return fmt.Errorf("store: set alert role if unset: %w", err)
+	}
+	return nil
+}
+
 // GetIncidentSlackThread returns the Slack message ts and channel stored for
 // the given incident, or ("", "", ErrNotFound) when no thread has been recorded.
 func (s *Store) GetIncidentSlackThread(ctx context.Context, incidentID string) (ts, channel string, err error) {
