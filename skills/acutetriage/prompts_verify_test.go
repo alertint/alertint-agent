@@ -130,6 +130,22 @@ func TestMemoryVerdictStaysInCallOneWhenVerificationDisabled(t *testing.T) {
 	}
 }
 
+// R1/ADR-0024: an empty contrast result weighs against the draft ONLY when
+// its query reused vocabulary confirmed present in the evidence (a confirmed
+// absence); every other empty is inconclusive and must not lower confidence.
+func TestCallTwoPromptEmptyResultFraming(t *testing.T) {
+	c2 := callTwoContinuation(json.RawMessage(`{"a":1}`), minimalRound(), nil)
+	for _, want := range []string{
+		"confirmed absence",
+		"inconclusive",
+		"do NOT lower confidence",
+	} {
+		if !strings.Contains(c2, want) {
+			t.Fatalf("missing %q in call-2 continuation:\n%s", want, c2)
+		}
+	}
+}
+
 // Call 2 continuation structure: opens with the draft-verdict header (the
 // shared prefix is now carried separately as Prompt.Prefix, not concatenated
 // here — see CONTEXT.md "Shared prefix"), results outrank, complete schema

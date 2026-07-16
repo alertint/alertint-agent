@@ -216,9 +216,15 @@ func callTwoContinuation(draftRaw json.RawMessage, round *VerificationRound, mem
 	renderVerificationResults(&b, round)
 	b.WriteString("\n\nThese results are computed facts: they outrank the draft, the evidence " +
 		"sections above, and any recalled prior hypotheses. Re-judge your draft against them. " +
-		"If they contradict it, revise — do not defend the draft. A replacement hypothesis " +
-		"formed now is itself unverified: keep its confidence moderate. Respond with the SAME " +
-		"JSON schema as before, complete (do NOT include the \"verification\" key again).")
+		"If they contradict it, revise — do not defend the draft. A query that returned no " +
+		"data weighs against the draft ONLY if it reused metric names and label keys " +
+		"confirmed present in the evidence above (a confirmed absence). Any other empty " +
+		"result is inconclusive — the expression may simply have matched nothing (for " +
+		"example, joining metrics whose label schemas differ) — so treat it as neither " +
+		"support nor contradiction and do NOT lower confidence because of it. A replacement " +
+		"hypothesis formed now is itself unverified: keep its confidence moderate. Respond " +
+		"with the SAME JSON schema as before, complete (do NOT include the \"verification\" " +
+		"key again).")
 	if memory != nil && memory.Strong != nil {
 		b.WriteString("\n\nAfter weighing the verification results, add a \"memory_verdict\" field " +
 			"judging the folded prior hypothesis in the Memory section: \"confirms\", \"refutes\", " +
