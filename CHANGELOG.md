@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-07-16
+
 ### Added
 
 - Triage prompt caching: when verification is enabled, the draft call marks
@@ -473,7 +475,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single static binary** — pure-Go SQLite (no CGO), no external runtime dependencies.
   Multi-platform builds: `linux/amd64`, `linux/arm64`, `darwin/arm64`.
 
-[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.8.2...HEAD
+[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.8.3...HEAD
+[0.8.3]: https://github.com/alertint/alertint-agent/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/alertint/alertint-agent/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/alertint/alertint-agent/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/alertint/alertint-agent/compare/v0.7.5...v0.8.0
