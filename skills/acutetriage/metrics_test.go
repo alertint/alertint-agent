@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -119,6 +120,148 @@ func TestRankSeries_CapKeepsTopN(t *testing.T) {
 	}
 	if got := rankSeries(vector(list...), members, 10); len(got) != 10 {
 		t.Errorf("cap not applied: got %d", len(got))
+	}
+}
+
+// ADR-0025: within one metric family at equal overlap, snapshots order by
+// numeric value DESCENDING — a comparator sample is a top-N by magnitude,
+// not an alphabetical slice (the f28da0d8 bias).
+func TestRankSeries_ValueOrdersWithinFamily(t *testing.T) {
+	members := memberLabelPairs([]store.Alert{alert(map[string]string{"instance": "node-1"})})
+	raw := vector(
+		s(map[string]string{"__name__": "fluentd_input_records_total", "instance": "node-1", "app": "abacus-live"}, "3.67e+06"),
+		s(map[string]string{"__name__": "fluentd_input_records_total", "instance": "node-1", "app": "anu-iap-proxy"}, "6.6e+06"),
+		s(map[string]string{"__name__": "fluentd_input_records_total", "instance": "node-1", "app": "payments-service-live"}, "5.5e+06"),
+	)
+	got := rankSeries(raw, members, 10)
+	if len(got) != 3 {
+		t.Fatalf("want 3, got %d: %+v", len(got), got)
+	}
+	if got[0].Value != "6.6e+06" || got[1].Value != "5.5e+06" || got[2].Value != "3.67e+06" {
+		t.Errorf("want value-descending order, got: %+v", got)
+	}
+}
+
+// Unparsable values rank after parsable ones within their family, tiebroken
+// by series identity — the order stays total and deterministic (R5).
+func TestRankSeries_UnparsableValueRanksLast(t *testing.T) {
+	members := memberLabelPairs([]store.Alert{alert(map[string]string{"instance": "node-1"})})
+	raw := vector(
+		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "zz"}, "not-a-number"),
+		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "aa"}, "NaN"),
+		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "small"}, "1"),
+	)
+	got := rankSeries(raw, members, 10)
+	if len(got) != 3 {
+		t.Fatalf("want 3, got %d: %+v", len(got), got)
+	}
+	if got[0].Value != "1" {
+		t.Errorf("numeric value must rank before unparsable ones: %+v", got)
+	}
+	// The two unparsable entries tiebreak by series identity ascending: aa before zz.
+	if !strings.Contains(got[1].Series, `app="aa"`) || !strings.Contains(got[2].Series, `app="zz"`) {
+		t.Errorf("unparsable tiebreak must be series-identity asc: %+v", got)
+	}
+}
+
+// Response order must not matter (R5): the same series presented reversed
+// yield the identical ranking.
+func TestRankSeries_ResponseOrderIndependent(t *testing.T) {
+	members := memberLabelPairs([]store.Alert{alert(map[string]string{"instance": "node-1"})})
+	fwd := vector(
+		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "a"}, "1"),
+		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "b"}, "2"),
+		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "c"}, "3"),
+	)
+	rev := vector(
+		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "c"}, "3"),
+		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "b"}, "2"),
+		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "a"}, "1"),
+	)
+	g1, g2 := rankSeries(fwd, members, 10), rankSeries(rev, members, 10)
+	if len(g1) != 3 || len(g2) != 3 {
+		t.Fatalf("want 3+3, got %d+%d", len(g1), len(g2))
+	}
+	for i := range g1 {
+		if g1[i] != g2[i] {
+			t.Fatalf("order-dependent ranking at %d: %+v vs %+v", i, g1[i], g2[i])
+		}
+	}
+}
+
+// ADR-0025: comparator-tier series (overlap ≤ 1) are capped at 3 per metric
+// family per scope, so one big family cannot eat every slot and hide the
+// other families.
+func TestRankSeries_ComparatorFamilyCap(t *testing.T) {
+	members := memberLabelPairs([]store.Alert{alert(map[string]string{"instance": "node-1"})})
+	raw := vector(
+		s(map[string]string{"__name__": "big_family", "instance": "node-1", "app": "a"}, "5"),
+		s(map[string]string{"__name__": "big_family", "instance": "node-1", "app": "b"}, "4"),
+		s(map[string]string{"__name__": "big_family", "instance": "node-1", "app": "c"}, "3"),
+		s(map[string]string{"__name__": "big_family", "instance": "node-1", "app": "d"}, "2"),
+		s(map[string]string{"__name__": "big_family", "instance": "node-1", "app": "e"}, "1"),
+		s(map[string]string{"__name__": "other_family", "instance": "node-1"}, "9"),
+	)
+	got := rankSeries(raw, members, 10)
+	if len(got) != 4 {
+		t.Fatalf("want 3 capped big_family + 1 other_family = 4, got %d: %+v", len(got), got)
+	}
+	// big_family keeps its TOP 3 by value; other_family survives the flood.
+	if got[0].Value != "5" || got[1].Value != "4" || got[2].Value != "3" || got[3].Metric != "other_family" {
+		t.Errorf("cap/order wrong: %+v", got)
+	}
+}
+
+// The no-regression guard: member-evidence series (overlap ≥ 2) are NEVER
+// capped or counted against the family cap — a 5-pod storm keeps every
+// member pod's series, and the family's comparators still get their own 3.
+func TestRankSeries_MemberEvidenceNeverCapped(t *testing.T) {
+	members := memberLabelPairs([]store.Alert{
+		alert(map[string]string{"instance": "node-1", "pod": "api-1"}),
+		alert(map[string]string{"instance": "node-1", "pod": "api-2"}),
+		alert(map[string]string{"instance": "node-1", "pod": "api-3"}),
+		alert(map[string]string{"instance": "node-1", "pod": "api-4"}),
+		alert(map[string]string{"instance": "node-1", "pod": "api-5"}),
+	})
+	series := []map[string]any{
+		s(map[string]string{"__name__": "http_reqs", "instance": "node-1", "pod": "api-1"}, "1"),
+		s(map[string]string{"__name__": "http_reqs", "instance": "node-1", "pod": "api-2"}, "1"),
+		s(map[string]string{"__name__": "http_reqs", "instance": "node-1", "pod": "api-3"}, "1"),
+		s(map[string]string{"__name__": "http_reqs", "instance": "node-1", "pod": "api-4"}, "1"),
+		s(map[string]string{"__name__": "http_reqs", "instance": "node-1", "pod": "api-5"}, "1"),
+		// Same family, comparator tier (shares only instance):
+		s(map[string]string{"__name__": "http_reqs", "instance": "node-1", "pod": "peer-x"}, "9"),
+		s(map[string]string{"__name__": "http_reqs", "instance": "node-1", "pod": "peer-y"}, "8"),
+		s(map[string]string{"__name__": "http_reqs", "instance": "node-1", "pod": "peer-z"}, "7"),
+		s(map[string]string{"__name__": "http_reqs", "instance": "node-1", "pod": "peer-w"}, "6"),
+	}
+	got := rankSeries(vector(series...), members, 10)
+	// 5 member series (overlap 2, uncapped) + 3 comparator series (capped) = 8.
+	if len(got) != 8 {
+		t.Fatalf("want 5 member + 3 comparators = 8, got %d: %+v", len(got), got)
+	}
+	// Members first (overlap 2), then comparators top-3 by value: 9, 8, 7.
+	if got[5].Value != "9" || got[6].Value != "8" || got[7].Value != "7" {
+		t.Errorf("comparator tail wrong: %+v", got)
+	}
+}
+
+// A metric value whose magnitude exceeds float64's range (an adversarial
+// "1e400") still parses to a meaningful ±Inf via strconv.ParseFloat's
+// ErrRange overflow case — it must rank as the largest magnitude in its
+// family, not fall to the unparsable tail (code-review finding).
+func TestRankSeries_OverflowValueRanksAsInfinite(t *testing.T) {
+	members := memberLabelPairs([]store.Alert{alert(map[string]string{"instance": "node-1"})})
+	raw := vector(
+		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "normal"}, "42"),
+		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "overflow"}, "1e400"),
+	)
+	got := rankSeries(raw, members, 10)
+	if len(got) != 2 {
+		t.Fatalf("want 2, got %d: %+v", len(got), got)
+	}
+	if got[0].Value != "1e400" {
+		t.Errorf("overflowed value must rank first (as +Inf), got: %+v", got)
 	}
 }
 

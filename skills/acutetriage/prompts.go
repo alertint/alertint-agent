@@ -191,7 +191,12 @@ func renderVerificationInstruction(b *strings.Builder, verify VerificationParams
 		"regional, infrastructure-wide) MUST include targeted disprove-queries. An empty "+
 		"list is allowed when no check would change your verdict. Two checks always run "+
 		"regardless: a parent-scope up ratio and an incidents-in-window scan — do not "+
-		"duplicate them.", verify.MaxQueries)
+		"duplicate them. Write queries that can actually return data: prefer single-metric "+
+		"expressions; reuse exact metric names and label keys visible in the Live metrics "+
+		"section or the alert labels; avoid combining two metrics (ratios, and/unless, "+
+		"group_left joins) unless both carry the same label keys — an expression joining "+
+		"metrics with mismatched label schemas returns empty regardless of what is true, "+
+		"and proves nothing.", verify.MaxQueries)
 }
 
 // callTwoContinuation builds the call-2 continuation appended after the
@@ -211,9 +216,15 @@ func callTwoContinuation(draftRaw json.RawMessage, round *VerificationRound, mem
 	renderVerificationResults(&b, round)
 	b.WriteString("\n\nThese results are computed facts: they outrank the draft, the evidence " +
 		"sections above, and any recalled prior hypotheses. Re-judge your draft against them. " +
-		"If they contradict it, revise — do not defend the draft. A replacement hypothesis " +
-		"formed now is itself unverified: keep its confidence moderate. Respond with the SAME " +
-		"JSON schema as before, complete (do NOT include the \"verification\" key again).")
+		"If they contradict it, revise — do not defend the draft. A query that returned no " +
+		"data weighs against the draft ONLY if it reused metric names and label keys " +
+		"confirmed present in the evidence above (a confirmed absence). Any other empty " +
+		"result is inconclusive — the expression may simply have matched nothing (for " +
+		"example, joining metrics whose label schemas differ) — so treat it as neither " +
+		"support nor contradiction and do NOT lower confidence because of it. A replacement " +
+		"hypothesis formed now is itself unverified: keep its confidence moderate. Respond " +
+		"with the SAME JSON schema as before, complete (do NOT include the \"verification\" " +
+		"key again).")
 	if memory != nil && memory.Strong != nil {
 		b.WriteString("\n\nAfter weighing the verification results, add a \"memory_verdict\" field " +
 			"judging the folded prior hypothesis in the Memory section: \"confirms\", \"refutes\", " +

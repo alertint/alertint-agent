@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -163,9 +165,10 @@ type MetricSnapshot struct {
 
 // rankSeries parses a Prometheus instant-vector data blob (the "data" field of
 // the API envelope), filters system metrics, and returns at most limit snapshots
-// ranked by (overlap desc, metric asc, series-identity asc) — a total,
-// response-order-independent order (R11). overlap counts a series' (k,v) label
-// pairs (excluding __name__) that a member alert also carries.
+// ranked by (overlap desc, metric asc, numeric-value desc within family,
+// series-identity asc) — a total, response-order-independent order (R5/R11,
+// ADR-0025). overlap counts a series' (k,v) label pairs (excluding __name__)
+// that a member alert also carries.
 //
 //nolint:unparam // limit is a general cap parameter exercised directly by unit tests; production callers happen to share one constant (maxSnapshotsPerScope) today.
 func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int) []MetricSnapshot {
@@ -181,6 +184,8 @@ func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int) []M
 	type cand struct {
 		snap    MetricSnapshot
 		overlap int
+		value   float64
+		numeric bool
 	}
 	cands := make([]cand, 0, len(d.Result))
 	for _, r := range d.Result {
@@ -201,9 +206,16 @@ func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int) []M
 				overlap++
 			}
 		}
+		// ErrRange means the literal's magnitude overflowed float64, but f is
+		// still a meaningful ±Inf (not garbage) — rank it as numeric, same as
+		// a literal "+Inf"/"-Inf" sample already is.
+		f, err := strconv.ParseFloat(val, 64)
+		numericErr := err == nil || errors.Is(err, strconv.ErrRange)
 		cands = append(cands, cand{
 			snap:    MetricSnapshot{Series: formatSeriesIdentity(r.Metric), Metric: name, Value: val},
 			overlap: overlap,
+			value:   f,
+			numeric: numericErr && !math.IsNaN(f),
 		})
 	}
 	sort.SliceStable(cands, func(i, j int) bool {
@@ -213,14 +225,31 @@ func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int) []M
 		if cands[i].snap.Metric != cands[j].snap.Metric {
 			return cands[i].snap.Metric < cands[j].snap.Metric
 		}
+		// Within one family: numeric values first, largest first (ADR-0025 —
+		// a comparator sample is a top-N by magnitude, not an alphabetical
+		// slice); unparsable values rank after, then series identity keeps
+		// the order total and response-order-independent (R11).
+		if cands[i].numeric != cands[j].numeric {
+			return cands[i].numeric
+		}
+		if cands[i].numeric && cands[i].value != cands[j].value {
+			return cands[i].value > cands[j].value
+		}
 		return cands[i].snap.Series < cands[j].snap.Series
 	})
-	if len(cands) > limit {
-		cands = cands[:limit]
-	}
-	out := make([]MetricSnapshot, len(cands))
-	for i, c := range cands {
-		out[i] = c.snap
+	perFamily := make(map[string]int)
+	out := make([]MetricSnapshot, 0, limit)
+	for _, c := range cands {
+		if len(out) >= limit {
+			break
+		}
+		if c.overlap <= comparatorMaxOverlap {
+			if perFamily[c.snap.Metric] >= maxSeriesPerFamily {
+				continue
+			}
+			perFamily[c.snap.Metric]++
+		}
+		out = append(out, c.snap)
 	}
 	return out
 }
@@ -258,6 +287,23 @@ func uniqueInstances(alerts []store.Alert) []string {
 }
 
 const maxSnapshotsPerScope = 10
+
+// maxSeriesPerFamily caps how many COMPARATOR-tier series one metric family
+// may take per scope (ADR-0025): a 10-slot scope then always shows several
+// families, and each family's comparator sample is its top-N by value.
+const maxSeriesPerFamily = 3
+
+// comparatorMaxOverlap is the tier boundary (ADR-0025): a series overlapping
+// the member alerts on at most this many label pairs (bare node/instance
+// context) is a comparator series and subject to the family cap; anything
+// above it is member evidence and is exempt from the per-family cap —
+// correlation must not remove evidence an uncorrelated alert would have had.
+// The overall maxSnapshotsPerScope slot budget still applies on top of this:
+// an incident with more member-evidence series than that budget (a storm
+// larger than the scope) can still see some truncated — a known, separate
+// limitation (see the group_key="" mega-incident collapse note), not one
+// this per-family cap addresses.
+const comparatorMaxOverlap = 1
 
 // maxInstanceSupplements caps how many per-instance {instance="X"} supplement
 // scopes one incident may query. A storm incident (or a group_key="" mega-merge)

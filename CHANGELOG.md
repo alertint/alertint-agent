@@ -19,6 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prefix drift). With verification disabled, requests are byte-identical to
   before and nothing is cached.
 
+### Fixed
+
+- Triage verification no longer lowers a finding's confidence over empty
+  contrast-query results unless the query reused metric names and label keys
+  confirmed present in the evidence; the verification-plan prompt now steers
+  the model toward single-metric queries and away from cross-metric label
+  joins that return empty regardless of ground truth.
+- Evidence-pack metric snapshots: comparator series (those sharing only the
+  incident's node/instance) are now ranked largest-value-first within each
+  metric family and capped at 3 per family, so the LLM sees a true top-N of
+  neighboring producers instead of an alphabetical slice; the incident's own
+  member series are never capped.
+
 ## [0.8.2] - 2026-07-16
 
 ### Fixed

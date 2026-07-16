@@ -89,6 +89,23 @@ func TestUserPromptVerificationInstructionAbsentWhenDisabled(t *testing.T) {
 	}
 }
 
+// R2 (spec 2026-07-16-verification-calibration): the plan instruction steers
+// the model toward falsifiable queries — single-metric, confirmed-vocabulary
+// expressions — and warns that a cross-family label join returns empty
+// regardless of ground truth (the f28da0d8 failure mode).
+func TestUserPromptVerificationInstructionQueryGuidance(t *testing.T) {
+	got := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil, VerificationParams{Enabled: true, MaxQueries: 4})
+	for _, want := range []string{
+		"single-metric",
+		"reuse exact metric names and label keys",
+		"mismatched label schemas returns empty",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in verification instruction:\n%s", want, got)
+		}
+	}
+}
+
 // R16: with verification enabled, memory verdict request is NOT in call 1.
 func TestMemoryVerdictMovesToCallTwo(t *testing.T) {
 	m := strongRecallFixture()
@@ -110,6 +127,22 @@ func TestMemoryVerdictStaysInCallOneWhenVerificationDisabled(t *testing.T) {
 	c1 := UserPrompt(basePack(), "{}", nil, nil, nil, nil, m, VerificationParams{Enabled: false})
 	if !strings.Contains(c1, `"memory_verdict"`) {
 		t.Fatal("verdict request must stay in call 1 on the kill-switch path")
+	}
+}
+
+// R1/ADR-0024: an empty contrast result weighs against the draft ONLY when
+// its query reused vocabulary confirmed present in the evidence (a confirmed
+// absence); every other empty is inconclusive and must not lower confidence.
+func TestCallTwoPromptEmptyResultFraming(t *testing.T) {
+	c2 := callTwoContinuation(json.RawMessage(`{"a":1}`), minimalRound(), nil)
+	for _, want := range []string{
+		"confirmed absence",
+		"inconclusive",
+		"do NOT lower confidence",
+	} {
+		if !strings.Contains(c2, want) {
+			t.Fatalf("missing %q in call-2 continuation:\n%s", want, c2)
+		}
 	}
 }
 
