@@ -362,15 +362,119 @@ func TestPromptSuffixConcatenated(t *testing.T) {
 		t.Fatalf("Complete: %v", err)
 	}
 
+	// A suffixed prompt always serializes as block array (Task 2), so
+	// reconstruct the text across blocks rather than substring-matching the
+	// raw JSON.
+	var blocks []requestBlock
+	if err := json.Unmarshal(decodeUserContent(t, gotBody), &blocks); err != nil {
+		t.Fatalf("content is not a block array: %v", err)
+	}
+	var got strings.Builder
+	for _, b := range blocks {
+		got.WriteString(b.Text)
+	}
+	if got.String() != "PREFIX-SUFFIX" {
+		t.Errorf("user content lost the prefix+suffix concatenation: %q", got.String())
+	}
+}
+
+// decodeUserContent pulls messages[0].content out of a captured request body.
+func decodeUserContent(t *testing.T, body []byte) json.RawMessage {
+	t.Helper()
 	var req struct {
 		Messages []struct {
 			Content json.RawMessage `json:"content"`
 		} `json:"messages"`
 	}
-	if err := json.Unmarshal(gotBody, &req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		t.Fatalf("parse request: %v", err)
 	}
-	if !strings.Contains(string(req.Messages[0].Content), "PREFIX-SUFFIX") {
-		t.Errorf("user content lost the prefix+suffix concatenation: %s", req.Messages[0].Content)
+	if len(req.Messages) != 1 {
+		t.Fatalf("messages = %d, want 1", len(req.Messages))
+	}
+	return req.Messages[0].Content
+}
+
+// captureServer returns a test server that records the last request body.
+func captureServer(t *testing.T, body *[]byte) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*body, _ = io.ReadAll(r.Body)
+		fmt.Fprint(w, responseBody(`{"ok":true}`, 1, 1))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+type requestBlock struct {
+	Type         string          `json:"type"`
+	Text         string          `json:"text"`
+	CacheControl json.RawMessage `json:"cache_control"`
+}
+
+// TestMarkedPromptEmitsBlocksWithBreakpoint: marked + suffix → two text
+// blocks, cache_control {"type":"ephemeral"} on the prefix block ONLY, no ttl.
+func TestMarkedPromptEmitsBlocksWithBreakpoint(t *testing.T) {
+	var body []byte
+	srv := captureServer(t, &body)
+	c := llm.NewWithHTTPClient(llm.Config{APIKey: "k"}, nil, nil, srv.URL)
+	if _, err := c.Complete(context.Background(), "sys",
+		llm.Prompt{Prefix: "E", Suffix: "DV", CachePrefix: true}, nil); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	var blocks []requestBlock
+	if err := json.Unmarshal(decodeUserContent(t, body), &blocks); err != nil {
+		t.Fatalf("content is not a block array: %v", err)
+	}
+	if len(blocks) != 2 {
+		t.Fatalf("blocks = %d, want 2", len(blocks))
+	}
+	if blocks[0].Text != "E" || blocks[1].Text != "DV" {
+		t.Errorf("block texts = %q, %q", blocks[0].Text, blocks[1].Text)
+	}
+	if string(blocks[0].CacheControl) != `{"type":"ephemeral"}` {
+		t.Errorf("prefix cache_control = %s, want {\"type\":\"ephemeral\"}", blocks[0].CacheControl)
+	}
+	if blocks[1].CacheControl != nil {
+		t.Errorf("suffix block must not carry cache_control, got %s", blocks[1].CacheControl)
+	}
+}
+
+// TestMarkedPromptNoSuffixSingleBlock: call-1 shape — one marked block.
+func TestMarkedPromptNoSuffixSingleBlock(t *testing.T) {
+	var body []byte
+	srv := captureServer(t, &body)
+	c := llm.NewWithHTTPClient(llm.Config{APIKey: "k"}, nil, nil, srv.URL)
+	if _, err := c.Complete(context.Background(), "sys",
+		llm.Prompt{Prefix: "E", CachePrefix: true}, nil); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	var blocks []requestBlock
+	if err := json.Unmarshal(decodeUserContent(t, body), &blocks); err != nil {
+		t.Fatalf("content is not a block array: %v", err)
+	}
+	if len(blocks) != 1 || string(blocks[0].CacheControl) != `{"type":"ephemeral"}` {
+		t.Errorf("want one marked block, got %+v", blocks)
+	}
+}
+
+// TestUnmarkedPromptKeepsLegacyStringShape: the kill-switch guarantee — an
+// unmarked, suffix-less prompt serializes content as a plain JSON string,
+// byte-identical to the pre-caching client.
+func TestUnmarkedPromptKeepsLegacyStringShape(t *testing.T) {
+	var body []byte
+	srv := captureServer(t, &body)
+	c := llm.NewWithHTTPClient(llm.Config{APIKey: "k"}, nil, nil, srv.URL)
+	if _, err := c.Complete(context.Background(), "sys",
+		llm.Prompt{Prefix: "plain user prompt"}, nil); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	content := decodeUserContent(t, body)
+	var s string
+	if err := json.Unmarshal(content, &s); err != nil {
+		t.Fatalf("content is not a plain JSON string (legacy shape broken): %s", content)
+	}
+	if s != "plain user prompt" {
+		t.Errorf("content = %q", s)
 	}
 }

@@ -229,8 +229,43 @@ type thinkingConfig struct {
 }
 
 type message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role string `json:"role"`
+	// Content is string (legacy single-turn shape, byte-identical to the
+	// pre-caching client) or []requestContentBlock (when a cache breakpoint
+	// or a suffix needs block structure). See userContent.
+	Content any `json:"content"`
+}
+
+// cacheControl marks a request content block as a prompt-cache breakpoint.
+// Only the default 5-minute TTL is ever used — no ttl field.
+type cacheControl struct {
+	Type string `json:"type"` // always "ephemeral"
+}
+
+// requestContentBlock is one text block of a block-typed user turn.
+type requestContentBlock struct {
+	Type         string        `json:"type"` // always "text"
+	Text         string        `json:"text"`
+	CacheControl *cacheControl `json:"cache_control,omitempty"`
+}
+
+// userContent renders the user turn. Plain string when nothing needs block
+// structure — the verification kill switch keeps its byte-identity guarantee.
+// Block array when a breakpoint or suffix is present: the breakpoint sits on
+// the prefix block, caching the cumulative tools+system+prefix span; the
+// suffix block is never marked.
+func userContent(p Prompt) any {
+	if !p.CachePrefix && p.Suffix == "" {
+		return p.Prefix
+	}
+	blocks := []requestContentBlock{{Type: "text", Text: p.Prefix}}
+	if p.CachePrefix {
+		blocks[0].CacheControl = &cacheControl{Type: "ephemeral"}
+	}
+	if p.Suffix != "" {
+		blocks = append(blocks, requestContentBlock{Type: "text", Text: p.Suffix})
+	}
+	return blocks
 }
 
 // messagesResponse is the relevant subset of the Anthropic response.
@@ -291,7 +326,7 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt Prompt) (j
 		Model:     c.cfg.Model,
 		MaxTokens: c.cfg.MaxTokens,
 		System:    system,
-		Messages:  []message{{Role: "user", Content: prompt.text()}},
+		Messages:  []message{{Role: "user", Content: userContent(prompt)}},
 		Thinking:  &thinkingConfig{Type: "disabled"},
 	}
 	encoded, err := json.Marshal(body)
