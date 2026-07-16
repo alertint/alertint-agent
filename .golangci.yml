@@ -38,8 +38,21 @@ linters:
     - nilerr           # MCP tool handlers intentionally return (result, nil) when err != nil — errors become tool result payloads, not transport errors
     - gocognit         # runServe and Config.Validate are hub functions that are naturally dense; extracting helpers would obscure control flow
     - maintidx         # same reason as gocognit — maintainability index penalises the top-level wiring function
+  exclusions:
+    paths:
+      # Linked git worktrees live under .claude/worktrees/ with no separate
+      # go.mod, so they share this module's package paths. go build/go vet
+      # already skip dot-directories by convention; golangci-lint does not,
+      # so a lint run from the repo root also (mis)scans nested worktree
+      # checkouts as duplicate copies of the same packages. Excluding them
+      # here only affects scans rooted at the primary checkout — a worktree
+      # linting itself (cd into it, golangci-lint run ./...) is unaffected.
+      - "^\\.claude/worktrees/"
 
 formatters:
   enable:
     - gofmt
     - goimports
+  exclusions:
+    paths:
+      - "^\\.claude/worktrees/"

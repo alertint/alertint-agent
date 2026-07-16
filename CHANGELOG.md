@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Storm-sized incidents no longer fail triage with `llm: response truncated at max_tokens`:
+  prompts now itemize at most the 20 most significant alerts (omitted members are recorded
+  with the `correlated` role deterministically) and cap finding prose, so the response's
+  output-token size stays flat at any incident size. `llm.max_tokens` is unchanged.
+
 ## [0.8.1] - 2026-07-15
 
 ### Fixed

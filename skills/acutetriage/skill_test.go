@@ -990,3 +990,121 @@ func TestPipeline_AttachesEvidenceSummaryAndPersistsMetrics(t *testing.T) {
 		t.Errorf("short-circuit finding must report Evidence.Skipped, got %+v", notifier.last.Evidence)
 	}
 }
+
+// TestRunDefaultsUnitemizedAlertRoles: member alerts the model omits from its
+// alerts array get the "correlated" role deterministically (bounded
+// itemization) — MCP consumers always see a role on every member.
+func TestRunDefaultsUnitemizedAlertRoles(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+
+	a1 := insertTestAlert(t, st, ctx, inc.ID, "fp-u1", map[string]string{"alertname": "Net"})
+	a2 := insertTestAlert(t, st, ctx, inc.ID, "fp-u2", map[string]string{"alertname": "Net"})
+	a3 := insertTestAlert(t, st, ctx, inc.ID, "fp-u3", map[string]string{"alertname": "Net"})
+
+	// The model itemizes only a1; a2 and a3 are omitted (top-N behavior).
+	roleResp, err := json.Marshal(map[string]any{
+		"analysis_name":        "Net issue",
+		"overall_issue":        "packet loss",
+		"correlation_findings": []string{},
+		"severity":             "medium",
+		"confidence":           0.7,
+		"alerts": []map[string]string{
+			{"alert_id": a1.ID, "role_in_incident": "primary"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	fllm := &fakeLLM{response: roleResp}
+	skill := acutetriage.New(acutetriage.Config{WindowSeconds: 60}, st, fllm, nil, nil, nil)
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	rows, err := st.DB().QueryContext(ctx, `SELECT alert_id, role FROM incident_alerts WHERE incident_id = ? ORDER BY alert_id`, inc.ID)
+	if err != nil {
+		t.Fatalf("query roles: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	roles := map[string]string{}
+	for rows.Next() {
+		var alertID string
+		var role sql.NullString
+		if err := rows.Scan(&alertID, &role); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if role.Valid {
+			roles[alertID] = role.String
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows error: %v", err)
+	}
+	if roles[a1.ID] != "primary" {
+		t.Errorf("a1 role = %q, want primary (model's own call must win)", roles[a1.ID])
+	}
+	if roles[a2.ID] != "correlated" {
+		t.Errorf("a2 role = %q, want correlated (defaulted)", roles[a2.ID])
+	}
+	if roles[a3.ID] != "correlated" {
+		t.Errorf("a3 role = %q, want correlated (defaulted)", roles[a3.ID])
+	}
+}
+
+// TestRejudgeDoesNotDowngradePreviouslyItemizedRole: an alert itemized as
+// "primary" on the initial triage must keep that role on a later re-judgment
+// even if the new response's (independently capped) itemization omits it —
+// omission on a later call must not be read as a fresh "correlated" verdict
+// overwriting an earlier explicit classification.
+func TestRejudgeDoesNotDowngradePreviouslyItemizedRole(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+
+	a1 := insertTestAlert(t, st, ctx, inc.ID, "fp-rd1", map[string]string{"alertname": "Net"})
+	a2 := insertTestAlert(t, st, ctx, inc.ID, "fp-rd2", map[string]string{"alertname": "Net"})
+
+	fllm := &fakeLLM{response: validLLMResponse([]string{a1.ID, a2.ID})}
+	skill := acutetriage.New(acutetriage.Config{WindowSeconds: 60}, st, fllm, nil, nil, nil)
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("initial Run: %v", err)
+	}
+
+	analyzed, err := st.GetIncidentByID(ctx, inc.ID)
+	if err != nil || analyzed == nil {
+		t.Fatalf("reload analyzed incident: %v", err)
+	}
+
+	// The re-judgment's own itemization omits a2 (independently capped —
+	// nothing to do with a2's earlier classification).
+	fllm.response = namedLLMResponse("Net issue, revisited", "packet loss persists", []string{a1.ID}, 0.8)
+	if err := skill.Rejudge(ctx, *analyzed, "cadence"); err != nil {
+		t.Fatalf("Rejudge: %v", err)
+	}
+
+	rows, err := st.DB().QueryContext(ctx, `SELECT alert_id, role FROM incident_alerts WHERE incident_id = ? ORDER BY alert_id`, inc.ID)
+	if err != nil {
+		t.Fatalf("query roles: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	roles := map[string]string{}
+	for rows.Next() {
+		var alertID string
+		var role sql.NullString
+		if err := rows.Scan(&alertID, &role); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if role.Valid {
+			roles[alertID] = role.String
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows error: %v", err)
+	}
+	if roles[a2.ID] != "primary" {
+		t.Errorf("a2 role = %q, want primary (must not be downgraded by omission on re-judgment)", roles[a2.ID])
+	}
+}

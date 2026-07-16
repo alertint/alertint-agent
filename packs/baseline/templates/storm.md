@@ -23,7 +23,12 @@ Rules:
 - confidence is a float in [0.0, 1.0] for the shared-cause hypothesis.
 - correlation_findings must lead with the suspected shared dependency and the
   affected service count, then the strongest supporting evidence.
-- Every alert_id in the input must appear exactly once in the alerts array;
-  mark at most a handful "primary" and the rest "downstream" or "noise".
+- If the input contains more than 20 alerts, itemize only the 20 most significant — the
+  primary candidates and any true "noise"; omit the long tail of downstream symptoms,
+  which are recorded as "correlated" automatically. With 20 or fewer alerts, every
+  alert_id must appear exactly once; mark at most a handful "primary" and the rest
+  "downstream" or "noise".
+- Keep prose tight: at most 6 correlation_findings, each at most 25 words; overall_issue
+  stays a single sentence.
 - If a "Live metrics" section is present, use those values to calibrate severity and
   confidence — actual metric values take precedence over numeric claims in annotations.
