@@ -143,8 +143,9 @@ func BuildEvidencePack(inc store.Incident, alerts []store.Alert, windowSeconds i
 // optional — pass nil when no log source is configured; when non-nil it always
 // renders a "Recent logs" section (lines, or a note explaining their absence).
 // verify.Enabled gates the verification-plan instruction (R1) and, when true,
-// moves the memory-verdict request out of this call and into callTwoPrompt
-// (R16) — call 2 is where the model re-judges with real evidence in hand, so
+// moves the memory-verdict request out of this call and into
+// callTwoContinuation (R16) — call 2 is where the model re-judges with real
+// evidence in hand, so
 // asking for a verdict here would have it judge the recalled prior against
 // nothing but its own draft. verify.Enabled == false reproduces the pre-Task-5
 // prompt byte-for-byte (the kill switch).
@@ -193,18 +194,18 @@ func renderVerificationInstruction(b *strings.Builder, verify VerificationParams
 		"duplicate them.", verify.MaxQueries)
 }
 
-// callTwoPrompt builds the full continuation prompt for the second LLM call
-// (R5): call 1's prompt verbatim (byte-identical prefix — the load-bearing
-// property for prompt caching), the model's own draft verdict, the computed
-// verification results, and a re-judge instruction. The verification results
-// are computed facts and OUTRANK the draft, the evidence sections above, and
-// any recalled prior hypotheses — the model is told to revise, not defend.
-// The memory-verdict request (moved here from call 1 per R16 when
-// verification is enabled) is appended only when a strong prior was recalled,
-// so the marks it drives have a target to judge.
-func callTwoPrompt(callOne string, draftRaw json.RawMessage, round *VerificationRound, memory *MemoryEnrichment) string {
+// callTwoContinuation builds the call-2 continuation appended after the
+// shared prefix (call 1's prompt, passed separately as Prompt.Prefix so the
+// client can mark the cache boundary — the shared prefix is the load-bearing
+// property, see CONTEXT.md "Shared prefix"): the model's own draft verdict,
+// the computed verification results, and a re-judge instruction. The
+// verification results are computed facts and OUTRANK the draft, the
+// evidence sections above, and any recalled prior hypotheses — the model is
+// told to revise, not defend. The memory-verdict request (moved here from
+// call 1 per R16 when verification is enabled) is appended only when a
+// strong prior was recalled, so the marks it drives have a target to judge.
+func callTwoContinuation(draftRaw json.RawMessage, round *VerificationRound, memory *MemoryEnrichment) string {
 	var b strings.Builder
-	b.WriteString(callOne)
 	b.WriteString("\n\n## Your draft verdict (your own prior output)\n")
 	b.Write(draftRaw)
 	renderVerificationResults(&b, round)

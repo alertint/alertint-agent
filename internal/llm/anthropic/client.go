@@ -133,7 +133,22 @@ type Completion struct {
 	Latency      time.Duration
 }
 
-// Complete sends systemPrompt + userPrompt to the model and returns a
+// Prompt is the user-turn payload of a Complete call. Prefix is always set;
+// Suffix is the verification round's call-2 continuation (empty on a
+// single-call prompt). CachePrefix marks the end of Prefix as a prompt-cache
+// breakpoint — set it only when a follow-up call reusing Prefix verbatim is
+// guaranteed (the verification pair), otherwise the cache write premium is
+// paid with no matching read.
+type Prompt struct {
+	Prefix      string
+	Suffix      string
+	CachePrefix bool
+}
+
+// text is the full user-turn text, prefix and suffix joined.
+func (p Prompt) text() string { return p.Prefix + p.Suffix }
+
+// Complete sends systemPrompt + prompt to the model and returns a
 // Completion whose Raw is the JSON extracted from the assistant's first text
 // content block, alongside the model, token usage, and latency.
 //
@@ -145,12 +160,12 @@ type Completion struct {
 // type.
 func (c *Client) Complete(
 	ctx context.Context,
-	systemPrompt, userPrompt string,
+	systemPrompt string, prompt Prompt,
 	requiredKeys []string,
 ) (Completion, error) {
 	start := c.now()
 
-	reqHash := promptHash(systemPrompt, userPrompt)
+	reqHash := promptHash(systemPrompt, prompt.text())
 	if c.auditor != nil {
 		_ = c.auditor.Append(ctx, "llm.anthropic", "llm.request", map[string]any{
 			"model":       c.cfg.Model,
@@ -158,7 +173,7 @@ func (c *Client) Complete(
 		})
 	}
 
-	raw, inputTokens, outputTokens, err := c.callWithRetry(ctx, systemPrompt, userPrompt)
+	raw, inputTokens, outputTokens, err := c.callWithRetry(ctx, systemPrompt, prompt)
 	latency := c.now().Sub(start)
 
 	if c.auditor != nil {
@@ -241,7 +256,7 @@ type apiError struct {
 
 // callWithRetry executes the HTTP request, retrying on 429/529 with
 // exponential backoff up to MaxRetries times.
-func (c *Client) callWithRetry(ctx context.Context, system, user string) (raw json.RawMessage, inputTok, outputTok int, err error) {
+func (c *Client) callWithRetry(ctx context.Context, system string, prompt Prompt) (raw json.RawMessage, inputTok, outputTok int, err error) {
 	delay := c.cfg.BaseRetryDelay
 	for attempt := 0; attempt <= MaxRetries; attempt++ {
 		if attempt > 0 {
@@ -252,7 +267,7 @@ func (c *Client) callWithRetry(ctx context.Context, system, user string) (raw js
 			}
 			delay *= 2
 		}
-		raw, inputTok, outputTok, err = c.doRequest(ctx, system, user)
+		raw, inputTok, outputTok, err = c.doRequest(ctx, system, prompt)
 		if err == nil {
 			return raw, inputTok, outputTok, nil
 		}
@@ -271,12 +286,12 @@ func (c *Client) callWithRetry(ctx context.Context, system, user string) (raw js
 }
 
 // doRequest performs a single HTTP call to the Messages API.
-func (c *Client) doRequest(ctx context.Context, system, user string) (json.RawMessage, int, int, error) {
+func (c *Client) doRequest(ctx context.Context, system string, prompt Prompt) (json.RawMessage, int, int, error) {
 	body := messagesRequest{
 		Model:     c.cfg.Model,
 		MaxTokens: c.cfg.MaxTokens,
 		System:    system,
-		Messages:  []message{{Role: "user", Content: user}},
+		Messages:  []message{{Role: "user", Content: prompt.text()}},
 		Thinking:  &thinkingConfig{Type: "disabled"},
 	}
 	encoded, err := json.Marshal(body)

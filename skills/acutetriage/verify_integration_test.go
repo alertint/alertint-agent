@@ -43,11 +43,11 @@ type scriptedLLM struct {
 	prompts   []string
 }
 
-func (f *scriptedLLM) Complete(_ context.Context, system, user string, _ []string) (llm.Completion, error) {
+func (f *scriptedLLM) Complete(_ context.Context, system string, p llm.Prompt, _ []string) (llm.Completion, error) {
 	i := f.calls
 	f.calls++
 	f.systems = append(f.systems, system)
-	f.prompts = append(f.prompts, user)
+	f.prompts = append(f.prompts, p.Prefix+p.Suffix)
 	if i >= len(f.responses) {
 		return llm.Completion{}, fmt.Errorf("scriptedLLM: unexpected call %d (only %d scripted)", i+1, len(f.responses))
 	}

@@ -536,7 +536,7 @@ func verificationLive(v *VerificationEnrichment) bool {
 }
 
 // renderVerificationResults appends the round's computed-facts section for
-// call 2 (Task 5's callTwoPrompt is the sole caller): the full "## Verification
+// call 2 (callTwoContinuation is the sole caller): the full "## Verification
 // results (computed, read-only)" header, then one entry per query (floor
 // first, in Queries order) naming its source/kind and why, followed by the
 // SAME Result string runVerification already rendered, flattened, and capped

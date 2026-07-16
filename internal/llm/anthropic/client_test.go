@@ -101,7 +101,7 @@ func TestSuccess(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv.URL, nil)
-	comp, err := c.Complete(context.Background(), "sys", "user", []string{"analysis_name", "confidence"})
+	comp, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "user"}, []string{"analysis_name", "confidence"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestDefaultModelAndThinkingDisabled(t *testing.T) {
 	defer srv.Close()
 
 	c := llm.NewWithHTTPClient(llm.Config{APIKey: "k"}, nil, nil, srv.URL)
-	if _, err := c.Complete(context.Background(), "sys", "user", []string{"analysis_name"}); err != nil {
+	if _, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "user"}, []string{"analysis_name"}); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
 	if body["model"] != llm.DefaultModel {
@@ -172,7 +172,7 @@ func TestMarkdownFenceStripped(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv.URL, nil)
-	comp, err := c.Complete(context.Background(), "sys", "user", []string{"key"})
+	comp, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "user"}, []string{"key"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -201,7 +201,7 @@ func TestRetryOn429(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv.URL, nil)
-	comp, err := c.Complete(context.Background(), "sys", "user", []string{"result"})
+	comp, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "user"}, []string{"result"})
 	if err != nil {
 		t.Fatalf("unexpected error after retries: %v", err)
 	}
@@ -225,7 +225,7 @@ func TestRetryExhausted(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv.URL, nil)
-	_, err := c.Complete(context.Background(), "sys", "user", nil)
+	_, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "user"}, nil)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -245,7 +245,7 @@ func TestSchemaViolation(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv.URL, nil)
-	_, err := c.Complete(context.Background(), "sys", "user", []string{"only_key", "missing_key"})
+	_, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "user"}, []string{"only_key", "missing_key"})
 	if err == nil {
 		t.Fatal("expected schema violation error, got nil")
 	}
@@ -270,7 +270,7 @@ func TestMaxTokensTruncationError(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv.URL, nil)
-	_, err := c.Complete(context.Background(), "sys", "user", []string{"analysis_name"})
+	_, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "user"}, []string{"analysis_name"})
 	if err == nil {
 		t.Fatal("expected truncation error, got nil")
 	}
@@ -293,7 +293,7 @@ func TestNon429ErrorNotRetried(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv.URL, nil)
-	_, err := c.Complete(context.Background(), "sys", "user", nil)
+	_, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "user"}, nil)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -316,7 +316,7 @@ func TestAuditRowsWritten(t *testing.T) {
 	c := newTestClient(t, srv.URL, auditor)
 
 	ctx := context.Background()
-	_, err := c.Complete(ctx, "sys", "user", []string{"ok"})
+	_, err := c.Complete(ctx, "sys", llm.Prompt{Prefix: "user"}, []string{"ok"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -343,4 +343,34 @@ func countAuditRows(db *sql.DB, kinds ...string) (map[string]int, error) {
 		out[k] = n
 	}
 	return out, nil
+}
+
+// TestPromptSuffixConcatenated verifies a Prompt with prefix+suffix reaches
+// the API as one user turn whose content is the exact concatenation (Task 2
+// changes the encoding to blocks when marked; the text must survive either way).
+func TestPromptSuffixConcatenated(t *testing.T) {
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		fmt.Fprint(w, responseBody(`{"ok":true}`, 1, 1))
+	}))
+	defer srv.Close()
+
+	c := llm.NewWithHTTPClient(llm.Config{APIKey: "k"}, nil, nil, srv.URL)
+	if _, err := c.Complete(context.Background(), "sys",
+		llm.Prompt{Prefix: "PREFIX-", Suffix: "SUFFIX"}, nil); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	var req struct {
+		Messages []struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(gotBody, &req); err != nil {
+		t.Fatalf("parse request: %v", err)
+	}
+	if !strings.Contains(string(req.Messages[0].Content), "PREFIX-SUFFIX") {
+		t.Errorf("user content lost the prefix+suffix concatenation: %s", req.Messages[0].Content)
+	}
 }

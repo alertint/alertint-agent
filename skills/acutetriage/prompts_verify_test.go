@@ -30,7 +30,7 @@ func strongRecallFixture() *MemoryEnrichment {
 	}
 }
 
-// minimalRound is a minimal VerificationRound fixture for callTwoPrompt tests.
+// minimalRound is a minimal VerificationRound fixture for callTwoContinuation tests.
 func minimalRound() *VerificationRound {
 	return &VerificationRound{
 		Queries: []VerificationQuery{
@@ -96,8 +96,8 @@ func TestMemoryVerdictMovesToCallTwo(t *testing.T) {
 	if strings.Contains(c1, `"memory_verdict"`) {
 		t.Fatal("verdict request must not render in call 1 when verification is enabled")
 	}
-	// …and IS in call 2.
-	c2 := callTwoPrompt(c1, json.RawMessage(`{"overall_issue":"x","confidence":0.9}`), minimalRound(), m)
+	// …and IS in call 2's continuation.
+	c2 := callTwoContinuation(json.RawMessage(`{"overall_issue":"x","confidence":0.9}`), minimalRound(), m)
 	if !strings.Contains(c2, `"memory_verdict"`) {
 		t.Fatal("verdict request must render in call 2")
 	}
@@ -113,12 +113,14 @@ func TestMemoryVerdictStaysInCallOneWhenVerificationDisabled(t *testing.T) {
 	}
 }
 
-// Call 2 structure: prefix byte-identical (prompt-cache), results outrank, complete schema demanded.
-func TestCallTwoPromptShape(t *testing.T) {
-	c1 := "CALL-ONE-PROMPT"
-	c2 := callTwoPrompt(c1, json.RawMessage(`{"a":1}`), minimalRound(), nil)
-	if !strings.HasPrefix(c2, c1) {
-		t.Fatal("call 2 must start with call 1's prompt byte-identical (R5 cache prefix)")
+// Call 2 continuation structure: opens with the draft-verdict header (the
+// shared prefix is now carried separately as Prompt.Prefix, not concatenated
+// here — see CONTEXT.md "Shared prefix"), results outrank, complete schema
+// demanded.
+func TestCallTwoContinuationShape(t *testing.T) {
+	c2 := callTwoContinuation(json.RawMessage(`{"a":1}`), minimalRound(), nil)
+	if !strings.HasPrefix(c2, "\n\n## Your draft verdict") {
+		t.Fatal("call 2 continuation must open with the draft-verdict header")
 	}
 	for _, want := range []string{"Verification results (computed, read-only)",
 		"do not defend", "outrank", "SAME JSON schema"} {
@@ -128,10 +130,10 @@ func TestCallTwoPromptShape(t *testing.T) {
 	}
 }
 
-// callTwoPrompt must not ask for a memory_verdict when there is no strong
-// recall to judge.
-func TestCallTwoPromptOmitsMemoryVerdictWhenNoMemory(t *testing.T) {
-	c2 := callTwoPrompt("CALL-ONE-PROMPT", json.RawMessage(`{"a":1}`), minimalRound(), nil)
+// callTwoContinuation must not ask for a memory_verdict when there is no
+// strong recall to judge.
+func TestCallTwoContinuationOmitsMemoryVerdictWhenNoMemory(t *testing.T) {
+	c2 := callTwoContinuation(json.RawMessage(`{"a":1}`), minimalRound(), nil)
 	if strings.Contains(c2, `"memory_verdict"`) {
 		t.Fatalf("no memory recalled: must not request a memory_verdict:\n%s", c2)
 	}
