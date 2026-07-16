@@ -749,6 +749,15 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 		s.logger.Warn("acutetriage: verification re-judge failed; draft stands", "incident", inc.ID, "err", err)
 		return s.degradedDraft(ctx, inc.ID, ar.raw, round, resp)
 	}
+	// Cache-engagement probe: call 2 always marks the shared prefix, so a zero
+	// cache read means the prefix is below the model's cacheable floor (benign,
+	// permanent on small models) or the prefix drifted (a regression). The two
+	// are indistinguishable here, so this stays a per-pair WARN — never
+	// once-then-quiet — and floors are asserted nowhere (they drift per release).
+	if comp.CacheReadInputTokens == 0 {
+		s.logger.Warn("acutetriage: verification call 2 read no cached prefix (prefix below the model's cacheable floor, or prefix drift)",
+			"incident", inc.ID, "model", comp.Model, "prefix_chars", len(ar.user))
+	}
 	var resp2 llmResponse
 	if err := json.Unmarshal(comp.Raw, &resp2); err != nil {
 		// A malformed re-judge must not fail a triage that has a valid draft.
