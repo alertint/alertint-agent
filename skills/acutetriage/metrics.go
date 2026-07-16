@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -163,9 +165,10 @@ type MetricSnapshot struct {
 
 // rankSeries parses a Prometheus instant-vector data blob (the "data" field of
 // the API envelope), filters system metrics, and returns at most limit snapshots
-// ranked by (overlap desc, metric asc, series-identity asc) — a total,
-// response-order-independent order (R11). overlap counts a series' (k,v) label
-// pairs (excluding __name__) that a member alert also carries.
+// ranked by (overlap desc, metric asc, numeric-value desc within family,
+// series-identity asc) — a total, response-order-independent order (R5/R11,
+// ADR-0025). overlap counts a series' (k,v) label pairs (excluding __name__)
+// that a member alert also carries.
 //
 //nolint:unparam // limit is a general cap parameter exercised directly by unit tests; production callers happen to share one constant (maxSnapshotsPerScope) today.
 func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int) []MetricSnapshot {
@@ -181,6 +184,8 @@ func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int) []M
 	type cand struct {
 		snap    MetricSnapshot
 		overlap int
+		value   float64
+		numeric bool
 	}
 	cands := make([]cand, 0, len(d.Result))
 	for _, r := range d.Result {
@@ -201,9 +206,12 @@ func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int) []M
 				overlap++
 			}
 		}
+		f, err := strconv.ParseFloat(val, 64)
 		cands = append(cands, cand{
 			snap:    MetricSnapshot{Series: formatSeriesIdentity(r.Metric), Metric: name, Value: val},
 			overlap: overlap,
+			value:   f,
+			numeric: err == nil && !math.IsNaN(f),
 		})
 	}
 	sort.SliceStable(cands, func(i, j int) bool {
@@ -212,6 +220,16 @@ func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int) []M
 		}
 		if cands[i].snap.Metric != cands[j].snap.Metric {
 			return cands[i].snap.Metric < cands[j].snap.Metric
+		}
+		// Within one family: numeric values first, largest first (ADR-0025 —
+		// a comparator sample is a top-N by magnitude, not an alphabetical
+		// slice); unparsable values rank after, then series identity keeps
+		// the order total and response-order-independent (R11).
+		if cands[i].numeric != cands[j].numeric {
+			return cands[i].numeric
+		}
+		if cands[i].numeric && cands[i].value != cands[j].value {
+			return cands[i].value > cands[j].value
 		}
 		return cands[i].snap.Series < cands[j].snap.Series
 	})

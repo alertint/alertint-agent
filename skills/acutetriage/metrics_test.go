@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -119,6 +120,72 @@ func TestRankSeries_CapKeepsTopN(t *testing.T) {
 	}
 	if got := rankSeries(vector(list...), members, 10); len(got) != 10 {
 		t.Errorf("cap not applied: got %d", len(got))
+	}
+}
+
+// ADR-0025: within one metric family at equal overlap, snapshots order by
+// numeric value DESCENDING — a comparator sample is a top-N by magnitude,
+// not an alphabetical slice (the f28da0d8 bias).
+func TestRankSeries_ValueOrdersWithinFamily(t *testing.T) {
+	members := memberLabelPairs([]store.Alert{alert(map[string]string{"instance": "node-1"})})
+	raw := vector(
+		s(map[string]string{"__name__": "fluentd_input_records_total", "instance": "node-1", "app": "abacus-live"}, "3.67e+06"),
+		s(map[string]string{"__name__": "fluentd_input_records_total", "instance": "node-1", "app": "anu-iap-proxy"}, "6.6e+06"),
+		s(map[string]string{"__name__": "fluentd_input_records_total", "instance": "node-1", "app": "payments-service-live"}, "5.5e+06"),
+	)
+	got := rankSeries(raw, members, 10)
+	if len(got) != 3 {
+		t.Fatalf("want 3, got %d: %+v", len(got), got)
+	}
+	if got[0].Value != "6.6e+06" || got[1].Value != "5.5e+06" || got[2].Value != "3.67e+06" {
+		t.Errorf("want value-descending order, got: %+v", got)
+	}
+}
+
+// Unparsable values rank after parsable ones within their family, tiebroken
+// by series identity — the order stays total and deterministic (R5).
+func TestRankSeries_UnparsableValueRanksLast(t *testing.T) {
+	members := memberLabelPairs([]store.Alert{alert(map[string]string{"instance": "node-1"})})
+	raw := vector(
+		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "zz"}, "not-a-number"),
+		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "aa"}, "NaN"),
+		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "small"}, "1"),
+	)
+	got := rankSeries(raw, members, 10)
+	if len(got) != 3 {
+		t.Fatalf("want 3, got %d: %+v", len(got), got)
+	}
+	if got[0].Value != "1" {
+		t.Errorf("numeric value must rank before unparsable ones: %+v", got)
+	}
+	// The two unparsable entries tiebreak by series identity ascending: aa before zz.
+	if !strings.Contains(got[1].Series, `app="aa"`) || !strings.Contains(got[2].Series, `app="zz"`) {
+		t.Errorf("unparsable tiebreak must be series-identity asc: %+v", got)
+	}
+}
+
+// Response order must not matter (R5): the same series presented reversed
+// yield the identical ranking.
+func TestRankSeries_ResponseOrderIndependent(t *testing.T) {
+	members := memberLabelPairs([]store.Alert{alert(map[string]string{"instance": "node-1"})})
+	fwd := vector(
+		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "a"}, "1"),
+		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "b"}, "2"),
+		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "c"}, "3"),
+	)
+	rev := vector(
+		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "c"}, "3"),
+		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "b"}, "2"),
+		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "a"}, "1"),
+	)
+	g1, g2 := rankSeries(fwd, members, 10), rankSeries(rev, members, 10)
+	if len(g1) != 3 || len(g2) != 3 {
+		t.Fatalf("want 3+3, got %d+%d", len(g1), len(g2))
+	}
+	for i := range g1 {
+		if g1[i] != g2[i] {
+			t.Fatalf("order-dependent ranking at %d: %+v vs %+v", i, g1[i], g2[i])
+		}
 	}
 }
 
