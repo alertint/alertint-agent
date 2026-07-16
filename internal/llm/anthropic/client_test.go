@@ -352,7 +352,7 @@ func TestPromptSuffixConcatenated(t *testing.T) {
 	var gotBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotBody, _ = io.ReadAll(r.Body)
-		fmt.Fprint(w, responseBody(`{"ok":true}`, 1, 1))
+		_, _ = fmt.Fprint(w, responseBody(`{"ok":true}`, 1, 1))
 	}))
 	defer srv.Close()
 
@@ -400,7 +400,7 @@ func captureServer(t *testing.T, body *[]byte) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		*body, _ = io.ReadAll(r.Body)
-		fmt.Fprint(w, responseBody(`{"ok":true}`, 1, 1))
+		_, _ = fmt.Fprint(w, responseBody(`{"ok":true}`, 1, 1))
 	}))
 	t.Cleanup(srv.Close)
 	return srv
@@ -490,7 +490,10 @@ func responseBodyCached(text string, inputTok, outputTok, cacheW, cacheR int) st
 			"cache_read_input_tokens":     cacheR,
 		},
 	}
-	b, _ := json.Marshal(payload)
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return "{}"
+	}
 	return string(b)
 }
 
@@ -498,7 +501,7 @@ func responseBodyCached(text string, inputTok, outputTok, cacheW, cacheR int) st
 // llm.response audit payload.
 func TestCacheUsageCaptured(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, responseBodyCached(`{"ok":true}`, 7, 3, 4200, 1100))
+		_, _ = fmt.Fprint(w, responseBodyCached(`{"ok":true}`, 7, 3, 4200, 1100))
 	}))
 	defer srv.Close()
 
