@@ -478,3 +478,55 @@ func TestUnmarkedPromptKeepsLegacyStringShape(t *testing.T) {
 		t.Errorf("content = %q", s)
 	}
 }
+
+// responseBodyCached builds a success body whose usage carries cache fields.
+func responseBodyCached(text string, inputTok, outputTok, cacheW, cacheR int) string {
+	payload := map[string]any{
+		"content": []map[string]any{{"type": "text", "text": text}},
+		"usage": map[string]any{
+			"input_tokens":                inputTok,
+			"output_tokens":               outputTok,
+			"cache_creation_input_tokens": cacheW,
+			"cache_read_input_tokens":     cacheR,
+		},
+	}
+	b, _ := json.Marshal(payload)
+	return string(b)
+}
+
+// TestCacheUsageCaptured: the two cache usage fields reach Completion and the
+// llm.response audit payload.
+func TestCacheUsageCaptured(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, responseBodyCached(`{"ok":true}`, 7, 3, 4200, 1100))
+	}))
+	defer srv.Close()
+
+	st := newTestStore(t)
+	auditor := audit.New(st.DB())
+	c := llm.NewWithHTTPClient(llm.Config{APIKey: "k"}, auditor, nil, srv.URL)
+
+	comp, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "E", CachePrefix: true}, nil)
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if comp.CacheCreationInputTokens != 4200 || comp.CacheReadInputTokens != 1100 {
+		t.Errorf("cache usage = %d/%d, want 4200/1100",
+			comp.CacheCreationInputTokens, comp.CacheReadInputTokens)
+	}
+
+	var payloadJSON string
+	if err := st.DB().QueryRowContext(context.Background(),
+		`SELECT payload_json FROM audit_log WHERE kind = 'llm.response'`).Scan(&payloadJSON); err != nil {
+		t.Fatalf("read llm.response payload: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
+		t.Fatalf("parse payload: %v", err)
+	}
+	if payload["cache_creation_input_tokens"] != float64(4200) ||
+		payload["cache_read_input_tokens"] != float64(1100) {
+		t.Errorf("audit payload cache fields = %v/%v, want 4200/1100",
+			payload["cache_creation_input_tokens"], payload["cache_read_input_tokens"])
+	}
+}
