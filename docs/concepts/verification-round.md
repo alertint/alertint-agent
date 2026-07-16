@@ -75,6 +75,19 @@ analysis on every re-fire spends none, so the extra call per judged incident
 isn't multiplied by every recurrence, only by genuinely new or escalated
 conditions.
 
+The second call also costs less than it looks: it reuses the first call's
+prompt verbatim as an Anthropic prompt-cache prefix, so the shared span
+(system prompt plus evidence) is written to the cache on call 1 and read back
+at roughly a tenth of the input price seconds later on call 2. `llm.response`
+audit rows carry the raw numbers — `cache_creation_input_tokens` and
+`cache_read_input_tokens`; effective input cost is
+`input + 1.25 × creation + 0.10 × read`. Caching engages only when the prefix
+clears the model's minimum cacheable size (model-dependent; small incidents on
+`claude-haiku-4-5` typically don't) — when the re-judge call reads no cached
+tokens, the agent logs a warning naming the likely cause. Worst case is
+today's cost, never more. With verification disabled, requests are unchanged
+and nothing is cached.
+
 ## The `unverified` caveat
 
 Most rounds resolve cleanly: the checks either back up the draft or

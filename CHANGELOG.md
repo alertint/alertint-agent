@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Triage prompt caching: when verification is enabled, the draft call marks
+  the shared prefix (system prompt + evidence pack) as an Anthropic
+  prompt-cache breakpoint and the re-judge call reads it seconds later at
+  ~0.10× input price — roughly a 40% input-cost cut on a typical verified
+  incident with the default model. `llm.response` audit rows now carry
+  `cache_creation_input_tokens` / `cache_read_input_tokens`, and a warning is
+  logged when the re-judge call read no cached prefix (model floor not met, or
+  prefix drift). With verification disabled, requests are byte-identical to
+  before and nothing is cached.
+
 ### Fixed
 
 - Storm-sized incidents no longer fail triage with `llm: response truncated at max_tokens`:
