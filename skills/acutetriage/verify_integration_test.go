@@ -3,9 +3,11 @@
 package acutetriage_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -26,8 +28,9 @@ import (
 // scriptResp is one queued reply: a raw JSON body OR an error (the LLM call
 // failing). err takes precedence when set.
 type scriptResp struct {
-	raw json.RawMessage
-	err error
+	raw       json.RawMessage
+	err       error
+	cacheRead int // scripted cache_read_input_tokens for this reply
 }
 
 // scriptedLLM returns queued responses in order (call 1, call 2, …) and records
@@ -41,23 +44,26 @@ type scriptedLLM struct {
 	calls     int
 	systems   []string
 	prompts   []string
+	records   []llm.Prompt // full structured prompts, for marking/prefix assertions
 }
 
-func (f *scriptedLLM) Complete(_ context.Context, system, user string, _ []string) (llm.Completion, error) {
+func (f *scriptedLLM) Complete(_ context.Context, system string, p llm.Prompt, _ []string) (llm.Completion, error) {
 	i := f.calls
 	f.calls++
 	f.systems = append(f.systems, system)
-	f.prompts = append(f.prompts, user)
+	f.prompts = append(f.prompts, p.Prefix+p.Suffix)
+	f.records = append(f.records, p)
 	if i >= len(f.responses) {
 		return llm.Completion{}, fmt.Errorf("scriptedLLM: unexpected call %d (only %d scripted)", i+1, len(f.responses))
 	}
 	r := f.responses[i]
 	return llm.Completion{
-		Raw:          r.raw,
-		Model:        "fake-model",
-		InputTokens:  11,
-		OutputTokens: 22,
-		Latency:      5 * time.Millisecond,
+		Raw:                  r.raw,
+		Model:                "fake-model",
+		InputTokens:          11,
+		OutputTokens:         22,
+		Latency:              5 * time.Millisecond,
+		CacheReadInputTokens: r.cacheRead,
 	}, r.err
 }
 
@@ -620,4 +626,96 @@ func TestCapInteraction(t *testing.T) {
 			t.Errorf("confidence = %v, want %v (state-only floor is not live evidence)", got, acutetriage.MaxMetadataOnlyConfidence)
 		}
 	})
+}
+
+// --------------------------------------------------------------------------
+// Prompt caching (Task 4): conditional marking, the shared-prefix guarantee,
+// and the cache-engagement WARN.
+// --------------------------------------------------------------------------
+
+// runVerifiedPair runs one enabled two-call triage against a scripted fake
+// and returns the fake for prompt/marking assertions. call2CacheRead scripts
+// call 2's cache_read_input_tokens; logger may be nil.
+func runVerifiedPair(t *testing.T, call2CacheRead int, logger *slog.Logger) *scriptedLLM {
+	t.Helper()
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-cache", map[string]string{"alertname": "DiskFull", "host": "web1"})
+
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "disk", "disk pressure on web1", 0.7, nil)},
+		{raw: callTwoResp(t, "disk", "disk pressure on web1", 0.7, ""), cacheRead: call2CacheRead},
+	}}
+	skill := acutetriage.New(verifyConfig(promHealthy(t)), st, scripted, nil, nil, logger)
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if scripted.calls != 2 {
+		t.Fatalf("want 2 LLM calls, got %d", scripted.calls)
+	}
+	return scripted
+}
+
+// TestConditionalMarking pins the marking rule: a lone marked call pays the
+// cache write premium with no read, so call 1 marks iff verification is
+// enabled; call 2 (which only exists when enabled) always marks.
+func TestConditionalMarking(t *testing.T) {
+	// Verification disabled — one call, unmarked, no suffix (kill-switch shape).
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-nomark", map[string]string{"alertname": "DiskFull", "host": "web1"})
+	off := &scriptedLLM{responses: []scriptResp{
+		{raw: callTwoResp(t, "draft", "disk pressure on web1", 0.7, "")},
+	}}
+	skill := acutetriage.New(acutetriage.Config{MinAlerts: 1}, st, off, nil, nil, nil)
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := off.records[0]; got.CachePrefix || got.Suffix != "" {
+		t.Errorf("verification off: call 1 must be unmarked and suffix-less, got CachePrefix=%v Suffix=%q", got.CachePrefix, got.Suffix)
+	}
+
+	// Verification enabled — both calls marked, call 2 carries the suffix.
+	on := runVerifiedPair(t, 3400, nil)
+	if !on.records[0].CachePrefix {
+		t.Error("verification on: call 1 must mark the shared prefix")
+	}
+	if !on.records[1].CachePrefix || on.records[1].Suffix == "" {
+		t.Errorf("call 2 must be marked and carry the continuation suffix, got CachePrefix=%v Suffix=%q", on.records[1].CachePrefix, on.records[1].Suffix)
+	}
+}
+
+// TestCallTwoPrefixIsCallOnePrompt pins the Shared prefix guarantee
+// (CONTEXT.md): the re-judge call's prompt opens with the draft call's
+// prompt, verbatim.
+func TestCallTwoPrefixIsCallOnePrompt(t *testing.T) {
+	f := runVerifiedPair(t, 3400, nil)
+	if f.records[0].Suffix != "" {
+		t.Errorf("call 1 must have no suffix, got %q", f.records[0].Suffix)
+	}
+	if f.records[1].Prefix != f.records[0].Prefix {
+		t.Error("call 2 prefix != call 1 prompt: the shared prefix drifted")
+	}
+	if !strings.Contains(f.records[1].Suffix, "## Your draft verdict") {
+		t.Error("call 2 suffix lost the draft-verdict continuation")
+	}
+}
+
+// TestWarnWhenCallTwoReadNoCachedPrefix: cacheRead 0 on call 2 → one WARN;
+// cacheRead > 0 → none. The WARN stays per-pair because below-floor and
+// prefix-drift are indistinguishable at log time.
+func TestWarnWhenCallTwoReadNoCachedPrefix(t *testing.T) {
+	var buf bytes.Buffer
+	runVerifiedPair(t, 0, slog.New(slog.NewTextHandler(&buf, nil)))
+	if !strings.Contains(buf.String(), "read no cached prefix") {
+		t.Error("expected WARN for zero cache read on call 2")
+	}
+
+	buf.Reset()
+	runVerifiedPair(t, 3400, slog.New(slog.NewTextHandler(&buf, nil)))
+	if strings.Contains(buf.String(), "read no cached prefix") {
+		t.Error("unexpected WARN when the cache engaged")
+	}
 }

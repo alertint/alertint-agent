@@ -131,9 +131,27 @@ type Completion struct {
 	InputTokens  int
 	OutputTokens int
 	Latency      time.Duration
+
+	CacheCreationInputTokens int // tokens written to the prompt cache (billed 1.25×)
+	CacheReadInputTokens     int // tokens served from the prompt cache (billed ~0.10×)
 }
 
-// Complete sends systemPrompt + userPrompt to the model and returns a
+// Prompt is the user-turn payload of a Complete call. Prefix is always set;
+// Suffix is the verification round's call-2 continuation (empty on a
+// single-call prompt). CachePrefix marks the end of Prefix as a prompt-cache
+// breakpoint — set it only when a follow-up call reusing Prefix verbatim is
+// guaranteed (the verification pair), otherwise the cache write premium is
+// paid with no matching read.
+type Prompt struct {
+	Prefix      string
+	Suffix      string
+	CachePrefix bool
+}
+
+// text is the full user-turn text, prefix and suffix joined.
+func (p Prompt) text() string { return p.Prefix + p.Suffix }
+
+// Complete sends systemPrompt + prompt to the model and returns a
 // Completion whose Raw is the JSON extracted from the assistant's first text
 // content block, alongside the model, token usage, and latency.
 //
@@ -145,12 +163,12 @@ type Completion struct {
 // type.
 func (c *Client) Complete(
 	ctx context.Context,
-	systemPrompt, userPrompt string,
+	systemPrompt string, prompt Prompt,
 	requiredKeys []string,
 ) (Completion, error) {
 	start := c.now()
 
-	reqHash := promptHash(systemPrompt, userPrompt)
+	reqHash := promptHash(systemPrompt, prompt.text())
 	if c.auditor != nil {
 		_ = c.auditor.Append(ctx, "llm.anthropic", "llm.request", map[string]any{
 			"model":       c.cfg.Model,
@@ -158,16 +176,18 @@ func (c *Client) Complete(
 		})
 	}
 
-	raw, inputTokens, outputTokens, err := c.callWithRetry(ctx, systemPrompt, userPrompt)
+	raw, usage, err := c.callWithRetry(ctx, systemPrompt, prompt)
 	latency := c.now().Sub(start)
 
 	if c.auditor != nil {
 		payload := map[string]any{
-			"model":         c.cfg.Model,
-			"prompt_hash":   reqHash,
-			"latency_ms":    latency.Milliseconds(),
-			"input_tokens":  inputTokens,
-			"output_tokens": outputTokens,
+			"model":                       c.cfg.Model,
+			"prompt_hash":                 reqHash,
+			"latency_ms":                  latency.Milliseconds(),
+			"input_tokens":                usage.input,
+			"output_tokens":               usage.output,
+			"cache_creation_input_tokens": usage.cacheCreation,
+			"cache_read_input_tokens":     usage.cacheRead,
 		}
 		if err != nil {
 			payload["error"] = err.Error()
@@ -176,11 +196,13 @@ func (c *Client) Complete(
 	}
 
 	comp := Completion{
-		Raw:          raw,
-		Model:        c.cfg.Model,
-		InputTokens:  inputTokens,
-		OutputTokens: outputTokens,
-		Latency:      latency,
+		Raw:                      raw,
+		Model:                    c.cfg.Model,
+		InputTokens:              usage.input,
+		OutputTokens:             usage.output,
+		Latency:                  latency,
+		CacheCreationInputTokens: usage.cacheCreation,
+		CacheReadInputTokens:     usage.cacheRead,
 	}
 	if err != nil {
 		return comp, err
@@ -214,8 +236,43 @@ type thinkingConfig struct {
 }
 
 type message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role string `json:"role"`
+	// Content is string (legacy single-turn shape, byte-identical to the
+	// pre-caching client) or []requestContentBlock (when a cache breakpoint
+	// or a suffix needs block structure). See userContent.
+	Content any `json:"content"`
+}
+
+// cacheControl marks a request content block as a prompt-cache breakpoint.
+// Only the default 5-minute TTL is ever used — no ttl field.
+type cacheControl struct {
+	Type string `json:"type"` // always "ephemeral"
+}
+
+// requestContentBlock is one text block of a block-typed user turn.
+type requestContentBlock struct {
+	Type         string        `json:"type"` // always "text"
+	Text         string        `json:"text"`
+	CacheControl *cacheControl `json:"cache_control,omitempty"`
+}
+
+// userContent renders the user turn. Plain string when nothing needs block
+// structure — the verification kill switch keeps its byte-identity guarantee.
+// Block array when a breakpoint or suffix is present: the breakpoint sits on
+// the prefix block, caching the cumulative tools+system+prefix span; the
+// suffix block is never marked.
+func userContent(p Prompt) any {
+	if !p.CachePrefix && p.Suffix == "" {
+		return p.Prefix
+	}
+	blocks := []requestContentBlock{{Type: "text", Text: p.Prefix}}
+	if p.CachePrefix {
+		blocks[0].CacheControl = &cacheControl{Type: "ephemeral"}
+	}
+	if p.Suffix != "" {
+		blocks = append(blocks, requestContentBlock{Type: "text", Text: p.Suffix})
+	}
+	return blocks
 }
 
 // messagesResponse is the relevant subset of the Anthropic response.
@@ -223,10 +280,17 @@ type messagesResponse struct {
 	Content    []contentBlock `json:"content"`
 	StopReason string         `json:"stop_reason"`
 	Usage      struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
+		InputTokens              int `json:"input_tokens"`
+		OutputTokens             int `json:"output_tokens"`
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 	} `json:"usage"`
 	Error *apiError `json:"error,omitempty"`
+}
+
+// tokenUsage is the per-call usage subset the client reports onward.
+type tokenUsage struct {
+	input, output, cacheCreation, cacheRead int
 }
 
 type contentBlock struct {
@@ -241,20 +305,20 @@ type apiError struct {
 
 // callWithRetry executes the HTTP request, retrying on 429/529 with
 // exponential backoff up to MaxRetries times.
-func (c *Client) callWithRetry(ctx context.Context, system, user string) (raw json.RawMessage, inputTok, outputTok int, err error) {
+func (c *Client) callWithRetry(ctx context.Context, system string, prompt Prompt) (raw json.RawMessage, usage tokenUsage, err error) {
 	delay := c.cfg.BaseRetryDelay
 	for attempt := 0; attempt <= MaxRetries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-time.After(delay):
 			case <-ctx.Done():
-				return nil, 0, 0, ctx.Err()
+				return nil, tokenUsage{}, ctx.Err()
 			}
 			delay *= 2
 		}
-		raw, inputTok, outputTok, err = c.doRequest(ctx, system, user)
+		raw, usage, err = c.doRequest(ctx, system, prompt)
 		if err == nil {
-			return raw, inputTok, outputTok, nil
+			return raw, usage, nil
 		}
 		var retryErr *RetryableError
 		if errors.As(err, &retryErr) && attempt < MaxRetries {
@@ -265,28 +329,28 @@ func (c *Client) callWithRetry(ctx context.Context, system, user string) (raw js
 			)
 			continue
 		}
-		return nil, 0, 0, err
+		return nil, tokenUsage{}, err
 	}
-	return nil, 0, 0, err
+	return nil, tokenUsage{}, err
 }
 
 // doRequest performs a single HTTP call to the Messages API.
-func (c *Client) doRequest(ctx context.Context, system, user string) (json.RawMessage, int, int, error) {
+func (c *Client) doRequest(ctx context.Context, system string, prompt Prompt) (json.RawMessage, tokenUsage, error) {
 	body := messagesRequest{
 		Model:     c.cfg.Model,
 		MaxTokens: c.cfg.MaxTokens,
 		System:    system,
-		Messages:  []message{{Role: "user", Content: user}},
+		Messages:  []message{{Role: "user", Content: userContent(prompt)}},
 		Thinking:  &thinkingConfig{Type: "disabled"},
 	}
 	encoded, err := json.Marshal(body)
 	if err != nil {
-		return nil, 0, 0, fmt.Errorf("llm: marshal request: %w", err)
+		return nil, tokenUsage{}, fmt.Errorf("llm: marshal request: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(encoded))
 	if err != nil {
-		return nil, 0, 0, fmt.Errorf("llm: build request: %w", err)
+		return nil, tokenUsage{}, fmt.Errorf("llm: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Api-Key", c.cfg.APIKey)
@@ -294,17 +358,17 @@ func (c *Client) doRequest(ctx context.Context, system, user string) (json.RawMe
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, 0, 0, fmt.Errorf("llm: http: %w", err)
+		return nil, tokenUsage{}, fmt.Errorf("llm: http: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
-		return nil, 0, 0, fmt.Errorf("llm: read response: %w", err)
+		return nil, tokenUsage{}, fmt.Errorf("llm: read response: %w", err)
 	}
 
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 529 {
-		return nil, 0, 0, &RetryableError{StatusCode: resp.StatusCode}
+		return nil, tokenUsage{}, &RetryableError{StatusCode: resp.StatusCode}
 	}
 	if resp.StatusCode != http.StatusOK {
 		var apiErr messagesResponse
@@ -313,12 +377,18 @@ func (c *Client) doRequest(ctx context.Context, system, user string) (json.RawMe
 		if apiErr.Error != nil {
 			msg = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, apiErr.Error.Message)
 		}
-		return nil, 0, 0, fmt.Errorf("llm: api error: %s", msg)
+		return nil, tokenUsage{}, fmt.Errorf("llm: api error: %s", msg)
 	}
 
 	var parsed messagesResponse
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return nil, 0, 0, fmt.Errorf("llm: parse response: %w", err)
+		return nil, tokenUsage{}, fmt.Errorf("llm: parse response: %w", err)
+	}
+	usage := tokenUsage{
+		input:         parsed.Usage.InputTokens,
+		output:        parsed.Usage.OutputTokens,
+		cacheCreation: parsed.Usage.CacheCreationInputTokens,
+		cacheRead:     parsed.Usage.CacheReadInputTokens,
 	}
 
 	// A max_tokens stop means the reply was cut off at the output ceiling: the
@@ -327,14 +397,12 @@ func (c *Client) doRequest(ctx context.Context, system, user string) (json.RawMe
 	// give — the fix is to raise llm.max_tokens, not to retry (which truncates
 	// identically), so this is returned immediately, not as a RetryableError.
 	if parsed.StopReason == "max_tokens" {
-		return nil, parsed.Usage.InputTokens, parsed.Usage.OutputTokens,
-			fmt.Errorf("%w=%d (raise llm.max_tokens)", ErrResponseTruncated, c.cfg.MaxTokens)
+		return nil, usage, fmt.Errorf("%w=%d (raise llm.max_tokens)", ErrResponseTruncated, c.cfg.MaxTokens)
 	}
 
 	text := firstTextBlock(parsed.Content)
 	if text == "" {
-		return nil, parsed.Usage.InputTokens, parsed.Usage.OutputTokens,
-			errors.New("llm: response contained no text content block")
+		return nil, usage, errors.New("llm: response contained no text content block")
 	}
 
 	// The model should return raw JSON. Trim any markdown fences.
@@ -342,10 +410,9 @@ func (c *Client) doRequest(ctx context.Context, system, user string) (json.RawMe
 
 	var raw json.RawMessage
 	if err := json.Unmarshal([]byte(text), &raw); err != nil {
-		return nil, parsed.Usage.InputTokens, parsed.Usage.OutputTokens,
-			fmt.Errorf("llm: response is not valid JSON: %w", err)
+		return nil, usage, fmt.Errorf("llm: response is not valid JSON: %w", err)
 	}
-	return raw, parsed.Usage.InputTokens, parsed.Usage.OutputTokens, nil
+	return raw, usage, nil
 }
 
 // firstTextBlock returns the text of the first content block with type "text".

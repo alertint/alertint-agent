@@ -40,9 +40,9 @@ type fakeLLM struct {
 	lastUser string // captures the last user prompt for assertions
 }
 
-func (f *fakeLLM) Complete(_ context.Context, _, user string, _ []string) (llm.Completion, error) {
+func (f *fakeLLM) Complete(_ context.Context, _ string, p llm.Prompt, _ []string) (llm.Completion, error) {
 	f.calls++
-	f.lastUser = user
+	f.lastUser = p.Prefix + p.Suffix
 	return llm.Completion{
 		Raw:          f.response,
 		Model:        "fake-model",

@@ -343,9 +343,10 @@ func recalledFrom(pf store.PriorFinding, weak, superseded bool) RecalledEntry {
 // (m.LatestAgo). A nil section renders nothing (the prompt stays byte-identical
 // to a non-memory triage). requestVerdict gates the memory_verdict request
 // below: false when verification is enabled (R16) — the request moves to
-// callTwoPrompt, since call 2 is where the model re-judges with real evidence
-// in hand rather than its own unverified draft — true on the kill-switch path,
-// where the verdict stays in call 1 exactly as before this task.
+// callTwoContinuation, since call 2 is where the model re-judges with real
+// evidence in hand rather than its own unverified draft — true on the
+// kill-switch path, where the verdict stays in call 1 exactly as before this
+// task.
 func renderMemory(b *strings.Builder, m *MemoryEnrichment, requestVerdict bool) {
 	if m == nil {
 		return

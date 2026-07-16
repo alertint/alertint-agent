@@ -25,7 +25,7 @@ import (
 // its own "llm responded" action-trail line — the incident-aware caller owns
 // that line, not the read-only client (ADR 0004).
 type LLMClient interface {
-	Complete(ctx context.Context, system, user string, requiredKeys []string) (llm.Completion, error)
+	Complete(ctx context.Context, system string, prompt llm.Prompt, requiredKeys []string) (llm.Completion, error)
 }
 
 // Config holds skill tunables.
@@ -549,7 +549,10 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		userPrompt = recurrence + "\n\n" + userPrompt
 	}
 	system := s.systemPrompt(decision, len(alerts))
-	comp, err := s.llm.Complete(ctx, system, userPrompt, RequiredKeys)
+	comp, err := s.llm.Complete(ctx, system, llm.Prompt{
+		Prefix:      userPrompt,
+		CachePrefix: s.cfg.Verification.Enabled,
+	}, RequiredKeys)
 	if err != nil {
 		s.logger.Error("llm failed", "incident", inc.ID, "err", err)
 		if s.auditor != nil {
@@ -737,10 +740,23 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 
 	// Call 2: the byte-identical call-1 prefix + the draft + the computed round +
 	// the (moved) memory-verdict request. On any failure the draft stands.
-	comp, err := s.llm.Complete(ctx, ar.system, callTwoPrompt(ar.user, ar.raw, round, ar.memory), RequiredKeys)
+	comp, err := s.llm.Complete(ctx, ar.system, llm.Prompt{
+		Prefix:      ar.user,
+		Suffix:      callTwoContinuation(ar.raw, round, ar.memory),
+		CachePrefix: true,
+	}, RequiredKeys)
 	if err != nil {
 		s.logger.Warn("acutetriage: verification re-judge failed; draft stands", "incident", inc.ID, "err", err)
 		return s.degradedDraft(ctx, inc.ID, ar.raw, round, resp)
+	}
+	// Cache-engagement probe: call 2 always marks the shared prefix, so a zero
+	// cache read means the prefix is below the model's cacheable floor (benign,
+	// permanent on small models) or the prefix drifted (a regression). The two
+	// are indistinguishable here, so this stays a per-pair WARN — never
+	// once-then-quiet — and floors are asserted nowhere (they drift per release).
+	if comp.CacheReadInputTokens == 0 {
+		s.logger.Warn("acutetriage: verification call 2 read no cached prefix (prefix below the model's cacheable floor, or prefix drift)",
+			"incident", inc.ID, "model", comp.Model, "prefix_chars", len(ar.user))
 	}
 	var resp2 llmResponse
 	if err := json.Unmarshal(comp.Raw, &resp2); err != nil {

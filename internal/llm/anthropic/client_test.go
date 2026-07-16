@@ -101,7 +101,7 @@ func TestSuccess(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv.URL, nil)
-	comp, err := c.Complete(context.Background(), "sys", "user", []string{"analysis_name", "confidence"})
+	comp, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "user"}, []string{"analysis_name", "confidence"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestDefaultModelAndThinkingDisabled(t *testing.T) {
 	defer srv.Close()
 
 	c := llm.NewWithHTTPClient(llm.Config{APIKey: "k"}, nil, nil, srv.URL)
-	if _, err := c.Complete(context.Background(), "sys", "user", []string{"analysis_name"}); err != nil {
+	if _, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "user"}, []string{"analysis_name"}); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
 	if body["model"] != llm.DefaultModel {
@@ -172,7 +172,7 @@ func TestMarkdownFenceStripped(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv.URL, nil)
-	comp, err := c.Complete(context.Background(), "sys", "user", []string{"key"})
+	comp, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "user"}, []string{"key"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -201,7 +201,7 @@ func TestRetryOn429(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv.URL, nil)
-	comp, err := c.Complete(context.Background(), "sys", "user", []string{"result"})
+	comp, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "user"}, []string{"result"})
 	if err != nil {
 		t.Fatalf("unexpected error after retries: %v", err)
 	}
@@ -225,7 +225,7 @@ func TestRetryExhausted(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv.URL, nil)
-	_, err := c.Complete(context.Background(), "sys", "user", nil)
+	_, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "user"}, nil)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -245,7 +245,7 @@ func TestSchemaViolation(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv.URL, nil)
-	_, err := c.Complete(context.Background(), "sys", "user", []string{"only_key", "missing_key"})
+	_, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "user"}, []string{"only_key", "missing_key"})
 	if err == nil {
 		t.Fatal("expected schema violation error, got nil")
 	}
@@ -270,7 +270,7 @@ func TestMaxTokensTruncationError(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv.URL, nil)
-	_, err := c.Complete(context.Background(), "sys", "user", []string{"analysis_name"})
+	_, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "user"}, []string{"analysis_name"})
 	if err == nil {
 		t.Fatal("expected truncation error, got nil")
 	}
@@ -293,7 +293,7 @@ func TestNon429ErrorNotRetried(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv.URL, nil)
-	_, err := c.Complete(context.Background(), "sys", "user", nil)
+	_, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "user"}, nil)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -316,7 +316,7 @@ func TestAuditRowsWritten(t *testing.T) {
 	c := newTestClient(t, srv.URL, auditor)
 
 	ctx := context.Background()
-	_, err := c.Complete(ctx, "sys", "user", []string{"ok"})
+	_, err := c.Complete(ctx, "sys", llm.Prompt{Prefix: "user"}, []string{"ok"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -343,4 +343,189 @@ func countAuditRows(db *sql.DB, kinds ...string) (map[string]int, error) {
 		out[k] = n
 	}
 	return out, nil
+}
+
+// TestPromptSuffixConcatenated verifies a Prompt with prefix+suffix reaches
+// the API as one user turn whose content is the exact concatenation (Task 2
+// changes the encoding to blocks when marked; the text must survive either way).
+func TestPromptSuffixConcatenated(t *testing.T) {
+	var gotBody []byte
+	srv := captureServer(t, &gotBody)
+
+	c := llm.NewWithHTTPClient(llm.Config{APIKey: "k"}, nil, nil, srv.URL)
+	if _, err := c.Complete(context.Background(), "sys",
+		llm.Prompt{Prefix: "PREFIX-", Suffix: "SUFFIX"}, nil); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	// A suffixed prompt always serializes as block array (Task 2), so
+	// reconstruct the text across blocks rather than substring-matching the
+	// raw JSON.
+	var blocks []requestBlock
+	if err := json.Unmarshal(decodeUserContent(t, gotBody), &blocks); err != nil {
+		t.Fatalf("content is not a block array: %v", err)
+	}
+	var got strings.Builder
+	for _, b := range blocks {
+		got.WriteString(b.Text)
+	}
+	if got.String() != "PREFIX-SUFFIX" {
+		t.Errorf("user content lost the prefix+suffix concatenation: %q", got.String())
+	}
+}
+
+// decodeUserContent pulls messages[0].content out of a captured request body.
+func decodeUserContent(t *testing.T, body []byte) json.RawMessage {
+	t.Helper()
+	var req struct {
+		Messages []struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		t.Fatalf("parse request: %v", err)
+	}
+	if len(req.Messages) != 1 {
+		t.Fatalf("messages = %d, want 1", len(req.Messages))
+	}
+	return req.Messages[0].Content
+}
+
+// captureServer returns a test server that records the last request body.
+func captureServer(t *testing.T, body *[]byte) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*body, _ = io.ReadAll(r.Body)
+		_, _ = fmt.Fprint(w, responseBody(`{"ok":true}`, 1, 1))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+type requestBlock struct {
+	Type         string          `json:"type"`
+	Text         string          `json:"text"`
+	CacheControl json.RawMessage `json:"cache_control"`
+}
+
+// TestMarkedPromptEmitsBlocksWithBreakpoint: marked + suffix → two text
+// blocks, cache_control {"type":"ephemeral"} on the prefix block ONLY, no ttl.
+func TestMarkedPromptEmitsBlocksWithBreakpoint(t *testing.T) {
+	var body []byte
+	srv := captureServer(t, &body)
+	c := llm.NewWithHTTPClient(llm.Config{APIKey: "k"}, nil, nil, srv.URL)
+	if _, err := c.Complete(context.Background(), "sys",
+		llm.Prompt{Prefix: "E", Suffix: "DV", CachePrefix: true}, nil); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	var blocks []requestBlock
+	if err := json.Unmarshal(decodeUserContent(t, body), &blocks); err != nil {
+		t.Fatalf("content is not a block array: %v", err)
+	}
+	if len(blocks) != 2 {
+		t.Fatalf("blocks = %d, want 2", len(blocks))
+	}
+	if blocks[0].Text != "E" || blocks[1].Text != "DV" {
+		t.Errorf("block texts = %q, %q", blocks[0].Text, blocks[1].Text)
+	}
+	if string(blocks[0].CacheControl) != `{"type":"ephemeral"}` {
+		t.Errorf("prefix cache_control = %s, want {\"type\":\"ephemeral\"}", blocks[0].CacheControl)
+	}
+	if blocks[1].CacheControl != nil {
+		t.Errorf("suffix block must not carry cache_control, got %s", blocks[1].CacheControl)
+	}
+}
+
+// TestMarkedPromptNoSuffixSingleBlock: call-1 shape — one marked block.
+func TestMarkedPromptNoSuffixSingleBlock(t *testing.T) {
+	var body []byte
+	srv := captureServer(t, &body)
+	c := llm.NewWithHTTPClient(llm.Config{APIKey: "k"}, nil, nil, srv.URL)
+	if _, err := c.Complete(context.Background(), "sys",
+		llm.Prompt{Prefix: "E", CachePrefix: true}, nil); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	var blocks []requestBlock
+	if err := json.Unmarshal(decodeUserContent(t, body), &blocks); err != nil {
+		t.Fatalf("content is not a block array: %v", err)
+	}
+	if len(blocks) != 1 || string(blocks[0].CacheControl) != `{"type":"ephemeral"}` {
+		t.Errorf("want one marked block, got %+v", blocks)
+	}
+}
+
+// TestUnmarkedPromptKeepsLegacyStringShape: the kill-switch guarantee — an
+// unmarked, suffix-less prompt serializes content as a plain JSON string,
+// byte-identical to the pre-caching client.
+func TestUnmarkedPromptKeepsLegacyStringShape(t *testing.T) {
+	var body []byte
+	srv := captureServer(t, &body)
+	c := llm.NewWithHTTPClient(llm.Config{APIKey: "k"}, nil, nil, srv.URL)
+	if _, err := c.Complete(context.Background(), "sys",
+		llm.Prompt{Prefix: "plain user prompt"}, nil); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	content := decodeUserContent(t, body)
+	var s string
+	if err := json.Unmarshal(content, &s); err != nil {
+		t.Fatalf("content is not a plain JSON string (legacy shape broken): %s", content)
+	}
+	if s != "plain user prompt" {
+		t.Errorf("content = %q", s)
+	}
+}
+
+// responseBodyCached builds a success body whose usage carries cache fields.
+func responseBodyCached(text string, inputTok, outputTok, cacheW, cacheR int) string {
+	payload := map[string]any{
+		"content": []map[string]any{{"type": "text", "text": text}},
+		"usage": map[string]any{
+			"input_tokens":                inputTok,
+			"output_tokens":               outputTok,
+			"cache_creation_input_tokens": cacheW,
+			"cache_read_input_tokens":     cacheR,
+		},
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
+}
+
+// TestCacheUsageCaptured: the two cache usage fields reach Completion and the
+// llm.response audit payload.
+func TestCacheUsageCaptured(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, responseBodyCached(`{"ok":true}`, 7, 3, 4200, 1100))
+	}))
+	defer srv.Close()
+
+	st := newTestStore(t)
+	auditor := audit.New(st.DB())
+	c := llm.NewWithHTTPClient(llm.Config{APIKey: "k"}, auditor, nil, srv.URL)
+
+	comp, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "E", CachePrefix: true}, nil)
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if comp.CacheCreationInputTokens != 4200 || comp.CacheReadInputTokens != 1100 {
+		t.Errorf("cache usage = %d/%d, want 4200/1100",
+			comp.CacheCreationInputTokens, comp.CacheReadInputTokens)
+	}
+
+	var payloadJSON string
+	if err := st.DB().QueryRowContext(context.Background(),
+		`SELECT payload_json FROM audit_log WHERE kind = 'llm.response'`).Scan(&payloadJSON); err != nil {
+		t.Fatalf("read llm.response payload: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
+		t.Fatalf("parse payload: %v", err)
+	}
+	if payload["cache_creation_input_tokens"] != float64(4200) ||
+		payload["cache_read_input_tokens"] != float64(1100) {
+		t.Errorf("audit payload cache fields = %v/%v, want 4200/1100",
+			payload["cache_creation_input_tokens"], payload["cache_read_input_tokens"])
+	}
 }
