@@ -191,7 +191,12 @@ func renderVerificationInstruction(b *strings.Builder, verify VerificationParams
 		"regional, infrastructure-wide) MUST include targeted disprove-queries. An empty "+
 		"list is allowed when no check would change your verdict. Two checks always run "+
 		"regardless: a parent-scope up ratio and an incidents-in-window scan — do not "+
-		"duplicate them.", verify.MaxQueries)
+		"duplicate them. Write queries that can actually return data: prefer single-metric "+
+		"expressions; reuse exact metric names and label keys visible in the Live metrics "+
+		"section or the alert labels; avoid combining two metrics (ratios, and/unless, "+
+		"group_left joins) unless both carry the same label keys — an expression joining "+
+		"metrics with mismatched label schemas returns empty regardless of what is true, "+
+		"and proves nothing.", verify.MaxQueries)
 }
 
 // callTwoContinuation builds the call-2 continuation appended after the

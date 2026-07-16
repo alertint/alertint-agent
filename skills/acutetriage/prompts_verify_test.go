@@ -89,6 +89,23 @@ func TestUserPromptVerificationInstructionAbsentWhenDisabled(t *testing.T) {
 	}
 }
 
+// R2 (spec 2026-07-16-verification-calibration): the plan instruction steers
+// the model toward falsifiable queries — single-metric, confirmed-vocabulary
+// expressions — and warns that a cross-family label join returns empty
+// regardless of ground truth (the f28da0d8 failure mode).
+func TestUserPromptVerificationInstructionQueryGuidance(t *testing.T) {
+	got := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil, VerificationParams{Enabled: true, MaxQueries: 4})
+	for _, want := range []string{
+		"single-metric",
+		"reuse exact metric names and label keys",
+		"mismatched label schemas returns empty",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q in verification instruction:\n%s", want, got)
+		}
+	}
+}
+
 // R16: with verification enabled, memory verdict request is NOT in call 1.
 func TestMemoryVerdictMovesToCallTwo(t *testing.T) {
 	m := strongRecallFixture()
