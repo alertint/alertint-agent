@@ -233,12 +233,19 @@ func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int) []M
 		}
 		return cands[i].snap.Series < cands[j].snap.Series
 	})
-	if len(cands) > limit {
-		cands = cands[:limit]
-	}
-	out := make([]MetricSnapshot, len(cands))
-	for i, c := range cands {
-		out[i] = c.snap
+	perFamily := make(map[string]int)
+	out := make([]MetricSnapshot, 0, limit)
+	for _, c := range cands {
+		if len(out) >= limit {
+			break
+		}
+		if c.overlap <= comparatorMaxOverlap {
+			if perFamily[c.snap.Metric] >= maxSeriesPerFamily {
+				continue
+			}
+			perFamily[c.snap.Metric]++
+		}
+		out = append(out, c.snap)
 	}
 	return out
 }
@@ -276,6 +283,18 @@ func uniqueInstances(alerts []store.Alert) []string {
 }
 
 const maxSnapshotsPerScope = 10
+
+// maxSeriesPerFamily caps how many COMPARATOR-tier series one metric family
+// may take per scope (ADR-0025): a 10-slot scope then always shows several
+// families, and each family's comparator sample is its top-N by value.
+const maxSeriesPerFamily = 3
+
+// comparatorMaxOverlap is the tier boundary (ADR-0025): a series overlapping
+// the member alerts on at most this many label pairs (bare node/instance
+// context) is a comparator series and subject to the family cap; anything
+// above it is member evidence and is NEVER capped or displaced — correlation
+// must not remove evidence an uncorrelated alert would have had.
+const comparatorMaxOverlap = 1
 
 // maxInstanceSupplements caps how many per-instance {instance="X"} supplement
 // scopes one incident may query. A storm incident (or a group_key="" mega-merge)

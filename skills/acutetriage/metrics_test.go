@@ -189,6 +189,63 @@ func TestRankSeries_ResponseOrderIndependent(t *testing.T) {
 	}
 }
 
+// ADR-0025: comparator-tier series (overlap ≤ 1) are capped at 3 per metric
+// family per scope, so one big family cannot eat every slot and hide the
+// other families.
+func TestRankSeries_ComparatorFamilyCap(t *testing.T) {
+	members := memberLabelPairs([]store.Alert{alert(map[string]string{"instance": "node-1"})})
+	raw := vector(
+		s(map[string]string{"__name__": "big_family", "instance": "node-1", "app": "a"}, "5"),
+		s(map[string]string{"__name__": "big_family", "instance": "node-1", "app": "b"}, "4"),
+		s(map[string]string{"__name__": "big_family", "instance": "node-1", "app": "c"}, "3"),
+		s(map[string]string{"__name__": "big_family", "instance": "node-1", "app": "d"}, "2"),
+		s(map[string]string{"__name__": "big_family", "instance": "node-1", "app": "e"}, "1"),
+		s(map[string]string{"__name__": "other_family", "instance": "node-1"}, "9"),
+	)
+	got := rankSeries(raw, members, 10)
+	if len(got) != 4 {
+		t.Fatalf("want 3 capped big_family + 1 other_family = 4, got %d: %+v", len(got), got)
+	}
+	// big_family keeps its TOP 3 by value; other_family survives the flood.
+	if got[0].Value != "5" || got[1].Value != "4" || got[2].Value != "3" || got[3].Metric != "other_family" {
+		t.Errorf("cap/order wrong: %+v", got)
+	}
+}
+
+// The no-regression guard: member-evidence series (overlap ≥ 2) are NEVER
+// capped or counted against the family cap — a 5-pod storm keeps every
+// member pod's series, and the family's comparators still get their own 3.
+func TestRankSeries_MemberEvidenceNeverCapped(t *testing.T) {
+	members := memberLabelPairs([]store.Alert{
+		alert(map[string]string{"instance": "node-1", "pod": "api-1"}),
+		alert(map[string]string{"instance": "node-1", "pod": "api-2"}),
+		alert(map[string]string{"instance": "node-1", "pod": "api-3"}),
+		alert(map[string]string{"instance": "node-1", "pod": "api-4"}),
+		alert(map[string]string{"instance": "node-1", "pod": "api-5"}),
+	})
+	series := []map[string]any{
+		s(map[string]string{"__name__": "http_reqs", "instance": "node-1", "pod": "api-1"}, "1"),
+		s(map[string]string{"__name__": "http_reqs", "instance": "node-1", "pod": "api-2"}, "1"),
+		s(map[string]string{"__name__": "http_reqs", "instance": "node-1", "pod": "api-3"}, "1"),
+		s(map[string]string{"__name__": "http_reqs", "instance": "node-1", "pod": "api-4"}, "1"),
+		s(map[string]string{"__name__": "http_reqs", "instance": "node-1", "pod": "api-5"}, "1"),
+		// Same family, comparator tier (shares only instance):
+		s(map[string]string{"__name__": "http_reqs", "instance": "node-1", "pod": "peer-x"}, "9"),
+		s(map[string]string{"__name__": "http_reqs", "instance": "node-1", "pod": "peer-y"}, "8"),
+		s(map[string]string{"__name__": "http_reqs", "instance": "node-1", "pod": "peer-z"}, "7"),
+		s(map[string]string{"__name__": "http_reqs", "instance": "node-1", "pod": "peer-w"}, "6"),
+	}
+	got := rankSeries(vector(series...), members, 10)
+	// 5 member series (overlap 2, uncapped) + 3 comparator series (capped) = 8.
+	if len(got) != 8 {
+		t.Fatalf("want 5 member + 3 comparators = 8, got %d: %+v", len(got), got)
+	}
+	// Members first (overlap 2), then comparators top-3 by value: 9, 8, 7.
+	if got[5].Value != "9" || got[6].Value != "8" || got[7].Value != "7" {
+		t.Errorf("comparator tail wrong: %+v", got)
+	}
+}
+
 type fakeProm struct {
 	// responses maps a matcher string → the instant-vector data blob to return.
 	responses map[string]json.RawMessage
