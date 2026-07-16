@@ -350,11 +350,7 @@ func countAuditRows(db *sql.DB, kinds ...string) (map[string]int, error) {
 // changes the encoding to blocks when marked; the text must survive either way).
 func TestPromptSuffixConcatenated(t *testing.T) {
 	var gotBody []byte
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotBody, _ = io.ReadAll(r.Body)
-		_, _ = fmt.Fprint(w, responseBody(`{"ok":true}`, 1, 1))
-	}))
-	defer srv.Close()
+	srv := captureServer(t, &gotBody)
 
 	c := llm.NewWithHTTPClient(llm.Config{APIKey: "k"}, nil, nil, srv.URL)
 	if _, err := c.Complete(context.Background(), "sys",
