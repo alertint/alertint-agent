@@ -246,6 +246,25 @@ func TestRankSeries_MemberEvidenceNeverCapped(t *testing.T) {
 	}
 }
 
+// A metric value whose magnitude exceeds float64's range (an adversarial
+// "1e400") still parses to a meaningful ±Inf via strconv.ParseFloat's
+// ErrRange overflow case — it must rank as the largest magnitude in its
+// family, not fall to the unparsable tail (code-review finding).
+func TestRankSeries_OverflowValueRanksAsInfinite(t *testing.T) {
+	members := memberLabelPairs([]store.Alert{alert(map[string]string{"instance": "node-1"})})
+	raw := vector(
+		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "normal"}, "42"),
+		s(map[string]string{"__name__": "m", "instance": "node-1", "app": "overflow"}, "1e400"),
+	)
+	got := rankSeries(raw, members, 10)
+	if len(got) != 2 {
+		t.Fatalf("want 2, got %d: %+v", len(got), got)
+	}
+	if got[0].Value != "1e400" {
+		t.Errorf("overflowed value must rank first (as +Inf), got: %+v", got)
+	}
+}
+
 type fakeProm struct {
 	// responses maps a matcher string → the instant-vector data blob to return.
 	responses map[string]json.RawMessage

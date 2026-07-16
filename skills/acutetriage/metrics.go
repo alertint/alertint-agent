@@ -206,12 +206,16 @@ func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int) []M
 				overlap++
 			}
 		}
+		// ErrRange means the literal's magnitude overflowed float64, but f is
+		// still a meaningful ±Inf (not garbage) — rank it as numeric, same as
+		// a literal "+Inf"/"-Inf" sample already is.
 		f, err := strconv.ParseFloat(val, 64)
+		numericErr := err == nil || errors.Is(err, strconv.ErrRange)
 		cands = append(cands, cand{
 			snap:    MetricSnapshot{Series: formatSeriesIdentity(r.Metric), Metric: name, Value: val},
 			overlap: overlap,
 			value:   f,
-			numeric: err == nil && !math.IsNaN(f),
+			numeric: numericErr && !math.IsNaN(f),
 		})
 	}
 	sort.SliceStable(cands, func(i, j int) bool {
@@ -292,8 +296,13 @@ const maxSeriesPerFamily = 3
 // comparatorMaxOverlap is the tier boundary (ADR-0025): a series overlapping
 // the member alerts on at most this many label pairs (bare node/instance
 // context) is a comparator series and subject to the family cap; anything
-// above it is member evidence and is NEVER capped or displaced — correlation
-// must not remove evidence an uncorrelated alert would have had.
+// above it is member evidence and is exempt from the per-family cap —
+// correlation must not remove evidence an uncorrelated alert would have had.
+// The overall maxSnapshotsPerScope slot budget still applies on top of this:
+// an incident with more member-evidence series than that budget (a storm
+// larger than the scope) can still see some truncated — a known, separate
+// limitation (see the group_key="" mega-incident collapse note), not one
+// this per-family cap addresses.
 const comparatorMaxOverlap = 1
 
 // maxInstanceSupplements caps how many per-instance {instance="X"} supplement
