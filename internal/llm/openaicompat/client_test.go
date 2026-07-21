@@ -1,0 +1,174 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package openaicompat_test
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/alertint/alertint-agent/internal/llm"
+	"github.com/alertint/alertint-agent/internal/llm/openaicompat"
+)
+
+// chatBody builds a minimal OpenAI chat-completions success body.
+func chatBody(content string, promptTok, completionTok int) string {
+	payload := map[string]any{
+		"choices": []map[string]any{
+			{"message": map[string]any{"content": content}, "finish_reason": "stop"},
+		},
+		"usage": map[string]any{
+			"prompt_tokens":     promptTok,
+			"completion_tokens": completionTok,
+		},
+	}
+	b, _ := json.Marshal(payload)
+	return string(b)
+}
+
+// newClient points a default-config client at srv. Overrides may tweak cfg.
+func newClient(srv *httptest.Server, mut func(*openaicompat.Config)) *openaicompat.Client {
+	cfg := openaicompat.Config{
+		BaseURL:        srv.URL,
+		Model:          "qwen3-32b",
+		MaxTokens:      4096,
+		ResponseFormat: "json_object",
+		TimeoutSeconds: 5,
+	}
+	if mut != nil {
+		mut(&cfg)
+	}
+	return openaicompat.New(cfg, nil, nil)
+}
+
+func TestCompleteHappyPath(t *testing.T) {
+	var gotPath string
+	var gotBody map[string]any
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(chatBody(`{"overall_issue":"disk full"}`, 100, 20)))
+	}))
+	defer srv.Close()
+
+	c := newClient(srv, nil)
+	comp, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "evidence"}, []string{"overall_issue"})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if gotPath != "/v1/chat/completions" {
+		t.Errorf("path = %q, want /v1/chat/completions", gotPath)
+	}
+	if gotAuth != "" {
+		t.Errorf("no APIKey set: Authorization header must be absent, got %q", gotAuth)
+	}
+	if gotBody["model"] != "qwen3-32b" {
+		t.Errorf("model = %v", gotBody["model"])
+	}
+	if gotBody["max_tokens"] != float64(4096) {
+		t.Errorf("max_tokens = %v", gotBody["max_tokens"])
+	}
+	msgs := gotBody["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("want [system,user] messages, got %d", len(msgs))
+	}
+	sys := msgs[0].(map[string]any)
+	usr := msgs[1].(map[string]any)
+	if sys["role"] != "system" || sys["content"] != "sys" {
+		t.Errorf("system message = %v", sys)
+	}
+	if usr["role"] != "user" || usr["content"] != "evidence" {
+		t.Errorf("user message = %v", usr)
+	}
+	rf := gotBody["response_format"].(map[string]any)
+	if rf["type"] != "json_object" {
+		t.Errorf("response_format = %v", rf)
+	}
+	kw := gotBody["chat_template_kwargs"].(map[string]any)
+	if kw["enable_thinking"] != false {
+		t.Errorf("enable_thinking = %v, want false", kw["enable_thinking"])
+	}
+	if string(comp.Raw) != `{"overall_issue":"disk full"}` {
+		t.Errorf("Raw = %s", comp.Raw)
+	}
+	if comp.Model != "qwen3-32b" || comp.InputTokens != 100 || comp.OutputTokens != 20 {
+		t.Errorf("usage mapping: %+v", comp)
+	}
+	if comp.CacheCreationInputTokens != 0 || comp.CacheReadInputTokens != 0 {
+		t.Errorf("cache fields must be zero on this wire format: %+v", comp)
+	}
+}
+
+func TestRequestShapeVariants(t *testing.T) {
+	var gotBody map[string]any
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotBody = nil // reset: json.Decode into a map merges rather than replaces stale keys
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		_, _ = w.Write([]byte(chatBody(`{"k":1}`, 1, 1)))
+	}))
+	defer srv.Close()
+
+	t.Run("bearer header when key set", func(t *testing.T) {
+		c := newClient(srv, func(cfg *openaicompat.Config) { cfg.APIKey = "sk-local" })
+		if _, err := c.Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"k"}); err != nil {
+			t.Fatal(err)
+		}
+		if gotAuth != "Bearer sk-local" {
+			t.Errorf("Authorization = %q", gotAuth)
+		}
+	})
+
+	t.Run("response_format off omits the field", func(t *testing.T) {
+		c := newClient(srv, func(cfg *openaicompat.Config) { cfg.ResponseFormat = "off" })
+		if _, err := c.Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"k"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, present := gotBody["response_format"]; present {
+			t.Error("response_format must be omitted when off")
+		}
+	})
+
+	t.Run("thinking true is passed through", func(t *testing.T) {
+		c := newClient(srv, func(cfg *openaicompat.Config) { cfg.Thinking = true })
+		if _, err := c.Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"k"}); err != nil {
+			t.Fatal(err)
+		}
+		kw := gotBody["chat_template_kwargs"].(map[string]any)
+		if kw["enable_thinking"] != true {
+			t.Errorf("enable_thinking = %v, want true", kw["enable_thinking"])
+		}
+	})
+
+	t.Run("prefix+suffix joined; CachePrefix changes nothing", func(t *testing.T) {
+		c := newClient(srv, nil)
+		p := llm.Prompt{Prefix: "call-1 prompt", Suffix: "\n\ncontinuation", CachePrefix: true}
+		if _, err := c.Complete(context.Background(), "s", p, []string{"k"}); err != nil {
+			t.Fatal(err)
+		}
+		usr := gotBody["messages"].([]any)[1].(map[string]any)
+		if usr["content"] != "call-1 prompt\n\ncontinuation" {
+			t.Errorf("user content = %q", usr["content"])
+		}
+	})
+}
+
+func TestMarkdownFenceStripped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(chatBody("```json\n{\"k\":1}\n```", 1, 1)))
+	}))
+	defer srv.Close()
+	comp, err := newClient(srv, nil).Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(comp.Raw) != `{"k":1}` {
+		t.Errorf("Raw = %s", comp.Raw)
+	}
+}
