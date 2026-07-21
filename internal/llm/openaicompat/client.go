@@ -208,35 +208,14 @@ type tokenUsage struct {
 	input, output int
 }
 
-// callWithRetry executes the HTTP request, retrying on 429 and any 5xx with
-// exponential backoff up to MaxRetries times.
-func (c *Client) callWithRetry(ctx context.Context, system string, prompt llm.Prompt) (raw json.RawMessage, usage tokenUsage, err error) {
-	delay := c.cfg.BaseRetryDelay
-	for attempt := 0; attempt <= MaxRetries; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-time.After(delay):
-			case <-ctx.Done():
-				return nil, tokenUsage{}, ctx.Err()
-			}
-			delay *= 2
-		}
-		raw, usage, err = c.doRequest(ctx, system, prompt)
-		if err == nil {
-			return raw, usage, nil
-		}
-		var retryErr *llm.RetryableError
-		if errors.As(err, &retryErr) && attempt < MaxRetries {
-			c.logger.Warn("llm: retryable error, backing off",
-				"attempt", attempt+1,
-				"status", retryErr.StatusCode,
-				"delay", delay,
-			)
-			continue
-		}
-		return nil, tokenUsage{}, err
-	}
-	return nil, tokenUsage{}, err
+// callWithRetry executes the HTTP request through the shared llm.CallWithRetry
+// backoff loop, retrying on 429 and any 5xx (wrapped by doRequest as
+// llm.RetryableError) up to MaxRetries times.
+func (c *Client) callWithRetry(ctx context.Context, system string, prompt llm.Prompt) (json.RawMessage, tokenUsage, error) {
+	return llm.CallWithRetry(ctx, c.logger, MaxRetries, c.cfg.BaseRetryDelay,
+		func(ctx context.Context) (json.RawMessage, tokenUsage, error) {
+			return c.doRequest(ctx, system, prompt)
+		})
 }
 
 // doRequest performs a single HTTP call to the chat-completions API.
