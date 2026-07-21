@@ -12,7 +12,8 @@ import (
 	"testing"
 	"time"
 
-	llm "github.com/alertint/alertint-agent/internal/llm/anthropic"
+	"github.com/alertint/alertint-agent/internal/llm"
+	llmanthropic "github.com/alertint/alertint-agent/internal/llm/anthropic"
 	"github.com/alertint/alertint-agent/skills/acutetriage"
 )
 
@@ -112,7 +113,7 @@ func TestClassify_TimeoutMapsToUnsureTimeout(t *testing.T) {
 	defer srv.Close()
 	defer close(done)
 
-	client := llm.NewWithHTTPClient(llm.Config{APIKey: "k", Model: "claude-haiku-4-5", TimeoutSeconds: 1}, nil, nil, srv.URL)
+	client := llmanthropic.NewWithHTTPClient(llmanthropic.Config{APIKey: "k", Model: "claude-haiku-4-5", TimeoutSeconds: 1}, nil, nil, srv.URL)
 	start := time.Now()
 	got := acutetriage.Classify(context.Background(), client, currentKeyForClassify,
 		candidateEntry("x", 0.5))

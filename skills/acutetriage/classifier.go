@@ -11,7 +11,7 @@ import (
 	"sort"
 	"strings"
 
-	llm "github.com/alertint/alertint-agent/internal/llm/anthropic"
+	"github.com/alertint/alertint-agent/internal/llm"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 

@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/audit"
-	llm "github.com/alertint/alertint-agent/internal/llm/anthropic"
+	"github.com/alertint/alertint-agent/internal/llm"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/skills/acutetriage"

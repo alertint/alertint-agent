@@ -20,8 +20,6 @@ package anthropic
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +29,7 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/audit"
+	"github.com/alertint/alertint-agent/internal/llm"
 )
 
 const (
@@ -121,36 +120,6 @@ func NewWithHTTPClient(cfg Config, auditor *audit.Auditor, logger *slog.Logger, 
 	}
 }
 
-// Completion is the result of a Complete call: the validated raw JSON plus the
-// usage figures the client already computes for the audit log. Returning them
-// (rather than discarding them) lets the incident-aware caller emit an "llm
-// responded" action-trail line without re-deriving anything — see ADR 0004.
-type Completion struct {
-	Raw          json.RawMessage // validated model JSON (nil on error)
-	Model        string          // the model that served the request
-	InputTokens  int
-	OutputTokens int
-	Latency      time.Duration
-
-	CacheCreationInputTokens int // tokens written to the prompt cache (billed 1.25×)
-	CacheReadInputTokens     int // tokens served from the prompt cache (billed ~0.10×)
-}
-
-// Prompt is the user-turn payload of a Complete call. Prefix is always set;
-// Suffix is the verification round's call-2 continuation (empty on a
-// single-call prompt). CachePrefix marks the end of Prefix as a prompt-cache
-// breakpoint — set it only when a follow-up call reusing Prefix verbatim is
-// guaranteed (the verification pair), otherwise the cache write premium is
-// paid with no matching read.
-type Prompt struct {
-	Prefix      string
-	Suffix      string
-	CachePrefix bool
-}
-
-// text is the full user-turn text, prefix and suffix joined.
-func (p Prompt) text() string { return p.Prefix + p.Suffix }
-
 // Complete sends systemPrompt + prompt to the model and returns a
 // Completion whose Raw is the JSON extracted from the assistant's first text
 // content block, alongside the model, token usage, and latency.
@@ -163,12 +132,12 @@ func (p Prompt) text() string { return p.Prefix + p.Suffix }
 // type.
 func (c *Client) Complete(
 	ctx context.Context,
-	systemPrompt string, prompt Prompt,
+	systemPrompt string, prompt llm.Prompt,
 	requiredKeys []string,
-) (Completion, error) {
+) (llm.Completion, error) {
 	start := c.now()
 
-	reqHash := promptHash(systemPrompt, prompt.text())
+	reqHash := llm.PromptHash(systemPrompt, prompt.Text())
 	if c.auditor != nil {
 		_ = c.auditor.Append(ctx, "llm.anthropic", "llm.request", map[string]any{
 			"model":       c.cfg.Model,
@@ -195,7 +164,7 @@ func (c *Client) Complete(
 		_ = c.auditor.Append(ctx, "llm.anthropic", "llm.response", payload)
 	}
 
-	comp := Completion{
+	comp := llm.Completion{
 		Raw:                      raw,
 		Model:                    c.cfg.Model,
 		InputTokens:              usage.input,
@@ -207,7 +176,7 @@ func (c *Client) Complete(
 	if err != nil {
 		return comp, err
 	}
-	if err := validateKeys(raw, requiredKeys); err != nil {
+	if err := llm.ValidateKeys(raw, requiredKeys); err != nil {
 		return comp, err
 	}
 	return comp, nil
@@ -261,7 +230,7 @@ type requestContentBlock struct {
 // Block array when a breakpoint or suffix is present: the breakpoint sits on
 // the prefix block, caching the cumulative tools+system+prefix span; the
 // suffix block is never marked.
-func userContent(p Prompt) any {
+func userContent(p llm.Prompt) any {
 	if !p.CachePrefix && p.Suffix == "" {
 		return p.Prefix
 	}
@@ -305,7 +274,7 @@ type apiError struct {
 
 // callWithRetry executes the HTTP request, retrying on 429/529 with
 // exponential backoff up to MaxRetries times.
-func (c *Client) callWithRetry(ctx context.Context, system string, prompt Prompt) (raw json.RawMessage, usage tokenUsage, err error) {
+func (c *Client) callWithRetry(ctx context.Context, system string, prompt llm.Prompt) (raw json.RawMessage, usage tokenUsage, err error) {
 	delay := c.cfg.BaseRetryDelay
 	for attempt := 0; attempt <= MaxRetries; attempt++ {
 		if attempt > 0 {
@@ -320,7 +289,7 @@ func (c *Client) callWithRetry(ctx context.Context, system string, prompt Prompt
 		if err == nil {
 			return raw, usage, nil
 		}
-		var retryErr *RetryableError
+		var retryErr *llm.RetryableError
 		if errors.As(err, &retryErr) && attempt < MaxRetries {
 			c.logger.Warn("llm: retryable error, backing off",
 				"attempt", attempt+1,
@@ -335,7 +304,7 @@ func (c *Client) callWithRetry(ctx context.Context, system string, prompt Prompt
 }
 
 // doRequest performs a single HTTP call to the Messages API.
-func (c *Client) doRequest(ctx context.Context, system string, prompt Prompt) (json.RawMessage, tokenUsage, error) {
+func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt) (json.RawMessage, tokenUsage, error) {
 	body := messagesRequest{
 		Model:     c.cfg.Model,
 		MaxTokens: c.cfg.MaxTokens,
@@ -368,7 +337,7 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt Prompt) (j
 	}
 
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 529 {
-		return nil, tokenUsage{}, &RetryableError{StatusCode: resp.StatusCode}
+		return nil, tokenUsage{}, &llm.RetryableError{StatusCode: resp.StatusCode}
 	}
 	if resp.StatusCode != http.StatusOK {
 		var apiErr messagesResponse
@@ -397,7 +366,7 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt Prompt) (j
 	// give — the fix is to raise llm.max_tokens, not to retry (which truncates
 	// identically), so this is returned immediately, not as a RetryableError.
 	if parsed.StopReason == "max_tokens" {
-		return nil, usage, fmt.Errorf("%w=%d (raise llm.max_tokens)", ErrResponseTruncated, c.cfg.MaxTokens)
+		return nil, usage, fmt.Errorf("%w=%d (raise llm.max_tokens)", llm.ErrResponseTruncated, c.cfg.MaxTokens)
 	}
 
 	text := firstTextBlock(parsed.Content)
@@ -406,7 +375,7 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt Prompt) (j
 	}
 
 	// The model should return raw JSON. Trim any markdown fences.
-	text = stripMarkdownFence(text)
+	text = llm.StripMarkdownFence(text)
 
 	var raw json.RawMessage
 	if err := json.Unmarshal([]byte(text), &raw); err != nil {
@@ -423,74 +392,4 @@ func firstTextBlock(blocks []contentBlock) string {
 		}
 	}
 	return ""
-}
-
-// stripMarkdownFence removes ```json ... ``` wrappers if present.
-func stripMarkdownFence(s string) string {
-	// Trim leading/trailing whitespace first.
-	trimmed := bytes.TrimSpace([]byte(s))
-	prefixes := [][]byte{[]byte("```json"), []byte("```")}
-	suffix := []byte("```")
-	for _, p := range prefixes {
-		if bytes.HasPrefix(trimmed, p) {
-			inner := bytes.TrimPrefix(trimmed, p)
-			inner = bytes.TrimSuffix(bytes.TrimSpace(inner), suffix)
-			return string(bytes.TrimSpace(inner))
-		}
-	}
-	return string(trimmed)
-}
-
-// validateKeys checks that every key in required appears at the top level
-// of the JSON object raw. Returns ErrSchemaViolation if any are missing.
-func validateKeys(raw json.RawMessage, required []string) error {
-	if len(required) == 0 {
-		return nil
-	}
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &obj); err != nil {
-		return fmt.Errorf("%w: response is not a JSON object", ErrSchemaViolation)
-	}
-	var missing []string
-	for _, k := range required {
-		if _, ok := obj[k]; !ok {
-			missing = append(missing, k)
-		}
-	}
-	if len(missing) > 0 {
-		return fmt.Errorf("%w: missing keys %v", ErrSchemaViolation, missing)
-	}
-	return nil
-}
-
-// promptHash returns a hex-encoded SHA-256 of the concatenated prompts.
-// Used in audit rows so the prompt content is never stored in the DB.
-func promptHash(system, user string) string {
-	h := sha256.New()
-	h.Write([]byte(system))
-	h.Write([]byte{0x1f}) // ASCII unit separator
-	h.Write([]byte(user))
-	return hex.EncodeToString(h.Sum(nil))
-}
-
-// ----------------------------------------------------------------------
-// Sentinel errors
-// ----------------------------------------------------------------------
-
-// ErrSchemaViolation is returned when the model's JSON response is
-// missing one or more required top-level keys.
-var ErrSchemaViolation = errors.New("llm: schema violation")
-
-// ErrResponseTruncated is returned when the model stopped at the output-token
-// ceiling (stop_reason=max_tokens), leaving the JSON reply incomplete. The
-// remedy is to raise llm.max_tokens; retrying reproduces the same truncation.
-var ErrResponseTruncated = errors.New("llm: response truncated at max_tokens")
-
-// RetryableError wraps an HTTP status code that warrants a retry.
-type RetryableError struct {
-	StatusCode int
-}
-
-func (e *RetryableError) Error() string {
-	return fmt.Sprintf("llm: retryable HTTP %d", e.StatusCode)
 }
