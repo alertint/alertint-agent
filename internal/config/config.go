@@ -8,8 +8,10 @@
 //     the env var that holds a secret, never the secret value itself.
 //     Accessors like Config.WebhookToken() resolve those env vars at call
 //     time so the agent never holds a secret it doesn't currently need.
-//   - Defaults are filled in by applyDefaults before validation, so callers
-//     only see a fully-populated *Config.
+//   - Defaults come from Defaults() (YAML decodes over it) plus the
+//     normalize step for provider-conditional defaults and canonical field
+//     forms, both before validation — so callers only see a fully-populated
+//     *Config, and the validate* methods never mutate what they check.
 //   - Validation is intentionally strict for v1: unknown YAML fields are
 //     rejected so config drift surfaces immediately instead of silently.
 package config
@@ -519,10 +521,42 @@ func loadFrom(r io.Reader, path string, offline bool) (*Config, error) {
 		return nil, fmt.Errorf("config: parse %s: %w", displayPath(path), err)
 	}
 
+	cfg.normalize()
 	if err := cfg.validate(offline); err != nil {
 		return nil, fmt.Errorf("config: validate %s: %w", displayPath(path), err)
 	}
 	return &cfg, nil
+}
+
+// normalize resolves provider-conditional defaults and canonicalizes fields
+// after decode and before validation, keeping the validate* methods
+// read-only. A value validation would reject is left untouched — the
+// validators report it against what the operator actually wrote.
+func (c *Config) normalize() {
+	if strings.EqualFold(c.LLM.Provider, "openai-compatible") {
+		// json_object can't live in Defaults(): a non-empty response_format is
+		// rejected on the anthropic provider, so the default is provider-conditional.
+		if c.LLM.ResponseFormat == "" {
+			c.LLM.ResponseFormat = "json_object"
+		}
+		c.LLM.BaseURL = normalizeLLMBaseURL(c.LLM.BaseURL)
+	}
+}
+
+// normalizeLLMBaseURL strips one trailing /v1 (and any trailing slash) so
+// both spellings of the same endpoint work — the client appends
+// /v1/chat/completions itself. Anything validateLLMBaseURL would reject is
+// returned unchanged.
+func normalizeLLMBaseURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	u, err := url.Parse(trimmed)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
+		u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return raw
+	}
+	u.Path = strings.TrimSuffix(strings.TrimRight(u.Path, "/"), "/v1")
+	u.Path = strings.TrimRight(u.Path, "/")
+	return u.String()
 }
 
 // Validate checks the Config is internally consistent and ready for use.
@@ -658,10 +692,8 @@ func (c *Config) validateLLM() []string {
 	case "openai-compatible":
 		errs = append(errs, c.validateLLMBaseURL()...)
 		switch c.LLM.ResponseFormat {
-		case "":
-			c.LLM.ResponseFormat = "json_object" // resolve the default once, here
-		case "json_object", "off":
-			// ok
+		case "", "json_object", "off":
+			// "" means the default (json_object), resolved by normalize on load.
 		default:
 			errs = append(errs, fmt.Sprintf("llm.response_format %q invalid (use \"json_object\" or \"off\")", c.LLM.ResponseFormat))
 		}
@@ -682,10 +714,9 @@ func (c *Config) validateLLM() []string {
 	return errs
 }
 
-// validateLLMBaseURL checks and normalizes llm.base_url for the
-// openai-compatible provider: must parse as an http(s) URL; one trailing /v1
-// (and any trailing slash) is stripped so both spellings of the same endpoint
-// work — the client appends /v1/chat/completions itself.
+// validateLLMBaseURL checks llm.base_url for the openai-compatible provider:
+// must parse as an http(s) URL with no credentials, query, or fragment.
+// Canonicalization (trailing /v1 and slash stripping) happens in normalize.
 func (c *Config) validateLLMBaseURL() []string {
 	raw := strings.TrimSpace(c.LLM.BaseURL)
 	if raw == "" {
@@ -701,9 +732,6 @@ func (c *Config) validateLLMBaseURL() []string {
 	if u.RawQuery != "" || u.Fragment != "" {
 		return []string{`llm.base_url must not contain a query string or fragment (root URL only, e.g. http://localhost:11434)`}
 	}
-	u.Path = strings.TrimSuffix(strings.TrimRight(u.Path, "/"), "/v1")
-	u.Path = strings.TrimRight(u.Path, "/")
-	c.LLM.BaseURL = u.String()
 	return nil
 }
 

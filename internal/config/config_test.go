@@ -889,6 +889,7 @@ func TestValidateLLMOpenAICompatible(t *testing.T) {
 
 	t.Run("valid minimal config passes", func(t *testing.T) {
 		c := base()
+		c.normalize()
 		if err := c.ValidateOffline(); err != nil {
 			t.Fatalf("expected valid, got: %v", err)
 		}
@@ -924,6 +925,7 @@ func TestValidateLLMOpenAICompatible(t *testing.T) {
 		} {
 			c := base()
 			c.LLM.BaseURL = in
+			c.normalize()
 			if err := c.ValidateOffline(); err != nil {
 				t.Fatalf("%q: %v", in, err)
 			}
@@ -934,11 +936,44 @@ func TestValidateLLMOpenAICompatible(t *testing.T) {
 		// path-prefixed proxy keeps its prefix
 		c := base()
 		c.LLM.BaseURL = "https://llm.corp.lan/qwen/v1"
+		c.normalize()
 		if err := c.ValidateOffline(); err != nil {
 			t.Fatal(err)
 		}
 		if c.LLM.BaseURL != "https://llm.corp.lan/qwen" {
 			t.Errorf("got %q, want https://llm.corp.lan/qwen", c.LLM.BaseURL)
+		}
+	})
+
+	t.Run("validation never mutates the config", func(t *testing.T) {
+		c := base()
+		c.LLM.BaseURL = "http://localhost:11434/v1/"
+		before := c.LLM
+		if err := c.ValidateOffline(); err != nil {
+			t.Fatalf("un-normalized base_url must still validate: %v", err)
+		}
+		if c.LLM != before {
+			t.Errorf("ValidateOffline mutated the config: before %+v, after %+v", before, c.LLM)
+		}
+	})
+
+	t.Run("load path normalizes before validation", func(t *testing.T) {
+		yamlCfg := `
+alertmanager:
+  webhook_token_env: ALERTINT_WEBHOOK_TOKEN
+llm:
+  provider: openai-compatible
+  base_url: http://localhost:11434/v1/
+`
+		cfg, err := loadFrom(strings.NewReader(yamlCfg), "", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.LLM.BaseURL != "http://localhost:11434" {
+			t.Errorf("base_url = %q, want http://localhost:11434", cfg.LLM.BaseURL)
+		}
+		if cfg.LLM.ResponseFormat != "json_object" {
+			t.Errorf("response_format = %q, want json_object", cfg.LLM.ResponseFormat)
 		}
 	})
 
