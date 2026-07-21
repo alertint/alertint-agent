@@ -67,6 +67,7 @@ type ClassifierResult struct {
 	Verdict   ClassifierVerdict
 	Candidate string // the prior incident id judged
 	Tokens    int
+	Err       error // the call error behind an unsure-* verdict; nil on a clean reply
 }
 
 // Classify asks the Haiku client whether the current incident shares an
@@ -87,6 +88,7 @@ func Classify(ctx context.Context, client LLMClient, currentKey string, candidat
 	res.Tokens = comp.InputTokens + comp.OutputTokens
 	if err != nil {
 		// res.Verdict already holds VerdictUnsureError; only a timeout refines it.
+		res.Err = err
 		if isTimeout(err) {
 			res.Verdict = VerdictUnsureTimeout
 		}
@@ -145,6 +147,20 @@ func (s *Skill) maybeClassify(ctx context.Context, inc store.Incident, memory *M
 	}
 
 	result := Classify(ctx, s.cfg.Classifier, inc.GroupKey, *memory.topPrefilter)
+	if result.Err != nil {
+		// The verdict fail-opens to unsure either way; the log distinguishes a
+		// truncated reply — the model's reasoning ate the completion budget —
+		// from a generic call failure, so the operator sees the actionable cause.
+		msg := "acutetriage: classifier call failed; verdict fail-opens to unsure"
+		if errors.Is(result.Err, llm.ErrResponseTruncated) {
+			msg = "acutetriage: classifier reply truncated at its completion budget (model reasoning consumed it; consider llm.thinking: false); verdict fail-opens to unsure"
+		}
+		s.logger.Warn(msg,
+			"incident", inc.ID,
+			"verdict", string(result.Verdict),
+			"error", result.Err,
+		)
+	}
 	if s.auditor != nil {
 		_ = s.auditor.Append(ctx, "skill:acute-triage", "memory.classifier_verdict", map[string]any{
 			"incident_id": inc.ID,

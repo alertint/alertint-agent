@@ -38,7 +38,10 @@ llm:
 
 The memory shadow classifier (when enabled) follows the same endpoint and
 reuses `llm.model` — a single-model local install has nothing cheaper to
-route classifier calls to.
+route classifier calls to. With `llm.thinking: true` the classifier call
+automatically gets a larger completion ceiling (8192 tokens) so reasoning
+output cannot truncate the verdict; a truncated classifier reply is noted
+explicitly in the logs and fail-opens to an "unsure" verdict.
 
 ## SGLang
 

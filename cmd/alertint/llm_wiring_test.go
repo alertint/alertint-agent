@@ -72,6 +72,46 @@ func TestBuildClassifierClient_OpenAICompatibleReusesLLMModel(t *testing.T) {
 	}
 }
 
+// TestBuildClassifierClient_ThinkingSizedTokenBudget pins the classifier's
+// completion ceiling on openai-compatible: the 1024 client default normally,
+// but a thinking-sized ceiling when llm.thinking is on — inherited reasoning
+// shares the completion budget on this wire format, and 1024 would truncate
+// every verdict into a fail-open "unsure".
+func TestBuildClassifierClient_ThinkingSizedTokenBudget(t *testing.T) {
+	for _, tc := range []struct {
+		thinking      bool
+		wantMaxTokens float64
+	}{
+		{thinking: false, wantMaxTokens: 1024},
+		{thinking: true, wantMaxTokens: classifierThinkingMaxTokens},
+	} {
+		var gotMaxTokens float64
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			gotMaxTokens, _ = body["max_tokens"].(float64)
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"verdict\":\"matched\"}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+		}))
+
+		cfg := config.Defaults()
+		cfg.LLM.Provider = "openai-compatible"
+		cfg.LLM.BaseURL = srv.URL
+		cfg.LLM.Model = "qwen3-32b"
+		cfg.LLM.Thinking = tc.thinking
+		cfg.Memory.Classifier.Mode = config.ClassifierModeShadow
+		cfg.Memory.Classifier.TimeoutSeconds = 5
+
+		client := buildClassifierClient(&cfg, "", nil, slog.Default())
+		if _, err := client.Complete(context.Background(), "sys", llm.Prompt{Prefix: "p"}, []string{"verdict"}); err != nil {
+			t.Fatalf("thinking=%v: Complete: %v", tc.thinking, err)
+		}
+		if gotMaxTokens != tc.wantMaxTokens {
+			t.Errorf("thinking=%v: classifier max_tokens = %v, want %v", tc.thinking, gotMaxTokens, tc.wantMaxTokens)
+		}
+		srv.Close()
+	}
+}
+
 // TestBuildClassifierClient_DisabledReturnsNil confirms the classifier stays
 // off (a true nil interface, no client constructed) regardless of provider
 // when memory.classifier.mode is off — the default.

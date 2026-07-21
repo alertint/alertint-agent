@@ -821,6 +821,12 @@ func llmopenaiCfg(cfg *config.Config, apiKey string, timeoutSeconds int, model s
 	}
 }
 
+// classifierThinkingMaxTokens is the classifier's completion ceiling when
+// llm.thinking is on. Reasoning output shares the completion budget on this
+// wire format, so the 1024-token verdict default would truncate mid-thought
+// and poison the graduation evidence with fail-open "unsure" verdicts.
+const classifierThinkingMaxTokens = 8192
+
 // buildClassifierClient builds the shadow classifier's own client. On
 // anthropic it keeps the dedicated Haiku model; on openai-compatible it
 // reuses llm.model — a single-model local endpoint has nothing cheaper to
@@ -837,8 +843,14 @@ func buildClassifierClient(cfg *config.Config, apiKey string, auditor *audit.Aud
 			slog.String("model", cfg.LLM.Model),
 		)
 		// MaxTokens 0 → the client's 1024 default, mirroring the anthropic
-		// classifier client, which also relies on its config default.
-		return llmopenai.New(llmopenaiCfg(cfg, apiKey, cfg.Memory.Classifier.TimeoutSeconds, cfg.LLM.Model, 0), auditor, logger)
+		// classifier client, which also relies on its config default. With
+		// llm.thinking on, the inherited reasoning competes with the verdict
+		// for that budget, so the ceiling grows to a thinking-sized one.
+		maxTokens := 0
+		if cfg.LLM.Thinking {
+			maxTokens = classifierThinkingMaxTokens
+		}
+		return llmopenai.New(llmopenaiCfg(cfg, apiKey, cfg.Memory.Classifier.TimeoutSeconds, cfg.LLM.Model, maxTokens), auditor, logger)
 	}
 	logger.Info("memory shadow classifier enabled",
 		slog.String("mode", string(cfg.Memory.Classifier.Mode)),
