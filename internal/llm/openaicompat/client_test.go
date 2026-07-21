@@ -28,7 +28,10 @@ func chatBody(content string, promptTok, completionTok int) string {
 			"completion_tokens": completionTok,
 		},
 	}
-	b, _ := json.Marshal(payload)
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return "{}"
+	}
 	return string(b)
 }
 
@@ -77,23 +80,35 @@ func TestCompleteHappyPath(t *testing.T) {
 	if gotBody["max_tokens"] != float64(4096) {
 		t.Errorf("max_tokens = %v", gotBody["max_tokens"])
 	}
-	msgs := gotBody["messages"].([]any)
-	if len(msgs) != 2 {
-		t.Fatalf("want [system,user] messages, got %d", len(msgs))
+	msgs, ok := gotBody["messages"].([]any)
+	if !ok || len(msgs) != 2 {
+		t.Fatalf("want [system,user] messages, got %v", gotBody["messages"])
 	}
-	sys := msgs[0].(map[string]any)
-	usr := msgs[1].(map[string]any)
+	sys, ok := msgs[0].(map[string]any)
+	if !ok {
+		t.Fatalf("system message is not an object: %v", msgs[0])
+	}
+	usr, ok := msgs[1].(map[string]any)
+	if !ok {
+		t.Fatalf("user message is not an object: %v", msgs[1])
+	}
 	if sys["role"] != "system" || sys["content"] != "sys" {
 		t.Errorf("system message = %v", sys)
 	}
 	if usr["role"] != "user" || usr["content"] != "evidence" {
 		t.Errorf("user message = %v", usr)
 	}
-	rf := gotBody["response_format"].(map[string]any)
+	rf, ok := gotBody["response_format"].(map[string]any)
+	if !ok {
+		t.Fatalf("response_format is not an object: %v", gotBody["response_format"])
+	}
 	if rf["type"] != "json_object" {
 		t.Errorf("response_format = %v", rf)
 	}
-	kw := gotBody["chat_template_kwargs"].(map[string]any)
+	kw, ok := gotBody["chat_template_kwargs"].(map[string]any)
+	if !ok {
+		t.Fatalf("chat_template_kwargs is not an object: %v", gotBody["chat_template_kwargs"])
+	}
 	if kw["enable_thinking"] != false {
 		t.Errorf("enable_thinking = %v, want false", kw["enable_thinking"])
 	}
@@ -144,7 +159,10 @@ func TestRequestShapeVariants(t *testing.T) {
 		if _, err := c.Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"k"}); err != nil {
 			t.Fatal(err)
 		}
-		kw := gotBody["chat_template_kwargs"].(map[string]any)
+		kw, ok := gotBody["chat_template_kwargs"].(map[string]any)
+		if !ok {
+			t.Fatalf("chat_template_kwargs is not an object: %v", gotBody["chat_template_kwargs"])
+		}
 		if kw["enable_thinking"] != true {
 			t.Errorf("enable_thinking = %v, want true", kw["enable_thinking"])
 		}
@@ -156,7 +174,14 @@ func TestRequestShapeVariants(t *testing.T) {
 		if _, err := c.Complete(context.Background(), "s", p, []string{"k"}); err != nil {
 			t.Fatal(err)
 		}
-		usr := gotBody["messages"].([]any)[1].(map[string]any)
+		msgs, ok := gotBody["messages"].([]any)
+		if !ok || len(msgs) != 2 {
+			t.Fatalf("want [system,user] messages, got %v", gotBody["messages"])
+		}
+		usr, ok := msgs[1].(map[string]any)
+		if !ok {
+			t.Fatalf("user message is not an object: %v", msgs[1])
+		}
 		if usr["content"] != "call-1 prompt\n\ncontinuation" {
 			t.Errorf("user content = %q", usr["content"])
 		}
@@ -190,7 +215,10 @@ func chatBodyFull(content, reasoning, finishReason string) string {
 		},
 		"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 5},
 	}
-	b, _ := json.Marshal(payload)
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return "{}"
+	}
 	return string(b)
 }
 
@@ -308,7 +336,7 @@ func TestRetriesExhaustedOnPersistent500(t *testing.T) {
 	c := newClient(srv, func(cfg *openaicompat.Config) { cfg.BaseRetryDelay = time.Millisecond })
 	_, err := c.Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"k"})
 	var retryErr *llm.RetryableError
-	if !errors.As(err, &retryErr) || retryErr.StatusCode != 500 {
+	if !errors.As(err, &retryErr) || retryErr.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("want RetryableError{500} after exhaustion, got %v", err)
 	}
 	if calls.Load() != 3 { // initial + MaxRetries(2)
