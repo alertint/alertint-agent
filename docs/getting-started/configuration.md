@@ -108,18 +108,23 @@ and feed the ones overlapping an incident's labels into triage. Dual-role:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `provider` | string | `anthropic` | Only `anthropic` is supported today |
-| `api_key_env` | string | — | **Required.** Env var name holding the Anthropic API key |
-| `model` | string | `claude-sonnet-5` | Anthropic model ID used for incident analysis |
+| `provider` | string | `anthropic` | `anthropic` or `openai-compatible` (self-hosted endpoint — see the [OpenAI-compatible endpoint](/docs/integrations/openai-compatible) guide) |
+| `api_key_env` | string | — | Env var name holding the API key. **Required** for `anthropic`; optional for `openai-compatible` (unauthenticated local endpoints omit it) |
+| `model` | string | `claude-sonnet-5` | Model ID (Anthropic) or the model name your endpoint serves (`openai-compatible`) |
 | `max_tokens` | int | `4096` | Output-token ceiling for the triage reply. Raise it if a very large correlated incident truncates (the finding JSON carries one entry per member alert) |
+| `base_url` | string | — | `openai-compatible` only, required there: endpoint root URL. A trailing `/v1` is accepted and stripped |
+| `response_format` | string | — | `openai-compatible` only: `json_object` (the default when unset) or `off` |
+| `thinking` | bool | `false` | `openai-compatible` only: opt a hybrid-reasoning model into thinking. Requires `max_tokens` 8000–16000 or triage fails with the truncation error |
+| `timeout_seconds` | int | `120` | Whole-request LLM timeout, either provider. Local endpoints under storm concurrency typically need ~300 |
 
 This is the model that triages your incidents and writes the finding
-summaries, so every dispatched incident consumes Anthropic API tokens.
-The Sonnet default gives the strongest analysis in its price class; set
-`model: claude-haiku-4-5` to cut per-incident cost when volume matters
-more than finding depth. Keep an eye on your spend in the Anthropic
-console — the agent does not yet meter or cap usage (budget tracking is
-planned).
+summaries, so every dispatched incident consumes LLM tokens — Anthropic API
+tokens on the default provider, or your own compute on a self-hosted
+`openai-compatible` endpoint. The Sonnet default gives the strongest
+analysis in its price class; set `model: claude-haiku-4-5` to cut
+per-incident cost when volume matters more than finding depth. Keep an eye
+on your spend in the Anthropic console — the agent does not yet meter or
+cap usage (budget tracking is planned).
 
 `max_tokens` bounds the finding reply. The finding JSON lists every member
 alert, so a very large correlated incident can exceed the default and truncate

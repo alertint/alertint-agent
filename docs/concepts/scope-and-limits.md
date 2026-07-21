@@ -97,7 +97,7 @@ The roadmap grows the same core rather than bolting on side products.
 Currently being explored:
 
 - Pattern / slow-burn rollups (repeated alerts over hours or days)
-- More LLM providers and more skills beyond acute triage
+- More skills beyond acute triage
 - Cost metering and budget caps
 - SSO/RBAC and team fleet management (the planned hosted control plane)
 - Pull-based Alertmanager reconciliation on startup
