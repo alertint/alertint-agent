@@ -314,6 +314,9 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt
 
 	var raw json.RawMessage
 	if err := json.Unmarshal([]byte(text), &raw); err != nil {
+		if c.cfg.ResponseFormat != "off" {
+			return nil, usage, fmt.Errorf("llm: response is not valid JSON: %w (%s)", err, responseFormatHint)
+		}
 		return nil, usage, fmt.Errorf("llm: response is not valid JSON: %w", err)
 	}
 	return raw, usage, nil

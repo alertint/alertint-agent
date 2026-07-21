@@ -942,6 +942,22 @@ func TestValidateLLMOpenAICompatible(t *testing.T) {
 		}
 	})
 
+	t.Run("base_url rejects query string, fragment, and embedded credentials", func(t *testing.T) {
+		cases := map[string]string{
+			"http://localhost:11434/v1?api-version=2024": "query string or fragment",
+			"http://localhost:11434/v1#frag":             "query string or fragment",
+			"http://user:pass@localhost:11434":           "embedded credentials",
+		}
+		for in, wantSubstr := range cases {
+			c := base()
+			c.LLM.BaseURL = in
+			err := c.ValidateOffline()
+			if err == nil || !strings.Contains(err.Error(), wantSubstr) {
+				t.Errorf("%q: want error containing %q, got: %v", in, wantSubstr, err)
+			}
+		}
+	})
+
 	t.Run("response_format enum", func(t *testing.T) {
 		c := base()
 		c.LLM.ResponseFormat = "off"

@@ -4,6 +4,7 @@ package openaicompat_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -13,8 +14,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/llm"
 	"github.com/alertint/alertint-agent/internal/llm/openaicompat"
+	"github.com/alertint/alertint-agent/internal/store"
 )
 
 // chatBody builds a minimal OpenAI chat-completions success body.
@@ -373,6 +376,38 @@ func TestResponseFormat400CarriesHint(t *testing.T) {
 	}
 }
 
+// TestNonJSON200CarriesResponseFormatHint: a runtime that silently ignores
+// response_format and returns 200 with plain prose must surface the same
+// actionable hint as the 400 path -- not just a bare "not valid JSON".
+func TestNonJSON200CarriesResponseFormatHint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(chatBody("sure, here is the disk usage summary you asked for", 5, 5)))
+	}))
+	defer srv.Close()
+	_, err := newClient(srv, nil).Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"k"})
+	if err == nil || !strings.Contains(err.Error(), `set llm.response_format: "off"`) {
+		t.Fatalf("200 with non-JSON content and response_format!=off must carry the config hint, got: %v", err)
+	}
+}
+
+// TestNonJSON200OmitsHintWhenResponseFormatOff: with response_format already
+// off, the hint would be nonsensical (it points at the very knob already set) --
+// omit it.
+func TestNonJSON200OmitsHintWhenResponseFormatOff(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(chatBody("not json at all", 5, 5)))
+	}))
+	defer srv.Close()
+	c := newClient(srv, func(cfg *openaicompat.Config) { cfg.ResponseFormat = "off" })
+	_, err := c.Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"k"})
+	if err == nil {
+		t.Fatal("want error for non-JSON content")
+	}
+	if strings.Contains(err.Error(), "response_format") {
+		t.Errorf("response_format already off: hint must not be appended, got: %v", err)
+	}
+}
+
 func TestTimeoutHonored(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(2 * time.Second)
@@ -387,5 +422,87 @@ func TestTimeoutHonored(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 1900*time.Millisecond {
 		t.Errorf("timeout not honored, took %v", elapsed)
+	}
+}
+
+// TestConfigDefaultsApplied locks the fallback branches in Config.defaults():
+// a Config that leaves MaxTokens/TimeoutSeconds unset (the zero value) must
+// still get the documented 1024/120 defaults. cmd/alertint's
+// buildClassifierClient deliberately passes MaxTokens: 0 on the
+// openai-compatible path to trigger this exact fallback.
+func TestConfigDefaultsApplied(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		_, _ = w.Write([]byte(chatBody(`{"k":1}`, 1, 1)))
+	}))
+	defer srv.Close()
+
+	c := openaicompat.New(openaicompat.Config{BaseURL: srv.URL, Model: "m"}, nil, nil)
+	if _, err := c.Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"k"}); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if gotBody["max_tokens"] != float64(1024) {
+		t.Errorf("max_tokens = %v, want default 1024", gotBody["max_tokens"])
+	}
+}
+
+// newTestStore opens an in-memory store with applied migrations.
+func newTestStore(t *testing.T) *store.Store {
+	t.Helper()
+	st, err := store.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	return st
+}
+
+// countAuditRows counts audit_log rows by kind.
+func countAuditRows(db *sql.DB, kinds ...string) (map[string]int, error) {
+	out := make(map[string]int)
+	for _, k := range kinds {
+		var n int
+		if err := db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM audit_log WHERE kind = ?`, k).Scan(&n); err != nil {
+			return nil, err
+		}
+		out[k] = n
+	}
+	return out, nil
+}
+
+// TestAuditRowsWritten mirrors internal/llm/anthropic's test of the same
+// name: llm.request and llm.response rows must be appended to the audit log
+// on a successful call, under the "llm.openaicompat" actor.
+func TestAuditRowsWritten(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(chatBody(`{"ok":true}`, 5, 8)))
+	}))
+	defer srv.Close()
+
+	st := newTestStore(t)
+	auditor := audit.New(st.DB())
+	c := openaicompat.New(openaicompat.Config{
+		BaseURL:        srv.URL,
+		Model:          "qwen3-32b",
+		MaxTokens:      4096,
+		ResponseFormat: "json_object",
+		TimeoutSeconds: 5,
+	}, auditor, nil)
+
+	ctx := context.Background()
+	if _, err := c.Complete(ctx, "sys", llm.Prompt{Prefix: "user"}, []string{"ok"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	rows, err := countAuditRows(st.DB(), "llm.request", "llm.response")
+	if err != nil {
+		t.Fatalf("count audit rows: %v", err)
+	}
+	if rows["llm.request"] != 1 {
+		t.Errorf("llm.request rows = %d, want 1", rows["llm.request"])
+	}
+	if rows["llm.response"] != 1 {
+		t.Errorf("llm.response rows = %d, want 1", rows["llm.response"])
 	}
 }

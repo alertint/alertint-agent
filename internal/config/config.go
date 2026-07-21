@@ -695,9 +695,15 @@ func (c *Config) validateLLMBaseURL() []string {
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return []string{fmt.Sprintf("llm.base_url %q must be an http(s) URL", raw)}
 	}
-	raw = strings.TrimRight(raw, "/")
-	raw = strings.TrimSuffix(raw, "/v1")
-	c.LLM.BaseURL = strings.TrimRight(raw, "/")
+	if u.User != nil {
+		return []string{`llm.base_url must not contain embedded credentials (use llm.api_key_env instead)`}
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return []string{`llm.base_url must not contain a query string or fragment (root URL only, e.g. http://localhost:11434)`}
+	}
+	u.Path = strings.TrimSuffix(strings.TrimRight(u.Path, "/"), "/v1")
+	u.Path = strings.TrimRight(u.Path, "/")
+	c.LLM.BaseURL = u.String()
 	return nil
 }
 
