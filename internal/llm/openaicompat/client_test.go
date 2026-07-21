@@ -253,6 +253,44 @@ func TestLeadingThinkBlockStripped(t *testing.T) {
 	}
 }
 
+func TestStackedThinkBlocksStripped(t *testing.T) {
+	// Sequential and nested leading blocks are still reasoning leakage — a
+	// single-block strip would leave debris that fails the JSON parse outright
+	// instead of degrading to the reply.
+	for name, content := range map[string]string{
+		"sequential": "<think>plan a</think>\n<think>plan b</think>\n{\"k\":1}",
+		"nested":     "<think>compare <think>host overlap?</think> no</think>{\"k\":1}",
+		"both":       " <think>a<think>b</think>c</think> <think>d</think>\n{\"k\":1}",
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(chatBodyFull(content, "", "stop")))
+			}))
+			defer srv.Close()
+			comp, err := newClient(srv, nil).Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"k"})
+			if err != nil {
+				t.Fatalf("stacked think blocks must be stripped: %v", err)
+			}
+			if string(comp.Raw) != `{"k":1}` {
+				t.Errorf("Raw = %s", comp.Raw)
+			}
+		})
+	}
+}
+
+func TestUnclosedThinkBlockLeftAlone(t *testing.T) {
+	// An unclosed leading <think> means the reply is unusable either way; the
+	// stripper leaves it untouched and the JSON parse reports it.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(chatBodyFull(`<think>never closed {"k":1}`, "", "stop")))
+	}))
+	defer srv.Close()
+	_, err := newClient(srv, nil).Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"k"})
+	if err == nil || !strings.Contains(err.Error(), "not valid JSON") {
+		t.Fatalf("want not-valid-JSON error, got %v", err)
+	}
+}
+
 func TestNonLeadingThinkLeftAlone(t *testing.T) {
 	// A <think> inside a JSON string value is model output, not leakage —
 	// the strip must not touch it.

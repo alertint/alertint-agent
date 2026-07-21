@@ -25,9 +25,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/llm"
@@ -340,14 +340,59 @@ func apiError(status int, body []byte) error {
 	return errors.New(msg)
 }
 
-// leadingThink matches one <think>…</think> block (plus surrounding
-// whitespace) at the very start of the content — the shape hybrid-reasoning
-// models leak when the serving runtime has no reasoning parser configured.
-var leadingThink = regexp.MustCompile(`(?s)\A\s*<think>.*?</think>\s*`)
+const (
+	thinkOpen  = "<think>"
+	thinkClose = "</think>"
+)
 
-// stripLeadingThink removes one leading think block. A non-leading
-// occurrence is left alone: only the leading position is reasoning leakage;
-// anywhere else it is model output on its own head.
+// stripLeadingThink removes leading <think>…</think> blocks (plus surrounding
+// whitespace) — the shape hybrid-reasoning models leak when the serving
+// runtime has no reasoning parser configured. Blocks may be stacked
+// sequentially or nested, so each one is consumed depth-balanced and the scan
+// repeats while another block immediately follows. A non-leading occurrence
+// is left alone: only the leading position is reasoning leakage; anywhere
+// else it is model output on its own head. An unclosed leading block leaves
+// the content untouched for the JSON parse to report.
 func stripLeadingThink(s string) string {
-	return leadingThink.ReplaceAllString(s, "")
+	cur, stripped := s, false
+	for {
+		trimmed := strings.TrimLeftFunc(cur, unicode.IsSpace)
+		if !strings.HasPrefix(trimmed, thinkOpen) {
+			if stripped {
+				return trimmed
+			}
+			return s
+		}
+		rest, ok := skipThinkBlock(trimmed)
+		if !ok {
+			if stripped {
+				return trimmed
+			}
+			return s
+		}
+		cur, stripped = rest, true
+	}
+}
+
+// skipThinkBlock consumes one depth-balanced <think>…</think> block from the
+// start of s and returns the remainder. ok is false when the block never
+// closes at depth zero.
+func skipThinkBlock(s string) (rest string, ok bool) {
+	depth, i := 0, 0
+	for i < len(s) {
+		switch {
+		case strings.HasPrefix(s[i:], thinkOpen):
+			depth++
+			i += len(thinkOpen)
+		case strings.HasPrefix(s[i:], thinkClose):
+			depth--
+			i += len(thinkClose)
+			if depth == 0 {
+				return s[i:], true
+			}
+		default:
+			i++
+		}
+	}
+	return "", false
 }
