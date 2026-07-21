@@ -876,3 +876,147 @@ func TestValidate_GroupLabelHygiene(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateLLMOpenAICompatible(t *testing.T) {
+	base := func() Config {
+		c := Defaults()
+		c.Alertmanager.WebhookTokenEnv = "ALERTINT_WEBHOOK_TOKEN"
+		c.LLM.Provider = "openai-compatible"
+		c.LLM.BaseURL = "http://localhost:30000"
+		c.LLM.APIKeyEnv = "" // optional for this provider
+		return c
+	}
+
+	t.Run("valid minimal config passes", func(t *testing.T) {
+		c := base()
+		if err := c.ValidateOffline(); err != nil {
+			t.Fatalf("expected valid, got: %v", err)
+		}
+		if c.LLM.ResponseFormat != "json_object" {
+			t.Fatalf("response_format must resolve to json_object, got %q", c.LLM.ResponseFormat)
+		}
+	})
+
+	t.Run("base_url required", func(t *testing.T) {
+		c := base()
+		c.LLM.BaseURL = ""
+		err := c.ValidateOffline()
+		if err == nil || !strings.Contains(err.Error(), "llm.base_url is required") {
+			t.Fatalf("want base_url-required error, got: %v", err)
+		}
+	})
+
+	t.Run("base_url must be http(s)", func(t *testing.T) {
+		c := base()
+		c.LLM.BaseURL = "ftp://x"
+		err := c.ValidateOffline()
+		if err == nil || !strings.Contains(err.Error(), "llm.base_url") {
+			t.Fatalf("want base_url scheme error, got: %v", err)
+		}
+	})
+
+	t.Run("base_url trailing v1 normalized", func(t *testing.T) {
+		for _, in := range []string{
+			"http://localhost:11434",
+			"http://localhost:11434/",
+			"http://localhost:11434/v1",
+			"http://localhost:11434/v1/",
+		} {
+			c := base()
+			c.LLM.BaseURL = in
+			if err := c.ValidateOffline(); err != nil {
+				t.Fatalf("%q: %v", in, err)
+			}
+			if c.LLM.BaseURL != "http://localhost:11434" {
+				t.Errorf("%q normalized to %q, want http://localhost:11434", in, c.LLM.BaseURL)
+			}
+		}
+		// path-prefixed proxy keeps its prefix
+		c := base()
+		c.LLM.BaseURL = "https://llm.corp.lan/qwen/v1"
+		if err := c.ValidateOffline(); err != nil {
+			t.Fatal(err)
+		}
+		if c.LLM.BaseURL != "https://llm.corp.lan/qwen" {
+			t.Errorf("got %q, want https://llm.corp.lan/qwen", c.LLM.BaseURL)
+		}
+	})
+
+	t.Run("response_format enum", func(t *testing.T) {
+		c := base()
+		c.LLM.ResponseFormat = "off"
+		if err := c.ValidateOffline(); err != nil {
+			t.Fatalf("off must be valid: %v", err)
+		}
+		c = base()
+		c.LLM.ResponseFormat = "json_schema"
+		if err := c.ValidateOffline(); err == nil || !strings.Contains(err.Error(), "llm.response_format") {
+			t.Fatalf("want response_format enum error, got: %v", err)
+		}
+	})
+
+	t.Run("timeout_seconds must be positive", func(t *testing.T) {
+		c := base()
+		c.LLM.TimeoutSeconds = -1
+		if err := c.ValidateOffline(); err == nil || !strings.Contains(err.Error(), "llm.timeout_seconds") {
+			t.Fatalf("want timeout error, got: %v", err)
+		}
+	})
+
+	t.Run("provider case-insensitive", func(t *testing.T) {
+		c := base()
+		c.LLM.Provider = "OpenAI-Compatible"
+		if err := c.ValidateOffline(); err != nil {
+			t.Fatalf("case-insensitive provider must pass: %v", err)
+		}
+	})
+}
+
+func TestValidateLLMAnthropicRejectsProviderScopedFields(t *testing.T) {
+	c := Defaults() // provider anthropic, api_key_env must be set for validity
+	c.Alertmanager.WebhookTokenEnv = "ALERTINT_WEBHOOK_TOKEN"
+	c.LLM.APIKeyEnv = "ANTHROPIC_API_KEY"
+
+	c.LLM.BaseURL = "http://localhost:30000"
+	if err := c.ValidateOffline(); err == nil || !strings.Contains(err.Error(), "llm.base_url") {
+		t.Fatalf("base_url must be rejected for anthropic, got: %v", err)
+	}
+	c.LLM.BaseURL = ""
+
+	c.LLM.ResponseFormat = "json_object"
+	if err := c.ValidateOffline(); err == nil || !strings.Contains(err.Error(), "llm.response_format") {
+		t.Fatalf("response_format must be rejected for anthropic, got: %v", err)
+	}
+	c.LLM.ResponseFormat = ""
+
+	c.LLM.Thinking = true
+	if err := c.ValidateOffline(); err == nil || !strings.Contains(err.Error(), "llm.thinking") {
+		t.Fatalf("thinking:true must be rejected for anthropic, got: %v", err)
+	}
+	c.LLM.Thinking = false
+
+	if err := c.ValidateOffline(); err != nil {
+		t.Fatalf("clean anthropic config must pass: %v", err)
+	}
+	// unknown provider error message now names both providers
+	c.LLM.Provider = "gemini"
+	if err := c.ValidateOffline(); err == nil || !strings.Contains(err.Error(), "openai-compatible") {
+		t.Fatalf("unknown-provider error must name the supported set, got: %v", err)
+	}
+}
+
+func TestLLMAPIKeyOptionalForOpenAICompatible(t *testing.T) {
+	c := Defaults()
+	c.LLM.Provider = "openai-compatible"
+	c.LLM.BaseURL = "http://localhost:30000"
+	c.LLM.APIKeyEnv = ""
+	key, err := c.LLMAPIKey()
+	if err != nil || key != "" {
+		t.Fatalf("unset api_key_env on openai-compatible: want empty key + nil err, got %q, %v", key, err)
+	}
+	// when named, the env var must still resolve (fail loud on empty)
+	c.LLM.APIKeyEnv = "ALERTINT_TEST_LLM_KEY_UNSET"
+	if _, err := c.LLMAPIKey(); err == nil {
+		t.Fatal("named-but-unset env var must error")
+	}
+}
