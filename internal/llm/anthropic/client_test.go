@@ -17,7 +17,8 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/audit"
-	llm "github.com/alertint/alertint-agent/internal/llm/anthropic"
+	"github.com/alertint/alertint-agent/internal/llm"
+	"github.com/alertint/alertint-agent/internal/llm/anthropic"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -64,15 +65,15 @@ func responseBodyStop(text, stopReason string, inputTok, outputTok int) string {
 }
 
 // newTestClient wires a Client against the given test server URL.
-func newTestClient(t *testing.T, serverURL string, auditor *audit.Auditor) *llm.Client {
+func newTestClient(t *testing.T, serverURL string, auditor *audit.Auditor) *anthropic.Client {
 	t.Helper()
-	cfg := llm.Config{
+	cfg := anthropic.Config{
 		APIKey:         "test-key",
 		Model:          "claude-test",
 		MaxTokens:      256,
 		BaseRetryDelay: 5 * time.Millisecond,
 	}
-	c := llm.NewWithHTTPClient(cfg, auditor, nil, serverURL)
+	c := anthropic.NewWithHTTPClient(cfg, auditor, nil, serverURL)
 	return c
 }
 
@@ -141,12 +142,12 @@ func TestDefaultModelAndThinkingDisabled(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := llm.NewWithHTTPClient(llm.Config{APIKey: "k"}, nil, nil, srv.URL)
+	c := anthropic.NewWithHTTPClient(anthropic.Config{APIKey: "k"}, nil, nil, srv.URL)
 	if _, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "user"}, []string{"analysis_name"}); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	if body["model"] != llm.DefaultModel {
-		t.Errorf("model on the wire = %v, want DefaultModel %q", body["model"], llm.DefaultModel)
+	if body["model"] != anthropic.DefaultModel {
+		t.Errorf("model on the wire = %v, want DefaultModel %q", body["model"], anthropic.DefaultModel)
 	}
 	thinking, ok := body["thinking"].(map[string]any)
 	if !ok || thinking["type"] != "disabled" {
@@ -157,8 +158,8 @@ func TestDefaultModelAndThinkingDisabled(t *testing.T) {
 // TestDefaultModelIsCurrentSonnet pins the default triage model: Sonnet for
 // first-finding quality, with Haiku as the documented config opt-in.
 func TestDefaultModelIsCurrentSonnet(t *testing.T) {
-	if llm.DefaultModel != "claude-sonnet-5" {
-		t.Errorf("DefaultModel = %q, want claude-sonnet-5", llm.DefaultModel)
+	if anthropic.DefaultModel != "claude-sonnet-5" {
+		t.Errorf("DefaultModel = %q, want claude-sonnet-5", anthropic.DefaultModel)
 	}
 }
 
@@ -229,7 +230,7 @@ func TestRetryExhausted(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	expectedCalls := int32(llm.MaxRetries + 1)
+	expectedCalls := int32(anthropic.MaxRetries + 1)
 	if calls.Load() != expectedCalls {
 		t.Errorf("expected %d calls, got %d", expectedCalls, calls.Load())
 	}
@@ -352,7 +353,7 @@ func TestPromptSuffixConcatenated(t *testing.T) {
 	var gotBody []byte
 	srv := captureServer(t, &gotBody)
 
-	c := llm.NewWithHTTPClient(llm.Config{APIKey: "k"}, nil, nil, srv.URL)
+	c := anthropic.NewWithHTTPClient(anthropic.Config{APIKey: "k"}, nil, nil, srv.URL)
 	if _, err := c.Complete(context.Background(), "sys",
 		llm.Prompt{Prefix: "PREFIX-", Suffix: "SUFFIX"}, nil); err != nil {
 		t.Fatalf("Complete: %v", err)
@@ -413,7 +414,7 @@ type requestBlock struct {
 func TestMarkedPromptEmitsBlocksWithBreakpoint(t *testing.T) {
 	var body []byte
 	srv := captureServer(t, &body)
-	c := llm.NewWithHTTPClient(llm.Config{APIKey: "k"}, nil, nil, srv.URL)
+	c := anthropic.NewWithHTTPClient(anthropic.Config{APIKey: "k"}, nil, nil, srv.URL)
 	if _, err := c.Complete(context.Background(), "sys",
 		llm.Prompt{Prefix: "E", Suffix: "DV", CachePrefix: true}, nil); err != nil {
 		t.Fatalf("Complete: %v", err)
@@ -440,7 +441,7 @@ func TestMarkedPromptEmitsBlocksWithBreakpoint(t *testing.T) {
 func TestMarkedPromptNoSuffixSingleBlock(t *testing.T) {
 	var body []byte
 	srv := captureServer(t, &body)
-	c := llm.NewWithHTTPClient(llm.Config{APIKey: "k"}, nil, nil, srv.URL)
+	c := anthropic.NewWithHTTPClient(anthropic.Config{APIKey: "k"}, nil, nil, srv.URL)
 	if _, err := c.Complete(context.Background(), "sys",
 		llm.Prompt{Prefix: "E", CachePrefix: true}, nil); err != nil {
 		t.Fatalf("Complete: %v", err)
@@ -460,7 +461,7 @@ func TestMarkedPromptNoSuffixSingleBlock(t *testing.T) {
 func TestUnmarkedPromptKeepsLegacyStringShape(t *testing.T) {
 	var body []byte
 	srv := captureServer(t, &body)
-	c := llm.NewWithHTTPClient(llm.Config{APIKey: "k"}, nil, nil, srv.URL)
+	c := anthropic.NewWithHTTPClient(anthropic.Config{APIKey: "k"}, nil, nil, srv.URL)
 	if _, err := c.Complete(context.Background(), "sys",
 		llm.Prompt{Prefix: "plain user prompt"}, nil); err != nil {
 		t.Fatalf("Complete: %v", err)
@@ -503,7 +504,7 @@ func TestCacheUsageCaptured(t *testing.T) {
 
 	st := newTestStore(t)
 	auditor := audit.New(st.DB())
-	c := llm.NewWithHTTPClient(llm.Config{APIKey: "k"}, auditor, nil, srv.URL)
+	c := anthropic.NewWithHTTPClient(anthropic.Config{APIKey: "k"}, auditor, nil, srv.URL)
 
 	comp, err := c.Complete(context.Background(), "sys", llm.Prompt{Prefix: "E", CachePrefix: true}, nil)
 	if err != nil {

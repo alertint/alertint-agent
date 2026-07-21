@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/audit"
-	llm "github.com/alertint/alertint-agent/internal/llm/anthropic"
+	"github.com/alertint/alertint-agent/internal/llm"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/skills/acutetriage"
@@ -236,6 +236,7 @@ func verifyConfig(prom *promclient.Client) acutetriage.Config {
 		Verification: acutetriage.VerificationParams{
 			Enabled: true, MaxQueries: 4, QueryTimeoutSeconds: 5, MaxSeries: 100,
 		},
+		PromptCaching: true,
 	}
 }
 
@@ -669,7 +670,7 @@ func TestConditionalMarking(t *testing.T) {
 	off := &scriptedLLM{responses: []scriptResp{
 		{raw: callTwoResp(t, "draft", "disk pressure on web1", 0.7, "")},
 	}}
-	skill := acutetriage.New(acutetriage.Config{MinAlerts: 1}, st, off, nil, nil, nil)
+	skill := acutetriage.New(acutetriage.Config{MinAlerts: 1, PromptCaching: true}, st, off, nil, nil, nil)
 	if err := skill.Run(ctx, inc); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -717,5 +718,42 @@ func TestWarnWhenCallTwoReadNoCachedPrefix(t *testing.T) {
 	runVerifiedPair(t, 3400, slog.New(slog.NewTextHandler(&buf, nil)))
 	if strings.Contains(buf.String(), "read no cached prefix") {
 		t.Error("unexpected WARN when the cache engaged")
+	}
+}
+
+// TestPromptCachingFalseSuppressesMarkAndWarn: with PromptCaching false
+// (openai-compatible wiring), neither call marks CachePrefix, and a zero
+// cache read on call 2 does not WARN — on a provider without client-side
+// caching, zero reads are normal, not a drift signal. The shared-prefix
+// guarantee itself is provider-independent and must survive.
+func TestPromptCachingFalseSuppressesMarkAndWarn(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-nocache", map[string]string{"alertname": "DiskFull", "host": "web1"})
+
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "disk", "disk pressure on web1", 0.7, nil)},
+		{raw: callTwoResp(t, "disk", "disk pressure on web1", 0.7, ""), cacheRead: 0},
+	}}
+	var buf bytes.Buffer
+	cfg := verifyConfig(promHealthy(t))
+	cfg.PromptCaching = false
+	skill := acutetriage.New(cfg, st, scripted, nil, nil, slog.New(slog.NewTextHandler(&buf, nil)))
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if scripted.calls != 2 {
+		t.Fatalf("want 2 LLM calls, got %d", scripted.calls)
+	}
+	if scripted.records[0].CachePrefix || scripted.records[1].CachePrefix {
+		t.Errorf("PromptCaching false: no call may mark CachePrefix, got call1=%v call2=%v",
+			scripted.records[0].CachePrefix, scripted.records[1].CachePrefix)
+	}
+	if scripted.records[1].Prefix != scripted.records[0].Prefix {
+		t.Error("shared-prefix guarantee must hold regardless of caching")
+	}
+	if strings.Contains(buf.String(), "read no cached prefix") {
+		t.Error("PromptCaching false: zero cache read must not WARN")
 	}
 }

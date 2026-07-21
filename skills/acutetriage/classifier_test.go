@@ -5,6 +5,7 @@ package acutetriage_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,7 +13,8 @@ import (
 	"testing"
 	"time"
 
-	llm "github.com/alertint/alertint-agent/internal/llm/anthropic"
+	"github.com/alertint/alertint-agent/internal/llm"
+	llmanthropic "github.com/alertint/alertint-agent/internal/llm/anthropic"
 	"github.com/alertint/alertint-agent/skills/acutetriage"
 )
 
@@ -70,6 +72,28 @@ func TestClassify_SchemaErrorNeverMatches(t *testing.T) {
 	}
 }
 
+// TestClassify_ErrSurfacesForLogging: the call error rides along in Err so the
+// caller can log the actionable cause — in particular a truncated reply (the
+// model's reasoning ate the completion budget) stays matchable via errors.Is.
+func TestClassify_ErrSurfacesForLogging(t *testing.T) {
+	truncErr := fmt.Errorf("%w=1024 (raise llm.max_tokens)", llm.ErrResponseTruncated)
+	fllm := &fakeLLM{err: truncErr}
+	got := acutetriage.Classify(context.Background(), fllm, currentKeyForClassify,
+		candidateEntry("x", 0.5))
+	if got.Verdict != acutetriage.VerdictUnsureError {
+		t.Errorf("verdict = %q, want unsure-error", got.Verdict)
+	}
+	if !errors.Is(got.Err, llm.ErrResponseTruncated) {
+		t.Errorf("Err = %v, want it to wrap llm.ErrResponseTruncated", got.Err)
+	}
+
+	clean := &fakeLLM{response: json.RawMessage(`{"verdict":"matched"}`)}
+	if got := acutetriage.Classify(context.Background(), clean, currentKeyForClassify,
+		candidateEntry("x", 0.5)); got.Err != nil {
+		t.Errorf("clean reply: Err = %v, want nil", got.Err)
+	}
+}
+
 // TestClassify_ModelUnsureIsDistinct: the model's own "unsure" reply is recorded
 // as VerdictUnsure, not conflated with the unsure-error failure variant, so the
 // graduation audit log can tell deliberate uncertainty from a broken call.
@@ -112,7 +136,7 @@ func TestClassify_TimeoutMapsToUnsureTimeout(t *testing.T) {
 	defer srv.Close()
 	defer close(done)
 
-	client := llm.NewWithHTTPClient(llm.Config{APIKey: "k", Model: "claude-haiku-4-5", TimeoutSeconds: 1}, nil, nil, srv.URL)
+	client := llmanthropic.NewWithHTTPClient(llmanthropic.Config{APIKey: "k", Model: "claude-haiku-4-5", TimeoutSeconds: 1}, nil, nil, srv.URL)
 	start := time.Now()
 	got := acutetriage.Classify(context.Background(), client, currentKeyForClassify,
 		candidateEntry("x", 0.5))

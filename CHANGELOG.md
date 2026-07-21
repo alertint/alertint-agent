@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- OpenAI-compatible LLM provider: point triage at a self-hosted endpoint
+  (SGLang, vLLM, Ollama, LM Studio) with `llm.provider: openai-compatible`
+  and `llm.base_url` — no proxy required, and alert data never leaves your
+  network. Includes enforced-JSON output by default (`llm.response_format`),
+  defensive handling for hybrid-reasoning models (`reasoning_content`
+  ignored, leading `<think>` blocks stripped, thinking disabled per request
+  unless `llm.thinking: true`), Bearer auth only when a key is configured,
+  and retries on transient local-runtime errors. The memory classifier
+  follows the same endpoint using `llm.model`. New for both providers:
+  `llm.timeout_seconds` (default 120 — the previous fixed value). See the
+  "OpenAI-compatible endpoint" integration guide.
+
 ## [0.8.3] - 2026-07-16
 
 ### Added

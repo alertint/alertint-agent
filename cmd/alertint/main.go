@@ -39,6 +39,7 @@ import (
 	"github.com/alertint/alertint-agent/internal/health"
 	"github.com/alertint/alertint-agent/internal/ingress"
 	llmanthropic "github.com/alertint/alertint-agent/internal/llm/anthropic"
+	llmopenai "github.com/alertint/alertint-agent/internal/llm/openaicompat"
 	"github.com/alertint/alertint-agent/internal/logging"
 	"github.com/alertint/alertint-agent/internal/logs"
 	"github.com/alertint/alertint-agent/internal/logs/loki"
@@ -191,7 +192,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	llmClient := llmanthropic.New(llmanthropicCfg(cfg), auditor, logger)
+	llmClient := buildLLMClient(cfg, apiKey, auditor, logger)
 
 	classifierClient := buildClassifierClient(cfg, apiKey, auditor, logger)
 
@@ -303,6 +304,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 				QueryTimeoutSeconds: cfg.Triage.Verification.QueryTimeoutSeconds,
 				MaxSeries:           cfg.Prometheus.MaxSeries,
 			},
+			PromptCaching: !llmProviderIsOpenAI(cfg),
 		},
 		st, llmClient, auditor, notifier, logger,
 	)
@@ -790,13 +792,65 @@ func buildNotifier(cfg *config.Config, st *store.Store, auditor *audit.Auditor, 
 	return notify.NewMulti(logger, nn...)
 }
 
-// buildClassifierClient builds the M3 shadow-classifier LLM client: a second
-// Anthropic client on the same key + auditor, running Haiku with the classifier's
-// seconds-scale timeout. Returns a true nil interface when the mode is off (the
-// default) so nothing is constructed and no classifier call is ever made.
+// llmProviderIsOpenAI reports whether the configured provider is the
+// openai-compatible one (case-insensitive, matching config validation).
+func llmProviderIsOpenAI(cfg *config.Config) bool {
+	return strings.EqualFold(cfg.LLM.Provider, "openai-compatible")
+}
+
+// buildLLMClient constructs the triage LLM client for the configured
+// provider. Exactly one provider serves an install (ADR-0026).
+func buildLLMClient(cfg *config.Config, apiKey string, auditor *audit.Auditor, logger *slog.Logger) acutetriage.LLMClient {
+	if llmProviderIsOpenAI(cfg) {
+		return llmopenai.New(llmopenaiCfg(cfg, apiKey, cfg.LLM.TimeoutSeconds, cfg.LLM.Model, cfg.LLM.MaxTokens), auditor, logger)
+	}
+	return llmanthropic.New(llmanthropicCfg(cfg), auditor, logger)
+}
+
+// llmopenaiCfg builds an openaicompat.Config; model/maxTokens/timeout are
+// parameters because the classifier client reuses this with its own values.
+func llmopenaiCfg(cfg *config.Config, apiKey string, timeoutSeconds int, model string, maxTokens int) llmopenai.Config {
+	return llmopenai.Config{
+		BaseURL:        cfg.LLM.BaseURL,
+		APIKey:         apiKey,
+		Model:          model,
+		MaxTokens:      maxTokens,
+		ResponseFormat: cfg.LLM.ResponseFormat,
+		Thinking:       cfg.LLM.Thinking,
+		TimeoutSeconds: timeoutSeconds,
+	}
+}
+
+// classifierThinkingMaxTokens is the classifier's completion ceiling when
+// llm.thinking is on. Reasoning output shares the completion budget on this
+// wire format, so the 1024-token verdict default would truncate mid-thought
+// and poison the graduation evidence with fail-open "unsure" verdicts.
+const classifierThinkingMaxTokens = 8192
+
+// buildClassifierClient builds the shadow classifier's own client. On
+// anthropic it keeps the dedicated Haiku model; on openai-compatible it
+// reuses llm.model — a single-model local endpoint has nothing cheaper to
+// serve, and requesting the Haiku constant there would 404 every call,
+// silently poisoning the ADR-0018 graduation evidence with fail-open
+// "unsure" verdicts. Returns a true nil interface when the mode is off.
 func buildClassifierClient(cfg *config.Config, apiKey string, auditor *audit.Auditor, logger *slog.Logger) acutetriage.LLMClient {
 	if !cfg.Memory.Classifier.Enabled() {
 		return nil
+	}
+	if llmProviderIsOpenAI(cfg) {
+		logger.Info("memory shadow classifier enabled",
+			slog.String("mode", string(cfg.Memory.Classifier.Mode)),
+			slog.String("model", cfg.LLM.Model),
+		)
+		// MaxTokens 0 → the client's 1024 default, mirroring the anthropic
+		// classifier client, which also relies on its config default. With
+		// llm.thinking on, the inherited reasoning competes with the verdict
+		// for that budget, so the ceiling grows to a thinking-sized one.
+		maxTokens := 0
+		if cfg.LLM.Thinking {
+			maxTokens = classifierThinkingMaxTokens
+		}
+		return llmopenai.New(llmopenaiCfg(cfg, apiKey, cfg.Memory.Classifier.TimeoutSeconds, cfg.LLM.Model, maxTokens), auditor, logger)
 	}
 	logger.Info("memory shadow classifier enabled",
 		slog.String("mode", string(cfg.Memory.Classifier.Mode)),
@@ -813,9 +867,10 @@ func buildClassifierClient(cfg *config.Config, apiKey string, auditor *audit.Aud
 func llmanthropicCfg(cfg *config.Config) llmanthropic.Config {
 	key, _ := cfg.LLMAPIKey()
 	return llmanthropic.Config{
-		APIKey:    key,
-		Model:     cfg.LLM.Model,
-		MaxTokens: cfg.LLM.MaxTokens,
+		APIKey:         key,
+		Model:          cfg.LLM.Model,
+		MaxTokens:      cfg.LLM.MaxTokens,
+		TimeoutSeconds: cfg.LLM.TimeoutSeconds,
 	}
 }
 

@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/audit"
-	llm "github.com/alertint/alertint-agent/internal/llm/anthropic"
+	"github.com/alertint/alertint-agent/internal/llm"
 	"github.com/alertint/alertint-agent/internal/logs"
 	"github.com/alertint/alertint-agent/internal/notify"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
@@ -93,6 +93,14 @@ type Config struct {
 	// call. The zero value (Enabled=false) is the kill switch: one call, no round,
 	// prompt byte-identical to the pre-feature triage.
 	Verification VerificationParams
+	// PromptCaching marks whether the wired LLM provider supports
+	// client-side prompt caching (anthropic: yes; openai-compatible: no —
+	// SGLang/vLLM prefix-cache server-side instead). Gates both the
+	// CachePrefix breakpoint marking and the cache-engagement WARN: on a
+	// provider without client-side caching a zero cache read is normal,
+	// and per-incident WARNs would teach operators to ignore a surface
+	// whose principle is "silence is unambiguous".
+	PromptCaching bool
 }
 
 // Skill orchestrates the full acute-triage pipeline for a single ready
@@ -551,7 +559,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 	system := s.systemPrompt(decision, len(alerts))
 	comp, err := s.llm.Complete(ctx, system, llm.Prompt{
 		Prefix:      userPrompt,
-		CachePrefix: s.cfg.Verification.Enabled,
+		CachePrefix: s.cfg.Verification.Enabled && s.cfg.PromptCaching,
 	}, RequiredKeys)
 	if err != nil {
 		s.logger.Error("llm failed", "incident", inc.ID, "err", err)
@@ -743,7 +751,7 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 	comp, err := s.llm.Complete(ctx, ar.system, llm.Prompt{
 		Prefix:      ar.user,
 		Suffix:      callTwoContinuation(ar.raw, round, ar.memory),
-		CachePrefix: true,
+		CachePrefix: s.cfg.PromptCaching,
 	}, RequiredKeys)
 	if err != nil {
 		s.logger.Warn("acutetriage: verification re-judge failed; draft stands", "incident", inc.ID, "err", err)
@@ -754,7 +762,7 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 	// permanent on small models) or the prefix drifted (a regression). The two
 	// are indistinguishable here, so this stays a per-pair WARN — never
 	// once-then-quiet — and floors are asserted nowhere (they drift per release).
-	if comp.CacheReadInputTokens == 0 {
+	if s.cfg.PromptCaching && comp.CacheReadInputTokens == 0 {
 		s.logger.Warn("acutetriage: verification call 2 read no cached prefix (prefix below the model's cacheable floor, or prefix drift)",
 			"incident", inc.ID, "model", comp.Model, "prefix_chars", len(ar.user))
 	}

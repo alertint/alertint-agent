@@ -8,8 +8,10 @@
 //     the env var that holds a secret, never the secret value itself.
 //     Accessors like Config.WebhookToken() resolve those env vars at call
 //     time so the agent never holds a secret it doesn't currently need.
-//   - Defaults are filled in by applyDefaults before validation, so callers
-//     only see a fully-populated *Config.
+//   - Defaults come from Defaults() (YAML decodes over it) plus the
+//     normalize step for provider-conditional defaults and canonical field
+//     forms, both before validation — so callers only see a fully-populated
+//     *Config, and the validate* methods never mutate what they check.
 //   - Validation is intentionally strict for v1: unknown YAML fields are
 //     rejected so config drift surfaces immediately instead of silently.
 package config
@@ -18,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -260,6 +263,26 @@ type LLMConfig struct {
 	// and the whole triage fails. Defaults to 4096; raise it for very large
 	// correlations.
 	MaxTokens int `yaml:"max_tokens"`
+	// BaseURL is the root URL of an OpenAI-compatible endpoint (SGLang, vLLM,
+	// Ollama, LM Studio). Required for provider "openai-compatible", rejected
+	// for "anthropic". A trailing /v1 is accepted and stripped at load — both
+	// http://host:11434 and http://host:11434/v1 reach the same endpoint.
+	BaseURL string `yaml:"base_url"`
+	// ResponseFormat controls enforced-JSON output on "openai-compatible":
+	// "json_object" (default — fails loud if the runtime lacks JSON mode) or
+	// "off". Rejected for "anthropic".
+	ResponseFormat string `yaml:"response_format"`
+	// Thinking opts a hybrid-reasoning model (Qwen/DeepSeek-class) into
+	// thinking on "openai-compatible": every request carries
+	// chat_template_kwargs {"enable_thinking": <value>}. Default false —
+	// thinking output competes with the JSON reply for max_tokens; enabling
+	// it requires raising llm.max_tokens to 8–16k. Rejected (when true) for
+	// "anthropic", which pins thinking disabled in the client.
+	Thinking bool `yaml:"thinking"`
+	// TimeoutSeconds is the whole-request HTTP timeout for either provider.
+	// Default 120 (the previously hardcoded client default). Local endpoints
+	// under storm concurrency typically need ~300.
+	TimeoutSeconds int `yaml:"timeout_seconds"`
 }
 
 // CorrelatorConfig configures the time-window correlator.
@@ -372,7 +395,8 @@ func Defaults() Config {
 			// 4096: a comfortable ceiling for the per-alert finding JSON. The
 			// old hardcoded 1024 truncated large correlated incidents mid-reply;
 			// this covers realistic incidents and is a config knob for the rest.
-			MaxTokens: 4096,
+			MaxTokens:      4096,
+			TimeoutSeconds: 120,
 		},
 		Correlator: CorrelatorConfig{
 			WindowSeconds: 90,
@@ -497,10 +521,42 @@ func loadFrom(r io.Reader, path string, offline bool) (*Config, error) {
 		return nil, fmt.Errorf("config: parse %s: %w", displayPath(path), err)
 	}
 
+	cfg.normalize()
 	if err := cfg.validate(offline); err != nil {
 		return nil, fmt.Errorf("config: validate %s: %w", displayPath(path), err)
 	}
 	return &cfg, nil
+}
+
+// normalize resolves provider-conditional defaults and canonicalizes fields
+// after decode and before validation, keeping the validate* methods
+// read-only. A value validation would reject is left untouched — the
+// validators report it against what the operator actually wrote.
+func (c *Config) normalize() {
+	if strings.EqualFold(c.LLM.Provider, "openai-compatible") {
+		// json_object can't live in Defaults(): a non-empty response_format is
+		// rejected on the anthropic provider, so the default is provider-conditional.
+		if c.LLM.ResponseFormat == "" {
+			c.LLM.ResponseFormat = "json_object"
+		}
+		c.LLM.BaseURL = normalizeLLMBaseURL(c.LLM.BaseURL)
+	}
+}
+
+// normalizeLLMBaseURL strips one trailing /v1 (and any trailing slash) so
+// both spellings of the same endpoint work — the client appends
+// /v1/chat/completions itself. Anything validateLLMBaseURL would reject is
+// returned unchanged.
+func normalizeLLMBaseURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	u, err := url.Parse(trimmed)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
+		u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return raw
+	}
+	u.Path = strings.TrimSuffix(strings.TrimRight(u.Path, "/"), "/v1")
+	u.Path = strings.TrimRight(u.Path, "/")
+	return u.String()
 }
 
 // Validate checks the Config is internally consistent and ready for use.
@@ -618,16 +674,33 @@ func (c *Config) validateStorage(offline bool) []string {
 
 func (c *Config) validateLLM() []string {
 	var errs []string
-	switch strings.ToLower(c.LLM.Provider) {
+	provider := strings.ToLower(c.LLM.Provider)
+	switch provider {
 	case "anthropic":
-		// ok
+		if strings.TrimSpace(c.LLM.APIKeyEnv) == "" {
+			errs = append(errs, "llm.api_key_env is required (env var name holding the LLM API key)")
+		}
+		if strings.TrimSpace(c.LLM.BaseURL) != "" {
+			errs = append(errs, `llm.base_url is only valid for provider "openai-compatible"`)
+		}
+		if strings.TrimSpace(c.LLM.ResponseFormat) != "" {
+			errs = append(errs, `llm.response_format is only valid for provider "openai-compatible"`)
+		}
+		if c.LLM.Thinking {
+			errs = append(errs, `llm.thinking is only valid for provider "openai-compatible" (the anthropic client always disables thinking)`)
+		}
+	case "openai-compatible":
+		errs = append(errs, c.validateLLMBaseURL()...)
+		switch c.LLM.ResponseFormat {
+		case "", "json_object", "off":
+			// "" means the default (json_object), resolved by normalize on load.
+		default:
+			errs = append(errs, fmt.Sprintf("llm.response_format %q invalid (use \"json_object\" or \"off\")", c.LLM.ResponseFormat))
+		}
 	case "":
 		errs = append(errs, "llm.provider is required")
 	default:
-		errs = append(errs, fmt.Sprintf("llm.provider %q not supported in v1 (only \"anthropic\")", c.LLM.Provider))
-	}
-	if strings.TrimSpace(c.LLM.APIKeyEnv) == "" {
-		errs = append(errs, "llm.api_key_env is required (env var name holding the LLM API key)")
+		errs = append(errs, fmt.Sprintf("llm.provider %q not supported (use \"anthropic\" or \"openai-compatible\")", c.LLM.Provider))
 	}
 	if strings.TrimSpace(c.LLM.Model) == "" {
 		errs = append(errs, "llm.model is required")
@@ -635,7 +708,31 @@ func (c *Config) validateLLM() []string {
 	if c.LLM.MaxTokens <= 0 {
 		errs = append(errs, "llm.max_tokens must be > 0")
 	}
+	if c.LLM.TimeoutSeconds <= 0 {
+		errs = append(errs, "llm.timeout_seconds must be > 0")
+	}
 	return errs
+}
+
+// validateLLMBaseURL checks llm.base_url for the openai-compatible provider:
+// must parse as an http(s) URL with no credentials, query, or fragment.
+// Canonicalization (trailing /v1 and slash stripping) happens in normalize.
+func (c *Config) validateLLMBaseURL() []string {
+	raw := strings.TrimSpace(c.LLM.BaseURL)
+	if raw == "" {
+		return []string{`llm.base_url is required for provider "openai-compatible" (root URL of the endpoint, e.g. http://localhost:11434)`}
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return []string{fmt.Sprintf("llm.base_url %q must be an http(s) URL", raw)}
+	}
+	if u.User != nil {
+		return []string{`llm.base_url must not contain embedded credentials (use llm.api_key_env instead)`}
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return []string{`llm.base_url must not contain a query string or fragment (root URL only, e.g. http://localhost:11434)`}
+	}
+	return nil
 }
 
 func (c *Config) validateCorrelator() []string {
@@ -1000,8 +1097,12 @@ func (c *Config) ChangesWebhookToken() (string, error) {
 }
 
 // LLMAPIKey returns the LLM API key, resolved from the env var named by
-// LLM.APIKeyEnv.
+// LLM.APIKeyEnv. For provider "openai-compatible" the key is optional: an
+// unset api_key_env means an unauthenticated local endpoint and returns "".
 func (c *Config) LLMAPIKey() (string, error) {
+	if strings.EqualFold(c.LLM.Provider, "openai-compatible") && strings.TrimSpace(c.LLM.APIKeyEnv) == "" {
+		return "", nil
+	}
 	return requireEnv(c.LLM.APIKeyEnv, "llm.api_key_env")
 }
 

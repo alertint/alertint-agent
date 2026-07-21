@@ -13,6 +13,16 @@ llm:
   api_key_env: ANTHROPIC_API_KEY              # name of the env var holding the Anthropic key
   model: claude-sonnet-5                      # default: strongest reasoning in its price class
   # model: claude-haiku-4-5                   # faster + cheaper alternative for cost-sensitive setups
+  timeout_seconds: 120                        # whole-request LLM timeout; local endpoints typically want 300
+
+  # Self-hosted alternative — any OpenAI-compatible endpoint (SGLang, vLLM,
+  # Ollama, LM Studio). See docs/integrations/openai-compatible.md.
+  # provider: openai-compatible
+  # base_url: http://localhost:30000          # endpoint root; a trailing /v1 also works
+  # model: qwen3-32b                          # the model name your endpoint serves
+  # response_format: json_object              # default; "off" if your runtime lacks enforced JSON
+  # thinking: false                           # enabling thinking? raise max_tokens to 8000-16000 or
+  #                                           # triage fails loud: "llm: response truncated at max_tokens"
 
 correlator:
   window_seconds: 90       # group alerts arriving within this window

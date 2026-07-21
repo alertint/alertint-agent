@@ -4,6 +4,7 @@ package ingress
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -126,7 +127,12 @@ func TestChangeReceiver_PersistsAndAudits(t *testing.T) {
 	srv := httptest.NewServer(host.Handler())
 	defer srv.Close()
 
-	body := `{"source":"github-actions","kind":"deploy","labels":{"service":"checkout"},"occurred_at":"2026-06-18T10:42:00Z"}`
+	// occurred_at is derived from the clock: the receiver prunes on insert
+	// anything older than its retention window, so a fixed date would rot out
+	// of the window and vanish from the assertion below.
+	occurred := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	body := fmt.Sprintf(`{"source":"github-actions","kind":"deploy","labels":{"service":"checkout"},"occurred_at":%q}`,
+		occurred.Format(time.RFC3339))
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/webhook/change", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer change-tok")
@@ -139,7 +145,7 @@ func TestChangeReceiver_PersistsAndAudits(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 
-	got, _ := st.ChangesInWindow(ctx, time.Date(2026, 6, 18, 10, 0, 0, 0, time.UTC), time.Date(2026, 6, 18, 11, 0, 0, 0, time.UTC))
+	got, _ := st.ChangesInWindow(ctx, occurred.Add(-time.Minute), occurred.Add(time.Minute))
 	if len(got) != 1 || got[0].ID == "" {
 		t.Fatalf("want 1 stored change with stamped ID, got %#v", got)
 	}
