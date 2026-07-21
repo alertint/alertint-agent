@@ -5,8 +5,10 @@ package openaicompat_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/alertint/alertint-agent/internal/llm"
@@ -170,5 +172,91 @@ func TestMarkdownFenceStripped(t *testing.T) {
 	}
 	if string(comp.Raw) != `{"k":1}` {
 		t.Errorf("Raw = %s", comp.Raw)
+	}
+}
+
+// chatBodyFull builds a success body with reasoning_content and finish_reason
+// under the caller's control.
+func chatBodyFull(content, reasoning, finishReason string) string {
+	msg := map[string]any{"content": content}
+	if reasoning != "" {
+		msg["reasoning_content"] = reasoning
+	}
+	payload := map[string]any{
+		"choices": []map[string]any{
+			{"message": msg, "finish_reason": finishReason},
+		},
+		"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 5},
+	}
+	b, _ := json.Marshal(payload)
+	return string(b)
+}
+
+func TestReasoningContentIgnored(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(chatBodyFull(`{"k":1}`, "long chain of thought that is not JSON", "stop")))
+	}))
+	defer srv.Close()
+	comp, err := newClient(srv, nil).Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"k"})
+	if err != nil {
+		t.Fatalf("reasoning_content sibling must not interfere: %v", err)
+	}
+	if string(comp.Raw) != `{"k":1}` {
+		t.Errorf("Raw = %s", comp.Raw)
+	}
+}
+
+func TestLeadingThinkBlockStripped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(chatBodyFull("  <think>hmm, disk\nor network?</think>\n{\"k\":1}", "", "stop")))
+	}))
+	defer srv.Close()
+	comp, err := newClient(srv, nil).Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"k"})
+	if err != nil {
+		t.Fatalf("leading think block must be stripped: %v", err)
+	}
+	if string(comp.Raw) != `{"k":1}` {
+		t.Errorf("Raw = %s", comp.Raw)
+	}
+}
+
+func TestNonLeadingThinkLeftAlone(t *testing.T) {
+	// A <think> inside a JSON string value is model output, not leakage —
+	// the strip must not touch it.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(chatBodyFull(`{"k":"the tag <think>x</think> appears in a log line"}`, "", "stop")))
+	}))
+	defer srv.Close()
+	comp, err := newClient(srv, nil).Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(comp.Raw), "<think>x</think>") {
+		t.Errorf("non-leading think must survive: %s", comp.Raw)
+	}
+}
+
+func TestFinishReasonLengthIsTruncationError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(chatBodyFull(`{"k":"cut of`, "", "length")))
+	}))
+	defer srv.Close()
+	_, err := newClient(srv, nil).Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"k"})
+	if !errors.Is(err, llm.ErrResponseTruncated) {
+		t.Fatalf("want ErrResponseTruncated, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "raise llm.max_tokens") {
+		t.Errorf("truncation error must be actionable: %v", err)
+	}
+}
+
+func TestRequiredKeyMissing(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(chatBody(`{"other":1}`, 1, 1)))
+	}))
+	defer srv.Close()
+	_, err := newClient(srv, nil).Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"overall_issue"})
+	if !errors.Is(err, llm.ErrSchemaViolation) {
+		t.Fatalf("want ErrSchemaViolation, got %v", err)
 	}
 }
