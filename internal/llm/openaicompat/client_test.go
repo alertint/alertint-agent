@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/alertint/alertint-agent/internal/llm"
 	"github.com/alertint/alertint-agent/internal/llm/openaicompat"
@@ -258,5 +260,104 @@ func TestRequiredKeyMissing(t *testing.T) {
 	_, err := newClient(srv, nil).Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"overall_issue"})
 	if !errors.Is(err, llm.ErrSchemaViolation) {
 		t.Fatalf("want ErrSchemaViolation, got %v", err)
+	}
+}
+
+func TestRetryOn429ThenSuccess(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte(chatBody(`{"k":1}`, 1, 1)))
+	}))
+	defer srv.Close()
+	c := newClient(srv, func(cfg *openaicompat.Config) { cfg.BaseRetryDelay = time.Millisecond })
+	if _, err := c.Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"k"}); err != nil {
+		t.Fatalf("429 then success must succeed: %v", err)
+	}
+	if calls.Load() != 2 {
+		t.Errorf("calls = %d, want 2", calls.Load())
+	}
+}
+
+func TestRetryOn503ThenSuccess(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable) // vLLM/SGLang queue full
+			return
+		}
+		_, _ = w.Write([]byte(chatBody(`{"k":1}`, 1, 1)))
+	}))
+	defer srv.Close()
+	c := newClient(srv, func(cfg *openaicompat.Config) { cfg.BaseRetryDelay = time.Millisecond })
+	if _, err := c.Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"k"}); err != nil {
+		t.Fatalf("503 then success must succeed: %v", err)
+	}
+}
+
+func TestRetriesExhaustedOnPersistent500(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	c := newClient(srv, func(cfg *openaicompat.Config) { cfg.BaseRetryDelay = time.Millisecond })
+	_, err := c.Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"k"})
+	var retryErr *llm.RetryableError
+	if !errors.As(err, &retryErr) || retryErr.StatusCode != 500 {
+		t.Fatalf("want RetryableError{500} after exhaustion, got %v", err)
+	}
+	if calls.Load() != 3 { // initial + MaxRetries(2)
+		t.Errorf("calls = %d, want 3", calls.Load())
+	}
+}
+
+func TestBadRequestImmediateWithExcerpt(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"unknown model qwen99"}}`))
+	}))
+	defer srv.Close()
+	_, err := newClient(srv, nil).Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"k"})
+	if err == nil || !strings.Contains(err.Error(), "HTTP 400") || !strings.Contains(err.Error(), "unknown model qwen99") {
+		t.Fatalf("400 must surface immediately with body excerpt, got: %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Errorf("400 must not be retried, calls = %d", calls.Load())
+	}
+}
+
+func TestResponseFormat400CarriesHint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"response_format is not supported"}}`))
+	}))
+	defer srv.Close()
+	_, err := newClient(srv, nil).Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"k"})
+	if err == nil || !strings.Contains(err.Error(), `set llm.response_format: "off"`) {
+		t.Fatalf("400 mentioning response_format must carry the config hint, got: %v", err)
+	}
+}
+
+func TestTimeoutHonored(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Second)
+		_, _ = w.Write([]byte(chatBody(`{"k":1}`, 1, 1)))
+	}))
+	defer srv.Close()
+	c := newClient(srv, func(cfg *openaicompat.Config) { cfg.TimeoutSeconds = 1 })
+	start := time.Now()
+	_, err := c.Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"k"})
+	if err == nil {
+		t.Fatal("want timeout error")
+	}
+	if elapsed := time.Since(start); elapsed > 1900*time.Millisecond {
+		t.Errorf("timeout not honored, took %v", elapsed)
 	}
 }
