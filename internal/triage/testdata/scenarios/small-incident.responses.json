@@ -1,0 +1,1 @@
+[{"response":{"analysis_name":"Disk pressure on api","overall_issue":"Disk usage on the api service has crossed the critical threshold.","correlation_findings":["DiskFull (critical) and DiskAlmostFull (warning) on the same service within 30s"],"severity":"high","confidence":0.88,"alerts":[{"alert_id":"PLACEHOLDER","role_in_incident":"correlated"}]}}]

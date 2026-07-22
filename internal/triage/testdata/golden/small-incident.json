@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "id": "small-incident",
+  "captured_at": "2026-07-22T09:26:21.600117Z",
+  "scenario_path": "internal/triage/testdata/scenarios/small-incident.yaml",
+  "incident": {
+    "id": "drill-small-incident",
+    "group_key": "cluster=prod,namespace=default,service=api",
+    "alert_count": 2,
+    "shared_labels": {
+      "cluster": "prod",
+      "namespace": "default",
+      "service": "api"
+    },
+    "alerts": [
+      {
+        "id": "alert-small-incident-0-0",
+        "labels": {
+          "alertname": "DiskFull",
+          "cluster": "prod",
+          "namespace": "default",
+          "service": "api",
+          "severity": "critical"
+        },
+        "annotations": {
+          "summary": "disk at 96%"
+        },
+        "starts_at": "2026-07-22T09:26:21.598436Z"
+      },
+      {
+        "id": "alert-small-incident-1-0",
+        "labels": {
+          "alertname": "DiskAlmostFull",
+          "cluster": "prod",
+          "namespace": "default",
+          "service": "api",
+          "severity": "warning"
+        },
+        "annotations": {
+          "summary": "disk at 90%"
+        },
+        "starts_at": "2026-07-22T09:26:51.598436Z"
+      }
+    ]
+  },
+  "rendered_finding": {
+    "alerts": [
+      {
+        "alert_id": "alert-small-incident-0-0",
+        "role_in_incident": "correlated"
+      }
+    ],
+    "analysis_name": "Disk pressure on api",
+    "confidence": 0.88,
+    "correlation_findings": [
+      "DiskFull (critical) and DiskAlmostFull (warning) on the same service within 30s"
+    ],
+    "overall_issue": "Disk usage on the api service has crossed the critical threshold.",
+    "severity": "high"
+  },
+  "verification": {
+    "outcome": "",
+    "queries_executed": 0,
+    "queries_failed": 0
+  },
+  "model_usage": {
+    "model": "scripted",
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "latency_ms": 1,
+    "cost_usd": 0,
+    "prompt_hash": ""
+  },
+  "config_snapshot": {
+    "model": "claude-sonnet-5",
+    "max_tokens": 4096,
+    "system_prompt_hash": "",
+    "triage_min_alerts": 1,
+    "verification_enabled": true,
+    "classifier_mode": "off",
+    "slack_min_severity": "low",
+    "rule_packs": [
+      {
+        "name": "baseline",
+        "version": "0.1.0",
+        "hash": ""
+      }
+    ]
+  },
+  "judge": {
+    "model": "claude-haiku-4-5",
+    "prompt_version": "v1",
+    "system_prompt_path": "internal/triage/judge_prompt.md"
+  }
+}

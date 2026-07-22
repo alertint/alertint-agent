@@ -1,0 +1,7 @@
+id: slow-burn
+alerts:
+  - labels: {alertname: HighLatency, cluster: prod, service: svc}
+    repeat: 24
+    spread: [service]
+  - labels: {alertname: HighLatency, cluster: prod, service: late}
+    offset_seconds: 1200

@@ -1,0 +1,6 @@
+id: storm-collapse
+alerts:
+  - labels: {alertname: HighErrorRate, cluster: prod, env: prod, service: svc}
+    annotations: {summary: "error rate above 5%"}
+    repeat: 24
+    spread: [service]

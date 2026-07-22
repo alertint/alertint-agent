@@ -87,6 +87,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 			return runValidate(args[1:], stdout, stderr)
 		case "drill":
 			return runDrill(args[1:], stdout, stderr)
+		case "drill-golden":
+			return runDrillGolden(args[1:], stdout, stderr)
 		case "serve":
 			return runServe(args[1:], stdout, stderr)
 		}

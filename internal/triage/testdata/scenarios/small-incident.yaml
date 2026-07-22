@@ -1,0 +1,7 @@
+id: small-incident
+alerts:
+  - labels: {alertname: DiskFull, cluster: prod, namespace: default, service: api, severity: critical}
+    annotations: {summary: "disk at 96%"}
+  - labels: {alertname: DiskAlmostFull, cluster: prod, namespace: default, service: api, severity: warning}
+    annotations: {summary: "disk at 90%"}
+    offset_seconds: 30

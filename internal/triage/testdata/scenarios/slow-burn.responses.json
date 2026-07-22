@@ -1,0 +1,1 @@
+[{"response":{"analysis_name":"Slow-burn latency drift","overall_issue":"High latency across many services over 20 minutes; not a storm.","correlation_findings":["24 HighLatency alerts spread across 24 services over 20m"],"severity":"medium","confidence":0.7,"alerts":[{"alert_id":"PLACEHOLDER","role_in_incident":"correlated"}]}}]

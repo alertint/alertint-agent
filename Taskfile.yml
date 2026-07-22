@@ -158,6 +158,21 @@ tasks:
     cmds:
       - go mod tidy
 
+  triage:golden:
+    desc: Capture a triage golden trace from a scenario + responses sidecar
+    cmds:
+      - go run ./cmd/alertint drill-golden --scenario={{.SCENARIO}} --responses={{.RESPONSES}} --out={{.OUT}} --config={{.CONFIG}}
+
+  triage:eval:
+    desc: Run the triage eval harness (schema + replay + judge)
+    cmds:
+      - go test -race -count=1 ./internal/triage/...
+
+  triage:promptfoo:
+    desc: Emit a promptfoo config from the current goldens (phase 2 stub)
+    cmds:
+      - echo "phase 2: emit promptfoo config from internal/triage/testdata/golden/*.json"
+
   clean:
     desc: Remove build artifacts
     cmds:

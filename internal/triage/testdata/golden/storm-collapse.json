@@ -1,0 +1,380 @@
+{
+  "schema_version": 1,
+  "id": "storm-collapse",
+  "captured_at": "2026-07-22T09:20:41.002639Z",
+  "scenario_path": "internal/triage/testdata/scenarios/storm-collapse.yaml",
+  "incident": {
+    "id": "drill-storm-collapse",
+    "group_key": "env=prod,alertname=HighErrorRate,cluster=prod",
+    "alert_count": 24,
+    "shared_labels": {
+      "alertname": "HighErrorRate",
+      "cluster": "prod",
+      "env": "prod"
+    },
+    "alerts": [
+      {
+        "id": "alert-storm-collapse-0-0",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-0"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      },
+      {
+        "id": "alert-storm-collapse-1-1",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-1"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      },
+      {
+        "id": "alert-storm-collapse-2-2",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-2"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      },
+      {
+        "id": "alert-storm-collapse-3-3",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-3"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      },
+      {
+        "id": "alert-storm-collapse-4-4",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-4"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      },
+      {
+        "id": "alert-storm-collapse-5-5",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-5"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      },
+      {
+        "id": "alert-storm-collapse-6-6",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-6"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      },
+      {
+        "id": "alert-storm-collapse-7-7",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-7"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      },
+      {
+        "id": "alert-storm-collapse-8-8",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-8"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      },
+      {
+        "id": "alert-storm-collapse-9-9",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-9"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      },
+      {
+        "id": "alert-storm-collapse-10-10",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-10"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      },
+      {
+        "id": "alert-storm-collapse-11-11",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-11"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      },
+      {
+        "id": "alert-storm-collapse-12-12",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-12"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      },
+      {
+        "id": "alert-storm-collapse-13-13",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-13"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      },
+      {
+        "id": "alert-storm-collapse-14-14",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-14"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      },
+      {
+        "id": "alert-storm-collapse-15-15",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-15"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      },
+      {
+        "id": "alert-storm-collapse-16-16",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-16"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      },
+      {
+        "id": "alert-storm-collapse-17-17",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-17"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      },
+      {
+        "id": "alert-storm-collapse-18-18",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-18"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      },
+      {
+        "id": "alert-storm-collapse-19-19",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-19"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      },
+      {
+        "id": "alert-storm-collapse-20-20",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-20"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      },
+      {
+        "id": "alert-storm-collapse-21-21",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-21"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      },
+      {
+        "id": "alert-storm-collapse-22-22",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-22"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      },
+      {
+        "id": "alert-storm-collapse-23-23",
+        "labels": {
+          "alertname": "HighErrorRate",
+          "cluster": "prod",
+          "env": "prod",
+          "service": "svc-23"
+        },
+        "annotations": {
+          "summary": "error rate above 5%"
+        },
+        "starts_at": "2026-07-22T09:20:40.998524Z"
+      }
+    ]
+  },
+  "rendered_finding": {
+    "alerts": [
+      {
+        "alert_id": "alert-storm-collapse-0-0",
+        "role_in_incident": "correlated"
+      }
+    ],
+    "analysis_name": "Storm: shared dependency degradation",
+    "confidence": 0.92,
+    "correlation_findings": [
+      "24 HighErrorRate alerts across 24 distinct services within 5m",
+      "Shared cluster=prod and env=prod labels indicate a common upstream cause"
+    ],
+    "overall_issue": "Alert storm across 24 services indicates a shared dependency failure.",
+    "severity": "high"
+  },
+  "verification": {
+    "outcome": "",
+    "queries_executed": 0,
+    "queries_failed": 0
+  },
+  "model_usage": {
+    "model": "scripted",
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "latency_ms": 1,
+    "cost_usd": 0,
+    "prompt_hash": ""
+  },
+  "config_snapshot": {
+    "model": "claude-sonnet-5",
+    "max_tokens": 4096,
+    "system_prompt_hash": "",
+    "triage_min_alerts": 1,
+    "verification_enabled": true,
+    "classifier_mode": "off",
+    "slack_min_severity": "low",
+    "rule_packs": [
+      {
+        "name": "baseline",
+        "version": "0.1.0",
+        "hash": ""
+      }
+    ]
+  },
+  "judge": {
+    "model": "claude-haiku-4-5",
+    "prompt_version": "v1",
+    "system_prompt_path": "internal/triage/judge_prompt.md"
+  }
+}

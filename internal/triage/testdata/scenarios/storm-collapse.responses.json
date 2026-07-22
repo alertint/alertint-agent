@@ -1,0 +1,17 @@
+[
+  {
+    "response": {
+      "analysis_name": "Storm: shared dependency degradation",
+      "overall_issue": "Alert storm across 24 services indicates a shared dependency failure.",
+      "correlation_findings": [
+        "24 HighErrorRate alerts across 24 distinct services within 5m",
+        "Shared cluster=prod and env=prod labels indicate a common upstream cause"
+      ],
+      "severity": "high",
+      "confidence": 0.92,
+      "alerts": [
+        {"alert_id": "PLACEHOLDER", "role_in_incident": "correlated"}
+      ]
+    }
+  }
+]

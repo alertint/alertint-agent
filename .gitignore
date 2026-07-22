@@ -89,3 +89,6 @@ CLAUDE.md
 /docs/pulse-reports/
 /docs/residual-review-findings/
 /docs/dogfood-reports/
+
+# Triage eval harness failure artifacts (CI uploads them as artifacts)
+/internal/triage/testdata/.last-failures/

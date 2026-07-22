@@ -1,0 +1,316 @@
+{
+  "schema_version": 1,
+  "id": "slow-burn",
+  "captured_at": "2026-07-22T09:26:21.745847Z",
+  "scenario_path": "internal/triage/testdata/scenarios/slow-burn.yaml",
+  "incident": {
+    "id": "drill-slow-burn",
+    "group_key": "cluster=prod,alertname=HighLatency",
+    "alert_count": 25,
+    "shared_labels": {
+      "alertname": "HighLatency",
+      "cluster": "prod"
+    },
+    "alerts": [
+      {
+        "id": "alert-slow-burn-0-0",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-0"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-1-1",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-1"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-2-2",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-2"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-3-3",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-3"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-4-4",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-4"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-5-5",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-5"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-6-6",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-6"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-7-7",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-7"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-8-8",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-8"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-9-9",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-9"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-10-10",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-10"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-11-11",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-11"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-12-12",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-12"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-13-13",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-13"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-14-14",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-14"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-15-15",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-15"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-16-16",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-16"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-17-17",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-17"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-18-18",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-18"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-19-19",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-19"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-20-20",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-20"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-21-21",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-21"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-22-22",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-22"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-23-23",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "svc-23"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:26:21.743428Z"
+      },
+      {
+        "id": "alert-slow-burn-24-0",
+        "labels": {
+          "alertname": "HighLatency",
+          "cluster": "prod",
+          "service": "late"
+        },
+        "annotations": null,
+        "starts_at": "2026-07-22T09:46:21.743428Z"
+      }
+    ]
+  },
+  "rendered_finding": {
+    "alerts": [
+      {
+        "alert_id": "alert-slow-burn-0-0",
+        "role_in_incident": "correlated"
+      }
+    ],
+    "analysis_name": "Slow-burn latency drift",
+    "confidence": 0.7,
+    "correlation_findings": [
+      "24 HighLatency alerts spread across 24 services over 20m"
+    ],
+    "overall_issue": "High latency across many services over 20 minutes; not a storm.",
+    "severity": "medium"
+  },
+  "verification": {
+    "outcome": "",
+    "queries_executed": 0,
+    "queries_failed": 0
+  },
+  "model_usage": {
+    "model": "scripted",
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "latency_ms": 1,
+    "cost_usd": 0,
+    "prompt_hash": ""
+  },
+  "config_snapshot": {
+    "model": "claude-sonnet-5",
+    "max_tokens": 4096,
+    "system_prompt_hash": "",
+    "triage_min_alerts": 1,
+    "verification_enabled": true,
+    "classifier_mode": "off",
+    "slack_min_severity": "low",
+    "rule_packs": [
+      {
+        "name": "baseline",
+        "version": "0.1.0",
+        "hash": ""
+      }
+    ]
+  },
+  "judge": {
+    "model": "claude-haiku-4-5",
+    "prompt_version": "v1",
+    "system_prompt_path": "internal/triage/judge_prompt.md"
+  }
+}
