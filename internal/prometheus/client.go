@@ -24,6 +24,7 @@ type Client struct {
 	baseURL             string
 	httpClient          *http.Client
 	authHeader          string
+	orgID               string
 	defaultRangeMinutes int
 }
 
@@ -31,6 +32,7 @@ type Client struct {
 type Config struct {
 	BaseURL             string
 	BearerToken         string // empty = no auth
+	OrgID               string // empty = no tenant header (multi-tenant Mimir/Cortex only)
 	TimeoutSeconds      int
 	DefaultRangeMinutes int
 }
@@ -44,6 +46,7 @@ func NewClient(cfg Config) *Client {
 	c := &Client{
 		baseURL:             strings.TrimRight(cfg.BaseURL, "/"),
 		httpClient:          &http.Client{Timeout: timeout},
+		orgID:               cfg.OrgID,
 		defaultRangeMinutes: cfg.DefaultRangeMinutes,
 	}
 	if cfg.BearerToken != "" {
@@ -93,6 +96,12 @@ func (c *Client) apiGet(ctx context.Context, path string, params url.Values) (js
 	}
 	if c.authHeader != "" {
 		req.Header.Set("Authorization", c.authHeader)
+	}
+	if c.orgID != "" {
+		// Assigned directly (not via Set) to keep the exact spelling on the
+		// wire; HTTP header names are case-insensitive, but this matches the
+		// Mimir/Cortex docs.
+		req.Header["X-Scope-OrgID"] = []string{c.orgID}
 	}
 
 	resp, err := c.httpClient.Do(req)

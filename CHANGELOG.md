@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Prometheus connector: optional `prometheus.org_id` sends the
+  `X-Scope-OrgID` tenant header on every query, enabling multi-tenant
+  Grafana Mimir and Cortex endpoints (parity with the Loki connector's
+  `org_id`). Omitted = behavior unchanged for vanilla Prometheus. (#42)
+
 ## [0.9.0] - 2026-07-21
 
 ### Added

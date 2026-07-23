@@ -102,6 +102,7 @@ prometheus:
   base_url: http://localhost:9090            # setting this turns the connector ON
   # enabled: false                           # uncomment to force OFF despite base_url
   bearer_token_env: PROMETHEUS_BEARER_TOKEN  # optional
+  # org_id: tenant-1                         # only for multi-tenant Mimir/Cortex
   timeout_seconds: 10                        # default
   default_range_minutes: 60                  # default
 ```
@@ -123,6 +124,7 @@ Querier component, not a Sidecar or Store Gateway.
 | `enabled` | Optional. Omitted = on when `base_url` is set; `false` forces off. |
 | `base_url` | Base URL of your Prometheus instance, e.g. `http://localhost:9090`. |
 | `bearer_token_env` | Optional. Name of the env var holding the Prometheus bearer token — see [Authentication](#authentication) for when you need one and where it comes from. |
+| `org_id` | Optional. Tenant/org ID sent as the `X-Scope-OrgID` header on every query — required by multi-tenant Grafana Mimir and Cortex. Omit for vanilla Prometheus. |
 | `timeout_seconds` | HTTP timeout for Prometheus queries. Default: `10`. |
 | `default_range_minutes` | Default lookback window for range queries. Default: `60`. |
 
@@ -174,6 +176,23 @@ curl -H "Authorization: Bearer $PROMETHEUS_BEARER_TOKEN" \
 
 The token is read once at `serve` startup; after rotating it, update
 the env var and restart the agent.
+
+### Multi-tenant Mimir and Cortex
+
+Grafana Mimir (and Cortex) are multi-tenant: every query must carry an
+`X-Scope-OrgID` header naming the tenant, or the request is rejected even
+with valid credentials. Set `org_id` to your tenant ID — it is an
+identifier, not a secret, so it lives inline in the config. It is
+independent of `bearer_token_env`: use either, both, or neither depending
+on what sits in front of your endpoint.
+
+Verify the pair the same way:
+
+```bash
+curl -H "X-Scope-OrgID: <tenant>" \
+  -H "Authorization: Bearer $PROMETHEUS_BEARER_TOKEN" \
+  "<base_url>/api/v1/query?query=up"
+```
 
 ### MCP tools
 

@@ -82,6 +82,7 @@ prometheus:
   # base_url: http://localhost:9090            # set this and Prometheus enrichment turns ON automatically
   # enabled: false                              # uncomment to force OFF even when base_url is set
   # bearer_token_env: PROMETHEUS_BEARER_TOKEN   # only if Prometheus requires auth
+  # org_id: tenant-1                            # only for multi-tenant Mimir/Cortex — sent as X-Scope-OrgID
   timeout_seconds: 10
   default_range_minutes: 60
 
