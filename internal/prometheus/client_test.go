@@ -59,7 +59,7 @@ func TestOrgIDHeader(t *testing.T) {
 	t.Run("set when org_id non-empty", func(t *testing.T) {
 		var got string
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			got = r.Header.Get("X-Scope-OrgID")
+			got = r.Header.Get("X-Scope-Orgid") // arrives canonical regardless of how it was sent
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
 		}))
@@ -77,7 +77,7 @@ func TestOrgIDHeader(t *testing.T) {
 	t.Run("absent when org_id empty", func(t *testing.T) {
 		var got string
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			got = r.Header.Get("X-Scope-OrgID")
+			got = r.Header.Get("X-Scope-Orgid") // arrives canonical regardless of how it was sent
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
 		}))
