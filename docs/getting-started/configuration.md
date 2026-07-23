@@ -256,6 +256,7 @@ presence-based: setting `base_url` turns the connector on; an explicit
 | `enabled` | bool | auto | Omitted = on when `base_url` is set (presence-based); set `false` to force off |
 | `base_url` | string | — | Prometheus HTTP API base URL, e.g. `http://localhost:9090` |
 | `bearer_token_env` | string | — | Optional env var name holding a bearer token for Prometheus |
+| `org_id` | string | — | Optional tenant/org ID sent as the `X-Scope-OrgID` header — required by multi-tenant Grafana Mimir/Cortex, omit for vanilla Prometheus |
 | `timeout_seconds` | int | `10` | Total budget for one incident's metric enrichment fetch. Shared across every scope queried, each of which gets an equal slice so a slow query cannot starve the rest |
 | `default_range_minutes` | int | `60` | Default lookback window for range queries |
 | `max_series` | int | `1000` | Server-side cap on the number of series each enrichment query may return, bounding the payload a broad selector pulls during an alert storm |
