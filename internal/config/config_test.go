@@ -1076,17 +1076,34 @@ func TestLLMAPIKeyOptionalForOpenAICompatible(t *testing.T) {
 // parsed from prometheus.org_id (strict parser accepts it) and defaults to
 // empty when omitted.
 func TestLoad_PrometheusOrgID(t *testing.T) {
-	yaml := strings.Replace(minimalValidYAML, "./alertint-agent.db", filepath.Join(t.TempDir(), "agent.db"), 1) + `
+	t.Run("set when configured", func(t *testing.T) {
+		yaml := strings.Replace(minimalValidYAML, "./alertint-agent.db", filepath.Join(t.TempDir(), "agent.db"), 1) + `
 prometheus:
   base_url: http://localhost:9090
   org_id: tenant-7
 `
-	path := writeConfig(t, yaml)
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.Prometheus.OrgID != "tenant-7" {
-		t.Errorf("Prometheus.OrgID = %q, want tenant-7", cfg.Prometheus.OrgID)
-	}
+		path := writeConfig(t, yaml)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.Prometheus.OrgID != "tenant-7" {
+			t.Errorf("Prometheus.OrgID = %q, want tenant-7", cfg.Prometheus.OrgID)
+		}
+	})
+
+	t.Run("empty when omitted", func(t *testing.T) {
+		yaml := strings.Replace(minimalValidYAML, "./alertint-agent.db", filepath.Join(t.TempDir(), "agent.db"), 1) + `
+prometheus:
+  base_url: http://localhost:9090
+`
+		path := writeConfig(t, yaml)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.Prometheus.OrgID != "" {
+			t.Errorf("Prometheus.OrgID = %q, want empty", cfg.Prometheus.OrgID)
+		}
+	})
 }
