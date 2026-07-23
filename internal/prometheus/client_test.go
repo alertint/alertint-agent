@@ -51,3 +51,44 @@ func TestQueryInstant_LimitParam(t *testing.T) {
 		})
 	}
 }
+
+// TestOrgIDHeader verifies the tenant header needed by multi-tenant
+// Mimir/Cortex: X-Scope-OrgID is sent when org_id is configured and absent
+// otherwise, so requests to vanilla Prometheus are byte-identical to before.
+func TestOrgIDHeader(t *testing.T) {
+	t.Run("set when org_id non-empty", func(t *testing.T) {
+		var got string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got = r.Header.Get("X-Scope-OrgID")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
+		}))
+		defer srv.Close()
+
+		c := NewClient(Config{BaseURL: srv.URL, OrgID: "tenant-7", TimeoutSeconds: 5})
+		if _, err := c.QueryInstant(context.Background(), "up", time.Time{}, 0); err != nil {
+			t.Fatalf("QueryInstant: %v", err)
+		}
+		if got != "tenant-7" {
+			t.Errorf("X-Scope-OrgID = %q, want tenant-7", got)
+		}
+	})
+
+	t.Run("absent when org_id empty", func(t *testing.T) {
+		var got string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got = r.Header.Get("X-Scope-OrgID")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
+		}))
+		defer srv.Close()
+
+		c := NewClient(Config{BaseURL: srv.URL, TimeoutSeconds: 5})
+		if _, err := c.QueryInstant(context.Background(), "up", time.Time{}, 0); err != nil {
+			t.Fatalf("QueryInstant: %v", err)
+		}
+		if got != "" {
+			t.Errorf("X-Scope-OrgID = %q, want absent", got)
+		}
+	})
+}
