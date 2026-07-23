@@ -89,6 +89,7 @@ type PrometheusConfig struct {
 	Enabled             *bool  `yaml:"enabled,omitempty"`
 	BaseURL             string `yaml:"base_url"`
 	BearerTokenEnv      string `yaml:"bearer_token_env,omitempty"`
+	OrgID               string `yaml:"org_id,omitempty"` // optional X-Scope-OrgID (multi-tenant Mimir/Cortex only)
 	TimeoutSeconds      int    `yaml:"timeout_seconds"`
 	DefaultRangeMinutes int    `yaml:"default_range_minutes"`
 	MaxSeries           int    `yaml:"max_series"` // server-side per-query series cap for metric enrichment

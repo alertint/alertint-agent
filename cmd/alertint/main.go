@@ -209,6 +209,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		prom = promclient.NewClient(promclient.Config{
 			BaseURL:             cfg.Prometheus.BaseURL,
 			BearerToken:         promToken,
+			OrgID:               cfg.Prometheus.OrgID,
 			TimeoutSeconds:      cfg.Prometheus.TimeoutSeconds,
 			DefaultRangeMinutes: cfg.Prometheus.DefaultRangeMinutes,
 		})

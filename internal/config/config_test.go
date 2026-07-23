@@ -1071,3 +1071,22 @@ func TestLLMAPIKeyOptionalForOpenAICompatible(t *testing.T) {
 		t.Fatal("named-but-unset env var must error")
 	}
 }
+
+// TestLoad_PrometheusOrgID verifies the optional multi-tenant tenant ID is
+// parsed from prometheus.org_id (strict parser accepts it) and defaults to
+// empty when omitted.
+func TestLoad_PrometheusOrgID(t *testing.T) {
+	yaml := strings.Replace(minimalValidYAML, "./alertint-agent.db", filepath.Join(t.TempDir(), "agent.db"), 1) + `
+prometheus:
+  base_url: http://localhost:9090
+  org_id: tenant-7
+`
+	path := writeConfig(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Prometheus.OrgID != "tenant-7" {
+		t.Errorf("Prometheus.OrgID = %q, want tenant-7", cfg.Prometheus.OrgID)
+	}
+}
