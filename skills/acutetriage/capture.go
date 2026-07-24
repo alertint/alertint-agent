@@ -295,14 +295,22 @@ func (e *CaptureEngine) grade(ctx context.Context, inc *store.Incident, exp Expe
 // widen runs the not-yet-frozen widen queries live, exactly once, freezing
 // each as a VerificationQuery with source "capture" (D10). A failed fetch
 // degrades the capture with a warning — never aborts the persist phase.
+// The whole phase shares ONE QueryTimeoutSeconds-sized budget, sliced evenly
+// across exprs (mirrors runVerificationWith's two-layer budget) — without
+// this, up to maxWidenQueries sequential per-query timeouts could each run
+// the full QueryTimeoutSeconds, reintroducing the unbounded-phase-latency
+// class of bug already fixed once for the main verification path.
 func (e *CaptureEngine) widen(ctx context.Context, incidentID string, exprs []string) ([]VerificationQuery, []string) {
 	if len(exprs) == 0 {
 		return nil, nil
 	}
-	perQuery := time.Duration(e.sk.cfg.Verification.QueryTimeoutSeconds) * time.Second
-	if perQuery <= 0 {
-		perQuery = 10 * time.Second
+	budget := time.Duration(e.sk.cfg.Verification.QueryTimeoutSeconds) * time.Second
+	if budget <= 0 {
+		budget = 10 * time.Second
 	}
+	phaseCtx, phaseCancel := context.WithTimeout(ctx, budget)
+	defer phaseCancel()
+	perQuery := budget / time.Duration(len(exprs))
 	maxSeries := e.sk.cfg.Verification.MaxSeries
 	now := time.Now().UTC()
 	prom := e.sk.promQuerier()
@@ -311,7 +319,7 @@ func (e *CaptureEngine) widen(ctx context.Context, incidentID string, exprs []st
 	for _, expr := range exprs {
 		q := VerificationQuery{Kind: kindPromQL, Source: sourceCapture, Expr: expr,
 			Why: "widened at capture"}
-		qCtx, cancel := context.WithTimeout(ctx, perQuery)
+		qCtx, cancel := context.WithTimeout(phaseCtx, perQuery)
 		runPromQL(qCtx, prom, &q, maxSeries, now, e.sk.logger, incidentID)
 		cancel()
 		if q.Outcome == OutcomeFailed || q.Outcome == OutcomeDegraded {

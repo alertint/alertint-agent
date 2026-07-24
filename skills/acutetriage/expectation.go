@@ -69,7 +69,12 @@ func synthesizeNote(verdict string, e Expectation) string {
 	if len(parts) == 0 {
 		return verb
 	}
-	return verb + ": " + strings.Join(parts, "; ")
+	// Capped below store.MaxAnnotationNoteChars (leaving room for capText's
+	// ellipsis marker): an expectation with many/long discriminator strings is
+	// otherwise schema-valid but would make the synthesized note alone exceed
+	// the store's write-boundary cap, failing an atomic capture on a caller
+	// who never opted into a free-text note at all.
+	return capText(verb+": "+strings.Join(parts, "; "), store.MaxAnnotationNoteChars-1)
 }
 
 // frozenEnvelope is the decoded persist-as-rendered enrichment envelope — the
@@ -202,13 +207,22 @@ func diffExpectationAgainstFinding(e Expectation, resp llmResponse) (missingMent
 
 // lintExpectationVerifiable warns when the expectation's cause series is in
 // neither the frozen snapshot (verification queries/results, metric sections)
-// nor the widened set — such a verdict can never go green (D10).
+// nor the widened set — such a verdict can never go green (D10). A query
+// whose Outcome is failed/degraded contributes nothing: its Expr still names
+// the series, but a failed fetch is not evidence the series is verifiable —
+// counting it would let a permanently-unreachable series pass the lint.
 func lintExpectationVerifiable(e Expectation, frozen frozenEnvelope, widened []VerificationQuery) []string {
 	var haystack strings.Builder
+	writeIfAnswered := func(q VerificationQuery) {
+		if q.Outcome == OutcomeFailed || q.Outcome == OutcomeDegraded {
+			return
+		}
+		haystack.WriteString(q.Expr + "\n" + q.Result + "\n")
+	}
 	if frozen.Verification != nil {
 		for _, r := range frozen.Verification.Rounds {
 			for _, q := range r.Queries {
-				haystack.WriteString(q.Expr + "\n" + q.Result + "\n")
+				writeIfAnswered(q)
 			}
 		}
 	}
@@ -218,7 +232,7 @@ func lintExpectationVerifiable(e Expectation, frozen frozenEnvelope, widened []V
 		}
 	}
 	for _, q := range widened {
-		haystack.WriteString(q.Expr + "\n" + q.Result + "\n")
+		writeIfAnswered(q)
 	}
 	hs := haystack.String()
 	var warnings []string

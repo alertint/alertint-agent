@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"time"
+	"unicode/utf8"
 )
 
 // MaxAnnotationNoteChars caps an operator annotation note at the write
@@ -37,8 +38,8 @@ func validateAnnotation(kind, note string) error {
 	if note == "" {
 		return errors.New("store: annotation note is required")
 	}
-	if len(note) > MaxAnnotationNoteChars {
-		return fmt.Errorf("store: annotation note exceeds %d chars (got %d)", MaxAnnotationNoteChars, len(note))
+	if n := utf8.RuneCountInString(note); n > MaxAnnotationNoteChars {
+		return fmt.Errorf("store: annotation note exceeds %d chars (got %d)", MaxAnnotationNoteChars, n)
 	}
 	return nil
 }

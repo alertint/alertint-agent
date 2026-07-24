@@ -122,6 +122,41 @@ func TestIncidentCaptureVerdict_HappyAndFailedReplay(t *testing.T) {
 	}
 }
 
+// TestIncidentCaptureVerdict_MalformedWidenQueriesErrors covers a
+// widen_queries argument that doesn't match the documented shape (an array
+// of strings): the handler must error, not silently drop the discriminating
+// evidence the caller asked to be fetched and frozen.
+func TestIncidentCaptureVerdict_MalformedWidenQueriesErrors(t *testing.T) {
+	st := newMCPStore(t)
+	seedAnalyzedPrior(t, st, "inc1", "service=api", "root cause", 0.7, time.Now(), false)
+	s := captureTestServer(t, st)
+	ctx := context.Background()
+
+	res, err := s.handleIncidentCaptureVerdict(ctx, reqWith(map[string]any{
+		"incident_id":   "inc1",
+		"verdict":       "correction",
+		"expectation":   map[string]any{"must_not_conclude": []any{"AZ outage"}},
+		"widen_queries": "node_network_up", // not an array
+	}))
+	if err != nil || !res.IsError {
+		t.Fatalf("a non-array widen_queries must error: %v %+v", err, res)
+	}
+
+	res, err = s.handleIncidentCaptureVerdict(ctx, reqWith(map[string]any{
+		"incident_id":   "inc1",
+		"verdict":       "correction",
+		"expectation":   map[string]any{"must_not_conclude": []any{"AZ outage"}},
+		"widen_queries": []any{"node_network_up", float64(1)}, // non-string element
+	}))
+	if err != nil || !res.IsError {
+		t.Fatalf("a widen_queries element that isn't a string must error: %v %+v", err, res)
+	}
+	// No verdict must have been persisted by either malformed call.
+	if v, err := st.LatestIncidentVerdict(ctx, "inc1"); err != nil || v != nil {
+		t.Fatalf("malformed widen_queries must not persist a verdict: v=%+v err=%v", v, err)
+	}
+}
+
 func TestGetIncident_ExposesAnnotationsAndVerdict(t *testing.T) {
 	st := newMCPStore(t)
 	ctx := context.Background()

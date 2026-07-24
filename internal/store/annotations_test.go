@@ -54,6 +54,24 @@ func TestInsertIncidentAnnotation_Validation(t *testing.T) {
 	}
 }
 
+// TestInsertIncidentAnnotation_CapIsRunesNotBytes covers a note built from
+// multi-byte UTF-8 characters (CJK, Cyrillic, emoji): the cap is documented
+// as "max 2000 chars" and must be enforced in characters, not the larger
+// UTF-8 byte count, or non-English operators get spuriously rejected under
+// the advertised limit.
+func TestInsertIncidentAnnotation_CapIsRunesNotBytes(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	id := readyIncident(t, s, "service=api")
+
+	// 1000 three-byte runes ("世") = 3000 bytes but only 1000 characters —
+	// well under the 2000-char cap, but over it if measured in bytes.
+	note := strings.Repeat("世", 1000) //nolint:gosmopolitan // deliberate multi-byte rune fixture, not a stray hardcoded string
+	if _, err := s.InsertIncidentAnnotation(ctx, id, "observation", note); err != nil {
+		t.Fatalf("a 1000-character multi-byte note must be accepted (2000-char cap): %v", err)
+	}
+}
+
 func TestSetRefuteMarksFloor(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

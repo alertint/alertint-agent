@@ -94,11 +94,17 @@ func (s *Server) handleIncidentCaptureVerdict(ctx context.Context, req mcplib.Ca
 		expectation = b
 	}
 	var widen []string
-	if arr, ok := mcplib.ParseArgument(req, "widen_queries", nil).([]any); ok {
+	if raw := mcplib.ParseArgument(req, "widen_queries", nil); raw != nil {
+		arr, ok := raw.([]any)
+		if !ok {
+			return errResult("widen_queries must be an array of strings"), nil
+		}
 		for _, v := range arr {
-			if s, ok := v.(string); ok {
-				widen = append(widen, s)
+			sv, ok := v.(string)
+			if !ok {
+				return errResult("widen_queries must be an array of strings"), nil
 			}
+			widen = append(widen, sv)
 		}
 	}
 	res, err := s.cfg.Capture.CaptureVerdict(ctx, acutetriage.CaptureRequest{

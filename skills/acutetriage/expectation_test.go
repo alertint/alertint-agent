@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/alertint/alertint-agent/internal/rules"
 	"github.com/alertint/alertint-agent/internal/store"
@@ -84,6 +85,22 @@ func TestSynthesizeNote(t *testing.T) {
 	}
 }
 
+// TestSynthesizeNote_CappedBelowStoreLimit covers a schema-valid expectation
+// with many/long discriminator strings: the synthesized note alone must
+// never exceed the store's write-boundary cap, or an atomic capture fails
+// for a caller who never opted into a free-text note.
+func TestSynthesizeNote_CappedBelowStoreLimit(t *testing.T) {
+	long := make([]string, 200)
+	for i := range long {
+		long[i] = strings.Repeat("x", 30)
+	}
+	e := Expectation{MustMention: long}
+	got := synthesizeNote("correction", e)
+	if n := utf8.RuneCountInString(got); n > store.MaxAnnotationNoteChars {
+		t.Fatalf("synthesized note is %d chars, exceeds store cap %d", n, store.MaxAnnotationNoteChars)
+	}
+}
+
 func TestStage1Corpus_RedWithoutSteeringRule_GreenWith(t *testing.T) {
 	alerts := []store.Alert{{ID: "a1", Fingerprint: "f1", Status: "firing",
 		Labels:      map[string]string{"alertname": "TargetDown", "namespace": "prod", "instance": "worker-14"},
@@ -137,5 +154,19 @@ func TestLintExpectationVerifiable(t *testing.T) {
 	widened := []VerificationQuery{{Kind: "promql", Source: "capture", Expr: `node_network_up{instance="worker-14"}`}}
 	if w := lintExpectationVerifiable(e, frozenEnvelope{}, widened); len(w) != 0 {
 		t.Fatalf("lint fired though widening covers the series: %v", w)
+	}
+}
+
+// TestLintExpectationVerifiable_FailedFetchStillUnverifiable covers a
+// widening fetch that failed (unreachable Prometheus): the query's Expr
+// still names the series, but a failed fetch is not evidence, so the lint
+// must still fire — a permanently-unreachable series must never silently
+// pass as "verifiable".
+func TestLintExpectationVerifiable_FailedFetchStillUnverifiable(t *testing.T) {
+	e := Expectation{CauseSeries: []string{"node_network_up"}, MustNotConclude: []string{"x"}}
+	failed := []VerificationQuery{{Kind: "promql", Source: "capture", Expr: "node_network_up", Outcome: OutcomeFailed, Result: "unavailable (timeout)"}}
+	w := lintExpectationVerifiable(e, frozenEnvelope{}, failed)
+	if len(w) != 1 || !strings.Contains(w[0], "expectation unverifiable") {
+		t.Fatalf("a failed widening fetch must not satisfy the verifiability lint: %v", w)
 	}
 }
