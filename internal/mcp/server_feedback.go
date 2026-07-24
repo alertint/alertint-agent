@@ -4,6 +4,7 @@
 // make, and they land exclusively in AlertINT's own incident state —
 // additive, audit-chained. Registered unconditionally: the read-only promise
 // is about the operator's systems, not AlertINT's own SQLite.
+
 package mcp
 
 import (

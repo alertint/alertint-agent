@@ -115,7 +115,7 @@ func (s *Store) LatestIncidentVerdict(ctx context.Context, incidentID string) (*
 	if err := row.Scan(&v.ID, &v.IncidentID, &v.Version, &v.Verdict,
 		&v.ExpectationJSON, &v.WidenedJSON, &v.CauseCategory, &created); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, nil //nolint:nilnil // callers distinguish not-found by nil pointer, not sentinel
 		}
 		return nil, fmt.Errorf("store: latest verdict: %w", err)
 	}
@@ -143,7 +143,7 @@ func (s *Store) LatestVerdictKinds(ctx context.Context, incidentIDs []string) (m
 		FROM incident_verdicts v
 		JOIN (SELECT incident_id, MAX(version) AS mv FROM incident_verdicts
 		      WHERE incident_id IN (`+placeholders+`) GROUP BY incident_id) m
-		  ON m.incident_id = v.incident_id AND m.mv = v.version`, args...)
+		  ON m.incident_id = v.incident_id AND m.mv = v.version`, args...) // #nosec G202 -- placeholders is a fixed "?,?,..." run built from len(incidentIDs) only; all runtime values bound via ? in args
 	if err != nil {
 		return nil, fmt.Errorf("store: latest verdict kinds: %w", err)
 	}

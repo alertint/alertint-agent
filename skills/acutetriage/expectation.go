@@ -45,7 +45,7 @@ func parseExpectation(raw json.RawMessage) (Expectation, error) {
 // canonicalExpectationJSON is the stable at-rest / comparison encoding
 // (struct field order is fixed, so byte equality means semantic equality).
 func canonicalExpectationJSON(e Expectation) string {
-	b, _ := json.Marshal(e)
+	b, _ := json.Marshal(e) //nolint:errchkjson // Expectation is plain strings/[]string; Marshal cannot fail
 	return string(b)
 }
 
@@ -105,7 +105,7 @@ func decodeFrozenEnvelope(enrichmentJSON string) frozenEnvelope {
 func (s *Skill) stage1Corpus(inc store.Incident, alerts []store.Alert, frozen frozenEnvelope) string {
 	decision := s.cfg.Rules.EvaluateIncident(alerts)
 	pack := BuildEvidencePack(inc, alerts, s.cfg.WindowSeconds)
-	packJSON, _ := json.Marshal(pack)
+	packJSON, _ := json.Marshal(pack) //nolint:errchkjson // same EvidencePack the pipeline already marshals successfully every triage; a failure here just narrows the diff corpus, never fatal
 
 	var b strings.Builder
 	b.Write(packJSON)

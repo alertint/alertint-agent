@@ -98,9 +98,15 @@ restart Windsurf and check **Settings → MCP Servers**:
 | `alertint_verify_audit` | Verify the hash-chained audit log and report any tampering. |
 | `prometheus_query` | Instant PromQL query against the connected Prometheus (requires Prometheus enabled). |
 | `prometheus_query_range` | Range PromQL query with auto-stepped resolution (requires Prometheus enabled). |
+| `loki_query_range` | Range-query the configured log backend using its native query language (requires a log source enabled). |
+| `alertint_recent_changes` | List recent deploys/releases/PRs matching a label selector (requires change enrichment enabled). |
 | `sentry_issues_list` | List live, distilled Sentry issues for a project (+ optional environment) by status (`unresolved`/`resolved`/`ignored`); requires the Sentry Error source enabled. |
 | `sentry_issues_trace` | Return full distilled stacktraces (`file:line`, function, `in_app`) for up to 10 Sentry issue ids; requires the Sentry Error source enabled. |
+| `alertint_incident_annotate` | Attach an operator correction/observation to an incident; corrections demote the finding from memory recall. |
+| `alertint_incident_capture_verdict` | Capture an operator-confirmed verdict as a replayable record and grade current triage against it (red/green). |
 
-All tools read local **AlertINT** state; the Prometheus tools additionally
-issue queries to the configured Prometheus instance — see
-[Prometheus](prometheus.md).
+Read-only toward your systems, always; feedback writes (the last two tools
+above) land only in AlertINT's own incident state, additive and
+audit-chained. Every other tool reads local **AlertINT** state; the
+Prometheus tools additionally issue queries to the configured Prometheus
+instance — see [Prometheus](prometheus.md).

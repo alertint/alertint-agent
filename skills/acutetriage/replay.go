@@ -7,6 +7,7 @@
 // series), enrichment sections come from the persisted envelope. Nothing is
 // persisted, notified, or bookkept — the would-be finding is returned for
 // grading only.
+
 package acutetriage
 
 import (

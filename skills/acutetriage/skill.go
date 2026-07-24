@@ -368,21 +368,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	// including the resolved-status probe, which exists only to label the
 	// notification — is a no-op there.
 	if s.notifier != nil {
-		// Check if all alerts are resolved to determine the finding's status label.
-		incidentStatus := "ongoing"
-		if incAlerts, err := s.st.GetIncidentAlerts(ctx, inc.ID); err == nil {
-			allResolved := len(incAlerts) > 0
-			for _, a := range incAlerts {
-				if a.Status != "resolved" {
-					allResolved = false
-					break
-				}
-			}
-			if allResolved {
-				incidentStatus = "resolved"
-				s.logger.Info("incident resolved", "incident", inc.ID, "alerts", len(incAlerts))
-			}
-		}
+		incidentStatus := s.resolvedStatusLabel(ctx, inc.ID)
 
 		f := notify.Finding{
 			IncidentID:          inc.ID,
@@ -446,6 +432,23 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		"dur", time.Since(start),
 	)
 	return nil
+}
+
+// resolvedStatusLabel reports "resolved" when every member alert of
+// incidentID is resolved, "ongoing" otherwise (including on a load error —
+// the notification still fires, just without the resolved label).
+func (s *Skill) resolvedStatusLabel(ctx context.Context, incidentID string) string {
+	incAlerts, err := s.st.GetIncidentAlerts(ctx, incidentID)
+	if err != nil || len(incAlerts) == 0 {
+		return "ongoing"
+	}
+	for _, a := range incAlerts {
+		if a.Status != "resolved" {
+			return "ongoing"
+		}
+	}
+	s.logger.Info("incident resolved", "incident", incidentID, "alerts", len(incAlerts))
+	return "resolved"
 }
 
 // auditEnrichmentDigests appends one hash-chained digest row per attempted

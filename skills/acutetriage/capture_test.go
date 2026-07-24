@@ -31,7 +31,7 @@ type fakeAnnotationSink struct {
 	events []notify.AnnotationEvent
 }
 
-func (f *fakeAnnotationSink) Name() string { return "fake" }
+func (f *fakeAnnotationSink) Name() string                                 { return "fake" }
 func (f *fakeAnnotationSink) Notify(context.Context, notify.Finding) error { return nil }
 func (f *fakeAnnotationSink) OnAnnotation(_ context.Context, ev notify.AnnotationEvent) error {
 	f.events = append(f.events, ev)
@@ -67,15 +67,15 @@ func countingCaptureProm(t *testing.T) (*promclient.Client, *int) {
 	return promServer(t, func(string) (int, string) { n++; return 200, vectorValue3 }), &n
 }
 
-// seedAnalyzedIncidentOnKey inserts an incident on groupKey with one member
-// alert and a persisted (trivial) finding — status "analyzed" — the input
-// shape the capture engine's write tools operate on.
-func seedAnalyzedIncidentOnKey(t *testing.T, st *store.Store, groupKey string) store.Incident {
+// seedAnalyzedIncidentOnKey inserts an incident on "service=api" with one
+// member alert and a persisted (trivial) finding — status "analyzed" — the
+// input shape the capture engine's write tools operate on.
+func seedAnalyzedIncidentOnKey(t *testing.T, st *store.Store) store.Incident {
 	t.Helper()
 	ctx := context.Background()
 	now := time.Now()
 	inc := store.Incident{
-		ID: uuid.NewString(), GroupKey: groupKey,
+		ID: uuid.NewString(), GroupKey: "service=api",
 		FirstAlertAt: now, LastAlertAt: now, ReadyAt: now,
 	}
 	if err := st.InsertIncident(ctx, inc); err != nil {
@@ -97,7 +97,7 @@ func seedAnalyzedIncidentOnKey(t *testing.T, st *store.Store, groupKey string) s
 
 func TestAnnotate_CorrectionDemotesAuditsNotifies(t *testing.T) {
 	st := newTestStore(t)
-	inc := seedAnalyzedIncidentOnKey(t, st, "service=api")
+	inc := seedAnalyzedIncidentOnKey(t, st)
 	sink := &fakeAnnotationSink{}
 	eng := acutetriage.NewCaptureEngine(skillForCapture(t, st, sink))
 
@@ -136,7 +136,7 @@ func TestAnnotate_CorrectionDemotesAuditsNotifies(t *testing.T) {
 
 func TestAnnotate_Validation(t *testing.T) {
 	st := newTestStore(t)
-	inc := seedAnalyzedIncidentOnKey(t, st, "service=api")
+	inc := seedAnalyzedIncidentOnKey(t, st)
 	sink := &fakeAnnotationSink{}
 	eng := acutetriage.NewCaptureEngine(skillForCapture(t, st, sink))
 	ctx := context.Background()
@@ -173,7 +173,7 @@ func TestAnnotate_Validation(t *testing.T) {
 func TestCaptureVerdict_PersistPhase(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
-	inc := seedAnalyzedIncidentOnKey(t, st, "service=api")
+	inc := seedAnalyzedIncidentOnKey(t, st)
 	sink := &fakeAnnotationSink{}
 	eng := acutetriage.NewCaptureEngine(skillForCaptureWithProm(t, st, sink, promHealthy(t)))
 
@@ -233,7 +233,7 @@ func TestCaptureVerdict_PersistPhase(t *testing.T) {
 func TestCaptureVerdict_RepeatCallSkipsPersist(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
-	inc := seedAnalyzedIncidentOnKey(t, st, "service=api")
+	inc := seedAnalyzedIncidentOnKey(t, st)
 	sink := &fakeAnnotationSink{}
 	prom, reqs := countingCaptureProm(t)
 	eng := acutetriage.NewCaptureEngine(skillForCaptureWithProm(t, st, sink, prom))
@@ -276,7 +276,7 @@ func TestCaptureVerdict_RepeatCallSkipsPersist(t *testing.T) {
 func TestCaptureVerdict_ChangedExpectationVersions(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
-	inc := seedAnalyzedIncidentOnKey(t, st, "service=api")
+	inc := seedAnalyzedIncidentOnKey(t, st)
 	sink := &fakeAnnotationSink{}
 	eng := acutetriage.NewCaptureEngine(skillForCaptureWithProm(t, st, sink, promHealthy(t)))
 
@@ -308,7 +308,7 @@ func TestCaptureVerdict_ChangedExpectationVersions(t *testing.T) {
 func TestCaptureVerdict_NewWidenQueriesVersionAndMerge(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
-	inc := seedAnalyzedIncidentOnKey(t, st, "service=api")
+	inc := seedAnalyzedIncidentOnKey(t, st)
 	sink := &fakeAnnotationSink{}
 	prom, reqs := countingCaptureProm(t)
 	eng := acutetriage.NewCaptureEngine(skillForCaptureWithProm(t, st, sink, prom))
@@ -350,7 +350,7 @@ func TestCaptureVerdict_NewWidenQueriesVersionAndMerge(t *testing.T) {
 func TestCaptureVerdict_FailedWideningDegradesNotAborts(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
-	inc := seedAnalyzedIncidentOnKey(t, st, "service=api")
+	inc := seedAnalyzedIncidentOnKey(t, st)
 	sink := &fakeAnnotationSink{}
 	eng := acutetriage.NewCaptureEngine(skillForCaptureWithProm(t, st, sink, promAllFail(t)))
 
@@ -390,7 +390,7 @@ func TestCaptureVerdict_FailedWideningDegradesNotAborts(t *testing.T) {
 func TestCaptureVerdict_Validation(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
-	inc := seedAnalyzedIncidentOnKey(t, st, "service=api")
+	inc := seedAnalyzedIncidentOnKey(t, st)
 	sink := &fakeAnnotationSink{}
 	eng := acutetriage.NewCaptureEngine(skillForCaptureWithProm(t, st, sink, promHealthy(t)))
 

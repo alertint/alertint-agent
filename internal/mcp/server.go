@@ -8,7 +8,10 @@
 //
 // Default endpoint: http://host:9912/mcp
 // Auth: Bearer token (constant-time compare, same pattern as the webhook).
-// All tools are read-only; no tool mutates store state or external systems.
+//
+// Read-only toward your systems, always; feedback writes (the two
+// alertint_incident_* write tools) land only in AlertINT's own incident
+// state, additive and audit-chained.
 package mcp
 
 import (
@@ -141,7 +144,8 @@ func (s *Server) withBearerAuth(next http.Handler) http.Handler {
 }
 
 // -----------------------------------------------------------------------------
-// Tool definitions (read-only, never mutate state)
+// Tool definitions (read-only toward operator systems; write-back tools live
+// in server_feedback.go)
 // -----------------------------------------------------------------------------
 
 func (s *Server) toolListIncidents() (mcplib.Tool, mcpserver.ToolHandlerFunc) {

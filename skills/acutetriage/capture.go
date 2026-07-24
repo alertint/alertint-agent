@@ -3,6 +3,7 @@
 // Capture: the feedback & verdict write-back engine (ADR-0027/0028). All
 // writes land in AlertINT's own SQLite + audit chain — never in operator
 // infrastructure. MCP handlers validate transport args and delegate here.
+
 package acutetriage
 
 import (
@@ -161,46 +162,14 @@ func (e *CaptureEngine) CaptureVerdict(ctx context.Context, req CaptureRequest) 
 
 	var warnings []string
 	verdictRow := latest
-	if latest == nil || latest.ExpectationJSON != expJSON || latest.Verdict != req.Verdict || len(newExprs) > 0 {
-		// Widen: live, once, only the exprs not already frozen (D9/D10).
-		fetched, wideWarns := e.widen(ctx, req.IncidentID, newExprs)
-		warnings = append(warnings, wideWarns...)
-		merged := append(priorWidened, fetched...)
-		widenedJSON := ""
-		if len(merged) > 0 {
-			b, err := json.Marshal(merged)
-			if err != nil {
-				return nil, fmt.Errorf("acutetriage: capture: marshal widened: %w", err)
-			}
-			widenedJSON = string(b)
-		}
-		note := req.Note
-		if note == "" {
-			note = synthesizeNote(req.Verdict, exp)
-		}
-		demote := 0
-		if req.Verdict == "correction" {
-			demote = demotionThreshold
-		}
-		v, _, err := e.sk.st.PersistVerdictCapture(ctx, store.VerdictCapture{
-			IncidentID: req.IncidentID, Verdict: req.Verdict,
-			ExpectationJSON: expJSON, WidenedJSON: widenedJSON,
-			CauseCategory: req.CauseCategory, AnnotationNote: note,
-			DemoteMarksFloor: demote,
-		})
+	needsPersist := latest == nil || latest.ExpectationJSON != expJSON || latest.Verdict != req.Verdict || len(newExprs) > 0
+	if needsPersist {
+		v, persistWarnings, err := e.persistCapture(ctx, req, exp, expJSON, inc, priorWidened, newExprs)
 		if err != nil {
-			return nil, fmt.Errorf("acutetriage: capture: persist: %w", err)
+			return nil, err
 		}
 		verdictRow = v
-		if e.sk.auditor != nil {
-			if err := e.sk.auditor.Append(ctx, captureActor, "incident.verdict_captured", map[string]any{
-				"incident_id": req.IncidentID, "verdict": req.Verdict, "version": v.Version,
-				"cause_category": req.CauseCategory, "widened_count": len(fetched), "note": note,
-			}); err != nil {
-				return nil, fmt.Errorf("acutetriage: capture: audit: %w", err)
-			}
-		}
-		e.notifyAnnotation(ctx, inc, req.Verdict, note, v.Version)
+		warnings = append(warnings, persistWarnings...)
 	}
 
 	frozen := decodeFrozenEnvelope(inc.EnrichmentJSON)
@@ -211,6 +180,53 @@ func (e *CaptureEngine) CaptureVerdict(ctx context.Context, req CaptureRequest) 
 	defer cancel()
 	e.grade(gctx, inc, exp, verdictRow, res)
 	return res, nil
+}
+
+// persistCapture runs the persist phase (D7/D9): widen the not-yet-frozen
+// exprs live once, merge with what's already frozen, write the verdict +
+// annotation + demotion atomically, audit, and fan out the annotation event.
+func (e *CaptureEngine) persistCapture(ctx context.Context, req CaptureRequest, exp Expectation, expJSON string,
+	inc *store.Incident, priorWidened []VerificationQuery, newExprs []string,
+) (*store.IncidentVerdict, []string, error) {
+	fetched, warnings := e.widen(ctx, req.IncidentID, newExprs)
+	merged := make([]VerificationQuery, 0, len(priorWidened)+len(fetched))
+	merged = append(merged, priorWidened...)
+	merged = append(merged, fetched...)
+	widenedJSON := ""
+	if len(merged) > 0 {
+		b, err := json.Marshal(merged)
+		if err != nil {
+			return nil, nil, fmt.Errorf("acutetriage: capture: marshal widened: %w", err)
+		}
+		widenedJSON = string(b)
+	}
+	note := req.Note
+	if note == "" {
+		note = synthesizeNote(req.Verdict, exp)
+	}
+	demote := 0
+	if req.Verdict == "correction" {
+		demote = demotionThreshold
+	}
+	v, _, err := e.sk.st.PersistVerdictCapture(ctx, store.VerdictCapture{
+		IncidentID: req.IncidentID, Verdict: req.Verdict,
+		ExpectationJSON: expJSON, WidenedJSON: widenedJSON,
+		CauseCategory: req.CauseCategory, AnnotationNote: note,
+		DemoteMarksFloor: demote,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("acutetriage: capture: persist: %w", err)
+	}
+	if e.sk.auditor != nil {
+		if err := e.sk.auditor.Append(ctx, captureActor, "incident.verdict_captured", map[string]any{
+			"incident_id": req.IncidentID, "verdict": req.Verdict, "version": v.Version,
+			"cause_category": req.CauseCategory, "widened_count": len(fetched), "note": note,
+		}); err != nil {
+			return nil, nil, fmt.Errorf("acutetriage: capture: audit: %w", err)
+		}
+	}
+	e.notifyAnnotation(ctx, inc, req.Verdict, note, v.Version)
+	return v, warnings, nil
 }
 
 // grade runs the two-stage advisory grade (D8). It only ever writes into res

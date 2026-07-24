@@ -205,7 +205,11 @@ func TestListIncidents_VerdictKind(t *testing.T) {
 	}
 	byID := map[string]map[string]any{}
 	for _, r := range payload.Incidents {
-		byID[r["id"].(string)] = r
+		id, ok := r["id"].(string)
+		if !ok {
+			t.Fatalf("row missing string id: %v", r)
+		}
+		byID[id] = r
 	}
 	if byID["inc1"]["verdict_kind"] != "correction" {
 		t.Fatalf("inc1 verdict_kind: %v", byID["inc1"]["verdict_kind"])

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- MCP write-back: `alertint_incident_annotate` and `alertint_incident_capture_verdict` — operator
+  corrections/confirmations land in AlertINT's own incident state (additive, audit-chained),
+  recall into future triage prompts as a human-locked tier above LLM priors, and a captured
+  verdict is immediately graded against current triage (red/green with an
+  evidence-selection vs synthesis layer) via a hermetic full-pipeline replay.
+
 ## [0.9.1] - 2026-07-24
 
 ### Added
