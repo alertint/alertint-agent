@@ -7,6 +7,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestInsertAndListIncidentAnnotations(t *testing.T) {
@@ -80,5 +81,38 @@ func TestSetRefuteMarksFloor(t *testing.T) {
 	}
 	if err := s.SetRefuteMarksFloor(ctx, "nope", 2); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing incident: want ErrNotFound, got %v", err)
+	}
+}
+
+func TestOperatorAnnotationsByGroupKey(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	a := readyIncident(t, s, "service=api")   // same key
+	b := readyIncident(t, s, "service=api")   // same key
+	c := readyIncident(t, s, "service=other") // different key
+	for _, in := range []struct{ id, kind, note string }{
+		{a, "correction", "on a"}, {b, "observation", "on b"}, {c, "observation", "on c"},
+	} {
+		if _, err := s.InsertIncidentAnnotation(ctx, in.id, in.kind, in.note); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.OperatorAnnotationsByGroupKey(ctx, "service=api", false, time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 annotations for the key, got %+v", got)
+	}
+	if !got[0].CreatedAt.After(got[1].CreatedAt) && got[0].CreatedAt != got[1].CreatedAt {
+		t.Fatal("not newest-first")
+	}
+	// Lookback cutoff excludes everything when since is in the future.
+	none, err := s.OperatorAnnotationsByGroupKey(ctx, "service=api", false, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("lookback ignored: %+v", none)
 	}
 }

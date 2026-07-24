@@ -33,6 +33,11 @@ type PriorFinding struct {
 	Episodes              int    // this incident's firing episodes = occurrence rows + 1
 	CorroboratingIssueIDs []string
 	IsDrill               bool
+	// CorrectedByOperator is true when this prior's incident carries at least
+	// one operator correction annotation. Structural demotion (D4): a corrected
+	// prior never takes the strong slot, regardless of memory_refute_marks
+	// (which a later LLM "confirms" could clear).
+	CorrectedByOperator bool
 }
 
 // MemoryView is the computed-never-stored recall for one incident's group_key:
@@ -113,6 +118,7 @@ func scanPriorCandidates(rows *sql.Rows) ([]priorCandidate, error) {
 			&c.pf.IncidentID, &c.groupKey,
 			&c.pf.Summary, &c.pf.RootCause, &c.pf.Confidence,
 			&enrichmentJSON, &c.pf.ContradictionMarks,
+			&c.pf.CorrectedByOperator,
 			&createdStr, &judgedStr, &firstStr,
 		); err != nil {
 			return nil, fmt.Errorf("store: scan prior candidate: %w", err)
@@ -144,6 +150,8 @@ const selectPriorCandidatesSQL = `
 	SELECT id, group_key,
 	       COALESCE(summary,''), COALESCE(root_cause,''), COALESCE(confidence,0.0),
 	       COALESCE(enrichment_json,''), memory_refute_marks,
+	       EXISTS (SELECT 1 FROM incident_annotations a
+	               WHERE a.incident_id = incidents.id AND a.kind = 'correction'),
 	       created_at, last_judged_at, first_alert_at
 	FROM incidents
 	WHERE status IN ('analyzed','resolved')
