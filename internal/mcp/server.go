@@ -281,6 +281,9 @@ func (s *Server) handleListIncidents(ctx context.Context, req mcplib.CallToolReq
 		// incident by recurrence collapse (the incident_occurrences ledger); 0
 		// for a first-time incident. The rendered "recurred ×N" is Occurrences+1.
 		Occurrences int `json:"occurrences,omitempty"`
+		// VerdictKind is the derived latest-verdict marker (ADR-0027/0028) —
+		// omitted when the incident carries no captured verdict.
+		VerdictKind string `json:"verdict_kind,omitempty"`
 	}
 
 	ids := make([]string, len(incidents))
@@ -298,6 +301,10 @@ func (s *Server) handleListIncidents(ctx context.Context, req mcplib.CallToolReq
 	occ, err := s.st.OccurrenceStatsByIncident(ctx, ids)
 	if err != nil {
 		return errResult("failed to load occurrence counts: " + err.Error()), nil
+	}
+	verdictKinds, err := s.st.LatestVerdictKinds(ctx, ids)
+	if err != nil {
+		return errResult("failed to load verdict kinds: " + err.Error()), nil
 	}
 
 	rows := make([]row, 0, len(incidents))
@@ -317,6 +324,7 @@ func (s *Server) handleListIncidents(ctx context.Context, req mcplib.CallToolReq
 			Recovery:     buildRecovery(c.Firing, c.Resolved, c.Total, inc.Status, inc.UpdatedAt),
 			Drill:        drills[inc.ID],
 			Occurrences:  occ[inc.ID].Count,
+			VerdictKind:  verdictKinds[inc.ID],
 		})
 	}
 
@@ -440,6 +448,20 @@ func (s *Server) handleGetIncident(ctx context.Context, req mcplib.CallToolReque
 	}
 	if mem := memoryPayload(view, lookback); mem != nil {
 		payload["memory"] = mem
+	}
+	if anns, err := s.st.ListIncidentAnnotations(ctx, inc.ID); err == nil && len(anns) > 0 {
+		rows := make([]map[string]any, 0, len(anns))
+		for _, a := range anns {
+			rows = append(rows, map[string]any{"kind": a.Kind, "note": a.Note, "created_at": a.CreatedAt})
+		}
+		payload["annotations"] = rows
+	}
+	if v, err := s.st.LatestIncidentVerdict(ctx, inc.ID); err == nil && v != nil {
+		verdict := map[string]any{"kind": v.Verdict, "version": v.Version, "created_at": v.CreatedAt}
+		if v.CauseCategory != "" {
+			verdict["cause_category"] = v.CauseCategory
+		}
+		payload["verdict"] = verdict
 	}
 
 	result, err := mcplib.NewToolResultJSON(payload)

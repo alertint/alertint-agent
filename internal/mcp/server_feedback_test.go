@@ -121,3 +121,96 @@ func TestIncidentCaptureVerdict_HappyAndFailedReplay(t *testing.T) {
 		t.Fatalf("verdict row missing: v=%+v err=%v", v, err)
 	}
 }
+
+func TestGetIncident_ExposesAnnotationsAndVerdict(t *testing.T) {
+	st := newMCPStore(t)
+	ctx := context.Background()
+	seedAnalyzedPrior(t, st, "inc1", "service=api", "root cause", 0.7, time.Now(), false)
+	seedAnalyzedPrior(t, st, "inc2", "service=other", "root cause", 0.7, time.Now(), false)
+
+	if _, err := st.InsertIncidentAnnotation(ctx, "inc1", "observation", "first"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.InsertIncidentAnnotation(ctx, "inc1", "correction", "second"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.PersistVerdictCapture(ctx, store.VerdictCapture{
+		IncidentID: "inc1", Verdict: "correction",
+		ExpectationJSON: `{"must_not_conclude":["x"]}`, AnnotationNote: "n",
+		CauseCategory: "network-flap",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Server{cfg: Config{}, st: st, auditor: audit.New(st.DB())}
+	res, err := s.handleGetIncident(ctx, reqWith(map[string]any{"incident_id": "inc1"}))
+	if err != nil || res.IsError {
+		t.Fatalf("handler: %v %s", err, resultText(t, res))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(resultText(t, res)), &payload); err != nil {
+		t.Fatal(err)
+	}
+	anns, ok := payload["annotations"].([]any)
+	if !ok || len(anns) != 3 { // 2 explicit + 1 from PersistVerdictCapture's own annotation row
+		t.Fatalf("annotations: %v", payload["annotations"])
+	}
+	first, ok := anns[0].(map[string]any)
+	if !ok || first["note"] != "n" { // newest-first: PersistVerdictCapture's row ("n") is newest
+		t.Fatalf("annotations[0] not newest-first: %v", anns[0])
+	}
+	verdict, ok := payload["verdict"].(map[string]any)
+	if !ok || verdict["kind"] != "correction" || verdict["version"] != float64(1) || verdict["cause_category"] != "network-flap" {
+		t.Fatalf("verdict: %v", payload["verdict"])
+	}
+
+	res2, err := s.handleGetIncident(ctx, reqWith(map[string]any{"incident_id": "inc2"}))
+	if err != nil || res2.IsError {
+		t.Fatalf("handler: %v %s", err, resultText(t, res2))
+	}
+	var payload2 map[string]any
+	if err := json.Unmarshal([]byte(resultText(t, res2)), &payload2); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := payload2["annotations"]; ok {
+		t.Fatalf("incident without annotations must omit the key: %v", payload2["annotations"])
+	}
+	if _, ok := payload2["verdict"]; ok {
+		t.Fatalf("incident without a verdict must omit the key: %v", payload2["verdict"])
+	}
+}
+
+func TestListIncidents_VerdictKind(t *testing.T) {
+	st := newMCPStore(t)
+	ctx := context.Background()
+	seedAnalyzedPrior(t, st, "inc1", "service=api", "root cause", 0.7, time.Now(), false)
+	seedAnalyzedPrior(t, st, "inc2", "service=other", "root cause", 0.7, time.Now(), false)
+	if _, _, err := st.PersistVerdictCapture(ctx, store.VerdictCapture{
+		IncidentID: "inc1", Verdict: "correction",
+		ExpectationJSON: `{"must_not_conclude":["x"]}`, AnnotationNote: "n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Server{cfg: Config{}, st: st, auditor: audit.New(st.DB())}
+	res, err := s.handleListIncidents(ctx, reqWith(map[string]any{}))
+	if err != nil || res.IsError {
+		t.Fatalf("handler: %v %s", err, resultText(t, res))
+	}
+	var payload struct {
+		Incidents []map[string]any `json:"incidents"`
+	}
+	if err := json.Unmarshal([]byte(resultText(t, res)), &payload); err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]map[string]any{}
+	for _, r := range payload.Incidents {
+		byID[r["id"].(string)] = r
+	}
+	if byID["inc1"]["verdict_kind"] != "correction" {
+		t.Fatalf("inc1 verdict_kind: %v", byID["inc1"]["verdict_kind"])
+	}
+	if _, ok := byID["inc2"]["verdict_kind"]; ok {
+		t.Fatalf("inc2 has no verdict, key must be omitted: %v", byID["inc2"]["verdict_kind"])
+	}
+}
