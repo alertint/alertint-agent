@@ -207,8 +207,73 @@ func (e *CaptureEngine) CaptureVerdict(ctx context.Context, req CaptureRequest) 
 	warnings = append(warnings, lintExpectationVerifiable(exp, frozen, decodeWidened(verdictRow))...)
 
 	res := &CaptureResult{VerdictID: verdictRow.ID, Version: verdictRow.Version, Warnings: warnings}
-	res.ReplayFailed = true // grade phase lands in the next task
+	gctx, cancel := context.WithTimeout(ctx, gradeDeadline)
+	defer cancel()
+	e.grade(gctx, inc, exp, verdictRow, res)
 	return res, nil
+}
+
+// grade runs the two-stage advisory grade (D8). It only ever writes into res
+// — a grading failure cannot touch the already-persisted capture (D9).
+func (e *CaptureEngine) grade(ctx context.Context, inc *store.Incident, exp Expectation, verdictRow *store.IncidentVerdict, res *CaptureResult) {
+	frozen := decodeFrozenEnvelope(inc.EnrichmentJSON)
+	alerts, err := e.sk.st.GetIncidentAlerts(ctx, inc.ID)
+	if err != nil || len(alerts) == 0 {
+		res.ReplayFailed = true
+		res.Warnings = append(res.Warnings, "replay failed: could not load member alerts — verdict captured intact")
+		return
+	}
+
+	// Stage 1 — deterministic expectation diff against the pack current rules
+	// assemble. Absent discriminating evidence → red, evidence-selection, no
+	// LLM call (a synthesis green over absent evidence would be
+	// right-for-the-wrong-reason).
+	d := diffExpectationAgainstPack(exp, e.sk.stage1Corpus(*inc, alerts, frozen))
+	if len(d.MissingSeries) > 0 || len(d.MissingSubjects) > 0 {
+		res.Grade = "red"
+		res.Layer = "evidence_selection"
+		for _, m := range d.MissingSeries {
+			res.Warnings = append(res.Warnings, fmt.Sprintf("series %q is not in the evidence pack current rules assemble — the fix is a rule/check, not a prompt", m))
+		}
+		for _, m := range d.MissingSubjects {
+			res.Warnings = append(res.Warnings, fmt.Sprintf("subject %q appears nowhere in the assembled evidence", m))
+		}
+		return
+	}
+
+	// Stage 2 — full-pipeline hermetic replay (current rules + prompts + live
+	// LLM over frozen data, widened series servable).
+	var frozenQueries []VerificationQuery
+	if frozen.Verification != nil {
+		for _, r := range frozen.Verification.Rounds {
+			frozenQueries = append(frozenQueries, r.Queries...)
+		}
+	}
+	frozenQueries = append(frozenQueries, decodeWidened(verdictRow)...)
+	rep, err := e.sk.replayIncidentWith(ctx, *inc, alerts, frozen, frozenQueries)
+	if err != nil {
+		e.sk.logger.Warn("acutetriage: capture: replay failed; verdict captured intact",
+			"incident", inc.ID, "err", err)
+		res.ReplayFailed = true
+		res.Warnings = append(res.Warnings, "replay failed — verdict captured intact")
+		return
+	}
+	res.ReplayFidelity = rep.fidelity
+
+	missing, bad, warns := diffExpectationAgainstFinding(exp, rep.resp)
+	res.Warnings = append(res.Warnings, warns...)
+	if len(missing) == 0 && len(bad) == 0 {
+		res.Grade = "green"
+		return
+	}
+	res.Grade = "red"
+	res.Layer = "synthesis"
+	for _, m := range missing {
+		res.Warnings = append(res.Warnings, fmt.Sprintf("replayed finding does not mention %q", m))
+	}
+	for _, b := range bad {
+		res.Warnings = append(res.Warnings, fmt.Sprintf("replayed finding still concludes %q", b))
+	}
 }
 
 // widen runs the not-yet-frozen widen queries live, exactly once, freezing

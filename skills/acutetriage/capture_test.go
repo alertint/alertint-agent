@@ -5,7 +5,10 @@ package acutetriage_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -13,8 +16,10 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/alertint/alertint-agent/internal/audit"
+	"github.com/alertint/alertint-agent/internal/llm"
 	"github.com/alertint/alertint-agent/internal/notify"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
+	"github.com/alertint/alertint-agent/internal/rules"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/skills/acutetriage"
 )
@@ -446,5 +451,311 @@ func TestCaptureVerdict_Validation(t *testing.T) {
 	}
 	if !lintFound {
 		t.Fatalf("want an unverifiable-cause-series lint warning, got %v", res.Warnings)
+	}
+}
+
+// --------------------------------------------------------------------------
+// CaptureVerdict — grade phase (Task 13): two-stage advisory grading.
+// --------------------------------------------------------------------------
+
+// captureEngineWithHint mirrors expectation_test.go's engineWithHint (that
+// one lives in the internal `acutetriage` package and is unreachable from
+// here): a one-rule *rules.Engine matching alertname=TargetDown whose
+// then.root_cause_hint carries hint — the "steering rule" fixture.
+func captureEngineWithHint(t *testing.T, hint string) *rules.Engine {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "pack.yaml"), []byte("name: test\nversion: \"0.0.1\"\nupdated: \"2026-07-24\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rulesDir := filepath.Join(dir, "rules")
+	if err := os.MkdirAll(rulesDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ruleYAML := `rules:
+  - id: test.steering-hint
+    kind: correlation
+    description: Steering hint for TargetDown
+    when:
+      all:
+        - label: alertname
+          op: equals
+          value: TargetDown
+    then:
+      root_cause_hint: ` + hint + `
+    updated: "2026-07-24"
+`
+	if err := os.WriteFile(filepath.Join(rulesDir, "01-hint.yaml"), []byte(ruleYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e, err := rules.NewEngine(context.Background(), nil, rules.NewLocalDirSource(dir, 0))
+	if err != nil {
+		t.Fatalf("build rule engine: %v", err)
+	}
+	return e
+}
+
+// explodingLLM fails the test if ever called — proves a code path never
+// reaches the LLM (stage-1 red must short-circuit before any grading call).
+type explodingLLM struct{ t *testing.T }
+
+func (e *explodingLLM) Complete(context.Context, string, llm.Prompt, []string) (llm.Completion, error) {
+	e.t.Helper()
+	e.t.Fatal("LLM must not be called")
+	return llm.Completion{}, nil
+}
+
+// seedGradableIncident seeds an analyzed incident (via a real Run, no
+// steering rule, no model-proposed verification query — a floor-only round)
+// carrying a "TargetDown" member alert on worker-14 — the fixture Task 13's
+// grading tests capture a verdict against and replay under current rules.
+func seedGradableIncident(t *testing.T, st *store.Store, prom *promclient.Client) store.Incident {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now()
+	id := uuid.NewString()
+	if err := st.InsertIncident(ctx, store.Incident{
+		ID: id, GroupKey: "namespace=prod", FirstAlertAt: now, LastAlertAt: now, ReadyAt: now,
+	}); err != nil {
+		t.Fatalf("insert incident: %v", err)
+	}
+	if err := st.MarkIncidentReady(ctx, id); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	a := store.Alert{
+		ID: uuid.NewString(), Fingerprint: "fp-" + id, Status: "firing",
+		Labels:      map[string]string{"alertname": "TargetDown", "namespace": "prod", "instance": "worker-14"},
+		Annotations: map[string]string{"summary": "target down"},
+		StartsAt:    now, ReceivedAt: now,
+	}
+	stored, err := st.UpsertAlertByFingerprint(ctx, a)
+	if err != nil {
+		t.Fatalf("upsert alert: %v", err)
+	}
+	if err := st.AddAlertToIncident(ctx, id, stored.ID, now); err != nil {
+		t.Fatalf("add alert: %v", err)
+	}
+
+	seedLLM := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "TargetDown", "target down", 0.6, nil)},
+		{raw: callTwoResp(t, "TargetDown", "target down", 0.6, "")},
+	}}
+	seedSkill := acutetriage.New(verifyConfig(prom), st, seedLLM, audit.New(st.DB()), nil, nil)
+	inc, err := st.GetIncidentByID(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seedSkill.Run(ctx, *inc); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	got, err := st.GetIncidentByID(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return *got
+}
+
+// gradeSkill builds the Skill CaptureEngine grades against — the "current
+// triage" wiring (rules/LLM the operator's install runs NOW, which may
+// differ from what produced the incident's original finding).
+func gradeSkill(t *testing.T, st *store.Store, llmClient acutetriage.LLMClient, rulesEngine *rules.Engine, prom *promclient.Client, sink *fakeAnnotationSink) *acutetriage.Skill {
+	t.Helper()
+	cfg := verifyConfig(prom)
+	cfg.Rules = rulesEngine
+	return acutetriage.New(cfg, st, llmClient, audit.New(st.DB()), notify.NewMulti(nil, sink), nil)
+}
+
+func TestGrade_Stage1RedEvidenceSelection(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	prom := promHealthy(t)
+	inc := seedGradableIncident(t, st, prom)
+	eng := acutetriage.NewCaptureEngine(gradeSkill(t, st, &explodingLLM{t: t}, nil, prom, &fakeAnnotationSink{}))
+
+	res, err := eng.CaptureVerdict(ctx, acutetriage.CaptureRequest{
+		IncidentID: inc.ID, Verdict: "correction",
+		Expectation:  json.RawMessage(`{"cause_series":["node_network_up"],"must_not_conclude":["AZ outage"]}`),
+		WidenQueries: []string{"node_network_up"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Grade != "red" || res.Layer != "evidence_selection" {
+		t.Fatalf("grade=%q layer=%q warnings=%v", res.Grade, res.Layer, res.Warnings)
+	}
+	if res.ReplayFidelity != "" {
+		t.Fatalf("stage-1 red must not run stage 2, got fidelity %q", res.ReplayFidelity)
+	}
+	if res.ReplayFailed {
+		t.Fatal("a graded (non-erroring) capture must not report replay_failed")
+	}
+}
+
+func TestGrade_Stage2GreenWithSteeringRule(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	prom := promHealthy(t)
+	inc := seedGradableIncident(t, st, prom)
+	gradeLLM := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "TargetDown", "flapping NIC", 0.70, []map[string]any{
+			{"kind": "promql", "expr": "node_network_up", "why": "discriminates NIC flap"},
+		})},
+		{raw: callTwoResp(t, "NIC flap", "flapping NIC on worker-14", 0.75, "")},
+	}}
+	hintEngine := captureEngineWithHint(t, "check node_network_up on the flapping NIC")
+	eng := acutetriage.NewCaptureEngine(gradeSkill(t, st, gradeLLM, hintEngine, prom, &fakeAnnotationSink{}))
+
+	res, err := eng.CaptureVerdict(ctx, acutetriage.CaptureRequest{
+		IncidentID: inc.ID, Verdict: "correction",
+		Expectation:  json.RawMessage(`{"cause_series":["node_network_up"],"must_mention":["worker-14"],"must_not_conclude":["AZ outage"]}`),
+		WidenQueries: []string{"node_network_up"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Grade != "green" {
+		t.Fatalf("grade=%q layer=%q warnings=%v", res.Grade, res.Layer, res.Warnings)
+	}
+	if res.ReplayFidelity != "full" {
+		t.Fatalf("fidelity=%q, want full", res.ReplayFidelity)
+	}
+}
+
+func TestGrade_SynthesisRed(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	prom := promHealthy(t)
+	inc := seedGradableIncident(t, st, prom)
+	gradeLLM := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "TargetDown", "flapping NIC", 0.70, []map[string]any{
+			{"kind": "promql", "expr": "node_network_up", "why": "discriminates NIC flap"},
+		})},
+		{raw: callTwoResp(t, "AZ event", "regional AZ outage in eu-west-1", 0.75, "")},
+	}}
+	hintEngine := captureEngineWithHint(t, "check node_network_up on the flapping NIC")
+	eng := acutetriage.NewCaptureEngine(gradeSkill(t, st, gradeLLM, hintEngine, prom, &fakeAnnotationSink{}))
+
+	res, err := eng.CaptureVerdict(ctx, acutetriage.CaptureRequest{
+		IncidentID: inc.ID, Verdict: "correction",
+		Expectation:  json.RawMessage(`{"cause_series":["node_network_up"],"must_not_conclude":["AZ outage"]}`),
+		WidenQueries: []string{"node_network_up"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Grade != "red" || res.Layer != "synthesis" {
+		t.Fatalf("grade=%q layer=%q warnings=%v", res.Grade, res.Layer, res.Warnings)
+	}
+}
+
+func TestGrade_ConfirmationRegression(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	prom := promHealthy(t)
+	inc := seedGradableIncident(t, st, prom)
+	gradeLLM := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "TargetDown", "still fine", 0.6, nil)},
+		{raw: callTwoResp(t, "unrelated", "something else entirely", 0.6, "")},
+	}}
+	eng := acutetriage.NewCaptureEngine(gradeSkill(t, st, gradeLLM, nil, prom, &fakeAnnotationSink{}))
+
+	res, err := eng.CaptureVerdict(ctx, acutetriage.CaptureRequest{
+		IncidentID: inc.ID, Verdict: "confirmation",
+		Expectation: json.RawMessage(`{"must_mention":["worker-14"]}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Grade != "red" {
+		t.Fatalf("a regressed confirmation must grade red, got %q layer=%q warnings=%v", res.Grade, res.Layer, res.Warnings)
+	}
+}
+
+func TestGrade_ReplayFailureLeavesCaptureIntact(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	prom := promHealthy(t)
+	inc := seedGradableIncident(t, st, prom)
+	gradeLLM := &scriptedLLM{responses: []scriptResp{{err: errors.New("boom")}}}
+	eng := acutetriage.NewCaptureEngine(gradeSkill(t, st, gradeLLM, nil, prom, &fakeAnnotationSink{}))
+
+	res, err := eng.CaptureVerdict(ctx, acutetriage.CaptureRequest{
+		IncidentID: inc.ID, Verdict: "correction",
+		Expectation: json.RawMessage(`{"must_mention":["worker-14"]}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.ReplayFailed {
+		t.Fatal("want replay_failed true")
+	}
+	if res.Grade != "" {
+		t.Fatalf("grade must be empty on a replay failure, got %q", res.Grade)
+	}
+	v, err := st.LatestIncidentVerdict(ctx, inc.ID)
+	if err != nil || v == nil {
+		t.Fatalf("verdict row must exist despite grading failure: v=%+v err=%v", v, err)
+	}
+	anns, err := st.ListIncidentAnnotations(ctx, inc.ID)
+	if err != nil || len(anns) != 1 {
+		t.Fatalf("annotation row must exist: anns=%+v err=%v", anns, err)
+	}
+	if n := auditCount(t, st, "incident.verdict_captured"); n != 1 {
+		t.Fatalf("audit row must exist, got %d", n)
+	}
+}
+
+func TestGrade_RepeatCallRegrades(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	prom, reqs := countingCaptureProm(t)
+	inc := seedGradableIncident(t, st, prom)
+
+	req := acutetriage.CaptureRequest{
+		IncidentID: inc.ID, Verdict: "correction",
+		Expectation:  json.RawMessage(`{"cause_series":["node_network_up"],"must_not_conclude":["AZ outage"]}`),
+		WidenQueries: []string{"node_network_up"},
+	}
+	eng1 := acutetriage.NewCaptureEngine(gradeSkill(t, st, &explodingLLM{t: t}, nil, prom, &fakeAnnotationSink{}))
+	res1, err := eng1.CaptureVerdict(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res1.Grade != "red" || res1.Layer != "evidence_selection" {
+		t.Fatalf("first call: grade=%q layer=%q", res1.Grade, res1.Layer)
+	}
+	reqsAfterFirst := *reqs
+	annsAfterFirst, err := st.ListIncidentAnnotations(ctx, inc.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gradeLLM := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "TargetDown", "flapping NIC", 0.70, []map[string]any{
+			{"kind": "promql", "expr": "node_network_up", "why": "discriminates NIC flap"},
+		})},
+		{raw: callTwoResp(t, "NIC flap", "flapping NIC on worker-14", 0.75, "")},
+	}}
+	hintEngine := captureEngineWithHint(t, "check node_network_up on the flapping NIC")
+	eng2 := acutetriage.NewCaptureEngine(gradeSkill(t, st, gradeLLM, hintEngine, prom, &fakeAnnotationSink{}))
+	res2, err := eng2.CaptureVerdict(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res2.Version != res1.Version {
+		t.Fatalf("repeat call versioned: %d != %d", res2.Version, res1.Version)
+	}
+	if res2.Grade != "green" {
+		t.Fatalf("repeat call should re-grade fresh (green with the new rule), got %q layer=%q", res2.Grade, res2.Layer)
+	}
+	if *reqs != reqsAfterFirst {
+		t.Fatalf("repeat call issued a new widening HTTP request: %d != %d", *reqs, reqsAfterFirst)
+	}
+	annsAfterSecond, err := st.ListIncidentAnnotations(ctx, inc.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(annsAfterSecond) != len(annsAfterFirst) {
+		t.Fatalf("repeat call wrote a new annotation row: %d != %d", len(annsAfterSecond), len(annsAfterFirst))
 	}
 }
