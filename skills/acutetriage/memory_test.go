@@ -181,6 +181,61 @@ func TestRenderMemory_WeakEntriesBoundedWithMore(t *testing.T) {
 	}
 }
 
+func TestRenderMemory_OperatorTierAboveStrong(t *testing.T) {
+	m := &MemoryEnrichment{
+		GroupKey: "k", Rung: "2", PriorCount: 1, LatestAgo: "1d ago",
+		Operator: []OperatorEntry{
+			{IncidentID: "i1", Kind: "correction", Note: "corrected: cause NodeNetworkInterfaceFlapping; not AZ outage", Date: "2026-07-08"},
+			{IncidentID: "i2", Kind: "observation", Note: "line1\nline2", Date: "2026-07-07"},
+		},
+		OperatorMore: 1,
+		Strong:       &RecalledEntry{IncidentID: "p1", Confidence: 0.9, RootCause: "AZ outage", AnalyzedAt: time.Date(2026, 7, 8, 0, 0, 0, 0, time.UTC)},
+	}
+	var b strings.Builder
+	renderMemory(&b, m, false)
+	out := b.String()
+	for _, want := range []string{
+		"[operator correction, 2026-07-08] corrected: cause NodeNetworkInterfaceFlapping; not AZ outage",
+		"[operator note, 2026-07-07] line1 line2", // flattened
+		"+1 more operator note(s)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q\n---\n%s", want, out)
+		}
+	}
+	// Tier order: operator entries render before the strong prior.
+	if strings.Index(out, "[operator correction") > strings.Index(out, "prior hypothesis") {
+		t.Fatal("operator tier rendered below LLM priors")
+	}
+}
+
+func TestRenderMemory_OperatorSupersededTag(t *testing.T) {
+	m := &MemoryEnrichment{GroupKey: "k", Rung: "3a", PriorCount: 1, LatestAgo: "1d ago",
+		Weak: []RecalledEntry{{IncidentID: "p1", RootCause: "AZ outage", OperatorSuperseded: true, AnalyzedAt: time.Now()}}}
+	var b strings.Builder
+	renderMemory(&b, m, false)
+	if !strings.Contains(b.String(), "[superseded by operator correction]") {
+		t.Fatalf("missing operator-superseded tag:\n%s", b.String())
+	}
+}
+
+func TestRenderMemory_OperatorOnlyHeadline(t *testing.T) {
+	m := &MemoryEnrichment{GroupKey: "k", Rung: "operator",
+		Operator: []OperatorEntry{{IncidentID: "i1", Kind: "confirmation", Note: "confirmed", Date: "2026-07-08"}}}
+	var b strings.Builder
+	renderMemory(&b, m, false)
+	out := b.String()
+	if !strings.Contains(out, "Operator notes for this key") {
+		t.Fatalf("headline:\n%s", out)
+	}
+	if !strings.Contains(out, "[operator confirmation, 2026-07-08]") {
+		t.Fatalf("entry:\n%s", out)
+	}
+	if strings.Contains(out, "Weak-signal matches only") {
+		t.Fatal("wrong headline for operator-only recall")
+	}
+}
+
 // --- fold tests (FetchMemory) ------------------------------------------------
 
 // Covers R17 render half: a prior at the demotion threshold drops to a weak
