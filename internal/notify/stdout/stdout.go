@@ -125,3 +125,35 @@ func (n *Notifier) OnOccurrenceAttached(ctx context.Context, ev notify.Recurrenc
 	}
 	return nil
 }
+
+// annotationLine is the JSON shape written for each operator annotation.
+type annotationLine struct {
+	Ts             time.Time `json:"ts"`
+	Kind           string    `json:"kind"` // "annotation"
+	IncidentID     string    `json:"incident_id"`
+	GroupKey       string    `json:"group_key"`
+	AnnotationKind string    `json:"annotation_kind"`
+	Note           string    `json:"note"`
+	VerdictVersion int       `json:"verdict_version,omitempty"`
+	Drill          bool      `json:"drill,omitempty"`
+}
+
+// OnAnnotation writes one JSON line per operator write-back — always (not
+// verbose-gated): like occurrence lines, it IS the visible signal on stdout.
+// The audit row is the capture engine's job, not the sink's.
+func (n *Notifier) OnAnnotation(ctx context.Context, ev notify.AnnotationEvent) error {
+	l := annotationLine{
+		Ts: n.now(), Kind: "annotation",
+		IncidentID: ev.IncidentID, GroupKey: ev.GroupKey,
+		AnnotationKind: ev.Kind, Note: ev.Note,
+		VerdictVersion: ev.VerdictVersion, Drill: ev.Drill,
+	}
+	b, err := json.Marshal(l)
+	if err != nil {
+		return fmt.Errorf("stdout notifier: marshal annotation: %w", err)
+	}
+	if _, err := fmt.Fprintf(n.w, "%s\n", b); err != nil {
+		return fmt.Errorf("stdout notifier: write annotation: %w", err)
+	}
+	return nil
+}

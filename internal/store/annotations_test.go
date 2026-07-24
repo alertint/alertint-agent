@@ -84,7 +84,7 @@ func TestSetRefuteMarksFloor(t *testing.T) {
 	}
 }
 
-func TestOperatorAnnotationsByGroupKey(t *testing.T) {
+func TestOperatorAnnotations(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	a := readyIncident(t, s, "service=api")   // same key
@@ -97,7 +97,7 @@ func TestOperatorAnnotationsByGroupKey(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got, err := s.OperatorAnnotationsByGroupKey(ctx, "service=api", false, time.Now().Add(-time.Hour))
+	got, err := s.OperatorAnnotations(ctx, "service=api", false, time.Now().Add(-time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestOperatorAnnotationsByGroupKey(t *testing.T) {
 		t.Fatal("not newest-first")
 	}
 	// Lookback cutoff excludes everything when since is in the future.
-	none, err := s.OperatorAnnotationsByGroupKey(ctx, "service=api", false, time.Now().Add(time.Hour))
+	none, err := s.OperatorAnnotations(ctx, "service=api", false, time.Now().Add(time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}

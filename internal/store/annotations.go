@@ -124,12 +124,12 @@ type OperatorAnnotation struct {
 	CreatedAt  time.Time
 }
 
-// OperatorAnnotationsByGroupKey returns every annotation on the key's
+// OperatorAnnotations returns every annotation on the key's
 // incidents within the lookback, newest-first, filtered to the caller's drill
 // side (a real triage recalls only real incidents' notes and vice versa).
 // Unlike prior-finding recall it does NOT exclude the current incident: a
 // re-judgment must recall a correction captured on the incident itself.
-func (s *Store) OperatorAnnotationsByGroupKey(ctx context.Context, groupKey string, currentIsDrill bool, since time.Time) ([]OperatorAnnotation, error) {
+func (s *Store) OperatorAnnotations(ctx context.Context, groupKey string, currentIsDrill bool, since time.Time) ([]OperatorAnnotation, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT a.incident_id, a.kind, a.note, a.created_at
 		FROM incident_annotations a
@@ -138,7 +138,7 @@ func (s *Store) OperatorAnnotationsByGroupKey(ctx context.Context, groupKey stri
 		ORDER BY a.created_at DESC, a.id DESC`,
 		groupKey, since.UTC().Format(time.RFC3339Nano))
 	if err != nil {
-		return nil, fmt.Errorf("store: operator annotations by group key: %w", err)
+		return nil, fmt.Errorf("store: operator annotations: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 	var all []OperatorAnnotation

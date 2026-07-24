@@ -51,6 +51,24 @@ func TestOnOccurrenceAttached_WritesLineAlways(t *testing.T) {
 	}
 }
 
+func TestOnAnnotation_WritesJSONLine(t *testing.T) {
+	var buf bytes.Buffer
+	n := New(&buf, nil, false) // NOT verbose-gated: annotation lines always write
+	err := n.OnAnnotation(context.Background(), notify.AnnotationEvent{
+		IncidentID: "inc1", GroupKey: "service=api", Kind: "correction", Note: "not AZ outage", VerdictVersion: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("not a JSON line: %v", err)
+	}
+	if got["kind"] != "annotation" || got["annotation_kind"] != "correction" {
+		t.Fatalf("line: %v", got)
+	}
+}
+
 func TestNotify_UnverifiedCaveat(t *testing.T) {
 	// Test with Unverified: true
 	var buf bytes.Buffer
