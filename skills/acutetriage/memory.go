@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -20,6 +21,9 @@ import (
 type MemoryReader interface {
 	MemoryView(ctx context.Context, groupKey, currentIncidentID string, currentIsDrill bool, since time.Time) (*store.MemoryView, error)
 	MemoryPrefilter(ctx context.Context, groupKey, currentIncidentID string, currentIsDrill bool, since time.Time, limit int) ([]store.PriorFinding, error)
+	// OperatorAnnotations feeds the human-locked tier (ADR-0028): every
+	// annotation on the key's incidents within the lookback, newest-first.
+	OperatorAnnotations(ctx context.Context, groupKey string, currentIsDrill bool, since time.Time) ([]store.OperatorAnnotation, error)
 }
 
 // MemoryParams carries the recall tunables from the memory config section.
@@ -44,6 +48,10 @@ const weakPrefilterScan = 25
 // demotionThreshold is the contradiction-mark count at which a prior drops from
 // strong recall so a newer finding displaces it (R17).
 const demotionThreshold = 2
+
+// maxOperatorEntries bounds the rendered operator tier (slot rank D4:
+// corrections > confirmations > observations); the rest fold into "+N more".
+const maxOperatorEntries = 2
 
 // memoryUntrustedNotice is the constant frame around every recalled finding:
 // recalled text is prior LLM output generated from attacker-influenceable alert
@@ -76,6 +84,19 @@ type RecalledEntry struct {
 	// "LLM-matched, probably related" and is persisted (persist-as-rendered) so the
 	// at-rest envelope reflects exactly what the model saw. Never set in shadow mode.
 	ClassifierMatched bool `json:"classifier_matched,omitempty"`
+	// OperatorSuperseded marks a same-key prior demoted because its incident
+	// carries an operator correction annotation (D4 human-locked demotion) —
+	// distinct from Superseded's contradiction-mark demotion.
+	OperatorSuperseded bool `json:"operator_superseded,omitempty"`
+}
+
+// OperatorEntry is one recalled operator annotation as it renders and persists
+// in the operator tier (ADR-0028).
+type OperatorEntry struct {
+	IncidentID string `json:"incident_id"`
+	Kind       string `json:"kind"`
+	Note       string `json:"note"`
+	Date       string `json:"date"`
 }
 
 // MemoryEnrichment is the recall section: the fourth envelope key beside
@@ -98,6 +119,13 @@ type MemoryEnrichment struct {
 	Strong    *RecalledEntry  `json:"strong,omitempty"`
 	Weak      []RecalledEntry `json:"weak,omitempty"`
 	MoreCount int             `json:"more_count,omitempty"`
+	// Operator is the human-locked tier (ADR-0028): up to maxOperatorEntries
+	// recalled annotations, ranked correction > confirmation > observation,
+	// newest-first within a rank. Never counted as live evidence (R18, same as
+	// the rest of memory).
+	Operator []OperatorEntry `json:"operator,omitempty"`
+	// OperatorMore is the fold count for operator entries beyond the cap.
+	OperatorMore int `json:"operator_more,omitempty"`
 	// topPrefilter is the most-recent rung-3a (one-label-off) prefilter candidate,
 	// retained for the shadow classifier independent of the weak-entry render cap:
 	// a key with several demoted same-key priors can push every prefilter candidate
@@ -129,6 +157,10 @@ func FetchMemory(ctx context.Context, reader MemoryReader, params MemoryParams, 
 	if err != nil {
 		weakCandidates = nil // a prefilter miss must not sink the exact-key recall
 	}
+	ops, err := reader.OperatorAnnotations(ctx, inc.GroupKey, isDrill, since)
+	if err != nil {
+		ops = nil // an operator-tier miss must not sink the recall
+	}
 
 	m := &MemoryEnrichment{
 		GroupKey:       inc.GroupKey,
@@ -145,8 +177,17 @@ func FetchMemory(ctx context.Context, reader MemoryReader, params MemoryParams, 
 	// Fold same-key priors: the most-recent non-demoted prior takes the strong
 	// slot (carrying the folded key facts); any prior at the demotion threshold
 	// drops to a weak "superseded" entry so a newer finding displaces it (R17).
+	// A prior corrected by an operator wins over marks-based demotion (D4): it
+	// never takes the strong slot regardless of memory_refute_marks, since a
+	// later LLM "confirms" could clear those marks but not the human correction.
 	var demoted []RecalledEntry
 	for _, pf := range view.PriorFindings {
+		if pf.CorrectedByOperator {
+			e := recalledFrom(pf, false, true)
+			e.OperatorSuperseded = true
+			demoted = append(demoted, e)
+			continue
+		}
 		if pf.ContradictionMarks >= demotionThreshold {
 			demoted = append(demoted, recalledFrom(pf, false, true))
 			continue
@@ -174,16 +215,49 @@ func FetchMemory(ctx context.Context, reader MemoryReader, params MemoryParams, 
 		weak = weak[:maxWeakEntries]
 	}
 	m.Weak = weak
+	m.Operator, m.OperatorMore = operatorTier(ops)
 
-	if m.Strong == nil && len(m.Weak) == 0 {
+	if m.Strong == nil && len(m.Weak) == 0 && len(m.Operator) == 0 {
 		return nil // empty view: no memory key in the envelope, prompt unchanged
 	}
-	if m.Strong != nil {
+	switch {
+	case m.Strong != nil:
 		m.Rung = "2"
-	} else {
+	case len(m.Weak) > 0:
 		m.Rung = "3a"
+	default:
+		m.Rung = "operator"
 	}
 	return m
+}
+
+// operatorTier sorts annotations by slot rank (correction < confirmation <
+// observation), newest-first within a rank, and caps the render at
+// maxOperatorEntries with a fold count.
+func operatorTier(ops []store.OperatorAnnotation) ([]OperatorEntry, int) {
+	if len(ops) == 0 {
+		return nil, 0
+	}
+	rank := map[string]int{"correction": 0, "confirmation": 1, "observation": 2}
+	sorted := make([]store.OperatorAnnotation, len(ops))
+	copy(sorted, ops)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		if rank[sorted[i].Kind] != rank[sorted[j].Kind] {
+			return rank[sorted[i].Kind] < rank[sorted[j].Kind]
+		}
+		return sorted[i].CreatedAt.After(sorted[j].CreatedAt)
+	})
+	out := make([]OperatorEntry, 0, maxOperatorEntries)
+	for _, o := range sorted {
+		if len(out) == maxOperatorEntries {
+			break
+		}
+		out = append(out, OperatorEntry{
+			IncidentID: o.IncidentID, Kind: o.Kind, Note: o.Note,
+			Date: o.CreatedAt.UTC().Format("2006-01-02"),
+		})
+	}
+	return out, len(sorted) - len(out)
 }
 
 // validMemoryVerdicts is the closed enum for the soft-required memory_verdict.

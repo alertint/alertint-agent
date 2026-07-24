@@ -212,6 +212,10 @@ func (s *stubMemoryReader) MemoryPrefilter(_ context.Context, _, _ string, _ boo
 	return s.prefilter, nil
 }
 
+func (s *stubMemoryReader) OperatorAnnotations(_ context.Context, _ string, _ bool, _ time.Time) ([]store.OperatorAnnotation, error) {
+	return nil, nil
+}
+
 // Covers AE5: an annotations-only re-fire recalling a 0.70 prior, with the model
 // returning 0.85, persists at the 0.60 metadata-only cap — a recalled prior's
 // confidence is never smuggled into an evidence-free re-fire. The memory section
