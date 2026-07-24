@@ -63,6 +63,9 @@ type Config struct {
 	// to compute the incident-detail memory block from the same memoryView the
 	// triage saw, so the operator's view cannot drift from the prompt (R26).
 	MemoryLookbackDays int
+	// Capture handles the two write-back tools (ADR-0027); nil only in tests —
+	// serve always wires it.
+	Capture *acutetriage.CaptureEngine
 }
 
 // Server is the AlertINT MCP HTTP server. Construct with NewServer; start
@@ -91,6 +94,8 @@ func NewServer(cfg Config, st *store.Store, auditor *audit.Auditor) *Server {
 	ms.AddTool(s.toolVerifyAudit())
 	ms.AddTool(s.toolPrometheusQuery())
 	ms.AddTool(s.toolPrometheusQueryRange())
+	ms.AddTool(s.toolIncidentAnnotate())
+	ms.AddTool(s.toolIncidentCaptureVerdict())
 
 	// Log passthrough tool, registered only when a log source is configured.
 	// Named after the active backend (loki_query_range) so multiple sources can

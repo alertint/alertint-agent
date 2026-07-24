@@ -310,6 +310,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		st, llmClient, auditor, notifier, logger,
 	)
 	_ = apiKey // key is embedded in llmClient via Config.APIKey
+	captureEngine := acutetriage.NewCaptureEngine(skill)
 
 	corCfg := correlator.Config{
 		WindowSeconds:   cfg.Correlator.WindowSeconds,
@@ -343,7 +344,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		return err
 	}
 
-	mcpHTTPSrv, mcpErrCh, err := startMCP(cfg, st, auditor, prom, logSrc, sentryReader, sentryParams, logger)
+	mcpHTTPSrv, mcpErrCh, err := startMCP(cfg, st, auditor, prom, logSrc, sentryReader, sentryParams, captureEngine, logger)
 	if err != nil {
 		return err
 	}
@@ -461,7 +462,7 @@ func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor,
 // startMCP starts the MCP HTTP server when enabled. MCP clients connect by
 // URL (e.g. http://host:9912/mcp) — no subprocess or shared file needed.
 // Returns (nil, nil, nil) when disabled.
-func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom *promclient.Client, logSrc logs.Source, sentryReader acutetriage.SentryReader, sentryParams acutetriage.SentryParams, logger *slog.Logger) (*http.Server, <-chan error, error) {
+func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom *promclient.Client, logSrc logs.Source, sentryReader acutetriage.SentryReader, sentryParams acutetriage.SentryParams, captureEngine *acutetriage.CaptureEngine, logger *slog.Logger) (*http.Server, <-chan error, error) {
 	if !cfg.MCPEnabled() {
 		return nil, nil, nil
 	}
@@ -485,6 +486,7 @@ func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom 
 		SentryParams:            sentryParams,
 		SentryLiveWindowMinutes: cfg.Sentry.Issues.LiveWindowMinutes,
 		MemoryLookbackDays:      cfg.Memory.LookbackDays,
+		Capture:                 captureEngine,
 	}, st, auditor)
 	srv := &http.Server{
 		Addr:    cfg.MCP.Addr,
