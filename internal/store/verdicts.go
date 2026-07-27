@@ -11,6 +11,13 @@ import (
 	"time"
 )
 
+// VerdictSourceHuman marks a verdict captured explicitly over MCP: an
+// operator-confirmed label, worth full label_confidence. Harvested channels
+// (revert reconciliation, silence) get their own source values and lower
+// confidence when they land — a verdict row is never written without
+// provenance, so a harvested label can never masquerade as a human one.
+const VerdictSourceHuman = "human"
+
 // IncidentVerdict is one version of an incident's captured verdict.
 // Append-only; the highest version is operative. The existence of any row IS
 // the derived verdict marker (spec: marker is derived, never stored).
@@ -19,6 +26,8 @@ type IncidentVerdict struct {
 	IncidentID      string
 	Version         int
 	Verdict         string // correction | confirmation
+	Source          string // label provenance, e.g. VerdictSourceHuman
+	LabelConfidence float64
 	ExpectationJSON string
 	WidenedJSON     string // "" when no widened entries
 	CauseCategory   string // free-form, "" when absent
@@ -30,6 +39,8 @@ type IncidentVerdict struct {
 type VerdictCapture struct {
 	IncidentID       string
 	Verdict          string // correction | confirmation
+	Source           string
+	LabelConfidence  float64 // (0, 1]
 	ExpectationJSON  string
 	WidenedJSON      string
 	CauseCategory    string
@@ -43,6 +54,12 @@ type VerdictCapture struct {
 func (s *Store) PersistVerdictCapture(ctx context.Context, c VerdictCapture) (*IncidentVerdict, *IncidentAnnotation, error) {
 	if c.Verdict != "correction" && c.Verdict != "confirmation" {
 		return nil, nil, fmt.Errorf("store: verdict %q not in {correction, confirmation}", c.Verdict)
+	}
+	if c.Source == "" {
+		return nil, nil, errors.New("store: verdict source empty — every verdict carries provenance")
+	}
+	if c.LabelConfidence <= 0 || c.LabelConfidence > 1 {
+		return nil, nil, fmt.Errorf("store: label_confidence %v outside (0, 1]", c.LabelConfidence)
 	}
 	if err := validateAnnotation(c.Verdict, c.AnnotationNote); err != nil {
 		return nil, nil, err
@@ -74,10 +91,10 @@ func (s *Store) PersistVerdictCapture(ctx context.Context, c VerdictCapture) (*I
 	}
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO incident_verdicts
-			(incident_id, version, verdict, expectation_json, widened_json, cause_category, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		c.IncidentID, version, c.Verdict, c.ExpectationJSON, widened, cause,
-		now.Format(time.RFC3339Nano))
+			(incident_id, version, verdict, source, label_confidence, expectation_json, widened_json, cause_category, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.IncidentID, version, c.Verdict, c.Source, c.LabelConfidence,
+		c.ExpectationJSON, widened, cause, now.Format(time.RFC3339Nano))
 	if err != nil {
 		return nil, nil, fmt.Errorf("store: insert verdict: %w", err)
 	}
@@ -97,6 +114,7 @@ func (s *Store) PersistVerdictCapture(ctx context.Context, c VerdictCapture) (*I
 	}
 	return &IncidentVerdict{
 		ID: id, IncidentID: c.IncidentID, Version: version, Verdict: c.Verdict,
+		Source: c.Source, LabelConfidence: c.LabelConfidence,
 		ExpectationJSON: c.ExpectationJSON, WidenedJSON: c.WidenedJSON,
 		CauseCategory: c.CauseCategory, CreatedAt: now,
 	}, ann, nil
@@ -106,13 +124,13 @@ func (s *Store) PersistVerdictCapture(ctx context.Context, c VerdictCapture) (*I
 // incident, or nil, nil when none exists.
 func (s *Store) LatestIncidentVerdict(ctx context.Context, incidentID string) (*IncidentVerdict, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, incident_id, version, verdict, expectation_json,
+		SELECT id, incident_id, version, verdict, source, label_confidence, expectation_json,
 		       COALESCE(widened_json, ''), COALESCE(cause_category, ''), created_at
 		FROM incident_verdicts WHERE incident_id = ?
 		ORDER BY version DESC LIMIT 1`, incidentID)
 	var v IncidentVerdict
 	var created string
-	if err := row.Scan(&v.ID, &v.IncidentID, &v.Version, &v.Verdict,
+	if err := row.Scan(&v.ID, &v.IncidentID, &v.Version, &v.Verdict, &v.Source, &v.LabelConfidence,
 		&v.ExpectationJSON, &v.WidenedJSON, &v.CauseCategory, &created); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil //nolint:nilnil // callers distinguish not-found by nil pointer, not sentinel

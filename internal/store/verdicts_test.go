@@ -15,6 +15,7 @@ func TestPersistVerdictCapture_VersionsAndAtomicity(t *testing.T) {
 
 	v1, a1, err := s.PersistVerdictCapture(ctx, VerdictCapture{
 		IncidentID: id, Verdict: "correction",
+		Source: VerdictSourceHuman, LabelConfidence: 1,
 		ExpectationJSON:  `{"must_not_conclude":["AZ outage"]}`,
 		WidenedJSON:      `[{"kind":"promql","source":"capture","expr":"node_network_up"}]`,
 		CauseCategory:    "network-flap",
@@ -24,7 +25,7 @@ func TestPersistVerdictCapture_VersionsAndAtomicity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("persist: %v", err)
 	}
-	if v1.Version != 1 || v1.Verdict != "correction" {
+	if v1.Version != 1 || v1.Verdict != "correction" || v1.Source != VerdictSourceHuman || v1.LabelConfidence != 1 {
 		t.Fatalf("v1: %+v", v1)
 	}
 	if a1.Kind != "correction" {
@@ -41,6 +42,7 @@ func TestPersistVerdictCapture_VersionsAndAtomicity(t *testing.T) {
 
 	v2, _, err := s.PersistVerdictCapture(ctx, VerdictCapture{
 		IncidentID: id, Verdict: "confirmation",
+		Source: VerdictSourceHuman, LabelConfidence: 1,
 		ExpectationJSON: `{"must_mention":["NIC"]}`, AnnotationNote: "confirmed",
 	})
 	if err != nil {
@@ -57,17 +59,31 @@ func TestPersistVerdictCapture_VersionsAndAtomicity(t *testing.T) {
 	if latest.Version != 2 || latest.Verdict != "confirmation" {
 		t.Fatalf("latest: %+v", latest)
 	}
+	if latest.Source != VerdictSourceHuman || latest.LabelConfidence != 1 {
+		t.Fatalf("latest provenance round-trip: %+v", latest)
+	}
 }
 
 func TestPersistVerdictCapture_Validation(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	id := readyIncident(t, s, "service=api")
-	if _, _, err := s.PersistVerdictCapture(ctx, VerdictCapture{IncidentID: "nope", Verdict: "correction", ExpectationJSON: "{}", AnnotationNote: "x"}); !errors.Is(err, ErrNotFound) {
+	if _, _, err := s.PersistVerdictCapture(ctx, VerdictCapture{IncidentID: "nope", Verdict: "correction", Source: VerdictSourceHuman, LabelConfidence: 1, ExpectationJSON: "{}", AnnotationNote: "x"}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
-	if _, _, err := s.PersistVerdictCapture(ctx, VerdictCapture{IncidentID: id, Verdict: "observation", ExpectationJSON: "{}", AnnotationNote: "x"}); err == nil {
+	if _, _, err := s.PersistVerdictCapture(ctx, VerdictCapture{IncidentID: id, Verdict: "observation", Source: VerdictSourceHuman, LabelConfidence: 1, ExpectationJSON: "{}", AnnotationNote: "x"}); err == nil {
 		t.Fatal("bad verdict accepted")
+	}
+	// Provenance is mandatory: no source, zero-value confidence, and
+	// out-of-range confidence are all rejected before anything is written.
+	if _, _, err := s.PersistVerdictCapture(ctx, VerdictCapture{IncidentID: id, Verdict: "correction", LabelConfidence: 1, ExpectationJSON: "{}", AnnotationNote: "x"}); err == nil {
+		t.Fatal("empty source accepted")
+	}
+	if _, _, err := s.PersistVerdictCapture(ctx, VerdictCapture{IncidentID: id, Verdict: "correction", Source: VerdictSourceHuman, ExpectationJSON: "{}", AnnotationNote: "x"}); err == nil {
+		t.Fatal("zero label_confidence accepted")
+	}
+	if _, _, err := s.PersistVerdictCapture(ctx, VerdictCapture{IncidentID: id, Verdict: "correction", Source: VerdictSourceHuman, LabelConfidence: 1.5, ExpectationJSON: "{}", AnnotationNote: "x"}); err == nil {
+		t.Fatal("label_confidence > 1 accepted")
 	}
 	// No verdict row may exist after any failed persist (atomicity).
 	if v, _ := s.LatestIncidentVerdict(ctx, id); v != nil {
@@ -82,7 +98,7 @@ func TestLatestVerdictKinds(t *testing.T) {
 	b := readyIncident(t, s, "service=b")
 	mustCapture := func(inc, verdict string) {
 		t.Helper()
-		if _, _, err := s.PersistVerdictCapture(ctx, VerdictCapture{IncidentID: inc, Verdict: verdict, ExpectationJSON: "{}", AnnotationNote: "n"}); err != nil {
+		if _, _, err := s.PersistVerdictCapture(ctx, VerdictCapture{IncidentID: inc, Verdict: verdict, Source: VerdictSourceHuman, LabelConfidence: 1, ExpectationJSON: "{}", AnnotationNote: "n"}); err != nil {
 			t.Fatal(err)
 		}
 	}

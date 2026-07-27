@@ -210,6 +210,7 @@ func (e *CaptureEngine) persistCapture(ctx context.Context, req CaptureRequest, 
 	}
 	v, _, err := e.sk.st.PersistVerdictCapture(ctx, store.VerdictCapture{
 		IncidentID: req.IncidentID, Verdict: req.Verdict,
+		Source: store.VerdictSourceHuman, LabelConfidence: 1,
 		ExpectationJSON: expJSON, WidenedJSON: widenedJSON,
 		CauseCategory: req.CauseCategory, AnnotationNote: note,
 		DemoteMarksFloor: demote,

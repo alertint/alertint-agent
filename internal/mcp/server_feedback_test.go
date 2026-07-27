@@ -171,6 +171,7 @@ func TestGetIncident_ExposesAnnotationsAndVerdict(t *testing.T) {
 	}
 	if _, _, err := st.PersistVerdictCapture(ctx, store.VerdictCapture{
 		IncidentID: "inc1", Verdict: "correction",
+		Source: store.VerdictSourceHuman, LabelConfidence: 1,
 		ExpectationJSON: `{"must_not_conclude":["x"]}`, AnnotationNote: "n",
 		CauseCategory: "network-flap",
 	}); err != nil {
@@ -222,6 +223,7 @@ func TestListIncidents_VerdictKind(t *testing.T) {
 	seedAnalyzedPrior(t, st, "inc2", "service=other", "root cause", 0.7, time.Now(), false)
 	if _, _, err := st.PersistVerdictCapture(ctx, store.VerdictCapture{
 		IncidentID: "inc1", Verdict: "correction",
+		Source: store.VerdictSourceHuman, LabelConfidence: 1,
 		ExpectationJSON: `{"must_not_conclude":["x"]}`, AnnotationNote: "n",
 	}); err != nil {
 		t.Fatal(err)
