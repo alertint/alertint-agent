@@ -256,6 +256,48 @@ func (m *Multi) OnOccurrenceAttached(ctx context.Context, ev RecurrenceEvent) er
 	return first
 }
 
+// AnnotationEvent is an operator write-back (annotate or verdict capture)
+// fanned out to sinks: a Slack thread reply on the incident's existing card
+// and a stdout JSON line. VerdictVersion is >0 when the event came from
+// alertint_incident_capture_verdict.
+type AnnotationEvent struct {
+	IncidentID     string `json:"incident_id"`
+	GroupKey       string `json:"group_key"`
+	Kind           string `json:"kind"` // correction | observation | confirmation
+	Note           string `json:"note"`
+	VerdictVersion int    `json:"verdict_version,omitempty"`
+	Drill          bool   `json:"drill,omitempty"`
+}
+
+// AnnotationSink is an optional capability: a Notifier that also renders an
+// operator annotation event. Sinks that don't implement it are skipped.
+type AnnotationSink interface {
+	OnAnnotation(ctx context.Context, ev AnnotationEvent) error
+}
+
+// OnAnnotation fans an annotation event out to every contained notifier that
+// implements AnnotationSink, returning the first sink error.
+func (m *Multi) OnAnnotation(ctx context.Context, ev AnnotationEvent) error {
+	var first error
+	for _, n := range m.notifiers {
+		s, ok := n.(AnnotationSink)
+		if !ok {
+			continue
+		}
+		if err := s.OnAnnotation(ctx, ev); err != nil {
+			m.logger.Warn("notify annotation sink failed",
+				slog.String("sink", n.Name()),
+				slog.String("incident", ev.IncidentID),
+				slog.String("err", err.Error()),
+			)
+			if first == nil {
+				first = err
+			}
+		}
+	}
+	return first
+}
+
 // statusOrOngoing defaults an empty Finding status to "ongoing" so the outcome
 // line always carries a concrete status token.
 func statusOrOngoing(s string) string {

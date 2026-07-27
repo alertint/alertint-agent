@@ -373,3 +373,60 @@ func TestRenderVerificationResultsNilRound(t *testing.T) {
 		t.Fatalf("nil round must render nothing, got %q", b.String())
 	}
 }
+
+func TestSnapshotExecutor_ServesFrozenAndMisses(t *testing.T) {
+	frozen := []VerificationQuery{
+		{Kind: "up_ratio", Source: "floor", Expr: `{namespace="prod"}`, Outcome: OutcomeFetched, Result: `up 9/10 in {namespace="prod"}`},
+		{Kind: "incidents_in_window", Source: "floor", Params: map[string]any{"window_minutes": float64(60)}, Outcome: OutcomeFetched, Result: "2 other incidents"},
+		{Kind: "promql", Source: "capture", Expr: "node_network_up", Outcome: OutcomeFetched, Result: "node_network_up 0"},
+	}
+	exec := newSnapshotExecutor(frozen)
+
+	hit := VerificationQuery{Kind: "promql", Source: "model", Expr: "node_network_up"}
+	exec.execute(context.Background(), &hit)
+	if hit.Outcome != OutcomeFetched || hit.Result != "node_network_up 0" {
+		t.Fatalf("frozen result not served: %+v", hit)
+	}
+
+	miss := VerificationQuery{Kind: "promql", Source: "model", Expr: "rate(other[5m])"}
+	exec.execute(context.Background(), &miss)
+	if miss.Outcome != OutcomeEmpty || miss.Result != "no data (replay)" {
+		t.Fatalf("miss shape wrong: %+v", miss)
+	}
+
+	// incidents_in_window matches on window_minutes regardless of number encoding
+	win := VerificationQuery{Kind: "incidents_in_window", Source: "floor", Params: map[string]any{"window_minutes": 60}}
+	exec.execute(context.Background(), &win)
+	if win.Outcome != OutcomeFetched {
+		t.Fatalf("window match failed: %+v", win)
+	}
+
+	if got := exec.fidelity(); got != "partial (1/3 verification queries unmatched)" {
+		t.Fatalf("fidelity: %q", got)
+	}
+}
+
+// countingExecutor counts execute calls, useful for asserting runVerificationWith
+// dispatches every query (floor + model) through the executor exactly once.
+type countingExecutor struct{ calls int }
+
+func (e *countingExecutor) execute(_ context.Context, q *VerificationQuery) {
+	e.calls++
+	q.Outcome = OutcomeFetched
+	q.Result = "ok"
+}
+
+func TestRunVerificationWith_UsesExecutorForEveryQuery(t *testing.T) {
+	alerts := []store.Alert{alertWithLabels(map[string]string{"namespace": "prod"})}
+	exec := &countingExecutor{}
+	params := VerificationParams{MaxQueries: 4, QueryTimeoutSeconds: 5, MaxSeries: 100}
+	modelQ := []VerificationQuery{{Kind: kindPromQL, Source: "model", Expr: "up"}}
+
+	round := runVerificationWith(context.Background(), exec, params, alerts, DraftRef{}, modelQ, time.Now())
+	if exec.calls != 3 { // 2 floor queries + 1 model query
+		t.Fatalf("executor calls = %d, want 3", exec.calls)
+	}
+	if len(round.Queries) != 3 {
+		t.Fatalf("round queries = %d, want 3", len(round.Queries))
+	}
+}

@@ -15,7 +15,9 @@ expectations.
 ## Design principles
 
 - **Read-only by design** — **AlertINT** observes and reports. It never
-  touches your infrastructure, so teams can adopt it without risk.
+  touches your infrastructure, so teams can adopt it without risk. The one
+  write an agent can make is feedback into AlertINT's own incident record —
+  additive, audit-chained, local.
 - **Self-hosted and local** — your alert data and incident context stay on
   your machine.
 - **Fair Source** — the runtime and all baseline and community packs are

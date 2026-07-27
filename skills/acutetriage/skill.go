@@ -169,6 +169,15 @@ type pipelineParams struct {
 	// Zero on an initial triage.
 	recurrenceEpisodes int
 	recurrenceLastSeen time.Time
+
+	// replay, when non-nil, turns this run into a hermetic grading replay
+	// (capture D8 stage 2): enrichment comes from the frozen envelope,
+	// verification runs against the snapshot executor, and every side effect —
+	// role writes, memory bookkeeping, the resolved-status probe — is skipped.
+	// The auditor and notifier are already nil on the replaying Skill copy
+	// (replayIncidentWith strips them), so pipeline/analysis audit and notify
+	// guards need no extra branches.
+	replay *replayRun
 }
 
 // Run executes the full triage pipeline for a newly-ready incident.
@@ -273,7 +282,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	// Produce the analysis: from the matched rule (short-circuit) or from the LLM
 	// with the pack-selected system prompt, the span-anchored enrichments, and
 	// (on a re-judgment) the recurrence context prepended.
-	ar, err := s.analysis(ctx, inc, alerts, decision, pack, packJSON, p.spanStart, p.recurrence)
+	ar, err := s.analysis(ctx, inc, alerts, decision, pack, packJSON, p.spanStart, p.recurrence, p.replay)
 	if err != nil {
 		return err
 	}
@@ -293,7 +302,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	finalRaw := ar.raw
 	var ver *VerificationEnrichment
 	if s.cfg.Verification.Enabled && !ar.shortCircuit {
-		finalRaw, resp, ver = s.verifyAndRejudge(ctx, inc, alerts, ar, resp)
+		finalRaw, resp, ver = s.verifyAndRejudge(ctx, inc, alerts, ar, resp, p)
 	}
 	// applyEvidenceCap sees the verification enrichment; live verification PromQL
 	// evidence lifts the annotations-only basis just like live metrics/logs do
@@ -320,52 +329,47 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		return fmt.Errorf("acutetriage: save output: %w", err)
 	}
 
-	// Update per-alert roles.
-	for _, ao := range resp.Alerts {
-		if err := s.st.SetAlertRole(ctx, inc.ID, ao.AlertID, ao.RoleInIncident); err != nil {
-			s.logger.Warn("acutetriage: set alert role failed",
-				"incident_id", inc.ID,
-				"alert_id", ao.AlertID,
-				"role", ao.RoleInIncident,
-				"err", err,
-			)
+	// Update per-alert roles. Skipped during a hermetic replay (p.replay != nil):
+	// grading must persist nothing beyond the capture already written.
+	if p.replay == nil {
+		for _, ao := range resp.Alerts {
+			if err := s.st.SetAlertRole(ctx, inc.ID, ao.AlertID, ao.RoleInIncident); err != nil {
+				s.logger.Warn("acutetriage: set alert role failed",
+					"incident_id", inc.ID,
+					"alert_id", ao.AlertID,
+					"role", ao.RoleInIncident,
+					"err", err,
+				)
+			}
 		}
-	}
 
-	// Bounded itemization: the prompts ask the model to itemize at most
-	// maxItemizedAlerts members (Task 2's templates); every member it omits
-	// gets the neutral default role deterministically, so a storm-sized
-	// incident still exposes a role on every alert over MCP. Skipped on the
-	// short-circuit path — a rule finding carries no model itemization and
-	// its members keep NULL roles, as before this change.
-	if !ar.shortCircuit {
-		s.defaultUnitemizedRoles(ctx, inc.ID, alerts, resp.Alerts)
+		// Bounded itemization: the prompts ask the model to itemize at most
+		// maxItemizedAlerts members (Task 2's templates); every member it omits
+		// gets the neutral default role deterministically, so a storm-sized
+		// incident still exposes a role on every alert over MCP. Skipped on the
+		// short-circuit path — a rule finding carries no model itemization and
+		// its members keep NULL roles, as before this change.
+		if !ar.shortCircuit {
+			s.defaultUnitemizedRoles(ctx, inc.ID, alerts, resp.Alerts)
+		}
 	}
 
 	// Memory bookkeeping (M2): maintain the contradiction-decay marks from the
 	// model's verdict, reset on a replacement, and audit the recall. Best-effort —
 	// a bookkeeping failure never fails a triage that already persisted its finding.
-	s.applyMemoryBookkeeping(ctx, inc, ar.memory, resp.MemoryVerdict, p.rejudge)
-
-	// Check if all alerts are resolved to determine the finding's status label.
-	incidentStatus := "ongoing"
-	if incAlerts, err := s.st.GetIncidentAlerts(ctx, inc.ID); err == nil {
-		allResolved := len(incAlerts) > 0
-		for _, a := range incAlerts {
-			if a.Status != "resolved" {
-				allResolved = false
-				break
-			}
-		}
-		if allResolved {
-			incidentStatus = "resolved"
-			s.logger.Info("incident resolved", "incident", inc.ID, "alerts", len(incAlerts))
-		}
+	// Skipped during replay: grading must move no marks on stale/replayed grounds.
+	if p.replay == nil {
+		s.applyMemoryBookkeeping(ctx, inc, ar.memory, resp.MemoryVerdict, p.rejudge)
 	}
 
 	// Notify. On a re-judgment the finding flows the same gate — the Slack
 	// notifier threads the reply on the existing card, or posts a new one if none.
+	// nil during replay (replayIncidentWith strips it), so this whole block —
+	// including the resolved-status probe, which exists only to label the
+	// notification — is a no-op there.
 	if s.notifier != nil {
+		incidentStatus := s.resolvedStatusLabel(ctx, inc.ID)
+
 		f := notify.Finding{
 			IncidentID:          inc.ID,
 			GroupKey:            inc.GroupKey,
@@ -428,6 +432,23 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		"dur", time.Since(start),
 	)
 	return nil
+}
+
+// resolvedStatusLabel reports "resolved" when every member alert of
+// incidentID is resolved, "ongoing" otherwise (including on a load error —
+// the notification still fires, just without the resolved label).
+func (s *Skill) resolvedStatusLabel(ctx context.Context, incidentID string) string {
+	incAlerts, err := s.st.GetIncidentAlerts(ctx, incidentID)
+	if err != nil || len(incAlerts) == 0 {
+		return "ongoing"
+	}
+	for _, a := range incAlerts {
+		if a.Status != "resolved" {
+			return "ongoing"
+		}
+	}
+	s.logger.Info("incident resolved", "incident", incidentID, "alerts", len(incAlerts))
+	return "resolved"
 }
 
 // auditEnrichmentDigests appends one hash-chained digest row per attempted
@@ -503,7 +524,7 @@ type analysisResult struct {
 // metric and log-enrichment snapshots (nil on the short-circuit path) so the
 // caller can persist exactly what the model saw and judge the evidence basis
 // for the deterministic confidence cap.
-func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store.Alert, decision rules.Decision, pack EvidencePack, packJSON []byte, spanStart time.Time, recurrence string) (analysisResult, error) {
+func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store.Alert, decision rules.Decision, pack EvidencePack, packJSON []byte, spanStart time.Time, recurrence string, replay *replayRun) (analysisResult, error) {
 	if decision.ShortCircuit {
 		raw, err := shortCircuitResponse(decision, alerts)
 		if err != nil {
@@ -524,32 +545,51 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 	// Prometheus is a concrete *promclient.Client (nil when disabled); promQuerier
 	// yields a TRUE nil interface so FetchMetrics's nil check is not defeated by a
 	// typed-nil. The verification round builds its querier the same way.
-	metrics := FetchMetrics(ctx, s.promQuerier(), s.cfg.MetricParams, alerts, spanStart, inc.ID, s.logger)
-	// Best-effort log enrichment: never blocks or fails triage. end=now so a
-	// still-firing incident captures the freshest lines around analysis time.
-	enrichment := FetchLogs(ctx, s.cfg.LogSource, s.cfg.LogParams, alerts, spanStart, time.Now().UTC(), inc.ID, s.logger)
-	// Change enrichment reads local SQLite — reliable mid-incident, no timeout.
-	changes := FetchChanges(ctx, s.st, s.cfg.ChangeParams, alerts, spanStart, time.Now().UTC(), inc.ID, s.logger)
-	// Sentry Error source: a bounded 1+K query-at-triage, best-effort, never blocks.
-	sentry := FetchSentry(ctx, s.cfg.Sentry, s.cfg.SentryParams, alerts, spanStart, time.Now().UTC(), inc.ID, s.logger)
-	// Zero-LLM cross-source verdict, computed downstream of the rule engine at the
-	// triage seam (KTD5/R3): sets sentry.Reconciliation in place on a conclusive
-	// look, inert (no-op) when sentry is nil or the query was inconclusive.
-	reconcile(sentry)
-	// Recall prior findings for this key (rung-2 exact + rung-3a prefilter). A
-	// local store read, best-effort: a miss/err yields nil and the prompt is
-	// byte-identical to a non-memory triage. Never passed to hasLiveEvidence or
-	// the confidence cap — memory is context, never live evidence (R18).
-	memory := FetchMemory(ctx, s.cfg.Memory, s.cfg.MemoryParams, inc, isDrill(alerts), time.Now().UTC())
-	// Disposition-lite: when a recalled finding carries corroborating Sentry issue
-	// ids, one bounded status read renders the regression/known-tolerated
-	// transition. Best-effort, fail-safe — never blocks the recall.
-	applyDisposition(ctx, s.cfg.Sentry, s.cfg.SentryParams, memory)
-	// Shadow classifier (M3): judge the top rung-3a weak candidate. Runs before the
-	// prompt is rendered so an `on`-mode match both tags what the model sees and is
-	// captured by persist-as-rendered; in `shadow` mode it only audits and leaves
-	// the render byte-identical. A no-op when disabled or there are no candidates.
-	s.maybeClassify(ctx, inc, memory)
+	var (
+		metrics    *MetricEnrichment
+		enrichment *LogEnrichment
+		changes    *ChangeEnrichment
+		sentry     *SentryEnrichment
+		memory     *MemoryEnrichment
+	)
+	if replay != nil {
+		// Frozen inputs (persist-as-rendered envelope): no live fetch, no
+		// reconcile/disposition/classifier — the sections replay exactly as the
+		// original triage saw them; memory replays as-of-incident-time, so a
+		// just-captured correction never grades its own capture green.
+		metrics = replay.frozen.Metrics
+		enrichment = replay.frozen.Logs
+		changes = replay.frozen.Changes
+		sentry = replay.frozen.Sentry
+		memory = replay.frozen.Memory
+	} else {
+		metrics = FetchMetrics(ctx, s.promQuerier(), s.cfg.MetricParams, alerts, spanStart, inc.ID, s.logger)
+		// Best-effort log enrichment: never blocks or fails triage. end=now so a
+		// still-firing incident captures the freshest lines around analysis time.
+		enrichment = FetchLogs(ctx, s.cfg.LogSource, s.cfg.LogParams, alerts, spanStart, time.Now().UTC(), inc.ID, s.logger)
+		// Change enrichment reads local SQLite — reliable mid-incident, no timeout.
+		changes = FetchChanges(ctx, s.st, s.cfg.ChangeParams, alerts, spanStart, time.Now().UTC(), inc.ID, s.logger)
+		// Sentry Error source: a bounded 1+K query-at-triage, best-effort, never blocks.
+		sentry = FetchSentry(ctx, s.cfg.Sentry, s.cfg.SentryParams, alerts, spanStart, time.Now().UTC(), inc.ID, s.logger)
+		// Zero-LLM cross-source verdict, computed downstream of the rule engine at the
+		// triage seam (KTD5/R3): sets sentry.Reconciliation in place on a conclusive
+		// look, inert (no-op) when sentry is nil or the query was inconclusive.
+		reconcile(sentry)
+		// Recall prior findings for this key (rung-2 exact + rung-3a prefilter). A
+		// local store read, best-effort: a miss/err yields nil and the prompt is
+		// byte-identical to a non-memory triage. Never passed to hasLiveEvidence or
+		// the confidence cap — memory is context, never live evidence (R18).
+		memory = FetchMemory(ctx, s.cfg.Memory, s.cfg.MemoryParams, inc, isDrill(alerts), time.Now().UTC())
+		// Disposition-lite: when a recalled finding carries corroborating Sentry issue
+		// ids, one bounded status read renders the regression/known-tolerated
+		// transition. Best-effort, fail-safe — never blocks the recall.
+		applyDisposition(ctx, s.cfg.Sentry, s.cfg.SentryParams, memory)
+		// Shadow classifier (M3): judge the top rung-3a weak candidate. Runs before the
+		// prompt is rendered so an `on`-mode match both tags what the model sees and is
+		// captured by persist-as-rendered; in `shadow` mode it only audits and leaves
+		// the render byte-identical. A no-op when disabled or there are no candidates.
+		s.maybeClassify(ctx, inc, memory)
+	}
 	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment, changes, sentry, memory, s.cfg.Verification)
 	// On a re-judgment, prepend the deterministic recurrence context so the model
 	// judges the recurrence with its history rather than as a first-time event.
@@ -736,7 +776,7 @@ func (s *Skill) promQuerier() metricQuerier {
 // with its memory verdict cleared, so a lost re-judge never fails a triage the
 // draft could otherwise ship (the never-fails invariant) and never moves memory
 // marks on stale grounds (R16). resp is the draft (already clamped).
-func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts []store.Alert, ar analysisResult, resp llmResponse) (json.RawMessage, llmResponse, *VerificationEnrichment) {
+func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts []store.Alert, ar analysisResult, resp llmResponse, p pipelineParams) (json.RawMessage, llmResponse, *VerificationEnrichment) {
 	draft := DraftRef{RootCause: resp.OverallIssue, Confidence: resp.Confidence}
 	modelQ := parseVerificationPlan(ar.raw, s.cfg.Verification.MaxQueries, s.logger, inc.ID)
 	s.auditVerificationPlanned(ctx, inc, alerts, modelQ)
@@ -744,7 +784,14 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 	// The runner shares the SAME true-nil-safe querier the analysis fetch used, and
 	// the store as the incidents_in_window state reader. It never errors: a query's
 	// own failure lands in its Outcome/Result, never aborting the round (R2).
-	round := runVerification(ctx, s.promQuerier(), s.st, s.cfg.Verification, inc, alerts, draft, modelQ, time.Now().UTC(), s.logger)
+	// During replay, queries are served from the frozen snapshot instead — no
+	// live data-source call is ever made.
+	var round *VerificationRound
+	if p.replay != nil {
+		round = runVerificationWith(ctx, p.replay.exec, s.cfg.Verification, alerts, draft, modelQ, time.Now().UTC())
+	} else {
+		round = runVerification(ctx, s.promQuerier(), s.st, s.cfg.Verification, inc, alerts, draft, modelQ, time.Now().UTC(), s.logger)
+	}
 
 	// Call 2: the byte-identical call-1 prefix + the draft + the computed round +
 	// the (moved) memory-verdict request. On any failure the draft stands.

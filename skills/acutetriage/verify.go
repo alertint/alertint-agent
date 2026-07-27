@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,6 +40,10 @@ const (
 	kindPromQL            = "promql"
 	kindUpRatio           = "up_ratio"
 	kindIncidentsInWindow = "incidents_in_window"
+	// sourceCapture marks a query widened live-once at verdict capture (D10) and
+	// frozen into a verdict's widened_json — distinct from "model" (a live
+	// triage's own proposed query) and "floor" (always-run).
+	sourceCapture = "capture"
 )
 
 // VerificationQuery is one planned/executed query, persisted verbatim (R8/R10).
@@ -201,11 +206,34 @@ type verifyStateReader interface {
 // Params carries no valid window_minutes (R4 default).
 const defaultWindowMinutes = 60
 
+// queryExecutor abstracts "run one verification query, fill Outcome/Result in
+// place". liveExecutor is production; snapshotExecutor is the hermetic replay
+// seam (ADR-0021 pipeline, frozen data).
+type queryExecutor interface {
+	execute(ctx context.Context, q *VerificationQuery)
+}
+
+// liveExecutor runs queries against the real backends — the pre-existing
+// runOneQuery behavior, unchanged.
+type liveExecutor struct {
+	prom      metricQuerier
+	state     verifyStateReader
+	inc       store.Incident
+	now       time.Time
+	maxSeries int
+	logger    *slog.Logger
+}
+
+func (e *liveExecutor) execute(ctx context.Context, q *VerificationQuery) {
+	runOneQuery(ctx, e.prom, e.state, q, e.inc, e.now, e.maxSeries, e.logger)
+}
+
 // runVerification executes the floor queries (always: peer up-ratio +
-// cross-incident scan) plus every model-proposed query, each under its own
-// slice of the shared query-phase budget, filling Outcome and Result on every
-// query (R2/R3). Never returns an error — a query's own failure lands in its
-// Outcome/Result, it never aborts the round or the ones after it.
+// cross-incident scan) plus every model-proposed query against the live
+// backends, each under its own slice of the shared query-phase budget,
+// filling Outcome and Result on every query (R2/R3). Never returns an error —
+// a query's own failure lands in its Outcome/Result, it never aborts the
+// round or the ones after it.
 //
 // The pipeline (verifyAndRejudge) passes the real skill logger; the runner tests
 // pass nil (defaulted to slog.Default below).
@@ -216,7 +244,18 @@ func runVerification(ctx context.Context, prom metricQuerier, state verifyStateR
 	if logger == nil {
 		logger = slog.Default()
 	}
+	exec := &liveExecutor{prom: prom, state: state, inc: inc, now: now, maxSeries: params.MaxSeries, logger: logger}
+	return runVerificationWith(ctx, exec, params, alerts, draft, modelQueries, now)
+}
 
+// runVerificationWith is runVerification's executor-parameterized core: every
+// floor + model query is dispatched through exec instead of always hitting
+// the live backends, so replay can serve queries from a frozen snapshot
+// (Task 11) while production runs unchanged through runVerification's
+// liveExecutor wrapper.
+func runVerificationWith(ctx context.Context, exec queryExecutor, params VerificationParams,
+	alerts []store.Alert, draft DraftRef, modelQueries []VerificationQuery, now time.Time,
+) *VerificationRound {
 	queries := make([]VerificationQuery, 0, 2+len(modelQueries))
 	queries = append(queries, floorPlan(alerts)...)
 	queries = append(queries, modelQueries...)
@@ -239,7 +278,7 @@ func runVerification(ctx context.Context, prom metricQuerier, state verifyStateR
 
 	for i := range queries {
 		qCtx, cancel := context.WithTimeout(queryPhaseCtx, perQuery)
-		runOneQuery(qCtx, prom, state, &queries[i], inc, now, params.MaxSeries, logger)
+		exec.execute(qCtx, &queries[i])
 		cancel()
 	}
 
@@ -404,13 +443,20 @@ func renderUnavailable(reason string) string {
 	return capText(flattenRecalled(fmt.Sprintf("unavailable (%s)", reason)), 400)
 }
 
-// windowMinutesFromParams reads a query's "window_minutes" param — a float64,
-// since it round-trips through the model's JSON — defaulting to
-// defaultWindowMinutes when absent, the wrong type, or non-positive (R4).
+// windowMinutesFromParams reads a query's "window_minutes" param — normally a
+// float64 since it round-trips through the model's JSON, but also accepted as
+// a plain int (a live Go-constructed query, e.g. the snapshot-executor match
+// in replay, never passes through JSON) — defaulting to defaultWindowMinutes
+// when absent, the wrong type, or non-positive (R4).
 func windowMinutesFromParams(params map[string]any) int {
-	if v, ok := params["window_minutes"]; ok {
-		if f, ok := v.(float64); ok && f > 0 {
-			return int(f)
+	switch v := params["window_minutes"].(type) {
+	case float64:
+		if v > 0 {
+			return int(v)
+		}
+	case int:
+		if v > 0 {
+			return v
 		}
 	}
 	return defaultWindowMinutes
@@ -558,4 +604,56 @@ func renderVerificationResults(b *strings.Builder, r *VerificationRound) {
 		}
 		fmt.Fprintf(b, "\n  %s", q.Result)
 	}
+}
+
+// snapshotExecutor serves verification queries from the frozen snapshot:
+// original round results + widened entries (source "capture"). Floor queries
+// regenerate byte-identical (floorPlan is deterministic) and hit; model
+// queries exact-match; a miss returns "no data (replay)" — OutcomeEmpty, the
+// same "asked, nothing there" class the 0.8.3 empty-result calibration
+// already teaches the model to weigh. Not safe for concurrent use (the round
+// loop is sequential).
+type snapshotExecutor struct {
+	byKey   map[string]VerificationQuery
+	matched int
+	missed  int
+}
+
+func newSnapshotExecutor(frozen []VerificationQuery) *snapshotExecutor {
+	m := make(map[string]VerificationQuery, len(frozen))
+	for _, q := range frozen {
+		m[snapshotKey(q)] = q
+	}
+	return &snapshotExecutor{byKey: m}
+}
+
+// snapshotKey normalizes a query to its match identity: kind+expr for
+// promql/up_ratio, kind+window for incidents_in_window (numbers arrive as
+// float64 from frozen JSON and as int from live params — normalize both).
+func snapshotKey(q VerificationQuery) string {
+	if q.Kind == kindIncidentsInWindow {
+		return q.Kind + "\x1f" + strconv.Itoa(windowMinutesFromParams(q.Params))
+	}
+	return q.Kind + "\x1f" + q.Expr
+}
+
+func (e *snapshotExecutor) execute(_ context.Context, q *VerificationQuery) {
+	if f, ok := e.byKey[snapshotKey(*q)]; ok {
+		q.Outcome = f.Outcome
+		q.Result = f.Result
+		e.matched++
+		return
+	}
+	q.Outcome = OutcomeEmpty
+	q.Result = "no data (replay)"
+	e.missed++
+}
+
+// fidelity is the replay_fidelity report: full when every executed query was
+// served from the snapshot, else partial with the unmatched count.
+func (e *snapshotExecutor) fidelity() string {
+	if e.missed == 0 {
+		return "full"
+	}
+	return fmt.Sprintf("partial (%d/%d verification queries unmatched)", e.missed, e.missed+e.matched)
 }

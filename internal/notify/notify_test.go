@@ -47,6 +47,43 @@ func TestMulti_OnOccurrenceAttachedFansOutOnlyToCapableSinks(t *testing.T) {
 	// A plain sink is skipped without panicking — reaching here proves it.
 }
 
+// annCapableSink is a Notifier that also implements notify.AnnotationSink.
+type annCapableSink struct {
+	fakeNotifier
+
+	got []notify.AnnotationEvent
+	err error
+}
+
+func (s *annCapableSink) OnAnnotation(_ context.Context, ev notify.AnnotationEvent) error {
+	s.got = append(s.got, ev)
+	return s.err
+}
+
+func TestMulti_OnAnnotationFansOutOnlyToCapableSinks(t *testing.T) {
+	ann := &annCapableSink{fakeNotifier: fakeNotifier{name: "ann"}}
+	plain := &fakeNotifier{name: "plain"} // no OnAnnotation
+	m := notify.NewMulti(slog.Default(), ann, plain)
+
+	ev := notify.AnnotationEvent{IncidentID: "i1", GroupKey: "service=api", Kind: "correction", Note: "not AZ outage"}
+	if err := m.OnAnnotation(context.Background(), ev); err != nil {
+		t.Fatalf("OnAnnotation: %v", err)
+	}
+	if len(ann.got) != 1 || ann.got[0].IncidentID != "i1" {
+		t.Errorf("annotation-capable sink saw %+v, want one event for i1", ann.got)
+	}
+	// A plain sink is skipped without panicking — reaching here proves it.
+}
+
+func TestMulti_OnAnnotationReturnsFirstSinkError(t *testing.T) {
+	failing := &annCapableSink{fakeNotifier: fakeNotifier{name: "failing"}, err: errors.New("boom")}
+	m := notify.NewMulti(slog.Default(), failing)
+
+	if err := m.OnAnnotation(context.Background(), notify.AnnotationEvent{IncidentID: "i1"}); err == nil {
+		t.Fatal("want the sink's error propagated")
+	}
+}
+
 func sampleFinding() notify.Finding {
 	return notify.Finding{
 		IncidentID:          "inc-001",

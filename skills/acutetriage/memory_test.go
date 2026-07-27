@@ -4,6 +4,7 @@ package acutetriage
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -20,6 +21,8 @@ type fakeMemoryReader struct {
 	prefilter []store.PriorFinding
 	viewErr   error
 	prefErr   error
+	ops       []store.OperatorAnnotation
+	opsErr    error
 }
 
 func (f *fakeMemoryReader) MemoryView(_ context.Context, groupKey, _ string, _ bool, _ time.Time) (*store.MemoryView, error) {
@@ -34,6 +37,10 @@ func (f *fakeMemoryReader) MemoryView(_ context.Context, groupKey, _ string, _ b
 
 func (f *fakeMemoryReader) MemoryPrefilter(_ context.Context, _, _ string, _ bool, _ time.Time, _ int) ([]store.PriorFinding, error) {
 	return f.prefilter, f.prefErr
+}
+
+func (f *fakeMemoryReader) OperatorAnnotations(_ context.Context, _ string, _ bool, _ time.Time) ([]store.OperatorAnnotation, error) {
+	return f.ops, f.opsErr
 }
 
 func now2026() time.Time { return time.Date(2026, 7, 9, 2, 5, 0, 0, time.UTC) }
@@ -174,6 +181,61 @@ func TestRenderMemory_WeakEntriesBoundedWithMore(t *testing.T) {
 	}
 }
 
+func TestRenderMemory_OperatorTierAboveStrong(t *testing.T) {
+	m := &MemoryEnrichment{
+		GroupKey: "k", Rung: "2", PriorCount: 1, LatestAgo: "1d ago",
+		Operator: []OperatorEntry{
+			{IncidentID: "i1", Kind: "correction", Note: "corrected: cause NodeNetworkInterfaceFlapping; not AZ outage", Date: "2026-07-08"},
+			{IncidentID: "i2", Kind: "observation", Note: "line1\nline2", Date: "2026-07-07"},
+		},
+		OperatorMore: 1,
+		Strong:       &RecalledEntry{IncidentID: "p1", Confidence: 0.9, RootCause: "AZ outage", AnalyzedAt: time.Date(2026, 7, 8, 0, 0, 0, 0, time.UTC)},
+	}
+	var b strings.Builder
+	renderMemory(&b, m, false)
+	out := b.String()
+	for _, want := range []string{
+		"[operator correction, 2026-07-08] corrected: cause NodeNetworkInterfaceFlapping; not AZ outage",
+		"[operator note, 2026-07-07] line1 line2", // flattened
+		"+1 more operator note(s)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q\n---\n%s", want, out)
+		}
+	}
+	// Tier order: operator entries render before the strong prior.
+	if strings.Index(out, "[operator correction") > strings.Index(out, "prior hypothesis") {
+		t.Fatal("operator tier rendered below LLM priors")
+	}
+}
+
+func TestRenderMemory_OperatorSupersededTag(t *testing.T) {
+	m := &MemoryEnrichment{GroupKey: "k", Rung: "3a", PriorCount: 1, LatestAgo: "1d ago",
+		Weak: []RecalledEntry{{IncidentID: "p1", RootCause: "AZ outage", OperatorSuperseded: true, AnalyzedAt: time.Now()}}}
+	var b strings.Builder
+	renderMemory(&b, m, false)
+	if !strings.Contains(b.String(), "[superseded by operator correction]") {
+		t.Fatalf("missing operator-superseded tag:\n%s", b.String())
+	}
+}
+
+func TestRenderMemory_OperatorOnlyHeadline(t *testing.T) {
+	m := &MemoryEnrichment{GroupKey: "k", Rung: "operator",
+		Operator: []OperatorEntry{{IncidentID: "i1", Kind: "confirmation", Note: "confirmed", Date: "2026-07-08"}}}
+	var b strings.Builder
+	renderMemory(&b, m, false)
+	out := b.String()
+	if !strings.Contains(out, "Operator notes for this key") {
+		t.Fatalf("headline:\n%s", out)
+	}
+	if !strings.Contains(out, "[operator confirmation, 2026-07-08]") {
+		t.Fatalf("entry:\n%s", out)
+	}
+	if strings.Contains(out, "Weak-signal matches only") {
+		t.Fatal("wrong headline for operator-only recall")
+	}
+}
+
 // --- fold tests (FetchMemory) ------------------------------------------------
 
 // Covers R17 render half: a prior at the demotion threshold drops to a weak
@@ -271,6 +333,73 @@ func TestFetchMemory_EmptyViewReturnsNil(t *testing.T) {
 func TestFetchMemory_NilReaderReturnsNil(t *testing.T) {
 	if m := FetchMemory(context.Background(), nil, MemoryParams{}, store.Incident{ID: "cur"}, false, now2026()); m != nil {
 		t.Errorf("nil reader (recall disabled) must yield nil, got %+v", m)
+	}
+}
+
+// --- operator tier (ADR-0028) -------------------------------------------------
+
+func TestFetchMemory_OperatorTier_RankAndCap(t *testing.T) {
+	now := time.Now().UTC()
+	reader := &fakeMemoryReader{ // extend the existing fake's fields
+		ops: []store.OperatorAnnotation{
+			{IncidentID: "i1", Kind: "observation", Note: "obs newest", CreatedAt: now.Add(-1 * time.Hour)},
+			{IncidentID: "i2", Kind: "correction", Note: "corr older", CreatedAt: now.Add(-24 * time.Hour)},
+			{IncidentID: "i3", Kind: "confirmation", Note: "conf", CreatedAt: now.Add(-2 * time.Hour)},
+		},
+	}
+	m := FetchMemory(context.Background(), reader, MemoryParams{}, store.Incident{ID: "cur", GroupKey: "k"}, false, now)
+	if m == nil {
+		t.Fatal("operator-only recall must not return nil")
+	}
+	// Rank: corrections > confirmations > observations, then newest-first; cap 2.
+	if len(m.Operator) != 2 || m.Operator[0].Kind != "correction" || m.Operator[1].Kind != "confirmation" {
+		t.Fatalf("rank/cap wrong: %+v", m.Operator)
+	}
+	if m.OperatorMore != 1 {
+		t.Fatalf("more count: %d", m.OperatorMore)
+	}
+}
+
+func TestFetchMemory_CorrectedPriorNeverStrong(t *testing.T) {
+	now := time.Now().UTC()
+	reader := &fakeMemoryReader{
+		view: &store.MemoryView{GroupKey: "k", PriorFindings: []store.PriorFinding{
+			{IncidentID: "p1", RootCause: "wrong AZ outage", CorrectedByOperator: true, AnalyzedAt: now},
+		}},
+	}
+	m := FetchMemory(context.Background(), reader, MemoryParams{}, store.Incident{ID: "cur", GroupKey: "k"}, false, now)
+	if m == nil {
+		t.Fatal("nil enrichment")
+	}
+	if m.Strong != nil {
+		t.Fatal("corrected prior took the strong slot")
+	}
+	if len(m.Weak) != 1 || !m.Weak[0].OperatorSuperseded {
+		t.Fatalf("want one operator-superseded weak entry: %+v", m.Weak)
+	}
+}
+
+func TestFetchMemory_OperatorFetchErrorDegradesToNoTier(t *testing.T) {
+	reader := &fakeMemoryReader{
+		view:   &store.MemoryView{GroupKey: "k"},
+		opsErr: errors.New("boom"),
+	}
+	m := FetchMemory(context.Background(), reader, MemoryParams{}, store.Incident{ID: "cur", GroupKey: "k"}, false, now2026())
+	if m != nil {
+		t.Errorf("an operator-fetch error with nothing else recalled must yield nil, got %+v", m)
+	}
+}
+
+func TestFetchMemory_OperatorOnlyRungIsOperator(t *testing.T) {
+	reader := &fakeMemoryReader{
+		ops: []store.OperatorAnnotation{{IncidentID: "i1", Kind: "confirmation", Note: "confirmed", CreatedAt: now2026()}},
+	}
+	m := FetchMemory(context.Background(), reader, MemoryParams{}, store.Incident{ID: "cur", GroupKey: "k"}, false, now2026())
+	if m == nil {
+		t.Fatal("nil enrichment")
+	}
+	if m.Rung != "operator" {
+		t.Fatalf("want rung %q, got %q", "operator", m.Rung)
 	}
 }
 

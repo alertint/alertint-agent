@@ -198,6 +198,37 @@ func TestMemoryView_ExcludesCurrentIncident(t *testing.T) {
 	}
 }
 
+func TestMemoryView_CorrectedByOperator(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 9, 2, 0, 0, 0, time.UTC)
+	since := now.AddDate(0, 0, -90)
+	key := "cluster=prod,namespace=web,service=api"
+	seedJudged(t, s, judged{id: "inc_corrected", groupKey: key, createdAt: now.AddDate(0, 0, -1), rootCause: "wrong AZ outage"})
+	seedJudged(t, s, judged{id: "inc_plain", groupKey: key, createdAt: now.AddDate(0, 0, -2), rootCause: "plain"})
+	if _, err := s.InsertIncidentAnnotation(ctx, "inc_corrected", "correction", "operator said no"); err != nil {
+		t.Fatalf("insert annotation: %v", err)
+	}
+
+	v, err := s.MemoryView(ctx, key, "inc_current", false, since)
+	if err != nil {
+		t.Fatalf("MemoryView: %v", err)
+	}
+	if len(v.PriorFindings) != 2 {
+		t.Fatalf("want 2 priors, got %+v", v.PriorFindings)
+	}
+	byID := map[string]PriorFinding{}
+	for _, pf := range v.PriorFindings {
+		byID[pf.IncidentID] = pf
+	}
+	if !byID["inc_corrected"].CorrectedByOperator {
+		t.Errorf("inc_corrected should be CorrectedByOperator, got %+v", byID["inc_corrected"])
+	}
+	if byID["inc_plain"].CorrectedByOperator {
+		t.Errorf("inc_plain has no correction annotation, should be false: %+v", byID["inc_plain"])
+	}
+}
+
 func TestMemoryView_LookbackExcludesOldPrior(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
