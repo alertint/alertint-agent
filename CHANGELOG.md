@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-27
+
 ### Added
 
 - MCP write-back: `alertint_incident_annotate` and `alertint_incident_capture_verdict` — operator
@@ -508,7 +510,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single static binary** — pure-Go SQLite (no CGO), no external runtime dependencies.
   Multi-platform builds: `linux/amd64`, `linux/arm64`, `darwin/arm64`.
 
-[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/alertint/alertint-agent/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/alertint/alertint-agent/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/alertint/alertint-agent/compare/v0.8.3...v0.9.0
 [0.8.3]: https://github.com/alertint/alertint-agent/compare/v0.8.2...v0.8.3
