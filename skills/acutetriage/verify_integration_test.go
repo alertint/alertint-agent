@@ -834,21 +834,19 @@ func TestPromptCachingFalseSuppressesMarkAndWarn(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// Verdict steering (Task 7): the ruling contract — call-2 demand, soft
-// parse, audit, loud failure (ADR-0029).
+// Verdict steering (Tasks 7-8): the ruling contract — call-2 demand, soft
+// parse, audit, loud failure (ADR-0029) — plus the deterministic confidence
+// backstop that clamps off the recorded ruling (applySteeringCap).
 //
 // Every test here seeds the REAL store with a captured verdict via
 // PersistVerdictCapture (Config.Memory = st) so FetchMemory's real
 // GoverningVerdict query populates MemoryEnrichment.Governing end-to-end —
-// not a stubbed reader. Task 8 (not built yet) is the deterministic
-// confidence backstop that clamps off the recorded ruling; TestSteering_
-// UnverifiableClamps / AbsentRulingKeepsRevisionAndClamps /
-// UnbackedContradictionClamps are written against that not-yet-built
-// behavior and are EXPECTED to fail here for exactly one reason — the
-// persisted confidence is not yet clamped — until Task 8 lands. Their
-// fixtures deliberately keep live verification evidence flowing (a fetched
-// floor up_ratio) so the PRE-EXISTING annotations-only cap (applyEvidenceCap)
-// cannot accidentally paper over the still-missing steering-specific clamp.
+// not a stubbed reader. TestSteering_UnverifiableClamps /
+// AbsentRulingKeepsRevisionAndClamps / UnbackedContradictionClamps assert on
+// the steering-specific backstop; their fixtures deliberately keep live
+// verification evidence flowing (a fetched floor up_ratio) so the
+// PRE-EXISTING annotations-only cap (applyEvidenceCap) cannot accidentally
+// paper over the steering-specific clamp under test.
 // --------------------------------------------------------------------------
 
 // callTwoRespWithRuling builds a call-2 re-judged verdict carrying an
@@ -1075,16 +1073,14 @@ func runSteeringUnbackedFixture(t *testing.T, fp, rootCause, ruling, basis strin
 // evidence IS present and the pre-existing annotations-only cap does not
 // apply here) and the model rules "unverifiable". Per ADR-0029/Task 8, an
 // unverifiable ruling must clamp confidence to MaxMetadataOnlyConfidence
-// regardless of live evidence elsewhere — that backstop does not exist yet,
-// so this is EXPECTED TO FAIL until Task 8 lands (confidence survives at
-// 0.85 today).
+// regardless of live evidence elsewhere.
 func TestSteering_UnverifiableClamps(t *testing.T) {
 	f, ver := runSteeringUnbackedFixture(t, "fp-steer-c",
 		"per operator correction of 2026-07-28, not verifiable from current evidence",
 		"unverifiable", "pvc_bytes returned no series")
 
 	if f.confidence != acutetriage.MaxMetadataOnlyConfidence {
-		t.Errorf("confidence = %v, want %v (unverifiable steering ruling must clamp — Task 8 backstop, not built yet)",
+		t.Errorf("confidence = %v, want %v (unverifiable steering ruling must clamp — Task 8 backstop)",
 			f.confidence, acutetriage.MaxMetadataOnlyConfidence)
 	}
 	if ver == nil || ver.OperatorRuling == nil {
@@ -1103,7 +1099,7 @@ func TestSteering_UnverifiableClamps(t *testing.T) {
 // revises the root cause, but omits the operator_ruling key entirely. Soft
 // validation means the revision is KEPT regardless (never a triage failure),
 // and the record defaults to "absent". Per ADR-0029/Task 8, an absent ruling
-// must clamp exactly like unverifiable — EXPECTED TO FAIL until Task 8 lands.
+// must clamp exactly like unverifiable.
 func TestSteering_AbsentRulingKeepsRevisionAndClamps(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
@@ -1133,7 +1129,7 @@ func TestSteering_AbsentRulingKeepsRevisionAndClamps(t *testing.T) {
 		t.Errorf("root cause = %q, want the revision KEPT despite the absent ruling (soft validation)", f.rootCause)
 	}
 	if f.confidence != acutetriage.MaxMetadataOnlyConfidence {
-		t.Errorf("confidence = %v, want %v (absent ruling must clamp — Task 8 backstop, not built yet)",
+		t.Errorf("confidence = %v, want %v (absent ruling must clamp — Task 8 backstop)",
 			f.confidence, acutetriage.MaxMetadataOnlyConfidence)
 	}
 	ver := verificationOf(t, f.enrichment)
@@ -1233,14 +1229,13 @@ func TestSteering_MalformedRulingShapeKeepsRevisionAndClamps(t *testing.T) {
 // TestSteering_UnbackedContradictionClamps: the model rules "contradicted"
 // but the operator query never fetched data (promUpHealthyElseEmpty — empty,
 // not fetched) — Backed must be false. Per ADR-0029/Task 8, a contradiction
-// needs data: an unbacked one must clamp same as unverifiable. EXPECTED TO
-// FAIL until Task 8 lands.
+// needs data: an unbacked one must clamp same as unverifiable.
 func TestSteering_UnbackedContradictionClamps(t *testing.T) {
 	f, ver := runSteeringUnbackedFixture(t, "fp-steer-e", "disk pressure on web1",
 		"contradicted", "no data supports the correction, but I conclude it anyway")
 
 	if f.confidence != acutetriage.MaxMetadataOnlyConfidence {
-		t.Errorf("confidence = %v, want %v (unbacked contradiction must clamp — Task 8 backstop, not built yet)",
+		t.Errorf("confidence = %v, want %v (unbacked contradiction must clamp — Task 8 backstop)",
 			f.confidence, acutetriage.MaxMetadataOnlyConfidence)
 	}
 	if ver == nil || ver.OperatorRuling == nil {
@@ -1262,9 +1257,9 @@ func TestSteering_UnbackedContradictionClamps(t *testing.T) {
 // not a text grep). No Prometheus is configured here, so there is NO live
 // verification evidence at all: the PRE-EXISTING annotations-only cap
 // (applyEvidenceCap, built before this task) already clamps confidence to
-// MaxMetadataOnlyConfidence on its own — this test therefore PASSES today,
-// exercising the ERROR log and the "unruled" record Task 7 adds, without
-// depending on Task 8's not-yet-built steering-specific backstop.
+// MaxMetadataOnlyConfidence on its own — this test exercises the ERROR log
+// and the "unruled" record (Task 7) without depending on the steering-specific
+// backstop (Task 8) to produce the clamp.
 func TestSteering_CallTwoFailureLogsErrorAndClamps(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)

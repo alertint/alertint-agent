@@ -50,9 +50,10 @@ type Finding struct {
 	Unverified bool `json:"unverified,omitempty"`
 	// History is the group key's operator history (R13/D9), producer-computed
 	// by the triage skill the same way Recurrence is: notifiers stay I/O-free
-	// renderers, the skill owns the store read. nil only when the skill has no
-	// store to read from at all; otherwise always populated (tri-state honest —
-	// "unavailable" on a read error, never silently absent).
+	// renderers, the skill owns the store read. nil only when no notifier is
+	// attached at all (the skill builds History inside its notify block);
+	// otherwise always populated (tri-state honest — "unavailable" on a store
+	// read error, never silently absent).
 	History *History `json:"history,omitempty"`
 	// Steering, when non-nil, reports the ruling on a steered finding (ADR-0029):
 	// a governing correction verdict was present on the group key. nil when no

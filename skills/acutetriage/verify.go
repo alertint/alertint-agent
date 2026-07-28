@@ -230,6 +230,21 @@ type verifyStateReader interface {
 // Params carries no valid window_minutes (R4 default).
 const defaultWindowMinutes = 60
 
+// minPerQueryTimeout floors each query's slice of the shared QueryTimeoutSeconds
+// budget (D10 deviation, user-approved). Steering can add up to
+// maxSteeringQueries operator queries on top of the floor and the model's own
+// proposals — up to 11 queries sharing one round today — so a naive equal
+// split (budget / len(queries)) can shrink well below what even a healthy
+// backend needs to answer, including the floor's own essential up_ratio
+// check. A slow backend then becomes indistinguishable from a genuinely
+// untested correction: a timed-out probe doesn't count as fetched, doesn't
+// count as backed, and confidence gets clamped anyway. This floor does not
+// grow the outer budget: when flooring every slice would sum past it, the
+// outer queryPhaseCtx deadline (still the hard ceiling below) simply cuts off
+// the trailing queries' contexts early — the same accepted degradation mode
+// FetchMetrics already relies on — rather than adding rebalancing logic here.
+const minPerQueryTimeout = 2 * time.Second
+
 // queryExecutor abstracts "run one verification query, fill Outcome/Result in
 // place". liveExecutor is production; snapshotExecutor is the hermetic replay
 // seam (ADR-0021 pipeline, frozen data).
@@ -293,17 +308,24 @@ func runVerificationWith(ctx context.Context, exec queryExecutor, params Verific
 	// an outer queryPhaseCtx caps the WHOLE query phase at QueryTimeoutSeconds
 	// regardless of how the caller's ctx is scoped, and each query additionally
 	// gets its own slice of that budget so one slow or hung query times out on
-	// its own share instead of starving the rest of the round. A purely
-	// sequential loop dividing the budget N ways would already sum to at most
-	// the total (integer division only trims remainder nanoseconds, never
-	// grows it), but the outer ctx is kept anyway as the same hard ceiling
-	// FetchMetrics relies on — belt-and-braces against a future refactor (e.g.
-	// concurrent queries) silently breaking that invariant. len(queries) is
-	// never 0 — floorPlan always contributes its two entries.
+	// its own share instead of starving the rest of the round. Without the
+	// minPerQueryTimeout floor below, a purely sequential loop dividing the
+	// budget N ways would always sum to at most the total (integer division
+	// only trims remainder nanoseconds, never grows it) — but once N is large
+	// enough that the floor kicks in, per-query slices can sum past the
+	// budget. The outer ctx is what makes that safe: a child context's
+	// effective deadline can never exceed its parent's, so once
+	// queryPhaseCtx's own deadline passes, every further query's context is
+	// already expired and fails fast — trailing queries are simply cut off
+	// rather than the round running long. len(queries) is never 0 — floorPlan
+	// always contributes its two entries.
 	budget := time.Duration(params.QueryTimeoutSeconds) * time.Second
 	queryPhaseCtx, phaseCancel := context.WithTimeout(ctx, budget)
 	defer phaseCancel()
 	perQuery := budget / time.Duration(len(queries))
+	if perQuery < minPerQueryTimeout {
+		perQuery = minPerQueryTimeout
+	}
 
 	for i := range queries {
 		qCtx, cancel := context.WithTimeout(queryPhaseCtx, perQuery)

@@ -497,14 +497,20 @@ func writeGoverningVerdict(b *strings.Builder, g *GoverningVerdict, requestVerdi
 }
 
 // writeCorrectedCauseAnchors appends the correction's cause alert/series as a
-// single trailer line, when either is present.
+// single trailer line, when either is present. The "; " separator between the
+// two parts renders only when BOTH are present — a cause_alert-only anchor
+// must not leave a dangling "alert Foo;." with the semicolon immediately
+// followed by the trailing period.
 func writeCorrectedCauseAnchors(b *strings.Builder, g *GoverningVerdict) {
 	if g.CauseAlert == "" && len(g.CauseSeries) == 0 {
 		return
 	}
 	b.WriteString("\nCorrected-cause anchors:")
 	if g.CauseAlert != "" {
-		fmt.Fprintf(b, " alert %s;", g.CauseAlert)
+		fmt.Fprintf(b, " alert %s", g.CauseAlert)
+		if len(g.CauseSeries) > 0 {
+			b.WriteString(";")
+		}
 	}
 	if len(g.CauseSeries) > 0 {
 		fmt.Fprintf(b, " series %s", strings.Join(g.CauseSeries, ", "))

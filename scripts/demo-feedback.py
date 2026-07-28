@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-# demo-feedback.py — end-to-end demo of the v0.10.0 feedback & verdict capture
-# loop against the local Docker Compose stack.
+# demo-feedback.py — end-to-end demo of the feedback & verdict capture loop,
+# including verdict steering (supported/contradicted/unverifiable), against
+# the local Docker Compose stack.
 #
 # The loop it walks, in one run:
 #
@@ -392,7 +393,7 @@ def refire_and_wait(mcp, inc, last_id, seen_ids, webhook_port, token, salt, time
 # ---------------------------------------------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="AlertINT v0.10.0 feedback & verdict capture demo")
+    ap = argparse.ArgumentParser(description="AlertINT feedback & verdict capture + steering demo")
     ap.add_argument("--reset", action="store_true", help="docker compose down -v first (clean slate)")
     ap.add_argument("--skip-stack", action="store_true", help="do not touch docker compose; use what is running")
     ap.add_argument("--skip-drill", action="store_true", help="do not fire a drill; reuse an existing drill incident")
@@ -421,7 +422,7 @@ def main():
     if not binary.exists():
         die("./bin/alertint is missing — run `task build` first")
 
-    print(f"{BOLD}AlertINT — feedback & verdict capture (v0.10.0) end-to-end demo{RESET}")
+    print(f"{BOLD}AlertINT — feedback & verdict capture + steering end-to-end demo{RESET}")
     dim(f"MCP http://127.0.0.1:{mcp_port}/mcp · receivers http://127.0.0.1:{webhook_port}")
 
     # ── step 0 — stack ──────────────────────────────────────────────────────

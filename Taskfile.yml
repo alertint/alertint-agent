@@ -123,7 +123,7 @@ tasks:
       - echo "✓ Tracking state purged. Fresh alerts can now be generated."
 
   demo:feedback:
-    desc: "End-to-end feedback & verdict capture demo (v0.10.0): drill → triage → MCP write-back → recall → audit. Args after `--`, e.g. `task demo:feedback -- --reset`"
+    desc: "End-to-end feedback & verdict capture demo: drill → triage → MCP write-back → recall → audit → steering proof (supported/contradicted/unverifiable). Args after `--`, e.g. `task demo:feedback -- --reset`"
     deps: [build]
     dotenv: [".env"]
     cmds:

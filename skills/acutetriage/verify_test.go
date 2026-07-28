@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -450,5 +451,58 @@ func TestRunVerificationWith_OperatorQueriesRideTheRound(t *testing.T) {
 	}
 	if round.Queries[2].Source != sourceOperator || round.Queries[2].Expr != "pvc_bytes" {
 		t.Fatalf("operator query must follow the floor, got %+v", round.Queries[2])
+	}
+}
+
+// deadlineRecordingExecutor records, for each dispatched query, the duration
+// remaining until its context's deadline — pins minPerQueryTimeout's floor
+// without depending on a real timeout actually firing (the fake executor
+// returns instantly).
+type deadlineRecordingExecutor struct {
+	remaining []time.Duration
+}
+
+func (e *deadlineRecordingExecutor) execute(ctx context.Context, q *VerificationQuery) {
+	if dl, ok := ctx.Deadline(); ok {
+		e.remaining = append(e.remaining, time.Until(dl))
+	} else {
+		e.remaining = append(e.remaining, -1)
+	}
+	q.Outcome = OutcomeFetched
+	q.Result = "ok"
+}
+
+// TestRunVerificationWith_PerQueryFloor_FullElevenQueryCase pins the D10
+// floor (user-approved deviation): with the full 11-query case steering can
+// produce (2 floor + 5 operator + 4 model) sharing a small total budget, a
+// naive equal split (5s / 11 ≈ 454ms) would shrink every query's slice —
+// including the floor's own essential up_ratio check — well under a second.
+// minPerQueryTimeout ensures no single query's slice drops below it.
+func TestRunVerificationWith_PerQueryFloor_FullElevenQueryCase(t *testing.T) {
+	alerts := []store.Alert{alertWithLabels(map[string]string{"namespace": "prod"})}
+	exec := &deadlineRecordingExecutor{}
+	params := VerificationParams{QueryTimeoutSeconds: 5} // 5s / 11 ≈ 454ms naive — well under the floor
+
+	operatorQ := make([]VerificationQuery, 5)
+	for i := range operatorQ {
+		operatorQ[i] = VerificationQuery{Kind: kindPromQL, Source: sourceOperator, Expr: fmt.Sprintf("s%d", i)}
+	}
+	modelQ := make([]VerificationQuery, 4)
+	for i := range modelQ {
+		modelQ[i] = VerificationQuery{Kind: kindPromQL, Source: "model", Expr: fmt.Sprintf("m%d", i)}
+	}
+
+	round := runVerificationWith(context.Background(), exec, params, alerts, DraftRef{}, operatorQ, modelQ, time.Now())
+	if len(round.Queries) != 11 {
+		t.Fatalf("want 11 queries (2 floor + 5 operator + 4 model), got %d", len(round.Queries))
+	}
+	if len(exec.remaining) != 11 {
+		t.Fatalf("want 11 executed queries, got %d", len(exec.remaining))
+	}
+	const tolerance = 200 * time.Millisecond // wall-clock slack for ctx creation between capture and check
+	for i, d := range exec.remaining {
+		if d < minPerQueryTimeout-tolerance {
+			t.Errorf("query %d: per-query slice %v below the floor %v", i, d, minPerQueryTimeout)
+		}
 	}
 }

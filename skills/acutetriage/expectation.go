@@ -200,13 +200,32 @@ func diffExpectationAgainstFinding(e Expectation, resp llmResponse) (missingMent
 	return missingMention, badConclusions, warnings
 }
 
-// lintExpectationVerifiable warns when the expectation's cause series is in
-// neither the frozen snapshot (verification queries/results, metric sections)
-// nor the widened set — such a verdict can never go green (D10). A query
-// whose Outcome is failed/degraded contributes nothing: its Expr still names
-// the series, but a failed fetch is not evidence the series is verifiable —
-// counting it would let a permanently-unreachable series pass the lint.
-func lintExpectationVerifiable(e Expectation, frozen frozenEnvelope, widened []VerificationQuery) []string {
+// lintExpectationVerifiable warns at capture time about two distinct ways an
+// expectation can never be tested:
+//
+//   - A correction naming NO evidence anchor at all (cause_alert,
+//     cause_series, or widened evidence) can never generate a single
+//     steering query — buildSteeringQueries draws exclusively from
+//     cause_series and widened evidence (governingEntry.WidenExprs). Once
+//     captured, Steers stays true forever with nothing to test, so
+//     applySteeringCap clamps every future triage on this group key with no
+//     way out until a newer capture on the key adds an anchor. This check
+//     fires only for verdict=="correction" — a confirmation never steers, so
+//     it carries no such obligation.
+//   - The expectation's cause series is in neither the frozen snapshot
+//     (verification queries/results, metric sections) nor the widened set —
+//     such a verdict can never go green (D10). A query whose Outcome is
+//     failed/degraded contributes nothing: its Expr still names the series,
+//     but a failed fetch is not evidence the series is verifiable — counting
+//     it would let a permanently-unreachable series pass the lint.
+func lintExpectationVerifiable(verdict string, e Expectation, frozen frozenEnvelope, widened []VerificationQuery) []string {
+	var warnings []string
+	if verdict == "correction" && e.CauseAlert == "" && len(e.CauseSeries) == 0 && len(widened) == 0 {
+		warnings = append(warnings, "this correction names no evidence anchors (cause_alert, cause_series, or "+
+			"widen_queries) — it can never be tested; every future triage on this group key will be "+
+			"confidence-capped until a newer capture adds anchors")
+	}
+
 	var haystack strings.Builder
 	writeIfAnswered := func(q VerificationQuery) {
 		if q.Outcome == OutcomeFailed || q.Outcome == OutcomeDegraded {
@@ -230,7 +249,6 @@ func lintExpectationVerifiable(e Expectation, frozen frozenEnvelope, widened []V
 		writeIfAnswered(q)
 	}
 	hs := haystack.String()
-	var warnings []string
 	for _, s := range e.CauseSeries {
 		if s != "" && !strings.Contains(hs, s) {
 			warnings = append(warnings, fmt.Sprintf("expectation unverifiable — cause series %q is in neither snapshot nor widening; this verdict can never go green", s))

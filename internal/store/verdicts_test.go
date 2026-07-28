@@ -166,6 +166,35 @@ func TestGoverningVerdict_NoneIsNilNil(t *testing.T) {
 	}
 }
 
+// TestGoverningVerdict_LaterAnnotationDoesNotOverrideCapturedNote is a
+// regression test: a plain alertint_incident_annotate call of the SAME kind
+// on the SAME incident, made after a verdict capture, must never silently
+// rewrite the captured verdict's rendered note (the note subquery's
+// "a.created_at <= v.created_at" bound is what enforces this).
+func TestGoverningVerdict_LaterAnnotationDoesNotOverrideCapturedNote(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	now := time.Now().UTC()
+	seedJudged(t, s, judged{id: "inc-a", groupKey: "service=checkout", createdAt: now})
+
+	mustCapture(t, s, ctx, "inc-a", "correction", `{"must_mention":["queue"]}`, "captured note")
+
+	if _, err := s.InsertIncidentAnnotation(ctx, "inc-a", "correction", "a much later, unrelated note"); err != nil {
+		t.Fatalf("insert later annotation: %v", err)
+	}
+
+	v, err := s.GoverningVerdict(ctx, "service=checkout", false)
+	if err != nil {
+		t.Fatalf("GoverningVerdict: %v", err)
+	}
+	if v == nil {
+		t.Fatal("want a governing verdict, got nil")
+	}
+	if v.Note != "captured note" {
+		t.Fatalf("a later plain annotation must not override the captured verdict's note, got %q", v.Note)
+	}
+}
+
 func TestGoverningVerdict_DrillParity(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)

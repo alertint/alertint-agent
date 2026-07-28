@@ -973,7 +973,7 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 	var ruling *OperatorRulingRecord
 	if g := governingOf(ar.memory); g != nil && g.Steers {
 		ruling = &OperatorRulingRecord{
-			Ruling: "absent", Backed: operatorEvidenceFetched(round),
+			Ruling: "absent", Backed: operatorEvidenceFetched(g, round),
 			VerdictID: g.VerdictID, VerdictVersion: g.Version, VerdictDate: g.Date,
 		}
 		var r modelRuling
@@ -1004,7 +1004,7 @@ func (s *Skill) degradedDraft(ctx context.Context, incidentID string, draftRaw j
 	draft.MemoryVerdict = ""
 	var ruling *OperatorRulingRecord
 	if g != nil && g.Steers {
-		ruling = &OperatorRulingRecord{Ruling: "unruled", Backed: operatorEvidenceFetched(round),
+		ruling = &OperatorRulingRecord{Ruling: "unruled", Backed: operatorEvidenceFetched(g, round),
 			VerdictID: g.VerdictID, VerdictVersion: g.Version, VerdictDate: g.Date}
 	}
 	s.auditVerificationExecuted(ctx, incidentID, verifyOutcomeDegraded, round, false)

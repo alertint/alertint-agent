@@ -117,7 +117,8 @@ func (s *Store) ListIncidentAnnotations(ctx context.Context, incidentID string) 
 }
 
 // OperatorAnnotation is one recalled operator annotation for the human-locked
-// memory tier (ADR-0028): fetched by group key over the recall lookback.
+// memory tier (ADR-0028): fetched by group key, unbounded — human writes are
+// permanent (R7), not subject to time-based decay.
 type OperatorAnnotation struct {
 	IncidentID string
 	Kind       string

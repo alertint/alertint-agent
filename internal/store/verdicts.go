@@ -186,12 +186,22 @@ func (s *Store) LatestVerdictKinds(ctx context.Context, incidentIDs []string) (m
 // real. Verdicts on the incident currently being triaged are included (a
 // correction on it steers its own re-judgment). Returns nil, nil when the key
 // carries no verdict.
+//
+// The note subquery is bound to "AND a.created_at <= v.created_at": within
+// PersistVerdictCapture's transaction the annotation row is written strictly
+// before the verdict row's own created_at is stamped, so the capture's own
+// annotation always satisfies this bound and remains the newest-and-earliest
+// candidate. Without the bound, a later free-text alertint_incident_annotate
+// call of the same kind on the same incident would silently outrank and
+// replace the captured verdict's note here — annotations must stay pure
+// context with zero effect on triage.
 func (s *Store) GoverningVerdict(ctx context.Context, groupKey string, currentIsDrill bool) (*IncidentVerdict, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT v.id, v.incident_id, v.version, v.verdict, v.source, v.label_confidence,
 		       v.expectation_json, COALESCE(v.widened_json, ''), COALESCE(v.cause_category, ''),
 		       COALESCE((SELECT a.note FROM incident_annotations a
 		                 WHERE a.incident_id = v.incident_id AND a.kind = v.verdict
+		                   AND a.created_at <= v.created_at
 		                 ORDER BY a.created_at DESC, a.id DESC LIMIT 1), ''),
 		       v.created_at
 		FROM incident_verdicts v

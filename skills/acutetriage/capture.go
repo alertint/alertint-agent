@@ -166,7 +166,7 @@ func (e *CaptureEngine) CaptureVerdict(ctx context.Context, req CaptureRequest) 
 	}
 
 	frozen := decodeFrozenEnvelope(inc.EnrichmentJSON)
-	warnings = append(warnings, lintExpectationVerifiable(exp, frozen, decodeWidened(verdictRow))...)
+	warnings = append(warnings, lintExpectationVerifiable(req.Verdict, exp, frozen, decodeWidened(verdictRow))...)
 
 	res := &CaptureResult{VerdictID: verdictRow.ID, Version: verdictRow.Version, Warnings: warnings}
 	gctx, cancel := context.WithTimeout(ctx, gradeDeadline)

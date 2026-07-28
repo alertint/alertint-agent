@@ -51,7 +51,11 @@ type GoverningVerdict struct {
 // expectation decodes leniently (a persisted record is trusted shape-wise;
 // unknown future fields must not kill recall). Grading vocabulary
 // (must_mention / must_not_conclude) is deliberately NOT carried — it never
-// renders into a prompt (R6).
+// renders into a prompt (R6). CauseAlert/CauseSeries are supplied by MCP
+// clients (AI agents reading attacker-influenceable alert labels) and render
+// straight into the prompt's "Corrected-cause anchors" line, so they get the
+// same injection hardening as Note: flattened (no smuggled newlines) and
+// capped at maxRecallEntryChars.
 func governingEntry(v *store.IncidentVerdict, now time.Time) *GoverningVerdict {
 	if v == nil {
 		return nil
@@ -73,18 +77,42 @@ func governingEntry(v *store.IncidentVerdict, now time.Time) *GoverningVerdict {
 		Date:        v.CreatedAt.UTC().Format("2006-01-02"),
 		Age:         humanizeAge(now.Sub(v.CreatedAt)),
 		Note:        capText(flattenRecalled(v.Note), maxRecallEntryChars),
-		CauseAlert:  exp.CauseAlert,
-		CauseSeries: exp.CauseSeries,
+		CauseAlert:  capText(flattenRecalled(exp.CauseAlert), maxRecallEntryChars),
+		CauseSeries: hardenRecalledStrings(exp.CauseSeries),
 		WidenExprs:  exprs,
 		Steers:      v.Verdict == "correction",
 	}
 }
 
-// buildSteeringQueries derives the correction's deterministic query set (R2):
-// widen_queries expressions verbatim first, then one probe per cause_series —
-// the metric name as a bare instant vector selector (no guessed labels; the
-// max_series bound prices over-breadth, a bad name lands as a failed outcome).
-// Deduped by expr, capped at maxSteeringQueries.
+// hardenRecalledStrings applies the same injection hardening as a single
+// recalled string (flattenRecalled + capText at maxRecallEntryChars) to every
+// element of an MCP-client-supplied string slice. nil in, nil out.
+func hardenRecalledStrings(ss []string) []string {
+	if len(ss) == 0 {
+		return nil
+	}
+	out := make([]string, len(ss))
+	for i, s := range ss {
+		out[i] = capText(flattenRecalled(s), maxRecallEntryChars)
+	}
+	return out
+}
+
+// buildSteeringQueries derives the correction's deterministic query set: one
+// probe per cause_series FIRST, then widen_queries expressions verbatim fill
+// whatever budget remains — a deliberate, user-approved deviation from the
+// plan's original "widen_queries verbatim first" ordering (Global Constraint
+// #2). widen_queries accumulate across verdict captures (merged forward,
+// never pruned) and can exceed maxSteeringQueries on their own; emitting them
+// first could silently squeeze the cause-series probes — the queries that
+// actually test whether the corrected cause is real — out of the round
+// entirely, while Backed still ends up true off an unrelated widen query
+// (e.g. a generic `up` check). Probes-first guarantees the correction's own
+// claim gets tested before any budget goes to accumulated widen exprs.
+//
+// Probe shape: the metric name as a bare instant vector selector (no guessed
+// labels; the max_series bound prices over-breadth, a bad name lands as a
+// failed outcome). Deduped by expr, capped at maxSteeringQueries.
 func buildSteeringQueries(g *GoverningVerdict) []VerificationQuery {
 	if g == nil || !g.Steers {
 		return nil
@@ -98,11 +126,11 @@ func buildSteeringQueries(g *GoverningVerdict) []VerificationQuery {
 		seen[expr] = true
 		out = append(out, VerificationQuery{Kind: kindPromQL, Source: sourceOperator, Expr: expr, Why: why})
 	}
-	for _, e := range g.WidenExprs {
-		add(e, "operator correction: evidence widened at capture")
-	}
 	for _, s := range g.CauseSeries {
 		add(s, fmt.Sprintf("operator correction: does %s show the corrected cause?", s))
+	}
+	for _, e := range g.WidenExprs {
+		add(e, "operator correction: evidence widened at capture")
 	}
 	return out
 }
@@ -209,16 +237,30 @@ func BuildHistory(ctx context.Context, r HistoryReader, groupKey, incidentID str
 	return h
 }
 
-// operatorEvidenceFetched reports whether at least one steering query returned
-// data. OutcomeEmpty does not count: an empty result carries no sign
-// (ADR-0024), so it can back neither "supported" nor "contradicted" — the R4
-// backstop treats an unbacked ruling as absent.
-func operatorEvidenceFetched(r *VerificationRound) bool {
-	if r == nil {
+// operatorEvidenceFetched reports whether the round actually tested the
+// governing correction's own claim: a query sourced from the operator tier
+// AND fetched AND whose expr names one of the correction's cause_series
+// entries. A widen-only match (an operator query whose expr is not a
+// cause_series entry) does not count — a correction accumulates widen exprs
+// across captures, and an always-fetching widen query (e.g. a generic `up`
+// check) must not permanently satisfy "Backed" regardless of whether the
+// corrected cause was ever tested. OutcomeEmpty does not count either: an
+// empty result carries no sign (ADR-0024), so it can back neither
+// "supported" nor "contradicted" — the R4 backstop treats an unbacked ruling
+// as absent.
+func operatorEvidenceFetched(g *GoverningVerdict, r *VerificationRound) bool {
+	if g == nil || r == nil {
+		return false
+	}
+	causeSeries := make(map[string]bool, len(g.CauseSeries))
+	for _, s := range g.CauseSeries {
+		causeSeries[s] = true
+	}
+	if len(causeSeries) == 0 {
 		return false
 	}
 	for _, q := range r.Queries {
-		if q.Source == sourceOperator && q.Outcome == OutcomeFetched {
+		if q.Source == sourceOperator && q.Outcome == OutcomeFetched && causeSeries[q.Expr] {
 			return true
 		}
 	}
