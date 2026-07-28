@@ -347,13 +347,20 @@ def latest_drill_incident(mcp):
     return drills[0]
 
 
-def poll_new_incident(mcp, group_key, exclude_id, timeout, interval=5):
+def poll_new_incident(mcp, group_key, seen_ids, timeout, interval=5):
+    """Poll until a NEW analyzed incident shows up on group_key — "new" meaning
+    its id is not in seen_ids, the full set of every incident already known on
+    this group key (not just the single most-recently-fired one). A same-key
+    incident history accumulates fast across steps 5/5b/5c/5d (and can predate
+    this run entirely on a `--skip-stack --skip-drill` reuse) — excluding only
+    the last id would let an OLDER analyzed incident on the same key satisfy
+    "not excluded" and be returned as if it were the fresh triage, silently."""
     deadline = time.time() + timeout
     seen_status = None
     while time.time() < deadline:
         rows = mcp.call("alertint_list_incidents", {"limit": 25}).get("incidents", [])
         for r in rows:
-            if r["group_key"] == group_key and r["id"] != exclude_id:
+            if r["group_key"] == group_key and r["id"] not in seen_ids:
                 if r["status"] == "analyzed":
                     return r, None
                 seen_status = r["status"]
@@ -361,12 +368,15 @@ def poll_new_incident(mcp, group_key, exclude_id, timeout, interval=5):
     return None, seen_status
 
 
-def refire_and_wait(mcp, inc, exclude_id, webhook_port, token, salt, timeout):
-    """Wait out the recurrence-collapse window on inc's group key, re-fire its
+def refire_and_wait(mcp, inc, last_id, seen_ids, webhook_port, token, salt, timeout):
+    """Wait out the recurrence-collapse window on the most recently fired
+    incident (last_id, used only to read its last_alert_at), re-fire inc's
     alerts with a fresh salt, then poll for the resulting NEW analyzed
-    incident — the shared refire-and-poll shape the steering phases (5b/5c/5d)
-    each need once per seeded value."""
-    last = mcp.call("alertint_get_incident", {"incident_id": exclude_id})
+    incident — new meaning not in seen_ids (see poll_new_incident) — the
+    shared refire-and-poll shape the steering phases (5b/5c/5d) each need once
+    per seeded value. Callers must add the returned incident's id to seen_ids
+    before the next phase."""
+    last = mcp.call("alertint_get_incident", {"incident_id": last_id})
     last_alert = datetime.fromisoformat(last["last_alert_at"].replace("Z", "+00:00"))
     ready_at = last_alert + timedelta(minutes=DEMO_ATTACH_MINUTES, seconds=15)
     wait = (ready_at - datetime.now(timezone.utc)).total_seconds()
@@ -374,7 +384,7 @@ def refire_and_wait(mcp, inc, exclude_id, webhook_port, token, salt, timeout):
         info(f"waiting {int(wait)}s for the collapse window to close")
         time.sleep(wait)
     refire(inc, webhook_port, token, salt=salt)
-    return poll_new_incident(mcp, inc["group_key"], exclude_id, timeout)
+    return poll_new_incident(mcp, inc["group_key"], seen_ids, timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -581,6 +591,15 @@ def main():
 
     # ── step 5 — recall into the next incident ──────────────────────────────
     step(5, "the same failure happens again — does the correction come back?")
+    # seen_ids is every incident id already on this group key, BEFORE this run's
+    # first re-fire — not just incident_id. A single-id exclude filter would let
+    # an older same-key incident (e.g. a leftover from a prior --skip-stack run,
+    # or the original drill incident once more incidents accumulate below) match
+    # "not excluded" and be handed back as if it were the fresh triage. Every
+    # phase below (5, 5b, 5c, 5d) adds its own new incident's id before the next
+    # poll, so "new" always means "never seen on this key across this whole run".
+    baseline_rows = mcp.call("alertint_list_incidents", {"limit": 25}).get("incidents", [])
+    seen_ids = {r["id"] for r in baseline_rows if r["group_key"] == inc["group_key"]}
     last_alert = datetime.fromisoformat(inc["last_alert_at"].replace("Z", "+00:00"))
     ready_at = last_alert + timedelta(minutes=DEMO_ATTACH_MINUTES, seconds=15)
     wait = (ready_at - datetime.now(timezone.utc)).total_seconds()
@@ -591,12 +610,13 @@ def main():
     status, n = refire(inc, webhook_port, env["ALERTINT_WEBHOOK_TOKEN"], salt=f"demo-recall:{incident_id}")
     info(f"re-fired {n} alerts on group {inc['group_key']} with fresh fingerprints (HTTP {status})")
     info(f"waiting for the correlation window + triage (up to {args.triage_timeout}s)…")
-    row2, last_status = poll_new_incident(mcp, inc["group_key"], incident_id, args.triage_timeout)
+    row2, last_status = poll_new_incident(mcp, inc["group_key"], seen_ids, args.triage_timeout)
     if not row2:
         check("re-fire produced a second analyzed incident", "status=analyzed",
               f"status={last_status or 'none'}", False)
         return summarize(env)
     info(f"second incident {BOLD}{row2['id']}{RESET} analyzed")
+    seen_ids.add(row2["id"])
 
     pack = mcp.call("alertint_get_evidence_pack", {"incident_id": row2["id"]})
     memory = ((pack.get("enrichment") or {}).get("memory") or {})
@@ -630,11 +650,15 @@ def main():
     push_gauge(DEMO_SERIES, 3)
     info(f"seeded {DEMO_SERIES}=3 (pvc nearly full) — waiting one Prometheus scrape…")
     time.sleep(20)
-    row_s, last = refire_and_wait(mcp, inc, row2["id"], webhook_port,
+    seed_low = mcp.call("prometheus_query", {"expr": DEMO_SERIES}).get("result") or []
+    check("seed reached Prometheus before the re-fire", "≥1 series",
+          f"{len(seed_low)} series", len(seed_low) >= 1)
+    row_s, last = refire_and_wait(mcp, inc, row2["id"], seen_ids, webhook_port,
                                   env["ALERTINT_WEBHOOK_TOKEN"], f"demo-supported:{incident_id}", args.triage_timeout)
     if not row_s:
         check("supported-path incident analyzed", "analyzed", last or "none", False)
         return summarize(env)
+    seen_ids.add(row_s["id"])
     inc_s = mcp.call("alertint_get_incident", {"incident_id": row_s["id"]})
     oh = inc_s.get("operator_history") or {}
     steering_s = ((mcp.call("alertint_get_evidence_pack", {"incident_id": row_s["id"]})
@@ -651,11 +675,15 @@ def main():
     step("5c", "steering — series seeded HEALTHY: ruling must be CONTRADICTED, correction NOT adopted")
     push_gauge(DEMO_SERIES, 95)
     time.sleep(20)
-    row_c, last = refire_and_wait(mcp, inc, row_s["id"], webhook_port,
+    seed_healthy = mcp.call("prometheus_query", {"expr": DEMO_SERIES}).get("result") or []
+    check("seed reached Prometheus before the re-fire", "≥1 series",
+          f"{len(seed_healthy)} series", len(seed_healthy) >= 1)
+    row_c, last = refire_and_wait(mcp, inc, row_s["id"], seen_ids, webhook_port,
                                   env["ALERTINT_WEBHOOK_TOKEN"], f"demo-contradicted:{incident_id}", args.triage_timeout)
     if not row_c:
         check("contradicted-path incident analyzed", "analyzed", last or "none", False)
         return summarize(env)
+    seen_ids.add(row_c["id"])
     inc_c = mcp.call("alertint_get_incident", {"incident_id": row_c["id"]})
     steering_c = ((mcp.call("alertint_get_evidence_pack", {"incident_id": row_c["id"]})
                    .get("enrichment") or {}).get("verification") or {}).get("operator_ruling") or {}
@@ -671,11 +699,15 @@ def main():
     step("5d", "steering — series DELETED: ruling must be UNVERIFIABLE, capped adoption with provenance")
     delete_gauge()
     time.sleep(20)
-    row_u, last = refire_and_wait(mcp, inc, row_c["id"], webhook_port,
+    seed_deleted = mcp.call("prometheus_query", {"expr": DEMO_SERIES}).get("result") or []
+    check("deleted series is truly absent from Prometheus", "0 series",
+          f"{len(seed_deleted)} series", len(seed_deleted) == 0)
+    row_u, last = refire_and_wait(mcp, inc, row_c["id"], seen_ids, webhook_port,
                                   env["ALERTINT_WEBHOOK_TOKEN"], f"demo-unverifiable:{incident_id}", args.triage_timeout)
     if not row_u:
         check("unverifiable-path incident analyzed", "analyzed", last or "none", False)
         return summarize(env)
+    seen_ids.add(row_u["id"])  # no phase follows, but keeps the accumulated set consistent
     inc_u = mcp.call("alertint_get_incident", {"incident_id": row_u["id"]})
     steering_u = ((mcp.call("alertint_get_evidence_pack", {"incident_id": row_u["id"]})
                    .get("enrichment") or {}).get("verification") or {}).get("operator_ruling") or {}
