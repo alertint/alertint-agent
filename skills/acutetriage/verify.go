@@ -49,7 +49,7 @@ const (
 // VerificationQuery is one planned/executed query, persisted verbatim (R8/R10).
 type VerificationQuery struct {
 	Kind    string         `json:"kind"`
-	Source  string         `json:"source"` // "model" | "floor"
+	Source  string         `json:"source"` // "model" | "floor" | "capture" | "operator"
 	Expr    string         `json:"expr,omitempty"`
 	Params  map[string]any `json:"params,omitempty"`
 	Why     string         `json:"why,omitempty"`

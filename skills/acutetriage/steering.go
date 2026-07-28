@@ -1,0 +1,121 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+// Verdict steering (ADR-0029): the group key's governing correction verdict
+// contributes deterministic verification queries and demands a ruling before
+// its corrected cause may be adopted. Precedence through testing, never
+// authority.
+package acutetriage
+
+import (
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/alertint/alertint-agent/internal/store"
+)
+
+const (
+	// sourceOperator marks a steering query derived from the governing
+	// correction verdict's expectation (widen_queries verbatim + one bare
+	// probe per cause_series). Executed with floor+model queries; exempt from
+	// MaxQueries like the floor (deterministic, ≤ maxSteeringQueries).
+	sourceOperator = "operator"
+
+	// maxSteeringQueries bounds operator-sourced queries per triage (D10).
+	maxSteeringQueries = 5
+)
+
+// GoverningVerdict is the operator entry of the memory enrichment: the group
+// key's latest captured verdict, the single operator artifact triage consumes.
+// Persist-as-rendered: Age/Date are stamped at fetch time so replay needs no
+// clock; anchors + widen exprs are frozen so replay rebuilds identical
+// steering queries.
+type GoverningVerdict struct {
+	IncidentID  string   `json:"incident_id"`
+	VerdictID   int64    `json:"verdict_id"`
+	Version     int      `json:"version"`
+	Kind        string   `json:"kind"` // correction | confirmation
+	Date        string   `json:"date"` // YYYY-MM-DD (UTC capture date)
+	Age         string   `json:"age"`  // humanized at fetch
+	Note        string   `json:"note,omitempty"`
+	CauseAlert  string   `json:"cause_alert,omitempty"`
+	CauseSeries []string `json:"cause_series,omitempty"`
+	WidenExprs  []string `json:"widen_exprs,omitempty"`
+	Steers      bool     `json:"steers"`
+}
+
+// governingEntry distills a stored verdict into the enrichment entry. The
+// expectation decodes leniently (a persisted record is trusted shape-wise;
+// unknown future fields must not kill recall). Grading vocabulary
+// (must_mention / must_not_conclude) is deliberately NOT carried — it never
+// renders into a prompt (R6).
+func governingEntry(v *store.IncidentVerdict, now time.Time) *GoverningVerdict {
+	if v == nil {
+		return nil
+	}
+	var exp Expectation
+	_ = json.Unmarshal([]byte(v.ExpectationJSON), &exp)
+	widened := decodeWidened(v)
+	exprs := make([]string, 0, len(widened))
+	for _, w := range widened {
+		if w.Expr != "" {
+			exprs = append(exprs, w.Expr)
+		}
+	}
+	return &GoverningVerdict{
+		IncidentID:  v.IncidentID,
+		VerdictID:   v.ID,
+		Version:     v.Version,
+		Kind:        v.Verdict,
+		Date:        v.CreatedAt.UTC().Format("2006-01-02"),
+		Age:         humanizeAge(now.Sub(v.CreatedAt)),
+		Note:        capText(flattenRecalled(v.Note), maxRecallEntryChars),
+		CauseAlert:  exp.CauseAlert,
+		CauseSeries: exp.CauseSeries,
+		WidenExprs:  exprs,
+		Steers:      v.Verdict == "correction",
+	}
+}
+
+// buildSteeringQueries derives the correction's deterministic query set (R2):
+// widen_queries expressions verbatim first, then one probe per cause_series —
+// the metric name as a bare instant vector selector (no guessed labels; the
+// max_series bound prices over-breadth, a bad name lands as a failed outcome).
+// Deduped by expr, capped at maxSteeringQueries.
+func buildSteeringQueries(g *GoverningVerdict) []VerificationQuery {
+	if g == nil || !g.Steers {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var out []VerificationQuery
+	add := func(expr, why string) {
+		if expr == "" || seen[expr] || len(out) == maxSteeringQueries {
+			return
+		}
+		seen[expr] = true
+		out = append(out, VerificationQuery{Kind: kindPromQL, Source: sourceOperator, Expr: expr, Why: why})
+	}
+	for _, e := range g.WidenExprs {
+		add(e, "operator correction: evidence widened at capture")
+	}
+	for _, s := range g.CauseSeries {
+		add(s, fmt.Sprintf("operator correction: does %s show the corrected cause?", s))
+	}
+	return out
+}
+
+// operatorEvidenceFetched reports whether at least one steering query returned
+// data. OutcomeEmpty does not count: an empty result carries no sign
+// (ADR-0024), so it can back neither "supported" nor "contradicted" — the R4
+// backstop treats an unbacked ruling as absent.
+func operatorEvidenceFetched(r *VerificationRound) bool {
+	if r == nil {
+		return false
+	}
+	for _, q := range r.Queries {
+		if q.Source == sourceOperator && q.Outcome == OutcomeFetched {
+			return true
+		}
+	}
+	return false
+}
