@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestPersistVerdictCapture_VersionsAndAtomicity(t *testing.T) {
@@ -113,5 +114,72 @@ func TestLatestVerdictKinds(t *testing.T) {
 	}
 	if _, ok := kinds[b]; ok {
 		t.Fatal("b has no verdict")
+	}
+}
+
+// mustCapture persists a verdict capture with a human source and full
+// confidence, failing the test on error. Shared by the GoverningVerdict tests
+// below.
+func mustCapture(t *testing.T, s *Store, ctx context.Context, incID, verdict, expJSON, note string) *IncidentVerdict {
+	t.Helper()
+	v, _, err := s.PersistVerdictCapture(ctx, VerdictCapture{
+		IncidentID: incID, Verdict: verdict, Source: VerdictSourceHuman,
+		LabelConfidence: 1.0, ExpectationJSON: expJSON, AnnotationNote: note,
+	})
+	if err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+	return v
+}
+
+func TestGoverningVerdict_LatestAcrossIncidents(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	now := time.Now().UTC()
+	// two incidents on one group key, one on another
+	seedJudged(t, s, judged{id: "inc-a", groupKey: "service=checkout", createdAt: now})
+	seedJudged(t, s, judged{id: "inc-b", groupKey: "service=checkout", createdAt: now})
+	seedJudged(t, s, judged{id: "inc-x", groupKey: "service=other", createdAt: now})
+
+	mustCapture(t, s, ctx, "inc-a", "correction", `{"must_mention":["queue"]}`, "older note")
+	mustCapture(t, s, ctx, "inc-b", "confirmation", `{"must_mention":["ok"]}`, "newer note")
+	mustCapture(t, s, ctx, "inc-x", "correction", `{"must_mention":["zzz"]}`, "other key")
+
+	v, err := s.GoverningVerdict(ctx, "service=checkout", false)
+	if err != nil {
+		t.Fatalf("GoverningVerdict: %v", err)
+	}
+	if v == nil || v.IncidentID != "inc-b" || v.Verdict != "confirmation" {
+		t.Fatalf("want newest capture on the key (inc-b confirmation), got %+v", v)
+	}
+	if v.Note != "newer note" {
+		t.Fatalf("want the verdict's annotation note, got %q", v.Note)
+	}
+}
+
+func TestGoverningVerdict_NoneIsNilNil(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	v, err := s.GoverningVerdict(ctx, "service=ghost", false)
+	if err != nil || v != nil {
+		t.Fatalf("want nil,nil for a key with no verdicts, got %+v, %v", v, err)
+	}
+}
+
+func TestGoverningVerdict_DrillParity(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	now := time.Now().UTC()
+	seedJudged(t, s, judged{id: "inc-d", groupKey: "service=checkout", createdAt: now, drill: true}) // alerts carry alertint_drill label
+	seedJudged(t, s, judged{id: "inc-r", groupKey: "service=checkout", createdAt: now, drill: false})
+	mustCapture(t, s, ctx, "inc-d", "correction", `{"must_mention":["drill"]}`, "drill note")
+
+	// real triage never sees the drill verdict
+	if v, err := s.GoverningVerdict(ctx, "service=checkout", false); err != nil || v != nil {
+		t.Fatalf("real read must skip drill verdicts, got %+v, %v", v, err)
+	}
+	// drill triage sees it
+	if v, err := s.GoverningVerdict(ctx, "service=checkout", true); err != nil || v == nil || v.IncidentID != "inc-d" {
+		t.Fatalf("drill read must see the drill verdict, got %+v, %v", v, err)
 	}
 }

@@ -212,7 +212,7 @@ func (s *stubMemoryReader) MemoryPrefilter(_ context.Context, _, _ string, _ boo
 	return s.prefilter, nil
 }
 
-func (s *stubMemoryReader) OperatorAnnotations(_ context.Context, _ string, _ bool, _ time.Time) ([]store.OperatorAnnotation, error) {
+func (s *stubMemoryReader) OperatorAnnotations(_ context.Context, _ string, _ bool) ([]store.OperatorAnnotation, error) {
 	return nil, nil
 }
 

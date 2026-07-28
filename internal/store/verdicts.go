@@ -31,7 +31,10 @@ type IncidentVerdict struct {
 	ExpectationJSON string
 	WidenedJSON     string // "" when no widened entries
 	CauseCategory   string // free-form, "" when absent
-	CreatedAt       time.Time
+	// Note is the verdict's operator note (the newest annotation of the verdict's
+	// kind on its incident). Populated only by GoverningVerdict; "" elsewhere.
+	Note      string
+	CreatedAt time.Time
 }
 
 // VerdictCapture is the persist-phase input: verdict row + matching
@@ -174,4 +177,64 @@ func (s *Store) LatestVerdictKinds(ctx context.Context, incidentIDs []string) (m
 		out[id] = kind
 	}
 	return out, rows.Err()
+}
+
+// GoverningVerdict returns the latest captured verdict of any kind on a group
+// key — the single operator artifact triage consumes (ADR-0029). Unbounded by
+// lookback: human writes are permanent, superseded only by a newer capture.
+// Drill parity applies: drill verdicts govern only drill triage, real only
+// real. Verdicts on the incident currently being triaged are included (a
+// correction on it steers its own re-judgment). Returns nil, nil when the key
+// carries no verdict.
+func (s *Store) GoverningVerdict(ctx context.Context, groupKey string, currentIsDrill bool) (*IncidentVerdict, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT v.id, v.incident_id, v.version, v.verdict, v.source, v.label_confidence,
+		       v.expectation_json, COALESCE(v.widened_json, ''), COALESCE(v.cause_category, ''),
+		       COALESCE((SELECT a.note FROM incident_annotations a
+		                 WHERE a.incident_id = v.incident_id AND a.kind = v.verdict
+		                 ORDER BY a.created_at DESC, a.id DESC LIMIT 1), ''),
+		       v.created_at
+		FROM incident_verdicts v
+		JOIN incidents i ON i.id = v.incident_id
+		WHERE i.group_key = ?
+		ORDER BY v.created_at DESC, v.id DESC`, groupKey)
+	if err != nil {
+		return nil, fmt.Errorf("store: governing verdict: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var candidates []IncidentVerdict
+	for rows.Next() {
+		var v IncidentVerdict
+		var created string
+		if err := rows.Scan(&v.ID, &v.IncidentID, &v.Version, &v.Verdict, &v.Source,
+			&v.LabelConfidence, &v.ExpectationJSON, &v.WidenedJSON, &v.CauseCategory,
+			&v.Note, &created); err != nil {
+			return nil, fmt.Errorf("store: governing verdict scan: %w", err)
+		}
+		if v.CreatedAt, err = time.Parse(time.RFC3339Nano, created); err != nil {
+			return nil, fmt.Errorf("store: governing verdict parse created_at: %w", err)
+		}
+		candidates = append(candidates, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: governing verdict rows: %w", err)
+	}
+	if len(candidates) == 0 {
+		return nil, nil //nolint:nilnil // callers distinguish not-found by nil pointer, not sentinel
+	}
+	ids := make([]string, len(candidates))
+	for i := range candidates {
+		ids[i] = candidates[i].IncidentID
+	}
+	flags, err := s.IncidentDrillFlags(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("store: governing verdict drill flags: %w", err)
+	}
+	for i := range candidates {
+		if flags[candidates[i].IncidentID] == currentIsDrill {
+			return &candidates[i], nil
+		}
+	}
+	return nil, nil //nolint:nilnil // callers distinguish not-found by nil pointer, not sentinel
 }

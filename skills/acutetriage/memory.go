@@ -22,8 +22,8 @@ type MemoryReader interface {
 	MemoryView(ctx context.Context, groupKey, currentIncidentID string, currentIsDrill bool, since time.Time) (*store.MemoryView, error)
 	MemoryPrefilter(ctx context.Context, groupKey, currentIncidentID string, currentIsDrill bool, since time.Time, limit int) ([]store.PriorFinding, error)
 	// OperatorAnnotations feeds the human-locked tier (ADR-0028): every
-	// annotation on the key's incidents within the lookback, newest-first.
-	OperatorAnnotations(ctx context.Context, groupKey string, currentIsDrill bool, since time.Time) ([]store.OperatorAnnotation, error)
+	// annotation on the key's incidents, unbounded, newest-first.
+	OperatorAnnotations(ctx context.Context, groupKey string, currentIsDrill bool) ([]store.OperatorAnnotation, error)
 }
 
 // MemoryParams carries the recall tunables from the memory config section.
@@ -157,7 +157,7 @@ func FetchMemory(ctx context.Context, reader MemoryReader, params MemoryParams, 
 	if err != nil {
 		weakCandidates = nil // a prefilter miss must not sink the exact-key recall
 	}
-	ops, err := reader.OperatorAnnotations(ctx, inc.GroupKey, isDrill, since)
+	ops, err := reader.OperatorAnnotations(ctx, inc.GroupKey, isDrill)
 	if err != nil {
 		ops = nil // an operator-tier miss must not sink the recall
 	}

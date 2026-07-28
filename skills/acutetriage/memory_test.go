@@ -39,7 +39,7 @@ func (f *fakeMemoryReader) MemoryPrefilter(_ context.Context, _, _ string, _ boo
 	return f.prefilter, f.prefErr
 }
 
-func (f *fakeMemoryReader) OperatorAnnotations(_ context.Context, _ string, _ bool, _ time.Time) ([]store.OperatorAnnotation, error) {
+func (f *fakeMemoryReader) OperatorAnnotations(_ context.Context, _ string, _ bool) ([]store.OperatorAnnotation, error) {
 	return f.ops, f.opsErr
 }
 

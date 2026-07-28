@@ -125,19 +125,20 @@ type OperatorAnnotation struct {
 	CreatedAt  time.Time
 }
 
-// OperatorAnnotations returns every annotation on the key's
-// incidents within the lookback, newest-first, filtered to the caller's drill
-// side (a real triage recalls only real incidents' notes and vice versa).
+// OperatorAnnotations returns every annotation on the key's incidents,
+// unbounded and newest-first, filtered to the caller's drill side (a real
+// triage recalls only real incidents' notes and vice versa). Unbounded by
+// lookback: human writes are permanent (R7), not subject to time-based decay.
 // Unlike prior-finding recall it does NOT exclude the current incident: a
 // re-judgment must recall a correction captured on the incident itself.
-func (s *Store) OperatorAnnotations(ctx context.Context, groupKey string, currentIsDrill bool, since time.Time) ([]OperatorAnnotation, error) {
+func (s *Store) OperatorAnnotations(ctx context.Context, groupKey string, currentIsDrill bool) ([]OperatorAnnotation, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT a.incident_id, a.kind, a.note, a.created_at
 		FROM incident_annotations a
 		JOIN incidents i ON i.id = a.incident_id
-		WHERE i.group_key = ? AND a.created_at >= ?
+		WHERE i.group_key = ?
 		ORDER BY a.created_at DESC, a.id DESC`,
-		groupKey, since.UTC().Format(time.RFC3339Nano))
+		groupKey)
 	if err != nil {
 		return nil, fmt.Errorf("store: operator annotations: %w", err)
 	}
