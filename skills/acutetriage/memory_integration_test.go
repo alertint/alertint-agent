@@ -199,6 +199,7 @@ func TestRejudge_ResetsOwnMarks(t *testing.T) {
 type stubMemoryReader struct {
 	view      *store.MemoryView
 	prefilter []store.PriorFinding
+	governing *store.IncidentVerdict
 }
 
 func (s *stubMemoryReader) MemoryView(_ context.Context, groupKey, _ string, _ bool, _ time.Time) (*store.MemoryView, error) {
@@ -213,7 +214,7 @@ func (s *stubMemoryReader) MemoryPrefilter(_ context.Context, _, _ string, _ boo
 }
 
 func (s *stubMemoryReader) GoverningVerdict(_ context.Context, _ string, _ bool) (*store.IncidentVerdict, error) {
-	return nil, nil //nolint:nilnil // callers distinguish not-found by nil pointer, not sentinel
+	return s.governing, nil //nolint:nilnil // callers distinguish not-found by nil pointer, not sentinel
 }
 
 // Covers AE5: an annotations-only re-fire recalling a 0.70 prior, with the model

@@ -350,6 +350,81 @@ func TestVerificationRevisesRegionalVerdict(t *testing.T) {
 	}
 }
 
+// TestAuditVerificationPlannedIncludesOperatorQueries regression-tests the
+// audit-parity bug: auditVerificationPlanned used to be called before the
+// governing verdict's operator-sourced steering queries (ADR-0029) were even
+// computed, and its own plan assembly had no way to include them — so a
+// steering-active triage's "planned" audit row silently undercounted relative
+// to the round that actually executed. A governing correction verdict here
+// contributes one operator query (buildSteeringQueries), no model queries are
+// proposed, so the round is floor(2) + operator(1) = 3 — and the planned audit
+// row must show exactly that, with the operator query present.
+func TestAuditVerificationPlannedIncludesOperatorQueries(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	auditor := audit.New(st.DB())
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-steer", map[string]string{"alertname": "DiskFull", "host": "web1"})
+
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "disk event", "disk pressure", 0.9, nil)},
+		{raw: callTwoResp(t, "disk event", "disk pressure", 0.9, "")},
+	}}
+
+	cfg := verifyConfig(promHealthy(t))
+	cfg.Memory = &stubMemoryReader{
+		view: &store.MemoryView{GroupKey: "alertname=DiskFull,host=web1"},
+		governing: &store.IncidentVerdict{
+			IncidentID:      inc.ID,
+			Version:         1,
+			Verdict:         "correction",
+			ExpectationJSON: `{"cause_series":["pvc_bytes"]}`,
+			CreatedAt:       time.Now(),
+		},
+	}
+	cfg.MemoryParams = acutetriage.MemoryParams{LookbackDays: 90}
+	skill := acutetriage.New(cfg, st, scripted, auditor, nil, nil)
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	f := readFinding(t, st, inc.ID)
+	ver := verificationOf(t, f.enrichment)
+	if ver == nil || len(ver.Rounds) != 1 {
+		t.Fatalf("expected one verification round, got %+v", ver)
+	}
+	round := ver.Rounds[0]
+	if len(round.Queries) != 3 { // 2 floor + 1 operator, no model queries proposed
+		t.Fatalf("want 3 executed queries (2 floor + 1 operator), got %d: %+v", len(round.Queries), round.Queries)
+	}
+
+	var payload string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT payload_json FROM audit_log WHERE kind = 'incident.verification_planned'`).Scan(&payload); err != nil {
+		t.Fatalf("query incident.verification_planned audit: %v", err)
+	}
+	var planned struct {
+		Queries []map[string]string `json:"queries"`
+	}
+	if err := json.Unmarshal([]byte(payload), &planned); err != nil {
+		t.Fatalf("unmarshal planned payload: %v\n%s", err, payload)
+	}
+	if len(planned.Queries) != len(round.Queries) {
+		t.Fatalf("planned audit query count (%d) must match executed round query count (%d): planned=%+v executed=%+v",
+			len(planned.Queries), len(round.Queries), planned.Queries, round.Queries)
+	}
+	found := false
+	for _, q := range planned.Queries {
+		if q["source"] == "operator" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("planned audit payload must include the operator-sourced steering query: %+v", planned.Queries)
+	}
+}
+
 // --------------------------------------------------------------------------
 // T4(a) — clamp on a partial failure
 // --------------------------------------------------------------------------

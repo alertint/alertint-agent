@@ -779,17 +779,19 @@ func (s *Skill) promQuerier() metricQuerier {
 func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts []store.Alert, ar analysisResult, resp llmResponse, p pipelineParams) (json.RawMessage, llmResponse, *VerificationEnrichment) {
 	draft := DraftRef{RootCause: resp.OverallIssue, Confidence: resp.Confidence}
 	modelQ := parseVerificationPlan(ar.raw, s.cfg.Verification.MaxQueries, s.logger, inc.ID)
-	s.auditVerificationPlanned(ctx, inc, alerts, modelQ)
 
 	// The governing verdict's operator-sourced steering queries (ADR-0029) ride
 	// the same round, between the floor and the model's own proposals.
 	// ar.memory is nil on paths that skip memory fetch entirely (e.g. no store
 	// configured) — buildSteeringQueries is nil-safe on a nil governing verdict.
+	// Computed BEFORE auditVerificationPlanned so the "planned" audit row
+	// matches the round that actually executes (same three tiers, same order).
 	var governing *GoverningVerdict
 	if ar.memory != nil {
 		governing = ar.memory.Governing
 	}
 	operatorQ := buildSteeringQueries(governing)
+	s.auditVerificationPlanned(ctx, inc, alerts, operatorQ, modelQ)
 
 	// The runner shares the SAME true-nil-safe querier the analysis fetch used, and
 	// the store as the incidents_in_window state reader. It never errors: a query's
@@ -880,22 +882,32 @@ func (s *Skill) degradedDraft(ctx context.Context, incidentID string, draftRaw j
 	return draftRaw, draft, &VerificationEnrichment{Outcome: verifyOutcomeDegraded, Rounds: []VerificationRound{*round}}
 }
 
-// auditVerificationPlanned records the plan before it runs: the model/floor query
-// counts and each query's kind/source/why — never a metric value (R4/KTD6).
-func (s *Skill) auditVerificationPlanned(ctx context.Context, inc store.Incident, alerts []store.Alert, modelQ []VerificationQuery) {
+// auditVerificationPlanned records the plan before it runs: the floor/operator/
+// model query counts and each query's kind/source/why — never a metric value
+// (R4/KTD6). The plan is assembled in the SAME floor→operator→model order the
+// round itself uses (runVerificationWith), so this audit row's query list
+// matches the executed round query-for-query — operatorQ (the governing
+// verdict's steering queries, ADR-0029) must never be omitted here even though
+// it is exempt from MaxQueries, or the "planned" and "executed" audit rows
+// would silently disagree in count.
+func (s *Skill) auditVerificationPlanned(ctx context.Context, inc store.Incident, alerts []store.Alert, operatorQ, modelQ []VerificationQuery) {
 	if s.auditor == nil {
 		return
 	}
-	plan := append(floorPlan(alerts), modelQ...)
+	plan := make([]VerificationQuery, 0, 2+len(operatorQ)+len(modelQ))
+	plan = append(plan, floorPlan(alerts)...)
+	plan = append(plan, operatorQ...)
+	plan = append(plan, modelQ...)
 	qs := make([]map[string]string, 0, len(plan))
 	for _, q := range plan {
 		qs = append(qs, map[string]string{"kind": q.Kind, "source": q.Source, "why": q.Why})
 	}
 	_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.verification_planned", map[string]any{
-		"incident_id":       inc.ID,
-		"model_query_count": len(modelQ),
-		"floor_query_count": 2,
-		"queries":           qs,
+		"incident_id":          inc.ID,
+		"model_query_count":    len(modelQ),
+		"operator_query_count": len(operatorQ),
+		"floor_query_count":    2,
+		"queries":              qs,
 	})
 }
 
