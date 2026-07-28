@@ -50,31 +50,26 @@ func canonicalExpectationJSON(e Expectation) string {
 }
 
 // synthesizeNote derives the annotation note when the caller passes none
-// (D7): deterministic, from the expectation only.
+// (D7): deterministic, from the expectation only. MustMention/MustNotConclude
+// are grading vocabulary (R6) — the note becomes GoverningVerdict.Note, which
+// renders straight into the triage prompt, so those fields must NEVER
+// contribute phrasing here or the model is handed its own grading rubric.
+// CauseAlert is not grading vocabulary — it's the same evidence-anchor field
+// that already travels separately via GoverningVerdict.CauseAlert and renders
+// explicitly as a "Corrected-cause anchors:" line — so it stays.
 func synthesizeNote(verdict string, e Expectation) string {
 	verb := "corrected"
 	if verdict == "confirmation" {
 		verb = "confirmed"
 	}
-	var parts []string
-	if e.CauseAlert != "" {
-		parts = append(parts, "cause "+e.CauseAlert)
-	}
-	if len(e.MustMention) > 0 {
-		parts = append(parts, "must mention "+strings.Join(e.MustMention, ", "))
-	}
-	if len(e.MustNotConclude) > 0 {
-		parts = append(parts, "not "+strings.Join(e.MustNotConclude, ", "))
-	}
-	if len(parts) == 0 {
+	if e.CauseAlert == "" {
 		return verb
 	}
 	// Capped below store.MaxAnnotationNoteChars (leaving room for capText's
-	// ellipsis marker): an expectation with many/long discriminator strings is
-	// otherwise schema-valid but would make the synthesized note alone exceed
-	// the store's write-boundary cap, failing an atomic capture on a caller
-	// who never opted into a free-text note at all.
-	return capText(verb+": "+strings.Join(parts, "; "), store.MaxAnnotationNoteChars-1)
+	// ellipsis marker): a schema-valid but very long cause_alert must not make
+	// the synthesized note alone exceed the store's write-boundary cap, failing
+	// an atomic capture on a caller who never opted into a free-text note at all.
+	return capText(verb+": cause "+e.CauseAlert, store.MaxAnnotationNoteChars-1)
 }
 
 // frozenEnvelope is the decoded persist-as-rendered enrichment envelope — the

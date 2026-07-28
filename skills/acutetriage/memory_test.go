@@ -474,14 +474,27 @@ func TestFetchMemory_CorrectedPriorNeverStrong(t *testing.T) {
 	}
 }
 
+// The governing-verdict read error must be scoped to just that one tier
+// (fail-open), never sink the whole recall. Seeding a strong prior alongside
+// the error is the point: it proves the error is swallowed locally rather
+// than short-circuiting FetchMemory before the rest of the fold runs — a
+// fail-closed regression here (e.g. `if err != nil { return nil }` right
+// after the GoverningVerdict call) would drop the strong recall too, which
+// this assertion catches and a bare "m == nil with nothing else recalled"
+// check could not (that shape passes whether or not the error is scoped).
 func TestFetchMemory_GoverningVerdictFetchErrorDegradesToNoTier(t *testing.T) {
 	reader := &fakeMemoryReader{
-		view:         &store.MemoryView{GroupKey: "k"},
+		view: &store.MemoryView{GroupKey: "k", PriorFindings: []store.PriorFinding{
+			{IncidentID: "inc_strong", AnalyzedAt: now2026(), Confidence: 0.7, RootCause: "strong cause"},
+		}},
 		governingErr: errors.New("boom"),
 	}
 	m := FetchMemory(context.Background(), reader, MemoryParams{}, store.Incident{ID: "cur", GroupKey: "k"}, false, now2026())
-	if m != nil {
-		t.Errorf("a governing-verdict-fetch error with nothing else recalled must yield nil, got %+v", m)
+	if m == nil || m.Strong == nil {
+		t.Fatalf("a governing-verdict-fetch error must not sink the rest of the recall, got %+v", m)
+	}
+	if m.Governing != nil {
+		t.Errorf("a governing-verdict-fetch error must degrade to no governing tier, got %+v", m.Governing)
 	}
 }
 

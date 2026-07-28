@@ -72,32 +72,52 @@ func TestParseExpectation(t *testing.T) {
 	}
 }
 
+// R6: MustMention/MustNotConclude are grading vocabulary — even present on
+// the input Expectation, they must never surface in the synthesized note
+// (which becomes GoverningVerdict.Note and renders straight into the triage
+// prompt). CauseAlert is not grading vocabulary and stays.
 func TestSynthesizeNote(t *testing.T) {
 	e := Expectation{CauseAlert: "NodeNetworkInterfaceFlapping",
 		MustMention: []string{"NIC", "worker-14"}, MustNotConclude: []string{"AZ outage"}}
 	got := synthesizeNote("correction", e)
-	want := "corrected: cause NodeNetworkInterfaceFlapping; must mention NIC, worker-14; not AZ outage"
+	want := "corrected: cause NodeNetworkInterfaceFlapping"
 	if got != want {
 		t.Fatalf("got %q want %q", got, want)
 	}
-	if got := synthesizeNote("confirmation", Expectation{MustMention: []string{"disk full"}}); got != "confirmed: must mention disk full" {
+	if got := synthesizeNote("confirmation", Expectation{MustMention: []string{"disk full"}}); got != "confirmed" {
 		t.Fatalf("got %q", got)
 	}
 }
 
 // TestSynthesizeNote_CappedBelowStoreLimit covers a schema-valid expectation
-// with many/long discriminator strings: the synthesized note alone must
-// never exceed the store's write-boundary cap, or an atomic capture fails
-// for a caller who never opted into a free-text note.
+// with a very long cause_alert: the synthesized note alone must never exceed
+// the store's write-boundary cap, or an atomic capture fails for a caller who
+// never opted into a free-text note. MustMention no longer contributes to the
+// note (R6), so the long input has to come from CauseAlert to still exercise
+// the truncation path.
 func TestSynthesizeNote_CappedBelowStoreLimit(t *testing.T) {
-	long := make([]string, 200)
-	for i := range long {
-		long[i] = strings.Repeat("x", 30)
-	}
-	e := Expectation{MustMention: long}
+	e := Expectation{CauseAlert: strings.Repeat("x", 6000)}
 	got := synthesizeNote("correction", e)
 	if n := utf8.RuneCountInString(got); n > store.MaxAnnotationNoteChars {
 		t.Fatalf("synthesized note is %d chars, exceeds store cap %d", n, store.MaxAnnotationNoteChars)
+	}
+}
+
+// Belt and suspenders (R6): a real operator/agent would supply distinctive
+// MustMention/MustNotConclude content, not the literal snake_case JSON key
+// names — assert the actual strings never surface, not just the keys.
+func TestSynthesizeNote_NeverLeaksGradingVocabulary(t *testing.T) {
+	e := Expectation{
+		MustMention:     []string{"distinctivemention123"},
+		MustNotConclude: []string{"distinctiveconclude456"},
+	}
+	for _, verdict := range []string{"correction", "confirmation"} {
+		got := synthesizeNote(verdict, e)
+		for _, leaked := range []string{"distinctivemention123", "distinctiveconclude456"} {
+			if strings.Contains(got, leaked) {
+				t.Errorf("synthesizeNote(%q, ...) = %q leaked grading vocabulary %q", verdict, got, leaked)
+			}
+		}
 	}
 }
 

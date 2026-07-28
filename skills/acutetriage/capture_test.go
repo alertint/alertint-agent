@@ -213,7 +213,10 @@ func TestCaptureVerdict_PersistPhase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(anns) != 1 || anns[0].Kind != "correction" || !strings.Contains(anns[0].Note, "not AZ outage") {
+	// No free-text note and no cause_alert on the expectation: the note
+	// synthesizes to the bare verb — must_not_conclude ("AZ outage") is
+	// grading vocabulary (R6) and must never surface in the synthesized note.
+	if len(anns) != 1 || anns[0].Kind != "correction" || anns[0].Note != "corrected" {
 		t.Fatalf("annotation row: %+v", anns)
 	}
 
