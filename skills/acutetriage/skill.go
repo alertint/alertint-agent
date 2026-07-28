@@ -333,6 +333,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	// (the call-1 prompt-side directive was rendered before the round existed, so
 	// it passed nil — only this deterministic post-call cap sees verification).
 	s.applyEvidenceCap(&resp, decision, ar.metrics, ar.logs, ar.changes, ar.sentry, ver, inc.ID)
+	s.applySteeringCap(&resp, governingOf(ar.memory), ver, inc.ID)
 
 	// Persist output, including the log-enrichment snapshot so the evidence pack
 	// can replay exactly what the model saw (empty on the short-circuit /
@@ -769,6 +770,28 @@ func (s *Skill) applyEvidenceCap(resp *llmResponse, decision rules.Decision, met
 		"model_confidence", resp.Confidence,
 		"capped_to", MaxMetadataOnlyConfidence,
 	)
+	resp.Confidence = MaxMetadataOnlyConfidence
+}
+
+// applySteeringCap is the R4 backstop — one predicate: steering was active and
+// no fetched-query-backed ruling of supported or contradicted exists ⇒ the
+// finding's confidence is clamped to MaxMetadataOnlyConfidence. Covers
+// model-reported unverifiable, ruling absent, unbacked rulings, the degraded
+// round, and verification-off. A backed contradicted/supported never clamps
+// (scenario B keeps the model's own confidence). Deterministic: runs after
+// the LLM, independent of prompt compliance.
+func (s *Skill) applySteeringCap(resp *llmResponse, g *GoverningVerdict, ver *VerificationEnrichment, incidentID string) {
+	if g == nil || !g.Steers || resp.Confidence <= MaxMetadataOnlyConfidence {
+		return
+	}
+	if ver != nil && ver.OperatorRuling != nil {
+		r := ver.OperatorRuling
+		if (r.Ruling == "supported" || r.Ruling == "contradicted") && r.Backed {
+			return
+		}
+	}
+	s.logger.Info("confidence capped: operator correction not ruled out by fetched evidence",
+		"incident", incidentID, "model_confidence", resp.Confidence, "capped_to", MaxMetadataOnlyConfidence)
 	resp.Confidence = MaxMetadataOnlyConfidence
 }
 
