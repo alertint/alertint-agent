@@ -1165,9 +1165,13 @@ func TestSteering_AbsentRulingKeepsRevisionAndClamps(t *testing.T) {
 // unmarshal of the whole call-2 response: the revision is KEPT (never routed
 // through the degraded-JSON path, which would discard the whole verdict),
 // the ruling record degrades to "absent" — same as an omitted key — and the
-// existing soft-validation WARN fires. Live evidence (promHealthy) isolates
-// this to the shape-tolerance behavior itself: nothing here depends on
-// Task 8's not-yet-built clamp.
+// existing soft-validation WARN fires. That "absent" record is structurally
+// identical to TestSteering_AbsentRulingKeepsRevisionAndClamps's, so the
+// Task 8 backstop (applySteeringCap: clamp unless a fetched-query-backed
+// ruling of supported or contradicted exists) applies here exactly the same
+// way — confidence clamps to MaxMetadataOnlyConfidence regardless of the
+// live evidence (promHealthy) that keeps the pre-existing annotations-only
+// cap from firing on its own.
 func TestSteering_MalformedRulingShapeKeepsRevisionAndClamps(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
@@ -1197,8 +1201,9 @@ func TestSteering_MalformedRulingShapeKeepsRevisionAndClamps(t *testing.T) {
 	if f.rootCause != "pvc exhaustion on web1" {
 		t.Errorf("root cause = %q, want the revision KEPT despite the malformed ruling shape (soft validation)", f.rootCause)
 	}
-	if f.confidence != 0.85 {
-		t.Errorf("confidence = %v, want 0.85 (this fixture has live evidence throughout — the call must not be discarded as degraded)", f.confidence)
+	if f.confidence != acutetriage.MaxMetadataOnlyConfidence {
+		t.Errorf("confidence = %v, want %v (an absent ruling clamps regardless of shape — same backstop as the omitted-key case)",
+			f.confidence, acutetriage.MaxMetadataOnlyConfidence)
 	}
 	ver := verificationOf(t, f.enrichment)
 	if ver == nil {
