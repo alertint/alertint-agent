@@ -610,7 +610,8 @@ func (d *drillCmd) printCappedHint(confidence float64, kind capHintKind) {
 		d.printf("for real incidents, connect an evidence source (Prometheus first if you have it):")
 		d.printf("https://alertint.com/docs/integrations/prometheus — or get in touch and we'll add your stack.")
 	}
-	d.printf("note: drill alerts carry fictional labels, so evidence sources cannot uncap a drill re-run.")
+	d.printf("note: drill alerts carry fictional labels, so enrichment sources cannot uncap a drill re-run")
+	d.printf("      (an operator correction verified by the steering round is the one exception).")
 }
 
 func (d *drillCmd) printNotReady(incidentID, state string) {
