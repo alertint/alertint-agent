@@ -76,6 +76,25 @@ resolved but is firing again reads as a likely **regression**; one that is
 ignored reads as **known-tolerated**. The check is best-effort — if the status
 cannot be read, the recall proceeds with a short "status unavailable" note.
 
+## Operator verdicts steer the next triage
+
+When an operator captures a **correction** verdict on an incident, the next
+triage of that failure group tests it instead of blending it. The correction's
+evidence — its widened queries and one probe per named cause series — runs as
+read-only checks in the verification round, and the model must rule on the
+result: `supported` (the corrected cause is adopted, confidence from the
+evidence), `contradicted` (not adopted; the card says the correction was
+checked and what contradicted it), or `unverifiable` (adopted as a leading
+hypothesis, confidence capped at 0.6, with the correction's date named). A
+correction is never an axiom: it is guaranteed to be fetched and ruled on
+every recurrence, and live evidence can retire it. A **confirmation** verdict
+retires steering — it records that the machine's conclusion is right.
+
+Notes written with `alertint_incident_annotate` are context for the next
+investigator: they render on the Slack card's history block and in MCP
+incident reads (`operator_history`), permanent and age-stamped, and never
+enter the triage prompt or influence recall.
+
 ## Inspecting what the model saw
 
 The memory a given analysis saw is visible over MCP: the get-incident payload
@@ -179,7 +198,11 @@ render — but it is not recommended. The vendor never flips a render remotely.
 ## Configuration
 
 Both halves share the [`memory`](../getting-started/configuration.md#memory)
-config block. Recall reuses the same `lookback_days` horizon as the occurrence
-ledger. The recurrence key is the verbatim group key with no normalization, so
-grouping on volatile labels (a pod name, a job id) makes a condition rarely
-repeat — `alertint validate` warns when a group label looks volatile.
+config block. Recall of LLM prior findings reuses the same `lookback_days`
+horizon as the occurrence ledger — that scope is machine memory only. Operator
+verdicts and notes have no time bound: a human write is permanent, corrected
+only by a newer write, and a stale correction is retired by evidence (the
+steering ruling), not by the calendar. The recurrence key is the verbatim
+group key with no normalization, so grouping on volatile labels (a pod name, a
+job id) makes a condition rarely repeat — `alertint validate` warns when a
+group label looks volatile.

@@ -214,7 +214,7 @@ func (s *stubMemoryReader) MemoryPrefilter(_ context.Context, _, _ string, _ boo
 }
 
 func (s *stubMemoryReader) GoverningVerdict(_ context.Context, _ string, _ bool) (*store.IncidentVerdict, error) {
-	return s.governing, nil //nolint:nilnil // callers distinguish not-found by nil pointer, not sentinel
+	return s.governing, nil // callers distinguish not-found by nil pointer, not sentinel
 }
 
 // Covers AE5: an annotations-only re-fire recalling a 0.70 prior, with the model

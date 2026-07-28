@@ -4,6 +4,7 @@
 // contributes deterministic verification queries and demands a ruling before
 // its corrected cause may be adopted. Precedence through testing, never
 // authority.
+
 package acutetriage
 
 import (

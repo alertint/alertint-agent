@@ -92,7 +92,7 @@ restart Windsurf and check **Settings → MCP Servers**:
 | Tool | Description |
 |---|---|
 | `alertint_list_incidents` | List incidents with optional status and limit filters. |
-| `alertint_get_incident` | Get full analysis details for one incident by ID. |
+| `alertint_get_incident` | Get full analysis details for one incident by ID, including `operator_history` — the group's governing verdict and age-stamped notes, visible from any incident on the group key. |
 | `alertint_search_alerts` | Search raw alerts by label key and value. |
 | `alertint_get_evidence_pack` | Get the evidence pack and Prometheus metrics for an incident. |
 | `alertint_verify_audit` | Verify the hash-chained audit log and report any tampering. |
@@ -102,8 +102,8 @@ restart Windsurf and check **Settings → MCP Servers**:
 | `alertint_recent_changes` | List recent deploys/releases/PRs matching a label selector (requires change enrichment enabled). |
 | `sentry_issues_list` | List live, distilled Sentry issues for a project (+ optional environment) by status (`unresolved`/`resolved`/`ignored`); requires the Sentry Error source enabled. |
 | `sentry_issues_trace` | Return full distilled stacktraces (`file:line`, function, `in_app`) for up to 10 Sentry issue ids; requires the Sentry Error source enabled. |
-| `alertint_incident_annotate` | Attach an operator correction/observation to an incident; corrections demote the finding from memory recall. |
-| `alertint_incident_capture_verdict` | Capture an operator-confirmed verdict as a replayable record and grade current triage against it (red/green). |
+| `alertint_incident_annotate` | Attach a permanent, age-stamped operator note to an incident — context for the next investigator; never affects triage or memory recall. |
+| `alertint_incident_capture_verdict` | Capture an operator-confirmed correction or confirmation as a replayable, graded record. A correction steers the next triage of its failure group (tested against live evidence, ruling-gated — never blended in) and demotes the corrected prior from strong recall; a confirmation retires steering. |
 
 Read-only toward your systems, always; feedback writes (the last two tools
 above) land only in AlertINT's own incident state, additive and
