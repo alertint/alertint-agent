@@ -95,36 +95,33 @@ func seedAnalyzedIncidentOnKey(t *testing.T, st *store.Store) store.Incident {
 	return *got
 }
 
-func TestAnnotate_CorrectionDemotesAuditsNotifies(t *testing.T) {
+func TestAnnotate_CorrectionAuditsNotifiesNoDemote(t *testing.T) {
 	st := newTestStore(t)
 	inc := seedAnalyzedIncidentOnKey(t, st)
 	sink := &fakeAnnotationSink{}
 	eng := acutetriage.NewCaptureEngine(skillForCapture(t, st, sink))
+	ctx := context.Background()
 
-	res, err := eng.Annotate(context.Background(), acutetriage.AnnotateRequest{
+	res, err := eng.Annotate(ctx, acutetriage.AnnotateRequest{
 		IncidentID: inc.ID, Kind: "correction", Note: "not an AZ outage",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.Demoted {
-		t.Fatal("correction must demote")
+	if res.Demoted {
+		t.Fatal("a note-only correction pulls no lever (D7): demoted must be false")
 	}
 
-	var marks int
-	if err := st.DB().QueryRowContext(context.Background(),
-		`SELECT memory_refute_marks FROM incidents WHERE id = ?`, inc.ID).Scan(&marks); err != nil {
-		t.Fatal(err)
-	}
-	if marks != 2 { // demotionThreshold
-		t.Fatalf("marks floored at 2, got %d", marks)
+	// and the marks floor must be untouched
+	if marks := readRefuteMarks(t, st, ctx, inc.ID); marks != 0 {
+		t.Fatalf("annotate must not set the marks floor, got %d", marks)
 	}
 
 	if n := auditCount(t, st, "incident.annotated"); n != 1 {
 		t.Fatalf("want exactly one incident.annotated audit row, got %d", n)
 	}
 	auditor := audit.New(st.DB())
-	rep, err := auditor.Verify(context.Background())
+	rep, err := auditor.Verify(ctx)
 	if err != nil || !rep.OK {
 		t.Fatalf("audit chain must verify: report=%+v err=%v", rep, err)
 	}
@@ -132,6 +129,18 @@ func TestAnnotate_CorrectionDemotesAuditsNotifies(t *testing.T) {
 	if len(sink.events) != 1 || sink.events[0].Kind != "correction" || sink.events[0].Note != "not an AZ outage" {
 		t.Fatalf("annotation sink saw %+v", sink.events)
 	}
+}
+
+// readRefuteMarks reads memory_refute_marks for an incident — used to assert
+// annotate (D7) never touches the marks floor.
+func readRefuteMarks(t *testing.T, st *store.Store, ctx context.Context, incidentID string) int {
+	t.Helper()
+	var marks int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT memory_refute_marks FROM incidents WHERE id = ?`, incidentID).Scan(&marks); err != nil {
+		t.Fatal(err)
+	}
+	return marks
 }
 
 func TestAnnotate_Validation(t *testing.T) {
@@ -155,12 +164,7 @@ func TestAnnotate_Validation(t *testing.T) {
 	if res.Demoted {
 		t.Fatal("an observation must not demote")
 	}
-	var marks int
-	if err := st.DB().QueryRowContext(ctx,
-		`SELECT memory_refute_marks FROM incidents WHERE id = ?`, inc.ID).Scan(&marks); err != nil {
-		t.Fatal(err)
-	}
-	if marks != 0 {
+	if marks := readRefuteMarks(t, st, ctx, inc.ID); marks != 0 {
 		t.Fatalf("an observation must not touch marks, got %d", marks)
 	}
 }

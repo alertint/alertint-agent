@@ -40,9 +40,11 @@ type AnnotateResult struct {
 	Demoted      bool
 }
 
-// Annotate stores a kind+note annotation, demotes the finding from strong
-// recall iff correction (D3), audits, and fans out the annotation event
-// (Slack thread reply + stdout line). The finding row is never touched.
+// Annotate stores a kind+note annotation, audits, and fans out the annotation
+// event (Slack thread reply + stdout line). Notes speak to the next
+// investigator only (channel split, ADR-0028 as amended): an annotation pulls
+// no lever — no recall demotion, no marks floor. Machine effect belongs to
+// verdict capture. The finding row is never touched.
 func (e *CaptureEngine) Annotate(ctx context.Context, req AnnotateRequest) (*AnnotateResult, error) {
 	if req.Kind != "correction" && req.Kind != "observation" {
 		return nil, fmt.Errorf("acutetriage: annotate: kind %q not in {correction, observation} (confirmation is written by capture only)", req.Kind)
@@ -61,15 +63,6 @@ func (e *CaptureEngine) Annotate(ctx context.Context, req AnnotateRequest) (*Ann
 		}
 		return nil, fmt.Errorf("acutetriage: annotate: %w", err)
 	}
-	demoted := false
-	if req.Kind == "correction" {
-		if err := e.sk.st.SetRefuteMarksFloor(ctx, req.IncidentID, demotionThreshold); err != nil {
-			e.sk.logger.Warn("acutetriage: annotate: demotion failed (recall still demotes structurally)",
-				"incident", req.IncidentID, "err", err)
-		} else {
-			demoted = true
-		}
-	}
 	if e.sk.auditor != nil {
 		if err := e.sk.auditor.Append(ctx, captureActor, "incident.annotated", map[string]any{
 			"incident_id": req.IncidentID, "kind": req.Kind, "note": req.Note,
@@ -78,7 +71,7 @@ func (e *CaptureEngine) Annotate(ctx context.Context, req AnnotateRequest) (*Ann
 		}
 	}
 	e.notifyAnnotation(ctx, inc, req.Kind, req.Note, 0)
-	return &AnnotateResult{AnnotationID: ann.ID, Demoted: demoted}, nil
+	return &AnnotateResult{AnnotationID: ann.ID, Demoted: false}, nil
 }
 
 // notifyAnnotation fans the event out when the notifier supports it.

@@ -19,11 +19,12 @@ import (
 
 func (s *Server) toolIncidentAnnotate() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 	tool := mcplib.NewTool("alertint_incident_annotate",
-		mcplib.WithDescription("Attach an operator annotation to an incident. kind=correction "+
-			"demotes the incident's finding from strong memory recall immediately; "+
-			"kind=observation adds context only. The note (≤2000 chars) is recalled into "+
-			"future triages of this incident's key as a human-locked prior. Writes land "+
-			"only in AlertINT's own incident state, audit-chained — never in your systems."),
+		mcplib.WithDescription("Attach an operator note to an incident — human context "+
+			"for the next investigator, shown in the incident's history (Slack card and "+
+			"MCP reads), permanent and age-stamped. Notes never influence triage or "+
+			"memory recall; to correct or confirm a finding with machine effect, use "+
+			"alertint_incident_capture_verdict. Writes land only in AlertINT's own "+
+			"incident state, audit-chained — never in your systems."),
 		mcplib.WithString("incident_id", mcplib.Description("Incident ID from alertint_list_incidents."), mcplib.Required()),
 		mcplib.WithString("kind", mcplib.Description("correction | observation"), mcplib.Required()),
 		mcplib.WithString("note", mcplib.Description("Free text, max 2000 chars."), mcplib.Required()),
