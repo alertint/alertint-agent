@@ -181,7 +181,7 @@ func TestRunVerificationHealthyPeers(t *testing.T) {
 	r := runVerification(context.Background(), prom, fakeState{total: 0},
 		VerificationParams{Enabled: true, MaxQueries: 4, QueryTimeoutSeconds: 10},
 		store.Incident{ID: "inc1", GroupKey: "db|stolon"}, alerts,
-		DraftRef{RootCause: "regional partition", Confidence: 0.95}, model, time.Now().UTC(), nil)
+		DraftRef{RootCause: "regional partition", Confidence: 0.95}, nil, model, time.Now().UTC(), nil)
 
 	if len(r.Queries) != 3 { // 2 floor + 1 model
 		t.Fatalf("want 3 queries, got %d", len(r.Queries))
@@ -217,7 +217,7 @@ func TestRunVerificationPartialFailure(t *testing.T) {
 	r := runVerification(context.Background(), prom, fakeState{total: 0},
 		VerificationParams{Enabled: true, MaxQueries: 4, QueryTimeoutSeconds: 10},
 		store.Incident{ID: "inc1", GroupKey: "db|stolon"}, alerts,
-		DraftRef{RootCause: "x", Confidence: 0.8}, model, time.Now().UTC(), nil)
+		DraftRef{RootCause: "x", Confidence: 0.8}, nil, model, time.Now().UTC(), nil)
 
 	if len(r.Queries) != 3 {
 		t.Fatalf("want 3 queries, got %d", len(r.Queries))
@@ -247,7 +247,7 @@ func TestRunVerificationPromDown(t *testing.T) {
 		fakeState{total: 1, top: []store.WindowIncident{{GroupKey: "a|b", Status: "analyzed", Severity: "warning", AlertCount: 1}}},
 		VerificationParams{Enabled: true, MaxQueries: 4, QueryTimeoutSeconds: 10},
 		store.Incident{ID: "inc1", GroupKey: "db|stolon"}, alerts,
-		DraftRef{RootCause: "x", Confidence: 0.8}, nil, time.Now().UTC(), nil)
+		DraftRef{RootCause: "x", Confidence: 0.8}, nil, nil, time.Now().UTC(), nil)
 
 	if len(r.Queries) != 2 { // floor only, no model queries proposed
 		t.Fatalf("want 2 queries, got %d", len(r.Queries))
@@ -275,7 +275,7 @@ func TestRunVerificationNilProm(t *testing.T) {
 	r := runVerification(context.Background(), nil, fakeState{total: 0},
 		VerificationParams{Enabled: true, MaxQueries: 4, QueryTimeoutSeconds: 10},
 		store.Incident{ID: "inc1", GroupKey: "db|stolon"}, alerts,
-		DraftRef{RootCause: "x", Confidence: 0.8}, nil, time.Now().UTC(), nil)
+		DraftRef{RootCause: "x", Confidence: 0.8}, nil, nil, time.Now().UTC(), nil)
 
 	upRatio := r.Queries[0]
 	if upRatio.Outcome != OutcomeFailed || !strings.Contains(upRatio.Result, "prometheus not configured") {
@@ -353,6 +353,7 @@ func TestRenderVerificationResults(t *testing.T) {
 		Queries: []VerificationQuery{
 			{Kind: kindUpRatio, Source: "floor", Why: "peer-scope health", Outcome: OutcomeFetched, Result: `up 34/37 in {namespace="x"}`},
 			{Kind: kindIncidentsInWindow, Source: "floor", Outcome: OutcomeEmpty, Result: "0 incidents on other group keys (60m)"},
+			{Kind: kindPromQL, Source: sourceOperator, Why: "probe", Outcome: OutcomeFetched, Result: "pvc_bytes 1"},
 		},
 	}
 	var b strings.Builder
@@ -363,6 +364,9 @@ func TestRenderVerificationResults(t *testing.T) {
 	}
 	if !strings.Contains(out, "peer-scope health") {
 		t.Fatalf("render missing why: %q", out)
+	}
+	if !strings.Contains(out, "- [operator/promql]") {
+		t.Fatalf("render must tag operator-sourced queries, got %q", out)
 	}
 }
 
@@ -422,11 +426,29 @@ func TestRunVerificationWith_UsesExecutorForEveryQuery(t *testing.T) {
 	params := VerificationParams{MaxQueries: 4, QueryTimeoutSeconds: 5, MaxSeries: 100}
 	modelQ := []VerificationQuery{{Kind: kindPromQL, Source: "model", Expr: "up"}}
 
-	round := runVerificationWith(context.Background(), exec, params, alerts, DraftRef{}, modelQ, time.Now())
+	round := runVerificationWith(context.Background(), exec, params, alerts, DraftRef{}, nil, modelQ, time.Now())
 	if exec.calls != 3 { // 2 floor queries + 1 model query
 		t.Fatalf("executor calls = %d, want 3", exec.calls)
 	}
 	if len(round.Queries) != 3 {
 		t.Fatalf("round queries = %d, want 3", len(round.Queries))
+	}
+}
+
+// T6: operator-sourced (steering) queries ride the round between the floor
+// and the model's own proposals — floor, operator, model (D10) — and are
+// exempt from MaxQueries (the countingExecutor fake, reused from the test
+// above, fills every dispatched query's Outcome/Result regardless of source).
+func TestRunVerificationWith_OperatorQueriesRideTheRound(t *testing.T) {
+	exec := &countingExecutor{}
+	op := []VerificationQuery{{Kind: kindPromQL, Source: sourceOperator, Expr: "pvc_bytes", Why: "probe"}}
+	model := []VerificationQuery{{Kind: kindPromQL, Source: "model", Expr: "up", Why: "check"}}
+	round := runVerificationWith(context.Background(), exec, VerificationParams{QueryTimeoutSeconds: 5},
+		nil, DraftRef{}, op, model, time.Now())
+	if len(round.Queries) != 4 { // 2 floor + 1 operator + 1 model
+		t.Fatalf("want 4 queries, got %d", len(round.Queries))
+	}
+	if round.Queries[2].Source != sourceOperator || round.Queries[2].Expr != "pvc_bytes" {
+		t.Fatalf("operator query must follow the floor, got %+v", round.Queries[2])
 	}
 }

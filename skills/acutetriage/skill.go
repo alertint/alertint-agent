@@ -781,16 +781,28 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 	modelQ := parseVerificationPlan(ar.raw, s.cfg.Verification.MaxQueries, s.logger, inc.ID)
 	s.auditVerificationPlanned(ctx, inc, alerts, modelQ)
 
+	// The governing verdict's operator-sourced steering queries (ADR-0029) ride
+	// the same round, between the floor and the model's own proposals.
+	// ar.memory is nil on paths that skip memory fetch entirely (e.g. no store
+	// configured) — buildSteeringQueries is nil-safe on a nil governing verdict.
+	var governing *GoverningVerdict
+	if ar.memory != nil {
+		governing = ar.memory.Governing
+	}
+	operatorQ := buildSteeringQueries(governing)
+
 	// The runner shares the SAME true-nil-safe querier the analysis fetch used, and
 	// the store as the incidents_in_window state reader. It never errors: a query's
 	// own failure lands in its Outcome/Result, never aborting the round (R2).
 	// During replay, queries are served from the frozen snapshot instead — no
-	// live data-source call is ever made.
+	// live data-source call is ever made. Frozen memory carries Governing, so
+	// operatorQ rebuilds identically on replay and the snapshot executor serves
+	// each query by kind+expr — no snapshot-format change.
 	var round *VerificationRound
 	if p.replay != nil {
-		round = runVerificationWith(ctx, p.replay.exec, s.cfg.Verification, alerts, draft, modelQ, time.Now().UTC())
+		round = runVerificationWith(ctx, p.replay.exec, s.cfg.Verification, alerts, draft, operatorQ, modelQ, time.Now().UTC())
 	} else {
-		round = runVerification(ctx, s.promQuerier(), s.st, s.cfg.Verification, inc, alerts, draft, modelQ, time.Now().UTC(), s.logger)
+		round = runVerification(ctx, s.promQuerier(), s.st, s.cfg.Verification, inc, alerts, draft, operatorQ, modelQ, time.Now().UTC(), s.logger)
 	}
 
 	// Call 2: the byte-identical call-1 prefix + the draft + the computed round +

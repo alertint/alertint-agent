@@ -229,35 +229,40 @@ func (e *liveExecutor) execute(ctx context.Context, q *VerificationQuery) {
 }
 
 // runVerification executes the floor queries (always: peer up-ratio +
-// cross-incident scan) plus every model-proposed query against the live
-// backends, each under its own slice of the shared query-phase budget,
-// filling Outcome and Result on every query (R2/R3). Never returns an error —
-// a query's own failure lands in its Outcome/Result, it never aborts the
-// round or the ones after it.
+// cross-incident scan), the governing verdict's operator-sourced steering
+// queries (buildSteeringQueries, ADR-0029), and every model-proposed query
+// against the live backends, each under its own slice of the shared
+// query-phase budget, filling Outcome and Result on every query (R2/R3).
+// Never returns an error — a query's own failure lands in its Outcome/Result,
+// it never aborts the round or the ones after it.
 //
 // The pipeline (verifyAndRejudge) passes the real skill logger; the runner tests
 // pass nil (defaulted to slog.Default below).
 func runVerification(ctx context.Context, prom metricQuerier, state verifyStateReader,
 	params VerificationParams, inc store.Incident, alerts []store.Alert,
-	draft DraftRef, modelQueries []VerificationQuery, now time.Time, logger *slog.Logger,
+	draft DraftRef, operatorQueries, modelQueries []VerificationQuery, now time.Time, logger *slog.Logger,
 ) *VerificationRound {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	exec := &liveExecutor{prom: prom, state: state, inc: inc, now: now, maxSeries: params.MaxSeries, logger: logger}
-	return runVerificationWith(ctx, exec, params, alerts, draft, modelQueries, now)
+	return runVerificationWith(ctx, exec, params, alerts, draft, operatorQueries, modelQueries, now)
 }
 
 // runVerificationWith is runVerification's executor-parameterized core: every
-// floor + model query is dispatched through exec instead of always hitting
-// the live backends, so replay can serve queries from a frozen snapshot
-// (Task 11) while production runs unchanged through runVerification's
-// liveExecutor wrapper.
+// floor + operator + model query is dispatched through exec instead of always
+// hitting the live backends, so replay can serve queries from a frozen
+// snapshot (Task 11) while production runs unchanged through runVerification's
+// liveExecutor wrapper. operatorQueries (buildSteeringQueries — the governing
+// verdict's deterministic query set, ADR-0029) ride between the floor and the
+// model's own proposals; like the floor they are exempt from MaxQueries —
+// they are deterministic and separately capped at maxSteeringQueries (D10).
 func runVerificationWith(ctx context.Context, exec queryExecutor, params VerificationParams,
-	alerts []store.Alert, draft DraftRef, modelQueries []VerificationQuery, now time.Time,
+	alerts []store.Alert, draft DraftRef, operatorQueries, modelQueries []VerificationQuery, now time.Time,
 ) *VerificationRound {
-	queries := make([]VerificationQuery, 0, 2+len(modelQueries))
+	queries := make([]VerificationQuery, 0, 2+len(operatorQueries)+len(modelQueries))
 	queries = append(queries, floorPlan(alerts)...)
+	queries = append(queries, operatorQueries...)
 	queries = append(queries, modelQueries...)
 
 	// Two-layer budget, mirroring FetchMetrics exactly (metrics.go:361-374):
