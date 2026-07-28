@@ -993,8 +993,11 @@ func TestSteering_SupportedAdoptsUncapped(t *testing.T) {
 
 // TestSteering_ContradictedIsNotClamped: the money check — a fetched
 // steering query plus ruling "contradicted" records contradicted+backed, and
-// confidence is whatever the model itself returned (0.55), never clamped by
-// steering. Backed contradictions are never clamped, today or after Task 8.
+// confidence is whatever the model itself returned (0.9 — above
+// MaxMetadataOnlyConfidence, so the exemption itself, not just the
+// early-return guard for already-low confidence, is what's under test),
+// never clamped by steering. Backed contradictions are never clamped, today
+// or after Task 8.
 func TestSteering_ContradictedIsNotClamped(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
@@ -1004,7 +1007,7 @@ func TestSteering_ContradictedIsNotClamped(t *testing.T) {
 
 	scripted := &scriptedLLM{responses: []scriptResp{
 		{raw: draftResp(t, "draft", "disk pressure on web1", 0.85, nil)},
-		{raw: callTwoRespWithRuling(t, "draft", "disk pressure on web1", 0.55,
+		{raw: callTwoRespWithRuling(t, "draft", "disk pressure on web1", 0.9,
 			"contradicted", "pvc_bytes shows ample free space")},
 	}}
 
@@ -1018,8 +1021,8 @@ func TestSteering_ContradictedIsNotClamped(t *testing.T) {
 	}
 
 	f := readFinding(t, st, inc.ID)
-	if f.confidence != 0.55 {
-		t.Errorf("confidence = %v, want 0.55 (model's own; contradicted+backed is never clamped)", f.confidence)
+	if f.confidence != 0.9 {
+		t.Errorf("confidence = %v, want 0.9 (model's own, above the cap; contradicted+backed is never clamped)", f.confidence)
 	}
 	ver := verificationOf(t, f.enrichment)
 	if ver == nil || ver.OperatorRuling == nil {
