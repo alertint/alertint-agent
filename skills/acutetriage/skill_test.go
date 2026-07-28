@@ -991,6 +991,41 @@ func TestPipeline_AttachesEvidenceSummaryAndPersistsMetrics(t *testing.T) {
 	}
 }
 
+// TestRunOperatorHistoryAndSteering_VerificationOff: a steering-active
+// governing correction verdict with verification disabled entirely (the kill
+// switch). The Finding must carry both producer-computed payloads: History,
+// because the group key's governing verdict makes its own operator artifact
+// present ("history", not "first"/"seen"); and Steering with ruling
+// "unverifiable", because nothing ran to test the correction — verification
+// disabled is not the same as a ruling of "absent" (that's call 2's own
+// soft-parse default when a round DID run and the model omitted the key).
+func TestRunOperatorHistoryAndSteering_VerificationOff(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-hist-steer", map[string]string{"alertname": "DiskFull", "host": "web1"})
+	seedGoverningVerdict(t, st, ctx, inc.ID, "correction", `{"cause_series":["pvc_bytes"]}`)
+
+	fllm := &fakeLLM{response: validLLMResponse(nil)}
+	notifier := &capturingNotifier{}
+	cfg := acutetriage.Config{MinAlerts: 1} // Verification zero value: disabled (kill switch)
+	cfg.Memory = st
+	cfg.MemoryParams = acutetriage.MemoryParams{LookbackDays: 90}
+	skill := acutetriage.New(cfg, st, fllm, nil, notifier, nil)
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	f := notifier.last
+	if f.History == nil || f.History.State != "history" {
+		t.Fatalf("want History.State=history (governing verdict present), got %+v", f.History)
+	}
+	if f.Steering == nil || f.Steering.Ruling != "unverifiable" {
+		t.Fatalf("want Steering.Ruling=unverifiable (verification disabled, nothing ran), got %+v", f.Steering)
+	}
+}
+
 // TestRunDefaultsUnitemizedAlertRoles: member alerts the model omits from its
 // alerts array get the "correlated" role deterministically (bounded
 // itemization) — MCP consumers always see a role on every member.

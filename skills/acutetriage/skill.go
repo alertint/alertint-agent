@@ -417,6 +417,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		if p.rejudge && p.recurrenceEpisodes > 1 && !p.recurrenceLastSeen.IsZero() {
 			f.Recurrence = &notify.Recurrence{Episodes: p.recurrenceEpisodes, LastSeen: p.recurrenceLastSeen}
 		}
+		s.attachHistorySteering(ctx, inc, ar, ver, &f)
 		// Multi owns the per-sink notify outcome line(s): a quiet "notified" on
 		// success, a "notify partial"/"notify failed" summary plus one "notify
 		// sink failed" detail line per failing sink. The aggregated error it
@@ -458,6 +459,42 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		"dur", time.Since(start),
 	)
 	return nil
+}
+
+// attachHistorySteering populates f.History and f.Steering (Task 9, R13/D9,
+// ADR-0029): the producer-computed payload behind the Slack history block and
+// the ruling line — notifiers stay I/O-free renderers, this is the read.
+// History is always attempted (tri-state honest — nil only when there's no
+// store to read at all). Steering is set only when a governing correction is
+// steering: from the verification round's own ruling when one ran, or
+// directly as "unverifiable" when verification is disabled entirely and
+// nothing ran to test it (that's distinct from a round that ran and the model
+// left the ruling "absent" — call 2's own soft-parse default, remapped to the
+// "unruled" wire value).
+func (s *Skill) attachHistorySteering(ctx context.Context, inc store.Incident, ar analysisResult, ver *VerificationEnrichment, f *notify.Finding) {
+	epi, first := 0, time.Time{}
+	if ar.memory != nil {
+		epi, first = ar.memory.Episodes, ar.memory.FirstSeen
+	}
+	lookback := s.cfg.MemoryParams.LookbackDays
+	if lookback <= 0 {
+		lookback = 90
+	}
+	f.History = BuildHistory(ctx, s.st, inc.GroupKey, inc.ID, f.Drill, epi, first, lookback, time.Now().UTC())
+
+	if ver != nil && ver.OperatorRuling != nil {
+		r := ver.OperatorRuling
+		ruling := r.Ruling
+		if ruling == "absent" {
+			ruling = "unruled"
+		}
+		f.Steering = &notify.Steering{Ruling: ruling, Basis: r.Basis, VerdictDate: r.VerdictDate}
+		return
+	}
+	if g := governingOf(ar.memory); g != nil && g.Steers {
+		// verification disabled: steering active, nothing ran (R5)
+		f.Steering = &notify.Steering{Ruling: "unverifiable", VerdictDate: g.Date}
+	}
 }
 
 // resolvedStatusLabel reports "resolved" when every member alert of

@@ -7,10 +7,12 @@
 package acutetriage
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/notify"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -130,6 +132,80 @@ func steeringAuditFields(analyzed map[string]any, memory *MemoryEnrichment, ver 
 	if ver != nil && ver.OperatorRuling != nil {
 		analyzed["operator_ruling"] = ver.OperatorRuling.Ruling
 	}
+}
+
+// HistoryReader is the store surface BuildHistory needs: the group key's
+// governing verdict, every operator annotation on it, and whether any prior
+// incident exists at all. *store.Store satisfies it via Task 1's methods.
+type HistoryReader interface {
+	GoverningVerdict(ctx context.Context, groupKey string, currentIsDrill bool) (*store.IncidentVerdict, error)
+	OperatorAnnotations(ctx context.Context, groupKey string, currentIsDrill bool) ([]store.OperatorAnnotation, error)
+	AnyPriorIncident(ctx context.Context, groupKey, excludeIncidentID string, currentIsDrill bool) (bool, error)
+}
+
+// maxHistoryNotes bounds the rendered notes list; the remainder is counted,
+// not dropped silently (History.NotesMore).
+const maxHistoryNotes = 10
+
+// BuildHistory assembles the group key's operator history — the shared
+// payload behind the Slack history block, the stdout finding line, and MCP's
+// operator_history (R13/D9). Tri-state honest (R8/D8): "first" renders only
+// on clean reads with a false unbounded incident-existence check; a read
+// error reports "unavailable", never 🆕.
+func BuildHistory(ctx context.Context, r HistoryReader, groupKey, incidentID string, isDrill bool,
+	episodes int, firstSeen time.Time, windowDays int, now time.Time) *notify.History {
+	if r == nil {
+		return nil
+	}
+	unavailable := &notify.History{State: "unavailable"}
+	gv, err := r.GoverningVerdict(ctx, groupKey, isDrill)
+	if err != nil {
+		return unavailable
+	}
+	notes, err := r.OperatorAnnotations(ctx, groupKey, isDrill)
+	if err != nil {
+		return unavailable
+	}
+	anyPrior, err := r.AnyPriorIncident(ctx, groupKey, incidentID, isDrill)
+	if err != nil {
+		return unavailable
+	}
+
+	h := &notify.History{Episodes: episodes, FirstSeen: firstSeen, WindowDays: windowDays}
+	if gv != nil {
+		h.Verdict = &notify.HistoryVerdict{
+			Kind: gv.Verdict,
+			Age:  humanizeAge(now.Sub(gv.CreatedAt)),
+			Date: gv.CreatedAt.UTC().Format("2006-01-02"),
+			Note: capText(flattenRecalled(gv.Note), maxRecallEntryChars),
+		}
+	}
+	verdictNoteSkipped := false
+	for _, n := range notes {
+		if gv != nil && !verdictNoteSkipped && n.Kind == gv.Verdict && n.Note == gv.Note {
+			verdictNoteSkipped = true // the verdict renders itself; don't repeat its note
+			continue
+		}
+		if len(h.Notes) == maxHistoryNotes {
+			h.NotesMore++
+			continue
+		}
+		h.Notes = append(h.Notes, notify.HistoryNote{
+			Kind: n.Kind,
+			Age:  humanizeAge(now.Sub(n.CreatedAt)),
+			Note: capText(flattenRecalled(n.Note), maxRecallEntryChars),
+		})
+	}
+
+	switch {
+	case h.Verdict != nil || len(h.Notes) > 0:
+		h.State = "history"
+	case anyPrior:
+		h.State = "seen"
+	default:
+		h.State = "first"
+	}
+	return h
 }
 
 // operatorEvidenceFetched reports whether at least one steering query returned

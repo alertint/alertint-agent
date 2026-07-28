@@ -3,6 +3,8 @@
 package acutetriage
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -76,6 +78,76 @@ func TestBuildSteeringQueries_WidenFirstProbesDedupCap(t *testing.T) {
 func TestBuildSteeringQueries_NonSteeringNil(t *testing.T) {
 	if buildSteeringQueries(nil) != nil || buildSteeringQueries(&GoverningVerdict{Steers: false, CauseSeries: []string{"x"}}) != nil {
 		t.Fatal("only a steering correction contributes queries")
+	}
+}
+
+// fakeHistoryReader implements HistoryReader for TestBuildHistory_TriState.
+// err, when set, makes every method fail — the "unavailable" path.
+type fakeHistoryReader struct {
+	err       error
+	anyPrior  bool
+	governing *store.IncidentVerdict
+	notes     []store.OperatorAnnotation
+}
+
+func (f *fakeHistoryReader) GoverningVerdict(_ context.Context, _ string, _ bool) (*store.IncidentVerdict, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.governing, nil
+}
+
+func (f *fakeHistoryReader) OperatorAnnotations(_ context.Context, _ string, _ bool) ([]store.OperatorAnnotation, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.notes, nil
+}
+
+func (f *fakeHistoryReader) AnyPriorIncident(_ context.Context, _, _ string, _ bool) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	return f.anyPrior, nil
+}
+
+func TestBuildHistory_TriState(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// unavailable: reader errors
+	h := BuildHistory(ctx, &fakeHistoryReader{err: errors.New("boom")}, "k", "inc", false, 0, time.Time{}, 90, now)
+	if h == nil || h.State != "unavailable" {
+		t.Fatalf("store error ⇒ unavailable, got %+v", h)
+	}
+
+	// first: clean reads, nothing anywhere
+	h = BuildHistory(ctx, &fakeHistoryReader{}, "k", "inc", false, 0, time.Time{}, 90, now)
+	if h == nil || h.State != "first" {
+		t.Fatalf("clean-empty + no prior incident ⇒ first, got %+v", h)
+	}
+
+	// seen: prior incidents exist, no operator artifacts
+	h = BuildHistory(ctx, &fakeHistoryReader{anyPrior: true}, "k", "inc", false, 3, now.AddDate(0, 0, -20), 90, now)
+	if h == nil || h.State != "seen" || h.Episodes != 3 || h.WindowDays != 90 {
+		t.Fatalf("prior incidents without verdicts ⇒ seen, got %+v", h)
+	}
+
+	// history: governing verdict + notes, verdict's own annotation deduped
+	r := &fakeHistoryReader{
+		anyPrior:  true,
+		governing: &store.IncidentVerdict{Verdict: "correction", Note: "pvc filling", CreatedAt: now.AddDate(0, 0, -4), ExpectationJSON: `{"must_mention":["x"]}`},
+		notes: []store.OperatorAnnotation{
+			{IncidentID: "inc-a", Kind: "correction", Note: "pvc filling", CreatedAt: now.AddDate(0, 0, -4)}, // the verdict's own note
+			{IncidentID: "inc-a", Kind: "observation", Note: "canary contained it", CreatedAt: now.AddDate(0, 0, -5)},
+		},
+	}
+	h = BuildHistory(ctx, r, "k", "inc", false, 3, now.AddDate(0, 0, -20), 90, now)
+	if h == nil || h.State != "history" || h.Verdict == nil || h.Verdict.Kind != "correction" {
+		t.Fatalf("verdict ⇒ history, got %+v", h)
+	}
+	if len(h.Notes) != 1 || h.Notes[0].Kind != "observation" {
+		t.Fatalf("the verdict's own annotation must dedupe out of the notes list, got %+v", h.Notes)
 	}
 }
 
