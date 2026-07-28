@@ -17,12 +17,12 @@ import (
 // fakeMemoryReader returns canned recall data so the fold/render logic is tested
 // without a database (the store computation itself is covered in internal/store).
 type fakeMemoryReader struct {
-	view      *store.MemoryView
-	prefilter []store.PriorFinding
-	viewErr   error
-	prefErr   error
-	ops       []store.OperatorAnnotation
-	opsErr    error
+	view         *store.MemoryView
+	prefilter    []store.PriorFinding
+	viewErr      error
+	prefErr      error
+	governing    *store.IncidentVerdict
+	governingErr error
 }
 
 func (f *fakeMemoryReader) MemoryView(_ context.Context, groupKey, _ string, _ bool, _ time.Time) (*store.MemoryView, error) {
@@ -39,8 +39,8 @@ func (f *fakeMemoryReader) MemoryPrefilter(_ context.Context, _, _ string, _ boo
 	return f.prefilter, f.prefErr
 }
 
-func (f *fakeMemoryReader) OperatorAnnotations(_ context.Context, _ string, _ bool) ([]store.OperatorAnnotation, error) {
-	return f.ops, f.opsErr
+func (f *fakeMemoryReader) GoverningVerdict(_ context.Context, _ string, _ bool) (*store.IncidentVerdict, error) {
+	return f.governing, f.governingErr
 }
 
 func now2026() time.Time { return time.Date(2026, 7, 9, 2, 5, 0, 0, time.UTC) }
@@ -225,7 +225,9 @@ func TestRenderMemory_OperatorOnlyHeadline(t *testing.T) {
 	var b strings.Builder
 	renderMemory(&b, m, false)
 	out := b.String()
-	if !strings.Contains(out, "Operator notes for this key") {
+	// The headline text is now shared with the Governing-driven path (Step 3):
+	// "Operator record for this key" replaces the pre-Task-5 "Operator notes...".
+	if !strings.Contains(out, "Operator record for this key") {
 		t.Fatalf("headline:\n%s", out)
 	}
 	if !strings.Contains(out, "[operator confirmation, 2026-07-08]") {
@@ -233,6 +235,89 @@ func TestRenderMemory_OperatorOnlyHeadline(t *testing.T) {
 	}
 	if strings.Contains(out, "Weak-signal matches only") {
 		t.Fatal("wrong headline for operator-only recall")
+	}
+}
+
+// --- governing verdict render (channel split, D5/R6) -------------------------
+
+// Covers R2/D5: a steering correction frames the corrected cause as a
+// hypothesis to TEST via the verification round, never as established fact,
+// and carries its anchors so the model can see what the correction points at.
+func TestRenderMemory_SteeringFrame(t *testing.T) {
+	m := &MemoryEnrichment{GroupKey: "k", Rung: "operator", Governing: &GoverningVerdict{
+		Kind: "correction", Date: "2026-07-28", Age: "4d ago",
+		Note:       "Real cause was the checkout-logs-pvc filling up",
+		CauseAlert: "KubePersistentVolumeFillingUp", CauseSeries: []string{"kubelet_volume_stats_available_bytes"},
+		Steers: true,
+	}}
+	var b strings.Builder
+	renderMemory(&b, m, false) // verification enabled
+	out := b.String()
+	for _, want := range []string{
+		"[operator correction, 2026-07-28 (4d ago)]",
+		"Real cause was the checkout-logs-pvc filling up",
+		"leading hypothesis to TEST",
+		"KubePersistentVolumeFillingUp",
+		"kubelet_volume_stats_available_bytes",
+		"[operator/",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("steering frame missing %q in:\n%s", want, out)
+		}
+	}
+	// grading vocabulary never renders (R6) — belt and suspenders:
+	for _, banned := range []string{"must_mention", "must_not_conclude", "must not conclude"} {
+		if strings.Contains(out, banned) {
+			t.Errorf("grading vocabulary leaked into the prompt: %q", banned)
+		}
+	}
+}
+
+// R5: with verification disabled (the kill switch), a steering correction
+// cannot be tested this call, so the prompt demands the honest unverifiable
+// framing and a confidence ceiling instead of the "will be tested" promise.
+func TestRenderMemory_VerificationOffFallback(t *testing.T) {
+	m := &MemoryEnrichment{GroupKey: "k", Rung: "operator", Governing: &GoverningVerdict{
+		Kind: "correction", Date: "2026-07-28", Age: "4d ago", Note: "pvc", Steers: true,
+	}}
+	var b strings.Builder
+	renderMemory(&b, m, true) // requestVerdict==true ⇔ verification disabled
+	out := b.String()
+	if !strings.Contains(out, "per operator correction of 2026-07-28, not verifiable from current evidence") ||
+		!strings.Contains(out, "0.6") {
+		t.Errorf("verification-off steering fallback (R5) missing in:\n%s", out)
+	}
+}
+
+// A confirmation retires the steering: it renders as a trusted positive prior,
+// never with the "leading hypothesis to TEST" framing a correction carries.
+func TestRenderMemory_ConfirmationRendersTrustedPrior(t *testing.T) {
+	m := &MemoryEnrichment{GroupKey: "k", Rung: "operator", Governing: &GoverningVerdict{
+		Kind: "confirmation", Date: "2026-07-20", Age: "12d ago", Note: "confirmed on the bridge", Steers: false,
+	}}
+	var b strings.Builder
+	renderMemory(&b, m, false)
+	out := b.String()
+	if !strings.Contains(out, "[operator confirmation, 2026-07-20 (12d ago)]") ||
+		!strings.Contains(out, "trusted positive prior") {
+		t.Errorf("confirmation render missing in:\n%s", out)
+	}
+	if strings.Contains(out, "leading hypothesis") {
+		t.Error("a confirmation must not carry the steering frame")
+	}
+}
+
+// R6: envelopes persisted before the channel split (the free-text annotation
+// tier) replay byte-identically — the old rendering block stays reachable even
+// though FetchMemory never populates m.Operator for a fresh triage anymore.
+func TestRenderMemory_LegacyOperatorTierStillRenders(t *testing.T) {
+	m := &MemoryEnrichment{GroupKey: "k", Rung: "operator", Operator: []OperatorEntry{
+		{IncidentID: "inc-old", Kind: "correction", Note: "old note", Date: "2026-07-01"},
+	}}
+	var b strings.Builder
+	renderMemory(&b, m, false)
+	if !strings.Contains(b.String(), "[operator correction, 2026-07-01] old note") {
+		t.Errorf("legacy tier must render as persisted:\n%s", b.String())
 	}
 }
 
@@ -336,29 +421,39 @@ func TestFetchMemory_NilReaderReturnsNil(t *testing.T) {
 	}
 }
 
-// --- operator tier (ADR-0028) -------------------------------------------------
-
-func TestFetchMemory_OperatorTier_RankAndCap(t *testing.T) {
+// A fresh fetch with no priors and no strong/weak recall but a governing
+// correction verdict must still populate — the "operator" rung recall the
+// pre-Task-5 annotation tier used to carry (D5: verdict-only, no priors).
+func TestFetchMemory_GoverningVerdictPopulated_NoAnnotationTier(t *testing.T) {
 	now := time.Now().UTC()
-	reader := &fakeMemoryReader{ // extend the existing fake's fields
-		ops: []store.OperatorAnnotation{
-			{IncidentID: "i1", Kind: "observation", Note: "obs newest", CreatedAt: now.Add(-1 * time.Hour)},
-			{IncidentID: "i2", Kind: "correction", Note: "corr older", CreatedAt: now.Add(-24 * time.Hour)},
-			{IncidentID: "i3", Kind: "confirmation", Note: "conf", CreatedAt: now.Add(-2 * time.Hour)},
+	r := &fakeMemoryReader{
+		view: &store.MemoryView{GroupKey: "k"},
+		governing: &store.IncidentVerdict{
+			ID: 1, IncidentID: "inc-a", Version: 2, Verdict: "correction",
+			ExpectationJSON: `{"cause_series":["pvc_bytes"],"must_mention":["pvc"]}`,
+			Note:            "Real cause was the pvc", CreatedAt: now.AddDate(0, 0, -4),
 		},
 	}
-	m := FetchMemory(context.Background(), reader, MemoryParams{}, store.Incident{ID: "cur", GroupKey: "k"}, false, now)
-	if m == nil {
-		t.Fatal("operator-only recall must not return nil")
+	m := FetchMemory(context.Background(), r, MemoryParams{}, store.Incident{ID: "inc-new", GroupKey: "k"}, false, now)
+	if m == nil || m.Governing == nil || !m.Governing.Steers {
+		t.Fatalf("governing correction must populate and steer, got %+v", m)
 	}
-	// Rank: corrections > confirmations > observations, then newest-first; cap 2.
-	if len(m.Operator) != 2 || m.Operator[0].Kind != "correction" || m.Operator[1].Kind != "confirmation" {
-		t.Fatalf("rank/cap wrong: %+v", m.Operator)
+	if len(m.Operator) != 0 || m.OperatorMore != 0 {
+		t.Fatalf("the annotation tier is dead for new fetches (D5), got %+v", m.Operator)
 	}
-	if m.OperatorMore != 1 {
-		t.Fatalf("more count: %d", m.OperatorMore)
+	if m.Rung != "operator" {
+		t.Fatalf("verdict-only recall rungs as operator, got %q", m.Rung)
 	}
 }
+
+func TestFetchMemory_NoVerdictNoPriors_Nil(t *testing.T) {
+	r := &fakeMemoryReader{view: &store.MemoryView{GroupKey: "k"}}
+	if m := FetchMemory(context.Background(), r, MemoryParams{}, store.Incident{GroupKey: "k"}, false, time.Now()); m != nil {
+		t.Fatalf("clean-empty recall returns nil, got %+v", m)
+	}
+}
+
+// --- governing verdict fold (ADR-0028/0029) -----------------------------------
 
 func TestFetchMemory_CorrectedPriorNeverStrong(t *testing.T) {
 	now := time.Now().UTC()
@@ -379,20 +474,23 @@ func TestFetchMemory_CorrectedPriorNeverStrong(t *testing.T) {
 	}
 }
 
-func TestFetchMemory_OperatorFetchErrorDegradesToNoTier(t *testing.T) {
+func TestFetchMemory_GoverningVerdictFetchErrorDegradesToNoTier(t *testing.T) {
 	reader := &fakeMemoryReader{
-		view:   &store.MemoryView{GroupKey: "k"},
-		opsErr: errors.New("boom"),
+		view:         &store.MemoryView{GroupKey: "k"},
+		governingErr: errors.New("boom"),
 	}
 	m := FetchMemory(context.Background(), reader, MemoryParams{}, store.Incident{ID: "cur", GroupKey: "k"}, false, now2026())
 	if m != nil {
-		t.Errorf("an operator-fetch error with nothing else recalled must yield nil, got %+v", m)
+		t.Errorf("a governing-verdict-fetch error with nothing else recalled must yield nil, got %+v", m)
 	}
 }
 
-func TestFetchMemory_OperatorOnlyRungIsOperator(t *testing.T) {
+// A retiring confirmation (Steers == false) still rungs as "operator" when it
+// is the only thing recalled — diversifies TestFetchMemory_GoverningVerdictPopulated_NoAnnotationTier's
+// correction case with the non-steering kind.
+func TestFetchMemory_ConfirmationOnlyRungIsOperator(t *testing.T) {
 	reader := &fakeMemoryReader{
-		ops: []store.OperatorAnnotation{{IncidentID: "i1", Kind: "confirmation", Note: "confirmed", CreatedAt: now2026()}},
+		governing: &store.IncidentVerdict{IncidentID: "i1", Verdict: "confirmation", Note: "confirmed", CreatedAt: now2026()},
 	}
 	m := FetchMemory(context.Background(), reader, MemoryParams{}, store.Incident{ID: "cur", GroupKey: "k"}, false, now2026())
 	if m == nil {
@@ -400,6 +498,9 @@ func TestFetchMemory_OperatorOnlyRungIsOperator(t *testing.T) {
 	}
 	if m.Rung != "operator" {
 		t.Fatalf("want rung %q, got %q", "operator", m.Rung)
+	}
+	if m.Governing == nil || m.Governing.Steers {
+		t.Fatalf("a confirmation must not steer: %+v", m.Governing)
 	}
 }
 
