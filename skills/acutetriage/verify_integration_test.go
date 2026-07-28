@@ -870,6 +870,27 @@ func callTwoRespWithRuling(t *testing.T, name, rootCause string, conf float64, r
 	return mustJSON(t, resp)
 }
 
+// callTwoRespWithBareStringRuling builds a call-2 response whose
+// "operator_ruling" key is a bare string ("supported") rather than the
+// documented {"ruling":...,"basis":...} object — plausibly the single most
+// likely real-world shape mismatch (small/local models are especially prone
+// to this). Used to pin that a wrong-typed operator_ruling degrades exactly
+// like an omitted key (soft validation) rather than failing the unmarshal of
+// the whole call-2 response.
+func callTwoRespWithBareStringRuling(t *testing.T, name, rootCause string, conf float64) json.RawMessage {
+	t.Helper()
+	resp := map[string]any{
+		"analysis_name":        name,
+		"overall_issue":        rootCause,
+		"correlation_findings": []string{"c"},
+		"severity":             "medium",
+		"confidence":           conf,
+		"alerts":               []map[string]string{},
+		"operator_ruling":      "supported", // wrong shape: bare string, not an object
+	}
+	return mustJSON(t, resp)
+}
+
 // seedGoverningVerdict captures a verdict of the given kind ("correction" |
 // "confirmation") against incidentID via the real PersistVerdictCapture path,
 // so the group key's GoverningVerdict query (joined by group_key, not a fake)
@@ -1131,6 +1152,73 @@ func TestSteering_AbsentRulingKeepsRevisionAndClamps(t *testing.T) {
 	}
 	if !strings.Contains(analyzedPayload, `"operator_ruling":"absent"`) {
 		t.Errorf("incident.analyzed payload missing operator_ruling=absent: %s", analyzedPayload)
+	}
+}
+
+// TestSteering_MalformedRulingShapeKeepsRevisionAndClamps (review Finding 1):
+// call 2 answers with "operator_ruling" as a bare string ("supported")
+// instead of the documented {"ruling":...,"basis":...} object — plausibly
+// the single most likely real-world malformation, especially from smaller
+// local models behind the openai-compatible provider. Because
+// llmResponse.OperatorRuling is captured as json.RawMessage (untyped) rather
+// than a typed *modelRuling, this shape mismatch must NOT fail the
+// unmarshal of the whole call-2 response: the revision is KEPT (never routed
+// through the degraded-JSON path, which would discard the whole verdict),
+// the ruling record degrades to "absent" — same as an omitted key — and the
+// existing soft-validation WARN fires. Live evidence (promHealthy) isolates
+// this to the shape-tolerance behavior itself: nothing here depends on
+// Task 8's not-yet-built clamp.
+func TestSteering_MalformedRulingShapeKeepsRevisionAndClamps(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-steer-i", map[string]string{"alertname": "DiskFull", "host": "web1"})
+	seedGoverningVerdict(t, st, ctx, inc.ID, "correction", `{"cause_series":["pvc_bytes"]}`)
+
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "draft", "disk pressure on web1", 0.85, nil)},
+		{raw: callTwoRespWithBareStringRuling(t, "revised", "pvc exhaustion on web1", 0.85)},
+	}}
+
+	var buf bytes.Buffer
+	cfg := verifyConfig(promHealthy(t))
+	cfg.Memory = st
+	cfg.MemoryParams = acutetriage.MemoryParams{LookbackDays: 90}
+	skill := acutetriage.New(cfg, st, scripted, nil, nil, slog.New(slog.NewTextHandler(&buf, nil)))
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run must not fail on a wrong-shaped operator_ruling: %v", err)
+	}
+	if scripted.calls != 2 {
+		t.Fatalf("want 2 LLM calls, got %d", scripted.calls)
+	}
+
+	f := readFinding(t, st, inc.ID)
+	if f.rootCause != "pvc exhaustion on web1" {
+		t.Errorf("root cause = %q, want the revision KEPT despite the malformed ruling shape (soft validation)", f.rootCause)
+	}
+	if f.confidence != 0.85 {
+		t.Errorf("confidence = %v, want 0.85 (this fixture has live evidence throughout — the call must not be discarded as degraded)", f.confidence)
+	}
+	ver := verificationOf(t, f.enrichment)
+	if ver == nil {
+		t.Fatalf("expected a verification envelope (a wrong-shaped ruling must not force the degraded path)")
+	}
+	if ver.Outcome == "degraded" {
+		t.Errorf("outcome = degraded, want revised/supported — a malformed operator_ruling shape must not discard the whole call-2 verdict")
+	}
+	if ver.OperatorRuling == nil {
+		t.Fatalf("expected an operator_ruling record even when the shape is wrong, got %+v", ver)
+	}
+	r := ver.OperatorRuling
+	if r.Ruling != "absent" {
+		t.Errorf("ruling = %q, want absent (malformed shape degrades exactly like an omitted key)", r.Ruling)
+	}
+	if !r.Backed {
+		t.Error("backed = false, want true (operator query fetched)")
+	}
+	if !strings.Contains(buf.String(), "model omitted or mangled operator_ruling") {
+		t.Errorf("expected the soft-validation WARN to fire for the malformed shape, got log:\n%s", buf.String())
 	}
 }
 

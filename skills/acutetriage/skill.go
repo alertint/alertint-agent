@@ -142,10 +142,18 @@ type llmResponse struct {
 	// bookkeeping key must not abort a good triage), so absent/invalid is treated
 	// as silent post-parse. Present only when a memory section was rendered.
 	MemoryVerdict string `json:"memory_verdict,omitempty"`
-	// OperatorRuling is the model's judgment on the governing correction
-	// (ADR-0029). Soft-required like memory_verdict: absent/invalid never
-	// fails triage — the deterministic backstop clamps instead.
-	OperatorRuling *modelRuling `json:"operator_ruling,omitempty"`
+	// OperatorRuling is the model's raw operator_ruling reply (ADR-0029),
+	// captured as untyped JSON rather than a typed *modelRuling: a shape
+	// mismatch (e.g. a bare string instead of the documented
+	// {"ruling":...,"basis":...} object — plausibly the single most likely
+	// real-world malformation) must never fail the unmarshal of the WHOLE
+	// call-2 response, which would route a valid revised verdict through the
+	// malformed-JSON/degraded path over one bad bookkeeping key. Soft-required
+	// like memory_verdict: the lenient decode into modelRuling happens
+	// entirely downstream, in verifyAndRejudge's ruling block — absent/
+	// unparseable/invalid all collapse to the same "absent" record there, the
+	// deterministic backstop clamps instead of failing triage.
+	OperatorRuling json.RawMessage `json:"operator_ruling,omitempty"`
 }
 
 // modelRuling is the model's raw operator_ruling reply — shaped exactly like
@@ -908,7 +916,8 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 			Ruling: "absent", Backed: operatorEvidenceFetched(round),
 			VerdictID: g.VerdictID, VerdictVersion: g.Version, VerdictDate: g.Date,
 		}
-		if r := resp2.OperatorRuling; r != nil && validOperatorRulings[r.Ruling] {
+		var r modelRuling
+		if len(resp2.OperatorRuling) > 0 && json.Unmarshal(resp2.OperatorRuling, &r) == nil && validOperatorRulings[r.Ruling] {
 			ruling.Ruling = r.Ruling
 			ruling.Basis = capText(flattenRecalled(r.Basis), 300)
 		} else {
