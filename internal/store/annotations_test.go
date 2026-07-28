@@ -71,36 +71,6 @@ func TestInsertIncidentAnnotation_CapIsRunesNotBytes(t *testing.T) {
 	}
 }
 
-func TestSetRefuteMarksFloor(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	id := readyIncident(t, s, "service=api")
-
-	if err := s.SetRefuteMarksFloor(ctx, id, 2); err != nil {
-		t.Fatalf("floor: %v", err)
-	}
-	// Floor is MAX(current, floor): raising past it via Increment then re-flooring must not lower.
-	if _, err := s.IncrementRefuteMarks(ctx, id); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.IncrementRefuteMarks(ctx, id); err != nil {
-		t.Fatal(err)
-	} // now 4
-	if err := s.SetRefuteMarksFloor(ctx, id, 2); err != nil {
-		t.Fatal(err)
-	}
-	var marks int
-	if err := s.DB().QueryRowContext(ctx, `SELECT memory_refute_marks FROM incidents WHERE id = ?`, id).Scan(&marks); err != nil {
-		t.Fatal(err)
-	}
-	if marks != 4 {
-		t.Fatalf("floor lowered marks: got %d want 4", marks)
-	}
-	if err := s.SetRefuteMarksFloor(ctx, "nope", 2); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("missing incident: want ErrNotFound, got %v", err)
-	}
-}
-
 func TestOperatorAnnotations(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

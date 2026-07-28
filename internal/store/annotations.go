@@ -182,22 +182,3 @@ func (s *Store) OperatorAnnotations(ctx context.Context, groupKey string, curren
 	}
 	return out, nil
 }
-
-// SetRefuteMarksFloor raises memory_refute_marks to at least floor — the D3
-// correction demotion (idempotent; never lowers an already-higher count).
-func (s *Store) SetRefuteMarksFloor(ctx context.Context, incidentID string, floor int) error {
-	res, err := s.db.ExecContext(ctx, `
-		UPDATE incidents SET memory_refute_marks = MAX(memory_refute_marks, ?)
-		WHERE id = ?`, floor, incidentID)
-	if err != nil {
-		return fmt.Errorf("store: set refute marks floor: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("store: refute marks floor rows: %w", err)
-	}
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
