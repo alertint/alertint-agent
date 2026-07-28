@@ -73,6 +73,30 @@ type DraftRef struct {
 type VerificationEnrichment struct {
 	Outcome string              `json:"outcome"` // supported | revised | degraded
 	Rounds  []VerificationRound `json:"rounds"`
+	// OperatorRuling records call 2's judgment on the governing correction
+	// (ADR-0029) when one is steering; nil when no correction governs this
+	// triage at all.
+	OperatorRuling *OperatorRulingRecord `json:"operator_ruling,omitempty"`
+}
+
+// OperatorRulingRecord is the deterministic record of what call 2 ruled on
+// the governing correction's fetched operator-sourced evidence — or the
+// default when it didn't rule at all. Ruling is one of:
+//   - "supported" / "contradicted" / "unverifiable": the model's own valid
+//     ruling (soft-parsed from resp2.OperatorRuling).
+//   - "absent": call 2 answered but omitted or mangled the operator_ruling key.
+//   - "unruled": call 2 never completed (the degraded-draft path).
+//
+// Backed reports whether at least one operator-sourced query actually fetched
+// data (operatorEvidenceFetched), independent of what the model claims — the
+// Task 8 backstop treats an unbacked "contradicted" as unproven.
+type OperatorRulingRecord struct {
+	Ruling         string `json:"ruling"`
+	Basis          string `json:"basis,omitempty"`
+	Backed         bool   `json:"backed"`
+	VerdictID      int64  `json:"verdict_id"`
+	VerdictVersion int    `json:"verdict_version"`
+	VerdictDate    string `json:"verdict_date"`
 }
 
 // Verification-round outcomes (VerificationEnrichment.Outcome). degraded flags a

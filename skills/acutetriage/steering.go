@@ -104,6 +104,34 @@ func buildSteeringQueries(g *GoverningVerdict) []VerificationQuery {
 	return out
 }
 
+// governingOf is the nil-safe accessor onto a MemoryEnrichment's governing
+// verdict, used everywhere the pipeline needs to ask "is a correction
+// steering right now?" without repeating the nil check (m itself is nil on
+// paths that skip memory fetch entirely, e.g. no store configured).
+func governingOf(m *MemoryEnrichment) *GoverningVerdict {
+	if m == nil {
+		return nil
+	}
+	return m.Governing
+}
+
+// steeringAuditFields adds the incident.analyzed audit fields for a governing
+// correction (R12): its verdict identity rides the trail regardless of
+// whether a verification round ran (verification disabled still leaves the
+// correction governing, just untested), and the ruling itself when call 2
+// produced or defaulted one. A no-op when nothing is steering.
+func steeringAuditFields(analyzed map[string]any, memory *MemoryEnrichment, ver *VerificationEnrichment) {
+	g := governingOf(memory)
+	if g == nil || !g.Steers {
+		return
+	}
+	analyzed["steering_verdict_id"] = g.VerdictID
+	analyzed["steering_verdict_version"] = g.Version
+	if ver != nil && ver.OperatorRuling != nil {
+		analyzed["operator_ruling"] = ver.OperatorRuling.Ruling
+	}
+}
+
 // operatorEvidenceFetched reports whether at least one steering query returned
 // data. OutcomeEmpty does not count: an empty result carries no sign
 // (ADR-0024), so it can back neither "supported" nor "contradicted" — the R4

@@ -230,6 +230,24 @@ func callTwoContinuation(draftRaw json.RawMessage, round *VerificationRound, mem
 			"judging the folded prior hypothesis in the Memory section: \"confirms\", \"refutes\", " +
 			"or \"silent\". Do NOT raise your confidence on the strength of the recalled hypothesis alone.")
 	}
+	if g := governingOf(memory); g != nil && g.Steers {
+		fmt.Fprintf(&b, "\n\nAn operator correction of %s governs this failure group (see the "+
+			"Memory section). The queries marked [operator/...] above fetched the evidence it "+
+			"names. Add an \"operator_ruling\" key to your JSON, shaped exactly:\n"+
+			`  "operator_ruling": {"ruling": "supported"|"contradicted"|"unverifiable", "basis": "<one sentence>"}`+"\n"+
+			"- \"supported\": the computed operator-query results show the corrected cause. Adopt "+
+			"it as the root cause; set confidence from the evidence as usual.\n"+
+			"- \"contradicted\": the computed results show the corrected cause is NOT present now. "+
+			"Do not adopt it; conclude from the evidence, and state in overall_issue what "+
+			"contradicted the correction.\n"+
+			"- \"unverifiable\": the operator queries returned no usable data. Adopt the corrected "+
+			"cause as the leading hypothesis, state \"per operator correction of %s, not "+
+			"verifiable from current evidence\" in overall_issue, and keep confidence at or "+
+			"below %.1f.\n"+
+			"The empty-result rule above applies here too: an empty operator-query result is "+
+			"\"unverifiable\", not \"contradicted\", unless its metric names are confirmed present "+
+			"in the evidence.", g.Date, g.Date, MaxMetadataOnlyConfidence)
+	}
 	return b.String()
 }
 

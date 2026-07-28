@@ -142,7 +142,23 @@ type llmResponse struct {
 	// bookkeeping key must not abort a good triage), so absent/invalid is treated
 	// as silent post-parse. Present only when a memory section was rendered.
 	MemoryVerdict string `json:"memory_verdict,omitempty"`
+	// OperatorRuling is the model's judgment on the governing correction
+	// (ADR-0029). Soft-required like memory_verdict: absent/invalid never
+	// fails triage — the deterministic backstop clamps instead.
+	OperatorRuling *modelRuling `json:"operator_ruling,omitempty"`
 }
+
+// modelRuling is the model's raw operator_ruling reply — shaped exactly like
+// callTwoContinuation's demand, before it is validated into an
+// OperatorRulingRecord.
+type modelRuling struct {
+	Ruling string `json:"ruling"`
+	Basis  string `json:"basis"`
+}
+
+// validOperatorRulings is the closed enum for the soft-required
+// operator_ruling — a ruling outside this set is treated the same as absent.
+var validOperatorRulings = map[string]bool{"supported": true, "contradicted": true, "unverifiable": true}
 
 type alertOutput struct {
 	AlertID        string `json:"alert_id"`
@@ -414,6 +430,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		if ver != nil {
 			analyzed["verification_outcome"] = ver.Outcome
 		}
+		steeringAuditFields(analyzed, ar.memory, ver)
 		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.analyzed", analyzed)
 	}
 
@@ -816,7 +833,13 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 	}, RequiredKeys)
 	if err != nil {
 		s.logger.Warn("acutetriage: verification re-judge failed; draft stands", "incident", inc.ID, "err", err)
-		return s.degradedDraft(ctx, inc.ID, ar.raw, round, resp)
+		g := governingOf(ar.memory)
+		if g != nil && g.Steers {
+			s.logger.Error("acutetriage: steering: operator correction went unruled — verification call 2 failed; "+
+				"finding ships capped and the card says the check did not complete (check your LLM setup)",
+				"incident", inc.ID, "verdict_version", g.Version, "err", err)
+		}
+		return s.degradedDraft(ctx, inc.ID, ar.raw, round, resp, g)
 	}
 	// Cache-engagement probe: call 2 always marks the shared prefix, so a zero
 	// cache read means the prefix is below the model's cacheable floor (benign,
@@ -831,7 +854,13 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 	if err := json.Unmarshal(comp.Raw, &resp2); err != nil {
 		// A malformed re-judge must not fail a triage that has a valid draft.
 		s.logger.Warn("acutetriage: verification re-judge returned malformed JSON; draft stands", "incident", inc.ID, "err", err)
-		return s.degradedDraft(ctx, inc.ID, ar.raw, round, resp)
+		g := governingOf(ar.memory)
+		if g != nil && g.Steers {
+			s.logger.Error("acutetriage: steering: operator correction went unruled — verification call 2 failed; "+
+				"finding ships capped and the card says the check did not complete (check your LLM setup)",
+				"incident", inc.ID, "verdict_version", g.Version, "err", err)
+		}
+		return s.degradedDraft(ctx, inc.ID, ar.raw, round, resp, g)
 	}
 	clampConfidence(&resp2.Confidence)
 
@@ -865,9 +894,31 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 		// triage or the round.
 		resp2.MemoryVerdict = ""
 	}
+
+	// The ruling contract (ADR-0029): when a correction is steering, call 2 was
+	// asked (callTwoContinuation) to add an operator_ruling key judging the
+	// fetched operator-sourced evidence. Soft-parsed exactly like memory_verdict
+	// above — a missing or invalid ruling never fails triage, it defaults to
+	// "absent" and a WARN notes it (the deterministic confidence backstop,
+	// Task 8, clamps off this record). Backed reports whether any operator
+	// query actually fetched data, independent of what the model claims.
+	var ruling *OperatorRulingRecord
+	if g := governingOf(ar.memory); g != nil && g.Steers {
+		ruling = &OperatorRulingRecord{
+			Ruling: "absent", Backed: operatorEvidenceFetched(round),
+			VerdictID: g.VerdictID, VerdictVersion: g.Version, VerdictDate: g.Date,
+		}
+		if r := resp2.OperatorRuling; r != nil && validOperatorRulings[r.Ruling] {
+			ruling.Ruling = r.Ruling
+			ruling.Basis = capText(flattenRecalled(r.Basis), 300)
+		} else {
+			s.logger.Warn("acutetriage: steering: model omitted or mangled operator_ruling; treated as absent (clamp applies)",
+				"incident", inc.ID, "verdict_version", g.Version)
+		}
+	}
 	s.auditVerificationExecuted(ctx, inc.ID, outcome, round, clamped)
 
-	return comp.Raw, resp2, &VerificationEnrichment{Outcome: outcome, Rounds: []VerificationRound{*round}}
+	return comp.Raw, resp2, &VerificationEnrichment{Outcome: outcome, Rounds: []VerificationRound{*round}, OperatorRuling: ruling}
 }
 
 // degradedDraft is the shared call-2-failure return: the draft ships as final —
@@ -876,10 +927,19 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 // memory mark cleared (R16 — a lost call 2 moves no marks), outcome degraded, and
 // the executed round preserved for the envelope. It emits the
 // verification_executed audit so every planned round has a matching executed row.
-func (s *Skill) degradedDraft(ctx context.Context, incidentID string, draftRaw json.RawMessage, round *VerificationRound, draft llmResponse) (json.RawMessage, llmResponse, *VerificationEnrichment) {
+// g is the governing correction (nil when none/not steering) — a lost call 2
+// means the correction went unruled, recorded as such rather than silently
+// dropped (the caller already logged the ERROR naming the failure).
+func (s *Skill) degradedDraft(ctx context.Context, incidentID string, draftRaw json.RawMessage,
+	round *VerificationRound, draft llmResponse, g *GoverningVerdict) (json.RawMessage, llmResponse, *VerificationEnrichment) {
 	draft.MemoryVerdict = ""
+	var ruling *OperatorRulingRecord
+	if g != nil && g.Steers {
+		ruling = &OperatorRulingRecord{Ruling: "unruled", Backed: operatorEvidenceFetched(round),
+			VerdictID: g.VerdictID, VerdictVersion: g.Version, VerdictDate: g.Date}
+	}
 	s.auditVerificationExecuted(ctx, incidentID, verifyOutcomeDegraded, round, false)
-	return draftRaw, draft, &VerificationEnrichment{Outcome: verifyOutcomeDegraded, Rounds: []VerificationRound{*round}}
+	return draftRaw, draft, &VerificationEnrichment{Outcome: verifyOutcomeDegraded, Rounds: []VerificationRound{*round}, OperatorRuling: ruling}
 }
 
 // auditVerificationPlanned records the plan before it runs: the floor/operator/
