@@ -95,7 +95,7 @@ func runRestore(args []string, stdout, stderr io.Writer) error {
 func finalizeRestore(ctx context.Context, st *store.Store, info *backup.RestoreInfo, logger *slog.Logger) error {
 	auditor := audit.New(st.DB())
 
-	verifyResult := ""
+	var verifyResult string
 	report, verr := auditor.Verify(ctx)
 	switch {
 	case verr != nil && report != nil:

@@ -29,7 +29,7 @@ func TestAdmissionCheck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fdb.Exec(`CREATE TABLE notes (id INTEGER PRIMARY KEY)`); err != nil {
+	if _, err := fdb.ExecContext(ctx, `CREATE TABLE notes (id INTEGER PRIMARY KEY)`); err != nil {
 		t.Fatal(err)
 	}
 	_ = fdb.Close()
@@ -40,7 +40,7 @@ func TestAdmissionCheck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fdb2.Exec(
+	if _, err := fdb2.ExecContext(ctx,
 		`INSERT INTO schema_migrations (version, applied_at) VALUES (9999, '2026-07-28T00:00:00Z')`); err != nil {
 		t.Fatal(err)
 	}
@@ -85,9 +85,9 @@ func readProbeCount(t *testing.T, dbPath string) int {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM audit_log`).Scan(&n); err != nil {
+	if err := db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM audit_log`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	return n
@@ -104,7 +104,7 @@ func TestRestore_HappyPathOverExistingDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(
+	if _, err := db.ExecContext(ctx,
 		`INSERT INTO audit_log (ts, actor, kind, payload_json, prev_hash, hash)
 		 VALUES ('2026-07-28T00:00:01Z', 'test', 'test.probe', '{}', 'h0', 'h1')`); err != nil {
 		t.Fatal(err)
@@ -157,10 +157,10 @@ func TestRestore_RefusesWhileAgentHoldsDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	agent.SetMaxOpenConns(1)
-	if err := agent.Ping(); err != nil {
+	if err := agent.PingContext(ctx); err != nil {
 		t.Fatal(err)
 	}
-	defer agent.Close()
+	defer func() { _ = agent.Close() }()
 
 	_, rerr := Restore(ctx, dbPath, backupFile)
 	if rerr == nil || !strings.Contains(rerr.Error(), "agent appears to be running") {
@@ -317,10 +317,10 @@ func TestApplyStaged_TransientFailureLeavesStagingInPlace(t *testing.T) {
 		t.Fatal(err)
 	}
 	holder.SetMaxOpenConns(1)
-	if err := holder.Ping(); err != nil {
+	if err := holder.PingContext(ctx); err != nil {
 		t.Fatal(err)
 	}
-	defer holder.Close()
+	defer func() { _ = holder.Close() }()
 
 	_, aerr := ApplyStaged(ctx, dbPath)
 	if aerr == nil {

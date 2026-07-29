@@ -226,7 +226,7 @@ func StagingPath(dbPath string) string { return dbPath + ".restore" }
 func ApplyStaged(ctx context.Context, dbPath string) (*RestoreInfo, error) {
 	staging := StagingPath(dbPath)
 	if _, err := os.Stat(staging); errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
+		return nil, nil //nolint:nilnil // nothing staged is not an error; callers branch on a nil *RestoreInfo
 	} else if err != nil {
 		return nil, fmt.Errorf("stat staging file: %w", err)
 	}

@@ -23,7 +23,7 @@ func newStoreDB(t *testing.T, dir, name string) string {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	if _, err := st.DB().Exec(
+	if _, err := st.DB().ExecContext(context.Background(),
 		`INSERT INTO audit_log (ts, actor, kind, payload_json, prev_hash, hash)
 		 VALUES ('2026-07-28T00:00:00Z', 'test', 'test.probe', '{}', NULL, 'h0')`); err != nil {
 		t.Fatalf("seed probe row: %v", err)
@@ -64,13 +64,13 @@ func TestCreate_SnapshotIsHealthyAndSidecarFree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open snapshot: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	var res string
-	if err := db.QueryRow(`PRAGMA integrity_check`).Scan(&res); err != nil || res != "ok" {
+	if err := db.QueryRowContext(context.Background(), `PRAGMA integrity_check`).Scan(&res); err != nil || res != "ok" {
 		t.Fatalf("integrity_check = %q, err=%v", res, err)
 	}
 	var count int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM audit_log`).Scan(&count); err != nil || count != 1 {
+	if err := db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM audit_log`).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("audit_log count = %d, err=%v", count, err)
 	}
 }
@@ -110,7 +110,7 @@ func TestCreate_LiveWriterRace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -123,7 +123,7 @@ func TestCreate_LiveWriterRace(t *testing.T) {
 				return
 			default:
 			}
-			_, _ = st.DB().Exec(
+			_, _ = st.DB().ExecContext(context.Background(),
 				`INSERT INTO audit_log (ts, actor, kind, payload_json, prev_hash, hash)
 				 VALUES ('2026-07-28T00:00:00Z', 'w', 'test.probe', '{}', NULL, ?)`, i)
 		}
@@ -140,9 +140,9 @@ func TestCreate_LiveWriterRace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open snapshot: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	var res string
-	if err := db.QueryRow(`PRAGMA integrity_check`).Scan(&res); err != nil || res != "ok" {
+	if err := db.QueryRowContext(context.Background(), `PRAGMA integrity_check`).Scan(&res); err != nil || res != "ok" {
 		t.Fatalf("live snapshot integrity_check = %q, err=%v", res, err)
 	}
 }

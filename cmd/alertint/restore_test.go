@@ -7,12 +7,14 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/alertint/alertint-agent/internal/audit"
+	"github.com/alertint/alertint-agent/internal/backup"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -24,7 +26,7 @@ func seedAudit(t *testing.T, dbPath, kind string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	if err := audit.New(st.DB()).Append(context.Background(), "test", kind, map[string]string{"k": "v"}); err != nil {
 		t.Fatal(err)
 	}
@@ -36,9 +38,9 @@ func lastAuditKind(t *testing.T, dbPath string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	var kind string
-	if err := db.QueryRow(`SELECT kind FROM audit_log ORDER BY seq DESC LIMIT 1`).Scan(&kind); err != nil {
+	if err := db.QueryRowContext(context.Background(), `SELECT kind FROM audit_log ORDER BY seq DESC LIMIT 1`).Scan(&kind); err != nil {
 		t.Fatal(err)
 	}
 	return kind
@@ -85,7 +87,7 @@ func TestRunRestore_FullRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	if _, err := audit.New(st.DB()).Verify(context.Background()); err != nil {
 		t.Errorf("restored chain fails verify: %v", err)
 	}
@@ -112,5 +114,94 @@ func TestRunRestore_RefusesGarbageBackup(t *testing.T) {
 	}
 	if _, statErr := os.Stat(dbPath + ".pre-restore"); !errors.Is(statErr, os.ErrNotExist) {
 		t.Error("refused restore created a safety copy")
+	}
+}
+
+func TestOpenStoreWithStagedRestore_AppliesAndServesRestoredData(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	logger := slog.New(slog.DiscardHandler)
+
+	dbPath := newTestDB(t, dir)
+	seedAudit(t, dbPath, "test.live_only")
+
+	// Stage a distinguishable backup.
+	incoming := filepath.Join(dir, "incoming.db")
+	ist, err := store.Open(ctx, incoming)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := audit.New(ist.DB()).Append(ctx, "test", "test.from_backup", nil); err != nil {
+		t.Fatal(err)
+	}
+	_ = ist.Close()
+	if err := os.Rename(incoming, backup.StagingPath(dbPath)); err != nil {
+		t.Fatal(err)
+	}
+
+	st, info, err := openStoreWithStagedRestore(ctx, dbPath, logger)
+	if err != nil {
+		t.Fatalf("openStoreWithStagedRestore: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	if info == nil || info.Mode != "staged" {
+		t.Fatalf("info = %+v, want staged restore applied", info)
+	}
+	// The open store serves the restored data.
+	var count int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM audit_log WHERE kind = 'test.from_backup'`).Scan(&count); err != nil || count != 1 {
+		t.Errorf("restored row count = %d (err=%v), want 1", count, err)
+	}
+	// Staging consumed; previous DB at the safety copy.
+	if _, err := os.Stat(backup.StagingPath(dbPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Error("staging file not consumed")
+	}
+	if _, err := os.Stat(dbPath + ".pre-restore"); err != nil {
+		t.Errorf("safety copy missing: %v", err)
+	}
+}
+
+func TestOpenStoreWithStagedRestore_RejectedStagingErrorsOut(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	logger := slog.New(slog.DiscardHandler)
+
+	dbPath := newTestDB(t, dir)
+	if err := os.WriteFile(backup.StagingPath(dbPath), []byte("garbage"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := openStoreWithStagedRestore(ctx, dbPath, logger)
+	if err == nil {
+		t.Fatal("expected error for rejected staging file — serve must exit non-zero")
+	}
+	// Evidence preserved, original untouched: the NEXT start serves normally.
+	if _, statErr := os.Stat(backup.StagingPath(dbPath) + ".rejected"); statErr != nil {
+		t.Errorf(".rejected file missing: %v", statErr)
+	}
+	st, info, err := openStoreWithStagedRestore(ctx, dbPath, logger)
+	if err != nil {
+		t.Fatalf("second start after rejection: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	if info != nil {
+		t.Errorf("second start applied a restore: %+v", info)
+	}
+}
+
+func TestOpenStoreWithStagedRestore_NoStagingIsPlainOpen(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	logger := slog.New(slog.DiscardHandler)
+	dbPath := newTestDB(t, dir)
+
+	st, info, err := openStoreWithStagedRestore(ctx, dbPath, logger)
+	if err != nil {
+		t.Fatalf("plain open: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	if info != nil {
+		t.Errorf("info = %+v, want nil (nothing staged)", info)
 	}
 }
