@@ -80,9 +80,11 @@ and resolved — only the header and fields change on resolution.
 |---|---|
 | Main — header | 🔴 INCIDENT DETECTED when firing, updated to ✅ INCIDENT RESOLVED in-place when resolved. |
 | Main — root cause | One-sentence root cause hypothesis, preserved when the message is updated on resolution. |
-| Main — footer | Incident ID, alert count, group key, and start time. Replaced by resolved time and duration on resolution. |
+| Main — footer | Incident ID, alert count, severity, confidence, group key, and start time. Replaced by resolved time and duration on resolution. |
 | Main — agent handoff | `investigate incident <id> using alertint` — the MCP call to action, with the full incident ID. Dropped when the incident resolves. |
+| Main — steering ruling | On failure groups governed by an operator correction: one line stating whether live evidence supported it, contradicted it, or could not test it. Channel-visible on purpose — it is the triage outcome. |
 | Thread — analysis | Posted immediately after the main message: severity, confidence, alert count, and group key in a fields grid. |
+| Thread — operator history | The failure group's operator context: first-occurrence / seen-before state or the governing verdict's note, followed by up to three operator notes with ages. |
 | Thread — evidence | One line: per-source counts (Prometheus/Loki/Changes/Sentry) that fed the triage, e.g. `Prometheus 21 metrics · Loki 0 lines`. A connector that could not be reached shows `unreachable` instead of a count; a known-issue short-circuit shows `skipped (known issue)`; a zero-connector install shows `no sources configured`. Always present. |
 | Thread — findings | Bullet list of correlation findings. Only shown when the LLM identified more than one contributing factor. |
 | Thread — agent handoff | The same handoff block, so the call to action reads identically on every firing surface. |
@@ -101,10 +103,9 @@ Main channel:
 Root cause: CPU saturation on api-2 is causing request queuing, elevating
 error rates and response latency across the cluster.
 
-Incident a1b2c3d4 · 3 alerts · group cluster=prod · started 14:37 UTC
+Incident a1b2c3d4 · 3 alerts · high · 91% · group cluster=prod · started 14:37 UTC
 
-🤖 Investigate in your AI agent
-investigate incident a1b2c3d4-5e6f-7a8b-9c0d-1e2f3a4b5c6d using alertint
+🤖 Investigate in your AI agent: investigate incident a1b2c3d4-5e6f-7a8b-9c0d-1e2f3a4b5c6d using alertint
 ```
 
 Thread reply (posted immediately):
@@ -121,8 +122,12 @@ Correlation findings
 • HighCPU (api-2) fired 15 s before HighErrorRate — causal ordering confirmed.
 • HighLatency shares the same instance label, indicating single-host origin.
 
-🤖 Investigate in your AI agent
-investigate incident a1b2c3d4-5e6f-7a8b-9c0d-1e2f3a4b5c6d using alertint
+👀 seen ×2 in the last 90d (since 2026-07-01) — no operator verdict yet
+
+Operator notes
+📝 observation (2h ago): api-2 is the canary host; rollout paused.
+
+🤖 Investigate in your AI agent: investigate incident a1b2c3d4-5e6f-7a8b-9c0d-1e2f3a4b5c6d using alertint
 ```
 
 ## Example — resolved

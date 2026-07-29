@@ -100,7 +100,7 @@ type HistoryNote struct {
 
 // Steering reports the ruling on a steered finding (ADR-0029).
 type Steering struct {
-	Ruling      string `json:"ruling"` // supported | contradicted | unverifiable | unruled
+	Ruling      string `json:"ruling"` // supported | contradicted | unverifiable | untested | unruled
 	Basis       string `json:"basis,omitempty"`
 	VerdictDate string `json:"verdict_date"`
 }

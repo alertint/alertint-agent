@@ -326,12 +326,16 @@ func firingMainBlocks(f notify.Finding) []slacklib.Block {
 			nil, nil,
 		))
 	}
+	// Severity and confidence ride the channel-visible meta line — they are
+	// the two numbers an operator triages by, and the thread (where the full
+	// fields grid lives) is invisible until clicked.
+	meta := fmt.Sprintf("Incident `%s` · %d alerts", shortID(f.IncidentID), f.AlertCount)
+	if f.Severity != "" {
+		meta += fmt.Sprintf(" · %s · %.0f%%", strings.ToLower(f.Severity), f.Confidence*100)
+	}
+	meta += fmt.Sprintf(" · group `%s` · started %s UTC", f.GroupKey, f.FirstAlertAt.UTC().Format("15:04"))
 	blocks = append(blocks, slacklib.NewContextBlock("",
-		slacklib.NewTextBlockObject(slacklib.MarkdownType,
-			fmt.Sprintf("Incident `%s` · %d alerts · group `%s` · started %s UTC",
-				shortID(f.IncidentID), f.AlertCount, f.GroupKey,
-				f.FirstAlertAt.UTC().Format("15:04")),
-			false, false),
+		slacklib.NewTextBlockObject(slacklib.MarkdownType, meta, false, false),
 	))
 	// The MCP handoff is the differentiator, so it rides the headline card as
 	// a full-size section (a context block renders as small grey caption text
@@ -355,9 +359,11 @@ func firingCardBlocks(f notify.Finding) []slacklib.Block {
 	if f.Recurrence != nil {
 		blocks = append(blocks, recurrenceContextBlock(f.Recurrence.Episodes, f.Recurrence.LastSeen))
 	}
-	if b := historyContextBlock(f.History); b != nil {
-		blocks = append(blocks, b)
-	}
+	// The history line (🆕/👀/📌 + the operator's note text) renders on the
+	// thread detail, next to the operator-notes block it introduces — context
+	// for whoever opens the incident, not triage signal. The steering ruling
+	// stays on the card: it is the outcome ("correction checked: does not
+	// apply now") and must be visible in the channel feed.
 	if b := steeringContextBlock(f.Steering); b != nil {
 		blocks = append(blocks, b)
 	}
@@ -420,6 +426,13 @@ func steeringContextBlock(s *notify.Steering) slacklib.Block {
 		}
 	case "unverifiable":
 		text = fmt.Sprintf("⚠️ adopted per operator correction of %s, not verifiable from current evidence (confidence capped)", s.VerdictDate)
+		if s.Basis != "" {
+			text += " — " + s.Basis
+		}
+	case "untested":
+		// an unbacked supported/contradicted, remapped by the producer: the
+		// correction's named evidence never fetched, so no ruling took effect
+		text = fmt.Sprintf("⚠️ operator correction of %s could not be tested — its named evidence returned no usable data this round (confidence capped)", s.VerdictDate)
 	case "unruled":
 		text = "⚠️ operator correction present — check did not complete"
 	default:
@@ -440,11 +453,13 @@ func recurrenceContextBlock(occurrences int, lastSeen time.Time) slacklib.Block 
 }
 
 // agentHandoffBlock is the MCP call to action, rendered the same wherever it
-// appears: main firing card and thread detail.
+// appears: main firing card and thread detail. One line — a full-size section
+// block (a context block renders as small grey caption text and gets lost)
+// but without a separate header row, keeping the channel card compact.
 func agentHandoffBlock(incidentID string) slacklib.Block {
 	return slacklib.NewSectionBlock(
 		slacklib.NewTextBlockObject(slacklib.MarkdownType,
-			fmt.Sprintf(":robot_face: *Investigate in your AI agent*\n`investigate incident %s using alertint`", incidentID),
+			fmt.Sprintf(":robot_face: *Investigate in your AI agent:* `investigate incident %s using alertint`", incidentID),
 			false, false),
 		nil, nil,
 	)
@@ -525,6 +540,13 @@ func firingDetailBlocks(f notify.Finding) []slacklib.Block {
 			slacklib.NewTextBlockObject(slacklib.MarkdownType, strings.TrimRight(sb.String(), "\n"), false, false),
 			nil, nil,
 		))
+	}
+
+	// The tri-state history line (moved off the main card to keep the channel
+	// feed scannable) heads the operator context: 🆕/👀 state or the 📌
+	// governing-verdict note, then the bounded notes list.
+	if b := historyContextBlock(f.History); b != nil {
+		blocks = append(blocks, b)
 	}
 
 	if f.History != nil && len(f.History.Notes) > 0 {

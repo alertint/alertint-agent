@@ -86,14 +86,18 @@ result: `supported` (the corrected cause is adopted, confidence from the
 evidence), `contradicted` (not adopted; the card says the correction was
 checked and what contradicted it), or `unverifiable` (adopted as a leading
 hypothesis, confidence capped at 0.6, with the correction's date named). A
-correction is never an axiom: it is guaranteed to be fetched and ruled on
-every recurrence, and live evidence can retire it. A **confirmation** verdict
+supported or contradicted ruling whose named evidence never actually fetched
+carries no weight: the confidence cap applies and the card says the correction
+*could not be tested* — it never presents an untested conclusion as a tested
+one. A correction is never an axiom: it is guaranteed to be fetched and ruled
+on every recurrence, and live evidence can retire it. A **confirmation** verdict
 retires steering — it records that the machine's conclusion is right.
 
 Notes written with `alertint_incident_annotate` are context for the next
-investigator: they render on the Slack card's history block and in MCP
-incident reads (`operator_history`), permanent and age-stamped, and never
-enter the triage prompt or influence recall.
+investigator: they render on the incident's Slack thread (history line plus
+a bounded notes list) and in MCP incident reads (`operator_history`),
+permanent and age-stamped, and never enter the triage prompt or influence
+recall.
 
 ## Inspecting what the model saw
 

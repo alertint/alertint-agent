@@ -235,15 +235,25 @@ func callTwoContinuation(draftRaw json.RawMessage, round *VerificationRound, mem
 			"Memory section). The queries marked [operator/...] above fetched the evidence it "+
 			"names. Add an \"operator_ruling\" key to your JSON, shaped exactly:\n"+
 			`  "operator_ruling": {"ruling": "supported"|"contradicted"|"unverifiable", "basis": "<one sentence>"}`+"\n"+
-			"- \"supported\": the computed operator-query results show the corrected cause. Adopt "+
-			"it as the root cause; set confidence from the evidence as usual.\n"+
+			"- \"supported\": the corrected cause is present — the named series exhibits the "+
+			"state the correction claims (a resource the operator says filled up reads as full "+
+			"or critical). Presence is the bar, symmetric with \"contradicted\": you are testing "+
+			"whether live evidence is consistent with the operator's causal claim, not "+
+			"re-deriving the causal chain yourself. Judge the returned VALUES, not the "+
+			"provenance of the series — a fetched result for a series the correction names is "+
+			"usable evidence regardless of which job or exporter produced it. Adopt the "+
+			"corrected cause as the root cause; set confidence from the evidence as usual.\n"+
 			"- \"contradicted\": the computed results show the corrected cause is NOT present now. "+
 			"Do not adopt it; conclude from the evidence, and state in overall_issue what "+
-			"contradicted the correction.\n"+
+			"contradicted the correction. Mention the corrected cause ONLY in that contradiction "+
+			"statement — do not carry it into the root cause as a possible or underlying "+
+			"trigger.\n"+
 			"- \"unverifiable\": the operator queries returned no usable data. Adopt the corrected "+
 			"cause as the leading hypothesis, state \"per operator correction of %s, not "+
 			"verifiable from current evidence\" in overall_issue, and keep confidence at or "+
-			"below %.1f.\n"+
+			"below %.1f. If an operator query DID return data that you could not interpret, "+
+			"say what it returned (metric and value) in overall_issue and in your basis — the "+
+			"operator reading the card can often interpret a value you cannot.\n"+
 			"The empty-result rule above applies here too: an empty operator-query result is "+
 			"\"unverifiable\", not \"contradicted\", unless its metric names are confirmed present "+
 			"in the evidence.", g.Date, g.Date, MaxMetadataOnlyConfidence)

@@ -1079,6 +1079,49 @@ func TestRunSteeringSupported_FindingCarriesRuling(t *testing.T) {
 	}
 }
 
+// TestRunSteeringUnbackedContradicted_CardRemapsToUntested: the model rules
+// "contradicted" but the operator probe never fetched (promUpHealthyElseEmpty
+// answers it empty), so Backed=false and the Task 8 clamp already treated the
+// ruling as absent. The card payload must present the same deterministic fact
+// — "untested", basis dropped — never the model's unbacked conclusion
+// ("contradicted by absence of evidence" is the epistemic error the
+// vocabulary exists to prevent). The enrichment record keeps the raw ruling;
+// TestSteering_UnbackedContradictionClamps pins that side.
+func TestRunSteeringUnbackedContradicted_CardRemapsToUntested(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-steer-untested", map[string]string{"alertname": "DiskFull", "host": "web1"})
+	seedGoverningVerdict(t, st, ctx, inc.ID, "correction", `{"cause_series":["pvc_bytes"]}`)
+
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "draft", "generic disk pressure on web1", 0.85, nil)},
+		{raw: callTwoRespWithRuling(t, "corrected", "disk pressure on web1", 0.85,
+			"contradicted", "no data supports the correction, but I conclude it anyway")},
+	}}
+
+	notifier := &capturingNotifier{}
+	cfg := verifyConfig(promUpHealthyElseEmpty(t))
+	cfg.Memory = st
+	cfg.MemoryParams = acutetriage.MemoryParams{LookbackDays: 90}
+	skill := acutetriage.New(cfg, st, scripted, nil, notifier, nil)
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	f := notifier.last
+	if f.Steering == nil {
+		t.Fatalf("want a non-nil Steering (a ruling was produced by call 2)")
+	}
+	if f.Steering.Ruling != "untested" {
+		t.Errorf("Steering.Ruling = %q, want untested (unbacked contradicted must not present as tested)", f.Steering.Ruling)
+	}
+	if f.Steering.Basis != "" {
+		t.Errorf("Steering.Basis = %q, want empty (the unbacked basis asserts a rejected conclusion)", f.Steering.Basis)
+	}
+}
+
 // TestRunDefaultsUnitemizedAlertRoles: member alerts the model omits from its
 // alerts array get the "correlated" role deterministically (bounded
 // itemization) — MCP consumers always see a role on every member.

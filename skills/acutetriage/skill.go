@@ -484,11 +484,24 @@ func (s *Skill) attachHistorySteering(ctx context.Context, inc store.Incident, a
 
 	if ver != nil && ver.OperatorRuling != nil {
 		r := ver.OperatorRuling
-		ruling := r.Ruling
+		ruling, basis := r.Ruling, r.Basis
 		if ruling == "absent" {
 			ruling = "unruled"
 		}
-		f.Steering = &notify.Steering{Ruling: ruling, Basis: r.Basis, VerdictDate: r.VerdictDate}
+		// Presentation parity with the Task 8 backstop: an unbacked
+		// supported/contradicted had no effect (the clamp treated it as
+		// absent), so the card must not present the model's conclusion as a
+		// tested outcome — "contradicted by absence of evidence" on a card is
+		// exactly the epistemic error the ruling vocabulary exists to prevent.
+		// The wire value "untested" renders the deterministic fact (the
+		// correction's named evidence never fetched; confidence capped) and
+		// drops the model's basis, which asserts a conclusion the machinery
+		// rejected. The enrichment record keeps the raw ruling — this remap
+		// is card/stdout payload only.
+		if (ruling == "supported" || ruling == "contradicted") && !r.Backed {
+			ruling, basis = "untested", ""
+		}
+		f.Steering = &notify.Steering{Ruling: ruling, Basis: basis, VerdictDate: r.VerdictDate}
 		return
 	}
 	if g := governingOf(ar.memory); g != nil && g.Steers {
