@@ -418,3 +418,14 @@ func TestIncidentDrillFlags(t *testing.T) {
 		t.Fatalf("empty ids: got %v, %v; want empty map, nil", empty, err)
 	}
 }
+
+func TestMaxSchemaVersion(t *testing.T) {
+	got, err := MaxSchemaVersion()
+	if err != nil {
+		t.Fatalf("MaxSchemaVersion: %v", err)
+	}
+	// 0010_feedback_capture.sql exists today; the floor only ratchets up.
+	if got < 10 {
+		t.Errorf("MaxSchemaVersion = %d, want >= 10", got)
+	}
+}

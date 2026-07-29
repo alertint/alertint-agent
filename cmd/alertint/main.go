@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/audit"
+	"github.com/alertint/alertint-agent/internal/backup"
 	"github.com/alertint/alertint-agent/internal/config"
 	"github.com/alertint/alertint-agent/internal/correlator"
 	"github.com/alertint/alertint-agent/internal/health"
@@ -88,6 +89,10 @@ func run(args []string, stdout, stderr io.Writer) error {
 			return runValidate(args[1:], stdout, stderr)
 		case "drill":
 			return runDrill(args[1:], stdout, stderr)
+		case "backup":
+			return runBackup(args[1:], stdout, stderr)
+		case "restore":
+			return runRestore(args[1:], stdout, stderr)
 		case "serve":
 			return runServe(args[1:], stdout, stderr)
 		}
@@ -166,11 +171,12 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		cfg.MCP.Addr = *mcpAddr
 	}
 
-	st, err := store.Open(ctx, cfg.Storage.SQLitePath)
+	st, stagedInfo, err := openStoreWithStagedRestore(ctx, cfg.Storage.SQLitePath, logger)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = st.Close() }()
+	finalizeStagedRestoreIfApplied(ctx, st, stagedInfo, logger)
 
 	pruneChangesAtStartup(ctx, cfg, st, logger)
 
@@ -509,6 +515,46 @@ func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom 
 	return srv, ch, nil
 }
 
+// openStoreWithStagedRestore is serve's store-opening path: it applies a
+// pending Staged restore BEFORE store.Open — the one moment the agent
+// provably holds no database connection (ADR-0030) — then opens the store.
+// A rejected staging file is an error: serve exits non-zero once, loudly;
+// the staging file has already been set aside, so the next start serves
+// normally on the untouched DB.
+func openStoreWithStagedRestore(ctx context.Context, dbPath string, logger *slog.Logger) (*store.Store, *backup.RestoreInfo, error) {
+	info, err := backup.ApplyStaged(ctx, dbPath)
+	if err != nil {
+		logger.Error("staged restore failed", slog.String("error", err.Error()))
+		return nil, nil, fmt.Errorf("staged restore: %w", err)
+	}
+	if info != nil {
+		logger.Info("staged restore applied",
+			slog.String("source", info.SourceFile),
+			slog.Int64("source_bytes", info.SourceBytes),
+			slog.Int64("installed_bytes", info.InstalledBytes),
+			slog.String("safety_copy", info.SafetyCopy),
+		)
+	}
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	return st, info, nil
+}
+
+// finalizeStagedRestoreIfApplied verifies and audits a staged restore that
+// openStoreWithStagedRestore applied, if any. No-op when info is nil.
+// Failures warn only: the store is already open and serving, so a
+// verification failure must never abort a successful startup.
+func finalizeStagedRestoreIfApplied(ctx context.Context, st *store.Store, info *backup.RestoreInfo, logger *slog.Logger) {
+	if info == nil {
+		return
+	}
+	if err := finalizeRestore(ctx, st, info, logger); err != nil {
+		logger.Warn("staged restore finalization failed", slog.String("error", err.Error()))
+	}
+}
+
 func runVerifyAudit(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("alertint verify-audit", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -530,7 +576,7 @@ func runVerifyAudit(args []string, stdout, stderr io.Writer) error {
 	}
 	logging.SetDefault(logger)
 
-	dbPath, err := resolveDBPath(*cfgPath, *dbPathFlag)
+	dbPath, err := resolveDBPath("verify-audit", *cfgPath, *dbPathFlag)
 	if err != nil {
 		return err
 	}
@@ -591,12 +637,12 @@ func logConfigWarnings(logger *slog.Logger, cfg *config.Config) {
 	}
 }
 
-func resolveDBPath(cfgPath, dbPathFlag string) (string, error) {
+func resolveDBPath(sub, cfgPath, dbPathFlag string) (string, error) {
 	if dbPathFlag != "" {
 		return dbPathFlag, nil
 	}
 	if cfgPath == "" {
-		return "", errors.New("verify-audit: either --config or --db is required")
+		return "", fmt.Errorf("%s: either --config or --db is required", sub)
 	}
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
