@@ -3,9 +3,18 @@
 package ingress
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"regexp"
 	"strings"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/alertint/alertint-agent/internal/severity"
+	"github.com/alertint/alertint-agent/internal/store"
 )
 
 // ZabbixEvent is the webhook contract AlertINT owns (ADR-0031): a small fixed
@@ -57,4 +66,156 @@ func ParseZabbix(body []byte) (ZabbixEvent, error) {
 		return ZabbixEvent{}, fmt.Errorf("zabbix: trigger_name is required")
 	}
 	return ev, nil
+}
+
+// zabbixReceiver wraps ParseZabbix → map → persist → AlertSink/correlator,
+// mirroring alertReceiver. One webhook delivery carries one event.
+type zabbixReceiver struct {
+	store  *store.Store
+	sink   AlertSink
+	token  []byte
+	logger *slog.Logger
+	now    func() time.Time
+	newID  func() string
+}
+
+// NewZabbixReceiver builds the Zabbix receiver. sink may be nil.
+func NewZabbixReceiver(st *store.Store, token string, sink AlertSink, logger *slog.Logger) Receiver {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &zabbixReceiver{
+		store:  st,
+		sink:   sink,
+		token:  []byte(token),
+		logger: logger,
+		now:    func() time.Time { return time.Now().UTC() },
+		newID:  uuid.NewString,
+	}
+}
+
+func (r *zabbixReceiver) Route() string { return "POST /webhook/zabbix" }
+func (r *zabbixReceiver) Name() string  { return "zabbix" }
+func (r *zabbixReceiver) Token() []byte { return r.token }
+
+func (r *zabbixReceiver) Ingest(ctx context.Context, body []byte) (Summary, error) {
+	ev, err := ParseZabbix(body)
+	if err != nil {
+		return Summary{}, err // → 400
+	}
+	r.logger.Info("webhook received",
+		slog.String("source", "zabbix"),
+		slog.String("event_id", ev.EventID),
+		slog.String("status", ev.Status),
+		slog.String("host", ev.Host),
+	)
+	alert := r.toStoreAlert(ev)
+	stored, err := r.store.UpsertAlertByFingerprint(ctx, alert)
+	if err != nil {
+		// Persist failures are logged and swallowed: the host still answers 204
+		// (never-5xx), matching alertReceiver's contract.
+		r.logger.Error("upsert alert failed",
+			slog.String("fingerprint", alert.Fingerprint),
+			slog.String("err", err.Error()),
+		)
+		return Summary{Kind: "alert.received", Audit: zabbixAuditRecord(ev, false)}, nil
+	}
+	if r.sink != nil {
+		if err := r.sink(ctx, stored); err != nil {
+			r.logger.Warn("alert sink failed",
+				slog.String("fingerprint", stored.Fingerprint),
+				slog.String("err", err.Error()),
+			)
+		}
+	}
+	return Summary{Kind: "alert.received", Audit: zabbixAuditRecord(ev, true)}, nil
+}
+
+// labelKeySanitiser collapses every character outside [a-zA-Z0-9_] to _.
+var labelKeySanitiser = regexp.MustCompile(`[^a-zA-Z0-9_]`)
+
+// canonicalZabbixSeverity maps {EVENT.NSEVERITY} 1..5 to the default Zabbix
+// severity names, for the renamed-severity fallback (ADR-0033).
+var canonicalZabbixSeverity = map[string]string{
+	"1": "information", "2": "warning", "3": "average", "4": "high", "5": "disaster",
+}
+
+func (r *zabbixReceiver) toStoreAlert(ev ZabbixEvent) store.Alert {
+	now := r.now()
+
+	// Verbatim-first severity with nseverity fallback (ADR-0033): a name the
+	// shared ladder knows stays verbatim; an unknown name with a valid
+	// nseverity becomes the canonical tier name, the operator's word moving to
+	// the severity_display annotation.
+	sev := ev.Severity
+	var sevDisplay string
+	if severity.Rank(sev) == 0 {
+		if canonical, ok := canonicalZabbixSeverity[ev.NSeverity]; ok {
+			sevDisplay = ev.Severity
+			sev = canonical
+		}
+	}
+
+	labels := map[string]string{
+		"alertname":         ev.TriggerName,
+		"host":              ev.Host,
+		"severity":          sev,
+		"zabbix_trigger_id": ev.TriggerID,
+	}
+	for _, tag := range ev.Tags {
+		key := labelKeySanitiser.ReplaceAllString(tag.Tag, "_")
+		if key == "" {
+			continue
+		}
+		if _, taken := labels[key]; taken {
+			// Core identity labels win; a colliding tag is dropped, not merged.
+			r.logger.Debug("zabbix tag collides with core label, skipped", slog.String("tag", tag.Tag))
+			continue
+		}
+		labels[key] = tag.Value
+	}
+
+	annotations := map[string]string{}
+	setIfPresent := func(k, v string) {
+		if v != "" {
+			annotations[k] = v
+		}
+	}
+	setIfPresent("trigger_name", ev.TriggerName)
+	setIfPresent("item_key", ev.ItemKey)
+	setIfPresent("item_value", ev.ItemValue)
+	setIfPresent("zabbix_event_id", ev.EventID)
+	setIfPresent("host_visible", ev.HostVisible)
+	setIfPresent("generator_url", ev.GeneratorURL)
+	setIfPresent("clock", ev.Clock)
+	setIfPresent("recovery_clock", ev.RecoveryClock)
+	setIfPresent("severity_display", sevDisplay)
+
+	a := store.Alert{
+		ID:          r.newID(),
+		Fingerprint: "zabbix:" + ev.EventID,
+		Labels:      labels,
+		Annotations: annotations,
+		StartsAt:    now, // receipt-based by design — never parsed from clock (ADR-0031)
+		ReceivedAt:  now,
+	}
+	if ev.Status == "RESOLVED" {
+		a.Status = "resolved"
+		t := now
+		a.EndsAt = &t
+	} else {
+		a.Status = "firing"
+	}
+	return a
+}
+
+// zabbixAuditRecord is the receiver-owned audit payload (Summary contract).
+func zabbixAuditRecord(ev ZabbixEvent, persisted bool) map[string]any {
+	return map[string]any{
+		"event_id":  ev.EventID,
+		"status":    ev.Status,
+		"severity":  ev.Severity,
+		"host":      ev.Host,
+		"persisted": persisted,
+	}
 }
