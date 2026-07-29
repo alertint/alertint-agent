@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Zabbix receiver: `POST /webhook/zabbix` ingests Zabbix problem/resolution events
+  as first-class alerts — native webhook contract with a copy-paste media-type
+  template, severity ranking including per-install renamed severities, per-host
+  zero-config correlation. (docs/integrations/zabbix.md)
+
+### Changed
+
+- Default `correlator.group_labels` now includes `host` (was `cluster, namespace,
+  service`). Installs whose alerts carry a `host` label will see new group keys
+  for those alerts after upgrade.
+
 ## [0.11.0] - 2026-07-29
 
 ### Added

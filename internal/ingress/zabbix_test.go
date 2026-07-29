@@ -222,9 +222,10 @@ func TestServer_MountsZabbixRouteWithOwnToken(t *testing.T) {
 	defer ts.Close()
 
 	body := `{"event_id":"1","status":"PROBLEM","severity":"High","nseverity":"4","host":"h","trigger_id":"9","trigger_name":"T"}`
+	ctx := context.Background()
 
 	// zabbix token on the zabbix route: accepted
-	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/webhook/zabbix", strings.NewReader(body))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, ts.URL+"/webhook/zabbix", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer ztok")
 	resp, err := http.DefaultClient.Do(req)
@@ -237,7 +238,7 @@ func TestServer_MountsZabbixRouteWithOwnToken(t *testing.T) {
 	}
 
 	// alertmanager token on the zabbix route: rejected
-	req2, _ := http.NewRequest(http.MethodPost, ts.URL+"/webhook/zabbix", strings.NewReader(body))
+	req2, _ := http.NewRequestWithContext(ctx, http.MethodPost, ts.URL+"/webhook/zabbix", strings.NewReader(body))
 	req2.Header.Set("Content-Type", "application/json")
 	req2.Header.Set("Authorization", "Bearer atok")
 	resp2, err := http.DefaultClient.Do(req2)
