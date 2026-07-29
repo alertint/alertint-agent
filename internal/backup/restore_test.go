@@ -77,3 +77,166 @@ func TestAdmissionCheck(t *testing.T) {
 		})
 	}
 }
+
+// readProbeCount opens dbPath read-only and returns COUNT(*) of audit_log.
+func readProbeCount(t *testing.T, dbPath string) int {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM audit_log`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func TestRestore_HappyPathOverExistingDB(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	dbPath := newStoreDB(t, dir, "live.db")     // 1 probe row
+	backupFile := newStoreDB(t, dir, "snap.db") // separate DB, 1 probe row
+	// Make the current DB distinguishable: add a second row.
+	db, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO audit_log (ts, actor, kind, payload_json, prev_hash, hash)
+		 VALUES ('2026-07-28T00:00:01Z', 'test', 'test.probe', '{}', 'h0', 'h1')`); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	info, err := Restore(ctx, dbPath, backupFile)
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	// Sidecars swept: the flip removed -wal/-shm. Checked before any
+	// subsequent open of dbPath — backupFile here is itself a WAL-format
+	// store.Open database (unlike a real Create/VACUUM INTO backup, which
+	// is rollback-journal), so a later read-only open would legitimately
+	// recreate them as it services reads against the installed content.
+	for _, side := range []string{dbPath + "-wal", dbPath + "-shm"} {
+		if _, err := os.Stat(side); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("sidecar %s still present (err=%v)", side, err)
+		}
+	}
+	if got := readProbeCount(t, dbPath); got != 1 {
+		t.Errorf("restored DB rows = %d, want 1 (the backup's content)", got)
+	}
+	if got := readProbeCount(t, dbPath+".pre-restore"); got != 2 {
+		t.Errorf("safety copy rows = %d, want 2 (the previous content)", got)
+	}
+	if info.SafetyCopy != dbPath+".pre-restore" {
+		t.Errorf("SafetyCopy = %q", info.SafetyCopy)
+	}
+	if info.Mode != "offline" || info.SourceBytes <= 0 || info.InstalledBytes <= 0 {
+		t.Errorf("info = %+v", info)
+	}
+	// Offline mode preserves the backup file.
+	if _, err := os.Stat(backupFile); err != nil {
+		t.Errorf("backup file consumed in offline mode: %v", err)
+	}
+}
+
+func TestRestore_RefusesWhileAgentHoldsDB(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	dbPath := newStoreDB(t, dir, "live.db")
+	backupFile := newStoreDB(t, dir, "snap.db")
+
+	// Simulated live agent: an open store connection, idle. The
+	// journal-mode flip must fail SQLITE_BUSY even against an idle holder
+	// (spike-verified; wal_checkpoint would NOT catch this).
+	agent, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=journal_mode(wal)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent.SetMaxOpenConns(1)
+	if err := agent.Ping(); err != nil {
+		t.Fatal(err)
+	}
+	defer agent.Close()
+
+	_, rerr := Restore(ctx, dbPath, backupFile)
+	if rerr == nil || !strings.Contains(rerr.Error(), "agent appears to be running") {
+		t.Fatalf("Restore err = %v, want 'agent appears to be running'", rerr)
+	}
+	var adm *AdmissionError
+	if errors.As(rerr, &adm) {
+		t.Error("busy-guard failure must NOT be an AdmissionError (staged mode would wrongly consume the staging file)")
+	}
+	if got := readProbeCount(t, dbPath); got != 1 {
+		t.Errorf("current DB modified by refused restore: rows = %d", got)
+	}
+	if _, err := os.Stat(dbPath + ".pre-restore"); !errors.Is(err, os.ErrNotExist) {
+		t.Error("refused restore created a safety copy")
+	}
+}
+
+func TestRestore_IntoEmptyDirIsLegal(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	backupFile := newStoreDB(t, dir, "snap.db")
+	dbPath := filepath.Join(dir, "fresh", "alertint-agent.db")
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := Restore(ctx, dbPath, backupFile)
+	if err != nil {
+		t.Fatalf("Restore into empty dir: %v", err)
+	}
+	if info.SafetyCopy != "" {
+		t.Errorf("SafetyCopy = %q, want empty (no previous DB)", info.SafetyCopy)
+	}
+	if got := readProbeCount(t, dbPath); got != 1 {
+		t.Errorf("restored rows = %d, want 1", got)
+	}
+}
+
+// Crash between safety-copy rename and install: DB missing, .pre-restore
+// intact, backup untouched — and the documented recovery (rename back,
+// retry) works.
+func TestRestore_CrashAfterSafetyCopyIsRecoverable(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	dbPath := newStoreDB(t, dir, "live.db")
+	backupFile := newStoreDB(t, dir, "snap.db")
+
+	testHookAfterSafetyCopy = func() { panic("simulated crash") }
+	defer func() { testHookAfterSafetyCopy = nil }()
+
+	func() {
+		defer func() { _ = recover() }()
+		_, _ = Restore(ctx, dbPath, backupFile)
+		t.Error("expected simulated crash panic")
+	}()
+
+	// Documented post-crash state.
+	if _, err := os.Stat(dbPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("DB path state after crash: %v", err)
+	}
+	if got := readProbeCount(t, dbPath+".pre-restore"); got != 1 {
+		t.Fatalf("safety copy rows = %d, want 1", got)
+	}
+	if _, err := os.Stat(backupFile); err != nil {
+		t.Fatalf("backup file touched by crashed restore: %v", err)
+	}
+
+	// Documented recovery: rename back, retry.
+	testHookAfterSafetyCopy = nil
+	if err := os.Rename(dbPath+".pre-restore", dbPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Restore(ctx, dbPath, backupFile); err != nil {
+		t.Fatalf("retry after recovery: %v", err)
+	}
+	if got := readProbeCount(t, dbPath); got != 1 {
+		t.Errorf("restored rows = %d, want 1", got)
+	}
+}
