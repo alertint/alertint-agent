@@ -5,6 +5,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -146,6 +147,56 @@ func TestLoad_RejectsUnknownYAMLKeys(t *testing.T) {
 	path := writeConfig(t, yaml)
 	if _, err := Load(path); err == nil {
 		t.Fatal("expected error for unknown YAML key")
+	}
+}
+
+func TestZabbixIngressValidation(t *testing.T) {
+	cfg := Defaults()
+	cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
+	cfg.LLM.APIKeyEnv = "ANTHROPIC_API_KEY"
+	cfg.Alertmanager.WebhookTokenEnv = "ALERTINT_WEBHOOK_TOKEN"
+	cfg.Zabbix.Ingress.Enabled = true
+	cfg.Zabbix.Ingress.WebhookTokenEnv = ""
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "zabbix: ingress: webhook_token_env is required") {
+		t.Fatalf("want webhook_token_env validation error, got %v", err)
+	}
+}
+
+func TestZabbixIngressCountsAsInboundEnabled(t *testing.T) {
+	cfg := Defaults()
+	cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
+	cfg.LLM.APIKeyEnv = "ANTHROPIC_API_KEY"
+	cfg.Alertmanager.Enabled = false
+	cfg.Zabbix.Ingress.Enabled = true
+	cfg.Zabbix.Ingress.WebhookTokenEnv = "ALERTINT_ZABBIX_WEBHOOK_TOKEN"
+	cfg.Receivers.Address = ""
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "receivers.address is required") {
+		t.Fatalf("zabbix ingress must require receivers.address, got %v", err)
+	}
+}
+
+func TestDefaultGroupLabelsIncludeHost(t *testing.T) {
+	cfg := Defaults()
+	want := []string{"cluster", "namespace", "service", "host"}
+	if !reflect.DeepEqual(cfg.Correlator.GroupLabels, want) {
+		t.Fatalf("default group_labels = %v, want %v", cfg.Correlator.GroupLabels, want)
+	}
+}
+
+func TestZabbixWebhookTokenResolution(t *testing.T) {
+	cfg := Defaults()
+	cfg.Zabbix.Ingress.Enabled = true
+	cfg.Zabbix.Ingress.WebhookTokenEnv = "TEST_ZBX_TOKEN"
+	t.Setenv("TEST_ZBX_TOKEN", "s3cret")
+	tok, err := cfg.ZabbixWebhookToken()
+	if err != nil || tok != "s3cret" {
+		t.Fatalf("got (%q, %v)", tok, err)
+	}
+	t.Setenv("TEST_ZBX_TOKEN", "")
+	if _, err := cfg.ZabbixWebhookToken(); err == nil {
+		t.Fatal("want loud error for unset env var")
 	}
 }
 

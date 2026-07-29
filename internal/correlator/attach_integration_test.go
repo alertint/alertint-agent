@@ -520,6 +520,32 @@ func TestMaybeAttach_EventCarriesNewAlertname(t *testing.T) {
 	}
 }
 
+// TestGroupKey_ZabbixShapedAlertUnderDefaultLabels proves the compiled default
+// group_labels (config.Defaults(), which now includes host — ADR-0031) never
+// collapses a host-only Zabbix alert onto group_key="": it must key on host.
+func TestGroupKey_ZabbixShapedAlertUnderDefaultLabels(t *testing.T) {
+	st := openStore(t)
+	c := New(Config{GroupLabels: []string{"cluster", "namespace", "service", "host"}}, st, NopIncidentSink{}, nil)
+	a := store.Alert{Labels: map[string]string{
+		"alertname": "Disk low", "host": "db01", "severity": "high", "zabbix_trigger_id": "1",
+	}}
+	if gk := c.groupKey(a); gk != "host=db01" {
+		t.Fatalf("group_key = %q, want host=db01", gk)
+	}
+}
+
+// TestMaybeAttach_ZabbixDisasterSeverityRejudge proves the ladder extension
+// (ADR-0033) reaches the correlator's real severity-label path: a Zabbix
+// "disaster" alert attaching to a "warning"-baseline incident must trip the
+// severity re-judge trigger, not silently rank 0.
+func TestMaybeAttach_ZabbixDisasterSeverityRejudge(t *testing.T) {
+	now := time.Date(2026, 7, 8, 15, 30, 0, 0, time.UTC)
+	_, td := runRejudgeCase(t, firingAlert("fp-new", "DiskFull", "disaster", now, false), now.Add(-10*time.Minute))
+	if td.rej.count() != 1 || td.rej.triggers[0] != "severity" {
+		t.Errorf("rejudger triggers = %v, want [severity]", td.rej.triggers)
+	}
+}
+
 func TestMaybeAttach_EventCarriesCadenceDelta(t *testing.T) {
 	st := openStore(t)
 	c, td := newCorrelatorFor(t, st)

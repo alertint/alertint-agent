@@ -31,6 +31,7 @@ correlator:
     - cluster
     - namespace
     - service
+    - host                 # Zabbix's identity label — per-host is the zero-config grain for Zabbix alerts
 
 memory:                    # incident memory: recurrence collapse (always on, deterministic, free)
   attach_window_minutes: 30   # Clock A: re-fires within this window of the last one attach instead of re-triaging
@@ -131,6 +132,12 @@ changes:
     window_minutes: 120                    # look-back before the first alert
     max_events: 10                         # cap on ranked changes attached to a prompt
   retention_days: 30                       # prune changes older than this
+
+# Zabbix as an alert source (push receiver). See docs/integrations/zabbix.md.
+zabbix:
+  ingress:
+    enabled: false
+    webhook_token_env: ALERTINT_ZABBIX_WEBHOOK_TOKEN   # bearer token Zabbix presents to /webhook/zabbix
 
 # Sentry connector — two read-only roles over one shared connection/token:
 #   releases  → Change source: polls deploys/releases into the change plane
