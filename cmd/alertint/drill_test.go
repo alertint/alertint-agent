@@ -191,7 +191,7 @@ func TestDrill_HappyPath(t *testing.T) {
 	cfg := drillTestConfig(t)
 	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
 
-	groupKey := "cluster=drill-cluster-t3st01,namespace=drill-shop,service=drill-checkout"
+	groupKey := "cluster=drill-cluster-t3st01,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
 	f.listRows = []map[string]any{
 		{"id": "other", "group_key": "x=y", "status": "analyzed"},
 		{"id": "inc-42", "group_key": groupKey, "status": "analyzed"},
@@ -243,7 +243,7 @@ func TestDrill_ChangesDisabled(t *testing.T) {
 	cfg.Changes.Ingress.WebhookTokenEnv = "" // realistic: disabled feature, no env named
 	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
 
-	groupKey := "cluster=drill-cluster-t3st01,namespace=drill-shop,service=drill-checkout"
+	groupKey := "cluster=drill-cluster-t3st01,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
 	f.listRows = []map[string]any{{"id": "inc-7", "group_key": groupKey, "status": "analyzed"}}
 	capped := analyzedIncident("inc-7")
 	capped["confidence"] = 0.6
@@ -321,7 +321,7 @@ func TestDrill_NotAnalyzedYet(t *testing.T) {
 	cfg := drillTestConfig(t)
 	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
 
-	groupKey := "cluster=drill-cluster-t3st01,namespace=drill-shop,service=drill-checkout"
+	groupKey := "cluster=drill-cluster-t3st01,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
 	f.listRows = []map[string]any{{"id": "inc-9", "group_key": groupKey, "status": "processing"}}
 
 	if err := d.run(context.Background()); err != nil {
@@ -584,7 +584,7 @@ func TestDrill_ChangePostRejected(t *testing.T) {
 	t.Cleanup(rejecting.Close)
 
 	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship", target: rejecting.URL})
-	groupKey := "cluster=drill-cluster-t3st01,namespace=drill-shop,service=drill-checkout"
+	groupKey := "cluster=drill-cluster-t3st01,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
 	f.listRows = []map[string]any{{"id": "inc-8", "group_key": groupKey, "status": "analyzed"}}
 	capped := analyzedIncident("inc-8")
 	capped["confidence"] = 0.6
@@ -654,7 +654,7 @@ func TestDrill_CappedHintProbeWording(t *testing.T) {
 			d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
 			d.probePrometheus = func(string, string) bool { return probe }
 
-			groupKey := "cluster=drill-cluster-t3st01,namespace=drill-shop,service=drill-checkout"
+			groupKey := "cluster=drill-cluster-t3st01,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
 			f.listRows = []map[string]any{{"id": "inc-c", "group_key": groupKey, "status": "analyzed"}}
 			capped := analyzedIncident("inc-c")
 			capped["confidence"] = 0.6
@@ -746,7 +746,7 @@ func TestDrill_PollsUntilAnalyzed(t *testing.T) {
 		return nil
 	}
 
-	groupKey := "cluster=drill-cluster-t3st01,namespace=drill-shop,service=drill-checkout"
+	groupKey := "cluster=drill-cluster-t3st01,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
 	pending := []map[string]any{{"id": "inc-7", "group_key": groupKey, "status": "ready"}}
 	// [0] answers the pre-fire rerun scan (no drill candidate → fresh salt); the
 	// next two answer the finding polls.
@@ -779,7 +779,7 @@ func TestDrill_RerunCollapses(t *testing.T) {
 	cfg := drillTestConfig(t)
 	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
 
-	groupKey := "cluster=drill-cluster-priorsalt,namespace=drill-shop,service=drill-checkout"
+	groupKey := "cluster=drill-cluster-priorsalt,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
 	// A prior drill of this scenario, judged, active 5m ago (inside the 30m window).
 	f.listRows = []map[string]any{{
 		"id": "inc-9", "group_key": groupKey, "status": "analyzed",
@@ -814,7 +814,7 @@ func TestDrill_ResolveFlag(t *testing.T) {
 	cfg := drillTestConfig(t)
 	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship", resolve: true})
 
-	groupKey := "cluster=drill-cluster-t3st01,namespace=drill-shop,service=drill-checkout"
+	groupKey := "cluster=drill-cluster-t3st01,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
 	f.listRows = []map[string]any{{"id": "inc-42", "group_key": groupKey, "status": "analyzed"}}
 	f.incident = analyzedIncident("inc-42")
 

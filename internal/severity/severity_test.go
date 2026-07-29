@@ -65,8 +65,8 @@ func TestRank_ZabbixVocabulary(t *testing.T) {
 		{"Information", 1},
 		{"average", 2},
 		{"Average", 2},
-		{"high", 3},      // pre-existing tier, shared with "error"
-		{"warning", 2},   // pre-existing tier
+		{"high", 3},    // pre-existing tier, shared with "error"
+		{"warning", 2}, // pre-existing tier
 		{"disaster", 5},
 		{"Disaster", 5},
 		{"not classified", 0}, // unknown ranks below everything
