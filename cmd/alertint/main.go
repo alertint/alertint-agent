@@ -88,6 +88,9 @@ func run(args []string, stdout, stderr io.Writer) error {
 			return runValidate(args[1:], stdout, stderr)
 		case "drill":
 			return runDrill(args[1:], stdout, stderr)
+		case "backup":
+			return runBackup(args[1:], stdout, stderr)
+		// "restore" is implemented in restore.go (Task 7).
 		case "serve":
 			return runServe(args[1:], stdout, stderr)
 		}
@@ -530,7 +533,7 @@ func runVerifyAudit(args []string, stdout, stderr io.Writer) error {
 	}
 	logging.SetDefault(logger)
 
-	dbPath, err := resolveDBPath(*cfgPath, *dbPathFlag)
+	dbPath, err := resolveDBPath("verify-audit", *cfgPath, *dbPathFlag)
 	if err != nil {
 		return err
 	}
@@ -591,12 +594,12 @@ func logConfigWarnings(logger *slog.Logger, cfg *config.Config) {
 	}
 }
 
-func resolveDBPath(cfgPath, dbPathFlag string) (string, error) {
+func resolveDBPath(sub, cfgPath, dbPathFlag string) (string, error) {
 	if dbPathFlag != "" {
 		return dbPathFlag, nil
 	}
 	if cfgPath == "" {
-		return "", errors.New("verify-audit: either --config or --db is required")
+		return "", fmt.Errorf("%s: either --config or --db is required", sub)
 	}
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
