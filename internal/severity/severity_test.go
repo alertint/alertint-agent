@@ -55,3 +55,33 @@ func TestRank_CaseAndWhitespaceInsensitive(t *testing.T) {
 		t.Errorf("warn and warning must rank equal: %d != %d", Rank("WARN"), Rank("warning"))
 	}
 }
+
+func TestRank_ZabbixVocabulary(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int
+	}{
+		{"information", 1},
+		{"Information", 1},
+		{"average", 2},
+		{"Average", 2},
+		{"high", 3},      // pre-existing tier, shared with "error"
+		{"warning", 2},   // pre-existing tier
+		{"disaster", 5},
+		{"Disaster", 5},
+		{"not classified", 0}, // unknown ranks below everything
+	}
+	for _, c := range cases {
+		if got := Rank(c.in); got != c.want {
+			t.Errorf("Rank(%q) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
+func TestGateRank_UnaffectedByZabbixNames(t *testing.T) {
+	for _, s := range []string{"disaster", "average", "information"} {
+		if got := GateRank(s); got != 0 {
+			t.Errorf("GateRank(%q) = %d, want 0 (gate vocabulary is only low/medium/high)", s, got)
+		}
+	}
+}
