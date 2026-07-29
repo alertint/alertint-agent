@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `task demo:feedback` — end-to-end feedback-loop demo (`scripts/demo-feedback.py`):
   drill → MCP write-back → recall → steering proof (supported / contradicted /
   unverifiable) → audit verification.
+- `alertint backup` and `alertint restore`: consistent live snapshots of the
+  agent's SQLite state (read-only `VACUUM INTO`, safe while the agent runs)
+  and a safe-by-construction restore — admission-checked, atomic, refuses
+  while the agent is running, and always leaves the previous database at
+  `<db>.pre-restore`. On Kubernetes, restore without scale-to-zero or helper
+  Jobs: stage the file as `<db>.restore` and restart the pod; the agent
+  applies it at startup before opening the store. Every restore verifies the
+  audit chain and appends a `db.restore_applied` row.
 
 ### Changed
 
