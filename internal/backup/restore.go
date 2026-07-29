@@ -176,13 +176,13 @@ func foldAndProveExclusive(ctx context.Context, dbPath string) error {
 // pod can never re-apply an old restore). Offline mode copies via a temp
 // file in the DB's directory + fsync + rename, preserving the backup.
 func install(dbPath, source, mode string) error {
+	dir := filepath.Dir(dbPath)
 	if mode == "staged" {
 		if err := os.Rename(source, dbPath); err != nil {
 			return fmt.Errorf("install staged file: %w", err)
 		}
-		return nil
+		return fsyncDir(dir)
 	}
-	dir := filepath.Dir(dbPath)
 	src, err := os.Open(source) // #nosec G304 -- operator-supplied backup path; reading it is the point
 	if err != nil {
 		return fmt.Errorf("open backup: %w", err)
@@ -208,6 +208,21 @@ func install(dbPath, source, mode string) error {
 	}
 	if err := os.Rename(tmp.Name(), dbPath); err != nil {
 		return fmt.Errorf("install: %w", err)
+	}
+	return fsyncDir(dir)
+}
+
+// fsyncDir syncs a directory's metadata so a preceding rename into it is
+// durable across a crash — rename() is atomic but, without this, the
+// directory-entry update itself is not guaranteed to survive power loss.
+func fsyncDir(dir string) error {
+	d, err := os.Open(dir) // #nosec G304 -- directory containing the DB path, not attacker-controlled
+	if err != nil {
+		return fmt.Errorf("open directory for sync: %w", err)
+	}
+	defer func() { _ = d.Close() }()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("fsync directory: %w", err)
 	}
 	return nil
 }
