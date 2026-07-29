@@ -203,6 +203,21 @@ func loadMigrations() ([]migration, error) {
 	return out, nil
 }
 
+// MaxSchemaVersion returns the highest migration version embedded in this
+// binary. Restore admission uses it to refuse backups written by a newer
+// binary — migrate silently ignores unknown newer versions, so such a
+// backup would open cleanly and misbehave at query time.
+func MaxSchemaVersion() (int, error) {
+	files, err := loadMigrations()
+	if err != nil {
+		return 0, err
+	}
+	if len(files) == 0 {
+		return 0, fmt.Errorf("store: no embedded migrations")
+	}
+	return files[len(files)-1].version, nil
+}
+
 func parseMigrationName(filename string) (int, string, error) {
 	base := strings.TrimSuffix(filename, ".sql")
 	parts := strings.SplitN(base, "_", 2)
