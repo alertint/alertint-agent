@@ -90,7 +90,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 			return runDrill(args[1:], stdout, stderr)
 		case "backup":
 			return runBackup(args[1:], stdout, stderr)
-		// "restore" is implemented in restore.go (Task 7).
+		case "restore":
+			return runRestore(args[1:], stdout, stderr)
 		case "serve":
 			return runServe(args[1:], stdout, stderr)
 		}
