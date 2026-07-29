@@ -240,3 +240,96 @@ func TestRestore_CrashAfterSafetyCopyIsRecoverable(t *testing.T) {
 		t.Errorf("restored rows = %d, want 1", got)
 	}
 }
+
+func TestApplyStaged_NoStagingFileIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := newStoreDB(t, dir, "live.db")
+	info, err := ApplyStaged(context.Background(), dbPath)
+	if info != nil || err != nil {
+		t.Fatalf("ApplyStaged = (%+v, %v), want (nil, nil)", info, err)
+	}
+	if got := readProbeCount(t, dbPath); got != 1 {
+		t.Errorf("DB modified by no-op: rows = %d", got)
+	}
+}
+
+func TestApplyStaged_AppliesAndConsumesStagingFile(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	dbPath := newStoreDB(t, dir, "live.db")
+	staged := newStoreDB(t, dir, "incoming.db")
+	if err := os.Rename(staged, StagingPath(dbPath)); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := ApplyStaged(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("ApplyStaged: %v", err)
+	}
+	if info == nil || info.Mode != "staged" {
+		t.Fatalf("info = %+v, want staged", info)
+	}
+	// Staging file consumed — a crash loop can never re-apply it.
+	if _, err := os.Stat(StagingPath(dbPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Error("staging file still present after successful staged restore")
+	}
+	if got := readProbeCount(t, dbPath+".pre-restore"); got != 1 {
+		t.Errorf("safety copy rows = %d, want 1", got)
+	}
+}
+
+func TestApplyStaged_AdmissionFailureRejectsAside(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	dbPath := newStoreDB(t, dir, "live.db")
+	if err := os.WriteFile(StagingPath(dbPath), []byte("garbage"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := ApplyStaged(ctx, dbPath)
+	if err == nil || info != nil {
+		t.Fatalf("ApplyStaged = (%+v, %v), want admission error", info, err)
+	}
+	// Evidence preserved at .rejected; staging gone; original untouched.
+	if _, statErr := os.Stat(StagingPath(dbPath) + ".rejected"); statErr != nil {
+		t.Errorf("rejected file missing: %v", statErr)
+	}
+	if _, statErr := os.Stat(StagingPath(dbPath)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Error("staging file still present — next start would crash-loop")
+	}
+	if got := readProbeCount(t, dbPath); got != 1 {
+		t.Errorf("original DB touched: rows = %d", got)
+	}
+}
+
+func TestApplyStaged_TransientFailureLeavesStagingInPlace(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	dbPath := newStoreDB(t, dir, "live.db")
+	staged := newStoreDB(t, dir, "incoming.db")
+	if err := os.Rename(staged, StagingPath(dbPath)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Another process holds the DB: transient, NOT an admission failure.
+	holder, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=journal_mode(wal)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder.SetMaxOpenConns(1)
+	if err := holder.Ping(); err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+
+	_, aerr := ApplyStaged(ctx, dbPath)
+	if aerr == nil {
+		t.Fatal("expected busy-guard error")
+	}
+	if _, statErr := os.Stat(StagingPath(dbPath)); statErr != nil {
+		t.Errorf("staging file consumed on transient failure: %v", statErr)
+	}
+	if _, statErr := os.Stat(StagingPath(dbPath) + ".rejected"); !errors.Is(statErr, os.ErrNotExist) {
+		t.Error("transient failure produced a .rejected file")
+	}
+}

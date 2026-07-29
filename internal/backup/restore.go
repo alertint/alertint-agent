@@ -215,3 +215,33 @@ func install(dbPath, source, mode string) error {
 // StagingPath returns the exact path whose presence triggers a Staged
 // restore for dbPath: "<db>.restore" — this path and nothing else.
 func StagingPath(dbPath string) string { return dbPath + ".restore" }
+
+// ApplyStaged applies a Staged restore when the exact StagingPath(dbPath)
+// file exists (no flag, no config key). Returns (nil, nil) when nothing
+// is staged. On an admission failure the staging file is set aside as
+// <db>.restore.rejected — evidence preserved, and the next start finds no
+// staging file and serves normally on the untouched DB (one visible
+// failure, no crash loop). Transient failures (busy guard, I/O) leave the
+// staging file in place for retry. The caller exits non-zero on any error.
+func ApplyStaged(ctx context.Context, dbPath string) (*RestoreInfo, error) {
+	staging := StagingPath(dbPath)
+	if _, err := os.Stat(staging); errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	} else if err != nil {
+		return nil, fmt.Errorf("stat staging file: %w", err)
+	}
+
+	info, err := swap(ctx, dbPath, staging, "staged")
+	if err != nil {
+		var adm *AdmissionError
+		if errors.As(err, &adm) {
+			rejected := staging + ".rejected"
+			if rerr := os.Rename(staging, rejected); rerr != nil {
+				return nil, fmt.Errorf("staged restore rejected (%w); also failed to set staging file aside: %v", err, rerr)
+			}
+			return nil, fmt.Errorf("staged restore rejected, staging file moved to %s: %w", rejected, err)
+		}
+		return nil, fmt.Errorf("staged restore: %w", err)
+	}
+	return info, nil
+}
