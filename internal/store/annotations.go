@@ -117,7 +117,8 @@ func (s *Store) ListIncidentAnnotations(ctx context.Context, incidentID string) 
 }
 
 // OperatorAnnotation is one recalled operator annotation for the human-locked
-// memory tier (ADR-0028): fetched by group key over the recall lookback.
+// memory tier (ADR-0028): fetched by group key, unbounded — human writes are
+// permanent (R7), not subject to time-based decay.
 type OperatorAnnotation struct {
 	IncidentID string
 	Kind       string
@@ -125,19 +126,20 @@ type OperatorAnnotation struct {
 	CreatedAt  time.Time
 }
 
-// OperatorAnnotations returns every annotation on the key's
-// incidents within the lookback, newest-first, filtered to the caller's drill
-// side (a real triage recalls only real incidents' notes and vice versa).
+// OperatorAnnotations returns every annotation on the key's incidents,
+// unbounded and newest-first, filtered to the caller's drill side (a real
+// triage recalls only real incidents' notes and vice versa). Unbounded by
+// lookback: human writes are permanent (R7), not subject to time-based decay.
 // Unlike prior-finding recall it does NOT exclude the current incident: a
 // re-judgment must recall a correction captured on the incident itself.
-func (s *Store) OperatorAnnotations(ctx context.Context, groupKey string, currentIsDrill bool, since time.Time) ([]OperatorAnnotation, error) {
+func (s *Store) OperatorAnnotations(ctx context.Context, groupKey string, currentIsDrill bool) ([]OperatorAnnotation, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT a.incident_id, a.kind, a.note, a.created_at
 		FROM incident_annotations a
 		JOIN incidents i ON i.id = a.incident_id
-		WHERE i.group_key = ? AND a.created_at >= ?
+		WHERE i.group_key = ?
 		ORDER BY a.created_at DESC, a.id DESC`,
-		groupKey, since.UTC().Format(time.RFC3339Nano))
+		groupKey)
 	if err != nil {
 		return nil, fmt.Errorf("store: operator annotations: %w", err)
 	}
@@ -180,23 +182,4 @@ func (s *Store) OperatorAnnotations(ctx context.Context, groupKey string, curren
 		}
 	}
 	return out, nil
-}
-
-// SetRefuteMarksFloor raises memory_refute_marks to at least floor — the D3
-// correction demotion (idempotent; never lowers an already-higher count).
-func (s *Store) SetRefuteMarksFloor(ctx context.Context, incidentID string, floor int) error {
-	res, err := s.db.ExecContext(ctx, `
-		UPDATE incidents SET memory_refute_marks = MAX(memory_refute_marks, ?)
-		WHERE id = ?`, floor, incidentID)
-	if err != nil {
-		return fmt.Errorf("store: set refute marks floor: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("store: refute marks floor rows: %w", err)
-	}
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
 }

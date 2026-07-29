@@ -301,7 +301,7 @@ type MemoryConfig struct {
 	AttachWindowMinutes  int              `yaml:"attach_window_minutes"`  // Clock A: sliding attach window from the last occurrence
 	JudgmentCeilingHours int              `yaml:"judgment_ceiling_hours"` // Clock B: hard ceiling on time since the last LLM judgment
 	OccurrenceCap        int              `yaml:"occurrence_cap"`         // re-judge backstop after this many attaches since the last judgment
-	LookbackDays         int              `yaml:"lookback_days"`          // occurrence pruning + recall lookback horizon
+	LookbackDays         int              `yaml:"lookback_days"`          // machine memory only: occurrence pruning + LLM prior-finding recall. Operator verdicts and notes are permanent (age-stamped, superseded by newer writes — never expired).
 	Classifier           ClassifierConfig `yaml:"classifier"`             // M3 shadow classifier: dark by default
 }
 

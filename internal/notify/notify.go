@@ -48,6 +48,18 @@ type Finding struct {
 	// surface a caveat off it. False on the kill-switch path and on any
 	// supported/revised round.
 	Unverified bool `json:"unverified,omitempty"`
+	// History is the group key's operator history (R13/D9), producer-computed
+	// by the triage skill the same way Recurrence is: notifiers stay I/O-free
+	// renderers, the skill owns the store read. nil only when no notifier is
+	// attached at all (the skill builds History inside its notify block);
+	// otherwise always populated (tri-state honest — "unavailable" on a store
+	// read error, never silently absent).
+	History *History `json:"history,omitempty"`
+	// Steering, when non-nil, reports the ruling on a steered finding (ADR-0029):
+	// a governing correction verdict was present on the group key. nil when no
+	// correction is steering; non-nil in every case one is, whether or not a
+	// verification round actually ran to test it.
+	Steering *Steering `json:"steering,omitempty"`
 }
 
 // Recurrence is the live occurrence summary carried on a Finding so the Slack
@@ -56,6 +68,41 @@ type Finding struct {
 type Recurrence struct {
 	Episodes int       `json:"episodes"`
 	LastSeen time.Time `json:"last_seen"`
+}
+
+// History is the group key's operator history, producer-computed by the
+// triage skill (the Recurrence precedent): notifiers stay I/O-free renderers.
+type History struct {
+	State      string          `json:"state"`                // "first" | "seen" | "history" | "unavailable"
+	Episodes   int             `json:"episodes,omitempty"`   // windowed — wording must say so
+	FirstSeen  time.Time       `json:"first_seen,omitempty"` // windowed
+	WindowDays int             `json:"window_days,omitempty"`
+	Verdict    *HistoryVerdict `json:"verdict,omitempty"`
+	Notes      []HistoryNote   `json:"notes,omitempty"`
+	NotesMore  int             `json:"notes_more,omitempty"`
+}
+
+// HistoryVerdict is the group key's governing verdict, rendered into History.
+type HistoryVerdict struct {
+	Kind string `json:"kind"`
+	Age  string `json:"age"`
+	Date string `json:"date"`
+	Note string `json:"note,omitempty"`
+}
+
+// HistoryNote is one operator annotation rendered into History.Notes (the
+// governing verdict's own annotation is deduped out — it renders via Verdict).
+type HistoryNote struct {
+	Kind string `json:"kind"`
+	Age  string `json:"age"`
+	Note string `json:"note"`
+}
+
+// Steering reports the ruling on a steered finding (ADR-0029).
+type Steering struct {
+	Ruling      string `json:"ruling"` // supported | contradicted | unverifiable | untested | unruled
+	Basis       string `json:"basis,omitempty"`
+	VerdictDate string `json:"verdict_date"`
 }
 
 // RecurrenceEvent carries everything a sink needs to render a recurrence-collapse

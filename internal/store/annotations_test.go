@@ -7,7 +7,6 @@ import (
 	"errors"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestInsertAndListIncidentAnnotations(t *testing.T) {
@@ -72,36 +71,6 @@ func TestInsertIncidentAnnotation_CapIsRunesNotBytes(t *testing.T) {
 	}
 }
 
-func TestSetRefuteMarksFloor(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	id := readyIncident(t, s, "service=api")
-
-	if err := s.SetRefuteMarksFloor(ctx, id, 2); err != nil {
-		t.Fatalf("floor: %v", err)
-	}
-	// Floor is MAX(current, floor): raising past it via Increment then re-flooring must not lower.
-	if _, err := s.IncrementRefuteMarks(ctx, id); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.IncrementRefuteMarks(ctx, id); err != nil {
-		t.Fatal(err)
-	} // now 4
-	if err := s.SetRefuteMarksFloor(ctx, id, 2); err != nil {
-		t.Fatal(err)
-	}
-	var marks int
-	if err := s.DB().QueryRowContext(ctx, `SELECT memory_refute_marks FROM incidents WHERE id = ?`, id).Scan(&marks); err != nil {
-		t.Fatal(err)
-	}
-	if marks != 4 {
-		t.Fatalf("floor lowered marks: got %d want 4", marks)
-	}
-	if err := s.SetRefuteMarksFloor(ctx, "nope", 2); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("missing incident: want ErrNotFound, got %v", err)
-	}
-}
-
 func TestOperatorAnnotations(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -115,7 +84,7 @@ func TestOperatorAnnotations(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got, err := s.OperatorAnnotations(ctx, "service=api", false, time.Now().Add(-time.Hour))
+	got, err := s.OperatorAnnotations(ctx, "service=api", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,12 +94,20 @@ func TestOperatorAnnotations(t *testing.T) {
 	if !got[0].CreatedAt.After(got[1].CreatedAt) && got[0].CreatedAt != got[1].CreatedAt {
 		t.Fatal("not newest-first")
 	}
-	// Lookback cutoff excludes everything when since is in the future.
-	none, err := s.OperatorAnnotations(ctx, "service=api", false, time.Now().Add(time.Hour))
-	if err != nil {
-		t.Fatal(err)
+}
+
+// TestOperatorAnnotations_Unbounded confirms the read has no time bound at
+// all (R7: human writes are permanent, age-stamped rendering replaces
+// decay) — an annotation inserted long ago still comes back.
+func TestOperatorAnnotations_Unbounded(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	id := readyIncident(t, s, "service=checkout")
+	if _, err := s.InsertIncidentAnnotation(ctx, id, "observation", "ancient but permanent"); err != nil {
+		t.Fatalf("insert: %v", err)
 	}
-	if len(none) != 0 {
-		t.Fatalf("lookback ignored: %+v", none)
+	ops, err := s.OperatorAnnotations(ctx, "service=checkout", false)
+	if err != nil || len(ops) != 1 {
+		t.Fatalf("want 1 permanent annotation, got %d, %v", len(ops), err)
 	}
 }

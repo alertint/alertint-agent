@@ -350,6 +350,81 @@ func TestVerificationRevisesRegionalVerdict(t *testing.T) {
 	}
 }
 
+// TestAuditVerificationPlannedIncludesOperatorQueries regression-tests the
+// audit-parity bug: auditVerificationPlanned used to be called before the
+// governing verdict's operator-sourced steering queries (ADR-0029) were even
+// computed, and its own plan assembly had no way to include them — so a
+// steering-active triage's "planned" audit row silently undercounted relative
+// to the round that actually executed. A governing correction verdict here
+// contributes one operator query (buildSteeringQueries), no model queries are
+// proposed, so the round is floor(2) + operator(1) = 3 — and the planned audit
+// row must show exactly that, with the operator query present.
+func TestAuditVerificationPlannedIncludesOperatorQueries(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	auditor := audit.New(st.DB())
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-steer", map[string]string{"alertname": "DiskFull", "host": "web1"})
+
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "disk event", "disk pressure", 0.9, nil)},
+		{raw: callTwoResp(t, "disk event", "disk pressure", 0.9, "")},
+	}}
+
+	cfg := verifyConfig(promHealthy(t))
+	cfg.Memory = &stubMemoryReader{
+		view: &store.MemoryView{GroupKey: "alertname=DiskFull,host=web1"},
+		governing: &store.IncidentVerdict{
+			IncidentID:      inc.ID,
+			Version:         1,
+			Verdict:         "correction",
+			ExpectationJSON: `{"cause_series":["pvc_bytes"]}`,
+			CreatedAt:       time.Now(),
+		},
+	}
+	cfg.MemoryParams = acutetriage.MemoryParams{LookbackDays: 90}
+	skill := acutetriage.New(cfg, st, scripted, auditor, nil, nil)
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	f := readFinding(t, st, inc.ID)
+	ver := verificationOf(t, f.enrichment)
+	if ver == nil || len(ver.Rounds) != 1 {
+		t.Fatalf("expected one verification round, got %+v", ver)
+	}
+	round := ver.Rounds[0]
+	if len(round.Queries) != 3 { // 2 floor + 1 operator, no model queries proposed
+		t.Fatalf("want 3 executed queries (2 floor + 1 operator), got %d: %+v", len(round.Queries), round.Queries)
+	}
+
+	var payload string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT payload_json FROM audit_log WHERE kind = 'incident.verification_planned'`).Scan(&payload); err != nil {
+		t.Fatalf("query incident.verification_planned audit: %v", err)
+	}
+	var planned struct {
+		Queries []map[string]string `json:"queries"`
+	}
+	if err := json.Unmarshal([]byte(payload), &planned); err != nil {
+		t.Fatalf("unmarshal planned payload: %v\n%s", err, payload)
+	}
+	if len(planned.Queries) != len(round.Queries) {
+		t.Fatalf("planned audit query count (%d) must match executed round query count (%d): planned=%+v executed=%+v",
+			len(planned.Queries), len(round.Queries), planned.Queries, round.Queries)
+	}
+	found := false
+	for _, q := range planned.Queries {
+		if q["source"] == "operator" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("planned audit payload must include the operator-sourced steering query: %+v", planned.Queries)
+	}
+}
+
 // --------------------------------------------------------------------------
 // T4(a) — clamp on a partial failure
 // --------------------------------------------------------------------------
@@ -755,5 +830,588 @@ func TestPromptCachingFalseSuppressesMarkAndWarn(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "read no cached prefix") {
 		t.Error("PromptCaching false: zero cache read must not WARN")
+	}
+}
+
+// --------------------------------------------------------------------------
+// Verdict steering (Tasks 7-8): the ruling contract — call-2 demand, soft
+// parse, audit, loud failure (ADR-0029) — plus the deterministic confidence
+// backstop that clamps off the recorded ruling (applySteeringCap).
+//
+// Every test here seeds the REAL store with a captured verdict via
+// PersistVerdictCapture (Config.Memory = st) so FetchMemory's real
+// GoverningVerdict query populates MemoryEnrichment.Governing end-to-end —
+// not a stubbed reader. TestSteering_UnverifiableClamps /
+// AbsentRulingKeepsRevisionAndClamps / UnbackedContradictionClamps assert on
+// the steering-specific backstop; their fixtures deliberately keep live
+// verification evidence flowing (a fetched floor up_ratio) so the
+// PRE-EXISTING annotations-only cap (applyEvidenceCap) cannot accidentally
+// paper over the steering-specific clamp under test.
+// --------------------------------------------------------------------------
+
+// callTwoRespWithRuling builds a call-2 re-judged verdict carrying an
+// optional operator_ruling key (empty ruling omits the key entirely — the
+// soft-parse path under test).
+func callTwoRespWithRuling(t *testing.T, name, rootCause string, conf float64, ruling, basis string) json.RawMessage {
+	t.Helper()
+	resp := map[string]any{
+		"analysis_name":        name,
+		"overall_issue":        rootCause,
+		"correlation_findings": []string{"c"},
+		"severity":             "medium",
+		"confidence":           conf,
+		"alerts":               []map[string]string{},
+	}
+	if ruling != "" {
+		resp["operator_ruling"] = map[string]string{"ruling": ruling, "basis": basis}
+	}
+	return mustJSON(t, resp)
+}
+
+// callTwoRespWithBareStringRuling builds a call-2 response whose
+// "operator_ruling" key is a bare string ("supported") rather than the
+// documented {"ruling":...,"basis":...} object — plausibly the single most
+// likely real-world shape mismatch (small/local models are especially prone
+// to this). Used to pin that a wrong-typed operator_ruling degrades exactly
+// like an omitted key (soft validation) rather than failing the unmarshal of
+// the whole call-2 response.
+func callTwoRespWithBareStringRuling(t *testing.T, name, rootCause string, conf float64) json.RawMessage {
+	t.Helper()
+	resp := map[string]any{
+		"analysis_name":        name,
+		"overall_issue":        rootCause,
+		"correlation_findings": []string{"c"},
+		"severity":             "medium",
+		"confidence":           conf,
+		"alerts":               []map[string]string{},
+		"operator_ruling":      "supported", // wrong shape: bare string, not an object
+	}
+	return mustJSON(t, resp)
+}
+
+// seedGoverningVerdict captures a verdict of the given kind ("correction" |
+// "confirmation") against incidentID via the real PersistVerdictCapture path,
+// so the group key's GoverningVerdict query (joined by group_key, not a fake)
+// picks it up for any incident sharing that key.
+func seedGoverningVerdict(t *testing.T, st *store.Store, ctx context.Context, incidentID, kind, expectationJSON string) *store.IncidentVerdict {
+	t.Helper()
+	v, _, err := st.PersistVerdictCapture(ctx, store.VerdictCapture{
+		IncidentID:      incidentID,
+		Verdict:         kind,
+		Source:          store.VerdictSourceHuman,
+		LabelConfidence: 1,
+		ExpectationJSON: expectationJSON,
+		AnnotationNote:  "operator " + kind + " note",
+	})
+	if err != nil {
+		t.Fatalf("seed governing %s: %v", kind, err)
+	}
+	return v
+}
+
+// recordingHandler is a minimal slog.Handler that captures every record it
+// sees so a test can assert on the structured Level, not just grep formatted
+// text (a TextHandler line always contains "level=ERROR" as a substring of
+// its own formatting, which is not the same as asserting the Record's Level).
+type recordingHandler struct {
+	records []slog.Record
+}
+
+func (h *recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.records = append(h.records, r.Clone())
+	return nil
+}
+
+func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *recordingHandler) WithGroup(string) slog.Handler      { return h }
+
+func (h *recordingHandler) firstAtLevel(lvl slog.Level) (slog.Record, bool) {
+	for _, r := range h.records {
+		if r.Level == lvl {
+			return r, true
+		}
+	}
+	return slog.Record{}, false
+}
+
+// TestSteering_SupportedAdoptsUncapped: a fetched steering query (operator
+// query hits promHealthy) plus ruling "supported" records the ruling as
+// backed, persists the corrected cause call 2 adopted, and leaves confidence
+// exactly as the model returned it (0.85, uncapped) — a supported ruling
+// never clamps, today or after Task 8.
+func TestSteering_SupportedAdoptsUncapped(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-steer-a", map[string]string{"alertname": "DiskFull", "host": "web1"})
+	v := seedGoverningVerdict(t, st, ctx, inc.ID, "correction", `{"cause_series":["pvc_bytes"]}`)
+
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "draft", "generic disk pressure on web1", 0.85, nil)},
+		{raw: callTwoRespWithRuling(t, "corrected", "pvc exhaustion on web1", 0.85,
+			"supported", "pvc_bytes shows near-zero free space")},
+	}}
+
+	cfg := verifyConfig(promHealthy(t))
+	cfg.Memory = st
+	cfg.MemoryParams = acutetriage.MemoryParams{LookbackDays: 90}
+	skill := acutetriage.New(cfg, st, scripted, nil, nil, nil)
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if scripted.calls != 2 {
+		t.Fatalf("want 2 LLM calls, got %d", scripted.calls)
+	}
+
+	f := readFinding(t, st, inc.ID)
+	if f.confidence != 0.85 {
+		t.Errorf("confidence = %v, want 0.85 (supported ruling never clamps)", f.confidence)
+	}
+	if f.rootCause != "pvc exhaustion on web1" {
+		t.Errorf("root cause = %q, want the adopted corrected cause", f.rootCause)
+	}
+	ver := verificationOf(t, f.enrichment)
+	if ver == nil || ver.OperatorRuling == nil {
+		t.Fatalf("expected an operator_ruling record, got %+v", ver)
+	}
+	r := ver.OperatorRuling
+	if r.Ruling != "supported" {
+		t.Errorf("ruling = %q, want supported", r.Ruling)
+	}
+	if !r.Backed {
+		t.Error("backed = false, want true (operator query fetched)")
+	}
+	if r.VerdictID != v.ID || r.VerdictVersion != v.Version {
+		t.Errorf("ruling verdict id/version = %d/%d, want %d/%d", r.VerdictID, r.VerdictVersion, v.ID, v.Version)
+	}
+}
+
+// TestSteering_ContradictedIsNotClamped: the money check — a fetched
+// steering query plus ruling "contradicted" records contradicted+backed, and
+// confidence is whatever the model itself returned (0.9 — above
+// MaxMetadataOnlyConfidence, so the exemption itself, not just the
+// early-return guard for already-low confidence, is what's under test),
+// never clamped by steering. Backed contradictions are never clamped, today
+// or after Task 8.
+func TestSteering_ContradictedIsNotClamped(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-steer-b", map[string]string{"alertname": "DiskFull", "host": "web1"})
+	seedGoverningVerdict(t, st, ctx, inc.ID, "correction", `{"cause_series":["pvc_bytes"]}`)
+
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "draft", "disk pressure on web1", 0.85, nil)},
+		{raw: callTwoRespWithRuling(t, "draft", "disk pressure on web1", 0.9,
+			"contradicted", "pvc_bytes shows ample free space")},
+	}}
+
+	cfg := verifyConfig(promHealthy(t))
+	cfg.Memory = st
+	cfg.MemoryParams = acutetriage.MemoryParams{LookbackDays: 90}
+	skill := acutetriage.New(cfg, st, scripted, nil, nil, nil)
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	f := readFinding(t, st, inc.ID)
+	if f.confidence != 0.9 {
+		t.Errorf("confidence = %v, want 0.9 (model's own, above the cap; contradicted+backed is never clamped)", f.confidence)
+	}
+	ver := verificationOf(t, f.enrichment)
+	if ver == nil || ver.OperatorRuling == nil {
+		t.Fatalf("expected an operator_ruling record, got %+v", ver)
+	}
+	r := ver.OperatorRuling
+	if r.Ruling != "contradicted" {
+		t.Errorf("ruling = %q, want contradicted", r.Ruling)
+	}
+	if !r.Backed {
+		t.Error("backed = false, want true (operator query fetched)")
+	}
+}
+
+// runSteeringUnbackedFixture is the shared fixture for TestSteering_
+// UnverifiableClamps and TestSteering_UnbackedContradictionClamps: both seed
+// a governing correction, run a two-call triage where the floor's up_ratio
+// fetches (live evidence, so the pre-existing annotations-only cap cannot
+// paper over the still-missing steering backstop) but the operator's
+// steering query returns empty (promUpHealthyElseEmpty — unfetched, so
+// Backed must be false either way) — they differ only in what call 2 rules
+// and what root cause it settles on.
+func runSteeringUnbackedFixture(t *testing.T, fp, rootCause, ruling, basis string) (persistedFinding, *acutetriage.VerificationEnrichment) {
+	t.Helper()
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, fp, map[string]string{"alertname": "DiskFull", "host": "web1"})
+	seedGoverningVerdict(t, st, ctx, inc.ID, "correction", `{"cause_series":["pvc_bytes"]}`)
+
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "draft", "disk pressure on web1", 0.85, nil)},
+		{raw: callTwoRespWithRuling(t, "draft", rootCause, 0.85, ruling, basis)},
+	}}
+
+	cfg := verifyConfig(promUpHealthyElseEmpty(t))
+	cfg.Memory = st
+	cfg.MemoryParams = acutetriage.MemoryParams{LookbackDays: 90}
+	skill := acutetriage.New(cfg, st, scripted, nil, nil, nil)
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	f := readFinding(t, st, inc.ID)
+	return f, verificationOf(t, f.enrichment)
+}
+
+// TestSteering_UnverifiableClamps: the operator steering query returns an
+// empty series (the floor's up_ratio still fetches, so live verification
+// evidence IS present and the pre-existing annotations-only cap does not
+// apply here) and the model rules "unverifiable". Per ADR-0029/Task 8, an
+// unverifiable ruling must clamp confidence to MaxMetadataOnlyConfidence
+// regardless of live evidence elsewhere.
+func TestSteering_UnverifiableClamps(t *testing.T) {
+	f, ver := runSteeringUnbackedFixture(t, "fp-steer-c",
+		"per operator correction of 2026-07-28, not verifiable from current evidence",
+		"unverifiable", "pvc_bytes returned no series")
+
+	if f.confidence != acutetriage.MaxMetadataOnlyConfidence {
+		t.Errorf("confidence = %v, want %v (unverifiable steering ruling must clamp — Task 8 backstop)",
+			f.confidence, acutetriage.MaxMetadataOnlyConfidence)
+	}
+	if ver == nil || ver.OperatorRuling == nil {
+		t.Fatalf("expected an operator_ruling record, got %+v", ver)
+	}
+	r := ver.OperatorRuling
+	if r.Ruling != "unverifiable" {
+		t.Errorf("ruling = %q, want unverifiable", r.Ruling)
+	}
+	if r.Backed {
+		t.Error("backed = true, want false (operator query returned empty, not fetched)")
+	}
+}
+
+// TestSteering_AbsentRulingKeepsRevisionAndClamps: call 2 succeeds and
+// revises the root cause, but omits the operator_ruling key entirely. Soft
+// validation means the revision is KEPT regardless (never a triage failure),
+// and the record defaults to "absent". Per ADR-0029/Task 8, an absent ruling
+// must clamp exactly like unverifiable.
+func TestSteering_AbsentRulingKeepsRevisionAndClamps(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	auditor := audit.New(st.DB())
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-steer-d", map[string]string{"alertname": "DiskFull", "host": "web1"})
+	seedGoverningVerdict(t, st, ctx, inc.ID, "correction", `{"cause_series":["pvc_bytes"]}`)
+
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "draft", "disk pressure on web1", 0.85, nil)},
+		{raw: callTwoRespWithRuling(t, "revised", "pvc exhaustion on web1", 0.85, "", "")}, // no operator_ruling key
+	}}
+
+	// Live evidence present throughout (promHealthy): isolates the assertion to
+	// the steering-specific backstop rather than the pre-existing evidence cap.
+	cfg := verifyConfig(promHealthy(t))
+	cfg.Memory = st
+	cfg.MemoryParams = acutetriage.MemoryParams{LookbackDays: 90}
+	skill := acutetriage.New(cfg, st, scripted, auditor, nil, nil)
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	f := readFinding(t, st, inc.ID)
+	if f.rootCause != "pvc exhaustion on web1" {
+		t.Errorf("root cause = %q, want the revision KEPT despite the absent ruling (soft validation)", f.rootCause)
+	}
+	if f.confidence != acutetriage.MaxMetadataOnlyConfidence {
+		t.Errorf("confidence = %v, want %v (absent ruling must clamp — Task 8 backstop)",
+			f.confidence, acutetriage.MaxMetadataOnlyConfidence)
+	}
+	ver := verificationOf(t, f.enrichment)
+	if ver == nil || ver.OperatorRuling == nil {
+		t.Fatalf("expected an operator_ruling record even when call 2 omitted the key, got %+v", ver)
+	}
+	r := ver.OperatorRuling
+	if r.Ruling != "absent" {
+		t.Errorf("ruling = %q, want absent", r.Ruling)
+	}
+	if !r.Backed {
+		t.Error("backed = false, want true (operator query fetched)")
+	}
+
+	var analyzedPayload string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT payload_json FROM audit_log WHERE kind = 'incident.analyzed'`).Scan(&analyzedPayload); err != nil {
+		t.Fatalf("query incident.analyzed audit: %v", err)
+	}
+	if !strings.Contains(analyzedPayload, `"operator_ruling":"absent"`) {
+		t.Errorf("incident.analyzed payload missing operator_ruling=absent: %s", analyzedPayload)
+	}
+}
+
+// TestSteering_MalformedRulingShapeKeepsRevisionAndClamps (review Finding 1):
+// call 2 answers with "operator_ruling" as a bare string ("supported")
+// instead of the documented {"ruling":...,"basis":...} object — plausibly
+// the single most likely real-world malformation, especially from smaller
+// local models behind the openai-compatible provider. Because
+// llmResponse.OperatorRuling is captured as json.RawMessage (untyped) rather
+// than a typed *modelRuling, this shape mismatch must NOT fail the
+// unmarshal of the whole call-2 response: the revision is KEPT (never routed
+// through the degraded-JSON path, which would discard the whole verdict),
+// the ruling record degrades to "absent" — same as an omitted key — and the
+// existing soft-validation WARN fires. That "absent" record is structurally
+// identical to TestSteering_AbsentRulingKeepsRevisionAndClamps's, so the
+// Task 8 backstop (applySteeringCap: clamp unless a fetched-query-backed
+// ruling of supported or contradicted exists) applies here exactly the same
+// way — confidence clamps to MaxMetadataOnlyConfidence regardless of the
+// live evidence (promHealthy) that keeps the pre-existing annotations-only
+// cap from firing on its own.
+func TestSteering_MalformedRulingShapeKeepsRevisionAndClamps(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-steer-i", map[string]string{"alertname": "DiskFull", "host": "web1"})
+	seedGoverningVerdict(t, st, ctx, inc.ID, "correction", `{"cause_series":["pvc_bytes"]}`)
+
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "draft", "disk pressure on web1", 0.85, nil)},
+		{raw: callTwoRespWithBareStringRuling(t, "revised", "pvc exhaustion on web1", 0.85)},
+	}}
+
+	var buf bytes.Buffer
+	cfg := verifyConfig(promHealthy(t))
+	cfg.Memory = st
+	cfg.MemoryParams = acutetriage.MemoryParams{LookbackDays: 90}
+	skill := acutetriage.New(cfg, st, scripted, nil, nil, slog.New(slog.NewTextHandler(&buf, nil)))
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run must not fail on a wrong-shaped operator_ruling: %v", err)
+	}
+	if scripted.calls != 2 {
+		t.Fatalf("want 2 LLM calls, got %d", scripted.calls)
+	}
+
+	f := readFinding(t, st, inc.ID)
+	if f.rootCause != "pvc exhaustion on web1" {
+		t.Errorf("root cause = %q, want the revision KEPT despite the malformed ruling shape (soft validation)", f.rootCause)
+	}
+	if f.confidence != acutetriage.MaxMetadataOnlyConfidence {
+		t.Errorf("confidence = %v, want %v (an absent ruling clamps regardless of shape — same backstop as the omitted-key case)",
+			f.confidence, acutetriage.MaxMetadataOnlyConfidence)
+	}
+	ver := verificationOf(t, f.enrichment)
+	if ver == nil {
+		t.Fatalf("expected a verification envelope (a wrong-shaped ruling must not force the degraded path)")
+	}
+	if ver.Outcome == "degraded" {
+		t.Errorf("outcome = degraded, want revised/supported — a malformed operator_ruling shape must not discard the whole call-2 verdict")
+	}
+	if ver.OperatorRuling == nil {
+		t.Fatalf("expected an operator_ruling record even when the shape is wrong, got %+v", ver)
+	}
+	r := ver.OperatorRuling
+	if r.Ruling != "absent" {
+		t.Errorf("ruling = %q, want absent (malformed shape degrades exactly like an omitted key)", r.Ruling)
+	}
+	if !r.Backed {
+		t.Error("backed = false, want true (operator query fetched)")
+	}
+	if !strings.Contains(buf.String(), "model omitted or mangled operator_ruling") {
+		t.Errorf("expected the soft-validation WARN to fire for the malformed shape, got log:\n%s", buf.String())
+	}
+}
+
+// TestSteering_UnbackedContradictionClamps: the model rules "contradicted"
+// but the operator query never fetched data (promUpHealthyElseEmpty — empty,
+// not fetched) — Backed must be false. Per ADR-0029/Task 8, a contradiction
+// needs data: an unbacked one must clamp same as unverifiable.
+func TestSteering_UnbackedContradictionClamps(t *testing.T) {
+	f, ver := runSteeringUnbackedFixture(t, "fp-steer-e", "disk pressure on web1",
+		"contradicted", "no data supports the correction, but I conclude it anyway")
+
+	if f.confidence != acutetriage.MaxMetadataOnlyConfidence {
+		t.Errorf("confidence = %v, want %v (unbacked contradiction must clamp — Task 8 backstop)",
+			f.confidence, acutetriage.MaxMetadataOnlyConfidence)
+	}
+	if ver == nil || ver.OperatorRuling == nil {
+		t.Fatalf("expected an operator_ruling record, got %+v", ver)
+	}
+	r := ver.OperatorRuling
+	if r.Ruling != "contradicted" {
+		t.Errorf("ruling = %q, want contradicted", r.Ruling)
+	}
+	if r.Backed {
+		t.Error("backed = true, want false (zero fetched operator queries — a contradiction needs data)")
+	}
+}
+
+// TestSteering_CallTwoFailureLogsErrorAndClamps: call 2 dies outright with
+// steering active. The degraded draft ships, the record is "unruled", and an
+// ERROR-level log fires naming the LLM failure and the unruled correction
+// (captured via a recording slog.Handler, asserted on the structured Level —
+// not a text grep). No Prometheus is configured here, so there is NO live
+// verification evidence at all: the PRE-EXISTING annotations-only cap
+// (applyEvidenceCap, built before this task) already clamps confidence to
+// MaxMetadataOnlyConfidence on its own — this test exercises the ERROR log
+// and the "unruled" record (Task 7) without depending on the steering-specific
+// backstop (Task 8) to produce the clamp.
+func TestSteering_CallTwoFailureLogsErrorAndClamps(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-steer-f", map[string]string{"alertname": "DiskFull", "host": "web1"})
+	v := seedGoverningVerdict(t, st, ctx, inc.ID, "correction", `{"cause_series":["pvc_bytes"]}`)
+
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "draft", "disk pressure on web1", 0.9, nil)},
+		{err: context.DeadlineExceeded},
+	}}
+
+	handler := &recordingHandler{}
+	cfg := verifyConfig(nil) // no Prometheus: no live verification evidence anywhere
+	cfg.Memory = st
+	cfg.MemoryParams = acutetriage.MemoryParams{LookbackDays: 90}
+	skill := acutetriage.New(cfg, st, scripted, nil, nil, slog.New(handler))
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run must not fail when call 2 misses: %v", err)
+	}
+	if scripted.calls != 2 {
+		t.Fatalf("want 2 LLM calls, got %d", scripted.calls)
+	}
+
+	f := readFinding(t, st, inc.ID)
+	if f.confidence != acutetriage.MaxMetadataOnlyConfidence {
+		t.Errorf("confidence = %v, want %v (no live evidence anywhere: the pre-existing metadata-only cap applies)",
+			f.confidence, acutetriage.MaxMetadataOnlyConfidence)
+	}
+	ver := verificationOf(t, f.enrichment)
+	if ver == nil || ver.OperatorRuling == nil {
+		t.Fatalf("expected an operator_ruling record, got %+v", ver)
+	}
+	r := ver.OperatorRuling
+	if r.Ruling != "unruled" {
+		t.Errorf("ruling = %q, want unruled (call 2 never completed)", r.Ruling)
+	}
+	if r.VerdictID != v.ID {
+		t.Errorf("verdict id = %d, want %d", r.VerdictID, v.ID)
+	}
+
+	rec, ok := handler.firstAtLevel(slog.LevelError)
+	if !ok {
+		t.Fatalf("expected an ERROR-level log record, got none: %+v", handler.records)
+	}
+	if !strings.Contains(rec.Message, "unruled") {
+		t.Errorf("ERROR message must name the unruled correction, got: %q", rec.Message)
+	}
+	if !strings.Contains(rec.Message, "call 2 failed") {
+		t.Errorf("ERROR message must name the LLM failure, got: %q", rec.Message)
+	}
+}
+
+// TestSteering_VerificationOffClampsQuietly: verification disabled entirely
+// (the kill switch) with a governing correction present — exactly one LLM
+// call, no round ever runs, and no ERROR fires (nothing failed; there was
+// simply nothing to run). No Prometheus/metrics/logs/changes/Sentry are
+// configured, so there is no live evidence anywhere: the PRE-EXISTING
+// annotations-only cap already clamps confidence — this test PASSES today.
+// The audit's steering_verdict_id/version still ride the trail even though
+// no round executed (FetchMemory runs independently of Verification.Enabled).
+func TestSteering_VerificationOffClampsQuietly(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	auditor := audit.New(st.DB())
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-steer-g", map[string]string{"alertname": "DiskFull", "host": "web1"})
+	v := seedGoverningVerdict(t, st, ctx, inc.ID, "correction", `{"cause_series":["pvc_bytes"]}`)
+
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "draft", "disk pressure on web1", 0.9, nil)},
+	}}
+
+	var buf bytes.Buffer
+	cfg := acutetriage.Config{MinAlerts: 1} // Verification zero value: disabled (kill switch)
+	cfg.Memory = st
+	cfg.MemoryParams = acutetriage.MemoryParams{LookbackDays: 90}
+	skill := acutetriage.New(cfg, st, scripted, auditor, nil, slog.New(slog.NewTextHandler(&buf, nil)))
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if scripted.calls != 1 {
+		t.Fatalf("verification disabled: want exactly 1 LLM call, got %d", scripted.calls)
+	}
+
+	f := readFinding(t, st, inc.ID)
+	if f.confidence != acutetriage.MaxMetadataOnlyConfidence {
+		t.Errorf("confidence = %v, want %v (no live evidence anywhere: the pre-existing metadata-only cap applies)",
+			f.confidence, acutetriage.MaxMetadataOnlyConfidence)
+	}
+	if strings.Contains(buf.String(), "level=ERROR") {
+		t.Errorf("no ERROR expected: nothing failed, got log:\n%s", buf.String())
+	}
+
+	var analyzedPayload string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT payload_json FROM audit_log WHERE kind = 'incident.analyzed'`).Scan(&analyzedPayload); err != nil {
+		t.Fatalf("query incident.analyzed audit: %v", err)
+	}
+	if !strings.Contains(analyzedPayload, fmt.Sprintf(`"steering_verdict_id":%d`, v.ID)) {
+		t.Errorf("incident.analyzed payload missing steering_verdict_id: %s", analyzedPayload)
+	}
+}
+
+// TestSteering_ConfirmationRetiresSteering: a retiring confirmation governs
+// (Steers=false) — no operator-sourced query joins the round (floor-only, 2
+// queries), the call-2 suffix carries no operator_ruling demand, no ruling is
+// recorded, and confidence is uncapped (live evidence via promHealthy rules
+// out the unrelated evidence-basis cap, isolating "confirmation never
+// steers" as the only thing under test).
+func TestSteering_ConfirmationRetiresSteering(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-steer-h", map[string]string{"alertname": "DiskFull", "host": "web1"})
+	seedGoverningVerdict(t, st, ctx, inc.ID, "confirmation", `{}`)
+
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "draft", "disk pressure on web1", 0.85, nil)},
+		{raw: callTwoResp(t, "draft", "disk pressure on web1", 0.85, "")},
+	}}
+
+	cfg := verifyConfig(promHealthy(t))
+	cfg.Memory = st
+	cfg.MemoryParams = acutetriage.MemoryParams{LookbackDays: 90}
+	skill := acutetriage.New(cfg, st, scripted, nil, nil, nil)
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if scripted.calls != 2 {
+		t.Fatalf("want 2 LLM calls, got %d", scripted.calls)
+	}
+
+	f := readFinding(t, st, inc.ID)
+	ver := verificationOf(t, f.enrichment)
+	if ver == nil || len(ver.Rounds) != 1 {
+		t.Fatalf("expected one verification round, got %+v", ver)
+	}
+	if len(ver.Rounds[0].Queries) != 2 {
+		t.Errorf("want 2 queries (floor only, confirmation contributes no steering query), got %d: %+v",
+			len(ver.Rounds[0].Queries), ver.Rounds[0].Queries)
+	}
+	if ver.OperatorRuling != nil {
+		t.Errorf("confirmation must not demand or record an operator ruling, got %+v", ver.OperatorRuling)
+	}
+	if strings.Contains(scripted.prompts[1], "operator_ruling") {
+		t.Errorf("call-2 suffix must not demand an operator_ruling when a confirmation governs:\n%s", scripted.prompts[1])
+	}
+	if f.confidence != 0.85 {
+		t.Errorf("confidence = %v, want 0.85 (no clamp — confirmation does not steer)", f.confidence)
 	}
 }

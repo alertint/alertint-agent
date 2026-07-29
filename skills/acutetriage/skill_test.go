@@ -991,6 +991,137 @@ func TestPipeline_AttachesEvidenceSummaryAndPersistsMetrics(t *testing.T) {
 	}
 }
 
+// TestRunOperatorHistoryAndSteering_VerificationOff: a steering-active
+// governing correction verdict with verification disabled entirely (the kill
+// switch). The Finding must carry both producer-computed payloads: History,
+// because the group key's governing verdict makes its own operator artifact
+// present ("history", not "first"/"seen"); and Steering with ruling
+// "unverifiable", because nothing ran to test the correction — verification
+// disabled is not the same as a ruling of "absent" (that's call 2's own
+// soft-parse default when a round DID run and the model omitted the key).
+func TestRunOperatorHistoryAndSteering_VerificationOff(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-hist-steer", map[string]string{"alertname": "DiskFull", "host": "web1"})
+	seedGoverningVerdict(t, st, ctx, inc.ID, "correction", `{"cause_series":["pvc_bytes"]}`)
+
+	fllm := &fakeLLM{response: validLLMResponse(nil)}
+	notifier := &capturingNotifier{}
+	cfg := acutetriage.Config{MinAlerts: 1} // Verification zero value: disabled (kill switch)
+	cfg.Memory = st
+	cfg.MemoryParams = acutetriage.MemoryParams{LookbackDays: 90}
+	skill := acutetriage.New(cfg, st, fllm, nil, notifier, nil)
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	f := notifier.last
+	if f.History == nil || f.History.State != "history" {
+		t.Fatalf("want History.State=history (governing verdict present), got %+v", f.History)
+	}
+	if f.Steering == nil || f.Steering.Ruling != "unverifiable" {
+		t.Fatalf("want Steering.Ruling=unverifiable (verification disabled, nothing ran), got %+v", f.Steering)
+	}
+}
+
+// TestRunSteeringSupported_FindingCarriesRuling: the OTHER attachHistorySteering
+// branch — verification actually ran and call 2 returned an operator_ruling
+// (ver.OperatorRuling != nil), unlike the verification-off test above. Adapted
+// from TestSteering_SupportedAdoptsUncapped's fixture (verify_integration_test.go)
+// but wired with a real (capturing) notifier so this asserts directly on
+// notify.Finding.Steering rather than the persisted envelope's
+// verification.operator_ruling — a structurally separate field that every
+// existing TestSteering_* test checks instead, none of which reach this branch
+// at all (they all pass a nil notifier, and attachHistorySteering only runs
+// inside `if s.notifier != nil`). This is the one place the "absent"→"unruled"
+// remap and the Basis/VerdictDate carry-through have any test coverage.
+func TestRunSteeringSupported_FindingCarriesRuling(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-steer-finding", map[string]string{"alertname": "DiskFull", "host": "web1"})
+	v := seedGoverningVerdict(t, st, ctx, inc.ID, "correction", `{"cause_series":["pvc_bytes"]}`)
+
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "draft", "generic disk pressure on web1", 0.85, nil)},
+		{raw: callTwoRespWithRuling(t, "corrected", "pvc exhaustion on web1", 0.85,
+			"supported", "pvc_bytes shows near-zero free space")},
+	}}
+
+	notifier := &capturingNotifier{}
+	cfg := verifyConfig(promHealthy(t))
+	cfg.Memory = st
+	cfg.MemoryParams = acutetriage.MemoryParams{LookbackDays: 90}
+	skill := acutetriage.New(cfg, st, scripted, nil, notifier, nil)
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if scripted.calls != 2 {
+		t.Fatalf("want 2 LLM calls, got %d", scripted.calls)
+	}
+
+	f := notifier.last
+	if f.Steering == nil {
+		t.Fatalf("want a non-nil Steering (a ruling was produced by call 2)")
+	}
+	if f.Steering.Ruling != "supported" {
+		t.Errorf("Steering.Ruling = %q, want supported (verbatim, no remap)", f.Steering.Ruling)
+	}
+	if f.Steering.Basis != "pvc_bytes shows near-zero free space" {
+		t.Errorf("Steering.Basis = %q, want the model's basis verbatim", f.Steering.Basis)
+	}
+	wantDate := v.CreatedAt.UTC().Format("2006-01-02")
+	if f.Steering.VerdictDate != wantDate {
+		t.Errorf("Steering.VerdictDate = %q, want %q (the seeded verdict's capture date)", f.Steering.VerdictDate, wantDate)
+	}
+}
+
+// TestRunSteeringUnbackedContradicted_CardRemapsToUntested: the model rules
+// "contradicted" but the operator probe never fetched (promUpHealthyElseEmpty
+// answers it empty), so Backed=false and the Task 8 clamp already treated the
+// ruling as absent. The card payload must present the same deterministic fact
+// — "untested", basis dropped — never the model's unbacked conclusion
+// ("contradicted by absence of evidence" is the epistemic error the
+// vocabulary exists to prevent). The enrichment record keeps the raw ruling;
+// TestSteering_UnbackedContradictionClamps pins that side.
+func TestRunSteeringUnbackedContradicted_CardRemapsToUntested(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-steer-untested", map[string]string{"alertname": "DiskFull", "host": "web1"})
+	seedGoverningVerdict(t, st, ctx, inc.ID, "correction", `{"cause_series":["pvc_bytes"]}`)
+
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "draft", "generic disk pressure on web1", 0.85, nil)},
+		{raw: callTwoRespWithRuling(t, "corrected", "disk pressure on web1", 0.85,
+			"contradicted", "no data supports the correction, but I conclude it anyway")},
+	}}
+
+	notifier := &capturingNotifier{}
+	cfg := verifyConfig(promUpHealthyElseEmpty(t))
+	cfg.Memory = st
+	cfg.MemoryParams = acutetriage.MemoryParams{LookbackDays: 90}
+	skill := acutetriage.New(cfg, st, scripted, nil, notifier, nil)
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	f := notifier.last
+	if f.Steering == nil {
+		t.Fatalf("want a non-nil Steering (a ruling was produced by call 2)")
+	}
+	if f.Steering.Ruling != "untested" {
+		t.Errorf("Steering.Ruling = %q, want untested (unbacked contradicted must not present as tested)", f.Steering.Ruling)
+	}
+	if f.Steering.Basis != "" {
+		t.Errorf("Steering.Basis = %q, want empty (the unbacked basis asserts a rejected conclusion)", f.Steering.Basis)
+	}
+}
+
 // TestRunDefaultsUnitemizedAlertRoles: member alerts the model omits from its
 // alerts array get the "correlated" role deterministically (bounded
 // itemization) — MCP consumers always see a role on every member.

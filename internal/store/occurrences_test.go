@@ -613,6 +613,29 @@ func TestTouchIncidentActivity_SlidesLastAlertAt(t *testing.T) {
 	}
 }
 
+func TestAnyPriorIncident(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	now := time.Now().UTC()
+	seedIncident(t, s, "inc-1", "service=checkout", "analyzed", now)
+
+	// excluding the only incident ⇒ no prior
+	got, err := s.AnyPriorIncident(ctx, "service=checkout", "inc-1", false)
+	if err != nil || got {
+		t.Fatalf("want false when the only incident is excluded, got %v, %v", got, err)
+	}
+	seedIncident(t, s, "inc-2", "service=checkout", "analyzed", now)
+	got, err = s.AnyPriorIncident(ctx, "service=checkout", "inc-2", false)
+	if err != nil || !got {
+		t.Fatalf("want true with a prior incident on the key, got %v, %v", got, err)
+	}
+	// unknown key ⇒ false
+	got, err = s.AnyPriorIncident(ctx, "service=ghost", "", false)
+	if err != nil || got {
+		t.Fatalf("want false for unknown key, got %v, %v", got, err)
+	}
+}
+
 func TestOccurrences_CascadeDeleteWithIncident(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

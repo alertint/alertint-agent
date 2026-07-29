@@ -56,6 +56,11 @@ Before call 2, a runner executes:
   or another `incidents_in_window` lookup, run under the same rails as
   everyday enrichment (`prometheus.max_series`, per-query timeout slices).
   A named, closed set of query kinds — never raw SQL, never a write.
+- **When a governing correction is steering the triage, its operator-sourced
+  checks** — the correction's widened queries plus one probe per named cause
+  series, run alongside the floor and model queries (not instead of them),
+  capped at 5 and exempt from `max_queries` like the floor. Absent when no
+  correction verdict governs the group key.
 
 **Call 2** is a full continuation of call 1 — the same prompt prefix, the
 draft as the model's own prior turn, then every query's result appended
@@ -67,9 +72,10 @@ draft.
 
 ## Cost
 
-Judged incidents go from one LLM call to two, plus at most six read-only
-queries (the two-query floor plus up to four model-chosen checks by
-default). This lands after [recurrence collapse](incident-memory.md) has
+Judged incidents go from one LLM call to two, plus up to eleven read-only
+queries (the two-query floor, up to four model-chosen checks by default, and
+— when a governing correction is steering the triage — up to five more
+operator-sourced checks). This lands after [recurrence collapse](incident-memory.md) has
 already cut incident *volume* — a steady flapper that used to spend a fresh
 analysis on every re-fire spends none, so the extra call per judged incident
 isn't multiplied by every recurrence, only by genuinely new or escalated

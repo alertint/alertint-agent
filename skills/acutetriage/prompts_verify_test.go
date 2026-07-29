@@ -171,3 +171,38 @@ func TestCallTwoContinuationOmitsMemoryVerdictWhenNoMemory(t *testing.T) {
 		t.Fatalf("no memory recalled: must not request a memory_verdict:\n%s", c2)
 	}
 }
+
+// steeringGoverningFixture is a fixed, deterministic MemoryEnrichment whose
+// Governing verdict steers (a correction) — used to pin the operator_ruling
+// demand callTwoContinuation appends (ADR-0029).
+func steeringGoverningFixture() *MemoryEnrichment {
+	return &MemoryEnrichment{
+		GroupKey: "alertname=DiskFull,host=web1",
+		Rung:     "operator",
+		Governing: &GoverningVerdict{
+			IncidentID: "inc_steer", VerdictID: 7, Version: 1,
+			Kind: "correction", Date: "2026-07-20", Age: "8d ago",
+			Note: "actually a pvc leak", CauseSeries: []string{"pvc_bytes"},
+			Steers: true,
+		},
+	}
+}
+
+// TestCallTwoContinuationDemandsOperatorRulingWhenSteering (review finding:
+// only a negative assertion existed — a confirmation must NOT render the
+// demand — so nothing pinned that the positive case renders it at all. The
+// scripted-LLM integration tests can't catch this either: they return canned
+// responses regardless of what the prompt says, so the entire
+// `if g := governingOf(memory); g != nil && g.Steers` block in
+// callTwoContinuation could be silently deleted or mis-gated and every
+// TestSteering_* integration test would still pass. This is the direct unit
+// test that would catch that regression: a steering correction must produce
+// the operator_ruling demand naming all three enum values.
+func TestCallTwoContinuationDemandsOperatorRulingWhenSteering(t *testing.T) {
+	c2 := callTwoContinuation(json.RawMessage(`{"overall_issue":"x","confidence":0.9}`), minimalRound(), steeringGoverningFixture())
+	for _, want := range []string{`"operator_ruling"`, "supported", "contradicted", "unverifiable"} {
+		if !strings.Contains(c2, want) {
+			t.Fatalf("missing %q in call-2 continuation when a correction steers:\n%s", want, c2)
+		}
+	}
+}

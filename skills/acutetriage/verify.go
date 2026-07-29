@@ -49,7 +49,7 @@ const (
 // VerificationQuery is one planned/executed query, persisted verbatim (R8/R10).
 type VerificationQuery struct {
 	Kind    string         `json:"kind"`
-	Source  string         `json:"source"` // "model" | "floor"
+	Source  string         `json:"source"` // "model" | "floor" | "capture" | "operator"
 	Expr    string         `json:"expr,omitempty"`
 	Params  map[string]any `json:"params,omitempty"`
 	Why     string         `json:"why,omitempty"`
@@ -73,6 +73,30 @@ type DraftRef struct {
 type VerificationEnrichment struct {
 	Outcome string              `json:"outcome"` // supported | revised | degraded
 	Rounds  []VerificationRound `json:"rounds"`
+	// OperatorRuling records call 2's judgment on the governing correction
+	// (ADR-0029) when one is steering; nil when no correction governs this
+	// triage at all.
+	OperatorRuling *OperatorRulingRecord `json:"operator_ruling,omitempty"`
+}
+
+// OperatorRulingRecord is the deterministic record of what call 2 ruled on
+// the governing correction's fetched operator-sourced evidence — or the
+// default when it didn't rule at all. Ruling is one of:
+//   - "supported" / "contradicted" / "unverifiable": the model's own valid
+//     ruling (soft-parsed from resp2.OperatorRuling).
+//   - "absent": call 2 answered but omitted or mangled the operator_ruling key.
+//   - "unruled": call 2 never completed (the degraded-draft path).
+//
+// Backed reports whether at least one operator-sourced query actually fetched
+// data (operatorEvidenceFetched), independent of what the model claims — the
+// Task 8 backstop treats an unbacked "contradicted" as unproven.
+type OperatorRulingRecord struct {
+	Ruling         string `json:"ruling"`
+	Basis          string `json:"basis,omitempty"`
+	Backed         bool   `json:"backed"`
+	VerdictID      int64  `json:"verdict_id"`
+	VerdictVersion int    `json:"verdict_version"`
+	VerdictDate    string `json:"verdict_date"`
 }
 
 // Verification-round outcomes (VerificationEnrichment.Outcome). degraded flags a
@@ -206,6 +230,21 @@ type verifyStateReader interface {
 // Params carries no valid window_minutes (R4 default).
 const defaultWindowMinutes = 60
 
+// minPerQueryTimeout floors each query's slice of the shared QueryTimeoutSeconds
+// budget (D10 deviation, user-approved). Steering can add up to
+// maxSteeringQueries operator queries on top of the floor and the model's own
+// proposals — up to 11 queries sharing one round today — so a naive equal
+// split (budget / len(queries)) can shrink well below what even a healthy
+// backend needs to answer, including the floor's own essential up_ratio
+// check. A slow backend then becomes indistinguishable from a genuinely
+// untested correction: a timed-out probe doesn't count as fetched, doesn't
+// count as backed, and confidence gets clamped anyway. This floor does not
+// grow the outer budget: when flooring every slice would sum past it, the
+// outer queryPhaseCtx deadline (still the hard ceiling below) simply cuts off
+// the trailing queries' contexts early — the same accepted degradation mode
+// FetchMetrics already relies on — rather than adding rebalancing logic here.
+const minPerQueryTimeout = 2 * time.Second
+
 // queryExecutor abstracts "run one verification query, fill Outcome/Result in
 // place". liveExecutor is production; snapshotExecutor is the hermetic replay
 // seam (ADR-0021 pipeline, frozen data).
@@ -229,52 +268,64 @@ func (e *liveExecutor) execute(ctx context.Context, q *VerificationQuery) {
 }
 
 // runVerification executes the floor queries (always: peer up-ratio +
-// cross-incident scan) plus every model-proposed query against the live
-// backends, each under its own slice of the shared query-phase budget,
-// filling Outcome and Result on every query (R2/R3). Never returns an error —
-// a query's own failure lands in its Outcome/Result, it never aborts the
-// round or the ones after it.
+// cross-incident scan), the governing verdict's operator-sourced steering
+// queries (buildSteeringQueries, ADR-0029), and every model-proposed query
+// against the live backends, each under its own slice of the shared
+// query-phase budget, filling Outcome and Result on every query (R2/R3).
+// Never returns an error — a query's own failure lands in its Outcome/Result,
+// it never aborts the round or the ones after it.
 //
 // The pipeline (verifyAndRejudge) passes the real skill logger; the runner tests
 // pass nil (defaulted to slog.Default below).
 func runVerification(ctx context.Context, prom metricQuerier, state verifyStateReader,
 	params VerificationParams, inc store.Incident, alerts []store.Alert,
-	draft DraftRef, modelQueries []VerificationQuery, now time.Time, logger *slog.Logger,
+	draft DraftRef, operatorQueries, modelQueries []VerificationQuery, now time.Time, logger *slog.Logger,
 ) *VerificationRound {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	exec := &liveExecutor{prom: prom, state: state, inc: inc, now: now, maxSeries: params.MaxSeries, logger: logger}
-	return runVerificationWith(ctx, exec, params, alerts, draft, modelQueries, now)
+	return runVerificationWith(ctx, exec, params, alerts, draft, operatorQueries, modelQueries, now)
 }
 
 // runVerificationWith is runVerification's executor-parameterized core: every
-// floor + model query is dispatched through exec instead of always hitting
-// the live backends, so replay can serve queries from a frozen snapshot
-// (Task 11) while production runs unchanged through runVerification's
-// liveExecutor wrapper.
+// floor + operator + model query is dispatched through exec instead of always
+// hitting the live backends, so replay can serve queries from a frozen
+// snapshot (Task 11) while production runs unchanged through runVerification's
+// liveExecutor wrapper. operatorQueries (buildSteeringQueries — the governing
+// verdict's deterministic query set, ADR-0029) ride between the floor and the
+// model's own proposals; like the floor they are exempt from MaxQueries —
+// they are deterministic and separately capped at maxSteeringQueries (D10).
 func runVerificationWith(ctx context.Context, exec queryExecutor, params VerificationParams,
-	alerts []store.Alert, draft DraftRef, modelQueries []VerificationQuery, now time.Time,
+	alerts []store.Alert, draft DraftRef, operatorQueries, modelQueries []VerificationQuery, now time.Time,
 ) *VerificationRound {
-	queries := make([]VerificationQuery, 0, 2+len(modelQueries))
+	queries := make([]VerificationQuery, 0, 2+len(operatorQueries)+len(modelQueries))
 	queries = append(queries, floorPlan(alerts)...)
+	queries = append(queries, operatorQueries...)
 	queries = append(queries, modelQueries...)
 
 	// Two-layer budget, mirroring FetchMetrics exactly (metrics.go:361-374):
 	// an outer queryPhaseCtx caps the WHOLE query phase at QueryTimeoutSeconds
 	// regardless of how the caller's ctx is scoped, and each query additionally
 	// gets its own slice of that budget so one slow or hung query times out on
-	// its own share instead of starving the rest of the round. A purely
-	// sequential loop dividing the budget N ways would already sum to at most
-	// the total (integer division only trims remainder nanoseconds, never
-	// grows it), but the outer ctx is kept anyway as the same hard ceiling
-	// FetchMetrics relies on — belt-and-braces against a future refactor (e.g.
-	// concurrent queries) silently breaking that invariant. len(queries) is
-	// never 0 — floorPlan always contributes its two entries.
+	// its own share instead of starving the rest of the round. Without the
+	// minPerQueryTimeout floor below, a purely sequential loop dividing the
+	// budget N ways would always sum to at most the total (integer division
+	// only trims remainder nanoseconds, never grows it) — but once N is large
+	// enough that the floor kicks in, per-query slices can sum past the
+	// budget. The outer ctx is what makes that safe: a child context's
+	// effective deadline can never exceed its parent's, so once
+	// queryPhaseCtx's own deadline passes, every further query's context is
+	// already expired and fails fast — trailing queries are simply cut off
+	// rather than the round running long. len(queries) is never 0 — floorPlan
+	// always contributes its two entries.
 	budget := time.Duration(params.QueryTimeoutSeconds) * time.Second
 	queryPhaseCtx, phaseCancel := context.WithTimeout(ctx, budget)
 	defer phaseCancel()
 	perQuery := budget / time.Duration(len(queries))
+	if perQuery < minPerQueryTimeout {
+		perQuery = minPerQueryTimeout
+	}
 
 	for i := range queries {
 		qCtx, cancel := context.WithTimeout(queryPhaseCtx, perQuery)

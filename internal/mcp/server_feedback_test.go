@@ -49,8 +49,8 @@ func TestIncidentAnnotate_HappyPath(t *testing.T) {
 	if err := json.Unmarshal([]byte(resultText(t, res)), &payload); err != nil {
 		t.Fatalf("decode result: %v", err)
 	}
-	if payload["demoted"] != true {
-		t.Fatalf("payload: %v", payload)
+	if payload["demoted"] != false {
+		t.Fatalf("annotate must not demote (D7): payload: %v", payload)
 	}
 	if _, ok := payload["annotation_id"]; !ok {
 		t.Fatalf("missing annotation_id: %v", payload)

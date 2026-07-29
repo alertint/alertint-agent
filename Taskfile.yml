@@ -122,6 +122,13 @@ tasks:
       - rm -f .alertint_fake_alert_state.json
       - echo "✓ Tracking state purged. Fresh alerts can now be generated."
 
+  demo:feedback:
+    desc: "End-to-end feedback & verdict capture demo: drill → triage → MCP write-back → recall → audit → steering proof (supported/contradicted/unverifiable). Args after `--`, e.g. `task demo:feedback -- --reset`"
+    deps: [build]
+    dotenv: [".env"]
+    cmds:
+      - python3 scripts/demo-feedback.py {{.CLI_ARGS}}
+
   logs:push:local:
     desc: Seed the dev-stack Loki with fake multi-level log lines (run before alerts:fire)
     cmds:

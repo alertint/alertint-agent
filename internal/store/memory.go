@@ -34,9 +34,11 @@ type PriorFinding struct {
 	CorroboratingIssueIDs []string
 	IsDrill               bool
 	// CorrectedByOperator is true when this prior's incident carries at least
-	// one operator correction annotation. Structural demotion (D4): a corrected
-	// prior never takes the strong slot, regardless of memory_refute_marks
-	// (which a later LLM "confirms" could clear).
+	// one captured correction verdict (incident_verdicts.verdict = 'correction')
+	// — a free-text "correction" annotation alone does not set this (D7); that
+	// channel is context-only. Structural demotion (D4): a corrected prior never
+	// takes the strong slot, regardless of memory_refute_marks (which a later
+	// LLM "confirms" could clear).
 	CorrectedByOperator bool
 }
 
@@ -150,8 +152,8 @@ const selectPriorCandidatesSQL = `
 	SELECT id, group_key,
 	       COALESCE(summary,''), COALESCE(root_cause,''), COALESCE(confidence,0.0),
 	       COALESCE(enrichment_json,''), memory_refute_marks,
-	       EXISTS (SELECT 1 FROM incident_annotations a
-	               WHERE a.incident_id = incidents.id AND a.kind = 'correction'),
+	       EXISTS (SELECT 1 FROM incident_verdicts v
+	               WHERE v.incident_id = incidents.id AND v.verdict = 'correction'),
 	       created_at, last_judged_at, first_alert_at
 	FROM incidents
 	WHERE status IN ('analyzed','resolved')

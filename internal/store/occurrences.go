@@ -495,6 +495,47 @@ func (s *Store) PruneOccurrences(ctx context.Context, before time.Time, batchSiz
 	return total, nil
 }
 
+// AnyPriorIncident reports whether the group key has any incident other than
+// excludeIncidentID, unbounded in time (incidents are never pruned), with
+// drill parity. Backs the card's "first occurrence" claim (R8): only a
+// clean-empty recall AND a false here may render 🆕. Scans the newest 100
+// rows — in practice drill keys are salted per-run and never shared with real
+// keys, so the parity filter is a guard, not a workload.
+func (s *Store) AnyPriorIncident(ctx context.Context, groupKey, excludeIncidentID string, currentIsDrill bool) (bool, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id FROM incidents
+		WHERE group_key = ? AND id != ?
+		ORDER BY created_at DESC LIMIT 100`, groupKey, excludeIncidentID)
+	if err != nil {
+		return false, fmt.Errorf("store: any prior incident: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return false, fmt.Errorf("store: any prior incident scan: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("store: any prior incident rows: %w", err)
+	}
+	if len(ids) == 0 {
+		return false, nil
+	}
+	flags, err := s.IncidentDrillFlags(ctx, ids)
+	if err != nil {
+		return false, fmt.Errorf("store: any prior incident drill flags: %w", err)
+	}
+	for _, id := range ids {
+		if flags[id] == currentIsDrill {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func scanOccurrence(sc scanner) (*Occurrence, error) {
 	var (
 		occ         Occurrence

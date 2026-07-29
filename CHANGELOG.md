@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Verdict steering: a captured correction now steers the next triage of its failure group —
+  its evidence runs as verification queries and the model must rule `supported` /
+  `contradicted` / `unverifiable` before the corrected cause is adopted (supported adopts
+  uncapped, contradicted is rejected with the reason on the card, unverifiable adopts as a
+  capped leading hypothesis with dated provenance). A ruling whose named evidence never
+  fetched renders as *could not be tested* — an untested conclusion is never presented as
+  a tested one. Operator verdicts and notes are permanent: age-stamped rendering replaces
+  time-based expiry, and a newer capture supersedes an older one.
+- Incident history surface: the incident's Slack thread gains a tri-state operator history
+  line (first occurrence / seen-before / the governing verdict's note) above the operator
+  notes, the main card carries the steering ruling line, and `alertint_get_incident` gains
+  `operator_history` — the group's governing verdict and age-stamped notes, readable from
+  any incident on the key.
+- `task demo:feedback` — end-to-end feedback-loop demo (`scripts/demo-feedback.py`):
+  drill → MCP write-back → recall → steering proof (supported / contradicted /
+  unverifiable) → audit verification.
+
+### Changed
+
+- `alertint_incident_annotate` notes no longer affect triage or memory recall — notes are
+  context for the next investigator; machine effect (steering, prior demotion) belongs
+  exclusively to `alertint_incident_capture_verdict`. Prior-finding demotion now keys off
+  captured correction verdicts, not note corrections.
+- `memory.lookback_days` now governs machine memory only (occurrence pruning and LLM
+  prior-finding recall); operator verdicts and notes are read unbounded.
+- Slimmer Slack incident card: severity and confidence join the channel-visible meta line,
+  the agent handoff is one line, and operator history moved to the thread — the main card
+  is headline, root cause, steering ruling, meta, and handoff.
+
 ## [0.10.0] - 2026-07-27
 
 ### Added

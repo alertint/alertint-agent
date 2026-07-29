@@ -72,32 +72,52 @@ func TestParseExpectation(t *testing.T) {
 	}
 }
 
+// R6: MustMention/MustNotConclude are grading vocabulary — even present on
+// the input Expectation, they must never surface in the synthesized note
+// (which becomes GoverningVerdict.Note and renders straight into the triage
+// prompt). CauseAlert is not grading vocabulary and stays.
 func TestSynthesizeNote(t *testing.T) {
 	e := Expectation{CauseAlert: "NodeNetworkInterfaceFlapping",
 		MustMention: []string{"NIC", "worker-14"}, MustNotConclude: []string{"AZ outage"}}
 	got := synthesizeNote("correction", e)
-	want := "corrected: cause NodeNetworkInterfaceFlapping; must mention NIC, worker-14; not AZ outage"
+	want := "corrected: cause NodeNetworkInterfaceFlapping"
 	if got != want {
 		t.Fatalf("got %q want %q", got, want)
 	}
-	if got := synthesizeNote("confirmation", Expectation{MustMention: []string{"disk full"}}); got != "confirmed: must mention disk full" {
+	if got := synthesizeNote("confirmation", Expectation{MustMention: []string{"disk full"}}); got != "confirmed" {
 		t.Fatalf("got %q", got)
 	}
 }
 
 // TestSynthesizeNote_CappedBelowStoreLimit covers a schema-valid expectation
-// with many/long discriminator strings: the synthesized note alone must
-// never exceed the store's write-boundary cap, or an atomic capture fails
-// for a caller who never opted into a free-text note.
+// with a very long cause_alert: the synthesized note alone must never exceed
+// the store's write-boundary cap, or an atomic capture fails for a caller who
+// never opted into a free-text note. MustMention no longer contributes to the
+// note (R6), so the long input has to come from CauseAlert to still exercise
+// the truncation path.
 func TestSynthesizeNote_CappedBelowStoreLimit(t *testing.T) {
-	long := make([]string, 200)
-	for i := range long {
-		long[i] = strings.Repeat("x", 30)
-	}
-	e := Expectation{MustMention: long}
+	e := Expectation{CauseAlert: strings.Repeat("x", 6000)}
 	got := synthesizeNote("correction", e)
 	if n := utf8.RuneCountInString(got); n > store.MaxAnnotationNoteChars {
 		t.Fatalf("synthesized note is %d chars, exceeds store cap %d", n, store.MaxAnnotationNoteChars)
+	}
+}
+
+// Belt and suspenders (R6): a real operator/agent would supply distinctive
+// MustMention/MustNotConclude content, not the literal snake_case JSON key
+// names — assert the actual strings never surface, not just the keys.
+func TestSynthesizeNote_NeverLeaksGradingVocabulary(t *testing.T) {
+	e := Expectation{
+		MustMention:     []string{"distinctivemention123"},
+		MustNotConclude: []string{"distinctiveconclude456"},
+	}
+	for _, verdict := range []string{"correction", "confirmation"} {
+		got := synthesizeNote(verdict, e)
+		for _, leaked := range []string{"distinctivemention123", "distinctiveconclude456"} {
+			if strings.Contains(got, leaked) {
+				t.Errorf("synthesizeNote(%q, ...) = %q leaked grading vocabulary %q", verdict, got, leaked)
+			}
+		}
 	}
 }
 
@@ -147,12 +167,12 @@ func TestDiffExpectationAgainstFinding(t *testing.T) {
 
 func TestLintExpectationVerifiable(t *testing.T) {
 	e := Expectation{CauseSeries: []string{"node_network_up"}, MustNotConclude: []string{"x"}}
-	if w := lintExpectationVerifiable(e, frozenEnvelope{}, nil); len(w) != 1 ||
+	if w := lintExpectationVerifiable("correction", e, frozenEnvelope{}, nil); len(w) != 1 ||
 		!strings.Contains(w[0], "expectation unverifiable") {
 		t.Fatalf("lint silent on unverifiable series: %v", w)
 	}
 	widened := []VerificationQuery{{Kind: "promql", Source: "capture", Expr: `node_network_up{instance="worker-14"}`}}
-	if w := lintExpectationVerifiable(e, frozenEnvelope{}, widened); len(w) != 0 {
+	if w := lintExpectationVerifiable("correction", e, frozenEnvelope{}, widened); len(w) != 0 {
 		t.Fatalf("lint fired though widening covers the series: %v", w)
 	}
 }
@@ -165,8 +185,68 @@ func TestLintExpectationVerifiable(t *testing.T) {
 func TestLintExpectationVerifiable_FailedFetchStillUnverifiable(t *testing.T) {
 	e := Expectation{CauseSeries: []string{"node_network_up"}, MustNotConclude: []string{"x"}}
 	failed := []VerificationQuery{{Kind: "promql", Source: "capture", Expr: "node_network_up", Outcome: OutcomeFailed, Result: "unavailable (timeout)"}}
-	w := lintExpectationVerifiable(e, frozenEnvelope{}, failed)
+	w := lintExpectationVerifiable("correction", e, frozenEnvelope{}, failed)
 	if len(w) != 1 || !strings.Contains(w[0], "expectation unverifiable") {
 		t.Fatalf("a failed widening fetch must not satisfy the verifiability lint: %v", w)
 	}
+}
+
+// TestLintExpectationVerifiable_AnchorlessCorrectionWarns covers Fix 4: a
+// correction naming only must_not_conclude (a fully valid expectation per
+// parseExpectation) can never generate a single steering query — buildSteeringQueries
+// draws exclusively from cause_series/widened evidence — so it permanently
+// confidence-caps every future triage on the group key with no way out. The
+// operator must be warned about this at capture time.
+func TestLintExpectationVerifiable_AnchorlessCorrectionWarns(t *testing.T) {
+	e := Expectation{MustNotConclude: []string{"AZ outage"}}
+	w := lintExpectationVerifiable("correction", e, frozenEnvelope{}, nil)
+	if len(w) != 1 || !strings.Contains(w[0], "no evidence anchors") {
+		t.Fatalf("anchorless correction must warn, got: %v", w)
+	}
+}
+
+// TestLintExpectationVerifiable_AnchorlessConfirmationSilent: the anchorless
+// warning is specific to corrections (only a correction steers); a
+// confirmation naming no anchors is unremarkable and must not warn.
+func TestLintExpectationVerifiable_AnchorlessConfirmationSilent(t *testing.T) {
+	e := Expectation{MustNotConclude: []string{"AZ outage"}}
+	if w := lintExpectationVerifiable("confirmation", e, frozenEnvelope{}, nil); len(w) != 0 {
+		t.Fatalf("an anchorless confirmation must not warn (only corrections steer), got: %v", w)
+	}
+}
+
+// TestLintExpectationVerifiable_AnchorPresenceSuppressesWarning covers each
+// of the three anchor kinds individually: cause_alert alone, cause_series
+// alone (backed so the OTHER unverifiable-series warning stays silent too),
+// and widened evidence alone — any one of them must suppress the
+// no-anchors warning.
+func TestLintExpectationVerifiable_AnchorPresenceSuppressesWarning(t *testing.T) {
+	base := Expectation{MustNotConclude: []string{"AZ outage"}}
+
+	withCauseAlert := base
+	withCauseAlert.CauseAlert = "KubePersistentVolumeFillingUp"
+	if w := lintExpectationVerifiable("correction", withCauseAlert, frozenEnvelope{}, nil); anyContains(w, "no evidence anchors") {
+		t.Fatalf("cause_alert alone must suppress the no-anchors warning, got: %v", w)
+	}
+
+	withCauseSeries := base
+	withCauseSeries.CauseSeries = []string{"pvc_bytes"}
+	backed := []VerificationQuery{{Kind: "promql", Source: "capture", Expr: "pvc_bytes", Outcome: OutcomeFetched, Result: "0.01"}}
+	if w := lintExpectationVerifiable("correction", withCauseSeries, frozenEnvelope{}, backed); anyContains(w, "no evidence anchors") {
+		t.Fatalf("cause_series alone must suppress the no-anchors warning, got: %v", w)
+	}
+
+	widenedOnly := []VerificationQuery{{Kind: "promql", Source: "capture", Expr: "up"}}
+	if w := lintExpectationVerifiable("correction", base, frozenEnvelope{}, widenedOnly); anyContains(w, "no evidence anchors") {
+		t.Fatalf("widened evidence alone must suppress the no-anchors warning, got: %v", w)
+	}
+}
+
+func anyContains(list []string, substr string) bool {
+	for _, s := range list {
+		if strings.Contains(s, substr) {
+			return true
+		}
+	}
+	return false
 }

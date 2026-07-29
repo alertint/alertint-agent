@@ -142,7 +142,31 @@ type llmResponse struct {
 	// bookkeeping key must not abort a good triage), so absent/invalid is treated
 	// as silent post-parse. Present only when a memory section was rendered.
 	MemoryVerdict string `json:"memory_verdict,omitempty"`
+	// OperatorRuling is the model's raw operator_ruling reply (ADR-0029),
+	// captured as untyped JSON rather than a typed *modelRuling: a shape
+	// mismatch (e.g. a bare string instead of the documented
+	// {"ruling":...,"basis":...} object — plausibly the single most likely
+	// real-world malformation) must never fail the unmarshal of the WHOLE
+	// call-2 response, which would route a valid revised verdict through the
+	// malformed-JSON/degraded path over one bad bookkeeping key. Soft-required
+	// like memory_verdict: the lenient decode into modelRuling happens
+	// entirely downstream, in verifyAndRejudge's ruling block — absent/
+	// unparseable/invalid all collapse to the same "absent" record there, the
+	// deterministic backstop clamps instead of failing triage.
+	OperatorRuling json.RawMessage `json:"operator_ruling,omitempty"`
 }
+
+// modelRuling is the model's raw operator_ruling reply — shaped exactly like
+// callTwoContinuation's demand, before it is validated into an
+// OperatorRulingRecord.
+type modelRuling struct {
+	Ruling string `json:"ruling"`
+	Basis  string `json:"basis"`
+}
+
+// validOperatorRulings is the closed enum for the soft-required
+// operator_ruling — a ruling outside this set is treated the same as absent.
+var validOperatorRulings = map[string]bool{"supported": true, "contradicted": true, "unverifiable": true}
 
 type alertOutput struct {
 	AlertID        string `json:"alert_id"`
@@ -309,6 +333,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	// (the call-1 prompt-side directive was rendered before the round existed, so
 	// it passed nil — only this deterministic post-call cap sees verification).
 	s.applyEvidenceCap(&resp, decision, ar.metrics, ar.logs, ar.changes, ar.sentry, ver, inc.ID)
+	s.applySteeringCap(&resp, governingOf(ar.memory), ver, inc.ID)
 
 	// Persist output, including the log-enrichment snapshot so the evidence pack
 	// can replay exactly what the model saw (empty on the short-circuit /
@@ -392,6 +417,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		if p.rejudge && p.recurrenceEpisodes > 1 && !p.recurrenceLastSeen.IsZero() {
 			f.Recurrence = &notify.Recurrence{Episodes: p.recurrenceEpisodes, LastSeen: p.recurrenceLastSeen}
 		}
+		s.attachHistorySteering(ctx, inc, ar, ver, &f)
 		// Multi owns the per-sink notify outcome line(s): a quiet "notified" on
 		// success, a "notify partial"/"notify failed" summary plus one "notify
 		// sink failed" detail line per failing sink. The aggregated error it
@@ -414,6 +440,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		if ver != nil {
 			analyzed["verification_outcome"] = ver.Outcome
 		}
+		steeringAuditFields(analyzed, ar.memory, ver)
 		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.analyzed", analyzed)
 	}
 
@@ -432,6 +459,55 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		"dur", time.Since(start),
 	)
 	return nil
+}
+
+// attachHistorySteering populates f.History and f.Steering (Task 9, R13/D9,
+// ADR-0029): the producer-computed payload behind the Slack history block and
+// the ruling line — notifiers stay I/O-free renderers, this is the read.
+// History is always attempted (tri-state honest — nil only when there's no
+// store to read at all). Steering is set only when a governing correction is
+// steering: from the verification round's own ruling when one ran, or
+// directly as "unverifiable" when verification is disabled entirely and
+// nothing ran to test it (that's distinct from a round that ran and the model
+// left the ruling "absent" — call 2's own soft-parse default, remapped to the
+// "unruled" wire value).
+func (s *Skill) attachHistorySteering(ctx context.Context, inc store.Incident, ar analysisResult, ver *VerificationEnrichment, f *notify.Finding) {
+	epi, first := 0, time.Time{}
+	if ar.memory != nil {
+		epi, first = ar.memory.Episodes, ar.memory.FirstSeen
+	}
+	lookback := s.cfg.MemoryParams.LookbackDays
+	if lookback <= 0 {
+		lookback = 90
+	}
+	f.History = BuildHistory(ctx, s.st, inc.GroupKey, inc.ID, f.Drill, epi, first, lookback, time.Now().UTC())
+
+	if ver != nil && ver.OperatorRuling != nil {
+		r := ver.OperatorRuling
+		ruling, basis := r.Ruling, r.Basis
+		if ruling == "absent" {
+			ruling = "unruled"
+		}
+		// Presentation parity with the Task 8 backstop: an unbacked
+		// supported/contradicted had no effect (the clamp treated it as
+		// absent), so the card must not present the model's conclusion as a
+		// tested outcome — "contradicted by absence of evidence" on a card is
+		// exactly the epistemic error the ruling vocabulary exists to prevent.
+		// The wire value "untested" renders the deterministic fact (the
+		// correction's named evidence never fetched; confidence capped) and
+		// drops the model's basis, which asserts a conclusion the machinery
+		// rejected. The enrichment record keeps the raw ruling — this remap
+		// is card/stdout payload only.
+		if (ruling == "supported" || ruling == "contradicted") && !r.Backed {
+			ruling, basis = "untested", ""
+		}
+		f.Steering = &notify.Steering{Ruling: ruling, Basis: basis, VerdictDate: r.VerdictDate}
+		return
+	}
+	if g := governingOf(ar.memory); g != nil && g.Steers {
+		// verification disabled: steering active, nothing ran (R5)
+		f.Steering = &notify.Steering{Ruling: "unverifiable", VerdictDate: g.Date}
+	}
 }
 
 // resolvedStatusLabel reports "resolved" when every member alert of
@@ -747,6 +823,28 @@ func (s *Skill) applyEvidenceCap(resp *llmResponse, decision rules.Decision, met
 	resp.Confidence = MaxMetadataOnlyConfidence
 }
 
+// applySteeringCap is the R4 backstop — one predicate: steering was active and
+// no fetched-query-backed ruling of supported or contradicted exists ⇒ the
+// finding's confidence is clamped to MaxMetadataOnlyConfidence. Covers
+// model-reported unverifiable, ruling absent, unbacked rulings, the degraded
+// round, and verification-off. A backed contradicted/supported never clamps
+// (scenario B keeps the model's own confidence). Deterministic: runs after
+// the LLM, independent of prompt compliance.
+func (s *Skill) applySteeringCap(resp *llmResponse, g *GoverningVerdict, ver *VerificationEnrichment, incidentID string) {
+	if g == nil || !g.Steers || resp.Confidence <= MaxMetadataOnlyConfidence {
+		return
+	}
+	if ver != nil && ver.OperatorRuling != nil {
+		r := ver.OperatorRuling
+		if (r.Ruling == "supported" || r.Ruling == "contradicted") && r.Backed {
+			return
+		}
+	}
+	s.logger.Info("confidence capped: operator correction not ruled out by fetched evidence",
+		"incident", incidentID, "model_confidence", resp.Confidence, "capped_to", MaxMetadataOnlyConfidence)
+	resp.Confidence = MaxMetadataOnlyConfidence
+}
+
 func clampConfidence(c *float64) {
 	if *c < 0 {
 		*c = 0
@@ -779,18 +877,32 @@ func (s *Skill) promQuerier() metricQuerier {
 func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts []store.Alert, ar analysisResult, resp llmResponse, p pipelineParams) (json.RawMessage, llmResponse, *VerificationEnrichment) {
 	draft := DraftRef{RootCause: resp.OverallIssue, Confidence: resp.Confidence}
 	modelQ := parseVerificationPlan(ar.raw, s.cfg.Verification.MaxQueries, s.logger, inc.ID)
-	s.auditVerificationPlanned(ctx, inc, alerts, modelQ)
+
+	// The governing verdict's operator-sourced steering queries (ADR-0029) ride
+	// the same round, between the floor and the model's own proposals.
+	// ar.memory is nil on paths that skip memory fetch entirely (e.g. no store
+	// configured) — buildSteeringQueries is nil-safe on a nil governing verdict.
+	// Computed BEFORE auditVerificationPlanned so the "planned" audit row
+	// matches the round that actually executes (same three tiers, same order).
+	var governing *GoverningVerdict
+	if ar.memory != nil {
+		governing = ar.memory.Governing
+	}
+	operatorQ := buildSteeringQueries(governing)
+	s.auditVerificationPlanned(ctx, inc, alerts, operatorQ, modelQ)
 
 	// The runner shares the SAME true-nil-safe querier the analysis fetch used, and
 	// the store as the incidents_in_window state reader. It never errors: a query's
 	// own failure lands in its Outcome/Result, never aborting the round (R2).
 	// During replay, queries are served from the frozen snapshot instead — no
-	// live data-source call is ever made.
+	// live data-source call is ever made. Frozen memory carries Governing, so
+	// operatorQ rebuilds identically on replay and the snapshot executor serves
+	// each query by kind+expr — no snapshot-format change.
 	var round *VerificationRound
 	if p.replay != nil {
-		round = runVerificationWith(ctx, p.replay.exec, s.cfg.Verification, alerts, draft, modelQ, time.Now().UTC())
+		round = runVerificationWith(ctx, p.replay.exec, s.cfg.Verification, alerts, draft, operatorQ, modelQ, time.Now().UTC())
 	} else {
-		round = runVerification(ctx, s.promQuerier(), s.st, s.cfg.Verification, inc, alerts, draft, modelQ, time.Now().UTC(), s.logger)
+		round = runVerification(ctx, s.promQuerier(), s.st, s.cfg.Verification, inc, alerts, draft, operatorQ, modelQ, time.Now().UTC(), s.logger)
 	}
 
 	// Call 2: the byte-identical call-1 prefix + the draft + the computed round +
@@ -802,7 +914,13 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 	}, RequiredKeys)
 	if err != nil {
 		s.logger.Warn("acutetriage: verification re-judge failed; draft stands", "incident", inc.ID, "err", err)
-		return s.degradedDraft(ctx, inc.ID, ar.raw, round, resp)
+		g := governingOf(ar.memory)
+		if g != nil && g.Steers {
+			s.logger.Error("acutetriage: steering: operator correction went unruled — verification call 2 failed; "+
+				"finding ships capped and the card says the check did not complete (check your LLM setup)",
+				"incident", inc.ID, "verdict_version", g.Version, "err", err)
+		}
+		return s.degradedDraft(ctx, inc.ID, ar.raw, round, resp, g)
 	}
 	// Cache-engagement probe: call 2 always marks the shared prefix, so a zero
 	// cache read means the prefix is below the model's cacheable floor (benign,
@@ -817,7 +935,13 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 	if err := json.Unmarshal(comp.Raw, &resp2); err != nil {
 		// A malformed re-judge must not fail a triage that has a valid draft.
 		s.logger.Warn("acutetriage: verification re-judge returned malformed JSON; draft stands", "incident", inc.ID, "err", err)
-		return s.degradedDraft(ctx, inc.ID, ar.raw, round, resp)
+		g := governingOf(ar.memory)
+		if g != nil && g.Steers {
+			s.logger.Error("acutetriage: steering: operator correction went unruled — verification call 2 failed; "+
+				"finding ships capped and the card says the check did not complete (check your LLM setup)",
+				"incident", inc.ID, "verdict_version", g.Version, "err", err)
+		}
+		return s.degradedDraft(ctx, inc.ID, ar.raw, round, resp, g)
 	}
 	clampConfidence(&resp2.Confidence)
 
@@ -851,9 +975,32 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 		// triage or the round.
 		resp2.MemoryVerdict = ""
 	}
+
+	// The ruling contract (ADR-0029): when a correction is steering, call 2 was
+	// asked (callTwoContinuation) to add an operator_ruling key judging the
+	// fetched operator-sourced evidence. Soft-parsed exactly like memory_verdict
+	// above — a missing or invalid ruling never fails triage, it defaults to
+	// "absent" and a WARN notes it (the deterministic confidence backstop,
+	// Task 8, clamps off this record). Backed reports whether any operator
+	// query actually fetched data, independent of what the model claims.
+	var ruling *OperatorRulingRecord
+	if g := governingOf(ar.memory); g != nil && g.Steers {
+		ruling = &OperatorRulingRecord{
+			Ruling: "absent", Backed: operatorEvidenceFetched(g, round),
+			VerdictID: g.VerdictID, VerdictVersion: g.Version, VerdictDate: g.Date,
+		}
+		var r modelRuling
+		if len(resp2.OperatorRuling) > 0 && json.Unmarshal(resp2.OperatorRuling, &r) == nil && validOperatorRulings[r.Ruling] {
+			ruling.Ruling = r.Ruling
+			ruling.Basis = capText(flattenRecalled(r.Basis), 300)
+		} else {
+			s.logger.Warn("acutetriage: steering: model omitted or mangled operator_ruling; treated as absent (clamp applies)",
+				"incident", inc.ID, "verdict_version", g.Version)
+		}
+	}
 	s.auditVerificationExecuted(ctx, inc.ID, outcome, round, clamped)
 
-	return comp.Raw, resp2, &VerificationEnrichment{Outcome: outcome, Rounds: []VerificationRound{*round}}
+	return comp.Raw, resp2, &VerificationEnrichment{Outcome: outcome, Rounds: []VerificationRound{*round}, OperatorRuling: ruling}
 }
 
 // degradedDraft is the shared call-2-failure return: the draft ships as final —
@@ -862,28 +1009,47 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 // memory mark cleared (R16 — a lost call 2 moves no marks), outcome degraded, and
 // the executed round preserved for the envelope. It emits the
 // verification_executed audit so every planned round has a matching executed row.
-func (s *Skill) degradedDraft(ctx context.Context, incidentID string, draftRaw json.RawMessage, round *VerificationRound, draft llmResponse) (json.RawMessage, llmResponse, *VerificationEnrichment) {
+// g is the governing correction (nil when none/not steering) — a lost call 2
+// means the correction went unruled, recorded as such rather than silently
+// dropped (the caller already logged the ERROR naming the failure).
+func (s *Skill) degradedDraft(ctx context.Context, incidentID string, draftRaw json.RawMessage,
+	round *VerificationRound, draft llmResponse, g *GoverningVerdict) (json.RawMessage, llmResponse, *VerificationEnrichment) {
 	draft.MemoryVerdict = ""
+	var ruling *OperatorRulingRecord
+	if g != nil && g.Steers {
+		ruling = &OperatorRulingRecord{Ruling: "unruled", Backed: operatorEvidenceFetched(g, round),
+			VerdictID: g.VerdictID, VerdictVersion: g.Version, VerdictDate: g.Date}
+	}
 	s.auditVerificationExecuted(ctx, incidentID, verifyOutcomeDegraded, round, false)
-	return draftRaw, draft, &VerificationEnrichment{Outcome: verifyOutcomeDegraded, Rounds: []VerificationRound{*round}}
+	return draftRaw, draft, &VerificationEnrichment{Outcome: verifyOutcomeDegraded, Rounds: []VerificationRound{*round}, OperatorRuling: ruling}
 }
 
-// auditVerificationPlanned records the plan before it runs: the model/floor query
-// counts and each query's kind/source/why — never a metric value (R4/KTD6).
-func (s *Skill) auditVerificationPlanned(ctx context.Context, inc store.Incident, alerts []store.Alert, modelQ []VerificationQuery) {
+// auditVerificationPlanned records the plan before it runs: the floor/operator/
+// model query counts and each query's kind/source/why — never a metric value
+// (R4/KTD6). The plan is assembled in the SAME floor→operator→model order the
+// round itself uses (runVerificationWith), so this audit row's query list
+// matches the executed round query-for-query — operatorQ (the governing
+// verdict's steering queries, ADR-0029) must never be omitted here even though
+// it is exempt from MaxQueries, or the "planned" and "executed" audit rows
+// would silently disagree in count.
+func (s *Skill) auditVerificationPlanned(ctx context.Context, inc store.Incident, alerts []store.Alert, operatorQ, modelQ []VerificationQuery) {
 	if s.auditor == nil {
 		return
 	}
-	plan := append(floorPlan(alerts), modelQ...)
+	plan := make([]VerificationQuery, 0, 2+len(operatorQ)+len(modelQ))
+	plan = append(plan, floorPlan(alerts)...)
+	plan = append(plan, operatorQ...)
+	plan = append(plan, modelQ...)
 	qs := make([]map[string]string, 0, len(plan))
 	for _, q := range plan {
 		qs = append(qs, map[string]string{"kind": q.Kind, "source": q.Source, "why": q.Why})
 	}
 	_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.verification_planned", map[string]any{
-		"incident_id":       inc.ID,
-		"model_query_count": len(modelQ),
-		"floor_query_count": 2,
-		"queries":           qs,
+		"incident_id":          inc.ID,
+		"model_query_count":    len(modelQ),
+		"operator_query_count": len(operatorQ),
+		"floor_query_count":    2,
+		"queries":              qs,
 	})
 }
 

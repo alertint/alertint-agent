@@ -38,6 +38,16 @@ func blocksJSON(t *testing.T, blocks []slacklib.Block) string {
 	return string(b)
 }
 
+// mustTime parses a "YYYY-MM-DD" fixture date, panicking on malformed input —
+// test fixtures only, never a production parse path.
+func mustTime(s string) time.Time {
+	tm, err := time.Parse("2006-01-02", s)
+	if err != nil {
+		panic(err)
+	}
+	return tm
+}
+
 // TestFiringMainBlocksIncludeAgentCTA verifies the headline card carries the
 // copy-pasteable MCP-handoff prompt with the FULL incident ID (the downstream
 // alertint_get_incident call must resolve unambiguously).
@@ -211,5 +221,91 @@ func TestFiringDetailBlocks_UnverifiedCaveat(t *testing.T) {
 	s = blocksJSON(t, firingDetailBlocks(f))
 	if strings.Contains(s, "unverified") {
 		t.Errorf("verified finding must not contain unverified caveat:\n%s", s)
+	}
+}
+
+// TestFiringCardHistoryBlock covers the tri-state operator history line and
+// the steering ruling line (R9/R13, ADR-0029): first/seen/seen-without-count/
+// history/unavailable, plus all ruling outcomes. Surfaces differ on purpose:
+// history lines render on the thread detail (context for whoever opens the
+// incident), steering ruling lines on the main card (triage signal, must be
+// channel-visible).
+func TestFiringCardHistoryBlock(t *testing.T) {
+	cases := []struct {
+		name string
+		h    *notify.History
+		s    *notify.Steering
+		want string // substring that must appear in the rendered card blocks
+	}{
+		{"first", &notify.History{State: "first"}, nil,
+			"🆕 first occurrence — no prior incidents, verdicts, or notes for this failure group"},
+		{"seen", &notify.History{State: "seen", Episodes: 4, FirstSeen: mustTime("2026-07-01"), WindowDays: 90}, nil,
+			"👀 seen ×4 in the last 90d (since 2026-07-01) — no operator verdict yet"},
+		{"seen without count", &notify.History{State: "seen"}, nil,
+			"👀 seen before — no operator verdict yet"},
+		{"history", &notify.History{State: "history",
+			Verdict: &notify.HistoryVerdict{Kind: "correction", Age: "4d ago", Note: "pvc filling"}}, nil,
+			"📌 operator correction (4d ago): pvc filling"},
+		{"unavailable", &notify.History{State: "unavailable"}, nil,
+			"⚠️ operator history unavailable"},
+		{"ruling supported", &notify.History{State: "history"},
+			&notify.Steering{Ruling: "supported", Basis: "series is filling"},
+			"✅ operator correction checked: supported — series is filling"},
+		{"ruling contradicted", &notify.History{State: "history"},
+			&notify.Steering{Ruling: "contradicted", Basis: "series healthy"},
+			"❌ operator correction checked: does not apply now — series healthy"},
+		{"ruling unverifiable", &notify.History{State: "history"},
+			&notify.Steering{Ruling: "unverifiable", VerdictDate: "2026-07-28"},
+			"⚠️ adopted per operator correction of 2026-07-28, not verifiable from current evidence (confidence capped)"},
+		{"ruling unverifiable with basis", &notify.History{State: "history"},
+			&notify.Steering{Ruling: "unverifiable", VerdictDate: "2026-07-28", Basis: "pvc metric read 3, uninterpretable"},
+			"⚠️ adopted per operator correction of 2026-07-28, not verifiable from current evidence (confidence capped) — pvc metric read 3, uninterpretable"},
+		{"ruling untested", &notify.History{State: "history"},
+			&notify.Steering{Ruling: "untested", VerdictDate: "2026-07-28"},
+			"⚠️ operator correction of 2026-07-28 could not be tested — its named evidence returned no usable data this round (confidence capped)"},
+		{"ruling unruled", &notify.History{State: "history"},
+			&notify.Steering{Ruling: "unruled"},
+			"⚠️ operator correction present — check did not complete"},
+	}
+	for _, tc := range cases {
+		f := testFinding()
+		f.History, f.Steering = tc.h, tc.s
+		render := firingCardBlocks
+		if tc.s == nil { // history-only lines live on the thread detail
+			render = firingDetailBlocks
+		}
+		if got := blocksJSON(t, render(f)); !strings.Contains(got, tc.want) {
+			t.Errorf("%s: missing %q in:\n%s", tc.name, tc.want, got)
+		}
+	}
+}
+
+// TestFiringCardSlim pins the slim main card: the history line stays OFF the
+// channel card (thread-only), while severity and confidence ride the meta
+// line so the two numbers an operator triages by are channel-visible.
+func TestFiringCardSlim(t *testing.T) {
+	f := testFinding()
+	f.History = &notify.History{State: "history",
+		Verdict: &notify.HistoryVerdict{Kind: "correction", Age: "4d ago", Note: "pvc filling"}}
+	card := blocksJSON(t, firingCardBlocks(f))
+	if strings.Contains(card, "operator correction (4d ago)") {
+		t.Errorf("history note must not render on the main card:\n%s", card)
+	}
+	if !strings.Contains(card, "· high · 85% ·") {
+		t.Errorf("meta line missing severity/confidence:\n%s", card)
+	}
+}
+
+// TestFiringDetailNotes covers the bounded operator-notes block in the thread
+// detail view: the newest notes render verbatim, and overflow beyond the shown
+// slice plus the producer-reported NotesMore folds into a single "+N more" tail.
+func TestFiringDetailNotes(t *testing.T) {
+	f := testFinding()
+	f.History = &notify.History{State: "history", Notes: []notify.HistoryNote{
+		{Kind: "observation", Age: "5d ago", Note: "canary contained it"},
+	}, NotesMore: 2}
+	got := blocksJSON(t, firingDetailBlocks(f))
+	if !strings.Contains(got, "📝 observation (5d ago): canary contained it") || !strings.Contains(got, "+2 more") {
+		t.Errorf("notes render missing:\n%s", got)
 	}
 }

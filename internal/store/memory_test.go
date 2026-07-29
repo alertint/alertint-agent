@@ -206,9 +206,9 @@ func TestMemoryView_CorrectedByOperator(t *testing.T) {
 	key := "cluster=prod,namespace=web,service=api"
 	seedJudged(t, s, judged{id: "inc_corrected", groupKey: key, createdAt: now.AddDate(0, 0, -1), rootCause: "wrong AZ outage"})
 	seedJudged(t, s, judged{id: "inc_plain", groupKey: key, createdAt: now.AddDate(0, 0, -2), rootCause: "plain"})
-	if _, err := s.InsertIncidentAnnotation(ctx, "inc_corrected", "correction", "operator said no"); err != nil {
-		t.Fatalf("insert annotation: %v", err)
-	}
+	// D7: demotion keys off a captured correction verdict, not a free-text
+	// annotation (see TestMemoryView_DemotionKeysOffCorrectionVerdicts).
+	mustCapture(t, s, ctx, "inc_corrected", "correction", `{"must_mention":["az"]}`, "operator said no")
 
 	v, err := s.MemoryView(ctx, key, "inc_current", false, since)
 	if err != nil {
@@ -226,6 +226,49 @@ func TestMemoryView_CorrectedByOperator(t *testing.T) {
 	}
 	if byID["inc_plain"].CorrectedByOperator {
 		t.Errorf("inc_plain has no correction annotation, should be false: %+v", byID["inc_plain"])
+	}
+}
+
+// TestMemoryView_DemotionKeysOffCorrectionVerdicts pins spec D7: demotion
+// (CorrectedByOperator) fires only off a captured correction verdict
+// (incident_verdicts.verdict = 'correction'), never off a free-text
+// incident_annotations "correction" note by itself — that channel is
+// context-only (Task 3 formalizes it). A confirmation verdict never demotes.
+func TestMemoryView_DemotionKeysOffCorrectionVerdicts(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 9, 2, 0, 0, 0, time.UTC)
+	since := now.AddDate(0, 0, -90)
+	key := "cluster=prod,namespace=web,service=api"
+
+	// prior analyzed incident with only a note-correction: NOT demoted (D7)
+	seedJudged(t, s, judged{id: "inc-note", groupKey: key, createdAt: now.AddDate(0, 0, -1), rootCause: "note only"})
+	if _, err := s.InsertIncidentAnnotation(ctx, "inc-note", "correction", "note only"); err != nil {
+		t.Fatalf("annotate: %v", err)
+	}
+	// prior analyzed incident with a captured correction verdict: demoted
+	seedJudged(t, s, judged{id: "inc-verdict", groupKey: key, createdAt: now.AddDate(0, 0, -2), rootCause: "verdict"})
+	mustCapture(t, s, ctx, "inc-verdict", "correction", `{"must_mention":["queue"]}`, "captured")
+	// a confirmation verdict never demotes
+	seedJudged(t, s, judged{id: "inc-confirm", groupKey: key, createdAt: now.AddDate(0, 0, -3), rootCause: "confirm"})
+	mustCapture(t, s, ctx, "inc-confirm", "confirmation", `{"must_mention":["ok"]}`, "agreed")
+
+	view, err := s.MemoryView(ctx, key, "inc-current", false, since)
+	if err != nil {
+		t.Fatalf("MemoryView: %v", err)
+	}
+	got := map[string]bool{}
+	for _, pf := range view.PriorFindings {
+		got[pf.IncidentID] = pf.CorrectedByOperator
+	}
+	if got["inc-note"] {
+		t.Error("note-only correction must not demote (D7)")
+	}
+	if !got["inc-verdict"] {
+		t.Error("captured correction verdict must demote")
+	}
+	if got["inc-confirm"] {
+		t.Error("confirmation verdict must not demote")
 	}
 }
 

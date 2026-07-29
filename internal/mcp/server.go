@@ -467,6 +467,16 @@ func (s *Server) handleGetIncident(ctx context.Context, req mcplib.CallToolReque
 		}
 		payload["verdict"] = verdict
 	}
+	// Group-scoped operator history (R13/D9): the same BuildHistory the Slack
+	// notifier renders, so a correction captured on any incident on this group
+	// key is visible from every sibling incident's detail — never just the one
+	// it was captured on. Distinct from "verdict" above, which stays
+	// incident-scoped (this incident's own captured verdict only); the two
+	// must never collide. Episodes/FirstSeen/WindowDays are the notifier's
+	// recall-derived extras — MCP passes zeros, which the JSON omits.
+	if h := acutetriage.BuildHistory(ctx, s.st, inc.GroupKey, inc.ID, drill, 0, time.Time{}, 0, time.Now().UTC()); h != nil {
+		payload["operator_history"] = h
+	}
 
 	result, err := mcplib.NewToolResultJSON(payload)
 	if err != nil {
