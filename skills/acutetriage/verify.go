@@ -600,22 +600,39 @@ func firstInstantValue(raw json.RawMessage) (string, bool) {
 }
 
 // floorFetched is the first of the two R15 rails: every floor query
-// (Source=="floor") fetched or found nothing. A failed or degraded
-// MODEL-targeted query alone must never flip this — the floor is the promised
-// minimum, targeted queries are bonus precision on top (R15).
+// (Source=="floor") fetched or found nothing, AND at least one of them came
+// from a real backend. A failed or degraded MODEL-targeted query alone must
+// never flip this — the floor is the promised minimum, targeted queries are
+// bonus precision on top (R15).
+//
+// The real-backend requirement matters because composeFloor (ADR-0034) is
+// presence-based: an install with no Prometheus and no Zabbix configured — or
+// Zabbix configured but the incident lacking host identity — composes a floor
+// of ONLY kindIncidentsInWindow, this install's own SQLite bookkeeping, which
+// almost always fetches. Without excluding it, such an install would silently
+// clear the caveat on the strength of nothing but its own query, on every
+// triage. Requiring at least one non-incidents_in_window floor member
+// restores the pre-Task-6 behavior for a zero-real-backend install: back then
+// the floor always included up_ratio, which unconditionally failed
+// "prometheus not configured" absent Prometheus, so floorFetched was reliably
+// false and the 0.6 metadata-only confidence cap's caveat never cleared.
 func floorFetched(r *VerificationRound) bool {
 	if r == nil {
 		return false
 	}
+	sawRealSource := false
 	for _, q := range r.Queries {
 		if q.Source != "floor" {
 			continue
+		}
+		if q.Kind != kindIncidentsInWindow {
+			sawRealSource = true
 		}
 		if q.Outcome != OutcomeFetched && q.Outcome != OutcomeEmpty {
 			return false
 		}
 	}
-	return true
+	return sawRealSource
 }
 
 // anyUnfetched is the second R15 rail, backing the confidence clamp: any
@@ -634,13 +651,14 @@ func anyUnfetched(r *VerificationRound) bool {
 	return false
 }
 
-// verificationLive is the R17 cap-interaction predicate: whether any up_ratio
-// or promql query across every round actually fetched. A fetched PromQL
-// observation (whether the floor's aggregate ratio or a model-targeted query)
-// is a real observation of the infrastructure and counts as live evidence for
-// hasLiveEvidence; incidents_in_window never does — it is this install's own
-// SQLite bookkeeping, not an external observation. An install without
-// Prometheus configured therefore never trips this, leaving today's 0.6-cap
+// verificationLive is the R17 cap-interaction predicate: whether any
+// floor-source or promql query across every round actually fetched. A
+// fetched observation from any floor source — Prometheus's aggregate ratio,
+// a model promql, or the Zabbix floor's polling verdict / live problem
+// evaluation — is a real observation of the infrastructure and counts as
+// live evidence (ADR-0034 phase symmetry); incidents_in_window never does —
+// it is this install's own SQLite bookkeeping. An install with no floor
+// source configured therefore never trips this, leaving the 0.6-cap
 // behavior untouched.
 func verificationLive(v *VerificationEnrichment) bool {
 	if v == nil {
@@ -648,8 +666,11 @@ func verificationLive(v *VerificationEnrichment) bool {
 	}
 	for _, round := range v.Rounds {
 		for _, q := range round.Queries {
-			if (q.Kind == kindUpRatio || q.Kind == kindPromQL) && q.Outcome == OutcomeFetched {
-				return true
+			switch q.Kind {
+			case kindUpRatio, kindPromQL, kindZabbixReachability, kindZabbixNeighborProblems:
+				if q.Outcome == OutcomeFetched {
+					return true
+				}
 			}
 		}
 	}
@@ -704,10 +725,16 @@ func newSnapshotExecutor(frozen []VerificationQuery) *snapshotExecutor {
 
 // snapshotKey normalizes a query to its match identity: kind+expr for
 // promql/up_ratio, kind+window for incidents_in_window (numbers arrive as
-// float64 from frozen JSON and as int from live params — normalize both).
+// float64 from frozen JSON and as int from live params — normalize both),
+// kind+checked-hosts for the two Zabbix floor kinds (hostsFromParams already
+// tolerates the []any-vs-[]string shape difference between a frozen envelope
+// and a live-composed query, Task 3).
 func snapshotKey(q VerificationQuery) string {
-	if q.Kind == kindIncidentsInWindow {
+	switch q.Kind {
+	case kindIncidentsInWindow:
 		return q.Kind + "\x1f" + strconv.Itoa(windowMinutesFromParams(q.Params))
+	case kindZabbixReachability, kindZabbixNeighborProblems:
+		return q.Kind + "\x1f" + strings.Join(hostsFromParams(q.Params), ",")
 	}
 	return q.Kind + "\x1f" + q.Expr
 }

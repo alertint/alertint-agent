@@ -383,6 +383,21 @@ func TestFloorFetchedAndAnyUnfetched(t *testing.T) {
 	}
 }
 
+// A zero-backend install (no Prometheus, no Zabbix — or Zabbix configured but
+// the incident lacks host identity) composes a floor of ONLY
+// incidents_in_window (own-state SQLite bookkeeping). That alone must never
+// satisfy floorFetched — matching the pre-Task-6 behavior where an
+// unconfigured up_ratio reliably failed and kept the caveat forever on such
+// an install (the 0.6 metadata-only confidence cap persona).
+func TestFloorFetchedZeroBackendNeverClears(t *testing.T) {
+	r := &VerificationRound{Queries: []VerificationQuery{
+		{Source: "floor", Kind: kindIncidentsInWindow, Outcome: OutcomeFetched},
+	}}
+	if floorFetched(r) {
+		t.Fatal("incidents_in_window alone (no real backend contributed) must never satisfy floorFetched")
+	}
+}
+
 func TestVerificationLive(t *testing.T) {
 	if verificationLive(nil) {
 		t.Fatal("nil enrichment must not be live")
@@ -407,6 +422,28 @@ func TestVerificationLive(t *testing.T) {
 	}}}}
 	if !verificationLive(v2) {
 		t.Fatal("a fetched up_ratio query must also count as live evidence")
+	}
+}
+
+func TestVerificationLive_ZabbixFloorCounts(t *testing.T) {
+	cases := []struct {
+		name string
+		kind string
+		out  Outcome
+		want bool
+	}{
+		{"reachability fetched lifts", kindZabbixReachability, OutcomeFetched, true},
+		{"neighbor fetched lifts", kindZabbixNeighborProblems, OutcomeFetched, true},
+		{"neighbor empty does not lift", kindZabbixNeighborProblems, OutcomeEmpty, false},
+		{"reachability failed does not lift", kindZabbixReachability, OutcomeFailed, false},
+		{"incidents_in_window never lifts", kindIncidentsInWindow, OutcomeFetched, false},
+	}
+	for _, tc := range cases {
+		v := &VerificationEnrichment{Rounds: []VerificationRound{{Queries: []VerificationQuery{
+			{Kind: tc.kind, Outcome: tc.out}}}}}
+		if got := verificationLive(v); got != tc.want {
+			t.Errorf("%s: verificationLive = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 

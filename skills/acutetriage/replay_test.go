@@ -373,6 +373,26 @@ func TestReplayIncident_NoLiveZabbixCall(t *testing.T) {
 	}
 }
 
+func TestSnapshotKey_ZabbixKindsMatchOnHosts(t *testing.T) {
+	frozen := VerificationQuery{Kind: kindZabbixReachability,
+		Params:  map[string]any{"hosts": []any{"db-01", "web-01"}}, // post-JSON shape
+		Outcome: OutcomeFetched, Result: "db-01 reachable (1 interface); not in maintenance"}
+	exec := newSnapshotExecutor([]VerificationQuery{frozen})
+	live := VerificationQuery{Kind: kindZabbixReachability,
+		Params: map[string]any{"hosts": []string{"db-01", "web-01"}}} // live Go shape
+	exec.execute(context.Background(), &live)
+	if live.Outcome != OutcomeFetched || live.Result != frozen.Result {
+		t.Fatalf("snapshot miss: outcome=%s result=%q", live.Outcome, live.Result)
+	}
+	// Different host set → miss → the existing no-data path.
+	other := VerificationQuery{Kind: kindZabbixReachability,
+		Params: map[string]any{"hosts": []string{"cache-01"}}}
+	exec.execute(context.Background(), &other)
+	if other.Result != "no data (replay)" {
+		t.Fatalf("expected replay miss, got %q", other.Result)
+	}
+}
+
 func TestReplayIncident_NoFindingErrors(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, ":memory:")
