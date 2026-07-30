@@ -272,3 +272,186 @@ func severitiesFrom(min string) []int {
 	}
 	return out
 }
+
+// TriggerContext reads the operator knowledge baked into a trigger.
+func (c *Client) TriggerContext(ctx context.Context, triggerID string) (Operator, error) {
+	var rows []struct {
+		Description  string `json:"description"` // trigger NAME
+		Comments     string `json:"comments"`     // runbook text
+		URL          string `json:"url"`
+		Expression   string `json:"expression"`
+		Priority     string `json:"priority"` // severity 0..5
+		Dependencies []struct {
+			TriggerID   string `json:"triggerid"`
+			Description string `json:"description"`
+		} `json:"dependencies"`
+		Tags []KV `json:"tags"`
+	}
+	err := c.call(ctx, "trigger.get", map[string]any{
+		"output":             []string{"description", "comments", "url", "expression", "priority"},
+		"triggerids":         triggerID,
+		"selectDependencies": []string{"triggerid", "description"},
+		"selectTags":         "extend",
+	}, true, &rows)
+	if err != nil {
+		return Operator{}, err
+	}
+	if len(rows) == 0 {
+		return Operator{}, fmt.Errorf("zabbix: no trigger %q", triggerID)
+	}
+	r := rows[0]
+	op := Operator{
+		TriggerName: r.Description, Runbook: r.Comments, URL: r.URL,
+		Expression: r.Expression, Severity: r.Priority, Tags: r.Tags,
+	}
+	for _, d := range r.Dependencies {
+		op.Dependencies = append(op.Dependencies, DepTrigger{TriggerID: d.TriggerID, Name: d.Description})
+	}
+	return op, nil
+}
+
+// suppressionRow is the selectSuppressionData shape.
+type suppressionRow struct {
+	MaintenanceID string `json:"maintenanceid"`
+	UserID        string `json:"userid"`
+	SuppressUntil string `json:"suppress_until"`
+}
+
+// ProblemContext reads a problem's detail, decoding ack history and suppression cause.
+func (c *Client) ProblemContext(ctx context.Context, eventID string) (ProblemDetail, error) {
+	var rows []struct {
+		Severity     string `json:"severity"`
+		Clock        string `json:"clock"`
+		RClock       string `json:"r_clock"`
+		OpData       string `json:"opdata"`
+		CauseEventID string `json:"cause_eventid"`
+		Tags         []KV   `json:"tags"`
+		Acknowledges []struct {
+			Clock    string `json:"clock"`
+			Message  string `json:"message"`
+			Action   string `json:"action"`
+			Username string `json:"username"`
+		} `json:"acknowledges"`
+		Suppression []suppressionRow `json:"suppression_data"`
+	}
+	err := c.call(ctx, "problem.get", map[string]any{
+		"output":                "extend",
+		"eventids":              eventID,
+		"selectTags":            "extend",
+		"selectAcknowledges":    "extend",
+		"selectSuppressionData": "extend",
+	}, true, &rows)
+	if err != nil {
+		return ProblemDetail{}, err
+	}
+	if len(rows) == 0 {
+		return ProblemDetail{}, fmt.Errorf("zabbix: no problem event %q", eventID)
+	}
+	r := rows[0]
+	pd := ProblemDetail{Severity: r.Severity, StartedAt: unixStr(r.Clock), Tags: r.Tags, OpData: r.OpData}
+	if r.CauseEventID != "" && r.CauseEventID != "0" {
+		pd.CauseEventID = r.CauseEventID
+	}
+	if r.RClock == "0" || r.RClock == "" {
+		pd.Ongoing = true
+	} else {
+		pd.DurationSecs = unixStr(r.RClock).Unix() - unixStr(r.Clock).Unix()
+	}
+	for _, a := range r.Acknowledges {
+		action, _ := strconv.Atoi(a.Action)
+		pd.Acknowledges = append(pd.Acknowledges, AckEntry{
+			At: unixStr(a.Clock), User: a.Username, Message: a.Message,
+			Acknowledged: action&ackActionAcknowledge != 0,
+		})
+	}
+	pd.Suppression = decodeSuppression(r.Suppression)
+	return pd, nil
+}
+
+func decodeSuppression(data []suppressionRow) Suppression {
+	for _, s := range data {
+		if s.MaintenanceID != "" && s.MaintenanceID != "0" {
+			return Suppression{Kind: "maintenance", Until: unixStr(s.SuppressUntil)}
+		}
+		if s.UserID != "" && s.UserID != "0" {
+			return Suppression{Kind: "manual", Until: unixStr(s.SuppressUntil)}
+		}
+	}
+	return Suppression{Kind: "none"}
+}
+
+// HostContext reads the CMDB/topology layer (selectHostGroups, not the
+// deprecated selectGroups; live maintenance from maintenance_status —
+// host-level `available` is gone in 7.0, reachability is per-interface).
+func (c *Client) HostContext(ctx context.Context, host string) (Topology, error) {
+	var rows []struct {
+		Name              string            `json:"name"`
+		Description       string            `json:"description"`
+		MaintenanceStatus string            `json:"maintenance_status"`
+		Inventory         flexInventory `json:"inventory"`
+		HostGroups        []struct {
+			Name string `json:"name"`
+		} `json:"hostgroups"`
+		ParentTemplates []struct {
+			Name string `json:"name"`
+		} `json:"parentTemplates"`
+		Interfaces []struct {
+			IP        string `json:"ip"`
+			DNS       string `json:"dns"`
+			Available string `json:"available"`
+			Error     string `json:"error"`
+		} `json:"interfaces"`
+	}
+	err := c.call(ctx, "host.get", map[string]any{
+		"output":                []string{"name", "description", "maintenance_status"},
+		"filter":                map[string][]string{"host": {host}},
+		"selectInventory":       inventoryFields,
+		"selectHostGroups":      []string{"name"},
+		"selectParentTemplates": []string{"name"},
+		"selectInterfaces":      []string{"ip", "dns", "available", "error"},
+	}, true, &rows)
+	if err != nil {
+		return Topology{}, err
+	}
+	if len(rows) == 0 {
+		return Topology{}, fmt.Errorf("zabbix: no host %q", host)
+	}
+	r := rows[0]
+	top := Topology{
+		VisibleName: r.Name, Description: r.Description,
+		MaintenanceActive: r.MaintenanceStatus == "1",
+		Inventory:         r.Inventory, // already the curated subset (selectInventory list)
+	}
+	for _, g := range r.HostGroups {
+		top.Groups = append(top.Groups, g.Name)
+	}
+	for _, t := range r.ParentTemplates {
+		top.Templates = append(top.Templates, t.Name)
+	}
+	for _, i := range r.Interfaces {
+		addr := i.IP
+		if addr == "" {
+			addr = i.DNS
+		}
+		top.Interfaces = append(top.Interfaces, IfaceState{Addr: addr, Available: i.Available, Error: i.Error})
+	}
+	return top, nil
+}
+
+// FlapCount counts trigger firings since `since` (event.get countOutput;
+// objectids is the plural array param).
+func (c *Client) FlapCount(ctx context.Context, triggerID string, since time.Time) (int, error) {
+	var count string
+	err := c.call(ctx, "event.get", map[string]any{
+		"countOutput": true,
+		"object":      0, // trigger
+		"source":      0, // trigger events
+		"objectids":   []string{triggerID},
+		"time_from":   since.Unix(),
+	}, true, &count)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := strconv.Atoi(count)
+	return n, nil
+}
