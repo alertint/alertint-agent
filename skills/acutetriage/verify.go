@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/store"
+	"github.com/alertint/alertint-agent/internal/zabbix"
 )
 
 // VerificationParams carries the skill-side tunables (from config Task 1).
@@ -270,6 +271,24 @@ const defaultWindowMinutes = 60
 // FetchMetrics already relies on — rather than adding rebalancing logic here.
 const minPerQueryTimeout = 2 * time.Second
 
+// zabbixMultiRPCWeight is the budget-slice weight for the two Zabbix floor
+// kinds: on a cache miss they can issue up to 3 sequential Zabbix RPCs
+// (HostContext + HostGroups + GroupOpenProblems), unlike every other query
+// kind's single RPC or RPC pair, which gets weight 1.
+const zabbixMultiRPCWeight = 3
+
+// queryWeight is runVerificationWith's per-query share of the round's
+// timeout budget, relative to every other query in the round — see
+// zabbixMultiRPCWeight.
+func queryWeight(kind string) int {
+	switch kind {
+	case kindZabbixReachability, kindZabbixNeighborProblems:
+		return zabbixMultiRPCWeight
+	default:
+		return 1
+	}
+}
+
 // queryExecutor abstracts "run one verification query, fill Outcome/Result in
 // place". liveExecutor is production; snapshotExecutor is the hermetic replay
 // seam (ADR-0021 pipeline, frozen data).
@@ -311,16 +330,22 @@ func (e *liveExecutor) execute(ctx context.Context, q *VerificationQuery) {
 // Outcome/Result, it never aborts the round or the ones after it.
 //
 // The pipeline (verifyAndRejudge) passes the real skill logger; the runner tests
-// pass nil (defaulted to slog.Default below).
+// pass nil (defaulted to slog.Default below). zabbixSeed pre-populates the
+// round's zabbixVerifier cache from chunk-02's FetchZabbixContext fetch
+// (analysisResult.zabbixSeed) — the pipeline's only caller; runner tests pass
+// nil and pay the normal live-fetch cost.
 func runVerification(ctx context.Context, prom metricQuerier, zbx ZabbixReader, state verifyStateReader,
 	params VerificationParams, inc store.Incident, floor []VerificationQuery,
 	draft DraftRef, operatorQueries, modelQueries []VerificationQuery, now time.Time, logger *slog.Logger,
+	zabbixSeed map[string]zabbix.Topology,
 ) *VerificationRound {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	zv := newZabbixVerifier(zbx, logger, inc.ID)
+	zv.seedHostContext(zabbixSeed)
 	exec := &liveExecutor{prom: prom, state: state, inc: inc, now: now, maxSeries: params.MaxSeries,
-		logger: logger, zv: newZabbixVerifier(zbx, logger, inc.ID)}
+		logger: logger, zv: zv}
 	return runVerificationWith(ctx, exec, params, floor, draft, operatorQueries, modelQueries, now)
 }
 
@@ -358,13 +383,24 @@ func runVerificationWith(ctx context.Context, exec queryExecutor, params Verific
 	budget := time.Duration(params.QueryTimeoutSeconds) * time.Second
 	queryPhaseCtx, phaseCancel := context.WithTimeout(ctx, budget)
 	defer phaseCancel()
-	perQuery := budget / time.Duration(len(queries))
-	if perQuery < minPerQueryTimeout {
-		perQuery = minPerQueryTimeout
+
+	// Slices are weighted, not split evenly: the Zabbix floor kinds can issue
+	// up to 3 sequential RPCs on a cache miss (HostContext + HostGroups +
+	// GroupOpenProblems) versus one RPC pair for everything else, so an equal
+	// split would squeeze a legitimately slower query into the same share as
+	// a single aggregate query and misreport it as degraded/timed-out under
+	// load that Zabbix itself, not the query shape, caused.
+	totalWeight := 0
+	for i := range queries {
+		totalWeight += queryWeight(queries[i].Kind)
 	}
 
 	for i := range queries {
-		qCtx, cancel := context.WithTimeout(queryPhaseCtx, perQuery)
+		slice := budget * time.Duration(queryWeight(queries[i].Kind)) / time.Duration(totalWeight)
+		if slice < minPerQueryTimeout {
+			slice = minPerQueryTimeout
+		}
+		qCtx, cancel := context.WithTimeout(queryPhaseCtx, slice)
 		exec.execute(qCtx, &queries[i])
 		cancel()
 	}
@@ -493,20 +529,27 @@ func runPromQL(ctx context.Context, prom metricQuerier, q *VerificationQuery, ma
 	q.Result = capText(flattenRecalled(strings.Join(lines, "; ")), 400)
 }
 
-// classifyErr maps a single query error to its Outcome/Result: a
-// context.DeadlineExceeded is this query's own per-slice timeout (backend
-// reachable but too slow to answer within its share of the budget) —
-// OutcomeDegraded, distinct from a genuine failure, mirroring the 0.7.3
-// slow-is-not-down distinction in FetchMetrics/classify. Any other error is a
-// hard failure — OutcomeFailed.
+// isHardErr reports whether err is more than a mere timeout — the shared
+// "hard error beats timeout" classification every partial-failure path in
+// this package uses (classifyErr, classifyPairErrs, zabbixVerifier's
+// runReachability): a context.DeadlineExceeded is this query's own per-slice
+// timeout (backend reachable but too slow to answer within its share of the
+// budget), distinct from a genuine failure.
+func isHardErr(err error) bool {
+	return err != nil && !errors.Is(err, context.DeadlineExceeded)
+}
+
+// classifyErr maps a single query error to its Outcome/Result: a timeout is
+// OutcomeDegraded (mirroring the 0.7.3 slow-is-not-down distinction in
+// FetchMetrics/classify); any other error is OutcomeFailed.
 func classifyErr(q *VerificationQuery, err error) {
-	if errors.Is(err, context.DeadlineExceeded) {
-		q.Outcome = OutcomeDegraded
-		q.Result = renderUnavailable("timed out")
+	if isHardErr(err) {
+		q.Outcome = OutcomeFailed
+		q.Result = renderUnavailable("failed")
 		return
 	}
-	q.Outcome = OutcomeFailed
-	q.Result = renderUnavailable("failed")
+	q.Outcome = OutcomeDegraded
+	q.Result = renderUnavailable("timed out")
 }
 
 // classifyPairErrs is classifyErr for up_ratio's two sub-queries sharing one
@@ -514,9 +557,7 @@ func classifyErr(q *VerificationQuery, err error) {
 // the other (the more actionable outage — same precedent as FetchMetrics'
 // anyHardErr/anyTimeout: "hard error beats timeout").
 func classifyPairErrs(q *VerificationQuery, sumErr, countErr error) {
-	hardErr := (sumErr != nil && !errors.Is(sumErr, context.DeadlineExceeded)) ||
-		(countErr != nil && !errors.Is(countErr, context.DeadlineExceeded))
-	if hardErr {
+	if isHardErr(sumErr) || isHardErr(countErr) {
 		q.Outcome = OutcomeFailed
 		q.Result = renderUnavailable("failed")
 		return
@@ -639,7 +680,7 @@ func floorFetched(r *VerificationRound) bool {
 		if q.Source != "floor" {
 			continue
 		}
-		if q.Kind != kindIncidentsInWindow {
+		if isRealFloorSource(q) {
 			sawRealSource = true
 		}
 		if q.Outcome != OutcomeFetched && q.Outcome != OutcomeEmpty {
@@ -647,6 +688,15 @@ func floorFetched(r *VerificationRound) bool {
 		}
 	}
 	return sawRealSource
+}
+
+// isRealFloorSource reports whether q is a floor query backed by a real
+// external observation rather than kindIncidentsInWindow (this install's own
+// SQLite bookkeeping) — the one predicate floorFetched and anyUnfetched both
+// need and must agree on, shared here so a future floor source only needs
+// this single definition updated to stay in sync across both R15 rails.
+func isRealFloorSource(q VerificationQuery) bool {
+	return q.Source == "floor" && q.Kind != kindIncidentsInWindow
 }
 
 // anyUnfetched is the second R15 rail, backing the confidence clamp: any
@@ -674,7 +724,7 @@ func anyUnfetched(r *VerificationRound) bool {
 		if q.Outcome == OutcomeFailed || q.Outcome == OutcomeDegraded {
 			return true
 		}
-		if q.Source == "floor" && q.Kind != kindIncidentsInWindow {
+		if isRealFloorSource(q) {
 			sawRealFloorSource = true
 		}
 	}
@@ -690,17 +740,22 @@ func anyUnfetched(r *VerificationRound) bool {
 // it is this install's own SQLite bookkeeping. An install with no floor
 // source configured therefore never trips this, leaving the 0.6-cap
 // behavior untouched.
+//
+// The check is Kind != kindIncidentsInWindow rather than an explicit
+// allowlist of the other kinds by name, so a future floor source's new kind
+// counts automatically instead of requiring this switch to be remembered and
+// extended — the same generalization floorFetched/anyUnfetched already use
+// via isRealFloorSource (this predicate also covers a model-proposed
+// kindPromQL query, which isRealFloorSource's Source=="floor" check would
+// exclude, so it stays its own definition rather than reusing that one).
 func verificationLive(v *VerificationEnrichment) bool {
 	if v == nil {
 		return false
 	}
 	for _, round := range v.Rounds {
 		for _, q := range round.Queries {
-			switch q.Kind {
-			case kindUpRatio, kindPromQL, kindZabbixReachability, kindZabbixNeighborProblems:
-				if q.Outcome == OutcomeFetched {
-					return true
-				}
+			if q.Kind != kindIncidentsInWindow && q.Outcome == OutcomeFetched {
+				return true
 			}
 		}
 	}

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/store"
+	"github.com/alertint/alertint-agent/internal/zabbix"
 )
 
 func alertWithLabels(labels map[string]string) store.Alert {
@@ -254,7 +255,7 @@ func TestRunVerificationHealthyPeers(t *testing.T) {
 	r := runVerification(context.Background(), prom, nil, fakeState{total: 0},
 		params,
 		store.Incident{ID: "inc1", GroupKey: "db|stolon"}, composeFloor(params, "host", alerts),
-		DraftRef{RootCause: "regional partition", Confidence: 0.95}, nil, model, time.Now().UTC(), nil)
+		DraftRef{RootCause: "regional partition", Confidence: 0.95}, nil, model, time.Now().UTC(), nil, nil)
 
 	if len(r.Queries) != 3 { // 2 floor + 1 model
 		t.Fatalf("want 3 queries, got %d", len(r.Queries))
@@ -291,7 +292,7 @@ func TestRunVerificationPartialFailure(t *testing.T) {
 	r := runVerification(context.Background(), prom, nil, fakeState{total: 0},
 		params,
 		store.Incident{ID: "inc1", GroupKey: "db|stolon"}, composeFloor(params, "host", alerts),
-		DraftRef{RootCause: "x", Confidence: 0.8}, nil, model, time.Now().UTC(), nil)
+		DraftRef{RootCause: "x", Confidence: 0.8}, nil, model, time.Now().UTC(), nil, nil)
 
 	if len(r.Queries) != 3 {
 		t.Fatalf("want 3 queries, got %d", len(r.Queries))
@@ -322,7 +323,7 @@ func TestRunVerificationPromDown(t *testing.T) {
 		fakeState{total: 1, top: []store.WindowIncident{{GroupKey: "a|b", Status: "analyzed", Severity: "warning", AlertCount: 1}}},
 		params,
 		store.Incident{ID: "inc1", GroupKey: "db|stolon"}, composeFloor(params, "host", alerts),
-		DraftRef{RootCause: "x", Confidence: 0.8}, nil, nil, time.Now().UTC(), nil)
+		DraftRef{RootCause: "x", Confidence: 0.8}, nil, nil, time.Now().UTC(), nil, nil)
 
 	if len(r.Queries) != 2 { // floor only, no model queries proposed
 		t.Fatalf("want 2 queries, got %d", len(r.Queries))
@@ -351,7 +352,7 @@ func TestRunVerificationNilProm(t *testing.T) {
 	r := runVerification(context.Background(), nil, nil, fakeState{total: 0},
 		params,
 		store.Incident{ID: "inc1", GroupKey: "db|stolon"}, composeFloor(params, "host", alerts),
-		DraftRef{RootCause: "x", Confidence: 0.8}, nil, nil, time.Now().UTC(), nil)
+		DraftRef{RootCause: "x", Confidence: 0.8}, nil, nil, time.Now().UTC(), nil, nil)
 
 	upRatio := r.Queries[0]
 	if upRatio.Outcome != OutcomeFailed || !strings.Contains(upRatio.Result, "prometheus not configured") {
@@ -362,6 +363,31 @@ func TestRunVerificationNilProm(t *testing.T) {
 	}
 	if floorFetched(r) {
 		t.Fatal("nil prom must fail the floor (up_ratio never fetched)")
+	}
+}
+
+// TestRunVerification_ZabbixSeedAvoidsRedundantFetch proves runVerification's
+// zabbixSeed parameter (analysisResult.zabbixSeed, from chunk-02's
+// FetchZabbixContext) actually reaches the round's zabbixVerifier: a seeded
+// host's reachability check must serve the seed, never call the live reader.
+func TestRunVerification_ZabbixSeedAvoidsRedundantFetch(t *testing.T) {
+	z := &scriptedZabbixReader{hostCtx: func(string) (zabbix.Topology, error) {
+		t.Fatal("seeded host must not hit the live ZabbixReader")
+		return zabbix.Topology{}, nil
+	}}
+	floor := []VerificationQuery{{Kind: kindZabbixReachability, Source: "floor",
+		Params: map[string]any{"hosts": []string{"db-01"}, "hosts_total": float64(1)}}}
+	params := VerificationParams{Enabled: true, MaxQueries: 4, QueryTimeoutSeconds: 10, HasZabbix: true}
+	seed := map[string]zabbix.Topology{
+		"db-01": {Interfaces: []zabbix.IfaceState{{Addr: "a", Available: "1"}}},
+	}
+	r := runVerification(context.Background(), nil, z, fakeState{total: 0},
+		params,
+		store.Incident{ID: "inc1", GroupKey: "db|stolon"}, floor,
+		DraftRef{RootCause: "x", Confidence: 0.8}, nil, nil, time.Now().UTC(), nil, seed)
+
+	if r.Queries[0].Outcome != OutcomeFetched {
+		t.Fatalf("zabbix_reachability outcome = %q, want fetched from the seed", r.Queries[0].Outcome)
 	}
 }
 

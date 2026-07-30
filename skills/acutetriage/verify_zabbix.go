@@ -179,6 +179,17 @@ func newZabbixVerifier(zbx ZabbixReader, logger *slog.Logger, incID string) *zab
 	return &zabbixVerifier{zbx: zbx, logger: logger, incID: incID, cache: map[string]hostCtxResult{}}
 }
 
+// seedHostContext pre-populates the per-round HostContext cache from a
+// same-invocation fetch that already ran (chunk-02's FetchZabbixContext,
+// which resolves moments earlier in the same triage pipeline call) — avoids
+// a redundant host.get for a host the pipeline already fetched, without
+// risking staleness across any meaningfully separated calls.
+func (zv *zabbixVerifier) seedHostContext(seed map[string]zabbix.Topology) {
+	for host, top := range seed {
+		zv.cache[host] = hostCtxResult{top: top}
+	}
+}
+
 func (zv *zabbixVerifier) hostContext(ctx context.Context, host string) hostCtxResult {
 	if r, ok := zv.cache[host]; ok {
 		return r
@@ -208,14 +219,15 @@ func (zv *zabbixVerifier) runReachability(ctx context.Context, q *VerificationQu
 	for _, h := range hosts {
 		r := zv.hostContext(ctx, h)
 		if r.err != nil {
+			if isHardErr(r.err) {
+				hardErr = true
+			}
 			switch {
 			case errors.Is(r.err, zabbix.ErrNotFound):
-				hardErr = true
 				lines = append(lines, h+": no host matching")
 			case errors.Is(r.err, context.DeadlineExceeded):
 				lines = append(lines, h+": timed out")
 			default:
-				hardErr = true
 				lines = append(lines, h+": lookup failed")
 			}
 			zv.logger.Warn("acutetriage: verify: zabbix reachability lookup failed",
@@ -292,10 +304,10 @@ func (zv *zabbixVerifier) runNeighborProblems(ctx context.Context, q *Verificati
 	}
 	hosts := hostsFromParams(q.Params)
 
-	// Scope: union of resolved hosts' groups. hostContext hits Task 4's memo
-	// for every host reachability already resolved — no second RPC per host.
-	groupSet := map[string]bool{}
-	hostGroups := map[string][]string{} // host → its group names (peer accounting)
+	// Scope: resolved hosts' own groups (peer accounting). hostContext hits
+	// Task 4's memo for every host reachability already resolved — no second
+	// RPC per host.
+	hostGroups := map[string][]string{} // host → its group names
 	resolved := 0
 	for _, h := range hosts {
 		r := zv.hostContext(ctx, h)
@@ -304,11 +316,21 @@ func (zv *zabbixVerifier) runNeighborProblems(ctx context.Context, q *Verificati
 		}
 		resolved++
 		hostGroups[h] = r.top.Groups
-		for _, g := range r.top.Groups {
+	}
+	if resolved == 0 {
+		q.Outcome = OutcomeFailed
+		q.Result = renderUnavailable("scope unresolvable")
+		return
+	}
+	// groupSet is derived from hostGroups, never populated independently —
+	// the two must never disagree on which groups exist.
+	groupSet := map[string]bool{}
+	for _, groups := range hostGroups {
+		for _, g := range groups {
 			groupSet[g] = true
 		}
 	}
-	if resolved == 0 || len(groupSet) == 0 {
+	if len(groupSet) == 0 {
 		q.Outcome = OutcomeFailed
 		q.Result = renderUnavailable("scope unresolvable")
 		return
@@ -345,8 +367,11 @@ func (zv *zabbixVerifier) runNeighborProblems(ctx context.Context, q *Verificati
 	}
 
 	// Peer count: scope hosts minus the checked hosts that sit inside the
-	// chosen scope (spec G3 — an approximation that is deterministic and
-	// errs by at most the capped host count).
+	// chosen scope. scopeHosts sums each chosen group's own size — exact with
+	// one chosen group (no overlap is possible), an upper bound with two or
+	// more (Zabbix host-group membership isn't exclusive, so shared hosts get
+	// counted once per group they're in — renderScopeLine reflects this via
+	// exact/approximate rendering).
 	chosenNames := map[string]bool{}
 	ids := make([]string, 0, len(chosen))
 	for _, c := range chosen {
@@ -414,11 +439,18 @@ func (zv *zabbixVerifier) runNeighborProblems(ctx context.Context, q *Verificati
 
 // renderScopeLine names the chosen groups and the peer count — the scope the
 // re-judge is told was actually searched (ADR-0024's floor arm needs the
-// scope named for its empty to be a confirmed absence).
+// scope named for its empty to be a confirmed absence). Host-group membership
+// isn't exclusive in Zabbix, so a peer count summed across two or more chosen
+// groups can double-count a host tagged into several of them; with exactly
+// one chosen group the count is exact (no overlap is possible), so only the
+// multi-group case is qualified as an upper bound — never false precision.
 func renderScopeLine(chosen []zabbix.HostGroupInfo, peers int) string {
 	names := make([]string, 0, len(chosen))
 	for _, c := range chosen {
 		names = append(names, c.Name)
+	}
+	if len(chosen) > 1 {
+		return fmt.Sprintf("groups %s (up to %d peer hosts)", strings.Join(names, ", "), peers)
 	}
 	return fmt.Sprintf("groups %s (%d peer hosts)", strings.Join(names, ", "), peers)
 }

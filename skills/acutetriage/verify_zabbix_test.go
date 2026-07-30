@@ -225,6 +225,45 @@ func TestHostContext_MemoizedAcrossQueries(t *testing.T) {
 	}
 }
 
+// TestSeedHostContext_AvoidsRedundantFetch proves a pre-seeded host never
+// hits the live ZabbixReader: chunk-02's FetchZabbixContext already resolved
+// this host moments earlier in the same triage invocation, so the round must
+// reuse it rather than paying a second host.get for it.
+func TestSeedHostContext_AvoidsRedundantFetch(t *testing.T) {
+	z := &scriptedZabbixReader{hostCtx: func(string) (zabbix.Topology, error) {
+		t.Fatal("floor must not re-fetch a seeded host")
+		return zabbix.Topology{}, nil
+	}}
+	zv := newZabbixVerifier(z, nil, "inc-1")
+	zv.seedHostContext(map[string]zabbix.Topology{
+		"db-01": {Interfaces: []zabbix.IfaceState{{Addr: "a", Available: "1"}}},
+	})
+	q := reachQuery([]string{"db-01"}, 1)
+	zv.runReachability(context.Background(), q)
+	if q.Outcome != OutcomeFetched {
+		t.Fatalf("outcome = %s, want fetched from the seeded cache", q.Outcome)
+	}
+}
+
+// TestSeedHostContext_UnseededHostStillFetchesLive proves the seed is
+// additive, not a substitute for the live path: a host absent from the seed
+// (e.g. a multi-host incident where FetchZabbixContext only resolved the
+// first-seen host) still fetches normally.
+func TestSeedHostContext_UnseededHostStillFetchesLive(t *testing.T) {
+	var calls []string
+	z := &scriptedZabbixReader{hostCtx: func(host string) (zabbix.Topology, error) {
+		calls = append(calls, host)
+		return zabbix.Topology{Interfaces: []zabbix.IfaceState{{Addr: "a", Available: "1"}}}, nil
+	}}
+	zv := newZabbixVerifier(z, nil, "inc-1")
+	zv.seedHostContext(map[string]zabbix.Topology{"db-01": {}})
+	q := reachQuery([]string{"web-01"}, 1)
+	zv.runReachability(context.Background(), q)
+	if !reflect.DeepEqual(calls, []string{"web-01"}) {
+		t.Fatalf("hostCtx calls = %v, want [web-01]", calls)
+	}
+}
+
 // -- zabbixVerifier: runNeighborProblems -------------------------------------
 
 func neighborQuery(hosts []string, excludeIDs []string) *VerificationQuery {
@@ -271,7 +310,9 @@ func TestNeighborProblems_SmallestGroupsFirstDropsCatchalls(t *testing.T) {
 	if !reflect.DeepEqual(gotGroupIDs, []string{"1", "2"}) {
 		t.Fatalf("groupids = %v, want [1 2]", gotGroupIDs)
 	}
-	want := "2 open problems in groups Databases, Virtual machines (33 peer hosts): " +
+	// Two chosen groups: Zabbix host-group membership isn't exclusive, so the
+	// peer count is qualified as an upper bound rather than claimed exact.
+	want := "2 open problems in groups Databases, Virtual machines (up to 33 peer hosts): " +
 		"sev 4 Disk full on db-02; sev 2 Backup slow (suppressed); " +
 		"not scoped: Linux servers (77), Applications (113)"
 	if q.Result != want {
