@@ -652,17 +652,33 @@ func floorFetched(r *VerificationRound) bool {
 // anyUnfetched is the second R15 rail, backing the confidence clamp: any
 // query — floor OR model — that failed or degraded. An empty result still
 // counts as fetched here ("asked, nothing there" is itself an answer), so
-// only OutcomeFailed/OutcomeDegraded trip it.
+// only OutcomeFailed/OutcomeDegraded trip it directly.
+//
+// It also trips symmetrically with floorFetched's zero-real-backend fix: a
+// round whose only floor member is kindIncidentsInWindow (this install's own
+// SQLite bookkeeping, never a real observation) never fails or degrades — it
+// unconditionally fetches — so without this second condition, a zero-backend
+// install (no Prometheus, no Zabbix — or Zabbix configured but the incident
+// lacking host identity) would report anyUnfetched == false even though
+// nothing external was ever checked. That would silently disable the R15
+// clamp on exactly the installs where it matters most: those with OTHER live
+// evidence sources configured (e.g. Sentry, GitHub) where the 0.6
+// metadata-only cap does not apply, leaving the clamp as the only thing
+// stopping a re-judge from inflating confidence on zero verification.
 func anyUnfetched(r *VerificationRound) bool {
 	if r == nil {
 		return false
 	}
+	sawRealFloorSource := false
 	for _, q := range r.Queries {
 		if q.Outcome == OutcomeFailed || q.Outcome == OutcomeDegraded {
 			return true
 		}
+		if q.Source == "floor" && q.Kind != kindIncidentsInWindow {
+			sawRealFloorSource = true
+		}
 	}
-	return false
+	return !sawRealFloorSource
 }
 
 // verificationLive is the R17 cap-interaction predicate: whether any

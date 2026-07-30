@@ -412,6 +412,20 @@ func TestFloorFetchedZeroBackendNeverClears(t *testing.T) {
 	}
 }
 
+// The same zero-backend shape must also trip anyUnfetched — extending R15's
+// clamp rail symmetrically with floorFetched's fix above. Without this, a
+// zero-real-backend round (nothing failed or degraded, because nothing real
+// was even asked) would report anyUnfetched == false, silently disabling the
+// confidence clamp on an install where nothing was actually verified.
+func TestAnyUnfetched_IncidentsInWindowOnlyCountsAsUnfetched(t *testing.T) {
+	r := &VerificationRound{Queries: []VerificationQuery{
+		{Source: "floor", Kind: kindIncidentsInWindow, Outcome: OutcomeFetched},
+	}}
+	if !anyUnfetched(r) {
+		t.Fatal("incidents_in_window alone (no real backend contributed) must count as unfetched for the clamp")
+	}
+}
+
 func TestVerificationLive(t *testing.T) {
 	if verificationLive(nil) {
 		t.Fatal("nil enrichment must not be live")
