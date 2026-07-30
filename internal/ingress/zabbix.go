@@ -5,6 +5,7 @@ package ingress
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -49,7 +50,7 @@ type ZabbixTag struct {
 func ParseZabbix(body []byte) (ZabbixEvent, error) {
 	var ev ZabbixEvent
 	if err := json.Unmarshal(body, &ev); err != nil {
-		return ZabbixEvent{}, fmt.Errorf("invalid JSON: %w", err)
+		return ZabbixEvent{}, fmt.Errorf("zabbix: invalid JSON: %w", err)
 	}
 	if strings.TrimSpace(ev.EventID) == "" {
 		return ZabbixEvent{}, fmt.Errorf("zabbix: event_id is required")
@@ -109,7 +110,26 @@ func (r *zabbixReceiver) Ingest(ctx context.Context, body []byte) (Summary, erro
 		slog.String("status", ev.Status),
 		slog.String("host", ev.Host),
 	)
-	alert := r.toStoreAlert(ev)
+
+	// Preserve the firing row's original StartsAt across a later delivery for
+	// the same event_id (e.g. RESOLVED, or a retried PROBLEM): StartsAt is
+	// receipt-based only for the FIRST delivery, never rewritten by a later
+	// one, since UpsertAlertByFingerprint otherwise overwrites starts_at
+	// unconditionally on every upsert.
+	var existingStartsAt *time.Time
+	existing, err := r.store.GetAlertByFingerprint(ctx, "zabbix:"+ev.EventID)
+	switch {
+	case err == nil:
+		t := existing.StartsAt
+		existingStartsAt = &t
+	case errors.Is(err, store.ErrNotFound):
+		// First delivery for this event_id — StartsAt is this delivery's receipt time.
+	default:
+		r.logger.Warn("zabbix: lookup existing alert failed, treating as first delivery",
+			slog.String("err", err.Error()))
+	}
+
+	alert := r.toStoreAlert(ev, existingStartsAt)
 	stored, err := r.store.UpsertAlertByFingerprint(ctx, alert)
 	if err != nil {
 		// Persist failures are logged and swallowed: the host still answers 204
@@ -140,8 +160,12 @@ var canonicalZabbixSeverity = map[string]string{
 	"1": "information", "2": "warning", "3": "average", "4": "high", "5": "disaster",
 }
 
-func (r *zabbixReceiver) toStoreAlert(ev ZabbixEvent) store.Alert {
+func (r *zabbixReceiver) toStoreAlert(ev ZabbixEvent, existingStartsAt *time.Time) store.Alert {
 	now := r.now()
+	startsAt := now
+	if existingStartsAt != nil {
+		startsAt = *existingStartsAt
+	}
 
 	// Verbatim-first severity with nseverity fallback (ADR-0033): a name the
 	// shared ladder knows stays verbatim; an unknown name with a valid
@@ -162,14 +186,24 @@ func (r *zabbixReceiver) toStoreAlert(ev ZabbixEvent) store.Alert {
 		"severity":          sev,
 		"zabbix_trigger_id": ev.TriggerID,
 	}
+	coreKeys := make(map[string]bool, len(labels))
+	for k := range labels {
+		coreKeys[k] = true
+	}
 	for _, tag := range ev.Tags {
 		key := labelKeySanitiser.ReplaceAllString(tag.Tag, "_")
 		if key == "" {
 			continue
 		}
 		if _, taken := labels[key]; taken {
-			// Core identity labels win; a colliding tag is dropped, not merged.
-			r.logger.Debug("zabbix tag collides with core label, skipped", slog.String("tag", tag.Tag))
+			// The first writer of a key wins, whether it's a core identity
+			// label or an earlier tag in this same delivery; the second is
+			// dropped, not merged.
+			if coreKeys[key] {
+				r.logger.Debug("zabbix tag collides with core label, skipped", slog.String("tag", tag.Tag))
+			} else {
+				r.logger.Debug("zabbix tag collides with another tag, skipped", slog.String("tag", tag.Tag))
+			}
 			continue
 		}
 		labels[key] = tag.Value
@@ -196,7 +230,7 @@ func (r *zabbixReceiver) toStoreAlert(ev ZabbixEvent) store.Alert {
 		Fingerprint: "zabbix:" + ev.EventID,
 		Labels:      labels,
 		Annotations: annotations,
-		StartsAt:    now, // receipt-based by design — never parsed from clock (ADR-0031)
+		StartsAt:    startsAt, // receipt-based by design, preserved across later deliveries — never parsed from clock (ADR-0031)
 		ReceivedAt:  now,
 	}
 	if ev.Status == "RESOLVED" {

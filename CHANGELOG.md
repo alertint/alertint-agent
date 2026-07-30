@@ -18,7 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Default `correlator.group_labels` now includes `host` (was `cluster, namespace,
   service`). Installs whose alerts carry a `host` label will see new group keys
-  for those alerts after upgrade.
+  for those alerts after upgrade; set `correlator.group_labels` explicitly to the
+  old three-label list to keep pre-upgrade grouping.
+- The shared severity ladder (`internal/severity.Rank`) now recognizes Zabbix's
+  `information`/`average`/`disaster` names. A non-Zabbix install whose alerts
+  already carry a `severity` label matching one of these exact words will see
+  that label ranked instead of treated as unknown.
 
 ## [0.11.0] - 2026-07-29
 

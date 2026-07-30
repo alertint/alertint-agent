@@ -134,9 +134,6 @@ func TestZabbixReceiver_MapsProblemToFiringAlert(t *testing.T) {
 			t.Errorf("label %s: got %q want %q", k, a.Labels[k], v)
 		}
 	}
-	if _, collided := a.Labels["severity"]; !collided || a.Labels["severity"] == "evil" {
-		t.Error("a tag colliding with a core label must be skipped, core label wins")
-	}
 	wantAnn := map[string]string{
 		"trigger_name":    "Disk space is critically low",
 		"item_key":        "vfs.fs.size[/,pused]",
@@ -167,6 +164,12 @@ func TestZabbixReceiver_ResolvedDedupsOntoFiringRow(t *testing.T) {
 	if _, err := r.Ingest(context.Background(), problem); err != nil {
 		t.Fatal(err)
 	}
+	firing, err := st.GetAlertByFingerprint(context.Background(), "zabbix:77")
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalStartsAt := firing.StartsAt
+
 	if _, err := r.Ingest(context.Background(), resolved); err != nil {
 		t.Fatal(err)
 	}
@@ -176,6 +179,9 @@ func TestZabbixReceiver_ResolvedDedupsOntoFiringRow(t *testing.T) {
 	}
 	if got.Status != "resolved" || got.EndsAt == nil {
 		t.Fatalf("resolution must upsert onto the firing row: status=%q endsAt=%v", got.Status, got.EndsAt)
+	}
+	if !got.StartsAt.Equal(originalStartsAt) {
+		t.Errorf("StartsAt must be preserved from the firing delivery, got %v want %v", got.StartsAt, originalStartsAt)
 	}
 }
 
@@ -194,6 +200,40 @@ func TestZabbixReceiver_NSeverityFallbackForRenamedSeverity(t *testing.T) {
 	}
 	if a.Annotations["severity_display"] != "P1" {
 		t.Fatalf("operator's word must be preserved: %q", a.Annotations["severity_display"])
+	}
+}
+
+func TestZabbixReceiver_UnrecognizedSeverityWithNoNSeverityFallback(t *testing.T) {
+	st := newTestStore(t)
+	var sunk []store.Alert
+	sink := func(ctx context.Context, a store.Alert) error { sunk = append(sunk, a); return nil }
+	r := NewZabbixReceiver(st, "tok", sink, slog.Default())
+	body := []byte(`{"event_id":"99","status":"PROBLEM","severity":"Not classified","nseverity":"0","host":"h1","trigger_id":"5","trigger_name":"T"}`)
+	if _, err := r.Ingest(context.Background(), body); err != nil {
+		t.Fatal(err)
+	}
+	a := sunk[0]
+	if a.Labels["severity"] != "Not classified" {
+		t.Fatalf("an unrecognized name with no valid nseverity fallback must stay verbatim: got %q", a.Labels["severity"])
+	}
+	if _, ok := a.Annotations["severity_display"]; ok {
+		t.Error("severity_display must be absent when no nseverity fallback fired")
+	}
+}
+
+func TestZabbixReceiver_TagCollidesWithAnotherTag(t *testing.T) {
+	st := newTestStore(t)
+	var sunk []store.Alert
+	sink := func(ctx context.Context, a store.Alert) error { sunk = append(sunk, a); return nil }
+	r := NewZabbixReceiver(st, "tok", sink, slog.Default())
+	body := []byte(`{"event_id":"100","status":"PROBLEM","severity":"High","host":"h1","trigger_id":"5","trigger_name":"T",
+		"tags":[{"tag":"foo-bar","value":"first"},{"tag":"foo_bar","value":"second"}]}`)
+	if _, err := r.Ingest(context.Background(), body); err != nil {
+		t.Fatal(err)
+	}
+	a := sunk[0]
+	if a.Labels["foo_bar"] != "first" {
+		t.Fatalf("the first tag to claim a sanitised key must win over a later colliding tag: got %q", a.Labels["foo_bar"])
 	}
 }
 
