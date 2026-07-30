@@ -270,3 +270,163 @@ func renderHostReachability(host string, top zabbix.Topology) string {
 	}
 	return b.String()
 }
+
+// zabbixNeighborTopN is the render cap on listed problems (the
+// incidents_in_window top-5 precedent); the remainder folds into "+K more".
+const zabbixNeighborTopN = 5
+
+// runNeighborProblems fills q for kindZabbixNeighborProblems: open problems
+// across the checked hosts' host groups under smallest-groups-first scope
+// discipline (spec G3), own events subtracted by id, all severities
+// unfiltered, suppressed problems flagged. Vacuous scope (zero peer hosts)
+// renders inconclusive — ADR-0024's floor arm.
+func (zv *zabbixVerifier) runNeighborProblems(ctx context.Context, q *VerificationQuery) {
+	if zv.zbx == nil {
+		q.Outcome = OutcomeFailed
+		q.Result = renderUnavailable("zabbix not configured")
+		return
+	}
+	hosts := hostsFromParams(q.Params)
+
+	// Scope: union of resolved hosts' groups. hostContext hits Task 4's memo
+	// for every host reachability already resolved — no second RPC per host.
+	groupSet := map[string]bool{}
+	hostGroups := map[string][]string{} // host → its group names (peer accounting)
+	resolved := 0
+	for _, h := range hosts {
+		r := zv.hostContext(ctx, h)
+		if r.err != nil {
+			continue
+		}
+		resolved++
+		hostGroups[h] = r.top.Groups
+		for _, g := range r.top.Groups {
+			groupSet[g] = true
+		}
+	}
+	if resolved == 0 || len(groupSet) == 0 {
+		q.Outcome = OutcomeFailed
+		q.Result = renderUnavailable("scope unresolvable")
+		return
+	}
+	names := make([]string, 0, len(groupSet))
+	for g := range groupSet {
+		names = append(names, g)
+	}
+	sort.Strings(names)
+
+	infos, err := zv.zbx.HostGroups(ctx, names)
+	if err != nil {
+		zv.logger.Warn("acutetriage: verify: zabbix host-group lookup failed", "err", err, "incident", zv.incID)
+		classifyErr(q, err)
+		return
+	}
+
+	// Smallest-first accumulation: functional groups before catch-alls.
+	sort.Slice(infos, func(i, j int) bool {
+		if infos[i].Hosts != infos[j].Hosts {
+			return infos[i].Hosts < infos[j].Hosts
+		}
+		return infos[i].Name < infos[j].Name
+	})
+	var chosen, dropped []zabbix.HostGroupInfo
+	scopeHosts := 0
+	for _, info := range infos {
+		if len(chosen) > 0 && scopeHosts+info.Hosts > zabbixScopeMaxHosts {
+			dropped = append(dropped, info)
+			continue
+		}
+		chosen = append(chosen, info)
+		scopeHosts += info.Hosts
+	}
+
+	// Peer count: scope hosts minus the checked hosts that sit inside the
+	// chosen scope (spec G3 — an approximation that is deterministic and
+	// errs by at most the capped host count).
+	chosenNames := map[string]bool{}
+	ids := make([]string, 0, len(chosen))
+	for _, c := range chosen {
+		chosenNames[c.Name] = true
+		ids = append(ids, c.GroupID)
+	}
+	inScope := 0
+	for _, gs := range hostGroups {
+		for _, g := range gs {
+			if chosenNames[g] {
+				inScope++
+				break
+			}
+		}
+	}
+	peers := scopeHosts - inScope
+
+	probs, err := zv.zbx.GroupOpenProblems(ctx, ids, zabbix.ProblemSelector{})
+	if err != nil {
+		zv.logger.Warn("acutetriage: verify: zabbix group problems failed", "err", err, "incident", zv.incID)
+		classifyErr(q, err)
+		return
+	}
+	exclude := excludeEventIDsFromParams(q.Params)
+	kept := probs[:0]
+	for _, p := range probs {
+		if !exclude[p.EventID] {
+			kept = append(kept, p)
+		}
+	}
+
+	scopeLine := renderScopeLine(chosen, peers)
+	notScoped := renderNotScoped(dropped)
+	switch {
+	case len(kept) == 0 && peers <= 0:
+		q.Outcome = OutcomeEmpty
+		q.Result = capText(flattenRecalled(fmt.Sprintf(
+			"no peer hosts share %s's host groups — inconclusive", strings.Join(hosts, ", "))), 400)
+	case len(kept) == 0:
+		q.Outcome = OutcomeEmpty
+		q.Result = capText(flattenRecalled(fmt.Sprintf("0 open problems in %s%s", scopeLine, notScoped)), 400)
+	default:
+		q.Outcome = OutcomeFetched
+		top := kept
+		more := 0
+		if len(top) > zabbixNeighborTopN {
+			more = len(top) - zabbixNeighborTopN
+			top = top[:zabbixNeighborTopN]
+		}
+		parts := make([]string, 0, len(top))
+		for _, p := range top {
+			s := fmt.Sprintf("sev %s %s", p.Severity, p.Name)
+			if p.Suppressed {
+				s += " (suppressed)"
+			}
+			parts = append(parts, s)
+		}
+		line := fmt.Sprintf("%d open problems in %s: %s", len(kept), scopeLine, strings.Join(parts, "; "))
+		if more > 0 {
+			line += fmt.Sprintf("; +%d more", more)
+		}
+		q.Result = capText(flattenRecalled(line+notScoped), 400)
+	}
+}
+
+// renderScopeLine names the chosen groups and the peer count — the scope the
+// re-judge is told was actually searched (ADR-0024's floor arm needs the
+// scope named for its empty to be a confirmed absence).
+func renderScopeLine(chosen []zabbix.HostGroupInfo, peers int) string {
+	names := make([]string, 0, len(chosen))
+	for _, c := range chosen {
+		names = append(names, c.Name)
+	}
+	return fmt.Sprintf("groups %s (%d peer hosts)", strings.Join(names, ", "), peers)
+}
+
+// renderNotScoped names what scope discipline dropped — never a silent cap.
+func renderNotScoped(dropped []zabbix.HostGroupInfo) string {
+	if len(dropped) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(dropped))
+	for _, d := range dropped {
+		parts = append(parts, fmt.Sprintf("%s (%d)", d.Name, d.Hosts))
+	}
+	return "; not scoped: " + strings.Join(parts, ", ")
+}

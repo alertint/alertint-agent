@@ -220,3 +220,157 @@ func TestHostContext_MemoizedAcrossQueries(t *testing.T) {
 		t.Fatalf("HostContext called %d times, want 1 (memoized)", len(z.hostCtxCalls))
 	}
 }
+
+// -- zabbixVerifier: runNeighborProblems -------------------------------------
+
+func neighborQuery(hosts []string, excludeIDs []string) *VerificationQuery {
+	ex := make([]any, 0, len(excludeIDs))
+	for _, id := range excludeIDs {
+		ex = append(ex, id)
+	}
+	return &VerificationQuery{Kind: kindZabbixNeighborProblems, Source: "floor",
+		Params: map[string]any{"hosts": hosts, "hosts_total": float64(len(hosts)), "exclude_event_ids": ex}}
+}
+
+// The real operator sample from the grill: functional groups + catch-alls.
+func sampleGroups() []zabbix.HostGroupInfo {
+	return []zabbix.HostGroupInfo{
+		{GroupID: "1", Name: "Databases", Hosts: 17},
+		{GroupID: "2", Name: "Virtual machines", Hosts: 17},
+		{GroupID: "3", Name: "Linux servers", Hosts: 77},
+		{GroupID: "4", Name: "Applications", Hosts: 113},
+	}
+}
+
+func TestNeighborProblems_SmallestGroupsFirstDropsCatchalls(t *testing.T) {
+	var gotGroupIDs []string
+	z := &scriptedZabbixReader{
+		hostCtx: func(string) (zabbix.Topology, error) {
+			return zabbix.Topology{Groups: []string{"Databases", "Virtual machines", "Linux servers", "Applications"}}, nil
+		},
+		hostGroupsFn: func(names []string) ([]zabbix.HostGroupInfo, error) { return sampleGroups(), nil },
+		groupProbsFn: func(groupIDs []string) ([]zabbix.Problem, error) {
+			gotGroupIDs = groupIDs
+			return []zabbix.Problem{
+				{EventID: "900", Name: "Disk full on db-02", Severity: "4"},
+				{EventID: "901", Name: "Backup slow", Severity: "2", Suppressed: true},
+			}, nil
+		},
+	}
+	zv := newZabbixVerifier(z, nil, "inc-1")
+	q := neighborQuery([]string{"db-01"}, nil)
+	zv.runNeighborProblems(context.Background(), q)
+	if q.Outcome != OutcomeFetched {
+		t.Fatalf("outcome = %s, want fetched", q.Outcome)
+	}
+	// Databases(17) + Virtual machines(17) = 34 ≤ 50; Linux servers would hit 111 → dropped.
+	if !reflect.DeepEqual(gotGroupIDs, []string{"1", "2"}) {
+		t.Fatalf("groupids = %v, want [1 2]", gotGroupIDs)
+	}
+	want := "2 open problems in groups Databases, Virtual machines (33 peer hosts): " +
+		"sev 4 Disk full on db-02; sev 2 Backup slow (suppressed); " +
+		"not scoped: Linux servers (77), Applications (113)"
+	if q.Result != want {
+		t.Fatalf("result = %q\nwant     %q", q.Result, want)
+	}
+}
+
+func TestNeighborProblems_OwnEventsSubtracted(t *testing.T) {
+	z := &scriptedZabbixReader{
+		hostCtx: func(string) (zabbix.Topology, error) {
+			return zabbix.Topology{Groups: []string{"Databases"}}, nil
+		},
+		hostGroupsFn: func([]string) ([]zabbix.HostGroupInfo, error) {
+			return []zabbix.HostGroupInfo{{GroupID: "1", Name: "Databases", Hosts: 17}}, nil
+		},
+		groupProbsFn: func([]string) ([]zabbix.Problem, error) {
+			return []zabbix.Problem{
+				{EventID: "42", Name: "This very incident", Severity: "4"},
+				{EventID: "900", Name: "Neighbor problem", Severity: "3"},
+			}, nil
+		},
+	}
+	zv := newZabbixVerifier(z, nil, "inc-1")
+	q := neighborQuery([]string{"db-01"}, []string{"42"})
+	zv.runNeighborProblems(context.Background(), q)
+	want := "1 open problems in groups Databases (16 peer hosts): sev 3 Neighbor problem"
+	if q.Result != want {
+		t.Fatalf("result = %q\nwant     %q", q.Result, want)
+	}
+}
+
+func TestNeighborProblems_EmptyWithPeersIsWeighableEmpty(t *testing.T) {
+	z := &scriptedZabbixReader{
+		hostCtx: func(string) (zabbix.Topology, error) {
+			return zabbix.Topology{Groups: []string{"Databases"}}, nil
+		},
+		hostGroupsFn: func([]string) ([]zabbix.HostGroupInfo, error) {
+			return []zabbix.HostGroupInfo{{GroupID: "1", Name: "Databases", Hosts: 17}}, nil
+		},
+		groupProbsFn: func([]string) ([]zabbix.Problem, error) { return nil, nil },
+	}
+	zv := newZabbixVerifier(z, nil, "inc-1")
+	q := neighborQuery([]string{"db-01"}, nil)
+	zv.runNeighborProblems(context.Background(), q)
+	if q.Outcome != OutcomeEmpty {
+		t.Fatalf("outcome = %s, want empty", q.Outcome)
+	}
+	if q.Result != "0 open problems in groups Databases (16 peer hosts)" {
+		t.Fatalf("result = %q", q.Result)
+	}
+}
+
+func TestNeighborProblems_VacuousScopeRendersInconclusive(t *testing.T) {
+	z := &scriptedZabbixReader{
+		hostCtx: func(string) (zabbix.Topology, error) {
+			return zabbix.Topology{Groups: []string{"Zabbix servers"}}, nil
+		},
+		hostGroupsFn: func([]string) ([]zabbix.HostGroupInfo, error) {
+			return []zabbix.HostGroupInfo{{GroupID: "7", Name: "Zabbix servers", Hosts: 1}}, nil
+		},
+		groupProbsFn: func([]string) ([]zabbix.Problem, error) { return nil, nil },
+	}
+	zv := newZabbixVerifier(z, nil, "inc-1")
+	q := neighborQuery([]string{"zbx-01"}, nil)
+	zv.runNeighborProblems(context.Background(), q)
+	if q.Outcome != OutcomeEmpty {
+		t.Fatalf("outcome = %s, want empty", q.Outcome)
+	}
+	if q.Result != "no peer hosts share zbx-01's host groups — inconclusive" {
+		t.Fatalf("result = %q", q.Result)
+	}
+}
+
+func TestNeighborProblems_ScopeUnresolvable(t *testing.T) {
+	z := &scriptedZabbixReader{hostCtx: func(string) (zabbix.Topology, error) {
+		return zabbix.Topology{}, fmt.Errorf("boom")
+	}}
+	zv := newZabbixVerifier(z, nil, "inc-1")
+	q := neighborQuery([]string{"db-01"}, nil)
+	zv.runNeighborProblems(context.Background(), q)
+	if q.Outcome != OutcomeFailed {
+		t.Fatalf("outcome = %s, want failed", q.Outcome)
+	}
+	if q.Result != "unavailable (scope unresolvable)" {
+		t.Fatalf("result = %q", q.Result)
+	}
+}
+
+func TestNeighborProblems_AlwaysAtLeastOneGroup(t *testing.T) {
+	// Host only in a catch-all bigger than the cap: take it anyway.
+	z := &scriptedZabbixReader{
+		hostCtx: func(string) (zabbix.Topology, error) {
+			return zabbix.Topology{Groups: []string{"Applications"}}, nil
+		},
+		hostGroupsFn: func([]string) ([]zabbix.HostGroupInfo, error) {
+			return []zabbix.HostGroupInfo{{GroupID: "4", Name: "Applications", Hosts: 113}}, nil
+		},
+		groupProbsFn: func([]string) ([]zabbix.Problem, error) { return nil, nil },
+	}
+	zv := newZabbixVerifier(z, nil, "inc-1")
+	q := neighborQuery([]string{"app-01"}, nil)
+	zv.runNeighborProblems(context.Background(), q)
+	if q.Result != "0 open problems in groups Applications (112 peer hosts)" {
+		t.Fatalf("result = %q", q.Result)
+	}
+}
