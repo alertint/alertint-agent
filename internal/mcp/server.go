@@ -62,6 +62,12 @@ type Config struct {
 	// SentryLiveWindowMinutes is the default look-back for sentry_issues_list when
 	// start/end are omitted (config sentry.issues.live_window_minutes).
 	SentryLiveWindowMinutes int
+	// Zabbix is the read-only Zabbix client. nil = the two zabbix_* tools are
+	// not registered (presence-gated, ADR-0032).
+	Zabbix zabbixClient
+	// ZabbixDefaultRangeMinutes is zabbix_metric_history's default look-back
+	// when start is omitted (config's zabbix.api.default_range_minutes).
+	ZabbixDefaultRangeMinutes int
 	// MemoryLookbackDays is the recall horizon (config memory.lookback_days) used
 	// to compute the incident-detail memory block from the same memoryView the
 	// triage saw, so the operator's view cannot drift from the prompt (R26).
@@ -118,6 +124,12 @@ func NewServer(cfg Config, st *store.Store, auditor *audit.Auditor) *Server {
 	if s.cfg.Sentry != nil {
 		ms.AddTool(s.toolSentryIssuesList())
 		ms.AddTool(s.toolSentryIssuesTrace())
+	}
+
+	// Zabbix live read tools, registered only when the pull Source is configured.
+	if s.cfg.Zabbix != nil {
+		ms.AddTool(s.toolZabbixMetricHistory())
+		ms.AddTool(s.toolZabbixHostProblems())
 	}
 
 	// StreamableHTTPServer mounts internally at /mcp. Final client URL:
