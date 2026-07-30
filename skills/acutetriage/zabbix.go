@@ -275,16 +275,16 @@ func zabbixEntryCount(z *ZabbixContext) int {
 	return n
 }
 
-func capChars(s string, max int) string {
-	if len(s) <= max {
+func capChars(s string, maxLen int) string {
+	if len(s) <= maxLen {
 		return s
 	}
-	return s[:max]
+	return s[:maxLen]
 }
 
-func capDeps(d []zabbix.DepTrigger, max int) []zabbix.DepTrigger {
-	if len(d) <= max {
+func capDeps(d []zabbix.DepTrigger, maxLen int) []zabbix.DepTrigger {
+	if len(d) <= maxLen {
 		return d
 	}
-	return d[:max]
+	return d[:maxLen]
 }

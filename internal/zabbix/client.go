@@ -264,8 +264,8 @@ func unixStr(s string) time.Time {
 }
 
 // severitiesFrom returns the list of numeric severities >= min (0..5).
-func severitiesFrom(min string) []int {
-	lo, _ := strconv.Atoi(min)
+func severitiesFrom(minSev string) []int {
+	lo, _ := strconv.Atoi(minSev)
 	var out []int
 	for s := lo; s <= 5; s++ {
 		out = append(out, s)

@@ -528,33 +528,40 @@ func renderZabbix(b *strings.Builder, z *ZabbixContext) {
 			}
 		}
 	}
-	if z.Problem != nil {
-		p := z.Problem
-		if p.Ongoing {
-			b.WriteString("Problem: ongoing\n")
-		} else if p.DurationSecs > 0 {
-			fmt.Fprintf(b, "Problem: lasted %ds\n", p.DurationSecs)
-		}
-		if p.Suppression.Kind != "" && p.Suppression.Kind != "none" {
-			fmt.Fprintf(b, "Suppressed: %s until %s\n", p.Suppression.Kind, p.Suppression.Until.Format(time.RFC3339))
-		}
-		renderUntrustedText(b, "Operational data", p.OpData)
-		if len(p.Acknowledges) > 0 {
-			acks := append([]zabbix.AckEntry(nil), p.Acknowledges...)
-			sort.Slice(acks, func(i, j int) bool { return acks[i].At.After(acks[j].At) })
-			b.WriteString("Acknowledgements (newest first — who already knows):\n")
-			for _, a := range acks {
-				fmt.Fprintf(b, "- %s at %s", a.User, a.At.Format(time.RFC3339))
-				if a.Acknowledged {
-					b.WriteString(" [acknowledged]")
-				}
-				b.WriteString("\n")
-				renderUntrustedText(b, "  Message", a.Message)
-			}
-		}
-	}
+	renderZabbixProblem(b, z.Problem)
 	if z.Note != "" {
 		fmt.Fprintf(b, "Note: %s\n", z.Note)
+	}
+}
+
+// renderZabbixProblem renders class 3 — problem detail & human interaction —
+// split out of renderZabbix to keep that function's nesting flat.
+func renderZabbixProblem(b *strings.Builder, p *ZabbixProblemView) {
+	if p == nil {
+		return
+	}
+	if p.Ongoing {
+		b.WriteString("Problem: ongoing\n")
+	} else if p.DurationSecs > 0 {
+		fmt.Fprintf(b, "Problem: lasted %ds\n", p.DurationSecs)
+	}
+	if p.Suppression.Kind != "" && p.Suppression.Kind != "none" {
+		fmt.Fprintf(b, "Suppressed: %s until %s\n", p.Suppression.Kind, p.Suppression.Until.Format(time.RFC3339))
+	}
+	renderUntrustedText(b, "Operational data", p.OpData)
+	if len(p.Acknowledges) == 0 {
+		return
+	}
+	acks := append([]zabbix.AckEntry(nil), p.Acknowledges...)
+	sort.Slice(acks, func(i, j int) bool { return acks[i].At.After(acks[j].At) })
+	b.WriteString("Acknowledgements (newest first — who already knows):\n")
+	for _, a := range acks {
+		fmt.Fprintf(b, "- %s at %s", a.User, a.At.Format(time.RFC3339))
+		if a.Acknowledged {
+			b.WriteString(" [acknowledged]")
+		}
+		b.WriteString("\n")
+		renderUntrustedText(b, "  Message", a.Message)
 	}
 }
 
