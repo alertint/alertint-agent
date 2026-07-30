@@ -51,7 +51,7 @@ const userPromptKillSwitchGolden = "Analyze the following correlated incident.\n
 // UserPrompt BEFORE its signature/implementation changed for this task.
 func TestUserPromptKillSwitchByteIdentical(t *testing.T) {
 	m := strongRecallFixture()
-	got := UserPrompt(basePack(), "{}", nil, nil, nil, nil, m, VerificationParams{Enabled: false})
+	got := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil, m, VerificationParams{Enabled: false})
 	if got != userPromptKillSwitchGolden {
 		t.Fatalf("kill-switch output diverged from pre-feature golden:\n--- got ---\n%s\n--- want ---\n%s", got, userPromptKillSwitchGolden)
 	}
@@ -60,7 +60,7 @@ func TestUserPromptKillSwitchByteIdentical(t *testing.T) {
 // Enabled: instruction present, schema example includes both kinds, and the
 // scope-inflation MUST-verify line (R7) is present.
 func TestUserPromptVerificationInstruction(t *testing.T) {
-	got := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil, VerificationParams{Enabled: true, MaxQueries: 4})
+	got := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil, nil, VerificationParams{Enabled: true, MaxQueries: 4})
 	for _, want := range []string{`"verification"`, `"promql"`, `"incidents_in_window"`,
 		"MUST include", "disprove"} {
 		if !strings.Contains(got, want) {
@@ -74,7 +74,7 @@ func TestUserPromptVerificationInstruction(t *testing.T) {
 // N queries". Without it, a model following the text literally emits a bare
 // array and the plan degrades to floor-only (v0.8.0 production regression).
 func TestUserPromptVerificationInstructionShowsEnvelopeShape(t *testing.T) {
-	got := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil, VerificationParams{Enabled: true, MaxQueries: 4})
+	got := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil, nil, VerificationParams{Enabled: true, MaxQueries: 4})
 	if !strings.Contains(got, `"verification": {"queries": [`) {
 		t.Fatalf("instruction must show the exact envelope shape:\n%s", got)
 	}
@@ -83,7 +83,7 @@ func TestUserPromptVerificationInstructionShowsEnvelopeShape(t *testing.T) {
 // Disabled: no verification instruction at all — the kill switch must be
 // total, not just byte-identical for this one fixture.
 func TestUserPromptVerificationInstructionAbsentWhenDisabled(t *testing.T) {
-	got := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil, VerificationParams{Enabled: false})
+	got := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil, nil, VerificationParams{Enabled: false})
 	if strings.Contains(got, `"verification"`) {
 		t.Fatalf("verification instruction must not render when disabled:\n%s", got)
 	}
@@ -94,7 +94,7 @@ func TestUserPromptVerificationInstructionAbsentWhenDisabled(t *testing.T) {
 // expressions — and warns that a cross-family label join returns empty
 // regardless of ground truth (the f28da0d8 failure mode).
 func TestUserPromptVerificationInstructionQueryGuidance(t *testing.T) {
-	got := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil, VerificationParams{Enabled: true, MaxQueries: 4})
+	got := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil, nil, VerificationParams{Enabled: true, MaxQueries: 4})
 	for _, want := range []string{
 		"single-metric",
 		"reuse exact metric names and label keys",
@@ -109,7 +109,7 @@ func TestUserPromptVerificationInstructionQueryGuidance(t *testing.T) {
 // R16: with verification enabled, memory verdict request is NOT in call 1.
 func TestMemoryVerdictMovesToCallTwo(t *testing.T) {
 	m := strongRecallFixture()
-	c1 := UserPrompt(basePack(), "{}", nil, nil, nil, nil, m, VerificationParams{Enabled: true, MaxQueries: 4})
+	c1 := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil, m, VerificationParams{Enabled: true, MaxQueries: 4})
 	if strings.Contains(c1, `"memory_verdict"`) {
 		t.Fatal("verdict request must not render in call 1 when verification is enabled")
 	}
@@ -124,7 +124,7 @@ func TestMemoryVerdictMovesToCallTwo(t *testing.T) {
 // (unchanged behavior), matching the golden fixture above.
 func TestMemoryVerdictStaysInCallOneWhenVerificationDisabled(t *testing.T) {
 	m := strongRecallFixture()
-	c1 := UserPrompt(basePack(), "{}", nil, nil, nil, nil, m, VerificationParams{Enabled: false})
+	c1 := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil, m, VerificationParams{Enabled: false})
 	if !strings.Contains(c1, `"memory_verdict"`) {
 		t.Fatal("verdict request must stay in call 1 on the kill-switch path")
 	}

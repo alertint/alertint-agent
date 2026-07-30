@@ -332,7 +332,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	// evidence lifts the annotations-only basis just like live metrics/logs do
 	// (the call-1 prompt-side directive was rendered before the round existed, so
 	// it passed nil — only this deterministic post-call cap sees verification).
-	s.applyEvidenceCap(&resp, decision, ar.metrics, ar.logs, ar.changes, ar.sentry, ver, inc.ID)
+	s.applyEvidenceCap(&resp, decision, ar.metrics, ar.logs, ar.changes, ar.sentry, nil, ver, inc.ID)
 	s.applySteeringCap(&resp, governingOf(ar.memory), ver, inc.ID)
 
 	// Persist output, including the log-enrichment snapshot so the evidence pack
@@ -666,7 +666,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		// the render byte-identical. A no-op when disabled or there are no candidates.
 		s.maybeClassify(ctx, inc, memory)
 	}
-	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment, changes, sentry, memory, s.cfg.Verification)
+	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment, changes, sentry, nil, memory, s.cfg.Verification)
 	// On a re-judgment, prepend the deterministic recurrence context so the model
 	// judges the recurrence with its history rather than as a first-time event.
 	if recurrence != "" {
@@ -810,8 +810,8 @@ func marshalEnrichments(sources map[string]any, logger *slog.Logger, incidentID 
 // compliance. Short-circuit findings are exempt — they carry rule evidence, not
 // model judgment. The persisted output_json keeps the model's original number;
 // the incident row and every notification carry the capped one.
-func (s *Skill) applyEvidenceCap(resp *llmResponse, decision rules.Decision, metrics *MetricEnrichment, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, ver *VerificationEnrichment, incidentID string) {
-	if decision.ShortCircuit || !annotationsOnlyBasis(metrics, logs, changes, sentry, ver) ||
+func (s *Skill) applyEvidenceCap(resp *llmResponse, decision rules.Decision, metrics *MetricEnrichment, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, zabbix *ZabbixContext, ver *VerificationEnrichment, incidentID string) {
+	if decision.ShortCircuit || !annotationsOnlyBasis(metrics, logs, changes, sentry, zabbix, ver) ||
 		resp.Confidence <= MaxMetadataOnlyConfidence {
 		return
 	}
