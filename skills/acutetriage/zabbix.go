@@ -23,6 +23,8 @@ type ZabbixReader interface {
 	HostContext(ctx context.Context, host string) (zabbix.Topology, error)
 	FlapCount(ctx context.Context, triggerID string, since time.Time) (int, error)
 	OpenProblems(ctx context.Context, host string, sel zabbix.ProblemSelector) ([]zabbix.Problem, error)
+	HostGroups(ctx context.Context, names []string) ([]zabbix.HostGroupInfo, error)
+	GroupOpenProblems(ctx context.Context, groupIDs []string, sel zabbix.ProblemSelector) ([]zabbix.Problem, error)
 }
 
 // ZabbixParams carries the zabbix.api tunables the fetch needs.

@@ -313,6 +313,14 @@ func (p *poisonedZabbix) OpenProblems(context.Context, string, zabbix.ProblemSel
 	p.t.Fatal("replay must not call OpenProblems")
 	return nil, nil
 }
+func (p *poisonedZabbix) HostGroups(context.Context, []string) ([]zabbix.HostGroupInfo, error) {
+	p.t.Fatal("replay must not call HostGroups")
+	return nil, nil
+}
+func (p *poisonedZabbix) GroupOpenProblems(context.Context, []string, zabbix.ProblemSelector) ([]zabbix.Problem, error) {
+	p.t.Fatal("replay must not call GroupOpenProblems")
+	return nil, nil
+}
 
 func TestReplayIncident_NoLiveZabbixCall(t *testing.T) {
 	ctx := context.Background()

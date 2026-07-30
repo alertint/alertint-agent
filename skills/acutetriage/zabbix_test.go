@@ -25,6 +25,10 @@ type fakeZabbix struct {
 	flapErr     error
 	problems    []zabbix.Problem
 	problemsErr error
+	hostGroups     []zabbix.HostGroupInfo
+	hostGroupsErr  error
+	groupProblems  []zabbix.Problem
+	groupProblemsErr error
 	slow        time.Duration
 }
 
@@ -49,6 +53,12 @@ func (f *fakeZabbix) FlapCount(ctx context.Context, id string, since time.Time) 
 }
 func (f *fakeZabbix) OpenProblems(ctx context.Context, host string, sel zabbix.ProblemSelector) ([]zabbix.Problem, error) {
 	return f.problems, f.problemsErr
+}
+func (f *fakeZabbix) HostGroups(ctx context.Context, names []string) ([]zabbix.HostGroupInfo, error) {
+	return f.hostGroups, f.hostGroupsErr
+}
+func (f *fakeZabbix) GroupOpenProblems(ctx context.Context, groupIDs []string, sel zabbix.ProblemSelector) ([]zabbix.Problem, error) {
+	return f.groupProblems, f.groupProblemsErr
 }
 
 func zabbixOriginAlerts() []store.Alert {
