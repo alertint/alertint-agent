@@ -296,7 +296,10 @@ func (c *Client) HostGroups(ctx context.Context, names []string) ([]HostGroupInf
 	}
 	out := make([]HostGroupInfo, 0, len(rows))
 	for _, r := range rows {
-		n, _ := strconv.Atoi(r.Hosts)
+		n, err := strconv.Atoi(r.Hosts)
+		if err != nil {
+			return nil, fmt.Errorf("zabbix: hostgroup.get: parse host count for group %q: %w", r.Name, err)
+		}
 		out = append(out, HostGroupInfo{GroupID: r.GroupID, Name: r.Name, Hosts: n})
 	}
 	return out, nil

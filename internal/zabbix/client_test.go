@@ -229,6 +229,28 @@ func TestHostGroups_ResolvesNamesToIDsAndCounts(t *testing.T) {
 	}
 }
 
+// TestHostGroups_MalformedHostsCountReturnsError guards against a degraded or
+// proxied Zabbix response silently ranking a group as size 0 (the parse
+// error must surface, not be swallowed) — a size-0 group would jump the
+// queue in the neighbor check's smallest-first scope selection ahead of
+// legitimately small groups.
+func TestHostGroups_MalformedHostsCountReturnsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[
+			{"groupid":"4","name":"Databases","hosts":"not-a-number"}],"id":1}`))
+	}))
+	defer srv.Close()
+
+	c := zabbix.NewClient(zabbix.Config{BaseURL: srv.URL, APIToken: "t"})
+	infos, err := c.HostGroups(context.Background(), []string{"Databases"})
+	if err == nil {
+		t.Fatalf("HostGroups: want error on malformed host count, got infos = %+v", infos)
+	}
+	if !strings.Contains(err.Error(), "Databases") {
+		t.Fatalf("err = %v, want it to name the offending group", err)
+	}
+}
+
 func TestGroupOpenProblems_QueriesByGroupIDs(t *testing.T) {
 	var gotMethod string
 	var gotParams map[string]any
