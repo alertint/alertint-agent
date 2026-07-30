@@ -45,8 +45,12 @@ func TestFloorHosts_NoHostLabelMeansNone(t *testing.T) {
 // -- zabbixFloorQueries ------------------------------------------------------
 
 func TestZabbixFloorQueries_TwoFloorQueriesWithIdentityParams(t *testing.T) {
+	// zabbix_event_id lives in Annotations on a real receiver-shaped alert
+	// (internal/ingress/zabbix.go's setIfPresent), never Labels — this
+	// fixture must match that shape or it can't catch a regression to the
+	// wrong field.
 	alerts := []store.Alert{
-		alertWithLabels(map[string]string{"host": "db-01", "zabbix_event_id": "42"}),
+		{Labels: map[string]string{"host": "db-01"}, Annotations: map[string]string{"zabbix_event_id": "42"}},
 	}
 	qs := zabbixFloorQueries(alerts, "host")
 	if len(qs) != 2 {

@@ -85,7 +85,11 @@ func zabbixFloorQueries(alerts []store.Alert, hostLabel string) []VerificationQu
 	}
 	var eventIDs []string
 	for _, a := range alerts {
-		if id := alertLabel(a, "zabbix_event_id"); id != "" {
+		// zabbix_event_id is written into Annotations by the receiver
+		// (internal/ingress/zabbix.go's setIfPresent), never Labels — mirrors
+		// the existing FetchZabbixContext precedent (zabbix.go), no label
+		// fallback since nothing in this codebase writes it as a label.
+		if id := a.Annotations["zabbix_event_id"]; id != "" {
 			eventIDs = append(eventIDs, id)
 		}
 	}
