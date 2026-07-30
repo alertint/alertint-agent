@@ -685,7 +685,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		// the render byte-identical. A no-op when disabled or there are no candidates.
 		s.maybeClassify(ctx, inc, memory)
 	}
-	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment, changes, sentry, zbx, memory, s.cfg.Verification)
+	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment, changes, sentry, zbx, memory, s.verifyParams())
 	// On a re-judgment, prepend the deterministic recurrence context so the model
 	// judges the recurrence with its history rather than as a first-time event.
 	if recurrence != "" {
@@ -890,6 +890,16 @@ func (s *Skill) promQuerier() metricQuerier {
 	return mq
 }
 
+// verifyParams stamps the presence flags onto the configured verification
+// tunables: which floor sources exist on this install (ADR-0034) and hence
+// which query kinds the plan instruction may offer the model.
+func (s *Skill) verifyParams() VerificationParams {
+	vp := s.cfg.Verification
+	vp.HasPromQL = s.cfg.Prometheus != nil
+	vp.HasZabbix = s.cfg.Zabbix != nil
+	return vp
+}
+
 // verifyAndRejudge runs one verification round on a non-short-circuit draft and
 // re-judges it in a second LLM call (ADR-0021/0022). It returns the finding that
 // should ship: on success, call 2's raw JSON + parsed response + the executed
@@ -899,7 +909,9 @@ func (s *Skill) promQuerier() metricQuerier {
 // marks on stale grounds (R16). resp is the draft (already clamped).
 func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts []store.Alert, ar analysisResult, resp llmResponse, p pipelineParams) (json.RawMessage, llmResponse, *VerificationEnrichment) {
 	draft := DraftRef{RootCause: resp.OverallIssue, Confidence: resp.Confidence}
-	modelQ := parseVerificationPlan(ar.raw, s.cfg.Verification.MaxQueries, s.logger, inc.ID)
+	vp := s.verifyParams()
+	floor := composeFloor(vp, s.cfg.ZabbixParams.HostLabel, alerts)
+	modelQ := parseVerificationPlan(ar.raw, vp.MaxQueries, s.logger, inc.ID)
 
 	// The governing verdict's operator-sourced steering queries (ADR-0029) ride
 	// the same round, between the floor and the model's own proposals.
@@ -912,7 +924,7 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 		governing = ar.memory.Governing
 	}
 	operatorQ := buildSteeringQueries(governing)
-	s.auditVerificationPlanned(ctx, inc, alerts, operatorQ, modelQ)
+	s.auditVerificationPlanned(ctx, inc, floor, operatorQ, modelQ)
 
 	// The runner shares the SAME true-nil-safe querier the analysis fetch used, and
 	// the store as the incidents_in_window state reader. It never errors: a query's
@@ -923,9 +935,9 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 	// each query by kind+expr — no snapshot-format change.
 	var round *VerificationRound
 	if p.replay != nil {
-		round = runVerificationWith(ctx, p.replay.exec, s.cfg.Verification, alerts, draft, operatorQ, modelQ, time.Now().UTC())
+		round = runVerificationWith(ctx, p.replay.exec, vp, floor, draft, operatorQ, modelQ, time.Now().UTC())
 	} else {
-		round = runVerification(ctx, s.promQuerier(), s.st, s.cfg.Verification, inc, alerts, draft, operatorQ, modelQ, time.Now().UTC(), s.logger)
+		round = runVerification(ctx, s.promQuerier(), s.cfg.Zabbix, s.st, vp, inc, floor, draft, operatorQ, modelQ, time.Now().UTC(), s.logger)
 	}
 
 	// Call 2: the byte-identical call-1 prefix + the draft + the computed round +
@@ -1054,13 +1066,16 @@ func (s *Skill) degradedDraft(ctx context.Context, incidentID string, draftRaw j
 // matches the executed round query-for-query — operatorQ (the governing
 // verdict's steering queries, ADR-0029) must never be omitted here even though
 // it is exempt from MaxQueries, or the "planned" and "executed" audit rows
-// would silently disagree in count.
-func (s *Skill) auditVerificationPlanned(ctx context.Context, inc store.Incident, alerts []store.Alert, operatorQ, modelQ []VerificationQuery) {
+// would silently disagree in count. floor is the SAME pre-composed slice
+// (composeFloor, ADR-0034) the caller passes into runVerification/
+// runVerificationWith, so this audit row never recomputes — and can never
+// drift from — what actually executes.
+func (s *Skill) auditVerificationPlanned(ctx context.Context, inc store.Incident, floor, operatorQ, modelQ []VerificationQuery) {
 	if s.auditor == nil {
 		return
 	}
-	plan := make([]VerificationQuery, 0, 2+len(operatorQ)+len(modelQ))
-	plan = append(plan, floorPlan(alerts)...)
+	plan := make([]VerificationQuery, 0, len(floor)+len(operatorQ)+len(modelQ))
+	plan = append(plan, floor...)
 	plan = append(plan, operatorQ...)
 	plan = append(plan, modelQ...)
 	qs := make([]map[string]string, 0, len(plan))
@@ -1071,7 +1086,7 @@ func (s *Skill) auditVerificationPlanned(ctx context.Context, inc store.Incident
 		"incident_id":          inc.ID,
 		"model_query_count":    len(modelQ),
 		"operator_query_count": len(operatorQ),
-		"floor_query_count":    2,
+		"floor_query_count":    len(floor),
 		"queries":              qs,
 	})
 }
