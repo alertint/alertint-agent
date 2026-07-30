@@ -225,16 +225,14 @@ func (c *Client) MetricHistory(ctx context.Context, host, itemKey string, from, 
 	return Series{ItemID: item.ItemID, Name: item.Name, Units: item.Units, Source: "history", Points: pts}, nil
 }
 
-// OpenProblems lists currently-open problems on a host.
-func (c *Client) OpenProblems(ctx context.Context, host string, sel ProblemSelector) ([]Problem, error) {
-	hostids, err := c.hostIDs(ctx, host)
-	if err != nil {
-		return nil, err
-	}
+// openProblemsCall issues one problem.get with the shared output/sort shape
+// and decodes rows into []Problem. scopeKey/scopeIDs is "hostids" or
+// "groupids" — the only difference between the host- and group-scoped reads.
+func (c *Client) openProblemsCall(ctx context.Context, scopeKey string, scopeIDs []string, sel ProblemSelector) ([]Problem, error) {
 	params := map[string]any{
 		"output":     "extend",
 		"selectTags": "extend",
-		"hostids":    hostids,
+		scopeKey:     scopeIDs,
 		"recent":     false,
 		"sortfield":  []string{"eventid"},
 		"sortorder":  "DESC",
@@ -264,6 +262,46 @@ func (c *Client) OpenProblems(ctx context.Context, host string, sel ProblemSelec
 	return out, nil
 }
 
+// GroupOpenProblems lists currently-open problems across host groups —
+// OpenProblems' group-scoped sibling, serving the verification floor's
+// neighbor check (ADR-0034).
+func (c *Client) GroupOpenProblems(ctx context.Context, groupIDs []string, sel ProblemSelector) ([]Problem, error) {
+	return c.openProblemsCall(ctx, "groupids", groupIDs, sel)
+}
+
+// OpenProblems lists currently-open problems on a host.
+func (c *Client) OpenProblems(ctx context.Context, host string, sel ProblemSelector) ([]Problem, error) {
+	hostids, err := c.hostIDs(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	return c.openProblemsCall(ctx, "hostids", hostids, sel)
+}
+
+// HostGroups resolves group names to ids and host counts (hostgroup.get with
+// selectHosts "count") — one call serving both the floor's scope ranking and
+// its peer count.
+func (c *Client) HostGroups(ctx context.Context, names []string) ([]HostGroupInfo, error) {
+	var rows []struct {
+		GroupID string `json:"groupid"`
+		Name    string `json:"name"`
+		Hosts   string `json:"hosts"`
+	}
+	if err := c.call(ctx, "hostgroup.get", map[string]any{
+		"output":      []string{"groupid", "name"},
+		"filter":      map[string][]string{"name": names},
+		"selectHosts": "count",
+	}, true, &rows); err != nil {
+		return nil, err
+	}
+	out := make([]HostGroupInfo, 0, len(rows))
+	for _, r := range rows {
+		n, _ := strconv.Atoi(r.Hosts)
+		out = append(out, HostGroupInfo{GroupID: r.GroupID, Name: r.Name, Hosts: n})
+	}
+	return out, nil
+}
+
 // hostIDs resolves a technical host name to its hostid(s).
 func (c *Client) hostIDs(ctx context.Context, host string) ([]string, error) {
 	var hosts []struct {
@@ -280,7 +318,7 @@ func (c *Client) hostIDs(ctx context.Context, host string) ([]string, error) {
 		ids = append(ids, h.HostID)
 	}
 	if len(ids) == 0 {
-		return nil, fmt.Errorf("zabbix: no host matching %q", host)
+		return nil, fmt.Errorf("zabbix: no host matching %q: %w", host, ErrNotFound)
 	}
 	return ids, nil
 }
@@ -441,7 +479,7 @@ func (c *Client) HostContext(ctx context.Context, host string) (Topology, error)
 		return Topology{}, err
 	}
 	if len(rows) == 0 {
-		return Topology{}, fmt.Errorf("zabbix: no host %q", host)
+		return Topology{}, fmt.Errorf("zabbix: no host %q: %w", host, ErrNotFound)
 	}
 	r := rows[0]
 	top := Topology{
