@@ -126,21 +126,48 @@ func (c *Client) APIVersion(ctx context.Context) (string, error) {
 }
 
 // resolveItem looks up an item's id + value_type by host (technical name) + key.
+// resolveItem looks up an item's id + value_type by host (technical name) +
+// key. It tries an EXACT key match first, falling back to a fuzzy substring
+// search only when no exact item exists — so an unambiguous key (e.g.
+// system.cpu.util) is never shadowed by an unrelated longer key that happens
+// to substring-match it (e.g. system.cpu.util[,iowait]) under a bare `search`.
 func (c *Client) resolveItem(ctx context.Context, host, key string) (zItem, error) {
-	var items []zItem
-	err := c.call(ctx, "item.get", map[string]any{
-		"output": []string{"itemid", "value_type", "name", "units"},
-		"host":   host,
-		"search": map[string]string{"key_": key},
-		"limit":  1,
-	}, true, &items)
+	item, ok, err := c.lookupItem(ctx, host, key, false)
 	if err != nil {
 		return zItem{}, err
 	}
-	if len(items) == 0 {
+	if !ok {
+		item, ok, err = c.lookupItem(ctx, host, key, true)
+		if err != nil {
+			return zItem{}, err
+		}
+	}
+	if !ok {
 		return zItem{}, fmt.Errorf("zabbix: no item matching host=%q key=%q", host, key)
 	}
-	return items[0], nil
+	return item, nil
+}
+
+// lookupItem runs one item.get, exact (filter) or fuzzy (search) on key_.
+func (c *Client) lookupItem(ctx context.Context, host, key string, fuzzy bool) (zItem, bool, error) {
+	params := map[string]any{
+		"output": []string{"itemid", "value_type", "name", "units"},
+		"host":   host,
+		"limit":  1,
+	}
+	if fuzzy {
+		params["search"] = map[string]string{"key_": key}
+	} else {
+		params["filter"] = map[string]string{"key_": key}
+	}
+	var items []zItem
+	if err := c.call(ctx, "item.get", params, true, &items); err != nil {
+		return zItem{}, false, err
+	}
+	if len(items) == 0 {
+		return zItem{}, false, nil
+	}
+	return items[0], true, nil
 }
 
 // MetricHistory returns a normalized series for host+itemKey over [from,to].

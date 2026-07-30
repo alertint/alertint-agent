@@ -85,6 +85,83 @@ func TestMetricHistory_ResolvesValueTypeForFloat(t *testing.T) {
 	}
 }
 
+// TestMetricHistory_ExactKeyWinsOverAmbiguousSubstring proves an unambiguous
+// key resolves via an exact filter, never a fuzzy substring search that could
+// silently pick an unrelated longer key (e.g. system.cpu.util[,iowait]) that
+// happens to substring-match the requested one.
+func TestMetricHistory_ExactKeyWinsOverAmbiguousSubstring(t *testing.T) {
+	var sawSearch bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			Method string         `json:"method"`
+			Params map[string]any `json:"params"`
+		}
+		_ = json.Unmarshal(body, &req)
+		switch req.Method {
+		case "item.get":
+			if _, ok := req.Params["search"]; ok {
+				sawSearch = true
+			}
+			// The exact filter matches immediately — no ambiguity, no fuzzy fallback.
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[{"itemid":"100","value_type":"0"}],"id":1}`))
+		case "history.get":
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[{"clock":"1750000000","value":"1"}],"id":1}`))
+		default:
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[],"id":1}`))
+		}
+	}))
+	defer srv.Close()
+	c := zabbix.NewClient(zabbix.Config{BaseURL: srv.URL, APIToken: "t"})
+	now := time.Now()
+	if _, err := c.MetricHistory(context.Background(), "web01", "system.cpu.util", now.Add(-time.Hour), now, 100); err != nil {
+		t.Fatal(err)
+	}
+	if sawSearch {
+		t.Fatal("an exact match must resolve via filter alone, never falling back to search")
+	}
+}
+
+// TestMetricHistory_FuzzyFallbackWhenNoExactMatch proves the fuzzy search
+// still runs (as a second call) when no item exactly matches the given key.
+func TestMetricHistory_FuzzyFallbackWhenNoExactMatch(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			Method string         `json:"method"`
+			Params map[string]any `json:"params"`
+		}
+		_ = json.Unmarshal(body, &req)
+		switch req.Method {
+		case "item.get":
+			calls++
+			if _, ok := req.Params["filter"]; ok {
+				_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[],"id":1}`)) // no exact match
+				return
+			}
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[{"itemid":"101","value_type":"0"}],"id":1}`))
+		case "history.get":
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[{"clock":"1750000000","value":"1"}],"id":1}`))
+		default:
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[],"id":1}`))
+		}
+	}))
+	defer srv.Close()
+	c := zabbix.NewClient(zabbix.Config{BaseURL: srv.URL, APIToken: "t"})
+	now := time.Now()
+	s, err := c.MetricHistory(context.Background(), "web01", "cpu.util", now.Add(-time.Hour), now, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("want exact-then-fuzzy = 2 item.get calls, got %d", calls)
+	}
+	if s.ItemID != "101" {
+		t.Fatalf("want the fuzzy-matched item, got %+v", s)
+	}
+}
+
 func TestMetricHistory_OldWindowUsesTrends(t *testing.T) {
 	var calledTrend bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

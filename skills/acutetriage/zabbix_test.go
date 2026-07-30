@@ -15,15 +15,17 @@ import (
 )
 
 type fakeZabbix struct {
-	trigger    zabbix.Operator
-	triggerErr error
-	problem    zabbix.ProblemDetail
-	problemErr error
-	host       zabbix.Topology
-	hostErr    error
-	flap       int
-	problems   []zabbix.Problem
-	slow       time.Duration
+	trigger     zabbix.Operator
+	triggerErr  error
+	problem     zabbix.ProblemDetail
+	problemErr  error
+	host        zabbix.Topology
+	hostErr     error
+	flap        int
+	flapErr     error
+	problems    []zabbix.Problem
+	problemsErr error
+	slow        time.Duration
 }
 
 func (f *fakeZabbix) TriggerContext(ctx context.Context, id string) (zabbix.Operator, error) {
@@ -43,10 +45,10 @@ func (f *fakeZabbix) HostContext(ctx context.Context, host string) (zabbix.Topol
 	return f.host, f.hostErr
 }
 func (f *fakeZabbix) FlapCount(ctx context.Context, id string, since time.Time) (int, error) {
-	return f.flap, nil
+	return f.flap, f.flapErr
 }
 func (f *fakeZabbix) OpenProblems(ctx context.Context, host string, sel zabbix.ProblemSelector) ([]zabbix.Problem, error) {
-	return f.problems, nil
+	return f.problems, f.problemsErr
 }
 
 func zabbixOriginAlerts() []store.Alert {
@@ -162,5 +164,64 @@ func TestFetchZabbixContext_BoundingCaps(t *testing.T) {
 func TestFetchZabbixContext_NilClientNilCard(t *testing.T) {
 	if z := FetchZabbixContext(context.Background(), nil, ZabbixParams{}, zabbixOriginAlerts(), time.Now(), "inc-7", slog.Default()); z != nil {
 		t.Fatal("nil client must yield nil context")
+	}
+}
+
+// TestFetchZabbixContext_FetchedButEmptyIsNotLiveEvidence covers a class that
+// succeeds but returns nothing substantive (e.g. topology-only against a host
+// with no groups/templates/interfaces/maintenance and no visible name): the
+// context must roll up as OutcomeEmpty, not OutcomeFetched, so it never lifts
+// the annotations-only confidence cap (hasLiveEvidence gates specifically on
+// OutcomeFetched).
+func TestFetchZabbixContext_FetchedButEmptyIsNotLiveEvidence(t *testing.T) {
+	f := &fakeZabbix{host: zabbix.Topology{}} // every field zero-valued
+	alerts := []store.Alert{{Labels: map[string]string{"alertname": "x", "host": "web01"}}}
+	z := FetchZabbixContext(context.Background(), f, ZabbixParams{TimeoutSeconds: 5, HostLabel: "host"},
+		alerts, time.Now(), "inc-8", slog.Default())
+	if z.Outcome != OutcomeEmpty {
+		t.Fatalf("empty-but-fetched must roll up empty, not fetched: %q", z.Outcome)
+	}
+}
+
+// TestFetchZabbixContext_FlapCountFailureIsNotedNotMisrepresented covers a
+// FlapCount error after a successful TriggerContext: it must not surface as a
+// silent "fired 0 times" (a real zero is indistinguishable from unknown), and
+// the operator class itself must still succeed (a supplement failing is not a
+// class failure).
+func TestFetchZabbixContext_FlapCountFailureIsNotedNotMisrepresented(t *testing.T) {
+	f := &fakeZabbix{
+		trigger: zabbix.Operator{TriggerName: "T", Runbook: "r"},
+		flapErr: errors.New("timeout"),
+	}
+	z := FetchZabbixContext(context.Background(), f, ZabbixParams{TimeoutSeconds: 5, HostLabel: "host", FlapWindowHours: 24},
+		zabbixOriginAlerts(), time.Now(), "inc-9", slog.Default())
+	if z.Operator == nil {
+		t.Fatal("a flap-count-only failure must not fail the operator class")
+	}
+	if z.Operator.FlapWindowH != 0 {
+		t.Fatalf("FlapWindowH must stay 0 on a failed count (suppresses the misleading render), got %d", z.Operator.FlapWindowH)
+	}
+	if !strings.Contains(z.Note, "flap count") {
+		t.Fatalf("flap count failure must be noted: %q", z.Note)
+	}
+}
+
+// TestFetchZabbixContext_OtherProblemsFailureIsNoted covers an OpenProblems
+// error after a successful HostContext: the topology class must still
+// succeed, but the failure must be visible in Note rather than silently
+// rendering "no other open problems".
+func TestFetchZabbixContext_OtherProblemsFailureIsNoted(t *testing.T) {
+	f := &fakeZabbix{
+		host:        zabbix.Topology{VisibleName: "db"},
+		problemsErr: errors.New("timeout"),
+	}
+	alerts := []store.Alert{{Labels: map[string]string{"alertname": "x", "host": "db01"}}}
+	z := FetchZabbixContext(context.Background(), f, ZabbixParams{TimeoutSeconds: 5, HostLabel: "host"},
+		alerts, time.Now(), "inc-10", slog.Default())
+	if z.Topology == nil {
+		t.Fatal("an other-open-problems-only failure must not fail the topology class")
+	}
+	if !strings.Contains(z.Note, "other open problems") {
+		t.Fatalf("other-open-problems failure must be noted: %q", z.Note)
 	}
 }

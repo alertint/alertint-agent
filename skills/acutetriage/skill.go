@@ -450,7 +450,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.analyzed", analyzed)
 	}
 
-	s.auditEnrichmentDigests(ctx, inc.ID, ar.metrics, ar.logs, ar.changes, ar.sentry)
+	s.auditEnrichmentDigests(ctx, inc.ID, ar.metrics, ar.logs, ar.changes, ar.sentry, ar.zabbix)
 
 	ruleID := "none"
 	if decision.Rule != nil {
@@ -534,12 +534,12 @@ func (s *Skill) resolvedStatusLabel(ctx context.Context, incidentID string) stri
 }
 
 // auditEnrichmentDigests appends one hash-chained digest row per attempted
-// enrichment source — metrics, logs, changes, Sentry. Each digest carries only
-// counts/identifiers (selector, query, matched labels, reconciliation tag),
-// never raw evidence text or metric values, keeping the payload small and
-// PII-free (R4/R16/KTD6). A source contributes a row only when it was
-// attempted (non-nil); a nil auditor makes every call a no-op.
-func (s *Skill) auditEnrichmentDigests(ctx context.Context, incidentID string, metrics *MetricEnrichment, enrichment *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment) {
+// enrichment source — metrics, logs, changes, Sentry, Zabbix. Each digest
+// carries only counts/identifiers (selector, query, matched labels,
+// reconciliation tag), never raw evidence text or metric values, keeping the
+// payload small and PII-free (R4/R16/KTD6). A source contributes a row only
+// when it was attempted (non-nil); a nil auditor makes every call a no-op.
+func (s *Skill) auditEnrichmentDigests(ctx context.Context, incidentID string, metrics *MetricEnrichment, enrichment *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, zabbix *ZabbixContext) {
 	if s.auditor == nil {
 		return
 	}
@@ -579,6 +579,13 @@ func (s *Skill) auditEnrichmentDigests(ctx context.Context, incidentID string, m
 			"issue_count":   len(sentry.Issues),
 			"tag":           tag,
 			"corroborating": corroborating,
+		})
+	}
+	if zabbix != nil {
+		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.zabbix_enriched", map[string]any{
+			"incident_id": incidentID,
+			"outcome":     string(zabbix.Outcome),
+			"entry_count": zabbixEntryCount(zabbix),
 		})
 	}
 }

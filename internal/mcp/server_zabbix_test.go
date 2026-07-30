@@ -121,3 +121,18 @@ func TestZabbixHostProblems_ReturnsProblems(t *testing.T) {
 		t.Errorf("missing host should error: %q", resultText(t, missing))
 	}
 }
+
+func TestZabbixHostProblems_SeverityMinValidation(t *testing.T) {
+	st := newMCPStore(t)
+	fk := &fakeZabbixMCP{}
+	s := NewServer(zabbixMCPConfig(fk), st, audit.New(st.DB()))
+
+	bad, _ := s.handleZabbixHostProblems(context.Background(), reqWith(map[string]any{"host": "web01", "severity_min": "high"}))
+	if !bad.IsError || !strings.Contains(resultText(t, bad), "invalid severity_min") {
+		t.Errorf("non-numeric severity_min should error: %q", resultText(t, bad))
+	}
+	outOfRange, _ := s.handleZabbixHostProblems(context.Background(), reqWith(map[string]any{"host": "web01", "severity_min": "6"}))
+	if !outOfRange.IsError || !strings.Contains(resultText(t, outOfRange), "invalid severity_min") {
+		t.Errorf("out-of-range severity_min should error: %q", resultText(t, outOfRange))
+	}
+}

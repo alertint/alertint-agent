@@ -151,6 +151,17 @@ func FetchZabbixContext(ctx context.Context, client ZabbixReader, params ZabbixP
 		logger.Warn("acutetriage: zabbix class fetch failed",
 			"incident_id", incidentID, "class", class, "err", err.Error())
 	}
+	// noteOnly records a sub-fetch failure (a supplement to an already-succeeded
+	// class, e.g. flap count or other-open-problems) as a visible note without
+	// flipping the class-level failed/degraded verdict — the primary class data
+	// is still usable, so downgrading the whole context would overstate the loss.
+	noteOnly := func(what string, err error) {
+		mu.Lock()
+		notes = append(notes, what+" unavailable ("+err.Error()+")")
+		mu.Unlock()
+		logger.Warn("acutetriage: zabbix sub-fetch failed",
+			"incident_id", incidentID, "what", what, "err", err.Error())
+	}
 
 	var wg sync.WaitGroup
 	// Class 1 — operator knowledge (needs trigger id).
@@ -169,10 +180,16 @@ func FetchZabbixContext(ctx context.Context, client ZabbixReader, params ZabbixP
 				URL:          op.URL,
 				Expression:   op.Expression,
 				Dependencies: capDeps(op.Dependencies, zabbixDependenciesMax),
-				FlapWindowH:  int(flapWindow.Hours()),
 			}
-			if n, err := client.FlapCount(fetchCtx, triggerID, t.Add(-flapWindow)); err == nil {
+			// FlapWindowH is set only on a successful count — renderZabbix gates
+			// the "fired N times" phrase on it, so a failed count stays silent
+			// rather than rendering a misleading "fired 0 times" (a real zero is
+			// indistinguishable from "unknown" otherwise).
+			if n, err := client.FlapCount(fetchCtx, triggerID, t.Add(-flapWindow)); err != nil {
+				noteOnly("operator: flap count", err)
+			} else {
 				view.FlapCount = n
+				view.FlapWindowH = int(flapWindow.Hours())
 			}
 			mu.Lock()
 			z.Operator = view
@@ -194,11 +211,11 @@ func FetchZabbixContext(ctx context.Context, client ZabbixReader, params ZabbixP
 				Inventory: top.Inventory, Templates: top.Templates, Groups: top.Groups,
 				MaintenanceActive: top.MaintenanceActive, Interfaces: top.Interfaces,
 			}
-			if probs, err := client.OpenProblems(fetchCtx, host, zabbix.ProblemSelector{}); err == nil {
-				if len(probs) > zabbixOtherProblemsMax {
-					probs = probs[:zabbixOtherProblemsMax]
-				}
-				view.OtherOpenProblems = probs
+			probs, err := client.OpenProblems(fetchCtx, host, zabbix.ProblemSelector{})
+			if err != nil {
+				noteOnly("topology: other open problems", err)
+			} else {
+				view.OtherOpenProblems = capProblems(probs, zabbixOtherProblemsMax)
 			}
 			mu.Lock()
 			z.Topology = view
@@ -238,6 +255,13 @@ func FetchZabbixContext(ctx context.Context, client ZabbixReader, params ZabbixP
 		z.Outcome = OutcomeFailed
 	case degraded:
 		z.Outcome = OutcomeDegraded
+	case zabbixEntryCount(z) == 0:
+		// Every class that ran succeeded but none returned anything
+		// substantive (e.g. a bare topology lookup with an empty host) — a
+		// genuine zero, not live evidence, so it must not lift the
+		// annotations-only confidence cap (hasLiveEvidence checks
+		// OutcomeFetched specifically).
+		z.Outcome = OutcomeEmpty
 	default:
 		z.Outcome = OutcomeFetched
 	}
@@ -277,9 +301,13 @@ func zabbixEntryCount(z *ZabbixContext) int {
 
 func capChars(s string, maxLen int) string {
 	if len(s) <= maxLen {
+		return s // byte fast-path: ≤ maxLen bytes ⇒ ≤ maxLen runes, no alloc
+	}
+	r := []rune(s)
+	if len(r) <= maxLen {
 		return s
 	}
-	return s[:maxLen]
+	return string(r[:maxLen])
 }
 
 func capDeps(d []zabbix.DepTrigger, maxLen int) []zabbix.DepTrigger {
@@ -287,4 +315,11 @@ func capDeps(d []zabbix.DepTrigger, maxLen int) []zabbix.DepTrigger {
 		return d
 	}
 	return d[:maxLen]
+}
+
+func capProblems(p []zabbix.Problem, maxLen int) []zabbix.Problem {
+	if len(p) <= maxLen {
+		return p
+	}
+	return p[:maxLen]
 }

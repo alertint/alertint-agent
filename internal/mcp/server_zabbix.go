@@ -4,6 +4,7 @@ package mcp
 
 import (
 	"context"
+	"strconv"
 	"time"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
@@ -126,7 +127,14 @@ func (s *Server) handleZabbixHostProblems(ctx context.Context, req mcplib.CallTo
 	if host == "" {
 		return errResult("host is required"), nil
 	}
-	sel := zabbix.ProblemSelector{SeverityMin: mcplib.ParseString(req, "severity_min", "")}
+	severityMin := mcplib.ParseString(req, "severity_min", "")
+	if severityMin != "" {
+		n, err := strconv.Atoi(severityMin)
+		if err != nil || n < 0 || n > 5 {
+			return errResult(`invalid severity_min: must be a single digit "0".."5"`), nil
+		}
+	}
+	sel := zabbix.ProblemSelector{SeverityMin: severityMin}
 
 	problems, err := s.cfg.Zabbix.OpenProblems(ctx, host, sel)
 	if err != nil {
