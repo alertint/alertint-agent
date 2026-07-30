@@ -911,7 +911,7 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 	draft := DraftRef{RootCause: resp.OverallIssue, Confidence: resp.Confidence}
 	vp := s.verifyParams()
 	floor := composeFloor(vp, s.cfg.ZabbixParams.HostLabel, alerts)
-	modelQ := parseVerificationPlan(ar.raw, vp.MaxQueries, s.logger, inc.ID)
+	modelQ := parseVerificationPlan(ar.raw, vp, s.logger, inc.ID)
 
 	// The governing verdict's operator-sourced steering queries (ADR-0029) ride
 	// the same round, between the floor and the model's own proposals.

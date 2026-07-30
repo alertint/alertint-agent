@@ -184,10 +184,14 @@ func (p *verificationPlan) UnmarshalJSON(data []byte) error {
 // (floor-only) rather than erroring — the floor queries always run
 // regardless (R1). Kinds are filtered to the closed set the model may
 // propose (promql, incidents_in_window — R4; up_ratio is floor-only and
-// never model-proposable); empty-expr promql entries are dropped; every
-// surviving query is force-labeled Source: "model"; the list is capped at
-// maxQueries with the drop count logged (no silent caps, R3).
-func parseVerificationPlan(raw json.RawMessage, maxQueries int, logger *slog.Logger, incidentID string) []VerificationQuery {
+// never model-proposable); empty-expr promql entries are dropped; a
+// promql entry is also dropped when params.HasPromQL is false — a
+// Prometheus-less install can't run it, and an always-failing query would
+// trigger the R15 clamp every re-judge (belt-and-suspenders on top of the
+// prompt no longer offering the kind, ADR-0034); every surviving query is
+// force-labeled Source: "model"; the list is capped at params.MaxQueries
+// with the drop count logged (no silent caps, R3).
+func parseVerificationPlan(raw json.RawMessage, params VerificationParams, logger *slog.Logger, incidentID string) []VerificationQuery {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -202,11 +206,16 @@ func parseVerificationPlan(raw json.RawMessage, maxQueries int, logger *slog.Log
 		return nil
 	}
 
+	var droppedPromQL int
 	filtered := make([]VerificationQuery, 0, len(env.Verification.Queries))
 	for _, q := range env.Verification.Queries {
 		switch q.Kind {
 		case kindPromQL:
 			if q.Expr == "" {
+				continue
+			}
+			if !params.HasPromQL {
+				droppedPromQL++
 				continue
 			}
 		case kindIncidentsInWindow:
@@ -218,11 +227,16 @@ func parseVerificationPlan(raw json.RawMessage, maxQueries int, logger *slog.Log
 		filtered = append(filtered, q)
 	}
 
-	if len(filtered) > maxQueries {
-		dropped := len(filtered) - maxQueries
+	if droppedPromQL > 0 {
+		logger.Warn("acutetriage: verify: dropping model-proposed promql queries (prometheus not configured)",
+			"dropped", droppedPromQL, "incident", incidentID)
+	}
+
+	if len(filtered) > params.MaxQueries {
+		dropped := len(filtered) - params.MaxQueries
 		logger.Warn("acutetriage: verify: capping model-proposed verification queries",
-			"proposed", len(filtered), "kept", maxQueries, "dropped", dropped, "incident", incidentID)
-		filtered = filtered[:maxQueries]
+			"proposed", len(filtered), "kept", params.MaxQueries, "dropped", dropped, "incident", incidentID)
+		filtered = filtered[:params.MaxQueries]
 	}
 
 	return filtered

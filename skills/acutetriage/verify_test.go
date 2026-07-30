@@ -171,7 +171,7 @@ func kindsOf(qs []VerificationQuery) []string {
 // T2: a malformed verification block degrades to nil (floor-only), never errors.
 func TestParseVerificationPlanMalformed(t *testing.T) {
 	raw := json.RawMessage(`{"analysis_name":"x","verification":{"queries":"not-a-list"}}`)
-	if got := parseVerificationPlan(raw, 4, nil, "inc1"); got != nil {
+	if got := parseVerificationPlan(raw, VerificationParams{MaxQueries: 4}, nil, "inc1"); got != nil {
 		t.Fatalf("want nil on malformed, got %+v", got)
 	}
 }
@@ -185,7 +185,7 @@ func TestParseVerificationPlanBareArray(t *testing.T) {
 	raw := json.RawMessage(`{"analysis_name":"x","verification":[
 		{"kind":"promql","expr":"up{job=\"db\"}","why":"peers down too?"},
 		{"kind":"incidents_in_window","params":{"window_minutes":30},"why":"anything else firing?"}]}`)
-	got := parseVerificationPlan(raw, 4, nil, "inc1")
+	got := parseVerificationPlan(raw, VerificationParams{MaxQueries: 4, HasPromQL: true}, nil, "inc1")
 	if len(got) != 2 {
 		t.Fatalf("want 2 queries from bare-array shape, got %d: %+v", len(got), got)
 	}
@@ -205,7 +205,7 @@ func TestParseVerificationPlanCapAndKinds(t *testing.T) {
 		{"kind":"promql","expr":"q1"},{"kind":"sql","expr":"DROP TABLE"},
 		{"kind":"promql","expr":"q2"},{"kind":"incidents_in_window","params":{"window_minutes":30}},
 		{"kind":"promql","expr":"q3"},{"kind":"promql","expr":"q4"}]}}`)
-	got := parseVerificationPlan(raw, 4, nil, "inc1")
+	got := parseVerificationPlan(raw, VerificationParams{MaxQueries: 4, HasPromQL: true}, nil, "inc1")
 	if len(got) != 4 {
 		t.Fatalf("want 4 (capped, sql dropped), got %d: %+v", len(got), got)
 	}
@@ -216,6 +216,20 @@ func TestParseVerificationPlanCapAndKinds(t *testing.T) {
 		if q.Source != "model" {
 			t.Fatalf("model query mislabeled: %+v", q)
 		}
+	}
+}
+
+// Task 8/ADR-0034: a model that still proposes promql on a Prometheus-less
+// install must have that query dropped defensively (belt-and-suspenders on
+// top of the prompt no longer offering the kind) — otherwise it always fails,
+// triggering the R15 clamp every re-judge.
+func TestParseVerificationPlan_DropsPromQLWithoutPrometheus(t *testing.T) {
+	raw := json.RawMessage(`{"verification":{"queries":[
+		{"kind":"promql","expr":"up","why":"x"},
+		{"kind":"incidents_in_window","why":"y"}]}}`)
+	qs := parseVerificationPlan(raw, VerificationParams{MaxQueries: 3, HasZabbix: true}, nil, "inc-1")
+	if len(qs) != 1 || qs[0].Kind != kindIncidentsInWindow {
+		t.Fatalf("qs = %+v, want only incidents_in_window", qs)
 	}
 }
 

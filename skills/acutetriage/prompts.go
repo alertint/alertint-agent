@@ -178,12 +178,16 @@ func UserPrompt(pack EvidencePack, packJSON string, metrics *MetricEnrichment, l
 
 // renderVerificationInstruction appends the "verification" JSON-key request
 // (R1) when verification is enabled — up to verify.MaxQueries model-proposed
-// disprove-queries, from a closed kind set (promql, incidents_in_window; the
-// floor's up_ratio is never model-proposable). A root cause claiming
-// wider-than-member-alert scope MUST include targeted queries (R7 —
-// scope-inflation guard); an empty list is otherwise allowed. Silent when
-// verification is disabled, so the kill switch is total, not just
-// byte-identical for one fixture.
+// disprove-queries. The kind list and the floor sentence are install-aware
+// (ADR-0034/Task 8): promql is offered ONLY when verify.HasPromQL — a
+// Prometheus-less install would always fail those queries, triggering the
+// R15 clamp on every re-judge — and the floor sentence names whichever
+// checks are actually running (floorDescription). incidents_in_window is
+// always offered; up_ratio and the Zabbix floor checks are floor-only and
+// never model-proposable. A root cause claiming wider-than-member-alert
+// scope MUST include targeted queries (R7 — scope-inflation guard); an empty
+// list is otherwise allowed. Silent when verification is disabled, so the
+// kill switch is total, not just byte-identical for one fixture.
 func renderVerificationInstruction(b *strings.Builder, verify VerificationParams) {
 	if !verify.Enabled {
 		return
@@ -191,19 +195,37 @@ func renderVerificationInstruction(b *strings.Builder, verify VerificationParams
 	fmt.Fprintf(b, "\n\n## Verification plan (required key)\n"+
 		"After forming your verdict, add a \"verification\" key to your JSON, shaped exactly:\n"+
 		`  "verification": {"queries": [<up to %d queries>]}`+"\n"+
-		"Each query is a read-only check that could DISPROVE your root cause. Allowed kinds:\n"+
-		`  {"kind":"promql","expr":"<instant PromQL>","why":"<what this would refute>"}`+"\n"+
-		`  {"kind":"incidents_in_window","params":{"window_minutes":60},"why":"..."}`+"\n"+
-		"A root cause claiming scope wider than the member alerts (cluster-wide, zonal, "+
-		"regional, infrastructure-wide) MUST include targeted disprove-queries. An empty "+
-		"list is allowed when no check would change your verdict. Two checks always run "+
-		"regardless: a parent-scope up ratio and an incidents-in-window scan — do not "+
-		"duplicate them. Write queries that can actually return data: prefer single-metric "+
-		"expressions; reuse exact metric names and label keys visible in the Live metrics "+
-		"section or the alert labels; avoid combining two metrics (ratios, and/unless, "+
-		"group_left joins) unless both carry the same label keys — an expression joining "+
-		"metrics with mismatched label schemas returns empty regardless of what is true, "+
-		"and proves nothing.", verify.MaxQueries)
+		"Each query is a read-only check that could DISPROVE your root cause. Allowed kinds:\n", verify.MaxQueries)
+	if verify.HasPromQL {
+		b.WriteString(`  {"kind":"promql","expr":"<instant PromQL>","why":"<what this would refute>"}` + "\n")
+	}
+	b.WriteString(`  {"kind":"incidents_in_window","params":{"window_minutes":60},"why":"..."}` + "\n")
+	b.WriteString("A root cause claiming scope wider than the member alerts (cluster-wide, zonal, " +
+		"regional, infrastructure-wide) MUST include targeted disprove-queries. An empty " +
+		"list is allowed when no check would change your verdict. Deterministic checks always run " +
+		"regardless: " + floorDescription(verify) + " — do not duplicate them.")
+	if verify.HasPromQL {
+		b.WriteString(" Write queries that can actually return data: prefer single-metric " +
+			"expressions; reuse exact metric names and label keys visible in the Live metrics " +
+			"section or the alert labels; avoid combining two metrics (ratios, and/unless, " +
+			"group_left joins) unless both carry the same label keys — an expression joining " +
+			"metrics with mismatched label schemas returns empty regardless of what is true, " +
+			"and proves nothing.")
+	}
+}
+
+// floorDescription names the composed floor for the plan instruction, so the
+// model is told exactly which checks it must not duplicate (ADR-0034).
+func floorDescription(verify VerificationParams) string {
+	var parts []string
+	if verify.HasPromQL {
+		parts = append(parts, "a parent-scope up ratio")
+	}
+	if verify.HasZabbix {
+		parts = append(parts, "Zabbix host-reachability and neighbor open-problem checks")
+	}
+	parts = append(parts, "an incidents-in-window scan")
+	return strings.Join(parts, ", ")
 }
 
 // callTwoContinuation builds the call-2 continuation appended after the
@@ -225,7 +247,11 @@ func callTwoContinuation(draftRaw json.RawMessage, round *VerificationRound, mem
 		"sections above, and any recalled prior hypotheses. Re-judge your draft against them. " +
 		"If they contradict it, revise — do not defend the draft. A query that returned no " +
 		"data weighs against the draft ONLY if it reused metric names and label keys " +
-		"confirmed present in the evidence above (a confirmed absence). Any other empty " +
+		"confirmed present in the evidence above (a confirmed absence). A deterministic " +
+		"floor check reporting zero problems for a named, resolved scope (its result line " +
+		"names the groups and peer count it searched) is likewise a confirmed absence — " +
+		"except when it reports no peer hosts, which means the check had nothing to " +
+		"compare against: treat that as inconclusive. Any other empty " +
 		"result is inconclusive — the expression may simply have matched nothing (for " +
 		"example, joining metrics whose label schemas differ) — so treat it as neither " +
 		"support nor contradiction and do NOT lower confidence because of it. A replacement " +
