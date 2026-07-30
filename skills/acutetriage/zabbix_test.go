@@ -15,21 +15,21 @@ import (
 )
 
 type fakeZabbix struct {
-	trigger     zabbix.Operator
-	triggerErr  error
-	problem     zabbix.ProblemDetail
-	problemErr  error
-	host        zabbix.Topology
-	hostErr     error
-	flap        int
-	flapErr     error
-	problems    []zabbix.Problem
-	problemsErr error
-	hostGroups     []zabbix.HostGroupInfo
-	hostGroupsErr  error
-	groupProblems  []zabbix.Problem
+	trigger          zabbix.Operator
+	triggerErr       error
+	problem          zabbix.ProblemDetail
+	problemErr       error
+	host             zabbix.Topology
+	hostErr          error
+	flap             int
+	flapErr          error
+	problems         []zabbix.Problem
+	problemsErr      error
+	hostGroups       []zabbix.HostGroupInfo
+	hostGroupsErr    error
+	groupProblems    []zabbix.Problem
 	groupProblemsErr error
-	slow        time.Duration
+	slow             time.Duration
 }
 
 func (f *fakeZabbix) TriggerContext(ctx context.Context, id string) (zabbix.Operator, error) {

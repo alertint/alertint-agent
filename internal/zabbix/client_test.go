@@ -256,7 +256,7 @@ func TestGroupOpenProblems_QueriesByGroupIDs(t *testing.T) {
 	if _, ok := gotParams["hostids"]; ok {
 		t.Fatal("hostids must not be set on a group-scoped query")
 	}
-	if got := gotParams["groupids"].([]any); len(got) != 2 {
+	if got, ok := gotParams["groupids"].([]any); !ok || len(got) != 2 {
 		t.Fatalf("groupids = %v, want 2 ids", got)
 	}
 	if len(probs) != 1 || probs[0].EventID != "101" || !probs[0].Suppressed {
