@@ -37,6 +37,7 @@ type Config struct {
 	Receivers    ReceiversConfig    `yaml:"receivers"`
 	Alertmanager AlertmanagerConfig `yaml:"alertmanager"`
 	Changes      ChangesConfig      `yaml:"changes,omitempty"`
+	Zabbix       ZabbixConfig       `yaml:"zabbix"`
 	Storage      StorageConfig      `yaml:"storage"`
 	LLM          LLMConfig          `yaml:"llm"`
 	Correlator   CorrelatorConfig   `yaml:"correlator"`
@@ -235,6 +236,21 @@ type ChangesIngressConfig struct {
 	WebhookTokenEnv string `yaml:"webhook_token_env"`
 }
 
+// ZabbixConfig groups the Zabbix connector's two independently-enableable
+// sub-roles. Ingress (this section) is the push Receiver; the api section
+// (pull Source) arrives with the context chunk.
+type ZabbixConfig struct {
+	Ingress ZabbixIngressConfig `yaml:"ingress"`
+}
+
+// ZabbixIngressConfig enables the POST /webhook/zabbix receiver. Receivers use
+// an explicit enabled bool (the changes.ingress idiom), not presence-based
+// enablement — opening an inbound route is a deliberate act.
+type ZabbixIngressConfig struct {
+	Enabled         bool   `yaml:"enabled"`
+	WebhookTokenEnv string `yaml:"webhook_token_env"`
+}
+
 // ChangesEnrichmentConfig configures using stored changes at triage time and
 // over MCP (read surface).
 //
@@ -403,8 +419,10 @@ func Defaults() Config {
 			WindowSeconds: 90,
 			// 1: a lone first alert still produces a finding. Slack noise is
 			// controlled by notify.slack.min_severity, not by dropping triage.
-			MinAlerts:   1,
-			GroupLabels: []string{"cluster", "namespace", "service"},
+			MinAlerts: 1,
+			// host: the Zabbix identity label — without it every Zabbix alert
+			// would share group_key="" (ADR-0031).
+			GroupLabels: []string{"cluster", "namespace", "service", "host"},
 		},
 		Notify: NotifyConfig{
 			Stdout: true,
@@ -609,14 +627,12 @@ func (c *Config) validate(offline bool) error {
 
 // validateServing covers the inbound webhook host (all receivers share
 // receivers.address), the MCP server, and the requirement that at least one of
-// them is enabled. NOTE: when the Zabbix integration lands it adds
-// `|| c.Zabbix.Ingress.Enabled` to inboundEnabled and the nothing-to-serve
-// check — the two specs compose.
+// them is enabled.
 func (c *Config) validateServing() []string {
 	var errs []string
-	inboundEnabled := c.Alertmanager.Enabled || c.Changes.Ingress.Enabled
+	inboundEnabled := c.Alertmanager.Enabled || c.Changes.Ingress.Enabled || c.Zabbix.Ingress.Enabled
 	if inboundEnabled && strings.TrimSpace(c.Receivers.Address) == "" {
-		errs = append(errs, "receivers.address is required when any receiver is enabled (alertmanager or changes.ingress)")
+		errs = append(errs, "receivers.address is required when any receiver is enabled (alertmanager, changes.ingress, or zabbix.ingress)")
 	}
 	if c.Alertmanager.Enabled {
 		if strings.TrimSpace(c.Alertmanager.WebhookTokenEnv) == "" {
@@ -628,6 +644,11 @@ func (c *Config) validateServing() []string {
 			errs = append(errs, "changes: ingress: webhook_token_env is required when enabled (env var name holding the bearer token)")
 		}
 	}
+	if c.Zabbix.Ingress.Enabled {
+		if strings.TrimSpace(c.Zabbix.Ingress.WebhookTokenEnv) == "" {
+			errs = append(errs, "zabbix: ingress: webhook_token_env is required when enabled (env var name holding the bearer token)")
+		}
+	}
 	if c.MCPEnabled() {
 		if strings.TrimSpace(c.MCP.Addr) == "" {
 			errs = append(errs, "mcp.addr is required when mcp is enabled")
@@ -636,8 +657,8 @@ func (c *Config) validateServing() []string {
 			errs = append(errs, "mcp.token_env is required when mcp is enabled")
 		}
 	}
-	if !c.Alertmanager.Enabled && !c.Changes.Ingress.Enabled && !c.MCPEnabled() {
-		errs = append(errs, "nothing to serve: enable at least one of alertmanager, changes.ingress, or mcp")
+	if !c.Alertmanager.Enabled && !c.Changes.Ingress.Enabled && !c.Zabbix.Ingress.Enabled && !c.MCPEnabled() {
+		errs = append(errs, "nothing to serve: enable at least one of alertmanager, changes.ingress, zabbix.ingress, or mcp")
 	}
 	return errs
 }
@@ -1095,6 +1116,16 @@ func (c *Config) ChangesWebhookToken() (string, error) {
 		return "", nil
 	}
 	return requireEnv(c.Changes.Ingress.WebhookTokenEnv, "changes.ingress.webhook_token_env")
+}
+
+// ZabbixWebhookToken returns the bearer token for the zabbix webhook receiver,
+// resolved from the env var named by Zabbix.Ingress.WebhookTokenEnv. Returns
+// an empty string and nil error when the zabbix receiver is disabled.
+func (c *Config) ZabbixWebhookToken() (string, error) {
+	if !c.Zabbix.Ingress.Enabled {
+		return "", nil
+	}
+	return requireEnv(c.Zabbix.Ingress.WebhookTokenEnv, "zabbix.ingress.webhook_token_env")
 }
 
 // LLMAPIKey returns the LLM API key, resolved from the env var named by

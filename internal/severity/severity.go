@@ -14,17 +14,18 @@ import "strings"
 // everything — so a missing alert-severity label never manufactures a severity
 // rise. Used by the recurrence severity-rise trigger, which compares alert
 // labels (warning, critical, …).
+// Zabbix names (information/average/disaster) rank on the same ladder (ADR-0033).
 func Rank(s string) int {
 	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "debug", "trace", "info", "low":
+	case "debug", "trace", "info", "low", "information":
 		return 1
-	case "notice", "warn", "warning", "medium":
+	case "notice", "warn", "warning", "medium", "average":
 		return 2
 	case "error", "high":
 		return 3
 	case "critical", "crit":
 		return 4
-	case "alert", "emergency", "fatal", "page":
+	case "alert", "emergency", "fatal", "page", "disaster":
 		return 5
 	default:
 		return 0

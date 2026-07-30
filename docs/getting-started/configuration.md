@@ -98,6 +98,17 @@ and feed the ones overlapping an incident's labels into triage. Dual-role:
 | `enrichment.max_events` | int | `10` | Cap on ranked changes attached to a prompt (must be `> 0`) |
 | `retention_days` | int | `30` | Prune changes older than this; required `> 0` when changes are enabled |
 
+## `zabbix`
+
+The Zabbix connector namespace. `ingress` is the push receiver (this
+section); an `api` sub-section (pull source) arrives with a later chunk. See
+the [Zabbix integration guide](../integrations/zabbix.md).
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `ingress.enabled` | bool | `false` | Mount `POST /webhook/zabbix` on `receivers.address` |
+| `ingress.webhook_token_env` | string | — | **Required when `ingress.enabled`.** Env var name holding the Zabbix webhook bearer token |
+
 ## `storage`
 
 | Field | Type | Default | Description |
@@ -139,7 +150,7 @@ what they need, so raising it costs nothing for normal traffic.
 |---|---|---|---|
 | `window_seconds` | int | `90` | Alerts sharing the same group key within this window form one incident |
 | `min_alerts` | int | `1` | Minimum alerts before the incident is dispatched to the skill. The default `1` triages a lone alert too — use `notify.slack.min_severity` to control channel noise instead of dropping triage. |
-| `group_labels` | list | `[cluster, namespace, service]` | Label names used to compute the group key. Two alerts are correlated when all of these labels match. Deliberately excludes `alertname` so related alerts of different types (latency + crash-loop on one service) correlate into one incident; add it only if you want one incident per alert type. The `alertint_` label-key prefix is reserved for AlertINT itself (e.g. the `alertint_drill` drill marker) and is rejected here — reserved labels never participate in grouping. |
+| `group_labels` | list | `[cluster, namespace, service, host]` | Label names used to compute the group key. Two alerts are correlated when all of these labels match. Deliberately excludes `alertname` so related alerts of different types (latency + crash-loop on one service) correlate into one incident; add it only if you want one incident per alert type. `host` is the Zabbix connector's identity label — per-host is the zero-config grain for Zabbix alerts, which carry no `cluster`/`namespace`/`service`. The `alertint_` label-key prefix is reserved for AlertINT itself (e.g. the `alertint_drill` drill marker) and is rejected here — reserved labels never participate in grouping. |
 
 `window_seconds` is a tradeoff. A lower value reacts faster, but an
 incident may be analyzed with only the first alert or two of a burst

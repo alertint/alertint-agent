@@ -421,6 +421,13 @@ func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor,
 		}
 		receivers = append(receivers, ingress.NewChangeReceiver(st, token, cfg.Changes.RetentionDays, logger))
 	}
+	if cfg.Zabbix.Ingress.Enabled {
+		token, err := cfg.ZabbixWebhookToken()
+		if err != nil {
+			return nil, nil, err
+		}
+		receivers = append(receivers, ingress.NewZabbixReceiver(st, token, cor.Accept, logger))
+	}
 
 	if len(receivers) == 0 {
 		logger.Info("no inbound receivers enabled; /health endpoint not served")
