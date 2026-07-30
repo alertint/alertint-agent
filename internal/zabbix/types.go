@@ -5,8 +5,22 @@ package zabbix
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"time"
 )
+
+// ErrNotFound marks a lookup whose identity resolved to nothing (no such
+// host/item/trigger). Callers distinguish "identity wrong" from transport
+// failure with errors.Is.
+var ErrNotFound = errors.New("not found")
+
+// HostGroupInfo is one host group with its size — the ranking input for the
+// verification floor's smallest-groups-first scope discipline (ADR-0034).
+type HostGroupInfo struct {
+	GroupID string
+	Name    string
+	Hosts   int
+}
 
 // Series is a normalized metric time series. Source is "history" or "trends" —
 // which store answered (ADR-0032: the retention fallback is visible, never

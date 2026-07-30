@@ -60,7 +60,7 @@ func TestUserPromptKillSwitchByteIdentical(t *testing.T) {
 // Enabled: instruction present, schema example includes both kinds, and the
 // scope-inflation MUST-verify line (R7) is present.
 func TestUserPromptVerificationInstruction(t *testing.T) {
-	got := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil, nil, VerificationParams{Enabled: true, MaxQueries: 4})
+	got := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil, nil, VerificationParams{Enabled: true, MaxQueries: 4, HasPromQL: true})
 	for _, want := range []string{`"verification"`, `"promql"`, `"incidents_in_window"`,
 		"MUST include", "disprove"} {
 		if !strings.Contains(got, want) {
@@ -94,7 +94,7 @@ func TestUserPromptVerificationInstructionAbsentWhenDisabled(t *testing.T) {
 // expressions — and warns that a cross-family label join returns empty
 // regardless of ground truth (the f28da0d8 failure mode).
 func TestUserPromptVerificationInstructionQueryGuidance(t *testing.T) {
-	got := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil, nil, VerificationParams{Enabled: true, MaxQueries: 4})
+	got := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil, nil, VerificationParams{Enabled: true, MaxQueries: 4, HasPromQL: true})
 	for _, want := range []string{
 		"single-metric",
 		"reuse exact metric names and label keys",
@@ -204,5 +204,48 @@ func TestCallTwoContinuationDemandsOperatorRulingWhenSteering(t *testing.T) {
 		if !strings.Contains(c2, want) {
 			t.Fatalf("missing %q in call-2 continuation when a correction steers:\n%s", want, c2)
 		}
+	}
+}
+
+// Task 8/ADR-0034: a Zabbix-only install (no Prometheus) must not be offered
+// the promql kind — the model would always fail those queries, triggering the
+// R15 clamp every re-judge — and the floor sentence must name the Zabbix
+// checks actually running instead of promising an up ratio it can't provide.
+func TestVerificationInstruction_NoPromQLKindWithoutPrometheus(t *testing.T) {
+	out := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil, nil,
+		VerificationParams{Enabled: true, MaxQueries: 3, HasZabbix: true})
+	if strings.Contains(out, `"kind":"promql"`) {
+		t.Fatal("promql kind offered on an install without Prometheus")
+	}
+	if !strings.Contains(out, `"kind":"incidents_in_window"`) {
+		t.Fatal("incidents_in_window kind must always be offered")
+	}
+	if !strings.Contains(out, "host-reachability and neighbor open-problem checks") {
+		t.Fatal("floor description must name the Zabbix checks")
+	}
+	if strings.Contains(out, "parent-scope up ratio") {
+		t.Fatal("floor description must not promise an up ratio without Prometheus")
+	}
+}
+
+// A Prometheus-bearing install keeps the promql kind and the up-ratio floor
+// description — the install-aware change must not regress the common case.
+func TestVerificationInstruction_PromDescriptionUnchangedShape(t *testing.T) {
+	out := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil, nil,
+		VerificationParams{Enabled: true, MaxQueries: 3, HasPromQL: true})
+	if !strings.Contains(out, `"kind":"promql"`) || !strings.Contains(out, "parent-scope up ratio") {
+		t.Fatal("prom install must keep the promql kind and up-ratio floor description")
+	}
+}
+
+// ADR-0024: a Zabbix floor check reporting zero problems for a named, resolved
+// scope is a confirmed absence, same as a Prometheus empty result reusing
+// confirmed vocabulary — the re-judge continuation must say so.
+func TestCallTwoContinuation_FloorEmptySentencePresent(t *testing.T) {
+	round := &VerificationRound{Queries: []VerificationQuery{{Kind: kindZabbixNeighborProblems,
+		Source: "floor", Outcome: OutcomeEmpty, Result: "0 open problems in groups Databases (16 peer hosts)"}}}
+	out := callTwoContinuation(json.RawMessage(`{}`), round, nil)
+	if !strings.Contains(out, "no peer hosts") || !strings.Contains(out, "named, resolved scope") {
+		t.Fatalf("floor-empty rule missing from continuation:\n%s", out)
 	}
 }

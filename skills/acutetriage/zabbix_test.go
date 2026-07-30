@@ -15,17 +15,21 @@ import (
 )
 
 type fakeZabbix struct {
-	trigger     zabbix.Operator
-	triggerErr  error
-	problem     zabbix.ProblemDetail
-	problemErr  error
-	host        zabbix.Topology
-	hostErr     error
-	flap        int
-	flapErr     error
-	problems    []zabbix.Problem
-	problemsErr error
-	slow        time.Duration
+	trigger          zabbix.Operator
+	triggerErr       error
+	problem          zabbix.ProblemDetail
+	problemErr       error
+	host             zabbix.Topology
+	hostErr          error
+	flap             int
+	flapErr          error
+	problems         []zabbix.Problem
+	problemsErr      error
+	hostGroups       []zabbix.HostGroupInfo
+	hostGroupsErr    error
+	groupProblems    []zabbix.Problem
+	groupProblemsErr error
+	slow             time.Duration
 }
 
 func (f *fakeZabbix) TriggerContext(ctx context.Context, id string) (zabbix.Operator, error) {
@@ -50,6 +54,12 @@ func (f *fakeZabbix) FlapCount(ctx context.Context, id string, since time.Time) 
 func (f *fakeZabbix) OpenProblems(ctx context.Context, host string, sel zabbix.ProblemSelector) ([]zabbix.Problem, error) {
 	return f.problems, f.problemsErr
 }
+func (f *fakeZabbix) HostGroups(ctx context.Context, names []string) ([]zabbix.HostGroupInfo, error) {
+	return f.hostGroups, f.hostGroupsErr
+}
+func (f *fakeZabbix) GroupOpenProblems(ctx context.Context, groupIDs []string, sel zabbix.ProblemSelector) ([]zabbix.Problem, error) {
+	return f.groupProblems, f.groupProblemsErr
+}
 
 func zabbixOriginAlerts() []store.Alert {
 	return []store.Alert{{
@@ -66,7 +76,7 @@ func TestFetchZabbixContext_ZabbixOriginGetsAllThreeClasses(t *testing.T) {
 		flap:     3,
 		problems: []zabbix.Problem{{EventID: "1", Name: "other problem"}},
 	}
-	z := FetchZabbixContext(context.Background(), f, ZabbixParams{TimeoutSeconds: 5, HostLabel: "host", FlapWindowHours: 24},
+	z, _ := FetchZabbixContext(context.Background(), f, ZabbixParams{TimeoutSeconds: 5, HostLabel: "host", FlapWindowHours: 24},
 		zabbixOriginAlerts(), time.Now(), "inc-1", slog.Default())
 	if z == nil || z.Operator == nil || z.Topology == nil || z.Problem == nil {
 		t.Fatalf("all three classes expected: %+v", z)
@@ -85,7 +95,7 @@ func TestFetchZabbixContext_ZabbixOriginGetsAllThreeClasses(t *testing.T) {
 func TestFetchZabbixContext_AlertmanagerOriginOnlyTopology(t *testing.T) {
 	f := &fakeZabbix{host: zabbix.Topology{VisibleName: "web"}}
 	alerts := []store.Alert{{Labels: map[string]string{"alertname": "x", "host": "web01"}}}
-	z := FetchZabbixContext(context.Background(), f, ZabbixParams{TimeoutSeconds: 5, HostLabel: "host"},
+	z, _ := FetchZabbixContext(context.Background(), f, ZabbixParams{TimeoutSeconds: 5, HostLabel: "host"},
 		alerts, time.Now(), "inc-2", slog.Default())
 	if z.Operator != nil || z.Problem != nil {
 		t.Fatalf("non-zabbix-origin must skip operator/problem: %+v", z)
@@ -98,10 +108,41 @@ func TestFetchZabbixContext_AlertmanagerOriginOnlyTopology(t *testing.T) {
 	}
 }
 
+// TestFetchZabbixContext_SeedCarriesTheFetchedTopology proves the second
+// return value bridges Class 2's raw fetch forward for the verification
+// round to reuse (avoids a redundant host.get moments later in the same
+// triage invocation) — populated on success, empty on failure or when Class
+// 2 never ran.
+func TestFetchZabbixContext_SeedCarriesTheFetchedTopology(t *testing.T) {
+	top := zabbix.Topology{Groups: []string{"Databases"}, MaintenanceActive: true}
+	f := &fakeZabbix{host: top}
+	alerts := []store.Alert{{Labels: map[string]string{"alertname": "x", "host": "db-01"}}}
+	_, seed := FetchZabbixContext(context.Background(), f, ZabbixParams{TimeoutSeconds: 5, HostLabel: "host"},
+		alerts, time.Now(), "inc-seed-1", slog.Default())
+	if len(seed) != 1 || seed["db-01"].Groups[0] != "Databases" || !seed["db-01"].MaintenanceActive {
+		t.Fatalf("seed = %+v, want {db-01: %+v}", seed, top)
+	}
+
+	f2 := &fakeZabbix{hostErr: errors.New("boom")}
+	_, seedOnFail := FetchZabbixContext(context.Background(), f2, ZabbixParams{TimeoutSeconds: 5, HostLabel: "host"},
+		alerts, time.Now(), "inc-seed-2", slog.Default())
+	if len(seedOnFail) != 0 {
+		t.Fatalf("seed on Class 2 failure = %+v, want empty", seedOnFail)
+	}
+
+	f3 := &fakeZabbix{}
+	noHostAlerts := []store.Alert{{Labels: map[string]string{"alertname": "x", "zabbix_trigger_id": "t1"}}}
+	_, seedNoHost := FetchZabbixContext(context.Background(), f3, ZabbixParams{TimeoutSeconds: 5, HostLabel: "host"},
+		noHostAlerts, time.Now(), "inc-seed-3", slog.Default())
+	if len(seedNoHost) != 0 {
+		t.Fatalf("seed with no host label = %+v, want empty", seedNoHost)
+	}
+}
+
 func TestFetchZabbixContext_NoIdentityAtAll(t *testing.T) {
 	f := &fakeZabbix{}
 	alerts := []store.Alert{{Labels: map[string]string{"alertname": "x"}}}
-	z := FetchZabbixContext(context.Background(), f, ZabbixParams{TimeoutSeconds: 5, HostLabel: "host"},
+	z, _ := FetchZabbixContext(context.Background(), f, ZabbixParams{TimeoutSeconds: 5, HostLabel: "host"},
 		alerts, time.Now(), "inc-3", slog.Default())
 	if z == nil {
 		t.Fatal("card must be non-nil even with nothing to fetch (visibility-over-silence)")
@@ -117,7 +158,7 @@ func TestFetchZabbixContext_ClassFailureIsNotedOthersSurvive(t *testing.T) {
 		host:       zabbix.Topology{VisibleName: "db"},
 		problem:    zabbix.ProblemDetail{Ongoing: true},
 	}
-	z := FetchZabbixContext(context.Background(), f, ZabbixParams{TimeoutSeconds: 5, HostLabel: "host"},
+	z, _ := FetchZabbixContext(context.Background(), f, ZabbixParams{TimeoutSeconds: 5, HostLabel: "host"},
 		zabbixOriginAlerts(), time.Now(), "inc-4", slog.Default())
 	if z.Operator != nil {
 		t.Fatal("failed class must be nil")
@@ -136,7 +177,7 @@ func TestFetchZabbixContext_SlowClassIsDegraded(t *testing.T) {
 		host:    zabbix.Topology{VisibleName: "db"},
 		problem: zabbix.ProblemDetail{Ongoing: true},
 	}
-	z := FetchZabbixContext(context.Background(), f, ZabbixParams{TimeoutSeconds: 1, HostLabel: "host"},
+	z, _ := FetchZabbixContext(context.Background(), f, ZabbixParams{TimeoutSeconds: 1, HostLabel: "host"},
 		zabbixOriginAlerts(), time.Now(), "inc-5", slog.Default())
 	if z.Outcome != OutcomeDegraded {
 		t.Fatalf("deadline-exceeded must roll up degraded, not failed: %q", z.Outcome)
@@ -151,7 +192,7 @@ func TestFetchZabbixContext_BoundingCaps(t *testing.T) {
 		problems: manyProblems,
 		problem:  zabbix.ProblemDetail{Ongoing: true},
 	}
-	z := FetchZabbixContext(context.Background(), f, ZabbixParams{TimeoutSeconds: 5, HostLabel: "host"},
+	z, _ := FetchZabbixContext(context.Background(), f, ZabbixParams{TimeoutSeconds: 5, HostLabel: "host"},
 		zabbixOriginAlerts(), time.Now(), "inc-6", slog.Default())
 	if len(z.Operator.Runbook) > 2000 {
 		t.Fatalf("runbook must be capped at 2000 chars, got %d", len(z.Operator.Runbook))
@@ -162,7 +203,7 @@ func TestFetchZabbixContext_BoundingCaps(t *testing.T) {
 }
 
 func TestFetchZabbixContext_NilClientNilCard(t *testing.T) {
-	if z := FetchZabbixContext(context.Background(), nil, ZabbixParams{}, zabbixOriginAlerts(), time.Now(), "inc-7", slog.Default()); z != nil {
+	if z, _ := FetchZabbixContext(context.Background(), nil, ZabbixParams{}, zabbixOriginAlerts(), time.Now(), "inc-7", slog.Default()); z != nil {
 		t.Fatal("nil client must yield nil context")
 	}
 }
@@ -176,7 +217,7 @@ func TestFetchZabbixContext_NilClientNilCard(t *testing.T) {
 func TestFetchZabbixContext_FetchedButEmptyIsNotLiveEvidence(t *testing.T) {
 	f := &fakeZabbix{host: zabbix.Topology{}} // every field zero-valued
 	alerts := []store.Alert{{Labels: map[string]string{"alertname": "x", "host": "web01"}}}
-	z := FetchZabbixContext(context.Background(), f, ZabbixParams{TimeoutSeconds: 5, HostLabel: "host"},
+	z, _ := FetchZabbixContext(context.Background(), f, ZabbixParams{TimeoutSeconds: 5, HostLabel: "host"},
 		alerts, time.Now(), "inc-8", slog.Default())
 	if z.Outcome != OutcomeEmpty {
 		t.Fatalf("empty-but-fetched must roll up empty, not fetched: %q", z.Outcome)
@@ -193,7 +234,7 @@ func TestFetchZabbixContext_FlapCountFailureIsNotedNotMisrepresented(t *testing.
 		trigger: zabbix.Operator{TriggerName: "T", Runbook: "r"},
 		flapErr: errors.New("timeout"),
 	}
-	z := FetchZabbixContext(context.Background(), f, ZabbixParams{TimeoutSeconds: 5, HostLabel: "host", FlapWindowHours: 24},
+	z, _ := FetchZabbixContext(context.Background(), f, ZabbixParams{TimeoutSeconds: 5, HostLabel: "host", FlapWindowHours: 24},
 		zabbixOriginAlerts(), time.Now(), "inc-9", slog.Default())
 	if z.Operator == nil {
 		t.Fatal("a flap-count-only failure must not fail the operator class")
@@ -216,7 +257,7 @@ func TestFetchZabbixContext_OtherProblemsFailureIsNoted(t *testing.T) {
 		problemsErr: errors.New("timeout"),
 	}
 	alerts := []store.Alert{{Labels: map[string]string{"alertname": "x", "host": "db01"}}}
-	z := FetchZabbixContext(context.Background(), f, ZabbixParams{TimeoutSeconds: 5, HostLabel: "host"},
+	z, _ := FetchZabbixContext(context.Background(), f, ZabbixParams{TimeoutSeconds: 5, HostLabel: "host"},
 		alerts, time.Now(), "inc-10", slog.Default())
 	if z.Topology == nil {
 		t.Fatal("an other-open-problems-only failure must not fail the topology class")

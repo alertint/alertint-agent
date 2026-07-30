@@ -18,6 +18,7 @@ import (
 	"github.com/alertint/alertint-agent/internal/llm"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/store"
+	"github.com/alertint/alertint-agent/internal/zabbix"
 	"github.com/alertint/alertint-agent/skills/acutetriage"
 )
 
@@ -1413,5 +1414,191 @@ func TestSteering_ConfirmationRetiresSteering(t *testing.T) {
 	}
 	if f.confidence != 0.85 {
 		t.Errorf("confidence = %v, want 0.85 (no clamp — confirmation does not steer)", f.confidence)
+	}
+}
+
+// --------------------------------------------------------------------------
+// Task 9 — the Zabbix verification floor's acceptance test: a Zabbix-only
+// install (no Prometheus configured anywhere) must still clear the
+// metadata-only caveat and ship uncapped confidence, and the floor's
+// own-event exclusion must actually drop the incident's own open problem out
+// of the neighbor-problems render rather than reporting the incident back to
+// itself as a "neighbor" — proving Tasks 1-8's composeFloor + floorFetched +
+// own-event-exclusion chain works end to end on a real pipeline run, not
+// just in isolated unit tests.
+//
+// Note on what confidence assertion 4 below proves: this test's alert
+// carries a host label, so FetchZabbixContext (the separate chunk-02
+// enrichment path) also runs against the same pipelineZabbix fake — but
+// pipelineZabbix's fixture (no VisibleName/Inventory, MaintenanceActive
+// false, no OtherOpenProblems, suppression "none" explicitly excluded)
+// resolves that enrichment to OutcomeEmpty, not OutcomeFetched, so it does
+// NOT independently trip hasLiveEvidence. With no metrics/logs/changes/
+// Sentry wired either (verifyConfig(nil)), annotationsOnlyBasis reduces to
+// !verificationLive(ver) — so this test's uncapped 0.85 IS carried solely by
+// the verification floor's fetched zabbix_reachability query. The unit-level
+// isolation of that same mechanism also lives in
+// TestVerificationLive_ZabbixFloorCounts.
+// --------------------------------------------------------------------------
+
+// pipelineZabbix is the minimal exported-interface fake for the Zabbix-only
+// integration case: one healthy host in one functional group ("Databases",
+// 17 hosts total in HostGroups — 16 peers once the checked host itself is
+// excluded). GroupOpenProblems returns two open problems: the incident's own
+// (event id 5001, matching the test alert's zabbix_event_id ANNOTATION
+// below — the real receiver's shape, internal/ingress/zabbix.go — which the
+// floor's own-event exclusion must filter out) and one genuine neighbor
+// (event id 9002), which must render. TriggerContext still returns a loud
+// error as a tripwire: this alert carries no zabbix_trigger_id label, so it
+// is never actually called. ProblemContext, unlike before, DOES get called —
+// FetchZabbixContext's problem class keys on the zabbix_event_id annotation,
+// which is now populated — so it returns a real answer instead of an error.
+type pipelineZabbix struct{}
+
+func (pipelineZabbix) TriggerContext(context.Context, string) (zabbix.Operator, error) {
+	return zabbix.Operator{}, fmt.Errorf("zabbix: no trigger")
+}
+func (pipelineZabbix) ProblemContext(context.Context, string) (zabbix.ProblemDetail, error) {
+	return zabbix.ProblemDetail{Severity: "4", Ongoing: true, DurationSecs: 900,
+		Suppression: zabbix.Suppression{Kind: "none"}}, nil
+}
+func (pipelineZabbix) HostContext(context.Context, string) (zabbix.Topology, error) {
+	return zabbix.Topology{Groups: []string{"Databases"},
+		Interfaces: []zabbix.IfaceState{{Addr: "10.0.0.1", Available: "1"}}}, nil
+}
+func (pipelineZabbix) FlapCount(context.Context, string, time.Time) (int, error) { return 0, nil }
+func (pipelineZabbix) OpenProblems(context.Context, string, zabbix.ProblemSelector) ([]zabbix.Problem, error) {
+	return nil, nil
+}
+func (pipelineZabbix) HostGroups(context.Context, []string) ([]zabbix.HostGroupInfo, error) {
+	return []zabbix.HostGroupInfo{{GroupID: "1", Name: "Databases", Hosts: 17}}, nil
+}
+func (pipelineZabbix) GroupOpenProblems(context.Context, []string, zabbix.ProblemSelector) ([]zabbix.Problem, error) {
+	return []zabbix.Problem{
+		{EventID: "5001", Name: "db1 unreachable", Severity: "4"},    // the incident's own open problem — must be excluded
+		{EventID: "9002", Name: "cache-02 disk full", Severity: "2"}, // a genuine neighbor — must render
+	}, nil
+}
+
+func TestVerification_ZabbixOnlyInstall_ClearsCaveat(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	auditor := audit.New(st.DB())
+	inc := insertTestIncident(t, st, ctx)
+	// zabbix_event_id belongs in Annotations on a receiver-realistic alert
+	// (internal/ingress/zabbix.go), never Labels — insertTestAlert only takes
+	// labels, so the event id is attached with a follow-up upsert.
+	alert := insertTestAlert(t, st, ctx, inc.ID, "fp-zbx-only", map[string]string{
+		"alertname": "HostDown", "host": "db1",
+	})
+	alert.Annotations = map[string]string{"zabbix_event_id": "5001"}
+	if _, err := st.UpsertAlertByFingerprint(ctx, alert); err != nil {
+		t.Fatalf("attach zabbix_event_id annotation: %v", err)
+	}
+
+	rootCause := "db1 host pressure inside the Databases group"
+	scripted := &scriptedLLM{responses: []scriptResp{
+		// Call 1: draft with no verification key at all — the model proposes
+		// nothing (the Zabbix floor already covers this incident).
+		{raw: draftResp(t, "draft", rootCause, 0.85, nil)},
+		{raw: callTwoResp(t, "draft", rootCause, 0.85, "")},
+	}}
+
+	// NO Prometheus (verifyConfig's prom stays nil): Zabbix is the only
+	// configured backend on this install.
+	cfg := verifyConfig(nil)
+	cfg.Zabbix = pipelineZabbix{}
+	cfg.ZabbixParams = acutetriage.ZabbixParams{HostLabel: "host", TimeoutSeconds: 5}
+
+	notifier := &capturingNotifier{}
+	skill := acutetriage.New(cfg, st, scripted, auditor, notifier, nil)
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if scripted.calls != 2 {
+		t.Fatalf("want 2 LLM calls (draft + re-judge), got %d", scripted.calls)
+	}
+
+	// 1. The shipped finding must not carry the unverified caveat.
+	if notifier.last.Unverified {
+		t.Errorf("shipped finding must not be Unverified (the Zabbix floor cleared the caveat), got %+v", notifier.last)
+	}
+
+	f := readFinding(t, st, inc.ID)
+	ver := verificationOf(t, f.enrichment)
+	if ver == nil {
+		t.Fatalf("envelope missing verification key:\n%s", f.enrichment)
+	}
+
+	// 2. The round outcome is "supported" (call 2 kept the same root cause).
+	if ver.Outcome != "supported" {
+		t.Errorf("outcome = %q, want supported", ver.Outcome)
+	}
+	if len(ver.Rounds) != 1 {
+		t.Fatalf("want 1 round, got %d", len(ver.Rounds))
+	}
+	round := ver.Rounds[0]
+
+	// 3. The round contains the Zabbix floor pair plus incidents_in_window,
+	// and NO up_ratio (no Prometheus configured on this install).
+	if len(round.Queries) != 3 {
+		t.Fatalf("want 3 queries (zabbix_reachability + zabbix_neighbor_problems + incidents_in_window), got %d: %+v",
+			len(round.Queries), round.Queries)
+	}
+	byKind := make(map[string]acutetriage.VerificationQuery, len(round.Queries))
+	for _, q := range round.Queries {
+		byKind[q.Kind] = q
+	}
+	reach, ok := byKind["zabbix_reachability"]
+	if !ok {
+		t.Fatalf("round missing zabbix_reachability: %+v", round.Queries)
+	}
+	if reach.Outcome != acutetriage.OutcomeFetched {
+		t.Errorf("zabbix_reachability outcome = %q, want fetched", reach.Outcome)
+	}
+	neighbors, ok := byKind["zabbix_neighbor_problems"]
+	if !ok {
+		t.Fatalf("round missing zabbix_neighbor_problems: %+v", round.Queries)
+	}
+	if neighbors.Outcome != acutetriage.OutcomeFetched {
+		t.Errorf("zabbix_neighbor_problems outcome = %q, want fetched (one genuine neighbor problem)", neighbors.Outcome)
+	}
+	if !strings.Contains(neighbors.Result, "16 peer hosts") {
+		t.Errorf("zabbix_neighbor_problems result missing the 16-peer scope line: %q", neighbors.Result)
+	}
+	// Own-event exclusion (Finding 1, exercised end to end): GroupOpenProblems
+	// returns both the incident's own open problem (event id 5001) and a
+	// genuine neighbor (event id 9002) — only the neighbor may render.
+	if strings.Contains(neighbors.Result, "db1 unreachable") {
+		t.Errorf("own-event exclusion failed: the incident's own problem rendered as a neighbor: %q", neighbors.Result)
+	}
+	if !strings.Contains(neighbors.Result, "cache-02 disk full") {
+		t.Errorf("genuine neighbor problem missing from the render: %q", neighbors.Result)
+	}
+	if _, ok := byKind["incidents_in_window"]; !ok {
+		t.Errorf("round missing incidents_in_window: %+v", round.Queries)
+	}
+	if _, ok := byKind["up_ratio"]; ok {
+		t.Errorf("round must NOT contain up_ratio on a Prometheus-less install: %+v", round.Queries)
+	}
+
+	// 4. Confidence ships uncapped at 0.85: the chunk-02 Zabbix enrichment
+	// resolves to OutcomeEmpty on this fixture (see the file-level note
+	// above), so the fetched zabbix_reachability floor query is what carries
+	// verificationLive true and lifts the metadata-only cap here — the same
+	// mechanism TestVerificationLive_ZabbixFloorCounts isolates at the unit
+	// level.
+	if f.confidence != 0.85 {
+		t.Errorf("persisted confidence = %v, want 0.85 (uncapped)", f.confidence)
+	}
+	if notifier.last.Confidence != 0.85 {
+		t.Errorf("shipped confidence = %v, want 0.85 (uncapped)", notifier.last.Confidence)
+	}
+
+	// 5. Call 1's prompt must not offer the promql kind — no Prometheus is
+	// configured on this install.
+	if strings.Contains(scripted.prompts[0], `"kind":"promql"`) {
+		t.Errorf("call-1 prompt must not offer the promql kind on a Zabbix-only install:\n%s", scripted.prompts[0])
 	}
 }

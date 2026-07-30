@@ -313,6 +313,14 @@ func (p *poisonedZabbix) OpenProblems(context.Context, string, zabbix.ProblemSel
 	p.t.Fatal("replay must not call OpenProblems")
 	return nil, nil
 }
+func (p *poisonedZabbix) HostGroups(context.Context, []string) ([]zabbix.HostGroupInfo, error) {
+	p.t.Fatal("replay must not call HostGroups")
+	return nil, nil
+}
+func (p *poisonedZabbix) GroupOpenProblems(context.Context, []string, zabbix.ProblemSelector) ([]zabbix.Problem, error) {
+	p.t.Fatal("replay must not call GroupOpenProblems")
+	return nil, nil
+}
 
 func TestReplayIncident_NoLiveZabbixCall(t *testing.T) {
 	ctx := context.Background()
@@ -362,6 +370,26 @@ func TestReplayIncident_NoLiveZabbixCall(t *testing.T) {
 	}
 	if rep.fidelity != "full" {
 		t.Errorf("fidelity = %q, want full", rep.fidelity)
+	}
+}
+
+func TestSnapshotKey_ZabbixKindsMatchOnHosts(t *testing.T) {
+	frozen := VerificationQuery{Kind: kindZabbixReachability,
+		Params:  map[string]any{"hosts": []any{"db-01", "web-01"}}, // post-JSON shape
+		Outcome: OutcomeFetched, Result: "db-01 reachable (1 interface); not in maintenance"}
+	exec := newSnapshotExecutor([]VerificationQuery{frozen})
+	live := VerificationQuery{Kind: kindZabbixReachability,
+		Params: map[string]any{"hosts": []string{"db-01", "web-01"}}} // live Go shape
+	exec.execute(context.Background(), &live)
+	if live.Outcome != OutcomeFetched || live.Result != frozen.Result {
+		t.Fatalf("snapshot miss: outcome=%s result=%q", live.Outcome, live.Result)
+	}
+	// Different host set → miss → the existing no-data path.
+	other := VerificationQuery{Kind: kindZabbixReachability,
+		Params: map[string]any{"hosts": []string{"cache-01"}}}
+	exec.execute(context.Background(), &other)
+	if other.Result != "no data (replay)" {
+		t.Fatalf("expected replay miss, got %q", other.Result)
 	}
 }
 

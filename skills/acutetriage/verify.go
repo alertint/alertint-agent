@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/store"
+	"github.com/alertint/alertint-agent/internal/zabbix"
 )
 
 // VerificationParams carries the skill-side tunables (from config Task 1).
@@ -32,6 +33,12 @@ type VerificationParams struct {
 	MaxQueries          int
 	QueryTimeoutSeconds int
 	MaxSeries           int
+	// HasPromQL / HasZabbix are presence flags stamped by the skill
+	// (verifyParams()), never parsed from config: they select which floor
+	// sources contribute (ADR-0034) and which query kinds the model may be
+	// offered (prompts.go).
+	HasPromQL bool
+	HasZabbix bool
 }
 
 // Query kinds. The floor uses up_ratio + incidents_in_window; the model may
@@ -130,18 +137,23 @@ func parentScope(alerts []store.Alert) string {
 	return renderPromMatcher(scope)
 }
 
-// floorPlan returns the two queries that ALWAYS run in a verification round,
-// regardless of what the model proposes: peer-scope up_ratio and
-// incidents_in_window. Both are Source: "floor" — never subject to the
-// model's query cap or the closed-kind-set filter in parseVerificationPlan.
-func floorPlan(alerts []store.Alert) []VerificationQuery {
-	return []VerificationQuery{
-		{Kind: kindUpRatio, Source: "floor", Expr: parentScope(alerts),
-			Why: "peer-scope health: is the wider world up?"},
-		{Kind: kindIncidentsInWindow, Source: "floor",
-			Params: map[string]any{"window_minutes": float64(60)},
-			Why:    "is anything else firing?"},
+// composeFloor assembles the deterministic floor from the applicable floor
+// sources (ADR-0034) plus the universal own-state check. Every configured
+// source that can address the incident contributes; there is no either/or
+// branch and no activation config. Never returns an empty slice — the
+// own-state check always runs.
+func composeFloor(p VerificationParams, hostLabel string, alerts []store.Alert) []VerificationQuery {
+	var qs []VerificationQuery
+	if p.HasPromQL {
+		qs = append(qs, VerificationQuery{Kind: kindUpRatio, Source: "floor", Expr: parentScope(alerts),
+			Why: "peer-scope health: is the wider world up?"})
 	}
+	if p.HasZabbix {
+		qs = append(qs, zabbixFloorQueries(alerts, hostLabel)...)
+	}
+	return append(qs, VerificationQuery{Kind: kindIncidentsInWindow, Source: "floor",
+		Params: map[string]any{"window_minutes": float64(60)},
+		Why:    "is anything else firing?"})
 }
 
 // verificationPlanEnvelope is the shape parseVerificationPlan extracts out of
@@ -173,10 +185,14 @@ func (p *verificationPlan) UnmarshalJSON(data []byte) error {
 // (floor-only) rather than erroring — the floor queries always run
 // regardless (R1). Kinds are filtered to the closed set the model may
 // propose (promql, incidents_in_window — R4; up_ratio is floor-only and
-// never model-proposable); empty-expr promql entries are dropped; every
-// surviving query is force-labeled Source: "model"; the list is capped at
-// maxQueries with the drop count logged (no silent caps, R3).
-func parseVerificationPlan(raw json.RawMessage, maxQueries int, logger *slog.Logger, incidentID string) []VerificationQuery {
+// never model-proposable); empty-expr promql entries are dropped; a
+// promql entry is also dropped when params.HasPromQL is false — a
+// Prometheus-less install can't run it, and an always-failing query would
+// trigger the R15 clamp every re-judge (belt-and-suspenders on top of the
+// prompt no longer offering the kind, ADR-0034); every surviving query is
+// force-labeled Source: "model"; the list is capped at params.MaxQueries
+// with the drop count logged (no silent caps, R3).
+func parseVerificationPlan(raw json.RawMessage, params VerificationParams, logger *slog.Logger, incidentID string) []VerificationQuery {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -191,11 +207,16 @@ func parseVerificationPlan(raw json.RawMessage, maxQueries int, logger *slog.Log
 		return nil
 	}
 
+	var droppedPromQL int
 	filtered := make([]VerificationQuery, 0, len(env.Verification.Queries))
 	for _, q := range env.Verification.Queries {
 		switch q.Kind {
 		case kindPromQL:
 			if q.Expr == "" {
+				continue
+			}
+			if !params.HasPromQL {
+				droppedPromQL++
 				continue
 			}
 		case kindIncidentsInWindow:
@@ -207,11 +228,16 @@ func parseVerificationPlan(raw json.RawMessage, maxQueries int, logger *slog.Log
 		filtered = append(filtered, q)
 	}
 
-	if len(filtered) > maxQueries {
-		dropped := len(filtered) - maxQueries
+	if droppedPromQL > 0 {
+		logger.Warn("acutetriage: verify: dropping model-proposed promql queries (prometheus not configured)",
+			"dropped", droppedPromQL, "incident", incidentID)
+	}
+
+	if len(filtered) > params.MaxQueries {
+		dropped := len(filtered) - params.MaxQueries
 		logger.Warn("acutetriage: verify: capping model-proposed verification queries",
-			"proposed", len(filtered), "kept", maxQueries, "dropped", dropped, "incident", incidentID)
-		filtered = filtered[:maxQueries]
+			"proposed", len(filtered), "kept", params.MaxQueries, "dropped", dropped, "incident", incidentID)
+		filtered = filtered[:params.MaxQueries]
 	}
 
 	return filtered
@@ -245,6 +271,24 @@ const defaultWindowMinutes = 60
 // FetchMetrics already relies on — rather than adding rebalancing logic here.
 const minPerQueryTimeout = 2 * time.Second
 
+// zabbixMultiRPCWeight is the budget-slice weight for the two Zabbix floor
+// kinds: on a cache miss they can issue up to 3 sequential Zabbix RPCs
+// (HostContext + HostGroups + GroupOpenProblems), unlike every other query
+// kind's single RPC or RPC pair, which gets weight 1.
+const zabbixMultiRPCWeight = 3
+
+// queryWeight is runVerificationWith's per-query share of the round's
+// timeout budget, relative to every other query in the round — see
+// zabbixMultiRPCWeight.
+func queryWeight(kind string) int {
+	switch kind {
+	case kindZabbixReachability, kindZabbixNeighborProblems:
+		return zabbixMultiRPCWeight
+	default:
+		return 1
+	}
+}
+
 // queryExecutor abstracts "run one verification query, fill Outcome/Result in
 // place". liveExecutor is production; snapshotExecutor is the hermetic replay
 // seam (ADR-0021 pipeline, frozen data).
@@ -252,8 +296,9 @@ type queryExecutor interface {
 	execute(ctx context.Context, q *VerificationQuery)
 }
 
-// liveExecutor runs queries against the real backends — the pre-existing
-// runOneQuery behavior, unchanged.
+// liveExecutor runs queries against the real backends: the pre-existing
+// runOneQuery behavior for the legacy kinds, plus the Zabbix floor kinds
+// routed through zv (Tasks 4/5).
 type liveExecutor struct {
 	prom      metricQuerier
 	state     verifyStateReader
@@ -261,31 +306,47 @@ type liveExecutor struct {
 	now       time.Time
 	maxSeries int
 	logger    *slog.Logger
+	zv        *zabbixVerifier
 }
 
 func (e *liveExecutor) execute(ctx context.Context, q *VerificationQuery) {
-	runOneQuery(ctx, e.prom, e.state, q, e.inc, e.now, e.maxSeries, e.logger)
+	switch q.Kind {
+	case kindZabbixReachability:
+		e.zv.runReachability(ctx, q)
+	case kindZabbixNeighborProblems:
+		e.zv.runNeighborProblems(ctx, q)
+	default:
+		runOneQuery(ctx, e.prom, e.state, q, e.inc, e.now, e.maxSeries, e.logger)
+	}
 }
 
-// runVerification executes the floor queries (always: peer up-ratio +
-// cross-incident scan), the governing verdict's operator-sourced steering
-// queries (buildSteeringQueries, ADR-0029), and every model-proposed query
-// against the live backends, each under its own slice of the shared
-// query-phase budget, filling Outcome and Result on every query (R2/R3).
-// Never returns an error — a query's own failure lands in its Outcome/Result,
-// it never aborts the round or the ones after it.
+// runVerification executes the pre-composed floor (composeFloor — whichever
+// of peer up-ratio, the Zabbix reachability/neighbor-problems pair, and the
+// universal cross-incident scan apply, ADR-0034), the governing verdict's
+// operator-sourced steering queries (buildSteeringQueries, ADR-0029), and
+// every model-proposed query against the live backends, each under its own
+// slice of the shared query-phase budget, filling Outcome and Result on every
+// query (R2/R3). Never returns an error — a query's own failure lands in its
+// Outcome/Result, it never aborts the round or the ones after it.
 //
 // The pipeline (verifyAndRejudge) passes the real skill logger; the runner tests
-// pass nil (defaulted to slog.Default below).
-func runVerification(ctx context.Context, prom metricQuerier, state verifyStateReader,
-	params VerificationParams, inc store.Incident, alerts []store.Alert,
+// pass nil (defaulted to slog.Default below). zabbixSeed pre-populates the
+// round's zabbixVerifier cache from chunk-02's FetchZabbixContext fetch
+// (analysisResult.zabbixSeed) — the pipeline's only caller; runner tests pass
+// nil and pay the normal live-fetch cost.
+func runVerification(ctx context.Context, prom metricQuerier, zbx ZabbixReader, state verifyStateReader,
+	params VerificationParams, inc store.Incident, floor []VerificationQuery,
 	draft DraftRef, operatorQueries, modelQueries []VerificationQuery, now time.Time, logger *slog.Logger,
+	zabbixSeed map[string]zabbix.Topology,
 ) *VerificationRound {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	exec := &liveExecutor{prom: prom, state: state, inc: inc, now: now, maxSeries: params.MaxSeries, logger: logger}
-	return runVerificationWith(ctx, exec, params, alerts, draft, operatorQueries, modelQueries, now)
+	zv := newZabbixVerifier(zbx, logger, inc.ID)
+	zv.seedHostContext(zabbixSeed)
+	exec := &liveExecutor{prom: prom, state: state, inc: inc, now: now, maxSeries: params.MaxSeries,
+		logger: logger, zv: zv}
+	return runVerificationWith(ctx, exec, params, floor, draft, operatorQueries, modelQueries, now)
 }
 
 // runVerificationWith is runVerification's executor-parameterized core: every
@@ -297,10 +358,10 @@ func runVerification(ctx context.Context, prom metricQuerier, state verifyStateR
 // model's own proposals; like the floor they are exempt from MaxQueries —
 // they are deterministic and separately capped at maxSteeringQueries (D10).
 func runVerificationWith(ctx context.Context, exec queryExecutor, params VerificationParams,
-	alerts []store.Alert, draft DraftRef, operatorQueries, modelQueries []VerificationQuery, now time.Time,
+	floor []VerificationQuery, draft DraftRef, operatorQueries, modelQueries []VerificationQuery, now time.Time,
 ) *VerificationRound {
-	queries := make([]VerificationQuery, 0, 2+len(operatorQueries)+len(modelQueries))
-	queries = append(queries, floorPlan(alerts)...)
+	queries := make([]VerificationQuery, 0, len(floor)+len(operatorQueries)+len(modelQueries))
+	queries = append(queries, floor...)
 	queries = append(queries, operatorQueries...)
 	queries = append(queries, modelQueries...)
 
@@ -317,18 +378,29 @@ func runVerificationWith(ctx context.Context, exec queryExecutor, params Verific
 	// effective deadline can never exceed its parent's, so once
 	// queryPhaseCtx's own deadline passes, every further query's context is
 	// already expired and fails fast — trailing queries are simply cut off
-	// rather than the round running long. len(queries) is never 0 — floorPlan
-	// always contributes its two entries.
+	// rather than the round running long. len(queries) is never 0 — composeFloor
+	// always contributes at least the incidents_in_window entry.
 	budget := time.Duration(params.QueryTimeoutSeconds) * time.Second
 	queryPhaseCtx, phaseCancel := context.WithTimeout(ctx, budget)
 	defer phaseCancel()
-	perQuery := budget / time.Duration(len(queries))
-	if perQuery < minPerQueryTimeout {
-		perQuery = minPerQueryTimeout
+
+	// Slices are weighted, not split evenly: the Zabbix floor kinds can issue
+	// up to 3 sequential RPCs on a cache miss (HostContext + HostGroups +
+	// GroupOpenProblems) versus one RPC pair for everything else, so an equal
+	// split would squeeze a legitimately slower query into the same share as
+	// a single aggregate query and misreport it as degraded/timed-out under
+	// load that Zabbix itself, not the query shape, caused.
+	totalWeight := 0
+	for i := range queries {
+		totalWeight += queryWeight(queries[i].Kind)
 	}
 
 	for i := range queries {
-		qCtx, cancel := context.WithTimeout(queryPhaseCtx, perQuery)
+		slice := budget * time.Duration(queryWeight(queries[i].Kind)) / time.Duration(totalWeight)
+		if slice < minPerQueryTimeout {
+			slice = minPerQueryTimeout
+		}
+		qCtx, cancel := context.WithTimeout(queryPhaseCtx, slice)
 		exec.execute(qCtx, &queries[i])
 		cancel()
 	}
@@ -337,11 +409,13 @@ func runVerificationWith(ctx context.Context, exec queryExecutor, params Verific
 }
 
 // runOneQuery dispatches one query to its kind-specific executor, filling its
-// Outcome and Result in place. The closed kind set (kindUpRatio,
-// kindIncidentsInWindow, kindPromQL) is enforced upstream — floorPlan only
-// ever emits the first two, parseVerificationPlan only ever lets the latter
-// two through — so the default branch below is unreachable in practice; it
-// exists as a fail-safe rather than a silent no-op if that ever changes.
+// Outcome and Result in place. The closed kind set here (kindUpRatio,
+// kindIncidentsInWindow, kindPromQL) is enforced upstream — composeFloor only
+// ever emits up_ratio/incidents_in_window (the Zabbix floor kinds are routed
+// away by liveExecutor.execute before reaching here), parseVerificationPlan
+// only ever lets promql/incidents_in_window through — so the default branch
+// below is unreachable in practice; it exists as a fail-safe rather than a
+// silent no-op if that ever changes.
 func runOneQuery(ctx context.Context, prom metricQuerier, state verifyStateReader,
 	q *VerificationQuery, inc store.Incident, now time.Time, maxSeries int, logger *slog.Logger,
 ) {
@@ -362,7 +436,7 @@ func runOneQuery(ctx context.Context, prom metricQuerier, state verifyStateReade
 // runUpRatio executes the floor's peer-scope health check: sum(up{scope}) and
 // count(up{scope}) as two instant queries sharing this query's one budget
 // slice (never a series dump — always an aggregate pair, D7). scope is the
-// query's Expr, set by floorPlan to parentScope(alerts); "" renders an
+// query's Expr, set by composeFloor to parentScope(alerts); "" renders an
 // unscoped global ratio rather than a matcher that is really just the
 // incident's own target.
 func runUpRatio(ctx context.Context, prom metricQuerier, q *VerificationQuery, now time.Time, logger *slog.Logger, incidentID string) {
@@ -455,20 +529,27 @@ func runPromQL(ctx context.Context, prom metricQuerier, q *VerificationQuery, ma
 	q.Result = capText(flattenRecalled(strings.Join(lines, "; ")), 400)
 }
 
-// classifyErr maps a single query error to its Outcome/Result: a
-// context.DeadlineExceeded is this query's own per-slice timeout (backend
-// reachable but too slow to answer within its share of the budget) —
-// OutcomeDegraded, distinct from a genuine failure, mirroring the 0.7.3
-// slow-is-not-down distinction in FetchMetrics/classify. Any other error is a
-// hard failure — OutcomeFailed.
+// isHardErr reports whether err is more than a mere timeout — the shared
+// "hard error beats timeout" classification every partial-failure path in
+// this package uses (classifyErr, classifyPairErrs, zabbixVerifier's
+// runReachability): a context.DeadlineExceeded is this query's own per-slice
+// timeout (backend reachable but too slow to answer within its share of the
+// budget), distinct from a genuine failure.
+func isHardErr(err error) bool {
+	return err != nil && !errors.Is(err, context.DeadlineExceeded)
+}
+
+// classifyErr maps a single query error to its Outcome/Result: a timeout is
+// OutcomeDegraded (mirroring the 0.7.3 slow-is-not-down distinction in
+// FetchMetrics/classify); any other error is OutcomeFailed.
 func classifyErr(q *VerificationQuery, err error) {
-	if errors.Is(err, context.DeadlineExceeded) {
-		q.Outcome = OutcomeDegraded
-		q.Result = renderUnavailable("timed out")
+	if isHardErr(err) {
+		q.Outcome = OutcomeFailed
+		q.Result = renderUnavailable("failed")
 		return
 	}
-	q.Outcome = OutcomeFailed
-	q.Result = renderUnavailable("failed")
+	q.Outcome = OutcomeDegraded
+	q.Result = renderUnavailable("timed out")
 }
 
 // classifyPairErrs is classifyErr for up_ratio's two sub-queries sharing one
@@ -476,9 +557,7 @@ func classifyErr(q *VerificationQuery, err error) {
 // the other (the more actionable outage — same precedent as FetchMetrics'
 // anyHardErr/anyTimeout: "hard error beats timeout").
 func classifyPairErrs(q *VerificationQuery, sumErr, countErr error) {
-	hardErr := (sumErr != nil && !errors.Is(sumErr, context.DeadlineExceeded)) ||
-		(countErr != nil && !errors.Is(countErr, context.DeadlineExceeded))
-	if hardErr {
+	if isHardErr(sumErr) || isHardErr(countErr) {
 		q.Outcome = OutcomeFailed
 		q.Result = renderUnavailable("failed")
 		return
@@ -576,55 +655,106 @@ func firstInstantValue(raw json.RawMessage) (string, bool) {
 }
 
 // floorFetched is the first of the two R15 rails: every floor query
-// (Source=="floor") fetched or found nothing. A failed or degraded
-// MODEL-targeted query alone must never flip this — the floor is the promised
-// minimum, targeted queries are bonus precision on top (R15).
+// (Source=="floor") fetched or found nothing, AND at least one of them came
+// from a real backend. A failed or degraded MODEL-targeted query alone must
+// never flip this — the floor is the promised minimum, targeted queries are
+// bonus precision on top (R15).
+//
+// The real-backend requirement matters because composeFloor (ADR-0034) is
+// presence-based: an install with no Prometheus and no Zabbix configured — or
+// Zabbix configured but the incident lacking host identity — composes a floor
+// of ONLY kindIncidentsInWindow, this install's own SQLite bookkeeping, which
+// almost always fetches. Without excluding it, such an install would silently
+// clear the caveat on the strength of nothing but its own query, on every
+// triage. Requiring at least one non-incidents_in_window floor member
+// restores the pre-Task-6 behavior for a zero-real-backend install: back then
+// the floor always included up_ratio, which unconditionally failed
+// "prometheus not configured" absent Prometheus, so floorFetched was reliably
+// false and the 0.6 metadata-only confidence cap's caveat never cleared.
 func floorFetched(r *VerificationRound) bool {
 	if r == nil {
 		return false
 	}
+	sawRealSource := false
 	for _, q := range r.Queries {
 		if q.Source != "floor" {
 			continue
+		}
+		if isRealFloorSource(q) {
+			sawRealSource = true
 		}
 		if q.Outcome != OutcomeFetched && q.Outcome != OutcomeEmpty {
 			return false
 		}
 	}
-	return true
+	return sawRealSource
+}
+
+// isRealFloorSource reports whether q is a floor query backed by a real
+// external observation rather than kindIncidentsInWindow (this install's own
+// SQLite bookkeeping) — the one predicate floorFetched and anyUnfetched both
+// need and must agree on, shared here so a future floor source only needs
+// this single definition updated to stay in sync across both R15 rails.
+func isRealFloorSource(q VerificationQuery) bool {
+	return q.Source == "floor" && q.Kind != kindIncidentsInWindow
 }
 
 // anyUnfetched is the second R15 rail, backing the confidence clamp: any
 // query — floor OR model — that failed or degraded. An empty result still
 // counts as fetched here ("asked, nothing there" is itself an answer), so
-// only OutcomeFailed/OutcomeDegraded trip it.
+// only OutcomeFailed/OutcomeDegraded trip it directly.
+//
+// It also trips symmetrically with floorFetched's zero-real-backend fix: a
+// round whose only floor member is kindIncidentsInWindow (this install's own
+// SQLite bookkeeping, never a real observation) never fails or degrades — it
+// unconditionally fetches — so without this second condition, a zero-backend
+// install (no Prometheus, no Zabbix — or Zabbix configured but the incident
+// lacking host identity) would report anyUnfetched == false even though
+// nothing external was ever checked. That would silently disable the R15
+// clamp on exactly the installs where it matters most: those with OTHER live
+// evidence sources configured (e.g. Sentry, GitHub) where the 0.6
+// metadata-only cap does not apply, leaving the clamp as the only thing
+// stopping a re-judge from inflating confidence on zero verification.
 func anyUnfetched(r *VerificationRound) bool {
 	if r == nil {
 		return false
 	}
+	sawRealFloorSource := false
 	for _, q := range r.Queries {
 		if q.Outcome == OutcomeFailed || q.Outcome == OutcomeDegraded {
 			return true
 		}
+		if isRealFloorSource(q) {
+			sawRealFloorSource = true
+		}
 	}
-	return false
+	return !sawRealFloorSource
 }
 
-// verificationLive is the R17 cap-interaction predicate: whether any up_ratio
-// or promql query across every round actually fetched. A fetched PromQL
-// observation (whether the floor's aggregate ratio or a model-targeted query)
-// is a real observation of the infrastructure and counts as live evidence for
-// hasLiveEvidence; incidents_in_window never does — it is this install's own
-// SQLite bookkeeping, not an external observation. An install without
-// Prometheus configured therefore never trips this, leaving today's 0.6-cap
+// verificationLive is the R17 cap-interaction predicate: whether any
+// floor-source or promql query across every round actually fetched. A
+// fetched observation from any floor source — Prometheus's aggregate ratio,
+// a model promql, or the Zabbix floor's polling verdict / live problem
+// evaluation — is a real observation of the infrastructure and counts as
+// live evidence (ADR-0034 phase symmetry); incidents_in_window never does —
+// it is this install's own SQLite bookkeeping. An install with no floor
+// source configured therefore never trips this, leaving the 0.6-cap
 // behavior untouched.
+//
+// The check is Kind != kindIncidentsInWindow rather than an explicit
+// allowlist of the other kinds by name, so a future floor source's new kind
+// counts automatically instead of requiring this switch to be remembered and
+// extended — the same generalization floorFetched/anyUnfetched already use
+// via isRealFloorSource (this predicate also covers a model-proposed
+// kindPromQL query, which isRealFloorSource's Source=="floor" check would
+// exclude, so it stays its own definition rather than reusing that one).
 func verificationLive(v *VerificationEnrichment) bool {
 	if v == nil {
 		return false
 	}
 	for _, round := range v.Rounds {
 		for _, q := range round.Queries {
-			if (q.Kind == kindUpRatio || q.Kind == kindPromQL) && q.Outcome == OutcomeFetched {
+			if q.Kind != kindIncidentsInWindow && q.Outcome == OutcomeFetched {
 				return true
 			}
 		}
@@ -659,7 +789,7 @@ func renderVerificationResults(b *strings.Builder, r *VerificationRound) {
 
 // snapshotExecutor serves verification queries from the frozen snapshot:
 // original round results + widened entries (source "capture"). Floor queries
-// regenerate byte-identical (floorPlan is deterministic) and hit; model
+// regenerate byte-identical (composeFloor is deterministic) and hit; model
 // queries exact-match; a miss returns "no data (replay)" — OutcomeEmpty, the
 // same "asked, nothing there" class the 0.8.3 empty-result calibration
 // already teaches the model to weigh. Not safe for concurrent use (the round
@@ -680,10 +810,16 @@ func newSnapshotExecutor(frozen []VerificationQuery) *snapshotExecutor {
 
 // snapshotKey normalizes a query to its match identity: kind+expr for
 // promql/up_ratio, kind+window for incidents_in_window (numbers arrive as
-// float64 from frozen JSON and as int from live params — normalize both).
+// float64 from frozen JSON and as int from live params — normalize both),
+// kind+checked-hosts for the two Zabbix floor kinds (hostsFromParams already
+// tolerates the []any-vs-[]string shape difference between a frozen envelope
+// and a live-composed query, Task 3).
 func snapshotKey(q VerificationQuery) string {
-	if q.Kind == kindIncidentsInWindow {
+	switch q.Kind {
+	case kindIncidentsInWindow:
 		return q.Kind + "\x1f" + strconv.Itoa(windowMinutesFromParams(q.Params))
+	case kindZabbixReachability, kindZabbixNeighborProblems:
+		return q.Kind + "\x1f" + strings.Join(hostsFromParams(q.Params), ",")
 	}
 	return q.Kind + "\x1f" + q.Expr
 }

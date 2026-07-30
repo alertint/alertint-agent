@@ -5,10 +5,12 @@ package zabbix_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -189,5 +191,109 @@ func TestMetricHistory_OldWindowUsesTrends(t *testing.T) {
 	}
 	if !calledTrend || s.Source != "trends" {
 		t.Fatalf("want trend.get used, got calledTrend=%v source=%q", calledTrend, s.Source)
+	}
+}
+
+func TestHostGroups_ResolvesNamesToIDsAndCounts(t *testing.T) {
+	var gotMethod string
+	var gotParams map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string         `json:"method"`
+			Params map[string]any `json:"params"`
+		}
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &req)
+		gotMethod, gotParams = req.Method, req.Params
+		// selectHosts:"count" renders the count as a string in "hosts".
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[
+			{"groupid":"4","name":"Databases","hosts":"17"},
+			{"groupid":"9","name":"Linux servers","hosts":"77"}],"id":1}`))
+	}))
+	defer srv.Close()
+
+	c := zabbix.NewClient(zabbix.Config{BaseURL: srv.URL, APIToken: "t"})
+	infos, err := c.HostGroups(context.Background(), []string{"Databases", "Linux servers"})
+	if err != nil {
+		t.Fatalf("HostGroups: %v", err)
+	}
+	if gotMethod != "hostgroup.get" {
+		t.Fatalf("method = %q, want hostgroup.get", gotMethod)
+	}
+	if gotParams["selectHosts"] != "count" {
+		t.Fatalf("selectHosts = %v, want count", gotParams["selectHosts"])
+	}
+	want := []zabbix.HostGroupInfo{{GroupID: "4", Name: "Databases", Hosts: 17}, {GroupID: "9", Name: "Linux servers", Hosts: 77}}
+	if !reflect.DeepEqual(infos, want) {
+		t.Fatalf("infos = %+v, want %+v", infos, want)
+	}
+}
+
+// TestHostGroups_MalformedHostsCountReturnsError guards against a degraded or
+// proxied Zabbix response silently ranking a group as size 0 (the parse
+// error must surface, not be swallowed) — a size-0 group would jump the
+// queue in the neighbor check's smallest-first scope selection ahead of
+// legitimately small groups.
+func TestHostGroups_MalformedHostsCountReturnsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[
+			{"groupid":"4","name":"Databases","hosts":"not-a-number"}],"id":1}`))
+	}))
+	defer srv.Close()
+
+	c := zabbix.NewClient(zabbix.Config{BaseURL: srv.URL, APIToken: "t"})
+	infos, err := c.HostGroups(context.Background(), []string{"Databases"})
+	if err == nil {
+		t.Fatalf("HostGroups: want error on malformed host count, got infos = %+v", infos)
+	}
+	if !strings.Contains(err.Error(), "Databases") {
+		t.Fatalf("err = %v, want it to name the offending group", err)
+	}
+}
+
+func TestGroupOpenProblems_QueriesByGroupIDs(t *testing.T) {
+	var gotMethod string
+	var gotParams map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string         `json:"method"`
+			Params map[string]any `json:"params"`
+		}
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &req)
+		gotMethod, gotParams = req.Method, req.Params
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[
+			{"eventid":"101","name":"Disk full","severity":"4","clock":"1700000000","acknowledged":"0","suppressed":"1","tags":[]}],"id":1}`))
+	}))
+	defer srv.Close()
+
+	c := zabbix.NewClient(zabbix.Config{BaseURL: srv.URL, APIToken: "t"})
+	probs, err := c.GroupOpenProblems(context.Background(), []string{"4", "9"}, zabbix.ProblemSelector{})
+	if err != nil {
+		t.Fatalf("GroupOpenProblems: %v", err)
+	}
+	if gotMethod != "problem.get" {
+		t.Fatalf("method = %q, want problem.get", gotMethod)
+	}
+	if _, ok := gotParams["hostids"]; ok {
+		t.Fatal("hostids must not be set on a group-scoped query")
+	}
+	if got, ok := gotParams["groupids"].([]any); !ok || len(got) != 2 {
+		t.Fatalf("groupids = %v, want 2 ids", got)
+	}
+	if len(probs) != 1 || probs[0].EventID != "101" || !probs[0].Suppressed {
+		t.Fatalf("probs = %+v", probs)
+	}
+}
+
+func TestHostContext_NoHostWrapsErrNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[],"id":1}`))
+	}))
+	defer srv.Close()
+	c := zabbix.NewClient(zabbix.Config{BaseURL: srv.URL, APIToken: "t"})
+	_, err := c.HostContext(context.Background(), "ghost")
+	if !errors.Is(err, zabbix.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
 }

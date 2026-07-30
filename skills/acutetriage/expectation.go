@@ -123,8 +123,11 @@ func (s *Skill) stage1Corpus(inc store.Incident, alerts []store.Alert, frozen fr
 	for _, m := range instanceSupplements(alerts) {
 		b.WriteString("\n" + m)
 	}
-	for _, q := range floorPlan(alerts) {
+	for _, q := range composeFloor(s.verifyParams(), s.cfg.ZabbixParams.HostLabel, alerts) {
 		b.WriteString("\n" + q.Expr)
+		if hs := hostsFromParams(q.Params); len(hs) > 0 {
+			b.WriteString("\n" + strings.Join(hs, ","))
+		}
 	}
 	if frozen.Metrics != nil {
 		if sb, err := json.Marshal(frozen.Metrics); err == nil {

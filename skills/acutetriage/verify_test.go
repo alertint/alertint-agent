@@ -7,12 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/store"
+	"github.com/alertint/alertint-agent/internal/zabbix"
 )
 
 func alertWithLabels(labels map[string]string) store.Alert {
@@ -97,10 +99,13 @@ func TestParentScopeInstanceOnlyIsUnscoped(t *testing.T) {
 	}
 }
 
-// T1 half 1: the floor is always two queries, regardless of anything.
+// T1 half 1: with the Prometheus floor source present, the composed floor is
+// always the same two queries, regardless of anything else about the alerts
+// — this is the old floorPlan behavior, now reached via composeFloor with
+// HasPromQL: true (byte-identical to the pre-composition floor).
 func TestFloorPlanAlways(t *testing.T) {
 	alerts := []store.Alert{alertWithLabels(map[string]string{"instance": "x"})}
-	fp := floorPlan(alerts)
+	fp := composeFloor(VerificationParams{HasPromQL: true}, "host", alerts)
 	if len(fp) != 2 || fp[0].Kind != kindUpRatio || fp[1].Kind != kindIncidentsInWindow {
 		t.Fatalf("unexpected floor: %+v", fp)
 	}
@@ -111,10 +116,63 @@ func TestFloorPlanAlways(t *testing.T) {
 	}
 }
 
+// composeFloor assembles the deterministic floor from whichever floor
+// sources are configured (ADR-0034): Prometheus's up_ratio, the Zabbix
+// floor's two kinds, plus the universal incidents_in_window own-state check
+// — always last, always present.
+func TestComposeFloor_PromOnly(t *testing.T) {
+	alerts := []store.Alert{alertWithLabels(map[string]string{"namespace": "prod"})}
+	floor := composeFloor(VerificationParams{HasPromQL: true}, "host", alerts)
+	kinds := kindsOf(floor)
+	want := []string{kindUpRatio, kindIncidentsInWindow}
+	if !reflect.DeepEqual(kinds, want) {
+		t.Fatalf("kinds = %v, want %v", kinds, want)
+	}
+}
+
+func TestComposeFloor_ZabbixOnly(t *testing.T) {
+	alerts := []store.Alert{alertWithLabels(map[string]string{"host": "db-01"})}
+	floor := composeFloor(VerificationParams{HasZabbix: true}, "host", alerts)
+	kinds := kindsOf(floor)
+	want := []string{kindZabbixReachability, kindZabbixNeighborProblems, kindIncidentsInWindow}
+	if !reflect.DeepEqual(kinds, want) {
+		t.Fatalf("kinds = %v, want %v", kinds, want)
+	}
+}
+
+func TestComposeFloor_MixedShopGetsBothFloors(t *testing.T) {
+	alerts := []store.Alert{alertWithLabels(map[string]string{"host": "db-01", "namespace": "prod"})}
+	floor := composeFloor(VerificationParams{HasPromQL: true, HasZabbix: true}, "host", alerts)
+	kinds := kindsOf(floor)
+	want := []string{kindUpRatio, kindZabbixReachability, kindZabbixNeighborProblems, kindIncidentsInWindow}
+	if !reflect.DeepEqual(kinds, want) {
+		t.Fatalf("kinds = %v, want %v", kinds, want)
+	}
+}
+
+func TestComposeFloor_ZabbixConfiguredButNoHostLabel(t *testing.T) {
+	alerts := []store.Alert{alertWithLabels(map[string]string{"alertname": "x"})}
+	floor := composeFloor(VerificationParams{HasZabbix: true}, "host", alerts)
+	kinds := kindsOf(floor)
+	// Not applicable → own-state check only; the round will degrade honestly.
+	want := []string{kindIncidentsInWindow}
+	if !reflect.DeepEqual(kinds, want) {
+		t.Fatalf("kinds = %v, want %v", kinds, want)
+	}
+}
+
+func kindsOf(qs []VerificationQuery) []string {
+	out := make([]string, 0, len(qs))
+	for _, q := range qs {
+		out = append(out, q.Kind)
+	}
+	return out
+}
+
 // T2: a malformed verification block degrades to nil (floor-only), never errors.
 func TestParseVerificationPlanMalformed(t *testing.T) {
 	raw := json.RawMessage(`{"analysis_name":"x","verification":{"queries":"not-a-list"}}`)
-	if got := parseVerificationPlan(raw, 4, nil, "inc1"); got != nil {
+	if got := parseVerificationPlan(raw, VerificationParams{MaxQueries: 4}, nil, "inc1"); got != nil {
 		t.Fatalf("want nil on malformed, got %+v", got)
 	}
 }
@@ -128,7 +186,7 @@ func TestParseVerificationPlanBareArray(t *testing.T) {
 	raw := json.RawMessage(`{"analysis_name":"x","verification":[
 		{"kind":"promql","expr":"up{job=\"db\"}","why":"peers down too?"},
 		{"kind":"incidents_in_window","params":{"window_minutes":30},"why":"anything else firing?"}]}`)
-	got := parseVerificationPlan(raw, 4, nil, "inc1")
+	got := parseVerificationPlan(raw, VerificationParams{MaxQueries: 4, HasPromQL: true}, nil, "inc1")
 	if len(got) != 2 {
 		t.Fatalf("want 2 queries from bare-array shape, got %d: %+v", len(got), got)
 	}
@@ -148,7 +206,7 @@ func TestParseVerificationPlanCapAndKinds(t *testing.T) {
 		{"kind":"promql","expr":"q1"},{"kind":"sql","expr":"DROP TABLE"},
 		{"kind":"promql","expr":"q2"},{"kind":"incidents_in_window","params":{"window_minutes":30}},
 		{"kind":"promql","expr":"q3"},{"kind":"promql","expr":"q4"}]}}`)
-	got := parseVerificationPlan(raw, 4, nil, "inc1")
+	got := parseVerificationPlan(raw, VerificationParams{MaxQueries: 4, HasPromQL: true}, nil, "inc1")
 	if len(got) != 4 {
 		t.Fatalf("want 4 (capped, sql dropped), got %d: %+v", len(got), got)
 	}
@@ -159,6 +217,20 @@ func TestParseVerificationPlanCapAndKinds(t *testing.T) {
 		if q.Source != "model" {
 			t.Fatalf("model query mislabeled: %+v", q)
 		}
+	}
+}
+
+// Task 8/ADR-0034: a model that still proposes promql on a Prometheus-less
+// install must have that query dropped defensively (belt-and-suspenders on
+// top of the prompt no longer offering the kind) — otherwise it always fails,
+// triggering the R15 clamp every re-judge.
+func TestParseVerificationPlan_DropsPromQLWithoutPrometheus(t *testing.T) {
+	raw := json.RawMessage(`{"verification":{"queries":[
+		{"kind":"promql","expr":"up","why":"x"},
+		{"kind":"incidents_in_window","why":"y"}]}}`)
+	qs := parseVerificationPlan(raw, VerificationParams{MaxQueries: 3, HasZabbix: true}, nil, "inc-1")
+	if len(qs) != 1 || qs[0].Kind != kindIncidentsInWindow {
+		t.Fatalf("qs = %+v, want only incidents_in_window", qs)
 	}
 }
 
@@ -179,10 +251,11 @@ func TestRunVerificationHealthyPeers(t *testing.T) {
 	alerts := []store.Alert{alertWithLabels(map[string]string{"namespace": "paysvc-sandbox-staging", "instance": "10.0.0.1"})}
 	model := []VerificationQuery{{Kind: kindPromQL, Source: "model",
 		Expr: `sum by (cluster) (up{env="paysvc-sandbox-staging"})`, Why: "peers down too?"}}
-	r := runVerification(context.Background(), prom, fakeState{total: 0},
-		VerificationParams{Enabled: true, MaxQueries: 4, QueryTimeoutSeconds: 10},
-		store.Incident{ID: "inc1", GroupKey: "db|stolon"}, alerts,
-		DraftRef{RootCause: "regional partition", Confidence: 0.95}, nil, model, time.Now().UTC(), nil)
+	params := VerificationParams{Enabled: true, MaxQueries: 4, QueryTimeoutSeconds: 10, HasPromQL: true}
+	r := runVerification(context.Background(), prom, nil, fakeState{total: 0},
+		params,
+		store.Incident{ID: "inc1", GroupKey: "db|stolon"}, composeFloor(params, "host", alerts),
+		DraftRef{RootCause: "regional partition", Confidence: 0.95}, nil, model, time.Now().UTC(), nil, nil)
 
 	if len(r.Queries) != 3 { // 2 floor + 1 model
 		t.Fatalf("want 3 queries, got %d", len(r.Queries))
@@ -215,10 +288,11 @@ func TestRunVerificationPartialFailure(t *testing.T) {
 	alerts := []store.Alert{alertWithLabels(map[string]string{"namespace": "checkout"})}
 	model := []VerificationQuery{{Kind: kindPromQL, Source: "model",
 		Expr: `bogus_metric{namespace="checkout"}`, Why: "does this exist?"}}
-	r := runVerification(context.Background(), prom, fakeState{total: 0},
-		VerificationParams{Enabled: true, MaxQueries: 4, QueryTimeoutSeconds: 10},
-		store.Incident{ID: "inc1", GroupKey: "db|stolon"}, alerts,
-		DraftRef{RootCause: "x", Confidence: 0.8}, nil, model, time.Now().UTC(), nil)
+	params := VerificationParams{Enabled: true, MaxQueries: 4, QueryTimeoutSeconds: 10, HasPromQL: true}
+	r := runVerification(context.Background(), prom, nil, fakeState{total: 0},
+		params,
+		store.Incident{ID: "inc1", GroupKey: "db|stolon"}, composeFloor(params, "host", alerts),
+		DraftRef{RootCause: "x", Confidence: 0.8}, nil, model, time.Now().UTC(), nil, nil)
 
 	if len(r.Queries) != 3 {
 		t.Fatalf("want 3 queries, got %d", len(r.Queries))
@@ -244,11 +318,12 @@ func TestRunVerificationPromDown(t *testing.T) {
 		return nil, errors.New("connection refused")
 	})
 	alerts := []store.Alert{alertWithLabels(map[string]string{"namespace": "checkout"})}
-	r := runVerification(context.Background(), prom,
+	params := VerificationParams{Enabled: true, MaxQueries: 4, QueryTimeoutSeconds: 10, HasPromQL: true}
+	r := runVerification(context.Background(), prom, nil,
 		fakeState{total: 1, top: []store.WindowIncident{{GroupKey: "a|b", Status: "analyzed", Severity: "warning", AlertCount: 1}}},
-		VerificationParams{Enabled: true, MaxQueries: 4, QueryTimeoutSeconds: 10},
-		store.Incident{ID: "inc1", GroupKey: "db|stolon"}, alerts,
-		DraftRef{RootCause: "x", Confidence: 0.8}, nil, nil, time.Now().UTC(), nil)
+		params,
+		store.Incident{ID: "inc1", GroupKey: "db|stolon"}, composeFloor(params, "host", alerts),
+		DraftRef{RootCause: "x", Confidence: 0.8}, nil, nil, time.Now().UTC(), nil, nil)
 
 	if len(r.Queries) != 2 { // floor only, no model queries proposed
 		t.Fatalf("want 2 queries, got %d", len(r.Queries))
@@ -273,10 +348,11 @@ func TestRunVerificationPromDown(t *testing.T) {
 // query is unaffected (R3 note in Step 3).
 func TestRunVerificationNilProm(t *testing.T) {
 	alerts := []store.Alert{alertWithLabels(map[string]string{"namespace": "checkout"})}
-	r := runVerification(context.Background(), nil, fakeState{total: 0},
-		VerificationParams{Enabled: true, MaxQueries: 4, QueryTimeoutSeconds: 10},
-		store.Incident{ID: "inc1", GroupKey: "db|stolon"}, alerts,
-		DraftRef{RootCause: "x", Confidence: 0.8}, nil, nil, time.Now().UTC(), nil)
+	params := VerificationParams{Enabled: true, MaxQueries: 4, QueryTimeoutSeconds: 10, HasPromQL: true}
+	r := runVerification(context.Background(), nil, nil, fakeState{total: 0},
+		params,
+		store.Incident{ID: "inc1", GroupKey: "db|stolon"}, composeFloor(params, "host", alerts),
+		DraftRef{RootCause: "x", Confidence: 0.8}, nil, nil, time.Now().UTC(), nil, nil)
 
 	upRatio := r.Queries[0]
 	if upRatio.Outcome != OutcomeFailed || !strings.Contains(upRatio.Result, "prometheus not configured") {
@@ -287,6 +363,31 @@ func TestRunVerificationNilProm(t *testing.T) {
 	}
 	if floorFetched(r) {
 		t.Fatal("nil prom must fail the floor (up_ratio never fetched)")
+	}
+}
+
+// TestRunVerification_ZabbixSeedAvoidsRedundantFetch proves runVerification's
+// zabbixSeed parameter (analysisResult.zabbixSeed, from chunk-02's
+// FetchZabbixContext) actually reaches the round's zabbixVerifier: a seeded
+// host's reachability check must serve the seed, never call the live reader.
+func TestRunVerification_ZabbixSeedAvoidsRedundantFetch(t *testing.T) {
+	z := &scriptedZabbixReader{hostCtx: func(string) (zabbix.Topology, error) {
+		t.Fatal("seeded host must not hit the live ZabbixReader")
+		return zabbix.Topology{}, nil
+	}}
+	floor := []VerificationQuery{{Kind: kindZabbixReachability, Source: "floor",
+		Params: map[string]any{"hosts": []string{"db-01"}, "hosts_total": float64(1)}}}
+	params := VerificationParams{Enabled: true, MaxQueries: 4, QueryTimeoutSeconds: 10, HasZabbix: true}
+	seed := map[string]zabbix.Topology{
+		"db-01": {Interfaces: []zabbix.IfaceState{{Addr: "a", Available: "1"}}},
+	}
+	r := runVerification(context.Background(), nil, z, fakeState{total: 0},
+		params,
+		store.Incident{ID: "inc1", GroupKey: "db|stolon"}, floor,
+		DraftRef{RootCause: "x", Confidence: 0.8}, nil, nil, time.Now().UTC(), nil, seed)
+
+	if r.Queries[0].Outcome != OutcomeFetched {
+		t.Fatalf("zabbix_reachability outcome = %q, want fetched from the seed", r.Queries[0].Outcome)
 	}
 }
 
@@ -322,6 +423,35 @@ func TestFloorFetchedAndAnyUnfetched(t *testing.T) {
 	}
 }
 
+// A zero-backend install (no Prometheus, no Zabbix — or Zabbix configured but
+// the incident lacks host identity) composes a floor of ONLY
+// incidents_in_window (own-state SQLite bookkeeping). That alone must never
+// satisfy floorFetched — matching the pre-Task-6 behavior where an
+// unconfigured up_ratio reliably failed and kept the caveat forever on such
+// an install (the 0.6 metadata-only confidence cap persona).
+func TestFloorFetchedZeroBackendNeverClears(t *testing.T) {
+	r := &VerificationRound{Queries: []VerificationQuery{
+		{Source: "floor", Kind: kindIncidentsInWindow, Outcome: OutcomeFetched},
+	}}
+	if floorFetched(r) {
+		t.Fatal("incidents_in_window alone (no real backend contributed) must never satisfy floorFetched")
+	}
+}
+
+// The same zero-backend shape must also trip anyUnfetched — extending R15's
+// clamp rail symmetrically with floorFetched's fix above. Without this, a
+// zero-real-backend round (nothing failed or degraded, because nothing real
+// was even asked) would report anyUnfetched == false, silently disabling the
+// confidence clamp on an install where nothing was actually verified.
+func TestAnyUnfetched_IncidentsInWindowOnlyCountsAsUnfetched(t *testing.T) {
+	r := &VerificationRound{Queries: []VerificationQuery{
+		{Source: "floor", Kind: kindIncidentsInWindow, Outcome: OutcomeFetched},
+	}}
+	if !anyUnfetched(r) {
+		t.Fatal("incidents_in_window alone (no real backend contributed) must count as unfetched for the clamp")
+	}
+}
+
 func TestVerificationLive(t *testing.T) {
 	if verificationLive(nil) {
 		t.Fatal("nil enrichment must not be live")
@@ -346,6 +476,28 @@ func TestVerificationLive(t *testing.T) {
 	}}}}
 	if !verificationLive(v2) {
 		t.Fatal("a fetched up_ratio query must also count as live evidence")
+	}
+}
+
+func TestVerificationLive_ZabbixFloorCounts(t *testing.T) {
+	cases := []struct {
+		name string
+		kind string
+		out  Outcome
+		want bool
+	}{
+		{"reachability fetched lifts", kindZabbixReachability, OutcomeFetched, true},
+		{"neighbor fetched lifts", kindZabbixNeighborProblems, OutcomeFetched, true},
+		{"neighbor empty does not lift", kindZabbixNeighborProblems, OutcomeEmpty, false},
+		{"reachability failed does not lift", kindZabbixReachability, OutcomeFailed, false},
+		{"incidents_in_window never lifts", kindIncidentsInWindow, OutcomeFetched, false},
+	}
+	for _, tc := range cases {
+		v := &VerificationEnrichment{Rounds: []VerificationRound{{Queries: []VerificationQuery{
+			{Kind: tc.kind, Outcome: tc.out}}}}}
+		if got := verificationLive(v); got != tc.want {
+			t.Errorf("%s: verificationLive = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 
@@ -424,10 +576,10 @@ func (e *countingExecutor) execute(_ context.Context, q *VerificationQuery) {
 func TestRunVerificationWith_UsesExecutorForEveryQuery(t *testing.T) {
 	alerts := []store.Alert{alertWithLabels(map[string]string{"namespace": "prod"})}
 	exec := &countingExecutor{}
-	params := VerificationParams{MaxQueries: 4, QueryTimeoutSeconds: 5, MaxSeries: 100}
+	params := VerificationParams{MaxQueries: 4, QueryTimeoutSeconds: 5, MaxSeries: 100, HasPromQL: true}
 	modelQ := []VerificationQuery{{Kind: kindPromQL, Source: "model", Expr: "up"}}
 
-	round := runVerificationWith(context.Background(), exec, params, alerts, DraftRef{}, nil, modelQ, time.Now())
+	round := runVerificationWith(context.Background(), exec, params, composeFloor(params, "host", alerts), DraftRef{}, nil, modelQ, time.Now())
 	if exec.calls != 3 { // 2 floor queries + 1 model query
 		t.Fatalf("executor calls = %d, want 3", exec.calls)
 	}
@@ -444,8 +596,9 @@ func TestRunVerificationWith_OperatorQueriesRideTheRound(t *testing.T) {
 	exec := &countingExecutor{}
 	op := []VerificationQuery{{Kind: kindPromQL, Source: sourceOperator, Expr: "pvc_bytes", Why: "probe"}}
 	model := []VerificationQuery{{Kind: kindPromQL, Source: "model", Expr: "up", Why: "check"}}
-	round := runVerificationWith(context.Background(), exec, VerificationParams{QueryTimeoutSeconds: 5},
-		nil, DraftRef{}, op, model, time.Now())
+	params := VerificationParams{QueryTimeoutSeconds: 5, HasPromQL: true}
+	round := runVerificationWith(context.Background(), exec, params,
+		composeFloor(params, "host", nil), DraftRef{}, op, model, time.Now())
 	if len(round.Queries) != 4 { // 2 floor + 1 operator + 1 model
 		t.Fatalf("want 4 queries, got %d", len(round.Queries))
 	}
@@ -481,7 +634,7 @@ func (e *deadlineRecordingExecutor) execute(ctx context.Context, q *Verification
 func TestRunVerificationWith_PerQueryFloor_FullElevenQueryCase(t *testing.T) {
 	alerts := []store.Alert{alertWithLabels(map[string]string{"namespace": "prod"})}
 	exec := &deadlineRecordingExecutor{}
-	params := VerificationParams{QueryTimeoutSeconds: 5} // 5s / 11 ≈ 454ms naive — well under the floor
+	params := VerificationParams{QueryTimeoutSeconds: 5, HasPromQL: true} // 5s / 11 ≈ 454ms naive — well under the floor
 
 	operatorQ := make([]VerificationQuery, 5)
 	for i := range operatorQ {
@@ -492,7 +645,7 @@ func TestRunVerificationWith_PerQueryFloor_FullElevenQueryCase(t *testing.T) {
 		modelQ[i] = VerificationQuery{Kind: kindPromQL, Source: "model", Expr: fmt.Sprintf("m%d", i)}
 	}
 
-	round := runVerificationWith(context.Background(), exec, params, alerts, DraftRef{}, operatorQ, modelQ, time.Now())
+	round := runVerificationWith(context.Background(), exec, params, composeFloor(params, "host", alerts), DraftRef{}, operatorQ, modelQ, time.Now())
 	if len(round.Queries) != 11 {
 		t.Fatalf("want 11 queries (2 floor + 5 operator + 4 model), got %d", len(round.Queries))
 	}
