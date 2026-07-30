@@ -18,6 +18,7 @@ import (
 	"github.com/alertint/alertint-agent/internal/llm"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/store"
+	"github.com/alertint/alertint-agent/internal/zabbix"
 	"github.com/alertint/alertint-agent/skills/acutetriage"
 )
 
@@ -1413,5 +1414,153 @@ func TestSteering_ConfirmationRetiresSteering(t *testing.T) {
 	}
 	if f.confidence != 0.85 {
 		t.Errorf("confidence = %v, want 0.85 (no clamp — confirmation does not steer)", f.confidence)
+	}
+}
+
+// --------------------------------------------------------------------------
+// Task 9 — the Zabbix verification floor's acceptance test: a Zabbix-only
+// install (no Prometheus configured anywhere) must still clear the
+// metadata-only caveat and ship uncapped confidence, because the Zabbix
+// floor (reachability + neighbor-problems) is a real backend and
+// floorFetched/verificationLive must recognize it as such — proving Tasks
+// 1-8's composeFloor + floorFetched + verificationLive chain works end to
+// end on a real pipeline run, not just in isolated unit tests.
+// --------------------------------------------------------------------------
+
+// pipelineZabbix is the minimal exported-interface fake for the Zabbix-only
+// integration case: one healthy host in one functional group ("Databases",
+// 17 hosts total in HostGroups — 16 peers once the checked host itself is
+// excluded), no neighbor problems. TriggerContext/ProblemContext exist only
+// to satisfy ZabbixReader in full: this test's alert carries a host label
+// and a zabbix_event_id LABEL (what the floor's exclude-list reads), but no
+// zabbix_trigger_id label and no zabbix_event_id ANNOTATION (what
+// FetchZabbixContext's operator/problem classes read), so neither method is
+// ever actually called — both return loud errors as a tripwire if that ever
+// changes.
+type pipelineZabbix struct{}
+
+func (pipelineZabbix) TriggerContext(context.Context, string) (zabbix.Operator, error) {
+	return zabbix.Operator{}, fmt.Errorf("zabbix: no trigger")
+}
+func (pipelineZabbix) ProblemContext(context.Context, string) (zabbix.ProblemDetail, error) {
+	return zabbix.ProblemDetail{}, fmt.Errorf("zabbix: no problem")
+}
+func (pipelineZabbix) HostContext(context.Context, string) (zabbix.Topology, error) {
+	return zabbix.Topology{Groups: []string{"Databases"},
+		Interfaces: []zabbix.IfaceState{{Addr: "10.0.0.1", Available: "1"}}}, nil
+}
+func (pipelineZabbix) FlapCount(context.Context, string, time.Time) (int, error) { return 0, nil }
+func (pipelineZabbix) OpenProblems(context.Context, string, zabbix.ProblemSelector) ([]zabbix.Problem, error) {
+	return nil, nil
+}
+func (pipelineZabbix) HostGroups(context.Context, []string) ([]zabbix.HostGroupInfo, error) {
+	return []zabbix.HostGroupInfo{{GroupID: "1", Name: "Databases", Hosts: 17}}, nil
+}
+func (pipelineZabbix) GroupOpenProblems(context.Context, []string, zabbix.ProblemSelector) ([]zabbix.Problem, error) {
+	return nil, nil
+}
+
+func TestVerification_ZabbixOnlyInstall_ClearsCaveat(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	auditor := audit.New(st.DB())
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-zbx-only", map[string]string{
+		"alertname": "HostDown", "host": "db1", "zabbix_event_id": "5001",
+	})
+
+	rootCause := "db1 host pressure inside the Databases group"
+	scripted := &scriptedLLM{responses: []scriptResp{
+		// Call 1: draft with no verification key at all — the model proposes
+		// nothing (the Zabbix floor already covers this incident).
+		{raw: draftResp(t, "draft", rootCause, 0.85, nil)},
+		{raw: callTwoResp(t, "draft", rootCause, 0.85, "")},
+	}}
+
+	// NO Prometheus (verifyConfig's prom stays nil): Zabbix is the only
+	// configured backend on this install.
+	cfg := verifyConfig(nil)
+	cfg.Zabbix = pipelineZabbix{}
+	cfg.ZabbixParams = acutetriage.ZabbixParams{HostLabel: "host", TimeoutSeconds: 5}
+
+	notifier := &capturingNotifier{}
+	skill := acutetriage.New(cfg, st, scripted, auditor, notifier, nil)
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if scripted.calls != 2 {
+		t.Fatalf("want 2 LLM calls (draft + re-judge), got %d", scripted.calls)
+	}
+
+	// 1. The shipped finding must not carry the unverified caveat.
+	if notifier.last.Unverified {
+		t.Errorf("shipped finding must not be Unverified (the Zabbix floor cleared the caveat), got %+v", notifier.last)
+	}
+
+	f := readFinding(t, st, inc.ID)
+	ver := verificationOf(t, f.enrichment)
+	if ver == nil {
+		t.Fatalf("envelope missing verification key:\n%s", f.enrichment)
+	}
+
+	// 2. The round outcome is "supported" (call 2 kept the same root cause).
+	if ver.Outcome != "supported" {
+		t.Errorf("outcome = %q, want supported", ver.Outcome)
+	}
+	if len(ver.Rounds) != 1 {
+		t.Fatalf("want 1 round, got %d", len(ver.Rounds))
+	}
+	round := ver.Rounds[0]
+
+	// 3. The round contains the Zabbix floor pair plus incidents_in_window,
+	// and NO up_ratio (no Prometheus configured on this install).
+	if len(round.Queries) != 3 {
+		t.Fatalf("want 3 queries (zabbix_reachability + zabbix_neighbor_problems + incidents_in_window), got %d: %+v",
+			len(round.Queries), round.Queries)
+	}
+	byKind := make(map[string]acutetriage.VerificationQuery, len(round.Queries))
+	for _, q := range round.Queries {
+		byKind[q.Kind] = q
+	}
+	reach, ok := byKind["zabbix_reachability"]
+	if !ok {
+		t.Fatalf("round missing zabbix_reachability: %+v", round.Queries)
+	}
+	if reach.Outcome != acutetriage.OutcomeFetched {
+		t.Errorf("zabbix_reachability outcome = %q, want fetched", reach.Outcome)
+	}
+	neighbors, ok := byKind["zabbix_neighbor_problems"]
+	if !ok {
+		t.Fatalf("round missing zabbix_neighbor_problems: %+v", round.Queries)
+	}
+	if neighbors.Outcome != acutetriage.OutcomeEmpty {
+		t.Errorf("zabbix_neighbor_problems outcome = %q, want empty (quiet neighborhood)", neighbors.Outcome)
+	}
+	if !strings.Contains(neighbors.Result, "16 peer hosts") {
+		t.Errorf("zabbix_neighbor_problems result missing the 16-peer scope line: %q", neighbors.Result)
+	}
+	if _, ok := byKind["incidents_in_window"]; !ok {
+		t.Errorf("round missing incidents_in_window: %+v", round.Queries)
+	}
+	if _, ok := byKind["up_ratio"]; ok {
+		t.Errorf("round must NOT contain up_ratio on a Prometheus-less install: %+v", round.Queries)
+	}
+
+	// 4. Confidence ships uncapped at 0.85: the fetched Zabbix reachability
+	// check is live evidence (verificationLive) and the floor ran on a real
+	// backend (floorFetched), lifting the metadata-only cap even though no
+	// metric/log/change/Sentry enrichment is wired at all.
+	if f.confidence != 0.85 {
+		t.Errorf("persisted confidence = %v, want 0.85 (uncapped)", f.confidence)
+	}
+	if notifier.last.Confidence != 0.85 {
+		t.Errorf("shipped confidence = %v, want 0.85 (uncapped)", notifier.last.Confidence)
+	}
+
+	// 5. Call 1's prompt must not offer the promql kind — no Prometheus is
+	// configured on this install.
+	if strings.Contains(scripted.prompts[0], `"kind":"promql"`) {
+		t.Errorf("call-1 prompt must not offer the promql kind on a Zabbix-only install:\n%s", scripted.prompts[0])
 	}
 }
