@@ -277,7 +277,7 @@ func severitiesFrom(min string) []int {
 func (c *Client) TriggerContext(ctx context.Context, triggerID string) (Operator, error) {
 	var rows []struct {
 		Description  string `json:"description"` // trigger NAME
-		Comments     string `json:"comments"`     // runbook text
+		Comments     string `json:"comments"`    // runbook text
 		URL          string `json:"url"`
 		Expression   string `json:"expression"`
 		Priority     string `json:"priority"` // severity 0..5
@@ -385,9 +385,9 @@ func decodeSuppression(data []suppressionRow) Suppression {
 // host-level `available` is gone in 7.0, reachability is per-interface).
 func (c *Client) HostContext(ctx context.Context, host string) (Topology, error) {
 	var rows []struct {
-		Name              string            `json:"name"`
-		Description       string            `json:"description"`
-		MaintenanceStatus string            `json:"maintenance_status"`
+		Name              string        `json:"name"`
+		Description       string        `json:"description"`
+		MaintenanceStatus string        `json:"maintenance_status"`
 		Inventory         flexInventory `json:"inventory"`
 		HostGroups        []struct {
 			Name string `json:"name"`
