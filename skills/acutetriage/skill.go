@@ -17,6 +17,7 @@ import (
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/rules"
 	"github.com/alertint/alertint-agent/internal/store"
+	"github.com/alertint/alertint-agent/internal/zabbix"
 )
 
 // LLMClient is the interface the skill uses to call the model. The real
@@ -597,12 +598,19 @@ func (s *Skill) auditEnrichmentDigests(ctx context.Context, incidentID string, m
 // prefix. shortCircuit is true when the finding came from a matched known-issue
 // rule (no LLM call, no verification).
 type analysisResult struct {
-	raw          json.RawMessage
-	metrics      *MetricEnrichment
-	logs         *LogEnrichment
-	changes      *ChangeEnrichment
-	sentry       *SentryEnrichment
-	zabbix       *ZabbixContext
+	raw     json.RawMessage
+	metrics *MetricEnrichment
+	logs    *LogEnrichment
+	changes *ChangeEnrichment
+	sentry  *SentryEnrichment
+	zabbix  *ZabbixContext
+	// zabbixSeed carries FetchZabbixContext's raw per-host Topology fetch
+	// forward to the verification round (verifyAndRejudge), which seeds its
+	// zabbixVerifier's cache from it — avoids a redundant HostContext RPC for
+	// a host this same triage invocation already resolved moments earlier.
+	// Never persisted (only ar.zabbix's redacted view is); nil on the replay
+	// path (no live fetch to seed from).
+	zabbixSeed   map[string]zabbix.Topology
 	memory       *MemoryEnrichment
 	system, user string // prompts, kept for the call-2 continuation
 	shortCircuit bool
@@ -641,13 +649,17 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		changes    *ChangeEnrichment
 		sentry     *SentryEnrichment
 		zbx        *ZabbixContext
+		zbxSeed    map[string]zabbix.Topology
 		memory     *MemoryEnrichment
 	)
 	if replay != nil {
 		// Frozen inputs (persist-as-rendered envelope): no live fetch, no
 		// reconcile/disposition/classifier — the sections replay exactly as the
 		// original triage saw them; memory replays as-of-incident-time, so a
-		// just-captured correction never grades its own capture green.
+		// just-captured correction never grades its own capture green. No live
+		// HostContext fetch happened, so there is nothing to seed (zbxSeed
+		// stays nil) — the replayed verification round is a snapshot executor
+		// anyway, never a live zabbixVerifier.
 		metrics = replay.frozen.Metrics
 		enrichment = replay.frozen.Logs
 		changes = replay.frozen.Changes
@@ -665,7 +677,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		sentry = FetchSentry(ctx, s.cfg.Sentry, s.cfg.SentryParams, alerts, spanStart, time.Now().UTC(), inc.ID, s.logger)
 		// Zabbix context: three bounded classes fanned out under one timeout,
 		// best-effort, never blocks. nil client (source disabled) → nil context.
-		zbx = FetchZabbixContext(ctx, s.cfg.Zabbix, s.cfg.ZabbixParams, alerts, time.Now().UTC(), inc.ID, s.logger)
+		zbx, zbxSeed = FetchZabbixContext(ctx, s.cfg.Zabbix, s.cfg.ZabbixParams, alerts, time.Now().UTC(), inc.ID, s.logger)
 		// Zero-LLM cross-source verdict, computed downstream of the rule engine at the
 		// triage seam (KTD5/R3): sets sentry.Reconciliation in place on a conclusive
 		// look, inert (no-op) when sentry is nil or the query was inconclusive.
@@ -717,15 +729,16 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		"incident", inc.ID,
 	)
 	return analysisResult{
-		raw:     comp.Raw,
-		metrics: metrics,
-		logs:    enrichment,
-		changes: changes,
-		sentry:  sentry,
-		zabbix:  zbx,
-		memory:  memory,
-		system:  system,
-		user:    userPrompt,
+		raw:        comp.Raw,
+		metrics:    metrics,
+		logs:       enrichment,
+		changes:    changes,
+		sentry:     sentry,
+		zabbix:     zbx,
+		zabbixSeed: zbxSeed,
+		memory:     memory,
+		system:     system,
+		user:       userPrompt,
 	}, nil
 }
 
@@ -937,7 +950,7 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 	if p.replay != nil {
 		round = runVerificationWith(ctx, p.replay.exec, vp, floor, draft, operatorQ, modelQ, time.Now().UTC())
 	} else {
-		round = runVerification(ctx, s.promQuerier(), s.cfg.Zabbix, s.st, vp, inc, floor, draft, operatorQ, modelQ, time.Now().UTC(), s.logger)
+		round = runVerification(ctx, s.promQuerier(), s.cfg.Zabbix, s.st, vp, inc, floor, draft, operatorQ, modelQ, time.Now().UTC(), s.logger, ar.zabbixSeed)
 	}
 
 	// Call 2: the byte-identical call-1 prefix + the draft + the computed round +

@@ -96,10 +96,15 @@ type ZabbixProblemView struct {
 
 // FetchZabbixContext assembles the Zabbix context: three classes fanned out
 // concurrently under one timeout budget, each independently best-effort.
-// Never blocks or fails triage; nil client → nil (source disabled).
-func FetchZabbixContext(ctx context.Context, client ZabbixReader, params ZabbixParams, alerts []store.Alert, t time.Time, incidentID string, logger *slog.Logger) *ZabbixContext {
+// Never blocks or fails triage; nil client → nil (source disabled). The
+// second return value is the raw per-host Topology Class 2 fetched (today at
+// most one host) — a same-invocation verification round runs moments later
+// in this same pipeline call and can seed its own HostContext cache from it
+// instead of re-fetching, well within Zabbix's staleness tolerance; nil/empty
+// whenever Class 2 didn't run or didn't succeed.
+func FetchZabbixContext(ctx context.Context, client ZabbixReader, params ZabbixParams, alerts []store.Alert, t time.Time, incidentID string, logger *slog.Logger) (*ZabbixContext, map[string]zabbix.Topology) {
 	if client == nil {
-		return nil
+		return nil, nil
 	}
 	hostLabel := params.HostLabel
 	if hostLabel == "" {
@@ -122,7 +127,7 @@ func FetchZabbixContext(ctx context.Context, client ZabbixReader, params ZabbixP
 	if triggerID == "" && eventID == "" && host == "" {
 		z.Outcome = OutcomeNoSelector
 		z.Note = "no zabbix identity on this incident (no trigger id, event id, or host label)"
-		return z
+		return z, nil
 	}
 
 	timeout := time.Duration(params.TimeoutSeconds) * time.Second
@@ -140,6 +145,7 @@ func FetchZabbixContext(ctx context.Context, client ZabbixReader, params ZabbixP
 	var mu sync.Mutex
 	var notes []string
 	var degraded, failed bool
+	seed := map[string]zabbix.Topology{}
 	record := func(class string, err error) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -221,6 +227,7 @@ func FetchZabbixContext(ctx context.Context, client ZabbixReader, params ZabbixP
 			}
 			mu.Lock()
 			z.Topology = view
+			seed[host] = top
 			mu.Unlock()
 		}()
 	}
@@ -268,7 +275,7 @@ func FetchZabbixContext(ctx context.Context, client ZabbixReader, params ZabbixP
 		z.Outcome = OutcomeFetched
 	}
 	z.Note = strings.Join(notes, "; ")
-	return z
+	return z, seed
 }
 
 // zabbixEntryCount is the Evidence line count: context entries given to triage.
