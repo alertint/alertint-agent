@@ -1427,14 +1427,17 @@ func TestSteering_ConfirmationRetiresSteering(t *testing.T) {
 // own-event-exclusion chain works end to end on a real pipeline run, not
 // just in isolated unit tests.
 //
-// Note on what confidence assertion 4 below does and does not prove: this
-// test's alert carries a host label, so FetchZabbixContext (the separate
-// chunk-02 enrichment path) also runs against the same pipelineZabbix fake
-// and independently returns live evidence — so shipping uncapped confidence
-// here proves the full pipeline (both the enrichment and verification Zabbix
-// paths active) behaves correctly end to end; it does NOT in isolation prove
-// that verificationLive specifically is what lifts the cap. That mechanism
-// is isolated and unit-tested on its own in
+// Note on what confidence assertion 4 below proves: this test's alert
+// carries a host label, so FetchZabbixContext (the separate chunk-02
+// enrichment path) also runs against the same pipelineZabbix fake — but
+// pipelineZabbix's fixture (no VisibleName/Inventory, MaintenanceActive
+// false, no OtherOpenProblems, suppression "none" explicitly excluded)
+// resolves that enrichment to OutcomeEmpty, not OutcomeFetched, so it does
+// NOT independently trip hasLiveEvidence. With no metrics/logs/changes/
+// Sentry wired either (verifyConfig(nil)), annotationsOnlyBasis reduces to
+// !verificationLive(ver) — so this test's uncapped 0.85 IS carried solely by
+// the verification floor's fetched zabbix_reachability query. The unit-level
+// isolation of that same mechanism also lives in
 // TestVerificationLive_ZabbixFloorCounts.
 // --------------------------------------------------------------------------
 
@@ -1580,14 +1583,12 @@ func TestVerification_ZabbixOnlyInstall_ClearsCaveat(t *testing.T) {
 		t.Errorf("round must NOT contain up_ratio on a Prometheus-less install: %+v", round.Queries)
 	}
 
-	// 4. Confidence ships uncapped at 0.85: with both the chunk-02 Zabbix
-	// enrichment (FetchZabbixContext) and the Zabbix verification floor
-	// active on the same pipeline run, the metadata-only cap does not apply.
-	// This proves the full pipeline ships uncapped confidence and a cleared
-	// caveat end to end; it does NOT in isolation prove verificationLive is
-	// the (or a) mechanism responsible — see the file-level note above and
-	// TestVerificationLive_ZabbixFloorCounts, where verificationLive is
-	// isolated and tested on its own.
+	// 4. Confidence ships uncapped at 0.85: the chunk-02 Zabbix enrichment
+	// resolves to OutcomeEmpty on this fixture (see the file-level note
+	// above), so the fetched zabbix_reachability floor query is what carries
+	// verificationLive true and lifts the metadata-only cap here — the same
+	// mechanism TestVerificationLive_ZabbixFloorCounts isolates at the unit
+	// level.
 	if f.confidence != 0.85 {
 		t.Errorf("persisted confidence = %v, want 0.85 (uncapped)", f.confidence)
 	}
