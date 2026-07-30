@@ -234,3 +234,12 @@ returns nothing for a float item unless the item's type is resolved first).
 Show CPU history for web01 over the last 2 hours.
 List open problems on db-primary with severity at least high.
 ```
+
+## Verification
+
+With `zabbix.api` configured, the [verification round](../concepts/verification-round.md)
+runs its Zabbix floor checks automatically, no additional configuration
+required: the incident host's reachability (per-interface, maintenance-aware)
+and whether its smallest host groups have other open problems. On installs
+that don't also run Prometheus, this is what replaces the permanent
+`⚠ unverified — checks unavailable` caveat with a genuine, checked finding.

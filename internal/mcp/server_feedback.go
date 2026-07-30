@@ -67,7 +67,7 @@ func (s *Server) toolIncidentCaptureVerdict() (mcplib.Tool, mcpserver.ToolHandle
 		mcplib.WithString("incident_id", mcplib.Description("Incident ID."), mcplib.Required()),
 		mcplib.WithString("verdict", mcplib.Description("correction | confirmation"), mcplib.Required()),
 		mcplib.WithObject("expectation", mcplib.Description(
-			"Structured expectation: {cause_alert?, cause_series?: [metric names], severity_rank?, "+
+			"Structured expectation: {cause_alert?, cause_series?: [Prometheus metric names — not Zabbix item keys], severity_rank?, "+
 				"must_mention: [subjects], must_not_conclude: [wrong conclusions]}. "+
 				"At least one of must_mention/must_not_conclude is required."), mcplib.Required()),
 		mcplib.WithString("note", mcplib.Description("Optional annotation note; synthesized from the expectation when absent.")),

@@ -70,6 +70,18 @@ the draft, revise; don't defend it. The result is the finding that persists —
 confidence caps and the memory verdict apply to this final judgment, not the
 draft.
 
+### Floor sources
+
+The deterministic floor speaks the install's backend. Prometheus contributes
+a parent-scope up-ratio; a configured Zabbix API contributes two checks built
+from the incident's host — is the host reachable per Zabbix's own polling
+(and is it in maintenance), and are its host-group neighbors quiet or
+burning. Installs with either backend get a real falsification pass; on a
+Zabbix-only install findings no longer carry the "unverified — checks
+unavailable" caveat. Neighbor scope prefers the smallest host groups first
+(functional groups over catch-alls) and always names the groups it
+searched — and the ones it left out.
+
 ## Cost
 
 Judged incidents go from one LLM call to two, plus up to eleven read-only

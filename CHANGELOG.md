@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `zabbix_metric_history` and `zabbix_host_problems`, let investigating agents
   drill deeper. Presence-based: set `zabbix.api.base_url` to enable.
   (docs/integrations/zabbix.md)
+- Zabbix verification floor: on installs with `zabbix.api` configured, the triage
+  verification round now runs deterministic Zabbix contrast checks — affected-host
+  reachability (per-interface, with maintenance state) and open problems across the
+  host's smallest host groups — so Zabbix-only installs get real verified findings
+  instead of a permanent "unverified — checks unavailable" caveat, and fetched Zabbix
+  evidence lifts the metadata-only confidence cap. Completes the Zabbix connector
+  (receiver → context → verification).
 
 ### Changed
 
