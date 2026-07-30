@@ -299,6 +299,7 @@ func TestNeighborProblems_OwnEventsSubtracted(t *testing.T) {
 	}
 }
 
+//nolint:dupl // intentionally near-identical setup contrasting confirmed-absence vs. vacuous-inconclusive outcomes
 func TestNeighborProblems_EmptyWithPeersIsWeighableEmpty(t *testing.T) {
 	z := &scriptedZabbixReader{
 		hostCtx: func(string) (zabbix.Topology, error) {
@@ -320,6 +321,7 @@ func TestNeighborProblems_EmptyWithPeersIsWeighableEmpty(t *testing.T) {
 	}
 }
 
+//nolint:dupl // intentionally near-identical setup contrasting confirmed-absence vs. vacuous-inconclusive outcomes
 func TestNeighborProblems_VacuousScopeRendersInconclusive(t *testing.T) {
 	z := &scriptedZabbixReader{
 		hostCtx: func(string) (zabbix.Topology, error) {
