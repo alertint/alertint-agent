@@ -60,6 +60,12 @@ type Config struct {
 	// SentryParams carries the Error-source tunables (enabled, lookback,
 	// max_issues, fetch timeout, message toggle) from the sentry.issues section.
 	SentryParams SentryParams
+	// Zabbix is the optional read-only Zabbix Source used to assemble the
+	// Zabbix context at incident time. nil = no Zabbix enrichment. Pass a TRUE
+	// nil interface when unconfigured to avoid the typed-nil trap.
+	Zabbix ZabbixReader
+	// ZabbixParams carries the zabbix.api tunables (timeout, host label, flap window).
+	ZabbixParams ZabbixParams
 	// Memory is the read-only recall surface (the store) used to inject prior
 	// findings for a recurring key. nil = no recall (the consumer owns the field
 	// it reads; serve wiring assigns *store.Store). Pass a TRUE nil interface
@@ -332,7 +338,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	// evidence lifts the annotations-only basis just like live metrics/logs do
 	// (the call-1 prompt-side directive was rendered before the round existed, so
 	// it passed nil — only this deterministic post-call cap sees verification).
-	s.applyEvidenceCap(&resp, decision, ar.metrics, ar.logs, ar.changes, ar.sentry, nil, ver, inc.ID)
+	s.applyEvidenceCap(&resp, decision, ar.metrics, ar.logs, ar.changes, ar.sentry, ar.zabbix, ver, inc.ID)
 	s.applySteeringCap(&resp, governingOf(ar.memory), ver, inc.ID)
 
 	// Persist output, including the log-enrichment snapshot so the evidence pack
@@ -409,7 +415,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 			OutputJSON:          finalRaw,
 			Status:              incidentStatus,
 			Drill:               isDrill(alerts),
-			Evidence:            buildEvidenceSummary(decision.ShortCircuit, ar.metrics, ar.logs, ar.changes, ar.sentry),
+			Evidence:            buildEvidenceSummary(decision.ShortCircuit, ar.metrics, ar.logs, ar.changes, ar.sentry, ar.zabbix),
 			// A degraded round (floor unfetchable, or call 2 lost) shipped without a
 			// full falsification pass — card renderers surface a caveat off this.
 			Unverified: ver != nil && ver.Outcome == verifyOutcomeDegraded,
@@ -589,6 +595,7 @@ type analysisResult struct {
 	logs         *LogEnrichment
 	changes      *ChangeEnrichment
 	sentry       *SentryEnrichment
+	zabbix       *ZabbixContext
 	memory       *MemoryEnrichment
 	system, user string // prompts, kept for the call-2 continuation
 	shortCircuit bool
@@ -626,6 +633,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		enrichment *LogEnrichment
 		changes    *ChangeEnrichment
 		sentry     *SentryEnrichment
+		zbx        *ZabbixContext
 		memory     *MemoryEnrichment
 	)
 	if replay != nil {
@@ -637,6 +645,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		enrichment = replay.frozen.Logs
 		changes = replay.frozen.Changes
 		sentry = replay.frozen.Sentry
+		zbx = replay.frozen.Zabbix
 		memory = replay.frozen.Memory
 	} else {
 		metrics = FetchMetrics(ctx, s.promQuerier(), s.cfg.MetricParams, alerts, spanStart, inc.ID, s.logger)
@@ -647,6 +656,9 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		changes = FetchChanges(ctx, s.st, s.cfg.ChangeParams, alerts, spanStart, time.Now().UTC(), inc.ID, s.logger)
 		// Sentry Error source: a bounded 1+K query-at-triage, best-effort, never blocks.
 		sentry = FetchSentry(ctx, s.cfg.Sentry, s.cfg.SentryParams, alerts, spanStart, time.Now().UTC(), inc.ID, s.logger)
+		// Zabbix context: three bounded classes fanned out under one timeout,
+		// best-effort, never blocks. nil client (source disabled) → nil context.
+		zbx = FetchZabbixContext(ctx, s.cfg.Zabbix, s.cfg.ZabbixParams, alerts, time.Now().UTC(), inc.ID, s.logger)
 		// Zero-LLM cross-source verdict, computed downstream of the rule engine at the
 		// triage seam (KTD5/R3): sets sentry.Reconciliation in place on a conclusive
 		// look, inert (no-op) when sentry is nil or the query was inconclusive.
@@ -666,7 +678,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		// the render byte-identical. A no-op when disabled or there are no candidates.
 		s.maybeClassify(ctx, inc, memory)
 	}
-	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment, changes, sentry, nil, memory, s.cfg.Verification)
+	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment, changes, sentry, zbx, memory, s.cfg.Verification)
 	// On a re-judgment, prepend the deterministic recurrence context so the model
 	// judges the recurrence with its history rather than as a first-time event.
 	if recurrence != "" {
@@ -703,6 +715,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		logs:    enrichment,
 		changes: changes,
 		sentry:  sentry,
+		zabbix:  zbx,
 		memory:  memory,
 		system:  system,
 		user:    userPrompt,
@@ -777,6 +790,9 @@ func enrichmentSources(ar analysisResult, ver *VerificationEnrichment) map[strin
 	}
 	if ar.sentry != nil {
 		sources["sentry"] = ar.sentry
+	}
+	if ar.zabbix != nil {
+		sources["zabbix"] = ar.zabbix
 	}
 	if ar.memory != nil {
 		sources["memory"] = ar.memory

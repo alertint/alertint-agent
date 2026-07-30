@@ -38,7 +38,7 @@ const (
 // a lie — R12/AE10). With no source enrichment at all it renders an explicit
 // no-sources state (R6/AE9). Otherwise each non-nil source contributes one entry,
 // in a fixed order, with the uniform outcome→state mapping.
-func buildEvidenceSummary(shortCircuit bool, m *MetricEnrichment, l *LogEnrichment, c *ChangeEnrichment, se *SentryEnrichment) notify.EvidenceSummary {
+func buildEvidenceSummary(shortCircuit bool, m *MetricEnrichment, l *LogEnrichment, c *ChangeEnrichment, se *SentryEnrichment, z *ZabbixContext) notify.EvidenceSummary {
 	if shortCircuit {
 		return notify.EvidenceSummary{Skipped: true}
 	}
@@ -65,6 +65,11 @@ func buildEvidenceSummary(shortCircuit bool, m *MetricEnrichment, l *LogEnrichme
 		}
 		sources = append(sources, notify.SourceEvidence{
 			Source: "Sentry", Unit: "issues", Count: len(se.Issues), State: state,
+		})
+	}
+	if z != nil {
+		sources = append(sources, notify.SourceEvidence{
+			Source: "Zabbix", Unit: "entries", Count: zabbixEntryCount(z), State: cardState(z.Outcome),
 		})
 	}
 	if len(sources) == 0 {

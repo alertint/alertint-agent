@@ -20,6 +20,7 @@ import (
 	"github.com/alertint/alertint-agent/internal/llm"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/store"
+	"github.com/alertint/alertint-agent/internal/zabbix"
 )
 
 // replayScriptedLLM returns queued responses in call order and records the
@@ -107,6 +108,38 @@ func seedReplayIncident(t *testing.T, st *store.Store, ctx context.Context) stri
 		ID: uuid.NewString(), Fingerprint: "fp-" + id, Status: "firing",
 		Labels:      map[string]string{"alertname": "TargetDown", "namespace": "prod", "instance": "worker-14"},
 		Annotations: map[string]string{"summary": "target down"},
+		StartsAt:    now, ReceivedAt: now,
+	}
+	stored, err := st.UpsertAlertByFingerprint(ctx, a)
+	if err != nil {
+		t.Fatalf("upsert alert: %v", err)
+	}
+	if err := st.AddAlertToIncident(ctx, id, stored.ID, now); err != nil {
+		t.Fatalf("add alert: %v", err)
+	}
+	return id
+}
+
+// seedZabbixReplayIncident mirrors seedReplayIncident but tags the alert with
+// a "host" label so the Zabbix topology class (host-label-only) has something
+// to fetch.
+func seedZabbixReplayIncident(t *testing.T, st *store.Store, ctx context.Context) string {
+	t.Helper()
+	now := time.Now()
+	id := uuid.NewString()
+	if err := st.InsertIncident(ctx, store.Incident{
+		ID: id, GroupKey: "alertname=WebDown,host=web01",
+		FirstAlertAt: now, LastAlertAt: now, ReadyAt: now,
+	}); err != nil {
+		t.Fatalf("insert incident: %v", err)
+	}
+	if err := st.MarkIncidentReady(ctx, id); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	a := store.Alert{
+		ID: uuid.NewString(), Fingerprint: "fp-" + id, Status: "firing",
+		Labels:      map[string]string{"alertname": "WebDown", "host": "web01"},
+		Annotations: map[string]string{"summary": "web01 unreachable"},
 		StartsAt:    now, ReceivedAt: now,
 	}
 	stored, err := st.UpsertAlertByFingerprint(ctx, a)
@@ -253,6 +286,82 @@ func TestReplayIncident_HermeticFullPipeline(t *testing.T) {
 		if !strings.Contains(replayLLM.prompts[1], q.Result) {
 			t.Errorf("call-2 replay prompt missing frozen Result verbatim: %q", q.Result)
 		}
+	}
+}
+
+// poisonedZabbix fails the test if ANY method is invoked — proof that replay
+// serves the zabbix section from the frozen envelope, never a live call.
+type poisonedZabbix struct{ t *testing.T }
+
+func (p *poisonedZabbix) TriggerContext(context.Context, string) (zabbix.Operator, error) {
+	p.t.Fatal("replay must not call TriggerContext")
+	return zabbix.Operator{}, nil
+}
+func (p *poisonedZabbix) ProblemContext(context.Context, string) (zabbix.ProblemDetail, error) {
+	p.t.Fatal("replay must not call ProblemContext")
+	return zabbix.ProblemDetail{}, nil
+}
+func (p *poisonedZabbix) HostContext(context.Context, string) (zabbix.Topology, error) {
+	p.t.Fatal("replay must not call HostContext")
+	return zabbix.Topology{}, nil
+}
+func (p *poisonedZabbix) FlapCount(context.Context, string, time.Time) (int, error) {
+	p.t.Fatal("replay must not call FlapCount")
+	return 0, nil
+}
+func (p *poisonedZabbix) OpenProblems(context.Context, string, zabbix.ProblemSelector) ([]zabbix.Problem, error) {
+	p.t.Fatal("replay must not call OpenProblems")
+	return nil, nil
+}
+
+func TestReplayIncident_NoLiveZabbixCall(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	incID := seedZabbixReplayIncident(t, st, ctx)
+	zbxSeed := &fakeZabbix{host: zabbix.Topology{VisibleName: "web01"}}
+	cfg := Config{
+		MinAlerts:    1,
+		Zabbix:       zbxSeed,
+		ZabbixParams: ZabbixParams{TimeoutSeconds: 5, HostLabel: "host"},
+	}
+	seedLLM := &replayScriptedLLM{responses: []json.RawMessage{
+		draftJSON(t, "WebDown", "web01 unreachable", 0.7, nil),
+	}}
+	seedSkill := New(cfg, st, seedLLM, audit.New(st.DB()), nil, slog.Default())
+	inc, err := st.GetIncidentByID(ctx, incID)
+	if err != nil {
+		t.Fatalf("reload before run: %v", err)
+	}
+	if err := seedSkill.Run(ctx, *inc); err != nil {
+		t.Fatalf("seed Run: %v", err)
+	}
+
+	before, err := st.GetIncidentByID(ctx, incID)
+	if err != nil {
+		t.Fatalf("reload before replay: %v", err)
+	}
+	frozen := decodeFrozenEnvelope(before.EnrichmentJSON)
+	if frozen.Zabbix == nil || frozen.Zabbix.Topology == nil {
+		t.Fatal("seed did not persist a zabbix section")
+	}
+
+	replayCfg := cfg
+	replayCfg.Zabbix = &poisonedZabbix{t: t}
+	replayLLM := &replayScriptedLLM{responses: []json.RawMessage{
+		draftJSON(t, "WebDown", "web01 unreachable", 0.7, nil),
+	}}
+	replaySkill := New(replayCfg, st, replayLLM, nil, nil, slog.Default())
+	rep, err := replaySkill.replayIncident(ctx, *before)
+	if err != nil {
+		t.Fatalf("replayIncident: %v", err)
+	}
+	if rep.fidelity != "full" {
+		t.Errorf("fidelity = %q, want full", rep.fidelity)
 	}
 }
 
