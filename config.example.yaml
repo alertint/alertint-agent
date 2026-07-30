@@ -133,11 +133,25 @@ changes:
     max_events: 10                         # cap on ranked changes attached to a prompt
   retention_days: 30                       # prune changes older than this
 
-# Zabbix as an alert source (push receiver). See docs/integrations/zabbix.md.
+# Zabbix connector — two independently-enableable roles:
+#   ingress → push Receiver: native /webhook/zabbix problem/resolution events
+#   api     → pull Source: read-only context enrichment (operator knowledge,
+#             CMDB/topology, problem detail) + zabbix_metric_history /
+#             zabbix_host_problems MCP tools. Presence-based: setting
+#             base_url turns it on. See docs/integrations/zabbix.md.
 zabbix:
   ingress:
     enabled: false
     webhook_token_env: ALERTINT_ZABBIX_WEBHOOK_TOKEN   # bearer token Zabbix presents to /webhook/zabbix
+  api:
+    # enabled: false                       # uncomment to force OFF even when base_url is set
+    base_url: https://zbx.example.com      # Zabbix frontend root; /api_jsonrpc.php is appended
+    api_token_env: ZABBIX_API_TOKEN        # env var holding a read-only API token (Administration → API tokens)
+    timeout_seconds: 10                    # per-request HTTP timeout
+    default_range_minutes: 60              # zabbix_metric_history default look-back when start is omitted
+    history_retention_days: 7              # windows older than this fall back to hourly trends
+    flap_window_hours: 24                  # look-back for the trigger flap count
+    host_label: host                       # alert label carrying the Zabbix technical host name
 
 # Sentry connector — two read-only roles over one shared connection/token:
 #   releases  → Change source: polls deploys/releases into the change plane

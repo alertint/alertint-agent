@@ -100,14 +100,23 @@ and feed the ones overlapping an incident's labels into triage. Dual-role:
 
 ## `zabbix`
 
-The Zabbix connector namespace. `ingress` is the push receiver (this
-section); an `api` sub-section (pull source) arrives with a later chunk. See
-the [Zabbix integration guide](../integrations/zabbix.md).
+The Zabbix connector namespace: `ingress` is the push receiver; `api` is the
+pull source (read-only context enrichment + `zabbix_metric_history` /
+`zabbix_host_problems` MCP tools). See the
+[Zabbix integration guide](../integrations/zabbix.md).
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `ingress.enabled` | bool | `false` | Mount `POST /webhook/zabbix` on `receivers.address` |
 | `ingress.webhook_token_env` | string | — | **Required when `ingress.enabled`.** Env var name holding the Zabbix webhook bearer token |
+| `api.enabled` | bool | auto | Fetch the Zabbix context at triage time and register the two `zabbix_*` MCP tools. Omitted = **on automatically** when `api.base_url` is set; set `false` to force off. |
+| `api.base_url` | string | — | **Required when `api` is enabled.** Zabbix frontend root; `/api_jsonrpc.php` is appended |
+| `api.api_token_env` | string | — | **Required when `api` is enabled.** Env var name holding a read-only Zabbix API token |
+| `api.timeout_seconds` | int | `10` | Per-request HTTP timeout (must be `> 0`) |
+| `api.default_range_minutes` | int | `60` | `zabbix_metric_history` default look-back when `start` is omitted (must be `> 0`) |
+| `api.history_retention_days` | int | `7` | Windows older than this fall back from `history.get` to hourly `trend.get` (must be `> 0`) |
+| `api.flap_window_hours` | int | `24` | Look-back for the trigger flap count (must be `> 0`) |
+| `api.host_label` | string | `host` | Alert label carrying the Zabbix technical host name |
 
 ## `storage`
 
