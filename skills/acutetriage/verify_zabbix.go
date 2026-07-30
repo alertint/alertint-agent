@@ -8,9 +8,15 @@
 package acutetriage
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
 	"sort"
+	"strings"
 
 	"github.com/alertint/alertint-agent/internal/store"
+	"github.com/alertint/alertint-agent/internal/zabbix"
 )
 
 const (
@@ -144,4 +150,123 @@ func excludeEventIDsFromParams(params map[string]any) map[string]bool {
 		}
 	}
 	return out
+}
+
+// zabbixVerifier executes the Zabbix floor kinds for one round, memoizing
+// HostContext per host so reachability and the neighbor scope share one call
+// per host (two Zabbix round-trips total in the single-host case). Not safe
+// for concurrent use — the round loop is sequential, like snapshotExecutor.
+type zabbixVerifier struct {
+	zbx    ZabbixReader
+	logger *slog.Logger
+	incID  string
+	cache  map[string]hostCtxResult
+}
+
+type hostCtxResult struct {
+	top zabbix.Topology
+	err error
+}
+
+func newZabbixVerifier(zbx ZabbixReader, logger *slog.Logger, incID string) *zabbixVerifier {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &zabbixVerifier{zbx: zbx, logger: logger, incID: incID, cache: map[string]hostCtxResult{}}
+}
+
+func (zv *zabbixVerifier) hostContext(ctx context.Context, host string) hostCtxResult {
+	if r, ok := zv.cache[host]; ok {
+		return r
+	}
+	top, err := zv.zbx.HostContext(ctx, host)
+	r := hostCtxResult{top: top, err: err}
+	zv.cache[host] = r
+	return r
+}
+
+// runReachability fills q for kindZabbixReachability: one line per checked
+// host from Zabbix's own per-interface polling verdict plus maintenance
+// state. Any-fetched wins (spec G4): one answered host makes the query
+// fetched — an unreachable host is evidence, not a failed check — and every
+// sub-failure renders inline. All-failed classifies hard-error-beats-timeout
+// (the classifyPairErrs precedent).
+func (zv *zabbixVerifier) runReachability(ctx context.Context, q *VerificationQuery) {
+	if zv.zbx == nil {
+		q.Outcome = OutcomeFailed
+		q.Result = renderUnavailable("zabbix not configured")
+		return
+	}
+	hosts := hostsFromParams(q.Params)
+	var lines []string
+	var fetched int
+	var hardErr bool
+	for _, h := range hosts {
+		r := zv.hostContext(ctx, h)
+		if r.err != nil {
+			switch {
+			case errors.Is(r.err, zabbix.ErrNotFound):
+				hardErr = true
+				lines = append(lines, h+": no host matching")
+			case errors.Is(r.err, context.DeadlineExceeded):
+				lines = append(lines, h+": timed out")
+			default:
+				hardErr = true
+				lines = append(lines, h+": lookup failed")
+			}
+			zv.logger.Warn("acutetriage: verify: zabbix reachability lookup failed",
+				"host", h, "err", r.err, "incident", zv.incID)
+			continue
+		}
+		fetched++
+		lines = append(lines, renderHostReachability(h, r.top))
+	}
+	if extra := hostsTotalFromParams(q.Params) - len(hosts); extra > 0 {
+		lines = append(lines, fmt.Sprintf("+%d hosts not checked", extra))
+	}
+	switch {
+	case fetched > 0:
+		q.Outcome = OutcomeFetched
+	case hardErr:
+		q.Outcome = OutcomeFailed
+	default:
+		q.Outcome = OutcomeDegraded
+	}
+	q.Result = capText(flattenRecalled(strings.Join(lines, " | ")), 400)
+}
+
+// renderHostReachability renders one host's line: unavailable interfaces win
+// the line (they are the signal); all-available renders a count; anything
+// else is honestly unknown. Maintenance renders on every shape — a host in a
+// window explains "down" without a hypothesis.
+func renderHostReachability(host string, top zabbix.Topology) string {
+	var b strings.Builder
+	var unavailable []zabbix.IfaceState
+	available := 0
+	for _, i := range top.Interfaces {
+		switch i.Available {
+		case "2":
+			unavailable = append(unavailable, i)
+		case "1":
+			available++
+		}
+	}
+	switch {
+	case len(unavailable) > 0:
+		parts := make([]string, 0, len(unavailable))
+		for _, i := range unavailable {
+			parts = append(parts, fmt.Sprintf("interface %s unavailable (%q)", i.Addr, i.Error))
+		}
+		b.WriteString(host + ": " + strings.Join(parts, ", "))
+	case available > 0:
+		fmt.Fprintf(&b, "%s reachable (%s)", host, pluralize(available, "interface"))
+	default:
+		b.WriteString(host + ": availability unknown")
+	}
+	if top.MaintenanceActive {
+		b.WriteString("; in maintenance")
+	} else {
+		b.WriteString("; not in maintenance")
+	}
+	return b.String()
 }
