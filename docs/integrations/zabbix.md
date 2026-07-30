@@ -1,6 +1,6 @@
 ---
 title: "Zabbix"
-description: "Push Zabbix problem/resolution events into AlertINT as a first-class alert source."
+description: "Push Zabbix problem/resolution events into AlertINT as a first-class alert source, and pull operator/CMDB/problem context back at triage time."
 section: "Integrations"
 order: 7
 slug: "zabbix"
@@ -8,16 +8,20 @@ slug: "zabbix"
 
 # Zabbix
 
-Zabbix pushes problem/resolution events to AlertINT over a webhook; a `zabbix`
-receiver maps them to canonical alerts and hands them to the correlator. A
-Zabbix shop gets correlated, triaged incidents the same way an Alertmanager
-shop does — no Zabbix API access, no polling, no extra infrastructure.
+**AlertINT** integrates with Zabbix in two independently-enableable roles:
+Zabbix **pushes** problem/resolution events to AlertINT over a webhook (the
+`zabbix.ingress` receiver, below), and AlertINT optionally **pulls** read-only
+context back from the Zabbix API at triage time — the operator's runbook,
+trigger dependencies, flap history, host CMDB/topology, other open problems,
+and acknowledgement history (`zabbix.api`, further down). A Zabbix shop gets
+correlated, triaged incidents the same way an Alertmanager shop does, with the
+option to hand the LLM the same operator knowledge a human on-call would reach
+for.
 
 **Version target:** Zabbix 7.0.x LTS; the contract below is verified against
-the 7.0 macro documentation. This chunk is inbound-only — AlertINT never calls
-the Zabbix API.
+the 7.0 macro and JSON-RPC API documentation.
 
-## What you get
+## Push: the alert source (`zabbix.ingress`)
 
 - Zabbix `PROBLEM`/`RESOLVED` events become correlated, triaged incidents,
   the same pipeline Alertmanager alerts go through.
@@ -132,3 +136,101 @@ labels required. To correlate a condition across hosts (e.g. one incident for
 a shared dependency failing on several hosts at once), tag the trigger with a
 `service` tag; tags pass through as labels and participate in grouping like
 any other configured label.
+
+## Pull: the Zabbix context (`zabbix.api`)
+
+When `zabbix.api` is enabled, AlertINT reads back three bounded, read-only
+classes of context from the Zabbix JSON-RPC API at triage time and attaches
+them to the LLM prompt, the persisted finding, and two MCP tools. The client
+issues only `*.get` methods (plus the unauthenticated `apiinfo.version` health
+probe) — it never mutates Zabbix state.
+
+### Configuration
+
+```yaml
+zabbix:
+  api:
+    # enabled: false                       # uncomment to force OFF even when base_url is set
+    base_url: https://zbx.example.com      # Zabbix frontend root; /api_jsonrpc.php is appended
+    api_token_env: ZABBIX_API_TOKEN        # env var holding a read-only API token
+    timeout_seconds: 10                    # default
+    default_range_minutes: 60              # default; zabbix_metric_history look-back when start is omitted
+    history_retention_days: 7              # default; windows older than this fall back to hourly trends
+    flap_window_hours: 24                  # default; look-back for the trigger flap count
+    host_label: host                       # default; alert label carrying the Zabbix technical host name
+```
+
+Enablement is presence-based: setting `base_url` turns the Source on
+automatically; an explicit `enabled: false` forces it off. See the
+[configuration reference](../getting-started/configuration.md#zabbix) for the
+full field table.
+
+### Read-only API identity
+
+Create a dedicated service user for AlertINT rather than reusing a human
+account:
+
+1. **User roles → Create role.** Set **API access** to a dedicated role whose
+   API methods are an **Allow list** containing only:
+   `host.get, trigger.get, problem.get, event.get, item.get, history.get, trend.get`.
+   This is the read-only contract, enforced on the Zabbix side, not just
+   documented — the client only ever calls these methods, and the token
+   cannot do anything else even if it leaked.
+2. **Users → User groups → Create user group.** Grant **Read** permission on
+   the host groups you want AlertINT to see context for (not Deny-by-default
+   on everything — an unlisted host group returns empty results, not an
+   error, which reads as "no context" rather than "misconfigured").
+3. **Users → Create user.** Assign the role from step 1 and the group from
+   step 2.
+4. **Users → API tokens → Create API token,** scoped to that user, with no
+   expiry (or a long one you rotate deliberately). Export it as the env var
+   named by `api_token_env`:
+
+```bash
+export ZABBIX_API_TOKEN="<the generated token>"
+```
+
+Auth is the `Authorization: Bearer` header — never the legacy `auth` request
+parameter, which Zabbix removed in 7.2.
+
+### The Apache gotcha (ZBX-22952)
+
+If your Zabbix frontend runs under **Apache**, `CGIPassAuth On` is required in
+the frontend's Apache config or the `Authorization` header is silently
+stripped before PHP ever sees it (nginx is unaffected). The symptom is
+distinctive: the `zabbix` health check stays green — `apiinfo.version` needs
+no auth and answers fine — while every real context fetch comes back empty or
+unauthorized. If context is silently missing but health looks fine, check this
+first.
+
+### What the Zabbix context adds
+
+| Class | Needs | Adds |
+|---|---|---|
+| **Operator knowledge** | `zabbix_trigger_id` label | The trigger's runbook (`comments`), a jump-off `url`, the raw trigger expression, upstream dependency triggers (possible root cause), and how many times it has fired in the flap window. |
+| **CMDB/topology** | the configured `host_label` only — works even for non-Zabbix-origin incidents | Host groups, templates (role/stack), a curated inventory subset (contact, location, OS, hardware), live maintenance state, per-interface reachability, and other currently-open problems on the same host. |
+| **Problem detail** | `zabbix_event_id` annotation | Ongoing/duration, suppression (maintenance vs. manual, with an until-time), operational data, and acknowledgement history (who already knows, with their message). |
+
+Runbooks, host descriptions, operational data, and acknowledgement messages
+are operator-authored free text — they render inside AlertINT's untrusted-text
+frame (context for the model, never instructions) and are never treated as
+evidence the host is healthy when the section is empty or a class failed.
+
+### MCP tools
+
+When `zabbix.api` is enabled, two additional tools become available to your
+MCP client:
+
+| Tool | Description |
+|---|---|
+| `zabbix_metric_history` | An item's metric history for a host (raw `history.get`, or hourly `trend.get` for windows older than `history_retention_days` — the response's `source` field says which). Parameters: `host`, `item_key` (required), `start`/`end` (optional RFC3339), `limit` (optional). |
+| `zabbix_host_problems` | Currently-open Zabbix problems on a host, with severity, tags, duration, and ack/suppression state. Parameters: `host` (required), `severity_min` (optional, `"0"`–`"5"`). |
+
+Both take a **host + item key**, never Zabbix internal IDs — the tools hide
+the item-discovery dance and the `history.get` value-type quirk (it silently
+returns nothing for a float item unless the item's type is resolved first).
+
+```text
+Show CPU history for web01 over the last 2 hours.
+List open problems on db-primary with severity at least high.
+```

@@ -13,6 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as first-class alerts — native webhook contract with a copy-paste media-type
   template, severity ranking including per-install renamed severities, per-host
   zero-config correlation. (docs/integrations/zabbix.md)
+- Zabbix context enrichment: triage findings on Zabbix-connected incidents now
+  carry the operator's runbook, trigger dependencies, flap count, host
+  CMDB/topology (inventory, templates, live maintenance state, reachability),
+  other open problems on the host, and acknowledgement history — read-only over
+  the Zabbix API, bounded, and persisted for replay. Two new MCP tools,
+  `zabbix_metric_history` and `zabbix_host_problems`, let investigating agents
+  drill deeper. Presence-based: set `zabbix.api.base_url` to enable.
+  (docs/integrations/zabbix.md)
 
 ### Changed
 

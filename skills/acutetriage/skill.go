@@ -60,6 +60,12 @@ type Config struct {
 	// SentryParams carries the Error-source tunables (enabled, lookback,
 	// max_issues, fetch timeout, message toggle) from the sentry.issues section.
 	SentryParams SentryParams
+	// Zabbix is the optional read-only Zabbix Source used to assemble the
+	// Zabbix context at incident time. nil = no Zabbix enrichment. Pass a TRUE
+	// nil interface when unconfigured to avoid the typed-nil trap.
+	Zabbix ZabbixReader
+	// ZabbixParams carries the zabbix.api tunables (timeout, host label, flap window).
+	ZabbixParams ZabbixParams
 	// Memory is the read-only recall surface (the store) used to inject prior
 	// findings for a recurring key. nil = no recall (the consumer owns the field
 	// it reads; serve wiring assigns *store.Store). Pass a TRUE nil interface
@@ -332,7 +338,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	// evidence lifts the annotations-only basis just like live metrics/logs do
 	// (the call-1 prompt-side directive was rendered before the round existed, so
 	// it passed nil — only this deterministic post-call cap sees verification).
-	s.applyEvidenceCap(&resp, decision, ar.metrics, ar.logs, ar.changes, ar.sentry, ver, inc.ID)
+	s.applyEvidenceCap(&resp, decision, ar.metrics, ar.logs, ar.changes, ar.sentry, ar.zabbix, ver, inc.ID)
 	s.applySteeringCap(&resp, governingOf(ar.memory), ver, inc.ID)
 
 	// Persist output, including the log-enrichment snapshot so the evidence pack
@@ -409,7 +415,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 			OutputJSON:          finalRaw,
 			Status:              incidentStatus,
 			Drill:               isDrill(alerts),
-			Evidence:            buildEvidenceSummary(decision.ShortCircuit, ar.metrics, ar.logs, ar.changes, ar.sentry),
+			Evidence:            buildEvidenceSummary(decision.ShortCircuit, ar.metrics, ar.logs, ar.changes, ar.sentry, ar.zabbix),
 			// A degraded round (floor unfetchable, or call 2 lost) shipped without a
 			// full falsification pass — card renderers surface a caveat off this.
 			Unverified: ver != nil && ver.Outcome == verifyOutcomeDegraded,
@@ -444,7 +450,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.analyzed", analyzed)
 	}
 
-	s.auditEnrichmentDigests(ctx, inc.ID, ar.metrics, ar.logs, ar.changes, ar.sentry)
+	s.auditEnrichmentDigests(ctx, inc.ID, ar.metrics, ar.logs, ar.changes, ar.sentry, ar.zabbix)
 
 	ruleID := "none"
 	if decision.Rule != nil {
@@ -528,12 +534,12 @@ func (s *Skill) resolvedStatusLabel(ctx context.Context, incidentID string) stri
 }
 
 // auditEnrichmentDigests appends one hash-chained digest row per attempted
-// enrichment source — metrics, logs, changes, Sentry. Each digest carries only
-// counts/identifiers (selector, query, matched labels, reconciliation tag),
-// never raw evidence text or metric values, keeping the payload small and
-// PII-free (R4/R16/KTD6). A source contributes a row only when it was
-// attempted (non-nil); a nil auditor makes every call a no-op.
-func (s *Skill) auditEnrichmentDigests(ctx context.Context, incidentID string, metrics *MetricEnrichment, enrichment *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment) {
+// enrichment source — metrics, logs, changes, Sentry, Zabbix. Each digest
+// carries only counts/identifiers (selector, query, matched labels,
+// reconciliation tag), never raw evidence text or metric values, keeping the
+// payload small and PII-free (R4/R16/KTD6). A source contributes a row only
+// when it was attempted (non-nil); a nil auditor makes every call a no-op.
+func (s *Skill) auditEnrichmentDigests(ctx context.Context, incidentID string, metrics *MetricEnrichment, enrichment *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, zabbix *ZabbixContext) {
 	if s.auditor == nil {
 		return
 	}
@@ -575,6 +581,13 @@ func (s *Skill) auditEnrichmentDigests(ctx context.Context, incidentID string, m
 			"corroborating": corroborating,
 		})
 	}
+	if zabbix != nil {
+		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.zabbix_enriched", map[string]any{
+			"incident_id": incidentID,
+			"outcome":     string(zabbix.Outcome),
+			"entry_count": zabbixEntryCount(zabbix),
+		})
+	}
 }
 
 // analysisResult carries everything the first analysis pass produced: the raw
@@ -589,6 +602,7 @@ type analysisResult struct {
 	logs         *LogEnrichment
 	changes      *ChangeEnrichment
 	sentry       *SentryEnrichment
+	zabbix       *ZabbixContext
 	memory       *MemoryEnrichment
 	system, user string // prompts, kept for the call-2 continuation
 	shortCircuit bool
@@ -626,6 +640,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		enrichment *LogEnrichment
 		changes    *ChangeEnrichment
 		sentry     *SentryEnrichment
+		zbx        *ZabbixContext
 		memory     *MemoryEnrichment
 	)
 	if replay != nil {
@@ -637,6 +652,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		enrichment = replay.frozen.Logs
 		changes = replay.frozen.Changes
 		sentry = replay.frozen.Sentry
+		zbx = replay.frozen.Zabbix
 		memory = replay.frozen.Memory
 	} else {
 		metrics = FetchMetrics(ctx, s.promQuerier(), s.cfg.MetricParams, alerts, spanStart, inc.ID, s.logger)
@@ -647,6 +663,9 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		changes = FetchChanges(ctx, s.st, s.cfg.ChangeParams, alerts, spanStart, time.Now().UTC(), inc.ID, s.logger)
 		// Sentry Error source: a bounded 1+K query-at-triage, best-effort, never blocks.
 		sentry = FetchSentry(ctx, s.cfg.Sentry, s.cfg.SentryParams, alerts, spanStart, time.Now().UTC(), inc.ID, s.logger)
+		// Zabbix context: three bounded classes fanned out under one timeout,
+		// best-effort, never blocks. nil client (source disabled) → nil context.
+		zbx = FetchZabbixContext(ctx, s.cfg.Zabbix, s.cfg.ZabbixParams, alerts, time.Now().UTC(), inc.ID, s.logger)
 		// Zero-LLM cross-source verdict, computed downstream of the rule engine at the
 		// triage seam (KTD5/R3): sets sentry.Reconciliation in place on a conclusive
 		// look, inert (no-op) when sentry is nil or the query was inconclusive.
@@ -666,7 +685,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		// the render byte-identical. A no-op when disabled or there are no candidates.
 		s.maybeClassify(ctx, inc, memory)
 	}
-	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment, changes, sentry, memory, s.cfg.Verification)
+	userPrompt := UserPrompt(pack, string(packJSON), metrics, enrichment, changes, sentry, zbx, memory, s.cfg.Verification)
 	// On a re-judgment, prepend the deterministic recurrence context so the model
 	// judges the recurrence with its history rather than as a first-time event.
 	if recurrence != "" {
@@ -703,6 +722,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		logs:    enrichment,
 		changes: changes,
 		sentry:  sentry,
+		zabbix:  zbx,
 		memory:  memory,
 		system:  system,
 		user:    userPrompt,
@@ -778,6 +798,9 @@ func enrichmentSources(ar analysisResult, ver *VerificationEnrichment) map[strin
 	if ar.sentry != nil {
 		sources["sentry"] = ar.sentry
 	}
+	if ar.zabbix != nil {
+		sources["zabbix"] = ar.zabbix
+	}
 	if ar.memory != nil {
 		sources["memory"] = ar.memory
 	}
@@ -810,8 +833,8 @@ func marshalEnrichments(sources map[string]any, logger *slog.Logger, incidentID 
 // compliance. Short-circuit findings are exempt — they carry rule evidence, not
 // model judgment. The persisted output_json keeps the model's original number;
 // the incident row and every notification carry the capped one.
-func (s *Skill) applyEvidenceCap(resp *llmResponse, decision rules.Decision, metrics *MetricEnrichment, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, ver *VerificationEnrichment, incidentID string) {
-	if decision.ShortCircuit || !annotationsOnlyBasis(metrics, logs, changes, sentry, ver) ||
+func (s *Skill) applyEvidenceCap(resp *llmResponse, decision rules.Decision, metrics *MetricEnrichment, logs *LogEnrichment, changes *ChangeEnrichment, sentry *SentryEnrichment, zabbix *ZabbixContext, ver *VerificationEnrichment, incidentID string) {
+	if decision.ShortCircuit || !annotationsOnlyBasis(metrics, logs, changes, sentry, zabbix, ver) ||
 		resp.Confidence <= MaxMetadataOnlyConfidence {
 		return
 	}

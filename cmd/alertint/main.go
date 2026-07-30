@@ -53,6 +53,7 @@ import (
 	"github.com/alertint/alertint-agent/internal/rules"
 	"github.com/alertint/alertint-agent/internal/sentry"
 	"github.com/alertint/alertint-agent/internal/store"
+	"github.com/alertint/alertint-agent/internal/zabbix"
 	"github.com/alertint/alertint-agent/packs"
 	"github.com/alertint/alertint-agent/skills/acutetriage"
 )
@@ -164,12 +165,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 
 	logConfigWarnings(logger, cfg)
 
-	if *receiversAddr != "" {
-		cfg.Receivers.Address = *receiversAddr
-	}
-	if *mcpAddr != "" {
-		cfg.MCP.Addr = *mcpAddr
-	}
+	applyServeOverrides(cfg, *receiversAddr, *mcpAddr)
 
 	st, stagedInfo, err := openStoreWithStagedRestore(ctx, cfg.Storage.SQLitePath, logger)
 	if err != nil {
@@ -268,6 +264,17 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	// a live client — KTD7).
 	sentryReader, sentryParams := sentryErrorSource(cfg, sentryClient)
 
+	// Build the Zabbix pull Source when enabled. Read-only: the client issues
+	// only *.get methods (ADR-0032). Disabled → nothing constructed, no Zabbix
+	// API calls (zero-config triage unaffected).
+	zbxClient, err := newZabbixClient(cfg, logger)
+	if err != nil {
+		return err
+	}
+	// TRUE nil ZabbixReader interface unless the source is enabled (typed-nil
+	// trap: assign only when non-nil, mirrors sentryErrorSource).
+	zbxReader, zbxParams := zabbixContextSource(cfg, zbxClient)
+
 	skill := acutetriage.New(
 		acutetriage.Config{
 			WindowSeconds: cfg.Correlator.WindowSeconds,
@@ -291,6 +298,8 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 			},
 			Sentry:       sentryReader,
 			SentryParams: sentryParams,
+			Zabbix:       zbxReader,
+			ZabbixParams: zbxParams,
 			// Memory recall reads the same store the skill persists to; the
 			// concrete *store.Store is always present, so no typed-nil guard is
 			// needed. Recall is deterministic and default-on.
@@ -342,7 +351,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	// while one is failing — at startup a co-deployed dependency may still
 	// be booting — then at a steady pace, logging losses and recoveries.
 	// Results are cached for GET /health.
-	healthReg := buildHealthChecks(cfg, prom, logSrc, sentryClient)
+	healthReg := buildHealthChecks(cfg, prom, logSrc, sentryClient, zbxClient)
 	go healthReg.Watch(ctx, logger)
 
 	recvSrv, recvErrCh, err := startReceivers(cfg, st, auditor, cor, healthReg, logger)
@@ -350,7 +359,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		return err
 	}
 
-	mcpHTTPSrv, mcpErrCh, err := startMCP(cfg, st, auditor, prom, logSrc, sentryReader, sentryParams, captureEngine, logger)
+	mcpHTTPSrv, mcpErrCh, err := startMCP(cfg, st, auditor, prom, logSrc, sentryReader, sentryParams, zbxClient, captureEngine, logger)
 	if err != nil {
 		return err
 	}
@@ -475,7 +484,7 @@ func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor,
 // startMCP starts the MCP HTTP server when enabled. MCP clients connect by
 // URL (e.g. http://host:9912/mcp) — no subprocess or shared file needed.
 // Returns (nil, nil, nil) when disabled.
-func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom *promclient.Client, logSrc logs.Source, sentryReader acutetriage.SentryReader, sentryParams acutetriage.SentryParams, captureEngine *acutetriage.CaptureEngine, logger *slog.Logger) (*http.Server, <-chan error, error) {
+func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom *promclient.Client, logSrc logs.Source, sentryReader acutetriage.SentryReader, sentryParams acutetriage.SentryParams, zbxClient *zabbix.Client, captureEngine *acutetriage.CaptureEngine, logger *slog.Logger) (*http.Server, <-chan error, error) {
 	if !cfg.MCPEnabled() {
 		return nil, nil, nil
 	}
@@ -483,7 +492,7 @@ func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom 
 	if err != nil {
 		return nil, nil, err
 	}
-	mcpSrv := internalmcp.NewServer(internalmcp.Config{
+	mcpCfg := internalmcp.Config{
 		Token:                   mcpToken,
 		WindowSeconds:           cfg.Correlator.WindowSeconds,
 		Prometheus:              prom,
@@ -495,12 +504,20 @@ func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom 
 		// source uses (nil for disabled/releases-only → tools off), and the WHOLE
 		// resolved params envelope so the live deadline is the configured value, not
 		// zero (KTD8). Never pass a lone IncludeMessage scalar.
-		Sentry:                  sentryReader,
-		SentryParams:            sentryParams,
-		SentryLiveWindowMinutes: cfg.Sentry.Issues.LiveWindowMinutes,
-		MemoryLookbackDays:      cfg.Memory.LookbackDays,
-		Capture:                 captureEngine,
-	}, st, auditor)
+		Sentry:                    sentryReader,
+		SentryParams:              sentryParams,
+		SentryLiveWindowMinutes:   cfg.Sentry.Issues.LiveWindowMinutes,
+		ZabbixDefaultRangeMinutes: cfg.Zabbix.API.DefaultRangeMinutes,
+		MemoryLookbackDays:        cfg.Memory.LookbackDays,
+		Capture:                   captureEngine,
+	}
+	// zbxClient's field type is an unexported interface in package mcp, so it
+	// can't be declared as a typed nil here — assign only when non-nil (typed-nil
+	// trap: mirrors the skill-side ZabbixReader wiring above).
+	if zbxClient != nil {
+		mcpCfg.Zabbix = zbxClient
+	}
+	mcpSrv := internalmcp.NewServer(mcpCfg, st, auditor)
 	srv := &http.Server{
 		Addr:    cfg.MCP.Addr,
 		Handler: mcpSrv.Handler(),
@@ -638,6 +655,17 @@ func runHealth(args []string, stdout, stderr io.Writer) error {
 
 // logConfigWarnings emits each non-fatal config advisory (e.g. a volatile
 // group label) at WARN so startup surfaces them without blocking.
+// applyServeOverrides applies the --receivers-addr/--mcp-addr CLI flags over
+// the loaded config, in place. Empty flag values leave the config untouched.
+func applyServeOverrides(cfg *config.Config, receiversAddr, mcpAddr string) {
+	if receiversAddr != "" {
+		cfg.Receivers.Address = receiversAddr
+	}
+	if mcpAddr != "" {
+		cfg.MCP.Addr = mcpAddr
+	}
+}
+
 func logConfigWarnings(logger *slog.Logger, cfg *config.Config) {
 	for _, w := range cfg.Warnings() {
 		logger.Warn(w)
@@ -697,6 +725,44 @@ func newSentryClient(cfg *config.Config) (*sentry.Client, error) {
 	}), nil
 }
 
+// newZabbixClient builds the read-only Zabbix pull-Source client when
+// zabbix.api is enabled, resolving the token from its named env var. Returns
+// (nil, nil) when the source is disabled so callers can skip all Zabbix
+// wiring, mirroring newSentryClient.
+func newZabbixClient(cfg *config.Config, logger *slog.Logger) (*zabbix.Client, error) {
+	if !cfg.ZabbixAPIEnabled() {
+		return nil, nil //nolint:nilnil // a disabled source legitimately has no client and no error; callers branch on nil
+	}
+	token, err := cfg.ZabbixAPIToken()
+	if err != nil {
+		return nil, err
+	}
+	client := zabbix.NewClient(zabbix.Config{
+		BaseURL:              cfg.Zabbix.API.BaseURL,
+		APIToken:             token,
+		TimeoutSeconds:       cfg.Zabbix.API.TimeoutSeconds,
+		HistoryRetentionDays: cfg.Zabbix.API.HistoryRetentionDays,
+		FlapWindowHours:      cfg.Zabbix.API.FlapWindowHours,
+	})
+	logger.Info("zabbix api connected", slog.String("base_url", cfg.Zabbix.API.BaseURL))
+	return client, nil
+}
+
+// zabbixContextSource resolves the triage ZabbixReader + params from the built
+// client. Returns a TRUE nil ZabbixReader interface (not a typed-nil
+// *zabbix.Client) when client is nil, mirroring sentryErrorSource.
+func zabbixContextSource(cfg *config.Config, client *zabbix.Client) (acutetriage.ZabbixReader, acutetriage.ZabbixParams) {
+	params := acutetriage.ZabbixParams{
+		TimeoutSeconds:  cfg.Zabbix.API.TimeoutSeconds,
+		HostLabel:       cfg.Zabbix.API.HostLabel,
+		FlapWindowHours: cfg.Zabbix.API.FlapWindowHours,
+	}
+	if client != nil {
+		return client, params
+	}
+	return nil, params
+}
+
 // startSentryPoller builds the shared Sentry client when any feature is enabled
 // and starts the release/deploy poller ONLY when releases is enabled, returning
 // the client (for the Error source + the health check) and a stop func to defer.
@@ -754,7 +820,7 @@ func newSentryPoller(cfg *config.Config, client *sentry.Client, st *store.Store,
 
 // buildHealthChecks assembles connectivity probes for every enabled
 // integration. Returns nil (a no-op registry) when nothing is enabled.
-func buildHealthChecks(cfg *config.Config, prom *promclient.Client, logSrc logs.Source, sentryClient *sentry.Client) *health.Registry {
+func buildHealthChecks(cfg *config.Config, prom *promclient.Client, logSrc logs.Source, sentryClient *sentry.Client, zbxClient *zabbix.Client) *health.Registry {
 	var checks []health.Check
 	if cfg.PrometheusEnabled() && prom != nil {
 		checks = append(checks, health.Check{
@@ -791,6 +857,19 @@ func buildHealthChecks(cfg *config.Config, prom *promclient.Client, logSrc logs.
 				// valid, and project:read is granted — a read-only GET valid for
 				// the Error source (issues-only) too.
 				_, _, err := sentryClient.ListReleases(ctx, cfg.Sentry.Releases.Projects, "")
+				return err
+			},
+		})
+	}
+	if cfg.ZabbixAPIEnabled() && zbxClient != nil {
+		checks = append(checks, health.Check{
+			Name:   "zabbix",
+			Detail: cfg.Zabbix.API.BaseURL,
+			Probe: func(ctx context.Context) error {
+				// apiinfo.version needs no auth: proves the frontend is
+				// reachable and serving. Token validity surfaces on the first
+				// real context fetch.
+				_, err := zbxClient.APIVersion(ctx)
 				return err
 			},
 		})

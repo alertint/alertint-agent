@@ -526,7 +526,7 @@ func TestUserPrompt_MemoryAnchoringStaysCorrect(t *testing.T) {
 	}
 	// Memory present, NO live evidence: the annotations-only directive fires AND
 	// says recalled priors do not lift the basis.
-	out := UserPrompt(basePack(), "{}", nil, nil, nil, nil, mem, VerificationParams{})
+	out := UserPrompt(basePack(), "{}", nil, nil, nil, nil, nil, mem, VerificationParams{})
 	if !strings.Contains(out, "ANNOTATIONS ONLY") {
 		t.Errorf("annotations-only directive must fire when no live evidence:\n%s", out)
 	}
@@ -534,7 +534,7 @@ func TestUserPrompt_MemoryAnchoringStaysCorrect(t *testing.T) {
 		t.Errorf("basis must note recalled memory is not live evidence:\n%s", out)
 	}
 	// Live logs present: the basis directive is silent even with memory rendered.
-	out = UserPrompt(basePack(), "{}", nil, liveLogs(), nil, nil, mem, VerificationParams{})
+	out = UserPrompt(basePack(), "{}", nil, liveLogs(), nil, nil, nil, mem, VerificationParams{})
 	if strings.Contains(out, "ANNOTATIONS ONLY") {
 		t.Errorf("with live logs the annotations-only directive must stay silent:\n%s", out)
 	}

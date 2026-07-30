@@ -657,7 +657,7 @@ func TestKillSwitchSingleCall(t *testing.T) {
 		t.Fatalf("load alerts: %v", err)
 	}
 	pack := acutetriage.BuildEvidencePack(inc, alerts, 0)
-	want := acutetriage.UserPrompt(pack, string(mustJSON(t, pack)), nil, nil, nil, nil, nil, acutetriage.VerificationParams{})
+	want := acutetriage.UserPrompt(pack, string(mustJSON(t, pack)), nil, nil, nil, nil, nil, nil, acutetriage.VerificationParams{})
 	if scripted.prompts[0] != want {
 		t.Errorf("call-1 prompt drifted from the pre-feature fixture:\n--- got ---\n%s\n--- want ---\n%s", scripted.prompts[0], want)
 	}

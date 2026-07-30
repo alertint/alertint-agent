@@ -177,6 +177,50 @@ func TestZabbixIngressCountsAsInboundEnabled(t *testing.T) {
 	}
 }
 
+func TestZabbixAPIPresenceBasedEnablement(t *testing.T) {
+	cfg := Defaults()
+	if cfg.ZabbixAPIEnabled() {
+		t.Fatal("no base_url → disabled")
+	}
+	cfg.Zabbix.API.BaseURL = "https://zbx.example.com"
+	if !cfg.ZabbixAPIEnabled() {
+		t.Fatal("base_url present → enabled")
+	}
+	off := false
+	cfg.Zabbix.API.Enabled = &off
+	if cfg.ZabbixAPIEnabled() {
+		t.Fatal("explicit enabled:false must win over presence")
+	}
+}
+
+func TestZabbixAPIValidation(t *testing.T) {
+	cfg := Defaults()
+	cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
+	cfg.LLM.APIKeyEnv = "ANTHROPIC_API_KEY"
+	cfg.Alertmanager.WebhookTokenEnv = "ALERTINT_WEBHOOK_TOKEN"
+	cfg.Zabbix.API.BaseURL = "https://zbx.example.com"
+	cfg.Zabbix.API.APITokenEnv = ""
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "zabbix: api: api_token_env is required") {
+		t.Fatalf("want api_token_env error, got %v", err)
+	}
+	cfg.Zabbix.API.APITokenEnv = "ZABBIX_API_TOKEN"
+	cfg.Zabbix.API.TimeoutSeconds = 0
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "zabbix: api: timeout_seconds") {
+		t.Fatalf("want timeout_seconds error, got %v", err)
+	}
+}
+
+func TestZabbixAPIDefaults(t *testing.T) {
+	cfg := Defaults()
+	a := cfg.Zabbix.API
+	if a.TimeoutSeconds != 10 || a.DefaultRangeMinutes != 60 ||
+		a.HistoryRetentionDays != 7 || a.FlapWindowHours != 24 || a.HostLabel != "host" {
+		t.Fatalf("defaults wrong: %+v", a)
+	}
+}
+
 func TestDefaultGroupLabelsIncludeHost(t *testing.T) {
 	cfg := Defaults()
 	want := []string{"cluster", "namespace", "service", "host"}

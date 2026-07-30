@@ -79,6 +79,7 @@ type frozenEnvelope struct {
 	Logs         *LogEnrichment          `json:"logs"`
 	Changes      *ChangeEnrichment       `json:"changes"`
 	Sentry       *SentryEnrichment       `json:"sentry"`
+	Zabbix       *ZabbixContext          `json:"zabbix"`
 	Memory       *MemoryEnrichment       `json:"memory"`
 	Verification *VerificationEnrichment `json:"verification"`
 }
@@ -145,6 +146,12 @@ func (s *Skill) stage1Corpus(inc store.Incident, alerts []store.Alert, frozen fr
 	}
 	if frozen.Sentry != nil {
 		if sb, err := json.Marshal(frozen.Sentry); err == nil {
+			b.WriteString("\n")
+			b.Write(sb)
+		}
+	}
+	if frozen.Zabbix != nil {
+		if sb, err := json.Marshal(frozen.Zabbix); err == nil {
 			b.WriteString("\n")
 			b.Write(sb)
 		}

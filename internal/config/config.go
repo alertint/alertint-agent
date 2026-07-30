@@ -237,10 +237,11 @@ type ChangesIngressConfig struct {
 }
 
 // ZabbixConfig groups the Zabbix connector's two independently-enableable
-// sub-roles. Ingress (this section) is the push Receiver; the api section
-// (pull Source) arrives with the context chunk.
+// sub-roles: Ingress is the push Receiver; API is the pull Source (context
+// enrichment + MCP tools).
 type ZabbixConfig struct {
 	Ingress ZabbixIngressConfig `yaml:"ingress"`
+	API     ZabbixAPIConfig     `yaml:"api,omitempty"`
 }
 
 // ZabbixIngressConfig enables the POST /webhook/zabbix receiver. Receivers use
@@ -249,6 +250,21 @@ type ZabbixConfig struct {
 type ZabbixIngressConfig struct {
 	Enabled         bool   `yaml:"enabled"`
 	WebhookTokenEnv string `yaml:"webhook_token_env"`
+}
+
+// ZabbixAPIConfig configures the pull Source (Zabbix context enrichment + MCP
+// tools). Enabled is a *bool for presence-based enablement: an omitted key
+// (nil) means "on when base_url is set"; an explicit value is honored either
+// way. Resolve via Config.ZabbixAPIEnabled, never directly.
+type ZabbixAPIConfig struct {
+	Enabled              *bool  `yaml:"enabled,omitempty"`
+	BaseURL              string `yaml:"base_url"`
+	APITokenEnv          string `yaml:"api_token_env"`
+	TimeoutSeconds       int    `yaml:"timeout_seconds"`
+	DefaultRangeMinutes  int    `yaml:"default_range_minutes"`
+	HistoryRetentionDays int    `yaml:"history_retention_days"`
+	FlapWindowHours      int    `yaml:"flap_window_hours"`
+	HostLabel            string `yaml:"host_label"`
 }
 
 // ChangesEnrichmentConfig configures using stored changes at triage time and
@@ -478,6 +494,15 @@ func Defaults() Config {
 				// IncludeMessage left nil → defaults ON via MessageIncluded (R14).
 			},
 		},
+		Zabbix: ZabbixConfig{
+			API: ZabbixAPIConfig{
+				TimeoutSeconds:       10,
+				DefaultRangeMinutes:  60,
+				HistoryRetentionDays: 7,
+				FlapWindowHours:      24,
+				HostLabel:            "host",
+			},
+		},
 		Triage: TriageConfig{
 			Verification: VerificationConfig{
 				MaxQueries:          4,
@@ -603,6 +628,7 @@ func (c *Config) validate(offline bool) error {
 	errs = append(errs, c.validateCorrelator()...)
 	errs = append(errs, c.validateNotify()...)
 	errs = append(errs, c.validatePrometheus()...)
+	errs = append(errs, c.validateZabbixAPI()...)
 	errs = append(errs, c.validateLogs()...)
 	errs = append(errs, c.validateSentry()...)
 	errs = append(errs, c.validateChanges()...)
@@ -909,6 +935,35 @@ func (c *Config) validatePrometheus() []string {
 	return errs
 }
 
+func (c *Config) validateZabbixAPI() []string {
+	var errs []string
+	if !c.ZabbixAPIEnabled() {
+		return nil
+	}
+	if strings.TrimSpace(c.Zabbix.API.BaseURL) == "" {
+		errs = append(errs, "zabbix: api: base_url is required when enabled")
+	}
+	if strings.TrimSpace(c.Zabbix.API.APITokenEnv) == "" {
+		errs = append(errs, "zabbix: api: api_token_env is required when enabled")
+	}
+	if c.Zabbix.API.TimeoutSeconds <= 0 {
+		errs = append(errs, "zabbix: api: timeout_seconds must be > 0")
+	}
+	if c.Zabbix.API.DefaultRangeMinutes <= 0 {
+		errs = append(errs, "zabbix: api: default_range_minutes must be > 0")
+	}
+	if c.Zabbix.API.HistoryRetentionDays <= 0 {
+		errs = append(errs, "zabbix: api: history_retention_days must be > 0")
+	}
+	if c.Zabbix.API.FlapWindowHours <= 0 {
+		errs = append(errs, "zabbix: api: flap_window_hours must be > 0")
+	}
+	if strings.TrimSpace(c.Zabbix.API.HostLabel) == "" {
+		errs = append(errs, "zabbix: api: host_label is required when enabled")
+	}
+	return errs
+}
+
 func (c *Config) validateLogs() []string {
 	if !c.LogsEnabled() {
 		return nil
@@ -974,6 +1029,30 @@ func (c *Config) PrometheusEnabled() bool {
 		return *c.Prometheus.Enabled
 	}
 	return strings.TrimSpace(c.Prometheus.BaseURL) != ""
+}
+
+// ZabbixAPIEnabled resolves the effective Zabbix Source on/off state: an
+// explicit enabled value wins; when omitted, a configured base_url turns the
+// read-only connector on (presence-based enablement).
+func (c *Config) ZabbixAPIEnabled() bool {
+	if c.Zabbix.API.Enabled != nil {
+		return *c.Zabbix.API.Enabled
+	}
+	return strings.TrimSpace(c.Zabbix.API.BaseURL) != ""
+}
+
+// ZabbixAPIToken resolves the read-only API token from the env var named by
+// zabbix.api.api_token_env. Loud when unset.
+func (c *Config) ZabbixAPIToken() (string, error) {
+	name := strings.TrimSpace(c.Zabbix.API.APITokenEnv)
+	if name == "" {
+		return "", errors.New("zabbix: api: api_token_env is not configured")
+	}
+	v := os.Getenv(name)
+	if strings.TrimSpace(v) == "" {
+		return "", fmt.Errorf("zabbix: api: env var %s is empty or unset", name)
+	}
+	return v, nil
 }
 
 // LogsEnabled resolves the effective log-enrichment on/off state:

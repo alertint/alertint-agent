@@ -53,7 +53,7 @@ func TestSentryWiring_DisabledIsSilent(t *testing.T) {
 	if p := newSentryPoller(&cfg, nil, nil, slog.Default()); p != nil {
 		t.Error("newSentryPoller(nil client) should be nil")
 	}
-	reg := buildHealthChecks(&cfg, nil, nil, nil)
+	reg := buildHealthChecks(&cfg, nil, nil, nil, nil)
 	if sentryStatus(reg) != nil {
 		t.Error("sentry health check registered while disabled")
 	}
@@ -86,7 +86,7 @@ func TestSentryWiring_HealthCheckProbeOK(t *testing.T) {
 
 	cfg := sentryEnabledConfig(srv.URL)
 	client := sentry.NewClient(sentry.Config{BaseURL: srv.URL, Org: "acme", Token: "t"})
-	reg := buildHealthChecks(cfg, nil, nil, client)
+	reg := buildHealthChecks(cfg, nil, nil, client, nil)
 
 	s := sentryStatus(reg)
 	if s == nil {
@@ -111,7 +111,7 @@ func TestSentryWiring_HealthCheckProbeFailed(t *testing.T) {
 
 	cfg := sentryEnabledConfig(srv.URL)
 	client := sentry.NewClient(sentry.Config{BaseURL: srv.URL, Org: "acme", Token: "bad"})
-	reg := buildHealthChecks(cfg, nil, nil, client)
+	reg := buildHealthChecks(cfg, nil, nil, client, nil)
 
 	s := sentryStatus(reg)
 	if s == nil || s.OK {
@@ -174,7 +174,7 @@ func TestSentryWiring_IssuesOnlyRegistersHealthCheck(t *testing.T) {
 
 	cfg := issuesOnlyConfig(srv.URL)
 	client := sentry.NewClient(sentry.Config{BaseURL: srv.URL, Org: "acme", Token: "t"})
-	reg := buildHealthChecks(cfg, nil, nil, client)
+	reg := buildHealthChecks(cfg, nil, nil, client, nil)
 	if sentryStatus(reg) == nil {
 		t.Fatal("sentry health check must be registered for issues-only")
 	}
