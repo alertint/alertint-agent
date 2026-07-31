@@ -1,0 +1,23 @@
+zabbix_export:
+  version: '7.0'
+  media_types:
+    - name: AlertINT
+      type: WEBHOOK
+      description: 'Forwards problem/resolution events to an AlertINT agent (https://alertint.com/docs/integrations/zabbix). After import, set the url and token parameters for your install.'
+      parameters:
+        - name: payload
+          value: '{"event_id":"{EVENT.ID}","status":"{EVENT.STATUS}","severity":"{EVENT.SEVERITY}","nseverity":"{EVENT.NSEVERITY}","host":"{HOST.HOST}","host_visible":"{HOST.NAME}","trigger_id":"{TRIGGER.ID}","trigger_name":"{TRIGGER.NAME}","item_key":"{ITEM.KEY}","item_value":"{ITEM.VALUE}","tags":{EVENT.TAGSJSON},"clock":"{EVENT.DATE} {EVENT.TIME}","recovery_clock":"{EVENT.RECOVERY.DATE} {EVENT.RECOVERY.TIME}","generator_url":"{$ZABBIX_URL}/tr_events.php?triggerid={TRIGGER.ID}&eventid={EVENT.ID}"}'
+        - name: token
+          value: 'REPLACE-WITH-YOUR-ALERTINT_ZABBIX_WEBHOOK_TOKEN'
+        - name: url
+          value: 'http://REPLACE-ALERTINT-HOST:9911/webhook/zabbix'
+      script: |
+        var params = JSON.parse(value);
+        var req = new HttpRequest();
+        req.addHeader('Content-Type: application/json');
+        req.addHeader('Authorization: Bearer ' + params.token);
+        var resp = req.post(params.url, params.payload);
+        if (req.getStatus() >= 300) {
+            throw 'alertint replied ' + req.getStatus() + ': ' + resp;
+        }
+        return 'OK';
