@@ -49,6 +49,10 @@ See the [configuration reference](../getting-started/configuration.md#zabbix).
 
 ## Zabbix media type (copy-paste)
 
+Prefer importing? [`examples/zabbix-media-type.yaml`](https://github.com/alertint/alertint-agent/blob/main/examples/zabbix-media-type.yaml)
+is this media type as a Zabbix 7.0 import file — **Alerts → Media types →
+Import**, then set the `url` and `token` parameters for your install.
+
 Create **Alerts → Media types → Create media type**, type **Webhook**, with
 parameters:
 
