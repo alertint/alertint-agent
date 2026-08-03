@@ -84,6 +84,48 @@ namespace) and appended to the LLM prompt as a *Live metrics* section.
 The model uses those values to calibrate severity and confidence — actual
 numbers take precedence over text annotations.
 
+### Scoping evidence queries: the selector allowlist
+
+When AlertINT builds metric queries for an incident, it uses the alert-label
+keys shared by every member alert, filtered to a **selector allowlist** that
+drops alert metadata (`alertname`, `severity`, …) no backend labels data by.
+The built-in allowlist is:
+
+`namespace`, `service`, `job`, `pod`, `container`, `instance`
+
+#### Multi-cluster setups: `triage.extra_selector_labels`
+
+If one Prometheus/Mimir serves alerts from more than one cluster, `cluster`
+is on every alert but is not in the built-in allowlist — so evidence queries
+would mix series from other clusters. Add topology labels to the allowlist:
+
+```yaml
+triage:
+  extra_selector_labels: [cluster]
+```
+
+With alerts labeled `{cluster="eu-west", namespace="payments",
+service="checkout"}`, the queries become:
+
+| Query | Without | With `[cluster]` |
+|---|---|---|
+| Primary | `{namespace="payments",service="checkout"}` | `{cluster="eu-west",namespace="payments",service="checkout"}` |
+| Zero-match retry | `{namespace="payments"}` | `{cluster="eu-west",namespace="payments"}` |
+| Per-instance | `{instance="10.0.4.7:9100"}` | `{cluster="eu-west",instance="10.0.4.7:9100"}` |
+| Verification floor | `{namespace="payments",service="checkout"}` | `{cluster="eu-west",namespace="payments",service="checkout"}` |
+
+Configured labels are **never dropped by fallback queries**: when the primary
+query matches nothing, the retry sheds rule-attached labels (`service`,
+`job`) but keeps your extras. A label that exists on alerts but not on your
+series therefore shows up as an *empty* enrichment with the exact query in
+the agent log — loud and diagnosable — rather than silently widening to the
+wrong cluster.
+
+Use topology labels (`cluster`, `region`, `datacenter`), not identity labels
+(anything pod-like): a narrow extra would collapse the verification floor's
+peer scope to the incident's own targets. Run with `--log-level=debug` to see
+which shared alert labels the allowlist dropped for each incident.
+
 ### Evidence line
 
 Every finding notification carries a per-source evidence summary — how
