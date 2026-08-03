@@ -114,6 +114,22 @@ func TestExtraSelectorValues_PicksOnlyExtras(t *testing.T) {
 	}
 }
 
+func TestParentScope_ExtraIncluded(t *testing.T) {
+	got := parentScope(clusterAlerts(), []string{"cluster"})
+	want := `{cluster="eu-west",namespace="payments",service="checkout"}`
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestParentScope_NoExtras_Unchanged(t *testing.T) {
+	got := parentScope(clusterAlerts(), nil)
+	want := `{namespace="payments",service="checkout"}`
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
 // The invariant end-to-end (ADR-0035): primary matches nothing, the retry
 // still carries the extra.
 func TestFetchMetrics_RetryKeepsExtra(t *testing.T) {

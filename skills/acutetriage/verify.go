@@ -33,6 +33,9 @@ type VerificationParams struct {
 	MaxQueries          int
 	QueryTimeoutSeconds int
 	MaxSeries           int
+	// ExtraSelectorLabels joins the floor's peer scope (ADR-0035): a peer
+	// ratio computed across the operator's partitions is not a peer ratio.
+	ExtraSelectorLabels []string
 	// HasPromQL / HasZabbix are presence flags stamped by the skill
 	// (verifyParams()), never parsed from config: they select which floor
 	// sources contribute (ADR-0034) and which query kinds the model may be
@@ -121,15 +124,16 @@ const (
 var broadScopeKeys = []string{"namespace", "service", "job"}
 
 // parentScope derives a Prometheus matcher over the incident's shared
-// broad-scope labels (namespace/service/job) — the peer scope the floor's
-// up_ratio query runs against. Narrow identity labels (pod/container/instance)
-// are dropped even when shared, so a host-only alert yields "" (unscoped —
-// the caller falls back to a global ratio) rather than a matcher that is
-// really just the incident's own target.
-func parentScope(alerts []store.Alert) string {
+// broad-scope labels (namespace/service/job) plus any extra selector labels
+// (ADR-0035) — the peer scope the floor's up_ratio query runs against.
+// Narrow identity labels (pod/container/instance) are dropped even when
+// shared, so a host-only alert yields "" (unscoped — the caller falls back to
+// a global ratio) rather than a matcher that is really just the incident's
+// own target.
+func parentScope(alerts []store.Alert, extras []string) string {
 	shared := sharedLabelValues(alerts)
 	scope := map[string][]string{}
-	for _, k := range broadScopeKeys {
+	for _, k := range append(append([]string{}, broadScopeKeys...), extras...) {
 		if vs, ok := shared[k]; ok && len(vs) > 0 {
 			scope[k] = vs
 		}
@@ -145,7 +149,7 @@ func parentScope(alerts []store.Alert) string {
 func composeFloor(p VerificationParams, hostLabel string, alerts []store.Alert) []VerificationQuery {
 	var qs []VerificationQuery
 	if p.HasPromQL {
-		qs = append(qs, VerificationQuery{Kind: kindUpRatio, Source: "floor", Expr: parentScope(alerts),
+		qs = append(qs, VerificationQuery{Kind: kindUpRatio, Source: "floor", Expr: parentScope(alerts, p.ExtraSelectorLabels),
 			Why: "peer-scope health: is the wider world up?"})
 	}
 	if p.HasZabbix {
