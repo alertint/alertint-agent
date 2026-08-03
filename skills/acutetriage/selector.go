@@ -26,8 +26,8 @@ func allowedSelectorKeys(extras []string) []string {
 // an operator can see why a label is absent from evidence queries without
 // reading source. Guarded by Enabled so the recomputation costs nothing at
 // info level.
-func logDroppedSelectorKeys(logger *slog.Logger, surface string, alerts []store.Alert, extras []string, incidentID string) {
-	if logger == nil || !logger.Enabled(context.Background(), slog.LevelDebug) {
+func logDroppedSelectorKeys(ctx context.Context, logger *slog.Logger, surface string, alerts []store.Alert, extras []string, incidentID string) {
+	if logger == nil || !logger.Enabled(ctx, slog.LevelDebug) {
 		return
 	}
 	allowed := make(map[string]bool)

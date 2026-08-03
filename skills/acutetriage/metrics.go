@@ -394,7 +394,7 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 	}
 
 	shared := buildMetricSelector(alerts, params.ExtraSelectorLabels)
-	logDroppedSelectorKeys(logger, "metrics", alerts, params.ExtraSelectorLabels, incidentID)
+	logDroppedSelectorKeys(ctx, logger, "metrics", alerts, params.ExtraSelectorLabels, incidentID)
 	extraSel := extraSelectorValues(shared, params.ExtraSelectorLabels)
 	primary := renderPromMatcher(shared)
 	physicalFallback := renderPhysicalCore(shared, params.ExtraSelectorLabels)

@@ -71,7 +71,7 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 	// Generic selector: shared alert labels ∩ AllowedSelectorKeys. No per-backend
 	// renaming here — the provider owns translation (ADR-0002).
 	sel := buildLogSelector(alerts, params.ExtraSelectorLabels)
-	logDroppedSelectorKeys(logger, "logs", alerts, params.ExtraSelectorLabels, incidentID)
+	logDroppedSelectorKeys(ctx, logger, "logs", alerts, params.ExtraSelectorLabels, incidentID)
 	if len(sel.Labels) == 0 {
 		shared := formatLabels(sharedLabels(alerts))
 		logger.Info("acutetriage: logs: empty selector — no usable log labels for this incident",
