@@ -23,8 +23,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
+	"github.com/alertint/alertint-agent/internal/logs"
 	"gopkg.in/yaml.v3"
 )
 
@@ -62,9 +64,13 @@ type RulesConfig struct {
 }
 
 // TriageConfig groups triage-pipeline tunables. Verification (the falsification
-// round, ADR-0021/0022) is its first block.
+// round, ADR-0021/0022) is its first block. ExtraSelectorLabels extends the
+// built-in selector allowlist with operator-chosen topology keys (ADR-0035):
+// extend-only, one shared list for metric enrichment, log enrichment, and the
+// verification floor.
 type TriageConfig struct {
-	Verification VerificationConfig `yaml:"verification"`
+	Verification        VerificationConfig `yaml:"verification"`
+	ExtraSelectorLabels []string           `yaml:"extra_selector_labels,omitempty"`
 }
 
 // VerificationConfig tunes the verification round. Enabled is a *bool so an
@@ -633,6 +639,7 @@ func (c *Config) validate(offline bool) error {
 	errs = append(errs, c.validateSentry()...)
 	errs = append(errs, c.validateChanges()...)
 	errs = append(errs, c.validateVerification()...)
+	errs = append(errs, c.validateTriageSelector()...)
 	errs = append(errs, c.validateMemory()...)
 	if !offline {
 		errs = append(errs, c.validateRules()...)
@@ -833,6 +840,35 @@ func (c *Config) validateVerification() []string {
 	}
 	if c.Triage.Verification.QueryTimeoutSeconds <= 0 {
 		errs = append(errs, "triage: verification: query_timeout_seconds: must be > 0")
+	}
+	return errs
+}
+
+// selectorLabelNameRe is Prometheus label-name syntax — the strictest of the
+// backends the extras feed (LogQL accepts a superset), so one rule covers all.
+var selectorLabelNameRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+// validateTriageSelector rejects malformed extra selector labels at startup
+// (ADR-0035). An entry duplicating the built-in allowlist is an error rather
+// than a silent dedupe: the message names the full built-in list, so the
+// operator learns the allowlist exists without reading source.
+func (c *Config) validateTriageSelector() []string {
+	var errs []string
+	builtin := make(map[string]bool, len(logs.AllowedSelectorKeys))
+	for _, k := range logs.AllowedSelectorKeys {
+		builtin[k] = true
+	}
+	seen := make(map[string]bool, len(c.Triage.ExtraSelectorLabels))
+	for _, k := range c.Triage.ExtraSelectorLabels {
+		switch {
+		case !selectorLabelNameRe.MatchString(k):
+			errs = append(errs, fmt.Sprintf("triage: extra_selector_labels: %q: invalid label name (must match [a-zA-Z_][a-zA-Z0-9_]*)", k))
+		case seen[k]:
+			errs = append(errs, fmt.Sprintf("triage: extra_selector_labels: %q: duplicate entry", k))
+		case builtin[k]:
+			errs = append(errs, fmt.Sprintf("triage: extra_selector_labels: %q: already in the built-in allowlist (%s)", k, strings.Join(logs.AllowedSelectorKeys, ", ")))
+		}
+		seen[k] = true
 	}
 	return errs
 }
