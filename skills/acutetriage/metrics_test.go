@@ -34,7 +34,7 @@ func TestBuildMetricSelector_AllowlistIntersectionUnioned(t *testing.T) {
 		alert(map[string]string{"namespace": "checkout", "pod": "api-7f9x", "severity": "critical"}),
 		alert(map[string]string{"namespace": "checkout", "pod": "api-2a1b", "severity": "warning"}),
 	}
-	sel := buildMetricSelector(alerts)
+	sel := buildMetricSelector(alerts, nil)
 	// severity is not allowlisted → dropped; pod present on both, values unioned.
 	if _, ok := sel["severity"]; ok {
 		t.Error("severity must be dropped (not allowlisted)")

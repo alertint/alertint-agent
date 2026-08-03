@@ -15,7 +15,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/alertint/alertint-agent/internal/logs"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -31,10 +30,11 @@ var metricPhysicalKeys = map[string]bool{
 // values that key takes across members, unioned. This is exactly the log-selector
 // rule (ADR-0002/0016) — reusing sharedLabelValues — but with no provider
 // translation layer: for Prometheus, alert labels usually ARE series labels.
-func buildMetricSelector(alerts []store.Alert) map[string][]string {
+// extras is the operator-configured allowlist extension (ADR-0035).
+func buildMetricSelector(alerts []store.Alert, extras []string) map[string][]string {
 	shared := sharedLabelValues(alerts)
 	out := make(map[string][]string)
-	for _, k := range logs.AllowedSelectorKeys {
+	for _, k := range allowedSelectorKeys(extras) {
 		if vs, ok := shared[k]; ok && len(vs) > 0 {
 			out[k] = vs
 		}
@@ -318,8 +318,9 @@ const maxInstanceSupplements = 5
 // rather than read off the client so the fetch owns the per-scope deadline
 // budget and the server-side series bound.
 type MetricParams struct {
-	TimeoutSeconds int
-	MaxSeries      int // server-side per-query series cap (0 = unbounded)
+	TimeoutSeconds      int
+	MaxSeries           int      // server-side per-query series cap (0 = unbounded)
+	ExtraSelectorLabels []string // operator-configured allowlist extension (ADR-0035)
 }
 
 // metricQuerier is the narrow read surface FetchMetrics needs. *prometheus.Client
@@ -368,7 +369,8 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 		logger = slog.Default()
 	}
 
-	shared := buildMetricSelector(alerts)
+	shared := buildMetricSelector(alerts, params.ExtraSelectorLabels)
+	logDroppedSelectorKeys(logger, "metrics", alerts, params.ExtraSelectorLabels, incidentID)
 	primary := renderPromMatcher(shared)
 	physicalFallback := renderPhysicalCore(shared)
 
