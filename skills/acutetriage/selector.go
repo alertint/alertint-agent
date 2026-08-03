@@ -12,13 +12,21 @@ import (
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
+// mergeSelectorKeys returns a fresh slice of base followed by extras — the
+// "built-in core ∪ operator extras" pattern every selector-building site
+// applies to its own base set (ADR-0035: allowedSelectorKeys uses the
+// built-in six, parentScope uses broadScopeKeys). base is never aliased or
+// mutated.
+func mergeSelectorKeys(base, extras []string) []string {
+	return append(append(make([]string, 0, len(base)+len(extras)), base...), extras...)
+}
+
 // allowedSelectorKeys returns the effective selector allowlist: the built-in
 // keys plus the operator-configured extra selector labels (ADR-0035). Extras
 // arrive pre-validated (syntax, no duplicates against the built-ins), so a
-// plain append is safe. Always returns a fresh slice — the built-in list is
-// never aliased or mutated.
+// plain append is safe.
 func allowedSelectorKeys(extras []string) []string {
-	return append(append(make([]string, 0, len(logs.AllowedSelectorKeys)+len(extras)), logs.AllowedSelectorKeys...), extras...)
+	return mergeSelectorKeys(logs.AllowedSelectorKeys, extras)
 }
 
 // logDroppedSelectorKeys emits the discoverability breadcrumb (ADR-0035): at

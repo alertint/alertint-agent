@@ -133,7 +133,7 @@ var broadScopeKeys = []string{"namespace", "service", "job"}
 func parentScope(alerts []store.Alert, extras []string) string {
 	shared := sharedLabelValues(alerts)
 	scope := map[string][]string{}
-	for _, k := range append(append([]string{}, broadScopeKeys...), extras...) {
+	for _, k := range mergeSelectorKeys(broadScopeKeys, extras) {
 		if vs, ok := shared[k]; ok && len(vs) > 0 {
 			scope[k] = vs
 		}
