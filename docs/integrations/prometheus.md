@@ -84,6 +84,107 @@ namespace) and appended to the LLM prompt as a *Live metrics* section.
 The model uses those values to calibrate severity and confidence — actual
 numbers take precedence over text annotations.
 
+### Scoping evidence queries: the selector allowlist
+
+When AlertINT builds metric queries for an incident, it uses the alert-label
+keys shared by every member alert, filtered to a **selector allowlist** that
+drops alert metadata (`alertname`, `severity`, …) no backend labels data by.
+The built-in allowlist is:
+
+`namespace`, `service`, `job`, `pod`, `container`, `instance`
+
+#### Multi-cluster setups: `triage.extra_selector_labels`
+
+If one Prometheus/Mimir serves alerts from more than one cluster, `cluster`
+is on every alert but is not in the built-in allowlist — so evidence queries
+would mix series from other clusters. Add topology labels to the allowlist
+with `triage.extra_selector_labels`. The examples below all use one
+incident: shared labels `cluster=eu-west, namespace=payments,
+service=checkout`, with member alerts also carrying `region=eu` where noted.
+
+**Example 1 — not configured (the default).** Behavior is unchanged:
+
+```yaml
+triage: {}                # or the key omitted entirely
+```
+
+```text
+metric primary:  {namespace="payments",service="checkout"}
+log (pre-map):   {namespace="payments",service="checkout"}
+floor up_ratio:  {namespace="payments",service="checkout"}
+```
+
+**Example 2 — one topology label** (the multi-cluster case above):
+
+```yaml
+triage:
+  extra_selector_labels: [cluster]
+```
+
+```text
+metric primary:   {cluster="eu-west",namespace="payments",service="checkout"}
+zero-match retry: {cluster="eu-west",namespace="payments"}          # sheds service/job, keeps the extra
+supplement:       {cluster="eu-west",instance="10.0.4.7:9100"}      # per member alert carrying instance
+log (pre-map):    {cluster="eu-west",namespace="payments",service="checkout"}
+floor up_ratio:   {cluster="eu-west",namespace="payments",service="checkout"}
+```
+
+Configured labels are **never dropped by fallback queries**: when the primary
+query matches nothing, the retry sheds rule-attached labels (`service`,
+`job`) but keeps your extras. A label that exists on alerts but not on your
+series therefore shows up as an *empty* enrichment with the exact query in
+the agent log — loud and diagnosable — rather than silently widening to the
+wrong cluster.
+
+**Example 3 — several extras; only keys shared by every member are used.**
+Alerts carry `cluster` and `region`, but no `datacenter` — a configured key
+absent from any member alert simply never enters a query:
+
+```yaml
+triage:
+  extra_selector_labels: [cluster, region, datacenter]
+```
+
+```text
+metric primary: {cluster="eu-west",namespace="payments",region="eu",service="checkout"}
+```
+
+**Example 4 — extra on metrics, dropped for logs.** Mimir series carry
+`cluster` but the Loki streams don't; `loki.label_map` (see
+[Loki](loki.md#configuration)) removes it from log queries only:
+
+```yaml
+triage:
+  extra_selector_labels: [cluster]
+logs:
+  loki:
+    label_map:
+      cluster: ""        # drop for LogQL; metric/floor queries keep it
+```
+
+```text
+metric primary:  {cluster="eu-west",namespace="payments",service="checkout"}
+log (post-map):  {namespace="payments",service="checkout"}
+```
+
+**Example 5 — rejected at startup.** Fail-loud config validation catches bad
+syntax and built-in collisions before the agent ever runs a query:
+
+```yaml
+triage:
+  extra_selector_labels: [cluster-1, namespace]
+```
+
+```text
+triage: extra_selector_labels: "cluster-1": invalid label name (must match [a-zA-Z_][a-zA-Z0-9_]*)
+triage: extra_selector_labels: "namespace": already in the built-in allowlist (namespace, service, job, pod, container, instance)
+```
+
+Use topology labels (`cluster`, `region`, `datacenter`), not identity labels
+(anything pod-like): a narrow extra would collapse the verification floor's
+peer scope to the incident's own targets. Run with `--log-level=debug` to see
+which shared alert labels the allowlist dropped for each incident.
+
 ### Evidence line
 
 Every finding notification carries a per-source evidence summary — how

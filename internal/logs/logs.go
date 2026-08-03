@@ -73,12 +73,15 @@ type Selector struct {
 	Labels map[string][]string // e.g. {"namespace":{"prod"},"service":{"api","db-proxy"}}
 }
 
-// AllowedSelectorKeys is the generic allowlist of alert-label keys that
-// plausibly identify a log stream across ANY backend. The skill intersects an
-// incident's shared labels with this set to drop alert-metadata noise
-// (alertname, severity, prometheus, …) that no log backend labels streams by.
-// Per-backend renaming/dropping to a real stream-label schema is the
-// provider's job (e.g. loki.label_map), NOT this layer's.
+// AllowedSelectorKeys is the BUILT-IN allowlist of alert-label keys that
+// plausibly identify a log stream across ANY backend; operators extend it via
+// triage.extra_selector_labels (ADR-0035) — extras are appended by
+// acutetriage.allowedSelectorKeys, this slice itself is never mutated. The
+// skill intersects an incident's shared labels with the merged set to drop
+// alert-metadata noise (alertname, severity, prometheus, …) that no log
+// backend labels streams by. Per-backend renaming/dropping to a real
+// stream-label schema is the provider's job (e.g. loki.label_map), NOT this
+// layer's.
 var AllowedSelectorKeys = []string{"namespace", "service", "job", "pod", "container", "instance"}
 
 // Default normalization caps. Internal constants (not config in v1): each line

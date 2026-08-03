@@ -121,6 +121,22 @@ logs:
 
 Secrets are never inline — `*_env` fields name the env var holding the value.
 
+### Extra selector labels and `label_map`
+
+Keys added via `triage.extra_selector_labels` (see
+[Prometheus](prometheus.md)) flow into log queries too. If your Loki streams
+don't carry such a label, drop it from log queries only — metric and
+verification queries keep it:
+
+```yaml
+triage:
+  extra_selector_labels: [cluster]
+logs:
+  loki:
+    label_map:
+      cluster: ""   # drop for LogQL; Mimir/Prometheus queries keep it
+```
+
 ### Self-hosted Loki (no auth)
 
 ```yaml

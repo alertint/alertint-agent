@@ -34,6 +34,7 @@ type LogParams struct {
 	DefaultRangeMinutes int
 	TimeoutSeconds      int
 	MaxLines            int
+	ExtraSelectorLabels []string // operator-configured allowlist extension (ADR-0035)
 }
 
 // FetchLogs pulls recent log lines for an incident, analogous to FetchMetrics,
@@ -69,7 +70,8 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 
 	// Generic selector: shared alert labels ∩ AllowedSelectorKeys. No per-backend
 	// renaming here — the provider owns translation (ADR-0002).
-	sel := buildLogSelector(alerts)
+	sel := buildLogSelector(alerts, params.ExtraSelectorLabels)
+	logDroppedSelectorKeys(ctx, logger, "logs", alerts, params.ExtraSelectorLabels, incidentID)
 	if len(sel.Labels) == 0 {
 		shared := formatLabels(sharedLabels(alerts))
 		logger.Info("acutetriage: logs: empty selector — no usable log labels for this incident",
@@ -149,10 +151,10 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 // to all members means the provider's AND-combined matcher never over-constrains a
 // member's stream out; per-backend renaming/dropping to a real stream-label schema
 // stays the provider's job (ADR-0002).
-func buildLogSelector(alerts []store.Alert) logs.Selector {
+func buildLogSelector(alerts []store.Alert, extras []string) logs.Selector {
 	shared := sharedLabelValues(alerts)
 	out := make(map[string][]string)
-	for _, k := range logs.AllowedSelectorKeys {
+	for _, k := range allowedSelectorKeys(extras) {
 		if vs, ok := shared[k]; ok && len(vs) > 0 {
 			out[k] = vs
 		}

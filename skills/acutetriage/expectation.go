@@ -117,10 +117,11 @@ func (s *Skill) stage1Corpus(inc store.Incident, alerts []store.Alert, frozen fr
 	for _, r := range decision.References {
 		b.WriteString("\n" + r)
 	}
-	if sel := renderPromMatcher(buildMetricSelector(alerts)); sel != "" {
+	metricSel := buildMetricSelector(alerts, s.cfg.MetricParams.ExtraSelectorLabels)
+	if sel := renderPromMatcher(metricSel); sel != "" {
 		b.WriteString("\n" + sel)
 	}
-	for _, m := range instanceSupplements(alerts) {
+	for _, m := range instanceSupplements(alerts, extraSelectorValues(metricSel, s.cfg.MetricParams.ExtraSelectorLabels)) {
 		b.WriteString("\n" + m)
 	}
 	for _, q := range composeFloor(s.verifyParams(), s.cfg.ZabbixParams.HostLabel, alerts) {
