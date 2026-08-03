@@ -207,12 +207,18 @@ one.
 
 The triage section configures the LLM judgment pipeline. The verification round adds a second LLM pass that falsifies the draft verdict before persisting it. This two-call pattern surfaces missed context the first pass didn't weigh.
 
+`extra_selector_labels` extends the built-in selector allowlist — the
+alert-label keys eligible to enter evidence queries — with topology labels
+specific to your environment; see
+[Prometheus](../integrations/prometheus.md) for the full behavior.
+
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `verification.enabled` | bool | `auto` | Falsification round on every judged triage; omit to default on, or set to `false` to restore single-call triage (no verification). |
 | `verification.max_queries` | int | `4` | Cap on model-proposed disprove-queries (the deterministic floor always runs). A higher cap means more queries to weigh evidence against the draft. |
 | `verification.query_timeout_seconds` | int | `10` | Budget for the query phase, sliced per query. |
 | `verification.max_rounds` | int | `1` | Reserved for future multi-round verification; values greater than 1 are rejected. Today only `1` is supported. |
+| `extra_selector_labels` | list | — | Extra alert-label keys (topology labels like `cluster` or `region`) added to the built-in selector allowlist (`namespace, service, job, pod, container, instance`) used to build metric/log enrichment queries and the verification floor's peer scope. Extras join every query and are never dropped by fallback queries. Use topology labels, not identity labels. |
 
 ## `notify`
 

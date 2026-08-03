@@ -281,8 +281,9 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 			MinAlerts:     cfg.Correlator.MinAlerts,
 			Prometheus:    prom,
 			MetricParams: acutetriage.MetricParams{
-				TimeoutSeconds: cfg.Prometheus.TimeoutSeconds,
-				MaxSeries:      cfg.Prometheus.MaxSeries,
+				TimeoutSeconds:      cfg.Prometheus.TimeoutSeconds,
+				MaxSeries:           cfg.Prometheus.MaxSeries,
+				ExtraSelectorLabels: cfg.Triage.ExtraSelectorLabels,
 			},
 			Rules:     ruleEngine,
 			LogSource: logSrc,
@@ -290,6 +291,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 				DefaultRangeMinutes: cfg.Logs.DefaultRangeMinutes,
 				TimeoutSeconds:      cfg.Logs.TimeoutSeconds,
 				MaxLines:            cfg.Logs.MaxLines,
+				ExtraSelectorLabels: cfg.Triage.ExtraSelectorLabels,
 			},
 			ChangeParams: acutetriage.ChangeParams{
 				Enabled:       cfg.ChangesEnrichmentEnabled(),
@@ -319,6 +321,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 				MaxQueries:          cfg.Triage.Verification.MaxQueries,
 				QueryTimeoutSeconds: cfg.Triage.Verification.QueryTimeoutSeconds,
 				MaxSeries:           cfg.Prometheus.MaxSeries,
+				ExtraSelectorLabels: cfg.Triage.ExtraSelectorLabels,
 			},
 			PromptCaching: !llmProviderIsOpenAI(cfg),
 		},
