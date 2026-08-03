@@ -103,31 +103,55 @@ func dedupeSortedValues(in []string) []string {
 	return out
 }
 
-// instanceSupplements builds one bare {instance="X"} matcher per unique member
-// instance value — the per-instance supplement (R2). It guarantees an alert
-// carrying instance keeps at least its old broad per-instance scope even when
-// the shared intersection drops instance (a label-sparse co-member) or narrows
-// it (instance AND'd with pod would filter out node-level series). No-regression
-// guard: correlation must never remove evidence an uncorrelated alert would have.
-func instanceSupplements(alerts []store.Alert) []string {
-	instances := uniqueInstances(alerts)
-	out := make([]string, 0, len(instances))
-	for _, inst := range instances {
-		out = append(out, "{"+promMatcherTerm("instance", []string{inst})+"}")
+// extraSelectorValues returns the extras' entries of an already-filtered
+// shared selector — the AND terms every per-instance supplement carries
+// (ADR-0035: extras are never shed). Empty when no extra is shared.
+func extraSelectorValues(shared map[string][]string, extras []string) map[string][]string {
+	out := make(map[string][]string, len(extras))
+	for _, k := range extras {
+		if vs, ok := shared[k]; ok && len(vs) > 0 {
+			out[k] = vs
+		}
 	}
 	return out
 }
 
-// renderPhysicalCore renders the R9 retry selector: the shared selector with only
-// physical-identity keys (namespace, pod, container, instance), dropping the
-// logical keys (service, job) that alerting rules attach but that exist on no
-// series. Returns "" when the shared selector has no logical key — a retry would
-// then equal the primary, so there is nothing to rescue.
-func renderPhysicalCore(shared map[string][]string) string {
+// instanceSupplements builds one {instance="X"} matcher per unique member
+// instance value — the per-instance supplement (R2) — AND-ing in the shared
+// extra selector values (ADR-0035): instance addresses collide across
+// clusters sharing a backend, so a bare supplement can merge two different
+// machines. extraSel empty (no extras configured or none shared) keeps the
+// pre-existing bare shape. The no-regression guard holds: the member alert
+// carries the extra label itself, so its own series still match.
+func instanceSupplements(alerts []store.Alert, extraSel map[string][]string) []string {
+	instances := uniqueInstances(alerts)
+	out := make([]string, 0, len(instances))
+	for _, inst := range instances {
+		sel := map[string][]string{"instance": {inst}}
+		for k, vs := range extraSel {
+			sel[k] = vs
+		}
+		out = append(out, renderPromMatcher(sel))
+	}
+	return out
+}
+
+// renderPhysicalCore renders the R9 retry selector: the shared selector with
+// only physical-identity keys (namespace, pod, container, instance) plus any
+// extra selector labels — extras are scoping assertions and are never shed by
+// the retry (ADR-0035). It drops the built-in logical keys (service, job)
+// that alerting rules attach but that exist on no series. Returns "" when the
+// shared selector has no built-in logical key — a retry would then equal the
+// primary, so there is nothing to rescue.
+func renderPhysicalCore(shared map[string][]string, extras []string) string {
+	extraSet := make(map[string]bool, len(extras))
+	for _, k := range extras {
+		extraSet[k] = true
+	}
 	core := make(map[string][]string)
 	hasLogical := false
 	for k, vs := range shared {
-		if metricPhysicalKeys[k] {
+		if metricPhysicalKeys[k] || extraSet[k] {
 			core[k] = vs
 		} else {
 			hasLogical = true
@@ -371,8 +395,9 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 
 	shared := buildMetricSelector(alerts, params.ExtraSelectorLabels)
 	logDroppedSelectorKeys(logger, "metrics", alerts, params.ExtraSelectorLabels, incidentID)
+	extraSel := extraSelectorValues(shared, params.ExtraSelectorLabels)
 	primary := renderPromMatcher(shared)
-	physicalFallback := renderPhysicalCore(shared)
+	physicalFallback := renderPhysicalCore(shared, params.ExtraSelectorLabels)
 
 	// Ordered, deduped scope list: primary first (it alone gets the retry), then
 	// the per-instance supplements not already equal to the primary, capped at
@@ -384,7 +409,7 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 		scopes = append(scopes, primary)
 		seen[primary] = true
 	}
-	supplements := instanceSupplements(alerts)
+	supplements := instanceSupplements(alerts, extraSel)
 	added := 0
 	for _, sup := range supplements {
 		if seen[sup] {
