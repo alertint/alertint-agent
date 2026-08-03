@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Configurable selector labels: `triage.extra_selector_labels` adds
+  operator-chosen topology label keys (e.g. `cluster`) to the selector
+  allowlist used by metric/log enrichment and the verification floor's peer
+  scope — multi-cluster installs sharing one Prometheus/Mimir/Loki backend
+  can scope evidence to the incident's own cluster. Configured labels are
+  never dropped by fallback queries; misconfiguration fails loud as an empty
+  result with the executed query logged. (#51)
+
 ## [0.12.0] - 2026-07-30
 
 ### Added
