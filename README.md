@@ -38,28 +38,16 @@ alerts.
 
 ## How it works
 
-```mermaid
-flowchart LR
-    AM[Alertmanager] -->|webhook| ING[Ingest + dedup]
-    ZBX[Zabbix] -->|webhook| ING
-    CHG[Deploys / changes] -->|webhook| ING
-    ING --> COR[Correlation<br/>rule engine]
-    COR --> AI[AI triage<br/>Claude]
-    AI -->|draft verdict| VER[Verification round<br/>contrast evidence]
-    VER -->|re-judge| AI
-    AI --> SLK[Slack finding]
-    AI --> MCP[MCP server]
-    MCP --> AGT[Your AI agent<br/>investigation tools]
-    AGT -->|capture verdict| MEM[(Incident memory)]
-    MEM -->|steers next triage| AI
-```
-
 Two loops close on the triage step: the **[verification
 round](https://alertint.com/docs/concepts/verification-round)** gathers evidence
 chosen to disprove the model's own draft and makes it re-judge before anything
 persists, and an operator correction captured over MCP lands in **[incident
 memory](https://alertint.com/docs/concepts/incident-memory)**, where it steers
 the next triage of that failure group.
+
+The whole pipeline — receivers, correlation, the evidence pack, both loops, and
+the MCP surface — is diagrammed and walked through step by step in
+**[Architecture](https://alertint.com/docs/concepts/architecture)**.
 
 ## Documentation
 
