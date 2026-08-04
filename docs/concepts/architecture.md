@@ -1,6 +1,6 @@
 ---
 title: "Architecture"
-description: "One self-hosted binary sits between Alertmanager and your AI agent, and turns raw alerts into context worth investigating."
+description: "One self-hosted binary sits between your monitoring stack and your AI agent, and turns raw alerts into context worth investigating."
 section: "Concepts"
 order: 1
 slug: "architecture"
@@ -8,30 +8,57 @@ slug: "architecture"
 
 # Architecture
 
-One self-hosted binary sits between Alertmanager and your AI agent, and
-turns raw alerts into context worth investigating. Everything below runs
+One self-hosted binary sits between your monitoring stack and your AI agent,
+and turns raw alerts into context worth investigating. Everything below runs
 inside a single `alertint serve` process with local SQLite state.
 
 ```text
-Alertmanager ──webhook──▶ ingest ──▶ correlate ──▶ AI synthesis ──▶ notify (stdout / Slack)
-                                          │
-                                          ▼
-                              local state (SQLite)
-                                          ▲
-AI agent (Claude Code, …) ◀──MCP──▶ MCP server ──▶ Prometheus (PromQL)
+Alertmanager ──┐
+Zabbix ────────┼── webhook ──▶ ingest ──▶ correlate ──▶ triage ⇄ verification ──▶ notify (stdout / Slack)
+change events ─┘                                          │
+                                                          ▼
+                                                local state (SQLite)
 ```
 
-## Phase 1 — Ingest
+```text
+AI agent (Claude Code, …) ◀── MCP ──▶ MCP server ──▶ local state (SQLite)
+                                                └──▶ Prometheus · Loki · Zabbix (queries only)
+
+captured verdict ──▶ local state ──▶ steers the next triage of the same failure group
+```
+
+Two feedback loops close on the triage step, and both are why the same
+condition doesn't get the same wrong answer twice: the **verification round**
+makes each analysis falsify its own draft before the finding persists, and an
+operator **verdict** captured over MCP steers the next triage of that failure
+group.
+
+## Phase 1 — Ingest and triage
 
 ### 1. Webhook transmission
 
-Alertmanager fires a POST to the **AlertINT** webhook receiver over HTTP(S).
-The payload is the standard Alertmanager webhook JSON — no custom format
-required.
+Alerts arrive over HTTP(S) from any of the first-class alert sources, each on
+its own receiver, all mounted on the same listen address
+([`receivers.address`](../getting-started/configuration.md#receivers), default
+`:9911`) and each authenticated with its own bearer token:
 
-- **Protocol:** HTTP POST, Alertmanager webhook payload (version 4)
-- **Auth:** Bearer token (env var named by `alertmanager.webhook_token_env`,
-  default `ALERTINT_WEBHOOK_TOKEN`)
+| Source | Route | Payload |
+|---|---|---|
+| [Alertmanager](../getting-started/quickstart.md) | `POST /webhook/alertmanager` | Alertmanager webhook JSON (version 4) |
+| [Zabbix](../integrations/zabbix.md) | `POST /webhook/zabbix` | Zabbix `PROBLEM` / `RESOLVED` events |
+| [Change events](../integrations/changes.md) | `POST /webhook/change` | Deploys, config edits, flag flips |
+
+The first two are **alert** sources and feed the same pipeline end to end —
+a Zabbix shop gets correlated, triaged incidents exactly the way an
+Alertmanager shop does. Change events are not alerts: they feed the *what
+changed right before this?* plane that triage reads at analysis time, and can
+also be polled from [Sentry](../integrations/sentry.md) releases and deploys
+instead of pushed.
+
+- **Auth:** Bearer token per receiver (env vars named by
+  `alertmanager.webhook_token_env`, `zabbix.ingress.webhook_token_env`,
+  `changes.ingress.webhook_token_env`)
+- **No custom format required** on any of them
 
 ### 2. Persistence and deduplication
 
@@ -39,44 +66,84 @@ Received alerts are written to local state (SQLite). Duplicate firings of
 the same alert fingerprint are collapsed — one record per logical alert.
 
 - **Storage:** local SQLite, configurable path
-- **Dedup key:** Alertmanager alert fingerprint
+- **Dedup key:** alert fingerprint
 
 ### 3. Correlation
 
 Alerts that fire within a configurable time window and share common label
-dimensions (`alertname`, `cluster`, `namespace`, `service` by default) are
+dimensions (`cluster`, `namespace`, `service`, `host` by default) are
 grouped into a single incident record. Grouping is deterministic and
-re-evaluated as new alerts arrive.
+re-evaluated as new alerts arrive. The [rule engine](../rules-spec.md) runs
+here too: storm collapse, known-issue short-circuits, and prompt selection.
 
 - **Grouping keys:** `correlator.group_labels`
 - **Window:** `correlator.window_seconds`, default 90 s
 
-### 4. AI synthesis
+### 4. Memory
 
-Once an incident's window closes, **AlertINT** builds an evidence pack (shared
-labels, timeline, annotations — optionally enriched with live Prometheus
-metric values) and sends it to the configured LLM (Anthropic Claude). The
-model returns a structured finding: probable cause, severity assessment,
-confidence, and suggested next checks. The finding is stored locally
-alongside the incident.
+Before spending an analysis, **AlertINT** checks whether it has seen this
+condition before. A re-fire of an already-analyzed group key inside the
+collapse horizon attaches as an **occurrence** — the Slack card edits in
+place, no second LLM call. A genuinely new incident whose key matches a past
+analysis gets the prior finding **recalled** into its prompt as a past
+hypothesis, never as evidence. See [incident
+memory](incident-memory.md).
 
-- **Model:** Anthropic Claude (`claude-sonnet-5` by default; `claude-haiku-4-5` as the lower-cost option)
-- **Auth:** `ANTHROPIC_API_KEY` env var
-- **Output:** structured finding, persisted in local state
+- **Collapse:** occurrence attach, no LLM call; re-judgment only on an
+  escalation trigger
+- **Recall:** distilled prior findings, recurrence count, cadence
 
-### 5. Outbound notification
+### 5. Evidence pack
 
-The finding is emitted as one JSON line on stdout and, when configured,
-posted to a Slack channel. When all alerts recover, **AlertINT** updates the
-original Slack message in-place (🔴 → ✅) and posts a short resolution
-note in the thread.
+Once an incident's window closes, **AlertINT** builds an evidence pack:
+shared labels, timeline, and annotations, enriched — where the matching
+connector is configured — with live Prometheus metric values, recent
+[Loki](../integrations/loki.md) log lines, overlapping change events,
+[Sentry](../integrations/sentry.md) exceptions with `file:line`, and
+[Zabbix](../integrations/zabbix.md) operator context (runbook, trigger
+dependencies, flap history, host CMDB and maintenance state, other open
+problems). Every connector is read-only and optional; the pack degrades to
+labels and annotations when none is configured.
+
+### 6. AI triage — the draft
+
+The evidence pack goes to the configured LLM. The model returns a structured
+draft: probable cause, severity assessment, confidence, and suggested next
+checks — plus a short list of read-only checks it thinks would challenge its
+own conclusion.
+
+- **Model:** Anthropic Claude (`claude-sonnet-5` by default; `claude-haiku-4-5` as the lower-cost option), or any
+  [OpenAI-compatible endpoint](../integrations/openai-compatible.md) you host
+- **Auth:** `ANTHROPIC_API_KEY` env var (or the local endpoint's key)
+
+### 7. Verification round
+
+The draft is not the finding. **AlertINT** gathers **contrast evidence** —
+facts chosen to disprove the draft — and asks the model to re-judge against
+what it finds. A deterministic floor runs on every judged triage regardless
+of what the model asked for (peer-scope up ratio and other incidents in
+window on Prometheus installs; host reachability and host-group neighbors on
+Zabbix installs), plus up to `max_queries` model-chosen read-only checks. A
+round that can't finish marks the finding `⚠ unverified` and can never raise
+confidence. See [verification round](verification-round.md).
+
+- **Cost:** two LLM calls per judged incident, the second reading the first's
+  prompt-cache prefix at ~0.10× input price
+- **Kill-switch:** `triage.verification.enabled: false` restores single-call triage
+
+### 8. Outbound notification
+
+The final finding — the post-verification judgment, not the draft — is
+emitted as one JSON line on stdout and, when configured, posted to a Slack
+channel. When all alerts recover, **AlertINT** updates the original Slack
+message in-place (🔴 → ✅) and posts a short resolution note in the thread.
 
 - **Method:** stdout (always available) and Slack Bot Token API
   (`chat.postMessage` / `chat.update`)
 
 ## Phase 2 — Investigate
 
-### 6. Agent entry via MCP
+### 9. Agent entry via MCP
 
 An engineer opens their MCP-capable AI client (Claude Code, Cursor,
 Windsurf, or any MCP-compatible tool) pointed at the **AlertINT** MCP server,
@@ -85,32 +152,54 @@ which runs as part of the same binary — no separate daemon.
 - **Transport:** Streamable HTTP, `http://host:9912/mcp`
 - **Auth:** Bearer token (env var named by `mcp.token_env`)
 
-### 7. Evidence query
+### 10. Evidence query
 
 The agent calls **AlertINT** MCP tools to list recent incidents, retrieve
-alert payloads, evidence packs, and stored findings. All data is served
-from local state — no external calls at this stage.
+alert payloads, evidence packs, correlated change events, and stored
+findings. All data is served from local state — no external calls at this
+stage.
 
 - **MCP tools:** `alertint_list_incidents`, `alertint_get_incident`,
   `alertint_search_alerts`, `alertint_get_evidence_pack`,
-  `alertint_verify_audit`
+  `alertint_recent_changes`, `alertint_verify_audit`
 
-### 8. Telemetry context
+### 11. Telemetry context
 
-The agent issues PromQL queries through **AlertINT** MCP tools. **AlertINT**
-proxies the query to the configured Prometheus instance and returns the
-result — CPU, memory, latency, error rate, or any metric stored in
-Prometheus, scoped to the incident time window.
+The agent queries the same backends the evidence pack drew from, scoped to
+the incident window — metrics, logs, and Zabbix history — through
+**AlertINT**, which proxies each query and returns the result. Queries only:
+nothing here writes, tails, or mutates.
 
-- **MCP tools:** `prometheus_query`, `prometheus_query_range`
-- **Backend:** Prometheus HTTP API (queries only)
+- **MCP tools:** `prometheus_query`, `prometheus_query_range`,
+  `loki_query_range`, `zabbix_metric_history`, `zabbix_host_problems`
+- **Backends:** Prometheus HTTP API, Loki, Zabbix JSON-RPC — read paths only
 
-### 9. Decision point
+### 12. Capture a verdict — closing the loop
 
-The agent synthesizes alert payloads, the stored finding, and live metric
-context into a response. The engineer decides the next action — re-query,
-escalate, or begin remediation — with full context already in the
-conversation. **AlertINT**'s role ends at providing context; the next step is
+When the investigation lands somewhere the machine didn't, the agent writes
+it back. `alertint_incident_capture_verdict` records a **confirmation** or a
+**correction** against the incident; `alertint_incident_annotate` leaves a
+note for the next investigator. Both are additive and audit-chained — they
+never edit or delete what came before.
+
+A captured correction is not taken as fact: on the next triage of that
+failure group its evidence runs as verification checks and the model must
+rule `supported`, `contradicted`, or `unverifiable` before the corrected
+cause is adopted. Live evidence can retire a stale correction; the calendar
+can't. See [operator verdicts steer the next
+triage](incident-memory.md#operator-verdicts-steer-the-next-triage).
+
+- **MCP tools:** `alertint_incident_capture_verdict`, `alertint_incident_annotate`
+- **Effect:** steering on the next triage of the same group key — the only
+  write path in the product, and it writes to **AlertINT**'s own state, never
+  to your infrastructure
+
+### 13. Decision point
+
+The agent synthesizes alert payloads, the stored finding, and live context
+into a response. The engineer decides the next action — re-query, escalate,
+or begin remediation — with full context already in the conversation.
+**AlertINT**'s role ends at providing context; the next step is
 engineer-controlled.
 
 ## MCP-first investigation
@@ -124,6 +213,7 @@ Open the latest critical incident and summarize the evidence.
 Show the alert labels and annotations for this incident.
 Query Prometheus for CPU and memory around the incident window.
 Compare the finding with the metric trend and suggest next checks.
+That root cause is wrong — it was the cache rollout. Capture that as a correction.
 ```
 
 ## Incident lifecycle
@@ -137,6 +227,10 @@ collecting  →  ready  →  (skill running)  →  analyzed
 - `ready`: window expired, incident dispatched to the triage skill
 - `analyzed`: LLM output persisted
 - `failed`: LLM call or persistence error (logged; retry is on the roadmap)
+
+A recurrence of an `analyzed` incident attaches as an occurrence rather than
+minting a new row — the lifecycle above describes one incident, not one
+firing.
 
 ## Audit log
 
@@ -155,8 +249,11 @@ or the `alertint_verify_audit` MCP tool.
 - **No silent config drift** — unknown YAML keys are rejected at load time.
 - **No inline secrets** — all secret values come from env vars named by
   config fields.
-- **No 5xx to Alertmanager** — ingress always returns 2xx or 4xx; errors
-  are logged, not propagated upstream.
+- **No 5xx to a sender** — ingress always returns 2xx or 4xx; errors are
+  logged, not propagated upstream to Alertmanager or Zabbix.
 - **Single binary, SQLite state** — no external dependencies to install.
+- **Read-only outward** — every connector issues queries only. The single
+  write path is an operator verdict, and it writes to **AlertINT**'s own
+  state.
 - **MCP-first investigation** — local context is exposed through the MCP
   server; there is no web UI.

@@ -14,7 +14,7 @@
 
 > AlertINT is a self-hosted, [Fair Source](https://fair.io) agent runtime that turns infrastructure alerts into incident context your AI agent reads directly over MCP.
 
-A single Go binary that sits between Alertmanager and your AI agent. It ingests alert webhooks, correlates them into incidents through an open rule engine, runs an LLM triage skill, posts structured findings to Slack, and exposes the resulting incident state — plus read-only Prometheus access — to any MCP client. Read-only by design. Local state. You bring the LLM key.
+A single Go binary that sits between your monitoring stack and your AI agent. It ingests alert webhooks from Alertmanager and Zabbix, correlates them into incidents through an open rule engine, and runs an LLM triage that falsifies its own draft verdict before the finding ships. Findings go to Slack; the incident state — plus read-only Prometheus, Loki, and Zabbix access — is exposed to any MCP client. Corrections your agent captures over MCP steer the next triage of the same failure. Read-only by design. Local state. You bring the LLM key.
 
 **Full documentation: [alertint.com/docs](https://alertint.com/docs)**
 
@@ -32,7 +32,8 @@ The built-in incident drill plants a fake deploy, fires a burst of
 clearly-marked synthetic alerts through the production ingress, and polls
 until triage prints the finding — a causal analysis naming the planted
 deploy. From zero to that finding takes about ten minutes; then connect an
-MCP client to investigate it, and point Alertmanager at the agent for real
+MCP client to investigate it, and point Alertmanager or
+[Zabbix](https://alertint.com/docs/integrations/zabbix) at the agent for real
 alerts.
 
 ## How it works
@@ -40,18 +41,32 @@ alerts.
 ```mermaid
 flowchart LR
     AM[Alertmanager] -->|webhook| ING[Ingest + dedup]
+    ZBX[Zabbix] -->|webhook| ING
+    CHG[Deploys / changes] -->|webhook| ING
     ING --> COR[Correlation<br/>rule engine]
-    COR --> AI[AI synthesis<br/>Claude]
+    COR --> AI[AI triage<br/>Claude]
+    AI -->|draft verdict| VER[Verification round<br/>contrast evidence]
+    VER -->|re-judge| AI
     AI --> SLK[Slack finding]
-    COR --> MCP[MCP server]
+    AI --> MCP[MCP server]
     MCP --> AGT[Your AI agent<br/>investigation tools]
+    AGT -->|capture verdict| MEM[(Incident memory)]
+    MEM -->|steers next triage| AI
 ```
+
+Two loops close on the triage step: the **[verification
+round](https://alertint.com/docs/concepts/verification-round)** gathers evidence
+chosen to disprove the model's own draft and makes it re-judge before anything
+persists, and an operator correction captured over MCP lands in **[incident
+memory](https://alertint.com/docs/concepts/incident-memory)**, where it steers
+the next triage of that failure group.
 
 ## Documentation
 
 - **[Docs home](https://alertint.com/docs)** — quickstart, configuration reference
 - **[Architecture](https://alertint.com/docs/concepts/architecture)** — how the pipeline is built
-- **[Integrations](https://alertint.com/docs/integrations/mcp-clients)** — MCP clients, [Prometheus](https://alertint.com/docs/integrations/prometheus), [Slack](https://alertint.com/docs/notifications/slack)
+- **[Integrations](https://alertint.com/docs/integrations/mcp-clients)** — MCP clients, [Zabbix](https://alertint.com/docs/integrations/zabbix), [Prometheus](https://alertint.com/docs/integrations/prometheus), [Loki](https://alertint.com/docs/integrations/loki), [Slack](https://alertint.com/docs/notifications/slack)
+- **[Verification round](https://alertint.com/docs/concepts/verification-round)** and **[incident memory](https://alertint.com/docs/concepts/incident-memory)** — how triage checks itself and learns from corrections
 - **[Scope and limits](https://alertint.com/docs/concepts/scope-and-limits)** — what it will and won't do
 - **[FAQ](https://alertint.com/docs/concepts/faq)**
 
