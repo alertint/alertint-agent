@@ -8,24 +8,9 @@ slug: "architecture"
 
 # Architecture
 
-One self-hosted binary sits between your monitoring stack and your AI agent,
-and turns raw alerts into context worth investigating. Everything below runs
-inside a single `alertint serve` process with local SQLite state.
-
-```text
-Alertmanager ──┐
-Zabbix ────────┼── webhook ──▶ ingest ──▶ correlate ──▶ triage ⇄ verification ──▶ notify (stdout / Slack)
-change events ─┘                                          │
-                                                          ▼
-                                                local state (SQLite)
-```
-
-```text
-AI agent (Claude Code, …) ◀── MCP ──▶ MCP server ──▶ local state (SQLite)
-                                                └──▶ Prometheus · Loki · Zabbix (queries only)
-
-captured verdict ──▶ local state ──▶ steers the next triage of the same failure group
-```
+Everything below runs inside a single `alertint serve` process with local
+SQLite state — one binary, one config file, no external dependencies to
+install.
 
 Two feedback loops close on the triage step, and both are why the same
 condition doesn't get the same wrong answer twice: the **verification round**
