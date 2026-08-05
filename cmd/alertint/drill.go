@@ -82,7 +82,7 @@ func runDrill(args []string, stdout, stderr io.Writer) error {
 	fs.StringVar(&opts.result, "result", "", "skip firing; fetch and print the finding for an incident id")
 	fs.BoolVar(&opts.yes, "yes", false, "skip the remote-target confirmation prompt")
 	fs.BoolVar(&opts.resolve, "resolve", false, "after the run, re-send the burst as resolved so the drill incident closes")
-	fs.BoolVar(&opts.resolveWait, "resolve-wait", false, "with -resolve, hold the drill incident open after the payoff and resolve on Enter")
+	fs.BoolVar(&opts.resolveWait, "resolve-wait", false, "with --resolve, hold the drill incident open after the payoff and resolve on Enter")
 	fs.BoolVar(&opts.allowInsecure, "allow-insecure-http", false, "allow sending bearer tokens to a plain-http remote target")
 	fs.StringVar(&opts.viaAlertmanager, "via-alertmanager", "", "fire the burst through your Alertmanager (base URL, v2 API) to validate AM→AlertINT routing")
 	if err := fs.Parse(args); err != nil {
@@ -131,7 +131,7 @@ func (d *drillCmd) run(ctx context.Context) error {
 		return fmt.Errorf("drill: --resolve applies to a firing run, not --result (re-run the drill with --resolve instead)")
 	}
 	if d.opts.resolveWait && !d.opts.resolve {
-		return fmt.Errorf("drill: -resolve-wait requires -resolve")
+		return fmt.Errorf("drill: --resolve-wait requires --resolve")
 	}
 
 	// --result: the re-check path. One fetch, one print, done. The transport
@@ -865,12 +865,18 @@ func randomRunID() string {
 	return hex.EncodeToString(b[:])
 }
 
+// readPromptLine echoes prompt to stderr, then reads one line from stdin —
+// shared by stdinConfirm and stdinPause so the prompt never mixes into stdout.
+func readPromptLine(stderr io.Writer, prompt string) (string, error) {
+	_, _ = fmt.Fprint(stderr, prompt)
+	return bufio.NewReader(os.Stdin).ReadString('\n')
+}
+
 // stdinConfirm reads one y/N line from stdin, echoing the prompt to stderr so
 // it never mixes into stdout output.
 func stdinConfirm(stderr io.Writer) func(string) (bool, error) {
 	return func(prompt string) (bool, error) {
-		_, _ = fmt.Fprint(stderr, prompt)
-		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		line, err := readPromptLine(stderr, prompt)
 		if err != nil {
 			return false, err
 		}
@@ -883,8 +889,7 @@ func stdinConfirm(stderr io.Writer) func(string) (bool, error) {
 // stderr so it never mixes into stdout output.
 func stdinPause(stderr io.Writer) func(string) error {
 	return func(prompt string) error {
-		_, _ = fmt.Fprint(stderr, prompt)
-		_, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		_, err := readPromptLine(stderr, prompt)
 		return err
 	}
 }

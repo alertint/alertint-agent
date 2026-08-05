@@ -146,6 +146,7 @@ func drillTestCmd(t *testing.T, f *fakeInstance, cfg *config.Config, opts drillO
 			t.Fatal("confirm must not fire for loopback targets")
 			return false, nil
 		},
+		pause:           func(string) error { return nil },
 		newRunID:        func() string { return "t3st01" },
 		grace:           time.Second,
 		probePrometheus: func(string, string) bool { return false },
@@ -890,7 +891,7 @@ func TestDrill_ResolveWaitRequiresResolve(t *testing.T) {
 	cfg := drillTestConfig(t)
 	d, _ := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship", resolveWait: true})
 	err := d.run(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "-resolve-wait requires -resolve") {
+	if err == nil || !strings.Contains(err.Error(), "--resolve-wait requires --resolve") {
 		t.Fatalf("err = %v, want the -resolve-wait requires -resolve error", err)
 	}
 }
