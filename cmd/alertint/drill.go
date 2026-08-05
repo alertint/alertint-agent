@@ -50,6 +50,7 @@ type drillOpts struct {
 	yes             bool
 	allowInsecure   bool
 	resolve         bool
+	resolveWait     bool
 	viaAlertmanager string
 }
 
@@ -63,6 +64,7 @@ type drillCmd struct {
 	now      func() time.Time
 	sleep    func(context.Context, time.Duration) error
 	confirm  func(prompt string) (bool, error)
+	pause    func(prompt string) error
 	newRunID func() string
 	grace    time.Duration
 	// probePrometheus reports whether something answers on :9090 next to the
@@ -76,10 +78,11 @@ func runDrill(args []string, stdout, stderr io.Writer) error {
 	var opts drillOpts
 	fs.StringVar(&opts.cfgPath, "config", "", "path to alertint YAML config (the same file serve reads)")
 	fs.StringVar(&opts.target, "target", "", "base URL of a remote AlertINT instance (default: the local instance from config)")
-	fs.StringVar(&opts.scenario, "scenario", "flagship", "scenario to fire: flagship | storm")
+	fs.StringVar(&opts.scenario, "scenario", "flagship", "scenario to fire: flagship | storm | db-outage")
 	fs.StringVar(&opts.result, "result", "", "skip firing; fetch and print the finding for an incident id")
 	fs.BoolVar(&opts.yes, "yes", false, "skip the remote-target confirmation prompt")
 	fs.BoolVar(&opts.resolve, "resolve", false, "after the run, re-send the burst as resolved so the drill incident closes")
+	fs.BoolVar(&opts.resolveWait, "resolve-wait", false, "with --resolve, hold the drill incident open after the payoff and resolve on Enter")
 	fs.BoolVar(&opts.allowInsecure, "allow-insecure-http", false, "allow sending bearer tokens to a plain-http remote target")
 	fs.StringVar(&opts.viaAlertmanager, "via-alertmanager", "", "fire the burst through your Alertmanager (base URL, v2 API) to validate AM→AlertINT routing")
 	if err := fs.Parse(args); err != nil {
@@ -113,6 +116,7 @@ func runDrill(args []string, stdout, stderr io.Writer) error {
 			}
 		},
 		confirm:         stdinConfirm(stderr),
+		pause:           stdinPause(stderr),
 		newRunID:        randomRunID,
 		grace:           drillTriageGrace,
 		probePrometheus: probePrometheusDefault,
@@ -125,6 +129,9 @@ func (d *drillCmd) run(ctx context.Context) error {
 
 	if d.opts.result != "" && d.opts.resolve {
 		return fmt.Errorf("drill: --resolve applies to a firing run, not --result (re-run the drill with --resolve instead)")
+	}
+	if d.opts.resolveWait && !d.opts.resolve {
+		return fmt.Errorf("drill: --resolve-wait requires --resolve")
 	}
 
 	// --result: the re-check path. One fetch, one print, done. The transport
@@ -148,7 +155,7 @@ func (d *drillCmd) run(ctx context.Context) error {
 
 	sc, ok := drillScenarios()[d.opts.scenario]
 	if !ok {
-		return fmt.Errorf("drill: unknown scenario %q (have: flagship, storm)", d.opts.scenario)
+		return fmt.Errorf("drill: unknown scenario %q (have: flagship, storm, db-outage)", d.opts.scenario)
 	}
 
 	// The burst enters through the Alertmanager receiver; without it there is
@@ -265,6 +272,11 @@ func (d *drillCmd) run(ctx context.Context) error {
 func (d *drillCmd) maybeResolve(ctx context.Context, run drillRun, recvBase, webhookToken string) error {
 	if !d.opts.resolve {
 		return nil
+	}
+	if d.opts.resolveWait {
+		if err := d.pause("press Enter to resolve the drill incident… "); err != nil {
+			d.printf("note: stdin unavailable (%v) — resolving immediately", err)
+		}
 	}
 	payload := resolvedPayload(run, d.now())
 	if d.opts.viaAlertmanager != "" {
@@ -853,17 +865,32 @@ func randomRunID() string {
 	return hex.EncodeToString(b[:])
 }
 
+// readPromptLine echoes prompt to stderr, then reads one line from stdin —
+// shared by stdinConfirm and stdinPause so the prompt never mixes into stdout.
+func readPromptLine(stderr io.Writer, prompt string) (string, error) {
+	_, _ = fmt.Fprint(stderr, prompt)
+	return bufio.NewReader(os.Stdin).ReadString('\n')
+}
+
 // stdinConfirm reads one y/N line from stdin, echoing the prompt to stderr so
 // it never mixes into stdout output.
 func stdinConfirm(stderr io.Writer) func(string) (bool, error) {
 	return func(prompt string) (bool, error) {
-		_, _ = fmt.Fprint(stderr, prompt)
-		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		line, err := readPromptLine(stderr, prompt)
 		if err != nil {
 			return false, err
 		}
 		answer := strings.ToLower(strings.TrimSpace(line))
 		return answer == "y" || answer == "yes", nil
+	}
+}
+
+// stdinPause blocks until Enter (or stdin error), echoing the prompt to
+// stderr so it never mixes into stdout output.
+func stdinPause(stderr io.Writer) func(string) error {
+	return func(prompt string) error {
+		_, err := readPromptLine(stderr, prompt)
+		return err
 	}
 }
 

@@ -63,8 +63,10 @@ type changePayload struct {
 	OccurredAt time.Time         `json:"occurred_at"`
 }
 
-// drillScenarios returns the v1 catalog: the change-planted flagship and a
-// storm burst. Nothing else (cut table: full catalog is YAGNI).
+// drillScenarios returns the built-in catalog: the change-planted flagship, a
+// storm burst, and a database-outage cascade. The v1 "full catalog is YAGNI"
+// cut was deliberately reversed for db-outage (2026-08): a no-deploy cascade
+// is the best first-touch contrast to flagship's causal finding.
 func drillScenarios() map[string]drillScenario {
 	return map[string]drillScenario{
 		"flagship": {
@@ -114,13 +116,52 @@ func drillScenarios() map[string]drillScenario {
 		},
 		"storm": {
 			key:         "storm",
-			description: "storm-sized burst on one service — one incident from many near-identical alerts",
+			description: "storm burst — debug logging left on fleet-wide floods every node's disk; many near-identical alerts, one incident",
 			alerts:      stormTemplates(),
+		},
+		"db-outage": {
+			key:         "db-outage",
+			description: "database outage cascade — no deploy; the database is the root cause, the rest is downstream",
+			alerts: []drillAlertTemplate{
+				{
+					alertname: "DrillPostgresDown",
+					severity:  "critical",
+					annotations: map[string]string{
+						"summary":     "[drill] postgres on drill-orders-db is down — connection refused",
+						"description": "[drill] The drill-shop primary database stopped accepting connections; no automatic failover is configured.",
+					},
+				},
+				{
+					alertname: "DrillCheckoutDBPoolExhausted",
+					severity:  "critical",
+					annotations: map[string]string{
+						"summary":     "[drill] drill-checkout connection pool exhausted (0/50 available)",
+						"description": "[drill] Every pooled connection to drill-orders-db is dead; new requests block until the pool timeout fires.",
+					},
+				},
+				{
+					alertname: "DrillCheckoutHTTP5xx",
+					severity:  "warning",
+					annotations: map[string]string{
+						"summary":     "[drill] 5xx rate on drill-checkout is 31% — requests fail after the db timeout",
+						"description": "[drill] Checkout returns 500s once the database timeout expires; the error rate tracks the outage exactly.",
+					},
+				},
+				{
+					alertname: "DrillOrderQueueStalled",
+					severity:  "warning",
+					annotations: map[string]string{
+						"summary":     "[drill] order queue consumer for drill-checkout stalled (8k msgs, zero throughput)",
+						"description": "[drill] Consumers cannot commit orders without the database; the queue grows and drains nothing.",
+					},
+				},
+			},
 		},
 	}
 }
 
-// stormTemplates builds a homogeneous burst large enough to read as a storm.
+// stormTemplates builds the storm burst: one real-world mistake — debug
+// logging left enabled fleet-wide — filling every node's disk at once.
 func stormTemplates() []drillAlertTemplate {
 	out := make([]drillAlertTemplate, 0, 14)
 	for i := 0; i < 14; i++ {
@@ -129,8 +170,8 @@ func stormTemplates() []drillAlertTemplate {
 			severity:  "warning",
 			labels:    map[string]string{"node": fmt.Sprintf("drill-node-%02d", i)},
 			annotations: map[string]string{
-				"summary":     fmt.Sprintf("[drill] node drill-node-%02d under disk pressure (92%% used)", i),
-				"description": "[drill] Synthetic storm: many near-identical alerts from one failure domain.",
+				"summary":     fmt.Sprintf("[drill] node drill-node-%02d under disk pressure (92%% used, /var/log growing fast)", i),
+				"description": "[drill] Debug logging was left enabled fleet-wide after last night's incident; every node's /var/log is filling at once.",
 			},
 		})
 	}
