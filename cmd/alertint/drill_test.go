@@ -853,6 +853,48 @@ func TestDrill_ResolveFlag(t *testing.T) {
 	}
 }
 
+// TestDrill_ResolveWaitFlag: with --resolve --resolve-wait the resolution is
+// gated on the pause hook — the resolved burst posts only after it returns.
+func TestDrill_ResolveWaitFlag(t *testing.T) {
+	f := newFakeInstance(t)
+	cfg := drillTestConfig(t)
+	d, _ := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship", resolve: true, resolveWait: true})
+
+	paused := false
+	d.pause = func(string) error {
+		paused = true
+		if got := len(f.alertBodies); got != 1 {
+			t.Errorf("alert posts before Enter = %d, want 1 (burst only — resolution must wait)", got)
+		}
+		return nil
+	}
+
+	groupKey := "cluster=drill-cluster-t3st01,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
+	f.listRows = []map[string]any{{"id": "inc-42", "group_key": groupKey, "status": "analyzed"}}
+	f.incident = analyzedIncident("inc-42")
+
+	if err := d.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !paused {
+		t.Fatal("pause hook never fired")
+	}
+	if len(f.alertBodies) != 2 {
+		t.Fatalf("alert posts = %d, want 2 (burst + resolution after Enter)", len(f.alertBodies))
+	}
+}
+
+// TestDrill_ResolveWaitRequiresResolve: the flag is meaningless alone.
+func TestDrill_ResolveWaitRequiresResolve(t *testing.T) {
+	f := newFakeInstance(t)
+	cfg := drillTestConfig(t)
+	d, _ := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship", resolveWait: true})
+	err := d.run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "-resolve-wait requires -resolve") {
+		t.Fatalf("err = %v, want the -resolve-wait requires -resolve error", err)
+	}
+}
+
 // TestDrill_ResolveWithResultRejected: --resolve needs a firing run.
 func TestDrill_ResolveWithResultRejected(t *testing.T) {
 	f := newFakeInstance(t)

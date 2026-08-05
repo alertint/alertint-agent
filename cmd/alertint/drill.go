@@ -50,6 +50,7 @@ type drillOpts struct {
 	yes             bool
 	allowInsecure   bool
 	resolve         bool
+	resolveWait     bool
 	viaAlertmanager string
 }
 
@@ -63,6 +64,7 @@ type drillCmd struct {
 	now      func() time.Time
 	sleep    func(context.Context, time.Duration) error
 	confirm  func(prompt string) (bool, error)
+	pause    func(prompt string) error
 	newRunID func() string
 	grace    time.Duration
 	// probePrometheus reports whether something answers on :9090 next to the
@@ -80,6 +82,7 @@ func runDrill(args []string, stdout, stderr io.Writer) error {
 	fs.StringVar(&opts.result, "result", "", "skip firing; fetch and print the finding for an incident id")
 	fs.BoolVar(&opts.yes, "yes", false, "skip the remote-target confirmation prompt")
 	fs.BoolVar(&opts.resolve, "resolve", false, "after the run, re-send the burst as resolved so the drill incident closes")
+	fs.BoolVar(&opts.resolveWait, "resolve-wait", false, "with -resolve, hold the drill incident open after the payoff and resolve on Enter")
 	fs.BoolVar(&opts.allowInsecure, "allow-insecure-http", false, "allow sending bearer tokens to a plain-http remote target")
 	fs.StringVar(&opts.viaAlertmanager, "via-alertmanager", "", "fire the burst through your Alertmanager (base URL, v2 API) to validate AM→AlertINT routing")
 	if err := fs.Parse(args); err != nil {
@@ -113,6 +116,7 @@ func runDrill(args []string, stdout, stderr io.Writer) error {
 			}
 		},
 		confirm:         stdinConfirm(stderr),
+		pause:           stdinPause(stderr),
 		newRunID:        randomRunID,
 		grace:           drillTriageGrace,
 		probePrometheus: probePrometheusDefault,
@@ -125,6 +129,9 @@ func (d *drillCmd) run(ctx context.Context) error {
 
 	if d.opts.result != "" && d.opts.resolve {
 		return fmt.Errorf("drill: --resolve applies to a firing run, not --result (re-run the drill with --resolve instead)")
+	}
+	if d.opts.resolveWait && !d.opts.resolve {
+		return fmt.Errorf("drill: -resolve-wait requires -resolve")
 	}
 
 	// --result: the re-check path. One fetch, one print, done. The transport
@@ -265,6 +272,11 @@ func (d *drillCmd) run(ctx context.Context) error {
 func (d *drillCmd) maybeResolve(ctx context.Context, run drillRun, recvBase, webhookToken string) error {
 	if !d.opts.resolve {
 		return nil
+	}
+	if d.opts.resolveWait {
+		if err := d.pause("press Enter to resolve the drill incident… "); err != nil {
+			d.printf("note: stdin unavailable (%v) — resolving immediately", err)
+		}
 	}
 	payload := resolvedPayload(run, d.now())
 	if d.opts.viaAlertmanager != "" {
@@ -864,6 +876,16 @@ func stdinConfirm(stderr io.Writer) func(string) (bool, error) {
 		}
 		answer := strings.ToLower(strings.TrimSpace(line))
 		return answer == "y" || answer == "yes", nil
+	}
+}
+
+// stdinPause blocks until Enter (or stdin error), echoing the prompt to
+// stderr so it never mixes into stdout output.
+func stdinPause(stderr io.Writer) func(string) error {
+	return func(prompt string) error {
+		_, _ = fmt.Fprint(stderr, prompt)
+		_, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		return err
 	}
 }
 
