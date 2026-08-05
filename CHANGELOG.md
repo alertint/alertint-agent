@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `alertint drill --scenario db-outage`: a database-outage cascade scenario —
+  no planted deploy; the triage has to identify the database as the root cause
+  and read the remaining alerts as downstream symptoms.
+- `alertint drill --resolve-wait`: with `--resolve`, holds the drill incident
+  open after the finding (so it can be investigated over MCP) and resolves it
+  on Enter.
+
+### Changed
+
+- The `storm` drill scenario now tells a concrete story — debug logging left
+  enabled fleet-wide filling every node's disk — instead of a generic synthetic
+  burst.
+
 ## [0.12.1] - 2026-08-04
 
 ### Added

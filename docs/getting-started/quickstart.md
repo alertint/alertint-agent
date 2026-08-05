@@ -108,6 +108,15 @@ drill alert is marked end to end (`alertint_drill="true"` label, 🧪 DRILL
 banner on the Slack card, `drill: true` in the MCP incident list), and the
 run ends by printing an MCP handoff command for the next step.
 
+The drill ships three scenarios, selected with `--scenario`:
+
+- `flagship` (default) — a planted fake deploy followed by an error burst; the
+  finding names the deploy as the likely cause.
+- `db-outage` — a database-outage cascade with no deploy; the finding has to
+  point at the database and read the other alerts as downstream symptoms.
+- `storm` — debug logging left enabled fleet-wide fills every node's disk:
+  fourteen near-identical alerts collapsed into a single incident.
+
 ## 3. Connect an MCP client
 
 **AlertINT** serves MCP over HTTP on port 9912; clients authenticate with
