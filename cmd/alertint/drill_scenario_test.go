@@ -179,3 +179,36 @@ func TestMaterialize_StormAlertsDistinct(t *testing.T) {
 		seen[key] = true
 	}
 }
+
+// TestMaterialize_DBOutage: the cascade scenario plants no change event
+// (contrast with flagship: the finding must point at the database, not a
+// deploy) and materializes as four distinct-symptom alerts in one group.
+func TestMaterialize_DBOutage(t *testing.T) {
+	sc, ok := drillScenarios()["db-outage"]
+	if !ok {
+		t.Fatal("db-outage missing from the catalog")
+	}
+	if sc.change != nil {
+		t.Error("db-outage must not plant a change event — the cascade has no deploy to blame")
+	}
+
+	run := mustMaterialize(t, "db-outage", defaultGroupLabels, "db01aa")
+	if got := len(run.alerts.Alerts); got != 4 {
+		t.Fatalf("alert count = %d, want 4", got)
+	}
+	names := map[string]bool{}
+	for i, a := range run.alerts.Alerts {
+		names[a.Labels["alertname"]] = true
+		for _, field := range []string{"summary", "description"} {
+			if !strings.HasPrefix(a.Annotations[field], "[drill]") {
+				t.Errorf("alert[%d] %s lacks the [drill] prefix", i, field)
+			}
+		}
+		if a.Labels[store.DrillMarkerLabel] != store.DrillMarkerValue {
+			t.Errorf("alert[%d] missing the drill marker label", i)
+		}
+	}
+	if len(names) != 4 {
+		t.Errorf("distinct alertnames = %d, want 4 (the cascade reads as different symptoms)", len(names))
+	}
+}

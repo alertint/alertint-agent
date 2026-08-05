@@ -76,7 +76,7 @@ func runDrill(args []string, stdout, stderr io.Writer) error {
 	var opts drillOpts
 	fs.StringVar(&opts.cfgPath, "config", "", "path to alertint YAML config (the same file serve reads)")
 	fs.StringVar(&opts.target, "target", "", "base URL of a remote AlertINT instance (default: the local instance from config)")
-	fs.StringVar(&opts.scenario, "scenario", "flagship", "scenario to fire: flagship | storm")
+	fs.StringVar(&opts.scenario, "scenario", "flagship", "scenario to fire: flagship | storm | db-outage")
 	fs.StringVar(&opts.result, "result", "", "skip firing; fetch and print the finding for an incident id")
 	fs.BoolVar(&opts.yes, "yes", false, "skip the remote-target confirmation prompt")
 	fs.BoolVar(&opts.resolve, "resolve", false, "after the run, re-send the burst as resolved so the drill incident closes")
@@ -148,7 +148,7 @@ func (d *drillCmd) run(ctx context.Context) error {
 
 	sc, ok := drillScenarios()[d.opts.scenario]
 	if !ok {
-		return fmt.Errorf("drill: unknown scenario %q (have: flagship, storm)", d.opts.scenario)
+		return fmt.Errorf("drill: unknown scenario %q (have: flagship, storm, db-outage)", d.opts.scenario)
 	}
 
 	// The burst enters through the Alertmanager receiver; without it there is
