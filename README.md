@@ -4,7 +4,7 @@
 
 <h1 align="center">AlertINT</h1>
 
-<p align="center"><strong>Infrastructure Alerts, Decoded</strong></p>
+<p align="center"><strong>Infrastructure incidents, decoded.</strong></p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-blue" alt="license"></a>
@@ -12,7 +12,7 @@
   <a href="https://github.com/alertint/alertint-agent/actions/workflows/ci.yml"><img src="https://github.com/alertint/alertint-agent/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 </p>
 
-> AlertINT is a self-hosted, [Fair Source](https://fair.io) agent runtime that turns infrastructure alerts into incident context your AI agent reads directly over MCP.
+> AlertINT turns infrastructure alerts into investigated incidents and serves them to the AI tools you already use, over MCP — a self-hosted agent that runs inside your own network.
 
 A single Go binary that sits between your monitoring stack and your AI agent. It ingests alert webhooks from Alertmanager and Zabbix, correlates them into incidents through an open rule engine, and runs an LLM triage that falsifies its own draft verdict before the finding ships. Findings go to Slack; the incident state — plus read-only Prometheus, Loki, and Zabbix access — is exposed to any MCP client. Corrections your agent captures over MCP steer the next triage of the same failure. Read-only by design. Local state. You bring the LLM key.
 
