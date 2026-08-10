@@ -27,6 +27,19 @@ func mustMaterialize(t *testing.T, scenario string, keys []string, runID string)
 	return run
 }
 
+func TestMaterialize_ReceiverGroupingMode(t *testing.T) {
+	run := mustMaterialize(t, "flagship", nil, "source1")
+	if run.expectedGroupKey == "" {
+		t.Fatal("Receiver grouping mode produced an empty expected group key")
+	}
+	if len(run.alerts.GroupLabels) == 0 {
+		t.Fatal("Receiver grouping mode must supply Alertmanager groupLabels")
+	}
+	if got := drillGroupKey(run.alerts.GroupLabels); got != run.expectedGroupKey {
+		t.Fatalf("payload groupLabels key = %q, want expected key %q", got, run.expectedGroupKey)
+	}
+}
+
 // TestMaterialize_SingleGroupKey: every burst alert carries the identical
 // adapted group-label set, so the whole Drill correlates into one incident,
 // and the expected group key is the correlator's sorted k=v join.

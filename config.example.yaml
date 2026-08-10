@@ -27,11 +27,9 @@ llm:
 correlator:
   window_seconds: 90       # group alerts arriving within this window
   min_alerts: 1            # minimum alerts to form an incident (1 = single-alert triage)
-  group_labels:            # deliberately no alertname: different alert types on one service correlate into ONE incident
-    - cluster
-    - namespace
-    - service
-    - host                 # Zabbix's identity label — per-host is the zero-config grain for Zabbix alerts
+  # Optional override. Omit or leave empty to use the Receiver's grouping:
+  # Alertmanager groupLabels, or technical host for Zabbix.
+  # group_labels: [cluster, namespace, service]
 
 memory:                    # incident memory: recurrence collapse (always on, deterministic, free)
   attach_window_minutes: 30   # Clock A: re-fires within this window of the last one attach instead of re-triaging

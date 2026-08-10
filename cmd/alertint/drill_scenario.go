@@ -179,12 +179,12 @@ func stormTemplates() []drillAlertTemplate {
 }
 
 // drillRun is a materialized scenario: concrete payloads bound to one run id
-// and the target's group labels.
+// and either the target's explicit override or the drill's Receiver grouping.
 type drillRun struct {
 	runID string
-	// groupLabelValues holds the adapted value for every configured group
-	// label key; identical on every burst alert so the whole Drill lands in
-	// one incident.
+	// groupLabelValues holds the adapted value for every effective group label
+	// key; identical on every burst alert so the whole Drill lands in one
+	// Incident.
 	groupLabelValues map[string]string
 	// expectedGroupKey mirrors the correlator's sorted k=v join for the
 	// adapted labels — the drill finds its incident by exact match on it.
@@ -193,8 +193,14 @@ type drillRun struct {
 	change           *changePayload // nil when the scenario has no change event
 }
 
+// receiverModeDrillGroupLabels are emitted in the synthetic Alertmanager
+// envelope when no explicit override exists. They belong only to the Drill's
+// payload; they are not correlator defaults.
+var receiverModeDrillGroupLabels = []string{"cluster", "namespace", "service", "host"}
+
 // cannedGroupValues maps well-known group-label keys to fictional values.
 // Unknown keys fall back to "drill-<key>".
+
 var cannedGroupValues = map[string]string{
 	"cluster":   "drill-cluster",
 	"namespace": "drill-shop",
@@ -208,8 +214,8 @@ var cannedGroupValues = map[string]string{
 	"severity": "warning",
 }
 
-// materializeScenario binds a scenario to the target's group labels and a run
-// id: every configured group label gets the same obviously-fictional value on
+// materializeScenario binds a scenario to its effective grouping labels and a
+// run id: every group label gets the same obviously-fictional value on
 // every alert (label adaptation), the first configured key's value is salted
 // with the run id (run-unique group key: reruns inside an open window cannot
 // merge into the previous Drill, and discovery matches exactly), fingerprints
@@ -219,9 +225,7 @@ func materializeScenario(sc drillScenario, groupLabelKeys []string, groupSalt, f
 	if len(sc.alerts) == 0 || len(sc.alerts) > maxDrillAlerts {
 		return drillRun{}, fmt.Errorf("drill: scenario %s has %d alerts, want 1..%d (max-fire cap)", sc.key, len(sc.alerts), maxDrillAlerts)
 	}
-	if len(groupLabelKeys) == 0 {
-		return drillRun{}, fmt.Errorf("drill: target config has no correlator.group_labels")
-	}
+	groupLabelKeys = effectiveDrillGroupLabels(groupLabelKeys)
 
 	// groupSalt sets the run-unique group key (the correlator's collapse key);
 	// fpSeed sets the alert fingerprints. A fresh run passes the same value for
@@ -278,6 +282,7 @@ func materializeScenario(sc drillScenario, groupLabelKeys []string, groupSalt, f
 			GroupKey:     "alertint-drill/" + fpSeed,
 			Status:       "firing",
 			Receiver:     "alertint-drill",
+			GroupLabels:  adapted,
 			CommonLabels: adapted,
 			Alerts:       alerts,
 		},
@@ -316,6 +321,13 @@ func resolvedPayload(run drillRun, now time.Time) ingress.AlertmanagerPayload {
 	p.Status = "resolved"
 	p.Alerts = alerts
 	return p
+}
+
+func effectiveDrillGroupLabels(configured []string) []string {
+	if len(configured) > 0 {
+		return configured
+	}
+	return receiverModeDrillGroupLabels
 }
 
 // drillGroupKey mirrors internal/correlator groupKey for alerts that carry

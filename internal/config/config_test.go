@@ -5,7 +5,6 @@ package config
 import (
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 )
@@ -101,6 +100,9 @@ func TestLoad_MinimalValidConfig(t *testing.T) {
 	if cfg.Correlator.MinAlerts != 2 {
 		t.Errorf("MinAlerts = %d, want 2", cfg.Correlator.MinAlerts)
 	}
+	if got := strings.Join(cfg.Correlator.GroupLabels, ","); got != "cluster,namespace,service" {
+		t.Errorf("explicit group_labels = %q, want preserved override", got)
+	}
 	if cfg.LLM.Model == "" {
 		t.Error("LLM.Model is empty")
 	}
@@ -134,11 +136,26 @@ storage:
 	if cfg.Correlator.MinAlerts != 1 {
 		t.Errorf("default min_alerts not applied: %d", cfg.Correlator.MinAlerts)
 	}
+	if len(cfg.Correlator.GroupLabels) != 0 {
+		t.Errorf("omitted group_labels = %v, want Receiver grouping mode", cfg.Correlator.GroupLabels)
+	}
 	if !cfg.Notify.Stdout {
 		t.Error("default notify.stdout=true not applied")
 	}
 	if cfg.LogLevel != "info" {
 		t.Errorf("default log_level not applied: %q", cfg.LogLevel)
+	}
+}
+
+func TestLoad_ExplicitEmptyGroupLabelsUsesReceiverGrouping(t *testing.T) {
+	yaml := strings.Replace(minimalValidYAML,
+		`group_labels: ["cluster", "namespace", "service"]`, `group_labels: []`, 1)
+	cfg, err := LoadFrom(strings.NewReader(yaml), "test.yaml")
+	if err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	if len(cfg.Correlator.GroupLabels) != 0 {
+		t.Fatalf("group_labels = %v, want empty Receiver grouping override", cfg.Correlator.GroupLabels)
 	}
 }
 
@@ -221,11 +238,10 @@ func TestZabbixAPIDefaults(t *testing.T) {
 	}
 }
 
-func TestDefaultGroupLabelsIncludeHost(t *testing.T) {
+func TestDefaultGroupLabelsUseReceiverGrouping(t *testing.T) {
 	cfg := Defaults()
-	want := []string{"cluster", "namespace", "service", "host"}
-	if !reflect.DeepEqual(cfg.Correlator.GroupLabels, want) {
-		t.Fatalf("default group_labels = %v, want %v", cfg.Correlator.GroupLabels, want)
+	if len(cfg.Correlator.GroupLabels) != 0 {
+		t.Fatalf("default group_labels = %v, want empty Receiver grouping override", cfg.Correlator.GroupLabels)
 	}
 }
 
@@ -354,7 +370,6 @@ func TestValidate_RejectsBadCorrelatorBounds(t *testing.T) {
 	}{
 		{"zero window", func(c *Config) { c.Correlator.WindowSeconds = 0 }, "window_seconds"},
 		{"zero min_alerts", func(c *Config) { c.Correlator.MinAlerts = 0 }, "min_alerts"},
-		{"empty group_labels", func(c *Config) { c.Correlator.GroupLabels = nil }, "group_labels"},
 		{"blank label", func(c *Config) { c.Correlator.GroupLabels = []string{"cluster", " "} }, "group_labels[1]"},
 	}
 	for _, tc := range cases {

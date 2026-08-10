@@ -55,13 +55,17 @@ the same alert fingerprint are collapsed — one record per logical alert.
 
 ### 3. Correlation
 
-Alerts that fire within a configurable time window and share common label
-dimensions (`cluster`, `namespace`, `service`, `host` by default) are
-grouped into a single incident record. Grouping is deterministic and
-re-evaluated as new alerts arrive. The [rule engine](../rules-spec.md) runs
+Alerts that fire within a configurable time window and share a Receiver
+grouping identity are grouped into one Incident. Alertmanager supplies its v4
+webhook `groupLabels`, rendered deterministically as sorted `key=value` pairs;
+Zabbix supplies the technical `host`. A non-empty
+`correlator.group_labels` list overrides that Receiver identity for operators
+who want AlertINT to group on a different label set. If the selected identity
+has no value, AlertINT falls back to alertname and then fingerprint, so the
+Incident group key is never empty. The [rule engine](../rules-spec.md) runs
 here too: storm collapse, known-issue short-circuits, and prompt selection.
 
-- **Grouping keys:** `correlator.group_labels`
+- **Grouping identity:** Receiver default; optional `correlator.group_labels` override
 - **Window:** `correlator.window_seconds`, default 90 s
 
 ### 4. Memory

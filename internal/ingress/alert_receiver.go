@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/alertint/alertint-agent/internal/grouping"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -104,7 +105,7 @@ func (r *alertReceiver) Ingest(ctx context.Context, body []byte) (Summary, error
 	var persisted []store.Alert
 	if len(payload.Alerts) > 0 {
 		var persistErrs []error
-		persisted, persistErrs = r.persistAlerts(ctx, payload.Alerts)
+		persisted, persistErrs = r.persistAlerts(ctx, payload.Alerts, payload.GroupLabels)
 		// Hand off AFTER persistence; sink errors are logged, never fail the response.
 		if r.sink != nil {
 			for _, a := range persisted {
@@ -145,7 +146,7 @@ func alertAuditRecord(payload AlertmanagerPayload, persisted []store.Alert) map[
 	}
 }
 
-func (r *alertReceiver) persistAlerts(ctx context.Context, in []AlertmanagerAlert) ([]store.Alert, []error) {
+func (r *alertReceiver) persistAlerts(ctx context.Context, in []AlertmanagerAlert, groupLabels map[string]string) ([]store.Alert, []error) {
 	persisted := make([]store.Alert, 0, len(in))
 	var errs []error
 	for _, a := range in {
@@ -167,6 +168,9 @@ func (r *alertReceiver) persistAlerts(ctx context.Context, in []AlertmanagerAler
 			)
 			continue
 		}
+		stored.ReceiverGroupingIdentity = grouping.Ensure(
+			grouping.RenderLabels(groupLabels), stored.Labels, stored.Fingerprint,
+		)
 		persisted = append(persisted, stored)
 		r.logger.Debug("alert upserted",
 			slog.String("fingerprint", stored.Fingerprint),

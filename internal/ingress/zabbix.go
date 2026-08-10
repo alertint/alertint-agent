@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/alertint/alertint-agent/internal/grouping"
 	"github.com/alertint/alertint-agent/internal/severity"
 	"github.com/alertint/alertint-agent/internal/store"
 )
@@ -140,6 +141,9 @@ func (r *zabbixReceiver) Ingest(ctx context.Context, body []byte) (Summary, erro
 		)
 		return Summary{Kind: "alert.received", Audit: zabbixAuditRecord(ev, false)}, nil
 	}
+	stored.ReceiverGroupingIdentity = grouping.Ensure(
+		grouping.RenderSelectedLabels(stored.Labels, []string{"host"}), stored.Labels, stored.Fingerprint,
+	)
 	if r.sink != nil {
 		if err := r.sink(ctx, stored); err != nil {
 			r.logger.Warn("alert sink failed",

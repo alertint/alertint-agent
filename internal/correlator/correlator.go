@@ -4,10 +4,10 @@
 // described in Slice 05 of the AlertINT agent plan.
 //
 // Design notes
-//   - Group key: a deterministic string derived from the alert's labels
-//     (sorted key=value pairs joined with commas). The correlator groups
-//     all alerts that share the same group key into a single incident
-//     within the current open window.
+//   - Group key: the Receiver's stable identity unless a non-empty configured
+//     label list overrides it, with alertname/fingerprint safety fallbacks. The
+//     correlator groups all alerts sharing that key into one incident within
+//     the current open window.
 //   - Fixed window: ready_at = first_alert_at + WindowSeconds. Once the
 //     window closes the incident is marked "ready" and handed off via
 //     IncidentSink.OnIncidentReady.
@@ -27,11 +27,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"sort"
-	"strings"
 	"sync"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/grouping"
 	"github.com/alertint/alertint-agent/internal/notify"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/google/uuid"
@@ -84,9 +83,8 @@ type Config struct {
 	// TickInterval controls how often the background goroutine polls for
 	// expired windows. Defaults to 5 s. Tests may set this much smaller.
 	TickInterval time.Duration
-	// GroupLabels is the list of label keys to use for grouping alerts.
-	// Only these labels are included in the group key. If empty, all
-	// labels are used (not recommended for production).
+	// GroupLabels is an optional explicit override of the Receiver grouping
+	// identity. Only these labels are included when the list is non-empty.
 	GroupLabels []string
 
 	// Incident-memory (M1) horizon knobs. Zero values take the defaults below.
@@ -272,7 +270,7 @@ func (c *Correlator) recover(ctx context.Context) error {
 // creating one if none exists yet for this group key.
 // For resolved alerts, links to the most recent incident with matching group key.
 func (c *Correlator) handleAlert(ctx context.Context, a store.Alert) error {
-	gk := c.groupKey(a)
+	gk, overrideMiss := c.groupKeySelection(a)
 
 	inc, err := c.st.GetCollectingIncident(ctx, gk)
 	if err != nil && err != store.ErrNotFound {
@@ -307,6 +305,10 @@ func (c *Correlator) handleAlert(ctx context.Context, a store.Alert) error {
 	}
 
 	if err == store.ErrNotFound {
+		if overrideMiss {
+			c.logger.Warn("correlator: configured group_labels matched no alert labels; using safety fallback",
+				"fingerprint", a.Fingerprint, "group_key", gk)
+		}
 		// Open a new window.
 		window := time.Duration(c.cfg.WindowSeconds) * time.Second
 		inc = &store.Incident{
@@ -437,34 +439,21 @@ func (c *Correlator) flushExpired(ctx context.Context) error {
 	return nil
 }
 
-// groupKey builds a deterministic string from the alert's labels.
-// Only labels specified in GroupLabels are used; if GroupLabels is empty,
-// all labels are used (backwards compatibility for tests).
-// Labels are sorted so key order never matters.
+// groupKey selects the explicit configured-label identity when present,
+// otherwise the identity supplied by the Receiver. The shared safety fallback
+// guarantees that the resulting Incident key is never empty.
 func (c *Correlator) groupKey(a store.Alert) string {
-	var keys []string
-	if len(c.cfg.GroupLabels) > 0 {
-		// Use only configured group labels
-		keys = make([]string, 0, len(c.cfg.GroupLabels))
-		for _, k := range c.cfg.GroupLabels {
-			if _, ok := a.Labels[k]; ok {
-				keys = append(keys, k)
-			}
-		}
-	} else {
-		// Fallback: use all labels (for backwards compatibility in tests)
-		keys = make([]string, 0, len(a.Labels))
-		for k := range a.Labels {
-			keys = append(keys, k)
-		}
-	}
-	sort.Strings(keys)
+	key, _ := c.groupKeySelection(a)
+	return key
+}
 
-	parts := make([]string, 0, len(keys))
-	for _, k := range keys {
-		parts = append(parts, k+"="+a.Labels[k])
+func (c *Correlator) groupKeySelection(a store.Alert) (key string, overrideMiss bool) {
+	identity := a.ReceiverGroupingIdentity
+	if len(c.cfg.GroupLabels) > 0 {
+		identity = grouping.RenderSelectedLabels(a.Labels, c.cfg.GroupLabels)
+		overrideMiss = identity == ""
 	}
-	return strings.Join(parts, ",")
+	return grouping.Ensure(identity, a.Labels, a.Fingerprint), overrideMiss
 }
 
 // listCollectingIncidents returns all incidents currently in status

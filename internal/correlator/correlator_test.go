@@ -3,7 +3,10 @@
 package correlator_test
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -94,6 +97,168 @@ func startCorrelator(t *testing.T, cfg correlator.Config, st *store.Store, sink 
 // Tests
 // --------------------------------------------------------------------------
 
+func TestReceiverIdentityGroupsDifferentAlertNamesWithoutOverride(t *testing.T) {
+	st := newTestStore(t)
+	c := startCorrelator(t, correlator.Config{WindowSeconds: 60}, st, correlator.NopIncidentSink{})
+	ctx := context.Background()
+	now := time.Now()
+
+	for i, name := range []string{"HighLatency", "ErrorRate"} {
+		a := newAlert("fp-receiver-"+name, map[string]string{"alertname": name}, now.Add(time.Duration(i)*time.Millisecond))
+		a.ReceiverGroupingIdentity = "team=payments,zone=west"
+		stored, err := st.UpsertAlertByFingerprint(ctx, a)
+		if err != nil {
+			t.Fatalf("upsert %s: %v", name, err)
+		}
+		stored.ReceiverGroupingIdentity = a.ReceiverGroupingIdentity
+		if err := c.Accept(ctx, stored); err != nil {
+			t.Fatalf("accept %s: %v", name, err)
+		}
+	}
+
+	waitFor(t, func() bool {
+		incs, err := st.ListCollectingIncidents(ctx)
+		return err == nil && len(incs) == 1 && incs[0].AlertCount == 2
+	}, 2*time.Second, "one incident containing both Receiver-grouped alerts")
+	incs, err := st.ListCollectingIncidents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := incs[0].GroupKey, "team=payments,zone=west"; got != want {
+		t.Fatalf("group key = %q, want %q", got, want)
+	}
+}
+
+func TestDifferentReceiverIdentitiesCreateDifferentIncidents(t *testing.T) {
+	st := newTestStore(t)
+	c := startCorrelator(t, correlator.Config{WindowSeconds: 60}, st, correlator.NopIncidentSink{})
+	ctx := context.Background()
+	now := time.Now()
+
+	for i, identity := range []string{"team=payments", "team=search"} {
+		a := newAlert("fp-identity-"+identity, map[string]string{"alertname": "HighLatency"}, now.Add(time.Duration(i)*time.Millisecond))
+		a.ReceiverGroupingIdentity = identity
+		stored, err := st.UpsertAlertByFingerprint(ctx, a)
+		if err != nil {
+			t.Fatalf("upsert %s: %v", identity, err)
+		}
+		stored.ReceiverGroupingIdentity = identity
+		if err := c.Accept(ctx, stored); err != nil {
+			t.Fatalf("accept %s: %v", identity, err)
+		}
+	}
+
+	waitFor(t, func() bool {
+		incs, err := st.ListCollectingIncidents(ctx)
+		return err == nil && len(incs) == 2
+	}, 2*time.Second, "different Receiver identities to create separate incidents")
+}
+
+func TestExplicitGroupLabelsOverrideReceiverIdentity(t *testing.T) {
+	st := newTestStore(t)
+	c := startCorrelator(t, correlator.Config{WindowSeconds: 60, GroupLabels: []string{"service"}}, st, correlator.NopIncidentSink{})
+	ctx := context.Background()
+	now := time.Now()
+
+	for i, identity := range []string{"team=payments", "team=search"} {
+		a := newAlert("fp-override-"+identity, map[string]string{"alertname": "HighLatency", "service": "api"}, now.Add(time.Duration(i)*time.Millisecond))
+		a.ReceiverGroupingIdentity = identity
+		stored, err := st.UpsertAlertByFingerprint(ctx, a)
+		if err != nil {
+			t.Fatalf("upsert %s: %v", identity, err)
+		}
+		stored.ReceiverGroupingIdentity = identity
+		if err := c.Accept(ctx, stored); err != nil {
+			t.Fatalf("accept %s: %v", identity, err)
+		}
+	}
+
+	waitFor(t, func() bool {
+		incs, err := st.ListCollectingIncidents(ctx)
+		return err == nil && len(incs) == 1 && incs[0].AlertCount == 2
+	}, 2*time.Second, "configured-label override incident")
+	incs, err := st.ListCollectingIncidents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := incs[0].GroupKey, "service=api"; got != want {
+		t.Fatalf("group key = %q, want %q", got, want)
+	}
+}
+
+func TestMisappliedExplicitGroupLabelsWarnAndFallBack(t *testing.T) {
+	st := newTestStore(t)
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	c := correlator.New(correlator.Config{
+		WindowSeconds: 60,
+		TickInterval:  20 * time.Millisecond,
+		GroupLabels:   []string{"cluster"},
+	}, st, correlator.NopIncidentSink{}, logger)
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.Stop)
+	ctx := context.Background()
+	a := newAlert("fp-mismatch", map[string]string{"alertname": "HighLatency", "service": "api"}, time.Now())
+	stored, err := st.UpsertAlertByFingerprint(ctx, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Accept(ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, func() bool {
+		inc, err := st.GetCollectingIncident(ctx, "alertname=HighLatency")
+		return err == nil && inc.GroupKey != ""
+	}, 2*time.Second, "safe alertname fallback")
+	waitFor(t, func() bool {
+		return strings.Contains(logs.String(), "configured group_labels matched no alert labels")
+	}, 2*time.Second, "explicit override mismatch warning")
+}
+
+func TestEmptyReceiverIdentityFallsBackWithoutEmptyIncidentKey(t *testing.T) {
+	st := newTestStore(t)
+	c := startCorrelator(t, correlator.Config{WindowSeconds: 60}, st, correlator.NopIncidentSink{})
+	ctx := context.Background()
+	now := time.Now()
+	alerts := []store.Alert{
+		newAlert("fp-named", map[string]string{"alertname": "HighLatency"}, now),
+		newAlert("fp-unnamed", map[string]string{"service": "api"}, now.Add(time.Millisecond)),
+	}
+	for _, a := range alerts {
+		stored, err := st.UpsertAlertByFingerprint(ctx, a)
+		if err != nil {
+			t.Fatalf("upsert %s: %v", a.Fingerprint, err)
+		}
+		if err := c.Accept(ctx, stored); err != nil {
+			t.Fatalf("accept %s: %v", a.Fingerprint, err)
+		}
+	}
+
+	waitFor(t, func() bool {
+		incs, err := st.ListCollectingIncidents(ctx)
+		return err == nil && len(incs) == 2
+	}, 2*time.Second, "fallback incidents")
+	incs, err := st.ListCollectingIncidents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, inc := range incs {
+		if inc.GroupKey == "" {
+			t.Fatal("correlator created an empty Incident group key")
+		}
+		got[inc.GroupKey] = true
+	}
+	for _, want := range []string{"alertname=HighLatency", "fingerprint=fp-unnamed"} {
+		if !got[want] {
+			t.Errorf("missing fallback group key %q; got %v", want, got)
+		}
+	}
+}
+
 // TestSingleAlertPath verifies that a single alert creates a collecting
 // incident and, after the window, the sink receives a ready incident.
 func TestSingleAlertPath(t *testing.T) {
@@ -183,7 +348,7 @@ func TestDifferentGroupKeysSeparateIncidents(t *testing.T) {
 	st := newTestStore(t)
 	sink := &captureSink{}
 
-	cfg := correlator.Config{WindowSeconds: 1, TickInterval: 20 * time.Millisecond}
+	cfg := correlator.Config{WindowSeconds: 1, TickInterval: 20 * time.Millisecond, GroupLabels: []string{"host"}}
 	c := startCorrelator(t, cfg, st, sink)
 	ctx := context.Background()
 

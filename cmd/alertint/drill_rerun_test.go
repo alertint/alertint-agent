@@ -25,6 +25,18 @@ func TestDrillRerunSalt_ReusesSaltInHorizon(t *testing.T) {
 	}
 }
 
+func TestDrillRerunSalt_ReceiverGroupingMode(t *testing.T) {
+	now := time.Date(2026, 7, 8, 15, 0, 0, 0, time.UTC)
+	cands := []drillCandidate{{
+		ID: "inc1", Status: "analyzed", Drill: true, LastAlertAt: now.Add(-5 * time.Minute),
+		GroupKey: "cluster=drill-cluster-abc123,host=drill-node-01,namespace=drill-shop,service=drill-checkout",
+	}}
+	id, salt, ok := drillRerunSalt(cands, nil, now, 30*time.Minute)
+	if !ok || id != "inc1" || salt != "abc123" {
+		t.Fatalf("got (%q, %q, %v), want Receiver-mode rerun match", id, salt, ok)
+	}
+}
+
 func TestDrillRerunSalt_OutsideHorizonMintsFresh(t *testing.T) {
 	now := time.Date(2026, 7, 8, 15, 0, 0, 0, time.UTC)
 	cands := []drillCandidate{drillCand("inc1", "abc123", "analyzed", true, now.Add(-31*time.Minute))}

@@ -156,6 +156,39 @@ func TestZabbixReceiver_MapsProblemToFiringAlert(t *testing.T) {
 	}
 }
 
+func TestZabbixReceiverHandsOffPerHostIdentityAcrossResolution(t *testing.T) {
+	st := newTestStore(t)
+	var sunk []store.Alert
+	r := NewZabbixReceiver(st, "tok", func(_ context.Context, a store.Alert) error {
+		sunk = append(sunk, a)
+		return nil
+	}, slog.Default())
+
+	bodies := [][]byte{
+		[]byte(`{"event_id":"77","status":"PROBLEM","severity":"Warning","nseverity":"2","host":"db01","trigger_name":"Disk low"}`),
+		[]byte(`{"event_id":"77","status":"RESOLVED","severity":"Warning","nseverity":"2","host":"db01","trigger_name":"Disk low"}`),
+		[]byte(`{"event_id":"78","status":"PROBLEM","severity":"Warning","nseverity":"2","host":"db02","trigger_name":"Disk low"}`),
+	}
+	for _, body := range bodies {
+		if _, err := r.Ingest(context.Background(), body); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if len(sunk) != 3 {
+		t.Fatalf("sink calls = %d, want 3", len(sunk))
+	}
+	if got := sunk[0].ReceiverGroupingIdentity; got != "host=db01" {
+		t.Fatalf("problem identity = %q, want host=db01", got)
+	}
+	if got := sunk[1].ReceiverGroupingIdentity; got != sunk[0].ReceiverGroupingIdentity {
+		t.Fatalf("resolved identity = %q, want firing identity %q", got, sunk[0].ReceiverGroupingIdentity)
+	}
+	if got := sunk[2].ReceiverGroupingIdentity; got != "host=db02" || got == sunk[0].ReceiverGroupingIdentity {
+		t.Fatalf("second host identity = %q, want distinct host=db02", got)
+	}
+}
+
 func TestZabbixReceiver_ResolvedDedupsOntoFiringRow(t *testing.T) {
 	st := newTestStore(t)
 	r := NewZabbixReceiver(st, "tok", nil, slog.Default())

@@ -40,14 +40,15 @@ lands, will be gated behind explicit operator approval flows.
 
 ### High-cardinality label churn
 
-**Problem:** if your alerts use dynamic label values (e.g.
-`pod=web-68f9c-xk2pq`) the correlator creates one incident per unique pod
-name rather than grouping the fleet-wide event. The fixed-window group key
-is an exact match on all configured `group_labels`.
+**Problem:** a high-cardinality label in the selected grouping identity (for
+example `pod=web-68f9c-xk2pq`) creates one Incident per changing value rather
+than grouping the fleet-wide event. This can come from Alertmanager's
+`groupLabels` or from an explicit `correlator.group_labels` override.
 
-**Workaround:** exclude high-cardinality labels from
-`correlator.group_labels`. Use stable labels like `service`, `namespace`,
-`alertname`.
+**Workaround:** group the Alertmanager route on stable dimensions, or set an
+explicit override containing stable labels such as `service`, `namespace`, or
+`alertname`. AlertINT warns when a configured override matches none of an
+alert's labels and falls back safely instead of creating an empty key.
 
 ### Flapping alerts
 
