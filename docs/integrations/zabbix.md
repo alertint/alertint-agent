@@ -134,12 +134,13 @@ ranks normally — only genuinely unrecognized names trigger the fallback.
 
 ## Grouping
 
-The default `correlator.group_labels` includes `host`, so Zabbix alerts
-correlate per-host with zero configuration — no `cluster`/`namespace`/`service`
-labels required. To correlate a condition across hosts (e.g. one incident for
-a shared dependency failing on several hosts at once), tag the trigger with a
-`service` tag; tags pass through as labels and participate in grouping like
-any other configured label.
+The Zabbix Receiver supplies `host=<technical-host>` as its default grouping
+identity, so Zabbix alerts correlate per-host with zero configuration — no
+`cluster`/`namespace`/`service` labels required. To correlate a condition
+across hosts (for example one Incident for a shared dependency failing on
+several hosts at once), add a common trigger tag and set
+`correlator.group_labels` to that tag's label key. A non-empty list is an
+explicit override of the per-host Receiver identity.
 
 ## Pull: the Zabbix context (`zabbix.api`)
 

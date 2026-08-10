@@ -159,7 +159,13 @@ what they need, so raising it costs nothing for normal traffic.
 |---|---|---|---|
 | `window_seconds` | int | `90` | Alerts sharing the same group key within this window form one incident |
 | `min_alerts` | int | `1` | Minimum alerts before the incident is dispatched to the skill. The default `1` triages a lone alert too — use `notify.slack.min_severity` to control channel noise instead of dropping triage. |
-| `group_labels` | list | `[cluster, namespace, service, host]` | Label names used to compute the group key. Two alerts are correlated when all of these labels match. Deliberately excludes `alertname` so related alerts of different types (latency + crash-loop on one service) correlate into one incident; add it only if you want one incident per alert type. `host` is the Zabbix connector's identity label — per-host is the zero-config grain for Zabbix alerts, which carry no `cluster`/`namespace`/`service`. The `alertint_` label-key prefix is reserved for AlertINT itself (e.g. the `alertint_drill` drill marker) and is rejected here — reserved labels never participate in grouping. |
+| `group_labels` | list | — | Optional label-based override for the Receiver grouping identity. When omitted or empty, Alertmanager uses the webhook's `groupLabels` and Zabbix groups by technical `host`. A non-empty list instead builds the group key from matching alert labels. If the selected identity is empty, AlertINT falls back to `alertname`, then fingerprint, so an Incident key is never empty. The `alertint_` label-key prefix is reserved for AlertINT itself (e.g. the `alertint_drill` marker) and is rejected here. |
+
+Alertmanager `groupLabels` are rendered as sorted, readable `key=value` pairs;
+the opaque route-shaped `groupKey` remains audit metadata and is not used as
+the Incident key. Existing configurations with a non-empty `group_labels` list
+keep that behavior. If you omitted the field previously, upgrading switches
+the default from AlertINT's compiled label list to the Receiver identity.
 
 `window_seconds` is a tradeoff. A lower value reacts faster, but an
 incident may be analyzed with only the first alert or two of a burst
@@ -386,10 +392,8 @@ llm:
 correlator:
   window_seconds: 90
   min_alerts: 1
-  group_labels:
-    - cluster
-    - namespace
-    - service
+  # Optional override; omit to use Alertmanager groupLabels or Zabbix host.
+  # group_labels: [cluster, namespace, service]
 
 notify:
   stdout: true

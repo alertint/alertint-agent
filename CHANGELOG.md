@@ -18,6 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Incident grouping is Receiver-aware by default. When
+  `correlator.group_labels` is omitted or empty, Alertmanager uses its v4
+  `groupLabels` (rendered as sorted `key=value` pairs) and Zabbix groups by
+  technical host. A non-empty configured list remains an explicit override;
+  unmatched overrides fall back to alertname, then fingerprint, so Incident
+  keys cannot be empty. **Upgrade note:** installs that omitted the field move
+  from the old compiled `cluster, namespace, service, host` list to Receiver
+  grouping and may start new recurrence/memory identities once; explicit
+  non-empty configurations are unchanged.
 - The `storm` drill scenario now tells a concrete story — debug logging left
   enabled fleet-wide filling every node's disk — instead of a generic synthetic
   burst.

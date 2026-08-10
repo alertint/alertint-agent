@@ -520,15 +520,17 @@ func TestMaybeAttach_EventCarriesNewAlertname(t *testing.T) {
 	}
 }
 
-// TestGroupKey_ZabbixShapedAlertUnderDefaultLabels proves the compiled default
-// group_labels (config.Defaults(), which now includes host — ADR-0031) never
-// collapses a host-only Zabbix alert onto group_key="": it must key on host.
-func TestGroupKey_ZabbixShapedAlertUnderDefaultLabels(t *testing.T) {
+// TestGroupKey_ZabbixReceiverIdentity proves a host-only Zabbix alert uses the
+// Receiver's per-host identity when no configured override exists.
+func TestGroupKey_ZabbixReceiverIdentity(t *testing.T) {
 	st := openStore(t)
-	c := New(Config{GroupLabels: []string{"cluster", "namespace", "service", "host"}}, st, NopIncidentSink{}, nil)
-	a := store.Alert{Labels: map[string]string{
-		"alertname": "Disk low", "host": "db01", "severity": "high", "zabbix_trigger_id": "1",
-	}}
+	c := New(Config{}, st, NopIncidentSink{}, nil)
+	a := store.Alert{
+		ReceiverGroupingIdentity: "host=db01",
+		Labels: map[string]string{
+			"alertname": "Disk low", "host": "db01", "severity": "high", "zabbix_trigger_id": "1",
+		},
+	}
 	if gk := c.groupKey(a); gk != "host=db01" {
 		t.Fatalf("group_key = %q, want host=db01", gk)
 	}

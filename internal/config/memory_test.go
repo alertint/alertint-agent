@@ -152,10 +152,10 @@ func TestWarnings_VolatileGroupLabel(t *testing.T) {
 	}
 }
 
-func TestWarnings_SilentForDefaultGroupLabels(t *testing.T) {
+func TestWarnings_SilentForReceiverGroupingDefault(t *testing.T) {
 	cfg := Defaults()
 	if warns := cfg.Warnings(); len(warns) != 0 {
-		t.Errorf("shipped default group_labels must not warn, got: %v", warns)
+		t.Errorf("Receiver grouping default must not warn, got: %v", warns)
 	}
 }
 

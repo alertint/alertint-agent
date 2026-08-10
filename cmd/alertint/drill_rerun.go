@@ -29,6 +29,7 @@ type drillCandidate struct {
 // its alerts are a new firing episode (a distinct-fingerprint attach), not an
 // unchanged repeat.
 func drillRerunSalt(cands []drillCandidate, groupLabels []string, now time.Time, window time.Duration) (id, salt string, ok bool) {
+	groupLabels = effectiveDrillGroupLabels(groupLabels)
 	saltedKey := firstGroupLabel(groupLabels)
 	if saltedKey == "" {
 		return "", "", false

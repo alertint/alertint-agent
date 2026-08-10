@@ -261,6 +261,10 @@ type Alert struct {
 	StartsAt    time.Time
 	EndsAt      *time.Time
 	ReceivedAt  time.Time
+	// ReceiverGroupingIdentity is Receiver-to-correlator handoff metadata. It is
+	// not persisted as part of the alert payload; the resulting Incident group
+	// key is persisted instead.
+	ReceiverGroupingIdentity string
 	// Role is populated only by GetIncidentAlertsWithRoles; empty otherwise.
 	Role string
 }

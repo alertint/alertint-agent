@@ -325,12 +325,12 @@ const maxSeriesPerFamily = 3
 // The overall maxSnapshotsPerScope slot budget still applies on top of this:
 // an incident with more member-evidence series than that budget (a storm
 // larger than the scope) can still see some truncated — a known, separate
-// limitation (see the group_key="" mega-incident collapse note), not one
-// this per-family cap addresses.
+// limitation of an overly broad Receiver/configured grouping identity, not
+// one this per-family cap addresses.
 const comparatorMaxOverlap = 1
 
 // maxInstanceSupplements caps how many per-instance {instance="X"} supplement
-// scopes one incident may query. A storm incident (or a group_key="" mega-merge)
+// scopes one incident may query. A storm incident (or any overly broad group)
 // can span dozens of nodes; each bare supplement is a full node-series dump, so
 // an unbounded fan-out turns one incident into a thundering herd against the
 // metric backend. The primary scope is always queried; only the per-instance

@@ -442,9 +442,8 @@ func Defaults() Config {
 			// 1: a lone first alert still produces a finding. Slack noise is
 			// controlled by notify.slack.min_severity, not by dropping triage.
 			MinAlerts: 1,
-			// host: the Zabbix identity label — without it every Zabbix alert
-			// would share group_key="" (ADR-0031).
-			GroupLabels: []string{"cluster", "namespace", "service", "host"},
+			// GroupLabels is intentionally empty: Receivers supply the default
+			// grouping identity; a non-empty list is an operator override.
 		},
 		Notify: NotifyConfig{
 			Stdout: true,
@@ -798,29 +797,25 @@ func (c *Config) validateCorrelator() []string {
 	if c.Correlator.MinAlerts < 1 {
 		errs = append(errs, "correlator.min_alerts must be >= 1")
 	}
-	if len(c.Correlator.GroupLabels) == 0 {
-		errs = append(errs, "correlator.group_labels must contain at least one label")
-	} else {
-		seen := make(map[string]int, len(c.Correlator.GroupLabels))
-		for i, label := range c.Correlator.GroupLabels {
-			switch {
-			case strings.TrimSpace(label) == "":
-				errs = append(errs, fmt.Sprintf("correlator.group_labels[%d] is empty", i))
-			case label != strings.TrimSpace(label):
-				// Padded keys silently never match any alert label.
-				errs = append(errs, fmt.Sprintf("correlator.group_labels[%d] %q has surrounding whitespace", i, label))
-			case strings.HasPrefix(strings.ToLower(label), "alertint_"):
-				// The alertint_ label-key prefix is reserved as AlertINT-owned
-				// (e.g. the alertint_drill drill marker) and never participates
-				// in grouping.
-				errs = append(errs, fmt.Sprintf("correlator.group_labels[%d] %q uses the reserved alertint_ label prefix; alertint_* labels never participate in grouping", i, label))
-			default:
-				if j, dup := seen[label]; dup {
-					// A duplicated key doubles its part in the group key.
-					errs = append(errs, fmt.Sprintf("correlator.group_labels[%d] %q duplicates entry %d", i, label, j))
-				}
-				seen[label] = i
+	seen := make(map[string]int, len(c.Correlator.GroupLabels))
+	for i, label := range c.Correlator.GroupLabels {
+		switch {
+		case strings.TrimSpace(label) == "":
+			errs = append(errs, fmt.Sprintf("correlator.group_labels[%d] is empty", i))
+		case label != strings.TrimSpace(label):
+			// Padded keys silently never match any alert label.
+			errs = append(errs, fmt.Sprintf("correlator.group_labels[%d] %q has surrounding whitespace", i, label))
+		case strings.HasPrefix(strings.ToLower(label), "alertint_"):
+			// The alertint_ label-key prefix is reserved as AlertINT-owned
+			// (e.g. the alertint_drill drill marker) and never participates
+			// in grouping.
+			errs = append(errs, fmt.Sprintf("correlator.group_labels[%d] %q uses the reserved alertint_ label prefix; alertint_* labels never participate in grouping", i, label))
+		default:
+			if j, dup := seen[label]; dup {
+				// A duplicated key doubles its part in the group key.
+				errs = append(errs, fmt.Sprintf("correlator.group_labels[%d] %q duplicates entry %d", i, label, j))
 			}
+			seen[label] = i
 		}
 	}
 	return errs
