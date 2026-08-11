@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Drill Incident group keys now include the scenario name in the first effective
+  grouping label, so rerunning one scenario cannot collapse into a different
+  scenario whose remaining grouping labels are identical. The scenario name is
+  visible in Drill group keys shown by demos and MCP clients.
+- Slack Drill cards now explain that the Incident is synthetic and harmless on
+  both firing and resolved channel messages. When a Drill has no live evidence
+  checks, its unverified caveat now identifies that as expected for fictional
+  Drill labels instead of using the terse real-Incident wording.
+
 ## [0.13.0] - 2026-08-11
 
 ### Added

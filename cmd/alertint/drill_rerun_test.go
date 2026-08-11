@@ -12,14 +12,14 @@ var drillGroupLabels = []string{"cluster", "namespace", "service"}
 func drillCand(id, salt, status string, drill bool, lastAlert time.Time) drillCandidate {
 	// Mirrors materializeScenario: cluster is the salted (first) label; namespace
 	// and service take their canned values. Group key is sorted k=v.
-	gk := "cluster=drill-cluster-" + salt + ",namespace=drill-shop,service=drill-checkout"
+	gk := "cluster=drill-cluster-flagship-" + salt + ",namespace=drill-shop,service=drill-checkout"
 	return drillCandidate{ID: id, GroupKey: gk, Status: status, Drill: drill, LastAlertAt: lastAlert}
 }
 
 func TestDrillRerunSalt_ReusesSaltInHorizon(t *testing.T) {
 	now := time.Date(2026, 7, 8, 15, 0, 0, 0, time.UTC)
 	cands := []drillCandidate{drillCand("inc1", "abc123", "analyzed", true, now.Add(-5*time.Minute))}
-	id, salt, ok := drillRerunSalt(cands, drillGroupLabels, now, 30*time.Minute)
+	id, salt, ok := drillRerunSalt(cands, drillGroupLabels, "flagship", now, 30*time.Minute)
 	if !ok || id != "inc1" || salt != "abc123" {
 		t.Fatalf("got (%q, %q, %v), want (inc1, abc123, true)", id, salt, ok)
 	}
@@ -29,9 +29,9 @@ func TestDrillRerunSalt_ReceiverGroupingMode(t *testing.T) {
 	now := time.Date(2026, 7, 8, 15, 0, 0, 0, time.UTC)
 	cands := []drillCandidate{{
 		ID: "inc1", Status: "analyzed", Drill: true, LastAlertAt: now.Add(-5 * time.Minute),
-		GroupKey: "cluster=drill-cluster-abc123,host=drill-node-01,namespace=drill-shop,service=drill-checkout",
+		GroupKey: "cluster=drill-cluster-flagship-abc123,host=drill-node-01,namespace=drill-shop,service=drill-checkout",
 	}}
-	id, salt, ok := drillRerunSalt(cands, nil, now, 30*time.Minute)
+	id, salt, ok := drillRerunSalt(cands, nil, "flagship", now, 30*time.Minute)
 	if !ok || id != "inc1" || salt != "abc123" {
 		t.Fatalf("got (%q, %q, %v), want Receiver-mode rerun match", id, salt, ok)
 	}
@@ -40,7 +40,7 @@ func TestDrillRerunSalt_ReceiverGroupingMode(t *testing.T) {
 func TestDrillRerunSalt_OutsideHorizonMintsFresh(t *testing.T) {
 	now := time.Date(2026, 7, 8, 15, 0, 0, 0, time.UTC)
 	cands := []drillCandidate{drillCand("inc1", "abc123", "analyzed", true, now.Add(-31*time.Minute))}
-	if _, _, ok := drillRerunSalt(cands, drillGroupLabels, now, 30*time.Minute); ok {
+	if _, _, ok := drillRerunSalt(cands, drillGroupLabels, "flagship", now, 30*time.Minute); ok {
 		t.Fatal("matched a candidate outside Clock A, want fresh salt")
 	}
 }
@@ -48,14 +48,14 @@ func TestDrillRerunSalt_OutsideHorizonMintsFresh(t *testing.T) {
 func TestDrillRerunSalt_ResolvedStillMatches(t *testing.T) {
 	now := time.Date(2026, 7, 8, 15, 0, 0, 0, time.UTC)
 	cands := []drillCandidate{drillCand("inc1", "abc123", "resolved", true, now.Add(-2*time.Minute))}
-	if _, salt, ok := drillRerunSalt(cands, drillGroupLabels, now, 30*time.Minute); !ok || salt != "abc123" {
+	if _, salt, ok := drillRerunSalt(cands, drillGroupLabels, "flagship", now, 30*time.Minute); !ok || salt != "abc123" {
 		t.Fatalf("resolved drill not matched: salt=%q ok=%v (attach-to-resolved is valid)", salt, ok)
 	}
 }
 
 func TestDrillRerunSalt_NoPriorMintsFresh(t *testing.T) {
 	now := time.Date(2026, 7, 8, 15, 0, 0, 0, time.UTC)
-	if _, _, ok := drillRerunSalt(nil, drillGroupLabels, now, 30*time.Minute); ok {
+	if _, _, ok := drillRerunSalt(nil, drillGroupLabels, "flagship", now, 30*time.Minute); ok {
 		t.Fatal("matched with no candidates, want fresh salt")
 	}
 }
@@ -63,20 +63,31 @@ func TestDrillRerunSalt_NoPriorMintsFresh(t *testing.T) {
 func TestDrillRerunSalt_NonDrillIgnored(t *testing.T) {
 	now := time.Date(2026, 7, 8, 15, 0, 0, 0, time.UTC)
 	cands := []drillCandidate{drillCand("inc1", "abc123", "analyzed", false, now.Add(-2*time.Minute))}
-	if _, _, ok := drillRerunSalt(cands, drillGroupLabels, now, 30*time.Minute); ok {
+	if _, _, ok := drillRerunSalt(cands, drillGroupLabels, "flagship", now, 30*time.Minute); ok {
 		t.Fatal("matched a non-drill incident, want drill parity to reject it")
 	}
 }
 
 func TestDrillRerunSalt_DifferentScenarioIgnored(t *testing.T) {
 	now := time.Date(2026, 7, 8, 15, 0, 0, 0, time.UTC)
-	// A drill incident whose non-salted labels differ (another scenario/target).
+	// A drill incident whose non-salted labels differ (another target's labels).
 	cands := []drillCandidate{{
 		ID: "inc1", Status: "analyzed", Drill: true, LastAlertAt: now.Add(-2 * time.Minute),
-		GroupKey: "cluster=drill-cluster-abc123,namespace=drill-other,service=drill-checkout",
+		GroupKey: "cluster=drill-cluster-flagship-abc123,namespace=drill-other,service=drill-checkout",
 	}}
-	if _, _, ok := drillRerunSalt(cands, drillGroupLabels, now, 30*time.Minute); ok {
+	if _, _, ok := drillRerunSalt(cands, drillGroupLabels, "flagship", now, 30*time.Minute); ok {
 		t.Fatal("matched a different scenario (non-salted label mismatch)")
+	}
+}
+
+func TestDrillRerunSalt_CrossScenarioMintsFresh(t *testing.T) {
+	now := time.Date(2026, 7, 8, 15, 0, 0, 0, time.UTC)
+	// A storm rerun must not collapse into a fresh flagship incident: the
+	// scenario key in the salted label keeps otherwise-identical group labels
+	// apart.
+	cands := []drillCandidate{drillCand("inc1", "abc123", "analyzed", true, now.Add(-2*time.Minute))}
+	if _, _, ok := drillRerunSalt(cands, drillGroupLabels, "storm", now, 30*time.Minute); ok {
+		t.Fatal("storm rerun matched a flagship incident, want fresh salt")
 	}
 }
 
@@ -86,7 +97,7 @@ func TestDrillRerunSalt_MostRecentWins(t *testing.T) {
 		drillCand("old", "salt-old", "analyzed", true, now.Add(-20*time.Minute)),
 		drillCand("new", "salt-new", "analyzed", true, now.Add(-3*time.Minute)),
 	}
-	id, salt, ok := drillRerunSalt(cands, drillGroupLabels, now, 30*time.Minute)
+	id, salt, ok := drillRerunSalt(cands, drillGroupLabels, "flagship", now, 30*time.Minute)
 	if !ok || id != "new" || salt != "salt-new" {
 		t.Fatalf("got (%q, %q), want the most recent (new, salt-new)", id, salt)
 	}

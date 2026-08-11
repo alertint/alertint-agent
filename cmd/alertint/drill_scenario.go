@@ -216,11 +216,13 @@ var cannedGroupValues = map[string]string{
 
 // materializeScenario binds a scenario to its effective grouping labels and a
 // run id: every group label gets the same obviously-fictional value on
-// every alert (label adaptation), the first configured key's value is salted
-// with the run id (run-unique group key: reruns inside an open window cannot
-// merge into the previous Drill, and discovery matches exactly), fingerprints
-// are run-scoped deterministic hashes, and every alert carries the reserved
-// drill marker (ADR-0013).
+// every alert (label adaptation), the first effective key's value is salted
+// with the scenario key plus the run id (run-unique group key: reruns inside
+// an open window cannot merge into the previous Drill, discovery matches
+// exactly, and the rerun-collapse matcher can tell scenarios apart — a storm
+// rerun must never land on a flagship incident), fingerprints are run-scoped
+// deterministic hashes, and every alert carries the reserved drill marker
+// (ADR-0013).
 func materializeScenario(sc drillScenario, groupLabelKeys []string, groupSalt, fpSeed string, now time.Time) (drillRun, error) {
 	if len(sc.alerts) == 0 || len(sc.alerts) > maxDrillAlerts {
 		return drillRun{}, fmt.Errorf("drill: scenario %s has %d alerts, want 1..%d (max-fire cap)", sc.key, len(sc.alerts), maxDrillAlerts)
@@ -243,7 +245,7 @@ func materializeScenario(sc drillScenario, groupLabelKeys []string, groupSalt, f
 			v = "drill-" + key
 		}
 		if i == 0 {
-			v = v + "-" + groupSalt
+			v = v + "-" + sc.key + "-" + groupSalt
 		}
 		adapted[key] = v
 	}

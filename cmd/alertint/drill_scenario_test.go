@@ -46,7 +46,7 @@ func TestMaterialize_ReceiverGroupingMode(t *testing.T) {
 func TestMaterialize_SingleGroupKey(t *testing.T) {
 	run := mustMaterialize(t, "flagship", defaultGroupLabels, "4f2a1b")
 
-	want := "cluster=drill-cluster-4f2a1b,namespace=drill-shop,service=drill-checkout"
+	want := "cluster=drill-cluster-flagship-4f2a1b,namespace=drill-shop,service=drill-checkout"
 	if run.expectedGroupKey != want {
 		t.Errorf("expectedGroupKey = %q, want %q", run.expectedGroupKey, want)
 	}
@@ -65,7 +65,7 @@ func TestMaterialize_SingleGroupKey(t *testing.T) {
 func TestMaterialize_CustomGroupLabels(t *testing.T) {
 	run := mustMaterialize(t, "flagship", []string{"team", "region"}, "aa11bb")
 	for i, a := range run.alerts.Alerts {
-		if a.Labels["team"] != "drill-team-aa11bb" || a.Labels["region"] != "drill-region" {
+		if a.Labels["team"] != "drill-team-flagship-aa11bb" || a.Labels["region"] != "drill-region" {
 			t.Errorf("alert[%d] custom group labels = team=%q region=%q", i, a.Labels["team"], a.Labels["region"])
 		}
 	}

@@ -309,6 +309,21 @@ func drillPlainMarker(drill bool) string {
 func drillMd(f notify.Finding) string    { return drillMarker(f.Drill) }
 func drillPlain(f notify.Finding) string { return drillPlainMarker(f.Drill) }
 
+// drillFrameBlock is the one-line explainer under a Drill card's headline: a
+// first-time viewer in a shared channel must not need the CLI output (or any
+// product vocabulary) to know the incident is synthetic and harmless. The
+// banner marks the card; this line decodes the banner. nil for real findings.
+func drillFrameBlock(f notify.Finding) slacklib.Block {
+	if !f.Drill {
+		return nil
+	}
+	return slacklib.NewContextBlock("",
+		slacklib.NewTextBlockObject(slacklib.MarkdownType,
+			"🧪 [this is a drill — a synthetic incident fired by `alertint drill` to demo the pipeline; no real systems are affected]",
+			false, false),
+	)
+}
+
 // firingMainBlocks builds the brief main-channel message posted when an incident
 // fires: headline + root cause only. Keeps the channel timeline scannable.
 func firingMainBlocks(f notify.Finding) []slacklib.Block {
@@ -318,6 +333,9 @@ func firingMainBlocks(f notify.Finding) []slacklib.Block {
 				fmt.Sprintf("%s:red_circle: *INCIDENT DETECTED* — %s", drillMd(f), f.AnalysisName), false, false),
 			nil, nil,
 		),
+	}
+	if b := drillFrameBlock(f); b != nil {
+		blocks = append(blocks, b)
 	}
 	if f.OverallIssue != "" {
 		blocks = append(blocks, slacklib.NewSectionBlock(
@@ -522,9 +540,15 @@ func firingDetailBlocks(f notify.Finding) []slacklib.Block {
 	))
 
 	if f.Unverified {
+		// Drill wording: on a drill the missing checks are the expected state
+		// (drill labels are fictional, no evidence source can verify them), and
+		// the bare caveat reads as "the product is broken" to a first-timer.
+		unverifiedText := "⚠ unverified — checks unavailable"
+		if f.Drill {
+			unverifiedText = "⚠ unverified — no live evidence checks ran (expected for a drill: its labels are fictional)"
+		}
 		blocks = append(blocks, slacklib.NewContextBlock("",
-			slacklib.NewTextBlockObject(slacklib.MarkdownType,
-				"⚠ unverified — checks unavailable", false, false),
+			slacklib.NewTextBlockObject(slacklib.MarkdownType, unverifiedText, false, false),
 		))
 	}
 
@@ -583,6 +607,9 @@ func resolvedMainBlocks(f notify.Finding) []slacklib.Block {
 				fmt.Sprintf("%s:white_check_mark: *INCIDENT RESOLVED* — %s", drillMd(f), f.AnalysisName), false, false),
 			nil, nil,
 		),
+	}
+	if b := drillFrameBlock(f); b != nil {
+		blocks = append(blocks, b)
 	}
 	if f.OverallIssue != "" {
 		blocks = append(blocks, slacklib.NewSectionBlock(

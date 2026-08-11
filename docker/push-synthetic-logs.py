@@ -26,7 +26,7 @@
 #   python3 docker/push-synthetic-logs.py --target cloud       # Grafana Cloud
 #   python3 docker/push-synthetic-logs.py --url http://host:3100
 #
-# Run it just before `task alerts:fire` so the lines fall inside the agent's
+# Run it just before `task drill` so the lines fall inside the agent's
 # default 15-minute look-back window.
 
 import argparse
@@ -259,7 +259,7 @@ def main():
     print('  {cluster="prod"}                    # everything in prod')
     print("")
     print("Or fire alerts and watch the worker incident's triage prompt gain a")
-    print("'Recent logs' section:  task alerts:fire")
+    print("'Recent logs' section:  task drill")
     return 0
 
 

@@ -147,6 +147,46 @@ func TestDrillBannerOnAllSurfaces(t *testing.T) {
 	}
 }
 
+// TestDrillFrameOnMainCards verifies both main-channel cards (firing and
+// resolved — the same message edited in place) carry the one-line drill
+// explainer, and that real findings never do. The frame is what makes a drill
+// self-explanatory to a viewer who did not run the CLI.
+func TestDrillFrameOnMainCards(t *testing.T) {
+	const frame = "this is a drill"
+	drill := testFinding()
+	drill.Drill = true
+	regular := testFinding()
+
+	surfaces := map[string]func(notify.Finding) []slacklib.Block{
+		"firingMain":   firingMainBlocks,
+		"resolvedMain": resolvedMainBlocks,
+	}
+	for name, render := range surfaces {
+		if got := blocksJSON(t, render(drill)); !strings.Contains(got, frame) {
+			t.Errorf("%s: drill card missing the explainer frame:\n%s", name, got)
+		}
+		if got := blocksJSON(t, render(regular)); strings.Contains(got, frame) {
+			t.Errorf("%s: real finding must not carry the drill frame:\n%s", name, got)
+		}
+	}
+}
+
+// TestUnverifiedWordingDrillAware verifies the unverified caveat explains
+// itself on drill cards (missing checks are the expected state there) and
+// stays terse on real ones.
+func TestUnverifiedWordingDrillAware(t *testing.T) {
+	f := testFinding()
+	f.Unverified = true
+	if got := blocksJSON(t, firingDetailBlocks(f)); !strings.Contains(got, "unverified — checks unavailable") {
+		t.Errorf("real unverified finding missing the terse caveat:\n%s", got)
+	}
+	f.Drill = true
+	got := blocksJSON(t, firingDetailBlocks(f))
+	if !strings.Contains(got, "expected for a drill") {
+		t.Errorf("drill unverified finding missing the drill wording:\n%s", got)
+	}
+}
+
 func TestFiringCardBlocks_RecurrenceLine(t *testing.T) {
 	f := testFinding()
 	if s := blocksJSON(t, firingCardBlocks(f)); strings.Contains(s, "recurred") {
