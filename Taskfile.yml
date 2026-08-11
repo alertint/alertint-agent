@@ -102,25 +102,15 @@ tasks:
         fi
         {{.BIN_DIR}}/{{.BIN_NAME}} verify-audit $args
 
-  alerts:fire:
-    desc: Fire a burst of fake alerts at the local agent
-    dir: ../fake_alert_generator
+  drill:
+    desc: "Guided drill against the local Docker stack — fire a scenario, wait out the window, print the finding. Args after `--`, e.g. `task drill -- --scenario db-outage` (flagship | storm | db-outage)"
+    deps: [build]
+    dotenv: [".env"]
+    interactive: true
     cmds:
-      - python3 fake_alert_generator.py --config configs/LOCAL_AGENT.txt scenario burst
-
-  alerts:resolve:
-    desc: Resolve all fake alerts on the local agent
-    dir: ../fake_alert_generator
-    cmds:
-      - python3 fake_alert_generator.py --config configs/LOCAL_AGENT.txt resolve-all
-
-  alerts:purge:
-    desc: Purge local fake alert tracking state (clean slate for testing)
-    dir: ../fake_alert_generator
-    cmds:
-      - echo "Removing fake alert tracking state..."
-      - rm -f .alertint_fake_alert_state.json
-      - echo "✓ Tracking state purged. Fresh alerts can now be generated."
+      # Same config file the compose stack mounts (ALERTINT_CONFIG_FILE override
+      # included), so the drill reads exactly what serve reads.
+      - '{{.BIN_DIR}}/{{.BIN_NAME}} drill --config "docker/${ALERTINT_CONFIG_FILE:-agent.config.yaml}" {{.CLI_ARGS}}'
 
   demo:feedback:
     desc: "End-to-end feedback & verdict capture demo: drill → triage → MCP write-back → recall → audit → steering proof (supported/contradicted/unverifiable). Args after `--`, e.g. `task demo:feedback -- --reset`"
@@ -130,7 +120,7 @@ tasks:
       - python3 scripts/demo-feedback.py {{.CLI_ARGS}}
 
   logs:push:local:
-    desc: Seed the dev-stack Loki with fake multi-level log lines (run before alerts:fire)
+    desc: Seed the dev-stack Loki with fake multi-level log lines (run before task drill)
     cmds:
       - python3 docker/push-synthetic-logs.py --target local
 

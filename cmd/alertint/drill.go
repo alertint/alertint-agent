@@ -201,7 +201,7 @@ func (d *drillCmd) run(ctx context.Context) error {
 	if mcpAvailable {
 		if cands, cerr := d.fetchDrillCandidates(ctx, mcpEndpoint, mcpToken); cerr == nil {
 			w := time.Duration(d.cfg.Memory.AttachWindowMinutes) * time.Minute
-			if id, salt, ok := drillRerunSalt(cands, d.cfg.Correlator.GroupLabels, d.now(), w); ok {
+			if id, salt, ok := drillRerunSalt(cands, d.cfg.Correlator.GroupLabels, sc.key, d.now(), w); ok {
 				groupSalt, fpSeed, rerunID = salt, d.newRunID(), id
 				d.printf("rerun: a prior drill (%s) is inside the %dm collapse window — reusing its group key to exercise recurrence collapse", id, d.cfg.Memory.AttachWindowMinutes)
 			}

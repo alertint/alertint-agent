@@ -23,18 +23,21 @@ type drillCandidate struct {
 // on it (recurrence collapse) instead of minting a fresh incident. It matches:
 // drill-flagged, judged (analyzed|resolved), last activity within window of now,
 // every non-salted group label equal to the scenario's canned value, and the
-// salted (first) label equal to the canned prefix plus a salt. It returns the
-// incident id, the salt to reuse, and true; or ok=false to mint a fresh salt.
-// The most recent match wins. The rerun still fires with FRESH fingerprints so
-// its alerts are a new firing episode (a distinct-fingerprint attach), not an
+// salted (first) label equal to the canned prefix plus the scenario key plus a
+// salt — the scenario key in the salted value is what keeps scenarios apart
+// (their canned group labels are otherwise identical, so without it a storm
+// rerun would collapse into a flagship incident). It returns the incident id,
+// the salt to reuse, and true; or ok=false to mint a fresh salt. The most
+// recent match wins. The rerun still fires with FRESH fingerprints so its
+// alerts are a new firing episode (a distinct-fingerprint attach), not an
 // unchanged repeat.
-func drillRerunSalt(cands []drillCandidate, groupLabels []string, now time.Time, window time.Duration) (id, salt string, ok bool) {
+func drillRerunSalt(cands []drillCandidate, groupLabels []string, scenarioKey string, now time.Time, window time.Duration) (id, salt string, ok bool) {
 	groupLabels = effectiveDrillGroupLabels(groupLabels)
 	saltedKey := firstGroupLabel(groupLabels)
-	if saltedKey == "" {
+	if saltedKey == "" || scenarioKey == "" {
 		return "", "", false
 	}
-	prefix := cannedGroupValue(saltedKey) + "-"
+	prefix := cannedGroupValue(saltedKey) + "-" + scenarioKey + "-"
 
 	var best drillCandidate
 	var bestSalt string
