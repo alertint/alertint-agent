@@ -103,7 +103,7 @@ tasks:
         {{.BIN_DIR}}/{{.BIN_NAME}} verify-audit $args
 
   drill:
-    desc: "Guided drill against the local Docker stack — fire a scenario, wait out the window, print the finding. Args after `--`, e.g. `task drill -- --scenario db-outage` (flagship | storm | db-outage)"
+    desc: "Guided drill against the local Docker stack — fire a scenario, wait out the window, print the finding. Args after `--`, e.g. `task drill -- --scenario db-outage --fresh` (flagship | storm | db-outage)"
     deps: [build]
     dotenv: [".env"]
     interactive: true

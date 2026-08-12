@@ -23,6 +23,7 @@ import (
 	"github.com/alertint/alertint-agent/internal/config"
 	"github.com/alertint/alertint-agent/internal/correlator"
 	"github.com/alertint/alertint-agent/internal/ingress"
+	"github.com/alertint/alertint-agent/internal/logging"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/skills/acutetriage"
 )
@@ -47,7 +48,9 @@ type drillOpts struct {
 	target          string
 	scenario        string
 	result          string
+	colorMode       string
 	yes             bool
+	fresh           bool
 	allowInsecure   bool
 	resolve         bool
 	resolveWait     bool
@@ -59,6 +62,7 @@ type drillCmd struct {
 	cfg    *config.Config
 	opts   drillOpts
 	stdout io.Writer
+	color  bool
 
 	http     *http.Client
 	now      func() time.Time
@@ -80,7 +84,9 @@ func runDrill(args []string, stdout, stderr io.Writer) error {
 	fs.StringVar(&opts.target, "target", "", "base URL of a remote AlertINT instance (default: the local instance from config)")
 	fs.StringVar(&opts.scenario, "scenario", "flagship", "scenario to fire: flagship | storm | db-outage")
 	fs.StringVar(&opts.result, "result", "", "skip firing; fetch and print the finding for an incident id")
+	fs.StringVar(&opts.colorMode, "color", "auto", "terminal color: auto | always | never")
 	fs.BoolVar(&opts.yes, "yes", false, "skip the remote-target confirmation prompt")
+	fs.BoolVar(&opts.fresh, "fresh", false, "always create a new drill incident; bypass recurrence collapse")
 	fs.BoolVar(&opts.resolve, "resolve", false, "after the run, re-send the burst as resolved so the drill incident closes")
 	fs.BoolVar(&opts.resolveWait, "resolve-wait", false, "with --resolve, hold the drill incident open after the payoff and resolve on Enter")
 	fs.BoolVar(&opts.allowInsecure, "allow-insecure-http", false, "allow sending bearer tokens to a plain-http remote target")
@@ -90,6 +96,10 @@ func runDrill(args []string, stdout, stderr io.Writer) error {
 	}
 	if opts.cfgPath == "" {
 		return fmt.Errorf("drill: --config is required (the same config file serve reads)")
+	}
+	color, err := resolveDrillColor(opts.colorMode, stdout)
+	if err != nil {
+		return err
 	}
 
 	// Offline load: the drill never opens the database, so the config's
@@ -103,6 +113,7 @@ func runDrill(args []string, stdout, stderr io.Writer) error {
 		cfg:    cfg,
 		opts:   opts,
 		stdout: stdout,
+		color:  color,
 		http:   &http.Client{Timeout: drillHTTPTimeout},
 		now:    func() time.Time { return time.Now().UTC() },
 		sleep: func(ctx context.Context, dur time.Duration) error {
@@ -124,6 +135,26 @@ func runDrill(args []string, stdout, stderr io.Writer) error {
 	return d.run(context.Background())
 }
 
+func resolveDrillColor(mode string, stdout io.Writer) (bool, error) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if _, disabled := os.LookupEnv("NO_COLOR"); disabled {
+		switch mode {
+		case "auto", "always", "never":
+			return false, nil
+		}
+	}
+	switch mode {
+	case "auto":
+		return logging.ColorEnabled(stdout), nil
+	case "always":
+		return true, nil
+	case "never":
+		return false, nil
+	default:
+		return false, fmt.Errorf("drill: --color must be auto, always, or never (got %q)", mode)
+	}
+}
+
 func (d *drillCmd) run(ctx context.Context) error {
 	mcpEndpoint, mcpToken, mcpErr := d.mcpEndpoint()
 
@@ -134,23 +165,9 @@ func (d *drillCmd) run(ctx context.Context) error {
 		return fmt.Errorf("drill: --resolve-wait requires --resolve")
 	}
 
-	// --result: the re-check path. One fetch, one print, done. The transport
-	// guard applies here too — this path carries the MCP bearer token.
+	// --result: the re-check path. One fetch, one print, done.
 	if d.opts.result != "" {
-		if !d.cfg.MCPEnabled() {
-			return fmt.Errorf("drill: --result needs mcp enabled — set %s (mcp turns on automatically) or remove mcp.enabled: false", orDefault(d.cfg.MCP.TokenEnv, "ALERTINT_MCP_TOKEN"))
-		}
-		if mcpErr != nil {
-			return mcpErr
-		}
-		if err := d.guardInsecureTransport(mcpEndpoint); err != nil {
-			return err
-		}
-		client := newMCPOneShotClient(mcpEndpoint, mcpToken, d.http)
-		if err := client.initialize(ctx); err != nil {
-			return err
-		}
-		return d.fetchAndPrintIncident(ctx, client, d.opts.result, capHintNone, true)
+		return d.runResult(ctx, mcpEndpoint, mcpToken, mcpErr)
 	}
 
 	sc, ok := drillScenarios()[d.opts.scenario]
@@ -198,7 +215,7 @@ func (d *drillCmd) run(ctx context.Context) error {
 	groupSalt := d.newRunID()
 	fpSeed := groupSalt
 	rerunID := ""
-	if mcpAvailable {
+	if mcpAvailable && !d.opts.fresh {
 		if cands, cerr := d.fetchDrillCandidates(ctx, mcpEndpoint, mcpToken); cerr == nil {
 			w := time.Duration(d.cfg.Memory.AttachWindowMinutes) * time.Minute
 			if id, salt, ok := drillRerunSalt(cands, d.cfg.Correlator.GroupLabels, sc.key, d.now(), w); ok {
@@ -213,10 +230,16 @@ func (d *drillCmd) run(ctx context.Context) error {
 		return err
 	}
 
+	d.printPhase("fire")
+	if d.opts.fresh {
+		d.printf("%s", d.style("1;35", "fresh: bypassing prior drill recurrence — this run creates a new incident"))
+	}
 	capHint, err = d.fire(ctx, sc, run, recvBase, webhookToken, capHint)
 	if err != nil {
 		return err
 	}
+	d.printf("")
+	d.printPhase("correlate")
 
 	// Rerun payoff: the fire attaches as an occurrence on receipt — no triage,
 	// no window wait. Poll the matched incident's occurrence count instead.
@@ -249,6 +272,7 @@ func (d *drillCmd) run(ctx context.Context) error {
 			return err
 		}
 		d.printf("")
+		d.printPhase("finding")
 		d.printf("fired. mcp is not usable from here, so the finding cannot be fetched — check:")
 		if d.cfg.Notify.Slack.Enabled {
 			d.printf("  · the DRILL card in Slack channel %s", d.cfg.Notify.Slack.Channel)
@@ -264,6 +288,25 @@ func (d *drillCmd) run(ctx context.Context) error {
 	return d.maybeResolve(ctx, run, recvBase, webhookToken)
 }
 
+// runResult fetches and prints the finding for an existing incident id. The
+// transport guard applies here too — this path carries the MCP bearer token.
+func (d *drillCmd) runResult(ctx context.Context, mcpEndpoint, mcpToken string, mcpErr error) error {
+	if !d.cfg.MCPEnabled() {
+		return fmt.Errorf("drill: --result needs mcp enabled — set %s (mcp turns on automatically) or remove mcp.enabled: false", orDefault(d.cfg.MCP.TokenEnv, "ALERTINT_MCP_TOKEN"))
+	}
+	if mcpErr != nil {
+		return mcpErr
+	}
+	if err := d.guardInsecureTransport(mcpEndpoint); err != nil {
+		return err
+	}
+	client := newMCPOneShotClient(mcpEndpoint, mcpToken, d.http)
+	if err := client.initialize(ctx); err != nil {
+		return err
+	}
+	return d.fetchAndPrintIncident(ctx, client, d.opts.result, capHintNone, true)
+}
+
 // maybeResolve fires the run's burst again as resolved when --resolve is set:
 // same door, same token, same fingerprints — the instance closes the Drill
 // through the production resolution path (Slack cards update in place).
@@ -273,6 +316,8 @@ func (d *drillCmd) maybeResolve(ctx context.Context, run drillRun, recvBase, web
 	if !d.opts.resolve {
 		return nil
 	}
+	d.printf("")
+	d.printPhase("resolve")
 	if d.opts.resolveWait {
 		if err := d.pause("press Enter to resolve the drill incident… "); err != nil {
 			d.printf("note: stdin unavailable (%v) — resolving immediately", err)
@@ -286,7 +331,8 @@ func (d *drillCmd) maybeResolve(ctx context.Context, run drillRun, recvBase, web
 		}
 		return nil
 	}
-	d.printf("resolving the drill: %d resolved alerts (group %s)", len(payload.Alerts), run.expectedGroupKey)
+	d.printf("%s", d.style("1;92", fmt.Sprintf("alerts: %d resolved", len(payload.Alerts))))
+	d.printf("%s", d.style("2", "group: "+run.expectedGroupKey))
 	if err := d.postJSON(ctx, recvBase+"/webhook/alertmanager", webhookToken, payload); err != nil {
 		d.printf("warning: resolution not accepted: %v — the drill incident stays firing", err)
 	}
@@ -350,7 +396,9 @@ func (d *drillCmd) fire(ctx context.Context, sc drillScenario, run drillRun, rec
 		}
 		return capHint, nil
 	}
-	d.printf("firing %d drill alerts (scenario %s — %s; group %s)", len(run.alerts.Alerts), sc.key, sc.description, run.expectedGroupKey)
+	d.printf("%s", d.style("1", fmt.Sprintf("scenario: %s — %s", sc.key, sc.description)))
+	d.printf("%s", d.style("1;33", fmt.Sprintf("alerts: %d firing", len(run.alerts.Alerts))))
+	d.printf("%s", d.style("2", "group: "+run.expectedGroupKey))
 	if err := d.postJSON(ctx, recvBase+"/webhook/alertmanager", webhookToken, run.alerts); err != nil {
 		return capHint, fmt.Errorf("drill: firing alerts: %w", err)
 	}
@@ -570,26 +618,27 @@ func (d *drillCmd) fetchAndPrintIncident(ctx context.Context, client *mcpOneShot
 	}
 
 	d.printf("")
-	d.printf("── finding ─────────────────────────────────────────")
+	d.printPhase("finding")
 	if drill {
-		d.printf("🧪 DRILL — synthetic incident (%s=%s)", store.DrillMarkerLabel, store.DrillMarkerValue)
+		d.printf("%s", d.style("1;35", fmt.Sprintf("🧪 DRILL — synthetic incident (%s=%s)", store.DrillMarkerLabel, store.DrillMarkerValue)))
 	}
 	// LLM-derived text (and, via --result, text from ANY incident) prints to
 	// the operator's terminal — strip control characters so annotation or
 	// model output cannot smuggle escape sequences.
-	d.printf("%s", sanitizeTerm(inc.Finding.AnalysisName))
+	d.printf("%s", d.style("1", sanitizeTerm(inc.Finding.AnalysisName)))
 	d.printf("%s", sanitizeTerm(inc.Finding.OverallIssue))
 	for _, cf := range inc.Finding.CorrelationFindings {
 		d.printf("  • %s", sanitizeTerm(cf))
 	}
-	d.printf("severity: %s · confidence: %.0f%%", sanitizeTerm(inc.Finding.Severity), inc.Confidence*100)
+	d.printf("%s", d.style("1;33", fmt.Sprintf("severity: %s · confidence: %.0f%%", sanitizeTerm(inc.Finding.Severity), inc.Confidence*100)))
 	d.printCappedHint(inc.Confidence, capHint)
 	if d.cfg.Notify.Slack.Enabled {
-		d.printf("slack: the DRILL card is in %s", d.cfg.Notify.Slack.Channel)
+		d.printf("%s", d.style("36", "slack: the DRILL card is in "+d.cfg.Notify.Slack.Channel))
 	}
 	d.printf("")
-	d.printf("next: in your MCP-connected agent, run:")
-	d.printf("  investigate incident %s using alertint", inc.ID)
+	d.printPhase("investigate")
+	d.printf("in your MCP-connected agent, run:")
+	d.printf("%s", d.style("1;34", fmt.Sprintf("  investigate incident %s using alertint", inc.ID)))
 	return nil
 }
 
@@ -810,6 +859,35 @@ func (d *drillCmd) postAlertmanagerV2(ctx context.Context, payload ingress.Alert
 
 func (d *drillCmd) printf(format string, args ...any) {
 	_, _ = fmt.Fprintf(d.stdout, format+"\n", args...)
+}
+
+func (d *drillCmd) printPhase(phase string) {
+	var line, color string
+	switch phase {
+	case "fire":
+		line, color = "── fire ────────────────────────────────────────────", "33"
+	case "correlate":
+		line, color = "── correlate ───────────────────────────────────────", "36"
+	case "finding":
+		line, color = "── finding ─────────────────────────────────────────", "32"
+	case "investigate":
+		line, color = "── investigate ─────────────────────────────────────", "34"
+	case "resolve":
+		line, color = "── resolve ─────────────────────────────────────────", "92"
+	default:
+		line = "── " + phase
+	}
+	if d.color && color != "" {
+		line = "\x1b[1;" + color + "m" + line + "\x1b[0m"
+	}
+	d.printf("%s", line)
+}
+
+func (d *drillCmd) style(code, text string) string {
+	if !d.color {
+		return text
+	}
+	return "\x1b[" + code + "m" + text + "\x1b[0m"
 }
 
 func portOf(addr string) (string, error) {

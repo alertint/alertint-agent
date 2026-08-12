@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -221,6 +222,22 @@ func TestDrill_HappyPath(t *testing.T) {
 		t.Errorf("alert envelope invalid: %v %+v", err, envelope)
 	}
 	s := out.String()
+	headings := []string{
+		"── fire",
+		"── correlate",
+		"── finding",
+		"── investigate",
+	}
+	last := -1
+	for _, heading := range headings {
+		at := strings.Index(s, heading)
+		if at < 0 {
+			t.Errorf("stdout missing %q:\n%s", heading, s)
+		} else if at <= last {
+			t.Errorf("phase %q out of order:\n%s", heading, s)
+		}
+		last = at
+	}
 	for _, want := range []string{
 		"Drill checkout regression",
 		"investigate incident inc-42 using alertint",
@@ -232,6 +249,68 @@ func TestDrill_HappyPath(t *testing.T) {
 	}
 	if strings.Contains(s, "capped at 60%") {
 		t.Errorf("uncapped finding must not print the cap hint:\n%s", s)
+	}
+	if strings.Contains(s, "\x1b[") {
+		t.Errorf("captured output must stay plain in automatic color mode:\n%q", s)
+	}
+}
+
+// TestDrill_ColorPresentation: when color is enabled, the same drill payoff
+// gains semantic stage colors without changing its text content.
+func TestDrill_ColorPresentation(t *testing.T) {
+	f := newFakeInstance(t)
+	cfg := drillTestConfig(t)
+	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
+	d.color = true
+
+	groupKey := "cluster=drill-cluster-flagship-t3st01,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
+	f.listRows = []map[string]any{{"id": "inc-color", "group_key": groupKey, "status": "analyzed"}}
+	f.incident = analyzedIncident("inc-color")
+
+	if err := d.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	s := out.String()
+	for _, want := range []string{
+		"\x1b[1;33m── fire",
+		"\x1b[1;36m── correlate",
+		"\x1b[1;32m── finding",
+		"\x1b[1;34m── investigate",
+		"\x1b[1;35m🧪 DRILL",
+		"\x1b[1mDrill checkout regression",
+		"\x1b[1;34m  investigate incident inc-color using alertint",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("colored stdout missing %q:\n%q", want, s)
+		}
+	}
+}
+
+// TestDrill_ColorMode: recordings can force color, redirected/default output
+// stays plain, and the standard NO_COLOR opt-out always wins.
+func TestDrill_ColorMode(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	if err := os.Unsetenv("NO_COLOR"); err != nil {
+		t.Fatalf("unset NO_COLOR: %v", err)
+	}
+	t.Setenv("CLICOLOR_FORCE", "0")
+
+	if got, err := resolveDrillColor("auto", &bytes.Buffer{}); err != nil || got {
+		t.Fatalf("auto on redirected output = %v, %v; want false, nil", got, err)
+	}
+	if got, err := resolveDrillColor("always", &bytes.Buffer{}); err != nil || !got {
+		t.Fatalf("always = %v, %v; want true, nil", got, err)
+	}
+	if got, err := resolveDrillColor("never", os.Stdout); err != nil || got {
+		t.Fatalf("never = %v, %v; want false, nil", got, err)
+	}
+	if _, err := resolveDrillColor("rainbow", os.Stdout); err == nil || !strings.Contains(err.Error(), "auto, always, or never") {
+		t.Fatalf("invalid mode error = %v", err)
+	}
+
+	t.Setenv("NO_COLOR", "1")
+	if got, err := resolveDrillColor("always", &bytes.Buffer{}); err != nil || got {
+		t.Fatalf("NO_COLOR + always = %v, %v; want false, nil", got, err)
 	}
 }
 
@@ -807,6 +886,43 @@ func TestDrill_RerunCollapses(t *testing.T) {
 	}
 }
 
+// TestDrill_FreshBypassesRerunCollapse: --fresh ignores an eligible prior
+// drill and creates a new group immediately, while preserving the normal
+// correlation and finding flow for the new incident.
+func TestDrill_FreshBypassesRerunCollapse(t *testing.T) {
+	f := newFakeInstance(t)
+	cfg := drillTestConfig(t)
+	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship", fresh: true})
+
+	priorGroupKey := "cluster=drill-cluster-flagship-priorsalt,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
+	newGroupKey := "cluster=drill-cluster-flagship-t3st01,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
+	f.listRows = []map[string]any{
+		{
+			"id": "inc-prior", "group_key": priorGroupKey, "status": "analyzed",
+			"drill": true, "last_alert_at": "2026-07-03T11:55:00Z",
+		},
+		{"id": "inc-fresh", "group_key": newGroupKey, "status": "analyzed"},
+	}
+	f.incident = analyzedIncident("inc-fresh")
+
+	if err := d.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	s := out.String()
+	if !strings.Contains(s, "fresh: bypassing prior drill recurrence") {
+		t.Errorf("expected an explicit fresh-mode note:\n%s", s)
+	}
+	if strings.Contains(s, "reusing its group key") || strings.Contains(s, "recurred ×") {
+		t.Errorf("fresh mode must not use the recurrence path:\n%s", s)
+	}
+	if !strings.Contains(s, "waiting ~") {
+		t.Errorf("fresh mode must run a new correlation window:\n%s", s)
+	}
+	if !strings.Contains(s, newGroupKey) || strings.Contains(s, "group: "+priorGroupKey) {
+		t.Errorf("fresh mode must fire the new group key:\n%s", s)
+	}
+}
+
 // TestDrill_ResolveFlag: --resolve re-sends the burst as resolved after the
 // payoff — same fingerprints so the rows overwrite, endsAt set, payload
 // status resolved.
@@ -849,8 +965,11 @@ func TestDrill_ResolveFlag(t *testing.T) {
 			t.Errorf("alert %d fingerprint changed: %q vs %q — resolution must reuse the firing fingerprints", i, a.Fingerprint, firing.Alerts[i].Fingerprint)
 		}
 	}
-	if !strings.Contains(out.String(), "resolving the drill") {
+	if !strings.Contains(out.String(), "alerts: 4 resolved") {
 		t.Errorf("stdout missing resolution note:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "── resolve") {
+		t.Errorf("stdout missing resolution phase:\n%s", out.String())
 	}
 }
 

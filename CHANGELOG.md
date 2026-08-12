@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `alertint drill --fresh` bypasses drill recurrence reuse so repeated demos can
+  create a new incident immediately without waiting for the 30-minute attach
+  window. The normal recurrence-collapse behavior remains the default.
+- Drill terminal output now uses restrained, semantic ANSI colors on interactive
+  terminals. `--color=always` supports recordings, `--color=never` keeps output
+  plain, and `NO_COLOR` always wins.
+
 ## [0.13.1] - 2026-08-11
 
 ### Changed
