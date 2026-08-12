@@ -4,7 +4,7 @@
 |---|---|
 | [`alertmanager.yml`](alertmanager.yml) | Minimal Alertmanager receiver + route that forwards alerts to the agent's webhook with a bearer token |
 | [`rules/`](rules/) | Starter local rule pack: a known-issue rule, a correlation rule, and a baseline override. Load it with `rules.local_pack_dir` — see [`docs/rules-spec.md`](../docs/rules-spec.md) |
-| [`mcp-clients/`](mcp-clients/) | Copy-paste MCP client configs for Claude Code, Cursor, and Windsurf |
+| [`mcp-clients/`](mcp-clients/) | Copy-paste MCP client setup for Claude Code, Codex, Cursor, and Windsurf |
 | [`../docker/docker-compose.yaml`](../docker/docker-compose.yaml) | Full local stack: Alertmanager + Prometheus + AlertINT agent, wired together — the quickstart path |
 
 ## Using the example rule pack

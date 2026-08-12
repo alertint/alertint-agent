@@ -19,7 +19,7 @@ real alerts is the last step — the drill needs nothing but the agent.
 - An LLM: an [Anthropic API key](https://console.anthropic.com), **or** a
   self-hosted OpenAI-compatible endpoint (SGLang, vLLM, Ollama, LM Studio) —
   see [OpenAI-compatible endpoint](../integrations/openai-compatible.md)
-- An MCP client such as Claude Code, Cursor, or Windsurf
+- An MCP client such as Claude Code, Codex, Cursor, or Windsurf
 
 ## 1. Run the agent
 
@@ -117,12 +117,18 @@ The drill ships three scenarios, selected with `--scenario`:
 - `storm` — debug logging left enabled fleet-wide fills every node's disk:
   fourteen near-identical alerts collapsed into a single incident.
 
+By default, repeating the same scenario inside the recurrence window attaches
+to the existing drill incident and demonstrates `recurred ×N`. Add `--fresh`
+when every audience should see a brand-new incident immediately. Terminal color
+is automatic; use `--color=always` when recording through a non-TTY capture tool,
+or `--color=never`/`NO_COLOR` for plain output.
+
 ## 3. Connect an MCP client
 
 **AlertINT** serves MCP over HTTP on port 9912; clients authenticate with
-`ALERTINT_MCP_TOKEN`. Copy-paste configs for Claude Code, Cursor, and
-Windsurf are in [MCP clients](../integrations/mcp-clients.md). Then verify
-with the command the drill printed:
+`ALERTINT_MCP_TOKEN`. Copy-paste setup for Claude Code, Codex, Cursor, and
+Windsurf is in [MCP clients](../integrations/mcp-clients.md). Then verify with
+the command the drill printed:
 
 > investigate incident `<id>` using alertint
 

@@ -9,6 +9,13 @@ Auth: Bearer token — the value of the env var named in `mcp.token_env` (defaul
 
 ## Claude Code
 
+Add it from the shell (user scope makes it available in every project):
+
+```bash
+export ALERTINT_MCP_TOKEN="<your-token>"
+claude mcp add --transport http --scope user alertint http://localhost:9912/mcp --header "Authorization: Bearer ${ALERTINT_MCP_TOKEN}"
+```
+
 **Project-level** — create or merge `.mcp.json` at your project root:
 
 ```json
@@ -34,6 +41,34 @@ What alertint tools are available?
 ```
 
 See [`claude-code.json`](claude-code.json) for the copy-paste file.
+
+---
+
+## Codex
+
+Codex can add the Streamable HTTP server directly. Keep the token exported in
+the environment from which you start Codex; the saved configuration contains
+only the environment-variable name:
+
+```bash
+export ALERTINT_MCP_TOKEN="<your-token>"
+codex mcp add alertint --url http://localhost:9912/mcp --bearer-token-env-var ALERTINT_MCP_TOKEN
+```
+
+Verify with `codex mcp get alertint`. The Codex CLI, IDE extension, and desktop
+app share this MCP configuration.
+
+Alternatively, merge this into `~/.codex/config.toml` for global access, or
+`.codex/config.toml` in a trusted project for project-only access:
+
+```toml
+[mcp_servers.alertint]
+url = "http://localhost:9912/mcp"
+bearer_token_env_var = "ALERTINT_MCP_TOKEN"
+```
+
+See [`codex.toml`](codex.toml) for the copy-paste file. Keep the token value in
+the environment rather than writing it into `config.toml`.
 
 ---
 
