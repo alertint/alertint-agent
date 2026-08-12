@@ -1,0 +1,3 @@
+[mcp_servers.alertint]
+url = "http://localhost:9912/mcp"
+bearer_token_env_var = "ALERTINT_MCP_TOKEN"

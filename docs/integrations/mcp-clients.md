@@ -1,6 +1,6 @@
 ---
 title: "MCP clients"
-description: "Query AlertINT findings from Claude and other MCP clients."
+description: "Query AlertINT findings from Claude Code, Codex, and other MCP clients."
 section: "Integrations"
 order: 5
 slug: "mcp-clients"
@@ -34,8 +34,17 @@ Copy-paste versions of the configs below also ship in the repo under
 
 ## Claude Code
 
-Create `.mcp.json` at your project root (or merge into `~/.claude.json`
-for global access), then reload with `/mcp`:
+Export the token, then add **AlertINT** from the shell. `--scope user` makes it
+available in every project; use `--scope local` to keep it private to the
+current project instead:
+
+```bash
+export ALERTINT_MCP_TOKEN="<your-token>"
+claude mcp add --transport http --scope user alertint http://localhost:9912/mcp --header "Authorization: Bearer ${ALERTINT_MCP_TOKEN}"
+```
+
+Alternatively, create `.mcp.json` at your project root (or merge into
+`~/.claude.json` for global access), then reload with `/mcp`:
 
 ```json
 {
@@ -50,6 +59,36 @@ for global access), then reload with `/mcp`:
   }
 }
 ```
+
+## Codex
+
+Export the token in the environment from which you start Codex, then add the
+Streamable HTTP server. Codex stores the environment-variable name, not the
+token itself, in its shared MCP configuration:
+
+```bash
+export ALERTINT_MCP_TOKEN="<your-token>"
+codex mcp add alertint --url http://localhost:9912/mcp --bearer-token-env-var ALERTINT_MCP_TOKEN
+```
+
+Run `codex mcp get alertint` to inspect the saved entry or `codex mcp list` to
+list all configured servers. The Codex CLI, IDE extension, and desktop app use
+the same MCP configuration.
+
+Alternatively, merge this into `~/.codex/config.toml` for global access, or
+`.codex/config.toml` in a trusted project for project-only access:
+
+```toml
+[mcp_servers.alertint]
+url = "http://localhost:9912/mcp"
+bearer_token_env_var = "ALERTINT_MCP_TOKEN"
+```
+
+The token itself still belongs in the `ALERTINT_MCP_TOKEN` environment
+variable; do not put its value in `config.toml`.
+
+For a hosted **AlertINT** instance, replace `http://localhost:9912/mcp` in the
+command or configuration with its HTTPS MCP endpoint.
 
 ## Cursor
 

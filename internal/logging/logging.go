@@ -118,6 +118,12 @@ func colorEnabled(w io.Writer, isTTY func(io.Writer) bool) bool {
 	return isTTY(w)
 }
 
+// ColorEnabled reports whether human-facing terminal output should use ANSI
+// color, following the same NO_COLOR, CLICOLOR_FORCE, and TTY rules as logs.
+func ColorEnabled(w io.Writer) bool {
+	return colorEnabled(w, nil)
+}
+
 // forceColor reports whether CLICOLOR_FORCE requests color regardless of TTY
 // detection (the companion to NO_COLOR; see https://bixense.com/clicolors).
 // Any value other than unset / "" / "0" / "false" enables it.
