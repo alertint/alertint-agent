@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Build toolchain bumped to Go 1.26.6: govulncheck flags five stdlib
+  vulnerabilities in 1.26.5 with reachable call paths in the agent (net/http,
+  encoding/asn1 via TLS). Rebuild-only — no source changes.
+
 ## [0.13.2] - 2026-08-18
 
 ### Added
