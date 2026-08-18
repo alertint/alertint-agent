@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminals. `--color=always` supports recordings, `--color=never` keeps output
   plain, and `NO_COLOR` always wins.
 
+### Fixed
+
+- Hosted OpenAI triage: the `openai-compatible` client no longer sends
+  `chat_template_kwargs` when `llm.base_url` points at `api.openai.com`, which
+  rejects unknown request arguments with HTTP 400 — every triage failed before
+  the first token. Self-hosted runtimes (SGLang, vLLM, Ollama, LM Studio) keep
+  the `enable_thinking` pin unchanged.
+
 ## [0.13.1] - 2026-08-11
 
 ### Changed

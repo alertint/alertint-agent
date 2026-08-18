@@ -11,7 +11,9 @@
 //     usage fields are always zero (SGLang/vLLM prefix-cache server-side).
 //   - Reasoning defense: a reasoning_content sibling field is never read,
 //     one leading <think>…</think> block is stripped, and every request
-//     pins chat_template_kwargs {"enable_thinking": <cfg.Thinking>}.
+//     pins chat_template_kwargs {"enable_thinking": <cfg.Thinking>} — except
+//     against hosted OpenAI (api.openai.com), which rejects the field as an
+//     unrecognized request argument; the leading-<think> strip still applies.
 //   - Retries: 429 plus any 5xx (local runtimes signal transient overload /
 //     loading / respawn with generic 500/503, unlike Anthropic's 529).
 package openaicompat
@@ -25,6 +27,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 	"unicode"
@@ -92,6 +95,10 @@ type Client struct {
 	logger   *slog.Logger
 	now      func() time.Time
 	endpoint string
+	// pinChatTemplateKwargs sends the enable_thinking pin. Off for hosted
+	// OpenAI, which 400s on the unrecognized field; its models have no
+	// chat-template thinking toggle to pin anyway.
+	pinChatTemplateKwargs bool
 }
 
 // New constructs a Client. auditor and logger may be nil (no-ops).
@@ -107,7 +114,20 @@ func New(cfg Config, auditor *audit.Auditor, logger *slog.Logger) *Client {
 		logger:   logger,
 		now:      func() time.Time { return time.Now().UTC() },
 		endpoint: cfg.BaseURL + "/v1/chat/completions",
+
+		pinChatTemplateKwargs: !isHostedOpenAI(cfg.BaseURL),
 	}
+}
+
+// isHostedOpenAI reports whether baseURL points at the hosted OpenAI API.
+// BaseURL arrives normalized by internal/config (scheme + host, no trailing
+// slash or /v1), so a parse failure just means "not hosted OpenAI".
+func isHostedOpenAI(baseURL string) bool {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Hostname(), "api.openai.com")
 }
 
 // Complete sends systemPrompt + prompt and returns a llm.Completion whose Raw
@@ -172,7 +192,7 @@ type chatRequest struct {
 	MaxTokens          int             `json:"max_tokens"`
 	Messages           []chatMessage   `json:"messages"`
 	ResponseFormat     *responseFormat `json:"response_format,omitempty"`
-	ChatTemplateKwargs map[string]any  `json:"chat_template_kwargs"`
+	ChatTemplateKwargs map[string]any  `json:"chat_template_kwargs,omitempty"`
 }
 
 type chatMessage struct {
@@ -227,7 +247,9 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt
 			{Role: "system", Content: system},
 			{Role: "user", Content: prompt.Text()},
 		},
-		ChatTemplateKwargs: map[string]any{"enable_thinking": c.cfg.Thinking},
+	}
+	if c.pinChatTemplateKwargs {
+		body.ChatTemplateKwargs = map[string]any{"enable_thinking": c.cfg.Thinking}
 	}
 	if c.cfg.ResponseFormat != "off" {
 		body.ResponseFormat = &responseFormat{Type: "json_object"}
