@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-08-18
+
 ### Added
 
 - `alertint drill --fresh` bypasses drill recurrence reuse so repeated demos can
@@ -664,7 +666,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single static binary** — pure-Go SQLite (no CGO), no external runtime dependencies.
   Multi-platform builds: `linux/amd64`, `linux/arm64`, `darwin/arm64`.
 
-[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.13.1...HEAD
+[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.13.2...HEAD
+[0.13.2]: https://github.com/alertint/alertint-agent/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/alertint/alertint-agent/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/alertint/alertint-agent/compare/v0.12.1...v0.13.0
 [0.12.1]: https://github.com/alertint/alertint-agent/compare/v0.12.0...v0.12.1
