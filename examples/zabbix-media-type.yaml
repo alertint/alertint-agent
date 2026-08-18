@@ -4,20 +4,103 @@ zabbix_export:
     - name: AlertINT
       type: WEBHOOK
       description: 'Forwards problem/resolution events to an AlertINT agent (https://alertint.com/docs/integrations/zabbix). After import, set the url and token parameters for your install.'
+      # One parameter per payload field, assembled with JSON.stringify in the
+      # script — never a hand-written JSON payload string. Macro values may
+      # contain double quotes (quoted item-key parameters are common on DB
+      # monitoring items) and only script-side serialization escapes them.
       parameters:
-        - name: payload
-          value: '{"event_id":"{EVENT.ID}","status":"{EVENT.STATUS}","severity":"{EVENT.SEVERITY}","nseverity":"{EVENT.NSEVERITY}","host":"{HOST.HOST}","host_visible":"{HOST.NAME}","trigger_id":"{TRIGGER.ID}","trigger_name":"{TRIGGER.NAME}","item_key":"{ITEM.KEY}","item_value":"{ITEM.VALUE}","tags":{EVENT.TAGSJSON},"clock":"{EVENT.DATE} {EVENT.TIME}","recovery_clock":"{EVENT.RECOVERY.DATE} {EVENT.RECOVERY.TIME}","generator_url":"{$ZABBIX_URL}/tr_events.php?triggerid={TRIGGER.ID}&eventid={EVENT.ID}"}'
+        - name: clock
+          value: '{EVENT.DATE} {EVENT.TIME}'
+        - name: event_id
+          value: '{EVENT.ID}'
+        - name: generator_url
+          value: '{$ZABBIX_URL}/tr_events.php?triggerid={TRIGGER.ID}&eventid={EVENT.ID}'
+        - name: host
+          value: '{HOST.HOST}'
+        - name: host_visible
+          value: '{HOST.NAME}'
+        - name: item_key
+          value: '{ITEM.KEY}'
+        - name: item_value
+          value: '{ITEM.VALUE}'
+        - name: nseverity
+          value: '{EVENT.NSEVERITY}'
+        - name: recovery_clock
+          value: '{EVENT.RECOVERY.DATE} {EVENT.RECOVERY.TIME}'
+        - name: severity
+          value: '{EVENT.SEVERITY}'
+        - name: status
+          value: '{EVENT.STATUS}'
+        - name: tags
+          value: '{EVENT.TAGSJSON}'
         - name: token
           value: 'REPLACE-WITH-YOUR-ALERTINT_ZABBIX_WEBHOOK_TOKEN'
+        - name: trigger_id
+          value: '{TRIGGER.ID}'
+        - name: trigger_name
+          value: '{TRIGGER.NAME}'
         - name: url
           value: 'http://REPLACE-ALERTINT-HOST:9911/webhook/zabbix'
       script: |
         var params = JSON.parse(value);
+
+        var tags = [];
+        try {
+            tags = JSON.parse(params.tags);
+        } catch (e) {
+            tags = [];
+        }
+
+        var payload = {
+            event_id: params.event_id,
+            status: params.status,
+            severity: params.severity,
+            nseverity: params.nseverity,
+            host: params.host,
+            host_visible: params.host_visible,
+            trigger_id: params.trigger_id,
+            trigger_name: params.trigger_name,
+            item_key: params.item_key,
+            item_value: params.item_value,
+            tags: tags,
+            clock: params.clock,
+            recovery_clock: params.recovery_clock,
+            generator_url: params.generator_url
+        };
+
         var req = new HttpRequest();
         req.addHeader('Content-Type: application/json');
         req.addHeader('Authorization: Bearer ' + params.token);
-        var resp = req.post(params.url, params.payload);
+        var resp = req.post(params.url, JSON.stringify(payload));
         if (req.getStatus() >= 300) {
             throw 'alertint replied ' + req.getStatus() + ': ' + resp;
         }
         return 'OK';
+      # The webhook script never reads these — the parameters above are the
+      # wire contract — but Zabbix refuses to send ("No message defined for
+      # media type") when the operation has no custom message and no message
+      # template exists for the event type. Present so sending works out of
+      # the box; the content is Zabbix's stock default.
+      message_templates:
+        - event_source: TRIGGERS
+          operation_mode: PROBLEM
+          subject: 'Problem: {EVENT.NAME}'
+          message: |
+            Problem started at {EVENT.TIME} on {EVENT.DATE}
+            Problem name: {EVENT.NAME}
+            Host: {HOST.NAME}
+            Severity: {EVENT.SEVERITY}
+            Operational data: {EVENT.OPDATA}
+            Original problem ID: {EVENT.ID}
+            {TRIGGER.URL}
+        - event_source: TRIGGERS
+          operation_mode: RECOVERY
+          subject: 'Resolved in {EVENT.DURATION}: {EVENT.NAME}'
+          message: |
+            Problem has been resolved at {EVENT.RECOVERY.TIME} on {EVENT.RECOVERY.DATE}
+            Problem name: {EVENT.NAME}
+            Problem duration: {EVENT.DURATION}
+            Host: {HOST.NAME}
+            Severity: {EVENT.SEVERITY}
+            Original problem ID: {EVENT.ID}
+            {TRIGGER.URL}

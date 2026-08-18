@@ -54,34 +54,82 @@ is this media type as a Zabbix 7.0 import file — **Alerts → Media types →
 Import**, then set the `url` and `token` parameters for your install.
 
 Create **Alerts → Media types → Create media type**, type **Webhook**, with
-parameters:
+one parameter per payload field — the JSON body is assembled inside the
+script, never hand-written in a parameter:
 
 | Parameter | Value |
 |---|---|
 | `url` | `http://<alertint-host>:9911/webhook/zabbix` |
 | `token` | `<the value of ALERTINT_ZABBIX_WEBHOOK_TOKEN>` |
-| `payload` | `{"event_id":"{EVENT.ID}","status":"{EVENT.STATUS}","severity":"{EVENT.SEVERITY}","nseverity":"{EVENT.NSEVERITY}","host":"{HOST.HOST}","host_visible":"{HOST.NAME}","trigger_id":"{TRIGGER.ID}","trigger_name":"{TRIGGER.NAME}","item_key":"{ITEM.KEY}","item_value":"{ITEM.VALUE}","tags":{EVENT.TAGSJSON},"clock":"{EVENT.DATE} {EVENT.TIME}","recovery_clock":"{EVENT.RECOVERY.DATE} {EVENT.RECOVERY.TIME}","generator_url":"{$ZABBIX_URL}/tr_events.php?triggerid={TRIGGER.ID}&eventid={EVENT.ID}"}` |
+| `event_id` | `{EVENT.ID}` |
+| `status` | `{EVENT.STATUS}` |
+| `severity` | `{EVENT.SEVERITY}` |
+| `nseverity` | `{EVENT.NSEVERITY}` |
+| `host` | `{HOST.HOST}` |
+| `host_visible` | `{HOST.NAME}` |
+| `trigger_id` | `{TRIGGER.ID}` |
+| `trigger_name` | `{TRIGGER.NAME}` |
+| `item_key` | `{ITEM.KEY}` |
+| `item_value` | `{ITEM.VALUE}` |
+| `tags` | `{EVENT.TAGSJSON}` |
+| `clock` | `{EVENT.DATE} {EVENT.TIME}` |
+| `recovery_clock` | `{EVENT.RECOVERY.DATE} {EVENT.RECOVERY.TIME}` |
+| `generator_url` | `{$ZABBIX_URL}/tr_events.php?triggerid={TRIGGER.ID}&eventid={EVENT.ID}` |
 
 Script:
 
 ```javascript
 var params = JSON.parse(value);
+
+var tags = [];
+try {
+    tags = JSON.parse(params.tags);
+} catch (e) {
+    tags = [];
+}
+
+var payload = {
+    event_id: params.event_id,
+    status: params.status,
+    severity: params.severity,
+    nseverity: params.nseverity,
+    host: params.host,
+    host_visible: params.host_visible,
+    trigger_id: params.trigger_id,
+    trigger_name: params.trigger_name,
+    item_key: params.item_key,
+    item_value: params.item_value,
+    tags: tags,
+    clock: params.clock,
+    recovery_clock: params.recovery_clock,
+    generator_url: params.generator_url
+};
+
 var req = new HttpRequest();
 req.addHeader('Content-Type: application/json');
 req.addHeader('Authorization: Bearer ' + params.token);
-var resp = req.post(params.url, params.payload);
+var resp = req.post(params.url, JSON.stringify(payload));
 if (req.getStatus() >= 300) {
     throw 'alertint replied ' + req.getStatus() + ': ' + resp;
 }
 return 'OK';
 ```
 
-Two setup subtleties:
+Three setup subtleties:
 
-- **`{EVENT.TAGSJSON}` must appear unquoted** in the `payload` parameter,
-  exactly as shown above. Zabbix macro expansion runs before the script does,
-  and `{EVENT.TAGSJSON}` already expands to a JSON array (`[]` if the trigger
-  has no tags) — quoting it would turn a JSON array into a JSON string.
+- **One macro per parameter is load-bearing, not style.** Macro values can
+  contain double quotes — quoted item-key parameters are routine on DB
+  monitoring items (`db.odbc.select[locks,"mydb"]`) — and a hand-written JSON
+  payload string breaks on the first one (the agent replies
+  `400: zabbix: invalid JSON`). Zabbix escapes parameter values correctly
+  when handing them to the script, and `JSON.stringify` escapes them on the
+  way out; nothing else does.
+- **A message template must exist** (Message templates tab → add *Problem*
+  and *Problem recovery*, default content is fine — the import file above
+  already includes them). The webhook script never reads the message, but
+  Zabbix refuses to send at all — the action log shows *"No message defined
+  for media type"* — when the operation has no custom message and the media
+  type has no template for the event type.
 - **`{$ZABBIX_URL}`** is a user macro you define yourself (**Data collection →
   Macros**, or globally under **Users → API tokens** settings), holding your
   Zabbix frontend's base URL. It's only used to build `generator_url`, a

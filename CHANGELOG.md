@@ -23,6 +23,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejects unknown request arguments with HTTP 400 — every triage failed before
   the first token. Self-hosted runtimes (SGLang, vLLM, Ollama, LM Studio) keep
   the `enable_thinking` pin unchanged.
+- Zabbix media type: the webhook payload is now assembled in the script with
+  `JSON.stringify` from one parameter per field, instead of a hand-written JSON
+  payload string. Macro values containing double quotes — routine on DB
+  monitoring item keys like `db.odbc.select[locks,"mydb"]` — broke the old
+  payload and the agent answered `400: zabbix: invalid JSON`. Re-import
+  `examples/zabbix-media-type.yaml` to pick up the fix.
+- Zabbix media type: the import file now ships *Problem* and *Problem
+  recovery* message templates. Without them Zabbix refuses to send at all
+  ("No message defined for media type") when the trigger-action operation has
+  no custom message, even though the webhook script never reads the message.
 
 ## [0.13.1] - 2026-08-11
 
