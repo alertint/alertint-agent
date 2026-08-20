@@ -6,23 +6,12 @@ import (
 	"context"
 	"testing"
 	"time"
-
-	"github.com/alertint/alertint-agent/internal/correlator"
 )
 
-func TestAlertmanagerReceiverToIncidentUsesEnvelopeGrouping(t *testing.T) {
+func TestAlertmanagerReceiverQueuesEnvelopeGroupedDeliveries(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
-	c := correlator.New(correlator.Config{
-		WindowSeconds: 60,
-		TickInterval:  20 * time.Millisecond,
-	}, st, correlator.NopIncidentSink{}, nil)
-	if err := c.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-	defer c.Stop()
-
-	r := NewAlertReceiver(st, "token", c.Accept, nil)
+	r := NewAlertReceiver(st, "token", nil, nil)
 	now := time.Now().UTC()
 	payload := AlertmanagerPayload{
 		Version:     "4",
@@ -47,23 +36,18 @@ func TestAlertmanagerReceiverToIncidentUsesEnvelopeGrouping(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		incs, err := st.ListCollectingIncidents(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(incs) == 1 && incs[0].AlertCount == 2 {
-			if got, want := incs[0].GroupKey, "tenant=acme,workload=checkout"; got != want {
-				t.Fatalf("Incident group key = %q, want %q", got, want)
-			}
-			if incs[0].GroupKey == "" {
-				t.Fatal("Incident group key must not be empty")
-			}
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+	var pending int
+	if err := st.DB().QueryRow(`SELECT COUNT(*) FROM alert_delivery_dispatches WHERE status='pending'`).Scan(&pending); err != nil {
+		t.Fatal(err)
 	}
-	incs, _ := st.ListCollectingIncidents(ctx)
-	t.Fatalf("Receiver-to-Incident grouping did not converge: %+v", incs)
+	if pending != 2 {
+		t.Fatalf("pending dispatches = %d, want 2", pending)
+	}
+	var identities int
+	if err := st.DB().QueryRow(`SELECT COUNT(DISTINCT receiver_grouping_identity) FROM alert_deliveries`).Scan(&identities); err != nil {
+		t.Fatal(err)
+	}
+	if identities != 1 {
+		t.Fatalf("distinct grouping identities = %d, want 1", identities)
+	}
 }

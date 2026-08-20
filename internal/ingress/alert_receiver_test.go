@@ -12,11 +12,7 @@ import (
 
 func TestAlertmanagerReceiverHandsOffSortedGroupLabelsIdentity(t *testing.T) {
 	st := newTestStore(t)
-	var sunk []store.Alert
-	r := NewAlertReceiver(st, "token", func(_ context.Context, a store.Alert) error {
-		sunk = append(sunk, a)
-		return nil
-	}, nil)
+	r := NewAlertReceiver(st, "token", nil, nil)
 
 	payload := AlertmanagerPayload{
 		Version:     "4",
@@ -33,21 +29,14 @@ func TestAlertmanagerReceiverHandsOffSortedGroupLabelsIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(sunk) != 1 {
-		t.Fatalf("sink calls = %d, want 1", len(sunk))
-	}
-	if got, want := sunk[0].ReceiverGroupingIdentity, "team=payments,zone=west"; got != want {
+	if got, want := deliveryGroupingIdentity(t, st, "fp-sorted"), "team=payments,zone=west"; got != want {
 		t.Fatalf("ReceiverGroupingIdentity = %q, want %q", got, want)
 	}
 }
 
 func TestAlertmanagerReceiverFallsBackToAlertnameIdentity(t *testing.T) {
 	st := newTestStore(t)
-	var sunk store.Alert
-	r := NewAlertReceiver(st, "token", func(_ context.Context, a store.Alert) error {
-		sunk = a
-		return nil
-	}, nil)
+	r := NewAlertReceiver(st, "token", nil, nil)
 
 	payload := AlertmanagerPayload{
 		Version: "4",
@@ -63,18 +52,14 @@ func TestAlertmanagerReceiverFallsBackToAlertnameIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got, want := sunk.ReceiverGroupingIdentity, "alertname=HighLatency"; got != want {
+	if got, want := deliveryGroupingIdentity(t, st, "fp-alertname"), "alertname=HighLatency"; got != want {
 		t.Fatalf("ReceiverGroupingIdentity = %q, want %q", got, want)
 	}
 }
 
 func TestAlertmanagerReceiverFallsBackToFingerprintIdentity(t *testing.T) {
 	st := newTestStore(t)
-	var sunk store.Alert
-	r := NewAlertReceiver(st, "token", func(_ context.Context, a store.Alert) error {
-		sunk = a
-		return nil
-	}, nil)
+	r := NewAlertReceiver(st, "token", nil, nil)
 
 	payload := AlertmanagerPayload{
 		Version: "4",
@@ -90,18 +75,14 @@ func TestAlertmanagerReceiverFallsBackToFingerprintIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got, want := sunk.ReceiverGroupingIdentity, "fingerprint=fp-only"; got != want {
+	if got, want := deliveryGroupingIdentity(t, st, "fp-only"), "fingerprint=fp-only"; got != want {
 		t.Fatalf("ReceiverGroupingIdentity = %q, want %q", got, want)
 	}
 }
 
 func TestAlertmanagerReceiverFiringAndResolvedShareIdentity(t *testing.T) {
 	st := newTestStore(t)
-	var sunk []store.Alert
-	r := NewAlertReceiver(st, "token", func(_ context.Context, a store.Alert) error {
-		sunk = append(sunk, a)
-		return nil
-	}, nil)
+	r := NewAlertReceiver(st, "token", nil, nil)
 
 	payload := AlertmanagerPayload{
 		Version:     "4",
@@ -124,10 +105,20 @@ func TestAlertmanagerReceiverFiringAndResolvedShareIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(sunk) != 2 {
-		t.Fatalf("sink calls = %d, want 2", len(sunk))
+	if got, want := deliveryGroupingIdentity(t, st, "fp-resolution"), "team=payments"; got != want {
+		t.Fatalf("ReceiverGroupingIdentity = %q, want %q", got, want)
 	}
-	if sunk[0].ReceiverGroupingIdentity != sunk[1].ReceiverGroupingIdentity {
-		t.Fatalf("firing identity %q differs from resolved identity %q", sunk[0].ReceiverGroupingIdentity, sunk[1].ReceiverGroupingIdentity)
+}
+
+func deliveryGroupingIdentity(t *testing.T, st *store.Store, fingerprint string) string {
+	t.Helper()
+	var got string
+	if err := st.DB().QueryRow(`
+		SELECT d.receiver_grouping_identity
+		FROM alert_deliveries d JOIN alerts a ON a.id = d.alert_id
+		WHERE a.fingerprint = ? ORDER BY d.received_at DESC LIMIT 1
+	`, fingerprint).Scan(&got); err != nil {
+		t.Fatalf("delivery grouping identity: %v", err)
 	}
+	return got
 }

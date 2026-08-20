@@ -91,9 +91,7 @@ func TestParseZabbix_EmptyTagsTolerated(t *testing.T) {
 
 func TestZabbixReceiver_MapsProblemToFiringAlert(t *testing.T) {
 	st := newTestStore(t)
-	var sunk []store.Alert
-	sink := func(ctx context.Context, a store.Alert) error { sunk = append(sunk, a); return nil }
-	r := NewZabbixReceiver(st, "tok", sink, slog.Default())
+	r := NewZabbixReceiver(st, "tok", nil, slog.Default())
 
 	if r.Route() != "POST /webhook/zabbix" || r.Name() != "zabbix" {
 		t.Fatalf("identity: route=%q name=%q", r.Route(), r.Name())
@@ -111,10 +109,10 @@ func TestZabbixReceiver_MapsProblemToFiringAlert(t *testing.T) {
 	if sum.Kind != "alert.received" {
 		t.Fatalf("audit kind: %q", sum.Kind)
 	}
-	if len(sunk) != 1 {
-		t.Fatalf("sink calls: %d", len(sunk))
+	a, err := st.GetAlertByFingerprint(context.Background(), "zabbix:9134")
+	if err != nil {
+		t.Fatal(err)
 	}
-	a := sunk[0]
 	if a.Fingerprint != "zabbix:9134" {
 		t.Fatalf("fingerprint: %q", a.Fingerprint)
 	}
@@ -158,11 +156,7 @@ func TestZabbixReceiver_MapsProblemToFiringAlert(t *testing.T) {
 
 func TestZabbixReceiverHandsOffPerHostIdentityAcrossResolution(t *testing.T) {
 	st := newTestStore(t)
-	var sunk []store.Alert
-	r := NewZabbixReceiver(st, "tok", func(_ context.Context, a store.Alert) error {
-		sunk = append(sunk, a)
-		return nil
-	}, slog.Default())
+	r := NewZabbixReceiver(st, "tok", nil, slog.Default())
 
 	bodies := [][]byte{
 		[]byte(`{"event_id":"77","status":"PROBLEM","severity":"Warning","nseverity":"2","host":"db01","trigger_name":"Disk low"}`),
@@ -175,16 +169,10 @@ func TestZabbixReceiverHandsOffPerHostIdentityAcrossResolution(t *testing.T) {
 		}
 	}
 
-	if len(sunk) != 3 {
-		t.Fatalf("sink calls = %d, want 3", len(sunk))
-	}
-	if got := sunk[0].ReceiverGroupingIdentity; got != "host=db01" {
+	if got := zabbixGroupingIdentity(t, st, "zabbix:77"); got != "host=db01" {
 		t.Fatalf("problem identity = %q, want host=db01", got)
 	}
-	if got := sunk[1].ReceiverGroupingIdentity; got != sunk[0].ReceiverGroupingIdentity {
-		t.Fatalf("resolved identity = %q, want firing identity %q", got, sunk[0].ReceiverGroupingIdentity)
-	}
-	if got := sunk[2].ReceiverGroupingIdentity; got != "host=db02" || got == sunk[0].ReceiverGroupingIdentity {
+	if got := zabbixGroupingIdentity(t, st, "zabbix:78"); got != "host=db02" {
 		t.Fatalf("second host identity = %q, want distinct host=db02", got)
 	}
 }
@@ -220,14 +208,15 @@ func TestZabbixReceiver_ResolvedDedupsOntoFiringRow(t *testing.T) {
 
 func TestZabbixReceiver_NSeverityFallbackForRenamedSeverity(t *testing.T) {
 	st := newTestStore(t)
-	var sunk []store.Alert
-	sink := func(ctx context.Context, a store.Alert) error { sunk = append(sunk, a); return nil }
-	r := NewZabbixReceiver(st, "tok", sink, slog.Default())
+	r := NewZabbixReceiver(st, "tok", nil, slog.Default())
 	body := []byte(`{"event_id":"88","status":"PROBLEM","severity":"P1","nseverity":"5","host":"h1","trigger_id":"5","trigger_name":"T"}`)
 	if _, err := r.Ingest(context.Background(), body); err != nil {
 		t.Fatal(err)
 	}
-	a := sunk[0]
+	a, err := st.GetAlertByFingerprint(context.Background(), "zabbix:88")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if a.Labels["severity"] != "disaster" {
 		t.Fatalf("renamed severity must canonicalise via nseverity: got %q want disaster", a.Labels["severity"])
 	}
@@ -238,14 +227,15 @@ func TestZabbixReceiver_NSeverityFallbackForRenamedSeverity(t *testing.T) {
 
 func TestZabbixReceiver_UnrecognizedSeverityWithNoNSeverityFallback(t *testing.T) {
 	st := newTestStore(t)
-	var sunk []store.Alert
-	sink := func(ctx context.Context, a store.Alert) error { sunk = append(sunk, a); return nil }
-	r := NewZabbixReceiver(st, "tok", sink, slog.Default())
+	r := NewZabbixReceiver(st, "tok", nil, slog.Default())
 	body := []byte(`{"event_id":"99","status":"PROBLEM","severity":"Not classified","nseverity":"0","host":"h1","trigger_id":"5","trigger_name":"T"}`)
 	if _, err := r.Ingest(context.Background(), body); err != nil {
 		t.Fatal(err)
 	}
-	a := sunk[0]
+	a, err := st.GetAlertByFingerprint(context.Background(), "zabbix:99")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if a.Labels["severity"] != "Not classified" {
 		t.Fatalf("an unrecognized name with no valid nseverity fallback must stay verbatim: got %q", a.Labels["severity"])
 	}
@@ -256,18 +246,32 @@ func TestZabbixReceiver_UnrecognizedSeverityWithNoNSeverityFallback(t *testing.T
 
 func TestZabbixReceiver_TagCollidesWithAnotherTag(t *testing.T) {
 	st := newTestStore(t)
-	var sunk []store.Alert
-	sink := func(ctx context.Context, a store.Alert) error { sunk = append(sunk, a); return nil }
-	r := NewZabbixReceiver(st, "tok", sink, slog.Default())
+	r := NewZabbixReceiver(st, "tok", nil, slog.Default())
 	body := []byte(`{"event_id":"100","status":"PROBLEM","severity":"High","host":"h1","trigger_id":"5","trigger_name":"T",
 		"tags":[{"tag":"foo-bar","value":"first"},{"tag":"foo_bar","value":"second"}]}`)
 	if _, err := r.Ingest(context.Background(), body); err != nil {
 		t.Fatal(err)
 	}
-	a := sunk[0]
+	a, err := st.GetAlertByFingerprint(context.Background(), "zabbix:100")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if a.Labels["foo_bar"] != "first" {
 		t.Fatalf("the first tag to claim a sanitised key must win over a later colliding tag: got %q", a.Labels["foo_bar"])
 	}
+}
+
+func zabbixGroupingIdentity(t *testing.T, st *store.Store, fingerprint string) string {
+	t.Helper()
+	var got string
+	if err := st.DB().QueryRow(`
+		SELECT d.receiver_grouping_identity
+		FROM alert_deliveries d JOIN alerts a ON a.id = d.alert_id
+		WHERE a.fingerprint = ? ORDER BY d.received_at DESC LIMIT 1
+	`, fingerprint).Scan(&got); err != nil {
+		t.Fatalf("delivery grouping identity: %v", err)
+	}
+	return got
 }
 
 func TestZabbixReceiver_BadPayloadIsIngestError(t *testing.T) {

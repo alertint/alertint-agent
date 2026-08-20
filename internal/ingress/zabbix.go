@@ -16,6 +16,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/grouping"
 	"github.com/alertint/alertint-agent/internal/severity"
+	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -70,25 +71,23 @@ func ParseZabbix(body []byte) (ZabbixEvent, error) {
 	return ev, nil
 }
 
-// zabbixReceiver wraps ParseZabbix → map → persist → AlertSink/correlator,
-// mirroring alertReceiver. One webhook delivery carries one event.
+// zabbixReceiver validates and durably accepts one Zabbix event per request.
 type zabbixReceiver struct {
 	store  *store.Store
-	sink   AlertSink
 	token  []byte
 	logger *slog.Logger
 	now    func() time.Time
 	newID  func() string
 }
 
-// NewZabbixReceiver builds the Zabbix receiver. sink may be nil.
-func NewZabbixReceiver(st *store.Store, token string, sink AlertSink, logger *slog.Logger) Receiver {
+// NewZabbixReceiver builds the Zabbix receiver. sink is intentionally
+// ignored: accepted deliveries are handed off by durable workers.
+func NewZabbixReceiver(st *store.Store, token string, _ AlertSink, logger *slog.Logger) Receiver {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &zabbixReceiver{
 		store:  st,
-		sink:   sink,
 		token:  []byte(token),
 		logger: logger,
 		now:    func() time.Time { return time.Now().UTC() },
@@ -126,31 +125,33 @@ func (r *zabbixReceiver) Ingest(ctx context.Context, body []byte) (Summary, erro
 	case errors.Is(err, store.ErrNotFound):
 		// First delivery for this event_id — StartsAt is this delivery's receipt time.
 	default:
-		r.logger.Warn("zabbix: lookup existing alert failed, treating as first delivery",
-			slog.String("err", err.Error()))
+		return Summary{}, &DurabilityError{Err: fmt.Errorf("zabbix: read existing alert: %w", err)}
 	}
 
 	alert := r.toStoreAlert(ev, existingStartsAt)
-	stored, err := r.store.UpsertAlertByFingerprint(ctx, alert)
-	if err != nil {
-		// Persist failures are logged and swallowed: the host still answers 204
-		// (never-5xx), matching alertReceiver's contract.
-		r.logger.Error("upsert alert failed",
-			slog.String("fingerprint", alert.Fingerprint),
-			slog.String("err", err.Error()),
-		)
-		return Summary{Kind: "alert.received", Audit: zabbixAuditRecord(ev, false)}, nil
-	}
-	stored.ReceiverGroupingIdentity = grouping.Ensure(
-		grouping.RenderSelectedLabels(stored.Labels, []string{"host"}), stored.Labels, stored.Fingerprint,
+	identity := grouping.Ensure(
+		grouping.RenderSelectedLabels(alert.Labels, []string{"host"}), alert.Labels, alert.Fingerprint,
 	)
-	if r.sink != nil {
-		if err := r.sink(ctx, stored); err != nil {
-			r.logger.Warn("alert sink failed",
-				slog.String("fingerprint", stored.Fingerprint),
-				slog.String("err", err.Error()),
-			)
-		}
+	startedAt := alert.StartsAt
+	input := store.DeliveryInput{
+		ID:                       payloadDigest("zabbix", ev),
+		Alert:                    alert,
+		Source:                   "zabbix",
+		SourceEventID:            &ev.EventID,
+		SourceEpisodeKey:         "zabbix:" + ev.EventID,
+		SourceStartedAt:          &startedAt,
+		StartedAtBasis:           situationmodel.SourceTimeBasisReceiptFallback,
+		ResolvedAtBasis:          situationmodel.SourceTimeBasisMissing,
+		ReceiverGroupingIdentity: identity,
+		PayloadDigest:            payloadDigest("zabbix-payload", ev),
+	}
+	if alert.EndsAt != nil {
+		input.SourceResolvedAt = alert.EndsAt
+		input.ResolvedAtBasis = situationmodel.SourceTimeBasisReceiptFallback
+	}
+	_, err = r.store.AcceptDeliveries(ctx, []store.DeliveryInput{input})
+	if err != nil {
+		return Summary{}, &DurabilityError{Err: err}
 	}
 	return Summary{Kind: "alert.received", Audit: zabbixAuditRecord(ev, true)}, nil
 }

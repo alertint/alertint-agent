@@ -72,6 +72,10 @@ func (h *harness) sinkCalls() []store.Alert {
 	return out
 }
 
+func (h *harness) closeStore() {
+	_ = h.store.Close()
+}
+
 func samplePayload() AlertmanagerPayload {
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	return AlertmanagerPayload{
@@ -146,10 +150,12 @@ func TestPost_HappyPath_204_PersistsAndAudits(t *testing.T) {
 		t.Errorf("audit row count = %d, want 1", n)
 	}
 
-	// Sink received the alert.
-	calls := h.sinkCalls()
-	if len(calls) != 1 || calls[0].Fingerprint != "fp-1" {
-		t.Errorf("sink calls = %+v", calls)
+	var dispatches int
+	if err := h.store.DB().QueryRow(`SELECT COUNT(*) FROM alert_delivery_dispatches`).Scan(&dispatches); err != nil {
+		t.Fatal(err)
+	}
+	if dispatches != 1 {
+		t.Errorf("durable dispatches = %d, want 1", dispatches)
 	}
 }
 
@@ -183,8 +189,12 @@ func TestPost_MultipleAlerts_OneAuditRow_AllPersisted(t *testing.T) {
 		t.Errorf("audit rows = %d, want 1 per call", n)
 	}
 
-	if got := h.sinkCalls(); len(got) != 2 {
-		t.Errorf("sink call count = %d, want 2", len(got))
+	var dispatches int
+	if err := h.store.DB().QueryRow(`SELECT COUNT(*) FROM alert_delivery_dispatches`).Scan(&dispatches); err != nil {
+		t.Fatal(err)
+	}
+	if dispatches != 2 {
+		t.Errorf("durable dispatches = %d, want 2", dispatches)
 	}
 }
 
@@ -325,7 +335,7 @@ func TestPost_ZeroEndsAt_StoredAsNil(t *testing.T) {
 	}
 }
 
-func TestPost_InvalidAlertStatus_PartialPersistStill204(t *testing.T) {
+func TestPost_InvalidAlertStatusRejectsWholeEnvelope(t *testing.T) {
 	h := newHarness(t)
 	p := samplePayload()
 	p.Alerts = append(p.Alerts, AlertmanagerAlert{
@@ -338,19 +348,29 @@ func TestPost_InvalidAlertStatus_PartialPersistStill204(t *testing.T) {
 	body := mustMarshal(t, p)
 	resp := postPayload(t, h.server, body, nil)
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("status = %d, want 204 (partial-persist tolerated)", resp.StatusCode)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
 
-	if _, err := h.store.GetAlertByFingerprint(context.Background(), "fp-1"); err != nil {
-		t.Errorf("valid alert should be persisted: %v", err)
+	if _, err := h.store.GetAlertByFingerprint(context.Background(), "fp-1"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("valid alert must not be persisted: %v", err)
 	}
 	if _, err := h.store.GetAlertByFingerprint(context.Background(), "fp-bad"); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("invalid alert should not be persisted: %v", err)
 	}
 }
 
-func TestPost_SinkFailure_StillReturns204(t *testing.T) {
+func TestDurabilityFailureReturns503AndCommitsNothing(t *testing.T) {
+	h := newHarness(t)
+	h.closeStore()
+	resp := postPayload(t, h.server, mustMarshal(t, samplePayload()), nil)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+}
+
+func TestPost_LegacySinkIsNotCalledInline(t *testing.T) {
 	h := newHarness(t)
 	h.sinkMu.Lock()
 	h.sinkErr = errors.New("downstream blew up")
@@ -363,7 +383,10 @@ func TestPost_SinkFailure_StillReturns204(t *testing.T) {
 		t.Errorf("status = %d, want 204", resp.StatusCode)
 	}
 	if _, err := h.store.GetAlertByFingerprint(context.Background(), "fp-1"); err != nil {
-		t.Errorf("alert should be persisted even when sink fails: %v", err)
+		t.Errorf("alert should be persisted: %v", err)
+	}
+	if got := h.sinkCalls(); len(got) != 0 {
+		t.Errorf("legacy sink calls = %d, want 0", len(got))
 	}
 }
 

@@ -4,6 +4,7 @@ package ingress
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,11 +15,12 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/alertint/alertint-agent/internal/grouping"
+	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
-// AlertSink receives each alert after it has been persisted. The correlator
-// implements this; tests inject fakes. A nil sink means "skip handoff".
+// AlertSink is retained as a constructor compatibility type while correlation
+// moves to the durable alert delivery dispatch outbox.
 type AlertSink func(ctx context.Context, alert store.Alert) error
 
 // AlertmanagerPayload is the v4 webhook envelope. Fields we don't use are
@@ -59,24 +61,23 @@ func ParseAlertmanager(body []byte) (AlertmanagerPayload, error) {
 	return payload, nil
 }
 
-// alertReceiver wraps ParseAlertmanager → persist → AlertSink/correlator.
+// alertReceiver validates and durably accepts an Alertmanager envelope.
 type alertReceiver struct {
 	store  *store.Store
-	sink   AlertSink
 	token  []byte
 	logger *slog.Logger
 	now    func() time.Time
 	newID  func() string
 }
 
-// NewAlertReceiver builds the Alertmanager receiver. sink may be nil.
-func NewAlertReceiver(st *store.Store, token string, sink AlertSink, logger *slog.Logger) Receiver {
+// NewAlertReceiver builds the Alertmanager receiver. sink is intentionally
+// ignored: accepted deliveries are handed off by durable workers.
+func NewAlertReceiver(st *store.Store, token string, _ AlertSink, logger *slog.Logger) Receiver {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &alertReceiver{
 		store:  st,
-		sink:   sink,
 		token:  []byte(token),
 		logger: logger,
 		now:    func() time.Time { return time.Now().UTC() },
@@ -95,33 +96,28 @@ func (r *alertReceiver) Ingest(ctx context.Context, body []byte) (Summary, error
 	}
 
 	// One INFO line per accepted POST so a quiet-but-receiving agent is
-	// unambiguous; per-alert dedup detail stays at DEBUG in persistAlerts.
+	// unambiguous.
 	r.logger.Info("webhook received",
 		slog.Int("alerts", len(payload.Alerts)),
 		slog.String("group", payload.GroupKey),
 		slog.String("status", payload.Status),
 	)
 
-	var persisted []store.Alert
-	if len(payload.Alerts) > 0 {
-		var persistErrs []error
-		persisted, persistErrs = r.persistAlerts(ctx, payload.Alerts, payload.GroupLabels)
-		// Hand off AFTER persistence; sink errors are logged, never fail the response.
-		if r.sink != nil {
-			for _, a := range persisted {
-				if err := r.sink(ctx, a); err != nil {
-					r.logger.Warn("alert sink failed",
-						slog.String("fingerprint", a.Fingerprint),
-						slog.String("err", err.Error()),
-					)
-				}
-			}
+	inputs, err := r.deliveryInputs(payload.Alerts, payload.GroupLabels)
+	if err != nil {
+		return Summary{}, err
+	}
+	persisted := make([]store.Alert, 0, len(inputs))
+	if len(inputs) > 0 {
+		deliveries, err := r.store.AcceptDeliveries(ctx, inputs)
+		if err != nil {
+			return Summary{}, &DurabilityError{Err: err}
 		}
-		if len(persistErrs) > 0 {
-			r.logger.Error("partial persist failure",
-				slog.Int("alerts_received", len(payload.Alerts)),
-				slog.Int("alerts_persisted", len(persisted)),
-				slog.Int("alerts_failed", len(persistErrs)),
+		for _, d := range deliveries {
+			persisted = append(persisted, d.Alert)
+			r.logger.Debug("alert upserted",
+				slog.String("fingerprint", d.Alert.Fingerprint),
+				slog.String("status", d.Alert.Status),
 			)
 		}
 	}
@@ -146,38 +142,47 @@ func alertAuditRecord(payload AlertmanagerPayload, persisted []store.Alert) map[
 	}
 }
 
-func (r *alertReceiver) persistAlerts(ctx context.Context, in []AlertmanagerAlert, groupLabels map[string]string) ([]store.Alert, []error) {
-	persisted := make([]store.Alert, 0, len(in))
-	var errs []error
+func (r *alertReceiver) deliveryInputs(in []AlertmanagerAlert, groupLabels map[string]string) ([]store.DeliveryInput, error) {
+	inputs := make([]store.DeliveryInput, 0, len(in))
 	for _, a := range in {
 		alert, err := r.toStoreAlert(a)
 		if err != nil {
-			errs = append(errs, err)
-			r.logger.Warn("dropping invalid alert",
-				slog.String("fingerprint", a.Fingerprint),
-				slog.String("err", err.Error()),
-			)
-			continue
+			return nil, err
 		}
-		stored, err := r.store.UpsertAlertByFingerprint(ctx, alert)
-		if err != nil {
-			errs = append(errs, err)
-			r.logger.Error("upsert alert failed",
-				slog.String("fingerprint", alert.Fingerprint),
-				slog.String("err", err.Error()),
-			)
-			continue
+		identity := grouping.Ensure(
+			grouping.RenderLabels(groupLabels), alert.Labels, alert.Fingerprint,
+		)
+		startedAt := alert.StartsAt
+		input := store.DeliveryInput{
+			ID:                       payloadDigest("alertmanager", a),
+			Alert:                    alert,
+			Source:                   "alertmanager",
+			SourceEpisodeKey:         "alertmanager:" + alert.Fingerprint + ":" + startedAt.UTC().Format(time.RFC3339Nano),
+			SourceStartedAt:          &startedAt,
+			StartedAtBasis:           situationmodel.SourceTimeBasisSourcePayload,
+			ResolvedAtBasis:          situationmodel.SourceTimeBasisMissing,
+			ReceiverGroupingIdentity: identity,
+			PayloadDigest:            payloadDigest("alertmanager-payload", a),
 		}
-		stored.ReceiverGroupingIdentity = grouping.Ensure(
-			grouping.RenderLabels(groupLabels), stored.Labels, stored.Fingerprint,
-		)
-		persisted = append(persisted, stored)
-		r.logger.Debug("alert upserted",
-			slog.String("fingerprint", stored.Fingerprint),
-			slog.String("status", stored.Status),
-		)
+		if alert.EndsAt != nil {
+			input.SourceResolvedAt = alert.EndsAt
+			input.ResolvedAtBasis = situationmodel.SourceTimeBasisSourcePayload
+		}
+		inputs = append(inputs, input)
 	}
-	return persisted, errs
+	return inputs, nil
+}
+
+func payloadDigest(source string, v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		// Receiver payload structs are JSON-marshalable; preserve a stable
+		// value if that invariant is ever broken so validation still decides
+		// the HTTP class rather than panicking in the request path.
+		b = []byte(source)
+	}
+	sum := sha256.Sum256(append([]byte(source+":"), b...))
+	return fmt.Sprintf("sha256:%x", sum[:])
 }
 
 func (r *alertReceiver) toStoreAlert(a AlertmanagerAlert) (store.Alert, error) {
