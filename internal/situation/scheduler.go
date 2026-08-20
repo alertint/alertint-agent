@@ -14,14 +14,14 @@ import (
 
 // LeaseExtender is the narrow durable boundary needed by the scheduler.
 type LeaseExtender interface {
-	ExtendSituationLease(context.Context, string, string, time.Time, time.Duration) error
+	ExtendSituationLease(context.Context, string, string, int64, time.Time, time.Duration) error
 }
 
 // RunWithLeaseHeartbeat runs one reconciliation while extending ownership at
 // the configured interval. A failed extension cancels the work context before
 // the reconciler may start another context-aware operation.
-func RunWithLeaseHeartbeat(ctx context.Context, extender LeaseExtender, situationID, owner string, interval, lease time.Duration, reconcile func(context.Context) error) error {
-	if extender == nil || reconcile == nil || interval <= 0 || lease <= interval || situationID == "" || owner == "" {
+func RunWithLeaseHeartbeat(ctx context.Context, extender LeaseExtender, situationID, owner string, claimToken int64, interval, lease time.Duration, reconcile func(context.Context) error) error {
+	if extender == nil || reconcile == nil || interval <= 0 || lease <= interval || situationID == "" || owner == "" || claimToken <= 0 {
 		return errors.New("situation: heartbeat requires ownership, positive interval, and longer lease")
 	}
 	workCtx, cancel := context.WithCancelCause(ctx)
@@ -37,7 +37,7 @@ func RunWithLeaseHeartbeat(ctx context.Context, extender LeaseExtender, situatio
 			case <-workCtx.Done():
 				return
 			case now := <-ticker.C:
-				if err := extender.ExtendSituationLease(workCtx, situationID, owner, now.UTC(), lease); err != nil {
+				if err := extender.ExtendSituationLease(workCtx, situationID, owner, claimToken, now.UTC(), lease); err != nil {
 					wrapped := fmt.Errorf("situation: lease heartbeat: %w", err)
 					heartbeatErr <- wrapped
 					cancel(wrapped)
@@ -77,6 +77,24 @@ type PrioritySignals struct {
 	EnvelopeViolation       bool
 	RecoveryBoundary        bool
 	DeadlineBoundary        bool
+}
+
+// IsPublishedMaterialReason reports whether a durable due reason represents a
+// new externally visible fact, rather than a timer, retry, or reassessment.
+func IsPublishedMaterialReason(reason model.DueReason) bool {
+	switch reason {
+	case model.DueIncidentCreated,
+		model.DueMembershipChanged,
+		model.DueNewSymptom,
+		model.DueAlertResolved,
+		model.DueAlertRefired,
+		model.DueConnectorHealthChanged,
+		model.DueOperatorJudgment,
+		model.DueEnvelopeChanged:
+		return true
+	default:
+		return false
+	}
 }
 
 // PriorityFor applies the fixed priority bands and promotes waiting work by

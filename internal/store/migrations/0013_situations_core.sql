@@ -26,15 +26,19 @@ CREATE TABLE situations (
     due_reasons_json           TEXT    NOT NULL CHECK (json_valid(due_reasons_json) AND json_type(due_reasons_json) = 'array'),
     lease_owner                TEXT,
     lease_expires_at           TEXT,
+    claim_token                INTEGER NOT NULL DEFAULT 0 CHECK (claim_token >= 0),
     attempt_count              INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
     last_error_class           TEXT,
     retry_at                   TEXT,
     created_at                 TEXT    NOT NULL CHECK (created_at <> ''),
     updated_at                 TEXT    NOT NULL CHECK (updated_at <> ''),
     CHECK ((lease_owner IS NULL) = (lease_expires_at IS NULL)),
+    CHECK ((recovery_observed_at IS NULL) = (grace_until IS NULL)),
+    CHECK (recovery_observed_at IS NULL OR grace_until >= recovery_observed_at),
     CHECK (
-        (lifecycle IN ('active', 'recovery_pending') AND terminal_at IS NULL AND terminal_reason IS NULL)
-        OR (lifecycle = 'recovered' AND terminal_at IS NOT NULL AND terminal_reason IS NULL)
+        (lifecycle = 'active' AND recovery_observed_at IS NULL AND terminal_at IS NULL AND terminal_reason IS NULL)
+        OR (lifecycle = 'recovery_pending' AND recovery_observed_at IS NOT NULL AND terminal_at IS NULL AND terminal_reason IS NULL)
+        OR (lifecycle = 'recovered' AND recovery_observed_at IS NOT NULL AND terminal_at IS NOT NULL AND terminal_reason IS NULL)
         OR (lifecycle = 'closed_unknown' AND terminal_at IS NOT NULL AND terminal_reason IS NOT NULL)
     )
 ) STRICT;
@@ -56,11 +60,17 @@ BEFORE UPDATE OF lifecycle ON situations
 WHEN NOT (
     (OLD.lifecycle = 'active' AND NEW.lifecycle IN ('active', 'recovery_pending', 'closed_unknown'))
     OR (OLD.lifecycle = 'recovery_pending' AND NEW.lifecycle IN ('recovery_pending', 'active', 'recovered', 'closed_unknown'))
-    OR (OLD.lifecycle = 'recovered' AND NEW.lifecycle = 'recovered')
-    OR (OLD.lifecycle = 'closed_unknown' AND NEW.lifecycle = 'closed_unknown')
 )
 BEGIN
     SELECT RAISE(ABORT, 'invalid situation lifecycle transition');
+END;
+
+CREATE TRIGGER situations_terminal_projection_immutable
+BEFORE UPDATE OF terminal_at, terminal_reason ON situations
+WHEN OLD.terminal_at IS NOT NULL
+ AND (NEW.terminal_at IS NOT OLD.terminal_at OR NEW.terminal_reason IS NOT OLD.terminal_reason)
+BEGIN
+    SELECT RAISE(ABORT, 'situation terminal projection is immutable');
 END;
 
 CREATE TRIGGER situations_public_handle_immutable
@@ -123,6 +133,7 @@ CREATE TABLE situation_input_outbox (
     status           TEXT    NOT NULL CHECK (status IN ('pending', 'claimed', 'applied', 'failed')),
     lease_owner      TEXT,
     lease_expires_at TEXT,
+    claim_token      INTEGER NOT NULL DEFAULT 0 CHECK (claim_token >= 0),
     attempt_count    INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
     last_error_class TEXT,
     retry_at         TEXT,

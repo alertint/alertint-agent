@@ -34,13 +34,22 @@ type SituationInput struct {
 	GroupKey       string
 	DeliveryID     *string
 	OccurredAt     time.Time
+	ClaimOwner     string
+	ClaimToken     int64
 }
 
 type storedSituationInput struct {
 	SituationInput
 	Status         string
-	LeaseOwner     *string
 	LeaseExpiresAt *time.Time
+}
+
+// SituationClaim carries the durable fencing identity for one claimed
+// aggregate. Every lease-sensitive mutation requires the complete claim.
+type SituationClaim struct {
+	Situation  model.Situation
+	ClaimOwner string
+	ClaimToken int64
 }
 
 // ClaimSituationInputs leases pending, retry-due, or expired input work. The
@@ -58,7 +67,7 @@ func (s *Store) ClaimSituationInputs(ctx context.Context, owner string, now time
 	rows, err := tx.QueryContext(ctx, `
 		UPDATE situation_input_outbox
 		SET status = 'claimed', lease_owner = ?, lease_expires_at = ?,
-		    attempt_count = attempt_count + 1
+		    claim_token = claim_token + 1, attempt_count = attempt_count + 1
 		WHERE id IN (
 			SELECT id FROM situation_input_outbox
 			WHERE (status = 'pending' AND (retry_at IS NULL OR retry_at <= ?))
@@ -108,8 +117,8 @@ func (s *Store) ClaimSituationInputs(ctx context.Context, owner string, now time
 
 // RetrySituationInput releases a claimed input for a later retry or records a
 // terminal local dead letter. It performs no outbound work.
-func (s *Store) RetrySituationInput(ctx context.Context, inputID, class string, retryAt time.Time, terminal bool) error {
-	if strings.TrimSpace(inputID) == "" || strings.TrimSpace(class) == "" {
+func (s *Store) RetrySituationInput(ctx context.Context, claim SituationInput, class string, retryAt time.Time, terminal bool) error {
+	if strings.TrimSpace(claim.ID) == "" || strings.TrimSpace(claim.ClaimOwner) == "" || claim.ClaimToken <= 0 || strings.TrimSpace(class) == "" {
 		return errors.New("store: situation input retry requires id and error class")
 	}
 	status := "pending"
@@ -124,7 +133,8 @@ func (s *Store) RetrySituationInput(ctx context.Context, inputID, class string, 
 		UPDATE situation_input_outbox
 		SET status = ?, lease_owner = NULL, lease_expires_at = NULL,
 		    last_error_class = ?, retry_at = ?
-		WHERE id = ? AND status = 'claimed'`, status, class, retry, inputID)
+		WHERE id = ? AND status = 'claimed' AND lease_owner = ? AND claim_token = ?`,
+		status, class, retry, claim.ID, claim.ClaimOwner, claim.ClaimToken)
 	if err != nil {
 		return fmt.Errorf("store: retry situation input: %w", err)
 	}
@@ -148,7 +158,7 @@ const situationColumns = `
 
 // ClaimDueSituations leases due nonterminal aggregates in deterministic
 // priority order. Overdue work ages upward by one band per minute.
-func (s *Store) ClaimDueSituations(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]model.Situation, error) {
+func (s *Store) ClaimDueSituations(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]SituationClaim, error) {
 	if strings.TrimSpace(owner) == "" || lease <= 0 || limit <= 0 {
 		return nil, errors.New("store: situation claim requires owner, positive lease, and positive limit")
 	}
@@ -163,7 +173,11 @@ func (s *Store) ClaimDueSituations(ctx context.Context, owner string, now time.T
 			SELECT id,
 			       CASE
 			           WHEN attention = 'urgent' THEN 0
-			           WHEN public_handle IS NOT NULL AND json_array_length(due_reasons_json) > 0 THEN 1
+			           WHEN public_handle IS NOT NULL AND EXISTS (
+			               SELECT 1 FROM json_each(due_reasons_json)
+			               WHERE value IN ('incident_created', 'membership_changed', 'new_symptom', 'alert_resolved',
+			                               'alert_refired', 'connector_health_changed', 'operator_judgment', 'envelope_changed')
+			           ) THEN 1
 			           WHEN EXISTS (SELECT 1 FROM json_each(due_reasons_json) WHERE value IN ('new_symptom', 'envelope_changed', 'envelope_boundary')) THEN 2
 			           WHEN EXISTS (SELECT 1 FROM json_each(due_reasons_json) WHERE value IN ('recovery_grace_expired', 'observation_deadline')) THEN 3
 			           ELSE 4
@@ -181,7 +195,8 @@ func (s *Store) ClaimDueSituations(ctx context.Context, owner string, now time.T
 			LIMIT ?
 		)
 		UPDATE situations
-		SET lease_owner = ?, lease_expires_at = ?, attempt_count = attempt_count + 1,
+		SET lease_owner = ?, lease_expires_at = ?, claim_token = claim_token + 1,
+		    attempt_count = attempt_count + 1,
 		    updated_at = ?
 		WHERE id IN (SELECT id FROM chosen)
 		RETURNING id`, canonicalTime(now), canonicalTime(now), canonicalTime(now), canonicalTime(now), limit,
@@ -205,26 +220,30 @@ func (s *Store) ClaimDueSituations(ctx context.Context, owner string, now time.T
 	if err := rows.Close(); err != nil {
 		return nil, fmt.Errorf("store: close claimed situation ids: %w", err)
 	}
-	out := make([]model.Situation, 0, len(ids))
+	out := make([]SituationClaim, 0, len(ids))
 	for _, id := range ids {
 		claimed, err := querySituation(ctx, tx, `SELECT `+situationColumns+` FROM situations WHERE id = ?`, id)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, claimed)
+		var token int64
+		if err := tx.QueryRowContext(ctx, `SELECT claim_token FROM situations WHERE id = ?`, id).Scan(&token); err != nil {
+			return nil, fmt.Errorf("store: read claimed situation token: %w", err)
+		}
+		out = append(out, SituationClaim{Situation: claimed, ClaimOwner: owner, ClaimToken: token})
 	}
 	sort.Slice(out, func(i, j int) bool {
-		leftWait := now.Sub(out[i].NextAssessmentAt)
-		rightWait := now.Sub(out[j].NextAssessmentAt)
-		left := situation.PriorityFor(prioritySignalsForSituation(out[i]), leftWait, time.Minute)
-		right := situation.PriorityFor(prioritySignalsForSituation(out[j]), rightWait, time.Minute)
+		leftWait := now.Sub(out[i].Situation.NextAssessmentAt)
+		rightWait := now.Sub(out[j].Situation.NextAssessmentAt)
+		left := situation.PriorityFor(prioritySignalsForSituation(out[i].Situation), leftWait, time.Minute)
+		right := situation.PriorityFor(prioritySignalsForSituation(out[j].Situation), rightWait, time.Minute)
 		if left != right {
 			return left < right
 		}
-		if !out[i].NextAssessmentAt.Equal(out[j].NextAssessmentAt) {
-			return out[i].NextAssessmentAt.Before(out[j].NextAssessmentAt)
+		if !out[i].Situation.NextAssessmentAt.Equal(out[j].Situation.NextAssessmentAt) {
+			return out[i].Situation.NextAssessmentAt.Before(out[j].Situation.NextAssessmentAt)
 		}
-		return out[i].ID < out[j].ID
+		return out[i].Situation.ID < out[j].Situation.ID
 	})
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("store: commit due situation claims: %w", err)
@@ -234,10 +253,10 @@ func (s *Store) ClaimDueSituations(ctx context.Context, owner string, now time.T
 
 func prioritySignalsForSituation(value model.Situation) situation.PrioritySignals {
 	signals := situation.PrioritySignals{DeterministicUrgent: value.Attention == model.AttentionUrgent}
-	if value.PublicHandle != nil && len(value.DueReasons) > 0 {
-		signals.PublishedMaterialChange = true
-	}
 	for _, reason := range value.DueReasons {
+		if value.PublicHandle != nil && situation.IsPublishedMaterialReason(reason) {
+			signals.PublishedMaterialChange = true
+		}
 		switch reason {
 		case model.DueNewSymptom:
 			signals.NewSymptom = true
@@ -270,16 +289,16 @@ func (s *Store) RecoverExpiredSituationLeases(ctx context.Context, now time.Time
 }
 
 // ExtendSituationLease heartbeats only a live lease still owned by owner.
-func (s *Store) ExtendSituationLease(ctx context.Context, situationID, owner string, now time.Time, lease time.Duration) error {
-	if strings.TrimSpace(situationID) == "" || strings.TrimSpace(owner) == "" || lease <= 0 {
+func (s *Store) ExtendSituationLease(ctx context.Context, situationID, owner string, claimToken int64, now time.Time, lease time.Duration) error {
+	if strings.TrimSpace(situationID) == "" || strings.TrimSpace(owner) == "" || claimToken <= 0 || lease <= 0 {
 		return errors.New("store: situation lease extension requires id, owner, and positive lease")
 	}
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE situations
 		SET lease_expires_at = ?, updated_at = ?
-		WHERE id = ? AND lease_owner = ? AND lease_expires_at > ?
+		WHERE id = ? AND lease_owner = ? AND claim_token = ? AND lease_expires_at > ?
 		  AND lifecycle IN ('active', 'recovery_pending')`,
-		canonicalTime(now.Add(lease)), canonicalTime(now), situationID, owner, canonicalTime(now))
+		canonicalTime(now.Add(lease)), canonicalTime(now), situationID, owner, claimToken, canonicalTime(now))
 	if err != nil {
 		return fmt.Errorf("store: extend situation lease: %w", err)
 	}
@@ -320,8 +339,9 @@ func (s *Store) CurrentSituationForGroup(ctx context.Context, groupKey string) (
 
 // CommitSituationTransition conditionally applies a reconciler result to the
 // exact input version it observed. Stale work has no aggregate effect.
-func (s *Store) CommitSituationTransition(ctx context.Context, expectedInputVersion int, tr model.Transition, assessmentID *string) error {
-	if strings.TrimSpace(tr.SituationID) == "" || expectedInputVersion < 1 || tr.InputVersion != expectedInputVersion {
+func (s *Store) CommitSituationTransition(ctx context.Context, claim SituationClaim, tr model.Transition, assessmentID *string) error {
+	expectedInputVersion := claim.Situation.InputVersion
+	if strings.TrimSpace(tr.SituationID) == "" || tr.SituationID != claim.Situation.ID || strings.TrimSpace(claim.ClaimOwner) == "" || claim.ClaimToken <= 0 || expectedInputVersion < 1 || tr.InputVersion != expectedInputVersion {
 		return errors.New("store: situation transition requires matching positive input version")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -335,6 +355,16 @@ func (s *Store) CommitSituationTransition(ctx context.Context, expectedInputVers
 	}
 	if current.InputVersion != expectedInputVersion {
 		return ErrSituationVersionConflict
+	}
+	var durableToken int64
+	if current.LeaseOwner == nil || *current.LeaseOwner != claim.ClaimOwner {
+		return ErrSituationLeaseLost
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT claim_token FROM situations WHERE id = ?`, tr.SituationID).Scan(&durableToken); err != nil {
+		return fmt.Errorf("store: read situation transition fence: %w", err)
+	}
+	if durableToken != claim.ClaimToken {
+		return ErrSituationLeaseLost
 	}
 	if !validSituationAttention(tr.Attention) || !validSituationLifecycle(tr.Lifecycle) {
 		return errors.New("store: invalid situation transition state")
@@ -384,7 +414,7 @@ func (s *Store) CommitSituationTransition(ctx context.Context, expectedInputVers
 		if !validTerminalReason(reason) {
 			return errors.New("store: closed unknown requires a structured terminal reason")
 		}
-		firing, err := situationHasCurrentFiringMember(ctx, tx, tr.SituationID)
+		firing, err := situationHasFreshAuthoritativeFiring(ctx, tx, tr.SituationID, createdAt)
 		if err != nil {
 			return err
 		}
@@ -395,20 +425,17 @@ func (s *Store) CommitSituationTransition(ctx context.Context, expectedInputVers
 		terminalReason = string(reason)
 		nextAssessmentAt = createdAt
 	}
-	lastObserved := current.LastLifecycleObservedAt
-	if tr.Lifecycle != current.Lifecycle && createdAt.After(lastObserved) {
-		lastObserved = createdAt
-	}
 	res, err := tx.ExecContext(ctx, `
 		UPDATE situations
 		SET lifecycle = ?, attention = ?, current_assessment_id = COALESCE(?, current_assessment_id),
 		    recovery_observed_at = ?, grace_until = ?, terminal_at = ?, terminal_reason = ?,
 		    next_assessment_at = ?, due_reasons_json = '[]', lease_owner = NULL,
 		    lease_expires_at = NULL, last_error_class = NULL, retry_at = NULL,
-		    last_lifecycle_observed_at = ?, updated_at = ?
-		WHERE id = ? AND input_version = ?`,
+		    updated_at = ?
+		WHERE id = ? AND input_version = ? AND lease_owner = ? AND claim_token = ?`,
 		tr.Lifecycle, attention, nullableString(assessmentID), recoveryObservedAt, graceUntil, terminalAt, terminalReason,
-		canonicalTime(nextAssessmentAt), canonicalTime(lastObserved), canonicalTime(createdAt), tr.SituationID, expectedInputVersion)
+		canonicalTime(nextAssessmentAt), canonicalTime(createdAt), tr.SituationID, expectedInputVersion,
+		claim.ClaimOwner, claim.ClaimToken)
 	if err != nil {
 		return fmt.Errorf("store: commit situation transition: %w", err)
 	}
@@ -427,7 +454,7 @@ func (s *Store) CommitSituationTransition(ctx context.Context, expectedInputVers
 
 func legalSituationTransition(from, to model.Lifecycle) bool {
 	if from == to {
-		return true
+		return from == model.LifecycleActive || from == model.LifecycleRecoveryPending
 	}
 	switch from {
 	case model.LifecycleActive:
@@ -467,28 +494,62 @@ func validTerminalReason(value model.TerminalReason) bool {
 	}
 }
 
-func situationHasCurrentFiringMember(ctx context.Context, tx *sql.Tx, situationID string) (bool, error) {
-	var firing bool
-	err := tx.QueryRowContext(ctx, `
-		SELECT EXISTS (
+func situationHasFreshAuthoritativeFiring(ctx context.Context, tx *sql.Tx, situationID string, at time.Time) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT d.source, d.status, d.received_at
+		FROM situation_incidents AS si
+		JOIN incident_alert_deliveries AS iad ON iad.incident_id = si.incident_id
+		JOIN alert_deliveries AS d ON d.id = iad.delivery_id
+		WHERE si.situation_id = ?
+		  AND NOT EXISTS (
 			SELECT 1
-			FROM situation_incidents AS si
-			JOIN incident_alerts AS ia ON ia.incident_id = si.incident_id
-			JOIN alerts AS a ON a.id = ia.alert_id
-			WHERE si.situation_id = ? AND a.status = 'firing'
-		)`, situationID).Scan(&firing)
+			FROM situation_incidents AS newer_si
+			JOIN incident_alert_deliveries AS newer_iad ON newer_iad.incident_id = newer_si.incident_id
+			JOIN alert_deliveries AS newer ON newer.id = newer_iad.delivery_id
+			WHERE newer_si.situation_id = si.situation_id
+			  AND newer.source_episode_key = d.source_episode_key
+			  AND (newer.received_at > d.received_at OR (newer.received_at = d.received_at AND newer.id > d.id))
+		  )`, situationID)
 	if err != nil {
-		return false, fmt.Errorf("store: check situation firing members: %w", err)
+		return false, fmt.Errorf("store: query authoritative situation lifecycle: %w", err)
 	}
-	return firing, nil
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var source, status, receivedRaw string
+		if err := rows.Scan(&source, &status, &receivedRaw); err != nil {
+			return false, fmt.Errorf("store: scan authoritative situation lifecycle: %w", err)
+		}
+		receivedAt, err := parseSituationTime("delivery received_at", receivedRaw)
+		if err != nil {
+			return false, err
+		}
+		if status == string(model.DeliveryStatusFiring) && at.Before(receivedAt.Add(authoritativeLifecycleWindow(source))) {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("store: iterate authoritative situation lifecycle: %w", err)
+	}
+	return false, nil
+}
+
+// Task 11 may extend this default from advisory semantic profiles, but never
+// shorten it. The immutable delivery source remains an explicit input so a
+// source-specific authority policy can be introduced without consulting the
+// mutable compatibility projection.
+func authoritativeLifecycleWindow(source string) time.Duration {
+	if strings.TrimSpace(source) == "" {
+		return 0
+	}
+	return 24 * time.Hour
 }
 
 // ApplySituationInput atomically creates/selects the exact-group aggregate,
 // attaches the Incident once, advances the input version once, and marks the
 // claimed outbox row applied. Reapplying an applied row is a successful read.
-func (s *Store) ApplySituationInput(ctx context.Context, inputID string) (model.Situation, error) {
-	if strings.TrimSpace(inputID) == "" {
-		return model.Situation{}, errors.New("store: situation input id is required")
+func (s *Store) ApplySituationInput(ctx context.Context, claim SituationInput) (model.Situation, error) {
+	if strings.TrimSpace(claim.ID) == "" || strings.TrimSpace(claim.ClaimOwner) == "" || claim.ClaimToken <= 0 {
+		return model.Situation{}, errors.New("store: situation input claim is required")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -496,9 +557,12 @@ func (s *Store) ApplySituationInput(ctx context.Context, inputID string) (model.
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	in, err := readSituationInput(ctx, tx, inputID)
+	in, err := readSituationInput(ctx, tx, claim.ID)
 	if err != nil {
 		return model.Situation{}, err
+	}
+	if in.ClaimToken != claim.ClaimToken {
+		return model.Situation{}, ErrSituationLeaseLost
 	}
 	if in.Status == "applied" {
 		owned, err := situationForIncidentTx(ctx, tx, in.IncidentID)
@@ -512,6 +576,9 @@ func (s *Store) ApplySituationInput(ctx context.Context, inputID string) (model.
 	}
 	if in.Status != "claimed" {
 		return model.Situation{}, errors.New("store: situation input must be claimed before apply")
+	}
+	if in.ClaimOwner != claim.ClaimOwner {
+		return model.Situation{}, ErrSituationLeaseLost
 	}
 	appliedAt := time.Now().UTC()
 
@@ -564,7 +631,8 @@ func (s *Store) ApplySituationInput(ctx context.Context, inputID string) (model.
 		UPDATE situation_input_outbox
 		SET status = 'applied', lease_owner = NULL, lease_expires_at = NULL,
 		    retry_at = NULL, applied_at = ?
-		WHERE id = ? AND status = 'claimed'`, canonicalTime(appliedAt), in.ID)
+		WHERE id = ? AND status = 'claimed' AND lease_owner = ? AND claim_token = ?`,
+		canonicalTime(appliedAt), in.ID, claim.ClaimOwner, claim.ClaimToken)
 	if err != nil {
 		return model.Situation{}, fmt.Errorf("store: mark situation input applied: %w", err)
 	}
@@ -585,6 +653,7 @@ type situationTimes struct {
 	EffectiveStartedAt      time.Time
 	EffectiveStartedAtBasis model.SourceTimeBasis
 	FirstReceivedAt         time.Time
+	LifecycleObservedAt     *time.Time
 }
 
 func situationInputTimes(ctx context.Context, tx *sql.Tx, in storedSituationInput, firstAlertAt, incidentCreatedAt string) (situationTimes, error) {
@@ -603,8 +672,13 @@ func situationInputTimes(ctx context.Context, tx *sql.Tx, in storedSituationInpu
 	var sourceStarted sql.NullString
 	var basis model.SourceTimeBasis
 	var receivedAt string
-	if err := tx.QueryRowContext(ctx, `SELECT source_started_at, started_at_basis, received_at FROM alert_deliveries WHERE id = ?`, *in.DeliveryID).
-		Scan(&sourceStarted, &basis, &receivedAt); err != nil {
+	var status model.DeliveryStatus
+	if err := tx.QueryRowContext(ctx, `
+		SELECT d.source_started_at, d.started_at_basis, d.received_at, d.status
+		FROM alert_deliveries AS d
+		JOIN incident_alert_deliveries AS iad ON iad.delivery_id = d.id
+		WHERE d.id = ? AND iad.incident_id = ?`, *in.DeliveryID, in.IncidentID).
+		Scan(&sourceStarted, &basis, &receivedAt, &status); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return situationTimes{}, ErrNotFound
 		}
@@ -621,6 +695,10 @@ func situationInputTimes(ctx context.Context, tx *sql.Tx, in storedSituationInpu
 	if err != nil {
 		return situationTimes{}, err
 	}
+	if status == model.DeliveryStatusFiring || status == model.DeliveryStatusResolved {
+		observedAt := out.FirstReceivedAt
+		out.LifecycleObservedAt = &observedAt
+	}
 	return out, nil
 }
 
@@ -630,6 +708,10 @@ func createSituationForInput(ctx context.Context, tx *sql.Tx, in storedSituation
 		return model.Situation{}, fmt.Errorf("store: marshal initial situation due reason: %w", err)
 	}
 	id := uuid.NewString()
+	lastObserved := time.Time{}
+	if times.LifecycleObservedAt != nil {
+		lastObserved = *times.LifecycleObservedAt
+	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO situations (
 			id, previous_situation_id, group_key, lifecycle, attention, input_version,
@@ -638,7 +720,7 @@ func createSituationForInput(ctx context.Context, tx *sql.Tx, in storedSituation
 			due_reasons_json, attempt_count, created_at, updated_at
 		) VALUES (?, ?, ?, 'active', 'observe', 1, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
 		id, nullableString(previousID), in.GroupKey, canonicalTime(appliedAt), canonicalTime(times.EffectiveStartedAt),
-		times.EffectiveStartedAtBasis, canonicalTime(times.FirstReceivedAt), canonicalTime(in.OccurredAt), canonicalTime(in.OccurredAt), string(reasonsJSON),
+		times.EffectiveStartedAtBasis, canonicalTime(times.FirstReceivedAt), canonicalTime(lastObserved), canonicalTime(in.OccurredAt), string(reasonsJSON),
 		canonicalTime(appliedAt), canonicalTime(appliedAt)); err != nil {
 		return model.Situation{}, fmt.Errorf("store: create situation: %w", err)
 	}
@@ -659,8 +741,8 @@ func applyInputToExistingSituation(ctx context.Context, tx *sql.Tx, current mode
 	}
 	next := situation.EarlierAssessmentAt(current.NextAssessmentAt, in.OccurredAt)
 	lastObserved := current.LastLifecycleObservedAt
-	if in.OccurredAt.After(lastObserved) {
-		lastObserved = in.OccurredAt.UTC()
+	if times.LifecycleObservedAt != nil && times.LifecycleObservedAt.After(lastObserved) {
+		lastObserved = times.LifecycleObservedAt.UTC()
 	}
 	effectiveStartedAt := current.EffectiveStartedAt
 	if times.EffectiveStartedAt.Before(effectiveStartedAt) {
@@ -724,10 +806,10 @@ func readSituationInput(ctx context.Context, q queryRower, inputID string) (stor
 	var occurredAt string
 	err := q.QueryRowContext(ctx, `
 		SELECT id, idempotency_key, incident_id, kind, group_key, delivery_id,
-		       occurred_at, status, lease_owner, lease_expires_at
+		       occurred_at, status, lease_owner, lease_expires_at, claim_token
 		FROM situation_input_outbox WHERE id = ?`, inputID).
 		Scan(&in.ID, &in.IdempotencyKey, &in.IncidentID, &in.Kind, &in.GroupKey, &deliveryID,
-			&occurredAt, &in.Status, &leaseOwner, &leaseExpires)
+			&occurredAt, &in.Status, &leaseOwner, &leaseExpires, &in.ClaimToken)
 	if errors.Is(err, sql.ErrNoRows) {
 		return storedSituationInput{}, ErrNotFound
 	}
@@ -735,7 +817,9 @@ func readSituationInput(ctx context.Context, q queryRower, inputID string) (stor
 		return storedSituationInput{}, fmt.Errorf("store: read situation input: %w", err)
 	}
 	in.DeliveryID = nullStringPtr(deliveryID)
-	in.LeaseOwner = nullStringPtr(leaseOwner)
+	if leaseOwner.Valid {
+		in.ClaimOwner = leaseOwner.String
+	}
 	if in.OccurredAt, err = parseSituationTime("input occurred_at", occurredAt); err != nil {
 		return storedSituationInput{}, err
 	}

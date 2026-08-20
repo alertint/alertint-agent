@@ -30,18 +30,20 @@ func TestMergeDueReasonsUnionsInCanonicalOrder(t *testing.T) {
 }
 
 type failingLeaseExtender struct {
-	calls int
+	calls      int
+	claimToken int64
 }
 
-func (f *failingLeaseExtender) ExtendSituationLease(context.Context, string, string, time.Time, time.Duration) error {
+func (f *failingLeaseExtender) ExtendSituationLease(_ context.Context, _ string, _ string, claimToken int64, _ time.Time, _ time.Duration) error {
 	f.calls++
+	f.claimToken = claimToken
 	return errors.New("store: situation lease lost")
 }
 
 func TestRunWithLeaseHeartbeatAbortsReconcileWhenOwnershipIsLost(t *testing.T) {
 	extender := &failingLeaseExtender{}
 	err := RunWithLeaseHeartbeat(
-		context.Background(), extender, "situation-1", "worker-1", time.Millisecond, time.Minute,
+		context.Background(), extender, "situation-1", "worker-1", 42, time.Millisecond, time.Minute,
 		func(ctx context.Context) error {
 			<-ctx.Done()
 			return context.Cause(ctx)
@@ -52,6 +54,9 @@ func TestRunWithLeaseHeartbeatAbortsReconcileWhenOwnershipIsLost(t *testing.T) {
 	}
 	if extender.calls != 1 {
 		t.Fatalf("heartbeat calls = %d", extender.calls)
+	}
+	if extender.claimToken != 42 {
+		t.Fatalf("heartbeat claim token = %d", extender.claimToken)
 	}
 }
 
@@ -90,5 +95,26 @@ func TestPriorityForOrdersSignalsAndAgesOneBandAtATime(t *testing.T) {
 	}
 	if got := PriorityFor(PrioritySignals{}, 2*time.Minute, time.Minute); got != PriorityNewSymptom {
 		t.Fatalf("aged observe priority = %d, want %d", got, PriorityNewSymptom)
+	}
+}
+
+func TestIsPublishedMaterialReasonExcludesDurableWorkReasons(t *testing.T) {
+	for _, reason := range []model.DueReason{model.DueMembershipChanged, model.DueAlertResolved, model.DueEnvelopeChanged} {
+		if !IsPublishedMaterialReason(reason) {
+			t.Fatalf("material reason %q was excluded", reason)
+		}
+	}
+	for _, reason := range []model.DueReason{
+		model.DueRecoveryGraceExpired,
+		model.DueObservationDeadline,
+		model.DueRetry,
+		model.DueManualReassessment,
+		model.DueDurationMilestone,
+		model.DueSemanticProfileChanged,
+		model.DueUpgradeReconstruction,
+	} {
+		if IsPublishedMaterialReason(reason) {
+			t.Fatalf("non-material work reason %q was promoted", reason)
+		}
 	}
 }
