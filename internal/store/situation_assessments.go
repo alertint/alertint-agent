@@ -365,7 +365,7 @@ func (s *Store) UpdateDeliverySourceTimes(ctx context.Context, claim SituationCl
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM situation_incidents si
 			JOIN incident_alert_deliveries iad ON iad.incident_id=si.incident_id
 			JOIN alert_deliveries d ON d.id=iad.delivery_id
-			WHERE si.situation_id=? AND d.id<>? AND d.source_started_at IS NOT NULL AND d.started_at_basis<>'source_api'`, ownerID, deliveryID).Scan(&different); err != nil {
+			WHERE si.situation_id=? AND d.id<>? AND d.started_at_basis IN ('source_payload','receipt_fallback','mixed')`, ownerID, deliveryID).Scan(&different); err != nil {
 			return fmt.Errorf("store: inspect source time basis: %w", err)
 		}
 		if different > 0 {

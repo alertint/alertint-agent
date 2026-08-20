@@ -279,8 +279,10 @@ func (c *Client) OpenProblems(ctx context.Context, host string, sel ProblemSelec
 }
 
 // ProblemHistory returns a bounded host problem timeline over [start,end]. It
-// resolves the technical host first and then issues only event.get for trigger
-// problem events. limit+1 detects truncation without losing that information.
+// resolves the technical host first, uses event.get's problem-time overlap
+// filter for trigger problem events, and resolves r_eventid values through a
+// second read-only event.get because event objects do not expose r_clock.
+// limit+1 detects truncation without losing that information.
 func (c *Client) ProblemHistory(ctx context.Context, host string, start, end time.Time, severityMin string, limit int) ([]ProblemHistoryRow, error) {
 	if strings.TrimSpace(host) == "" {
 		return nil, fmt.Errorf("zabbix: problem history host is required")
@@ -302,17 +304,17 @@ func (c *Client) ProblemHistory(ctx context.Context, host string, start, end tim
 		return nil, err
 	}
 	params := map[string]any{
-		"output":     []string{"eventid", "objectid", "name", "clock", "r_clock", "severity", "acknowledged", "suppressed", "cause_eventid"},
-		"selectTags": "extend",
-		"hostids":    hostIDs,
-		"source":     0,
-		"object":     0,
-		"value":      1,
-		"time_from":  start.Unix(),
-		"time_till":  end.Unix(),
-		"sortfield":  []string{"clock", "eventid"},
-		"sortorder":  "DESC",
-		"limit":      limit + 1,
+		"output":            []string{"eventid", "objectid", "name", "clock", "r_eventid", "severity", "acknowledged", "suppressed", "cause_eventid"},
+		"selectTags":        "extend",
+		"hostids":           hostIDs,
+		"source":            0,
+		"object":            0,
+		"value":             1,
+		"problem_time_from": start.Unix(),
+		"problem_time_till": end.Unix(),
+		"sortfield":         []string{"clock", "eventid"},
+		"sortorder":         "DESC",
+		"limit":             limit + 1,
 	}
 	if severityMin != "" {
 		params["severities"] = severitiesFrom(severityMin)
@@ -322,7 +324,7 @@ func (c *Client) ProblemHistory(ctx context.Context, host string, start, end tim
 		TriggerID    string `json:"objectid"`
 		Name         string `json:"name"`
 		Clock        string `json:"clock"`
-		RClock       string `json:"r_clock"`
+		RecoveryID   string `json:"r_eventid"`
 		Severity     string `json:"severity"`
 		Acknowledged string `json:"acknowledged"`
 		Suppressed   string `json:"suppressed"`
@@ -335,6 +337,32 @@ func (c *Client) ProblemHistory(ctx context.Context, host string, start, end tim
 	truncated := len(rows) > limit
 	if truncated {
 		rows = rows[:limit]
+	}
+	recoveryIDs := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if row.RecoveryID != "" && row.RecoveryID != "0" {
+			recoveryIDs = append(recoveryIDs, row.RecoveryID)
+		}
+	}
+	recoveryClocks := make(map[string]time.Time, len(recoveryIDs))
+	if len(recoveryIDs) > 0 {
+		var recoveryRows []struct {
+			EventID string `json:"eventid"`
+			Clock   string `json:"clock"`
+		}
+		if err := c.call(ctx, "event.get", map[string]any{
+			"output":   []string{"eventid", "clock"},
+			"eventids": recoveryIDs,
+		}, true, &recoveryRows); err != nil {
+			return nil, err
+		}
+		for _, recovery := range recoveryRows {
+			clock, err := parseUnixField("recovery event clock", recovery.Clock)
+			if err != nil {
+				return nil, err
+			}
+			recoveryClocks[recovery.EventID] = clock
+		}
 	}
 	out := make([]ProblemHistoryRow, 0, len(rows))
 	for _, row := range rows {
@@ -350,19 +378,19 @@ func (c *Client) ProblemHistory(ctx context.Context, host string, start, end tim
 		if row.CauseEventID != "" && row.CauseEventID != "0" {
 			item.CauseEventID = row.CauseEventID
 		}
-		if row.RClock == "" || row.RClock == "0" {
+		if row.RecoveryID == "" || row.RecoveryID == "0" {
 			item.Ongoing = true
 			item.DurationSeconds = end.Unix() - startedAt.Unix()
 			if item.DurationSeconds < 0 {
 				item.DurationSeconds = 0
 			}
 		} else {
-			resolvedAt, err := parseUnixField("r_clock", row.RClock)
-			if err != nil {
-				return nil, err
+			resolvedAt, ok := recoveryClocks[row.RecoveryID]
+			if !ok {
+				return nil, fmt.Errorf("zabbix: recovery event %q missing for problem %q", row.RecoveryID, row.EventID)
 			}
 			if resolvedAt.Before(startedAt) {
-				return nil, fmt.Errorf("zabbix: problem history r_clock precedes clock for event %q", row.EventID)
+				return nil, fmt.Errorf("zabbix: recovery event clock precedes problem clock for event %q", row.EventID)
 			}
 			item.ResolvedAt = &resolvedAt
 			item.DurationSeconds = resolvedAt.Unix() - startedAt.Unix()

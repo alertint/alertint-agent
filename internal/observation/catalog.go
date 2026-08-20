@@ -77,7 +77,7 @@ func DefaultCatalog(adapters Adapters) *Catalog {
 		Capability{Name: observationmodel.CapabilityZabbixProblemHistory, ReadOnly: true,
 			ScopeKeys: []string{"host"}, RequiredScope: []string{"host"}, MaxWindow: 90 * 24 * time.Hour, MaxLimit: 500,
 			Freshness: time.Minute, Timeout: 10 * time.Second, MaxResultBytes: resultBytes,
-			MaxCost: Cost{SourceCalls: 2}, Executor: configuredExecutor(adapters.ZabbixProblemHistory)},
+			MaxCost: Cost{SourceCalls: 3}, Executor: configuredExecutor(adapters.ZabbixProblemHistory)},
 		Capability{Name: observationmodel.CapabilityLokiQuery, ReadOnly: true,
 			ScopeKeys: []string{"host", "service", "environment"}, MaxWindow: 24 * time.Hour, MaxLimit: 1000,
 			Freshness: 10 * time.Second, Timeout: 10 * time.Second, MaxResultBytes: resultBytes,

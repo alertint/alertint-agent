@@ -186,6 +186,13 @@ func validateCapabilityParameters(capability Capability, parameters map[string]a
 			return fmt.Errorf("observation: parameter %q is required for %q", key, capability.Name)
 		}
 	}
+	for _, key := range []string{"resource", "query", "item_key", "severity_min", "direction", "kind"} {
+		if value, present := parameters[key]; present {
+			if _, ok := value.(string); !ok {
+				return fmt.Errorf("observation: parameter %q must be a string", key)
+			}
+		}
+	}
 	if resource, ok := parameters["resource"].(string); ok {
 		switch resource {
 		case "situation", "incident", "deliveries", "assessments", "judgments", "envelopes", "history":

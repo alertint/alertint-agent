@@ -70,11 +70,14 @@ func (r *Runner) Execute(ctx context.Context, plans []observationmodel.Plan, all
 	runs := make([]Run, len(plans))
 	factsByPlan := make([][]observationmodel.Fact, len(plans))
 	var wg sync.WaitGroup
+	reservedCalls := 0
 	for index, plan := range plans {
-		if index >= r.maxCalls {
+		capability, _ := r.catalog.capability(plan.Capability)
+		if reservedCalls+capability.MaxCost.SourceCalls > r.maxCalls {
 			runs[index] = r.withheldRun(plan)
 			continue
 		}
+		reservedCalls += capability.MaxCost.SourceCalls
 		wg.Add(1)
 		go func(index int, plan observationmodel.Plan) {
 			defer wg.Done()
@@ -106,6 +109,13 @@ func (r *Runner) executeOne(ctx context.Context, plan observationmodel.Plan) ([]
 	facts, cost, err := capability.Executor.Execute(callCtx, plan)
 	run.ObservedAt = r.clock().UTC()
 	run.Cost = cost
+	if cost.SourceCalls < 0 || cost.Tokens < 0 || cost.SourceCalls > capability.MaxCost.SourceCalls ||
+		(plan.Budget > 0 && cost.SourceCalls > plan.Budget) || (capability.MaxCost.Tokens > 0 && cost.Tokens > capability.MaxCost.Tokens) {
+		run.Status = observationmodel.ResultStatusFailed
+		run.ErrorClass = "cost_bound_exceeded"
+		run.Digest = digestFacts(nil)
+		return nil, run
+	}
 	if err != nil {
 		run.Status, run.ErrorClass = classifyError(err)
 		if run.Status == observationmodel.ResultStatusStale {
@@ -114,13 +124,6 @@ func (r *Runner) executeOne(ctx context.Context, plan observationmodel.Plan) ([]
 			run.Freshness = observationmodel.FreshnessUnknown
 		}
 		run.Truncated = run.Status == observationmodel.ResultStatusTruncated
-		run.Digest = digestFacts(nil)
-		return nil, run
-	}
-	if cost.SourceCalls < 0 || cost.Tokens < 0 || cost.SourceCalls > capability.MaxCost.SourceCalls ||
-		(plan.Budget > 0 && cost.SourceCalls > plan.Budget) || (capability.MaxCost.Tokens > 0 && cost.Tokens > capability.MaxCost.Tokens) {
-		run.Status = observationmodel.ResultStatusFailed
-		run.ErrorClass = "cost_bound_exceeded"
 		run.Digest = digestFacts(nil)
 		return nil, run
 	}
@@ -148,8 +151,9 @@ func (r *Runner) executeOne(ctx context.Context, plan observationmodel.Plan) ([]
 		validated = append(validated, fact)
 	}
 	run.Status, run.Freshness = classifyFacts(validated)
-	if run.Truncated {
+	if run.Truncated || run.Status == observationmodel.ResultStatusTruncated {
 		run.Status = observationmodel.ResultStatusTruncated
+		run.Truncated = true
 	}
 	run.Digest = digestFacts(validated)
 	return validated, run
@@ -192,7 +196,7 @@ func classifyFacts(facts []observationmodel.Fact) (observationmodel.ResultStatus
 	if len(facts) == 0 {
 		return observationmodel.ResultStatusConfirmedEmpty, observationmodel.FreshnessFresh
 	}
-	status := observationmodel.ResultStatusConfirmedValue
+	status := facts[0].ResultStatus
 	freshness := observationmodel.FreshnessFresh
 	for _, fact := range facts {
 		if fact.Freshness == observationmodel.FreshnessStale {
@@ -200,21 +204,39 @@ func classifyFacts(facts []observationmodel.Fact) (observationmodel.ResultStatus
 		} else if fact.Freshness == observationmodel.FreshnessUnknown && freshness == observationmodel.FreshnessFresh {
 			freshness = observationmodel.FreshnessUnknown
 		}
-		switch fact.ResultStatus {
-		case observationmodel.ResultStatusTruncated:
-			status = observationmodel.ResultStatusTruncated
-		case observationmodel.ResultStatusStale:
-			if status != observationmodel.ResultStatusTruncated {
-				status = observationmodel.ResultStatusStale
-			}
-		case observationmodel.ResultStatusUnconfirmedEmpty, observationmodel.ResultStatusUnavailable,
-			observationmodel.ResultStatusFailed, observationmodel.ResultStatusVocabularyUnresolved:
-			if status == observationmodel.ResultStatusConfirmedValue {
-				status = fact.ResultStatus
-			}
+		if fact.ResultStatus == observationmodel.ResultStatusStale {
+			freshness = observationmodel.FreshnessStale
+		}
+		if resultStatusRank(fact.ResultStatus) > resultStatusRank(status) {
+			status = fact.ResultStatus
 		}
 	}
 	return status, freshness
+}
+
+func resultStatusRank(status observationmodel.ResultStatus) int {
+	switch status {
+	case observationmodel.ResultStatusConfirmedEmpty:
+		return 0
+	case observationmodel.ResultStatusConfirmedValue:
+		return 1
+	case observationmodel.ResultStatusUnconfirmedEmpty:
+		return 2
+	case observationmodel.ResultStatusUnavailable:
+		return 3
+	case observationmodel.ResultStatusVocabularyUnresolved:
+		return 4
+	case observationmodel.ResultStatusWithheldByBudget:
+		return 5
+	case observationmodel.ResultStatusStale:
+		return 6
+	case observationmodel.ResultStatusTruncated:
+		return 7
+	case observationmodel.ResultStatusFailed:
+		return 8
+	default:
+		return -1
+	}
 }
 
 func validateFact(fact observationmodel.Fact, plan observationmodel.Plan) error {

@@ -225,6 +225,40 @@ func TestUpdateDeliverySourceTimesCorrectsFallbackAndSchedulesOwner(t *testing.T
 	}
 }
 
+func TestUpdateDeliverySourceTimesPreservesMixedBasisWithNullFallbackMember(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	received := mustSituationTime(t, "2026-08-20T10:00:00Z")
+	observed := mustSituationTime(t, "2026-08-20T11:00:00Z")
+	apiStart := mustSituationTime(t, "2026-08-20T09:00:00Z")
+	seedSourceTimeFixture(t, s, received)
+	insertSituationFixture(t, s, "s-mixed-time", "host=db-source", "", situationmodel.LifecycleActive, observed.Add(time.Hour))
+	if _, err := s.DB().Exec(`UPDATE situations SET effective_started_at=?,effective_started_at_basis='receipt_fallback' WHERE id='s-mixed-time'`, canonicalTime(received)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().Exec(`INSERT INTO situation_incidents(situation_id,incident_id,attached_at) VALUES('s-mixed-time','inc-source-time',?)`, canonicalTime(received)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().Exec(`INSERT INTO incident_alert_deliveries(incident_id,delivery_id,created_at) VALUES('inc-source-time','delivery-source-time',?)`, canonicalTime(received)); err != nil {
+		t.Fatal(err)
+	}
+	seedNullFallbackSituationMember(t, s, "s-mixed-time", received)
+	claims, err := s.ClaimDueSituations(ctx, "mixed-worker", observed.Add(time.Hour), time.Minute, 1)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("claim=%+v err=%v", claims, err)
+	}
+	if err := s.UpdateDeliverySourceTimes(ctx, claims[0], "delivery-source-time", &apiStart, nil, observed); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.SituationForIncident(ctx, "inc-source-time")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.EffectiveStartedAt.Equal(apiStart) || got.EffectiveStartedAtBasis != situationmodel.SourceTimeBasisMixed {
+		t.Fatalf("situation=%+v", got)
+	}
+}
+
 func seedSourceTimeFixture(t *testing.T, s *Store, received time.Time) {
 	t.Helper()
 	if _, err := s.DB().Exec(`INSERT INTO alerts(id,fingerprint,status,labels_json,annotations_json,starts_at,received_at)
@@ -240,6 +274,31 @@ func seedSourceTimeFixture(t *testing.T, s *Store, received time.Time) {
 	}
 	if _, err := s.DB().Exec(`INSERT INTO incidents(id,group_key,status,first_alert_at,last_alert_at,ready_at,alert_count,created_at,updated_at,dispatch_managed)
 		VALUES('inc-source-time','host=db-source','ready',?,?,?,?,?,?,1)`, canonicalTime(received), canonicalTime(received), canonicalTime(received), 1, canonicalTime(received), canonicalTime(received)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedNullFallbackSituationMember(t *testing.T, s *Store, situationID string, received time.Time) {
+	t.Helper()
+	if _, err := s.DB().Exec(`INSERT INTO alerts(id,fingerprint,status,labels_json,annotations_json,starts_at,received_at)
+		VALUES('alert-null-fallback','fp-null-fallback','firing','{}','{}',?,?)`, canonicalTime(received), canonicalTime(received)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().Exec(`INSERT INTO alert_deliveries(
+		id,alert_id,source,source_episode_key,status,labels_json,annotations_json,starts_at,
+		started_at_basis,resolved_at_basis,receiver_grouping_identity,payload_digest,received_at)
+		VALUES('delivery-null-fallback','alert-null-fallback','zabbix','zabbix:event:2','firing','{}','{}',?,
+		'receipt_fallback','missing','host=db-source','digest-null-fallback',?)`, canonicalTime(received), canonicalTime(received)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().Exec(`INSERT INTO incidents(id,group_key,status,first_alert_at,last_alert_at,ready_at,alert_count,created_at,updated_at,dispatch_managed)
+		VALUES('inc-null-fallback','host=db-source','ready',?,?,?,?,?,?,1)`, canonicalTime(received), canonicalTime(received), canonicalTime(received), 1, canonicalTime(received), canonicalTime(received)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().Exec(`INSERT INTO situation_incidents(situation_id,incident_id,attached_at) VALUES(?,'inc-null-fallback',?)`, situationID, canonicalTime(received)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().Exec(`INSERT INTO incident_alert_deliveries(incident_id,delivery_id,created_at) VALUES('inc-null-fallback','delivery-null-fallback',?)`, canonicalTime(received)); err != nil {
 		t.Fatal(err)
 	}
 }

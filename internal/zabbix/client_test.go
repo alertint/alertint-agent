@@ -298,9 +298,9 @@ func TestHostContext_NoHostWrapsErrNotFound(t *testing.T) {
 	}
 }
 
-func TestProblemHistoryNormalizesClockAndRClock(t *testing.T) {
+func TestProblemHistoryUsesAssociatedRecoveryEventClock(t *testing.T) {
 	var methods []string
-	var eventParams map[string]any
+	var problemParams, recoveryParams map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Method string         `json:"method"`
@@ -314,9 +314,14 @@ func TestProblemHistoryNormalizesClockAndRClock(t *testing.T) {
 		case "host.get":
 			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[{"hostid":"17"}],"id":1}`))
 		case "event.get":
-			eventParams = req.Params
+			if _, recovering := req.Params["eventids"]; recovering {
+				recoveryParams = req.Params
+				_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[{"eventid":"601","clock":"1787187600"}],"id":1}`))
+				return
+			}
+			problemParams = req.Params
 			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[{
-				"eventid":"501","objectid":"71","name":"CPU {$WINDOW}","clock":"1787184000","r_clock":"1787187600",
+				"eventid":"501","objectid":"71","name":"CPU {$WINDOW}","clock":"1787184000","r_eventid":"601",
 				"severity":"4","acknowledged":"1","suppressed":"0","tags":[{"tag":"service","value":"db"}],"cause_eventid":"99"
 			}],"id":1}`))
 		default:
@@ -339,14 +344,29 @@ func TestProblemHistoryNormalizesClockAndRClock(t *testing.T) {
 	if row.EventID != "501" || row.TriggerID != "71" || row.Name != "CPU {$WINDOW}" || !row.Acknowledged || row.Suppressed || row.CauseEventID != "99" {
 		t.Fatalf("identity row=%+v", row)
 	}
-	if !reflect.DeepEqual(methods, []string{"host.get", "event.get"}) {
+	if !reflect.DeepEqual(methods, []string{"host.get", "event.get", "event.get"}) {
 		t.Fatalf("methods=%v", methods)
 	}
-	if got := eventParams["hostids"]; !reflect.DeepEqual(got, []any{"17"}) {
+	if got := problemParams["hostids"]; !reflect.DeepEqual(got, []any{"17"}) {
 		t.Fatalf("hostids=%v", got)
 	}
-	if eventParams["value"] != float64(1) || eventParams["source"] != float64(0) || eventParams["object"] != float64(0) {
-		t.Fatalf("read-only problem-event params=%v", eventParams)
+	if problemParams["value"] != float64(1) || problemParams["source"] != float64(0) || problemParams["object"] != float64(0) {
+		t.Fatalf("read-only problem-event params=%v", problemParams)
+	}
+	if problemParams["problem_time_from"] != float64(start.Unix()) || problemParams["problem_time_till"] != float64(end.Unix()) || problemParams["time_from"] != nil || problemParams["time_till"] != nil {
+		t.Fatalf("overlap params=%v", problemParams)
+	}
+	output, ok := problemParams["output"].([]any)
+	if !ok {
+		t.Fatalf("output=%T %v", problemParams["output"], problemParams["output"])
+	}
+	for _, field := range output {
+		if field == "r_clock" {
+			t.Fatalf("unsupported event.get r_clock requested: %v", output)
+		}
+	}
+	if got := recoveryParams["eventids"]; !reflect.DeepEqual(got, []any{"601"}) {
+		t.Fatalf("recovery eventids=%v", got)
 	}
 }
 
@@ -364,17 +384,20 @@ func TestProblemHistoryPreservesTruncationAndOngoingDuration(t *testing.T) {
 		if req.Params["limit"] != float64(2) {
 			t.Fatalf("limit=%v, want limit+1", req.Params["limit"])
 		}
+		if req.Params["problem_time_from"] != float64(1787184000) || req.Params["problem_time_till"] != float64(1787187600) {
+			t.Fatalf("overlap params=%v", req.Params)
+		}
 		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[
-			{"eventid":"2","objectid":"7","name":"ongoing","clock":"1787184000","r_clock":"0","severity":"3","acknowledged":"0","suppressed":"0","tags":[]},
-			{"eventid":"1","objectid":"7","name":"older","clock":"1787180000","r_clock":"1787181000","severity":"3","acknowledged":"0","suppressed":"0","tags":[]}
+			{"eventid":"2","objectid":"7","name":"ongoing","clock":"1787180000","r_eventid":"0","severity":"3","acknowledged":"0","suppressed":"0","tags":[]},
+			{"eventid":"1","objectid":"7","name":"older","clock":"1787170000","r_eventid":"0","severity":"3","acknowledged":"0","suppressed":"0","tags":[]}
 		],"id":1}`))
 	}))
 	defer srv.Close()
 	client := zabbix.NewClient(zabbix.Config{BaseURL: srv.URL, APIToken: "t"})
-	start := time.Unix(1787180000, 0).UTC()
+	start := time.Unix(1787184000, 0).UTC()
 	end := time.Unix(1787187600, 0).UTC()
 	rows, err := client.ProblemHistory(context.Background(), "db-1", start, end, "3", 1)
-	if err != nil || len(rows) != 1 || !rows[0].Ongoing || !rows[0].Truncated || rows[0].DurationSeconds != 3600 {
+	if err != nil || len(rows) != 1 || !rows[0].Ongoing || !rows[0].Truncated || rows[0].DurationSeconds != 7600 || !rows[0].StartedAt.Before(start) {
 		t.Fatalf("rows=%+v err=%v", rows, err)
 	}
 }
@@ -389,7 +412,7 @@ func TestProblemHistoryRejectsMalformedSourceClock(t *testing.T) {
 			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[{"hostid":"17"}],"id":1}`))
 			return
 		}
-		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[{"eventid":"1","objectid":"7","name":"bad","clock":"not-a-clock","r_clock":"0","severity":"3"}],"id":1}`))
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[{"eventid":"1","objectid":"7","name":"bad","clock":"not-a-clock","r_eventid":"0","severity":"3"}],"id":1}`))
 	}))
 	defer srv.Close()
 	client := zabbix.NewClient(zabbix.Config{BaseURL: srv.URL, APIToken: "t"})

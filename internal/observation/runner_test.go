@@ -164,6 +164,112 @@ func TestRunnerRejectsInvalidPlanBeforeCallingExecutor(t *testing.T) {
 	}
 }
 
+func TestRunnerBudgetsDeclaredSourceCallsIncludingErrors(t *testing.T) {
+	now := mustObservationTime(t, "2026-08-20T02:00:00Z")
+	for _, tc := range []struct {
+		name        string
+		sourceCalls int
+		executeErr  error
+		wantFirst   observationmodel.ResultStatus
+		wantClass   string
+	}{
+		{name: "success", sourceCalls: 2, wantFirst: observationmodel.ResultStatusConfirmedEmpty},
+		{name: "error", sourceCalls: 2, executeErr: errors.New("source failed"), wantFirst: observationmodel.ResultStatusFailed, wantClass: "connector_error"},
+		{name: "error over declared cost", sourceCalls: 3, executeErr: errors.New("source failed"), wantFirst: observationmodel.ResultStatusFailed, wantClass: "cost_bound_exceeded"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			executor := executorFunc(func(context.Context, observationmodel.Plan) ([]observationmodel.Fact, Cost, error) {
+				calls++
+				return nil, Cost{SourceCalls: tc.sourceCalls}, tc.executeErr
+			})
+			cat := NewCatalog(Capability{
+				Name: observationmodel.CapabilityStoreRead, ReadOnly: true,
+				ScopeKeys: []string{"situation_id"}, RequiredScope: []string{"situation_id"},
+				MaxWindow: time.Hour, MaxLimit: 10, Freshness: time.Second, Timeout: time.Second,
+				MaxResultBytes: 1024, MaxCost: Cost{SourceCalls: 2}, Executor: executor,
+			})
+			runner := NewRunner(cat, 2, 1)
+			runner.clock = func() time.Time { return now }
+			plan := validPlan(observationmodel.CapabilityStoreRead, map[string]string{"situation_id": "s-1"}, now.Add(-time.Minute), now)
+			_, runs, err := runner.Execute(context.Background(), []observationmodel.Plan{plan, plan}, Scope{"situation_id": {"s-1"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if calls != 1 || len(runs) != 2 || runs[0].Status != tc.wantFirst || runs[0].ErrorClass != tc.wantClass || runs[1].Status != observationmodel.ResultStatusWithheldByBudget {
+				t.Fatalf("calls=%d runs=%+v", calls, runs)
+			}
+		})
+	}
+}
+
+func TestRunnerPreservesEveryReturnedClosedStatus(t *testing.T) {
+	now := mustObservationTime(t, "2026-08-20T02:00:00Z")
+	statuses := []observationmodel.ResultStatus{
+		observationmodel.ResultStatusConfirmedValue,
+		observationmodel.ResultStatusConfirmedEmpty,
+		observationmodel.ResultStatusUnconfirmedEmpty,
+		observationmodel.ResultStatusUnavailable,
+		observationmodel.ResultStatusFailed,
+		observationmodel.ResultStatusStale,
+		observationmodel.ResultStatusTruncated,
+		observationmodel.ResultStatusWithheldByBudget,
+		observationmodel.ResultStatusVocabularyUnresolved,
+	}
+	for _, status := range statuses {
+		t.Run(string(status), func(t *testing.T) {
+			executor := executorFunc(func(context.Context, observationmodel.Plan) ([]observationmodel.Fact, Cost, error) {
+				return []observationmodel.Fact{{
+					ID: "fact-" + string(status), SituationID: "s-1", InputVersion: 1,
+					Kind: "result", Subject: "s-1", Value: json.RawMessage(`{}`),
+					SourceCapability: observationmodel.CapabilityStoreRead, ObservedAt: now,
+					Freshness: observationmodel.FreshnessFresh, ResultStatus: status,
+					Digest: "digest-" + string(status), EvidenceRefs: []string{},
+				}}, Cost{SourceCalls: 1}, nil
+			})
+			cat := NewCatalog(Capability{
+				Name: observationmodel.CapabilityStoreRead, ReadOnly: true,
+				ScopeKeys: []string{"situation_id"}, RequiredScope: []string{"situation_id"},
+				MaxWindow: time.Hour, MaxLimit: 10, Freshness: time.Second, Timeout: time.Second,
+				MaxResultBytes: 4096, MaxCost: Cost{SourceCalls: 1}, Executor: executor,
+			})
+			runner := NewRunner(cat, 1, 1)
+			runner.clock = func() time.Time { return now }
+			plan := validPlan(observationmodel.CapabilityStoreRead, map[string]string{"situation_id": "s-1"}, now.Add(-time.Minute), now)
+			_, runs, err := runner.Execute(context.Background(), []observationmodel.Plan{plan}, Scope{"situation_id": {"s-1"}})
+			if err != nil || len(runs) != 1 || runs[0].Status != status {
+				t.Fatalf("status=%q runs=%+v err=%v", status, runs, err)
+			}
+		})
+	}
+}
+
+func TestValidatePlanRejectsWrongOptionalParameterTypes(t *testing.T) {
+	now := mustObservationTime(t, "2026-08-20T02:00:00Z")
+	catalog := DefaultCatalog(Adapters{})
+	cases := []struct {
+		name       string
+		capability observationmodel.Capability
+		scope      map[string]string
+		parameters string
+		allowed    Scope
+	}{
+		{name: "severity number", capability: observationmodel.CapabilityZabbixProblemHistory, scope: map[string]string{"host": "db-1"}, parameters: `{"severity_min":3}`, allowed: Scope{"host": {"db-1"}}},
+		{name: "direction number", capability: observationmodel.CapabilityLokiQuery, scope: map[string]string{"host": "db-1"}, parameters: `{"query":"{host=\"db-1\"}","direction":1}`, allowed: Scope{"host": {"db-1"}}},
+		{name: "sentry query boolean", capability: observationmodel.CapabilitySentryIssues, scope: map[string]string{"project": "api"}, parameters: `{"query":false}`, allowed: Scope{"project": {"api"}}},
+		{name: "change kind array", capability: observationmodel.CapabilityChangeEvents, scope: map[string]string{"service": "api"}, parameters: `{"kind":[]}`, allowed: Scope{"service": {"api"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := validPlan(tc.capability, tc.scope, now.Add(-time.Minute), now)
+			plan.Parameters = json.RawMessage(tc.parameters)
+			if err := catalog.Validate(plan, tc.allowed); err == nil || !strings.Contains(err.Error(), "must be a string") {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
+}
+
 func validPlan(capability observationmodel.Capability, scope map[string]string, start, end time.Time) observationmodel.Plan {
 	parameters := json.RawMessage(`{}`)
 	switch capability {
