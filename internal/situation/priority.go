@@ -8,15 +8,40 @@ import (
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
-// ApplyAttentionFloors promotes only the four closed deterministic anchors.
-// All other candidate codes remain advisory to validated L2 assessment.
-func ApplyAttentionFloors(proposed model.Attention, reasons []model.ReasonCandidate) model.Attention {
-	for _, reason := range reasons {
-		if _, ok := urgentFloorCodes[reason.Code]; ok && reason.DeterministicFloor {
-			return model.AttentionUrgent
+// ApplyAttentionFloors promotes only candidates that exactly match a fresh
+// deterministic catalog evaluation of snapshot. Caller-authored candidates
+// carry no floor authority.
+func ApplyAttentionFloors(proposed model.Attention, snapshot Snapshot, reasons []model.ReasonCandidate) model.Attention {
+	eligible := EligibleReasons(snapshot)
+	for _, supplied := range reasons {
+		if _, ok := urgentFloorCodes[supplied.Code]; !ok {
+			continue
+		}
+		for _, expected := range eligible {
+			if reasonCandidatesEqual(expected, supplied) && expected.DeterministicFloor {
+				return model.AttentionUrgent
+			}
 		}
 	}
 	return proposed
+}
+
+func reasonCandidatesEqual(left, right model.ReasonCandidate) bool {
+	if left.ID != right.ID || left.CatalogVersion != right.CatalogVersion || left.PredicateVersion != right.PredicateVersion ||
+		left.Code != right.Code || left.PredicateResult != right.PredicateResult || left.DeterministicFloor != right.DeterministicFloor {
+		return false
+	}
+	leftRefs := canonicalStrings(left.EvidenceRefs)
+	rightRefs := canonicalStrings(right.EvidenceRefs)
+	if len(leftRefs) != len(rightRefs) {
+		return false
+	}
+	for i := range leftRefs {
+		if leftRefs[i] != rightRefs[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // DeriveInterruptionPriority implements the fixed Situation publication

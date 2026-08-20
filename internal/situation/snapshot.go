@@ -41,15 +41,16 @@ type Membership struct {
 }
 
 type Symptom struct {
-	ID               string               `json:"id"`
-	Source           string               `json:"source,omitempty"`
-	TriggerVersion   string               `json:"trigger_version,omitempty"`
-	ProfileSignature string               `json:"profile_signature,omitempty"`
-	ProfileVersion   int                  `json:"profile_version,omitempty"`
-	Lifecycle        model.DeliveryStatus `json:"lifecycle"`
-	Severity         string               `json:"severity,omitempty"`
-	Novel            bool                 `json:"novel"`
-	EvidenceRefs     []string             `json:"evidence_refs"`
+	ID                  string               `json:"id"`
+	Source              string               `json:"source,omitempty"`
+	TriggerVersion      string               `json:"trigger_version,omitempty"`
+	ProfileSignature    string               `json:"profile_signature,omitempty"`
+	ProfileVersion      int                  `json:"profile_version,omitempty"`
+	Lifecycle           model.DeliveryStatus `json:"lifecycle"`
+	Severity            string               `json:"severity,omitempty"`
+	Novel               bool                 `json:"novel"`
+	EvidenceRefs        []string             `json:"evidence_refs"`
+	NoveltyEvidenceRefs []string             `json:"novelty_evidence_refs,omitempty"`
 }
 
 type ProfileHead struct {
@@ -108,15 +109,49 @@ type ConnectorState struct {
 	EvidenceRefs []string                      `json:"evidence_refs"`
 }
 
-// L1Finding is the bounded normalized output of acute investigation. Raw model
-// prose and confidence numbers are not part of the material snapshot.
-type L1Finding struct {
+// L1Output is the bounded acute-investigation input. BuildSnapshot discards
+// prose and confidence before constructing the material Snapshot.
+type L1Output struct {
 	Status          string   `json:"status"`
 	Summary         string   `json:"summary,omitempty"`
 	RootCauseClass  string   `json:"root_cause_class,omitempty"`
 	ConfidenceClass string   `json:"confidence_class,omitempty"`
 	FactDigests     []string `json:"fact_digests,omitempty"`
 	EvidenceRefs    []string `json:"evidence_refs,omitempty"`
+}
+
+// L1Finding is the material normalized subset retained by Snapshot.
+type L1Finding struct {
+	Status         string   `json:"status"`
+	RootCauseClass string   `json:"root_cause_class,omitempty"`
+	FactDigests    []string `json:"fact_digests,omitempty"`
+	EvidenceRefs   []string `json:"evidence_refs,omitempty"`
+}
+
+// JudgmentFact retains steering semantics without audit identity or actor
+// attribution metadata.
+type JudgmentFact struct {
+	CoveredFactHash string              `json:"covered_fact_hash"`
+	CoveredSymptoms []string            `json:"covered_symptoms"`
+	CoveredImpact   []string            `json:"covered_impact"`
+	Judgment        model.JudgmentKind  `json:"judgment"`
+	Basis           model.JudgmentBasis `json:"basis"`
+	Workload        string              `json:"workload,omitempty"`
+	ValidUntil      *time.Time          `json:"valid_until,omitempty"`
+	EvidenceRefs    []string            `json:"evidence_refs"`
+}
+
+// EnvelopeResult is the material deterministic policy evaluation retained by
+// Snapshot. Evaluation attempt identity and presentation time are discarded.
+type EnvelopeResult struct {
+	EnvelopeID        string                         `json:"envelope_id"`
+	EnvelopeVersion   int                            `json:"envelope_version"`
+	Result            model.EnvelopeEvaluationResult `json:"result"`
+	MatchedFields     []string                       `json:"matched_fields"`
+	Violations        []string                       `json:"violations"`
+	Observability     []string                       `json:"observability"`
+	EvidenceRefs      []string                       `json:"evidence_refs"`
+	QuietingAuthority bool                           `json:"quieting_authority"`
 }
 
 // SnapshotInput is an immutable read model. Callers remain responsible for
@@ -131,7 +166,8 @@ type SnapshotInput struct {
 	Facts                       []observationmodel.Fact
 	Judgments                   []model.Judgment
 	Envelope                    *model.EnvelopeEvaluation
-	L1                          *L1Finding
+	EnvelopeEvidenceRefs        []string
+	L1                          *L1Output
 	CompletedEpisodes           []CompletedEpisode
 	CurrentDurationEvidenceRefs []string
 	DurationClass               string
@@ -144,50 +180,50 @@ type SnapshotInput struct {
 	TerminalUncertainty         *TerminalUncertainty
 	ConnectorStates             []ConnectorState
 	Limitations                 []model.Limitation
-	SlackChannel                string
 }
 
 // Snapshot is a detached, canonical, replayable fact view for one exact
 // Situation input version.
 type Snapshot struct {
-	SchemaVersion               int                       `json:"schema_version"`
-	SituationID                 string                    `json:"situation_id"`
-	InputVersion                int                       `json:"input_version"`
-	Lifecycle                   model.Lifecycle           `json:"lifecycle"`
-	EffectiveStartedAt          time.Time                 `json:"effective_started_at"`
-	EffectiveStartedAtBasis     model.SourceTimeBasis     `json:"effective_started_at_basis"`
-	FirstReceivedAt             time.Time                 `json:"first_received_at"`
-	GeneratedAt                 time.Time                 `json:"generated_at"`
-	ElapsedSeconds              int64                     `json:"elapsed_seconds"`
-	DurationClass               string                    `json:"duration_class"`
-	RecurrenceClass             string                    `json:"recurrence_class"`
-	CrossedMilestones           []string                  `json:"crossed_milestones"`
-	IncidentIDs                 []string                  `json:"incident_ids"`
-	Deliveries                  []Delivery                `json:"deliveries"`
-	Symptoms                    []Symptom                 `json:"symptoms"`
-	ProfileHeads                []ProfileHead             `json:"profile_heads"`
-	Facts                       []observationmodel.Fact   `json:"facts"`
-	Judgments                   []model.Judgment          `json:"judgments"`
-	Envelope                    *model.EnvelopeEvaluation `json:"envelope,omitempty"`
-	L1                          *L1Finding                `json:"l1,omitempty"`
-	CompletedEpisodes           []CompletedEpisode        `json:"completed_episodes"`
-	CurrentDurationEvidenceRefs []string                  `json:"current_duration_evidence_refs"`
-	Impact                      []ImpactFact              `json:"impact"`
-	BlastRadius                 *BlastRadius              `json:"blast_radius,omitempty"`
-	UrgentPolicies              []UrgentPolicy            `json:"urgent_policies"`
-	SemanticChoice              *SemanticChoice           `json:"semantic_choice,omitempty"`
-	TerminalUncertainty         *TerminalUncertainty      `json:"terminal_uncertainty,omitempty"`
-	ConnectorStates             []ConnectorState          `json:"connector_states"`
-	Limitations                 []model.Limitation        `json:"limitations"`
-	EligibleReasons             []model.ReasonCandidate   `json:"eligible_reasons"`
-	MaterialHash                string                    `json:"material_hash"`
-	SlackChannel                string                    `json:"slack_channel,omitempty"`
+	SchemaVersion               int                     `json:"schema_version"`
+	SituationID                 string                  `json:"situation_id"`
+	InputVersion                int                     `json:"input_version"`
+	Lifecycle                   model.Lifecycle         `json:"lifecycle"`
+	EffectiveStartedAt          time.Time               `json:"effective_started_at"`
+	EffectiveStartedAtBasis     model.SourceTimeBasis   `json:"effective_started_at_basis"`
+	FirstReceivedAt             time.Time               `json:"first_received_at"`
+	ElapsedSeconds              int64                   `json:"elapsed_seconds"`
+	DurationClass               string                  `json:"duration_class"`
+	RecurrenceClass             string                  `json:"recurrence_class"`
+	CrossedMilestones           []string                `json:"crossed_milestones"`
+	IncidentIDs                 []string                `json:"incident_ids"`
+	Deliveries                  []Delivery              `json:"deliveries"`
+	Symptoms                    []Symptom               `json:"symptoms"`
+	ProfileHeads                []ProfileHead           `json:"profile_heads"`
+	Facts                       []observationmodel.Fact `json:"facts"`
+	Judgments                   []JudgmentFact          `json:"judgments"`
+	Envelope                    *EnvelopeResult         `json:"envelope,omitempty"`
+	L1                          *L1Finding              `json:"l1,omitempty"`
+	CompletedEpisodes           []CompletedEpisode      `json:"completed_episodes"`
+	CurrentDurationEvidenceRefs []string                `json:"current_duration_evidence_refs"`
+	Impact                      []ImpactFact            `json:"impact"`
+	BlastRadius                 *BlastRadius            `json:"blast_radius,omitempty"`
+	UrgentPolicies              []UrgentPolicy          `json:"urgent_policies"`
+	SemanticChoice              *SemanticChoice         `json:"semantic_choice,omitempty"`
+	TerminalUncertainty         *TerminalUncertainty    `json:"terminal_uncertainty,omitempty"`
+	ConnectorStates             []ConnectorState        `json:"connector_states"`
+	Limitations                 []model.Limitation      `json:"limitations"`
+	EligibleReasons             []model.ReasonCandidate `json:"eligible_reasons"`
+	MaterialHash                string                  `json:"material_hash"`
 }
 
 // BuildSnapshot canonically reduces already-loaded immutable evidence.
 func BuildSnapshot(in SnapshotInput) (Snapshot, error) {
 	if strings.TrimSpace(in.Situation.ID) == "" || in.Situation.InputVersion <= 0 {
 		return Snapshot{}, errors.New("situation: snapshot requires situation id and positive input version")
+	}
+	if err := validateEffectiveStartProvenance(in.Situation, in.Deliveries); err != nil {
+		return Snapshot{}, err
 	}
 	deliveries := canonicalDeliveries(in.Deliveries)
 	effective, firstReceipt, basis := canonicalSituationTimes(in.Situation, deliveries)
@@ -221,16 +257,16 @@ func BuildSnapshot(in SnapshotInput) (Snapshot, error) {
 	snapshot := Snapshot{
 		SchemaVersion: SnapshotSchemaVersion, SituationID: in.Situation.ID, InputVersion: in.Situation.InputVersion,
 		Lifecycle: in.Situation.Lifecycle, EffectiveStartedAt: effective, EffectiveStartedAtBasis: basis,
-		FirstReceivedAt: firstReceipt, GeneratedAt: now, ElapsedSeconds: int64(elapsed / time.Second),
+		FirstReceivedAt: firstReceipt, ElapsedSeconds: int64(elapsed / time.Second),
 		DurationClass: durationClass, RecurrenceClass: recurrenceClass,
 		CrossedMilestones: canonicalStrings(in.CrossedMilestones), Deliveries: deliveries,
 		Symptoms: canonicalSymptoms(in.Symptoms, deliveries), ProfileHeads: canonicalProfiles(in.ProfileHeads), Facts: facts,
-		Judgments: canonicalJudgments(in.Judgments), Envelope: canonicalEnvelope(in.Envelope), L1: canonicalL1(in.L1),
+		Judgments: canonicalJudgments(in.Judgments), Envelope: canonicalEnvelope(in.Envelope, in.EnvelopeEvidenceRefs), L1: canonicalL1(in.L1),
 		CompletedEpisodes: canonicalEpisodes(in.CompletedEpisodes), CurrentDurationEvidenceRefs: canonicalStrings(in.CurrentDurationEvidenceRefs),
 		Impact: canonicalImpact(in.Impact), BlastRadius: canonicalBlastRadius(in.BlastRadius),
 		UrgentPolicies: canonicalPolicies(in.UrgentPolicies), SemanticChoice: canonicalSemanticChoice(in.SemanticChoice),
 		TerminalUncertainty: canonicalTerminalUncertainty(in.TerminalUncertainty), ConnectorStates: canonicalConnectorStates(in.ConnectorStates),
-		Limitations: canonicalLimitations(in.Limitations), SlackChannel: in.SlackChannel,
+		Limitations: canonicalLimitations(in.Limitations),
 	}
 	incidentIDs := make([]string, 0, len(in.Memberships)+len(deliveries))
 	for _, membership := range in.Memberships {
@@ -243,6 +279,20 @@ func BuildSnapshot(in SnapshotInput) (Snapshot, error) {
 	snapshot.EligibleReasons = EligibleReasons(snapshot)
 	snapshot.MaterialHash = MaterialFactHash(snapshot)
 	return snapshot, nil
+}
+
+func validateEffectiveStartProvenance(situation model.Situation, deliveries []Delivery) error {
+	if !situation.EffectiveStartedAt.IsZero() && !validHashBasis(situation.EffectiveStartedAtBasis) {
+		return errors.New("situation: snapshot effective start requires source_payload, source_api, receipt_fallback, or mixed provenance")
+	}
+	for _, delivery := range deliveries {
+		contributesStart := delivery.SourceStartedAt != nil ||
+			delivery.StartedAtBasis == model.SourceTimeBasisReceiptFallback && !delivery.ReceivedAt.IsZero()
+		if contributesStart && !validHashBasis(delivery.StartedAtBasis) {
+			return errors.New("situation: snapshot delivery start requires source_payload, source_api, receipt_fallback, or mixed provenance")
+		}
+	}
+	return nil
 }
 
 func classifyDuration(elapsed time.Duration) string {
@@ -338,6 +388,7 @@ func canonicalSymptoms(explicit []Symptom, deliveries []Delivery) []Symptom {
 		symptom.ID = strings.TrimSpace(symptom.ID)
 		symptom.Severity = strings.ToLower(strings.TrimSpace(symptom.Severity))
 		symptom.EvidenceRefs = canonicalStrings(symptom.EvidenceRefs)
+		symptom.NoveltyEvidenceRefs = canonicalStrings(symptom.NoveltyEvidenceRefs)
 		out = append(out, symptom)
 	}
 	for _, delivery := range latest {
@@ -372,27 +423,57 @@ func canonicalProfiles(in []ProfileHead) []ProfileHead {
 	return out
 }
 
-func canonicalJudgments(in []model.Judgment) []model.Judgment {
-	out := append([]model.Judgment(nil), in...)
+func canonicalJudgments(in []model.Judgment) []JudgmentFact {
+	out := make([]JudgmentFact, len(in))
+	for i := range in {
+		out[i] = JudgmentFact{
+			CoveredFactHash: in[i].CoveredFactHash,
+			CoveredSymptoms: canonicalStrings(in[i].CoveredSymptoms),
+			CoveredImpact:   canonicalStrings(in[i].CoveredImpact),
+			Judgment:        in[i].Judgment,
+			Basis:           in[i].Basis,
+			EvidenceRefs:    canonicalStrings(in[i].EvidenceRefs),
+		}
+		if in[i].Workload != nil {
+			out[i].Workload = strings.TrimSpace(*in[i].Workload)
+		}
+		if in[i].ValidUntil != nil {
+			value := in[i].ValidUntil.UTC()
+			out[i].ValidUntil = &value
+		}
+	}
+	return canonicalJudgmentFacts(out)
+}
+
+func canonicalJudgmentFacts(in []JudgmentFact) []JudgmentFact {
+	out := append([]JudgmentFact(nil), in...)
 	for i := range out {
 		out[i].CoveredSymptoms = canonicalStrings(out[i].CoveredSymptoms)
 		out[i].CoveredImpact = canonicalStrings(out[i].CoveredImpact)
 		out[i].EvidenceRefs = canonicalStrings(out[i].EvidenceRefs)
-		out[i].CreatedAt = out[i].CreatedAt.UTC()
-		if out[i].Workload != nil {
-			value := *out[i].Workload
-			out[i].Workload = &value
-		}
+		out[i].Workload = strings.TrimSpace(out[i].Workload)
 		if out[i].ValidUntil != nil {
 			value := out[i].ValidUntil.UTC()
 			out[i].ValidUntil = &value
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out
+	sort.Slice(out, func(i, j int) bool { return canonicalLess(out[i], out[j]) })
+	return dedupeJSON(out)
 }
 
-func canonicalEnvelope(in *model.EnvelopeEvaluation) *model.EnvelopeEvaluation {
+func canonicalEnvelope(in *model.EnvelopeEvaluation, evidenceRefs []string) *EnvelopeResult {
+	if in == nil {
+		return nil
+	}
+	return &EnvelopeResult{
+		EnvelopeID: in.EnvelopeID, EnvelopeVersion: in.EnvelopeVersion, Result: in.Result,
+		MatchedFields: canonicalStrings(in.MatchedFields), Violations: canonicalStrings(in.Violations),
+		Observability: canonicalStrings(in.Observability), EvidenceRefs: canonicalStrings(evidenceRefs),
+		QuietingAuthority: in.QuietingAuthority,
+	}
+}
+
+func canonicalEnvelopeResult(in *EnvelopeResult) *EnvelopeResult {
 	if in == nil {
 		return nil
 	}
@@ -400,11 +481,19 @@ func canonicalEnvelope(in *model.EnvelopeEvaluation) *model.EnvelopeEvaluation {
 	out.MatchedFields = canonicalStrings(in.MatchedFields)
 	out.Violations = canonicalStrings(in.Violations)
 	out.Observability = canonicalStrings(in.Observability)
-	out.CreatedAt = in.CreatedAt.UTC()
+	out.EvidenceRefs = canonicalStrings(in.EvidenceRefs)
 	return &out
 }
 
-func canonicalL1(in *L1Finding) *L1Finding {
+func canonicalL1(in *L1Output) *L1Finding {
+	if in == nil {
+		return nil
+	}
+	return &L1Finding{Status: in.Status, RootCauseClass: in.RootCauseClass,
+		FactDigests: canonicalStrings(in.FactDigests), EvidenceRefs: canonicalStrings(in.EvidenceRefs)}
+}
+
+func canonicalL1Finding(in *L1Finding) *L1Finding {
 	if in == nil {
 		return nil
 	}
@@ -457,7 +546,7 @@ func canonicalPolicies(in []UrgentPolicy) []UrgentPolicy {
 	for i := range out {
 		out[i].EvidenceRefs = canonicalStrings(out[i].EvidenceRefs)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	sort.Slice(out, func(i, j int) bool { return canonicalLess(out[i], out[j]) })
 	return out
 }
 
@@ -484,15 +573,7 @@ func canonicalConnectorStates(in []ConnectorState) []ConnectorState {
 	for i := range out {
 		out[i].EvidenceRefs = canonicalStrings(out[i].EvidenceRefs)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Capability != out[j].Capability {
-			return out[i].Capability < out[j].Capability
-		}
-		if out[i].Status != out[j].Status {
-			return out[i].Status < out[j].Status
-		}
-		return out[i].Freshness < out[j].Freshness
-	})
+	sort.Slice(out, func(i, j int) bool { return canonicalLess(out[i], out[j]) })
 	return out
 }
 
@@ -509,6 +590,12 @@ func dedupeJSON[T any](in []T) []T {
 		out = append(out, value)
 	}
 	return out
+}
+
+func canonicalLess[T any](left, right T) bool {
+	leftJSON, _ := json.Marshal(left)
+	rightJSON, _ := json.Marshal(right)
+	return string(leftJSON) < string(rightJSON)
 }
 
 // MaterialFactHash hashes only normalized evidence meaning. Snapshot identity,
@@ -555,35 +642,6 @@ func MaterialFactHash(snapshot Snapshot) string {
 		materialReasons[i] = materialReason{reason.CatalogVersion, reason.PredicateVersion, reason.Code,
 			reason.PredicateResult, canonicalStrings(reason.EvidenceRefs), reason.DeterministicFloor}
 	}
-	type materialEnvelope struct {
-		EnvelopeID        string                         `json:"envelope_id"`
-		EnvelopeVersion   int                            `json:"envelope_version"`
-		Result            model.EnvelopeEvaluationResult `json:"result"`
-		MatchedFields     []string                       `json:"matched_fields"`
-		Violations        []string                       `json:"violations"`
-		Observability     []string                       `json:"observability"`
-		QuietingAuthority bool                           `json:"quieting_authority"`
-	}
-	var envelope *materialEnvelope
-	if snapshot.Envelope != nil {
-		envelope = &materialEnvelope{
-			EnvelopeID: snapshot.Envelope.EnvelopeID, EnvelopeVersion: snapshot.Envelope.EnvelopeVersion,
-			Result: snapshot.Envelope.Result, MatchedFields: canonicalStrings(snapshot.Envelope.MatchedFields),
-			Violations: canonicalStrings(snapshot.Envelope.Violations), Observability: canonicalStrings(snapshot.Envelope.Observability),
-			QuietingAuthority: snapshot.Envelope.QuietingAuthority,
-		}
-	}
-	type materialL1 struct {
-		Status         string   `json:"status"`
-		RootCauseClass string   `json:"root_cause_class"`
-		FactDigests    []string `json:"fact_digests"`
-		EvidenceRefs   []string `json:"evidence_refs"`
-	}
-	var l1 *materialL1
-	if snapshot.L1 != nil {
-		l1 = &materialL1{Status: snapshot.L1.Status, RootCauseClass: snapshot.L1.RootCauseClass,
-			FactDigests: canonicalStrings(snapshot.L1.FactDigests), EvidenceRefs: canonicalStrings(snapshot.L1.EvidenceRefs)}
-	}
 	material := struct {
 		SchemaVersion           int                   `json:"schema_version"`
 		ReasonCatalogVersion    int                   `json:"reason_catalog_version"`
@@ -596,9 +654,9 @@ func MaterialFactHash(snapshot Snapshot) string {
 		Symptoms                []Symptom             `json:"symptoms"`
 		ProfileHeads            []ProfileHead         `json:"profile_heads"`
 		Facts                   []materialFact        `json:"facts"`
-		Judgments               []model.Judgment      `json:"judgments"`
-		Envelope                *materialEnvelope     `json:"envelope,omitempty"`
-		L1                      *materialL1           `json:"l1,omitempty"`
+		Judgments               []JudgmentFact        `json:"judgments"`
+		Envelope                *EnvelopeResult       `json:"envelope,omitempty"`
+		L1                      *L1Finding            `json:"l1,omitempty"`
 		Impact                  []ImpactFact          `json:"impact"`
 		BlastRadius             *BlastRadius          `json:"blast_radius,omitempty"`
 		UrgentPolicies          []UrgentPolicy        `json:"urgent_policies"`
@@ -611,7 +669,7 @@ func MaterialFactHash(snapshot Snapshot) string {
 		SnapshotSchemaVersion, ReasonCatalogVersion, canonicalPredicateVersions(), snapshot.Lifecycle, snapshot.EffectiveStartedAtBasis,
 		strings.TrimSpace(snapshot.DurationClass), strings.TrimSpace(snapshot.RecurrenceClass), canonicalStrings(snapshot.CrossedMilestones),
 		canonicalSymptoms(snapshot.Symptoms, nil), canonicalProfiles(snapshot.ProfileHeads), facts,
-		canonicalJudgments(snapshot.Judgments), envelope, l1, canonicalImpact(snapshot.Impact),
+		canonicalJudgmentFacts(snapshot.Judgments), canonicalEnvelopeResult(snapshot.Envelope), canonicalL1Finding(snapshot.L1), canonicalImpact(snapshot.Impact),
 		canonicalBlastRadius(snapshot.BlastRadius), canonicalPolicies(snapshot.UrgentPolicies), canonicalSemanticChoice(snapshot.SemanticChoice),
 		canonicalTerminalUncertainty(snapshot.TerminalUncertainty), canonicalConnectorStates(snapshot.ConnectorStates),
 		canonicalLimitations(snapshot.Limitations), materialReasons,

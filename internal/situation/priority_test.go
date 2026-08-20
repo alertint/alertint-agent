@@ -9,21 +9,50 @@ import (
 )
 
 func TestApplyAttentionFloorsUsesExactlyFourUrgentCodes(t *testing.T) {
+	snapshot := sampleSnapshot()
 	for _, code := range []string{"critical_anchor", "confirmed_severe_impact", "expanding_blast_radius", "urgent_policy"} {
-		reason := model.ReasonCandidate{Code: code, DeterministicFloor: true}
-		if got := ApplyAttentionFloors(model.AttentionObserve, []model.ReasonCandidate{reason}); got != model.AttentionUrgent {
+		snapshot = snapshotForFloor(code)
+		reason := requireReason(t, EligibleReasons(snapshot), code)
+		if got := applyAttentionFloorsAgainstSnapshot(model.AttentionObserve, snapshot, []model.ReasonCandidate{reason}); got != model.AttentionUrgent {
 			t.Fatalf("%s attention = %s", code, got)
 		}
 	}
 	for _, code := range []string{"duration_outlier", "novel_symptom", "envelope_violation", "operator_judgment_needed", "terminal_uncertainty", "invented"} {
 		reason := model.ReasonCandidate{Code: code, DeterministicFloor: true}
-		if got := ApplyAttentionFloors(model.AttentionInvestigate, []model.ReasonCandidate{reason}); got != model.AttentionInvestigate {
+		if got := applyAttentionFloorsAgainstSnapshot(model.AttentionInvestigate, snapshot, []model.ReasonCandidate{reason}); got != model.AttentionInvestigate {
 			t.Fatalf("%s gained an urgent floor: %s", code, got)
 		}
 	}
-	if got := ApplyAttentionFloors(model.AttentionInvestigate, []model.ReasonCandidate{{Code: "critical_anchor"}}); got != model.AttentionInvestigate {
+	if got := applyAttentionFloorsAgainstSnapshot(model.AttentionInvestigate, snapshot, []model.ReasonCandidate{{Code: "critical_anchor"}}); got != model.AttentionInvestigate {
 		t.Fatalf("unmarked candidate gained an urgent floor: %s", got)
 	}
+}
+
+func TestApplyAttentionFloorsRejectsFabricatedCatalogCandidate(t *testing.T) {
+	snapshot := sampleSnapshot()
+	fabricated := newCandidate("critical_anchor", "active_source_severity_critical", []string{"delivery:invented"}, true)
+	if got := applyAttentionFloorsAgainstSnapshot(model.AttentionObserve, snapshot, []model.ReasonCandidate{fabricated}); got != model.AttentionObserve {
+		t.Fatalf("fabricated candidate granted urgent attention: %s", got)
+	}
+}
+
+func applyAttentionFloorsAgainstSnapshot(proposed model.Attention, snapshot Snapshot, reasons []model.ReasonCandidate) model.Attention {
+	return ApplyAttentionFloors(proposed, snapshot, reasons)
+}
+
+func snapshotForFloor(code string) Snapshot {
+	s := sampleSnapshot()
+	switch code {
+	case "critical_anchor":
+		s.Symptoms = []Symptom{{ID: "critical", Lifecycle: model.DeliveryStatusFiring, Severity: "critical", EvidenceRefs: []string{"delivery:critical"}}}
+	case "confirmed_severe_impact":
+		s.Impact = []ImpactFact{{Kind: "availability", Severity: "severe", Confirmed: true, EvidenceRefs: []string{"fact:availability"}}}
+	case "expanding_blast_radius":
+		s.BlastRadius = &BlastRadius{Previous: 1, Current: 3, UrgentBoundary: 2, EvidenceRefs: []string{"fact:scope-before", "fact:scope-now"}}
+	case "urgent_policy":
+		s.UrgentPolicies = []UrgentPolicy{{ID: "policy:1", Active: true, Scoped: true, EvidenceRefs: []string{"policy:1"}}}
+	}
+	return s
 }
 
 func TestDeriveInterruptionPriorityUsesDeterministicLadder(t *testing.T) {

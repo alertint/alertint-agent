@@ -4,6 +4,7 @@ package situation
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 	"time"
 
@@ -14,7 +15,6 @@ import (
 func TestMaterialFactHashIgnoresSlackAndExactSecondsWithinClass(t *testing.T) {
 	a := sampleSnapshot()
 	b := a
-	b.SlackChannel = "C999"
 	b.ElapsedSeconds = a.ElapsedSeconds + 12
 	if MaterialFactHash(a) != MaterialFactHash(b) {
 		t.Fatal("non-material fields changed hash")
@@ -22,6 +22,114 @@ func TestMaterialFactHashIgnoresSlackAndExactSecondsWithinClass(t *testing.T) {
 	b.DurationClass = "long"
 	if MaterialFactHash(a) == MaterialFactHash(b) {
 		t.Fatal("duration class did not change hash")
+	}
+}
+
+func TestBuildSnapshotSanitizesProhibitedNoise(t *testing.T) {
+	workload := "nightly"
+	validUntil := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	input := baseSnapshotInput()
+	input.Judgments = []model.Judgment{{
+		ID: "judgment:a", SituationID: "s-1", JudgedInputVersion: 3, CoveredFactHash: "sha256:covered",
+		CoveredSymptoms: []string{"cpu"}, CoveredImpact: []string{"availability"}, Judgment: model.JudgmentUnexpected,
+		Basis: model.JudgmentBasisOperatorKnowledge, Workload: &workload, ValidUntil: &validUntil,
+		EvidenceRefs: []string{"fact:cpu"}, AuthenticatedAs: "installation-token", AssertedOperator: "janis",
+		CreatedAt: time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC),
+	}}
+	input.Envelope = &model.EnvelopeEvaluation{ID: "evaluation:a", EnvelopeID: "envelope:1", EnvelopeVersion: 2,
+		SituationID: "s-1", InputVersion: 3, Result: model.EnvelopeEvaluationMatch, MatchedFields: []string{"scope"},
+		Observability: []string{"mandatory_signals_observable"}, QuietingAuthority: true,
+		CreatedAt: time.Date(2026, 8, 20, 10, 1, 0, 0, time.UTC)}
+	input.L1 = &L1Output{Status: "complete", Summary: "raw model prose", RootCauseClass: "resource_saturation",
+		ConfidenceClass: "high", FactDigests: []string{"sha256:fact"}, EvidenceRefs: []string{"fact:cpu"}}
+	setStringField(&input, "SlackChannel", "C123")
+
+	snapshot, err := BuildSnapshot(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(raw, &document); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"generated_at", "slack_channel"} {
+		if _, ok := document[field]; ok {
+			t.Fatalf("snapshot exposed %q: %s", field, raw)
+		}
+	}
+	assertNestedFieldsAbsent(t, document, "judgments", []string{"id", "situation_id", "judged_input_version", "authenticated_as", "asserted_operator", "created_at"})
+	assertNestedFieldsAbsent(t, document, "envelope", []string{"id", "situation_id", "input_version", "created_at"})
+	assertNestedFieldsAbsent(t, document, "l1", []string{"summary", "confidence_class"})
+}
+
+func TestMaterialFactHashIgnoresJudgmentAuditMetadata(t *testing.T) {
+	first := baseSnapshotInput()
+	second := baseSnapshotInput()
+	workloadA, workloadB := "nightly", "nightly"
+	first.Judgments = []model.Judgment{{
+		ID: "judgment:a", SituationID: "s-1", JudgedInputVersion: 3, CoveredFactHash: "sha256:covered",
+		CoveredSymptoms: []string{"cpu"}, CoveredImpact: []string{"availability"}, Judgment: model.JudgmentUnexpected,
+		Basis: model.JudgmentBasisOperatorKnowledge, Workload: &workloadA, EvidenceRefs: []string{"fact:cpu"},
+		AuthenticatedAs: "token:a", AssertedOperator: "janis", CreatedAt: time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC),
+	}}
+	second.Judgments = []model.Judgment{{
+		ID: "judgment:b", SituationID: "another", JudgedInputVersion: 99, CoveredFactHash: "sha256:covered",
+		CoveredSymptoms: []string{"cpu"}, CoveredImpact: []string{"availability"}, Judgment: model.JudgmentUnexpected,
+		Basis: model.JudgmentBasisOperatorKnowledge, Workload: &workloadB, EvidenceRefs: []string{"fact:cpu"},
+		AuthenticatedAs: "token:b", AssertedOperator: "liene", CreatedAt: time.Date(2026, 8, 20, 10, 5, 0, 0, time.UTC),
+	}}
+	a, err := BuildSnapshot(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := BuildSnapshot(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.MaterialHash != b.MaterialHash {
+		t.Fatalf("judgment audit metadata changed hash:\n%s\n%s", a.MaterialHash, b.MaterialHash)
+	}
+}
+
+func TestMaterialFactHashCanonicalizesEqualKeyPoliciesAndConnectors(t *testing.T) {
+	a := sampleSnapshot()
+	a.UrgentPolicies = []UrgentPolicy{
+		{ID: "policy:1", Active: false, Scoped: true, EvidenceRefs: []string{"policy:inactive"}},
+		{ID: "policy:1", Active: true, Scoped: true, EvidenceRefs: []string{"policy:active"}},
+	}
+	a.ConnectorStates = []ConnectorState{
+		{Capability: observationmodel.CapabilityStoreRead, Status: observationmodel.ResultStatusUnavailable, Freshness: observationmodel.FreshnessUnknown, EvidenceRefs: []string{"run:b"}},
+		{Capability: observationmodel.CapabilityStoreRead, Status: observationmodel.ResultStatusUnavailable, Freshness: observationmodel.FreshnessUnknown, EvidenceRefs: []string{"run:a"}},
+	}
+	b := a
+	b.UrgentPolicies = []UrgentPolicy{a.UrgentPolicies[1], a.UrgentPolicies[0]}
+	b.ConnectorStates = []ConnectorState{a.ConnectorStates[1], a.ConnectorStates[0]}
+	if MaterialFactHash(a) != MaterialFactHash(b) {
+		t.Fatal("equal-key policy or connector input order changed hash")
+	}
+}
+
+func TestBuildSnapshotRejectsUnknownEffectiveStartBasis(t *testing.T) {
+	for _, basis := range []model.SourceTimeBasis{model.SourceTimeBasisMissing, model.SourceTimeBasis("invented")} {
+		t.Run(string(basis), func(t *testing.T) {
+			input := baseSnapshotInput()
+			input.Situation.EffectiveStartedAtBasis = basis
+			if _, err := BuildSnapshot(input); err == nil {
+				t.Fatalf("accepted persisted effective-start basis %q", basis)
+			}
+
+			input = baseSnapshotInput()
+			input.Deliveries = []Delivery{{ID: "d-1", StableSymptomID: "zabbix:1", Status: model.DeliveryStatusFiring,
+				SourceStartedAt: utcPtr(2026, 8, 20, 8, 0), StartedAtBasis: basis,
+				ReceivedAt: time.Date(2026, 8, 20, 8, 1, 0, 0, time.UTC)}}
+			if _, err := BuildSnapshot(input); err == nil {
+				t.Fatalf("accepted delivery effective-start basis %q", basis)
+			}
+		})
 	}
 }
 
@@ -49,15 +157,15 @@ func TestMaterialFactHashCanonicalizesOrderingJSONAndUTC(t *testing.T) {
 	}
 }
 
-func TestMaterialFactHashOmitsModelProseAndEnvelopeAuditNoise(t *testing.T) {
+func TestMaterialFactHashIncludesNormalizedL1AndEnvelopeSemantics(t *testing.T) {
 	a := sampleSnapshot()
-	a.L1 = &L1Finding{Status: "complete", Summary: "first prose", RootCauseClass: "resource_saturation", ConfidenceClass: "high", FactDigests: []string{"sha256:fact"}, EvidenceRefs: []string{"fact:cpu"}}
-	a.Envelope = &model.EnvelopeEvaluation{ID: "evaluation:a", EnvelopeID: "envelope:1", EnvelopeVersion: 2, SituationID: "s-1", InputVersion: 3, Result: model.EnvelopeEvaluationMatch, MatchedFields: []string{"scope"}, QuietingAuthority: true, CreatedAt: time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)}
+	a.L1 = &L1Finding{Status: "complete", RootCauseClass: "resource_saturation", FactDigests: []string{"sha256:fact"}, EvidenceRefs: []string{"fact:cpu"}}
+	a.Envelope = &EnvelopeResult{EnvelopeID: "envelope:1", EnvelopeVersion: 2, Result: model.EnvelopeEvaluationMatch, MatchedFields: []string{"scope"}, QuietingAuthority: true}
 	b := a
-	b.L1 = &L1Finding{Status: "complete", Summary: "rewritten prose", RootCauseClass: "resource_saturation", ConfidenceClass: "low", FactDigests: []string{"sha256:fact"}, EvidenceRefs: []string{"fact:cpu"}}
-	b.Envelope = &model.EnvelopeEvaluation{ID: "evaluation:b", EnvelopeID: "envelope:1", EnvelopeVersion: 2, SituationID: "another", InputVersion: 99, Result: model.EnvelopeEvaluationMatch, MatchedFields: []string{"scope"}, QuietingAuthority: true, CreatedAt: time.Date(2026, 8, 20, 10, 5, 0, 0, time.UTC)}
+	b.L1 = &L1Finding{Status: "complete", RootCauseClass: "resource_saturation", FactDigests: []string{"sha256:fact"}, EvidenceRefs: []string{"fact:cpu"}}
+	b.Envelope = &EnvelopeResult{EnvelopeID: "envelope:1", EnvelopeVersion: 2, Result: model.EnvelopeEvaluationMatch, MatchedFields: []string{"scope"}, QuietingAuthority: true}
 	if MaterialFactHash(a) != MaterialFactHash(b) {
-		t.Fatal("model prose or envelope audit metadata changed hash")
+		t.Fatal("equivalent normalized l1 or envelope semantics changed hash")
 	}
 	b.L1.RootCauseClass = "database_lock"
 	if MaterialFactHash(a) == MaterialFactHash(b) {
@@ -110,7 +218,7 @@ func TestBuildSnapshotDerivesEarliestStartAndPreservesReceipt(t *testing.T) {
 	if got.Deliveries[1].ID != "d-late" {
 		t.Fatal("snapshot aliases mutable input")
 	}
-	if got.Judgments[0].Workload == nil || *got.Judgments[0].Workload != "nightly" {
+	if got.Judgments[0].Workload != "nightly" {
 		t.Fatal("snapshot aliases nested judgment input")
 	}
 }
@@ -171,7 +279,43 @@ func sampleSnapshot() Snapshot {
 		IncidentIDs:             []string{"inc-1"},
 		Symptoms:                []Symptom{{ID: "zabbix:18422", Lifecycle: model.DeliveryStatusFiring, Severity: "high", EvidenceRefs: []string{"delivery:d-1"}}},
 		Limitations:             []model.Limitation{{Code: "metrics_unavailable", Detail: "prometheus unavailable"}},
-		SlackChannel:            "C123",
+	}
+}
+
+func baseSnapshotInput() SnapshotInput {
+	return SnapshotInput{
+		Situation: model.Situation{
+			ID: "s-1", InputVersion: 3, Lifecycle: model.LifecycleActive,
+			EffectiveStartedAt:      time.Date(2026, 8, 20, 9, 0, 0, 0, time.UTC),
+			EffectiveStartedAtBasis: model.SourceTimeBasisSourcePayload,
+			FirstReceivedAt:         time.Date(2026, 8, 20, 9, 1, 0, 0, time.UTC),
+		},
+		Now:           time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC),
+		DurationClass: "medium", RecurrenceClass: "recurring",
+	}
+}
+
+func setStringField(target any, name, value string) {
+	field := reflect.ValueOf(target).Elem().FieldByName(name)
+	if field.IsValid() && field.CanSet() && field.Kind() == reflect.String {
+		field.SetString(value)
+	}
+}
+
+func assertNestedFieldsAbsent(t *testing.T, document map[string]any, name string, forbidden []string) {
+	t.Helper()
+	value := document[name]
+	if list, ok := value.([]any); ok && len(list) > 0 {
+		value = list[0]
+	}
+	nested, ok := value.(map[string]any)
+	if !ok {
+		t.Fatalf("snapshot %q is not an object: %#v", name, value)
+	}
+	for _, field := range forbidden {
+		if _, ok := nested[field]; ok {
+			t.Fatalf("snapshot %q exposed %q: %#v", name, field, nested)
+		}
 	}
 }
 

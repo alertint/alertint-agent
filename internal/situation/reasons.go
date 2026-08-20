@@ -82,20 +82,20 @@ func EligibleReasons(snapshot Snapshot) []model.ReasonCandidate {
 
 	novelRefs := make([]string, 0)
 	for _, symptom := range snapshot.Symptoms {
-		if symptom.Lifecycle == model.DeliveryStatusFiring && symptom.Novel && len(canonicalStrings(symptom.EvidenceRefs)) > 0 {
+		if symptom.Lifecycle == model.DeliveryStatusFiring && symptom.Novel &&
+			len(canonicalStrings(symptom.EvidenceRefs)) > 0 && evidenceRefsResolveToFacts(snapshot, symptom.NoveltyEvidenceRefs) {
 			novelRefs = append(novelRefs, symptom.EvidenceRefs...)
+			novelRefs = append(novelRefs, symptom.NoveltyEvidenceRefs...)
 		}
 	}
 	if len(canonicalStrings(novelRefs)) > 0 {
 		reasons = append(reasons, newCandidate("novel_symptom", "active_normalized_symptom_absent_from_comparable_history", novelRefs, false))
 	}
 
-	if snapshot.Envelope != nil && snapshot.Envelope.Result == model.EnvelopeEvaluationViolation && len(snapshot.Envelope.Violations) > 0 {
-		refs := append([]string(nil), snapshot.Envelope.Observability...)
-		refs = append(refs, snapshot.Envelope.Violations...)
-		if len(canonicalStrings(refs)) > 0 {
-			reasons = append(reasons, newCandidate("envelope_violation", "active_envelope_violation", refs, false))
-		}
+	if snapshot.Envelope != nil && snapshot.Envelope.Result == model.EnvelopeEvaluationViolation &&
+		len(snapshot.Envelope.Violations) > 0 && len(snapshot.Envelope.Observability) > 0 &&
+		evidenceRefsResolveToFacts(snapshot, snapshot.Envelope.EvidenceRefs) {
+		reasons = append(reasons, newCandidate("envelope_violation", "active_envelope_violation", snapshot.Envelope.EvidenceRefs, false))
 	}
 
 	if uncertainty := snapshot.TerminalUncertainty; uncertainty != nil && uncertainty.DeadlineCrossed && uncertainty.Actionable &&
@@ -120,6 +120,26 @@ func EligibleReasons(snapshot Snapshot) []model.ReasonCandidate {
 
 	sort.Slice(reasons, func(i, j int) bool { return reasons[i].Code < reasons[j].Code })
 	return reasons
+}
+
+func evidenceRefsResolveToFacts(snapshot Snapshot, refs []string) bool {
+	refs = canonicalStrings(refs)
+	if len(refs) == 0 {
+		return false
+	}
+	known := make(map[string]struct{}, len(snapshot.Facts))
+	for _, fact := range snapshot.Facts {
+		known[fact.ID] = struct{}{}
+		for _, ref := range fact.EvidenceRefs {
+			known[ref] = struct{}{}
+		}
+	}
+	for _, ref := range refs {
+		if _, ok := known[ref]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func severeImpact(severity string) bool {
@@ -156,16 +176,22 @@ func durationOutlierEvidence(snapshot Snapshot) ([]string, bool) {
 		return nil, false
 	}
 	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
-	median := durations[len(durations)/2]
-	if len(durations)%2 == 0 {
-		median = (durations[len(durations)/2-1] + durations[len(durations)/2]) / 2
-	}
 	p95Index := int(math.Ceil(float64(len(durations))*0.95)) - 1
 	if p95Index < 0 {
 		p95Index = 0
 	}
 	p95 := durations[p95Index]
-	return refs, snapshot.ElapsedSeconds > p95 && snapshot.ElapsedSeconds > 2*median
+	return refs, snapshot.ElapsedSeconds > p95 && exceedsTwiceMedian(snapshot.ElapsedSeconds, durations)
+}
+
+func exceedsTwiceMedian(current int64, sortedDurations []int64) bool {
+	middle := len(sortedDurations) / 2
+	if len(sortedDurations)%2 != 0 {
+		median := sortedDurations[middle]
+		return current > median && current-median > median
+	}
+	left, right := sortedDurations[middle-1], sortedDurations[middle]
+	return current > left && current-left > right
 }
 
 func newCandidate(code, result string, refs []string, floor bool) model.ReasonCandidate {

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
@@ -25,12 +26,17 @@ func TestReasonCatalogEligibility(t *testing.T) {
 func TestEligibleReasonsEmitsAllNineEvidenceBoundCodes(t *testing.T) {
 	s := snapshotWithCompletedDurations([]time.Duration{5 * time.Minute, 6 * time.Minute, 7 * time.Minute, 8 * time.Minute, 9 * time.Minute}, 20*time.Minute)
 	s.Symptoms = []Symptom{
-		{ID: "critical", Lifecycle: model.DeliveryStatusFiring, Severity: "critical", Novel: true, EvidenceRefs: []string{"delivery:critical", "history:symptoms"}},
+		{ID: "critical", Lifecycle: model.DeliveryStatusFiring, Severity: "critical", Novel: true, EvidenceRefs: []string{"delivery:critical"}, NoveltyEvidenceRefs: []string{"history:symptoms"}},
 	}
 	s.Impact = []ImpactFact{{Kind: "availability", Severity: "severe", Confirmed: true, EvidenceRefs: []string{"fact:availability"}}}
 	s.BlastRadius = &BlastRadius{Previous: 2, Current: 4, UrgentBoundary: 3, EvidenceRefs: []string{"fact:scope-before", "fact:scope-now"}}
 	s.UrgentPolicies = []UrgentPolicy{{ID: "policy:1", Active: true, Scoped: true, EvidenceRefs: []string{"policy:1"}}}
-	s.Envelope = &model.EnvelopeEvaluation{Result: model.EnvelopeEvaluationViolation, Violations: []string{"duration"}, Observability: []string{"fact:duration"}}
+	s.Envelope = &EnvelopeResult{EnvelopeID: "envelope:1", EnvelopeVersion: 1, Result: model.EnvelopeEvaluationViolation,
+		Violations: []string{"duration"}, Observability: []string{"mandatory_signals_observable"}, EvidenceRefs: []string{"fact:duration"}}
+	s.Facts = []observationmodel.Fact{
+		fact("history:symptoms", "symptom_history", `{"critical_absent":true}`),
+		fact("fact:duration", "duration", `{"class":"long"}`),
+	}
 	s.SemanticChoice = &SemanticChoice{Code: "owning_team", State: model.ActionStatusExhausted, EvidenceRefs: []string{"run:ownership"}}
 	s.TerminalUncertainty = &TerminalUncertainty{DeadlineCrossed: true, Actionable: true, Reason: model.TerminalReasonSourceUnavailable, EvidenceRefs: []string{"fact:lifecycle", "deadline:lifecycle"}}
 
@@ -85,10 +91,51 @@ func TestCriticalCandidateAggregatesEvidenceIndependentOfSymptomOrder(t *testing
 func TestWeakOrUnboundSignalsProduceNoReason(t *testing.T) {
 	s := sampleSnapshot()
 	s.Symptoms = []Symptom{{ID: "new-incident-alert-name", Lifecycle: model.DeliveryStatusFiring, Severity: "high", Novel: true}}
-	s.L1 = &L1Finding{Summary: "model thinks this is important", ConfidenceClass: "high"}
 	s.SemanticChoice = &SemanticChoice{Code: "owning_team", State: model.ActionStatusBlocked, EvidenceRefs: []string{"run:ownership"}}
 	if got := EligibleReasons(s); len(got) != 0 {
 		t.Fatalf("weak signals produced reasons: %+v", got)
+	}
+}
+
+func TestNovelSymptomRequiresComparableHistoryAbsenceEvidence(t *testing.T) {
+	s := sampleSnapshot()
+	s.Symptoms = []Symptom{{ID: "new-symptom", Lifecycle: model.DeliveryStatusFiring, Novel: true, EvidenceRefs: []string{"delivery:new"}}}
+	if got := EligibleReasons(s); hasReason(got, "novel_symptom") {
+		t.Fatalf("novel symptom admitted without history-absence evidence: %+v", got)
+	}
+}
+
+func TestEnvelopeViolationRequiresObservabilityEvidence(t *testing.T) {
+	s := sampleSnapshot()
+	s.Envelope = &EnvelopeResult{EnvelopeID: "envelope:1", EnvelopeVersion: 2,
+		Result: model.EnvelopeEvaluationViolation, Violations: []string{"duration"}, Observability: []string{"mandatory_signals_observable"}}
+	if got := EligibleReasons(s); hasReason(got, "envelope_violation") {
+		t.Fatalf("envelope labels admitted without evidence: %+v", got)
+	}
+}
+
+func TestNovelAndEnvelopeEvidenceReferencesMustResolveToFacts(t *testing.T) {
+	novel := sampleSnapshot()
+	novel.Symptoms = []Symptom{{ID: "new-symptom", Lifecycle: model.DeliveryStatusFiring, Novel: true,
+		EvidenceRefs: []string{"delivery:new"}, NoveltyEvidenceRefs: []string{"fact:missing-history"}}}
+	if got := EligibleReasons(novel); hasReason(got, "novel_symptom") {
+		t.Fatalf("unresolved novelty evidence admitted: %+v", got)
+	}
+	novel.Facts = []observationmodel.Fact{fact("fact:missing-history", "symptom_history", `{"absent":true}`)}
+	if got := EligibleReasons(novel); !hasReason(got, "novel_symptom") {
+		t.Fatalf("resolved novelty evidence rejected: %+v", got)
+	}
+
+	envelope := sampleSnapshot()
+	envelope.Envelope = &EnvelopeResult{EnvelopeID: "envelope:1", EnvelopeVersion: 2,
+		Result: model.EnvelopeEvaluationViolation, Violations: []string{"duration"}, Observability: []string{"duration_observed"},
+		EvidenceRefs: []string{"fact:missing-duration"}}
+	if got := EligibleReasons(envelope); hasReason(got, "envelope_violation") {
+		t.Fatalf("unresolved envelope evidence admitted: %+v", got)
+	}
+	envelope.Facts = []observationmodel.Fact{fact("fact:missing-duration", "duration", `{"class":"long"}`)}
+	if got := EligibleReasons(envelope); !hasReason(got, "envelope_violation") {
+		t.Fatalf("resolved envelope evidence rejected: %+v", got)
 	}
 }
 
@@ -107,6 +154,13 @@ func TestDurationOutlierRequiresFiveComparableAndStrictThresholds(t *testing.T) 
 				t.Fatalf("duration outlier admitted: %+v", got)
 			}
 		})
+	}
+}
+
+func TestDurationOutlierEvenMedianKeepsHalfSecondThreshold(t *testing.T) {
+	s := snapshotWithCompletedDurations([]time.Duration{10 * time.Second, 10 * time.Second, 10 * time.Second, 11 * time.Second, 11 * time.Second, 12 * time.Second}, 21*time.Second)
+	if got := EligibleReasons(s); hasReason(got, "duration_outlier") {
+		t.Fatalf("duration equal to twice exact median admitted: %+v", got)
 	}
 }
 
