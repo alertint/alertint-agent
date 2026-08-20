@@ -51,6 +51,7 @@ type Config struct {
 	Rules        RulesConfig        `yaml:"rules"`
 	Memory       MemoryConfig       `yaml:"memory"`
 	Triage       TriageConfig       `yaml:"triage,omitempty"`
+	Situations   SituationsConfig   `yaml:"situations"`
 	LogLevel     string             `yaml:"log_level"`
 	LogFormat    string             `yaml:"log_format"`
 }
@@ -61,6 +62,72 @@ type Config struct {
 // override baseline entries with the same id or name.
 type RulesConfig struct {
 	LocalPackDir string `yaml:"local_pack_dir,omitempty"`
+}
+
+// SituationsConfig controls the durable Situation reconciliation workers. All
+// values are explicit rather than feature flags: a configured Situation worker
+// is always active once the runtime cutover wires it.
+type SituationsConfig struct {
+	Workers                  int                    `yaml:"workers"`
+	ReconcileIntervalSeconds int                    `yaml:"reconcile_interval_seconds"`
+	LeaseSeconds             int                    `yaml:"lease_seconds"`
+	LeaseHeartbeatSeconds    int                    `yaml:"lease_heartbeat_seconds"`
+	RecoveryGrace            RecoveryGraceConfig    `yaml:"recovery_grace"`
+	Cadence                  SituationCadenceConfig `yaml:"cadence"`
+	Budgets                  SituationBudgetsConfig `yaml:"budgets"`
+	Retry                    SituationRetryConfig   `yaml:"retry"`
+	Slack                    SituationSlackConfig   `yaml:"slack"`
+	DependencyHealth         DependencyHealthConfig `yaml:"dependency_health"`
+	EnvelopeReview           EnvelopeReviewConfig   `yaml:"envelope_review"`
+}
+
+// RecoveryGraceConfig bounds source-specific recovery confirmation windows.
+type RecoveryGraceConfig struct {
+	WebhookSeconds    int `yaml:"webhook_seconds"`
+	PollingMinSeconds int `yaml:"polling_min_seconds"`
+	PollingMaxSeconds int `yaml:"polling_max_seconds"`
+}
+
+// SituationCadenceConfig sets the controller's fast, normal, and slow
+// checkpoint cadences.
+type SituationCadenceConfig struct {
+	FastSeconds   int `yaml:"fast_seconds"`
+	NormalSeconds int `yaml:"normal_seconds"`
+	SlowSeconds   int `yaml:"slow_seconds"`
+}
+
+// SituationBudgetsConfig caps work for one reconciliation attempt and input.
+type SituationBudgetsConfig struct {
+	MaxObservationCalls  int `yaml:"max_observation_calls"`
+	MaxL1LLMCalls        int `yaml:"max_l1_llm_calls"`
+	MaxL2LLMCalls        int `yaml:"max_l2_llm_calls"`
+	AttemptWallSeconds   int `yaml:"attempt_wall_seconds"`
+	MaxAttemptsPerInput  int `yaml:"max_attempts_per_input"`
+	ConnectorConcurrency int `yaml:"connector_concurrency"`
+	LLMConcurrency       int `yaml:"llm_concurrency"`
+}
+
+// SituationRetryConfig controls exponential retry backoff and jitter.
+type SituationRetryConfig struct {
+	InitialSeconds int `yaml:"initial_seconds"`
+	MaximumSeconds int `yaml:"maximum_seconds"`
+	JitterPercent  int `yaml:"jitter_percent"`
+}
+
+// SituationSlackConfig controls Situation-specific publication behavior.
+type SituationSlackConfig struct {
+	RepageCooldownSeconds        int  `yaml:"repage_cooldown_seconds"`
+	BroadcastOnCriticalityChange bool `yaml:"broadcast_on_criticality_change"`
+}
+
+// DependencyHealthConfig controls installation-level dependency degradation.
+type DependencyHealthConfig struct {
+	BroadcastAfterSeconds int `yaml:"broadcast_after_seconds"`
+}
+
+// EnvelopeReviewConfig controls sparse expected-behaviour review reminders.
+type EnvelopeReviewConfig struct {
+	ReminderIntervalDays int `yaml:"reminder_interval_days"`
 }
 
 // TriageConfig groups triage-pipeline tunables. Verification (the falsification
@@ -527,6 +594,42 @@ func Defaults() Config {
 				TimeoutSeconds: 10,
 			},
 		},
+		Situations: SituationsConfig{
+			Workers:                  2,
+			ReconcileIntervalSeconds: 1,
+			LeaseSeconds:             300,
+			LeaseHeartbeatSeconds:    30,
+			RecoveryGrace: RecoveryGraceConfig{
+				WebhookSeconds:    120,
+				PollingMinSeconds: 120,
+				PollingMaxSeconds: 600,
+			},
+			Cadence: SituationCadenceConfig{
+				FastSeconds:   60,
+				NormalSeconds: 300,
+				SlowSeconds:   900,
+			},
+			Budgets: SituationBudgetsConfig{
+				MaxObservationCalls:  6,
+				MaxL1LLMCalls:        2,
+				MaxL2LLMCalls:        2,
+				AttemptWallSeconds:   180,
+				MaxAttemptsPerInput:  5,
+				ConnectorConcurrency: 4,
+				LLMConcurrency:       2,
+			},
+			Retry: SituationRetryConfig{
+				InitialSeconds: 5,
+				MaximumSeconds: 300,
+				JitterPercent:  20,
+			},
+			Slack: SituationSlackConfig{
+				RepageCooldownSeconds:        900,
+				BroadcastOnCriticalityChange: true,
+			},
+			DependencyHealth: DependencyHealthConfig{BroadcastAfterSeconds: 300},
+			EnvelopeReview:   EnvelopeReviewConfig{ReminderIntervalDays: 30},
+		},
 		LogLevel:  "info",
 		LogFormat: "auto",
 	}
@@ -640,6 +743,7 @@ func (c *Config) validate(offline bool) error {
 	errs = append(errs, c.validateVerification()...)
 	errs = append(errs, c.validateTriageSelector()...)
 	errs = append(errs, c.validateMemory()...)
+	errs = append(errs, c.validateSituations()...)
 	if !offline {
 		errs = append(errs, c.validateRules()...)
 	}
@@ -655,6 +759,61 @@ func (c *Config) validate(offline bool) error {
 		return fmt.Errorf("invalid config:\n  - %s", strings.Join(errs, "\n  - "))
 	}
 	return nil
+}
+
+// validateSituations rejects incomplete or contradictory controller settings
+// before workers can claim durable work.
+func (c *Config) validateSituations() []string {
+	s := c.Situations
+	var errs []string
+	positive := []struct {
+		name  string
+		value int
+	}{
+		{"situations.workers", s.Workers},
+		{"situations.reconcile_interval_seconds", s.ReconcileIntervalSeconds},
+		{"situations.lease_seconds", s.LeaseSeconds},
+		{"situations.lease_heartbeat_seconds", s.LeaseHeartbeatSeconds},
+		{"situations.recovery_grace.webhook_seconds", s.RecoveryGrace.WebhookSeconds},
+		{"situations.recovery_grace.polling_min_seconds", s.RecoveryGrace.PollingMinSeconds},
+		{"situations.recovery_grace.polling_max_seconds", s.RecoveryGrace.PollingMaxSeconds},
+		{"situations.cadence.fast_seconds", s.Cadence.FastSeconds},
+		{"situations.cadence.normal_seconds", s.Cadence.NormalSeconds},
+		{"situations.cadence.slow_seconds", s.Cadence.SlowSeconds},
+		{"situations.budgets.max_observation_calls", s.Budgets.MaxObservationCalls},
+		{"situations.budgets.max_l1_llm_calls", s.Budgets.MaxL1LLMCalls},
+		{"situations.budgets.max_l2_llm_calls", s.Budgets.MaxL2LLMCalls},
+		{"situations.budgets.attempt_wall_seconds", s.Budgets.AttemptWallSeconds},
+		{"situations.budgets.max_attempts_per_input", s.Budgets.MaxAttemptsPerInput},
+		{"situations.budgets.connector_concurrency", s.Budgets.ConnectorConcurrency},
+		{"situations.budgets.llm_concurrency", s.Budgets.LLMConcurrency},
+		{"situations.retry.initial_seconds", s.Retry.InitialSeconds},
+		{"situations.retry.maximum_seconds", s.Retry.MaximumSeconds},
+		{"situations.slack.repage_cooldown_seconds", s.Slack.RepageCooldownSeconds},
+		{"situations.dependency_health.broadcast_after_seconds", s.DependencyHealth.BroadcastAfterSeconds},
+		{"situations.envelope_review.reminder_interval_days", s.EnvelopeReview.ReminderIntervalDays},
+	}
+	for _, field := range positive {
+		if field.value <= 0 {
+			errs = append(errs, field.name+" must be > 0")
+		}
+	}
+	if s.LeaseHeartbeatSeconds >= s.LeaseSeconds {
+		errs = append(errs, "situations.lease_heartbeat_seconds must be less than lease_seconds")
+	}
+	if s.RecoveryGrace.PollingMinSeconds > s.RecoveryGrace.PollingMaxSeconds {
+		errs = append(errs, "situations.recovery_grace.polling_min_seconds must be less than or equal to polling_max_seconds")
+	}
+	if s.Cadence.FastSeconds > s.Cadence.NormalSeconds || s.Cadence.NormalSeconds > s.Cadence.SlowSeconds {
+		errs = append(errs, "situations.cadence must satisfy fast_seconds <= normal_seconds <= slow_seconds")
+	}
+	if s.Retry.InitialSeconds > s.Retry.MaximumSeconds {
+		errs = append(errs, "situations.retry.initial_seconds must be less than or equal to maximum_seconds")
+	}
+	if s.Retry.JitterPercent < 0 || s.Retry.JitterPercent > 100 {
+		errs = append(errs, "situations.retry.jitter_percent must be between 0 and 100")
+	}
+	return errs
 }
 
 // validateServing covers the inbound webhook host (all receivers share
