@@ -5,9 +5,12 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
 func TestOpenMigratesExisting0010DatabaseToDeliveryLedger(t *testing.T) {
@@ -135,10 +138,86 @@ func TestClaimAlertDispatchesReturnsOnlyRowsChangedByThisClaim(t *testing.T) {
 	}
 }
 
+func TestAlertDispatchMutationsRejectExpiredReclaimedFence(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+	acceptDeliveryFixture(t, s, "fenced-delivery", now)
+	first, err := s.ClaimAlertDispatches(context.Background(), "worker-old", now, time.Minute, 1)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first claim=%+v err=%v", first, err)
+	}
+	second, err := s.ClaimAlertDispatches(context.Background(), "worker-new", now.Add(2*time.Minute), time.Minute, 1)
+	if err != nil || len(second) != 1 {
+		t.Fatalf("second claim=%+v err=%v", second, err)
+	}
+	if first[0].ClaimToken == second[0].ClaimToken {
+		t.Fatalf("claim tokens both %d, want monotonic fence", first[0].ClaimToken)
+	}
+	if err := s.MarkAlertDispatchApplied(context.Background(), first[0], now.Add(2*time.Minute)); !errors.Is(err, ErrAlertDispatchLeaseLost) {
+		t.Fatalf("stale apply err=%v, want ErrAlertDispatchLeaseLost", err)
+	}
+	if err := s.RetryAlertDispatch(context.Background(), first[0], "stale_retry", now.Add(3*time.Minute), false); !errors.Is(err, ErrAlertDispatchLeaseLost) {
+		t.Fatalf("stale retry err=%v, want ErrAlertDispatchLeaseLost", err)
+	}
+	var owner string
+	var token int64
+	if err := s.DB().QueryRowContext(context.Background(), `SELECT lease_owner, claim_token FROM alert_delivery_dispatches WHERE delivery_id = 'fenced-delivery'`).Scan(&owner, &token); err != nil {
+		t.Fatal(err)
+	}
+	if owner != "worker-new" || token != second[0].ClaimToken {
+		t.Fatalf("durable fence=(%q,%d), want (%q,%d)", owner, token, "worker-new", second[0].ClaimToken)
+	}
+}
+
+func TestApplyCorrelatedDeliveryRollsBackIncidentLinkAndInputTogether(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+	acceptDeliveryFixture(t, s, "atomic-delivery", now)
+	blocker := Incident{ID: "blocker-incident", GroupKey: "service=other", FirstAlertAt: now, LastAlertAt: now, ReadyAt: now.Add(time.Minute)}
+	if err := s.InsertIncident(context.Background(), blocker); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().ExecContext(context.Background(), `
+		INSERT INTO situation_input_outbox(id, idempotency_key, incident_id, kind, group_key, occurred_at, status)
+		VALUES ('blocker-input', 'delivery:collision', 'blocker-incident', 'incident_created', 'service=other', ?, 'pending')`, canonicalTime(now)); err != nil {
+		t.Fatal(err)
+	}
+	deliveryID := "atomic-delivery"
+	err := s.ApplyCorrelatedDelivery(context.Background(), CorrelatedDeliveryMutation{
+		DeliveryID: deliveryID,
+		Incident:   Incident{ID: "atomic-incident", GroupKey: "service=api", FirstAlertAt: now, LastAlertAt: now, ReadyAt: now.Add(time.Minute)},
+		Input:      SituationInput{ID: "atomic-input", IdempotencyKey: "delivery:collision", IncidentID: "atomic-incident", DeliveryID: &deliveryID, Kind: "incident_created", GroupKey: "service=api", OccurredAt: now},
+	})
+	if err == nil {
+		t.Fatal("ApplyCorrelatedDelivery error=nil, want idempotency collision")
+	}
+	if got := deliveryRowCount(t, s, "incidents"); got != 1 {
+		t.Fatalf("incidents=%d, want only blocker after rollback", got)
+	}
+	if got := deliveryRowCount(t, s, "incident_alert_deliveries"); got != 0 {
+		t.Fatalf("delivery links=%d, want 0 after rollback", got)
+	}
+}
+
+func acceptDeliveryFixture(t *testing.T, s *Store, deliveryID string, now time.Time) {
+	t.Helper()
+	started := now.Add(-time.Minute)
+	_, err := s.AcceptDeliveries(context.Background(), []DeliveryInput{{
+		ID:     deliveryID,
+		Alert:  Alert{ID: deliveryID + "-alert", Fingerprint: deliveryID + "-fp", Status: "firing", Labels: map[string]string{"service": "api"}, Annotations: map[string]string{}, StartsAt: started, ReceivedAt: now},
+		Source: "alertmanager", SourceEpisodeKey: "alertmanager:" + deliveryID, SourceStartedAt: &started,
+		StartedAtBasis: model.SourceTimeBasisSourcePayload, ResolvedAtBasis: model.SourceTimeBasisMissing,
+		ReceiverGroupingIdentity: "service=api", PayloadDigest: "sha256:" + deliveryID,
+	}})
+	if err != nil {
+		t.Fatalf("accept delivery: %v", err)
+	}
+}
+
 func deliveryRowCount(t *testing.T, s *Store, table string) int {
 	t.Helper()
 	var n int
-	if err := s.DB().QueryRow("SELECT COUNT(*) FROM " + table).Scan(&n); err != nil {
+	if err := s.DB().QueryRowContext(context.Background(), "SELECT COUNT(*) FROM "+table).Scan(&n); err != nil {
 		t.Fatalf("count %s: %v", table, err)
 	}
 	return n

@@ -405,6 +405,19 @@ type Incident struct {
 	LastJudgedAt *time.Time
 }
 
+// CorrelatedDeliveryMutation is the complete durable effect of applying one
+// immutable Alert delivery. Occurrence with ID zero appends an episode;
+// Occurrence with a positive ID advances that episode's last-seen timestamp.
+// RequireNonterminalOwner fences a recurrence decision against a concurrent
+// terminal Situation transition inside the write transaction.
+type CorrelatedDeliveryMutation struct {
+	DeliveryID              string
+	Incident                Incident
+	Occurrence              *Occurrence
+	Input                   SituationInput
+	RequireNonterminalOwner bool
+}
+
 // InsertIncident creates a new incident row in status "collecting".
 func (s *Store) InsertIncident(ctx context.Context, inc Incident) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)

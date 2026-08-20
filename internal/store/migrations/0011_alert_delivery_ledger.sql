@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: FSL-1.1-ALv2
 -- Immutable accepted alert deliveries and their durable correlation outbox.
 -- The alerts table remains the compatibility latest-wins projection; every
 -- accepted source delivery is retained here for replay and audit.
@@ -30,10 +31,14 @@ CREATE TABLE alert_delivery_dispatches (
     status TEXT NOT NULL CHECK (status IN ('pending','claimed','applied','failed')),
     lease_owner TEXT,
     lease_expires_at TEXT,
+    claim_token INTEGER NOT NULL DEFAULT 0 CHECK (claim_token >= 0),
     attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
     last_error_class TEXT,
     retry_at TEXT,
-    applied_at TEXT
+    applied_at TEXT,
+    CHECK ((status = 'claimed') = (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)),
+    CHECK ((status = 'applied') = (applied_at IS NOT NULL)),
+    CHECK (status <> 'failed' OR retry_at IS NULL)
 ) STRICT;
 
 CREATE INDEX alert_delivery_dispatches_status_retry_at_idx ON alert_delivery_dispatches(status, retry_at);
@@ -41,6 +46,7 @@ CREATE INDEX alert_delivery_dispatches_status_retry_at_idx ON alert_delivery_dis
 CREATE TABLE incident_alert_deliveries (
     incident_id  TEXT NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
     delivery_id  TEXT NOT NULL UNIQUE REFERENCES alert_deliveries(id),
+    occurrence_id INTEGER REFERENCES incident_occurrences(id) ON DELETE SET NULL,
     created_at   TEXT NOT NULL,
     PRIMARY KEY (incident_id, delivery_id)
 ) STRICT;

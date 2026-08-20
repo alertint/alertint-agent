@@ -52,11 +52,22 @@ type AlertDispatch struct {
 	Status         string
 	LeaseOwner     *string
 	LeaseExpiresAt *time.Time
+	ClaimToken     int64
 	AttemptCount   int
 	LastErrorClass *string
 	RetryAt        *time.Time
 	AppliedAt      *time.Time
 }
+
+// ErrAlertDispatchLeaseLost means a worker no longer owns the claimed
+// delivery dispatch. Callers must not acknowledge or rewrite the replacement
+// worker's lease after receiving it.
+var ErrAlertDispatchLeaseLost = errors.New("store: alert dispatch lease lost")
+
+// ErrIncidentOwnerNotCollapsible means recurrence planning selected an
+// Incident whose primary Situation is missing or terminal. The caller must
+// take the safe-new-Incident path instead of collapsing across that boundary.
+var ErrIncidentOwnerNotCollapsible = errors.New("store: incident owner does not permit recurrence collapse")
 
 type preparedDelivery struct {
 	in         DeliveryInput
@@ -237,12 +248,15 @@ func (s *Store) ClaimAlertDispatches(ctx context.Context, owner string, now time
 	leaseExpires := canonicalTime(now.Add(lease))
 	claimedRows, err := tx.QueryContext(ctx, `
 		UPDATE alert_delivery_dispatches
-		SET status = 'claimed', lease_owner = ?, lease_expires_at = ?, attempt_count = attempt_count + 1
+		SET status = 'claimed', lease_owner = ?, lease_expires_at = ?,
+		    claim_token = claim_token + 1, attempt_count = attempt_count + 1
 		WHERE delivery_id IN (
-			SELECT delivery_id FROM alert_delivery_dispatches
-			WHERE (status = 'pending' AND (retry_at IS NULL OR retry_at <= ?))
-				OR (status = 'claimed' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
-			ORDER BY COALESCE(retry_at, '') ASC, delivery_id ASC LIMIT ?
+			SELECT d.delivery_id
+			FROM alert_delivery_dispatches AS d
+			JOIN alert_deliveries AS ad ON ad.id = d.delivery_id
+			WHERE (d.status = 'pending' AND (d.retry_at IS NULL OR d.retry_at <= ?))
+				OR (d.status = 'claimed' AND d.lease_expires_at IS NOT NULL AND d.lease_expires_at <= ?)
+			ORDER BY COALESCE(d.retry_at, ad.received_at) ASC, ad.received_at ASC, d.delivery_id ASC LIMIT ?
 		)
 		RETURNING delivery_id
 	`, owner, leaseExpires, canonicalTime(now), canonicalTime(now), limit)
@@ -300,8 +314,16 @@ func (s *Store) ClaimAlertDispatches(ctx context.Context, owner string, now time
 
 // MarkAlertDispatchApplied records successful correlation after its own
 // transaction has committed.
-func (s *Store) MarkAlertDispatchApplied(ctx context.Context, deliveryID string, at time.Time) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE alert_delivery_dispatches SET status='applied', lease_owner=NULL, lease_expires_at=NULL, retry_at=NULL, applied_at=? WHERE delivery_id=?`, canonicalTime(at), deliveryID)
+func (s *Store) MarkAlertDispatchApplied(ctx context.Context, claim AlertDispatch, at time.Time) error {
+	if strings.TrimSpace(claim.Delivery.ID) == "" || claim.LeaseOwner == nil || strings.TrimSpace(*claim.LeaseOwner) == "" || claim.ClaimToken <= 0 || at.IsZero() {
+		return errors.New("store: applied alert dispatch requires a complete claim and applied time")
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE alert_delivery_dispatches
+		SET status='applied', lease_owner=NULL, lease_expires_at=NULL,
+		    retry_at=NULL, applied_at=?
+		WHERE delivery_id=? AND status='claimed' AND lease_owner=? AND claim_token=?`,
+		canonicalTime(at), claim.Delivery.ID, *claim.LeaseOwner, claim.ClaimToken)
 	if err != nil {
 		return fmt.Errorf("store: mark alert dispatch applied: %w", err)
 	}
@@ -309,20 +331,30 @@ func (s *Store) MarkAlertDispatchApplied(ctx context.Context, deliveryID string,
 	if err != nil {
 		return fmt.Errorf("store: count applied alert dispatch: %w", err)
 	}
-	if n == 0 {
-		return ErrNotFound
+	if n != 1 {
+		return ErrAlertDispatchLeaseLost
 	}
 	return nil
 }
 
 // RetryAlertDispatch releases a dispatch for retry or marks it terminal.
-func (s *Store) RetryAlertDispatch(ctx context.Context, deliveryID, class string, retryAt time.Time, terminal bool) error {
+func (s *Store) RetryAlertDispatch(ctx context.Context, claim AlertDispatch, class string, retryAt time.Time, terminal bool) error {
+	if strings.TrimSpace(claim.Delivery.ID) == "" || claim.LeaseOwner == nil || strings.TrimSpace(*claim.LeaseOwner) == "" || claim.ClaimToken <= 0 || strings.TrimSpace(class) == "" {
+		return errors.New("store: alert dispatch retry requires a complete claim and error class")
+	}
 	status := "pending"
 	var retry any = canonicalTime(retryAt)
 	if terminal {
 		status, retry = "failed", nil
+	} else if retryAt.IsZero() {
+		return errors.New("store: alert dispatch retry time is required")
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE alert_delivery_dispatches SET status=?, lease_owner=NULL, lease_expires_at=NULL, last_error_class=?, retry_at=? WHERE delivery_id=?`, status, class, retry, deliveryID)
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE alert_delivery_dispatches
+		SET status=?, lease_owner=NULL, lease_expires_at=NULL,
+		    last_error_class=?, retry_at=?
+		WHERE delivery_id=? AND status='claimed' AND lease_owner=? AND claim_token=?`,
+		status, class, retry, claim.Delivery.ID, *claim.LeaseOwner, claim.ClaimToken)
 	if err != nil {
 		return fmt.Errorf("store: retry alert dispatch: %w", err)
 	}
@@ -330,10 +362,268 @@ func (s *Store) RetryAlertDispatch(ctx context.Context, deliveryID, class string
 	if err != nil {
 		return fmt.Errorf("store: count retried alert dispatch: %w", err)
 	}
-	if n == 0 {
-		return ErrNotFound
+	if n != 1 {
+		return ErrAlertDispatchLeaseLost
 	}
 	return nil
+}
+
+// ApplyCorrelatedDelivery atomically mutates the Incident/Occurrence,
+// establishes immutable delivery ownership, retains the compatibility current
+// Alert membership, and produces one durable Situation input. Reapplying an
+// already-owned delivery is a successful no-op.
+func (s *Store) ApplyCorrelatedDelivery(ctx context.Context, m CorrelatedDeliveryMutation) error {
+	if err := validateCorrelatedDeliveryMutation(m); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin correlated delivery: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var alreadyLinked int
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM incident_alert_deliveries WHERE delivery_id = ?`, m.DeliveryID).Scan(&alreadyLinked)
+	switch {
+	case err == nil:
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("store: commit duplicate correlated delivery: %w", err)
+		}
+		return nil
+	case !errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("store: read correlated delivery ownership: %w", err)
+	}
+
+	var alertID, deliveryStatus, receivedAt string
+	if err := tx.QueryRowContext(ctx, `SELECT alert_id, status, received_at FROM alert_deliveries WHERE id = ?`, m.DeliveryID).
+		Scan(&alertID, &deliveryStatus, &receivedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("store: read correlated delivery: %w", err)
+	}
+	deliveryReceivedAt, err := time.Parse(time.RFC3339Nano, receivedAt)
+	if err != nil {
+		return fmt.Errorf("store: parse correlated delivery received time: %w", err)
+	}
+
+	if m.RequireNonterminalOwner {
+		var lifecycle string
+		err := tx.QueryRowContext(ctx, `
+			SELECT s.lifecycle
+			FROM situations AS s
+			JOIN situation_incidents AS si ON si.situation_id = s.id
+			WHERE si.incident_id = ?`, m.Incident.ID).Scan(&lifecycle)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrIncidentOwnerNotCollapsible
+		}
+		if err != nil {
+			return fmt.Errorf("store: read recurrence Situation owner: %w", err)
+		}
+		if lifecycle != string(situationmodel.LifecycleActive) && lifecycle != string(situationmodel.LifecycleRecoveryPending) {
+			return ErrIncidentOwnerNotCollapsible
+		}
+	}
+
+	created, incidentStatus, err := ensureCorrelatedIncident(ctx, tx, m.Incident)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO incident_analysis_state(incident_id, status, decision_reason, updated_at)
+		VALUES (?, 'not_requested', 'correlation_collecting', ?)`, m.Incident.ID, canonicalTime(now)); err != nil {
+		return fmt.Errorf("store: ensure correlated incident analysis state: %w", err)
+	}
+
+	occurrenceID, err := applyCorrelatedOccurrenceTx(ctx, tx, m, deliveryReceivedAt)
+	if err != nil {
+		return err
+	}
+	if err := attachCorrelatedDeliveryTx(ctx, tx, m, alertID, occurrenceID, deliveryReceivedAt, now); err != nil {
+		return err
+	}
+
+	input := m.Input
+	// Delivery-backed lifecycle time always comes from the immutable ledger,
+	// never from a mutable caller projection.
+	input.OccurredAt = deliveryReceivedAt.UTC()
+	input.Kind, err = correlatedSituationInputKind(ctx, tx, input.Kind, m.Incident.ID, deliveryStatus, incidentStatus, created, now)
+	if err != nil {
+		return err
+	}
+	if _, err := dueReasonForInputKind(input.Kind); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO situation_input_outbox(
+			id, idempotency_key, incident_id, delivery_id, kind, group_key, occurred_at, status
+		) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`, input.ID, input.IdempotencyKey, input.IncidentID,
+		m.DeliveryID, input.Kind, input.GroupKey, canonicalTime(input.OccurredAt)); err != nil {
+		return fmt.Errorf("store: insert correlated Situation input: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit correlated delivery: %w", err)
+	}
+	return nil
+}
+
+func applyCorrelatedOccurrenceTx(ctx context.Context, tx *sql.Tx, m CorrelatedDeliveryMutation, receivedAt time.Time) (sql.NullInt64, error) {
+	if m.Occurrence == nil {
+		return sql.NullInt64{}, nil
+	}
+	if m.Occurrence.ID == 0 {
+		id, err := insertOccurrenceTx(ctx, tx, *m.Occurrence)
+		if err != nil {
+			return sql.NullInt64{}, err
+		}
+		return sql.NullInt64{Int64: id, Valid: true}, nil
+	}
+	lastSeen := m.Occurrence.LastSeen
+	if lastSeen.IsZero() {
+		lastSeen = receivedAt
+	}
+	res, err := tx.ExecContext(ctx, `
+		UPDATE incident_occurrences SET last_seen = MAX(last_seen, ?)
+		WHERE id = ? AND incident_id = ?`, fmtOccTime(lastSeen), m.Occurrence.ID, m.Incident.ID)
+	if err != nil {
+		return sql.NullInt64{}, fmt.Errorf("store: touch correlated occurrence: %w", err)
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return sql.NullInt64{}, fmt.Errorf("store: count touched correlated occurrence: %w", err)
+	}
+	if changed != 1 {
+		return sql.NullInt64{}, ErrNotFound
+	}
+	return sql.NullInt64{Int64: m.Occurrence.ID, Valid: true}, nil
+}
+
+func attachCorrelatedDeliveryTx(ctx context.Context, tx *sql.Tx, m CorrelatedDeliveryMutation, alertID string, occurrenceID sql.NullInt64, receivedAt, now time.Time) error {
+	memberRes, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO incident_alerts(incident_id, alert_id, created_at)
+		VALUES (?, ?, ?)`, m.Incident.ID, alertID, canonicalTime(now))
+	if err != nil {
+		return fmt.Errorf("store: attach correlated Alert projection: %w", err)
+	}
+	memberAdded, err := memberRes.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: count correlated Alert projection: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE incidents
+		SET alert_count = alert_count + ?, last_alert_at = MAX(last_alert_at, ?), updated_at = ?
+		WHERE id = ?`, memberAdded, canonicalTime(receivedAt), canonicalTime(now), m.Incident.ID); err != nil {
+		return fmt.Errorf("store: update correlated Incident: %w", err)
+	}
+	var occurrenceValue any
+	if occurrenceID.Valid {
+		occurrenceValue = occurrenceID.Int64
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO incident_alert_deliveries(incident_id, delivery_id, occurrence_id, created_at)
+		VALUES (?, ?, ?, ?)`, m.Incident.ID, m.DeliveryID, occurrenceValue, canonicalTime(now)); err != nil {
+		return fmt.Errorf("store: link correlated delivery: %w", err)
+	}
+	return nil
+}
+
+func correlatedSituationInputKind(ctx context.Context, tx *sql.Tx, requested, incidentID, deliveryStatus, incidentStatus string, created bool, now time.Time) (string, error) {
+	if created {
+		return "incident_created", nil
+	}
+	if deliveryStatus != "resolved" || (incidentStatus != "ready" && incidentStatus != "analyzed") {
+		return requested, nil
+	}
+	unresolved, err := unresolvedIncidentMembersTx(ctx, tx, incidentID)
+	if err != nil || unresolved != 0 {
+		return requested, err
+	}
+	res, err := tx.ExecContext(ctx, `
+		UPDATE incidents SET status = 'resolved', updated_at = ?
+		WHERE id = ? AND status IN ('ready', 'analyzed')`, canonicalTime(now), incidentID)
+	if err != nil {
+		return "", fmt.Errorf("store: resolve correlated Incident: %w", err)
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return "", fmt.Errorf("store: count resolved correlated Incident: %w", err)
+	}
+	if changed == 1 {
+		return "incident_resolved", nil
+	}
+	return requested, nil
+}
+
+func validateCorrelatedDeliveryMutation(m CorrelatedDeliveryMutation) error {
+	if strings.TrimSpace(m.DeliveryID) == "" || strings.TrimSpace(m.Incident.ID) == "" || strings.TrimSpace(m.Incident.GroupKey) == "" {
+		return errors.New("store: correlated delivery requires delivery and Incident identity")
+	}
+	if m.Incident.FirstAlertAt.IsZero() || m.Incident.LastAlertAt.IsZero() || m.Incident.ReadyAt.IsZero() {
+		return errors.New("store: correlated delivery requires Incident times")
+	}
+	if strings.TrimSpace(m.Input.ID) == "" || strings.TrimSpace(m.Input.IdempotencyKey) == "" || m.Input.OccurredAt.IsZero() {
+		return errors.New("store: correlated delivery requires Situation input identity and time")
+	}
+	if m.Input.IncidentID != m.Incident.ID || m.Input.GroupKey != m.Incident.GroupKey {
+		return errors.New("store: correlated Situation input does not match Incident")
+	}
+	if m.Input.DeliveryID == nil || *m.Input.DeliveryID != m.DeliveryID {
+		return errors.New("store: correlated Situation input does not match delivery")
+	}
+	if m.Occurrence != nil && m.Occurrence.IncidentID != m.Incident.ID {
+		return errors.New("store: correlated Occurrence does not match Incident")
+	}
+	if _, err := dueReasonForInputKind(m.Input.Kind); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ensureCorrelatedIncident(ctx context.Context, tx *sql.Tx, inc Incident) (created bool, status string, err error) {
+	var groupKey string
+	err = tx.QueryRowContext(ctx, `SELECT group_key, status FROM incidents WHERE id = ?`, inc.ID).Scan(&groupKey, &status)
+	if err == nil {
+		if groupKey != inc.GroupKey {
+			return false, "", errors.New("store: correlated Incident group key mismatch")
+		}
+		return false, status, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, "", fmt.Errorf("store: read correlated Incident: %w", err)
+	}
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO incidents(
+			id, group_key, status, first_alert_at, last_alert_at, ready_at,
+			alert_count, created_at, updated_at
+		) VALUES (?, ?, 'collecting', ?, ?, ?, 0, ?, ?)`, inc.ID, inc.GroupKey,
+		canonicalTime(inc.FirstAlertAt), canonicalTime(inc.LastAlertAt), canonicalTime(inc.ReadyAt),
+		canonicalTime(now), canonicalTime(now)); err != nil {
+		return false, "", fmt.Errorf("store: insert correlated Incident: %w", err)
+	}
+	return true, "collecting", nil
+}
+
+func unresolvedIncidentMembersTx(ctx context.Context, tx *sql.Tx, incidentID string) (int, error) {
+	var count int
+	err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM incident_alerts AS ia
+		WHERE ia.incident_id = ?
+		  AND COALESCE((
+			SELECT ad.status
+			FROM incident_alert_deliveries AS iad
+			JOIN alert_deliveries AS ad ON ad.id = iad.delivery_id
+			WHERE iad.incident_id = ia.incident_id AND ad.alert_id = ia.alert_id
+			ORDER BY ad.received_at DESC, ad.id DESC
+			LIMIT 1
+		  ), 'firing') <> 'resolved'`, incidentID).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("store: count unresolved correlated Incident members: %w", err)
+	}
+	return count, nil
 }
 
 const dispatchSelect = `
@@ -341,7 +631,7 @@ SELECT d.delivery_id, ad.alert_id, ad.source, ad.source_event_id, ad.source_epis
        ad.labels_json, ad.annotations_json, ad.starts_at, ad.ends_at, ad.source_started_at, ad.source_resolved_at,
        ad.started_at_basis, ad.resolved_at_basis, ad.receiver_grouping_identity, ad.payload_digest, ad.received_at,
        a.fingerprint, d.status, d.lease_owner, d.lease_expires_at,
-       d.attempt_count, d.last_error_class, d.retry_at, d.applied_at
+       d.claim_token, d.attempt_count, d.last_error_class, d.retry_at, d.applied_at
 FROM alert_delivery_dispatches d
 JOIN alert_deliveries ad ON ad.id = d.delivery_id
 JOIN alerts a ON a.id = ad.alert_id`
@@ -371,7 +661,7 @@ func scanDispatch(s scanner) (AlertDispatch, error) {
 	err := s.Scan(&d.Delivery.ID, &d.Delivery.Alert.ID, &d.Delivery.Source, &sourceEvent, &d.Delivery.SourceEpisodeKey, &status,
 		&labels, &annotations, &alertStarts, &alertEnds, &sourceStarted, &sourceResolved, &startedBasis, &resolvedBasis, &d.Delivery.ReceiverGroupingIdentity,
 		&d.Delivery.PayloadDigest, &received, &d.Delivery.Alert.Fingerprint, &d.Status, &leaseOwner, &leaseExpires,
-		&d.AttemptCount, &lastClass, &retryAt, &appliedAt)
+		&d.ClaimToken, &d.AttemptCount, &lastClass, &retryAt, &appliedAt)
 	if err != nil {
 		return AlertDispatch{}, err
 	}

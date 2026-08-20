@@ -56,6 +56,49 @@ var validTriggerKinds = map[string]bool{
 	"cap":           true,
 }
 
+// insertOccurrenceTx appends an occurrence inside a caller-owned transaction.
+// Durable delivery correlation uses it so the episode, immutable delivery
+// ownership, compatibility membership, and Situation input share one commit.
+func insertOccurrenceTx(ctx context.Context, tx *sql.Tx, occ Occurrence) (int64, error) {
+	if occ.IncidentID == "" {
+		return 0, errors.New("store: occurrence: incident_id is required")
+	}
+	if occ.OccurredAt.IsZero() {
+		return 0, errors.New("store: occurrence: occurred_at is required")
+	}
+	if occ.TriggerKind == "" {
+		occ.TriggerKind = "none"
+	}
+	if !validTriggerKinds[occ.TriggerKind] {
+		return 0, fmt.Errorf("store: occurrence: trigger_kind %q invalid", occ.TriggerKind)
+	}
+	lastSeen := occ.LastSeen
+	if lastSeen.IsZero() {
+		lastSeen = occ.OccurredAt
+	}
+	fpsJSON, err := json.Marshal(occ.Fingerprints)
+	if err != nil {
+		return 0, fmt.Errorf("store: occurrence: marshal fingerprints: %w", err)
+	}
+	payloadJSON, err := json.Marshal(occ.Payload)
+	if err != nil {
+		return 0, fmt.Errorf("store: occurrence: marshal payload: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `
+		INSERT INTO incident_occurrences
+			(incident_id, occurred_at, last_seen, fingerprints_json, payload_json, trigger_kind, snapshot_ref)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, occ.IncidentID, fmtOccTime(occ.OccurredAt), fmtOccTime(lastSeen),
+		string(fpsJSON), string(payloadJSON), occ.TriggerKind, occ.SnapshotRef)
+	if err != nil {
+		return 0, fmt.Errorf("store: insert occurrence: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("store: insert occurrence id: %w", err)
+	}
+	return id, nil
+}
+
 // InsertOccurrence appends an occurrence row and returns its new id. The write
 // is a single statement (no multi-row transaction needed): the row is
 // self-contained and derived counts are read on demand.

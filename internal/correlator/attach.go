@@ -8,8 +8,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/alertint/alertint-agent/internal/notify"
 	"github.com/alertint/alertint-agent/internal/severity"
+	"github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -79,17 +79,6 @@ type attachDecision struct {
 	// trigger == "cadence".
 	cadenceInterval time.Duration
 	cadenceMedian   time.Duration
-}
-
-// recurrenceDelta carries the display-only "why" facts from the impure decision
-// half (maybeAttachOccurrence) to attachOccurrence, which stamps them onto the
-// notify.RecurrenceEvent after reading fresh occurrence stats.
-type recurrenceDelta struct {
-	priorSeverity string
-	newSeverity   string
-	newAlertname  string
-	newInterval   time.Duration
-	priorMedian   time.Duration
 }
 
 // decideAttach is the pure heart of F1. Order is load-bearing: repeat detection
@@ -180,59 +169,70 @@ func medianDuration(ds []time.Duration) time.Duration {
 // decision-phase store error is fail-safe: it degrades to a new incident (a
 // triage that runs), never to silent collapse (a suppressed page).
 func (c *Correlator) maybeAttachOccurrence(ctx context.Context, a store.Alert, gk string) (bool, error) {
-	now := a.ReceivedAt
+	plan, ok := c.planDeliveryRecurrence(ctx, a, gk)
+	if !ok {
+		return false, nil
+	}
+	if plan.occurrence == nil {
+		return true, c.st.TouchIncidentActivity(ctx, plan.incident.ID, a.ReceivedAt)
+	}
+	if plan.occurrence.ID > 0 {
+		return true, c.st.TouchOccurrenceLastSeen(ctx, plan.occurrence.ID, plan.occurrence.LastSeen)
+	}
+	return true, c.attachOccurrence(ctx, a, plan.incident, gk, *plan.occurrence)
+}
 
+type deliveryRecurrencePlan struct {
+	incident   store.Incident
+	occurrence *store.Occurrence
+}
+
+// planDeliveryRecurrence gathers the durable facts for a recurrence decision.
+// Missing ownership, a terminal owner, or any lookup failure takes the safe
+// new-Incident path. ApplyCorrelatedDelivery repeats the owner check inside its
+// transaction to close the decision/commit race.
+func (c *Correlator) planDeliveryRecurrence(ctx context.Context, a store.Alert, gk string) (deliveryRecurrencePlan, bool) {
+	now := a.ReceivedAt.UTC()
 	candidate, err := c.st.GetRecentJudgedIncidentByGroupKey(ctx, gk)
 	if err == store.ErrNotFound {
-		return false, nil
+		return deliveryRecurrencePlan{}, false
 	}
 	if err != nil {
 		c.logger.Warn("correlator: judged-incident lookup failed; treating as new incident", "err", err, "group_key", gk)
-		return false, nil
+		return deliveryRecurrencePlan{}, false
+	}
+	owner, err := c.st.SituationForIncident(ctx, candidate.ID)
+	if err != nil {
+		if err != store.ErrNotFound {
+			c.logger.Warn("correlator: Situation-owner lookup failed; treating as new incident", "err", err, "incident_id", candidate.ID)
+		}
+		return deliveryRecurrencePlan{}, false
+	}
+	if owner.Lifecycle != model.LifecycleActive && owner.Lifecycle != model.LifecycleRecoveryPending {
+		return deliveryRecurrencePlan{}, false
 	}
 
-	// Load members once: they carry the trigger baselines, membership, and the
-	// candidate's drill-ness — no separate IncidentDrillFlags query needed.
 	members, err := c.st.GetIncidentAlerts(ctx, candidate.ID)
 	if err != nil {
 		c.logger.Warn("correlator: member lookup failed; treating as new incident", "err", err)
-		return false, nil
+		return deliveryRecurrencePlan{}, false
 	}
-	baselineSev, baselineSevLabel, known, isMember, candidateDrill := memberBaselines(members, a.Fingerprint)
-
-	// Drill parity: a drill re-fire never attaches to a real incident, or vice
-	// versa (salted drill keys make this near-impossible; the check makes it so).
+	baselineSev, _, known, isMember, candidateDrill := memberBaselines(members, a.Fingerprint)
 	if store.IsDrillAlert(a) != candidateDrill {
-		return false, nil
+		return deliveryRecurrencePlan{}, false
 	}
-
 	latestOcc, err := c.st.LatestOccurrence(ctx, candidate.ID)
 	if err != nil && err != store.ErrNotFound {
 		c.logger.Warn("correlator: latest-occurrence lookup failed; treating as new incident", "err", err)
-		return false, nil
+		return deliveryRecurrencePlan{}, false
 	}
-
-	// A new episode is a genuine re-fire: the condition recovered and returned
-	// (the candidate fully resolved), or an alert identity new to the incident
-	// joined (rotated fingerprint / new alertname). Otherwise it is an unchanged
-	// repeat of an already-firing member. Ingress upserts the alert before the
-	// correlator sees it, so the alert row's prior status is gone; the incident
-	// status and membership are the durable signals. Bounded gap: a single member
-	// of a multi-alert incident that individually resolves and re-fires under the
-	// same fingerprint reads as a repeat and is not re-examined until the whole
-	// incident resolves (Clock B only fires on a NEW episode, so it does not
-	// cover this member-local case). Severity changes alter the fingerprint, so
-	// a severity escalation is unaffected.
-	isNewEpisode := candidate.Status == "resolved" || !isMember
-
-	// An unchanged repeat only slides last_seen — short-circuit before the
-	// cross-incident count/cadence reads, which the common repeat path never
-	// needs. Clock B is checked only for new episodes, so a repeat never mints.
-	if !isNewEpisode {
-		if latestOcc != nil {
-			return true, c.st.TouchOccurrenceLastSeen(ctx, latestOcc.ID, now)
+	if candidate.Status != "resolved" && isMember {
+		if latestOcc == nil {
+			return deliveryRecurrencePlan{incident: *candidate}, true
 		}
-		return true, c.st.TouchIncidentActivity(ctx, candidate.ID, now)
+		touch := *latestOcc
+		touch.LastSeen = now
+		return deliveryRecurrencePlan{incident: *candidate, occurrence: &touch}, true
 	}
 
 	lastActivity := candidate.LastAlertAt
@@ -246,55 +246,33 @@ func (c *Correlator) maybeAttachOccurrence(ctx context.Context, a store.Alert, g
 	occSince, err := c.st.CountOccurrencesSince(ctx, candidate.ID, lastJudged)
 	if err != nil {
 		c.logger.Warn("correlator: occurrence-count lookup failed; treating as new incident", "err", err)
-		return false, nil
+		return deliveryRecurrencePlan{}, false
 	}
 	episodeTimes, err := c.st.KeyEpisodeTimes(ctx, gk, now.Add(-c.cfg.Lookback))
 	if err != nil {
 		c.logger.Warn("correlator: episode-times lookup failed; treating as new incident", "err", err)
-		return false, nil
+		return deliveryRecurrencePlan{}, false
 	}
-
 	decision := decideAttach(attachInputs{
-		now:                    now,
-		lastJudgedAt:           lastJudged,
-		lastActivity:           lastActivity,
-		occurrencesSinceJudged: occSince,
-		isNewEpisode:           true,
-		incomingSeverityRank:   severity.Rank(a.Labels["severity"]),
-		incomingAlertname:      a.Labels["alertname"],
-		baselineSeverityRank:   baselineSev,
-		knownAlertnames:        known,
-		episodeTimes:           episodeTimes,
-		attachWindow:           c.cfg.AttachWindow,
-		judgmentCeiling:        c.cfg.JudgmentCeiling,
-		occurrenceCap:          c.cfg.OccurrenceCap,
+		now: now, lastJudgedAt: lastJudged, lastActivity: lastActivity,
+		occurrencesSinceJudged: occSince, isNewEpisode: true,
+		incomingSeverityRank: severity.Rank(a.Labels["severity"]), incomingAlertname: a.Labels["alertname"],
+		baselineSeverityRank: baselineSev, knownAlertnames: known, episodeTimes: episodeTimes,
+		attachWindow: c.cfg.AttachWindow, judgmentCeiling: c.cfg.JudgmentCeiling, occurrenceCap: c.cfg.OccurrenceCap,
 	})
-
-	// Display-only "why" facts for the recurrence event, derived here in the
-	// impure half where labels and the episode series are in hand. decideAttach
-	// stays pure; these never feed back into the decision.
-	var delta recurrenceDelta
-	switch decision.trigger {
-	case "severity":
-		delta.priorSeverity = baselineSevLabel
-		delta.newSeverity = a.Labels["severity"]
-	case "new_alertname":
-		delta.newAlertname = a.Labels["alertname"]
-	case "cadence":
-		delta.newInterval, delta.priorMedian = decision.cadenceInterval, decision.cadenceMedian
+	if decision.action == actionNewIncident || decision.action == actionRepeatTouch {
+		return deliveryRecurrencePlan{}, false
 	}
+	occ := recurrenceOccurrence(a, candidate.ID, decision.trigger)
+	return deliveryRecurrencePlan{incident: *candidate, occurrence: &occ}, true
+}
 
-	switch decision.action {
-	case actionNewIncident:
-		return false, nil
-	case actionAttach, actionRejudge:
-		return true, c.attachOccurrence(ctx, a, *candidate, gk, decision, delta)
-	case actionRepeatTouch:
-		// Unreachable: repeats are short-circuited above before decideAttach runs
-		// (isNewEpisode is forced true here). Fall through to a safe new incident.
-		return false, nil
-	default:
-		return false, nil
+func recurrenceOccurrence(a store.Alert, incidentID, trigger string) store.Occurrence {
+	return store.Occurrence{
+		IncidentID: incidentID, OccurredAt: a.ReceivedAt.UTC(), LastSeen: a.ReceivedAt.UTC(),
+		Fingerprints: []string{a.Fingerprint},
+		Payload:      []store.OccurrenceMember{{Fingerprint: a.Fingerprint, Labels: a.Labels, Annotations: a.Annotations}},
+		TriggerKind:  trigger,
 	}
 }
 
@@ -324,27 +302,10 @@ func memberBaselines(members []store.Alert, incomingFP string) (maxSev int, maxS
 	return maxSev, maxSevLabel, known, isMember, isDrill
 }
 
-// attachOccurrence records one occurrence row (with its trigger), mirrors the
-// alert into incident_alerts, audits the attach, fires the collapse notifier,
-// and — for an escalation — runs the re-judgment (U4 wires the rejudger). A
-// re-judgment failure leaves the prior finding standing; last_judged_at is left
-// unreset, so a subsequent triggering attach re-attempts it. Note this is
-// retry-per-trigger, not a single retry: a persistently failing re-judgment
-// (e.g. a revoked key) re-fires on each new-episode trigger, rate-bounded only
-// by the LLM client's own timeout/backoff.
-func (c *Correlator) attachOccurrence(ctx context.Context, a store.Alert, inc store.Incident, gk string, decision attachDecision, delta recurrenceDelta) error {
-	occ := store.Occurrence{
-		IncidentID:   inc.ID,
-		OccurredAt:   a.ReceivedAt,
-		LastSeen:     a.ReceivedAt,
-		Fingerprints: []string{a.Fingerprint},
-		Payload: []store.OccurrenceMember{{
-			Fingerprint: a.Fingerprint,
-			Labels:      a.Labels,
-			Annotations: a.Annotations,
-		}},
-		TriggerKind: decision.trigger,
-	}
+// attachOccurrence is retained only for legacy in-memory fixtures. Durable
+// deliveries use ApplyCorrelatedDelivery, which emits a Situation input instead
+// of calling notification or re-judgment code inline.
+func (c *Correlator) attachOccurrence(ctx context.Context, a store.Alert, inc store.Incident, gk string, occ store.Occurrence) error {
 	// One transaction: the occurrence row and its incident_alerts membership
 	// commit together, so a partial failure can't leave an orphan occurrence a
 	// redelivery would re-count. Mirroring the resolved branch, the alert joins
@@ -359,38 +320,15 @@ func (c *Correlator) attachOccurrence(ctx context.Context, a store.Alert, inc st
 		if err := c.auditor.Append(ctx, "correlator", "incident.occurrence_attached", map[string]any{
 			"incident_id": inc.ID,
 			"group_key":   gk,
-			"trigger":     decision.trigger,
+			"trigger":     occ.TriggerKind,
 		}); err != nil {
 			c.logger.Warn("correlator: audit occurrence_attached failed", "err", err, "incident_id", inc.ID)
 		}
 	}
 
 	stats := c.occurrenceStats(ctx, inc.ID)
-	if c.occNotifier != nil {
-		ev := notify.RecurrenceEvent{
-			Incident:      inc,
-			Stats:         stats,
-			Trigger:       decision.trigger,
-			Drill:         store.IsDrillAlert(a),
-			PriorSeverity: delta.priorSeverity,
-			NewSeverity:   delta.newSeverity,
-			NewAlertname:  delta.newAlertname,
-			NewInterval:   delta.newInterval,
-			PriorMedian:   delta.priorMedian,
-		}
-		if err := c.occNotifier.OnOccurrenceAttached(ctx, ev); err != nil {
-			c.logger.Warn("correlator: occurrence notify failed", "err", err, "incident_id", inc.ID)
-		}
-	}
 	c.logger.Info("correlator: occurrence attached",
-		"incident_id", inc.ID, "group_key", gk, "trigger", decision.trigger, "occurrences", stats.Count)
-
-	if decision.action == actionRejudge && c.rejudger != nil {
-		if err := c.rejudger.Rejudge(ctx, inc, decision.trigger); err != nil {
-			c.logger.Error("correlator: re-judgment failed; prior finding stands",
-				"err", err, "incident_id", inc.ID, "trigger", decision.trigger)
-		}
-	}
+		"incident_id", inc.ID, "group_key", gk, "trigger", occ.TriggerKind, "occurrences", stats.Count)
 	return nil
 }
 

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/notify"
+	"github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/google/uuid"
 )
@@ -140,6 +141,16 @@ func seedJudged(t *testing.T, st *store.Store, id, status string, lastActivity, 
 	if err := st.AddAlertToIncident(ctx, id, member.ID, member.ReceivedAt); err != nil {
 		t.Fatalf("link member: %v", err)
 	}
+	owner, err := st.CurrentSituationForGroup(ctx, gkAPI)
+	if err == store.ErrNotFound {
+		seedIncidentOwner(t, st, id, gkAPI, model.LifecycleActive, lastActivity)
+	} else if err != nil {
+		t.Fatalf("read current Situation: %v", err)
+	} else if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO situation_incidents(situation_id, incident_id, attached_at) VALUES (?, ?, ?)`,
+		owner.ID, id, ts(lastActivity)); err != nil {
+		t.Fatalf("attach Incident to current Situation: %v", err)
+	}
 }
 
 func occCount(t *testing.T, st *store.Store, id string) int {
@@ -187,8 +198,8 @@ func TestMaybeAttach_PlainAttach(t *testing.T) {
 	if td.aud.occurrenceAttachedCount() != 1 {
 		t.Errorf("audit rows = %d, want 1", td.aud.occurrenceAttachedCount())
 	}
-	if td.notif.count() != 1 || td.notif.calls[0].Stats.Count != 1 {
-		t.Errorf("notifier calls = %d (%v), want 1 (count=1)", td.notif.count(), td.notif.calls)
+	if td.notif.count() != 0 {
+		t.Errorf("notifier calls = %d, want 0 (Situation controller owns notification)", td.notif.count())
 	}
 	if td.rej.count() != 0 {
 		t.Errorf("rejudger called %d times, want 0 (plain attach, no LLM)", td.rej.count())
@@ -337,17 +348,19 @@ func runRejudgeCase(t *testing.T, incoming store.Alert, lastJudged time.Time) (*
 
 func TestMaybeAttach_SeverityRejudge(t *testing.T) {
 	now := time.Date(2026, 7, 8, 15, 30, 0, 0, time.UTC)
-	_, td := runRejudgeCase(t, firingAlert("fp-new", "DiskFull", "critical", now, false), now.Add(-10*time.Minute))
-	if td.rej.count() != 1 || td.rej.triggers[0] != "severity" {
-		t.Errorf("rejudger triggers = %v, want [severity]", td.rej.triggers)
+	st, td := runRejudgeCase(t, firingAlert("fp-new", "DiskFull", "critical", now, false), now.Add(-10*time.Minute))
+	latest, _ := st.LatestOccurrence(context.Background(), "inc_1")
+	if latest.TriggerKind != "severity" || td.rej.count() != 0 {
+		t.Errorf("trigger=%q direct rejudgments=%d, want severity and 0", latest.TriggerKind, td.rej.count())
 	}
 }
 
 func TestMaybeAttach_NewAlertnameRejudge(t *testing.T) {
 	now := time.Date(2026, 7, 8, 15, 30, 0, 0, time.UTC)
-	_, td := runRejudgeCase(t, firingAlert("fp-new", "OOMKilled", "warning", now, false), now.Add(-10*time.Minute))
-	if td.rej.count() != 1 || td.rej.triggers[0] != "new_alertname" {
-		t.Errorf("rejudger triggers = %v, want [new_alertname]", td.rej.triggers)
+	st, td := runRejudgeCase(t, firingAlert("fp-new", "OOMKilled", "warning", now, false), now.Add(-10*time.Minute))
+	latest, _ := st.LatestOccurrence(context.Background(), "inc_1")
+	if latest.TriggerKind != "new_alertname" || td.rej.count() != 0 {
+		t.Errorf("trigger=%q direct rejudgments=%d, want new_alertname and 0", latest.TriggerKind, td.rej.count())
 	}
 }
 
@@ -355,8 +368,8 @@ func TestMaybeAttach_CeilingRejudge(t *testing.T) {
 	now := time.Date(2026, 7, 8, 15, 30, 0, 0, time.UTC)
 	// Recent activity (inside Clock A) but judged 5h ago (past the 4h ceiling).
 	st, td := runRejudgeCase(t, firingAlert("fp-new", "DiskFull", "warning", now, false), now.Add(-5*time.Hour))
-	if td.rej.count() != 1 || td.rej.triggers[0] != "ceiling" {
-		t.Errorf("rejudger triggers = %v, want [ceiling]", td.rej.triggers)
+	if td.rej.count() != 0 {
+		t.Errorf("direct rejudgments=%d, want 0", td.rej.count())
 	}
 	latest, _ := st.LatestOccurrence(context.Background(), "inc_1")
 	if latest.TriggerKind != "ceiling" {
@@ -425,8 +438,8 @@ func TestMaybeAttach_CollapseArithmetic(t *testing.T) {
 	if td.aud.occurrenceAttachedCount() != n {
 		t.Errorf("audit rows = %d, want %d", td.aud.occurrenceAttachedCount(), n)
 	}
-	if td.notif.count() != n {
-		t.Errorf("notifier calls = %d, want %d", td.notif.count(), n)
+	if td.notif.count() != 0 {
+		t.Errorf("notifier calls = %d, want 0", td.notif.count())
 	}
 	if td.rej.count() != 0 {
 		t.Errorf("rejudger calls = %d, want 0 (steady cadence, no trigger)", td.rej.count())
@@ -462,8 +475,9 @@ func TestMaybeAttach_CadenceRejudge(t *testing.T) {
 	if _, err := c.maybeAttachOccurrence(ctx, incoming, gkAPI); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
-	if td.rej.count() != 1 || td.rej.triggers[0] != "cadence" {
-		t.Errorf("rejudger triggers = %v, want [cadence]", td.rej.triggers)
+	latest, _ := st.LatestOccurrence(ctx, "inc_n4")
+	if latest.TriggerKind != "cadence" || td.rej.count() != 0 {
+		t.Errorf("trigger=%q direct rejudgments=%d, want cadence and 0", latest.TriggerKind, td.rej.count())
 	}
 }
 
@@ -495,28 +509,19 @@ func TestFlushExpired_PrunesOnSchedule(t *testing.T) {
 	}
 }
 
-func TestMaybeAttach_EventCarriesSeverityDelta(t *testing.T) {
+func TestMaybeAttach_SeverityDoesNotNotifyInline(t *testing.T) {
 	now := time.Date(2026, 7, 8, 15, 30, 0, 0, time.UTC)
-	_, td := runRejudgeCase(t, firingAlert("fp-new", "DiskFull", "critical", now, false), now.Add(-10*time.Minute))
-	if td.notif.count() != 1 {
-		t.Fatalf("notifier calls = %d, want 1", td.notif.count())
-	}
-	ev := td.notif.calls[0]
-	if ev.Trigger != "severity" || ev.NewSeverity != "critical" || ev.PriorSeverity != "warning" {
-		t.Errorf("severity event = {trigger:%q new:%q prior:%q}, want {severity critical warning}",
-			ev.Trigger, ev.NewSeverity, ev.PriorSeverity)
-	}
-	if ev.Stats.Count != 1 {
-		t.Errorf("stats.Count = %d, want 1", ev.Stats.Count)
+	_, td := runRejudgeCase(t, firingAlert("fp-new-inline", "DiskFull", "critical", now, false), now.Add(-10*time.Minute))
+	if td.notif.count() != 0 {
+		t.Fatalf("notifier calls = %d, want 0", td.notif.count())
 	}
 }
 
-func TestMaybeAttach_EventCarriesNewAlertname(t *testing.T) {
+func TestMaybeAttach_NewAlertnameDoesNotNotifyInline(t *testing.T) {
 	now := time.Date(2026, 7, 8, 15, 30, 0, 0, time.UTC)
-	_, td := runRejudgeCase(t, firingAlert("fp-new", "OOMKilled", "warning", now, false), now.Add(-10*time.Minute))
-	ev := td.notif.calls[0]
-	if ev.Trigger != "new_alertname" || ev.NewAlertname != "OOMKilled" {
-		t.Errorf("new_alertname event = {trigger:%q name:%q}, want {new_alertname OOMKilled}", ev.Trigger, ev.NewAlertname)
+	_, td := runRejudgeCase(t, firingAlert("fp-name-inline", "OOMKilled", "warning", now, false), now.Add(-10*time.Minute))
+	if td.notif.count() != 0 {
+		t.Fatalf("notifier calls = %d, want 0", td.notif.count())
 	}
 }
 
@@ -542,13 +547,14 @@ func TestGroupKey_ZabbixReceiverIdentity(t *testing.T) {
 // severity re-judge trigger, not silently rank 0.
 func TestMaybeAttach_ZabbixDisasterSeverityRejudge(t *testing.T) {
 	now := time.Date(2026, 7, 8, 15, 30, 0, 0, time.UTC)
-	_, td := runRejudgeCase(t, firingAlert("fp-new", "DiskFull", "disaster", now, false), now.Add(-10*time.Minute))
-	if td.rej.count() != 1 || td.rej.triggers[0] != "severity" {
-		t.Errorf("rejudger triggers = %v, want [severity]", td.rej.triggers)
+	st, td := runRejudgeCase(t, firingAlert("fp-new", "DiskFull", "disaster", now, false), now.Add(-10*time.Minute))
+	latest, _ := st.LatestOccurrence(context.Background(), "inc_1")
+	if latest.TriggerKind != "severity" || td.rej.count() != 0 {
+		t.Errorf("trigger=%q direct rejudgments=%d, want severity and 0", latest.TriggerKind, td.rej.count())
 	}
 }
 
-func TestMaybeAttach_EventCarriesCadenceDelta(t *testing.T) {
+func TestMaybeAttach_CadenceDoesNotNotifyInline(t *testing.T) {
 	st := openStore(t)
 	c, td := newCorrelatorFor(t, st)
 	ctx := context.Background()
@@ -565,11 +571,7 @@ func TestMaybeAttach_EventCarriesCadenceDelta(t *testing.T) {
 	if _, err := c.maybeAttachOccurrence(ctx, incoming, gkAPI); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
-	ev := td.notif.calls[0]
-	if ev.Trigger != "cadence" {
-		t.Fatalf("trigger = %q, want cadence", ev.Trigger)
-	}
-	if ev.NewInterval <= 0 || ev.PriorMedian <= 0 || ev.NewInterval*8 >= ev.PriorMedian {
-		t.Errorf("cadence delta = {new:%s median:%s}, want new*8 < median with both > 0", ev.NewInterval, ev.PriorMedian)
+	if td.notif.count() != 0 {
+		t.Fatalf("notifier calls = %d, want 0", td.notif.count())
 	}
 }
