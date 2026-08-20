@@ -61,6 +61,23 @@ func (a *Auditor) withClock(now func() time.Time) *Auditor {
 // JSON-marshalable value; it is normalized into canonical JSON before
 // hashing so the same logical payload always produces the same hash.
 func (a *Auditor) Append(ctx context.Context, actor, kind string, payload any) error {
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("audit: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := a.AppendTx(ctx, tx, actor, kind, payload); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("audit: commit: %w", err)
+	}
+	return nil
+}
+
+// AppendTx adds one hash-chained audit record to a caller-owned transaction.
+// It is the atomic boundary for durable state changes that require an audit row.
+func (a *Auditor) AppendTx(ctx context.Context, tx *sql.Tx, actor, kind string, payload any) error {
 	if err := validateAppendArgs(actor, kind); err != nil {
 		return err
 	}
@@ -68,12 +85,6 @@ func (a *Auditor) Append(ctx context.Context, actor, kind string, payload any) e
 	if err != nil {
 		return fmt.Errorf("audit: canonicalize payload: %w", err)
 	}
-
-	tx, err := a.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("audit: begin tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
 
 	var prev sql.NullString
 	row := tx.QueryRowContext(ctx, `SELECT hash FROM audit_log ORDER BY seq DESC LIMIT 1`)
@@ -94,9 +105,6 @@ func (a *Auditor) Append(ctx context.Context, actor, kind string, payload any) e
 		VALUES (?, ?, ?, ?, ?, ?)
 	`, ts, actor, kind, string(canonical), prevArg, hash); err != nil {
 		return fmt.Errorf("audit: insert row: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("audit: commit: %w", err)
 	}
 	return nil
 }

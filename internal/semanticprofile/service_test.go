@@ -4,12 +4,15 @@ package semanticprofile
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/llm"
 	profilemodel "github.com/alertint/alertint-agent/internal/semanticprofile/model"
 	"github.com/alertint/alertint-agent/internal/store"
@@ -82,6 +85,23 @@ func TestInferencePromptBoundsSourceText(t *testing.T) {
 	}
 }
 
+func TestHugeLabelMapsKeepPromptAndSignatureMaterialBounded(t *testing.T) {
+	labels := make(map[string]string, 4_096)
+	annotations := make(map[string]string, 4_096)
+	for i := 0; i < 4_096; i++ {
+		key := fmt.Sprintf("label-%04d", i)
+		labels[key] = strings.Repeat("v", 4_096)
+		annotations[key] = strings.Repeat("a", 4_096)
+	}
+	delivery := sampleDelivery(labels)
+	delivery.Alert.Annotations = annotations
+	_, material := signatureMaterial(delivery)
+	prompt := inferencePrompt(delivery, Signature(delivery))
+	if len(material) > maxProfileJSONBytes || len(prompt.Prefix) > 20_000 {
+		t.Fatalf("material=%d prompt=%d", len(material), len(prompt.Prefix))
+	}
+}
+
 func TestDecodeProfileRejectsOversizedRawAndCollections(t *testing.T) {
 	tooLarge := json.RawMessage(`{"` + strings.Repeat("x", maxProfileJSONBytes) + `":"x"}`)
 	if _, err := decodeProfile(tooLarge, "zabbix:test"); err == nil || !strings.Contains(err.Error(), "too large") {
@@ -125,6 +145,28 @@ func TestCorrectionSurfacesRequiredRejectedAuditFailure(t *testing.T) {
 	}
 }
 
+func TestSuccessfulAuditFailureRollsBackProfileAndOutbox(t *testing.T) {
+	st, err := store.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	seedProfile(t, st, "zabbix:trigger=18422:template=sha256:923b", 1)
+	svc := New(st, staticLLM{}, "semantic-profile-v1", "configured-model", failingTransactionalAuditSink{})
+	_, err = svc.Correct(context.Background(), Correction{Signature: "zabbix:trigger=18422:template=sha256:923b", ExpectedVersion: 1, Confirmed: true, ConfirmedBy: "janis", Raw: validProfileJSON()})
+	if !errors.Is(err, errAuditUnavailable) {
+		t.Fatalf("err=%v", err)
+	}
+	history, err := st.SemanticProfile(context.Background(), "zabbix:trigger=18422:template=sha256:923b")
+	if err != nil || history.CurrentVersion != 1 {
+		t.Fatalf("history=%+v err=%v", history, err)
+	}
+	changes, err := st.SemanticProfileChanges(context.Background(), 10)
+	if err != nil || len(changes) != 1 {
+		t.Fatalf("changes=%+v err=%v", changes, err)
+	}
+}
+
 func TestCorrectRejectsOversizedAttribution(t *testing.T) {
 	svc, st := newService(t)
 	current := seedProfile(t, st, "zabbix:trigger=18422:template=sha256:923b", 1)
@@ -154,10 +196,27 @@ func (s *failingAuditStore) SemanticProfile(context.Context, string) (*profilemo
 func (*failingAuditStore) AppendSemanticProfileVersion(context.Context, int, profilemodel.ProfileVersion) error {
 	return nil
 }
+func (*failingAuditStore) AppendSemanticProfileVersionWithAudit(context.Context, int, profilemodel.ProfileVersion, store.SemanticProfileAuditAppender, []store.SemanticProfileAuditEvent) error {
+	return nil
+}
 
 type failingAuditSink struct{}
 
 func (failingAuditSink) Append(context.Context, string, string, any) error {
+	return errAuditUnavailable
+}
+
+func (failingAuditSink) AppendTx(context.Context, *sql.Tx, string, string, any) error {
+	return errAuditUnavailable
+}
+
+type failingTransactionalAuditSink struct{}
+
+func (failingTransactionalAuditSink) Append(context.Context, string, string, any) error {
+	return errAuditUnavailable
+}
+
+func (failingTransactionalAuditSink) AppendTx(context.Context, *sql.Tx, string, string, any) error {
 	return errAuditUnavailable
 }
 
@@ -168,7 +227,7 @@ func newService(t *testing.T) (*Service, *store.Store) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	return New(st, staticLLM{}, "semantic-profile-v1", "configured-model"), st
+	return New(st, staticLLM{}, "semantic-profile-v1", "configured-model", audit.New(st.DB())), st
 }
 
 func seedProfile(t *testing.T, st *store.Store, signature string, version int) ProfileVersion {

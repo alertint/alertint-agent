@@ -45,16 +45,31 @@ func inferencePrompt(d store.AlertDelivery, signature string) llm.Prompt {
 }
 
 func boundedValues(values map[string]string) map[string]string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	out := make(map[string]string, min(len(keys), 32))
-	for _, key := range keys[:min(len(keys), 32)] {
+	keys := boundedSchemaKeys(values)
+	out := make(map[string]string, len(keys))
+	for _, key := range keys {
 		out[limitText(key, 128)] = limitText(values[key], 256)
 	}
 	return out
+}
+
+// boundedSchemaKeys retains the lexically first 32 keys with fixed resident
+// memory. Scanning a map is necessary for a deterministic schema, but neither
+// prompt nor signature construction allocates per input key.
+func boundedSchemaKeys(values map[string]string) []string {
+	keys := make([]string, 0, 32)
+	for key := range values {
+		if len(keys) < cap(keys) {
+			keys = append(keys, key)
+			sort.Strings(keys)
+			continue
+		}
+		if key < keys[len(keys)-1] {
+			keys[len(keys)-1] = key
+			sort.Strings(keys)
+		}
+	}
+	return keys
 }
 
 func limitText(v string, n int) string {

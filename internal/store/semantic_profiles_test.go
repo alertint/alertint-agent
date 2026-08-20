@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,6 +53,38 @@ func TestAppendSemanticProfileVersionRejectsStaleHead(t *testing.T) {
 	}
 	if err := s.AppendSemanticProfileVersion(ctx, 0, testProfileVersion("profile-2", first.SignatureKey, "correction")); !errors.Is(err, ErrVersionConflict) {
 		t.Fatalf("err = %v, want version conflict", err)
+	}
+}
+
+func TestAppendSemanticProfileVersionRejectsOversizedDirectInput(t *testing.T) {
+	s := newTestStore(t)
+	for name, mutate := range map[string]func(*model.ProfileVersion){
+		"signature": func(v *model.ProfileVersion) {
+			v.SignatureKey = strings.Repeat("k", maxSemanticProfileSignatureBytes+1)
+		},
+		"source": func(v *model.ProfileVersion) { v.Source = strings.Repeat("s", maxSemanticProfileSourceBytes+1) },
+		"material": func(v *model.ProfileVersion) {
+			v.SignatureMaterial = json.RawMessage(`"` + strings.Repeat("m", maxSemanticProfileMaterialBytes) + `"`)
+		},
+		"profile": func(v *model.ProfileVersion) {
+			v.Profile.Uncertainty = []string{strings.Repeat("u", maxSemanticProfileValueBytes+1)}
+		},
+		"model":  func(v *model.ProfileVersion) { v.Model = strings.Repeat("m", maxSemanticProfileModelBytes+1) },
+		"prompt": func(v *model.ProfileVersion) { v.PromptVersion = strings.Repeat("p", maxSemanticProfilePromptBytes+1) },
+		"usage": func(v *model.ProfileVersion) {
+			v.TokenUsage = json.RawMessage(`"` + strings.Repeat("u", maxSemanticProfileUsageBytes) + `"`)
+		},
+		"attribution": func(v *model.ProfileVersion) {
+			v.AssertedBy = strings.Repeat("a", maxSemanticProfileAttributionBytes+1)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			v := testProfileVersion("profile-oversized", "zabbix:trigger=18422:template=sha256:923b", "inferred")
+			mutate(&v)
+			if err := s.AppendSemanticProfileVersion(context.Background(), 0, v); err == nil || !strings.Contains(err.Error(), "too large") {
+				t.Fatalf("err=%v", err)
+			}
+		})
 	}
 }
 

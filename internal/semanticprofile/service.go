@@ -5,6 +5,7 @@ package semanticprofile
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,7 +15,6 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/llm"
 	profilemodel "github.com/alertint/alertint-agent/internal/semanticprofile/model"
 	"github.com/alertint/alertint-agent/internal/store"
@@ -39,11 +39,13 @@ var ErrVersionConflict = errors.New("semanticprofile: version conflict")
 type Store interface {
 	SemanticProfile(context.Context, string) (*profilemodel.History, error)
 	AppendSemanticProfileVersion(context.Context, int, profilemodel.ProfileVersion) error
+	AppendSemanticProfileVersionWithAudit(context.Context, int, profilemodel.ProfileVersion, store.SemanticProfileAuditAppender, []store.SemanticProfileAuditEvent) error
 }
 
 // AuditSink records required, redacted profile audit events durably.
 type AuditSink interface {
 	Append(context.Context, string, string, any) error
+	AppendTx(context.Context, *sql.Tx, string, string, any) error
 }
 
 // LLMClient is intentionally completion-only: semantic inference has no tool
@@ -62,13 +64,7 @@ type Service struct {
 	auditor       AuditSink
 }
 
-func New(st Store, client LLMClient, promptVersion, model string, auditors ...AuditSink) *Service {
-	var auditor AuditSink
-	if len(auditors) > 0 {
-		auditor = auditors[0]
-	} else if concreteStore, ok := st.(*store.Store); ok {
-		auditor = audit.New(concreteStore.DB())
-	}
+func New(st Store, client LLMClient, promptVersion, model string, auditor AuditSink) *Service {
 	return &Service{store: st, llm: client, promptVersion: promptVersion, model: model, auditor: auditor}
 }
 
@@ -89,6 +85,9 @@ func (s *Service) Get(ctx context.Context, signature string) (*History, error) {
 func (s *Service) InferIfMissing(ctx context.Context, d store.AlertDelivery) (*History, error) {
 	if s == nil || s.store == nil || s.llm == nil {
 		return nil, nil
+	}
+	if err := s.requireAudit(); err != nil {
+		return nil, err
 	}
 	signature, material := signatureMaterial(d)
 	history, err := s.Get(ctx, signature)
@@ -128,17 +127,15 @@ func (s *Service) InferIfMissing(ctx context.Context, d store.AlertDelivery) (*H
 		Profile: profile, Origin: OriginInferred, InputDigest: inputDigest(d.PayloadDigest, material),
 		Model: modelName, PromptVersion: s.promptVersion, TokenUsage: usage, CreatedAt: time.Now().UTC(),
 	}
-	if err := s.store.AppendSemanticProfileVersion(ctx, 0, v); err != nil {
+	events := []store.SemanticProfileAuditEvent{
+		{Kind: "semantic_profile.inferred", Payload: map[string]any{"signature": signature, "version": 1, "input_digest": v.InputDigest, "model": modelName, "prompt_version": s.promptVersion}},
+		{Kind: "semantic_profile.head_advanced", Payload: map[string]any{"signature": signature, "from_version": 0, "to_version": 1, "origin": v.Origin}},
+	}
+	if err := s.store.AppendSemanticProfileVersionWithAudit(ctx, 0, v, s.auditor, events); err != nil {
 		if auditErr := s.audit(ctx, "semantic_profile.inference_rejected", map[string]any{"signature": signature, "reason": "head_advance_failed"}); auditErr != nil {
 			return nil, auditErr
 		}
 		return nil, nil
-	}
-	if err := s.audit(ctx, "semantic_profile.inferred", map[string]any{"signature": signature, "version": 1, "input_digest": v.InputDigest, "model": modelName, "prompt_version": s.promptVersion}); err != nil {
-		return nil, err
-	}
-	if err := s.audit(ctx, "semantic_profile.head_advanced", map[string]any{"signature": signature, "from_version": 0, "to_version": 1, "origin": v.Origin}); err != nil {
-		return nil, err
 	}
 	return s.Get(ctx, signature)
 }
@@ -157,6 +154,9 @@ type Correction struct {
 func (s *Service) Correct(ctx context.Context, c Correction) (*ProfileVersion, error) {
 	if s == nil || s.store == nil {
 		return nil, errors.New("semanticprofile: store is required")
+	}
+	if err := s.requireAudit(); err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(c.Signature) == "" {
 		return nil, errors.New("semanticprofile: signature is required")
@@ -193,7 +193,11 @@ func (s *Service) Correct(ctx context.Context, c Correction) (*ProfileVersion, e
 		SignatureMaterial: current.SignatureMaterial, Profile: profile, Origin: OriginCorrection,
 		InputDigest: inputDigest(string(c.Raw), nil), AssertedBy: strings.TrimSpace(c.ConfirmedBy), CreatedAt: time.Now().UTC(),
 	}
-	if err := s.store.AppendSemanticProfileVersion(ctx, c.ExpectedVersion, v); err != nil {
+	events := []store.SemanticProfileAuditEvent{
+		{Kind: "semantic_profile.corrected", Payload: map[string]any{"signature": c.Signature, "version": c.ExpectedVersion + 1, "input_digest": v.InputDigest, "asserted_by": v.AssertedBy}},
+		{Kind: "semantic_profile.head_advanced", Payload: map[string]any{"signature": c.Signature, "from_version": c.ExpectedVersion, "to_version": c.ExpectedVersion + 1, "origin": v.Origin}},
+	}
+	if err := s.store.AppendSemanticProfileVersionWithAudit(ctx, c.ExpectedVersion, v, s.auditor, events); err != nil {
 		if errors.Is(err, store.ErrVersionConflict) {
 			if auditErr := s.audit(ctx, "semantic_profile.correction_rejected", map[string]any{"signature": c.Signature, "expected_version": c.ExpectedVersion, "current_version": history.CurrentVersion, "reason": "version_conflict"}); auditErr != nil {
 				return nil, auditErr
@@ -206,22 +210,22 @@ func (s *Service) Correct(ctx context.Context, c Correction) (*ProfileVersion, e
 	if err != nil {
 		return nil, err
 	}
-	result := &updated.Versions[len(updated.Versions)-1]
-	if err := s.audit(ctx, "semantic_profile.corrected", map[string]any{"signature": c.Signature, "version": result.Version, "input_digest": result.InputDigest, "asserted_by": result.AssertedBy}); err != nil {
-		return nil, err
-	}
-	if err := s.audit(ctx, "semantic_profile.head_advanced", map[string]any{"signature": c.Signature, "from_version": c.ExpectedVersion, "to_version": result.Version, "origin": result.Origin}); err != nil {
-		return nil, err
-	}
-	return result, nil
+	return &updated.Versions[len(updated.Versions)-1], nil
 }
 
 func (s *Service) audit(ctx context.Context, kind string, payload map[string]any) error {
-	if s.auditor == nil {
-		return errors.New("semanticprofile: required audit sink is unavailable")
+	if err := s.requireAudit(); err != nil {
+		return err
 	}
 	if err := s.auditor.Append(ctx, "semanticprofile", kind, payload); err != nil {
 		return fmt.Errorf("semanticprofile: required audit %s: %w", kind, err)
+	}
+	return nil
+}
+
+func (s *Service) requireAudit() error {
+	if s.auditor == nil {
+		return errors.New("semanticprofile: required audit sink is unavailable")
 	}
 	return nil
 }

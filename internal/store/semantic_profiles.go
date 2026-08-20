@@ -20,6 +20,33 @@ import (
 // optimistic write reached the store.
 var ErrVersionConflict = errors.New("store: semantic profile version conflict")
 
+const (
+	maxSemanticProfileIDBytes          = 128
+	maxSemanticProfileSignatureBytes   = 512
+	maxSemanticProfileSourceBytes      = 128
+	maxSemanticProfileMaterialBytes    = 4 * 1024
+	maxSemanticProfileJSONBytes        = 16 * 1024
+	maxSemanticProfileValueBytes       = 512
+	maxSemanticProfileSignalKindBytes  = 128
+	maxSemanticProfileListEntries      = 16
+	maxSemanticProfileModelBytes       = 512
+	maxSemanticProfilePromptBytes      = 512
+	maxSemanticProfileUsageBytes       = 4 * 1024
+	maxSemanticProfileAttributionBytes = 128
+)
+
+// SemanticProfileAuditAppender is the minimal transactional audit boundary
+// required for a profile head change. Store deliberately does not import audit.
+type SemanticProfileAuditAppender interface {
+	AppendTx(context.Context, *sql.Tx, string, string, any) error
+}
+
+// SemanticProfileAuditEvent is redacted semantic-profile audit metadata.
+type SemanticProfileAuditEvent struct {
+	Kind    string
+	Payload map[string]any
+}
+
 // SemanticProfileChange is a durable, advisory-only profile-change handoff for
 // the later Situation scheduler. It grants no authority to this package.
 type SemanticProfileChange struct {
@@ -100,6 +127,19 @@ func (s *Store) SemanticProfileChanges(ctx context.Context, limit int) ([]Semant
 // AppendSemanticProfileVersion appends expected+1 and changes the current head
 // in the same transaction. Version rows are never otherwise rewritten.
 func (s *Store) AppendSemanticProfileVersion(ctx context.Context, expected int, v profilemodel.ProfileVersion) error {
+	return s.appendSemanticProfileVersion(ctx, expected, v, nil, nil)
+}
+
+// AppendSemanticProfileVersionWithAudit atomically appends a profile version,
+// advances its head, emits its handoff, and writes every required audit event.
+func (s *Store) AppendSemanticProfileVersionWithAudit(ctx context.Context, expected int, v profilemodel.ProfileVersion, auditor SemanticProfileAuditAppender, events []SemanticProfileAuditEvent) error {
+	if auditor == nil || len(events) == 0 {
+		return errors.New("store: semantic profile audit is required")
+	}
+	return s.appendSemanticProfileVersion(ctx, expected, v, auditor, events)
+}
+
+func (s *Store) appendSemanticProfileVersion(ctx context.Context, expected int, v profilemodel.ProfileVersion, auditor SemanticProfileAuditAppender, events []SemanticProfileAuditEvent) error {
 	if expected < 0 {
 		return errors.New("store: semantic profile expected version must be nonnegative")
 	}
@@ -118,6 +158,9 @@ func (s *Store) AppendSemanticProfileVersion(ctx context.Context, expected int, 
 	profileJSON, err := json.Marshal(v.Profile)
 	if err != nil {
 		return fmt.Errorf("store: marshal semantic profile: %w", err)
+	}
+	if len(profileJSON) > maxSemanticProfileJSONBytes {
+		return errors.New("store: semantic profile JSON is too large")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -188,6 +231,14 @@ func (s *Store) AppendSemanticProfileVersion(ctx context.Context, expected int, 
 	if _, err := tx.ExecContext(ctx, `INSERT INTO semantic_profile_change_outbox(signature_key, version, reason, created_at) VALUES (?, ?, 'semantic_profile_changed', ?)`, v.SignatureKey, v.Version, canonicalTime(v.CreatedAt)); err != nil {
 		return fmt.Errorf("store: enqueue semantic profile change: %w", err)
 	}
+	for _, event := range events {
+		if strings.TrimSpace(event.Kind) == "" {
+			return errors.New("store: semantic profile audit kind is required")
+		}
+		if err := auditor.AppendTx(ctx, tx, "semanticprofile", event.Kind, event.Payload); err != nil {
+			return fmt.Errorf("store: append semantic profile audit: %w", err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: commit semantic profile append: %w", err)
 	}
@@ -198,14 +249,55 @@ func validateSemanticProfileVersion(v profilemodel.ProfileVersion) error {
 	if strings.TrimSpace(v.SignatureKey) == "" || strings.TrimSpace(v.Source) == "" || strings.TrimSpace(v.InputDigest) == "" {
 		return errors.New("store: semantic profile signature, source, and input digest are required")
 	}
+	if len(v.ID) > maxSemanticProfileIDBytes || len(v.SignatureKey) > maxSemanticProfileSignatureBytes || len(v.Source) > maxSemanticProfileSourceBytes {
+		return errors.New("store: semantic profile id, signature, or source is too large")
+	}
+	if len(v.InputDigest) > maxSemanticProfileSignatureBytes || len(v.Model) > maxSemanticProfileModelBytes || len(v.PromptVersion) > maxSemanticProfilePromptBytes || len(v.AssertedBy) > maxSemanticProfileAttributionBytes {
+		return errors.New("store: semantic profile provenance is too large")
+	}
+	if err := validateStoredProfile(v.Profile); err != nil {
+		return err
+	}
+	if len(v.SignatureMaterial) > maxSemanticProfileMaterialBytes {
+		return errors.New("store: semantic profile signature material is too large")
+	}
 	if len(v.SignatureMaterial) == 0 || !json.Valid(v.SignatureMaterial) {
 		return errors.New("store: semantic profile signature material must be JSON")
 	}
 	if v.Origin != profilemodel.OriginInferred && v.Origin != profilemodel.OriginCorrection {
 		return fmt.Errorf("store: semantic profile origin %q is invalid", v.Origin)
 	}
+	if len(v.TokenUsage) > maxSemanticProfileUsageBytes {
+		return errors.New("store: semantic profile token usage is too large")
+	}
 	if len(v.TokenUsage) != 0 && !json.Valid(v.TokenUsage) {
 		return errors.New("store: semantic profile token usage must be JSON")
+	}
+	return nil
+}
+
+func validateStoredProfile(profile profilemodel.Profile) error {
+	if len(profile.Signature) > maxSemanticProfileSignatureBytes || len(profile.SubjectKind) > maxSemanticProfileValueBytes || len(profile.EventKind) > maxSemanticProfileValueBytes || len(profile.PossibleRole) > maxSemanticProfileValueBytes || len(profile.HorizonTier) > maxSemanticProfileValueBytes {
+		return errors.New("store: semantic profile field is too large")
+	}
+	for _, field := range []struct {
+		name     string
+		values   []string
+		maxBytes int
+	}{
+		{"candidate scope", profile.CandidateScope, maxSemanticProfileSignalKindBytes},
+		{"companion signal kind", profile.CompanionSignalKinds, maxSemanticProfileSignalKindBytes},
+		{"useful capability", profile.UsefulCapabilities, maxSemanticProfileSignalKindBytes},
+		{"uncertainty", profile.Uncertainty, maxSemanticProfileValueBytes},
+	} {
+		if len(field.values) > maxSemanticProfileListEntries {
+			return fmt.Errorf("store: too many semantic profile %ss", field.name)
+		}
+		for _, value := range field.values {
+			if len(value) > field.maxBytes {
+				return fmt.Errorf("store: semantic profile %s value is too large", field.name)
+			}
+		}
 	}
 	return nil
 }

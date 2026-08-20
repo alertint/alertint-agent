@@ -8,7 +8,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"sort"
 	"strings"
 
 	"github.com/alertint/alertint-agent/internal/store"
@@ -65,12 +64,7 @@ func firstValue(values map[string]string, keys ...string) string {
 }
 
 func sortedKeys(values map[string]string) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	keys = keys[:min(len(keys), 32)]
+	keys := boundedSchemaKeys(values)
 	for i := range keys {
 		keys[i] = limitText(keys[i], maxSourceBytes)
 	}
