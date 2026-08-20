@@ -43,6 +43,7 @@ type ProfileVersion struct {
 	Model             string          `json:"model,omitempty"`
 	PromptVersion     string          `json:"prompt_version,omitempty"`
 	TokenUsage        json.RawMessage `json:"token_usage,omitempty"`
+	AssertedBy        string          `json:"asserted_by,omitempty"`
 	CreatedAt         time.Time       `json:"created_at"`
 	SupersededAt      *time.Time      `json:"superseded_at,omitempty"`
 }

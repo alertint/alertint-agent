@@ -19,6 +19,15 @@ var profileFields = []string{
 	"companion_signal_kinds", "horizon_tier", "useful_capabilities", "uncertainty",
 }
 
+const (
+	maxSourceBytes        = 128
+	maxAttributionBytes   = 128
+	maxProfileJSONBytes   = 16 * 1024
+	maxProfileListEntries = 16
+	maxProfileValueBytes  = 512
+	maxSignalKindBytes    = 128
+)
+
 func inferencePrompt(d store.AlertDelivery, signature string) llm.Prompt {
 	type boundedMap map[string]string
 	input := struct {
@@ -28,7 +37,7 @@ func inferencePrompt(d store.AlertDelivery, signature string) llm.Prompt {
 		Labels      boundedMap `json:"labels"`
 		Annotations boundedMap `json:"annotations"`
 	}{
-		Signature: signature, Source: d.Source, AlertName: limitText(d.Alert.Labels["alertname"], 256),
+		Signature: signature, Source: limitText(d.Source, maxSourceBytes), AlertName: limitText(d.Alert.Labels["alertname"], 256),
 		Labels: boundedValues(d.Alert.Labels), Annotations: boundedValues(d.Alert.Annotations),
 	}
 	body, _ := json.Marshal(input)

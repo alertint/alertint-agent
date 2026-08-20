@@ -41,6 +41,11 @@ type Store interface {
 	AppendSemanticProfileVersion(context.Context, int, profilemodel.ProfileVersion) error
 }
 
+// AuditSink records required, redacted profile audit events durably.
+type AuditSink interface {
+	Append(context.Context, string, string, any) error
+}
+
 // LLMClient is intentionally completion-only: semantic inference has no tool
 // surface and cannot mutate an operated system.
 type LLMClient interface {
@@ -54,16 +59,18 @@ type Service struct {
 	llm           LLMClient
 	promptVersion string
 	model         string
-	auditor       *audit.Auditor
+	auditor       AuditSink
 }
 
-func New(st Store, client LLMClient, promptVersion, model string) *Service {
-	return &Service{store: st, llm: client, promptVersion: promptVersion, model: model}
+func New(st Store, client LLMClient, promptVersion, model string, auditors ...AuditSink) *Service {
+	var auditor AuditSink
+	if len(auditors) > 0 {
+		auditor = auditors[0]
+	} else if concreteStore, ok := st.(*store.Store); ok {
+		auditor = audit.New(concreteStore.DB())
+	}
+	return &Service{store: st, llm: client, promptVersion: promptVersion, model: model, auditor: auditor}
 }
-
-// SetAuditor records profile decisions without retaining raw source or model
-// content. It is optional so inference remains available in read-only tests.
-func (s *Service) SetAuditor(auditor *audit.Auditor) { s.auditor = auditor }
 
 // Get returns immutable profile history for one signature.
 func (s *Service) Get(ctx context.Context, signature string) (*History, error) {
@@ -93,12 +100,16 @@ func (s *Service) InferIfMissing(ctx context.Context, d store.AlertDelivery) (*H
 	}
 	completion, err := s.llm.Complete(ctx, systemPrompt, inferencePrompt(d, signature), profileFields)
 	if err != nil {
-		s.audit(ctx, "semantic_profile.inference_rejected", map[string]any{"signature": signature, "reason": "llm_failed"})
+		if err := s.audit(ctx, "semantic_profile.inference_rejected", map[string]any{"signature": signature, "reason": "llm_failed"}); err != nil {
+			return nil, err
+		}
 		return nil, nil
 	}
 	profile, err := decodeProfile(completion.Raw, signature)
 	if err != nil {
-		s.audit(ctx, "semantic_profile.inference_rejected", map[string]any{"signature": signature, "reason": "invalid_profile"})
+		if auditErr := s.audit(ctx, "semantic_profile.inference_rejected", map[string]any{"signature": signature, "reason": "invalid_profile"}); auditErr != nil {
+			return nil, auditErr
+		}
 		return nil, nil
 	}
 	usage, err := json.Marshal(map[string]int{
@@ -113,16 +124,22 @@ func (s *Service) InferIfMissing(ctx context.Context, d store.AlertDelivery) (*H
 		modelName = s.model
 	}
 	v := ProfileVersion{
-		ID: uuid.NewString(), SignatureKey: signature, Source: d.Source, SignatureMaterial: material,
+		ID: uuid.NewString(), SignatureKey: signature, Source: limitText(d.Source, maxSourceBytes), SignatureMaterial: material,
 		Profile: profile, Origin: OriginInferred, InputDigest: inputDigest(d.PayloadDigest, material),
 		Model: modelName, PromptVersion: s.promptVersion, TokenUsage: usage, CreatedAt: time.Now().UTC(),
 	}
 	if err := s.store.AppendSemanticProfileVersion(ctx, 0, v); err != nil {
-		s.audit(ctx, "semantic_profile.inference_rejected", map[string]any{"signature": signature, "reason": "head_advance_failed"})
+		if auditErr := s.audit(ctx, "semantic_profile.inference_rejected", map[string]any{"signature": signature, "reason": "head_advance_failed"}); auditErr != nil {
+			return nil, auditErr
+		}
 		return nil, nil
 	}
-	s.audit(ctx, "semantic_profile.inferred", map[string]any{"signature": signature, "version": 1, "input_digest": v.InputDigest, "model": modelName, "prompt_version": s.promptVersion})
-	s.audit(ctx, "semantic_profile.head_advanced", map[string]any{"signature": signature, "from_version": 0, "to_version": 1, "origin": v.Origin})
+	if err := s.audit(ctx, "semantic_profile.inferred", map[string]any{"signature": signature, "version": 1, "input_digest": v.InputDigest, "model": modelName, "prompt_version": s.promptVersion}); err != nil {
+		return nil, err
+	}
+	if err := s.audit(ctx, "semantic_profile.head_advanced", map[string]any{"signature": signature, "from_version": 0, "to_version": 1, "origin": v.Origin}); err != nil {
+		return nil, err
+	}
 	return s.Get(ctx, signature)
 }
 
@@ -144,12 +161,17 @@ func (s *Service) Correct(ctx context.Context, c Correction) (*ProfileVersion, e
 	if strings.TrimSpace(c.Signature) == "" {
 		return nil, errors.New("semanticprofile: signature is required")
 	}
+	if len(c.Signature) > maxProfileValueBytes {
+		return nil, errors.New("semanticprofile: signature is too large")
+	}
 	history, err := s.Get(ctx, c.Signature)
 	if err != nil {
 		return nil, err
 	}
 	if c.ExpectedVersion != history.CurrentVersion {
-		s.audit(ctx, "semantic_profile.correction_rejected", map[string]any{"signature": c.Signature, "expected_version": c.ExpectedVersion, "current_version": history.CurrentVersion, "reason": "version_conflict"})
+		if err := s.audit(ctx, "semantic_profile.correction_rejected", map[string]any{"signature": c.Signature, "expected_version": c.ExpectedVersion, "current_version": history.CurrentVersion, "reason": "version_conflict"}); err != nil {
+			return nil, err
+		}
 		return nil, ErrVersionConflict
 	}
 	if !c.Confirmed {
@@ -157,6 +179,9 @@ func (s *Service) Correct(ctx context.Context, c Correction) (*ProfileVersion, e
 	}
 	if strings.TrimSpace(c.ConfirmedBy) == "" {
 		return nil, errors.New("semanticprofile: asserted attribution is required")
+	}
+	if len(c.ConfirmedBy) > maxAttributionBytes {
+		return nil, errors.New("semanticprofile: asserted attribution is too large")
 	}
 	profile, err := decodeProfile(c.Raw, c.Signature)
 	if err != nil {
@@ -166,11 +191,13 @@ func (s *Service) Correct(ctx context.Context, c Correction) (*ProfileVersion, e
 	v := ProfileVersion{
 		ID: uuid.NewString(), SignatureKey: c.Signature, Source: current.Source,
 		SignatureMaterial: current.SignatureMaterial, Profile: profile, Origin: OriginCorrection,
-		InputDigest: inputDigest(string(c.Raw), nil), CreatedAt: time.Now().UTC(),
+		InputDigest: inputDigest(string(c.Raw), nil), AssertedBy: strings.TrimSpace(c.ConfirmedBy), CreatedAt: time.Now().UTC(),
 	}
 	if err := s.store.AppendSemanticProfileVersion(ctx, c.ExpectedVersion, v); err != nil {
 		if errors.Is(err, store.ErrVersionConflict) {
-			s.audit(ctx, "semantic_profile.correction_rejected", map[string]any{"signature": c.Signature, "expected_version": c.ExpectedVersion, "current_version": history.CurrentVersion, "reason": "version_conflict"})
+			if auditErr := s.audit(ctx, "semantic_profile.correction_rejected", map[string]any{"signature": c.Signature, "expected_version": c.ExpectedVersion, "current_version": history.CurrentVersion, "reason": "version_conflict"}); auditErr != nil {
+				return nil, auditErr
+			}
 			return nil, ErrVersionConflict
 		}
 		return nil, err
@@ -180,18 +207,29 @@ func (s *Service) Correct(ctx context.Context, c Correction) (*ProfileVersion, e
 		return nil, err
 	}
 	result := &updated.Versions[len(updated.Versions)-1]
-	s.audit(ctx, "semantic_profile.corrected", map[string]any{"signature": c.Signature, "version": result.Version, "input_digest": result.InputDigest})
-	s.audit(ctx, "semantic_profile.head_advanced", map[string]any{"signature": c.Signature, "from_version": c.ExpectedVersion, "to_version": result.Version, "origin": result.Origin})
+	if err := s.audit(ctx, "semantic_profile.corrected", map[string]any{"signature": c.Signature, "version": result.Version, "input_digest": result.InputDigest, "asserted_by": result.AssertedBy}); err != nil {
+		return nil, err
+	}
+	if err := s.audit(ctx, "semantic_profile.head_advanced", map[string]any{"signature": c.Signature, "from_version": c.ExpectedVersion, "to_version": result.Version, "origin": result.Origin}); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 
-func (s *Service) audit(ctx context.Context, kind string, payload map[string]any) {
-	if s.auditor != nil {
-		_ = s.auditor.Append(ctx, "semanticprofile", kind, payload)
+func (s *Service) audit(ctx context.Context, kind string, payload map[string]any) error {
+	if s.auditor == nil {
+		return errors.New("semanticprofile: required audit sink is unavailable")
 	}
+	if err := s.auditor.Append(ctx, "semanticprofile", kind, payload); err != nil {
+		return fmt.Errorf("semanticprofile: required audit %s: %w", kind, err)
+	}
+	return nil
 }
 
 func decodeProfile(raw json.RawMessage, signature string) (Profile, error) {
+	if len(raw) > maxProfileJSONBytes {
+		return Profile{}, errors.New("semanticprofile: profile JSON is too large")
+	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		return Profile{}, fmt.Errorf("semanticprofile: profile must be a JSON object: %w", err)
@@ -237,6 +275,18 @@ func validateProfile(profile Profile) error {
 	if !allowed(profile.HorizonTier, "unknown", "minutes", "hours", "days") {
 		return fmt.Errorf("semanticprofile: horizon tier %q is invalid", profile.HorizonTier)
 	}
+	if err := validateProfileList("candidate scopes", profile.CandidateScope, maxSignalKindBytes); err != nil {
+		return err
+	}
+	if err := validateProfileList("companion signal kinds", profile.CompanionSignalKinds, maxSignalKindBytes); err != nil {
+		return err
+	}
+	if err := validateProfileList("useful capabilities", profile.UsefulCapabilities, maxSignalKindBytes); err != nil {
+		return err
+	}
+	if err := validateProfileList("uncertainty", profile.Uncertainty, maxProfileValueBytes); err != nil {
+		return err
+	}
 	for _, scope := range profile.CandidateScope {
 		if !allowed(scope, "host", "service", "workload", "cluster", "namespace", "node", "database", "instance") {
 			return fmt.Errorf("semanticprofile: candidate scope %q is invalid", scope)
@@ -249,6 +299,21 @@ func validateProfile(profile Profile) error {
 	}
 	if len(profile.CandidateScope) == 0 || len(profile.UsefulCapabilities) == 0 || len(profile.Uncertainty) == 0 {
 		return errors.New("semanticprofile: candidate scope, useful capabilities, and uncertainty are required")
+	}
+	return nil
+}
+
+func validateProfileList(name string, values []string, maxValueBytes int) error {
+	if len(values) > maxProfileListEntries {
+		return fmt.Errorf("semanticprofile: too many %s", name)
+	}
+	for _, value := range values {
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("semanticprofile: %s must not contain empty values", name)
+		}
+		if len(value) > maxValueBytes {
+			return fmt.Errorf("semanticprofile: %s value is too large", name)
+		}
 	}
 	return nil
 }

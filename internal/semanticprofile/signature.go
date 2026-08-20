@@ -22,18 +22,18 @@ func Signature(d store.AlertDelivery) string {
 }
 
 func signatureMaterial(d store.AlertDelivery) (string, json.RawMessage) {
-	source := strings.ToLower(strings.TrimSpace(d.Source))
+	source := strings.ToLower(limitText(d.Source, maxSourceBytes))
 	if source == "" {
 		source = "unknown"
 	}
-	triggerID := strings.TrimSpace(firstValue(d.Alert.Labels, "zabbix_trigger_id", "trigger_id"))
+	triggerID := limitText(firstValue(d.Alert.Labels, "zabbix_trigger_id", "trigger_id"), maxSourceBytes)
 	template := templateIdentity(d)
 	if source == "zabbix" && triggerID != "" {
 		material := map[string]any{"source": source, "trigger_id": triggerID, "template_identity": template}
 		return source + ":trigger=" + triggerID + ":template=" + template, mustJSON(material)
 	}
 	material := map[string]any{
-		"source": source, "alert_name": d.Alert.Labels["alertname"],
+		"source": source, "alert_name": limitText(d.Alert.Labels["alertname"], 256),
 		"label_schema": sortedKeys(d.Alert.Labels), "annotation_schema": sortedKeys(d.Alert.Annotations),
 		"template_identity": template,
 	}
@@ -47,12 +47,12 @@ func templateIdentity(d store.AlertDelivery) string {
 		v = firstValue(d.Alert.Labels, "template_identity", "template_version", "trigger_version", "zabbix_template")
 	}
 	if strings.HasPrefix(strings.ToLower(v), "sha256:") {
-		return "sha256:" + strings.ToLower(strings.TrimPrefix(v, "sha256:"))
+		return "sha256:" + limitText(strings.TrimPrefix(strings.ToLower(v), "sha256:"), maxSourceBytes)
 	}
 	if v == "" {
 		v = d.Alert.Labels["alertname"]
 	}
-	return "sha256:" + digest(v)
+	return "sha256:" + digest(limitText(v, maxProfileValueBytes))
 }
 
 func firstValue(values map[string]string, keys ...string) string {
@@ -70,6 +70,10 @@ func sortedKeys(values map[string]string) []string {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
+	keys = keys[:min(len(keys), 32)]
+	for i := range keys {
+		keys[i] = limitText(keys[i], maxSourceBytes)
+	}
 	return keys
 }
 

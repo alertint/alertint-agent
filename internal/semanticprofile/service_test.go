@@ -10,14 +10,22 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/llm"
+	profilemodel "github.com/alertint/alertint-agent/internal/semanticprofile/model"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
 func TestSignatureDoesNotFragmentByHostValue(t *testing.T) {
 	a := sampleDelivery(map[string]string{"alertname": "HighCPU", "host": "db-01"})
 	b := sampleDelivery(map[string]string{"alertname": "HighCPU", "host": "db-02"})
+	if got, want := Signature(a), Signature(b); got != want {
+		t.Fatalf("%q != %q", got, want)
+	}
+}
+
+func TestSignatureNormalizesUppercaseSHA256Prefix(t *testing.T) {
+	a := sampleDelivery(map[string]string{"alertname": "HighCPU", "zabbix_trigger_id": "18422", "template_identity": "SHA256:923B"})
+	b := sampleDelivery(map[string]string{"alertname": "HighCPU", "zabbix_trigger_id": "18422", "template_identity": "sha256:923b"})
 	if got, want := Signature(a), Signature(b); got != want {
 		t.Fatalf("%q != %q", got, want)
 	}
@@ -51,7 +59,6 @@ func TestInferIfMissingCachesValidatedProfile(t *testing.T) {
 
 func TestCorrectAuditsRejectedStaleWriteWithoutRawProfile(t *testing.T) {
 	svc, st := newService(t)
-	svc.SetAuditor(audit.New(st.DB()))
 	current := seedProfile(t, st, "zabbix:trigger=18422:template=sha256:923b", 1)
 	_, err := svc.Correct(context.Background(), Correction{Signature: current.SignatureKey, ExpectedVersion: 0, Confirmed: true, ConfirmedBy: "janis"})
 	if !errors.Is(err, ErrVersionConflict) {
@@ -66,6 +73,67 @@ func TestCorrectAuditsRejectedStaleWriteWithoutRawProfile(t *testing.T) {
 	}
 }
 
+func TestInferencePromptBoundsSourceText(t *testing.T) {
+	delivery := sampleDelivery(map[string]string{"alertname": "HighCPU"})
+	delivery.Source = strings.Repeat("source", 100)
+	prompt := inferencePrompt(delivery, "zabbix:schema=sha256:test")
+	if strings.Contains(prompt.Prefix, delivery.Source) || len(prompt.Prefix) > 5_000 {
+		t.Fatalf("prompt retained unbounded source: %d bytes", len(prompt.Prefix))
+	}
+}
+
+func TestDecodeProfileRejectsOversizedRawAndCollections(t *testing.T) {
+	tooLarge := json.RawMessage(`{"` + strings.Repeat("x", maxProfileJSONBytes) + `":"x"}`)
+	if _, err := decodeProfile(tooLarge, "zabbix:test"); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("oversized raw err=%v", err)
+	}
+	profile := `{"signature":"","subject_kind":"database_host","event_kind":"resource_saturation","possible_role":"symptom","candidate_scope":["host"],"companion_signal_kinds":[` + strings.Repeat(`"availability",`, maxProfileListEntries) + `"availability"],"horizon_tier":"hours","useful_capabilities":["zabbix_metric_range"],"uncertainty":["workload unknown"]}`
+	if _, err := decodeProfile(json.RawMessage(profile), "zabbix:test"); err == nil || !strings.Contains(err.Error(), "too many companion signal kinds") {
+		t.Fatalf("unbounded collection err=%v", err)
+	}
+}
+
+func TestCorrectRetainsAttributionAndDurablyHandsOffProfileChange(t *testing.T) {
+	svc, st := newService(t)
+	current := seedProfile(t, st, "zabbix:trigger=18422:template=sha256:923b", 1)
+	updated, err := svc.Correct(context.Background(), Correction{Signature: current.SignatureKey, ExpectedVersion: 1, Confirmed: true, ConfirmedBy: "janis", Raw: validProfileJSON()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.AssertedBy != "janis" {
+		t.Fatalf("asserted attribution = %q", updated.AssertedBy)
+	}
+	changes, err := st.SemanticProfileChanges(context.Background(), 10)
+	if err != nil || len(changes) != 2 || changes[1].Reason != "semantic_profile_changed" || changes[1].Version != 2 {
+		t.Fatalf("changes=%+v err=%v", changes, err)
+	}
+	var payload string
+	if err := st.DB().QueryRowContext(context.Background(), `SELECT payload_json FROM audit_log WHERE kind = 'semantic_profile.corrected' ORDER BY seq DESC LIMIT 1`).Scan(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(payload, `"asserted_by":"janis"`) || strings.Contains(payload, string(validProfileJSON())) {
+		t.Fatalf("correction audit=%s", payload)
+	}
+}
+
+func TestCorrectionSurfacesRequiredRejectedAuditFailure(t *testing.T) {
+	base := &failingAuditStore{history: &profilemodel.History{SignatureKey: "zabbix:test", CurrentVersion: 1, Versions: []profilemodel.ProfileVersion{{SignatureKey: "zabbix:test", Version: 1}}}}
+	svc := New(base, staticLLM{}, "semantic-profile-v1", "configured-model", failingAuditSink{})
+	_, err := svc.Correct(context.Background(), Correction{Signature: "zabbix:test", ExpectedVersion: 0, Confirmed: true, ConfirmedBy: "janis"})
+	if !errors.Is(err, errAuditUnavailable) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestCorrectRejectsOversizedAttribution(t *testing.T) {
+	svc, st := newService(t)
+	current := seedProfile(t, st, "zabbix:trigger=18422:template=sha256:923b", 1)
+	_, err := svc.Correct(context.Background(), Correction{Signature: current.SignatureKey, ExpectedVersion: 1, Confirmed: true, ConfirmedBy: strings.Repeat("j", maxAttributionBytes+1), Raw: validProfileJSON()})
+	if err == nil || !strings.Contains(err.Error(), "asserted attribution is too large") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 type staticLLM struct{}
 
 func (staticLLM) Complete(context.Context, string, llm.Prompt, []string) (llm.Completion, error) {
@@ -74,6 +142,23 @@ func (staticLLM) Complete(context.Context, string, llm.Prompt, []string) (llm.Co
 		"candidate_scope":["host"],"companion_signal_kinds":["availability"],"horizon_tier":"hours",
 		"useful_capabilities":["zabbix_metric_range"],"uncertainty":["workload unknown"]
 	}`)}, nil
+}
+
+var errAuditUnavailable = errors.New("audit unavailable")
+
+type failingAuditStore struct{ history *profilemodel.History }
+
+func (s *failingAuditStore) SemanticProfile(context.Context, string) (*profilemodel.History, error) {
+	return s.history, nil
+}
+func (*failingAuditStore) AppendSemanticProfileVersion(context.Context, int, profilemodel.ProfileVersion) error {
+	return nil
+}
+
+type failingAuditSink struct{}
+
+func (failingAuditSink) Append(context.Context, string, string, any) error {
+	return errAuditUnavailable
 }
 
 func newService(t *testing.T) (*Service, *store.Store) {
@@ -104,4 +189,8 @@ func seedProfile(t *testing.T, st *store.Store, signature string, version int) P
 func sampleDelivery(labels map[string]string) store.AlertDelivery {
 	now := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
 	return store.AlertDelivery{Source: "zabbix", PayloadDigest: "sha256:delivery", Alert: store.Alert{Fingerprint: "fp", Status: "firing", Labels: labels, Annotations: map[string]string{}, StartsAt: now, ReceivedAt: now}}
+}
+
+func validProfileJSON() json.RawMessage {
+	return json.RawMessage(`{"signature":"","subject_kind":"database_host","event_kind":"resource_saturation","possible_role":"symptom","candidate_scope":["host"],"companion_signal_kinds":["availability"],"horizon_tier":"hours","useful_capabilities":["zabbix_metric_range"],"uncertainty":["workload unknown"]}`)
 }

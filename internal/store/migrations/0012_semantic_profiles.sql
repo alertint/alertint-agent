@@ -21,6 +21,7 @@ CREATE TABLE semantic_profile_versions (
     model                   TEXT,
     prompt_version          TEXT,
     token_usage_json        TEXT    CHECK (token_usage_json IS NULL OR json_valid(token_usage_json)),
+    asserted_by             TEXT,
     created_at              TEXT    NOT NULL,
     superseded_at           TEXT,
     UNIQUE (signature_key, version)
@@ -28,6 +29,16 @@ CREATE TABLE semantic_profile_versions (
 
 CREATE INDEX semantic_profile_versions_signature_version_idx
     ON semantic_profile_versions(signature_key, version);
+
+-- This is a neutral durable handoff only. A later Situation task consumes it;
+-- L0 does not own membership, lifecycle, Attention, or scheduling execution.
+CREATE TABLE semantic_profile_change_outbox (
+    signature_key TEXT    NOT NULL REFERENCES semantic_profile_heads(signature_key) ON DELETE CASCADE,
+    version       INTEGER NOT NULL CHECK (version >= 1),
+    reason        TEXT    NOT NULL CHECK (reason = 'semantic_profile_changed'),
+    created_at    TEXT    NOT NULL,
+    PRIMARY KEY (signature_key, version)
+) STRICT;
 
 CREATE TRIGGER semantic_profile_versions_no_delete
 BEFORE DELETE ON semantic_profile_versions
@@ -50,6 +61,7 @@ WHEN NEW.id IS NOT OLD.id
   OR NEW.model IS NOT OLD.model
   OR NEW.prompt_version IS NOT OLD.prompt_version
   OR NEW.token_usage_json IS NOT OLD.token_usage_json
+  OR NEW.asserted_by IS NOT OLD.asserted_by
   OR NEW.created_at IS NOT OLD.created_at
   OR OLD.superseded_at IS NOT NULL
   OR NEW.superseded_at IS NULL

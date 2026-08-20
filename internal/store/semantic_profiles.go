@@ -20,6 +20,15 @@ import (
 // optimistic write reached the store.
 var ErrVersionConflict = errors.New("store: semantic profile version conflict")
 
+// SemanticProfileChange is a durable, advisory-only profile-change handoff for
+// the later Situation scheduler. It grants no authority to this package.
+type SemanticProfileChange struct {
+	SignatureKey string
+	Version      int
+	Reason       string
+	CreatedAt    time.Time
+}
+
 // SemanticProfile returns the current head together with every immutable
 // version, oldest first.
 func (s *Store) SemanticProfile(ctx context.Context, signature string) (*profilemodel.History, error) {
@@ -36,7 +45,7 @@ func (s *Store) SemanticProfile(ctx context.Context, signature string) (*profile
 	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, signature_key, version, source, signature_material_json, profile_json,
-		       origin, input_digest, model, prompt_version, token_usage_json, created_at, superseded_at
+		       origin, input_digest, model, prompt_version, token_usage_json, asserted_by, created_at, superseded_at
 		FROM semantic_profile_versions WHERE signature_key = ? ORDER BY version ASC`, signature)
 	if err != nil {
 		return nil, fmt.Errorf("store: read semantic profile versions: %w", err)
@@ -56,6 +65,36 @@ func (s *Store) SemanticProfile(ctx context.Context, signature string) (*profile
 		return nil, errors.New("store: semantic profile head/version history mismatch")
 	}
 	return history, nil
+}
+
+// SemanticProfileChanges exposes the durable profile-change outbox in creation
+// order. Consumption/acknowledgement belongs to the later Situation scheduler.
+func (s *Store) SemanticProfileChanges(ctx context.Context, limit int) ([]SemanticProfileChange, error) {
+	if limit <= 0 {
+		return nil, errors.New("store: semantic profile change limit must be positive")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT signature_key, version, reason, created_at FROM semantic_profile_change_outbox ORDER BY created_at ASC, signature_key ASC, version ASC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: read semantic profile changes: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := make([]SemanticProfileChange, 0, limit)
+	for rows.Next() {
+		var change SemanticProfileChange
+		var created string
+		if err := rows.Scan(&change.SignatureKey, &change.Version, &change.Reason, &created); err != nil {
+			return nil, fmt.Errorf("store: scan semantic profile change: %w", err)
+		}
+		var err error
+		if change.CreatedAt, err = time.Parse(time.RFC3339Nano, created); err != nil {
+			return nil, fmt.Errorf("store: parse semantic profile change created at: %w", err)
+		}
+		out = append(out, change)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate semantic profile changes: %w", err)
+	}
+	return out, nil
 }
 
 // AppendSemanticProfileVersion appends expected+1 and changes the current head
@@ -114,7 +153,7 @@ func (s *Store) AppendSemanticProfileVersion(ctx context.Context, expected int, 
 		}
 	}
 
-	var modelName, promptVersion, tokenUsage any
+	var modelName, promptVersion, tokenUsage, assertedBy any
 	if v.Model != "" {
 		modelName = v.Model
 	}
@@ -124,12 +163,15 @@ func (s *Store) AppendSemanticProfileVersion(ctx context.Context, expected int, 
 	if len(v.TokenUsage) != 0 {
 		tokenUsage = string(v.TokenUsage)
 	}
+	if v.AssertedBy != "" {
+		assertedBy = v.AssertedBy
+	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO semantic_profile_versions
-			(id, signature_key, version, source, signature_material_json, profile_json, origin, input_digest, model, prompt_version, token_usage_json, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			(id, signature_key, version, source, signature_material_json, profile_json, origin, input_digest, model, prompt_version, token_usage_json, asserted_by, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		v.ID, v.SignatureKey, v.Version, v.Source, string(v.SignatureMaterial), string(profileJSON), v.Origin, v.InputDigest,
-		modelName, promptVersion, tokenUsage, canonicalTime(v.CreatedAt)); err != nil {
+		modelName, promptVersion, tokenUsage, assertedBy, canonicalTime(v.CreatedAt)); err != nil {
 		return fmt.Errorf("store: insert semantic profile version: %w", err)
 	}
 	res, err := tx.ExecContext(ctx, `UPDATE semantic_profile_heads SET current_version = ?, updated_at = ? WHERE signature_key = ? AND current_version = ?`, v.Version, canonicalTime(v.CreatedAt), v.SignatureKey, expected)
@@ -142,6 +184,9 @@ func (s *Store) AppendSemanticProfileVersion(ctx context.Context, expected int, 
 	}
 	if n != 1 {
 		return ErrVersionConflict
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO semantic_profile_change_outbox(signature_key, version, reason, created_at) VALUES (?, ?, 'semantic_profile_changed', ?)`, v.SignatureKey, v.Version, canonicalTime(v.CreatedAt)); err != nil {
+		return fmt.Errorf("store: enqueue semantic profile change: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: commit semantic profile append: %w", err)
@@ -168,16 +213,16 @@ func validateSemanticProfileVersion(v profilemodel.ProfileVersion) error {
 func scanSemanticProfileVersion(s scanner) (profilemodel.ProfileVersion, error) {
 	var v profilemodel.ProfileVersion
 	var material, profile, created string
-	var modelName, promptVersion, tokenUsage, superseded sql.NullString
+	var modelName, promptVersion, tokenUsage, assertedBy, superseded sql.NullString
 	if err := s.Scan(&v.ID, &v.SignatureKey, &v.Version, &v.Source, &material, &profile, &v.Origin, &v.InputDigest,
-		&modelName, &promptVersion, &tokenUsage, &created, &superseded); err != nil {
+		&modelName, &promptVersion, &tokenUsage, &assertedBy, &created, &superseded); err != nil {
 		return profilemodel.ProfileVersion{}, fmt.Errorf("store: scan semantic profile version: %w", err)
 	}
 	v.SignatureMaterial = json.RawMessage(material)
 	if err := json.Unmarshal([]byte(profile), &v.Profile); err != nil {
 		return profilemodel.ProfileVersion{}, fmt.Errorf("store: decode semantic profile: %w", err)
 	}
-	v.Model, v.PromptVersion = modelName.String, promptVersion.String
+	v.Model, v.PromptVersion, v.AssertedBy = modelName.String, promptVersion.String, assertedBy.String
 	if tokenUsage.Valid {
 		v.TokenUsage = json.RawMessage(tokenUsage.String)
 	}

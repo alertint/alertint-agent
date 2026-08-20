@@ -37,6 +37,10 @@ func TestAppendSemanticProfileVersionAdvancesHeadAndRetainsHistory(t *testing.T)
 	if history.Versions[1].Version != 2 || history.Versions[1].SupersededAt != nil {
 		t.Fatalf("second version is not current: %+v", history.Versions[1])
 	}
+	changes, err := s.SemanticProfileChanges(ctx, 10)
+	if err != nil || len(changes) != 2 || changes[0].Reason != "semantic_profile_changed" || changes[1].Version != 2 {
+		t.Fatalf("change handoff = %+v, %v", changes, err)
+	}
 }
 
 func TestAppendSemanticProfileVersionRejectsStaleHead(t *testing.T) {
