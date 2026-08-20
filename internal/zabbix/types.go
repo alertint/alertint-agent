@@ -61,6 +61,25 @@ type KV struct {
 	Value string `json:"value"`
 }
 
+// ProblemHistoryRow is one normalized trigger-problem lifecycle returned by
+// event.get. Source macro text remains text; only Unix clock/r_clock fields are
+// admitted as canonical UTC instants.
+type ProblemHistoryRow struct {
+	EventID         string     `json:"event_id"`
+	TriggerID       string     `json:"trigger_id"`
+	Name            string     `json:"name"`
+	StartedAt       time.Time  `json:"started_at"`
+	ResolvedAt      *time.Time `json:"resolved_at,omitempty"`
+	DurationSeconds int64      `json:"duration_seconds"`
+	Ongoing         bool       `json:"ongoing"`
+	Severity        string     `json:"severity"`
+	Acknowledged    bool       `json:"acknowledged"`
+	Suppressed      bool       `json:"suppressed"`
+	Tags            []KV       `json:"tags,omitempty"`
+	CauseEventID    string     `json:"cause_event_id,omitempty"`
+	Truncated       bool       `json:"truncated,omitempty"`
+}
+
 // zItem is the item.get shape we read.
 type zItem struct {
 	ItemID    string `json:"itemid"`

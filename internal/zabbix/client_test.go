@@ -297,3 +297,104 @@ func TestHostContext_NoHostWrapsErrNotFound(t *testing.T) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
 }
+
+func TestProblemHistoryNormalizesClockAndRClock(t *testing.T) {
+	var methods []string
+	var eventParams map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string         `json:"method"`
+			Params map[string]any `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		methods = append(methods, req.Method)
+		switch req.Method {
+		case "host.get":
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[{"hostid":"17"}],"id":1}`))
+		case "event.get":
+			eventParams = req.Params
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[{
+				"eventid":"501","objectid":"71","name":"CPU {$WINDOW}","clock":"1787184000","r_clock":"1787187600",
+				"severity":"4","acknowledged":"1","suppressed":"0","tags":[{"tag":"service","value":"db"}],"cause_eventid":"99"
+			}],"id":1}`))
+		default:
+			t.Fatalf("unexpected method %q", req.Method)
+		}
+	}))
+	defer srv.Close()
+
+	client := zabbix.NewClient(zabbix.Config{BaseURL: srv.URL, APIToken: "t"})
+	start := time.Date(2026, 8, 19, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 8, 21, 0, 0, 0, 0, time.UTC)
+	rows, err := client.ProblemHistory(context.Background(), "db-1", start, end, "3", 20)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("rows=%+v err=%v", rows, err)
+	}
+	row := rows[0]
+	if row.StartedAt.Unix() != 1787184000 || row.ResolvedAt == nil || row.ResolvedAt.Unix() != 1787187600 || row.Ongoing || row.DurationSeconds != 3600 {
+		t.Fatalf("row=%+v", row)
+	}
+	if row.EventID != "501" || row.TriggerID != "71" || row.Name != "CPU {$WINDOW}" || !row.Acknowledged || row.Suppressed || row.CauseEventID != "99" {
+		t.Fatalf("identity row=%+v", row)
+	}
+	if !reflect.DeepEqual(methods, []string{"host.get", "event.get"}) {
+		t.Fatalf("methods=%v", methods)
+	}
+	if got := eventParams["hostids"]; !reflect.DeepEqual(got, []any{"17"}) {
+		t.Fatalf("hostids=%v", got)
+	}
+	if eventParams["value"] != float64(1) || eventParams["source"] != float64(0) || eventParams["object"] != float64(0) {
+		t.Fatalf("read-only problem-event params=%v", eventParams)
+	}
+}
+
+func TestProblemHistoryPreservesTruncationAndOngoingDuration(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string         `json:"method"`
+			Params map[string]any `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Method == "host.get" {
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[{"hostid":"17"}],"id":1}`))
+			return
+		}
+		if req.Params["limit"] != float64(2) {
+			t.Fatalf("limit=%v, want limit+1", req.Params["limit"])
+		}
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[
+			{"eventid":"2","objectid":"7","name":"ongoing","clock":"1787184000","r_clock":"0","severity":"3","acknowledged":"0","suppressed":"0","tags":[]},
+			{"eventid":"1","objectid":"7","name":"older","clock":"1787180000","r_clock":"1787181000","severity":"3","acknowledged":"0","suppressed":"0","tags":[]}
+		],"id":1}`))
+	}))
+	defer srv.Close()
+	client := zabbix.NewClient(zabbix.Config{BaseURL: srv.URL, APIToken: "t"})
+	start := time.Unix(1787180000, 0).UTC()
+	end := time.Unix(1787187600, 0).UTC()
+	rows, err := client.ProblemHistory(context.Background(), "db-1", start, end, "3", 1)
+	if err != nil || len(rows) != 1 || !rows[0].Ongoing || !rows[0].Truncated || rows[0].DurationSeconds != 3600 {
+		t.Fatalf("rows=%+v err=%v", rows, err)
+	}
+}
+
+func TestProblemHistoryRejectsMalformedSourceClock(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Method == "host.get" {
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[{"hostid":"17"}],"id":1}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[{"eventid":"1","objectid":"7","name":"bad","clock":"not-a-clock","r_clock":"0","severity":"3"}],"id":1}`))
+	}))
+	defer srv.Close()
+	client := zabbix.NewClient(zabbix.Config{BaseURL: srv.URL, APIToken: "t"})
+	_, err := client.ProblemHistory(context.Background(), "db-1", time.Now().UTC().Add(-time.Hour), time.Now().UTC(), "3", 1)
+	if err == nil || !strings.Contains(err.Error(), "clock") {
+		t.Fatalf("err=%v", err)
+	}
+}

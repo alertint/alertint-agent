@@ -278,6 +278,103 @@ func (c *Client) OpenProblems(ctx context.Context, host string, sel ProblemSelec
 	return c.openProblemsCall(ctx, "hostids", hostids, sel)
 }
 
+// ProblemHistory returns a bounded host problem timeline over [start,end]. It
+// resolves the technical host first and then issues only event.get for trigger
+// problem events. limit+1 detects truncation without losing that information.
+func (c *Client) ProblemHistory(ctx context.Context, host string, start, end time.Time, severityMin string, limit int) ([]ProblemHistoryRow, error) {
+	if strings.TrimSpace(host) == "" {
+		return nil, fmt.Errorf("zabbix: problem history host is required")
+	}
+	if start.IsZero() || end.IsZero() || start.Location() != time.UTC || end.Location() != time.UTC || !end.After(start) {
+		return nil, fmt.Errorf("zabbix: problem history requires a positive canonical utc window")
+	}
+	if limit <= 0 || limit > 10000 {
+		return nil, fmt.Errorf("zabbix: problem history limit must be between 1 and 10000")
+	}
+	if severityMin != "" {
+		severity, err := strconv.Atoi(severityMin)
+		if err != nil || severity < 0 || severity > 5 || strconv.Itoa(severity) != severityMin {
+			return nil, fmt.Errorf("zabbix: problem history severity_min must be 0 through 5")
+		}
+	}
+	hostIDs, err := c.hostIDs(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	params := map[string]any{
+		"output":     []string{"eventid", "objectid", "name", "clock", "r_clock", "severity", "acknowledged", "suppressed", "cause_eventid"},
+		"selectTags": "extend",
+		"hostids":    hostIDs,
+		"source":     0,
+		"object":     0,
+		"value":      1,
+		"time_from":  start.Unix(),
+		"time_till":  end.Unix(),
+		"sortfield":  []string{"clock", "eventid"},
+		"sortorder":  "DESC",
+		"limit":      limit + 1,
+	}
+	if severityMin != "" {
+		params["severities"] = severitiesFrom(severityMin)
+	}
+	var rows []struct {
+		EventID      string `json:"eventid"`
+		TriggerID    string `json:"objectid"`
+		Name         string `json:"name"`
+		Clock        string `json:"clock"`
+		RClock       string `json:"r_clock"`
+		Severity     string `json:"severity"`
+		Acknowledged string `json:"acknowledged"`
+		Suppressed   string `json:"suppressed"`
+		Tags         []KV   `json:"tags"`
+		CauseEventID string `json:"cause_eventid"`
+	}
+	if err := c.call(ctx, "event.get", params, true, &rows); err != nil {
+		return nil, err
+	}
+	truncated := len(rows) > limit
+	if truncated {
+		rows = rows[:limit]
+	}
+	out := make([]ProblemHistoryRow, 0, len(rows))
+	for _, row := range rows {
+		startedAt, err := parseUnixField("clock", row.Clock)
+		if err != nil {
+			return nil, err
+		}
+		item := ProblemHistoryRow{
+			EventID: row.EventID, TriggerID: row.TriggerID, Name: row.Name, StartedAt: startedAt,
+			Severity: row.Severity, Acknowledged: row.Acknowledged == "1", Suppressed: row.Suppressed == "1",
+			Tags: row.Tags,
+		}
+		if row.CauseEventID != "" && row.CauseEventID != "0" {
+			item.CauseEventID = row.CauseEventID
+		}
+		if row.RClock == "" || row.RClock == "0" {
+			item.Ongoing = true
+			item.DurationSeconds = end.Unix() - startedAt.Unix()
+			if item.DurationSeconds < 0 {
+				item.DurationSeconds = 0
+			}
+		} else {
+			resolvedAt, err := parseUnixField("r_clock", row.RClock)
+			if err != nil {
+				return nil, err
+			}
+			if resolvedAt.Before(startedAt) {
+				return nil, fmt.Errorf("zabbix: problem history r_clock precedes clock for event %q", row.EventID)
+			}
+			item.ResolvedAt = &resolvedAt
+			item.DurationSeconds = resolvedAt.Unix() - startedAt.Unix()
+		}
+		out = append(out, item)
+	}
+	if truncated && len(out) > 0 {
+		out[len(out)-1].Truncated = true
+	}
+	return out, nil
+}
+
 // HostGroups resolves group names to ids and host counts (hostgroup.get with
 // selectHosts "count") — one call serving both the floor's scope ranking and
 // its peer count.
@@ -329,6 +426,14 @@ func (c *Client) hostIDs(ctx context.Context, host string) ([]string, error) {
 func unixStr(s string) time.Time {
 	n, _ := strconv.ParseInt(s, 10, 64)
 	return time.Unix(n, 0).UTC()
+}
+
+func parseUnixField(field, value string) (time.Time, error) {
+	n, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || n < 0 {
+		return time.Time{}, fmt.Errorf("zabbix: parse problem history %s %q", field, value)
+	}
+	return time.Unix(n, 0).UTC(), nil
 }
 
 // severitiesFrom returns the list of numeric severities >= min (0..5).
