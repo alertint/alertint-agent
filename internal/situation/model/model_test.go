@@ -61,6 +61,25 @@ func TestAssessmentCarriesControllerLifecycleAndActionContract(t *testing.T) {
 	}
 }
 
+func TestSituationCarriesCanonicalLifecycleObservationTime(t *testing.T) {
+	observedAt := time.Date(2026, time.August, 20, 10, 30, 0, 0, time.UTC)
+	raw, err := json.Marshal(Situation{LastLifecycleObservedAt: observedAt})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	var rendered string
+	if err := json.Unmarshal(got["last_lifecycle_observed_at"], &rendered); err != nil {
+		t.Fatalf("Unmarshal last_lifecycle_observed_at: %v", err)
+	}
+	if rendered != "2026-08-20T10:30:00Z" {
+		t.Fatalf("last_lifecycle_observed_at = %q", rendered)
+	}
+}
+
 func TestEnvelopeCompanionSetsRemainSeparate(t *testing.T) {
 	envelope := EnvelopeVersion{
 		Conditions: EnvelopeConditions{

@@ -103,6 +103,7 @@ type Situation struct {
 	EffectiveStartedAt      time.Time       `json:"effective_started_at"`
 	EffectiveStartedAtBasis SourceTimeBasis `json:"effective_started_at_basis"`
 	FirstReceivedAt         time.Time       `json:"first_received_at"`
+	LastLifecycleObservedAt time.Time       `json:"last_lifecycle_observed_at"`
 	RecoveryObservedAt      *time.Time      `json:"recovery_observed_at,omitempty"`
 	GraceUntil              *time.Time      `json:"grace_until,omitempty"`
 	TerminalAt              *time.Time      `json:"terminal_at,omitempty"`
