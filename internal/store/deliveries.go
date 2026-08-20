@@ -235,7 +235,7 @@ func (s *Store) ClaimAlertDispatches(ctx context.Context, owner string, now time
 	}
 	defer func() { _ = tx.Rollback() }()
 	leaseExpires := canonicalTime(now.Add(lease))
-	_, err = tx.ExecContext(ctx, `
+	claimedRows, err := tx.QueryContext(ctx, `
 		UPDATE alert_delivery_dispatches
 		SET status = 'claimed', lease_owner = ?, lease_expires_at = ?, attempt_count = attempt_count + 1
 		WHERE delivery_id IN (
@@ -244,11 +244,39 @@ func (s *Store) ClaimAlertDispatches(ctx context.Context, owner string, now time
 				OR (status = 'claimed' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
 			ORDER BY COALESCE(retry_at, '') ASC, delivery_id ASC LIMIT ?
 		)
+		RETURNING delivery_id
 	`, owner, leaseExpires, canonicalTime(now), canonicalTime(now), limit)
 	if err != nil {
 		return nil, fmt.Errorf("store: claim alert dispatches: %w", err)
 	}
-	rows, err := tx.QueryContext(ctx, dispatchSelect+` WHERE d.status = 'claimed' AND d.lease_owner = ? AND d.lease_expires_at = ? ORDER BY d.delivery_id`, owner, leaseExpires)
+	claimedIDs := make([]string, 0, limit)
+	for claimedRows.Next() {
+		var id string
+		if err := claimedRows.Scan(&id); err != nil {
+			_ = claimedRows.Close()
+			return nil, fmt.Errorf("store: scan claimed alert dispatch id: %w", err)
+		}
+		claimedIDs = append(claimedIDs, id)
+	}
+	if err := claimedRows.Err(); err != nil {
+		_ = claimedRows.Close()
+		return nil, fmt.Errorf("store: iterate claimed alert dispatch ids: %w", err)
+	}
+	if err := claimedRows.Close(); err != nil {
+		return nil, fmt.Errorf("store: close claimed alert dispatch ids: %w", err)
+	}
+	if len(claimedIDs) == 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("store: commit empty alert dispatch claim: %w", err)
+		}
+		return []AlertDispatch{}, nil
+	}
+	args := make([]any, len(claimedIDs))
+	placeholders := make([]string, len(claimedIDs))
+	for i, id := range claimedIDs {
+		args[i], placeholders[i] = id, "?"
+	}
+	rows, err := tx.QueryContext(ctx, dispatchSelect+` WHERE d.delivery_id IN (`+strings.Join(placeholders, ",")+`) ORDER BY d.delivery_id`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("store: read claimed alert dispatches: %w", err)
 	}

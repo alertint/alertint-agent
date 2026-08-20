@@ -107,6 +107,34 @@ func TestAcceptDeliveriesRollsBackWholeEnvelope(t *testing.T) {
 	}
 }
 
+func TestClaimAlertDispatchesReturnsOnlyRowsChangedByThisClaim(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+	in := []DeliveryInput{
+		{
+			ID: "claim-d1", Alert: Alert{ID: "claim-a1", Fingerprint: "claim-fp1", Status: "firing", Labels: map[string]string{}, Annotations: map[string]string{}, StartsAt: now, ReceivedAt: now},
+			Source: "alertmanager", SourceEpisodeKey: "alertmanager:claim-fp1:2026-08-20T10:00:00Z", SourceStartedAt: &now,
+			StartedAtBasis: "source_payload", ResolvedAtBasis: "missing", ReceiverGroupingIdentity: "service=api", PayloadDigest: "sha256:claim-a",
+		},
+		{
+			ID: "claim-d2", Alert: Alert{ID: "claim-a2", Fingerprint: "claim-fp2", Status: "firing", Labels: map[string]string{}, Annotations: map[string]string{}, StartsAt: now, ReceivedAt: now},
+			Source: "alertmanager", SourceEpisodeKey: "alertmanager:claim-fp2:2026-08-20T10:00:00Z", SourceStartedAt: &now,
+			StartedAtBasis: "source_payload", ResolvedAtBasis: "missing", ReceiverGroupingIdentity: "service=api", PayloadDigest: "sha256:claim-b",
+		},
+	}
+	if _, err := s.AcceptDeliveries(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.ClaimAlertDispatches(context.Background(), "worker-1", now, time.Minute, 1)
+	if err != nil || len(first) != 1 || first[0].Delivery.ID != "claim-d1" {
+		t.Fatalf("first claim=%+v err=%v", first, err)
+	}
+	second, err := s.ClaimAlertDispatches(context.Background(), "worker-1", now, time.Minute, 1)
+	if err != nil || len(second) != 1 || second[0].Delivery.ID != "claim-d2" {
+		t.Fatalf("second claim=%+v err=%v", second, err)
+	}
+}
+
 func deliveryRowCount(t *testing.T, s *Store, table string) int {
 	t.Helper()
 	var n int

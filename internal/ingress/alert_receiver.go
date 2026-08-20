@@ -103,7 +103,7 @@ func (r *alertReceiver) Ingest(ctx context.Context, body []byte) (Summary, error
 		slog.String("status", payload.Status),
 	)
 
-	inputs, err := r.deliveryInputs(payload.Alerts, payload.GroupLabels)
+	inputs, err := r.deliveryInputs(payload)
 	if err != nil {
 		return Summary{}, err
 	}
@@ -142,19 +142,24 @@ func alertAuditRecord(payload AlertmanagerPayload, persisted []store.Alert) map[
 	}
 }
 
-func (r *alertReceiver) deliveryInputs(in []AlertmanagerAlert, groupLabels map[string]string) ([]store.DeliveryInput, error) {
-	inputs := make([]store.DeliveryInput, 0, len(in))
-	for _, a := range in {
+func (r *alertReceiver) deliveryInputs(payload AlertmanagerPayload) ([]store.DeliveryInput, error) {
+	inputs := make([]store.DeliveryInput, 0, len(payload.Alerts))
+	for _, a := range payload.Alerts {
 		alert, err := r.toStoreAlert(a)
 		if err != nil {
 			return nil, err
 		}
 		identity := grouping.Ensure(
-			grouping.RenderLabels(groupLabels), alert.Labels, alert.Fingerprint,
+			grouping.RenderLabels(payload.GroupLabels), alert.Labels, alert.Fingerprint,
 		)
 		startedAt := alert.StartsAt
+		normalized := alertmanagerDeliveryPayload{
+			Version: payload.Version, GroupKey: payload.GroupKey, Status: payload.Status, Receiver: payload.Receiver,
+			GroupLabels: payload.GroupLabels, CommonLabels: payload.CommonLabels, CommonAnnotations: payload.CommonAnnotations,
+			ExternalURL: payload.ExternalURL, Alert: a,
+		}
 		input := store.DeliveryInput{
-			ID:                       payloadDigest("alertmanager", a),
+			ID:                       payloadDigest("alertmanager-delivery", normalized),
 			Alert:                    alert,
 			Source:                   "alertmanager",
 			SourceEpisodeKey:         "alertmanager:" + alert.Fingerprint + ":" + startedAt.UTC().Format(time.RFC3339Nano),
@@ -162,7 +167,7 @@ func (r *alertReceiver) deliveryInputs(in []AlertmanagerAlert, groupLabels map[s
 			StartedAtBasis:           situationmodel.SourceTimeBasisSourcePayload,
 			ResolvedAtBasis:          situationmodel.SourceTimeBasisMissing,
 			ReceiverGroupingIdentity: identity,
-			PayloadDigest:            payloadDigest("alertmanager-payload", a),
+			PayloadDigest:            payloadDigest("alertmanager-payload", normalized),
 		}
 		if alert.EndsAt != nil {
 			input.SourceResolvedAt = alert.EndsAt
@@ -171,6 +176,21 @@ func (r *alertReceiver) deliveryInputs(in []AlertmanagerAlert, groupLabels map[s
 		inputs = append(inputs, input)
 	}
 	return inputs, nil
+}
+
+// alertmanagerDeliveryPayload is the normalized, per-member source payload
+// retained by a delivery digest. Envelope context is included because it
+// determines receiver grouping and therefore durable dispatch semantics.
+type alertmanagerDeliveryPayload struct {
+	Version           string            `json:"version"`
+	GroupKey          string            `json:"group_key"`
+	Status            string            `json:"status"`
+	Receiver          string            `json:"receiver"`
+	GroupLabels       map[string]string `json:"group_labels"`
+	CommonLabels      map[string]string `json:"common_labels"`
+	CommonAnnotations map[string]string `json:"common_annotations"`
+	ExternalURL       string            `json:"external_url"`
+	Alert             AlertmanagerAlert `json:"alert"`
 }
 
 func payloadDigest(source string, v any) string {
