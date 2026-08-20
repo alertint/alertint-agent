@@ -86,7 +86,7 @@ type DispatchWorker struct {
 	logger     *slog.Logger
 
 	now   func() time.Time
-	apply func(context.Context, store.AlertDelivery) error
+	apply func(context.Context, store.AlertDispatch) error
 
 	runMu    sync.Mutex
 	stateMu  sync.Mutex
@@ -193,7 +193,7 @@ func (w *DispatchWorker) RunOnce(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return errors.Join(runErr, err)
 		}
-		if err := w.apply(ctx, claim.Delivery); err != nil {
+		if err := w.apply(ctx, claim); err != nil {
 			class, terminal := classifyDispatchError(err, claim.AttemptCount, w.retry.MaxAttempts)
 			retryAt := w.now().UTC().Add(w.retry.backoff(claim.AttemptCount))
 			if retryErr := w.store.RetryAlertDispatch(ctx, claim, class, retryAt, terminal); retryErr != nil {

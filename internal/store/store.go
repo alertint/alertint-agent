@@ -408,10 +408,14 @@ type Incident struct {
 // CorrelatedDeliveryMutation is the complete durable effect of applying one
 // immutable Alert delivery. Occurrence with ID zero appends an episode;
 // Occurrence with a positive ID advances that episode's last-seen timestamp.
+// DispatchOwner and DispatchClaimToken fence every correlation effect to the
+// durable dispatch lease that authorized it.
 // RequireNonterminalOwner fences a recurrence decision against a concurrent
 // terminal Situation transition inside the write transaction.
 type CorrelatedDeliveryMutation struct {
 	DeliveryID              string
+	DispatchOwner           string
+	DispatchClaimToken      int64
 	Incident                Incident
 	Occurrence              *Occurrence
 	Input                   SituationInput

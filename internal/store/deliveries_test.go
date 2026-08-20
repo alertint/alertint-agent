@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -183,10 +184,14 @@ func TestApplyCorrelatedDeliveryRollsBackIncidentLinkAndInputTogether(t *testing
 		t.Fatal(err)
 	}
 	deliveryID := "atomic-delivery"
-	err := s.ApplyCorrelatedDelivery(context.Background(), CorrelatedDeliveryMutation{
-		DeliveryID: deliveryID,
-		Incident:   Incident{ID: "atomic-incident", GroupKey: "service=api", FirstAlertAt: now, LastAlertAt: now, ReadyAt: now.Add(time.Minute)},
-		Input:      SituationInput{ID: "atomic-input", IdempotencyKey: "delivery:collision", IncidentID: "atomic-incident", DeliveryID: &deliveryID, Kind: "incident_created", GroupKey: "service=api", OccurredAt: now},
+	claims, err := s.ClaimAlertDispatches(context.Background(), "atomic-worker", now, time.Minute, 1)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("claim=%+v err=%v", claims, err)
+	}
+	err = s.ApplyCorrelatedDelivery(context.Background(), CorrelatedDeliveryMutation{
+		DeliveryID: deliveryID, DispatchOwner: "atomic-worker", DispatchClaimToken: claims[0].ClaimToken,
+		Incident: Incident{ID: "atomic-incident", GroupKey: "service=api", FirstAlertAt: now, LastAlertAt: now, ReadyAt: now.Add(time.Minute)},
+		Input:    SituationInput{ID: "atomic-input", IdempotencyKey: "delivery:collision", IncidentID: "atomic-incident", DeliveryID: &deliveryID, Kind: "incident_created", GroupKey: "service=api", OccurredAt: now},
 	})
 	if err == nil {
 		t.Fatal("ApplyCorrelatedDelivery error=nil, want idempotency collision")
@@ -197,6 +202,61 @@ func TestApplyCorrelatedDeliveryRollsBackIncidentLinkAndInputTogether(t *testing
 	if got := deliveryRowCount(t, s, "incident_alert_deliveries"); got != 0 {
 		t.Fatalf("delivery links=%d, want 0 after rollback", got)
 	}
+}
+
+func TestConcurrentFirstDeliveriesShareOneCollectingIncident(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	acceptDeliveryFixture(t, s, "first-delivery-a", now)
+	acceptDeliveryFixture(t, s, "first-delivery-b", now.Add(time.Second))
+	claims, err := s.ClaimAlertDispatches(context.Background(), "concurrent-worker", now.Add(time.Minute), time.Minute, 2)
+	if err != nil || len(claims) != 2 {
+		t.Fatalf("claims=%+v err=%v", claims, err)
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, len(claims))
+	for i, claim := range claims {
+		go func() {
+			<-start
+			incidentID := fmt.Sprintf("concurrent-incident-%d", i)
+			deliveryID := claim.Delivery.ID
+			errs <- s.ApplyCorrelatedDelivery(context.Background(), CorrelatedDeliveryMutation{
+				DeliveryID: deliveryID, DispatchOwner: "concurrent-worker", DispatchClaimToken: claim.ClaimToken,
+				Incident: Incident{ID: incidentID, GroupKey: "service=api", FirstAlertAt: claim.Delivery.ReceivedAt,
+					LastAlertAt: claim.Delivery.ReceivedAt, ReadyAt: claim.Delivery.ReceivedAt.Add(time.Minute)},
+				Input: SituationInput{ID: "input-" + deliveryID, IdempotencyKey: "delivery:" + deliveryID,
+					IncidentID: incidentID, DeliveryID: &deliveryID, Kind: "incident_created", GroupKey: "service=api", OccurredAt: claim.Delivery.ReceivedAt},
+			})
+		}()
+	}
+	close(start)
+	for range claims {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent mutation: %v", err)
+		}
+	}
+	if got := deliveryRowCount(t, s, "incidents"); got != 1 {
+		t.Fatalf("collecting incidents=%d, want 1", got)
+	}
+	if got := deliveryRowCount(t, s, "incident_alert_deliveries"); got != 2 {
+		t.Fatalf("delivery links=%d, want 2", got)
+	}
+	if got := deliveryRowCount(t, s, "situation_input_outbox"); got != 2 {
+		t.Fatalf("Situation inputs=%d, want 2", got)
+	}
+	if got := deliveryDistinctIncidentCount(t, s); got != 1 {
+		t.Fatalf("delivery Incident owners=%d, want 1", got)
+	}
+}
+
+func deliveryDistinctIncidentCount(t *testing.T, s *Store) int {
+	t.Helper()
+	var n int
+	if err := s.DB().QueryRowContext(context.Background(), `SELECT COUNT(DISTINCT incident_id) FROM incident_alert_deliveries`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
 }
 
 func acceptDeliveryFixture(t *testing.T, s *Store, deliveryID string, now time.Time) {

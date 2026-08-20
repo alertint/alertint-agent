@@ -202,7 +202,8 @@ func (c *Correlator) Accept(ctx context.Context, a store.Alert) error {
 // ApplyDelivery correlates one immutable, durably accepted delivery. The
 // Incident/Occurrence mutation, immutable ownership link, compatibility
 // membership, and Situation-input production commit atomically in the store.
-func (c *Correlator) ApplyDelivery(ctx context.Context, d store.AlertDelivery) error {
+func (c *Correlator) ApplyDelivery(ctx context.Context, claim store.AlertDispatch) error {
+	d := claim.Delivery
 	if d.ID == "" || d.Alert.ID == "" || d.Alert.Fingerprint == "" || d.ReceivedAt.IsZero() ||
 		(d.Alert.Status != "firing" && d.Alert.Status != "resolved") {
 		return fmt.Errorf("%w: identity, received time, and lifecycle status are required", ErrInvalidDelivery)
@@ -224,7 +225,7 @@ func (c *Correlator) ApplyDelivery(ctx context.Context, d store.AlertDelivery) e
 	}
 	if err == store.ErrNotFound && a.Status == "firing" {
 		if plan, collapsible := c.planDeliveryRecurrence(ctx, a, gk); collapsible {
-			m := c.correlatedDeliveryMutation(d, plan.incident, plan.occurrence, "membership_changed", true)
+			m := c.correlatedDeliveryMutation(claim, plan.incident, plan.occurrence, "membership_changed", true)
 			if err := c.st.ApplyCorrelatedDelivery(ctx, m); err == nil {
 				c.logger.Info("correlator: delivery collapsed into Incident", "delivery_id", d.ID, "incident_id", plan.incident.ID)
 				return nil
@@ -246,26 +247,28 @@ func (c *Correlator) ApplyDelivery(ctx context.Context, d store.AlertDelivery) e
 			ID: uuid.NewString(), GroupKey: gk, FirstAlertAt: d.ReceivedAt.UTC(),
 			LastAlertAt: d.ReceivedAt.UTC(), ReadyAt: d.ReceivedAt.UTC().Add(window),
 		}
-		if err := c.st.ApplyCorrelatedDelivery(ctx, c.correlatedDeliveryMutation(d, fresh, nil, "incident_created", false)); err != nil {
+		if err := c.st.ApplyCorrelatedDelivery(ctx, c.correlatedDeliveryMutation(claim, fresh, nil, "incident_created", false)); err != nil {
 			return fmt.Errorf("correlator: apply delivery to new Incident: %w", err)
 		}
 		c.logger.Info("correlator: delivery opened Incident", "delivery_id", d.ID, "incident_id", fresh.ID, "group_key", gk)
 		return nil
 	}
 
-	if err := c.st.ApplyCorrelatedDelivery(ctx, c.correlatedDeliveryMutation(d, *inc, nil, "membership_changed", false)); err != nil {
+	if err := c.st.ApplyCorrelatedDelivery(ctx, c.correlatedDeliveryMutation(claim, *inc, nil, "membership_changed", false)); err != nil {
 		return fmt.Errorf("correlator: apply delivery to Incident: %w", err)
 	}
 	c.logger.Debug("correlator: delivery joined Incident", "delivery_id", d.ID, "incident_id", inc.ID)
 	return nil
 }
 
-func (c *Correlator) correlatedDeliveryMutation(d store.AlertDelivery, inc store.Incident, occ *store.Occurrence, kind string, requireNonterminalOwner bool) store.CorrelatedDeliveryMutation {
+func (c *Correlator) correlatedDeliveryMutation(claim store.AlertDispatch, inc store.Incident, occ *store.Occurrence, kind string, requireNonterminalOwner bool) store.CorrelatedDeliveryMutation {
+	d := claim.Delivery
 	deliveryID := d.ID
-	return store.CorrelatedDeliveryMutation{
-		DeliveryID: d.ID,
-		Incident:   inc,
-		Occurrence: occ,
+	m := store.CorrelatedDeliveryMutation{
+		DeliveryID:         d.ID,
+		DispatchClaimToken: claim.ClaimToken,
+		Incident:           inc,
+		Occurrence:         occ,
 		Input: store.SituationInput{
 			ID:             uuid.NewSHA1(uuid.NameSpaceURL, []byte("alertint:situation-input:"+d.ID)).String(),
 			IdempotencyKey: "delivery:" + d.ID,
@@ -277,6 +280,10 @@ func (c *Correlator) correlatedDeliveryMutation(d store.AlertDelivery, inc store
 		},
 		RequireNonterminalOwner: requireNonterminalOwner,
 	}
+	if claim.LeaseOwner != nil {
+		m.DispatchOwner = *claim.LeaseOwner
+	}
+	return m
 }
 
 // Start launches the background processing loop and returns immediately.

@@ -43,6 +43,12 @@ CREATE TABLE alert_delivery_dispatches (
 
 CREATE INDEX alert_delivery_dispatches_status_retry_at_idx ON alert_delivery_dispatches(status, retry_at);
 
+-- Runtime cutover is deferred, so distinguish durable-correlation Incidents
+-- from the legacy insertion path while fencing concurrent durable workers.
+ALTER TABLE incidents ADD COLUMN dispatch_managed INTEGER NOT NULL DEFAULT 0 CHECK (dispatch_managed IN (0, 1));
+CREATE UNIQUE INDEX incidents_one_dispatch_collecting_group_idx
+    ON incidents(group_key) WHERE status = 'collecting' AND dispatch_managed = 1;
+
 CREATE TABLE incident_alert_deliveries (
     incident_id  TEXT NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
     delivery_id  TEXT NOT NULL UNIQUE REFERENCES alert_deliveries(id),

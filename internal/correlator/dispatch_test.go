@@ -21,7 +21,7 @@ func TestDispatchWorkerPersistsRetryWithBackoff(t *testing.T) {
 		Retry: RetryPolicy{InitialBackoff: 10 * time.Second, MaxBackoff: time.Minute, MaxAttempts: 3, Jitter: func(d time.Duration) time.Duration { return d }},
 	}, nil)
 	w.now = func() time.Time { return now }
-	w.apply = func(context.Context, store.AlertDelivery) error { return errors.New("temporary database contention") }
+	w.apply = func(context.Context, store.AlertDispatch) error { return errors.New("temporary database contention") }
 
 	if err := w.RunOnce(context.Background()); err == nil {
 		t.Fatal("RunOnce error=nil, want retryable processing error")
@@ -42,7 +42,7 @@ func TestDispatchWorkerDeadLettersPermanentError(t *testing.T) {
 	cor := New(Config{}, st, NopIncidentSink{}, nil)
 	w := NewDispatchWorker(st, cor, DispatchWorkerConfig{Owner: "failed-worker", Lease: time.Minute}, nil)
 	w.now = func() time.Time { return now }
-	w.apply = func(context.Context, store.AlertDelivery) error { return ErrInvalidDelivery }
+	w.apply = func(context.Context, store.AlertDispatch) error { return ErrInvalidDelivery }
 
 	if err := w.RunOnce(context.Background()); err == nil {
 		t.Fatal("RunOnce error=nil, want permanent processing error")

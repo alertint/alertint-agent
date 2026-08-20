@@ -246,38 +246,31 @@ func (s *Store) ClaimAlertDispatches(ctx context.Context, owner string, now time
 	}
 	defer func() { _ = tx.Rollback() }()
 	leaseExpires := canonicalTime(now.Add(lease))
-	claimedRows, err := tx.QueryContext(ctx, `
-		UPDATE alert_delivery_dispatches
-		SET status = 'claimed', lease_owner = ?, lease_expires_at = ?,
-		    claim_token = claim_token + 1, attempt_count = attempt_count + 1
-		WHERE delivery_id IN (
-			SELECT d.delivery_id
-			FROM alert_delivery_dispatches AS d
-			JOIN alert_deliveries AS ad ON ad.id = d.delivery_id
-			WHERE (d.status = 'pending' AND (d.retry_at IS NULL OR d.retry_at <= ?))
-				OR (d.status = 'claimed' AND d.lease_expires_at IS NOT NULL AND d.lease_expires_at <= ?)
-			ORDER BY COALESCE(d.retry_at, ad.received_at) ASC, ad.received_at ASC, d.delivery_id ASC LIMIT ?
-		)
-		RETURNING delivery_id
-	`, owner, leaseExpires, canonicalTime(now), canonicalTime(now), limit)
+	candidateRows, err := tx.QueryContext(ctx, `
+		SELECT d.delivery_id
+		FROM alert_delivery_dispatches AS d
+		JOIN alert_deliveries AS ad ON ad.id = d.delivery_id
+		WHERE (d.status = 'pending' AND (d.retry_at IS NULL OR d.retry_at <= ?))
+			OR (d.status = 'claimed' AND d.lease_expires_at IS NOT NULL AND d.lease_expires_at <= ?)
+		ORDER BY COALESCE(d.retry_at, ad.received_at) ASC, ad.received_at ASC, d.delivery_id ASC LIMIT ?
+	`, canonicalTime(now), canonicalTime(now), limit)
 	if err != nil {
-		return nil, fmt.Errorf("store: claim alert dispatches: %w", err)
+		return nil, fmt.Errorf("store: select alert dispatch candidates: %w", err)
 	}
+	defer func() { _ = candidateRows.Close() }()
 	claimedIDs := make([]string, 0, limit)
-	for claimedRows.Next() {
+	for candidateRows.Next() {
 		var id string
-		if err := claimedRows.Scan(&id); err != nil {
-			_ = claimedRows.Close()
-			return nil, fmt.Errorf("store: scan claimed alert dispatch id: %w", err)
+		if err := candidateRows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("store: scan alert dispatch candidate: %w", err)
 		}
 		claimedIDs = append(claimedIDs, id)
 	}
-	if err := claimedRows.Err(); err != nil {
-		_ = claimedRows.Close()
-		return nil, fmt.Errorf("store: iterate claimed alert dispatch ids: %w", err)
+	if err := candidateRows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate alert dispatch candidates: %w", err)
 	}
-	if err := claimedRows.Close(); err != nil {
-		return nil, fmt.Errorf("store: close claimed alert dispatch ids: %w", err)
+	if err := candidateRows.Close(); err != nil {
+		return nil, fmt.Errorf("store: close alert dispatch candidates: %w", err)
 	}
 	if len(claimedIDs) == 0 {
 		if err := tx.Commit(); err != nil {
@@ -290,7 +283,24 @@ func (s *Store) ClaimAlertDispatches(ctx context.Context, owner string, now time
 	for i, id := range claimedIDs {
 		args[i], placeholders[i] = id, "?"
 	}
-	rows, err := tx.QueryContext(ctx, dispatchSelect+` WHERE d.delivery_id IN (`+strings.Join(placeholders, ",")+`) ORDER BY d.delivery_id`, args...)
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE alert_delivery_dispatches
+		SET status = 'claimed', lease_owner = ?, lease_expires_at = ?,
+		    claim_token = claim_token + 1, attempt_count = attempt_count + 1
+		WHERE delivery_id IN (`+strings.Join(placeholders, ",")+`)`, append([]any{owner, leaseExpires}, args...)...); err != nil {
+		return nil, fmt.Errorf("store: claim alert dispatches: %w", err)
+	}
+	orderTerms := make([]string, len(claimedIDs))
+	orderArgs := make([]any, len(claimedIDs))
+	for i, id := range claimedIDs {
+		orderTerms[i] = "WHEN ? THEN " + fmt.Sprint(i)
+		orderArgs[i] = id
+	}
+	queryArgs := append([]any{}, args...)
+	queryArgs = append(queryArgs, owner)
+	queryArgs = append(queryArgs, orderArgs...)
+	rows, err := tx.QueryContext(ctx, dispatchSelect+` WHERE d.delivery_id IN (`+strings.Join(placeholders, ",")+
+		`) AND d.status = 'claimed' AND d.lease_owner = ? ORDER BY CASE d.delivery_id `+strings.Join(orderTerms, " ")+` END`, queryArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("store: read claimed alert dispatches: %w", err)
 	}
@@ -381,6 +391,9 @@ func (s *Store) ApplyCorrelatedDelivery(ctx context.Context, m CorrelatedDeliver
 		return fmt.Errorf("store: begin correlated delivery: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := verifyCorrelatedDispatchClaimTx(ctx, tx, m); err != nil {
+		return err
+	}
 
 	var alreadyLinked int
 	err = tx.QueryRowContext(ctx, `SELECT 1 FROM incident_alert_deliveries WHERE delivery_id = ?`, m.DeliveryID).Scan(&alreadyLinked)
@@ -425,9 +438,14 @@ func (s *Store) ApplyCorrelatedDelivery(ctx context.Context, m CorrelatedDeliver
 		}
 	}
 
-	created, incidentStatus, err := ensureCorrelatedIncident(ctx, tx, m.Incident)
+	created, incidentStatus, incidentID, err := ensureCorrelatedIncident(ctx, tx, m.Incident, m.Input.Kind == "incident_created" && m.Occurrence == nil)
 	if err != nil {
 		return err
+	}
+	if incidentID != m.Incident.ID {
+		m.Incident.ID = incidentID
+		m.Input.IncidentID = incidentID
+		m.Input.Kind = "membership_changed"
 	}
 	now := time.Now().UTC()
 	if _, err := tx.ExecContext(ctx, `
@@ -557,8 +575,11 @@ func correlatedSituationInputKind(ctx context.Context, tx *sql.Tx, requested, in
 }
 
 func validateCorrelatedDeliveryMutation(m CorrelatedDeliveryMutation) error {
-	if strings.TrimSpace(m.DeliveryID) == "" || strings.TrimSpace(m.Incident.ID) == "" || strings.TrimSpace(m.Incident.GroupKey) == "" {
-		return errors.New("store: correlated delivery requires delivery and Incident identity")
+	if strings.TrimSpace(m.DeliveryID) == "" || strings.TrimSpace(m.DispatchOwner) == "" || m.DispatchClaimToken <= 0 {
+		return errors.New("store: correlated delivery requires a complete dispatch claim")
+	}
+	if strings.TrimSpace(m.Incident.ID) == "" || strings.TrimSpace(m.Incident.GroupKey) == "" {
+		return errors.New("store: correlated delivery requires Incident identity")
 	}
 	if m.Incident.FirstAlertAt.IsZero() || m.Incident.LastAlertAt.IsZero() || m.Incident.ReadyAt.IsZero() {
 		return errors.New("store: correlated delivery requires Incident times")
@@ -581,29 +602,57 @@ func validateCorrelatedDeliveryMutation(m CorrelatedDeliveryMutation) error {
 	return nil
 }
 
-func ensureCorrelatedIncident(ctx context.Context, tx *sql.Tx, inc Incident) (created bool, status string, err error) {
+func verifyCorrelatedDispatchClaimTx(ctx context.Context, tx *sql.Tx, m CorrelatedDeliveryMutation) error {
+	var valid int
+	err := tx.QueryRowContext(ctx, `
+		SELECT 1 FROM alert_delivery_dispatches
+		WHERE delivery_id = ? AND status = 'claimed' AND lease_owner = ? AND claim_token = ?`,
+		m.DeliveryID, m.DispatchOwner, m.DispatchClaimToken).Scan(&valid)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrAlertDispatchLeaseLost
+	}
+	if err != nil {
+		return fmt.Errorf("store: verify correlated dispatch claim: %w", err)
+	}
+	return nil
+}
+
+func ensureCorrelatedIncident(ctx context.Context, tx *sql.Tx, inc Incident, reuseCollecting bool) (created bool, status, incidentID string, err error) {
 	var groupKey string
 	err = tx.QueryRowContext(ctx, `SELECT group_key, status FROM incidents WHERE id = ?`, inc.ID).Scan(&groupKey, &status)
 	if err == nil {
 		if groupKey != inc.GroupKey {
-			return false, "", errors.New("store: correlated Incident group key mismatch")
+			return false, "", "", errors.New("store: correlated Incident group key mismatch")
 		}
-		return false, status, nil
+		return false, status, inc.ID, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return false, "", fmt.Errorf("store: read correlated Incident: %w", err)
+		return false, "", "", fmt.Errorf("store: read correlated Incident: %w", err)
+	}
+	if reuseCollecting {
+		var existingID string
+		err = tx.QueryRowContext(ctx, `
+			SELECT id, status FROM incidents
+			WHERE group_key = ? AND status = 'collecting'
+			ORDER BY created_at ASC, id ASC LIMIT 1`, inc.GroupKey).Scan(&existingID, &status)
+		if err == nil {
+			return false, status, existingID, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return false, "", "", fmt.Errorf("store: read collecting correlated Incident: %w", err)
+		}
 	}
 	now := time.Now().UTC()
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO incidents(
 			id, group_key, status, first_alert_at, last_alert_at, ready_at,
-			alert_count, created_at, updated_at
-		) VALUES (?, ?, 'collecting', ?, ?, ?, 0, ?, ?)`, inc.ID, inc.GroupKey,
+			alert_count, created_at, updated_at, dispatch_managed
+		) VALUES (?, ?, 'collecting', ?, ?, ?, 0, ?, ?, 1)`, inc.ID, inc.GroupKey,
 		canonicalTime(inc.FirstAlertAt), canonicalTime(inc.LastAlertAt), canonicalTime(inc.ReadyAt),
 		canonicalTime(now), canonicalTime(now)); err != nil {
-		return false, "", fmt.Errorf("store: insert correlated Incident: %w", err)
+		return false, "", "", fmt.Errorf("store: insert correlated Incident: %w", err)
 	}
-	return true, "collecting", nil
+	return true, "collecting", inc.ID, nil
 }
 
 func unresolvedIncidentMembersTx(ctx context.Context, tx *sql.Tx, incidentID string) (int, error) {

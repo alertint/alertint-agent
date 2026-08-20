@@ -4,6 +4,7 @@ package correlator
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -50,7 +51,7 @@ func TestDispatchReplaysAfterCorrelationCommitBeforeDispatchAck(t *testing.T) {
 	if err != nil || len(first) != 1 {
 		t.Fatalf("first claim=%+v err=%v", first, err)
 	}
-	if err := cor.ApplyDelivery(context.Background(), first[0].Delivery); err != nil {
+	if err := cor.ApplyDelivery(context.Background(), first[0]); err != nil {
 		t.Fatalf("first correlation commit: %v", err)
 	}
 
@@ -58,7 +59,7 @@ func TestDispatchReplaysAfterCorrelationCommitBeforeDispatchAck(t *testing.T) {
 	if err != nil || len(reclaimed) != 1 {
 		t.Fatalf("reclaim=%+v err=%v", reclaimed, err)
 	}
-	if err := cor.ApplyDelivery(context.Background(), reclaimed[0].Delivery); err != nil {
+	if err := cor.ApplyDelivery(context.Background(), reclaimed[0]); err != nil {
 		t.Fatalf("replayed correlation: %v", err)
 	}
 	if err := st.MarkAlertDispatchApplied(context.Background(), reclaimed[0], now.Add(2*time.Minute)); err != nil {
@@ -77,6 +78,77 @@ func TestDispatchReplaysAfterCorrelationCommitBeforeDispatchAck(t *testing.T) {
 	}
 }
 
+func TestStaleApplyDeliveryAfterReclaimHasNoCorrelationEffects(t *testing.T) {
+	st := openStore(t)
+	now := time.Date(2026, 8, 20, 10, 30, 0, 0, time.UTC)
+	delivery := acceptDispatchDelivery(t, st, "delivery-stale-apply", "fp-stale-apply", "firing", now)
+	cor := New(Config{GroupLabels: []string{"service"}}, st, NopIncidentSink{}, nil)
+
+	stale, err := st.ClaimAlertDispatches(context.Background(), "worker-stale", now, time.Minute, 1)
+	if err != nil || len(stale) != 1 {
+		t.Fatalf("stale claim=%+v err=%v", stale, err)
+	}
+	current, err := st.ClaimAlertDispatches(context.Background(), "worker-current", now.Add(2*time.Minute), time.Minute, 1)
+	if err != nil || len(current) != 1 {
+		t.Fatalf("current claim=%+v err=%v", current, err)
+	}
+
+	if err := cor.ApplyDelivery(context.Background(), stale[0]); !errors.Is(err, store.ErrAlertDispatchLeaseLost) {
+		t.Fatalf("stale ApplyDelivery err=%v, want ErrAlertDispatchLeaseLost", err)
+	}
+	for _, table := range []string{"incidents", "incident_occurrences", "incident_alert_deliveries", "situation_input_outbox"} {
+		if got := countQuery(t, st, `SELECT COUNT(*) FROM `+table); got != 0 {
+			t.Fatalf("%s effects=%d after stale apply, want 0", table, got)
+		}
+	}
+
+	if err := cor.ApplyDelivery(context.Background(), current[0]); err != nil {
+		t.Fatalf("current ApplyDelivery: %v", err)
+	}
+	if got := countQuery(t, st, `SELECT COUNT(*) FROM incident_alert_deliveries WHERE delivery_id = ?`, delivery.ID); got != 1 {
+		t.Fatalf("current delivery links=%d, want 1", got)
+	}
+}
+
+func TestClaimOrderPreservesFiringBeforeResolvedForLifecycle(t *testing.T) {
+	st := openStore(t)
+	now := time.Date(2026, 8, 20, 11, 0, 0, 0, time.UTC)
+	acceptDispatchDelivery(t, st, "z-firing-digest", "fp-causal", "firing", now)
+	acceptDispatchDelivery(t, st, "a-resolved-digest", "fp-causal", "resolved", now.Add(time.Minute))
+	claims, err := st.ClaimAlertDispatches(context.Background(), "worker-causal", now.Add(2*time.Minute), time.Minute, 2)
+	if err != nil || len(claims) != 2 {
+		t.Fatalf("claims=%+v err=%v", claims, err)
+	}
+	if claims[0].Delivery.ID != "z-firing-digest" || claims[1].Delivery.ID != "a-resolved-digest" {
+		t.Fatalf("claim order=(%q,%q), want firing then resolved", claims[0].Delivery.ID, claims[1].Delivery.ID)
+	}
+
+	cor := New(Config{GroupLabels: []string{"service"}}, st, NopIncidentSink{}, nil)
+	if err := cor.ApplyDelivery(context.Background(), claims[0]); err != nil {
+		t.Fatalf("apply firing: %v", err)
+	}
+	var incidentID string
+	if err := st.DB().QueryRow(`SELECT incident_id FROM incident_alert_deliveries WHERE delivery_id = 'z-firing-digest'`).Scan(&incidentID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().Exec(`UPDATE incidents SET status = 'analyzed' WHERE id = ?`, incidentID); err != nil {
+		t.Fatal(err)
+	}
+	if err := cor.ApplyDelivery(context.Background(), claims[1]); err != nil {
+		t.Fatalf("apply resolved: %v", err)
+	}
+	var incidentStatus, inputKind string
+	if err := st.DB().QueryRow(`SELECT status FROM incidents WHERE id = ?`, incidentID).Scan(&incidentStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DB().QueryRow(`SELECT kind FROM situation_input_outbox WHERE delivery_id = 'a-resolved-digest'`).Scan(&inputKind); err != nil {
+		t.Fatal(err)
+	}
+	if incidentStatus != "resolved" || inputKind != "incident_resolved" {
+		t.Fatalf("lifecycle=(%q,%q), want (resolved,incident_resolved)", incidentStatus, inputKind)
+	}
+}
+
 func TestTerminalOwnerForcesNewIncident(t *testing.T) {
 	st := openStore(t)
 	now := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
@@ -87,7 +159,8 @@ func TestTerminalOwnerForcesNewIncident(t *testing.T) {
 	cor := New(Config{GroupLabels: []string{"service"}}, st, NopIncidentSink{}, nil)
 
 	before := countQuery(t, st, `SELECT COUNT(*) FROM incidents`)
-	if err := cor.ApplyDelivery(context.Background(), delivery); err != nil {
+	claim := claimAcceptedDelivery(t, st, "worker-terminal", now.Add(time.Second))
+	if err := cor.ApplyDelivery(context.Background(), claim); err != nil {
 		t.Fatalf("apply refire: %v", err)
 	}
 	if got := countQuery(t, st, `SELECT COUNT(*) FROM incidents`); got != before+1 {
@@ -116,7 +189,8 @@ func TestNonterminalOwnerCollapsesThroughAtomicSituationInput(t *testing.T) {
 	delivery := acceptDispatchDelivery(t, st, "delivery-active-refire", "fp-active-refire", "firing", now)
 	cor, doubles := newCorrelatorFor(t, st)
 
-	if err := cor.ApplyDelivery(context.Background(), delivery); err != nil {
+	claim := claimAcceptedDelivery(t, st, "worker-active", now.Add(time.Second))
+	if err := cor.ApplyDelivery(context.Background(), claim); err != nil {
 		t.Fatalf("apply active refire: %v", err)
 	}
 	if got := countQuery(t, st, `SELECT COUNT(*) FROM incident_occurrences WHERE incident_id = 'incident-active'`); got != 1 {
@@ -138,8 +212,12 @@ func TestResolvedDeliveryAtomicallyMarksIncidentAndEmitsResolvedInput(t *testing
 	now := time.Date(2026, 8, 20, 14, 0, 0, 0, time.UTC)
 	cor := New(Config{GroupLabels: []string{"service"}}, st, NopIncidentSink{}, nil)
 	firing := acceptDispatchDelivery(t, st, "delivery-firing", "fp-lifecycle", "firing", now)
-	if err := cor.ApplyDelivery(context.Background(), firing); err != nil {
+	firingClaim := claimAcceptedDelivery(t, st, "worker-firing", now.Add(time.Second))
+	if err := cor.ApplyDelivery(context.Background(), firingClaim); err != nil {
 		t.Fatalf("apply firing: %v", err)
+	}
+	if err := st.MarkAlertDispatchApplied(context.Background(), firingClaim, now.Add(time.Second)); err != nil {
+		t.Fatalf("ack firing: %v", err)
 	}
 	var incidentID string
 	if err := st.DB().QueryRow(`SELECT incident_id FROM incident_alert_deliveries WHERE delivery_id = ?`, firing.ID).Scan(&incidentID); err != nil {
@@ -149,7 +227,8 @@ func TestResolvedDeliveryAtomicallyMarksIncidentAndEmitsResolvedInput(t *testing
 		t.Fatal(err)
 	}
 	resolved := acceptDispatchDelivery(t, st, "delivery-resolved", "fp-lifecycle", "resolved", now.Add(time.Minute))
-	if err := cor.ApplyDelivery(context.Background(), resolved); err != nil {
+	resolvedClaim := claimAcceptedDelivery(t, st, "worker-resolved", now.Add(2*time.Minute))
+	if err := cor.ApplyDelivery(context.Background(), resolvedClaim); err != nil {
 		t.Fatalf("apply resolved: %v", err)
 	}
 	var status, kind string
@@ -162,6 +241,15 @@ func TestResolvedDeliveryAtomicallyMarksIncidentAndEmitsResolvedInput(t *testing
 	if status != "resolved" || kind != "incident_resolved" {
 		t.Fatalf("resolved mutation=(%q,%q), want (resolved,incident_resolved)", status, kind)
 	}
+}
+
+func claimAcceptedDelivery(t *testing.T, st *store.Store, owner string, now time.Time) store.AlertDispatch {
+	t.Helper()
+	claims, err := st.ClaimAlertDispatches(context.Background(), owner, now, time.Minute, 1)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("claim accepted delivery=%+v err=%v", claims, err)
+	}
+	return claims[0]
 }
 
 func acceptDispatchDelivery(t *testing.T, st *store.Store, deliveryID, fingerprint, status string, at time.Time) store.AlertDelivery {
