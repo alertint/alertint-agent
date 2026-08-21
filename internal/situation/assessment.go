@@ -96,11 +96,23 @@ func ValidateAssessment(snapshot Snapshot, proposal model.Assessment, now time.T
 		if !ok {
 			return model.Assessment{}, nil, errors.New("situation: a non-critical publication requires a matching eligible reason candidate")
 		}
-		_ = reason
+		// A real CandidateID match proves the candidate exists; it does not
+		// prove the proposal's own Code/EvidenceRefs weren't altered from
+		// it. Canonicalize both from the matched candidate — only free-text
+		// Summary is the model's to author.
+		if adj, changed := canonicalizeSufficientReason(&out, reason); changed {
+			adjustments = append(adjustments, adj)
+		}
 	} else if out.SufficientReason != nil {
-		// Observe requires no reason, but a cited one still must be real.
-		if _, ok := matchingEligibleReason(snapshot, out.SufficientReason); !ok {
+		// Observe requires no reason, but a cited one still must be real —
+		// and, as above, its Code/EvidenceRefs are canonicalized rather than
+		// trusted verbatim.
+		reason, ok := matchingEligibleReason(snapshot, out.SufficientReason)
+		if !ok {
 			return model.Assessment{}, nil, errors.New("situation: cited sufficient reason is not an eligible candidate")
+		}
+		if adj, changed := canonicalizeSufficientReason(&out, reason); changed {
+			adjustments = append(adjustments, adj)
 		}
 	}
 
@@ -249,8 +261,14 @@ func selectUrgentFloorReason(snapshot Snapshot) (model.ReasonCandidate, bool) {
 	return model.ReasonCandidate{}, false
 }
 
+// sufficientReasonFromCandidate canonicalizes a SufficientReason from its
+// matched candidate: Code and EvidenceRefs always come from the candidate
+// (never the proposal, which may have altered either), CandidateID is the
+// candidate's own ID, and Summary is the only field the caller's free text
+// may supply — a proposal with no usable summary gets a generic one so the
+// field is never empty.
 func sufficientReasonFromCandidate(candidate model.ReasonCandidate, priorSummary *model.SufficientReason) *model.SufficientReason {
-	summary := "deterministic urgent floor"
+	summary := "matched eligible reason candidate " + candidate.Code
 	if priorSummary != nil && strings.TrimSpace(priorSummary.Summary) != "" {
 		summary = priorSummary.Summary
 	}
@@ -258,4 +276,23 @@ func sufficientReasonFromCandidate(candidate model.ReasonCandidate, priorSummary
 		Code: candidate.Code, CandidateID: candidate.ID, Summary: summary,
 		EvidenceRefs: append([]string(nil), candidate.EvidenceRefs...),
 	}
+}
+
+// canonicalizeSufficientReason overwrites out.SufficientReason from its
+// already-matched candidate and reports whether the proposal's own Code or
+// EvidenceRefs actually differed from the canonical values — a real
+// CandidateID match proves the candidate exists, never that the proposal's
+// Code/EvidenceRefs weren't independently altered from it. The change is
+// reported (not just applied) so the caller can record it as an audited
+// ValidationAdjustment.
+func canonicalizeSufficientReason(out *model.Assessment, candidate model.ReasonCandidate) (model.ValidationAdjustment, bool) {
+	before := out.SufficientReason
+	changed := before.Code != candidate.Code || !stringSlicesEqual(before.EvidenceRefs, candidate.EvidenceRefs)
+	out.SufficientReason = sufficientReasonFromCandidate(candidate, before)
+	if !changed {
+		return model.ValidationAdjustment{}, false
+	}
+	return model.ValidationAdjustment{
+		Code: "sufficient_reason_canonicalized", Detail: "the proposed reason's code/evidence did not match its cited candidate; canonicalized from the eligible candidate",
+	}, true
 }

@@ -223,13 +223,14 @@ func (c *Controller) Reconcile(ctx context.Context, situationID string) error {
 	}
 
 	decision := c.decideL1(claim, snap, trusted)
-	if err := c.store.SetAnalysisState(ctx, AnalysisState{
+	if decision.Status == L1StatusPlanned {
+		if err := c.beginAcuteInvestigation(ctx, claim, incidentID, decision, now); err != nil {
+			return fmt.Errorf("situation: reconcile: begin l1: %w", err)
+		}
+	} else if err := c.store.SetAnalysisState(ctx, AnalysisState{
 		IncidentID: incidentID, Status: decision.Status, DecisionReason: decision.DecisionReason, UpdatedAt: now,
 	}); err != nil {
 		return fmt.Errorf("situation: reconcile: set analysis state: %w", err)
-	}
-	if decision.Status == L1StatusPlanned {
-		c.dispatchAcuteInvestigation(ctx, claim.Situation.ID, incidentID)
 	}
 
 	if trusted.Trustworthy && trusted.FactHash == snap.MaterialHash {
@@ -287,12 +288,58 @@ func (c *Controller) attachProfiles(ctx context.Context, in *SnapshotInput) {
 	}
 }
 
+// beginAcuteInvestigation applies the B+ "planned" decision: it guards
+// against dispatching a second concurrent Investigate() for the same
+// Incident (the async goroutine deliberately outlives this lease-scoped
+// Reconcile call, so a later reconciliation pass before the first completes
+// must observe "running" and skip re-dispatch rather than firing a
+// duplicate call), tracks L1's own attempt budget against the same
+// per-input attempt count L2 parks on, and only then dispatches.
+func (c *Controller) beginAcuteInvestigation(ctx context.Context, claim Claim, incidentID string, decision L1Decision, now time.Time) error {
+	if claim.Situation.AttemptCount >= c.cfg.MaxAttemptsPerInput {
+		// This Situation's own reconciliation attempt budget for the
+		// current unchanged input is exhausted — the same gate runL2 parks
+		// on. Repeatedly re-dispatching L1 against the same unchanged facts
+		// would not help either; mark it exhausted rather than leaving the
+		// gate stuck at "planned" forever.
+		return c.store.SetAnalysisState(ctx, AnalysisState{
+			IncidentID: incidentID, Status: L1StatusExhausted, DecisionReason: "l1_attempt_budget_exhausted", UpdatedAt: now,
+		})
+	}
+	if c.acute == nil {
+		// No investigator wired: the decision stands as planned — nothing
+		// to dispatch, and nothing to guard against duplicating.
+		return c.store.SetAnalysisState(ctx, AnalysisState{
+			IncidentID: incidentID, Status: decision.Status, DecisionReason: decision.DecisionReason, UpdatedAt: now,
+		})
+	}
+	current, err := c.store.AnalysisState(ctx, incidentID)
+	if err != nil {
+		return err
+	}
+	if current.Status == L1StatusRunning {
+		// An investigation is already in flight for this Incident; do not
+		// dispatch a duplicate.
+		return nil
+	}
+	if err := c.store.SetAnalysisState(ctx, AnalysisState{
+		IncidentID: incidentID, Status: L1StatusRunning, DecisionReason: decision.DecisionReason, UpdatedAt: now,
+	}); err != nil {
+		return err
+	}
+	c.dispatchAcuteInvestigation(ctx, claim.Situation.ID, incidentID)
+	return nil
+}
+
 // dispatchAcuteInvestigation runs L1 asynchronously: Reconcile has already
 // (or is about to) commit whatever deterministic/L2 result the current
 // facts support, and L1's own finding only matters for a LATER
 // reconciliation once its normalization is durable. It uses a
 // cancellation-detached context so the lease-scoped ctx ending when
-// Reconcile returns cannot cut the investigation off mid-flight.
+// Reconcile returns cannot cut the investigation off mid-flight. The caller
+// (beginAcuteInvestigation) has already persisted "running" and confirmed no
+// other investigation is in flight, so this only ever transitions running ->
+// complete/blocked.
 func (c *Controller) dispatchAcuteInvestigation(ctx context.Context, situationID, incidentID string) {
 	if c.acute == nil {
 		return
@@ -367,13 +414,19 @@ func (c *Controller) commitDeterministicDegraded(ctx context.Context, claim Clai
 	return c.commitAssessment(ctx, claim, snap, validated, adjustments, AssessmentActorDeterministic, priorSequence, now, nil)
 }
 
-// runL2 requests a validated L2 proposal within the two-call budget: the
-// first call, and — only on a syntactically invalid response, never a
-// policy rejection — one corrective retry. It never prompt-arounds a policy
-// rejection. After five exhausted attempts for this unchanged input it
-// parks rather than converting exhaustion into terminality; otherwise a
-// failed/rejected/exhausted call still ends in a safe deterministic degraded
-// commit so the Situation is never left without a current Assessment.
+// runL2 requests a validated L2 proposal within the two-call budget. A
+// syntactically invalid response earns one corrective retry (never a policy
+// rejection, which is rejected outright with no prompt-around retry); a
+// valid first proposal that still leaves a material contradiction unresolved
+// (Causality: contradicted — the schema's own name for exactly this state)
+// earns exactly one optional finalize pass against the same immutable
+// snapshot, spending whatever budget remains. Every discarded call (a
+// transport/API error, a malformed response, or a policy rejection) is
+// audited. After five exhausted attempts for this unchanged input it parks
+// rather than converting exhaustion into terminality; otherwise a call that
+// never yields a committable proposal still ends in a safe deterministic
+// degraded commit so the Situation is never left without a current
+// Assessment.
 func (c *Controller) runL2(ctx context.Context, claim Claim, snap Snapshot, prior *model.Assessment, priorSequence int, now time.Time) error {
 	if claim.Situation.AttemptCount >= c.cfg.MaxAttemptsPerInput {
 		return c.store.Park(ctx, claim, now.Add(c.cfg.ParkRetryAfter), "l2_budget_exhausted_unchanged_input")
@@ -384,30 +437,56 @@ func (c *Controller) runL2(ctx context.Context, claim Claim, snap Snapshot, prio
 
 	prompt := BuildAssessmentPrompt(snap, prior, c.cfg.AllowedCapabilities)
 	sequence := priorSequence
+	var (
+		haveValid  bool
+		validValid model.Assessment
+		validAdj   []model.ValidationAdjustment
+		validUsage json.RawMessage
+		validSeq   int
+	)
 	for call := 0; call < c.cfg.MaxL2Calls; call++ {
 		completion, err := c.assessor.Complete(ctx, AssessmentSystemPrompt, prompt, AssessmentRequiredKeys)
+		sequence++
 		if err != nil {
-			// The call itself failed (network/provider); no proposal to
-			// audit or retry against. Fall through to the deterministic
-			// degrade.
+			// The call itself failed (network/provider): audited as failed
+			// with no proposal (there is none), then stop — a transport/API
+			// error is not a schema-correction case and is never retried
+			// within this attempt cycle.
+			c.recordDiscardedAttempt(ctx, claim, snap, AttemptStatusFailed, nil, sequence, now)
 			break
 		}
-		sequence++
 		var proposal model.Assessment
 		if jsonErr := json.Unmarshal(completion.Raw, &proposal); jsonErr != nil {
-			// Syntactically invalid output: audited as failed, then one
-			// corrective retry when budget remains.
 			c.recordDiscardedAttempt(ctx, claim, snap, AttemptStatusFailed, completion.Raw, sequence, now)
-			continue
+			if !haveValid && call+1 < c.cfg.MaxL2Calls {
+				// One corrective retry, only before any valid proposal
+				// exists to fall back on.
+				continue
+			}
+			break
 		}
 		validated, adjustments, valErr := ValidateAssessment(snap, proposal, now)
 		if valErr != nil {
 			// Policy rejection: audited as rejected, then reject outright —
-			// no prompt-around retry.
+			// no prompt-around retry, valid or not.
 			c.recordDiscardedAttempt(ctx, claim, snap, AttemptStatusRejected, completion.Raw, sequence, now)
 			break
 		}
+		if !haveValid && validated.Causality == model.CausalityContradicted && call+1 < c.cfg.MaxL2Calls {
+			// The first valid proposal still leaves a material contradiction
+			// unresolved: spend exactly one remaining call finalizing it
+			// against the same snapshot rather than committing it as-is.
+			haveValid, validValid, validAdj, validUsage, validSeq = true, validated, adjustments, modelUsageJSON(completion), sequence
+			continue
+		}
 		return c.commitAssessment(ctx, claim, snap, validated, adjustments, AssessmentActorLLM, sequence-1, now, modelUsageJSON(completion))
+	}
+	if haveValid {
+		// The finalize pass was not reached, failed, or was rejected: the
+		// first valid (if still contradicted) proposal stands rather than
+		// being discarded outright. validSeq — not the loop's now-advanced
+		// sequence — is this proposal's own attempt sequence number.
+		return c.commitAssessment(ctx, claim, snap, validValid, validAdj, AssessmentActorLLM, validSeq-1, now, validUsage)
 	}
 	return c.commitDeterministicDegraded(ctx, claim, snap, sequence, now)
 }

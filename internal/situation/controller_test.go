@@ -172,6 +172,27 @@ func (noopInvestigator) Investigate(_ context.Context, incidentID string) (Acute
 	return AcuteResult{IncidentID: incidentID, CompletedAt: time.Now().UTC()}, nil
 }
 
+// countingInvestigator completes immediately and counts how many times it
+// was dispatched — used to assert a duplicate concurrent dispatch never
+// happens.
+type countingInvestigator struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *countingInvestigator) Investigate(_ context.Context, incidentID string) (AcuteResult, error) {
+	c.mu.Lock()
+	c.calls++
+	c.mu.Unlock()
+	return AcuteResult{IncidentID: incidentID, CompletedAt: time.Now().UTC()}, nil
+}
+
+func (c *countingInvestigator) callCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
 // fakeAssessor returns queued completions in order, repeating the last one.
 type fakeAssessor struct {
 	mu          sync.Mutex
@@ -315,7 +336,8 @@ func validAssessmentCompletion(t *testing.T) llm.Completion {
 // TestCriticalPublishesBeforeL1Finishes verifies a deterministic urgent
 // floor commits its root Assessment without waiting on L1: Reconcile
 // returns even though the acute investigator never completes, and the B+
-// gate state is durably "planned" (dispatched, not blocking).
+// gate state is durably "running" (dispatched, in flight, not blocking
+// Reconcile).
 func TestCriticalPublishesBeforeL1Finishes(t *testing.T) {
 	blocking := blockingAcuteInvestigator()
 	t.Cleanup(func() { close(blocking.unblock); <-blocking.done })
@@ -325,7 +347,7 @@ func TestCriticalPublishesBeforeL1Finishes(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.assertRootIntentPersisted()
-	h.assertL1State(L1StatusPlanned)
+	h.assertL1State(L1StatusRunning)
 }
 
 // TestReconcileCommitsValidL2Proposal is the green-path control: a fresh
@@ -526,5 +548,177 @@ func TestReconcilePolicyRejectionNeverRetries(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("attempts = %+v, want a rejected attempt recording the policy violation", h.store.attempts)
+	}
+}
+
+// TestReconcileRecordsFailedAttemptOnTransportError verifies a raw
+// assessor.Complete error (network/provider failure, not a malformed or
+// policy-rejected response) is audited as a failed attempt with no
+// proposal, is never retried within the attempt cycle, and still ends in
+// the safe deterministic degraded commit.
+func TestReconcileRecordsFailedAttemptOnTransportError(t *testing.T) {
+	assessor := &fakeAssessor{err: errors.New("boom: provider unavailable")}
+	h := newControllerHarnessWithAssessor(t, noopInvestigator{}, assessor)
+	h.seedSituation("duration_outlier", 0)
+
+	if err := h.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if assessor.callCount() != 1 {
+		t.Fatalf("assessor calls = %d, want 1 (a transport error is never retried)", assessor.callCount())
+	}
+	if h.store.committedCount() != 1 {
+		t.Fatalf("committed transitions = %d, want 1 (deterministic degraded fallback)", h.store.committedCount())
+	}
+	found := false
+	for _, attempt := range h.store.attempts {
+		if attempt.Status == AttemptStatusFailed && attempt.Proposal == nil {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("attempts = %+v, want a failed attempt with no proposal recording the transport error", h.store.attempts)
+	}
+}
+
+// TestReconcileSkipsDuplicateL1DispatchWhileRunning verifies a second
+// reconciliation pass never dispatches a concurrent Investigate() for an
+// Incident whose acute investigation is already "running" — the async
+// goroutine deliberately outlives the lease-scoped Reconcile call that
+// started it, so a later pass must observe and respect that state.
+func TestReconcileSkipsDuplicateL1DispatchWhileRunning(t *testing.T) {
+	investigator := &countingInvestigator{}
+	h := newControllerHarness(t, investigator)
+	h.seedSituation("duration_outlier", 0)
+	if err := h.store.SetAnalysisState(context.Background(), AnalysisState{
+		IncidentID: harnessIncidentID, Status: L1StatusRunning, DecisionReason: "l1_attempt_completed", UpdatedAt: h.now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if investigator.callCount() != 0 {
+		t.Fatalf("investigator calls = %d, want 0 (an investigation is already running)", investigator.callCount())
+	}
+	h.assertL1State(L1StatusRunning)
+}
+
+// TestReconcileMarksL1ExhaustedAfterMaxAttempts verifies L1 stops being
+// re-planned forever once the Situation's own reconciliation attempt budget
+// for the unchanged input is exhausted — the same gate that parks L2 — and
+// is marked exhausted rather than left stuck at planned.
+func TestReconcileMarksL1ExhaustedAfterMaxAttempts(t *testing.T) {
+	investigator := &countingInvestigator{}
+	h := newControllerHarness(t, investigator)
+	h.seedSituation("duration_outlier", 5) // == default MaxAttemptsPerInput
+
+	if err := h.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if investigator.callCount() != 0 {
+		t.Fatalf("investigator calls = %d, want 0 (l1 attempt budget exhausted)", investigator.callCount())
+	}
+	h.assertL1State(L1StatusExhausted)
+}
+
+func contradictedInvestigateProposal(t *testing.T) model.Assessment {
+	t.Helper()
+	p := validInvestigateProposal(t)
+	p.Causality = model.CausalityContradicted
+	return p
+}
+
+func completionFor(t *testing.T, a model.Assessment) llm.Completion {
+	t.Helper()
+	raw, err := json.Marshal(a)
+	if err != nil {
+		t.Fatalf("marshal assessment: %v", err)
+	}
+	return llm.Completion{Raw: raw, Model: "fake-model"}
+}
+
+// TestReconcileFinalizePassResolvesContradiction verifies a first valid
+// proposal that leaves a material contradiction unresolved (Causality:
+// contradicted) earns exactly one finalize pass against the same snapshot,
+// and — when that pass resolves it — the finalize proposal is what commits.
+func TestReconcileFinalizePassResolvesContradiction(t *testing.T) {
+	assessor := &fakeAssessor{completions: []llm.Completion{
+		completionFor(t, contradictedInvestigateProposal(t)),
+		completionFor(t, validInvestigateProposal(t)), // correlated: resolves the contradiction
+	}}
+	h := newControllerHarnessWithAssessor(t, noopInvestigator{}, assessor)
+	h.seedSituation("duration_outlier", 0)
+
+	if err := h.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if assessor.callCount() != 2 {
+		t.Fatalf("assessor calls = %d, want 2 (one finalize pass)", assessor.callCount())
+	}
+	if h.store.committedCount() != 1 {
+		t.Fatalf("committed transitions = %d, want 1", h.store.committedCount())
+	}
+	tr := h.store.lastCommitted()
+	if tr.Assessment == nil || tr.Assessment.Causality != model.CausalityCorrelated {
+		t.Fatalf("committed causality = %+v, want correlated (the finalize pass's resolution)", tr.Assessment)
+	}
+}
+
+// TestReconcileFinalizePassKeepsFirstValidWhenSecondFails verifies that when
+// the one finalize pass a contradicted first proposal earns is itself
+// unusable (malformed here), the first valid — still contradicted —
+// proposal stands rather than being discarded, and the failed finalize
+// attempt is still audited.
+func TestReconcileFinalizePassKeepsFirstValidWhenSecondFails(t *testing.T) {
+	assessor := &fakeAssessor{completions: []llm.Completion{
+		completionFor(t, contradictedInvestigateProposal(t)),
+		{Raw: json.RawMessage(`not json`), Model: "fake-model"},
+	}}
+	h := newControllerHarnessWithAssessor(t, noopInvestigator{}, assessor)
+	h.seedSituation("duration_outlier", 0)
+
+	if err := h.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if assessor.callCount() != 2 {
+		t.Fatalf("assessor calls = %d, want 2 (the one permitted finalize pass)", assessor.callCount())
+	}
+	if h.store.committedCount() != 1 {
+		t.Fatalf("committed transitions = %d, want 1 (the first valid proposal stands)", h.store.committedCount())
+	}
+	tr := h.store.lastCommitted()
+	if tr.Assessment == nil || tr.Assessment.Causality != model.CausalityContradicted {
+		t.Fatalf("committed causality = %+v, want contradicted (finalize pass failed; first proposal stands)", tr.Assessment)
+	}
+	found := false
+	for _, attempt := range h.store.attempts {
+		if attempt.Status == AttemptStatusFailed {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("attempts = %+v, want the failed finalize pass audited", h.store.attempts)
+	}
+}
+
+// TestReconcileNoFinalizePassWhenFirstProposalUncontradicted verifies the
+// finalize pass is truly optional: a first valid proposal that does not
+// leave a material contradiction unresolved commits immediately, spending
+// only one call.
+func TestReconcileNoFinalizePassWhenFirstProposalUncontradicted(t *testing.T) {
+	assessor := &fakeAssessor{completions: []llm.Completion{completionFor(t, validInvestigateProposal(t))}}
+	h := newControllerHarnessWithAssessor(t, noopInvestigator{}, assessor)
+	h.seedSituation("duration_outlier", 0)
+
+	if err := h.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if assessor.callCount() != 1 {
+		t.Fatalf("assessor calls = %d, want 1 (no contradiction to finalize)", assessor.callCount())
+	}
+	if h.store.committedCount() != 1 {
+		t.Fatalf("committed transitions = %d, want 1", h.store.committedCount())
 	}
 }

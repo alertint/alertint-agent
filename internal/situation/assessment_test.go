@@ -75,6 +75,38 @@ func TestValidateAssessmentRejectsInventedReasonAndLifecycle(t *testing.T) {
 	}
 }
 
+// TestValidateAssessmentCanonicalizesReasonCodeAndEvidence verifies that a
+// real, eligible CandidateID does not license an arbitrary Code label or
+// fabricated EvidenceRefs riding along with it: both are always overwritten
+// from the matched candidate, never trusted verbatim from the proposal. Only
+// free-text Summary is the model's to author.
+func TestValidateAssessmentCanonicalizesReasonCodeAndEvidence(t *testing.T) {
+	snap, reason := investigateSnapshotWithDurationOutlier(t)
+	now := mustTime(t, "2026-08-20T10:00:00Z")
+	p := validInvestigateProposal(t)
+	p.SufficientReason.Code = "novel_symptom"                     // fabricated: real ID, wrong code
+	p.SufficientReason.EvidenceRefs = []string{"fact:fabricated"} // fabricated evidence
+
+	out, _, err := ValidateAssessment(snap, p, now)
+	if err != nil {
+		t.Fatalf("ValidateAssessment: %v", err)
+	}
+	if out.SufficientReason == nil {
+		t.Fatal("sufficient reason is nil")
+	}
+	if out.SufficientReason.Code != reason.Code {
+		t.Fatalf("code = %q, want canonical %q", out.SufficientReason.Code, reason.Code)
+	}
+	if len(out.SufficientReason.EvidenceRefs) != len(reason.EvidenceRefs) {
+		t.Fatalf("evidence refs = %v, want canonical %v", out.SufficientReason.EvidenceRefs, reason.EvidenceRefs)
+	}
+	for i, ref := range reason.EvidenceRefs {
+		if out.SufficientReason.EvidenceRefs[i] != ref {
+			t.Fatalf("evidence refs = %v, want canonical %v", out.SufficientReason.EvidenceRefs, reason.EvidenceRefs)
+		}
+	}
+}
+
 // TestValidateAssessmentAcceptsValidInvestigateProposal is the green-path
 // control: a proposal that cites a genuinely eligible reason and a
 // consistent action contract validates without adjustment or error.
