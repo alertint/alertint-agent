@@ -87,7 +87,7 @@ func (s *Skill) replayIncidentWith(ctx context.Context, inc store.Incident, aler
 		return nil
 	}
 
-	if err := rs.pipeline(ctx, inc, alerts, pipelineParams{
+	if _, err := rs.pipeline(ctx, inc, alerts, pipelineParams{
 		spanStart: inc.FirstAlertAt,
 		persist:   persist,
 		replay:    run,

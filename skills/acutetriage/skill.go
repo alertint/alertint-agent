@@ -29,6 +29,17 @@ type LLMClient interface {
 	Complete(ctx context.Context, system string, prompt llm.Prompt, requiredKeys []string) (llm.Completion, error)
 }
 
+// SituationInputAppender is the narrow seam through which a persisted
+// Incident effect (an operator annotation or verdict capture) reaches the
+// Situation controller as durable evidence — never as a direct Slack effect
+// (D2). incidentID names the Incident whose owning Situation should become
+// due for reconciliation; occurredAt is the canonical UTC instant of the
+// effect. A failure is best-effort: it must never fail the write that
+// already landed.
+type SituationInputAppender interface {
+	AppendSituationInput(ctx context.Context, incidentID string, occurredAt time.Time) error
+}
+
 // Config holds skill tunables.
 type Config struct {
 	// WindowSeconds is forwarded into the evidence pack for context.
@@ -100,6 +111,14 @@ type Config struct {
 	// call. The zero value (Enabled=false) is the kill switch: one call, no round,
 	// prompt byte-identical to the pre-feature triage.
 	Verification VerificationParams
+	// Situations lets a persisted Incident annotation or verdict capture make
+	// the owning Situation due for reconciliation (D2/architecture:
+	// `internal/situation` is the sole L2 aggregate and Slack authority, so
+	// an operator write-back must reach it as evidence, not as a direct
+	// Incident-thread Slack effect). nil = no Situation wiring yet (the
+	// consumer owns the field it reads; runtime cutover is Task 13). Pass a
+	// TRUE nil interface when unconfigured to avoid the typed-nil trap.
+	Situations SituationInputAppender
 	// PromptCaching marks whether the wired LLM provider supports
 	// client-side prompt caching (anthropic: yes; openai-compatible: no —
 	// SGLang/vLLM prefix-cache server-side instead). Gates both the
@@ -113,26 +132,29 @@ type Config struct {
 // Skill orchestrates the full acute-triage pipeline for a single ready
 // incident: load → build evidence → call LLM → persist → notify → audit.
 type Skill struct {
-	cfg      Config
-	st       *store.Store
-	llm      LLMClient
-	auditor  *audit.Auditor
-	notifier notify.Notifier
-	logger   *slog.Logger
+	cfg        Config
+	st         *store.Store
+	llm        LLMClient
+	auditor    *audit.Auditor
+	notifier   notify.Notifier
+	situations SituationInputAppender
+	logger     *slog.Logger
 }
 
 // New constructs a Skill. notifier may be nil (notifications skipped).
+// cfg.Situations may be nil (no Situation wiring yet).
 func New(cfg Config, st *store.Store, llmClient LLMClient, auditor *audit.Auditor, notifier notify.Notifier, logger *slog.Logger) *Skill {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Skill{
-		cfg:      cfg,
-		st:       st,
-		llm:      llmClient,
-		auditor:  auditor,
-		notifier: notifier,
-		logger:   logger,
+		cfg:        cfg,
+		st:         st,
+		llm:        llmClient,
+		auditor:    auditor,
+		notifier:   notifier,
+		situations: cfg.Situations,
+		logger:     logger,
 	}
 }
 
@@ -241,10 +263,11 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 		return nil
 	}
 
-	return s.pipeline(ctx, inc, alerts, pipelineParams{
+	_, err = s.pipeline(ctx, inc, alerts, pipelineParams{
 		spanStart: inc.FirstAlertAt,
 		persist:   s.st.SaveIncidentOutput,
 	})
+	return err
 }
 
 // Rejudge re-runs the full triage pipeline for an already-judged incident and
@@ -267,7 +290,7 @@ func (s *Skill) Rejudge(ctx context.Context, inc store.Incident, trigger string)
 	}
 
 	spanStart, recurrence, stats := s.buildRecurrenceContext(ctx, inc, trigger)
-	return s.pipeline(ctx, inc, alerts, pipelineParams{
+	_, err = s.pipeline(ctx, inc, alerts, pipelineParams{
 		rejudge:            true,
 		trigger:            trigger,
 		spanStart:          spanStart,
@@ -276,11 +299,85 @@ func (s *Skill) Rejudge(ctx context.Context, inc store.Incident, trigger string)
 		recurrenceEpisodes: stats.Episodes(),
 		recurrenceLastSeen: stats.LastSeen,
 	})
+	return err
+}
+
+// Result is the persisted acute-triage finding returned by Investigate. It
+// carries no prose beyond what the Situation controller's B+ gate and L2
+// Assessment prompt need — richer Incident-card fields (severity,
+// correlation findings, recurrence, steering) stay internal to the legacy
+// notify.Finding path used by Run/Rejudge until the Task 13 cutover.
+type Result struct {
+	IncidentID     string
+	OutputJSON     json.RawMessage
+	Summary        string
+	RootCause      string
+	Confidence     float64
+	EnrichmentJSON string
+	CompletedAt    time.Time
+}
+
+// ErrInvestigationSkipped means the Incident has too few member alerts for a
+// bounded acute investigation (the same MinAlerts floor Run applies). The
+// caller (the Situation controller's B+ gate) records no attempt for it.
+var ErrInvestigationSkipped = errors.New("acutetriage: investigation skipped: below minimum alert threshold")
+
+// Investigate runs the bounded acute-triage pipeline for one Incident and
+// returns the persisted finding as evidence, never as a notification: D2/B+
+// gives L1 no Attention or Slack authority, only the Situation controller's
+// validated L2 Assessment does. It runs the shared pipeline on an internally
+// silenced copy of the Skill (the same shallow-copy technique
+// replayIncidentWith uses) so the pipeline's own notify step — still
+// required, unchanged, by the legacy Run/Rejudge entrypoints that back
+// `serve` until the Task 13 hard cutover — never fires here.
+func (s *Skill) Investigate(ctx context.Context, inc store.Incident) (Result, error) {
+	s.logger.Info("acute investigation started", "incident", inc.ID, "alerts", inc.AlertCount)
+
+	alerts, err := s.st.GetIncidentAlerts(ctx, inc.ID)
+	if err != nil {
+		return Result{}, fmt.Errorf("acutetriage: investigate: load alerts: %w", err)
+	}
+	if len(alerts) == 0 {
+		s.logger.Warn("acutetriage: investigate: incident has no member alerts; skipping", "incident_id", inc.ID)
+		return Result{}, ErrInvestigationSkipped
+	}
+	minAlerts := s.cfg.MinAlerts
+	if minAlerts <= 0 {
+		minAlerts = 1
+	}
+	if len(alerts) < minAlerts {
+		return Result{}, ErrInvestigationSkipped
+	}
+
+	spanStart := inc.FirstAlertAt
+	recurrence := ""
+	reassessment := inc.Status == "analyzed" || inc.Status == "resolved"
+	persist := s.st.SaveIncidentOutput
+	trigger := ""
+	if reassessment {
+		trigger = "b_plus_reassessment"
+		var stats store.OccurrenceStats
+		spanStart, recurrence, stats = s.buildRecurrenceContext(ctx, inc, trigger)
+		_ = stats // recurrence episode/last-seen counters feed notify.Finding only, unused here
+		persist = s.st.ReplaceIncidentOutput
+	}
+
+	quiet := *s // shallow copy: same store/llm/cfg, notify stripped (mirrors replayIncidentWith)
+	quiet.notifier = nil
+	return quiet.pipeline(ctx, inc, alerts, pipelineParams{
+		rejudge: reassessment, trigger: trigger, spanStart: spanStart,
+		recurrence: recurrence, persist: persist,
+	})
 }
 
 // pipeline is the shared triage core: rules → evidence → LLM → persist → notify
-// → audit. p selects the initial-triage vs re-judgment differences.
-func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store.Alert, p pipelineParams) error {
+// → audit. p selects the initial-triage vs re-judgment differences. It
+// returns the persisted Result so a notifier-free caller (Investigate) can
+// consume the finding without any Slack effect; Run/Rejudge discard it and
+// keep their own byte-identical notify behavior (the `s.notifier` block
+// below still fires for them — Investigate calls this on a copy with
+// notifier stripped, mirroring the existing hermetic-replay pattern).
+func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store.Alert, p pipelineParams) (Result, error) {
 	start := time.Now()
 
 	// Evaluate the rule engine: it may pick a specialized analysis template or
@@ -299,7 +396,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	pack := BuildEvidencePack(inc, alerts, s.cfg.WindowSeconds)
 	packJSON, err := json.Marshal(pack)
 	if err != nil {
-		return fmt.Errorf("acutetriage: marshal evidence pack: %w", err)
+		return Result{}, fmt.Errorf("acutetriage: marshal evidence pack: %w", err)
 	}
 
 	if s.auditor != nil {
@@ -315,12 +412,12 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	// (on a re-judgment) the recurrence context prepended.
 	ar, err := s.analysis(ctx, inc, alerts, decision, pack, packJSON, p.spanStart, p.recurrence, p.replay)
 	if err != nil {
-		return err
+		return Result{}, err
 	}
 
 	var resp llmResponse
 	if err := json.Unmarshal(ar.raw, &resp); err != nil {
-		return fmt.Errorf("acutetriage: parse llm response: %w", err)
+		return Result{}, fmt.Errorf("acutetriage: parse llm response: %w", err)
 	}
 	clampConfidence(&resp.Confidence)
 
@@ -356,9 +453,9 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		if errors.Is(err, store.ErrNotFound) {
 			s.logger.Warn("acutetriage: incident not in a persistable state; finding dropped",
 				"incident_id", inc.ID, "rejudge", p.rejudge)
-			return nil
+			return Result{}, nil
 		}
-		return fmt.Errorf("acutetriage: save output: %w", err)
+		return Result{}, fmt.Errorf("acutetriage: save output: %w", err)
 	}
 
 	// Update per-alert roles. Skipped during a hermetic replay (p.replay != nil):
@@ -465,7 +562,15 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		"rejudge", p.rejudge,
 		"dur", time.Since(start),
 	)
-	return nil
+	return Result{
+		IncidentID:     inc.ID,
+		OutputJSON:     finalRaw,
+		Summary:        resp.AnalysisName,
+		RootCause:      resp.OverallIssue,
+		Confidence:     resp.Confidence,
+		EnrichmentJSON: enrichmentJSON,
+		CompletedAt:    time.Now().UTC(),
+	}, nil
 }
 
 // attachHistorySteering populates f.History and f.Steering (Task 9, R13/D9,

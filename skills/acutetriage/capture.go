@@ -71,7 +71,23 @@ func (e *CaptureEngine) Annotate(ctx context.Context, req AnnotateRequest) (*Ann
 		}
 	}
 	e.notifyAnnotation(ctx, inc, req.Kind, req.Note, 0)
+	e.appendSituationInput(ctx, req.IncidentID)
 	return &AnnotateResult{AnnotationID: ann.ID, Demoted: false}, nil
+}
+
+// appendSituationInput makes the Incident's owning Situation due for
+// reconciliation after a persisted annotation or verdict capture, so the
+// controller's own L2 Assessment — not this legacy write-back path — decides
+// whether and how to reflect it outward. Best-effort and nil-safe: a
+// Situation-input failure never fails a capture that already landed, and it
+// is a no-op until the Situation controller is wired (Task 13 cutover).
+func (e *CaptureEngine) appendSituationInput(ctx context.Context, incidentID string) {
+	if e.sk.situations == nil {
+		return
+	}
+	if err := e.sk.situations.AppendSituationInput(ctx, incidentID, time.Now().UTC()); err != nil {
+		e.sk.logger.Warn("acutetriage: append situation input failed", "incident_id", incidentID, "err", err)
+	}
 }
 
 // notifyAnnotation fans the event out when the notifier supports it.
@@ -220,6 +236,7 @@ func (e *CaptureEngine) persistCapture(ctx context.Context, req CaptureRequest, 
 		}
 	}
 	e.notifyAnnotation(ctx, inc, req.Verdict, note, v.Version)
+	e.appendSituationInput(ctx, req.IncidentID)
 	return v, warnings, nil
 }
 

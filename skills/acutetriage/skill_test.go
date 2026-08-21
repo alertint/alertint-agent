@@ -1239,3 +1239,150 @@ func TestRejudgeDoesNotDowngradePreviouslyItemizedRole(t *testing.T) {
 		t.Errorf("a2 role = %q, want primary (must not be downgraded by omission on re-judgment)", roles[a2.ID])
 	}
 }
+
+// --------------------------------------------------------------------------
+// Investigate (Task 8: B+ refactor — L1 returns evidence, owns no Slack)
+// --------------------------------------------------------------------------
+
+// recordingNotifier counts Notify calls so a test can assert Investigate
+// never triggers the legacy Incident-thread fan-out, while Run still does.
+type recordingNotifier struct{ calls int }
+
+func (n *recordingNotifier) Name() string { return "recording" }
+func (n *recordingNotifier) Notify(context.Context, notify.Finding) error {
+	n.calls++
+	return nil
+}
+
+// TestInvestigatePersistsResultWithoutNotifying verifies Investigate persists
+// the finding (output_json/summary/root_cause/confidence, status=analyzed)
+// and returns a matching Result, but never calls the notifier — L1 evidence
+// carries no Slack authority (D2/B+).
+func TestInvestigatePersistsResultWithoutNotifying(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	a1 := insertTestAlert(t, st, ctx, inc.ID, "fp-inv1", map[string]string{"alertname": "DiskFull", "host": "web1"})
+	a2 := insertTestAlert(t, st, ctx, inc.ID, "fp-inv2", map[string]string{"alertname": "DiskFull", "host": "web1"})
+
+	fllm := &fakeLLM{response: validLLMResponse([]string{a1.ID, a2.ID})}
+	rec := &recordingNotifier{}
+	skill := acutetriage.New(acutetriage.Config{WindowSeconds: 60}, st, fllm, nil, rec, nil)
+
+	res, err := skill.Investigate(ctx, inc)
+	if err != nil {
+		t.Fatalf("Investigate: %v", err)
+	}
+	if res.IncidentID != inc.ID {
+		t.Errorf("IncidentID = %q, want %q", res.IncidentID, inc.ID)
+	}
+	if res.Summary != "DiskFull on web1" {
+		t.Errorf("Summary = %q", res.Summary)
+	}
+	if res.RootCause != "Disk utilisation reached 95% on web1" {
+		t.Errorf("RootCause = %q", res.RootCause)
+	}
+	if len(res.OutputJSON) == 0 || !json.Valid(res.OutputJSON) {
+		t.Errorf("OutputJSON invalid: %s", res.OutputJSON)
+	}
+	if res.CompletedAt.IsZero() {
+		t.Error("CompletedAt is zero")
+	}
+	if rec.calls != 0 {
+		t.Errorf("notifier.Notify called %d times, want 0 — Investigate must own no Slack", rec.calls)
+	}
+
+	var status, summary string
+	if err := st.DB().QueryRowContext(ctx, `SELECT status, summary FROM incidents WHERE id = ?`, inc.ID).Scan(&status, &summary); err != nil {
+		t.Fatalf("scan incident: %v", err)
+	}
+	if status != "analyzed" {
+		t.Errorf("status = %q, want analyzed", status)
+	}
+	if summary != res.Summary {
+		t.Errorf("persisted summary = %q, want %q", summary, res.Summary)
+	}
+}
+
+// TestInvestigateSkipsBelowMinAlerts verifies Investigate reports
+// ErrInvestigationSkipped (not a hard failure) when the Incident has fewer
+// member alerts than the configured floor, mirroring Run's gate.
+func TestInvestigateSkipsBelowMinAlerts(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	a1 := insertTestAlert(t, st, ctx, inc.ID, "fp-skip1", map[string]string{"alertname": "DiskFull"})
+	_ = a1
+
+	fllm := &fakeLLM{response: validLLMResponse([]string{a1.ID})}
+	skill := acutetriage.New(acutetriage.Config{MinAlerts: 2}, st, fllm, nil, nil, nil)
+
+	_, err := skill.Investigate(ctx, inc)
+	if !errors.Is(err, acutetriage.ErrInvestigationSkipped) {
+		t.Fatalf("Investigate error = %v, want ErrInvestigationSkipped", err)
+	}
+	if fllm.calls != 0 {
+		t.Errorf("llm called %d times, want 0 on a skipped investigation", fllm.calls)
+	}
+}
+
+// TestInvestigateReassessesAnalyzedIncident verifies a second Investigate
+// call on an already-analyzed Incident (the B+ re-request path) replaces the
+// finding in place via ReplaceIncidentOutput rather than requiring the
+// ready/processing status SaveIncidentOutput demands.
+func TestInvestigateReassessesAnalyzedIncident(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	a1 := insertTestAlert(t, st, ctx, inc.ID, "fp-re1", map[string]string{"alertname": "DiskFull"})
+	a2 := insertTestAlert(t, st, ctx, inc.ID, "fp-re2", map[string]string{"alertname": "DiskFull"})
+
+	fllm := &fakeLLM{response: validLLMResponse([]string{a1.ID, a2.ID})}
+	skill := acutetriage.New(acutetriage.Config{WindowSeconds: 60}, st, fllm, nil, nil, nil)
+
+	if _, err := skill.Investigate(ctx, inc); err != nil {
+		t.Fatalf("first Investigate: %v", err)
+	}
+	analyzed, err := st.GetIncidentByID(ctx, inc.ID)
+	if err != nil || analyzed == nil {
+		t.Fatalf("reload analyzed incident: %v", err)
+	}
+
+	fllm.response = namedLLMResponse("DiskFull, revisited", "still full", []string{a1.ID, a2.ID}, 0.8)
+	res, err := skill.Investigate(ctx, *analyzed)
+	if err != nil {
+		t.Fatalf("second Investigate: %v", err)
+	}
+	if res.Summary != "DiskFull, revisited" {
+		t.Errorf("Summary = %q, want the replaced finding", res.Summary)
+	}
+	var summary string
+	if err := st.DB().QueryRowContext(ctx, `SELECT summary FROM incidents WHERE id = ?`, inc.ID).Scan(&summary); err != nil {
+		t.Fatalf("scan incident: %v", err)
+	}
+	if summary != "DiskFull, revisited" {
+		t.Errorf("persisted summary = %q, want replaced", summary)
+	}
+}
+
+// TestRunStillNotifies is the control: Run (the legacy Incident-Slack path
+// still wired to `serve` until the Task 13 cutover) must keep notifying
+// exactly as before — the notify.Notifier field was not removed from the
+// Skill, only bypassed for Investigate.
+func TestRunStillNotifies(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	a1 := insertTestAlert(t, st, ctx, inc.ID, "fp-run-notify", map[string]string{"alertname": "DiskFull"})
+
+	fllm := &fakeLLM{response: validLLMResponse([]string{a1.ID})}
+	rec := &recordingNotifier{}
+	skill := acutetriage.New(acutetriage.Config{}, st, fllm, nil, rec, nil)
+
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if rec.calls != 1 {
+		t.Errorf("notifier.Notify called %d times, want 1", rec.calls)
+	}
+}

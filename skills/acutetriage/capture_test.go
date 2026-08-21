@@ -131,6 +131,42 @@ func TestAnnotate_CorrectionAuditsNotifiesNoDemote(t *testing.T) {
 	}
 }
 
+// fakeSituationInputAppender records AppendSituationInput calls so a test can
+// assert the Situation controller was made aware of an annotation/verdict
+// without any Slack effect (Task 8).
+type fakeSituationInputAppender struct {
+	incidentIDs []string
+}
+
+func (f *fakeSituationInputAppender) AppendSituationInput(_ context.Context, incidentID string, _ time.Time) error {
+	f.incidentIDs = append(f.incidentIDs, incidentID)
+	return nil
+}
+
+// TestAnnotate_AppendsSituationInput verifies an annotation makes the owning
+// Situation due for reconciliation (via the SituationInputAppender seam)
+// alongside — not instead of — the existing legacy annotation fan-out, which
+// stays wired to `serve` until the Task 13 cutover.
+func TestAnnotate_AppendsSituationInput(t *testing.T) {
+	st := newTestStore(t)
+	inc := seedAnalyzedIncidentOnKey(t, st)
+	sink := &fakeAnnotationSink{}
+	situations := &fakeSituationInputAppender{}
+	cfg := acutetriage.Config{MinAlerts: 1, Situations: situations}
+	skill := acutetriage.New(cfg, st, &fakeLLM{}, audit.New(st.DB()), notify.NewMulti(nil, sink), slog.Default())
+	eng := acutetriage.NewCaptureEngine(skill)
+	ctx := context.Background()
+
+	if _, err := eng.Annotate(ctx, acutetriage.AnnotateRequest{
+		IncidentID: inc.ID, Kind: "observation", Note: "worth watching",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(situations.incidentIDs) != 1 || situations.incidentIDs[0] != inc.ID {
+		t.Fatalf("situations.incidentIDs = %v, want [%s]", situations.incidentIDs, inc.ID)
+	}
+}
+
 // readRefuteMarks reads memory_refute_marks for an incident — used to assert
 // annotate (D7) never touches the marks floor.
 func readRefuteMarks(t *testing.T, st *store.Store, ctx context.Context, incidentID string) int {
