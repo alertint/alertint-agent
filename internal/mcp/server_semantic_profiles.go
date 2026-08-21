@@ -116,6 +116,9 @@ func (s *Server) handleSemanticProfileCorrect(ctx context.Context, req mcplib.Ca
 	if correction.ExpectedVersion < 0 {
 		return errResult("expected_version is required"), nil
 	}
+	if errRes := requireConfirmation(correction.Confirmed, correction.ConfirmedBy); errRes != nil {
+		return errRes, nil
+	}
 	v, err := s.cfg.SituationCommands.CorrectSemanticProfile(ctx, correction)
 	if err != nil {
 		return errResult("failed to correct semantic profile: " + err.Error()), nil

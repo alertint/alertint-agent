@@ -275,3 +275,74 @@ func TestHandleSituationJudgmentRecordRequiresSituation(t *testing.T) {
 		t.Fatal("expected an error result for a missing situation")
 	}
 }
+
+func TestHandleSituationJudgmentRecordRejectsUnconfirmed(t *testing.T) {
+	fake := &fakeSituationCommands{judgment: &model.Judgment{ID: "j1"}}
+	st := newMCPStore(t)
+	s := NewServer(Config{SituationCommands: fake}, st, audit.New(st.DB()))
+
+	res, err := s.handleSituationJudgmentRecord(context.Background(), reqWith(map[string]any{
+		"situation": "sit-1", "judgment": "expected_this_episode", "basis": "operator_knowledge",
+		"operator_confirmed": false, "confirmed_by": "janis",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError {
+		t.Fatal("expected an error result for operator_confirmed=false")
+	}
+	if fake.lastJudgmentReq.Situation != "" {
+		t.Fatalf("command must not be called on an unconfirmed request, got %+v", fake.lastJudgmentReq)
+	}
+}
+
+func TestHandleSituationJudgmentRecordRejectsMissingConfirmedBy(t *testing.T) {
+	fake := &fakeSituationCommands{judgment: &model.Judgment{ID: "j1"}}
+	st := newMCPStore(t)
+	s := NewServer(Config{SituationCommands: fake}, st, audit.New(st.DB()))
+
+	res, err := s.handleSituationJudgmentRecord(context.Background(), reqWith(map[string]any{
+		"situation": "sit-1", "judgment": "expected_this_episode", "basis": "operator_knowledge",
+		"operator_confirmed": true, "confirmed_by": "",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError {
+		t.Fatal("expected an error result for an empty confirmed_by")
+	}
+	if fake.lastJudgmentReq.Situation != "" {
+		t.Fatalf("command must not be called without asserted attribution, got %+v", fake.lastJudgmentReq)
+	}
+}
+
+func TestHandleSituationJudgmentRecordRejectsInvalidJudgmentAndBasisEnums(t *testing.T) {
+	fake := &fakeSituationCommands{judgment: &model.Judgment{ID: "j1"}}
+	st := newMCPStore(t)
+	s := NewServer(Config{SituationCommands: fake}, st, audit.New(st.DB()))
+
+	res, err := s.handleSituationJudgmentRecord(context.Background(), reqWith(map[string]any{
+		"situation": "sit-1", "judgment": "definitely_bad", "basis": "operator_knowledge",
+		"operator_confirmed": true, "confirmed_by": "janis",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError {
+		t.Fatal("expected an error result for an invalid judgment enum value")
+	}
+
+	res, err = s.handleSituationJudgmentRecord(context.Background(), reqWith(map[string]any{
+		"situation": "sit-1", "judgment": "expected_this_episode", "basis": "gut_feeling",
+		"operator_confirmed": true, "confirmed_by": "janis",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError {
+		t.Fatal("expected an error result for an invalid basis enum value")
+	}
+	if fake.lastJudgmentReq.Situation != "" {
+		t.Fatalf("command must not be called for an invalid enum, got %+v", fake.lastJudgmentReq)
+	}
+}

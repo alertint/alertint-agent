@@ -124,3 +124,65 @@ func TestHandleExpectedBehaviorRevokeRequiresReason(t *testing.T) {
 		t.Fatal("expected an error result for a missing reason")
 	}
 }
+
+func TestHandleExpectedBehaviorConfirmRejectsUnconfirmedOrMissingAttribution(t *testing.T) {
+	fake := &fakeSituationCommands{envelopeConfirm: &model.EnvelopeVersion{EnvelopeID: "env-1", Version: 1}}
+	st := newMCPStore(t)
+	s := NewServer(Config{SituationCommands: fake}, st, audit.New(st.DB()))
+
+	confirmArgs := map[string]any{
+		"source_judgment_id": "j-1", "expected_current_version": 0,
+		"scope":         map[string]any{"group_key": "host=db-1"},
+		"review_due_at": "2026-11-20T00:00:00Z",
+	}
+
+	unconfirmed := map[string]any{}
+	for k, v := range confirmArgs {
+		unconfirmed[k] = v
+	}
+	unconfirmed["operator_confirmed"] = false
+	unconfirmed["confirmed_by"] = "janis"
+	if res, err := s.handleExpectedBehaviorConfirm(context.Background(), reqWith(unconfirmed)); err != nil || !res.IsError {
+		t.Fatalf("expected an error result for operator_confirmed=false, err=%v", err)
+	}
+
+	missingAttribution := map[string]any{}
+	for k, v := range confirmArgs {
+		missingAttribution[k] = v
+	}
+	missingAttribution["operator_confirmed"] = true
+	missingAttribution["confirmed_by"] = ""
+	if res, err := s.handleExpectedBehaviorConfirm(context.Background(), reqWith(missingAttribution)); err != nil || !res.IsError {
+		t.Fatalf("expected an error result for empty confirmed_by, err=%v", err)
+	}
+
+	if fake.lastConfirm.SourceJudgmentID != "" {
+		t.Fatalf("ConfirmEnvelope must not be called without valid confirmation, got %+v", fake.lastConfirm)
+	}
+}
+
+func TestHandleExpectedBehaviorRevokeRejectsUnconfirmedOrMissingAttribution(t *testing.T) {
+	fake := &fakeSituationCommands{envelopeRevoke: &model.EnvelopeVersion{EnvelopeID: "env-1", Version: 2}}
+	st := newMCPStore(t)
+	s := NewServer(Config{SituationCommands: fake}, st, audit.New(st.DB()))
+
+	res, err := s.handleExpectedBehaviorRevoke(context.Background(), reqWith(map[string]any{
+		"envelope_id": "env-1", "expected_current_version": 1, "reason": "trigger retired",
+		"operator_confirmed": false, "confirmed_by": "janis",
+	}))
+	if err != nil || !res.IsError {
+		t.Fatalf("expected an error result for operator_confirmed=false, err=%v", err)
+	}
+
+	res, err = s.handleExpectedBehaviorRevoke(context.Background(), reqWith(map[string]any{
+		"envelope_id": "env-1", "expected_current_version": 1, "reason": "trigger retired",
+		"operator_confirmed": true, "confirmed_by": "",
+	}))
+	if err != nil || !res.IsError {
+		t.Fatalf("expected an error result for empty confirmed_by, err=%v", err)
+	}
+
+	if fake.lastRevoke.EnvelopeID != "" {
+		t.Fatalf("RevokeEnvelope must not be called without valid confirmation, got %+v", fake.lastRevoke)
+	}
+}

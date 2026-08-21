@@ -79,6 +79,9 @@ func (s *Server) handleExpectedBehaviorConfirm(ctx context.Context, req mcplib.C
 	if confirmation.ExpectedCurrentVersion < 0 {
 		return errResult("expected_current_version is required"), nil
 	}
+	if errRes := requireConfirmation(confirmation.OperatorConfirmed, confirmation.ConfirmedBy); errRes != nil {
+		return errRes, nil
+	}
 	if err := decodeArgument(req, "scope", &confirmation.Scope); err != nil {
 		return errResult("invalid scope: " + err.Error()), nil
 	}
@@ -121,6 +124,9 @@ func (s *Server) handleExpectedBehaviorRevoke(ctx context.Context, req mcplib.Ca
 	}
 	if revocation.Reason == "" {
 		return errResult("reason is required"), nil
+	}
+	if errRes := requireConfirmation(revocation.OperatorConfirmed, revocation.ConfirmedBy); errRes != nil {
+		return errRes, nil
 	}
 	v, err := s.cfg.SituationCommands.RevokeEnvelope(ctx, revocation)
 	if err != nil {

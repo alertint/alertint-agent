@@ -147,3 +147,32 @@ func TestHandleSemanticProfileCorrectRequiresSignature(t *testing.T) {
 		t.Fatal("expected an error result for a missing signature")
 	}
 }
+
+func TestHandleSemanticProfileCorrectRejectsUnconfirmedOrMissingAttribution(t *testing.T) {
+	fake := &fakeSituationCommands{profileVersion: &profilemodel.ProfileVersion{ID: "profile-3", SignatureKey: "sig-1"}}
+	st := newMCPStore(t)
+	s := NewServer(Config{SituationCommands: fake}, st, audit.New(st.DB()))
+	profile := map[string]any{
+		"signature": "sig-1", "subject_kind": "database_host", "event_kind": "resource_saturation",
+		"possible_role": "symptom", "candidate_scope": []any{"host"}, "horizon_tier": "hours",
+		"useful_capabilities": []any{"zabbix_metric_range"}, "uncertainty": []any{"workload unknown"},
+	}
+
+	res, err := s.handleSemanticProfileCorrect(context.Background(), reqWith(map[string]any{
+		"signature": "sig-1", "expected_version": 1, "profile": profile, "confirmed": false, "confirmed_by": "janis",
+	}))
+	if err != nil || !res.IsError {
+		t.Fatalf("expected an error result for confirmed=false, err=%v", err)
+	}
+
+	res, err = s.handleSemanticProfileCorrect(context.Background(), reqWith(map[string]any{
+		"signature": "sig-1", "expected_version": 1, "profile": profile, "confirmed": true, "confirmed_by": "",
+	}))
+	if err != nil || !res.IsError {
+		t.Fatalf("expected an error result for empty confirmed_by, err=%v", err)
+	}
+
+	if fake.lastCorrection.Signature != "" {
+		t.Fatalf("CorrectSemanticProfile must not be called without valid confirmation, got %+v", fake.lastCorrection)
+	}
+}

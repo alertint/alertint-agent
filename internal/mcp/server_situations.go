@@ -139,6 +139,43 @@ func jsonResult(v any) (*mcplib.CallToolResult, error) {
 	return result, nil
 }
 
+// requireConfirmation enforces every policy/profile write's explicit
+// confirmation and asserted attribution (brief: "Require confirmation and
+// asserted attribution for every policy/profile write"). mcp-go's
+// input-schema validation is not enabled on this server (NewMCPServer is
+// constructed without WithInputSchemaValidation), so mcplib.Required() is
+// schema metadata only, never enforced at the transport layer — every write
+// handler must check confirmation/attribution itself, exactly like every
+// other required field it already validates manually. Returns nil when the
+// confirmation is valid.
+func requireConfirmation(confirmed bool, confirmedBy string) *mcplib.CallToolResult {
+	if !confirmed {
+		return errResult("explicit confirmation is required (the confirmation flag must be true)")
+	}
+	if strings.TrimSpace(confirmedBy) == "" {
+		return errResult("confirmed_by (asserted operator identity) is required")
+	}
+	return nil
+}
+
+func validJudgmentKind(k model.JudgmentKind) bool {
+	switch k {
+	case model.JudgmentExpectedThisEpisode, model.JudgmentUnexpected, model.JudgmentInconclusive:
+		return true
+	default:
+		return false
+	}
+}
+
+func validJudgmentBasis(b model.JudgmentBasis) bool {
+	switch b {
+	case model.JudgmentBasisOperatorKnowledge, model.JudgmentBasisAlertintEvidence:
+		return true
+	default:
+		return false
+	}
+}
+
 type situationListRow struct {
 	ID                  string     `json:"id"`
 	PreviousSituationID *string    `json:"previous_situation_id,omitempty"`
@@ -411,6 +448,15 @@ func (s *Server) handleSituationJudgmentRecord(ctx context.Context, req mcplib.C
 	}
 	if strings.TrimSpace(jr.Situation) == "" {
 		return errResult("situation is required"), nil
+	}
+	if !validJudgmentKind(jr.Judgment) {
+		return errResult("judgment must be one of expected_this_episode, unexpected, inconclusive"), nil
+	}
+	if !validJudgmentBasis(jr.Basis) {
+		return errResult("basis must be one of operator_knowledge, alertint_evidence"), nil
+	}
+	if errRes := requireConfirmation(jr.OperatorConfirmed, jr.ConfirmedBy); errRes != nil {
+		return errRes, nil
 	}
 	if workload := mcplib.ParseString(req, "workload", ""); workload != "" {
 		jr.Workload = &workload
