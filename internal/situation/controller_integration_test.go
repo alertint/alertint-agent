@@ -59,8 +59,17 @@ func crashAt(target string) func(name string) error {
 // it (a real process restart would do no less and no more), resumes
 // ordinary operation to quiescence, and asserts the exactly-once durability
 // invariants: no lost accepted delivery, no duplicate ownership, no
-// duplicate input version, no duplicate root, no reopened terminal
-// Situation, and no missing durable intent.
+// duplicate input version, no duplicate root, and no missing durable intent.
+//
+// This suite's single fixed scenario (one critical delivery, escalate,
+// never resolve) never reaches a terminal lifecycle, so it asserts only that
+// the Situation stays exactly where this scenario always drives it (active)
+// — it is not, and must not be read as, coverage for "a terminal Situation
+// never reopens". That property has its own dedicated coverage in
+// TestTerminalSituationNeverReopens below, which drives a real Situation to
+// closed_unknown and then exercises the three places a reopen risk actually
+// exists: a restart immediately after terminality, startup reconstruction,
+// and a crash mid-way through accepting a post-terminal refire.
 //
 // observation_commit has no real production commit to interrupt today:
 // internal/situation's Controller never invokes the observation.Runner
@@ -84,6 +93,255 @@ func TestRestartAfterEveryBoundary(t *testing.T) {
 			assertExactlyOnceInvariants(t, dbPath, boundary)
 		})
 	}
+}
+
+// TestTerminalSituationNeverReopens exercises the spec-mandated, constraint-
+// mandated invariant TestRestartAfterEveryBoundary's fixed scenario can
+// never reach: "Terminal Situations never reopen." It drives a real
+// Situation to closed_unknown against the real store (lifecycle truth
+// unobservable past its deadline — reachable deterministically without a
+// symptom-driven recovery/refire transition, which a newly confirmed gap in
+// internal/store's production wiring blocks; see
+// TestReplayCorpusAgainstRealStore's realStoreExcluded doc comment for the
+// full finding), then covers the three places a reopen risk actually
+// exists: a restart immediately after terminality followed by a refire, a
+// startup reconstruction pass, and a crash mid-way through accepting a
+// post-terminal refire's Situation input.
+func TestTerminalSituationNeverReopens(t *testing.T) {
+	t.Run("restart_then_refire_links_a_new_situation", func(t *testing.T) {
+		ctx := context.Background()
+		dbPath := filepath.Join(t.TempDir(), "alertint.db")
+		terminalID := driveSituationToClosedUnknown(t, dbPath)
+
+		// The process restarts cleanly (no crash mid-flight — this is the
+		// "post-terminal restart" risk point named in the review finding):
+		// reopen the same file with entirely fresh wiring.
+		rig := buildCrashRig(t, dbPath, nil)
+		ingestFingerprinted(t, rig.receiver, "fp-crash-boundary-refire", "critical", rig.clock())
+		if err := rig.dispatch.RunOnce(ctx); err != nil {
+			t.Fatalf("refire dispatch: %v", err)
+		}
+		if _, err := rig.inputs.RunOnce(ctx); err != nil {
+			t.Fatalf("refire apply situation input: %v", err)
+		}
+		newID := claimOneDueSituation(t, rig.runtime, "terminal-restart-refire")
+		if err := rig.controller.Reconcile(ctx, newID); err != nil {
+			t.Fatalf("refire reconcile: %v", err)
+		}
+
+		assertTerminalSituationNeverReopened(t, dbPath, terminalID, newID)
+	})
+
+	t.Run("reconstruction_never_reopens", func(t *testing.T) {
+		ctx := context.Background()
+		dbPath := filepath.Join(t.TempDir(), "alertint.db")
+		terminalID := driveSituationToClosedUnknown(t, dbPath)
+
+		before := situationSnapshot(t, dbPath, terminalID)
+
+		rig := buildCrashRig(t, dbPath, nil)
+		reconstructor := situation.NewReconstructor(rig.runtime, rig.clock)
+		report, err := reconstructor.Run(ctx)
+		if err != nil {
+			t.Fatalf("reconstruct: %v", err)
+		}
+		// The terminal Situation's Incident is already represented
+		// (situation_incidents already links it), so
+		// UnrepresentedActiveIncidents must exclude it outright —
+		// reconstruction creates nothing for this group.
+		if report.Reconstructed != 0 || report.AttachedIncidents != 0 {
+			t.Fatalf("reconstruction touched an already-represented terminal group: %+v", report)
+		}
+
+		after := situationSnapshot(t, dbPath, terminalID)
+		if after != before {
+			t.Fatalf("reconstruction mutated the terminal situation: before=%+v after=%+v", before, after)
+		}
+		assertCount(t, openForAssertions(t, dbPath).DB(), `SELECT COUNT(*) FROM situations`, 1, "situations after reconstruction")
+	})
+
+	t.Run("crash_during_post_terminal_input_accept", func(t *testing.T) {
+		ctx := context.Background()
+		dbPath := filepath.Join(t.TempDir(), "alertint.db")
+		terminalID := driveSituationToClosedUnknown(t, dbPath)
+
+		rig := buildCrashRig(t, dbPath, nil)
+		ingestFingerprinted(t, rig.receiver, "fp-crash-boundary-refire", "critical", rig.clock())
+		if err := rig.dispatch.RunOnce(ctx); err != nil {
+			t.Fatalf("refire dispatch: %v", err)
+		}
+		// Crash exactly at situation_input_commit: the terminal owner has
+		// already forced a new Incident (durably committed by the dispatch
+		// round above), but the new Situation this new Incident should own
+		// has not been created yet.
+		rig.inputs.SetBoundaryHookForTest(crashAt("situation_input_commit"))
+		if _, err := rig.inputs.RunOnce(ctx); err != nil && !errors.Is(err, errInjectedCrash) {
+			t.Fatalf("refire apply situation input: %v", err)
+		}
+
+		runToQuiescence(t, dbPath)
+
+		var newID string
+		if err := openForAssertions(t, dbPath).DB().QueryRowContext(ctx,
+			`SELECT id FROM situations WHERE id != ? AND group_key = 'service=crash-svc'`, terminalID).Scan(&newID); err != nil {
+			t.Fatalf("read the new post-terminal situation: %v", err)
+		}
+		assertTerminalSituationNeverReopened(t, dbPath, terminalID, newID)
+	})
+}
+
+// driveSituationToClosedUnknown drives one real Situation, through the real
+// production stack, from a fresh critical delivery to closed_unknown. It
+// reaches closed_unknown via TerminalUncertainty (lifecycle truth
+// unobservable past its deadline) rather than a clean recovery, because
+// ReconcileLifecycle's recovery/refire path depends on
+// SnapshotInput.Symptoms, which internal/store's LoadReconciliationInput
+// never populates (see TestReplayCorpusAgainstRealStore's
+// realStoreExcluded doc comment) — TerminalUncertainty has no such
+// dependency and is a fully real, unmodified production path. The delivery
+// and Situation's lifecycle-observed timestamps are pushed into the past
+// directly via SQL (the same direct-seed pattern seedRecurrenceOccurrence
+// and seedRealEnvelopeHead already use) so the very next reconciliation
+// deterministically finds the default (HorizonUnknown, 24h) deadline
+// already crossed — no real waiting.
+func driveSituationToClosedUnknown(t *testing.T, dbPath string) string {
+	t.Helper()
+	ctx := context.Background()
+	rig := buildCrashRig(t, dbPath, nil)
+	now := rig.clock()
+
+	ingestOne(t, rig.receiver, "critical", now)
+	if err := rig.dispatch.RunOnce(ctx); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if _, err := rig.inputs.RunOnce(ctx); err != nil {
+		t.Fatalf("apply situation input: %v", err)
+	}
+	situationID := claimOneDueSituation(t, rig.runtime, "terminal-setup")
+
+	// Push the delivery and the Situation's lifecycle-observed time into the
+	// past BEFORE the first-ever reconciliation, not after: a symptom_state
+	// fact's id is deterministic per (situation, input_version, symptom), so
+	// rewriting these timestamps between two reconciliations of the same
+	// unchanged input_version would collide with the fact
+	// LoadReconciliationInput already durably derived and wrote the first
+	// time. Rewriting first means this Situation's only-ever reconciliation
+	// derives and writes that fact exactly once, with the already-past
+	// timestamp baked in from the start.
+	past := now.Add(-25 * time.Hour).UTC().Format(time.RFC3339Nano)
+	if _, err := rig.st.DB().ExecContext(ctx, `
+		UPDATE alert_deliveries SET received_at = ?
+		WHERE id IN (
+			SELECT delivery_id FROM incident_alert_deliveries
+			WHERE incident_id IN (SELECT incident_id FROM situation_incidents WHERE situation_id = ?)
+		)`, past, situationID); err != nil {
+		t.Fatalf("push delivery received_at into the past: %v", err)
+	}
+	if _, err := rig.st.DB().ExecContext(ctx, `
+		UPDATE situations SET last_lifecycle_observed_at = ? WHERE id = ?`, past, situationID); err != nil {
+		t.Fatalf("push situation lifecycle-observed time into the past: %v", err)
+	}
+
+	// One reconciliation: TerminalUncertainty is resolved from the
+	// now-past delivery/lifecycle-observed timestamps ahead of any L1/L2
+	// work, so ReconcileLifecycle routes straight to closed_unknown without
+	// ever committing an intermediate "active" Assessment first.
+	if err := rig.controller.Reconcile(ctx, situationID); err != nil {
+		t.Fatalf("closed_unknown reconcile: %v", err)
+	}
+
+	var lifecycle string
+	if err := rig.st.DB().QueryRowContext(ctx, `SELECT lifecycle FROM situations WHERE id = ?`, situationID).Scan(&lifecycle); err != nil {
+		t.Fatalf("read lifecycle: %v", err)
+	}
+	if lifecycle != string(model.LifecycleClosedUnknown) {
+		t.Fatalf("lifecycle = %q, want closed_unknown (terminal-state setup failed)", lifecycle)
+	}
+
+	// Mark the owning Incident judged (status='analyzed'), matching the
+	// exact prior state internal/correlator's own
+	// TestTerminalOwnerForcesNewIncident seeds (seedJudged): the correlator
+	// only ever consults GetRecentJudgedIncidentByGroupKey (status IN
+	// ('analyzed','resolved')) when deciding whether a later delivery for
+	// this group re-attaches to the terminal owner or forces a new,
+	// distinct Incident — an unjudged ("collecting") Incident is never a
+	// recurrence-collapse candidate at all, terminal or not, so a caller
+	// driving straight to closed_unknown without this step would not
+	// actually exercise the terminal-owner path the tests below need.
+	if _, err := rig.st.DB().ExecContext(ctx, `
+		UPDATE incidents SET status = 'analyzed', last_judged_at = ?
+		WHERE id IN (SELECT incident_id FROM situation_incidents WHERE situation_id = ?)`,
+		now.UTC().Format(time.RFC3339Nano), situationID); err != nil {
+		t.Fatalf("mark owning incident judged: %v", err)
+	}
+	return situationID
+}
+
+// terminalFields is the subset of a Situation row that must never change
+// once terminal.
+type terminalFields struct {
+	Lifecycle  string
+	TerminalAt string
+	UpdatedAt  string
+}
+
+func situationSnapshot(t *testing.T, dbPath, situationID string) terminalFields {
+	t.Helper()
+	st := openForAssertions(t, dbPath)
+	var f terminalFields
+	if err := st.DB().QueryRowContext(context.Background(),
+		`SELECT lifecycle, COALESCE(terminal_at, ''), updated_at FROM situations WHERE id = ?`, situationID).
+		Scan(&f.Lifecycle, &f.TerminalAt, &f.UpdatedAt); err != nil {
+		t.Fatalf("read situation snapshot: %v", err)
+	}
+	return f
+}
+
+// openForAssertions opens a short-lived read handle on dbPath for assertion
+// queries, closed automatically at test cleanup.
+func openForAssertions(t *testing.T, dbPath string) *store.Store {
+	t.Helper()
+	st, err := store.Open(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("reopen store for assertions: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	return st
+}
+
+// assertTerminalSituationNeverReopened is this suite's core assertion:
+// terminalID's own row never left closed_unknown, and refireID is a
+// distinct, newly created Situation linked back to it via
+// previous_situation_id (store.createSituationForInput's real,
+// unmodified "terminal owner forces a new, linked Situation" path —
+// mirrored at the Incident level by
+// internal/correlator/crash_recovery_test.go's
+// TestTerminalOwnerForcesNewIncident).
+func assertTerminalSituationNeverReopened(t *testing.T, dbPath, terminalID, refireID string) {
+	t.Helper()
+	if refireID == "" || refireID == terminalID {
+		t.Fatalf("refire situation id is invalid: %q (terminal=%q)", refireID, terminalID)
+	}
+	st := openForAssertions(t, dbPath)
+	ctx := context.Background()
+
+	var terminalLifecycle string
+	if err := st.DB().QueryRowContext(ctx, `SELECT lifecycle FROM situations WHERE id = ?`, terminalID).Scan(&terminalLifecycle); err != nil {
+		t.Fatalf("read terminal situation lifecycle: %v", err)
+	}
+	if terminalLifecycle != string(model.LifecycleClosedUnknown) {
+		t.Fatalf("terminal situation lifecycle = %q, want closed_unknown (it reopened)", terminalLifecycle)
+	}
+
+	var previous sql.NullString
+	if err := st.DB().QueryRowContext(ctx, `SELECT previous_situation_id FROM situations WHERE id = ?`, refireID).Scan(&previous); err != nil {
+		t.Fatalf("read refire situation's previous_situation_id: %v", err)
+	}
+	if !previous.Valid || previous.String != terminalID {
+		t.Fatalf("refire situation previous_situation_id = %v, want %q", previous, terminalID)
+	}
+
+	assertCount(t, st.DB(), `SELECT COUNT(*) FROM situations WHERE group_key = 'service=crash-svc'`, 2, "situations for the exact group (terminal + linked refire)")
 }
 
 // --------------------------------------------------------------------------
@@ -178,10 +436,20 @@ func buildCrashRig(t *testing.T, dbPath string, assessor situation.AssessmentCli
 // ingestOne posts one Alertmanager delivery for the fixed test group.
 func ingestOne(t *testing.T, receiver ingress.Receiver, severity string, at time.Time) {
 	t.Helper()
+	ingestFingerprinted(t, receiver, "fp-crash-boundary", severity, at)
+}
+
+// ingestFingerprinted posts one real Alertmanager delivery for the fixed
+// "crash-svc" group under an explicit fingerprint — used when a test needs a
+// second, distinct symptom for the same group (e.g. a post-terminal refire,
+// which must be a genuinely new alert rather than a continuing member of the
+// same still-open Incident the original fingerprint already belongs to).
+func ingestFingerprinted(t *testing.T, receiver ingress.Receiver, fingerprint, severity string, at time.Time) {
+	t.Helper()
 	payload := ingress.AlertmanagerPayload{
 		Version: "4", Status: "firing", GroupLabels: map[string]string{"service": "crash-svc"},
 		Alerts: []ingress.AlertmanagerAlert{{
-			Status: "firing", Fingerprint: "fp-crash-boundary",
+			Status: "firing", Fingerprint: fingerprint,
 			Labels:      map[string]string{"alertname": "CrashBoundaryProbe", "service": "crash-svc", "severity": severity},
 			Annotations: map[string]string{}, StartsAt: at,
 		}},
@@ -452,10 +720,13 @@ func runToQuiescence(t *testing.T, dbPath string) {
 	t.Fatal("recovery did not reach quiescence within the round budget")
 }
 
-// assertExactlyOnceInvariants asserts the durability guarantees the whole
-// crash-boundary suite exists to lock: no lost accepted delivery, no
-// duplicate ownership, no duplicate input version, no duplicate root, no
-// reopened terminal Situation, and no missing durable intent.
+// assertExactlyOnceInvariants asserts the durability guarantees this fixed
+// (never-terminal) scenario can actually exercise: no lost accepted
+// delivery, no duplicate ownership, no duplicate input version, no
+// duplicate root, and no missing durable intent. "Terminal Situations never
+// reopen" is NOT among them — this scenario never reaches a terminal
+// lifecycle, so nothing here could ever catch a reopen regression; see
+// TestTerminalSituationNeverReopens instead.
 func assertExactlyOnceInvariants(t *testing.T, dbPath, boundary string) {
 	t.Helper()
 	ctx := context.Background()
@@ -496,8 +767,10 @@ func assertExactlyOnceInvariants(t *testing.T, dbPath, boundary string) {
 		t.Fatalf("root-create intents = %d, want at most 1", roots)
 	}
 
-	// No reopened terminal Situation and every notification intent lands in
-	// a closed, valid status.
+	// This fixed scenario only ever drives the Situation to active — a
+	// sanity check that recovery didn't corrupt lifecycle state, NOT
+	// coverage that a terminal Situation never reopens (it never becomes
+	// terminal here at all; see TestTerminalSituationNeverReopens).
 	var lifecycle string
 	if err := db.QueryRowContext(ctx, `SELECT lifecycle FROM situations WHERE group_key = 'service=crash-svc'`).Scan(&lifecycle); err != nil {
 		t.Fatalf("read situation lifecycle: %v", err)
