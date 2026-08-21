@@ -1,0 +1,32 @@
+{
+  "description": "A critical delivery crosses the floor within its first minute (duration class short) and publishes. The operator janis records an expected-this-episode judgment against that exact view. The same symptom keeps firing unchanged for the next forty minutes (duration class plateaus to long); the floor re-fires on the same evidence and only edits the existing root — the judgment steers no deterministic outcome here, but is durably recorded and carried into the next L2 prompt.",
+  "rounds": [
+    {
+      "advance_seconds": 30,
+      "duration_class": "short",
+      "symptoms": [
+        {"id": "primary-db-unreachable", "lifecycle": "firing", "severity": "critical"}
+      ]
+    },
+    {
+      "advance_seconds": 2400,
+      "duration_class": "long",
+      "symptoms": [
+        {"id": "primary-db-unreachable", "lifecycle": "firing", "severity": "critical"}
+      ],
+      "judgments": [
+        {"judgment": "expected_this_episode", "basis": "operator_knowledge", "asserted_operator": "janis"}
+      ]
+    }
+  ],
+  "expect": {
+    "situation_count": 1,
+    "main_channel_pokes": 1,
+    "transitions": ["active", "active"],
+    "causality": "unknown",
+    "l1_runs": 2,
+    "final_lifecycle": "active",
+    "envelope_result": "",
+    "notification_kinds": ["situation_root_create", "situation_root_edit"]
+  }
+}

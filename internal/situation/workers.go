@@ -246,6 +246,9 @@ type InputWorker struct {
 	cfg   WorkerConfig
 	clock func() time.Time
 	loop  *loop
+	// hook is the crash-boundary test seam (replay.go). nil in every
+	// production construction; only SetBoundaryHookForTest sets it.
+	hook boundaryHook
 }
 
 // NewInputWorker constructs an InputWorker. clock nil uses UTC wall time.
@@ -294,6 +297,12 @@ func (w *InputWorker) runOnce(ctx context.Context) (int, error) {
 			continue
 		}
 		applied++
+		if hookErr := runBoundaryHook(w.hook, "situation_input_commit"); hookErr != nil {
+			// The apply above already committed durably; a crash here only
+			// abandons the rest of this claim batch, which stays leased and
+			// becomes claimable again once that lease lapses.
+			return applied, hookErr
+		}
 	}
 	return applied, errors.Join(failures...)
 }
@@ -498,6 +507,9 @@ type NotificationWorker struct {
 	cfg       WorkerConfig
 	clock     func() time.Time
 	loop      *loop
+	// hook is the crash-boundary test seam (replay.go). nil in every
+	// production construction; only SetBoundaryHookForTest sets it.
+	hook boundaryHook
 }
 
 // NewNotificationWorker constructs a NotificationWorker. A nil deliverer
@@ -548,7 +560,20 @@ func (w *NotificationWorker) runOnce(ctx context.Context) (int, error) {
 	var failures []error
 	for _, intent := range intents {
 		out, deliverErr := w.deliverer.Deliver(ctx, intent)
+		if hookErr := runBoundaryHook(w.hook, "slack_post_timeout"); hookErr != nil {
+			// The outward Slack effect (or its attempt) already happened by
+			// the time this fires; a crash right here loses only the local
+			// record of what the response said. The intent stays leased
+			// pending/failed and the next claim replays the identical
+			// client_msg_id, so a real Slack post is never duplicated.
+			return delivered, hookErr
+		}
 		if deliverErr == nil {
+			if hookErr := runBoundaryHook(w.hook, coordinateCommitBoundary(intent.Kind)); hookErr != nil {
+				// Slack accepted the post/edit/reply; a crash here loses only
+				// the local coordinate commit, not the outward effect.
+				return delivered, hookErr
+			}
 			if markErr := w.store.MarkNotificationDelivered(ctx, intent.ID, out.Channel, out.MessageTS, w.clock().UTC()); markErr != nil {
 				failures = append(failures, fmt.Errorf("situation: record delivered notification %s: %w", intent.ID, markErr))
 				continue

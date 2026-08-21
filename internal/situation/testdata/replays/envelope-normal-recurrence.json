@@ -1,0 +1,27 @@
+{
+  "description": "A critical-severity delivery would normally cross the deterministic urgent floor, but an active, matching expected-behavior envelope with quieting authority silences the critical_anchor candidate outright. No L2 call produces a sufficient reason either, so the Situation publishes nothing at all.",
+  "rounds": [
+    {
+      "advance_seconds": 0,
+      "symptoms": [
+        {"id": "batch-job-lag", "lifecycle": "firing", "severity": "critical"}
+      ],
+      "envelope": {
+        "envelope_id": "envelope:nightly-batch",
+        "envelope_version": 1,
+        "result": "match",
+        "quieting_authority": true
+      }
+    }
+  ],
+  "expect": {
+    "situation_count": 1,
+    "main_channel_pokes": 0,
+    "transitions": ["active"],
+    "causality": "unknown",
+    "l1_runs": 1,
+    "final_lifecycle": "active",
+    "envelope_result": "match",
+    "notification_kinds": []
+  }
+}

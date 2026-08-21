@@ -1,0 +1,26 @@
+{
+  "description": "Two symptoms firing close together in time carry no evidence binding one to the other. L2 tries to claim supported causality anyway; ValidateAssessment downgrades it to correlated because the proposal cites no matching eligible reason to support it.",
+  "rounds": [
+    {
+      "advance_seconds": 0,
+      "symptoms": [
+        {"id": "web-error-rate", "lifecycle": "firing", "severity": "high"},
+        {"id": "db-slow-query", "lifecycle": "firing", "severity": "high"}
+      ],
+      "assessor": {
+        "attention": "observe",
+        "causality": "supported"
+      }
+    }
+  ],
+  "expect": {
+    "situation_count": 1,
+    "main_channel_pokes": 0,
+    "transitions": ["active"],
+    "causality": "correlated",
+    "l1_runs": 1,
+    "final_lifecycle": "active",
+    "envelope_result": "",
+    "notification_kinds": []
+  }
+}

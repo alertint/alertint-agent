@@ -186,6 +186,9 @@ type Controller struct {
 	assessor     AssessmentClient
 	clock        func() time.Time
 	cfg          Config
+	// hook is the crash-boundary test seam (replay.go). nil in every
+	// production construction; only SetBoundaryHookForTest sets it.
+	hook boundaryHook
 }
 
 // NewController constructs a Controller. profiles, observations, acute, and
@@ -382,6 +385,13 @@ func (c *Controller) dispatchAcuteInvestigation(ctx context.Context, situationID
 			status = L1StatusBlocked
 		}
 		_ = c.store.SetAnalysisState(bg, AnalysisState{IncidentID: incidentID, Status: status, DecisionReason: "l1_attempt_completed", UpdatedAt: now})
+		if runBoundaryHook(c.hook, "l1_complete") != nil {
+			// A crash between the durable L1 completion commit above and the
+			// MarkDue nudge below must not lose the completion itself — only
+			// the follow-up wake-up, which the next ordinary reconciliation
+			// pass (polling on its own cadence) still picks up.
+			return
+		}
 		if err != nil {
 			return
 		}
@@ -626,6 +636,9 @@ func (c *Controller) runL2(ctx context.Context, claim Claim, snap Snapshot, prio
 			haveValid, validValid, validAdj, validUsage, validSeq = true, validated, adjustments, modelUsageJSON(completion), sequence
 			continue
 		}
+		if err := runBoundaryHook(c.hook, "l2_complete"); err != nil {
+			return err
+		}
 		return c.commitAssessment(ctx, claim, snap, validated, adjustments, AssessmentActorLLM, sequence-1, now, modelUsageJSON(completion))
 	}
 	if haveValid {
@@ -633,6 +646,9 @@ func (c *Controller) runL2(ctx context.Context, claim Claim, snap Snapshot, prio
 		// first valid (if still contradicted) proposal stands rather than
 		// being discarded outright. validSeq — not the loop's now-advanced
 		// sequence — is this proposal's own attempt sequence number.
+		if err := runBoundaryHook(c.hook, "l2_complete"); err != nil {
+			return err
+		}
 		return c.commitAssessment(ctx, claim, snap, validValid, validAdj, AssessmentActorLLM, validSeq-1, now, validUsage)
 	}
 	return c.commitDeterministicDegraded(ctx, claim, snap, sequence, now)
@@ -695,6 +711,17 @@ func (c *Controller) commitAssessmentWithReason(ctx context.Context, claim Claim
 			return fmt.Errorf("situation: reconcile: store stale attempt: %w", appendErr)
 		}
 		return c.store.Reschedule(ctx, claim, now)
+	}
+	if err == nil {
+		// The transition (and every notification intent it required) is
+		// already durably committed by the time this fires — a crash here
+		// loses only this worker's lease/completion bookkeeping, never the
+		// commit itself. The next claim round simply reclaims the lapsed
+		// lease and reconciles again; the covered fact hash then makes that
+		// pass a no-op commit.
+		if hookErr := runBoundaryHook(c.hook, "transition_commit"); hookErr != nil {
+			return hookErr
+		}
 	}
 	if err != nil {
 		return fmt.Errorf("situation: reconcile: commit assessment: %w", err)

@@ -1,0 +1,22 @@
+{
+  "description": "A single critical-severity delivery meets the deterministic urgent floor (critical_anchor). The root publishes synchronously; L1 is dispatched but held so the assertion proves publication never waits for it to finish.",
+  "rounds": [
+    {
+      "advance_seconds": 0,
+      "symptoms": [
+        {"id": "db-disk-full", "lifecycle": "firing", "severity": "critical"}
+      ],
+      "hold_l1_until_asserted": true
+    }
+  ],
+  "expect": {
+    "situation_count": 1,
+    "main_channel_pokes": 1,
+    "transitions": ["active"],
+    "causality": "unknown",
+    "l1_runs": 1,
+    "final_lifecycle": "active",
+    "envelope_result": "",
+    "notification_kinds": ["situation_root_create"]
+  }
+}

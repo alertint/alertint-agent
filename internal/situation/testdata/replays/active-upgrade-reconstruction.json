@@ -1,0 +1,20 @@
+{
+  "description": "Startup reconstruction finds three nonterminal Incidents across two exact groups with no owning Situation yet — the one-time pre-0011 upgrade population. It creates exactly one Situation per exact group, attaches every member Incident, and publishes nothing: current evidence decides publication on the first ordinary reconciliation pass, never the restart itself.",
+  "reconstruction": {
+    "incidents": [
+      {"incident_id": "legacy-checkout-a", "group_key": "service=checkout"},
+      {"incident_id": "legacy-checkout-b", "group_key": "service=checkout"},
+      {"incident_id": "legacy-payments-a", "group_key": "service=payments"}
+    ]
+  },
+  "expect": {
+    "situation_count": 2,
+    "main_channel_pokes": 0,
+    "transitions": [],
+    "causality": "",
+    "l1_runs": 0,
+    "final_lifecycle": "active",
+    "envelope_result": "",
+    "notification_kinds": []
+  }
+}

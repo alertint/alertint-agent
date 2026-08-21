@@ -1,0 +1,45 @@
+{
+  "description": "A batch-job delivery that never reaches the deterministic critical floor on its own starts under a matching envelope, so it stays silent through the first round. Once the incident runs past the envelope's authorized duration the next evaluation flips to violation; L2 cites the now-eligible envelope_violation reason and the Situation publishes its first root — the envelope itself, not a floor, drove the escalation.",
+  "rounds": [
+    {
+      "advance_seconds": 0,
+      "symptoms": [
+        {"id": "batch-job-lag", "lifecycle": "firing", "severity": "high"}
+      ],
+      "envelope": {
+        "envelope_id": "envelope:nightly-batch",
+        "envelope_version": 1,
+        "result": "match",
+        "quieting_authority": true
+      }
+    },
+    {
+      "advance_seconds": 1800,
+      "symptoms": [
+        {"id": "batch-job-lag", "lifecycle": "firing", "severity": "high"}
+      ],
+      "envelope": {
+        "envelope_id": "envelope:nightly-batch",
+        "envelope_version": 2,
+        "result": "violation",
+        "violations": ["duration_exceeded"],
+        "observability": ["duration_observed"]
+      },
+      "assessor": {
+        "attention": "investigate",
+        "causality": "correlated",
+        "reason_code": "envelope_violation"
+      }
+    }
+  ],
+  "expect": {
+    "situation_count": 1,
+    "main_channel_pokes": 1,
+    "transitions": ["active", "active"],
+    "causality": "correlated",
+    "l1_runs": 2,
+    "final_lifecycle": "active",
+    "envelope_result": "violation",
+    "notification_kinds": ["situation_root_create"]
+  }
+}

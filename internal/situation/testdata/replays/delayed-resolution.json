@@ -1,0 +1,36 @@
+{
+  "description": "A non-critical symptom runs far longer than its five comparable prior episodes (duration_outlier), so L2 investigates and publishes rather than a deterministic floor. The symptom eventually resolves on its own, passing visibly through recovery_pending before terminal recovery — a delayed but clean resolution, never a second poke.",
+  "rounds": [
+    {
+      "advance_seconds": 1500,
+      "symptoms": [
+        {"id": "batch-export-slow", "lifecycle": "firing", "severity": "high"}
+      ],
+      "completed_episode_minutes": [5, 6, 7, 8, 9],
+      "assessor": {
+        "attention": "investigate",
+        "causality": "correlated",
+        "reason_code": "duration_outlier"
+      }
+    },
+    {
+      "advance_seconds": 1200,
+      "symptoms": [
+        {"id": "batch-export-slow", "lifecycle": "resolved"}
+      ]
+    },
+    {
+      "advance_seconds": 130
+    }
+  ],
+  "expect": {
+    "situation_count": 1,
+    "main_channel_pokes": 1,
+    "transitions": ["active", "recovery_pending", "recovered"],
+    "causality": "unknown",
+    "l1_runs": 1,
+    "final_lifecycle": "recovered",
+    "envelope_result": "",
+    "notification_kinds": ["situation_root_create", "situation_root_edit", "situation_root_edit"]
+  }
+}

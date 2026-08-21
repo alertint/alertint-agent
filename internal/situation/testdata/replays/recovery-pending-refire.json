@@ -1,0 +1,33 @@
+{
+  "description": "A critical delivery crosses the floor and publishes. The symptom then resolves, and the Situation visibly passes through recovery_pending (a silent root edit) before the same symptom refires within grace: refiring returns the Situation to active and reassesses current facts, which still cross the same floor and re-edit the same root — never a second poke, never a second root.",
+  "rounds": [
+    {
+      "advance_seconds": 0,
+      "symptoms": [
+        {"id": "queue-depth-critical", "lifecycle": "firing", "severity": "critical"}
+      ]
+    },
+    {
+      "advance_seconds": 30,
+      "symptoms": [
+        {"id": "queue-depth-critical", "lifecycle": "resolved"}
+      ]
+    },
+    {
+      "advance_seconds": 20,
+      "symptoms": [
+        {"id": "queue-depth-critical", "lifecycle": "firing", "severity": "critical"}
+      ]
+    }
+  ],
+  "expect": {
+    "situation_count": 1,
+    "main_channel_pokes": 1,
+    "transitions": ["active", "recovery_pending", "active"],
+    "causality": "unknown",
+    "l1_runs": 2,
+    "final_lifecycle": "active",
+    "envelope_result": "",
+    "notification_kinds": ["situation_root_create", "situation_root_edit", "situation_root_edit"]
+  }
+}

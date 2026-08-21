@@ -1,0 +1,30 @@
+{
+  "description": "A critical delivery crosses the floor and publishes. The symptom resolves and the Situation visibly passes through recovery_pending before its recovery grace deadline elapses with no refire, so it becomes terminally recovered — the stable counterpart to recovery-pending-refire.",
+  "rounds": [
+    {
+      "advance_seconds": 0,
+      "symptoms": [
+        {"id": "replica-lag-critical", "lifecycle": "firing", "severity": "critical"}
+      ]
+    },
+    {
+      "advance_seconds": 30,
+      "symptoms": [
+        {"id": "replica-lag-critical", "lifecycle": "resolved"}
+      ]
+    },
+    {
+      "advance_seconds": 130
+    }
+  ],
+  "expect": {
+    "situation_count": 1,
+    "main_channel_pokes": 1,
+    "transitions": ["active", "recovery_pending", "recovered"],
+    "causality": "unknown",
+    "l1_runs": 1,
+    "final_lifecycle": "recovered",
+    "envelope_result": "",
+    "notification_kinds": ["situation_root_create", "situation_root_edit", "situation_root_edit"]
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "description": "A critical delivery starts under a matching, quieting envelope and stays silent, mirroring envelope-normal-recurrence. The envelope keeps matching through the second round — it never itself violates — but a forbidden impact signal (confirmed severe availability impact) is observed anyway. Impact-based escalation is never gated by envelope quieting authority, so the deterministic floor fires and publishes despite the envelope still reporting match.",
+  "rounds": [
+    {
+      "advance_seconds": 0,
+      "symptoms": [
+        {"id": "cache-cluster-degraded", "lifecycle": "firing", "severity": "critical"}
+      ],
+      "envelope": {
+        "envelope_id": "envelope:cache-maintenance",
+        "envelope_version": 1,
+        "result": "match",
+        "quieting_authority": true
+      }
+    },
+    {
+      "advance_seconds": 300,
+      "symptoms": [
+        {"id": "cache-cluster-degraded", "lifecycle": "firing", "severity": "critical"}
+      ],
+      "envelope": {
+        "envelope_id": "envelope:cache-maintenance",
+        "envelope_version": 1,
+        "result": "match",
+        "quieting_authority": true
+      },
+      "impact": [
+        {"kind": "availability", "severity": "severe", "confirmed": true}
+      ]
+    }
+  ],
+  "expect": {
+    "situation_count": 1,
+    "main_channel_pokes": 1,
+    "transitions": ["active", "active"],
+    "causality": "unknown",
+    "l1_runs": 2,
+    "final_lifecycle": "active",
+    "envelope_result": "match",
+    "notification_kinds": ["situation_root_create"]
+  }
+}

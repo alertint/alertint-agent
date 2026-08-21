@@ -1,0 +1,20 @@
+{
+  "description": "Zabbix itself becomes unreachable, affecting two active Situations whose evidence depends on it. A transient blip stays silent; only once the outage is sustained past the broadcast threshold does DependencyHealthSink create the one permitted health root, fanning both affected Situations out to reconsider. Recovery then produces the one permitted recovery update — never a second root.",
+  "dependency_health": {
+    "dependency": "zabbix",
+    "affected_situations": ["situation-checkout", "situation-payments"],
+    "broadcast_after_seconds": 300,
+    "event_offsets_seconds": [0, 120, 400, 900],
+    "event_ok": [false, false, false, true]
+  },
+  "expect": {
+    "situation_count": 2,
+    "main_channel_pokes": 1,
+    "transitions": [],
+    "causality": "",
+    "l1_runs": 0,
+    "final_lifecycle": "active",
+    "envelope_result": "",
+    "notification_kinds": ["health_root", "health_update"]
+  }
+}
