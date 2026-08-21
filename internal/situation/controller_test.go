@@ -873,3 +873,69 @@ func TestReconcileRefireFallsThroughToNormalFlow(t *testing.T) {
 		t.Fatalf("l1 state = %q, want the ordinary B+ gate to have run", got)
 	}
 }
+
+// TestReconcileEntersRecoveryPendingPreservesUrgentAttention verifies D4's
+// "preserves the prior Attention for audit and refire handling": a
+// Situation whose durable Attention is urgent, entering recovery_pending
+// with all member symptoms resolved, commits a Transition/Assessment audit
+// record that still says urgent — not silently downgraded to observe —
+// and carries forward the SufficientReason that justified it from the full
+// prior Assessment.
+func TestReconcileEntersRecoveryPendingPreservesUrgentAttention(t *testing.T) {
+	h := newControllerHarness(t, noopInvestigator{})
+	h.seedLifecycleSituation(func(s *model.Situation) {
+		s.Attention = model.AttentionUrgent
+	}, []Symptom{{ID: "sym-1", Lifecycle: model.DeliveryStatusResolved}}, nil)
+	priorReason := &model.SufficientReason{
+		Code: "critical_anchor", CandidateID: "reason:critical_anchor:v2:abc", Summary: "prior urgent reason",
+		EvidenceRefs: []string{"fact:1"},
+	}
+	h.store.prior[harnessSituationID] = &model.Assessment{Attention: model.AttentionUrgent, SufficientReason: priorReason}
+
+	if err := h.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if h.store.committedCount() != 1 {
+		t.Fatalf("committed transitions = %d, want 1", h.store.committedCount())
+	}
+	tr := h.store.lastCommitted()
+	if tr.Lifecycle != model.LifecycleRecoveryPending {
+		t.Fatalf("lifecycle = %q, want recovery_pending", tr.Lifecycle)
+	}
+	if tr.Attention != model.AttentionUrgent {
+		t.Fatalf("transition attention = %q, want preserved urgent", tr.Attention)
+	}
+	if tr.Assessment == nil || tr.Assessment.Attention != model.AttentionUrgent {
+		t.Fatalf("committed assessment attention = %+v, want preserved urgent", tr.Assessment)
+	}
+	if tr.Assessment.SufficientReason == nil || tr.Assessment.SufficientReason.Code != "critical_anchor" {
+		t.Fatalf("committed assessment sufficient reason = %+v, want preserved from the prior assessment", tr.Assessment.SufficientReason)
+	}
+}
+
+// TestReconcileEntersRecoveryPendingNeverRaisesAttention verifies the
+// lifecycle-commit path may preserve or lower Attention entering
+// recovery_pending, but never raise it: even if a stale full prior
+// Assessment record claims a higher Attention than the Situation's own
+// durable value, the committed transition must not adopt the higher one.
+func TestReconcileEntersRecoveryPendingNeverRaisesAttention(t *testing.T) {
+	h := newControllerHarness(t, noopInvestigator{})
+	h.seedLifecycleSituation(func(s *model.Situation) {
+		s.Attention = model.AttentionObserve
+	}, []Symptom{{ID: "sym-1", Lifecycle: model.DeliveryStatusResolved}}, nil)
+	// A stale prior *Assessment* record (independent of the durable
+	// Situation.Attention this reconciliation actually carries forward)
+	// claims urgent — this must never leak into a raised commit.
+	h.store.prior[harnessSituationID] = &model.Assessment{Attention: model.AttentionUrgent}
+
+	if err := h.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	tr := h.store.lastCommitted()
+	if tr.Attention != model.AttentionObserve {
+		t.Fatalf("transition attention = %q, want observe (the lifecycle-commit path must never raise Attention above the pre-transition value)", tr.Attention)
+	}
+	if tr.Assessment == nil || tr.Assessment.SufficientReason != nil {
+		t.Fatalf("committed assessment = %+v, want no sufficient reason (prior disagreed with the preserved attention)", tr.Assessment)
+	}
+}

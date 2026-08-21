@@ -4,6 +4,7 @@ package situation
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -131,7 +132,9 @@ func (f *fakeDependencyHealthStore) scheduledCount() int {
 // threshold (mirroring 20 probe cycles of a real outage), then one
 // recovery — verifying at most one health root and one recovery update are
 // ever created, regardless of how many failing observations were reported
-// along the way.
+// along the way. TestRegistryDrivesSustainedOutageToOneHealthRoot is its
+// true end-to-end companion: it proves the same outcome through the real
+// health.Registry pipeline rather than calling the sink directly.
 func TestSharedOutageCreatesOneHealthRoot(t *testing.T) {
 	store := newFakeDependencyHealthStore()
 	sink := NewDependencyHealthSink(store, 5*time.Minute)
@@ -234,5 +237,108 @@ func TestDependencyHealthSinkRequiresNameAndTime(t *testing.T) {
 	}
 	if err := sink.RecordDependencyStatus(context.Background(), health.Status{Name: "llm", OK: true}); err == nil {
 		t.Fatal("zero observation time accepted")
+	}
+}
+
+// TestRegistryDrivesSustainedOutageToOneHealthRoot is the true end-to-end
+// companion to TestSharedOutageCreatesOneHealthRoot: rather than calling
+// RecordDependencyStatus directly, it drives a real health.Registry through
+// a simulated >5-minute steadily-failing outage via Run — the exact
+// pipeline health.go's dueForSink actually produces (a failing check is
+// reported on every probe, not just its first observation/transition) — and
+// asserts the one health root actually fires through that pipeline. A
+// SetClock-injected fake clock advances by 30s per probe so the test runs
+// in real time on the order of milliseconds rather than 5+ real minutes.
+func TestRegistryDrivesSustainedOutageToOneHealthRoot(t *testing.T) {
+	store := newFakeDependencyHealthStore()
+	sink := NewDependencyHealthSink(store, 5*time.Minute)
+
+	failing := true
+	registry := health.NewRegistry(time.Nanosecond, health.Check{
+		Name: "zabbix",
+		Probe: func(context.Context) error {
+			if failing {
+				return errors.New("connection refused")
+			}
+			return nil
+		},
+	})
+	registry.SetSink(sink)
+
+	start := mustTime(t, "2026-08-20T10:00:00Z")
+	fakeNow := start
+	registry.SetClock(func() time.Time {
+		current := fakeNow
+		fakeNow = fakeNow.Add(30 * time.Second)
+		return current
+	})
+
+	// 11 probes * 30s = 330s > the 5-minute broadcast threshold. Each Run
+	// call forces a fresh probe (ttl = 1ns).
+	for i := 0; i < 11; i++ {
+		registry.Run(context.Background())
+	}
+	if got := store.rootIntentCount(); got != 1 {
+		t.Fatalf("health root intents after a sustained outage driven through the real Registry = %d, want 1", got)
+	}
+	if got := store.scheduledCount(); got != 1 {
+		t.Fatalf("scheduled affected situations = %d, want 1 (only the first failing observation transitions)", got)
+	}
+
+	failing = false
+	registry.Run(context.Background())
+	if got := store.updateIntentCount(); got != 1 {
+		t.Fatalf("health update intents after recovery driven through the real Registry = %d, want 1", got)
+	}
+
+	// A steady-healthy repeat must not re-report to the sink at all (health.go's
+	// own contract), so no further store activity should occur.
+	registry.Run(context.Background())
+	if got := store.updateIntentCount(); got != 1 {
+		t.Fatalf("health update intents after a steady-healthy repeat = %d, want still 1", got)
+	}
+}
+
+// TestRegistryWithholdsHealthRootForABriefOutage is the real-Registry
+// companion to TestDependencyHealthSinkWithholdsRootBeforeSustainedThreshold:
+// an outage that recovers before crossing the sustained-broadcast threshold
+// must never produce a health root, even though the Registry now reports
+// every failing probe (not just the first).
+func TestRegistryWithholdsHealthRootForABriefOutage(t *testing.T) {
+	store := newFakeDependencyHealthStore()
+	sink := NewDependencyHealthSink(store, 5*time.Minute)
+
+	failing := true
+	registry := health.NewRegistry(time.Nanosecond, health.Check{
+		Name: "zabbix",
+		Probe: func(context.Context) error {
+			if failing {
+				return errors.New("connection refused")
+			}
+			return nil
+		},
+	})
+	registry.SetSink(sink)
+
+	start := mustTime(t, "2026-08-20T10:00:00Z")
+	fakeNow := start
+	registry.SetClock(func() time.Time {
+		current := fakeNow
+		fakeNow = fakeNow.Add(10 * time.Second)
+		return current
+	})
+
+	// 3 probes * 10s = 30s, well under the 5-minute threshold.
+	for i := 0; i < 3; i++ {
+		registry.Run(context.Background())
+	}
+	if got := store.rootIntentCount(); got != 0 {
+		t.Fatalf("health root intents for a brief outage = %d, want 0", got)
+	}
+
+	failing = false
+	registry.Run(context.Background())
+	if got := store.updateIntentCount(); got != 0 {
+		t.Fatalf("health update intents for a never-rooted outage = %d, want 0 (recovers silently)", got)
 	}
 }

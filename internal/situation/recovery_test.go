@@ -59,6 +59,31 @@ func TestRecoveryPendingRefireAndGrace(t *testing.T) {
 	}
 }
 
+// TestObserveRecoveryPreservesNonObserveAttentionAcrossRefire verifies D4's
+// "preserves the prior Attention for audit and refire handling": entering
+// recovery_pending from an Urgent (or Investigate) Situation keeps that
+// exact Attention — not just Observe — and a later refire back to active
+// still sees the preserved value, since neither ObserveRecovery nor
+// ObserveRefire ever computes a fresh Attention; both only ever copy it
+// forward from the pre-transition Situation.
+func TestObserveRecoveryPreservesNonObserveAttentionAcrossRefire(t *testing.T) {
+	now := mustTime(t, "2026-08-20T10:00:00Z")
+	for _, attention := range []model.Attention{model.AttentionUrgent, model.AttentionInvestigate} {
+		s := activeSituation(now)
+		s.Attention = attention
+
+		pending := ObserveRecovery(s, now, 2*time.Minute)
+		if pending.Attention != attention {
+			t.Fatalf("[%s] pending attention = %q, want preserved %q", attention, pending.Attention, attention)
+		}
+
+		refired := ObserveRefire(pending, now.Add(time.Minute))
+		if refired.Attention != attention {
+			t.Fatalf("[%s] refired attention = %q, want preserved %q (refire handling sees the preserved attention)", attention, refired.Attention, attention)
+		}
+	}
+}
+
 // TestObserveRecoveryOnIllegalLifecycleIsNoop verifies the pure functions
 // never mutate a Situation whose current lifecycle cannot legally take the
 // requested event (terminal states never reopen).

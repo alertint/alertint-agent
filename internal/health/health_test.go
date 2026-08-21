@@ -165,14 +165,16 @@ func (f *fakeSink) calls() []Status {
 	return append([]Status(nil), f.statuses...)
 }
 
-func TestRegistry_SinkCalledOnFirstObservationAndTransitionsOnly(t *testing.T) {
+// TestRegistry_SinkReportsEveryFailingObservationButSuppressesSteadyHealthy
+// verifies the sink keeps hearing about a check that stays failing (so a
+// sink deciding whether an outage has been *sustained* long enough to act
+// can ever actually observe that threshold being crossed — see health.go's
+// Sink doc comment), while a steady *healthy* repeat is suppressed once the
+// one permitted recovery call has been made.
+func TestRegistry_SinkReportsEveryFailingObservationButSuppressesSteadyHealthy(t *testing.T) {
 	r := NewRegistry(time.Hour, Check{Name: "prometheus", Detail: "http://prom:9090"})
 	sink := &fakeSink{}
 	r.SetSink(sink)
-	// Scripted sequence: fails 3 times steadily (only the first is a
-	// reportable event — first observation, itself already failing), then
-	// recovers once (a real transition), then stays healthy (no further
-	// calls).
 	watchHarness(t, r, []error{
 		errors.New("connection refused"),
 		errors.New("connection refused"),
@@ -181,14 +183,16 @@ func TestRegistry_SinkCalledOnFirstObservationAndTransitionsOnly(t *testing.T) {
 		nil,
 	})
 	calls := sink.calls()
-	if len(calls) != 2 {
-		t.Fatalf("sink calls = %d, want 2 (first observation + one recovery transition): %+v", len(calls), calls)
+	if len(calls) != 4 {
+		t.Fatalf("sink calls = %d, want 4 (3 failing observations + 1 recovery transition; the second OK is a steady-healthy repeat and must not be reported): %+v", len(calls), calls)
 	}
-	if calls[0].OK {
-		t.Errorf("first call OK = true, want the initial failing observation")
+	for i := 0; i < 3; i++ {
+		if calls[i].OK {
+			t.Errorf("call %d OK = true, want a failing observation", i)
+		}
 	}
-	if !calls[1].OK {
-		t.Errorf("second call OK = false, want the recovery transition")
+	if !calls[3].OK {
+		t.Errorf("call 3 OK = false, want the recovery transition")
 	}
 }
 

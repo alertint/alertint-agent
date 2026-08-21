@@ -248,7 +248,7 @@ func (c *Controller) Reconcile(ctx context.Context, situationID string) error {
 		// all controller-owned, model-free commits (D4/degraded operation:
 		// "stops automatic live probes/LLM work") — L1 is never dispatched
 		// and L2 never runs for these.
-		return c.commitLifecycleTransition(ctx, claim, snap, lifecycleOutcome, trusted.Sequence, now)
+		return c.commitLifecycleTransition(ctx, claim, snap, lifecycleOutcome, prior, trusted.Sequence, now)
 	}
 
 	decision := c.decideL1(claim, snap, trusted)
@@ -424,18 +424,21 @@ func (c *Controller) commitDeterministicFloor(ctx context.Context, claim Claim, 
 // lifecycle transition (grace expiry to terminal recovered, entering
 // recovery_pending, or terminal closed_unknown) that ReconcileLifecycle
 // already decided ahead of any L1/L2 work. None of these ever involve a
-// model call. Attention is Observe throughout: grace expiry and
-// closed_unknown both stop automatic live probes/LLM work by spec, and
-// entering recovery_pending has no fresh urgent/investigate evidence to
-// cite once every member Alert has resolved (the deterministic floor
-// recomputation inside ValidateAssessment still protects against a stale
-// snapshot proving otherwise).
-func (c *Controller) commitLifecycleTransition(ctx context.Context, claim Claim, snap Snapshot, outcome LifecycleOutcome, priorSequence int, now time.Time) error {
+// model call. Grace expiry and closed_unknown always commit Attention
+// observe (grace expiry per spec: "terminal Attention observe"; both stop
+// automatic live probes/LLM work). Entering recovery_pending instead
+// preserves whatever Attention the Situation already durably carried (D4:
+// "preserves the prior Attention for audit and refire handling") — never
+// raising it, only ever echoing or (structurally, since it is copied
+// forward rather than recomputed) lowering it.
+func (c *Controller) commitLifecycleTransition(ctx context.Context, claim Claim, snap Snapshot, outcome LifecycleOutcome, prior *model.Assessment, priorSequence int, now time.Time) error {
 	s := outcome.Situation
 	var (
-		ac              model.ActionContract
-		reason          string
-		evidenceQuality model.EvidenceQuality
+		ac               model.ActionContract
+		reason           string
+		evidenceQuality  model.EvidenceQuality
+		attention        = model.AttentionObserve
+		sufficientReason *model.SufficientReason
 	)
 	switch s.Lifecycle {
 	case model.LifecycleRecovered:
@@ -457,21 +460,82 @@ func (c *Controller) commitLifecycleTransition(ctx context.Context, claim Claim,
 			NextUpdateAt: &nextUpdate, NextUpdateOn: []string{"recovery_grace_expired", "alert_refired"},
 		}
 		reason, evidenceQuality = "recovery_observed", model.EvidenceQualityDegraded
+		// D4: "Entering pending preserves the prior Attention for audit and
+		// refire handling." s.Attention already IS that preserved value:
+		// ObserveRecovery is a pure lifecycle-field transition (recovery.go)
+		// that never computes a fresh Attention, only copies it forward
+		// from the pre-transition durable Situation — so this can never
+		// raise Attention above what it already durably was, only ever
+		// echo it. When the full prior Assessment is available and still
+		// agrees with that preserved value, its SufficientReason rides
+		// along too, so the audit record stays internally coherent (an
+		// Urgent/Investigate Attention with the reason that justified it,
+		// not a dangling one).
+		attention = s.Attention
+		if prior != nil && prior.Attention == attention {
+			sufficientReason = prior.SufficientReason
+		}
 	default:
 		return fmt.Errorf("situation: lifecycle transition commits an unexpected lifecycle %q", s.Lifecycle)
 	}
 	proposal := model.Assessment{
 		SchemaVersion: AssessmentSchemaVersion, Persistence: model.PersistenceUnknown, Impact: model.ImpactUnknown,
-		Novelty: model.NoveltyInsufficientHistory, Causality: model.CausalityUnknown, Attention: model.AttentionObserve,
-		Lifecycle: s.Lifecycle, EvidenceQuality: evidenceQuality, ActionContract: ac,
+		Novelty: model.NoveltyInsufficientHistory, Causality: model.CausalityUnknown, Attention: attention,
+		Lifecycle: snap.Lifecycle, EvidenceQuality: evidenceQuality, ActionContract: ac, SufficientReason: sufficientReason,
 		Limitations:     []model.Limitation{{Code: "controller_lifecycle_transition", Detail: "deterministic lifecycle transition; no model interpretation requested"}},
 		ProposedCadence: model.CadenceNormal,
 	}
-	validated, adjustments, err := ValidateAssessment(snap, proposal, now)
+
+	var (
+		validated   model.Assessment
+		adjustments []model.ValidationAdjustment
+		err         error
+	)
+	if attention == model.AttentionObserve {
+		// The common case — grace expiry, closed_unknown, and a
+		// recovery_pending entry whose prior Attention was already observe
+		// — goes through the same shared gate every other commit uses.
+		validated, adjustments, err = ValidateAssessment(snap, proposal, now)
+	} else {
+		// A preserved non-observe Attention entering recovery_pending is
+		// controller-owned deterministic authority recording a fact that
+		// was already authoritative (the Situation's own durable
+		// Attention), not an L2 proposal minting new urgency.
+		// ValidateAssessment's floor/reason-matching gate exists
+		// specifically to stop a MODEL from inventing urgency from
+		// stale/current evidence and would otherwise reject this preserved
+		// value outright once the just-resolved facts no longer support a
+		// live floor or eligible reason. Route around that one gate only;
+		// the structural checks it also performs (closed-enum membership,
+		// action-contract actor/status consistency, the next_update_at
+		// contract) still apply via validateLifecycleTransitionAssessment.
+		validated = proposal
+		err = validateLifecycleTransitionAssessment(validated, now)
+	}
 	if err != nil {
 		return fmt.Errorf("situation: reconcile: lifecycle transition validation: %w", err)
 	}
 	return c.commitAssessmentWithReason(ctx, claim, snap, validated, adjustments, AssessmentActorDeterministic, priorSequence, now, nil, reason)
+}
+
+// validateLifecycleTransitionAssessment applies the same structural checks
+// ValidateAssessment performs — closed-enum membership, action-contract
+// actor/status consistency, and the next_update_at contract — without its
+// Attention floor/reason-matching gate. Reserved for
+// commitLifecycleTransition's one controller-owned path (entering
+// recovery_pending with a preserved non-observe Attention) that is
+// recording an already-authoritative fact, not proposing new urgency.
+func validateLifecycleTransitionAssessment(a model.Assessment, now time.Time) error {
+	if a.SchemaVersion != AssessmentSchemaVersion {
+		return errors.New("situation: assessment schema version is not the authoritative version")
+	}
+	if err := validateAssessmentEnums(a); err != nil {
+		return err
+	}
+	if err := validateActionContract(a); err != nil {
+		return err
+	}
+	return validateUpdateSchedule(a, now)
 }
 
 // commitDeterministicDegraded is the safe default when L2 cannot produce a

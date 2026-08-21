@@ -53,15 +53,19 @@ type Status struct {
 }
 
 // Sink receives durable dependency-health status observations. Registry
-// calls it only on the first observation of each check and on every
-// OK<->failing transition thereafter — never on a steady repeat — so a
-// sustained shared outage produces at most one recorded failing observation
-// plus one recovery observation, matching the installation-level "at most
-// one health root, one recovery update" contract
-// (internal/situation.DependencyHealthSink is the concrete implementation;
-// expressed here as an interface so this package never imports
-// internal/situation, which already imports this package indirectly via
-// cmd/alertint wiring).
+// calls it on the first observation of each check, on every OK<->failing
+// transition, and on every subsequent probe while a check remains
+// failing — a steady *healthy* repeat is the only thing suppressed (once a
+// recovery has been reported, there is nothing further to do until the
+// next failure). Repeated failing calls are deliberate, not a relaxation of
+// "at most one health root, one recovery update": a sink deciding whether a
+// shared outage has been *sustained* long enough to broadcast (e.g.
+// internal/situation.DependencyHealthSink, the concrete implementation)
+// needs to keep observing an ongoing outage to ever cross that threshold —
+// it enforces the "at most one" guarantee itself, against durable state,
+// not against call cadence. Expressed here as an interface so this package
+// never imports internal/situation, which already imports this package
+// indirectly via cmd/alertint wiring.
 type Sink interface {
 	RecordDependencyStatus(ctx context.Context, status Status) error
 }
@@ -78,6 +82,7 @@ type Registry struct {
 	probedAt     time.Time
 	sink         Sink
 	lastObserved map[string]bool // name -> last OK reported to sink
+	now          func() time.Time
 }
 
 // NewRegistry builds a registry; ttl <= 0 uses DefaultTTL.
@@ -90,16 +95,35 @@ func NewRegistry(ttl time.Duration, checks ...Check) *Registry {
 		ttl:         ttl,
 		watchMin:    watchMinDelay,
 		watchSteady: watchSteadyInterval,
+		now:         func() time.Time { return time.Now().UTC() },
 	}
+}
+
+// SetClock overrides the wall-clock source Registry stamps Status.CheckedAt
+// with (default time.Now). Intended for tests that need to simulate a long
+// elapsed span (e.g. a sustained outage crossing a downstream sink's
+// broadcast threshold) without actually waiting in real time. nil restores
+// the default. Safe for concurrent use; a nil registry is a no-op.
+func (r *Registry) SetClock(now func() time.Time) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if now == nil {
+		now = func() time.Time { return time.Now().UTC() }
+	}
+	r.now = now
 }
 
 // SetSink attaches an optional durable dependency-health sink (nil detaches
 // it). It is called synchronously from Run/Watch on first observation of
-// each check and on every OK<->failing transition; a sink error is only
-// logged where a logger is available (Watch) and never blocks or fails the
-// probe itself — dependency-health persistence is best-effort
-// observability, not probe authority. Safe for concurrent use; a nil
-// registry is a no-op.
+// each check, on every OK<->failing transition, and on every subsequent
+// probe while a check remains failing (see Sink's doc comment); a sink
+// error is only logged where a logger is available (Watch) and never
+// blocks or fails the probe itself — dependency-health persistence is
+// best-effort observability, not probe authority. Safe for concurrent use;
+// a nil registry is a no-op.
 func (r *Registry) SetSink(sink Sink) {
 	if r == nil {
 		return
@@ -117,7 +141,14 @@ func (r *Registry) Run(ctx context.Context) []Status {
 		return nil
 	}
 	r.mu.Lock()
-	if r.cached != nil && time.Since(r.probedAt) < r.ttl {
+	// One clock read per call (not one for the freshness check and another
+	// for probedAt bookkeeping): both this Registry's TTL bookkeeping and
+	// every probed Status.CheckedAt this call produces are driven by the
+	// same injectable clock (SetClock; time.Now by default), so a test
+	// simulating elapsed time gets a single, predictable jump per call
+	// instead of an inflated one from multiple reads.
+	now := r.now()
+	if r.cached != nil && now.Sub(r.probedAt) < r.ttl {
 		cached := r.cached
 		r.mu.Unlock()
 		return cached
@@ -125,9 +156,9 @@ func (r *Registry) Run(ctx context.Context) []Status {
 	// The lock stays held across the probe itself (unchanged from before
 	// this sink addition): it serializes concurrent callers racing a TTL
 	// expiry onto a single real probe rather than a stampede.
-	statuses := probeAll(ctx, r.checks)
+	statuses := probeAll(ctx, r.checks, func() time.Time { return now })
 	r.cached = statuses
-	r.probedAt = time.Now().UTC()
+	r.probedAt = now.UTC()
 	sink, due := r.dueForSink(statuses)
 	r.mu.Unlock()
 	notifySink(ctx, sink, due, nil)
@@ -214,22 +245,29 @@ func (r *Registry) Watch(ctx context.Context, logger *slog.Logger) {
 
 // probeAndCache runs every probe once and replaces the cached statuses.
 // It probes without holding the lock so /health is never blocked on a
-// slow probe; it only takes the lock to swap the result in.
+// slow probe; it only takes the lock to read the clock and swap the
+// result in. One clock read per call, reused for every probed
+// Status.CheckedAt this pass and for probedAt bookkeeping — see Run's
+// matching comment.
 func (r *Registry) probeAndCache(ctx context.Context) []Status {
-	statuses := probeAll(ctx, r.checks)
+	r.mu.Lock()
+	now := r.now()
+	r.mu.Unlock()
+	statuses := probeAll(ctx, r.checks, func() time.Time { return now })
 	r.mu.Lock()
 	r.cached = statuses
-	r.probedAt = time.Now().UTC()
+	r.probedAt = now.UTC()
 	r.mu.Unlock()
 	return statuses
 }
 
 // notifyFromProbe reports one probeAndCache result to the attached sink
-// (first observation / transitions only), logging a sink failure when a
-// logger is available. It never blocks the caller on I/O beyond the sink
-// call itself and never affects probe results. Unlike Run — which already
-// holds r.mu across its own probe — Watch's probeAndCache runs unlocked, so
-// this method takes the lock itself just to compute the due set.
+// (see dueForSink for exactly which statuses are reportable), logging a
+// sink failure when a logger is available. It never blocks the caller on
+// I/O beyond the sink call itself and never affects probe results. Unlike
+// Run — which already holds r.mu across its own probe — Watch's
+// probeAndCache runs unlocked, so this method takes the lock itself just to
+// compute the due set.
 func (r *Registry) notifyFromProbe(ctx context.Context, statuses []Status, logger *slog.Logger) {
 	r.mu.Lock()
 	sink, due := r.dueForSink(statuses)
@@ -242,8 +280,9 @@ func (r *Registry) notifyFromProbe(ctx context.Context, statuses []Status, logge
 // It updates the per-check last reported OK/failing state and returns the
 // currently attached sink (nil if none) together with the subset of
 // statuses that are reportable this pass: a check's very first
-// observation, or one whose OK/failing state differs from what was last
-// reported. A steady repeat reports nothing.
+// observation, any transition, or — deliberately, so a sink can notice a
+// sustained outage crossing its own broadcast threshold — a still-failing
+// repeat. Only a steady *healthy* repeat reports nothing.
 func (r *Registry) dueForSink(statuses []Status) (Sink, []Status) {
 	sink := r.sink
 	if sink == nil {
@@ -255,7 +294,7 @@ func (r *Registry) dueForSink(statuses []Status) (Sink, []Status) {
 	var due []Status
 	for _, s := range statuses {
 		prev, seen := r.lastObserved[s.Name]
-		if !seen || prev != s.OK {
+		if !seen || prev != s.OK || !s.OK {
 			due = append(due, s)
 		}
 		r.lastObserved[s.Name] = s.OK
@@ -281,9 +320,10 @@ func notifySink(ctx context.Context, sink Sink, due []Status, logger *slog.Logge
 	}
 }
 
-// probeAll runs every probe once and returns the statuses.
-func probeAll(ctx context.Context, checks []Check) []Status {
-	now := time.Now().UTC()
+// probeAll runs every probe once and returns the statuses, stamped with
+// clock() (normally time.Now, overridable via Registry.SetClock).
+func probeAll(ctx context.Context, checks []Check, clock func() time.Time) []Status {
+	now := clock().UTC()
 	statuses := make([]Status, 0, len(checks))
 	for _, c := range checks {
 		pctx, cancel := context.WithTimeout(ctx, probeTimeout)
