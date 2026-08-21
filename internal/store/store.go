@@ -1188,3 +1188,28 @@ func validateAlert(a Alert) error {
 	}
 	return nil
 }
+
+// CheckWritable reports whether the database can currently take an
+// authoritative write. It opens a reserved write transaction and rolls it
+// back, so it proves lock acquisition — the condition behind a transient
+// SQLITE_BUSY, a read-only file, or a lost handle — without mutating a single
+// row.
+//
+// It deliberately performs no durable write, so it cannot by itself detect a
+// full disk; the next real round does, and re-degrades readiness. Its job is
+// to give recovery a path that does not depend on a round the readiness gate
+// is currently blocking.
+func (s *Store) CheckWritable(ctx context.Context) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("store: acquire connection for write check: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return fmt.Errorf("store: database is not writable: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, `ROLLBACK`); err != nil {
+		return fmt.Errorf("store: release write check transaction: %w", err)
+	}
+	return nil
+}

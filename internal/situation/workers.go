@@ -57,13 +57,20 @@ type WorkerConfig struct {
 	IdleCadence time.Duration
 	// Ready gates a round on durable storage being writable. While it
 	// returns false no round starts, so no connector, model, or Slack I/O
-	// runs against state that could not be persisted first. nil is
-	// always-ready.
-	Ready func() bool
-	// OnRound observes each completed round's outcome. It is how storage
-	// write health becomes authoritative for readiness: a failing round
-	// degrades health, and the first successful one restores it. nil is
-	// no-op.
+	// runs against state that could not be persisted first.
+	//
+	// It is therefore the ONLY thing that still executes while storage is
+	// unwritable, which makes it the one place recovery can live: an
+	// implementation that gates on storage health MUST be able to re-test
+	// that health from inside Ready and return true again. Gating on a
+	// cached verdict that only a completed round could clear would latch the
+	// runtime off permanently. Ready receives the round's context so its
+	// re-test can be bounded and cancelled. nil is always-ready.
+	Ready func(ctx context.Context) bool
+	// OnRound observes each completed round's outcome — never a skipped one,
+	// which is not an outcome. It is how storage write health becomes
+	// authoritative for readiness: a failing round degrades health, and a
+	// later successful one restores it. nil is no-op.
 	OnRound func(handled int, err error)
 }
 
@@ -90,7 +97,7 @@ func (c WorkerConfig) normalized() WorkerConfig {
 		c.IdleCadence = defaultIdleCadence
 	}
 	if c.Ready == nil {
-		c.Ready = func() bool { return true }
+		c.Ready = func(context.Context) bool { return true }
 	}
 	if c.OnRound == nil {
 		c.OnRound = func(int, error) {}
@@ -101,10 +108,12 @@ func (c WorkerConfig) normalized() WorkerConfig {
 // gatedRound wraps one worker round with the readiness gate and the outcome
 // observer, so every worker in this file honors storage write health
 // identically: nothing outward is attempted while storage is unwritable, and
-// each round's outcome is what makes readiness authoritative.
+// each round's outcome is what makes readiness authoritative. Every worker
+// entry point (RunOnce, Drain, and the background loop) goes through it, so
+// there is no ungated way to reach a round body.
 func (c WorkerConfig) gatedRound(round func(context.Context) (int, error)) func(context.Context) (int, error) {
 	return func(ctx context.Context) (int, error) {
-		if !c.Ready() {
+		if !c.Ready(ctx) {
 			return 0, nil
 		}
 		handled, err := round(ctx)
@@ -249,7 +258,7 @@ func NewInputWorker(store InputStore, cfg WorkerConfig, clock func() time.Time, 
 }
 
 // Start launches the background claim loop. It must be called at most once.
-func (w *InputWorker) Start(ctx context.Context) { w.loop.start(ctx, w.cfg.gatedRound(w.RunOnce)) }
+func (w *InputWorker) Start(ctx context.Context) { w.loop.start(ctx, w.RunOnce) }
 
 // Stop drains the in-flight round within ctx's deadline.
 func (w *InputWorker) Stop(ctx context.Context) error { return w.loop.stop(ctx) }
@@ -259,8 +268,13 @@ func (w *InputWorker) Wake() { w.loop.Wake() }
 
 // RunOnce claims and applies one batch, returning how many inputs were
 // applied. A retryable apply failure releases the claim for a later attempt;
-// an exhausted budget records an operator-visible dead letter.
+// an exhausted budget records an operator-visible dead letter. It runs
+// through the readiness gate, so it is a no-op while storage is unwritable.
 func (w *InputWorker) RunOnce(ctx context.Context) (int, error) {
+	return w.cfg.gatedRound(w.runOnce)(ctx)
+}
+
+func (w *InputWorker) runOnce(ctx context.Context) (int, error) {
 	if w.store == nil {
 		return 0, errors.New("situation: input worker requires a durable store")
 	}
@@ -365,7 +379,7 @@ func NewWorkerPool(store ControllerStore, reconciler Reconciler, cfg WorkerConfi
 }
 
 // Start launches the background claim loop. It must be called at most once.
-func (p *WorkerPool) Start(ctx context.Context) { p.loop.start(ctx, p.cfg.gatedRound(p.RunOnce)) }
+func (p *WorkerPool) Start(ctx context.Context) { p.loop.start(ctx, p.RunOnce) }
 
 // Stop drains the in-flight round within ctx's deadline.
 func (p *WorkerPool) Stop(ctx context.Context) error { return p.loop.stop(ctx) }
@@ -375,8 +389,13 @@ func (p *WorkerPool) Wake() { p.loop.Wake() }
 
 // RunOnce claims and reconciles one batch of due Situations, returning how
 // many were handled. A reconciliation failure releases the claim with a
-// backoff so the aggregate stays durable and claimable.
+// backoff so the aggregate stays durable and claimable. It runs through the
+// readiness gate, so it is a no-op while storage is unwritable.
 func (p *WorkerPool) RunOnce(ctx context.Context) (int, error) {
+	return p.cfg.gatedRound(p.runOnce)(ctx)
+}
+
+func (p *WorkerPool) runOnce(ctx context.Context) (int, error) {
 	if p.store == nil || p.reconciler == nil {
 		return 0, errors.New("situation: controller pool requires a durable store and reconciler")
 	}
@@ -507,8 +526,13 @@ func (w *NotificationWorker) Stop(ctx context.Context) error { return w.loop.sto
 func (w *NotificationWorker) Wake() { w.loop.Wake() }
 
 // RunOnce claims and delivers one batch of intents, returning how many were
-// delivered.
+// delivered. It runs through the readiness gate, so no Slack call is
+// attempted while storage cannot record its outcome.
 func (w *NotificationWorker) RunOnce(ctx context.Context) (int, error) {
+	return w.cfg.gatedRound(w.runOnce)(ctx)
+}
+
+func (w *NotificationWorker) runOnce(ctx context.Context) (int, error) {
 	if w.store == nil {
 		return 0, errors.New("situation: notification worker requires a durable store")
 	}

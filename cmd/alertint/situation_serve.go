@@ -17,13 +17,18 @@ import (
 	"github.com/alertint/alertint-agent/internal/config"
 	"github.com/alertint/alertint-agent/internal/correlator"
 	"github.com/alertint/alertint-agent/internal/health"
+	"github.com/alertint/alertint-agent/internal/logs"
 	notifyslack "github.com/alertint/alertint-agent/internal/notify/slack"
 	notifystdout "github.com/alertint/alertint-agent/internal/notify/stdout"
 	"github.com/alertint/alertint-agent/internal/observation"
+	"github.com/alertint/alertint-agent/internal/observation/connectors"
+	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/semanticprofile"
+	"github.com/alertint/alertint-agent/internal/sentry"
 	"github.com/alertint/alertint-agent/internal/situation"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
+	"github.com/alertint/alertint-agent/internal/zabbix"
 	"github.com/alertint/alertint-agent/skills/acutetriage"
 )
 
@@ -129,22 +134,46 @@ type serveRuntime struct {
 // storeWriteHealth makes SQLite write health authoritative for readiness. A
 // failed authoritative write logs one ERROR, fails readiness, and gates every
 // worker: no connector, model, or Slack I/O runs while state cannot be
-// persisted, and no in-memory state is ever published in its place. The first
-// successful write restores readiness and wakes the durable workers.
+// persisted, and no in-memory state is ever published in its place.
+//
+// Recovery must never depend on a round the gate is blocking, or the runtime
+// would latch off until a restart. So the gate itself re-probes: Ready runs a
+// real (rate-limited) writability check whenever it is currently degraded,
+// and the /health probe runs the same check. The first check that succeeds
+// restores readiness and wakes the durable workers; if storage is still
+// genuinely broken, the round that follows re-degrades it immediately.
 type storeWriteHealth struct {
 	logger *slog.Logger
 	path   string
+	// probe re-tests real write capability. nil never latches: readiness
+	// simply follows the last observed round.
+	probe func(context.Context) error
+	// recheckAfter rate-limits probing from the gate, which is consulted on
+	// every worker poll.
+	recheckAfter time.Duration
+	clock        func() time.Time
 
-	mu      sync.Mutex
-	lastErr error
-	wake    func()
+	mu          sync.Mutex
+	lastErr     error
+	lastRecheck time.Time
+	wake        func()
 }
 
-func newStoreWriteHealth(path string, logger *slog.Logger) *storeWriteHealth {
+// defaultWriteHealthRecheck bounds how often the readiness gate re-probes
+// storage while degraded. It is short enough that recovery is measured in
+// seconds, long enough that a sustained outage does not hammer the file.
+const defaultWriteHealthRecheck = 2 * time.Second
+
+func newStoreWriteHealth(path string, probe func(context.Context) error, logger *slog.Logger) *storeWriteHealth {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &storeWriteHealth{logger: logger, path: path, wake: func() {}}
+	return &storeWriteHealth{
+		logger: logger, path: path, probe: probe,
+		recheckAfter: defaultWriteHealthRecheck,
+		clock:        func() time.Time { return time.Now().UTC() },
+		wake:         func() {},
+	}
 }
 
 // SetWake attaches the worker wake-up used when readiness is restored.
@@ -157,17 +186,56 @@ func (h *storeWriteHealth) SetWake(wake func()) {
 	h.wake = wake
 }
 
-// Ready reports whether durable storage is currently writable.
-func (h *storeWriteHealth) Ready() bool {
+// Ready reports whether durable storage is currently writable, re-probing
+// when it is not. This is the recovery path: the gate is the only thing that
+// still runs while degraded, so it is the only place that can clear the
+// degradation.
+func (h *storeWriteHealth) Ready(ctx context.Context) bool {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.lastErr == nil
+	if h.lastErr == nil {
+		h.mu.Unlock()
+		return true
+	}
+	if h.probe == nil {
+		h.mu.Unlock()
+		return false
+	}
+	now := h.clock()
+	if !h.lastRecheck.IsZero() && now.Sub(h.lastRecheck) < h.recheckAfter {
+		h.mu.Unlock()
+		return false
+	}
+	h.lastRecheck = now
+	h.mu.Unlock()
+	return h.recheck(ctx) == nil
 }
 
-// Observe records one round's outcome. It logs exactly once per state change,
-// never once per failing round, so a sustained outage does not itself become
-// a log storm.
+// recheck runs the real writability probe and folds its result into the same
+// state machine a worker round feeds.
+func (h *storeWriteHealth) recheck(ctx context.Context) error {
+	if h.probe == nil {
+		return nil
+	}
+	err := h.probe(ctx)
+	h.record(err)
+	return err
+}
+
+// Observe records one completed round's outcome. Routine contention (a lost
+// lease, a version conflict, an intent another worker already resolved, a
+// cancelled shutdown) is not a storage failure and never degrades readiness —
+// treating it as one would gate the whole runtime off during ordinary
+// multi-worker operation.
 func (h *storeWriteHealth) Observe(_ int, err error) {
+	if !storageUnavailable(err) {
+		err = nil
+	}
+	h.record(err)
+}
+
+// record applies one observation, logging exactly once per state change so a
+// sustained outage does not become a log storm.
+func (h *storeWriteHealth) record(err error) {
 	h.mu.Lock()
 	previous := h.lastErr
 	h.lastErr = err
@@ -184,17 +252,38 @@ func (h *storeWriteHealth) Observe(_ int, err error) {
 	}
 }
 
-// Check exposes storage write health as a readiness probe, so GET /health
-// reports degraded whenever an authoritative write is failing.
+// Check exposes storage write health as a readiness probe. It performs the
+// real writability check rather than replaying a cached verdict, so GET
+// /health reports the current truth and the health registry's own retry
+// cadence is a second, independent recovery path.
 func (h *storeWriteHealth) Check() health.Check {
 	return health.Check{
 		Name:   "sqlite",
 		Detail: h.path,
-		Probe: func(context.Context) error {
-			h.mu.Lock()
-			defer h.mu.Unlock()
-			return h.lastErr
+		Probe: func(ctx context.Context) error {
+			return h.recheck(ctx)
 		},
+	}
+}
+
+// storageUnavailable reports whether an error means durable storage could not
+// be written, as opposed to an ordinary concurrent-work outcome. Only the
+// former may degrade readiness.
+func storageUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return false
+	case errors.Is(err, store.ErrSituationLeaseLost),
+		errors.Is(err, store.ErrSituationVersionConflict),
+		errors.Is(err, store.ErrAlertDispatchLeaseLost),
+		errors.Is(err, store.ErrNotificationNotPending),
+		errors.Is(err, store.ErrNotFound):
+		return false
+	default:
+		return true
 	}
 }
 
@@ -280,6 +369,41 @@ type situationDeps struct {
 	Model       string
 	Stdout      *notifystdout.Notifier
 	SlackClient notifyslack.APIClient
+	// Observations carries the read-only connector reducers behind the
+	// bounded observation capabilities. An absent source leaves its
+	// capability registered but honestly unavailable.
+	Observations connectors.Sources
+}
+
+// buildObservationSources binds the read-only clients serve already
+// constructs for L1 to the bounded observation capabilities, so the Situation
+// controller gathers evidence from the same connectors — read-only, typed,
+// and within each capability's declared call budget.
+//
+// Each assignment is guarded on a live client rather than on config alone: a
+// typed-nil client stored in an interface would look wired and then fail on
+// every call instead of degrading honestly (the same typed-nil trap the
+// triage Sentry/Zabbix readers avoid).
+func buildObservationSources(cfg *config.Config, st *store.Store, prom *promclient.Client, logSrc logs.Source, sentryClient *sentry.Client, zbxClient *zabbix.Client) connectors.Sources {
+	// The local store is always present, so a zero-integration installation
+	// still gathers its own delivery-ledger evidence.
+	out := connectors.Sources{Situations: st}
+	if cfg.ChangesEnrichmentEnabled() || cfg.Changes.Ingress.Enabled {
+		out.Changes = st
+	}
+	if cfg.PrometheusEnabled() && prom != nil {
+		out.Prometheus = prom
+	}
+	if cfg.ZabbixAPIEnabled() && zbxClient != nil {
+		out.Zabbix = zbxClient
+	}
+	if cfg.LogsEnabled() && logSrc != nil {
+		out.Logs = logSrc
+	}
+	if cfg.Sentry.Issues.Enabled && sentryClient != nil {
+		out.Sentry = sentryClient
+	}
+	return out
 }
 
 // buildSituationRuntime assembles the whole Situation topology: the durable
@@ -313,10 +437,14 @@ func buildSituationRuntime(cfg *config.Config, st *store.Store, auditor *audit.A
 	if deps.Skill != nil {
 		acute = acuteInvestigator{skill: deps.Skill, store: st}
 	}
-	// Every capability is registered read-only; adapters stay nil until a
-	// connector reducer is wired, which classifies execution as unavailable
-	// rather than hiding the capability.
-	catalog := observation.DefaultCatalog(observation.Adapters{})
+	// Every capability is registered read-only. A slot whose connector this
+	// installation does not run stays nil, which classifies execution as
+	// unavailable — distinct from a confirmed empty result, and never hidden.
+	catalog := observation.DefaultCatalog(deps.Observations.Adapters())
+	if unavailable := deps.Observations.Unavailable(); len(unavailable) > 0 {
+		logger.Info("situation observation capabilities unavailable",
+			slog.String("capabilities", strings.Join(unavailable, ",")))
+	}
 	observations := observation.NewRunner(catalog, sc.Budgets.MaxObservationCalls, sc.Budgets.ConnectorConcurrency)
 	controller := situation.NewController(runtime, profileReader{service: profiles}, observations, acute, deps.Assessor, clock,
 		situation.Config{
@@ -333,7 +461,7 @@ func buildSituationRuntime(cfg *config.Config, st *store.Store, auditor *audit.A
 			}.RecoveryGrace(),
 		})
 
-	writeHealth := newStoreWriteHealth(cfg.Storage.SQLitePath, logger)
+	writeHealth := newStoreWriteHealth(cfg.Storage.SQLitePath, st.CheckWritable, logger)
 	base := situation.WorkerConfig{
 		Lease:       time.Duration(sc.LeaseSeconds) * time.Second,
 		Interval:    time.Duration(sc.ReconcileIntervalSeconds) * time.Second,

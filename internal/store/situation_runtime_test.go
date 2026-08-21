@@ -472,3 +472,37 @@ func TestSituationRuntimeLoadsReadOnlySnapshotWithoutWriting(t *testing.T) {
 		t.Fatalf("read-only snapshot: %v", err)
 	}
 }
+
+func TestStoreCheckWritableReportsRealWriteCapability(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if err := s.CheckWritable(ctx); err != nil {
+		t.Fatalf("CheckWritable on a healthy store = %v, want nil", err)
+	}
+	// A closed store cannot take the write lock, so the probe reports the
+	// failure rather than replaying a cached verdict.
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CheckWritable(ctx); err == nil {
+		t.Fatal("CheckWritable on a closed store reported writable")
+	}
+}
+
+func TestSituationRuntimeReleaseToleratesAnAlreadyReleasedClaim(t *testing.T) {
+	s := newTestStore(t)
+	now := mustSituationTime(t, "2026-08-20T10:00:00Z")
+	ctx := context.Background()
+	claim := seedRuntimeSituation(t, s, "contended", "warning", "firing", now)
+	runtime := testRuntime(t, s, now)
+
+	due := situation.DueClaim{SituationID: claim.Situation.ID, ClaimOwner: claim.ClaimOwner, ClaimToken: claim.ClaimToken}
+	if err := runtime.ReleaseSituation(ctx, due, "boom", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	// Releasing a claim that is already gone reached the same end state, so it
+	// must not report a failure a caller would read as a storage outage.
+	if err := runtime.ReleaseSituation(ctx, due, "boom", now.Add(time.Minute)); err != nil {
+		t.Fatalf("second release = %v, want nil (routine lease contention is not a failure)", err)
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestInsertAndListIncidentAnnotations(t *testing.T) {
@@ -110,4 +111,53 @@ func TestOperatorAnnotations_Unbounded(t *testing.T) {
 	if err != nil || len(ops) != 1 {
 		t.Fatalf("want 1 permanent annotation, got %d, %v", len(ops), err)
 	}
+}
+
+// TestAnnotationOrderingSurvivesTrimmedTimestamps pins the newest-first
+// contract against the exact hazard that made it intermittent: created_at is
+// RFC3339Nano TEXT, which trims trailing zeros, so a later instant can sort
+// BELOW an earlier one under SQLite's lexical comparison (".0111Z" < ".011Z").
+// Ordering by the monotonic rowid is immune, so this is deterministic.
+func TestAnnotationOrderingSurvivesTrimmedTimestamps(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedIncident(t, s, "inc-order", "service=api", "analyzed", time.Now().UTC())
+
+	for _, note := range []string{"first", "second", "third"} {
+		if _, err := s.InsertIncidentAnnotation(ctx, "inc-order", "observation", note); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Force the adversarial pair: the newest row's timestamp sorts lexically
+	// below its predecessor's, exactly as RFC3339Nano trimming produces.
+	if _, err := s.DB().ExecContext(ctx,
+		`UPDATE incident_annotations SET created_at = '2026-08-21T14:33:08.011Z' WHERE note = 'second'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().ExecContext(ctx,
+		`UPDATE incident_annotations SET created_at = '2026-08-21T14:33:08.0111Z' WHERE note = 'third'`); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.ListIncidentAnnotations(ctx, "inc-order")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"third", "second", "first"}
+	if len(got) != len(want) {
+		t.Fatalf("annotations=%d, want %d", len(got), len(want))
+	}
+	for i, note := range want {
+		if got[i].Note != note {
+			t.Fatalf("annotations[%d]=%q, want %q (order=%v)", i, got[i].Note, note, notes(got))
+		}
+	}
+}
+
+func notes(in []IncidentAnnotation) []string {
+	out := make([]string, 0, len(in))
+	for _, a := range in {
+		out = append(out, a.Note)
+	}
+	return out
 }

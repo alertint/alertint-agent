@@ -151,6 +151,18 @@ func containsRecursiveModel(value any) bool {
 	return false
 }
 
+// situationIDParameter and inputVersionParameter are permitted on every
+// capability. A reduced fact must name the exact Situation and input version
+// it was gathered for, and the plan is the only per-execution carrier of that
+// identity — `situation_id` is a SCOPE key only for store_read, so every
+// other capability would otherwise have no way to express it at all. They are
+// permitted rather than required so a caller reducing outside a Situation (a
+// probe, a fixture) still validates.
+const (
+	situationIDParameter  = "situation_id"
+	inputVersionParameter = "input_version"
+)
+
 func validateCapabilityParameters(capability Capability, parameters map[string]any) error {
 	var required, permitted []string
 	switch capability.Name {
@@ -171,6 +183,7 @@ func validateCapabilityParameters(capability Capability, parameters map[string]a
 	default:
 		return fmt.Errorf("observation: capability %q has no parameter vocabulary", capability.Name)
 	}
+	permitted = append(permitted, situationIDParameter, inputVersionParameter)
 	allowed := make(map[string]struct{}, len(permitted))
 	for _, key := range permitted {
 		allowed[key] = struct{}{}

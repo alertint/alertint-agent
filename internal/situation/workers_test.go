@@ -358,3 +358,52 @@ func TestNotificationWorkerWithoutDelivererLeavesIntentsPending(t *testing.T) {
 		t.Fatalf("handled=%d delivered=%v; a Situation with no Slack sink must leave intents durable", handled, store.delivered)
 	}
 }
+
+// --------------------------------------------------------------------------
+// Readiness gate
+// --------------------------------------------------------------------------
+
+func TestRunOnceHonorsTheReadinessGateOnEveryEntryPoint(t *testing.T) {
+	store := newFakeInputStore(inputClaim("a"))
+	ready := false
+	var observed []error
+	cfg := WorkerConfig{
+		Owner:   "worker-1",
+		Ready:   func(context.Context) bool { return ready },
+		OnRound: func(_ int, err error) { observed = append(observed, err) },
+	}
+	w := NewInputWorker(store, cfg, fixedClock("2026-08-20T10:00:00Z"), nil)
+
+	// Gate closed: the round body never runs, so nothing is claimed and the
+	// observer is not called (a skipped round is not an outcome).
+	applied, err := w.RunOnce(context.Background())
+	if err != nil || applied != 0 {
+		t.Fatalf("gated round applied=%d err=%v", applied, err)
+	}
+	if len(store.applied) != 0 || len(observed) != 0 {
+		t.Fatalf("gate did not stop the round: applied=%v observed=%v", store.applied, observed)
+	}
+
+	// Gate reopened: the very next call runs for real and reports its outcome.
+	ready = true
+	applied, err = w.RunOnce(context.Background())
+	if err != nil || applied != 1 {
+		t.Fatalf("reopened round applied=%d err=%v", applied, err)
+	}
+	if len(observed) != 1 || observed[0] != nil {
+		t.Fatalf("observed=%v, want one successful round", observed)
+	}
+}
+
+func TestDrainHonorsTheReadinessGate(t *testing.T) {
+	store := newFakeInputStore(inputClaim("a"))
+	w := NewInputWorker(store, WorkerConfig{Owner: "worker-1", Ready: func(context.Context) bool { return false }},
+		fixedClock("2026-08-20T10:00:00Z"), nil)
+	applied, err := w.Drain(context.Background())
+	if err != nil || applied != 0 {
+		t.Fatalf("drain applied=%d err=%v", applied, err)
+	}
+	if len(store.applied) != 0 {
+		t.Fatalf("startup replay ran against unwritable storage: %v", store.applied)
+	}
+}

@@ -92,11 +92,17 @@ func insertAnnotationTx(ctx context.Context, tx *sql.Tx, incidentID, kind, note 
 
 // ListIncidentAnnotations returns every annotation of one incident,
 // newest-first.
+//
+// It orders by the monotonic rowid, not by created_at. created_at is stored
+// as RFC3339Nano TEXT, which trims trailing zeros — so ".011Z" sorts ABOVE
+// ".0111Z" under SQLite's lexical TEXT comparison and two annotations written
+// in the same millisecond can come back inverted. The rowid is assigned in
+// insertion order and has no such hazard.
 func (s *Store) ListIncidentAnnotations(ctx context.Context, incidentID string) ([]IncidentAnnotation, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, incident_id, kind, note, created_at
 		FROM incident_annotations WHERE incident_id = ?
-		ORDER BY created_at DESC, id DESC`, incidentID)
+		ORDER BY id DESC`, incidentID)
 	if err != nil {
 		return nil, fmt.Errorf("store: list annotations: %w", err)
 	}
@@ -127,7 +133,9 @@ type OperatorAnnotation struct {
 }
 
 // OperatorAnnotations returns every annotation on the key's incidents,
-// unbounded and newest-first, filtered to the caller's drill side (a real
+// unbounded and newest-first by insertion order (see
+// ListIncidentAnnotations on why not created_at), filtered to the caller's
+// drill side (a real
 // triage recalls only real incidents' notes and vice versa). Unbounded by
 // lookback: human writes are permanent (R7), not subject to time-based decay.
 // Unlike prior-finding recall it does NOT exclude the current incident: a
@@ -138,7 +146,7 @@ func (s *Store) OperatorAnnotations(ctx context.Context, groupKey string, curren
 		FROM incident_annotations a
 		JOIN incidents i ON i.id = a.incident_id
 		WHERE i.group_key = ?
-		ORDER BY a.created_at DESC, a.id DESC`,
+		ORDER BY a.id DESC`,
 		groupKey)
 	if err != nil {
 		return nil, fmt.Errorf("store: operator annotations: %w", err)

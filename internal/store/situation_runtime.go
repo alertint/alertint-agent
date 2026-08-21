@@ -155,25 +155,23 @@ func (r *SituationRuntime) ExtendSituationLease(ctx context.Context, situationID
 // ReleaseSituation drops a claim whose reconciliation failed, recording the
 // failure class and the next attempt time. The aggregate stays durable and
 // claimable; nothing about a failed attempt advances lifecycle.
+//
+// A claim that is already gone — the transition released it, or the lease
+// lapsed and another worker took over — reached the same end state, so this
+// reports success. Releasing is idempotent by design: routine lease
+// contention must never be mistaken for a storage failure by a caller that
+// gates readiness on round outcomes.
 func (r *SituationRuntime) ReleaseSituation(ctx context.Context, claim situation.DueClaim, class string, retryAt time.Time) error {
 	if strings.TrimSpace(claim.SituationID) == "" || strings.TrimSpace(claim.ClaimOwner) == "" || claim.ClaimToken <= 0 {
 		return errors.New("store: releasing a situation requires a complete claim")
 	}
 	now := r.clock().UTC()
-	res, err := r.st.db.ExecContext(ctx, `
+	if _, err := r.st.db.ExecContext(ctx, `
 		UPDATE situations
 		SET lease_owner = NULL, lease_expires_at = NULL, last_error_class = ?, retry_at = ?, updated_at = ?
 		WHERE id = ? AND lease_owner = ? AND claim_token = ?`,
-		class, canonicalTime(retryAt), canonicalTime(now), claim.SituationID, claim.ClaimOwner, claim.ClaimToken)
-	if err != nil {
+		class, canonicalTime(retryAt), canonicalTime(now), claim.SituationID, claim.ClaimOwner, claim.ClaimToken); err != nil {
 		return fmt.Errorf("store: release situation claim: %w", err)
-	}
-	changed, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("store: count released situation claim: %w", err)
-	}
-	if changed != 1 {
-		return ErrSituationLeaseLost
 	}
 	return nil
 }

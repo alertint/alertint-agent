@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"github.com/alertint/alertint-agent/internal/llm"
 	notifyslack "github.com/alertint/alertint-agent/internal/notify/slack"
 	notifystdout "github.com/alertint/alertint-agent/internal/notify/stdout"
+	"github.com/alertint/alertint-agent/internal/situation"
 	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/skills/acutetriage"
@@ -236,38 +238,129 @@ func TestReconstructionSchedulesActiveIncidentsWithoutPublishing(t *testing.T) {
 	}
 }
 
-func TestStoreWriteHealthGatesWorkAndRestoresReadiness(t *testing.T) {
+// failingInputStore is a real situation.InputStore whose claim call fails
+// while `broken` is set — the shape of a transient SQLITE_BUSY on the very
+// first statement of a worker round.
+type failingInputStore struct {
+	broken bool
+	claims int
+}
+
+func (f *failingInputStore) ClaimSituationInputs(_ context.Context, _ string, _ time.Time, _ time.Duration, _ int) ([]situation.InputClaim, error) {
+	f.claims++
+	if f.broken {
+		return nil, errors.New("database is locked")
+	}
+	return nil, nil
+}
+
+func (f *failingInputStore) ApplySituationInput(context.Context, situation.InputClaim) error {
+	return nil
+}
+
+func (f *failingInputStore) RetrySituationInput(context.Context, situation.InputClaim, string, time.Time, bool) error {
+	return nil
+}
+
+// TestStoreWriteHealthRecoversThroughALaterRealRound drives the whole
+// readiness path through a real worker: a real failing round degrades it, the
+// gate then blocks real rounds, and a later real round recovers it. Nothing
+// here calls Observe directly — the point is that the recovery PATH exists,
+// not that the mechanism can be poked.
+func TestStoreWriteHealthRecoversThroughALaterRealRound(t *testing.T) {
+	ctx := context.Background()
 	var logged bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	h := newStoreWriteHealth("/tmp/alertint.db", logger)
+
+	writable := false
+	h := newStoreWriteHealth("/tmp/alertint.db", func(context.Context) error {
+		if writable {
+			return nil
+		}
+		return errors.New("attempt to write a readonly database")
+	}, logger)
+	h.recheckAfter = 0 // probe on every gate consultation in the test
 	woken := 0
 	h.SetWake(func() { woken++ })
 
-	if !h.Ready() {
-		t.Fatal("fresh storage health should be ready")
+	backing := &failingInputStore{broken: true}
+	worker := situation.NewInputWorker(backing, situation.WorkerConfig{
+		Owner: "worker-1", Ready: h.Ready, OnRound: h.Observe,
+	}, func() time.Time { return time.Now().UTC() }, logger)
+
+	// A real round fails against unwritable storage: readiness degrades.
+	if _, err := worker.RunOnce(ctx); err == nil {
+		t.Fatal("expected the failing round to surface its error")
 	}
-	if err := h.Check().Probe(context.Background()); err != nil {
-		t.Fatalf("probe=%v, want healthy", err)
+	if h.Ready(ctx) {
+		t.Fatal("readiness stayed ready after a real failing round")
+	}
+	if err := h.Check().Probe(ctx); err == nil {
+		t.Fatal("health probe reported ok while storage is unwritable")
 	}
 
-	h.Observe(0, errors.New("disk I/O error"))
-	if h.Ready() {
-		t.Fatal("readiness stayed ready after an authoritative write failure")
+	// While degraded the gate blocks real rounds: the store is not touched.
+	claimsWhenDegraded := backing.claims
+	if _, err := worker.RunOnce(ctx); err != nil {
+		t.Fatalf("gated round returned %v, want a clean no-op", err)
 	}
-	if err := h.Check().Probe(context.Background()); err == nil {
-		t.Fatal("health probe stayed ok after an authoritative write failure")
+	if backing.claims != claimsWhenDegraded {
+		t.Fatalf("a gated round still reached storage: claims %d -> %d", claimsWhenDegraded, backing.claims)
 	}
-	h.Observe(0, errors.New("disk I/O error"))
 	if got := strings.Count(logged.String(), "sqlite write failed"); got != 1 {
 		t.Fatalf("logged %d ERROR lines, want exactly one per state change", got)
 	}
 
-	h.Observe(1, nil)
-	if !h.Ready() {
-		t.Fatal("a successful write did not restore readiness")
+	// Storage recovers. The next real round must run again — with no restart,
+	// and without anything calling Observe on its behalf.
+	writable = true
+	backing.broken = false
+	applied, err := worker.RunOnce(ctx)
+	if err != nil || applied != 0 {
+		t.Fatalf("recovered round applied=%d err=%v", applied, err)
 	}
-	if woken != 1 {
-		t.Fatalf("workers woken %d times on recovery, want 1", woken)
+	if backing.claims <= claimsWhenDegraded {
+		t.Fatalf("the round body never ran after recovery: claims %d -> %d", claimsWhenDegraded, backing.claims)
+	}
+	if !h.Ready(ctx) {
+		t.Fatal("readiness did not recover after storage became writable")
+	}
+	if err := h.Check().Probe(ctx); err != nil {
+		t.Fatalf("health probe = %v after recovery, want ok", err)
+	}
+	if woken == 0 {
+		t.Fatal("durable workers were never woken on recovery")
+	}
+}
+
+// TestStoreWriteHealthIgnoresRoutineContention proves ordinary multi-worker
+// outcomes never gate the runtime off.
+func TestStoreWriteHealthIgnoresRoutineContention(t *testing.T) {
+	ctx := context.Background()
+	h := newStoreWriteHealth("/tmp/alertint.db", func(context.Context) error { return nil }, slog.New(slog.DiscardHandler))
+	for _, err := range []error{
+		store.ErrSituationLeaseLost,
+		store.ErrSituationVersionConflict,
+		store.ErrAlertDispatchLeaseLost,
+		store.ErrNotificationNotPending,
+		store.ErrNotFound,
+		context.Canceled,
+		fmt.Errorf("situation: release situation s-1: %w", store.ErrSituationLeaseLost),
+	} {
+		h.Observe(0, err)
+		if !h.Ready(ctx) {
+			t.Fatalf("routine outcome %v degraded storage readiness", err)
+		}
+	}
+	// The check is not vacuous: a genuine storage error does degrade it, and
+	// only a successful re-probe brings it back.
+	failing := newStoreWriteHealth("/tmp/alertint.db", func(context.Context) error {
+		return errors.New("disk I/O error")
+	}, slog.New(slog.DiscardHandler))
+	failing.recheckAfter = 0
+	failing.Observe(0, errors.New("disk I/O error"))
+	if failing.Ready(ctx) {
+		t.Fatal("a genuine storage failure did not degrade readiness")
 	}
 }
 
@@ -334,5 +427,61 @@ func TestCutoverRuntimeTurnsADeliveryIntoASituationPoke(t *testing.T) {
 	}
 	if intents[0].ClientMessageID == "" {
 		t.Fatal("intent carries no deterministic client message id; a retry could duplicate the post")
+	}
+}
+
+// TestServeWiresObservationExecutorsForConfiguredConnectors proves the
+// cut-over runtime gathers evidence from the connectors this installation
+// actually runs, and stays honestly unavailable for the ones it does not.
+func TestServeWiresObservationExecutorsForConfiguredConnectors(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Defaults()
+	cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "alertint.db")
+	st, err := store.Open(ctx, cfg.Storage.SQLitePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	// A zero-integration installation still reduces its own delivery ledger.
+	bare := buildObservationSources(&cfg, st, nil, nil, nil, nil)
+	if bare.Situations == nil {
+		t.Fatal("the local store_read reducer is not wired; a zero-integration install would gather nothing")
+	}
+	for _, name := range bare.Unavailable() {
+		if name == "store_read" {
+			t.Fatal("store_read reported unavailable on an install that has a store")
+		}
+	}
+
+	// A configured Zabbix installation gets the problem timeline and metric
+	// range reducers Task 6's support was built for.
+	enabled := true
+	cfg.Zabbix.API.Enabled = &enabled
+	cfg.Zabbix.API.BaseURL = "https://zabbix.example.com"
+	cfg.Zabbix.API.APITokenEnv = "ALERTINT_ZABBIX_TOKEN"
+	t.Setenv("ALERTINT_ZABBIX_TOKEN", "zbx-token")
+	zbx, err := newZabbixClient(&cfg, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if zbx == nil {
+		t.Fatal("zabbix api is enabled but no client was built")
+	}
+	wired := buildObservationSources(&cfg, st, nil, nil, nil, zbx)
+	if wired.Zabbix == nil {
+		t.Fatal("zabbix is configured but its observation reducers are not wired")
+	}
+	for _, name := range wired.Unavailable() {
+		if strings.HasPrefix(name, "zabbix") {
+			t.Fatalf("%q reported unavailable while zabbix is configured", name)
+		}
+	}
+
+	// A disabled connector must never be wired as a typed-nil client, which
+	// would look available and then fail every call.
+	if wired.Prometheus != nil || wired.Logs != nil || wired.Sentry != nil {
+		t.Fatalf("a disabled connector was wired: prom=%v logs=%v sentry=%v",
+			wired.Prometheus != nil, wired.Logs != nil, wired.Sentry != nil)
 	}
 }

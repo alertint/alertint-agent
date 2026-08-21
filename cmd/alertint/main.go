@@ -363,6 +363,9 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		Model:       cfg.LLM.Model,
 		Stdout:      situationStdout,
 		SlackClient: slackClient,
+		// The Situation controller gathers bounded evidence from the same
+		// read-only connectors L1 already uses.
+		Observations: buildObservationSources(cfg, st, prom, logSrc, sentryClient, zbxClient),
 	}, logger)
 	if err != nil {
 		return err
