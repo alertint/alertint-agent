@@ -548,13 +548,23 @@ func (r *SituationRuntime) AppendAssessmentAttempt(ctx context.Context, claim si
 }
 
 // CommitAuthoritative appends the authoritative attempt and applies the
-// transition together with every notification intent it requires.
+// transition together with every notification intent it requires — all in
+// ONE transaction.
 //
-// The intents are planned here and handed to CommitSituationTransition so
-// they commit in the SAME transaction as the transition: there is deliberately
-// no path that commits a transition and then separately publishes it, because
-// a crash in that window would silently drop a promised Slack effect with no
-// durable record one was ever owed.
+// The intents are planned here and handed to the commit so they land in the
+// SAME transaction as the transition: there is deliberately no path that
+// commits a transition and then separately publishes it, because a crash in
+// that window would silently drop a promised Slack effect with no durable
+// record one was ever owed.
+//
+// The authoritative attempt is in that same transaction for the mirror-image
+// reason. When the attempt was its own commit, a crash between the two writes
+// left a durable status='authoritative' attempt with no transition; on
+// restart LastTrustedAssessment reads that orphan back as the covering
+// decision, and an orphan carrying evidence_quality 'complete' then makes the
+// B+ covered-hash gate suppress every later pass on an unchanged material
+// hash — the promised transition, urgent poke included, would never commit at
+// all. Either both writes land or neither does.
 func (r *SituationRuntime) CommitAuthoritative(ctx context.Context, claim situation.Claim, attempt situation.AssessmentAttempt, tr model.Transition) error {
 	stored, err := storeAssessmentAttempt(claim, attempt)
 	if err != nil {
@@ -562,18 +572,14 @@ func (r *SituationRuntime) CommitAuthoritative(ctx context.Context, claim situat
 	}
 	storedClaim := storeSituationClaim(claim)
 
-	intents, err := r.planTransitionIntents(ctx, claim, tr)
+	plan, err := r.planTransitionIntents(ctx, claim, tr)
 	if err != nil {
 		return err
 	}
-	if err := r.st.AppendAssessmentAttempt(ctx, storedClaim, stored); err != nil {
-		if errors.Is(err, ErrSituationVersionConflict) {
-			return situation.ErrStaleInput
-		}
-		return err
-	}
 	assessmentID := attempt.ID
-	if err := r.st.CommitSituationTransition(ctx, storedClaim, tr, &assessmentID, intents); err != nil {
+	plan.attempt = &stored
+	plan.assessmentID = &assessmentID
+	if err := r.st.commitSituationTransition(ctx, storedClaim, tr, plan); err != nil {
 		if errors.Is(err, ErrSituationVersionConflict) {
 			return situation.ErrStaleInput
 		}
@@ -618,33 +624,51 @@ func (r *SituationRuntime) observeTransition(ctx context.Context, tr model.Trans
 // planTransitionIntents resolves the durable publication context and runs
 // the deterministic planner. The planner's output is the input to the atomic
 // commit — never a separate publish call.
-func (r *SituationRuntime) planTransitionIntents(ctx context.Context, claim situation.Claim, tr model.Transition) ([]model.NotificationIntent, error) {
+func (r *SituationRuntime) planTransitionIntents(ctx context.Context, claim situation.Claim, tr model.Transition) (situationTransitionCommit, error) {
 	channel, messageTS, published, err := r.st.SituationRootCoordinates(ctx, claim.Situation.ID)
 	if err != nil && !errors.Is(err, ErrNotFound) {
-		return nil, err
+		return situationTransitionCommit{}, err
 	}
 	root := situation.RootCoordinates{Exists: published, Channel: channel, MessageTS: messageTS}
+	var withheldRootID string
 	if !root.Exists {
-		// A still-undelivered root-create already reserves the Situation's one
-		// root; treating it as absent would plan a second one.
-		reserved, err := r.st.HasRootCreateIntent(ctx, claim.Situation.ID)
+		reserved, ok, err := r.st.ReservedRootCreateIntent(ctx, claim.Situation.ID)
 		if err != nil {
-			return nil, err
+			return situationTransitionCommit{}, err
 		}
-		root.Exists = reserved
+		switch {
+		case !ok:
+			// No reservation at all: this transition may mint the one root.
+		case reserved.Status == model.NotificationWithheldByOperatorSlackFloor:
+			// The Situation's one root is reserved by a root create the
+			// operator floor withheld and that therefore never delivered, so
+			// the Situation has no Slack surface at all. Planning root EDITS
+			// against it would fail "situation root is not published yet"
+			// forever and dead-letter every later effect — permanently
+			// silencing the Situation, including a poke the deterministic
+			// critical floor is never allowed to suppress. Plan this
+			// transition as the Situation's first publication instead, and
+			// reactivate that reserved row below when it now clears the floor.
+			withheldRootID = reserved.ID
+		default:
+			// A still-undelivered but deliverable root create already reserves
+			// the Situation's one root; treating it as absent would plan a
+			// second one.
+			root.Exists = true
+		}
 	}
 
 	prior, err := r.priorTransition(ctx, claim.Situation.ID)
 	if err != nil {
-		return nil, err
+		return situationTransitionCommit{}, err
 	}
 	lastPoke, err := r.lastMainChannelPokeAt(ctx, claim.Situation.ID)
 	if err != nil {
-		return nil, err
+		return situationTransitionCommit{}, err
 	}
 	recurrenceCount, recurrenceTrigger, err := r.recurrenceContext(ctx, claim.Situation.ID)
 	if err != nil {
-		return nil, err
+		return situationTransitionCommit{}, err
 	}
 
 	planned := situation.PlanNotificationIntents(situation.PublishInput{
@@ -660,15 +684,48 @@ func (r *SituationRuntime) planTransitionIntents(ctx context.Context, claim situ
 		CooldownSeconds:       r.policy.RepageCooldownSeconds,
 		Now:                   tr.CreatedAt.UTC(),
 	})
+	if withheldRootID != "" {
+		return reactivationCommit(withheldRootID, planned), nil
+	}
 	out := make([]model.NotificationIntent, 0, len(planned))
 	for _, intent := range planned {
 		prepared, err := r.withClientMessageID(intent)
 		if err != nil {
-			return nil, err
+			return situationTransitionCommit{}, err
 		}
 		out = append(out, prepared)
 	}
-	return out, nil
+	return situationTransitionCommit{intents: out}, nil
+}
+
+// reactivationCommit turns the first-publication plan computed against a
+// reserved-but-withheld root into a commit that reuses that exact reserved
+// row. planned is whatever the planner decides this Situation's first
+// publication is — nothing at all (no sufficient reason), or the single root
+// create, either still withheld by the floor or now pending because it clears
+// it. Only the pending case reactivates.
+//
+// No new intent is ever persisted here. The Situation owns exactly one
+// root_create for its whole life (notification_intents_one_root_create_idx),
+// the reserved row already IS that root, and its idempotency key and
+// client_msg_id stay exactly as first planned — so a Slack retry of the
+// reactivated post remains idempotent. Nor is a root edit planned alongside
+// it: a first publication plans only the root, and the delivery path renders
+// the Situation's current durable state at delivery time, so the reactivated
+// root already publishes what this transition just made true. Any dependent
+// effect a LATER transition plans still orders itself correctly behind the
+// root through the deliverer's existing "situation root is not published yet"
+// retry.
+func reactivationCommit(reservedID string, planned []model.NotificationIntent) situationTransitionCommit {
+	for _, intent := range planned {
+		if intent.Kind != model.NotificationSituationRootCreate || intent.Status != model.NotificationPending || intent.InterruptionPriority == nil {
+			continue
+		}
+		return situationTransitionCommit{reactivateRootCreate: &rootCreateReactivation{id: reservedID, priority: *intent.InterruptionPriority}}
+	}
+	// Still below the operator floor, or nothing worth publishing at all: the
+	// reserved root stays withheld and this transition leaves no Slack trace.
+	return situationTransitionCommit{}
 }
 
 // priorTransition rebuilds the Situation's previous committed transition

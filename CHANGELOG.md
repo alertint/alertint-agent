@@ -11,6 +11,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added the proactive Situation controller: durable Alert delivery tracking, bounded Situation investigation, one evolving Slack thread with viewer-local update promises and recovery confirmation, structured MCP steering and expected-behaviour envelopes, plus local notification-compression reporting.
 
+### Changed
+
+- Slack output is now per Situation instead of per Incident. One Situation root
+  is posted once and edited in place for the whole operational episode, with
+  thread replies for recurrence and a broadcast reply only on a genuine
+  handoff — replacing the per-Incident firing/resolved card pair and its
+  occurrence edits.
+- `notify.slack.min_severity` keeps its compatibility name but now gates a
+  deterministic Interruption priority (`low` | `medium` | `high` | `critical`)
+  derived from the validated reason, Attention, and action contract — never
+  Alert source severity or a model-generated field. `critical` always passes,
+  and the floor only ever withholds a new main-channel poke, never an in-place
+  root edit, thread history, ingestion, Assessment, or MCP visibility.
+- `notify.stdout` now writes one versioned Situation-state JSON line per newly
+  authoritative Assessment or material lifecycle transition — including a
+  silent Situation that never reaches Slack — instead of a per-finding line.
+
+### Removed
+
+- Removed per-Incident Slack notification from `serve`. This is a hard
+  cutover: there is no runtime toggle back to an "Incident notifies" mode, and
+  the Situation controller is the only Slack writer in this build. The legacy
+  Incident card renderers remain in the tree for fixture tests but are no
+  longer reachable from `serve`; historical Incident Slack data and the
+  existing Incident/evidence MCP tools are preserved unchanged.
+- Removed the L1 acute finding's own outward output: a finding no longer posts
+  or edits a Slack message, and no longer emits its own stdout unit. A finding
+  is evidence the Situation controller consumes — it carries no Attention or
+  notification authority of its own.
+
 ## [0.13.3] - 2026-08-18
 
 ### Security

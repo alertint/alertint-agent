@@ -28,7 +28,9 @@ makes each analysis falsify its own draft before the finding persists, and an
 operator **verdict** captured over MCP steers the next triage of that failure
 group. A third loop closes at the Situation level: an operator **judgment**
 or a reusable **Expected-behaviour envelope** steers the existing Situation
-root directly, without minting a new one.
+root directly, without minting a new one — envelope steering is recomputed
+on an MCP call today, not automatically during reconciliation (see
+[known gaps](#situation-controller-known-gaps)).
 
 ## Phase 1 — Ingest and triage (Incident, L1)
 
@@ -325,11 +327,19 @@ Summarizing the honesty carries called out above, in one place:
 4. **`notify.slack.min_severity` uses a permissive Interruption-priority
    mapping.** `warning` maps to `medium`, `unknown`/unset maps to `low`, and
    `critical` always passes — this floor never withholds a critical poke.
+5. **Semantic profiles are never inferred automatically.** Bounded advisory
+   L0 inference is implemented and tested, but nothing in the delivery path
+   calls it, so a profile head only ever exists where an operator created one
+   over MCP (`alertint_semantic_profile_correct`). With no head, the advisory
+   horizon widening that would extend a slow source's lifecycle-observation
+   deadline never engages, and every Situation falls back to the
+   deterministic tier default.
 
 None of these change what is durably persisted, what MCP can read, or the
 correctness of the parts that are wired; they change what data reaches a
-Situation's automatic facts and how finely the outward Slack floor and
-recovery timing can be tuned per source today.
+Situation's automatic facts and how finely the outward Slack floor, the
+lifecycle-observation horizon, and recovery timing can be tuned per source
+today.
 
 ## Phase 2 — Investigate
 

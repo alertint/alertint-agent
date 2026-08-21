@@ -41,6 +41,88 @@ func (s *Store) HasRootCreateIntent(ctx context.Context, situationID string) (bo
 	return exists == 1, nil
 }
 
+// ReservedRootCreate is the Situation's one reserved root-create intent, as
+// the deterministic planner needs to see it: its identity plus the status
+// that decides whether it can still become the Situation's Slack surface. A
+// pending or delivered reservation means "this Situation has (or will shortly
+// have) a root"; a withheld_by_operator_slack_floor reservation means the
+// opposite — the row reserves the one root the partial unique index allows,
+// but it will never deliver on its own, so the Situation still has no Slack
+// surface at all.
+type ReservedRootCreate struct {
+	ID     string
+	Status situationmodel.NotificationStatus
+}
+
+// ReservedRootCreateIntent returns the Situation's reserved root-create intent
+// when one exists. The planner needs the status, not just existence: a
+// withheld root create permanently reserves the Situation's one root while
+// never publishing it, so planning root EDITS against it would dead-letter
+// every later outward effect — including a critical poke, which the operator
+// floor is never allowed to suppress. See
+// SituationRuntime.planTransitionIntents for the reactivation seam.
+func (s *Store) ReservedRootCreateIntent(ctx context.Context, situationID string) (ReservedRootCreate, bool, error) {
+	if strings.TrimSpace(situationID) == "" {
+		return ReservedRootCreate{}, false, errors.New("store: root-create reservation lookup requires a situation id")
+	}
+	var out ReservedRootCreate
+	var status string
+	err := s.db.QueryRowContext(ctx, `SELECT id, status FROM notification_intents
+		WHERE situation_id = ? AND kind = 'situation_root_create'`, situationID).Scan(&out.ID, &status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ReservedRootCreate{}, false, nil
+	}
+	if err != nil {
+		return ReservedRootCreate{}, false, fmt.Errorf("store: read reserved root-create intent: %w", err)
+	}
+	out.Status = situationmodel.NotificationStatus(status)
+	return out, true, nil
+}
+
+// rootCreateReactivation names the reserved-but-withheld root create to
+// return to pending, and the Interruption priority that now clears the
+// operator floor. Reactivation is an UPDATE by design: only DELETE is
+// trigger-blocked on notification_intents, and the row must be reused rather
+// than replaced because notification_intents_one_root_create_idx allows
+// exactly one root create per Situation for its whole life.
+type rootCreateReactivation struct {
+	id       string
+	priority situationmodel.InterruptionPriority
+}
+
+// reactivateWithheldRootCreateTx flips the reserved root create back to
+// pending and restamps the Interruption priority that now clears the floor,
+// leaving id, idempotency_key, and client_msg_id untouched: the reactivated
+// row is the same promised effect, and reusing its client_msg_id is exactly
+// what keeps a Slack retry idempotent. It never carries rendered content —
+// the delivery path renders the Situation's current durable state at delivery
+// time, so a reactivated root publishes what is true now, not what was true
+// when the floor withheld it.
+func reactivateWithheldRootCreateTx(ctx context.Context, tx *sql.Tx, situationID string, in rootCreateReactivation) error {
+	if strings.TrimSpace(in.id) == "" || strings.TrimSpace(situationID) == "" {
+		return errors.New("store: root-create reactivation requires an intent id and a situation id")
+	}
+	if !validInterruptionPriority(in.priority) {
+		return fmt.Errorf("store: reactivated root-create interruption priority %q is invalid", in.priority)
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE notification_intents
+		SET status = 'pending', interruption_priority = ?, retry_at = NULL
+		WHERE id = ? AND situation_id = ? AND kind = 'situation_root_create'
+		  AND status = 'withheld_by_operator_slack_floor' AND delivered_at IS NULL`,
+		string(in.priority), in.id, situationID)
+	if err != nil {
+		return fmt.Errorf("store: reactivate withheld root-create intent: %w", err)
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: count reactivated root-create intent: %w", err)
+	}
+	if changed != 1 {
+		return ErrNotificationNotPending
+	}
+	return nil
+}
+
 // CreateNotificationIntent persists one intended outward Slack effect before
 // any I/O — the durable guarantee every notification delivery relies on. It
 // is idempotent on idempotency_key: a retry that recomputes the identical

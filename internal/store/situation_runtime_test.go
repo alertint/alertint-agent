@@ -506,3 +506,268 @@ func TestSituationRuntimeReleaseToleratesAnAlreadyReleasedClaim(t *testing.T) {
 		t.Fatalf("second release = %v, want nil (routine lease contention is not a failure)", err)
 	}
 }
+
+// testRuntimeWithFloor is testRuntime with an explicit outward min_severity
+// floor, so a test can exercise what the operator floor withholds.
+func testRuntimeWithFloor(t *testing.T, s *Store, now time.Time, floor situationmodel.InterruptionPriority) *SituationRuntime {
+	t.Helper()
+	return NewSituationRuntime(s,
+		func(key string) string { return "cmid:" + key },
+		func(d AlertDelivery) string { return "signature:" + d.Source },
+		func() time.Time { return now },
+		SituationRuntimePolicy{MinSeverity: floor, HorizonTier: situation.HorizonHours},
+	)
+}
+
+// reclaimRuntimeSituation takes the reconciliation lease again after a commit
+// released it — the ordinary "next due pass" a worker performs.
+func reclaimRuntimeSituation(t *testing.T, s *Store, now time.Time) situation.Claim {
+	t.Helper()
+	claims, err := s.ClaimDueSituations(context.Background(), "reconciler", now, time.Minute, 1)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("reclaim=%+v err=%v", claims, err)
+	}
+	return situation.Claim{Situation: claims[0].Situation, ClaimOwner: claims[0].ClaimOwner, ClaimToken: claims[0].ClaimToken}
+}
+
+// mediumFloorAssessment carries a sufficient reason (so a first publication is
+// planned at all) whose deterministic Interruption priority is `medium` —
+// below a `high` operator floor.
+func mediumFloorAssessment(nextUpdate time.Time) situationmodel.Assessment {
+	return situationmodel.Assessment{
+		SchemaVersion: situation.AssessmentSchemaVersion, Persistence: situationmodel.PersistenceUnknown,
+		Impact: situationmodel.ImpactUnknown, Novelty: situationmodel.NoveltyInsufficientHistory,
+		Causality: situationmodel.CausalityUnknown, Attention: situationmodel.AttentionInvestigate,
+		Lifecycle: situationmodel.LifecycleActive, EvidenceQuality: situationmodel.EvidenceQualityComplete,
+		SufficientReason: &situationmodel.SufficientReason{
+			CandidateID: "confirmed_severe_impact", Code: "confirmed_severe_impact",
+			Summary: "confirmed severe impact", EvidenceRefs: []string{"delivery:delivery-floor"},
+		},
+		ActionContract: situationmodel.ActionContract{
+			NextActor: situationmodel.NextActorAlertint, ActionStatus: situationmodel.ActionStatusPlanned,
+			NextUpdateAt: &nextUpdate, NextUpdateOn: []string{"recovery_observed"},
+		},
+		ProposedCadence: situationmodel.CadenceNormal,
+	}
+}
+
+// criticalFloorAssessment is the deterministic critical anchor — the priority
+// the binding constraint says always passes the outward floor.
+func criticalFloorAssessment(nextUpdate time.Time) situationmodel.Assessment {
+	assessment := mediumFloorAssessment(nextUpdate)
+	assessment.Attention = situationmodel.AttentionUrgent
+	assessment.SufficientReason = &situationmodel.SufficientReason{
+		CandidateID: "critical_anchor", Code: "critical_anchor",
+		Summary: "active critical severity", EvidenceRefs: []string{"delivery:delivery-floor"},
+	}
+	assessment.ProposedCadence = situationmodel.CadenceFast
+	return assessment
+}
+
+func floorAttempt(t *testing.T, claim situation.Claim, id string, sequence int, assessment situationmodel.Assessment, now time.Time) situation.AssessmentAttempt {
+	t.Helper()
+	return situation.AssessmentAttempt{
+		ID: id, Sequence: sequence, InputVersion: claim.Situation.InputVersion, FactHash: "hash-" + id,
+		Actor: situation.AssessmentActorDeterministic, Status: situation.AttemptStatusAuthoritative,
+		TriggerReasons: []string{"incident_created"}, SnapshotDigest: "hash-" + id,
+		Validated: mustJSONFixture(t, assessment), CreatedAt: now, CompletedAt: &now,
+	}
+}
+
+func floorTransition(claim situation.Claim, id string, assessment situationmodel.Assessment, now time.Time) situationmodel.Transition {
+	return situationmodel.Transition{
+		ID: id, SituationID: claim.Situation.ID, InputVersion: claim.Situation.InputVersion,
+		Lifecycle: assessment.Lifecycle, Attention: assessment.Attention,
+		Assessment: &assessment, ActionContract: assessment.ActionContract, Reason: "incident_created", CreatedAt: now,
+	}
+}
+
+func situationRootCreateRow(t *testing.T, s *Store, situationID string) situationmodel.NotificationIntent {
+	t.Helper()
+	intents, err := s.SituationNotifications(context.Background(), situationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found []situationmodel.NotificationIntent
+	for _, intent := range intents {
+		if intent.Kind == situationmodel.NotificationSituationRootCreate {
+			found = append(found, intent)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("root creates=%d, want exactly one for the Situation's whole life: %+v", len(found), intents)
+	}
+	return found[0]
+}
+
+// TestSituationRuntimeWithheldRootReactivatesWhenTheFloorIsCrossed proves a
+// Situation whose FIRST publication the operator floor withheld can still
+// publish its one root when a later transition crosses the deterministic
+// critical floor. The withheld row permanently reserves the Situation's only
+// root_create (notification_intents_one_root_create_idx), so before this fix
+// every later transition planned a root EDIT against a root that was never
+// posted — the deliverer answered "situation root is not published yet"
+// forever and the critical poke was lost, violating "`critical` always
+// passes".
+func TestSituationRuntimeWithheldRootReactivatesWhenTheFloorIsCrossed(t *testing.T) {
+	s := newTestStore(t)
+	now := mustSituationTime(t, "2026-08-20T10:00:00Z")
+	ctx := context.Background()
+	claim := seedRuntimeSituation(t, s, "floor", "warning", "firing", now)
+	runtime := testRuntimeWithFloor(t, s, now, situationmodel.PriorityHigh)
+
+	firstUpdate := now.Add(time.Minute)
+	quiet := mediumFloorAssessment(firstUpdate)
+	if err := runtime.CommitAuthoritative(ctx, claim,
+		floorAttempt(t, claim, "attempt-floor-1", 1, quiet, now),
+		floorTransition(claim, "transition-floor-1", quiet, now)); err != nil {
+		t.Fatal(err)
+	}
+	withheld := situationRootCreateRow(t, s, claim.Situation.ID)
+	if withheld.Status != situationmodel.NotificationWithheldByOperatorSlackFloor {
+		t.Fatalf("first publication status=%q, want the operator floor to withhold it", withheld.Status)
+	}
+
+	// The Situation escalates to the deterministic critical anchor.
+	later := now.Add(2 * time.Minute)
+	reclaimed := reclaimRuntimeSituation(t, s, later)
+	escalated := criticalFloorAssessment(later.Add(time.Minute))
+	if err := testRuntimeWithFloor(t, s, later, situationmodel.PriorityHigh).CommitAuthoritative(ctx, reclaimed,
+		floorAttempt(t, reclaimed, "attempt-floor-2", 2, escalated, later),
+		floorTransition(reclaimed, "transition-floor-2", escalated, later)); err != nil {
+		t.Fatal(err)
+	}
+
+	intents, err := s.SituationNotifications(ctx, claim.Situation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(intents) != 1 {
+		t.Fatalf("intents=%+v; the reactivated root is the whole publication — no edit against an unpublished root", intents)
+	}
+	root := intents[0]
+	if root.Kind != situationmodel.NotificationSituationRootCreate || root.Status != situationmodel.NotificationPending {
+		t.Fatalf("root=%+v, want the reserved root create returned to pending", root)
+	}
+	if root.InterruptionPriority == nil || *root.InterruptionPriority != situationmodel.PriorityCritical {
+		t.Fatalf("interruption priority=%v, want the critical priority that cleared the floor", root.InterruptionPriority)
+	}
+	if !root.MainChannelPoke {
+		t.Fatal("reactivated root is not a main-channel poke; the critical escalation would never interrupt")
+	}
+	// Identity must stay exactly as first planned: the reserved row IS the
+	// Situation's one root, and its client_msg_id is what keeps a Slack retry
+	// of the post idempotent.
+	if root.ID != withheld.ID || root.IdempotencyKey != withheld.IdempotencyKey || root.ClientMessageID != withheld.ClientMessageID {
+		t.Fatalf("reactivated root identity drifted: %+v vs %+v", root, withheld)
+	}
+}
+
+// TestSituationRuntimeWithheldRootStaysWithheldBelowTheFloor is the negative
+// half: a later transition that still ranks below the operator floor must
+// neither publish the reserved root nor plan an undeliverable edit against it.
+func TestSituationRuntimeWithheldRootStaysWithheldBelowTheFloor(t *testing.T) {
+	s := newTestStore(t)
+	now := mustSituationTime(t, "2026-08-20T10:00:00Z")
+	ctx := context.Background()
+	claim := seedRuntimeSituation(t, s, "floor", "warning", "firing", now)
+	runtime := testRuntimeWithFloor(t, s, now, situationmodel.PriorityHigh)
+
+	quiet := mediumFloorAssessment(now.Add(time.Minute))
+	if err := runtime.CommitAuthoritative(ctx, claim,
+		floorAttempt(t, claim, "attempt-quiet-1", 1, quiet, now),
+		floorTransition(claim, "transition-quiet-1", quiet, now)); err != nil {
+		t.Fatal(err)
+	}
+	first := situationRootCreateRow(t, s, claim.Situation.ID)
+
+	later := now.Add(2 * time.Minute)
+	reclaimed := reclaimRuntimeSituation(t, s, later)
+	stillQuiet := mediumFloorAssessment(later.Add(time.Minute))
+	if err := testRuntimeWithFloor(t, s, later, situationmodel.PriorityHigh).CommitAuthoritative(ctx, reclaimed,
+		floorAttempt(t, reclaimed, "attempt-quiet-2", 2, stillQuiet, later),
+		floorTransition(reclaimed, "transition-quiet-2", stillQuiet, later)); err != nil {
+		t.Fatal(err)
+	}
+
+	intents, err := s.SituationNotifications(ctx, claim.Situation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(intents) != 1 {
+		t.Fatalf("intents=%+v; a still-withheld Situation gains no Slack effect at all", intents)
+	}
+	if intents[0].ID != first.ID || intents[0].Status != situationmodel.NotificationWithheldByOperatorSlackFloor {
+		t.Fatalf("root=%+v, want the same row still withheld", intents[0])
+	}
+}
+
+// TestSituationRuntimeAuthoritativeCommitIsAtomicAcrossTheAttemptBoundary is
+// the crash-boundary proof for CommitAuthoritative: the authoritative attempt
+// and the transition it authorizes are ONE transaction. A rollback anywhere in
+// that transaction must leave no orphan authoritative attempt, because
+// LastTrustedAssessment would read the orphan back as the covering decision
+// and — with evidence_quality 'complete' — the B+ covered-hash gate would then
+// suppress every later pass on an unchanged material hash, so the promised
+// transition (urgent poke included) would never commit at all.
+func TestSituationRuntimeAuthoritativeCommitIsAtomicAcrossTheAttemptBoundary(t *testing.T) {
+	s := newTestStore(t)
+	now := mustSituationTime(t, "2026-08-20T10:00:00Z")
+	ctx := context.Background()
+	claim := seedRuntimeSituation(t, s, "atomic", "critical", "firing", now)
+	runtime := testRuntime(t, s, now)
+
+	nextUpdate := now.Add(time.Minute)
+	assessment := criticalFloorAssessment(nextUpdate)
+	attempt := floorAttempt(t, claim, "attempt-atomic", 1, assessment, now)
+
+	// An active transition with no next_update_at fails inside the commit
+	// transaction, after the attempt insert — the exact crash boundary the
+	// two-transaction version could not survive.
+	doomed := floorTransition(claim, "transition-atomic", assessment, now)
+	doomed.ActionContract.NextUpdateAt = nil
+	if err := runtime.CommitAuthoritative(ctx, claim, attempt, doomed); err == nil {
+		t.Fatal("expected the invalid transition to fail the commit")
+	}
+
+	var attempts int
+	if err := s.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM situation_assessment_attempts WHERE id = ?`, "attempt-atomic").Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 0 {
+		t.Fatalf("orphan authoritative attempts=%d; the rolled-back transition left a durable attempt behind", attempts)
+	}
+	trusted, prior, err := runtime.LastTrustedAssessment(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trusted.Trustworthy || prior != nil || trusted.Sequence != 0 {
+		t.Fatalf("trusted=%+v prior=%+v; an orphan attempt would cover the hash and suppress every later pass", trusted, prior)
+	}
+	intents, err := s.SituationNotifications(ctx, claim.Situation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(intents) != 0 {
+		t.Fatalf("intents=%+v, want none from a rolled-back commit", intents)
+	}
+
+	// "Restart": the same reconciliation runs again and commits for real.
+	if err := runtime.CommitAuthoritative(ctx, claim, attempt, floorTransition(claim, "transition-atomic", assessment, now)); err != nil {
+		t.Fatalf("post-restart commit: %v", err)
+	}
+	committed, err := s.GetSituation(ctx, claim.Situation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed.CurrentAssessmentID == nil || *committed.CurrentAssessmentID != "attempt-atomic" {
+		t.Fatalf("current assessment=%v, want the retried attempt", committed.CurrentAssessmentID)
+	}
+	if !committed.NextAssessmentAt.Equal(nextUpdate) {
+		t.Fatalf("next assessment=%s, want %s", committed.NextAssessmentAt, nextUpdate)
+	}
+	root := situationRootCreateRow(t, s, claim.Situation.ID)
+	if root.Status != situationmodel.NotificationPending {
+		t.Fatalf("root=%+v, want the promised poke pending after the retry", root)
+	}
+}

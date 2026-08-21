@@ -308,7 +308,7 @@ func runSituationRoundsFixture(t *testing.T, fixture replayFixture) {
 		// so the harness knows deterministically whether to expect a
 		// completion signal rather than guessing from stale gate state.
 		outcome := ReconcileLifecycle(situationRow, orderedSymptoms, nil, clockNow, replayRecoveryGrace)
-		l1WillDispatch := !(outcome.Changed && outcome.Terminal)
+		l1WillDispatch := !(outcome.Changed && outcome.Decisive)
 
 		if err := ctrl.Reconcile(context.Background(), replaySituationID); err != nil {
 			t.Fatalf("round %d: reconcile: %v", inputVersion, err)

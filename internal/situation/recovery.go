@@ -256,13 +256,15 @@ type LifecycleOutcome struct {
 	Situation model.Situation
 	// Changed is true when a lifecycle transition applies this pass.
 	Changed bool
-	// Terminal is true when the outcome must be committed directly and the
+	// Decisive is true when the outcome must be committed directly and the
 	// pass must skip L1/L2 entirely (grace expiry, closed_unknown, and
 	// entering recovery_pending are all controller-owned, model-free
-	// commits). A refire (Changed=true, Terminal=false) instead falls
-	// through to the ordinary L1/L2 path so current facts are reassessed
-	// (D4: "returns to active and reassesses current facts").
-	Terminal bool
+	// commits). It does NOT mean the resulting Lifecycle is terminal —
+	// recovery_pending is decisive and nonterminal, and only `recovered` and
+	// `closed_unknown` are terminal. A refire (Changed=true, Decisive=false)
+	// instead falls through to the ordinary L1/L2 path so current facts are
+	// reassessed (D4: "returns to active and reassesses current facts").
+	Decisive bool
 	Event    Event
 }
 
@@ -277,20 +279,20 @@ type LifecycleOutcome struct {
 func ReconcileLifecycle(s model.Situation, symptoms []Symptom, uncertainty *TerminalUncertainty, now time.Time, grace time.Duration) LifecycleOutcome {
 	if uncertainty != nil && uncertainty.DeadlineCrossed && uncertainty.Actionable && validTerminalUncertainty(uncertainty.Reason) {
 		if next, err := CloseUnknown(s, uncertainty.Reason, now); err == nil {
-			return LifecycleOutcome{Situation: next, Changed: true, Terminal: true, Event: EventLifecycleUnobservable}
+			return LifecycleOutcome{Situation: next, Changed: true, Decisive: true, Event: EventLifecycleUnobservable}
 		}
 	}
 	switch s.Lifecycle {
 	case model.LifecycleRecoveryPending:
 		if hasFiringSymptom(symptoms) {
-			return LifecycleOutcome{Situation: ObserveRefire(s, now), Changed: true, Terminal: false, Event: EventRefired}
+			return LifecycleOutcome{Situation: ObserveRefire(s, now), Changed: true, Decisive: false, Event: EventRefired}
 		}
 		if s.GraceUntil != nil && !now.Before(*s.GraceUntil) {
-			return LifecycleOutcome{Situation: ExpireGrace(s, now), Changed: true, Terminal: true, Event: EventGraceExpired}
+			return LifecycleOutcome{Situation: ExpireGrace(s, now), Changed: true, Decisive: true, Event: EventGraceExpired}
 		}
 	case model.LifecycleActive:
 		if allSymptomsResolved(symptoms) {
-			return LifecycleOutcome{Situation: ObserveRecovery(s, now, grace), Changed: true, Terminal: true, Event: EventRecoveryObserved}
+			return LifecycleOutcome{Situation: ObserveRecovery(s, now, grace), Changed: true, Decisive: true, Event: EventRecoveryObserved}
 		}
 	}
 	return LifecycleOutcome{Situation: s}

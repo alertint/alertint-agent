@@ -223,7 +223,7 @@ func TestReconcileLifecycleGraceExpiry(t *testing.T) {
 	s := activeSituation(now)
 	pending := ObserveRecovery(s, now, time.Minute)
 	outcome := ReconcileLifecycle(pending, nil, nil, now.Add(time.Minute), 2*time.Minute)
-	if !outcome.Changed || !outcome.Terminal || outcome.Situation.Lifecycle != model.LifecycleRecovered {
+	if !outcome.Changed || !outcome.Decisive || outcome.Situation.Lifecycle != model.LifecycleRecovered {
 		t.Fatalf("outcome = %+v, want terminal recovered", outcome)
 	}
 }
@@ -234,7 +234,7 @@ func TestReconcileLifecycleRefireBeforeGraceExpiry(t *testing.T) {
 	pending := ObserveRecovery(s, now, 2*time.Minute)
 	symptoms := []Symptom{{ID: "sym-1", Lifecycle: model.DeliveryStatusFiring}}
 	outcome := ReconcileLifecycle(pending, symptoms, nil, now.Add(time.Minute), 2*time.Minute)
-	if !outcome.Changed || outcome.Terminal || outcome.Situation.Lifecycle != model.LifecycleActive {
+	if !outcome.Changed || outcome.Decisive || outcome.Situation.Lifecycle != model.LifecycleActive {
 		t.Fatalf("outcome = %+v, want active refire", outcome)
 	}
 }
@@ -244,7 +244,7 @@ func TestReconcileLifecycleEntersRecoveryPendingWhenAllResolved(t *testing.T) {
 	s := activeSituation(now)
 	symptoms := []Symptom{{ID: "sym-1", Lifecycle: model.DeliveryStatusResolved}}
 	outcome := ReconcileLifecycle(s, symptoms, nil, now, 2*time.Minute)
-	if !outcome.Changed || !outcome.Terminal || outcome.Situation.Lifecycle != model.LifecycleRecoveryPending {
+	if !outcome.Changed || !outcome.Decisive || outcome.Situation.Lifecycle != model.LifecycleRecoveryPending {
 		t.Fatalf("outcome = %+v, want recovery_pending", outcome)
 	}
 	if outcome.Situation.GraceUntil == nil || !outcome.Situation.GraceUntil.Equal(now.Add(2*time.Minute)) {
@@ -268,7 +268,7 @@ func TestReconcileLifecycleClosesUnknownFromTerminalUncertainty(t *testing.T) {
 	s.LastLifecycleObservedAt = now.Add(-8 * 24 * time.Hour)
 	uncertainty := &TerminalUncertainty{DeadlineCrossed: true, Actionable: true, Reason: model.TerminalReasonSourceUnavailable}
 	outcome := ReconcileLifecycle(s, nil, uncertainty, now, 2*time.Minute)
-	if !outcome.Changed || !outcome.Terminal || outcome.Situation.Lifecycle != model.LifecycleClosedUnknown {
+	if !outcome.Changed || !outcome.Decisive || outcome.Situation.Lifecycle != model.LifecycleClosedUnknown {
 		t.Fatalf("outcome = %+v, want closed_unknown", outcome)
 	}
 }

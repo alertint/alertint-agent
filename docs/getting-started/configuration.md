@@ -276,16 +276,20 @@ this section at all.
 | `dependency_health.broadcast_after_seconds` | int | `300` | How long a shared dependency (the LLM, a connector) must stay degraded before one installation-level health root posts (must be `> 0`) |
 | `envelope_review.reminder_interval_days` | int | `30` | At most one sparse Expected-behaviour envelope confirmation reminder per this many days (must be `> 0`) |
 
-Two known gaps in this release, both honestly reflected in the defaults
+Three known gaps in this release, all honestly reflected in the defaults
 above and in [Architecture](../concepts/architecture.md#situation-controller-known-gaps):
 the Reconcile loop does not yet invoke the observation runner (Prometheus,
 Zabbix metrics, Loki, Sentry, and change-event connector facts do not reach
 Situation snapshots yet, even though all seven executors are implemented and
 tested through the runner — only delivery-derived symptom facts and
-`store_read` facts flow today), and Expected-behaviour envelope *evaluation*
-is not yet wired into reconcile (envelopes, judgments, confirmation, and
+`store_read` facts flow today); Expected-behaviour envelope *evaluation* is
+not yet wired into reconcile (envelopes, judgments, confirmation, and
 revocation all work correctly over MCP; only automatic evaluation during
-reconciliation does not fire yet).
+reconciliation does not fire yet); and semantic profiles are never inferred
+automatically (a profile head exists only where an operator created one over
+MCP, so the advisory widening of a Situation's lifecycle-observation deadline
+never engages and every Situation falls back to the deterministic tier
+default).
 
 ## `notify`
 

@@ -206,16 +206,45 @@ func (s *Store) AppendSituationFacts(ctx context.Context, claim SituationClaim, 
 
 // AppendAssessmentAttempt appends one attempt under a current fence. Only an
 // authoritative attempt atomically advances situations.current_assessment_id.
+//
+// This opens its own transaction, so it is the right call for an attempt that
+// has no atomicity requirement with anything else (a proposed, rejected,
+// failed, or stale attempt). An AUTHORITATIVE attempt must instead commit in
+// the same transaction as the transition it authorizes — see
+// appendAssessmentAttemptTx and CommitSituationTransition's attempt: a durable
+// authoritative attempt with no committed transition is an orphan that
+// LastTrustedAssessment reads back as the covering decision, so the B+
+// covered-hash gate then suppresses every later pass on an unchanged material
+// hash and the promised transition (urgent poke included) never commits.
 func (s *Store) AppendAssessmentAttempt(ctx context.Context, claim SituationClaim, attempt AssessmentAttempt) error {
-	prepared, err := prepareAssessmentAttempt(claim, attempt)
-	if err != nil {
-		return err
-	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("store: begin assessment attempt: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := appendAssessmentAttemptTx(ctx, tx, claim, attempt); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit assessment attempt: %w", err)
+	}
+	return nil
+}
+
+// appendAssessmentAttemptTx is the tx-scoped attempt-append primitive: fence
+// check, insert-or-idempotent-replay, and — for an authoritative attempt — the
+// current_assessment_id advance, all against an already-open transaction. It
+// mirrors createNotificationIntentTx so a caller that must also commit the
+// transition this attempt authorizes gets exactly one commit or rollback for
+// both. The 0014 trigger ordering permits this insert-then-update in one
+// transaction: situations_current_assessment_authoritative only requires the
+// referenced attempt row to be visible and authoritative, which the insert
+// above already made true inside this transaction.
+func appendAssessmentAttemptTx(ctx context.Context, tx *sql.Tx, claim SituationClaim, attempt AssessmentAttempt) error {
+	prepared, err := prepareAssessmentAttempt(claim, attempt)
+	if err != nil {
+		return err
+	}
 	if err := verifySituationFence(ctx, tx, claim); err != nil {
 		return err
 	}
@@ -268,9 +297,6 @@ func (s *Store) AppendAssessmentAttempt(ctx context.Context, claim SituationClai
 		if changed != 1 {
 			return ErrSituationVersionConflict
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("store: commit assessment attempt: %w", err)
 	}
 	return nil
 }

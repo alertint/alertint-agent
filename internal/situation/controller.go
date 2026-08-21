@@ -246,7 +246,7 @@ func (c *Controller) Reconcile(ctx context.Context, situationID string) error {
 		return fmt.Errorf("situation: reconcile: trusted assessment: %w", err)
 	}
 
-	if lifecycleOutcome.Changed && lifecycleOutcome.Terminal {
+	if lifecycleOutcome.Changed && lifecycleOutcome.Decisive {
 		// Grace expiry, entering recovery_pending, and closed_unknown are
 		// all controller-owned, model-free commits (D4/degraded operation:
 		// "stops automatic live probes/LLM work") — L1 is never dispatched
@@ -395,7 +395,14 @@ func (c *Controller) dispatchAcuteInvestigation(ctx context.Context, situationID
 		if err != nil {
 			return
 		}
-		_ = NormalizeL1(result) // persisting the normalized finding into a snapshot-loadable fact is Task 9+ store wiring
+		// The normalized finding is deliberately not persisted here: the
+		// snapshot loader already projects the durable L1 finding of the
+		// Situation's primary Incident on the next pass (see
+		// SituationRuntime.acuteFinding), so writing a second copy would
+		// duplicate the same evidence under a different identity. The
+		// normalization still runs so a malformed L1 result is rejected at
+		// its source rather than inside the reconcile it wakes.
+		_ = NormalizeL1(result)
 		_ = c.store.MarkDue(bg, situationID, model.DueRetry, now)
 	}()
 }

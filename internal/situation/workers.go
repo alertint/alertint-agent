@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
@@ -615,7 +616,17 @@ func errorClass(err error) string {
 	}
 	const maxErrorClassBytes = 200
 	if len(class) > maxErrorClassBytes {
-		class = class[:maxErrorClassBytes]
+		// Truncate on a rune boundary: a source name, a hostname, or a Slack
+		// error string can carry multi-byte UTF-8, and cutting mid-rune would
+		// persist a mojibake tail an operator cannot read.
+		cut := maxErrorClassBytes
+		for cut > 0 && !utf8.RuneStart(class[cut]) {
+			cut--
+		}
+		class = strings.TrimSpace(class[:cut])
+		if class == "" {
+			return "unknown"
+		}
 	}
 	return class
 }

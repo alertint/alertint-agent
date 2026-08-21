@@ -354,10 +354,42 @@ func (s *Store) CurrentSituationForGroup(ctx context.Context, groupKey string) (
 // must match tr.SituationID; a validation failure on any intent rolls the
 // whole transition back, not just the intent.
 func (s *Store) CommitSituationTransition(ctx context.Context, claim SituationClaim, tr model.Transition, assessmentID *string, intents []model.NotificationIntent) error {
+	return s.commitSituationTransition(ctx, claim, tr, situationTransitionCommit{assessmentID: assessmentID, intents: intents})
+}
+
+// situationTransitionCommit bundles everything one authoritative
+// reconciliation result must make durable in exactly ONE transaction. Every
+// field here was, at some point, a separate write; each one that stayed
+// separate was a crash window that silently dropped part of what the
+// controller had already promised.
+type situationTransitionCommit struct {
+	// attempt, when set, is the authoritative Assessment attempt this
+	// transition applies. It is inserted in the same transaction as the
+	// transition (appendAssessmentAttemptTx) because a durable authoritative
+	// attempt with no committed transition is an orphan that
+	// LastTrustedAssessment reads back as the covering decision: with
+	// evidence_quality 'complete' the B+ covered-hash gate then suppresses
+	// every later pass on an unchanged material hash, and the transition —
+	// including an urgent poke — never commits at all.
+	attempt *AssessmentAttempt
+	// assessmentID advances situations.current_assessment_id when set.
+	assessmentID *string
+	// intents are the notification intents this transition requires.
+	intents []model.NotificationIntent
+	// reactivateRootCreate, when set, returns the Situation's reserved but
+	// withheld, never-delivered root create to pending in this same
+	// transaction, so a Situation whose first publication the operator floor
+	// withheld can still publish its one root once a later transition clears
+	// the floor.
+	reactivateRootCreate *rootCreateReactivation
+}
+
+func (s *Store) commitSituationTransition(ctx context.Context, claim SituationClaim, tr model.Transition, plan situationTransitionCommit) error {
 	expectedInputVersion := claim.Situation.InputVersion
 	if strings.TrimSpace(tr.SituationID) == "" || tr.SituationID != claim.Situation.ID || strings.TrimSpace(claim.ClaimOwner) == "" || claim.ClaimToken <= 0 || expectedInputVersion < 1 || tr.InputVersion != expectedInputVersion {
 		return errors.New("store: situation transition requires matching positive input version")
 	}
+	intents := plan.intents
 	for _, intent := range intents {
 		if intent.SituationID != nil && *intent.SituationID != tr.SituationID {
 			return errors.New("store: notification intent situation id does not match the committed transition")
@@ -368,6 +400,15 @@ func (s *Store) CommitSituationTransition(ctx context.Context, claim SituationCl
 		return fmt.Errorf("store: begin situation transition: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	// The attempt goes first so its fence/version errors keep the exact
+	// precedence the older two-transaction path had, and so the
+	// situations_current_assessment_authoritative trigger already sees the
+	// authoritative row it references.
+	if plan.attempt != nil {
+		if err := appendAssessmentAttemptTx(ctx, tx, claim, *plan.attempt); err != nil {
+			return err
+		}
+	}
 	current, err := querySituation(ctx, tx, `SELECT `+situationColumns+` FROM situations WHERE id = ?`, tr.SituationID)
 	if err != nil {
 		return err
@@ -421,6 +462,17 @@ func (s *Store) CommitSituationTransition(ctx context.Context, claim SituationCl
 			graceUntil = canonicalTime(*tr.ActionContract.NextUpdateAt)
 			nextAssessmentAt = tr.ActionContract.NextUpdateAt.UTC()
 		} else {
+			// An already-expired grace, by design. A recovery_pending
+			// transition that promises no next update is a degenerate input:
+			// every published nonterminal Situation owes a future
+			// next_update_at, and the grace window IS that promise. Rather
+			// than invent a grace length the caller never stated — which
+			// would silently hold a Situation open for a made-up duration —
+			// the window opens already closed, so the very next reconcile
+			// pass expires it and reaches a real decision (recovered, or
+			// refired on a fresh firing symptom). Terminal Situations never
+			// reopen, so this can only shorten uncertainty, never resurrect
+			// a closed one.
 			graceUntil = canonicalTime(createdAt)
 			nextAssessmentAt = createdAt
 		}
@@ -452,7 +504,7 @@ func (s *Store) CommitSituationTransition(ctx context.Context, claim SituationCl
 		    lease_expires_at = NULL, last_error_class = NULL, retry_at = NULL,
 		    updated_at = ?
 		WHERE id = ? AND input_version = ? AND lease_owner = ? AND claim_token = ?`,
-		tr.Lifecycle, attention, nullableString(assessmentID), recoveryObservedAt, graceUntil, terminalAt, terminalReason,
+		tr.Lifecycle, attention, nullableString(plan.assessmentID), recoveryObservedAt, graceUntil, terminalAt, terminalReason,
 		canonicalTime(nextAssessmentAt), canonicalTime(createdAt), tr.SituationID, expectedInputVersion,
 		claim.ClaimOwner, claim.ClaimToken)
 	if err != nil {
@@ -470,12 +522,17 @@ func (s *Store) CommitSituationTransition(ctx context.Context, claim SituationCl
 			return fmt.Errorf("store: persist notification intent %d atomically with situation transition: %w", i, err)
 		}
 	}
+	if plan.reactivateRootCreate != nil {
+		if err := reactivateWithheldRootCreateTx(ctx, tx, tr.SituationID, *plan.reactivateRootCreate); err != nil {
+			return fmt.Errorf("store: reactivate withheld root create atomically with situation transition: %w", err)
+		}
+	}
 	// The Situation's immutable public identity is minted with the very
 	// transition that promises its root, never afterwards: an operator who
 	// sees the root must be able to name the Situation over MCP, and a crash
 	// between "root promised" and "handle minted" would leave a published
 	// Situation nobody can address.
-	if hasRootCreate(intents) && current.PublicHandle == nil {
+	if (hasRootCreate(intents) || plan.reactivateRootCreate != nil) && current.PublicHandle == nil {
 		if err := mintSituationPublicHandleTx(ctx, tx, current); err != nil {
 			return err
 		}

@@ -91,7 +91,7 @@ single-alert findings have less correlation context.
 
 The proactive Situation controller (see [Architecture](architecture.md)) is
 fully wired for delivery ingestion, lifecycle, Slack, and MCP steering, but
-ships with four known, honestly-scoped gaps rather than the spec's full
+ships with five known, honestly-scoped gaps rather than the spec's full
 aspiration:
 
 **Connector observation is not yet wired into Reconcile.** All seven
@@ -123,10 +123,21 @@ mapping.** `warning` maps to `medium`, an unrecognized or unset value maps to
 the most permissive `low`, and `critical` always passes the floor — the
 mapping favors not missing a poke over precise per-severity suppression.
 
+**Semantic profiles are never inferred automatically.** The bounded, advisory
+L0 inference (`internal/semanticprofile`) is implemented and tested, but no
+production path calls it, so a profile head exists only where an operator
+created one over MCP (`alertint_semantic_profile_correct`). Profiles are
+advisory-only by design and can never raise Attention or force a poke; the
+practical consequence of the gap is that the advisory widening of a
+Situation's lifecycle-observation deadline — which would give a genuinely
+slow source longer before its lifecycle is declared unobservable — never
+engages on its own, so every Situation uses the deterministic tier default.
+
 None of these change what is durably persisted, what MCP can read, or the
 correctness of the parts that are wired — they narrow what data reaches a
-Situation's automatic facts and how finely today's recovery timing and
-outward Slack floor can be tuned per source.
+Situation's automatic facts and how finely today's recovery timing,
+lifecycle-observation horizon, and outward Slack floor can be tuned per
+source.
 
 ### Deeper metric context is operator-driven
 

@@ -5,9 +5,11 @@ package situation
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
@@ -405,5 +407,24 @@ func TestDrainHonorsTheReadinessGate(t *testing.T) {
 	}
 	if len(store.applied) != 0 {
 		t.Fatalf("startup replay ran against unwritable storage: %v", store.applied)
+	}
+}
+
+// TestErrorClassTruncatesOnARuneBoundary proves the durable failure class
+// stays readable text. The 200-byte cap can land in the middle of a
+// multi-byte UTF-8 rune — a source name, a hostname, or a Slack error string
+// routinely carries one — and a naive byte slice would persist a broken half
+// rune into last_error_class, exactly where an operator reads it.
+func TestErrorClassTruncatesOnARuneBoundary(t *testing.T) {
+	message := strings.Repeat("a", 199) + "\u00e9" + strings.Repeat("b", 50)
+	class := errorClass(errors.New(message))
+	if !utf8.ValidString(class) {
+		t.Fatalf("error class %q is not valid UTF-8", class)
+	}
+	if len(class) > 200 {
+		t.Fatalf("error class is %d bytes, want at most 200", len(class))
+	}
+	if class != strings.Repeat("a", 199) {
+		t.Fatalf("error class = %q, want the text truncated at the last whole rune", class)
 	}
 }
