@@ -427,6 +427,117 @@ func TestMarkNotificationDeliveredStampsEnvelopeReviewCoordinatesAndPromptTime(t
 	}
 }
 
+// TestCommitSituationTransitionPersistsIntentsAtomicallyOnSuccess proves the
+// happy path of the atomicity guarantee: every notification intent passed
+// to CommitSituationTransition lands durably in the same commit as the
+// transition it belongs to.
+func TestCommitSituationTransitionPersistsIntentsAtomicallyOnSuccess(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := mustSituationTime(t, "2026-08-20T10:00:00Z")
+	seedIncident(t, s, "atomic-inc", "host=atomic", "ready", now)
+	in := SituationInput{ID: "atomic-input", IdempotencyKey: "incident:atomic", IncidentID: "atomic-inc", Kind: "incident_created", GroupKey: "host=atomic", OccurredAt: now}
+	seedSituationInput(t, s, in, "claimed", "worker-1", now.Add(time.Minute))
+	created, err := s.ApplySituationInput(ctx, claimedSituationInputForTest(in, "worker-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims, err := s.ClaimDueSituations(ctx, "reconciler-1", now, time.Minute, 1)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("claim=%+v err=%v", claims, err)
+	}
+	next := now.Add(5 * time.Minute)
+	transition := situationmodel.Transition{
+		ID: "atomic-transition", SituationID: created.ID, InputVersion: 1,
+		Lifecycle: situationmodel.LifecycleActive, Attention: situationmodel.AttentionUrgent,
+		ActionContract: situationmodel.ActionContract{NextUpdateAt: &next}, CreatedAt: now.Add(time.Second),
+	}
+	root := testSituationIntent("atomic-root", "situation:"+created.ID+":transition:atomic-transition:root", created.ID, true, situationmodel.NotificationPending, now.Add(time.Second))
+	reply := situationmodel.NotificationIntent{
+		ID: "atomic-reply", IdempotencyKey: "situation:" + created.ID + ":transition:atomic-transition:root:broadcast",
+		SubjectKind: situationmodel.NotificationSubjectSituation, SubjectID: created.ID, SituationID: &created.ID,
+		Kind: situationmodel.NotificationSituationBroadcastReply, MainChannelPoke: false, Status: situationmodel.NotificationPending,
+		ClientMessageID: "client-atomic-reply", CreatedAt: now.Add(time.Second),
+	}
+	if err := s.CommitSituationTransition(ctx, claims[0], transition, nil, []situationmodel.NotificationIntent{root, reply}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.SituationForIncident(ctx, "atomic-inc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Lifecycle != situationmodel.LifecycleActive || got.Attention != situationmodel.AttentionUrgent {
+		t.Fatalf("situation not transitioned: %+v", got)
+	}
+	var count int
+	if err := s.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM notification_intents WHERE id IN ('atomic-root','atomic-reply')`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("expected both intents to commit atomically with the transition, got %d rows", count)
+	}
+}
+
+// TestCommitSituationTransitionRollsBackIntentsWithTransition is the
+// negative half of the atomicity guarantee: when one of several intents in
+// the same call fails, the whole transaction — the transition update AND
+// every already-inserted intent in this call — rolls back together. A
+// partial commit would silently drop a promised outward Slack effect with
+// no durable record one was ever owed.
+func TestCommitSituationTransitionRollsBackIntentsWithTransition(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := mustSituationTime(t, "2026-08-20T10:00:00Z")
+	seedIncident(t, s, "rollback-inc", "host=rollback", "ready", now)
+	in := SituationInput{ID: "rollback-input", IdempotencyKey: "incident:rollback", IncidentID: "rollback-inc", Kind: "incident_created", GroupKey: "host=rollback", OccurredAt: now}
+	seedSituationInput(t, s, in, "claimed", "worker-1", now.Add(time.Minute))
+	created, err := s.ApplySituationInput(ctx, claimedSituationInputForTest(in, "worker-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims, err := s.ClaimDueSituations(ctx, "reconciler-1", now, time.Minute, 1)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("claim=%+v err=%v", claims, err)
+	}
+	next := now.Add(5 * time.Minute)
+	transition := situationmodel.Transition{
+		ID: "rollback-transition", SituationID: created.ID, InputVersion: 1,
+		Lifecycle: situationmodel.LifecycleActive, Attention: situationmodel.AttentionUrgent,
+		ActionContract: situationmodel.ActionContract{NextUpdateAt: &next}, CreatedAt: now.Add(time.Second),
+	}
+	// The first intent is valid and would insert successfully in isolation.
+	valid := testSituationIntent("rollback-root", "situation:"+created.ID+":transition:rollback-transition:root", created.ID, true, situationmodel.NotificationPending, now.Add(time.Second))
+	// The second is invalid (no client_msg_id) and fails Go-side validation
+	// inside the same transaction the first intent already inserted into.
+	invalid := valid
+	invalid.ID = "rollback-invalid"
+	invalid.IdempotencyKey = "situation:" + created.ID + ":transition:rollback-transition:root:broadcast"
+	invalid.ClientMessageID = ""
+
+	err = s.CommitSituationTransition(ctx, claims[0], transition, nil, []situationmodel.NotificationIntent{valid, invalid})
+	if err == nil {
+		t.Fatal("expected the invalid second intent to fail the whole commit")
+	}
+
+	// The transition itself must not have taken effect.
+	got, err := s.SituationForIncident(ctx, "rollback-inc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Lifecycle != situationmodel.LifecycleActive || got.Attention != "observe" || got.InputVersion != 1 {
+		t.Fatalf("transition leaked despite the rolled-back commit: %+v", got)
+	}
+	// Neither intent — including the one that was individually valid — must
+	// have survived the rollback.
+	var count int
+	if err := s.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM notification_intents WHERE id IN ('rollback-root','rollback-invalid')`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("expected the valid intent's insert to roll back with the failed commit, got %d surviving rows", count)
+	}
+}
+
 func TestNotificationIntentImmutableOnceCreated(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -438,5 +549,58 @@ func TestNotificationIntentImmutableOnceCreated(t *testing.T) {
 	}
 	if _, err := s.DB().ExecContext(ctx, `DELETE FROM notification_intents WHERE id=?`, "intent-10"); err == nil || !strings.Contains(err.Error(), "immutable") {
 		t.Fatalf("expected an immutability trigger to block delete, got %v", err)
+	}
+}
+
+// TestNotificationIntentsOneRootCreatePerSituationDBConstraint proves the
+// DB-level defense-in-depth guard: notification_intents_one_root_create_idx
+// blocks a second situation_root_create row for the same situation_id even
+// when it carries a different id/idempotency_key (so the ordinary
+// idempotent-replay path — same idempotency_key — never even reaches this
+// constraint; this is specifically the "two independently-keyed root
+// creates" case the reviewed planner bug could otherwise produce).
+func TestNotificationIntentsOneRootCreatePerSituationDBConstraint(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := mustSituationTime(t, "2026-08-20T10:00:00Z")
+	insertSituationFixture(t, s, "s-notify-11", "host=db-11", "", situationmodel.LifecycleActive, now)
+
+	first := testSituationIntent("root-a", "situation:s-notify-11:transition:t1:root", "s-notify-11", true, situationmodel.NotificationPending, now)
+	if err := s.CreateNotificationIntent(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	second := testSituationIntent("root-b", "situation:s-notify-11:transition:t2:root", "s-notify-11", true, situationmodel.NotificationPending, now)
+	if err := s.CreateNotificationIntent(ctx, second); err == nil {
+		t.Fatal("expected a second, independently-keyed situation_root_create for the same situation to be rejected")
+	}
+
+	var count int
+	if err := s.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM notification_intents WHERE situation_id=? AND kind='situation_root_create'`, "s-notify-11").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly one situation_root_create row to survive, got %d", count)
+	}
+}
+
+// TestHasRootCreateIntentReflectsAnyStatus proves the planner-facing
+// existence check counts a root-create in any status (pending included) —
+// not only a delivered one — matching the DB constraint's own semantics.
+func TestHasRootCreateIntentReflectsAnyStatus(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := mustSituationTime(t, "2026-08-20T10:00:00Z")
+	insertSituationFixture(t, s, "s-notify-12", "host=db-12", "", situationmodel.LifecycleActive, now)
+
+	if exists, err := s.HasRootCreateIntent(ctx, "s-notify-12"); err != nil || exists {
+		t.Fatalf("exists=%v err=%v, want false before any root-create intent exists", exists, err)
+	}
+
+	pending := testSituationIntent("root-pending", "situation:s-notify-12:transition:t1:root", "s-notify-12", true, situationmodel.NotificationPending, now)
+	if err := s.CreateNotificationIntent(ctx, pending); err != nil {
+		t.Fatal(err)
+	}
+	if exists, err := s.HasRootCreateIntent(ctx, "s-notify-12"); err != nil || !exists {
+		t.Fatalf("exists=%v err=%v, want true for a still-pending (undelivered) root-create", exists, err)
 	}
 }

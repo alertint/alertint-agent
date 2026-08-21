@@ -54,6 +54,18 @@ CREATE INDEX notification_intents_situation_idx
     ON notification_intents(situation_id, created_at)
     WHERE situation_id IS NOT NULL;
 
+-- One Situation owns one root: at most one situation_root_create intent may
+-- ever exist for a given situation_id, regardless of its delivery status
+-- (pending, delivered, withheld, or failed). The root is minted once, at
+-- first publication, and is never replaced — a permanently failed
+-- root-create is retried against its own durable row, never superseded by a
+-- second row. This is a defense-in-depth guard: the planner (situation
+-- package) is also required to treat any existing root-create intent as
+-- "this Situation already has a root" before it ever proposes a new one.
+CREATE UNIQUE INDEX notification_intents_one_root_create_idx
+    ON notification_intents(situation_id)
+    WHERE kind = 'situation_root_create';
+
 CREATE TRIGGER notification_intents_no_delete
 BEFORE DELETE ON notification_intents
 BEGIN

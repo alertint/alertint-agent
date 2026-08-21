@@ -17,14 +17,43 @@ import (
 // needs. It is situation-owned rather than *store.Store for the same reason
 // as Controller.Store: internal/store already imports internal/situation,
 // so this package cannot import it back. The concrete adapter over
-// store.Store.CreateNotificationIntent lives in cmd/alertint wiring (Task
-// 13).
+// store.Store.CreateNotificationIntent/HasRootCreateIntent lives in
+// cmd/alertint wiring (Task 13).
 type PublisherStore interface {
 	CreateNotificationIntent(ctx context.Context, in model.NotificationIntent) error
+	// HasRootCreateIntent reports whether the Situation already owns a
+	// situation_root_create notification intent, in any status (pending,
+	// delivered, withheld, or failed). Publish consults this before
+	// planning so a root-create that is still pending delivery — not yet
+	// reflected in the caller-supplied RootCoordinates.Exists, which a
+	// caller conventionally derives from delivered Slack coordinates —
+	// still counts as "this Situation already has a root". One Situation
+	// owns one root, full stop; a still-undelivered root-create already
+	// reserves it.
+	HasRootCreateIntent(ctx context.Context, situationID string) (bool, error)
 }
 
-// RootCoordinates is the Situation's current durable Slack root state.
-// Exists is false only before the Situation's first publication.
+// Recurrence rung triggers — the real-world-change categories that earn a
+// thread-only reply regardless of episode count, mirroring the legacy
+// notify.RecurrenceEvent.Trigger enum in
+// internal/notify/slack/occurrence.go's isRejudgeTrigger/rungHeadline.
+// RecurrenceTriggerCap and RecurrenceTriggerCeiling are named for
+// completeness with that enum but produce no output — a cap or ceiling
+// change stays silent by spec.
+const (
+	RecurrenceTriggerSeverity     = "severity"
+	RecurrenceTriggerNewAlertname = "new_alertname"
+	RecurrenceTriggerCadence      = "cadence"
+	RecurrenceTriggerCap          = "cap"
+	RecurrenceTriggerCeiling      = "ceiling"
+)
+
+// RootCoordinates is the Situation's current durable Slack root state, as
+// known to the caller before Publish resolves it further. Exists is
+// conventionally derived from delivered Slack coordinates (Channel/
+// MessageTS populated); Publish additionally treats a still-pending
+// root-create intent as Exists — a caller is not required to know about an
+// in-flight, undelivered root-create for this to hold.
 type RootCoordinates struct {
 	Exists    bool
 	Channel   string
@@ -49,8 +78,22 @@ type PublishInput struct {
 	// RecurrenceCount is 0 when this transition is not a recurrence-collapse
 	// attach; otherwise the exact-key episode count.
 	RecurrenceCount int
-	// RecurrenceMode is "off" to disable recurrence thread output entirely;
-	// any other value (including empty) is the default change-gated mode.
+	// RecurrenceTrigger names which real-world-change rung fired this
+	// recurrence-collapse attach, mirroring the legacy
+	// notify.RecurrenceEvent.Trigger semantics in
+	// internal/notify/slack/occurrence.go: RecurrenceTriggerSeverity,
+	// RecurrenceTriggerNewAlertname, and RecurrenceTriggerCadence each
+	// produce a thread-only "why" reply regardless of RecurrenceCount;
+	// RecurrenceTriggerCap and RecurrenceTriggerCeiling stay silent by
+	// spec; "" means a plain attach, evaluated against RecurrenceCount's
+	// milestone membership (5/10/25/50/100, then every 100) instead. A rung
+	// trigger and a milestone count never both apply to the same attach —
+	// exactly like the legacy occurrence path, where a re-judging trigger
+	// owns the "why" reply and a plain attach owns the milestone reply.
+	RecurrenceTrigger string
+	// RecurrenceMode is "off" to disable recurrence thread output entirely
+	// (neither a rung trigger nor a milestone count produces anything); any
+	// other value (including empty) is the default change-gated mode.
 	RecurrenceMode        string
 	LastMainChannelPokeAt *time.Time
 	CooldownSeconds       int
@@ -89,9 +132,8 @@ func PlanNotificationIntents(in PublishInput) []model.NotificationIntent {
 	if poke {
 		out = append(out, situationIntent(in, model.NotificationSituationBroadcastReply, false, nil, "root:broadcast", now))
 	}
-	if in.RecurrenceMode != "off" && recurrenceMilestone(in.RecurrenceCount) {
-		suffix := fmt.Sprintf("root:recurrence:%d", in.RecurrenceCount)
-		out = append(out, situationIntent(in, model.NotificationSituationThreadReply, false, nil, suffix, now))
+	if suffix, ok := recurrenceThreadReplyDue(in); ok {
+		out = append(out, situationIntent(in, model.NotificationSituationThreadReply, false, nil, "root:recurrence:"+suffix, now))
 	}
 	return applyMinSeverityFloor(out, in.MinSeverity)
 }
@@ -148,6 +190,13 @@ func NewPublisher(store PublisherStore, clientMessageID func(string) string) *Pu
 // client_msg_id every time, so CreateNotificationIntent's own idempotent
 // replay handling absorbs a duplicate Publish call safely.
 func (p *Publisher) Publish(ctx context.Context, in PublishInput) error {
+	if !in.Root.Exists && strings.TrimSpace(in.Transition.SituationID) != "" {
+		exists, err := p.store.HasRootCreateIntent(ctx, in.Transition.SituationID)
+		if err != nil {
+			return fmt.Errorf("situation: publish: check existing root-create intent: %w", err)
+		}
+		in.Root.Exists = exists
+	}
 	for _, intent := range PlanNotificationIntents(in) {
 		if p.clientMessageID != nil {
 			intent.ClientMessageID = p.clientMessageID(intent.IdempotencyKey)
@@ -253,6 +302,29 @@ func recurrenceMilestone(count int) bool {
 	default:
 		return count > 100 && count%100 == 0
 	}
+}
+
+// recurrenceThreadReplyDue decides whether this attach earns the one
+// thread-only recurrence reply, and if so, the idempotency suffix that
+// identifies it. It mirrors the legacy occurrence.go split exactly: a rung
+// trigger (severity/new_alertname/cadence) always earns a reply regardless
+// of count and owns the reply outright; a plain attach (no trigger) earns
+// one only when RecurrenceCount crosses a milestone. Cap/ceiling changes,
+// and RecurrenceMode "off", always produce nothing.
+func recurrenceThreadReplyDue(in PublishInput) (suffix string, ok bool) {
+	if in.RecurrenceMode == "off" {
+		return "", false
+	}
+	switch in.RecurrenceTrigger {
+	case RecurrenceTriggerSeverity, RecurrenceTriggerNewAlertname, RecurrenceTriggerCadence:
+		return "rung:" + in.RecurrenceTrigger, true
+	case RecurrenceTriggerCap, RecurrenceTriggerCeiling:
+		return "", false
+	}
+	if in.RecurrenceTrigger == "" && recurrenceMilestone(in.RecurrenceCount) {
+		return fmt.Sprintf("milestone:%d", in.RecurrenceCount), true
+	}
+	return "", false
 }
 
 // applyMinSeverityFloor withholds a new main-channel poke whose deterministic

@@ -18,22 +18,70 @@ import (
 // because it was already terminally resolved by an earlier call.
 var ErrNotificationNotPending = errors.New("store: notification intent is not pending")
 
+// HasRootCreateIntent reports whether situationID already owns a
+// situation_root_create notification intent, in any status. "One Situation
+// owns one root" holds regardless of delivery state: a still-pending
+// root-create already reserves the Situation's one root, so a caller
+// planning notifications must treat it exactly like a delivered one and
+// never propose a second root-create. This mirrors the DB's own
+// notification_intents_one_root_create_idx partial unique index (belt and
+// braces: the planner is expected to check first, the index is what makes a
+// planner bug fail loudly instead of silently).
+func (s *Store) HasRootCreateIntent(ctx context.Context, situationID string) (bool, error) {
+	if strings.TrimSpace(situationID) == "" {
+		return false, errors.New("store: root-create existence check requires a situation id")
+	}
+	var exists int
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM notification_intents WHERE situation_id = ? AND kind = 'situation_root_create'
+	)`, situationID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("store: check existing root-create intent: %w", err)
+	}
+	return exists == 1, nil
+}
+
 // CreateNotificationIntent persists one intended outward Slack effect before
 // any I/O — the durable guarantee every notification delivery relies on. It
 // is idempotent on idempotency_key: a retry that recomputes the identical
 // intent succeeds silently; a retry whose content differs under the same
 // idempotency_key fails closed rather than silently redefining what was
 // promised.
+//
+// This opens its own transaction, so it is the right call for a
+// notification intent that has no atomicity requirement with anything
+// else (an envelope review, a dependency-health update). A notification
+// intent that must commit atomically with the authoritative transition
+// that requires it (a Situation root create/edit/broadcast/thread reply)
+// goes through CommitSituationTransition's own intents parameter instead —
+// see createNotificationIntentTx.
 func (s *Store) CreateNotificationIntent(ctx context.Context, in situationmodel.NotificationIntent) error {
-	prepared, err := prepareNotificationIntent(in)
-	if err != nil {
-		return err
-	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("store: begin create notification intent: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := createNotificationIntentTx(ctx, tx, in); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit create notification intent: %w", err)
+	}
+	return nil
+}
+
+// createNotificationIntentTx is the tx-scoped intent-creation primitive:
+// insert-or-idempotent-replay against an already-open transaction, so a
+// caller that also needs to mutate other rows in the same commit (namely
+// CommitSituationTransition, persisting a Situation's required notification
+// intents atomically with its Assessment/lifecycle transition, per the D3
+// durability guarantee: an outward effect is durably recorded before any
+// I/O ever attempts it) gets exactly one commit or rollback for both.
+func createNotificationIntentTx(ctx context.Context, tx *sql.Tx, in situationmodel.NotificationIntent) error {
+	prepared, err := prepareNotificationIntent(in)
+	if err != nil {
+		return err
+	}
 	result, err := tx.ExecContext(ctx, `INSERT INTO notification_intents (
 		id, idempotency_key, subject_kind, subject_id, situation_id, transition_id, kind,
 		main_channel_poke, interruption_priority, status, channel, message_ts, client_msg_id,
@@ -58,9 +106,6 @@ func (s *Store) CreateNotificationIntent(ctx context.Context, in situationmodel.
 		if !equalPreparedNotificationIntentIdentity(existing, prepared) {
 			return errors.New("store: notification intent identity collision")
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("store: commit create notification intent: %w", err)
 	}
 	return nil
 }

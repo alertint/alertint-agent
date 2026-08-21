@@ -339,10 +339,25 @@ func (s *Store) CurrentSituationForGroup(ctx context.Context, groupKey string) (
 
 // CommitSituationTransition conditionally applies a reconciler result to the
 // exact input version it observed. Stale work has no aggregate effect.
-func (s *Store) CommitSituationTransition(ctx context.Context, claim SituationClaim, tr model.Transition, assessmentID *string) error {
+//
+// intents carries every notification intent this transition requires
+// (situation_root_create/root_edit/broadcast/thread_reply — planned
+// deterministically by situation.PlanNotificationIntents) so it commits
+// atomically with the transition it belongs to: a crash between "the
+// transition committed" and "the outward effect was recorded" must never
+// happen, since a lost intent silently drops a promised Slack effect with
+// no durable record one was ever owed. Any intent whose SituationID is set
+// must match tr.SituationID; a validation failure on any intent rolls the
+// whole transition back, not just the intent.
+func (s *Store) CommitSituationTransition(ctx context.Context, claim SituationClaim, tr model.Transition, assessmentID *string, intents []model.NotificationIntent) error {
 	expectedInputVersion := claim.Situation.InputVersion
 	if strings.TrimSpace(tr.SituationID) == "" || tr.SituationID != claim.Situation.ID || strings.TrimSpace(claim.ClaimOwner) == "" || claim.ClaimToken <= 0 || expectedInputVersion < 1 || tr.InputVersion != expectedInputVersion {
 		return errors.New("store: situation transition requires matching positive input version")
+	}
+	for _, intent := range intents {
+		if intent.SituationID != nil && *intent.SituationID != tr.SituationID {
+			return errors.New("store: notification intent situation id does not match the committed transition")
+		}
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -445,6 +460,11 @@ func (s *Store) CommitSituationTransition(ctx context.Context, claim SituationCl
 	}
 	if changed != 1 {
 		return ErrSituationVersionConflict
+	}
+	for i, intent := range intents {
+		if err := createNotificationIntentTx(ctx, tx, intent); err != nil {
+			return fmt.Errorf("store: persist notification intent %d atomically with situation transition: %w", i, err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: finish situation transition: %w", err)

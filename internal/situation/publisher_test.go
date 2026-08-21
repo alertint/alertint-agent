@@ -208,6 +208,115 @@ func TestPlanNotificationIntentsRepageOnNewlyCrossedCriticality(t *testing.T) {
 	}
 }
 
+// stableRecurrenceInput builds a PublishInput against an already-published,
+// unchanged-priority root (no repage in play) so recurrence-reply decisions
+// can be observed in isolation from the handoff/repage logic covered
+// elsewhere.
+func stableRecurrenceInput(t *testing.T, count int, trigger, mode string) PublishInput {
+	t.Helper()
+	now := mustPublisherTime(t, "2026-08-20T10:00:00Z")
+	prior := transitionFor("t0", "s1", model.LifecycleActive, model.AttentionInvestigate, floorAssessment(model.AttentionInvestigate, "duration_outlier", nil, nil))
+	return PublishInput{
+		Transition:      transitionFor("t1", "s1", model.LifecycleActive, model.AttentionInvestigate, floorAssessment(model.AttentionInvestigate, "duration_outlier", nil, nil)),
+		PriorTransition: &prior,
+		Root:            RootCoordinates{Exists: true, Channel: "C1", MessageTS: "ts1"},
+		MinSeverity:     model.PriorityLow, Now: now,
+		RecurrenceCount: count, RecurrenceTrigger: trigger, RecurrenceMode: mode,
+	}
+}
+
+func threadReplies(intents []model.NotificationIntent) []model.NotificationIntent {
+	var out []model.NotificationIntent
+	for _, intent := range intents {
+		if intent.Kind == model.NotificationSituationThreadReply {
+			out = append(out, intent)
+		}
+	}
+	return out
+}
+
+// TestRecurrenceRungTriggersProduceThreadOnlyReply covers the three
+// real-world-change rungs from the brief ("severity change, a new alert
+// name, cadence") against the legacy internal/notify/slack/occurrence.go
+// semantic reference (isRejudgeTrigger/rungHeadline): each earns exactly
+// one thread-only reply, regardless of RecurrenceCount, and it is never a
+// main-channel poke or a broadcast.
+func TestRecurrenceRungTriggersProduceThreadOnlyReply(t *testing.T) {
+	for _, trigger := range []string{RecurrenceTriggerSeverity, RecurrenceTriggerNewAlertname, RecurrenceTriggerCadence} {
+		t.Run(trigger, func(t *testing.T) {
+			in := stableRecurrenceInput(t, 0, trigger, "")
+			replies := threadReplies(PlanNotificationIntents(in))
+			if len(replies) != 1 {
+				t.Fatalf("trigger=%s: expected exactly one thread reply, got %+v", trigger, replies)
+			}
+			if replies[0].MainChannelPoke {
+				t.Fatalf("trigger=%s: a recurrence rung reply must never be a main-channel poke: %+v", trigger, replies[0])
+			}
+			for _, intent := range PlanNotificationIntents(in) {
+				if intent.Kind == model.NotificationSituationBroadcastReply {
+					t.Fatalf("trigger=%s: a recurrence rung must never broadcast: %+v", trigger, intent)
+				}
+			}
+		})
+	}
+}
+
+// TestRecurrenceCapAndCeilingTriggersStaySilent proves the spec's explicit
+// exception: "cap or ceiling changes stay silent."
+func TestRecurrenceCapAndCeilingTriggersStaySilent(t *testing.T) {
+	for _, trigger := range []string{RecurrenceTriggerCap, RecurrenceTriggerCeiling} {
+		t.Run(trigger, func(t *testing.T) {
+			in := stableRecurrenceInput(t, 100, trigger, "") // even a milestone count must not leak through a cap/ceiling trigger
+			if replies := threadReplies(PlanNotificationIntents(in)); len(replies) != 0 {
+				t.Fatalf("trigger=%s: expected silence, got %+v", trigger, replies)
+			}
+		})
+	}
+}
+
+// TestRecurrenceMilestoneMembershipExactCounts proves the exact milestone
+// schedule from the brief: "counts 5/10/25/50/100 then every 100" — no more,
+// no less — for a plain attach (no rung trigger).
+func TestRecurrenceMilestoneMembershipExactCounts(t *testing.T) {
+	cases := []struct {
+		count int
+		want  bool
+	}{
+		{1, false}, {4, false}, {5, true}, {6, false},
+		{9, false}, {10, true}, {11, false},
+		{24, false}, {25, true}, {26, false},
+		{49, false}, {50, true}, {51, false},
+		{99, false}, {100, true}, {101, false},
+		{150, false}, {199, false}, {200, true}, {201, false},
+		{300, true},
+	}
+	for _, tc := range cases {
+		in := stableRecurrenceInput(t, tc.count, "", "")
+		got := len(threadReplies(PlanNotificationIntents(in))) == 1
+		if got != tc.want {
+			t.Fatalf("count=%d: milestone reply produced=%v, want %v", tc.count, got, tc.want)
+		}
+	}
+}
+
+// TestRecurrenceModeOffDisablesRungAndMilestoneOutput proves
+// "recurrence_mode: off disables recurrence output" for both output paths —
+// a rung trigger and a milestone count.
+func TestRecurrenceModeOffDisablesRungAndMilestoneOutput(t *testing.T) {
+	t.Run("rung trigger", func(t *testing.T) {
+		in := stableRecurrenceInput(t, 0, RecurrenceTriggerSeverity, "off")
+		if replies := threadReplies(PlanNotificationIntents(in)); len(replies) != 0 {
+			t.Fatalf("expected recurrence_mode off to suppress the rung reply, got %+v", replies)
+		}
+	})
+	t.Run("milestone count", func(t *testing.T) {
+		in := stableRecurrenceInput(t, 50, "", "off")
+		if replies := threadReplies(PlanNotificationIntents(in)); len(replies) != 0 {
+			t.Fatalf("expected recurrence_mode off to suppress the milestone reply, got %+v", replies)
+		}
+	})
+}
+
 func TestClientMessageIDDerivedFromIdempotencyKeyReusedOnRetry(t *testing.T) {
 	seen := map[string]string{}
 	fn := func(key string) string {
@@ -259,6 +368,66 @@ func TestPublisherPropagatesStoreError(t *testing.T) {
 	}
 }
 
+// TestPublishTreatsPendingUndeliveredRootCreateAsRootExists proves "one
+// Situation owns one root" holds even before the first root-create has been
+// delivered: a caller that has not yet observed delivered Slack coordinates
+// (so RootCoordinates.Exists is conventionally still false) must not get a
+// second situation_root_create out of Publish once a root-create intent —
+// pending or not — already exists for the Situation.
+func TestPublishTreatsPendingUndeliveredRootCreateAsRootExists(t *testing.T) {
+	now := mustPublisherTime(t, "2026-08-20T10:00:00Z")
+	in := PublishInput{
+		Transition: model.Transition{
+			ID: "t2", SituationID: "s1", Lifecycle: model.LifecycleActive, Attention: model.AttentionUrgent,
+			Assessment: floorAssessment(model.AttentionUrgent, "critical_anchor", nil, nil),
+		},
+		// Root.Exists is false — the caller only knows about delivered
+		// coordinates, and this root-create has not delivered yet.
+		Root: RootCoordinates{Exists: false}, MinSeverity: model.PriorityLow, Now: now,
+	}
+	store := &fakePublisherStore{hasRootCreate: true}
+	p := NewPublisher(store, func(key string) string { return "cmid" })
+	if err := p.Publish(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	if store.rootCreateCheckedFor != "s1" {
+		t.Fatalf("expected Publish to check for an existing root-create against situation s1, checked %q", store.rootCreateCheckedFor)
+	}
+	for _, intent := range store.created {
+		if intent.Kind == model.NotificationSituationRootCreate {
+			t.Fatalf("expected no second situation_root_create once one already exists (even undelivered), got %+v", store.created)
+		}
+	}
+	if len(store.created) == 0 {
+		t.Fatal("expected the transition to still produce a root edit")
+	}
+	if store.created[0].Kind != model.NotificationSituationRootEdit {
+		t.Fatalf("kind=%s, want situation_root_edit once the pending root-create counts as an existing root", store.created[0].Kind)
+	}
+}
+
+// TestPublishSkipsRootCreateCheckWhenRootAlreadyKnownDelivered proves the
+// store is not consulted at all when the caller already knows the root
+// exists (the common case, avoiding a needless query on every routine edit).
+func TestPublishSkipsRootCreateCheckWhenRootAlreadyKnownDelivered(t *testing.T) {
+	now := mustPublisherTime(t, "2026-08-20T10:00:00Z")
+	in := PublishInput{
+		Transition: model.Transition{
+			ID: "t3", SituationID: "s1", Lifecycle: model.LifecycleActive, Attention: model.AttentionObserve,
+			Assessment: floorAssessment(model.AttentionObserve, "", nil, nil),
+		},
+		Root: RootCoordinates{Exists: true, Channel: "C1", MessageTS: "ts1"}, MinSeverity: model.PriorityLow, Now: now,
+	}
+	store := &fakePublisherStore{}
+	p := NewPublisher(store, func(key string) string { return "cmid" })
+	if err := p.Publish(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	if store.rootCreateCheckedFor != "" {
+		t.Fatalf("expected no HasRootCreateIntent check when the root is already known, checked %q", store.rootCreateCheckedFor)
+	}
+}
+
 func TestPlanEnvelopeReviewIntentIsStandaloneHighPriorityPoke(t *testing.T) {
 	now := mustPublisherTime(t, "2026-08-20T10:00:00Z")
 	intent := PlanEnvelopeReviewIntent("env-1", now)
@@ -289,8 +458,11 @@ func TestPlanDependencyHealthIntentRootVsUpdate(t *testing.T) {
 }
 
 type fakePublisherStore struct {
-	created []model.NotificationIntent
-	err     error
+	created              []model.NotificationIntent
+	err                  error
+	hasRootCreate        bool
+	hasRootCreateErr     error
+	rootCreateCheckedFor string
 }
 
 func (f *fakePublisherStore) CreateNotificationIntent(ctx context.Context, in model.NotificationIntent) error {
@@ -299,6 +471,14 @@ func (f *fakePublisherStore) CreateNotificationIntent(ctx context.Context, in mo
 	}
 	f.created = append(f.created, in)
 	return nil
+}
+
+func (f *fakePublisherStore) HasRootCreateIntent(ctx context.Context, situationID string) (bool, error) {
+	f.rootCreateCheckedFor = situationID
+	if f.hasRootCreateErr != nil {
+		return false, f.hasRootCreateErr
+	}
+	return f.hasRootCreate, nil
 }
 
 func mustPublisherTime(t *testing.T, value string) time.Time {

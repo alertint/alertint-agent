@@ -492,7 +492,7 @@ func TestCommitSituationTransitionRejectsExpiredReclaimedFence(t *testing.T) {
 		Lifecycle: situationmodel.LifecycleActive, Attention: situationmodel.AttentionInvestigate,
 		ActionContract: situationmodel.ActionContract{NextUpdateAt: &next}, CreatedAt: now.Add(2*time.Minute + time.Second),
 	}
-	if err := s.CommitSituationTransition(context.Background(), first[0], transition, nil); !errors.Is(err, ErrSituationLeaseLost) {
+	if err := s.CommitSituationTransition(context.Background(), first[0], transition, nil, nil); !errors.Is(err, ErrSituationLeaseLost) {
 		t.Fatalf("stale commit err=%v", err)
 	}
 	var owner string
@@ -505,7 +505,7 @@ func TestCommitSituationTransitionRejectsExpiredReclaimedFence(t *testing.T) {
 	}
 	transition.SituationID = second[0].Situation.ID
 	transition.InputVersion = second[0].Situation.InputVersion
-	if err := s.CommitSituationTransition(context.Background(), second[0], transition, nil); err != nil {
+	if err := s.CommitSituationTransition(context.Background(), second[0], transition, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -534,7 +534,7 @@ func TestCommitSituationTransitionRejectsStaleInputVersion(t *testing.T) {
 		Lifecycle: situationmodel.LifecycleActive, Attention: situationmodel.AttentionInvestigate,
 		CreatedAt: now.Add(2 * time.Second),
 	}
-	if err := s.CommitSituationTransition(context.Background(), oldClaims[0], transition, nil); !errors.Is(err, ErrSituationVersionConflict) {
+	if err := s.CommitSituationTransition(context.Background(), oldClaims[0], transition, nil, nil); !errors.Is(err, ErrSituationVersionConflict) {
 		t.Fatalf("stale commit err = %v", err)
 	}
 	got, err := s.SituationForIncident(context.Background(), "transition-inc")
@@ -566,7 +566,7 @@ func TestCommitSituationTransitionPersistsRecoveryPendingAndRefire(t *testing.T)
 		Lifecycle: situationmodel.LifecycleRecoveryPending, Attention: situationmodel.AttentionInvestigate,
 		ActionContract: situationmodel.ActionContract{NextUpdateAt: &graceUntil}, CreatedAt: now.Add(time.Second),
 	}
-	if err := s.CommitSituationTransition(context.Background(), claims[0], pending, nil); err != nil {
+	if err := s.CommitSituationTransition(context.Background(), claims[0], pending, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.SituationForIncident(context.Background(), "lifecycle-inc")
@@ -589,7 +589,7 @@ func TestCommitSituationTransitionPersistsRecoveryPendingAndRefire(t *testing.T)
 	if err != nil || len(claims) != 1 {
 		t.Fatalf("refire claim=%+v err=%v", claims, err)
 	}
-	if err := s.CommitSituationTransition(context.Background(), claims[0], refired, nil); err != nil {
+	if err := s.CommitSituationTransition(context.Background(), claims[0], refired, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	got, err = s.SituationForIncident(context.Background(), "lifecycle-inc")
@@ -615,7 +615,7 @@ func TestCommitSituationTransitionRecoveryRetainsGraceEvidence(t *testing.T) {
 		Lifecycle: situationmodel.LifecycleRecoveryPending, Attention: situationmodel.AttentionUrgent,
 		ActionContract: situationmodel.ActionContract{NextUpdateAt: &graceUntil}, CreatedAt: now.Add(time.Second),
 	}
-	if err := s.CommitSituationTransition(context.Background(), claims[0], pending, nil); err != nil {
+	if err := s.CommitSituationTransition(context.Background(), claims[0], pending, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	recoveredAt := graceUntil.Add(time.Second)
@@ -627,7 +627,7 @@ func TestCommitSituationTransitionRecoveryRetainsGraceEvidence(t *testing.T) {
 	if err != nil || len(claims) != 1 {
 		t.Fatalf("recovery claim=%+v err=%v", claims, err)
 	}
-	if err := s.CommitSituationTransition(context.Background(), claims[0], recovered, nil); err != nil {
+	if err := s.CommitSituationTransition(context.Background(), claims[0], recovered, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.CurrentSituationForGroup(context.Background(), "host=recovering")
@@ -665,7 +665,7 @@ func TestCommitSituationTransitionIgnoresMutableCompatibilityFiring(t *testing.T
 		Lifecycle: situationmodel.LifecycleClosedUnknown, Attention: situationmodel.AttentionObserve,
 		Reason: string(situationmodel.TerminalReasonResolutionMissing), CreatedAt: now.Add(time.Minute),
 	}
-	if err := s.CommitSituationTransition(context.Background(), claims[0], transition, nil); err != nil {
+	if err := s.CommitSituationTransition(context.Background(), claims[0], transition, nil, nil); err != nil {
 		t.Fatalf("closed unknown from compatibility projection: %v", err)
 	}
 	got, err := s.SituationForIncident(context.Background(), "firing-inc")
@@ -722,7 +722,7 @@ func TestCommitSituationTransitionUsesFreshAuthoritativeFiringDeadline(t *testin
 				Lifecycle: situationmodel.LifecycleClosedUnknown, Attention: situationmodel.AttentionObserve,
 				Reason: string(situationmodel.TerminalReasonResolutionMissing), CreatedAt: now.Add(tc.closeAt),
 			}
-			err = s.CommitSituationTransition(context.Background(), claims[0], transition, nil)
+			err = s.CommitSituationTransition(context.Background(), claims[0], transition, nil, nil)
 			if tc.wantError && (err == nil || !strings.Contains(err.Error(), "firing")) {
 				t.Fatalf("fresh authoritative close err=%v", err)
 			}
