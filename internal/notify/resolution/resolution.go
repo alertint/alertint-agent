@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: FSL-1.1-ALv2
 
-// Package resolution implements a resolution notifier that wraps existing
-// notifiers to send incident resolved notifications.
+// Package resolution implements the legacy per-Incident resolution card
+// update.
+//
+// It is NOT reachable from serve after the Situation cutover: recovery is a
+// visible Situation lifecycle state (recovery_pending, then recovered) whose
+// one Slack surface is the Situation root, edited by the notification
+// worker. This package remains compiled only so the existing
+// historical-card fixture tests keep rendering the cards operators already
+// have in their channels.
 package resolution
 
 import (
@@ -9,7 +16,6 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/alertint/alertint-agent/internal/correlator"
 	"github.com/alertint/alertint-agent/internal/notify"
 	"github.com/alertint/alertint-agent/internal/store"
 )
@@ -27,8 +33,8 @@ func New(inner notify.Notifier, st *store.Store) *Notifier {
 	return &Notifier{inner: inner, st: st}
 }
 
-// OnIncidentResolved implements correlator.ResolutionNotifier.
-// It sends a resolution notification using the wrapped notifier.
+// OnIncidentResolved renders one legacy resolved Incident card through the
+// wrapped notifier. Nothing in serve calls it after the cutover.
 func (n *Notifier) OnIncidentResolved(ctx context.Context, inc store.Incident) error {
 	// Carry original LLM analysis into the resolved finding when available
 	// so notifiers (e.g. Slack) can preserve context in the updated message.
@@ -79,6 +85,3 @@ func (n *Notifier) OnIncidentResolved(ctx context.Context, inc store.Incident) e
 	}
 	return n.inner.Notify(ctx, f)
 }
-
-// Ensure Notifier implements correlator.ResolutionNotifier.
-var _ correlator.ResolutionNotifier = (*Notifier)(nil)

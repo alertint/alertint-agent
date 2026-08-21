@@ -36,6 +36,10 @@ type SituationInput struct {
 	OccurredAt     time.Time
 	ClaimOwner     string
 	ClaimToken     int64
+	// AttemptCount is how many times this input has been claimed. It bounds
+	// the retry budget before the input becomes an operator-visible dead
+	// letter; it carries no lifecycle authority.
+	AttemptCount int
 }
 
 type storedSituationInput struct {
@@ -466,10 +470,126 @@ func (s *Store) CommitSituationTransition(ctx context.Context, claim SituationCl
 			return fmt.Errorf("store: persist notification intent %d atomically with situation transition: %w", i, err)
 		}
 	}
+	// The Situation's immutable public identity is minted with the very
+	// transition that promises its root, never afterwards: an operator who
+	// sees the root must be able to name the Situation over MCP, and a crash
+	// between "root promised" and "handle minted" would leave a published
+	// Situation nobody can address.
+	if hasRootCreate(intents) && current.PublicHandle == nil {
+		if err := mintSituationPublicHandleTx(ctx, tx, current); err != nil {
+			return err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: finish situation transition: %w", err)
 	}
 	return nil
+}
+
+func hasRootCreate(intents []model.NotificationIntent) bool {
+	for _, intent := range intents {
+		if intent.Kind == model.NotificationSituationRootCreate {
+			return true
+		}
+	}
+	return false
+}
+
+// mintSituationPublicHandleTx assigns the immutable public handle and title
+// at first publication. The unsuffixed handle is tried first; a
+// case-insensitive collision with an existing handle earns the deterministic
+// per-Situation suffix rather than a counter, so the identity stays stable
+// across retries of the same transition.
+func mintSituationPublicHandleTx(ctx context.Context, tx *sql.Tx, current model.Situation) error {
+	values := groupKeyValues(current.GroupKey)
+	dominant, err := dominantSymptomTx(ctx, tx, current.ID)
+	if err != nil {
+		return err
+	}
+	for _, collision := range []bool{false, true} {
+		handle, err := situation.PublicHandle(values, dominant, current.ID, collision)
+		if err != nil {
+			return fmt.Errorf("store: derive situation public handle: %w", err)
+		}
+		var taken int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT EXISTS(SELECT 1 FROM situations WHERE public_handle = ? COLLATE NOCASE)`, handle).Scan(&taken); err != nil {
+			return fmt.Errorf("store: check situation public handle collision: %w", err)
+		}
+		if taken == 1 {
+			continue
+		}
+		title := current.GroupKey
+		if dominant != "" {
+			title = dominant + " — " + current.GroupKey
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE situations SET public_handle = ?, title = COALESCE(title, ?) WHERE id = ? AND public_handle IS NULL`,
+			handle, title, current.ID); err != nil {
+			return fmt.Errorf("store: mint situation public handle: %w", err)
+		}
+		return nil
+	}
+	return errors.New("store: situation public handle could not be minted without collision")
+}
+
+// groupKeyValues extracts the label values of a rendered group key
+// ("k=v,k=v") so the public handle reads as the operator's own vocabulary.
+func groupKeyValues(groupKey string) []string {
+	parts := strings.Split(groupKey, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if _, value, ok := strings.Cut(part, "="); ok && strings.TrimSpace(value) != "" {
+			out = append(out, value)
+			continue
+		}
+		if strings.TrimSpace(part) != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+// dominantSymptomTx names the Situation's most severe currently firing alert,
+// falling back to any member alertname. It is presentation vocabulary for the
+// handle, never an authority signal.
+func dominantSymptomTx(ctx context.Context, tx *sql.Tx, situationID string) (string, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT d.labels_json, d.status
+		FROM situation_incidents AS si
+		JOIN incident_alert_deliveries AS iad ON iad.incident_id = si.incident_id
+		JOIN alert_deliveries AS d ON d.id = iad.delivery_id
+		WHERE si.situation_id = ?
+		ORDER BY d.received_at DESC, d.id DESC`, situationID)
+	if err != nil {
+		return "", fmt.Errorf("store: query situation dominant symptom: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	fallback := ""
+	for rows.Next() {
+		var labelsJSON, status string
+		if err := rows.Scan(&labelsJSON, &status); err != nil {
+			return "", fmt.Errorf("store: scan situation dominant symptom: %w", err)
+		}
+		labels := map[string]string{}
+		if err := json.Unmarshal([]byte(labelsJSON), &labels); err != nil {
+			continue
+		}
+		name := labels["alertname"]
+		if name == "" {
+			continue
+		}
+		if status == string(model.DeliveryStatusFiring) {
+			return name, nil
+		}
+		if fallback == "" {
+			fallback = name
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("store: iterate situation dominant symptom: %w", err)
+	}
+	return fallback, nil
 }
 
 func legalSituationTransition(from, to model.Lifecycle) bool {
@@ -826,10 +946,10 @@ func readSituationInput(ctx context.Context, q queryRower, inputID string) (stor
 	var occurredAt string
 	err := q.QueryRowContext(ctx, `
 		SELECT id, idempotency_key, incident_id, kind, group_key, delivery_id,
-		       occurred_at, status, lease_owner, lease_expires_at, claim_token
+		       occurred_at, status, lease_owner, lease_expires_at, claim_token, attempt_count
 		FROM situation_input_outbox WHERE id = ?`, inputID).
 		Scan(&in.ID, &in.IdempotencyKey, &in.IncidentID, &in.Kind, &in.GroupKey, &deliveryID,
-			&occurredAt, &in.Status, &leaseOwner, &leaseExpires, &in.ClaimToken)
+			&occurredAt, &in.Status, &leaseOwner, &leaseExpires, &in.ClaimToken, &in.AttemptCount)
 	if errors.Is(err, sql.ErrNoRows) {
 		return storedSituationInput{}, ErrNotFound
 	}

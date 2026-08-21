@@ -105,12 +105,14 @@ type Steering struct {
 	VerdictDate string `json:"verdict_date"`
 }
 
-// RecurrenceEvent carries everything a sink needs to render a recurrence-collapse
-// attach: the incident, its derived occurrence stats, the trigger rung, and the
-// per-trigger delta facts that name the "why" on a thread reply. The correlator
-// builds it in the impure half of the attach path, where the baselines, incoming
-// labels, and episode series are already in hand. Delta fields are zero except
-// for the trigger they belong to.
+// RecurrenceEvent carries everything a legacy sink needs to render a
+// recurrence-collapse attach: the incident, its derived occurrence stats, the
+// trigger rung, and the per-trigger delta facts that name the "why" on a
+// thread reply. Delta fields are zero except for the trigger they belong to.
+//
+// The correlator no longer builds one: after the cutover a collapse attach is
+// a durable Situation input, and situation.PlanNotificationIntents decides
+// what (if anything) it says. This type survives for the fixture tests only.
 type RecurrenceEvent struct {
 	Incident store.Incident
 	Stats    store.OccurrenceStats
@@ -274,6 +276,12 @@ func (m *Multi) Notify(ctx context.Context, f Finding) error {
 // OccurrenceSink is an optional capability: a Notifier that also renders a
 // recurrence-collapse occurrence attach (deterministic, zero-LLM). Sinks that
 // don't implement it are simply skipped by Multi's fan-out.
+//
+// Nothing in serve fans occurrences out after the Situation cutover: a
+// recurrence-collapse attach becomes a durable Situation input, and the one
+// thread reply it may earn is planned as a notification intent and delivered
+// by the Situation notification worker. This capability and its renderers
+// remain compiled only for the historical-card fixture tests.
 type OccurrenceSink interface {
 	OnOccurrenceAttached(ctx context.Context, ev RecurrenceEvent) error
 }

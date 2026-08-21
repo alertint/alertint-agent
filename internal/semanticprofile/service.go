@@ -137,7 +137,7 @@ func (s *Service) InferIfMissing(ctx context.Context, d store.AlertDelivery) (*H
 		}
 		return nil, nil
 	}
-	return s.Get(ctx, signature)
+	return s.store.SemanticProfile(ctx, signature)
 }
 
 // Correction is a confirmed replacement profile at one expected head version.

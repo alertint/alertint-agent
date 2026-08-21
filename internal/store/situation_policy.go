@@ -798,6 +798,24 @@ func (s *Store) DueEnvelopeReviews(ctx context.Context, now time.Time, interval 
 	return out, nil
 }
 
+// EnvelopeMatchCount reports how many Situations this envelope has quieted
+// since its last confirmation prompt — the one number a sparse review
+// reminder needs so the operator knows what they are re-confirming.
+func (s *Store) EnvelopeMatchCount(ctx context.Context, envelopeID string) (int, error) {
+	if strings.TrimSpace(envelopeID) == "" {
+		return 0, errors.New("store: envelope match count requires an envelope id")
+	}
+	var count int
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM envelope_evaluations AS e
+		JOIN expected_behavior_envelopes AS h ON h.id = e.envelope_id
+		WHERE e.envelope_id = ? AND e.result = 'match'
+		  AND (h.last_review_prompt_at IS NULL OR e.created_at > h.last_review_prompt_at)`, envelopeID).Scan(&count); err != nil {
+		return 0, fmt.Errorf("store: count envelope matches: %w", err)
+	}
+	return count, nil
+}
+
 // MarkEnvelopeReviewPrompted records that a review reminder was created for
 // envelopeID at now, so DueEnvelopeReviews does not surface it again until
 // another full interval has elapsed.

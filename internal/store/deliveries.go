@@ -815,3 +815,15 @@ func timePtr(v sql.NullString) (*time.Time, error) {
 	}
 	return &out, nil
 }
+
+// PendingAlertDispatches counts accepted deliveries still awaiting
+// correlation — the backlog startup replay drains before ordinary
+// reconciliation begins.
+func (s *Store) PendingAlertDispatches(ctx context.Context) (int, error) {
+	var count int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM alert_delivery_dispatches WHERE status IN ('pending', 'claimed')`).Scan(&count); err != nil {
+		return 0, fmt.Errorf("store: count pending alert dispatches: %w", err)
+	}
+	return count, nil
+}

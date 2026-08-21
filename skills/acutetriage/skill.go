@@ -235,6 +235,12 @@ type pipelineParams struct {
 
 // Run executes the full triage pipeline for a newly-ready incident.
 // It is safe to call from the IncidentSink goroutine.
+// NotifierWired reports whether this Skill was constructed with an outward
+// notifier. After the Situation cutover serve constructs it without one — L1
+// is durable evidence for the controller's B+ gate (D2), never an outward
+// effect — so the wiring itself is assertable rather than merely commented.
+func (s *Skill) NotifierWired() bool { return s != nil && s.notifier != nil }
+
 func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 	s.logger.Info("triage started", "incident", inc.ID, "alerts", inc.AlertCount)
 

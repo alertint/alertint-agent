@@ -32,21 +32,20 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/grouping"
-	"github.com/alertint/alertint-agent/internal/notify"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/google/uuid"
 )
 
-// IncidentSink receives incidents that have exited the collecting window
-// and are ready for further processing.
+// IncidentSink receives incidents that have exited the collecting window and
+// are ready for further processing.
+//
+// After the Situation cutover serve wires NopIncidentSink: a correlated
+// delivery reaches the Situation controller through its durable input outbox,
+// never through an in-memory sink, and the correlator has no outward
+// notification authority at all. The interface remains for the legacy
+// in-memory fixtures that still exercise the window/flush path.
 type IncidentSink interface {
 	OnIncidentReady(ctx context.Context, inc store.Incident) error
-}
-
-// ResolutionNotifier receives notifications when an incident becomes fully resolved
-// (all alerts have status="resolved").
-type ResolutionNotifier interface {
-	OnIncidentResolved(ctx context.Context, inc store.Incident) error
 }
 
 // NopIncidentSink discards every incident. Useful in tests that only
@@ -54,22 +53,6 @@ type ResolutionNotifier interface {
 type NopIncidentSink struct{}
 
 func (NopIncidentSink) OnIncidentReady(_ context.Context, _ store.Incident) error { return nil }
-
-// OccurrenceNotifier receives a deterministic, zero-LLM notification each time a
-// re-fire attaches as an occurrence (recurrence collapse). The stdout notifier
-// emits one line; the Slack notifier edits the card and/or posts the "why" as a
-// thread reply. nil means no occurrence notifications.
-type OccurrenceNotifier interface {
-	OnOccurrenceAttached(ctx context.Context, ev notify.RecurrenceEvent) error
-}
-
-// Rejudger runs a fresh triage that replaces an incident's finding in place when
-// an escalation trigger or the Clock B ceiling fires. Implemented by the triage
-// skill and wired in U4 — nil means an escalation records its occurrence and
-// trigger but no re-judgment runs yet.
-type Rejudger interface {
-	Rejudge(ctx context.Context, inc store.Incident, trigger string) error
-}
 
 // Auditor is the subset of internal/audit the correlator uses to record
 // occurrence attaches (incident.occurrence_attached). nil disables auditing.
@@ -124,14 +107,11 @@ func (c *Config) defaults() {
 // Correlator groups incoming store.Alert values into incidents using a
 // fixed time window and notifies an IncidentSink when each window closes.
 type Correlator struct {
-	cfg                Config
-	st                 *store.Store
-	sink               IncidentSink
-	resolutionNotifier ResolutionNotifier
-	occNotifier        OccurrenceNotifier
-	rejudger           Rejudger
-	auditor            Auditor
-	logger             *slog.Logger
+	cfg     Config
+	st      *store.Store
+	sink    IncidentSink
+	auditor Auditor
+	logger  *slog.Logger
 
 	// pruneEvery is how many flush ticks pass between occurrence prunes (~hourly
 	// at the default tick). Set in New; tests may override.
@@ -170,18 +150,6 @@ func New(cfg Config, st *store.Store, sink IncidentSink, logger *slog.Logger) *C
 		doneCh:     make(chan struct{}),
 	}
 }
-
-// SetResolutionNotifier sets the notifier for incident resolution events.
-// Call this after New() but before Start().
-func (c *Correlator) SetResolutionNotifier(rn ResolutionNotifier) {
-	c.resolutionNotifier = rn
-}
-
-// SetOccurrenceNotifier sets the collapse notifier (U5). Call after New, before Start.
-func (c *Correlator) SetOccurrenceNotifier(n OccurrenceNotifier) { c.occNotifier = n }
-
-// SetRejudger sets the re-judgment runner (U4). Call after New, before Start.
-func (c *Correlator) SetRejudger(r Rejudger) { c.rejudger = r }
 
 // SetAuditor sets the auditor for occurrence-attach events. Call after New, before Start.
 func (c *Correlator) SetAuditor(a Auditor) { c.auditor = a }
@@ -467,11 +435,6 @@ func (c *Correlator) maybeResolveIncident(ctx context.Context, inc *store.Incide
 		return
 	}
 	c.logger.Info("correlator: incident resolved - all alerts recovered", "incident_id", inc.ID, "group_key", gk)
-	if c.resolutionNotifier != nil {
-		if notifyErr := c.resolutionNotifier.OnIncidentResolved(ctx, *inc); notifyErr != nil {
-			c.logger.Warn("correlator: resolution notify failed", "incident_id", inc.ID, "err", notifyErr)
-		}
-	}
 }
 
 // checkAllAlertsResolved returns true if all alerts in the incident are resolved.

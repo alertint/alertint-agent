@@ -91,15 +91,19 @@ func openStore(t *testing.T) *store.Store {
 	return st
 }
 
-// newCorrelatorFor builds a non-started correlator wired with the three test
-// doubles, grouping on the "service" label.
+// newCorrelatorFor builds a non-started correlator grouping on the "service"
+// label, alongside the occurrence-notifier and rejudger doubles.
+//
+// After the Situation cutover the correlator has no seam to attach either
+// double to: notification and re-judgment authority belong to the Situation
+// controller alone. The doubles stay so the "zero calls" assertions below
+// keep reading as the behavioural claim they are — nothing outward happens on
+// the correlation path — rather than silently disappearing.
 func newCorrelatorFor(t *testing.T, st *store.Store) (*Correlator, *testDoubles) {
 	t.Helper()
 	c := New(Config{GroupLabels: []string{"service"}}, st, NopIncidentSink{}, nil)
 	td := &testDoubles{notif: &fakeOccNotifier{}, aud: &fakeAuditor{}, rej: &fakeRejudger{}}
-	c.SetOccurrenceNotifier(td.notif)
 	c.SetAuditor(td.aud)
-	c.SetRejudger(td.rej)
 	return c, td
 }
 

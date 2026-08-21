@@ -45,10 +45,7 @@ import (
 	"github.com/alertint/alertint-agent/internal/logs"
 	"github.com/alertint/alertint-agent/internal/logs/loki"
 	internalmcp "github.com/alertint/alertint-agent/internal/mcp"
-	"github.com/alertint/alertint-agent/internal/notify"
-	notifyresolution "github.com/alertint/alertint-agent/internal/notify/resolution"
 	notifyslack "github.com/alertint/alertint-agent/internal/notify/slack"
-	notifystdout "github.com/alertint/alertint-agent/internal/notify/stdout"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/rules"
 	"github.com/alertint/alertint-agent/internal/sentry"
@@ -200,7 +197,13 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 
 	classifierClient := buildClassifierClient(cfg, apiKey, auditor, logger)
 
-	notifier := buildNotifier(cfg, st, auditor, logger, strings.EqualFold(level, "debug"))
+	// One Slack authority after the cutover: the Situation notification
+	// worker, delivering durable intents. The legacy IncidentSink -> acute
+	// triage -> Slack path, the resolution notifier, and the occurrence
+	// notifier are all gone from serve; their renderers remain compiled only
+	// for historical-card fixture tests.
+	situationStdout := buildSituationStdout(cfg, auditor, strings.EqualFold(level, "debug"))
+	slackClient := buildSlackAPIClient(cfg, logger)
 
 	// Build Prometheus client when enabled. Passed into both the triage skill
 	// (metric enrichment for the LLM prompt) and the MCP server (PromQL tools).
@@ -327,7 +330,9 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 			},
 			PromptCaching: !llmProviderIsOpenAI(cfg),
 		},
-		st, llmClient, auditor, notifier, logger,
+		// No notifier: L1 is durable evidence for the Situation controller's
+		// B+ gate (D2), never an outward effect of its own.
+		st, llmClient, auditor, nil, logger,
 	)
 	_ = apiKey // key is embedded in llmClient via Config.APIKey
 	captureEngine := acutetriage.NewCaptureEngine(skill)
@@ -340,31 +345,54 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		OccurrenceCap:   cfg.Memory.OccurrenceCap,
 		Lookback:        time.Duration(cfg.Memory.LookbackDays) * 24 * time.Hour,
 	}
-	cor := correlator.New(corCfg, st, incidentSink{skill: skill}, logger)
-
-	cor.SetResolutionNotifier(notifyresolution.New(notifier, st))
+	// The correlator keeps its window/flush duties but has no outward sink:
+	// durable Situation inputs, not an in-memory IncidentSink, carry a
+	// correlated delivery forward.
+	cor := correlator.New(corCfg, st, correlator.NopIncidentSink{}, logger)
 	cor.SetAuditor(auditor)
-	cor.SetRejudger(skill)
-	cor.SetOccurrenceNotifier(notifier)
 
 	if err := cor.Start(ctx); err != nil {
 		return fmt.Errorf("correlator start: %w", err)
 	}
 	defer cor.Stop()
 
+	rt, err := buildSituationRuntime(cfg, st, auditor, cor, situationDeps{
+		Skill:       skill,
+		Assessor:    llmClient,
+		ProfileLLM:  llmClient,
+		Model:       cfg.LLM.Model,
+		Stdout:      situationStdout,
+		SlackClient: slackClient,
+	}, logger)
+	if err != nil {
+		return err
+	}
+	logger.Info("situation runtime ready", slog.String("slack_authority", rt.describe()))
+
+	// Startup reconstruction runs after migrations and before any worker
+	// starts: leases recovered, durable queues replayed, then any active
+	// Incident no Situation represents is populated — scheduled, never
+	// published, so an upgrade cannot storm the main channel.
+	if err := rt.runReconstruction(ctx, logger); err != nil {
+		logger.Error("situation startup reconstruction incomplete", slog.String("err", err.Error()))
+	}
+	rt.workers.Start(ctx)
+
 	// Probe enabled integrations in the background: quickly (with backoff)
 	// while one is failing — at startup a co-deployed dependency may still
 	// be booting — then at a steady pace, logging losses and recoveries.
-	// Results are cached for GET /health.
-	healthReg := buildHealthChecks(cfg, prom, logSrc, sentryClient, zbxClient)
+	// Results are cached for GET /health. SQLite write health rides the same
+	// registry, so a failing authoritative write fails readiness.
+	healthReg := buildHealthChecks(cfg, prom, logSrc, sentryClient, zbxClient, rt.writeHealth.Check())
+	healthReg.SetSink(rt.healthSink)
 	go healthReg.Watch(ctx, logger)
 
-	recvSrv, recvErrCh, err := startReceivers(cfg, st, auditor, cor, healthReg, logger)
+	recvSrv, recvErrCh, err := startReceivers(cfg, st, auditor, healthReg, logger)
 	if err != nil {
 		return err
 	}
 
-	mcpHTTPSrv, mcpErrCh, err := startMCP(cfg, st, auditor, prom, logSrc, sentryReader, sentryParams, zbxClient, captureEngine, logger)
+	mcpHTTPSrv, mcpErrCh, err := startMCP(cfg, st, auditor, prom, logSrc, sentryReader, sentryParams, zbxClient, captureEngine, rt.commands, logger)
 	if err != nil {
 		return err
 	}
@@ -396,6 +424,12 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 			logger.Error("MCP graceful shutdown failed", slog.String("err", err.Error()))
 		}
 	}
+	// Workers stop after the HTTP surfaces so nothing new is accepted while
+	// in-flight claims drain. Anything still leased at the deadline stays
+	// durable; its lease lapses and the next start recovers it.
+	if err := rt.workers.Stop(shutdownCtx); err != nil {
+		logger.Warn("situation workers did not fully drain", slog.String("err", err.Error()))
+	}
 	logger.Info("alertint stopped", slog.String("reason", "signal"))
 	return nil
 }
@@ -419,14 +453,17 @@ func pruneChangesAtStartup(ctx context.Context, cfg *config.Config, st *store.St
 // startReceivers starts the inbound webhook host when at least one receiver is
 // enabled. The host also serves GET /health. Returns (nil, nil, nil) when no
 // receiver is enabled — the nil error channel never fires in runServe's select.
-func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor, cor *correlator.Correlator, healthReg *health.Registry, logger *slog.Logger) (*http.Server, <-chan error, error) {
+func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor, healthReg *health.Registry, logger *slog.Logger) (*http.Server, <-chan error, error) {
 	var receivers []ingress.Receiver
 	if cfg.Alertmanager.Enabled {
 		token, err := cfg.WebhookToken()
 		if err != nil {
 			return nil, nil, err
 		}
-		receivers = append(receivers, ingress.NewAlertReceiver(st, token, cor.Accept, logger))
+		// nil sink: acceptance is store-only and durable. Correlation happens
+		// afterwards, from the delivery dispatch queue, and can never alter
+		// the response the source already got.
+		receivers = append(receivers, ingress.NewAlertReceiver(st, token, nil, logger))
 	}
 	if cfg.Changes.Ingress.Enabled {
 		token, err := cfg.ChangesWebhookToken()
@@ -440,7 +477,7 @@ func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor,
 		if err != nil {
 			return nil, nil, err
 		}
-		receivers = append(receivers, ingress.NewZabbixReceiver(st, token, cor.Accept, logger))
+		receivers = append(receivers, ingress.NewZabbixReceiver(st, token, nil, logger))
 	}
 
 	if len(receivers) == 0 {
@@ -489,7 +526,7 @@ func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor,
 // startMCP starts the MCP HTTP server when enabled. MCP clients connect by
 // URL (e.g. http://host:9912/mcp) — no subprocess or shared file needed.
 // Returns (nil, nil, nil) when disabled.
-func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom *promclient.Client, logSrc logs.Source, sentryReader acutetriage.SentryReader, sentryParams acutetriage.SentryParams, zbxClient *zabbix.Client, captureEngine *acutetriage.CaptureEngine, logger *slog.Logger) (*http.Server, <-chan error, error) {
+func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom *promclient.Client, logSrc logs.Source, sentryReader acutetriage.SentryReader, sentryParams acutetriage.SentryParams, zbxClient *zabbix.Client, captureEngine *acutetriage.CaptureEngine, commands internalmcp.SituationCommands, logger *slog.Logger) (*http.Server, <-chan error, error) {
 	if !cfg.MCPEnabled() {
 		return nil, nil, nil
 	}
@@ -515,6 +552,9 @@ func startMCP(cfg *config.Config, st *store.Store, auditor *audit.Auditor, prom 
 		ZabbixDefaultRangeMinutes: cfg.Zabbix.API.DefaultRangeMinutes,
 		MemoryLookbackDays:        cfg.Memory.LookbackDays,
 		Capture:                   captureEngine,
+		// The whole Situation-mode tool group registers together off this one
+		// presence check: after the cutover serve always supplies it.
+		SituationCommands: commands,
 	}
 	// zbxClient's field type is an unexported interface in package mcp, so it
 	// can't be declared as a typed nil here — assign only when non-nil (typed-nil
@@ -825,8 +865,8 @@ func newSentryPoller(cfg *config.Config, client *sentry.Client, st *store.Store,
 
 // buildHealthChecks assembles connectivity probes for every enabled
 // integration. Returns nil (a no-op registry) when nothing is enabled.
-func buildHealthChecks(cfg *config.Config, prom *promclient.Client, logSrc logs.Source, sentryClient *sentry.Client, zbxClient *zabbix.Client) *health.Registry {
-	var checks []health.Check
+func buildHealthChecks(cfg *config.Config, prom *promclient.Client, logSrc logs.Source, sentryClient *sentry.Client, zbxClient *zabbix.Client, extra ...health.Check) *health.Registry {
+	checks := append([]health.Check(nil), extra...)
 	if cfg.PrometheusEnabled() && prom != nil {
 		checks = append(checks, health.Check{
 			Name:   "prometheus",
@@ -896,40 +936,6 @@ func buildHealthChecks(cfg *config.Config, prom *promclient.Client, logSrc logs.
 		return nil
 	}
 	return health.NewRegistry(health.DefaultTTL, checks...)
-}
-
-// buildNotifier constructs the notify.Multi from the loaded config and logs the
-// active sinks at startup. The human-readable one-line finding summary and the
-// per-sink "notified" outcome line are owned by Multi (both at INFO, both
-// formats). The sinks themselves:
-//
-//   - stdout: always an active sink when notify.stdout is set, so a send is
-//     confirmed (notified · stdout=ok) at INFO. Its verbose full JSON line is
-//     written only at debug level (consistently, in every format).
-//   - slack: when enabled and a bot token resolves.
-func buildNotifier(cfg *config.Config, st *store.Store, auditor *audit.Auditor, logger *slog.Logger, debug bool) *notify.Multi {
-	var nn []notify.Notifier
-	var sinks []string
-	slackWired := false
-	if cfg.Notify.Stdout {
-		nn = append(nn, notifystdout.New(os.Stdout, auditor, debug))
-		sinks = append(sinks, "stdout")
-	}
-	if cfg.Notify.Slack.Enabled {
-		if token, err := cfg.SlackBotToken(); err == nil && token != "" {
-			nn = append(nn, notifyslack.New(token, cfg.Notify.Slack.Channel, cfg.Notify.Slack.MinSeverity, cfg.Notify.Slack.RecurrenceMode, st, auditor))
-			sinks = append(sinks, "slack")
-			slackWired = true
-		}
-	}
-
-	attrs := []any{slog.String("sinks", strings.Join(sinks, ","))}
-	if slackWired {
-		attrs = append(attrs, slog.String("slack_channel", cfg.Notify.Slack.Channel))
-	}
-	logger.Info("notifiers ready", attrs...)
-
-	return notify.NewMulti(logger, nn...)
 }
 
 // llmProviderIsOpenAI reports whether the configured provider is the
@@ -1012,15 +1018,6 @@ func llmanthropicCfg(cfg *config.Config) llmanthropic.Config {
 		MaxTokens:      cfg.LLM.MaxTokens,
 		TimeoutSeconds: cfg.LLM.TimeoutSeconds,
 	}
-}
-
-// incidentSink wraps an acutetriage.Skill as a correlator.IncidentSink.
-type incidentSink struct {
-	skill *acutetriage.Skill
-}
-
-func (s incidentSink) OnIncidentReady(ctx context.Context, inc store.Incident) error {
-	return s.skill.Run(ctx, inc)
 }
 
 // buildLogger constructs the runtime logger applying precedence
