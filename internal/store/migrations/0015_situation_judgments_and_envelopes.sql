@@ -85,8 +85,15 @@ CREATE TABLE envelope_evaluations (
     matched_fields_json TEXT    NOT NULL CHECK (json_valid(matched_fields_json) AND json_type(matched_fields_json) = 'array'),
     violations_json     TEXT    NOT NULL CHECK (json_valid(violations_json) AND json_type(violations_json) = 'array'),
     observability_json  TEXT    NOT NULL CHECK (json_valid(observability_json) AND json_type(observability_json) = 'array'),
+    -- Resolved UTC schedule window a configured Schedule condition evaluated
+    -- against, persisted rather than re-derived so a DST-sensitive
+    -- determination stays independently auditable. Both NULL when the
+    -- evaluated version carries no Schedule condition.
+    schedule_window_start TEXT,
+    schedule_window_end   TEXT,
     quieting_authority  INTEGER NOT NULL CHECK (quieting_authority IN (0, 1)),
-    created_at          TEXT    NOT NULL CHECK (created_at <> '')
+    created_at          TEXT    NOT NULL CHECK (created_at <> ''),
+    CHECK ((schedule_window_start IS NULL) = (schedule_window_end IS NULL))
 ) STRICT;
 
 CREATE INDEX envelope_evaluations_situation_idx

@@ -106,6 +106,7 @@ func (s *Store) RecordJudgment(ctx context.Context, snap situation.Snapshot, req
 		_ = tx.Rollback()
 		s.auditSituationPolicyRejection(ctx, auditor, "judgment.rejected", map[string]any{
 			"situation_id": snap.SituationID, "expected_input_version": snap.InputVersion, "actual_input_version": current.inputVersion,
+			"authenticated_as": authenticatedAs, "asserted_operator": req.ConfirmedBy,
 		})
 		return nil, ErrSituationVersionConflict
 	}
@@ -272,6 +273,22 @@ func insertSituationJudgmentTx(ctx context.Context, tx *sql.Tx, p preparedSituat
 // owns first-time creation, since only it carries the source judgment a new
 // envelope must be attributed to.
 func (s *Store) AppendEnvelopeVersion(ctx context.Context, expected int, v situationmodel.EnvelopeVersion) error {
+	return s.appendEnvelopeVersion(ctx, expected, v, nil, nil)
+}
+
+// AppendEnvelopeVersionWithAudit atomically appends an envelope version and
+// writes every required audit event in the same transaction — the shape a
+// system-driven append (a trigger/template-change caller appending
+// `invalidated`) needs, matching RecordJudgment/ConfirmEnvelope/RevokeEnvelope's
+// mandatory-audit requirement for every judgment/envelope write.
+func (s *Store) AppendEnvelopeVersionWithAudit(ctx context.Context, expected int, v situationmodel.EnvelopeVersion, auditor SituationPolicyAuditAppender, events []SituationPolicyAuditEvent) error {
+	if auditor == nil || len(events) == 0 {
+		return errors.New("store: envelope version audit is required")
+	}
+	return s.appendEnvelopeVersion(ctx, expected, v, auditor, events)
+}
+
+func (s *Store) appendEnvelopeVersion(ctx context.Context, expected int, v situationmodel.EnvelopeVersion, auditor SituationPolicyAuditAppender, events []SituationPolicyAuditEvent) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("store: begin append envelope version: %w", err)
@@ -279,6 +296,11 @@ func (s *Store) AppendEnvelopeVersion(ctx context.Context, expected int, v situa
 	defer func() { _ = tx.Rollback() }()
 	if _, err := appendEnvelopeVersionTx(ctx, tx, expected, v); err != nil {
 		return err
+	}
+	if auditor != nil {
+		if err := appendSituationPolicyAuditEvents(ctx, tx, auditor, events); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: commit append envelope version: %w", err)
@@ -339,6 +361,7 @@ func (s *Store) ConfirmEnvelope(ctx context.Context, confirmation situationmodel
 			_ = tx.Rollback()
 			s.auditSituationPolicyRejection(ctx, auditor, "envelope.confirm.rejected", map[string]any{
 				"source_judgment_id": confirmation.SourceJudgmentID, "expected_current_version": confirmation.ExpectedCurrentVersion,
+				"authenticated_as": authenticatedAs, "asserted_operator": confirmation.ConfirmedBy,
 			})
 		}
 		return nil, err
@@ -354,6 +377,7 @@ func (s *Store) ConfirmEnvelope(ctx context.Context, confirmation situationmodel
 			_ = tx.Rollback()
 			s.auditSituationPolicyRejection(ctx, auditor, "envelope.confirm.rejected", map[string]any{
 				"envelope_id": envelopeID, "expected_current_version": confirmation.ExpectedCurrentVersion,
+				"authenticated_as": authenticatedAs, "asserted_operator": confirmation.ConfirmedBy,
 			})
 		}
 		return nil, err
@@ -416,6 +440,7 @@ func (s *Store) RevokeEnvelope(ctx context.Context, revocation situationmodel.En
 			_ = tx.Rollback()
 			s.auditSituationPolicyRejection(ctx, auditor, "envelope.revoke.rejected", map[string]any{
 				"envelope_id": revocation.EnvelopeID, "expected_current_version": revocation.ExpectedCurrentVersion,
+				"authenticated_as": authenticatedAs, "asserted_operator": revocation.ConfirmedBy,
 			})
 		}
 		return nil, err
@@ -803,6 +828,21 @@ func (s *Store) MarkEnvelopeReviewPrompted(ctx context.Context, envelopeID strin
 // attempt. Exact replay (identical id and content) succeeds; a reused id
 // with different content fails closed.
 func (s *Store) AppendEnvelopeEvaluation(ctx context.Context, e situationmodel.EnvelopeEvaluation) error {
+	return s.appendEnvelopeEvaluation(ctx, e, nil, nil)
+}
+
+// AppendEnvelopeEvaluationWithAudit atomically appends one deterministic
+// evaluation attempt and writes every required audit event in the same
+// transaction, matching RecordJudgment/ConfirmEnvelope/RevokeEnvelope's
+// mandatory-audit requirement for every judgment/envelope write.
+func (s *Store) AppendEnvelopeEvaluationWithAudit(ctx context.Context, e situationmodel.EnvelopeEvaluation, auditor SituationPolicyAuditAppender, events []SituationPolicyAuditEvent) error {
+	if auditor == nil || len(events) == 0 {
+		return errors.New("store: envelope evaluation audit is required")
+	}
+	return s.appendEnvelopeEvaluation(ctx, e, auditor, events)
+}
+
+func (s *Store) appendEnvelopeEvaluation(ctx context.Context, e situationmodel.EnvelopeEvaluation, auditor SituationPolicyAuditAppender, events []SituationPolicyAuditEvent) error {
 	prepared, err := prepareEnvelopeEvaluation(e)
 	if err != nil {
 		return err
@@ -814,10 +854,12 @@ func (s *Store) AppendEnvelopeEvaluation(ctx context.Context, e situationmodel.E
 	defer func() { _ = tx.Rollback() }()
 	result, err := tx.ExecContext(ctx, `INSERT INTO envelope_evaluations (
 		id, envelope_id, envelope_version, situation_id, input_version, result,
-		matched_fields_json, violations_json, observability_json, quieting_authority, created_at
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING`,
+		matched_fields_json, violations_json, observability_json,
+		schedule_window_start, schedule_window_end, quieting_authority, created_at
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING`,
 		prepared.id, prepared.envelopeID, prepared.envelopeVersion, prepared.situationID, prepared.inputVersion, prepared.result,
-		prepared.matchedFieldsJSON, prepared.violationsJSON, prepared.observabilityJSON, prepared.quietingAuthority, prepared.createdAt)
+		prepared.matchedFieldsJSON, prepared.violationsJSON, prepared.observabilityJSON,
+		nullableTimeString(prepared.scheduleWindowStart), nullableTimeString(prepared.scheduleWindowEnd), prepared.quietingAuthority, prepared.createdAt)
 	if err != nil {
 		return fmt.Errorf("store: append envelope evaluation: %w", err)
 	}
@@ -834,6 +876,11 @@ func (s *Store) AppendEnvelopeEvaluation(ctx context.Context, e situationmodel.E
 			return errors.New("store: envelope evaluation identity collision")
 		}
 	}
+	if auditor != nil {
+		if err := appendSituationPolicyAuditEvents(ctx, tx, auditor, events); err != nil {
+			return err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: commit append envelope evaluation: %w", err)
 	}
@@ -843,6 +890,7 @@ func (s *Store) AppendEnvelopeEvaluation(ctx context.Context, e situationmodel.E
 type preparedEnvelopeEvaluation struct {
 	id, envelopeID, situationID, result                  string
 	matchedFieldsJSON, violationsJSON, observabilityJSON string
+	scheduleWindowStart, scheduleWindowEnd               string
 	createdAt                                            string
 	envelopeVersion, inputVersion, quietingAuthority     int
 }
@@ -860,6 +908,21 @@ func prepareEnvelopeEvaluation(e situationmodel.EnvelopeEvaluation) (preparedEnv
 	}
 	if e.QuietingAuthority && e.Result != situationmodel.EnvelopeEvaluationMatch {
 		return preparedEnvelopeEvaluation{}, errors.New("store: only a matched envelope evaluation may carry quieting authority")
+	}
+	if (e.ScheduleWindowStart == nil) != (e.ScheduleWindowEnd == nil) {
+		return preparedEnvelopeEvaluation{}, errors.New("store: envelope evaluation schedule window requires both start and end or neither")
+	}
+	var scheduleStart, scheduleEnd string
+	if e.ScheduleWindowStart != nil {
+		if e.ScheduleWindowStart.IsZero() || e.ScheduleWindowStart.Location() != time.UTC ||
+			e.ScheduleWindowEnd.IsZero() || e.ScheduleWindowEnd.Location() != time.UTC {
+			return preparedEnvelopeEvaluation{}, errors.New("store: envelope evaluation schedule window must be canonical utc times")
+		}
+		if !e.ScheduleWindowStart.Before(*e.ScheduleWindowEnd) {
+			return preparedEnvelopeEvaluation{}, errors.New("store: envelope evaluation schedule window start must precede end")
+		}
+		scheduleStart = canonicalTime(*e.ScheduleWindowStart)
+		scheduleEnd = canonicalTime(*e.ScheduleWindowEnd)
 	}
 	matched, violations, observability := e.MatchedFields, e.Violations, e.Observability
 	if matched == nil {
@@ -886,21 +949,36 @@ func prepareEnvelopeEvaluation(e situationmodel.EnvelopeEvaluation) (preparedEnv
 	return preparedEnvelopeEvaluation{
 		id: e.ID, envelopeID: e.EnvelopeID, envelopeVersion: e.EnvelopeVersion, situationID: e.SituationID, inputVersion: e.InputVersion,
 		result: string(e.Result), matchedFieldsJSON: string(matchedJSON), violationsJSON: string(violationsJSON), observabilityJSON: string(observabilityJSON),
+		scheduleWindowStart: scheduleStart, scheduleWindowEnd: scheduleEnd,
 		quietingAuthority: boolInt(e.QuietingAuthority), createdAt: canonicalTime(e.CreatedAt),
 	}, nil
 }
 
 func readPreparedEnvelopeEvaluation(ctx context.Context, tx *sql.Tx, id string) (preparedEnvelopeEvaluation, error) {
 	var out preparedEnvelopeEvaluation
+	var scheduleStart, scheduleEnd sql.NullString
 	err := tx.QueryRowContext(ctx, `SELECT id, envelope_id, envelope_version, situation_id, input_version, result,
-		matched_fields_json, violations_json, observability_json, quieting_authority, created_at
+		matched_fields_json, violations_json, observability_json,
+		schedule_window_start, schedule_window_end, quieting_authority, created_at
 		FROM envelope_evaluations WHERE id=?`, id).
 		Scan(&out.id, &out.envelopeID, &out.envelopeVersion, &out.situationID, &out.inputVersion, &out.result,
-			&out.matchedFieldsJSON, &out.violationsJSON, &out.observabilityJSON, &out.quietingAuthority, &out.createdAt)
+			&out.matchedFieldsJSON, &out.violationsJSON, &out.observabilityJSON,
+			&scheduleStart, &scheduleEnd, &out.quietingAuthority, &out.createdAt)
 	if err != nil {
 		return preparedEnvelopeEvaluation{}, fmt.Errorf("store: read envelope evaluation replay: %w", err)
 	}
+	out.scheduleWindowStart = scheduleStart.String
+	out.scheduleWindowEnd = scheduleEnd.String
 	return out, nil
+}
+
+// nullableTimeString converts a canonical time string ("" meaning unset)
+// into a SQL argument: NULL when unset, the string itself otherwise.
+func nullableTimeString(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
 }
 
 // ---------------------------------------------------------------------

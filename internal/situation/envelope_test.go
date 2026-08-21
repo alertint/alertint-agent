@@ -100,6 +100,76 @@ func TestEvaluateEnvelopeScheduleOutsideWindowViolates(t *testing.T) {
 	}
 }
 
+// TestEvaluateEnvelopePersistsResolvedScheduleWindow covers review finding
+// #1: the resolved UTC schedule interval must be carried onto EnvelopeResult
+// (never re-derived), for both a match and a violation, and DST-sensitive
+// determinations stay independently auditable.
+func TestEvaluateEnvelopePersistsResolvedScheduleWindow(t *testing.T) {
+	v := model.EnvelopeVersion{EnvelopeID: "env-1", Version: 1, Status: model.EnvelopeStatusActive,
+		Conditions: model.EnvelopeConditions{Schedule: &model.Schedule{Days: []string{"sun"}, LocalStart: "01:30", LocalEnd: "03:30", Timezone: "Europe/Riga"}}}
+	wantStart := mustScheduleTime(t, "2026-10-24T22:30:00Z")
+	wantEnd := mustScheduleTime(t, "2026-10-25T01:30:00Z")
+
+	inside := EvaluateEnvelope(v, EnvelopeFacts{Occurred: mustScheduleTime(t, "2026-10-25T01:00:00Z")})
+	if inside.ScheduleWindowStart == nil || inside.ScheduleWindowEnd == nil {
+		t.Fatalf("expected a persisted schedule window on match, got %+v", inside)
+	}
+	if !inside.ScheduleWindowStart.Equal(wantStart) || !inside.ScheduleWindowEnd.Equal(wantEnd) {
+		t.Fatalf("window=%s..%s want=%s..%s", inside.ScheduleWindowStart, inside.ScheduleWindowEnd, wantStart, wantEnd)
+	}
+
+	outside := EvaluateEnvelope(v, EnvelopeFacts{Occurred: mustScheduleTime(t, "2026-10-25T12:00:00Z")})
+	if outside.Result != model.EnvelopeEvaluationViolation {
+		t.Fatalf("result=%s", outside.Result)
+	}
+	if outside.ScheduleWindowStart == nil || outside.ScheduleWindowEnd == nil {
+		t.Fatalf("expected a persisted schedule window on violation too, got %+v", outside)
+	}
+
+	noSchedule := EvaluateEnvelope(envelopeWithCompanions(nil, nil), EnvelopeFacts{})
+	if noSchedule.ScheduleWindowStart != nil || noSchedule.ScheduleWindowEnd != nil {
+		t.Fatalf("expected no persisted window without a configured schedule, got %+v", noSchedule)
+	}
+}
+
+// TestEvaluateEnvelopeScopeGates covers matching-order steps 1-3 (exact
+// group scope, source/trigger identity, current trigger version): any
+// mismatch is a hard gate to not_applicable, evaluated before any condition.
+func TestEvaluateEnvelopeScopeGates(t *testing.T) {
+	v := model.EnvelopeVersion{EnvelopeID: "env-1", Version: 1, Status: model.EnvelopeStatusActive,
+		Scope:      model.EnvelopeScope{GroupKey: "host=db-prod-1", Source: "zabbix", TriggerID: "18422", TriggerVersion: "sha256:923b"},
+		Conditions: model.EnvelopeConditions{RequiredCompanionSignals: []string{"database_lock"}}}
+	matchingFacts := func() EnvelopeFacts {
+		return EnvelopeFacts{GroupKey: "host=db-prod-1", Source: "zabbix", TriggerID: "18422", TriggerVersion: "sha256:923b",
+			ActiveSignals: []string{"database_lock"}, ObservedSignals: []string{"database_lock"}}
+	}
+
+	if got := EvaluateEnvelope(v, matchingFacts()); got.Result != model.EnvelopeEvaluationMatch {
+		t.Fatalf("exact scope match result=%s", got.Result)
+	}
+
+	cases := map[string]func(*EnvelopeFacts){
+		"group_key mismatch":       func(f *EnvelopeFacts) { f.GroupKey = "host=other" },
+		"source mismatch":          func(f *EnvelopeFacts) { f.Source = "prometheus" },
+		"trigger_id mismatch":      func(f *EnvelopeFacts) { f.TriggerID = "99999" },
+		"trigger_version mismatch": func(f *EnvelopeFacts) { f.TriggerVersion = "sha256:changed" },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			facts := matchingFacts()
+			mutate(&facts)
+			got := EvaluateEnvelope(v, facts)
+			if got.Result != model.EnvelopeEvaluationNotApplicable {
+				t.Fatalf("%s: result=%s, want not_applicable", name, got.Result)
+			}
+			if len(got.MatchedFields) != 0 || len(got.Violations) != 0 || len(got.Observability) != 0 {
+				t.Fatalf("%s: expected no condition checks to run once scope is gated, got matched=%v violations=%v observability=%v",
+					name, got.MatchedFields, got.Violations, got.Observability)
+			}
+		})
+	}
+}
+
 func TestEvaluateEnvelopeOmittedDurationMaxDoesNotAuthorizeArbitraryDuration(t *testing.T) {
 	v := model.EnvelopeVersion{EnvelopeID: "env-1", Version: 1, Status: model.EnvelopeStatusActive,
 		Conditions: model.EnvelopeConditions{DurationMinutes: &model.DurationRange{Min: 5, Max: 0}}}
@@ -166,9 +236,9 @@ func TestValidateEnvelopeConditionsRejectsFreeTextUncertainty(t *testing.T) {
 }
 
 func TestValidateEnvelopeConditionsAcceptsClosedUncertainty(t *testing.T) {
-	closed := string(model.EvidenceQualityDegraded)
+	closed := uncertaintyPolicyMandatorySignalsObservable
 	if err := ValidateEnvelopeConditions(model.EnvelopeConditions{MaximumUncertainty: &closed}); err != nil {
-		t.Fatalf("expected a closed evidence-quality value to validate: %v", err)
+		t.Fatalf("expected the one closed maximum_uncertainty value to validate: %v", err)
 	}
 }
 

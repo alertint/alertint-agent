@@ -4,6 +4,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -456,5 +457,232 @@ func TestRecordSituationJudgmentLowLevelPrimitive(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("count=%d", count)
+	}
+}
+
+func lastAuditPayload(t *testing.T, s *Store) map[string]any {
+	t.Helper()
+	var payloadJSON string
+	if err := s.DB().QueryRow(`SELECT payload_json FROM audit_log ORDER BY seq DESC LIMIT 1`).Scan(&payloadJSON); err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
+// TestRejectedJudgmentAuditCarriesAttribution covers review finding #2: a
+// rejected optimistic write must be audited with both the authenticated
+// trust domain and the asserted operator, not just the version conflict.
+func TestRejectedJudgmentAuditCarriesAttribution(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	auditor := audit.New(s.DB())
+	now := mustSituationTime(t, "2026-08-20T10:00:00Z")
+	insertSituationFixture(t, s, "s-judge-attr", "host=db-attr", "", situationmodel.LifecycleActive, now)
+
+	req := testJudgmentRequest("s-judge-attr")
+	req.ConfirmedBy = "janis"
+	_, err := s.RecordJudgment(ctx, testJudgmentSnapshot("s-judge-attr", 2), req, "slack:U-janis", now, auditor, testAuditEvents("judgment.recorded"))
+	if !errors.Is(err, ErrSituationVersionConflict) {
+		t.Fatalf("err=%v, want version conflict", err)
+	}
+	payload := lastAuditPayload(t, s)
+	if payload["authenticated_as"] != "slack:U-janis" || payload["asserted_operator"] != "janis" {
+		t.Fatalf("rejected judgment audit payload=%+v, missing attribution", payload)
+	}
+}
+
+// TestRejectedEnvelopeConfirmAuditCarriesAttribution covers review finding
+// #2 for ConfirmEnvelope's head-resolution rejection path, exercised once
+// against an unknown source judgment (no head exists yet) and once against
+// an existing head at a stale version — both go through the same
+// resolveOrCreateEnvelopeHeadTx rejection and both must carry attribution.
+// (appendEnvelopeVersionTx's own defense-in-depth version check is not
+// independently reachable here: within one transaction on this
+// single-connection store, it always observes the same current_version
+// resolveOrCreateEnvelopeHeadTx already validated.)
+func TestRejectedEnvelopeConfirmAuditCarriesAttribution(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	auditor := audit.New(s.DB())
+	now := mustSituationTime(t, "2026-08-20T10:00:00Z")
+	insertSituationFixture(t, s, "s-env-attr", "host=db-attr2", "", situationmodel.LifecycleActive, now)
+	j, err := s.RecordJudgment(ctx, testJudgmentSnapshot("s-env-attr", 1), testJudgmentRequest("s-env-attr"), "slack:U1", now, auditor, testAuditEvents("judgment.recorded"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	confirmation := situationmodel.EnvelopeConfirmation{
+		SourceJudgmentID: j.ID, ExpectedCurrentVersion: 1, // stale: no version has ever been confirmed yet
+		Scope: situationmodel.EnvelopeScope{GroupKey: "host=db-attr2"}, ReviewDueAt: now.Add(30 * 24 * time.Hour),
+		OperatorConfirmed: true, ConfirmedBy: "janis",
+	}
+	if _, err := s.ConfirmEnvelope(ctx, confirmation, "slack:U-janis", now, auditor, testAuditEvents("envelope.confirmed")); !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("err=%v, want version conflict", err)
+	}
+	payload := lastAuditPayload(t, s)
+	if payload["authenticated_as"] != "slack:U-janis" || payload["asserted_operator"] != "janis" {
+		t.Fatalf("rejected envelope confirm (head resolve) audit payload=%+v, missing attribution", payload)
+	}
+
+	// Now an existing head at a stale expected version.
+	secondJudgmentID, _ := confirmTestEnvelope(t, s, ctx, auditor, "s-env-attr", "host=db-attr2-second", now)
+	secondConfirmation := situationmodel.EnvelopeConfirmation{
+		SourceJudgmentID: secondJudgmentID, ExpectedCurrentVersion: 0, // stale: head is already at version 1
+		Scope: situationmodel.EnvelopeScope{GroupKey: "host=db-attr2-second"}, ReviewDueAt: now.Add(30 * 24 * time.Hour),
+		OperatorConfirmed: true, ConfirmedBy: "janis",
+	}
+	if _, err := s.ConfirmEnvelope(ctx, secondConfirmation, "slack:U-janis", now, auditor, testAuditEvents("envelope.confirmed")); !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("err=%v, want version conflict", err)
+	}
+	payload = lastAuditPayload(t, s)
+	if payload["authenticated_as"] != "slack:U-janis" || payload["asserted_operator"] != "janis" || payload["source_judgment_id"] != secondJudgmentID {
+		t.Fatalf("rejected envelope confirm (existing head, stale version) audit payload=%+v, missing attribution", payload)
+	}
+}
+
+// TestRejectedEnvelopeRevokeAuditCarriesAttribution covers review finding
+// #2 for RevokeEnvelope's rejection branch.
+func TestRejectedEnvelopeRevokeAuditCarriesAttribution(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	auditor := audit.New(s.DB())
+	now := mustSituationTime(t, "2026-08-20T10:00:00Z")
+	insertSituationFixture(t, s, "s-env-attr3", "host=db-attr3", "", situationmodel.LifecycleActive, now)
+	_, envelopeID := confirmTestEnvelope(t, s, ctx, auditor, "s-env-attr3", "host=db-attr3", now)
+
+	revocation := situationmodel.EnvelopeRevocation{EnvelopeID: envelopeID, ExpectedCurrentVersion: 99, Reason: "stale", OperatorConfirmed: true, ConfirmedBy: "janis"}
+	if _, err := s.RevokeEnvelope(ctx, revocation, "slack:U-janis", now, auditor, testAuditEvents("envelope.revoked")); !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("err=%v, want version conflict", err)
+	}
+	payload := lastAuditPayload(t, s)
+	if payload["authenticated_as"] != "slack:U-janis" || payload["asserted_operator"] != "janis" {
+		t.Fatalf("rejected envelope revoke audit payload=%+v, missing attribution", payload)
+	}
+}
+
+// TestAppendEnvelopeVersionWithAuditWritesAtomically covers review finding
+// #3: the invalidation path (a system-driven AppendEnvelopeVersion call,
+// unlike the operator-driven RecordJudgment/ConfirmEnvelope/RevokeEnvelope)
+// must support atomic audit too.
+func TestAppendEnvelopeVersionWithAuditWritesAtomically(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	auditor := audit.New(s.DB())
+	now := mustSituationTime(t, "2026-08-20T10:00:00Z")
+	insertSituationFixture(t, s, "s-env-audit1", "host=db-audit1", "", situationmodel.LifecycleActive, now)
+	_, envelopeID := confirmTestEnvelope(t, s, ctx, auditor, "s-env-audit1", "host=db-audit1", now)
+
+	if err := s.AppendEnvelopeVersionWithAudit(ctx, 1, situationmodel.EnvelopeVersion{}, nil, nil); err == nil {
+		t.Fatal("expected an error when no auditor/events are supplied")
+	}
+
+	invalidated := situationmodel.EnvelopeVersion{
+		EnvelopeID: envelopeID, Status: situationmodel.EnvelopeStatusInvalidated, Scope: situationmodel.EnvelopeScope{GroupKey: "host=db-audit1"},
+		Conditions:  situationmodel.EnvelopeConditions{RequiredCompanionSignals: []string{"database_lock"}},
+		ReviewDueAt: now.Add(30 * 24 * time.Hour), AuthenticatedAs: "system:trigger-watch", AssertedOperator: "system", CreatedAt: now,
+	}
+	if err := s.AppendEnvelopeVersionWithAudit(ctx, 1, invalidated, auditor, []SituationPolicyAuditEvent{{Kind: "envelope.invalidated", Payload: map[string]any{"envelope_id": envelopeID}}}); err != nil {
+		t.Fatal(err)
+	}
+	var kind string
+	if err := s.DB().QueryRowContext(ctx, `SELECT kind FROM audit_log ORDER BY seq DESC LIMIT 1`).Scan(&kind); err != nil {
+		t.Fatal(err)
+	}
+	if kind != "envelope.invalidated" {
+		t.Fatalf("last audit kind=%q, want envelope.invalidated", kind)
+	}
+	report, err := auditor.Verify(ctx)
+	if err != nil || !report.OK {
+		t.Fatalf("audit chain broken: report=%+v err=%v", report, err)
+	}
+}
+
+// TestAppendEnvelopeEvaluationWithAuditWritesAtomically covers review
+// finding #3 for AppendEnvelopeEvaluation.
+func TestAppendEnvelopeEvaluationWithAuditWritesAtomically(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	auditor := audit.New(s.DB())
+	now := mustSituationTime(t, "2026-08-20T10:00:00Z")
+	insertSituationFixture(t, s, "s-env-audit2", "host=db-audit2", "", situationmodel.LifecycleActive, now)
+	_, envelopeID := confirmTestEnvelope(t, s, ctx, auditor, "s-env-audit2", "host=db-audit2", now)
+
+	if err := s.AppendEnvelopeEvaluationWithAudit(ctx, situationmodel.EnvelopeEvaluation{}, nil, nil); err == nil {
+		t.Fatal("expected an error when no auditor/events are supplied")
+	}
+
+	e := situationmodel.EnvelopeEvaluation{
+		ID: "eval-audit", EnvelopeID: envelopeID, EnvelopeVersion: 1, SituationID: "s-env-audit2", InputVersion: 1,
+		Result: situationmodel.EnvelopeEvaluationMatch, MatchedFields: []string{"required_companion_present:database_lock"}, CreatedAt: now,
+	}
+	if err := s.AppendEnvelopeEvaluationWithAudit(ctx, e, auditor, []SituationPolicyAuditEvent{{Kind: "envelope.evaluated", Payload: map[string]any{"envelope_id": envelopeID}}}); err != nil {
+		t.Fatal(err)
+	}
+	var kind string
+	if err := s.DB().QueryRowContext(ctx, `SELECT kind FROM audit_log ORDER BY seq DESC LIMIT 1`).Scan(&kind); err != nil {
+		t.Fatal(err)
+	}
+	if kind != "envelope.evaluated" {
+		t.Fatalf("last audit kind=%q, want envelope.evaluated", kind)
+	}
+}
+
+// TestAppendEnvelopeEvaluationPersistsResolvedScheduleWindow covers review
+// finding #1 at the persistence layer: the resolved UTC schedule interval
+// EvaluateEnvelope computes must round-trip through the store.
+func TestAppendEnvelopeEvaluationPersistsResolvedScheduleWindow(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	auditor := audit.New(s.DB())
+	now := mustSituationTime(t, "2026-08-20T10:00:00Z")
+	insertSituationFixture(t, s, "s-env-window", "host=db-window", "", situationmodel.LifecycleActive, now)
+	_, envelopeID := confirmTestEnvelope(t, s, ctx, auditor, "s-env-window", "host=db-window", now)
+
+	start := mustSituationTime(t, "2026-10-24T22:30:00Z")
+	end := mustSituationTime(t, "2026-10-25T01:30:00Z")
+	e := situationmodel.EnvelopeEvaluation{
+		ID: "eval-window", EnvelopeID: envelopeID, EnvelopeVersion: 1, SituationID: "s-env-window", InputVersion: 1,
+		Result: situationmodel.EnvelopeEvaluationMatch, MatchedFields: []string{"schedule_within_window"},
+		ScheduleWindowStart: &start, ScheduleWindowEnd: &end, CreatedAt: now,
+	}
+	if err := s.AppendEnvelopeEvaluation(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	var startStr, endStr string
+	if err := s.DB().QueryRowContext(ctx, `SELECT schedule_window_start, schedule_window_end FROM envelope_evaluations WHERE id=?`, "eval-window").
+		Scan(&startStr, &endStr); err != nil {
+		t.Fatal(err)
+	}
+	if startStr != canonicalTime(start) || endStr != canonicalTime(end) {
+		t.Fatalf("persisted window=%s..%s want=%s..%s", startStr, endStr, canonicalTime(start), canonicalTime(end))
+	}
+
+	// Exact replay with the same window succeeds; a changed window is a collision.
+	if err := s.AppendEnvelopeEvaluation(ctx, e); err != nil {
+		t.Fatalf("exact replay should succeed: %v", err)
+	}
+	changed := e
+	laterEnd := end.Add(time.Hour)
+	changed.ScheduleWindowEnd = &laterEnd
+	if err := s.AppendEnvelopeEvaluation(ctx, changed); err == nil || !strings.Contains(err.Error(), "collision") {
+		t.Fatalf("changed window replay err=%v, want collision", err)
+	}
+}
+
+func TestAppendEnvelopeEvaluationRejectsMismatchedScheduleWindow(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := mustSituationTime(t, "2026-08-20T10:00:00Z")
+	start := now
+	e := situationmodel.EnvelopeEvaluation{
+		ID: "eval-mismatch", EnvelopeID: "env-x", EnvelopeVersion: 1, SituationID: "sit-x", InputVersion: 1,
+		Result: situationmodel.EnvelopeEvaluationMatch, ScheduleWindowStart: &start, CreatedAt: now,
+	}
+	if err := s.AppendEnvelopeEvaluation(ctx, e); err == nil {
+		t.Fatal("expected an error for a schedule window with only a start")
 	}
 }

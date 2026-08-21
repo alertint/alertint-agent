@@ -149,17 +149,23 @@ const (
 )
 
 type EnvelopeEvaluation struct {
-	ID                string                   `json:"id"`
-	EnvelopeID        string                   `json:"envelope_id"`
-	EnvelopeVersion   int                      `json:"envelope_version"`
-	SituationID       string                   `json:"situation_id"`
-	InputVersion      int                      `json:"input_version"`
-	Result            EnvelopeEvaluationResult `json:"result"`
-	MatchedFields     []string                 `json:"matched_fields"`
-	Violations        []string                 `json:"violations"`
-	Observability     []string                 `json:"observability"`
-	QuietingAuthority bool                     `json:"quieting_authority"`
-	CreatedAt         time.Time                `json:"created_at"`
+	ID              string                   `json:"id"`
+	EnvelopeID      string                   `json:"envelope_id"`
+	EnvelopeVersion int                      `json:"envelope_version"`
+	SituationID     string                   `json:"situation_id"`
+	InputVersion    int                      `json:"input_version"`
+	Result          EnvelopeEvaluationResult `json:"result"`
+	MatchedFields   []string                 `json:"matched_fields"`
+	Violations      []string                 `json:"violations"`
+	Observability   []string                 `json:"observability"`
+	// ScheduleWindowStart/End are the resolved UTC schedule interval a
+	// configured Schedule condition evaluated against, persisted so a
+	// DST-sensitive determination is independently auditable without
+	// re-deriving it. Both are nil when the version carries no Schedule.
+	ScheduleWindowStart *time.Time `json:"schedule_window_start,omitempty"`
+	ScheduleWindowEnd   *time.Time `json:"schedule_window_end,omitempty"`
+	QuietingAuthority   bool       `json:"quieting_authority"`
+	CreatedAt           time.Time  `json:"created_at"`
 }
 
 // InterruptionPriority is derived deterministically and never model-authored.

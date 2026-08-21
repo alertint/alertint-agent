@@ -143,15 +143,20 @@ type JudgmentFact struct {
 
 // EnvelopeResult is the material deterministic policy evaluation retained by
 // Snapshot. Evaluation attempt identity and presentation time are discarded.
+// ScheduleWindowStart/End are the resolved UTC schedule interval a
+// configured Schedule condition evaluated against — persisted rather than
+// re-derived so a DST-sensitive determination stays independently auditable.
 type EnvelopeResult struct {
-	EnvelopeID        string                         `json:"envelope_id"`
-	EnvelopeVersion   int                            `json:"envelope_version"`
-	Result            model.EnvelopeEvaluationResult `json:"result"`
-	MatchedFields     []string                       `json:"matched_fields"`
-	Violations        []string                       `json:"violations"`
-	Observability     []string                       `json:"observability"`
-	EvidenceRefs      []string                       `json:"evidence_refs"`
-	QuietingAuthority bool                           `json:"quieting_authority"`
+	EnvelopeID          string                         `json:"envelope_id"`
+	EnvelopeVersion     int                            `json:"envelope_version"`
+	Result              model.EnvelopeEvaluationResult `json:"result"`
+	MatchedFields       []string                       `json:"matched_fields"`
+	Violations          []string                       `json:"violations"`
+	Observability       []string                       `json:"observability"`
+	EvidenceRefs        []string                       `json:"evidence_refs"`
+	ScheduleWindowStart *time.Time                     `json:"schedule_window_start,omitempty"`
+	ScheduleWindowEnd   *time.Time                     `json:"schedule_window_end,omitempty"`
+	QuietingAuthority   bool                           `json:"quieting_authority"`
 }
 
 // SnapshotInput is an immutable read model. Callers remain responsible for
@@ -469,6 +474,7 @@ func canonicalEnvelope(in *model.EnvelopeEvaluation, evidenceRefs []string) *Env
 		EnvelopeID: in.EnvelopeID, EnvelopeVersion: in.EnvelopeVersion, Result: in.Result,
 		MatchedFields: canonicalStrings(in.MatchedFields), Violations: canonicalStrings(in.Violations),
 		Observability: canonicalStrings(in.Observability), EvidenceRefs: canonicalStrings(evidenceRefs),
+		ScheduleWindowStart: canonicalTimePtr(in.ScheduleWindowStart), ScheduleWindowEnd: canonicalTimePtr(in.ScheduleWindowEnd),
 		QuietingAuthority: in.QuietingAuthority,
 	}
 }
@@ -482,7 +488,17 @@ func canonicalEnvelopeResult(in *EnvelopeResult) *EnvelopeResult {
 	out.Violations = canonicalStrings(in.Violations)
 	out.Observability = canonicalStrings(in.Observability)
 	out.EvidenceRefs = canonicalStrings(in.EvidenceRefs)
+	out.ScheduleWindowStart = canonicalTimePtr(in.ScheduleWindowStart)
+	out.ScheduleWindowEnd = canonicalTimePtr(in.ScheduleWindowEnd)
 	return &out
+}
+
+func canonicalTimePtr(in *time.Time) *time.Time {
+	if in == nil {
+		return nil
+	}
+	value := in.UTC()
+	return &value
 }
 
 func canonicalL1(in *L1Output) *L1Finding {
