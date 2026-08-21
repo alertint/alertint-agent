@@ -722,3 +722,154 @@ func TestReconcileNoFinalizePassWhenFirstProposalUncontradicted(t *testing.T) {
 		t.Fatalf("committed transitions = %d, want 1", h.store.committedCount())
 	}
 }
+
+// --------------------------------------------------------------------------
+// Recovery/deadline lifecycle wiring (Task 11)
+// --------------------------------------------------------------------------
+
+// seedLifecycleSituation seeds a bare claimed Situation for the lifecycle
+// short-circuit tests below: no reason-catalog evidence, just enough for
+// BuildSnapshot to succeed (id, positive input version, canonical
+// effective-start provenance, current time).
+func (h *controllerHarness) seedLifecycleSituation(mutate func(*model.Situation), symptoms []Symptom, uncertainty *TerminalUncertainty) {
+	h.t.Helper()
+	situation := model.Situation{
+		ID: harnessSituationID, GroupKey: "group-1", Lifecycle: model.LifecycleActive, Attention: model.AttentionObserve,
+		InputVersion: 1, EffectiveStartedAt: h.now.Add(-time.Hour), EffectiveStartedAtBasis: model.SourceTimeBasisSourcePayload,
+		FirstReceivedAt: h.now.Add(-time.Hour), LastLifecycleObservedAt: h.now,
+		NextAssessmentAt: h.now, CreatedAt: h.now.Add(-time.Hour), UpdatedAt: h.now,
+	}
+	if mutate != nil {
+		mutate(&situation)
+	}
+	claim := Claim{Situation: situation, ClaimOwner: "worker-1", ClaimToken: 1}
+	h.store.claims[harnessSituationID] = claim
+	h.store.inputs[harnessSituationID] = SnapshotInput{
+		Situation: situation, Now: h.now, Symptoms: symptoms, TerminalUncertainty: uncertainty,
+	}
+	h.store.incidentIDs[harnessSituationID] = harnessIncidentID
+}
+
+// TestReconcileEntersRecoveryPendingAndSkipsL1 verifies a fully resolved
+// active Situation enters recovery_pending deterministically, with the
+// grace deadline stamped on the ActionContract's next_update_at, and never
+// dispatches L1 (D4/degraded operation: a controller-owned lifecycle
+// transition is model-free).
+func TestReconcileEntersRecoveryPendingAndSkipsL1(t *testing.T) {
+	h := newControllerHarness(t, noopInvestigator{})
+	h.seedLifecycleSituation(nil, []Symptom{{ID: "sym-1", Lifecycle: model.DeliveryStatusResolved}}, nil)
+
+	if err := h.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if h.store.committedCount() != 1 {
+		t.Fatalf("committed transitions = %d, want 1", h.store.committedCount())
+	}
+	tr := h.store.lastCommitted()
+	if tr.Lifecycle != model.LifecycleRecoveryPending {
+		t.Fatalf("lifecycle = %q, want recovery_pending", tr.Lifecycle)
+	}
+	if tr.Attention != model.AttentionObserve {
+		t.Fatalf("attention = %q, want observe", tr.Attention)
+	}
+	if tr.ActionContract.NextUpdateAt == nil || !tr.ActionContract.NextUpdateAt.After(h.now) {
+		t.Fatalf("next_update_at = %+v, want a future grace deadline", tr.ActionContract.NextUpdateAt)
+	}
+	if got := h.store.analysisStatus(harnessIncidentID); got != "" {
+		t.Fatalf("l1 state = %q, want untouched (L1 never dispatched)", got)
+	}
+}
+
+// TestReconcileExpiresGraceToRecoveredAndSkipsL1 verifies a recovery_pending
+// Situation whose grace deadline has passed commits terminal `recovered`
+// with Attention observe, without dispatching L1.
+func TestReconcileExpiresGraceToRecoveredAndSkipsL1(t *testing.T) {
+	h := newControllerHarness(t, noopInvestigator{})
+	graceUntil := h.now.Add(-time.Minute) // already expired
+	recoveryObservedAt := h.now.Add(-3 * time.Minute)
+	h.seedLifecycleSituation(func(s *model.Situation) {
+		s.Lifecycle = model.LifecycleRecoveryPending
+		s.GraceUntil = &graceUntil
+		s.RecoveryObservedAt = &recoveryObservedAt
+	}, nil, nil)
+
+	if err := h.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if h.store.committedCount() != 1 {
+		t.Fatalf("committed transitions = %d, want 1", h.store.committedCount())
+	}
+	tr := h.store.lastCommitted()
+	if tr.Lifecycle != model.LifecycleRecovered {
+		t.Fatalf("lifecycle = %q, want recovered", tr.Lifecycle)
+	}
+	if tr.Attention != model.AttentionObserve {
+		t.Fatalf("attention = %q, want observe", tr.Attention)
+	}
+	if tr.ActionContract.NextUpdateAt != nil {
+		t.Fatalf("next_update_at = %+v, want none (terminal)", tr.ActionContract.NextUpdateAt)
+	}
+	if got := h.store.analysisStatus(harnessIncidentID); got != "" {
+		t.Fatalf("l1 state = %q, want untouched (L1 never dispatched)", got)
+	}
+}
+
+// TestReconcileClosesUnknownAndSkipsL1 verifies an externally resolved
+// TerminalUncertainty (deadline crossed, actionable, a structured reason)
+// commits terminal closed_unknown with that exact reason, without
+// dispatching L1.
+func TestReconcileClosesUnknownAndSkipsL1(t *testing.T) {
+	h := newControllerHarness(t, noopInvestigator{})
+	uncertainty := &TerminalUncertainty{DeadlineCrossed: true, Actionable: true, Reason: model.TerminalReasonSourceUnavailable}
+	h.seedLifecycleSituation(func(s *model.Situation) {
+		s.LastLifecycleObservedAt = h.now.Add(-8 * 24 * time.Hour)
+	}, nil, uncertainty)
+
+	if err := h.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if h.store.committedCount() != 1 {
+		t.Fatalf("committed transitions = %d, want 1", h.store.committedCount())
+	}
+	tr := h.store.lastCommitted()
+	if tr.Lifecycle != model.LifecycleClosedUnknown {
+		t.Fatalf("lifecycle = %q, want closed_unknown", tr.Lifecycle)
+	}
+	if tr.Reason != string(model.TerminalReasonSourceUnavailable) {
+		t.Fatalf("reason = %q, want %q", tr.Reason, model.TerminalReasonSourceUnavailable)
+	}
+	if got := h.store.analysisStatus(harnessIncidentID); got != "" {
+		t.Fatalf("l1 state = %q, want untouched (L1 never dispatched)", got)
+	}
+}
+
+// TestReconcileRefireFallsThroughToNormalFlow verifies a recovery_pending
+// Situation observing a firing symptom again refires back to active and
+// continues into the ordinary L1/L2 flow (D4: "reassesses current facts")
+// rather than short-circuiting.
+func TestReconcileRefireFallsThroughToNormalFlow(t *testing.T) {
+	h := newControllerHarness(t, noopInvestigator{})
+	graceUntil := h.now.Add(time.Minute) // not yet expired
+	recoveryObservedAt := h.now.Add(-time.Minute)
+	h.seedLifecycleSituation(func(s *model.Situation) {
+		s.Lifecycle = model.LifecycleRecoveryPending
+		s.GraceUntil = &graceUntil
+		s.RecoveryObservedAt = &recoveryObservedAt
+	}, []Symptom{{ID: "sym-1", Lifecycle: model.DeliveryStatusFiring}}, nil)
+
+	if err := h.reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if h.store.committedCount() != 1 {
+		t.Fatalf("committed transitions = %d, want 1", h.store.committedCount())
+	}
+	tr := h.store.lastCommitted()
+	if tr.Lifecycle != model.LifecycleActive {
+		t.Fatalf("lifecycle = %q, want active", tr.Lifecycle)
+	}
+	// The ordinary flow was NOT short-circuited: the B+ gate ran and left a
+	// durable analysis-state decision (empty means it was never touched).
+	if got := h.store.analysisStatus(harnessIncidentID); got == "" {
+		t.Fatalf("l1 state = %q, want the ordinary B+ gate to have run", got)
+	}
+}

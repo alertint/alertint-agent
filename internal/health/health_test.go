@@ -144,3 +144,81 @@ func TestRegistry_WatchLogsConnectionLossAndRecovery(t *testing.T) {
 		}
 	}
 }
+
+// fakeSink records every Status it is called with, safe for concurrent use.
+type fakeSink struct {
+	mu       sync.Mutex
+	statuses []Status
+	err      error
+}
+
+func (f *fakeSink) RecordDependencyStatus(_ context.Context, status Status) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.statuses = append(f.statuses, status)
+	return f.err
+}
+
+func (f *fakeSink) calls() []Status {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]Status(nil), f.statuses...)
+}
+
+func TestRegistry_SinkCalledOnFirstObservationAndTransitionsOnly(t *testing.T) {
+	r := NewRegistry(time.Hour, Check{Name: "prometheus", Detail: "http://prom:9090"})
+	sink := &fakeSink{}
+	r.SetSink(sink)
+	// Scripted sequence: fails 3 times steadily (only the first is a
+	// reportable event — first observation, itself already failing), then
+	// recovers once (a real transition), then stays healthy (no further
+	// calls).
+	watchHarness(t, r, []error{
+		errors.New("connection refused"),
+		errors.New("connection refused"),
+		errors.New("connection refused"),
+		nil,
+		nil,
+	})
+	calls := sink.calls()
+	if len(calls) != 2 {
+		t.Fatalf("sink calls = %d, want 2 (first observation + one recovery transition): %+v", len(calls), calls)
+	}
+	if calls[0].OK {
+		t.Errorf("first call OK = true, want the initial failing observation")
+	}
+	if !calls[1].OK {
+		t.Errorf("second call OK = false, want the recovery transition")
+	}
+}
+
+func TestRegistry_SinkNilSafe(t *testing.T) {
+	r := NewRegistry(time.Minute, Check{Name: "good", Probe: func(context.Context) error { return nil }})
+	// No sink attached: Run must not panic and must behave exactly as
+	// before.
+	statuses := r.Run(context.Background())
+	if len(statuses) != 1 || !statuses[0].OK {
+		t.Fatalf("statuses = %+v", statuses)
+	}
+}
+
+func TestRegistry_RunCallsSinkOnFirstObservation(t *testing.T) {
+	r := NewRegistry(time.Hour, Check{Name: "good", Probe: func(context.Context) error { return nil }})
+	sink := &fakeSink{}
+	r.SetSink(sink)
+	r.Run(context.Background())
+	r.Run(context.Background()) // within TTL: cached, no re-probe, no second sink call
+	calls := sink.calls()
+	if len(calls) != 1 {
+		t.Fatalf("sink calls = %d, want 1 (first observation only): %+v", len(calls), calls)
+	}
+}
+
+func TestRegistry_SinkErrorDoesNotFailProbe(t *testing.T) {
+	r := NewRegistry(time.Minute, Check{Name: "good", Probe: func(context.Context) error { return nil }})
+	r.SetSink(&fakeSink{err: errors.New("durable write failed")})
+	statuses := r.Run(context.Background())
+	if len(statuses) != 1 || !statuses[0].OK {
+		t.Fatalf("a sink failure must never affect the probe result: %+v", statuses)
+	}
+}

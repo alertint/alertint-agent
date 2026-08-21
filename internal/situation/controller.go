@@ -141,6 +141,12 @@ type Config struct {
 	SlowCadence         time.Duration
 	ParkRetryAfter      time.Duration
 	AllowedCapabilities []string
+	// RecoveryGrace is the source-aware recovery confirmation window applied
+	// when a Situation enters recovery_pending (D4). The caller resolves the
+	// exact per-source value (RecoveryGraceConfig.RecoveryGrace, given the
+	// real connector delivery methods this package cannot see) before
+	// constructing Controller; zero uses the webhook default (120s).
+	RecoveryGrace time.Duration
 }
 
 func (c Config) normalized() Config {
@@ -161,6 +167,9 @@ func (c Config) normalized() Config {
 	}
 	if c.ParkRetryAfter <= 0 {
 		c.ParkRetryAfter = 24 * time.Hour
+	}
+	if c.RecoveryGrace <= 0 {
+		c.RecoveryGrace = (RecoveryGraceConfig{}).RecoveryGrace()
 	}
 	return c
 }
@@ -212,6 +221,18 @@ func (c *Controller) Reconcile(ctx context.Context, situationID string) error {
 	c.attachProfiles(ctx, &in)
 	now := c.clock().UTC()
 	in.Now = now
+
+	// Deterministic D4 lifecycle transitions (grace expiry, refire, entering
+	// recovery_pending, and terminal closed_unknown once lifecycle truth is
+	// unobservable past deadline) apply ahead of any L1/L2 work — they are
+	// purely time/fact-driven and must fire even when nothing else about the
+	// input changed. lifecycleOutcome mutates in.Situation so the snapshot
+	// this reconciliation builds already reflects the new lifecycle.
+	lifecycleOutcome := ReconcileLifecycle(in.Situation, in.Symptoms, in.TerminalUncertainty, now, c.cfg.RecoveryGrace)
+	if lifecycleOutcome.Changed {
+		in.Situation = lifecycleOutcome.Situation
+	}
+
 	snap, err := BuildSnapshot(in)
 	if err != nil {
 		return fmt.Errorf("situation: reconcile: build snapshot: %w", err)
@@ -220,6 +241,14 @@ func (c *Controller) Reconcile(ctx context.Context, situationID string) error {
 	trusted, prior, err := c.store.LastTrustedAssessment(ctx, claim)
 	if err != nil {
 		return fmt.Errorf("situation: reconcile: trusted assessment: %w", err)
+	}
+
+	if lifecycleOutcome.Changed && lifecycleOutcome.Terminal {
+		// Grace expiry, entering recovery_pending, and closed_unknown are
+		// all controller-owned, model-free commits (D4/degraded operation:
+		// "stops automatic live probes/LLM work") — L1 is never dispatched
+		// and L2 never runs for these.
+		return c.commitLifecycleTransition(ctx, claim, snap, lifecycleOutcome, trusted.Sequence, now)
 	}
 
 	decision := c.decideL1(claim, snap, trusted)
@@ -391,6 +420,60 @@ func (c *Controller) commitDeterministicFloor(ctx context.Context, claim Claim, 
 	return c.commitAssessment(ctx, claim, snap, validated, adjustments, AssessmentActorDeterministic, priorSequence, now, nil)
 }
 
+// commitLifecycleTransition commits a deterministic, controller-owned D4
+// lifecycle transition (grace expiry to terminal recovered, entering
+// recovery_pending, or terminal closed_unknown) that ReconcileLifecycle
+// already decided ahead of any L1/L2 work. None of these ever involve a
+// model call. Attention is Observe throughout: grace expiry and
+// closed_unknown both stop automatic live probes/LLM work by spec, and
+// entering recovery_pending has no fresh urgent/investigate evidence to
+// cite once every member Alert has resolved (the deterministic floor
+// recomputation inside ValidateAssessment still protects against a stale
+// snapshot proving otherwise).
+func (c *Controller) commitLifecycleTransition(ctx context.Context, claim Claim, snap Snapshot, outcome LifecycleOutcome, priorSequence int, now time.Time) error {
+	s := outcome.Situation
+	var (
+		ac              model.ActionContract
+		reason          string
+		evidenceQuality model.EvidenceQuality
+	)
+	switch s.Lifecycle {
+	case model.LifecycleRecovered:
+		ac = model.ActionContract{NextActor: model.NextActorNone, ActionStatus: model.ActionStatusComplete}
+		reason, evidenceQuality = "recovery_grace_expired", model.EvidenceQualityDegraded
+	case model.LifecycleClosedUnknown:
+		ac = model.ActionContract{NextActor: model.NextActorNone, ActionStatus: model.ActionStatusComplete}
+		evidenceQuality = model.EvidenceQualityInsufficient
+		if s.TerminalReason != nil {
+			reason = string(*s.TerminalReason)
+		}
+	case model.LifecycleRecoveryPending:
+		if s.GraceUntil == nil {
+			return errors.New("situation: entering recovery_pending requires a grace deadline")
+		}
+		nextUpdate := *s.GraceUntil
+		ac = model.ActionContract{
+			NextActor: model.NextActorNone, ActionStatus: model.ActionStatusWaiting,
+			NextUpdateAt: &nextUpdate, NextUpdateOn: []string{"recovery_grace_expired", "alert_refired"},
+		}
+		reason, evidenceQuality = "recovery_observed", model.EvidenceQualityDegraded
+	default:
+		return fmt.Errorf("situation: lifecycle transition commits an unexpected lifecycle %q", s.Lifecycle)
+	}
+	proposal := model.Assessment{
+		SchemaVersion: AssessmentSchemaVersion, Persistence: model.PersistenceUnknown, Impact: model.ImpactUnknown,
+		Novelty: model.NoveltyInsufficientHistory, Causality: model.CausalityUnknown, Attention: model.AttentionObserve,
+		Lifecycle: s.Lifecycle, EvidenceQuality: evidenceQuality, ActionContract: ac,
+		Limitations:     []model.Limitation{{Code: "controller_lifecycle_transition", Detail: "deterministic lifecycle transition; no model interpretation requested"}},
+		ProposedCadence: model.CadenceNormal,
+	}
+	validated, adjustments, err := ValidateAssessment(snap, proposal, now)
+	if err != nil {
+		return fmt.Errorf("situation: reconcile: lifecycle transition validation: %w", err)
+	}
+	return c.commitAssessmentWithReason(ctx, claim, snap, validated, adjustments, AssessmentActorDeterministic, priorSequence, now, nil, reason)
+}
+
 // commitDeterministicDegraded is the safe default when L2 cannot produce a
 // validated proposal this attempt (no assessor wired, the call failed, or
 // the budget was exhausted) and no deterministic urgent floor applies
@@ -513,6 +596,18 @@ func (c *Controller) recordDiscardedAttempt(ctx context.Context, claim Claim, sn
 // state) is stored as `stale`, produces no outward effect, and reschedules
 // the current input rather than failing the reconciliation.
 func (c *Controller) commitAssessment(ctx context.Context, claim Claim, snap Snapshot, validated model.Assessment, adjustments []model.ValidationAdjustment, actor AssessmentActor, priorSequence int, now time.Time, usage json.RawMessage) error {
+	reason := strings.Join(dueReasonStrings(claim.Situation.DueReasons), ",")
+	return c.commitAssessmentWithReason(ctx, claim, snap, validated, adjustments, actor, priorSequence, now, usage, reason)
+}
+
+// commitAssessmentWithReason is commitAssessment's shared implementation,
+// parameterized on the committed model.Transition's Reason: ordinary
+// Assessment commits join the triggering due reasons (commitAssessment's own
+// default), while a deterministic lifecycle transition
+// (commitLifecycleTransition) instead needs an exact fixed reason —
+// closed_unknown's structured terminal reason, in particular, must equal
+// one of the store's four accepted values exactly, not a due-reason join.
+func (c *Controller) commitAssessmentWithReason(ctx context.Context, claim Claim, snap Snapshot, validated model.Assessment, adjustments []model.ValidationAdjustment, actor AssessmentActor, priorSequence int, now time.Time, usage json.RawMessage, reason string) error {
 	validatedJSON, err := json.Marshal(validated)
 	if err != nil {
 		return fmt.Errorf("situation: reconcile: marshal validated assessment: %w", err)
@@ -526,7 +621,7 @@ func (c *Controller) commitAssessment(ctx context.Context, claim Claim, snap Sna
 	tr := model.Transition{
 		ID: uuid.NewString(), SituationID: claim.Situation.ID, InputVersion: snap.InputVersion,
 		Lifecycle: validated.Lifecycle, Attention: validated.Attention, Assessment: &validated,
-		ActionContract: validated.ActionContract, Reason: strings.Join(attempt.TriggerReasons, ","), CreatedAt: now,
+		ActionContract: validated.ActionContract, Reason: reason, CreatedAt: now,
 	}
 	err = c.store.CommitAuthoritative(ctx, claim, attempt, tr)
 	if errors.Is(err, ErrStaleInput) {
