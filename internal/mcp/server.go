@@ -75,6 +75,13 @@ type Config struct {
 	// Capture handles the two write-back tools (ADR-0027); nil only in tests —
 	// serve always wires it.
 	Capture *acutetriage.CaptureEngine
+	// SituationCommands gates the whole Situation-mode tool group (all
+	// eleven alertint_situation_*/alertint_semantic_profile_*/
+	// alertint_expected_behavior_*/alertint_poke_funnel_get tools) — nil
+	// registers none of them, so serve never wires a partial Situation
+	// stream ahead of Task 13's cutover. cmd/alertint wiring supplies the
+	// concrete implementation once the Situation controller is live.
+	SituationCommands SituationCommands
 }
 
 // Server is the AlertINT MCP HTTP server. Construct with NewServer; start
@@ -84,6 +91,10 @@ type Server struct {
 	st      *store.Store
 	auditor *audit.Auditor
 	handler http.Handler
+	// ms is the underlying mcp-go server, kept for test introspection of
+	// registration (registeredToolNames); production code only ever needs
+	// Handler().
+	ms *mcpserver.MCPServer
 }
 
 // NewServer builds the MCP server with the always-on incident/alert/audit tools
@@ -132,11 +143,39 @@ func NewServer(cfg Config, st *store.Store, auditor *audit.Auditor) *Server {
 		ms.AddTool(s.toolZabbixHostProblems())
 	}
 
+	// The whole Situation-mode tool group registers together, gated on one
+	// presence check — never partially, and never ahead of Task 13's cutover
+	// wiring a concrete SituationCommands implementation into serve.
+	if s.cfg.SituationCommands != nil {
+		ms.AddTool(s.toolSituationList())
+		ms.AddTool(s.toolSituationGet())
+		ms.AddTool(s.toolSituationEvidenceGet())
+		ms.AddTool(s.toolSituationReassess())
+		ms.AddTool(s.toolSituationJudgmentRecord())
+		ms.AddTool(s.toolSemanticProfileGet())
+		ms.AddTool(s.toolSemanticProfileCorrect())
+		ms.AddTool(s.toolExpectedBehaviorList())
+		ms.AddTool(s.toolExpectedBehaviorConfirm())
+		ms.AddTool(s.toolExpectedBehaviorRevoke())
+		ms.AddTool(s.toolPokeFunnelGet())
+	}
+
 	// StreamableHTTPServer mounts internally at /mcp. Final client URL:
 	// http://host:<mcp_addr>/mcp
 	httpSrv := mcpserver.NewStreamableHTTPServer(ms)
 	s.handler = s.withBearerAuth(httpSrv)
+	s.ms = ms
 	return s
+}
+
+// registeredToolNames returns the set of tool names actually AddTool'd onto
+// this server — test-only introspection for registration-gate coverage.
+func (s *Server) registeredToolNames() map[string]bool {
+	out := make(map[string]bool)
+	for name := range s.ms.ListTools() {
+		out[name] = true
+	}
+	return out
 }
 
 // Handler returns the http.Handler to mount on an http.Server.
@@ -300,6 +339,12 @@ func (s *Server) handleListIncidents(ctx context.Context, req mcplib.CallToolReq
 		// VerdictKind is the derived latest-verdict marker (ADR-0027/0028) —
 		// omitted when the incident carries no captured verdict.
 		VerdictKind string `json:"verdict_kind,omitempty"`
+		// AcuteFindingStatus is the explicit B+ acute-analysis gate
+		// (incident_analysis_state.status). It no longer implies a Slack
+		// card; a gated-off incident reads not_requested with a reason,
+		// never an ambiguous absence.
+		AcuteFindingStatus string `json:"acute_finding_status"`
+		AcuteFindingReason string `json:"acute_finding_reason,omitempty"`
 	}
 
 	ids := make([]string, len(incidents))
@@ -322,25 +367,32 @@ func (s *Server) handleListIncidents(ctx context.Context, req mcplib.CallToolReq
 	if err != nil {
 		return errResult("failed to load verdict kinds: " + err.Error()), nil
 	}
+	analysis, err := s.st.AnalysisStates(ctx, ids)
+	if err != nil {
+		return errResult("failed to load acute-analysis gate state: " + err.Error()), nil
+	}
 
 	rows := make([]row, 0, len(incidents))
 	for _, inc := range incidents {
 		c := counts[inc.ID]
+		state := analysis[inc.ID]
 		rows = append(rows, row{
-			ID:           inc.ID,
-			GroupKey:     inc.GroupKey,
-			Status:       inc.Status,
-			AlertCount:   inc.AlertCount,
-			Summary:      inc.Summary,
-			RootCause:    inc.RootCause,
-			Confidence:   inc.Confidence,
-			FirstAlertAt: inc.FirstAlertAt,
-			LastAlertAt:  inc.LastAlertAt,
-			CreatedAt:    inc.CreatedAt,
-			Recovery:     buildRecovery(c.Firing, c.Resolved, c.Total, inc.Status, inc.UpdatedAt),
-			Drill:        drills[inc.ID],
-			Occurrences:  occ[inc.ID].Count,
-			VerdictKind:  verdictKinds[inc.ID],
+			ID:                 inc.ID,
+			GroupKey:           inc.GroupKey,
+			Status:             inc.Status,
+			AlertCount:         inc.AlertCount,
+			Summary:            inc.Summary,
+			RootCause:          inc.RootCause,
+			Confidence:         inc.Confidence,
+			FirstAlertAt:       inc.FirstAlertAt,
+			LastAlertAt:        inc.LastAlertAt,
+			CreatedAt:          inc.CreatedAt,
+			Recovery:           buildRecovery(c.Firing, c.Resolved, c.Total, inc.Status, inc.UpdatedAt),
+			Drill:              drills[inc.ID],
+			Occurrences:        occ[inc.ID].Count,
+			VerdictKind:        verdictKinds[inc.ID],
+			AcuteFindingStatus: string(state.Status),
+			AcuteFindingReason: state.DecisionReason,
 		})
 	}
 
@@ -441,23 +493,33 @@ func (s *Server) handleGetIncident(ctx context.Context, req mcplib.CallToolReque
 		view = nil // omit the memory block; the core incident detail still renders
 	}
 
+	// Explicit B+ acute-analysis gate (incident_analysis_state): a gated-off
+	// incident reads not_requested with a reason, never an ambiguous absence.
+	analysis, err := s.st.AnalysisStates(ctx, []string{inc.ID})
+	if err != nil {
+		return errResult("failed to load acute-analysis gate state: " + err.Error()), nil
+	}
+	state := analysis[inc.ID]
+
 	payload := map[string]any{
-		"id":             inc.ID,
-		"group_key":      inc.GroupKey,
-		"status":         inc.Status,
-		"alert_count":    inc.AlertCount,
-		"first_alert_at": inc.FirstAlertAt,
-		"last_alert_at":  inc.LastAlertAt,
-		"created_at":     inc.CreatedAt,
-		"updated_at":     inc.UpdatedAt,
-		"summary":        inc.Summary,
-		"root_cause":     inc.RootCause,
-		"confidence":     inc.Confidence,
-		"recovery":       buildRecovery(firing, resolved, len(alerts), inc.Status, inc.UpdatedAt),
-		"drill":          drill,
-		"occurrences":    stats.Count,
-		"finding":        finding,
-		"alerts":         alertRows,
+		"id":                   inc.ID,
+		"group_key":            inc.GroupKey,
+		"status":               inc.Status,
+		"alert_count":          inc.AlertCount,
+		"first_alert_at":       inc.FirstAlertAt,
+		"last_alert_at":        inc.LastAlertAt,
+		"created_at":           inc.CreatedAt,
+		"updated_at":           inc.UpdatedAt,
+		"summary":              inc.Summary,
+		"root_cause":           inc.RootCause,
+		"confidence":           inc.Confidence,
+		"recovery":             buildRecovery(firing, resolved, len(alerts), inc.Status, inc.UpdatedAt),
+		"drill":                drill,
+		"occurrences":          stats.Count,
+		"finding":              finding,
+		"alerts":               alertRows,
+		"acute_finding_status": string(state.Status),
+		"acute_finding_reason": state.DecisionReason,
 	}
 	if stats.Count > 0 {
 		payload["last_occurrence_at"] = stats.LastSeen

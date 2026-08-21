@@ -86,6 +86,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 			return runHealth(args[1:], stdout, stderr)
 		case "verify-audit":
 			return runVerifyAudit(args[1:], stdout, stderr)
+		case "funnel":
+			return runFunnel(args[1:], stdout, stderr)
 		case "validate":
 			return runValidate(args[1:], stdout, stderr)
 		case "drill":

@@ -1015,3 +1015,147 @@ func (s *Store) auditSituationPolicyRejection(ctx context.Context, auditor Situa
 	}
 	_ = tx.Commit()
 }
+
+// ---------------------------------------------------------------------
+// Read views (MCP alertint_expected_behavior_list/alertint_situation_get)
+// ---------------------------------------------------------------------
+
+// ListEnvelopes returns every Expected-behaviour envelope's current head,
+// including revoked/invalidated ones — envelopes never expire automatically
+// and their history stays visible.
+func (s *Store) ListEnvelopes(ctx context.Context) ([]situationmodel.Envelope, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM expected_behavior_envelopes ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list envelopes: %w", err)
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("store: scan envelope id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("store: iterate envelope ids: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("store: close envelope id list: %w", err)
+	}
+	out := make([]situationmodel.Envelope, 0, len(ids))
+	for _, id := range ids {
+		head, err := s.Envelope(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *head)
+	}
+	return out, nil
+}
+
+// SituationJudgments returns the Situation's append-only operator judgments,
+// oldest first.
+func (s *Store) SituationJudgments(ctx context.Context, situationID string) ([]situationmodel.Judgment, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, situation_id, judged_input_version, covered_fact_hash, covered_symptoms_json,
+		covered_impact_json, judgment, basis, workload, valid_until, evidence_refs_json, authenticated_as, asserted_operator, created_at
+		FROM situation_judgments WHERE situation_id = ? ORDER BY created_at ASC, id ASC`, situationID)
+	if err != nil {
+		return nil, fmt.Errorf("store: query situation judgments: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []situationmodel.Judgment
+	for rows.Next() {
+		var j situationmodel.Judgment
+		var symptomsJSON, impactJSON, evidenceRefsJSON, createdAt string
+		var workload, validUntil sql.NullString
+		if err := rows.Scan(&j.ID, &j.SituationID, &j.JudgedInputVersion, &j.CoveredFactHash, &symptomsJSON,
+			&impactJSON, &j.Judgment, &j.Basis, &workload, &validUntil, &evidenceRefsJSON, &j.AuthenticatedAs, &j.AssertedOperator, &createdAt); err != nil {
+			return nil, fmt.Errorf("store: scan situation judgment: %w", err)
+		}
+		if err := json.Unmarshal([]byte(symptomsJSON), &j.CoveredSymptoms); err != nil {
+			return nil, fmt.Errorf("store: decode judgment covered symptoms: %w", err)
+		}
+		if err := json.Unmarshal([]byte(impactJSON), &j.CoveredImpact); err != nil {
+			return nil, fmt.Errorf("store: decode judgment covered impact: %w", err)
+		}
+		if err := json.Unmarshal([]byte(evidenceRefsJSON), &j.EvidenceRefs); err != nil {
+			return nil, fmt.Errorf("store: decode judgment evidence refs: %w", err)
+		}
+		if workload.Valid {
+			w := workload.String
+			j.Workload = &w
+		}
+		if validUntil.Valid {
+			at, err := parseSituationTime("judgment valid_until", validUntil.String)
+			if err != nil {
+				return nil, err
+			}
+			j.ValidUntil = &at
+		}
+		if j.CreatedAt, err = parseSituationTime("judgment created_at", createdAt); err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate situation judgments: %w", err)
+	}
+	return out, nil
+}
+
+// SituationEnvelopeEvaluations returns the Situation's deterministic
+// envelope-evaluation audit trail, oldest first.
+func (s *Store) SituationEnvelopeEvaluations(ctx context.Context, situationID string) ([]situationmodel.EnvelopeEvaluation, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, envelope_id, envelope_version, situation_id, input_version, result,
+		matched_fields_json, violations_json, observability_json, schedule_window_start, schedule_window_end, quieting_authority, created_at
+		FROM envelope_evaluations WHERE situation_id = ? ORDER BY created_at ASC, id ASC`, situationID)
+	if err != nil {
+		return nil, fmt.Errorf("store: query situation envelope evaluations: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []situationmodel.EnvelopeEvaluation
+	for rows.Next() {
+		var e situationmodel.EnvelopeEvaluation
+		var matchedJSON, violationsJSON, observabilityJSON, createdAt string
+		var scheduleStart, scheduleEnd sql.NullString
+		var quietingAuthority int
+		if err := rows.Scan(&e.ID, &e.EnvelopeID, &e.EnvelopeVersion, &e.SituationID, &e.InputVersion, &e.Result,
+			&matchedJSON, &violationsJSON, &observabilityJSON, &scheduleStart, &scheduleEnd, &quietingAuthority, &createdAt); err != nil {
+			return nil, fmt.Errorf("store: scan situation envelope evaluation: %w", err)
+		}
+		if err := json.Unmarshal([]byte(matchedJSON), &e.MatchedFields); err != nil {
+			return nil, fmt.Errorf("store: decode envelope evaluation matched fields: %w", err)
+		}
+		if err := json.Unmarshal([]byte(violationsJSON), &e.Violations); err != nil {
+			return nil, fmt.Errorf("store: decode envelope evaluation violations: %w", err)
+		}
+		if err := json.Unmarshal([]byte(observabilityJSON), &e.Observability); err != nil {
+			return nil, fmt.Errorf("store: decode envelope evaluation observability: %w", err)
+		}
+		e.QuietingAuthority = quietingAuthority != 0
+		if scheduleStart.Valid {
+			at, err := parseSituationTime("envelope evaluation schedule_window_start", scheduleStart.String)
+			if err != nil {
+				return nil, err
+			}
+			e.ScheduleWindowStart = &at
+		}
+		if scheduleEnd.Valid {
+			at, err := parseSituationTime("envelope evaluation schedule_window_end", scheduleEnd.String)
+			if err != nil {
+				return nil, err
+			}
+			e.ScheduleWindowEnd = &at
+		}
+		if e.CreatedAt, err = parseSituationTime("envelope evaluation created_at", createdAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate situation envelope evaluations: %w", err)
+	}
+	return out, nil
+}
