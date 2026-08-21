@@ -48,16 +48,21 @@ var realStoreExcluded = map[string]string{
 		"SnapshotInput.CurrentDurationEvidenceRefs — internal/store's LoadReconciliationInput populates " +
 		".CompletedEpisodes for real but never sets .CurrentDurationEvidenceRefs anywhere, so durationOutlierEvidence " +
 		"can never resolve its current-duration fact. Same parked observation-connector gap as above.",
-	"recovery-pending-refire.json": "requires ReconcileLifecycle's symptom-driven recovery/refire transitions " +
-		"(allSymptomsResolved/hasFiringSymptom), which read SnapshotInput.Symptoms — a newly confirmed gap found " +
-		"while building this real-store pass: internal/store's LoadReconciliationInput never sets .Symptoms anywhere " +
-		"(grepped the whole store package); canonicalSymptoms only derives Snapshot.Symptoms from Deliveries inside " +
-		"BuildSnapshot, which controller.go calls AFTER ReconcileLifecycle already ran against the empty raw list. " +
-		"Recovery/refire lifecycle transitions therefore cannot fire against the real production loader today. " +
-		"Reported, not fixed — out of this task's scope.",
-	"recovery-pending-stable.json": "same reason as recovery-pending-refire.json (grace-expiry is reachable via " +
-		"TerminalUncertainty alone, but this fixture's recovery_pending ENTRY step depends on the same " +
-		"unpopulated SnapshotInput.Symptoms).",
+	"recovery-pending-stable.json": "SnapshotInput.Symptoms is now populated (internal/store's LoadReconciliationInput " +
+		"calls situation.DeriveSymptomsFromDeliveries), and this fixture's recovery_pending ENTRY step fires correctly " +
+		"against the real store (confirmed: transitions reach [active recovery_pending ...]) — the same fix makes " +
+		"recovery-pending-refire.json's ENTRY+REFIRE steps pass in full. What still cannot fire is this fixture's LAST " +
+		"step alone: grace EXPIRY (recovery_pending -> recovered) needs >=120s of elapsed real time to cross " +
+		"RecoveryGraceConfig's webhook-default grace deadline, and runRealStoreRoundsFixture's driver clock is an " +
+		"un-mockable time.Now() shared by both store.SituationRuntime and situation.Controller — unlike the in-package " +
+		"replay_test.go driver validating this same corpus, which advances a fully injectable fake clock by each " +
+		"round's own advance_seconds. A genuinely different, verified, PRE-EXISTING test-harness gap (this driver " +
+		"silently ignores every fixture's advance_seconds field) — not SnapshotInput.Symptoms, and not " +
+		"LoadReconciliationInput. Giving this driver a shared fake clock keyed to advance_seconds (mirroring " +
+		"replay_test.go) is the fix, but it is out of this task's ruled scope: it would also newly apply to other " +
+		"currently-passing multi-round fixtures with their own large final-round advance_seconds (janis-short-then-" +
+		"plateau.json: 2400s; envelope-duration-violation.json: 1800s), which needs its own verification pass this " +
+		"task did not scope. Reported, not fixed.",
 }
 
 // TestReplayCorpusAgainstRealStore drives every fixture in the locked corpus
@@ -314,10 +319,34 @@ func runRealStoreRoundsFixture(t *testing.T, fx realStoreFixture) {
 		if err := controller.Reconcile(ctx, situationID); err != nil {
 			t.Fatalf("round %d: reconcile: %v", round, err)
 		}
-		select {
-		case <-l1Done:
-		case <-time.After(2 * time.Second):
-			t.Fatalf("round %d: timed out waiting for l1_complete", round)
+		// "l1_complete" only fires when this round's reconciliation actually
+		// dispatched an acute investigation: beginAcuteInvestigation sets the
+		// incident's AnalysisState to "running" SYNCHRONOUSLY, before the
+		// completion goroutine starts, so that write is already durable by
+		// the time Reconcile returns. A Terminal D4 lifecycle commit
+		// (recovery_pending entry, grace expiry, closed_unknown)
+		// short-circuits ahead of L1 entirely (controller.go: "L1 is never
+		// dispatched and L2 never runs for these") and leaves AnalysisState
+		// exactly as the prior round left it — never "running" as a result
+		// of THIS round — so waiting unconditionally would hang past this
+		// round's real completion. Only wait when a dispatch this round
+		// actually left the gate "running".
+		incidents, err := st.SituationMemberIncidents(ctx, situationID)
+		if err != nil {
+			t.Fatalf("round %d: read situation member incidents: %v", round, err)
+		}
+		if len(incidents) > 0 {
+			state, err := runtime.AnalysisState(ctx, incidents[0].ID)
+			if err != nil {
+				t.Fatalf("round %d: read analysis state: %v", round, err)
+			}
+			if state.Status == situation.L1StatusRunning {
+				select {
+				case <-l1Done:
+				case <-time.After(2 * time.Second):
+					t.Fatalf("round %d: timed out waiting for l1_complete", round)
+				}
+			}
 		}
 	}
 

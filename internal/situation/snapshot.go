@@ -377,7 +377,20 @@ func canonicalDeliveries(in []Delivery) []Delivery {
 	return out
 }
 
-func canonicalSymptoms(explicit []Symptom, deliveries []Delivery) []Symptom {
+// DeriveSymptomsFromDeliveries reduces the immutable delivery ledger to one
+// Symptom per StableSymptomID, keeping only the most recently received
+// delivery for each (ties broken by the larger delivery ID, mirroring
+// canonicalDeliveries' own tie-break) so the resulting lifecycle/severity is
+// each symptom's current state, not a stale earlier observation.
+//
+// This is the SAME derivation canonicalSymptoms folds into Snapshot.Symptoms
+// from BuildSnapshot's own Deliveries — a loader assembling SnapshotInput
+// ahead of BuildSnapshot (so symptom-driven lifecycle transitions can see
+// current lifecycle/severity before the Snapshot exists, e.g.
+// store.LoadReconciliationInput populating SnapshotInput.Symptoms for
+// ReconcileLifecycle) must call this exact function to stay consistent with
+// it rather than writing a second, potentially divergent, reduction.
+func DeriveSymptomsFromDeliveries(deliveries []Delivery) []Symptom {
 	latest := make(map[string]Delivery)
 	for _, delivery := range deliveries {
 		if delivery.StableSymptomID == "" {
@@ -388,14 +401,7 @@ func canonicalSymptoms(explicit []Symptom, deliveries []Delivery) []Symptom {
 			latest[delivery.StableSymptomID] = delivery
 		}
 	}
-	out := make([]Symptom, 0, len(explicit)+len(latest))
-	for _, symptom := range explicit {
-		symptom.ID = strings.TrimSpace(symptom.ID)
-		symptom.Severity = strings.ToLower(strings.TrimSpace(symptom.Severity))
-		symptom.EvidenceRefs = canonicalStrings(symptom.EvidenceRefs)
-		symptom.NoveltyEvidenceRefs = canonicalStrings(symptom.NoveltyEvidenceRefs)
-		out = append(out, symptom)
-	}
+	out := make([]Symptom, 0, len(latest))
 	for _, delivery := range latest {
 		refs := append([]string(nil), delivery.EvidenceRefs...)
 		refs = append(refs, "delivery:"+delivery.ID)
@@ -403,6 +409,25 @@ func canonicalSymptoms(explicit []Symptom, deliveries []Delivery) []Symptom {
 			ProfileSignature: delivery.ProfileSignature, ProfileVersion: delivery.ProfileVersion, Lifecycle: delivery.Status,
 			Severity: delivery.Severity, EvidenceRefs: canonicalStrings(refs)})
 	}
+	sort.Slice(out, func(i, j int) bool {
+		left, _ := json.Marshal(out[i])
+		right, _ := json.Marshal(out[j])
+		return string(left) < string(right)
+	})
+	return out
+}
+
+func canonicalSymptoms(explicit []Symptom, deliveries []Delivery) []Symptom {
+	derived := DeriveSymptomsFromDeliveries(deliveries)
+	out := make([]Symptom, 0, len(explicit)+len(derived))
+	for _, symptom := range explicit {
+		symptom.ID = strings.TrimSpace(symptom.ID)
+		symptom.Severity = strings.ToLower(strings.TrimSpace(symptom.Severity))
+		symptom.EvidenceRefs = canonicalStrings(symptom.EvidenceRefs)
+		symptom.NoveltyEvidenceRefs = canonicalStrings(symptom.NoveltyEvidenceRefs)
+		out = append(out, symptom)
+	}
+	out = append(out, derived...)
 	sort.Slice(out, func(i, j int) bool {
 		left, _ := json.Marshal(out[i])
 		right, _ := json.Marshal(out[j])

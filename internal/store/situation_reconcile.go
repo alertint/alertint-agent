@@ -72,6 +72,13 @@ func (r *SituationRuntime) LoadReconciliationInput(ctx context.Context, claim si
 		return in, primaryIncidentID, err
 	}
 	in.Deliveries = r.snapshotDeliveries(rows)
+	// Reuse BuildSnapshot's own delivery-to-symptom reduction (rather than a
+	// second, potentially divergent one) so ReconcileLifecycle's
+	// symptom-driven recovery/refire checks (hasFiringSymptom/
+	// allSymptomsResolved, controller.go — which run BEFORE BuildSnapshot
+	// derives Snapshot.Symptoms) see the same current lifecycle/severity the
+	// snapshot itself will.
+	in.Symptoms = situation.DeriveSymptomsFromDeliveries(in.Deliveries)
 
 	derived := deriveSymptomStateFacts(claim, in.Deliveries)
 	if len(derived) > 0 && leaseFenced(claim) {
