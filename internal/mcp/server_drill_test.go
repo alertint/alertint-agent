@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/audit"
+	"github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -98,6 +99,49 @@ func TestGetIncident_DrillFlag(t *testing.T) {
 		}
 		if payload.Drill != want {
 			t.Errorf("%s drill = %v, want %v", id, payload.Drill, want)
+		}
+	}
+}
+
+// TestSituationGet_DrillFlag: alertint_situation_get's derived drill boolean
+// mirrors the member Incident's drill marker (ADR-0013) — the same signal
+// alertint_list_incidents/alertint_get_incident already surface, now
+// propagated through Situation identity as the spec requires ("the
+// sender-asserted Drill marker carries through the Incident into Situation
+// MCP, stdout, Slack root, and thread rendering, but grants no Attention or
+// publication authority").
+func TestSituationGet_DrillFlag(t *testing.T) {
+	st := newMCPStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	s := NewServer(Config{SituationCommands: &fakeSituationCommands{}}, st, audit.New(st.DB()))
+
+	for _, id := range []string{"sg-drill", "sg-real"} {
+		seedTestIncident(t, st, id, "g="+id, now)
+	}
+	addLabeledMember(t, st, "sg-drill", "sgd1", map[string]string{
+		store.DrillMarkerLabel: store.DrillMarkerValue, "service": "drill-checkout"})
+	addLabeledMember(t, st, "sg-real", "sgr1", map[string]string{"service": "checkout"})
+
+	seedTestSituation(t, st, "sit-drill", "g=sg-drill", "sit-drill-handle", model.LifecycleActive, now)
+	attachTestIncident(t, st, "sit-drill", "sg-drill", now)
+	seedTestSituation(t, st, "sit-real", "g=sg-real", "sit-real-handle", model.LifecycleActive, now)
+	attachTestIncident(t, st, "sit-real", "sg-real", now)
+
+	want := map[string]bool{"sit-drill": true, "sit-real": false}
+	for id, wantDrill := range want {
+		res, err := s.handleSituationGet(ctx, reqWith(map[string]any{"situation": id}))
+		if err != nil || res.IsError {
+			t.Fatalf("get situation errored: %v %s", err, resultText(t, res))
+		}
+		var payload struct {
+			Drill bool `json:"drill"`
+		}
+		if err := json.Unmarshal([]byte(resultText(t, res)), &payload); err != nil {
+			t.Fatalf("payload not JSON: %v", err)
+		}
+		if payload.Drill != wantDrill {
+			t.Errorf("%s drill = %v, want %v", id, payload.Drill, wantDrill)
 		}
 	}
 }

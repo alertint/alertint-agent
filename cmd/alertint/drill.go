@@ -12,7 +12,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -24,21 +23,21 @@ import (
 	"github.com/alertint/alertint-agent/internal/correlator"
 	"github.com/alertint/alertint-agent/internal/ingress"
 	"github.com/alertint/alertint-agent/internal/logging"
+	"github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
-	"github.com/alertint/alertint-agent/skills/acutetriage"
 )
 
 // drillHTTPTimeout bounds every drill-side HTTP call. Explicit and non-zero:
 // a zero deadline would expire every request.
 const drillHTTPTimeout = 15 * time.Second
 
-// drillTriageGrace is the bounded LLM-triage budget added on top of the
-// correlation window: the drill polls for the finding until it is ready or
-// this budget runs out.
+// drillTriageGrace is the bounded budget the drill gives the controller to
+// raise a Situation (and, with --resolve, to observe it move through
+// recovery_pending to recovered) on top of the correlation window.
 const drillTriageGrace = 75 * time.Second
 
-// drillPollInterval paces the post-window finding polls. Each poll is one
-// cheap MCP list call; the run ends as soon as triage does instead of
+// drillPollInterval paces every post-window Situation poll. Each poll is one
+// cheap MCP call; a run ends as soon as the awaited state appears instead of
 // sleeping out the full grace.
 const drillPollInterval = 5 * time.Second
 
@@ -71,9 +70,6 @@ type drillCmd struct {
 	pause    func(prompt string) error
 	newRunID func() string
 	grace    time.Duration
-	// probePrometheus reports whether something answers on :9090 next to the
-	// target — a heuristic that only shapes one hint line.
-	probePrometheus func(scheme, host string) bool
 }
 
 func runDrill(args []string, stdout, stderr io.Writer) error {
@@ -83,11 +79,11 @@ func runDrill(args []string, stdout, stderr io.Writer) error {
 	fs.StringVar(&opts.cfgPath, "config", "", "path to alertint YAML config (the same file serve reads)")
 	fs.StringVar(&opts.target, "target", "", "base URL of a remote AlertINT instance (default: the local instance from config)")
 	fs.StringVar(&opts.scenario, "scenario", "flagship", "scenario to fire: flagship | storm | db-outage")
-	fs.StringVar(&opts.result, "result", "", "skip firing; fetch and print the finding for an incident id")
+	fs.StringVar(&opts.result, "result", "", "skip firing; fetch and print an existing Situation by id or public handle")
 	fs.StringVar(&opts.colorMode, "color", "auto", "terminal color: auto | always | never")
 	fs.BoolVar(&opts.yes, "yes", false, "skip the remote-target confirmation prompt")
 	fs.BoolVar(&opts.fresh, "fresh", false, "always create a new drill incident; bypass recurrence collapse")
-	fs.BoolVar(&opts.resolve, "resolve", false, "after the run, re-send the burst as resolved so the drill incident closes")
+	fs.BoolVar(&opts.resolve, "resolve", false, "after the run, re-send the burst as resolved and watch the Situation reach recovery_pending then recovered")
 	fs.BoolVar(&opts.resolveWait, "resolve-wait", false, "with --resolve, hold the drill incident open after the payoff and resolve on Enter")
 	fs.BoolVar(&opts.allowInsecure, "allow-insecure-http", false, "allow sending bearer tokens to a plain-http remote target")
 	fs.StringVar(&opts.viaAlertmanager, "via-alertmanager", "", "fire the burst through your Alertmanager (base URL, v2 API) to validate AM→AlertINT routing")
@@ -126,11 +122,10 @@ func runDrill(args []string, stdout, stderr io.Writer) error {
 				return nil
 			}
 		},
-		confirm:         stdinConfirm(stderr),
-		pause:           stdinPause(stderr),
-		newRunID:        randomRunID,
-		grace:           drillTriageGrace,
-		probePrometheus: probePrometheusDefault,
+		confirm:  stdinConfirm(stderr),
+		pause:    stdinPause(stderr),
+		newRunID: randomRunID,
+		grace:    drillTriageGrace,
 	}
 	return d.run(context.Background())
 }
@@ -206,21 +201,26 @@ func (d *drillCmd) run(ctx context.Context) error {
 	}
 
 	// Preflights: notify-and-continue, never hard-fail.
-	mcpAvailable, capHint := d.printPreflights(sc, mcpErr)
+	mcpAvailable := d.printPreflights(sc, mcpErr)
 
-	// Recurrence-collapse rerun: if a prior drill of this scenario is still
-	// inside the collapse window, reuse its group salt so this fire lands on it
-	// as an occurrence. It fires with FRESH fingerprints so its alerts are a new
-	// firing episode (a distinct-fingerprint attach), not an unchanged repeat.
+	// Recurrence rerun: if a prior drill of this scenario is still inside the
+	// collapse window, reuse its group salt so this fire lands on its exact
+	// group key. The Situation controller's own identity rules then decide
+	// what happens (spec: "Situation creation and public identity") — attach
+	// while the owner is active/recovery_pending, or mint a fresh Situation
+	// linked through previous_situation_id once it has gone terminal — so this
+	// scan does not filter by lifecycle itself. It fires with FRESH
+	// fingerprints so its alerts are a new firing episode (a distinct-
+	// fingerprint attach), not an unchanged repeat.
 	groupSalt := d.newRunID()
 	fpSeed := groupSalt
-	rerunID := ""
+	rerunID, rerunLifecycle := "", ""
 	if mcpAvailable && !d.opts.fresh {
 		if cands, cerr := d.fetchDrillCandidates(ctx, mcpEndpoint, mcpToken); cerr == nil {
 			w := time.Duration(d.cfg.Memory.AttachWindowMinutes) * time.Minute
-			if id, salt, ok := drillRerunSalt(cands, d.cfg.Correlator.GroupLabels, sc.key, d.now(), w); ok {
-				groupSalt, fpSeed, rerunID = salt, d.newRunID(), id
-				d.printf("rerun: a prior drill (%s) is inside the %dm collapse window — reusing its group key to exercise recurrence collapse", id, d.cfg.Memory.AttachWindowMinutes)
+			if id, lifecycle, salt, ok := drillRerunSalt(cands, d.cfg.Correlator.GroupLabels, sc.key, d.now(), w); ok {
+				groupSalt, fpSeed, rerunID, rerunLifecycle = salt, d.newRunID(), id, lifecycle
+				d.printf("rerun: a prior drill (%s, lifecycle=%s) is inside the %dm collapse window — reusing its group key to exercise Situation identity", id, lifecycle, d.cfg.Memory.AttachWindowMinutes)
 			}
 		}
 	}
@@ -234,30 +234,28 @@ func (d *drillCmd) run(ctx context.Context) error {
 	if d.opts.fresh {
 		d.printf("%s", d.style("1;35", "fresh: bypassing prior drill recurrence — this run creates a new incident"))
 	}
-	capHint, err = d.fire(ctx, sc, run, recvBase, webhookToken, capHint)
-	if err != nil {
+	if err := d.fire(ctx, sc, run, recvBase, webhookToken); err != nil {
 		return err
 	}
 	d.printf("")
 	d.printPhase("correlate")
 
-	// Rerun payoff: the fire attaches as an occurrence on receipt — no triage,
-	// no window wait. Poll the matched incident's occurrence count instead.
+	// Rerun payoff: the fire attaches (or, past a terminal owner, links) on
+	// receipt — no window wait. Poll for the outcome instead.
 	if rerunID != "" {
+		situationID := ""
 		if mcpAvailable {
-			if err := d.pollOccurrenceRerun(ctx, mcpEndpoint, mcpToken, rerunID); err != nil {
-				return err
-			}
+			situationID = d.pollRerunOutcome(ctx, mcpEndpoint, mcpToken, run.expectedGroupKey, rerunID, rerunLifecycle)
 		} else {
-			d.printf("fired the rerun; mcp is not usable from here — check the DRILL card edit to \"recurred ×N\".")
+			d.printf("fired the rerun; mcp is not usable from here — check the Situation card in Slack for the update.")
 		}
-		return d.maybeResolve(ctx, run, recvBase, webhookToken)
+		return d.maybeResolve(ctx, run, recvBase, webhookToken, mcpEndpoint, mcpToken, mcpAvailable, situationID)
 	}
 
-	// First run: wait out the correlation window — a server-side property of the
-	// target's correlator (tune correlator.window_seconds to shorten it) —
-	// then poll for the finding during the bounded triage grace so the run
-	// ends as soon as triage does.
+	// First run: wait out the correlation window — a server-side property of
+	// the target's correlator (tune correlator.window_seconds to shorten it) —
+	// then poll for the owning Situation during the bounded grace so the run
+	// ends as soon as it appears.
 	window := time.Duration(d.cfg.Correlator.WindowSeconds)*time.Second + correlator.DefaultTickInterval
 	d.printf("waiting ~%ds for the correlation window…", int(window.Seconds()))
 	if err := d.sleep(ctx, window); err != nil {
@@ -265,31 +263,37 @@ func (d *drillCmd) run(ctx context.Context) error {
 	}
 
 	if !mcpAvailable {
-		// Nothing to poll without MCP: give triage its grace blind, then
-		// point at the surfaces that can show the finding.
-		d.printf("window closed; giving the LLM triage up to %ds…", int(d.grace.Seconds()))
+		// Nothing to poll without MCP: give the controller its grace blind,
+		// then point at the surfaces that can show the Situation.
+		d.printf("window closed; giving the controller up to %ds to raise a Situation…", int(d.grace.Seconds()))
 		if err := d.sleep(ctx, d.grace); err != nil {
 			return err
 		}
 		d.printf("")
 		d.printPhase("finding")
-		d.printf("fired. mcp is not usable from here, so the finding cannot be fetched — check:")
+		d.printf("fired. mcp is not usable from here, so the Situation cannot be fetched — check:")
 		if d.cfg.Notify.Slack.Enabled {
-			d.printf("  · the DRILL card in Slack channel %s", d.cfg.Notify.Slack.Channel)
+			d.printf("  · the Situation card in Slack channel %s", d.cfg.Notify.Slack.Channel)
 		}
-		d.printf("  · the `finding` summary line in serve logs (group %s)", run.expectedGroupKey)
-		d.printf("then hand the incident to your agent: investigate the latest drill incident using alertint")
-		return d.maybeResolve(ctx, run, recvBase, webhookToken)
+		d.printf("  · the Situation stdout line in serve logs (group %s)", run.expectedGroupKey)
+		d.printf("then hand it to your agent: investigate the latest drill situation using alertint")
+		return d.maybeResolve(ctx, run, recvBase, webhookToken, mcpEndpoint, mcpToken, mcpAvailable, "")
 	}
-	d.printf("window closed; polling for the finding (up to %ds)…", int(d.grace.Seconds()))
-	if err := d.fetchPayoff(ctx, mcpEndpoint, mcpToken, run.expectedGroupKey, capHint); err != nil {
+	d.printf("window closed; polling for the owning Situation (up to %ds)…", int(d.grace.Seconds()))
+	snap, found, err := d.fetchSituationPayoff(ctx, mcpEndpoint, mcpToken, run.expectedGroupKey)
+	if err != nil {
 		return err
 	}
-	return d.maybeResolve(ctx, run, recvBase, webhookToken)
+	situationID := ""
+	if found {
+		situationID = snap.ID
+	}
+	return d.maybeResolve(ctx, run, recvBase, webhookToken, mcpEndpoint, mcpToken, mcpAvailable, situationID)
 }
 
-// runResult fetches and prints the finding for an existing incident id. The
-// transport guard applies here too — this path carries the MCP bearer token.
+// runResult fetches and prints one existing Situation by id or public
+// handle. The transport guard applies here too — this path carries the MCP
+// bearer token.
 func (d *drillCmd) runResult(ctx context.Context, mcpEndpoint, mcpToken string, mcpErr error) error {
 	if !d.cfg.MCPEnabled() {
 		return fmt.Errorf("drill: --result needs mcp enabled — set %s (mcp turns on automatically) or remove mcp.enabled: false", orDefault(d.cfg.MCP.TokenEnv, "ALERTINT_MCP_TOKEN"))
@@ -304,15 +308,21 @@ func (d *drillCmd) runResult(ctx context.Context, mcpEndpoint, mcpToken string, 
 	if err := client.initialize(ctx); err != nil {
 		return err
 	}
-	return d.fetchAndPrintIncident(ctx, client, d.opts.result, capHintNone, true)
+	snap, err := d.getSituationSnapshot(ctx, client, d.opts.result)
+	if err != nil {
+		return fmt.Errorf("drill: fetch situation %s: %w", d.opts.result, err)
+	}
+	d.printSituationPayoff(snap)
+	return nil
 }
 
 // maybeResolve fires the run's burst again as resolved when --resolve is set:
 // same door, same token, same fingerprints — the instance closes the Drill
-// through the production resolution path (Slack cards update in place).
+// through the production resolution path (Slack cards update in place) — then
+// watches the owning Situation move through recovery_pending to recovered.
 // Warn-and-continue: the payoff has already been delivered, and a failed
 // resolution just leaves a firing Drill.
-func (d *drillCmd) maybeResolve(ctx context.Context, run drillRun, recvBase, webhookToken string) error {
+func (d *drillCmd) maybeResolve(ctx context.Context, run drillRun, recvBase, webhookToken, mcpEndpoint, mcpToken string, mcpAvailable bool, situationID string) error {
 	if !d.opts.resolve {
 		return nil
 	}
@@ -327,63 +337,122 @@ func (d *drillCmd) maybeResolve(ctx context.Context, run drillRun, recvBase, web
 	if d.opts.viaAlertmanager != "" {
 		d.printf("resolving the drill via your Alertmanager (delivery rides AM's group_interval)…")
 		if err := d.postAlertmanagerV2(ctx, payload); err != nil {
-			d.printf("warning: alertmanager rejected the resolution: %v — the drill incident stays firing", err)
+			d.printf("warning: alertmanager rejected the resolution: %v — the drill Situation stays active", err)
+			return nil
 		}
+	} else {
+		d.printf("%s", d.style("1;92", fmt.Sprintf("alerts: %d resolved", len(payload.Alerts))))
+		d.printf("%s", d.style("2", "group: "+run.expectedGroupKey))
+		if err := d.postJSON(ctx, recvBase+"/webhook/alertmanager", webhookToken, payload); err != nil {
+			d.printf("warning: resolution not accepted: %v — the drill Situation stays active", err)
+			return nil
+		}
+	}
+	if !mcpAvailable || situationID == "" {
+		d.printSlackFallback(run.expectedGroupKey)
 		return nil
 	}
-	d.printf("%s", d.style("1;92", fmt.Sprintf("alerts: %d resolved", len(payload.Alerts))))
-	d.printf("%s", d.style("2", "group: "+run.expectedGroupKey))
-	if err := d.postJSON(ctx, recvBase+"/webhook/alertmanager", webhookToken, payload); err != nil {
-		d.printf("warning: resolution not accepted: %v — the drill incident stays firing", err)
+	return d.pollRecoveryThenRecovered(ctx, mcpEndpoint, mcpToken, situationID)
+}
+
+// pollRecoveryThenRecovered watches the visible recovery path: it first waits
+// for the Situation to show recovery_pending (the grace window watching for a
+// clean recovery), then for it to reach the terminal recovered state, each
+// bounded by the drill's grace. A bounded timeout at either stage points at
+// --result rather than failing the run — the payoff already printed.
+func (d *drillCmd) pollRecoveryThenRecovered(ctx context.Context, mcpEndpoint, mcpToken, situationID string) error {
+	client := newMCPOneShotClient(mcpEndpoint, mcpToken, d.http)
+	if err := client.initialize(ctx); err != nil {
+		d.printf("warning: could not reach MCP to confirm recovery: %v", err)
+		return nil
 	}
+
+	d.printf("waiting for the Situation to show recovery pending (up to %ds)…", int(d.grace.Seconds()))
+	pending, ok, err := d.pollUntilLifecycle(ctx, client, situationID, string(model.LifecycleRecoveryPending))
+	if err != nil {
+		return err
+	}
+	if !ok {
+		d.printf("the Situation has not shown recovery pending yet; re-check with:")
+		d.printf("  alertint drill --config %s%s --result %s", d.opts.cfgPath, d.targetFlagSuffix(), situationID)
+		return nil
+	}
+	d.printf("%s", d.style("1;92", fmt.Sprintf("recovery pending: %s — attention=%s (grace window watching for a clean recovery)", situationTarget(pending), pending.Attention)))
+
+	d.printf("waiting for the Situation to recover (up to %ds)…", int(d.grace.Seconds()))
+	recovered, ok, err := d.pollUntilLifecycle(ctx, client, situationID, string(model.LifecycleRecovered))
+	if err != nil {
+		return err
+	}
+	if !ok {
+		d.printf("the Situation has not recovered yet; re-check with:")
+		d.printf("  alertint drill --config %s%s --result %s", d.opts.cfgPath, d.targetFlagSuffix(), situationID)
+		return nil
+	}
+	d.printf("%s", d.style("1;92", fmt.Sprintf("recovered: %s closed cleanly", situationTarget(recovered))))
 	return nil
 }
 
-// printPreflights emits the notify-and-continue setup notes and resolves the
-// capped-hint kind for this run.
-func (d *drillCmd) printPreflights(sc drillScenario, mcpErr error) (mcpAvailable bool, capHint capHintKind) {
+// pollUntilLifecycle polls one Situation until its lifecycle equals want or
+// the drill's grace runs out. Polling is paced by d.sleep so the loop is
+// deterministic under test clocks.
+func (d *drillCmd) pollUntilLifecycle(ctx context.Context, client *mcpOneShotClient, situationID, want string) (situationSnapshot, bool, error) {
+	polls := int(d.grace / drillPollInterval)
+	if polls < 1 {
+		polls = 1
+	}
+	for attempt := 0; ; attempt++ {
+		snap, err := d.getSituationSnapshot(ctx, client, situationID)
+		if err == nil && snap.Lifecycle == want {
+			return snap, true, nil
+		}
+		if attempt >= polls {
+			return situationSnapshot{}, false, nil
+		}
+		if err := d.sleep(ctx, drillPollInterval); err != nil {
+			return situationSnapshot{}, false, err
+		}
+	}
+}
+
+// printPreflights emits the notify-and-continue setup notes and resolves
+// whether MCP is usable from here.
+func (d *drillCmd) printPreflights(sc drillScenario, mcpErr error) (mcpAvailable bool) {
 	mcpAvailable = d.cfg.MCPEnabled() && mcpErr == nil
 	if d.cfg.MCPEnabled() && mcpErr != nil {
 		d.printf("note: mcp is enabled but not usable from here (%v) — the drill will fire, but", mcpErr)
-		d.printf("      cannot fetch the finding when it is ready; fix the token/addr and use --result.")
+		d.printf("      cannot fetch the Situation when it is ready; fix the token/addr and use --result.")
 	}
-	// The capped-finding hint's first remedy depends on WHY the deploy is
-	// missing: never attempted (ingress disabled) vs attempted and rejected.
-	capHint = capHintProbe
 	if sc.change != nil && !d.cfg.Changes.Ingress.Enabled {
-		capHint = capHintEnableChanges
-		d.printf("note: changes.ingress is disabled, so the planted deploy will be skipped and the finding stays at the metadata-only confidence cap.")
-		d.printf("      enable it in %s and re-run for the causal, uncapped drill:", d.opts.cfgPath)
+		d.printf("note: changes.ingress is disabled, so the planted deploy will be skipped — the Situation")
+		d.printf("      forms from alert evidence alone. enable it in %s and re-run for the causal deploy evidence:", d.opts.cfgPath)
 		d.printf("        changes:")
 		d.printf("          ingress:")
 		d.printf("            enabled: true")
 		d.printf("            webhook_token_env: %s", orDefault(d.cfg.Changes.Ingress.WebhookTokenEnv, "ALERTINT_CHANGES_WEBHOOK_TOKEN"))
 	}
 	if !d.cfg.MCPEnabled() {
-		d.printf("note: mcp is disabled, so the drill cannot fetch the finding when it is ready.")
+		d.printf("note: mcp is disabled, so the drill cannot fetch the Situation when it is ready.")
 		if d.cfg.MCP.Enabled != nil && !*d.cfg.MCP.Enabled {
 			d.printf("      mcp.enabled is false in %s — remove that line to complete the loop.", d.opts.cfgPath)
 		} else {
 			d.printf("      set %s to a long random secret and mcp turns on automatically.", orDefault(d.cfg.MCP.TokenEnv, "ALERTINT_MCP_TOKEN"))
 		}
 	}
-	return mcpAvailable, capHint
+	return mcpAvailable
 }
 
-// fire POSTs the planted change event (when enabled) and the burst, returning
-// the possibly-adjusted capped-hint kind (a rejected deploy changes the honest
-// remedy).
-func (d *drillCmd) fire(ctx context.Context, sc drillScenario, run drillRun, recvBase, webhookToken string, capHint capHintKind) (capHintKind, error) {
+// fire POSTs the planted change event (when enabled) and the burst.
+func (d *drillCmd) fire(ctx context.Context, sc drillScenario, run drillRun, recvBase, webhookToken string) error {
 	if d.cfg.Changes.Ingress.Enabled && sc.change != nil {
 		token, err := d.cfg.ChangesWebhookToken()
 		if err != nil {
-			return capHint, err
+			return err
 		}
 		d.printf("planting change event: %s (%s ago)", run.change.Title, sc.change.occurredAgo)
 		if err := d.postJSON(ctx, recvBase+"/webhook/change", token, run.change); err != nil {
 			d.printf("warning: change event not accepted: %v — continuing without it", err)
-			d.printf("         (check the %s env var; the finding will stay capped without the deploy)", orDefault(d.cfg.Changes.Ingress.WebhookTokenEnv, "ALERTINT_CHANGES_WEBHOOK_TOKEN"))
-			capHint = capHintChangeRejected
+			d.printf("         (check the %s env var; the deploy evidence will be missing without it)", orDefault(d.cfg.Changes.Ingress.WebhookTokenEnv, "ALERTINT_CHANGES_WEBHOOK_TOKEN"))
 		}
 	}
 
@@ -394,300 +463,414 @@ func (d *drillCmd) fire(ctx context.Context, sc drillScenario, run drillRun, rec
 		if err := d.postAlertmanagerV2(ctx, run.alerts); err != nil {
 			d.printf("warning: alertmanager rejected the burst: %v", err)
 		}
-		return capHint, nil
+		return nil
 	}
 	d.printf("%s", d.style("1", fmt.Sprintf("scenario: %s — %s", sc.key, sc.description)))
 	d.printf("%s", d.style("1;33", fmt.Sprintf("alerts: %d firing", len(run.alerts.Alerts))))
 	d.printf("%s", d.style("2", "group: "+run.expectedGroupKey))
 	if err := d.postJSON(ctx, recvBase+"/webhook/alertmanager", webhookToken, run.alerts); err != nil {
-		return capHint, fmt.Errorf("drill: firing alerts: %w", err)
+		return fmt.Errorf("drill: firing alerts: %w", err)
 	}
-	return capHint, nil
+	return nil
 }
 
-// fetchPayoff is the post-wait payoff: initialize, then poll the incident
-// list until the finding is analyzed or the triage grace runs out, and print
-// the finding (or the degraded pointer — never empty-handed). Polling is
-// paced by d.sleep so the loop is deterministic under test clocks.
-func (d *drillCmd) fetchPayoff(ctx context.Context, mcpEndpoint, mcpToken, groupKey string, capHint capHintKind) error {
-	client := newMCPOneShotClient(mcpEndpoint, mcpToken, d.http)
-	if err := client.initialize(ctx); err != nil {
-		d.printf("warning: could not reach MCP at %s: %v", mcpEndpoint, err)
-		d.printSlackFallback(groupKey)
-		return nil
-	}
-	polls := int(d.grace / drillPollInterval)
-	var incidentID, state string
-	var drifted bool
-	for attempt := 0; ; attempt++ {
-		var err error
-		incidentID, state, drifted, err = d.findIncident(ctx, client, groupKey)
-		if err != nil {
-			d.printf("warning: could not list incidents: %v", err)
-			d.printSlackFallback(groupKey)
-			return nil
-		}
-		if incidentID != "" && state == "analyzed" {
-			break
-		}
-		if attempt >= polls {
-			// Grace exhausted: report the honest state and the re-check.
-			if incidentID == "" {
-				d.printf("no incident for group %s yet — the window may still be collecting.", groupKey)
-				d.printSlackFallback(groupKey)
-				return nil
-			}
-			if drifted {
-				d.printDrift(groupKey)
-			}
-			d.printNotReady(incidentID, state)
-			return nil
-		}
-		if err := d.sleep(ctx, drillPollInterval); err != nil {
-			return err
-		}
-	}
-	if drifted {
-		d.printDrift(groupKey)
-	}
-	return d.fetchAndPrintIncident(ctx, client, incidentID, capHint, false)
+// -----------------------------------------------------------------------------
+// Situation discovery, snapshot, and payoff rendering
+// -----------------------------------------------------------------------------
+
+// situationSnapshot is the drill's flattened view of one alertint_situation_get
+// response — exactly the fields the payoff print, the recovery poll, and the
+// rerun-linkage check consume.
+type situationSnapshot struct {
+	ID                        string
+	PublicHandle              string
+	GroupKey                  string
+	Lifecycle                 string
+	Attention                 string
+	Drill                     bool
+	TerminalBanner            string
+	PreviousSituationID       *string
+	NextActor                 string
+	ActionStatus              string
+	OperatorActionRequired    string
+	OperatorJudgmentRequested string
+	WaitReason                string
+	Incidents                 []situationMemberIncident
+	Notifications             []situationNotificationRow
 }
 
-func (d *drillCmd) printDrift(groupKey string) {
-	d.printf("note: no incident matched group %s — the target's group_labels likely differ", groupKey)
-	d.printf("      from this config file (config drift). Showing the newest drill incident instead.")
+// situationMemberIncident is one Situation member's L1 acute-analysis gate
+// state — evidence, reported independent of the Situation payoff above it.
+type situationMemberIncident struct {
+	ID                 string
+	AcuteFindingStatus string
+	AcuteFindingReason string
 }
 
-// findIncident matches the run's salted group key on the incident list.
-// limit 100: newest-first, and a busy instance must not page the drill out.
-// When the exact key is absent (local config drifted from the target's), it
-// falls back to the newest drill-flagged incident and reports drifted=true.
-// fetchDrillCandidates lists the target's incidents over MCP and distills them
-// to the fields the rerun-salt matcher needs. Best-effort: any error means "no
-// candidates" (mint a fresh salt), never a failed drill.
-func (d *drillCmd) fetchDrillCandidates(ctx context.Context, mcpEndpoint, mcpToken string) ([]drillCandidate, error) {
+type situationNotificationRow struct {
+	Kind            string
+	MainChannelPoke bool
+	Status          string
+}
+
+// decodeSituationSnapshot unmarshals one alertint_situation_get response into
+// a situationSnapshot.
+func decodeSituationSnapshot(raw json.RawMessage) (situationSnapshot, error) {
+	var payload struct {
+		TerminalBanner    string `json:"terminal_banner"`
+		ID                string `json:"id"`
+		PreviousSituation *struct {
+			ID string `json:"id"`
+		} `json:"previous_situation"`
+		GroupKey     string  `json:"group_key"`
+		PublicHandle *string `json:"public_handle"`
+		Lifecycle    string  `json:"lifecycle"`
+		Attention    string  `json:"attention"`
+		Drill        bool    `json:"drill"`
+		Incidents    []struct {
+			ID                 string `json:"id"`
+			AcuteFindingStatus string `json:"acute_finding_status"`
+			AcuteFindingReason string `json:"acute_finding_reason"`
+		} `json:"incidents"`
+		CurrentAssessment *struct {
+			ActionContract struct {
+				NextActor                 string `json:"next_actor"`
+				ActionStatus              string `json:"action_status"`
+				OperatorActionRequired    string `json:"operator_action_required"`
+				OperatorJudgmentRequested string `json:"operator_judgment_requested"`
+				WaitReason                string `json:"wait_reason"`
+			} `json:"action_contract"`
+		} `json:"current_assessment"`
+		Notifications []struct {
+			Kind            string `json:"kind"`
+			MainChannelPoke bool   `json:"main_channel_poke"`
+			Status          string `json:"status"`
+		} `json:"notifications"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return situationSnapshot{}, fmt.Errorf("drill: decode situation: %w", err)
+	}
+	snap := situationSnapshot{
+		ID: payload.ID, GroupKey: payload.GroupKey, Lifecycle: payload.Lifecycle, Attention: payload.Attention,
+		Drill: payload.Drill, TerminalBanner: payload.TerminalBanner,
+	}
+	if payload.PublicHandle != nil {
+		snap.PublicHandle = *payload.PublicHandle
+	}
+	if payload.PreviousSituation != nil {
+		id := payload.PreviousSituation.ID
+		snap.PreviousSituationID = &id
+	}
+	if payload.CurrentAssessment != nil {
+		ac := payload.CurrentAssessment.ActionContract
+		snap.NextActor, snap.ActionStatus = ac.NextActor, ac.ActionStatus
+		snap.OperatorActionRequired = ac.OperatorActionRequired
+		snap.OperatorJudgmentRequested = ac.OperatorJudgmentRequested
+		snap.WaitReason = ac.WaitReason
+	}
+	for _, m := range payload.Incidents {
+		snap.Incidents = append(snap.Incidents, situationMemberIncident{
+			ID: m.ID, AcuteFindingStatus: m.AcuteFindingStatus, AcuteFindingReason: m.AcuteFindingReason,
+		})
+	}
+	for _, n := range payload.Notifications {
+		snap.Notifications = append(snap.Notifications, situationNotificationRow{
+			Kind: n.Kind, MainChannelPoke: n.MainChannelPoke, Status: n.Status,
+		})
+	}
+	return snap, nil
+}
+
+func (d *drillCmd) getSituationSnapshot(ctx context.Context, client *mcpOneShotClient, id string) (situationSnapshot, error) {
+	raw, err := client.callTool(ctx, "alertint_situation_get", map[string]any{"situation": id})
+	if err != nil {
+		return situationSnapshot{}, err
+	}
+	return decodeSituationSnapshot(raw)
+}
+
+// findSituationByGroupKey matches the run's salted group key on the
+// Situation list. limit 200: most-recently-updated first, and a busy
+// instance must not page the drill out. When the exact key is absent (local
+// config drifted from the target's), it falls back to the newest Situation
+// whose group key still looks like a drill's and reports drifted=true.
+func (d *drillCmd) findSituationByGroupKey(ctx context.Context, client *mcpOneShotClient, groupKey string) (id string, drifted bool, err error) {
+	raw, err := client.callTool(ctx, "alertint_situation_list", map[string]any{"limit": 200})
+	if err != nil {
+		return "", false, err
+	}
+	var payload struct {
+		Situations []struct {
+			ID       string `json:"id"`
+			GroupKey string `json:"group_key"`
+		} `json:"situations"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return "", false, fmt.Errorf("drill: decode situation list: %w", err)
+	}
+	for _, s := range payload.Situations {
+		if s.GroupKey == groupKey {
+			return s.ID, false, nil
+		}
+	}
+	for _, s := range payload.Situations {
+		if looksLikeDrillGroupKey(s.GroupKey, d.cfg.Correlator.GroupLabels) {
+			return s.ID, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+// fetchDrillCandidates lists the target's Situations over MCP and distills
+// them to the fields the rerun-salt matcher needs. Best-effort: any error
+// means "no candidates" (mint a fresh salt), never a failed drill.
+func (d *drillCmd) fetchDrillCandidates(ctx context.Context, mcpEndpoint, mcpToken string) ([]drillSituationCandidate, error) {
 	client := newMCPOneShotClient(mcpEndpoint, mcpToken, d.http)
 	if err := client.initialize(ctx); err != nil {
 		return nil, err
 	}
-	raw, err := client.callTool(ctx, "alertint_list_incidents", map[string]any{"limit": 100})
+	raw, err := client.callTool(ctx, "alertint_situation_list", map[string]any{"limit": 200})
 	if err != nil {
 		return nil, err
 	}
 	var payload struct {
-		Incidents []struct {
-			ID          string    `json:"id"`
-			GroupKey    string    `json:"group_key"`
-			Status      string    `json:"status"`
-			Drill       bool      `json:"drill"`
-			LastAlertAt time.Time `json:"last_alert_at"`
-			Occurrences int       `json:"occurrences"`
-		} `json:"incidents"`
+		Situations []struct {
+			ID                  string    `json:"id"`
+			PreviousSituationID *string   `json:"previous_situation_id"`
+			GroupKey            string    `json:"group_key"`
+			Lifecycle           string    `json:"lifecycle"`
+			UpdatedAt           time.Time `json:"updated_at"`
+		} `json:"situations"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return nil, fmt.Errorf("drill: decode incident list: %w", err)
+		return nil, fmt.Errorf("drill: decode situation list: %w", err)
 	}
-	out := make([]drillCandidate, 0, len(payload.Incidents))
-	for _, inc := range payload.Incidents {
-		out = append(out, drillCandidate{
-			ID: inc.ID, GroupKey: inc.GroupKey, Status: inc.Status,
-			Drill: inc.Drill, LastAlertAt: inc.LastAlertAt, Occurrences: inc.Occurrences,
+	out := make([]drillSituationCandidate, 0, len(payload.Situations))
+	for _, s := range payload.Situations {
+		out = append(out, drillSituationCandidate{
+			ID: s.ID, GroupKey: s.GroupKey, Lifecycle: s.Lifecycle,
+			PreviousSituationID: s.PreviousSituationID, UpdatedAt: s.UpdatedAt,
 		})
 	}
 	return out, nil
 }
 
-// pollOccurrenceRerun polls the matched incident until its occurrence count
-// registers the collapsed re-fire, then prints the "recurred ×N" payoff. It
-// exits as soon as the count increments; a timeout points at the card edit.
-func (d *drillCmd) pollOccurrenceRerun(ctx context.Context, mcpEndpoint, mcpToken, incidentID string) error {
+// fetchSituationPayoff is the post-window payoff: initialize, then poll the
+// Situation list until the owning Situation appears (or the grace runs out),
+// fetch its full detail, and print it. Every published nonterminal Situation
+// is reported as-is — a silent non-critical run is not a failure, it is the
+// controller correctly keeping Slack quiet.
+func (d *drillCmd) fetchSituationPayoff(ctx context.Context, mcpEndpoint, mcpToken, groupKey string) (situationSnapshot, bool, error) {
 	client := newMCPOneShotClient(mcpEndpoint, mcpToken, d.http)
 	if err := client.initialize(ctx); err != nil {
-		d.printf("warning: could not reach MCP to confirm the collapse: %v", err)
-		return nil
+		d.printf("warning: could not reach MCP at %s: %v", mcpEndpoint, err)
+		d.printSlackFallback(groupKey)
+		return situationSnapshot{}, false, nil
 	}
-	d.printf("rerun fired; polling incident %s for the collapsed occurrence (up to %ds)…", incidentID, int(d.grace.Seconds()))
+	polls := int(d.grace / drillPollInterval)
+	var id string
+	var drifted bool
+	for attempt := 0; ; attempt++ {
+		var err error
+		id, drifted, err = d.findSituationByGroupKey(ctx, client, groupKey)
+		if err != nil {
+			d.printf("warning: could not list situations: %v", err)
+			d.printSlackFallback(groupKey)
+			return situationSnapshot{}, false, nil
+		}
+		if id != "" {
+			break
+		}
+		if attempt >= polls {
+			d.printf("no Situation for group %s yet — the window may still be collecting.", groupKey)
+			d.printSlackFallback(groupKey)
+			return situationSnapshot{}, false, nil
+		}
+		if err := d.sleep(ctx, drillPollInterval); err != nil {
+			return situationSnapshot{}, false, err
+		}
+	}
+	if drifted {
+		d.printDrift(groupKey)
+	}
+	snap, err := d.getSituationSnapshot(ctx, client, id)
+	if err != nil {
+		d.printf("warning: could not fetch situation %s: %v", id, err)
+		return situationSnapshot{}, false, nil
+	}
+	d.printSituationPayoff(snap)
+	return snap, true, nil
+}
+
+// pollRerunOutcome polls for the Situation owning the reused group key and
+// classifies the outcome: a collapse into the same prior Situation (no new
+// Situation minted — a plain rerun during recovery grace), or a fresh
+// Situation correctly linked to a terminal prior through
+// previous_situation_id (spec: "a rerun after terminal recovery creates a
+// new linked Drill Situation"). It returns the observed Situation id, or ""
+// on timeout.
+func (d *drillCmd) pollRerunOutcome(ctx context.Context, mcpEndpoint, mcpToken, groupKey, priorID, priorLifecycle string) string {
+	client := newMCPOneShotClient(mcpEndpoint, mcpToken, d.http)
+	if err := client.initialize(ctx); err != nil {
+		d.printf("warning: could not reach MCP to confirm the rerun outcome: %v", err)
+		return ""
+	}
+	d.printf("rerun fired; polling for the owning Situation (up to %ds)…", int(d.grace.Seconds()))
 	polls := int(d.grace / drillPollInterval)
 	if polls < 1 {
 		polls = 1
 	}
+	prior := drillSituation(priorID, priorLifecycle, "")
 	for i := 0; i < polls; i++ {
-		raw, err := client.callTool(ctx, "alertint_get_incident", map[string]any{"incident_id": incidentID})
-		if err == nil {
-			var p struct {
-				Occurrences int `json:"occurrences"`
-			}
-			if json.Unmarshal(raw, &p) == nil && p.Occurrences > 0 {
-				d.printf("collapsed: incident %s recurred ×%d — no second triage, the existing card edits in place", incidentID, p.Occurrences+1)
-				return nil
+		id, _, err := d.findSituationByGroupKey(ctx, client, groupKey)
+		if err == nil && id != "" {
+			if snap, gerr := d.getSituationSnapshot(ctx, client, id); gerr == nil {
+				switch {
+				case id == priorID:
+					d.printf("%s", d.style("1;92", fmt.Sprintf("collapsed: situation %s absorbed the rerun — lifecycle=%s attention=%s (no new Situation minted)", situationTarget(snap), snap.Lifecycle, snap.Attention)))
+					return id
+				case isNewLinkedDrill(prior, drillSituation(id, snap.Lifecycle, stringOrEmpty(snap.PreviousSituationID))):
+					d.printf("%s", d.style("1;92", fmt.Sprintf("new linked situation: %s links back to the terminal %s via previous_situation_id — lifecycle=%s attention=%s", situationTarget(snap), priorID, snap.Lifecycle, snap.Attention)))
+					return id
+				}
 			}
 		}
 		if i < polls-1 {
 			if err := d.sleep(ctx, drillPollInterval); err != nil {
-				return err
+				return ""
 			}
 		}
 	}
-	d.printf("the occurrence has not registered yet; check the DRILL card edit to \"recurred ×N\", or re-run with --result %s", incidentID)
-	return nil
+	d.printf("the rerun has not settled yet; check the Situation card, or re-run with --result %s", priorID)
+	return ""
 }
 
-func (d *drillCmd) findIncident(ctx context.Context, client *mcpOneShotClient, groupKey string) (id, state string, drifted bool, err error) {
-	raw, err := client.callTool(ctx, "alertint_list_incidents", map[string]any{"limit": 100})
-	if err != nil {
-		return "", "", false, err
-	}
-	var payload struct {
-		Incidents []struct {
-			ID       string `json:"id"`
-			GroupKey string `json:"group_key"`
-			Status   string `json:"status"`
-			Drill    bool   `json:"drill"`
-		} `json:"incidents"`
-	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return "", "", false, fmt.Errorf("drill: decode incident list: %w", err)
-	}
-	for _, inc := range payload.Incidents {
-		if inc.GroupKey == groupKey {
-			return inc.ID, inc.Status, false, nil
-		}
-	}
-	for _, inc := range payload.Incidents {
-		if inc.Drill {
-			return inc.ID, inc.Status, true, nil
-		}
-	}
-	return "", "", false, nil
-}
-
-// capHintKind steers the capped-finding hint's first remedy: the honest fix
-// differs between "the deploy was never attempted" (ingress disabled), "it
-// was attempted and rejected" (token problem), and "evidence sources are the
-// remedy" (probe).
-type capHintKind int
-
-const (
-	capHintNone capHintKind = iota
-	capHintProbe
-	capHintEnableChanges
-	capHintChangeRejected
-)
-
-// fetchAndPrintIncident is the payoff: one alertint_get_incident call printed
-// as a console finding card. strict makes fetch errors fatal (--result mode:
-// a wrong incident id must not exit 0 while advising to re-run itself).
-func (d *drillCmd) fetchAndPrintIncident(ctx context.Context, client *mcpOneShotClient, incidentID string, capHint capHintKind, strict bool) error {
-	raw, err := client.callTool(ctx, "alertint_get_incident", map[string]any{"incident_id": incidentID})
-	if err != nil {
-		if strict {
-			return fmt.Errorf("drill: fetch incident %s: %w", incidentID, err)
-		}
-		d.printf("warning: could not fetch incident %s: %v", incidentID, err)
-		d.printNotReady(incidentID, "unknown")
-		return nil
-	}
-	var inc struct {
-		ID         string  `json:"id"`
-		Status     string  `json:"status"`
-		Confidence float64 `json:"confidence"`
-		Finding    struct {
-			AnalysisName        string   `json:"analysis_name"`
-			OverallIssue        string   `json:"overall_issue"`
-			CorrelationFindings []string `json:"correlation_findings"`
-			Severity            string   `json:"severity"`
-		} `json:"finding"`
-		Alerts []struct {
-			Labels map[string]string `json:"labels"`
-		} `json:"alerts"`
-	}
-	if err := json.Unmarshal(raw, &inc); err != nil {
-		return fmt.Errorf("drill: decode incident: %w", err)
-	}
-	if inc.Status != "analyzed" {
-		d.printNotReady(inc.ID, inc.Status)
-		return nil
-	}
-
-	drill := false
-	for _, a := range inc.Alerts {
-		if a.Labels[store.DrillMarkerLabel] == store.DrillMarkerValue {
-			drill = true
-			break
-		}
-	}
-
+// printSituationPayoff prints the Situation as the payoff: handle,
+// lifecycle/Attention, the operator contract, and the notification outcome,
+// then — independently, never gating the payoff above — each member
+// Incident's L1 acute-analysis gate state.
+func (d *drillCmd) printSituationPayoff(snap situationSnapshot) {
 	d.printf("")
 	d.printPhase("finding")
-	if drill {
-		d.printf("%s", d.style("1;35", fmt.Sprintf("🧪 DRILL — synthetic incident (%s=%s)", store.DrillMarkerLabel, store.DrillMarkerValue)))
+	if snap.Drill {
+		d.printf("%s", d.style("1;35", fmt.Sprintf("🧪 DRILL — synthetic Situation (%s=%s)", store.DrillMarkerLabel, store.DrillMarkerValue)))
 	}
-	// LLM-derived text (and, via --result, text from ANY incident) prints to
-	// the operator's terminal — strip control characters so annotation or
-	// model output cannot smuggle escape sequences.
-	d.printf("%s", d.style("1", sanitizeTerm(inc.Finding.AnalysisName)))
-	d.printf("%s", sanitizeTerm(inc.Finding.OverallIssue))
-	for _, cf := range inc.Finding.CorrelationFindings {
-		d.printf("  • %s", sanitizeTerm(cf))
+	if snap.TerminalBanner != "" {
+		d.printf("%s", d.style("1;33", sanitizeTerm(snap.TerminalBanner)))
 	}
-	d.printf("%s", d.style("1;33", fmt.Sprintf("severity: %s · confidence: %.0f%%", sanitizeTerm(inc.Finding.Severity), inc.Confidence*100)))
-	d.printCappedHint(inc.Confidence, capHint)
-	if d.cfg.Notify.Slack.Enabled {
-		d.printf("%s", d.style("36", "slack: the DRILL card is in "+d.cfg.Notify.Slack.Channel))
+	handle := "(not yet published — Situation is still silent)"
+	if snap.PublicHandle != "" {
+		handle = snap.PublicHandle
+	}
+	d.printf("%s", d.style("1", "handle: "+sanitizeTerm(handle)))
+	d.printf("lifecycle: %s · attention: %s", snap.Lifecycle, snap.Attention)
+	d.printf("%s", d.style("2", operatorContractLine(snap)))
+	d.printf("%s", notificationOutcomeLine(snap))
+	if len(snap.Incidents) == 0 {
+		d.printf("L1 gate: no member incidents yet")
+	} else {
+		d.printf("L1 gate (evidence, independent of the Situation payoff above):")
+		for _, m := range snap.Incidents {
+			line := fmt.Sprintf("  • %s: %s", m.ID, m.AcuteFindingStatus)
+			if m.AcuteFindingReason != "" {
+				line += " (" + sanitizeTerm(m.AcuteFindingReason) + ")"
+			}
+			d.printf("%s", line)
+		}
+	}
+	if d.cfg.Notify.Slack.Enabled && snap.PublicHandle != "" {
+		d.printf("%s", d.style("36", "slack: the Situation card is in "+d.cfg.Notify.Slack.Channel))
 	}
 	d.printf("")
 	d.printPhase("investigate")
 	d.printf("in your MCP-connected agent, run:")
-	d.printf("%s", d.style("1;34", fmt.Sprintf("  investigate incident %s using alertint", inc.ID)))
-	return nil
+	d.printf("%s", d.style("1;34", "  investigate situation "+sanitizeTerm(situationTarget(snap))+" using alertint"))
 }
 
-// printCappedHint explains the metadata-only confidence cap and the cheapest
-// way to lift it. The Prometheus promise is scoped to REAL incidents: drill
-// labels are fictional, so a Prometheus-connected drill re-run stays capped.
-func (d *drillCmd) printCappedHint(confidence float64, kind capHintKind) {
-	if kind == capHintNone || math.Abs(confidence-acutetriage.MaxMetadataOnlyConfidence) > 1e-9 {
-		return
+// situationTarget picks the identifier to hand to an operator or agent: the
+// public handle once published, the raw id while still silent.
+func situationTarget(snap situationSnapshot) string {
+	if snap.PublicHandle != "" {
+		return snap.PublicHandle
 	}
-	d.printf("")
-	d.printf("this finding is capped at %.0f%%: the triage saw only alert metadata, no live evidence.", acutetriage.MaxMetadataOnlyConfidence*100)
-	switch kind {
-	case capHintEnableChanges:
-		d.printf("cheapest lift: enable changes.ingress (see the note above) and re-run — the planted")
-		d.printf("deploy counts as live evidence and produces the causal, uncapped drill finding.")
-		return
-	case capHintChangeRejected:
-		d.printf("cheapest lift: the planted deploy was rejected at the change webhook (see the warning")
-		d.printf("above — check the token env var), so the causal evidence never landed; fix and re-run.")
-		return
-	case capHintNone, capHintProbe:
-		// fall through to the probe wording below
-	}
-	scheme, host := d.probeBase()
-	if d.probePrometheus(scheme, host) {
-		d.printf("for real incidents, connect Prometheus (something is answering on %s:9090 — you", host)
-		d.printf("almost certainly run it next to Alertmanager): https://alertint.com/docs/integrations/prometheus")
-	} else {
-		d.printf("for real incidents, connect an evidence source (Prometheus first if you have it):")
-		d.printf("https://alertint.com/docs/integrations/prometheus — or get in touch and we'll add your stack.")
-	}
-	d.printf("note: drill alerts carry fictional labels, so enrichment sources cannot uncap a drill re-run")
-	d.printf("      (an operator correction verified by the steering round is the one exception).")
+	return snap.ID
 }
 
-func (d *drillCmd) printNotReady(incidentID, state string) {
-	d.printf("")
-	d.printf("incident %s is not analyzed yet (state: %s).", incidentID, state)
-	d.printf("re-check with:")
-	d.printf("  alertint drill --config %s%s --result %s", d.opts.cfgPath, d.targetFlagSuffix(), incidentID)
+// operatorContractLine renders the Situation's current action contract —
+// who acts next and why — from its current Assessment.
+func operatorContractLine(snap situationSnapshot) string {
+	parts := []string{"next_actor=" + orDefault(snap.NextActor, "unknown"), "action_status=" + orDefault(snap.ActionStatus, "unknown")}
+	if snap.OperatorActionRequired != "" {
+		parts = append(parts, "operator_action_required="+sanitizeTerm(snap.OperatorActionRequired))
+	}
+	if snap.OperatorJudgmentRequested != "" {
+		parts = append(parts, "operator_judgment_requested="+sanitizeTerm(snap.OperatorJudgmentRequested))
+	}
+	if snap.WaitReason != "" {
+		parts = append(parts, "wait_reason="+sanitizeTerm(snap.WaitReason))
+	}
+	return "operator contract: " + strings.Join(parts, " · ")
+}
+
+// notificationOutcomeLine summarizes the Situation's most recent
+// main-channel-poke notification. No such notification is not a failure —
+// it is the controller honestly reporting a silent, non-critical Situation.
+func notificationOutcomeLine(snap situationSnapshot) string {
+	var last *situationNotificationRow
+	for i := range snap.Notifications {
+		if snap.Notifications[i].MainChannelPoke {
+			last = &snap.Notifications[i]
+		}
+	}
+	if last == nil {
+		return "notification: Situation created; controller kept Slack quiet"
+	}
+	switch last.Status {
+	case "delivered":
+		return fmt.Sprintf("notification: published to Slack (%s)", last.Kind)
+	case "withheld_by_operator_slack_floor":
+		return fmt.Sprintf("notification: withheld by the operator Slack floor (%s)", last.Kind)
+	case "pending":
+		return fmt.Sprintf("notification: queued for delivery (%s)", last.Kind)
+	case "failed":
+		return fmt.Sprintf("notification: delivery failed (%s) — check serve logs", last.Kind)
+	default:
+		return fmt.Sprintf("notification: %s (%s)", last.Status, last.Kind)
+	}
+}
+
+// looksLikeDrillGroupKey reports whether a group key's salted label carries
+// the canned drill prefix — the drift-fallback's safety net when no exact
+// key match exists, without needing a Drill boolean on the Situation list
+// row (that view carries none; only alertint_situation_get does).
+func looksLikeDrillGroupKey(gk string, groupLabels []string) bool {
+	labels := parseGroupKey(gk)
+	saltedKey := firstGroupLabel(effectiveDrillGroupLabels(groupLabels))
+	if saltedKey == "" {
+		return false
+	}
+	v, ok := labels[saltedKey]
+	return ok && strings.HasPrefix(v, cannedGroupValue(saltedKey)+"-")
+}
+
+func (d *drillCmd) printDrift(groupKey string) {
+	d.printf("note: no Situation matched group %s — the target's group_labels likely differ", groupKey)
+	d.printf("      from this config file (config drift). Showing the newest drill Situation instead.")
 }
 
 func (d *drillCmd) printSlackFallback(groupKey string) {
 	if d.cfg.Notify.Slack.Enabled {
-		d.printf("check Slack channel %s for the DRILL card (group %s).", d.cfg.Notify.Slack.Channel, groupKey)
+		d.printf("check Slack channel %s for the Situation card (group %s).", d.cfg.Notify.Slack.Channel, groupKey)
 	} else {
-		d.printf("check the `finding` summary line in serve logs (group %s).", groupKey)
+		d.printf("check the Situation stdout line in serve logs (group %s).", groupKey)
 	}
+}
+
+func stringOrEmpty(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }
 
 // ---------------------------------------------------------------------------
@@ -711,9 +894,8 @@ func (d *drillCmd) receiverBase() (string, error) {
 	return "http://127.0.0.1:" + port, nil
 }
 
-// targetSchemeHost resolves the scheme/host every derived endpoint (MCP,
-// Prometheus probe) shares with the fire target: --target's when set,
-// loopback otherwise.
+// targetSchemeHost resolves the scheme/host every derived endpoint (MCP)
+// shares with the fire target: --target's when set, loopback otherwise.
 func (d *drillCmd) targetSchemeHost() (scheme, host string) {
 	scheme, host = "http", "127.0.0.1"
 	if d.opts.target != "" {
@@ -789,11 +971,6 @@ func (d *drillCmd) targetFlagSuffix() string {
 		return ""
 	}
 	return " --target " + d.opts.target
-}
-
-// probeBase picks where the Prometheus heuristic probe points.
-func (d *drillCmd) probeBase() (scheme, host string) {
-	return d.targetSchemeHost()
 }
 
 // ---------------------------------------------------------------------------
@@ -970,15 +1147,4 @@ func stdinPause(stderr io.Writer) func(string) error {
 		_, err := readPromptLine(stderr, prompt)
 		return err
 	}
-}
-
-// probePrometheusDefault answers the ":9090 heuristic" with a short GET.
-func probePrometheusDefault(scheme, host string) bool {
-	client := &http.Client{Timeout: 1500 * time.Millisecond}
-	resp, err := client.Get(fmt.Sprintf("%s://%s:9090/-/ready", scheme, host)) //nolint:noctx // one-shot CLI probe, hard 1.5s client timeout
-	if err != nil {
-		return false
-	}
-	_ = resp.Body.Close()
-	return resp.StatusCode < 500
 }

@@ -222,7 +222,11 @@ var cannedGroupValues = map[string]string{
 // exactly, and the rerun-collapse matcher can tell scenarios apart — a storm
 // rerun must never land on a flagship incident), fingerprints are run-scoped
 // deterministic hashes, and every alert carries the reserved drill marker
-// (ADR-0013).
+// (ADR-0013). That marker is presentation-only: it carries through the
+// Incident into Situation MCP, stdout, and Slack root/thread rendering, but
+// grants no Attention or publication authority — the flagship and
+// db-outage scenarios keep their deterministic critical anchors precisely so
+// the marker alone is never what makes them page.
 func materializeScenario(sc drillScenario, groupLabelKeys []string, groupSalt, fpSeed string, now time.Time) (drillRun, error) {
 	if len(sc.alerts) == 0 || len(sc.alerts) > maxDrillAlerts {
 		return drillRun{}, fmt.Errorf("drill: scenario %s has %d alerts, want 1..%d (max-fire cap)", sc.key, len(sc.alerts), maxDrillAlerts)

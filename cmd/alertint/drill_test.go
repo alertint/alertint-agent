@@ -22,17 +22,26 @@ import (
 
 // fakeInstance emulates a running AlertINT: the two webhook receivers and a
 // streamable-HTTP MCP endpoint (initialize + tools/call, format-only session
-// check — the contract verified against mcp-go v0.54.1).
+// check — the contract verified against mcp-go v0.54.1) serving the two
+// Situation read tools the drill consumes.
 type fakeInstance struct {
 	mu           sync.Mutex
 	changeBodies [][]byte
 	alertBodies  [][]byte
 	authSeen     []string
 
-	listRows      []map[string]any
-	listRowsSeq   [][]map[string]any // consumed first, one per list call
-	incident      map[string]any
-	getIncidentID []string
+	listRows    []map[string]any   // alertint_situation_list rows
+	listRowsSeq [][]map[string]any // consumed first, one per list call
+
+	situation      map[string]any // fallback single alertint_situation_get fixture
+	situationSeq   [][]byte       // FIFO of raw alertint_situation_get responses; consumed before the fallback
+	getSituationID []string       // every id/handle alertint_situation_get was called with
+
+	// situationID/groupKey/situationHandle: the fixed identity queueSituation
+	// builds its canned responses around.
+	situationID     string
+	groupKey        string
+	situationHandle string
 
 	receiver *httptest.Server
 	mcp      *httptest.Server
@@ -81,17 +90,27 @@ func newFakeInstance(t *testing.T) *fakeInstance {
 			f.mu.Lock()
 			var payload any
 			switch req.Params.Name {
-			case "alertint_list_incidents":
+			case "alertint_situation_list":
 				if len(f.listRowsSeq) > 0 {
-					payload = map[string]any{"incidents": f.listRowsSeq[0]}
+					payload = map[string]any{"situations": f.listRowsSeq[0]}
 					f.listRowsSeq = f.listRowsSeq[1:]
 				} else {
-					payload = map[string]any{"incidents": f.listRows}
+					payload = map[string]any{"situations": f.listRows}
 				}
-			case "alertint_get_incident":
-				id, _ := req.Params.Arguments["incident_id"].(string)
-				f.getIncidentID = append(f.getIncidentID, id)
-				payload = f.incident
+			case "alertint_situation_get":
+				id, _ := req.Params.Arguments["situation"].(string)
+				f.getSituationID = append(f.getSituationID, id)
+				if len(f.situationSeq) > 0 {
+					var raw json.RawMessage = f.situationSeq[0]
+					f.situationSeq = f.situationSeq[1:]
+					f.mu.Unlock()
+					writeRPC(w, req.ID, map[string]any{
+						"content": []map[string]any{{"type": "text", "text": string(raw)}},
+						"isError": false,
+					})
+					return
+				}
+				payload = f.situation
 			}
 			f.mu.Unlock()
 			text, _ := json.Marshal(payload)
@@ -114,6 +133,31 @@ func (f *fakeInstance) record(r *http.Request, into *[][]byte) {
 	defer f.mu.Unlock()
 	*into = append(*into, buf.Bytes())
 	f.authSeen = append(f.authSeen, r.Header.Get("Authorization"))
+}
+
+// queueSituation appends one canned alertint_situation_get response — built
+// around the fake's fixed situationID/groupKey/situationHandle — to the FIFO
+// consumed by the next alertint_situation_get call. actionStatus is the
+// current Assessment's action_contract.action_status (e.g. "planned",
+// "running", "complete").
+func (f *fakeInstance) queueSituation(lifecycle, actionStatus string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	body := map[string]any{
+		"id": f.situationID, "group_key": f.groupKey, "public_handle": f.situationHandle,
+		"lifecycle": lifecycle, "attention": "investigate", "drill": true,
+		"incidents": []map[string]any{{"id": f.situationID + "-inc-1", "acute_finding_status": "complete"}},
+		"current_assessment": map[string]any{
+			"action_contract": map[string]any{"next_actor": "alertint", "action_status": actionStatus},
+		},
+		"notifications":   []map[string]any{{"kind": "situation_root_create", "main_channel_poke": true, "status": "delivered"}},
+		"terminal_banner": "",
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		panic(err)
+	}
+	f.situationSeq = append(f.situationSeq, raw)
 }
 
 func writeRPC(w http.ResponseWriter, id int, result any) {
@@ -147,10 +191,9 @@ func drillTestCmd(t *testing.T, f *fakeInstance, cfg *config.Config, opts drillO
 			t.Fatal("confirm must not fire for loopback targets")
 			return false, nil
 		},
-		pause:           func(string) error { return nil },
-		newRunID:        func() string { return "t3st01" },
-		grace:           time.Second,
-		probePrometheus: func(string, string) bool { return false },
+		pause:    func(string) error { return nil },
+		newRunID: func() string { return "t3st01" },
+		grace:    time.Second,
 	}
 	return d, &out
 }
@@ -173,32 +216,84 @@ func drillTestConfig(t *testing.T) *config.Config {
 	return &cfg
 }
 
-func analyzedIncident(id string) map[string]any {
+// flagshipGroupKey is the exact group key materializeScenario produces for
+// the "flagship" scenario with the newRunID stub ("t3st01") and the default
+// Receiver-mode group labels.
+const flagshipGroupKey = "cluster=drill-cluster-flagship-t3st01,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
+
+// situationFixture builds one alertint_situation_get payload for the given
+// id/group key/lifecycle, with a published handle and one complete member
+// Incident — the shared shape most tests need.
+func situationFixture(id, groupKey, lifecycle string) map[string]any {
 	return map[string]any{
-		"id": id, "status": "analyzed", "confidence": 0.9,
-		"finding": map[string]any{
-			"analysis_name":        "Drill checkout regression",
-			"overall_issue":        "The v2.3.1 deploy broke the payment handler",
-			"correlation_findings": []string{"burst started minutes after the deploy"},
-			"severity":             "high",
+		"id": id, "group_key": groupKey, "public_handle": id + "-handle",
+		"lifecycle": lifecycle, "attention": "investigate", "drill": true,
+		"incidents": []map[string]any{{"id": id + "-inc-1", "acute_finding_status": "complete"}},
+		"current_assessment": map[string]any{
+			"action_contract": map[string]any{"next_actor": "alertint", "action_status": "running"},
 		},
-		"alerts": []map[string]any{{"labels": map[string]string{"alertint_drill": "true"}}},
+		"notifications":   []map[string]any{{"kind": "situation_root_create", "main_channel_poke": true, "status": "delivered"}},
+		"terminal_banner": "",
 	}
 }
 
-// TestDrill_HappyPath: change then burst then one-shot fetch; the console
-// carries the finding and the full-id CTA.
+// drillHarness wraps a drillCmd wired to a fakeInstance with a fixed drill
+// identity, for tests that drive the Situation lifecycle over a sequence of
+// alertint_situation_get responses (queueSituation).
+type drillHarness struct {
+	cmd *drillCmd
+	mcp *fakeInstance
+	out *bytes.Buffer
+}
+
+func newDrillHarness(t *testing.T) *drillHarness {
+	t.Helper()
+	f := newFakeInstance(t)
+	f.situationID = "sit-1"
+	f.situationHandle = "drill-checkout-high-error-rate"
+	f.groupKey = flagshipGroupKey
+	// A row with an unset (zero-time) UpdatedAt is naturally outside the
+	// rerun-candidate collapse window, so the pre-fire scan mints a fresh
+	// salt matching flagshipGroupKey exactly — the same convention every
+	// other test in this file relies on.
+	f.listRows = []map[string]any{{"id": f.situationID, "group_key": f.groupKey}}
+	cfg := drillTestConfig(t)
+	cmd, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship", resolve: true})
+	return &drillHarness{cmd: cmd, mcp: f, out: out}
+}
+
+func (h *drillHarness) run(ctx context.Context) error { return h.cmd.run(ctx) }
+func (h *drillHarness) output() string                { return h.out.String() }
+
+// TestDrillResolveWaitsThroughRecoveryPending: the brief's canonical example
+// — --resolve watches the Situation move active -> recovery_pending ->
+// recovered, reporting each stage rather than only the terminal outcome.
+func TestDrillResolveWaitsThroughRecoveryPending(t *testing.T) {
+	d := newDrillHarness(t)
+	d.mcp.queueSituation("active", "planned")
+	d.mcp.queueSituation("recovery_pending", "complete")
+	d.mcp.queueSituation("recovered", "complete")
+	if err := d.run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	out := d.output()
+	if !strings.Contains(out, "recovery pending") || !strings.Contains(out, "recovered") {
+		t.Fatalf("output=%s", out)
+	}
+}
+
+// TestDrill_HappyPath: change then burst then poll; the console carries the
+// Situation payoff and the investigate CTA.
 func TestDrill_HappyPath(t *testing.T) {
 	f := newFakeInstance(t)
 	cfg := drillTestConfig(t)
 	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
 
-	groupKey := "cluster=drill-cluster-flagship-t3st01,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
 	f.listRows = []map[string]any{
-		{"id": "other", "group_key": "x=y", "status": "analyzed"},
-		{"id": "inc-42", "group_key": groupKey, "status": "analyzed"},
+		{"id": "other", "group_key": "x=y"},
+		{"id": "sit-42", "group_key": flagshipGroupKey},
 	}
-	f.incident = analyzedIncident("inc-42")
+	f.situation = situationFixture("sit-42", flagshipGroupKey, "active")
 
 	if err := d.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
@@ -239,16 +334,16 @@ func TestDrill_HappyPath(t *testing.T) {
 		last = at
 	}
 	for _, want := range []string{
-		"Drill checkout regression",
-		"investigate incident inc-42 using alertint",
+		"handle: sit-42-handle",
+		"lifecycle: active",
+		"investigate situation sit-42-handle using alertint",
 		"DRILL",
+		"L1 gate",
+		"sit-42-inc-1: complete",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("stdout missing %q:\n%s", want, s)
 		}
-	}
-	if strings.Contains(s, "capped at 60%") {
-		t.Errorf("uncapped finding must not print the cap hint:\n%s", s)
 	}
 	if strings.Contains(s, "\x1b[") {
 		t.Errorf("captured output must stay plain in automatic color mode:\n%q", s)
@@ -263,9 +358,8 @@ func TestDrill_ColorPresentation(t *testing.T) {
 	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
 	d.color = true
 
-	groupKey := "cluster=drill-cluster-flagship-t3st01,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
-	f.listRows = []map[string]any{{"id": "inc-color", "group_key": groupKey, "status": "analyzed"}}
-	f.incident = analyzedIncident("inc-color")
+	f.listRows = []map[string]any{{"id": "sit-color", "group_key": flagshipGroupKey}}
+	f.situation = situationFixture("sit-color", flagshipGroupKey, "active")
 
 	if err := d.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
@@ -277,8 +371,8 @@ func TestDrill_ColorPresentation(t *testing.T) {
 		"\x1b[1;32m── finding",
 		"\x1b[1;34m── investigate",
 		"\x1b[1;35m🧪 DRILL",
-		"\x1b[1mDrill checkout regression",
-		"\x1b[1;34m  investigate incident inc-color using alertint",
+		"\x1b[1mhandle: sit-color-handle",
+		"\x1b[1;34m  investigate situation sit-color-handle using alertint",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("colored stdout missing %q:\n%q", want, s)
@@ -314,8 +408,8 @@ func TestDrill_ColorMode(t *testing.T) {
 	}
 }
 
-// TestDrill_ChangesDisabled: no change POST, enable lines printed, burst still
-// fired, and the capped hint names enabling change ingress as first remedy.
+// TestDrill_ChangesDisabled: no change POST, enable lines printed, burst
+// still fired.
 func TestDrill_ChangesDisabled(t *testing.T) {
 	f := newFakeInstance(t)
 	cfg := drillTestConfig(t)
@@ -323,11 +417,8 @@ func TestDrill_ChangesDisabled(t *testing.T) {
 	cfg.Changes.Ingress.WebhookTokenEnv = "" // realistic: disabled feature, no env named
 	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
 
-	groupKey := "cluster=drill-cluster-flagship-t3st01,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
-	f.listRows = []map[string]any{{"id": "inc-7", "group_key": groupKey, "status": "analyzed"}}
-	capped := analyzedIncident("inc-7")
-	capped["confidence"] = 0.6
-	f.incident = capped
+	f.listRows = []map[string]any{{"id": "sit-7", "group_key": flagshipGroupKey}}
+	f.situation = situationFixture("sit-7", flagshipGroupKey, "active")
 
 	if err := d.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
@@ -342,8 +433,6 @@ func TestDrill_ChangesDisabled(t *testing.T) {
 	for _, want := range []string{
 		"changes.ingress is disabled",
 		"webhook_token_env: ALERTINT_CHANGES_WEBHOOK_TOKEN",
-		"capped at 60%",
-		"enable changes.ingress",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("stdout missing %q:\n%s", want, s)
@@ -351,8 +440,8 @@ func TestDrill_ChangesDisabled(t *testing.T) {
 	}
 }
 
-// TestDrill_MCPDisabled: fires, prints enable lines and the serve-log pointer,
-// never touches MCP, exits 0.
+// TestDrill_MCPDisabled: fires, prints enable lines and the serve-log
+// pointer, never touches MCP, exits 0.
 func TestDrill_MCPDisabled(t *testing.T) {
 	f := newFakeInstance(t)
 	cfg := drillTestConfig(t)
@@ -367,7 +456,7 @@ func TestDrill_MCPDisabled(t *testing.T) {
 		t.Errorf("burst not fired")
 	}
 	s := out.String()
-	for _, want := range []string{"mcp is disabled", "mcp.enabled is false in cfg.yaml", "`finding` summary line in serve logs"} {
+	for _, want := range []string{"mcp is disabled", "mcp.enabled is false in cfg.yaml", "Situation stdout line in serve logs"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("stdout missing %q:\n%s", want, s)
 		}
@@ -394,33 +483,43 @@ func TestDrill_MCPOffByAbsence(t *testing.T) {
 	}
 }
 
-// TestDrill_NotAnalyzedYet: a slow triage prints id, state, and the exact
-// --result re-check command — never empty-handed, exit 0.
-func TestDrill_NotAnalyzedYet(t *testing.T) {
+// TestDrill_SilentNonCriticalStorm: a Situation with no delivered
+// main-channel-poke notification reports the controller correctly kept
+// Slack quiet — silence is not treated as failure.
+func TestDrill_SilentNonCriticalStorm(t *testing.T) {
 	f := newFakeInstance(t)
 	cfg := drillTestConfig(t)
-	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
+	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "storm"})
 
-	groupKey := "cluster=drill-cluster-flagship-t3st01,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
-	f.listRows = []map[string]any{{"id": "inc-9", "group_key": groupKey, "status": "processing"}}
+	stormGroupKey := "cluster=drill-cluster-storm-t3st01,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
+	f.listRows = []map[string]any{{"id": "sit-storm", "group_key": stormGroupKey}}
+	f.situation = map[string]any{
+		"id": "sit-storm", "group_key": stormGroupKey, "public_handle": nil,
+		"lifecycle": "active", "attention": "observe", "drill": true,
+		"incidents":          []map[string]any{{"id": "inc-storm-1", "acute_finding_status": "not_requested"}},
+		"current_assessment": map[string]any{"action_contract": map[string]any{"next_actor": "alertint", "action_status": "waiting"}},
+		"notifications":      []map[string]any{},
+		"terminal_banner":    "",
+	}
 
 	if err := d.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	s := out.String()
-	for _, want := range []string{"state: processing", "--result inc-9"} {
-		if !strings.Contains(s, want) {
-			t.Errorf("stdout missing %q:\n%s", want, s)
-		}
+	if !strings.Contains(s, "Situation created; controller kept Slack quiet") {
+		t.Errorf("stdout missing the quiet-controller note:\n%s", s)
+	}
+	if !strings.Contains(s, "not yet published") {
+		t.Errorf("stdout missing the still-silent handle note:\n%s", s)
 	}
 }
 
-// TestDrill_ResultMode: --result fetches exactly one incident, list-free.
+// TestDrill_ResultMode: --result fetches exactly one Situation, list-free.
 func TestDrill_ResultMode(t *testing.T) {
 	f := newFakeInstance(t)
 	cfg := drillTestConfig(t)
-	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", result: "inc-42"})
-	f.incident = analyzedIncident("inc-42")
+	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", result: "sit-42"})
+	f.situation = situationFixture("sit-42", flagshipGroupKey, "active")
 
 	if err := d.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
@@ -428,10 +527,10 @@ func TestDrill_ResultMode(t *testing.T) {
 	if len(f.alertBodies)+len(f.changeBodies) != 0 {
 		t.Error("--result must not fire anything")
 	}
-	if len(f.getIncidentID) != 1 || f.getIncidentID[0] != "inc-42" {
-		t.Errorf("get_incident calls = %v, want exactly [inc-42]", f.getIncidentID)
+	if len(f.getSituationID) != 1 || f.getSituationID[0] != "sit-42" {
+		t.Errorf("get calls = %v, want exactly [sit-42]", f.getSituationID)
 	}
-	if !strings.Contains(out.String(), "investigate incident inc-42 using alertint") {
+	if !strings.Contains(out.String(), "investigate situation sit-42-handle using alertint") {
 		t.Errorf("stdout missing CTA:\n%s", out.String())
 	}
 }
@@ -580,7 +679,7 @@ func TestDrill_UnknownScenario(t *testing.T) {
 // so a plain-HTTP remote target needs the explicit override too.
 func TestDrill_ResultModeInsecureRemote(t *testing.T) {
 	cfg := drillTestConfig(t)
-	d, _ := drillTestCmd(t, nil, cfg, drillOpts{cfgPath: "cfg.yaml", result: "inc-1", target: "http://alertint.example:9911"})
+	d, _ := drillTestCmd(t, nil, cfg, drillOpts{cfgPath: "cfg.yaml", result: "sit-1", target: "http://alertint.example:9911"})
 	err := d.run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "--allow-insecure-http") {
 		t.Fatalf("run = %v, want insecure-http refusal before any token is sent", err)
@@ -647,8 +746,8 @@ func TestDrill_MCPMisconfigPreflight(t *testing.T) {
 	}
 }
 
-// TestDrill_ChangePostRejected: an attempted-but-rejected planted deploy warns
-// with the token hint and steers the capped hint to the rejected wording.
+// TestDrill_ChangePostRejected: an attempted-but-rejected planted deploy
+// warns with the token hint.
 func TestDrill_ChangePostRejected(t *testing.T) {
 	cfg := drillTestConfig(t)
 	f := newFakeInstance(t)
@@ -664,57 +763,52 @@ func TestDrill_ChangePostRejected(t *testing.T) {
 	t.Cleanup(rejecting.Close)
 
 	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship", target: rejecting.URL})
-	groupKey := "cluster=drill-cluster-flagship-t3st01,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
-	f.listRows = []map[string]any{{"id": "inc-8", "group_key": groupKey, "status": "analyzed"}}
-	capped := analyzedIncident("inc-8")
-	capped["confidence"] = 0.6
-	f.incident = capped
+	f.listRows = []map[string]any{{"id": "sit-8", "group_key": flagshipGroupKey}}
+	f.situation = situationFixture("sit-8", flagshipGroupKey, "active")
 
 	if err := d.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	s := out.String()
-	for _, want := range []string{"change event not accepted", "check the DEMO_TEST_CH env var", "rejected at the change webhook"} {
+	for _, want := range []string{"change event not accepted", "check the DEMO_TEST_CH env var"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("stdout missing %q:\n%s", want, s)
 		}
 	}
-	if strings.Contains(s, "enable changes.ingress") {
-		t.Errorf("rejected-POST run must not advise enabling already-enabled ingress:\n%s", s)
-	}
 }
 
-// TestDrill_DriftFallback: when no incident matches the locally-computed group
-// key, the newest drill incident is used with a config-drift caveat.
+// TestDrill_DriftFallback: when no Situation matches the locally-computed
+// group key, the newest situation whose group key still looks like a drill's
+// is used with a config-drift caveat.
 func TestDrill_DriftFallback(t *testing.T) {
 	f := newFakeInstance(t)
 	cfg := drillTestConfig(t)
 	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
 
 	f.listRows = []map[string]any{
-		{"id": "real-1", "group_key": "service=checkout", "status": "analyzed", "drill": false},
-		{"id": "drill-9", "group_key": "team=drill-team-x", "status": "analyzed", "drill": true},
+		{"id": "real-1", "group_key": "service=checkout"},
+		{"id": "drill-9", "group_key": "cluster=drill-cluster-flagship-driftedsalt,namespace=drill-shop,service=drill-checkout"},
 	}
-	f.incident = analyzedIncident("drill-9")
+	f.situation = situationFixture("drill-9", "cluster=drill-cluster-flagship-driftedsalt,namespace=drill-shop,service=drill-checkout", "active")
 
 	if err := d.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	s := out.String()
-	if !strings.Contains(s, "config drift") || !strings.Contains(s, "investigate incident drill-9 using alertint") {
+	if !strings.Contains(s, "config drift") || !strings.Contains(s, "investigate situation drill-9-handle using alertint") {
 		t.Errorf("drift fallback missing:\n%s", s)
 	}
 }
 
-// TestDrill_ResultUnknownIncident: --result with a bad id must error (exit 1),
-// not print a hint recommending the same doomed command.
-func TestDrill_ResultUnknownIncident(t *testing.T) {
+// TestDrill_ResultUnknownSituation: --result with a bad id must error
+// (exit 1).
+func TestDrill_ResultUnknownSituation(t *testing.T) {
 	f := newFakeInstance(t)
 	cfg := drillTestConfig(t)
 	f.mcp.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Mcp-Session-Id", "mcp-session-x")
-		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"incident \"nope\" not found"}]}}`))
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"situation \"nope\" not found"}]}}`))
 	})
 	d, _ := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", result: "nope"})
 	err := d.run(context.Background())
@@ -723,53 +817,15 @@ func TestDrill_ResultUnknownIncident(t *testing.T) {
 	}
 }
 
-// TestDrill_CappedHintProbeWording: with change ingress on and fired, the
-// Prometheus probe steers the wording between detected and docs-link
-// variants; both stay scoped to real incidents.
-func TestDrill_CappedHintProbeWording(t *testing.T) {
-	for name, probe := range map[string]bool{"probe hit": true, "probe miss": false} {
-		t.Run(name, func(t *testing.T) {
-			f := newFakeInstance(t)
-			cfg := drillTestConfig(t)
-			d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
-			d.probePrometheus = func(string, string) bool { return probe }
-
-			groupKey := "cluster=drill-cluster-flagship-t3st01,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
-			f.listRows = []map[string]any{{"id": "inc-c", "group_key": groupKey, "status": "analyzed"}}
-			capped := analyzedIncident("inc-c")
-			capped["confidence"] = 0.6
-			f.incident = capped
-
-			if err := d.run(context.Background()); err != nil {
-				t.Fatalf("run: %v", err)
-			}
-			s := out.String()
-			if probe && !strings.Contains(s, "something is answering") {
-				t.Errorf("probe-hit wording missing:\n%s", s)
-			}
-			if !probe && !strings.Contains(s, "get in touch") {
-				t.Errorf("probe-miss wording missing:\n%s", s)
-			}
-			if !strings.Contains(s, "cannot uncap a drill re-run") {
-				t.Errorf("real-incident scoping missing:\n%s", s)
-			}
-		})
-	}
-}
-
 // TestDrill_SanitizesFindingText: control characters in MCP-sourced strings
 // never reach the terminal.
 func TestDrill_SanitizesFindingText(t *testing.T) {
 	f := newFakeInstance(t)
 	cfg := drillTestConfig(t)
-	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", result: "inc-evil"})
-	evil := analyzedIncident("inc-evil")
-	finding, ok := evil["finding"].(map[string]any)
-	if !ok {
-		t.Fatal("fixture finding is not a map")
-	}
-	finding["analysis_name"] = "evil\x1b[31mred\x07bell"
-	f.incident = evil
+	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", result: "sit-evil"})
+	evil := situationFixture("sit-evil", flagshipGroupKey, "active")
+	evil["public_handle"] = "evil\x1b[31mred\x07bell"
+	f.situation = evil
 
 	if err := d.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
@@ -811,10 +867,9 @@ func TestDrill_ConfirmErrorPath(t *testing.T) {
 	}
 }
 
-// TestDrill_PollsUntilAnalyzed: with a multi-poll grace, the payoff returns
-// as soon as a poll sees the analyzed state instead of sleeping out the full
-// triage grace.
-func TestDrill_PollsUntilAnalyzed(t *testing.T) {
+// TestDrill_PollsUntilFound: with a multi-poll grace, the payoff returns as
+// soon as a poll finds the Situation instead of sleeping out the full grace.
+func TestDrill_PollsUntilFound(t *testing.T) {
 	f := newFakeInstance(t)
 	cfg := drillTestConfig(t)
 	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
@@ -826,18 +881,18 @@ func TestDrill_PollsUntilAnalyzed(t *testing.T) {
 		return nil
 	}
 
-	groupKey := "cluster=drill-cluster-flagship-t3st01,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
-	pending := []map[string]any{{"id": "inc-7", "group_key": groupKey, "status": "ready"}}
-	// [0] answers the pre-fire rerun scan (no drill candidate → fresh salt); the
-	// next two answer the finding polls.
-	f.listRowsSeq = [][]map[string]any{{}, pending, pending}
-	f.listRows = []map[string]any{{"id": "inc-7", "group_key": groupKey, "status": "analyzed"}}
-	f.incident = analyzedIncident("inc-7")
+	found := []map[string]any{{"id": "sit-7", "group_key": flagshipGroupKey}}
+	// [0] answers the pre-fire rerun scan (no drill candidate → fresh salt);
+	// [1],[2] answer the discovery poll with nothing yet; the fallback (not
+	// consumed by listRowsSeq) then finally returns the row.
+	f.listRowsSeq = [][]map[string]any{{}, {}, {}}
+	f.listRows = found
+	f.situation = situationFixture("sit-7", flagshipGroupKey, "active")
 
 	if err := d.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if !strings.Contains(out.String(), "investigate incident inc-7 using alertint") {
+	if !strings.Contains(out.String(), "investigate situation sit-7-handle using alertint") {
 		t.Errorf("missing finding CTA:\n%s", out.String())
 	}
 	var polls int
@@ -847,26 +902,24 @@ func TestDrill_PollsUntilAnalyzed(t *testing.T) {
 		}
 	}
 	if polls != 2 {
-		t.Errorf("poll sleeps = %d, want 2 (loop must stop as soon as the state is analyzed)", polls)
+		t.Errorf("poll sleeps = %d, want 2 (loop must stop as soon as the Situation is found)", polls)
 	}
 }
 
-// TestDrill_RerunCollapses: a second drill inside the collapse window reuses the
-// prior incident's group salt, so the fire lands as an occurrence — no second
-// triage, no window wait — and the payoff reports "recurred ×2".
+// TestDrill_RerunCollapses: a second drill inside the collapse window reuses
+// the prior (nonterminal) Situation's group salt; the runtime attaches
+// rather than minting a fresh Situation, and the payoff reports the collapse
+// rather than a new linked Situation.
 func TestDrill_RerunCollapses(t *testing.T) {
 	f := newFakeInstance(t)
 	cfg := drillTestConfig(t)
 	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
 
-	groupKey := "cluster=drill-cluster-flagship-priorsalt,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
-	// A prior drill of this scenario, judged, active 5m ago (inside the 30m window).
+	priorGroupKey := "cluster=drill-cluster-flagship-priorsalt,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
 	f.listRows = []map[string]any{{
-		"id": "inc-9", "group_key": groupKey, "status": "analyzed",
-		"drill": true, "last_alert_at": "2026-07-03T11:55:00Z",
+		"id": "sit-9", "group_key": priorGroupKey, "lifecycle": "active", "updated_at": "2026-07-03T11:55:00Z",
 	}}
-	// After the re-fire the incident carries one collapsed occurrence.
-	f.incident = map[string]any{"id": "inc-9", "status": "analyzed", "occurrences": 1}
+	f.situation = situationFixture("sit-9", priorGroupKey, "active")
 
 	if err := d.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
@@ -875,35 +928,68 @@ func TestDrill_RerunCollapses(t *testing.T) {
 	if !strings.Contains(s, "reusing its group key") {
 		t.Errorf("expected a rerun-detected note:\n%s", s)
 	}
-	if !strings.Contains(s, "recurred ×2") {
-		t.Errorf("expected the collapsed payoff recurred ×2:\n%s", s)
+	if !strings.Contains(s, "collapsed: situation") || !strings.Contains(s, "no new Situation minted") {
+		t.Errorf("expected the collapsed payoff:\n%s", s)
 	}
 	if strings.Contains(s, "waiting ~") {
 		t.Errorf("a rerun must skip the correlation-window wait:\n%s", s)
 	}
-	if len(f.getIncidentID) == 0 || f.getIncidentID[len(f.getIncidentID)-1] != "inc-9" {
-		t.Errorf("expected a get_incident poll on inc-9, got %v", f.getIncidentID)
+	if len(f.getSituationID) == 0 || f.getSituationID[len(f.getSituationID)-1] != "sit-9" {
+		t.Errorf("expected a get on sit-9, got %v", f.getSituationID)
+	}
+}
+
+// TestDrill_RerunCreatesLinkedSituation: a rerun whose exact group key was
+// last owned by a terminal (recovered) Situation reuses the salt too, but
+// the runtime mints a fresh Situation linked through previous_situation_id
+// — the drill must report the new link, not a collapse.
+func TestDrill_RerunCreatesLinkedSituation(t *testing.T) {
+	f := newFakeInstance(t)
+	cfg := drillTestConfig(t)
+	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship"})
+
+	priorGroupKey := "cluster=drill-cluster-flagship-priorsalt,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
+	// The pre-fire rerun scan (the first list call) sees the terminal prior;
+	// every list call after that (the post-fire discovery poll, on the same
+	// reused exact group key) sees the fallback — the brand new Situation the
+	// runtime minted because the owner had gone terminal.
+	f.listRowsSeq = [][]map[string]any{
+		{{"id": "sit-old", "group_key": priorGroupKey, "lifecycle": "recovered", "updated_at": "2026-07-03T11:55:00Z"}},
+	}
+	f.listRows = []map[string]any{{"id": "sit-new", "group_key": priorGroupKey}}
+	newSit := situationFixture("sit-new", priorGroupKey, "active")
+	newSit["previous_situation"] = map[string]any{"id": "sit-old", "lifecycle": "recovered"}
+	f.situation = newSit
+
+	if err := d.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	s := out.String()
+	if !strings.Contains(s, "reusing its group key") {
+		t.Errorf("expected a rerun-detected note:\n%s", s)
+	}
+	if !strings.Contains(s, "new linked situation") || !strings.Contains(s, "sit-old") {
+		t.Errorf("expected the new-linked-situation payoff naming the terminal prior:\n%s", s)
+	}
+	if strings.Contains(s, "collapsed:") {
+		t.Errorf("a post-terminal rerun must not be reported as a collapse:\n%s", s)
 	}
 }
 
 // TestDrill_FreshBypassesRerunCollapse: --fresh ignores an eligible prior
 // drill and creates a new group immediately, while preserving the normal
-// correlation and finding flow for the new incident.
+// correlation and finding flow for the new Situation.
 func TestDrill_FreshBypassesRerunCollapse(t *testing.T) {
 	f := newFakeInstance(t)
 	cfg := drillTestConfig(t)
 	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship", fresh: true})
 
 	priorGroupKey := "cluster=drill-cluster-flagship-priorsalt,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
-	newGroupKey := "cluster=drill-cluster-flagship-t3st01,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
 	f.listRows = []map[string]any{
-		{
-			"id": "inc-prior", "group_key": priorGroupKey, "status": "analyzed",
-			"drill": true, "last_alert_at": "2026-07-03T11:55:00Z",
-		},
-		{"id": "inc-fresh", "group_key": newGroupKey, "status": "analyzed"},
+		{"id": "sit-prior", "group_key": priorGroupKey, "lifecycle": "active", "updated_at": "2026-07-03T11:55:00Z"},
+		{"id": "sit-fresh", "group_key": flagshipGroupKey},
 	}
-	f.incident = analyzedIncident("inc-fresh")
+	f.situation = situationFixture("sit-fresh", flagshipGroupKey, "active")
 
 	if err := d.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
@@ -912,13 +998,13 @@ func TestDrill_FreshBypassesRerunCollapse(t *testing.T) {
 	if !strings.Contains(s, "fresh: bypassing prior drill recurrence") {
 		t.Errorf("expected an explicit fresh-mode note:\n%s", s)
 	}
-	if strings.Contains(s, "reusing its group key") || strings.Contains(s, "recurred ×") {
+	if strings.Contains(s, "reusing its group key") || strings.Contains(s, "collapsed:") {
 		t.Errorf("fresh mode must not use the recurrence path:\n%s", s)
 	}
 	if !strings.Contains(s, "waiting ~") {
 		t.Errorf("fresh mode must run a new correlation window:\n%s", s)
 	}
-	if !strings.Contains(s, newGroupKey) || strings.Contains(s, "group: "+priorGroupKey) {
+	if !strings.Contains(s, flagshipGroupKey) || strings.Contains(s, "group: "+priorGroupKey) {
 		t.Errorf("fresh mode must fire the new group key:\n%s", s)
 	}
 }
@@ -931,9 +1017,8 @@ func TestDrill_ResolveFlag(t *testing.T) {
 	cfg := drillTestConfig(t)
 	d, out := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", scenario: "flagship", resolve: true})
 
-	groupKey := "cluster=drill-cluster-flagship-t3st01,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
-	f.listRows = []map[string]any{{"id": "inc-42", "group_key": groupKey, "status": "analyzed"}}
-	f.incident = analyzedIncident("inc-42")
+	f.listRows = []map[string]any{{"id": "sit-42", "group_key": flagshipGroupKey}}
+	f.situation = situationFixture("sit-42", flagshipGroupKey, "active")
 
 	if err := d.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
@@ -989,9 +1074,8 @@ func TestDrill_ResolveWaitFlag(t *testing.T) {
 		return nil
 	}
 
-	groupKey := "cluster=drill-cluster-flagship-t3st01,host=drill-node-01,namespace=drill-shop,service=drill-checkout"
-	f.listRows = []map[string]any{{"id": "inc-42", "group_key": groupKey, "status": "analyzed"}}
-	f.incident = analyzedIncident("inc-42")
+	f.listRows = []map[string]any{{"id": "sit-42", "group_key": flagshipGroupKey}}
+	f.situation = situationFixture("sit-42", flagshipGroupKey, "active")
 
 	if err := d.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
@@ -1019,7 +1103,7 @@ func TestDrill_ResolveWaitRequiresResolve(t *testing.T) {
 func TestDrill_ResolveWithResultRejected(t *testing.T) {
 	f := newFakeInstance(t)
 	cfg := drillTestConfig(t)
-	d, _ := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", result: "inc-1", resolve: true})
+	d, _ := drillTestCmd(t, f, cfg, drillOpts{cfgPath: "cfg.yaml", result: "sit-1", resolve: true})
 	err := d.run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "--resolve applies to a firing run") {
 		t.Fatalf("run = %v, want resolve/result conflict error", err)
