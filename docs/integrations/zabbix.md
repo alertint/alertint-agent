@@ -150,6 +150,12 @@ through and close out the incident.
 | Fingerprint | `event_id` | Namespaced `zabbix:<event_id>`, stable across the `PROBLEM`→`RESOLVED` pair, so the resolution dedups onto the same alert row. |
 | Status | `status` | `PROBLEM` → firing, `RESOLVED` → resolved. |
 | Timestamps | receipt time | `StartsAt`/`EndsAt` are stamped when AlertINT receives the webhook, never parsed from `clock`/`recovery_clock` — those expand in the Zabbix server's own timezone with no UTC offset in the string, which would silently skew timestamps that anchor enrichment windows. The raw `clock`/`recovery_clock` strings still ride along as annotations for reference. |
+| `alertname` label | `trigger_name` | Aligns with Alertmanager's grouping vocabulary. |
+| `host` label | `host` | The technical host name (`{HOST.HOST}`) — the correlator's per-host identity. |
+| `severity` label | `severity` | Verbatim, with a fallback — see below. |
+| `zabbix_trigger_id` label | `trigger_id` | Stable across firing episodes of the same condition — safe for grouping. |
+| tag labels | `tags[]` | Each `{tag: value}` becomes a label, key sanitised to `[a-zA-Z0-9_]`. A tag colliding with a core label name is dropped; the core label wins. |
+| `zabbix_event_id`, `host_visible`, `trigger_name`, `item_key`, `item_value`, `generator_url`, `clock`, `recovery_clock` annotations | as named | Display/debug context, never used for grouping. |
 
 The Situation delivery ledger goes one step further and tracks *why* each
 timestamp is what it is: every delivery carries a `started_at_basis` /
@@ -161,12 +167,6 @@ both the receipt-time `starts_at`/`ends_at` and, when available, the
 distinct `source_started_at`/`source_resolved_at` alongside their basis, so
 an investigating agent can tell a confirmed source-reported time from an
 AlertINT-stamped fallback.
-| `alertname` label | `trigger_name` | Aligns with Alertmanager's grouping vocabulary. |
-| `host` label | `host` | The technical host name (`{HOST.HOST}`) — the correlator's per-host identity. |
-| `severity` label | `severity` | Verbatim, with a fallback — see below. |
-| `zabbix_trigger_id` label | `trigger_id` | Stable across firing episodes of the same condition — safe for grouping. |
-| tag labels | `tags[]` | Each `{tag: value}` becomes a label, key sanitised to `[a-zA-Z0-9_]`. A tag colliding with a core label name is dropped; the core label wins. |
-| `zabbix_event_id`, `host_visible`, `trigger_name`, `item_key`, `item_value`, `generator_url`, `clock`, `recovery_clock` annotations | as named | Display/debug context, never used for grouping. |
 
 ## Severity
 

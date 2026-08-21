@@ -22,9 +22,11 @@ under the [`memory`](../getting-started/configuration.md#memory) config block.
 
 When a firing alert's group key matches an already-analyzed incident and lands
 inside the **collapse horizon**, AlertINT attaches it as an **occurrence** of
-that incident instead of minting a new one and spending another analysis. The
-incident's Slack card edits in place — `recurred ×N · last HH:MM` — and a JSON
-occurrence line is written to stdout. No second LLM call.
+that incident instead of minting a new one and spending another analysis — no
+second LLM call. This is Incident-level bookkeeping; the owning Situation's
+Slack root and thread are what surface it, per the recurrence rules in
+[Slack: Recurrence](../notifications/slack.md#recurrence) — there is no
+separate per-Incident card.
 
 The horizon is two clocks: a sliding attach window (default 30 minutes from the
 last occurrence) and a hard ceiling on the time since the last analysis (default
@@ -83,21 +85,22 @@ triage of that failure group tests it instead of blending it. The correction's
 evidence — its widened queries and one probe per named cause series — runs as
 read-only checks in the verification round, and the model must rule on the
 result: `supported` (the corrected cause is adopted, confidence from the
-evidence), `contradicted` (not adopted; the card says the correction was
-checked and what contradicted it), or `unverifiable` (adopted as a leading
-hypothesis, confidence capped at 0.6, with the correction's date named). A
-supported or contradicted ruling whose named evidence never actually fetched
-carries no weight: the confidence cap applies and the card says the correction
+evidence), `contradicted` (not adopted; the persisted finding — readable via
+`alertint_get_incident` — states the correction was checked and what
+contradicted it), or `unverifiable` (adopted as a leading hypothesis,
+confidence capped at 0.6, with the correction's date named). A supported or
+contradicted ruling whose named evidence never actually fetched carries no
+weight: the confidence cap applies and the finding states the correction
 *could not be tested* — it never presents an untested conclusion as a tested
 one. A correction is never an axiom: it is guaranteed to be fetched and ruled
 on every recurrence, and live evidence can retire it. A **confirmation** verdict
 retires steering — it records that the machine's conclusion is right.
 
 Notes written with `alertint_incident_annotate` are context for the next
-investigator: they render on the incident's Slack thread (history line plus
-a bounded notes list) and in MCP incident reads (`operator_history`),
-permanent and age-stamped, and never enter the triage prompt or influence
-recall.
+investigator: they render in MCP incident reads (`operator_history` — a
+history line plus a bounded notes list, readable from any incident on the
+group key), permanent and age-stamped, and never enter the triage prompt or
+influence recall.
 
 ## Inspecting what the model saw
 

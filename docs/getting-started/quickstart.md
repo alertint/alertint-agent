@@ -89,7 +89,7 @@ LLM settings, `alertint validate` for pre-flight checks — see
 
 ## 2. Fire a drill
 
-With the agent running, one command takes you to "finding ready":
+With the agent running, one command takes you to a published Situation:
 
 ```bash
 alertint drill --config config.yaml
@@ -102,11 +102,13 @@ docker compose -f docker/docker-compose.yaml exec agent /alertint drill --config
 ```
 
 The drill plants a fake deploy, fires a burst of clearly fictional alerts at
-the production ingress, waits out the correlation window, then prints the
-resulting finding — a causal analysis that names the planted deploy. Every
-drill alert is marked end to end (`alertint_drill="true"` label, 🧪 DRILL
-banner on the Slack card, `drill: true` in the MCP incident list), and the
-run ends by printing an MCP handoff command for the next step.
+the production ingress, waits out the correlation window, then polls the
+owning Situation the Situation controller raises from those alerts and
+prints it once published — a causal analysis that names the planted deploy.
+Every drill alert is marked end to end (`alertint_drill="true"` label, 🧪
+DRILL banner on the Situation's Slack root and thread, `drill: true` on both
+`alertint_situation_get` and the MCP incident list), and the run ends by
+printing an MCP handoff command for the next step.
 
 The drill ships three scenarios, selected with `--scenario`:
 
@@ -130,11 +132,11 @@ or `--color=never`/`NO_COLOR` for plain output.
 Windsurf is in [MCP clients](../integrations/mcp-clients.md). Then verify with
 the command the drill printed:
 
-> investigate incident `<id>` using alertint
+> investigate situation `<handle>` using alertint
 
 or ask a specific operational question:
 
-> List recent AlertINT incidents and summarize the most critical one.
+> List open AlertINT Situations and summarize the most critical one.
 
 ## 4. Point Alertmanager at the agent
 
@@ -158,7 +160,10 @@ receivers:
 ```
 
 Reload Alertmanager. From now on the agent receives a copy of every alert,
-correlates alerts into incidents, and produces an AI finding for each.
+correlates alerts into incidents, and attaches each to a Situation — which
+decides whether and when focused acute analysis is worth running and when
+you hear about it, rather than triaging and posting every one immediately.
+See [Architecture](../concepts/architecture.md) for the full contract.
 
 ## Next steps
 

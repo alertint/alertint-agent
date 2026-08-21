@@ -80,6 +80,12 @@ render the exact shade. An explicit operator action requirement beats an
 explicit judgment request beats a matching expected-episode envelope beats
 the default "AlertINT investigating" state.
 
+`expected_active` itself renders correctly whenever the controller has a
+matching envelope evaluation to act on. In this build that evaluation is not
+yet produced automatically during ordinary reconciliation — see "Known gap"
+under [Judgment and envelope confirmation](#judgment-and-envelope-confirmation)
+below.
+
 ## What the root says
 
 Every published root states why attention is warranted, what has been
@@ -179,15 +185,28 @@ caller yet classifies deliveries as webhook versus polling — see
 
 `alertint_situation_judgment_record` and `alertint_expected_behavior_confirm`
 both **require explicit confirmation and an asserted operator identity**
-(`operator_confirmed: true` plus `confirmed_by`). A recorded judgment or a
-newly matching Expected-behaviour envelope steers the *existing* root
-directly — the root's action contract and state can move (e.g. to
-`expected_active`, or out of `judgment_requested`) as a root edit plus a
-non-broadcast thread reply, without minting a new Situation. Every judgment
-and envelope write is audit-chained with both
-`authenticated_as=installation_mcp_token` (the one MCP trust domain today —
-there is no per-user RBAC/SSO in this tracer bullet) and the asserted
-operator.
+(`operator_confirmed: true` plus `confirmed_by`). A recorded judgment steers
+the *existing* root directly — it becomes part of the Situation's next
+deterministic snapshot, so the root's action contract and state can move
+(e.g. out of `judgment_requested`) as a root edit plus a non-broadcast
+thread reply, without minting a new Situation. Every judgment and envelope
+write is audit-chained with both `authenticated_as=installation_mcp_token`
+(the one MCP trust domain today — there is no per-user RBAC/SSO in this
+tracer bullet) and the asserted operator.
+
+**Known gap:** confirming or revoking an Expected-behaviour envelope does
+**not** yet, on its own, steer an existing root to or from `expected_active`
+in this build. Confirmation and revocation persist the envelope version
+correctly and schedule the affected Situations for reconsideration, but the
+Reconcile loop does not call the envelope-matching logic during that
+reconsideration — so a newly confirmed envelope will not silence a matching
+Situation's poke, and a revoked one will not resume interrupting, until this
+wiring lands. The envelope surface itself — confirmation, versioning,
+matching logic, schedule/DST resolution, violation detection — is fully
+correct and covered by tests that call it directly; only its automatic
+invocation from an ordinary reconciliation attempt is missing. See
+[Architecture: Situation controller — known
+gaps](../concepts/architecture.md#situation-controller-known-gaps).
 
 An Expected-behaviour envelope's sparse confirmation reminder
 (`situations.envelope_review.reminder_interval_days`, default 30) is its own
