@@ -51,14 +51,59 @@ triage:
     max_rounds: 1                 # reserved for future multi-round verification; only 1 is accepted today
   extra_selector_labels: []       # extra topology label keys (e.g. [cluster]) joined to every evidence/verification query; extend-only, never dropped by fallbacks
 
+# Proactive Situation controller — the durable L2 aggregate that owns Attention,
+# lifecycle, and the one evolving Slack thread per operational episode. It is
+# not a feature flag: every accepted Alert delivery always attaches to a
+# Situation, and it is the only Slack writer in this build. See
+# docs/concepts/architecture.md and docs/getting-started/configuration.md#situations.
+situations:
+  workers: 2                        # durable reconciliation workers claiming due Situations
+  reconcile_interval_seconds: 1     # how often idle workers poll for due work
+  lease_seconds: 300                # claim lease duration; an expired lease is recovered on restart or by another worker
+  lease_heartbeat_seconds: 30       # how often an in-progress attempt renews its lease; must be less than lease_seconds
+
+  recovery_grace:                   # how long a Situation waits in recovery_pending before turning green
+    webhook_seconds: 120            # fixed grace for webhook-delivered sources (used for every source in this build — see docs)
+    polling_min_seconds: 120        # lower clamp for a polling source's grace (2x its poll interval)
+    polling_max_seconds: 600        # upper clamp for a polling source's grace
+
+  cadence:                          # ordinary observing-checkpoint spacing, fastest to slowest
+    fast_seconds: 60
+    normal_seconds: 300
+    slow_seconds: 900
+
+  budgets:                          # per-attempt caps bounding one reconciliation attempt
+    max_observation_calls: 6        # bounded connector reads per attempt
+    max_l1_llm_calls: 2             # acute-triage (L1) model calls per attempt
+    max_l2_llm_calls: 2             # Situation Assessment (L2) model calls per attempt
+    attempt_wall_seconds: 180       # wall-clock ceiling for one attempt
+    max_attempts_per_input: 5       # exhausted attempts on one unchanged input park work rather than force terminality
+    connector_concurrency: 4        # concurrent connector reads across all in-flight attempts
+    llm_concurrency: 2              # concurrent LLM calls across all in-flight attempts
+
+  retry:                            # exponential backoff for retryable connector/LLM failures
+    initial_seconds: 5
+    maximum_seconds: 300
+    jitter_percent: 20              # +/-20% jitter to avoid retry stampedes
+
+  slack:
+    repage_cooldown_seconds: 900        # minimum spacing between a materially-changed required-action re-page
+    broadcast_on_criticality_change: true  # a newly crossed deterministic critical floor always earns a broadcast reply
+
+  dependency_health:
+    broadcast_after_seconds: 300    # how long a shared dependency (LLM, a connector) must stay degraded before one installation-level health root posts
+
+  envelope_review:
+    reminder_interval_days: 30      # at most one sparse Expected-behaviour envelope confirmation reminder per this many days
+
 notify:
   stdout: true             # always emit one JSON line per finding to stdout
   slack:
     enabled: false
     bot_token_env: SLACK_BOT_TOKEN   # xoxb- bot token (requires chat:write scope)
     channel: "#alerts"               # channel name or ID
-    min_severity: low                # low | medium | high — raise to suppress lower-severity findings on Slack (stdout always emits)
-    recurrence_mode: change-gated    # change-gated (default) | off — how recurring incidents resurface in the incident thread; off = silent card count-bump only
+    min_severity: low                # low | medium | high — outward-only floor on new main-channel Situation pokes, compared against a deterministic Interruption priority (critical always passes); never affects ingestion, Assessment, or MCP visibility. See docs/notifications/slack.md.
+    recurrence_mode: change-gated    # change-gated (default) | off — how a recurring symptom resurfaces in its Situation's thread; off = silent root count-bump only
 
 # MCP HTTP server — AI coding agents connect to http://host:9912/mcp
 # Presence-based: set ALERTINT_MCP_TOKEN to a long random secret and the

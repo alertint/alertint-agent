@@ -68,6 +68,35 @@ func TestDriftGate_ToolsDocumented(t *testing.T) {
 	t13, _ := s.toolIncidentCaptureVerdict()
 	addTool(t13.Name)
 
+	// The eleven Situation-mode tools (ADR/Task 12): Situation reads plus the
+	// confirmed, attributed write surface. Registered together in serve, gated
+	// on cfg.SituationCommands != nil, but the tool *definitions* (unlike their
+	// handlers) carry no such gate, so this drift gate can and does cover them
+	// unconditionally — a missing doc row for any of the eleven must fail here
+	// exactly like every other tool.
+	t14, _ := s.toolSituationList()
+	addTool(t14.Name)
+	t15, _ := s.toolSituationGet()
+	addTool(t15.Name)
+	t16, _ := s.toolSituationEvidenceGet()
+	addTool(t16.Name)
+	t17, _ := s.toolSituationReassess()
+	addTool(t17.Name)
+	t18, _ := s.toolSituationJudgmentRecord()
+	addTool(t18.Name)
+	t19, _ := s.toolSemanticProfileGet()
+	addTool(t19.Name)
+	t20, _ := s.toolSemanticProfileCorrect()
+	addTool(t20.Name)
+	t21, _ := s.toolExpectedBehaviorList()
+	addTool(t21.Name)
+	t22, _ := s.toolExpectedBehaviorConfirm()
+	addTool(t22.Name)
+	t23, _ := s.toolExpectedBehaviorRevoke()
+	addTool(t23.Name)
+	t24, _ := s.toolPokeFunnelGet()
+	addTool(t24.Name)
+
 	documented := documentedToolNames(t)
 
 	for name := range names {

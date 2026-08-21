@@ -1,6 +1,6 @@
 ---
 title: "Slack"
-description: "Send AlertINT findings to Slack channels."
+description: "One evolving Slack thread per Situation, with viewer-local update promises and visible recovery confirmation."
 section: "Notifications"
 order: 1
 slug: "slack"
@@ -8,23 +8,18 @@ slug: "slack"
 
 # Slack
 
-**AlertINT** posts structured Block Kit messages to Slack after every
-completed incident analysis. When alerts recover, the original message is
-updated in-place and a thread reply is posted — one message per incident,
-no channel noise.
+**AlertINT**'s Situation controller is the only Slack writer in this build.
+Every operational episode gets **one root message and one thread** — never
+one card per Incident, never a card per re-fire. The root is edited in place
+as the episode evolves; routine detail goes to the thread, almost always
+without re-notifying the channel.
 
-Synthetic incidents fired by `alertint drill` are unmistakable in a shared
-channel: every surface of their card — headline, thread details, and the
-plain-text fallback — carries a 🧪 **DRILL** banner, so a drill never
-reads as a real incident to a teammate scrolling past.
+Synthetic Situations fired by `alertint drill` are unmistakable in a shared
+channel: every surface of their root and thread — text, fallback, and
+recurrence replies — carries a 🧪 **DRILL** prefix, so a drill never reads as
+a real Situation to a teammate scrolling past.
 
 ## Setup — Slack app with bot token
-
-Bot tokens let **AlertINT** track the message it posted. When an incident
-fires, **AlertINT** posts a rich Block Kit message and records its position in
-the channel. When all alerts recover, it updates that message in-place
-(🔴 → ✅, a duration field appears) and posts a short resolution note in
-the thread.
 
 1. **Create a Slack app.** Go to <https://api.slack.com/apps> and click
    **Create New App → From scratch**. Name it **AlertINT** and select your
@@ -40,7 +35,7 @@ the thread.
    it.
 
 4. **Invite the bot to your channel.** In Slack, open the channel where
-   alerts should appear (create `#alerts` if needed) and type
+   Situations should appear (create `#alerts` if needed) and type
    `/invite @AlertINT`. The bot must be a channel member to post there.
 
 5. **Add the token to your `.env` file** — the same file that holds your
@@ -62,136 +57,85 @@ the thread.
        channel: "#alerts"              # channel name or ID where alerts should post
    ```
 
-What happens at runtime:
+## One root, seven states
 
-- **Firing** — posts a brief main-channel message (name + root cause) and
-  immediately posts the full analysis — severity, confidence, correlation
-  findings, MCP hint — as a thread reply.
-- **Resolved** — updates the original main-channel message in-place
-  (header changes 🔴 → ✅, duration appears) and posts full resolution
-  details — duration, alert count, resolved time — as a thread reply.
+A Situation receives its immutable public handle and one Slack root only
+when it is first published — a genuinely silent Situation (one whose facts
+never crossed a publication reason) never gets a root at all. Text is
+authoritative; color/icon is supplementary:
 
-## Message structure
+| State | Color/icon | Meaning |
+|---|---|---|
+| `investigating` | 🟠 orange | AlertINT investigating — no operator action |
+| `judgment_requested` | 🟡 yellow | Operator judgment requested — still monitoring |
+| `action_required` | 🔴 red | Operator action required — monitoring continues |
+| `expected_active` | ⚪ neutral | Expected for this episode — no operator action (a matching, quieting Expected-behaviour envelope covers the current episode) |
+| `recovery_pending` | 🟢 light green | Recovery observed — confirming stability |
+| `recovered` | ✅ green check | Recovered — no further action |
+| `closed_unknown` | ⚫ neutral | Closed with uncertainty — review reason in MCP |
 
-Every notification uses Slack Block Kit. The same blocks appear for firing
-and resolved — only the header and fields change on resolution.
+`recovery_pending` uses a deliberately distinct light-green treatment so it
+never reads as the same state as `recovered` on a Slack surface that can't
+render the exact shade. An explicit operator action requirement beats an
+explicit judgment request beats a matching expected-episode envelope beats
+the default "AlertINT investigating" state.
 
-| Block | Description |
-|---|---|
-| Main — header | 🔴 INCIDENT DETECTED when firing, updated to ✅ INCIDENT RESOLVED in-place when resolved. |
-| Main — root cause | One-sentence root cause hypothesis, preserved when the message is updated on resolution. |
-| Main — footer | Incident ID, alert count, severity, confidence, group key, and start time. Replaced by resolved time and duration on resolution. |
-| Main — agent handoff | `investigate incident <id> using alertint` — the MCP call to action, with the full incident ID. Dropped when the incident resolves. |
-| Main — steering ruling | On failure groups governed by an operator correction: one line stating whether live evidence supported it, contradicted it, or could not test it. Channel-visible on purpose — it is the triage outcome. |
-| Thread — analysis | Posted immediately after the main message: severity, confidence, alert count, and group key in a fields grid. |
-| Thread — operator history | The failure group's operator context: first-occurrence / seen-before state or the governing verdict's note, followed by up to three operator notes with ages. |
-| Thread — evidence | One line: per-source counts (Prometheus/Loki/Changes/Sentry) that fed the triage, e.g. `Prometheus 21 metrics · Loki 0 lines`. A connector that could not be reached shows `unreachable` instead of a count; a known-issue short-circuit shows `skipped (known issue)`; a zero-connector install shows `no sources configured`. Always present. |
-| Thread — findings | Bullet list of correlation findings. Only shown when the LLM identified more than one contributing factor. |
-| Thread — agent handoff | The same handoff block, so the call to action reads identically on every firing surface. |
-| Thread — resolved | Posted when all alerts recover: duration, alert count, and resolved timestamp in a fields grid. |
+## What the root says
 
-## Example — firing
-
-Two messages are posted: a brief main-channel message and an immediate
-thread reply with the full analysis.
-
-Main channel:
+Every published root states why attention is warranted, what has been
+checked, what runs next, who acts, and when the next update lands — plus the
+Situation's MCP handle:
 
 ```text
-🔴 INCIDENT DETECTED — API Tier Degraded: CPU Saturation + Error Spike
-
-Root cause: CPU saturation on api-2 is causing request queuing, elevating
-error rates and response latency across the cluster.
-
-Incident a1b2c3d4 · 3 alerts · high · 91% · group cluster=prod · started 14:37 UTC
-
-🤖 Investigate in your AI agent: investigate incident a1b2c3d4-5e6f-7a8b-9c0d-1e2f3a4b5c6d using alertint
+🟠 AlertINT investigating — no operator action
+Why: sustained CPU saturation on db-prod-1, no confirmed causal change yet
+Checked: Prometheus, recent deploys
+Next: verification round on the acute finding
+Actor: AlertINT
+Next update in 5 minutes, by <!date^1787210400^{date_short_pretty} at {time}|2026-08-20 10:00 UTC>.
+Handle: `db-prod-sustained-cpu`
 ```
 
-Thread reply (posted immediately):
+That `<!date^…>` token is Slack's own date markup — **AlertINT** emits it for
+every instant on the Situation surface (start time, evidence time, next
+update, envelope boundaries, recovery observed/grace, terminal time, prior-
+episode comparisons). Slack renders the same underlying epoch in **each
+viewer's own device-local timezone and time format** — the same message
+shows roughly 13:00 to a Riga viewer and 11:00 to a UK viewer in summer,
+while the canonical stored instant stays `10:00Z` everywhere else (storage,
+audit, MCP, scheduling). A plain UTC fallback rides in the same payload for
+any surface that cannot render the markup.
 
-```text
-Analysis details
+The promised update line always pairs a relative and a viewer-local absolute
+time: `Next update in 5 minutes, by <viewer-local time>`, plus `, or on
+recovery` when recovery is one of the events that can trigger an earlier
+update. Relative minutes are computed from the canonical rendered time and
+the next-update deadline, rounding a partial minute upward; a root edit
+recomputes both, and reconciliation at the promised deadline replaces an
+expired countdown before it can go stale in the channel.
 
-Severity: HIGH        Confidence: 91%
-Alerts: 3             Group: cluster=prod
+## Thread vs. channel — the re-page rule
 
-Evidence: Prometheus 14 metrics · Loki 6 lines · Changes 1 · Sentry 2 issues
+Routine evidence, retries, limitations, judgments, and Assessment history
+post as **non-broadcast thread replies** or root edits — visible to anyone
+who opens the thread, invisible to anyone just scanning the channel. A new
+main-channel poke (a broadcast reply, or the very first root) is permitted
+only for:
 
-Correlation findings
-• HighCPU (api-2) fired 15 s before HighErrorRate — causal ordering confirmed.
-• HighLatency shares the same instance label, indicating single-host origin.
+- a newly crossed deterministic critical floor,
+- a valid urgent Attention,
+- a no-action → judgment/action handoff, or
+- a materially changed required action, after a cooldown
+  (`situations.slack.repage_cooldown_seconds`, default 900s).
 
-👀 seen ×2 in the last 90d (since 2026-07-01) — no operator verdict yet
+A handoff always edits the root first, then adds exactly one broadcast
+reply. Lack of acknowledgement never causes repeated paging — **AlertINT**
+does not re-page because nobody responded.
 
-Operator notes
-📝 observation (2h ago): api-2 is the canary host; rollout paused.
+### Recurrence
 
-🤖 Investigate in your AI agent: investigate incident a1b2c3d4-5e6f-7a8b-9c0d-1e2f3a4b5c6d using alertint
-```
-
-## Example — resolved
-
-The original main-channel message is updated in-place and a resolution
-note is posted in the thread.
-
-Main channel (updated in-place):
-
-```text
-✅ INCIDENT RESOLVED — API Tier Degraded: CPU Saturation + Error Spike
-
-Root cause: CPU saturation on api-2 is causing request queuing, elevating
-error rates and response latency across the cluster.
-
-Incident a1b2c3d4 · resolved after 15m · 14:52 UTC
-```
-
-Thread reply:
-
-```text
-✅ All clear — all alerts have recovered.
-
-Duration: 15m    Alerts: 3 recovered    Resolved: 14:52 UTC
-
-Incident a1b2c3d4 · duration 15m
-```
-
-The MCP hint in the message footer is a pre-filled tool call. Paste it
-directly into Claude Code, Cursor, or Windsurf to open the full evidence
-pack for that incident — see [MCP clients](../integrations/mcp-clients.md).
-
-## Recurrence resurfacing
-
-When an already-analyzed incident re-fires inside the collapse window, it
-doesn't get a new card — it attaches as another occurrence on the same
-incident, and the card that's already in the channel is what carries the
-update. Recurrence never adds channel messages: everything below happens on
-the existing card or inside its thread. What lands depends on what changed:
-
-- **A plain re-fire** — same symptom, same severity, steady cadence — just
-  bumps the occurrence count on the existing card in place
-  (`🔁 recurred ×N · last HH:MM`). No new message anywhere.
-- **A real-world change** — severity escalated, a new symptom (alertname)
-  joined, or the cadence sped up markedly — posts a thread reply naming
-  exactly why (`why: severity` / `why: new_alertname` / `why: cadence`), and
-  the incident is re-analyzed with the fresh finding edited into the same
-  card — never a new one.
-- **A steady flapper** that never trips one of those changes still gets a
-  thread reply at milestone counts — ×5, ×10, ×25, ×50, ×100, then every
-  ×100 — so a long-running recurring incident keeps a visible trail in its
-  thread even without a qualifying change.
-
-Every recurrence reply states the reason, e.g.:
-
-```text
-Incident a1b2c3d4 · recurred ×9 · last 14:52 UTC · why: cadence
-```
-
-Two backstop triggers — a hard occurrence cap and a periodic re-analysis
-ceiling — force a fresh re-analysis without representing a genuine escalation,
-so they edit the card but never post a reply; they stay silent by design.
-
-Control this with `notify.slack.recurrence_mode`:
+A recurring symptom resurfaces in its Situation's existing thread, controlled
+by `notify.slack.recurrence_mode`:
 
 ```yaml
 notify:
@@ -199,11 +143,126 @@ notify:
     recurrence_mode: change-gated   # change-gated (default) | off
 ```
 
-- `change-gated` (default) — post a thread reply on a real-world change or a
-  milestone, as described above.
-- `off` — recurrence never posts replies; the card's occurrence count still
-  updates in place, silently.
+- `change-gated` (default) — a real-world change (severity rise, new
+  symptom, faster cadence) or a milestone (×5/×10/×25/×50/×100, then every
+  ×100) posts one non-broadcast thread reply naming why
+  (`:repeat: recurred ×9`); anything short of that just edits the root count
+  in place.
+- `off` — recurrence never posts a reply; the root's count still updates in
+  place, silently.
 
-Drill incidents (`alertint drill`) keep their 🧪 DRILL banner on every
-recurrence surface — card edit, thread reply, and fallback text — same as
-every other rendered surface.
+## Recovery pending — visible before "recovered"
+
+When a Situation's current member Alerts resolve, **every published root
+immediately edits** to the light-green `recovery_pending` state and a
+non-broadcast thread reply records it — the prior Attention is preserved for
+audit and refire handling, but the pending Slack contract, not the Attention
+color, controls what's on screen. Firing-only probes pause; source/recovery
+watching continues.
+
+- **A refire before grace expires** edits the root back to its active state
+  and records "recovery did not hold" as a non-broadcast reply — no new
+  channel message, unless the refire independently crosses one of the
+  re-page rules above.
+- **Clean grace expiry** turns the same root green (`recovered`) and adds a
+  closure thread reply.
+
+`recovery_pending`, `expected_active`, and every ordinary de-escalation edit
+are root edits — none of them count as a main-channel poke. The recovery
+confirmation window is configurable per source in
+`situations.recovery_grace`; in this build every Situation currently uses
+the flat `webhook_seconds` default (120s) regardless of source, since no
+caller yet classifies deliveries as webhook versus polling — see
+[Architecture](../concepts/architecture.md#situation-controller-known-gaps).
+
+## Judgment and envelope confirmation
+
+`alertint_situation_judgment_record` and `alertint_expected_behavior_confirm`
+both **require explicit confirmation and an asserted operator identity**
+(`operator_confirmed: true` plus `confirmed_by`). A recorded judgment or a
+newly matching Expected-behaviour envelope steers the *existing* root
+directly — the root's action contract and state can move (e.g. to
+`expected_active`, or out of `judgment_requested`) as a root edit plus a
+non-broadcast thread reply, without minting a new Situation. Every judgment
+and envelope write is audit-chained with both
+`authenticated_as=installation_mcp_token` (the one MCP trust domain today —
+there is no per-user RBAC/SSO in this tracer bullet) and the asserted
+operator.
+
+An Expected-behaviour envelope's sparse confirmation reminder
+(`situations.envelope_review.reminder_interval_days`, default 30) is its own
+standalone, high-priority main-channel message — it never creates or reuses
+a Situation thread:
+
+```text
+:clipboard: Expected-behaviour review due — nightly_risk_calculation on db-prod-1
+Review by: <!date^…|2026-11-20 UTC>
+Matches since last confirmation: 4
+MCP: `alertint_expected_behavior_confirm`
+```
+
+## The outward Slack floor: `min_severity`
+
+`notify.slack.min_severity` (`low` \| `medium` \| `high`, default `low`) is a
+temporary, outward-only escape hatch. In Situation mode it no longer compares
+against Alert severity — it compares against a deterministic **Interruption
+priority** derived from the validated reason, Attention, and action
+contract:
+
+| Interruption priority | When it applies |
+|---|---|
+| `critical` | an unquieted deterministic critical floor — **always passes this outward floor**, regardless of `min_severity` |
+| `high` | urgent Attention, operator judgment/action required, actionable terminal uncertainty, or a sustained shared-health outage |
+| `medium` | non-critical investigation while AlertINT remains the next actor |
+| `low` | an informational standalone interruption, if one is introduced |
+
+L2 cannot propose or set this priority — code derives it deterministically.
+Today the outward config value's string-to-priority mapping is intentionally
+permissive: `warning` maps to `medium`, and any unrecognized or unset value
+falls back to the most permissive `low` floor rather than silently
+withholding a poke.
+
+The floor only withholds a **new main-channel poke** — never an in-place
+root edit, non-broadcast thread history, ingestion, Assessment, or MCP
+visibility. A poke withheld this way persists as
+`withheld_by_operator_slack_floor` in the notification history (visible on
+`alertint_situation_get`); it is never silently rewritten as "observe" or
+treated as healthy.
+
+## Shared dependency health
+
+When a shared installation-level dependency (the LLM, a connector) stays
+degraded past `situations.dependency_health.broadcast_after_seconds` (default
+300s), **AlertINT** posts **at most one health root** for the whole outage,
+and one recovery update when it clears:
+
+```text
+:warning: LLM degraded — AlertINT's shared dependency is unavailable; affected Situations remain visible in MCP
+```
+
+Affected Situations expose the degradation in MCP and audit and only update
+their own existing threads if their operator contract actually changes — a
+shared outage never fans out into one noisy message per affected Situation.
+The health root and its recovery update are both main-channel pokes, and
+both are counted separately in the funnel (see
+[Architecture](../concepts/architecture.md#the-funnel)).
+
+## Idempotency
+
+Every post carries a deterministic `client_msg_id` (a UUIDv5 over a fixed
+AlertINT Slack namespace and the notification's own `idempotency_key`), so a
+retry after a timeout or a restart reuses the exact identity Slack already
+saw instead of double-posting. Root edits always target the persisted
+channel and message timestamp from the first publish. A Slack-side failure
+never rewrites an actionable Assessment as `observe` — it remains a durable
+pending/failed intent that retries with the same identity, honoring Slack's
+own rate-limit retry timing where available.
+
+## Legacy per-Incident notification (removed)
+
+Earlier builds posted one Slack card per Incident directly after triage, with
+firing/resolved states and per-recurrence card edits. That code path is no
+longer wired in `alertint serve` — the Situation controller described above
+is the sole Slack writer. The old per-Incident renderers remain in the
+codebase only to back fixture tests for the earlier card format; they are
+never reachable at runtime.

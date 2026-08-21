@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added the proactive Situation controller: durable Alert delivery tracking, bounded Situation investigation, one evolving Slack thread with viewer-local update promises and recovery confirmation, structured MCP steering and expected-behaviour envelopes, plus local notification-compression reporting.
+
 ## [0.13.3] - 2026-08-18
 
 ### Security

@@ -15,9 +15,13 @@ expectations.
 ## Design principles
 
 - **Read-only by design** — **AlertINT** observes and reports. It never
-  touches your infrastructure, so teams can adopt it without risk. The one
-  write an agent can make is feedback into AlertINT's own incident record —
-  additive, audit-chained, local.
+  touches your infrastructure, so teams can adopt it without risk. Every
+  write an agent can make — an incident verdict/annotation, a Situation
+  judgment, an Expected-behaviour envelope confirmation/revocation, a
+  semantic-profile correction — is feedback into AlertINT's own incident
+  state: additive, audit-chained, and never a write toward an operated
+  system. This boundary held through the proactive Situation controller
+  unchanged.
 - **Self-hosted and local** — your alert data and incident context stay on
   your machine.
 - **Fair Source** — the runtime and all baseline and community packs are
@@ -82,6 +86,47 @@ produce a lower-quality analysis.
 
 **Workaround:** set `min_alerts: 1` to always triage, or accept that
 single-alert findings have less correlation context.
+
+### Situation controller: known gaps in this release
+
+The proactive Situation controller (see [Architecture](architecture.md)) is
+fully wired for delivery ingestion, lifecycle, Slack, and MCP steering, but
+ships with four known, honestly-scoped gaps rather than the spec's full
+aspiration:
+
+**Connector observation is not yet wired into Reconcile.** All seven
+read-only observation executors (Prometheus/Zabbix metrics/Loki/Sentry/change
+events) are implemented, wired, and tested end to end through
+`internal/observation`'s runner, but the controller's Reconcile loop never
+calls it. Only delivery-derived symptom facts and `store_read` facts (the
+durable state already in SQLite) reach a Situation's deterministic snapshot
+today.
+
+**Expected-behaviour envelope evaluation is not yet wired into any
+production reconcile path.** The full envelope lifecycle — confirmation,
+versioning, matching, schedule/DST resolution, violation detection,
+invalidation, revocation — works correctly and is fully tested when driven
+over MCP. Only its automatic evaluation as part of an ordinary
+reconciliation attempt does not fire in production yet, so a confirmed
+envelope will not yet quiet a matching Situation on its own without an MCP
+call recomputing it.
+
+**Recovery grace is a flat webhook-default in production.** The config
+schema (`situations.recovery_grace`) supports a source-aware window — a
+fixed grace for webhook sources, twice the poll interval clamped to a range
+for polling sources — but no caller currently classifies a delivery source
+as webhook versus polling, so every Situation uses the flat
+`webhook_seconds` default (120s) regardless of source.
+
+**`notify.slack.min_severity` uses a permissive Interruption-priority
+mapping.** `warning` maps to `medium`, an unrecognized or unset value maps to
+the most permissive `low`, and `critical` always passes the floor — the
+mapping favors not missing a poke over precise per-severity suppression.
+
+None of these change what is durably persisted, what MCP can read, or the
+correctness of the parts that are wired — they narrow what data reaches a
+Situation's automatic facts and how finely today's recovery timing and
+outward Slack floor can be tuned per source.
 
 ### Deeper metric context is operator-driven
 

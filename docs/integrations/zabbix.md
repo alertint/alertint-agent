@@ -150,6 +150,17 @@ through and close out the incident.
 | Fingerprint | `event_id` | Namespaced `zabbix:<event_id>`, stable across the `PROBLEM`→`RESOLVED` pair, so the resolution dedups onto the same alert row. |
 | Status | `status` | `PROBLEM` → firing, `RESOLVED` → resolved. |
 | Timestamps | receipt time | `StartsAt`/`EndsAt` are stamped when AlertINT receives the webhook, never parsed from `clock`/`recovery_clock` — those expand in the Zabbix server's own timezone with no UTC offset in the string, which would silently skew timestamps that anchor enrichment windows. The raw `clock`/`recovery_clock` strings still ride along as annotations for reference. |
+
+The Situation delivery ledger goes one step further and tracks *why* each
+timestamp is what it is: every delivery carries a `started_at_basis` /
+`resolved_at_basis` of `source_payload` (from the source's own event data),
+`source_api` (confirmed by a later source-API read), or `receipt_fallback`
+(no source-provided time was available, so AlertINT's own receipt time was
+used) — never silently blended. `alertint_situation_evidence_get` returns
+both the receipt-time `starts_at`/`ends_at` and, when available, the
+distinct `source_started_at`/`source_resolved_at` alongside their basis, so
+an investigating agent can tell a confirmed source-reported time from an
+AlertINT-stamped fallback.
 | `alertname` label | `trigger_name` | Aligns with Alertmanager's grouping vocabulary. |
 | `host` label | `host` | The technical host name (`{HOST.HOST}`) — the correlator's per-host identity. |
 | `severity` label | `severity` | Verbatim, with a fallback — see below. |

@@ -19,11 +19,22 @@ correlator:
   group_labels:
     - cluster
 
+# The proactive Situation controller runs unconditionally with its built-in
+# defaults (2 workers, 120s recovery grace, etc.) — it is the sole L2
+# aggregate and the only Slack writer in this build. Uncomment `situations:`
+# below to override any of it for this stack; see
+# docs/getting-started/configuration.md#situations.
+# situations:
+#   workers: 2
+
 notify:
   stdout: true
-  # To deliver findings to Slack: set enabled: true, put a bot token
+  # One versioned Situation-state JSON line is written per newly authoritative
+  # Assessment or material lifecycle transition — including silent Situations
+  # that never reach Slack. See docs/concepts/architecture.md.
+  # To deliver Situation updates to Slack: set enabled: true, put a bot token
   # (xoxb-…, chat:write scope) in SLACK_BOT_TOKEN in your .env, and set
-  # your channel. The stack runs fine without Slack — findings go to stdout.
+  # your channel. The stack runs fine without Slack — state still goes to stdout.
   slack:
     enabled: false
     bot_token_env: SLACK_BOT_TOKEN

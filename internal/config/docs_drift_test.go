@@ -21,7 +21,9 @@ package config
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -40,6 +42,67 @@ const (
 var documentedElsewhere = map[string]string{
 	"logs":   "../../docs/integrations/loki.md",
 	"sentry": "../../docs/integrations/sentry.md",
+}
+
+// docsRoot is the public documentation tree TestSituationDocsContainRuntimeSurface
+// searches — every Markdown page a real operator can read, not just this
+// package's own two gated surfaces (config.example.yaml and
+// configuration.md).
+const docsRoot = "../../docs"
+
+// docsContain reports whether needle appears verbatim in any Markdown file
+// under docsRoot. It is a blunt, deliberately non-structural check: unlike
+// the drift gates above (which parse specific tables on specific pages),
+// this one only asks whether the Situation controller's core runtime
+// surface reached public documentation *somewhere* — the config section
+// name, a durable lifecycle state, representative MCP tool names, the
+// funnel CLI, and the viewer-local Slack time wording.
+func docsContain(t *testing.T, needle string) bool {
+	t.Helper()
+	found := false
+	err := filepath.WalkDir(docsRoot, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() || filepath.Ext(path) != ".md" {
+			return nil
+		}
+		raw, err := os.ReadFile(path) // #nosec G304 -- path comes from walking the repo's own docs tree
+		if err != nil {
+			return err
+		}
+		if strings.Contains(string(raw), needle) {
+			found = true
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", docsRoot, err)
+	}
+	return found
+}
+
+// TestSituationDocsContainRuntimeSurface gates the Situation controller's
+// core runtime surface against the public docs tree as a whole: the
+// `situations:` config section, the persisted `recovery_pending` lifecycle
+// state, two representative Situation MCP tool names, the `alertint funnel`
+// CLI, and the viewer-local Slack time wording all documented somewhere in
+// docs/. Complements — never replaces — the structural drift gates above
+// and in internal/mcp/docs_drift_test.go, which check specific pages and
+// tables rather than documented anywhere at all.
+func TestSituationDocsContainRuntimeSurface(t *testing.T) {
+	for _, needle := range []string{
+		"situations:",
+		"recovery_pending",
+		"alertint_situation_get",
+		"alertint_expected_behavior_confirm",
+		"alertint funnel",
+		"viewer-local",
+	} {
+		if !docsContain(t, needle) {
+			t.Fatalf("public docs missing %q", needle)
+		}
+	}
 }
 
 func TestDriftGate_ExampleConfigLoads(t *testing.T) {

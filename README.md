@@ -14,7 +14,7 @@
 
 > AlertINT turns infrastructure alerts into investigated incidents and serves them to the AI tools you already use, over MCP — a self-hosted agent that runs inside your own network.
 
-A single Go binary that sits between your monitoring stack and your AI agent. It ingests alert webhooks from Alertmanager and Zabbix, correlates them into incidents through an open rule engine, and runs an LLM triage that falsifies its own draft verdict before the finding ships. Findings go to Slack; the incident state — plus read-only Prometheus, Loki, and Zabbix access — is exposed to any MCP client. Corrections your agent captures over MCP steer the next triage of the same failure. Read-only by design. Local state. You bring the LLM key.
+A single Go binary that sits between your monitoring stack and your AI agent. It ingests alert webhooks from Alertmanager and Zabbix, correlates them into incidents through an open rule engine, and runs an LLM triage that falsifies its own draft verdict before the finding ships. A proactive Situation controller owns every operational episode end to end: it decides whether and when that acute analysis has decision value, keeps one evolving Slack thread per Situation — with viewer-local update promises and a visible recovery-pending state before declaring stability — and is the only Slack writer in this build. The full Situation and Incident state, plus read-only Prometheus, Loki, and Zabbix access, is exposed to any MCP client. Judgments, Expected-behaviour envelopes, and corrections your agent captures over MCP steer the existing Situation and the next triage of the same failure. Read-only toward your infrastructure, always. Local state. You bring the LLM key.
 
 **Full documentation: [alertint.com/docs](https://alertint.com/docs)**
 
@@ -28,25 +28,30 @@ stack), configure, and prove the whole pipeline with one command:
 alertint drill --config config.yaml
 ```
 
-The built-in incident drill plants a fake deploy, fires a burst of
-clearly-marked synthetic alerts through the production ingress, and polls
-until triage prints the finding — a causal analysis naming the planted
-deploy. From zero to that finding takes about ten minutes; then connect an
-MCP client to investigate it, and point Alertmanager or
+The built-in drill plants a fake deploy, fires a burst of clearly-marked
+synthetic alerts through the production ingress, and polls the resulting
+Situation until it publishes — a causal analysis naming the planted deploy.
+From zero to that Situation takes about ten minutes; then connect an MCP
+client to investigate it, and point Alertmanager or
 [Zabbix](https://alertint.com/docs/integrations/zabbix) at the agent for real
 alerts.
 
 ## How it works
 
-Two loops close on the triage step: the **[verification
+Two feedback loops close on the acute triage step: the **[verification
 round](https://alertint.com/docs/concepts/verification-round)** gathers evidence
 chosen to disprove the model's own draft and makes it re-judge before anything
 persists, and an operator correction captured over MCP lands in **[incident
 memory](https://alertint.com/docs/concepts/incident-memory)**, where it steers
-the next triage of that failure group.
+the next triage of that failure group. A third loop closes at the Situation
+level: a proactive Situation controller decides whether acute analysis has
+decision value, publishes as soon as facts justify it (never waiting on the
+model), and lets an operator judgment or a reusable Expected-behaviour
+envelope steer the existing Situation root directly.
 
-The whole pipeline — receivers, correlation, the evidence pack, both loops, and
-the MCP surface — is diagrammed and walked through step by step in
+The whole pipeline — receivers, correlation, the evidence pack, all three
+loops, the Situation controller, and the MCP surface — is diagrammed and
+walked through step by step in
 **[Architecture](https://alertint.com/docs/concepts/architecture)**.
 
 ## Documentation

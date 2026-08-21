@@ -226,30 +226,83 @@ specific to your environment; see
 | `verification.max_rounds` | int | `1` | Reserved for future multi-round verification; values greater than 1 are rejected. Today only `1` is supported. |
 | `extra_selector_labels` | list | — | Extra alert-label keys (topology labels like `cluster` or `region`) added to the built-in selector allowlist (`namespace, service, job, pod, container, instance`) used to build metric/log enrichment queries and the verification floor's peer scope. Extras join every query and are never dropped by fallback queries. Use topology labels, not identity labels. |
 
+## `situations`
+
+The proactive Situation controller — the durable L2 aggregate that owns
+Attention, lifecycle, and the one evolving Slack thread per operational
+episode. It is not a feature flag: every accepted Alert delivery always
+attaches to a Situation by exact group key, and it is the sole Slack writer
+in this build (there is no legacy per-Incident notification mode). See
+[Architecture](../concepts/architecture.md) and [Slack](../notifications/slack.md).
+
+```yaml
+situations:
+  workers: 2
+  recovery_grace:
+    webhook_seconds: 120
+  cadence:
+    fast_seconds: 60
+    normal_seconds: 300
+    slow_seconds: 900
+```
+
+Every field below has a working default — most installs never need to touch
+this section at all.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `workers` | int | `2` | Durable reconciliation workers claiming due Situations (must be `> 0`) |
+| `reconcile_interval_seconds` | int | `1` | How often an idle worker polls for due work (must be `> 0`) |
+| `lease_seconds` | int | `300` | Claim-lease duration; an expired lease is recovered on restart or by another worker (must be `> 0`) |
+| `lease_heartbeat_seconds` | int | `30` | How often an in-progress attempt renews its lease; must be `> 0` and strictly less than `lease_seconds` |
+| `recovery_grace.webhook_seconds` | int | `120` | Recovery confirmation window for a webhook-delivered source. **This is the only grace value actually applied today** — production wiring always calls the source-aware calculation with no sources given, so every Situation currently uses this flat default regardless of source (must be `> 0`) |
+| `recovery_grace.polling_min_seconds` | int | `120` | Lower clamp for a polling source's grace (2× its poll interval). Defined and validated, but not yet reachable — no caller currently classifies a source as polling (must be `> 0` and `<= polling_max_seconds`) |
+| `recovery_grace.polling_max_seconds` | int | `600` | Upper clamp for a polling source's grace. Same not-yet-reachable status as `polling_min_seconds` (must be `> 0`) |
+| `cadence.fast_seconds` | int | `60` | Fastest ordinary observing-checkpoint spacing (must satisfy `fast_seconds <= normal_seconds <= slow_seconds`) |
+| `cadence.normal_seconds` | int | `300` | Normal ordinary observing-checkpoint spacing |
+| `cadence.slow_seconds` | int | `900` | Slowest ordinary observing-checkpoint spacing |
+| `budgets.max_observation_calls` | int | `6` | Bounded connector reads per reconciliation attempt (must be `> 0`) |
+| `budgets.max_l1_llm_calls` | int | `2` | Acute-triage (L1) model calls per attempt (must be `> 0`) |
+| `budgets.max_l2_llm_calls` | int | `2` | Situation Assessment (L2) model calls per attempt (must be `> 0`) |
+| `budgets.attempt_wall_seconds` | int | `180` | Wall-clock ceiling for one reconciliation attempt (must be `> 0`) |
+| `budgets.max_attempts_per_input` | int | `5` | Exhausted attempts on one unchanged input park work — the controller preserves the last safe Assessment and waits for a named reconsider event — rather than forcing terminality (must be `> 0`) |
+| `budgets.connector_concurrency` | int | `4` | Concurrent connector reads across all in-flight attempts (must be `> 0`) |
+| `budgets.llm_concurrency` | int | `2` | Concurrent LLM calls across all in-flight attempts (must be `> 0`) |
+| `retry.initial_seconds` | int | `5` | Initial exponential-backoff delay for a retryable connector/LLM failure (must be `> 0` and `<= retry.maximum_seconds`) |
+| `retry.maximum_seconds` | int | `300` | Backoff ceiling |
+| `retry.jitter_percent` | int | `20` | +/-jitter applied to each backoff delay, `0`-`100`, to avoid retry stampedes |
+| `slack.repage_cooldown_seconds` | int | `900` | Minimum spacing between a materially-changed required-action re-page on an already-published Situation (must be `> 0`) |
+| `slack.broadcast_on_criticality_change` | bool | `true` | A newly crossed deterministic critical floor always earns one broadcast thread reply |
+| `dependency_health.broadcast_after_seconds` | int | `300` | How long a shared dependency (the LLM, a connector) must stay degraded before one installation-level health root posts (must be `> 0`) |
+| `envelope_review.reminder_interval_days` | int | `30` | At most one sparse Expected-behaviour envelope confirmation reminder per this many days (must be `> 0`) |
+
+Two known gaps in this release, both honestly reflected in the defaults
+above and in [Architecture](../concepts/architecture.md#situation-controller-known-gaps):
+the Reconcile loop does not yet invoke the observation runner (Prometheus,
+Zabbix metrics, Loki, Sentry, and change-event connector facts do not reach
+Situation snapshots yet, even though all seven executors are implemented and
+tested through the runner — only delivery-derived symptom facts and
+`store_read` facts flow today), and Expected-behaviour envelope *evaluation*
+is not yet wired into reconcile (envelopes, judgments, confirmation, and
+revocation all work correctly over MCP; only automatic evaluation during
+reconciliation does not fire yet).
+
 ## `notify`
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `stdout` | bool | `true` | Deliver the finding to **stdout** as one JSON line. The full JSON is verbose detail: it is written **only at `--log-level=debug`** (consistently, in every format). At `info` the sink is still active — a send is confirmed on the `notified` line — but no JSON is written; the result shows as the one-line `finding` summary instead. Recommended to leave on. |
-| `slack.enabled` | bool | `false` | Post a Block Kit message to a Slack channel via the bot-token API (message updated in-place on resolve) |
+| `stdout` | bool | `true` | Write one versioned Situation-state JSON line per newly authoritative Assessment or material lifecycle transition — including a silent Situation that never reaches Slack. Recommended to leave on. |
+| `slack.enabled` | bool | `false` | Publish the Situation controller's one evolving Slack thread per operational episode via the bot-token API (root edited in-place; replies posted to its thread) |
 | `slack.bot_token_env` | string | — | Required when `slack.enabled: true`. Env var name holding the Slack bot token (`xoxb-…`, requires the `chat:write` scope) |
 | `slack.channel` | string | — | Required when `slack.enabled: true`. Channel name (e.g. `#alerts`) or ID (e.g. `C1234567890`) |
-| `slack.min_severity` | string | `low` | Findings below this severity (`low` \| `medium` \| `high`) are not posted to Slack; stdout always emits. An incident suppressed at firing is also suppressed at resolution. The default posts everything. |
-| `slack.recurrence_mode` | string | `change-gated` | How a recurring incident resurfaces in its thread: `change-gated` posts a thread reply only on a real-world change (severity rise, new symptom, faster cadence) or a milestone (×5/×10/×25/×50/×100, then every ×100) — replies stay in the thread, nothing extra is sent to the channel; `off` keeps recurrence to a silent card count-bump. See [Slack](../notifications/slack.md) for details. |
+| `slack.min_severity` | string | `low` | A temporary, outward-only escape hatch (`low` \| `medium` \| `high`). In Situation mode this compares against a deterministic Interruption priority — not Alert severity or an L2-generated field — derived from the validated reason, Attention, and action contract: `critical` (an unquieted deterministic critical floor) always passes; `high` covers urgent Attention, operator judgment/action required, actionable terminal uncertainty, or a sustained shared-health outage; `medium` covers non-critical investigation while AlertINT remains the next actor; `low` (the default) posts every new main-channel poke. The floor only withholds a *new* main-channel poke — never an in-place root edit, non-broadcast thread history, ingestion, Assessment, or MCP visibility. See [Slack](../notifications/slack.md). |
+| `slack.recurrence_mode` | string | `change-gated` | How a recurring symptom resurfaces in its Situation's thread: `change-gated` posts a thread reply only on a real-world change or a milestone; `off` keeps recurrence to a silent root count-bump. See [Slack](../notifications/slack.md) for details. |
 
 At startup the agent logs one `notifiers ready` line listing the active sinks
-(and the Slack channel) so you can see where findings will go. Every analysis
-then logs, at INFO regardless of format:
+(and the Slack channel) so you can see where Situation updates will go.
 
-- one human-readable `finding` summary (severity, confidence, alert count,
-  incident id, analysis name) — the live-watch view of the result; and
-- one `notified` line confirming delivery per sink (`notified · stdout=ok
-  slack=ok …`), so a send — or a sink-specific failure — is never silent.
-
-The full JSON finding (`notify.stdout`, above) is the verbose machine
-representation, reserved for `--log-level=debug`.
-
-See [Slack](../notifications/slack.md) for the full setup walkthrough.
+See [Slack](../notifications/slack.md) for the full Situation Slack contract
+and setup walkthrough.
 
 ## `mcp`
 

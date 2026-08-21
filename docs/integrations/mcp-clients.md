@@ -11,8 +11,10 @@ slug: "mcp-clients"
 **AlertINT** runs a persistent MCP Streamable HTTP server on port 9912,
 started inside `alertint serve` whenever the `ALERTINT_MCP_TOKEN` env var
 is set (presence-based; `mcp.enabled: false` forces it off). Any MCP-capable
-AI agent can connect to it and query incidents, evidence packs, and live
-metrics in natural language.
+AI agent can connect to it and query Situations, incidents, evidence packs,
+and live metrics in natural language — and, with explicit confirmation and
+an asserted operator, record a judgment, promote or revoke an
+Expected-behaviour envelope, or correct a semantic profile.
 
 **Endpoint:** `http://<host>:9912/mcp`
 
@@ -128,10 +130,42 @@ restart Windsurf and check **Settings → MCP Servers**:
 
 ## Available tools
 
+### Situation
+
+Every Situation is visible, including one that was never published to Slack
+and one that has already gone terminal (`recovered`/`closed_unknown`) — a
+terminal `alertint_situation_get` response leads with a status banner.
+
+| Tool | Description |
+|---|---|
+| `alertint_situation_list` | List Situations, most recently updated first, including silent and terminal ones. |
+| `alertint_situation_get` | Get complete detail for one Situation: canonical times, lifecycle/Attention, current Assessment, member Incidents with their L1 acute-analysis gate state, facts, limitations, observation runs, judgments, envelope evaluations, transition history, notification history, the Drill flag, and the linked previous Situation. |
+| `alertint_situation_evidence_get` | Get the Situation's immutable delivery evidence — every accepted source delivery across its member Incidents, in the original ledger order, not a latest-wins Alert projection. |
+| `alertint_situation_reassess` | Request one manual reassessment of a Situation — schedules one elevated attempt and bypasses hash reuse once; cannot bypass scope, concurrency, safety floors, connector allowlists, or budgets. Repeated requests before it runs coalesce into one attempt. |
+| `alertint_situation_judgment_record` | Record the operator's current judgment (`expected_this_episode` \| `unexpected` \| `inconclusive`) tied to the exact input/fact/symptom/impact view judged. Requires explicit confirmation and an asserted operator; steers the existing root, never creates a new one. |
+
+### Expected-behaviour envelopes and semantic profiles
+
+| Tool | Description |
+|---|---|
+| `alertint_expected_behavior_list` | List every Expected-behaviour envelope's current head — active, revoked, and invalidated. |
+| `alertint_expected_behavior_confirm` | Promote a confirmed current judgment into a reusable, versioned envelope, scoped to an exact group and source/trigger identity. Every omitted condition means unknown/not authorized, never unlimited. Requires a confirmed source judgment and explicit confirmation. |
+| `alertint_expected_behavior_revoke` | Revoke an envelope: appends a revoked version and immediately schedules every active Situation that has ever evaluated it for reconsideration. |
+| `alertint_semantic_profile_get` | Get the advisory L0 semantic profile history for a source signature — immutable version history plus current head. Resolve by exact signature or by every distinct signature among a Situation's member deliveries. |
+| `alertint_semantic_profile_correct` | Append an operator-confirmed replacement profile version at an exact expected head version (optimistic concurrency). Requires explicit confirmation and an asserted operator. |
+
+### Local compression
+
+| Tool | Description |
+|---|---|
+| `alertint_poke_funnel_get` | Report the local-compression funnel for a window: accepted deliveries, distinct source episodes, Incidents, Situations, root creates/edits, non-broadcast and broadcast thread replies, envelope reviews, health pokes, and total main-channel pokes. Delivery and source-episode counts are reported separately so retries and recovery deliveries are never counted as avoided interruptions. Same query as `alertint funnel --since <UTC> --until <UTC>`; it does not know external Zabbix-to-Slack message counts — that baseline is observable only from the operator's separate path. |
+
+### Incident, evidence, and telemetry
+
 | Tool | Description |
 |---|---|
 | `alertint_list_incidents` | List incidents with optional status and limit filters. |
-| `alertint_get_incident` | Get full analysis details for one incident by ID, including `operator_history` — the group's governing verdict and age-stamped notes, visible from any incident on the group key. |
+| `alertint_get_incident` | Get full analysis details for one incident by ID, including `acute_finding_status` (`not_requested` \| `planned` \| `running` \| `complete` \| `blocked` \| `exhausted` — the Situation controller's B+ gate decision) and `operator_history` — the group's governing verdict and age-stamped notes, visible from any incident on the group key. |
 | `alertint_search_alerts` | Search raw alerts by label key and value. |
 | `alertint_get_evidence_pack` | Get the evidence pack and Prometheus metrics for an incident. |
 | `alertint_verify_audit` | Verify the hash-chained audit log and report any tampering. |
@@ -144,8 +178,8 @@ restart Windsurf and check **Settings → MCP Servers**:
 | `alertint_incident_annotate` | Attach a permanent, age-stamped operator note to an incident — context for the next investigator; never affects triage or memory recall. |
 | `alertint_incident_capture_verdict` | Capture an operator-confirmed correction or confirmation as a replayable, graded record. A correction steers the next triage of its failure group (tested against live evidence, ruling-gated — never blended in) and demotes the corrected prior from strong recall; a confirmation retires steering. |
 
-Read-only toward your systems, always; feedback writes (the last two tools
-above) land only in AlertINT's own incident state, additive and
-audit-chained. Every other tool reads local **AlertINT** state; the
-Prometheus tools additionally issue queries to the configured Prometheus
-instance — see [Prometheus](prometheus.md).
+Read-only toward your systems, always; every confirmed write above lands
+only in AlertINT's own incident state, additive and audit-chained. Every
+other tool reads local **AlertINT** state; the Prometheus tools additionally
+issue queries to the configured Prometheus instance — see
+[Prometheus](prometheus.md).
