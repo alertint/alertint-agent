@@ -5,6 +5,7 @@ package situation
 import (
 	"testing"
 
+	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
@@ -36,22 +37,36 @@ func TestApplyAttentionFloorsRejectsFabricatedCatalogCandidate(t *testing.T) {
 	}
 }
 
+func TestApplyAttentionFloorsRejectsStructurallyMatchingFloorsBackedByArbitraryFacts(t *testing.T) {
+	for _, code := range []string{"critical_anchor", "confirmed_severe_impact", "expanding_blast_radius", "urgent_policy"} {
+		snapshot, _ := snapshotForReasonEvidence(code)
+		for i := range snapshot.Facts {
+			snapshot.Facts[i] = semanticFact(snapshot.Facts[i].ID, "unrelated", "other", `{"present":true}`, snapshot.Facts[i].EvidenceRefs...)
+			snapshot.Facts[i].ResultStatus = observationmodel.ResultStatusConfirmedValue
+		}
+		var fabricated model.ReasonCandidate
+		switch code {
+		case "critical_anchor":
+			fabricated = newCandidate(code, "active_source_severity_critical", []string{"delivery:critical"}, true)
+		case "confirmed_severe_impact":
+			fabricated = newCandidate(code, "confirmed_severe_availability_or_impact", []string{"fact:availability"}, true)
+		case "expanding_blast_radius":
+			fabricated = newCandidate(code, "configured_urgent_boundary_crossed", []string{"fact:scope-before", "fact:scope-now"}, true)
+		case "urgent_policy":
+			fabricated = newCandidate(code, "active_explicit_scoped_urgent_policy", []string{"policy:1"}, true)
+		}
+		if got := ApplyAttentionFloors(model.AttentionObserve, snapshot, []model.ReasonCandidate{fabricated}); got != model.AttentionObserve {
+			t.Fatalf("%s arbitrary fact granted urgent attention: %s", code, got)
+		}
+	}
+}
+
 func applyAttentionFloorsAgainstSnapshot(proposed model.Attention, snapshot Snapshot, reasons []model.ReasonCandidate) model.Attention {
 	return ApplyAttentionFloors(proposed, snapshot, reasons)
 }
 
 func snapshotForFloor(code string) Snapshot {
-	s := sampleSnapshot()
-	switch code {
-	case "critical_anchor":
-		s.Symptoms = []Symptom{{ID: "critical", Lifecycle: model.DeliveryStatusFiring, Severity: "critical", EvidenceRefs: []string{"delivery:critical"}}}
-	case "confirmed_severe_impact":
-		s.Impact = []ImpactFact{{Kind: "availability", Severity: "severe", Confirmed: true, EvidenceRefs: []string{"fact:availability"}}}
-	case "expanding_blast_radius":
-		s.BlastRadius = &BlastRadius{Previous: 1, Current: 3, UrgentBoundary: 2, EvidenceRefs: []string{"fact:scope-before", "fact:scope-now"}}
-	case "urgent_policy":
-		s.UrgentPolicies = []UrgentPolicy{{ID: "policy:1", Active: true, Scoped: true, EvidenceRefs: []string{"policy:1"}}}
-	}
+	s, _ := snapshotForReasonEvidence(code)
 	return s
 }
 
