@@ -21,9 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Situation controller will surface it as dependency health). Incidents that
   leave `ready` while a retry is
   pending (resolved by their alerts recovering) are dropped without another
-  call. On startup every incident still in `ready` — orphaned by a restart
-  mid-triage or mid-backoff, or by an earlier version — is dispatched once
-  more and enters the same schedule if it fails again. Reported in #60.
+  call. On startup an incident still in `ready` for less than an hour —
+  orphaned by a restart mid-triage or mid-backoff — is dispatched once more
+  and enters the same schedule if it fails again; anything ready for longer
+  (including incidents stuck by earlier versions) is closed out as `failed`
+  without a triage call, so upgrading over a backlog of stuck incidents does
+  not fire one LLM call per incident. Reported in #60.
 
 ## [0.13.3] - 2026-08-18
 

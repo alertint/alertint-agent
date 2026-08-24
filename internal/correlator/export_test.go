@@ -19,3 +19,6 @@ func (c *Correlator) SetNow(now func() time.Time) { c.now = now }
 
 // TriageRetryDelays exposes the backoff schedule to tests.
 var TriageRetryDelays = triageRetryDelays
+
+// StartupRetryWindow exposes the startup recovery cutoff to tests.
+const StartupRetryWindow = startupRetryWindow

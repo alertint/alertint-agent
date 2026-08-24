@@ -64,35 +64,43 @@ type retryHarness struct {
 	now     time.Time
 }
 
-// newRetryHarness inserts one overdue collecting incident (with a member
-// alert) and a correlator whose sink fails the first `failures` calls.
-func newRetryHarness(t *testing.T, failures int) *retryHarness {
+// insertCollectingIncident inserts a collecting incident for group `name`
+// with one member alert, ready at readyAt.
+func insertCollectingIncident(t *testing.T, st *store.Store, name string, readyAt time.Time) store.Incident {
 	t.Helper()
 	ctx := context.Background()
-	st := newTestStore(t)
-	past := time.Now().UTC().Add(-10 * time.Second)
 	inc := store.Incident{
 		ID:           uuid.NewString(),
-		GroupKey:     "alertname=Retry",
-		FirstAlertAt: past,
-		LastAlertAt:  past,
-		ReadyAt:      past,
+		GroupKey:     "alertname=" + name,
+		FirstAlertAt: readyAt,
+		LastAlertAt:  readyAt,
+		ReadyAt:      readyAt,
 		AlertCount:   0, // AddAlertToIncident below brings it to 1
 	}
 	if err := st.InsertIncident(ctx, inc); err != nil {
 		t.Fatalf("insert incident: %v", err)
 	}
-	a := newAlert("fp-retry", map[string]string{"alertname": "Retry"}, past)
+	a := newAlert("fp-"+name, map[string]string{"alertname": name}, readyAt)
 	if _, err := st.UpsertAlertByFingerprint(ctx, a); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 	if err := st.AddAlertToIncident(ctx, inc.ID, a.ID, a.ReceivedAt); err != nil {
 		t.Fatalf("add alert to incident: %v", err)
 	}
+	return inc
+}
+
+// newRetryHarness inserts one overdue collecting incident (with a member
+// alert) and a correlator whose sink fails the first `failures` calls.
+func newRetryHarness(t *testing.T, failures int) *retryHarness {
+	t.Helper()
+	st := newTestStore(t)
+	now := time.Now().UTC()
+	inc := insertCollectingIncident(t, st, "Retry", now.Add(-10*time.Second))
 
 	h := &retryHarness{
 		t: t, st: st, sink: &failingSink{failures: failures}, exhaust: &exhaustCapture{},
-		inc: inc, now: time.Now().UTC(),
+		inc: inc, now: now,
 	}
 	h.cor = correlator.New(correlator.Config{WindowSeconds: 60}, st, h.sink, nil)
 	h.cor.SetNow(func() time.Time { return h.now })
@@ -355,4 +363,50 @@ func TestStartupRecoveryCleanSkipIsDispatchedOnce(t *testing.T) {
 	if s := h.status(); s != "ready" {
 		t.Fatalf("status = %q, want ready", s)
 	}
+}
+
+// TestStartupRecoveryExpiresStaleReadyIncidents: an incident that has been
+// "ready" for longer than the startup window is closed out as "failed" at
+// Start without a sink call or a notifier event, so an upgrade over a
+// backlog of stuck incidents does not become an LLM burst. A fresh one is
+// still re-dispatched.
+func TestStartupRecoveryExpiresStaleReadyIncidents(t *testing.T) {
+	h := newRetryHarness(t, 1000)
+	ctx := context.Background()
+	if err := h.st.MarkIncidentReady(ctx, h.inc.ID); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	stale := insertCollectingIncident(t, h.st, "Stale", h.now.Add(-correlator.StartupRetryWindow-time.Minute))
+	if err := h.st.MarkIncidentReady(ctx, stale.ID); err != nil {
+		t.Fatalf("mark stale ready: %v", err)
+	}
+
+	if err := h.cor.Recover(ctx); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	got, err := h.st.GetIncidentByID(ctx, stale.ID)
+	if err != nil || got == nil {
+		t.Fatalf("get stale: %v", err)
+	}
+	if got.Status != "failed" {
+		t.Fatalf("stale incident status after start = %q, want failed", got.Status)
+	}
+	h.wantCalls(0, "recover itself dispatches nothing")
+	h.wantExhaustEvents(0, "stale closure is silent on the notifier")
+
+	h.flush()
+	h.wantCalls(1, "first tick: only the fresh incident")
+	if h.sink.calls[0] != h.inc.ID {
+		t.Fatalf("dispatched %s, want the fresh incident %s", h.sink.calls[0], h.inc.ID)
+	}
+	// Much later the fresh incident keeps its own schedule; the stale one is
+	// never dispatched.
+	h.now = h.now.Add(24 * time.Hour)
+	h.flush()
+	for _, id := range h.sink.calls {
+		if id == stale.ID {
+			t.Fatalf("stale incident %s was dispatched", stale.ID)
+		}
+	}
+	h.wantExhaustEvents(0, "still no event for the stale one")
 }

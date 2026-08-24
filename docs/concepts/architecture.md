@@ -224,8 +224,11 @@ collecting  →  ready  →  (skill running)  →  analyzed
   the stdout notifier as one `{"kind":"triage_exhausted",…}` line — no Slack
   card, so an LLM outage never becomes one card per stuck incident). A later firing
   of the same group opens a fresh incident. Retry state lives in memory, so
-  on startup every incident still in `ready` is dispatched once more — a
-  restart mid-triage or mid-backoff does not strand it
+  on startup an incident still in `ready` is dispatched once more if it has
+  been ready for less than an hour — a restart mid-triage or mid-backoff does
+  not strand it. Older ones are closed out as `failed` without a triage call
+  (audited with reason `startup_retry_window_expired`, one summary log line),
+  so an upgrade over a backlog of stuck incidents does not become an LLM burst
 
 A recurrence of an `analyzed` incident attaches as an occurrence rather than
 minting a new row — the lifecycle above describes one incident, not one

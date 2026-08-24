@@ -24,6 +24,15 @@ var triageRetryDelays = []time.Duration{
 	32 * time.Minute,
 }
 
+// startupRetryWindow bounds startup recovery: an incident that has been
+// "ready" for longer than this is closed out as "failed" without a triage
+// call instead of being re-dispatched, so an upgrade over a long backlog of
+// stuck incidents does not turn into an LLM burst. It matches the ~43 min
+// retry horizon: had the process stayed up, such an incident would have
+// exhausted its schedule by now. A condition that is still active re-fires
+// and opens a fresh incident.
+const startupRetryWindow = time.Hour
+
 // triageRetry is the in-memory retry state for one incident. The correlator
 // keeps it only for incidents whose sink call errored — an incident the skill
 // deliberately leaves in "ready" (below min_alerts, no member alerts) returns
@@ -44,20 +53,48 @@ type triageRetry struct {
 	lastErr   error
 }
 
-// seedTriageRetries registers every incident still in "ready" for one
-// dispatch on the next tick. Called from Start: a previous process may have
-// died mid-triage or exited during the backoff, and nothing else re-reads
-// ready rows. Clean skips cost one nil sink call per restart.
+// seedTriageRetries handles every incident still in "ready" at Start: a
+// previous process may have died mid-triage or exited during the backoff, and
+// nothing else re-reads ready rows. Incidents ready for less than
+// startupRetryWindow are registered for one dispatch on the next tick (clean
+// skips cost one nil sink call per restart); older ones are marked "failed"
+// outright, audited with reason startup_retry_window_expired, and never sent
+// to the sink or the notifier — one summary log line covers them.
 func (c *Correlator) seedTriageRetries(ctx context.Context) error {
 	incs, err := c.st.ListReadyIncidents(ctx)
 	if err != nil {
 		return err
 	}
+	now := c.now().UTC()
+	var seeded, expired int
 	for _, inc := range incs {
-		c.retries[inc.ID] = &triageRetry{groupKey: inc.GroupKey, alertCount: inc.AlertCount}
+		if now.Sub(inc.ReadyAt) <= startupRetryWindow {
+			c.retries[inc.ID] = &triageRetry{groupKey: inc.GroupKey, alertCount: inc.AlertCount}
+			seeded++
+			continue
+		}
+		if err := c.st.MarkIncidentFailed(ctx, inc.ID); err != nil {
+			c.logger.Error("correlator: startup recovery: mark stale incident failed",
+				"incident_id", inc.ID, "group_key", inc.GroupKey, "err", err)
+			continue
+		}
+		expired++
+		if c.auditor != nil {
+			if err := c.auditor.Append(ctx, "correlator", "incident.triage_exhausted", map[string]any{
+				"incident_id": inc.ID,
+				"group_key":   inc.GroupKey,
+				"attempts":    0,
+				"reason":      "startup_retry_window_expired",
+				"ready_at":    inc.ReadyAt.UTC(),
+			}); err != nil {
+				c.logger.Warn("correlator: audit stale incident failed", "incident_id", inc.ID, "err", err)
+			}
+		}
 	}
 	if len(incs) > 0 {
-		c.logger.Info("correlator: startup recovery: re-dispatching ready incidents", "ready_incidents", len(incs))
+		c.logger.Warn("correlator: startup recovery: ready incidents found",
+			"ready_incidents", len(incs), "redispatch", seeded,
+			"marked_failed", expired, "retry_window", startupRetryWindow)
 	}
 	return nil
 }
@@ -121,6 +158,7 @@ func (c *Correlator) closeExhausted(ctx context.Context, id string, r *triageRet
 			"incident_id": id,
 			"group_key":   r.groupKey,
 			"attempts":    r.failures,
+			"reason":      "max_attempts",
 			"error":       r.lastErr.Error(),
 		}); err != nil {
 			c.logger.Warn("correlator: audit triage exhausted", "incident_id", id, "err", err)
