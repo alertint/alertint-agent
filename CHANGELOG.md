@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Triage failures no longer strand incidents in `ready` forever. When the
+  triage skill returns an error (LLM endpoint down, connector failure,
+  persistence error) the correlator now re-dispatches the incident with
+  backoff — 30 s, 2 min, 8 min, 32 min — and after five failed attempts moves
+  it to the terminal `failed` status the architecture doc already promised:
+  visible over MCP, logged as `triage exhausted`, audited as
+  `incident.triage_exhausted`, and written to the stdout notifier as one
+  `{"kind":"triage_exhausted",…}` line per incident (no Slack card by design —
+  an LLM outage across thirty incidents should be one signal, not thirty; the
+  Situation controller will surface it as dependency health). Incidents that
+  leave `ready` while a retry is
+  pending (resolved by their alerts recovering) are dropped without another
+  call. On startup an incident still in `ready` for less than an hour —
+  orphaned by a restart mid-triage or mid-backoff — is dispatched once more
+  and enters the same schedule if it fails again; anything ready for longer
+  (including incidents stuck by earlier versions) is closed out as `failed`
+  without a triage call, so upgrading over a backlog of stuck incidents does
+  not fire one LLM call per incident. Reported in #60.
+
 ## [0.13.3] - 2026-08-18
 
 ### Security

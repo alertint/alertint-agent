@@ -247,7 +247,12 @@ then logs, at INFO regardless of format:
   slack=ok …`), so a send — or a sink-specific failure — is never silent.
 
 The full JSON finding (`notify.stdout`, above) is the verbose machine
-representation, reserved for `--log-level=debug`.
+representation, reserved for `--log-level=debug`. Independently of log level,
+the stdout sink always writes one JSON line for each event that is *not* a
+finding: a recurrence attach (`"kind":"occurrence"`), an operator annotation
+(`"kind":"annotation"`), and an incident whose triage failed on every retry
+(`"kind":"triage_exhausted"`, carrying the incident id, attempt count, and the
+last error).
 
 See [Slack](../notifications/slack.md) for the full setup walkthrough.
 

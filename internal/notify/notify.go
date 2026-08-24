@@ -303,6 +303,49 @@ func (m *Multi) OnOccurrenceAttached(ctx context.Context, ev RecurrenceEvent) er
 	return first
 }
 
+// TriageExhaustedEvent is emitted once when an incident's triage failed on
+// every scheduled attempt and the incident was moved to the terminal "failed"
+// status — one event per incident, never per attempt, so an LLM outage across
+// N incidents produces N lines spread over the backoff horizon, not N×5.
+type TriageExhaustedEvent struct {
+	IncidentID string `json:"incident_id"`
+	GroupKey   string `json:"group_key"`
+	AlertCount int    `json:"alert_count"`
+	Attempts   int    `json:"attempts"`
+	Error      string `json:"error"` // last attempt's error
+}
+
+// TriageFailureSink is an optional capability: a Notifier that also renders a
+// triage-exhausted event. Sinks that don't implement it are skipped; the Slack
+// sink deliberately does not, so an LLM outage never becomes one card per
+// stuck incident (the Situation controller surfaces it as dependency health).
+type TriageFailureSink interface {
+	OnTriageExhausted(ctx context.Context, ev TriageExhaustedEvent) error
+}
+
+// OnTriageExhausted fans a triage-exhausted event out to every contained
+// notifier that implements TriageFailureSink, returning the first sink error.
+func (m *Multi) OnTriageExhausted(ctx context.Context, ev TriageExhaustedEvent) error {
+	var first error
+	for _, n := range m.notifiers {
+		s, ok := n.(TriageFailureSink)
+		if !ok {
+			continue
+		}
+		if err := s.OnTriageExhausted(ctx, ev); err != nil {
+			m.logger.Warn("notify triage-exhausted sink failed",
+				slog.String("sink", n.Name()),
+				slog.String("incident", ev.IncidentID),
+				slog.String("err", err.Error()),
+			)
+			if first == nil {
+				first = err
+			}
+		}
+	}
+	return first
+}
+
 // AnnotationEvent is an operator write-back (annotate or verdict capture)
 // fanned out to sinks: a Slack thread reply on the incident's existing card
 // and a stdout JSON line. VerdictVersion is >0 when the event came from

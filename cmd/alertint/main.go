@@ -344,6 +344,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	cor.SetAuditor(auditor)
 	cor.SetRejudger(skill)
 	cor.SetOccurrenceNotifier(notifier)
+	cor.SetTriageFailureNotifier(notifier)
 
 	if err := cor.Start(ctx); err != nil {
 		return fmt.Errorf("correlator start: %w", err)

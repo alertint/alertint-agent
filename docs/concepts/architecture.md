@@ -209,13 +209,26 @@ That root cause is wrong — it was the cache rollout. Capture that as a correct
 
 ```text
 collecting  →  ready  →  (skill running)  →  analyzed
-                                          →  failed
+                 ↑              │
+                 └── retry ─────┘  →  failed (after 5 attempts)
 ```
 
 - `collecting`: window is open, alerts arriving
-- `ready`: window expired, incident dispatched to the triage skill
+- `ready`: window expired, incident dispatched to the triage skill. If the
+  skill errors (LLM endpoint down, connector failure, persistence error) the
+  incident stays here and is re-dispatched with backoff — 30 s, 2 min, 8 min,
+  32 min — from the correlator's flush ticker
 - `analyzed`: LLM output persisted
-- `failed`: LLM call or persistence error (logged; retry is on the roadmap)
+- `failed`: every attempt errored; the incident is closed out (logged as
+  `triage exhausted`, audited as `incident.triage_exhausted`, and written to
+  the stdout notifier as one `{"kind":"triage_exhausted",…}` line — no Slack
+  card, so an LLM outage never becomes one card per stuck incident). A later firing
+  of the same group opens a fresh incident. Retry state lives in memory, so
+  on startup an incident still in `ready` is dispatched once more if it has
+  been ready for less than an hour — a restart mid-triage or mid-backoff does
+  not strand it. Older ones are closed out as `failed` without a triage call
+  (audited with reason `startup_retry_window_expired`, one summary log line),
+  so an upgrade over a backlog of stuck incidents does not become an LLM burst
 
 A recurrence of an `analyzed` incident attaches as an occurrence rather than
 minting a new row — the lifecycle above describes one incident, not one

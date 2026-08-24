@@ -109,3 +109,38 @@ func TestNotify_UnverifiedCaveat(t *testing.T) {
 		t.Errorf("caveat = %v, want empty/nil for verified finding", caveat)
 	}
 }
+
+func TestOnTriageExhausted_WritesLineAlways(t *testing.T) {
+	var buf bytes.Buffer
+	// verbose=false: the line is written regardless — it is the visible
+	// failure signal on stdout.
+	n := New(&buf, nil, false)
+
+	err := n.OnTriageExhausted(context.Background(), notify.TriageExhaustedEvent{
+		IncidentID: "i1", GroupKey: "k", AlertCount: 3, Attempts: 5,
+		Error: "acutetriage: llm: connection refused",
+	})
+	if err != nil {
+		t.Fatalf("OnTriageExhausted: %v", err)
+	}
+
+	var line map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &line); err != nil {
+		t.Fatalf("triage_exhausted line not valid JSON: %v (%q)", err, buf.String())
+	}
+	if line["kind"] != "triage_exhausted" {
+		t.Errorf("kind = %v, want triage_exhausted", line["kind"])
+	}
+	if line["incident_id"] != "i1" || line["group_key"] != "k" {
+		t.Errorf("identity = %v/%v, want i1/k", line["incident_id"], line["group_key"])
+	}
+	if got, _ := line["attempts"].(float64); got != 5 {
+		t.Errorf("attempts = %v, want 5", line["attempts"])
+	}
+	if got, _ := line["alert_count"].(float64); got != 3 {
+		t.Errorf("alert_count = %v, want 3", line["alert_count"])
+	}
+	if line["error"] != "acutetriage: llm: connection refused" {
+		t.Errorf("error = %v", line["error"])
+	}
+}
