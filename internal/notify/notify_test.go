@@ -47,6 +47,32 @@ func TestMulti_OnOccurrenceAttachedFansOutOnlyToCapableSinks(t *testing.T) {
 	// A plain sink is skipped without panicking — reaching here proves it.
 }
 
+// triageCapableSink is a Notifier that also implements notify.TriageFailureSink.
+type triageCapableSink struct {
+	fakeNotifier
+
+	got []notify.TriageExhaustedEvent
+}
+
+func (s *triageCapableSink) OnTriageExhausted(_ context.Context, ev notify.TriageExhaustedEvent) error {
+	s.got = append(s.got, ev)
+	return nil
+}
+
+func TestMulti_OnTriageExhaustedFansOutOnlyToCapableSinks(t *testing.T) {
+	sink := &triageCapableSink{fakeNotifier: fakeNotifier{name: "stdout"}}
+	plain := &fakeNotifier{name: "plain"} // no OnTriageExhausted (the Slack shape)
+	m := notify.NewMulti(slog.Default(), sink, plain)
+
+	ev := notify.TriageExhaustedEvent{IncidentID: "i1", GroupKey: "k", Attempts: 5, Error: "llm down"}
+	if err := m.OnTriageExhausted(context.Background(), ev); err != nil {
+		t.Fatalf("OnTriageExhausted: %v", err)
+	}
+	if len(sink.got) != 1 || sink.got[0] != ev {
+		t.Errorf("capable sink got %+v, want exactly [%+v]", sink.got, ev)
+	}
+}
+
 // annCapableSink is a Notifier that also implements notify.AnnotationSink.
 type annCapableSink struct {
 	fakeNotifier

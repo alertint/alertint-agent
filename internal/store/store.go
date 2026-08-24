@@ -526,6 +526,32 @@ func (s *Store) MarkIncidentReady(ctx context.Context, incidentID string) error 
 	return nil
 }
 
+// MarkIncidentFailed transitions an incident from "ready" to the terminal
+// "failed" status once triage dispatch has exhausted its retry budget. Only
+// "ready" qualifies: an incident that was analyzed or resolved in the
+// meantime keeps that status. Returns ErrNotFound if no such ready incident
+// exists.
+func (s *Store) MarkIncidentFailed(ctx context.Context, incidentID string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE incidents
+		SET status     = 'failed',
+		    updated_at = ?
+		WHERE id = ? AND status = 'ready'
+	`, now, incidentID)
+	if err != nil {
+		return fmt.Errorf("store: mark incident failed: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: mark incident failed rows: %w", err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // ListCollectingIncidents returns all incidents in status "collecting",
 // ordered by ready_at ascending (soonest deadline first).
 func (s *Store) ListCollectingIncidents(ctx context.Context) ([]Incident, error) {

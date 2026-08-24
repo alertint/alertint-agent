@@ -126,6 +126,45 @@ func (n *Notifier) OnOccurrenceAttached(ctx context.Context, ev notify.Recurrenc
 	return nil
 }
 
+// triageExhaustedLine is the JSON shape written when an incident's triage
+// has failed on every scheduled attempt.
+type triageExhaustedLine struct {
+	Ts         time.Time `json:"ts"`
+	Kind       string    `json:"kind"` // "triage_exhausted"
+	IncidentID string    `json:"incident_id"`
+	GroupKey   string    `json:"group_key"`
+	AlertCount int       `json:"alert_count"`
+	Attempts   int       `json:"attempts"`
+	Error      string    `json:"error"`
+}
+
+// OnTriageExhausted writes one JSON line when an incident is closed out as
+// "failed" — always (not verbose-gated): it IS the visible failure signal on
+// stdout, the one place an operator without Slack sees that an incident got
+// no finding.
+func (n *Notifier) OnTriageExhausted(ctx context.Context, ev notify.TriageExhaustedEvent) error {
+	l := triageExhaustedLine{
+		Ts: n.now(), Kind: "triage_exhausted",
+		IncidentID: ev.IncidentID, GroupKey: ev.GroupKey,
+		AlertCount: ev.AlertCount, Attempts: ev.Attempts, Error: ev.Error,
+	}
+	b, err := json.Marshal(l)
+	if err != nil {
+		return fmt.Errorf("stdout notifier: marshal triage exhausted: %w", err)
+	}
+	if _, err := fmt.Fprintf(n.w, "%s\n", b); err != nil {
+		return fmt.Errorf("stdout notifier: write triage exhausted: %w", err)
+	}
+	if n.auditor != nil {
+		_ = n.auditor.Append(ctx, "notify.stdout", "notify.triage_exhausted", map[string]any{
+			"incident_id": ev.IncidentID,
+			"attempts":    ev.Attempts,
+			"recipient":   "stdout",
+		})
+	}
+	return nil
+}
+
 // annotationLine is the JSON shape written for each operator annotation.
 type annotationLine struct {
 	Ts             time.Time `json:"ts"`

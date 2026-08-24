@@ -429,3 +429,59 @@ func TestMaxSchemaVersion(t *testing.T) {
 		t.Errorf("MaxSchemaVersion = %d, want >= 10", got)
 	}
 }
+
+// TestMarkIncidentFailed_OnlyFromReady confirms the terminal "failed"
+// transition applies to "ready" incidents only — an incident that was
+// analyzed, resolved, or is still collecting keeps its status.
+func TestMarkIncidentFailed_OnlyFromReady(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	cases := []struct {
+		setStatus  string
+		wantErr    error
+		wantStatus string
+	}{
+		{"ready", nil, "failed"},
+		{"collecting", ErrNotFound, "collecting"},
+		{"analyzed", ErrNotFound, "analyzed"},
+		{"resolved", ErrNotFound, "resolved"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.setStatus, func(t *testing.T) {
+			id := uuid.NewString()
+			inc := Incident{
+				ID:           id,
+				GroupKey:     "test=failed-" + tc.setStatus,
+				FirstAlertAt: now,
+				LastAlertAt:  now,
+				ReadyAt:      now.Add(time.Minute),
+			}
+			if err := s.InsertIncident(ctx, inc); err != nil {
+				t.Fatalf("insert: %v", err)
+			}
+			if _, err := s.db.ExecContext(ctx,
+				`UPDATE incidents SET status=?, updated_at=? WHERE id=?`,
+				tc.setStatus, now.Format(time.RFC3339Nano), id,
+			); err != nil {
+				t.Fatalf("set status %s: %v", tc.setStatus, err)
+			}
+
+			err := s.MarkIncidentFailed(ctx, id)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("MarkIncidentFailed from %s: err = %v, want %v", tc.setStatus, err, tc.wantErr)
+			}
+
+			var got string
+			if err := s.db.QueryRowContext(ctx,
+				`SELECT status FROM incidents WHERE id=?`, id,
+			).Scan(&got); err != nil {
+				t.Fatalf("read back: %v", err)
+			}
+			if got != tc.wantStatus {
+				t.Errorf("status = %q, want %q", got, tc.wantStatus)
+			}
+		})
+	}
+}
