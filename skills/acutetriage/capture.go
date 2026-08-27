@@ -316,7 +316,7 @@ func (e *CaptureEngine) widen(ctx context.Context, incidentID string, exprs []st
 		qCtx, cancel := context.WithTimeout(phaseCtx, perQuery)
 		runPromQL(qCtx, prom, &q, maxSeries, now, e.sk.logger, incidentID)
 		cancel()
-		if q.Outcome == OutcomeFailed || q.Outcome == OutcomeDegraded {
+		if q.Outcome == OutcomeFailed || q.Outcome == OutcomeDegraded || q.Outcome == OutcomeInvalid {
 			warnings = append(warnings, fmt.Sprintf("widening fetch failed for %q (%s) — capture degraded, verdict persisted", expr, q.Outcome))
 		}
 		out = append(out, q)

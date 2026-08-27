@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -391,6 +392,44 @@ func TestCaptureVerdict_FailedWideningDegradesNotAborts(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("warnings should mention the failed fetch: %v", res.Warnings)
+	}
+}
+
+// TestCaptureVerdict_InvalidWideningDegradesNotAborts covers a widen expr
+// that fails LOCAL PromQL validation (issue #62: a function call followed by
+// a bare "by (...)" clause, e.g. `func(...) by (...)` instead of `agg by
+// (...) (func(...))`) — it must never reach Prometheus at all, land as
+// OutcomeInvalid, and still only degrade the capture with a warning, never
+// abort the persist phase (mirrors TestCaptureVerdict_FailedWideningDegradesNotAborts
+// for the backend-rejected case).
+func TestCaptureVerdict_InvalidWideningDegradesNotAborts(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	inc := seedAnalyzedIncidentOnKey(t, st)
+	sink := &fakeAnnotationSink{}
+	eng := acutetriage.NewCaptureEngine(skillForCaptureWithProm(t, st, sink, promHealthy(t)))
+
+	res, err := eng.CaptureVerdict(ctx, acutetriage.CaptureRequest{
+		IncidentID: inc.ID, Verdict: "correction",
+		Expectation:  json.RawMessage(`{"must_not_conclude":["AZ outage"]}`),
+		WidenQueries: []string{`increase(metric_name[1h]) by (type)`},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := st.LatestIncidentVerdict(ctx, inc.ID)
+	if err != nil || v == nil {
+		t.Fatalf("verdict row must exist: v=%+v err=%v", v, err)
+	}
+	var widened []acutetriage.VerificationQuery
+	if err := json.Unmarshal([]byte(v.WidenedJSON), &widened); err != nil {
+		t.Fatal(err)
+	}
+	if len(widened) != 1 || widened[0].Outcome != acutetriage.OutcomeInvalid {
+		t.Fatalf("invalid widening outcome = %+v", widened)
+	}
+	if !slices.ContainsFunc(res.Warnings, func(s string) bool { return strings.Contains(s, "widening fetch failed") }) {
+		t.Fatalf("missing invalid-widen warning: %v", res.Warnings)
 	}
 }
 

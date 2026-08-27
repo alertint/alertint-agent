@@ -7,12 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
 
+	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/internal/zabbix"
 )
@@ -28,6 +30,38 @@ type fakeQuerier func(expr string) (json.RawMessage, error)
 
 func (f fakeQuerier) QueryInstant(_ context.Context, expr string, _ time.Time, _ int) (json.RawMessage, error) {
 	return f(expr)
+}
+
+// TestRunPromQLRejectsInvalidLocally covers issue #62: a model-proposed
+// expression that fails local PromQL validation must never reach the
+// querier at all — it is marked invalid and not executed.
+func TestRunPromQLRejectsInvalidLocally(t *testing.T) {
+	calls := 0
+	prom := fakeQuerier(func(string) (json.RawMessage, error) {
+		calls++
+		return nil, nil
+	})
+	q := VerificationQuery{Kind: kindPromQL, Source: "model", Expr: `increase(metric_name[1h]) by (type)`}
+	runPromQL(context.Background(), prom, &q, 100, time.Now(), slog.Default(), "inc-62")
+	if calls != 0 || q.Outcome != OutcomeInvalid || q.Result != "invalid query (not executed)" {
+		t.Fatalf("calls=%d query=%+v", calls, q)
+	}
+}
+
+func TestClassifyErrBadDataIsInvalid(t *testing.T) {
+	q := VerificationQuery{}
+	classifyErr(&q, &promclient.APIError{StatusCode: 422, Type: "bad_data", Message: `invalid parameter "query": parse error`})
+	if q.Outcome != OutcomeInvalid {
+		t.Fatalf("outcome = %q, want invalid", q.Outcome)
+	}
+}
+
+func TestClassifyErrNonQueryBadDataIsFailed(t *testing.T) {
+	q := VerificationQuery{}
+	classifyErr(&q, &promclient.APIError{StatusCode: 400, Type: "bad_data", Message: `invalid parameter "limit"`})
+	if q.Outcome != OutcomeFailed {
+		t.Fatalf("outcome = %q, want failed", q.Outcome)
+	}
 }
 
 // fakeState is the verifyStateReader test double: a canned (total, top, err)

@@ -1104,20 +1104,25 @@ func (s *Skill) auditVerificationPlanned(ctx context.Context, inc store.Incident
 	})
 }
 
-// auditVerificationExecuted records the round result: outcome, fetched/failed
-// query counts (an empty answer counts as fetched — "asked, nothing there"), and
-// whether the confidence clamp fired. No metric values.
+// auditVerificationExecuted records the round result: outcome,
+// fetched/failed/invalid query counts (an empty answer counts as fetched —
+// "asked, nothing there"; invalid is counted separately from failed since it
+// is a model-quality signal, never a backend outage, and was never executed
+// against the backend), and whether the confidence clamp fired. No
+// expressions, no metric values.
 func (s *Skill) auditVerificationExecuted(ctx context.Context, incidentID, outcome string, round *VerificationRound, clamped bool) {
 	if s.auditor == nil {
 		return
 	}
-	var fetched, failed int
+	var fetched, failed, invalid int
 	for _, q := range round.Queries {
 		switch q.Outcome {
 		case OutcomeFetched, OutcomeEmpty:
 			fetched++
 		case OutcomeFailed, OutcomeDegraded:
 			failed++
+		case OutcomeInvalid:
+			invalid++
 		case OutcomeNoSelector:
 			// Metric-enrichment-only outcome; never set on a verification query.
 		}
@@ -1127,6 +1132,7 @@ func (s *Skill) auditVerificationExecuted(ctx context.Context, incidentID, outco
 		"outcome":     outcome,
 		"fetched":     fetched,
 		"failed":      failed,
+		"invalid":     invalid,
 		"clamped":     clamped,
 	})
 }

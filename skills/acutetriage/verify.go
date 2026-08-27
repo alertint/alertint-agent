@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/internal/zabbix"
 )
@@ -394,12 +395,23 @@ func runVerificationWith(ctx context.Context, exec queryExecutor, params Verific
 	// split would squeeze a legitimately slower query into the same share as
 	// a single aggregate query and misreport it as degraded/timed-out under
 	// load that Zabbix itself, not the query shape, caused.
+	// A query already resolved OutcomeInvalid (Task 5's repair step marks a
+	// residual-invalid query before this call runs) is excluded from both the
+	// weight split and dispatch: it was never going to be sent to the
+	// backend, so it must not shrink every other query's slice, nor pay for
+	// an executor call whose outcome would just be overwritten right back to
+	// what it already is.
 	totalWeight := 0
 	for i := range queries {
-		totalWeight += queryWeight(queries[i].Kind)
+		if queries[i].Outcome != OutcomeInvalid {
+			totalWeight += queryWeight(queries[i].Kind)
+		}
 	}
 
 	for i := range queries {
+		if queries[i].Outcome == OutcomeInvalid {
+			continue
+		}
 		slice := budget * time.Duration(queryWeight(queries[i].Kind)) / time.Duration(totalWeight)
 		if slice < minPerQueryTimeout {
 			slice = minPerQueryTimeout
@@ -500,6 +512,15 @@ func runIncidentsInWindow(ctx context.Context, state verifyStateReader, q *Verif
 	q.Result = capText(flattenRecalled(renderIncidentsInWindowResult(total, top, windowMinutes)), 400)
 }
 
+// markInvalid marks q as a locally invalid PromQL expression: it is never
+// sent to the backend at all, so it must never read as empty data (a real
+// "asked, nothing there" answer) or as a backend failure — it is its own
+// unfetched, inconclusive outcome (ADR-0043).
+func markInvalid(q *VerificationQuery) {
+	q.Outcome = OutcomeInvalid
+	q.Result = "invalid query (not executed)"
+}
+
 // runPromQL executes one model-proposed promql query, server-side bounded by
 // maxSeries (prometheus.max_series — R3). Rendered as series-identity/value
 // pairs, capped at maxSnapshotsPerScope lines (mirrors the metric-enrichment
@@ -508,6 +529,12 @@ func runPromQL(ctx context.Context, prom metricQuerier, q *VerificationQuery, ma
 	if prom == nil {
 		q.Outcome = OutcomeFailed
 		q.Result = renderUnavailable("prometheus not configured")
+		return
+	}
+	if err := promclient.ValidateExpr(q.Expr); err != nil {
+		logger.Warn("acutetriage: verify: promql query invalid; not executed",
+			"source", q.Source, "expr", q.Expr, "err", err, "incident", incidentID)
+		markInvalid(q)
 		return
 	}
 	data, err := prom.QueryInstant(ctx, q.Expr, now, maxSeries)
@@ -543,10 +570,25 @@ func isHardErr(err error) bool {
 	return err != nil && !errors.Is(err, context.DeadlineExceeded)
 }
 
-// classifyErr maps a single query error to its Outcome/Result: a timeout is
-// OutcomeDegraded (mirroring the 0.7.3 slow-is-not-down distinction in
-// FetchMetrics/classify); any other error is OutcomeFailed.
+// resultInvalidBackendRejected renders a query the backend itself rejected as
+// malformed (promclient.IsInvalidQuery) — distinguishable from
+// markInvalid's local-not-executed text so the final re-judge (and the
+// Finding card) can tell the two invalid paths apart (ADR-0043).
+const resultInvalidBackendRejected = "invalid query (backend rejected)"
+
+// classifyErr maps a single query error to its Outcome/Result: a
+// query-specific backend bad_data response (promclient.IsInvalidQuery) is
+// OutcomeInvalid — checked before timeout/hard-error handling, since it is a
+// query-construction defect, not a backend health signal. Otherwise a
+// timeout is OutcomeDegraded (mirroring the 0.7.3 slow-is-not-down
+// distinction in FetchMetrics/classify); any other error, including a
+// non-query bad_data, is OutcomeFailed.
 func classifyErr(q *VerificationQuery, err error) {
+	if promclient.IsInvalidQuery(err) {
+		q.Outcome = OutcomeInvalid
+		q.Result = resultInvalidBackendRejected
+		return
+	}
 	if isHardErr(err) {
 		q.Outcome = OutcomeFailed
 		q.Result = renderUnavailable("failed")
@@ -557,10 +599,17 @@ func classifyErr(q *VerificationQuery, err error) {
 }
 
 // classifyPairErrs is classifyErr for up_ratio's two sub-queries sharing one
-// outcome: a hard error on either sum or count wins over a mere timeout on
-// the other (the more actionable outage — same precedent as FetchMetrics'
+// outcome: a query-specific backend bad_data on either sub-query wins first
+// (same query-construction-defect precedence as classifyErr); otherwise a
+// hard error on either sum or count wins over a mere timeout on the other
+// (the more actionable outage — same precedent as FetchMetrics'
 // anyHardErr/anyTimeout: "hard error beats timeout").
 func classifyPairErrs(q *VerificationQuery, sumErr, countErr error) {
+	if promclient.IsInvalidQuery(sumErr) || promclient.IsInvalidQuery(countErr) {
+		q.Outcome = OutcomeInvalid
+		q.Result = resultInvalidBackendRejected
+		return
+	}
 	if isHardErr(sumErr) || isHardErr(countErr) {
 		q.Outcome = OutcomeFailed
 		q.Result = renderUnavailable("failed")
@@ -704,9 +753,10 @@ func isRealFloorSource(q VerificationQuery) bool {
 }
 
 // anyUnfetched is the second R15 rail, backing the confidence clamp: any
-// query — floor OR model — that failed or degraded. An empty result still
-// counts as fetched here ("asked, nothing there" is itself an answer), so
-// only OutcomeFailed/OutcomeDegraded trip it directly.
+// query — floor OR model — that failed, degraded, or was never executed at
+// all because it was invalid. An empty result still counts as fetched here
+// ("asked, nothing there" is itself an answer), so only
+// OutcomeFailed/OutcomeDegraded/OutcomeInvalid trip it directly.
 //
 // It also trips symmetrically with floorFetched's zero-real-backend fix: a
 // round whose only floor member is kindIncidentsInWindow (this install's own
@@ -725,7 +775,7 @@ func anyUnfetched(r *VerificationRound) bool {
 	}
 	sawRealFloorSource := false
 	for _, q := range r.Queries {
-		if q.Outcome == OutcomeFailed || q.Outcome == OutcomeDegraded {
+		if q.Outcome == OutcomeFailed || q.Outcome == OutcomeDegraded || q.Outcome == OutcomeInvalid {
 			return true
 		}
 		if isRealFloorSource(q) {
