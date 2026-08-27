@@ -30,9 +30,17 @@ const (
 	DeliveryRecoveryPending = "recovery_pending"
 	DeliveryRecovered       = "recovered"
 	DeliverySuppressed      = "suppressed"
+	// DeliveryIndeterminate: a root POST was started (persisted before the
+	// HTTP call) and its outcome is unknown — a transport failure after the
+	// request may have been accepted, or a crash before the coordinates were
+	// written. Slack may hold a root, so it is never re-posted.
+	DeliveryIndeterminate = "indeterminate"
 
 	minProbeInterval   = time.Minute
 	maxContentSubjects = 8
+	// unsupportedRecheck bounds how long an "unsupported" probe verdict
+	// suppresses idle probing in-process before the route is re-validated.
+	unsupportedRecheck = time.Hour
 )
 
 // Auditor is the subset of internal/audit.Auditor the tracker needs.
@@ -149,19 +157,22 @@ func New(ctx context.Context, st *store.Store, opts Options) (*Tracker, error) {
 	}
 
 	now := opts.Now()
+	// probeUnsupported is deliberately NOT restored from rec.LastProbeOutcome:
+	// the verdict is process-local, because the endpoint or provider it was
+	// reached against may have changed in config across the restart. The
+	// first idle window after boot re-validates the route.
 	return &Tracker{
-		st:               st,
-		now:              opts.Now,
-		logger:           opts.Logger,
-		auditor:          opts.Auditor,
-		broadcastAfter:   opts.BroadcastAfter,
-		idleAfter:        opts.IdleProbeAfter,
-		rec:              rec,
-		caps:             caps,
-		inFlight:         0,
-		idleSince:        now,
-		probeUnsupported: rec.LastProbeOutcome == string(llm.ProbeUnsupported),
-		kick:             make(chan struct{}, 1),
+		st:             st,
+		now:            opts.Now,
+		logger:         opts.Logger,
+		auditor:        opts.Auditor,
+		broadcastAfter: opts.BroadcastAfter,
+		idleAfter:      opts.IdleProbeAfter,
+		rec:            rec,
+		caps:           caps,
+		inFlight:       0,
+		idleSince:      now,
+		kick:           make(chan struct{}, 1),
 	}, nil
 }
 
@@ -314,8 +325,10 @@ func (t *Tracker) Snapshot() Snapshot {
 }
 
 // ProbeDue reports whether an idle reachability probe should run now: no
-// in-flight call, no known-unsupported route, at least idleAfter since the
-// last completed real call, and at least one minute since the last probe.
+// in-flight call, at least idleAfter since the last completed real call, at
+// least one minute since the last probe, and — after an "unsupported"
+// verdict — at least unsupportedRecheck since that probe, so a backend that
+// gains a probe route is discovered without a restart.
 func (t *Tracker) ProbeDue(now time.Time) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -323,7 +336,10 @@ func (t *Tracker) ProbeDue(now time.Time) bool {
 	// below: if a probe does run off this decision, ObserveProbe compares
 	// against this snapshot to detect a real call that raced it.
 	t.probeReservedGen = t.activityGen
-	if t.probeUnsupported || t.inFlight > 0 {
+	if t.inFlight > 0 {
+		return false
+	}
+	if t.probeUnsupported && (t.rec.LastProbeAt == nil || now.Sub(*t.rec.LastProbeAt) < unsupportedRecheck) {
 		return false
 	}
 	if now.Sub(t.idleSince) < t.idleAfter {
@@ -529,7 +545,11 @@ func (t *Tracker) recompute(now time.Time) bool {
 		switch t.rec.SlackDelivery {
 		case DeliveryDelivered:
 			t.rec.SlackDelivery = DeliveryRecoveryPending
-		case DeliveryNone, DeliveryPending:
+		case DeliveryNone, DeliveryPending, DeliveryIndeterminate:
+			// No confirmed root to edit. If an indeterminate post later
+			// turns out to have succeeded (its result arrives after this
+			// recovery), applyDeliveryResult adopts the root and moves this
+			// to recovery_pending so it still gets its recovery edit.
 			t.rec.SlackDelivery = DeliverySuppressed
 			t.auditAppend("llm.health.slack_suppressed", map[string]any{
 				"generation": t.rec.OutageGeneration, "down_for_ms": downFor.Milliseconds(),

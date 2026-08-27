@@ -18,7 +18,7 @@ CREATE TABLE llm_health (
     slack_ts             TEXT    NOT NULL DEFAULT '',
     slack_channel        TEXT    NOT NULL DEFAULT '',
     slack_delivery       TEXT    NOT NULL DEFAULT 'none'
-                         CHECK (slack_delivery IN ('none','pending','delivered','recovery_pending','recovered','suppressed')),
+                         CHECK (slack_delivery IN ('none','pending','indeterminate','delivered','recovery_pending','recovered','suppressed')),
     slack_state          TEXT    NOT NULL DEFAULT '',
     slack_generation     INTEGER NOT NULL DEFAULT 0,
     recovered_at         TEXT,

@@ -211,7 +211,13 @@ recovers, one more edit closes it out:
 One root per sustained episode, edited in place, never per-Incident and never
 threaded. If the LLM recovers before the root was ever successfully
 delivered, the stale outage/recovery pair is suppressed — it survives only in
-state, audit, and logs. During an outage, new Incident triage retries with
+state, audit, and logs. A post Slack definitely rejected is retried on the
+next minute; a post whose outcome is unknown (the request may have been
+accepted before the connection failed, or the process restarted mid-post) is
+never retried, because a second root is worse than a missing one — the
+outage still shows in `/health`, audit, and logs. A root that turns out to
+have landed after the episode already moved on is adopted and edited, never
+left standing as a stale outage. During an outage, new Incident triage retries with
 backoff and correlation may be delayed; this copy never claims Alert intake
 itself is unaffected. See [Integration health](../getting-started/configuration.md#integration-health)
 for the `/health` shape behind these messages.

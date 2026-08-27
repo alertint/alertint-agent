@@ -292,12 +292,16 @@ capability**, cleared only by its own success:
   never a prompt. A dependency-class probe failure also makes the
   installation `unavailable` (the only signal available when traffic is
   absent); it is cleared by probe success or by any real primary-client
-  success, never the reverse.
+  success, never the reverse. A backend with no probe route is left alone
+  for an hour at a time and re-checked, and that verdict is never carried
+  across a restart (the endpoint may have changed in config).
 - State is durable in `llm_health` / `llm_health_capabilities`, restored on
   restart, and exposed under `/health`'s `llm` key without affecting the
   HTTP status. Audit kinds: `llm.health.changed`, `llm.health.probe`,
   `llm.health.slack_posted`, `llm.health.slack_updated`,
-  `llm.health.slack_suppressed`, `llm.health.slack_failed` — all bounded
+  `llm.health.slack_suppressed`, `llm.health.slack_failed`,
+  `llm.health.slack_indeterminate`, `llm.health.slack_adopted`,
+  `llm.health.slack_orphaned` — all bounded
   reason codes and sanitized detail, never prompts, provider bodies,
   headers, or credentials.
 - When Slack is enabled, one `AlertINT system` root message is posted per

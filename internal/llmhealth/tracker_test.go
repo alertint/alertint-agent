@@ -232,9 +232,36 @@ func TestProbeUnsupportedIsNotFailure(t *testing.T) {
 	if s := tr.Snapshot(); s.State != llmhealth.StateHealthy || s.LastProbeOutcome != "unsupported" {
 		t.Fatalf("%+v", s)
 	}
-	c.add(time.Hour)
+	c.add(30 * time.Minute)
 	if tr.ProbeDue(c.now()) {
 		t.Fatal("unsupported probe route must stop probing")
+	}
+}
+
+// TestProbeUnsupportedIsProcessLocalAndRechecked pins that "unsupported" is
+// a suppression, not a permanent verdict: the route is re-validated once an
+// hour in-process (a backend can be upgraded to expose a probe route), and
+// never restored from the durable outcome across a restart (the endpoint or
+// provider may have changed in config), so the first idle window after a
+// restart probes again.
+func TestProbeUnsupportedIsProcessLocalAndRechecked(t *testing.T) {
+	tr, st, c, _ := newTracker(t)
+	tr.ObserveProbe(llm.ProbeResult{Outcome: llm.ProbeUnsupported, Method: "GET", Path: "/v1/models"})
+	c.add(time.Hour)
+	if !tr.ProbeDue(c.now()) {
+		t.Fatal("an unsupported route must be re-validated after an hour")
+	}
+
+	tr2, err := llmhealth.New(context.Background(), st, llmhealth.Options{Now: c.now, IdleProbeAfter: 5 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr2.ProbeDue(c.now()) {
+		t.Fatal("not idle yet after restart")
+	}
+	c.add(5 * time.Minute)
+	if !tr2.ProbeDue(c.now()) {
+		t.Fatal("a restart must not inherit the previous process's unsupported verdict")
 	}
 }
 

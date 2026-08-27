@@ -5,6 +5,7 @@ package llmhealth_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -16,11 +17,15 @@ type fakePub struct {
 	mu                   sync.Mutex
 	posts, updates       []string
 	failPost, failUpdate bool
+	failPostErr          error // when non-nil, PostSystemMessage returns exactly this
 }
 
 func (p *fakePub) PostSystemMessage(_ context.Context, text string) (string, string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.failPostErr != nil {
+		return "", "", p.failPostErr
+	}
 	if p.failPost {
 		return "", "", errors.New("slack: ratelimited")
 	}
@@ -254,12 +259,15 @@ func (p *blockingPub) PostSystemMessage(ctx context.Context, text string) (strin
 	return p.fakePub.PostSystemMessage(ctx, text)
 }
 
-// TestRecoveryDuringInFlightPostDiscardsStaleResult covers the race where the
-// LLM recovers while a PostSystemMessage HTTP call for the just-ended outage
-// is still in flight: the outage generation must be fenced at recovery too
-// (not only when a new outage starts), so the late-arriving success is
-// discarded — never resurrected as a "delivered" root nothing will ever edit.
-func TestRecoveryDuringInFlightPostDiscardsStaleResult(t *testing.T) {
+// TestRecoveryDuringInFlightPostReconcilesStaleRoot covers the race where
+// the LLM recovers while a PostSystemMessage HTTP call for the just-ended
+// outage is still in flight. The generation fence correctly stops the stale
+// result from being applied as a live "delivered" root — but the POST DID
+// succeed, so Slack now shows an outage root. Discarding the coordinates
+// would leave that root saying "unavailable" forever; instead the tracker
+// must adopt them and edit the root to the recovery copy, so the final
+// visible message is the truth.
+func TestRecoveryDuringInFlightPostReconcilesStaleRoot(t *testing.T) {
 	tr, _, c, a := newTracker(t)
 	pub := &blockingPub{fakePub: &fakePub{}, started: make(chan struct{}), release: make(chan struct{})}
 
@@ -279,17 +287,137 @@ func TestRecoveryDuringInFlightPostDiscardsStaleResult(t *testing.T) {
 	close(pub.release)
 	<-done
 
-	posted, suppressed := false, false
+	suppressed := false
 	for _, k := range a.kinds {
-		posted = posted || k == "llm.health.slack_posted"
 		suppressed = suppressed || k == "llm.health.slack_suppressed"
 	}
-	if posted {
-		t.Fatal("a delivery result computed before recovery must not be applied after it")
-	}
 	if !suppressed {
+		t.Fatalf("recovery before a confirmed delivery must still audit as suppressed: %v", a.kinds)
+	}
+
+	// The next step must reconcile the root Slack actually shows.
+	tr.Deliver(context.Background(), pub)
+	pub.mu.Lock()
+	defer pub.mu.Unlock()
+	if len(pub.posts) != 1 || len(pub.updates) != 1 {
+		t.Fatalf("posts=%v updates=%v; want the one stale root edited exactly once", pub.posts, pub.updates)
+	}
+	if want := llmhealth.RenderRecovery(5 * time.Minute); pub.updates[0] != want {
+		t.Fatalf("final visible message = %q, want %q", pub.updates[0], want)
+	}
+}
+
+// TestNewOutageDuringInFlightPostAdoptsRootForNewEpisode covers the rarer
+// variant: recovery AND a new outage both happen while the first episode's
+// POST is in flight. The stale root is adopted as the new episode's root
+// (one root, kept edited in place) rather than orphaned as a permanent
+// false outage or duplicated by a second post.
+func TestNewOutageDuringInFlightPostAdoptsRootForNewEpisode(t *testing.T) {
+	tr, _, c, _ := newTracker(t)
+	pub := &blockingPub{fakePub: &fakePub{}, started: make(chan struct{}), release: make(chan struct{})}
+
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(err503)
+	c.add(5 * time.Minute)
+
+	done := make(chan struct{})
+	go func() {
+		tr.Deliver(context.Background(), pub)
+		close(done)
+	}()
+	<-pub.started
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(nil)    // episode 1 recovers
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(err503) // episode 2 begins
+	close(pub.release)
+	<-done
+
+	c.add(5 * time.Minute)
+	tr.Deliver(context.Background(), pub)
+	if pub.postCount() != 1 {
+		t.Fatalf("posts = %v; the stale root must be adopted, never duplicated", pub.posts)
+	}
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(nil) // episode 2 recovers
+	tr.Deliver(context.Background(), pub)
+	pub.mu.Lock()
+	defer pub.mu.Unlock()
+	if len(pub.updates) != 1 || pub.updates[0] != llmhealth.RenderRecovery(5*time.Minute) {
+		t.Fatalf("updates = %v; the adopted root must be edited to episode 2's recovery", pub.updates)
+	}
+}
+
+// TestIndeterminatePostIsNeverRetried pins the one-root contract against a
+// POST whose outcome is unknown (transport failure after the request may
+// have been accepted): without a Slack lookup there is no way to know
+// whether a root exists, so the tracker must not post again — a possibly
+// missing message is recoverable from logs/audit//health, a duplicate root
+// is not.
+func TestIndeterminatePostIsNeverRetried(t *testing.T) {
+	tr, st, c, a := newTracker(t)
+	pub := &fakePub{failPostErr: fmt.Errorf("channel C1: post system message: %w", llmhealth.ErrDeliveryIndeterminate)}
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(err503)
+	c.add(5 * time.Minute)
+	tr.Deliver(context.Background(), pub)
+
+	rec, _, err := st.GetLLMHealth(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.SlackDelivery != llmhealth.DeliveryIndeterminate {
+		t.Fatalf("durable slack_delivery = %q, want %q", rec.SlackDelivery, llmhealth.DeliveryIndeterminate)
+	}
+	pub.failPostErr = nil
+	c.add(time.Minute)
+	tr.Deliver(context.Background(), pub)
+	if pub.postCount() != 0 {
+		t.Fatalf("posts = %v; an indeterminate post must never be retried", pub.posts)
+	}
+	seen := false
+	for _, k := range a.kinds {
+		seen = seen || k == "llm.health.slack_indeterminate"
+	}
+	if !seen {
 		t.Fatalf("audit kinds = %v", a.kinds)
 	}
+}
+
+// TestCrashBetweenPostAndPersistDoesNotRepost pins the durable side of the
+// same contract: the "a post is in flight" marker is persisted BEFORE the
+// HTTP call, so a process that dies between Slack accepting the message and
+// the coordinates being written comes back knowing a root may exist and does
+// not post a second one.
+func TestCrashBetweenPostAndPersistDoesNotRepost(t *testing.T) {
+	tr, st, c, _ := newTracker(t)
+	pub := &blockingPub{fakePub: &fakePub{}, started: make(chan struct{}), release: make(chan struct{})}
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(err503)
+	c.add(5 * time.Minute)
+
+	done := make(chan struct{})
+	go func() {
+		tr.Deliver(context.Background(), pub)
+		close(done)
+	}()
+	<-pub.started
+
+	// "Crash" here: a fresh tracker from the durable state alone.
+	rec, _, err := st.GetLLMHealth(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.SlackDelivery != llmhealth.DeliveryIndeterminate {
+		t.Fatalf("durable slack_delivery while a post is in flight = %q, want %q", rec.SlackDelivery, llmhealth.DeliveryIndeterminate)
+	}
+	tr2, err := llmhealth.New(context.Background(), st, llmhealth.Options{Now: c.now, BroadcastAfter: 5 * time.Minute, IdleProbeAfter: 5 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub2 := &fakePub{}
+	c.add(time.Minute)
+	tr2.Deliver(context.Background(), pub2)
+	if pub2.postCount() != 0 {
+		t.Fatalf("restarted tracker posted %v; a root may already exist", pub2.posts)
+	}
+
+	close(pub.release)
+	<-done
 }
 
 // blockingUpdatePub wraps fakePub and blocks inside UpdateSystemMessage until

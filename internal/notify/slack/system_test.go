@@ -4,8 +4,35 @@ package slack
 
 import (
 	"context"
+	"errors"
 	"testing"
+
+	slacklib "github.com/slack-go/slack"
+
+	"github.com/alertint/alertint-agent/internal/llmhealth"
 )
+
+// TestPostSystemMessageClassifiesIndeterminateFailures pins the contract the
+// llmhealth tracker relies on to keep one root per Outage episode: a
+// definite Slack rejection (Slack answered, the message was not posted) is
+// returned as-is so the tracker retries, while a transport failure — where
+// Slack may already have accepted the message — is marked
+// llmhealth.ErrDeliveryIndeterminate so the tracker never posts again.
+func TestPostSystemMessageClassifiesIndeterminateFailures(t *testing.T) {
+	fake := newFakeSlack(t)
+	fake.postErr = errors.New("channel_not_found")
+	n := NewWithClient(fake, "#alerts", "high", "", &fakeThreadStore{}, nil)
+	_, _, err := n.PostSystemMessage(context.Background(), "x")
+	if err == nil || llmhealth.IsDeliveryIndeterminate(err) {
+		t.Fatalf("a definite Slack rejection must be retryable, got %v", err)
+	}
+
+	dead := NewWithClient(slacklib.New("xoxb-test", slacklib.OptionAPIURL("http://127.0.0.1:1/")), "#alerts", "high", "", &fakeThreadStore{}, nil)
+	_, _, err = dead.PostSystemMessage(context.Background(), "x")
+	if err == nil || !llmhealth.IsDeliveryIndeterminate(err) {
+		t.Fatalf("a transport failure must be indeterminate, got %v", err)
+	}
+}
 
 func TestPostAndUpdateSystemMessageArePlainRootMessages(t *testing.T) {
 	fake := newFakeSlack(t)

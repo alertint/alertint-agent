@@ -38,6 +38,7 @@ type fakeSlack struct {
 	posts     []postCapture
 	updates   []string
 	updateErr error
+	postErr   error // when non-nil, chat.postMessage answers ok:false with this text
 
 	srv    *httptest.Server
 	client *slacklib.Client
@@ -64,6 +65,12 @@ func (f *fakeSlack) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		f.updates = append(f.updates, r.FormValue("text"))
 	} else {
+		if f.postErr != nil {
+			f.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"ok":false,"error":%q}`, f.postErr.Error())
+			return
+		}
 		f.posts = append(f.posts, postCapture{
 			channel:   r.FormValue("channel"),
 			text:      r.FormValue("text"),
