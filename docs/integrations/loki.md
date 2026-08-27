@@ -95,6 +95,7 @@ logs:
   provider: loki
   timeout_seconds: 10         # TOTAL budget for the whole fetch (filtered + fallback)
   default_range_minutes: 15   # look-back window before the first alert
+  max_window_minutes: 120    # cap on the fetched window ending at now; 0 = unbounded
   max_lines: 50               # backend query limit
   loki:
     base_url: http://loki:3100
@@ -112,6 +113,7 @@ logs:
 | `provider` | Only `loki` in v1. |
 | `timeout_seconds` | Total budget for the whole fetch (both passes share it). Default `10`. |
 | `default_range_minutes` | Look-back window before the first alert. Default `15`. |
+| `max_window_minutes` | Cap on the fetched window `[start, now]`, independent of incident age. A still-firing incident re-judged after days would otherwise scan its whole span and trip Loki's per-query byte limit; the clamp keeps the most recent N minutes and tells the model the earlier span was not fetched. `0` = unbounded. Default `120`. |
 | `max_lines` | Maximum lines per query. Default `50`. |
 | `loki.base_url` | Loki base URL, e.g. `http://loki:3100` or a Grafana Cloud `logs-prod-*.grafana.net` URL. |
 | `loki.auth.mode` | `none`, `bearer`, or `basic`. Default `none`. |

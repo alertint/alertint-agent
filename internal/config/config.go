@@ -116,6 +116,7 @@ type LogsConfig struct {
 	Provider            string     `yaml:"provider"`              // only "loki" in v1
 	TimeoutSeconds      int        `yaml:"timeout_seconds"`       // TOTAL budget for the whole fetch (filtered + fallback share it)
 	DefaultRangeMinutes int        `yaml:"default_range_minutes"` // window before the first alert
+	MaxWindowMinutes    int        `yaml:"max_window_minutes"`    // cap on [start, now]; 0 = unbounded (issue #63)
 	MaxLines            int        `yaml:"max_lines"`             // backend query limit
 	Loki                LokiConfig `yaml:"loki,omitempty"`
 }
@@ -472,6 +473,7 @@ func Defaults() Config {
 			Provider:            "loki",
 			TimeoutSeconds:      10,
 			DefaultRangeMinutes: 15,
+			MaxWindowMinutes:    120,
 			MaxLines:            50,
 			Loki: LokiConfig{
 				Auth: LokiAuthConfig{Mode: "none"},
@@ -1013,6 +1015,9 @@ func (c *Config) validateLogs() []string {
 	}
 	if c.Logs.DefaultRangeMinutes <= 0 {
 		errs = append(errs, "logs.default_range_minutes must be > 0")
+	}
+	if c.Logs.MaxWindowMinutes < 0 {
+		errs = append(errs, "logs.max_window_minutes must be >= 0 (0 = unbounded)")
 	}
 	if c.Logs.MaxLines <= 0 {
 		errs = append(errs, "logs.max_lines must be > 0")

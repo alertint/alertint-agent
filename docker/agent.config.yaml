@@ -63,6 +63,7 @@ logs:
   provider: loki
   timeout_seconds: 10
   default_range_minutes: 15
+  max_window_minutes: 120
   max_lines: 50
   loki:
     base_url: http://loki:3100

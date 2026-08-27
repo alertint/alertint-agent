@@ -33,6 +33,9 @@ func TestLogs_Defaults(t *testing.T) {
 	if d.Logs.MaxLines != 50 {
 		t.Errorf("logs.max_lines default = %d, want 50", d.Logs.MaxLines)
 	}
+	if d.Logs.MaxWindowMinutes != 120 {
+		t.Errorf("logs.max_window_minutes default = %d, want 120", d.Logs.MaxWindowMinutes)
+	}
 	if d.Logs.Loki.Auth.Mode != "none" {
 		t.Errorf("logs.loki.auth.mode default = %q, want none", d.Logs.Loki.Auth.Mode)
 	}
@@ -101,11 +104,12 @@ func TestValidateLogs_BadTunables(t *testing.T) {
 	cfg.Logs.TimeoutSeconds = 0
 	cfg.Logs.DefaultRangeMinutes = 0
 	cfg.Logs.MaxLines = 0
+	cfg.Logs.MaxWindowMinutes = -1
 	err := cfg.Validate()
 	if err == nil {
 		t.Fatal("want errors for non-positive tunables")
 	}
-	for _, want := range []string{"timeout_seconds", "default_range_minutes", "max_lines"} {
+	for _, want := range []string{"timeout_seconds", "default_range_minutes", "max_lines", "max_window_minutes"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error missing %q: %v", want, err)
 		}

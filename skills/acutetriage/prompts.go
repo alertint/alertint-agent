@@ -643,7 +643,12 @@ func renderLogs(b *strings.Builder, e *LogEnrichment) {
 		return
 	}
 	if len(e.Lines) > 0 {
-		fmt.Fprintf(b, "\n\nRecent logs (%s, most recent first, around incident time):", e.Source)
+		if !e.SpanStart.IsZero() {
+			fmt.Fprintf(b, "\n\nRecent logs (%s, most recent first, last %s only — incident span since %s not fetched):",
+				e.Source, e.End.Sub(e.Start).Round(time.Minute), e.SpanStart.UTC().Format(time.RFC3339))
+		} else {
+			fmt.Fprintf(b, "\n\nRecent logs (%s, most recent first, around incident time):", e.Source)
+		}
 		for _, ln := range e.Lines {
 			fmt.Fprintf(b, "\n  %s  %s", ln.Timestamp.UTC().Format(time.RFC3339), ln.Line)
 		}
@@ -654,6 +659,12 @@ func renderLogs(b *strings.Builder, e *LogEnrichment) {
 		note = "no log lines available"
 	}
 	fmt.Fprintf(b, "\n\nRecent logs (%s): %s", e.Source, note)
+	if !e.SpanStart.IsZero() {
+		// Same disclosure as the success path: an empty window that was clamped
+		// says nothing about the incident span before the clamp.
+		fmt.Fprintf(b, "\n  (window clamped to the last %s — incident span since %s not fetched)",
+			e.End.Sub(e.Start).Round(time.Minute), e.SpanStart.UTC().Format(time.RFC3339))
+	}
 	if e.Query != "" {
 		fmt.Fprintf(b, "\n  (query: %s). Treat this as missing evidence, not as \"no errors\".", e.Query)
 	} else {

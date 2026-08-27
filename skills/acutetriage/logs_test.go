@@ -330,3 +330,76 @@ func TestFetchLogs_NormalizeCapsEnforced(t *testing.T) {
 		t.Error("newest line not first after normalize")
 	}
 }
+
+// Issue #63: the window must be capped independently of incident age.
+func TestFetchLogs_MaxWindowClampsOldSpanStart(t *testing.T) {
+	src := &fakeSource{name: "loki", fetched: logs.Fetched{Lines: []logs.Line{{Timestamp: time.Unix(1, 0), Line: "x"}}}}
+	last := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	first := last.Add(-48 * time.Hour) // incident open for two days
+	p := LogParams{DefaultRangeMinutes: 15, MaxWindowMinutes: 120, TimeoutSeconds: 10, MaxLines: 50}
+	e := FetchLogs(context.Background(), src, p, alertsWith(map[string]string{"namespace": "p"}), first, last, "inc-test", nil)
+
+	if want := last.Add(-120 * time.Minute); !src.gotStart.Equal(want) {
+		t.Errorf("start = %v, want last-120m (%v)", src.gotStart, want)
+	}
+	if !src.gotEnd.Equal(last) {
+		t.Errorf("end = %v, want last", src.gotEnd)
+	}
+	if want := first.Add(-15 * time.Minute); !e.SpanStart.Equal(want) {
+		t.Errorf("SpanStart = %v, want requested start %v", e.SpanStart, want)
+	}
+	var b strings.Builder
+	renderLogs(&b, e)
+	if !strings.Contains(b.String(), "last 2h0m0s only") || !strings.Contains(b.String(), "not fetched") {
+		t.Errorf("prompt must say the window was clamped, got %q", b.String())
+	}
+}
+
+func TestFetchLogs_MaxWindowNotAppliedCases(t *testing.T) {
+	last := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name      string
+		age       time.Duration
+		maxWindow int
+	}{
+		{"recent span stays unclamped", 30 * time.Minute, 120},
+		{"zero means unbounded", 48 * time.Hour, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &fakeSource{name: "loki", fetched: logs.Fetched{Lines: []logs.Line{{Timestamp: time.Unix(1, 0), Line: "x"}}}}
+			first := last.Add(-tc.age)
+			p := LogParams{DefaultRangeMinutes: 15, MaxWindowMinutes: tc.maxWindow, TimeoutSeconds: 10, MaxLines: 50}
+			e := FetchLogs(context.Background(), src, p, alertsWith(map[string]string{"namespace": "p"}), first, last, "inc-test", nil)
+
+			if want := first.Add(-15 * time.Minute); !src.gotStart.Equal(want) {
+				t.Errorf("start = %v, want first-15m (unclamped)", src.gotStart)
+			}
+			if !e.SpanStart.IsZero() {
+				t.Errorf("SpanStart must be zero when no clamp applied, got %v", e.SpanStart)
+			}
+		})
+	}
+}
+
+func TestRenderLogs_ClampDisclosedWhenEmpty(t *testing.T) {
+	end := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	e := &LogEnrichment{
+		Source:    "loki",
+		Query:     `{namespace="p"}`,
+		Start:     end.Add(-120 * time.Minute),
+		End:       end,
+		SpanStart: end.Add(-48 * time.Hour),
+		Note:      "log backend returned no lines for this query",
+		Outcome:   OutcomeEmpty,
+	}
+	var b strings.Builder
+	renderLogs(&b, e)
+	out := b.String()
+	if !strings.Contains(out, "window clamped to the last 2h0m0s") || !strings.Contains(out, "not fetched") {
+		t.Errorf("empty-result prompt must disclose the clamp, got %q", out)
+	}
+	if !strings.Contains(out, "missing evidence") {
+		t.Errorf("empty-result prompt must keep the missing-evidence guidance, got %q", out)
+	}
+}
