@@ -37,8 +37,12 @@ const (
 	// class allows; claude-haiku-4-5 remains a one-line config opt-in for cost.
 	DefaultModel = "claude-sonnet-5"
 
+	// anthropicBaseURL is the Anthropic API origin used when no test override
+	// is supplied.
+	anthropicBaseURL = "https://api.anthropic.com"
+
 	// messagesEndpoint is the Anthropic Messages API URL.
-	messagesEndpoint = "https://api.anthropic.com/v1/messages"
+	messagesEndpoint = anthropicBaseURL + "/v1/messages"
 
 	// anthropicVersion is the API version header value required by Anthropic.
 	anthropicVersion = "2023-06-01"
@@ -90,6 +94,7 @@ type Client struct {
 	logger   *slog.Logger
 	now      func() time.Time
 	endpoint string // overridden in tests via NewWithHTTPClient
+	baseURL  string // origin backing endpoint; used by Probe
 }
 
 // New constructs a Client. auditor and logger may be nil (no-ops).
@@ -105,9 +110,9 @@ func NewWithHTTPClient(cfg Config, auditor *audit.Auditor, logger *slog.Logger, 
 	if logger == nil {
 		logger = slog.Default()
 	}
-	endpoint := messagesEndpoint
+	origin := anthropicBaseURL
 	if baseURL != "" {
-		endpoint = baseURL + "/v1/messages"
+		origin = baseURL
 	}
 	return &Client{
 		cfg:      cfg,
@@ -115,7 +120,8 @@ func NewWithHTTPClient(cfg Config, auditor *audit.Auditor, logger *slog.Logger, 
 		auditor:  auditor,
 		logger:   logger,
 		now:      func() time.Time { return time.Now().UTC() },
-		endpoint: endpoint,
+		endpoint: origin + "/v1/messages",
+		baseURL:  origin,
 	}
 }
 

@@ -2,7 +2,12 @@
 
 package llm
 
-import "context"
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+)
 
 // ProbeOutcome is the result class of a zero-generation reachability probe.
 type ProbeOutcome string
@@ -28,4 +33,39 @@ type ProbeResult struct {
 // without generating tokens. Implementations must never POST.
 type Prober interface {
 	Probe(ctx context.Context) ProbeResult
+}
+
+// DoProbe executes a prepared GET and maps the status into a ProbeResult.
+// Bodies are drained (bounded) and discarded: a probe never surfaces provider
+// text. Only GET requests are accepted — the guard is what makes "no probe
+// generates" a property of the type, not a convention.
+func DoProbe(client *http.Client, req *http.Request, path string) ProbeResult {
+	res := ProbeResult{Method: req.Method, Path: path}
+	if req.Method != http.MethodGet {
+		res.Outcome = ProbeFailed
+		res.Err = fmt.Errorf("llm: probe must be GET, got %s", req.Method)
+		return res
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		res.Outcome = ProbeFailed
+		res.Err = fmt.Errorf("llm: http: %w", err)
+		return res
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	res.StatusCode = resp.StatusCode
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		res.Outcome = ProbeOK
+	case resp.StatusCode == http.StatusNotFound, resp.StatusCode == http.StatusMethodNotAllowed, resp.StatusCode == http.StatusNotImplemented:
+		res.Outcome = ProbeUnsupported
+	case resp.StatusCode == http.StatusTooManyRequests, resp.StatusCode >= 500:
+		res.Outcome = ProbeFailed
+		res.Err = &RetryableError{StatusCode: resp.StatusCode}
+	default:
+		res.Outcome = ProbeFailed
+		res.Err = &APIError{StatusCode: resp.StatusCode}
+	}
+	return res
 }

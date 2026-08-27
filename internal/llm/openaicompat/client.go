@@ -98,6 +98,9 @@ type Client struct {
 	// OpenAI, which 400s on the unrecognized field; its models have no
 	// chat-template thinking toggle to pin anyway.
 	pinChatTemplateKwargs bool
+	// hosted marks the endpoint as hosted OpenAI: Probe uses the model-
+	// metadata route instead of the generic health/models routes.
+	hosted bool
 }
 
 // New constructs a Client. auditor and logger may be nil (no-ops).
@@ -115,6 +118,7 @@ func New(cfg Config, auditor *audit.Auditor, logger *slog.Logger) *Client {
 		endpoint: cfg.BaseURL + "/v1/chat/completions",
 
 		pinChatTemplateKwargs: !isHostedOpenAI(cfg.BaseURL),
+		hosted:                isHostedOpenAI(cfg.BaseURL),
 	}
 }
 
