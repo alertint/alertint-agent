@@ -310,6 +310,12 @@ func TestValidateSyntaxRepair_ClauseOwnershipAndWrapperScope(t *testing.T) {
 		name:     "aggregator keyword as an on-clause label name",
 		original: `foo / on(sum) bar by (x)`,
 		repaired: `foo / on(sum) sum by (x) (bar)`,
+	}, {
+		// The most common issue-62 shape in the wild: the orphaned clause
+		// trails a function argument, and the wrapper opens at that argument.
+		name:     "wrapper inside a function argument",
+		original: `histogram_quantile(0.9, rate(x[5m]) by (le))`,
+		repaired: `histogram_quantile(0.9, sum by (le) (rate(x[5m])))`,
 	}}
 	for _, tc := range accept {
 		t.Run("accept/"+tc.name, func(t *testing.T) {
@@ -421,11 +427,145 @@ func TestValidateSyntaxRepair_ClauseOwnershipAndWrapperScope(t *testing.T) {
 		name:     "wrapper swallows a vector-matching binary expression",
 		original: `foo / on(sum) bar by (x)`,
 		repaired: `sum by (x) (foo / on(sum) bar)`,
+	}, {
+		// A clause written INSIDE the aggregation's parentheses is not the
+		// aggregator's modifier slot, so moving it out is not a recognised
+		// respelling. Known false reject, documented on ValidateSyntaxRepair.
+		name:     "clause moved out of the aggregation's parentheses",
+		original: `sum(increase(x[1h]) by (type))`,
+		repaired: `sum by (type) (increase(x[1h]))`,
+	}, {
+		name:     "clause moved out of the aggregation's parentheses, rate form",
+		original: `sum(rate(a[5m]) by (job))`,
+		repaired: `sum by (job) (rate(a[5m]))`,
 	}}
 	for _, tc := range reject {
 		t.Run("reject/"+tc.name, func(t *testing.T) {
 			if err := ValidateSyntaxRepair(tc.original, tc.repaired); err == nil {
 				t.Fatalf("unrecognised rewrite accepted as syntax repair: %s", tc.repaired)
+			}
+		})
+	}
+}
+
+// An aggregation keyword the original left DANGLING — `avg by (x)`, the
+// truncated head of an aggregation — is still an aggregation, not a metric
+// named `avg`. Counting it as zero would let the gate wrap it as the operand of
+// a brand-new `sum`, which both changes the aggregation operator and invents an
+// operand: `avg by (x)` -> `sum by (x) (avg)` asks for the sum of a series
+// literally named "avg".
+func TestValidateSyntaxRepair_DanglingAggregator(t *testing.T) {
+	for _, agg := range []string{"sum", "avg", "count", "min", "max", "topk", "stddev", "stdvar", "group", "quantile", "bottomk", "count_values"} {
+		t.Run("reject/by/"+agg, func(t *testing.T) {
+			original := agg + ` by (x)`
+			repaired := `sum by (x) (` + agg + `)`
+			if err := ValidateSyntaxRepair(original, repaired); err == nil {
+				t.Fatalf("dangling aggregator wrapped as a metric: %s -> %s", original, repaired)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name               string
+		original, repaired string
+	}{{
+		name:     "without form",
+		original: `avg without (x)`,
+		repaired: `sum without (x) (avg)`,
+	}, {
+		name:     "mid expression",
+		original: `foo + sum by (x)`,
+		repaired: `foo + sum by (x) (sum)`,
+	}, {
+		name:     "trailing aggregator with no clause at all",
+		original: `foo + avg`,
+		repaired: `foo + sum(avg)`,
+	}} {
+		t.Run("reject/"+tc.name, func(t *testing.T) {
+			if err := ValidateSyntaxRepair(tc.original, tc.repaired); err == nil {
+				t.Fatalf("dangling aggregator wrapped as a metric: %s", tc.repaired)
+			}
+		})
+	}
+}
+
+// `agg by (t) (X)` and `agg(X) by (t)` are the same PromQL — the two spellings
+// of one aggregation's modifier slot — so a repair may move a clause between
+// them on an aggregation the original ALREADY had. What it may not do is move a
+// clause to a slot belonging to a different aggregator, or to no aggregator at
+// all: those are the High-1 re-ownership pairs, and they stay rejected.
+func TestValidateSyntaxRepair_ClauseRespelling(t *testing.T) {
+	accept := []struct {
+		name               string
+		original, repaired string
+	}{{
+		name:     "trailing clause respelled inline",
+		original: `sum(foo) by (a)`,
+		repaired: `sum by (a) (foo)`,
+	}, {
+		name:     "inline clause respelled trailing",
+		original: `sum by (a) (foo)`,
+		repaired: `sum(foo) by (a)`,
+	}, {
+		name:     "parameterised aggregator respelled inline",
+		original: `topk(5, foo) by (t)`,
+		repaired: `topk by (t) (5, foo)`,
+	}, {
+		name:     "parameterised aggregator respelled trailing",
+		original: `topk by (t) (5, foo)`,
+		repaired: `topk(5, foo) by (t)`,
+	}, {
+		name:     "both operands respelled",
+		original: `sum by (a) (foo) + sum by (b) (bar)`,
+		repaired: `sum(foo) by (a) + sum(bar) by (b)`,
+	}}
+	for _, tc := range accept {
+		t.Run("accept/"+tc.name, func(t *testing.T) {
+			if err := ValidateSyntaxRepair(tc.original, tc.repaired); err != nil {
+				t.Fatalf("clause respelling on the same aggregator rejected: %v", err)
+			}
+		})
+	}
+
+	reject := []struct {
+		name               string
+		original, repaired string
+	}{{
+		// Respelling normalises the SLOT, not the owner: these two clauses
+		// still belong to different aggregators.
+		name:     "respelled but swapped between aggregators",
+		original: `sum by (a) (foo) + sum by (b) (bar)`,
+		repaired: `sum(bar) by (a) + sum(foo) by (b)`,
+	}, {
+		name:     "respelled onto a different aggregator",
+		original: `increase(http_errors_total[1h]) by (code) / sum(capacity)`,
+		repaired: `increase(http_errors_total[1h]) / sum(capacity) by (code)`,
+	}}
+	for _, tc := range reject {
+		t.Run("reject/"+tc.name, func(t *testing.T) {
+			if err := ValidateSyntaxRepair(tc.original, tc.repaired); err == nil {
+				t.Fatalf("clause re-owned via respelling: %s", tc.repaired)
+			}
+		})
+	}
+}
+
+// A wrapper must wrap something. When the orphaned clause sits at a term
+// boundary the term is empty, and `sum by (t) ()` is not a repair of anything —
+// it does not even parse. ValidateExpr runs before the gate in production, but
+// the gate is written to be sound on its own rather than to lean on the
+// caller's ordering.
+func TestValidateSyntaxRepair_ZeroWidthWrapper(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		original, repaired string
+	}{
+		{name: "before a term", original: `by (t) foo`, repaired: `sum by (t) () foo`},
+		{name: "mid expression", original: `a + by (t) b`, repaired: `a + sum by (t) () b`},
+		{name: "clause alone", original: `by (t)`, repaired: `sum by (t) ()`},
+	} {
+		t.Run("reject/"+tc.name, func(t *testing.T) {
+			if err := ValidateSyntaxRepair(tc.original, tc.repaired); err == nil {
+				t.Fatalf("zero-width wrapper accepted: %s", tc.repaired)
 			}
 		})
 	}
@@ -661,8 +801,8 @@ func TestCanonicalizePromql_KeywordNamedMatcherLabel(t *testing.T) {
 	if !slices.Equal(got.tokens, want) {
 		t.Fatalf("canonicalizePromql tokens = %+v, want %+v", got.tokens, want)
 	}
-	if n := countAggregators(got.tokens); n != 0 {
-		t.Fatalf("matcher label counted as an aggregator: %d", n)
+	if idx := appliedAggregators(got.tokens); len(idx) != 0 {
+		t.Fatalf("matcher label counted as an aggregator: %v", idx)
 	}
 
 	// A quoted label name lands in the same triple rather than scattering the
@@ -677,36 +817,81 @@ func TestCanonicalizePromql_KeywordNamedMatcherLabel(t *testing.T) {
 	}
 }
 
-// An aggregation keyword only counts as an aggregation when it is actually
-// applied — followed by its argument list or by a grouping keyword. The same
-// keyword used as a LABEL NAME (PromQL's maybe_label rule admits it) must not
-// inflate the count, or a legitimate repair looks like a second aggregator.
-func TestCountAggregators(t *testing.T) {
+// An aggregation keyword IS an aggregation wherever it appears in the
+// expression — including dangling at the end, which is a truncated aggregation
+// rather than a metric of that name. The one exception is a keyword used as a
+// LABEL NAME inside a vector-matching or cardinality list (PromQL's maybe_label
+// rule admits every aggregator name there), which aggregates nothing and must
+// not inflate the count, or a legitimate repair looks like a second aggregator.
+func TestAppliedAggregators(t *testing.T) {
 	for _, tc := range []struct {
 		expr string
-		want int
+		want []int
 	}{
-		{expr: `sum(foo)`, want: 1},
-		{expr: `sum by (t) (foo)`, want: 1},
-		{expr: `sum(foo) by (t)`, want: 1},
-		{expr: `topk(5, foo)`, want: 1},
-		{expr: `max(sum by (t) (foo))`, want: 2},
-		{expr: `increase(foo[1h])`, want: 0},
+		{expr: `sum(foo)`, want: []int{0}},
+		{expr: `sum by (t) (foo)`, want: []int{0}},
+		{expr: `sum(foo) by (t)`, want: []int{0}},
+		{expr: `topk(5, foo)`, want: []int{0}},
+		{expr: `max(sum by (t) (foo))`, want: []int{0, 2}},
+		{expr: `increase(foo[1h])`, want: nil},
 		// Label names, not aggregations.
-		{expr: `foo / on(sum) bar`, want: 0},
-		{expr: `foo / on(quantile) bar`, want: 0},
-		{expr: `foo / ignoring(count) bar`, want: 0},
-		{expr: `a / on(x) group_left(sum) b`, want: 0},
-		{expr: `foo{quantile="0.99"}`, want: 0},
-		// A truncated `sum by` keeps its bare keyword, and still counts.
-		{expr: `sum by`, want: 1},
+		{expr: `foo / on(sum) bar`, want: nil},
+		{expr: `foo / on(quantile) bar`, want: nil},
+		{expr: `foo / ignoring(count) bar`, want: nil},
+		{expr: `a / on(x) group_left(sum) b`, want: nil},
+		{expr: `a / on(x) group_right(sum) b`, want: nil},
+		{expr: `foo{quantile="0.99"}`, want: nil},
+		// The real wrapper is found even when an aggregator-named label sits
+		// in front of it.
+		{expr: `foo / on(sum) sum by (x) (bar)`, want: []int{6}},
+		// Dangling: a truncated aggregation still aggregates.
+		{expr: `sum by`, want: []int{0}},
+		{expr: `avg by (x)`, want: []int{0}},
+		{expr: `foo + sum by (x)`, want: []int{2}},
+		{expr: `sum by (x) (avg)`, want: []int{0, 2}},
 	} {
 		got, err := canonicalizePromql(tc.expr)
 		if err != nil {
 			t.Fatalf("canonicalizePromql(%q): %v", tc.expr, err)
 		}
-		if n := countAggregators(got.tokens); n != tc.want {
-			t.Fatalf("countAggregators(%q) = %d, want %d", tc.expr, n, tc.want)
+		if idx := appliedAggregators(got.tokens); !slices.Equal(idx, tc.want) {
+			t.Fatalf("appliedAggregators(%q) = %v, want %v", tc.expr, idx, tc.want)
+		}
+	}
+}
+
+// A clause's slot is normalized before it is compared: the two spellings of one
+// aggregation's modifier slot (`agg by (t) (X)` and `agg(X) by (t)`) name the
+// same owner, and any other position is compared literally so a clause cannot
+// drift onto a different owner.
+func TestClauseSlot(t *testing.T) {
+	for _, tc := range []struct {
+		expr string
+		want []string
+	}{
+		{expr: `sum by (a) (foo)`, want: []string{"owner:0"}},
+		{expr: `sum(foo) by (a)`, want: []string{"owner:0"}},
+		{expr: `topk(5, foo) by (t)`, want: []string{"owner:0"}},
+		{expr: `topk by (t) (5, foo)`, want: []string{"owner:0"}},
+		{expr: `sum by (a) (foo) + sum by (b) (bar)`, want: []string{"owner:0", "owner:5"}},
+		{expr: `sum(foo) by (a) + sum(bar) by (b)`, want: []string{"owner:0", "owner:5"}},
+		// A clause inside the aggregation's parentheses is NOT its modifier
+		// slot, and a clause with no aggregator at all keeps its position.
+		{expr: `sum(increase(x[1h]) by (type))`, want: []string{"pos:9"}},
+		{expr: `increase(x[1h]) by (type)`, want: []string{"pos:7"}},
+		{expr: `increase(a[1h]) by (x) / sum(b)`, want: []string{"pos:7"}},
+	} {
+		got, err := canonicalizePromql(tc.expr)
+		if err != nil {
+			t.Fatalf("canonicalizePromql(%q): %v", tc.expr, err)
+		}
+		aggregators := appliedAggregators(got.tokens)
+		slots := make([]string, 0, len(got.clauses))
+		for _, clause := range got.clauses {
+			slots = append(slots, clauseSlot(got.tokens, aggregators, clause.index))
+		}
+		if !slices.Equal(slots, tc.want) {
+			t.Fatalf("clause slots for %q = %v, want %v", tc.expr, slots, tc.want)
 		}
 	}
 }

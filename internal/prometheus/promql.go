@@ -4,8 +4,8 @@ package prometheus
 
 import (
 	"fmt"
-	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	promqlparser "github.com/prometheus/prometheus/promql/parser"
@@ -70,7 +70,11 @@ type promqlCanonical struct {
 //     list is NOT a clause and stays in the sequence as an ordinary token.
 //     `on` / `ignoring` / `group_left` / `group_right` are never lifted — their
 //     position decides which operator they modify, so they stay in the sequence
-//     with their parens and labels as ordinary tokens.
+//     with their parens and labels as ordinary tokens. Clause positions are
+//     compared through clauseSlot, which treats the two spellings of ONE
+//     aggregation's modifier slot (`agg by (t) (X)` and `agg(X) by (t)`) as the
+//     same slot — they are the same PromQL — and every other position
+//     literally, so a clause still cannot move onto a different owner.
 //   - W2, one new `sum` wrapper, and only over an original that had none. See
 //     validateNewSumWrapper: exactly one orphaned clause on each side, the new
 //     aggregator must be `sum`, the clause must belong to that wrapper, the
@@ -92,8 +96,12 @@ type promqlCanonical struct {
 // with two orphaned clauses (`… by (x) + … by (y)`), which needs two new
 // wrappers; redundant parentheses added around the wrapped term; a new wrapper
 // that is not `sum` (`count`/`avg`/`max`/… answer a different question than an
-// orphaned `by` asked, so they are not recognised repairs); and wrapping a
-// whole binary expression when the clause trails only its right operand.
+// orphaned `by` asked, so they are not recognised repairs); wrapping a whole
+// binary expression when the clause trails only its right operand; and moving a
+// clause OUT of an existing aggregation's parentheses
+// (`sum(increase(x[1h]) by (type))` → `sum by (type) (increase(x[1h]))`) —
+// inside the parens is the aggregation's ARGUMENT, not its modifier slot, so
+// that move is not one of the two spellings clauseSlot normalizes.
 //
 // The original is by construction INVALID PromQL, so there is no parse tree to
 // compare against — only what the token stream says. That is enough in the
@@ -112,22 +120,22 @@ func ValidateSyntaxRepair(original, repaired string) error {
 		return fmt.Errorf("prometheus: syntax repair rejected: repaired expression not fully tokenizable")
 	}
 
-	aggOriginal := countAggregators(originalCanon.tokens)
-	aggRepaired := countAggregators(repairedCanon.tokens)
+	aggOriginal := appliedAggregators(originalCanon.tokens)
+	aggRepaired := appliedAggregators(repairedCanon.tokens)
 	switch {
-	case aggOriginal == aggRepaired:
+	case len(aggOriginal) == len(aggRepaired):
 		// No new wrapper: nothing may have moved at all. The sequence is
 		// checked first so a changed token is reported by its own class
 		// rather than by the clause shift it drags along.
 		if err := firstCanonDivergence(originalCanon.tokens, repairedCanon.tokens); err != nil {
 			return err
 		}
-		if !slices.Equal(originalCanon.clauses, repairedCanon.clauses) {
+		if !equalClauseSlots(originalCanon, aggOriginal, repairedCanon, aggRepaired) {
 			return fmt.Errorf("prometheus: syntax repair changed a grouping label list")
 		}
 		return nil
-	case aggOriginal == 0 && aggRepaired == 1:
-		return validateNewSumWrapper(originalCanon, repairedCanon)
+	case len(aggOriginal) == 0 && len(aggRepaired) == 1:
+		return validateNewSumWrapper(originalCanon, repairedCanon, aggRepaired[0])
 	default:
 		// Aggregation removed, a second one added, or one added to an
 		// expression that already aggregated: none of those is a repair.
@@ -145,7 +153,7 @@ func ValidateSyntaxRepair(original, repaired string) error {
 // orphaned clause immediately follows (termStart) and closes exactly where that
 // clause sat. Since one original admits exactly one such wrapping, two
 // contradictory repairs of it can never both be accepted.
-func validateNewSumWrapper(original, repaired promqlCanonical) error {
+func validateNewSumWrapper(original, repaired promqlCanonical, open int) error {
 	aggErr := fmt.Errorf("prometheus: syntax repair changed an aggregation operator")
 	if len(original.clauses) != 1 || len(repaired.clauses) != 1 {
 		return aggErr
@@ -154,15 +162,16 @@ func validateNewSumWrapper(original, repaired promqlCanonical) error {
 	// The wrapper: `sum` and nothing else. count and group return a count
 	// rather than the quantity, and avg/min/max/stddev/stdvar answer a
 	// different question than the orphaned `by` asked.
-	open := findAggregator(repaired.tokens)
-	if open < 0 || repaired.tokens[open].typ != promqlparser.SUM {
+	if repaired.tokens[open].typ != promqlparser.SUM {
 		return aggErr
 	}
 	if open+1 >= len(repaired.tokens) || repaired.tokens[open+1].typ != promqlparser.LEFT_PAREN {
 		return aggErr
 	}
+	// A wrapper must wrap something: `closing == open+2` is `sum(…)` around an
+	// empty term, which is not a repair of anything (and does not parse).
 	closing := matchingCloser(repaired.tokens, open+1)
-	if closing < 0 {
+	if closing < 0 || closing <= open+2 {
 		return aggErr
 	}
 
@@ -220,6 +229,13 @@ func validateNewSumWrapper(original, repaired promqlCanonical) error {
 // follows), a comma, `bool`, a vector-matching keyword, an unmatched opening
 // bracket, or the start of the sequence. `offset`, `@`, durations, numbers,
 // identifiers, `start`/`end` and balanced groups are all part of the term.
+//
+// The modifier-list exception is keyed on the SINGLE token before the `(`,
+// which is exactly how the pinned grammar spells those clauses today. If a
+// future PromQL ever puts something between the modifier keyword and its label
+// list, this test would stop recognising the list and would silently widen the
+// term (rather than fail closed), so it needs revisiting on a parser bump that
+// changes that shape.
 func termStart(tokens []canonToken, boundary int) (int, bool) {
 	i := boundary - 1
 	for i >= 0 {
@@ -327,9 +343,26 @@ func matchingCloser(tokens []canonToken, i int) int {
 	return -1
 }
 
-// countAggregators counts the aggregations an expression actually performs.
-func countAggregators(tokens []canonToken) int {
-	n, braceDepth := 0, 0
+// appliedAggregators returns the indices of the aggregation keywords the
+// expression actually aggregates with, in order.
+//
+// An `IsAggregator()` token counts wherever it appears, INCLUDING dangling at
+// the end of the sequence: `avg by (x)` is a truncated aggregation — exactly
+// the malformed input the repair path exists for — and reading it as a metric
+// named `avg` would let the gate bless `sum by (x) (avg)`, which changes the
+// aggregation operator and invents the operand.
+//
+// The single exception is a keyword used as a LABEL NAME inside a
+// vector-matching or cardinality list, which PromQL's `maybe_label` rule
+// admits: the SUM token in `foo / on(sum) bar` aggregates nothing, and counting
+// it would make a legitimate repair look like a second aggregator being
+// introduced. Those spans are tracked with a depth counter rather than a
+// look-behind, so nesting inside such a list cannot escape it. Tokens inside a
+// `{…}` selector are excluded for the same reason (today's lexer emits
+// IDENTIFIER for every in-brace label name, but the guard does not rely on it).
+func appliedAggregators(tokens []canonToken) []int {
+	var found []int
+	braceDepth, listDepth := 0, 0
 	for i := range tokens {
 		switch tokens[i].typ {
 		case promqlparser.LEFT_BRACE:
@@ -338,50 +371,66 @@ func countAggregators(tokens []canonToken) int {
 			if braceDepth > 0 {
 				braceDepth--
 			}
-		}
-		if braceDepth == 0 && aggregatorAt(tokens, i) {
-			n++
-		}
-	}
-	return n
-}
-
-// findAggregator returns the index of the first applied aggregation keyword, or
-// -1. Used only where countAggregators has already established there is exactly
-// one.
-func findAggregator(tokens []canonToken) int {
-	braceDepth := 0
-	for i := range tokens {
-		switch tokens[i].typ {
-		case promqlparser.LEFT_BRACE:
-			braceDepth++
-		case promqlparser.RIGHT_BRACE:
-			if braceDepth > 0 {
-				braceDepth--
+		case promqlparser.LEFT_PAREN:
+			switch {
+			case listDepth > 0:
+				listDepth++
+			case i > 0 && isVectorMatchingKeyword(tokens[i-1].typ):
+				listDepth = 1
+			}
+		case promqlparser.RIGHT_PAREN:
+			if listDepth > 0 {
+				listDepth--
 			}
 		}
-		if braceDepth == 0 && aggregatorAt(tokens, i) {
-			return i
+		if braceDepth == 0 && listDepth == 0 && tokens[i].typ.IsAggregator() {
+			found = append(found, i)
 		}
 	}
-	return -1
+	return found
 }
 
-// aggregatorAt reports whether tokens[i] is an aggregation keyword that is
-// actually applied — followed by its argument list or by a grouping keyword
-// that had no parenthesized list to be lifted with. PromQL's `maybe_label` rule
-// admits every aggregator name as a LABEL name, so `foo / on(sum) bar` carries
-// a SUM token that aggregates nothing; counting it would make a legitimate
-// repair look like a second aggregator being introduced.
-func aggregatorAt(tokens []canonToken, i int) bool {
-	if !tokens[i].typ.IsAggregator() || i+1 >= len(tokens) {
+// equalClauseSlots reports whether the two clause lists name the same slots with
+// the same labels, pairwise.
+func equalClauseSlots(original promqlCanonical, aggOriginal []int, repaired promqlCanonical, aggRepaired []int) bool {
+	if len(original.clauses) != len(repaired.clauses) {
 		return false
 	}
-	switch tokens[i+1].typ {
-	case promqlparser.LEFT_PAREN, promqlparser.BY, promqlparser.WITHOUT:
-		return true
+	for i, originalClause := range original.clauses {
+		repairedClause := repaired.clauses[i]
+		if originalClause.text != repairedClause.text {
+			return false
+		}
+		if clauseSlot(original.tokens, aggOriginal, originalClause.index) !=
+			clauseSlot(repaired.tokens, aggRepaired, repairedClause.index) {
+			return false
+		}
 	}
-	return false
+	return true
+}
+
+// clauseSlot names the position a clause occupies, normalizing the two
+// spellings of one aggregation's modifier slot.
+//
+// `agg by (t) (X)` lifts its clause at the aggregator's index + 1 and
+// `agg(X) by (t)` at the index just past the aggregator's closing parenthesis;
+// both are the same PromQL, so both report `owner:<aggregator index>` and a
+// repair may respell one as the other. Every other position — including inside
+// the aggregation's parentheses, which is its ARGUMENT rather than its modifier
+// slot — reports its literal index, so a clause cannot drift onto a different
+// owner or onto no owner at all without the comparison noticing.
+func clauseSlot(tokens []canonToken, aggregators []int, index int) string {
+	for _, k := range aggregators {
+		if index == k+1 {
+			return "owner:" + strconv.Itoa(k)
+		}
+		if k+1 < len(tokens) && tokens[k+1].typ == promqlparser.LEFT_PAREN {
+			if closing := matchingCloser(tokens, k+1); closing >= 0 && index == closing+1 {
+				return "owner:" + strconv.Itoa(k)
+			}
+		}
+	}
+	return "pos:" + strconv.Itoa(index)
 }
 
 // firstCanonDivergence returns nil when the two sequences are identical, and
