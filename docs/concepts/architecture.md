@@ -208,31 +208,72 @@ That root cause is wrong — it was the cache rollout. Capture that as a correct
 ## Incident lifecycle
 
 ```text
-collecting  →  ready  →  (skill running)  →  analyzed
-                 ↑              │
-                 └── retry ─────┘  →  failed (after 5 attempts)
+collecting  →  ready  →  processing  →  analyzed
+                 ↑            │
+                 └─ backoff ──┘  →  failed (after 5 attempts)
+                 └─ skipped        (deliberate no-op, e.g. below min_alerts)
 ```
 
-- `collecting`: window is open, alerts arriving
-- `ready`: window expired, incident dispatched to the triage skill. If the
-  skill errors (LLM endpoint down, connector failure, persistence error) the
-  incident stays here and is re-dispatched with backoff — 30 s, 2 min, 8 min,
-  32 min — from the correlator's flush ticker
-- `analyzed`: LLM output persisted
+- `collecting`: window is open, alerts arriving.
+- `ready`: window expired; a durable **triage schedule** — phase, attempt
+  count, next-due time, attempt-start time, bounded last-error — is seeded
+  for the incident, one row per incident, and it dispatches to the triage
+  skill.
+- `processing`: the transition to `processing` happens *before* the triage
+  skill is called and is a real in-flight lease, not a display value — a
+  crash mid-call is distinguishable from a clean run. If the skill errors
+  (LLM endpoint down, connector failure, persistence error) the incident
+  returns to `ready` in phase `backoff` and is re-dispatched — 30 s, 2 min,
+  8 min, 32 min after the initial attempt, five attempts total — from the
+  correlator's flush ticker. If the skill deterministically has nothing to
+  say (e.g. below `min_alerts`) the incident returns to `ready` in phase
+  `skipped` — a judgment, not a failure, and it is never redispatched.
+- **Retry-aware attachment:** while an incident is `ready` in phase
+  `backoff`, a later firing alert with the same group key and Drill parity
+  joins it as a member instead of minting a new incident or waiting for
+  recurrence collapse — the correlation window closes *collection*, not
+  *membership*, and membership stays open until the incident is first
+  judged (a Finding, a clean skip, or terminal failure). Attaching adds
+  membership only: no occurrence is recorded, no recurrence notification
+  fires, and the next-due time never accelerates. It never applies to
+  `pending`/`processing` (an attempt is genuinely in flight), `skipped`
+  (already judged), or `failed`/`exhausted` (terminal).
+- `analyzed`: LLM output persisted; the triage schedule row is deleted.
 - `failed`: every attempt errored; the incident is closed out (logged as
   `triage exhausted`, audited as `incident.triage_exhausted`, and written to
   the stdout notifier as one `{"kind":"triage_exhausted",…}` line — no Slack
-  card, so an LLM outage never becomes one card per stuck incident). A later firing
-  of the same group opens a fresh incident. Retry state lives in memory, so
-  on startup an incident still in `ready` is dispatched once more if it has
-  been ready for less than an hour — a restart mid-triage or mid-backoff does
-  not strand it. Older ones are closed out as `failed` without a triage call
-  (audited with reason `startup_retry_window_expired`, one summary log line),
-  so an upgrade over a backlog of stuck incidents does not become an LLM burst
+  card, so an LLM outage never becomes one card per stuck incident). A later
+  firing of the same group opens a fresh incident.
+- **Restart recovery:** the triage schedule is durable (SQLite, survives a
+  restart), and an attempt interrupted mid-call *counts* — the attempt
+  number is incremented before the skill is called, so a crash cannot be
+  used to redispatch for free. On startup, an interrupted `processing`
+  incident recovers to `backoff` with its next-due time computed from when
+  the interrupted attempt itself began (never a free extra delay from the
+  restart time), or straight to `failed` if that was its fifth attempt. A
+  legacy `ready` incident with no triage row (from a pre-upgrade binary) is
+  seeded fresh and dispatched once. In every case, the existing one-hour
+  startup horizon applies to *every* unjudged incident, not only legacy
+  ones: a due time more than an hour in the past at boot closes the incident
+  out as `failed` without a triage call (audited with reason
+  `startup_retry_window_expired`), so an upgrade over a backlog of stuck
+  incidents does not become an LLM burst. A condition that is still real
+  re-fires and opens a fresh incident, so nothing live is lost.
+- Resolving an incident (all member alerts recover) clears its triage row
+  outright — a resolved incident is never retried.
 
 A recurrence of an `analyzed` incident attaches as an occurrence rather than
 minting a new row — the lifecycle above describes one incident, not one
 firing.
+
+**Honest limitation:** the triage *schedule* is durable, but the Correlator's
+own alert queue is not. A Receiver persists an alert to the store before
+handing it to the Correlator, but that handoff itself is a bounded in-memory
+channel, and the triage skill call runs synchronously inside the single
+Correlator loop — correlation pauses for its duration, and a crash between
+persisting an alert and its handoff can still lose that handoff. A durable
+Receiver-to-Correlator delivery ledger and/or an asynchronous triage worker
+are a separate, future architecture item.
 
 ## Audit log
 

@@ -260,7 +260,8 @@ func TestEmptyReceiverIdentityFallsBackWithoutEmptyIncidentKey(t *testing.T) {
 }
 
 // TestSingleAlertPath verifies that a single alert creates a collecting
-// incident and, after the window, the sink receives a ready incident.
+// incident and, after the window, the sink receives it durably dispatched
+// (status "processing" — a real in-flight lease, R1).
 func TestSingleAlertPath(t *testing.T) {
 	st := newTestStore(t)
 	sink := &captureSink{}
@@ -293,8 +294,8 @@ func TestSingleAlertPath(t *testing.T) {
 		t.Fatal("expected incident to be flushed to sink; none received")
 	}
 	inc := sink.get(0)
-	if inc.Status != "ready" {
-		t.Errorf("incident status = %q, want ready", inc.Status)
+	if inc.Status != "processing" {
+		t.Errorf("incident status = %q, want processing", inc.Status)
 	}
 	if inc.AlertCount < 1 {
 		t.Errorf("incident alert_count = %d, want >= 1", inc.AlertCount)
@@ -555,9 +556,18 @@ func TestIncidentResolvesWhenAllMembersResolve(t *testing.T) {
 		}
 	}
 
-	// Window flushes → incident ready.
-	waitFor(t, func() bool { return sink.len() > 0 }, 3*time.Second, "incident ready")
+	// Window flushes → incident dispatched. The sink observes it while
+	// Status is durably "processing" (the in-flight lease taken before the
+	// sink is called); dispatchTriage only returns it to "ready" (phase
+	// "skipped", a clean skip since captureSink never persists a Finding)
+	// after the sink call returns. Wait for that settled state rather than
+	// racing sink.len() > 0 against the correlator's own goroutine.
+	waitFor(t, func() bool { return sink.len() > 0 }, 3*time.Second, "incident dispatched")
 	incID := sink.get(0).ID
+	waitFor(t, func() bool {
+		g, e := st.GetIncidentByID(ctx, incID)
+		return e == nil && g != nil && g.Status == "ready"
+	}, 3*time.Second, "incident settled to ready after clean-skip dispatch")
 	ready, err := st.GetIncidentByID(ctx, incID)
 	if err != nil {
 		t.Fatalf("get ready incident: %v", err)

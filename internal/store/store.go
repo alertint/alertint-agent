@@ -814,9 +814,20 @@ func (s *Store) SaveIncidentOutput(ctx context.Context, incidentID, outputJSON, 
 // analysis (e.g. fewer alerts than MinAlerts) never advance to "analyzed"
 // but can still become fully resolved when their member alerts recover.
 // Returns ErrNotFound if no incident in an eligible status exists.
+//
+// Resolution also clears any non-exhausted triage row (R7): a due retry must
+// never observe a resolved incident and dispatch an LLM call for it. An
+// exhausted row is never deleted here — it belongs to a "failed" incident,
+// which this method's own status guard already excludes.
 func (s *Store) MarkIncidentResolved(ctx context.Context, incidentID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	res, err := s.db.ExecContext(ctx, `
+	res, err := tx.ExecContext(ctx, `
 		UPDATE incidents
 		SET status     = 'resolved',
 		    updated_at = ?
@@ -832,7 +843,14 @@ func (s *Store) MarkIncidentResolved(ctx context.Context, incidentID string) err
 	if n == 0 {
 		return ErrNotFound
 	}
-	return nil
+
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM incident_triage WHERE incident_id = ? AND phase != 'exhausted'
+	`, incidentID); err != nil {
+		return fmt.Errorf("store: mark incident resolved: clear triage: %w", err)
+	}
+
+	return tx.Commit()
 }
 
 // SetAlertRole sets the role column on an incident_alerts row.

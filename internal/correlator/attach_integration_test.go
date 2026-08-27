@@ -31,6 +31,7 @@ func (f *fakeOccNotifier) count() int { f.mu.Lock(); defer f.mu.Unlock(); return
 type auditRow struct {
 	kind    string
 	trigger string
+	payload map[string]any
 }
 type fakeAuditor struct {
 	mu   sync.Mutex
@@ -41,10 +42,12 @@ func (a *fakeAuditor) Append(_ context.Context, _, kind string, payload any) err
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	trig := ""
+	var pm map[string]any
 	if m, ok := payload.(map[string]any); ok {
 		trig, _ = m["trigger"].(string)
+		pm = m
 	}
-	a.rows = append(a.rows, auditRow{kind: kind, trigger: trig})
+	a.rows = append(a.rows, auditRow{kind: kind, trigger: trig, payload: pm})
 	return nil
 }
 func (a *fakeAuditor) occurrenceAttachedCount() int {
@@ -57,6 +60,19 @@ func (a *fakeAuditor) occurrenceAttachedCount() int {
 		}
 	}
 	return n
+}
+
+// rowsOfKind returns every audited row of the given kind, in append order.
+func (a *fakeAuditor) rowsOfKind(kind string) []auditRow {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []auditRow
+	for _, r := range a.rows {
+		if r.kind == kind {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 type fakeRejudger struct {
