@@ -82,7 +82,8 @@ func TestValidateSyntaxRepair_SemanticAnchors(t *testing.T) {
 		repaired: `sum(increase(metric_name{type="error"}[1h])) by (type)`,
 	}, {
 		// Operator tracking must not over-reject: a matcher operator and a
-		// top-level comparison coexist, and only the aggregation moves.
+		// top-level comparison coexist, and only the aggregation moves. The
+		// wrapper opens at the start of the term the clause followed.
 		name:     "matcher and comparison survive relocation",
 		original: `foo{env="prod"} > increase(bar[1h]) by (type)`,
 		repaired: `foo{env="prod"} > sum by (type) (increase(bar[1h]))`,
@@ -164,12 +165,12 @@ func TestValidateSyntaxRepair_SemanticAnchors(t *testing.T) {
 }
 
 // The gate accepts a rewrite only when it is one the repair path exists for:
-// relocating by/without clauses, adding at most one aggregation wrapper to an
-// expression that had none, and reordering matchers inside one selector.
-// Everything else — a modifier moved onto a different operand, a keyword the
-// signature design had no case for, a second aggregation, a parameterised
-// wrapper, added precedence parentheses — differs as a token sequence and is
-// rejected by construction.
+// one new `sum` wrapper over an expression that had none, a relocated
+// by/without clause, and matchers reordered inside one selector. Everything
+// else — a modifier moved onto a different operand, a keyword the signature
+// design had no case for, a second aggregation, a parameterised wrapper, added
+// precedence parentheses — differs as a token sequence and is rejected by
+// construction.
 func TestValidateSyntaxRepair_RewriteWhitelist(t *testing.T) {
 	accept := []struct {
 		name               string
@@ -229,8 +230,7 @@ func TestValidateSyntaxRepair_RewriteWhitelist(t *testing.T) {
 		original: `increase(x[1h]) by (type)`,
 		repaired: `max(sum by (type) (increase(x[1h])))`,
 	}, {
-		// topk takes a parameter, so the wrapper is not a bare `agg( … )`:
-		// the 5 and its comma survive the strip and do not match.
+		// topk takes a parameter, so the wrapper is not a bare `sum( … )`.
 		name:     "parameterised aggregation wrapper added",
 		original: `increase(x[1h]) by (type)`,
 		repaired: `topk by (type) (5, increase(x[1h]))`,
@@ -244,6 +244,183 @@ func TestValidateSyntaxRepair_RewriteWhitelist(t *testing.T) {
 		name:     "wrapper added to an already aggregating expression",
 		original: `sum(foo) + increase(bar[1h]) by (type)`,
 		repaired: `sum(foo) + sum by (type) (increase(bar[1h]))`,
+	}}
+	for _, tc := range reject {
+		t.Run("reject/"+tc.name, func(t *testing.T) {
+			if err := ValidateSyntaxRepair(tc.original, tc.repaired); err == nil {
+				t.Fatalf("unrecognised rewrite accepted as syntax repair: %s", tc.repaired)
+			}
+		})
+	}
+}
+
+// A by/without clause's POSITION says which sub-expression it groups, and a new
+// wrapper's SCOPE says which sub-expression is aggregated. Both are
+// meaning-carrying, so both are anchored: the clause keeps the remainder index
+// it was lifted from, and a new `sum` wrapper must open at the start of the
+// term its orphaned clause follows and close exactly where that clause sat.
+//
+// Every reject row below was an accepted false positive before those two rules
+// existed; every original is invalid PromQL and every repaired expression
+// parses, so each pair is one the repair path can really be handed.
+func TestValidateSyntaxRepair_ClauseOwnershipAndWrapperScope(t *testing.T) {
+	accept := []struct {
+		name               string
+		original, repaired string
+	}{{
+		// term = increase(http_errors_total[1h]); the wrapper closes where the
+		// clause sat, leaving `> 100` outside it.
+		name:     "wrapper closes at the clause boundary before a comparison",
+		original: `increase(http_errors_total[1h]) by (code) > 100`,
+		repaired: `sum by (code) (increase(http_errors_total[1h])) > 100`,
+	}, {
+		name:     "wrapper closes at the clause boundary before a subtraction",
+		original: `increase(a[1h]) by (x) - b`,
+		repaired: `sum by (x) (increase(a[1h])) - b`,
+	}, {
+		// term = rate(b[5m]) only — the clause follows the right operand.
+		name:     "wrapper wraps only the operand the clause follows",
+		original: `rate(a[5m]) / rate(b[5m]) by (job)`,
+		repaired: `rate(a[5m]) / sum by (job) (rate(b[5m]))`,
+	}, {
+		// term = (a + b): a balanced parenthesized group is one term.
+		name:     "parenthesized group is one term",
+		original: `(a + b) by (x)`,
+		repaired: `sum by (x) ((a + b))`,
+	}, {
+		// term = bar: a vector-matching modifier list ends the term to its
+		// left, it is not part of the operand that follows it.
+		name:     "vector matching list is not part of the term",
+		original: `foo / on(x) bar by (t)`,
+		repaired: `foo / on(x) sum by (t) (bar)`,
+	}, {
+		// term = foo offset 5m: offset is a postfix modifier of the term.
+		name:     "offset belongs to the term",
+		original: `foo offset 5m by (t)`,
+		repaired: `sum by (t) (foo offset 5m)`,
+	}, {
+		// term = a: unary minus is an operator, so it bounds the term.
+		name:     "unary minus bounds the term",
+		original: `-a by (x)`,
+		repaired: `-sum by (x) (a)`,
+	}, {
+		// An aggregator keyword used as a LABEL NAME inside on(...) must not
+		// count as an aggregation, or this legitimate repair would look like
+		// a second aggregator being introduced.
+		name:     "aggregator keyword as an on-clause label name",
+		original: `foo / on(sum) bar by (x)`,
+		repaired: `foo / on(sum) sum by (x) (bar)`,
+	}}
+	for _, tc := range accept {
+		t.Run("accept/"+tc.name, func(t *testing.T) {
+			if err := ValidateSyntaxRepair(tc.original, tc.repaired); err != nil {
+				t.Fatalf("recognised rewrite rejected: %v", err)
+			}
+		})
+	}
+
+	reject := []struct {
+		name               string
+		original, repaired string
+	}{{
+		// High-1: the clause is re-owned by a DIFFERENT aggregator. Errors
+		// grouped by code over total capacity becomes ungrouped errors over
+		// capacity grouped by code.
+		name:     "clause re-owned by a different aggregator",
+		original: `increase(http_errors_total[1h]) by (code) / sum(capacity)`,
+		repaired: `increase(http_errors_total[1h]) / sum by (code) (capacity)`,
+	}, {
+		name:     "without clause re-owned by a different aggregator",
+		original: `increase(a[1h]) without (pod) / sum(b)`,
+		repaired: `increase(a[1h]) / sum without (pod) (b)`,
+	}, {
+		name:     "clause re-owned by a different aggregator, short form",
+		original: `increase(a[1h]) by (x) / sum(b)`,
+		repaired: `increase(a[1h]) / sum by (x) (b)`,
+	}, {
+		name:     "two clauses swapped between operands",
+		original: `by (a) sum(foo) + by (b) sum(bar)`,
+		repaired: `sum by (b) (foo) + sum by (a) (bar)`,
+	}, {
+		name:     "two clauses swapped between valid operands",
+		original: `sum by (a) (foo) + sum by (b) (bar)`,
+		repaired: `sum by (b) (foo) + sum by (a) (bar)`,
+	}, {
+		// High-2: the same original also "accepted" this contradictory
+		// wrapper, which filters per-series first and sums afterwards.
+		name:     "wrapper swallows the comparison",
+		original: `increase(http_errors_total[1h]) by (code) > 100`,
+		repaired: `sum by (code) (increase(http_errors_total[1h]) > 100)`,
+	}, {
+		name:     "wrapper swallows the subtraction",
+		original: `increase(a[1h]) by (x) - b`,
+		repaired: `sum by (x) (increase(a[1h]) - b)`,
+	}, {
+		name:     "wrapper swallows the whole ratio",
+		original: `rate(a[5m]) / rate(b[5m]) by (job)`,
+		repaired: `sum by (job) (rate(a[5m]) / rate(b[5m]))`,
+	}, {
+		name:     "wrapper wraps the wrong operand of the ratio",
+		original: `rate(a[5m]) / rate(b[5m]) by (job)`,
+		repaired: `sum by (job) (rate(a[5m])) / rate(b[5m])`,
+	}, {
+		// Important-1: a new wrapper may only be `sum`. count returns the
+		// number of series, group returns 1, avg/min/max/stddev/stdvar all
+		// answer a different question than the orphaned `by` asked.
+		name:     "new wrapper uses count",
+		original: `increase(http_errors_total{job="api"}[1h]) by (code)`,
+		repaired: `count by (code) (increase(http_errors_total{job="api"}[1h]))`,
+	}, {
+		name:     "new wrapper uses group",
+		original: `increase(http_errors_total{job="api"}[1h]) by (code)`,
+		repaired: `group by (code) (increase(http_errors_total{job="api"}[1h]))`,
+	}, {
+		name:     "new wrapper uses avg",
+		original: `increase(http_errors_total{job="api"}[1h]) by (code)`,
+		repaired: `avg by (code) (increase(http_errors_total{job="api"}[1h]))`,
+	}, {
+		name:     "new wrapper uses min",
+		original: `increase(http_errors_total{job="api"}[1h]) by (code)`,
+		repaired: `min by (code) (increase(http_errors_total{job="api"}[1h]))`,
+	}, {
+		name:     "new wrapper uses max",
+		original: `increase(http_errors_total{job="api"}[1h]) by (code)`,
+		repaired: `max by (code) (increase(http_errors_total{job="api"}[1h]))`,
+	}, {
+		name:     "new wrapper uses stddev",
+		original: `increase(http_errors_total{job="api"}[1h]) by (code)`,
+		repaired: `stddev by (code) (increase(http_errors_total{job="api"}[1h]))`,
+	}, {
+		name:     "new wrapper uses stdvar",
+		original: `increase(http_errors_total{job="api"}[1h]) by (code)`,
+		repaired: `stdvar by (code) (increase(http_errors_total{job="api"}[1h]))`,
+	}, {
+		// Important-2: a truncated `by` with no label list must not be
+		// extracted-and-dropped, or it unifies with an empty grouping clause
+		// and silently becomes "aggregate away every label".
+		name:     "truncated by keyword completed as an empty grouping",
+		original: `rate(http_requests_total{job="api"}[5m]) by`,
+		repaired: `sum by () (rate(http_requests_total{job="api"}[5m]))`,
+	}, {
+		name:     "truncated without keyword completed as an empty grouping",
+		original: `rate(http_requests_total{job="api"}[5m]) without`,
+		repaired: `sum without () (rate(http_requests_total{job="api"}[5m]))`,
+	}, {
+		// A label NAMED by inside a vector-matching list must stay in the
+		// sequence rather than being lifted out as a clause.
+		name:     "by used as an on-clause label name",
+		original: `foo / on(by) bar`,
+		repaired: `sum by () (foo / on() bar)`,
+	}, {
+		name:     "by used as a group_left label name",
+		original: `a / on(x) group_left(by) b`,
+		repaired: `sum by () (a / on(x) group_left() b)`,
+	}, {
+		// The wrapper must bind tightly to the term the clause follows, so
+		// wrapping the whole expression is not on offer here either.
+		name:     "wrapper swallows a vector-matching binary expression",
+		original: `foo / on(sum) bar by (x)`,
+		repaired: `sum by (x) (foo / on(sum) bar)`,
 	}}
 	for _, tc := range reject {
 		t.Run("reject/"+tc.name, func(t *testing.T) {
@@ -297,10 +474,10 @@ func TestValidateSyntaxRepair_KeywordNamedLabels(t *testing.T) {
 		repaired: `sum by (count) (foo)`,
 		wantErr:  "changed a grouping label list",
 	}, {
-		// on/ignoring label lists are no longer extracted into the clause
-		// list — they stay in the token sequence, so a changed label is
-		// reported by the class of the token that diverged. START and END are
-		// bare keywords, hence the structural class.
+		// on/ignoring label lists are not extracted into the clause list —
+		// they stay in the token sequence, so a changed label is reported by
+		// the class of the token that diverged. START and END are bare
+		// keywords, hence the structural class.
 		name:     "keyword-named on-clause label changed",
 		original: `foo / on (start) bar`,
 		repaired: `foo / on (end) bar`,
@@ -348,6 +525,9 @@ func TestCanonicalizePromql_MatcherTriplesCollapse(t *testing.T) {
 	for _, tc := range []struct {
 		expr string
 		want []string
+		// degenerate marks the rows whose value slot is not a quoted string,
+		// where the matcher operator is SUPPOSED to stay a standalone token.
+		degenerate bool
 	}{
 		{expr: `foo{env="prod"} > 5`, want: []string{"foo", "{", `env="prod"`, "}", ">", "5"}},
 		{
@@ -368,6 +548,12 @@ func TestCanonicalizePromql_MatcherTriplesCollapse(t *testing.T) {
 		{expr: `foo > bool bar`, want: []string{"foo", ">", "bool", "bar"}},
 		{expr: `foo @ start()`, want: []string{"foo", "@", "start", "(", ")"}},
 		{expr: `a / on(x) group_left b`, want: []string{"a", "/", "on", "(", "x", ")", "group_left", "b"}},
+		// A valid matcher's value is always a quoted string, so a degenerate
+		// value slot must NOT be swallowed into the triple — the } and the ,
+		// below would otherwise vanish into a synthetic token and the brace
+		// depth would never return to zero.
+		{expr: `foo{a=}`, want: []string{"foo", "{", "a", "=", "}"}, degenerate: true},
+		{expr: `foo{a=,b="1"}`, want: []string{"foo", "{", "a", "=", ",", `b="1"`, "}"}, degenerate: true},
 	} {
 		got, err := canonicalizePromql(tc.expr)
 		if err != nil {
@@ -375,6 +561,9 @@ func TestCanonicalizePromql_MatcherTriplesCollapse(t *testing.T) {
 		}
 		if vals := canonTokenValues(got.tokens); !slices.Equal(vals, tc.want) {
 			t.Fatalf("canonicalizePromql(%q) tokens = %v, want %v", tc.expr, vals, tc.want)
+		}
+		if tc.degenerate {
+			continue
 		}
 		for _, tok := range got.tokens {
 			if !tok.matcher && isMatcherOp(tok.typ) {
@@ -385,50 +574,65 @@ func TestCanonicalizePromql_MatcherTriplesCollapse(t *testing.T) {
 }
 
 // The clause entries the grouping check compares, spelled out: keyword kept,
-// labels sorted, one entry per by/without clause, the whole list sorted (a
-// relocated clause carries no position), and an entry recorded even for the
-// degenerate no-list form so a clause is never silently dropped.
+// labels sorted, one entry per by/without clause IN ENCOUNTER ORDER, each
+// carrying the remainder index it was lifted from (its position is what says
+// which sub-expression it groups, so it is compared, not discarded).
 //
-// on/ignoring are deliberately NOT extracted any more. Their position decides
-// which binary operator they modify, so pulling them out of the sequence is
-// exactly the hole that let `a / on(instance) b * c` be rewritten as
-// `a / b * on(instance) c`. They stay in the remainder as ordinary tokens.
+// on/ignoring are deliberately NOT extracted. Their position decides which
+// binary operator they modify, so pulling them out of the sequence is exactly
+// the hole that let `a / on(instance) b * c` be rewritten as
+// `a / b * on(instance) c`. Nor is a bare by/without with no parenthesized
+// label list extracted: dropping that token from the sequence let a truncated
+// `… by` be "repaired" into `sum by () (…)`.
 func TestCanonicalizePromql_GroupClauses(t *testing.T) {
 	for _, tc := range []struct {
 		expr            string
-		wantClauses     []string
+		wantClauses     []promqlClause
 		wantInRemainder []string
 	}{
-		{expr: `sum by (b, a) (foo)`, wantClauses: []string{"by:a,b"}},
-		{expr: `sum without (type) (foo)`, wantClauses: []string{"without:type"}},
-		{expr: `sum by (a) (foo) + sum by (b) (bar)`, wantClauses: []string{"by:a", "by:b"}},
-		{expr: `sum by (b) (bar) + sum by (a) (foo)`, wantClauses: []string{"by:a", "by:b"}},
-		{expr: `sum by () (foo)`, wantClauses: []string{"by:"}},
+		{expr: `sum by (b, a) (foo)`, wantClauses: []promqlClause{{index: 1, text: "by:a,b"}}},
+		{expr: `sum without (type) (foo)`, wantClauses: []promqlClause{{index: 1, text: "without:type"}}},
+		{
+			expr:        `sum by (a) (foo) + sum by (b) (bar)`,
+			wantClauses: []promqlClause{{index: 1, text: "by:a"}, {index: 6, text: "by:b"}},
+		},
+		{
+			// Encounter order, not sorted: swapping two clauses between two
+			// operands must be visible as a difference.
+			expr:        `sum by (b) (bar) + sum by (a) (foo)`,
+			wantClauses: []promqlClause{{index: 1, text: "by:b"}, {index: 6, text: "by:a"}},
+		},
+		{expr: `sum by () (foo)`, wantClauses: []promqlClause{{index: 1, text: "by:"}}},
 		{expr: `sum(foo)`, wantClauses: nil},
-		{expr: `sum by (quantile) (foo)`, wantClauses: []string{"by:quantile"}},
+		{expr: `sum by (quantile) (foo)`, wantClauses: []promqlClause{{index: 1, text: "by:quantile"}}},
 		{expr: `foo / on (start) bar`, wantClauses: nil, wantInRemainder: []string{"on", "(", "start", ")"}},
 		{expr: `foo / ignoring (b, a) bar`, wantClauses: nil, wantInRemainder: []string{"ignoring", "(", "b", ",", "a", ")"}},
 		{
 			expr:            `sum by (type) (foo / on (instance) bar)`,
-			wantClauses:     []string{"by:type"},
+			wantClauses:     []promqlClause{{index: 1, text: "by:type"}},
 			wantInRemainder: []string{"on", "(", "instance", ")"},
 		},
+		// A bare by/without keeps its token; nothing is dropped.
+		{expr: `rate(x[5m]) by`, wantClauses: nil, wantInRemainder: []string{")", "by"}},
+		{expr: `rate(x[5m]) without`, wantClauses: nil, wantInRemainder: []string{")", "without"}},
+		{expr: `foo / on(by) bar`, wantClauses: nil, wantInRemainder: []string{"on", "(", "by", ")"}},
+		{expr: `a / on(x) group_left(by) b`, wantClauses: nil, wantInRemainder: []string{"group_left", "(", "by", ")"}},
 	} {
 		got, err := canonicalizePromql(tc.expr)
 		if err != nil {
 			t.Fatalf("canonicalizePromql(%q): %v", tc.expr, err)
 		}
 		if !slices.Equal(got.clauses, tc.wantClauses) {
-			t.Fatalf("canonicalizePromql(%q).clauses = %v, want %v", tc.expr, got.clauses, tc.wantClauses)
+			t.Fatalf("canonicalizePromql(%q).clauses = %+v, want %+v", tc.expr, got.clauses, tc.wantClauses)
 		}
 		vals := canonTokenValues(got.tokens)
-		for _, extracted := range []string{"by", "without"} {
-			if slices.Contains(vals, extracted) {
-				t.Fatalf("canonicalizePromql(%q): %q left in the remainder %v", tc.expr, extracted, vals)
-			}
-		}
 		if tc.wantInRemainder != nil && !containsRun(vals, tc.wantInRemainder) {
 			t.Fatalf("canonicalizePromql(%q) tokens = %v, want them to contain %v", tc.expr, vals, tc.wantInRemainder)
+		}
+		for _, clause := range got.clauses {
+			if clause.index < 0 || clause.index > len(got.tokens) {
+				t.Fatalf("canonicalizePromql(%q): clause index %d out of range for %d tokens", tc.expr, clause.index, len(got.tokens))
+			}
 		}
 	}
 }
@@ -457,10 +661,8 @@ func TestCanonicalizePromql_KeywordNamedMatcherLabel(t *testing.T) {
 	if !slices.Equal(got.tokens, want) {
 		t.Fatalf("canonicalizePromql tokens = %+v, want %+v", got.tokens, want)
 	}
-	for _, tok := range got.tokens {
-		if tok.typ.IsAggregator() {
-			t.Fatalf("matcher label recorded as an aggregator: %q", tok.val)
-		}
+	if n := countAggregators(got.tokens); n != 0 {
+		t.Fatalf("matcher label counted as an aggregator: %d", n)
 	}
 
 	// A quoted label name lands in the same triple rather than scattering the
@@ -472,6 +674,87 @@ func TestCanonicalizePromql_KeywordNamedMatcherLabel(t *testing.T) {
 	wantQuoted := []string{"http_request_duration_seconds", "{", `"quantile"="0.99"`, "}"}
 	if vals := canonTokenValues(quoted.tokens); !slices.Equal(vals, wantQuoted) {
 		t.Fatalf("quoted tokens = %v, want %v", vals, wantQuoted)
+	}
+}
+
+// An aggregation keyword only counts as an aggregation when it is actually
+// applied — followed by its argument list or by a grouping keyword. The same
+// keyword used as a LABEL NAME (PromQL's maybe_label rule admits it) must not
+// inflate the count, or a legitimate repair looks like a second aggregator.
+func TestCountAggregators(t *testing.T) {
+	for _, tc := range []struct {
+		expr string
+		want int
+	}{
+		{expr: `sum(foo)`, want: 1},
+		{expr: `sum by (t) (foo)`, want: 1},
+		{expr: `sum(foo) by (t)`, want: 1},
+		{expr: `topk(5, foo)`, want: 1},
+		{expr: `max(sum by (t) (foo))`, want: 2},
+		{expr: `increase(foo[1h])`, want: 0},
+		// Label names, not aggregations.
+		{expr: `foo / on(sum) bar`, want: 0},
+		{expr: `foo / on(quantile) bar`, want: 0},
+		{expr: `foo / ignoring(count) bar`, want: 0},
+		{expr: `a / on(x) group_left(sum) b`, want: 0},
+		{expr: `foo{quantile="0.99"}`, want: 0},
+		// A truncated `sum by` keeps its bare keyword, and still counts.
+		{expr: `sum by`, want: 1},
+	} {
+		got, err := canonicalizePromql(tc.expr)
+		if err != nil {
+			t.Fatalf("canonicalizePromql(%q): %v", tc.expr, err)
+		}
+		if n := countAggregators(got.tokens); n != tc.want {
+			t.Fatalf("countAggregators(%q) = %d, want %d", tc.expr, n, tc.want)
+		}
+	}
+}
+
+// termStart is the tight-binding reading of `X by (t)`: the clause groups the
+// operand it immediately follows, and that operand's extent is what a new
+// wrapper is allowed to cover. One original therefore admits exactly one
+// wrapping, which is what makes contradictory repairs of the same original
+// impossible to both accept.
+func TestTermStart(t *testing.T) {
+	for _, tc := range []struct {
+		expr     string
+		wantTerm []string
+	}{
+		{expr: `increase(x[1h]) by (type)`, wantTerm: []string{"increase", "(", "x", "[", "1h", "]", ")"}},
+		{
+			expr:     `foo{env="prod"} > increase(bar[1h]) by (type)`,
+			wantTerm: []string{"increase", "(", "bar", "[", "1h", "]", ")"},
+		},
+		{expr: `(a + b) by (x)`, wantTerm: []string{"(", "a", "+", "b", ")"}},
+		{
+			expr:     `rate(a[5m]) / rate(b[5m]) by (job)`,
+			wantTerm: []string{"rate", "(", "b", "[", "5m", "]", ")"},
+		},
+		{expr: `foo / on(x) bar by (t)`, wantTerm: []string{"bar"}},
+		{expr: `a / on(x) group_left(y) bar by (t)`, wantTerm: []string{"bar"}},
+		{expr: `foo offset 5m by (t)`, wantTerm: []string{"foo", "offset", "5m"}},
+		{expr: `-a by (x)`, wantTerm: []string{"a"}},
+		{expr: `foo @ 1234 by (t)`, wantTerm: []string{"foo", "@", "1234"}},
+		{expr: `foo{env="prod"} by (t)`, wantTerm: []string{"foo", "{", `env="prod"`, "}"}},
+		{expr: `a and b by (t)`, wantTerm: []string{"b"}},
+		{expr: `foo > bool bar by (t)`, wantTerm: []string{"bar"}},
+	} {
+		got, err := canonicalizePromql(tc.expr)
+		if err != nil {
+			t.Fatalf("canonicalizePromql(%q): %v", tc.expr, err)
+		}
+		if len(got.clauses) != 1 {
+			t.Fatalf("canonicalizePromql(%q): want exactly one clause, got %+v", tc.expr, got.clauses)
+		}
+		boundary := got.clauses[0].index
+		start, ok := termStart(got.tokens, boundary)
+		if !ok {
+			t.Fatalf("termStart(%q) could not determine a term start", tc.expr)
+		}
+		if term := canonTokenValues(got.tokens[start:boundary]); !slices.Equal(term, tc.wantTerm) {
+			t.Fatalf("termStart(%q) term = %v, want %v", tc.expr, term, tc.wantTerm)
+		}
 	}
 }
 
