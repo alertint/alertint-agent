@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/llmhealth"
 	"github.com/alertint/alertint-agent/internal/notify"
 	"github.com/alertint/alertint-agent/internal/store"
 )
@@ -82,11 +83,16 @@ func (c *Correlator) dispatchTriage(ctx context.Context, incidentID string) {
 }
 
 // classifyTriageError produces the bounded, sanitized code/detail persisted
-// on a failed dispatch (R9). All non-LLM sink errors classify conservatively;
-// the sibling LLM-health PR replaces this with capability-aware dependency
-// codes without changing the retry schedule.
+// on a failed dispatch (R9). A dispatch error that llmhealth can classify
+// into a real dependency/content reason persists that reason code and its
+// safe detail; anything else (a non-LLM sink error, a shape llmhealth has
+// never seen) falls back to the generic triage_dispatch_failed code so a
+// failure is always recorded, never dropped.
 func classifyTriageError(err error) (code, detail string) {
-	return "triage_dispatch_failed", err.Error()
+	if reason := llmhealth.Classify(err); reason != llmhealth.ReasonUnknown {
+		return string(reason), llmhealth.SafeDetail(err)
+	}
+	return "triage_dispatch_failed", llmhealth.SafeDetail(err)
 }
 
 // triageFailed records a failed dispatch and either schedules the next
