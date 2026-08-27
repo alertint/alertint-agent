@@ -3,6 +3,7 @@
 package prometheus
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -10,6 +11,11 @@ import (
 
 	promqlparser "github.com/prometheus/prometheus/promql/parser"
 )
+
+// errMalformedGroupClause reports a `by (…)` / `without (…)` list that is not
+// PromQL's flat label list. It is distinguished from a lexer failure only so
+// ValidateSyntaxRepair can name the right reason; both fail closed.
+var errMalformedGroupClause = errors.New("prometheus: malformed grouping clause")
 
 // ValidateExpr parses expr with the official Prometheus PromQL grammar.
 // A fresh facade keeps the unstable upstream parser API confined here.
@@ -66,8 +72,12 @@ type promqlCanonical struct {
 //   - W1, by/without relocation. Every `by (…)` / `without (…)` clause (the
 //     keyword followed by a parenthesized label list) is lifted out of the
 //     sequence into a clause list, keeping its keyword, its sorted labels, and
-//     the remainder index it was lifted from. A bare `by` / `without` with no
-//     list is NOT a clause and stays in the sequence as an ordinary token.
+//     the remainder index it was lifted from. The list must be PromQL's FLAT
+//     label list: because the clause leaves the sequence, anything nested
+//     inside it would leave with it unrecorded, so a non-flat list rejects the
+//     repair outright rather than being read as labels (see readGroupClause).
+//     A bare `by` / `without` with no list is NOT a clause and stays in the
+//     sequence as an ordinary token.
 //     `on` / `ignoring` / `group_left` / `group_right` are never lifted — their
 //     position decides which operator they modify, so they stay in the sequence
 //     with their parens and labels as ordinary tokens. Clause positions are
@@ -108,14 +118,21 @@ type promqlCanonical struct {
 // fail-closed direction: any disagreement is a rejection.
 //
 // Errors name the class of the first divergence and never include query text.
-// If either side cannot be tokenized this fails closed: the repair is rejected
-// rather than approved on a partial read.
+// If either side cannot be tokenized, or carries a grouping clause that is not
+// a flat label list, this fails closed: the repair is rejected rather than
+// approved on a partial read.
 func ValidateSyntaxRepair(original, repaired string) error {
 	originalCanon, err := canonicalizePromql(original)
+	if errors.Is(err, errMalformedGroupClause) {
+		return fmt.Errorf("prometheus: syntax repair rejected: malformed grouping clause")
+	}
 	if err != nil {
 		return fmt.Errorf("prometheus: syntax repair rejected: original expression not fully tokenizable")
 	}
 	repairedCanon, err := canonicalizePromql(repaired)
+	if errors.Is(err, errMalformedGroupClause) {
+		return fmt.Errorf("prometheus: syntax repair rejected: malformed grouping clause")
+	}
 	if err != nil {
 		return fmt.Errorf("prometheus: syntax repair rejected: repaired expression not fully tokenizable")
 	}
@@ -540,9 +557,12 @@ func canonicalizePromql(expr string) (promqlCanonical, error) {
 		// emitting every in-brace label name as an IDENTIFIER.
 		case braceDepth == 0 && isGroupClauseKeyword(it.Typ) &&
 			i+1 < len(items) && items[i+1].Typ == promqlparser.LEFT_PAREN:
-			var text string
-			text, i = readGroupClause(items, i)
+			text, closing, err := readGroupClause(items, i)
+			if err != nil {
+				return promqlCanonical{}, err
+			}
 			canon.clauses = append(canon.clauses, promqlClause{index: len(canon.tokens), text: text})
+			i = closing
 
 		default:
 			canon.tokens = append(canon.tokens, canonToken{typ: it.Typ, val: it.Val})
@@ -609,35 +629,73 @@ func groupClauseKeyword(t promqlparser.ItemType) string {
 
 // readGroupClause reduces the grouping clause starting at items[i] (the keyword
 // itself, which the caller has already checked is followed by a LEFT_PAREN) to
-// its normalized text, and returns the index of the clause's last token so the
-// caller's loop resumes just past it.
+// its normalized text, and returns the index of the clause's closing
+// parenthesis so the caller's loop resumes just past it.
 //
-// The labels a clause names decide what the query groups over, so they are
-// anchored; the whole balanced parenthesized list is consumed, and every
-// depth-1 token other than the separating commas counts as a label, since
-// PromQL's `maybe_label` rule admits keywords (`quantile`, `count`, `start`,
-// ...) and quoted strings there, not just identifiers. Labels are sorted
-// (`by (a,b)` and `by (b,a)` group identically) and the keyword is kept, so a
-// by<->without swap — which inverts kept vs. excluded labels — is caught.
-func readGroupClause(items []promqlparser.Item, i int) (string, int) {
+// The invariant: every token this consumes either enters the canonical
+// representation or causes a rejection. Nothing is consumed and discarded —
+// the clause is lifted OUT of the token sequence, so a token silently dropped
+// here is a token whose deletion by a repair can never be detected. That is not
+// hypothetical: reading `by (type(bar{env="prod"}))` as a label list used to
+// swallow `bar`, `env="prod"` and `"prod"`, and the repair that deleted them
+// then compared equal.
+//
+// So the list must be PromQL's flat `label_list` and nothing else. Between the
+// opening parenthesis and its match, only a label name (the pinned grammar's
+// `grouping_label` rule: `maybe_label | STRING`, which admits keywords such as
+// `quantile`, `count` and `start` as well as identifiers and quoted strings)
+// and the separating COMMA are legal. A nested parenthesis, a brace, an
+// operator, a number, a duration, or the end of input before the closing
+// parenthesis all return an error, and the caller fails closed.
+//
+// Labels are sorted (`by (a,b)` and `by (b,a)` group identically) and the
+// keyword is kept, so a by<->without swap — which inverts kept vs. excluded
+// labels — is caught.
+func readGroupClause(items []promqlparser.Item, i int) (string, int, error) {
 	keyword := groupClauseKeyword(items[i].Typ)
 	var labels []string
-	depth := 1
-	j := i + 2
-	for ; j < len(items) && depth > 0; j++ {
+	for j := i + 2; j < len(items); j++ {
 		switch {
-		case items[j].Typ == promqlparser.LEFT_PAREN:
-			depth++
 		case items[j].Typ == promqlparser.RIGHT_PAREN:
-			depth--
+			sort.Strings(labels)
+			return keyword + ":" + strings.Join(labels, ","), j, nil
 		case items[j].Typ == promqlparser.COMMA:
 			// separator, not a label
-		case depth == 1:
+		case isGroupLabelToken(items[j].Typ):
 			labels = append(labels, items[j].Val)
+		default:
+			return "", 0, errMalformedGroupClause
 		}
 	}
-	sort.Strings(labels)
-	return keyword + ":" + strings.Join(labels, ","), j - 1
+	return "", 0, errMalformedGroupClause
+}
+
+// isGroupLabelToken reports whether t may name a label inside a `by (…)` /
+// `without (…)` list, per the pinned parser's `grouping_label` rule
+// (`maybe_label | STRING`, generated_parser.y). The keyword list is transcribed
+// from that rule rather than derived from IsKeyword()/IsAggregator(), because
+// the two are not the same set — WITHOUT, for instance, is a keyword the rule
+// does NOT admit — and being narrower than the grammar only ever costs a
+// rejection. A parser bump that adds a keyword to `maybe_label` and not to this
+// list makes the gate refuse a repair, never approve a wrong one.
+func isGroupLabelToken(t promqlparser.ItemType) bool {
+	switch t {
+	case promqlparser.IDENTIFIER, promqlparser.METRIC_IDENTIFIER, promqlparser.STRING:
+		return true
+	case promqlparser.AVG, promqlparser.BOOL, promqlparser.BOTTOMK, promqlparser.BY,
+		promqlparser.COUNT, promqlparser.COUNT_VALUES, promqlparser.GROUP,
+		promqlparser.GROUP_LEFT, promqlparser.GROUP_RIGHT, promqlparser.FILL,
+		promqlparser.FILL_LEFT, promqlparser.FILL_RIGHT, promqlparser.IGNORING,
+		promqlparser.LAND, promqlparser.LOR, promqlparser.LUNLESS, promqlparser.MAX,
+		promqlparser.MIN, promqlparser.OFFSET, promqlparser.ON, promqlparser.QUANTILE,
+		promqlparser.STDDEV, promqlparser.STDVAR, promqlparser.SUM, promqlparser.TOPK,
+		promqlparser.START, promqlparser.END, promqlparser.ATAN2, promqlparser.LIMITK,
+		promqlparser.LIMIT_RATIO, promqlparser.STEP, promqlparser.RANGE,
+		promqlparser.ANCHORED, promqlparser.SMOOTHED, promqlparser.MAX_OF,
+		promqlparser.MIN_OF:
+		return true
+	}
+	return false
 }
 
 // isMatcherOp reports whether t is one of the four label-matcher operators.

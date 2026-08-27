@@ -745,6 +745,13 @@ func TestCanonicalizePromql_GroupClauses(t *testing.T) {
 		{expr: `sum by () (foo)`, wantClauses: []promqlClause{{index: 1, text: "by:"}}},
 		{expr: `sum(foo)`, wantClauses: nil},
 		{expr: `sum by (quantile) (foo)`, wantClauses: []promqlClause{{index: 1, text: "by:quantile"}}},
+		// Every token type the pinned grammar's grouping_label rule admits:
+		// maybe_label's keywords and a quoted STRING.
+		{
+			expr:        `sum by (start, end, offset, on, bool, sum, count, quantile) (foo)`,
+			wantClauses: []promqlClause{{index: 1, text: "by:bool,count,end,offset,on,quantile,start,sum"}},
+		},
+		{expr: `sum by ("quantile") (foo)`, wantClauses: []promqlClause{{index: 1, text: `by:"quantile"`}}},
 		{expr: `foo / on (start) bar`, wantClauses: nil, wantInRemainder: []string{"on", "(", "start", ")"}},
 		{expr: `foo / ignoring (b, a) bar`, wantClauses: nil, wantInRemainder: []string{"ignoring", "(", "b", ",", "a", ")"}},
 		{
@@ -774,6 +781,149 @@ func TestCanonicalizePromql_GroupClauses(t *testing.T) {
 				t.Fatalf("canonicalizePromql(%q): clause index %d out of range for %d tokens", tc.expr, clause.index, len(got.tokens))
 			}
 		}
+	}
+}
+
+// A grouping list is PromQL's flat `label_list`, nothing else. Anything nested
+// inside it — a call, a selector, a parenthesized group — is not a label list,
+// and reading one as if it were meant its inner tokens were consumed and thrown
+// away: the clause then lifted out of the sequence carrying a metric, a matcher
+// and a literal with it, so a repair could delete them and still compare equal.
+// The reader now fails closed on any token that is not a label name or a comma,
+// which is the invariant it must hold: every token it consumes either enters the
+// canonical representation or causes a rejection.
+func TestValidateSyntaxRepair_MalformedGroupingClause(t *testing.T) {
+	const malformed = "syntax repair rejected: malformed grouping clause"
+	for _, tc := range []struct {
+		name               string
+		original, repaired string
+		wantErr            string
+	}{{
+		// The finding: `type(bar{env="prod"})` is not a label list. Reading it
+		// as one dropped `bar`, `env="prod"` and `"prod"` from the original,
+		// so the repair that deletes them compared equal and was ACCEPTED.
+		name:     "call nested in the grouping list",
+		original: `increase(foo[1h]) by (type(bar{env="prod"}))`,
+		repaired: `sum by (type) (increase(foo[1h]))`,
+		wantErr:  malformed,
+	}, {
+		name:     "parenthesized group nested in the grouping list",
+		original: `foo by (a, (b))`,
+		repaired: `sum by (a, b) (foo)`,
+		wantErr:  malformed,
+	}, {
+		name:     "selector nested in the grouping list",
+		original: `foo by (a{x="1"})`,
+		repaired: `sum by (a) (foo)`,
+		wantErr:  malformed,
+	}, {
+		name:     "number in the grouping list",
+		original: `foo by (a 5)`,
+		repaired: `sum by (a) (foo)`,
+		wantErr:  malformed,
+	}, {
+		name:     "without clause with a nested call",
+		original: `increase(foo[1h]) without (type(bar))`,
+		repaired: `sum without (type) (increase(foo[1h]))`,
+		wantErr:  malformed,
+	}, {
+		// The repaired side is read by the same rule.
+		name:     "malformed grouping list on the repaired side",
+		original: `foo by (a)`,
+		repaired: `sum by (a(b)) (foo)`,
+		wantErr:  malformed,
+	}, {
+		// Unterminated: today the lexer already refuses this one, so the
+		// message is the tokenizer's. Either way it must not be accepted.
+		name:     "unterminated grouping list",
+		original: `foo by (a`,
+		repaired: `sum by (a) (foo)`,
+		wantErr:  "syntax repair rejected",
+	}} {
+		t.Run("reject/"+tc.name, func(t *testing.T) {
+			err := ValidateSyntaxRepair(tc.original, tc.repaired)
+			if err == nil {
+				t.Fatalf("malformed grouping clause accepted as syntax repair: %s -> %s", tc.original, tc.repaired)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %v, want it to mention %q", err, tc.wantErr)
+			}
+			if strings.Contains(err.Error(), "foo") || strings.Contains(err.Error(), "prod") {
+				t.Fatalf("error leaked query text: %v", err)
+			}
+		})
+	}
+}
+
+// readGroupClause's contract, spelled out: a flat list of label names and
+// commas is reduced to its normalized text and the index of its closing paren;
+// anything else — a nested paren, a brace, an operator, a number, or running
+// out of input before the closing paren — is an error, never a silent
+// truncation of what it consumed.
+func TestReadGroupClause(t *testing.T) {
+	// clauseOf lexes expr and reads the grouping clause opened by its first
+	// by/without keyword.
+	clauseOf := func(t *testing.T, expr string) (string, int, error) {
+		t.Helper()
+		items, err := lexAllItems(expr)
+		if err != nil {
+			t.Fatalf("lexAllItems(%q): %v", expr, err)
+		}
+		for i, it := range items {
+			if isGroupClauseKeyword(it.Typ) {
+				return readGroupClause(items, i)
+			}
+		}
+		t.Fatalf("no grouping keyword in %q", expr)
+		return "", 0, nil
+	}
+
+	for _, tc := range []struct {
+		expr string
+		want string
+	}{
+		{expr: `sum by (b, a) (foo)`, want: "by:a,b"},
+		{expr: `sum without (type) (foo)`, want: "without:type"},
+		{expr: `sum by () (foo)`, want: "by:"},
+		{expr: `sum by (quantile) (foo)`, want: "by:quantile"},
+		{expr: `sum by ("quantile") (foo)`, want: `by:"quantile"`},
+		{expr: `sum by (start, end) (foo)`, want: "by:end,start"},
+	} {
+		text, last, err := clauseOf(t, tc.expr)
+		if err != nil {
+			t.Fatalf("readGroupClause(%q): %v", tc.expr, err)
+		}
+		if text != tc.want {
+			t.Fatalf("readGroupClause(%q) = %q, want %q", tc.expr, text, tc.want)
+		}
+		items, _ := lexAllItems(tc.expr)
+		if last >= len(items) || items[last].Typ != promqlparser.RIGHT_PAREN {
+			t.Fatalf("readGroupClause(%q) last index %d is not the closing paren", tc.expr, last)
+		}
+	}
+
+	for _, expr := range []string{
+		`foo by (a, (b))`,
+		`foo by (type(bar))`,
+		`foo by (a{x="1"})`,
+		`foo by (a 5)`,
+		`foo by (a + b)`,
+		`foo by (5m)`,
+		`foo by (without)`, // WITHOUT is not in the grammar's maybe_label rule
+	} {
+		if _, _, err := clauseOf(t, expr); err == nil {
+			t.Fatalf("readGroupClause(%q) accepted a non-flat label list", expr)
+		}
+	}
+
+	// Running out of input before the closing paren is an error, not a
+	// silently truncated clause.
+	items, err := lexAllItems(`sum by (a, b)`)
+	if err != nil {
+		t.Fatalf("lexAllItems: %v", err)
+	}
+	if _, _, err := readGroupClause(items[:len(items)-1], 1); err == nil {
+		t.Fatalf("readGroupClause accepted an unterminated label list")
 	}
 }
 
