@@ -51,6 +51,15 @@ triage:
     max_rounds: 1                 # reserved for future multi-round verification; only 1 is accepted today
   extra_selector_labels: []       # extra topology label keys (e.g. [cluster]) joined to every evidence/verification query; extend-only, never dropped by fallbacks
 
+# Installation dependency health. The LLM is observed from real triage calls;
+# the idle probe is a metadata GET (never a completion) that runs only after
+# this many seconds without a completed real call. A Slack system message is
+# posted once the LLM has been unhealthy for broadcast_after_seconds and is
+# edited in place on recovery (only when notify.slack.enabled).
+health:
+  llm_idle_probe_after_seconds: 300
+  broadcast_after_seconds: 300
+
 notify:
   stdout: true             # always emit one JSON line per finding to stdout
   slack:

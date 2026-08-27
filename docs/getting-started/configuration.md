@@ -226,6 +226,18 @@ specific to your environment; see
 | `verification.max_rounds` | int | `1` | Reserved for future multi-round verification; values greater than 1 are rejected. Today only `1` is supported. |
 | `extra_selector_labels` | list | — | Extra alert-label keys (topology labels like `cluster` or `region`) added to the built-in selector allowlist (`namespace, service, job, pod, container, instance`) used to build metric/log enrichment queries and the verification floor's peer scope. Extras join every query and are never dropped by fallback queries. Use topology labels, not identity labels. |
 
+## `health`
+
+Installation dependency health for the LLM. Real triage calls are the primary
+signal; a non-generating metadata `GET` probe runs only while idle. See
+[Integration health](#integration-health) for the `/health` shape and the
+[Slack guide](../notifications/slack.md#system-messages) for the system message.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `llm_idle_probe_after_seconds` | int | `300` | Seconds without a completed real LLM call before an idle metadata probe runs (at most once per minute while idle; never while a call is in flight). Must be positive. |
+| `broadcast_after_seconds` | int | `300` | Seconds the LLM must be continuously unhealthy before one `AlertINT system` Slack message is posted. Must be positive. |
+
 ## `notify`
 
 | Field | Type | Default | Description |

@@ -51,8 +51,19 @@ type Config struct {
 	Rules        RulesConfig        `yaml:"rules"`
 	Memory       MemoryConfig       `yaml:"memory"`
 	Triage       TriageConfig       `yaml:"triage,omitempty"`
+	Health       HealthConfig       `yaml:"health"`
 	LogLevel     string             `yaml:"log_level"`
 	LogFormat    string             `yaml:"log_format"`
+}
+
+// HealthConfig tunes installation-level dependency health (today: the LLM).
+// Neither knob has an enable switch: outcome observation is always on, the
+// idle probe runs only when no real LLM call has completed for
+// llm_idle_probe_after_seconds, and a Slack system message is posted only
+// once the LLM has been continuously unhealthy for broadcast_after_seconds.
+type HealthConfig struct {
+	LLMIdleProbeAfterSeconds int `yaml:"llm_idle_probe_after_seconds"`
+	BroadcastAfterSeconds    int `yaml:"broadcast_after_seconds"`
 }
 
 // RulesConfig configures rule pack loading. The embedded baseline pack is
@@ -529,6 +540,10 @@ func Defaults() Config {
 				TimeoutSeconds: 10,
 			},
 		},
+		Health: HealthConfig{
+			LLMIdleProbeAfterSeconds: 300,
+			BroadcastAfterSeconds:    300,
+		},
 		LogLevel:  "info",
 		LogFormat: "auto",
 	}
@@ -640,6 +655,7 @@ func (c *Config) validate(offline bool) error {
 	errs = append(errs, c.validateSentry()...)
 	errs = append(errs, c.validateChanges()...)
 	errs = append(errs, c.validateVerification()...)
+	errs = append(errs, c.validateHealth()...)
 	errs = append(errs, c.validateTriageSelector()...)
 	errs = append(errs, c.validateMemory()...)
 	if !offline {
@@ -819,6 +835,18 @@ func (c *Config) validateCorrelator() []string {
 			}
 			seen[label] = i
 		}
+	}
+	return errs
+}
+
+// validateHealth checks the installation dependency health config.
+func (c *Config) validateHealth() []string {
+	var errs []string
+	if c.Health.LLMIdleProbeAfterSeconds <= 0 {
+		errs = append(errs, "health: llm_idle_probe_after_seconds must be positive")
+	}
+	if c.Health.BroadcastAfterSeconds <= 0 {
+		errs = append(errs, "health: broadcast_after_seconds must be positive")
 	}
 	return errs
 }
