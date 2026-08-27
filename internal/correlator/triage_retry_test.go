@@ -294,6 +294,23 @@ func TestTriageBackoffRecordsCapabilityAwareCode(t *testing.T) {
 	}
 }
 
+// TestTriageBackoffRecordsResponseMalformed pins the content-class side of
+// the same contract: a Call-1 typed-decode failure propagated the way Acute
+// Triage now propagates it (wrapping llmhealth.ErrResponseMalformed) lands
+// on the durable triage row as response_malformed — the same code /health
+// reports for that capability — not the generic fallback.
+func TestTriageBackoffRecordsResponseMalformed(t *testing.T) {
+	h := newRetryHarness(t, 1)
+	h.sink.failErr = fmt.Errorf("acutetriage: parse llm response: %w", fmt.Errorf("%w: json: cannot unmarshal string into Go struct field", llmhealth.ErrResponseMalformed))
+
+	h.flush()
+
+	tri := mustBackoffRow(t, h.st, h.inc.ID)
+	if tri.LastErrorCode != "response_malformed" {
+		t.Fatalf("code = %q, want response_malformed", tri.LastErrorCode)
+	}
+}
+
 // TestTriageBackoffDoesNotMisattributeAmbiguousShapedErrors pins
 // classifyTriageError's other side: llmhealth.Classify's timeout/network/
 // canceled reasons match on generic stdlib shapes (context.DeadlineExceeded,

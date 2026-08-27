@@ -5,6 +5,7 @@ package acutetriage_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/alertint/alertint-agent/internal/llm"
@@ -63,6 +64,28 @@ func TestCall1MalformedTypedResponseObservedAfterDecode(t *testing.T) {
 	s := tr.Snapshot()
 	if s.State != llmhealth.StateUnavailable || s.Reason != llmhealth.ReasonResponseMalformed {
 		t.Fatalf("two distinct incidents must corroborate: %+v", s)
+	}
+}
+
+// TestCall1MalformedTypedResponseErrorCarriesReason pins that the error Run
+// returns for a typed-decode failure is the SAME reason-bearing error the
+// health tracker observed: both wrap llmhealth.ErrResponseMalformed, so the
+// Correlator's durable triage row records response_malformed exactly as
+// /health does, never a generic code that disagrees with it.
+func TestCall1MalformedTypedResponseErrorCarriesReason(t *testing.T) {
+	ctx, st, tr, inc := healthFixture(t)
+	bad := &fakeLLM{response: json.RawMessage(`{"analysis_name":"x","overall_issue":"y","correlation_findings":[],"severity":"low","confidence":"high","alerts":[]}`)}
+	sk := acutetriage.New(acutetriage.Config{MinAlerts: 1, Health: tr}, st, bad, nil, nil, nil)
+
+	err := sk.Run(ctx, inc)
+	if err == nil {
+		t.Fatal("malformed typed response must fail the triage")
+	}
+	if !errors.Is(err, llmhealth.ErrResponseMalformed) {
+		t.Fatalf("Run error %v does not wrap ErrResponseMalformed", err)
+	}
+	if got := llmhealth.Classify(err); got != llmhealth.ReasonResponseMalformed {
+		t.Fatalf("Classify(Run error) = %q, want response_malformed (what the tracker recorded)", got)
 	}
 }
 

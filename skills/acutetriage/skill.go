@@ -328,8 +328,13 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	// was canceled between the LLM call returning and the decode finishing.
 	var resp llmResponse
 	if err := json.Unmarshal(ar.raw, &resp); err != nil {
-		ar.health.Finish(fmt.Errorf("%w: %v", llmhealth.ErrResponseMalformed, err)) //nolint:contextcheck
-		return fmt.Errorf("acutetriage: parse llm response: %w", err)
+		// One reason-bearing error for both consumers: the tracker observes
+		// it, and the Correlator classifies the very same error for its
+		// durable triage code — so /health and the retry row can never
+		// disagree about why this attempt failed.
+		malformed := fmt.Errorf("%w: %v", llmhealth.ErrResponseMalformed, err)
+		ar.health.Finish(malformed) //nolint:contextcheck
+		return fmt.Errorf("acutetriage: parse llm response: %w", malformed)
 	}
 	ar.health.Finish(nil) //nolint:contextcheck
 	clampConfidence(&resp.Confidence)
