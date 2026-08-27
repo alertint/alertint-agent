@@ -4,6 +4,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -483,5 +484,48 @@ func TestMarkIncidentFailed_OnlyFromReady(t *testing.T) {
 				t.Errorf("status = %q, want %q", got, tc.wantStatus)
 			}
 		})
+	}
+}
+
+// TestMarkIncidentResolved_ClearsTriageRow covers R7: resolving a
+// ready+backoff incident deletes its triage row, and a due retry afterward
+// finds nothing to redispatch.
+func TestMarkIncidentResolved_ClearsTriageRow(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	incID := readyIncident(t, s, "service=resolve-clears")
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+
+	if err := s.SeedIncidentTriage(ctx, incID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.BeginIncidentTriage(ctx, incID, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BackoffIncidentTriage(ctx, incID, now.Add(time.Minute), "timeout", "deadline exceeded"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.MarkIncidentResolved(ctx, incID); err != nil {
+		t.Fatalf("MarkIncidentResolved: %v", err)
+	}
+
+	got, err := s.GetIncidentByID(ctx, incID)
+	if err != nil || got == nil || got.Status != "resolved" {
+		t.Fatalf("incident = %+v, %v, want status resolved", got, err)
+	}
+
+	var phase string
+	scanErr := s.db.QueryRowContext(ctx, `SELECT phase FROM incident_triage WHERE incident_id = ?`, incID).Scan(&phase)
+	if !errors.Is(scanErr, sql.ErrNoRows) {
+		t.Fatalf("triage row after resolution: phase=%q err=%v, want sql.ErrNoRows (row deleted)", phase, scanErr)
+	}
+
+	due, err := s.ListDueIncidentTriage(ctx, now.Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("list due: %v", err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("due triage after resolution = %+v, want none", due)
 	}
 }

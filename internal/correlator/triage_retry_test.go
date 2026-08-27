@@ -287,7 +287,9 @@ func TestTriageExhaustsToFailed(t *testing.T) {
 }
 
 // TestTriageRetrySkipsIncidentThatLeftReady: an incident resolved while a
-// retry is pending is dropped without another sink call and keeps its status.
+// retry is pending is dropped without another sink call and keeps its
+// status. R7: resolution also clears the triage row outright, so it is
+// absent from every later scan, not merely skipped by the Begin guard.
 func TestTriageRetrySkipsIncidentThatLeftReady(t *testing.T) {
 	h := newRetryHarness(t, 1000)
 
@@ -295,6 +297,9 @@ func TestTriageRetrySkipsIncidentThatLeftReady(t *testing.T) {
 	h.wantCalls(1, "initial dispatch")
 	if err := h.st.MarkIncidentResolved(context.Background(), h.inc.ID); err != nil {
 		t.Fatalf("mark resolved: %v", err)
+	}
+	if got := triagePhase(t, h.st, h.inc.ID); got != "" {
+		t.Fatalf("triage row after resolution = %q, want absent (deleted)", got)
 	}
 
 	h.now = h.now.Add(correlator.TriageRetryDelays[0])
