@@ -260,7 +260,8 @@ func TestEmptyReceiverIdentityFallsBackWithoutEmptyIncidentKey(t *testing.T) {
 }
 
 // TestSingleAlertPath verifies that a single alert creates a collecting
-// incident and, after the window, the sink receives a ready incident.
+// incident and, after the window, the sink receives it durably dispatched
+// (status "processing" — a real in-flight lease, R1).
 func TestSingleAlertPath(t *testing.T) {
 	st := newTestStore(t)
 	sink := &captureSink{}
@@ -293,8 +294,8 @@ func TestSingleAlertPath(t *testing.T) {
 		t.Fatal("expected incident to be flushed to sink; none received")
 	}
 	inc := sink.get(0)
-	if inc.Status != "ready" {
-		t.Errorf("incident status = %q, want ready", inc.Status)
+	if inc.Status != "processing" {
+		t.Errorf("incident status = %q, want processing", inc.Status)
 	}
 	if inc.AlertCount < 1 {
 		t.Errorf("incident alert_count = %d, want >= 1", inc.AlertCount)

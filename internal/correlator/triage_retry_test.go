@@ -4,6 +4,7 @@ package correlator_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"sync"
 	"testing"
@@ -15,16 +16,20 @@ import (
 	"github.com/google/uuid"
 )
 
-// failingSink errors on the first `failures` OnIncidentReady calls and
-// succeeds afterwards, recording every call.
+// failingSink errors on the first `failures` OnIncidentReady calls. After
+// that it either performs a clean skip (returns nil without persisting,
+// leaving the Incident "processing") or persists a Finding via
+// SaveIncidentOutput, depending on cleanSkip.
 type failingSink struct {
-	mu       sync.Mutex
-	failures int
-	calls    []string
-	onCall   func() // optional hook run inside each call (e.g. advance the clock)
+	mu        sync.Mutex
+	failures  int
+	cleanSkip bool
+	calls     []string
+	onCall    func() // optional hook run inside each call (e.g. advance the clock)
+	st        *store.Store
 }
 
-func (s *failingSink) OnIncidentReady(_ context.Context, inc store.Incident) error {
+func (s *failingSink) OnIncidentReady(ctx context.Context, inc store.Incident) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.onCall != nil {
@@ -34,7 +39,10 @@ func (s *failingSink) OnIncidentReady(_ context.Context, inc store.Incident) err
 	if len(s.calls) <= s.failures {
 		return errors.New("acutetriage: llm: connection refused")
 	}
-	return nil
+	if s.cleanSkip {
+		return nil
+	}
+	return s.st.SaveIncidentOutput(ctx, inc.ID, `{"ok":true}`, "n", "i", 0.5, "")
 }
 
 func (s *failingSink) count() int {
@@ -91,16 +99,32 @@ func insertCollectingIncident(t *testing.T, st *store.Store, name string, readyA
 }
 
 // newRetryHarness inserts one overdue collecting incident (with a member
-// alert) and a correlator whose sink fails the first `failures` calls.
+// alert) and a correlator whose sink fails the first `failures` calls, then
+// persists a Finding.
 func newRetryHarness(t *testing.T, failures int) *retryHarness {
+	t.Helper()
+	return newRetryHarnessMode(t, failures, false)
+}
+
+// newRetryHarnessCleanSkip is like newRetryHarness but the sink never fails
+// and never persists — every call is a clean skip (the skill's deterministic
+// "nothing to say").
+func newRetryHarnessCleanSkip(t *testing.T) *retryHarness {
+	t.Helper()
+	return newRetryHarnessMode(t, 0, true)
+}
+
+func newRetryHarnessMode(t *testing.T, failures int, cleanSkip bool) *retryHarness {
 	t.Helper()
 	st := newTestStore(t)
 	now := time.Now().UTC()
 	inc := insertCollectingIncident(t, st, "Retry", now.Add(-10*time.Second))
 
 	h := &retryHarness{
-		t: t, st: st, sink: &failingSink{failures: failures}, exhaust: &exhaustCapture{},
-		inc: inc, now: now,
+		t: t, st: st,
+		sink:    &failingSink{failures: failures, cleanSkip: cleanSkip, st: st},
+		exhaust: &exhaustCapture{},
+		inc:     inc, now: now,
 	}
 	h.cor = correlator.New(correlator.Config{WindowSeconds: 60}, st, h.sink, nil)
 	h.cor.SetNow(func() time.Time { return h.now })
@@ -141,9 +165,45 @@ func (h *retryHarness) wantExhaustEvents(n int, when string) {
 	}
 }
 
-// TestTriageRetryAfterSinkError: one failed dispatch is retried after the
-// first backoff delay, and a successful retry ends the schedule.
-func TestTriageRetryAfterSinkError(t *testing.T) {
+// triagePhase reads the durable triage phase for incidentID, or "" if no row
+// exists (e.g. never seeded, or deleted on completion).
+func triagePhase(t *testing.T, st *store.Store, incidentID string) string {
+	t.Helper()
+	var phase string
+	err := st.DB().QueryRowContext(context.Background(),
+		`SELECT phase FROM incident_triage WHERE incident_id = ?`, incidentID).Scan(&phase)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ""
+		}
+		t.Fatalf("triage phase: %v", err)
+	}
+	return phase
+}
+
+// triageAttempts reads the durable attempt count for incidentID, or -1 if no
+// row exists.
+func triageAttempts(t *testing.T, st *store.Store, incidentID string) int {
+	t.Helper()
+	var n int
+	err := st.DB().QueryRowContext(context.Background(),
+		`SELECT attempts FROM incident_triage WHERE incident_id = ?`, incidentID).Scan(&n)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return -1
+		}
+		t.Fatalf("triage attempts: %v", err)
+	}
+	return n
+}
+
+// TestTriageRetry_PendingThroughBackoffThenSuccess pins the durable phase
+// sequence across a failed dispatch followed by a successful retry:
+// pending/0 -> in_flight/1 -> backoff/1, then backoff/1 -> in_flight/2 ->
+// analyzed/no triage row. in_flight is transient (Begin and the sink call
+// both happen inside one synchronous dispatch), so only the states at rest
+// between ticks are directly observable.
+func TestTriageRetry_PendingThroughBackoffThenSuccess(t *testing.T) {
 	h := newRetryHarness(t, 1)
 
 	h.flush()
@@ -151,21 +211,24 @@ func TestTriageRetryAfterSinkError(t *testing.T) {
 	if s := h.status(); s != "ready" {
 		t.Fatalf("status after failed dispatch = %q, want ready", s)
 	}
-
-	// Same instant, and just short of the delay: not due yet.
-	h.flush()
-	h.now = h.now.Add(correlator.TriageRetryDelays[0] - time.Second)
-	h.flush()
-	h.wantCalls(1, "before first delay elapsed")
-
-	h.now = h.now.Add(time.Second)
-	h.flush()
-	h.wantCalls(2, "first retry")
-	if s := h.status(); s != "ready" {
-		t.Fatalf("status after successful retry = %q, want ready (sink is a fake; skill persists)", s)
+	if got := triagePhase(t, h.st, h.inc.ID); got != "backoff" {
+		t.Fatalf("phase after failed dispatch = %q, want backoff", got)
+	}
+	if got := triageAttempts(t, h.st, h.inc.ID); got != 1 {
+		t.Fatalf("attempts after failed dispatch = %d, want 1", got)
 	}
 
-	// Success cleared the retry state: nothing more is dispatched, ever.
+	h.now = h.now.Add(correlator.TriageRetryDelays[0])
+	h.flush()
+	h.wantCalls(2, "first retry")
+	if s := h.status(); s != "analyzed" {
+		t.Fatalf("status after successful retry = %q, want analyzed", s)
+	}
+	if got := triagePhase(t, h.st, h.inc.ID); got != "" {
+		t.Fatalf("triage row after completion = %q, want absent (deleted)", got)
+	}
+
+	// Completion deleted the triage row: nothing more is dispatched, ever.
 	h.now = h.now.Add(2 * time.Hour)
 	h.flush()
 	h.wantCalls(2, "after success")
@@ -188,6 +251,9 @@ func TestTriageExhaustsToFailed(t *testing.T) {
 	}
 	if s := h.status(); s != "failed" {
 		t.Fatalf("status after exhausting retries = %q, want failed", s)
+	}
+	if got := triagePhase(t, h.st, h.inc.ID); got != "exhausted" {
+		t.Fatalf("phase after exhausting retries = %q, want exhausted", got)
 	}
 	h.wantExhaustEvents(1, "after exhaustion")
 	ev := h.exhaust.events[0]
@@ -226,13 +292,17 @@ func TestTriageRetrySkipsIncidentThatLeftReady(t *testing.T) {
 	h.wantExhaustEvents(0, "incident resolved, never exhausted")
 }
 
-// TestTriageNoRetryOnCleanSkip: a sink that returns nil (the skill skipping
-// below min_alerts, say) is never re-dispatched.
+// TestTriageNoRetryOnCleanSkip: a sink that performs a clean skip (the skill
+// deterministically has nothing to say, e.g. below min_alerts) is never
+// re-dispatched.
 func TestTriageNoRetryOnCleanSkip(t *testing.T) {
-	h := newRetryHarness(t, 0)
+	h := newRetryHarnessCleanSkip(t)
 
 	h.flush()
 	h.wantCalls(1, "initial dispatch")
+	if got := triagePhase(t, h.st, h.inc.ID); got != "skipped" {
+		t.Fatalf("phase after clean skip = %q, want skipped", got)
+	}
 	h.now = h.now.Add(24 * time.Hour)
 	h.flush()
 	h.wantCalls(1, "much later")
@@ -262,9 +332,10 @@ func TestTriageBackoffCountsFromAfterTheCall(t *testing.T) {
 	h.wantCalls(2, "first retry")
 }
 
-// TestTriageExhaustedWriteIsRetriedUntilItSucceeds: when the terminal
-// "failed" write fails, the incident keeps its retry entry and the write —
-// not the sink call — is re-attempted on a later tick.
+// TestTriageExhaustedWriteIsRetriedUntilItSucceeds: when the terminal write
+// (the exhaustion transition) fails after the fifth sink call has already
+// run, the incident stays durably "processing"/in_flight — not re-dispatched
+// — and the write itself, not the sink call, is retried on a later tick.
 func TestTriageExhaustedWriteIsRetriedUntilItSucceeds(t *testing.T) {
 	h := newRetryHarness(t, 1000)
 	ctx := context.Background()
@@ -278,24 +349,32 @@ func TestTriageExhaustedWriteIsRetriedUntilItSucceeds(t *testing.T) {
 	}
 	h.wantCalls(attempts-1, "before last attempt")
 
-	// Make every write fail; the store runs on a single connection so the
-	// pragma sticks for the calls below.
-	if _, err := h.st.DB().ExecContext(ctx, "PRAGMA query_only = 1"); err != nil {
-		t.Fatalf("query_only on: %v", err)
+	// Once the fifth sink call has run (Begin already durably succeeded),
+	// make the database read-only so only the terminal exhaustion write fails.
+	h.sink.onCall = func() {
+		if len(h.sink.calls) == attempts-1 {
+			if _, err := h.st.DB().ExecContext(ctx, "PRAGMA query_only = 1"); err != nil {
+				t.Fatalf("query_only on: %v", err)
+			}
+		}
 	}
 	h.now = h.now.Add(delays[len(delays)-1])
 	h.flush()
 	h.wantCalls(attempts, "last attempt")
-	if s := h.status(); s != "ready" {
-		t.Fatalf("status with failing write = %q, want ready", s)
+	if got := triagePhase(t, h.st, h.inc.ID); got != "in_flight" {
+		t.Fatalf("phase with failing terminal write = %q, want in_flight", got)
 	}
+	if s := h.status(); s != "processing" {
+		t.Fatalf("status with failing write = %q, want processing", s)
+	}
+	h.wantExhaustEvents(0, "while the terminal write keeps failing")
 
-	// Write still failing: no sink call, no status change, entry retained.
+	// Write still failing: no sink call, no status change, row retained.
 	h.now = h.now.Add(delays[0])
 	h.flush()
 	h.wantCalls(attempts, "write retry while store read-only")
-	if s := h.status(); s != "ready" {
-		t.Fatalf("status = %q, want ready", s)
+	if got := triagePhase(t, h.st, h.inc.ID); got != "in_flight" {
+		t.Fatalf("phase = %q, want in_flight", got)
 	}
 	h.wantExhaustEvents(0, "while the terminal write keeps failing")
 
@@ -314,99 +393,4 @@ func TestTriageExhaustedWriteIsRetriedUntilItSucceeds(t *testing.T) {
 	h.flush()
 	h.wantCalls(attempts, "after terminal write")
 	h.wantExhaustEvents(1, "after terminal write")
-}
-
-// TestStartupRecoveryRedispatchesReadyIncidents: an incident left in "ready"
-// by a previous process is dispatched once on the first tick after Start and,
-// if that fails, enters the normal schedule.
-func TestStartupRecoveryRedispatchesReadyIncidents(t *testing.T) {
-	h := newRetryHarness(t, 1000)
-	ctx := context.Background()
-	if err := h.st.MarkIncidentReady(ctx, h.inc.ID); err != nil {
-		t.Fatalf("mark ready: %v", err)
-	}
-	if err := h.cor.Recover(ctx); err != nil {
-		t.Fatalf("recover: %v", err)
-	}
-
-	h.flush()
-	h.wantCalls(1, "first tick after start")
-	if s := h.status(); s != "ready" {
-		t.Fatalf("status = %q, want ready", s)
-	}
-
-	h.now = h.now.Add(correlator.TriageRetryDelays[0] - time.Second)
-	h.flush()
-	h.wantCalls(1, "before first delay")
-	h.now = h.now.Add(time.Second)
-	h.flush()
-	h.wantCalls(2, "first retry after recovered dispatch")
-}
-
-// TestStartupRecoveryCleanSkipIsDispatchedOnce: a legitimately-ready incident
-// (the skill returns nil) costs one sink call per restart and nothing more.
-func TestStartupRecoveryCleanSkipIsDispatchedOnce(t *testing.T) {
-	h := newRetryHarness(t, 0)
-	ctx := context.Background()
-	if err := h.st.MarkIncidentReady(ctx, h.inc.ID); err != nil {
-		t.Fatalf("mark ready: %v", err)
-	}
-	if err := h.cor.Recover(ctx); err != nil {
-		t.Fatalf("recover: %v", err)
-	}
-
-	h.flush()
-	h.wantCalls(1, "first tick after start")
-	h.now = h.now.Add(24 * time.Hour)
-	h.flush()
-	h.wantCalls(1, "much later")
-	if s := h.status(); s != "ready" {
-		t.Fatalf("status = %q, want ready", s)
-	}
-}
-
-// TestStartupRecoveryExpiresStaleReadyIncidents: an incident that has been
-// "ready" for longer than the startup window is closed out as "failed" at
-// Start without a sink call or a notifier event, so an upgrade over a
-// backlog of stuck incidents does not become an LLM burst. A fresh one is
-// still re-dispatched.
-func TestStartupRecoveryExpiresStaleReadyIncidents(t *testing.T) {
-	h := newRetryHarness(t, 1000)
-	ctx := context.Background()
-	if err := h.st.MarkIncidentReady(ctx, h.inc.ID); err != nil {
-		t.Fatalf("mark ready: %v", err)
-	}
-	stale := insertCollectingIncident(t, h.st, "Stale", h.now.Add(-correlator.StartupRetryWindow-time.Minute))
-	if err := h.st.MarkIncidentReady(ctx, stale.ID); err != nil {
-		t.Fatalf("mark stale ready: %v", err)
-	}
-
-	if err := h.cor.Recover(ctx); err != nil {
-		t.Fatalf("recover: %v", err)
-	}
-	got, err := h.st.GetIncidentByID(ctx, stale.ID)
-	if err != nil || got == nil {
-		t.Fatalf("get stale: %v", err)
-	}
-	if got.Status != "failed" {
-		t.Fatalf("stale incident status after start = %q, want failed", got.Status)
-	}
-	h.wantCalls(0, "recover itself dispatches nothing")
-	h.wantExhaustEvents(0, "stale closure is silent on the notifier")
-
-	h.flush()
-	h.wantCalls(1, "first tick: only the fresh incident")
-	if h.sink.calls[0] != h.inc.ID {
-		t.Fatalf("dispatched %s, want the fresh incident %s", h.sink.calls[0], h.inc.ID)
-	}
-	// Much later the fresh incident keeps its own schedule; the stale one is
-	// never dispatched.
-	h.now = h.now.Add(24 * time.Hour)
-	h.flush()
-	for _, id := range h.sink.calls {
-		if id == stale.ID {
-			t.Fatalf("stale incident %s was dispatched", stale.ID)
-		}
-	}
-	h.wantExhaustEvents(0, "still no event for the stale one")
 }

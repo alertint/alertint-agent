@@ -149,9 +149,6 @@ type Correlator struct {
 	pruneEvery int
 	flushCount int
 
-	// retries holds the in-memory triage retry state, keyed by incident ID.
-	// Touched only on the loop goroutine (flushExpired).
-	retries map[string]*triageRetry
 	// now is the clock flushExpired reads; tests substitute a fake.
 	now func() time.Time
 
@@ -182,7 +179,6 @@ func New(cfg Config, st *store.Store, sink IncidentSink, logger *slog.Logger) *C
 		sink:       sink,
 		logger:     logger,
 		pruneEvery: pruneEvery,
-		retries:    make(map[string]*triageRetry),
 		now:        time.Now,
 		alertCh:    make(chan store.Alert, 256),
 		stopCh:     make(chan struct{}),
@@ -278,19 +274,15 @@ func (c *Correlator) loop(ctx context.Context) {
 	}
 }
 
-// recover re-arms timers for any incidents that were "collecting" when
-// the process last exited, and queues every incident left in "ready" for a
-// re-dispatch (see seedTriageRetries). It does NOT fire them immediately —
-// the tick loop will catch overdue ones on the next tick.
+// recover re-arms timers for any incidents that were "collecting" when the
+// process last exited. It does NOT fire them immediately — the tick loop
+// will catch overdue ones on the next tick.
 func (c *Correlator) recover(ctx context.Context) error {
 	incs, err := listCollectingIncidents(ctx, c.st)
 	if err != nil {
 		return fmt.Errorf("correlator: startup recovery: %w", err)
 	}
 	c.logger.Info("correlator: startup recovery", "collecting_incidents", len(incs))
-	if err := c.seedTriageRetries(ctx); err != nil {
-		return fmt.Errorf("correlator: startup recovery: list ready: %w", err)
-	}
 	return nil
 }
 
@@ -431,9 +423,9 @@ func (c *Correlator) checkAllAlertsResolved(ctx context.Context, incidentID stri
 	return true, nil
 }
 
-// flushExpired marks every overdue collecting incident as ready and
-// notifies the sink, then re-dispatches incidents whose earlier sink call
-// failed and whose retry is due.
+// flushExpired marks every overdue collecting incident as ready, seeds its
+// durable triage row, and dispatches it, then dispatches every incident
+// whose durable backoff is due.
 func (c *Correlator) flushExpired(ctx context.Context) error {
 	incs, err := listCollectingIncidents(ctx, c.st)
 	if err != nil {
@@ -451,17 +443,16 @@ func (c *Correlator) flushExpired(ctx context.Context) error {
 		}
 		c.logger.Info("correlator: incident ready", "incident_id", inc.ID, "group_key", inc.GroupKey, "alert_count", inc.AlertCount)
 
-		// Refresh the struct so the sink sees updated fields.
-		ready := inc
-		ready.Status = "ready"
-		if err := c.sink.OnIncidentReady(ctx, ready); err != nil {
-			c.triageFailed(ctx, ready, err)
+		if err := c.st.SeedIncidentTriage(ctx, inc.ID, now); err != nil {
+			c.logger.Error("correlator: seed triage", "incident_id", inc.ID, "err", err)
+			continue
 		}
+		c.dispatchTriage(ctx, inc.ID)
 	}
 
 	// Sink calls above may have taken a while (an LLM round-trip); re-read
 	// the clock so due retries are not pushed to the next tick.
-	c.retryTriage(ctx, c.now().UTC())
+	c.dispatchDueTriage(ctx, c.now().UTC())
 
 	// Piggyback occurrence pruning on the flush ticker (~hourly at the default
 	// tick), so old occurrence rows are reclaimed without a separate job (R12).

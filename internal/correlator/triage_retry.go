@@ -24,188 +24,178 @@ var triageRetryDelays = []time.Duration{
 	32 * time.Minute,
 }
 
-// startupRetryWindow bounds startup recovery: an incident that has been
-// "ready" for longer than this is closed out as "failed" without a triage
-// call instead of being re-dispatched, so an upgrade over a long backlog of
-// stuck incidents does not turn into an LLM burst. It matches the ~43 min
-// retry horizon: had the process stayed up, such an incident would have
+// startupRetryWindow bounds startup recovery: an unjudged incident whose due
+// time is older than this is closed out as "failed" without a triage call
+// instead of being re-dispatched, so an upgrade over a long backlog of stuck
+// incidents does not turn into an LLM burst (ADR-0045). It matches the ~43
+// min retry horizon: had the process stayed up, such an incident would have
 // exhausted its schedule by now. A condition that is still active re-fires
 // and opens a fresh incident.
 const startupRetryWindow = time.Hour
 
-// triageRetry is the in-memory retry state for one incident. The correlator
-// keeps it only for incidents whose sink call errored — an incident the skill
-// deliberately leaves in "ready" (below min_alerts, no member alerts) returns
-// nil and is never re-dispatched.
-//
-// The map does not survive a restart, so Start seeds it from every incident
-// still in "ready": each is dispatched once on the first tick and either
-// completes, is skipped again (nil, dropped), or enters the schedule.
-type triageRetry struct {
-	groupKey   string
-	alertCount int
-	failures   int       // sink errors so far, including the initial dispatch
-	nextAt     time.Time // earliest time of the next attempt
-	// exhausted is set once the schedule is spent; from then on only the
-	// terminal "failed" write is pending, and it is retried on its own
-	// without another sink call.
-	exhausted bool
-	lastErr   error
-}
-
-// seedTriageRetries handles every incident still in "ready" at Start: a
-// previous process may have died mid-triage or exited during the backoff, and
-// nothing else re-reads ready rows. Incidents ready for less than
-// startupRetryWindow are registered for one dispatch on the next tick (clean
-// skips cost one nil sink call per restart); older ones are marked "failed"
-// outright, audited with reason startup_retry_window_expired, and never sent
-// to the sink or the notifier — one summary log line covers them.
-func (c *Correlator) seedTriageRetries(ctx context.Context) error {
-	incs, err := c.st.ListReadyIncidents(ctx)
+// dispatchTriage runs one triage attempt for incidentID: it begins the
+// durable attempt (Incident status -> processing, triage phase -> in_flight)
+// before calling the sink (R1), invokes the sink, and resolves the terminal
+// outcome by rereading the Incident so alert_count can never be stale (R5).
+func (c *Correlator) dispatchTriage(ctx context.Context, incidentID string) {
+	now := c.now().UTC()
+	active, err := c.st.BeginIncidentTriage(ctx, incidentID, now)
 	if err != nil {
-		return err
-	}
-	now := c.now().UTC()
-	var seeded, expired int
-	for _, inc := range incs {
-		if now.Sub(inc.ReadyAt) <= startupRetryWindow {
-			c.retries[inc.ID] = &triageRetry{groupKey: inc.GroupKey, alertCount: inc.AlertCount}
-			seeded++
-			continue
+		if !errors.Is(err, store.ErrNotFound) {
+			c.logger.Error("correlator: begin triage dispatch", "incident_id", incidentID, "err", err)
 		}
-		if err := c.st.MarkIncidentFailed(ctx, inc.ID); err != nil {
-			c.logger.Error("correlator: startup recovery: mark stale incident failed",
-				"incident_id", inc.ID, "group_key", inc.GroupKey, "err", err)
-			continue
-		}
-		expired++
-		if c.auditor != nil {
-			if err := c.auditor.Append(ctx, "correlator", "incident.triage_exhausted", map[string]any{
-				"incident_id": inc.ID,
-				"group_key":   inc.GroupKey,
-				"attempts":    0,
-				"reason":      "startup_retry_window_expired",
-				"ready_at":    inc.ReadyAt.UTC(),
-			}); err != nil {
-				c.logger.Warn("correlator: audit stale incident failed", "incident_id", inc.ID, "err", err)
-			}
-		}
-	}
-	if len(incs) > 0 {
-		c.logger.Warn("correlator: startup recovery: ready incidents found",
-			"ready_incidents", len(incs), "redispatch", seeded,
-			"marked_failed", expired, "retry_window", startupRetryWindow)
-	}
-	return nil
-}
-
-// triageFailed records a failed sink call for inc and either schedules the
-// next attempt or, once the schedule is spent, moves the incident to the
-// terminal "failed" status. The retry deadline is taken from a fresh clock
-// reading: the sink call itself may have run for longer than the delay.
-func (c *Correlator) triageFailed(ctx context.Context, inc store.Incident, cause error) {
-	r := c.retries[inc.ID]
-	if r == nil {
-		r = &triageRetry{groupKey: inc.GroupKey, alertCount: inc.AlertCount}
-		c.retries[inc.ID] = r
-	}
-	r.failures++
-	r.lastErr = cause
-	now := c.now().UTC()
-	maxAttempts := len(triageRetryDelays) + 1
-	if r.failures < maxAttempts {
-		delay := triageRetryDelays[r.failures-1]
-		r.nextAt = now.Add(delay)
-		c.logger.Warn("correlator: triage failed; will retry",
-			"incident_id", inc.ID, "group_key", inc.GroupKey,
-			"attempt", r.failures, "max_attempts", maxAttempts,
-			"retry_in", delay, "err", cause)
 		return
 	}
-	r.exhausted = true
-	c.closeExhausted(ctx, inc.ID, r, now)
-}
 
-// closeExhausted performs the terminal "failed" write for an incident whose
-// schedule is spent. The retry entry is dropped only once the write has
-// succeeded, or when the incident has already left "ready" (ErrNotFound);
-// on any other store error the write is re-attempted on a later tick so a
-// transient SQLite failure cannot recreate the permanent orphan. The audit
-// row and the notifier event follow the successful write, so both fire
-// exactly once per incident.
-func (c *Correlator) closeExhausted(ctx context.Context, id string, r *triageRetry, now time.Time) {
-	err := c.st.MarkIncidentFailed(ctx, id)
+	inc, err := c.st.GetIncidentByID(ctx, incidentID)
+	if err != nil || inc == nil {
+		c.logger.Error("correlator: load incident for triage dispatch", "incident_id", incidentID, "err", err)
+		return
+	}
+	c.logger.Info("correlator: dispatching triage", "incident_id", incidentID, "group_key", inc.GroupKey, "attempt", active.Attempts)
+
+	sinkErr := c.sink.OnIncidentReady(ctx, *inc)
+
+	fresh, ferr := c.st.GetIncidentByID(ctx, incidentID)
+	if ferr != nil || fresh == nil {
+		c.logger.Error("correlator: reload incident after triage dispatch", "incident_id", incidentID, "err", ferr)
+		fresh = inc
+	}
+
 	switch {
-	case err == nil:
-		delete(c.retries, id)
-	case errors.Is(err, store.ErrNotFound):
-		delete(c.retries, id)
-		c.logger.Info("correlator: triage exhausted but incident already left ready; not marking failed",
-			"incident_id", id, "group_key", r.groupKey)
-		return
+	case sinkErr != nil:
+		c.triageFailed(ctx, *fresh, active, sinkErr)
+	case fresh.Status == "processing":
+		// The skill returned nil without persisting a Finding: a deterministic
+		// clean skip (e.g. below min_alerts), which counts as judgment.
+		if err := c.st.SkipIncidentTriage(ctx, incidentID); err != nil && !errors.Is(err, store.ErrNotFound) {
+			c.logger.Error("correlator: skip triage", "incident_id", incidentID, "err", err)
+		}
 	default:
-		r.nextAt = now.Add(triageRetryDelays[0])
-		c.logger.Error("correlator: mark incident failed; will retry the write",
-			"incident_id", id, "group_key", r.groupKey, "retry_in", triageRetryDelays[0], "err", err)
+		// analyzed | resolved: a Finding persisted during the sink call.
+		if err := c.st.CompleteIncidentTriage(ctx, incidentID); err != nil && !errors.Is(err, store.ErrNotFound) {
+			c.logger.Error("correlator: complete triage", "incident_id", incidentID, "err", err)
+		}
+	}
+}
+
+// classifyTriageError produces the bounded, sanitized code/detail persisted
+// on a failed dispatch (R9). All non-LLM sink errors classify conservatively;
+// the sibling LLM-health PR replaces this with capability-aware dependency
+// codes without changing the retry schedule.
+func classifyTriageError(err error) (code, detail string) {
+	return "triage_dispatch_failed", err.Error()
+}
+
+// triageFailed records a failed dispatch and either schedules the next
+// attempt or, once the schedule is spent, moves the incident to the terminal
+// "failed" status.
+func (c *Correlator) triageFailed(ctx context.Context, inc store.Incident, active store.IncidentTriage, cause error) {
+	code, detail := classifyTriageError(cause)
+	if active.Attempts >= len(triageRetryDelays)+1 {
+		c.exhaustTriage(ctx, inc, active.Attempts, code, detail, "max_attempts")
+		return
+	}
+	next := c.now().UTC().Add(triageRetryDelays[active.Attempts-1])
+	if err := c.st.BackoffIncidentTriage(ctx, inc.ID, next, code, detail); err != nil {
+		c.logger.Error("correlator: backoff triage", "incident_id", inc.ID, "err", err)
+		return
+	}
+	c.logger.Warn("correlator: triage failed; will retry",
+		"incident_id", inc.ID, "group_key", inc.GroupKey,
+		"attempt", active.Attempts, "max_attempts", len(triageRetryDelays)+1,
+		"retry_in", next.Sub(c.now().UTC()), "err", cause)
+}
+
+// exhaustTriage performs the terminal "failed" write for an incident whose
+// schedule is spent. Only after ExhaustIncidentTriage succeeds does the audit
+// row and notifier event fire, so both happen exactly once per incident; a
+// repeated terminal transition returns ErrNotFound and emits nothing, and any
+// other store error leaves the row `in_flight` so a later tick retries the
+// write itself (never another sink call) via retryStuckTerminalWrites.
+func (c *Correlator) exhaustTriage(ctx context.Context, inc store.Incident, attempts int, code, detail, reason string) {
+	updated, err := c.st.ExhaustIncidentTriage(ctx, inc.ID, code, detail)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			c.logger.Info("correlator: triage exhausted but incident already left ready/processing; not marking failed",
+				"incident_id", inc.ID, "group_key", inc.GroupKey)
+			return
+		}
+		c.logger.Error("correlator: mark incident exhausted; will retry the write",
+			"incident_id", inc.ID, "group_key", inc.GroupKey, "err", err)
 		return
 	}
 
+	fresh, ferr := c.st.GetIncidentByID(ctx, inc.ID)
+	if ferr != nil || fresh == nil {
+		fresh = &inc
+	}
 	c.logger.Error("correlator: triage exhausted; incident marked failed",
-		"incident_id", id, "group_key", r.groupKey,
-		"attempts", r.failures, "err", r.lastErr)
+		"incident_id", inc.ID, "group_key", inc.GroupKey, "attempts", attempts, "err", updated.LastErrorDetail)
+
 	if c.auditor != nil {
 		if err := c.auditor.Append(ctx, "correlator", "incident.triage_exhausted", map[string]any{
-			"incident_id": id,
-			"group_key":   r.groupKey,
-			"attempts":    r.failures,
-			"reason":      "max_attempts",
-			"error":       r.lastErr.Error(),
+			"incident_id": inc.ID,
+			"group_key":   inc.GroupKey,
+			"attempts":    attempts,
+			"reason":      reason,
+			"error":       updated.LastErrorDetail,
 		}); err != nil {
-			c.logger.Warn("correlator: audit triage exhausted", "incident_id", id, "err", err)
+			c.logger.Warn("correlator: audit triage exhausted", "incident_id", inc.ID, "err", err)
 		}
 	}
 	if c.triageNotifier != nil {
 		ev := notify.TriageExhaustedEvent{
-			IncidentID: id,
-			GroupKey:   r.groupKey,
-			AlertCount: r.alertCount,
-			Attempts:   r.failures,
-			Error:      r.lastErr.Error(),
+			IncidentID: inc.ID,
+			GroupKey:   inc.GroupKey,
+			AlertCount: fresh.AlertCount,
+			Attempts:   attempts,
+			Error:      updated.LastErrorDetail,
 		}
 		if err := c.triageNotifier.OnTriageExhausted(ctx, ev); err != nil {
-			c.logger.Warn("correlator: triage exhausted notify failed", "incident_id", id, "err", err)
+			c.logger.Warn("correlator: triage exhausted notify failed", "incident_id", inc.ID, "err", err)
 		}
 	}
 }
 
-// retryTriage re-dispatches every incident whose retry is due and completes
-// pending terminal writes. An incident that left "ready" in the meantime
-// (resolved by its alerts recovering, or analyzed by a re-judgment) is
-// dropped without a sink call.
-func (c *Correlator) retryTriage(ctx context.Context, now time.Time) {
-	for id, r := range c.retries {
-		if now.Before(r.nextAt) {
+// retryStuckTerminalWrites finishes any dispatch whose terminal write
+// (backoff or exhaustion) did not persist on an earlier tick — e.g. a
+// transient store failure right after the sink call resolved. Such a row is
+// left `in_flight` deliberately: this is the same durable signal a restart
+// recovers from, so retrying it every tick is safe, never re-invokes the
+// sink, and only ever finishes the transition that failed to write. Only the
+// already-exhausted case is retried here; a sub-max in_flight row left by a
+// genuine process interruption is reconciled at startup.
+func (c *Correlator) retryStuckTerminalWrites(ctx context.Context) {
+	stuck, err := c.st.ListInterruptedIncidentTriage(ctx)
+	if err != nil {
+		c.logger.Error("correlator: list interrupted triage", "err", err)
+		return
+	}
+	for _, active := range stuck {
+		if active.Attempts < len(triageRetryDelays)+1 {
 			continue
 		}
-		if r.exhausted {
-			c.closeExhausted(ctx, id, r, now)
+		inc, err := c.st.GetIncidentByID(ctx, active.IncidentID)
+		if err != nil || inc == nil {
+			c.logger.Error("correlator: load incident for stuck triage write", "incident_id", active.IncidentID, "err", err)
 			continue
 		}
-		inc, err := c.st.GetIncidentByID(ctx, id)
-		if err != nil {
-			c.logger.Error("correlator: load incident for triage retry", "incident_id", id, "err", err)
-			continue
-		}
-		if inc == nil || inc.Status != "ready" {
-			delete(c.retries, id)
-			continue
-		}
-		c.logger.Info("correlator: retrying triage",
-			"incident_id", id, "group_key", inc.GroupKey, "attempt", r.failures+1)
-		if err := c.sink.OnIncidentReady(ctx, *inc); err != nil {
-			c.triageFailed(ctx, *inc, err)
-			continue
-		}
-		delete(c.retries, id)
+		c.exhaustTriage(ctx, *inc, active.Attempts, active.LastErrorCode, active.LastErrorDetail, "max_attempts")
+	}
+}
+
+// dispatchDueTriage reconciles any stuck terminal write, then dispatches
+// every incident whose durable backoff is due.
+func (c *Correlator) dispatchDueTriage(ctx context.Context, now time.Time) {
+	c.retryStuckTerminalWrites(ctx)
+
+	due, err := c.st.ListDueIncidentTriage(ctx, now)
+	if err != nil {
+		c.logger.Error("correlator: list due triage", "err", err)
+		return
+	}
+	for _, d := range due {
+		c.dispatchTriage(ctx, d.IncidentID)
 	}
 }
