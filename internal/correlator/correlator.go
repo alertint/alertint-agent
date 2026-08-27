@@ -312,6 +312,21 @@ func (c *Correlator) handleAlert(ctx context.Context, a store.Alert) error {
 		}
 	}
 
+	// Retry-aware attachment (issue 60): a firing re-fire with no open window
+	// joins a same-group Incident that is still unjudged and durably retrying
+	// (ready + backoff) before recurrence collapse or a new Incident is ever
+	// considered — an unjudged Incident stays collected until its first
+	// judgment (CONTEXT.md: Incident).
+	if err == store.ErrNotFound && a.Status == "firing" {
+		handled, attachErr := c.maybeAttachRetryingIncident(ctx, a, gk)
+		if attachErr != nil {
+			return attachErr
+		}
+		if handled {
+			return nil
+		}
+	}
+
 	// Recurrence collapse (M1): a firing re-fire with no open window may attach
 	// to an already-judged incident as an occurrence instead of minting a new
 	// incident + LLM call. This is a firing-side mirror of the resolved branch
