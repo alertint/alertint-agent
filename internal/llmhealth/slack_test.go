@@ -204,6 +204,28 @@ func TestSlackCoordinatesSurviveRestart(t *testing.T) {
 	}
 }
 
+// TestFailedPostDeliveryStatePersists covers the gap where a failed
+// PostSystemMessage set SlackDelivery = DeliveryPending in memory but
+// returned before persist(), so the durable llm_health row never reflected
+// the attempt: after a restart it would look exactly like "none" (no attempt
+// ever happened) rather than "pending" (one already failed) — durable state
+// and the audit trail must agree.
+func TestFailedPostDeliveryStatePersists(t *testing.T) {
+	tr, st, c, _ := newTracker(t)
+	pub := &fakePub{failPost: true}
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(err503)
+	c.add(5 * time.Minute)
+	tr.Deliver(context.Background(), pub)
+
+	rec, _, err := st.GetLLMHealth(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.SlackDelivery != llmhealth.DeliveryPending {
+		t.Fatalf("durable slack_delivery = %q, want %q", rec.SlackDelivery, llmhealth.DeliveryPending)
+	}
+}
+
 func TestNilPublisherKeepsLocalHistoryOnly(t *testing.T) {
 	tr, _, c, _ := newTracker(t)
 	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(err503)
@@ -267,5 +289,63 @@ func TestRecoveryDuringInFlightPostDiscardsStaleResult(t *testing.T) {
 	}
 	if !suppressed {
 		t.Fatalf("audit kinds = %v", a.kinds)
+	}
+}
+
+// blockingUpdatePub wraps fakePub and blocks inside UpdateSystemMessage until
+// release is closed, signaling started once the call has begun — mirrors
+// blockingPub but for the edit call instead of the initial post.
+type blockingUpdatePub struct {
+	*fakePub
+
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (p *blockingUpdatePub) UpdateSystemMessage(ctx context.Context, channel, ts, text string) error {
+	p.once.Do(func() { close(p.started) })
+	<-p.release
+	return p.fakePub.UpdateSystemMessage(ctx, channel, ts, text)
+}
+
+// TestNewOutageWhileRecoveryEditInFlightDoesNotStealItsGeneration covers the
+// race where a SECOND outage begins while the FIRST episode's recovery edit
+// (UpdateSystemMessage) is still in flight. SlackGeneration must be an
+// independently monotonic fence: if entering the new outage merely copies
+// OutageGeneration (which the recovery increment may have already raced
+// ahead of), the two can coincide again, so the stale recovery-edit result
+// passes the staleness check and marks the brand-new, never-posted episode
+// "recovered" — permanently silencing its own root.
+func TestNewOutageWhileRecoveryEditInFlightDoesNotStealItsGeneration(t *testing.T) {
+	tr, _, c, _ := newTracker(t)
+	pub := &blockingUpdatePub{fakePub: &fakePub{}, started: make(chan struct{}), release: make(chan struct{})}
+
+	// Episode 1: outage, broadcast (root posts immediately, not blocked), recover.
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(err503)
+	c.add(5 * time.Minute)
+	tr.Deliver(context.Background(), pub)
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(nil)
+
+	// The recovery edit starts and blocks.
+	done := make(chan struct{})
+	go func() {
+		tr.Deliver(context.Background(), pub)
+		close(done)
+	}()
+	<-pub.started
+
+	// Episode 2 begins while the episode-1 recovery edit above is still in flight.
+	tr.Begin(llmhealth.CapabilityTriageDraft, "j").Finish(err503)
+
+	close(pub.release)
+	<-done
+
+	// Episode 2 must still be able to post its own root once broadcastAfter
+	// elapses — it must not come out of the gate already marked "recovered".
+	c.add(5 * time.Minute)
+	tr.Deliver(context.Background(), pub)
+	if pub.postCount() != 2 {
+		t.Fatalf("second episode's root was never posted (its generation was stolen by a stale recovery edit): posts=%v", pub.posts)
 	}
 }

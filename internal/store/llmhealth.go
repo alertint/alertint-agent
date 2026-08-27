@@ -5,6 +5,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -40,7 +41,12 @@ type LLMCapabilityRecord struct {
 	LastSuccessAt  *time.Time
 	LastFailureAt  *time.Time
 	UnhealthySince *time.Time
-	UpdatedAt      time.Time
+	// ContentSubjects is the bounded set of distinct subjects (Incident IDs)
+	// that have content-class-failed this capability since its last success —
+	// the H1 two-distinct-Incident corroboration evidence. nil/empty means
+	// none recorded.
+	ContentSubjects []string
+	UpdatedAt       time.Time
 }
 
 // GetLLMHealth returns the durable aggregate row and every capability row,
@@ -60,7 +66,7 @@ func (s *Store) GetLLMHealth(ctx context.Context) (LLMHealthRecord, []LLMCapabil
 	}
 
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT capability, healthy, reason_code, detail, last_success_at, last_failure_at, unhealthy_since, updated_at
+		SELECT capability, healthy, reason_code, detail, last_success_at, last_failure_at, unhealthy_since, content_subjects, updated_at
 		FROM llm_health_capabilities
 		ORDER BY capability
 	`)
@@ -111,16 +117,21 @@ func (s *Store) SaveLLMHealth(ctx context.Context, rec LLMHealthRecord, caps []L
 	}
 
 	for _, c := range caps {
+		subjects, err := marshalContentSubjects(c.ContentSubjects)
+		if err != nil {
+			return fmt.Errorf("store: llm health: marshal content_subjects for %s: %w", c.Capability, err)
+		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO llm_health_capabilities (capability, healthy, reason_code, detail, last_success_at, last_failure_at, unhealthy_since, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			INSERT INTO llm_health_capabilities (capability, healthy, reason_code, detail, last_success_at, last_failure_at, unhealthy_since, content_subjects, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(capability) DO UPDATE SET
 				healthy = excluded.healthy, reason_code = excluded.reason_code, detail = excluded.detail,
 				last_success_at = excluded.last_success_at, last_failure_at = excluded.last_failure_at,
-				unhealthy_since = excluded.unhealthy_since, updated_at = excluded.updated_at
+				unhealthy_since = excluded.unhealthy_since, content_subjects = excluded.content_subjects,
+				updated_at = excluded.updated_at
 		`,
 			c.Capability, c.Healthy, c.ReasonCode, c.Detail,
-			nullTime(c.LastSuccessAt), nullTime(c.LastFailureAt), nullTime(c.UnhealthySince), now,
+			nullTime(c.LastSuccessAt), nullTime(c.LastFailureAt), nullTime(c.UnhealthySince), subjects, now,
 		); err != nil {
 			return fmt.Errorf("store: llm health: save capability %s: %w", c.Capability, err)
 		}
@@ -191,15 +202,45 @@ func scanLLMHealth(s scanner) (*LLMHealthRecord, error) {
 	return &rec, nil
 }
 
+// marshalContentSubjects renders subjects as a JSON array for the
+// content_subjects column; nil/empty renders "[]" (the column's NOT NULL
+// default), never SQL NULL.
+func marshalContentSubjects(subjects []string) (string, error) {
+	if len(subjects) == 0 {
+		return "[]", nil
+	}
+	b, err := json.Marshal(subjects)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// unmarshalContentSubjects parses the content_subjects column back into a
+// slice; "[]" (or any empty/unparseable value) yields nil, matching the
+// zero-value LLMCapabilityRecord.ContentSubjects a fresh capability has.
+func unmarshalContentSubjects(raw string) []string {
+	if raw == "" || raw == "[]" {
+		return nil
+	}
+	var subjects []string
+	if err := json.Unmarshal([]byte(raw), &subjects); err != nil {
+		return nil
+	}
+	return subjects
+}
+
 func scanLLMCapability(s scanner) (*LLMCapabilityRecord, error) {
 	var (
 		c                                            LLMCapabilityRecord
 		lastSuccessAt, lastFailureAt, unhealthySince sql.NullString
+		contentSubjects                              string
 		updatedStr                                   string
 	)
-	if err := s.Scan(&c.Capability, &c.Healthy, &c.ReasonCode, &c.Detail, &lastSuccessAt, &lastFailureAt, &unhealthySince, &updatedStr); err != nil {
+	if err := s.Scan(&c.Capability, &c.Healthy, &c.ReasonCode, &c.Detail, &lastSuccessAt, &lastFailureAt, &unhealthySince, &contentSubjects, &updatedStr); err != nil {
 		return nil, fmt.Errorf("scan: %w", err)
 	}
+	c.ContentSubjects = unmarshalContentSubjects(contentSubjects)
 
 	var err error
 	if c.LastSuccessAt, err = parseNullTime(lastSuccessAt); err != nil {

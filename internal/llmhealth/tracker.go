@@ -89,15 +89,25 @@ type Tracker struct {
 	broadcastAfter time.Duration
 	idleAfter      time.Duration
 
-	mu                sync.Mutex
-	rec               store.LLMHealthRecord
-	caps              map[Capability]*store.LLMCapabilityRecord
-	contentSubjects   map[Capability][]string
+	mu   sync.Mutex
+	rec  store.LLMHealthRecord
+	caps map[Capability]*store.LLMCapabilityRecord
+	// content-failure corroboration evidence (the bounded distinct-subject
+	// set) lives on each capability's own ContentSubjects field, so it is
+	// persisted/restored automatically alongside everything else in caps —
+	// no separate bookkeeping map needed.
 	inFlight          int
 	idleSince         time.Time
 	probeUnsupported  bool
 	unsupportedLogged bool
 	kick              chan struct{}
+
+	// activityGen counts every completed (non-ignored) real call; ProbeDue
+	// snapshots it into probeReservedGen so ObserveProbe can detect a real
+	// call that raced a probe already in flight and discard a stale probe
+	// failure instead of letting it override a fresher, stronger success.
+	activityGen      int64
+	probeReservedGen int64
 }
 
 // Observation is one in-flight LLM call started by Tracker.Begin. Exactly one
@@ -147,7 +157,6 @@ func New(ctx context.Context, st *store.Store, opts Options) (*Tracker, error) {
 		idleAfter:        opts.IdleProbeAfter,
 		rec:              rec,
 		caps:             caps,
-		contentSubjects:  make(map[Capability][]string),
 		inFlight:         0,
 		idleSince:        now,
 		probeUnsupported: rec.LastProbeOutcome == string(llm.ProbeUnsupported),
@@ -192,6 +201,7 @@ func (t *Tracker) finish(capability Capability, subject string, err error) {
 
 	now := t.now()
 	t.idleSince = now
+	t.activityGen++
 	callAt := now
 	t.rec.LastRealCallAt = &callAt
 
@@ -200,7 +210,6 @@ func (t *Tracker) finish(capability Capability, subject string, err error) {
 		t.markCapabilityHealthy(capability, now)
 		successAt := now
 		t.rec.LastRealSuccessAt = &successAt
-		delete(t.contentSubjects, capability)
 		if capability == CapabilityTriageDraft || capability == CapabilityVerificationRejudge {
 			t.clearCapabilityIfPresent(CapabilityProbe, now)
 		}
@@ -237,9 +246,17 @@ func (t *Tracker) ObserveProbe(res llm.ProbeResult) {
 		}
 	case llm.ProbeFailed:
 		reason := Classify(res.Err)
-		if reason.Class() == ClassDependency {
+		switch {
+		case t.activityGen != t.probeReservedGen:
+			// A real call completed while this probe was in flight: that
+			// stronger signal must not be overridden by a now-stale probe
+			// failure (the flip side of "probe success cannot erase a real
+			// inference failure" — a stale probe failure cannot erase a real
+			// inference success either).
+			t.logger.Warn("llm health: stale probe failure discarded; a real call completed while the probe was in flight")
+		case reason.Class() == ClassDependency:
 			t.markCapabilityUnhealthy(CapabilityProbe, reason, SafeDetail(res.Err), now)
-		} else {
+		default:
 			t.logger.Warn("llm health: probe failed with a non-dependency reason", "reason", string(reason))
 		}
 	}
@@ -296,6 +313,10 @@ func (t *Tracker) Snapshot() Snapshot {
 func (t *Tracker) ProbeDue(now time.Time) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	// Reserve the current activity generation regardless of the outcome
+	// below: if a probe does run off this decision, ObserveProbe compares
+	// against this snapshot to detect a real call that raced it.
+	t.probeReservedGen = t.activityGen
 	if t.probeUnsupported || t.inFlight > 0 {
 		return false
 	}
@@ -333,6 +354,9 @@ func (t *Tracker) markCapabilityHealthy(capability Capability, now time.Time) {
 	c.ReasonCode = ""
 	c.Detail = ""
 	c.UnhealthySince = nil
+	// A success closes the corroboration window: content failures recorded
+	// before it no longer count toward the next window's two-subject rule.
+	c.ContentSubjects = nil
 	successAt := now
 	c.LastSuccessAt = &successAt
 	if wasUnhealthy {
@@ -385,7 +409,7 @@ func (t *Tracker) recordContentFailure(capability Capability, subject string, re
 		c.Detail = detail
 	}
 
-	subjects := t.contentSubjects[capability]
+	subjects := c.ContentSubjects
 	found := false
 	for _, s := range subjects {
 		if s == subject {
@@ -398,7 +422,7 @@ func (t *Tracker) recordContentFailure(capability Capability, subject string, re
 		if len(subjects) > maxContentSubjects {
 			subjects = subjects[len(subjects)-maxContentSubjects:]
 		}
-		t.contentSubjects[capability] = subjects
+		c.ContentSubjects = subjects
 	}
 
 	if len(subjects) >= 2 && c.Healthy {
@@ -458,7 +482,13 @@ func (t *Tracker) recompute(now time.Time) bool {
 		t.rec.SlackDelivery = DeliveryNone
 		t.rec.SlackTS = ""
 		t.rec.SlackChannel = ""
-		t.rec.SlackGeneration = t.rec.OutageGeneration
+		// SlackGeneration is its own independent monotonic fence, never
+		// assigned from OutageGeneration: the recovery branch below also
+		// increments it, so copying OutageGeneration here can coincidentally
+		// reproduce a value already in flight on a stale (pre-recovery)
+		// delivery plan, letting it pass applyDeliveryResult's staleness
+		// check and corrupt this brand-new episode's Slack state.
+		t.rec.SlackGeneration++
 		t.rec.SlackState = ""
 		t.rec.State = string(newState)
 		t.rec.ReasonCode = reasonCode

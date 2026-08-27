@@ -37,5 +37,11 @@ CREATE TABLE llm_health_capabilities (
     last_success_at  TEXT,
     last_failure_at  TEXT,
     unhealthy_since  TEXT,
+    -- content_subjects is the bounded (<= 8) JSON array of distinct Incident
+    -- IDs that content-class-failed this capability since its last success —
+    -- the H1 two-distinct-Incident corroboration evidence. Durable so an
+    -- outage spanning a restart still corroborates correctly instead of
+    -- silently resetting to zero uncorroborated failures.
+    content_subjects TEXT    NOT NULL DEFAULT '[]',
     updated_at       TEXT    NOT NULL
 ) STRICT;

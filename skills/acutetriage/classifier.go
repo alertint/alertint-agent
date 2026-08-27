@@ -115,7 +115,12 @@ func Classify(ctx context.Context, client LLMClient, currentKey string, candidat
 	case string(VerdictUnsure):
 		res.Verdict = VerdictUnsure
 	default:
+		// An out-of-enum verdict is a schema violation the model committed,
+		// not a successful call: set Err so a caller observing it (Finish)
+		// records a real failure instead of silently clearing an unhealthy
+		// memory_classifier capability via Finish(nil).
 		res.Verdict = VerdictUnsureError
+		res.Err = fmt.Errorf("acutetriage: classifier: %w", llmhealth.ErrResponseMalformed)
 	}
 	return res
 }

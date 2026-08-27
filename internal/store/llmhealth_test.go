@@ -29,7 +29,7 @@ func TestLLMHealthRoundTrip(t *testing.T) {
 		SlackTS: "1.2", SlackChannel: "C1", SlackDelivery: "delivered", SlackState: "unavailable", SlackGeneration: 3,
 	}
 	caps := []LLMCapabilityRecord{
-		{Capability: "triage_draft", Healthy: false, ReasonCode: "provider_unavailable", Detail: "HTTP 503", UnhealthySince: &since, LastFailureAt: &since},
+		{Capability: "triage_draft", Healthy: false, ReasonCode: "provider_unavailable", Detail: "HTTP 503", UnhealthySince: &since, LastFailureAt: &since, ContentSubjects: []string{"inc-1", "inc-2"}},
 		{Capability: "memory_classifier", Healthy: true, LastSuccessAt: &since},
 	}
 	if err := s.SaveLLMHealth(ctx, rec, caps); err != nil {
@@ -44,6 +44,12 @@ func TestLLMHealthRoundTrip(t *testing.T) {
 	}
 	if len(gotCaps) != 2 || gotCaps[0].Capability != "memory_classifier" || gotCaps[1].Capability != "triage_draft" || gotCaps[1].Healthy {
 		t.Fatalf("caps = %+v", gotCaps) // ordered by capability name
+	}
+	if want := []string{"inc-1", "inc-2"}; len(gotCaps[1].ContentSubjects) != 2 || gotCaps[1].ContentSubjects[0] != want[0] || gotCaps[1].ContentSubjects[1] != want[1] {
+		t.Fatalf("content_subjects round-trip = %+v, want %v", gotCaps[1].ContentSubjects, want)
+	}
+	if gotCaps[0].ContentSubjects != nil {
+		t.Fatalf("content_subjects default = %+v, want nil/empty", gotCaps[0].ContentSubjects)
 	}
 	// Second save overwrites (upsert), never duplicates.
 	caps[0].Healthy = true

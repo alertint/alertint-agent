@@ -176,6 +176,39 @@ func TestContentFailureNeverMasksDependencyOutageReason(t *testing.T) {
 	}
 }
 
+// TestContentFailureCorroborationSurvivesRestart covers H1/H5's durability
+// requirement for the two-distinct-Incident corroboration evidence itself:
+// a content failure recorded just before a restart, plus one on a different
+// Incident just after, must still corroborate — an outage episode spans
+// restarts, so the evidence backing it must too.
+func TestContentFailureCorroborationSurvivesRestart(t *testing.T) {
+	st, err := store.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	tr, err := llmhealth.New(context.Background(), st, llmhealth.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	malformed := errors.Join(llmhealth.ErrResponseMalformed, errors.New("unexpected end of JSON"))
+	tr.Begin(llmhealth.CapabilityTriageDraft, "inc-1").Finish(malformed)
+	if s := tr.Snapshot(); s.State != llmhealth.StateHealthy {
+		t.Fatalf("one bad incident is not an outage: %+v", s)
+	}
+
+	// Restart: a fresh Tracker loads off the same durable store.
+	tr2, err := llmhealth.New(context.Background(), st, llmhealth.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr2.Begin(llmhealth.CapabilityTriageDraft, "inc-2").Finish(malformed)
+	if s := tr2.Snapshot(); s.State != llmhealth.StateUnavailable || s.Reason != llmhealth.ReasonResponseMalformed {
+		t.Fatalf("corroboration evidence from before the restart must still count: %+v", s)
+	}
+}
+
 func TestProbeFailureMakesUnavailableUntilRealSuccess(t *testing.T) {
 	tr := newTrackerOnly(t)
 	tr.ObserveProbe(llm.ProbeResult{Outcome: llm.ProbeFailed, Method: "GET", Path: "/health", Err: err503})

@@ -149,6 +149,7 @@ func (t *Tracker) applyDeliveryResult(plan deliveryPlan, channel, ts string, err
 			t.rec.SlackDelivery = DeliveryPending
 			t.logger.Warn("llm health: slack system message delivery failed; will retry")
 			t.auditAppend("llm.health.slack_failed", map[string]any{"generation": plan.generation, "op": "post"})
+			t.persist()
 			return
 		}
 		t.rec.SlackDelivery = DeliveryDelivered
@@ -160,6 +161,7 @@ func (t *Tracker) applyDeliveryResult(plan deliveryPlan, channel, ts string, err
 	case deliverUpdateState:
 		if err != nil {
 			t.logger.Warn("llm health: slack system message delivery failed; will retry")
+			t.persist()
 			return
 		}
 		t.rec.SlackState = string(plan.state)
@@ -168,6 +170,7 @@ func (t *Tracker) applyDeliveryResult(plan deliveryPlan, channel, ts string, err
 	case deliverUpdateRecovery:
 		if err != nil {
 			t.logger.Warn("llm health: slack system message delivery failed; will retry")
+			t.persist()
 			return
 		}
 		t.rec.SlackDelivery = DeliveryRecovered

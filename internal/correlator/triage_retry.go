@@ -82,14 +82,31 @@ func (c *Correlator) dispatchTriage(ctx context.Context, incidentID string) {
 	}
 }
 
+// ambiguousShapedReasons are llmhealth reasons that match on generic stdlib
+// error shapes (context.DeadlineExceeded, a net.Error, a *url.Error) rather
+// than an internal/llm- or internal/llmhealth-specific typed value. The
+// Acute Triage sink error classifyTriageError sees is the WHOLE skill
+// invocation's error, not just the LLM call's — a SQLite write timing out or
+// a Prometheus/Zabbix/log-source fetch failing can produce these same
+// shapes, so trusting them here would misattribute a non-LLM failure as an
+// LLM dependency code.
+var ambiguousShapedReasons = map[llmhealth.Reason]bool{
+	llmhealth.ReasonTimeout:  true,
+	llmhealth.ReasonNetwork:  true,
+	llmhealth.ReasonCanceled: true,
+}
+
 // classifyTriageError produces the bounded, sanitized code/detail persisted
 // on a failed dispatch (R9). A dispatch error that llmhealth can classify
-// into a real dependency/content reason persists that reason code and its
-// safe detail; anything else (a non-LLM sink error, a shape llmhealth has
-// never seen) falls back to the generic triage_dispatch_failed code so a
-// failure is always recorded, never dropped.
+// into a reason backed by an LLM-specific typed error (a provider status,
+// a schema/malformed-response sentinel) persists that reason code and its
+// safe detail; anything else — an ambiguous generic-shaped reason that a
+// non-LLM sink error could equally produce, or a shape llmhealth has never
+// seen — falls back to the generic triage_dispatch_failed code so a failure
+// is always recorded, never dropped, and never misattributed.
 func classifyTriageError(err error) (code, detail string) {
-	if reason := llmhealth.Classify(err); reason != llmhealth.ReasonUnknown {
+	reason := llmhealth.Classify(err)
+	if reason != llmhealth.ReasonUnknown && !ambiguousShapedReasons[reason] {
 		return string(reason), llmhealth.SafeDetail(err)
 	}
 	return "triage_dispatch_failed", llmhealth.SafeDetail(err)

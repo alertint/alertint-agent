@@ -15,6 +15,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/llm"
 	llmanthropic "github.com/alertint/alertint-agent/internal/llm/anthropic"
+	"github.com/alertint/alertint-agent/internal/llmhealth"
 	"github.com/alertint/alertint-agent/skills/acutetriage"
 )
 
@@ -108,13 +109,20 @@ func TestClassify_ModelUnsureIsDistinct(t *testing.T) {
 
 // TestClassify_GarbageVerdictIsUnsureError: a present-but-unrecognized verdict
 // value is treated as unsure-error, not a match — only a clean matched/no-match
-// is trusted.
+// is trusted. Err must also be set (wrapping llmhealth.ErrResponseMalformed,
+// the same as the JSON-decode-failure path): an out-of-enum reply is a schema
+// violation the model committed, not a successful call, so maybeClassify's
+// obs.Finish(result.Err) must observe it as a failure — never silently clear
+// an unhealthy memory_classifier capability via a Finish(nil).
 func TestClassify_GarbageVerdictIsUnsureError(t *testing.T) {
 	fllm := &fakeLLM{response: json.RawMessage(`{"verdict":"probably yes"}`)}
 	got := acutetriage.Classify(context.Background(), fllm, currentKeyForClassify,
 		candidateEntry("x", 0.5))
 	if got.Verdict != acutetriage.VerdictUnsureError {
 		t.Errorf("verdict = %q, want unsure-error", got.Verdict)
+	}
+	if !errors.Is(got.Err, llmhealth.ErrResponseMalformed) {
+		t.Errorf("Err = %v, want it to wrap llmhealth.ErrResponseMalformed", got.Err)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -226,17 +227,17 @@ func triageNextAt(t *testing.T, st *store.Store, incidentID string) time.Time {
 // mustBackoffRow reads back incidentID's Incident and its durable triage row,
 // failing the test if the Incident is not currently "ready" in phase
 // "backoff" (the only state GetBackoffIncidentByGroupKey resolves).
-func mustBackoffRow(t *testing.T, st *store.Store, incidentID string) (store.Incident, store.IncidentTriage) {
+func mustBackoffRow(t *testing.T, st *store.Store, incidentID string) store.IncidentTriage {
 	t.Helper()
 	inc, err := st.GetIncidentByID(context.Background(), incidentID)
 	if err != nil {
 		t.Fatalf("get incident: %v", err)
 	}
-	got, tri, err := st.GetBackoffIncidentByGroupKey(context.Background(), inc.GroupKey)
+	_, tri, err := st.GetBackoffIncidentByGroupKey(context.Background(), inc.GroupKey)
 	if err != nil {
 		t.Fatalf("get backoff incident by group key: %v", err)
 	}
-	return *got, *tri
+	return *tri
 }
 
 // TestTriageRetry_PendingThroughBackoffThenSuccess pins the durable phase
@@ -286,9 +287,41 @@ func TestTriageBackoffRecordsCapabilityAwareCode(t *testing.T) {
 
 	h.flush()
 
-	_, tri := mustBackoffRow(t, h.st, h.inc.ID)
+	tri := mustBackoffRow(t, h.st, h.inc.ID)
 	if tri.LastErrorCode != "provider_unavailable" || tri.LastErrorDetail != "HTTP 503" {
 		t.Fatalf("triage row = %+v", tri)
+	}
+}
+
+// TestTriageBackoffDoesNotMisattributeAmbiguousShapedErrors pins
+// classifyTriageError's other side: llmhealth.Classify's timeout/network/
+// canceled reasons match on generic stdlib shapes (context.DeadlineExceeded,
+// net.Error, url.Error) that any non-LLM failure in the sink call — a SQLite
+// write timing out, a Prometheus/Zabbix/log-source fetch failing — could
+// produce too. Trusting them here would misattribute a non-LLM failure as an
+// LLM dependency code, so classifyTriageError falls back to the generic code
+// for exactly these three ambiguous reasons and trusts only the reasons that
+// require an internal/llm- or internal/llmhealth-specific typed error no
+// other subsystem constructs.
+func TestTriageBackoffDoesNotMisattributeAmbiguousShapedErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"context deadline (e.g. a SQLite write timing out)", fmt.Errorf("store: save output: %w", context.DeadlineExceeded)},
+		{"context canceled (e.g. shutdown mid non-LLM call)", fmt.Errorf("store: save output: %w", context.Canceled)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newRetryHarness(t, 1)
+			h.sink.failErr = tc.err
+
+			h.flush()
+
+			tri := mustBackoffRow(t, h.st, h.inc.ID)
+			if tri.LastErrorCode != "triage_dispatch_failed" {
+				t.Fatalf("code = %q, want the generic fallback (a %v is not LLM-specific)", tri.LastErrorCode, tc.err)
+			}
+		})
 	}
 }
 

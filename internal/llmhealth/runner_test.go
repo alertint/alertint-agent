@@ -93,6 +93,39 @@ func TestRunWakesOnKick(t *testing.T) {
 	<-done
 }
 
+// TestStaleProbeFailureDiscardedAfterRealSuccessRacesIt covers the TOCTOU gap
+// between ProbeDue() (checks inFlight == 0, releases the lock) and the probe
+// HTTP call actually starting: a real call can begin — and succeed — while
+// the probe is still in flight. The probe's later-arriving failure must not
+// override that fresher, stronger real-success signal (H2's "probe success
+// cannot erase a real inference failure" cuts both ways: a stale probe
+// failure must not erase a real inference success either).
+func TestStaleProbeFailureDiscardedAfterRealSuccessRacesIt(t *testing.T) {
+	tr, _, c, _ := newTracker(t)
+	pr := &fakeProber{res: llm.ProbeResult{Outcome: llm.ProbeFailed, Method: "GET", Path: "/v1/models/m", Err: err503}, block: make(chan struct{})}
+	r := llmhealth.NewRunner(tr, pr, nil, nil)
+	c.add(5 * time.Minute)
+
+	done := make(chan struct{})
+	go func() {
+		r.Step(context.Background(), c.now())
+		close(done)
+	}()
+	for pr.calls.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+
+	// A real call races in and succeeds while the probe above is still blocked.
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(nil)
+
+	close(pr.block)
+	<-done
+
+	if s := tr.Snapshot(); s.State != llmhealth.StateHealthy {
+		t.Fatalf("a stale probe failure must not override a real success that raced it: %+v", s)
+	}
+}
+
 func TestProbeTimeoutIsBounded(t *testing.T) {
 	tr, _, c, _ := newTracker(t)
 	pr := &fakeProber{res: llm.ProbeResult{Outcome: llm.ProbeFailed, Err: context.DeadlineExceeded}, block: make(chan struct{})}
