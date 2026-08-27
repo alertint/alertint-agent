@@ -283,6 +283,36 @@ func TestMaxTokensTruncationError(t *testing.T) {
 	}
 }
 
+// TestMaxTokensTruncationErrorPerCallHint verifies that when the truncation
+// ceiling came from an explicit per-call Prompt.MaxOutputTokens (Task 2), the
+// error reports the per-call cap instead of the "raise llm.max_tokens"
+// operator hint — a deliberately bounded repair call must not be
+// misdiagnosed as an operator misconfiguration.
+func TestMaxTokensTruncationErrorPerCallHint(t *testing.T) {
+	truncated := `{"queries":[{"query":"up{job=`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, responseBodyStop(truncated, "max_tokens", 100, 128))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL, nil) // configured MaxTokens: 256
+	_, err := c.Complete(context.Background(), "sys",
+		llm.Prompt{Prefix: "repair", MaxOutputTokens: 128}, []string{"queries"})
+	if err == nil {
+		t.Fatal("expected truncation error, got nil")
+	}
+	if !errors.Is(err, llm.ErrResponseTruncated) {
+		t.Errorf("expected ErrResponseTruncated, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "per-call max_output_tokens") {
+		t.Errorf("explicit per-call cap must report the per-call hint, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "raise llm.max_tokens") {
+		t.Errorf("explicit per-call cap must not report the operator-misconfiguration hint, got: %v", err)
+	}
+}
+
 // TestNon429ErrorNotRetried verifies that a 500 is returned immediately
 // without retrying.
 func TestNon429ErrorNotRetried(t *testing.T) {
