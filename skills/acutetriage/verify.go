@@ -195,8 +195,23 @@ func (p *verificationPlan) UnmarshalJSON(data []byte) error {
 // Prometheus-less install can't run it, and an always-failing query would
 // trigger the R15 clamp every re-judge (belt-and-suspenders on top of the
 // prompt no longer offering the kind, ADR-0034); every surviving query is
-// force-labeled Source: "model"; the list is capped at params.MaxQueries
-// with the drop count logged (no silent caps, R3).
+// force-labeled Source: "model" and stripped of the two execution-owned
+// fields (see below); the list is capped at params.MaxQueries with the drop
+// count logged (no silent caps, R3).
+//
+// Outcome and Result are execution-owned: only this codebase's own executors
+// (runOneQuery, the Zabbix verifier, markInvalid, the snapshot executor) may
+// ever set them. They carry JSON tags because a round is persisted verbatim
+// (R8/R10) — which means a model's draft JSON can name them too, and
+// unmarshalling straight into VerificationQuery would let it. That is not
+// cosmetic: a model-supplied Outcome:"invalid" makes runVerificationWith skip
+// the query entirely (it assumes only Task 5's repair step marks a query
+// invalid), so a perfectly valid expression is never checked against
+// Prometheus yet still fires the invalid-query caveat and the R15 clamp; and a
+// model-supplied Result is rendered verbatim by renderVerificationResults into
+// call 2's "computed, read-only" section, turning call 1's output into call
+// 2's prompt. Both are therefore reset to their zero value on every surviving
+// query. Kind, Expr, Params, and Why stay model-controlled by design.
 func parseVerificationPlan(raw json.RawMessage, params VerificationParams, logger *slog.Logger, incidentID string) []VerificationQuery {
 	if logger == nil {
 		logger = slog.Default()
@@ -230,6 +245,9 @@ func parseVerificationPlan(raw json.RawMessage, params VerificationParams, logge
 			continue
 		}
 		q.Source = "model"
+		// Execution-owned, never model-supplied — see the doc comment above.
+		q.Outcome = ""
+		q.Result = ""
 		filtered = append(filtered, q)
 	}
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 
 	promqlparser "github.com/prometheus/prometheus/promql/parser"
 )
@@ -21,9 +22,10 @@ func ValidateExpr(expr string) error {
 
 // promqlSignature is a normalized, order-preserving summary of the semantic
 // anchors in a PromQL expression: the things a syntax-only repair must never
-// change. Grouping punctuation, whitespace, comments, and aggregation
-// wrapping/grouping syntax (which a syntax repair is explicitly allowed to
-// add or relocate) are deliberately excluded.
+// change. Only grouping punctuation, whitespace, comments, and the PRESENCE of
+// an aggregation wrapper (which a syntax repair is explicitly allowed to add,
+// per ADR-0043) are excluded — everything a reader would call "what this query
+// asks" is anchored here.
 type promqlSignature struct {
 	metricRefs    []string   // vector-selector metric names, in encounter order
 	calls         []string   // non-aggregator function names, in encounter order
@@ -34,14 +36,36 @@ type promqlSignature struct {
 	// values between two different selectors is detected as a change, not
 	// masked by a global sort turning the comparison into a multiset check.
 	literals []string // "kind:value" duration/number/string literals, in encounter order
+	// groupClauses holds one "by:l1,l2" / "without:l1,l2" entry per by/without
+	// clause, in encounter order. Labels are sorted within a clause (`by (a,b)`
+	// and `by (b,a)` group identically), but the keyword is kept so a
+	// by<->without swap — which inverts kept vs. excluded labels — is caught
+	// too. Relocating a clause is legal syntax repair; changing WHICH labels it
+	// names is a different question being asked.
+	groupClauses []string
+	// aggregators holds the aggregation keywords (sum, avg, topk, ...) in
+	// encounter order. ValidateSyntaxRepair compares this ONLY when the
+	// original already had at least one: introducing the aggregation an
+	// expression was missing is the canonical repair (issue 62), but swapping
+	// topk for bottomk in an expression that already aggregated is a semantic
+	// change wearing a syntax repair's clothes.
+	aggregators []string
+	// operators holds arithmetic/comparison/set/@ operator tokens (everything
+	// the pinned parser's ItemType.IsOperator reports), in encounter order.
+	// Label-matcher operators never reach here: they are consumed whole as part
+	// of a matcher triple, where matcherGroups already anchors them together
+	// with their label and value.
+	operators []string
 }
 
 // ValidateSyntaxRepair reports whether repaired is a syntax-only rewrite of
-// original: the same metric references, function calls, label matchers, and
-// literals, with only grouping punctuation and aggregation wrapping/grouping
-// syntax (e.g. moving or completing a `by (...)` clause) allowed to differ.
-// It never inspects query text in its error messages, only the class of
-// anchor that changed.
+// original: the same metric references, function calls, label matchers,
+// literals, grouping label lists, operators, and — when the original already
+// aggregated — the same aggregation operator. Only grouping punctuation and
+// the introduction or relocation of an aggregation wrapper (e.g. completing
+// `increase(x[1h]) by (type)` into `sum by (type) (increase(x[1h]))`) may
+// differ. It never inspects query text in its error messages, only the class
+// of anchor that changed.
 //
 // If original cannot be tokenized far enough to establish a signature, this
 // fails closed: the repair is rejected rather than approved on a partial
@@ -65,6 +89,16 @@ func ValidateSyntaxRepair(original, repaired string) error {
 		return fmt.Errorf("prometheus: syntax repair changed a label matcher")
 	case !slices.Equal(originalSig.literals, repairedSig.literals):
 		return fmt.Errorf("prometheus: syntax repair changed a literal")
+	case !slices.Equal(originalSig.groupClauses, repairedSig.groupClauses):
+		return fmt.Errorf("prometheus: syntax repair changed a grouping label list")
+	case !slices.Equal(originalSig.operators, repairedSig.operators):
+		return fmt.Errorf("prometheus: syntax repair changed an operator")
+	// Guarded, deliberately: an original with NO aggregator may gain exactly
+	// the one it was missing (the issue-62 relocation this whole repair path
+	// exists for). An original that already aggregated may not have that
+	// aggregator swapped for a different one.
+	case len(originalSig.aggregators) > 0 && !slices.Equal(originalSig.aggregators, repairedSig.aggregators):
+		return fmt.Errorf("prometheus: syntax repair changed an aggregation operator")
 	}
 	return nil
 }
@@ -119,28 +153,22 @@ func buildPromqlSignature(expr string) (promqlSignature, error) {
 			}
 
 		case it.Typ == promqlparser.BY || it.Typ == promqlparser.WITHOUT:
-			// The grouping label list that may follow `by`/`without` is
-			// aggregation syntax a repair is allowed to add or move; skip
-			// the keyword and, if present, the whole balanced parenthesized
-			// list that follows it.
-			if i+1 < len(items) && items[i+1].Typ == promqlparser.LEFT_PAREN {
-				depth := 1
-				j := i + 2
-				for ; j < len(items) && depth > 0; j++ {
-					switch items[j].Typ {
-					case promqlparser.LEFT_PAREN:
-						depth++
-					case promqlparser.RIGHT_PAREN:
-						depth--
-					}
-				}
-				i = j - 1
-			}
+			var clause string
+			clause, i = readGroupClause(items, i)
+			sig.groupClauses = append(sig.groupClauses, clause)
 
 		case it.Typ.IsAggregator():
-			// The aggregation operator itself (sum, avg, ...) is exactly
-			// the syntax a repair is allowed to add; it carries no anchor
-			// content of its own.
+			// WHETHER an expression aggregates is repairable syntax; WHICH
+			// aggregator it uses is not (sum and topk answer different
+			// questions). ValidateSyntaxRepair applies the distinction.
+			sig.aggregators = append(sig.aggregators, it.Val)
+
+		case it.Typ.IsOperator():
+			// Arithmetic, comparison, set operators and the `@` modifier, per
+			// the pinned parser's own classifier rather than a hand-rolled
+			// list. Label-matcher operators never reach this case: the
+			// IDENTIFIER branch below consumes each matcher triple whole.
+			sig.operators = append(sig.operators, it.Val)
 
 		case it.Typ == promqlparser.IDENTIFIER, it.Typ == promqlparser.METRIC_IDENTIFIER:
 			if braceDepth > 0 && i+2 < len(items) && isMatcherOp(items[i+1].Typ) {
@@ -168,6 +196,44 @@ func buildPromqlSignature(expr string) (promqlSignature, error) {
 	}
 
 	return sig, nil
+}
+
+// readGroupClause reduces the `by`/`without` clause starting at items[i] (the
+// keyword itself) to one signature entry, and returns the index of the clause's
+// last token so the caller's loop resumes just past it.
+//
+// A clause may be relocated or introduced outright by a repair, so its POSITION
+// carries no anchor content — but the labels it names decide what the query
+// groups over, so they do. The whole balanced parenthesized list is consumed;
+// labels are collected at paren depth 1 and sorted (`by (a,b)` and `by (b,a)`
+// group identically). A keyword with no list at all — not realistic PromQL, but
+// the caller must not misread the token stream if it ever appears — still
+// yields an entry with an empty label list rather than being dropped.
+func readGroupClause(items []promqlparser.Item, i int) (string, int) {
+	keyword := "by"
+	if items[i].Typ == promqlparser.WITHOUT {
+		keyword = "without"
+	}
+	var labels []string
+	if i+1 < len(items) && items[i+1].Typ == promqlparser.LEFT_PAREN {
+		depth := 1
+		j := i + 2
+		for ; j < len(items) && depth > 0; j++ {
+			switch items[j].Typ {
+			case promqlparser.LEFT_PAREN:
+				depth++
+			case promqlparser.RIGHT_PAREN:
+				depth--
+			case promqlparser.IDENTIFIER, promqlparser.METRIC_IDENTIFIER:
+				if depth == 1 {
+					labels = append(labels, items[j].Val)
+				}
+			}
+		}
+		i = j - 1
+	}
+	sort.Strings(labels)
+	return keyword + ":" + strings.Join(labels, ","), i
 }
 
 // isMatcherOp reports whether t is one of the four label-matcher operators.
