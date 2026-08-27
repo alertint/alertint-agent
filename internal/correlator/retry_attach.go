@@ -28,17 +28,22 @@ func (c *Correlator) maybeAttachRetryingIncident(ctx context.Context, a store.Al
 	}
 
 	// Load members once: they carry the candidate's Drill-ness, mirroring the
-	// occurrence-attach invariant (no cross-Drill attach).
+	// occurrence-attach invariant (no cross-Drill attach), and let us tell a
+	// genuinely new member from an idempotent re-fire of an existing one
+	// without a second query.
 	members, err := c.st.GetIncidentAlerts(ctx, candidate.ID)
 	if err != nil {
 		c.logger.Warn("correlator: member lookup failed; treating as new incident", "err", err, "incident_id", candidate.ID)
 		return false, nil
 	}
 	candidateDrill := false
+	alreadyMember := false
 	for _, m := range members {
 		if store.IsDrillAlert(m) {
 			candidateDrill = true
-			break
+		}
+		if m.Fingerprint == a.Fingerprint {
+			alreadyMember = true
 		}
 	}
 	if store.IsDrillAlert(a) != candidateDrill {
@@ -49,13 +54,22 @@ func (c *Correlator) maybeAttachRetryingIncident(ctx context.Context, a store.Al
 		return false, fmt.Errorf("correlator: attach retrying incident: %w", err)
 	}
 
+	if alreadyMember {
+		// An idempotent re-fire of an already-attached fingerprint: no new
+		// membership, so nothing meaningful happened — no log, no audit,
+		// mirroring the occurrence-attach "repeat" short-circuit in attach.go.
+		return true, nil
+	}
+
+	memberCount := len(members) + 1
 	c.logger.Info("correlator: alert attached during triage backoff",
-		"incident_id", candidate.ID, "group_key", groupKey, "alert_id", a.ID, "next_at", tri.NextAt)
+		"incident_id", candidate.ID, "group_key", groupKey, "alert_id", a.ID, "next_at", tri.NextAt, "member_count", memberCount)
 	if c.auditor != nil {
 		if err := c.auditor.Append(ctx, "correlator", "incident.triage_member_attached", map[string]any{
-			"incident_id": candidate.ID,
-			"group_key":   groupKey,
-			"alert_id":    a.ID,
+			"incident_id":  candidate.ID,
+			"group_key":    groupKey,
+			"alert_id":     a.ID,
+			"member_count": memberCount,
 		}); err != nil {
 			c.logger.Warn("correlator: audit triage_member_attached failed", "err", err, "incident_id", candidate.ID)
 		}

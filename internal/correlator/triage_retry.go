@@ -181,10 +181,39 @@ func (c *Correlator) reconcileInFlightTriage(ctx context.Context) {
 	}
 }
 
-// dispatchDueTriage reconciles any stuck in_flight row, then dispatches
-// every incident whose durable backoff is due.
+// reconcileUnscheduledTriage seeds a durable pending row for any "ready"
+// Incident with no triage row at all, and applies the startup horizon to it.
+// Such an Incident arises two ways: a pre-upgrade legacy row, or — since
+// MarkIncidentReady and SeedIncidentTriage are two separate store calls, not
+// one transaction — this run's own SeedIncidentTriage call failing right
+// after MarkIncidentReady already committed. Either way the Incident is
+// otherwise invisible to every later scan (R1/R3: it is neither collecting
+// nor present in the due schedule), so this is called every tick, not only
+// once at startup.
+func (c *Correlator) reconcileUnscheduledTriage(ctx context.Context, now time.Time) {
+	unscheduled, err := c.st.ListLegacyReadyIncidents(ctx)
+	if err != nil {
+		c.logger.Error("correlator: list unscheduled ready incidents", "err", err)
+		return
+	}
+	if len(unscheduled) > 0 {
+		c.logger.Warn("correlator: found ready incidents with no triage schedule", "count", len(unscheduled))
+	}
+	for _, inc := range unscheduled {
+		if err := c.st.SeedIncidentTriage(ctx, inc.ID, inc.ReadyAt); err != nil {
+			c.logger.Error("correlator: seed unscheduled triage", "incident_id", inc.ID, "err", err)
+			continue
+		}
+		c.applyStartupHorizon(ctx, inc, inc.ReadyAt, 0, now)
+	}
+}
+
+// dispatchDueTriage reconciles any stuck in_flight row and any unscheduled
+// ready incident, then dispatches every incident whose durable backoff is
+// due.
 func (c *Correlator) dispatchDueTriage(ctx context.Context, now time.Time) {
 	c.reconcileInFlightTriage(ctx)
+	c.reconcileUnscheduledTriage(ctx, now)
 
 	due, err := c.st.ListDueIncidentTriage(ctx, now)
 	if err != nil {
@@ -198,28 +227,14 @@ func (c *Correlator) dispatchDueTriage(ctx context.Context, now time.Time) {
 
 // recoverTriageState reconciles the durable triage schedule before the loop
 // starts (ADR-0045): every interrupted in_flight row is resolved first (the
-// attempt counts), every legacy "ready" row with no triage row is seeded as
-// pending, and finally the one-hour startup horizon is applied to every
-// pending/backoff row so a long backlog cannot become a boot-time LLM burst.
-// It never calls the sink; due work runs on the first tick after Start.
+// attempt counts), every unscheduled "ready" row (legacy or otherwise) is
+// seeded as pending, and finally the one-hour startup horizon is applied to
+// every pending/backoff row so a long backlog cannot become a boot-time LLM
+// burst. It never calls the sink; due work runs on the first tick after
+// Start.
 func (c *Correlator) recoverTriageState(ctx context.Context, now time.Time) error {
 	c.reconcileInFlightTriage(ctx)
-
-	legacy, err := c.st.ListLegacyReadyIncidents(ctx)
-	if err != nil {
-		return fmt.Errorf("list legacy ready: %w", err)
-	}
-	for _, inc := range legacy {
-		if err := c.st.SeedIncidentTriage(ctx, inc.ID, inc.ReadyAt); err != nil {
-			c.logger.Error("correlator: seed legacy triage", "incident_id", inc.ID, "err", err)
-		}
-	}
-	if len(legacy) > 0 {
-		c.logger.Warn("correlator: startup recovery: legacy ready incidents found", "count", len(legacy))
-	}
-	for _, inc := range legacy {
-		c.applyStartupHorizon(ctx, inc, inc.ReadyAt, 0, now)
-	}
+	c.reconcileUnscheduledTriage(ctx, now)
 
 	due, err := c.st.ListDueIncidentTriage(ctx, now)
 	if err != nil {

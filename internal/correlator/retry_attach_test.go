@@ -165,6 +165,13 @@ func TestMaybeAttachRetryingIncident_PositiveAttachDetails(t *testing.T) {
 	if td.notif.count() != 0 {
 		t.Errorf("recurrence notifier called %d times, want 0 (retry-aware attach is not an occurrence)", td.notif.count())
 	}
+	attached := td.aud.rowsOfKind("incident.triage_member_attached")
+	if len(attached) != 1 {
+		t.Fatalf("audit rows = %d, want 1", len(attached))
+	}
+	if got := attached[0].payload["member_count"]; got != 2 {
+		t.Errorf("audit member_count = %v, want 2", got)
+	}
 
 	_, triAfter, err := st.GetBackoffIncidentByGroupKey(ctx, gkAPI)
 	if err != nil {
@@ -191,10 +198,11 @@ func TestMaybeAttachRetryingIncident_PositiveAttachDetails(t *testing.T) {
 
 // TestMaybeAttachRetryingIncident_SameFingerprintIsIdempotent: a
 // same-fingerprint re-fire while the incident is backing off attaches
-// without duplicating membership.
+// without duplicating membership, and — since nothing new actually
+// happened — without logging or auditing an attach.
 func TestMaybeAttachRetryingIncident_SameFingerprintIsIdempotent(t *testing.T) {
 	st := openStore(t)
-	c, _ := newCorrelatorFor(t, st)
+	c, td := newCorrelatorFor(t, st)
 	ctx := context.Background()
 	incID, member := seedTriagePhase(t, st, store.TriageBackoff, false)
 
@@ -212,6 +220,9 @@ func TestMaybeAttachRetryingIncident_SameFingerprintIsIdempotent(t *testing.T) {
 	}
 	if got := memberCount(t, st, incID); got != 1 {
 		t.Errorf("members = %d, want 1 (same fingerprint, idempotent)", got)
+	}
+	if got := len(td.aud.rowsOfKind("incident.triage_member_attached")); got != 0 {
+		t.Errorf("audit rows = %d, want 0 (no new membership, nothing to audit)", got)
 	}
 }
 

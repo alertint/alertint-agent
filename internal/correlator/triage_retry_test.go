@@ -817,3 +817,29 @@ func TestStartupRecovery_StaleInFlightRowAfterSuccessIsCleared(t *testing.T) {
 	}
 	h.wantCalls(0, "recover never calls the sink")
 }
+
+// TestFlushExpired_ReconcilesUnscheduledReadyIncident proves a code-review
+// fix (R1/R3): an Incident left "ready" with no triage row — because
+// MarkIncidentReady and SeedIncidentTriage are two separate store calls, and
+// the second can fail after the first already committed — is picked up and
+// dispatched on a later flush tick, not stuck until a process restart.
+func TestFlushExpired_ReconcilesUnscheduledReadyIncident(t *testing.T) {
+	h := newRetryHarness(t, 1000)
+	ctx := context.Background()
+
+	// Simulate MarkIncidentReady succeeding while SeedIncidentTriage failed:
+	// "ready" with no triage row, without ever going through Start/Recover.
+	if err := h.st.MarkIncidentReady(ctx, h.inc.ID); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	if got := triagePhase(t, h.st, h.inc.ID); got != "" {
+		t.Fatalf("phase = %q, want absent (unscheduled)", got)
+	}
+
+	// An ordinary flush tick, not startup recovery, must reconcile it.
+	h.flush()
+	h.wantCalls(1, "unscheduled incident reconciled and dispatched")
+	if got := triagePhase(t, h.st, h.inc.ID); got != "backoff" {
+		t.Fatalf("phase after reconciliation = %q, want backoff", got)
+	}
+}

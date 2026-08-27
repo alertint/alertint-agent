@@ -556,9 +556,18 @@ func TestIncidentResolvesWhenAllMembersResolve(t *testing.T) {
 		}
 	}
 
-	// Window flushes → incident ready.
-	waitFor(t, func() bool { return sink.len() > 0 }, 3*time.Second, "incident ready")
+	// Window flushes → incident dispatched. The sink observes it while
+	// Status is durably "processing" (the in-flight lease taken before the
+	// sink is called); dispatchTriage only returns it to "ready" (phase
+	// "skipped", a clean skip since captureSink never persists a Finding)
+	// after the sink call returns. Wait for that settled state rather than
+	// racing sink.len() > 0 against the correlator's own goroutine.
+	waitFor(t, func() bool { return sink.len() > 0 }, 3*time.Second, "incident dispatched")
 	incID := sink.get(0).ID
+	waitFor(t, func() bool {
+		g, e := st.GetIncidentByID(ctx, incID)
+		return e == nil && g != nil && g.Status == "ready"
+	}, 3*time.Second, "incident settled to ready after clean-skip dispatch")
 	ready, err := st.GetIncidentByID(ctx, incID)
 	if err != nil {
 		t.Fatalf("get ready incident: %v", err)

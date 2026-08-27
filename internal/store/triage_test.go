@@ -6,8 +6,10 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestIncidentTriageLifecycle(t *testing.T) {
@@ -77,6 +79,35 @@ func TestIncidentTriageDetailIsCapped(t *testing.T) {
 	_, tri, _ := st.GetBackoffIncidentByGroupKey(ctx, "service=cap")
 	if len(tri.LastErrorDetail) > 256 || tri.LastErrorDetail[:1] != "x" || tri.LastErrorDetail[1:2] != " " {
 		t.Fatalf("detail not sanitized/capped: %q", tri.LastErrorDetail)
+	}
+}
+
+// TestSanitizeTriageDetail_InvalidUTF8 covers a provider response body
+// containing arbitrary, non-UTF-8 bytes: the result must always be valid
+// UTF-8 and within the byte cap, both when the raw input is short (never
+// reaches the truncation path at all) and when it is long enough that
+// truncation must walk past invalid bytes without miscounting their width.
+func TestSanitizeTriageDetail_InvalidUTF8(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"short lone continuation byte", "error: \x80\x81 bad gateway"},
+		{"short truncated multi-byte sequence", "prefix \xe2\x82 suffix"},
+		{"long input entirely invalid bytes", "x" + strings.Repeat("\xff", 400)},
+		{"invalid bytes just before the byte cap", strings.Repeat("a", 250) + "\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80"},
+		{"valid multibyte runes straddling the byte cap", strings.Repeat("a", 254) + strings.Repeat("€", 4)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitizeTriageDetail(tc.in)
+			if !utf8.ValidString(got) {
+				t.Fatalf("sanitizeTriageDetail(%q) = %q, not valid UTF-8", tc.in, got)
+			}
+			if len(got) > maxTriageDetailBytes {
+				t.Fatalf("sanitizeTriageDetail(%q) = %q, len %d exceeds cap %d", tc.in, got, len(got), maxTriageDetailBytes)
+			}
+		})
 	}
 }
 

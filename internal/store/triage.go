@@ -40,24 +40,30 @@ type IncidentTriage struct {
 // (R9): the stable code is authoritative, detail is diagnostic only.
 const maxTriageDetailBytes = 256
 
-// sanitizeTriageDetail replaces CR/LF with spaces, trims, and truncates to
-// the longest valid UTF-8 prefix no longer than maxTriageDetailBytes.
+// sanitizeTriageDetail replaces CR/LF with spaces, trims, drops any invalid
+// UTF-8 byte (a provider response body may contain arbitrary bytes), and
+// truncates to the longest valid UTF-8 prefix no longer than
+// maxTriageDetailBytes.
+//
+// ToValidUTF8 must run before the truncation walk below: ranging over a
+// string containing invalid UTF-8 yields utf8.RuneError at each bad byte,
+// and utf8.RuneLen(utf8.RuneError) reports 3 (the encoded width of U+FFFD)
+// regardless of how many source bytes were actually invalid — so computing
+// truncation width from the decoded rune, over unvalidated input, silently
+// miscounts and can leave invalid bytes in the result.
 func sanitizeTriageDetail(s string) string {
 	s = strings.NewReplacer("\r", " ", "\n", " ").Replace(s)
 	s = strings.TrimSpace(s)
+	s = strings.ToValidUTF8(s, "")
 	if len(s) <= maxTriageDetailBytes {
 		return s
 	}
 	end := 0
 	for i, r := range s {
-		rl := utf8.RuneLen(r)
-		if rl < 0 {
-			rl = 1
-		}
-		if i+rl > maxTriageDetailBytes {
+		if i+utf8.RuneLen(r) > maxTriageDetailBytes {
 			break
 		}
-		end = i + rl
+		end = i + utf8.RuneLen(r)
 	}
 	return s[:end]
 }
