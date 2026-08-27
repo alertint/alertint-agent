@@ -23,6 +23,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/health"
+	"github.com/alertint/alertint-agent/internal/llmhealth"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -60,6 +61,13 @@ type Summary struct {
 	Audit map[string]any // receiver-owned audit payload (hashed into the chain)
 }
 
+// LLMHealthReader exposes the durable installation LLM dependency state for
+// GET /health. Dependency state is informational: it never changes the HTTP
+// status, which reflects agent + SQLite liveness only.
+type LLMHealthReader interface {
+	Snapshot() llmhealth.Snapshot
+}
+
 // Server is the inbound webhook host. Construct with New; mount Handler() on an
 // http.Server bound to receivers.address.
 type Server struct {
@@ -68,6 +76,7 @@ type Server struct {
 	receivers []Receiver
 	logger    *slog.Logger
 	health    *health.Registry
+	llmHealth LLMHealthReader
 }
 
 // Options configures a Server.
@@ -77,6 +86,9 @@ type Options struct {
 	Receivers []Receiver   // at least one
 	Logger    *slog.Logger // optional; defaults to slog.Default()
 	Health    *health.Registry
+	// LLMHealth, when set, exposes the durable LLM dependency snapshot under
+	// /health's "llm" key. Optional; omitted from the response when nil.
+	LLMHealth LLMHealthReader
 }
 
 // New constructs the host. It errors if any required field is missing.
@@ -100,6 +112,7 @@ func New(opts Options) (*Server, error) {
 		receivers: opts.Receivers,
 		logger:    logger,
 		health:    opts.Health,
+		llmHealth: opts.LLMHealth,
 	}, nil
 }
 
@@ -166,11 +179,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		code = http.StatusServiceUnavailable
 	}
 	body := struct {
-		Status       string          `json:"status"`
-		Integrations []health.Status `json:"integrations,omitempty"`
+		Status       string              `json:"status"`
+		Integrations []health.Status     `json:"integrations,omitempty"`
+		LLM          *llmhealth.Snapshot `json:"llm,omitempty"`
 	}{
 		Status:       status,
 		Integrations: s.health.Run(r.Context()),
+	}
+	if s.llmHealth != nil {
+		snap := s.llmHealth.Snapshot()
+		body.LLM = &snap
 	}
 	w.WriteHeader(code)
 	if err := json.NewEncoder(w).Encode(body); err != nil {

@@ -18,6 +18,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/health"
+	"github.com/alertint/alertint-agent/internal/llmhealth"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -522,6 +523,68 @@ func TestHealth_IncludesIntegrationStatuses(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("body %q should contain %s", body, want)
 		}
+	}
+}
+
+type stubLLMHealth struct{ s llmhealth.Snapshot }
+
+func (x stubLLMHealth) Snapshot() llmhealth.Snapshot { return x.s }
+
+func TestHealth_IncludesLLMStateButStays200(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	since := time.Now().UTC().Add(-7 * time.Minute)
+	snap := llmhealth.Snapshot{State: llmhealth.StateUnavailable, Reason: llmhealth.ReasonProviderUnavailable, Detail: "HTTP 503", UnhealthySince: &since, OutageGeneration: 2,
+		Capabilities: []llmhealth.CapabilitySnapshot{{Capability: llmhealth.CapabilityTriageDraft, Healthy: false, Reason: llmhealth.ReasonProviderUnavailable, Detail: "HTTP 503"}}}
+	host, err := New(Options{Store: s, Auditor: audit.New(s.DB()), LLMHealth: stubLLMHealth{snap}, Receivers: []Receiver{NewAlertReceiver(s, testToken, nil, nil)}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(host.Handler())
+	t.Cleanup(srv.Close)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/health", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (LLM dependency state never fails liveness)", resp.StatusCode)
+	}
+	body := mustReadBody(t, resp)
+	for _, want := range []string{`"status":"ok"`, `"llm":{"state":"unavailable"`, `"reason":"provider_unavailable"`, `"outage_generation":2`, `"capability":"triage_draft"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body %q should contain %s", body, want)
+		}
+	}
+}
+
+func TestHealth_OmitsLLMWhenNotWired(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	host, err := New(Options{Store: s, Auditor: audit.New(s.DB()), Receivers: []Receiver{NewAlertReceiver(s, testToken, nil, nil)}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(host.Handler())
+	t.Cleanup(srv.Close)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/health", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body := mustReadBody(t, resp)
+	if strings.Contains(body, `"llm"`) {
+		t.Errorf("body %q should omit llm when not wired", body)
 	}
 }
 
