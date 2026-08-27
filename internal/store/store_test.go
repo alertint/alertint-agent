@@ -424,9 +424,9 @@ func TestMaxSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	// 0010_feedback_capture.sql exists today; the floor only ratchets up.
-	if got < 10 {
-		t.Errorf("MaxSchemaVersion = %d, want >= 10", got)
+	// 0011_incident_triage.sql exists today; the floor only ratchets up.
+	if got < 11 {
+		t.Errorf("MaxSchemaVersion = %d, want >= 11", got)
 	}
 }
 
