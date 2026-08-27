@@ -35,11 +35,13 @@ func TestOpen_AppliesEmbeddedMigrations(t *testing.T) {
 	defer func() { _ = rows.Close() }()
 
 	want := map[string]bool{
-		"alerts":            false,
-		"audit_log":         false,
-		"incident_alerts":   false,
-		"incidents":         false,
-		"schema_migrations": false,
+		"alerts":                  false,
+		"audit_log":               false,
+		"incident_alerts":         false,
+		"incidents":               false,
+		"schema_migrations":       false,
+		"llm_health":              false,
+		"llm_health_capabilities": false,
 	}
 	for rows.Next() {
 		var name string
