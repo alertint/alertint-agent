@@ -20,10 +20,16 @@ The **verification round** is the fix: after the model drafts a verdict,
 AlertINT gathers **contrast evidence** — facts chosen to disprove the draft,
 not support it — and asks the model to re-judge the draft against what it
 finds. This is a fixed, two-step process, not an open-ended investigation: it
-runs the same bounded shape on every judged triage, never more than a second
-call and a capped batch of read-only queries. Open-ended, hypothesis-chasing
+runs the same bounded shape on every judged triage — a capped batch of
+read-only queries between the two calls. Open-ended, hypothesis-chasing
 investigation stays where it already lived — at the MCP layer, driven by a
 human or a connected agent.
+
+The normal path remains two LLM calls. If model-proposed PromQL is
+syntactically invalid, AlertINT parses it locally and makes one repair call
+for the invalid batch, capped at 512 output tokens, before executing any
+repaired query. It validates once more and never makes a second repair
+call.
 
 ## What runs
 
@@ -70,6 +76,52 @@ the draft, revise; don't defend it. The result is the finding that persists —
 confidence caps and the memory verdict apply to this final judgment, not the
 draft.
 
+### Locally invalid PromQL
+
+Every model-proposed PromQL check is parsed locally before it can run, with
+the official Prometheus PromQL grammar — the same package Prometheus itself
+uses to parse queries, statically compiled into the AlertINT binary. There is
+no runtime download and no dependency on the target Prometheus's own version
+or reachability to validate syntax.
+
+A query that fails local parsing isn't dropped outright: AlertINT batches
+every locally invalid query from the round's plan into one repair call to the
+model, capped at 512 output tokens, asking it to fix only the syntax. Each
+returned replacement is parsed again and checked against the original — a
+repair may rearrange grouping or aggregation syntax, but it may not change a
+metric name, a label matcher, a function call, or a literal, so a model can't
+"fix" a query it can't parse by quietly substituting a different question.
+Whatever is still invalid after that one call — a failed repair call, a
+malformed reply, or a replacement that fails either check — is never sent to
+Prometheus. There is no second repair attempt.
+
+A query that never reaches the backend this way resolves the query outcome
+`invalid`: distinct from a query that ran and matched nothing (`empty`) and
+from a query the backend couldn't answer (`failed`/`degraded`). It's logged
+with the expression that was tried, persisted and audited as `invalid`, and
+treated as inconclusive evidence — it can't confirm or contradict the draft
+in call 2, the same as a failed or timed-out check. The Finding card surfaces
+it as its own Slack/stdout caveat, kept separate from the `⚠ unverified —
+checks unavailable` caveat below: an invalid query is a query-construction
+problem, not a missing or slow metrics backend.
+
+The same `invalid` outcome also covers a query that *passes* local syntax
+validation but Prometheus itself still rejects as malformed — a
+query-specific `bad_data` response naming the `query` parameter. That
+backend-authoritative fallback applies to any live query the round runs, not
+only the batch that went through repair: the deterministic floor's
+peer-scope ratio can hit it too. A `bad_data` response about something else
+(an out-of-range `limit` or `time` parameter, say), or any other backend
+error, is a genuine backend problem and stays classified as `failed`
+(hard error) or `degraded` (timeout) as before — it is never conflated with
+`invalid`.
+
+A syntactically valid query that runs and simply matches nothing is a
+separate, ordinary case: `empty`, not `invalid`. An empty or weak-but-valid
+result is a semantic question — did the query ask about the right series? —
+not a query-construction defect, and call 2 is told to weigh it as
+inconclusive rather than as a contradiction, exactly as before this feature.
+
 ### Floor sources
 
 The deterministic floor speaks the install's backend. Prometheus contributes
@@ -93,18 +145,26 @@ analysis on every re-fire spends none, so the extra call per judged incident
 isn't multiplied by every recurrence, only by genuinely new or escalated
 conditions.
 
-The second call also costs less than it looks: it reuses the first call's
-prompt verbatim as an Anthropic prompt-cache prefix, so the shared span
-(system prompt plus evidence) is written to the cache on call 1 and read back
-at roughly a tenth of the input price seconds later on call 2. `llm.response`
-audit rows carry the raw numbers — `cache_creation_input_tokens` and
-`cache_read_input_tokens`; effective input cost is
-`input + 1.25 × creation + 0.10 × read`. Caching engages only when the prefix
-clears the model's minimum cacheable size (model-dependent; small incidents on
-`claude-haiku-4-5` typically don't) — when the re-judge call reads no cached
-tokens, the agent logs a warning naming the likely cause. Worst case is
-today's cost, never more. With verification disabled, requests are unchanged
-and nothing is cached.
+Two calls is still the normal path. A third call is possible, never
+guaranteed: only when call 1 proposes at least one locally-invalid PromQL
+check does the round spend the one bounded repair call (capped at 512 output
+tokens) described above, before call 2 runs. A round with only valid
+model-proposed queries — the overwhelming majority — never sees it. The
+repair call is small, independent of the draft/re-judge prompt pair, and
+doesn't share their prompt-cache prefix.
+
+The second (re-judge) call also costs less than it looks: it reuses the
+first call's prompt verbatim as an Anthropic prompt-cache prefix, so the
+shared span (system prompt plus evidence) is written to the cache on call 1
+and read back at roughly a tenth of the input price seconds later on call 2.
+`llm.response` audit rows carry the raw numbers —
+`cache_creation_input_tokens` and `cache_read_input_tokens`; effective input
+cost is `input + 1.25 × creation + 0.10 × read`. Caching engages only when
+the prefix clears the model's minimum cacheable size (model-dependent; small
+incidents on `claude-haiku-4-5` typically don't) — when the re-judge call
+reads no cached tokens, the agent logs a warning naming the likely cause.
+Worst case is today's cost, never more. With verification disabled, requests
+are unchanged and nothing is cached.
 
 ## The `unverified` caveat
 
@@ -121,9 +181,12 @@ the only thing a caveat needs to say is "the checks that were supposed to
 back this up didn't run." A degraded round can never raise confidence past
 what the draft already had, and it produces no memory verdict — an
 unverified finding can't confirm or refute a recalled prior, so the
-recurrence flywheel is only ever fed by contrast-checked judgments. A failed
-*model-chosen* query alone doesn't degrade the round; the floor is the
-promised minimum, and targeted queries are bonus precision on top of it.
+recurrence flywheel is only ever fed by contrast-checked judgments. A failed,
+degraded, or locally/backend-invalid *model-chosen* query alone doesn't
+degrade the round; the floor is the promised minimum, and targeted queries
+are bonus precision on top of it. An invalid model-chosen query gets its own
+caveat (see [Locally invalid PromQL](#locally-invalid-promql) above),
+separate from `⚠ unverified`.
 
 ## Configuration
 

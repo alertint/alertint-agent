@@ -305,6 +305,29 @@ MCP client:
 | `prometheus_query` | Instant PromQL query. Parameters: `expr` (required), `time` (optional ISO 8601). |
 | `prometheus_query_range` | Range PromQL query with auto-stepped resolution. Parameters: `expr`, `start`, `end` (ISO 8601), `step` (optional). |
 
+`prometheus_query` and `prometheus_query_range` are **backend-native
+passthrough**: whatever PromQL the connected agent sends goes straight to
+Prometheus. There is no local syntax check and no repair attempt on this
+path — a malformed expression comes back as whatever error Prometheus itself
+returns, verbatim, for the calling agent to read and correct. That's a
+deliberate boundary, not an oversight: this is a human or a connected agent
+driving an open-ended investigation, and the tool's job is to report exactly
+what the backend said, not to intercept or second-guess the query. It also
+means a non-vanilla backend's own extensions keep working — a VictoriaMetrics
+MetricsQL function like `median_over_time`, say, that the standard PromQL
+grammar doesn't recognize still runs fine through these tools, because
+nothing here parses it against that grammar first.
+
+The bundled local validation and one-shot repair described in
+[Verification round](../concepts/verification-round.md#locally-invalid-promql)
+apply only to the unattended acute-triage verification round's own
+model-proposed PromQL — a fixed, no-human-in-the-loop pipeline where a
+malformed query would otherwise either burn a Prometheus round-trip on
+something that can never succeed or silently drop a check with no chance to
+fix it. The two paths never overlap: an MCP client's queries are never
+locally validated or repaired, and the verification round never calls
+`prometheus_query`/`prometheus_query_range`.
+
 ### Example queries
 
 Ask your agent in natural language — **AlertINT** handles the PromQL via MCP:

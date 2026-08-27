@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window to the most recent N minutes; the prompt states when the earlier span
   was not fetched. (#63)
 
+- Model-proposed PromQL verification checks are now parsed locally with the bundled official Prometheus parser. Invalid expressions get one batch repair call capped at 512 output tokens, are validated once more, and are never sent to Prometheus if still invalid. Residual invalid queries are logged with the expression, persisted/audited as `invalid`, treated as inconclusive for confidence, and shown separately from an unavailable metrics backend in Slack. Query-specific Prometheus `bad_data` responses remain a typed backend-authoritative fallback; unrelated bad request parameters remain backend failures. Normal verification stays at two LLM calls; only a malformed query plan can add the single repair call. Reported in #62.
+
 ## [0.13.4] - 2026-08-25
 
 ### Fixed

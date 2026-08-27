@@ -211,7 +211,7 @@ one.
 
 ## `triage`
 
-The triage section configures the LLM judgment pipeline. The verification round adds a second LLM pass that falsifies the draft verdict before persisting it. This two-call pattern surfaces missed context the first pass didn't weigh.
+The triage section configures the LLM judgment pipeline. With verification disabled (`verification.enabled: false`) triage is one LLM call. Normally the verification round adds a second LLM pass that falsifies the draft verdict before persisting it, surfacing missed context the first pass didn't weigh. At most three calls happen — never more — only when the draft proposes model PromQL that fails local syntax validation: one bounded repair call (capped at 512 output tokens) runs between the draft and the re-judge, fixing or discarding the invalid query before it can reach Prometheus. No separate config field governs the repair call; the existing `verification.enabled` kill switch is what turns it off, along with the rest of the round.
 
 `extra_selector_labels` extends the built-in selector allowlist — the
 alert-label keys eligible to enter evidence queries — with topology labels
