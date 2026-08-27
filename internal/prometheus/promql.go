@@ -152,7 +152,18 @@ func buildPromqlSignature(expr string) (promqlSignature, error) {
 				}
 			}
 
-		case it.Typ == promqlparser.BY || it.Typ == promqlparser.WITHOUT:
+		// Checked before every keyword-shaped case below, and deliberately
+		// blind to the label name's token type: PromQL accepts keywords
+		// (`quantile`, `count`, `and`, ...) and quoted strings as label names,
+		// so anything sitting in front of a matcher operator inside an open
+		// selector is a label name, whatever it lexed as. Consuming the triple
+		// here is also what keeps those tokens from being double-counted as an
+		// aggregator, an operator, or a literal.
+		case matcherTripleAt(items, i, braceDepth):
+			currentGroup = append(currentGroup, it.Val+items[i+1].Val+items[i+2].Val)
+			i += 2
+
+		case isGroupClauseKeyword(it.Typ):
 			var clause string
 			clause, i = readGroupClause(items, i)
 			sig.groupClauses = append(sig.groupClauses, clause)
@@ -166,16 +177,11 @@ func buildPromqlSignature(expr string) (promqlSignature, error) {
 		case it.Typ.IsOperator():
 			// Arithmetic, comparison, set operators and the `@` modifier, per
 			// the pinned parser's own classifier rather than a hand-rolled
-			// list. Label-matcher operators never reach this case: the
-			// IDENTIFIER branch below consumes each matcher triple whole.
+			// list. Label-matcher operators never reach this case — the
+			// matcher-triple case above already consumed them.
 			sig.operators = append(sig.operators, it.Val)
 
 		case it.Typ == promqlparser.IDENTIFIER, it.Typ == promqlparser.METRIC_IDENTIFIER:
-			if braceDepth > 0 && i+2 < len(items) && isMatcherOp(items[i+1].Typ) {
-				currentGroup = append(currentGroup, it.Val+items[i+1].Val+items[i+2].Val)
-				i += 2
-				continue
-			}
 			if i+1 < len(items) && items[i+1].Typ == promqlparser.LEFT_PAREN {
 				sig.calls = append(sig.calls, it.Val)
 				continue
@@ -198,36 +204,77 @@ func buildPromqlSignature(expr string) (promqlSignature, error) {
 	return sig, nil
 }
 
-// readGroupClause reduces the `by`/`without` clause starting at items[i] (the
-// keyword itself) to one signature entry, and returns the index of the clause's
-// last token so the caller's loop resumes just past it.
+// matcherTripleAt reports whether items[i:i+3] is a `label<op>value` matcher
+// triple inside an open selector brace. The label-name slot is intentionally
+// untyped: PromQL's grammar accepts keywords and quoted strings as label names,
+// so what matters is only that a matcher operator follows.
+func matcherTripleAt(items []promqlparser.Item, i, braceDepth int) bool {
+	return braceDepth > 0 && i+2 < len(items) && isMatcherOp(items[i+1].Typ)
+}
+
+// isGroupClauseKeyword reports whether t opens a parenthesized label list whose
+// contents readGroupClause should anchor: an aggregation modifier (`by` /
+// `without`) or a vector-matching clause (`on` / `ignoring`).
+//
+// GROUP_LEFT/GROUP_RIGHT are deliberately absent. Their label list is OPTIONAL,
+// so `group_left (foo + bar)` would have a plain parenthesized EXPRESSION
+// consumed as if it were labels — hiding its metric references from the rest of
+// the signature, which is the opposite of failing closed. Left uncased, their
+// labels fall through to metricRefs, where a change is still caught (as a
+// changed metric reference rather than a changed label list): less precise,
+// but safe.
+func isGroupClauseKeyword(t promqlparser.ItemType) bool {
+	switch t {
+	case promqlparser.BY, promqlparser.WITHOUT, promqlparser.ON, promqlparser.IGNORING:
+		return true
+	}
+	return false
+}
+
+// groupClauseKeyword names the clause t opens, for the signature entry.
+func groupClauseKeyword(t promqlparser.ItemType) string {
+	switch t {
+	case promqlparser.WITHOUT:
+		return "without"
+	case promqlparser.ON:
+		return "on"
+	case promqlparser.IGNORING:
+		return "ignoring"
+	}
+	return "by"
+}
+
+// readGroupClause reduces the grouping or vector-matching clause starting at
+// items[i] (the keyword itself) to one signature entry, and returns the index
+// of the clause's last token so the caller's loop resumes just past it.
 //
 // A clause may be relocated or introduced outright by a repair, so its POSITION
 // carries no anchor content — but the labels it names decide what the query
-// groups over, so they do. The whole balanced parenthesized list is consumed;
-// labels are collected at paren depth 1 and sorted (`by (a,b)` and `by (b,a)`
-// group identically). A keyword with no list at all — not realistic PromQL, but
-// the caller must not misread the token stream if it ever appears — still
-// yields an entry with an empty label list rather than being dropped.
+// groups or matches over, so they do. The whole balanced parenthesized list is
+// consumed; every depth-1 token other than the separating commas counts as a
+// label, since PromQL's `maybe_label` rule admits keywords (`quantile`,
+// `count`, `start`, ...) and quoted strings there, not just identifiers.
+// Labels are sorted (`by (a,b)` and `by (b,a)` group identically) and the
+// keyword is kept, so by<->without and on<->ignoring swaps are caught. A
+// keyword with no list at all — not realistic PromQL, but the caller must not
+// misread the token stream if it ever appears — still yields an entry with an
+// empty label list rather than being dropped.
 func readGroupClause(items []promqlparser.Item, i int) (string, int) {
-	keyword := "by"
-	if items[i].Typ == promqlparser.WITHOUT {
-		keyword = "without"
-	}
+	keyword := groupClauseKeyword(items[i].Typ)
 	var labels []string
 	if i+1 < len(items) && items[i+1].Typ == promqlparser.LEFT_PAREN {
 		depth := 1
 		j := i + 2
 		for ; j < len(items) && depth > 0; j++ {
-			switch items[j].Typ {
-			case promqlparser.LEFT_PAREN:
+			switch {
+			case items[j].Typ == promqlparser.LEFT_PAREN:
 				depth++
-			case promqlparser.RIGHT_PAREN:
+			case items[j].Typ == promqlparser.RIGHT_PAREN:
 				depth--
-			case promqlparser.IDENTIFIER, promqlparser.METRIC_IDENTIFIER:
-				if depth == 1 {
-					labels = append(labels, items[j].Val)
-				}
+			case items[j].Typ == promqlparser.COMMA:
+				// separator, not a label
+			case depth == 1:
+				labels = append(labels, items[j].Val)
 			}
 		}
 		i = j - 1
