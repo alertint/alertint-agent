@@ -1707,6 +1707,16 @@ func TestVerificationRepairsInvalidModelQuery(t *testing.T) {
 	if !strings.Contains(scripted.records[1].Prefix, issue62Invalid) {
 		t.Errorf("repair call did not carry the invalid expression:\n%s", scripted.records[1].Prefix)
 	}
+	// The repair prompt is standalone and must never be cache-marked, and it
+	// must not disturb the shared prefix bytes between the draft and the
+	// final re-judge (Global Constraint: preserve shared-prefix semantics for
+	// draft/final calls).
+	if scripted.records[1].CachePrefix {
+		t.Error("repair call must never be cache-marked")
+	}
+	if scripted.records[2].Prefix != scripted.records[0].Prefix {
+		t.Error("re-judge prefix != draft prompt: the repair call sitting in between disturbed the shared prefix")
+	}
 
 	receivedQueries := sent()
 	for _, sent := range receivedQueries {
@@ -1787,7 +1797,8 @@ func TestVerificationRepairFailureLeavesQueryInvalid(t *testing.T) {
 
 	prom, sent := promRecorder(t)
 	var buf bytes.Buffer
-	skill := acutetriage.New(verifyConfig(prom), st, scripted, auditor, nil,
+	notifier := &capturingNotifier{}
+	skill := acutetriage.New(verifyConfig(prom), st, scripted, auditor, notifier,
 		slog.New(slog.NewTextHandler(&buf, nil)))
 	if err := skill.Run(ctx, inc); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -1795,6 +1806,19 @@ func TestVerificationRepairFailureLeavesQueryInvalid(t *testing.T) {
 
 	if scripted.calls != 3 {
 		t.Fatalf("calls = %d, want draft + ONE repair + re-judge (never a second repair)", scripted.calls)
+	}
+
+	// The pipeline's one wire from a residual-invalid query to the
+	// operator-visible Slack/stdout caveat: VerificationInvalidQueries must be
+	// set through the REAL pipeline, and — the important half — it must be
+	// wired independently of Unverified, which only reflects connector/round
+	// degradation, not an invalid model query (the floor still fetched fine
+	// here, so the round is not degraded).
+	if notifier.last.VerificationInvalidQueries != 1 {
+		t.Errorf("notified VerificationInvalidQueries = %d, want 1", notifier.last.VerificationInvalidQueries)
+	}
+	if notifier.last.Unverified {
+		t.Errorf("an invalid model query alone must not flag Unverified, got %+v", notifier.last)
 	}
 	for _, q := range sent() {
 		if q == issue62Invalid || q == stillInvalid {

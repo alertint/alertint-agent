@@ -64,6 +64,18 @@ func TestClassifyErrNonQueryBadDataIsFailed(t *testing.T) {
 	}
 }
 
+// TestClassifyPairErrsBadDataIsInvalid: up_ratio's two sub-queries share one
+// outcome, and a query-specific bad_data on either sub-query must win the
+// same way classifyErr's single-error case does — this is the branch that
+// degrades the round when the FLOOR query itself is invalid.
+func TestClassifyPairErrsBadDataIsInvalid(t *testing.T) {
+	q := VerificationQuery{}
+	classifyPairErrs(&q, &promclient.APIError{StatusCode: 422, Type: "bad_data", Message: `invalid parameter "query": parse error`}, nil)
+	if q.Outcome != OutcomeInvalid {
+		t.Fatalf("outcome = %q, want invalid", q.Outcome)
+	}
+}
+
 // fakeState is the verifyStateReader test double: a canned (total, top, err)
 // triple returned regardless of arguments.
 type fakeState struct {

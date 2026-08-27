@@ -78,17 +78,26 @@ draft.
 
 ### Locally invalid PromQL
 
-Every model-proposed PromQL check is parsed locally before it can run, with
-the official Prometheus PromQL grammar — the same package Prometheus itself
-uses to parse queries, statically compiled into the AlertINT binary. There is
-no runtime download and no dependency on the target Prometheus's own version
+Every PromQL check this pipeline runs is parsed locally before it can
+run — not only the model's own proposals: a governing correction's
+operator-sourced steering checks and the widen queries run once at verdict
+capture go through the identical local check (the floor's own up-ratio and
+incidents-in-window checks have no arbitrary expression to parse, so this
+step never applies to them). All of it uses the official
+Prometheus PromQL grammar — the same package Prometheus itself uses to
+parse queries, statically compiled into the AlertINT binary. There is no
+runtime download and no dependency on the target Prometheus's own version
 or reachability to validate syntax.
 
 A query that fails local parsing isn't dropped outright: AlertINT batches
-every locally invalid query from the round's plan into one repair call to the
-model, capped at 512 output tokens, asking it to fix only the syntax. Each
-returned replacement is parsed again and checked against the original — a
-repair may rearrange grouping or aggregation syntax, but it may not change a
+every locally invalid **model-proposed** query from the round's plan into one
+repair call to the model, capped at 512 output tokens, asking it to fix only
+the syntax. Operator-sourced steering and capture-widening queries that fail
+the same local check are marked invalid outright and never sent to a repair
+call — they weren't drafted by the model, so there is nothing for the model
+to be asked to fix. Each returned replacement is parsed again and checked
+against the original — a repair may rearrange grouping or aggregation
+syntax, but it may not change a
 metric name, a label matcher, a function call, or a literal, so a model can't
 "fix" a query it can't parse by quietly substituting a different question.
 Whatever is still invalid after that one call — a failed repair call, a
