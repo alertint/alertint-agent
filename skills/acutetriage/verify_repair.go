@@ -77,6 +77,39 @@ func repairPrompt(issues []promQLIssue) string {
 	return verificationRepairInstruction + string(body)
 }
 
+// decodeRepairReplacements reduces one repair reply to the replacements that
+// may actually be applied, keyed by query index. asked is the set of indices
+// the call requested a repair for (its values, the original parser errors, are
+// not read here).
+//
+// First nonblank entry wins per requested index: a duplicate for an index
+// already answered, a blank expression, and an index that was never asked
+// about (out of range, or pointing at a query that parsed fine) are all
+// ignored rather than trusted — a repair call may only fix what it was handed,
+// never reach a query that parsed. A reply that cannot be decoded is an error;
+// the caller treats that exactly like a failed call.
+func decodeRepairReplacements(raw json.RawMessage, asked map[int]error) (map[int]string, error) {
+	var env repairEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf("malformed repair response: %w", err)
+	}
+	replacements := make(map[int]string, len(asked))
+	for _, r := range env.Queries {
+		expr := strings.TrimSpace(r.Expr)
+		if expr == "" {
+			continue
+		}
+		if _, requested := asked[r.Index]; !requested {
+			continue
+		}
+		if _, done := replacements[r.Index]; done {
+			continue
+		}
+		replacements[r.Index] = expr
+	}
+	return replacements, nil
+}
+
 // repairModelPromQL gives every locally invalid model-proposed PromQL query in
 // queries exactly ONE chance to be fixed, in a single batched LLM call, and
 // returns the effective plan plus the counts of what happened.
@@ -142,31 +175,12 @@ func (s *Skill) repairModelPromQL(ctx context.Context, incidentID string, querie
 		MaxOutputTokens: verificationRepairMaxOutputTokens,
 	}, []string{"queries"})
 
-	// First nonblank entry wins per requested index: a duplicate for an index
-	// already answered, a blank expression, and an index that was never asked
-	// about (out of range, or pointing at a query that parsed fine) are all
-	// ignored rather than trusted. A reply that cannot be decoded at all is
-	// treated exactly like a failed call — no replacements, one call spent.
-	replacements := make(map[int]string, len(issues))
+	// A reply that cannot be decoded at all is treated exactly like a failed
+	// call — no replacements, one call spent, the decode error folded into
+	// callErr so it rides the same WARN field below.
+	var replacements map[int]string
 	if callErr == nil {
-		var env repairEnvelope
-		if err := json.Unmarshal(comp.Raw, &env); err != nil {
-			callErr = fmt.Errorf("malformed repair response: %w", err)
-		} else {
-			for _, r := range env.Queries {
-				expr := strings.TrimSpace(r.Expr)
-				if expr == "" {
-					continue
-				}
-				if _, asked := parseErr[r.Index]; !asked {
-					continue
-				}
-				if _, done := replacements[r.Index]; done {
-					continue
-				}
-				replacements[r.Index] = expr
-			}
-		}
+		replacements, callErr = decodeRepairReplacements(comp.Raw, parseErr)
 	}
 
 	// Revalidate every attempted index once, after application. A replacement
