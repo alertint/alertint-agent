@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/alertint/alertint-agent/internal/llm"
+	"github.com/alertint/alertint-agent/internal/llmhealth"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -100,6 +101,7 @@ func Classify(ctx context.Context, client LLMClient, currentKey string, candidat
 	}
 	if err := json.Unmarshal(comp.Raw, &parsed); err != nil {
 		res.Verdict = VerdictUnsureError
+		res.Err = fmt.Errorf("acutetriage: classifier: %w", llmhealth.ErrResponseMalformed)
 		return res
 	}
 	// Trust only a clean reply from the enum the prompt offers; the model's own
@@ -146,7 +148,9 @@ func (s *Skill) maybeClassify(ctx context.Context, inc store.Incident, memory *M
 		defer cancel()
 	}
 
+	obs := s.cfg.Health.Begin(llmhealth.CapabilityMemoryClassifier, inc.ID)
 	result := Classify(ctx, s.cfg.Classifier, inc.GroupKey, *memory.topPrefilter)
+	obs.Finish(result.Err)
 	if result.Err != nil {
 		// The verdict fail-opens to unsure either way; the log distinguishes a
 		// truncated reply — the model's reasoning ate the completion budget —

@@ -87,7 +87,19 @@ type VerificationEnrichment struct {
 	// (ADR-0029) when one is steering; nil when no correction governs this
 	// triage at all.
 	OperatorRuling *OperatorRulingRecord `json:"operator_ruling,omitempty"`
+	// DegradationReason names why a degraded round shipped the draft: empty
+	// when Outcome != degraded, otherwise one of the Degradation* constants.
+	DegradationReason string `json:"degradation_reason,omitempty"`
 }
+
+// Degradation reasons for a degraded VerificationEnrichment.Outcome: the
+// re-judge call itself failed, it replied but the typed decode failed, or
+// the deterministic floor could not fetch even though call 2 succeeded.
+const (
+	DegradationLLMCallFailed                 = "llm_call_failed"
+	DegradationLLMResponseInvalid            = "llm_response_invalid"
+	DegradationVerificationSourceUnavailable = "verification_source_unavailable"
+)
 
 // OperatorRulingRecord is the deterministic record of what call 2 ruled on
 // the governing correction's fetched operator-sourced evidence — or the

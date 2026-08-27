@@ -12,6 +12,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/llm"
+	"github.com/alertint/alertint-agent/internal/llmhealth"
 	"github.com/alertint/alertint-agent/internal/logs"
 	"github.com/alertint/alertint-agent/internal/notify"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
@@ -108,6 +109,10 @@ type Config struct {
 	// and per-incident WARNs would teach operators to ignore a surface
 	// whose principle is "silence is unambiguous".
 	PromptCaching bool
+	// Health, when non-nil, receives one final outcome per LLM call (transport,
+	// schema, and typed-decode included) so installation-level LLM dependency
+	// health reflects real inference. nil = no observation (tests, offline tools).
+	Health *llmhealth.Tracker
 }
 
 // Skill orchestrates the full acute-triage pipeline for a single ready
@@ -320,8 +325,10 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 
 	var resp llmResponse
 	if err := json.Unmarshal(ar.raw, &resp); err != nil {
+		ar.health.Finish(fmt.Errorf("%w: %v", llmhealth.ErrResponseMalformed, err))
 		return fmt.Errorf("acutetriage: parse llm response: %w", err)
 	}
+	ar.health.Finish(nil)
 	clampConfidence(&resp.Confidence)
 
 	// Verification round (ADR-0021/0022): after the draft verdict, run the floor +
@@ -614,6 +621,10 @@ type analysisResult struct {
 	memory       *MemoryEnrichment
 	system, user string // prompts, kept for the call-2 continuation
 	shortCircuit bool
+	// health is the open triage_draft observation Call 1 started (nil on the
+	// short-circuit path, or when Config.Health is nil). pipeline finishes it
+	// once the typed decode either succeeds or fails.
+	health *llmhealth.Observation
 }
 
 // analysis produces the raw finding JSON, either synthesized from a
@@ -704,11 +715,13 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		userPrompt = recurrence + "\n\n" + userPrompt
 	}
 	system := s.systemPrompt(decision, len(alerts))
+	obs := s.cfg.Health.Begin(llmhealth.CapabilityTriageDraft, inc.ID)
 	comp, err := s.llm.Complete(ctx, system, llm.Prompt{
 		Prefix:      userPrompt,
 		CachePrefix: s.cfg.Verification.Enabled && s.cfg.PromptCaching,
 	}, RequiredKeys)
 	if err != nil {
+		obs.Finish(err)
 		s.logger.Error("llm failed", "incident", inc.ID, "err", err)
 		if s.auditor != nil {
 			_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.analysis_failed", map[string]any{
@@ -739,6 +752,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		memory:     memory,
 		system:     system,
 		user:       userPrompt,
+		health:     obs,
 	}, nil
 }
 
@@ -955,12 +969,14 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 
 	// Call 2: the byte-identical call-1 prefix + the draft + the computed round +
 	// the (moved) memory-verdict request. On any failure the draft stands.
+	obs := s.cfg.Health.Begin(llmhealth.CapabilityVerificationRejudge, inc.ID)
 	comp, err := s.llm.Complete(ctx, ar.system, llm.Prompt{
 		Prefix:      ar.user,
 		Suffix:      callTwoContinuation(ar.raw, round, ar.memory),
 		CachePrefix: s.cfg.PromptCaching,
 	}, RequiredKeys)
 	if err != nil {
+		obs.Finish(err)
 		s.logger.Warn("acutetriage: verification re-judge failed; draft stands", "incident", inc.ID, "err", err)
 		g := governingOf(ar.memory)
 		if g != nil && g.Steers {
@@ -968,7 +984,7 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 				"finding ships capped and the card says the check did not complete (check your LLM setup)",
 				"incident", inc.ID, "verdict_version", g.Version, "err", err)
 		}
-		return s.degradedDraft(ctx, inc.ID, ar.raw, round, resp, g)
+		return s.degradedDraft(ctx, inc.ID, ar.raw, round, resp, g, DegradationLLMCallFailed)
 	}
 	// Cache-engagement probe: call 2 always marks the shared prefix, so a zero
 	// cache read means the prefix is below the model's cacheable floor (benign,
@@ -982,6 +998,7 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 	var resp2 llmResponse
 	if err := json.Unmarshal(comp.Raw, &resp2); err != nil {
 		// A malformed re-judge must not fail a triage that has a valid draft.
+		obs.Finish(fmt.Errorf("%w: %v", llmhealth.ErrResponseMalformed, err))
 		s.logger.Warn("acutetriage: verification re-judge returned malformed JSON; draft stands", "incident", inc.ID, "err", err)
 		g := governingOf(ar.memory)
 		if g != nil && g.Steers {
@@ -989,8 +1006,9 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 				"finding ships capped and the card says the check did not complete (check your LLM setup)",
 				"incident", inc.ID, "verdict_version", g.Version, "err", err)
 		}
-		return s.degradedDraft(ctx, inc.ID, ar.raw, round, resp, g)
+		return s.degradedDraft(ctx, inc.ID, ar.raw, round, resp, g, DegradationLLMResponseInvalid)
 	}
+	obs.Finish(nil)
 	clampConfidence(&resp2.Confidence)
 
 	// Clamp rail (R15): a re-judge that leans on unfetched evidence must not raise
@@ -1048,7 +1066,11 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 	}
 	s.auditVerificationExecuted(ctx, inc.ID, outcome, round, clamped)
 
-	return comp.Raw, resp2, &VerificationEnrichment{Outcome: outcome, Rounds: []VerificationRound{*round}, OperatorRuling: ruling}
+	degradationReason := ""
+	if outcome == verifyOutcomeDegraded {
+		degradationReason = DegradationVerificationSourceUnavailable
+	}
+	return comp.Raw, resp2, &VerificationEnrichment{Outcome: outcome, Rounds: []VerificationRound{*round}, OperatorRuling: ruling, DegradationReason: degradationReason}
 }
 
 // degradedDraft is the shared call-2-failure return: the draft ships as final —
@@ -1061,7 +1083,7 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 // means the correction went unruled, recorded as such rather than silently
 // dropped (the caller already logged the ERROR naming the failure).
 func (s *Skill) degradedDraft(ctx context.Context, incidentID string, draftRaw json.RawMessage,
-	round *VerificationRound, draft llmResponse, g *GoverningVerdict) (json.RawMessage, llmResponse, *VerificationEnrichment) {
+	round *VerificationRound, draft llmResponse, g *GoverningVerdict, reason string) (json.RawMessage, llmResponse, *VerificationEnrichment) {
 	draft.MemoryVerdict = ""
 	var ruling *OperatorRulingRecord
 	if g != nil && g.Steers {
@@ -1069,7 +1091,7 @@ func (s *Skill) degradedDraft(ctx context.Context, incidentID string, draftRaw j
 			VerdictID: g.VerdictID, VerdictVersion: g.Version, VerdictDate: g.Date}
 	}
 	s.auditVerificationExecuted(ctx, incidentID, verifyOutcomeDegraded, round, false)
-	return draftRaw, draft, &VerificationEnrichment{Outcome: verifyOutcomeDegraded, Rounds: []VerificationRound{*round}, OperatorRuling: ruling}
+	return draftRaw, draft, &VerificationEnrichment{Outcome: verifyOutcomeDegraded, Rounds: []VerificationRound{*round}, OperatorRuling: ruling, DegradationReason: reason}
 }
 
 // auditVerificationPlanned records the plan before it runs: the floor/operator/

@@ -202,7 +202,7 @@ func (t *Tracker) finish(cap Capability, subject string, err error) {
 		t.rec.LastRealSuccessAt = &successAt
 		delete(t.contentSubjects, cap)
 		if cap == CapabilityTriageDraft || cap == CapabilityVerificationRejudge {
-			t.markCapabilityHealthy(CapabilityProbe, now)
+			t.clearCapabilityIfPresent(CapabilityProbe, now)
 		}
 	case ClassDependency:
 		t.markCapabilityUnhealthy(cap, reason, SafeDetail(err), now)
@@ -336,6 +336,18 @@ func (t *Tracker) markCapabilityHealthy(cap Capability, now time.Time) {
 	if wasUnhealthy {
 		t.logger.Info("llm health: capability recovered", "capability", string(cap))
 	}
+}
+
+// clearCapabilityIfPresent clears an existing unhealthy record for cap
+// without creating one — used when a stronger signal (a real primary-client
+// success) proves reachability the probe capability itself was never asked
+// about. A capability that has genuinely never been observed stays absent
+// from Snapshot rather than gaining a synthetic healthy entry.
+func (t *Tracker) clearCapabilityIfPresent(cap Capability, now time.Time) {
+	if _, ok := t.caps[cap]; !ok {
+		return
+	}
+	t.markCapabilityHealthy(cap, now)
 }
 
 func (t *Tracker) markCapabilityUnhealthy(cap Capability, reason Reason, detail string, now time.Time) {
