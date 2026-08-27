@@ -5,6 +5,7 @@ package correlator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/notify"
@@ -198,4 +199,103 @@ func (c *Correlator) dispatchDueTriage(ctx context.Context, now time.Time) {
 	for _, d := range due {
 		c.dispatchTriage(ctx, d.IncidentID)
 	}
+}
+
+// recoverTriageState reconciles the durable triage schedule before the loop
+// starts (ADR-0045): every interrupted in_flight row is resolved first (the
+// attempt counts), every legacy "ready" row with no triage row is seeded as
+// pending, and finally the one-hour startup horizon is applied to every
+// pending/backoff row so a long backlog cannot become a boot-time LLM burst.
+// It never calls the sink; due work runs on the first tick after Start.
+func (c *Correlator) recoverTriageState(ctx context.Context, now time.Time) error {
+	interrupted, err := c.st.ListInterruptedIncidentTriage(ctx)
+	if err != nil {
+		return fmt.Errorf("list interrupted: %w", err)
+	}
+	for _, active := range interrupted {
+		c.recoverInterruptedAttempt(ctx, active)
+	}
+
+	legacy, err := c.st.ListLegacyReadyIncidents(ctx)
+	if err != nil {
+		return fmt.Errorf("list legacy ready: %w", err)
+	}
+	for _, inc := range legacy {
+		if err := c.st.SeedIncidentTriage(ctx, inc.ID, inc.ReadyAt); err != nil {
+			c.logger.Error("correlator: seed legacy triage", "incident_id", inc.ID, "err", err)
+		}
+	}
+	if len(legacy) > 0 {
+		c.logger.Warn("correlator: startup recovery: legacy ready incidents found", "count", len(legacy))
+	}
+	for _, inc := range legacy {
+		c.applyStartupHorizon(ctx, inc, inc.ReadyAt, 0, now)
+	}
+
+	due, err := c.st.ListDueIncidentTriage(ctx, now)
+	if err != nil {
+		return fmt.Errorf("list due: %w", err)
+	}
+	for _, active := range due {
+		inc, err := c.st.GetIncidentByID(ctx, active.IncidentID)
+		if err != nil || inc == nil {
+			c.logger.Error("correlator: load incident for startup horizon", "incident_id", active.IncidentID, "err", err)
+			continue
+		}
+		c.applyStartupHorizon(ctx, *inc, active.NextAt, active.Attempts, now)
+	}
+	return nil
+}
+
+// recoverInterruptedAttempt resolves one triage row a restart found still
+// in_flight — a process crash mid-call. The attempt counts (ADR-0045): a row
+// already at the attempt ceiling goes straight to exhausted; otherwise it
+// moves to backoff with next_at computed from when the interrupted attempt
+// itself began, so it does not get a free extra delay from the restart time.
+func (c *Correlator) recoverInterruptedAttempt(ctx context.Context, active store.IncidentTriage) {
+	inc, err := c.st.GetIncidentByID(ctx, active.IncidentID)
+	if err != nil || inc == nil {
+		c.logger.Error("correlator: load incident for interrupted triage", "incident_id", active.IncidentID, "err", err)
+		return
+	}
+	const code = "process_interrupted"
+	const detail = "attempt interrupted before completion"
+	if active.Attempts >= len(triageRetryDelays)+1 {
+		c.exhaustTriage(ctx, *inc, active.Attempts, code, detail, "interrupted")
+		return
+	}
+	next := active.StartedAt.Add(triageRetryDelays[active.Attempts-1])
+	if err := c.st.RecoverInterruptedIncidentTriage(ctx, active.IncidentID, next, code, detail); err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			c.logger.Error("correlator: recover interrupted triage", "incident_id", active.IncidentID, "err", err)
+		}
+		return
+	}
+	c.logger.Warn("correlator: startup recovery: interrupted triage attempt recovered to backoff",
+		"incident_id", active.IncidentID, "group_key", inc.GroupKey, "attempts", active.Attempts, "next_at", next)
+	if c.auditor != nil {
+		if err := c.auditor.Append(ctx, "correlator", "incident.triage_attempt", map[string]any{
+			"incident_id": active.IncidentID,
+			"group_key":   inc.GroupKey,
+			"phase":       "backoff",
+			"attempts":    active.Attempts,
+			"next_at":     next,
+			"reason":      "interrupted",
+		}); err != nil {
+			c.logger.Warn("correlator: audit interrupted triage recovery", "incident_id", active.IncidentID, "err", err)
+		}
+	}
+}
+
+// applyStartupHorizon closes out inc if due is more than startupRetryWindow
+// before now (ADR-0045) — the one-hour horizon that already governed legacy
+// "ready" rows, applied here to every unjudged row regardless of how it got
+// there. A condition that is still real re-fires and opens a fresh incident,
+// so nothing live is lost.
+func (c *Correlator) applyStartupHorizon(ctx context.Context, inc store.Incident, due time.Time, attempts int, now time.Time) {
+	if now.Sub(due) <= startupRetryWindow {
+		return
+	}
+	c.exhaustTriage(ctx, inc, attempts, "startup_retry_window_expired",
+		"due time exceeded the one-hour startup horizon", "startup_retry_window_expired")
 }

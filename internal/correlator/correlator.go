@@ -275,14 +275,19 @@ func (c *Correlator) loop(ctx context.Context) {
 }
 
 // recover re-arms timers for any incidents that were "collecting" when the
-// process last exited. It does NOT fire them immediately — the tick loop
-// will catch overdue ones on the next tick.
+// process last exited, and reconciles the durable triage schedule (interrupted
+// in_flight rows, legacy ready rows with no triage row, and the one-hour
+// startup horizon — see recoverTriageState). It does NOT fire anything
+// immediately — the tick loop will catch due work on the next tick.
 func (c *Correlator) recover(ctx context.Context) error {
 	incs, err := listCollectingIncidents(ctx, c.st)
 	if err != nil {
 		return fmt.Errorf("correlator: startup recovery: %w", err)
 	}
 	c.logger.Info("correlator: startup recovery", "collecting_incidents", len(incs))
+	if err := c.recoverTriageState(ctx, c.now().UTC()); err != nil {
+		return fmt.Errorf("correlator: startup recovery: %w", err)
+	}
 	return nil
 }
 

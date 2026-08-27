@@ -265,13 +265,17 @@ func (s *Store) ExhaustIncidentTriage(ctx context.Context, incidentID, code, det
 	return *active, nil
 }
 
-// ListDueIncidentTriage returns every triage row in phase backoff whose
-// next_at is at or before now, ordered soonest-due first.
+// ListDueIncidentTriage returns every triage row in phase pending or backoff
+// whose next_at is at or before now, ordered soonest-due first. A "pending"
+// row normally never sits at rest between ticks (a freshly ready incident is
+// seeded and dispatched atomically within the same flush), but startup
+// recovery seeds legacy rows as pending without dispatching them immediately
+// — this is what makes them due on the first tick after Start.
 func (s *Store) ListDueIncidentTriage(ctx context.Context, now time.Time) ([]IncidentTriage, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT incident_id, phase, attempts, next_at, started_at, COALESCE(last_error_code,''), COALESCE(last_error_detail,'')
 		FROM incident_triage
-		WHERE phase = 'backoff' AND next_at <= ?
+		WHERE phase IN ('pending','backoff') AND next_at <= ?
 		ORDER BY next_at ASC
 	`, now.UTC().Format(time.RFC3339Nano))
 	if err != nil {

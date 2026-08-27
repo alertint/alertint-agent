@@ -80,6 +80,64 @@ func TestIncidentTriageDetailIsCapped(t *testing.T) {
 	}
 }
 
+func TestRecoverInterruptedIncidentTriage(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	incID := readyIncident(t, st, "service=recover")
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+
+	if err := st.SeedIncidentTriage(ctx, incID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.BeginIncidentTriage(ctx, incID, now); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a crash: nothing resolves the in-flight attempt.
+
+	next := now.Add(2 * time.Minute)
+	if err := st.RecoverInterruptedIncidentTriage(ctx, incID, next, "process_interrupted", "attempt interrupted before completion"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetIncidentByID(ctx, incID)
+	if err != nil || got == nil || got.Status != "ready" {
+		t.Fatalf("status after recover = %+v, %v, want ready", got, err)
+	}
+	_, tri, err := st.GetBackoffIncidentByGroupKey(ctx, "service=recover")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tri.Attempts != 1 || !tri.NextAt.Equal(next) {
+		t.Fatalf("recovered triage = %+v, want attempts=1 next_at=%v", tri, next)
+	}
+
+	// A row not currently in_flight (e.g. already recovered, or never begun)
+	// must not be touched a second time.
+	if err := st.RecoverInterruptedIncidentTriage(ctx, incID, next.Add(time.Minute), "process_interrupted", "x"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second recover on a non-in_flight row = %v, want ErrNotFound", err)
+	}
+}
+
+func TestListLegacyReadyIncidents(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	legacyID := readyIncident(t, st, "service=legacy")
+
+	durableID := readyIncident(t, st, "service=durable")
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	if err := st.SeedIncidentTriage(ctx, durableID, now); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.ListLegacyReadyIncidents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != legacyID {
+		t.Fatalf("legacy ready incidents = %+v, want exactly [%s] (durable row has its own triage row)", got, legacyID)
+	}
+}
+
 // TestIncidentTriageSurvivesRestart proves attempts and next_at persist across
 // Close + Open on a temp-file database — :memory: cannot prove durability.
 func TestIncidentTriageSurvivesRestart(t *testing.T) {

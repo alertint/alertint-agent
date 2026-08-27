@@ -197,6 +197,24 @@ func triageAttempts(t *testing.T, st *store.Store, incidentID string) int {
 	return n
 }
 
+// triageNextAt reads the durable next-due time for incidentID.
+func triageNextAt(t *testing.T, st *store.Store, incidentID string) time.Time {
+	t.Helper()
+	var s sql.NullString
+	if err := st.DB().QueryRowContext(context.Background(),
+		`SELECT next_at FROM incident_triage WHERE incident_id = ?`, incidentID).Scan(&s); err != nil {
+		t.Fatalf("triage next_at: %v", err)
+	}
+	if !s.Valid {
+		return time.Time{}
+	}
+	got, err := time.Parse(time.RFC3339Nano, s.String)
+	if err != nil {
+		t.Fatalf("parse next_at: %v", err)
+	}
+	return got
+}
+
 // TestTriageRetry_PendingThroughBackoffThenSuccess pins the durable phase
 // sequence across a failed dispatch followed by a successful retry:
 // pending/0 -> in_flight/1 -> backoff/1, then backoff/1 -> in_flight/2 ->
@@ -393,4 +411,306 @@ func TestTriageExhaustedWriteIsRetriedUntilItSucceeds(t *testing.T) {
 	h.flush()
 	h.wantCalls(attempts, "after terminal write")
 	h.wantExhaustEvents(1, "after terminal write")
+}
+
+// --------------------------------------------------------------------------
+// Startup recovery (Task 3): interrupted and legacy triage state, and the
+// one-hour startup horizon (ADR-0045).
+// --------------------------------------------------------------------------
+
+// TestStartupRecovery_PreservesDurableBackoff: a durable backoff row that
+// was never interrupted (the process shut down cleanly between attempts)
+// survives Recover with its attempts and next_at exactly unchanged.
+func TestStartupRecovery_PreservesDurableBackoff(t *testing.T) {
+	h := newRetryHarness(t, 1000)
+	ctx := context.Background()
+
+	h.flush()
+	h.now = h.now.Add(correlator.TriageRetryDelays[0])
+	h.flush()
+	h.wantCalls(2, "two failed attempts")
+	if got := triagePhase(t, h.st, h.inc.ID); got != "backoff" {
+		t.Fatalf("phase = %q, want backoff", got)
+	}
+	if got := triageAttempts(t, h.st, h.inc.ID); got != 2 {
+		t.Fatalf("attempts = %d, want 2", got)
+	}
+	wantNext := triageNextAt(t, h.st, h.inc.ID)
+
+	if err := h.cor.Recover(ctx); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if got := triagePhase(t, h.st, h.inc.ID); got != "backoff" {
+		t.Fatalf("phase after recover = %q, want backoff (unchanged)", got)
+	}
+	if got := triageAttempts(t, h.st, h.inc.ID); got != 2 {
+		t.Fatalf("attempts after recover = %d, want 2 (unchanged)", got)
+	}
+	if got := triageNextAt(t, h.st, h.inc.ID); !got.Equal(wantNext) {
+		t.Fatalf("next_at after recover = %v, want %v (unchanged)", got, wantNext)
+	}
+	h.wantCalls(2, "recover itself dispatches nothing")
+}
+
+// TestStartupRecovery_InterruptedAttemptBecomesBackoff covers ADR-0045: an
+// attempt interrupted mid-flight counts. The row is built directly through
+// the store's guarded transitions (Seed/Begin/Backoff/Begin again) to land
+// exactly on "processing"/in_flight/attempts=2 without ever resolving the
+// second attempt — the state a process crash mid-call would leave behind.
+func TestStartupRecovery_InterruptedAttemptBecomesBackoff(t *testing.T) {
+	h := newRetryHarness(t, 1000)
+	ctx := context.Background()
+
+	if err := h.st.MarkIncidentReady(ctx, h.inc.ID); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	if err := h.st.SeedIncidentTriage(ctx, h.inc.ID, h.now); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := h.st.BeginIncidentTriage(ctx, h.inc.ID, h.now); err != nil {
+		t.Fatalf("begin 1: %v", err)
+	}
+	if err := h.st.BackoffIncidentTriage(ctx, h.inc.ID, h.now.Add(correlator.TriageRetryDelays[0]), "timeout", "deadline exceeded"); err != nil {
+		t.Fatalf("backoff 1: %v", err)
+	}
+	startedAt := h.now.Add(correlator.TriageRetryDelays[0])
+	active, err := h.st.BeginIncidentTriage(ctx, h.inc.ID, startedAt)
+	if err != nil {
+		t.Fatalf("begin 2: %v", err)
+	}
+	if active.Attempts != 2 {
+		t.Fatalf("attempts before crash = %d, want 2", active.Attempts)
+	}
+	// Nothing resolves this attempt: simulates a crash mid-call.
+
+	h.now = startedAt
+	if err := h.cor.Recover(ctx); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+
+	if got := triagePhase(t, h.st, h.inc.ID); got != "backoff" {
+		t.Fatalf("phase after recover = %q, want backoff", got)
+	}
+	if s := h.status(); s != "ready" {
+		t.Fatalf("status after recover = %q, want ready", s)
+	}
+	wantNext := startedAt.Add(correlator.TriageRetryDelays[1]) // delay[attempts-1] = delay[1]
+	if got := triageNextAt(t, h.st, h.inc.ID); !got.Equal(wantNext) {
+		t.Fatalf("next_at after recover = %v, want %v (started_at + delay[attempts-1])", got, wantNext)
+	}
+	h.wantCalls(0, "recover itself dispatches nothing")
+}
+
+// TestStartupRecovery_InterruptedAtMaxAttemptsExhausts covers ADR-0045: an
+// Incident can reach "failed" with fewer than five completed LLM calls when
+// the fifth attempt itself is interrupted — the schedule is spent regardless.
+func TestStartupRecovery_InterruptedAtMaxAttemptsExhausts(t *testing.T) {
+	h := newRetryHarness(t, 1000)
+	ctx := context.Background()
+
+	if err := h.st.MarkIncidentReady(ctx, h.inc.ID); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	if err := h.st.SeedIncidentTriage(ctx, h.inc.ID, h.now); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	at := h.now
+	for i := 0; i < len(correlator.TriageRetryDelays); i++ {
+		if _, err := h.st.BeginIncidentTriage(ctx, h.inc.ID, at); err != nil {
+			t.Fatalf("begin %d: %v", i+1, err)
+		}
+		at = at.Add(correlator.TriageRetryDelays[i])
+		if err := h.st.BackoffIncidentTriage(ctx, h.inc.ID, at, "timeout", "deadline exceeded"); err != nil {
+			t.Fatalf("backoff %d: %v", i+1, err)
+		}
+	}
+	active, err := h.st.BeginIncidentTriage(ctx, h.inc.ID, at) // 5th attempt, in_flight
+	if err != nil {
+		t.Fatalf("begin final: %v", err)
+	}
+	if active.Attempts != 5 {
+		t.Fatalf("attempts before crash = %d, want 5", active.Attempts)
+	}
+
+	if err := h.cor.Recover(ctx); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if got := triagePhase(t, h.st, h.inc.ID); got != "exhausted" {
+		t.Fatalf("phase after recover = %q, want exhausted", got)
+	}
+	if s := h.status(); s != "failed" {
+		t.Fatalf("status after recover = %q, want failed", s)
+	}
+	h.wantCalls(0, "recover never calls the sink")
+	h.wantExhaustEvents(1, "interrupted at max attempts")
+	if ev := h.exhaust.events[0]; ev.Attempts != 5 {
+		t.Fatalf("exhaust event attempts = %d, want 5", ev.Attempts)
+	}
+}
+
+// TestStartupRecovery_LegacyReadySeedsAndDispatchesOnce: a "ready" incident
+// with no triage row (left by a pre-upgrade binary) is seeded as pending and
+// dispatched once on the first tick after Start; if that fails, it enters the
+// normal schedule.
+func TestStartupRecovery_LegacyReadySeedsAndDispatchesOnce(t *testing.T) {
+	h := newRetryHarness(t, 1000)
+	ctx := context.Background()
+	if err := h.st.MarkIncidentReady(ctx, h.inc.ID); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+
+	if err := h.cor.Recover(ctx); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if got := triagePhase(t, h.st, h.inc.ID); got != "pending" {
+		t.Fatalf("phase after recover = %q, want pending", got)
+	}
+	h.wantCalls(0, "recover itself dispatches nothing")
+
+	h.flush()
+	h.wantCalls(1, "first tick after start")
+	if s := h.status(); s != "ready" {
+		t.Fatalf("status = %q, want ready", s)
+	}
+
+	h.now = h.now.Add(correlator.TriageRetryDelays[0] - time.Second)
+	h.flush()
+	h.wantCalls(1, "before first delay")
+	h.now = h.now.Add(time.Second)
+	h.flush()
+	h.wantCalls(2, "first retry after recovered dispatch")
+}
+
+// TestStartupRecovery_LegacyReadyCleanSkipDispatchedOnce: a legitimately-ready
+// legacy incident (the skill returns nil) costs one sink call per restart and
+// nothing more.
+func TestStartupRecovery_LegacyReadyCleanSkipDispatchedOnce(t *testing.T) {
+	h := newRetryHarnessCleanSkip(t)
+	ctx := context.Background()
+	if err := h.st.MarkIncidentReady(ctx, h.inc.ID); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	if err := h.cor.Recover(ctx); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+
+	h.flush()
+	h.wantCalls(1, "first tick after start")
+	h.now = h.now.Add(24 * time.Hour)
+	h.flush()
+	h.wantCalls(1, "much later")
+	if s := h.status(); s != "ready" {
+		t.Fatalf("status = %q, want ready", s)
+	}
+	if got := triagePhase(t, h.st, h.inc.ID); got != "skipped" {
+		t.Fatalf("phase = %q, want skipped", got)
+	}
+}
+
+// TestStartupRecovery_ExpiresStaleLegacyReadyIncidents: a legacy incident
+// that has been "ready" for longer than the startup window is closed out as
+// "failed" at Start without a sink call, so an upgrade over a backlog of
+// stuck incidents does not become an LLM burst. A fresh one is still
+// re-dispatched normally.
+func TestStartupRecovery_ExpiresStaleLegacyReadyIncidents(t *testing.T) {
+	h := newRetryHarness(t, 1000)
+	ctx := context.Background()
+	if err := h.st.MarkIncidentReady(ctx, h.inc.ID); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	stale := insertCollectingIncident(t, h.st, "Stale", h.now.Add(-correlator.StartupRetryWindow-time.Minute))
+	if err := h.st.MarkIncidentReady(ctx, stale.ID); err != nil {
+		t.Fatalf("mark stale ready: %v", err)
+	}
+
+	if err := h.cor.Recover(ctx); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	got, err := h.st.GetIncidentByID(ctx, stale.ID)
+	if err != nil || got == nil {
+		t.Fatalf("get stale: %v", err)
+	}
+	if got.Status != "failed" {
+		t.Fatalf("stale incident status after start = %q, want failed", got.Status)
+	}
+	if phase := triagePhase(t, h.st, stale.ID); phase != "exhausted" {
+		t.Fatalf("stale phase = %q, want exhausted", phase)
+	}
+	h.wantCalls(0, "recover itself dispatches nothing")
+	h.wantExhaustEvents(1, "stale closure (reason startup_retry_window_expired)")
+
+	h.flush()
+	h.wantCalls(1, "first tick: only the fresh incident")
+	if h.sink.calls[0] != h.inc.ID {
+		t.Fatalf("dispatched %s, want the fresh incident %s", h.sink.calls[0], h.inc.ID)
+	}
+	h.now = h.now.Add(24 * time.Hour)
+	h.flush()
+	for _, id := range h.sink.calls {
+		if id == stale.ID {
+			t.Fatalf("stale incident %s was dispatched", stale.ID)
+		}
+	}
+	h.wantExhaustEvents(1, "still only the one exhaust event")
+}
+
+// TestStartupRecovery_DurableBackoffOverdueExpires covers R3/ADR-0045: a
+// durable backoff row (not merely legacy) whose next_at is more than the
+// startup window in the past also expires at recovery — the horizon applies
+// to every unjudged row, not only legacy ones. A backoff row overdue by less
+// than the window is left untouched and runs on the first tick.
+func TestStartupRecovery_DurableBackoffOverdueExpires(t *testing.T) {
+	h := newRetryHarness(t, 1000)
+	ctx := context.Background()
+
+	if err := h.st.MarkIncidentReady(ctx, h.inc.ID); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	if err := h.st.SeedIncidentTriage(ctx, h.inc.ID, h.now); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := h.st.BeginIncidentTriage(ctx, h.inc.ID, h.now); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	overdueNext := h.now.Add(-correlator.StartupRetryWindow - time.Minute)
+	if err := h.st.BackoffIncidentTriage(ctx, h.inc.ID, overdueNext, "timeout", "deadline exceeded"); err != nil {
+		t.Fatalf("backoff: %v", err)
+	}
+
+	fresh := insertCollectingIncident(t, h.st, "Fresh", h.now.Add(-5*time.Second))
+	if err := h.st.MarkIncidentReady(ctx, fresh.ID); err != nil {
+		t.Fatalf("mark fresh ready: %v", err)
+	}
+	if err := h.st.SeedIncidentTriage(ctx, fresh.ID, h.now); err != nil {
+		t.Fatalf("seed fresh: %v", err)
+	}
+	if _, err := h.st.BeginIncidentTriage(ctx, fresh.ID, h.now); err != nil {
+		t.Fatalf("begin fresh: %v", err)
+	}
+	// Overdue by less than the window: must survive recovery untouched.
+	recentNext := h.now.Add(-time.Minute)
+	if err := h.st.BackoffIncidentTriage(ctx, fresh.ID, recentNext, "timeout", "deadline exceeded"); err != nil {
+		t.Fatalf("backoff fresh: %v", err)
+	}
+
+	if err := h.cor.Recover(ctx); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+
+	if phase := triagePhase(t, h.st, h.inc.ID); phase != "exhausted" {
+		t.Fatalf("overdue backoff phase after recover = %q, want exhausted", phase)
+	}
+	stale, err := h.st.GetIncidentByID(ctx, h.inc.ID)
+	if err != nil || stale == nil || stale.Status != "failed" {
+		t.Fatalf("overdue backoff incident = %+v, %v, want status failed", stale, err)
+	}
+
+	if phase := triagePhase(t, h.st, fresh.ID); phase != "backoff" {
+		t.Fatalf("recent backoff phase after recover = %q, want backoff (untouched)", phase)
+	}
+	if got := triageNextAt(t, h.st, fresh.ID); !got.Equal(recentNext) {
+		t.Fatalf("recent backoff next_at after recover = %v, want %v (unchanged)", got, recentNext)
+	}
+	h.wantCalls(0, "recover itself dispatches nothing")
+	h.wantExhaustEvents(1, "only the overdue backoff row expires")
 }
