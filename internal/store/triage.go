@@ -104,12 +104,24 @@ func (s *Store) BeginIncidentTriage(ctx context.Context, incidentID string, star
 		return IncidentTriage{}, ErrNotFound
 	}
 
-	if _, err := tx.ExecContext(ctx, `
+	// The phase guard is defense-in-depth: today's only callers already
+	// guarantee phase is pending or backoff (ListDueIncidentTriage excludes
+	// every other phase), but the guard makes that invariant load-bearing at
+	// the SQL layer too, not just by caller discipline.
+	res2, err := tx.ExecContext(ctx, `
 		UPDATE incident_triage
 		SET phase = 'in_flight', attempts = attempts + 1, started_at = ?, next_at = NULL, updated_at = ?
-		WHERE incident_id = ?
-	`, startedAt.UTC().Format(time.RFC3339Nano), now, incidentID); err != nil {
+		WHERE incident_id = ? AND phase IN ('pending','backoff')
+	`, startedAt.UTC().Format(time.RFC3339Nano), now, incidentID)
+	if err != nil {
 		return IncidentTriage{}, fmt.Errorf("store: begin incident triage: update triage: %w", err)
+	}
+	n2, err := res2.RowsAffected()
+	if err != nil {
+		return IncidentTriage{}, fmt.Errorf("store: begin incident triage: triage rows: %w", err)
+	}
+	if n2 == 0 {
+		return IncidentTriage{}, ErrNotFound
 	}
 
 	active, err := scanIncidentTriage(tx.QueryRowContext(ctx, `

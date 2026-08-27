@@ -17,7 +17,8 @@ import (
 // first retry waits 30 s and the last ~32 min, so a short LLM or connector
 // outage self-heals and a long one exhausts inside the hour instead of
 // leaving the incident in "ready" forever. Five attempts in total, counting
-// the initial dispatch.
+// the initial dispatch — len(triageRetryDelays)+1 must stay in sync with the
+// attempts CHECK constraint in migrations/0011_incident_triage.sql.
 var triageRetryDelays = []time.Duration{
 	30 * time.Second,
 	2 * time.Minute,
@@ -113,7 +114,7 @@ func (c *Correlator) triageFailed(ctx context.Context, inc store.Incident, activ
 // row and notifier event fire, so both happen exactly once per incident; a
 // repeated terminal transition returns ErrNotFound and emits nothing, and any
 // other store error leaves the row `in_flight` so a later tick retries the
-// write itself (never another sink call) via retryStuckTerminalWrites.
+// write itself (never another sink call) via reconcileInFlightTriage.
 func (c *Correlator) exhaustTriage(ctx context.Context, inc store.Incident, attempts int, code, detail, reason string) {
 	updated, err := c.st.ExhaustIncidentTriage(ctx, inc.ID, code, detail)
 	if err != nil {
@@ -159,37 +160,31 @@ func (c *Correlator) exhaustTriage(ctx context.Context, inc store.Incident, atte
 	}
 }
 
-// retryStuckTerminalWrites finishes any dispatch whose terminal write
-// (backoff or exhaustion) did not persist on an earlier tick — e.g. a
-// transient store failure right after the sink call resolved. Such a row is
-// left `in_flight` deliberately: this is the same durable signal a restart
-// recovers from, so retrying it every tick is safe, never re-invokes the
-// sink, and only ever finishes the transition that failed to write. Only the
-// already-exhausted case is retried here; a sub-max in_flight row left by a
-// genuine process interruption is reconciled at startup.
-func (c *Correlator) retryStuckTerminalWrites(ctx context.Context) {
+// reconcileInFlightTriage resolves every triage row currently `in_flight`
+// without ever re-invoking the sink. A row observed at rest between ticks
+// cannot be a dispatch actively in progress — the Correlator loop is
+// synchronous, so dispatchTriage always runs a row to completion (or fails a
+// write and returns) before control comes back here — so any row found here
+// is either a genuine process-crash interruption or a terminal write that
+// itself failed to persist on an earlier tick. Both are indistinguishable
+// from the store's point of view and reconciled identically (ADR-0045): the
+// interrupted attempt counts. Called every tick (so a stuck write recovers
+// as soon as the store does, not only at restart) and once at startup.
+func (c *Correlator) reconcileInFlightTriage(ctx context.Context) {
 	stuck, err := c.st.ListInterruptedIncidentTriage(ctx)
 	if err != nil {
 		c.logger.Error("correlator: list interrupted triage", "err", err)
 		return
 	}
 	for _, active := range stuck {
-		if active.Attempts < len(triageRetryDelays)+1 {
-			continue
-		}
-		inc, err := c.st.GetIncidentByID(ctx, active.IncidentID)
-		if err != nil || inc == nil {
-			c.logger.Error("correlator: load incident for stuck triage write", "incident_id", active.IncidentID, "err", err)
-			continue
-		}
-		c.exhaustTriage(ctx, *inc, active.Attempts, active.LastErrorCode, active.LastErrorDetail, "max_attempts")
+		c.recoverInterruptedAttempt(ctx, active)
 	}
 }
 
-// dispatchDueTriage reconciles any stuck terminal write, then dispatches
+// dispatchDueTriage reconciles any stuck in_flight row, then dispatches
 // every incident whose durable backoff is due.
 func (c *Correlator) dispatchDueTriage(ctx context.Context, now time.Time) {
-	c.retryStuckTerminalWrites(ctx)
+	c.reconcileInFlightTriage(ctx)
 
 	due, err := c.st.ListDueIncidentTriage(ctx, now)
 	if err != nil {
@@ -208,13 +203,7 @@ func (c *Correlator) dispatchDueTriage(ctx context.Context, now time.Time) {
 // pending/backoff row so a long backlog cannot become a boot-time LLM burst.
 // It never calls the sink; due work runs on the first tick after Start.
 func (c *Correlator) recoverTriageState(ctx context.Context, now time.Time) error {
-	interrupted, err := c.st.ListInterruptedIncidentTriage(ctx)
-	if err != nil {
-		return fmt.Errorf("list interrupted: %w", err)
-	}
-	for _, active := range interrupted {
-		c.recoverInterruptedAttempt(ctx, active)
-	}
+	c.reconcileInFlightTriage(ctx)
 
 	legacy, err := c.st.ListLegacyReadyIncidents(ctx)
 	if err != nil {
@@ -247,15 +236,32 @@ func (c *Correlator) recoverTriageState(ctx context.Context, now time.Time) erro
 	return nil
 }
 
-// recoverInterruptedAttempt resolves one triage row a restart found still
-// in_flight — a process crash mid-call. The attempt counts (ADR-0045): a row
-// already at the attempt ceiling goes straight to exhausted; otherwise it
-// moves to backoff with next_at computed from when the interrupted attempt
-// itself began, so it does not get a free extra delay from the restart time.
+// recoverInterruptedAttempt resolves one triage row found still in_flight —
+// a process crash mid-call, or a terminal write that itself failed to
+// persist on an earlier tick. The attempt counts (ADR-0045): a row already
+// at the attempt ceiling goes straight to exhausted; otherwise it moves to
+// backoff with next_at computed from when the interrupted attempt itself
+// began, so it does not get a free extra delay from the restart/retry time.
+//
+// If the Incident's own status has already moved past "processing" — the
+// triage skill's own persist (SaveIncidentOutput) succeeded, but the
+// dispatch's own CompleteIncidentTriage cleanup failed to write, or lost a
+// race with a crash — the row is stale bookkeeping for an Incident that is
+// no longer unjudged (CONTEXT.md: Triage schedule) and is deleted outright
+// rather than reconciled into a schedule that would never be reached again.
 func (c *Correlator) recoverInterruptedAttempt(ctx context.Context, active store.IncidentTriage) {
 	inc, err := c.st.GetIncidentByID(ctx, active.IncidentID)
 	if err != nil || inc == nil {
 		c.logger.Error("correlator: load incident for interrupted triage", "incident_id", active.IncidentID, "err", err)
+		return
+	}
+	if inc.Status != "processing" {
+		if err := c.st.CompleteIncidentTriage(ctx, active.IncidentID); err != nil && !errors.Is(err, store.ErrNotFound) {
+			c.logger.Error("correlator: clear stale in-flight triage row", "incident_id", active.IncidentID, "err", err)
+			return
+		}
+		c.logger.Warn("correlator: cleared stale in-flight triage row for an incident already judged",
+			"incident_id", active.IncidentID, "group_key", inc.GroupKey, "status", inc.Status)
 		return
 	}
 	const code = "process_interrupted"

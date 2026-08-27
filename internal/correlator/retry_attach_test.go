@@ -69,6 +69,10 @@ func seedTriagePhase(t *testing.T, st *store.Store, phase store.TriagePhase, mem
 		if _, err := st.ExhaustIncidentTriage(ctx, inc.ID, "max_attempts", "exhausted"); err != nil {
 			t.Fatalf("exhaust: %v", err)
 		}
+	case store.TriagePending:
+		t.Fatalf("unreachable: pending is handled above")
+	default:
+		t.Fatalf("seedTriagePhase: unsupported phase %q", phase)
 	}
 	return inc.ID, member
 }
@@ -225,6 +229,45 @@ func TestMaybeAttachRetryingIncident_FailSafeOnLookupError(t *testing.T) {
 	if err != nil || handled {
 		t.Fatalf("maybeAttachRetryingIncident on a store error = (%v, %v), want (false, nil) — fail-safe", handled, err)
 	}
+}
+
+// TestMaybeAttachRetryingIncident_DrillParityBothDirections covers R4/ADR-0013:
+// Drill parity blocks attachment in both directions — a drill re-fire never
+// joins a real retrying incident, and a real re-fire never joins a Drill one.
+func TestMaybeAttachRetryingIncident_DrillParityBothDirections(t *testing.T) {
+	t.Run("drill incoming, real candidate", func(t *testing.T) {
+		st := openStore(t)
+		c, _ := newCorrelatorFor(t, st)
+		incID, _ := seedTriagePhase(t, st, store.TriageBackoff, false)
+		incoming := firingAlert("fp-drill", "DiskFull", "warning", time.Now().UTC(), true)
+		if _, err := st.UpsertAlertByFingerprint(context.Background(), incoming); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+		handled, err := c.maybeAttachRetryingIncident(context.Background(), incoming, gkAPI)
+		if err != nil || handled {
+			t.Fatalf("drill incoming vs real candidate = (%v, %v), want (false, nil)", handled, err)
+		}
+		if got := memberCount(t, st, incID); got != 1 {
+			t.Errorf("members = %d, want 1 (no cross-drill attach)", got)
+		}
+	})
+
+	t.Run("real incoming, drill candidate", func(t *testing.T) {
+		st := openStore(t)
+		c, _ := newCorrelatorFor(t, st)
+		incID, _ := seedTriagePhase(t, st, store.TriageBackoff, true)
+		incoming := firingAlert("fp-real", "DiskFull", "warning", time.Now().UTC(), false)
+		if _, err := st.UpsertAlertByFingerprint(context.Background(), incoming); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+		handled, err := c.maybeAttachRetryingIncident(context.Background(), incoming, gkAPI)
+		if err != nil || handled {
+			t.Fatalf("real incoming vs drill candidate = (%v, %v), want (false, nil)", handled, err)
+		}
+		if got := memberCount(t, st, incID); got != 1 {
+			t.Errorf("members = %d, want 1 (no cross-drill attach)", got)
+		}
+	})
 }
 
 // TestHandleAlert_RetryAttachPrecedesRecurrenceCollapse proves the ordering

@@ -9,6 +9,8 @@
 CREATE TABLE incident_triage (
     incident_id       TEXT    NOT NULL PRIMARY KEY,
     phase             TEXT    NOT NULL CHECK (phase IN ('pending','in_flight','backoff','skipped','exhausted')),
+    -- 5 = len(triageRetryDelays)+1 in internal/correlator/triage_retry.go —
+    -- keep both in sync if the retry schedule ever changes attempt count.
     attempts          INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0 AND attempts <= 5),
     next_at           TEXT,
     started_at        TEXT,

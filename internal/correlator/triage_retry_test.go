@@ -719,3 +719,101 @@ func TestStartupRecovery_DurableBackoffOverdueExpires(t *testing.T) {
 	h.wantCalls(0, "recover itself dispatches nothing")
 	h.wantExhaustEvents(1, "only the overdue backoff row expires")
 }
+
+// --------------------------------------------------------------------------
+// Code-review follow-ups: in-flight reconciliation runs every tick (not only
+// at startup, and not only once a row reaches the attempt ceiling), and a
+// stale in_flight row left by a successful-but-uncleaned dispatch is deleted
+// rather than orphaned forever.
+// --------------------------------------------------------------------------
+
+// TestTriageBackoffWriteIsRetriedUntilItSucceeds: a terminal write that
+// fails below the attempt ceiling (not just at it) is retried on the very
+// next tick without another sink call. Before this fix, mid-run
+// reconciliation only handled a row already at max attempts.
+func TestTriageBackoffWriteIsRetriedUntilItSucceeds(t *testing.T) {
+	h := newRetryHarness(t, 1000)
+	ctx := context.Background()
+
+	h.flush()
+	h.wantCalls(1, "initial dispatch")
+	if got := triagePhase(t, h.st, h.inc.ID); got != "backoff" {
+		t.Fatalf("phase = %q, want backoff", got)
+	}
+
+	// Once the second sink call has run (Begin already durably succeeded,
+	// attempts=2), make the database read-only so only that attempt's
+	// terminal backoff write fails.
+	h.sink.onCall = func() {
+		if len(h.sink.calls) == 1 { // about to make the 2nd call
+			if _, err := h.st.DB().ExecContext(ctx, "PRAGMA query_only = 1"); err != nil {
+				t.Fatalf("query_only on: %v", err)
+			}
+		}
+	}
+	h.now = h.now.Add(correlator.TriageRetryDelays[0])
+	h.flush()
+	h.wantCalls(2, "second attempt")
+	if got := triagePhase(t, h.st, h.inc.ID); got != "in_flight" {
+		t.Fatalf("phase with failing backoff write = %q, want in_flight", got)
+	}
+	if got := triageAttempts(t, h.st, h.inc.ID); got != 2 {
+		t.Fatalf("attempts = %d, want 2", got)
+	}
+
+	if _, err := h.st.DB().ExecContext(ctx, "PRAGMA query_only = 0"); err != nil {
+		t.Fatalf("query_only off: %v", err)
+	}
+	// The store recovered; the very next tick reconciles the stuck write
+	// without dispatching another sink call.
+	h.now = h.now.Add(time.Second)
+	h.flush()
+	h.wantCalls(2, "reconciled without another sink call")
+	if got := triagePhase(t, h.st, h.inc.ID); got != "backoff" {
+		t.Fatalf("phase after reconciliation = %q, want backoff", got)
+	}
+	if got := triageAttempts(t, h.st, h.inc.ID); got != 2 {
+		t.Fatalf("attempts after reconciliation = %d, want 2 (unchanged)", got)
+	}
+}
+
+// TestStartupRecovery_StaleInFlightRowAfterSuccessIsCleared: if the triage
+// skill's own persist (SaveIncidentOutput, a separate transaction) succeeds
+// but the dispatch's own cleanup (CompleteIncidentTriage) never runs — a
+// crash, or a transient store error right after — the leftover in_flight row
+// is deleted rather than orphaned: it belongs to an Incident that is no
+// longer unjudged, so reconciling it into a schedule would never be reached
+// again.
+func TestStartupRecovery_StaleInFlightRowAfterSuccessIsCleared(t *testing.T) {
+	h := newRetryHarness(t, 1000)
+	ctx := context.Background()
+
+	if err := h.st.MarkIncidentReady(ctx, h.inc.ID); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	if err := h.st.SeedIncidentTriage(ctx, h.inc.ID, h.now); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := h.st.BeginIncidentTriage(ctx, h.inc.ID, h.now); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := h.st.SaveIncidentOutput(ctx, h.inc.ID, `{"ok":true}`, "n", "i", 0.5, ""); err != nil {
+		t.Fatalf("save output: %v", err)
+	}
+	if got := triagePhase(t, h.st, h.inc.ID); got != "in_flight" {
+		t.Fatalf("phase before reconciliation = %q, want in_flight (unreconciled)", got)
+	}
+
+	if err := h.cor.Recover(ctx); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+
+	if got := triagePhase(t, h.st, h.inc.ID); got != "" {
+		t.Fatalf("phase after reconciliation = %q, want absent (deleted, not orphaned)", got)
+	}
+	inc, err := h.st.GetIncidentByID(ctx, h.inc.ID)
+	if err != nil || inc == nil || inc.Status != "analyzed" {
+		t.Fatalf("incident = %+v, %v, want status analyzed (untouched)", inc, err)
+	}
+	h.wantCalls(0, "recover never calls the sink")
+}

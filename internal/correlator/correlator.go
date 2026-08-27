@@ -41,7 +41,11 @@ import (
 )
 
 // IncidentSink receives incidents that have exited the collecting window
-// and are ready for further processing.
+// and are ready for further processing. The Incident passed to
+// OnIncidentReady carries Status "processing", not "ready": the transition
+// to "processing" is a real durable lease taken before the sink is called
+// (R1), not a display value, so an implementation must not branch on
+// Status == "ready" here.
 type IncidentSink interface {
 	OnIncidentReady(ctx context.Context, inc store.Incident) error
 }
