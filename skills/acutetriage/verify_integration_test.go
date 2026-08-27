@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1600,5 +1601,300 @@ func TestVerification_ZabbixOnlyInstall_ClearsCaveat(t *testing.T) {
 	// configured on this install.
 	if strings.Contains(scripted.prompts[0], `"kind":"promql"`) {
 		t.Errorf("call-1 prompt must not offer the promql kind on a Zabbix-only install:\n%s", scripted.prompts[0])
+	}
+}
+
+// --------------------------------------------------------------------------
+// One bounded batch repair of the model's own invalid PromQL (issue #62)
+// --------------------------------------------------------------------------
+
+// issue62Invalid is the shape that started this: a valid-looking aggregation
+// the Prometheus parser rejects outright (`by` may only follow an aggregator).
+// Before repair it was sent to Prometheus, rejected there, and the round
+// degraded on a query the model could have fixed in one line.
+const issue62Invalid = `increase(metric_name[1h]) by (type)`
+
+// issue62Repaired is the same query, syntax-only: same metric, same window,
+// same grouping — so promclient.ValidateSyntaxRepair accepts it.
+const issue62Repaired = `sum by (type) (increase(metric_name[1h]))`
+
+// repairResp builds the repair call's reply envelope: one replacement for the
+// query at index idx.
+func repairResp(idx int, expr string) json.RawMessage {
+	return json.RawMessage(fmt.Sprintf(`{"queries":[{"index":%d,"expr":%q}]}`, idx, expr))
+}
+
+// promRecorder wires a Prometheus that answers everything healthy and records
+// every expression it was actually asked to run.
+func promRecorder(t *testing.T) (*promclient.Client, func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var seen []string
+	client := promServer(t, func(q string) (int, string) {
+		mu.Lock()
+		seen = append(seen, q)
+		mu.Unlock()
+		return 200, vectorValue3
+	})
+	return client, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), seen...)
+	}
+}
+
+// auditPayload returns the single audit payload of the given kind.
+func auditPayload(t *testing.T, st *store.Store, kind string) string {
+	t.Helper()
+	var payload string
+	if err := st.DB().QueryRowContext(context.Background(),
+		`SELECT payload_json FROM audit_log WHERE kind = ?`, kind).Scan(&payload); err != nil {
+		t.Fatalf("query %s audit: %v", kind, err)
+	}
+	return payload
+}
+
+// modelQueryOf returns the round's single model-sourced promql query.
+func modelQueryOf(t *testing.T, round acutetriage.VerificationRound) acutetriage.VerificationQuery {
+	t.Helper()
+	for _, q := range round.Queries {
+		if q.Source == "model" && q.Kind == "promql" {
+			return q
+		}
+	}
+	t.Fatalf("round has no model-sourced promql query: %+v", round.Queries)
+	return acutetriage.VerificationQuery{}
+}
+
+// TestVerificationRepairsInvalidModelQuery is the acceptance test for issue
+// #62: a draft proposing an unparseable PromQL query costs exactly ONE extra
+// LLM call (draft → repair → re-judge), capped at 512 output tokens, and the
+// query that reaches Prometheus is the CORRECTED one — the invalid expression
+// never leaves the process.
+func TestVerificationRepairsInvalidModelQuery(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	auditor := audit.New(st.DB())
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-repair", map[string]string{"alertname": "DiskFull", "host": "web1"})
+
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "draft", "disk pressure on web1", 0.8, []map[string]any{
+			{"kind": "promql", "expr": issue62Invalid, "why": "would refute"},
+		})},
+		{raw: repairResp(0, issue62Repaired)},
+		{raw: callTwoResp(t, "draft", "disk pressure on web1", 0.8, "")},
+	}}
+
+	prom, sent := promRecorder(t)
+	skill := acutetriage.New(verifyConfig(prom), st, scripted, auditor, nil, nil)
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if scripted.calls != 3 {
+		t.Fatalf("calls = %d, want draft + one repair + re-judge", scripted.calls)
+	}
+	if scripted.records[1].MaxOutputTokens != 512 {
+		t.Fatalf("repair cap = %d, want 512", scripted.records[1].MaxOutputTokens)
+	}
+	// Only the repair call is capped; the draft and re-judge keep the
+	// operator's configured ceiling.
+	if scripted.records[0].MaxOutputTokens != 0 || scripted.records[2].MaxOutputTokens != 0 {
+		t.Errorf("only the repair call may lower the output ceiling: %d / %d",
+			scripted.records[0].MaxOutputTokens, scripted.records[2].MaxOutputTokens)
+	}
+	if !strings.Contains(scripted.records[1].Prefix, issue62Invalid) {
+		t.Errorf("repair call did not carry the invalid expression:\n%s", scripted.records[1].Prefix)
+	}
+
+	receivedQueries := sent()
+	for _, sent := range receivedQueries {
+		if sent == issue62Invalid {
+			t.Fatalf("invalid query reached Prometheus: %q", sent)
+		}
+	}
+	corrected := 0
+	for _, sent := range receivedQueries {
+		if sent == issue62Repaired {
+			corrected++
+		}
+	}
+	if corrected != 1 {
+		t.Fatalf("corrected query ran %d times, want exactly 1: %q", corrected, receivedQueries)
+	}
+
+	f := readFinding(t, st, inc.ID)
+	ver := verificationOf(t, f.enrichment)
+	if ver == nil || len(ver.Rounds) != 1 {
+		t.Fatalf("expected one verification round, got %+v", ver)
+	}
+	q := modelQueryOf(t, ver.Rounds[0])
+	if q.Expr != issue62Repaired {
+		t.Errorf("persisted expr = %q, want the repaired one", q.Expr)
+	}
+	if q.Outcome != acutetriage.OutcomeFetched && q.Outcome != acutetriage.OutcomeEmpty {
+		t.Errorf("repaired query outcome = %q, want fetched/empty (it actually ran)", q.Outcome)
+	}
+	if q.Why != "would refute" {
+		t.Errorf("repair rewrote the model's stated intent: %q", q.Why)
+	}
+
+	if n := auditCount(t, st, "incident.verification_repair"); n != 1 {
+		t.Fatalf("verification_repair audit rows = %d, want 1", n)
+	}
+	payload := auditPayload(t, st, "incident.verification_repair")
+	var repair struct {
+		Attempted          int `json:"attempted"`
+		Repaired           int `json:"repaired"`
+		InvalidAfterRepair int `json:"invalid_after_repair"`
+	}
+	if err := json.Unmarshal([]byte(payload), &repair); err != nil {
+		t.Fatalf("unmarshal repair payload: %v\n%s", err, payload)
+	}
+	if repair.Attempted != 1 || repair.Repaired != 1 || repair.InvalidAfterRepair != 0 {
+		t.Errorf("repair audit counts = %+v, want attempted=1 repaired=1 invalid_after_repair=0", repair)
+	}
+	// Counts only: no expression, no parser string, no model output.
+	for _, leak := range []string{issue62Invalid, issue62Repaired, "parse error", "promql"} {
+		if strings.Contains(payload, leak) {
+			t.Errorf("repair audit payload leaked %q: %s", leak, payload)
+		}
+	}
+}
+
+// TestVerificationRepairFailureLeavesQueryInvalid: the one repair call answers
+// with something still unparseable. There is no second attempt — the query is
+// marked invalid, never sent to Prometheus, and the round carries that as its
+// own outcome so the re-judge sees an honest "this check did not run".
+func TestVerificationRepairFailureLeavesQueryInvalid(t *testing.T) {
+	// Still invalid: `by` needs a parenthesized aggregation body after it.
+	const stillInvalid = `sum by (type) increase(metric_name[1h])`
+
+	ctx := context.Background()
+	st := newTestStore(t)
+	auditor := audit.New(st.DB())
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-repair-fail", map[string]string{"alertname": "DiskFull", "host": "web1"})
+
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "draft", "disk pressure on web1", 0.8, []map[string]any{
+			{"kind": "promql", "expr": issue62Invalid, "why": "would refute"},
+		})},
+		{raw: repairResp(0, stillInvalid)},
+		{raw: callTwoResp(t, "draft", "disk pressure on web1", 0.8, "")},
+	}}
+
+	prom, sent := promRecorder(t)
+	var buf bytes.Buffer
+	skill := acutetriage.New(verifyConfig(prom), st, scripted, auditor, nil,
+		slog.New(slog.NewTextHandler(&buf, nil)))
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if scripted.calls != 3 {
+		t.Fatalf("calls = %d, want draft + ONE repair + re-judge (never a second repair)", scripted.calls)
+	}
+	for _, q := range sent() {
+		if q == issue62Invalid || q == stillInvalid {
+			t.Fatalf("invalid query reached Prometheus: %q", q)
+		}
+	}
+
+	logs := buf.String()
+	if !strings.Contains(logs, "invalid after one repair") {
+		t.Errorf("logs missing the residual-invalid warning:\n%s", logs)
+	}
+	if !strings.Contains(logs, stillInvalid) {
+		t.Errorf("logs missing the residual expression %q:\n%s", stillInvalid, logs)
+	}
+
+	f := readFinding(t, st, inc.ID)
+	ver := verificationOf(t, f.enrichment)
+	if ver == nil || len(ver.Rounds) != 1 {
+		t.Fatalf("expected one verification round, got %+v", ver)
+	}
+	q := modelQueryOf(t, ver.Rounds[0])
+	if q.Outcome != acutetriage.OutcomeInvalid {
+		t.Errorf("outcome = %q, want invalid", q.Outcome)
+	}
+	if q.Result != "invalid query (not executed)" {
+		t.Errorf("result = %q, want the never-executed text", q.Result)
+	}
+	// Apply-then-revalidate: the persisted expression is the last one actually
+	// tried (the rejected replacement), marked invalid so it never executes.
+	if q.Expr != stillInvalid {
+		t.Errorf("persisted expr = %q, want the rejected replacement", q.Expr)
+	}
+	if q.Why != "would refute" {
+		t.Errorf("a failed repair must not touch the model's stated intent: %q", q.Why)
+	}
+
+	var executed struct {
+		Invalid int `json:"invalid"`
+		Fetched int `json:"fetched"`
+	}
+	payload := auditPayload(t, st, "incident.verification_executed")
+	if err := json.Unmarshal([]byte(payload), &executed); err != nil {
+		t.Fatalf("unmarshal executed payload: %v\n%s", err, payload)
+	}
+	if executed.Invalid != 1 {
+		t.Errorf("executed audit invalid = %d, want 1: %s", executed.Invalid, payload)
+	}
+
+	var repair struct {
+		Attempted          int `json:"attempted"`
+		Repaired           int `json:"repaired"`
+		InvalidAfterRepair int `json:"invalid_after_repair"`
+	}
+	if err := json.Unmarshal([]byte(auditPayload(t, st, "incident.verification_repair")), &repair); err != nil {
+		t.Fatalf("unmarshal repair payload: %v", err)
+	}
+	if repair.Attempted != 1 || repair.Repaired != 0 || repair.InvalidAfterRepair != 1 {
+		t.Errorf("repair audit counts = %+v, want attempted=1 repaired=0 invalid_after_repair=1", repair)
+	}
+}
+
+// TestVerificationRepairSkippedWhenPlanValid pins the other half of the
+// call-count contract: repair costs nothing when there is nothing to repair.
+// A syntactically valid plan still makes exactly the two calls it always did,
+// and emits no repair audit row at all. (The verification-disabled path's
+// single call is pinned by TestKillSwitchSingleCall.)
+func TestVerificationRepairSkippedWhenPlanValid(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	auditor := audit.New(st.DB())
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-norepair", map[string]string{"alertname": "DiskFull", "host": "web1"})
+
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "draft", "disk pressure on web1", 0.8, []map[string]any{
+			{"kind": "promql", "expr": issue62Repaired, "why": "would refute"},
+			{"kind": "incidents_in_window", "why": "anything else?"},
+		})},
+		{raw: callTwoResp(t, "draft", "disk pressure on web1", 0.8, "")},
+	}}
+
+	prom, sent := promRecorder(t)
+	skill := acutetriage.New(verifyConfig(prom), st, scripted, auditor, nil, nil)
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if scripted.calls != 2 {
+		t.Fatalf("calls = %d, want draft + re-judge only (a valid plan needs no repair)", scripted.calls)
+	}
+	if n := auditCount(t, st, "incident.verification_repair"); n != 0 {
+		t.Errorf("verification_repair audit rows = %d, want 0 (nothing was repaired)", n)
+	}
+	ran := false
+	for _, q := range sent() {
+		if q == issue62Repaired {
+			ran = true
+		}
+	}
+	if !ran {
+		t.Errorf("valid model query never reached Prometheus: %q", sent())
 	}
 }

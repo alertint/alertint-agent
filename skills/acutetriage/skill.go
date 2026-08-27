@@ -925,6 +925,14 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 	vp := s.verifyParams()
 	floor := composeFloor(vp, s.cfg.ZabbixParams.HostLabel, alerts)
 	modelQ := parseVerificationPlan(ar.raw, vp, s.logger, inc.ID)
+	// One bounded batch repair of the model's own invalid PromQL, before
+	// anything else sees the plan (ADR-0043): the audit row below, the round,
+	// and the re-judge must all describe the EFFECTIVE plan — a repaired query
+	// as it will actually run, a still-broken one already marked invalid and
+	// excluded from execution — not the model's unchecked draft of it. Exactly
+	// one call, only when something is actually invalid, and never a second
+	// one; the stats it returns ride their own count-only audit row.
+	modelQ, _ = s.repairModelPromQL(ctx, inc.ID, modelQ)
 
 	// The governing verdict's operator-sourced steering queries (ADR-0029) ride
 	// the same round, between the floor and the model's own proposals.
