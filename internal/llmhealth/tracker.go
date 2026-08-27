@@ -102,10 +102,11 @@ type Tracker struct {
 	unsupportedLogged bool
 	kick              chan struct{}
 
-	// activityGen counts every completed (non-ignored) real call; ProbeDue
-	// snapshots it into probeReservedGen so ObserveProbe can detect a real
-	// call that raced a probe already in flight and discard a stale probe
-	// failure instead of letting it override a fresher, stronger success.
+	// activityGen counts every real call start (Begin) and every completed
+	// non-ignored real call (finish); ProbeDue snapshots it into
+	// probeReservedGen so ObserveProbe can detect a real call that began or
+	// finished while a probe was in flight and discard the stale probe
+	// failure instead of letting it override the fresher, stronger signal.
 	activityGen      int64
 	probeReservedGen int64
 }
@@ -172,6 +173,10 @@ func (t *Tracker) Begin(capability Capability, subject string) *Observation {
 	}
 	t.mu.Lock()
 	t.inFlight++
+	// Starting a real call already invalidates any probe in flight: the
+	// call's own Finish is the authoritative reachability signal, and a
+	// probe failure landing while it runs must not pre-empt that verdict.
+	t.activityGen++
 	t.mu.Unlock()
 	return &Observation{t: t, capability: capability, subject: subject}
 }
@@ -248,12 +253,13 @@ func (t *Tracker) ObserveProbe(res llm.ProbeResult) {
 		reason := Classify(res.Err)
 		switch {
 		case t.activityGen != t.probeReservedGen:
-			// A real call completed while this probe was in flight: that
-			// stronger signal must not be overridden by a now-stale probe
-			// failure (the flip side of "probe success cannot erase a real
-			// inference failure" — a stale probe failure cannot erase a real
-			// inference success either).
-			t.logger.Warn("llm health: stale probe failure discarded; a real call completed while the probe was in flight")
+			// A real call began or completed while this probe was in
+			// flight: that stronger signal (its Finish) must not be
+			// pre-empted or overridden by a now-stale probe failure (the flip
+			// side of "probe success cannot erase a real inference failure" —
+			// a stale probe failure cannot erase a real inference success
+			// either).
+			t.logger.Warn("llm health: stale probe failure discarded; a real call began or completed while the probe was in flight")
 		case reason.Class() == ClassDependency:
 			t.markCapabilityUnhealthy(CapabilityProbe, reason, SafeDetail(res.Err), now)
 		default:

@@ -13,6 +13,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/correlator"
 	"github.com/alertint/alertint-agent/internal/llm"
+	"github.com/alertint/alertint-agent/internal/llmhealth"
 	"github.com/alertint/alertint-agent/internal/notify"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/google/uuid"
@@ -322,6 +323,24 @@ func TestTriageBackoffDoesNotMisattributeAmbiguousShapedErrors(t *testing.T) {
 				t.Fatalf("code = %q, want the generic fallback (a %v is not LLM-specific)", tri.LastErrorCode, tc.err)
 			}
 		})
+	}
+}
+
+// TestTriageBackoffRecordsLLMOriginTimeout pins the resolution of the
+// ambiguity above: a timeout/network/canceled error that Acute Triage marked
+// as LLM-origin (llmhealth.MarkLLMOrigin at its Complete boundary) IS
+// trustworthy, so the motivating production failure — a real Call-1 context
+// deadline — persists its capability-aware "timeout" code instead of the
+// generic fallback.
+func TestTriageBackoffRecordsLLMOriginTimeout(t *testing.T) {
+	h := newRetryHarness(t, 1)
+	h.sink.failErr = fmt.Errorf("acutetriage: llm: %w", llmhealth.MarkLLMOrigin(context.DeadlineExceeded))
+
+	h.flush()
+
+	tri := mustBackoffRow(t, h.st, h.inc.ID)
+	if tri.LastErrorCode != "timeout" {
+		t.Fatalf("code = %q, want timeout (the error is marked LLM-origin)", tri.LastErrorCode)
 	}
 }
 

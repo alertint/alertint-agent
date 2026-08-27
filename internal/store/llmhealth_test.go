@@ -62,6 +62,31 @@ func TestLLMHealthRoundTrip(t *testing.T) {
 	}
 }
 
+// TestLLMHealthMalformedContentSubjectsFailsLoud pins that corrupt
+// corroboration evidence can never silently degrade the two-Incident rule:
+// the column CHECK rejects a non-array value at write time, and — should one
+// ever land anyway — the parser returns an error (so llmhealth.New fails
+// loud, like every other unloadable field) instead of reading it as "no
+// content failures recorded".
+func TestLLMHealthMalformedContentSubjectsFailsLoud(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if err := s.SaveLLMHealth(ctx, LLMHealthRecord{State: "healthy", SlackDelivery: "none"},
+		[]LLMCapabilityRecord{{Capability: "triage_draft", Healthy: true}}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	for _, bad := range []string{`not json`, `"a string"`, `{"a":1}`} {
+		if _, err := s.db.ExecContext(ctx, `UPDATE llm_health_capabilities SET content_subjects = ? WHERE capability = 'triage_draft'`, bad); err == nil {
+			t.Fatalf("content_subjects CHECK must reject %q", bad)
+		}
+	}
+	for _, bad := range []string{`not json`, `"a string"`, `[1, 2]`} {
+		if _, err := unmarshalContentSubjects(bad); err == nil {
+			t.Fatalf("unmarshalContentSubjects(%q) must return an error, not an empty set", bad)
+		}
+	}
+}
+
 func TestLLMHealthRejectsUnknownEnums(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

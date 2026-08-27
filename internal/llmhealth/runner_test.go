@@ -126,6 +126,42 @@ func TestStaleProbeFailureDiscardedAfterRealSuccessRacesIt(t *testing.T) {
 	}
 }
 
+// TestStaleProbeFailureDiscardedWhenRealCallBeginsDuringIt covers the
+// remaining interleaving: the real call BEGINS after ProbeDue decided but is
+// still in flight when the probe fails. The probe's failure is stale the
+// moment a real call starts — that call's own Finish is the authoritative
+// signal about reachability — so the probe must not mark the installation
+// unavailable in the window before the real call completes.
+func TestStaleProbeFailureDiscardedWhenRealCallBeginsDuringIt(t *testing.T) {
+	tr, _, c, _ := newTracker(t)
+	pr := &fakeProber{res: llm.ProbeResult{Outcome: llm.ProbeFailed, Method: "GET", Path: "/v1/models/m", Err: err503}, block: make(chan struct{})}
+	r := llmhealth.NewRunner(tr, pr, nil, nil)
+	c.add(5 * time.Minute)
+
+	done := make(chan struct{})
+	go func() {
+		r.Step(context.Background(), c.now())
+		close(done)
+	}()
+	for pr.calls.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+
+	// A real call begins while the probe is blocked — and is still in flight
+	// when the probe's failure lands.
+	obs := tr.Begin(llmhealth.CapabilityTriageDraft, "i")
+	close(pr.block)
+	<-done
+
+	if s := tr.Snapshot(); s.State != llmhealth.StateHealthy {
+		t.Fatalf("a probe failure that raced a real call's start must not mark the installation unavailable: %+v", s)
+	}
+	obs.Finish(nil)
+	if s := tr.Snapshot(); s.State != llmhealth.StateHealthy {
+		t.Fatalf("after the racing real call succeeds: %+v", s)
+	}
+}
+
 func TestProbeTimeoutIsBounded(t *testing.T) {
 	tr, _, c, _ := newTracker(t)
 	pr := &fakeProber{res: llm.ProbeResult{Outcome: llm.ProbeFailed, Err: context.DeadlineExceeded}, block: make(chan struct{})}

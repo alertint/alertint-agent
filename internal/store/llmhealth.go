@@ -217,17 +217,20 @@ func marshalContentSubjects(subjects []string) (string, error) {
 }
 
 // unmarshalContentSubjects parses the content_subjects column back into a
-// slice; "[]" (or any empty/unparseable value) yields nil, matching the
-// zero-value LLMCapabilityRecord.ContentSubjects a fresh capability has.
-func unmarshalContentSubjects(raw string) []string {
+// slice; "[]" (or empty) yields nil, matching the zero-value
+// LLMCapabilityRecord.ContentSubjects a fresh capability has. Anything that
+// is not a JSON array of strings is an error, never an empty set: corrupt
+// corroboration evidence must fail loud at load (llmhealth.New) rather than
+// silently weaken the two-Incident rule to zero recorded failures.
+func unmarshalContentSubjects(raw string) ([]string, error) {
 	if raw == "" || raw == "[]" {
-		return nil
+		return nil, nil
 	}
 	var subjects []string
 	if err := json.Unmarshal([]byte(raw), &subjects); err != nil {
-		return nil
+		return nil, err
 	}
-	return subjects
+	return subjects, nil
 }
 
 func scanLLMCapability(s scanner) (*LLMCapabilityRecord, error) {
@@ -240,9 +243,10 @@ func scanLLMCapability(s scanner) (*LLMCapabilityRecord, error) {
 	if err := s.Scan(&c.Capability, &c.Healthy, &c.ReasonCode, &c.Detail, &lastSuccessAt, &lastFailureAt, &unhealthySince, &contentSubjects, &updatedStr); err != nil {
 		return nil, fmt.Errorf("scan: %w", err)
 	}
-	c.ContentSubjects = unmarshalContentSubjects(contentSubjects)
-
 	var err error
+	if c.ContentSubjects, err = unmarshalContentSubjects(contentSubjects); err != nil {
+		return nil, fmt.Errorf("parse content_subjects: %w", err)
+	}
 	if c.LastSuccessAt, err = parseNullTime(lastSuccessAt); err != nil {
 		return nil, fmt.Errorf("parse last_success_at: %w", err)
 	}

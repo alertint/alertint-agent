@@ -738,7 +738,10 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 				"error":       err.Error(),
 			})
 		}
-		return analysisResult{}, fmt.Errorf("acutetriage: llm: %w", err)
+		// Marked LLM-origin so the Correlator can trust an ambiguous
+		// stdlib-shaped reason (timeout/network/canceled) for its durable
+		// capability-aware triage code instead of guessing where it came from.
+		return analysisResult{}, fmt.Errorf("acutetriage: llm: %w", llmhealth.MarkLLMOrigin(err))
 	}
 	// Action-trail success line, sibling to "llm failed" above: emitted by the
 	// incident-aware caller so it carries the incident ID and the usage the

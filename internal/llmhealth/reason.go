@@ -62,6 +62,34 @@ const (
 // the typed JSON decode of the reply failed.
 var ErrResponseMalformed = errors.New("llmhealth: response malformed")
 
+// llmOriginError marks an error as having come out of an LLM call. It is
+// transparent to Classify and errors.Is/As (Unwrap exposes the original), and
+// exists only so a consumer that sees a whole-invocation error (the Correlator
+// sees Acute Triage's entire sink error, not just the Complete result) can
+// tell an LLM timeout/network failure from an identically-shaped one raised
+// by SQLite or a metrics/log-source fetch.
+type llmOriginError struct{ err error }
+
+func (e *llmOriginError) Error() string { return e.err.Error() }
+func (e *llmOriginError) Unwrap() error { return e.err }
+
+// MarkLLMOrigin wraps err as LLM-origin. nil stays nil so a success path
+// needs no branch. Acute Triage applies it at its Complete boundary before
+// propagating the failure.
+func MarkLLMOrigin(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &llmOriginError{err: err}
+}
+
+// IsLLMOrigin reports whether err (or anything it wraps) was marked by
+// MarkLLMOrigin.
+func IsLLMOrigin(err error) bool {
+	var o *llmOriginError
+	return errors.As(err, &o)
+}
+
 // Classify maps an error from an LLM call (transport, provider, schema, or
 // typed-decode) onto a stable Reason. nil maps to ReasonOK.
 func Classify(err error) Reason {

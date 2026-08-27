@@ -41,7 +41,10 @@ CREATE TABLE llm_health_capabilities (
     -- IDs that content-class-failed this capability since its last success —
     -- the H1 two-distinct-Incident corroboration evidence. Durable so an
     -- outage spanning a restart still corroborates correctly instead of
-    -- silently resetting to zero uncorroborated failures.
-    content_subjects TEXT    NOT NULL DEFAULT '[]',
+    -- silently resetting to zero uncorroborated failures. The CHECK keeps a
+    -- non-array from ever landing; the store's parser fails loud on load
+    -- should one slip past anyway.
+    content_subjects TEXT    NOT NULL DEFAULT '[]'
+                     CHECK (json_valid(content_subjects) AND json_type(content_subjects) = 'array'),
     updated_at       TEXT    NOT NULL
 ) STRICT;

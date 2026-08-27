@@ -21,6 +21,34 @@ func (timeoutError) Error() string   { return "i/o timeout" }
 func (timeoutError) Timeout() bool   { return true }
 func (timeoutError) Temporary() bool { return true }
 
+// TestMarkLLMOrigin pins the LLM-origin marker Acute Triage wraps around a
+// failed Complete: the marker is transparent to Classify (the wrapped error
+// still classifies by its own shape), survives further fmt.Errorf %w
+// wrapping, and is absent from an identically-shaped error that did not come
+// through the marker — so a downstream consumer (the Correlator) can trust an
+// ambiguous stdlib-shaped reason only when the marker vouches for it.
+func TestMarkLLMOrigin(t *testing.T) {
+	marked := fmt.Errorf("acutetriage: llm: %w", llmhealth.MarkLLMOrigin(context.DeadlineExceeded))
+	if !llmhealth.IsLLMOrigin(marked) {
+		t.Fatal("marked error not recognised through fmt.Errorf wrapping")
+	}
+	if got := llmhealth.Classify(marked); got != llmhealth.ReasonTimeout {
+		t.Fatalf("Classify(marked) = %q, want timeout (the marker must be transparent)", got)
+	}
+	if !errors.Is(marked, context.DeadlineExceeded) {
+		t.Fatal("marker must unwrap to the original error")
+	}
+	if llmhealth.IsLLMOrigin(fmt.Errorf("store: %w", context.DeadlineExceeded)) {
+		t.Fatal("an unmarked deadline must not read as LLM-origin")
+	}
+	if llmhealth.IsLLMOrigin(nil) {
+		t.Fatal("nil is not LLM-origin")
+	}
+	if llmhealth.MarkLLMOrigin(nil) != nil {
+		t.Fatal("MarkLLMOrigin(nil) must stay nil so a success path needs no branch")
+	}
+}
+
 func TestClassify(t *testing.T) {
 	var _ net.Error = timeoutError{}
 	cases := []struct {
