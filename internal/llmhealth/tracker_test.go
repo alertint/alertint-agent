@@ -5,6 +5,7 @@ package llmhealth_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,10 +14,25 @@ import (
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
-type clock struct{ t time.Time }
+// clock is read from the Runner's own goroutine (TestRunWakesOnKick) and
+// written from the test goroutine, so it needs its own lock distinct from
+// the Tracker's.
+type clock struct {
+	mu sync.Mutex
+	t  time.Time
+}
 
-func (c *clock) now() time.Time      { return c.t }
-func (c *clock) add(d time.Duration) { c.t = c.t.Add(d) }
+func (c *clock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *clock) add(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
 
 type recAudit struct {
 	kinds    []string

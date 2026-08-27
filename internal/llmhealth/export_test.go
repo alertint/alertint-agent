@@ -10,3 +10,9 @@ func (t *Tracker) IdleSince() time.Time {
 	defer t.mu.Unlock()
 	return t.idleSince
 }
+
+// SetRunnerTickForTest overrides the Runner's ticker interval for tests.
+func SetRunnerTickForTest(d time.Duration) { runnerTick = d }
+
+// SetProbeTimeoutForTest overrides the Runner's per-probe timeout for tests.
+func SetProbeTimeoutForTest(d time.Duration) { probeTimeout = d }
