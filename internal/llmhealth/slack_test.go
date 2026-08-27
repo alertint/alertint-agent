@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/llmhealth"
+	"github.com/alertint/alertint-agent/internal/store"
 )
 
 type fakePub struct {
@@ -307,12 +308,14 @@ func TestRecoveryDuringInFlightPostReconcilesStaleRoot(t *testing.T) {
 	}
 }
 
-// TestNewOutageDuringInFlightPostAdoptsRootForNewEpisode covers the rarer
+// TestLateRootFromPreviousEpisodeGetsItsOwnRecoveryEdit covers the rarer
 // variant: recovery AND a new outage both happen while the first episode's
-// POST is in flight. The stale root is adopted as the new episode's root
-// (one root, kept edited in place) rather than orphaned as a permanent
-// false outage or duplicated by a second post.
-func TestNewOutageDuringInFlightPostAdoptsRootForNewEpisode(t *testing.T) {
+// POST is in flight. Outage episodes are separate histories (CONTEXT.md):
+// the late episode-1 root gets episode-1's recovery edit, and episode 2
+// keeps its own independent delivery state — it must not become visible
+// through the old root before satisfying broadcast_after, and it posts its
+// own root once it does. Two roots across two episodes is correct.
+func TestLateRootFromPreviousEpisodeGetsItsOwnRecoveryEdit(t *testing.T) {
 	tr, _, c, _ := newTracker(t)
 	pub := &blockingPub{fakePub: &fakePub{}, started: make(chan struct{}), release: make(chan struct{})}
 
@@ -325,22 +328,83 @@ func TestNewOutageDuringInFlightPostAdoptsRootForNewEpisode(t *testing.T) {
 		close(done)
 	}()
 	<-pub.started
-	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(nil)    // episode 1 recovers
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(nil)    // episode 1 recovers (down 5m)
 	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(err503) // episode 2 begins
 	close(pub.release)
 	<-done
 
+	// Immediately: the late root is edited to episode 1's recovery; episode 2
+	// has not been unhealthy for broadcast_after, so nothing new is posted.
+	tr.Deliver(context.Background(), pub)
+	pub.mu.Lock()
+	if len(pub.posts) != 1 || len(pub.updates) != 1 || pub.updates[0] != llmhealth.RenderRecovery(5*time.Minute) {
+		pub.mu.Unlock()
+		t.Fatalf("posts=%v updates=%v; want the late root edited to episode 1's recovery and no early root for episode 2", pub.posts, pub.updates)
+	}
+	pub.mu.Unlock()
+	if s := tr.Snapshot(); s.State != llmhealth.StateUnavailable {
+		t.Fatalf("episode 2 must still be an outage: %+v", s)
+	}
+
+	// Episode 2 sustains: it gets its own root, then its own recovery edit.
 	c.add(5 * time.Minute)
 	tr.Deliver(context.Background(), pub)
-	if pub.postCount() != 1 {
-		t.Fatalf("posts = %v; the stale root must be adopted, never duplicated", pub.posts)
+	if pub.postCount() != 2 {
+		t.Fatalf("posts = %v; episode 2 must post its own root once sustained", pub.posts)
 	}
-	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(nil) // episode 2 recovers
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(nil)
 	tr.Deliver(context.Background(), pub)
 	pub.mu.Lock()
 	defer pub.mu.Unlock()
-	if len(pub.updates) != 1 || pub.updates[0] != llmhealth.RenderRecovery(5*time.Minute) {
-		t.Fatalf("updates = %v; the adopted root must be edited to episode 2's recovery", pub.updates)
+	if len(pub.updates) != 2 || pub.updates[1] != llmhealth.RenderRecovery(5*time.Minute) {
+		t.Fatalf("updates = %v; episode 2's root must get episode 2's recovery edit", pub.updates)
+	}
+}
+
+// TestPostIsNotAttemptedWhenWriteAheadMarkerFails pins that the "durable
+// before POST" guarantee depends on the write actually committing: if the
+// indeterminate marker cannot be persisted, the POST must not happen (Slack
+// could accept a root that a restarted process would never know about, and
+// would post again). Once the store is back, delivery proceeds normally.
+func TestPostIsNotAttemptedWhenWriteAheadMarkerFails(t *testing.T) {
+	path := t.TempDir() + "/health.db"
+	st, err := store.Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &clock{t: time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)}
+	opts := llmhealth.Options{Now: c.now, BroadcastAfter: 5 * time.Minute, IdleProbeAfter: 5 * time.Minute}
+	tr, err := llmhealth.New(context.Background(), st, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(err503)
+	c.add(5 * time.Minute)
+
+	// The store goes away before delivery: the marker write fails.
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pub := &fakePub{}
+	tr.Deliver(context.Background(), pub)
+	if pub.postCount() != 0 {
+		t.Fatalf("posted %v without a committed write-ahead marker", pub.posts)
+	}
+
+	// Store back (as after a restart): the outage is still undelivered and
+	// delivery proceeds exactly once.
+	st2, err := store.Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st2.Close() })
+	tr2, err := llmhealth.New(context.Background(), st2, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr2.Deliver(context.Background(), pub)
+	if pub.postCount() != 1 {
+		t.Fatalf("posts = %v after the store returned", pub.posts)
 	}
 }
 

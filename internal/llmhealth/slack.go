@@ -100,13 +100,42 @@ func (t *Tracker) Deliver(ctx context.Context, pub Publisher) {
 	plan := t.planDelivery() //nolint:contextcheck
 	switch plan.op {
 	case deliverNone:
-		return
 	case deliverPost:
 		channel, ts, err := pub.PostSystemMessage(ctx, plan.text)
 		t.applyDeliveryResult(plan, channel, ts, err) //nolint:contextcheck
 	case deliverUpdateState, deliverUpdateRecovery:
 		err := pub.UpdateSystemMessage(ctx, plan.channel, plan.ts, plan.text)
 		t.applyDeliveryResult(plan, plan.channel, plan.ts, err) //nolint:contextcheck
+	}
+	t.editLateRoots(ctx, pub)
+}
+
+// editLateRoots gives every root that landed after its episode had already
+// closed that episode's own recovery edit, independently of the current
+// episode's delivery state. A failed edit stays queued for the next step.
+func (t *Tracker) editLateRoots(ctx context.Context, pub Publisher) {
+	t.mu.Lock()
+	pending := t.lateRoots
+	t.lateRoots = nil
+	t.mu.Unlock()
+	if len(pending) == 0 {
+		return
+	}
+	var failed []lateRoot
+	for _, r := range pending {
+		if err := pub.UpdateSystemMessage(ctx, r.channel, r.ts, RenderRecovery(r.downFor)); err != nil {
+			t.logger.Warn("llm health: late slack root recovery edit failed; will retry", "channel", r.channel, "ts", r.ts)
+			failed = append(failed, r)
+			continue
+		}
+		// auditAppend uses its own bounded context.Background() by design: a
+		// delivered edit must be recorded even if ctx is canceled around it.
+		t.auditAppend("llm.health.slack_updated", map[string]any{"late_root": true, "channel": r.channel, "ts": r.ts, "state": "recovered"}) //nolint:contextcheck
+	}
+	if len(failed) > 0 {
+		t.mu.Lock()
+		t.lateRoots = append(failed, t.lateRoots...)
+		t.mu.Unlock()
 	}
 }
 
@@ -128,9 +157,16 @@ func (t *Tracker) planDelivery() deliveryPlan {
 		// coordinates being written, the restarted tracker sees
 		// "indeterminate" and never posts a second root for this episode.
 		// A definite rejection moves it back to pending (retried); a
-		// success to delivered.
+		// success to delivered. The guarantee only holds if the marker
+		// actually commits, so a failed write means no POST this step —
+		// the state reverts and the next step tries again.
+		prev := t.rec.SlackDelivery
 		t.rec.SlackDelivery = DeliveryIndeterminate
-		t.persist()
+		if err := t.persist(); err != nil {
+			t.rec.SlackDelivery = prev
+			t.logger.Warn("llm health: slack system message not posted; write-ahead marker could not be persisted", "err", err)
+			return deliveryPlan{}
+		}
 		return deliveryPlan{op: deliverPost, text: RenderOutage(state, now.Sub(*t.rec.UnhealthySince)), generation: gen, state: state}
 
 	case state != StateHealthy && t.rec.SlackDelivery == DeliveryDelivered && t.rec.SlackState != string(state):
@@ -179,13 +215,13 @@ func (t *Tracker) applyDeliveryResult(plan deliveryPlan, channel, ts string, err
 				// audit; a missing root is recoverable, a duplicate is not.
 				t.logger.Warn("llm health: slack system message delivery indeterminate; not retrying to avoid a duplicate root")
 				t.auditAppend("llm.health.slack_indeterminate", map[string]any{"generation": plan.generation, "op": "post"})
-				t.persist()
+				_ = t.persist() // logged inside; the marker was already committed before the POST
 				return
 			}
 			t.rec.SlackDelivery = DeliveryPending
 			t.logger.Warn("llm health: slack system message delivery failed; will retry")
 			t.auditAppend("llm.health.slack_failed", map[string]any{"generation": plan.generation, "op": "post"})
-			t.persist()
+			_ = t.persist() // logged inside; the in-memory result stands
 			return
 		}
 		t.rec.SlackDelivery = DeliveryDelivered
@@ -197,7 +233,7 @@ func (t *Tracker) applyDeliveryResult(plan deliveryPlan, channel, ts string, err
 	case deliverUpdateState:
 		if err != nil {
 			t.logger.Warn("llm health: slack system message delivery failed; will retry")
-			t.persist()
+			_ = t.persist() // logged inside; the in-memory result stands
 			return
 		}
 		t.rec.SlackState = string(plan.state)
@@ -206,47 +242,49 @@ func (t *Tracker) applyDeliveryResult(plan deliveryPlan, channel, ts string, err
 	case deliverUpdateRecovery:
 		if err != nil {
 			t.logger.Warn("llm health: slack system message delivery failed; will retry")
-			t.persist()
+			_ = t.persist() // logged inside; the in-memory result stands
 			return
 		}
 		t.rec.SlackDelivery = DeliveryRecovered
 		t.auditAppend("llm.health.slack_updated", map[string]any{"generation": plan.generation, "state": "recovered"})
 	}
-	t.persist()
+	_ = t.persist() // logged inside; the in-memory result stands
 }
 
 // adoptStaleRoot reconciles a root that a now-stale plan successfully posted
-// while the episode moved on under it. Called under mu.
+// while its episode closed under it. Called under mu. The root belongs to
+// the episode whose generation the plan carried, and only ever receives THAT
+// episode's recovery edit — episodes are separate histories, so it is never
+// reassigned to a later one.
 //
-//   - The episode recovered and nothing was confirmed delivered (suppressed):
-//     adopt the root and move to recovery_pending, so the next step edits it
-//     to the recovery copy — the final visible message is the truth.
-//   - A new episode has already begun and has no root of its own yet: adopt
-//     the root as that episode's, delivered, so it keeps being edited in
-//     place (state changes, then recovery) — one root, never a duplicate.
+//   - The plan's episode is the one that just recovered and nothing else has
+//     happened since (state healthy, delivery suppressed): adopt the root and
+//     move to recovery_pending, so the durable state machine edits it.
+//   - The plan's episode is the one that just recovered but a new episode has
+//     already begun: queue the root for its own recovery edit (in-memory, see
+//     lateRoots); the new episode keeps its own delivery state and its own
+//     broadcast_after threshold.
 //   - Anything else cannot happen with the single-goroutine Runner (it would
 //     need two overlapping Deliver calls); it is audited as orphaned so the
 //     stray root is at least visible to an operator.
 func (t *Tracker) adoptStaleRoot(plan deliveryPlan, channel, ts string) {
-	state := State(t.rec.State)
-	switch {
-	case state == StateHealthy && t.rec.SlackDelivery == DeliverySuppressed:
+	if !t.lastRecovery.valid || t.lastRecovery.slackGen != plan.generation {
+		t.logger.Warn("llm health: a stale slack root was posted for an episode that is no longer tracked; it will not be edited", "channel", channel, "ts", ts)
+		t.auditAppend("llm.health.slack_orphaned", map[string]any{"posted_generation": plan.generation, "channel": channel, "ts": ts})
+		return
+	}
+	if State(t.rec.State) == StateHealthy && t.rec.SlackDelivery == DeliverySuppressed {
 		t.rec.SlackTS, t.rec.SlackChannel = ts, channel
 		t.rec.SlackState = string(plan.state)
 		t.rec.SlackDelivery = DeliveryRecoveryPending
 		t.logger.Info("llm health: adopted a slack root posted during recovery; editing it to recovered")
 		t.auditAppend("llm.health.slack_adopted", map[string]any{"posted_generation": plan.generation, "into": DeliveryRecoveryPending})
-	case state != StateHealthy && (t.rec.SlackDelivery == DeliveryNone || t.rec.SlackDelivery == DeliveryPending || t.rec.SlackDelivery == DeliveryIndeterminate):
-		t.rec.SlackTS, t.rec.SlackChannel = ts, channel
-		t.rec.SlackState = string(plan.state)
-		t.rec.SlackDelivery = DeliveryDelivered
-		t.logger.Info("llm health: adopted a slack root posted for the previous episode as this episode's root")
-		t.auditAppend("llm.health.slack_adopted", map[string]any{"posted_generation": plan.generation, "into": DeliveryDelivered, "generation": t.rec.OutageGeneration})
-	default:
-		t.logger.Warn("llm health: a stale slack root was posted and could not be adopted; it will not be edited", "channel", channel, "ts", ts)
-		t.auditAppend("llm.health.slack_orphaned", map[string]any{"posted_generation": plan.generation, "channel": channel, "ts": ts})
+		_ = t.persist() // logged inside; the in-memory adoption stands
+		t.kickLocked()
 		return
 	}
-	t.persist()
+	t.lateRoots = append(t.lateRoots, lateRoot{channel: channel, ts: ts, downFor: t.lastRecovery.downFor})
+	t.logger.Info("llm health: a slack root landed late for an already-closed episode; editing it to that episode's recovery")
+	t.auditAppend("llm.health.slack_adopted", map[string]any{"posted_generation": plan.generation, "into": "late_recovery_edit"})
 	t.kickLocked()
 }

@@ -117,6 +117,27 @@ type Tracker struct {
 	// failure instead of letting it override the fresher, stronger signal.
 	activityGen      int64
 	probeReservedGen int64
+
+	// lastRecovery remembers the most recently closed episode by the Slack
+	// generation its outage plans carried, so a root that lands late for
+	// that episode can still be given that episode's own recovery edit.
+	lastRecovery struct {
+		valid    bool
+		slackGen int64
+		downFor  time.Duration
+	}
+	// lateRoots are roots that landed after their episode closed and a new
+	// one began; each is edited to its own episode's recovery copy by
+	// Deliver. In-memory only: the window (recovery + new outage inside one
+	// HTTP call, then a crash before the edit) is not worth a column.
+	lateRoots []lateRoot
+}
+
+// lateRoot is one Slack root awaiting its (already-closed) episode's
+// recovery edit.
+type lateRoot struct {
+	channel, ts string
+	downFor     time.Duration
 }
 
 // Observation is one in-flight LLM call started by Tracker.Begin. Exactly one
@@ -479,7 +500,7 @@ func (t *Tracker) aggregate() (State, string, string) {
 // and kicks the Runner if the aggregate transitioned.
 func (t *Tracker) recomputeAndPersist(now time.Time) {
 	changed := t.recompute(now)
-	t.persist()
+	_ = t.persist() // logged inside; the observation is never dropped
 	if changed {
 		t.kickLocked()
 	}
@@ -532,7 +553,11 @@ func (t *Tracker) recompute(now time.Time) bool {
 		// in-flight PostSystemMessage/UpdateSystemMessage HTTP call that
 		// hasn't returned yet) is discarded by applyDeliveryResult's
 		// generation check instead of resurrecting pre-recovery Slack state
-		// once it finally completes.
+		// once it finally completes. Remember which generation this episode
+		// ran under so a late root for it can still get this recovery.
+		t.lastRecovery.valid = true
+		t.lastRecovery.slackGen = t.rec.SlackGeneration
+		t.lastRecovery.downFor = downFor
 		t.rec.SlackGeneration++
 		t.rec.State = string(newState)
 		t.rec.ReasonCode = ""
@@ -570,9 +595,11 @@ func (t *Tracker) recompute(now time.Time) bool {
 }
 
 // persist saves the current aggregate + capability records. A failure is
-// logged, not surfaced: the in-memory state stays authoritative and the
-// observation that triggered this persist is never dropped.
-func (t *Tracker) persist() {
+// logged and returned; most callers ignore it by design — the in-memory
+// state stays authoritative and the observation that triggered the persist
+// is never dropped. The one caller that must not ignore it is the Slack
+// write-ahead marker in planDelivery.
+func (t *Tracker) persist() error {
 	rec := t.rec
 	caps := make([]store.LLMCapabilityRecord, 0, len(t.caps))
 	for _, c := range t.caps {
@@ -584,7 +611,9 @@ func (t *Tracker) persist() {
 	defer cancel()
 	if err := t.st.SaveLLMHealth(ctx, rec, caps); err != nil {
 		t.logger.Error("llm health: persist failed", "err", err)
+		return err
 	}
+	return nil
 }
 
 func (t *Tracker) kickLocked() {
