@@ -43,4 +43,24 @@ func TestValidateSyntaxRepair(t *testing.T) {
 			t.Fatalf("semantic workaround accepted: %s", changed)
 		}
 	}
+
+	// A label value swapped between two different selectors must be
+	// rejected even though the multiset of matcher values across the whole
+	// expression is unchanged: pooling matchers globally instead of per
+	// selector would let this slip through.
+	swapOriginal := `metric_a{x="1",y="2"} - metric_b{x="2",y="1"}`
+	swapped := `metric_a{x="2",y="1"} - metric_b{x="1",y="2"}`
+	if err := ValidateSyntaxRepair(swapOriginal, swapped); err == nil {
+		t.Fatalf("label values swapped across selectors accepted: %s", swapped)
+	}
+}
+
+func TestValidateSyntaxRepair_FailClosed(t *testing.T) {
+	// An unterminated string cannot be fully tokenized. ValidateSyntaxRepair
+	// must reject the repair rather than approve it on a partial signature.
+	original := `metric_name{x="unterminated`
+	repaired := `metric_name{x="unterminated"}`
+	if err := ValidateSyntaxRepair(original, repaired); err == nil {
+		t.Fatalf("unlexable original accepted as syntax-only repair")
+	}
 }

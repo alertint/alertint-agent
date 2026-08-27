@@ -25,10 +25,15 @@ func ValidateExpr(expr string) error {
 // wrapping/grouping syntax (which a syntax repair is explicitly allowed to
 // add or relocate) are deliberately excluded.
 type promqlSignature struct {
-	metricRefs []string // vector-selector metric names, in encounter order
-	calls      []string // non-aggregator function names, in encounter order
-	matchers   []string // "label<op>value" label-matcher triples, sorted
-	literals   []string // "kind:value" duration/number/string literals, in encounter order
+	metricRefs    []string   // vector-selector metric names, in encounter order
+	calls         []string   // non-aggregator function names, in encounter order
+	matcherGroups [][]string // one entry per `{...}` selector, in encounter order; each
+	// entry holds that selector's "label<op>value" triples, sorted within the
+	// selector only. Grouping by originating selector (rather than pooling every
+	// matcher into one flat sorted list) is required so that swapping label
+	// values between two different selectors is detected as a change, not
+	// masked by a global sort turning the comparison into a multiset check.
+	literals []string // "kind:value" duration/number/string literals, in encounter order
 }
 
 // ValidateSyntaxRepair reports whether repaired is a syntax-only rewrite of
@@ -56,12 +61,29 @@ func ValidateSyntaxRepair(original, repaired string) error {
 		return fmt.Errorf("prometheus: syntax repair changed a metric reference")
 	case !slices.Equal(originalSig.calls, repairedSig.calls):
 		return fmt.Errorf("prometheus: syntax repair changed a function call")
-	case !slices.Equal(originalSig.matchers, repairedSig.matchers):
+	case !equalMatcherGroups(originalSig.matcherGroups, repairedSig.matcherGroups):
 		return fmt.Errorf("prometheus: syntax repair changed a label matcher")
 	case !slices.Equal(originalSig.literals, repairedSig.literals):
 		return fmt.Errorf("prometheus: syntax repair changed a literal")
 	}
 	return nil
+}
+
+// equalMatcherGroups reports whether a and b hold the same label-matcher
+// triples per selector, in the same selector order. Each group is compared
+// as a set (its own contents were sorted when built), but the groups
+// themselves are compared positionally so a value swapped between two
+// different selectors is caught rather than masked.
+func equalMatcherGroups(a, b [][]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !slices.Equal(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // buildPromqlSignature tokenizes expr with the official lexer and reduces
@@ -75,16 +97,25 @@ func buildPromqlSignature(expr string) (promqlSignature, error) {
 
 	var sig promqlSignature
 	braceDepth := 0
+	var currentGroup []string // matcher triples for the selector braces currently open
 
 	for i := 0; i < len(items); i++ {
 		it := items[i]
 		switch {
 		case it.Typ == promqlparser.LEFT_BRACE:
+			if braceDepth == 0 {
+				currentGroup = nil
+			}
 			braceDepth++
 
 		case it.Typ == promqlparser.RIGHT_BRACE:
 			if braceDepth > 0 {
 				braceDepth--
+				if braceDepth == 0 {
+					sort.Strings(currentGroup)
+					sig.matcherGroups = append(sig.matcherGroups, currentGroup)
+					currentGroup = nil
+				}
 			}
 
 		case it.Typ == promqlparser.BY || it.Typ == promqlparser.WITHOUT:
@@ -113,7 +144,7 @@ func buildPromqlSignature(expr string) (promqlSignature, error) {
 
 		case it.Typ == promqlparser.IDENTIFIER, it.Typ == promqlparser.METRIC_IDENTIFIER:
 			if braceDepth > 0 && i+2 < len(items) && isMatcherOp(items[i+1].Typ) {
-				sig.matchers = append(sig.matchers, it.Val+items[i+1].Val+items[i+2].Val)
+				currentGroup = append(currentGroup, it.Val+items[i+1].Val+items[i+2].Val)
 				i += 2
 				continue
 			}
@@ -136,7 +167,6 @@ func buildPromqlSignature(expr string) (promqlSignature, error) {
 		}
 	}
 
-	sort.Strings(sig.matchers)
 	return sig, nil
 }
 
