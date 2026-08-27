@@ -39,8 +39,10 @@ import (
 	"github.com/alertint/alertint-agent/internal/correlator"
 	"github.com/alertint/alertint-agent/internal/health"
 	"github.com/alertint/alertint-agent/internal/ingress"
+	"github.com/alertint/alertint-agent/internal/llm"
 	llmanthropic "github.com/alertint/alertint-agent/internal/llm/anthropic"
 	llmopenai "github.com/alertint/alertint-agent/internal/llm/openaicompat"
+	"github.com/alertint/alertint-agent/internal/llmhealth"
 	"github.com/alertint/alertint-agent/internal/logging"
 	"github.com/alertint/alertint-agent/internal/logs"
 	"github.com/alertint/alertint-agent/internal/logs/loki"
@@ -198,7 +200,24 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 
 	classifierClient := buildClassifierClient(cfg, apiKey, auditor, logger)
 
-	notifier := buildNotifier(cfg, st, auditor, logger, strings.EqualFold(level, "debug"))
+	notifier, llmSystemPublisher := buildNotifier(cfg, st, auditor, logger, strings.EqualFold(level, "debug"))
+
+	llmHealth, err := llmhealth.New(ctx, st, llmhealth.Options{
+		Logger:         logger,
+		Auditor:        auditor,
+		BroadcastAfter: time.Duration(cfg.Health.BroadcastAfterSeconds) * time.Second,
+		IdleProbeAfter: time.Duration(cfg.Health.LLMIdleProbeAfterSeconds) * time.Second,
+	})
+	if err != nil {
+		return fmt.Errorf("llm health: %w", err)
+	}
+	llmProber := buildLLMProber(cfg, llmClient)
+	logger.Info("llm health: observing",
+		slog.Duration("idle_probe_after", time.Duration(cfg.Health.LLMIdleProbeAfterSeconds)*time.Second),
+		slog.Duration("broadcast_after", time.Duration(cfg.Health.BroadcastAfterSeconds)*time.Second),
+		slog.Bool("probe", llmProber != nil),
+		slog.Bool("slack", llmSystemPublisher != nil),
+	)
 
 	// Build Prometheus client when enabled. Passed into both the triage skill
 	// (metric enrichment for the LLM prompt) and the MCP server (PromQL tools).
@@ -325,6 +344,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 				ExtraSelectorLabels: cfg.Triage.ExtraSelectorLabels,
 			},
 			PromptCaching: !llmProviderIsOpenAI(cfg),
+			Health:        llmHealth,
 		},
 		st, llmClient, auditor, notifier, logger,
 	)
@@ -358,8 +378,9 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	// Results are cached for GET /health.
 	healthReg := buildHealthChecks(cfg, prom, logSrc, sentryClient, zbxClient)
 	go healthReg.Watch(ctx, logger)
+	go llmhealth.NewRunner(llmHealth, llmProber, llmSystemPublisher, logger).Run(ctx)
 
-	recvSrv, recvErrCh, err := startReceivers(cfg, st, auditor, cor, healthReg, logger)
+	recvSrv, recvErrCh, err := startReceivers(cfg, st, auditor, cor, healthReg, llmHealth, logger)
 	if err != nil {
 		return err
 	}
@@ -419,7 +440,7 @@ func pruneChangesAtStartup(ctx context.Context, cfg *config.Config, st *store.St
 // startReceivers starts the inbound webhook host when at least one receiver is
 // enabled. The host also serves GET /health. Returns (nil, nil, nil) when no
 // receiver is enabled — the nil error channel never fires in runServe's select.
-func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor, cor *correlator.Correlator, healthReg *health.Registry, logger *slog.Logger) (*http.Server, <-chan error, error) {
+func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor, cor *correlator.Correlator, healthReg *health.Registry, llmHealth ingress.LLMHealthReader, logger *slog.Logger) (*http.Server, <-chan error, error) {
 	var receivers []ingress.Receiver
 	if cfg.Alertmanager.Enabled {
 		token, err := cfg.WebhookToken()
@@ -454,6 +475,7 @@ func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor,
 		Receivers: receivers,
 		Logger:    logger,
 		Health:    healthReg,
+		LLMHealth: llmHealth,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -907,29 +929,36 @@ func buildHealthChecks(cfg *config.Config, prom *promclient.Client, logSrc logs.
 //     confirmed (notified · stdout=ok) at INFO. Its verbose full JSON line is
 //     written only at debug level (consistently, in every format).
 //   - slack: when enabled and a bot token resolves.
-func buildNotifier(cfg *config.Config, st *store.Store, auditor *audit.Auditor, logger *slog.Logger, debug bool) *notify.Multi {
+//
+// buildNotifier also returns the llmhealth.Publisher for the installation's
+// one system-message surface: the same Slack *Notifier when Slack is wired,
+// else nil (LLM dependency health then lives in state/audit/logs only).
+func buildNotifier(cfg *config.Config, st *store.Store, auditor *audit.Auditor, logger *slog.Logger, debug bool) (*notify.Multi, llmhealth.Publisher) {
 	var nn []notify.Notifier
 	var sinks []string
 	slackWired := false
+	var publisher llmhealth.Publisher
 	if cfg.Notify.Stdout {
 		nn = append(nn, notifystdout.New(os.Stdout, auditor, debug))
 		sinks = append(sinks, "stdout")
 	}
 	if cfg.Notify.Slack.Enabled {
 		if token, err := cfg.SlackBotToken(); err == nil && token != "" {
-			nn = append(nn, notifyslack.New(token, cfg.Notify.Slack.Channel, cfg.Notify.Slack.MinSeverity, cfg.Notify.Slack.RecurrenceMode, st, auditor))
+			slackNotifier := notifyslack.New(token, cfg.Notify.Slack.Channel, cfg.Notify.Slack.MinSeverity, cfg.Notify.Slack.RecurrenceMode, st, auditor)
+			nn = append(nn, slackNotifier)
 			sinks = append(sinks, "slack")
 			slackWired = true
+			publisher = slackNotifier
 		}
 	}
 
-	attrs := []any{slog.String("sinks", strings.Join(sinks, ","))}
+	attrs := []any{slog.String("sinks", strings.Join(sinks, ",")), slog.Bool("llm_system_messages", slackWired)}
 	if slackWired {
 		attrs = append(attrs, slog.String("slack_channel", cfg.Notify.Slack.Channel))
 	}
 	logger.Info("notifiers ready", attrs...)
 
-	return notify.NewMulti(logger, nn...)
+	return notify.NewMulti(logger, nn...), publisher
 }
 
 // llmProviderIsOpenAI reports whether the configured provider is the
@@ -945,6 +974,20 @@ func buildLLMClient(cfg *config.Config, apiKey string, auditor *audit.Auditor, l
 		return llmopenai.New(llmopenaiCfg(cfg, apiKey, cfg.LLM.TimeoutSeconds, cfg.LLM.Model, cfg.LLM.MaxTokens), auditor, logger)
 	}
 	return llmanthropic.New(llmanthropicCfg(cfg), auditor, logger)
+}
+
+// buildLLMProber type-asserts the primary LLM client into an llm.Prober for
+// the idle reachability probe. Both concrete clients satisfy it; a future
+// client type that doesn't is a config/wiring gap, not a crash — the idle
+// probe just stays off and a WARN says why.
+func buildLLMProber(cfg *config.Config, client acutetriage.LLMClient) llm.Prober {
+	p, ok := client.(llm.Prober)
+	if !ok {
+		slog.Default().Warn("llm health: configured client does not support the idle probe; idle probing disabled",
+			slog.String("provider", cfg.LLM.Provider))
+		return nil
+	}
+	return p
 }
 
 // llmopenaiCfg builds an openaicompat.Config; model/maxTokens/timeout are
