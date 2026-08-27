@@ -146,7 +146,7 @@ func TestBuildLLMProber_BothProvidersSatisfyProber(t *testing.T) {
 	anthropicCfg := config.Defaults()
 	anthropicCfg.LLM.Provider = "anthropic"
 	anthropicClient := buildLLMClient(&anthropicCfg, "key", nil, slog.Default())
-	if p := buildLLMProber(&anthropicCfg, anthropicClient); p == nil {
+	if p := buildLLMProber(&anthropicCfg, anthropicClient, slog.Default()); p == nil {
 		t.Error("anthropic client must build a non-nil llm.Prober")
 	}
 
@@ -154,7 +154,7 @@ func TestBuildLLMProber_BothProvidersSatisfyProber(t *testing.T) {
 	openaiCfg.LLM.Provider = "openai-compatible"
 	openaiCfg.LLM.BaseURL = "http://localhost:30000"
 	openaiClient := buildLLMClient(&openaiCfg, "", nil, slog.Default())
-	if p := buildLLMProber(&openaiCfg, openaiClient); p == nil {
+	if p := buildLLMProber(&openaiCfg, openaiClient, slog.Default()); p == nil {
 		t.Error("openai-compatible client must build a non-nil llm.Prober")
 	}
 }

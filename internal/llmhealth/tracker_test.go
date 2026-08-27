@@ -158,6 +158,24 @@ func TestContentFailureNeedsTwoSubjects(t *testing.T) {
 	}
 }
 
+// TestContentFailureNeverMasksDependencyOutageReason: a capability already
+// unhealthy from a real dependency failure keeps that reason/detail through
+// an uncorroborated (single-subject) content failure — aggregate() reads
+// the capability's own ReasonCode/Detail for any unhealthy capability, so
+// overwriting it here would report the wrong outage cause mid-incident.
+func TestContentFailureNeverMasksDependencyOutageReason(t *testing.T) {
+	tr := newTrackerOnly(t)
+	tr.Begin(llmhealth.CapabilityTriageDraft, "inc-1").Finish(err503)
+	if s := tr.Snapshot(); s.State != llmhealth.StateUnavailable || s.Reason != llmhealth.ReasonProviderUnavailable {
+		t.Fatalf("after dependency failure: %+v", s)
+	}
+	malformed := errors.Join(llmhealth.ErrResponseMalformed, errors.New("unexpected end of JSON"))
+	tr.Begin(llmhealth.CapabilityTriageDraft, "inc-2").Finish(malformed)
+	if s := tr.Snapshot(); s.State != llmhealth.StateUnavailable || s.Reason != llmhealth.ReasonProviderUnavailable {
+		t.Fatalf("one uncorroborated content failure must not mask the ongoing dependency outage reason: %+v", s)
+	}
+}
+
 func TestProbeFailureMakesUnavailableUntilRealSuccess(t *testing.T) {
 	tr := newTrackerOnly(t)
 	tr.ObserveProbe(llm.ProbeResult{Outcome: llm.ProbeFailed, Method: "GET", Path: "/health", Err: err503})

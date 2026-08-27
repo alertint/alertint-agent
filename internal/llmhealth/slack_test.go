@@ -214,3 +214,58 @@ func TestNilPublisherKeepsLocalHistoryOnly(t *testing.T) {
 		t.Fatalf("%+v", s)
 	}
 }
+
+// blockingPub wraps fakePub and blocks inside PostSystemMessage until
+// release is closed, signaling started once the call has begun — lets a test
+// pin down state exactly while a post is in flight.
+type blockingPub struct {
+	*fakePub
+
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (p *blockingPub) PostSystemMessage(ctx context.Context, text string) (string, string, error) {
+	p.once.Do(func() { close(p.started) })
+	<-p.release
+	return p.fakePub.PostSystemMessage(ctx, text)
+}
+
+// TestRecoveryDuringInFlightPostDiscardsStaleResult covers the race where the
+// LLM recovers while a PostSystemMessage HTTP call for the just-ended outage
+// is still in flight: the outage generation must be fenced at recovery too
+// (not only when a new outage starts), so the late-arriving success is
+// discarded — never resurrected as a "delivered" root nothing will ever edit.
+func TestRecoveryDuringInFlightPostDiscardsStaleResult(t *testing.T) {
+	tr, _, c, a := newTracker(t)
+	pub := &blockingPub{fakePub: &fakePub{}, started: make(chan struct{}), release: make(chan struct{})}
+
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(err503)
+	c.add(5 * time.Minute)
+
+	done := make(chan struct{})
+	go func() {
+		tr.Deliver(context.Background(), pub)
+		close(done)
+	}()
+	<-pub.started
+
+	// Recover while the post above is still blocked in flight.
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(nil)
+
+	close(pub.release)
+	<-done
+
+	posted, suppressed := false, false
+	for _, k := range a.kinds {
+		posted = posted || k == "llm.health.slack_posted"
+		suppressed = suppressed || k == "llm.health.slack_suppressed"
+	}
+	if posted {
+		t.Fatal("a delivery result computed before recovery must not be applied after it")
+	}
+	if !suppressed {
+		t.Fatalf("audit kinds = %v", a.kinds)
+	}
+}

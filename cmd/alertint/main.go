@@ -211,7 +211,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("llm health: %w", err)
 	}
-	llmProber := buildLLMProber(cfg, llmClient)
+	llmProber := buildLLMProber(cfg, llmClient, logger)
 	logger.Info("llm health: observing",
 		slog.Duration("idle_probe_after", time.Duration(cfg.Health.LLMIdleProbeAfterSeconds)*time.Second),
 		slog.Duration("broadcast_after", time.Duration(cfg.Health.BroadcastAfterSeconds)*time.Second),
@@ -980,10 +980,10 @@ func buildLLMClient(cfg *config.Config, apiKey string, auditor *audit.Auditor, l
 // the idle reachability probe. Both concrete clients satisfy it; a future
 // client type that doesn't is a config/wiring gap, not a crash — the idle
 // probe just stays off and a WARN says why.
-func buildLLMProber(cfg *config.Config, client acutetriage.LLMClient) llm.Prober {
+func buildLLMProber(cfg *config.Config, client acutetriage.LLMClient, logger *slog.Logger) llm.Prober {
 	p, ok := client.(llm.Prober)
 	if !ok {
-		slog.Default().Warn("llm health: configured client does not support the idle probe; idle probing disabled",
+		logger.Warn("llm health: configured client does not support the idle probe; idle probing disabled",
 			slog.String("provider", cfg.LLM.Provider))
 		return nil
 	}

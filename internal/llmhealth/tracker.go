@@ -377,8 +377,13 @@ func (t *Tracker) recordContentFailure(capability Capability, subject string, re
 	c := t.getOrCreateCap(capability)
 	failAt := now
 	c.LastFailureAt = &failAt
-	c.ReasonCode = string(reason)
-	c.Detail = detail
+	// A capability already unhealthy for a dependency-class reason keeps that
+	// reason/detail: one uncorroborated content hiccup during a real outage
+	// must not overwrite what aggregate() reports as the outage cause.
+	if c.Healthy || Reason(c.ReasonCode).Class() == ClassContent {
+		c.ReasonCode = string(reason)
+		c.Detail = detail
+	}
 
 	subjects := t.contentSubjects[capability]
 	found := false
@@ -471,6 +476,12 @@ func (t *Tracker) recompute(now time.Time) bool {
 		if t.rec.UnhealthySince != nil {
 			downFor = now.Sub(*t.rec.UnhealthySince)
 		}
+		// Bump the fence so a delivery plan computed before this recovery (an
+		// in-flight PostSystemMessage/UpdateSystemMessage HTTP call that
+		// hasn't returned yet) is discarded by applyDeliveryResult's
+		// generation check instead of resurrecting pre-recovery Slack state
+		// once it finally completes.
+		t.rec.SlackGeneration++
 		t.rec.State = string(newState)
 		t.rec.ReasonCode = ""
 		t.rec.Detail = ""

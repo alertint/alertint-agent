@@ -18,12 +18,13 @@ type Publisher interface {
 
 // RenderOutage renders the root/edit copy for a sustained unhealthy state.
 // Copy never claims uninterrupted Alert intake and never mentions Situations.
+// Callers never pass StateHealthy (planDelivery only reaches here when
+// state != StateHealthy); default renders the unavailable copy for
+// StateUnavailable and is deliberately not split out per-value.
 func RenderOutage(state State, down time.Duration) string {
-	switch state {
+	switch state { //nolint:exhaustive // StateHealthy is a caller-enforced unreachable input, not a case to render
 	case StateDegraded:
 		return fmt.Sprintf("⚠️ AlertINT system · LLM degraded for %s. Verification re-judgment is failing; draft Findings continue with reduced confidence.", FormatDuration(down))
-	case StateHealthy, StateUnavailable:
-		return fmt.Sprintf("⚠️ AlertINT system · LLM unavailable for %s. New Incident triage is retrying; correlation may be delayed.", FormatDuration(down))
 	default:
 		return fmt.Sprintf("⚠️ AlertINT system · LLM unavailable for %s. New Incident triage is retrying; correlation may be delayed.", FormatDuration(down))
 	}
