@@ -21,7 +21,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -321,16 +320,16 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt
 	if resp.StatusCode != http.StatusOK {
 		var apiErr messagesResponse
 		_ = json.Unmarshal(respBody, &apiErr)
-		msg := fmt.Sprintf("HTTP %d", resp.StatusCode)
+		e := &llm.APIError{StatusCode: resp.StatusCode}
 		if apiErr.Error != nil {
-			msg = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, apiErr.Error.Message)
+			e.Message = apiErr.Error.Message
 		}
-		return nil, tokenUsage{}, fmt.Errorf("llm: api error: %s", msg)
+		return nil, tokenUsage{}, e
 	}
 
 	var parsed messagesResponse
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return nil, tokenUsage{}, fmt.Errorf("llm: parse response: %w", err)
+		return nil, tokenUsage{}, fmt.Errorf("%w: parse response: %w", llm.ErrResponseInvalid, err)
 	}
 	usage := tokenUsage{
 		input:         parsed.Usage.InputTokens,
@@ -350,7 +349,7 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt
 
 	text := firstTextBlock(parsed.Content)
 	if text == "" {
-		return nil, usage, errors.New("llm: response contained no text content block")
+		return nil, usage, fmt.Errorf("%w: response contained no text content block", llm.ErrResponseInvalid)
 	}
 
 	// The model should return raw JSON. Trim any markdown fences.
@@ -358,7 +357,7 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt
 
 	var raw json.RawMessage
 	if err := json.Unmarshal([]byte(text), &raw); err != nil {
-		return nil, usage, fmt.Errorf("llm: response is not valid JSON: %w", err)
+		return nil, usage, fmt.Errorf("%w: response is not valid JSON: %w", llm.ErrResponseInvalid, err)
 	}
 	return raw, usage, nil
 }
