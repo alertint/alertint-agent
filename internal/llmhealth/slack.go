@@ -22,6 +22,8 @@ func RenderOutage(state State, down time.Duration) string {
 	switch state {
 	case StateDegraded:
 		return fmt.Sprintf("⚠️ AlertINT system · LLM degraded for %s. Verification re-judgment is failing; draft Findings continue with reduced confidence.", FormatDuration(down))
+	case StateHealthy, StateUnavailable:
+		return fmt.Sprintf("⚠️ AlertINT system · LLM unavailable for %s. New Incident triage is retrying; correlation may be delayed.", FormatDuration(down))
 	default:
 		return fmt.Sprintf("⚠️ AlertINT system · LLM unavailable for %s. New Incident triage is retrying; correlation may be delayed.", FormatDuration(down))
 	}
@@ -80,15 +82,18 @@ func (t *Tracker) Deliver(ctx context.Context, pub Publisher) {
 		return
 	}
 	plan := t.planDelivery()
+	// applyDeliveryResult persists with its own bounded context.Background()
+	// by design: a Slack delivery result must be recorded even if ctx is
+	// canceled between the HTTP call returning and the state update.
 	switch plan.op {
 	case deliverNone:
 		return
 	case deliverPost:
 		channel, ts, err := pub.PostSystemMessage(ctx, plan.text)
-		t.applyDeliveryResult(plan, channel, ts, err)
+		t.applyDeliveryResult(plan, channel, ts, err) //nolint:contextcheck
 	case deliverUpdateState, deliverUpdateRecovery:
 		err := pub.UpdateSystemMessage(ctx, plan.channel, plan.ts, plan.text)
-		t.applyDeliveryResult(plan, plan.channel, plan.ts, err)
+		t.applyDeliveryResult(plan, plan.channel, plan.ts, err) //nolint:contextcheck
 	}
 }
 
@@ -135,6 +140,9 @@ func (t *Tracker) applyDeliveryResult(plan deliveryPlan, channel, ts string, err
 	}
 
 	switch plan.op {
+	case deliverNone:
+		// Deliver never calls applyDeliveryResult for deliverNone.
+		return
 	case deliverPost:
 		if err != nil {
 			t.rec.SlackDelivery = DeliveryPending

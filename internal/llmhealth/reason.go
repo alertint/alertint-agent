@@ -3,7 +3,7 @@
 // Package llmhealth owns installation-level LLM dependency health: capability
 // observations from real triage calls, an idle zero-generation probe, a
 // durable neutral aggregate, and one Slack system message per sustained
-// episode. It sits below Acute Triage and never imports internal/situation.
+// episode. It sits below Acute Triage and never imports the Situation package.
 package llmhealth
 
 import (
@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 
 	"github.com/alertint/alertint-agent/internal/llm"
@@ -79,7 +80,7 @@ func Classify(err error) Reason {
 	}
 	var retry *llm.RetryableError
 	if errors.As(err, &retry) {
-		if retry.StatusCode == 429 {
+		if retry.StatusCode == http.StatusTooManyRequests {
 			return ReasonRateLimited
 		}
 		return ReasonProviderUnavailable
@@ -87,11 +88,11 @@ func Classify(err error) Reason {
 	var api *llm.APIError
 	if errors.As(err, &api) {
 		switch {
-		case api.StatusCode == 401 || api.StatusCode == 403:
+		case api.StatusCode == http.StatusUnauthorized || api.StatusCode == http.StatusForbidden:
 			return ReasonAuthFailed
-		case api.StatusCode == 429:
+		case api.StatusCode == http.StatusTooManyRequests:
 			return ReasonRateLimited
-		case api.StatusCode >= 500:
+		case api.StatusCode >= http.StatusInternalServerError:
 			return ReasonProviderUnavailable
 		default:
 			return ReasonRequestInvalid
@@ -119,6 +120,8 @@ func (r Reason) Class() Class {
 		return ClassIgnored
 	case ReasonRequestInvalid, ReasonSchemaViolation, ReasonResponseMalformed:
 		return ClassContent
+	case ReasonTimeout, ReasonNetwork, ReasonRateLimited, ReasonProviderUnavailable, ReasonAuthFailed, ReasonUnknown:
+		return ClassDependency
 	default:
 		return ClassDependency
 	}
@@ -141,6 +144,8 @@ func SafeDetail(err error) string {
 		return "schema violation"
 	case ReasonResponseMalformed:
 		return "typed response malformed"
+	case ReasonRateLimited, ReasonProviderUnavailable, ReasonAuthFailed, ReasonRequestInvalid, ReasonUnknown:
+		// Falls through to the HTTP-status formatting below.
 	}
 	var retry *llm.RetryableError
 	if errors.As(err, &retry) {

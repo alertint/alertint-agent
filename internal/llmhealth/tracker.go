@@ -103,10 +103,10 @@ type Tracker struct {
 // Observation is one in-flight LLM call started by Tracker.Begin. Exactly one
 // Finish call ends it; further calls are no-ops.
 type Observation struct {
-	t       *Tracker
-	cap     Capability
-	subject string
-	done    bool
+	t          *Tracker
+	capability Capability
+	subject    string
+	done       bool
 }
 
 // New loads persisted installation LLM dependency state and returns a ready
@@ -155,16 +155,16 @@ func New(ctx context.Context, st *store.Store, opts Options) (*Tracker, error) {
 	}, nil
 }
 
-// Begin starts one observation of cap for subject (an Incident ID). A nil
+// Begin starts one observation of capability for subject (an Incident ID). A nil
 // Tracker returns nil so Health: nil call sites need no branch.
-func (t *Tracker) Begin(cap Capability, subject string) *Observation {
+func (t *Tracker) Begin(capability Capability, subject string) *Observation {
 	if t == nil {
 		return nil
 	}
 	t.mu.Lock()
 	t.inFlight++
 	t.mu.Unlock()
-	return &Observation{t: t, cap: cap, subject: subject}
+	return &Observation{t: t, capability: capability, subject: subject}
 }
 
 // Finish ends the observation with err (nil on success). Safe on a nil
@@ -174,10 +174,10 @@ func (o *Observation) Finish(err error) {
 		return
 	}
 	o.done = true
-	o.t.finish(o.cap, o.subject, err)
+	o.t.finish(o.capability, o.subject, err)
 }
 
-func (t *Tracker) finish(cap Capability, subject string, err error) {
+func (t *Tracker) finish(capability Capability, subject string, err error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -197,17 +197,19 @@ func (t *Tracker) finish(cap Capability, subject string, err error) {
 
 	switch reason.Class() {
 	case ClassOK:
-		t.markCapabilityHealthy(cap, now)
+		t.markCapabilityHealthy(capability, now)
 		successAt := now
 		t.rec.LastRealSuccessAt = &successAt
-		delete(t.contentSubjects, cap)
-		if cap == CapabilityTriageDraft || cap == CapabilityVerificationRejudge {
+		delete(t.contentSubjects, capability)
+		if capability == CapabilityTriageDraft || capability == CapabilityVerificationRejudge {
 			t.clearCapabilityIfPresent(CapabilityProbe, now)
 		}
 	case ClassDependency:
-		t.markCapabilityUnhealthy(cap, reason, SafeDetail(err), now)
+		t.markCapabilityUnhealthy(capability, reason, SafeDetail(err), now)
 	case ClassContent:
-		t.recordContentFailure(cap, subject, reason, SafeDetail(err), now)
+		t.recordContentFailure(capability, subject, reason, SafeDetail(err), now)
+	case ClassIgnored:
+		// Unreachable: handled by the early return above.
 	}
 
 	t.recomputeAndPersist(now)
@@ -269,14 +271,14 @@ func (t *Tracker) Snapshot() Snapshot {
 	}
 
 	names := make([]Capability, 0, len(t.caps))
-	for cap := range t.caps {
-		names = append(names, cap)
+	for capability := range t.caps {
+		names = append(names, capability)
 	}
 	sort.Slice(names, func(i, j int) bool { return names[i] < names[j] })
-	for _, cap := range names {
-		c := t.caps[cap]
+	for _, capability := range names {
+		c := t.caps[capability]
 		snap.Capabilities = append(snap.Capabilities, CapabilitySnapshot{
-			Capability:     cap,
+			Capability:     capability,
 			Healthy:        c.Healthy,
 			Reason:         Reason(c.ReasonCode),
 			Detail:         c.Detail,
@@ -312,20 +314,20 @@ func (t *Tracker) Kick() <-chan struct{} {
 	return t.kick
 }
 
-// getOrCreateCap returns cap's record, creating it healthy-by-default (a
+// getOrCreateCap returns capability's record, creating it healthy-by-default (a
 // capability that has never been observed, or has only had uncorroborated
 // content failures, is not yet grounds to call it unhealthy).
-func (t *Tracker) getOrCreateCap(cap Capability) *store.LLMCapabilityRecord {
-	c, ok := t.caps[cap]
+func (t *Tracker) getOrCreateCap(capability Capability) *store.LLMCapabilityRecord {
+	c, ok := t.caps[capability]
 	if !ok {
-		c = &store.LLMCapabilityRecord{Capability: string(cap), Healthy: true}
-		t.caps[cap] = c
+		c = &store.LLMCapabilityRecord{Capability: string(capability), Healthy: true}
+		t.caps[capability] = c
 	}
 	return c
 }
 
-func (t *Tracker) markCapabilityHealthy(cap Capability, now time.Time) {
-	c := t.getOrCreateCap(cap)
+func (t *Tracker) markCapabilityHealthy(capability Capability, now time.Time) {
+	c := t.getOrCreateCap(capability)
 	wasUnhealthy := !c.Healthy
 	c.Healthy = true
 	c.ReasonCode = ""
@@ -334,24 +336,24 @@ func (t *Tracker) markCapabilityHealthy(cap Capability, now time.Time) {
 	successAt := now
 	c.LastSuccessAt = &successAt
 	if wasUnhealthy {
-		t.logger.Info("llm health: capability recovered", "capability", string(cap))
+		t.logger.Info("llm health: capability recovered", "capability", string(capability))
 	}
 }
 
-// clearCapabilityIfPresent clears an existing unhealthy record for cap
+// clearCapabilityIfPresent clears an existing unhealthy record for capability
 // without creating one — used when a stronger signal (a real primary-client
 // success) proves reachability the probe capability itself was never asked
 // about. A capability that has genuinely never been observed stays absent
 // from Snapshot rather than gaining a synthetic healthy entry.
-func (t *Tracker) clearCapabilityIfPresent(cap Capability, now time.Time) {
-	if _, ok := t.caps[cap]; !ok {
+func (t *Tracker) clearCapabilityIfPresent(capability Capability, now time.Time) {
+	if _, ok := t.caps[capability]; !ok {
 		return
 	}
-	t.markCapabilityHealthy(cap, now)
+	t.markCapabilityHealthy(capability, now)
 }
 
-func (t *Tracker) markCapabilityUnhealthy(cap Capability, reason Reason, detail string, now time.Time) {
-	c := t.getOrCreateCap(cap)
+func (t *Tracker) markCapabilityUnhealthy(capability Capability, reason Reason, detail string, now time.Time) {
+	c := t.getOrCreateCap(capability)
 	wasHealthy := c.Healthy
 	c.Healthy = false
 	c.ReasonCode = string(reason)
@@ -363,7 +365,7 @@ func (t *Tracker) markCapabilityUnhealthy(cap Capability, reason Reason, detail 
 		c.UnhealthySince = &since
 	}
 	if wasHealthy {
-		t.logger.Warn("llm health: capability unhealthy", "capability", string(cap), "reason", string(reason), "detail", detail)
+		t.logger.Warn("llm health: capability unhealthy", "capability", string(capability), "reason", string(reason), "detail", detail)
 	}
 }
 
@@ -371,14 +373,14 @@ func (t *Tracker) markCapabilityUnhealthy(cap Capability, reason Reason, detail 
 // capability is marked unhealthy only once two or more distinct subjects
 // have content-failed since its last success, so one pathological Incident
 // cannot declare the LLM unhealthy.
-func (t *Tracker) recordContentFailure(cap Capability, subject string, reason Reason, detail string, now time.Time) {
-	c := t.getOrCreateCap(cap)
+func (t *Tracker) recordContentFailure(capability Capability, subject string, reason Reason, detail string, now time.Time) {
+	c := t.getOrCreateCap(capability)
 	failAt := now
 	c.LastFailureAt = &failAt
 	c.ReasonCode = string(reason)
 	c.Detail = detail
 
-	subjects := t.contentSubjects[cap]
+	subjects := t.contentSubjects[capability]
 	found := false
 	for _, s := range subjects {
 		if s == subject {
@@ -391,14 +393,14 @@ func (t *Tracker) recordContentFailure(cap Capability, subject string, reason Re
 		if len(subjects) > maxContentSubjects {
 			subjects = subjects[len(subjects)-maxContentSubjects:]
 		}
-		t.contentSubjects[cap] = subjects
+		t.contentSubjects[capability] = subjects
 	}
 
 	if len(subjects) >= 2 && c.Healthy {
 		c.Healthy = false
 		since := now
 		c.UnhealthySince = &since
-		t.logger.Warn("llm health: capability unhealthy", "capability", string(cap), "reason", string(reason), "detail", detail)
+		t.logger.Warn("llm health: capability unhealthy", "capability", string(capability), "reason", string(reason), "detail", detail)
 	}
 }
 
@@ -408,13 +410,13 @@ func (t *Tracker) recordContentFailure(cap Capability, subject string, reason Re
 // coincides exactly with the priority the state itself implies.
 func (t *Tracker) aggregate() (State, string, string) {
 	order := []Capability{CapabilityTriageDraft, CapabilityProbe, CapabilityVerificationRejudge}
-	for _, cap := range order {
-		c, ok := t.caps[cap]
+	for _, capability := range order {
+		c, ok := t.caps[capability]
 		if !ok || c.Healthy {
 			continue
 		}
 		state := StateDegraded
-		if cap == CapabilityTriageDraft || cap == CapabilityProbe {
+		if capability == CapabilityTriageDraft || capability == CapabilityProbe {
 			state = StateUnavailable
 		}
 		return state, c.ReasonCode, c.Detail

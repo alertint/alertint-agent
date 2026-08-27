@@ -150,7 +150,9 @@ func (s *Skill) maybeClassify(ctx context.Context, inc store.Incident, memory *M
 
 	obs := s.cfg.Health.Begin(llmhealth.CapabilityMemoryClassifier, inc.ID)
 	result := Classify(ctx, s.cfg.Classifier, inc.GroupKey, *memory.topPrefilter)
-	obs.Finish(result.Err)
+	// Finish persists with its own bounded context.Background() by design: a
+	// classifier observation must never be dropped because ctx was canceled.
+	obs.Finish(result.Err) //nolint:contextcheck
 	if result.Err != nil {
 		// The verdict fail-opens to unsure either way; the log distinguishes a
 		// truncated reply — the model's reasoning ate the completion budget —

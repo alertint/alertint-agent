@@ -323,12 +323,15 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		return err
 	}
 
+	// ar.health.Finish persists with its own bounded context.Background() by
+	// design: a triage_draft observation must never be dropped because ctx
+	// was canceled between the LLM call returning and the decode finishing.
 	var resp llmResponse
 	if err := json.Unmarshal(ar.raw, &resp); err != nil {
-		ar.health.Finish(fmt.Errorf("%w: %v", llmhealth.ErrResponseMalformed, err))
+		ar.health.Finish(fmt.Errorf("%w: %v", llmhealth.ErrResponseMalformed, err)) //nolint:contextcheck
 		return fmt.Errorf("acutetriage: parse llm response: %w", err)
 	}
-	ar.health.Finish(nil)
+	ar.health.Finish(nil) //nolint:contextcheck
 	clampConfidence(&resp.Confidence)
 
 	// Verification round (ADR-0021/0022): after the draft verdict, run the floor +
@@ -724,7 +727,10 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		CachePrefix: s.cfg.Verification.Enabled && s.cfg.PromptCaching,
 	}, RequiredKeys)
 	if err != nil {
-		obs.Finish(err)
+		// obs.Finish persists with its own bounded context.Background() by
+		// design: a triage_draft observation must never be dropped because
+		// ctx was canceled.
+		obs.Finish(err) //nolint:contextcheck
 		s.logger.Error("llm failed", "incident", inc.ID, "err", err)
 		if s.auditor != nil {
 			_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.analysis_failed", map[string]any{
@@ -979,7 +985,10 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 		CachePrefix: s.cfg.PromptCaching,
 	}, RequiredKeys)
 	if err != nil {
-		obs.Finish(err)
+		// obs.Finish persists with its own bounded context.Background() by
+		// design: a verification_rejudge observation must never be dropped
+		// because ctx was canceled.
+		obs.Finish(err) //nolint:contextcheck
 		s.logger.Warn("acutetriage: verification re-judge failed; draft stands", "incident", inc.ID, "err", err)
 		g := governingOf(ar.memory)
 		if g != nil && g.Steers {
@@ -1001,7 +1010,7 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 	var resp2 llmResponse
 	if err := json.Unmarshal(comp.Raw, &resp2); err != nil {
 		// A malformed re-judge must not fail a triage that has a valid draft.
-		obs.Finish(fmt.Errorf("%w: %v", llmhealth.ErrResponseMalformed, err))
+		obs.Finish(fmt.Errorf("%w: %v", llmhealth.ErrResponseMalformed, err)) //nolint:contextcheck
 		s.logger.Warn("acutetriage: verification re-judge returned malformed JSON; draft stands", "incident", inc.ID, "err", err)
 		g := governingOf(ar.memory)
 		if g != nil && g.Steers {
@@ -1011,7 +1020,7 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 		}
 		return s.degradedDraft(ctx, inc.ID, ar.raw, round, resp, g, DegradationLLMResponseInvalid)
 	}
-	obs.Finish(nil)
+	obs.Finish(nil) //nolint:contextcheck // persists with its own bounded context.Background() by design
 	clampConfidence(&resp2.Confidence)
 
 	// Clamp rail (R15): a re-judge that leans on unfetched evidence must not raise

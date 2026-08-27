@@ -15,14 +15,14 @@ import (
 	"github.com/alertint/alertint-agent/internal/llmhealth"
 )
 
-type timeoutErr struct{}
+type timeoutError struct{}
 
-func (timeoutErr) Error() string   { return "i/o timeout" }
-func (timeoutErr) Timeout() bool   { return true }
-func (timeoutErr) Temporary() bool { return true }
+func (timeoutError) Error() string   { return "i/o timeout" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return true }
 
 func TestClassify(t *testing.T) {
-	var _ net.Error = timeoutErr{}
+	var _ net.Error = timeoutError{}
 	cases := []struct {
 		name string
 		err  error
@@ -32,7 +32,7 @@ func TestClassify(t *testing.T) {
 		{"nil", nil, llmhealth.ReasonOK, llmhealth.ClassOK},
 		{"canceled", fmt.Errorf("acutetriage: llm: %w", context.Canceled), llmhealth.ReasonCanceled, llmhealth.ClassIgnored},
 		{"deadline", context.DeadlineExceeded, llmhealth.ReasonTimeout, llmhealth.ClassDependency},
-		{"net timeout", &url.Error{Op: "Post", Err: timeoutErr{}}, llmhealth.ReasonTimeout, llmhealth.ClassDependency},
+		{"net timeout", &url.Error{Op: "Post", Err: timeoutError{}}, llmhealth.ReasonTimeout, llmhealth.ClassDependency},
 		{"net refused", &url.Error{Op: "Post", Err: errors.New("connection refused")}, llmhealth.ReasonNetwork, llmhealth.ClassDependency},
 		{"429", &llm.RetryableError{StatusCode: 429}, llmhealth.ReasonRateLimited, llmhealth.ClassDependency},
 		{"529", &llm.RetryableError{StatusCode: 529}, llmhealth.ReasonProviderUnavailable, llmhealth.ClassDependency},
@@ -57,12 +57,12 @@ func TestClassify(t *testing.T) {
 func TestSafeDetailNeverLeaksProviderText(t *testing.T) {
 	secret := "sk-ant-SECRET " + strings.Repeat("body", 200)
 	cases := map[error]string{
-		&llm.APIError{StatusCode: 401, Message: secret}:                       "HTTP 401",
-		&llm.RetryableError{StatusCode: 503}:                                  "HTTP 503",
-		&url.Error{Op: "Post", URL: "https://x/" + secret, Err: timeoutErr{}}: "request timed out",
-		fmt.Errorf("%w: missing keys [summary]", llm.ErrSchemaViolation):      "schema violation",
-		fmt.Errorf("%w: %s", llmhealth.ErrResponseMalformed, secret):          "typed response malformed",
-		context.DeadlineExceeded:                                              "request timed out",
+		&llm.APIError{StatusCode: 401, Message: secret}:                         "HTTP 401",
+		&llm.RetryableError{StatusCode: 503}:                                    "HTTP 503",
+		&url.Error{Op: "Post", URL: "https://x/" + secret, Err: timeoutError{}}: "request timed out",
+		fmt.Errorf("%w: missing keys [summary]", llm.ErrSchemaViolation):        "schema violation",
+		fmt.Errorf("%w: %s", llmhealth.ErrResponseMalformed, secret):            "typed response malformed",
+		context.DeadlineExceeded:                                                "request timed out",
 	}
 	for err, want := range cases {
 		got := llmhealth.SafeDetail(err)

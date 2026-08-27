@@ -76,11 +76,11 @@ func TestConcurrentObservationsRace(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			cap := llmhealth.CapabilityTriageDraft
+			capability := llmhealth.CapabilityTriageDraft
 			if i%3 == 0 {
-				cap = llmhealth.CapabilityMemoryClassifier
+				capability = llmhealth.CapabilityMemoryClassifier
 			}
-			obs := tr.Begin(cap, fmt.Sprintf("inc-%d", i))
+			obs := tr.Begin(capability, fmt.Sprintf("inc-%d", i))
 			if i%2 == 0 {
 				obs.Finish(err503)
 			} else {

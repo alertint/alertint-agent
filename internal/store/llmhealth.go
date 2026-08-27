@@ -144,7 +144,7 @@ func nullTime(t *time.Time) any {
 // parseNullTime turns a nullable stored timestamp back into *time.Time.
 func parseNullTime(s sql.NullString) (*time.Time, error) {
 	if !s.Valid {
-		return nil, nil
+		return nil, nil //nolint:nilnil // SQL NULL legitimately has no timestamp and no error; callers branch on nil
 	}
 	v, err := time.Parse(time.RFC3339Nano, s.String)
 	if err != nil {

@@ -5,6 +5,7 @@ package llm_test
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"testing"
 
 	"github.com/alertint/alertint-agent/internal/llm"
@@ -19,7 +20,7 @@ func TestAPIErrorString(t *testing.T) {
 	}
 	var target *llm.APIError
 	wrapped := fmt.Errorf("acutetriage: llm: %w", &llm.APIError{StatusCode: 403})
-	if !errors.As(wrapped, &target) || target.StatusCode != 403 {
+	if !errors.As(wrapped, &target) || target.StatusCode != http.StatusForbidden {
 		t.Fatalf("errors.As failed: %v", wrapped)
 	}
 }

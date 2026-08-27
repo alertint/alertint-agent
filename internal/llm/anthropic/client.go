@@ -41,9 +41,6 @@ const (
 	// is supplied.
 	anthropicBaseURL = "https://api.anthropic.com"
 
-	// messagesEndpoint is the Anthropic Messages API URL.
-	messagesEndpoint = anthropicBaseURL + "/v1/messages"
-
 	// anthropicVersion is the API version header value required by Anthropic.
 	anthropicVersion = "2023-06-01"
 
@@ -103,7 +100,7 @@ func New(cfg Config, auditor *audit.Auditor, logger *slog.Logger) *Client {
 }
 
 // NewWithHTTPClient constructs a Client with a custom base URL. When
-// baseURL is non-empty it overrides messagesEndpoint; this is used in
+// baseURL is non-empty it overrides anthropicBaseURL; this is used in
 // tests to point at an httptest.Server.
 func NewWithHTTPClient(cfg Config, auditor *audit.Auditor, logger *slog.Logger, baseURL string) *Client {
 	cfg.defaults()

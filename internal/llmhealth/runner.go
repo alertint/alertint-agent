@@ -65,5 +65,8 @@ func (r *Runner) Step(ctx context.Context, now time.Time) {
 	pctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	res := r.prober.Probe(pctx)
 	cancel()
-	r.t.ObserveProbe(res)
+	// ObserveProbe persists with its own bounded context.Background() by
+	// design (Task 6 contract): an observation must never be dropped because
+	// the caller's ctx was canceled mid-persist.
+	r.t.ObserveProbe(res) //nolint:contextcheck
 }

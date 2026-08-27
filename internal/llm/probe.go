@@ -46,7 +46,7 @@ func DoProbe(client *http.Client, req *http.Request, path string) ProbeResult {
 		res.Err = fmt.Errorf("llm: probe must be GET, got %s", req.Method)
 		return res
 	}
-	resp, err := client.Do(req)
+	resp, err := client.Do(req) // #nosec G704 -- req's URL is always built by the caller from the operator-configured provider base URL (anthropicBaseURL or llm.base_url), never from request/user input
 	if err != nil {
 		res.Outcome = ProbeFailed
 		res.Err = fmt.Errorf("llm: http: %w", err)

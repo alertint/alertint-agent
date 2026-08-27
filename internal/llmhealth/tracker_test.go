@@ -63,6 +63,26 @@ func newTracker(t *testing.T) (*llmhealth.Tracker, *store.Store, *clock, *recAud
 	return tr, st, c, a
 }
 
+// newTrackerOnly is newTracker for the common case: a test that needs only
+// the Tracker itself, with no clock or audit assertions.
+func newTrackerOnly(t *testing.T) *llmhealth.Tracker {
+	t.Helper()
+	st, err := store.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	tr, err := llmhealth.New(context.Background(), st, llmhealth.Options{
+		Now:            time.Now,
+		BroadcastAfter: 5 * time.Minute,
+		IdleProbeAfter: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tr
+}
+
 var err503 = &llm.RetryableError{StatusCode: 503}
 
 func TestCall1FailureMakesUnavailableAndOnlyCall1SuccessClears(t *testing.T) {
@@ -89,7 +109,7 @@ func TestCall1FailureMakesUnavailableAndOnlyCall1SuccessClears(t *testing.T) {
 }
 
 func TestCall2FailureDegradesOnly(t *testing.T) {
-	tr, _, _, _ := newTracker(t)
+	tr := newTrackerOnly(t)
 	tr.Begin(llmhealth.CapabilityVerificationRejudge, "inc-1").Finish(context.DeadlineExceeded)
 	if s := tr.Snapshot(); s.State != llmhealth.StateDegraded || s.Reason != llmhealth.ReasonTimeout {
 		t.Fatalf("%+v", s)
@@ -105,7 +125,7 @@ func TestCall2FailureDegradesOnly(t *testing.T) {
 }
 
 func TestClassifierNeverChangesAggregate(t *testing.T) {
-	tr, _, _, _ := newTracker(t)
+	tr := newTrackerOnly(t)
 	tr.Begin(llmhealth.CapabilityMemoryClassifier, "inc-1").Finish(&llm.APIError{StatusCode: 401})
 	s := tr.Snapshot()
 	if s.State != llmhealth.StateHealthy {
@@ -125,7 +145,7 @@ func TestShutdownCancelIsIgnored(t *testing.T) {
 }
 
 func TestContentFailureNeedsTwoSubjects(t *testing.T) {
-	tr, _, _, _ := newTracker(t)
+	tr := newTrackerOnly(t)
 	malformed := errors.Join(llmhealth.ErrResponseMalformed, errors.New("unexpected end of JSON"))
 	tr.Begin(llmhealth.CapabilityTriageDraft, "inc-1").Finish(malformed)
 	tr.Begin(llmhealth.CapabilityTriageDraft, "inc-1").Finish(malformed) // retry of the same Incident
@@ -139,7 +159,7 @@ func TestContentFailureNeedsTwoSubjects(t *testing.T) {
 }
 
 func TestProbeFailureMakesUnavailableUntilRealSuccess(t *testing.T) {
-	tr, _, _, _ := newTracker(t)
+	tr := newTrackerOnly(t)
 	tr.ObserveProbe(llm.ProbeResult{Outcome: llm.ProbeFailed, Method: "GET", Path: "/health", Err: err503})
 	if s := tr.Snapshot(); s.State != llmhealth.StateUnavailable {
 		t.Fatalf("%+v", s)

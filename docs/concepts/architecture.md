@@ -275,6 +275,40 @@ persisting an alert and its handoff can still lose that handoff. A durable
 Receiver-to-Correlator delivery ledger and/or an asynchronous triage worker
 are a separate, future architecture item.
 
+## LLM dependency health
+
+The configured LLM is an installation-level dependency, observed below Acute
+Triage rather than owned by any Incident or Situation. Each distinct use of
+the LLM — the triage draft (Call 1), the verification re-judgment (Call 2),
+the optional memory classifier, and the idle probe — is its own **LLM
+capability**, cleared only by its own success:
+
+- A `triage_draft` failure makes the installation `unavailable`; a
+  `verification_rejudge` failure makes it `degraded` while drafts continue
+  to ship. `memory_classifier` is reported independently and never changes
+  the rolled-up state.
+- After five idle minutes with zero in-flight calls, a strictly
+  non-generating metadata `GET` probes reachability — never a completion,
+  never a prompt. A dependency-class probe failure also makes the
+  installation `unavailable` (the only signal available when traffic is
+  absent); it is cleared by probe success or by any real primary-client
+  success, never the reverse.
+- State is durable in `llm_health` / `llm_health_capabilities`, restored on
+  restart, and exposed under `/health`'s `llm` key without affecting the
+  HTTP status. Audit kinds: `llm.health.changed`, `llm.health.probe`,
+  `llm.health.slack_posted`, `llm.health.slack_updated`,
+  `llm.health.slack_suppressed`, `llm.health.slack_failed` — all bounded
+  reason codes and sanitized detail, never prompts, provider bodies,
+  headers, or credentials.
+- When Slack is enabled, one `AlertINT system` root message is posted per
+  sustained outage episode and edited in place as the state or recovery
+  changes — never a card per stuck Incident.
+
+**Honest limitation:** the same synchronous-Correlator-loop limitation above
+applies here — a Call 1/Call 2/probe in flight pauses correlation for its
+duration, so LLM dependency health is observed from real work, not a
+side-channel canary.
+
 ## Audit log
 
 Every action appends a hash-chained row to the local audit log:

@@ -460,3 +460,14 @@ informational and never makes an orchestrator restart the agent:
 ```json
 {"status":"ok","integrations":[{"name":"prometheus","detail":"http://prometheus:9090","ok":true,"checked_at":"..."}]}
 ```
+
+The response also carries the LLM's installation dependency state under
+`llm` (see [`health`](#health)). This state comes from real triage calls plus
+an idle metadata `GET` probe; it is informational and never changes the HTTP
+status — `alertint health` is unchanged. `state` is `healthy | degraded |
+unavailable`; `capabilities[]` lists whichever of `triage_draft`,
+`verification_rejudge`, `memory_classifier`, `probe` have been observed:
+
+```json
+{"status":"ok","llm":{"state":"unavailable","reason":"provider_unavailable","detail":"HTTP 503","unhealthy_since":"2026-08-27T12:00:00Z","outage_generation":2,"in_flight":0,"capabilities":[{"capability":"triage_draft","healthy":false,"reason":"provider_unavailable","detail":"HTTP 503"}]}}
+```

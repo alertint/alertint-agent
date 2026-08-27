@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Installation-level LLM dependency health. Real triage outcomes are observed
+  per capability (draft, verification re-judge, optional classifier); after
+  five idle minutes a zero-generation metadata `GET` probe checks reachability
+  (never a completion, never a prompt). State is durable and shown in
+  `GET /health` under `llm` without changing the liveness status. When Slack
+  is enabled, one brief `AlertINT system` message is posted after five
+  continuous unhealthy minutes and edited in place on recovery — never one
+  card per stuck incident. New `health` config block:
+  `llm_idle_probe_after_seconds` and `broadcast_after_seconds` (both 300).
+  (#60)
+- Verification degradation now records why the draft shipped:
+  `degradation_reason` is one of `llm_call_failed`, `llm_response_invalid`,
+  `verification_source_unavailable`, and the Slack/stdout caveat names it.
+  (#60)
+
 ### Fixed
 
 - Log enrichment no longer queries Loki over the incident's entire open span.
@@ -16,6 +33,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   New `logs.max_window_minutes` (default `120`, `0` = unbounded) clamps the
   window to the most recent N minutes; the prompt states when the earlier span
   was not fetched. (#63)
+- Triage retries are durable: an incident's dispatch phase, attempt count, and
+  next retry time live in a new `incident_triage` table, the incident is
+  `processing` while a triage call is in flight, and a restart mid-attempt
+  resumes the schedule instead of guessing. A same-group firing alert that
+  arrives while triage is in retry backoff joins the original incident
+  instead of opening a duplicate; clean skips, in-flight calls, and failed
+  incidents are not joined. Retry delays (30 s, 2 m, 8 m, 32 m) and the
+  five-attempt budget are unchanged. (#60)
 
 ## [0.13.4] - 2026-08-25
 

@@ -13,8 +13,8 @@ import (
 
 var _ llm.Prober = (*Client)(nil)
 
-// Probe checks reachability with a model-metadata GET. It never touches
-// /v1/messages and sends no prompt, so it costs zero tokens.
+// Probe checks reachability with a model-metadata GET. It never touches the
+// generation endpoint and sends no prompt, so it costs zero tokens.
 func (c *Client) Probe(ctx context.Context) llm.ProbeResult {
 	p := "/v1/models/" + url.PathEscape(c.cfg.Model)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+p, nil)
