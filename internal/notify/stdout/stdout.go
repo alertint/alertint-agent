@@ -64,7 +64,7 @@ func (n *Notifier) Notify(ctx context.Context, f notify.Finding) error {
 			Finding: f,
 		}
 		if f.Unverified {
-			l.Caveat = "⚠ unverified — checks unavailable"
+			l.Caveat = notify.UnverifiedCaveat(f.DegradationReason, f.Drill)
 		}
 		b, err := json.Marshal(l)
 		if err != nil {

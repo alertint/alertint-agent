@@ -543,10 +543,7 @@ func firingDetailBlocks(f notify.Finding) []slacklib.Block {
 		// Drill wording: on a drill the missing checks are the expected state
 		// (drill labels are fictional, no evidence source can verify them), and
 		// the bare caveat reads as "the product is broken" to a first-timer.
-		unverifiedText := "⚠ unverified — checks unavailable"
-		if f.Drill {
-			unverifiedText = "⚠ unverified — no live evidence checks ran (expected for a drill: its labels are fictional)"
-		}
+		unverifiedText := notify.UnverifiedCaveat(f.DegradationReason, f.Drill)
 		blocks = append(blocks, slacklib.NewContextBlock("",
 			slacklib.NewTextBlockObject(slacklib.MarkdownType, unverifiedText, false, false),
 		))

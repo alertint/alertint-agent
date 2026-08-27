@@ -187,6 +187,19 @@ func TestUnverifiedWordingDrillAware(t *testing.T) {
 	}
 }
 
+func TestUnverifiedWordingDegradationReason(t *testing.T) {
+	f := testFinding()
+	f.Unverified = true
+	f.DegradationReason = "llm_call_failed"
+	got := blocksJSON(t, firingDetailBlocks(f))
+	if !strings.Contains(got, "verification call failed") {
+		t.Errorf("degradation reason must distinguish an LLM call failure:\n%s", got)
+	}
+	if strings.Contains(got, "checks unavailable") {
+		t.Errorf("degradation reason must replace the generic caveat, not add to it:\n%s", got)
+	}
+}
+
 func TestFiringCardBlocks_RecurrenceLine(t *testing.T) {
 	f := testFinding()
 	if s := blocksJSON(t, firingCardBlocks(f)); strings.Contains(s, "recurred") {

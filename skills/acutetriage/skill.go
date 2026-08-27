@@ -428,6 +428,9 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 			// full falsification pass — card renderers surface a caveat off this.
 			Unverified: ver != nil && ver.Outcome == verifyOutcomeDegraded,
 		}
+		if ver != nil {
+			f.DegradationReason = ver.DegradationReason
+		}
 		if p.rejudge && p.recurrenceEpisodes > 1 && !p.recurrenceLastSeen.IsZero() {
 			f.Recurrence = &notify.Recurrence{Episodes: p.recurrenceEpisodes, LastSeen: p.recurrenceLastSeen}
 		}

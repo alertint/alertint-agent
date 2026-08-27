@@ -582,3 +582,23 @@ func TestFindingJSONDrillKey(t *testing.T) {
 		t.Errorf("real finding JSON must omit drill: %s", plain)
 	}
 }
+
+func TestUnverifiedCaveat(t *testing.T) {
+	cases := []struct {
+		reason string
+		drill  bool
+		want   string
+	}{
+		{"llm_call_failed", false, "⚠ unverified — verification call failed; confidence is the draft's"},
+		{"llm_call_failed", true, "⚠ unverified — verification call failed; confidence is the draft's"},
+		{"llm_response_invalid", false, "⚠ unverified — verification reply unreadable; confidence is the draft's"},
+		{"verification_source_unavailable", false, "⚠ unverified — checks unavailable"},
+		{"verification_source_unavailable", true, "⚠ unverified — no live evidence checks ran (expected for a drill: its labels are fictional)"},
+		{"", false, "⚠ unverified — checks unavailable"},
+	}
+	for _, tc := range cases {
+		if got := notify.UnverifiedCaveat(tc.reason, tc.drill); got != tc.want {
+			t.Errorf("(%q,%v) = %q", tc.reason, tc.drill, got)
+		}
+	}
+}
