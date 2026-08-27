@@ -20,135 +20,245 @@ func ValidateExpr(expr string) error {
 	return nil
 }
 
-// promqlSignature is a normalized, order-preserving summary of the semantic
-// anchors in a PromQL expression: the things a syntax-only repair must never
-// change. Only grouping punctuation, whitespace, comments, and the PRESENCE of
-// an aggregation wrapper (which a syntax repair is explicitly allowed to add,
-// per ADR-0043) are excluded — everything a reader would call "what this query
-// asks" is anchored here.
-type promqlSignature struct {
-	metricRefs    []string   // vector-selector metric names, in encounter order
-	calls         []string   // non-aggregator function names, in encounter order
-	matcherGroups [][]string // one entry per `{...}` selector, in encounter order; each
-	// entry holds that selector's "label<op>value" triples, sorted within the
-	// selector only. Grouping by originating selector (rather than pooling every
-	// matcher into one flat sorted list) is required so that swapping label
-	// values between two different selectors is detected as a change, not
-	// masked by a global sort turning the comparison into a multiset check.
-	literals []string // "kind:value" duration/number/string literals, in encounter order
-	// groupClauses holds one "by:l1,l2" / "without:l1,l2" entry per by/without
-	// clause, in encounter order. Labels are sorted within a clause (`by (a,b)`
-	// and `by (b,a)` group identically), but the keyword is kept so a
-	// by<->without swap — which inverts kept vs. excluded labels — is caught
-	// too. Relocating a clause is legal syntax repair; changing WHICH labels it
-	// names is a different question being asked.
-	groupClauses []string
-	// aggregators holds the aggregation keywords (sum, avg, topk, ...) in
-	// encounter order. ValidateSyntaxRepair compares this ONLY when the
-	// original already had at least one: introducing the aggregation an
-	// expression was missing is the canonical repair (issue 62), but swapping
-	// topk for bottomk in an expression that already aggregated is a semantic
-	// change wearing a syntax repair's clothes.
-	aggregators []string
-	// operators holds arithmetic/comparison/set/@ operator tokens (everything
-	// the pinned parser's ItemType.IsOperator reports), in encounter order.
-	// Label-matcher operators never reach here: they are consumed whole as part
-	// of a matcher triple, where matcherGroups already anchors them together
-	// with their label and value.
-	operators []string
+// canonToken is one token of an expression's canonical form: either a lexer
+// item carried through verbatim (typ and val as the lexer produced them), or
+// the synthetic token a `label<op>value` matcher triple collapses into (typ
+// zero — no real ItemType is zero — val the three parts concatenated, matcher
+// true). Two canonical tokens are the same token only if all three fields
+// agree, so nothing is ever compared on its value alone.
+type canonToken struct {
+	typ     promqlparser.ItemType
+	val     string
+	matcher bool
 }
 
-// ValidateSyntaxRepair reports whether repaired is a syntax-only rewrite of
-// original: the same metric references, function calls, label matchers,
-// literals, grouping label lists, operators, and — when the original already
-// aggregated — the same aggregation operator. Only grouping punctuation and
-// the introduction or relocation of an aggregation wrapper (e.g. completing
-// `increase(x[1h]) by (type)` into `sum by (type) (increase(x[1h]))`) may
-// differ. It never inspects query text in its error messages, only the class
-// of anchor that changed.
+// promqlCanonical is an expression reduced to the two things the repair gate
+// compares: the token sequence with by/without clauses lifted out, and those
+// clauses as a sorted list.
+type promqlCanonical struct {
+	tokens  []canonToken
+	clauses []string
+}
+
+// ValidateSyntaxRepair reports whether repaired is a rewrite of original that
+// the syntax-repair path is allowed to produce. It is a WHITELIST, not a list
+// of forbidden changes: the two token sequences must be identical except for
+// the three rewrites named below, so every keyword, modifier, parenthesis,
+// bracket, comma, literal and identifier the repair touched but that is not
+// whitelisted makes the sequences differ, and the repair is rejected. A PromQL
+// keyword added to a future parser needs no new case here — it is anchored the
+// moment the lexer emits it.
 //
-// If original cannot be tokenized far enough to establish a signature, this
-// fails closed: the repair is rejected rather than approved on a partial
-// read.
+// The whitelist:
+//
+//   - W1, by/without relocation. Every `by (…)` / `without (…)` clause is
+//     lifted out of both sequences into a clause list (keyword kept, labels
+//     sorted). The sorted clause lists must be equal: a clause may move or
+//     swap places with another, but its keyword and labels may not change.
+//     `on` / `ignoring` / `group_left` / `group_right` are NOT lifted — their
+//     position decides which operator they modify, so they stay in the
+//     sequence with their parens and labels as ordinary tokens.
+//   - W2, at most one new aggregation wrapper, and only over an original that
+//     had none. If both sides have the same number of aggregators the
+//     remainders must be exactly equal. If the original had none and the
+//     repaired has exactly one, that aggregator plus its opening parenthesis
+//     and the matching closing one are removed, and what is left must be
+//     exactly the original. Anything else is rejected — including a second
+//     aggregator and a parameterised wrapper such as `topk(5, …)`, whose
+//     parameter and comma survive the removal and do not match.
+//   - W3, matcher order inside one selector. The `label<op>value` triples of a
+//     single `{…}` selector are collapsed into one token each and sorted among
+//     themselves. Matchers of one selector apply conjunctively, so their order
+//     cannot change what is selected; the braces, the commas and every other
+//     token stay exactly where they were, and matchers are never pooled across
+//     selectors (that would let two selectors swap label values unnoticed).
+//
+// The original is by construction INVALID PromQL, so there is no parse tree to
+// compare against — only what the token stream says. That is enough in the
+// fail-closed direction: any disagreement is a rejection, and a rejected repair
+// only means one optional verification query does not run (ADR-0043).
+//
+// Errors name the class of the first divergence and never include query text.
+// If either side cannot be tokenized this fails closed: the repair is rejected
+// rather than approved on a partial read.
 func ValidateSyntaxRepair(original, repaired string) error {
-	originalSig, err := buildPromqlSignature(original)
+	originalCanon, err := canonicalizePromql(original)
 	if err != nil {
 		return fmt.Errorf("prometheus: syntax repair rejected: original expression not fully tokenizable")
 	}
-	repairedSig, err := buildPromqlSignature(repaired)
+	repairedCanon, err := canonicalizePromql(repaired)
 	if err != nil {
 		return fmt.Errorf("prometheus: syntax repair rejected: repaired expression not fully tokenizable")
 	}
-
-	switch {
-	case !slices.Equal(originalSig.metricRefs, repairedSig.metricRefs):
-		return fmt.Errorf("prometheus: syntax repair changed a metric reference")
-	case !slices.Equal(originalSig.calls, repairedSig.calls):
-		return fmt.Errorf("prometheus: syntax repair changed a function call")
-	case !equalMatcherGroups(originalSig.matcherGroups, repairedSig.matcherGroups):
-		return fmt.Errorf("prometheus: syntax repair changed a label matcher")
-	case !slices.Equal(originalSig.literals, repairedSig.literals):
-		return fmt.Errorf("prometheus: syntax repair changed a literal")
-	case !slices.Equal(originalSig.groupClauses, repairedSig.groupClauses):
+	if !slices.Equal(originalCanon.clauses, repairedCanon.clauses) {
 		return fmt.Errorf("prometheus: syntax repair changed a grouping label list")
-	case !slices.Equal(originalSig.operators, repairedSig.operators):
-		return fmt.Errorf("prometheus: syntax repair changed an operator")
-	// Guarded, deliberately: an original with NO aggregator may gain exactly
-	// the one it was missing (the issue-62 relocation this whole repair path
-	// exists for). An original that already aggregated may not have that
-	// aggregator swapped for a different one.
-	case len(originalSig.aggregators) > 0 && !slices.Equal(originalSig.aggregators, repairedSig.aggregators):
+	}
+	return compareCanonTokens(originalCanon.tokens, repairedCanon.tokens)
+}
+
+// compareCanonTokens applies W2 and then requires the two remainders to be
+// token-for-token equal.
+func compareCanonTokens(original, repaired []canonToken) error {
+	aggOriginal := countAggregators(original)
+	aggRepaired := countAggregators(repaired)
+	switch {
+	case aggOriginal == aggRepaired:
+		return firstCanonDivergence(original, repaired)
+	case aggOriginal == 0 && aggRepaired == 1:
+		// The issue-62 repair: the expression was missing the aggregation its
+		// grouping clause implied, and the model wrapped it. Strip exactly the
+		// wrapper and the two sides must then agree exactly.
+		stripped, ok := stripAggregationWrapper(repaired)
+		if !ok {
+			return fmt.Errorf("prometheus: syntax repair changed an aggregation operator")
+		}
+		return firstCanonDivergence(original, stripped)
+	default:
+		// Aggregation removed, a second one added, or one added to an
+		// expression that already aggregated: none of those is a repair.
 		return fmt.Errorf("prometheus: syntax repair changed an aggregation operator")
+	}
+}
+
+// countAggregators counts the aggregation keywords (sum, topk, quantile, ...)
+// in a canonical sequence, per the pinned parser's own classifier.
+func countAggregators(tokens []canonToken) int {
+	n := 0
+	for _, tok := range tokens {
+		if tok.typ.IsAggregator() {
+			n++
+		}
+	}
+	return n
+}
+
+// stripAggregationWrapper removes the single aggregator token, the LEFT_PAREN
+// that must follow it, and that parenthesis's match from tokens. It reports
+// false when the aggregator is not shaped like a bare `agg( … )` wrapper — an
+// aggregator with a grouping-modifier or parameter list in between, or an
+// unbalanced parenthesis — so the caller can reject rather than guess. A
+// parameterised wrapper (`topk(5, …)`) does pass this shape check; its 5 and
+// comma then remain and fail the sequence comparison, which is the same
+// rejection by a more precise route.
+func stripAggregationWrapper(tokens []canonToken) ([]canonToken, bool) {
+	open := -1
+	for i, tok := range tokens {
+		if tok.typ.IsAggregator() {
+			open = i
+			break
+		}
+	}
+	if open < 0 || open+1 >= len(tokens) || tokens[open+1].typ != promqlparser.LEFT_PAREN {
+		return nil, false
+	}
+	depth, closing := 0, -1
+	for j := open + 1; j < len(tokens) && closing < 0; j++ {
+		switch tokens[j].typ {
+		case promqlparser.LEFT_PAREN:
+			depth++
+		case promqlparser.RIGHT_PAREN:
+			depth--
+			if depth == 0 {
+				closing = j
+			}
+		}
+	}
+	if closing < 0 {
+		return nil, false
+	}
+	stripped := make([]canonToken, 0, len(tokens)-3)
+	for i, tok := range tokens {
+		if i == open || i == open+1 || i == closing {
+			continue
+		}
+		stripped = append(stripped, tok)
+	}
+	return stripped, true
+}
+
+// firstCanonDivergence returns nil when the two sequences are identical, and
+// otherwise an error naming the class of the first position where they differ.
+// The class is read off the original's token there, falling back to the
+// repaired's (one of the two may not exist, when the sequences differ in
+// length) and finally to the structural catch-all.
+func firstCanonDivergence(original, repaired []canonToken) error {
+	for i := range max(len(original), len(repaired)) {
+		if i < len(original) && i < len(repaired) && original[i] == repaired[i] {
+			continue
+		}
+		class := ""
+		if i < len(original) {
+			class = canonTokenClass(original, i)
+		}
+		if class == "" && i < len(repaired) {
+			class = canonTokenClass(repaired, i)
+		}
+		if class == "" {
+			class = "the expression structure"
+		}
+		return fmt.Errorf("prometheus: syntax repair changed %s", class)
 	}
 	return nil
 }
 
-// equalMatcherGroups reports whether a and b hold the same label-matcher
-// triples per selector, in the same selector order. Each group is compared
-// as a set (its own contents were sorted when built), but the groups
-// themselves are compared positionally so a value swapped between two
-// different selectors is caught rather than masked.
-func equalMatcherGroups(a, b [][]string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if !slices.Equal(a[i], b[i]) {
-			return false
+// canonTokenClass names the anchor class tokens[i] belongs to, for the error
+// message. It returns "" for tokens that carry no class of their own —
+// parentheses, brackets, commas, and the bare keywords and modifiers (offset,
+// bool, @ start/end, on, ignoring, group_left, group_right) — whose change the
+// caller reports as a structural one.
+func canonTokenClass(tokens []canonToken, i int) string {
+	tok := tokens[i]
+	switch {
+	case tok.typ.IsAggregator():
+		return "an aggregation operator"
+	case tok.typ.IsOperator():
+		return "an operator"
+	case tok.matcher:
+		return "a label matcher"
+	case tok.typ == promqlparser.DURATION, tok.typ == promqlparser.NUMBER, tok.typ == promqlparser.STRING:
+		return "a literal"
+	case tok.typ == promqlparser.IDENTIFIER, tok.typ == promqlparser.METRIC_IDENTIFIER:
+		if i+1 < len(tokens) && tokens[i+1].typ == promqlparser.LEFT_PAREN {
+			return "a function call"
 		}
+		return "a metric reference"
 	}
-	return true
+	return ""
 }
 
-// buildPromqlSignature tokenizes expr with the official lexer and reduces
-// the token stream to a promqlSignature. It returns an error if expr cannot
-// be fully tokenized.
-func buildPromqlSignature(expr string) (promqlSignature, error) {
+// canonicalizePromql lexes expr and reduces it to its canonical form: the token
+// sequence with matcher triples collapsed and sorted within each selector (W3)
+// and by/without clauses lifted out (W1), plus those clauses sorted. Every
+// other token is carried through verbatim and in place — nothing is dropped,
+// because a token that leaves the sequence is a token whose change cannot be
+// detected. It returns an error if expr cannot be fully tokenized.
+func canonicalizePromql(expr string) (promqlCanonical, error) {
 	items, err := lexAllItems(expr)
 	if err != nil {
-		return promqlSignature{}, err
+		return promqlCanonical{}, err
 	}
 
-	var sig promqlSignature
+	var canon promqlCanonical
 	braceDepth := 0
-	var currentGroup []string // matcher triples for the selector braces currently open
+	var matcherSlots []int // positions in canon.tokens of the open selector's matchers
 
 	for i := 0; i < len(items); i++ {
 		it := items[i]
 		switch {
 		case it.Typ == promqlparser.LEFT_BRACE:
 			if braceDepth == 0 {
-				currentGroup = nil
+				matcherSlots = nil
 			}
 			braceDepth++
+			canon.tokens = append(canon.tokens, canonToken{typ: it.Typ, val: it.Val})
 
 		case it.Typ == promqlparser.RIGHT_BRACE:
+			canon.tokens = append(canon.tokens, canonToken{typ: it.Typ, val: it.Val})
 			if braceDepth > 0 {
 				braceDepth--
 				if braceDepth == 0 {
-					sort.Strings(currentGroup)
-					sig.matcherGroups = append(sig.matcherGroups, currentGroup)
-					currentGroup = nil
+					sortMatcherSlots(canon.tokens, matcherSlots)
+					matcherSlots = nil
 				}
 			}
 
@@ -156,52 +266,48 @@ func buildPromqlSignature(expr string) (promqlSignature, error) {
 		// blind to the label name's token type: PromQL accepts keywords
 		// (`quantile`, `count`, `and`, ...) and quoted strings as label names,
 		// so anything sitting in front of a matcher operator inside an open
-		// selector is a label name, whatever it lexed as. Consuming the triple
-		// here is also what keeps those tokens from being double-counted as an
-		// aggregator, an operator, or a literal.
+		// selector is a label name, whatever it lexed as. Collapsing the triple
+		// here is also what lets W3 sort matchers without a matcher operator
+		// drifting away from the label and value it belongs to.
 		case matcherTripleAt(items, i, braceDepth):
-			currentGroup = append(currentGroup, it.Val+items[i+1].Val+items[i+2].Val)
+			matcherSlots = append(matcherSlots, len(canon.tokens))
+			canon.tokens = append(canon.tokens, canonToken{val: it.Val + items[i+1].Val + items[i+2].Val, matcher: true})
 			i += 2
 
-		case isGroupClauseKeyword(it.Typ):
+		// Only outside braces: inside a selector the lexer emits every label
+		// name as an IDENTIFIER, but the depth check makes that independent of
+		// the lexer rather than reliant on it.
+		case braceDepth == 0 && isGroupClauseKeyword(it.Typ):
 			var clause string
 			clause, i = readGroupClause(items, i)
-			sig.groupClauses = append(sig.groupClauses, clause)
+			canon.clauses = append(canon.clauses, clause)
 
-		case it.Typ.IsAggregator():
-			// WHETHER an expression aggregates is repairable syntax; WHICH
-			// aggregator it uses is not (sum and topk answer different
-			// questions). ValidateSyntaxRepair applies the distinction.
-			sig.aggregators = append(sig.aggregators, it.Val)
-
-		case it.Typ.IsOperator():
-			// Arithmetic, comparison, set operators and the `@` modifier, per
-			// the pinned parser's own classifier rather than a hand-rolled
-			// list. Label-matcher operators never reach this case — the
-			// matcher-triple case above already consumed them.
-			sig.operators = append(sig.operators, it.Val)
-
-		case it.Typ == promqlparser.IDENTIFIER, it.Typ == promqlparser.METRIC_IDENTIFIER:
-			if i+1 < len(items) && items[i+1].Typ == promqlparser.LEFT_PAREN {
-				sig.calls = append(sig.calls, it.Val)
-				continue
-			}
-			if braceDepth == 0 {
-				sig.metricRefs = append(sig.metricRefs, it.Val)
-			}
-
-		case it.Typ == promqlparser.DURATION:
-			sig.literals = append(sig.literals, "duration:"+it.Val)
-
-		case it.Typ == promqlparser.NUMBER:
-			sig.literals = append(sig.literals, "number:"+it.Val)
-
-		case it.Typ == promqlparser.STRING:
-			sig.literals = append(sig.literals, "string:"+it.Val)
+		default:
+			canon.tokens = append(canon.tokens, canonToken{typ: it.Typ, val: it.Val})
 		}
 	}
 
-	return sig, nil
+	// A clause carries no position (relocating it is the repair), so the list
+	// is sorted before it is compared.
+	sort.Strings(canon.clauses)
+	return canon, nil
+}
+
+// sortMatcherSlots sorts, in place, the matcher tokens sitting at the given
+// positions of tokens — leaving every other token, the commas between the
+// matchers included, exactly where it is.
+func sortMatcherSlots(tokens []canonToken, slots []int) {
+	if len(slots) < 2 {
+		return
+	}
+	vals := make([]string, 0, len(slots))
+	for _, slot := range slots {
+		vals = append(vals, tokens[slot].val)
+	}
+	sort.Strings(vals)
+	for i, slot := range slots {
+		tokens[slot].val = vals[i]
+	}
 }
 
 // matcherTripleAt reports whether items[i:i+3] is a `label<op>value` matcher
@@ -212,50 +318,46 @@ func matcherTripleAt(items []promqlparser.Item, i, braceDepth int) bool {
 	return braceDepth > 0 && i+2 < len(items) && isMatcherOp(items[i+1].Typ)
 }
 
-// isGroupClauseKeyword reports whether t opens a parenthesized label list whose
-// contents readGroupClause should anchor: an aggregation modifier (`by` /
-// `without`) or a vector-matching clause (`on` / `ignoring`).
+// isGroupClauseKeyword reports whether t opens an aggregation grouping clause
+// (`by` / `without`) whose parenthesized label list readGroupClause lifts out
+// of the token sequence.
 //
-// GROUP_LEFT/GROUP_RIGHT are deliberately absent. Their label list is OPTIONAL,
-// so `group_left (foo + bar)` would have a plain parenthesized EXPRESSION
-// consumed as if it were labels — hiding its metric references from the rest of
-// the signature, which is the opposite of failing closed. Left uncased, their
-// labels fall through to metricRefs, where a change is still caught (as a
-// changed metric reference rather than a changed label list): less precise,
-// but safe.
+// ON/IGNORING/GROUP_LEFT/GROUP_RIGHT are deliberately absent. Lifting a clause
+// out of the sequence discards its position, and for a vector-matching or
+// cardinality modifier the position IS the meaning: which binary operator it
+// attaches to. `a / on(instance) b * c` and `a / b * on(instance) c` match on
+// different operators and must not compare equal. Left in the sequence, their
+// keyword, parens and labels are anchored as ordinary tokens, positions and
+// all — and GROUP_LEFT/GROUP_RIGHT, whose label list is optional, need no
+// list-shape guess at all.
 func isGroupClauseKeyword(t promqlparser.ItemType) bool {
 	switch t {
-	case promqlparser.BY, promqlparser.WITHOUT, promqlparser.ON, promqlparser.IGNORING:
+	case promqlparser.BY, promqlparser.WITHOUT:
 		return true
 	}
 	return false
 }
 
-// groupClauseKeyword names the clause t opens, for the signature entry.
+// groupClauseKeyword names the clause t opens, for the clause-list entry.
 func groupClauseKeyword(t promqlparser.ItemType) string {
-	switch t {
-	case promqlparser.WITHOUT:
+	if t == promqlparser.WITHOUT {
 		return "without"
-	case promqlparser.ON:
-		return "on"
-	case promqlparser.IGNORING:
-		return "ignoring"
 	}
 	return "by"
 }
 
-// readGroupClause reduces the grouping or vector-matching clause starting at
-// items[i] (the keyword itself) to one signature entry, and returns the index
-// of the clause's last token so the caller's loop resumes just past it.
+// readGroupClause reduces the grouping clause starting at items[i] (the keyword
+// itself) to one clause-list entry, and returns the index of the clause's last
+// token so the caller's loop resumes just past it.
 //
 // A clause may be relocated or introduced outright by a repair, so its POSITION
 // carries no anchor content — but the labels it names decide what the query
-// groups or matches over, so they do. The whole balanced parenthesized list is
-// consumed; every depth-1 token other than the separating commas counts as a
-// label, since PromQL's `maybe_label` rule admits keywords (`quantile`,
-// `count`, `start`, ...) and quoted strings there, not just identifiers.
-// Labels are sorted (`by (a,b)` and `by (b,a)` group identically) and the
-// keyword is kept, so by<->without and on<->ignoring swaps are caught. A
+// groups over, so they do. The whole balanced parenthesized list is consumed;
+// every depth-1 token other than the separating commas counts as a label, since
+// PromQL's `maybe_label` rule admits keywords (`quantile`, `count`, `start`,
+// ...) and quoted strings there, not just identifiers. Labels are sorted
+// (`by (a,b)` and `by (b,a)` group identically) and the keyword is kept, so a
+// by<->without swap — which inverts kept vs. excluded labels — is caught. A
 // keyword with no list at all — not realistic PromQL, but the caller must not
 // misread the token stream if it ever appears — still yields an entry with an
 // empty label list rather than being dropped.
