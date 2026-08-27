@@ -58,3 +58,24 @@ func TestPromptHashStable(t *testing.T) {
 		t.Fatal("separator must prevent boundary collisions")
 	}
 }
+
+func TestPromptOutputTokenLimit(t *testing.T) {
+	tests := []struct {
+		name       string
+		configured int
+		perCall    int
+		want       int
+	}{
+		{"unset keeps configured", 1024, 0, 1024},
+		{"lower explicit cap wins", 1024, 512, 512},
+		{"explicit cap cannot raise configured", 256, 512, 256},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := llm.Prompt{MaxOutputTokens: tc.perCall}
+			if got := p.OutputTokenLimit(tc.configured); got != tc.want {
+				t.Fatalf("OutputTokenLimit(%d) = %d, want %d", tc.configured, got, tc.want)
+			}
+		})
+	}
+}

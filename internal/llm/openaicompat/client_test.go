@@ -463,6 +463,32 @@ func TestTimeoutHonored(t *testing.T) {
 	}
 }
 
+// TestPerCallMaxOutputTokens verifies an explicit Prompt.MaxOutputTokens
+// lower than the configured ceiling reaches the wire as max_tokens (Task 2's
+// lowering-only per-call cap; Task 5's bounded PromQL repair call passes
+// MaxOutputTokens: 512).
+func TestPerCallMaxOutputTokens(t *testing.T) {
+	successBody := chatBody(`{"queries":[]}`, 1, 1)
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		_, _ = w.Write([]byte(successBody))
+	}))
+	defer srv.Close()
+
+	client := newClient(srv, nil)
+	_, err := client.Complete(context.Background(), "sys",
+		llm.Prompt{Prefix: "repair", MaxOutputTokens: 128}, []string{"queries"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := body["max_tokens"]; got != float64(128) {
+		t.Fatalf("max_tokens = %v, want 128", got)
+	}
+}
+
 // TestConfigDefaultsApplied locks the fallback branches in Config.defaults():
 // a Config that leaves MaxTokens/TimeoutSeconds unset (the zero value) must
 // still get the documented 1024/120 defaults. cmd/alertint's

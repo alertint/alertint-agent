@@ -494,6 +494,32 @@ func responseBodyCached(text string, inputTok, outputTok, cacheW, cacheR int) st
 	return string(b)
 }
 
+// TestPerCallMaxOutputTokens verifies an explicit Prompt.MaxOutputTokens
+// lower than the configured ceiling reaches the wire as max_tokens (Task 2's
+// lowering-only per-call cap; Task 5's bounded PromQL repair call passes
+// MaxOutputTokens: 512).
+func TestPerCallMaxOutputTokens(t *testing.T) {
+	successBody := responseBody(`{"queries":[]}`, 1, 1)
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		_, _ = w.Write([]byte(successBody))
+	}))
+	defer srv.Close()
+
+	client := newTestClient(t, srv.URL, nil)
+	_, err := client.Complete(context.Background(), "sys",
+		llm.Prompt{Prefix: "repair", MaxOutputTokens: 128}, []string{"queries"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := body["max_tokens"]; got != float64(128) {
+		t.Fatalf("max_tokens = %v, want 128", got)
+	}
+}
+
 // TestCacheUsageCaptured: the two cache usage fields reach Completion and the
 // llm.response audit payload.
 func TestCacheUsageCaptured(t *testing.T) {
