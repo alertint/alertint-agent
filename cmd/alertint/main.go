@@ -289,6 +289,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 			LogSource: logSrc,
 			LogParams: acutetriage.LogParams{
 				DefaultRangeMinutes: cfg.Logs.DefaultRangeMinutes,
+				MaxWindowMinutes:    cfg.Logs.MaxWindowMinutes,
 				TimeoutSeconds:      cfg.Logs.TimeoutSeconds,
 				MaxLines:            cfg.Logs.MaxLines,
 				ExtraSelectorLabels: cfg.Triage.ExtraSelectorLabels,

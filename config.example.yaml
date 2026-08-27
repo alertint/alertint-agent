@@ -100,6 +100,7 @@ logs:
   provider: loki
   timeout_seconds: 10        # TOTAL budget for the whole fetch (filtered + fallback)
   default_range_minutes: 15  # look-back window before the first alert
+  max_window_minutes: 120    # cap on the fetched window ending at now; 0 = unbounded
   max_lines: 50
   loki:
     # base_url: http://loki:3100           # set this and log enrichment turns ON (or https://logs-prod-006.grafana.net for Grafana Cloud)

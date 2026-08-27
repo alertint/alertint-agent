@@ -18,13 +18,16 @@ import (
 // can replay exactly what the LLM saw. The same value feeds both the prompt and
 // persistence — one fetch, two uses.
 type LogEnrichment struct {
-	Source  string      `json:"source"`          // src.Name()
-	Query   string      `json:"query,omitempty"` // the native query that ran ("" if none built)
-	Start   time.Time   `json:"start"`
-	End     time.Time   `json:"end"`
-	Lines   []logs.Line `json:"lines,omitempty"`   // normalized, newest-first
-	Note    string      `json:"note,omitempty"`    // why Lines is empty (queried-empty / timeout / error / no-selector)
-	Outcome Outcome     `json:"outcome,omitempty"` // fetched / empty / no_selector / failed (R8)
+	Source string      `json:"source"`          // src.Name()
+	Query  string      `json:"query,omitempty"` // the native query that ran ("" if none built)
+	Start  time.Time   `json:"start"`
+	End    time.Time   `json:"end"`
+	Lines  []logs.Line `json:"lines,omitempty"` // normalized, newest-first
+	Note   string      `json:"note,omitempty"`  // why Lines is empty (queried-empty / timeout / error / no-selector)
+	// SpanStart is the requested window start before any max_window_minutes
+	// clamp; zero when no clamp applied. Lets the prompt say "recent-only".
+	SpanStart time.Time `json:"span_start,omitzero"`
+	Outcome   Outcome   `json:"outcome,omitempty"` // fetched / empty / no_selector / failed (R8)
 }
 
 // LogParams carries the generic enrichment tunables from config (the logs
@@ -32,6 +35,7 @@ type LogEnrichment struct {
 // interface stays minimal (three methods, no Default*() accessors).
 type LogParams struct {
 	DefaultRangeMinutes int
+	MaxWindowMinutes    int // cap on the fetched window ending at `last`; 0 = unbounded
 	TimeoutSeconds      int
 	MaxLines            int
 	ExtraSelectorLabels []string // operator-configured allowlist extension (ADR-0035)
@@ -68,6 +72,23 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 	start := first.Add(-time.Duration(params.DefaultRangeMinutes) * time.Minute)
 	end := last
 
+	// Cap the window independently of incident age (issue #63). first is the
+	// collapse-span start, so an incident open for days would otherwise scan
+	// days of logs on every re-judgment and trip the backend's byte limit. A
+	// re-judgment needs recent evidence; the clamp keeps end=now and drops the
+	// stale head. SpanStart records what was asked so the prompt can say so.
+	var spanStart time.Time
+	if params.MaxWindowMinutes > 0 {
+		if floor := end.Add(-time.Duration(params.MaxWindowMinutes) * time.Minute); start.Before(floor) {
+			spanStart = start
+			start = floor
+			rangeLabel = fmt.Sprintf("last %dm (clamped)", params.MaxWindowMinutes)
+			logger.Info("acutetriage: logs: window clamped to max_window_minutes",
+				"source", source, "span_start", spanStart, "window_start", start,
+				"max_window_minutes", params.MaxWindowMinutes, "incident", incidentID)
+		}
+	}
+
 	// Generic selector: shared alert labels ∩ AllowedSelectorKeys. No per-backend
 	// renaming here — the provider owns translation (ADR-0002).
 	sel := buildLogSelector(alerts, params.ExtraSelectorLabels)
@@ -77,11 +98,12 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 		logger.Info("acutetriage: logs: empty selector — no usable log labels for this incident",
 			"source", source, "shared_labels", shared, "incident", incidentID)
 		return &LogEnrichment{
-			Source:  source,
-			Start:   start,
-			End:     end,
-			Note:    "no usable log selector for this incident (shared labels: " + shared + ")",
-			Outcome: OutcomeNoSelector,
+			Source:    source,
+			Start:     start,
+			End:       end,
+			SpanStart: spanStart,
+			Note:      "no usable log selector for this incident (shared labels: " + shared + ")",
+			Outcome:   OutcomeNoSelector,
 		}
 	}
 
@@ -97,12 +119,13 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 		logger.Warn("acutetriage: logs: backend query failed",
 			"source", source, "query", fetched.Query, "err", err, "incident", incidentID)
 		return &LogEnrichment{
-			Source:  source,
-			Query:   fetched.Query,
-			Start:   start,
-			End:     end,
-			Note:    "log backend query failed: " + err.Error(),
-			Outcome: OutcomeFailed,
+			Source:    source,
+			Query:     fetched.Query,
+			Start:     start,
+			End:       end,
+			SpanStart: spanStart,
+			Note:      "log backend query failed: " + err.Error(),
+			Outcome:   OutcomeFailed,
 		}
 	}
 
@@ -113,12 +136,13 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 		logger.Info("acutetriage: logs: query returned no lines — check label_map / line_filter",
 			"source", source, "query", fetched.Query, "incident", incidentID)
 		return &LogEnrichment{
-			Source:  source,
-			Query:   fetched.Query,
-			Start:   start,
-			End:     end,
-			Note:    "log backend returned no lines for this query",
-			Outcome: OutcomeEmpty,
+			Source:    source,
+			Query:     fetched.Query,
+			Start:     start,
+			End:       end,
+			SpanStart: spanStart,
+			Note:      "log backend returned no lines for this query",
+			Outcome:   OutcomeEmpty,
 		}
 	}
 
@@ -133,12 +157,13 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 	)
 
 	return &LogEnrichment{
-		Source:  source,
-		Query:   fetched.Query,
-		Start:   start,
-		End:     end,
-		Lines:   lines,
-		Outcome: OutcomeFetched,
+		Source:    source,
+		Query:     fetched.Query,
+		Start:     start,
+		End:       end,
+		SpanStart: spanStart,
+		Lines:     lines,
+		Outcome:   OutcomeFetched,
 	}
 }
 

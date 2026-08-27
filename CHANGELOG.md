@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Log enrichment no longer queries Loki over the incident's entire open span.
+  The window was `[first_alert − default_range_minutes, now]` (first occurrence
+  on re-judgment), so a still-firing incident grew the query with wall-clock
+  age until Loki's byte limit rejected it and triage ran with no logs at all.
+  New `logs.max_window_minutes` (default `120`, `0` = unbounded) clamps the
+  window to the most recent N minutes; the prompt states when the earlier span
+  was not fetched. (#63)
+
 ## [0.13.4] - 2026-08-25
 
 ### Fixed
