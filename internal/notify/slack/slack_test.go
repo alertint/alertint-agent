@@ -308,7 +308,7 @@ func TestFiringDetailBlocks_InvalidQueryCaveat(t *testing.T) {
 	if evidenceIdx < 0 || invalidIdx < 0 || unverifiedIdx < 0 {
 		t.Fatalf("expected all three markers present: evidence=%d invalid=%d unverified=%d\n%s", evidenceIdx, invalidIdx, unverifiedIdx, got)
 	}
-	if !(evidenceIdx < invalidIdx && invalidIdx < unverifiedIdx) {
+	if evidenceIdx >= invalidIdx || invalidIdx >= unverifiedIdx {
 		t.Fatalf("expected order evidence < invalid-query caveat < unverified caveat, got evidence=%d invalid=%d unverified=%d\n%s", evidenceIdx, invalidIdx, unverifiedIdx, got)
 	}
 }
