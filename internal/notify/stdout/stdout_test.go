@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -107,6 +108,114 @@ func TestNotify_UnverifiedCaveat(t *testing.T) {
 	}
 	if caveat, exists := line["caveat"]; exists && caveat != nil && caveat != "" {
 		t.Errorf("caveat = %v, want empty/nil for verified finding", caveat)
+	}
+}
+
+// TestNotify_InvalidQueryCaveat (Task 6): the invalid-query caveat is
+// structurally distinct from the Unverified/"checks unavailable" caveat —
+// it must render on its own when only queries are invalid, combine with the
+// unavailable caveat (joined by "; ") when both conditions hold, and the
+// structured VerificationInvalidQueries field must always survive in the
+// embedded Finding JSON regardless of which caveat text is produced.
+func TestNotify_InvalidQueryCaveat(t *testing.T) {
+	baseFinding := func() notify.Finding {
+		return notify.Finding{
+			IncidentID:   "test-incident",
+			GroupKey:     "test=group",
+			AnalysisName: "Test Analysis",
+			Severity:     "high",
+			Confidence:   0.85,
+		}
+	}
+
+	cases := []struct {
+		name           string
+		f              notify.Finding
+		wantSubstrings []string
+		wantAbsent     []string
+	}{
+		{
+			name: "invalid-only",
+			f: func() notify.Finding {
+				f := baseFinding()
+				f.VerificationInvalidQueries = 1
+				return f
+			}(),
+			wantSubstrings: []string{"1 metrics query invalid", "not used as evidence"},
+			wantAbsent:     []string{"checks unavailable"},
+		},
+		{
+			name: "plural invalid-only",
+			f: func() notify.Finding {
+				f := baseFinding()
+				f.VerificationInvalidQueries = 3
+				return f
+			}(),
+			wantSubstrings: []string{"3 metrics queries invalid"},
+			wantAbsent:     []string{"checks unavailable"},
+		},
+		{
+			name: "unavailable-only",
+			f: func() notify.Finding {
+				f := baseFinding()
+				f.Unverified = true
+				return f
+			}(),
+			wantSubstrings: []string{"unverified — checks unavailable"},
+			wantAbsent:     []string{"metrics query invalid", "metrics queries invalid"},
+		},
+		{
+			name: "combined",
+			f: func() notify.Finding {
+				f := baseFinding()
+				f.VerificationInvalidQueries = 2
+				f.Unverified = true
+				return f
+			}(),
+			wantSubstrings: []string{"2 metrics queries invalid", "unverified — checks unavailable"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			n := New(&buf, nil, true)
+			if err := n.Notify(context.Background(), tc.f); err != nil {
+				t.Fatalf("Notify: %v", err)
+			}
+
+			var l map[string]any
+			if err := json.Unmarshal(buf.Bytes(), &l); err != nil {
+				t.Fatalf("line not valid JSON: %v (%q)", err, buf.String())
+			}
+			caveat, _ := l["caveat"].(string)
+			for _, want := range tc.wantSubstrings {
+				if !strings.Contains(caveat, want) {
+					t.Errorf("caveat = %q, missing %q", caveat, want)
+				}
+			}
+			for _, absent := range tc.wantAbsent {
+				if strings.Contains(caveat, absent) {
+					t.Errorf("caveat = %q, must not contain %q", caveat, absent)
+				}
+			}
+
+			// Combined case must join with "; ".
+			if tc.name == "combined" && !strings.Contains(caveat, "; ") {
+				t.Errorf("combined caveat = %q, expected \"; \" join", caveat)
+			}
+
+			// The structured Finding field must always survive in the embedded
+			// JSON, regardless of which caveat text was produced.
+			finding, ok := l["finding"].(map[string]any)
+			if !ok {
+				t.Fatalf("finding not an object: %v", l["finding"])
+			}
+			gotCount, _ := finding["verification_invalid_queries"].(float64)
+			if int(gotCount) != tc.f.VerificationInvalidQueries {
+				t.Errorf("finding.verification_invalid_queries = %v, want %d", finding["verification_invalid_queries"], tc.f.VerificationInvalidQueries)
+			}
+		})
 	}
 }
 

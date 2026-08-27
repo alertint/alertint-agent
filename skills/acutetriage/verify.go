@@ -785,6 +785,27 @@ func anyUnfetched(r *VerificationRound) bool {
 	return !sawRealFloorSource
 }
 
+// invalidQueryCount counts every query across every round that resolved
+// OutcomeInvalid — a local-validation or backend bad_data rejection that was
+// never fetched and so was never used as evidence (Task 5/Task 6). It walks
+// all rounds, not just the latest, so a re-judgment's Finding still reports
+// invalid queries from an earlier round. Distinct from anyUnfetched: this is
+// a presentation-layer count for notify.Finding, not a confidence-clamp rail.
+func invalidQueryCount(v *VerificationEnrichment) int {
+	if v == nil {
+		return 0
+	}
+	var n int
+	for _, r := range v.Rounds {
+		for _, q := range r.Queries {
+			if q.Outcome == OutcomeInvalid {
+				n++
+			}
+		}
+	}
+	return n
+}
+
 // verificationLive is the R17 cap-interaction predicate: whether any
 // floor-source or promql query across every round actually fetched. A
 // fetched observation from any floor source — Prometheus's aggregate ratio,

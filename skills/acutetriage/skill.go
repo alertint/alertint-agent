@@ -420,6 +420,10 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 			// A degraded round (floor unfetchable, or call 2 lost) shipped without a
 			// full falsification pass — card renderers surface a caveat off this.
 			Unverified: ver != nil && ver.Outcome == verifyOutcomeDegraded,
+			// VerificationInvalidQueries counts locally-invalid/backend-rejected
+			// queries across every round — independent of Unverified, which only
+			// reflects connector/round-level degradation.
+			VerificationInvalidQueries: invalidQueryCount(ver),
 		}
 		if p.rejudge && p.recurrenceEpisodes > 1 && !p.recurrenceLastSeen.IsZero() {
 			f.Recurrence = &notify.Recurrence{Episodes: p.recurrenceEpisodes, LastSeen: p.recurrenceLastSeen}

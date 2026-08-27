@@ -539,6 +539,22 @@ func firingDetailBlocks(f notify.Finding) []slacklib.Block {
 		nil, nil,
 	))
 
+	// Invalid-query caveat (Task 6): a locally-invalid or backend-rejected
+	// verification query was never fetched and never used as evidence — a
+	// distinct, classified caveat from Unverified/"checks unavailable" below,
+	// which reflects connector/round-level degradation instead. Renders the
+	// count only, never the query expression. Must precede the Unverified
+	// block so the two independent caveats stay visually ordered.
+	if n := f.VerificationInvalidQueries; n > 0 {
+		noun := "query"
+		if n != 1 {
+			noun = "queries"
+		}
+		text := fmt.Sprintf("⚠ verification incomplete — %d metrics %s invalid; not used as evidence and confidence could not increase", n, noun)
+		blocks = append(blocks, slacklib.NewContextBlock("",
+			slacklib.NewTextBlockObject(slacklib.MarkdownType, text, false, false)))
+	}
+
 	if f.Unverified {
 		// Drill wording: on a drill the missing checks are the expected state
 		// (drill labels are fictional, no evidence source can verify them), and
