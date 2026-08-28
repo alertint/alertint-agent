@@ -68,6 +68,13 @@ CI rejects pull requests containing commits without a sign-off. By signing
 off you certify that you have the right to submit the work under the
 project license (FSL-1.1-ALv2; see [LICENSE](LICENSE)).
 
+## Questions
+
+Not sure if something is a bug, or want to ask "does it work with X"? Use
+[GitHub Discussions](https://github.com/alertint/alertint-agent/discussions)
+(Q&A). Fuzzy feature wishes go to Ideas there; concrete, scoped requests use
+the [feature request template](https://github.com/alertint/alertint-agent/issues/new?template=feature_request.yml).
+
 ## Reporting security issues
 
 Never via public issues — see [SECURITY.md](SECURITY.md).
