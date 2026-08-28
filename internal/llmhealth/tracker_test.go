@@ -347,3 +347,39 @@ func TestNilTrackerIsSafe(t *testing.T) {
 	var obs *llmhealth.Observation
 	obs.Finish(nil)
 }
+
+// TestSealDropsObservationsAfterTheFinalAcknowledgment: Seal is the
+// runner's guarantee that the state it acknowledged in its final pass is the
+// state that survives. Owners join every producer before that pass, but a
+// join can time out (a handler wedged past the shutdown window); a producer
+// that then finishes must not move the durable state behind the
+// acknowledgment, kick a runner that is gone, or write to a store that is
+// closing. It is dropped and logged, whether it began before or after Seal.
+func TestSealDropsObservationsAfterTheFinalAcknowledgment(t *testing.T) {
+	tr, st, _, a := newTracker(t)
+	before := tr.Begin(llmhealth.CapabilityTriageDraft, "i")
+	tr.Seal()
+	before.Finish(err503)
+	tr.Begin(llmhealth.CapabilityVerificationRejudge, "j").Finish(nil)
+	tr.ObserveProbe(llm.ProbeResult{Outcome: llm.ProbeFailed, Err: err503})
+
+	snap := tr.Snapshot()
+	if snap.State != llmhealth.StateHealthy || len(snap.Capabilities) != 0 || snap.LastRealSuccessAt != nil || snap.InFlight != 0 {
+		t.Fatalf("sealed tracker moved: %+v", snap)
+	}
+	select {
+	case <-tr.Kick():
+		t.Fatal("sealed tracker kicked a runner that is gone")
+	default:
+	}
+	rec, caps, err := st.GetLLMHealth(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.LastRealCallAt != nil || len(caps) != 0 {
+		t.Fatalf("sealed tracker persisted: rec=%+v caps=%d", rec, len(caps))
+	}
+	if len(a.kinds) != 0 {
+		t.Fatalf("sealed tracker audited: %v", a.kinds)
+	}
+}

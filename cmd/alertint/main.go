@@ -447,15 +447,23 @@ func stopLLMHealthRunner(r *llmhealth.Runner, done <-chan struct{}, logger *slog
 	}
 }
 
-// closeCaptureEngine joins Captured-verdict grading (an LLM capability
-// producer on MCP request goroutines, which http.Server.Shutdown does not
-// interrupt) before the LLM health runner is stopped. Grades in progress are
-// canceled; the health tracker ignores shutdown-driven cancellation.
+// closeCaptureEngine joins every Captured-verdict / annotation operation
+// (MCP request goroutines, which http.Server.Shutdown neither cancels nor
+// reliably joins) before the LLM health runner is stopped and the store is
+// closed. Grades in progress are canceled — the health tracker ignores
+// shutdown-driven cancellation — and persists in progress complete. A join
+// that times out means an operation is wedged past every bound it has: the
+// process still exits, but not as if the runner's precondition held — the
+// runner seals the tracker after its final pass, so whatever that operation
+// reports later is dropped, and its store access fails against a closed
+// store rather than moving state nobody acknowledged.
 func closeCaptureEngine(eng *acutetriage.CaptureEngine, logger *slog.Logger) {
 	ctx, cancel := context.WithTimeout(context.Background(), ingress.DefaultShutdownTimeout)
 	defer cancel()
 	if err := eng.Close(ctx); err != nil {
-		logger.Warn("verdict grading did not stop within the shutdown window", slog.String("err", err.Error()))
+		logger.Error("a verdict capture or annotation did not finish within the shutdown window; "+
+			"its late LLM observation will be dropped after the health runner's final pass and its store access will fail",
+			slog.String("err", err.Error()))
 	}
 }
 

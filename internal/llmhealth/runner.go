@@ -115,16 +115,21 @@ func (r *Runner) Start(ctx context.Context) <-chan struct{} {
 // Stop, so once the channel from Start closes every transition the final
 // state implies has been attempted and its outcome recorded (delivered,
 // pending retry, or indeterminate) — nothing is left for a restart that a
-// live process could still have done.
+// live process could still have done. The pass ends by sealing the Tracker:
+// an owner whose join timed out on a wedged producer proceeds knowing that
+// whatever it still reports is dropped, never a transition nobody
+// acknowledged.
 func (r *Runner) Stop() { r.stopOnce.Do(func() { close(r.stopCh) }) }
 
 // finalDeliver is Stop's acknowledgment pass. Deliver applies its own
 // per-call and whole-phase bounds; the outer bound only keeps a wedged
-// publisher from holding the owner past DrainTimeout.
+// publisher from holding the owner past DrainTimeout. The Tracker is sealed
+// once the pass has recorded its outcomes.
 func (r *Runner) finalDeliver() {
 	ctx, cancel := context.WithTimeout(context.Background(), deliveryBudget+deliveryTimeout)
 	defer cancel()
 	r.t.Deliver(ctx, r.pub)
+	r.t.Seal()
 }
 
 // Run loops until Stop is called (final delivery pass, then return) or ctx

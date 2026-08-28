@@ -725,3 +725,30 @@ func TestStopCutsTheStepInProgress(t *testing.T) {
 		t.Fatalf("final pass: edits landed = %d, durable slack_delivery = %q; want the cut edit retried and recovered", pub.updateCount(), rec.SlackDelivery)
 	}
 }
+
+// TestStopSealsTheTrackerAfterTheFinalPass: once the channel from Start
+// closes, the acknowledged state is final — a producer the owner failed to
+// join in time cannot move it any more.
+func TestStopSealsTheTrackerAfterTheFinalPass(t *testing.T) {
+	tr, st, c, _ := newTracker(t)
+	pub := &fakePub{}
+	r := llmhealth.NewRunner(tr, nil, pub, nil)
+	llmhealth.SetRunnerTickForTest(time.Hour)
+	done := r.Start(context.Background())
+	r.Stop()
+	<-done
+
+	tr.Begin(llmhealth.CapabilityTriageDraft, "late").Finish(err503)
+	c.add(5 * time.Minute)
+	r.Step(context.Background(), c.now())
+	if tr.Snapshot().State != llmhealth.StateHealthy || pub.postCount() != 0 {
+		t.Fatalf("a producer finishing after Stop moved the acknowledged state: %+v, posts=%d", tr.Snapshot(), pub.postCount())
+	}
+	rec, _, err := st.GetLLMHealth(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.LastRealCallAt != nil {
+		t.Fatalf("late observation persisted: %+v", rec)
+	}
+}

@@ -104,8 +104,11 @@ type Tracker struct {
 	// set) lives on each capability's own ContentSubjects field, so it is
 	// persisted/restored automatically alongside everything else in caps —
 	// no separate bookkeeping map needed.
-	inFlight          int
-	idleSince         time.Time
+	inFlight  int
+	idleSince time.Time
+	// sealed is set by Seal once the Runner has acknowledged the final
+	// state: from then on observations are dropped (logged), not recorded.
+	sealed            bool
 	probeUnsupported  bool
 	unsupportedLogged bool
 	kick              chan struct{}
@@ -193,6 +196,22 @@ func New(ctx context.Context, st *store.Store, opts Options) (*Tracker, error) {
 	}, nil
 }
 
+// Seal ends observation for good: the Runner calls it after its final
+// delivery pass, so the state that pass acknowledged is the state that
+// survives. Owners join every producer before that pass; a join can still
+// time out on a wedged handler, and whatever finishes after Seal is dropped
+// with a warning — it can neither move the durable state behind the
+// acknowledgment, kick a Runner that is gone, nor write to a store that is
+// closing. Nil-safe.
+func (t *Tracker) Seal() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.sealed = true
+	t.mu.Unlock()
+}
+
 // Begin starts one observation of capability for subject (an Incident ID). A nil
 // Tracker returns nil so Health: nil call sites need no branch.
 func (t *Tracker) Begin(capability Capability, subject string) *Observation {
@@ -200,6 +219,10 @@ func (t *Tracker) Begin(capability Capability, subject string) *Observation {
 		return nil
 	}
 	t.mu.Lock()
+	if t.sealed {
+		t.mu.Unlock()
+		return &Observation{t: t, capability: capability, subject: subject, done: true}
+	}
 	t.inFlight++
 	// Starting a real call already invalidates any probe in flight: the
 	// call's own Finish is the authoritative reachability signal, and a
@@ -226,6 +249,11 @@ func (t *Tracker) finish(capability Capability, subject string, err error) {
 	t.inFlight--
 
 	reason := Classify(err)
+	if t.sealed && reason.Class() != ClassIgnored {
+		t.logger.Warn("llm health: observation after the final acknowledgment dropped; the producer outlived shutdown",
+			"capability", string(capability), "reason", string(reason))
+		return
+	}
 	if reason.Class() == ClassIgnored {
 		// Shutdown-driven cancellation is not an observation: no capability
 		// mutation, no persist, no audit, no idle-clock reset.
@@ -261,6 +289,9 @@ func (t *Tracker) finish(capability Capability, subject string, err error) {
 func (t *Tracker) ObserveProbe(res llm.ProbeResult) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.sealed {
+		return
+	}
 
 	now := t.now()
 	probeAt := now
