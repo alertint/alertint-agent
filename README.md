@@ -60,6 +60,12 @@ the MCP surface — is diagrammed and walked through step by step in
 
 The [`/docs`](docs/) folder in this repo is the canonical source for those pages — the website renders it at build time. Documentation PRs are welcome here; see [`docs/README.md`](docs/README.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Questions and support
+
+- **Questions** — [GitHub Discussions](https://github.com/alertint/alertint-agent/discussions) (Q&A for "does it work with X", Ideas for what you wish it did)
+- **Bugs** — [Issues](https://github.com/alertint/alertint-agent/issues/new/choose)
+- **Security** — never in public; see [SECURITY.md](SECURITY.md)
+
 ## License
 
 AlertINT is **[Fair Source](https://fair.io)**, licensed under [FSL-1.1-ALv2](LICENSE) (Functional Source License). Free to read, use, modify, and self-host at any scale. The only restriction is offering the software to others as a competing commercial product or service. Each release converts to Apache 2.0 — full open source — two years after publication. See [fsl.software](https://fsl.software) for the license text.
