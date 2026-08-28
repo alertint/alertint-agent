@@ -226,9 +226,11 @@ func diffExpectationAgainstFinding(e Expectation, resp llmResponse) (missingMent
 //   - The expectation's cause series is in neither the frozen snapshot
 //     (verification queries/results, metric sections) nor the widened set —
 //     such a verdict can never go green (D10). A query whose Outcome is
-//     failed/degraded contributes nothing: its Expr still names the series,
-//     but a failed fetch is not evidence the series is verifiable — counting
-//     it would let a permanently-unreachable series pass the lint.
+//     failed/degraded/invalid contributes nothing: its Expr still names the
+//     series, but neither a failed fetch nor a query that was never executed
+//     at all (invalid) is evidence the series is verifiable — counting
+//     either would let a permanently-unreachable or malformed series pass the
+//     lint.
 func lintExpectationVerifiable(verdict string, e Expectation, frozen frozenEnvelope, widened []VerificationQuery) []string {
 	var warnings []string
 	if verdict == "correction" && e.CauseAlert == "" && len(e.CauseSeries) == 0 && len(widened) == 0 {
@@ -239,7 +241,7 @@ func lintExpectationVerifiable(verdict string, e Expectation, frozen frozenEnvel
 
 	var haystack strings.Builder
 	writeIfAnswered := func(q VerificationQuery) {
-		if q.Outcome == OutcomeFailed || q.Outcome == OutcomeDegraded {
+		if q.Outcome == OutcomeFailed || q.Outcome == OutcomeDegraded || q.Outcome == OutcomeInvalid {
 			return
 		}
 		haystack.WriteString(q.Expr + "\n" + q.Result + "\n")

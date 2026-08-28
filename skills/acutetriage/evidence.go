@@ -30,6 +30,9 @@ const (
 	// "slow" and the finding is NOT dragged into the annotations-only confidence
 	// cap, since the metric data very likely exists.
 	OutcomeDegraded Outcome = "degraded"
+	// OutcomeInvalid is a verification-query construction failure. It is
+	// unfetched and inconclusive, distinct from empty data and backend failure.
+	OutcomeInvalid Outcome = "invalid"
 )
 
 // buildEvidenceSummary maps the incident's enrichment outcomes into the always-on

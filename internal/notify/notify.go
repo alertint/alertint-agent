@@ -52,6 +52,9 @@ type Finding struct {
 	// draft: llm_call_failed | llm_response_invalid | verification_source_unavailable.
 	// Empty when the round was not degraded.
 	DegradationReason string `json:"degradation_reason,omitempty"`
+	// VerificationInvalidQueries counts methodological query failures that were
+	// not used as evidence. It is independent of connector availability.
+	VerificationInvalidQueries int `json:"verification_invalid_queries,omitempty"`
 	// History is the group key's operator history (R13/D9), producer-computed
 	// by the triage skill the same way Recurrence is: notifiers stay I/O-free
 	// renderers, the skill owns the store read. nil only when no notifier is

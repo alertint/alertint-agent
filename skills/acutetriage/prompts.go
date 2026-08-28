@@ -254,7 +254,9 @@ func callTwoContinuation(draftRaw json.RawMessage, round *VerificationRound, mem
 		"compare against: treat that as inconclusive. Any other empty " +
 		"result is inconclusive — the expression may simply have matched nothing (for " +
 		"example, joining metrics whose label schemas differ) — so treat it as neither " +
-		"support nor contradiction and do NOT lower confidence because of it. A replacement " +
+		"support nor contradiction and do NOT lower confidence because of it. A query " +
+		"marked invalid, failed, or timed out was not fetched: treat it as inconclusive " +
+		"and not evidence for or against the draft. A replacement " +
 		"hypothesis formed now is itself unverified: keep its confidence moderate. Respond " +
 		"with the SAME JSON schema as before, complete (do NOT include the \"verification\" " +
 		"key again).")

@@ -243,9 +243,10 @@ func (c *Client) callWithRetry(ctx context.Context, system string, prompt llm.Pr
 
 // doRequest performs a single HTTP call to the chat-completions API.
 func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt) (json.RawMessage, tokenUsage, error) {
+	maxTokens := prompt.OutputTokenLimit(c.cfg.MaxTokens)
 	body := chatRequest{
 		Model:     c.cfg.Model,
-		MaxTokens: c.cfg.MaxTokens,
+		MaxTokens: maxTokens,
 		Messages: []chatMessage{
 			{Role: "system", Content: system},
 			{Role: "user", Content: prompt.Text()},
@@ -305,9 +306,17 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt
 	// A length finish means the reply was cut off at the completion-token
 	// ceiling: the text is incomplete JSON. Surface it as an actionable
 	// truncation error rather than the misleading "not valid JSON" — the fix
-	// is to raise llm.max_tokens (or disable llm.thinking), not to retry.
+	// is to raise llm.max_tokens (or disable llm.thinking), not to retry. When
+	// the ceiling came from an explicit per-call Prompt.MaxOutputTokens (e.g. a
+	// deliberately bounded repair call), the operator's configured
+	// llm.max_tokens is not the cause — report the per-call cap instead so the
+	// truncation is not misdiagnosed as an operator misconfiguration.
 	if choice.FinishReason == "length" {
-		return nil, usage, fmt.Errorf("%w=%d (raise llm.max_tokens)", llm.ErrResponseTruncated, c.cfg.MaxTokens)
+		hint := "raise llm.max_tokens"
+		if prompt.MaxOutputTokens != 0 {
+			hint = "per-call max_output_tokens"
+		}
+		return nil, usage, fmt.Errorf("%w=%d (%s)", llm.ErrResponseTruncated, maxTokens, hint)
 	}
 
 	text := stripLeadingThink(choice.Message.Content)

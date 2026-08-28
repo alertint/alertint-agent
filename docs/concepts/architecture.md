@@ -116,8 +116,11 @@ Zabbix installs), plus up to `max_queries` model-chosen read-only checks. A
 round that can't finish marks the finding `⚠ unverified` and can never raise
 confidence. See [verification round](verification-round.md).
 
-- **Cost:** two LLM calls per judged incident, the second reading the first's
-  prompt-cache prefix at ~0.10× input price
+- **Cost:** one LLM call per judged incident with verification disabled; two
+  calls normally, the second reading the first's prompt-cache prefix at
+  ~0.10× input price; at most three only when call 1 proposes locally
+  invalid PromQL and the round spends its one bounded repair call before the
+  second
 - **Kill-switch:** `triage.verification.enabled: false` restores single-call triage
 
 ### 8. Outbound notification

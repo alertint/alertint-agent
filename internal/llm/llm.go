@@ -22,13 +22,26 @@ import (
 // breakpoint on providers that support client-side caching; providers
 // without it ignore the flag.
 type Prompt struct {
-	Prefix      string
-	Suffix      string
-	CachePrefix bool
+	Prefix          string
+	Suffix          string
+	CachePrefix     bool
+	MaxOutputTokens int // zero = provider-configured limit; positive may only lower it
 }
 
 // Text is the full user-turn text, prefix and suffix joined.
 func (p Prompt) Text() string { return p.Prefix + p.Suffix }
+
+// OutputTokenLimit returns the effective output-token ceiling for this call:
+// the operator's configured value, unless MaxOutputTokens is set and lower —
+// an explicit per-call value may only lower the configured ceiling, never
+// raise it. Used by callers (e.g. a bounded repair call) that need a tighter
+// cap on a single request without touching llm.max_tokens.
+func (p Prompt) OutputTokenLimit(configured int) int {
+	if p.MaxOutputTokens > 0 && p.MaxOutputTokens < configured {
+		return p.MaxOutputTokens
+	}
+	return configured
+}
 
 // Completion is the result of a Complete call: the validated raw JSON plus
 // the usage figures the client already computes for the audit log (ADR 0004).
