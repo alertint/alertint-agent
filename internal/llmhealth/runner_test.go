@@ -4,7 +4,9 @@ package llmhealth_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -264,6 +266,83 @@ func TestLateRootBacklogCannotStarveProbe(t *testing.T) {
 	}
 	if calls := pub.calls.Load(); calls >= 5 {
 		t.Fatalf("slack calls = %d; the budget did not cut the backlog short", calls)
+	}
+}
+
+// poisonedPub stalls every update of one specific root ts and answers all
+// others at once, so one bad late root can be placed at the head of the queue.
+type poisonedPub struct {
+	stallTS string
+	mu      sync.Mutex
+	edited  []string
+}
+
+func (p *poisonedPub) PostSystemMessage(_ context.Context, _ string) (string, string, error) {
+	return "", "", errors.New("unexpected post")
+}
+
+func (p *poisonedPub) UpdateSystemMessage(ctx context.Context, _, ts, _ string) error {
+	if ts == p.stallTS {
+		<-ctx.Done()
+		return fmt.Errorf("update: %w", ctx.Err())
+	}
+	p.mu.Lock()
+	p.edited = append(p.edited, ts)
+	p.mu.Unlock()
+	return nil
+}
+
+// TestLateRootRetriesAreFair pins that a late root whose edit keeps failing
+// cannot shadow the roots queued behind it: a budget that admits about one
+// edit per Step must still reach every other root within a few Steps, or a
+// stale "LLM unavailable" root would stand in the channel indefinitely because
+// of an unrelated one ahead of it in the queue.
+func TestLateRootRetriesAreFair(t *testing.T) {
+	_, st, c, _ := newTracker(t)
+	rec, caps, err := st.GetLLMHealth(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.LateRoots = []store.LLMLateRoot{
+		{Channel: "C1", TS: "poison", DownForMS: 60000},
+		{Channel: "C1", TS: "1.1", DownForMS: 60000},
+		{Channel: "C1", TS: "1.2", DownForMS: 60000},
+	}
+	if err := st.SaveLLMHealth(context.Background(), rec, caps); err != nil {
+		t.Fatal(err)
+	}
+	tr, err := llmhealth.New(context.Background(), st, llmhealth.Options{Now: c.now, BroadcastAfter: 5 * time.Minute, IdleProbeAfter: 5 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := &poisonedPub{stallTS: "poison"}
+	pr := &fakeProber{res: llm.ProbeResult{Outcome: llm.ProbeOK, Method: "GET", Path: "/health"}}
+	r := llmhealth.NewRunner(tr, pr, pub, nil)
+	// The stalled edit alone spends the whole budget: exactly one attempt
+	// per Step, so whichever root is at the head is the only one tried.
+	llmhealth.SetDeliveryTimeoutForTest(50 * time.Millisecond)
+	llmhealth.SetDeliveryBudgetForTest(40 * time.Millisecond)
+	t.Cleanup(func() {
+		llmhealth.SetDeliveryTimeoutForTest(15 * time.Second)
+		llmhealth.SetDeliveryBudgetForTest(45 * time.Second)
+	})
+
+	for i := 0; i < 4; i++ {
+		r.Step(context.Background(), c.now())
+		c.add(time.Second)
+	}
+	pub.mu.Lock()
+	edited := append([]string(nil), pub.edited...)
+	pub.mu.Unlock()
+	if len(edited) != 2 {
+		t.Fatalf("edited late roots after 4 steps = %v; the poisoned head starved the queue", edited)
+	}
+	rec, _, err = st.GetLLMHealth(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.LateRoots) != 1 || rec.LateRoots[0].TS != "poison" {
+		t.Fatalf("durable late roots = %+v; only the poisoned root should remain", rec.LateRoots)
 	}
 }
 

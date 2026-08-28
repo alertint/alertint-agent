@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/store"
@@ -140,6 +141,12 @@ func updateBounded(ctx context.Context, pub Publisher, channel, ts, text string)
 // episode's delivery state. The queue is durable (rec.LateRoots): a root is
 // removed only once its edit has landed, so a failed edit — or a crash
 // before it — is retried on the next step, in this process or the next.
+//
+// Retries are fair: every root attempted this step and still pending is
+// rotated behind the untouched ones, durably, so a root whose edit keeps
+// failing (or keeps eating the whole delivery budget) cannot shadow the roots
+// queued after it. Without the rotation a single bad head entry would leave
+// every later root's stale outage message standing indefinitely.
 func (t *Tracker) editLateRoots(ctx context.Context, pub Publisher) {
 	t.mu.Lock()
 	pending := append([]store.LLMLateRoot(nil), t.rec.LateRoots...)
@@ -148,13 +155,15 @@ func (t *Tracker) editLateRoots(ctx context.Context, pub Publisher) {
 		return
 	}
 	edited := map[store.LLMLateRoot]bool{}
+	failed := map[store.LLMLateRoot]bool{}
 	for _, r := range pending {
 		if ctx.Err() != nil {
-			t.logger.Warn("llm health: delivery budget spent; remaining late slack root edits wait for the next step", "remaining", len(pending)-len(edited))
+			t.logger.Warn("llm health: delivery budget spent; remaining late slack root edits wait for the next step", "remaining", len(pending)-len(edited)-len(failed))
 			break
 		}
 		if err := updateBounded(ctx, pub, r.Channel, r.TS, RenderRecovery(time.Duration(r.DownForMS)*time.Millisecond)); err != nil {
 			t.logger.Warn("llm health: late slack root recovery edit failed; will retry", "channel", r.Channel, "ts", r.TS)
+			failed[r] = true
 			continue
 		}
 		edited[r] = true
@@ -162,18 +171,27 @@ func (t *Tracker) editLateRoots(ctx context.Context, pub Publisher) {
 		// delivered edit must be recorded even if ctx is canceled around it.
 		t.auditAppend("llm.health.slack_updated", map[string]any{"late_root": true, "channel": r.Channel, "ts": r.TS, "state": "recovered"}) //nolint:contextcheck
 	}
-	if len(edited) == 0 {
+	if len(edited) == 0 && len(failed) == 0 {
 		return
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	kept := t.rec.LateRoots[:0:0]
+	next := t.rec.LateRoots[:0:0]
+	var retry []store.LLMLateRoot
 	for _, r := range t.rec.LateRoots {
-		if !edited[r] {
-			kept = append(kept, r)
+		switch {
+		case edited[r]:
+		case failed[r]:
+			retry = append(retry, r)
+		default:
+			next = append(next, r)
 		}
 	}
-	t.rec.LateRoots = kept
+	next = append(next, retry...)
+	if len(edited) == 0 && slices.Equal(next, t.rec.LateRoots) {
+		return // nothing landed and nothing moved: no write needed
+	}
+	t.rec.LateRoots = next
 	_ = t.persist() //nolint:contextcheck // logged inside; own bounded context by design — the edit landed regardless of ctx
 }
 

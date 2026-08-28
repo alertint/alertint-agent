@@ -314,7 +314,9 @@ capability**, cleared only by its own success:
   changes — never a card per stuck Incident. Every Slack call is bounded by
   its own timeout, so a stalled Slack endpoint can never hold up the idle
   probe behind it; a root still awaiting its episode's recovery edit is kept
-  in `llm_health.late_roots` until the edit lands, across restarts.
+  in `llm_health.late_roots` until the edit lands, across restarts; a root
+  whose edit keeps failing is rotated behind the others so it cannot starve
+  them.
 
 **Honest limitation:** the same synchronous-Correlator-loop limitation above
 applies here — a Call 1/Call 2/probe in flight pauses correlation for its
