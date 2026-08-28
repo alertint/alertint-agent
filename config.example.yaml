@@ -55,10 +55,11 @@ triage:
 # the idle probe is a metadata GET (never a completion) that runs only after
 # this many seconds without a completed real call. A Slack system message is
 # posted once the LLM has been unhealthy for broadcast_after_seconds and is
-# edited in place on recovery (only when notify.slack.enabled).
+# edited in place on recovery (only when notify.slack.enabled). The entire
+# block is optional; omitted fields keep the 300-second (5-minute) defaults.
 health:
-  llm_idle_probe_after_seconds: 300
-  broadcast_after_seconds: 300
+  llm_idle_probe_after_seconds: 300  # default: probe after 5 minutes without a completed real LLM call
+  broadcast_after_seconds: 300       # default: notify after 5 continuous unhealthy minutes
 
 notify:
   stdout: true             # always emit one JSON line per finding to stdout

@@ -233,6 +233,21 @@ signal; a non-generating metadata `GET` probe runs only while idle. See
 [Integration health](#integration-health) for the `/health` shape and the
 [Slack guide](../notifications/slack.md#system-messages) for the system message.
 
+Both settings are optional and default to `300` seconds (5 minutes). Omitting
+the entire `health` block leaves both defaults in effect:
+
+```yaml
+health:
+  llm_idle_probe_after_seconds: 300  # default: probe after 5 minutes without a completed real LLM call
+  broadcast_after_seconds: 300       # default: notify after 5 continuous unhealthy minutes
+```
+
+The timers are independent. `llm_idle_probe_after_seconds` controls when the
+zero-generation fallback probe becomes eligible; it still waits for zero calls
+in flight and runs at most once per minute while idle. `broadcast_after_seconds`
+starts when the aggregate LLM dependency state first becomes `degraded` or
+`unavailable`; state changes inside the same outage episode do not reset it.
+
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `llm_idle_probe_after_seconds` | int | `300` | Seconds without a completed real LLM call before an idle metadata probe runs (at most once per minute while idle; never while a call is in flight). Must be positive. |
