@@ -378,7 +378,14 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	// Results are cached for GET /health.
 	healthReg := buildHealthChecks(cfg, prom, logSrc, sentryClient, zbxClient)
 	go healthReg.Watch(ctx, logger)
-	go llmhealth.NewRunner(llmHealth, llmProber, llmSystemPublisher, logger).Run(ctx)
+	// The LLM health runner is joined on every exit path, before the store
+	// closes (deferred earlier, so it runs later): a Slack root POST in
+	// flight at shutdown is detached from ctx by design, and its result
+	// must still be persisted or the episode's write-ahead marker stays
+	// "indeterminate" for good.
+	llmRunCtx, llmRunCancel := context.WithCancel(ctx)
+	llmRunDone := llmhealth.NewRunner(llmHealth, llmProber, llmSystemPublisher, logger).Start(llmRunCtx)
+	defer drainLLMHealthRunner(llmRunCancel, llmRunDone, logger)
 
 	recvSrv, recvErrCh, err := startReceivers(cfg, st, auditor, cor, healthReg, llmHealth, logger)
 	if err != nil {
@@ -419,6 +426,18 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 	logger.Info("alertint stopped", slog.String("reason", "signal"))
 	return nil
+}
+
+// drainLLMHealthRunner stops the LLM health runner and waits, bounded by
+// llmhealth.DrainTimeout, for it to finish — long enough for a detached
+// Slack root POST to return and persist its coordinates.
+func drainLLMHealthRunner(cancel context.CancelFunc, done <-chan struct{}, logger *slog.Logger) {
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(llmhealth.DrainTimeout):
+		logger.Warn("llm health runner did not stop within the drain window; abandoning its in-flight delivery")
+	}
 }
 
 // pruneChangesAtStartup runs a one-shot retention prune so a long-stopped agent

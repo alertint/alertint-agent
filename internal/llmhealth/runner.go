@@ -46,6 +46,27 @@ func NewRunner(t *Tracker, prober llm.Prober, pub Publisher, logger *slog.Logger
 	return &Runner{t: t, prober: prober, pub: pub, logger: logger}
 }
 
+// DrainTimeout is how long an owner should wait for the channel returned by
+// Start after canceling ctx. A Slack POST that is in flight at cancellation
+// is deliberately detached from it (see Deliver) and bounded only by
+// deliveryTimeout; the join must outlast that call and the persistence of
+// its result, or the write-ahead marker stays "indeterminate" for good and
+// a root Slack did accept can never be edited again.
+const DrainTimeout = 20 * time.Second
+
+// Start runs Run on its own goroutine and returns a channel that is closed
+// once Run has returned. Owners must keep the store open until it closes
+// (bounded by DrainTimeout): an unjoined Runner exits with its in-flight
+// delivery abandoned.
+func (r *Runner) Start(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.Run(ctx)
+	}()
+	return done
+}
+
 // Run loops until ctx is done, calling Step on every tick and immediately
 // after every Tracker.Kick (a state or Slack-delivery-relevant transition),
 // so a recovery edit does not wait for the next full-minute tick.

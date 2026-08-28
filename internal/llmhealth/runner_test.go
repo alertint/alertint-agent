@@ -97,6 +97,45 @@ func TestRunWakesOnKick(t *testing.T) {
 	<-done
 }
 
+// TestStartJoinsInFlightPostOnShutdown pins the lifecycle side of the
+// detached POST: the done channel Start returns closes only after a POST in
+// flight at cancellation has returned and its coordinates were persisted, so
+// the owner can keep the store open until then instead of exiting with the
+// durable marker stuck at "indeterminate".
+func TestStartJoinsInFlightPostOnShutdown(t *testing.T) {
+	tr, st, c, _ := newTracker(t)
+	pub := &blockingPub{fakePub: &fakePub{}, started: make(chan struct{}), release: make(chan struct{})}
+	r := llmhealth.NewRunner(tr, nil, pub, nil)
+	llmhealth.SetRunnerTickForTest(time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(err503) // transition → buffered kick
+	c.add(5 * time.Minute)
+	done := r.Start(ctx) // consumes the kick: root due → POST
+
+	<-pub.started // past the fence, POST in flight
+	cancel()
+	select {
+	case <-done:
+		t.Fatal("runner reported done while its POST was still in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(pub.release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not finish after the POST returned")
+	}
+	rec, _, err := st.GetLLMHealth(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.SlackDelivery != llmhealth.DeliveryDelivered || rec.SlackTS == "" {
+		t.Fatalf("durable slack_delivery = %q ts = %q; the joined POST's coordinates must be persisted before done closes", rec.SlackDelivery, rec.SlackTS)
+	}
+}
+
 // TestStaleProbeFailureDiscardedAfterRealSuccessRacesIt covers the TOCTOU gap
 // between ProbeDue() (checks inFlight == 0, releases the lock) and the probe
 // HTTP call actually starting: a real call can begin — and succeed — while
