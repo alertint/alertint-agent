@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window to the most recent N minutes; the prompt states when the earlier span
   was not fetched. (#63)
 
+- Model-proposed PromQL verification checks are now parsed locally with the bundled official Prometheus parser. Invalid expressions get one batch repair call capped at 512 output tokens, are validated once more, and are never sent to Prometheus if still invalid. A repair is accepted only when it is a recognised rewrite of the original — one `sum` wrapper added to an expression that had none, scoped to exactly the term its orphaned `by`/`without` clause followed, that clause relocated onto it, a grouping clause respelled between the two forms of one aggregation's own modifier slot (`sum(x) by (t)` and `sum by (t) (x)`), and matchers reordered inside a single selector — and any other token change is rejected, so a repair cannot quietly move a selector, modifier or grouping clause onto a different operand, introduce `bool`/`group_left`/`group_right`/`offset`/`@ start()`, aggregate with something other than `sum`, wrap a truncated aggregation as if it were a metric of that name, add a second aggregation, or re-parenthesise the arithmetic. Residual invalid queries are logged with the expression, persisted/audited as `invalid`, treated as inconclusive for confidence, and shown separately from an unavailable metrics backend in Slack. Query-specific Prometheus `bad_data` responses remain a typed backend-authoritative fallback; unrelated bad request parameters remain backend failures. Normal verification stays at two LLM calls; only a malformed query plan can add the single repair call. Reported in #62.
+
 ## [0.13.4] - 2026-08-25
 
 ### Fixed

@@ -420,6 +420,10 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 			// A degraded round (floor unfetchable, or call 2 lost) shipped without a
 			// full falsification pass — card renderers surface a caveat off this.
 			Unverified: ver != nil && ver.Outcome == verifyOutcomeDegraded,
+			// VerificationInvalidQueries counts locally-invalid/backend-rejected
+			// queries across every round — independent of Unverified, which only
+			// reflects connector/round-level degradation.
+			VerificationInvalidQueries: invalidQueryCount(ver),
 		}
 		if p.rejudge && p.recurrenceEpisodes > 1 && !p.recurrenceLastSeen.IsZero() {
 			f.Recurrence = &notify.Recurrence{Episodes: p.recurrenceEpisodes, LastSeen: p.recurrenceLastSeen}
@@ -925,6 +929,14 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 	vp := s.verifyParams()
 	floor := composeFloor(vp, s.cfg.ZabbixParams.HostLabel, alerts)
 	modelQ := parseVerificationPlan(ar.raw, vp, s.logger, inc.ID)
+	// One bounded batch repair of the model's own invalid PromQL, before
+	// anything else sees the plan (ADR-0043): the audit row below, the round,
+	// and the re-judge must all describe the EFFECTIVE plan — a repaired query
+	// as it will actually run, a still-broken one already marked invalid and
+	// excluded from execution — not the model's unchecked draft of it. Exactly
+	// one call, only when something is actually invalid, and never a second
+	// one; the stats it returns ride their own count-only audit row.
+	modelQ, _ = s.repairModelPromQL(ctx, inc.ID, modelQ)
 
 	// The governing verdict's operator-sourced steering queries (ADR-0029) ride
 	// the same round, between the floor and the model's own proposals.
@@ -1104,20 +1116,25 @@ func (s *Skill) auditVerificationPlanned(ctx context.Context, inc store.Incident
 	})
 }
 
-// auditVerificationExecuted records the round result: outcome, fetched/failed
-// query counts (an empty answer counts as fetched — "asked, nothing there"), and
-// whether the confidence clamp fired. No metric values.
+// auditVerificationExecuted records the round result: outcome,
+// fetched/failed/invalid query counts (an empty answer counts as fetched —
+// "asked, nothing there"; invalid is counted separately from failed since it
+// is a model-quality signal, never a backend outage, and was never executed
+// against the backend), and whether the confidence clamp fired. No
+// expressions, no metric values.
 func (s *Skill) auditVerificationExecuted(ctx context.Context, incidentID, outcome string, round *VerificationRound, clamped bool) {
 	if s.auditor == nil {
 		return
 	}
-	var fetched, failed int
+	var fetched, failed, invalid int
 	for _, q := range round.Queries {
 		switch q.Outcome {
 		case OutcomeFetched, OutcomeEmpty:
 			fetched++
 		case OutcomeFailed, OutcomeDegraded:
 			failed++
+		case OutcomeInvalid:
+			invalid++
 		case OutcomeNoSelector:
 			// Metric-enrichment-only outcome; never set on a verification query.
 		}
@@ -1127,6 +1144,7 @@ func (s *Skill) auditVerificationExecuted(ctx context.Context, incidentID, outco
 		"outcome":     outcome,
 		"fetched":     fetched,
 		"failed":      failed,
+		"invalid":     invalid,
 		"clamped":     clamped,
 	})
 }

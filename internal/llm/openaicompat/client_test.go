@@ -321,6 +321,31 @@ func TestFinishReasonLengthIsTruncationError(t *testing.T) {
 	}
 }
 
+// TestFinishReasonLengthPerCallHint verifies that when the truncation
+// ceiling came from an explicit per-call Prompt.MaxOutputTokens (Task 2), the
+// error reports the per-call cap instead of the "raise llm.max_tokens"
+// operator hint — a deliberately bounded repair call must not be
+// misdiagnosed as an operator misconfiguration.
+func TestFinishReasonLengthPerCallHint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(chatBodyFull(`{"queries":[{"query":"up{job=`, "", "length")))
+	}))
+	defer srv.Close()
+
+	c := newClient(srv, nil) // configured MaxTokens: 4096
+	_, err := c.Complete(context.Background(), "s",
+		llm.Prompt{Prefix: "p", MaxOutputTokens: 128}, []string{"queries"})
+	if !errors.Is(err, llm.ErrResponseTruncated) {
+		t.Fatalf("want ErrResponseTruncated, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "per-call max_output_tokens") {
+		t.Errorf("explicit per-call cap must report the per-call hint, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "raise llm.max_tokens") {
+		t.Errorf("explicit per-call cap must not report the operator-misconfiguration hint, got: %v", err)
+	}
+}
+
 func TestRequiredKeyMissing(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(chatBody(`{"other":1}`, 1, 1)))
@@ -460,6 +485,32 @@ func TestTimeoutHonored(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 1900*time.Millisecond {
 		t.Errorf("timeout not honored, took %v", elapsed)
+	}
+}
+
+// TestPerCallMaxOutputTokens verifies an explicit Prompt.MaxOutputTokens
+// lower than the configured ceiling reaches the wire as max_tokens (Task 2's
+// lowering-only per-call cap; Task 5's bounded PromQL repair call passes
+// MaxOutputTokens: 512).
+func TestPerCallMaxOutputTokens(t *testing.T) {
+	successBody := chatBody(`{"queries":[]}`, 1, 1)
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		_, _ = w.Write([]byte(successBody))
+	}))
+	defer srv.Close()
+
+	client := newClient(srv, nil)
+	_, err := client.Complete(context.Background(), "sys",
+		llm.Prompt{Prefix: "repair", MaxOutputTokens: 128}, []string{"queries"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := body["max_tokens"]; got != float64(128) {
+		t.Fatalf("max_tokens = %v, want 128", got)
 	}
 }
 

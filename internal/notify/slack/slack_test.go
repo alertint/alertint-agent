@@ -264,6 +264,55 @@ func TestFiringDetailBlocks_UnverifiedCaveat(t *testing.T) {
 	}
 }
 
+// TestFiringDetailBlocks_InvalidQueryCaveat (Task 6): a locally-invalid or
+// backend-rejected verification query is a distinct, classified caveat from
+// Unverified/"checks unavailable" — it renders singular/plural correctly,
+// never masquerades as connector unavailability, and coexists with the
+// Unverified caveat when both apply (independent conditions, ADR/R15 rails
+// stay untouched — this is presentation only).
+func TestFiringDetailBlocks_InvalidQueryCaveat(t *testing.T) {
+	f := testFinding()
+	f.VerificationInvalidQueries = 1
+	got := blocksJSON(t, firingDetailBlocks(f))
+	for _, want := range []string{
+		"verification incomplete",
+		"1 metrics query invalid",
+		"not used as evidence",
+		"confidence could not increase",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "checks unavailable") {
+		t.Fatalf("invalid query must not masquerade as unavailable: %s", got)
+	}
+
+	// Plural noun, and coexistence with the Unverified caveat: both must
+	// render, separately classified.
+	f.VerificationInvalidQueries = 2
+	f.Unverified = true
+	got = blocksJSON(t, firingDetailBlocks(f))
+	if !strings.Contains(got, "2 metrics queries invalid") {
+		t.Fatalf("missing plural invalid caveat: %s", got)
+	}
+	if !strings.Contains(got, "unverified — checks unavailable") {
+		t.Fatalf("unavailable caveat must remain separately classified: %s", got)
+	}
+
+	// Ordering: the invalid-query caveat must appear after the evidence line
+	// and before the Unverified caveat.
+	evidenceIdx := strings.Index(got, "Evidence:")
+	invalidIdx := strings.Index(got, "queries invalid")
+	unverifiedIdx := strings.Index(got, "checks unavailable")
+	if evidenceIdx < 0 || invalidIdx < 0 || unverifiedIdx < 0 {
+		t.Fatalf("expected all three markers present: evidence=%d invalid=%d unverified=%d\n%s", evidenceIdx, invalidIdx, unverifiedIdx, got)
+	}
+	if evidenceIdx >= invalidIdx || invalidIdx >= unverifiedIdx {
+		t.Fatalf("expected order evidence < invalid-query caveat < unverified caveat, got evidence=%d invalid=%d unverified=%d\n%s", evidenceIdx, invalidIdx, unverifiedIdx, got)
+	}
+}
+
 // TestFiringCardHistoryBlock covers the tri-state operator history line and
 // the steering ruling line (R9/R13, ADR-0029): first/seen/seen-without-count/
 // history/unavailable, plus all ruling outcomes. Surfaces differ on purpose:

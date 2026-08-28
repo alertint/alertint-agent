@@ -305,6 +305,41 @@ MCP client:
 | `prometheus_query` | Instant PromQL query. Parameters: `expr` (required), `time` (optional ISO 8601). |
 | `prometheus_query_range` | Range PromQL query with auto-stepped resolution. Parameters: `expr`, `start`, `end` (ISO 8601), `step` (optional). |
 
+`prometheus_query` and `prometheus_query_range` are **backend-native
+passthrough**: whatever PromQL the connected agent sends goes straight to
+Prometheus. There is no local syntax check and no repair attempt on this
+path — a malformed expression comes back as whatever error Prometheus itself
+returns, verbatim, for the calling agent to read and correct. That's a
+deliberate boundary, not an oversight: this is a human or a connected agent
+driving an open-ended investigation, and the tool's job is to report exactly
+what the backend said, not to intercept or second-guess the query. It also
+means a non-vanilla backend's own extensions keep working — a VictoriaMetrics
+MetricsQL function like `median_over_time`, say, that the standard PromQL
+grammar doesn't recognize still runs fine through these tools, because
+nothing here parses it against that grammar first.
+
+The bundled local validation described in
+[Verification round](../concepts/verification-round.md#locally-invalid-promql)
+is wider than just the model's own checks: it covers every PromQL
+expression the unattended pipeline runs as a check — the model's
+disprove-queries, a governing correction's operator-sourced steering
+checks, and the widen queries run once at verdict capture all go through
+the same local parse (the deterministic floor's own up-ratio and
+incidents-in-window checks build fixed queries of their own and carry no
+operator- or model-authored expression to validate, so this step never
+applies to them). The one-shot repair call is narrower: it only ever
+fires for locally-invalid **model-proposed** PromQL — a fixed,
+no-human-in-the-loop pipeline where a malformed query would otherwise
+either burn a Prometheus round-trip on something that can never succeed or
+silently drop a check with no chance to fix it. A locally-invalid
+operator-sourced or capture-widening query is marked invalid the same way
+but is never sent to a repair call — a human authored it, so the honest
+move is to surface the failure, not have the model guess at a fix. Neither
+local validation nor repair ever touches these two MCP tools:
+`prometheus_query` and `prometheus_query_range` queries go straight to
+Prometheus exactly as sent, and the verification round never calls either
+tool.
+
 ### Example queries
 
 Ask your agent in natural language — **AlertINT** handles the PromQL via MCP:

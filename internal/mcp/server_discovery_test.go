@@ -64,6 +64,46 @@ func TestPrometheusQuery_NonEmptyNoHint(t *testing.T) {
 	}
 }
 
+// TestPrometheusQuery_NoLocalParserInterception is a boundary regression
+// (ADR-0043): the on-demand prometheus_query / prometheus_query_range MCP
+// tools remain a direct backend-native passthrough, never intercepted by the
+// bundled official-grammar PromQL parser skills/acutetriage's own unattended
+// verification path uses (internal/prometheus.ValidateExpr). median_over_time
+// is a real VictoriaMetrics/MetricsQL function name a non-vanilla backend may
+// support natively, but the official Prometheus grammar does not recognize —
+// ValidateExpr rejects it with "unknown function". Both an instant and a
+// range call with that exact expression must still reach the fake backend
+// byte-identical and come back successfully, proving this package never
+// calls that parser (or any parser) at all — not merely that this one
+// expression happens to pass it.
+func TestPrometheusQuery_NoLocalParserInterception(t *testing.T) {
+	const backendSpecificExpr = `median_over_time(metric_name[5m])`
+	var gotExprs []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotExprs = append(gotExprs, r.URL.Query().Get("query"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
+	}))
+	t.Cleanup(srv.Close)
+	prom := promclient.NewClient(promclient.Config{BaseURL: srv.URL})
+
+	st := newMCPStore(t)
+	s := NewServer(Config{Prometheus: prom}, st, audit.New(st.DB()))
+
+	res, err := s.handlePrometheusQuery(context.Background(), reqWith(map[string]any{"expr": backendSpecificExpr}))
+	if err != nil || res.IsError {
+		t.Fatalf("instant query errored: %v %s", err, resultText(t, res))
+	}
+	res, err = s.handlePrometheusQueryRange(context.Background(), reqWith(map[string]any{"expr": backendSpecificExpr}))
+	if err != nil || res.IsError {
+		t.Fatalf("range query errored: %v %s", err, resultText(t, res))
+	}
+
+	if len(gotExprs) != 2 || gotExprs[0] != backendSpecificExpr || gotExprs[1] != backendSpecificExpr {
+		t.Fatalf("both exact expressions must reach the backend unmodified, got %v", gotExprs)
+	}
+}
+
 func TestLogsQueryRange_EmptyResultHint(t *testing.T) {
 	st := newMCPStore(t)
 	spy := &spySource{data: json.RawMessage(`{"resultType":"streams","result":[]}`)}

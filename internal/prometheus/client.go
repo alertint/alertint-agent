@@ -10,6 +10,7 @@ package prometheus
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -35,6 +36,39 @@ type Config struct {
 	OrgID               string // empty = no tenant header (multi-tenant Mimir/Cortex only)
 	TimeoutSeconds      int
 	DefaultRangeMinutes int
+}
+
+// APIError represents a structured Prometheus API error response.
+type APIError struct {
+	StatusCode int
+	Type       string
+	Message    string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("prometheus %s: %s", e.Type, e.Message)
+}
+
+// IsInvalidQuery reports whether err is a bad_data APIError specifically
+// indicating a malformed query parameter, as opposed to other parameter
+// errors (limit, time) or non-bad_data failures.
+func IsInvalidQuery(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Type != "bad_data" {
+		return false
+	}
+	msg := strings.ToLower(apiErr.Message)
+	queryParam := strings.Contains(msg, `parameter "query"`) ||
+		strings.Contains(msg, "parameter 'query'") || strings.Contains(msg, "parameter query")
+	if strings.Contains(msg, "parameter") {
+		return queryParam // an explicitly named non-query parameter wins over generic parse wording
+	}
+	for _, marker := range []string{"parse error", "parse query", "parsing query", "invalid promql", "invalid query"} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // NewClient builds a Client from cfg. A zero TimeoutSeconds defaults to 10s.
@@ -125,7 +159,11 @@ func (c *Client) apiGet(ctx context.Context, path string, params url.Values) (js
 		return nil, fmt.Errorf("prometheus: decode response: %w", err)
 	}
 	if envelope.Status != "success" {
-		return nil, fmt.Errorf("prometheus %s: %s", envelope.ErrorType, envelope.Error)
+		return nil, &APIError{
+			StatusCode: resp.StatusCode,
+			Type:       envelope.ErrorType,
+			Message:    envelope.Error,
+		}
 	}
 	return envelope.Data, nil
 }

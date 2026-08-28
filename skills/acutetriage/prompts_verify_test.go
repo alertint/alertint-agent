@@ -249,3 +249,21 @@ func TestCallTwoContinuation_FloorEmptySentencePresent(t *testing.T) {
 		t.Fatalf("floor-empty rule missing from continuation:\n%s", out)
 	}
 }
+
+// Task 6: a query the local validator/backend rejected (OutcomeInvalid) was
+// never fetched — the re-judge continuation must explicitly say it is
+// inconclusive and not evidence for or against the draft, so the model does
+// not misread "invalid query (not executed)" as a confirmed absence.
+func TestCallTwoPromptInvalidQueriesAreInconclusive(t *testing.T) {
+	round := minimalRound()
+	round.Queries = append(round.Queries, VerificationQuery{
+		Kind: kindPromQL, Source: "model", Outcome: OutcomeInvalid,
+		Result: "invalid query (not executed)",
+	})
+	got := callTwoContinuation(json.RawMessage(`{"overall_issue":"x"}`), round, nil)
+	for _, want := range []string{"invalid", "inconclusive", "not evidence"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q:\n%s", want, got)
+		}
+	}
+}

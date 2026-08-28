@@ -48,6 +48,9 @@ type Finding struct {
 	// surface a caveat off it. False on the kill-switch path and on any
 	// supported/revised round.
 	Unverified bool `json:"unverified,omitempty"`
+	// VerificationInvalidQueries counts methodological query failures that were
+	// not used as evidence. It is independent of connector availability.
+	VerificationInvalidQueries int `json:"verification_invalid_queries,omitempty"`
 	// History is the group key's operator history (R13/D9), producer-computed
 	// by the triage skill the same way Recurrence is: notifiers stay I/O-free
 	// renderers, the skill owns the store read. nil only when no notifier is

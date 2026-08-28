@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/audit"
@@ -63,9 +64,7 @@ func (n *Notifier) Notify(ctx context.Context, f notify.Finding) error {
 			Kind:    "finding",
 			Finding: f,
 		}
-		if f.Unverified {
-			l.Caveat = "⚠ unverified — checks unavailable"
-		}
+		l.Caveat = caveatText(f)
 		b, err := json.Marshal(l)
 		if err != nil {
 			return fmt.Errorf("stdout notifier: marshal: %w", err)
@@ -81,6 +80,30 @@ func (n *Notifier) Notify(ctx context.Context, f notify.Finding) error {
 		})
 	}
 	return nil
+}
+
+// caveatText builds the verbose-line Caveat sentence(s). Two conditions are
+// independent and classified separately (Task 6): VerificationInvalidQueries
+// (methodological query failures never used as evidence, e.g. a locally-
+// invalid or backend-rejected PromQL expression — never renders the
+// expression itself, only the count) and Unverified (a degraded round —
+// connector/round-level unavailability, unchanged from before this task).
+// When both apply they combine, invalid-query sentence first, joined by
+// "; " — mirrors the Slack detail-block ordering (invalid-query caveat
+// before the Unverified caveat).
+func caveatText(f notify.Finding) string {
+	var parts []string
+	if n := f.VerificationInvalidQueries; n > 0 {
+		noun := "query"
+		if n != 1 {
+			noun = "queries"
+		}
+		parts = append(parts, fmt.Sprintf("⚠ verification incomplete — %d metrics %s invalid; not used as evidence and confidence could not increase", n, noun))
+	}
+	if f.Unverified {
+		parts = append(parts, "⚠ unverified — checks unavailable")
+	}
+	return strings.Join(parts, "; ")
 }
 
 // occurrenceLine is the JSON shape written for each recurrence-collapse attach.

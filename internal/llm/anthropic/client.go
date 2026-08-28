@@ -284,9 +284,10 @@ func (c *Client) callWithRetry(ctx context.Context, system string, prompt llm.Pr
 
 // doRequest performs a single HTTP call to the Messages API.
 func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt) (json.RawMessage, tokenUsage, error) {
+	maxTokens := prompt.OutputTokenLimit(c.cfg.MaxTokens)
 	body := messagesRequest{
 		Model:     c.cfg.Model,
-		MaxTokens: c.cfg.MaxTokens,
+		MaxTokens: maxTokens,
 		System:    system,
 		Messages:  []message{{Role: "user", Content: userContent(prompt)}},
 		Thinking:  &thinkingConfig{Type: "disabled"},
@@ -344,8 +345,16 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt
 	// rather than the raw, misleading "not valid JSON" the parse below would
 	// give — the fix is to raise llm.max_tokens, not to retry (which truncates
 	// identically), so this is returned immediately, not as a RetryableError.
+	// When the ceiling came from an explicit per-call Prompt.MaxOutputTokens
+	// (e.g. a deliberately bounded repair call), the operator's configured
+	// llm.max_tokens is not the cause — report the per-call cap instead so the
+	// truncation is not misdiagnosed as an operator misconfiguration.
 	if parsed.StopReason == "max_tokens" {
-		return nil, usage, fmt.Errorf("%w=%d (raise llm.max_tokens)", llm.ErrResponseTruncated, c.cfg.MaxTokens)
+		hint := "raise llm.max_tokens"
+		if prompt.MaxOutputTokens != 0 {
+			hint = "per-call max_output_tokens"
+		}
+		return nil, usage, fmt.Errorf("%w=%d (%s)", llm.ErrResponseTruncated, maxTokens, hint)
 	}
 
 	text := firstTextBlock(parsed.Content)

@@ -191,6 +191,21 @@ func TestLintExpectationVerifiable_FailedFetchStillUnverifiable(t *testing.T) {
 	}
 }
 
+// TestLintExpectationVerifiable_InvalidQueryNotVerifiable covers the third
+// non-evidence Outcome (alongside failed/degraded above): a query that never
+// executed at all because it was locally invalid still names the series in
+// its Expr, but that is not evidence the series is verifiable — the lint
+// must still fire.
+func TestLintExpectationVerifiable_InvalidQueryNotVerifiable(t *testing.T) {
+	frozen := frozenEnvelope{Verification: &VerificationEnrichment{Rounds: []VerificationRound{{
+		Queries: []VerificationQuery{{Expr: "pvc_bytes", Outcome: OutcomeInvalid}},
+	}}}}
+	warnings := lintExpectationVerifiable("correction", Expectation{CauseSeries: []string{"pvc_bytes"}}, frozen, nil)
+	if len(warnings) == 0 {
+		t.Fatal("invalid query must not make cause_series verifiable")
+	}
+}
+
 // TestLintExpectationVerifiable_AnchorlessCorrectionWarns covers Fix 4: a
 // correction naming only must_not_conclude (a fully valid expectation per
 // parseExpectation) can never generate a single steering query — buildSteeringQueries

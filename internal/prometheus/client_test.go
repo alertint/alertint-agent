@@ -4,6 +4,7 @@ package prometheus
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -91,4 +92,33 @@ func TestOrgIDHeader(t *testing.T) {
 			t.Errorf("X-Scope-OrgID = %q, want absent", got)
 		}
 	})
+}
+
+func TestQueryInstantPreservesAPIError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"status":"error","errorType":"bad_data","error":"invalid parameter \"query\": parse error"}`))
+	}))
+	defer srv.Close()
+
+	_, err := NewClient(Config{BaseURL: srv.URL}).QueryInstant(context.Background(), "bad", time.Time{}, 0)
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error type = %T, want *APIError: %v", err, err)
+	}
+	if apiErr.StatusCode != http.StatusUnprocessableEntity || apiErr.Type != "bad_data" || !IsInvalidQuery(err) {
+		t.Fatalf("APIError = %+v IsInvalidQuery=%v", apiErr, IsInvalidQuery(err))
+	}
+}
+
+func TestIsInvalidQueryRejectsNonQueryFailures(t *testing.T) {
+	for _, err := range []error{
+		&APIError{StatusCode: 422, Type: "execution", Message: "query execution failed"},
+		&APIError{StatusCode: 400, Type: "bad_data", Message: `invalid parameter "limit": parse error`},
+		&APIError{StatusCode: 400, Type: "bad_data", Message: `invalid parameter "time": cannot parse timestamp`},
+	} {
+		if IsInvalidQuery(err) {
+			t.Fatalf("non-query failure classified as invalid query: %v", err)
+		}
+	}
 }
