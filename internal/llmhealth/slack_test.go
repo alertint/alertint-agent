@@ -576,6 +576,46 @@ func TestPreCanceledDeliveryDoesNotSilenceEpisode(t *testing.T) {
 	}
 }
 
+// cancelOnPostPub cancels the delivery's parent context the moment the POST
+// is invoked — a shutdown landing after Deliver's last ctx check and before
+// the request leaves — and then behaves like ctxAwarePub.
+type cancelOnPostPub struct {
+	ctxAwarePub
+
+	cancel context.CancelFunc
+}
+
+func (p *cancelOnPostPub) PostSystemMessage(ctx context.Context, text string) (string, string, error) {
+	p.cancel()
+	return p.ctxAwarePub.PostSystemMessage(ctx, text)
+}
+
+// TestCancelRacingPostDoesNotSilenceEpisode pins the other side of the fence:
+// once the "post started" marker is committed and the last ctx check has
+// passed, a cancellation can no longer stop the request from being made, so
+// it cannot turn a never-sent post into a durable indeterminate marker.
+func TestCancelRacingPostDoesNotSilenceEpisode(t *testing.T) {
+	tr, st, c, _ := newTracker(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pub := &cancelOnPostPub{cancel: cancel}
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(err503)
+	c.add(5 * time.Minute)
+
+	tr.Deliver(ctx, pub)
+
+	if pub.postCount() != 1 {
+		t.Fatalf("posts = %v; a cancellation racing the POST must not stop it", pub.posts)
+	}
+	rec, _, err := st.GetLLMHealth(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.SlackDelivery != llmhealth.DeliveryDelivered {
+		t.Fatalf("durable slack_delivery = %q, want %q", rec.SlackDelivery, llmhealth.DeliveryDelivered)
+	}
+}
+
 // TestCrashBetweenPostAndPersistDoesNotRepost pins the durable side of the
 // same contract: the "a post is in flight" marker is persisted BEFORE the
 // HTTP call, so a process that dies between Slack accepting the message and

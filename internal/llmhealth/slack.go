@@ -120,14 +120,20 @@ func (t *Tracker) Deliver(ctx context.Context, pub Publisher) {
 	case deliverNone:
 	case deliverPost:
 		// Same reasoning once more, for a cancellation that landed between
-		// the marker commit and the POST: the request has not left, so the
+		// the marker commit and this fence: the request has not left, so the
 		// bare ctx error (never ErrDeliveryIndeterminate) takes the
 		// definite-failure path and the marker goes back to pending.
 		if err := ctx.Err(); err != nil {
 			t.applyDeliveryResult(plan, "", "", err) //nolint:contextcheck
 			break
 		}
-		channel, ts, err := postBounded(ctx, pub, plan.text)
+		// Past the fence the POST is detached from cancellation: a cancel
+		// landing between the check and the request would otherwise fail the
+		// call before it is sent, and the publisher would report that as
+		// indeterminate — a durable marker for a post that never left. The
+		// call keeps its own deliveryTimeout, so shutdown waits at most that
+		// long; only genuine transport uncertainty is indeterminate now.
+		channel, ts, err := postBounded(context.WithoutCancel(ctx), pub, plan.text)
 		t.applyDeliveryResult(plan, channel, ts, err) //nolint:contextcheck
 	case deliverUpdateState, deliverUpdateRecovery:
 		err := updateBounded(ctx, pub, plan.channel, plan.ts, plan.text)
