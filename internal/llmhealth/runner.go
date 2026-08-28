@@ -62,14 +62,21 @@ func NewRunner(t *Tracker, prober llm.Prober, pub Publisher, logger *slog.Logger
 //	idle probe due in the same step: the probe itself fails at once on the
 //	canceled ctx, but ObserveProbe still persists and audits
 //	                                         2 × persistTimeout
+//	a real call recovering while the POST is out holds the lock across
+//	two audits and a persist, and the returning POST then adopts the
+//	stale root with one more audit and persist
+//	                                         5 × persistTimeout
 //	+ scheduling margin                      drainMargin
 //
 // Everything else in the step (late-root edits, the probe HTTP call) is
-// bound to ctx and returns immediately once it is canceled. Stopping short
-// of this chain leaves the write-ahead marker "indeterminate" for good and a
+// bound to ctx and returns immediately once it is canceled. The owner should
+// still stop observation producers before draining — each further Finish
+// under contention adds its own bounded persist — but the window covers one
+// full recovery so a single straggler cannot break it. Stopping short of
+// this chain leaves the write-ahead marker "indeterminate" for good and a
 // root Slack did accept without the coordinates needed to edit it again.
 func DrainTimeout() time.Duration {
-	return deliveryTimeout + 4*persistTimeout + drainMargin
+	return deliveryTimeout + 9*persistTimeout + drainMargin
 }
 
 // Start runs Run on its own goroutine and returns a channel that is closed

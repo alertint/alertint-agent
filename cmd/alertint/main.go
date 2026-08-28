@@ -219,6 +219,17 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		slog.Bool("slack", llmSystemPublisher != nil),
 	)
 
+	// The LLM health runner starts here, before the correlator, so the
+	// deferred order on every exit path is: correlator stopped (the only
+	// producer of capability observations, joined by cor.Stop), then the
+	// runner drained, then the store closed. A Slack root POST in flight at
+	// shutdown is detached from ctx by design; its result — and any
+	// recovery racing it — must still be persisted or the episode's
+	// write-ahead marker stays "indeterminate" for good.
+	llmRunCtx, llmRunCancel := context.WithCancel(ctx)
+	llmRunDone := llmhealth.NewRunner(llmHealth, llmProber, llmSystemPublisher, logger).Start(llmRunCtx)
+	defer drainLLMHealthRunner(llmRunCancel, llmRunDone, logger)
+
 	// Build Prometheus client when enabled. Passed into both the triage skill
 	// (metric enrichment for the LLM prompt) and the MCP server (PromQL tools).
 	var prom *promclient.Client
@@ -378,15 +389,6 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	// Results are cached for GET /health.
 	healthReg := buildHealthChecks(cfg, prom, logSrc, sentryClient, zbxClient)
 	go healthReg.Watch(ctx, logger)
-	// The LLM health runner is joined on every exit path, before the store
-	// closes (deferred earlier, so it runs later): a Slack root POST in
-	// flight at shutdown is detached from ctx by design, and its result
-	// must still be persisted or the episode's write-ahead marker stays
-	// "indeterminate" for good.
-	llmRunCtx, llmRunCancel := context.WithCancel(ctx)
-	llmRunDone := llmhealth.NewRunner(llmHealth, llmProber, llmSystemPublisher, logger).Start(llmRunCtx)
-	defer drainLLMHealthRunner(llmRunCancel, llmRunDone, logger)
-
 	recvSrv, recvErrCh, err := startReceivers(cfg, st, auditor, cor, healthReg, llmHealth, logger)
 	if err != nil {
 		return err
