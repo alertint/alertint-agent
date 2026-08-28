@@ -95,6 +95,12 @@ func (t *Tracker) Deliver(ctx context.Context, pub Publisher) {
 	if pub == nil {
 		return
 	}
+	// One budget for the whole phase: the episode's own call plus the late
+	// root edits below. Each call is bounded on its own too; whatever does
+	// not fit stays queued for the next step, so a backlog of stalled edits
+	// never holds the idle probe behind it for N × deliveryTimeout.
+	ctx, cancel := context.WithTimeout(ctx, deliveryBudget)
+	defer cancel()
 	// planDelivery and applyDeliveryResult persist with their own bounded
 	// context.Background() by design: the "post started" marker and the
 	// delivery result must both be recorded even if ctx is canceled around
@@ -143,6 +149,10 @@ func (t *Tracker) editLateRoots(ctx context.Context, pub Publisher) {
 	}
 	edited := map[store.LLMLateRoot]bool{}
 	for _, r := range pending {
+		if ctx.Err() != nil {
+			t.logger.Warn("llm health: delivery budget spent; remaining late slack root edits wait for the next step", "remaining", len(pending)-len(edited))
+			break
+		}
 		if err := updateBounded(ctx, pub, r.Channel, r.TS, RenderRecovery(time.Duration(r.DownForMS)*time.Millisecond)); err != nil {
 			t.logger.Warn("llm health: late slack root recovery edit failed; will retry", "channel", r.Channel, "ts", r.TS)
 			continue

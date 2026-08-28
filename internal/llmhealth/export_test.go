@@ -19,3 +19,6 @@ func SetProbeTimeoutForTest(d time.Duration) { probeTimeout = d }
 
 // SetDeliveryTimeoutForTest overrides the per-Slack-call delivery timeout.
 func SetDeliveryTimeoutForTest(d time.Duration) { deliveryTimeout = d }
+
+// SetDeliveryBudgetForTest overrides the whole-Deliver-phase budget.
+func SetDeliveryBudgetForTest(d time.Duration) { deliveryBudget = d }

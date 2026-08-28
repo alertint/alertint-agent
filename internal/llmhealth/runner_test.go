@@ -11,6 +11,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/llm"
 	"github.com/alertint/alertint-agent/internal/llmhealth"
+	"github.com/alertint/alertint-agent/internal/store"
 )
 
 type fakeProber struct {
@@ -220,6 +221,49 @@ func TestStalledSlackDeliveryDoesNotBlockProbe(t *testing.T) {
 	}
 	if s := tr.Snapshot(); s.State != llmhealth.StateHealthy {
 		t.Fatalf("probe success must still recover the installation: %+v", s)
+	}
+}
+
+// TestLateRootBacklogCannotStarveProbe pins that the whole Slack delivery
+// phase of one Step is budgeted, not just each call: N stalled late-root
+// edits must not cost N × deliveryTimeout before the due probe runs.
+func TestLateRootBacklogCannotStarveProbe(t *testing.T) {
+	_, st, c, _ := newTracker(t)
+	rec, caps, err := st.GetLLMHealth(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		rec.LateRoots = append(rec.LateRoots, store.LLMLateRoot{Channel: "C1", TS: fmt.Sprintf("1.%d", i), DownForMS: 60000})
+	}
+	if err := st.SaveLLMHealth(context.Background(), rec, caps); err != nil {
+		t.Fatal(err)
+	}
+	tr, err := llmhealth.New(context.Background(), st, llmhealth.Options{Now: c.now, BroadcastAfter: 5 * time.Minute, IdleProbeAfter: 5 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := &stalledPub{}
+	pr := &fakeProber{res: llm.ProbeResult{Outcome: llm.ProbeOK, Method: "GET", Path: "/health"}}
+	r := llmhealth.NewRunner(tr, pr, pub, nil)
+	llmhealth.SetDeliveryTimeoutForTest(100 * time.Millisecond)
+	llmhealth.SetDeliveryBudgetForTest(150 * time.Millisecond)
+	t.Cleanup(func() {
+		llmhealth.SetDeliveryTimeoutForTest(15 * time.Second)
+		llmhealth.SetDeliveryBudgetForTest(45 * time.Second)
+	})
+	c.add(5 * time.Minute)
+
+	start := time.Now()
+	r.Step(context.Background(), c.now())
+	if el := time.Since(start); el > 400*time.Millisecond {
+		t.Fatalf("Step took %v: the late-root backlog was drained call by call instead of within one budget", el)
+	}
+	if pr.calls.Load() != 1 {
+		t.Fatal("the due idle probe did not run")
+	}
+	if calls := pub.calls.Load(); calls >= 5 {
+		t.Fatalf("slack calls = %d; the budget did not cut the backlog short", calls)
 	}
 }
 

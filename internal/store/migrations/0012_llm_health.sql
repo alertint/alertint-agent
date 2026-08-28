@@ -36,7 +36,7 @@ VALUES (1, 'healthy', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
 
 CREATE TABLE llm_health_capabilities (
     capability       TEXT    NOT NULL PRIMARY KEY
-                     CHECK (capability IN ('triage_draft','verification_rejudge','memory_classifier','probe')),
+                     CHECK (capability IN ('triage_draft','verification_rejudge','memory_classifier','query_repair','probe')),
     healthy          INTEGER NOT NULL CHECK (healthy IN (0, 1)),
     reason_code      TEXT    NOT NULL DEFAULT '',
     detail           TEXT    NOT NULL DEFAULT '',

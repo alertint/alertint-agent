@@ -287,9 +287,10 @@ the optional memory classifier, and the idle probe — is its own **LLM
 capability**, cleared only by its own success:
 
 - A `triage_draft` failure makes the installation `unavailable`; a
-  `verification_rejudge` failure makes it `degraded` while drafts continue
-  to ship. `memory_classifier` is reported independently and never changes
-  the rolled-up state.
+  `verification_rejudge` or `query_repair` failure (the one bounded PromQL
+  repair call before Call 2) makes it `degraded` while drafts continue to
+  ship. `memory_classifier` is reported independently and never changes the
+  rolled-up state.
 - After five idle minutes with zero in-flight calls, a strictly
   non-generating metadata `GET` probes reachability — never a completion,
   never a prompt. A dependency-class probe failure also makes the

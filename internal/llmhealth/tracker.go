@@ -243,7 +243,7 @@ func (t *Tracker) finish(capability Capability, subject string, err error) {
 		t.markCapabilityHealthy(capability, now)
 		successAt := now
 		t.rec.LastRealSuccessAt = &successAt
-		if capability == CapabilityTriageDraft || capability == CapabilityVerificationRejudge {
+		if capability == CapabilityTriageDraft || capability == CapabilityVerificationRejudge || capability == CapabilityQueryRepair {
 			t.clearCapabilityIfPresent(CapabilityProbe, now)
 		}
 	case ClassDependency:
@@ -474,10 +474,11 @@ func (t *Tracker) recordContentFailure(capability Capability, subject string, re
 
 // aggregate computes the rolled-up state and the reason/detail of the first
 // unhealthy capability in priority order — triage_draft and probe drive
-// unavailable, verification_rejudge alone drives degraded, and this order
-// coincides exactly with the priority the state itself implies.
+// unavailable, verification_rejudge and query_repair drive degraded (the
+// draft still ships; verification is thinner), and this order coincides
+// exactly with the priority the state itself implies.
 func (t *Tracker) aggregate() (State, string, string) {
-	order := []Capability{CapabilityTriageDraft, CapabilityProbe, CapabilityVerificationRejudge}
+	order := []Capability{CapabilityTriageDraft, CapabilityProbe, CapabilityVerificationRejudge, CapabilityQueryRepair}
 	for _, capability := range order {
 		c, ok := t.caps[capability]
 		if !ok || c.Healthy {

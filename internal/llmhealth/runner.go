@@ -20,6 +20,11 @@ var (
 	// failure with an unknown outcome and so becomes indeterminate; a
 	// timed-out edit simply retries on the next step.
 	deliveryTimeout = 15 * time.Second
+	// deliveryBudget bounds one whole Deliver phase (the episode's own call
+	// plus however many late-root edits are queued): a backlog of stalled
+	// edits must not cost N × deliveryTimeout before the idle probe runs.
+	// Whatever did not fit stays queued for the next step.
+	deliveryBudget = 45 * time.Second
 )
 
 // Runner drives the one-minute cadence: Slack delivery, then an idle probe

@@ -25,7 +25,13 @@ const (
 	CapabilityTriageDraft         Capability = "triage_draft"
 	CapabilityVerificationRejudge Capability = "verification_rejudge"
 	CapabilityMemoryClassifier    Capability = "memory_classifier"
-	CapabilityProbe               Capability = "probe"
+	// CapabilityQueryRepair is the one bounded PromQL repair call the
+	// verification round may spend before Call 2. A real generation against
+	// the same provider, so its outcome is observed like every other; its
+	// failure only thins verification (the draft still ships), so it drives
+	// degraded, never unavailable.
+	CapabilityQueryRepair Capability = "query_repair"
+	CapabilityProbe       Capability = "probe"
 )
 
 // Reason names why one call outcome was recorded, from success through every
