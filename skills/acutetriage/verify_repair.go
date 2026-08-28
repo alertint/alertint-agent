@@ -176,7 +176,9 @@ func (s *Skill) repairModelPromQL(ctx context.Context, incidentID string, querie
 	// own capability: a failed call is a dependency failure, a reply that
 	// cannot be decoded — or that offers nothing the validator accepts — is a
 	// content failure (response_malformed, corroborated across Incidents like
-	// any other), and at least one accepted replacement is a success.
+	// any other), and at least one accepted replacement is a success. The
+	// capability is reported in /health but never drives the rolled-up state
+	// (see llmhealth.CapabilityQueryRepair).
 	obs := s.cfg.Health.Begin(llmhealth.CapabilityQueryRepair, incidentID)
 	comp, callErr := s.llm.Complete(ctx, verificationRepairSystem, llm.Prompt{
 		Prefix:          repairPrompt(issues),

@@ -474,11 +474,14 @@ func (t *Tracker) recordContentFailure(capability Capability, subject string, re
 
 // aggregate computes the rolled-up state and the reason/detail of the first
 // unhealthy capability in priority order — triage_draft and probe drive
-// unavailable, verification_rejudge and query_repair drive degraded (the
-// draft still ships; verification is thinner), and this order coincides
-// exactly with the priority the state itself implies.
+// unavailable, verification_rejudge alone drives degraded, and this order
+// coincides exactly with the priority the state itself implies.
+// memory_classifier and query_repair are reported per capability only: a
+// repair success happens only when the model proposes invalid PromQL, so no
+// normal-path success could ever clear a repair failure — driving the
+// aggregate from it would leave the installation degraded indefinitely.
 func (t *Tracker) aggregate() (State, string, string) {
-	order := []Capability{CapabilityTriageDraft, CapabilityProbe, CapabilityVerificationRejudge, CapabilityQueryRepair}
+	order := []Capability{CapabilityTriageDraft, CapabilityProbe, CapabilityVerificationRejudge}
 	for _, capability := range order {
 		c, ok := t.caps[capability]
 		if !ok || c.Healthy {

@@ -27,9 +27,11 @@ const (
 	CapabilityMemoryClassifier    Capability = "memory_classifier"
 	// CapabilityQueryRepair is the one bounded PromQL repair call the
 	// verification round may spend before Call 2. A real generation against
-	// the same provider, so its outcome is observed like every other; its
-	// failure only thins verification (the draft still ships), so it drives
-	// degraded, never unavailable.
+	// the same provider, so its outcome is observed like every other (it
+	// counts as in flight and fences the idle probe); but it is reported per
+	// capability only and never drives the rolled-up state, because its own
+	// success is opportunistic (only when invalid PromQL was proposed) and
+	// could not be relied on to clear a failure.
 	CapabilityQueryRepair Capability = "query_repair"
 	CapabilityProbe       Capability = "probe"
 )

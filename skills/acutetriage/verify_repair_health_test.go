@@ -58,15 +58,25 @@ func repairSkill(tr *llmhealth.Tracker, fake *repairLLM) *Skill {
 // be decoded or offers nothing usable is a content-class failure (needing the
 // usual two-Incident corroboration), and a success clears the capability.
 func TestRepairModelPromQL_ObservesLLMHealth(t *testing.T) {
-	t.Run("dependency failure degrades", func(t *testing.T) {
+	t.Run("dependency failure is reported but never drives the aggregate", func(t *testing.T) {
+		// A repair success only happens when the model proposes invalid
+		// PromQL, so nothing on the normal path could ever clear a repair
+		// failure: if it drove the aggregate, one transient 503 would keep the
+		// installation degraded (and its Slack episode open) while Call 1 and
+		// Call 2 kept succeeding. It is observed like memory_classifier —
+		// visible per capability, never the rolled-up state.
 		tr := newRepairHealth(t)
 		repairSkill(tr, &repairLLM{err: &llm.RetryableError{StatusCode: 503}}).repairModelPromQL(context.Background(), "inc-1", invalidRepairInput)
 		c := repairCap(t, tr)
 		if c.Healthy || c.Reason != llmhealth.ReasonProviderUnavailable {
 			t.Fatalf("%+v", c)
 		}
-		if st := tr.Snapshot().State; st != llmhealth.StateDegraded {
-			t.Fatalf("state = %s, want degraded", st)
+		if st := tr.Snapshot().State; st != llmhealth.StateHealthy {
+			t.Fatalf("state = %s, want healthy: query_repair must not drive the aggregate", st)
+		}
+		tr.Begin(llmhealth.CapabilityVerificationRejudge, "inc-1").Finish(nil)
+		if st := tr.Snapshot().State; st != llmhealth.StateHealthy {
+			t.Fatalf("state = %s after a Call 2 success", st)
 		}
 	})
 	t.Run("malformed reply is content-class", func(t *testing.T) {
