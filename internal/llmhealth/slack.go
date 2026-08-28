@@ -96,6 +96,15 @@ func (t *Tracker) Deliver(ctx context.Context, pub Publisher) {
 	if pub == nil {
 		return
 	}
+	// A ctx that is already done (shutdown racing a queued tick or kick)
+	// must not reach planDelivery: the write-ahead marker it commits says "a
+	// POST may have gone out", and a POST on a done ctx fails before it is
+	// sent — the publisher cannot tell that apart from a transport failure
+	// after sending, so it would report indeterminate and the episode's only
+	// root would be suppressed for good, across restarts.
+	if ctx.Err() != nil {
+		return
+	}
 	// One budget for the whole phase: the episode's own call plus the late
 	// root edits below. Each call is bounded on its own too; whatever does
 	// not fit stays queued for the next step, so a backlog of stalled edits
@@ -110,6 +119,14 @@ func (t *Tracker) Deliver(ctx context.Context, pub Publisher) {
 	switch plan.op {
 	case deliverNone:
 	case deliverPost:
+		// Same reasoning once more, for a cancellation that landed between
+		// the marker commit and the POST: the request has not left, so the
+		// bare ctx error (never ErrDeliveryIndeterminate) takes the
+		// definite-failure path and the marker goes back to pending.
+		if err := ctx.Err(); err != nil {
+			t.applyDeliveryResult(plan, "", "", err) //nolint:contextcheck
+			break
+		}
 		channel, ts, err := postBounded(ctx, pub, plan.text)
 		t.applyDeliveryResult(plan, channel, ts, err) //nolint:contextcheck
 	case deliverUpdateState, deliverUpdateRecovery:

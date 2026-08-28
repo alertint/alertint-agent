@@ -531,6 +531,51 @@ func TestIndeterminatePostIsNeverRetried(t *testing.T) {
 	}
 }
 
+// ctxAwarePub behaves like the real Slack publisher on a canceled context:
+// the transport fails before anything is sent, and — unable to tell that
+// apart from a failure after sending — the publisher marks it indeterminate.
+type ctxAwarePub struct{ fakePub }
+
+func (p *ctxAwarePub) PostSystemMessage(ctx context.Context, text string) (string, string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", "", fmt.Errorf("channel C1: post system message: %w: %w", llmhealth.ErrDeliveryIndeterminate, err)
+	}
+	return p.fakePub.PostSystemMessage(ctx, text)
+}
+
+// TestPreCanceledDeliveryDoesNotSilenceEpisode pins that a Deliver whose ctx
+// is already canceled — shutdown racing a queued tick or kick — never commits
+// the "post started" marker: no request could have left, so nothing is
+// indeterminate, and the episode's one root is still posted by the next live
+// step (in this process or the next) instead of being suppressed for good.
+func TestPreCanceledDeliveryDoesNotSilenceEpisode(t *testing.T) {
+	tr, st, c, _ := newTracker(t)
+	pub := &ctxAwarePub{}
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(err503)
+	c.add(5 * time.Minute)
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	tr.Deliver(canceled, pub)
+
+	if pub.postCount() != 0 {
+		t.Fatalf("posts = %v; nothing may be posted on a canceled context", pub.posts)
+	}
+	rec, _, err := st.GetLLMHealth(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.SlackDelivery == llmhealth.DeliveryIndeterminate {
+		t.Fatalf("durable slack_delivery = %q after a pre-canceled delivery; the episode is silenced for good", rec.SlackDelivery)
+	}
+
+	c.add(time.Minute)
+	tr.Deliver(context.Background(), pub)
+	if pub.postCount() != 1 {
+		t.Fatalf("posts = %v; the live step must post the episode's root exactly once", pub.posts)
+	}
+}
+
 // TestCrashBetweenPostAndPersistDoesNotRepost pins the durable side of the
 // same contract: the "a post is in flight" marker is persisted BEFORE the
 // HTTP call, so a process that dies between Slack accepting the message and
