@@ -13,6 +13,13 @@ import (
 var (
 	runnerTick   = time.Minute
 	probeTimeout = 10 * time.Second
+	// deliveryTimeout bounds every single Slack Publisher call made by
+	// Deliver. The Runner is one goroutine: a Slack endpoint that accepts
+	// the connection and never answers would otherwise wedge kicks, retry
+	// edits and idle probes for good. A timed-out POST is a transport
+	// failure with an unknown outcome and so becomes indeterminate; a
+	// timed-out edit simply retries on the next step.
+	deliveryTimeout = 15 * time.Second
 )
 
 // Runner drives the one-minute cadence: Slack delivery, then an idle probe

@@ -4,6 +4,7 @@ package llmhealth_test
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -159,6 +160,66 @@ func TestStaleProbeFailureDiscardedWhenRealCallBeginsDuringIt(t *testing.T) {
 	obs.Finish(nil)
 	if s := tr.Snapshot(); s.State != llmhealth.StateHealthy {
 		t.Fatalf("after the racing real call succeeds: %+v", s)
+	}
+}
+
+// stalledPub accepts the connection and never answers: PostSystemMessage /
+// UpdateSystemMessage return only when ctx is done, the way a Slack request
+// against a stalled endpoint would with no client timeout.
+type stalledPub struct{ calls atomic.Int32 }
+
+func (p *stalledPub) PostSystemMessage(ctx context.Context, _ string) (string, string, error) {
+	p.calls.Add(1)
+	<-ctx.Done()
+	return "", "", fmt.Errorf("post: %w", ctx.Err())
+}
+
+func (p *stalledPub) UpdateSystemMessage(ctx context.Context, _, _, _ string) error {
+	p.calls.Add(1)
+	<-ctx.Done()
+	return fmt.Errorf("update: %w", ctx.Err())
+}
+
+// TestStalledSlackDeliveryDoesNotBlockProbe pins that one stalled Slack
+// request cannot stop the single Runner: Step bounds every Publisher call
+// with its own timeout, returns, and still runs the idle probe that is due —
+// otherwise an idle LLM recovery would stay reported as unavailable for as
+// long as Slack keeps the connection open.
+func TestStalledSlackDeliveryDoesNotBlockProbe(t *testing.T) {
+	tr, _, c, _ := newTracker(t)
+	pub := &stalledPub{}
+	pr := &fakeProber{res: llm.ProbeResult{Outcome: llm.ProbeOK, Method: "GET", Path: "/health"}}
+	r := llmhealth.NewRunner(tr, pr, pub, nil)
+	llmhealth.SetDeliveryTimeoutForTest(20 * time.Millisecond)
+	t.Cleanup(func() { llmhealth.SetDeliveryTimeoutForTest(15 * time.Second) })
+
+	// A probe-driven outage: the LLM went away while idle, and only the next
+	// idle probe can bring it back.
+	c.add(5 * time.Minute)
+	tr.ObserveProbe(llm.ProbeResult{Outcome: llm.ProbeFailed, Err: err503})
+	if s := tr.Snapshot(); s.State != llmhealth.StateUnavailable {
+		t.Fatalf("%+v", s)
+	}
+	c.add(5 * time.Minute) // broadcast_after reached; the next probe is due
+
+	done := make(chan struct{})
+	go func() {
+		r.Step(context.Background(), c.now())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Step did not return while Slack stalled; the Runner is wedged")
+	}
+	if pub.calls.Load() != 1 {
+		t.Fatalf("slack calls = %d", pub.calls.Load())
+	}
+	if pr.calls.Load() != 1 {
+		t.Fatal("the due idle probe did not run after the stalled Slack call")
+	}
+	if s := tr.Snapshot(); s.State != llmhealth.StateHealthy {
+		t.Fatalf("probe success must still recover the installation: %+v", s)
 	}
 }
 

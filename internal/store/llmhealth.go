@@ -28,7 +28,19 @@ type LLMHealthRecord struct {
 	SlackState        string
 	SlackGeneration   int64
 	RecoveredAt       *time.Time
-	UpdatedAt         time.Time
+	// LateRoots are Slack roots that landed after their Outage episode had
+	// already closed and still await that episode's recovery edit. Durable
+	// so a crash before the edit never leaves a false outage root standing.
+	LateRoots []LLMLateRoot
+	UpdatedAt time.Time
+}
+
+// LLMLateRoot is one Slack root awaiting its (already-closed) episode's
+// recovery edit; DownForMS is that episode's duration for the recovery copy.
+type LLMLateRoot struct {
+	Channel   string `json:"channel"`
+	TS        string `json:"ts"`
+	DownForMS int64  `json:"down_for_ms"`
 }
 
 // LLMCapabilityRecord mirrors one row in llm_health_capabilities: the
@@ -57,7 +69,7 @@ func (s *Store) GetLLMHealth(ctx context.Context) (LLMHealthRecord, []LLMCapabil
 		SELECT state, reason_code, detail, unhealthy_since, outage_generation,
 		       last_real_success_at, last_real_call_at, last_probe_at, last_probe_outcome,
 		       slack_ts, slack_channel, slack_delivery, slack_state, slack_generation,
-		       recovered_at, updated_at
+		       recovered_at, late_roots, updated_at
 		FROM llm_health WHERE id = 1
 	`)
 	rec, err := scanLLMHealth(row)
@@ -100,18 +112,22 @@ func (s *Store) SaveLLMHealth(ctx context.Context, rec LLMHealthRecord, caps []L
 	defer func() { _ = tx.Rollback() }()
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	lateRoots, err := marshalLateRoots(rec.LateRoots)
+	if err != nil {
+		return fmt.Errorf("store: llm health: marshal late_roots: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE llm_health SET
 			state = ?, reason_code = ?, detail = ?, unhealthy_since = ?, outage_generation = ?,
 			last_real_success_at = ?, last_real_call_at = ?, last_probe_at = ?, last_probe_outcome = ?,
 			slack_ts = ?, slack_channel = ?, slack_delivery = ?, slack_state = ?, slack_generation = ?,
-			recovered_at = ?, updated_at = ?
+			recovered_at = ?, late_roots = ?, updated_at = ?
 		WHERE id = 1
 	`,
 		rec.State, rec.ReasonCode, rec.Detail, nullTime(rec.UnhealthySince), rec.OutageGeneration,
 		nullTime(rec.LastRealSuccessAt), nullTime(rec.LastRealCallAt), nullTime(rec.LastProbeAt), rec.LastProbeOutcome,
 		rec.SlackTS, rec.SlackChannel, rec.SlackDelivery, rec.SlackState, rec.SlackGeneration,
-		nullTime(rec.RecoveredAt), now,
+		nullTime(rec.RecoveredAt), lateRoots, now,
 	); err != nil {
 		return fmt.Errorf("store: llm health: save: %w", err)
 	}
@@ -169,18 +185,22 @@ func scanLLMHealth(s scanner) (*LLMHealthRecord, error) {
 		rec                                                            LLMHealthRecord
 		unhealthySince, lastRealSuccessAt, lastRealCallAt, lastProbeAt sql.NullString
 		recoveredAt                                                    sql.NullString
+		lateRoots                                                      string
 		updatedStr                                                     string
 	)
 	if err := s.Scan(
 		&rec.State, &rec.ReasonCode, &rec.Detail, &unhealthySince, &rec.OutageGeneration,
 		&lastRealSuccessAt, &lastRealCallAt, &lastProbeAt, &rec.LastProbeOutcome,
 		&rec.SlackTS, &rec.SlackChannel, &rec.SlackDelivery, &rec.SlackState, &rec.SlackGeneration,
-		&recoveredAt, &updatedStr,
+		&recoveredAt, &lateRoots, &updatedStr,
 	); err != nil {
 		return nil, fmt.Errorf("scan: %w", err)
 	}
 
 	var err error
+	if rec.LateRoots, err = unmarshalLateRoots(lateRoots); err != nil {
+		return nil, fmt.Errorf("parse late_roots: %w", err)
+	}
 	if rec.UnhealthySince, err = parseNullTime(unhealthySince); err != nil {
 		return nil, fmt.Errorf("parse unhealthy_since: %w", err)
 	}
@@ -231,6 +251,33 @@ func unmarshalContentSubjects(raw string) ([]string, error) {
 		return nil, err
 	}
 	return subjects, nil
+}
+
+// marshalLateRoots renders roots as a JSON array for the late_roots column;
+// nil/empty renders "[]" (the column's NOT NULL default), never SQL NULL.
+func marshalLateRoots(roots []LLMLateRoot) (string, error) {
+	if len(roots) == 0 {
+		return "[]", nil
+	}
+	b, err := json.Marshal(roots)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// unmarshalLateRoots parses the late_roots column; "[]" (or empty) yields
+// nil. Anything else that is not a JSON array of roots is an error, never an
+// empty set: a pending recovery edit must never be silently dropped at load.
+func unmarshalLateRoots(raw string) ([]LLMLateRoot, error) {
+	if raw == "" || raw == "[]" {
+		return nil, nil
+	}
+	var roots []LLMLateRoot
+	if err := json.Unmarshal([]byte(raw), &roots); err != nil {
+		return nil, err
+	}
+	return roots, nil
 }
 
 func scanLLMCapability(s scanner) (*LLMCapabilityRecord, error) {

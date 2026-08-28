@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/alertint/alertint-agent/internal/store"
 )
 
 // ErrDeliveryIndeterminate is wrapped by a Publisher when a PostSystemMessage
@@ -101,42 +103,68 @@ func (t *Tracker) Deliver(ctx context.Context, pub Publisher) {
 	switch plan.op {
 	case deliverNone:
 	case deliverPost:
-		channel, ts, err := pub.PostSystemMessage(ctx, plan.text)
+		channel, ts, err := postBounded(ctx, pub, plan.text)
 		t.applyDeliveryResult(plan, channel, ts, err) //nolint:contextcheck
 	case deliverUpdateState, deliverUpdateRecovery:
-		err := pub.UpdateSystemMessage(ctx, plan.channel, plan.ts, plan.text)
+		err := updateBounded(ctx, pub, plan.channel, plan.ts, plan.text)
 		t.applyDeliveryResult(plan, plan.channel, plan.ts, err) //nolint:contextcheck
 	}
 	t.editLateRoots(ctx, pub)
 }
 
+// postBounded / updateBounded give every single Slack call its own
+// deliveryTimeout: the Runner is one goroutine, and a Slack endpoint that
+// accepts the connection but never answers must not wedge kicks, retry edits
+// and idle probes behind it. A timed-out post is a transport failure whose
+// outcome is unknown — the Publisher marks it indeterminate.
+func postBounded(ctx context.Context, pub Publisher, text string) (string, string, error) {
+	ctx, cancel := context.WithTimeout(ctx, deliveryTimeout)
+	defer cancel()
+	return pub.PostSystemMessage(ctx, text)
+}
+
+func updateBounded(ctx context.Context, pub Publisher, channel, ts, text string) error {
+	ctx, cancel := context.WithTimeout(ctx, deliveryTimeout)
+	defer cancel()
+	return pub.UpdateSystemMessage(ctx, channel, ts, text)
+}
+
 // editLateRoots gives every root that landed after its episode had already
 // closed that episode's own recovery edit, independently of the current
-// episode's delivery state. A failed edit stays queued for the next step.
+// episode's delivery state. The queue is durable (rec.LateRoots): a root is
+// removed only once its edit has landed, so a failed edit — or a crash
+// before it — is retried on the next step, in this process or the next.
 func (t *Tracker) editLateRoots(ctx context.Context, pub Publisher) {
 	t.mu.Lock()
-	pending := t.lateRoots
-	t.lateRoots = nil
+	pending := append([]store.LLMLateRoot(nil), t.rec.LateRoots...)
 	t.mu.Unlock()
 	if len(pending) == 0 {
 		return
 	}
-	var failed []lateRoot
+	edited := map[store.LLMLateRoot]bool{}
 	for _, r := range pending {
-		if err := pub.UpdateSystemMessage(ctx, r.channel, r.ts, RenderRecovery(r.downFor)); err != nil {
-			t.logger.Warn("llm health: late slack root recovery edit failed; will retry", "channel", r.channel, "ts", r.ts)
-			failed = append(failed, r)
+		if err := updateBounded(ctx, pub, r.Channel, r.TS, RenderRecovery(time.Duration(r.DownForMS)*time.Millisecond)); err != nil {
+			t.logger.Warn("llm health: late slack root recovery edit failed; will retry", "channel", r.Channel, "ts", r.TS)
 			continue
 		}
+		edited[r] = true
 		// auditAppend uses its own bounded context.Background() by design: a
 		// delivered edit must be recorded even if ctx is canceled around it.
-		t.auditAppend("llm.health.slack_updated", map[string]any{"late_root": true, "channel": r.channel, "ts": r.ts, "state": "recovered"}) //nolint:contextcheck
+		t.auditAppend("llm.health.slack_updated", map[string]any{"late_root": true, "channel": r.Channel, "ts": r.TS, "state": "recovered"}) //nolint:contextcheck
 	}
-	if len(failed) > 0 {
-		t.mu.Lock()
-		t.lateRoots = append(failed, t.lateRoots...)
-		t.mu.Unlock()
+	if len(edited) == 0 {
+		return
 	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	kept := t.rec.LateRoots[:0:0]
+	for _, r := range t.rec.LateRoots {
+		if !edited[r] {
+			kept = append(kept, r)
+		}
+	}
+	t.rec.LateRoots = kept
+	_ = t.persist() //nolint:contextcheck // logged inside; own bounded context by design — the edit landed regardless of ctx
 }
 
 func (t *Tracker) planDelivery() deliveryPlan {
@@ -167,6 +195,7 @@ func (t *Tracker) planDelivery() deliveryPlan {
 			t.logger.Warn("llm health: slack system message not posted; write-ahead marker could not be persisted", "err", err)
 			return deliveryPlan{}
 		}
+		t.outstandingPosts[gen] = outstandingPost{}
 		return deliveryPlan{op: deliverPost, text: RenderOutage(state, now.Sub(*t.rec.UnhealthySince)), generation: gen, state: state}
 
 	case state != StateHealthy && t.rec.SlackDelivery == DeliveryDelivered && t.rec.SlackState != string(state):
@@ -195,9 +224,14 @@ func (t *Tracker) planDelivery() deliveryPlan {
 func (t *Tracker) applyDeliveryResult(plan deliveryPlan, channel, ts string, err error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	var outstanding outstandingPost
+	if plan.op == deliverPost {
+		outstanding = t.outstandingPosts[plan.generation]
+		delete(t.outstandingPosts, plan.generation)
+	}
 	if plan.generation != t.rec.SlackGeneration {
 		if plan.op == deliverPost && err == nil {
-			t.adoptStaleRoot(plan, channel, ts)
+			t.adoptStaleRoot(plan, outstanding, channel, ts)
 		}
 		return
 	}
@@ -258,22 +292,24 @@ func (t *Tracker) applyDeliveryResult(plan deliveryPlan, channel, ts string, err
 // reassigned to a later one.
 //
 //   - The plan's episode is the one that just recovered and nothing else has
-//     happened since (state healthy, delivery suppressed): adopt the root and
-//     move to recovery_pending, so the durable state machine edits it.
-//   - The plan's episode is the one that just recovered but a new episode has
-//     already begun: queue the root for its own recovery edit (in-memory, see
-//     lateRoots); the new episode keeps its own delivery state and its own
-//     broadcast_after threshold.
-//   - Anything else cannot happen with the single-goroutine Runner (it would
-//     need two overlapping Deliver calls); it is audited as orphaned so the
-//     stray root is at least visible to an operator.
-func (t *Tracker) adoptStaleRoot(plan deliveryPlan, channel, ts string) {
-	if !t.lastRecovery.valid || t.lastRecovery.slackGen != plan.generation {
+//     happened since (the recovery bumped the generation exactly once, state
+//     healthy, delivery suppressed): adopt the root and move to
+//     recovery_pending, so the durable state machine edits it.
+//   - The plan's episode closed but more has happened since (a new episode
+//     began, and possibly closed too): queue the root durably
+//     (rec.LateRoots) for its own recovery edit with its own duration; the
+//     current episode keeps its own delivery state and broadcast_after.
+//   - The POST returned for an episode that never closed while it was
+//     outstanding, yet the generation moved on. That cannot happen with the
+//     single-goroutine Runner; it is audited as orphaned so the stray root
+//     is at least visible to an operator.
+func (t *Tracker) adoptStaleRoot(plan deliveryPlan, outstanding outstandingPost, channel, ts string) {
+	if !outstanding.closed {
 		t.logger.Warn("llm health: a stale slack root was posted for an episode that is no longer tracked; it will not be edited", "channel", channel, "ts", ts)
 		t.auditAppend("llm.health.slack_orphaned", map[string]any{"posted_generation": plan.generation, "channel": channel, "ts": ts})
 		return
 	}
-	if State(t.rec.State) == StateHealthy && t.rec.SlackDelivery == DeliverySuppressed {
+	if t.rec.SlackGeneration == plan.generation+1 && State(t.rec.State) == StateHealthy && t.rec.SlackDelivery == DeliverySuppressed {
 		t.rec.SlackTS, t.rec.SlackChannel = ts, channel
 		t.rec.SlackState = string(plan.state)
 		t.rec.SlackDelivery = DeliveryRecoveryPending
@@ -283,8 +319,9 @@ func (t *Tracker) adoptStaleRoot(plan deliveryPlan, channel, ts string) {
 		t.kickLocked()
 		return
 	}
-	t.lateRoots = append(t.lateRoots, lateRoot{channel: channel, ts: ts, downFor: t.lastRecovery.downFor})
+	t.rec.LateRoots = append(t.rec.LateRoots, store.LLMLateRoot{Channel: channel, TS: ts, DownForMS: outstanding.downFor.Milliseconds()})
 	t.logger.Info("llm health: a slack root landed late for an already-closed episode; editing it to that episode's recovery")
 	t.auditAppend("llm.health.slack_adopted", map[string]any{"posted_generation": plan.generation, "into": "late_recovery_edit"})
+	_ = t.persist() // logged inside; the queued edit is retried from durable state either way
 	t.kickLocked()
 }

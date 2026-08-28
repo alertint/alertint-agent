@@ -16,3 +16,6 @@ func SetRunnerTickForTest(d time.Duration) { runnerTick = d }
 
 // SetProbeTimeoutForTest overrides the Runner's per-probe timeout for tests.
 func SetProbeTimeoutForTest(d time.Duration) { probeTimeout = d }
+
+// SetDeliveryTimeoutForTest overrides the per-Slack-call delivery timeout.
+func SetDeliveryTimeoutForTest(d time.Duration) { deliveryTimeout = d }

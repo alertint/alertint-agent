@@ -22,6 +22,12 @@ CREATE TABLE llm_health (
     slack_state          TEXT    NOT NULL DEFAULT '',
     slack_generation     INTEGER NOT NULL DEFAULT 0,
     recovered_at         TEXT,
+    -- late_roots is the JSON array of Slack roots that landed after their
+    -- Outage episode had already closed and are still awaiting that
+    -- episode's recovery edit ({"channel","ts","down_for_ms"}). Durable so a
+    -- crash before the edit never leaves a false outage root standing.
+    late_roots           TEXT    NOT NULL DEFAULT '[]'
+                         CHECK (json_valid(late_roots) AND json_type(late_roots) = 'array'),
     updated_at           TEXT    NOT NULL
 ) STRICT;
 

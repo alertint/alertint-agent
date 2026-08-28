@@ -27,6 +27,7 @@ func TestLLMHealthRoundTrip(t *testing.T) {
 		State: "unavailable", ReasonCode: "provider_unavailable", Detail: "HTTP 503",
 		UnhealthySince: &since, OutageGeneration: 3, LastProbeOutcome: "failed",
 		SlackTS: "1.2", SlackChannel: "C1", SlackDelivery: "delivered", SlackState: "unavailable", SlackGeneration: 3,
+		LateRoots: []LLMLateRoot{{Channel: "C1", TS: "0.9", DownForMS: 300000}},
 	}
 	caps := []LLMCapabilityRecord{
 		{Capability: "triage_draft", Healthy: false, ReasonCode: "provider_unavailable", Detail: "HTTP 503", UnhealthySince: &since, LastFailureAt: &since, ContentSubjects: []string{"inc-1", "inc-2"}},
@@ -41,6 +42,9 @@ func TestLLMHealthRoundTrip(t *testing.T) {
 	}
 	if got.State != "unavailable" || got.OutageGeneration != 3 || got.SlackTS != "1.2" || got.SlackDelivery != "delivered" || !got.UnhealthySince.Equal(since) {
 		t.Fatalf("got %+v", got)
+	}
+	if len(got.LateRoots) != 1 || got.LateRoots[0] != (LLMLateRoot{Channel: "C1", TS: "0.9", DownForMS: 300000}) {
+		t.Fatalf("late_roots round-trip = %+v", got.LateRoots)
 	}
 	if len(gotCaps) != 2 || gotCaps[0].Capability != "memory_classifier" || gotCaps[1].Capability != "triage_draft" || gotCaps[1].Healthy {
 		t.Fatalf("caps = %+v", gotCaps) // ordered by capability name

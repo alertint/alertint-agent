@@ -361,6 +361,94 @@ func TestLateRootFromPreviousEpisodeGetsItsOwnRecoveryEdit(t *testing.T) {
 	}
 }
 
+// TestLateRootSurvivesTwoRecoveriesDuringItsPost pins that recovery metadata
+// stays associated with EVERY generation that has a POST outstanding, not
+// just the newest closed episode: if episode 1's POST is still blocked while
+// episode 1 recovers (down 5m), episode 2 begins and ALSO recovers (down 2m),
+// the returning episode-1 root must still be edited to episode 1's own
+// recovery — never orphaned as a standing false outage, and never given
+// episode 2's duration.
+func TestLateRootSurvivesTwoRecoveriesDuringItsPost(t *testing.T) {
+	tr, _, c, a := newTracker(t)
+	pub := &blockingPub{fakePub: &fakePub{}, started: make(chan struct{}), release: make(chan struct{})}
+
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(err503)
+	c.add(5 * time.Minute)
+
+	done := make(chan struct{})
+	go func() {
+		tr.Deliver(context.Background(), pub)
+		close(done)
+	}()
+	<-pub.started
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(nil)    // episode 1 recovers (down 5m)
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(err503) // episode 2 begins
+	c.add(2 * time.Minute)
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(nil) // episode 2 recovers (down 2m)
+	close(pub.release)
+	<-done
+
+	tr.Deliver(context.Background(), pub)
+	for _, k := range a.kinds {
+		if k == "llm.health.slack_orphaned" {
+			t.Fatalf("episode 1's root was orphaned: %v", a.kinds)
+		}
+	}
+	pub.mu.Lock()
+	defer pub.mu.Unlock()
+	if len(pub.posts) != 1 || len(pub.updates) != 1 || pub.updates[0] != llmhealth.RenderRecovery(5*time.Minute) {
+		t.Fatalf("posts=%v updates=%v; want the late root edited to episode 1's own 5m recovery", pub.posts, pub.updates)
+	}
+}
+
+// TestPendingLateRootEditSurvivesRestart pins that a late root awaiting its
+// recovery edit is durable: if the process dies after adopting the root but
+// before (or while) editing it, the restarted tracker still edits it —
+// otherwise a false outage root stands in the channel forever, against the
+// cross-restart recovery-edit contract.
+func TestPendingLateRootEditSurvivesRestart(t *testing.T) {
+	tr, st, c, _ := newTracker(t)
+	pub := &blockingPub{fakePub: &fakePub{failUpdate: true}, started: make(chan struct{}), release: make(chan struct{})}
+
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(err503)
+	c.add(5 * time.Minute)
+	done := make(chan struct{})
+	go func() {
+		tr.Deliver(context.Background(), pub)
+		close(done)
+	}()
+	<-pub.started
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(nil)    // episode 1 recovers (down 5m)
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(err503) // episode 2 begins
+	close(pub.release)
+	<-done // the late root is adopted; its recovery edit (failUpdate) has not landed
+
+	// "Crash" here: a fresh tracker from the durable state alone, a working Slack.
+	tr2, err := llmhealth.New(context.Background(), st, llmhealth.Options{Now: c.now, BroadcastAfter: 5 * time.Minute, IdleProbeAfter: 5 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub2 := &fakePub{}
+	tr2.Deliver(context.Background(), pub2)
+	pub2.mu.Lock()
+	if len(pub2.posts) != 0 || len(pub2.updates) != 1 || pub2.updates[0] != llmhealth.RenderRecovery(5*time.Minute) {
+		pub2.mu.Unlock()
+		t.Fatalf("after restart posts=%v updates=%v; want only the pending late root edited to its recovery", pub2.posts, pub2.updates)
+	}
+	pub2.mu.Unlock()
+
+	// Edited once; a further step (and another restart) must not edit it again.
+	tr2.Deliver(context.Background(), pub2)
+	tr3, err := llmhealth.New(context.Background(), st, llmhealth.Options{Now: c.now, BroadcastAfter: 5 * time.Minute, IdleProbeAfter: 5 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr3.Deliver(context.Background(), pub2)
+	if pub2.updateCount() != 1 {
+		t.Fatalf("updates = %v; the late edit must be done exactly once", pub2.updates)
+	}
+}
+
 // TestPostIsNotAttemptedWhenWriteAheadMarkerFails pins that the "durable
 // before POST" guarantee depends on the write actually committing: if the
 // indeterminate marker cannot be persisted, the POST must not happen (Slack

@@ -217,8 +217,13 @@ accepted before the connection failed, or the process restarted mid-post) is
 never retried, because a second root is worse than a missing one — the
 outage still shows in `/health`, audit, and logs. A root that turns out to
 have landed after its episode already recovered is edited to that episode's
-recovery, never left standing as a stale outage — and never reused by the
-next episode, which earns its own root on its own clock. During an outage, new Incident triage retries with
+recovery — however many episodes have come and gone since, and even across a
+restart before the edit lands — never left standing as a stale outage, and
+never reused by the next episode, which earns its own root on its own clock.
+Each Slack request is bounded by its own timeout: a request Slack accepts but
+never answers counts as an unknown outcome (a post) or is retried on the
+next minute (an edit), and never delays the idle probe that would report the
+LLM back. During an outage, new Incident triage retries with
 backoff and correlation may be delayed; this copy never claims Alert intake
 itself is unaffected. See [Integration health](../getting-started/configuration.md#integration-health)
 for the `/health` shape behind these messages.

@@ -118,26 +118,21 @@ type Tracker struct {
 	activityGen      int64
 	probeReservedGen int64
 
-	// lastRecovery remembers the most recently closed episode by the Slack
-	// generation its outage plans carried, so a root that lands late for
-	// that episode can still be given that episode's own recovery edit.
-	lastRecovery struct {
-		valid    bool
-		slackGen int64
-		downFor  time.Duration
-	}
-	// lateRoots are roots that landed after their episode closed and a new
-	// one began; each is edited to its own episode's recovery copy by
-	// Deliver. In-memory only: the window (recovery + new outage inside one
-	// HTTP call, then a crash before the edit) is not worth a column.
-	lateRoots []lateRoot
+	// outstandingPosts tracks every root POST that has left planDelivery and
+	// not yet returned to applyDeliveryResult, keyed by the Slack generation
+	// the plan carried. A recovery that closes an episode while its POST is
+	// still in flight records that episode's duration here (closed), so
+	// however many episodes come and go before the POST returns, a root
+	// that lands late still gets its OWN episode's recovery edit. Entries
+	// are removed when the POST returns; roots awaiting their late edit are
+	// durable on rec.LateRoots, never process-local.
+	outstandingPosts map[int64]outstandingPost
 }
 
-// lateRoot is one Slack root awaiting its (already-closed) episode's
-// recovery edit.
-type lateRoot struct {
-	channel, ts string
-	downFor     time.Duration
+// outstandingPost is the recovery metadata kept for one in-flight root POST.
+type outstandingPost struct {
+	closed  bool
+	downFor time.Duration
 }
 
 // Observation is one in-flight LLM call started by Tracker.Begin. Exactly one
@@ -183,17 +178,18 @@ func New(ctx context.Context, st *store.Store, opts Options) (*Tracker, error) {
 	// reached against may have changed in config across the restart. The
 	// first idle window after boot re-validates the route.
 	return &Tracker{
-		st:             st,
-		now:            opts.Now,
-		logger:         opts.Logger,
-		auditor:        opts.Auditor,
-		broadcastAfter: opts.BroadcastAfter,
-		idleAfter:      opts.IdleProbeAfter,
-		rec:            rec,
-		caps:           caps,
-		inFlight:       0,
-		idleSince:      now,
-		kick:           make(chan struct{}, 1),
+		st:               st,
+		now:              opts.Now,
+		logger:           opts.Logger,
+		auditor:          opts.Auditor,
+		broadcastAfter:   opts.BroadcastAfter,
+		idleAfter:        opts.IdleProbeAfter,
+		rec:              rec,
+		caps:             caps,
+		inFlight:         0,
+		idleSince:        now,
+		kick:             make(chan struct{}, 1),
+		outstandingPosts: map[int64]outstandingPost{},
 	}, nil
 }
 
@@ -553,11 +549,13 @@ func (t *Tracker) recompute(now time.Time) bool {
 		// in-flight PostSystemMessage/UpdateSystemMessage HTTP call that
 		// hasn't returned yet) is discarded by applyDeliveryResult's
 		// generation check instead of resurrecting pre-recovery Slack state
-		// once it finally completes. Remember which generation this episode
-		// ran under so a late root for it can still get this recovery.
-		t.lastRecovery.valid = true
-		t.lastRecovery.slackGen = t.rec.SlackGeneration
-		t.lastRecovery.downFor = downFor
+		// once it finally completes. If a root POST for this episode is still
+		// in flight, remember this recovery against its generation so the
+		// late root can still get this episode's own recovery edit.
+		if op, ok := t.outstandingPosts[t.rec.SlackGeneration]; ok {
+			op.closed, op.downFor = true, downFor
+			t.outstandingPosts[t.rec.SlackGeneration] = op
+		}
 		t.rec.SlackGeneration++
 		t.rec.State = string(newState)
 		t.rec.ReasonCode = ""
