@@ -145,9 +145,15 @@ func TestStartJoinsInFlightPostOnShutdown(t *testing.T) {
 // the stale root with one more audit and persist. Each is individually
 // bounded; the drain window must cover all of them with margin.
 func TestDrainTimeoutCoversWorstCaseChain(t *testing.T) {
-	chain := llmhealth.DeliveryTimeoutForTest() + 9*llmhealth.PersistTimeoutForTest()
+	// One step's tail past the post fence (detached POST, its audit+persist,
+	// a due probe's persist+audit, a recovery holding the lock across two
+	// audits and a persist, the stale-root adoption audit+persist) PLUS the
+	// final delivery pass Stop runs against the settled state: one whole
+	// Deliver phase (deliveryBudget) and its last result's audit+persist.
+	chain := llmhealth.DeliveryTimeoutForTest() + 9*llmhealth.PersistTimeoutForTest() +
+		llmhealth.DeliveryBudgetForTest() + 2*llmhealth.PersistTimeoutForTest()
 	if got := llmhealth.DrainTimeout(); got <= chain {
-		t.Fatalf("DrainTimeout = %v, must exceed the worst-case post→audit→persist→probe-persist→probe-audit chain %v", got, chain)
+		t.Fatalf("DrainTimeout = %v, must exceed the worst-case chain %v", got, chain)
 	}
 }
 
@@ -583,5 +589,139 @@ func TestProbeTimeoutIsBounded(t *testing.T) {
 	}
 	if s := tr.Snapshot(); s.State != llmhealth.StateUnavailable || s.Reason != llmhealth.ReasonTimeout {
 		t.Fatalf("%+v", s)
+	}
+}
+
+// TestStopPostsRootThatBecameDueWithoutAKick: the broadcast window elapses
+// after the last kick was consumed (the failing observation was not yet 5m
+// old when the runner stepped on it). No producer will kick again; only a
+// tick would. Stop must still acknowledge the settled state — post the
+// episode's root — before the runner exits, not leave it for a restart.
+func TestStopPostsRootThatBecameDueWithoutAKick(t *testing.T) {
+	tr, st, c, _ := newTracker(t)
+	pub := &fakePub{}
+	r := llmhealth.NewRunner(tr, nil, pub, nil)
+	llmhealth.SetRunnerTickForTest(time.Hour)
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(err503)
+	<-tr.Kick()                           // the kick the loop would have taken…
+	r.Step(context.Background(), c.now()) // …and the step it would have run: not due yet
+	done := r.Start(context.Background())
+	c.add(5 * time.Minute) // now due; nothing will kick again
+	r.Stop()
+	select {
+	case <-done:
+	case <-time.After(llmhealth.DrainTimeout()):
+		t.Fatal("runner did not stop within DrainTimeout")
+	}
+	if pub.postCount() != 1 {
+		t.Fatalf("root posts at Stop = %d, want 1: the due root must be acknowledged before exit", pub.postCount())
+	}
+	rec, _, err := st.GetLLMHealth(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.SlackDelivery != llmhealth.DeliveryDelivered || rec.SlackTS == "" {
+		t.Fatalf("durable slack_delivery = %q ts = %q after Stop", rec.SlackDelivery, rec.SlackTS)
+	}
+}
+
+// TestStopAcknowledgesRecoveryRacingStop is the reported interleaving: the
+// last producer recovers (kick buffered) and the owner stops the runner in
+// the same instant. A cancel-and-join runner may select the stop first and
+// exit with the root still saying "unavailable". Stop must deliver the
+// recovery edit whichever branch the select takes.
+func TestStopAcknowledgesRecoveryRacingStop(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		tr, st, c, _ := newTracker(t)
+		pub := &fakePub{}
+		r := llmhealth.NewRunner(tr, nil, pub, nil)
+		llmhealth.SetRunnerTickForTest(time.Hour)
+		tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(err503)
+		c.add(5 * time.Minute)
+		r.Step(context.Background(), c.now()) // root delivered; the kick was consumed by nobody: drain it
+		select {
+		case <-tr.Kick():
+		default:
+		}
+		tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(nil) // final transition → kick buffered
+		r.Stop()                                                   // and the stop: both ready when the loop first selects
+		done := r.Start(context.Background())
+		select {
+		case <-done:
+		case <-time.After(llmhealth.DrainTimeout()):
+			t.Fatal("runner did not stop within DrainTimeout")
+		}
+		rec, _, err := st.GetLLMHealth(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pub.updateCount() != 1 || rec.SlackDelivery != llmhealth.DeliveryRecovered {
+			t.Fatalf("run %d: recovery edits = %d, durable slack_delivery = %q; the final transition was not acknowledged before exit", i, pub.updateCount(), rec.SlackDelivery)
+		}
+	}
+}
+
+// cutPub blocks the first update until its ctx ends and reports how it
+// ended; later calls answer at once.
+type cutPub struct {
+	fakePub
+
+	firstErr chan error
+	once     sync.Once
+}
+
+func (p *cutPub) UpdateSystemMessage(ctx context.Context, channel, ts, text string) error {
+	var first bool
+	p.once.Do(func() { first = true })
+	if first {
+		<-ctx.Done()
+		p.firstErr <- ctx.Err()
+		return ctx.Err()
+	}
+	return p.fakePub.UpdateSystemMessage(ctx, channel, ts, text)
+}
+
+// TestStopCutsTheStepInProgress: the runner's own ctx is never canceled by
+// the owner (Stop is the shutdown path), so Stop itself must cut the step
+// that is running — otherwise a stalled edit or a slow probe in that step
+// keeps running to its own bound before the final pass even starts, past
+// what DrainTimeout accounts for. The cut is observable as context.Canceled
+// (not DeadlineExceeded) on the stalled call, and the final pass then
+// retries it on a live ctx.
+func TestStopCutsTheStepInProgress(t *testing.T) {
+	restore := llmhealth.SetTimeoutsForTest(2*time.Second, 100*time.Millisecond, 100*time.Millisecond)
+	t.Cleanup(restore)
+	tr, st, c, _ := newTracker(t)
+	pub := &cutPub{firstErr: make(chan error, 1)}
+	r := llmhealth.NewRunner(tr, nil, pub, nil)
+	llmhealth.SetRunnerTickForTest(time.Hour)
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(err503)
+	<-tr.Kick()
+	c.add(5 * time.Minute)
+	r.Step(context.Background(), c.now()) // root delivered
+	done := r.Start(context.Background())
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(nil) // kick → step → recovery edit stalls in cutPub
+	time.Sleep(50 * time.Millisecond)                          // let the step reach the stalled edit
+	start := time.Now()
+	r.Stop()
+	select {
+	case err := <-pub.firstErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("stalled edit ended with %v after %v; Stop must cut the step in progress, not wait out its bound", err, time.Since(start))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("stalled edit never ended")
+	}
+	select {
+	case <-done:
+	case <-time.After(llmhealth.DrainTimeout()):
+		t.Fatal("runner did not stop within DrainTimeout")
+	}
+	rec, _, err := st.GetLLMHealth(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pub.updateCount() != 1 || rec.SlackDelivery != llmhealth.DeliveryRecovered {
+		t.Fatalf("final pass: edits landed = %d, durable slack_delivery = %q; want the cut edit retried and recovered", pub.updateCount(), rec.SlackDelivery)
 	}
 }

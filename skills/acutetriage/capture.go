@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/notify"
@@ -23,11 +24,77 @@ const captureActor = "mcp"
 // CaptureEngine wraps the triage Skill: the persist phase uses its store /
 // auditor / notifier; the grade phase replays through its pipeline config
 // ("current triage").
+//
+// The grade phase makes real generations through the primary client, so it
+// is an LLM capability producer like correlator triage (ADR-0046: health
+// comes from every real call). Unlike the correlator it runs on MCP request
+// goroutines that http.Server.Shutdown neither cancels nor joins, so the
+// engine owns that lifecycle itself: Close cancels every grade in progress
+// and returns once none is running, letting the owner stop the LLM health
+// runner knowing no producer is left.
 type CaptureEngine struct {
 	sk *Skill
+
+	mu      sync.Mutex
+	closed  bool
+	grades  sync.WaitGroup
+	closeCh chan struct{} // closed once by Close; cancels every grade ctx
 }
 
-func NewCaptureEngine(sk *Skill) *CaptureEngine { return &CaptureEngine{sk: sk} }
+func NewCaptureEngine(sk *Skill) *CaptureEngine {
+	return &CaptureEngine{sk: sk, closeCh: make(chan struct{})}
+}
+
+// errCaptureClosed is what enterGrade reports once Close has begun.
+var errCaptureClosed = errors.New("acutetriage: capture: engine closed")
+
+// Close cancels grades in progress — their LLM calls end in a shutdown-driven
+// cancellation, which the health tracker ignores (H1) — and waits for them to
+// return, bounded by ctx. Verdicts already persisted are untouched; the MCP
+// caller sees replay_failed, as for any grading failure.
+func (e *CaptureEngine) Close(ctx context.Context) error {
+	e.mu.Lock()
+	if !e.closed {
+		e.closed = true
+		close(e.closeCh)
+	}
+	e.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		e.grades.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// enterGrade registers a grade with the engine and returns a ctx that is
+// also canceled by Close, plus the release func. It fails once Close has
+// begun so the WaitGroup can never be added to while Close waits on it.
+func (e *CaptureEngine) enterGrade(ctx context.Context) (context.Context, func(), error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return nil, nil, errCaptureClosed
+	}
+	e.grades.Add(1)
+	gctx, cancel := context.WithTimeout(ctx, gradeDeadline)
+	go func() {
+		select {
+		case <-e.closeCh:
+			cancel()
+		case <-gctx.Done():
+		}
+	}()
+	return gctx, func() {
+		cancel()
+		e.grades.Done()
+	}, nil
+}
 
 type AnnotateRequest struct {
 	IncidentID string
@@ -169,8 +236,14 @@ func (e *CaptureEngine) CaptureVerdict(ctx context.Context, req CaptureRequest) 
 	warnings = append(warnings, lintExpectationVerifiable(req.Verdict, exp, frozen, decodeWidened(verdictRow))...)
 
 	res := &CaptureResult{VerdictID: verdictRow.ID, Version: verdictRow.Version, Warnings: warnings}
-	gctx, cancel := context.WithTimeout(ctx, gradeDeadline)
-	defer cancel()
+	gctx, release, err := e.enterGrade(ctx)
+	if err != nil {
+		// The verdict is already persisted; only the grade is refused.
+		res.ReplayFailed = true
+		res.Warnings = append(res.Warnings, "replay skipped: agent shutting down — verdict captured intact")
+		return res, nil
+	}
+	defer release()
 	e.grade(gctx, inc, exp, verdictRow, res)
 	return res, nil
 }

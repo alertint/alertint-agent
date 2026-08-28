@@ -219,21 +219,19 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		slog.Bool("slack", llmSystemPublisher != nil),
 	)
 
-	// The LLM health runner starts here, before the correlator, so the
-	// deferred order on every exit path is: correlator stopped (the only
-	// producer of capability observations, joined by cor.Stop — verdict
-	// replays strip Health), then the runner drained, then the store
-	// closed. The runner's context is deliberately NOT derived from the
-	// signal ctx: SIGTERM must not exit the runner before cor.Stop has
-	// joined the producers, or a last Finish kicks a runner that is already
-	// gone and the episode's System message never posts / never gets its
-	// recovery edit. drainLLMHealthRunner is the only thing that cancels it.
-	// A Slack root POST in flight at shutdown is detached by design; its
-	// result — and any recovery racing it — must still be persisted or the
-	// episode's write-ahead marker stays "indeterminate" for good.
-	llmRunCtx, llmRunCancel := context.WithCancel(context.Background())
-	llmRunDone := llmhealth.NewRunner(llmHealth, llmProber, llmSystemPublisher, logger).Start(llmRunCtx)
-	defer drainLLMHealthRunner(llmRunCancel, llmRunDone, logger)
+	// LLM health lifecycle. Capability observations come from two producers:
+	// correlator triage (synchronous inside the correlator loop, joined by
+	// cor.Stop) and Captured-verdict grading (MCP request goroutines, joined
+	// by captureEngine.Close). The runner starts here, before both, so the
+	// LIFO defers stop them first and the runner's final delivery pass then
+	// acknowledges a state nothing can move any more: cor.Stop →
+	// captureEngine.Close → runner Stop+join → store close. The runner runs
+	// on a never-canceled ctx on purpose: the signal ctx must not abort it
+	// before the producers are joined, and a canceled runner never delivers
+	// — only Stop does the final pass.
+	llmRunner := llmhealth.NewRunner(llmHealth, llmProber, llmSystemPublisher, logger)
+	llmRunDone := llmRunner.Start(context.Background())
+	defer stopLLMHealthRunner(llmRunner, llmRunDone, logger)
 
 	// Build Prometheus client when enabled. Passed into both the triage skill
 	// (metric enrichment for the LLM prompt) and the MCP server (PromQL tools).
@@ -366,6 +364,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	)
 	_ = apiKey // key is embedded in llmClient via Config.APIKey
 	captureEngine := acutetriage.NewCaptureEngine(skill)
+	defer closeCaptureEngine(captureEngine, logger) // after cor.Stop, before the runner stops
 
 	corCfg := correlator.Config{
 		WindowSeconds:   cfg.Correlator.WindowSeconds,
@@ -435,15 +434,28 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	return nil
 }
 
-// drainLLMHealthRunner stops the LLM health runner and waits, bounded by
-// llmhealth.DrainTimeout, for it to finish — long enough for a detached
-// Slack root POST to return and persist its coordinates.
-func drainLLMHealthRunner(cancel context.CancelFunc, done <-chan struct{}, logger *slog.Logger) {
-	cancel()
+// stopLLMHealthRunner stops the LLM health runner — its final delivery pass
+// acknowledges the settled state — and waits, bounded by
+// llmhealth.DrainTimeout, for it to finish. Call only after every capability
+// producer has been joined.
+func stopLLMHealthRunner(r *llmhealth.Runner, done <-chan struct{}, logger *slog.Logger) {
+	r.Stop()
 	select {
 	case <-done:
 	case <-time.After(llmhealth.DrainTimeout()):
 		logger.Warn("llm health runner did not stop within the drain window; abandoning its in-flight delivery")
+	}
+}
+
+// closeCaptureEngine joins Captured-verdict grading (an LLM capability
+// producer on MCP request goroutines, which http.Server.Shutdown does not
+// interrupt) before the LLM health runner is stopped. Grades in progress are
+// canceled; the health tracker ignores shutdown-driven cancellation.
+func closeCaptureEngine(eng *acutetriage.CaptureEngine, logger *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), ingress.DefaultShutdownTimeout)
+	defer cancel()
+	if err := eng.Close(ctx); err != nil {
+		logger.Warn("verdict grading did not stop within the shutdown window", slog.String("err", err.Error()))
 	}
 }
 

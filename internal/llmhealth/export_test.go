@@ -27,6 +27,7 @@ func SetDeliveryBudgetForTest(d time.Duration) { deliveryBudget = d }
 // DrainTimeout is derived from.
 func DeliveryTimeoutForTest() time.Duration { return deliveryTimeout }
 func PersistTimeoutForTest() time.Duration  { return persistTimeout }
+func DeliveryBudgetForTest() time.Duration  { return deliveryBudget }
 
 // SetTimeoutsForTest shrinks the per-call delivery, persistence and drain
 // margin bounds together and returns a restore func.

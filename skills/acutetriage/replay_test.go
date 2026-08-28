@@ -414,12 +414,11 @@ func TestReplayIncident_NoFindingErrors(t *testing.T) {
 	}
 }
 
-// TestReplayIncident_DoesNotObserveLLMHealth: a verdict replay is grading, not
-// triage. Its Call 1/Call 2 must not enter the installation LLM dependency
-// state — otherwise an MCP handler (which http.Server.Shutdown does not
-// interrupt) keeps producing observations after the correlator and the
-// health runner have been stopped.
-func TestReplayIncident_DoesNotObserveLLMHealth(t *testing.T) {
+// TestReplayIncident_ObservesLLMHealth: a verdict replay's Call 1/Call 2 are
+// real generations through the primary client, so they are LLM capability
+// observations like any other (ADR-0046: health comes from every real
+// call). Grading is joined at shutdown, not hidden from the tracker.
+func TestReplayIncident_ObservesLLMHealth(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, ":memory:")
 	if err != nil {
@@ -452,7 +451,16 @@ func TestReplayIncident_DoesNotObserveLLMHealth(t *testing.T) {
 		t.Fatalf("replayIncident: %v", err)
 	}
 	snap := tr.Snapshot()
-	if snap.LastRealSuccessAt != nil || len(snap.Capabilities) != 0 {
-		t.Fatalf("replay fed the LLM health tracker: last_real_success_at=%v capabilities=%+v", snap.LastRealSuccessAt, snap.Capabilities)
+	if snap.LastRealSuccessAt == nil {
+		t.Fatalf("replay's real generation was not observed: %+v", snap)
+	}
+	var seen bool
+	for _, c := range snap.Capabilities {
+		if c.Capability == llmhealth.CapabilityTriageDraft && c.Healthy && c.LastSuccessAt != nil {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatalf("triage_draft not recorded healthy by the replay: %+v", snap.Capabilities)
 	}
 }
