@@ -18,6 +18,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/llm"
+	"github.com/alertint/alertint-agent/internal/llmhealth"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/internal/zabbix"
@@ -410,5 +411,48 @@ func TestReplayIncident_NoFindingErrors(t *testing.T) {
 	_, err = sk.replayIncident(ctx, *inc)
 	if err == nil || !strings.Contains(err.Error(), "no finding") {
 		t.Fatalf("want an error mentioning 'no finding', got %v", err)
+	}
+}
+
+// TestReplayIncident_DoesNotObserveLLMHealth: a verdict replay is grading, not
+// triage. Its Call 1/Call 2 must not enter the installation LLM dependency
+// state — otherwise an MCP handler (which http.Server.Shutdown does not
+// interrupt) keeps producing observations after the correlator and the
+// health runner have been stopped.
+func TestReplayIncident_DoesNotObserveLLMHealth(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	incID := seedReplayIncident(t, st, ctx)
+	inc, err := st.GetIncidentByID(ctx, incID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := New(Config{MinAlerts: 1}, st, &replayScriptedLLM{responses: []json.RawMessage{
+		draftJSON(t, "TargetDown", "flapping NIC", 0.80, nil),
+	}}, nil, nil, slog.Default())
+	if err := seed.Run(ctx, *inc); err != nil {
+		t.Fatalf("seed Run: %v", err)
+	}
+	if inc, err = st.GetIncidentByID(ctx, incID); err != nil {
+		t.Fatal(err)
+	}
+	tr, err := llmhealth.New(ctx, st, llmhealth.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sk := New(Config{MinAlerts: 1, Health: tr}, st, &replayScriptedLLM{responses: []json.RawMessage{
+		draftJSON(t, "TargetDown", "flapping NIC", 0.80, nil),
+	}}, nil, nil, slog.Default())
+	if _, err := sk.replayIncident(ctx, *inc); err != nil {
+		t.Fatalf("replayIncident: %v", err)
+	}
+	snap := tr.Snapshot()
+	if snap.LastRealSuccessAt != nil || len(snap.Capabilities) != 0 {
+		t.Fatalf("replay fed the LLM health tracker: last_real_success_at=%v capabilities=%+v", snap.LastRealSuccessAt, snap.Capabilities)
 	}
 }

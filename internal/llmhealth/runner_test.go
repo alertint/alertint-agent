@@ -156,15 +156,37 @@ func TestDrainTimeoutCoversWorstCaseChain(t *testing.T) {
 // the first Append.
 type slowAudit struct {
 	started chan struct{}
-	once    sync.Once
+	// startedAt is the 1-based Append call that closes started (0 = first).
+	startedAt int
+	once      sync.Once
+
+	mu     sync.Mutex
+	calls  int
+	events []string
 }
 
-func (a *slowAudit) Append(ctx context.Context, _, _ string, _ any) error {
-	if a.started != nil {
+func (a *slowAudit) Append(ctx context.Context, _, event string, _ any) error {
+	a.mu.Lock()
+	a.calls++
+	a.events = append(a.events, event)
+	n := a.calls
+	a.mu.Unlock()
+	if a.started != nil && n >= a.startedAt {
 		a.once.Do(func() { close(a.started) })
 	}
 	<-ctx.Done()
 	return ctx.Err()
+}
+
+func (a *slowAudit) seen(event string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, e := range a.events {
+		if e == event {
+			return true
+		}
+	}
+	return false
 }
 
 // delayedPub answers the POST only just inside deliveryTimeout.
@@ -253,7 +275,9 @@ func TestStartDrainsRecoveryRacingPostWithinDrainTimeout(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	c := &clock{t: time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)}
-	audit := &slowAudit{started: make(chan struct{})}
+	// The initial failing observation below is audit #1; the recovery's
+	// first audit under the lock is #2 — that is the one the test waits on.
+	audit := &slowAudit{started: make(chan struct{}), startedAt: 2}
 	tr, err := llmhealth.New(context.Background(), st, llmhealth.Options{Now: c.now, Auditor: audit, BroadcastAfter: 5 * time.Minute, IdleProbeAfter: 5 * time.Minute})
 	if err != nil {
 		t.Fatal(err)
@@ -289,6 +313,11 @@ func TestStartDrainsRecoveryRacingPostWithinDrainTimeout(t *testing.T) {
 	}
 	if rec.SlackDelivery != llmhealth.DeliveryRecoveryPending || rec.SlackTS == "" {
 		t.Fatalf("durable slack_delivery = %q ts = %q; the root posted during recovery must be adopted durably before done closes", rec.SlackDelivery, rec.SlackTS)
+	}
+	// Distinguishes stale-root adoption (recovery won the lock first) from an
+	// ordinary delivered-root recovery, which ends in the same durable state.
+	if !audit.seen("llm.health.slack_adopted") {
+		t.Fatalf("no llm.health.slack_adopted audit: the POST did not return into a recovery that already held the lock; events=%v", audit.events)
 	}
 }
 

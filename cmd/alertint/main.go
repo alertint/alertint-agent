@@ -221,12 +221,17 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 
 	// The LLM health runner starts here, before the correlator, so the
 	// deferred order on every exit path is: correlator stopped (the only
-	// producer of capability observations, joined by cor.Stop), then the
-	// runner drained, then the store closed. A Slack root POST in flight at
-	// shutdown is detached from ctx by design; its result — and any
-	// recovery racing it — must still be persisted or the episode's
-	// write-ahead marker stays "indeterminate" for good.
-	llmRunCtx, llmRunCancel := context.WithCancel(ctx)
+	// producer of capability observations, joined by cor.Stop — verdict
+	// replays strip Health), then the runner drained, then the store
+	// closed. The runner's context is deliberately NOT derived from the
+	// signal ctx: SIGTERM must not exit the runner before cor.Stop has
+	// joined the producers, or a last Finish kicks a runner that is already
+	// gone and the episode's System message never posts / never gets its
+	// recovery edit. drainLLMHealthRunner is the only thing that cancels it.
+	// A Slack root POST in flight at shutdown is detached by design; its
+	// result — and any recovery racing it — must still be persisted or the
+	// episode's write-ahead marker stays "indeterminate" for good.
+	llmRunCtx, llmRunCancel := context.WithCancel(context.Background())
 	llmRunDone := llmhealth.NewRunner(llmHealth, llmProber, llmSystemPublisher, logger).Start(llmRunCtx)
 	defer drainLLMHealthRunner(llmRunCancel, llmRunDone, logger)
 

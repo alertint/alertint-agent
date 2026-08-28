@@ -76,6 +76,12 @@ func (s *Skill) replayIncidentWith(ctx context.Context, inc store.Incident, aler
 	rs := *s // shallow copy: same store/llm/cfg, side effects stripped
 	rs.auditor = nil
 	rs.notifier = nil
+	// Grading is not triage: a replay's LLM calls must not feed the
+	// installation LLM dependency state. Keeping them out also keeps the
+	// correlator the only producer of health observations, which is what
+	// lets shutdown quiesce producers before draining the health runner —
+	// an MCP handler mid-replay is not interrupted by http.Server.Shutdown.
+	rs.cfg.Health = nil
 
 	persist := func(ctx context.Context, incidentID, outputJSON, summary, rootCause string, confidence float64, enrichmentJSON string) error {
 		var resp llmResponse
