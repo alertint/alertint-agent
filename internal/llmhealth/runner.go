@@ -25,6 +25,13 @@ var (
 	// edits must not cost N × deliveryTimeout before the idle probe runs.
 	// Whatever did not fit stays queued for the next step.
 	deliveryBudget = 45 * time.Second
+	// persistTimeout bounds every store write and audit append the tracker
+	// makes on its own context.Background() (they must land even when the
+	// caller's ctx is gone).
+	persistTimeout = 5 * time.Second
+	// drainMargin is scheduling headroom on top of the worst-case chain
+	// DrainTimeout adds up.
+	drainMargin = 5 * time.Second
 )
 
 // Runner drives the one-minute cadence: Slack delivery, then an idle probe
@@ -47,12 +54,23 @@ func NewRunner(t *Tracker, prober llm.Prober, pub Publisher, logger *slog.Logger
 }
 
 // DrainTimeout is how long an owner should wait for the channel returned by
-// Start after canceling ctx. A Slack POST that is in flight at cancellation
-// is deliberately detached from it (see Deliver) and bounded only by
-// deliveryTimeout; the join must outlast that call and the persistence of
-// its result, or the write-ahead marker stays "indeterminate" for good and
-// a root Slack did accept can never be edited again.
-const DrainTimeout = 20 * time.Second
+// Start after canceling ctx. It is derived from the longest chain one Step
+// can still run past the post fence, every link individually bounded:
+//
+//	detached root POST                       deliveryTimeout
+//	post-result audit + persist              2 × persistTimeout
+//	idle probe due in the same step: the probe itself fails at once on the
+//	canceled ctx, but ObserveProbe still persists and audits
+//	                                         2 × persistTimeout
+//	+ scheduling margin                      drainMargin
+//
+// Everything else in the step (late-root edits, the probe HTTP call) is
+// bound to ctx and returns immediately once it is canceled. Stopping short
+// of this chain leaves the write-ahead marker "indeterminate" for good and a
+// root Slack did accept without the coordinates needed to edit it again.
+func DrainTimeout() time.Duration {
+	return deliveryTimeout + 4*persistTimeout + drainMargin
+}
 
 // Start runs Run on its own goroutine and returns a channel that is closed
 // once Run has returned. Owners must keep the store open until it closes

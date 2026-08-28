@@ -136,6 +136,94 @@ func TestStartJoinsInFlightPostOnShutdown(t *testing.T) {
 	}
 }
 
+// TestDrainTimeoutCoversWorstCaseChain pins the derivation: after the post
+// fence a shutdown may still have to wait for the detached POST, the
+// post-result audit and persist, and — when an idle probe was due in the
+// same step — the probe's own persist and audit. Each is individually
+// bounded; the drain window must cover all of them with margin.
+func TestDrainTimeoutCoversWorstCaseChain(t *testing.T) {
+	chain := llmhealth.DeliveryTimeoutForTest() + 4*llmhealth.PersistTimeoutForTest()
+	if got := llmhealth.DrainTimeout(); got <= chain {
+		t.Fatalf("DrainTimeout = %v, must exceed the worst-case post→audit→persist→probe-persist→probe-audit chain %v", got, chain)
+	}
+}
+
+// slowAudit holds every Append until its bounded context expires, so each
+// audit stage costs the full persistTimeout.
+type slowAudit struct{}
+
+func (slowAudit) Append(ctx context.Context, _, _ string, _ any) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// delayedPub answers the POST only just inside deliveryTimeout.
+type delayedPub struct {
+	fakePub
+
+	delay   time.Duration
+	started chan struct{}
+	once    sync.Once
+}
+
+func (p *delayedPub) PostSystemMessage(ctx context.Context, text string) (string, string, error) {
+	p.once.Do(func() { close(p.started) })
+	time.Sleep(p.delay)
+	return p.fakePub.PostSystemMessage(ctx, text)
+}
+
+// TestStartDrainsWorstCaseChainWithinDrainTimeout runs the maximum-duration
+// shutdown path with the bounds shrunk: a POST that takes almost the whole
+// deliveryTimeout, audit appends that each burn a full persistTimeout, and
+// an idle probe due in the same step. The runner must still finish inside
+// DrainTimeout with the root's coordinates durable. (The store is concrete,
+// so persist latency itself is not injectable here; its bound is covered by
+// the derivation test above.)
+func TestStartDrainsWorstCaseChainWithinDrainTimeout(t *testing.T) {
+	restore := llmhealth.SetTimeoutsForTest(200*time.Millisecond, 100*time.Millisecond, 100*time.Millisecond)
+	t.Cleanup(restore)
+	llmhealth.SetRunnerTickForTest(time.Hour)
+
+	st, err := store.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	c := &clock{t: time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)}
+	tr, err := llmhealth.New(context.Background(), st, llmhealth.Options{Now: c.now, Auditor: slowAudit{}, BroadcastAfter: 5 * time.Minute, IdleProbeAfter: 5 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := &delayedPub{delay: 150 * time.Millisecond, started: make(chan struct{})}
+	pr := &fakeProber{res: llm.ProbeResult{Outcome: llm.ProbeFailed, Err: context.Canceled}}
+	r := llmhealth.NewRunner(tr, pr, pub, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(err503) // transition → buffered kick
+	c.add(5 * time.Minute)                                        // root due and probe due
+	done := r.Start(ctx)
+
+	<-pub.started
+	cancel()
+	start := time.Now()
+	select {
+	case <-done:
+	case <-time.After(llmhealth.DrainTimeout()):
+		t.Fatalf("runner still draining after DrainTimeout %v", llmhealth.DrainTimeout())
+	}
+	t.Logf("drained in %v of %v", time.Since(start), llmhealth.DrainTimeout())
+	if pr.calls.Load() != 1 {
+		t.Fatalf("probe calls = %d; the worst case includes the probe stage", pr.calls.Load())
+	}
+	rec, _, err := st.GetLLMHealth(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.SlackDelivery != llmhealth.DeliveryDelivered || rec.SlackTS == "" {
+		t.Fatalf("durable slack_delivery = %q ts = %q", rec.SlackDelivery, rec.SlackTS)
+	}
+}
+
 // TestStaleProbeFailureDiscardedAfterRealSuccessRacesIt covers the TOCTOU gap
 // between ProbeDue() (checks inFlight == 0, releases the lock) and the probe
 // HTTP call actually starting: a real call can begin — and succeed — while

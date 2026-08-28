@@ -435,7 +435,7 @@ func drainLLMHealthRunner(cancel context.CancelFunc, done <-chan struct{}, logge
 	cancel()
 	select {
 	case <-done:
-	case <-time.After(llmhealth.DrainTimeout):
+	case <-time.After(llmhealth.DrainTimeout()):
 		logger.Warn("llm health runner did not stop within the drain window; abandoning its in-flight delivery")
 	}
 }

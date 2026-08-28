@@ -609,7 +609,7 @@ func (t *Tracker) persist() error {
 	}
 	sort.Slice(caps, func(i, j int) bool { return caps[i].Capability < caps[j].Capability })
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), persistTimeout)
 	defer cancel()
 	if err := t.st.SaveLLMHealth(ctx, rec, caps); err != nil {
 		t.logger.Error("llm health: persist failed", "err", err)
@@ -629,7 +629,7 @@ func (t *Tracker) auditAppend(kind string, payload map[string]any) {
 	if t.auditor == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), persistTimeout)
 	defer cancel()
 	_ = t.auditor.Append(ctx, "llmhealth", kind, payload)
 }
