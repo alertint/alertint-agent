@@ -21,7 +21,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -38,8 +37,9 @@ const (
 	// class allows; claude-haiku-4-5 remains a one-line config opt-in for cost.
 	DefaultModel = "claude-sonnet-5"
 
-	// messagesEndpoint is the Anthropic Messages API URL.
-	messagesEndpoint = "https://api.anthropic.com/v1/messages"
+	// anthropicBaseURL is the Anthropic API origin used when no test override
+	// is supplied.
+	anthropicBaseURL = "https://api.anthropic.com"
 
 	// anthropicVersion is the API version header value required by Anthropic.
 	anthropicVersion = "2023-06-01"
@@ -91,6 +91,7 @@ type Client struct {
 	logger   *slog.Logger
 	now      func() time.Time
 	endpoint string // overridden in tests via NewWithHTTPClient
+	baseURL  string // origin backing endpoint; used by Probe
 }
 
 // New constructs a Client. auditor and logger may be nil (no-ops).
@@ -99,16 +100,16 @@ func New(cfg Config, auditor *audit.Auditor, logger *slog.Logger) *Client {
 }
 
 // NewWithHTTPClient constructs a Client with a custom base URL. When
-// baseURL is non-empty it overrides messagesEndpoint; this is used in
+// baseURL is non-empty it overrides anthropicBaseURL; this is used in
 // tests to point at an httptest.Server.
 func NewWithHTTPClient(cfg Config, auditor *audit.Auditor, logger *slog.Logger, baseURL string) *Client {
 	cfg.defaults()
 	if logger == nil {
 		logger = slog.Default()
 	}
-	endpoint := messagesEndpoint
+	origin := anthropicBaseURL
 	if baseURL != "" {
-		endpoint = baseURL + "/v1/messages"
+		origin = baseURL
 	}
 	return &Client{
 		cfg:      cfg,
@@ -116,7 +117,8 @@ func NewWithHTTPClient(cfg Config, auditor *audit.Auditor, logger *slog.Logger, 
 		auditor:  auditor,
 		logger:   logger,
 		now:      func() time.Time { return time.Now().UTC() },
-		endpoint: endpoint,
+		endpoint: origin + "/v1/messages",
+		baseURL:  origin,
 	}
 }
 
@@ -322,16 +324,16 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt
 	if resp.StatusCode != http.StatusOK {
 		var apiErr messagesResponse
 		_ = json.Unmarshal(respBody, &apiErr)
-		msg := fmt.Sprintf("HTTP %d", resp.StatusCode)
+		e := &llm.APIError{StatusCode: resp.StatusCode}
 		if apiErr.Error != nil {
-			msg = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, apiErr.Error.Message)
+			e.Message = apiErr.Error.Message
 		}
-		return nil, tokenUsage{}, fmt.Errorf("llm: api error: %s", msg)
+		return nil, tokenUsage{}, e
 	}
 
 	var parsed messagesResponse
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return nil, tokenUsage{}, fmt.Errorf("llm: parse response: %w", err)
+		return nil, tokenUsage{}, fmt.Errorf("%w: parse response: %w", llm.ErrResponseInvalid, err)
 	}
 	usage := tokenUsage{
 		input:         parsed.Usage.InputTokens,
@@ -359,7 +361,7 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt
 
 	text := firstTextBlock(parsed.Content)
 	if text == "" {
-		return nil, usage, errors.New("llm: response contained no text content block")
+		return nil, usage, fmt.Errorf("%w: response contained no text content block", llm.ErrResponseInvalid)
 	}
 
 	// The model should return raw JSON. Trim any markdown fences.
@@ -367,7 +369,7 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt
 
 	var raw json.RawMessage
 	if err := json.Unmarshal([]byte(text), &raw); err != nil {
-		return nil, usage, fmt.Errorf("llm: response is not valid JSON: %w", err)
+		return nil, usage, fmt.Errorf("%w: response is not valid JSON: %w", llm.ErrResponseInvalid, err)
 	}
 	return raw, usage, nil
 }

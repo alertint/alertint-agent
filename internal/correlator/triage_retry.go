@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/llmhealth"
 	"github.com/alertint/alertint-agent/internal/notify"
 	"github.com/alertint/alertint-agent/internal/store"
 )
@@ -81,12 +82,39 @@ func (c *Correlator) dispatchTriage(ctx context.Context, incidentID string) {
 	}
 }
 
+// ambiguousShapedReasons are llmhealth reasons that match on generic stdlib
+// error shapes (context.DeadlineExceeded, a net.Error, a *url.Error) rather
+// than an internal/llm- or internal/llmhealth-specific typed value. The
+// Acute Triage sink error classifyTriageError sees is the WHOLE skill
+// invocation's error, not just the LLM call's — a SQLite write timing out or
+// a Prometheus/Zabbix/log-source fetch failing can produce these same
+// shapes, so they are trusted only when Acute Triage's LLM-origin marker
+// (llmhealth.MarkLLMOrigin, applied at its Complete boundary) vouches that
+// the error actually came out of the LLM call.
+var ambiguousShapedReasons = map[llmhealth.Reason]bool{
+	llmhealth.ReasonTimeout:  true,
+	llmhealth.ReasonNetwork:  true,
+	llmhealth.ReasonCanceled: true,
+}
+
 // classifyTriageError produces the bounded, sanitized code/detail persisted
-// on a failed dispatch (R9). All non-LLM sink errors classify conservatively;
-// the sibling LLM-health PR replaces this with capability-aware dependency
-// codes without changing the retry schedule.
+// on a failed dispatch (R9). A dispatch error that llmhealth can classify
+// into a reason backed by an LLM-specific typed error (a provider status,
+// a schema/malformed-response sentinel), or into an ambiguous stdlib-shaped
+// reason that carries the LLM-origin marker, persists that reason code and
+// its safe detail; anything else — an unmarked ambiguous reason that a
+// non-LLM sink error could equally produce, or a shape llmhealth has never
+// seen — falls back to the generic triage_dispatch_failed code so a failure
+// is always recorded, never dropped, and never misattributed.
 func classifyTriageError(err error) (code, detail string) {
-	return "triage_dispatch_failed", err.Error()
+	reason := llmhealth.Classify(err)
+	switch {
+	case reason == llmhealth.ReasonUnknown:
+	case ambiguousShapedReasons[reason] && !llmhealth.IsLLMOrigin(err):
+	default:
+		return string(reason), llmhealth.SafeDetail(err)
+	}
+	return "triage_dispatch_failed", llmhealth.SafeDetail(err)
 }
 
 // triageFailed records a failed dispatch and either schedules the next

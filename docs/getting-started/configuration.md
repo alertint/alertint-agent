@@ -226,6 +226,33 @@ specific to your environment; see
 | `verification.max_rounds` | int | `1` | Reserved for future multi-round verification; values greater than 1 are rejected. Today only `1` is supported. |
 | `extra_selector_labels` | list | — | Extra alert-label keys (topology labels like `cluster` or `region`) added to the built-in selector allowlist (`namespace, service, job, pod, container, instance`) used to build metric/log enrichment queries and the verification floor's peer scope. Extras join every query and are never dropped by fallback queries. Use topology labels, not identity labels. |
 
+## `health`
+
+Installation dependency health for the LLM. Real triage calls are the primary
+signal; a non-generating metadata `GET` probe runs only while idle. See
+[Integration health](#integration-health) for the `/health` shape and the
+[Slack guide](../notifications/slack.md#system-messages) for the system message.
+
+Both settings are optional and default to `300` seconds (5 minutes). Omitting
+the entire `health` block leaves both defaults in effect:
+
+```yaml
+health:
+  llm_idle_probe_after_seconds: 300  # default: probe after 5 minutes without a completed real LLM call
+  broadcast_after_seconds: 300       # default: notify after 5 continuous unhealthy minutes
+```
+
+The timers are independent. `llm_idle_probe_after_seconds` controls when the
+zero-generation fallback probe becomes eligible; it still waits for zero calls
+in flight and runs at most once per minute while idle. `broadcast_after_seconds`
+starts when the aggregate LLM dependency state first becomes `degraded` or
+`unavailable`; state changes inside the same outage episode do not reset it.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `llm_idle_probe_after_seconds` | int | `300` | Seconds without a completed real LLM call before an idle metadata probe runs (at most once per minute while idle; never while a call is in flight). Must be positive. |
+| `broadcast_after_seconds` | int | `300` | Seconds the LLM must be continuously unhealthy before one `AlertINT system` Slack message is posted. Must be positive. |
+
 ## `notify`
 
 | Field | Type | Default | Description |
@@ -447,4 +474,16 @@ informational and never makes an orchestrator restart the agent:
 
 ```json
 {"status":"ok","integrations":[{"name":"prometheus","detail":"http://prometheus:9090","ok":true,"checked_at":"..."}]}
+```
+
+The response also carries the LLM's installation dependency state under
+`llm` (see [`health`](#health)). This state comes from real triage calls plus
+an idle metadata `GET` probe; it is informational and never changes the HTTP
+status — `alertint health` is unchanged. `state` is `healthy | degraded |
+unavailable`; `capabilities[]` lists whichever of `triage_draft`,
+`verification_rejudge`, `query_repair`, `memory_classifier`, `probe` have
+been observed:
+
+```json
+{"status":"ok","llm":{"state":"unavailable","reason":"provider_unavailable","detail":"HTTP 503","unhealthy_since":"2026-08-27T12:00:00Z","outage_generation":2,"in_flight":0,"capabilities":[{"capability":"triage_draft","healthy":false,"reason":"provider_unavailable","detail":"HTTP 503"}]}}
 ```

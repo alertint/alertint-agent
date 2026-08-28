@@ -18,6 +18,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/llm"
+	"github.com/alertint/alertint-agent/internal/llmhealth"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/internal/zabbix"
@@ -410,5 +411,56 @@ func TestReplayIncident_NoFindingErrors(t *testing.T) {
 	_, err = sk.replayIncident(ctx, *inc)
 	if err == nil || !strings.Contains(err.Error(), "no finding") {
 		t.Fatalf("want an error mentioning 'no finding', got %v", err)
+	}
+}
+
+// TestReplayIncident_ObservesLLMHealth: a verdict replay's Call 1/Call 2 are
+// real generations through the primary client, so they are LLM capability
+// observations like any other (ADR-0046: health comes from every real
+// call). Grading is joined at shutdown, not hidden from the tracker.
+func TestReplayIncident_ObservesLLMHealth(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	incID := seedReplayIncident(t, st, ctx)
+	inc, err := st.GetIncidentByID(ctx, incID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := New(Config{MinAlerts: 1}, st, &replayScriptedLLM{responses: []json.RawMessage{
+		draftJSON(t, "TargetDown", "flapping NIC", 0.80, nil),
+	}}, nil, nil, slog.Default())
+	if err := seed.Run(ctx, *inc); err != nil {
+		t.Fatalf("seed Run: %v", err)
+	}
+	if inc, err = st.GetIncidentByID(ctx, incID); err != nil {
+		t.Fatal(err)
+	}
+	tr, err := llmhealth.New(ctx, st, llmhealth.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sk := New(Config{MinAlerts: 1, Health: tr}, st, &replayScriptedLLM{responses: []json.RawMessage{
+		draftJSON(t, "TargetDown", "flapping NIC", 0.80, nil),
+	}}, nil, nil, slog.Default())
+	if _, err := sk.replayIncident(ctx, *inc); err != nil {
+		t.Fatalf("replayIncident: %v", err)
+	}
+	snap := tr.Snapshot()
+	if snap.LastRealSuccessAt == nil {
+		t.Fatalf("replay's real generation was not observed: %+v", snap)
+	}
+	var seen bool
+	for _, c := range snap.Capabilities {
+		if c.Capability == llmhealth.CapabilityTriageDraft && c.Healthy && c.LastSuccessAt != nil {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatalf("triage_draft not recorded healthy by the replay: %+v", snap.Capabilities)
 	}
 }

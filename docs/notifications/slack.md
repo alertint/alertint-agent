@@ -187,6 +187,47 @@ Every recurrence reply states the reason, e.g.:
 Incident a1b2c3d4 · recurred ×9 · last 14:52 UTC · why: cadence
 ```
 
+## System messages
+
+The configured LLM is an installation dependency, not a property of any
+Incident. When it has been continuously unhealthy for
+`health.broadcast_after_seconds` (default 5 minutes), AlertINT posts one
+plain-text `AlertINT system` root message — on whenever Slack is enabled, no
+second switch:
+
+> ⚠️ AlertINT system · LLM unavailable for 5m. New Incident triage is
+> retrying; correlation may be delayed.
+
+> ⚠️ AlertINT system · LLM degraded for 5m. Verification re-judgment is
+> failing; draft Findings continue with reduced confidence.
+
+If the state changes again inside the same outage (`degraded ↔ unavailable`),
+the same message is edited in place — never a second post. Once the LLM
+recovers, one more edit closes it out:
+
+> ✅ AlertINT system · LLM recovered after 12m. Pending triage retries
+> continue automatically.
+
+One root per sustained episode, edited in place, never per-Incident and never
+threaded. If the LLM recovers before the root was ever successfully
+delivered, the stale outage/recovery pair is suppressed — it survives only in
+state, audit, and logs. A post Slack definitely rejected is retried on the
+next minute; a post whose outcome is unknown (the request may have been
+accepted before the connection failed, or the process restarted mid-post) is
+never retried, because a second root is worse than a missing one — the
+outage still shows in `/health`, audit, and logs. A root that turns out to
+have landed after its episode already recovered is edited to that episode's
+recovery — however many episodes have come and gone since, and even across a
+restart before the edit lands — never left standing as a stale outage, and
+never reused by the next episode, which earns its own root on its own clock.
+Each Slack request is bounded by its own timeout: a request Slack accepts but
+never answers counts as an unknown outcome (a post) or is retried on the
+next minute (an edit), and never delays the idle probe that would report the
+LLM back. During an outage, new Incident triage retries with
+backoff and correlation may be delayed; this copy never claims Alert intake
+itself is unaffected. See [Integration health](../getting-started/configuration.md#integration-health)
+for the `/health` shape behind these messages.
+
 Two backstop triggers — a hard occurrence cap and a periodic re-analysis
 ceiling — force a fresh re-analysis without representing a genuine escalation,
 so they edit the card but never post a reply; they stay silent by design.

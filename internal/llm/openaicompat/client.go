@@ -22,7 +22,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -99,6 +98,9 @@ type Client struct {
 	// OpenAI, which 400s on the unrecognized field; its models have no
 	// chat-template thinking toggle to pin anyway.
 	pinChatTemplateKwargs bool
+	// hosted marks the endpoint as hosted OpenAI: Probe uses the model-
+	// metadata route instead of the generic health/models routes.
+	hosted bool
 }
 
 // New constructs a Client. auditor and logger may be nil (no-ops).
@@ -116,6 +118,7 @@ func New(cfg Config, auditor *audit.Auditor, logger *slog.Logger) *Client {
 		endpoint: cfg.BaseURL + "/v1/chat/completions",
 
 		pinChatTemplateKwargs: !isHostedOpenAI(cfg.BaseURL),
+		hosted:                isHostedOpenAI(cfg.BaseURL),
 	}
 }
 
@@ -289,14 +292,14 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt
 
 	var parsed chatResponse
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return nil, tokenUsage{}, fmt.Errorf("llm: parse response: %w", err)
+		return nil, tokenUsage{}, fmt.Errorf("%w: parse response: %w", llm.ErrResponseInvalid, err)
 	}
 	usage := tokenUsage{
 		input:  parsed.Usage.PromptTokens,
 		output: parsed.Usage.CompletionTokens,
 	}
 	if len(parsed.Choices) == 0 {
-		return nil, usage, errors.New("llm: response contained no choices")
+		return nil, usage, fmt.Errorf("%w: response contained no choices", llm.ErrResponseInvalid)
 	}
 	choice := parsed.Choices[0]
 
@@ -318,16 +321,16 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt
 
 	text := stripLeadingThink(choice.Message.Content)
 	if text == "" {
-		return nil, usage, errors.New("llm: response contained no text content")
+		return nil, usage, fmt.Errorf("%w: response contained no text content", llm.ErrResponseInvalid)
 	}
 	text = llm.StripMarkdownFence(text)
 
 	var raw json.RawMessage
 	if err := json.Unmarshal([]byte(text), &raw); err != nil {
 		if c.cfg.ResponseFormat != "off" {
-			return nil, usage, fmt.Errorf("llm: response is not valid JSON: %w (%s)", err, responseFormatHint)
+			return nil, usage, fmt.Errorf("%w: response is not valid JSON: %w (%s)", llm.ErrResponseInvalid, err, responseFormatHint)
 		}
-		return nil, usage, fmt.Errorf("llm: response is not valid JSON: %w", err)
+		return nil, usage, fmt.Errorf("%w: response is not valid JSON: %w", llm.ErrResponseInvalid, err)
 	}
 	return raw, usage, nil
 }
@@ -340,14 +343,10 @@ func apiError(status int, body []byte) error {
 	if len(excerpt) > maxErrorBodyExcerpt {
 		excerpt = excerpt[:maxErrorBodyExcerpt] + "…"
 	}
-	msg := fmt.Sprintf("llm: api error: HTTP %d", status)
-	if excerpt != "" {
-		msg += ": " + excerpt
-	}
 	if status == http.StatusBadRequest && strings.Contains(excerpt, "response_format") {
-		msg += " (" + responseFormatHint + ")"
+		excerpt += " (" + responseFormatHint + ")"
 	}
-	return errors.New(msg)
+	return &llm.APIError{StatusCode: status, Message: excerpt}
 }
 
 const (

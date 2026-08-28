@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/notify"
@@ -23,11 +24,93 @@ const captureActor = "mcp"
 // CaptureEngine wraps the triage Skill: the persist phase uses its store /
 // auditor / notifier; the grade phase replays through its pipeline config
 // ("current triage").
+//
+// Every operation runs on an MCP request goroutine that http.Server.Shutdown
+// neither cancels nor reliably joins (its drain is bounded and gives up), so
+// the engine owns that lifecycle itself. Two owners depend on it: the store,
+// which closes only after no operation can still write to it, and the LLM
+// health runner, whose final pass must run after no grade — a real
+// generation, hence an LLM capability producer (ADR-0046) — can still report.
+// Close therefore refuses every operation that begins after it, cancels only
+// the grade phase of those in progress (the persist phase completes: the
+// operator's verdict lands), and returns once every registered operation
+// has left.
 type CaptureEngine struct {
 	sk *Skill
+
+	mu      sync.Mutex
+	closed  bool
+	ops     sync.WaitGroup // every operation, from before its first store access
+	closeCh chan struct{}  // closed once by Close; cancels every grade ctx
 }
 
-func NewCaptureEngine(sk *Skill) *CaptureEngine { return &CaptureEngine{sk: sk} }
+func NewCaptureEngine(sk *Skill) *CaptureEngine {
+	return &CaptureEngine{sk: sk, closeCh: make(chan struct{})}
+}
+
+// ErrCaptureClosed is returned by every operation that begins once Close has
+// begun: nothing of it was persisted, and the caller should retry after the
+// agent is back.
+var ErrCaptureClosed = errors.New("acutetriage: capture: agent shutting down — nothing persisted, retry after restart")
+
+// Close refuses new operations, cancels grades in progress — their LLM calls
+// end in a shutdown-driven cancellation, which the health tracker ignores
+// (H1) — and waits for every operation already begun to return, bounded by
+// ctx. A ctx error means an operation is still running: the owner must not
+// treat the store or the health runner as free of this producer.
+func (e *CaptureEngine) Close(ctx context.Context) error {
+	e.mu.Lock()
+	if !e.closed {
+		e.closed = true
+		close(e.closeCh)
+	}
+	e.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		e.ops.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// enter registers one operation before it touches the store and returns its
+// release func. It fails once Close has begun, so the WaitGroup can never be
+// added to while Close waits on it.
+func (e *CaptureEngine) enter() (func(), error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return nil, ErrCaptureClosed
+	}
+	e.ops.Add(1)
+	return e.ops.Done, nil
+}
+
+// gradeContext derives the grade phase's ctx: bounded by gradeDeadline and
+// canceled by Close. It reports closed when Close has already begun, so a
+// grade never starts against a shutting-down runner.
+func (e *CaptureEngine) gradeContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	e.mu.Lock()
+	closed := e.closed
+	e.mu.Unlock()
+	if closed {
+		return nil, nil, ErrCaptureClosed
+	}
+	gctx, cancel := context.WithTimeout(ctx, gradeDeadline)
+	go func() {
+		select {
+		case <-e.closeCh:
+			cancel()
+		case <-gctx.Done():
+		}
+	}()
+	return gctx, cancel, nil
+}
 
 type AnnotateRequest struct {
 	IncidentID string
@@ -49,6 +132,11 @@ func (e *CaptureEngine) Annotate(ctx context.Context, req AnnotateRequest) (*Ann
 	if req.Kind != "correction" && req.Kind != "observation" {
 		return nil, fmt.Errorf("acutetriage: annotate: kind %q not in {correction, observation} (confirmation is written by capture only)", req.Kind)
 	}
+	release, err := e.enter()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	inc, err := e.sk.st.GetIncidentByID(ctx, req.IncidentID)
 	if err != nil {
 		return nil, fmt.Errorf("acutetriage: annotate: load incident: %w", err)
@@ -134,6 +222,11 @@ func (e *CaptureEngine) CaptureVerdict(ctx context.Context, req CaptureRequest) 
 	if len(req.WidenQueries) > maxWidenQueries {
 		return nil, fmt.Errorf("acutetriage: capture: %d widen_queries exceeds the cap of %d", len(req.WidenQueries), maxWidenQueries)
 	}
+	release, err := e.enter()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	inc, err := e.sk.st.GetIncidentByID(ctx, req.IncidentID)
 	if err != nil {
 		return nil, fmt.Errorf("acutetriage: capture: load incident: %w", err)
@@ -169,7 +262,14 @@ func (e *CaptureEngine) CaptureVerdict(ctx context.Context, req CaptureRequest) 
 	warnings = append(warnings, lintExpectationVerifiable(req.Verdict, exp, frozen, decodeWidened(verdictRow))...)
 
 	res := &CaptureResult{VerdictID: verdictRow.ID, Version: verdictRow.Version, Warnings: warnings}
-	gctx, cancel := context.WithTimeout(ctx, gradeDeadline)
+	gctx, cancel, err := e.gradeContext(ctx)
+	if err != nil {
+		// Close began during the persist phase: the verdict is persisted;
+		// only the grade is refused.
+		res.ReplayFailed = true
+		res.Warnings = append(res.Warnings, "replay skipped: agent shutting down — verdict captured intact")
+		return res, nil
+	}
 	defer cancel()
 	e.grade(gctx, inc, exp, verdictRow, res)
 	return res, nil

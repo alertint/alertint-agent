@@ -137,3 +137,53 @@ func TestLLMProviderIsOpenAI_CaseInsensitive(t *testing.T) {
 		t.Error("anthropic must not be treated as openai-compatible")
 	}
 }
+
+// TestBuildLLMProber_BothProvidersSatisfyProber pins that the wired client
+// for either provider, built the exact way runServe builds it, is usable as
+// an llmhealth idle-probe prober — a swapped/missing type assertion here
+// would silently disable idle probing for one provider.
+func TestBuildLLMProber_BothProvidersSatisfyProber(t *testing.T) {
+	anthropicCfg := config.Defaults()
+	anthropicCfg.LLM.Provider = "anthropic"
+	anthropicClient := buildLLMClient(&anthropicCfg, "key", nil, slog.Default())
+	if p := buildLLMProber(&anthropicCfg, anthropicClient, slog.Default()); p == nil {
+		t.Error("anthropic client must build a non-nil llm.Prober")
+	}
+
+	openaiCfg := config.Defaults()
+	openaiCfg.LLM.Provider = "openai-compatible"
+	openaiCfg.LLM.BaseURL = "http://localhost:30000"
+	openaiClient := buildLLMClient(&openaiCfg, "", nil, slog.Default())
+	if p := buildLLMProber(&openaiCfg, openaiClient, slog.Default()); p == nil {
+		t.Error("openai-compatible client must build a non-nil llm.Prober")
+	}
+}
+
+// TestBuildNotifierPublisher_OnlyWhenSlackWired pins buildNotifier's second
+// return value: a non-nil llmhealth.Publisher only when Slack is enabled with
+// a resolvable bot token — never when Slack is disabled or the token env var
+// is unset, and the primary *notify.Multi return is unaffected either way.
+func TestBuildNotifierPublisher_OnlyWhenSlackWired(t *testing.T) {
+	off := config.Defaults()
+	off.Notify.Stdout = true
+	off.Notify.Slack.Enabled = false
+	if multi, pub := buildNotifier(&off, nil, nil, slog.Default(), false); multi == nil || pub != nil {
+		t.Errorf("slack disabled: multi=%v pub=%v, want non-nil multi and nil publisher", multi, pub)
+	}
+
+	unresolved := config.Defaults()
+	unresolved.Notify.Slack.Enabled = true
+	unresolved.Notify.Slack.BotTokenEnv = "ALERTINT_TEST_UNSET_BOT_TOKEN"
+	if _, pub := buildNotifier(&unresolved, nil, nil, slog.Default(), false); pub != nil {
+		t.Error("slack enabled but token env unresolved: want nil publisher")
+	}
+
+	on := config.Defaults()
+	on.Notify.Slack.Enabled = true
+	on.Notify.Slack.BotTokenEnv = "ALERTINT_TEST_BOT_TOKEN"
+	on.Notify.Slack.Channel = "#alerts"
+	t.Setenv("ALERTINT_TEST_BOT_TOKEN", "xoxb-test")
+	if multi, pub := buildNotifier(&on, nil, nil, slog.Default(), false); multi == nil || pub == nil {
+		t.Errorf("slack enabled with resolvable token: multi=%v pub=%v, want both non-nil", multi, pub)
+	}
+}

@@ -48,6 +48,10 @@ type Finding struct {
 	// surface a caveat off it. False on the kill-switch path and on any
 	// supported/revised round.
 	Unverified bool `json:"unverified,omitempty"`
+	// DegradationReason names why a degraded verification round shipped the
+	// draft: llm_call_failed | llm_response_invalid | verification_source_unavailable.
+	// Empty when the round was not degraded.
+	DegradationReason string `json:"degradation_reason,omitempty"`
 	// VerificationInvalidQueries counts methodological query failures that were
 	// not used as evidence. It is independent of connector availability.
 	VerificationInvalidQueries int `json:"verification_invalid_queries,omitempty"`
@@ -321,7 +325,8 @@ type TriageExhaustedEvent struct {
 // TriageFailureSink is an optional capability: a Notifier that also renders a
 // triage-exhausted event. Sinks that don't implement it are skipped; the Slack
 // sink deliberately does not, so an LLM outage never becomes one card per
-// stuck incident (the Situation controller surfaces it as dependency health).
+// stuck incident: installation-level LLM dependency health (internal/llmhealth)
+// surfaces it once, as the `AlertINT system` message and in GET /health.
 type TriageFailureSink interface {
 	OnTriageExhausted(ctx context.Context, ev TriageExhaustedEvent) error
 }
@@ -398,4 +403,20 @@ func statusOrOngoing(s string) string {
 		return "ongoing"
 	}
 	return s
+}
+
+// UnverifiedCaveat is the single caveat line every renderer shows for an
+// unverified finding, distinguished by the bounded degradation reason. It
+// never carries query expressions, prompts, or raw responses.
+func UnverifiedCaveat(reason string, drill bool) string {
+	switch reason {
+	case "llm_call_failed":
+		return "⚠ unverified — verification call failed; confidence is the draft's"
+	case "llm_response_invalid":
+		return "⚠ unverified — verification reply unreadable; confidence is the draft's"
+	}
+	if drill {
+		return "⚠ unverified — no live evidence checks ran (expected for a drill: its labels are fictional)"
+	}
+	return "⚠ unverified — checks unavailable"
 }

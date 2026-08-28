@@ -278,6 +278,53 @@ persisting an alert and its handoff can still lose that handoff. A durable
 Receiver-to-Correlator delivery ledger and/or an asynchronous triage worker
 are a separate, future architecture item.
 
+## LLM dependency health
+
+The configured LLM is an installation-level dependency, observed below Acute
+Triage rather than owned by any Incident or Situation. Each distinct use of
+the LLM — the triage draft (Call 1), the bounded PromQL query repair, the
+verification re-judgment (Call 2), the optional memory classifier, and the
+idle probe — is its own **LLM capability**, cleared only by its own success:
+
+- A `triage_draft` failure makes the installation `unavailable`; a
+  `verification_rejudge` failure makes it `degraded` while drafts continue
+  to ship. `memory_classifier` and `query_repair` (the one bounded PromQL
+  repair call before Call 2) are reported independently and never change
+  the rolled-up state — a repair only runs when the model proposed invalid
+  PromQL, so its success could never be relied on to clear a failure.
+- After five idle minutes with zero in-flight calls, a strictly
+  non-generating metadata `GET` probes reachability — never a completion,
+  never a prompt. A dependency-class probe failure also makes the
+  installation `unavailable` (the only signal available when traffic is
+  absent); it is cleared by probe success or by any real primary-client
+  success, never the reverse. A backend with no probe route is left alone
+  for an hour at a time and re-checked, and that verdict is never carried
+  across a restart (the endpoint may have changed in config).
+- State is durable in `llm_health` / `llm_health_capabilities`, restored on
+  restart, and exposed under `/health`'s `llm` key without affecting the
+  HTTP status. Audit kinds: `llm.health.changed`, `llm.health.probe`,
+  `llm.health.slack_posted`, `llm.health.slack_updated`,
+  `llm.health.slack_suppressed`, `llm.health.slack_failed`,
+  `llm.health.slack_indeterminate`, `llm.health.slack_adopted`,
+  `llm.health.slack_orphaned` — all bounded
+  reason codes and sanitized detail, never prompts, provider bodies,
+  headers, or credentials.
+- When Slack is enabled, one `AlertINT system` root message is posted per
+  sustained outage episode and edited in place as the state or recovery
+  changes — never a card per stuck Incident. Every Slack call is bounded by
+  its own timeout, so a stalled Slack endpoint can never hold up the idle
+  probe behind it; a root still awaiting its episode's recovery edit is kept
+  in `llm_health.late_roots` until the edit lands, across restarts; a root
+  whose edit keeps failing is rotated behind the others so it cannot starve
+  them.
+
+**Honest limitation:** the same synchronous-Correlator-loop limitation above
+applies to the Acute Triage calls the Correlator makes — a Call 1/Call 2 in
+flight pauses correlation for its duration. The idle probe does not: it runs
+on the health runner's own goroutine, as do Captured-verdict replay calls
+(MCP request goroutines). LLM dependency health is observed from real work
+first; the probe is only a GET-only fallback after five idle minutes.
+
 ## Audit log
 
 Every action appends a hash-chained row to the local audit log:

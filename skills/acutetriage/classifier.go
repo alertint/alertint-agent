@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/alertint/alertint-agent/internal/llm"
+	"github.com/alertint/alertint-agent/internal/llmhealth"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -100,6 +101,7 @@ func Classify(ctx context.Context, client LLMClient, currentKey string, candidat
 	}
 	if err := json.Unmarshal(comp.Raw, &parsed); err != nil {
 		res.Verdict = VerdictUnsureError
+		res.Err = fmt.Errorf("acutetriage: classifier: %w", llmhealth.ErrResponseMalformed)
 		return res
 	}
 	// Trust only a clean reply from the enum the prompt offers; the model's own
@@ -113,7 +115,12 @@ func Classify(ctx context.Context, client LLMClient, currentKey string, candidat
 	case string(VerdictUnsure):
 		res.Verdict = VerdictUnsure
 	default:
+		// An out-of-enum verdict is a schema violation the model committed,
+		// not a successful call: set Err so a caller observing it (Finish)
+		// records a real failure instead of silently clearing an unhealthy
+		// memory_classifier capability via Finish(nil).
 		res.Verdict = VerdictUnsureError
+		res.Err = fmt.Errorf("acutetriage: classifier: %w", llmhealth.ErrResponseMalformed)
 	}
 	return res
 }
@@ -146,7 +153,11 @@ func (s *Skill) maybeClassify(ctx context.Context, inc store.Incident, memory *M
 		defer cancel()
 	}
 
+	obs := s.cfg.Health.Begin(llmhealth.CapabilityMemoryClassifier, inc.ID)
 	result := Classify(ctx, s.cfg.Classifier, inc.GroupKey, *memory.topPrefilter)
+	// Finish persists with its own bounded context.Background() by design: a
+	// classifier observation must never be dropped because ctx was canceled.
+	obs.Finish(result.Err) //nolint:contextcheck
 	if result.Err != nil {
 		// The verdict fail-opens to unsure either way; the log distinguishes a
 		// truncated reply — the model's reasoning ate the completion budget —

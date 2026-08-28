@@ -6,11 +6,14 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/correlator"
+	"github.com/alertint/alertint-agent/internal/llm"
+	"github.com/alertint/alertint-agent/internal/llmhealth"
 	"github.com/alertint/alertint-agent/internal/notify"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/google/uuid"
@@ -24,9 +27,13 @@ type failingSink struct {
 	mu        sync.Mutex
 	failures  int
 	cleanSkip bool
-	calls     []string
-	onCall    func() // optional hook run inside each call (e.g. advance the clock)
-	st        *store.Store
+	// failErr, when set, is returned on every failing call instead of the
+	// generic connection-refused error — lets a test drive a specific
+	// llmhealth-classifiable error shape through the retry path.
+	failErr error
+	calls   []string
+	onCall  func() // optional hook run inside each call (e.g. advance the clock)
+	st      *store.Store
 }
 
 func (s *failingSink) OnIncidentReady(ctx context.Context, inc store.Incident) error {
@@ -37,6 +44,9 @@ func (s *failingSink) OnIncidentReady(ctx context.Context, inc store.Incident) e
 	}
 	s.calls = append(s.calls, inc.ID)
 	if len(s.calls) <= s.failures {
+		if s.failErr != nil {
+			return s.failErr
+		}
 		return errors.New("acutetriage: llm: connection refused")
 	}
 	if s.cleanSkip {
@@ -215,6 +225,22 @@ func triageNextAt(t *testing.T, st *store.Store, incidentID string) time.Time {
 	return got
 }
 
+// mustBackoffRow reads back incidentID's Incident and its durable triage row,
+// failing the test if the Incident is not currently "ready" in phase
+// "backoff" (the only state GetBackoffIncidentByGroupKey resolves).
+func mustBackoffRow(t *testing.T, st *store.Store, incidentID string) store.IncidentTriage {
+	t.Helper()
+	inc, err := st.GetIncidentByID(context.Background(), incidentID)
+	if err != nil {
+		t.Fatalf("get incident: %v", err)
+	}
+	_, tri, err := st.GetBackoffIncidentByGroupKey(context.Background(), inc.GroupKey)
+	if err != nil {
+		t.Fatalf("get backoff incident by group key: %v", err)
+	}
+	return *tri
+}
+
 // TestTriageRetry_PendingThroughBackoffThenSuccess pins the durable phase
 // sequence across a failed dispatch followed by a successful retry:
 // pending/0 -> in_flight/1 -> backoff/1, then backoff/1 -> in_flight/2 ->
@@ -250,6 +276,89 @@ func TestTriageRetry_PendingThroughBackoffThenSuccess(t *testing.T) {
 	h.now = h.now.Add(2 * time.Hour)
 	h.flush()
 	h.wantCalls(2, "after success")
+}
+
+// TestTriageBackoffRecordsCapabilityAwareCode pins classifyTriageError's
+// classified branch: a dependency-class llmhealth error persists its
+// llmhealth reason code and safe detail on the durable triage row, not the
+// generic "triage_dispatch_failed" fallback.
+func TestTriageBackoffRecordsCapabilityAwareCode(t *testing.T) {
+	h := newRetryHarness(t, 1)
+	h.sink.failErr = &llm.RetryableError{StatusCode: 503}
+
+	h.flush()
+
+	tri := mustBackoffRow(t, h.st, h.inc.ID)
+	if tri.LastErrorCode != "provider_unavailable" || tri.LastErrorDetail != "HTTP 503" {
+		t.Fatalf("triage row = %+v", tri)
+	}
+}
+
+// TestTriageBackoffRecordsResponseMalformed pins the content-class side of
+// the same contract: a Call-1 typed-decode failure propagated the way Acute
+// Triage now propagates it (wrapping llmhealth.ErrResponseMalformed) lands
+// on the durable triage row as response_malformed — the same code /health
+// reports for that capability — not the generic fallback.
+func TestTriageBackoffRecordsResponseMalformed(t *testing.T) {
+	h := newRetryHarness(t, 1)
+	h.sink.failErr = fmt.Errorf("acutetriage: parse llm response: %w", fmt.Errorf("%w: json: cannot unmarshal string into Go struct field", llmhealth.ErrResponseMalformed))
+
+	h.flush()
+
+	tri := mustBackoffRow(t, h.st, h.inc.ID)
+	if tri.LastErrorCode != "response_malformed" {
+		t.Fatalf("code = %q, want response_malformed", tri.LastErrorCode)
+	}
+}
+
+// TestTriageBackoffDoesNotMisattributeAmbiguousShapedErrors pins
+// classifyTriageError's other side: llmhealth.Classify's timeout/network/
+// canceled reasons match on generic stdlib shapes (context.DeadlineExceeded,
+// net.Error, url.Error) that any non-LLM failure in the sink call — a SQLite
+// write timing out, a Prometheus/Zabbix/log-source fetch failing — could
+// produce too. Trusting them here would misattribute a non-LLM failure as an
+// LLM dependency code, so classifyTriageError falls back to the generic code
+// for exactly these three ambiguous reasons and trusts only the reasons that
+// require an internal/llm- or internal/llmhealth-specific typed error no
+// other subsystem constructs.
+func TestTriageBackoffDoesNotMisattributeAmbiguousShapedErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"context deadline (e.g. a SQLite write timing out)", fmt.Errorf("store: save output: %w", context.DeadlineExceeded)},
+		{"context canceled (e.g. shutdown mid non-LLM call)", fmt.Errorf("store: save output: %w", context.Canceled)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newRetryHarness(t, 1)
+			h.sink.failErr = tc.err
+
+			h.flush()
+
+			tri := mustBackoffRow(t, h.st, h.inc.ID)
+			if tri.LastErrorCode != "triage_dispatch_failed" {
+				t.Fatalf("code = %q, want the generic fallback (a %v is not LLM-specific)", tri.LastErrorCode, tc.err)
+			}
+		})
+	}
+}
+
+// TestTriageBackoffRecordsLLMOriginTimeout pins the resolution of the
+// ambiguity above: a timeout/network/canceled error that Acute Triage marked
+// as LLM-origin (llmhealth.MarkLLMOrigin at its Complete boundary) IS
+// trustworthy, so the motivating production failure — a real Call-1 context
+// deadline — persists its capability-aware "timeout" code instead of the
+// generic fallback.
+func TestTriageBackoffRecordsLLMOriginTimeout(t *testing.T) {
+	h := newRetryHarness(t, 1)
+	h.sink.failErr = fmt.Errorf("acutetriage: llm: %w", llmhealth.MarkLLMOrigin(context.DeadlineExceeded))
+
+	h.flush()
+
+	tri := mustBackoffRow(t, h.st, h.inc.ID)
+	if tri.LastErrorCode != "timeout" {
+		t.Fatalf("code = %q, want timeout (the error is marked LLM-origin)", tri.LastErrorCode)
+	}
 }
 
 // TestTriageExhaustsToFailed: a sink that never recovers is retried through

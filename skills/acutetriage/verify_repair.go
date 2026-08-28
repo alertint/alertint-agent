@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/alertint/alertint-agent/internal/llm"
+	"github.com/alertint/alertint-agent/internal/llmhealth"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 )
 
@@ -170,10 +171,20 @@ func (s *Skill) repairModelPromQL(ctx context.Context, incidentID string, querie
 	stats.Attempted = len(issues)
 	out := slices.Clone(queries)
 
+	// The repair call is a real generation against the same provider, so its
+	// final typed outcome is observed like every other (ADR-0046) under its
+	// own capability: a failed call is a dependency failure, a reply that
+	// cannot be decoded — or that offers nothing the validator accepts — is a
+	// content failure (response_malformed, corroborated across Incidents like
+	// any other), and at least one accepted replacement is a success. The
+	// capability is reported in /health but never drives the rolled-up state
+	// (see llmhealth.CapabilityQueryRepair).
+	obs := s.cfg.Health.Begin(llmhealth.CapabilityQueryRepair, incidentID)
 	comp, callErr := s.llm.Complete(ctx, verificationRepairSystem, llm.Prompt{
 		Prefix:          repairPrompt(issues),
 		MaxOutputTokens: verificationRepairMaxOutputTokens,
 	}, []string{"queries"})
+	healthErr := llmhealth.MarkLLMOrigin(callErr)
 
 	// A reply that cannot be decoded at all is treated exactly like a failed
 	// call — no replacements, one call spent, the decode error folded into
@@ -181,6 +192,9 @@ func (s *Skill) repairModelPromQL(ctx context.Context, incidentID string, querie
 	var replacements map[int]string
 	if callErr == nil {
 		replacements, callErr = decodeRepairReplacements(comp.Raw, parseErr)
+		if callErr != nil {
+			healthErr = fmt.Errorf("%w: %v", llmhealth.ErrResponseMalformed, callErr)
+		}
 	}
 
 	// Revalidate every attempted index once, after application. A replacement
@@ -208,6 +222,13 @@ func (s *Skill) repairModelPromQL(ctx context.Context, incidentID string, querie
 		logger.Warn("acutetriage: verify: model promql invalid after one repair; not executed",
 			"incident", incidentID, "expr", out[i].Expr, "err", err, "repair_err", callErr)
 	}
+	if healthErr == nil && stats.Repaired == 0 {
+		healthErr = fmt.Errorf("%w: repair reply offered no replacement the validator accepted", llmhealth.ErrResponseMalformed)
+	}
+	// obs.Finish persists with its own bounded context.Background() by design:
+	// a query_repair observation must never be dropped because ctx was
+	// canceled around the call.
+	obs.Finish(healthErr) //nolint:contextcheck
 
 	// Counts only — never an expression, a parser string, or model output
 	// (R4/KTD6, same rule the planned/executed rows follow).

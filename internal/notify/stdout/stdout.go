@@ -101,7 +101,7 @@ func caveatText(f notify.Finding) string {
 		parts = append(parts, fmt.Sprintf("⚠ verification incomplete — %d metrics %s invalid; not used as evidence and confidence could not increase", n, noun))
 	}
 	if f.Unverified {
-		parts = append(parts, "⚠ unverified — checks unavailable")
+		parts = append(parts, notify.UnverifiedCaveat(f.DegradationReason, f.Drill))
 	}
 	return strings.Join(parts, "; ")
 }

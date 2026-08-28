@@ -111,6 +111,36 @@ func TestNotify_UnverifiedCaveat(t *testing.T) {
 	}
 }
 
+func TestNotify_DegradationReasonCaveatAndJSONKey(t *testing.T) {
+	var buf bytes.Buffer
+	n := New(&buf, nil, true)
+	f := notify.Finding{
+		IncidentID:        "test-incident",
+		GroupKey:          "test=group",
+		Unverified:        true,
+		DegradationReason: "llm_call_failed",
+	}
+	if err := n.Notify(context.Background(), f); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+
+	var line map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &line); err != nil {
+		t.Fatalf("line not valid JSON: %v (%q)", err, buf.String())
+	}
+	want := "⚠ unverified — verification call failed; confidence is the draft's"
+	if line["caveat"] != want {
+		t.Errorf("caveat = %v, want %q", line["caveat"], want)
+	}
+	finding, ok := line["finding"].(map[string]any)
+	if !ok {
+		t.Fatalf("finding key missing or wrong shape: %v", line["finding"])
+	}
+	if finding["degradation_reason"] != "llm_call_failed" {
+		t.Errorf("finding.degradation_reason = %v, want llm_call_failed", finding["degradation_reason"])
+	}
+}
+
 // TestNotify_InvalidQueryCaveat (Task 6): the invalid-query caveat is
 // structurally distinct from the Unverified/"checks unavailable" caveat —
 // it must render on its own when only queries are invalid, combine with the

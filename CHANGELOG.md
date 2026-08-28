@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Installation-level LLM dependency health. Real triage outcomes are observed
+  per capability (draft, verification re-judge, optional classifier); after
+  five idle minutes a zero-generation metadata `GET` probe checks reachability
+  (never a completion, never a prompt). State is durable and shown in
+  `GET /health` under `llm` without changing the liveness status. When Slack
+  is enabled, one brief `AlertINT system` message is posted after five
+  continuous unhealthy minutes and edited in place on recovery — never one
+  card per stuck incident. New `health` config block:
+  `llm_idle_probe_after_seconds` and `broadcast_after_seconds` (both 300).
+  (#60)
+- Verification degradation now records why the draft shipped:
+  `degradation_reason` is one of `llm_call_failed`, `llm_response_invalid`,
+  `verification_source_unavailable`, and the Slack/stdout caveat names it.
+  (#60)
+
 ### Fixed
 
 - Log enrichment no longer queries Loki over the incident's entire open span.
@@ -16,6 +33,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   New `logs.max_window_minutes` (default `120`, `0` = unbounded) clamps the
   window to the most recent N minutes; the prompt states when the earlier span
   was not fetched. (#63)
+- Triage retries are durable: an incident's dispatch phase, attempt count, and
+  next retry time live in a new `incident_triage` table, the incident is
+  `processing` while a triage call is in flight, and a restart mid-attempt
+  resumes the schedule instead of guessing. A same-group firing alert that
+  arrives while triage is in retry backoff joins the original incident
+  instead of opening a duplicate; clean skips, in-flight calls, and failed
+  incidents are not joined. Retry delays (30 s, 2 m, 8 m, 32 m) and the
+  five-attempt budget are unchanged. (#60)
 
 - Model-proposed PromQL verification checks are now parsed locally with the bundled official Prometheus parser. Invalid expressions get one batch repair call capped at 512 output tokens, are validated once more, and are never sent to Prometheus if still invalid. A repair is accepted only when it is a recognised rewrite of the original — one `sum` wrapper added to an expression that had none, scoped to exactly the term its orphaned `by`/`without` clause followed, that clause relocated onto it, a grouping clause respelled between the two forms of one aggregation's own modifier slot (`sum(x) by (t)` and `sum by (t) (x)`), and matchers reordered inside a single selector — and any other token change is rejected, so a repair cannot quietly move a selector, modifier or grouping clause onto a different operand, introduce `bool`/`group_left`/`group_right`/`offset`/`@ start()`, aggregate with something other than `sum`, wrap a truncated aggregation as if it were a metric of that name, add a second aggregation, or re-parenthesise the arithmetic. Residual invalid queries are logged with the expression, persisted/audited as `invalid`, treated as inconclusive for confidence, and shown separately from an unavailable metrics backend in Slack. Query-specific Prometheus `bad_data` responses remain a typed backend-authoritative fallback; unrelated bad request parameters remain backend failures. Normal verification stays at two LLM calls; only a malformed query plan can add the single repair call. Reported in #62.
 

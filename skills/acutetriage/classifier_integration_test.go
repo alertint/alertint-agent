@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/audit"
+	"github.com/alertint/alertint-agent/internal/llmhealth"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/skills/acutetriage"
 )
@@ -22,14 +23,27 @@ type clsRun struct {
 	incID  string       // the analyzed incident id
 }
 
+// classifierOpts extends classifierScenario without breaking its many
+// positional-arg callers: err forces the classifier fake's Complete to fail
+// (instead of returning classifierResp), health wires Config.Health.
+type classifierOpts struct {
+	err    error
+	health *llmhealth.Tracker
+}
+
 // classifierScenario seeds a rung-3a recall: no exact-key priors, one weak
 // prefilter candidate that is one group-label off. It runs one triage with the
 // given classifier mode + a classifier fake.
-func classifierScenario(t *testing.T, mode string, classifierResp json.RawMessage) clsRun {
+func classifierScenario(t *testing.T, mode string, classifierResp json.RawMessage, opts ...classifierOpts) clsRun {
 	t.Helper()
 	ctx := context.Background()
 	st := newTestStore(t)
 	auditor := audit.New(st.DB())
+
+	var o classifierOpts
+	if len(opts) > 0 {
+		o = opts[0]
+	}
 
 	inc := insertTestIncident(t, st, ctx)
 	a1 := insertTestAlert(t, st, ctx, inc.ID, "fp-cls", map[string]string{"alertname": "DiskFull", "host": "web1"})
@@ -44,7 +58,7 @@ func classifierScenario(t *testing.T, mode string, classifierResp json.RawMessag
 		},
 	}}
 	triageFake := &fakeLLM{response: validLLMResponse([]string{a1.ID})}
-	classifierFake := &fakeLLM{response: classifierResp}
+	classifierFake := &fakeLLM{response: classifierResp, err: o.err}
 
 	skill := acutetriage.New(acutetriage.Config{
 		MinAlerts:      1,
@@ -52,6 +66,7 @@ func classifierScenario(t *testing.T, mode string, classifierResp json.RawMessag
 		MemoryParams:   acutetriage.MemoryParams{LookbackDays: 90},
 		Classifier:     classifierFake,
 		ClassifierMode: mode,
+		Health:         o.health,
 	}, st, triageFake, auditor, nil, nil)
 
 	if err := skill.Run(ctx, inc); err != nil {

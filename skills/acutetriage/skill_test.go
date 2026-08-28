@@ -20,6 +20,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/llm"
+	"github.com/alertint/alertint-agent/internal/llmhealth"
 	"github.com/alertint/alertint-agent/internal/notify"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/rules"
@@ -371,6 +372,32 @@ func TestRunLLMError(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("analysis_failed audit rows = %d, want 1", n)
+	}
+}
+
+// TestRunLLMErrorIsMarkedLLMOrigin pins the Call-1 boundary contract the
+// Correlator relies on: a failed Complete propagates out of Run wrapped in
+// llmhealth's LLM-origin marker, so an ambiguous stdlib-shaped failure (here a
+// context deadline) can still persist its capability-aware triage code
+// without the Correlator guessing that a deadline came from the LLM.
+func TestRunLLMErrorIsMarkedLLMOrigin(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-origin", map[string]string{"alertname": "Y"})
+
+	fllm := &fakeLLM{err: fmt.Errorf("anthropic: %w", context.DeadlineExceeded)}
+	skill := acutetriage.New(acutetriage.Config{MinAlerts: 1}, st, fllm, nil, nil, nil)
+
+	err := skill.Run(ctx, inc)
+	if err == nil {
+		t.Fatal("expected error from llm, got nil")
+	}
+	if !llmhealth.IsLLMOrigin(err) {
+		t.Fatalf("Run error %v is not marked LLM-origin", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run error %v lost the underlying deadline", err)
 	}
 }
 

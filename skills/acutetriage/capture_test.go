@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/llm"
+	"github.com/alertint/alertint-agent/internal/llmhealth"
 	"github.com/alertint/alertint-agent/internal/notify"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/rules"
@@ -803,5 +805,187 @@ func TestGrade_RepeatCallRegrades(t *testing.T) {
 	}
 	if len(annsAfterSecond) != len(annsAfterFirst) {
 		t.Fatalf("repeat call wrote a new annotation row: %d != %d", len(annsAfterSecond), len(annsAfterFirst))
+	}
+}
+
+// blockingLLM holds every completion until its ctx is canceled.
+type blockingLLM struct {
+	started chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingLLM) Complete(ctx context.Context, _ string, _ llm.Prompt, _ []string) (llm.Completion, error) {
+	b.once.Do(func() { close(b.started) })
+	<-ctx.Done()
+	return llm.Completion{}, ctx.Err()
+}
+
+// TestCaptureEngineCloseJoinsGrading: grading's live LLM calls are LLM
+// capability observations (in flight while they run — fencing the idle
+// probe — and reported when they finish). http.Server.Shutdown does not
+// interrupt an MCP handler mid-grade, so the engine must be closable: Close
+// cancels the grade (shutdown-driven cancellation is ignored, H1) and
+// returns only once no grade is running, so the owner can stop the health
+// runner knowing no producer is left.
+func TestCaptureEngineCloseJoinsGrading(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	prom := promHealthy(t)
+	inc := seedGradableIncident(t, st, prom)
+	tr, err := llmhealth.New(ctx, st, llmhealth.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := verifyConfig(prom)
+	cfg.Health = tr
+	gradeLLM := &blockingLLM{started: make(chan struct{})}
+	eng := acutetriage.NewCaptureEngine(acutetriage.New(cfg, st, gradeLLM, audit.New(st.DB()), notify.NewMulti(nil, &fakeAnnotationSink{}), nil))
+
+	type outcome struct {
+		res *acutetriage.CaptureResult
+		err error
+	}
+	got := make(chan outcome, 1)
+	go func() {
+		res, err := eng.CaptureVerdict(ctx, acutetriage.CaptureRequest{
+			IncidentID: inc.ID, Verdict: "correction",
+			Expectation: json.RawMessage(`{"must_mention":["worker-14"]}`),
+		})
+		got <- outcome{res, err}
+	}()
+	<-gradeLLM.started
+	if n := tr.Snapshot().InFlight; n != 1 {
+		t.Fatalf("in_flight during grading = %d, want 1: a grading call must fence the idle probe", n)
+	}
+
+	cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := eng.Close(cctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case o := <-got:
+		if o.err != nil || !o.res.ReplayFailed {
+			t.Fatalf("after Close: err=%v res=%+v, want a captured verdict with replay_failed", o.err, o.res)
+		}
+	default:
+		t.Fatal("Close returned while the grade was still running")
+	}
+	snap := tr.Snapshot()
+	if snap.InFlight != 0 || snap.LastRealSuccessAt != nil || len(snap.Capabilities) != 0 {
+		t.Fatalf("a shutdown-canceled grade must leave no observation: %+v", snap)
+	}
+	// A call that begins after Close is refused before it touches the store:
+	// the store is about to close behind the engine, so nothing may start a
+	// persist phase the owner can no longer wait for. The operator's verdict
+	// is not lost — it was never accepted; the MCP caller gets a clear error.
+	late, err := eng.CaptureVerdict(ctx, acutetriage.CaptureRequest{
+		IncidentID: inc.ID, Verdict: "confirmation",
+		Expectation: json.RawMessage(`{"must_mention":["worker-14"]}`),
+	})
+	if !errors.Is(err, acutetriage.ErrCaptureClosed) || late != nil {
+		t.Fatalf("capture after Close: err=%v res=%+v, want ErrCaptureClosed and no result", err, late)
+	}
+	if v, err := st.LatestIncidentVerdict(ctx, inc.ID); err != nil || v == nil || v.Version != 1 {
+		t.Fatalf("a refused capture must persist nothing: latest verdict = %+v (err %v), want v1 only", v, err)
+	}
+	if _, err := eng.Annotate(ctx, acutetriage.AnnotateRequest{IncidentID: inc.ID, Kind: "observation", Note: "late"}); !errors.Is(err, acutetriage.ErrCaptureClosed) {
+		t.Fatalf("annotate after Close: err=%v, want ErrCaptureClosed", err)
+	}
+	if n := tr.Snapshot().InFlight; n != 0 {
+		t.Fatalf("a refused call must not touch the tracker: in_flight=%d", n)
+	}
+}
+
+// blockingSink holds the annotation fan-out (the last step of the persist
+// phase, strictly before grading) until released.
+type blockingSink struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingSink) Name() string                                 { return "blocking" }
+func (b *blockingSink) Notify(context.Context, notify.Finding) error { return nil }
+func (b *blockingSink) OnAnnotation(context.Context, notify.AnnotationEvent) error {
+	b.once.Do(func() { close(b.started) })
+	<-b.release
+	return nil
+}
+
+// TestCaptureEngineCloseWaitsForThePersistPhase: the engine's join must cover
+// the WHOLE Captured-verdict operation, not just its grade. A handler still
+// persisting (store writes, audit, widening, fan-out) is invisible to an
+// http.Server.Shutdown that has given up, so if Close could return while one
+// is in the persist phase, the owner would close the store underneath it —
+// and the runner's final pass would run with a producer about to enter
+// grading. Close returns only once the operation has left; the operation
+// itself completes its persist (the verdict lands) and only its grade is
+// refused.
+func TestCaptureEngineCloseWaitsForThePersistPhase(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	prom := promHealthy(t)
+	inc := seedGradableIncident(t, st, prom)
+	tr, err := llmhealth.New(ctx, st, llmhealth.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := verifyConfig(prom)
+	cfg.Health = tr
+	sink := &blockingSink{started: make(chan struct{}), release: make(chan struct{})}
+	gradeLLM := &blockingLLM{started: make(chan struct{})}
+	eng := acutetriage.NewCaptureEngine(acutetriage.New(cfg, st, gradeLLM, audit.New(st.DB()), notify.NewMulti(nil, sink), nil))
+
+	type outcome struct {
+		res *acutetriage.CaptureResult
+		err error
+	}
+	got := make(chan outcome, 1)
+	go func() {
+		res, err := eng.CaptureVerdict(ctx, acutetriage.CaptureRequest{
+			IncidentID: inc.ID, Verdict: "correction",
+			Expectation: json.RawMessage(`{"must_mention":["worker-14"]}`),
+		})
+		got <- outcome{res, err}
+	}()
+	<-sink.started // the operation is mid-persist, before enterGrade
+
+	closed := make(chan error, 1)
+	go func() {
+		cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		closed <- eng.Close(cctx)
+	}()
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned (%v) while a capture was still in its persist phase; the owner would close the store underneath it", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	close(sink.release)
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not return once the operation left")
+	}
+	select {
+	case o := <-got:
+		if o.err != nil || !o.res.ReplayFailed || o.res.Version != 1 {
+			t.Fatalf("operation overlapping Close: err=%v res=%+v, want the verdict persisted (v1) and only the grade refused", o.err, o.res)
+		}
+	default:
+		t.Fatal("Close returned before the operation did")
+	}
+	select {
+	case <-gradeLLM.started:
+		t.Fatal("a grade must not start once Close has begun")
+	default:
+	}
+	if v, err := st.LatestIncidentVerdict(ctx, inc.ID); err != nil || v == nil || v.Version != 1 {
+		t.Fatalf("persist phase must complete before Close returns: latest verdict = %+v (err %v)", v, err)
 	}
 }
