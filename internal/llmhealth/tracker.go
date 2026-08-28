@@ -196,13 +196,15 @@ func New(ctx context.Context, st *store.Store, opts Options) (*Tracker, error) {
 	}, nil
 }
 
-// Seal ends observation for good: the Runner calls it after its final
-// delivery pass, so the state that pass acknowledged is the state that
-// survives. Owners join every producer before that pass; a join can still
-// time out on a wedged handler, and whatever finishes after Seal is dropped
-// with a warning — it can neither move the durable state behind the
-// acknowledgment, kick a Runner that is gone, nor write to a store that is
-// closing. Nil-safe.
+// Seal ends observation for good: the Runner calls it BEFORE its final
+// delivery pass, so that pass acknowledges one immutable snapshot and the
+// state it acknowledged is the state that survives. Owners join every
+// producer before that pass; a join can still time out on a wedged handler,
+// and whatever finishes after Seal is dropped with a warning — it can
+// neither move the durable state behind (or under) the acknowledgment,
+// kick a Runner that is gone, nor write to a store that is closing. Slack
+// delivery is not observation: Deliver's own mutations (root coordinates,
+// delivery markers, late-root edits) proceed on a sealed Tracker. Nil-safe.
 func (t *Tracker) Seal() {
 	if t == nil {
 		return

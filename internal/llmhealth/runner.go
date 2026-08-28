@@ -115,21 +115,27 @@ func (r *Runner) Start(ctx context.Context) <-chan struct{} {
 // Stop, so once the channel from Start closes every transition the final
 // state implies has been attempted and its outcome recorded (delivered,
 // pending retry, or indeterminate) — nothing is left for a restart that a
-// live process could still have done. The pass ends by sealing the Tracker:
-// an owner whose join timed out on a wedged producer proceeds knowing that
-// whatever it still reports is dropped, never a transition nobody
-// acknowledged.
+// live process could still have done. The pass begins by sealing the
+// Tracker — the observation cutoff — so it acknowledges one immutable
+// snapshot: an owner whose join timed out on a wedged producer proceeds
+// knowing that whatever it still reports is dropped, never a transition
+// nobody acknowledged.
 func (r *Runner) Stop() { r.stopOnce.Do(func() { close(r.stopCh) }) }
 
-// finalDeliver is Stop's acknowledgment pass. Deliver applies its own
-// per-call and whole-phase bounds; the outer bound only keeps a wedged
-// publisher from holding the owner past DrainTimeout. The Tracker is sealed
-// once the pass has recorded its outcomes.
+// finalDeliver is Stop's acknowledgment pass. The Tracker is sealed FIRST:
+// the seal is the observation cutoff, and the pass must acknowledge one
+// immutable snapshot. Sealing after the pass would let a producer the owner
+// failed to join move the aggregate while the pass's POST is in flight —
+// the returning root would be adopted as recovery-pending with nobody left
+// to make that edit. Delivery's own mutations (coordinates, markers, late
+// roots) are not observations and proceed on a sealed Tracker. Deliver
+// applies its own per-call and whole-phase bounds; the outer bound only
+// keeps a wedged publisher from holding the owner past DrainTimeout.
 func (r *Runner) finalDeliver() {
+	r.t.Seal()
 	ctx, cancel := context.WithTimeout(context.Background(), deliveryBudget+deliveryTimeout)
 	defer cancel()
 	r.t.Deliver(ctx, r.pub)
-	r.t.Seal()
 }
 
 // Run loops until Stop is called (final delivery pass, then return) or ctx

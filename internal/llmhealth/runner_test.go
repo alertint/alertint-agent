@@ -752,3 +752,46 @@ func TestStopSealsTheTrackerAfterTheFinalPass(t *testing.T) {
 		t.Fatalf("late observation persisted: %+v", rec)
 	}
 }
+
+// TestFinalPassAcknowledgesOneSealedSnapshot: the observation cutoff must
+// come BEFORE the final delivery pass, not after it. A Close that timed out
+// means a producer may still exist; if it could finish while the pass's
+// POST is in flight, the aggregate would move after the delivery plan was
+// computed — the returning root gets adopted as recovery-pending and the
+// pass then seals without anyone left to make the recovery edit, leaving
+// the sole System message falsely "unavailable" until restart. With the
+// seal first, the pass acknowledges one immutable snapshot and the late
+// observation is dropped.
+func TestFinalPassAcknowledgesOneSealedSnapshot(t *testing.T) {
+	tr, st, c, _ := newTracker(t)
+	pub := &blockingPub{fakePub: &fakePub{}, started: make(chan struct{}), release: make(chan struct{})}
+	r := llmhealth.NewRunner(tr, nil, pub, nil)
+	llmhealth.SetRunnerTickForTest(time.Hour)
+	tr.Begin(llmhealth.CapabilityTriageDraft, "i").Finish(err503)
+	<-tr.Kick() // drain: the root must be posted by the final pass, not a step
+	c.add(5 * time.Minute)
+	late := tr.Begin(llmhealth.CapabilityTriageDraft, "unjoined") // a producer the owner failed to join in time
+
+	done := r.Start(context.Background())
+	r.Stop()
+	<-pub.started    // final pass: root POST in flight
+	late.Finish(nil) // reports success behind the plan
+	close(pub.release)
+	select {
+	case <-done:
+	case <-time.After(llmhealth.DrainTimeout()):
+		t.Fatal("runner did not stop within DrainTimeout")
+	}
+
+	snap := tr.Snapshot()
+	rec, _, err := st.GetLLMHealth(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.State != llmhealth.StateUnavailable || rec.SlackDelivery != llmhealth.DeliveryDelivered || pub.postCount() != 1 || pub.updateCount() != 0 {
+		t.Fatalf("late observation moved the acknowledged state: state=%s slack_delivery=%q posts=%d updates=%d; want unavailable/delivered/1/0", snap.State, rec.SlackDelivery, pub.postCount(), pub.updateCount())
+	}
+	if rec.LastRealSuccessAt != nil {
+		t.Fatalf("late success persisted: %+v", rec)
+	}
+}
