@@ -282,9 +282,9 @@ are a separate, future architecture item.
 
 The configured LLM is an installation-level dependency, observed below Acute
 Triage rather than owned by any Incident or Situation. Each distinct use of
-the LLM — the triage draft (Call 1), the verification re-judgment (Call 2),
-the optional memory classifier, and the idle probe — is its own **LLM
-capability**, cleared only by its own success:
+the LLM — the triage draft (Call 1), the bounded PromQL query repair, the
+verification re-judgment (Call 2), the optional memory classifier, and the
+idle probe — is its own **LLM capability**, cleared only by its own success:
 
 - A `triage_draft` failure makes the installation `unavailable`; a
   `verification_rejudge` failure makes it `degraded` while drafts continue
