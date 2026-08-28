@@ -454,15 +454,16 @@ func stopLLMHealthRunner(r *llmhealth.Runner, done <-chan struct{}, logger *slog
 // shutdown-driven cancellation — and persists in progress complete. A join
 // that times out means an operation is wedged past every bound it has: the
 // process still exits, but not as if the runner's precondition held — the
-// runner seals the tracker after its final pass, so whatever that operation
-// reports later is dropped, and its store access fails against a closed
-// store rather than moving state nobody acknowledged.
+// runner seals the tracker BEFORE its final pass (the observation cutoff),
+// so the pass acknowledges one immutable snapshot, whatever that operation
+// reports from then on is dropped, and its store access fails against a
+// closed store rather than moving state nobody acknowledged.
 func closeCaptureEngine(eng *acutetriage.CaptureEngine, logger *slog.Logger) {
 	ctx, cancel := context.WithTimeout(context.Background(), ingress.DefaultShutdownTimeout)
 	defer cancel()
 	if err := eng.Close(ctx); err != nil {
 		logger.Error("a verdict capture or annotation did not finish within the shutdown window; "+
-			"its late LLM observation will be dropped after the health runner's final pass and its store access will fail",
+			"the health runner seals observation before its final pass, so its late LLM observation will be dropped and its store access will fail",
 			slog.String("err", err.Error()))
 	}
 }

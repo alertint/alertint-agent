@@ -325,7 +325,8 @@ type TriageExhaustedEvent struct {
 // TriageFailureSink is an optional capability: a Notifier that also renders a
 // triage-exhausted event. Sinks that don't implement it are skipped; the Slack
 // sink deliberately does not, so an LLM outage never becomes one card per
-// stuck incident (the Situation controller surfaces it as dependency health).
+// stuck incident: installation-level LLM dependency health (internal/llmhealth)
+// surfaces it once, as the `AlertINT system` message and in GET /health.
 type TriageFailureSink interface {
 	OnTriageExhausted(ctx context.Context, ev TriageExhaustedEvent) error
 }

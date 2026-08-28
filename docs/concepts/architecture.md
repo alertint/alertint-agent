@@ -319,9 +319,11 @@ idle probe — is its own **LLM capability**, cleared only by its own success:
   them.
 
 **Honest limitation:** the same synchronous-Correlator-loop limitation above
-applies here — a Call 1/Call 2/probe in flight pauses correlation for its
-duration, so LLM dependency health is observed from real work, not a
-side-channel canary.
+applies to the Acute Triage calls the Correlator makes — a Call 1/Call 2 in
+flight pauses correlation for its duration. The idle probe does not: it runs
+on the health runner's own goroutine, as do Captured-verdict replay calls
+(MCP request goroutines). LLM dependency health is observed from real work
+first; the probe is only a GET-only fallback after five idle minutes.
 
 ## Audit log
 
