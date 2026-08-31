@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+
+contact_links:
+  - name: Questions and support
+    url: https://github.com/alertint/alertint-agent/discussions/categories/q-a
+    about: Ask configuration, compatibility, and usage questions in Discussions.
+
+  - name: Ideas
+    url: https://github.com/alertint/alertint-agent/discussions/categories/ideas
+    about: Share early or exploratory ideas before opening a scoped feature request.
+
+  - name: Security vulnerability
+    url: https://github.com/alertint/alertint-agent/security/policy
+    about: Report vulnerabilities privately; never include security details in a public issue.

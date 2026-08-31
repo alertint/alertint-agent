@@ -20,9 +20,17 @@ A single Go binary that sits between your monitoring stack and your AI agent. It
 
 ## Get started
 
-The **[Quickstart](https://alertint.com/docs/getting-started/quickstart)** is
-the canonical walkthrough — install (single binary or bundled Docker Compose
-stack), configure, and prove the whole pipeline with one command:
+Install the binary with Go:
+
+```bash
+go install github.com/alertint/alertint-agent/cmd/alertint@latest
+```
+
+The released multi-architecture Docker image is
+`ghcr.io/alertint/alertint-agent:latest`. The
+**[Quickstart](https://alertint.com/docs/getting-started/quickstart)** is the
+canonical walkthrough for the bundled Docker Compose stack, configuration,
+and proving the whole pipeline with one command:
 
 ```bash
 alertint drill --config config.yaml
@@ -57,6 +65,7 @@ the MCP surface — is diagrammed and walked through step by step in
 - **[Verification round](https://alertint.com/docs/concepts/verification-round)** and **[incident memory](https://alertint.com/docs/concepts/incident-memory)** — how triage checks itself and learns from corrections
 - **[Scope and limits](https://alertint.com/docs/concepts/scope-and-limits)** — what it will and won't do
 - **[FAQ](https://alertint.com/docs/concepts/faq)**
+- **[Changelog](CHANGELOG.md)** — notable changes and upgrade notes by release
 
 The [`/docs`](docs/) folder in this repo is the canonical source for those pages — the website renders it at build time. Documentation PRs are welcome here; see [`docs/README.md`](docs/README.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
 
