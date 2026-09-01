@@ -49,6 +49,28 @@ func foundationGroupPayload(group, alertname, fingerprint string, at time.Time) 
 	}
 }
 
+// foundationResolvedPayload builds a one-alert "resolved" Alertmanager v4
+// envelope for the SAME fingerprint foundationGroupPayload used — the
+// follow-up delivery TestFoundationReconstructionInvokesNoOutwardSurface
+// needs to actually reach Correlator.applyResolvedDeliveryPlan's
+// OnIncidentResolved branch, not just a fresh firing delivery that never
+// exercises it.
+func foundationResolvedPayload(group, alertname, fingerprint string, startsAt, endsAt time.Time) AlertmanagerPayload {
+	return AlertmanagerPayload{
+		Version:     "4",
+		Status:      "resolved",
+		GroupLabels: map[string]string{"group": group},
+		Alerts: []AlertmanagerAlert{{
+			Status:      "resolved",
+			Labels:      map[string]string{"alertname": alertname, "group": group},
+			Annotations: map[string]string{},
+			StartsAt:    startsAt,
+			EndsAt:      endsAt,
+			Fingerprint: fingerprint,
+		}},
+	}
+}
+
 // openFoundationHost wires a real file-backed Store behind a real
 // ingress.Server (one Alertmanager receiver, real Auditor) and returns an
 // httptest.Server plus the Store and its on-disk path, so a test can POST
@@ -375,17 +397,44 @@ func TestFoundationStoreAcceptanceFailureReturns503WithZeroCommittedRows(t *test
 // window-expiry sink, not anything ApplyDelivery reaches directly. What
 // IS reachable from ApplyDelivery, and so needs an explicit fake to prove
 // silent, is the Correlator's own outward surface: its IncidentSink,
-// ResolutionNotifier, OccurrenceNotifier, and Auditor. This test wires
-// fakes for all four directly onto the Correlator BEFORE calling
-// Reconstruct.Run — the worst case, deliberately not the safe ordering
-// cmd/alertint follows — and still observes zero calls, because a fresh
-// firing delivery for a brand-new group reaches none of the four
-// (resolution/occurrence/audit trigger only on resolved/recurrence/retry-
-// attach paths this fixture never exercises). This complements, not
-// duplicates, internal/situation/reconstruct_test.go's own non-vacuous
-// proof (a fixture that WOULD leak if wired early) at the correlator-
-// internals level; this one is driven from the real receiver HTTP
-// boundary.
+// ResolutionNotifier, OccurrenceNotifier, and Auditor.
+//
+// A lone fresh firing delivery reaches NONE of those four — resolution,
+// occurrence, and audit calls only trigger on resolved/recurrence/retry-
+// attach paths a single firing delivery never exercises, which would make
+// a bare zero-calls assertion vacuous (it would pass identically whether
+// or not reconstruction ever wired a notifier early). So this fixture
+// queues a second, resolved delivery for the SAME fingerprint after
+// moving the Incident to "ready" — once that Incident is no longer
+// "collecting", applying its resolved follow-up routes through
+// Correlator.applyResolvedDeliveryPlan, which fully resolves the
+// Incident's only member and explicitly checks
+// "result.Resolved && c.resolutionNotifier != nil" before calling
+// OnIncidentResolved. Reconstruction drains that queued resolved
+// delivery, so this really does reach the outward surface: the test
+// asserts the Incident actually resolved (proving the branch was hit),
+// separately from asserting the notifier fake saw zero calls.
+//
+// There is no structural guard inside Reconstructor/DispatchWorker that
+// suppresses notifications during a reconstruction pass — the SAME
+// Correlator/DispatchWorker instance drains dispatches during
+// reconstruction and during ordinary live operation afterward. The only
+// thing that keeps reconstruction silent in production is cmd/alertint's
+// wiring order (see cmd/alertint/main.go's foundationSequence):
+// SetResolutionNotifier/SetOccurrenceNotifier are called only from
+// startCorrelator, strictly AFTER Reconstruct() returns — the fix for the
+// exact ordering bug internal/situation/reconstruct_test.go's
+// TestNotifiersWiredBeforeReconstructionWouldLeakOutward (Task 8) proves
+// would otherwise leak. This test reproduces that same safe ordering
+// (wire IncidentSink/Auditor immediately — matching cmd/alertint, and
+// harmless since neither is reachable from this fixture either — then
+// wire ResolutionNotifier/OccurrenceNotifier only after Run returns) so
+// its zero-calls assertion is a real consequence of that discipline, not
+// an artifact of a fixture that could never reach the branch regardless
+// of wiring order. This complements, not duplicates,
+// internal/situation/reconstruct_test.go's own pair of tests (Task 8) at
+// the correlator-internals level; this one is driven from the real
+// receiver HTTP boundary, through a crash and restart.
 // ----------------------------------------------------------------------
 
 type foundationOutwardSpy struct {
@@ -431,6 +480,35 @@ func TestFoundationReconstructionInvokesNoOutwardSurface(t *testing.T) {
 	at := time.Date(2026, 9, 1, 3, 0, 0, 0, time.UTC)
 	postAndExpect204(t, srv, foundationGroupPayload("silent-reconstruction", "Quiet", "fp-silent", at))
 
+	// Correlate and settle the firing delivery to "ready" BEFORE the crash,
+	// with a plain (no notifier) Correlator — ordinary pre-crash server
+	// operation, not the property under test. Without this, the resolved
+	// follow-up below would land on a still-"collecting" Incident and
+	// never reach the resolved-Incident notify branch at all.
+	preCrashCor := correlator.New(correlator.Config{WindowSeconds: 60}, st, nil, nil)
+	preCrashDispatch := correlator.NewDispatchWorker(st, preCrashCor, correlator.WorkerConfig{Owner: "precrash:dispatch"}, nil)
+	if _, err := preCrashDispatch.Drain(ctx); err != nil {
+		t.Fatalf("pre-crash dispatch drain: %v", err)
+	}
+	var incidentID string
+	if err := st.DB().QueryRowContext(ctx, `SELECT id FROM incidents LIMIT 1`).Scan(&incidentID); err != nil {
+		t.Fatalf("read incident id: %v", err)
+	}
+	if err := st.MarkIncidentReady(ctx, incidentID); err != nil {
+		t.Fatalf("mark incident ready: %v", err)
+	}
+
+	// Queue a resolved follow-up for the SAME fingerprint. Its dispatch
+	// stays pending until reconstruction drains it; once the Incident is
+	// "ready" (not "collecting"), applying a resolved delivery for its
+	// only member routes through Correlator.applyResolvedDeliveryPlan,
+	// which fully resolves the Incident and explicitly checks
+	// result.Resolved && c.resolutionNotifier != nil before calling
+	// OnIncidentResolved — the actual outward surface a Task-8-style
+	// ordering bug would leak from. Without this follow-up, the
+	// zero-outward-calls assertion below would be vacuous.
+	postAndExpect204(t, srv, foundationResolvedPayload("silent-reconstruction", "Quiet", "fp-silent", at, at.Add(time.Minute)))
+
 	srv.Close()
 	if err := st.Close(); err != nil {
 		t.Fatalf("close store: %v", err)
@@ -441,33 +519,64 @@ func TestFoundationReconstructionInvokesNoOutwardSurface(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = st2.Close() })
 
-	// The pre-crash POST above already appended its own "alert.received"
-	// audit row through the real receiver/Auditor path — that is normal
+	// The pre-crash POSTs above already appended their own "alert.received"
+	// audit rows through the real receiver/Auditor path — that is normal
 	// receiver acknowledgment, not reconstruction, so this test compares
 	// the count reconstruction itself adds, not the table's raw total.
 	auditBefore := countRows(t, st2, `SELECT COUNT(*) FROM audit_log`)
 
 	spy := &foundationOutwardSpy{}
+	// IncidentSink and Auditor are wired from construction, matching
+	// cmd/alertint's real ordering exactly (see the comment block above) —
+	// harmless here since this fixture never reaches either's call sites.
+	// ResolutionNotifier/OccurrenceNotifier are deliberately NOT wired yet:
+	// cmd/alertint only wires those from startCorrelator, strictly after
+	// Reconstruct() returns.
 	cor := correlator.New(correlator.Config{WindowSeconds: 60}, st2, spy, nil)
-	// Deliberately the UNSAFE ordering — wire every outward surface before
-	// reconstruction runs, not after, so a zero count here is not vacuous.
-	cor.SetResolutionNotifier(spy)
-	cor.SetOccurrenceNotifier(spy)
 	cor.SetAuditor(spy)
 
 	dispatch := correlator.NewDispatchWorker(st2, cor, correlator.WorkerConfig{Owner: "silent:dispatch"}, nil)
 	inputs := situation.NewInputWorker(st2, situation.WorkerConfig{Owner: "silent:input"}, nil)
-	r := situation.NewReconstructor(st2, func() time.Time { return at.Add(time.Minute) }).WithReplay(dispatch, inputs)
+	r := situation.NewReconstructor(st2, func() time.Time { return at.Add(time.Hour) }).WithReplay(dispatch, inputs)
 
 	report, err := r.Run(ctx)
 	if err != nil {
 		t.Fatalf("reconstruct: %v", err)
 	}
-	if report.ReplayedDeliveries != 1 || report.ReplayedInputs != 1 {
-		t.Fatalf("report = %+v, want real work to have happened (otherwise zero outward calls would be vacuous)", report)
+	if report.ReplayedDeliveries != 1 {
+		t.Fatalf("replayed deliveries = %d, want 1 (the queued resolved follow-up; the firing delivery was already applied pre-crash)", report.ReplayedDeliveries)
 	}
+	if report.ReplayedInputs < 1 {
+		t.Fatalf("replayed inputs = %d, want at least 1", report.ReplayedInputs)
+	}
+
+	// Prove the fixture actually reached the branch this test exists to
+	// guard: the Incident really did resolve during reconstruction — only
+	// the NOTIFICATION must have been suppressed, not the resolution
+	// itself. Without this check, a bug that skipped resolution entirely
+	// would also read as "zero outward calls" and pass for the wrong
+	// reason. Confirmed empirically too: wiring SetResolutionNotifier
+	// BEFORE r.Run above (the unsafe order Task 8 fixed) makes this exact
+	// fixture deliver exactly one OnIncidentResolved call — proof this
+	// fixture is live, not inert.
+	var incidentStatus string
+	if err := st2.DB().QueryRowContext(ctx, `SELECT status FROM incidents WHERE id = ?`, incidentID).Scan(&incidentStatus); err != nil {
+		t.Fatalf("read incident status: %v", err)
+	}
+	if incidentStatus != "resolved" {
+		t.Fatalf("incident status after reconstruction = %s, want resolved (otherwise this test is vacuous)", incidentStatus)
+	}
+
 	if got := spy.total(); got != 0 {
-		t.Fatalf("outward calls during reconstruction = %d, want 0", got)
+		t.Fatalf("outward calls during reconstruction (Auditor/IncidentSink only — ResolutionNotifier/OccurrenceNotifier not wired yet) = %d, want 0", got)
+	}
+
+	// NOW wire the deferred notifiers, exactly where cmd/alertint's
+	// startCorrelator does: strictly after reconstruction, never before.
+	cor.SetResolutionNotifier(spy)
+	cor.SetOccurrenceNotifier(spy)
+	if got := spy.total(); got != 0 {
+		t.Fatalf("wiring the deferred notifiers after reconstruction must not itself trigger a call: got %d", got)
 	}
 	if got := countRows(t, st2, `SELECT COUNT(*) FROM audit_log`); got != auditBefore {
 		t.Fatalf("audit_log rows: %d before reconstruction, %d after — reconstruction itself must never audit", auditBefore, got)
