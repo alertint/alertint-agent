@@ -4,6 +4,7 @@ package correlator
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"testing"
 	"time"
@@ -83,6 +84,9 @@ func situationInputKinds(t *testing.T, st *store.Store, incidentID string) []str
 			t.Fatal(err)
 		}
 		out = append(out, k)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate situation inputs: %v", err)
 	}
 	return out
 }
@@ -208,6 +212,8 @@ func TestApplyDelivery_JoinsExistingCollectingIncident(t *testing.T) {
 func TestApplyDelivery_RetryAttachBeforeRecurrence(t *testing.T) {
 	st := openStore(t)
 	c := New(Config{}, st, NopIncidentSink{}, nil)
+	aud := &fakeAuditor{}
+	c.SetAuditor(aud)
 	now := time.Date(2026, 9, 1, 3, 0, 0, 0, time.UTC)
 	member := firingAlert("fp-orig", "DiskFull", "warning", now.Add(-time.Hour), false)
 	insertBackoffIncident(t, st, "inc-backoff", gkAPI, now.Add(-time.Hour), member)
@@ -232,6 +238,19 @@ func TestApplyDelivery_RetryAttachBeforeRecurrence(t *testing.T) {
 	kinds := situationInputKinds(t, st, "inc-backoff")
 	if len(kinds) != 1 || kinds[0] != "membership_changed" {
 		t.Fatalf("situation input kinds = %v, want [membership_changed]", kinds)
+	}
+	// The durable path re-emits the triage_member_attached audit event
+	// retry_attach.go's legacy path used to write.
+	rows := aud.rowsOfKind("incident.triage_member_attached")
+	if len(rows) != 1 {
+		t.Fatalf("triage_member_attached audit rows = %d, want 1", len(rows))
+	}
+	if rows[0].payload["incident_id"] != "inc-backoff" || rows[0].payload["group_key"] != gkAPI || rows[0].payload["alert_id"] != claim.Delivery.Alert.ID {
+		t.Fatalf("triage_member_attached audit payload = %+v, want incident_id=inc-backoff group_key=%s alert_id=%s",
+			rows[0].payload, gkAPI, claim.Delivery.Alert.ID)
+	}
+	if mc, ok := rows[0].payload["member_count"].(int); !ok || mc != 2 {
+		t.Fatalf("triage_member_attached audit member_count = %v, want 2", rows[0].payload["member_count"])
 	}
 }
 
@@ -295,8 +314,10 @@ func TestApplyDelivery_RecurrenceCollapseAttachesOccurrenceAndNotifies(t *testin
 	c := New(Config{}, st, NopIncidentSink{}, nil)
 	notifier := &fakeOccNotifier{}
 	rejudger := &fakeRejudger{}
+	aud := &fakeAuditor{}
 	c.SetOccurrenceNotifier(notifier)
 	c.SetRejudger(rejudger)
+	c.SetAuditor(aud)
 	now := time.Date(2026, 7, 8, 15, 30, 0, 0, time.UTC)
 	member := firingAlert("fp-orig", "DiskFull", "warning", now.Add(-5*time.Minute), false)
 	seedJudged(t, st, "inc_1", "analyzed", now.Add(-5*time.Minute), now.Add(-10*time.Minute), member)
@@ -324,6 +345,47 @@ func TestApplyDelivery_RecurrenceCollapseAttachesOccurrenceAndNotifies(t *testin
 	if rejudger.count() != 0 {
 		t.Fatalf("rejudger calls = %d, want 0 (delivery path never re-judges inline)", rejudger.count())
 	}
+	// The durable path re-emits the occurrence-attach audit event
+	// attach.go's legacy path used to write — see docs/concepts/
+	// incident-memory.md's "Measuring memory" analyses_avoided query, which
+	// counts exactly this event kind with trigger='none'.
+	rows := aud.rowsOfKind("incident.occurrence_attached")
+	if len(rows) != 1 {
+		t.Fatalf("occurrence_attached audit rows = %d, want 1", len(rows))
+	}
+	if rows[0].payload["incident_id"] != "inc_1" || rows[0].payload["group_key"] != gkAPI || rows[0].trigger != "new_alertname" {
+		t.Fatalf("occurrence_attached audit payload = %+v, want incident_id=inc_1 group_key=%s trigger=new_alertname", rows[0].payload, gkAPI)
+	}
+}
+
+// TestApplyDelivery_RecurrenceCollapseAuditsPlainAttachAsTriggerNone proves
+// the durable path's re-emitted occurrence_attached audit event carries
+// trigger="none" for a plain, non-escalating attach — exactly what docs/
+// concepts/incident-memory.md's "Measuring memory" analyses_avoided query
+// (kind='incident.occurrence_attached' AND payload trigger='none') counts.
+func TestApplyDelivery_RecurrenceCollapseAuditsPlainAttachAsTriggerNone(t *testing.T) {
+	st := openStore(t)
+	c := New(Config{}, st, NopIncidentSink{}, nil)
+	aud := &fakeAuditor{}
+	c.SetAuditor(aud)
+	now := time.Date(2026, 7, 8, 15, 30, 0, 0, time.UTC)
+	member := firingAlert("fp-orig", "DiskFull", "warning", now.Add(-5*time.Minute), false)
+	seedJudged(t, st, "inc_1", "analyzed", now.Add(-5*time.Minute), now.Add(-10*time.Minute), member)
+
+	// Same alertname, same severity as the baseline member — a new episode
+	// inside the horizon with no escalation trigger.
+	in := deliveryInputFor("d1", "fp-new", gkAPI, "firing", now)
+	in.Alert.Labels["alertname"] = "DiskFull"
+	in.Alert.Labels["severity"] = "warning"
+	claim := claimOneDelivery(t, st, in, now)
+	if err := c.ApplyDelivery(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := aud.rowsOfKind("incident.occurrence_attached")
+	if len(rows) != 1 || rows[0].trigger != "none" {
+		t.Fatalf("occurrence_attached audit rows = %+v, want exactly one row with trigger=none", rows)
+	}
 }
 
 func TestApplyDelivery_RecurrenceEscalationCarriesTriggerFacts(t *testing.T) {
@@ -349,6 +411,27 @@ func TestApplyDelivery_RecurrenceEscalationCarriesTriggerFacts(t *testing.T) {
 	ev := notifier.calls[0]
 	if ev.Trigger != "severity" || ev.PriorSeverity != "warning" || ev.NewSeverity != "critical" {
 		t.Fatalf("recurrence event = %+v, want trigger=severity prior=warning new=critical", ev)
+	}
+
+	// The durable trigger linkage a future Situation controller reconstructs
+	// "this needed re-judgment" from (instead of the delivery path calling
+	// Rejudge inline): the occurrence's trigger_kind and the delivery's
+	// stamped occurrence_id, queried directly off the ledger tables.
+	var triggerKind string
+	if err := st.DB().QueryRowContext(context.Background(),
+		`SELECT trigger_kind FROM incident_occurrences WHERE incident_id = ?`, "inc_1").Scan(&triggerKind); err != nil {
+		t.Fatalf("read occurrence trigger_kind: %v", err)
+	}
+	if triggerKind != "severity" {
+		t.Fatalf("incident_occurrences.trigger_kind = %q, want severity", triggerKind)
+	}
+	var occurrenceID sql.NullInt64
+	if err := st.DB().QueryRowContext(context.Background(),
+		`SELECT occurrence_id FROM incident_alert_deliveries WHERE delivery_id = ?`, "d1").Scan(&occurrenceID); err != nil {
+		t.Fatalf("read delivery occurrence_id: %v", err)
+	}
+	if !occurrenceID.Valid {
+		t.Fatal("incident_alert_deliveries.occurrence_id was not stamped for the collapsing delivery")
 	}
 }
 

@@ -704,10 +704,13 @@ func (c *Correlator) applyRetryAttachDeliveryPlan(ctx context.Context, claim sto
 		return false, nil
 	}
 	candidateDrill := false
+	alreadyMember := false
 	for _, mem := range members {
 		if store.IsDrillAlert(mem) {
 			candidateDrill = true
-			break
+		}
+		if mem.Fingerprint == a.Fingerprint {
+			alreadyMember = true
 		}
 	}
 	if store.IsDrillAlert(a) != candidateDrill {
@@ -722,6 +725,20 @@ func (c *Correlator) applyRetryAttachDeliveryPlan(ctx context.Context, claim sto
 		return false, fmt.Errorf("correlator: attach retrying incident: %w", err)
 	}
 	c.logger.Info("correlator: delivery attached during triage backoff", "incident_id", result.Incident.ID, "group_key", gk, "delivery_id", claim.Delivery.ID)
+
+	// An idempotent re-fire of an already-attached fingerprint adds no new
+	// membership — nothing meaningful happened, so no audit, mirroring the
+	// legacy retry-attach "repeat" short-circuit (retry_attach.go).
+	if !alreadyMember && c.auditor != nil {
+		if err := c.auditor.Append(ctx, "correlator", "incident.triage_member_attached", map[string]any{
+			"incident_id":  result.Incident.ID,
+			"group_key":    gk,
+			"alert_id":     a.ID,
+			"member_count": result.Incident.AlertCount,
+		}); err != nil {
+			c.logger.Warn("correlator: audit triage_member_attached failed", "err", err, "incident_id", result.Incident.ID)
+		}
+	}
 	return true, nil
 }
 
@@ -869,6 +886,21 @@ func (c *Correlator) applyRecurrenceDeliveryPlan(ctx context.Context, claim stor
 		return false, fmt.Errorf("correlator: apply recurring delivery: %w", err)
 	}
 	c.logger.Info("correlator: delivery collapsed into incident", "delivery_id", claim.Delivery.ID, "incident_id", result.Incident.ID, "group_key", gk, "trigger", plan.trigger)
+
+	// result.Occurrence is nil for a duplicate-delivery replay (crash
+	// recovery re-claiming an already-applied delivery): the store commits
+	// nothing new in that case, so neither the audit nor the notifier below
+	// fires, mirroring the legacy attachOccurrence audit call this durable
+	// path re-emits (attach.go).
+	if plan.isNewOccurrence && result.Occurrence != nil && c.auditor != nil {
+		if err := c.auditor.Append(ctx, "correlator", "incident.occurrence_attached", map[string]any{
+			"incident_id": result.Incident.ID,
+			"group_key":   gk,
+			"trigger":     plan.trigger,
+		}); err != nil {
+			c.logger.Warn("correlator: audit occurrence_attached failed", "err", err, "incident_id", result.Incident.ID)
+		}
+	}
 
 	if plan.isNewOccurrence && c.occNotifier != nil && result.Occurrence != nil {
 		stats := c.occurrenceStats(ctx, result.Incident.ID)
