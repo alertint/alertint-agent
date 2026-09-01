@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -193,6 +194,24 @@ func TestAlertmanagerReceiverFiringAndResolvedHaveDistinctIDsStableEpisodeKey(t 
 	if firing.Delivery.ReceiverGroupingIdentity != resolved.Delivery.ReceiverGroupingIdentity {
 		t.Fatalf("firing identity %q differs from resolved identity %q",
 			firing.Delivery.ReceiverGroupingIdentity, resolved.Delivery.ReceiverGroupingIdentity)
+	}
+
+	// The firing member's own delivery must never claim a resolution basis,
+	// and the resolved member (which carries a real EndsAt) must claim
+	// source_payload for both — these bases are what a later Situation
+	// reconstruction trusts to distinguish a real source timestamp from a
+	// receipt-time stand-in, so a silent flip here must fail a test.
+	if firing.Delivery.StartedAtBasis != situationmodel.SourceTimeBasisSourcePayload {
+		t.Fatalf("firing StartedAtBasis = %q, want source_payload", firing.Delivery.StartedAtBasis)
+	}
+	if firing.Delivery.ResolvedAtBasis != situationmodel.SourceTimeBasisMissing {
+		t.Fatalf("firing ResolvedAtBasis = %q, want missing", firing.Delivery.ResolvedAtBasis)
+	}
+	if resolved.Delivery.StartedAtBasis != situationmodel.SourceTimeBasisSourcePayload {
+		t.Fatalf("resolved StartedAtBasis = %q, want source_payload", resolved.Delivery.StartedAtBasis)
+	}
+	if resolved.Delivery.ResolvedAtBasis != situationmodel.SourceTimeBasisSourcePayload {
+		t.Fatalf("resolved ResolvedAtBasis = %q, want source_payload (a real EndsAt was sent)", resolved.Delivery.ResolvedAtBasis)
 	}
 }
 

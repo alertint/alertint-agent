@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/alertint/alertint-agent/internal/audit"
+	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -344,6 +345,23 @@ func TestZabbixReceiver_ResolutionReusesFirstEpisodeStart(t *testing.T) {
 	}
 	if res.Delivery.SourceResolvedAt == nil {
 		t.Fatal("resolved delivery must carry a SourceResolvedAt")
+	}
+
+	// Neither Zabbix time is ever payload-derived (ADR-0031 forbids parsing
+	// clock/recovery_clock), including when a delivery reuses the first
+	// episode's established start — reuse must never silently relabel that
+	// basis as source_payload.
+	if firing.Delivery.StartedAtBasis != situationmodel.SourceTimeBasisReceiptFallback {
+		t.Fatalf("firing StartedAtBasis = %q, want receipt_fallback", firing.Delivery.StartedAtBasis)
+	}
+	if firing.Delivery.ResolvedAtBasis != situationmodel.SourceTimeBasisMissing {
+		t.Fatalf("firing ResolvedAtBasis = %q, want missing", firing.Delivery.ResolvedAtBasis)
+	}
+	if res.Delivery.StartedAtBasis != situationmodel.SourceTimeBasisReceiptFallback {
+		t.Fatalf("resolved StartedAtBasis = %q, want receipt_fallback (reuse must not relabel the basis)", res.Delivery.StartedAtBasis)
+	}
+	if res.Delivery.ResolvedAtBasis != situationmodel.SourceTimeBasisReceiptFallback {
+		t.Fatalf("resolved ResolvedAtBasis = %q, want receipt_fallback", res.Delivery.ResolvedAtBasis)
 	}
 }
 
