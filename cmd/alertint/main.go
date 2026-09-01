@@ -494,7 +494,9 @@ func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor,
 		if err != nil {
 			return nil, nil, err
 		}
-		receivers = append(receivers, ingress.NewAlertReceiver(st, token, cor.Accept, logger))
+		// wake is nil until Task 8 wires the durable dispatch worker's wake
+		// callback; the receiver only durably persists deliveries here.
+		receivers = append(receivers, ingress.NewAlertReceiver(st, token, nil, logger))
 	}
 	if cfg.Changes.Ingress.Enabled {
 		token, err := cfg.ChangesWebhookToken()
@@ -508,7 +510,9 @@ func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor,
 		if err != nil {
 			return nil, nil, err
 		}
-		receivers = append(receivers, ingress.NewZabbixReceiver(st, token, cor.Accept, logger))
+		// wake is nil until Task 8 wires the durable dispatch worker's wake
+		// callback; the receiver only durably persists deliveries here.
+		receivers = append(receivers, ingress.NewZabbixReceiver(st, token, nil, logger))
 	}
 
 	if len(receivers) == 0 {

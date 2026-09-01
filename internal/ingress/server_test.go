@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -25,12 +26,11 @@ import (
 const testToken = "secret-test-token"
 
 type harness struct {
-	host    *Server
-	store   *store.Store
-	server  *httptest.Server
-	sinkMu  sync.Mutex
-	sinkIn  []store.Alert
-	sinkErr error
+	host   *Server
+	store  *store.Store
+	server *httptest.Server
+	wakeMu sync.Mutex
+	wakeN  int
 }
 
 func newHarness(t *testing.T) *harness {
@@ -45,16 +45,15 @@ func newHarness(t *testing.T) *harness {
 	a := audit.New(s.DB())
 
 	h := &harness{store: s}
-	sink := func(ctx context.Context, alert store.Alert) error {
-		h.sinkMu.Lock()
-		defer h.sinkMu.Unlock()
-		h.sinkIn = append(h.sinkIn, alert)
-		return h.sinkErr
+	wake := func() {
+		h.wakeMu.Lock()
+		defer h.wakeMu.Unlock()
+		h.wakeN++
 	}
 	host, err := New(Options{
 		Store:     s,
 		Auditor:   a,
-		Receivers: []Receiver{NewAlertReceiver(s, testToken, sink, nil)},
+		Receivers: []Receiver{NewAlertReceiver(s, testToken, wake, nil)},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -65,12 +64,10 @@ func newHarness(t *testing.T) *harness {
 	return h
 }
 
-func (h *harness) sinkCalls() []store.Alert {
-	h.sinkMu.Lock()
-	defer h.sinkMu.Unlock()
-	out := make([]store.Alert, len(h.sinkIn))
-	copy(out, h.sinkIn)
-	return out
+func (h *harness) wakeCalls() int {
+	h.wakeMu.Lock()
+	defer h.wakeMu.Unlock()
+	return h.wakeN
 }
 
 func samplePayload() AlertmanagerPayload {
@@ -147,10 +144,9 @@ func TestPost_HappyPath_204_PersistsAndAudits(t *testing.T) {
 		t.Errorf("audit row count = %d, want 1", n)
 	}
 
-	// Sink received the alert.
-	calls := h.sinkCalls()
-	if len(calls) != 1 || calls[0].Fingerprint != "fp-1" {
-		t.Errorf("sink calls = %+v", calls)
+	// wake fired exactly once for the durably-accepted delivery.
+	if got := h.wakeCalls(); got != 1 {
+		t.Errorf("wake calls = %d, want 1", got)
 	}
 }
 
@@ -184,8 +180,9 @@ func TestPost_MultipleAlerts_OneAuditRow_AllPersisted(t *testing.T) {
 		t.Errorf("audit rows = %d, want 1 per call", n)
 	}
 
-	if got := h.sinkCalls(); len(got) != 2 {
-		t.Errorf("sink call count = %d, want 2", len(got))
+	// One wake per POST, not one per member alert.
+	if got := h.wakeCalls(); got != 1 {
+		t.Errorf("wake call count = %d, want 1", got)
 	}
 }
 
@@ -326,7 +323,10 @@ func TestPost_ZeroEndsAt_StoredAsNil(t *testing.T) {
 	}
 }
 
-func TestPost_InvalidAlertStatus_PartialPersistStill204(t *testing.T) {
+// TestPost_InvalidAlertStatus_WholeEnvelopeRejected400 proves the all-or-
+// nothing durability boundary: one structurally invalid member rejects the
+// whole POST as 400 and commits no member, not even the otherwise-valid one.
+func TestPost_InvalidAlertStatus_WholeEnvelopeRejected400(t *testing.T) {
 	h := newHarness(t)
 	p := samplePayload()
 	p.Alerts = append(p.Alerts, AlertmanagerAlert{
@@ -339,32 +339,135 @@ func TestPost_InvalidAlertStatus_PartialPersistStill204(t *testing.T) {
 	body := mustMarshal(t, p)
 	resp := postPayload(t, h.server, body, nil)
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("status = %d, want 204 (partial-persist tolerated)", resp.StatusCode)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (all-or-nothing envelope rejection)", resp.StatusCode)
 	}
 
-	if _, err := h.store.GetAlertByFingerprint(context.Background(), "fp-1"); err != nil {
-		t.Errorf("valid alert should be persisted: %v", err)
+	if _, err := h.store.GetAlertByFingerprint(context.Background(), "fp-1"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("the otherwise-valid alert must not be persisted when a sibling member is invalid: %v", err)
 	}
 	if _, err := h.store.GetAlertByFingerprint(context.Background(), "fp-bad"); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("invalid alert should not be persisted: %v", err)
 	}
+	if got := h.wakeCalls(); got != 0 {
+		t.Errorf("wake calls = %d, want 0 for a rejected envelope", got)
+	}
 }
 
-func TestPost_SinkFailure_StillReturns204(t *testing.T) {
-	h := newHarness(t)
-	h.sinkMu.Lock()
-	h.sinkErr = errors.New("downstream blew up")
-	h.sinkMu.Unlock()
+// stubDurabilityReceiver is a minimal Receiver whose Ingest always fails with
+// a *DurabilityError, used to prove the host maps that failure class to 503
+// with the fixed public message, independent of any real receiver's
+// internals.
+type stubDurabilityReceiver struct {
+	route, name string
+	token       []byte
+}
 
-	body := mustMarshal(t, samplePayload())
-	resp := postPayload(t, h.server, body, nil)
+func (s *stubDurabilityReceiver) Route() string { return s.route }
+func (s *stubDurabilityReceiver) Name() string  { return s.name }
+func (s *stubDurabilityReceiver) Token() []byte { return s.token }
+func (s *stubDurabilityReceiver) Ingest(_ context.Context, _ []byte) (Summary, error) {
+	return Summary{}, &DurabilityError{Err: errors.New("database is locked")}
+}
+
+func TestPost_DurabilityFailure_503WithFixedMessage(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	host, err := New(Options{
+		Store:   s,
+		Auditor: audit.New(s.DB()),
+		Receivers: []Receiver{
+			&stubDurabilityReceiver{route: "POST /webhook/stub-durability", name: "stub", token: []byte("tok")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(host.Handler())
+	t.Cleanup(srv.Close)
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/webhook/stub-durability", strings.NewReader("{}"))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer tok")
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	body := mustReadBody(t, resp)
+	if !strings.Contains(body, "delivery could not be persisted; retry later") {
+		t.Errorf("body = %q, want the fixed public durability message", body)
+	}
+	if strings.Contains(body, "database is locked") {
+		t.Errorf("body = %q, must not leak the wrapped internal error text", body)
+	}
+
+	var n int
+	if err := s.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_log`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("audit rows = %d, want 0 for a durability failure", n)
+	}
+}
+
+// TestPost_HappyPath_204_QueryableFromSecondConnection proves 204 means
+// durably committed, not merely accepted into this process's memory: a
+// second, independent connection into the same on-disk database must
+// already see the delivery and its pending dispatch by the time the
+// response returns.
+func TestPost_HappyPath_204_QueryableFromSecondConnection(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "durability.db")
+	s, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	host, err := New(Options{
+		Store:     s,
+		Auditor:   audit.New(s.DB()),
+		Receivers: []Receiver{NewAlertReceiver(s, testToken, nil, nil)},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(host.Handler())
+	t.Cleanup(srv.Close)
+
+	resp := postPayload(t, srv, mustMarshal(t, samplePayload()), nil)
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusNoContent {
-		t.Errorf("status = %d, want 204", resp.StatusCode)
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
 	}
-	if _, err := h.store.GetAlertByFingerprint(context.Background(), "fp-1"); err != nil {
-		t.Errorf("alert should be persisted even when sink fails: %v", err)
+
+	second, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("second store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+
+	if _, err := second.GetAlertByFingerprint(ctx, "fp-1"); err != nil {
+		t.Errorf("delivered alert not visible from a second connection: %v", err)
+	}
+	var deliveries, pending int
+	if err := second.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM alert_deliveries`).Scan(&deliveries); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM alert_delivery_dispatches WHERE status = 'pending'`).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if deliveries != 1 || pending != 1 {
+		t.Fatalf("second connection sees deliveries=%d pending_dispatches=%d, want 1 and 1", deliveries, pending)
 	}
 }
 

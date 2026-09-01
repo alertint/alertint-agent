@@ -4,6 +4,8 @@ package ingress
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,12 +16,17 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/alertint/alertint-agent/internal/grouping"
+	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
-// AlertSink receives each alert after it has been persisted. The correlator
-// implements this; tests inject fakes. A nil sink means "skip handoff".
-type AlertSink func(ctx context.Context, alert store.Alert) error
+// DeliveryWake nudges the durable dispatch worker (wired in a later task) to
+// look for newly pending work sooner than its normal poll interval. It is
+// called at most once per Ingest call, strictly after that call's
+// AcceptDeliveries commits successfully — never before, and never when
+// Ingest rejects the payload (4xx) or the Store fails to persist it (503). A
+// nil DeliveryWake is a no-op.
+type DeliveryWake func()
 
 // AlertmanagerPayload is the v4 webhook envelope. Fields we don't use are
 // decoded but ignored.
@@ -59,24 +66,24 @@ func ParseAlertmanager(body []byte) (AlertmanagerPayload, error) {
 	return payload, nil
 }
 
-// alertReceiver wraps ParseAlertmanager → persist → AlertSink/correlator.
+// alertReceiver wraps ParseAlertmanager → durable acceptance → wake.
 type alertReceiver struct {
 	store  *store.Store
-	sink   AlertSink
+	wake   DeliveryWake
 	token  []byte
 	logger *slog.Logger
 	now    func() time.Time
 	newID  func() string
 }
 
-// NewAlertReceiver builds the Alertmanager receiver. sink may be nil.
-func NewAlertReceiver(st *store.Store, token string, sink AlertSink, logger *slog.Logger) Receiver {
+// NewAlertReceiver builds the Alertmanager receiver. wake may be nil.
+func NewAlertReceiver(st *store.Store, token string, wake DeliveryWake, logger *slog.Logger) Receiver {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &alertReceiver{
 		store:  st,
-		sink:   sink,
+		wake:   wake,
 		token:  []byte(token),
 		logger: logger,
 		now:    func() time.Time { return time.Now().UTC() },
@@ -88,6 +95,13 @@ func (r *alertReceiver) Route() string { return "POST /webhook/alertmanager" }
 func (r *alertReceiver) Name() string  { return "alertmanager" }
 func (r *alertReceiver) Token() []byte { return r.token }
 
+// Ingest parses the envelope, validates and normalizes every member into a
+// store.DeliveryInput, then commits the whole batch in one AcceptDeliveries
+// call. A structurally invalid member rejects the whole envelope (400)
+// before the Store is ever called — this POST is all-or-nothing. Once
+// AcceptDeliveries commits, wake fires exactly once and the delivery is
+// durable; nothing after this point (including the audit append) can turn
+// the response into anything but 204.
 func (r *alertReceiver) Ingest(ctx context.Context, body []byte) (Summary, error) {
 	payload, err := ParseAlertmanager(body)
 	if err != nil {
@@ -104,24 +118,25 @@ func (r *alertReceiver) Ingest(ctx context.Context, body []byte) (Summary, error
 
 	var persisted []store.Alert
 	if len(payload.Alerts) > 0 {
-		var persistErrs []error
-		persisted, persistErrs = r.persistAlerts(ctx, payload.Alerts, payload.GroupLabels)
-		// Hand off AFTER persistence; sink errors are logged, never fail the response.
-		if r.sink != nil {
-			for _, a := range persisted {
-				if err := r.sink(ctx, a); err != nil {
-					r.logger.Warn("alert sink failed",
-						slog.String("fingerprint", a.Fingerprint),
-						slog.String("err", err.Error()),
-					)
-				}
-			}
+		inputs, err := r.buildDeliveryInputs(payload)
+		if err != nil {
+			return Summary{}, err // → 400, nothing committed
 		}
-		if len(persistErrs) > 0 {
-			r.logger.Error("partial persist failure",
-				slog.Int("alerts_received", len(payload.Alerts)),
-				slog.Int("alerts_persisted", len(persisted)),
-				slog.Int("alerts_failed", len(persistErrs)),
+
+		accepted, err := r.store.AcceptDeliveries(ctx, inputs)
+		if err != nil {
+			return Summary{}, &DurabilityError{Err: err} // → 503
+		}
+		if r.wake != nil {
+			r.wake()
+		}
+
+		persisted = make([]store.Alert, 0, len(accepted))
+		for _, d := range accepted {
+			persisted = append(persisted, d.Alert)
+			r.logger.Debug("alert upserted",
+				slog.String("fingerprint", d.Alert.Fingerprint),
+				slog.String("status", d.Alert.Status),
 			)
 		}
 	}
@@ -146,38 +161,64 @@ func alertAuditRecord(payload AlertmanagerPayload, persisted []store.Alert) map[
 	}
 }
 
-func (r *alertReceiver) persistAlerts(ctx context.Context, in []AlertmanagerAlert, groupLabels map[string]string) ([]store.Alert, []error) {
-	persisted := make([]store.Alert, 0, len(in))
-	var errs []error
-	for _, a := range in {
-		alert, err := r.toStoreAlert(a)
+// normalizedAlertmanagerMember is the deterministic content payloadDigest
+// hashes for one Alertmanager alert: the raw wire-level fields for that
+// member plus the enclosing envelope metadata that participates in its
+// derived grouping identity. It never includes a locally-generated ID,
+// receipt-clock reading, or anything else this receiver invents — only what
+// Alertmanager actually sent — so re-POSTing the same body twice yields the
+// same digest for the same member, which is what makes transport redelivery
+// a successful no-op instead of a duplicate row.
+type normalizedAlertmanagerMember struct {
+	Version     string
+	GroupKey    string
+	Receiver    string
+	GroupLabels map[string]string
+	Alert       AlertmanagerAlert
+}
+
+// buildDeliveryInputs validates and normalizes every Alertmanager alert
+// member into a store.DeliveryInput before any of them reaches the Store.
+// One invalid member returns an error and produces no inputs at all, so the
+// caller never commits a partial envelope.
+func (r *alertReceiver) buildDeliveryInputs(payload AlertmanagerPayload) ([]store.DeliveryInput, error) {
+	inputs := make([]store.DeliveryInput, 0, len(payload.Alerts))
+	for _, raw := range payload.Alerts {
+		alert, err := r.toStoreAlert(raw)
 		if err != nil {
-			errs = append(errs, err)
-			r.logger.Warn("dropping invalid alert",
-				slog.String("fingerprint", a.Fingerprint),
-				slog.String("err", err.Error()),
-			)
-			continue
+			return nil, fmt.Errorf("alertmanager: invalid alert (fingerprint %q): %w", raw.Fingerprint, err)
 		}
-		stored, err := r.store.UpsertAlertByFingerprint(ctx, alert)
-		if err != nil {
-			errs = append(errs, err)
-			r.logger.Error("upsert alert failed",
-				slog.String("fingerprint", alert.Fingerprint),
-				slog.String("err", err.Error()),
-			)
-			continue
+
+		member := normalizedAlertmanagerMember{
+			Version:     payload.Version,
+			GroupKey:    payload.GroupKey,
+			Receiver:    payload.Receiver,
+			GroupLabels: payload.GroupLabels,
+			Alert:       raw,
 		}
-		stored.ReceiverGroupingIdentity = grouping.Ensure(
-			grouping.RenderLabels(groupLabels), stored.Labels, stored.Fingerprint,
-		)
-		persisted = append(persisted, stored)
-		r.logger.Debug("alert upserted",
-			slog.String("fingerprint", stored.Fingerprint),
-			slog.String("status", stored.Status),
-		)
+
+		input := store.DeliveryInput{
+			ID:                       payloadDigest("alertmanager-delivery", member),
+			Alert:                    alert,
+			Source:                   "alertmanager",
+			SourceEpisodeKey:         "alertmanager:" + alert.Fingerprint + ":" + alert.StartsAt.UTC().Format(time.RFC3339Nano),
+			SourceStartedAt:          timePtr(alert.StartsAt),
+			StartedAtBasis:           situationmodel.SourceTimeBasisSourcePayload,
+			ResolvedAtBasis:          situationmodel.SourceTimeBasisMissing,
+			ReceiverGroupingIdentity: grouping.Ensure(grouping.RenderLabels(payload.GroupLabels), alert.Labels, alert.Fingerprint),
+			PayloadDigest:            payloadDigest("alertmanager-payload", member),
+			SourceProvenance: store.SourceProvenance{
+				GeneratorURL:    raw.GeneratorURL,
+				AcquisitionMode: store.SourceAcquisitionWebhook,
+			},
+		}
+		if alert.Status == "resolved" && alert.EndsAt != nil {
+			input.SourceResolvedAt = timePtr(*alert.EndsAt)
+			input.ResolvedAtBasis = situationmodel.SourceTimeBasisSourcePayload
+		}
+		inputs = append(inputs, input)
 	}
-	return persisted, errs
+	return inputs, nil
 }
 
 func (r *alertReceiver) toStoreAlert(a AlertmanagerAlert) (store.Alert, error) {
@@ -215,4 +256,33 @@ func (r *alertReceiver) toStoreAlert(a AlertmanagerAlert) (store.Alert, error) {
 		EndsAt:      endsAt,
 		ReceivedAt:  r.now(),
 	}, nil
+}
+
+// timePtr returns a pointer to an independent copy of t.
+func timePtr(t time.Time) *time.Time { return &t }
+
+// payloadDigest returns a deterministic "sha256:<hex>" digest over a
+// namespaced JSON encoding of value. Namespacing on source lets the same
+// underlying value produce different digests for different purposes (e.g. a
+// delivery ID vs. a recorded payload digest for the same normalized alert),
+// while guaranteeing that byte-identical input always produces the
+// byte-identical digest — required for transport redelivery of the same
+// normalized source payload to resolve to the same delivery ID.
+//
+// encoding/json already sorts map keys and fixes struct field order, so
+// marshaling is canonical enough here: every caller passes one of this
+// package's own fixed-shape struct/map values built from already-decoded
+// JSON, never anything with nondeterministic field order.
+func payloadDigest(source string, value any) string {
+	b, err := json.Marshal(value)
+	if err != nil {
+		// value is always one of this package's own struct/map types
+		// decoded from JSON we already parsed once; re-encoding it can only
+		// fail for shapes this package never constructs. Fall back to a
+		// deterministic textual representation rather than let one
+		// unexpected value panic the request.
+		b = []byte(fmt.Sprintf("%#v", value))
+	}
+	sum := sha256.Sum256(append([]byte(source+"\x00"), b...))
+	return "sha256:" + hex.EncodeToString(sum[:])
 }

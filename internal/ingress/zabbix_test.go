@@ -4,6 +4,7 @@ package ingress
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -91,9 +92,8 @@ func TestParseZabbix_EmptyTagsTolerated(t *testing.T) {
 
 func TestZabbixReceiver_MapsProblemToFiringAlert(t *testing.T) {
 	st := newTestStore(t)
-	var sunk []store.Alert
-	sink := func(ctx context.Context, a store.Alert) error { sunk = append(sunk, a); return nil }
-	r := NewZabbixReceiver(st, "tok", sink, slog.Default())
+	var wakes int
+	r := NewZabbixReceiver(st, "tok", func() { wakes++ }, slog.Default())
 
 	if r.Route() != "POST /webhook/zabbix" || r.Name() != "zabbix" {
 		t.Fatalf("identity: route=%q name=%q", r.Route(), r.Name())
@@ -111,10 +111,14 @@ func TestZabbixReceiver_MapsProblemToFiringAlert(t *testing.T) {
 	if sum.Kind != "alert.received" {
 		t.Fatalf("audit kind: %q", sum.Kind)
 	}
-	if len(sunk) != 1 {
-		t.Fatalf("sink calls: %d", len(sunk))
+	if wakes != 1 {
+		t.Fatalf("wake calls: %d, want 1", wakes)
 	}
-	a := sunk[0]
+	assertTableCount(t, st.DB(), "alert_deliveries", 1)
+	a, err := st.GetAlertByFingerprint(context.Background(), "zabbix:9134")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if a.Fingerprint != "zabbix:9134" {
 		t.Fatalf("fingerprint: %q", a.Fingerprint)
 	}
@@ -158,11 +162,7 @@ func TestZabbixReceiver_MapsProblemToFiringAlert(t *testing.T) {
 
 func TestZabbixReceiverHandsOffPerHostIdentityAcrossResolution(t *testing.T) {
 	st := newTestStore(t)
-	var sunk []store.Alert
-	r := NewZabbixReceiver(st, "tok", func(_ context.Context, a store.Alert) error {
-		sunk = append(sunk, a)
-		return nil
-	}, slog.Default())
+	r := NewZabbixReceiver(st, "tok", nil, slog.Default())
 
 	bodies := [][]byte{
 		[]byte(`{"event_id":"77","status":"PROBLEM","severity":"Warning","nseverity":"2","host":"db01","trigger_name":"Disk low"}`),
@@ -175,16 +175,21 @@ func TestZabbixReceiverHandsOffPerHostIdentityAcrossResolution(t *testing.T) {
 		}
 	}
 
-	if len(sunk) != 3 {
-		t.Fatalf("sink calls = %d, want 3", len(sunk))
+	claims := claimAll(t, st)
+	if len(claims) != 3 {
+		t.Fatalf("claimed dispatches = %d, want 3", len(claims))
 	}
-	if got := sunk[0].ReceiverGroupingIdentity; got != "host=db01" {
+	problem := findDelivery(t, claims, "zabbix:77", "firing")
+	resolved := findDelivery(t, claims, "zabbix:77", "resolved")
+	secondHost := findDelivery(t, claims, "zabbix:78", "firing")
+
+	if got := problem.Delivery.ReceiverGroupingIdentity; got != "host=db01" {
 		t.Fatalf("problem identity = %q, want host=db01", got)
 	}
-	if got := sunk[1].ReceiverGroupingIdentity; got != sunk[0].ReceiverGroupingIdentity {
-		t.Fatalf("resolved identity = %q, want firing identity %q", got, sunk[0].ReceiverGroupingIdentity)
+	if got := resolved.Delivery.ReceiverGroupingIdentity; got != problem.Delivery.ReceiverGroupingIdentity {
+		t.Fatalf("resolved identity = %q, want firing identity %q", got, problem.Delivery.ReceiverGroupingIdentity)
 	}
-	if got := sunk[2].ReceiverGroupingIdentity; got != "host=db02" || got == sunk[0].ReceiverGroupingIdentity {
+	if got := secondHost.Delivery.ReceiverGroupingIdentity; got != "host=db02" || got == problem.Delivery.ReceiverGroupingIdentity {
 		t.Fatalf("second host identity = %q, want distinct host=db02", got)
 	}
 }
@@ -220,14 +225,15 @@ func TestZabbixReceiver_ResolvedDedupsOntoFiringRow(t *testing.T) {
 
 func TestZabbixReceiver_NSeverityFallbackForRenamedSeverity(t *testing.T) {
 	st := newTestStore(t)
-	var sunk []store.Alert
-	sink := func(ctx context.Context, a store.Alert) error { sunk = append(sunk, a); return nil }
-	r := NewZabbixReceiver(st, "tok", sink, slog.Default())
+	r := NewZabbixReceiver(st, "tok", nil, slog.Default())
 	body := []byte(`{"event_id":"88","status":"PROBLEM","severity":"P1","nseverity":"5","host":"h1","trigger_id":"5","trigger_name":"T"}`)
 	if _, err := r.Ingest(context.Background(), body); err != nil {
 		t.Fatal(err)
 	}
-	a := sunk[0]
+	a, err := st.GetAlertByFingerprint(context.Background(), "zabbix:88")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if a.Labels["severity"] != "disaster" {
 		t.Fatalf("renamed severity must canonicalise via nseverity: got %q want disaster", a.Labels["severity"])
 	}
@@ -238,14 +244,15 @@ func TestZabbixReceiver_NSeverityFallbackForRenamedSeverity(t *testing.T) {
 
 func TestZabbixReceiver_UnrecognizedSeverityWithNoNSeverityFallback(t *testing.T) {
 	st := newTestStore(t)
-	var sunk []store.Alert
-	sink := func(ctx context.Context, a store.Alert) error { sunk = append(sunk, a); return nil }
-	r := NewZabbixReceiver(st, "tok", sink, slog.Default())
+	r := NewZabbixReceiver(st, "tok", nil, slog.Default())
 	body := []byte(`{"event_id":"99","status":"PROBLEM","severity":"Not classified","nseverity":"0","host":"h1","trigger_id":"5","trigger_name":"T"}`)
 	if _, err := r.Ingest(context.Background(), body); err != nil {
 		t.Fatal(err)
 	}
-	a := sunk[0]
+	a, err := st.GetAlertByFingerprint(context.Background(), "zabbix:99")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if a.Labels["severity"] != "Not classified" {
 		t.Fatalf("an unrecognized name with no valid nseverity fallback must stay verbatim: got %q", a.Labels["severity"])
 	}
@@ -256,15 +263,16 @@ func TestZabbixReceiver_UnrecognizedSeverityWithNoNSeverityFallback(t *testing.T
 
 func TestZabbixReceiver_TagCollidesWithAnotherTag(t *testing.T) {
 	st := newTestStore(t)
-	var sunk []store.Alert
-	sink := func(ctx context.Context, a store.Alert) error { sunk = append(sunk, a); return nil }
-	r := NewZabbixReceiver(st, "tok", sink, slog.Default())
+	r := NewZabbixReceiver(st, "tok", nil, slog.Default())
 	body := []byte(`{"event_id":"100","status":"PROBLEM","severity":"High","host":"h1","trigger_id":"5","trigger_name":"T",
 		"tags":[{"tag":"foo-bar","value":"first"},{"tag":"foo_bar","value":"second"}]}`)
 	if _, err := r.Ingest(context.Background(), body); err != nil {
 		t.Fatal(err)
 	}
-	a := sunk[0]
+	a, err := st.GetAlertByFingerprint(context.Background(), "zabbix:100")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if a.Labels["foo_bar"] != "first" {
 		t.Fatalf("the first tag to claim a sanitised key must win over a later colliding tag: got %q", a.Labels["foo_bar"])
 	}
@@ -275,6 +283,105 @@ func TestZabbixReceiver_BadPayloadIsIngestError(t *testing.T) {
 	r := NewZabbixReceiver(st, "tok", nil, slog.Default())
 	if _, err := r.Ingest(context.Background(), []byte(`{"status":"PROBLEM"}`)); err == nil {
 		t.Fatal("want parse error (maps to 400)")
+	}
+}
+
+// TestZabbixReceiver_TriggerIDBecomesSignalIDOnly proves trigger_id is
+// persisted as SourceProvenance.SignalID and never doubles as a
+// SignalVersion or an episode identity — the webhook cannot prove the
+// trigger configuration version, so that field must stay unavailable.
+func TestZabbixReceiver_TriggerIDBecomesSignalIDOnly(t *testing.T) {
+	st := newTestStore(t)
+	r := NewZabbixReceiver(st, "tok", nil, slog.Default())
+	body := []byte(`{"event_id":"200","status":"PROBLEM","severity":"High","host":"h1","trigger_id":"555","trigger_name":"T"}`)
+	if _, err := r.Ingest(context.Background(), body); err != nil {
+		t.Fatal(err)
+	}
+	d := findDelivery(t, claimAll(t, st), "zabbix:200", "firing")
+	if d.Delivery.SourceProvenance.SignalID == nil || *d.Delivery.SourceProvenance.SignalID != "555" {
+		t.Fatalf("SignalID = %v, want \"555\"", d.Delivery.SourceProvenance.SignalID)
+	}
+	if d.Delivery.SourceProvenance.SignalVersion != nil {
+		t.Fatalf("SignalVersion must stay unavailable, got %v", *d.Delivery.SourceProvenance.SignalVersion)
+	}
+	if d.Delivery.SourceEpisodeKey != "zabbix:200" {
+		t.Fatalf("SourceEpisodeKey = %q, want zabbix:200 (trigger_id must never leak into episode identity)", d.Delivery.SourceEpisodeKey)
+	}
+}
+
+// TestZabbixReceiver_ResolutionReusesFirstEpisodeStart proves a RESOLVED
+// delivery's SourceStartedAt reuses the first PROBLEM's established episode
+// start rather than recomputing a fresh receipt time, while still recording
+// distinct delivery IDs and its own receipt-based SourceResolvedAt.
+func TestZabbixReceiver_ResolutionReusesFirstEpisodeStart(t *testing.T) {
+	st := newTestStore(t)
+	r := NewZabbixReceiver(st, "tok", nil, slog.Default())
+	problem := []byte(`{"event_id":"300","status":"PROBLEM","severity":"High","host":"h1","trigger_id":"5","trigger_name":"T"}`)
+	resolved := []byte(`{"event_id":"300","status":"RESOLVED","severity":"High","host":"h1","trigger_id":"5","trigger_name":"T"}`)
+	if _, err := r.Ingest(context.Background(), problem); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Ingest(context.Background(), resolved); err != nil {
+		t.Fatal(err)
+	}
+
+	claims := claimAll(t, st)
+	firing := findDelivery(t, claims, "zabbix:300", "firing")
+	res := findDelivery(t, claims, "zabbix:300", "resolved")
+
+	if firing.Delivery.ID == res.Delivery.ID {
+		t.Fatal("firing and resolved deliveries must have distinct IDs")
+	}
+	if firing.Delivery.SourceEpisodeKey != res.Delivery.SourceEpisodeKey {
+		t.Fatalf("episode key must stay stable: firing=%q resolved=%q", firing.Delivery.SourceEpisodeKey, res.Delivery.SourceEpisodeKey)
+	}
+	if firing.Delivery.SourceStartedAt == nil || res.Delivery.SourceStartedAt == nil {
+		t.Fatal("both deliveries must carry a SourceStartedAt")
+	}
+	if !firing.Delivery.SourceStartedAt.Equal(*res.Delivery.SourceStartedAt) {
+		t.Fatalf("resolved delivery must reuse the first episode start: firing=%v resolved=%v",
+			*firing.Delivery.SourceStartedAt, *res.Delivery.SourceStartedAt)
+	}
+	if res.Delivery.SourceResolvedAt == nil {
+		t.Fatal("resolved delivery must carry a SourceResolvedAt")
+	}
+}
+
+// TestZabbixReceiver_RedeliveryIsIdempotent proves transport redelivery of
+// the exact same Zabbix event body is a successful no-op.
+func TestZabbixReceiver_RedeliveryIsIdempotent(t *testing.T) {
+	st := newTestStore(t)
+	r := NewZabbixReceiver(st, "tok", nil, slog.Default())
+	body := []byte(`{"event_id":"400","status":"PROBLEM","severity":"High","host":"h1","trigger_id":"5","trigger_name":"T"}`)
+	if _, err := r.Ingest(context.Background(), body); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Ingest(context.Background(), body); err != nil {
+		t.Fatal(err)
+	}
+	assertTableCount(t, st.DB(), "alert_deliveries", 1)
+	assertTableCount(t, st.DB(), "alert_delivery_dispatches", 1)
+}
+
+// TestZabbixReceiver_EpisodeLookupFailureIsDurabilityError proves a Store
+// read failure while resolving the episode start is a *DurabilityError
+// (503), never treated as "no prior episode" (which would silently
+// overwrite an established episode's start with a fresh receipt time).
+func TestZabbixReceiver_EpisodeLookupFailureIsDurabilityError(t *testing.T) {
+	st := newTestStore(t)
+	r := NewZabbixReceiver(st, "tok", nil, slog.Default())
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	body := []byte(`{"event_id":"500","status":"PROBLEM","severity":"High","host":"h1","trigger_id":"5","trigger_name":"T"}`)
+	_, err := r.Ingest(context.Background(), body)
+	if err == nil {
+		t.Fatal("want an error once the Store is unusable")
+	}
+	var durable *DurabilityError
+	if !errors.As(err, &durable) {
+		t.Fatalf("err = %v, want a *DurabilityError", err)
 	}
 }
 

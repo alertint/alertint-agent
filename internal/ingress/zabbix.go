@@ -16,6 +16,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/grouping"
 	"github.com/alertint/alertint-agent/internal/severity"
+	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -70,25 +71,25 @@ func ParseZabbix(body []byte) (ZabbixEvent, error) {
 	return ev, nil
 }
 
-// zabbixReceiver wraps ParseZabbix → map → persist → AlertSink/correlator,
+// zabbixReceiver wraps ParseZabbix → map → durable acceptance → wake,
 // mirroring alertReceiver. One webhook delivery carries one event.
 type zabbixReceiver struct {
 	store  *store.Store
-	sink   AlertSink
+	wake   DeliveryWake
 	token  []byte
 	logger *slog.Logger
 	now    func() time.Time
 	newID  func() string
 }
 
-// NewZabbixReceiver builds the Zabbix receiver. sink may be nil.
-func NewZabbixReceiver(st *store.Store, token string, sink AlertSink, logger *slog.Logger) Receiver {
+// NewZabbixReceiver builds the Zabbix receiver. wake may be nil.
+func NewZabbixReceiver(st *store.Store, token string, wake DeliveryWake, logger *slog.Logger) Receiver {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &zabbixReceiver{
 		store:  st,
-		sink:   sink,
+		wake:   wake,
 		token:  []byte(token),
 		logger: logger,
 		now:    func() time.Time { return time.Now().UTC() },
@@ -100,6 +101,11 @@ func (r *zabbixReceiver) Route() string { return "POST /webhook/zabbix" }
 func (r *zabbixReceiver) Name() string  { return "zabbix" }
 func (r *zabbixReceiver) Token() []byte { return r.token }
 
+// Ingest parses one Zabbix event, resolves its episode start, and commits it
+// as one immutable delivery. A parse/validation failure is a 400 and never
+// touches the Store. Once AcceptDeliveries commits, wake fires and the
+// delivery is durable — nothing after this point can turn the response into
+// anything but 204.
 func (r *zabbixReceiver) Ingest(ctx context.Context, body []byte) (Summary, error) {
 	ev, err := ParseZabbix(body)
 	if err != nil {
@@ -112,47 +118,40 @@ func (r *zabbixReceiver) Ingest(ctx context.Context, body []byte) (Summary, erro
 		slog.String("host", ev.Host),
 	)
 
-	// Preserve the firing row's original StartsAt across a later delivery for
-	// the same event_id (e.g. RESOLVED, or a retried PROBLEM): StartsAt is
-	// receipt-based only for the FIRST delivery, never rewritten by a later
-	// one, since UpsertAlertByFingerprint otherwise overwrites starts_at
-	// unconditionally on every upsert.
-	var existingStartsAt *time.Time
-	existing, err := r.store.GetAlertByFingerprint(ctx, "zabbix:"+ev.EventID)
-	switch {
-	case err == nil:
-		t := existing.StartsAt
-		existingStartsAt = &t
-	case errors.Is(err, store.ErrNotFound):
-		// First delivery for this event_id — StartsAt is this delivery's receipt time.
-	default:
-		r.logger.Warn("zabbix: lookup existing alert failed, treating as first delivery",
-			slog.String("err", err.Error()))
+	startedAt, err := r.episodeStart(ctx, "zabbix:"+ev.EventID)
+	if err != nil {
+		return Summary{}, err // → 503 (already a *DurabilityError)
 	}
 
-	alert := r.toStoreAlert(ev, existingStartsAt)
-	stored, err := r.store.UpsertAlertByFingerprint(ctx, alert)
-	if err != nil {
-		// Persist failures are logged and swallowed: the host still answers 204
-		// (never-5xx), matching alertReceiver's contract.
-		r.logger.Error("upsert alert failed",
-			slog.String("fingerprint", alert.Fingerprint),
-			slog.String("err", err.Error()),
-		)
-		return Summary{Kind: "alert.received", Audit: zabbixAuditRecord(ev, false)}, nil
+	alert := r.toStoreAlert(ev, startedAt)
+	input := r.toDeliveryInput(ev, alert)
+
+	if _, err := r.store.AcceptDeliveries(ctx, []store.DeliveryInput{input}); err != nil {
+		return Summary{}, &DurabilityError{Err: err} // → 503
 	}
-	stored.ReceiverGroupingIdentity = grouping.Ensure(
-		grouping.RenderSelectedLabels(stored.Labels, []string{"host"}), stored.Labels, stored.Fingerprint,
-	)
-	if r.sink != nil {
-		if err := r.sink(ctx, stored); err != nil {
-			r.logger.Warn("alert sink failed",
-				slog.String("fingerprint", stored.Fingerprint),
-				slog.String("err", err.Error()),
-			)
-		}
+	if r.wake != nil {
+		r.wake()
 	}
-	return Summary{Kind: "alert.received", Audit: zabbixAuditRecord(ev, true)}, nil
+
+	return Summary{Kind: "alert.received", Audit: zabbixAuditRecord(ev)}, nil
+}
+
+// episodeStart resolves the SourceStartedAt this delivery must use: the
+// already-durable episode's established start when one exists, or this
+// delivery's own receipt time when it's the first PROBLEM for this event_id.
+// A Store read failure here is a durability failure, not invalid input — it
+// must never be treated as "no prior episode" and silently overwrite an
+// existing episode's start.
+func (r *zabbixReceiver) episodeStart(ctx context.Context, fingerprint string) (time.Time, error) {
+	existing, err := r.store.GetAlertByFingerprint(ctx, fingerprint)
+	switch {
+	case err == nil:
+		return existing.StartsAt, nil
+	case errors.Is(err, store.ErrNotFound):
+		return r.now(), nil
+	default:
+		return time.Time{}, &DurabilityError{Err: fmt.Errorf("zabbix: lookup existing alert: %w", err)}
+	}
 }
 
 // labelKeySanitiser collapses every character outside [a-zA-Z0-9_] to _.
@@ -164,12 +163,8 @@ var canonicalZabbixSeverity = map[string]string{
 	"1": "information", "2": "warning", "3": "average", "4": "high", "5": "disaster",
 }
 
-func (r *zabbixReceiver) toStoreAlert(ev ZabbixEvent, existingStartsAt *time.Time) store.Alert {
+func (r *zabbixReceiver) toStoreAlert(ev ZabbixEvent, startsAt time.Time) store.Alert {
 	now := r.now()
-	startsAt := now
-	if existingStartsAt != nil {
-		startsAt = *existingStartsAt
-	}
 
 	// Verbatim-first severity with nseverity fallback (ADR-0033): a name the
 	// shared ladder knows stays verbatim; an unknown name with a valid
@@ -247,13 +242,57 @@ func (r *zabbixReceiver) toStoreAlert(ev ZabbixEvent, existingStartsAt *time.Tim
 	return a
 }
 
+// toDeliveryInput maps one Zabbix event to its immutable delivery. The
+// source episode identity is zabbix:<event_id> only — trigger_id identifies
+// the source signal (SignalID), never the episode, and never doubles as a
+// SignalVersion: the webhook cannot prove the trigger configuration version,
+// so that field stays unavailable rather than synthesized (Plan 4 may derive
+// it later from bounded Zabbix API configuration reads). Neither
+// SourceStartedAt nor SourceResolvedAt is ever payload-derived — ADR-0031
+// forbids parsing clock/recovery_clock — so both bases are receipt_fallback
+// (or missing, before a resolution has been observed at all).
+func (r *zabbixReceiver) toDeliveryInput(ev ZabbixEvent, alert store.Alert) store.DeliveryInput {
+	var signalID *string
+	if id := strings.TrimSpace(ev.TriggerID); id != "" {
+		signalID = &id
+	}
+	eventID := ev.EventID
+
+	input := store.DeliveryInput{
+		ID:               payloadDigest("zabbix-delivery", ev),
+		Alert:            alert,
+		Source:           "zabbix",
+		SourceEventID:    &eventID,
+		SourceEpisodeKey: "zabbix:" + ev.EventID,
+		SourceStartedAt:  timePtr(alert.StartsAt),
+		StartedAtBasis:   situationmodel.SourceTimeBasisReceiptFallback,
+		ResolvedAtBasis:  situationmodel.SourceTimeBasisMissing,
+		ReceiverGroupingIdentity: grouping.Ensure(
+			grouping.RenderSelectedLabels(alert.Labels, []string{"host"}), alert.Labels, alert.Fingerprint,
+		),
+		PayloadDigest: payloadDigest("zabbix-payload", ev),
+		SourceProvenance: store.SourceProvenance{
+			SignalID:        signalID,
+			GeneratorURL:    ev.GeneratorURL,
+			AcquisitionMode: store.SourceAcquisitionWebhook,
+		},
+	}
+	if alert.Status == "resolved" && alert.EndsAt != nil {
+		input.SourceResolvedAt = timePtr(*alert.EndsAt)
+		input.ResolvedAtBasis = situationmodel.SourceTimeBasisReceiptFallback
+	}
+	return input
+}
+
 // zabbixAuditRecord is the receiver-owned audit payload (Summary contract).
-func zabbixAuditRecord(ev ZabbixEvent, persisted bool) map[string]any {
+// It is only ever built after AcceptDeliveries has durably committed, so
+// there is no persisted/not-persisted distinction left to record.
+func zabbixAuditRecord(ev ZabbixEvent) map[string]any {
 	return map[string]any{
 		"event_id":  ev.EventID,
 		"status":    ev.Status,
 		"severity":  ev.Severity,
 		"host":      ev.Host,
-		"persisted": persisted,
+		"persisted": true,
 	}
 }

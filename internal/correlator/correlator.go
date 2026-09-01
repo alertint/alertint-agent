@@ -209,8 +209,12 @@ func (c *Correlator) SetTriageFailureNotifier(n TriageFailureNotifier) { c.triag
 // SetAuditor sets the auditor for occurrence-attach events. Call after New, before Start.
 func (c *Correlator) SetAuditor(a Auditor) { c.auditor = a }
 
-// Accept implements ingress.AlertSink. It is safe to call from multiple
-// goroutines and will not block unless the internal channel is full.
+// Accept queues an already-persisted alert for correlation. As of the
+// durable delivery ledger (Task 4), no production Receiver calls this
+// directly anymore — that handoff moves to a durable dispatch worker in a
+// later task; callers here are tests and any other direct caller within this
+// package's boundary. It is safe to call from multiple goroutines and will
+// not block unless the internal channel is full.
 func (c *Correlator) Accept(ctx context.Context, a store.Alert) error {
 	select {
 	case c.alertCh <- a:
