@@ -52,6 +52,7 @@ type Config struct {
 	Memory       MemoryConfig       `yaml:"memory"`
 	Triage       TriageConfig       `yaml:"triage,omitempty"`
 	Health       HealthConfig       `yaml:"health"`
+	Situations   SituationsConfig   `yaml:"situations"`
 	LogLevel     string             `yaml:"log_level"`
 	LogFormat    string             `yaml:"log_format"`
 }
@@ -64,6 +65,62 @@ type Config struct {
 type HealthConfig struct {
 	LLMIdleProbeAfterSeconds int `yaml:"llm_idle_probe_after_seconds"`
 	BroadcastAfterSeconds    int `yaml:"broadcast_after_seconds"`
+}
+
+// situationsMaxL2CallsPerAttempt and situationsMaxWorkAttemptsPerInput are
+// the Plan 2 situation controller's fixed L2 call/attempt accounting
+// (doctopus spec 02-controller-triage-coordination "L2 call and attempt
+// accounting"): two L2 provider calls per controller attempt, five durable
+// controller attempts per unchanged input. They are shipped as configuration
+// keys (so the wire shape documents the ceiling) but validateSituations
+// rejects any other value — Plan 2 does not make them tunable.
+const (
+	situationsMaxL2CallsPerAttempt    = 2
+	situationsMaxWorkAttemptsPerInput = 5
+)
+
+// SituationsConfig configures the Plan 2 situation controller: worker
+// concurrency, the reconcile poll interval, Situation claim lease/heartbeat
+// timing, the webhook source recovery grace, internal cadence tiers, the
+// fixed L2 call/work-attempt ceiling, the per-attempt wall clock, the shared
+// L2 provider semaphore, and bounded retry/jitter. It carries no Plan 3/4
+// settings: no L1 call budget, connector concurrency, or envelope review
+// interval. In particular, Plan 2 deliberately never adds
+// situations.budgets.max_l1_llm_calls (spec.md 02-controller-triage-coordination
+// "Attempt identity and completion": Acute Triage keeps its shipped
+// five-attempt schedule; a parsed budget with no distinct consuming behavior
+// would be removed rather than shipped unused) — strict YAML decoding
+// rejects it outright as an unknown field.
+type SituationsConfig struct {
+	Workers                     int                     `yaml:"workers"`
+	ReconcilePollSeconds        int                     `yaml:"reconcile_poll_seconds"`
+	LeaseSeconds                int                     `yaml:"lease_seconds"`
+	HeartbeatSeconds            int                     `yaml:"heartbeat_seconds"`
+	WebhookRecoveryGraceSeconds int                     `yaml:"webhook_recovery_grace_seconds"`
+	Cadence                     SituationsCadenceConfig `yaml:"cadence"`
+	MaxL2CallsPerAttempt        int                     `yaml:"max_l2_calls_per_attempt"`
+	MaxWorkAttemptsPerInput     int                     `yaml:"max_work_attempts_per_input"`
+	AttemptWallSeconds          int                     `yaml:"attempt_wall_seconds"`
+	LLMConcurrency              int                     `yaml:"llm_concurrency"`
+	Retry                       SituationsRetryConfig   `yaml:"retry"`
+}
+
+// SituationsCadenceConfig sizes the controller's internal fast/normal/slow
+// reconsideration tempo (model.Cadence). Cadence is persisted machinery, not
+// card content: it only widens or narrows how soon the controller next
+// reconciles a nonterminal Situation.
+type SituationsCadenceConfig struct {
+	FastSeconds   int `yaml:"fast_seconds"`
+	NormalSeconds int `yaml:"normal_seconds"`
+	SlowSeconds   int `yaml:"slow_seconds"`
+}
+
+// SituationsRetryConfig bounds the controller/store transient-error retry
+// range and its jitter fraction.
+type SituationsRetryConfig struct {
+	MinSeconds    int `yaml:"min_seconds"`
+	MaxSeconds    int `yaml:"max_seconds"`
+	JitterPercent int `yaml:"jitter_percent"`
 }
 
 // RulesConfig configures rule pack loading. The embedded baseline pack is
@@ -557,6 +614,27 @@ func Defaults() Config {
 			LLMIdleProbeAfterSeconds: 300,
 			BroadcastAfterSeconds:    300,
 		},
+		Situations: SituationsConfig{
+			Workers:                     2,
+			ReconcilePollSeconds:        1,
+			LeaseSeconds:                300,
+			HeartbeatSeconds:            30,
+			WebhookRecoveryGraceSeconds: 120,
+			Cadence: SituationsCadenceConfig{
+				FastSeconds:   60,
+				NormalSeconds: 300,
+				SlowSeconds:   900,
+			},
+			MaxL2CallsPerAttempt:    situationsMaxL2CallsPerAttempt,
+			MaxWorkAttemptsPerInput: situationsMaxWorkAttemptsPerInput,
+			AttemptWallSeconds:      180,
+			LLMConcurrency:          2,
+			Retry: SituationsRetryConfig{
+				MinSeconds:    5,
+				MaxSeconds:    300,
+				JitterPercent: 20,
+			},
+		},
 		LogLevel:  "info",
 		LogFormat: "auto",
 	}
@@ -671,6 +749,7 @@ func (c *Config) validate(offline bool) error {
 	errs = append(errs, c.validateHealth()...)
 	errs = append(errs, c.validateTriageSelector()...)
 	errs = append(errs, c.validateMemory()...)
+	errs = append(errs, c.validateSituations()...)
 	if !offline {
 		errs = append(errs, c.validateRules()...)
 	}
@@ -945,6 +1024,63 @@ func (c *Config) validateMemory() []string {
 	if c.Memory.Classifier.Enabled() && c.Memory.Classifier.TimeoutSeconds <= 0 {
 		errs = append(errs, "memory: classifier: timeout_seconds: must be > 0 when mode is shadow or on")
 	}
+	return errs
+}
+
+// validateSituations checks the Plan 2 situation controller surface:
+// positive durations/concurrency, a lease heartbeat strictly shorter than
+// the lease it renews, a jitter fraction in [0,100], and the fixed L2
+// call/work-attempt ceiling (situationsMaxL2CallsPerAttempt,
+// situationsMaxWorkAttemptsPerInput) — Plan 2 does not make either tunable,
+// so any other configured value is rejected rather than silently accepted.
+func (c *Config) validateSituations() []string {
+	var errs []string
+	s := c.Situations
+
+	positive := []struct {
+		name string
+		v    int
+	}{
+		{"situations.workers", s.Workers},
+		{"situations.reconcile_poll_seconds", s.ReconcilePollSeconds},
+		{"situations.lease_seconds", s.LeaseSeconds},
+		{"situations.heartbeat_seconds", s.HeartbeatSeconds},
+		{"situations.webhook_recovery_grace_seconds", s.WebhookRecoveryGraceSeconds},
+		{"situations.cadence.fast_seconds", s.Cadence.FastSeconds},
+		{"situations.cadence.normal_seconds", s.Cadence.NormalSeconds},
+		{"situations.cadence.slow_seconds", s.Cadence.SlowSeconds},
+		{"situations.attempt_wall_seconds", s.AttemptWallSeconds},
+		{"situations.llm_concurrency", s.LLMConcurrency},
+		{"situations.retry.min_seconds", s.Retry.MinSeconds},
+		{"situations.retry.max_seconds", s.Retry.MaxSeconds},
+	}
+	for _, p := range positive {
+		if p.v <= 0 {
+			errs = append(errs, fmt.Sprintf("%s must be > 0", p.name))
+		}
+	}
+
+	if s.HeartbeatSeconds > 0 && s.LeaseSeconds > 0 && s.HeartbeatSeconds >= s.LeaseSeconds {
+		errs = append(errs, fmt.Sprintf(
+			"situations.heartbeat_seconds (%d) must be shorter than situations.lease_seconds (%d)",
+			s.HeartbeatSeconds, s.LeaseSeconds))
+	}
+
+	if s.Retry.JitterPercent < 0 || s.Retry.JitterPercent > 100 {
+		errs = append(errs, fmt.Sprintf("situations.retry.jitter_percent (%d) must be between 0 and 100", s.Retry.JitterPercent))
+	}
+
+	if s.MaxL2CallsPerAttempt != situationsMaxL2CallsPerAttempt {
+		errs = append(errs, fmt.Sprintf(
+			"situations.max_l2_calls_per_attempt must be %d (fixed L2 call accounting; not yet tunable)",
+			situationsMaxL2CallsPerAttempt))
+	}
+	if s.MaxWorkAttemptsPerInput != situationsMaxWorkAttemptsPerInput {
+		errs = append(errs, fmt.Sprintf(
+			"situations.max_work_attempts_per_input must be %d (fixed work-attempt accounting; not yet tunable)",
+			situationsMaxWorkAttemptsPerInput))
+	}
+
 	return errs
 }
 

@@ -3,11 +3,28 @@
 // Package model defines the closed, transport-neutral Situation domain
 // vocabulary shared by the situation controller and the store: lifecycle
 // states, attention levels, timestamp provenance, delivery status, due
-// reasons, terminal reasons, and the Situation aggregate itself. It holds
-// data only — no behavior. All timestamps are UTC.
+// reasons, terminal reasons, material facts, the Assessment contract, and
+// the Situation aggregate itself. It holds data plus closed-enum shape
+// validation — Validate methods reject unknown values and internally
+// inconsistent shapes, but never derive, persist, or call out. All
+// timestamps are UTC.
 package model
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
+
+// validateEnum reports an error unless v is one of allowed. It backs every
+// closed-enum Validate method in this package.
+func validateEnum[T ~string](kind string, v T, allowed ...T) error {
+	for _, a := range allowed {
+		if v == a {
+			return nil
+		}
+	}
+	return fmt.Errorf("model: %s: unknown value %q", kind, v)
+}
 
 // Lifecycle is controller-owned; terminal states never reopen.
 type Lifecycle string
@@ -19,6 +36,19 @@ const (
 	LifecycleClosedUnknown   Lifecycle = "closed_unknown"
 )
 
+// Validate reports an error unless l is one of the closed Lifecycle values.
+func (l Lifecycle) Validate() error {
+	return validateEnum("lifecycle", l,
+		LifecycleActive, LifecycleRecoveryPending, LifecycleRecovered, LifecycleClosedUnknown)
+}
+
+// Terminal reports whether l is a terminal lifecycle (recovered or
+// closed_unknown): terminal lifecycles never reopen and carry no future
+// Operator-contract update promise.
+func (l Lifecycle) Terminal() bool {
+	return l == LifecycleRecovered || l == LifecycleClosedUnknown
+}
+
 // Attention expresses the current operator attention contract.
 type Attention string
 
@@ -27,6 +57,11 @@ const (
 	AttentionInvestigate Attention = "investigate"
 	AttentionUrgent      Attention = "urgent"
 )
+
+// Validate reports an error unless a is one of the closed Attention values.
+func (a Attention) Validate() error {
+	return validateEnum("attention", a, AttentionObserve, AttentionInvestigate, AttentionUrgent)
+}
 
 // SourceTimeBasis records the provenance of a canonical source timestamp.
 type SourceTimeBasis string
