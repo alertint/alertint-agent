@@ -379,15 +379,14 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 	cor := correlator.New(corCfg, st, incidentSink{skill: skill}, logger)
 
-	// SetAuditor/SetRejudger/SetTriageFailureNotifier are safe to wire here,
-	// before reconstruction: none of them is reachable from ApplyDelivery's
+	// SetRejudger/SetTriageFailureNotifier are safe to wire here, before
+	// reconstruction: neither is reachable from ApplyDelivery's
 	// durable-dispatch path (Rejudge is deliberately never called
-	// synchronously from a delivery commit; the occurrence-attach audit call
-	// and the triage-exhausted notifier both live only on the legacy
-	// Accept/handleAlert path and the correlator's own internal ticker loop,
-	// neither of which runs during reconstruction). SetResolutionNotifier and
-	// SetOccurrenceNotifier are NOT wired here — see startCorrelator below.
-	cor.SetAuditor(auditor)
+	// synchronously from a delivery commit, and the triage-exhausted
+	// notifier fires only from the correlator's own internal ticker loop,
+	// which isn't running during reconstruction). SetAuditor,
+	// SetResolutionNotifier, and SetOccurrenceNotifier are NOT wired here —
+	// all three ARE reachable from ApplyDelivery — see startCorrelator below.
 	cor.SetRejudger(skill)
 	cor.SetTriageFailureNotifier(notifier)
 
@@ -426,19 +425,23 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 			logReconstructionReport(logger, report)
 			return nil
 		},
-		// SetResolutionNotifier/SetOccurrenceNotifier are wired here — between
-		// reconstruct and cor.Start, never before — because both are
-		// synchronously reachable from ApplyDelivery's durable-dispatch path
-		// (a queued resolved delivery whose commit settles an Incident calls
-		// the resolution notifier; a queued firing delivery that collapses
-		// into a recurrence occurrence calls the occurrence notifier). Wiring
-		// them before reconstruction would let a plain crash-and-restart with
-		// ordinary queued webhook traffic post to Slack from reconstruction —
-		// exactly the outward effect this task's Reconstructor must never
-		// cause. The Setters' own doc comments require only "after New,
-		// before Start", so this ordering is legal; the Correlator's loop
-		// itself isn't running yet either.
+		// SetAuditor/SetResolutionNotifier/SetOccurrenceNotifier are wired
+		// here — between reconstruct and cor.Start, never before — because
+		// all three are synchronously reachable from ApplyDelivery's
+		// durable-dispatch path (a queued resolved delivery whose commit
+		// settles an Incident calls the resolution notifier; a queued firing
+		// delivery that collapses into a recurrence occurrence calls the
+		// occurrence notifier and appends the occurrence_attached audit
+		// event; a queued retry attach appends triage_member_attached).
+		// Wiring them before reconstruction would let a plain
+		// crash-and-restart with ordinary queued webhook traffic post to
+		// Slack — or append audit rows — from reconstruction: exactly the
+		// outward effects the spec's "reconstruction invokes no notifier,
+		// audit callback, ..." acceptance forbids. The Setters' own doc
+		// comments require only "after New, before Start", so this ordering
+		// is legal; the Correlator's loop itself isn't running yet either.
 		startCorrelator: func(ctx context.Context) error {
+			cor.SetAuditor(auditor)
 			cor.SetResolutionNotifier(notifyresolution.New(notifier, st))
 			cor.SetOccurrenceNotifier(notifier)
 			return cor.Start(ctx)

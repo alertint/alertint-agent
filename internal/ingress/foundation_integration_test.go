@@ -404,16 +404,17 @@ func TestFoundationStoreAcceptanceFailureReturns503WithZeroCommittedRows(t *test
 // attach paths a single firing delivery never exercises, which would make
 // a bare zero-calls assertion vacuous (it would pass identically whether
 // or not reconstruction ever wired a notifier early). So this fixture
-// queues a second, resolved delivery for the SAME fingerprint after
-// moving the Incident to "ready" — once that Incident is no longer
-// "collecting", applying its resolved follow-up routes through
-// Correlator.applyResolvedDeliveryPlan, which fully resolves the
-// Incident's only member and explicitly checks
-// "result.Resolved && c.resolutionNotifier != nil" before calling
-// OnIncidentResolved. Reconstruction drains that queued resolved
-// delivery, so this really does reach the outward surface: the test
-// asserts the Incident actually resolved (proving the branch was hit),
-// separately from asserting the notifier fake saw zero calls.
+// queues TWO follow-ups that stay pending across the crash: a resolved
+// delivery for the first group's "ready" Incident, which routes through
+// Correlator.applyResolvedDeliveryPlan and its
+// "result.Resolved && c.resolutionNotifier != nil" check before calling
+// OnIncidentResolved; and a firing delivery for a second group's judged
+// Incident, which routes through applyRecurrenceDeliveryPlan and its
+// occurrence-notifier and incident.occurrence_attached auditor calls.
+// Reconstruction drains both, so this really does reach the outward
+// surface: the test asserts the first Incident actually resolved and the
+// second actually gained an occurrence (proving both branches were hit),
+// separately from asserting the fakes saw zero calls.
 //
 // There is no structural guard inside Reconstructor/DispatchWorker that
 // suppresses notifications during a reconstruction pass — the SAME
@@ -421,14 +422,14 @@ func TestFoundationStoreAcceptanceFailureReturns503WithZeroCommittedRows(t *test
 // reconstruction and during ordinary live operation afterward. The only
 // thing that keeps reconstruction silent in production is cmd/alertint's
 // wiring order (see cmd/alertint/main.go's foundationSequence):
-// SetResolutionNotifier/SetOccurrenceNotifier are called only from
-// startCorrelator, strictly AFTER Reconstruct() returns — the fix for the
-// exact ordering bug internal/situation/reconstruct_test.go's
+// SetAuditor/SetResolutionNotifier/SetOccurrenceNotifier are called only
+// from startCorrelator, strictly AFTER Reconstruct() returns — the fix
+// for the exact ordering bug internal/situation/reconstruct_test.go's
 // TestNotifiersWiredBeforeReconstructionWouldLeakOutward (Task 8) proves
 // would otherwise leak. This test reproduces that same safe ordering
-// (wire IncidentSink/Auditor immediately — matching cmd/alertint, and
-// harmless since neither is reachable from this fixture either — then
-// wire ResolutionNotifier/OccurrenceNotifier only after Run returns) so
+// (wire only the IncidentSink immediately — matching cmd/alertint, and
+// harmless since it is not reachable from this fixture — then wire
+// Auditor/ResolutionNotifier/OccurrenceNotifier only after Run returns) so
 // its zero-calls assertion is a real consequence of that discipline, not
 // an artifact of a fixture that could never reach the branch regardless
 // of wiring order. This complements, not duplicates,
@@ -498,16 +499,46 @@ func TestFoundationReconstructionInvokesNoOutwardSurface(t *testing.T) {
 		t.Fatalf("mark incident ready: %v", err)
 	}
 
-	// Queue a resolved follow-up for the SAME fingerprint. Its dispatch
-	// stays pending until reconstruction drains it; once the Incident is
-	// "ready" (not "collecting"), applying a resolved delivery for its
-	// only member routes through Correlator.applyResolvedDeliveryPlan,
-	// which fully resolves the Incident and explicitly checks
+	// A second group seeds the OTHER outward branch: a judged Incident whose
+	// queued firing follow-up recurrence-collapses DURING reconstruction —
+	// the path that appends the incident.occurrence_attached audit event and
+	// calls the occurrence notifier (applyRecurrenceDeliveryPlan). Without
+	// it, the Auditor half of the zero-calls assertion would be vacuous: no
+	// fixture branch could reach an audit site regardless of when the
+	// Auditor was wired. This whole block runs BEFORE either follow-up is
+	// posted — its drain applies every dispatch pending at that moment, so
+	// the two follow-ups must only be queued after it.
+	postAndExpect204(t, srv, foundationGroupPayload("silent-recurrence", "Noisy", "fp-noisy-1", at))
+	if _, err := preCrashDispatch.Drain(ctx); err != nil {
+		t.Fatalf("pre-crash dispatch drain (second group): %v", err)
+	}
+	var judgedID string
+	if err := st.DB().QueryRowContext(ctx, `SELECT id FROM incidents WHERE id <> ?`, incidentID).Scan(&judgedID); err != nil {
+		t.Fatalf("read second incident id: %v", err)
+	}
+	// Judge it directly (status + last_judged_at are all the recurrence
+	// planner reads) so the follow-up below is a genuine recurrence
+	// candidate, not a join into a still-collecting window. Wall-clock
+	// time, because the recurrence horizon compares against the follow-up
+	// delivery's real HTTP receipt time.
+	judgedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := st.DB().ExecContext(ctx, `UPDATE incidents SET status='analyzed', last_judged_at=?, updated_at=? WHERE id=?`, judgedAt, judgedAt, judgedID); err != nil {
+		t.Fatalf("judge second incident: %v", err)
+	}
+
+	// Both follow-ups stay queued (pending dispatches) across the crash:
+	// reconstruction, not any live worker, is what must drain them.
+	//
+	// The resolved follow-up reuses the FIRST group's fingerprint. Once
+	// that Incident is "ready" (not "collecting"), applying a resolved
+	// delivery for its only member routes through
+	// Correlator.applyResolvedDeliveryPlan, which fully resolves the
+	// Incident and explicitly checks
 	// result.Resolved && c.resolutionNotifier != nil before calling
-	// OnIncidentResolved — the actual outward surface a Task-8-style
-	// ordering bug would leak from. Without this follow-up, the
-	// zero-outward-calls assertion below would be vacuous.
+	// OnIncidentResolved — the notifier surface a Task-8-style ordering
+	// bug would leak from.
 	postAndExpect204(t, srv, foundationResolvedPayload("silent-reconstruction", "Quiet", "fp-silent", at, at.Add(time.Minute)))
+	postAndExpect204(t, srv, foundationGroupPayload("silent-recurrence", "Noisy", "fp-noisy-2", at.Add(time.Minute)))
 
 	srv.Close()
 	if err := st.Close(); err != nil {
@@ -526,14 +557,15 @@ func TestFoundationReconstructionInvokesNoOutwardSurface(t *testing.T) {
 	auditBefore := countRows(t, st2, `SELECT COUNT(*) FROM audit_log`)
 
 	spy := &foundationOutwardSpy{}
-	// IncidentSink and Auditor are wired from construction, matching
+	// Only the IncidentSink is wired from construction, matching
 	// cmd/alertint's real ordering exactly (see the comment block above) —
-	// harmless here since this fixture never reaches either's call sites.
-	// ResolutionNotifier/OccurrenceNotifier are deliberately NOT wired yet:
-	// cmd/alertint only wires those from startCorrelator, strictly after
-	// Reconstruct() returns.
+	// harmless here since this fixture never reaches its call site.
+	// Auditor, ResolutionNotifier, and OccurrenceNotifier are deliberately
+	// NOT wired yet: cmd/alertint only wires those from startCorrelator,
+	// strictly after Reconstruct() returns, because this fixture's queued
+	// follow-ups DO reach all three call sites during the reconstruction
+	// drain.
 	cor := correlator.New(correlator.Config{WindowSeconds: 60}, st2, spy, nil)
-	cor.SetAuditor(spy)
 
 	dispatch := correlator.NewDispatchWorker(st2, cor, correlator.WorkerConfig{Owner: "silent:dispatch"}, nil)
 	inputs := situation.NewInputWorker(st2, situation.WorkerConfig{Owner: "silent:input"}, nil)
@@ -543,8 +575,8 @@ func TestFoundationReconstructionInvokesNoOutwardSurface(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconstruct: %v", err)
 	}
-	if report.ReplayedDeliveries != 1 {
-		t.Fatalf("replayed deliveries = %d, want 1 (the queued resolved follow-up; the firing delivery was already applied pre-crash)", report.ReplayedDeliveries)
+	if report.ReplayedDeliveries != 2 {
+		t.Fatalf("replayed deliveries = %d, want 2 (the queued resolved follow-up and the queued recurrence follow-up; the initial firing deliveries were already applied pre-crash)", report.ReplayedDeliveries)
 	}
 	if report.ReplayedInputs < 1 {
 		t.Fatalf("replayed inputs = %d, want at least 1", report.ReplayedInputs)
@@ -567,22 +599,31 @@ func TestFoundationReconstructionInvokesNoOutwardSurface(t *testing.T) {
 		t.Fatalf("incident status after reconstruction = %s, want resolved (otherwise this test is vacuous)", incidentStatus)
 	}
 
-	if got := spy.total(); got != 0 {
-		t.Fatalf("outward calls during reconstruction (Auditor/IncidentSink only — ResolutionNotifier/OccurrenceNotifier not wired yet) = %d, want 0", got)
+	// Same proof for the second branch: the queued firing follow-up really
+	// did collapse into the judged Incident as an occurrence during
+	// reconstruction — only the audit append and the notification must have
+	// been suppressed, never the durable attach itself.
+	if got := countRows(t, st2, `SELECT COUNT(*) FROM incident_occurrences WHERE incident_id = ?`, judgedID); got != 1 {
+		t.Fatalf("occurrences on judged incident after reconstruction = %d, want 1 (otherwise the audit half of this test is vacuous)", got)
 	}
 
-	// NOW wire the deferred notifiers, exactly where cmd/alertint's
+	if got := spy.total(); got != 0 {
+		t.Fatalf("outward calls during reconstruction (IncidentSink only — Auditor/ResolutionNotifier/OccurrenceNotifier not wired yet) = %d, want 0", got)
+	}
+
+	// NOW wire the deferred outward surface, exactly where cmd/alertint's
 	// startCorrelator does: strictly after reconstruction, never before.
+	cor.SetAuditor(spy)
 	cor.SetResolutionNotifier(spy)
 	cor.SetOccurrenceNotifier(spy)
 	if got := spy.total(); got != 0 {
-		t.Fatalf("wiring the deferred notifiers after reconstruction must not itself trigger a call: got %d", got)
+		t.Fatalf("wiring the deferred outward surface after reconstruction must not itself trigger a call: got %d", got)
 	}
 	if got := countRows(t, st2, `SELECT COUNT(*) FROM audit_log`); got != auditBefore {
 		t.Fatalf("audit_log rows: %d before reconstruction, %d after — reconstruction itself must never audit", auditBefore, got)
 	}
-	if got := countRows(t, st2, `SELECT COUNT(*) FROM situations`); got != 1 {
-		t.Fatalf("situations = %d, want exactly 1", got)
+	if got := countRows(t, st2, `SELECT COUNT(*) FROM situations`); got != 2 {
+		t.Fatalf("situations = %d, want exactly 2 (one per fixture group)", got)
 	}
 }
 
