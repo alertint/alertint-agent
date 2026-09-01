@@ -95,18 +95,32 @@ func triagePhaseFor(t *testing.T, st *Store, incidentID string) TriagePhase {
 // opens it through Store.Open — which applies every migration through
 // 0016 in one pass.
 //
-// Before this task, a restart's own Go-level reconciliation
-// (ListLegacyReadyIncidents + SeedIncidentTriage, guarded by a one-hour
-// startup horizon) was the only thing that gave these orphaned rows a
-// schedule. Migration 0016's own upgrade backfill ("ready Incident with no
-// Triage row" -> awaiting_decision at attempt zero, spec's Upgrade mapping
-// table) now applies uniformly to every ready-without-schedule Incident
-// regardless of how old it is — a v0.13.4-vintage row included — so that
-// gap is closed at migration time, before any Go-level reconciliation runs.
-// Whether stale unjudged work is worth a fresh controller decision is now
-// the controller's own B+ gate judgment (Task 6/8 territory), not a blind
-// pre-controller SQL heuristic, so ListLegacyReadyIncidents correctly finds
-// nothing left to reconcile.
+// What this proves: migration 0016's own upgrade backfill ("ready Incident
+// with no Triage row" -> awaiting_decision at attempt zero, spec's Upgrade
+// mapping table) closes the one-time, v0.13.4-vintage gap at migration
+// time — a pre-existing "ready"-without-schedule row present in a database
+// being upgraded now gets awaiting_decision directly from the migration,
+// before any Go-level reconciliation ever runs. So for THIS test's
+// fixture (rows that pre-date this migration), ListLegacyReadyIncidents
+// correctly finds none of them left to reconcile. Whether stale unjudged
+// work is worth a fresh controller decision is now the controller's own
+// B+ gate judgment (Task 6/8 territory), not a blind pre-controller SQL
+// heuristic — but that judgment only applies to rows the migration itself
+// already swept up.
+//
+// This does NOT make ListLegacyReadyIncidents dead code in general. It
+// remains live, necessary production code: reconcileUnscheduledTriage in
+// internal/correlator/triage_retry.go calls it every Correlator tick (not
+// just at startup) to catch a separate, ongoing, non-transactional race —
+// flushExpired in internal/correlator/correlator.go calls
+// MarkIncidentReadyWithSituationInput and SeedIncidentTriage as two
+// separate, non-transactional store calls, and if the second fails right
+// after the first commits, the Incident is left "ready" with no triage
+// row, otherwise invisible to every later scan. Migration 0016's backfill
+// runs exactly once, at DB-upgrade time; it cannot repair an Incident that
+// enters this state during live operation afterward — only the
+// still-running reconciliation loop can, which is precisely why it keeps
+// calling ListLegacyReadyIncidents every tick.
 func TestTriageUpgrade_V0134ReadyIncidentsBecomeAwaitingDecision(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "legacy.db")
