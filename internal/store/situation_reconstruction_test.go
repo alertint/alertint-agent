@@ -288,6 +288,60 @@ func TestRecoverExpiredFoundationLeasesNoOpWhenNothingExpired(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------
+// CountDeadLetteredFoundationWork
+// ----------------------------------------------------------------------
+
+// TestCountDeadLetteredFoundationWorkCountsOnlyFailedRows seeds one
+// dead-lettered (status='failed') row and one still-live row in each of
+// the two fenced dispatch/input outbox tables, and asserts the count
+// reports exactly the dead-lettered ones — the rows MaxAttempts exhausted
+// and every future claim will skip forever (docs/concepts/architecture.md:
+// "nothing is ever silently dropped").
+func TestCountDeadLetteredFoundationWorkCountsOnlyFailedRows(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+
+	if _, err := st.AcceptDeliveries(ctx, []DeliveryInput{
+		deliveryFixture("d-failed", "fp-failed", base),
+		deliveryFixture("d-pending", "fp-pending", base),
+	}); err != nil {
+		t.Fatalf("accept deliveries: %v", err)
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE alert_delivery_dispatches SET status = 'failed' WHERE delivery_id = 'd-failed'`); err != nil {
+		t.Fatalf("dead-letter dispatch: %v", err)
+	}
+
+	insertIncidentAndInput(t, st, "inc-failed-input", "input-failed", "group-failed", base)
+	if _, err := st.db.ExecContext(ctx, `UPDATE situation_input_outbox SET status = 'failed' WHERE id = 'input-failed'`); err != nil {
+		t.Fatalf("dead-letter situation input: %v", err)
+	}
+	insertIncidentAndInput(t, st, "inc-pending-input", "input-pending", "group-pending", base)
+
+	counts, err := st.CountDeadLetteredFoundationWork(ctx)
+	if err != nil {
+		t.Fatalf("CountDeadLetteredFoundationWork: %v", err)
+	}
+	if counts.AlertDispatches != 1 {
+		t.Errorf("AlertDispatches = %d, want 1", counts.AlertDispatches)
+	}
+	if counts.SituationInputs != 1 {
+		t.Errorf("SituationInputs = %d, want 1", counts.SituationInputs)
+	}
+}
+
+func TestCountDeadLetteredFoundationWorkZeroOnEmptyStore(t *testing.T) {
+	st := newTestStore(t)
+	counts, err := st.CountDeadLetteredFoundationWork(context.Background())
+	if err != nil {
+		t.Fatalf("CountDeadLetteredFoundationWork on empty store: %v", err)
+	}
+	if counts != (DeadLetterCounts{}) {
+		t.Fatalf("counts = %+v, want zero value", counts)
+	}
+}
+
+// ----------------------------------------------------------------------
 // UnrepresentedOperationalIncidents
 // ----------------------------------------------------------------------
 

@@ -423,15 +423,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 			if err != nil {
 				return fmt.Errorf("situation foundation reconstruction: %w", err)
 			}
-			logger.Info("situation foundation reconstructed",
-				slog.Int64("alert_dispatch_leases_recovered", report.RecoveredLeases.AlertDispatches),
-				slog.Int64("situation_input_leases_recovered", report.RecoveredLeases.SituationInputs),
-				slog.Int64("situation_leases_recovered", report.RecoveredLeases.Situations),
-				slog.Int("deliveries_replayed", report.ReplayedDeliveries),
-				slog.Int("inputs_replayed", report.ReplayedInputs),
-				slog.Int("groups_represented", report.RepresentedGroups),
-				slog.Int("incidents_represented", report.RepresentedIncidents),
-			)
+			logReconstructionReport(logger, report)
 			return nil
 		},
 		// SetResolutionNotifier/SetOccurrenceNotifier are wired here — between
@@ -451,12 +443,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 			cor.SetOccurrenceNotifier(notifier)
 			return cor.Start(ctx)
 		},
-		startInputWorker: func(ctx context.Context) {
-			rt.inputs.Start(ctx)
-		},
-		startDispatchWorker: func(ctx context.Context) {
-			rt.dispatch.Start(ctx)
-		},
+		startWorkers: rt.Start,
 		startReceivers: func() error {
 			var err error
 			recvSrv, recvErrCh, err = startReceivers(cfg, st, auditor, healthReg, llmHealth, rt.WakeDispatch, logger)
@@ -490,14 +477,15 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), ingress.DefaultShutdownTimeout)
 	defer cancel()
 
-	// Receivers, then the dispatch worker, then the input worker, then the
-	// Correlator: Receivers stopping first means no new inbound work can be
-	// durably accepted; the two queue workers stopping next means nothing
-	// already durably queued goes unclaimed mid-drain; the Correlator
-	// stopping last — via stopCorrelator, the same sync.Once-guarded call
-	// the defer above falls back to on every other exit path — means it
-	// keeps serving fixed-window expiry and Triage retry for exactly as
-	// long as anything upstream could still be handing it work.
+	// Receivers, then the foundation workers (rt.Stop: dispatch, then
+	// input), then the Correlator: Receivers stopping first means no new
+	// inbound work can be durably accepted; the queue workers stopping next
+	// means nothing already durably queued goes unclaimed mid-drain; the
+	// Correlator stopping last — via stopCorrelator, the same
+	// sync.Once-guarded call the defer above falls back to on every other
+	// exit path — means it keeps serving fixed-window expiry and Triage
+	// retry for exactly as long as anything upstream could still be handing
+	// it work.
 	stopSeq := foundationStopSequence{
 		stopReceivers: func() error {
 			if recvSrv == nil {
@@ -505,9 +493,8 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 			}
 			return recvSrv.Shutdown(shutdownCtx)
 		},
-		stopDispatchWorker: rt.dispatch.Stop,
-		stopInputWorker:    rt.inputs.Stop,
-		stopCorrelator:     stopCorrelator,
+		stopWorkers:    rt.Stop,
+		stopCorrelator: stopCorrelator,
 	}
 	if err := stopSeq.run(shutdownCtx); err != nil {
 		logger.Error("situation foundation shutdown failed", slog.String("err", err.Error()))

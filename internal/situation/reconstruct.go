@@ -40,14 +40,20 @@ type LeaseRecovery = store.LeaseRecovery
 // ReconstructSituation needs to represent it.
 type UpgradeIncident = store.UpgradeIncident
 
+// DeadLetterCounts reports how many rows in each fenced dispatch/input
+// outbox table have permanently exhausted retries (status='failed') — see
+// store.DeadLetterCounts for why this exists.
+type DeadLetterCounts = store.DeadLetterCounts
+
 // ReconstructStore is the narrow slice of *store.Store the Reconstructor
-// depends on: recovering expired leases and representing every
-// operational Incident that has no Situation yet. Every method here is
-// either a straight lease release or a database projection — none of
-// them may call a notifier, LLM, connector, or Slack dependency, and the
-// Reconstructor never asks them to.
+// depends on: recovering expired leases, counting dead-lettered work, and
+// representing every operational Incident that has no Situation yet.
+// Every method here is either a straight lease release or a database
+// projection — none of them may call a notifier, LLM, connector, or Slack
+// dependency, and the Reconstructor never asks them to.
 type ReconstructStore interface {
 	RecoverExpiredFoundationLeases(ctx context.Context, now time.Time) (LeaseRecovery, error)
+	CountDeadLetteredFoundationWork(ctx context.Context) (DeadLetterCounts, error)
 	UnrepresentedOperationalIncidents(ctx context.Context) ([]UpgradeIncident, error)
 	ReconstructSituation(ctx context.Context, groupKey string, incidents []UpgradeIncident, now time.Time) (string, error)
 }
@@ -67,6 +73,7 @@ type Reconstruction struct {
 	ReplayedInputs       int
 	RepresentedGroups    int
 	RepresentedIncidents int
+	DeadLettered         DeadLetterCounts
 }
 
 // Reconstructor performs the fixed startup order recover expired leases
@@ -148,6 +155,14 @@ func (r *Reconstructor) Run(ctx context.Context) (Reconstruction, error) {
 		report.RepresentedGroups++
 		report.RepresentedIncidents += len(group.incidents)
 	}
+
+	deadLettered, err := r.store.CountDeadLetteredFoundationWork(ctx)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("situation: count dead-lettered foundation work: %w", err))
+	} else {
+		report.DeadLettered = deadLettered
+	}
+
 	return report, errors.Join(errs...)
 }
 

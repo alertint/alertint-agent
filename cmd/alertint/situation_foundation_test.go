@@ -69,10 +69,8 @@ func tracedFoundationSequence(tr *tracer) foundationSequence {
 			tr.add("start_correlator")
 			return nil
 		},
-		startInputWorker: func(context.Context) {
+		startWorkers: func(context.Context) {
 			tr.add("start_input_worker")
-		},
-		startDispatchWorker: func(context.Context) {
 			tr.add("start_dispatch_worker")
 		},
 		startReceivers: func() error {
@@ -165,11 +163,8 @@ func TestFoundationStopSequenceOrdersEveryPhase(t *testing.T) {
 			tr.add("stop_receivers")
 			return nil
 		},
-		stopDispatchWorker: func(context.Context) error {
+		stopWorkers: func(context.Context) error {
 			tr.add("stop_dispatch_worker")
-			return nil
-		},
-		stopInputWorker: func(context.Context) error {
 			tr.add("stop_input_worker")
 			return nil
 		},
@@ -198,13 +193,10 @@ func TestFoundationStopSequenceRunsEveryPhaseDespiteEarlierFailures(t *testing.T
 			tr.add("stop_receivers")
 			return receiversErr
 		},
-		stopDispatchWorker: func(context.Context) error {
+		stopWorkers: func(context.Context) error {
 			tr.add("stop_dispatch_worker")
-			return dispatchErr
-		},
-		stopInputWorker: func(context.Context) error {
 			tr.add("stop_input_worker")
-			return nil
+			return dispatchErr
 		},
 		stopCorrelator: func() {
 			tr.add("stop_correlator")

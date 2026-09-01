@@ -46,6 +46,19 @@ type LeaseRecovery struct {
 	Situations      int64
 }
 
+// DeadLetterCounts reports how many rows in each fenced dispatch/input
+// outbox table have permanently exhausted retries (status='failed') —
+// dead-lettered work this plan promises is "never silently dropped"
+// (docs/concepts/architecture.md): the row is durably on disk, but is
+// excluded from every future claim and otherwise invisible without
+// hand-written SQL. CountDeadLetteredFoundationWork surfaces it once per
+// Reconstructor.Run pass so a stuck delivery or Situation input has a
+// startup-visible tripwire.
+type DeadLetterCounts struct {
+	AlertDispatches int
+	SituationInputs int
+}
+
 // UpgradeIncident is one operational Incident with no Situation membership
 // yet, carrying the persisted Incident/delivery-derived times
 // ReconstructSituation needs to represent it — never a live read of
@@ -108,6 +121,27 @@ func (s *Store) RecoverExpiredFoundationLeases(ctx context.Context, now time.Tim
 		return LeaseRecovery{}, fmt.Errorf("store: commit recover expired foundation leases: %w", err)
 	}
 	return rec, nil
+}
+
+// CountDeadLetteredFoundationWork counts every permanently failed
+// (status='failed') row across the two fenced dispatch/input outbox
+// tables — rows MaxAttempts exhausted and future claims will never pick up
+// again. Two independent single-table counts, not one transaction: this is
+// a read-only snapshot for a startup report, not a consistency-sensitive
+// decision.
+func (s *Store) CountDeadLetteredFoundationWork(ctx context.Context) (DeadLetterCounts, error) {
+	var counts DeadLetterCounts
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM alert_delivery_dispatches WHERE status = 'failed'`,
+	).Scan(&counts.AlertDispatches); err != nil {
+		return DeadLetterCounts{}, fmt.Errorf("store: count dead-lettered alert dispatches: %w", err)
+	}
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM situation_input_outbox WHERE status = 'failed'`,
+	).Scan(&counts.SituationInputs); err != nil {
+		return DeadLetterCounts{}, fmt.Errorf("store: count dead-lettered situation inputs: %w", err)
+	}
+	return counts, nil
 }
 
 // execRowsAffected runs one UPDATE and returns RowsAffected.

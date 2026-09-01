@@ -65,6 +65,35 @@ func (r *foundationRuntime) Reconstruct(ctx context.Context) (situation.Reconstr
 	return r.reconstructor.Run(ctx)
 }
 
+// logReconstructionReport logs one Reconstructor.Run pass's report at
+// startup, then — if either fenced outbox table has permanently failed
+// (dead-lettered, MaxAttempts exhausted) rows — warns loudly: a
+// dead-lettered row is durably on disk but excluded from every future
+// claim, and otherwise invisible without hand-written SQL
+// (docs/concepts/architecture.md: "nothing is ever silently dropped").
+// Factored out of runServe's own reconstruct closure to keep that
+// function's branching count where it belongs — on the actual startup
+// decision tree, not on how a report gets logged.
+func logReconstructionReport(logger *slog.Logger, report situation.Reconstruction) {
+	logger.Info("situation foundation reconstructed",
+		slog.Int64("alert_dispatch_leases_recovered", report.RecoveredLeases.AlertDispatches),
+		slog.Int64("situation_input_leases_recovered", report.RecoveredLeases.SituationInputs),
+		slog.Int64("situation_leases_recovered", report.RecoveredLeases.Situations),
+		slog.Int("deliveries_replayed", report.ReplayedDeliveries),
+		slog.Int("inputs_replayed", report.ReplayedInputs),
+		slog.Int("groups_represented", report.RepresentedGroups),
+		slog.Int("incidents_represented", report.RepresentedIncidents),
+		slog.Int("dead_lettered_dispatches", report.DeadLettered.AlertDispatches),
+		slog.Int("dead_lettered_inputs", report.DeadLettered.SituationInputs),
+	)
+	if report.DeadLettered.AlertDispatches > 0 || report.DeadLettered.SituationInputs > 0 {
+		logger.Warn("situation foundation has dead-lettered work excluded from future claims",
+			slog.Int("dead_lettered_dispatches", report.DeadLettered.AlertDispatches),
+			slog.Int("dead_lettered_inputs", report.DeadLettered.SituationInputs),
+		)
+	}
+}
+
 // Start launches the input worker, then the dispatch worker, each on its
 // own background schedule. Call only after Reconstruct has succeeded.
 func (r *foundationRuntime) Start(ctx context.Context) {
@@ -113,16 +142,19 @@ func (r *foundationRuntime) WakeDispatch() {
 // foundationSequence composes reconstruction, Correlator start, worker
 // start, and Receiver start in the exact order this plan's startup
 // invariant requires: reconstruct -> start the Correlator -> start the
-// input worker -> start the dispatch worker -> start Receivers. run stops
-// at the first failure, so a reconstruction error — or a Correlator start
-// failure — prevents Receivers, and everything after it, from ever
-// starting.
+// foundation workers (input, then dispatch — foundationRuntime.Start's own
+// order) -> start Receivers. run stops at the first failure, so a
+// reconstruction error — or a Correlator start failure — prevents
+// Receivers, and everything after it, from ever starting. startWorkers is
+// always the real process's foundationRuntime.Start: main wires it as
+// exactly rt.Start, never as separate per-worker closures, so the order
+// guarantee foundationRuntime.Start/Stop's own tests prove is the order
+// the real process actually executes.
 type foundationSequence struct {
-	reconstruct         func(ctx context.Context) error
-	startCorrelator     func(ctx context.Context) error
-	startInputWorker    func(ctx context.Context)
-	startDispatchWorker func(ctx context.Context)
-	startReceivers      func() error
+	reconstruct     func(ctx context.Context) error
+	startCorrelator func(ctx context.Context) error
+	startWorkers    func(ctx context.Context)
+	startReceivers  func() error
 }
 
 func (f foundationSequence) run(ctx context.Context) error {
@@ -132,27 +164,29 @@ func (f foundationSequence) run(ctx context.Context) error {
 	if err := f.startCorrelator(ctx); err != nil {
 		return err
 	}
-	f.startInputWorker(ctx)
-	f.startDispatchWorker(ctx)
+	f.startWorkers(ctx)
 	return f.startReceivers()
 }
 
 // foundationStopSequence composes the shutdown mirror of
-// foundationSequence: stop Receivers, then the dispatch worker, then the
-// input worker, then the Correlator. Receivers stopping first means no
-// new inbound work can be durably accepted; the dispatch and input
-// workers stopping next means nothing already durably queued goes
-// unclaimed mid-drain; the Correlator stopping last means it keeps
-// serving its own fixed-window expiry and Triage retry schedule for
-// exactly as long as anything upstream could still be handing it work.
-// run collects every stop error with errors.Join rather than stopping
-// early, since every later stage must still get a chance to shut down
-// even if an earlier one failed.
+// foundationSequence: stop Receivers, then the foundation workers
+// (dispatch, then input — foundationRuntime.Stop's own order), then the
+// Correlator. Receivers stopping first means no new inbound work can be
+// durably accepted; the workers stopping next means nothing already
+// durably queued goes unclaimed mid-drain; the Correlator stopping last
+// means it keeps serving its own fixed-window expiry and Triage retry
+// schedule for exactly as long as anything upstream could still be
+// handing it work. run collects every stop error with errors.Join rather
+// than stopping early, since every later stage must still get a chance to
+// shut down even if an earlier one failed. stopWorkers is always the real
+// process's foundationRuntime.Stop: main wires it as exactly rt.Stop,
+// never as separate per-worker closures, so
+// TestFoundationRuntimeStopsDispatchBeforeInputs proves the order the
+// real process actually executes.
 type foundationStopSequence struct {
-	stopReceivers      func() error
-	stopDispatchWorker func(ctx context.Context) error
-	stopInputWorker    func(ctx context.Context) error
-	stopCorrelator     func()
+	stopReceivers  func() error
+	stopWorkers    func(ctx context.Context) error
+	stopCorrelator func()
 }
 
 func (f foundationStopSequence) run(ctx context.Context) error {
@@ -160,10 +194,7 @@ func (f foundationStopSequence) run(ctx context.Context) error {
 	if err := f.stopReceivers(); err != nil {
 		errs = append(errs, err)
 	}
-	if err := f.stopDispatchWorker(ctx); err != nil {
-		errs = append(errs, err)
-	}
-	if err := f.stopInputWorker(ctx); err != nil {
+	if err := f.stopWorkers(ctx); err != nil {
 		errs = append(errs, err)
 	}
 	f.stopCorrelator()

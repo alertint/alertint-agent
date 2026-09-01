@@ -315,6 +315,43 @@ func TestReconstructorRepresentsEveryOperationalIncidentWithoutPublishing(t *tes
 	assertOperationalIncidentsRepresented(t, st)
 }
 
+// TestReconstructorReportsDeadLetteredWork proves a permanently failed
+// (status='failed', MaxAttempts exhausted) row in each fenced outbox table
+// surfaces on the report Run returns — the startup-visible tripwire
+// docs/concepts/architecture.md's "nothing is ever silently dropped"
+// promise depends on (see store.CountDeadLetteredFoundationWork).
+func TestReconstructorReportsDeadLetteredWork(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, err := store.Open(ctx, filepath.Join(dir, "dead-letter.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	if _, err := st.AcceptDeliveries(ctx, []store.DeliveryInput{
+		firingDeliveryFixture("d-dead", "fp-dead", "group:dead", now),
+	}); err != nil {
+		t.Fatalf("accept delivery: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `UPDATE alert_delivery_dispatches SET status = 'failed' WHERE delivery_id = 'd-dead'`); err != nil {
+		t.Fatalf("dead-letter dispatch: %v", err)
+	}
+
+	r := NewReconstructor(st, fixedClock)
+	report, err := r.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if report.DeadLettered.AlertDispatches != 1 {
+		t.Fatalf("DeadLettered.AlertDispatches = %d, want 1", report.DeadLettered.AlertDispatches)
+	}
+	if report.DeadLettered.SituationInputs != 0 {
+		t.Fatalf("DeadLettered.SituationInputs = %d, want 0", report.DeadLettered.SituationInputs)
+	}
+}
+
 func TestReconstructorSecondRunCreatesOrAttachesNothingNew(t *testing.T) {
 	st, dispatch, inputs, notifier := reconstructionFixture(t)
 	r := NewReconstructor(st, fixedClock).WithReplay(dispatch, inputs)
@@ -420,6 +457,9 @@ type fakeReconstructStore struct {
 	recoverErr error
 	recovered  LeaseRecovery
 
+	deadLettered    DeadLetterCounts
+	deadLetteredErr error
+
 	incidents    []UpgradeIncident
 	incidentsErr error
 
@@ -429,6 +469,10 @@ type fakeReconstructStore struct {
 
 func (f *fakeReconstructStore) RecoverExpiredFoundationLeases(context.Context, time.Time) (LeaseRecovery, error) {
 	return f.recovered, f.recoverErr
+}
+
+func (f *fakeReconstructStore) CountDeadLetteredFoundationWork(context.Context) (DeadLetterCounts, error) {
+	return f.deadLettered, f.deadLetteredErr
 }
 
 func (f *fakeReconstructStore) UnrepresentedOperationalIncidents(context.Context) ([]UpgradeIncident, error) {
@@ -544,6 +588,10 @@ type traceReconstructStore struct {
 func (f *traceReconstructStore) RecoverExpiredFoundationLeases(context.Context, time.Time) (LeaseRecovery, error) {
 	*f.trace = append(*f.trace, "recover_leases")
 	return LeaseRecovery{}, nil
+}
+
+func (f *traceReconstructStore) CountDeadLetteredFoundationWork(context.Context) (DeadLetterCounts, error) {
+	return DeadLetterCounts{}, nil
 }
 
 func (f *traceReconstructStore) UnrepresentedOperationalIncidents(context.Context) ([]UpgradeIncident, error) {
