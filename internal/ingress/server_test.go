@@ -137,7 +137,7 @@ func TestPost_HappyPath_204_PersistsAndAudits(t *testing.T) {
 
 	// One audit row was appended.
 	var n int
-	if err := h.store.DB().QueryRow(`SELECT COUNT(*) FROM audit_log WHERE kind='alert.received'`).Scan(&n); err != nil {
+	if err := h.store.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM audit_log WHERE kind='alert.received'`).Scan(&n); err != nil {
 		t.Fatalf("count: %v", err)
 	}
 	if n != 1 {
@@ -175,7 +175,7 @@ func TestPost_MultipleAlerts_OneAuditRow_AllPersisted(t *testing.T) {
 	}
 
 	var n int
-	_ = h.store.DB().QueryRow(`SELECT COUNT(*) FROM audit_log WHERE kind='alert.received'`).Scan(&n)
+	_ = h.store.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM audit_log WHERE kind='alert.received'`).Scan(&n)
 	if n != 1 {
 		t.Errorf("audit rows = %d, want 1 per call", n)
 	}
@@ -298,7 +298,7 @@ func TestPost_FingerprintDedupe_LatestWins(t *testing.T) {
 	}
 
 	var rowCount int
-	_ = h.store.DB().QueryRow(`SELECT COUNT(*) FROM alerts`).Scan(&rowCount)
+	_ = h.store.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM alerts`).Scan(&rowCount)
 	if rowCount != 1 {
 		t.Errorf("alerts row count = %d, want 1 after dedupe", rowCount)
 	}
@@ -482,7 +482,7 @@ func TestPost_EmptyAlertList_204AndAuditRow(t *testing.T) {
 		t.Errorf("status = %d, want 204", resp.StatusCode)
 	}
 	var n int
-	_ = h.store.DB().QueryRow(`SELECT COUNT(*) FROM audit_log WHERE kind='alert.received'`).Scan(&n)
+	_ = h.store.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM audit_log WHERE kind='alert.received'`).Scan(&n)
 	if n != 1 {
 		t.Errorf("audit rows = %d, want 1", n)
 	}

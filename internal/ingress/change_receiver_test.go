@@ -155,7 +155,7 @@ func TestChangeReceiver_PersistsAndAudits(t *testing.T) {
 
 	// Audit row recorded under kind=change.received.
 	var n int
-	if err := st.DB().QueryRow(`SELECT COUNT(*) FROM audit_log WHERE kind='change.received'`).Scan(&n); err != nil {
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_log WHERE kind='change.received'`).Scan(&n); err != nil {
 		t.Fatalf("count audit: %v", err)
 	}
 	if n != 1 {

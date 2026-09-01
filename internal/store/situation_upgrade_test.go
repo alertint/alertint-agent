@@ -90,7 +90,7 @@ func TestSituationFoundationUpgradesMigration12Database(t *testing.T) {
 	defer func() { _ = st.Close() }()
 
 	var versions int
-	if err := st.DB().QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version IN (13,14)`).Scan(&versions); err != nil {
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version IN (13,14)`).Scan(&versions); err != nil {
 		t.Fatal(err)
 	}
 	if versions != 2 {
@@ -98,7 +98,7 @@ func TestSituationFoundationUpgradesMigration12Database(t *testing.T) {
 	}
 
 	var incidents int
-	if err := st.DB().QueryRow(`SELECT COUNT(*) FROM incidents WHERE id='pre-upgrade-incident'`).Scan(&incidents); err != nil {
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM incidents WHERE id='pre-upgrade-incident'`).Scan(&incidents); err != nil {
 		t.Fatal(err)
 	}
 	if incidents != 1 {
