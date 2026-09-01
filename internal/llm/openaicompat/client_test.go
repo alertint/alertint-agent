@@ -171,6 +171,34 @@ func TestRequestShapeVariants(t *testing.T) {
 		}
 	})
 
+	t.Run("reasoning_effort is passed through when set", func(t *testing.T) {
+		c := newClient(srv, func(cfg *openaicompat.Config) { cfg.ReasoningEffort = "low" })
+		if _, err := c.Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"k"}); err != nil {
+			t.Fatal(err)
+		}
+		kw, ok := gotBody["chat_template_kwargs"].(map[string]any)
+		if !ok {
+			t.Fatalf("chat_template_kwargs is not an object: %v", gotBody["chat_template_kwargs"])
+		}
+		if kw["reasoning_effort"] != "low" {
+			t.Errorf("reasoning_effort = %v, want %q", kw["reasoning_effort"], "low")
+		}
+	})
+
+	t.Run("reasoning_effort empty omits the key", func(t *testing.T) {
+		c := newClient(srv, func(cfg *openaicompat.Config) { cfg.ReasoningEffort = "" })
+		if _, err := c.Complete(context.Background(), "s", llm.Prompt{Prefix: "p"}, []string{"k"}); err != nil {
+			t.Fatal(err)
+		}
+		kw, ok := gotBody["chat_template_kwargs"].(map[string]any)
+		if !ok {
+			t.Fatalf("chat_template_kwargs is not an object: %v", gotBody["chat_template_kwargs"])
+		}
+		if _, present := kw["reasoning_effort"]; present {
+			t.Error("reasoning_effort must be omitted when empty")
+		}
+	})
+
 	t.Run("prefix+suffix joined; CachePrefix changes nothing", func(t *testing.T) {
 		c := newClient(srv, nil)
 		p := llm.Prompt{Prefix: "call-1 prompt", Suffix: "\n\ncontinuation", CachePrefix: true}

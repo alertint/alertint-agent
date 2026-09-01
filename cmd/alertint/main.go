@@ -1041,13 +1041,14 @@ func buildLLMProber(cfg *config.Config, client acutetriage.LLMClient, logger *sl
 // parameters because the classifier client reuses this with its own values.
 func llmopenaiCfg(cfg *config.Config, apiKey string, timeoutSeconds int, model string, maxTokens int) llmopenai.Config {
 	return llmopenai.Config{
-		BaseURL:        cfg.LLM.BaseURL,
-		APIKey:         apiKey,
-		Model:          model,
-		MaxTokens:      maxTokens,
-		ResponseFormat: cfg.LLM.ResponseFormat,
-		Thinking:       cfg.LLM.Thinking,
-		TimeoutSeconds: timeoutSeconds,
+		BaseURL:         cfg.LLM.BaseURL,
+		APIKey:          apiKey,
+		Model:           model,
+		MaxTokens:       maxTokens,
+		ResponseFormat:  cfg.LLM.ResponseFormat,
+		Thinking:        cfg.LLM.Thinking,
+		ReasoningEffort: cfg.LLM.ReasoningEffort,
+		TimeoutSeconds:  timeoutSeconds,
 	}
 }
 

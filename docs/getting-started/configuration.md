@@ -135,6 +135,7 @@ pull source (read-only context enrichment + `zabbix_metric_history` /
 | `base_url` | string | — | `openai-compatible` only, required there: endpoint root URL. A trailing `/v1` is accepted and stripped |
 | `response_format` | string | — | `openai-compatible` only: `json_object` (the default when unset) or `off` |
 | `thinking` | bool | `false` | `openai-compatible` only: opt a hybrid-reasoning model into thinking. Requires `max_tokens` 8000–16000 or triage fails with the truncation error |
+| `reasoning_effort` | string | — | `openai-compatible` only: sent as `chat_template_kwargs.reasoning_effort` alongside `enable_thinking`. Model-specific values (e.g. Qwen3.8: `xhigh`/`medium`/`low`), passed through unvalidated; empty omits the field and leaves the model/server default in effect |
 | `timeout_seconds` | int | `120` | Whole-request LLM timeout, either provider. Local endpoints under storm concurrency typically need ~300 |
 
 This is the model that triages your incidents and writes the finding

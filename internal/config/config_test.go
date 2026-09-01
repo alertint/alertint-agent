@@ -1156,6 +1156,12 @@ func TestValidateLLMAnthropicRejectsProviderScopedFields(t *testing.T) {
 	}
 	c.LLM.Thinking = false
 
+	c.LLM.ReasoningEffort = "low"
+	if err := c.ValidateOffline(); err == nil || !strings.Contains(err.Error(), "llm.reasoning_effort") {
+		t.Fatalf("reasoning_effort must be rejected for anthropic, got: %v", err)
+	}
+	c.LLM.ReasoningEffort = ""
+
 	if err := c.ValidateOffline(); err != nil {
 		t.Fatalf("clean anthropic config must pass: %v", err)
 	}

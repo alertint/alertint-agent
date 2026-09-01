@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `llm.reasoning_effort` (`openai-compatible` only): sent as
+  `chat_template_kwargs.reasoning_effort` alongside `enable_thinking`, for
+  adaptive-reasoning models (e.g. Qwen3.8: `xhigh`/`medium`/`low`). Passed
+  through unvalidated since the accepted vocabulary is model-specific; empty
+  (default) omits the field, leaving the model/server default in effect.
+
 ## [0.13.5] - 2026-08-28
 
 ### Added

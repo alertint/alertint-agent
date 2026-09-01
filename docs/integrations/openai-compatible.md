@@ -34,6 +34,11 @@ llm:
   #                                    # thinking output competes with the reply for the token budget,
   #                                    # and an overrun fails triage with
   #                                    # "llm: response truncated at max_tokens" in the logs.
+  # reasoning_effort: low               # adaptive-reasoning models only (e.g. Qwen3.8: xhigh/medium/low).
+  #                                    # Sent as chat_template_kwargs.reasoning_effort alongside
+  #                                    # enable_thinking; passed through unvalidated, so use whatever
+  #                                    # vocabulary your model's chat template accepts. Empty (default)
+  #                                    # omits the field, leaving the model/server default in effect.
 ```
 
 The memory shadow classifier (when enabled) follows the same endpoint and

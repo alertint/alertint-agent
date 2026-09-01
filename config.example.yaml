@@ -23,6 +23,8 @@ llm:
   # response_format: json_object              # default; "off" if your runtime lacks enforced JSON
   # thinking: false                           # enabling thinking? raise max_tokens to 8000-16000 or
   #                                           # triage fails loud: "llm: response truncated at max_tokens"
+  # reasoning_effort: low                     # adaptive-reasoning models only (e.g. Qwen3.8: xhigh/medium/low);
+  #                                           # empty (default) omits the field, leaving the model/server default
 
 correlator:
   window_seconds: 90       # group alerts arriving within this window
