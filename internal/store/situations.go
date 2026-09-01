@@ -400,7 +400,11 @@ func sourceTimesForInputTx(ctx context.Context, tx *sql.Tx, deliveryID *string, 
 
 // resolveAndApplySituationTx implements the owner-selection precedence: an
 // Incident that already owns a Situation always continues feeding it
-// (regardless of that Situation's own lifecycle); otherwise the exact
+// (regardless of that Situation's own lifecycle — correlation already
+// refuses to attach NEW deliveries to an Incident whose owner is terminal,
+// see terminalSituationOwnerTx, so the only inputs that reach a terminal
+// owner here are ones already queued when the owner terminalized — a race
+// the future controller must settle explicitly); otherwise the exact
 // group's nonterminal Situation joins; otherwise a new active "observe"
 // Situation is created, linked via previous_situation_id to the newest
 // terminal same-group Situation, if any. It returns the id of the Situation

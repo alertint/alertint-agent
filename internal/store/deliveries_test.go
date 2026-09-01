@@ -783,3 +783,72 @@ func TestConcurrentFirstDeliveriesShareOneCollectingIncident(t *testing.T) {
 	assertQueryCount(t, st.DB(), `SELECT COUNT(*) FROM incident_alert_deliveries`, 2)
 	assertQueryCount(t, st.DB(), `SELECT COUNT(*) FROM situation_input_outbox`, 2)
 }
+
+// TestApplyCorrelatedDeliveryRejectsTerminalSituationOwner proves the
+// terminal-episode boundary holds inside the durable mutation itself: an
+// attach plan (RequireNonterminalOwner) onto an Incident whose owning
+// Situation has gone terminal is rejected with
+// ErrIncidentOwnerNotCollapsible and commits nothing, while the identical
+// plan against a live owner succeeds. The correlator then falls through to
+// a fresh Incident, whose Situation input opens a linked new Situation —
+// see TestApplySituationInputCreatesNewSituationLinkedToTerminalPredecessor.
+func TestApplyCorrelatedDeliveryRejectsTerminalSituationOwner(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 2, 0, 0, 0, time.UTC)
+
+	// A real Incident owning a real Situation, via the actual input path.
+	insertIncidentAndInput(t, st, "inc-1", "input-1", "service=api", now)
+	if err := st.ApplySituationInput(ctx, claimOneInput(t, st, "w", now)); err != nil {
+		t.Fatalf("apply situation input: %v", err)
+	}
+
+	attach := func(deliveryID, inputID string, at time.Time) error {
+		if _, err := st.AcceptDeliveries(ctx, []DeliveryInput{deliveryFixture(deliveryID, "fp-"+deliveryID, at)}); err != nil {
+			t.Fatalf("accept %s: %v", deliveryID, err)
+		}
+		claims, err := st.ClaimAlertDispatches(ctx, "dispatch-a", at, time.Minute, 10)
+		if err != nil {
+			t.Fatalf("claim %s: %v", deliveryID, err)
+		}
+		var claim *AlertDispatch
+		for i := range claims {
+			if claims[i].Delivery.ID == deliveryID {
+				claim = &claims[i]
+			}
+		}
+		if claim == nil {
+			t.Fatalf("delivery %s not among claimed dispatches", deliveryID)
+		}
+		_, err = st.ApplyCorrelatedDelivery(ctx, CorrelatedDeliveryMutation{
+			DeliveryID:              deliveryID,
+			DispatchOwner:           "dispatch-a",
+			DispatchClaimToken:      claim.ClaimToken,
+			Incident:                Incident{ID: "inc-1", GroupKey: "service=api", FirstAlertAt: now, LastAlertAt: now, ReadyAt: now.Add(time.Minute)},
+			Input:                   SituationInput{ID: inputID, IdempotencyKey: "delivery:" + deliveryID, IncidentID: "inc-1", DeliveryID: &deliveryID, Kind: "membership_changed", GroupKey: "service=api", OccurredAt: at},
+			RequireNonterminalOwner: true,
+		})
+		return err
+	}
+
+	// Control: with the owning Situation still active, the attach commits.
+	if err := attach("d-live", "input-d-live", now.Add(time.Minute)); err != nil {
+		t.Fatalf("attach with live situation owner: %v", err)
+	}
+
+	terminalAt := canonicalTime(now.Add(time.Hour))
+	if _, err := st.db.ExecContext(ctx, `
+		UPDATE situations SET lifecycle='closed_unknown', terminal_at=?, terminal_reason='resolution_missing', updated_at=?`,
+		terminalAt, terminalAt); err != nil {
+		t.Fatalf("terminalize fixture situation: %v", err)
+	}
+
+	// The same attach plan against the now-terminal owner is rejected, and
+	// the rejection rolls back everything: no ownership link, no input row.
+	err := attach("d-late", "input-d-late", now.Add(2*time.Hour))
+	if !errors.Is(err, ErrIncidentOwnerNotCollapsible) {
+		t.Fatalf("attach with terminal situation owner: err = %v, want ErrIncidentOwnerNotCollapsible", err)
+	}
+	assertQueryCount(t, st.DB(), `SELECT COUNT(*) FROM incident_alert_deliveries WHERE delivery_id = 'd-late'`, 0)
+	assertQueryCount(t, st.DB(), `SELECT COUNT(*) FROM situation_input_outbox WHERE id = 'input-d-late'`, 0)
+}

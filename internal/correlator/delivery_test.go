@@ -597,3 +597,76 @@ func (r *captureResolutionNotifier) OnIncidentResolved(_ context.Context, inc st
 func (r *captureResolutionNotifier) count() int { return len(r.calls) }
 
 var _ ResolutionNotifier = (*captureResolutionNotifier)(nil)
+
+// seedTerminalSituationOwner gives incidentID a terminal ("closed_unknown")
+// owning Situation — what a future controller's termination leaves behind.
+// Correlation must then refuse to collapse later same-group work into that
+// Incident: a later firing never crosses a terminal Situation boundary.
+func seedTerminalSituationOwner(t *testing.T, st *store.Store, situationID, incidentID, groupKey string, at time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	ts := at.UTC().Format(time.RFC3339Nano)
+	if _, err := st.DB().ExecContext(ctx, `
+		INSERT INTO situations (id, group_key, lifecycle, attention, input_version, opened_at,
+			effective_started_at, effective_started_at_basis, first_received_at,
+			last_lifecycle_observed_at, terminal_at, terminal_reason,
+			next_assessment_at, due_reasons_json, created_at, updated_at)
+		VALUES (?, ?, 'closed_unknown', 'observe', 1, ?, ?, 'receipt_fallback', ?, ?, ?, 'resolution_missing', ?, '[]', ?, ?)`,
+		situationID, groupKey, ts, ts, ts, ts, ts, ts, ts, ts); err != nil {
+		t.Fatalf("seed terminal situation: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `
+		INSERT INTO situation_incidents (situation_id, incident_id, attached_at) VALUES (?, ?, ?)`,
+		situationID, incidentID, ts); err != nil {
+		t.Fatalf("attach incident to terminal situation: %v", err)
+	}
+}
+
+// TestApplyDelivery_TerminalSituationOwnerOpensFreshIncident: the spec's
+// terminal-boundary rule end to end on the durable path. A judged
+// same-group Incident inside the collapse horizon would normally absorb
+// this delivery as an occurrence; because its owning Situation is terminal,
+// the store rejects the collapse inside the mutation and the correlator
+// falls through to a fresh Incident instead. The fresh Incident's
+// "incident_created" input is what later opens a linked new Situation —
+// covered by the store's
+// TestApplySituationInputCreatesNewSituationLinkedToTerminalPredecessor.
+func TestApplyDelivery_TerminalSituationOwnerOpensFreshIncident(t *testing.T) {
+	st := openStore(t)
+	c := New(Config{}, st, NopIncidentSink{}, nil)
+	aud := &fakeAuditor{}
+	c.SetAuditor(aud)
+	now := time.Date(2026, 7, 8, 15, 30, 0, 0, time.UTC)
+	member := firingAlert("fp-orig", "DiskFull", "warning", now.Add(-5*time.Minute), false)
+	seedJudged(t, st, "inc_1", "analyzed", now.Add(-5*time.Minute), now.Add(-10*time.Minute), member)
+	seedTerminalSituationOwner(t, st, "sit_1", "inc_1", gkAPI, now.Add(-4*time.Minute))
+
+	claim := claimOneDelivery(t, st, deliveryInputFor("d1", "fp-new", gkAPI, "firing", now), now)
+	if err := c.ApplyDelivery(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := occCount(t, st, "inc_1"); got != 0 {
+		t.Fatalf("occurrences on inc_1 = %d, want 0 (terminal episode must not absorb new work)", got)
+	}
+	if got := memberCount(t, st, "inc_1"); got != 1 {
+		t.Fatalf("members on inc_1 = %d, want 1 (unchanged)", got)
+	}
+	var owner string
+	if err := st.DB().QueryRowContext(context.Background(), `SELECT incident_id FROM incident_alert_deliveries WHERE delivery_id = 'd1'`).Scan(&owner); err != nil {
+		t.Fatalf("read delivery ownership: %v", err)
+	}
+	if owner == "inc_1" {
+		t.Fatal("delivery attached to inc_1 across a terminal Situation boundary; want a fresh Incident")
+	}
+	kinds := situationInputKinds(t, st, owner)
+	if len(kinds) != 1 || kinds[0] != "incident_created" {
+		t.Fatalf("situation input kinds for fresh incident = %v, want [incident_created]", kinds)
+	}
+	if rows := aud.rowsOfKind("incident.occurrence_attached"); len(rows) != 0 {
+		t.Fatalf("occurrence_attached audit rows = %d, want 0", len(rows))
+	}
+	if got := dispatchStatus(t, st); got != "applied" {
+		t.Fatalf("dispatch status = %q, want applied", got)
+	}
+}

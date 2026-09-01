@@ -99,8 +99,11 @@ var ErrAlertDispatchLeaseLost = errors.New("store: alert dispatch lease lost")
 // ErrIncidentOwnerNotCollapsible means a plan to attach a delivery to an
 // existing Incident (recurrence collapse, or a same-group retry-backoff
 // attach) is no longer valid — the target Incident's status moved to a
-// terminal state between planning and commit. The caller must discard the
-// plan and correlate the delivery as a fresh Incident instead.
+// terminal state between planning and commit, or the Incident's owning
+// Situation has reached a terminal lifecycle (a later firing must never
+// cross a terminal Situation boundary). The caller must discard the plan
+// and correlate the delivery as a fresh Incident instead; that fresh
+// Incident's Situation input then opens a linked new Situation.
 var ErrIncidentOwnerNotCollapsible = errors.New("store: incident owner does not permit correlated attach")
 
 // CorrelatedDeliveryMutation is everything ApplyCorrelatedDelivery needs to
@@ -112,8 +115,10 @@ var ErrIncidentOwnerNotCollapsible = errors.New("store: incident owner does not 
 // "insert a new occurrence row", a non-zero one means "touch this existing
 // occurrence's last_seen". RequireNonterminalOwner gates an attach-to-
 // existing-Incident plan (recurrence collapse, retry-backoff attach) on the
-// owner not having gone terminal between planning and commit; it is never
-// set for a fresh-Incident or resolved-delivery-association plan.
+// owner not having gone terminal between planning and commit — both the
+// Incident's own status and, per the spec's terminal-boundary rule, its
+// owning Situation's lifecycle, re-checked inside the transaction; it is
+// never set for a fresh-Incident or resolved-delivery-association plan.
 type CorrelatedDeliveryMutation struct {
 	DeliveryID              string
 	DispatchOwner           string
@@ -502,8 +507,17 @@ func (s *Store) ApplyCorrelatedDelivery(ctx context.Context, m CorrelatedDeliver
 		requestedKind = "membership_changed"
 	}
 
-	if m.RequireNonterminalOwner && incidentStatus == "failed" {
-		return CorrelatedDeliveryResult{}, ErrIncidentOwnerNotCollapsible
+	if m.RequireNonterminalOwner {
+		if incidentStatus == "failed" {
+			return CorrelatedDeliveryResult{}, ErrIncidentOwnerNotCollapsible
+		}
+		terminal, err := terminalSituationOwnerTx(ctx, tx, m.Incident.ID)
+		if err != nil {
+			return CorrelatedDeliveryResult{}, err
+		}
+		if terminal {
+			return CorrelatedDeliveryResult{}, ErrIncidentOwnerNotCollapsible
+		}
 	}
 
 	now := time.Now().UTC()
@@ -551,6 +565,29 @@ func (s *Store) ApplyCorrelatedDelivery(ctx context.Context, m CorrelatedDeliver
 		result.Occurrence = &occ
 	}
 	return result, nil
+}
+
+// terminalSituationOwnerTx reports whether incidentID's owning Situation —
+// if it has one — has reached a terminal lifecycle ("recovered" or
+// "closed_unknown"). A later firing must not cross a terminal Situation
+// boundary: correlation re-checks the owner inside the durable mutation so
+// a recurrence collapse or retry attach onto an Incident whose episode
+// already closed is rejected (ErrIncidentOwnerNotCollapsible) and the
+// delivery falls through to a fresh Incident, whose Situation input then
+// opens a linked new Situation (previous_situation_id).
+func terminalSituationOwnerTx(ctx context.Context, tx *sql.Tx, incidentID string) (bool, error) {
+	var lifecycle string
+	err := tx.QueryRowContext(ctx, `
+		SELECT s.lifecycle FROM situation_incidents si
+		JOIN situations s ON s.id = si.situation_id
+		WHERE si.incident_id = ?`, incidentID).Scan(&lifecycle)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("store: read correlated incident's situation owner: %w", err)
+	}
+	return lifecycle == "recovered" || lifecycle == "closed_unknown", nil
 }
 
 // applyDuplicateCorrelatedDeliveryTx handles a delivery that already owns an
