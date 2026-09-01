@@ -5,6 +5,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -673,16 +674,65 @@ func TestListSituationsOrdersNewestUpdatedFirst(t *testing.T) {
 	}
 }
 
+// insertRawSituation inserts one minimal, nonterminal "active" Situation
+// row directly, bypassing ApplySituationInput/ReconstructSituation — the
+// clamp test below only needs a large volume of distinct rows to list
+// against, never their full lifecycle.
+func insertRawSituation(t *testing.T, st *Store, id, groupKey string, updatedAt time.Time) {
+	t.Helper()
+	ts := canonicalTime(updatedAt)
+	if _, err := st.db.ExecContext(context.Background(), `
+		INSERT INTO situations (
+			id, group_key, lifecycle, attention, input_version,
+			opened_at, effective_started_at, effective_started_at_basis, first_received_at,
+			last_lifecycle_observed_at, next_assessment_at, due_reasons_json, created_at, updated_at
+		) VALUES (?, ?, 'active', 'observe', 1, ?, ?, 'receipt_fallback', ?, ?, ?, '[]', ?, ?)`,
+		id, groupKey, ts, ts, ts, ts, ts, ts, ts); err != nil {
+		t.Fatalf("insert raw situation %s: %v", id, err)
+	}
+}
+
 func TestListSituationsClampsLimit(t *testing.T) {
 	st := newTestStore(t)
 	if _, err := st.ListSituations(context.Background(), 0); err != nil {
-		t.Fatalf("limit 0: %v", err)
+		t.Fatalf("limit 0 on empty store: %v", err)
 	}
 	if _, err := st.ListSituations(context.Background(), -5); err != nil {
+		t.Fatalf("negative limit on empty store: %v", err)
+	}
+
+	// Seed more rows than maxSituationListLimit so a bad/missing clamp would
+	// actually show up in len(got) — asserting only err == nil against an
+	// empty store, as this test used to, is true regardless of whether the
+	// clamp does anything at all.
+	base := time.Date(2026, 9, 1, 5, 0, 0, 0, time.UTC)
+	const seeded = maxSituationListLimit + 5
+	for i := 0; i < seeded; i++ {
+		insertRawSituation(t, st, fmt.Sprintf("sit-%04d", i), fmt.Sprintf("group-%04d", i), base.Add(time.Duration(i)*time.Second))
+	}
+
+	oversized, err := st.ListSituations(context.Background(), 10000)
+	if err != nil {
+		t.Fatalf("oversized limit: %v", err)
+	}
+	if len(oversized) != maxSituationListLimit {
+		t.Fatalf("ListSituations(10000) returned %d rows, want the clamped max %d", len(oversized), maxSituationListLimit)
+	}
+
+	def, err := st.ListSituations(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("default limit: %v", err)
+	}
+	if len(def) != defaultSituationListLimit {
+		t.Fatalf("ListSituations(0) returned %d rows, want the documented default %d", len(def), defaultSituationListLimit)
+	}
+
+	negative, err := st.ListSituations(context.Background(), -5)
+	if err != nil {
 		t.Fatalf("negative limit: %v", err)
 	}
-	if _, err := st.ListSituations(context.Background(), 10000); err != nil {
-		t.Fatalf("oversized limit: %v", err)
+	if len(negative) != defaultSituationListLimit {
+		t.Fatalf("ListSituations(-5) returned %d rows, want the documented default %d", len(negative), defaultSituationListLimit)
 	}
 }
 
