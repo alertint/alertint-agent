@@ -630,3 +630,153 @@ func TestApplySituationInputClearsControllerLeaseFencingStaleRelease(t *testing.
 		t.Fatalf("stale release after input-triggered lease clear = %v, want ErrSituationLeaseLost", err)
 	}
 }
+
+// ----------------------------------------------------------------------
+// Task 9: read-only Situation views (ListSituations, GetSituation,
+// GetSituationByHandle, ListSituationIncidents) — the exact surface the MCP
+// Situation tools depend on.
+// ----------------------------------------------------------------------
+
+func TestListSituationsOrdersNewestUpdatedFirst(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 5, 0, 0, 0, time.UTC)
+
+	insertIncidentAndInput(t, st, "inc-a", "input-a", "service=a", now)
+	claimA := claimOneInput(t, st, "worker-a", now)
+	if err := st.ApplySituationInput(context.Background(), claimA); err != nil {
+		t.Fatal(err)
+	}
+	insertIncidentAndInput(t, st, "inc-b", "input-b", "service=b", now.Add(time.Minute))
+	claimB := claimOneInput(t, st, "worker-a", now.Add(time.Minute))
+	if err := st.ApplySituationInput(context.Background(), claimB); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second input against the FIRST situation's group advances its
+	// updated_at past the second situation's, so newest-updated-first must
+	// reorder it back to the front despite being created earlier.
+	insertIncidentAndInput(t, st, "inc-a2", "input-a2", "service=a", now.Add(2*time.Minute))
+	claimA2 := claimOneInput(t, st, "worker-a", now.Add(2*time.Minute))
+	if err := st.ApplySituationInput(context.Background(), claimA2); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.ListSituations(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("situations = %+v, want exactly 2", got)
+	}
+	if got[0].GroupKey != "service=a" || got[1].GroupKey != "service=b" {
+		t.Fatalf("order = [%s, %s], want [service=a, service=b] (most recently updated first)", got[0].GroupKey, got[1].GroupKey)
+	}
+}
+
+func TestListSituationsClampsLimit(t *testing.T) {
+	st := newTestStore(t)
+	if _, err := st.ListSituations(context.Background(), 0); err != nil {
+		t.Fatalf("limit 0: %v", err)
+	}
+	if _, err := st.ListSituations(context.Background(), -5); err != nil {
+		t.Fatalf("negative limit: %v", err)
+	}
+	if _, err := st.ListSituations(context.Background(), 10000); err != nil {
+		t.Fatalf("oversized limit: %v", err)
+	}
+}
+
+func TestGetSituationByID(t *testing.T) {
+	st, situationID, _ := dueSituationFixture(t)
+
+	got, err := st.GetSituation(context.Background(), situationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != situationID {
+		t.Fatalf("id = %s, want %s", got.ID, situationID)
+	}
+}
+
+func TestGetSituationUnknownIDReturnsErrNotFound(t *testing.T) {
+	st := newTestStore(t)
+	if _, err := st.GetSituation(context.Background(), "does-not-exist"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestGetSituationByHandleCaseInsensitive(t *testing.T) {
+	st, situationID, _ := dueSituationFixture(t)
+	if _, err := st.db.ExecContext(context.Background(), `UPDATE situations SET public_handle = ? WHERE id = ?`, "INC-Api-42", situationID); err != nil {
+		t.Fatalf("seed public_handle: %v", err)
+	}
+
+	got, err := st.GetSituationByHandle(context.Background(), "inc-api-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != situationID {
+		t.Fatalf("id = %s, want %s", got.ID, situationID)
+	}
+}
+
+func TestGetSituationByHandleUnknownReturnsErrNotFound(t *testing.T) {
+	st := newTestStore(t)
+	if _, err := st.GetSituationByHandle(context.Background(), "no-such-handle"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+	// A Situation exists but has never been assigned a handle (public_handle
+	// IS NULL) — SQL NULL never equals a bound parameter, so this must also
+	// miss rather than falsely matching an empty-string lookup.
+	st2, _, _ := dueSituationFixture(t)
+	if _, err := st2.GetSituationByHandle(context.Background(), ""); err == nil {
+		t.Fatal("expected an error for an empty handle")
+	}
+}
+
+func TestListSituationIncidentsReturnsMembersInAttachmentOrder(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 6, 0, 0, 0, time.UTC)
+	insertIncidentAndInput(t, st, "inc-1", "input-1", "service=members", now)
+	claim1 := claimOneInput(t, st, "worker-a", now)
+	if err := st.ApplySituationInput(context.Background(), claim1); err != nil {
+		t.Fatal(err)
+	}
+	insertIncidentAndInput(t, st, "inc-2", "input-2", "service=members", now.Add(time.Second))
+	claim2 := claimOneInput(t, st, "worker-a", now.Add(time.Second))
+	if err := st.ApplySituationInput(context.Background(), claim2); err != nil {
+		t.Fatal(err)
+	}
+
+	// insertIncidentAndInput's fixture helper already moves each Incident to
+	// "ready" (see insertIncidentAndInputKind) so a same-group second fixture
+	// doesn't collide on incidents_one_collecting_group_idx — both members
+	// are expected at "ready" below, not "collecting".
+	sits := listSituations(t, st)
+	if len(sits) != 1 {
+		t.Fatalf("situations = %+v, want exactly 1", sits)
+	}
+
+	got, err := st.ListSituationIncidents(context.Background(), sits[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []SituationIncidentRef{
+		{IncidentID: "inc-1", Status: "ready"},
+		{IncidentID: "inc-2", Status: "ready"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("members = %+v, want %+v", got, want)
+	}
+}
+
+func TestListSituationIncidentsEmptyForUnknownSituation(t *testing.T) {
+	st := newTestStore(t)
+	got, err := st.ListSituationIncidents(context.Background(), "no-such-situation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("members = %+v, want empty", got)
+	}
+}

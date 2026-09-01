@@ -135,6 +135,8 @@ restart Windsurf and check **Settings → MCP Servers**:
 | `alertint_search_alerts` | Search raw alerts by label key and value. |
 | `alertint_get_evidence_pack` | Get the evidence pack and Prometheus metrics for an incident. |
 | `alertint_verify_audit` | Verify the hash-chained audit log and report any tampering. |
+| `alertint_list_situations` | List durable Situations — the exact-group lineage that durably owns one or more Incidents — most recently updated first. Foundation state only: no controller Assessment or operator contract exists yet. |
+| `alertint_get_situation` | Get one Situation by id or public handle, with its member Incidents. `assessment` and `operator_contract` are always `null` — there is no Situation controller yet to produce either. |
 | `prometheus_query` | Instant PromQL query against the connected Prometheus (requires Prometheus enabled). |
 | `prometheus_query_range` | Range PromQL query with auto-stepped resolution (requires Prometheus enabled). |
 | `loki_query_range` | Range-query the configured log backend using its native query language (requires a log source enabled). |

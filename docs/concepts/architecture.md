@@ -45,13 +45,36 @@ instead of pushed.
   `changes.ingress.webhook_token_env`)
 - **No custom format required** on any of them
 
-### 2. Persistence and deduplication
+### 2. Durable acceptance and deduplication
 
-Received alerts are written to local state (SQLite). Duplicate firings of
-the same alert fingerprint are collapsed — one record per logical alert.
+Received alerts are written to local state (SQLite) as an immutable,
+append-only delivery — the receiver acknowledges the sender (`204`) only
+once that delivery *and* a pending dispatch record for it have committed
+together in one transaction. Duplicate firings of the same alert
+fingerprint still collapse to one record in the latest-wins `alerts`
+projection, but the underlying delivery ledger keeps every accepted
+delivery, so a replayed webhook (the same sender retrying, or a restart
+resending an unacknowledged batch) is recognized by its deterministic
+content digest and resolves to the same delivery — a safe no-op, never a
+duplicate. A structurally invalid payload is rejected `400` before
+anything is written; a payload that's valid but can't be durably
+persisted returns `503` so a well-behaved sender retries — nothing is
+ever silently dropped or acknowledged without being on disk.
+
+A background worker drains the pending-dispatch queue and hands each
+delivery to the Correlator below. This closes the crash window a receiver
+POST used to leave open between accepting an alert and correlating it: if
+the agent restarts before a dispatch is claimed, or after it's claimed but
+before correlation commits, the delivery is still on disk and is claimed
+and correlated again on the next drain — startup runs this drain to
+completion before accepting new inbound traffic (see "Situation
+foundation" below).
 
 - **Storage:** local SQLite, configurable path
-- **Dedup key:** alert fingerprint
+- **Dedup key:** alert fingerprint (`alerts` projection); delivery content
+  digest (durable delivery ledger)
+- **Durability boundary:** `204` = delivery + dispatch committed; `400` =
+  rejected, nothing written; `503` = valid but not yet durable, retry
 
 ### 3. Correlation
 
@@ -67,6 +90,28 @@ here too: storm collapse, known-issue short-circuits, and prompt selection.
 
 - **Grouping identity:** Receiver default; optional `correlator.group_labels` override
 - **Window:** `correlator.window_seconds`, default 90 s
+
+### 3a. Situation foundation
+
+Every correlated delivery also feeds a **Situation** — a durable record
+that owns one or more Incidents under one exact group key across restarts,
+so a fresh firing of the same group after a prior one resolved is linked
+to it as a new lineage rather than starting from nothing. This is a
+**foundation, not a controller**: today it durably groups Incidents and is
+visible read-only through MCP (`alertint_list_situations`,
+`alertint_get_situation`) — it does not decide when Triage runs, does not
+own the Slack card, and produces no Assessment or operator contract yet
+(both fields read `null` on every Situation). Everything in Phase 1 below
+Correlation — memory, evidence, triage, verification, notification — still
+runs exactly as described, keyed off the Incident, unaffected by which
+Situation an Incident belongs to. There is no
+`state_controller_mode`, shadow-output path, or legacy/new runtime switch:
+this build has exactly one grouping path, and it's the one described here.
+
+- **MCP tools:** `alertint_list_situations`, `alertint_get_situation` —
+  see [MCP clients](../integrations/mcp-clients.md)
+- **Not yet:** Triage scheduling, Slack ownership, Assessment, operator
+  contracts, episode summaries
 
 ### 4. Memory
 
@@ -269,14 +314,22 @@ A recurrence of an `analyzed` incident attaches as an occurrence rather than
 minting a new row — the lifecycle above describes one incident, not one
 firing.
 
-**Honest limitation:** the triage *schedule* is durable, but the Correlator's
-own alert queue is not. A Receiver persists an alert to the store before
-handing it to the Correlator, but that handoff itself is a bounded in-memory
-channel, and the triage skill call runs synchronously inside the single
-Correlator loop — correlation pauses for its duration, and a crash between
-persisting an alert and its handoff can still lose that handoff. A durable
-Receiver-to-Correlator delivery ledger and/or an asynchronous triage worker
-are a separate, future architecture item.
+The triage *schedule* is durable, and so is the path that feeds it: a
+Receiver no longer hands an alert to the Correlator directly through an
+in-memory channel — it durably accepts the delivery (see "Durable
+acceptance and deduplication" above), and a background worker, on its own
+schedule, claims and correlates it. A crash at any point between accepting
+a delivery and correlating it loses nothing; the pending dispatch is still
+on disk and is picked up on the next drain, at startup or otherwise.
+
+**Honest limitation:** the triage skill call itself still runs
+synchronously inside the Correlator's own fixed-window-flush/retry loop —
+that loop pauses for the duration of a triage call, exactly as before this
+foundation shipped. That loop is a separate goroutine from the
+delivery-dispatch worker above, so a slow triage call no longer blocks new
+deliveries from being correlated — but triage dispatch itself is still one
+call at a time. An asynchronous triage worker is a separate, future
+architecture item.
 
 ## LLM dependency health
 
@@ -342,8 +395,10 @@ or the `alertint_verify_audit` MCP tool.
 - **No silent config drift** — unknown YAML keys are rejected at load time.
 - **No inline secrets** — all secret values come from env vars named by
   config fields.
-- **No 5xx to a sender** — ingress always returns 2xx or 4xx; errors are
-  logged, not propagated upstream to Alertmanager or Zabbix.
+- **5xx only means "retry me"** — ingress returns `503` exclusively when a
+  structurally valid payload could not be durably persisted (e.g. SQLite
+  unavailable), so a well-behaved sender retries the exact same body; a
+  payload ingress has decided to reject is always `4xx`, never `5xx`.
 - **Single binary, SQLite state** — no external dependencies to install.
 - **Read-only outward** — every connector issues queries only. The single
   write path is an operator verdict, and it writes to **AlertINT**'s own

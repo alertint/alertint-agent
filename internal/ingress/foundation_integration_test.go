@@ -1,0 +1,489 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package ingress
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/alertint/alertint-agent/internal/audit"
+	"github.com/alertint/alertint-agent/internal/correlator"
+	"github.com/alertint/alertint-agent/internal/notify"
+	"github.com/alertint/alertint-agent/internal/situation"
+	"github.com/alertint/alertint-agent/internal/store"
+)
+
+// ----------------------------------------------------------------------
+// Task 9, Step 4: end-to-end durability scenarios this task's plan asks
+// for, driven from the real inbound HTTP boundary (POST /webhook/
+// alertmanager) against a real file-backed Store — never a hand-inserted
+// situations row. Scenarios 1 and 2 combine into the primary workflow test
+// TestFoundationReceiverRestartToSituation, retained per the plan as a
+// permanent smoke test; scenarios 5, 6, 8, and 9 each get their own test.
+// Scenarios 3, 4, and 7 live in internal/correlator/
+// foundation_crash_recovery_test.go, closer to the dispatch/input-worker
+// crash boundary they exercise.
+// ----------------------------------------------------------------------
+
+// foundationGroupPayload builds a one-alert Alertmanager v4 envelope for the
+// given group/fingerprint — enough for the receiver's durable-acceptance
+// path to derive a stable ReceiverGroupingIdentity.
+func foundationGroupPayload(group, alertname, fingerprint string, at time.Time) AlertmanagerPayload {
+	return AlertmanagerPayload{
+		Version:     "4",
+		Status:      "firing",
+		GroupLabels: map[string]string{"group": group},
+		Alerts: []AlertmanagerAlert{{
+			Status:      "firing",
+			Labels:      map[string]string{"alertname": alertname, "group": group},
+			Annotations: map[string]string{},
+			StartsAt:    at,
+			Fingerprint: fingerprint,
+		}},
+	}
+}
+
+// openFoundationHost wires a real file-backed Store behind a real
+// ingress.Server (one Alertmanager receiver, real Auditor) and returns an
+// httptest.Server plus the Store and its on-disk path, so a test can POST
+// over real HTTP and later close/reopen the SAME file to simulate a
+// restart. wake, if non-nil, is called once per durably accepted envelope.
+func openFoundationHost(t *testing.T, wake DeliveryWake) (*httptest.Server, *store.Store, string) {
+	t.Helper()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "foundation.db")
+	st, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	host, err := New(Options{
+		Store:     st,
+		Auditor:   audit.New(st.DB()),
+		Receivers: []Receiver{NewAlertReceiver(st, testToken, wake, nil)},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(host.Handler())
+	return srv, st, path
+}
+
+// postAndExpect204 POSTs payload and requires the durable-acceptance 204 —
+// every Step 4 scenario in this file that reaches this helper is proving
+// something downstream of a successful accept, never a rejection path.
+func postAndExpect204(t *testing.T, srv *httptest.Server, payload AlertmanagerPayload) {
+	t.Helper()
+	resp := postPayload(t, srv, mustMarshal(t, payload), nil)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, mustReadBody(t, resp))
+	}
+}
+
+// ----------------------------------------------------------------------
+// Scenarios 1 + 2: receiver POST commits delivery and dispatch; close
+// immediately before dispatch, reopen, reconstruct, and observe one
+// Incident plus one Situation. Named per this task's plan so the release
+// plan can retain it as a permanent smoke test.
+// ----------------------------------------------------------------------
+
+func TestFoundationReceiverRestartToSituation(t *testing.T) {
+	ctx := context.Background()
+	var wakes int
+	srv, st, path := openFoundationHost(t, func() { wakes++ })
+
+	at := time.Date(2026, 9, 1, 3, 0, 0, 0, time.UTC)
+	postAndExpect204(t, srv, foundationGroupPayload("checkout", "HighLatency", "fp-restart", at))
+	if wakes != 1 {
+		t.Fatalf("wake calls = %d, want 1", wakes)
+	}
+
+	// Scenario 1: the POST alone commits an immutable delivery plus a
+	// pending dispatch — nothing else has run yet.
+	if got := countRows(t, st, `SELECT COUNT(*) FROM alert_deliveries`); got != 1 {
+		t.Fatalf("alert_deliveries = %d, want 1", got)
+	}
+	if got := countRows(t, st, `SELECT COUNT(*) FROM alert_delivery_dispatches WHERE status = 'pending'`); got != 1 {
+		t.Fatalf("pending alert_delivery_dispatches = %d, want 1", got)
+	}
+	if got := countRows(t, st, `SELECT COUNT(*) FROM incidents`); got != 0 {
+		t.Fatalf("incidents before any dispatch worker ran = %d, want 0", got)
+	}
+
+	// Scenario 2: crash — close the store and the HTTP host before the
+	// dispatch worker (never started in this test) claims anything.
+	srv.Close()
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	// Restart against the same on-disk file.
+	st2, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	t.Cleanup(func() { _ = st2.Close() })
+
+	cor := correlator.New(correlator.Config{WindowSeconds: 60}, st2, nil, nil)
+	dispatch := correlator.NewDispatchWorker(st2, cor, correlator.WorkerConfig{Owner: "restart:dispatch"}, nil)
+	inputs := situation.NewInputWorker(st2, situation.WorkerConfig{Owner: "restart:input"}, nil)
+	r := situation.NewReconstructor(st2, func() time.Time { return at.Add(time.Minute) }).WithReplay(dispatch, inputs)
+
+	report, err := r.Run(ctx)
+	if err != nil {
+		t.Fatalf("reconstruct: %v", err)
+	}
+	if report.ReplayedDeliveries != 1 {
+		t.Fatalf("replayed deliveries = %d, want 1", report.ReplayedDeliveries)
+	}
+	if report.ReplayedInputs != 1 {
+		t.Fatalf("replayed inputs = %d, want 1", report.ReplayedInputs)
+	}
+	if report.RepresentedGroups != 0 || report.RepresentedIncidents != 0 {
+		t.Fatalf("report = %+v, want the fallback represent phase to find nothing (the queue drain already owns this Incident)", report)
+	}
+
+	if got := countRows(t, st2, `SELECT COUNT(*) FROM incidents`); got != 1 {
+		t.Fatalf("incidents after restart = %d, want exactly 1", got)
+	}
+	if got := countRows(t, st2, `SELECT COUNT(*) FROM situations`); got != 1 {
+		t.Fatalf("situations after restart = %d, want exactly 1", got)
+	}
+	if got := countRows(t, st2, `SELECT COUNT(*) FROM situation_incidents`); got != 1 {
+		t.Fatalf("situation_incidents after restart = %d, want exactly 1", got)
+	}
+}
+
+// ----------------------------------------------------------------------
+// Scenario 5: replay the same Alertmanager POST before and after restart
+// and observe one delivery-driven version increment.
+// ----------------------------------------------------------------------
+
+func TestFoundationReplayedPostAcrossRestartOneVersionIncrement(t *testing.T) {
+	ctx := context.Background()
+	srv, st, path := openFoundationHost(t, nil)
+
+	at := time.Date(2026, 9, 1, 3, 0, 0, 0, time.UTC)
+	payload := foundationGroupPayload("payments", "HighErrorRate", "fp-replay", at)
+
+	postAndExpect204(t, srv, payload)
+
+	cor := correlator.New(correlator.Config{WindowSeconds: 60}, st, nil, nil)
+	dispatch := correlator.NewDispatchWorker(st, cor, correlator.WorkerConfig{Owner: "pre-restart:dispatch"}, nil)
+	inputs := situation.NewInputWorker(st, situation.WorkerConfig{Owner: "pre-restart:input"}, nil)
+	if _, err := dispatch.Drain(ctx); err != nil {
+		t.Fatalf("pre-restart dispatch drain: %v", err)
+	}
+	if _, err := inputs.Drain(ctx); err != nil {
+		t.Fatalf("pre-restart input drain: %v", err)
+	}
+	if got := countRows(t, st, `SELECT input_version FROM situations LIMIT 1`); got != 1 {
+		t.Fatalf("input_version before restart = %d, want 1", got)
+	}
+
+	// Restart.
+	srv.Close()
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	st2, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	t.Cleanup(func() { _ = st2.Close() })
+	host2, err := New(Options{Store: st2, Auditor: audit.New(st2.DB()), Receivers: []Receiver{NewAlertReceiver(st2, testToken, nil, nil)}})
+	if err != nil {
+		t.Fatalf("New after restart: %v", err)
+	}
+	srv2 := httptest.NewServer(host2.Handler())
+	t.Cleanup(srv2.Close)
+
+	// Replay the byte-identical Alertmanager POST — same fingerprint, same
+	// startsAt, same group — after the restart. The delivery digest is
+	// deterministic (internal/ingress.payloadDigest), so this must resolve
+	// to the SAME delivery id and commit no new dispatch.
+	postAndExpect204(t, srv2, payload)
+
+	cor2 := correlator.New(correlator.Config{WindowSeconds: 60}, st2, nil, nil)
+	dispatch2 := correlator.NewDispatchWorker(st2, cor2, correlator.WorkerConfig{Owner: "post-restart:dispatch"}, nil)
+	inputs2 := situation.NewInputWorker(st2, situation.WorkerConfig{Owner: "post-restart:input"}, nil)
+	nDispatch, err := dispatch2.Drain(ctx)
+	if err != nil {
+		t.Fatalf("post-restart dispatch drain: %v", err)
+	}
+	if nDispatch != 0 {
+		t.Fatalf("post-restart dispatch drained %d, want 0 (the replayed POST commits no new dispatch)", nDispatch)
+	}
+	if _, err := inputs2.Drain(ctx); err != nil {
+		t.Fatalf("post-restart input drain: %v", err)
+	}
+
+	if got := countRows(t, st2, `SELECT COUNT(*) FROM alert_deliveries`); got != 1 {
+		t.Fatalf("alert_deliveries after replay = %d, want exactly 1 (deduped by delivery id)", got)
+	}
+	if got := countRows(t, st2, `SELECT COUNT(*) FROM situations`); got != 1 {
+		t.Fatalf("situations after replay = %d, want exactly 1", got)
+	}
+	if got := countRows(t, st2, `SELECT input_version FROM situations LIMIT 1`); got != 1 {
+		t.Fatalf("input_version after replay across restart = %d, want 1 (one delivery-driven increment total, not two)", got)
+	}
+}
+
+// ----------------------------------------------------------------------
+// Scenario 6: POST two same-group members concurrently and observe one
+// nonterminal Situation.
+// ----------------------------------------------------------------------
+
+func TestFoundationConcurrentSameGroupPostsOneNonterminalSituation(t *testing.T) {
+	ctx := context.Background()
+	srv, st, _ := openFoundationHost(t, nil)
+	at := time.Date(2026, 9, 1, 3, 0, 0, 0, time.UTC)
+
+	p1 := foundationGroupPayload("concurrent-group", "MemberOne", "fp-concurrent-1", at)
+	p2 := foundationGroupPayload("concurrent-group", "MemberTwo", "fp-concurrent-2", at)
+
+	var wg sync.WaitGroup
+	statuses := make([]int, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		resp := postPayload(t, srv, mustMarshal(t, p1), nil)
+		statuses[0] = resp.StatusCode
+		_ = resp.Body.Close()
+	}()
+	go func() {
+		defer wg.Done()
+		resp := postPayload(t, srv, mustMarshal(t, p2), nil)
+		statuses[1] = resp.StatusCode
+		_ = resp.Body.Close()
+	}()
+	wg.Wait()
+	for i, code := range statuses {
+		if code != http.StatusNoContent {
+			t.Fatalf("post %d status = %d, want 204", i, code)
+		}
+	}
+
+	cor := correlator.New(correlator.Config{WindowSeconds: 60}, st, nil, nil)
+	dispatch := correlator.NewDispatchWorker(st, cor, correlator.WorkerConfig{Owner: "concurrent:dispatch"}, nil)
+	inputs := situation.NewInputWorker(st, situation.WorkerConfig{Owner: "concurrent:input"}, nil)
+	if _, err := dispatch.Drain(ctx); err != nil {
+		t.Fatalf("drain dispatch: %v", err)
+	}
+	if _, err := inputs.Drain(ctx); err != nil {
+		t.Fatalf("drain inputs: %v", err)
+	}
+
+	if got := countRows(t, st, `SELECT COUNT(*) FROM alert_deliveries`); got != 2 {
+		t.Fatalf("alert_deliveries = %d, want 2 (both members committed)", got)
+	}
+	// Both members share one exact group and one fixed correlation window,
+	// so the Correlator itself (not the Situation layer) already merges
+	// them into one Incident — attachment order depends on which of the
+	// two concurrent POSTs' dispatch the drain applies first, so this
+	// asserts the count, not which delivery "won" first.
+	if got := countRows(t, st, `SELECT COUNT(*) FROM incidents`); got != 1 {
+		t.Fatalf("incidents = %d, want exactly 1 (one exact group, one collecting window)", got)
+	}
+	if got := countRows(t, st, `SELECT COUNT(*) FROM incident_alert_deliveries`); got != 2 {
+		t.Fatalf("incident_alert_deliveries = %d, want 2 (both concurrently-posted members attached to the one incident)", got)
+	}
+
+	// The exact-group invariant this scenario exists to prove: at most
+	// (here, exactly) one nonterminal Situation for the group both
+	// concurrent members share, regardless of how their two POSTs
+	// interleaved at the HTTP layer.
+	var groupKey string
+	if err := st.DB().QueryRowContext(ctx, `SELECT group_key FROM situations LIMIT 1`).Scan(&groupKey); err != nil {
+		t.Fatalf("read situation group_key: %v", err)
+	}
+	if got := countRows(t, st, `SELECT COUNT(*) FROM situations WHERE lifecycle IN ('active','recovery_pending') AND group_key = ?`, groupKey); got != 1 {
+		t.Fatalf("nonterminal situations for group %q = %d, want exactly 1", groupKey, got)
+	}
+	if got := countRows(t, st, `SELECT COUNT(*) FROM situations`); got != 1 {
+		t.Fatalf("total situations = %d, want exactly 1 (both members landed in the same exact group)", got)
+	}
+	if got := countRows(t, st, `SELECT COUNT(*) FROM situation_incidents WHERE situation_id = (SELECT id FROM situations LIMIT 1)`); got != 1 {
+		t.Fatalf("situation membership = %d, want 1 (the one incident both members were correlated into)", got)
+	}
+}
+
+// ----------------------------------------------------------------------
+// Scenario 8: inject a Store acceptance failure and prove HTTP 503 with
+// zero committed rows.
+// ----------------------------------------------------------------------
+
+func TestFoundationStoreAcceptanceFailureReturns503WithZeroCommittedRows(t *testing.T) {
+	ctx := context.Background()
+	srv, st, path := openFoundationHost(t, nil)
+	defer srv.Close()
+
+	// Inject a real Store acceptance failure — not a stub Receiver — by
+	// closing the underlying database connection out from under the real
+	// alertReceiver AcceptDeliveries call is about to make.
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	at := time.Date(2026, 9, 1, 3, 0, 0, 0, time.UTC)
+	resp := postPayload(t, srv, mustMarshal(t, foundationGroupPayload("durability-fail", "WillFail", "fp-fail", at)), nil)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	body := mustReadBody(t, resp)
+	if !strings.Contains(body, "delivery could not be persisted; retry later") {
+		t.Errorf("body = %q, want the fixed public durability message", body)
+	}
+	if strings.Contains(strings.ToLower(body), "database is closed") || strings.Contains(strings.ToLower(body), "sql:") {
+		t.Errorf("body = %q, must not leak the underlying driver error", body)
+	}
+
+	// Zero committed rows: verified from a SEPARATE connection to the same
+	// on-disk file, not the (now closed) connection that just failed.
+	second, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatalf("open second connection: %v", err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+	if got := countRows(t, second, `SELECT COUNT(*) FROM alert_deliveries`); got != 0 {
+		t.Fatalf("alert_deliveries after a failed acceptance = %d, want 0", got)
+	}
+	if got := countRows(t, second, `SELECT COUNT(*) FROM alert_delivery_dispatches`); got != 0 {
+		t.Fatalf("alert_delivery_dispatches after a failed acceptance = %d, want 0", got)
+	}
+	if got := countRows(t, second, `SELECT COUNT(*) FROM audit_log`); got != 0 {
+		t.Fatalf("audit_log after a failed acceptance = %d, want 0", got)
+	}
+}
+
+// ----------------------------------------------------------------------
+// Scenario 9: assert no Situation Slack/notifier, connector, LLM, or audit
+// fake is invoked by reconstruction.
+//
+// There is structurally no LLM or connector call reachable from this
+// path at all: Reconstructor.Run's dispatch.Drain only ever calls
+// Correlator.ApplyDelivery, never starts the Correlator's own ticker loop
+// (cor.Start), and the acute-triage skill — the only code in this
+// codebase that ever calls the LLM — is wired as the ticker-driven
+// window-expiry sink, not anything ApplyDelivery reaches directly. What
+// IS reachable from ApplyDelivery, and so needs an explicit fake to prove
+// silent, is the Correlator's own outward surface: its IncidentSink,
+// ResolutionNotifier, OccurrenceNotifier, and Auditor. This test wires
+// fakes for all four directly onto the Correlator BEFORE calling
+// Reconstruct.Run — the worst case, deliberately not the safe ordering
+// cmd/alertint follows — and still observes zero calls, because a fresh
+// firing delivery for a brand-new group reaches none of the four
+// (resolution/occurrence/audit trigger only on resolved/recurrence/retry-
+// attach paths this fixture never exercises). This complements, not
+// duplicates, internal/situation/reconstruct_test.go's own non-vacuous
+// proof (a fixture that WOULD leak if wired early) at the correlator-
+// internals level; this one is driven from the real receiver HTTP
+// boundary.
+// ----------------------------------------------------------------------
+
+type foundationOutwardSpy struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (s *foundationOutwardSpy) OnIncidentReady(context.Context, store.Incident) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	return nil
+}
+func (s *foundationOutwardSpy) OnIncidentResolved(context.Context, store.Incident) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	return nil
+}
+func (s *foundationOutwardSpy) OnOccurrenceAttached(context.Context, notify.RecurrenceEvent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	return nil
+}
+func (s *foundationOutwardSpy) Append(context.Context, string, string, any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	return nil
+}
+
+func (s *foundationOutwardSpy) total() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+func TestFoundationReconstructionInvokesNoOutwardSurface(t *testing.T) {
+	ctx := context.Background()
+	srv, st, path := openFoundationHost(t, nil)
+
+	at := time.Date(2026, 9, 1, 3, 0, 0, 0, time.UTC)
+	postAndExpect204(t, srv, foundationGroupPayload("silent-reconstruction", "Quiet", "fp-silent", at))
+
+	srv.Close()
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	st2, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	t.Cleanup(func() { _ = st2.Close() })
+
+	// The pre-crash POST above already appended its own "alert.received"
+	// audit row through the real receiver/Auditor path — that is normal
+	// receiver acknowledgment, not reconstruction, so this test compares
+	// the count reconstruction itself adds, not the table's raw total.
+	auditBefore := countRows(t, st2, `SELECT COUNT(*) FROM audit_log`)
+
+	spy := &foundationOutwardSpy{}
+	cor := correlator.New(correlator.Config{WindowSeconds: 60}, st2, spy, nil)
+	// Deliberately the UNSAFE ordering — wire every outward surface before
+	// reconstruction runs, not after, so a zero count here is not vacuous.
+	cor.SetResolutionNotifier(spy)
+	cor.SetOccurrenceNotifier(spy)
+	cor.SetAuditor(spy)
+
+	dispatch := correlator.NewDispatchWorker(st2, cor, correlator.WorkerConfig{Owner: "silent:dispatch"}, nil)
+	inputs := situation.NewInputWorker(st2, situation.WorkerConfig{Owner: "silent:input"}, nil)
+	r := situation.NewReconstructor(st2, func() time.Time { return at.Add(time.Minute) }).WithReplay(dispatch, inputs)
+
+	report, err := r.Run(ctx)
+	if err != nil {
+		t.Fatalf("reconstruct: %v", err)
+	}
+	if report.ReplayedDeliveries != 1 || report.ReplayedInputs != 1 {
+		t.Fatalf("report = %+v, want real work to have happened (otherwise zero outward calls would be vacuous)", report)
+	}
+	if got := spy.total(); got != 0 {
+		t.Fatalf("outward calls during reconstruction = %d, want 0", got)
+	}
+	if got := countRows(t, st2, `SELECT COUNT(*) FROM audit_log`); got != auditBefore {
+		t.Fatalf("audit_log rows: %d before reconstruction, %d after — reconstruction itself must never audit", auditBefore, got)
+	}
+	if got := countRows(t, st2, `SELECT COUNT(*) FROM situations`); got != 1 {
+		t.Fatalf("situations = %d, want exactly 1", got)
+	}
+}
+
+// countRows runs a literal (never concatenated) COUNT/scalar query and
+// returns the result. Shared by every Step 4 scenario in this file.
+func countRows(t *testing.T, st *store.Store, query string, args ...any) int {
+	t.Helper()
+	var n int
+	if err := st.DB().QueryRowContext(context.Background(), query, args...).Scan(&n); err != nil {
+		t.Fatalf("count query %q: %v", query, err)
+	}
+	return n
+}

@@ -36,6 +36,27 @@ re-route alerts, run scripts or runbooks, or page ticketing systems for
 you. Several of these are natural future directions — remediation, if it
 lands, will be gated behind explicit operator approval flows.
 
+## Durable Situation foundation
+
+Every accepted alert delivery is now immutable and durably queued, and the
+Incidents it produces are grouped under a durable per-exact-group
+**Situation** — visible read-only through the `alertint_list_situations`
+and `alertint_get_situation` MCP tools (see [Architecture: Situation
+foundation](architecture.md), [MCP clients](../integrations/mcp-clients.md)).
+Be precise about what that is and isn't:
+
+- **Is:** durable delivery acceptance and dispatch, crash-safe correlation,
+  and durable exact-group Situation grouping across restarts — all visible
+  read-only over MCP.
+- **Is not (yet):** a Situation controller. Nothing here decides when
+  Triage runs, owns the Slack card, or produces an Assessment, an operator
+  contract, or an episode summary — every `alertint_get_situation` response
+  reads `assessment: null` and `operator_contract: null`, honestly,
+  because neither exists.
+- **No mode switch:** there is no `state_controller_mode`, shadow-output
+  path, or legacy/new runtime toggle to configure — this build has exactly
+  one grouping path.
+
 ## Known weaknesses
 
 ### High-cardinality label churn

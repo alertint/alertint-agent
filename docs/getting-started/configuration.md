@@ -124,6 +124,17 @@ pull source (read-only context enrichment + `zabbix_metric_history` /
 |---|---|---|---|
 | `sqlite_path` | string | `./alertint-agent.db` | Path to the SQLite database file. The directory must be writable. |
 
+### Schema upgrades and rollback
+
+Every `alertint serve` start applies any pending embedded schema
+migrations to the configured database before accepting inbound traffic.
+Take a live backup ([Backup & restore](backup-restore.md)) before
+upgrading to a new AlertINT release. Rolling back a schema upgrade means
+restoring that pre-upgrade backup — there is no in-place schema-downgrade
+path, and starting an older binary against an already-upgraded database
+is unsupported: an older binary does not understand the newer schema and
+its behavior against it is undefined.
+
 ## `llm`
 
 | Field | Type | Default | Description |

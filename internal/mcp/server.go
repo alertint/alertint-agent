@@ -106,6 +106,13 @@ func NewServer(cfg Config, st *store.Store, auditor *audit.Auditor) *Server {
 	ms.AddTool(s.toolIncidentAnnotate())
 	ms.AddTool(s.toolIncidentCaptureVerdict())
 
+	// Read-only Situation foundation views (Task 9): always registered when
+	// MCP is enabled, unlike the source tools below — there is no connector
+	// to gate them on. Neither tool creates a judgment, note, verdict,
+	// envelope, Assessment, or reassessment request.
+	ms.AddTool(s.toolListSituations())
+	ms.AddTool(s.toolGetSituation())
+
 	// Log passthrough tool, registered only when a log source is configured.
 	// Named after the active backend (loki_query_range) so multiple sources can
 	// coexist additively later — see ADR-0003.

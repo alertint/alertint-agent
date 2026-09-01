@@ -173,7 +173,7 @@ func loadClaimedSituationInputsTx(ctx context.Context, tx *sql.Tx, ids []string,
 		SELECT id, idempotency_key, incident_id, delivery_id, kind, group_key, occurred_at, claim_token, attempt_count
 		FROM situation_input_outbox
 		WHERE id IN (` + strings.Join(placeholders, ",") + `) AND status = 'claimed' AND lease_owner = ?
-		ORDER BY occurred_at ASC, id ASC`
+		ORDER BY occurred_at ASC, id ASC` // #nosec G202 -- placeholders is a fixed "?,?,..." run built from len(ids) only; all runtime values bound via ? in args
 
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -792,7 +792,7 @@ func (s *Store) ClaimDueSituations(ctx context.Context, owner string, now time.T
 		placeholders[i] = "?"
 		args = append(args, id)
 	}
-	query := situationSelect + ` WHERE id IN (` + strings.Join(placeholders, ",") + `) ORDER BY next_assessment_at ASC, id ASC`
+	query := situationSelect + ` WHERE id IN (` + strings.Join(placeholders, ",") + `) ORDER BY next_assessment_at ASC, id ASC` // #nosec G202 -- placeholders is a fixed "?,?,..." run built from len(claimedIDs) only; all runtime values bound via ? in args
 	rows2, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("store: read claimed due situations: %w", err)
@@ -841,4 +841,135 @@ func (s *Store) ReleaseSituationClaim(ctx context.Context, claim situationmodel.
 		return ErrSituationLeaseLost
 	}
 	return nil
+}
+
+// ----------------------------------------------------------------------
+// Read-only Situation views (Task 9)
+//
+// These three reads plus SituationIncidentRef/ListSituationIncidents below
+// are the entire surface the read-only MCP Situation tools
+// (alertint_list_situations, alertint_get_situation) depend on. None of
+// them mutate anything, none of them take a lease, and none of them is
+// reachable from any write path in this file.
+// ----------------------------------------------------------------------
+
+// defaultSituationListLimit and maxSituationListLimit bound ListSituations
+// exactly like ListRecentIncidents bounds its own limit: a non-positive
+// input falls back to the default, anything above the ceiling is clamped
+// down to it, and neither case is an error.
+const (
+	defaultSituationListLimit = 20
+	maxSituationListLimit     = 100
+)
+
+// ListSituations returns up to limit Situations ordered by most recently
+// updated first — an operator or agent scanning the foundation wants "what
+// changed most recently", not insertion order, so a long-lived quiet
+// Situation does not bury a Situation that just advanced. limit is clamped
+// to [1,maxSituationListLimit]; a non-positive limit falls back to
+// defaultSituationListLimit.
+func (s *Store) ListSituations(ctx context.Context, limit int) ([]situationmodel.Situation, error) {
+	if limit <= 0 {
+		limit = defaultSituationListLimit
+	}
+	if limit > maxSituationListLimit {
+		limit = maxSituationListLimit
+	}
+	rows, err := s.db.QueryContext(ctx, situationSelect+` ORDER BY updated_at DESC, id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: list situations: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make([]situationmodel.Situation, 0, limit)
+	for rows.Next() {
+		sit, err := scanSituation(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: scan situation: %w", err)
+		}
+		out = append(out, sit)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate situations: %w", err)
+	}
+	return out, nil
+}
+
+// GetSituation reads one Situation by its exact id, or ErrNotFound if none
+// exists.
+func (s *Store) GetSituation(ctx context.Context, id string) (situationmodel.Situation, error) {
+	if strings.TrimSpace(id) == "" {
+		return situationmodel.Situation{}, errors.New("store: situation id is required")
+	}
+	sit, err := scanSituation(s.db.QueryRowContext(ctx, situationSelect+` WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return situationmodel.Situation{}, ErrNotFound
+	}
+	if err != nil {
+		return situationmodel.Situation{}, fmt.Errorf("store: get situation: %w", err)
+	}
+	return sit, nil
+}
+
+// GetSituationByHandle reads one Situation by its public_handle, matched
+// case-insensitively (a human may transcribe a handle with different
+// casing). Returns ErrNotFound if no Situation carries that handle — which
+// today is every Situation, since nothing in this build ever assigns
+// public_handle; the method exists so the read surface is complete once a
+// later plan starts publishing handles, and so alertint_get_situation's
+// handle parameter has something real to call.
+func (s *Store) GetSituationByHandle(ctx context.Context, handle string) (situationmodel.Situation, error) {
+	if strings.TrimSpace(handle) == "" {
+		return situationmodel.Situation{}, errors.New("store: situation handle is required")
+	}
+	sit, err := scanSituation(s.db.QueryRowContext(ctx, situationSelect+` WHERE public_handle = ? COLLATE NOCASE`, handle))
+	if errors.Is(err, sql.ErrNoRows) {
+		return situationmodel.Situation{}, ErrNotFound
+	}
+	if err != nil {
+		return situationmodel.Situation{}, fmt.Errorf("store: get situation by handle: %w", err)
+	}
+	return sit, nil
+}
+
+// SituationIncidentRef is one member Incident's identity and current
+// status, in Situation attachment order — the minimal, read-only
+// projection alertint_get_situation needs. A caller wanting the full
+// Incident detail (member alerts, finding, ...) follows up with
+// GetIncidentByID.
+type SituationIncidentRef struct {
+	IncidentID string
+	Status     string
+}
+
+// ListSituationIncidents returns a Situation's immutable member Incidents
+// (situation_incidents — attach-only, never updated or deleted), in
+// attachment order.
+func (s *Store) ListSituationIncidents(ctx context.Context, situationID string) ([]SituationIncidentRef, error) {
+	if strings.TrimSpace(situationID) == "" {
+		return nil, errors.New("store: situation id is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT i.id, i.status
+		FROM situation_incidents si
+		JOIN incidents i ON i.id = si.incident_id
+		WHERE si.situation_id = ?
+		ORDER BY si.attached_at ASC, i.id ASC`, situationID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list situation incidents: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make([]SituationIncidentRef, 0)
+	for rows.Next() {
+		var ref SituationIncidentRef
+		if err := rows.Scan(&ref.IncidentID, &ref.Status); err != nil {
+			return nil, fmt.Errorf("store: scan situation incident: %w", err)
+		}
+		out = append(out, ref)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate situation incidents: %w", err)
+	}
+	return out, nil
 }
