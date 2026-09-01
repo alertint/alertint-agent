@@ -339,6 +339,9 @@ type LLMConfig struct {
 	// "low") so this is passed through unvalidated, same as Thinking's
 	// boolean carries no value-semantics check. Rejected (when non-empty)
 	// for "anthropic", which has no equivalent chat-template mechanism.
+	// Requires Thinking true: it sizes the thinking budget, so pairing it
+	// with enable_thinking=false sends a contradictory pin the model
+	// silently ignores rather than a config mistake surfaced at load.
 	ReasoningEffort string `yaml:"reasoning_effort"`
 	// TimeoutSeconds is the whole-request HTTP timeout for either provider.
 	// Default 120 (the previously hardcoded client default). Local endpoints
@@ -781,6 +784,9 @@ func (c *Config) validateLLM() []string {
 			// "" means the default (json_object), resolved by normalize on load.
 		default:
 			errs = append(errs, fmt.Sprintf("llm.response_format %q invalid (use \"json_object\" or \"off\")", c.LLM.ResponseFormat))
+		}
+		if strings.TrimSpace(c.LLM.ReasoningEffort) != "" && !c.LLM.Thinking {
+			errs = append(errs, "llm.reasoning_effort requires llm.thinking: true (it sizes the thinking budget)")
 		}
 	case "":
 		errs = append(errs, "llm.provider is required")

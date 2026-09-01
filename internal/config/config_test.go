@@ -1008,6 +1008,21 @@ func TestValidateLLMOpenAICompatible(t *testing.T) {
 		}
 	})
 
+	t.Run("reasoning_effort requires thinking true", func(t *testing.T) {
+		c := base()
+		c.LLM.ReasoningEffort = "low"
+		c.LLM.Thinking = false
+		err := c.ValidateOffline()
+		if err == nil || !strings.Contains(err.Error(), "llm.reasoning_effort requires llm.thinking: true") {
+			t.Fatalf("want reasoning_effort-requires-thinking error, got: %v", err)
+		}
+
+		c.LLM.Thinking = true
+		if err := c.ValidateOffline(); err != nil {
+			t.Fatalf("reasoning_effort with thinking:true must pass, got: %v", err)
+		}
+	})
+
 	t.Run("base_url required", func(t *testing.T) {
 		c := base()
 		c.LLM.BaseURL = ""
