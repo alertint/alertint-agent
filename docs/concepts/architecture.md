@@ -108,8 +108,15 @@ here too: storm collapse, known-issue short-circuits, and prompt selection.
 
 Every correlated delivery also feeds a **Situation** — a durable record
 that owns one or more Incidents under one exact group key across restarts,
-so a fresh firing of the same group after a prior one resolved is linked
-to it as a new lineage rather than starting from nothing. This is a
+so a fresh firing of the same group finds its durable history waiting
+rather than starting from nothing. Nothing closes a Situation in this
+build: a group's Situation stays active indefinitely and keeps owning that
+group's later Incidents, so a re-fire after a prior resolution feeds the
+same Situation (or collapses into the judged Incident as an occurrence).
+The episode-boundary machinery — a closed Situation refusing new work, a
+fresh linked Situation opening in its place — is already enforced at the
+storage layer, but only becomes observable once the Situation controller
+ships lifecycle termination. This is a
 **foundation, not a controller**: today it durably groups Incidents and is
 visible read-only through MCP (`alertint_list_situations`,
 `alertint_get_situation`) — it does not decide when Triage runs, does not

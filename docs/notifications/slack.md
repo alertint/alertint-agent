@@ -173,9 +173,13 @@ the existing card or inside its thread. What lands depends on what changed:
   (`🔁 recurred ×N · last HH:MM`). No new message anywhere.
 - **A real-world change** — severity escalated, a new symptom (alertname)
   joined, or the cadence sped up markedly — posts a thread reply naming
-  exactly why (`why: severity` / `why: new_alertname` / `why: cadence`), and
-  the incident is re-analyzed with the fresh finding edited into the same
-  card — never a new one.
+  exactly why (`why: severity` / `why: new_alertname` / `why: cadence`).
+  The escalation trigger is durably recorded on the occurrence, but the
+  automatic re-analysis it is meant to drive is not wired to the delivery
+  pipeline yet — acting on recorded triggers is an explicit obligation of
+  the upcoming Situation controller — so today the card's finding is not
+  re-edited on escalation; the thread reply is the escalation's visible
+  trace.
 - **A steady flapper** that never trips one of those changes still gets a
   thread reply at milestone counts — ×5, ×10, ×25, ×50, ×100, then every
   ×100 — so a long-running recurring incident keeps a visible trail in its
@@ -229,8 +233,9 @@ itself is unaffected. See [Integration health](../getting-started/configuration.
 for the `/health` shape behind these messages.
 
 Two backstop triggers — a hard occurrence cap and a periodic re-analysis
-ceiling — force a fresh re-analysis without representing a genuine escalation,
-so they edit the card but never post a reply; they stay silent by design.
+ceiling — are likewise recorded without representing a genuine escalation, and
+never post a reply; the fresh re-analysis they are meant to force awaits the
+same Situation controller.
 
 Control this with `notify.slack.recurrence_mode`:
 
