@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -457,6 +458,35 @@ func loadClaimedDispatchesTx(ctx context.Context, tx *sql.Tx, ids []string, owne
 	return out, nil
 }
 
+// errorClassPattern is the stable-lowercase-identifier contract for
+// last_error_class: lowercase letters, digits, and underscores, starting
+// with a letter. It exists to keep this column a closed-vocabulary-shaped
+// classification, never a place a raw error message (which could embed a
+// URL, header value, or other sensitive/verbose text) can land.
+var errorClassPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+
+// maxErrorClassLength bounds last_error_class well below anything a raw
+// error message would need, so an oversized value is rejected rather than
+// silently truncated.
+const maxErrorClassLength = 64
+
+// validateErrorClass enforces that class is a stable lowercase identifier
+// (e.g. "transient", "rate_limited"), never raw error text. It never
+// sanitizes or truncates — a non-conforming class is a validation error,
+// not something this function repairs.
+func validateErrorClass(class string) error {
+	if class == "" {
+		return errors.New("store: alert dispatch error class is required")
+	}
+	if len(class) > maxErrorClassLength {
+		return fmt.Errorf("store: alert dispatch error class exceeds %d characters", maxErrorClassLength)
+	}
+	if !errorClassPattern.MatchString(class) {
+		return errors.New("store: alert dispatch error class must be a lowercase identifier (e.g. \"transient\"), not raw error text")
+	}
+	return nil
+}
+
 // RetryAlertDispatch releases a claimed dispatch back to "pending" for a
 // future retry, or marks it terminally "failed" when terminal is true. The
 // update is fenced on (delivery_id, status='claimed', lease_owner,
@@ -465,8 +495,11 @@ func loadClaimedDispatchesTx(ctx context.Context, tx *sql.Tx, ids []string, owne
 // ErrAlertDispatchLeaseLost instead of silently doing nothing.
 func (s *Store) RetryAlertDispatch(ctx context.Context, claim AlertDispatch, class string, retryAt time.Time, terminal bool) error {
 	if strings.TrimSpace(claim.Delivery.ID) == "" || claim.LeaseOwner == nil || strings.TrimSpace(*claim.LeaseOwner) == "" ||
-		claim.ClaimToken <= 0 || strings.TrimSpace(class) == "" {
-		return errors.New("store: alert dispatch retry requires a complete claim and error class")
+		claim.ClaimToken <= 0 {
+		return errors.New("store: alert dispatch retry requires a complete claim")
+	}
+	if err := validateErrorClass(class); err != nil {
+		return err
 	}
 	status := "pending"
 	var retry any = canonicalTime(retryAt)

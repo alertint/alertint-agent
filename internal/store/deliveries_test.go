@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -223,6 +224,53 @@ func TestRetryAlertDispatchHonorsRetryDueTiming(t *testing.T) {
 	}
 	if due[0].AttemptCount != 2 {
 		t.Fatalf("attempt count = %d, want 2", due[0].AttemptCount)
+	}
+}
+
+func TestRetryAlertDispatchRejectsNonConformingErrorClass(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 1, 2, 3, 0, time.UTC)
+	if _, err := st.AcceptDeliveries(ctx, []DeliveryInput{deliveryFixture("delivery-a", "fp-a", now)}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := st.ClaimAlertDispatches(ctx, "worker-a", now, time.Minute, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	badClasses := []string{
+		"",
+		"Transient", // uppercase
+		"connection refused: dial tcp 10.0.0.5:443",     // raw error text with spaces/colons
+		"https://internal.example.com/secret?token=abc", // a URL that could leak
+		"1_leading_digit",
+		"trailing_space ",
+		strings.Repeat("a", maxErrorClassLength+1), // over length cap
+	}
+	for _, class := range badClasses {
+		if err := st.RetryAlertDispatch(ctx, claimed[0], class, now.Add(time.Minute), false); err == nil {
+			t.Fatalf("accepted non-conforming error class %q", class)
+		} else if errors.Is(err, ErrAlertDispatchLeaseLost) {
+			t.Fatalf("error class %q rejected via lease-lost instead of validation: %v", class, err)
+		}
+	}
+
+	// The claim must still be intact — a rejected class must not have
+	// touched the row.
+	var status string
+	var leaseOwner sql.NullString
+	if err := st.DB().QueryRowContext(ctx, `SELECT status, lease_owner FROM alert_delivery_dispatches WHERE delivery_id = ?`, "delivery-a").
+		Scan(&status, &leaseOwner); err != nil {
+		t.Fatal(err)
+	}
+	if status != "claimed" || !leaseOwner.Valid || leaseOwner.String != "worker-a" {
+		t.Fatalf("claim mutated by rejected retry: status=%q lease_owner=%v", status, leaseOwner)
+	}
+
+	// A conforming class still works on the same still-valid claim.
+	if err := st.RetryAlertDispatch(ctx, claimed[0], "rate_limited", now.Add(time.Minute), false); err != nil {
+		t.Fatalf("conforming error class rejected: %v", err)
 	}
 }
 
