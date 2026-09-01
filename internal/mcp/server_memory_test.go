@@ -76,11 +76,15 @@ func TestGetIncident_MemoryBlockMatchesMemoryView(t *testing.T) {
 	now := time.Now().UTC()
 	key := "cluster=prod,namespace=web,service=api"
 
+	// Seed the analyzed prior first so it leaves "collecting" before the
+	// current incident starts collecting on the same group_key: 0013 added
+	// a partial unique index allowing only one collecting incident per
+	// group_key at a time, matching how the correlator behaves in practice.
+	seedAnalyzedPrior(t, st, "inc-prior", key, "backup rotation misconfigured", 0.70, now.AddDate(0, 0, -3), false)
 	// Current incident + one analyzed prior on the same key, with two occurrences.
 	if err := st.InsertIncident(ctx, store.Incident{ID: "inc-current", GroupKey: key, FirstAlertAt: now, LastAlertAt: now, ReadyAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	seedAnalyzedPrior(t, st, "inc-prior", key, "backup rotation misconfigured", 0.70, now.AddDate(0, 0, -3), false)
 	for i := 1; i <= 2; i++ {
 		at := now.AddDate(0, 0, -3).Add(time.Duration(i) * 24 * time.Hour)
 		if _, err := st.InsertOccurrence(ctx, store.Occurrence{IncidentID: "inc-prior", OccurredAt: at, LastSeen: at, Fingerprints: []string{"fp"}}); err != nil {
