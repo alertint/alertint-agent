@@ -999,7 +999,7 @@ func loadClaimedDispatchesTx(ctx context.Context, tx *sql.Tx, ids []string, owne
 	args = append(args, owner)
 	query := dispatchSelect + ` WHERE d.delivery_id IN (` + strings.Join(placeholders, ",") +
 		`) AND d.status = 'claimed' AND d.lease_owner = ?
-		ORDER BY COALESCE(d.retry_at, ad.received_at) ASC, ad.received_at ASC, d.delivery_id ASC`
+		ORDER BY COALESCE(d.retry_at, ad.received_at) ASC, ad.received_at ASC, d.delivery_id ASC` // #nosec G202 -- placeholders is a fixed "?,?,..." run built from len(ids) only; all runtime values bound via ? in args
 
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {

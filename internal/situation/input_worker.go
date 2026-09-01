@@ -152,7 +152,7 @@ func inputRetryBackoff(attempt int) time.Duration {
 	if attempt > 32 { // 1s<<31 already exceeds the cap many times over
 		return inputRetryCap
 	}
-	d := inputRetryBase * time.Duration(uint64(1)<<uint(attempt-1))
+	d := inputRetryBase * time.Duration(uint64(1)<<uint(attempt-1)) // #nosec G115 -- attempt is capped <= 32 immediately above, so 1<<(attempt-1) never exceeds 2^31, far below int64's range
 	if d <= 0 || d > inputRetryCap {
 		return inputRetryCap
 	}
