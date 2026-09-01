@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/correlator"
+	"github.com/alertint/alertint-agent/internal/notify"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
 )
@@ -19,9 +20,9 @@ import (
 // ----------------------------------------------------------------------
 
 // callCounter is a fake correlator.IncidentSink + correlator.ResolutionNotifier
-// that counts every call — reconstruction wires it in as a canary: if
-// anything on the reconstruction path ever reached an outward notification
-// surface, Calls would go non-zero.
+// + correlator.OccurrenceNotifier that counts every call — reconstruction
+// wires it in as a canary: if anything on the reconstruction path ever
+// reached an outward notification surface, Calls would go non-zero.
 type callCounter struct {
 	Calls int
 }
@@ -36,13 +37,26 @@ func (c *callCounter) OnIncidentResolved(context.Context, store.Incident) error 
 	return nil
 }
 
+func (c *callCounter) OnOccurrenceAttached(context.Context, notify.RecurrenceEvent) error {
+	c.Calls++
+	return nil
+}
+
 func firingDeliveryFixture(id, fingerprint, groupIdentity string, at time.Time) store.DeliveryInput {
+	return deliveryFixtureForReconstruction(id, fingerprint, groupIdentity, "firing", at)
+}
+
+// deliveryFixtureForReconstruction builds one DeliveryInput ready for
+// AcceptDeliveries, carrying groupIdentity as the Receiver grouping
+// identity and an explicit status ("firing" or "resolved") on its Alert —
+// the status firingDeliveryFixture always hardcodes to "firing".
+func deliveryFixtureForReconstruction(id, fingerprint, groupIdentity, status string, at time.Time) store.DeliveryInput {
 	return store.DeliveryInput{
 		ID: id,
 		Alert: store.Alert{
 			ID:          "alert-" + fingerprint,
 			Fingerprint: fingerprint,
-			Status:      "firing",
+			Status:      status,
 			Labels:      map[string]string{"alertname": "test", "fp": fingerprint},
 			Annotations: map[string]string{"summary": "test alert"},
 			StartsAt:    at,
@@ -57,6 +71,30 @@ func firingDeliveryFixture(id, fingerprint, groupIdentity string, at time.Time) 
 		SourceProvenance: store.SourceProvenance{
 			AcquisitionMode: store.SourceAcquisitionWebhook,
 		},
+	}
+}
+
+// seedJudgedIncidentForReconstruction inserts a judged Incident with one
+// member alert directly — mirroring internal/correlator's own unexported
+// seedJudged/firingAlert test helpers, which this package cannot import —
+// for building resolved/recurrence-collapse scenarios a Reconstructor.Run
+// pass can reach via dispatch.Drain -> Correlator.ApplyDelivery.
+func seedJudgedIncidentForReconstruction(t *testing.T, st *store.Store, id, groupKey, status string, lastActivity, lastJudged time.Time, member store.Alert) {
+	t.Helper()
+	ctx := context.Background()
+	ts := func(x time.Time) string { return x.UTC().Format(time.RFC3339Nano) }
+	if _, err := st.DB().ExecContext(ctx, `
+		INSERT INTO incidents
+			(id, group_key, status, first_alert_at, last_alert_at, ready_at, alert_count, last_judged_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+	`, id, groupKey, status, ts(lastActivity), ts(lastActivity), ts(lastActivity), ts(lastJudged), ts(lastActivity), ts(lastActivity)); err != nil {
+		t.Fatalf("seed judged incident %s: %v", id, err)
+	}
+	if _, err := st.UpsertAlertByFingerprint(ctx, member); err != nil {
+		t.Fatalf("seed member alert for %s: %v", id, err)
+	}
+	if err := st.AddAlertToIncident(ctx, id, member.ID, member.ReceivedAt); err != nil {
+		t.Fatalf("link member alert for %s: %v", id, err)
 	}
 }
 
@@ -164,6 +202,73 @@ func reconstructionFixture(t *testing.T) (*store.Store, *correlator.DispatchWork
 	return st, dispatch, inputs, notifier
 }
 
+// reconstructionFixtureWithNotifiableDeliveries builds a second,
+// independent file-backed Store whose queued durable deliveries are chosen
+// specifically to reach the two Correlator code paths Task 8's review found
+// synchronously reachable from Reconstructor.Run's dispatch.Drain ->
+// Correlator.ApplyDelivery: (a) a resolved delivery for a group whose
+// existing "ready" Incident has exactly one still-firing member — applying
+// it resolves that member and flips the Incident fully to "resolved",
+// which calls the Correlator's ResolutionNotifier if one is wired (mirrors
+// internal/correlator's
+// TestApplyDelivery_ResolvedDeliveryResolvesIncidentAndNotifies); and (b) a
+// firing delivery for a group whose existing "analyzed" (judged) Incident
+// has one member, queued with a brand-new fingerprint — applying it
+// collapses into a new recurrence Occurrence, which calls the Correlator's
+// OccurrenceNotifier if one is wired (mirrors
+// TestApplyDelivery_RecurrenceCollapseAttachesOccurrenceAndNotifies). It
+// returns the Correlator itself, unlike reconstructionFixture, so a test can
+// control exactly when — relative to calling Reconstructor.Run — those two
+// notifiers get wired.
+func reconstructionFixtureWithNotifiableDeliveries(t *testing.T) (*store.Store, *correlator.Correlator, *correlator.DispatchWorker, *InputWorker, *callCounter) {
+	t.Helper()
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, err := store.Open(ctx, filepath.Join(dir, "reconstruction-notify.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+
+	// (a) resolved delivery settling an existing "ready" Incident's only member.
+	resolveMember := store.Alert{
+		ID: "alert-resolve-member", Fingerprint: "fp-resolve-member", Status: "firing",
+		Labels:      map[string]string{"alertname": "test", "fp": "fp-resolve-member"},
+		Annotations: map[string]string{"summary": "test alert"},
+		StartsAt:    now.Add(-time.Hour), ReceivedAt: now.Add(-time.Hour),
+	}
+	seedJudgedIncidentForReconstruction(t, st, "inc-resolve-target", "group:resolve-target", "ready", now.Add(-time.Hour), now.Add(-time.Hour), resolveMember)
+	if _, err := st.AcceptDeliveries(ctx, []store.DeliveryInput{
+		deliveryFixtureForReconstruction("d-resolve", "fp-resolve-member", "group:resolve-target", "resolved", now),
+	}); err != nil {
+		t.Fatalf("accept resolved delivery: %v", err)
+	}
+
+	// (b) firing delivery, new fingerprint, collapsing into a recurrence
+	// occurrence against an existing "analyzed" Incident.
+	occMember := store.Alert{
+		ID: "alert-occ-member", Fingerprint: "fp-occ-member", Status: "firing",
+		Labels:      map[string]string{"alertname": "test", "fp": "fp-occ-member"},
+		Annotations: map[string]string{"summary": "test alert"},
+		StartsAt:    now.Add(-5 * time.Minute), ReceivedAt: now.Add(-5 * time.Minute),
+	}
+	seedJudgedIncidentForReconstruction(t, st, "inc-occ-target", "group:occ-target", "analyzed", now.Add(-5*time.Minute), now.Add(-10*time.Minute), occMember)
+	if _, err := st.AcceptDeliveries(ctx, []store.DeliveryInput{
+		deliveryFixtureForReconstruction("d-occ", "fp-occ-new", "group:occ-target", "firing", now),
+	}); err != nil {
+		t.Fatalf("accept recurrence-collapsing delivery: %v", err)
+	}
+
+	notifier := &callCounter{}
+	cor := correlator.New(correlator.Config{WindowSeconds: 60}, st, notifier, nil)
+	dispatch := correlator.NewDispatchWorker(st, cor, correlator.WorkerConfig{Owner: "recon-notify:dispatch"}, nil)
+	inputs := NewInputWorker(st, WorkerConfig{Owner: "recon-notify:input"}, nil)
+
+	return st, cor, dispatch, inputs, notifier
+}
+
 // assertOperationalIncidentsRepresented asserts that every operational
 // Incident (collecting/ready/processing/analyzed/failed) reconstructionFixture
 // seeded now belongs to a Situation, and that the settled resolved Incident
@@ -249,6 +354,58 @@ func TestReconstructorSecondRunCreatesOrAttachesNothingNew(t *testing.T) {
 	if situationsAfter != situationsBefore || membershipsAfter != membershipsBefore {
 		t.Fatalf("second run changed durable state: situations %d->%d, memberships %d->%d",
 			situationsBefore, situationsAfter, membershipsBefore, membershipsAfter)
+	}
+}
+
+// TestReconstructorNeverCallsNotifiersWiredAfterReconstruction proves the
+// discipline cmd/alertint's startCorrelator now follows (wire
+// SetResolutionNotifier/SetOccurrenceNotifier strictly between reconstruct
+// and Correlator.Start, never before) is what actually keeps reconstruction
+// silent: it runs Reconstructor.Run against a fixture whose queued
+// deliveries genuinely reach both the resolution-notifier and the
+// occurrence-notifier branches (see
+// reconstructionFixtureWithNotifiableDeliveries), then wires both notifiers
+// only afterward, and asserts zero calls happened. Its sibling test below
+// proves this isn't vacuous — the same fixture, with the notifiers wired
+// before Run instead, does leak.
+func TestReconstructorNeverCallsNotifiersWiredAfterReconstruction(t *testing.T) {
+	st, cor, dispatch, inputs, notifier := reconstructionFixtureWithNotifiableDeliveries(t)
+	r := NewReconstructor(st, fixedClock).WithReplay(dispatch, inputs)
+
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if notifier.Calls != 0 {
+		t.Fatalf("reconstruction produced %d outward notifier call(s) with no notifier wired yet — impossible unless Correlator.ApplyDelivery changed", notifier.Calls)
+	}
+
+	// Wire the notifiers exactly where cmd/alertint's startCorrelator does:
+	// strictly between reconstruction and Correlator.Start, never before.
+	cor.SetResolutionNotifier(notifier)
+	cor.SetOccurrenceNotifier(notifier)
+}
+
+// TestNotifiersWiredBeforeReconstructionWouldLeakOutward intentionally
+// reproduces the exact ordering bug Task 8's review caught in
+// cmd/alertint/main.go — wiring the Correlator's notifiers before
+// reconstruction runs — against the same fixture the sibling test above
+// uses. It exists so a future change that wires notifiers earlier (in
+// cmd/alertint, or in a fixture like this one) fails loudly here instead of
+// silently regressing the fix, and so the sibling test's zero-calls
+// assertion is proven non-vacuous: this fixture's resolved/
+// recurrence-collapsing deliveries really do reach the notifier branches
+// when given the chance.
+func TestNotifiersWiredBeforeReconstructionWouldLeakOutward(t *testing.T) {
+	st, cor, dispatch, inputs, notifier := reconstructionFixtureWithNotifiableDeliveries(t)
+	cor.SetResolutionNotifier(notifier)
+	cor.SetOccurrenceNotifier(notifier)
+	r := NewReconstructor(st, fixedClock).WithReplay(dispatch, inputs)
+
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if notifier.Calls == 0 {
+		t.Fatal("expected wiring notifiers before reconstruction to leak at least one outward call; if this reads 0, the fixture's deliveries no longer reach the vulnerable code paths and this regression guard has gone silent")
 	}
 }
 

@@ -125,21 +125,32 @@ func execRowsAffected(ctx context.Context, tx *sql.Tx, query string, args ...any
 // represents unconditionally — failed is included deliberately, since
 // migration 0001 already supports it and excluding it would hide
 // triage-exhausted operational state from the Situation foundation. A
-// resolved Incident represents only if it still carries an immutable
-// firing delivery member: its own alerts resolved, but the durable
-// delivery ledger never recorded that resolution, so from the Situation's
-// perspective this Incident is not actually settled.
+// resolved Incident represents only if the durable delivery ledger itself
+// never recorded its resolution: it has at least one attached firing
+// delivery and NO attached resolved delivery at all. alert_deliveries is an
+// append-only ledger (a properly resolved Incident keeps BOTH its original
+// firing row and a later resolved one), so "has some firing delivery"
+// alone is not enough to prove the ledger never witnessed the resolution —
+// it must also have zero resolved deliveries, or a normally-settled
+// Incident (firing row followed by a resolved row) would be wrongly swept
+// back into an active Situation.
 const unrepresentedOperationalIncidentsQuery = `
 SELECT i.id, i.group_key, i.first_alert_at, i.last_alert_at
 FROM incidents i
 WHERE NOT EXISTS (SELECT 1 FROM situation_incidents si WHERE si.incident_id = i.id)
   AND (
     i.status IN ('collecting','ready','processing','analyzed','failed')
-    OR (i.status = 'resolved' AND EXISTS (
-        SELECT 1 FROM incident_alert_deliveries iad
-        JOIN alert_deliveries ad ON ad.id = iad.delivery_id
-        WHERE iad.incident_id = i.id AND ad.status = 'firing'
-    ))
+    OR (i.status = 'resolved'
+        AND EXISTS (
+            SELECT 1 FROM incident_alert_deliveries iad
+            JOIN alert_deliveries ad ON ad.id = iad.delivery_id
+            WHERE iad.incident_id = i.id AND ad.status = 'firing'
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM incident_alert_deliveries iad
+            JOIN alert_deliveries ad ON ad.id = iad.delivery_id
+            WHERE iad.incident_id = i.id AND ad.status = 'resolved'
+        ))
   )
 ORDER BY i.group_key ASC, i.id ASC`
 

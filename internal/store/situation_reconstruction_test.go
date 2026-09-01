@@ -15,6 +15,17 @@ import (
 // Fixture helpers
 // ----------------------------------------------------------------------
 
+// resolvedDeliveryFixture mirrors deliveryFixture (deliveries_test.go) but
+// with the Alert's Status set to "resolved" — deliveryFixture always
+// hardcodes "firing", so a genuinely-settled-Incident fixture (a firing
+// delivery followed by a later resolved one for the same fingerprint) needs
+// its own builder.
+func resolvedDeliveryFixture(id, fingerprint string, now time.Time) DeliveryInput {
+	d := deliveryFixture(id, fingerprint, now)
+	d.Alert.Status = "resolved"
+	return d
+}
+
 // insertRawIncident inserts an Incident row directly, bypassing the normal
 // lifecycle transition methods, so reconstruction tests can seed a
 // specific status (including "processing", "analyzed", and "resolved",
@@ -294,12 +305,31 @@ func TestUnrepresentedOperationalIncidentsIncludesEveryOperationalStatus(t *test
 	// Resolved with no firing member: excluded.
 	insertRawIncident(t, st, "inc-resolved-settled", "group-resolved-settled", "resolved", base, base)
 
-	// Resolved but still carrying an immutable firing delivery member: included.
+	// Resolved but still carrying an immutable firing delivery member, with
+	// no resolved delivery ever recorded for it: included — the ledger
+	// itself never witnessed the resolution the Incident's own status claims.
 	if _, err := st.AcceptDeliveries(ctx, []DeliveryInput{deliveryFixture("d-firing-member", "fp-firing-member", base)}); err != nil {
 		t.Fatalf("accept firing delivery: %v", err)
 	}
 	insertRawIncident(t, st, "inc-resolved-unsettled", "group-resolved-unsettled", "resolved", base, base)
 	attachDeliveryToIncident(t, st, "inc-resolved-unsettled", "d-firing-member", base)
+
+	// Resolved, genuinely settled: both a firing delivery AND a later
+	// resolved delivery for the same fingerprint are attached (exactly what
+	// alert_deliveries' append-only ledger looks like for an Incident that
+	// actually fired then recovered) — excluded. Regression case for the
+	// predicate that used to check only "has some firing delivery", which
+	// wrongly swept every settled Incident with any ledger-era firing row
+	// back into a brand-new active Situation.
+	if _, err := st.AcceptDeliveries(ctx, []DeliveryInput{
+		deliveryFixture("d-settled-firing", "fp-settled", base),
+		resolvedDeliveryFixture("d-settled-resolved", "fp-settled", base.Add(time.Minute)),
+	}); err != nil {
+		t.Fatalf("accept settled firing+resolved deliveries: %v", err)
+	}
+	insertRawIncident(t, st, "inc-resolved-settled-ledger", "group-resolved-settled-ledger", "resolved", base, base)
+	attachDeliveryToIncident(t, st, "inc-resolved-settled-ledger", "d-settled-firing", base)
+	attachDeliveryToIncident(t, st, "inc-resolved-settled-ledger", "d-settled-resolved", base.Add(time.Minute))
 
 	// Already represented: excluded regardless of status.
 	insertRawIncident(t, st, "inc-already-represented", "group-already-represented", "ready", base, base)
