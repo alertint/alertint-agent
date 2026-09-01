@@ -641,7 +641,14 @@ func (c *Correlator) applyResolvedDeliveryPlan(ctx context.Context, claim store.
 	}
 	c.logger.Info("correlator: resolved delivery linked to incident", "incident_id", result.Incident.ID, "delivery_id", claim.Delivery.ID, "group_key", gk, "status", result.Incident.Status)
 	if result.Resolved && c.resolutionNotifier != nil {
-		if notifyErr := c.resolutionNotifier.OnIncidentResolved(ctx, result.Incident); notifyErr != nil {
+		// Pass the pre-commit, fully-scanned *recentInc — not result.Incident,
+		// which comes back through the store's lightweight scanIncident (no
+		// Summary/RootCause/Confidence/LastJudgedAt) — so a resolved card for
+		// an analyzed Incident still carries its real analysis, matching what
+		// current main's handleResolvedAlert passes today (pre-resolution
+		// status included; the notifier never depended on a post-commit
+		// Status="resolved" value).
+		if notifyErr := c.resolutionNotifier.OnIncidentResolved(ctx, *recentInc); notifyErr != nil {
 			c.logger.Warn("correlator: resolution notify failed", "incident_id", result.Incident.ID, "err", notifyErr)
 		}
 	}

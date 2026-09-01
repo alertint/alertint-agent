@@ -409,6 +409,11 @@ func TestApplyDelivery_ResolvedDeliveryResolvesIncidentAndNotifies(t *testing.T)
 	now := time.Date(2026, 9, 1, 3, 0, 0, 0, time.UTC)
 	member := firingAlert("fp-only", "DiskFull", "warning", now.Add(-time.Hour), false)
 	seedJudged(t, st, "inc_1", "ready", now.Add(-time.Hour), now.Add(-time.Hour), member)
+	// A judged (analyzed) Incident's real finding must survive into the
+	// resolution notification — not fall back to a generic placeholder.
+	if err := st.SaveIncidentOutput(context.Background(), "inc_1", "{}", "Disk Full Alert", "disk usage exceeded threshold", 0.87, ""); err != nil {
+		t.Fatalf("save incident output: %v", err)
+	}
 
 	claim := claimOneDelivery(t, st, deliveryInputFor("d1", "fp-only", gkAPI, "resolved", now), now)
 	if err := c.ApplyDelivery(context.Background(), claim); err != nil {
@@ -428,6 +433,10 @@ func TestApplyDelivery_ResolvedDeliveryResolvesIncidentAndNotifies(t *testing.T)
 	}
 	if resolved.count() != 1 {
 		t.Fatalf("resolution notifier calls = %d, want 1", resolved.count())
+	}
+	notified := resolved.calls[0]
+	if notified.Summary != "Disk Full Alert" || notified.RootCause != "disk usage exceeded threshold" || notified.Confidence != 0.87 {
+		t.Fatalf("resolution notifier incident = %+v, want the analyzed Incident's real Summary/RootCause/Confidence preserved", notified)
 	}
 }
 
