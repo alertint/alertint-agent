@@ -35,19 +35,24 @@ func TestOpen_AppliesEmbeddedMigrations(t *testing.T) {
 	defer func() { _ = rows.Close() }()
 
 	want := map[string]bool{
-		"alerts":                    false,
-		"audit_log":                 false,
-		"incident_alerts":           false,
-		"incidents":                 false,
-		"schema_migrations":         false,
-		"llm_health":                false,
-		"llm_health_capabilities":   false,
-		"alert_deliveries":          false,
-		"alert_delivery_dispatches": false,
-		"incident_alert_deliveries": false,
-		"situations":                false,
-		"situation_incidents":       false,
-		"situation_input_outbox":    false,
+		"alerts":                        false,
+		"audit_log":                     false,
+		"incident_alerts":               false,
+		"incidents":                     false,
+		"schema_migrations":             false,
+		"llm_health":                    false,
+		"llm_health_capabilities":       false,
+		"alert_deliveries":              false,
+		"alert_delivery_dispatches":     false,
+		"incident_alert_deliveries":     false,
+		"situations":                    false,
+		"situation_incidents":           false,
+		"situation_input_outbox":        false,
+		"situation_facts":               false,
+		"situation_assessment_calls":    false,
+		"situation_assessment_attempts": false,
+		"situation_assessment_coverage": false,
+		"incident_triage_attempts":      false,
 	}
 	for rows.Next() {
 		var name string
@@ -433,9 +438,9 @@ func TestMaxSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	// 0014_situation_foundation.sql is the newest migration today.
-	if got != 14 {
-		t.Errorf("MaxSchemaVersion = %d, want 14", got)
+	// 0016_incident_triage_controller.sql is the newest migration today.
+	if got != 16 {
+		t.Errorf("MaxSchemaVersion = %d, want 16", got)
 	}
 }
 
