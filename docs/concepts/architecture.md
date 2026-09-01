@@ -61,6 +61,19 @@ anything is written; a payload that's valid but can't be durably
 persisted returns `503` so a well-behaved sender retries — nothing is
 ever silently dropped or acknowledged without being on disk.
 
+This same content digest has a consequence worth naming for a repeat-capable
+sender: because the delivery id is derived purely from the normalized
+payload (never from a receipt timestamp), a genuine repeat whose payload is
+byte-identical to one already accepted — a Zabbix escalation step resending
+the same macros, for example — resolves to the *same* delivery, not a new
+one. The repeat is deduped exactly as intended, but it also does not slide
+the collapse window forward the way current main's `last_seen`/`received_at`
+touch used to for such a sender: an identical resend is invisible to the
+collapse horizon rather than extending it. A sender whose repeats carry even
+one changed byte (a refreshed timestamp field, an incremented counter) is
+unaffected — that produces a distinct digest and a distinct delivery as
+before.
+
 A background worker drains the pending-dispatch queue and hands each
 delivery to the Correlator below. This closes the crash window a receiver
 POST used to leave open between accepting an alert and correlating it: if
@@ -123,8 +136,11 @@ analysis gets the prior finding **recalled** into its prompt as a past
 hypothesis, never as evidence. See [incident
 memory](incident-memory.md).
 
-- **Collapse:** occurrence attach, no LLM call; re-judgment only on an
-  escalation trigger
+- **Collapse:** occurrence attach, no LLM call. An escalation trigger
+  (severity rise, new alert type, cadence spike, occurrence/time ceiling) is
+  durably recorded on the occurrence, but nothing currently acts on it —
+  automatic re-judgment on that trigger is a Situation controller obligation,
+  not yet-shipped behavior. See [incident memory](incident-memory.md#recurrence-collapse).
 - **Recall:** distilled prior findings, recurrence count, cadence
 
 ### 5. Evidence pack

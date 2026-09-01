@@ -197,8 +197,8 @@ only the knobs below.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `attach_window_minutes` | int | `30` | Clock A. A re-fire within this many minutes of the last occurrence attaches instead of re-triaging. A longer window collapses more aggressively. |
-| `judgment_ceiling_hours` | int | `4` | Clock B. A steady flapper that never pauses would slide Clock A forever; once this long has passed since the last analysis, the next re-fire forces a fresh re-judgment (with the accumulated history) even while still collapsing. |
-| `occurrence_cap` | int | `100` | Backstop trigger: force a re-judgment after this many occurrences have attached since the last analysis, regardless of the clocks. |
+| `judgment_ceiling_hours` | int | `4` | Clock B. A steady flapper that never pauses would slide Clock A forever; once this long has passed since the last analysis, the next re-fire is durably recorded as an escalation trigger (with the accumulated history) even while still collapsing. Acting on that trigger to force a fresh re-judgment automatically is not yet wired into the durable delivery pipeline — see [incident memory](../concepts/incident-memory.md#recurrence-collapse). |
+| `occurrence_cap` | int | `100` | Backstop: durably records an escalation trigger after this many occurrences have attached since the last analysis, regardless of the clocks. Not yet acted on automatically — see [incident memory](../concepts/incident-memory.md#recurrence-collapse). |
 | `lookback_days` | int | `90` | How long occurrence rows are retained and how far back recurrence counts and cadence are computed. Older occurrences are pruned on the correlator's normal flush cycle. |
 | `classifier.mode` | string | `off` | Shadow classifier (see below). `off` makes no extra LLM call; `shadow` runs a small fuzzy-match call and records every verdict in the audit log while the recall render stays unchanged; `on` lets a graduated match tag the recall. **Quote the value** — bare `off`/`on` are YAML booleans. |
 | `classifier.timeout_seconds` | int | `10` | Seconds-scale timeout for the classifier's own Haiku call. Only used when `mode` is `shadow` or `on`. |
