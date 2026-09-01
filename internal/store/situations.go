@@ -98,12 +98,13 @@ func dueReasonForInputKind(kind string) (situationmodel.DueReason, error) {
 // deterministic (occurred_at, id) order. Claiming never applies anything;
 // callers apply claimed work only after this transaction commits.
 //
-// table over (situation_input_outbox vs. alert_delivery_dispatches); this
-// plan's own pre-flight conflict scan already ruled the analogous
-// per-package WorkerConfig duplication intentional rather than something to
-// unify across the two claim mechanisms.
+// This deliberately mirrors ClaimAlertDispatches' claim shape one table over
+// (situation_input_outbox vs. alert_delivery_dispatches); this plan's own
+// pre-flight conflict scan already ruled the analogous per-package
+// WorkerConfig duplication intentional rather than something to unify across
+// the two claim mechanisms.
 //
-//nolint:dupl // deliberately mirrors ClaimAlertDispatches' claim shape one
+//nolint:dupl // mirrors ClaimAlertDispatches deliberately; see doc comment above
 func (s *Store) ClaimSituationInputs(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]SituationClaim, error) {
 	if strings.TrimSpace(owner) == "" || lease <= 0 || limit <= 0 {
 		return nil, errors.New("store: situation input claim requires owner, positive lease, and positive limit")

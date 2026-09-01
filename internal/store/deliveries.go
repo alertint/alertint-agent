@@ -907,12 +907,13 @@ func insertDeliveryTx(ctx context.Context, tx *sql.Tx, p preparedDelivery, a Ale
 // delivery receipt time, then delivery ID. Claiming never calls outbound
 // code; callers apply the claimed work only after this transaction commits.
 //
-// table over (alert_delivery_dispatches vs. situation_input_outbox); this
-// plan's own pre-flight conflict scan already ruled the analogous
-// per-package WorkerConfig duplication intentional rather than something to
-// unify across the two claim mechanisms.
+// This deliberately mirrors ClaimSituationInputs' claim shape one table over
+// (alert_delivery_dispatches vs. situation_input_outbox); this plan's own
+// pre-flight conflict scan already ruled the analogous per-package
+// WorkerConfig duplication intentional rather than something to unify across
+// the two claim mechanisms.
 //
-//nolint:dupl // deliberately mirrors ClaimSituationInputs' claim shape one
+//nolint:dupl // mirrors ClaimSituationInputs deliberately; see doc comment above
 func (s *Store) ClaimAlertDispatches(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]AlertDispatch, error) {
 	if strings.TrimSpace(owner) == "" || lease <= 0 || limit <= 0 {
 		return nil, errors.New("store: dispatch claim requires owner, positive lease, and positive limit")

@@ -587,3 +587,46 @@ func TestSituationClaimTokenFencesStaleController(t *testing.T) {
 	}
 	assertSituationLeaseOwner(t, st, situationID, "controller-b")
 }
+
+// TestApplySituationInputClearsControllerLeaseFencingStaleRelease is the
+// direct, end-to-end proof of the property this plan calls out by name: a
+// controller that claimed a due Situation (a live ClaimDueSituations lease)
+// cannot commit against it once ApplySituationInput has advanced that
+// Situation's input_version — because joinSituationTx unconditionally clears
+// lease_owner/lease_expires_at on every join, fencing the controller's now-
+// stale claim out via ReleaseSituationClaim's own (lease_owner, claim_token)
+// check, without needing any direct knowledge of input_version itself.
+func TestApplySituationInputClearsControllerLeaseFencingStaleRelease(t *testing.T) {
+	st, situationID, now := dueSituationFixture(t)
+
+	controllerClaims, err := st.ClaimDueSituations(context.Background(), "controller-a", now, time.Minute, 1)
+	if err != nil || len(controllerClaims) != 1 {
+		t.Fatalf("claim due situation: %v, %v", controllerClaims, err)
+	}
+	staleClaim := controllerClaims[0]
+	if staleClaim.ID != situationID {
+		t.Fatalf("claimed situation id = %s, want %s", staleClaim.ID, situationID)
+	}
+	assertSituationLeaseOwner(t, st, situationID, "controller-a")
+
+	// A same-group input arrives and joins the Situation the controller just
+	// claimed. joinSituationTx must clear that lease so the controller's
+	// now-stale claim can no longer commit against the advanced input_version.
+	insertIncidentAndInput(t, st, "inc-second", "input-second", "service=due", now.Add(time.Minute))
+	inputClaim := claimOneInput(t, st, "worker-a", now.Add(time.Minute))
+	if err := st.ApplySituationInput(context.Background(), inputClaim); err != nil {
+		t.Fatal(err)
+	}
+
+	got := getSituationByID(t, st, situationID)
+	if got.InputVersion != 2 {
+		t.Fatalf("input_version = %d, want 2 (same-group input applied)", got.InputVersion)
+	}
+	if got.LeaseOwner != nil {
+		t.Fatalf("lease_owner = %q, want nil (cleared by joinSituationTx)", *got.LeaseOwner)
+	}
+
+	if err := st.ReleaseSituationClaim(context.Background(), staleClaim, now.Add(2*time.Minute)); !errors.Is(err, ErrSituationLeaseLost) {
+		t.Fatalf("stale release after input-triggered lease clear = %v, want ErrSituationLeaseLost", err)
+	}
+}
