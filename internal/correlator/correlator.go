@@ -29,6 +29,7 @@ package correlator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -36,6 +37,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/grouping"
 	"github.com/alertint/alertint-agent/internal/notify"
+	"github.com/alertint/alertint-agent/internal/severity"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/google/uuid"
 )
@@ -465,7 +467,11 @@ func (c *Correlator) flushExpired(ctx context.Context) error {
 		if now.Before(inc.ReadyAt) {
 			continue
 		}
-		if err := c.st.MarkIncidentReady(ctx, inc.ID); err != nil {
+		// The ready transition and its incident_ready Situation input commit
+		// together (Task 5), so this is durably visible to the Situation even
+		// if the process crashes before SeedIncidentTriage below ever runs —
+		// Plan 2 replaces that immediate seed with "awaiting_decision".
+		if err := c.st.MarkIncidentReadyWithSituationInput(ctx, inc.ID, now); err != nil {
 			c.logger.Error("correlator: mark ready", "incident_id", inc.ID, "err", err)
 			continue
 		}
@@ -512,4 +518,400 @@ func (c *Correlator) groupKeySelection(a store.Alert) (key string, overrideMiss 
 // "collecting" by scanning the store.
 func listCollectingIncidents(ctx context.Context, st *store.Store) ([]store.Incident, error) {
 	return st.ListCollectingIncidents(ctx)
+}
+
+// ----------------------------------------------------------------------
+// Durable delivery correlation (Task 5)
+//
+// ApplyDelivery is the delivery-ledger-backed replacement for handleAlert: it
+// plans the same grouping/attachment decisions handleAlert makes, then
+// converts the plan into one store.CorrelatedDeliveryMutation and commits it
+// through a single call to the store, which performs the Incident/Occurrence
+// mutation, the current incident_alerts compatibility attachment, the
+// immutable incident_alert_deliveries ownership link, and the Situation
+// input insertion atomically. No production Receiver calls handleAlert
+// anymore (Task 4); a later durable dispatch worker calls ApplyDelivery for
+// every claimed store.AlertDispatch. handleAlert stays untouched for the
+// legacy in-memory fixtures that still exercise it directly.
+// ----------------------------------------------------------------------
+
+// ErrInvalidDelivery classifies a durably claimed delivery that cannot
+// satisfy the correlation contract (missing identity or receipt time). It is
+// a permanent local dead letter, not a retryable dependency failure.
+var ErrInvalidDelivery = errors.New("correlator: invalid delivery")
+
+// ApplyDelivery correlates one immutable, durably claimed delivery. The
+// Incident/Occurrence mutation, immutable ownership link, compatibility
+// membership, and Situation-input production commit atomically in the
+// store — see store.ApplyCorrelatedDelivery.
+func (c *Correlator) ApplyDelivery(ctx context.Context, claim store.AlertDispatch) error {
+	d := claim.Delivery
+	if d.ID == "" || d.Alert.ID == "" || d.Alert.Fingerprint == "" || d.ReceivedAt.IsZero() {
+		return fmt.Errorf("%w: delivery identity and receipt time are required", ErrInvalidDelivery)
+	}
+	a := d.Alert
+	a.ReceivedAt = d.ReceivedAt.UTC()
+	a.ReceiverGroupingIdentity = d.ReceiverGroupingIdentity
+	gk, overrideMiss := c.groupKeySelection(a)
+	// Select collecting, unjudged retry attachment, resolved owner, recurrence,
+	// or a fresh fixed-window Incident using current-main order and Drill guards.
+	return c.applyDeliveryPlan(ctx, claim, a, gk, overrideMiss)
+}
+
+// applyDeliveryPlan mirrors handleAlert's decision order exactly — a
+// collecting window first, then (for a delivery with no open window) the
+// resolved-association, retry-backoff-attachment, and judged-Incident
+// recurrence-collapse branches in that order, falling back to a fresh
+// Incident only when none of them claims the delivery.
+func (c *Correlator) applyDeliveryPlan(ctx context.Context, claim store.AlertDispatch, a store.Alert, gk string, overrideMiss bool) error {
+	inc, err := c.st.GetCollectingIncident(ctx, gk)
+	if err != nil && err != store.ErrNotFound {
+		return fmt.Errorf("correlator: get collecting incident for delivery: %w", err)
+	}
+
+	if err == store.ErrNotFound && a.Status == "resolved" {
+		return c.applyResolvedDeliveryPlan(ctx, claim, a, gk)
+	}
+
+	// Retry-aware attachment (issue 60): a firing re-fire with no open window
+	// joins a same-group Incident that is still unjudged and durably retrying
+	// (ready + backoff) before recurrence collapse or a new Incident is ever
+	// considered.
+	if err == store.ErrNotFound && a.Status == "firing" {
+		handled, attachErr := c.applyRetryAttachDeliveryPlan(ctx, claim, a, gk)
+		if attachErr != nil {
+			return attachErr
+		}
+		if handled {
+			return nil
+		}
+	}
+
+	// Recurrence collapse (M1): a firing re-fire with no open window may
+	// attach to an already-judged incident as an occurrence instead of
+	// minting a new incident.
+	if err == store.ErrNotFound && a.Status == "firing" {
+		handled, attachErr := c.applyRecurrenceDeliveryPlan(ctx, claim, a, gk)
+		if attachErr != nil {
+			return attachErr
+		}
+		if handled {
+			return nil
+		}
+	}
+
+	if err == store.ErrNotFound {
+		return c.applyFreshIncidentDeliveryPlan(ctx, claim, a, gk, overrideMiss)
+	}
+
+	if _, err := c.applyExistingIncidentDeliveryPlan(ctx, claim, *inc, "membership_changed", false); err != nil {
+		return fmt.Errorf("correlator: apply delivery to incident: %w", err)
+	}
+	return nil
+}
+
+// applyExistingIncidentDeliveryPlan attaches a delivery to an Incident the
+// caller already resolved to a concrete row (a still-open collecting window,
+// a resolved-delivery association, or a retry-backoff/recurrence candidate).
+func (c *Correlator) applyExistingIncidentDeliveryPlan(ctx context.Context, claim store.AlertDispatch, inc store.Incident, kind string, requireNonterminalOwner bool) (store.CorrelatedDeliveryResult, error) {
+	m, err := c.correlatedDeliveryMutation(claim, inc, nil, kind, requireNonterminalOwner)
+	if err != nil {
+		return store.CorrelatedDeliveryResult{}, err
+	}
+	return c.st.ApplyCorrelatedDelivery(ctx, m)
+}
+
+// applyResolvedDeliveryPlan mirrors handleResolvedAlert: a resolved delivery
+// with no open collecting window links to the most recent Incident for its
+// group key regardless of status, opening a fresh Incident only when no
+// prior Incident exists for the group at all. When the commit itself flips
+// the Incident to "resolved" the legacy resolution notifier fires — after
+// the transaction, never inside it.
+func (c *Correlator) applyResolvedDeliveryPlan(ctx context.Context, claim store.AlertDispatch, a store.Alert, gk string) error {
+	recentInc, err := c.st.GetRecentIncidentByGroupKey(ctx, gk)
+	if err == store.ErrNotFound {
+		return c.applyFreshIncidentDeliveryPlan(ctx, claim, a, gk, false)
+	}
+	if err != nil {
+		return fmt.Errorf("correlator: get recent incident for resolved delivery: %w", err)
+	}
+	result, err := c.applyExistingIncidentDeliveryPlan(ctx, claim, *recentInc, "membership_changed", false)
+	if err != nil {
+		return fmt.Errorf("correlator: apply resolved delivery: %w", err)
+	}
+	c.logger.Info("correlator: resolved delivery linked to incident", "incident_id", result.Incident.ID, "delivery_id", claim.Delivery.ID, "group_key", gk, "status", result.Incident.Status)
+	if result.Resolved && c.resolutionNotifier != nil {
+		if notifyErr := c.resolutionNotifier.OnIncidentResolved(ctx, result.Incident); notifyErr != nil {
+			c.logger.Warn("correlator: resolution notify failed", "incident_id", result.Incident.ID, "err", notifyErr)
+		}
+	}
+	return nil
+}
+
+// applyFreshIncidentDeliveryPlan opens a new fixed-window Incident for a
+// delivery that matched none of the attachment paths above.
+func (c *Correlator) applyFreshIncidentDeliveryPlan(ctx context.Context, claim store.AlertDispatch, a store.Alert, gk string, overrideMiss bool) error {
+	if overrideMiss {
+		c.logger.Warn("correlator: configured group_labels matched no delivery labels; using safety fallback",
+			"fingerprint", a.Fingerprint, "group_key", gk)
+	}
+	window := time.Duration(c.cfg.WindowSeconds) * time.Second
+	fresh := store.Incident{
+		ID:           uuid.NewString(),
+		GroupKey:     gk,
+		FirstAlertAt: a.ReceivedAt,
+		LastAlertAt:  a.ReceivedAt,
+		ReadyAt:      a.ReceivedAt.Add(window),
+	}
+	result, err := c.applyExistingIncidentDeliveryPlan(ctx, claim, fresh, "incident_created", false)
+	if err != nil {
+		return fmt.Errorf("correlator: apply delivery to new incident: %w", err)
+	}
+	c.logger.Info("correlator: delivery opened incident", "delivery_id", claim.Delivery.ID, "incident_id", result.Incident.ID, "group_key", gk)
+	return nil
+}
+
+// applyRetryAttachDeliveryPlan implements R4 for durable deliveries: a
+// firing delivery with no collecting window may join the newest same-group
+// Incident that is durably retrying (ready + backoff, non-exhausted)
+// instead of collapsing into a recurrence or minting a new Incident. Store
+// lookup errors and a Drill-parity mismatch fail safe to the caller trying
+// the next attachment path. RequireNonterminalOwner closes the race between
+// this read and the commit: if the candidate stopped being a valid retry
+// target in between (e.g. it was judged or exhausted), the store rejects the
+// attach and this falls through to the next plan rather than misattaching a
+// delivery to an Incident it no longer belongs to.
+func (c *Correlator) applyRetryAttachDeliveryPlan(ctx context.Context, claim store.AlertDispatch, a store.Alert, gk string) (bool, error) {
+	candidate, _, err := c.st.GetBackoffIncidentByGroupKey(ctx, gk)
+	if err == store.ErrNotFound {
+		return false, nil
+	}
+	if err != nil {
+		c.logger.Warn("correlator: backoff-incident lookup failed; treating as new incident", "err", err, "group_key", gk)
+		return false, nil
+	}
+
+	members, err := c.st.GetIncidentAlerts(ctx, candidate.ID)
+	if err != nil {
+		c.logger.Warn("correlator: member lookup failed; treating as new incident", "err", err, "incident_id", candidate.ID)
+		return false, nil
+	}
+	candidateDrill := false
+	for _, mem := range members {
+		if store.IsDrillAlert(mem) {
+			candidateDrill = true
+			break
+		}
+	}
+	if store.IsDrillAlert(a) != candidateDrill {
+		return false, nil
+	}
+
+	result, err := c.applyExistingIncidentDeliveryPlan(ctx, claim, *candidate, "membership_changed", true)
+	if err != nil {
+		if errors.Is(err, store.ErrIncidentOwnerNotCollapsible) {
+			return false, nil
+		}
+		return false, fmt.Errorf("correlator: attach retrying incident: %w", err)
+	}
+	c.logger.Info("correlator: delivery attached during triage backoff", "incident_id", result.Incident.ID, "group_key", gk, "delivery_id", claim.Delivery.ID)
+	return true, nil
+}
+
+// deliveryRecurrencePlan is the read-only outcome of planDeliveryRecurrence:
+// the candidate Incident to attach to, and — only for a genuine new episode
+// — the Occurrence to insert or touch plus the display-only "why" facts for
+// the (post-commit) recurrence notifier.
+type deliveryRecurrencePlan struct {
+	incident        store.Incident
+	occurrence      *store.Occurrence
+	trigger         string
+	isNewOccurrence bool
+	delta           recurrenceDelta
+}
+
+// planDeliveryRecurrence gathers the durable facts for a recurrence
+// decision and runs decideAttach — the same pure trigger matrix attach.go's
+// maybeAttachOccurrence uses for handleAlert — without writing anything. It
+// is the pure planning half of F1 for the delivery-ledger path: missing
+// ownership, a Drill mismatch, or any lookup failure takes the safe
+// new-Incident path (ok=false). ApplyCorrelatedDelivery repeats the owner
+// check inside its transaction (RequireNonterminalOwner) to close the
+// decision/commit race.
+func (c *Correlator) planDeliveryRecurrence(ctx context.Context, a store.Alert, gk string) (deliveryRecurrencePlan, bool) {
+	now := a.ReceivedAt
+
+	candidate, err := c.st.GetRecentJudgedIncidentByGroupKey(ctx, gk)
+	if err == store.ErrNotFound {
+		return deliveryRecurrencePlan{}, false
+	}
+	if err != nil {
+		c.logger.Warn("correlator: judged-incident lookup failed; treating as new incident", "err", err, "group_key", gk)
+		return deliveryRecurrencePlan{}, false
+	}
+
+	members, err := c.st.GetIncidentAlerts(ctx, candidate.ID)
+	if err != nil {
+		c.logger.Warn("correlator: member lookup failed; treating as new incident", "err", err)
+		return deliveryRecurrencePlan{}, false
+	}
+	baselineSev, baselineSevLabel, known, isMember, candidateDrill := memberBaselines(members, a.Fingerprint)
+
+	if store.IsDrillAlert(a) != candidateDrill {
+		return deliveryRecurrencePlan{}, false
+	}
+
+	latestOcc, err := c.st.LatestOccurrence(ctx, candidate.ID)
+	if err != nil && err != store.ErrNotFound {
+		c.logger.Warn("correlator: latest-occurrence lookup failed; treating as new incident", "err", err)
+		return deliveryRecurrencePlan{}, false
+	}
+
+	isNewEpisode := candidate.Status == "resolved" || !isMember
+
+	if !isNewEpisode {
+		if latestOcc != nil {
+			touch := *latestOcc
+			touch.LastSeen = now
+			return deliveryRecurrencePlan{incident: *candidate, occurrence: &touch}, true
+		}
+		return deliveryRecurrencePlan{incident: *candidate}, true
+	}
+
+	lastActivity := candidate.LastAlertAt
+	if latestOcc != nil {
+		lastActivity = latestOcc.LastSeen
+	}
+	lastJudged := candidate.FirstAlertAt
+	if candidate.LastJudgedAt != nil {
+		lastJudged = *candidate.LastJudgedAt
+	}
+
+	occSince, err := c.st.CountOccurrencesSince(ctx, candidate.ID, lastJudged)
+	if err != nil {
+		c.logger.Warn("correlator: occurrence-count lookup failed; treating as new incident", "err", err)
+		return deliveryRecurrencePlan{}, false
+	}
+	episodeTimes, err := c.st.KeyEpisodeTimes(ctx, gk, now.Add(-c.cfg.Lookback))
+	if err != nil {
+		c.logger.Warn("correlator: episode-times lookup failed; treating as new incident", "err", err)
+		return deliveryRecurrencePlan{}, false
+	}
+
+	decision := decideAttach(attachInputs{
+		now:                    now,
+		lastJudgedAt:           lastJudged,
+		lastActivity:           lastActivity,
+		occurrencesSinceJudged: occSince,
+		isNewEpisode:           true,
+		incomingSeverityRank:   severity.Rank(a.Labels["severity"]),
+		incomingAlertname:      a.Labels["alertname"],
+		baselineSeverityRank:   baselineSev,
+		knownAlertnames:        known,
+		episodeTimes:           episodeTimes,
+		attachWindow:           c.cfg.AttachWindow,
+		judgmentCeiling:        c.cfg.JudgmentCeiling,
+		occurrenceCap:          c.cfg.OccurrenceCap,
+	})
+
+	if decision.action == actionNewIncident || decision.action == actionRepeatTouch {
+		return deliveryRecurrencePlan{}, false
+	}
+
+	var delta recurrenceDelta
+	switch decision.trigger {
+	case "severity":
+		delta.priorSeverity, delta.newSeverity = baselineSevLabel, a.Labels["severity"]
+	case "new_alertname":
+		delta.newAlertname = a.Labels["alertname"]
+	case "cadence":
+		delta.newInterval, delta.priorMedian = decision.cadenceInterval, decision.cadenceMedian
+	}
+
+	occ := store.Occurrence{
+		IncidentID:   candidate.ID,
+		OccurredAt:   a.ReceivedAt,
+		LastSeen:     a.ReceivedAt,
+		Fingerprints: []string{a.Fingerprint},
+		Payload:      []store.OccurrenceMember{{Fingerprint: a.Fingerprint, Labels: a.Labels, Annotations: a.Annotations}},
+		TriggerKind:  decision.trigger,
+	}
+	return deliveryRecurrencePlan{incident: *candidate, occurrence: &occ, trigger: decision.trigger, isNewOccurrence: true, delta: delta}, true
+}
+
+// applyRecurrenceDeliveryPlan converts planDeliveryRecurrence's verdict into
+// one durable commit. A newly inserted occurrence fires the (post-commit)
+// occurrence notifier; re-judgment is deliberately not invoked here — an LLM
+// call has no place inside (or synchronously after) a durable dispatch
+// commit, and the Situation controller (a later task) is what acts on a
+// "membership_changed" input's trigger going forward.
+func (c *Correlator) applyRecurrenceDeliveryPlan(ctx context.Context, claim store.AlertDispatch, a store.Alert, gk string) (bool, error) {
+	plan, ok := c.planDeliveryRecurrence(ctx, a, gk)
+	if !ok {
+		return false, nil
+	}
+	m, err := c.correlatedDeliveryMutation(claim, plan.incident, plan.occurrence, "membership_changed", true)
+	if err != nil {
+		return false, err
+	}
+	result, err := c.st.ApplyCorrelatedDelivery(ctx, m)
+	if err != nil {
+		if errors.Is(err, store.ErrIncidentOwnerNotCollapsible) {
+			return false, nil
+		}
+		return false, fmt.Errorf("correlator: apply recurring delivery: %w", err)
+	}
+	c.logger.Info("correlator: delivery collapsed into incident", "delivery_id", claim.Delivery.ID, "incident_id", result.Incident.ID, "group_key", gk, "trigger", plan.trigger)
+
+	if plan.isNewOccurrence && c.occNotifier != nil && result.Occurrence != nil {
+		stats := c.occurrenceStats(ctx, result.Incident.ID)
+		ev := notify.RecurrenceEvent{
+			Incident:      result.Incident,
+			Stats:         stats,
+			Trigger:       plan.trigger,
+			Drill:         store.IsDrillAlert(a),
+			PriorSeverity: plan.delta.priorSeverity,
+			NewSeverity:   plan.delta.newSeverity,
+			NewAlertname:  plan.delta.newAlertname,
+			NewInterval:   plan.delta.newInterval,
+			PriorMedian:   plan.delta.priorMedian,
+		}
+		if notifyErr := c.occNotifier.OnOccurrenceAttached(ctx, ev); notifyErr != nil {
+			c.logger.Warn("correlator: occurrence notify failed", "err", notifyErr, "incident_id", result.Incident.ID)
+		}
+	}
+	return true, nil
+}
+
+// correlatedDeliveryMutation builds the store mutation for one claimed
+// delivery attaching to inc (a fresh, proposed Incident or an already-real
+// one — the store's ensureCorrelatedIncidentTx tells the difference), with
+// occ non-nil only for a recurrence-collapse plan. kind is the caller's
+// best guess at the Situation input's Kind ("incident_created" or
+// "membership_changed"); the store derives the authoritative Kind from
+// committed state (including "incident_resolved") and never trusts this
+// guess blindly.
+func (c *Correlator) correlatedDeliveryMutation(claim store.AlertDispatch, inc store.Incident, occ *store.Occurrence, kind string, requireNonterminalOwner bool) (store.CorrelatedDeliveryMutation, error) {
+	if claim.LeaseOwner == nil || *claim.LeaseOwner == "" {
+		return store.CorrelatedDeliveryMutation{}, fmt.Errorf("%w: claimed delivery is missing its lease owner", ErrInvalidDelivery)
+	}
+	d := claim.Delivery
+	deliveryID := d.ID
+	return store.CorrelatedDeliveryMutation{
+		DeliveryID:         d.ID,
+		DispatchOwner:      *claim.LeaseOwner,
+		DispatchClaimToken: claim.ClaimToken,
+		Incident:           inc,
+		Occurrence:         occ,
+		Input: store.SituationInput{
+			ID:             uuid.NewString(),
+			IdempotencyKey: "delivery:" + d.ID,
+			IncidentID:     inc.ID,
+			Kind:           kind,
+			GroupKey:       inc.GroupKey,
+			DeliveryID:     &deliveryID,
+			OccurredAt:     d.ReceivedAt.UTC(),
+		},
+		RequireNonterminalOwner: requireNonterminalOwner,
+	}, nil
 }

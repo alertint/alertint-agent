@@ -432,3 +432,354 @@ func TestValidateDeliveryInputRequiresPollIntervalMatchingAcquisitionMode(t *tes
 		t.Fatal("accepted poll delivery with zero poll interval")
 	}
 }
+
+// ---------------------------------------------------------------------
+// ApplyCorrelatedDelivery / MarkIncidentReadyWithSituationInput (Task 5)
+// ---------------------------------------------------------------------
+
+func insertCollectingIncident(t *testing.T, st *Store, id, groupKey string, readyAt time.Time) {
+	t.Helper()
+	if err := st.InsertIncident(context.Background(), Incident{
+		ID: id, GroupKey: groupKey, FirstAlertAt: readyAt, LastAlertAt: readyAt, ReadyAt: readyAt,
+	}); err != nil {
+		t.Fatalf("insert collecting incident: %v", err)
+	}
+}
+
+func assertIncidentStatus(t *testing.T, st *Store, incidentID, want string) {
+	t.Helper()
+	var got string
+	if err := st.DB().QueryRowContext(context.Background(), `SELECT status FROM incidents WHERE id = ?`, incidentID).Scan(&got); err != nil {
+		t.Fatalf("read incident status: %v", err)
+	}
+	if got != want {
+		t.Fatalf("incident %s status = %q, want %q", incidentID, got, want)
+	}
+}
+
+func assertQueryCount(t *testing.T, db *sql.DB, query string, want int, args ...any) {
+	t.Helper()
+	var got int
+	if err := db.QueryRowContext(context.Background(), query, args...).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("count = %d, want %d (query: %s)", got, want, query)
+	}
+}
+
+// assertCorrelatedDeliveryRows checks all five durable effects one commit of
+// ApplyCorrelatedDelivery must have produced: the Incident row, the current
+// incident_alerts compatibility membership, the immutable
+// incident_alert_deliveries ownership link, the Situation input, and the
+// dispatch's terminal status.
+func assertCorrelatedDeliveryRows(t *testing.T, db *sql.DB, deliveryID, incidentID, inputID, dispatchStatus string) {
+	t.Helper()
+	ctx := context.Background()
+
+	assertQueryCount(t, db, `SELECT COUNT(*) FROM incidents WHERE id = ?`, 1, incidentID)
+
+	var alertID string
+	if err := db.QueryRowContext(ctx, `SELECT alert_id FROM alert_deliveries WHERE id = ?`, deliveryID).Scan(&alertID); err != nil {
+		t.Fatalf("read delivery alert id: %v", err)
+	}
+	assertQueryCount(t, db, `SELECT COUNT(*) FROM incident_alerts WHERE incident_id = ? AND alert_id = ?`, 1, incidentID, alertID)
+
+	var linkIncidentID string
+	if err := db.QueryRowContext(ctx, `SELECT incident_id FROM incident_alert_deliveries WHERE delivery_id = ?`, deliveryID).Scan(&linkIncidentID); err != nil {
+		t.Fatalf("read immutable delivery ownership: %v", err)
+	}
+	if linkIncidentID != incidentID {
+		t.Fatalf("immutable delivery ownership incident = %q, want %q", linkIncidentID, incidentID)
+	}
+
+	assertQueryCount(t, db, `SELECT COUNT(*) FROM situation_input_outbox WHERE id = ? AND incident_id = ?`, 1, inputID, incidentID)
+
+	var status string
+	if err := db.QueryRowContext(ctx, `SELECT status FROM alert_delivery_dispatches WHERE delivery_id = ?`, deliveryID).Scan(&status); err != nil {
+		t.Fatalf("read dispatch status: %v", err)
+	}
+	if status != dispatchStatus {
+		t.Fatalf("dispatch status = %q, want %q", status, dispatchStatus)
+	}
+}
+
+func TestApplyCorrelatedDeliveryCommitsIncidentInputAndDispatch(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 2, 0, 0, 0, time.UTC)
+	_, _ = st.AcceptDeliveries(ctx, []DeliveryInput{deliveryFixture("d1", "fp1", now)})
+	claims, _ := st.ClaimAlertDispatches(ctx, "dispatch-a", now, time.Minute, 1)
+	deliveryID := claims[0].Delivery.ID
+
+	result, err := st.ApplyCorrelatedDelivery(ctx, CorrelatedDeliveryMutation{
+		DeliveryID:         deliveryID,
+		DispatchOwner:      "dispatch-a",
+		DispatchClaimToken: claims[0].ClaimToken,
+		Incident:           Incident{ID: "inc-1", GroupKey: "service=api", FirstAlertAt: now, LastAlertAt: now, ReadyAt: now.Add(time.Minute)},
+		Input:              SituationInput{ID: "input-d1", IdempotencyKey: "delivery:d1", IncidentID: "inc-1", DeliveryID: &deliveryID, Kind: "incident_created", GroupKey: "service=api", OccurredAt: now},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Created || result.Incident.ID != "inc-1" {
+		t.Fatalf("result = %+v", result)
+	}
+	assertCorrelatedDeliveryRows(t, st.DB(), "d1", "inc-1", "input-d1", "applied")
+}
+
+func TestApplyCorrelatedDeliveryRollsBackOnSituationInputFailure(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 2, 0, 0, 0, time.UTC)
+
+	// A test-only trigger simulates a mid-transaction failure at the
+	// Situation-input insertion step (step 9), so this test can assert the
+	// whole transaction — Incident, membership, immutable ownership, and the
+	// dispatch transition — rolls back together, not just the input row.
+	if _, err := st.DB().ExecContext(ctx, `
+		CREATE TRIGGER test_force_situation_input_failure
+		BEFORE INSERT ON situation_input_outbox
+		WHEN NEW.incident_id = 'inc-force-fail'
+		BEGIN SELECT RAISE(ABORT, 'forced situation input failure'); END;
+	`); err != nil {
+		t.Fatalf("create test trigger: %v", err)
+	}
+
+	_, _ = st.AcceptDeliveries(ctx, []DeliveryInput{deliveryFixture("d-fail", "fp-fail", now)})
+	claims, err := st.ClaimAlertDispatches(ctx, "dispatch-a", now, time.Minute, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryID := claims[0].Delivery.ID
+
+	_, err = st.ApplyCorrelatedDelivery(ctx, CorrelatedDeliveryMutation{
+		DeliveryID:         deliveryID,
+		DispatchOwner:      "dispatch-a",
+		DispatchClaimToken: claims[0].ClaimToken,
+		Incident:           Incident{ID: "inc-force-fail", GroupKey: "service=fail", FirstAlertAt: now, LastAlertAt: now, ReadyAt: now.Add(time.Minute)},
+		Input:              SituationInput{ID: "input-fail", IdempotencyKey: "delivery:" + deliveryID, IncidentID: "inc-force-fail", DeliveryID: &deliveryID, Kind: "incident_created", GroupKey: "service=fail", OccurredAt: now},
+	})
+	if err == nil {
+		t.Fatal("expected forced situation input failure")
+	}
+
+	assertTableCount(t, st.DB(), "incidents", 0)
+	assertTableCount(t, st.DB(), "incident_alerts", 0)
+	assertTableCount(t, st.DB(), "incident_alert_deliveries", 0)
+	assertTableCount(t, st.DB(), "situation_input_outbox", 0)
+
+	var status string
+	if err := st.DB().QueryRowContext(ctx, `SELECT status FROM alert_delivery_dispatches WHERE delivery_id = ?`, deliveryID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "claimed" {
+		t.Fatalf("dispatch status = %q, want claimed (unchanged by the rolled-back transaction)", status)
+	}
+}
+
+func TestApplyCorrelatedDeliveryStaleClaimTokenChangesNothing(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 2, 0, 0, 0, time.UTC)
+	_, _ = st.AcceptDeliveries(ctx, []DeliveryInput{deliveryFixture("d-stale", "fp-stale", now)})
+	claims, err := st.ClaimAlertDispatches(ctx, "dispatch-a", now, time.Minute, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryID := claims[0].Delivery.ID
+
+	_, err = st.ApplyCorrelatedDelivery(ctx, CorrelatedDeliveryMutation{
+		DeliveryID:         deliveryID,
+		DispatchOwner:      "dispatch-a",
+		DispatchClaimToken: claims[0].ClaimToken + 1, // stale/wrong token
+		Incident:           Incident{ID: "inc-stale", GroupKey: "service=stale", FirstAlertAt: now, LastAlertAt: now, ReadyAt: now.Add(time.Minute)},
+		Input:              SituationInput{ID: "input-stale", IdempotencyKey: "delivery:" + deliveryID, IncidentID: "inc-stale", DeliveryID: &deliveryID, Kind: "incident_created", GroupKey: "service=stale", OccurredAt: now},
+	})
+	if !errors.Is(err, ErrAlertDispatchLeaseLost) {
+		t.Fatalf("err = %v, want ErrAlertDispatchLeaseLost", err)
+	}
+	assertTableCount(t, st.DB(), "incidents", 0)
+	assertTableCount(t, st.DB(), "situation_input_outbox", 0)
+
+	var status string
+	if err := st.DB().QueryRowContext(ctx, `SELECT status FROM alert_delivery_dispatches WHERE delivery_id = ?`, deliveryID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "claimed" {
+		t.Fatalf("dispatch status = %q, want claimed (unchanged)", status)
+	}
+}
+
+func TestApplyCorrelatedDeliveryDuplicateRepairsAppliedProjection(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 2, 0, 0, 0, time.UTC)
+	_, _ = st.AcceptDeliveries(ctx, []DeliveryInput{deliveryFixture("d-dup", "fp-dup", now)})
+	claims, err := st.ClaimAlertDispatches(ctx, "dispatch-a", now, time.Minute, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryID := claims[0].Delivery.ID
+	mutation := CorrelatedDeliveryMutation{
+		DeliveryID:         deliveryID,
+		DispatchOwner:      "dispatch-a",
+		DispatchClaimToken: claims[0].ClaimToken,
+		Incident:           Incident{ID: "inc-dup", GroupKey: "service=dup", FirstAlertAt: now, LastAlertAt: now, ReadyAt: now.Add(time.Minute)},
+		Input:              SituationInput{ID: "input-dup", IdempotencyKey: "delivery:" + deliveryID, IncidentID: "inc-dup", DeliveryID: &deliveryID, Kind: "incident_created", GroupKey: "service=dup", OccurredAt: now},
+	}
+	first, err := st.ApplyCorrelatedDelivery(ctx, mutation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Duplicate {
+		t.Fatal("first application marked duplicate")
+	}
+
+	// Manually reset only the dispatch row to a fresh claim, simulating
+	// recovery code that reads stale claim state and replays the same
+	// mutation. The store must repair the applied projection and report
+	// Duplicate=true without creating a second Incident link or input.
+	if _, err := st.DB().ExecContext(ctx, `
+		UPDATE alert_delivery_dispatches
+		SET status='claimed', lease_owner='dispatch-b', lease_expires_at=?, claim_token=claim_token+1, applied_at=NULL, retry_at=NULL
+		WHERE delivery_id=?`, now.Add(time.Minute).UTC().Format(time.RFC3339Nano), deliveryID); err != nil {
+		t.Fatal(err)
+	}
+	var token int64
+	if err := st.DB().QueryRowContext(ctx, `SELECT claim_token FROM alert_delivery_dispatches WHERE delivery_id=?`, deliveryID).Scan(&token); err != nil {
+		t.Fatal(err)
+	}
+
+	replay := mutation
+	replay.DispatchOwner = "dispatch-b"
+	replay.DispatchClaimToken = token
+	second, err := st.ApplyCorrelatedDelivery(ctx, replay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Duplicate {
+		t.Fatal("replay not marked duplicate")
+	}
+	if second.Incident.ID != "inc-dup" {
+		t.Fatalf("replay incident = %+v", second.Incident)
+	}
+
+	assertCorrelatedDeliveryRows(t, st.DB(), deliveryID, "inc-dup", "input-dup", "applied")
+	assertTableCount(t, st.DB(), "incident_alert_deliveries", 1)
+	assertTableCount(t, st.DB(), "situation_input_outbox", 1)
+}
+
+func TestMarkIncidentReadyWithSituationInputIsAtomicAndIdempotent(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 2, 5, 0, 0, time.UTC)
+	insertCollectingIncident(t, st, "inc-ready", "service=api", now.Add(-time.Minute))
+	if err := st.MarkIncidentReadyWithSituationInput(ctx, "inc-ready", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkIncidentReadyWithSituationInput(ctx, "inc-ready", now); err != nil {
+		t.Fatal(err)
+	}
+	assertIncidentStatus(t, st, "inc-ready", "ready")
+	assertQueryCount(t, st.DB(), `SELECT COUNT(*) FROM situation_input_outbox WHERE idempotency_key=? AND kind='incident_ready'`, 1, "incident-ready:inc-ready")
+}
+
+func TestMarkIncidentReadyWithSituationInputRejectsUnknownIncident(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 2, 5, 0, 0, time.UTC)
+	if err := st.MarkIncidentReadyWithSituationInput(ctx, "does-not-exist", now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestMarkIncidentReadyWithSituationInputRejectsTerminalIncident(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 2, 5, 0, 0, time.UTC)
+	insertCollectingIncident(t, st, "inc-done", "service=done", now)
+	if _, err := st.DB().ExecContext(ctx, `UPDATE incidents SET status='failed' WHERE id=?`, "inc-done"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkIncidentReadyWithSituationInput(ctx, "inc-done", now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func newFileTestStore(t *testing.T) *Store {
+	t.Helper()
+	st, err := Open(context.Background(), filepath.Join(t.TempDir(), "alertint.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := st.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return st
+}
+
+func acceptSameGroupFixtures(t *testing.T, st *Store, ids []string, now time.Time) {
+	t.Helper()
+	inputs := make([]DeliveryInput, 0, len(ids))
+	for _, id := range ids {
+		in := deliveryFixture(id, "fp-"+id, now)
+		in.ReceiverGroupingIdentity = "service=api"
+		inputs = append(inputs, in)
+	}
+	if _, err := st.AcceptDeliveries(context.Background(), inputs); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func claimDispatches(t *testing.T, st *Store, owner string, now time.Time, count int) []AlertDispatch {
+	t.Helper()
+	claims, err := st.ClaimAlertDispatches(context.Background(), owner, now, time.Minute, count)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != count {
+		t.Fatalf("claims = %d, want %d", len(claims), count)
+	}
+	return claims
+}
+
+func applyFreshSameGroupMutation(st *Store, claim AlertDispatch, groupKey string, now time.Time) error {
+	deliveryID := claim.Delivery.ID
+	_, err := st.ApplyCorrelatedDelivery(context.Background(), CorrelatedDeliveryMutation{
+		DeliveryID: deliveryID, DispatchOwner: *claim.LeaseOwner, DispatchClaimToken: claim.ClaimToken,
+		Incident: Incident{ID: "inc-" + deliveryID, GroupKey: groupKey, FirstAlertAt: now, LastAlertAt: now, ReadyAt: now.Add(time.Minute)},
+		Input:    SituationInput{ID: "input-" + deliveryID, IdempotencyKey: "delivery:" + deliveryID, IncidentID: "inc-" + deliveryID, DeliveryID: &deliveryID, Kind: "incident_created", GroupKey: groupKey, OccurredAt: now},
+	})
+	return err
+}
+
+func TestConcurrentFirstDeliveriesShareOneCollectingIncident(t *testing.T) {
+	st := newFileTestStore(t)
+	now := time.Date(2026, 9, 1, 2, 0, 0, 0, time.UTC)
+	acceptSameGroupFixtures(t, st, []string{"d1", "d2"}, now)
+	claims := claimDispatches(t, st, "worker-a", now, 2)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, len(claims))
+	for _, claim := range claims {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- applyFreshSameGroupMutation(st, claim, "service=api", now)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	assertQueryCount(t, st.DB(), `SELECT COUNT(*) FROM incidents WHERE group_key=? AND status='collecting'`, 1, "service=api")
+	assertQueryCount(t, st.DB(), `SELECT COUNT(*) FROM incident_alert_deliveries`, 2)
+	assertQueryCount(t, st.DB(), `SELECT COUNT(*) FROM situation_input_outbox`, 2)
+}

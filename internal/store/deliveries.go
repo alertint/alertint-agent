@@ -96,6 +96,560 @@ type AlertDispatch struct {
 // must discard the stale claim, not retry with it, on receiving this error.
 var ErrAlertDispatchLeaseLost = errors.New("store: alert dispatch lease lost")
 
+// ErrIncidentOwnerNotCollapsible means a plan to attach a delivery to an
+// existing Incident (recurrence collapse, or a same-group retry-backoff
+// attach) is no longer valid — the target Incident's status moved to a
+// terminal state between planning and commit. The caller must discard the
+// plan and correlate the delivery as a fresh Incident instead.
+var ErrIncidentOwnerNotCollapsible = errors.New("store: incident owner does not permit correlated attach")
+
+// CorrelatedDeliveryMutation is everything ApplyCorrelatedDelivery needs to
+// commit one durably claimed delivery's correlation outcome in a single
+// transaction. Incident carries the caller's plan — an existing Incident's
+// identity to attach to, or a fresh Incident's proposed identity and times —
+// preserving its exact GroupKey either way. Occurrence is non-nil only when
+// the caller's plan is a recurrence collapse: a nil Occurrence.ID means
+// "insert a new occurrence row", a non-zero one means "touch this existing
+// occurrence's last_seen". RequireNonterminalOwner gates an attach-to-
+// existing-Incident plan (recurrence collapse, retry-backoff attach) on the
+// owner not having gone terminal between planning and commit; it is never
+// set for a fresh-Incident or resolved-delivery-association plan.
+type CorrelatedDeliveryMutation struct {
+	DeliveryID              string
+	DispatchOwner           string
+	DispatchClaimToken      int64
+	Incident                Incident
+	Occurrence              *Occurrence
+	Input                   SituationInput
+	RequireNonterminalOwner bool
+}
+
+// CorrelatedDeliveryResult is the durable outcome ApplyCorrelatedDelivery
+// returns after its transaction commits. Incident reflects the row exactly
+// as committed (whether freshly inserted, reused across a concurrent-first-
+// delivery race, or already owning the delivery). Created is true only when
+// this call's transaction itself inserted the Incident row. Resolved is true
+// only when this call's transaction itself flipped the Incident to
+// "resolved" (i.e. the Situation input Kind came out "incident_resolved").
+// Duplicate is true when the delivery already owned an immutable
+// incident_alert_deliveries link before this call — a successful no-op that
+// still repairs a missing idempotent input or a stuck dispatch projection.
+type CorrelatedDeliveryResult struct {
+	Incident   Incident
+	Created    bool
+	Occurrence *Occurrence
+	Resolved   bool
+	Duplicate  bool
+}
+
+const incidentSelectByID = `
+	SELECT id, group_key, status, first_alert_at, last_alert_at, ready_at, alert_count, created_at, updated_at
+	FROM incidents WHERE id = ?`
+
+// validateCorrelatedDeliveryMutation checks the fields ApplyCorrelatedDelivery
+// must have before it can safely open a transaction. It never touches the
+// database.
+func validateCorrelatedDeliveryMutation(m CorrelatedDeliveryMutation) error {
+	if strings.TrimSpace(m.DeliveryID) == "" {
+		return errors.New("store: correlated delivery requires a delivery id")
+	}
+	if strings.TrimSpace(m.DispatchOwner) == "" || m.DispatchClaimToken <= 0 {
+		return errors.New("store: correlated delivery requires a complete dispatch claim")
+	}
+	if strings.TrimSpace(m.Incident.ID) == "" || strings.TrimSpace(m.Incident.GroupKey) == "" {
+		return errors.New("store: correlated delivery requires incident identity")
+	}
+	if m.Incident.FirstAlertAt.IsZero() || m.Incident.LastAlertAt.IsZero() || m.Incident.ReadyAt.IsZero() {
+		return errors.New("store: correlated delivery requires incident times")
+	}
+	if strings.TrimSpace(m.Input.ID) == "" || strings.TrimSpace(m.Input.IdempotencyKey) == "" || strings.TrimSpace(m.Input.Kind) == "" || m.Input.OccurredAt.IsZero() {
+		return errors.New("store: correlated delivery requires situation input identity, kind, and time")
+	}
+	if m.Input.IncidentID != m.Incident.ID {
+		return errors.New("store: correlated situation input incident does not match incident")
+	}
+	if m.Input.GroupKey != m.Incident.GroupKey {
+		return errors.New("store: correlated situation input group key does not match incident")
+	}
+	if m.Input.DeliveryID == nil || *m.Input.DeliveryID != m.DeliveryID {
+		return errors.New("store: correlated situation input does not match delivery")
+	}
+	if m.Occurrence != nil && m.Occurrence.IncidentID != m.Incident.ID {
+		return errors.New("store: correlated occurrence does not match incident")
+	}
+	return nil
+}
+
+// verifyCorrelatedDispatchClaimTx confirms delivery_id is still claimed by
+// (owner, token) at the instant this transaction observes it. A mismatch —
+// the lease expired and moved on, or was never claimed — is
+// ErrAlertDispatchLeaseLost, never a silent no-op.
+func verifyCorrelatedDispatchClaimTx(ctx context.Context, tx *sql.Tx, deliveryID, owner string, token int64) error {
+	var valid int
+	err := tx.QueryRowContext(ctx, `
+		SELECT 1 FROM alert_delivery_dispatches
+		WHERE delivery_id = ? AND status = 'claimed' AND lease_owner = ? AND claim_token = ?`,
+		deliveryID, owner, token).Scan(&valid)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrAlertDispatchLeaseLost
+	}
+	if err != nil {
+		return fmt.Errorf("store: verify correlated dispatch claim: %w", err)
+	}
+	return nil
+}
+
+// ensureCorrelatedIncidentTx resolves the Incident a correlated delivery
+// attaches to. It first looks the plan up by ID — the ordinary case for a
+// plan that already names a real, existing Incident (recurrence collapse,
+// retry-backoff attach, resolved-delivery association, or a duplicate
+// replay). Only when the plan is a genuinely fresh Incident (reuseCollecting)
+// does it re-check for a collecting Incident under the same exact group_key
+// before inserting — closing the concurrent-first-delivery race: two
+// callers racing to open the first Incident for a brand-new group both
+// resolve to the SAME collecting row, because every ApplyCorrelatedDelivery
+// transaction runs on the store's single database connection (Open sets
+// SetMaxOpenConns(1)), so this select-then-insert can never interleave with
+// another one — there is never more than one such transaction in flight.
+func ensureCorrelatedIncidentTx(ctx context.Context, tx *sql.Tx, inc Incident, reuseCollecting bool) (created bool, status, incidentID string, err error) {
+	var groupKey string
+	err = tx.QueryRowContext(ctx, `SELECT group_key, status FROM incidents WHERE id = ?`, inc.ID).Scan(&groupKey, &status)
+	if err == nil {
+		if groupKey != inc.GroupKey {
+			return false, "", "", fmt.Errorf("store: correlated incident %s group key mismatch: have %q, want %q", inc.ID, groupKey, inc.GroupKey)
+		}
+		return false, status, inc.ID, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, "", "", fmt.Errorf("store: read correlated incident: %w", err)
+	}
+	if reuseCollecting {
+		var existingID string
+		err = tx.QueryRowContext(ctx, `
+			SELECT id, status FROM incidents
+			WHERE group_key = ? AND status = 'collecting'
+			ORDER BY created_at ASC, id ASC LIMIT 1`, inc.GroupKey).Scan(&existingID, &status)
+		if err == nil {
+			return false, status, existingID, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return false, "", "", fmt.Errorf("store: read collecting correlated incident: %w", err)
+		}
+	}
+	now := canonicalTime(time.Now().UTC())
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO incidents (id, group_key, status, first_alert_at, last_alert_at, ready_at, alert_count, created_at, updated_at)
+		VALUES (?, ?, 'collecting', ?, ?, ?, 0, ?, ?)`,
+		inc.ID, inc.GroupKey, canonicalTime(inc.FirstAlertAt), canonicalTime(inc.LastAlertAt), canonicalTime(inc.ReadyAt), now, now); err != nil {
+		return false, "", "", fmt.Errorf("store: insert correlated incident: %w", err)
+	}
+	return true, "collecting", inc.ID, nil
+}
+
+// applyCorrelatedOccurrenceTx applies the caller's Occurrence plan, if any:
+// nil does nothing; an Occurrence with ID == 0 inserts a new occurrence row
+// (a genuine new episode); a non-zero ID only slides that occurrence's
+// last_seen forward (an unchanged repeat touch). It returns the occurrence
+// id to stamp onto the immutable delivery link, if any.
+func applyCorrelatedOccurrenceTx(ctx context.Context, tx *sql.Tx, incidentID string, occ *Occurrence, deliveryReceivedAt time.Time) (sql.NullInt64, error) {
+	if occ == nil {
+		return sql.NullInt64{}, nil
+	}
+	if occ.ID == 0 {
+		return insertCorrelatedOccurrenceTx(ctx, tx, *occ)
+	}
+	return touchCorrelatedOccurrenceTx(ctx, tx, incidentID, *occ, deliveryReceivedAt)
+}
+
+// insertCorrelatedOccurrenceTx records a genuinely new episode.
+func insertCorrelatedOccurrenceTx(ctx context.Context, tx *sql.Tx, occ Occurrence) (sql.NullInt64, error) {
+	trigger := occ.TriggerKind
+	if trigger == "" {
+		trigger = "none"
+	}
+	if !validTriggerKinds[trigger] {
+		return sql.NullInt64{}, fmt.Errorf("store: occurrence: trigger_kind %q invalid", trigger)
+	}
+	lastSeen := occ.LastSeen
+	if lastSeen.IsZero() {
+		lastSeen = occ.OccurredAt
+	}
+	fpsJSON, err := json.Marshal(occ.Fingerprints)
+	if err != nil {
+		return sql.NullInt64{}, fmt.Errorf("store: occurrence: marshal fingerprints: %w", err)
+	}
+	payloadJSON, err := json.Marshal(occ.Payload)
+	if err != nil {
+		return sql.NullInt64{}, fmt.Errorf("store: occurrence: marshal payload: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `
+		INSERT INTO incident_occurrences (incident_id, occurred_at, last_seen, fingerprints_json, payload_json, trigger_kind, snapshot_ref)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		occ.IncidentID, fmtOccTime(occ.OccurredAt), fmtOccTime(lastSeen), string(fpsJSON), string(payloadJSON), trigger, occ.SnapshotRef)
+	if err != nil {
+		return sql.NullInt64{}, fmt.Errorf("store: insert correlated occurrence: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return sql.NullInt64{}, fmt.Errorf("store: insert correlated occurrence id: %w", err)
+	}
+	return sql.NullInt64{Int64: id, Valid: true}, nil
+}
+
+// touchCorrelatedOccurrenceTx slides an unchanged repeat's last_seen forward
+// without minting a new episode.
+func touchCorrelatedOccurrenceTx(ctx context.Context, tx *sql.Tx, incidentID string, occ Occurrence, deliveryReceivedAt time.Time) (sql.NullInt64, error) {
+	lastSeen := occ.LastSeen
+	if lastSeen.IsZero() {
+		lastSeen = deliveryReceivedAt
+	}
+	res, err := tx.ExecContext(ctx, `
+		UPDATE incident_occurrences SET last_seen = MAX(last_seen, ?)
+		WHERE id = ? AND incident_id = ?`, fmtOccTime(lastSeen), occ.ID, incidentID)
+	if err != nil {
+		return sql.NullInt64{}, fmt.Errorf("store: touch correlated occurrence: %w", err)
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return sql.NullInt64{}, fmt.Errorf("store: count touched correlated occurrence: %w", err)
+	}
+	if changed != 1 {
+		return sql.NullInt64{}, ErrNotFound
+	}
+	return sql.NullInt64{Int64: occ.ID, Valid: true}, nil
+}
+
+// attachCorrelatedDeliveryTx attaches the current Alert projection to the
+// Incident with INSERT OR IGNORE (a delivery whose alert already joined the
+// Incident, e.g. an unchanged repeat, is a no-op here), updates the
+// Incident's count and times from the rows actually affected (never a blind
+// increment), and inserts the delivery's unique immutable ownership link.
+func attachCorrelatedDeliveryTx(ctx context.Context, tx *sql.Tx, incidentID, deliveryID, alertID string, occurrenceID sql.NullInt64, deliveryReceivedAt, now time.Time) error {
+	memberRes, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO incident_alerts (incident_id, alert_id, created_at)
+		VALUES (?, ?, ?)`, incidentID, alertID, canonicalTime(now))
+	if err != nil {
+		return fmt.Errorf("store: attach correlated alert projection: %w", err)
+	}
+	memberAdded, err := memberRes.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: count correlated alert projection: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE incidents
+		SET alert_count = alert_count + ?, last_alert_at = MAX(last_alert_at, ?), updated_at = ?
+		WHERE id = ?`, memberAdded, canonicalTime(deliveryReceivedAt), canonicalTime(now), incidentID); err != nil {
+		return fmt.Errorf("store: update correlated incident: %w", err)
+	}
+
+	var occurrenceValue any
+	if occurrenceID.Valid {
+		occurrenceValue = occurrenceID.Int64
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO incident_alert_deliveries (incident_id, delivery_id, occurrence_id, created_at)
+		VALUES (?, ?, ?, ?)`, incidentID, deliveryID, occurrenceValue, canonicalTime(now)); err != nil {
+		return fmt.Errorf("store: link correlated delivery: %w", err)
+	}
+	return nil
+}
+
+// unresolvedIncidentMembersTx counts the Incident's current members (from
+// the compatibility incident_alerts table) whose most recent immutable
+// delivery status is not "resolved" — an alert with no delivery-ledger row
+// at all defaults to "firing", the safe (unresolved) assumption. Zero means
+// every immutable member delivery agrees the condition has recovered.
+func unresolvedIncidentMembersTx(ctx context.Context, tx *sql.Tx, incidentID string) (int, error) {
+	var count int
+	err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM incident_alerts AS ia
+		WHERE ia.incident_id = ?
+		  AND COALESCE((
+			SELECT ad.status
+			FROM incident_alert_deliveries AS iad
+			JOIN alert_deliveries AS ad ON ad.id = iad.delivery_id
+			WHERE iad.incident_id = ia.incident_id AND ad.alert_id = ia.alert_id
+			ORDER BY ad.received_at DESC, ad.id DESC
+			LIMIT 1
+		  ), 'firing') <> 'resolved'`, incidentID).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("store: count unresolved correlated incident members: %w", err)
+	}
+	return count, nil
+}
+
+// correlatedSituationInputKindTx derives the Situation input Kind from
+// committed state, never from the caller's pre-transaction guess alone: a
+// freshly inserted Incident is always "incident_created"; otherwise, only a
+// resolved delivery landing on a "ready" or "analyzed" Incident whose every
+// immutable member delivery now agrees the condition recovered flips the
+// Incident to "resolved" and reports "incident_resolved". Anything else
+// keeps the caller's requested Kind (ordinarily "membership_changed").
+func correlatedSituationInputKindTx(ctx context.Context, tx *sql.Tx, requested, incidentID, deliveryStatus, incidentStatus string, created bool, now time.Time) (kind string, resolved bool, err error) {
+	if created {
+		return "incident_created", false, nil
+	}
+	if deliveryStatus != "resolved" || (incidentStatus != "ready" && incidentStatus != "analyzed") {
+		return requested, false, nil
+	}
+	unresolved, err := unresolvedIncidentMembersTx(ctx, tx, incidentID)
+	if err != nil {
+		return requested, false, err
+	}
+	if unresolved != 0 {
+		return requested, false, nil
+	}
+	res, err := tx.ExecContext(ctx, `
+		UPDATE incidents SET status = 'resolved', updated_at = ? WHERE id = ? AND status IN ('ready', 'analyzed')`,
+		canonicalTime(now), incidentID)
+	if err != nil {
+		return "", false, fmt.Errorf("store: resolve correlated incident: %w", err)
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return "", false, fmt.Errorf("store: count resolved correlated incident: %w", err)
+	}
+	if changed == 1 {
+		return "incident_resolved", true, nil
+	}
+	return requested, false, nil
+}
+
+// markCorrelatedDispatchAppliedTx fences the applied transition on the exact
+// claim this call verified at the top of its transaction, so nothing else
+// could have moved the lease in between.
+func markCorrelatedDispatchAppliedTx(ctx context.Context, tx *sql.Tx, deliveryID, owner string, token int64, at time.Time) error {
+	res, err := tx.ExecContext(ctx, `
+		UPDATE alert_delivery_dispatches
+		SET status='applied', lease_owner=NULL, lease_expires_at=NULL, retry_at=NULL, applied_at=?
+		WHERE delivery_id=? AND status='claimed' AND lease_owner=? AND claim_token=?`,
+		canonicalTime(at), deliveryID, owner, token)
+	if err != nil {
+		return fmt.Errorf("store: mark correlated dispatch applied: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: count correlated dispatch applied: %w", err)
+	}
+	if n != 1 {
+		return ErrAlertDispatchLeaseLost
+	}
+	return nil
+}
+
+// ApplyCorrelatedDelivery verifies the current dispatch lease and atomically
+// performs the Incident/Occurrence mutation, current incident_alerts
+// compatibility attachment, immutable incident_alert_deliveries ownership,
+// Situation-input insertion, and dispatch transition to "applied" in one
+// transaction. Reapplying an already-owned delivery is a successful no-op
+// (Duplicate=true) that still repairs a missing idempotent input or a stuck
+// "claimed" dispatch projection before acknowledging the current claim —
+// there is no separate success acknowledgment after this method, which
+// removes the crash window between applying correlation and completing the
+// dispatch.
+func (s *Store) ApplyCorrelatedDelivery(ctx context.Context, m CorrelatedDeliveryMutation) (CorrelatedDeliveryResult, error) {
+	if err := validateCorrelatedDeliveryMutation(m); err != nil {
+		return CorrelatedDeliveryResult{}, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return CorrelatedDeliveryResult{}, fmt.Errorf("store: begin correlated delivery: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := verifyCorrelatedDispatchClaimTx(ctx, tx, m.DeliveryID, m.DispatchOwner, m.DispatchClaimToken); err != nil {
+		return CorrelatedDeliveryResult{}, err
+	}
+
+	var existingIncidentID string
+	err = tx.QueryRowContext(ctx, `SELECT incident_id FROM incident_alert_deliveries WHERE delivery_id = ?`, m.DeliveryID).Scan(&existingIncidentID)
+	switch {
+	case err == nil:
+		return applyDuplicateCorrelatedDeliveryTx(ctx, tx, m, existingIncidentID)
+	case !errors.Is(err, sql.ErrNoRows):
+		return CorrelatedDeliveryResult{}, fmt.Errorf("store: read correlated delivery ownership: %w", err)
+	}
+
+	var alertID, deliveryStatus, receivedAtStr string
+	if err := tx.QueryRowContext(ctx, `SELECT alert_id, status, received_at FROM alert_deliveries WHERE id = ?`, m.DeliveryID).
+		Scan(&alertID, &deliveryStatus, &receivedAtStr); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return CorrelatedDeliveryResult{}, ErrNotFound
+		}
+		return CorrelatedDeliveryResult{}, fmt.Errorf("store: read correlated delivery: %w", err)
+	}
+	deliveryReceivedAt, err := time.Parse(time.RFC3339Nano, receivedAtStr)
+	if err != nil {
+		return CorrelatedDeliveryResult{}, fmt.Errorf("store: parse correlated delivery received time: %w", err)
+	}
+
+	reuseCollecting := m.Input.Kind == "incident_created" && m.Occurrence == nil
+	created, incidentStatus, incidentID, err := ensureCorrelatedIncidentTx(ctx, tx, m.Incident, reuseCollecting)
+	if err != nil {
+		return CorrelatedDeliveryResult{}, err
+	}
+
+	requestedKind := m.Input.Kind
+	if incidentID != m.Incident.ID {
+		// The plan's imagined Incident ID lost the race (or never existed to
+		// begin with, for a plan that already named a real Incident under a
+		// mismatched ID — which fails the group-key check inside
+		// ensureCorrelatedIncidentTx instead). Downgrade to plain membership.
+		m.Incident.ID = incidentID
+		m.Input.IncidentID = incidentID
+		requestedKind = "membership_changed"
+	}
+
+	if m.RequireNonterminalOwner && incidentStatus == "failed" {
+		return CorrelatedDeliveryResult{}, ErrIncidentOwnerNotCollapsible
+	}
+
+	now := time.Now().UTC()
+	occurrenceID, err := applyCorrelatedOccurrenceTx(ctx, tx, m.Incident.ID, m.Occurrence, deliveryReceivedAt)
+	if err != nil {
+		return CorrelatedDeliveryResult{}, err
+	}
+
+	if err := attachCorrelatedDeliveryTx(ctx, tx, m.Incident.ID, m.DeliveryID, alertID, occurrenceID, deliveryReceivedAt, now); err != nil {
+		return CorrelatedDeliveryResult{}, err
+	}
+
+	kind, resolved, err := correlatedSituationInputKindTx(ctx, tx, requestedKind, m.Incident.ID, deliveryStatus, incidentStatus, created, now)
+	if err != nil {
+		return CorrelatedDeliveryResult{}, err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO situation_input_outbox (id, idempotency_key, incident_id, delivery_id, kind, group_key, occurred_at, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`,
+		m.Input.ID, m.Input.IdempotencyKey, m.Incident.ID, m.DeliveryID, kind, m.Incident.GroupKey, canonicalTime(deliveryReceivedAt.UTC())); err != nil {
+		return CorrelatedDeliveryResult{}, fmt.Errorf("store: insert correlated situation input: %w", err)
+	}
+
+	if err := markCorrelatedDispatchAppliedTx(ctx, tx, m.DeliveryID, m.DispatchOwner, m.DispatchClaimToken, now); err != nil {
+		return CorrelatedDeliveryResult{}, err
+	}
+
+	incPtr, err := scanIncident(tx.QueryRowContext(ctx, incidentSelectByID, m.Incident.ID))
+	if err != nil {
+		return CorrelatedDeliveryResult{}, fmt.Errorf("store: read committed correlated incident: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return CorrelatedDeliveryResult{}, fmt.Errorf("store: commit correlated delivery: %w", err)
+	}
+
+	result := CorrelatedDeliveryResult{Incident: *incPtr, Created: created, Resolved: resolved}
+	if m.Occurrence != nil {
+		occ := *m.Occurrence
+		occ.IncidentID = m.Incident.ID
+		if occurrenceID.Valid {
+			occ.ID = occurrenceID.Int64
+		}
+		result.Occurrence = &occ
+	}
+	return result, nil
+}
+
+// applyDuplicateCorrelatedDeliveryTx handles a delivery that already owns an
+// immutable incident_alert_deliveries link: steps 3–7 (the Incident/
+// Occurrence mutation, membership, and ownership link) never re-run, but
+// steps 8–10 still repair a missing idempotent input or a stuck "claimed"
+// dispatch projection before this call acknowledges the current claim.
+func applyDuplicateCorrelatedDeliveryTx(ctx context.Context, tx *sql.Tx, m CorrelatedDeliveryMutation, incidentID string) (CorrelatedDeliveryResult, error) {
+	if _, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO situation_input_outbox (id, idempotency_key, incident_id, delivery_id, kind, group_key, occurred_at, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`,
+		m.Input.ID, m.Input.IdempotencyKey, incidentID, m.DeliveryID, m.Input.Kind, m.Input.GroupKey, canonicalTime(m.Input.OccurredAt.UTC())); err != nil {
+		return CorrelatedDeliveryResult{}, fmt.Errorf("store: repair correlated situation input: %w", err)
+	}
+
+	now := time.Now().UTC()
+	if err := markCorrelatedDispatchAppliedTx(ctx, tx, m.DeliveryID, m.DispatchOwner, m.DispatchClaimToken, now); err != nil {
+		return CorrelatedDeliveryResult{}, err
+	}
+
+	incPtr, err := scanIncident(tx.QueryRowContext(ctx, incidentSelectByID, incidentID))
+	if err != nil {
+		return CorrelatedDeliveryResult{}, fmt.Errorf("store: read duplicate correlated incident: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return CorrelatedDeliveryResult{}, fmt.Errorf("store: commit duplicate correlated delivery: %w", err)
+	}
+	return CorrelatedDeliveryResult{Incident: *incPtr, Duplicate: true}, nil
+}
+
+// MarkIncidentReadyWithSituationInput atomically transitions incidentID from
+// "collecting" to "ready" and appends its one delivery-independent
+// incident_ready Situation input (idempotency key "incident-ready:<incident
+// id>") in the same commit. An already-"ready" Incident carrying the
+// matching input is a successful no-op — the idempotent replay a crash
+// between this method's commit and its caller's next step would produce.
+// Any other Incident state — "processing", "analyzed", "resolved",
+// "failed", or no such Incident at all — is ErrNotFound. This method does
+// not seed, begin, or complete incident_triage.
+func (s *Store) MarkIncidentReadyWithSituationInput(ctx context.Context, incidentID string, now time.Time) error {
+	if strings.TrimSpace(incidentID) == "" {
+		return errors.New("store: mark incident ready requires an incident id")
+	}
+	now = now.UTC()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin mark incident ready: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var status, groupKey string
+	err = tx.QueryRowContext(ctx, `SELECT status, group_key FROM incidents WHERE id = ?`, incidentID).Scan(&status, &groupKey)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("store: read incident for ready transition: %w", err)
+	}
+
+	idempotencyKey := "incident-ready:" + incidentID
+	switch status {
+	case "collecting":
+		res, err := tx.ExecContext(ctx, `UPDATE incidents SET status='ready', updated_at=? WHERE id=? AND status='collecting'`, canonicalTime(now), incidentID)
+		if err != nil {
+			return fmt.Errorf("store: mark incident ready: %w", err)
+		}
+		if n, rerr := res.RowsAffected(); rerr != nil {
+			return fmt.Errorf("store: count mark incident ready: %w", rerr)
+		} else if n != 1 {
+			return ErrNotFound
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO situation_input_outbox (id, idempotency_key, incident_id, kind, group_key, occurred_at, status)
+			VALUES (?, ?, ?, 'incident_ready', ?, ?, 'pending')`,
+			"situation-input:"+idempotencyKey, idempotencyKey, incidentID, groupKey, canonicalTime(now)); err != nil {
+			return fmt.Errorf("store: insert incident ready situation input: %w", err)
+		}
+	case "ready":
+		var exists int
+		err := tx.QueryRowContext(ctx, `SELECT 1 FROM situation_input_outbox WHERE idempotency_key = ?`, idempotencyKey).Scan(&exists)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("store: incident %s is ready without its incident_ready situation input", incidentID)
+		}
+		if err != nil {
+			return fmt.Errorf("store: check incident ready situation input: %w", err)
+		}
+		// Idempotent no-op: the ready transition and its input already
+		// committed together; fall through and commit without changes.
+	default:
+		return ErrNotFound
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit mark incident ready: %w", err)
+	}
+	return nil
+}
+
 // validateDeliveryInput checks the fields AcceptDeliveries must have before
 // it can safely open a transaction. It never touches the database.
 func validateDeliveryInput(d DeliveryInput) error {
