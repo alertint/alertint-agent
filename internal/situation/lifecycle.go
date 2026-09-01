@@ -18,7 +18,6 @@ const (
 	EventRefired               Event = "refired"
 	EventGraceExpired          Event = "grace_expired"
 	EventLifecycleUnobservable Event = "lifecycle_unobservable"
-	EventManualReassessment    Event = "manual_reassessment"
 )
 
 // AdvanceLifecycle applies one legal lifecycle event. Terminal lifecycles
@@ -32,7 +31,7 @@ func AdvanceLifecycle(from model.Lifecycle, event Event) (model.Lifecycle, error
 			return model.LifecycleRecoveryPending, nil
 		case EventLifecycleUnobservable:
 			return model.LifecycleClosedUnknown, nil
-		case EventRefired, EventManualReassessment:
+		case EventRefired:
 			return model.LifecycleActive, nil
 		case EventGraceExpired:
 			// No grace runs while active.
@@ -45,7 +44,7 @@ func AdvanceLifecycle(from model.Lifecycle, event Event) (model.Lifecycle, error
 			return model.LifecycleRecovered, nil
 		case EventLifecycleUnobservable:
 			return model.LifecycleClosedUnknown, nil
-		case EventRecoveryObserved, EventManualReassessment:
+		case EventRecoveryObserved:
 			return model.LifecycleRecoveryPending, nil
 		}
 	case model.LifecycleRecovered, model.LifecycleClosedUnknown:
