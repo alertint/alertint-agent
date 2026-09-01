@@ -1,0 +1,409 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package situation
+
+import (
+	"context"
+	"errors"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/alertint/alertint-agent/internal/correlator"
+	"github.com/alertint/alertint-agent/internal/situation/model"
+	"github.com/alertint/alertint-agent/internal/store"
+)
+
+// ----------------------------------------------------------------------
+// Fixtures
+// ----------------------------------------------------------------------
+
+// callCounter is a fake correlator.IncidentSink + correlator.ResolutionNotifier
+// that counts every call — reconstruction wires it in as a canary: if
+// anything on the reconstruction path ever reached an outward notification
+// surface, Calls would go non-zero.
+type callCounter struct {
+	Calls int
+}
+
+func (c *callCounter) OnIncidentReady(context.Context, store.Incident) error {
+	c.Calls++
+	return nil
+}
+
+func (c *callCounter) OnIncidentResolved(context.Context, store.Incident) error {
+	c.Calls++
+	return nil
+}
+
+func firingDeliveryFixture(id, fingerprint, groupIdentity string, at time.Time) store.DeliveryInput {
+	return store.DeliveryInput{
+		ID: id,
+		Alert: store.Alert{
+			ID:          "alert-" + fingerprint,
+			Fingerprint: fingerprint,
+			Status:      "firing",
+			Labels:      map[string]string{"alertname": "test", "fp": fingerprint},
+			Annotations: map[string]string{"summary": "test alert"},
+			StartsAt:    at,
+			ReceivedAt:  at,
+		},
+		Source:                   "alertmanager",
+		SourceEpisodeKey:         "alertmanager:" + fingerprint + ":" + at.UTC().Format(time.RFC3339Nano),
+		StartedAtBasis:           model.SourceTimeBasisReceiptFallback,
+		ResolvedAtBasis:          model.SourceTimeBasisMissing,
+		ReceiverGroupingIdentity: groupIdentity,
+		PayloadDigest:            "sha256:" + id,
+		SourceProvenance: store.SourceProvenance{
+			AcquisitionMode: store.SourceAcquisitionWebhook,
+		},
+	}
+}
+
+func insertRawIncidentForReconstruction(t *testing.T, st *store.Store, id, groupKey, status string, at time.Time) {
+	t.Helper()
+	ts := at.UTC().Format(time.RFC3339Nano)
+	if _, err := st.DB().ExecContext(context.Background(), `
+		INSERT INTO incidents (id, group_key, status, first_alert_at, last_alert_at, ready_at, alert_count, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+		id, groupKey, status, ts, ts, ts, ts, ts); err != nil {
+		t.Fatalf("insert raw incident %s: %v", id, err)
+	}
+}
+
+// reconstructionFixture builds a file-backed Store containing exactly the
+// pre-restart state Step 1 of this task's plan calls for: one accepted
+// pending delivery, one expired claimed delivery, one expired claimed
+// Situation input, one expired Situation claim, and one incident per
+// operational status plus one settled resolved incident, none of them
+// owned by a Situation yet. It returns the store plus a DispatchWorker and
+// InputWorker wired to it (and to a Correlator whose sink/resolution
+// notifier is the returned callCounter canary), ready for
+// Reconstructor.WithReplay.
+func reconstructionFixture(t *testing.T) (*store.Store, *correlator.DispatchWorker, *InputWorker, *callCounter) {
+	t.Helper()
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, err := store.Open(ctx, filepath.Join(dir, "reconstruction.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+
+	// One accepted pending delivery, one expired claimed delivery — both
+	// firing, on distinct groups, so dispatch.Drain opens two fresh
+	// incidents rather than colliding on incidents_one_collecting_group_idx.
+	if _, err := st.AcceptDeliveries(ctx, []store.DeliveryInput{
+		firingDeliveryFixture("d-pending", "fp-pending", "group:pending", now),
+		firingDeliveryFixture("d-expired", "fp-expired", "group:expired", now),
+	}); err != nil {
+		t.Fatalf("accept deliveries: %v", err)
+	}
+	if _, err := st.ClaimAlertDispatches(ctx, "stale-worker", now, time.Minute, 1); err != nil {
+		t.Fatalf("claim dispatch to expire: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `UPDATE alert_delivery_dispatches SET lease_expires_at = ? WHERE delivery_id = 'd-expired'`,
+		now.Add(-time.Second).UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("force-expire dispatch lease: %v", err)
+	}
+
+	// One expired claimed Situation input, on an Incident of its own.
+	if err := st.InsertIncident(ctx, store.Incident{
+		ID: "inc-input-source", GroupKey: "group-input-source",
+		FirstAlertAt: now, LastAlertAt: now, ReadyAt: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("insert input-source incident: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `
+		INSERT INTO situation_input_outbox (id, idempotency_key, incident_id, kind, group_key, occurred_at, status)
+		VALUES ('input-expired', 'idem-input-expired', 'inc-input-source', 'incident_created', 'group-input-source', ?, 'pending')`,
+		now.UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("insert pending situation input: %v", err)
+	}
+	if _, err := st.ClaimSituationInputs(ctx, "stale-worker", now, time.Minute, 1); err != nil {
+		t.Fatalf("claim situation input to expire: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `UPDATE situation_input_outbox SET lease_expires_at = ? WHERE id = 'input-expired'`,
+		now.Add(-time.Second).UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("force-expire situation input lease: %v", err)
+	}
+
+	// One expired Situation claim.
+	ts := now.UTC().Format(time.RFC3339Nano)
+	if _, err := st.DB().ExecContext(ctx, `
+		INSERT INTO situations (
+			id, group_key, lifecycle, attention, input_version,
+			opened_at, effective_started_at, effective_started_at_basis, first_received_at,
+			last_lifecycle_observed_at, next_assessment_at, due_reasons_json, created_at, updated_at
+		) VALUES ('sit-expired-claim', 'group-sit-expired-claim', 'active', 'observe', 1, ?, ?, 'receipt_fallback', ?, ?, ?, '[]', ?, ?)`,
+		ts, ts, ts, ts, ts, ts, ts); err != nil {
+		t.Fatalf("seed situation for expired claim: %v", err)
+	}
+	if _, err := st.ClaimDueSituations(ctx, "stale-worker", now, time.Minute, 10); err != nil {
+		t.Fatalf("claim situation to expire: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `UPDATE situations SET lease_expires_at = ? WHERE id = 'sit-expired-claim'`,
+		now.Add(-time.Second).UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("force-expire situation claim: %v", err)
+	}
+
+	// One Incident per operational status, plus one settled resolved
+	// Incident — none owned by a Situation.
+	for _, status := range []string{"collecting", "ready", "processing", "analyzed", "failed", "resolved"} {
+		insertRawIncidentForReconstruction(t, st, "inc-"+status, "group-"+status, status, now)
+	}
+
+	notifier := &callCounter{}
+	cor := correlator.New(correlator.Config{WindowSeconds: 60}, st, notifier, nil)
+	cor.SetResolutionNotifier(notifier)
+	dispatch := correlator.NewDispatchWorker(st, cor, correlator.WorkerConfig{Owner: "recon:dispatch"}, nil)
+	inputs := NewInputWorker(st, WorkerConfig{Owner: "recon:input"}, nil)
+
+	return st, dispatch, inputs, notifier
+}
+
+// assertOperationalIncidentsRepresented asserts that every operational
+// Incident (collecting/ready/processing/analyzed/failed) reconstructionFixture
+// seeded now belongs to a Situation, and that the settled resolved Incident
+// (no firing member) still does not.
+func assertOperationalIncidentsRepresented(t *testing.T, st *store.Store) {
+	t.Helper()
+	ctx := context.Background()
+	for _, status := range []string{"collecting", "ready", "processing", "analyzed", "failed"} {
+		id := "inc-" + status
+		var count int
+		if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM situation_incidents WHERE incident_id = ?`, id).Scan(&count); err != nil {
+			t.Fatalf("count membership for %s: %v", id, err)
+		}
+		if count != 1 {
+			t.Errorf("incident %s (status=%s) situation membership count = %d, want 1", id, status, count)
+		}
+	}
+	var settledCount int
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM situation_incidents WHERE incident_id = 'inc-resolved'`).Scan(&settledCount); err != nil {
+		t.Fatalf("count membership for settled resolved incident: %v", err)
+	}
+	if settledCount != 0 {
+		t.Errorf("settled resolved incident got represented (count=%d), want 0 (excluded)", settledCount)
+	}
+}
+
+// ----------------------------------------------------------------------
+// Tests
+// ----------------------------------------------------------------------
+
+func TestReconstructorRepresentsEveryOperationalIncidentWithoutPublishing(t *testing.T) {
+	st, dispatch, inputs, notifier := reconstructionFixture(t)
+	r := NewReconstructor(st, fixedClock).WithReplay(dispatch, inputs)
+	report, err := r.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if notifier.Calls != 0 {
+		t.Fatalf("startup published %d outward effects", notifier.Calls)
+	}
+	if report.ReplayedDeliveries == 0 || report.ReplayedInputs == 0 {
+		t.Fatalf("report = %+v", report)
+	}
+	assertOperationalIncidentsRepresented(t, st)
+}
+
+func TestReconstructorSecondRunCreatesOrAttachesNothingNew(t *testing.T) {
+	st, dispatch, inputs, notifier := reconstructionFixture(t)
+	r := NewReconstructor(st, fixedClock).WithReplay(dispatch, inputs)
+	ctx := context.Background()
+
+	if _, err := r.Run(ctx); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	assertOperationalIncidentsRepresented(t, st)
+
+	var situationsBefore, membershipsBefore int
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM situations`).Scan(&situationsBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM situation_incidents`).Scan(&membershipsBefore); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := r.Run(ctx)
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if notifier.Calls != 0 {
+		t.Fatalf("second run published %d outward effects", notifier.Calls)
+	}
+	if report.ReplayedDeliveries != 0 || report.ReplayedInputs != 0 || report.RepresentedGroups != 0 || report.RepresentedIncidents != 0 {
+		t.Fatalf("second run report = %+v, want an all-zero no-op", report)
+	}
+
+	var situationsAfter, membershipsAfter int
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM situations`).Scan(&situationsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM situation_incidents`).Scan(&membershipsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if situationsAfter != situationsBefore || membershipsAfter != membershipsBefore {
+		t.Fatalf("second run changed durable state: situations %d->%d, memberships %d->%d",
+			situationsBefore, situationsAfter, membershipsBefore, membershipsAfter)
+	}
+}
+
+// ----------------------------------------------------------------------
+// Orchestration-layer unit tests against fakes
+// ----------------------------------------------------------------------
+
+// fakeReconstructStore is a scriptable ReconstructStore for testing
+// Reconstructor.Run's own ordering and error-handling logic in isolation
+// from any real database.
+type fakeReconstructStore struct {
+	recoverErr error
+	recovered  LeaseRecovery
+
+	incidents    []UpgradeIncident
+	incidentsErr error
+
+	reconstructErr map[string]error // group key -> error, if any
+	reconstructed  []string         // group keys actually reconstructed, in call order
+}
+
+func (f *fakeReconstructStore) RecoverExpiredFoundationLeases(context.Context, time.Time) (LeaseRecovery, error) {
+	return f.recovered, f.recoverErr
+}
+
+func (f *fakeReconstructStore) UnrepresentedOperationalIncidents(context.Context) ([]UpgradeIncident, error) {
+	return f.incidents, f.incidentsErr
+}
+
+func (f *fakeReconstructStore) ReconstructSituation(_ context.Context, groupKey string, _ []UpgradeIncident, _ time.Time) (string, error) {
+	f.reconstructed = append(f.reconstructed, groupKey)
+	if err, ok := f.reconstructErr[groupKey]; ok {
+		return "", err
+	}
+	return "sit-" + groupKey, nil
+}
+
+type fakeReplayer struct {
+	drained int
+	err     error
+	calls   int
+}
+
+func (f *fakeReplayer) Drain(context.Context) (int, error) {
+	f.calls++
+	return f.drained, f.err
+}
+
+func TestReconstructorRunShortCircuitsOnLeaseRecoveryFailure(t *testing.T) {
+	fs := &fakeReconstructStore{recoverErr: errors.New("boom")}
+	dispatch := &fakeReplayer{}
+	inputs := &fakeReplayer{}
+	r := NewReconstructor(fs, fixedClock).WithReplay(dispatch, inputs)
+
+	if _, err := r.Run(context.Background()); err == nil {
+		t.Fatal("expected an error when lease recovery fails")
+	}
+	if dispatch.calls != 0 || inputs.calls != 0 {
+		t.Fatalf("dispatch/input drains ran despite a lease-recovery failure: %d/%d calls", dispatch.calls, inputs.calls)
+	}
+}
+
+func TestReconstructorRunShortCircuitsOnDrainFailure(t *testing.T) {
+	fs := &fakeReconstructStore{}
+	dispatch := &fakeReplayer{err: errors.New("dispatch drain failed")}
+	inputs := &fakeReplayer{}
+	r := NewReconstructor(fs, fixedClock).WithReplay(dispatch, inputs)
+
+	if _, err := r.Run(context.Background()); err == nil {
+		t.Fatal("expected an error when the delivery drain fails")
+	}
+	if inputs.calls != 0 {
+		t.Fatalf("input drain ran despite a delivery-drain failure: %d calls", inputs.calls)
+	}
+}
+
+func TestReconstructorRunOneBadGroupDoesNotBlockTheRest(t *testing.T) {
+	fs := &fakeReconstructStore{
+		incidents: []UpgradeIncident{
+			{IncidentID: "inc-1", GroupKey: "group-a"},
+			{IncidentID: "inc-2", GroupKey: "group-b"},
+			{IncidentID: "inc-3", GroupKey: "group-c"},
+		},
+		reconstructErr: map[string]error{"group-b": errors.New("malformed group")},
+	}
+	r := NewReconstructor(fs, fixedClock)
+
+	report, err := r.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected a joined error surfacing the one malformed group")
+	}
+	if report.RepresentedGroups != 2 || report.RepresentedIncidents != 2 {
+		t.Fatalf("report = %+v, want the two good groups represented despite the bad one", report)
+	}
+	want := []string{"group-a", "group-b", "group-c"}
+	if len(fs.reconstructed) != len(want) {
+		t.Fatalf("reconstructed groups = %v, want all three attempted", fs.reconstructed)
+	}
+	for i, g := range want {
+		if fs.reconstructed[i] != g {
+			t.Fatalf("reconstructed groups = %v, want deterministic order %v", fs.reconstructed, want)
+		}
+	}
+}
+
+func TestReconstructorRunOrdersRecoverDrainDrainRepresent(t *testing.T) {
+	var trace []string
+	fs := &traceReconstructStore{trace: &trace}
+	dispatch := &traceReplayer{trace: &trace, label: "drain_deliveries"}
+	inputs := &traceReplayer{trace: &trace, label: "drain_inputs"}
+	r := NewReconstructor(fs, fixedClock).WithReplay(dispatch, inputs)
+
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	want := []string{"recover_leases", "drain_deliveries", "drain_inputs", "reconstruct_incidents"}
+	if len(trace) != len(want) {
+		t.Fatalf("trace = %v, want %v", trace, want)
+	}
+	for i := range want {
+		if trace[i] != want[i] {
+			t.Fatalf("trace = %v, want %v", trace, want)
+		}
+	}
+}
+
+// traceReconstructStore appends to a shared trace at recover-leases time
+// and at the one represent-phase call (a single group, so
+// "reconstruct_incidents" appears exactly once) — enough to prove
+// Reconstructor.Run's phase order without needing a real database.
+type traceReconstructStore struct {
+	trace *[]string
+}
+
+func (f *traceReconstructStore) RecoverExpiredFoundationLeases(context.Context, time.Time) (LeaseRecovery, error) {
+	*f.trace = append(*f.trace, "recover_leases")
+	return LeaseRecovery{}, nil
+}
+
+func (f *traceReconstructStore) UnrepresentedOperationalIncidents(context.Context) ([]UpgradeIncident, error) {
+	return []UpgradeIncident{{IncidentID: "inc-1", GroupKey: "group-a"}}, nil
+}
+
+func (f *traceReconstructStore) ReconstructSituation(context.Context, string, []UpgradeIncident, time.Time) (string, error) {
+	*f.trace = append(*f.trace, "reconstruct_incidents")
+	return "sit-a", nil
+}
+
+type traceReplayer struct {
+	trace *[]string
+	label string
+}
+
+func (f *traceReplayer) Drain(context.Context) (int, error) {
+	*f.trace = append(*f.trace, f.label)
+	return 0, nil
+}

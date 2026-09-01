@@ -30,8 +30,11 @@ import (
 	"os/signal"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/backup"
@@ -382,10 +385,22 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	cor.SetOccurrenceNotifier(notifier)
 	cor.SetTriageFailureNotifier(notifier)
 
-	if err := cor.Start(ctx); err != nil {
-		return fmt.Errorf("correlator start: %w", err)
-	}
-	defer cor.Stop()
+	// stopCorrelator is called exactly once, however runServe exits: inline,
+	// in the right relative position, by foundationStopSequence on the
+	// normal shutdown path below, or — for every earlier return between here
+	// and there (a receivers/MCP wiring error, etc.) — by this defer acting
+	// as the safety net it always has been. sync.Once makes it safe to be
+	// both.
+	var corStopOnce sync.Once
+	stopCorrelator := func() { corStopOnce.Do(cor.Stop) }
+	defer stopCorrelator()
+
+	// The durable Situation foundation runtime (Task 8): the dispatch and
+	// input workers Tasks 6-7 built, plus the Reconstructor that converges
+	// durable state before either worker, or Receivers, ever runs. owner is
+	// this process's own lease identity, minted once.
+	owner := "alertint-" + uuid.NewString()
+	rt := newFoundationRuntime(st, cor, owner, logger)
 
 	// Probe enabled integrations in the background: quickly (with backoff)
 	// while one is failing — at startup a co-deployed dependency may still
@@ -393,8 +408,40 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	// Results are cached for GET /health.
 	healthReg := buildHealthChecks(cfg, prom, logSrc, sentryClient, zbxClient)
 	go healthReg.Watch(ctx, logger)
-	recvSrv, recvErrCh, err := startReceivers(cfg, st, auditor, cor, healthReg, llmHealth, logger)
-	if err != nil {
+
+	var recvSrv *http.Server
+	var recvErrCh <-chan error
+	startupSeq := foundationSequence{
+		reconstruct: func(ctx context.Context) error {
+			report, err := rt.Reconstruct(ctx)
+			if err != nil {
+				return fmt.Errorf("situation foundation reconstruction: %w", err)
+			}
+			logger.Info("situation foundation reconstructed",
+				slog.Int64("alert_dispatch_leases_recovered", report.RecoveredLeases.AlertDispatches),
+				slog.Int64("situation_input_leases_recovered", report.RecoveredLeases.SituationInputs),
+				slog.Int64("situation_leases_recovered", report.RecoveredLeases.Situations),
+				slog.Int("deliveries_replayed", report.ReplayedDeliveries),
+				slog.Int("inputs_replayed", report.ReplayedInputs),
+				slog.Int("groups_represented", report.RepresentedGroups),
+				slog.Int("incidents_represented", report.RepresentedIncidents),
+			)
+			return nil
+		},
+		startCorrelator: cor.Start,
+		startInputWorker: func(ctx context.Context) {
+			rt.inputs.Start(ctx)
+		},
+		startDispatchWorker: func(ctx context.Context) {
+			rt.dispatch.Start(ctx)
+		},
+		startReceivers: func() error {
+			var err error
+			recvSrv, recvErrCh, err = startReceivers(cfg, st, auditor, healthReg, llmHealth, rt.WakeDispatch, logger)
+			return err
+		},
+	}
+	if err := startupSeq.run(ctx); err != nil {
 		return err
 	}
 
@@ -420,11 +467,30 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), ingress.DefaultShutdownTimeout)
 	defer cancel()
-	if recvSrv != nil {
-		if err := recvSrv.Shutdown(shutdownCtx); err != nil {
-			logger.Error("receivers graceful shutdown failed", slog.String("err", err.Error()))
-		}
+
+	// Receivers, then the dispatch worker, then the input worker, then the
+	// Correlator: Receivers stopping first means no new inbound work can be
+	// durably accepted; the two queue workers stopping next means nothing
+	// already durably queued goes unclaimed mid-drain; the Correlator
+	// stopping last — via stopCorrelator, the same sync.Once-guarded call
+	// the defer above falls back to on every other exit path — means it
+	// keeps serving fixed-window expiry and Triage retry for exactly as
+	// long as anything upstream could still be handing it work.
+	stopSeq := foundationStopSequence{
+		stopReceivers: func() error {
+			if recvSrv == nil {
+				return nil
+			}
+			return recvSrv.Shutdown(shutdownCtx)
+		},
+		stopDispatchWorker: rt.dispatch.Stop,
+		stopInputWorker:    rt.inputs.Stop,
+		stopCorrelator:     stopCorrelator,
 	}
+	if err := stopSeq.run(shutdownCtx); err != nil {
+		logger.Error("situation foundation shutdown failed", slog.String("err", err.Error()))
+	}
+
 	if mcpHTTPSrv != nil {
 		if err := mcpHTTPSrv.Shutdown(shutdownCtx); err != nil {
 			logger.Error("MCP graceful shutdown failed", slog.String("err", err.Error()))
@@ -486,17 +552,19 @@ func pruneChangesAtStartup(ctx context.Context, cfg *config.Config, st *store.St
 
 // startReceivers starts the inbound webhook host when at least one receiver is
 // enabled. The host also serves GET /health. Returns (nil, nil, nil) when no
-// receiver is enabled — the nil error channel never fires in runServe's select.
-func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor, cor *correlator.Correlator, healthReg *health.Registry, llmHealth ingress.LLMHealthReader, logger *slog.Logger) (*http.Server, <-chan error, error) {
+// receiver is enabled — the nil error channel never fires in runServe's
+// select. wake is the durable dispatch worker's wake callback
+// (foundationRuntime.WakeDispatch) — a latency optimization only, safe to
+// pass nil (both Alertmanager and Zabbix receivers already tolerate a nil
+// DeliveryWake): the dispatch worker polls its durable queue regardless.
+func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor, healthReg *health.Registry, llmHealth ingress.LLMHealthReader, wake ingress.DeliveryWake, logger *slog.Logger) (*http.Server, <-chan error, error) {
 	var receivers []ingress.Receiver
 	if cfg.Alertmanager.Enabled {
 		token, err := cfg.WebhookToken()
 		if err != nil {
 			return nil, nil, err
 		}
-		// wake is nil until Task 8 wires the durable dispatch worker's wake
-		// callback; the receiver only durably persists deliveries here.
-		receivers = append(receivers, ingress.NewAlertReceiver(st, token, nil, logger))
+		receivers = append(receivers, ingress.NewAlertReceiver(st, token, wake, logger))
 	}
 	if cfg.Changes.Ingress.Enabled {
 		token, err := cfg.ChangesWebhookToken()
@@ -510,9 +578,7 @@ func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor,
 		if err != nil {
 			return nil, nil, err
 		}
-		// wake is nil until Task 8 wires the durable dispatch worker's wake
-		// callback; the receiver only durably persists deliveries here.
-		receivers = append(receivers, ingress.NewZabbixReceiver(st, token, nil, logger))
+		receivers = append(receivers, ingress.NewZabbixReceiver(st, token, wake, logger))
 	}
 
 	if len(receivers) == 0 {
