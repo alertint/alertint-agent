@@ -331,6 +331,28 @@ func TestUnrepresentedOperationalIncidentsIncludesEveryOperationalStatus(t *test
 	attachDeliveryToIncident(t, st, "inc-resolved-settled-ledger", "d-settled-firing", base)
 	attachDeliveryToIncident(t, st, "inc-resolved-settled-ledger", "d-settled-resolved", base.Add(time.Minute))
 
+	// Resolved, multi-member, PARTIALLY settled per the ledger: member A has
+	// both a firing delivery and a later resolved delivery for its own
+	// alert_id (properly ledger-resolved); member B has only ever been
+	// recorded firing — never ledger-resolved — even though incidents.status
+	// reached 'resolved' anyway (reachable via the legacy,
+	// ledger-independent checkAllAlertsResolved/MarkIncidentResolved path,
+	// which only checks the mutable alerts.status column). Included: a
+	// table-wide (rather than per-alert_id) "has some resolved delivery"
+	// check would let member A's unrelated resolved row wrongly mask member
+	// B's state, which the ledger never recorded at all.
+	if _, err := st.AcceptDeliveries(ctx, []DeliveryInput{
+		deliveryFixture("d-partial-a-firing", "fp-partial-a", base),
+		resolvedDeliveryFixture("d-partial-a-resolved", "fp-partial-a", base.Add(time.Minute)),
+		deliveryFixture("d-partial-b-firing", "fp-partial-b", base),
+	}); err != nil {
+		t.Fatalf("accept partially-settled multi-member deliveries: %v", err)
+	}
+	insertRawIncident(t, st, "inc-resolved-partial-member", "group-resolved-partial-member", "resolved", base, base)
+	attachDeliveryToIncident(t, st, "inc-resolved-partial-member", "d-partial-a-firing", base)
+	attachDeliveryToIncident(t, st, "inc-resolved-partial-member", "d-partial-a-resolved", base.Add(time.Minute))
+	attachDeliveryToIncident(t, st, "inc-resolved-partial-member", "d-partial-b-firing", base)
+
 	// Already represented: excluded regardless of status.
 	insertRawIncident(t, st, "inc-already-represented", "group-already-represented", "ready", base, base)
 	seedSituationForMembership(t, st, "sit-already", "group-already-represented", base)
@@ -341,7 +363,7 @@ func TestUnrepresentedOperationalIncidentsIncludesEveryOperationalStatus(t *test
 		t.Fatalf("UnrepresentedOperationalIncidents: %v", err)
 	}
 
-	want := []string{"inc-analyzed", "inc-collecting", "inc-failed", "inc-processing", "inc-ready", "inc-resolved-unsettled"}
+	want := []string{"inc-analyzed", "inc-collecting", "inc-failed", "inc-processing", "inc-ready", "inc-resolved-partial-member", "inc-resolved-unsettled"}
 	gotIDs := sortedIncidentIDs(got)
 	if len(gotIDs) != len(want) {
 		t.Fatalf("got %v, want %v", gotIDs, want)

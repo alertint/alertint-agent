@@ -126,14 +126,20 @@ func execRowsAffected(ctx context.Context, tx *sql.Tx, query string, args ...any
 // migration 0001 already supports it and excluding it would hide
 // triage-exhausted operational state from the Situation foundation. A
 // resolved Incident represents only if the durable delivery ledger itself
-// never recorded its resolution: it has at least one attached firing
-// delivery and NO attached resolved delivery at all. alert_deliveries is an
-// append-only ledger (a properly resolved Incident keeps BOTH its original
-// firing row and a later resolved one), so "has some firing delivery"
-// alone is not enough to prove the ledger never witnessed the resolution —
-// it must also have zero resolved deliveries, or a normally-settled
-// Incident (firing row followed by a resolved row) would be wrongly swept
-// back into an active Situation.
+// never recorded EVERY member's resolution: it has at least one attached
+// firing delivery whose own alert_id has no attached resolved delivery for
+// that SAME alert_id. This check is per-member (per alert_id), not
+// per-Incident, on purpose — alert_deliveries is an append-only ledger, so
+// a properly resolved member keeps BOTH its original firing row and a
+// later resolved one, but a multi-member Incident can have one member
+// fully ledger-resolved while another was only ever recorded firing (e.g.
+// incidents.status reached 'resolved' via the legacy,
+// ledger-independent checkAllAlertsResolved/MarkIncidentResolved path,
+// which only checks the mutable alerts.status column — exactly the
+// pre-cutover historical state this mechanism exists to reconcile). A
+// table-wide "the Incident has some resolved delivery somewhere" check
+// would let one settled member's resolved row mask a sibling member whose
+// resolution the ledger never recorded at all.
 const unrepresentedOperationalIncidentsQuery = `
 SELECT i.id, i.group_key, i.first_alert_at, i.last_alert_at
 FROM incidents i
@@ -145,11 +151,12 @@ WHERE NOT EXISTS (SELECT 1 FROM situation_incidents si WHERE si.incident_id = i.
             SELECT 1 FROM incident_alert_deliveries iad
             JOIN alert_deliveries ad ON ad.id = iad.delivery_id
             WHERE iad.incident_id = i.id AND ad.status = 'firing'
-        )
-        AND NOT EXISTS (
-            SELECT 1 FROM incident_alert_deliveries iad
-            JOIN alert_deliveries ad ON ad.id = iad.delivery_id
-            WHERE iad.incident_id = i.id AND ad.status = 'resolved'
+              AND NOT EXISTS (
+                  SELECT 1 FROM incident_alert_deliveries iad2
+                  JOIN alert_deliveries ad2 ON ad2.id = iad2.delivery_id
+                  WHERE iad2.incident_id = i.id AND ad2.status = 'resolved'
+                    AND ad2.alert_id = ad.alert_id
+              )
         ))
   )
 ORDER BY i.group_key ASC, i.id ASC`
