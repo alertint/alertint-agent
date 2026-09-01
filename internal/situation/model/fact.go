@@ -45,6 +45,17 @@ type Fact struct {
 	ObservedAt   time.Time        `json:"observed_at"`
 }
 
+// MarshalJSON canonicalizes EvidenceRefs to [] before marshaling: a
+// nil-constructed Fact (e.g. json.RawMessage decoded from a persisted
+// record, or a zero-value struct literal) must never serialize
+// evidence_refs as JSON null.
+func (f Fact) MarshalJSON() ([]byte, error) {
+	type factAlias Fact
+	a := factAlias(f)
+	a.EvidenceRefs = canonicalizeSlice(a.EvidenceRefs)
+	return json.Marshal(a)
+}
+
 // ReasonCandidate is one deterministic Sufficient-reason candidate offered
 // in a controller Snapshot. The model may select and explain only an
 // eligible candidate already present here — it cannot invent a reason.
@@ -56,4 +67,14 @@ type ReasonCandidate struct {
 	PredicateVersion   int      `json:"predicate_version"`
 	EvidenceRefs       []string `json:"evidence_refs"`
 	DeterministicFloor bool     `json:"deterministic_floor"`
+}
+
+// MarshalJSON canonicalizes EvidenceRefs to [] before marshaling: a
+// nil-constructed ReasonCandidate must never serialize evidence_refs as
+// JSON null.
+func (r ReasonCandidate) MarshalJSON() ([]byte, error) {
+	type reasonCandidateAlias ReasonCandidate
+	a := reasonCandidateAlias(r)
+	a.EvidenceRefs = canonicalizeSlice(a.EvidenceRefs)
+	return json.Marshal(a)
 }

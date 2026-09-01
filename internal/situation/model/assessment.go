@@ -3,6 +3,7 @@
 package model
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -288,6 +289,16 @@ func (r SufficientReason) Validate() error {
 	return nil
 }
 
+// MarshalJSON canonicalizes EvidenceRefs to [] before marshaling: a
+// nil-constructed SufficientReason must never serialize evidence_refs as
+// JSON null.
+func (r SufficientReason) MarshalJSON() ([]byte, error) {
+	type sufficientReasonAlias SufficientReason
+	a := sufficientReasonAlias(r)
+	a.EvidenceRefs = canonicalizeSlice(a.EvidenceRefs)
+	return json.Marshal(a)
+}
+
 // Limitation is one bounded, closed-code caveat attached to an Assessment,
 // e.g. {"code": "semantic_assessment_unavailable", "detail": "..."}.
 type Limitation struct {
@@ -316,6 +327,16 @@ type ActionContract struct {
 	NextUpdateAt           *time.Time      `json:"next_update_at"`
 	NextUpdateOn           []NextUpdateOn  `json:"next_update_on"`
 	WaitReason             *WaitReason     `json:"wait_reason"`
+}
+
+// MarshalJSON canonicalizes NextUpdateOn to [] before marshaling: a
+// terminal (or nil-constructed) ActionContract must never serialize
+// next_update_on as JSON null.
+func (c ActionContract) MarshalJSON() ([]byte, error) {
+	type actionContractAlias ActionContract
+	a := actionContractAlias(c)
+	a.NextUpdateOn = canonicalizeSlice(a.NextUpdateOn)
+	return json.Marshal(a)
 }
 
 // validate checks ActionContract's closed codes, the next_actor/action
@@ -404,14 +425,27 @@ type Assessment struct {
 	Cadence          Cadence           `json:"cadence"`
 }
 
+// MarshalJSON canonicalizes Limitations to [] before marshaling: a
+// nil-constructed Assessment must never serialize limitations as JSON
+// null. The nested ActionContract and SufficientReason canonicalize their
+// own slice fields via their own MarshalJSON methods.
+func (a Assessment) MarshalJSON() ([]byte, error) {
+	type assessmentAlias Assessment
+	out := assessmentAlias(a)
+	out.Limitations = canonicalizeSlice(out.Limitations)
+	return json.Marshal(out)
+}
+
 // Validate checks that every Assessment field carries a known closed value
 // and that the Operator contract is internally consistent: closed
-// actor/action/status/next_update_on/wait_reason codes, and a nonterminal
+// actor/action/status/next_update_on/wait_reason codes, a nonterminal
 // contract with a future next_update_at versus a terminal one with neither
-// update field. now anchors the "future" check. This is a shape/consistency
-// check only — evidence authority, controller-derived contract/cadence
-// values, and stale-input validation are Task 5's job
-// (ValidateAssessmentProposal, DeriveActionContract, DeriveCadence).
+// update field, and a terminal Lifecycle carrying Cadence("") versus a
+// nonterminal one requiring a non-empty Cadence. now anchors the "future"
+// check. This is a shape/consistency check only — evidence authority,
+// controller-derived contract/cadence values, and stale-input validation
+// are Task 5's job (ValidateAssessmentProposal, DeriveActionContract,
+// DeriveCadence).
 func (a Assessment) Validate(now time.Time) error {
 	if a.SchemaVersion != AssessmentSchemaVersion {
 		return fmt.Errorf("assessment: schema_version %d unsupported (want %d)", a.SchemaVersion, AssessmentSchemaVersion)
@@ -450,7 +484,20 @@ func (a Assessment) Validate(now time.Time) error {
 			return fmt.Errorf("assessment: limitations[%d]: %w", i, err)
 		}
 	}
-	if err := a.ActionContract.validate(now, a.Lifecycle.Terminal()); err != nil {
+
+	terminal := a.Lifecycle.Terminal()
+
+	// Cadence terminal/nonterminal shape: "" is the only legal value for a
+	// terminal Assessment (no future reconsideration is ever scheduled), and
+	// a nonterminal Assessment must always carry a live cadence.
+	switch {
+	case terminal && a.Cadence != Cadence(""):
+		return fmt.Errorf("assessment: terminal assessment must not set cadence, got %q", a.Cadence)
+	case !terminal && a.Cadence == Cadence(""):
+		return errors.New("assessment: nonterminal assessment requires a cadence")
+	}
+
+	if err := a.ActionContract.validate(now, terminal); err != nil {
 		return fmt.Errorf("assessment: %w", err)
 	}
 	return nil
@@ -469,6 +516,16 @@ type AssessmentProposal struct {
 	Attention        Attention         `json:"attention"`
 	SufficientReason *SufficientReason `json:"sufficient_reason"`
 	Limitations      []Limitation      `json:"limitations"`
+}
+
+// MarshalJSON canonicalizes Limitations to [] before marshaling: a
+// nil-constructed AssessmentProposal must never serialize limitations as
+// JSON null.
+func (p AssessmentProposal) MarshalJSON() ([]byte, error) {
+	type assessmentProposalAlias AssessmentProposal
+	out := assessmentProposalAlias(p)
+	out.Limitations = canonicalizeSlice(out.Limitations)
+	return json.Marshal(out)
 }
 
 // Validate checks that every AssessmentProposal field carries a known

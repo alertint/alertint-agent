@@ -4,6 +4,7 @@ package model
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -524,4 +525,141 @@ func TestLimitationValidateRequiresCode(t *testing.T) {
 	if err := (Limitation{Detail: "no code"}).Validate(); err == nil {
 		t.Fatal("want error for missing code, got nil")
 	}
+}
+
+// requireJSONArrayField fails the test unless key in raw is present and
+// serialized as a JSON array (empty or not) — never absent, never null.
+func requireJSONArrayField(t *testing.T, raw []byte, key string) {
+	t.Helper()
+	var asMap map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &asMap); err != nil {
+		t.Fatalf("unmarshal to map: %v\nraw: %s", err, raw)
+	}
+	field, present := asMap[key]
+	if !present {
+		t.Fatalf("missing key %q in %s", key, raw)
+	}
+	trimmed := strings.TrimSpace(string(field))
+	if trimmed == "null" {
+		t.Fatalf("field %q must not serialize as null, got %s (full: %s)", key, trimmed, raw)
+	}
+	if !strings.HasPrefix(trimmed, "[") {
+		t.Fatalf("field %q must serialize as a JSON array, got %s (full: %s)", key, trimmed, raw)
+	}
+}
+
+// TestNilSlicesCanonicalizeToEmptyJSONArray proves every persisted slice
+// field named by the review finding marshals as JSON [] rather than null
+// when the enclosing struct is nil-constructed (zero value or a literal
+// that never populated the slice) — matching spec.md's Assessment contract
+// ground truth, which shows "next_update_on": [] and "limitations": []
+// and never null.
+func TestNilSlicesCanonicalizeToEmptyJSONArray(t *testing.T) {
+	t.Run("Fact.EvidenceRefs", func(t *testing.T) {
+		raw, err := json.Marshal(Fact{ID: "fact-1"})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		requireJSONArrayField(t, raw, "evidence_refs")
+	})
+
+	t.Run("ReasonCandidate.EvidenceRefs", func(t *testing.T) {
+		raw, err := json.Marshal(ReasonCandidate{ID: "reason-1"})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		requireJSONArrayField(t, raw, "evidence_refs")
+	})
+
+	t.Run("SufficientReason.EvidenceRefs standalone", func(t *testing.T) {
+		raw, err := json.Marshal(SufficientReason{Code: "c", CandidateID: "cand-1"})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		requireJSONArrayField(t, raw, "evidence_refs")
+	})
+
+	t.Run("SufficientReason.EvidenceRefs nested in Assessment", func(t *testing.T) {
+		now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+		a := fullAssessment(now)
+		a.SufficientReason = &SufficientReason{Code: "c", CandidateID: "cand-1"}
+		raw, err := json.Marshal(a)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var asMap map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &asMap); err != nil {
+			t.Fatalf("unmarshal to map: %v", err)
+		}
+		requireJSONArrayField(t, asMap["sufficient_reason"], "evidence_refs")
+	})
+
+	t.Run("ActionContract.NextUpdateOn standalone", func(t *testing.T) {
+		raw, err := json.Marshal(ActionContract{})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		requireJSONArrayField(t, raw, "next_update_on")
+	})
+
+	t.Run("Assessment.Limitations", func(t *testing.T) {
+		raw, err := json.Marshal(Assessment{})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		requireJSONArrayField(t, raw, "limitations")
+	})
+
+	t.Run("Assessment.ActionContract.NextUpdateOn nested", func(t *testing.T) {
+		raw, err := json.Marshal(Assessment{})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var asMap map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &asMap); err != nil {
+			t.Fatalf("unmarshal to map: %v", err)
+		}
+		requireJSONArrayField(t, asMap["action_contract"], "next_update_on")
+	})
+
+	t.Run("AssessmentProposal.Limitations", func(t *testing.T) {
+		raw, err := json.Marshal(AssessmentProposal{})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		requireJSONArrayField(t, raw, "limitations")
+	})
+}
+
+// TestAssessmentCadenceTerminalConsistency proves Assessment.Validate
+// enforces the Cadence doc comment's claim in both directions: "" is the
+// only legal Cadence for a terminal Assessment, and a nonterminal
+// Assessment must always carry a non-empty, valid Cadence.
+func TestAssessmentCadenceTerminalConsistency(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+
+	for _, terminal := range []Lifecycle{LifecycleRecovered, LifecycleClosedUnknown} {
+		t.Run("terminal "+string(terminal)+" with non-empty cadence is rejected", func(t *testing.T) {
+			a := fullAssessment(now)
+			a.Lifecycle = terminal
+			a.ActionContract.NextUpdateAt = nil
+			a.ActionContract.NextUpdateOn = nil
+			a.ActionContract.AlertINTAction = nil
+			a.ActionContract.AlertINTStatus = nil
+			a.ActionContract.NextActor = NextActorNone
+			a.Cadence = CadenceFast // deliberately not reset to "" — the bug under test
+			if err := a.Validate(now); err == nil {
+				t.Fatal("want error for terminal assessment carrying non-empty cadence, got nil")
+			}
+		})
+	}
+
+	t.Run("nonterminal with empty cadence is rejected", func(t *testing.T) {
+		a := fullAssessment(now)
+		a.Lifecycle = LifecycleActive
+		a.Cadence = Cadence("")
+		if err := a.Validate(now); err == nil {
+			t.Fatal("want error for nonterminal assessment carrying empty cadence, got nil")
+		}
+	})
 }

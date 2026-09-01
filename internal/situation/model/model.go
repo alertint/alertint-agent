@@ -26,6 +26,19 @@ func validateEnum[T ~string](kind string, v T, allowed ...T) error {
 	return fmt.Errorf("model: %s: unknown value %q", kind, v)
 }
 
+// canonicalizeSlice returns s unchanged when non-nil, or a non-nil empty
+// slice of the same element type when s is nil. It backs every custom
+// MarshalJSON method in this package that must serialize a possibly-nil
+// persisted slice field as JSON [] rather than null, per the Assessment
+// contract ground truth (next_update_on, limitations, evidence_refs are
+// always arrays, never null).
+func canonicalizeSlice[T any](s []T) []T {
+	if s == nil {
+		return []T{}
+	}
+	return s
+}
+
 // Lifecycle is controller-owned; terminal states never reopen.
 type Lifecycle string
 
