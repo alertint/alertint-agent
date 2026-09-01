@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adaptive-reasoning models (e.g. Qwen3.8: `xhigh`/`medium`/`low`). Passed
   through unvalidated since the accepted vocabulary is model-specific; empty
   (default) omits the field, leaving the model/server default in effect.
+  Requires `llm.thinking: true` — it sizes the thinking budget, so pairing it
+  with thinking disabled is rejected at config load.
 
 ## [0.13.5] - 2026-08-28
 
