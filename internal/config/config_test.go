@@ -1008,6 +1008,21 @@ func TestValidateLLMOpenAICompatible(t *testing.T) {
 		}
 	})
 
+	t.Run("reasoning_effort requires thinking true", func(t *testing.T) {
+		c := base()
+		c.LLM.ReasoningEffort = "low"
+		c.LLM.Thinking = false
+		err := c.ValidateOffline()
+		if err == nil || !strings.Contains(err.Error(), "llm.reasoning_effort requires llm.thinking: true") {
+			t.Fatalf("want reasoning_effort-requires-thinking error, got: %v", err)
+		}
+
+		c.LLM.Thinking = true
+		if err := c.ValidateOffline(); err != nil {
+			t.Fatalf("reasoning_effort with thinking:true must pass, got: %v", err)
+		}
+	})
+
 	t.Run("base_url required", func(t *testing.T) {
 		c := base()
 		c.LLM.BaseURL = ""
@@ -1155,6 +1170,12 @@ func TestValidateLLMAnthropicRejectsProviderScopedFields(t *testing.T) {
 		t.Fatalf("thinking:true must be rejected for anthropic, got: %v", err)
 	}
 	c.LLM.Thinking = false
+
+	c.LLM.ReasoningEffort = "low"
+	if err := c.ValidateOffline(); err == nil || !strings.Contains(err.Error(), "llm.reasoning_effort") {
+		t.Fatalf("reasoning_effort must be rejected for anthropic, got: %v", err)
+	}
+	c.LLM.ReasoningEffort = ""
 
 	if err := c.ValidateOffline(); err != nil {
 		t.Fatalf("clean anthropic config must pass: %v", err)

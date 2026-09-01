@@ -330,6 +330,19 @@ type LLMConfig struct {
 	// it requires raising llm.max_tokens to 8–16k. Rejected (when true) for
 	// "anthropic", which pins thinking disabled in the client.
 	Thinking bool `yaml:"thinking"`
+	// ReasoningEffort opts a model with adaptive-reasoning chat-template
+	// support (Qwen3-class) into a specific depth on "openai-compatible":
+	// every request carries chat_template_kwargs {"reasoning_effort":
+	// <value>} alongside enable_thinking. Empty (default) omits the key
+	// entirely, leaving the model/server default in effect. The accepted
+	// values are model-specific (e.g. Qwen3.8 accepts "xhigh", "medium",
+	// "low") so this is passed through unvalidated, same as Thinking's
+	// boolean carries no value-semantics check. Rejected (when non-empty)
+	// for "anthropic", which has no equivalent chat-template mechanism.
+	// Requires Thinking true: it sizes the thinking budget, so pairing it
+	// with enable_thinking=false sends a contradictory pin the model
+	// silently ignores rather than a config mistake surfaced at load.
+	ReasoningEffort string `yaml:"reasoning_effort"`
 	// TimeoutSeconds is the whole-request HTTP timeout for either provider.
 	// Default 120 (the previously hardcoded client default). Local endpoints
 	// under storm concurrency typically need ~300.
@@ -761,6 +774,9 @@ func (c *Config) validateLLM() []string {
 		if c.LLM.Thinking {
 			errs = append(errs, `llm.thinking is only valid for provider "openai-compatible" (the anthropic client always disables thinking)`)
 		}
+		if strings.TrimSpace(c.LLM.ReasoningEffort) != "" {
+			errs = append(errs, `llm.reasoning_effort is only valid for provider "openai-compatible" (the anthropic client has no chat-template mechanism)`)
+		}
 	case "openai-compatible":
 		errs = append(errs, c.validateLLMBaseURL()...)
 		switch c.LLM.ResponseFormat {
@@ -768,6 +784,9 @@ func (c *Config) validateLLM() []string {
 			// "" means the default (json_object), resolved by normalize on load.
 		default:
 			errs = append(errs, fmt.Sprintf("llm.response_format %q invalid (use \"json_object\" or \"off\")", c.LLM.ResponseFormat))
+		}
+		if strings.TrimSpace(c.LLM.ReasoningEffort) != "" && !c.LLM.Thinking {
+			errs = append(errs, "llm.reasoning_effort requires llm.thinking: true (it sizes the thinking budget)")
 		}
 	case "":
 		errs = append(errs, "llm.provider is required")

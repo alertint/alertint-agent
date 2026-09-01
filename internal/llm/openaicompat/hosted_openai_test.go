@@ -41,7 +41,7 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { retu
 
 func TestHostedOpenAIOmitsChatTemplateKwargs(t *testing.T) {
 	var gotBody map[string]any
-	c := New(Config{BaseURL: "https://api.openai.com", Model: "gpt-4.1"}, nil, nil)
+	c := New(Config{BaseURL: "https://api.openai.com", Model: "gpt-4.1", Thinking: true, ReasoningEffort: "low"}, nil, nil)
 	c.http.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
 			t.Fatalf("decode request body: %v", err)

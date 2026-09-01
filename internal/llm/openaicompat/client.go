@@ -67,6 +67,11 @@ type Config struct {
 	ResponseFormat string
 	// Thinking is the value sent as chat_template_kwargs.enable_thinking.
 	Thinking bool
+	// ReasoningEffort, when non-empty, is sent as
+	// chat_template_kwargs.reasoning_effort alongside enable_thinking.
+	// Model-specific vocabulary (e.g. Qwen3.8: "xhigh", "medium", "low") —
+	// passed through as-is, no value validation here.
+	ReasoningEffort string
 	// BaseRetryDelay is the initial backoff before the first retry.
 	// Defaults to 1 second. Tests may set this much smaller.
 	BaseRetryDelay time.Duration
@@ -254,6 +259,9 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt
 	}
 	if c.pinChatTemplateKwargs {
 		body.ChatTemplateKwargs = map[string]any{"enable_thinking": c.cfg.Thinking}
+		if c.cfg.ReasoningEffort != "" {
+			body.ChatTemplateKwargs["reasoning_effort"] = c.cfg.ReasoningEffort
+		}
 	}
 	if c.cfg.ResponseFormat != "off" {
 		body.ResponseFormat = &responseFormat{Type: "json_object"}
