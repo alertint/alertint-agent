@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alertint/alertint-agent/internal/store"
+	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
 // fixedClock is a deterministic WorkerConfig.Now for tests that must not
@@ -27,23 +27,23 @@ func fixedClock() time.Time {
 type inputStoreSpy struct {
 	mu sync.Mutex
 
-	claims   []store.SituationClaim
-	claimFn  func(call int) ([]store.SituationClaim, error)
+	claims   []model.SituationClaim
+	claimFn  func(call int) ([]model.SituationClaim, error)
 	claimErr error
 
 	claimCalls int
 
-	applyFn func(claim store.SituationClaim) error
+	applyFn func(claim model.SituationClaim) error
 
 	retryCalled   bool
-	retryClaim    store.SituationClaim
+	retryClaim    model.SituationClaim
 	retryClass    string
 	retryAt       time.Time
 	retryTerminal bool
 	retryErr      error
 }
 
-func (s *inputStoreSpy) ClaimSituationInputs(_ context.Context, _ string, _ time.Time, _ time.Duration, _ int) ([]store.SituationClaim, error) {
+func (s *inputStoreSpy) ClaimSituationInputs(_ context.Context, _ string, _ time.Time, _ time.Duration, _ int) ([]model.SituationClaim, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.claimCalls++
@@ -58,14 +58,14 @@ func (s *inputStoreSpy) ClaimSituationInputs(_ context.Context, _ string, _ time
 	return out, nil
 }
 
-func (s *inputStoreSpy) ApplySituationInput(_ context.Context, claim store.SituationClaim) error {
+func (s *inputStoreSpy) ApplySituationInput(_ context.Context, claim model.SituationClaim) error {
 	if s.applyFn != nil {
 		return s.applyFn(claim)
 	}
 	return nil
 }
 
-func (s *inputStoreSpy) RetrySituationInput(_ context.Context, claim store.SituationClaim, class string, retryAt time.Time, terminal bool) error {
+func (s *inputStoreSpy) RetrySituationInput(_ context.Context, claim model.SituationClaim, class string, retryAt time.Time, terminal bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.retryCalled = true
@@ -76,14 +76,14 @@ func (s *inputStoreSpy) RetrySituationInput(_ context.Context, claim store.Situa
 	return s.retryErr
 }
 
-func (s *inputStoreSpy) setClaims(claims []store.SituationClaim) {
+func (s *inputStoreSpy) setClaims(claims []model.SituationClaim) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.claims = claims
 }
 
-func inputClaim(id string, attempt int) store.SituationClaim {
-	c := store.SituationClaim{AttemptCount: attempt}
+func inputClaim(id string, attempt int) model.SituationClaim {
+	c := model.SituationClaim{AttemptCount: attempt}
 	c.ID = id
 	return c
 }
@@ -93,7 +93,7 @@ func inputClaim(id string, attempt int) store.SituationClaim {
 // ----------------------------------------------------------------------
 
 func TestInputWorkerRetriesTransientFailure(t *testing.T) {
-	st := &inputStoreSpy{claims: []store.SituationClaim{inputClaim("i1", 1)}, applyFn: func(store.SituationClaim) error { return errors.New("temporary") }}
+	st := &inputStoreSpy{claims: []model.SituationClaim{inputClaim("i1", 1)}, applyFn: func(model.SituationClaim) error { return errors.New("temporary") }}
 	w := NewInputWorker(st, WorkerConfig{Owner: "worker-a", Now: fixedClock}, nil)
 	if handled, err := w.RunOnce(context.Background()); err != nil || handled != 1 {
 		t.Fatalf("run = %d, %v", handled, err)
@@ -104,7 +104,7 @@ func TestInputWorkerRetriesTransientFailure(t *testing.T) {
 }
 
 func TestInputWorkerSuccessNeedsNoCompletionCall(t *testing.T) {
-	st := &inputStoreSpy{claims: []store.SituationClaim{inputClaim("i1", 1)}}
+	st := &inputStoreSpy{claims: []model.SituationClaim{inputClaim("i1", 1)}}
 	w := NewInputWorker(st, WorkerConfig{Owner: "worker-a", Now: fixedClock}, nil)
 
 	handled, err := w.RunOnce(context.Background())
@@ -117,7 +117,7 @@ func TestInputWorkerSuccessNeedsNoCompletionCall(t *testing.T) {
 }
 
 func TestInputWorkerNotFoundTerminatesWithoutRetry(t *testing.T) {
-	st := &inputStoreSpy{claims: []store.SituationClaim{inputClaim("i1", 1)}, applyFn: func(store.SituationClaim) error { return store.ErrNotFound }}
+	st := &inputStoreSpy{claims: []model.SituationClaim{inputClaim("i1", 1)}, applyFn: func(model.SituationClaim) error { return model.ErrNotFound }}
 	w := NewInputWorker(st, WorkerConfig{Owner: "worker-a", Now: fixedClock}, nil)
 
 	handled, err := w.RunOnce(context.Background())
@@ -130,7 +130,7 @@ func TestInputWorkerNotFoundTerminatesWithoutRetry(t *testing.T) {
 }
 
 func TestInputWorkerContextCancellationSkipsRetryWrite(t *testing.T) {
-	st := &inputStoreSpy{claims: []store.SituationClaim{inputClaim("i1", 1)}, applyFn: func(store.SituationClaim) error { return context.Canceled }}
+	st := &inputStoreSpy{claims: []model.SituationClaim{inputClaim("i1", 1)}, applyFn: func(model.SituationClaim) error { return context.Canceled }}
 	w := NewInputWorker(st, WorkerConfig{Owner: "worker-a", Now: fixedClock}, nil)
 
 	handled, err := w.RunOnce(context.Background())
@@ -146,11 +146,11 @@ func TestInputWorkerContextCancellationSkipsRetryWrite(t *testing.T) {
 }
 
 func TestInputWorkerLeaseLostSkipsRetryWrite(t *testing.T) {
-	st := &inputStoreSpy{claims: []store.SituationClaim{inputClaim("i1", 1)}, applyFn: func(store.SituationClaim) error { return store.ErrSituationLeaseLost }}
+	st := &inputStoreSpy{claims: []model.SituationClaim{inputClaim("i1", 1)}, applyFn: func(model.SituationClaim) error { return model.ErrSituationLeaseLost }}
 	w := NewInputWorker(st, WorkerConfig{Owner: "worker-a", Now: fixedClock}, nil)
 
 	handled, err := w.RunOnce(context.Background())
-	if !errors.Is(err, store.ErrSituationLeaseLost) {
+	if !errors.Is(err, model.ErrSituationLeaseLost) {
 		t.Fatalf("err = %v, want ErrSituationLeaseLost", err)
 	}
 	if handled != 0 {
@@ -162,7 +162,7 @@ func TestInputWorkerLeaseLostSkipsRetryWrite(t *testing.T) {
 }
 
 func TestInputWorkerEighthFailedClaimBecomesTerminal(t *testing.T) {
-	st := &inputStoreSpy{claims: []store.SituationClaim{inputClaim("i1", 8)}, applyFn: func(store.SituationClaim) error { return errors.New("still failing") }}
+	st := &inputStoreSpy{claims: []model.SituationClaim{inputClaim("i1", 8)}, applyFn: func(model.SituationClaim) error { return errors.New("still failing") }}
 	w := NewInputWorker(st, WorkerConfig{Owner: "worker-a", Now: fixedClock}, nil)
 
 	if _, err := w.RunOnce(context.Background()); err != nil {
@@ -174,7 +174,7 @@ func TestInputWorkerEighthFailedClaimBecomesTerminal(t *testing.T) {
 }
 
 func TestInputWorkerSeventhFailedClaimStaysRetryable(t *testing.T) {
-	st := &inputStoreSpy{claims: []store.SituationClaim{inputClaim("i1", 7)}, applyFn: func(store.SituationClaim) error { return errors.New("still failing") }}
+	st := &inputStoreSpy{claims: []model.SituationClaim{inputClaim("i1", 7)}, applyFn: func(model.SituationClaim) error { return errors.New("still failing") }}
 	w := NewInputWorker(st, WorkerConfig{Owner: "worker-a", Now: fixedClock}, nil)
 
 	if _, err := w.RunOnce(context.Background()); err != nil {
@@ -187,14 +187,14 @@ func TestInputWorkerSeventhFailedClaimStaysRetryable(t *testing.T) {
 
 func TestInputWorkerBackoffGrowsExponentially(t *testing.T) {
 	now := fixedClock()
-	st := &inputStoreSpy{claims: []store.SituationClaim{inputClaim("i1", 1)}, applyFn: func(store.SituationClaim) error { return errors.New("boom") }}
+	st := &inputStoreSpy{claims: []model.SituationClaim{inputClaim("i1", 1)}, applyFn: func(model.SituationClaim) error { return errors.New("boom") }}
 	w := NewInputWorker(st, WorkerConfig{Owner: "worker-a", Now: fixedClock}, nil)
 	if _, err := w.RunOnce(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	first := st.retryAt.Sub(now)
 
-	st.setClaims([]store.SituationClaim{inputClaim("i1", 2)})
+	st.setClaims([]model.SituationClaim{inputClaim("i1", 2)})
 	if _, err := w.RunOnce(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -207,7 +207,7 @@ func TestInputWorkerBackoffGrowsExponentially(t *testing.T) {
 
 func TestInputWorkerBackoffCappedAtFiveMinutes(t *testing.T) {
 	now := fixedClock()
-	st := &inputStoreSpy{claims: []store.SituationClaim{inputClaim("i1", 10)}, applyFn: func(store.SituationClaim) error { return errors.New("boom") }}
+	st := &inputStoreSpy{claims: []model.SituationClaim{inputClaim("i1", 10)}, applyFn: func(model.SituationClaim) error { return errors.New("boom") }}
 	// MaxAttempts raised so attempt 10 is still eligible for a scheduled
 	// retry (not yet forced terminal) and the cap itself is what's under test.
 	w := NewInputWorker(st, WorkerConfig{Owner: "worker-a", MaxAttempts: 20, Now: fixedClock}, nil)
@@ -244,19 +244,19 @@ func TestInputWorkerRunOnceReportsClaimError(t *testing.T) {
 
 func TestInputWorkerDrainContinuesUntilZero(t *testing.T) {
 	var applyCalls []string
-	rounds := [][]store.SituationClaim{
+	rounds := [][]model.SituationClaim{
 		{inputClaim("i1", 1), inputClaim("i2", 1)},
 		{inputClaim("i3", 1)},
 		{},
 	}
 	st := &inputStoreSpy{
-		claimFn: func(call int) ([]store.SituationClaim, error) {
+		claimFn: func(call int) ([]model.SituationClaim, error) {
 			if call-1 < len(rounds) {
 				return rounds[call-1], nil
 			}
 			return nil, nil
 		},
-		applyFn: func(claim store.SituationClaim) error {
+		applyFn: func(claim model.SituationClaim) error {
 			applyCalls = append(applyCalls, claim.ID)
 			return nil
 		},
@@ -315,8 +315,8 @@ func TestInputWorkerWakeIsNonBlocking(t *testing.T) {
 func TestInputWorkerStartRunsImmediatelyAndWakeTriggersAnotherRound(t *testing.T) {
 	appliedCh := make(chan string, 4)
 	st := &inputStoreSpy{
-		claims: []store.SituationClaim{inputClaim("i1", 1)},
-		applyFn: func(claim store.SituationClaim) error {
+		claims: []model.SituationClaim{inputClaim("i1", 1)},
+		applyFn: func(claim model.SituationClaim) error {
 			appliedCh <- claim.ID
 			return nil
 		},
@@ -338,7 +338,7 @@ func TestInputWorkerStartRunsImmediatelyAndWakeTriggersAnotherRound(t *testing.T
 		t.Fatal("timed out waiting for the initial round")
 	}
 
-	st.setClaims([]store.SituationClaim{inputClaim("i2", 1)})
+	st.setClaims([]model.SituationClaim{inputClaim("i2", 1)})
 	w.Wake()
 
 	select {
@@ -358,8 +358,8 @@ func TestInputWorkerStartRunsImmediatelyAndWakeTriggersAnotherRound(t *testing.T
 func TestInputWorkerStopWaitsForActiveRound(t *testing.T) {
 	var applied int32
 	st := &inputStoreSpy{
-		claims: []store.SituationClaim{inputClaim("i1", 1)},
-		applyFn: func(store.SituationClaim) error {
+		claims: []model.SituationClaim{inputClaim("i1", 1)},
+		applyFn: func(model.SituationClaim) error {
 			time.Sleep(30 * time.Millisecond)
 			atomic.AddInt32(&applied, 1)
 			return nil
@@ -381,8 +381,8 @@ func TestInputWorkerStopRespectsShutdownDeadline(t *testing.T) {
 	defer close(block)
 
 	st := &inputStoreSpy{
-		claims: []store.SituationClaim{inputClaim("i1", 1)},
-		applyFn: func(store.SituationClaim) error {
+		claims: []model.SituationClaim{inputClaim("i1", 1)},
+		applyFn: func(model.SituationClaim) error {
 			<-block
 			return nil
 		},
