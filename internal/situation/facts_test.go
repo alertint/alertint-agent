@@ -4,6 +4,7 @@ package situation
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 	"time"
 
@@ -526,5 +527,88 @@ func TestAssessmentBasisHashDTOIncludesValidatorAndSchemaVersion(t *testing.T) {
 	changedValidator.ValidatorVersion = 2
 	if canonicalDigest(base) == canonicalDigest(changedValidator) {
 		t.Fatal("validator_version change did not change digest")
+	}
+}
+
+// TestAssessmentBasisHashStableAcrossInputVersionWithEligibleFloorReason is
+// Task 5's fix for the carried-forward gap flagged in Task 4's report:
+// reasonCandidateID (reasons.go) bakes InputVersion into every candidate's
+// own ID, so AssessmentBasisHash previously could never equal itself across
+// two input versions whenever at least one reason was eligible — exactly the
+// cases RevalidateReuse exists to handle. This test drives EligibleReasons
+// for real (not synthetic ReasonCandidate literals) across two input
+// versions of the same otherwise-unchanged Situation and proves the basis
+// hash is now stable, while also proving the underlying candidate IDs really
+// do still differ across input versions (so the test is not vacuous).
+func TestAssessmentBasisHashStableAcrossInputVersionWithEligibleFloorReason(t *testing.T) {
+	in := baseSnapshotInput(t)
+	in.Deliveries = append([]Delivery{}, in.Deliveries...)
+	in.Deliveries[0].Severity = "critical"
+	in.Deliveries[0].Status = model.DeliveryStatusFiring
+
+	symptoms1 := deriveSymptoms(in.Deliveries)
+	class1 := DurationClass(elapsedDuration(in))
+	eligible1 := EligibleReasons(in, symptoms1, class1)
+	material1 := MaterialFactHash(in, symptoms1, class1)
+	h1 := AssessmentBasisHash(in, material1, eligible1)
+
+	bumped := in
+	bumped.Situation.InputVersion = in.Situation.InputVersion + 1
+	symptoms2 := deriveSymptoms(bumped.Deliveries)
+	class2 := DurationClass(elapsedDuration(bumped))
+	eligible2 := EligibleReasons(bumped, symptoms2, class2)
+	material2 := MaterialFactHash(bumped, symptoms2, class2)
+	h2 := AssessmentBasisHash(bumped, material2, eligible2)
+
+	if len(eligible1) != 1 || len(eligible2) != 1 || eligible1[0].Code != reasonCodeCriticalAnchor {
+		t.Fatalf("test fixture invariant violated: expected exactly one eligible critical_anchor candidate on each side, got %v / %v", eligible1, eligible2)
+	}
+	if eligible1[0].ID == eligible2[0].ID {
+		t.Fatal("test fixture invariant violated: reasonCandidateID must still differ across input versions (else this regression test is vacuous) — reasons.go's own InputVersion-scoping is untouched by this fix")
+	}
+	if material1 != material2 {
+		t.Fatal("test fixture invariant violated: material fact hash must stay stable across input version alone")
+	}
+	if h1 != h2 {
+		t.Fatal("AssessmentBasisHash changed across input versions with an unchanged eligible critical_anchor candidate — the carried-forward InputVersion-instability bug is not fixed")
+	}
+}
+
+// TestAssessmentBasisHashStableAcrossInputVersionWithEligibleNonFloorReason
+// is the same regression proof for duration_outlier — a non-floor candidate
+// whose EvidenceRefs (unlike critical_anchor's empty set) really do carry
+// input-version-scoped fact IDs (factIdentity bakes input_version into every
+// fact ID), the deeper wrinkle the Task 5 dispatch flagged explicitly.
+func TestAssessmentBasisHashStableAcrossInputVersionWithEligibleNonFloorReason(t *testing.T) {
+	in := baseSnapshotInput(t)
+	start := in.Situation.EffectiveStartedAt
+	in.Now = start.Add(10 * time.Hour) // far beyond p95/2*median of the fixture priors
+	in.PriorSituations = fiveShortPriorSituations(in.Situation.GroupKey, start)
+
+	symptoms1 := deriveSymptoms(in.Deliveries)
+	class1 := DurationClass(elapsedDuration(in))
+	eligible1 := EligibleReasons(in, symptoms1, class1)
+	material1 := MaterialFactHash(in, symptoms1, class1)
+	h1 := AssessmentBasisHash(in, material1, eligible1)
+
+	bumped := in
+	bumped.Situation.InputVersion = in.Situation.InputVersion + 1
+	symptoms2 := deriveSymptoms(bumped.Deliveries)
+	class2 := DurationClass(elapsedDuration(bumped))
+	eligible2 := EligibleReasons(bumped, symptoms2, class2)
+	material2 := MaterialFactHash(bumped, symptoms2, class2)
+	h2 := AssessmentBasisHash(bumped, material2, eligible2)
+
+	if len(eligible1) != 1 || len(eligible2) != 1 || eligible1[0].Code != reasonCodeDurationOutlier {
+		t.Fatalf("test fixture invariant violated: expected exactly one eligible duration_outlier candidate on each side, got %v / %v", eligible1, eligible2)
+	}
+	if eligible1[0].ID == eligible2[0].ID {
+		t.Fatal("test fixture invariant violated: reasonCandidateID must still differ across input versions (else this regression test is vacuous)")
+	}
+	if reflect.DeepEqual(eligible1[0].EvidenceRefs, eligible2[0].EvidenceRefs) {
+		t.Fatal("test fixture invariant violated: duration_outlier's own EvidenceRefs (fact IDs) must differ across input versions too — they bake in input_version via factIdentity")
+	}
+	if h1 != h2 {
+		t.Fatal("AssessmentBasisHash changed across input versions with an unchanged eligible duration_outlier candidate")
 	}
 }

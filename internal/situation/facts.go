@@ -36,8 +36,14 @@ const (
 	// shape did not change, but it embeds MaterialFactHash's output string
 	// directly, so a hash produced before this fix must never be silently
 	// treated as compatible with one produced after it.
-	materialFactHashSchemaVersion    = 2
-	assessmentBasisHashSchemaVersion = 2
+	materialFactHashSchemaVersion = 2
+
+	// assessmentBasisHashSchemaVersion is bumped to 3 (Task 5): the carried-
+	// forward InputVersion-instability bug documented on
+	// assessmentBasisReasonDTO is fixed by dropping that DTO's ID field. A
+	// hash produced under the old ID-bearing shape must never be silently
+	// treated as compatible with one produced under the fixed shape.
+	assessmentBasisHashSchemaVersion = 3
 
 	// assessmentValidatorVersion tracks Task 5's ValidateAssessmentProposal
 	// rule set. Task 4 has no validator of its own; this placeholder lets
@@ -642,11 +648,49 @@ func MaterialFactHash(in SnapshotInput, symptoms []Symptom, durationClass string
 	return canonicalDigest(dto)
 }
 
+// assessmentBasisReasonDTO deliberately omits ReasonCandidate.ID — Task 5's
+// carried-forward-gap fix. reasonCandidateID (reasons.go) hashes
+// {SchemaVersion, SituationID, InputVersion, Code, CatalogVersion,
+// PredicateVersion, DeterministicFloor, EvidenceRefs}: it still includes
+// InputVersion (and, through EvidenceRefs, fact IDs that are themselves
+// input-version-scoped via factIdentity), so for ANY Snapshot with at least
+// one eligible reason candidate — exactly the interesting cases,
+// critical_anchor or duration_outlier firing — the candidate's own ID
+// differs on every single input version even when nothing material actually
+// changed. Hashing that ID here would mean AssessmentBasisHash could never
+// equal itself across two input versions whenever a reason is eligible,
+// defeating RevalidateReuse's entire purpose in exactly the cases reuse
+// matters most (Task 4's MaterialFactHash already fixed the identical class
+// of bug for itself, across two rounds; this is the one place it survived).
+//
+// The fix hashes each candidate's stable semantic identity instead — Code,
+// CatalogVersion, PredicateVersion, and its own DeterministicFloor — which is
+// exactly what changes when the catalog or a predicate's proven result
+// actually changes, and nothing else. This does not silently drop
+// EvidenceRefs from the reuse guard: the material facts a candidate's
+// evidence cites are already covered by MaterialFactHash (embedded in
+// assessmentBasisHashDTO below), which changes whenever the underlying
+// symptom/duration/membership/Triage-outcome content a candidate depends on
+// actually changes. Including the candidate's own versioned evidence-ref ID
+// strings here on top of that would only reintroduce the same input-version
+// churn one level down (those ref strings bake in input_version via
+// factIdentity too) without adding any real reuse-safety signal
+// MaterialFactHash doesn't already provide — the identical reasoning
+// MaterialFactHash's own doc comment gives for why per-Incident materiality
+// is MembershipDigest alone, not the delivery-level IncidentInputDigest.
+//
+// This is a legitimate reading of spec.md's "eligible Sufficient-reason IDs
+// and their catalog/predicate versions": spec's own stated intent (the
+// "Assessment reuse across input versions" section) is that reuse across
+// input versions must be POSSIBLE when nothing material changed — a literal
+// ID inclusion would make it impossible whenever a reason is eligible, which
+// cannot be what "IDs" was meant to require. See the Task 5 report for the
+// full accounting of the alternatives considered.
 type assessmentBasisReasonDTO struct {
-	ID               string `json:"id"`
-	Code             string `json:"code"`
-	CatalogVersion   int    `json:"catalog_version"`
-	PredicateVersion int    `json:"predicate_version"`
+	Code               string `json:"code"`
+	CatalogVersion     int    `json:"catalog_version"`
+	PredicateVersion   int    `json:"predicate_version"`
+	DeterministicFloor bool   `json:"deterministic_floor"`
 }
 
 type assessmentBasisHashDTO struct {
@@ -661,16 +705,19 @@ type assessmentBasisHashDTO struct {
 }
 
 // AssessmentBasisHash hashes materialFactHash plus the broader reuse-guard
-// content spec.md names: eligible-reason IDs and their catalog/predicate
-// versions, relevant controller-owned lifecycle/Attention state, whether a
-// deterministic urgent floor is currently active, and Assessment
-// schema/validator versions.
+// content spec.md names: eligible-reason identity (code, catalog/predicate
+// version, and own deterministic-floor result — see assessmentBasisReasonDTO
+// for why this is the candidates' stable semantic identity rather than their
+// input-version-scoped opaque ID), relevant controller-owned
+// lifecycle/Attention state, whether a deterministic urgent floor is
+// currently active, and Assessment schema/validator versions.
 func AssessmentBasisHash(in SnapshotInput, materialFactHash string, eligible []model.ReasonCandidate) string {
 	reasons := make([]assessmentBasisReasonDTO, 0, len(eligible))
 	floor := false
 	for _, r := range eligible {
 		reasons = append(reasons, assessmentBasisReasonDTO{
-			ID: r.ID, Code: r.Code, CatalogVersion: r.CatalogVersion, PredicateVersion: r.PredicateVersion,
+			Code: r.Code, CatalogVersion: r.CatalogVersion, PredicateVersion: r.PredicateVersion,
+			DeterministicFloor: r.DeterministicFloor,
 		})
 		if r.DeterministicFloor {
 			floor = true
