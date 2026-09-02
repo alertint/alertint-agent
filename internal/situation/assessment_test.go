@@ -158,6 +158,43 @@ func TestValidateAssessmentProposalRejectsUnknownReasonID(t *testing.T) {
 	}
 }
 
+// TestValidateAssessmentProposalRejectsUnknownLimitationCode proves a
+// fabricated Limitation.Code (spec.md: capability absence "is never
+// represented as confirmed empty, healthy, or fetched" — a model inventing
+// e.g. "prometheus_confirmed_healthy" must not be accepted verbatim) is
+// rejected rather than stored as-is on an authoritative Assessment.
+func TestValidateAssessmentProposalRejectsUnknownLimitationCode(t *testing.T) {
+	snap := snapshotFor(t, baseSnapshotInput(t))
+	call := callFor(snap)
+	p := validPlainProposal()
+	p.Limitations = []model.Limitation{{Code: "prometheus_confirmed_healthy", Detail: "fabricated capability claim"}}
+	raw := marshalRaw(t, p)
+
+	got := ValidateAssessmentProposal(raw, snap, call, time.Now())
+	if got.Outcome != ProposalOutcomeCapabilityRejected {
+		t.Fatalf("Outcome = %q, want capability_rejected", got.Outcome)
+	}
+	if len(got.Errors) == 0 || got.Errors[0].Code != "limitation_code_unknown" {
+		t.Fatalf("Errors = %v, want limitation_code_unknown", got.Errors)
+	}
+}
+
+// TestValidateAssessmentProposalAcceptsKnownLimitationCode is the positive
+// control: a proposal citing an actual plan2UnsupportedCapabilities code
+// (facts.go) is accepted, not swept up by the new rejection.
+func TestValidateAssessmentProposalAcceptsKnownLimitationCode(t *testing.T) {
+	snap := snapshotFor(t, baseSnapshotInput(t))
+	call := callFor(snap)
+	p := validPlainProposal()
+	p.Limitations = []model.Limitation{{Code: "prometheus_unavailable", Detail: "Prometheus is not a Plan 2 fact producer."}}
+	raw := marshalRaw(t, p)
+
+	got := ValidateAssessmentProposal(raw, snap, call, time.Now())
+	if got.Outcome != ProposalOutcomeAccepted {
+		t.Fatalf("Outcome = %q, want accepted; errors=%v", got.Outcome, got.Errors)
+	}
+}
+
 func TestValidateAssessmentProposalRejectsAbsentEvidenceRef(t *testing.T) {
 	in := durationOutlierInput(t)
 	snap := snapshotFor(t, in)
@@ -314,6 +351,33 @@ func TestValidateAssessmentProposalRejectsModelProposedCadence(t *testing.T) {
 		t.Fatal(err)
 	}
 	obj["cadence"] = json.RawMessage(`"fast"`)
+	raw := marshalRaw(t, obj)
+
+	got := ValidateAssessmentProposal(raw, snap, call, time.Now())
+	if got.Outcome != ProposalOutcomeMalformed {
+		t.Fatalf("Outcome = %q, want malformed", got.Outcome)
+	}
+	if len(got.Errors) == 0 || got.Errors[0].Code != "forbidden_field" {
+		t.Fatalf("Errors = %v, want forbidden_field", got.Errors)
+	}
+}
+
+// TestValidateAssessmentProposalRejectsStrayTopLevelOperatorContractField
+// proves the allowlist (Finding #3) catches what the old 3-key blacklist
+// ("lifecycle"/"action_contract"/"cadence") could not: a model response
+// that FLATTENS an Operator-contract field to the top level instead of
+// nesting it under action_contract. json.Unmarshal into AssessmentProposal
+// silently drops it (the Go struct has no such field), so only an
+// allowlist over the raw decoded object catches it.
+func TestValidateAssessmentProposalRejectsStrayTopLevelOperatorContractField(t *testing.T) {
+	snap := snapshotFor(t, baseSnapshotInput(t))
+	call := callFor(snap)
+	base := marshalRaw(t, validPlainProposal())
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(base, &obj); err != nil {
+		t.Fatal(err)
+	}
+	obj["next_update_at"] = json.RawMessage(`"2026-09-01T13:00:00Z"`)
 	raw := marshalRaw(t, obj)
 
 	got := ValidateAssessmentProposal(raw, snap, call, time.Now())
@@ -710,6 +774,86 @@ func TestRevalidateReuseSucceedsAcrossNewerInputWithUnchangedBasis(t *testing.T)
 	}
 	if err := got.Result.Assessment.Validate(later); err != nil {
 		t.Fatalf("reused Assessment fails Assessment.Validate: %v", err)
+	}
+}
+
+// TestRevalidateReuseSucceedsWellPastPriorNextUpdateAt is the reviewer's
+// repro for the trustworthy()-re-breaks-reuse bug: the prior's OWN
+// next_update_at promise (computed against the clock at the time prior was
+// written) has already elapsed by the time reuse is actually evaluated —
+// exactly the case reuse exists to serve (a LATER reconciliation revisiting
+// an unchanged basis). Fixture cadence is slow (15 minutes); this wakes
+// well past that window, unlike every other reuse test in this file, which
+// wakes within ~1 minute of a 2-minute fast-cadence window and so never
+// exercised this path. spec.md: the controller "never copies a stale
+// next_update_at" — it always recomputes the Operator contract fresh — so
+// staleness of the PRIOR's own next_update_at must never by itself make an
+// otherwise-valid prior ineligible for reuse.
+func TestRevalidateReuseSucceedsWellPastPriorNextUpdateAt(t *testing.T) {
+	now := mustTime(t, "2026-09-01T12:00:00Z")
+	in := baseSnapshotInput(t) // no eligible reasons, no Triage/retry state -> default (slow) cadence
+	snap := BuildSnapshot(in)
+	call := callFor(snap)
+	vr := ValidateAssessmentProposal(marshalRaw(t, validPlainProposal()), snap, call, now)
+	if vr.Outcome != ProposalOutcomeAccepted {
+		t.Fatalf("fixture proposal not accepted: %v", vr.Errors)
+	}
+	priorResult := DeriveAssessment(vr.Proposal, snap, in, ControllerState{}, model.DerivationModelValidated, nil, now)
+	prior := authoritativeFrom(t, priorResult, "assessment-1", now)
+	if prior.Assessment.Cadence != model.CadenceSlow {
+		t.Fatalf("fixture invariant violated: want slow cadence, got %q", prior.Assessment.Cadence)
+	}
+	if prior.Assessment.ActionContract.NextUpdateAt == nil {
+		t.Fatal("fixture invariant violated: prior carries no next_update_at")
+	}
+	// Well past the prior's own promise — not just past cadence, past it by
+	// a further hour, so this can never pass by accident of clock rounding.
+	wakeAt := prior.Assessment.ActionContract.NextUpdateAt.Add(time.Hour)
+
+	bumped := in
+	bumped.Situation.InputVersion++
+	newSnap := BuildSnapshot(bumped)
+	if newSnap.AssessmentBasisHash != prior.AssessmentBasisHash {
+		t.Fatalf("fixture invariant violated: basis hash changed across input version alone")
+	}
+
+	got := RevalidateReuse(prior, newSnap, bumped, ControllerState{}, wakeAt)
+	if !got.Ok {
+		t.Fatalf("RevalidateReuse rejected reuse solely because the prior's own stale next_update_at had elapsed: %s", got.Reason)
+	}
+	if got.Result.Derivation != model.DerivationRevalidatedReuse {
+		t.Fatalf("Derivation = %q, want revalidated_reuse", got.Result.Derivation)
+	}
+	if err := got.Result.Assessment.Validate(wakeAt); err != nil {
+		t.Fatalf("reused Assessment fails Assessment.Validate: %v", err)
+	}
+}
+
+// TestRevalidateReuseStillRejectsShapeInvalidPrior proves the fix above does
+// not overcorrect: trustworthy() must still reject a prior that is
+// genuinely shape/consistency-invalid for reasons that have nothing to do
+// with next_update_at freshness (here, an unknown Persistence enum value —
+// the same class of defect Assessment.Validate would have caught before
+// this fix, and Assessment.ValidateShape must still catch after it).
+func TestRevalidateReuseStillRejectsShapeInvalidPrior(t *testing.T) {
+	now := mustTime(t, "2026-09-01T12:00:00Z")
+	in := baseSnapshotInput(t)
+	snap := BuildSnapshot(in)
+	vr := ValidateAssessmentProposal(marshalRaw(t, validPlainProposal()), snap, callFor(snap), now)
+	priorResult := DeriveAssessment(vr.Proposal, snap, in, ControllerState{}, model.DerivationModelValidated, nil, now)
+	prior := authoritativeFrom(t, priorResult, "assessment-1", now)
+	prior.Assessment.Persistence = model.Persistence("bogus") // shape-invalid, unrelated to timing
+
+	bumped := in
+	bumped.Situation.InputVersion++
+	newSnap := BuildSnapshot(bumped)
+
+	got := RevalidateReuse(prior, newSnap, bumped, ControllerState{}, now.Add(time.Minute))
+	if got.Ok {
+		t.Fatal("RevalidateReuse must still reject a shape-invalid prior, unrelated to next_update_at freshness")
+	}
+	if got.Reason != "fails_current_validators" {
+		t.Fatalf("Reason = %q, want fails_current_validators", got.Reason)
 	}
 }
 

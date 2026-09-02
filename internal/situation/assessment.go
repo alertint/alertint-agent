@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -585,17 +586,33 @@ type ReuseResult struct {
 // revalidated_reuse both qualify; deterministic_fallback never does — every
 // fallback carries semantic_assessment_unavailable for its semantic fields by
 // construction, spec.md: "that fallback is never a semantic reuse source"),
-// and still passing the current schema/Operator-contract validators. Whether
-// prior "was authoritative for its exact input" and "has not been superseded
-// by a newer current Assessment" is the caller's responsibility: prior must
-// be the Situation's own current AuthoritativeAssessment (Task 8's job to
-// fetch) — a pure function has no way to independently verify either
-// property offline.
-func trustworthy(prior AuthoritativeAssessment, now time.Time) (string, bool) {
+// and still passing the current schema/Operator-contract SHAPE validators.
+//
+// This deliberately uses Assessment.ValidateShape, not Assessment.Validate:
+// prior's own ActionContract.NextUpdateAt was computed against the clock at
+// the time prior was written, and reuse exists precisely for a LATER
+// reconciliation revisiting an unchanged basis — by construction that
+// promise is usually already stale by the time trustworthy runs. spec.md is
+// explicit that the controller "never copies a stale next_update_at"; it
+// always recomputes the Operator contract fresh (DeriveAssessment, below,
+// already does this for every path). Judging prior's own stale timing
+// promise against the CURRENT wall clock would reject reuse for exactly the
+// reconciliations reuse is meant to serve, while telling us nothing about
+// whether prior's SEMANTIC content (persistence/impact/novelty/causality/
+// attention/sufficient_reason/limitations) is still valid. Every other
+// closed-shape/consistency rule (unknown enums, actor/action inconsistency,
+// missing required fields, ...) still applies via ValidateShape.
+//
+// Whether prior "was authoritative for its exact input" and "has not been
+// superseded by a newer current Assessment" is the caller's responsibility:
+// prior must be the Situation's own current AuthoritativeAssessment (Task
+// 8's job to fetch) — a pure function has no way to independently verify
+// either property offline.
+func trustworthy(prior AuthoritativeAssessment) (string, bool) {
 	if prior.Derivation == model.DerivationDeterministicFallback {
 		return "fallback_not_a_semantic_reuse_source", false
 	}
-	if err := prior.Assessment.Validate(now); err != nil {
+	if err := prior.Assessment.ValidateShape(); err != nil {
 		return "fails_current_validators", false
 	}
 	return "", true
@@ -619,7 +636,7 @@ func trustworthy(prior AuthoritativeAssessment, now time.Time) (string, bool) {
 // InputVersion into their IDs) and would fail this Snapshot's own evidence/
 // eligibility checks if carried over unchanged.
 func RevalidateReuse(prior AuthoritativeAssessment, snap Snapshot, in SnapshotInput, state ControllerState, now time.Time) ReuseResult {
-	if reason, ok := trustworthy(prior, now); !ok {
+	if reason, ok := trustworthy(prior); !ok {
 		return ReuseResult{Reason: reason}
 	}
 	if prior.AssessmentBasisHash != snap.AssessmentBasisHash {
@@ -720,12 +737,49 @@ type ValidationResult struct {
 	Adjustments []ValidationIssue
 }
 
-// forbiddenTopLevelKeys are Assessment fields the model must never author —
-// the controller-exclusive lifecycle/Operator-contract/cadence subset a raw
-// JSON reply could still smuggle in even though model.AssessmentProposal's Go
-// struct has no field for them (a bare json.Unmarshal into that struct
-// silently drops unknown keys instead of rejecting them).
-var forbiddenTopLevelKeys = []string{"lifecycle", "action_contract", "cadence"}
+// allowedProposalTopLevelKeys is the exact, closed set of top-level JSON
+// keys model.AssessmentProposal's Go struct legitimately carries — its own
+// eight `json:"..."` field tags (schema_version, persistence, impact,
+// novelty, causality, attention, sufficient_reason, limitations). A raw
+// proposal response is rejected if it carries ANY other top-level key: not
+// just the controller-exclusive lifecycle/action_contract/cadence subset,
+// but also a model response that FLATTENS an Operator-contract field to the
+// top level instead of nesting it under action_contract — e.g. a bare
+// next_update_at, next_actor, operator_action_required, or evidence_quality
+// key — which a narrower blacklist of exactly those 3 nested-shape names
+// would never catch. json.Unmarshal into AssessmentProposal silently drops
+// any unrecognized key rather than erroring, so this map-based allowlist
+// check on the raw decoded object is the only place that catches it.
+var allowedProposalTopLevelKeys = map[string]bool{
+	"schema_version":    true,
+	"persistence":       true,
+	"impact":            true,
+	"novelty":           true,
+	"causality":         true,
+	"attention":         true,
+	"sufficient_reason": true,
+	"limitations":       true,
+}
+
+// knownLimitationCode reports whether code is one of Plan 2's known/allowed
+// Limitation codes: the fixed plan2UnsupportedCapabilities set (facts.go —
+// the closed set of capability gaps this build's fact producers can name)
+// plus this file's own controller-authored fallback code
+// (limitationSemanticAssessmentUnavailable). spec.md: unsupported-capability
+// absence "is never represented as confirmed empty, healthy, or fetched" —
+// a model citing a fabricated code (e.g. "prometheus_confirmed_healthy")
+// must be rejected, not stored as if it were a recognized caveat.
+func knownLimitationCode(code string) bool {
+	if code == limitationSemanticAssessmentUnavailable {
+		return true
+	}
+	for _, l := range plan2UnsupportedCapabilities {
+		if l.Code == code {
+			return true
+		}
+	}
+	return false
+}
 
 // maxBoundedTextLength bounds every free-text field a proposal may carry
 // (SufficientReason.Summary, each Limitation.Detail) — "bounded structured
@@ -781,6 +835,12 @@ func validateProposalContent(proposal model.AssessmentProposal, snap Snapshot) V
 	// input exists for the model to ground this value in.
 	if proposal.Causality == model.CausalityOperatorConfirmed {
 		return policyResult("operator_confirmation_unavailable", "causality", "Plan 2 has no manual reassessment producer to ground operator_confirmed causality")
+	}
+
+	for i, l := range proposal.Limitations {
+		if !knownLimitationCode(l.Code) {
+			return capabilityResult("limitation_code_unknown", fmt.Sprintf("limitations[%d].code", i), "limitation code not present in this build's known/allowed set")
+		}
 	}
 
 	if proposal.SufficientReason != nil {
@@ -858,9 +918,9 @@ func ValidateAssessmentProposal(raw json.RawMessage, snap Snapshot, call Assessm
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		return malformedResult("invalid_json", "", "response is not a JSON object")
 	}
-	for _, k := range forbiddenTopLevelKeys {
-		if _, present := obj[k]; present {
-			return malformedResult("forbidden_field", k, "model-authored "+k+" is forbidden; the controller derives it exclusively")
+	for k := range obj {
+		if !allowedProposalTopLevelKeys[k] {
+			return malformedResult("forbidden_field", k, "top-level key "+k+" is not a legitimate AssessmentProposal field; the controller derives every controller-owned field exclusively")
 		}
 	}
 

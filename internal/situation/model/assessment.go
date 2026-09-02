@@ -340,10 +340,15 @@ func (c ActionContract) MarshalJSON() ([]byte, error) {
 }
 
 // validate checks ActionContract's closed codes, the next_actor/action
-// consistency rule, and the terminal/nonterminal update-promise shape. It is
-// a shape/consistency check only: deriving the correct values from
-// controller state is Task 5's DeriveActionContract.
-func (c ActionContract) validate(now time.Time, terminal bool) error {
+// consistency rule, and the terminal/nonterminal update-promise SHAPE —
+// present (non-nil) for a nonterminal contract, absent for a terminal one.
+// It never compares next_update_at against a wall clock; that freshness
+// check is requireFreshNextUpdateAt below, kept separate so a caller can
+// apply every shape/consistency rule without also rejecting on staleness
+// alone (see Assessment.ValidateShape's doc comment for why that split
+// matters). Deriving the correct values from controller state is Task 5's
+// DeriveActionContract; this is a shape/consistency check only.
+func (c ActionContract) validate(terminal bool) error {
 	if err := c.NextActor.Validate(); err != nil {
 		return fmt.Errorf("action_contract: %w", err)
 	}
@@ -400,6 +405,20 @@ func (c ActionContract) validate(now time.Time, terminal bool) error {
 	if c.NextUpdateAt == nil {
 		return errors.New("action_contract: nonterminal contract requires next_update_at")
 	}
+	return nil
+}
+
+// requireFreshNextUpdateAt additionally checks that a nonterminal contract's
+// next_update_at promise is still strictly in the future relative to now.
+// A terminal contract carries no next_update_at (validate above already
+// guarantees that), so this trivially passes it. Kept separate from
+// validate so a caller can check shape/consistency alone without also
+// judging whether a PRIOR contract's own timing promise has since elapsed —
+// see Assessment.ValidateShape.
+func (c ActionContract) requireFreshNextUpdateAt(now time.Time) error {
+	if c.NextUpdateAt == nil {
+		return nil
+	}
 	if !c.NextUpdateAt.After(now) {
 		return fmt.Errorf("action_contract: next_update_at %s must be after %s", c.NextUpdateAt, now)
 	}
@@ -447,6 +466,39 @@ func (a Assessment) MarshalJSON() ([]byte, error) {
 // are Task 5's job (ValidateAssessmentProposal, DeriveActionContract,
 // DeriveCadence).
 func (a Assessment) Validate(now time.Time) error {
+	if err := a.validateShape(); err != nil {
+		return err
+	}
+	if err := a.ActionContract.requireFreshNextUpdateAt(now); err != nil {
+		return fmt.Errorf("assessment: %w", err)
+	}
+	return nil
+}
+
+// ValidateShape checks every rule Validate checks — closed enums, schema
+// version, the Operator contract's actor/action consistency, the terminal/
+// nonterminal update-field SHAPE, and the terminal/nonterminal Cadence
+// split — EXCEPT it never compares the Operator contract's next_update_at
+// against a current wall clock.
+//
+// It exists for reuse-eligibility checks against a PRIOR authoritative
+// Assessment (internal/situation's RevalidateReuse/trustworthy). spec.md's
+// reuse section is explicit that the controller "never copies a stale
+// next_update_at" — it always recomputes the Operator contract fresh for
+// the new input — so a prior Assessment's OWN next_update_at promise having
+// already elapsed by the time reuse is actually evaluated (the whole point
+// of reuse: a LATER reconciliation revisiting an unchanged basis) is
+// expected, not a defect, and must never by itself make an otherwise
+// well-formed, semantically valid prior ineligible for reuse. Every other
+// closed-shape/consistency rule Validate enforces — unknown enums,
+// actor/action inconsistency, a missing required field, a terminal/
+// nonterminal Cadence mismatch — still applies here unchanged; only the
+// single next_update_at-vs-now freshness comparison is skipped.
+func (a Assessment) ValidateShape() error {
+	return a.validateShape()
+}
+
+func (a Assessment) validateShape() error {
 	if a.SchemaVersion != AssessmentSchemaVersion {
 		return fmt.Errorf("assessment: schema_version %d unsupported (want %d)", a.SchemaVersion, AssessmentSchemaVersion)
 	}
@@ -497,7 +549,7 @@ func (a Assessment) Validate(now time.Time) error {
 		return errors.New("assessment: nonterminal assessment requires a cadence")
 	}
 
-	if err := a.ActionContract.validate(now, terminal); err != nil {
+	if err := a.ActionContract.validate(terminal); err != nil {
 		return fmt.Errorf("assessment: %w", err)
 	}
 	return nil
