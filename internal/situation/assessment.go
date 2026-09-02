@@ -618,6 +618,42 @@ func trustworthy(prior AuthoritativeAssessment) (string, bool) {
 	return "", true
 }
 
+// rebindSufficientReason re-binds reason — an accepted Sufficient reason
+// carried on some PRIOR Assessment — to the CURRENT Snapshot's matching
+// eligible-reason candidate, by Code (the stable catalog identity), rather
+// than reusing it verbatim: reason's own CandidateID and EvidenceRefs are
+// scoped to the OLD input version they were originally matched against
+// (reasonCandidateID and factIdentity both bake InputVersion into their
+// IDs) and would fail validateProposalContent's own
+// findEligibleCandidateByID/factExists checks unchanged, even when the same
+// reason code is still eligible today. Returns (nil, true) for a nil
+// reason (nothing to rebind), (rebound, true) when a matching candidate is
+// found, and (nil, false) when the code no longer has ANY matching eligible
+// candidate — the caller's signal that this reason no longer grounds
+// anything and the proposal carrying it must not be accepted unchanged.
+//
+// Both of RevalidateReuse (revalidating a trustworthy prior's content
+// against a newer, but basis-UNCHANGED, input) and fallbackOrPreserve's
+// preserve branch (controller.go — revalidating a trustworthy prior's
+// content against a newer, basis-CHANGED, input when this cycle ends
+// without a fresh L2 result) face the identical problem and share this one
+// rebinding rule rather than each inventing their own.
+func rebindSufficientReason(reason *model.SufficientReason, eligible []model.ReasonCandidate) (*model.SufficientReason, bool) {
+	if reason == nil {
+		return nil, true
+	}
+	matched, found := findEligibleCandidateByCode(eligible, reason.Code)
+	if !found {
+		return nil, false
+	}
+	return &model.SufficientReason{
+		Code:         matched.Code,
+		CandidateID:  matched.ID,
+		Summary:      reason.Summary,
+		EvidenceRefs: append([]string(nil), matched.EvidenceRefs...),
+	}, true
+}
+
 // RevalidateReuse implements spec.md's "Assessment reuse across input
 // versions": when a newer input's Assessment basis is unchanged from a prior
 // trustworthy Assessment, the controller reuses its semantic reasoning
@@ -630,11 +666,8 @@ func trustworthy(prior AuthoritativeAssessment) (string, bool) {
 // ActionContract/next_update_at, and never copies prior's coverage tuples.
 //
 // A prior accepted Sufficient reason is rebound to the NEW Snapshot's
-// matching candidate by Code (the stable catalog identity), not reused
-// verbatim: the prior's own CandidateID and EvidenceRefs are scoped to the
-// OLD input version (reasonCandidateID and factIdentity both bake
-// InputVersion into their IDs) and would fail this Snapshot's own evidence/
-// eligibility checks if carried over unchanged.
+// matching candidate (rebindSufficientReason) rather than reused verbatim —
+// see that function's own doc comment for why.
 func RevalidateReuse(prior AuthoritativeAssessment, snap Snapshot, in SnapshotInput, state ControllerState, now time.Time) ReuseResult {
 	if reason, ok := trustworthy(prior); !ok {
 		return ReuseResult{Reason: reason}
@@ -652,18 +685,11 @@ func RevalidateReuse(prior AuthoritativeAssessment, snap Snapshot, in SnapshotIn
 		Attention:     prior.Assessment.Attention,
 		Limitations:   append([]model.Limitation(nil), prior.Assessment.Limitations...),
 	}
-	if prior.Assessment.SufficientReason != nil {
-		matched, found := findEligibleCandidateByCode(snap.EligibleReasons, prior.Assessment.SufficientReason.Code)
-		if !found {
-			return ReuseResult{Reason: "sufficient_reason_no_longer_eligible"}
-		}
-		proposal.SufficientReason = &model.SufficientReason{
-			Code:         matched.Code,
-			CandidateID:  matched.ID,
-			Summary:      prior.Assessment.SufficientReason.Summary,
-			EvidenceRefs: append([]string(nil), matched.EvidenceRefs...),
-		}
+	rebound, ok := rebindSufficientReason(prior.Assessment.SufficientReason, snap.EligibleReasons)
+	if !ok {
+		return ReuseResult{Reason: "sufficient_reason_no_longer_eligible"}
 	}
+	proposal.SufficientReason = rebound
 
 	revalidated := validateProposalContent(proposal, snap)
 	if !revalidated.Outcome.accepted() {

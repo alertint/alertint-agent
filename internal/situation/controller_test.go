@@ -469,6 +469,152 @@ func TestControllerReconcileDeterministicFloorFallsBackUrgentWhenL2Fails(t *test
 	}
 }
 
+// TestControllerReconcileFloorNewlyEligiblePreservedAssessmentForcesUrgentWhenL2Fails
+// proves the regression round 1's I3 fix introduced: fallbackOrPreserve's
+// PRESERVE branch (a trustworthy prior Assessment exists, this cycle ends
+// without an accepted L2 result) must still route the preserved proposal
+// through the SAME floor check every other path already gets
+// (validateProposalContent's Attention-raising adjustment), not commit the
+// stale pre-floor Attention untouched. Sequence: a warning-severity
+// Situation already carries a trustworthy model_validated Assessment with
+// Attention=observe (no floor eligible yet); a critical firing delivery then
+// joins, making critical_anchor newly eligible and changing both
+// MaterialFactHash and AssessmentBasisHash (RevalidateReuse correctly
+// refuses reuse: "assessment_basis_changed"); L2 is down this cycle
+// (transport failure), so Reconcile falls back to preserving the prior's
+// semantic content — which must NOT mean preserving its now-stale observe
+// Attention once the floor is active.
+func TestControllerReconcileFloorNewlyEligiblePreservedAssessmentForcesUrgentWhenL2Fails(t *testing.T) {
+	priorIn := ctBaseSnapshotInput()
+	priorIn.Now = ctBaseTime.Add(10 * time.Minute)
+	priorSnap := situation.BuildSnapshot(priorIn)
+	if hasFloorCandidate(priorSnap.EligibleReasons) {
+		t.Fatal("fixture invariant: no deterministic floor should be eligible yet in the prior snapshot")
+	}
+
+	prior := &situation.AuthoritativeAssessment{
+		ID: "assessment-prior-observe", SituationID: "situation-1",
+		AssessmentBasisHash: priorSnap.AssessmentBasisHash, MaterialFactHash: priorSnap.MaterialFactHash,
+		InputVersion: 2, Derivation: model.DerivationModelValidated,
+		Assessment: model.Assessment{
+			SchemaVersion: model.AssessmentSchemaVersion, Persistence: model.PersistenceSustained,
+			Impact: model.ImpactSuspected, Novelty: model.NoveltyFamiliar, Causality: model.CausalityCorrelated,
+			Attention: model.AttentionObserve, Lifecycle: model.LifecycleActive,
+			EvidenceQuality: model.EvidenceQualityComplete, Cadence: model.CadenceSlow,
+			ActionContract: model.ActionContract{NextActor: model.NextActorNone, NextUpdateAt: &ctBaseTime},
+		},
+	}
+
+	// This cycle: a critical firing delivery joins the same Incident —
+	// critical_anchor becomes newly eligible, changing the basis.
+	in := ctBaseSnapshotInput()
+	in.Deliveries = append(in.Deliveries, ctDelivery("delivery-2", "incident-1", true, "critical"))
+	in.CurrentAssessment = prior
+
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1, beginRetryEpoch: 0}
+	client := &fakeAssessmentClient{} // no scripted responses: CompleteOnce fails (transport failure).
+	c := ctController(t, store, client)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if client.calls != 1 {
+		t.Fatalf("CompleteOnce calls = %d, want exactly 1 (L2 must still be attempted before falling back to preserve)", client.calls)
+	}
+	if len(store.commits) != 1 {
+		t.Fatalf("commits = %d, want 1", len(store.commits))
+	}
+	commit := store.commits[0]
+	if commit.Attempt.ID != "" {
+		t.Fatalf("expected the PRESERVE branch (no new authoritative attempt row), got Attempt.ID=%q derivation=%q", commit.Attempt.ID, commit.Attempt.Derivation)
+	}
+	if commit.Attention != model.AttentionUrgent {
+		t.Fatalf("Attention = %q, want urgent: a deterministic floor became eligible this cycle and must not be silently dropped by preserving the stale pre-floor Assessment", commit.Attention)
+	}
+	if commit.Assessment.Attention != model.AttentionUrgent {
+		t.Fatalf("committed Assessment.Attention = %q, want urgent", commit.Assessment.Attention)
+	}
+	if commit.RetryAt == nil {
+		t.Fatal("expected a bounded retry to be scheduled after the transport failure, not a permanent stuck state")
+	}
+}
+
+// TestControllerReconcileFloorNoLongerEligibleDoesNotPreserveStaleUrgent proves
+// the symmetric half of the same fix: "never lower... but also never
+// invent." A prior trustworthy Assessment carries Attention=urgent grounded
+// in critical_anchor; this cycle the critical delivery is no longer part of
+// the Situation's input (the floor is no longer eligible) and L2 fails. The
+// preserved proposal's SufficientReason no longer matches any current
+// eligible candidate, so validateProposalContent must not accept it
+// unchanged — Reconcile must fall through to DeterministicFallback (which
+// independently proves no floor is active) rather than committing a stale
+// urgent Attention with a reason that no longer grounds it.
+func TestControllerReconcileFloorNoLongerEligibleDoesNotPreserveStaleUrgent(t *testing.T) {
+	priorIn := ctBaseSnapshotInput()
+	priorIn.Deliveries = append(priorIn.Deliveries, ctDelivery("delivery-2", "incident-1", true, "critical"))
+	priorIn.Now = ctBaseTime.Add(10 * time.Minute)
+	priorSnap := situation.BuildSnapshot(priorIn)
+	floorCandidate, ok := findFloorCandidateForTest(priorSnap.EligibleReasons)
+	if !ok {
+		t.Fatal("fixture invariant: critical_anchor must be eligible in the prior snapshot")
+	}
+
+	prior := &situation.AuthoritativeAssessment{
+		ID: "assessment-prior-urgent", SituationID: "situation-1",
+		AssessmentBasisHash: priorSnap.AssessmentBasisHash, MaterialFactHash: priorSnap.MaterialFactHash,
+		InputVersion: 2, Derivation: model.DerivationModelValidated,
+		Assessment: model.Assessment{
+			SchemaVersion: model.AssessmentSchemaVersion, Persistence: model.PersistenceSustained,
+			Impact: model.ImpactSuspected, Novelty: model.NoveltyFamiliar, Causality: model.CausalityCorrelated,
+			Attention: model.AttentionUrgent,
+			SufficientReason: &model.SufficientReason{
+				Code: floorCandidate.Code, CandidateID: floorCandidate.ID, Summary: floorCandidate.Summary,
+				EvidenceRefs: append([]string(nil), floorCandidate.EvidenceRefs...),
+			},
+			Lifecycle:       model.LifecycleActive,
+			EvidenceQuality: model.EvidenceQualityComplete, Cadence: model.CadenceSlow,
+			ActionContract: model.ActionContract{NextActor: model.NextActorNone, NextUpdateAt: &ctBaseTime},
+		},
+	}
+
+	// This cycle: back to the base warning-only delivery — the critical
+	// delivery is gone, so critical_anchor is no longer eligible.
+	in := ctBaseSnapshotInput()
+	in.CurrentAssessment = prior
+
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1, beginRetryEpoch: 0}
+	client := &fakeAssessmentClient{} // no scripted responses: CompleteOnce fails (transport failure).
+	c := ctController(t, store, client)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(store.commits) != 1 {
+		t.Fatalf("commits = %d, want 1", len(store.commits))
+	}
+	commit := store.commits[0]
+	if commit.Attention == model.AttentionUrgent {
+		t.Fatalf("Attention = urgent, want non-urgent: the floor grounding the prior's urgent Attention is no longer eligible, so it must not be preserved unchanged")
+	}
+	if commit.Attempt.ID == "" || commit.Attempt.Derivation != model.DerivationDeterministicFallback {
+		t.Fatalf("expected a fresh DeterministicFallback commit (Attempt.ID=%q Derivation=%q), not a preserved-but-ungrounded proposal", commit.Attempt.ID, commit.Attempt.Derivation)
+	}
+}
+
+func hasFloorCandidate(candidates []model.ReasonCandidate) bool {
+	_, ok := findFloorCandidateForTest(candidates)
+	return ok
+}
+
+func findFloorCandidateForTest(candidates []model.ReasonCandidate) (model.ReasonCandidate, bool) {
+	for _, c := range candidates {
+		if c.DeterministicFloor {
+			return c, true
+		}
+	}
+	return model.ReasonCandidate{}, false
+}
+
 func TestControllerReconcileWorkBearingRecordsDispatchBeforeIOAndAcceptsOnce(t *testing.T) {
 	in := ctBaseSnapshotInput()
 	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1, beginRetryEpoch: 0}

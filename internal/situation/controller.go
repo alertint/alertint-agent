@@ -840,20 +840,46 @@ func controllerParkBlocksDispatch(p ControllerParkedState, currentMaterialFactHa
 // for a cycle that ends WITHOUT a fresh accepted/contradicted L2 result:
 // when in.CurrentAssessment already exists and is trustworthy (Task 5's own
 // trustworthy — model-validated or deterministically complete, never a
-// stale fallback), its existing semantic content is preserved and only its
-// controller-owned fields (ActionContract/Cadence/EvidenceQuality) are
-// refreshed against state — no new durable row (the returned Attempt is the
-// zero value, so CommitController advances no current_assessment_id).
-// Otherwise (no prior at all, or the prior itself is untrustworthy) a fresh
-// DeterministicFallback becomes the new authoritative row — spec.md's
-// "Deterministic fallback when L2 is unavailable and no trustworthy prior
-// Assessment exists."
+// stale fallback), its existing semantic content is REVALIDATED against the
+// CURRENT snap — via the same rebindSufficientReason +
+// validateProposalContent pattern RevalidateReuse uses to revalidate a
+// prior against a newer input (assessment.go), not a Reconcile-invented
+// second copy of that logic — and, when accepted, the (possibly floor-
+// adjusted) proposal is preserved with only its controller-owned fields
+// (ActionContract/Cadence/EvidenceQuality) refreshed against state — no new
+// durable row (the returned Attempt is the zero value, so CommitController
+// advances no current_assessment_id). RevalidateReuse itself cannot be
+// called here directly: its own AssessmentBasisHash-equality gate exists for
+// a DIFFERENT purpose (deciding whether a whole cycle can skip work
+// entirely) and would always reject preserve's call site, since preserve is
+// reached only when RevalidateReuse has already failed (or never applied)
+// for THIS cycle's changed basis.
+//
+// Revalidation is essential, not optional: a Situation's deterministic
+// urgent floor (critical_anchor) can become newly eligible in the very
+// cycle L2 fails, and a stale prior Assessment's own Attention may no
+// longer reflect it (or, symmetrically, may still claim an urgent Attention
+// whose grounding floor has since lifted) — see validateProposalContent's
+// floor-adjustment/urgent_without_floor rules. When revalidation rejects
+// the preserved proposal (the floor grounding a stale urgent Attention is
+// gone, or any other current-basis policy check now fails it), preserving
+// it unchanged would commit an ungrounded Assessment, so this falls through
+// to the same DeterministicFallback path used when no trustworthy prior
+// exists at all — spec.md's "Deterministic fallback when L2 is unavailable
+// and no trustworthy prior Assessment exists" now also covers "...or the
+// prior's semantic content is no longer valid against the current basis."
 func (c *Controller) fallbackOrPreserve(situationID string, snap Snapshot, in SnapshotInput, state ControllerState, retryEpoch, workAttempt int, now time.Time) (model.Assessment, AssessmentAttempt, []model.IncidentCoverage) {
 	if in.CurrentAssessment != nil {
 		if _, ok := trustworthy(*in.CurrentAssessment); ok {
 			proposal := proposalFromAssessment(in.CurrentAssessment.Assessment)
-			result := DeriveAssessment(proposal, snap, in, state, in.CurrentAssessment.Derivation, in.CurrentAssessment.ReusedFromAssessmentID, now)
-			return result.Assessment, AssessmentAttempt{}, nil
+			if rebound, ok := rebindSufficientReason(proposal.SufficientReason, snap.EligibleReasons); ok {
+				proposal.SufficientReason = rebound
+				revalidated := validateProposalContent(proposal, snap)
+				if revalidated.Outcome.accepted() {
+					result := DeriveAssessment(revalidated.Proposal, snap, in, state, in.CurrentAssessment.Derivation, in.CurrentAssessment.ReusedFromAssessmentID, now)
+					return result.Assessment, AssessmentAttempt{}, nil
+				}
+			}
 		}
 	}
 	result := DeterministicFallback(snap, in, state, now)
@@ -1024,28 +1050,41 @@ func (c *Controller) Reconcile(ctx context.Context, claim Claim) error {
 	// still attempted), not replacing the attempt.
 	//
 	// The floor's Attention-raising is Task 5's own DeriveAssessment/
-	// validateProposalContent adjustment mechanism, already correctly wired
-	// into every remaining path without any Reconcile-level special case:
+	// validateProposalContent adjustment mechanism, correctly wired into
+	// EVERY remaining path without any Reconcile-level special case:
 	// validateProposalContent forces Attention to urgent (recorded as a safe
 	// "adjustment", never a rejection) whenever the floor is active,
-	// regardless of what the model itself proposed, for BOTH the fresh
-	// model-validated path (ValidateAssessmentProposal) and reuse's own
-	// revalidation step (RevalidateReuse); DeterministicAssessment applies the
-	// identical floor check directly when it IS reached — genuinely, now,
-	// only via DeterministicFallback, i.e. when this cycle's own work-bearing
-	// L2 dispatch below actually failed and no trustworthy prior Assessment
-	// exists (fallbackOrPreserve). So a floor Situation with no prior
-	// Assessment still goes through work-bearing dispatch just like any other
-	// Situation: on success it becomes model_validated with Attention forced
-	// urgent; on failure it falls back to DeterministicFallback, which ALSO
-	// forces Attention to urgent via the same floor check — either way this
-	// cycle's own commit already carries Attention=urgent, satisfying "the
-	// floor's only special effect is guaranteeing Attention is raised to
-	// urgent (never lowered)" without ever needing to skip L2 to get there.
-	// Once a trustworthy Assessment exists, RevalidateReuse keeps reusing that
-	// REAL semantic judgment (not a conservative default) for as long as the
-	// basis stays unchanged — exactly the same reuse behavior any other
-	// Situation gets.
+	// regardless of what the model itself proposed, for the fresh
+	// model-validated path (ValidateAssessmentProposal), reuse's own
+	// revalidation step (RevalidateReuse, when the basis is UNCHANGED), and
+	// fallbackOrPreserve's own preserve branch (revalidating a trustworthy
+	// prior's content against the CURRENT, possibly CHANGED, basis via that
+	// same validateProposalContent call — a fix to a gap this comment
+	// originally left open: an earlier version of this fix preserved the
+	// prior's content unrevalidated, so a floor that became newly eligible
+	// in the very cycle L2 failed could commit a stale pre-floor Attention);
+	// DeterministicAssessment applies the identical floor check directly
+	// when it IS reached — via DeterministicFallback, i.e. when this cycle's
+	// own work-bearing L2 dispatch below actually failed/was blocked AND no
+	// trustworthy prior Assessment exists, or the prior one revalidation
+	// rejects (fallbackOrPreserve). So a floor Situation with no prior
+	// Assessment still goes through work-bearing dispatch just like any
+	// other Situation: on success it becomes model_validated with Attention
+	// forced urgent; on failure it falls back to DeterministicFallback,
+	// which ALSO forces Attention to urgent via the same floor check. And a
+	// floor Situation that DOES already carry a trustworthy prior gets the
+	// identical guarantee through a different one of these same paths: an
+	// unchanged basis reuses it (RevalidateReuse) with Attention forced
+	// urgent if the floor is active; a changed basis with L2 down/blocked
+	// preserves it (fallbackOrPreserve) with the SAME forcing, or falls
+	// through to DeterministicFallback if revalidation itself rejects it
+	// (e.g. a SufficientReason that no longer grounds anything). Every one
+	// of these paths — fresh, reused, preserved, or fallback — therefore
+	// already carries Attention=urgent whenever the floor is active this
+	// cycle, satisfying "the floor's only special effect is guaranteeing
+	// Attention is raised to urgent (never lowered, and never invented once
+	// its own grounding is gone)" without ever needing to skip L2 to get
+	// there.
 
 	// 6. Work-bearing: consume a work attempt before any provider I/O.
 	retryEpoch, workAttempt, err := c.store.BeginControllerAttempt(ctx, claim, snap.MaterialFactHash, now)
