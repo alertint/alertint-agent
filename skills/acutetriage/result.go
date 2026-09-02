@@ -301,49 +301,46 @@ func (s *Skill) AfterCommit(ctx context.Context, result situation.AcuteResult) e
 	return errors.Join(errs...)
 }
 
-// OnTriageExhausted implements situation.ExhaustionNotifier (Task 7 fix,
-// Finding #3): TriageWorker's hook for a genuine attempt-schedule
-// exhaustion (the final consecutive failed attempt), called only after the
-// store's own exhaust write has actually committed. It restores the
-// operator-visible signal the deleted pre-Plan-2 dispatch chain's own
-// exhaustTriage (internal/correlator/triage_retry.go) produced — one
-// incident.triage_exhausted audit row, plus one notifier call — TriageWorker
-// itself had none of before this fix. Best-effort, exactly like every other
-// AfterCommit-adjacent side effect: a failure here is logged, never treated
-// as grounds to redo or re-notify the already durably exhausted attempt.
+// OnTriageExhausted implements situation.ExhaustionNotifier: TriageWorker's
+// hook for a genuine attempt-schedule exhaustion (the final consecutive
+// failed attempt), called only after the store's own exhaust write — AND
+// TriageWorker's own incident.triage_exhausted audit append — have already
+// happened (internal/situation/triage_worker.go's completeFailure/
+// notifyExhaustion). Best-effort, exactly like every other AfterCommit-
+// adjacent side effect: a failure here is logged, never treated as grounds
+// to redo or re-notify the already durably exhausted attempt.
 //
-// Known incomplete wiring (Task 9's runtime-wiring job, not this one): this
-// method is the concrete implementation Task 9 wires into a real
-// TriageWorker's exhaustionNotifier — cmd/alertint/main.go still only
-// calls the pre-Plan-2 Correlator.SetTriageFailureNotifier, which no
-// TriageWorker reads. s.notifier here reaches an operator only if it is (or
-// contains, via notify.Multi) a sink implementing notify.TriageFailureSink;
-// GroupKey/AlertCount are left zero-valued (TriageAttemptClaim carries
-// neither) — a reasonable minimal implementation of the interface Task 7
-// commits to, not a claim of full parity with the old event's richer
-// payload.
+// Task 9 fix round 2: this method does NOT audit. It used to also append
+// its own incident.triage_exhausted row here, which either double-emitted
+// the event (when TriageWorker's own append was unconditional) or, after an
+// intermediate fix made TriageWorker's append fallback-only, became the
+// SOLE surviving row in every real deployment (which always configures this
+// notifier) — and that row was missing situation_id/attempt_id/
+// attempt_number/input_version, because this method's own signature
+// (incidentID, code, detail — no attempt/situation identity at all) never
+// receives them. TriageWorker holds the full identity via its
+// TriageAttemptClaim and is now the row's single, unconditional owner; this
+// method is left as a pure notification hook — currently the only remaining
+// behavior is the notify.TriageFailureSink call below. s.notifier here
+// reaches an operator only if it is (or contains, via notify.Multi) a sink
+// implementing notify.TriageFailureSink; GroupKey/AlertCount are left
+// zero-valued (TriageAttemptClaim carries neither) — a reasonable minimal
+// implementation of the interface Task 7 commits to, not a claim of full
+// parity with the old event's richer payload.
 func (s *Skill) OnTriageExhausted(ctx context.Context, incidentID, code, detail string) error {
-	var errs []error
-	if s.auditor != nil {
-		if err := s.auditor.Append(ctx, "skill:acute-triage", "incident.triage_exhausted", map[string]any{
-			"incident_id": incidentID,
-			"code":        code,
-			"detail":      detail,
-		}); err != nil {
-			s.logger.Warn("acutetriage: triage exhausted audit append failed", "incident_id", incidentID, "err", err)
-			errs = append(errs, err)
-		}
+	if s.notifier == nil {
+		return nil
 	}
-	if s.notifier != nil {
-		if sink, ok := s.notifier.(notify.TriageFailureSink); ok {
-			ev := notify.TriageExhaustedEvent{IncidentID: incidentID, Error: code + ": " + detail}
-			if err := sink.OnTriageExhausted(ctx, ev); err != nil {
-				s.logger.Warn("acutetriage: triage exhausted notify failed", "incident_id", incidentID, "err", err)
-				errs = append(errs, err)
-			}
-		}
+	sink, ok := s.notifier.(notify.TriageFailureSink)
+	if !ok {
+		return nil
 	}
-	return errors.Join(errs...)
+	ev := notify.TriageExhaustedEvent{IncidentID: incidentID, Error: code + ": " + detail}
+	if err := sink.OnTriageExhausted(ctx, ev); err != nil {
+		s.logger.Warn("acutetriage: triage exhausted notify failed", "incident_id", incidentID, "err", err)
+		return err
+	}
+	return nil
 }
 
 func (s *Skill) applyPostCommitMemoryUpdate(ctx context.Context, u situation.MemoryUpdate) error {

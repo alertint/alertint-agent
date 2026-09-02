@@ -27,13 +27,22 @@ func (n *exhaustionSpyNotifier) OnTriageExhausted(_ context.Context, ev notify.T
 	return nil
 }
 
-// TestOnTriageExhausted_AppendsAuditAndNotifies proves Skill.OnTriageExhausted
+// TestOnTriageExhausted_NotifiesWithoutAuditing proves Skill.OnTriageExhausted
 // (the concrete situation.ExhaustionNotifier implementation Task 9 wires
-// into a real TriageWorker) both appends one incident.triage_exhausted
-// audit row and calls the notifier's TriageFailureSink capability exactly
-// once — restoring the operator-visible signal the deleted pre-Plan-2
-// exhaustTriage produced.
-func TestOnTriageExhausted_AppendsAuditAndNotifies(t *testing.T) {
+// into a real TriageWorker) calls the notifier's TriageFailureSink
+// capability exactly once and appends NO incident.triage_exhausted audit
+// row of its own — even with a real auditor configured.
+//
+// Task 9 fix round 2: this method used to also append its own
+// incident.triage_exhausted row, which either double-emitted the event or
+// (after an intermediate fix) became the sole surviving row in production
+// while missing situation_id/attempt_id/attempt_number/input_version —
+// fields this method's own signature (incidentID, code, detail) never
+// receives. TriageWorker itself (internal/situation/triage_worker.go's
+// completeFailure) is now the row's single, unconditional owner, since it
+// alone holds the full identity via its TriageAttemptClaim; this method is
+// left as a pure notification hook.
+func TestOnTriageExhausted_NotifiesWithoutAuditing(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
 	auditor := audit.New(st.DB())
@@ -48,8 +57,8 @@ func TestOnTriageExhausted_AppendsAuditAndNotifies(t *testing.T) {
 	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_log WHERE kind = 'incident.triage_exhausted'`).Scan(&n); err != nil {
 		t.Fatalf("count audit rows: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("incident.triage_exhausted audit rows = %d, want 1", n)
+	if n != 0 {
+		t.Fatalf("incident.triage_exhausted audit rows = %d, want 0 (OnTriageExhausted no longer audits — TriageWorker owns the row)", n)
 	}
 
 	if len(sink.calls) != 1 {

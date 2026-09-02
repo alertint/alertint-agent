@@ -176,26 +176,41 @@ type AfterCommitter interface {
 // attempt-schedule exhaustion (the final, MaxAttempts-th, consecutive
 // failed attempt) — mirroring how AfterCommitter is already a narrow
 // interface TriageWorker calls on a genuine success, this is the analogous
-// hook for TriageWorker's other terminal outcome. It restores the
-// operator-visible signal the deleted pre-Plan-2 dispatch chain's own
-// exhaustTriage produced (an incident.triage_exhausted audit row plus a
-// TriageFailureNotifier.OnTriageExhausted call), which TriageWorker had none
-// of before this fix (Task 7 report, Finding #3).
+// hook for TriageWorker's other terminal outcome.
+//
+// Task 9 fix round 2: this hook is notification-only. TriageWorker itself
+// is the single, unconditional owner of the incident.triage_exhausted audit
+// row (completeFailure, below) — it holds the full identity via the claim
+// it already has in hand (SituationID, AttemptID, AttemptNumber,
+// DecisionInputVersion), which this interface's signature deliberately
+// never receives, so an implementation could never build that row itself
+// even if it wanted to. An earlier version of this fix had a concrete
+// implementation (skills/acutetriage.Skill.OnTriageExhausted) own the audit
+// row instead, on the theory that it could build a "richer payload" — that
+// was backwards: OnTriageExhausted's signature has no access to any of the
+// identity fields above, so every production row it wrote was missing them.
+// This hook now exists purely so a concrete ExhaustionNotifier can layer
+// whatever non-audit operator notification it wants (e.g. Skill.
+// OnTriageExhausted's own Slack/notify.TriageFailureSink call) on top of
+// the worker's own already-complete audit row — it must never also append
+// incident.triage_exhausted itself.
 //
 // TriageWorker calls this ONLY after a genuine exhaustion has actually
-// committed — never on a clean skip (completeCleanSkip's own, separate,
-// non-failure completion path — see CompleteIncidentTriageAttemptAsClean-
-// Skip) and never on a stale completion or a still-retryable backoff.
+// committed and its own audit row has already been appended — never on a
+// clean skip (completeCleanSkip's own, separate, non-failure completion
+// path — see CompleteIncidentTriageAttemptAsCleanSkip) and never on a stale
+// completion or a still-retryable backoff.
 //
 // This interface deliberately never mentions internal/notify or
 // internal/store — see this file's own header comment for why
 // internal/situation cannot import either — so skills/acutetriage (or
 // wherever else is architecturally appropriate) can implement it with a
-// thin adapter over the real notifier/auditor, exactly the pattern its own
+// thin adapter over the real notifier, exactly the pattern its own
 // AfterCommitter implementation (Skill.AfterCommit) already follows. May be
 // nil (exhaustion notification disabled — tests, or a caller that has not
 // wired one yet); TriageWorker treats a nil ExhaustionNotifier as a no-op,
-// exactly like a nil AfterCommitter.
+// exactly like a nil AfterCommitter — the worker's own audit row still
+// fires either way.
 type ExhaustionNotifier interface {
 	OnTriageExhausted(ctx context.Context, incidentID, code, detail string) error
 }
@@ -850,16 +865,26 @@ func (w *TriageWorker) completeFailure(ctx context.Context, claim TriageAttemptC
 				"incident_id", claim.IncidentID, "attempt_id", claim.AttemptID, "err", err)
 			return
 		}
-		// Task 9 fix round, Finding #1: the incident.triage_exhausted audit
-		// row is emitted exactly once, by notifyExhaustion below — never
-		// also here. Production wires BOTH this worker's own SetAuditSink
-		// AND a real ExhaustionNotifier (skills/acutetriage.Skill.
-		// OnTriageExhausted) into the SAME audit sink; that notifier's own
-		// doc comment names appending this exact event as its whole
-		// purpose, with a richer payload than this package alone can build
-		// (no internal/store import). Appending it here too, unconditionally,
-		// double-emitted the row. See notifyExhaustion's own doc comment for
-		// the fallback that still covers a caller with no notifier wired.
+		// Task 9 fix round 2: TriageWorker itself is the single,
+		// unconditional owner of the incident.triage_exhausted audit row —
+		// it holds the full identity (situation_id/attempt_id/
+		// attempt_number/input_version) via claim, which
+		// ExhaustionNotifier.OnTriageExhausted's signature never receives.
+		// Round 1's fix made this append fire only when no notifier was
+		// configured, on the theory that the notifier (skills/acutetriage.
+		// Skill.OnTriageExhausted) would own the row instead and could build
+		// a "richer payload" — backwards: that method's signature has no
+		// access to any of the identity fields above, so the one surviving
+		// row in every real deployment (which always configures a notifier)
+		// was missing them. Appending unconditionally here, regardless of
+		// whether an ExhaustionNotifier is also configured, both restores
+		// full identity and closes the fragility of the row's existence
+		// ever depending on a notifier's own choice to audit at all. See
+		// notifyExhaustion below for the (now audit-free) notification hook.
+		w.auditAppend(ctx, "incident.triage_exhausted", map[string]any{
+			"situation_id": claim.SituationID, "incident_id": claim.IncidentID, "attempt_id": claim.AttemptID,
+			"attempt_number": claim.AttemptNumber, "input_version": claim.DecisionInputVersion, "code": code,
+		})
 		w.notifyExhaustion(ctx, claim, code, detail)
 		return
 	}
@@ -875,29 +900,25 @@ func (w *TriageWorker) completeFailure(ctx context.Context, claim TriageAttemptC
 		"retry_in", next.Sub(now), "err", cause)
 }
 
-// notifyExhaustion records a genuine attempt-schedule exhaustion's
-// operator-visible signal, after the exhaust write has actually committed —
-// mirroring completeSuccessOrStale's own best-effort treatment of
-// AfterCommit: a notify failure here is logged, never treated as grounds to
-// redo or re-notify the (already durably exhausted) attempt.
+// notifyExhaustion calls the configured ExhaustionNotifier, if any, after a
+// genuine attempt-schedule exhaustion has actually committed AND this
+// worker's own incident.triage_exhausted audit row has already been
+// appended (completeFailure, above) — mirroring completeSuccessOrStale's own
+// best-effort treatment of AfterCommit: a notify failure here is logged,
+// never treated as grounds to redo or re-notify the (already durably
+// exhausted, already audited) attempt.
 //
-// Task 9 fix round, Finding #1: exactly ONE incident.triage_exhausted audit
-// row is emitted per genuine exhaustion. When a real ExhaustionNotifier is
-// configured (skills/acutetriage.Skill.OnTriageExhausted in production,
-// wired into the SAME audit sink as this worker's own SetAuditSink), IT owns
-// the row — its own doc comment names appending this exact event as its
-// whole purpose, and it can build a richer payload than this package alone
-// (no internal/store import). completeFailure's own caller no longer
-// appends a duplicate. When no ExhaustionNotifier is configured at all (nil
-// — tests, or a caller that has not wired one yet), this worker's own direct
-// append is the fallback, so a genuine exhaustion is never silently
-// unaudited just because no notifier exists to own it.
+// Task 9 fix round 2: this is purely a notification hook. TriageWorker
+// itself is the single, unconditional owner of the incident.triage_exhausted
+// audit row (see completeFailure above) — a concrete ExhaustionNotifier
+// (skills/acutetriage.Skill.OnTriageExhausted in production) must layer only
+// non-audit behavior here (its own Slack/notify.TriageFailureSink call);
+// this function never appends audit itself, with or without a notifier
+// configured, so there is no longer any "fallback" case to reason about. A
+// nil exhaustionNotifier (tests, or a caller that has not wired one yet) is
+// simply a no-op — the worker's own audit row already fired regardless.
 func (w *TriageWorker) notifyExhaustion(ctx context.Context, claim TriageAttemptClaim, code, detail string) {
 	if w.exhaustionNotifier == nil {
-		w.auditAppend(ctx, "incident.triage_exhausted", map[string]any{
-			"situation_id": claim.SituationID, "incident_id": claim.IncidentID, "attempt_id": claim.AttemptID,
-			"attempt_number": claim.AttemptNumber, "input_version": claim.DecisionInputVersion, "code": code,
-		})
 		return
 	}
 	if err := w.exhaustionNotifier.OnTriageExhausted(ctx, claim.IncidentID, code, detail); err != nil {

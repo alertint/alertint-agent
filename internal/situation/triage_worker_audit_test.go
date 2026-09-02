@@ -94,24 +94,6 @@ func TestTriageWorkerAuditsStaleInputNotCompleted(t *testing.T) {
 	}
 }
 
-// auditingExhaustionNotifier mirrors the production shape closely enough to
-// catch Task 9 fix round Finding #1's double-emission regression:
-// skills/acutetriage.Skill.OnTriageExhausted appends its OWN
-// incident.triage_exhausted row to the SAME AuditSink the worker itself was
-// wired with (both share one audit sink in cmd/alertint's
-// newControllerRuntime) — unlike fakeExhaustionNotifier, which only records
-// calls on itself and never touches the shared sink, so it could never have
-// caught a double append.
-type auditingExhaustionNotifier struct {
-	sink situation.AuditSink
-}
-
-func (n *auditingExhaustionNotifier) OnTriageExhausted(ctx context.Context, incidentID, code, detail string) error {
-	return n.sink.Append(ctx, "skill:acute-triage", "incident.triage_exhausted", map[string]any{
-		"incident_id": incidentID, "code": code, "detail": detail,
-	})
-}
-
 // countKind returns how many of sink's recorded audit rows carry kind —
 // TestTriageWorkerAuditsExhaustionOnFifthAttempt's own exactly-once proof
 // needs a count, not merely fakeAuditSink.has's boolean "at least one".
@@ -126,15 +108,23 @@ func countKind(sink *fakeAuditSink, kind string) int {
 }
 
 // TestTriageWorkerAuditsExhaustionOnFifthAttempt mirrors
-// TestTriageWorker_FifthAttemptExhaustion's exact scenario and proves it
-// audits incident.triage_exhausted after the durable exhaust write commits —
-// and, Task 9 fix round Finding #1: EXACTLY ONCE, in the production
-// configuration where both the worker's own audit sink (SetAuditSink) AND a
-// real ExhaustionNotifier are wired into the SAME sink. The prior version of
-// this test wired a fakeExhaustionNotifier that never touched the shared
-// sink at all, so it could not have caught the double-emission regression
-// (the worker's own direct append plus the notifier's own real append,
-// wired here via auditingExhaustionNotifier, both landing in one sink).
+// TestTriageWorker_FifthAttemptExhaustion's exact scenario and proves the
+// worker itself unconditionally emits exactly one incident.triage_exhausted
+// audit row, carrying the full identity (situation_id/attempt_id/
+// attempt_number/input_version) — in the production configuration where
+// BOTH the worker's own audit sink (SetAuditSink) AND a real
+// ExhaustionNotifier are wired.
+//
+// Task 9 fix round 2: TriageWorker is now the row's single, unconditional
+// owner (completeFailure in triage_worker.go) — skills/acutetriage.Skill.
+// OnTriageExhausted no longer audits at all, only notifies (see
+// skills/acutetriage/exhaustion_test.go's own
+// TestOnTriageExhausted_NotifiesWithoutAuditing). notifier here is
+// fakeExhaustionNotifier, which — exactly like the real, fixed
+// Skill.OnTriageExhausted — never touches the shared audit sink, so this
+// proves both that the row is emitted (with full identity) and that wiring
+// a real notifier alongside the worker's own audit sink does not
+// double-emit it.
 func TestTriageWorkerAuditsExhaustionOnFifthAttempt(t *testing.T) {
 	claim := testClaim("inc-audit-3", 5)
 	store := &fakeStore{claimFn: func(ctx context.Context, incidentID, owner string, now time.Time, lease time.Duration) (situation.TriageAttemptClaim, error) {
@@ -145,7 +135,7 @@ func TestTriageWorkerAuditsExhaustionOnFifthAttempt(t *testing.T) {
 		return situation.AcuteResult{}, errors.New("still failing")
 	}}
 	audit := &fakeAuditSink{}
-	notifier := &auditingExhaustionNotifier{sink: audit}
+	notifier := &fakeExhaustionNotifier{}
 	w := situation.NewTriageWorker(store, lister, analyzer, &fakeAfterCommit{}, notifier, situation.TriageWorkerConfig{MaxAttempts: 5, Owner: "test-owner"}, nil)
 	w.SetAuditSink(audit)
 
@@ -153,20 +143,49 @@ func TestTriageWorkerAuditsExhaustionOnFifthAttempt(t *testing.T) {
 		t.Fatalf("RunOnce: %v", err)
 	}
 
-	if !audit.has("incident.triage_exhausted") {
-		t.Fatalf("audit kinds = %v, want incident.triage_exhausted", audit.kinds)
-	}
 	if n := countKind(audit, "incident.triage_exhausted"); n != 1 {
 		t.Fatalf("incident.triage_exhausted audit rows = %d, want exactly 1 (double-emission regression): kinds=%v", n, audit.kinds)
 	}
+	payload := payloadOfKind(t, audit, "incident.triage_exhausted")
+	for _, key := range []string{"situation_id", "incident_id", "attempt_id", "attempt_number", "input_version", "code"} {
+		if _, ok := payload[key]; !ok {
+			t.Fatalf("incident.triage_exhausted payload missing key %q: %+v", key, payload)
+		}
+	}
+	if got := payload["situation_id"]; got != claim.SituationID {
+		t.Errorf("situation_id = %v, want %v", got, claim.SituationID)
+	}
+	if got := payload["incident_id"]; got != claim.IncidentID {
+		t.Errorf("incident_id = %v, want %v", got, claim.IncidentID)
+	}
+	if got := payload["attempt_id"]; got != claim.AttemptID {
+		t.Errorf("attempt_id = %v, want %v", got, claim.AttemptID)
+	}
+	if got, ok := payload["attempt_number"].(int); !ok || got != claim.AttemptNumber {
+		t.Errorf("attempt_number = %v (ok=%v), want %v", payload["attempt_number"], ok, claim.AttemptNumber)
+	}
+	if got, ok := payload["input_version"].(int); !ok || got != claim.DecisionInputVersion {
+		t.Errorf("input_version = %v (ok=%v), want %v", payload["input_version"], ok, claim.DecisionInputVersion)
+	}
+
+	// The notifier is still called (it is the one thing this hook is left
+	// for), proving the worker's own unconditional audit append did not
+	// also suppress the notification side of exhaustion handling.
+	if calls := notifier.snapshot(); len(calls) != 1 {
+		t.Fatalf("exhaustion notifier calls = %d, want exactly 1", len(calls))
+	}
 }
 
-// TestTriageWorkerAuditsExhaustionFallbackWhenNoNotifierConfigured proves
-// the OTHER half of Finding #1's fix: when no ExhaustionNotifier is
-// configured at all (the worker's own SetAuditSink is still wired), the
-// worker's own direct append is the fallback — a genuine exhaustion is never
-// silently unaudited just because no notifier exists to own the row.
-func TestTriageWorkerAuditsExhaustionFallbackWhenNoNotifierConfigured(t *testing.T) {
+// TestTriageWorkerAuditsExhaustionRegardlessOfNotifierConfigured proves the
+// worker's own incident.triage_exhausted append no longer depends in any
+// way on whether an ExhaustionNotifier is configured: exactly one row lands
+// whether or not a notifier is wired (compare with
+// TestTriageWorkerAuditsExhaustionOnFifthAttempt above, which wires one).
+// Task 9 fix round 2 removed the prior "fallback only when no notifier
+// configured" gate entirely — this is no longer a fallback path, it is THE
+// path, so a genuine exhaustion is never left unaudited, or under-audited,
+// regardless of notifier wiring.
+func TestTriageWorkerAuditsExhaustionRegardlessOfNotifierConfigured(t *testing.T) {
 	claim := testClaim("inc-audit-3b", 5)
 	store := &fakeStore{claimFn: func(ctx context.Context, incidentID, owner string, now time.Time, lease time.Duration) (situation.TriageAttemptClaim, error) {
 		return claim, nil
@@ -184,7 +203,7 @@ func TestTriageWorkerAuditsExhaustionFallbackWhenNoNotifierConfigured(t *testing
 	}
 
 	if n := countKind(audit, "incident.triage_exhausted"); n != 1 {
-		t.Fatalf("incident.triage_exhausted audit rows = %d, want exactly 1 (fallback with no notifier configured): kinds=%v", n, audit.kinds)
+		t.Fatalf("incident.triage_exhausted audit rows = %d, want exactly 1 (no notifier configured): kinds=%v", n, audit.kinds)
 	}
 }
 
