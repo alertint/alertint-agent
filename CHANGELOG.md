@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.7] - 2026-09-02
+
 ### Fixed
 
 - A recovery arriving while initial triage is in flight no longer produces two
@@ -761,7 +763,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single static binary** — pure-Go SQLite (no CGO), no external runtime dependencies.
   Multi-platform builds: `linux/amd64`, `linux/arm64`, `darwin/arm64`.
 
-[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.13.6...HEAD
+[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.13.7...HEAD
+[0.13.7]: https://github.com/alertint/alertint-agent/compare/v0.13.6...v0.13.7
 [0.13.6]: https://github.com/alertint/alertint-agent/compare/v0.13.5...v0.13.6
 [0.13.5]: https://github.com/alertint/alertint-agent/compare/v0.13.4...v0.13.5
 [0.13.4]: https://github.com/alertint/alertint-agent/compare/v0.13.3...v0.13.4
