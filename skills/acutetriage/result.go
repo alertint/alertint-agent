@@ -73,6 +73,13 @@ const (
 // same shape GetIncidentAlerts has always produced), using the latest
 // ReceivedAt among ONLY the frozen delivery set — never a later mutation
 // outside it.
+//
+// Fixed (Task 7 fix round, round-2 finding against round 1's own Finding #1
+// fix above): an EMPTY claim.MemberDeliveryIDs is no longer treated as
+// automatic proof of zero member alerts — see loadFrozenClaimAlerts' own doc
+// comment for why that conflated a genuinely membership-less Incident with a
+// legacy/pre-delivery-ledger Incident that still has real members, and
+// silently, terminally clean-skipped the latter with a misleading reason.
 func (s *Skill) Analyze(ctx context.Context, claim situation.TriageAttemptClaim) (situation.AcuteResult, error) {
 	inc, err := s.st.GetIncidentByID(ctx, claim.IncidentID)
 	if err != nil {
@@ -142,19 +149,64 @@ func (s *Skill) analyzeFromAlerts(ctx context.Context, inc store.Incident, alert
 // loadFrozenClaimAlerts loads exactly the bounded, immutable member content
 // claim.MemberDeliveryIDs froze at claim time — s.st.GetAlertDeliveries,
 // never GetIncidentAlerts' current mutable projection — and collapses it
-// back down to one entry per member Alert via dedupeFrozenAlerts. An empty
-// claim.MemberDeliveryIDs (no member deliveries at all) returns (nil, nil):
-// the caller treats a nil/empty result as a clean skip, matching the
-// pre-fix "no member alerts" check exactly.
+// back down to one entry per member Alert via dedupeFrozenAlerts.
+//
+// An empty claim.MemberDeliveryIDs is ambiguous by itself: memberDeliveryIDsTx
+// (internal/store/triage_controller.go) freezes it from incident_alert_
+// deliveries alone, which is empty both for an Incident that genuinely has
+// zero member alerts AND for an Incident that predates the delivery ledger
+// (every Incident before migration 0013) or was otherwise reconstructed via
+// UnrepresentedOperationalIncidents/ReconstructSituation with incident_alerts
+// rows but no incident_alert_deliveries rows (see that file's own doc
+// comment: "It never synthesizes an Alert delivery for an old row"). Task 7
+// fix round, Finding introduced by round 1's own Finding #1 fix: silently
+// treating the second case the same as the first terminally clean-skips a
+// real Incident with a misleading "below the minimum member alert count"
+// reason.
+//
+// So an empty claim.MemberDeliveryIDs falls back to loadLegacyClaimAlerts,
+// which asks GetIncidentAlerts (the pre-Task-7, current-state read) whether
+// the Incident actually has members despite the empty frozen delivery set.
+// Every current ingestion path (attachCorrelatedDeliveryTx) inserts
+// incident_alerts and incident_alert_deliveries together, in the same
+// transaction — so incident_alerts rows with no incident_alert_deliveries
+// counterpart can only be pre-ledger/legacy rows, never a currently-active
+// Incident's membership racing this claim. Only when GetIncidentAlerts ALSO
+// returns nothing is this genuinely a zero-member Incident, and the result
+// (nil, nil) still reaches analyzeFromAlerts' own clean-skip check exactly
+// as before.
 func (s *Skill) loadFrozenClaimAlerts(ctx context.Context, claim situation.TriageAttemptClaim) ([]store.Alert, error) {
 	if len(claim.MemberDeliveryIDs) == 0 {
-		return nil, nil
+		return s.loadLegacyClaimAlerts(ctx, claim)
 	}
 	deliveries, err := s.st.GetAlertDeliveries(ctx, claim.MemberDeliveryIDs)
 	if err != nil {
 		return nil, fmt.Errorf("acutetriage: analyze: load frozen member deliveries: %w", err)
 	}
 	return dedupeFrozenAlerts(deliveries), nil
+}
+
+// loadLegacyClaimAlerts is loadFrozenClaimAlerts' fallback for a claim whose
+// MemberDeliveryIDs came back empty: it reads the Incident's CURRENT member
+// alerts via GetIncidentAlerts (the same read Run/skill.go has always used,
+// and everything used before Task 7's frozen-claim mechanism existed at
+// all), so a legacy/pre-ledger Incident with real incident_alerts rows still
+// gets analyzed instead of silently, terminally clean-skipped. This is
+// narrower than it looks: it only ever runs for the bounded legacy
+// population the delivery ledger has no coverage for at all (see
+// loadFrozenClaimAlerts' own doc comment for why a currently-active
+// Incident can never reach here with real members) — every other Incident
+// still goes through the frozen, race-proof delivery-ledger path Finding #1
+// added. A genuinely membership-less Incident (every member Alert somehow
+// lost its delivery link, or simply never had one) returns (nil, nil) here
+// exactly like GetIncidentAlerts always has, so the existing clean-skip
+// behavior for that case is unchanged.
+func (s *Skill) loadLegacyClaimAlerts(ctx context.Context, claim situation.TriageAttemptClaim) ([]store.Alert, error) {
+	alerts, err := s.st.GetIncidentAlerts(ctx, claim.IncidentID)
+	if err != nil {
+		return nil, fmt.Errorf("acutetriage: analyze: load legacy incident alerts (empty frozen delivery set): %w", err)
+	}
+	return alerts, nil
 }
 
 // dedupeFrozenAlerts collapses one AlertDelivery per Alert.ID. A claimed

@@ -194,6 +194,52 @@ func TestAnalyze_BelowMinAlertsReturnsErrCleanSkip(t *testing.T) {
 	}
 }
 
+// TestAnalyze_EmptyDeliveryIDsWithRealIncidentAlertsDoesNotCleanSkip is the
+// Task 7 fix round's own round-2 regression proof (the finding raised
+// against round 1's own Finding #1 fix): an Incident that predates the
+// delivery ledger — or was otherwise reconstructed with incident_alerts rows
+// but zero incident_alert_deliveries rows, see internal/store/
+// situation_reconstruction.go's ReconstructSituation doc comment — freezes
+// an EMPTY claim.MemberDeliveryIDs at claim time (memberDeliveryIDsTx has
+// nothing to freeze) even though the Incident has real members. Unlike
+// TestAnalyze_NoMemberAlertsReturnsErrCleanSkip just above (a genuinely
+// membership-less Incident, where GetIncidentAlerts ALSO returns nothing),
+// this Incident's real membership is still visible via the legacy
+// GetIncidentAlerts read: loadFrozenClaimAlerts must fall back to it rather
+// than silently treating the empty frozen delivery set as "nothing to
+// analyze" and terminally clean-skipping a real Incident.
+func TestAnalyze_EmptyDeliveryIDsWithRealIncidentAlertsDoesNotCleanSkip(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	// insertTestAlert (unlike insertTestAlertDelivery) writes only
+	// alerts+incident_alerts, never alert_deliveries/incident_alert_deliveries
+	// — exactly the legacy pre-migration-0013 shape memberDeliveryIDsTx sees
+	// nothing to freeze for.
+	a1 := insertTestAlert(t, st, ctx, inc.ID, "fp-legacy-1", map[string]string{"alertname": "DiskFull", "host": "web1"})
+
+	fllm := &fakeLLM{response: validLLMResponse([]string{a1.ID})}
+	skill := acutetriage.New(acutetriage.Config{MinAlerts: 1}, st, fllm, nil, nil, nil)
+
+	// No MemberDeliveryIDs at all — mirrors exactly what
+	// ClaimIncidentTriageAttempt's memberDeliveryIDsTx freezes for an
+	// Incident with zero incident_alert_deliveries rows.
+	claim := situation.TriageAttemptClaim{IncidentID: inc.ID, AttemptID: "attempt-legacy", AttemptNumber: 1}
+	result, err := skill.Analyze(ctx, claim)
+	if err != nil {
+		t.Fatalf("Analyze: %v, want a real analysis (a legacy Incident with real incident_alerts must not clean-skip)", err)
+	}
+	if result.IncidentID != inc.ID {
+		t.Errorf("IncidentID = %q, want %q", result.IncidentID, inc.ID)
+	}
+	if fllm.calls != 1 {
+		t.Errorf("LLM calls = %d, want 1 (the legacy alert was actually analyzed, not clean-skipped)", fllm.calls)
+	}
+	if result.AlertRoles[a1.ID] != "primary" {
+		t.Errorf("AlertRoles[a1] = %q, want primary (the legacy alert was actually analyzed)", result.AlertRoles[a1.ID])
+	}
+}
+
 // TestAnalyze_ShortCircuitSkipsDefaultedRoles proves a rule short-circuit's
 // synthesized response (which already itemizes every member) does not get
 // a spurious "correlated" default layered on top, matching the pre-Task-7
