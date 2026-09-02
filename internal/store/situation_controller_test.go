@@ -451,6 +451,245 @@ func TestRecoverInterruptedAssessmentCallTurnsOrphanedDispatchIntoProcessInterru
 	}
 }
 
+// TestRecoverInterruptedAssessmentCallAdvancesBasisSoNextAttemptDoesNotCollide
+// is the Task 10 regression test for the interrupted-call recovery bug: a
+// crash landing after RecordAssessmentCall's own durable dispatch commit but
+// before that cycle's CommitController ever runs used to leave
+// current_material_fact_hash/controller_work_attempts at their pre-cycle
+// values, so the NEXT real BeginControllerAttempt call (with the SAME,
+// unchanged material hash) recomputed the EXACT SAME work_attempt=1 the
+// immutable pre-crash situation_assessment_calls row already occupies —
+// colliding on that table's own UNIQUE(situation_id, input_version,
+// retry_epoch, work_attempt, call_number) index. This reproduces the
+// collision scenario directly (dispatch a call, never commit, recover, call
+// BeginControllerAttempt again) and asserts it now correctly continues the
+// SAME attempt budget (work_attempt=2 — not a free reset to 1, and not a
+// collision error), and that a real subsequent dispatch at those
+// coordinates succeeds.
+func TestRecoverInterruptedAssessmentCallAdvancesBasisSoNextAttemptDoesNotCollide(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-recover-collision", now)
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+
+	materialHash := "sha256:material-" + sitID
+	_, workAttempt, err := st.BeginControllerAttempt(context.Background(), claim, materialHash, now)
+	if err != nil {
+		t.Fatalf("BeginControllerAttempt: %v", err)
+	}
+	if workAttempt != 1 {
+		t.Fatalf("workAttempt = %d, want 1", workAttempt)
+	}
+
+	call := callFixture(uuid.NewString(), sitID, claim.Situation.InputVersion, workAttempt, 1, now)
+	if err := st.RecordAssessmentCall(context.Background(), claim, call); err != nil {
+		t.Fatalf("record call: %v", err)
+	}
+
+	// Simulate a crash: the process dies before this cycle's own
+	// CommitController ever runs. The call is durably dispatched, but
+	// current_material_fact_hash/controller_work_attempts are never
+	// advanced. Expire the lease, exactly like the other recovery tests.
+	if _, err := st.db.ExecContext(context.Background(), `UPDATE situations SET lease_expires_at = ? WHERE id = ?`,
+		now.Add(-time.Second).UTC().Format(time.RFC3339Nano), sitID); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := st.RecoverInterruptedAssessmentCalls(context.Background(), now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("recover interrupted assessment calls: %v", err)
+	}
+	if recovered != 1 {
+		t.Fatalf("recovered = %d, want 1", recovered)
+	}
+
+	// The next real cycle reclaims the Situation and calls
+	// BeginControllerAttempt again with the SAME material hash (nothing
+	// material changed): it must correctly continue the same attempt
+	// budget (work_attempt=2), never collide with the immutable pre-crash
+	// call at work_attempt=1, and never silently reset to 1 either (that
+	// would grant the crashed cycle's own wasted slot back for free).
+	reclaim := claimSituation(t, st, sitID, "controller-b", now.Add(time.Minute))
+	retryEpoch2, workAttempt2, err := st.BeginControllerAttempt(context.Background(), reclaim, materialHash, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("BeginControllerAttempt after recovery: %v", err)
+	}
+	if workAttempt2 != 2 {
+		t.Fatalf("workAttempt after recovery = %d, want 2 (continue the same attempt budget, not a free reset to 1, and not a collision)", workAttempt2)
+	}
+
+	// A real subsequent dispatch at these coordinates must not collide with
+	// situation_assessment_calls' own UNIQUE index.
+	call2 := call
+	call2.ID = uuid.NewString()
+	call2.RetryEpoch = retryEpoch2
+	call2.WorkAttempt = workAttempt2
+	if err := st.RecordAssessmentCall(context.Background(), reclaim, call2); err != nil {
+		t.Fatalf("record call after recovery: %v (want no UNIQUE-index collision)", err)
+	}
+}
+
+// TestRecoverInterruptedAssessmentCallsCatchUpStaleBasisAfterResolvedRejectedOutcome
+// covers the SAME underlying bug reached through a different door: a call
+// whose own outcome DID get durably recorded for real (AppendAssessmentOutcome's
+// own commit is separate from, and does not require, CommitController's) —
+// but whose owning cycle's CommitController still never ran (crash landed
+// between the outcome append and the projection commit). This call is never
+// "orphaned" by loadOrphanedAssessmentCallsTx's own outcome-less definition
+// (an attempt row DOES reference it), so it never turns into a
+// process_interrupted failure and RecoverInterruptedAssessmentCalls' own
+// returned count stays 0 — but the Situation's projection still needs the
+// SAME basis catch-up (loadStaleControllerBasisTx) to avoid the identical
+// UNIQUE-index collision on the next real BeginControllerAttempt call.
+func TestRecoverInterruptedAssessmentCallsCatchUpStaleBasisAfterResolvedRejectedOutcome(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-recover-stale-basis", now)
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+
+	materialHash := "sha256:material-" + sitID
+	_, workAttempt, err := st.BeginControllerAttempt(context.Background(), claim, materialHash, now)
+	if err != nil {
+		t.Fatalf("BeginControllerAttempt: %v", err)
+	}
+
+	call := callFixture(uuid.NewString(), sitID, claim.Situation.InputVersion, workAttempt, 1, now)
+	if err := st.RecordAssessmentCall(context.Background(), claim, call); err != nil {
+		t.Fatalf("record call: %v", err)
+	}
+
+	callID := call.ID
+	started := situationmodel.ProviderRequestStartedTrue
+	attempt := situation.AssessmentAttempt{
+		ID: uuid.NewString(), SituationID: sitID, CallID: &callID,
+		InputVersion: claim.Situation.InputVersion, WorkAttempt: workAttempt, Sequence: 1,
+		Status:                 "rejected",
+		ValidationErrors:       json.RawMessage(`["malformed_schema"]`),
+		ProviderRequestStarted: &started,
+		CreatedAt:              now, CompletedAt: now.Add(time.Second),
+	}
+	if err := st.AppendAssessmentOutcome(context.Background(), attempt); err != nil {
+		t.Fatalf("append rejected outcome: %v", err)
+	}
+
+	// Simulate a crash strictly after the rejected outcome's own durable
+	// commit, but before this cycle's own CommitController ever runs.
+	if _, err := st.db.ExecContext(context.Background(), `UPDATE situations SET lease_expires_at = ? WHERE id = ?`,
+		now.Add(-time.Second).UTC().Format(time.RFC3339Nano), sitID); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := st.RecoverInterruptedAssessmentCalls(context.Background(), now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("recover interrupted assessment calls: %v", err)
+	}
+	if recovered != 0 {
+		t.Fatalf("recovered (orphaned count) = %d, want 0 (this call already has a real recorded outcome, so it is never orphaned)", recovered)
+	}
+
+	reclaim := claimSituation(t, st, sitID, "controller-b", now.Add(time.Minute))
+	retryEpoch2, workAttempt2, err := st.BeginControllerAttempt(context.Background(), reclaim, materialHash, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("BeginControllerAttempt after recovery: %v", err)
+	}
+	if workAttempt2 != 2 {
+		t.Fatalf("workAttempt after recovery = %d, want 2 (the stale-basis catch-up must still advance past the resolved-but-never-committed attempt)", workAttempt2)
+	}
+
+	call2 := call
+	call2.ID = uuid.NewString()
+	call2.RetryEpoch = retryEpoch2
+	call2.WorkAttempt = workAttempt2
+	call2.CallNumber = 1
+	if err := st.RecordAssessmentCall(context.Background(), reclaim, call2); err != nil {
+		t.Fatalf("record call after recovery: %v (want no UNIQUE-index collision)", err)
+	}
+}
+
+// TestRecoverInterruptedAssessmentCallClearsStalePolicyParkOnBasisAdvance
+// proves advanceControllerBasisForRecoveryTx's own park-clearing safety
+// argument: a controller_parked_reason recorded against an OLDER basis is
+// provably stale whenever an interrupted call exists for the SAME Situation
+// (controllerParkBlocksDispatch would otherwise have prevented that call
+// from ever being dispatched — see that function's doc comment). Without
+// clearing it here, advancing current_material_fact_hash to the recovered
+// call's own (new) basis would make the STALE park look like it freshly
+// covers that new basis, wrongly re-blocking dispatch forever — a
+// regression of controller.go's own Finding I1 invariant ("a park recorded
+// against a DIFFERENT (older) basis no longer applies").
+func TestRecoverInterruptedAssessmentCallClearsStalePolicyParkOnBasisAdvance(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-recover-clears-park", now)
+
+	// Seed a policy_rejected park recorded against an OLDER basis, as if a
+	// prior (already-committed, non-crashed) cycle rejected the model's
+	// proposal and parked permanently for that input.
+	oldHash := "sha256:parked-basis"
+	if _, err := st.db.ExecContext(context.Background(), `
+		UPDATE situations SET controller_parked_at = ?, controller_parked_reason = ?, current_material_fact_hash = ?
+		WHERE id = ?`, canonicalTime(now), situation.ParkedReasonPolicyRejected, oldHash, sitID); err != nil {
+		t.Fatalf("seed stale park: %v", err)
+	}
+
+	// The basis genuinely changes (new material facts arrived), naturally
+	// lifting the stale park (controller.go's own Finding I1 comment): a
+	// real cycle proceeds to BeginControllerAttempt/dispatch exactly as if
+	// it were never parked.
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+	newHash := "sha256:material-" + sitID
+	_, workAttempt, err := st.BeginControllerAttempt(context.Background(), claim, newHash, now)
+	if err != nil {
+		t.Fatalf("BeginControllerAttempt: %v", err)
+	}
+	if workAttempt != 1 {
+		t.Fatalf("workAttempt = %d, want 1 (mismatched basis resets)", workAttempt)
+	}
+	call := callFixture(uuid.NewString(), sitID, claim.Situation.InputVersion, workAttempt, 1, now)
+	if err := st.RecordAssessmentCall(context.Background(), claim, call); err != nil {
+		t.Fatalf("record call: %v", err)
+	}
+
+	// Crash before this cycle's own CommitController ever runs — the stale
+	// controller_parked_reason from before is left untouched in the DB.
+	if _, err := st.db.ExecContext(context.Background(), `UPDATE situations SET lease_expires_at = ? WHERE id = ?`,
+		now.Add(-time.Second).UTC().Format(time.RFC3339Nano), sitID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.RecoverInterruptedAssessmentCalls(context.Background(), now.Add(time.Minute)); err != nil {
+		t.Fatalf("recover interrupted assessment calls: %v", err)
+	}
+
+	var parkedReason, parkedAt, materialHash sql.NullString
+	if err := st.db.QueryRowContext(context.Background(), `
+		SELECT controller_parked_reason, controller_parked_at, current_material_fact_hash FROM situations WHERE id = ?`, sitID).
+		Scan(&parkedReason, &parkedAt, &materialHash); err != nil {
+		t.Fatal(err)
+	}
+	if parkedReason.Valid {
+		t.Fatalf("controller_parked_reason = %q, want cleared (any park present alongside an interrupted call is provably stale)", parkedReason.String)
+	}
+	if parkedAt.Valid {
+		t.Fatalf("controller_parked_at = %q, want cleared", parkedAt.String)
+	}
+	if !materialHash.Valid || materialHash.String != newHash {
+		t.Fatalf("current_material_fact_hash = %v, want %q (advanced to the recovered call's own basis)", materialHash, newHash)
+	}
+
+	// The next real cycle is no longer wrongly blocked by the (now-cleared)
+	// stale park: BeginControllerAttempt succeeds and continues the SAME
+	// attempt budget.
+	reclaim := claimSituation(t, st, sitID, "controller-b", now.Add(time.Minute))
+	_, workAttempt2, err := st.BeginControllerAttempt(context.Background(), reclaim, newHash, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("BeginControllerAttempt after recovery: %v", err)
+	}
+	if workAttempt2 != 2 {
+		t.Fatalf("workAttempt after recovery = %d, want 2", workAttempt2)
+	}
+}
+
 func TestRecoverInterruptedAssessmentCallLeavesActivelyClaimedCallsUntouched(t *testing.T) {
 	st := newTestStore(t)
 	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)

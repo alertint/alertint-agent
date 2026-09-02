@@ -1140,76 +1140,16 @@ func testReplayCrashAfterSituationClaim(t *testing.T) {
 	assertIdempotentReconverge(f, sitID, client, analyzer, after)
 }
 
-// KNOWN BUG (discovered by this task's own Finding #1 systemic
-// assertNoReconcileFailed check, NOT introduced by it, and NOT caused by
-// Finding #2's clock-advancement fix — reproduces identically with
-// ageIntoLongDurationClass removed): boundaries 3, 4, and 5 below currently
-// fail assertNoReconcileFailed with last_error_class = "transport_failure"
-// on their first post-restart convergeAll call. Root cause, traced via a
-// temporary debug wrapper on ControllerStore.RecordAssessmentCall (since
-// removed):
-//
-//  1. Each of these three boundaries crashes strictly BEFORE its cycle's own
-//     CommitController ever runs — by construction, that is the whole point
-//     of "after dispatch record but before response" /"after rejected
-//     attempt persisted" / "after authoritative insert but before
-//     commit". So situations.controller_work_attempts and
-//     current_material_fact_hash are left exactly as they were before this
-//     Situation's very first controller cycle: controller_work_attempts=0,
-//     current_material_fact_hash=NULL. The pre-crash cycle DID durably
-//     record one situation_assessment_calls row at
-//     (input_version=1, retry_epoch=0, work_attempt=1, call_number=1) —
-//     immutable, per migration 0015's own no-update/no-delete triggers.
-//  2. On replay, the first post-restart reconcile calls BeginControllerAttempt
-//     (internal/store/situation_controller.go): since current_material_fact_hash
-//     is NULL (never committed), it treats this as a fresh epoch and returns
-//     work_attempt=1 again — nextAttempt intentionally resets on ANY basis
-//     change, "this covers BOTH 'a genuinely new material input arrived' and
-//     '...already reset controller_work_attempts to 0'" (that function's own
-//     doc comment). controller_retry_epoch is untouched: "controller_retry_epoch
-//     is returned read-only; only the [dependency-recovery] wake primitive
-//     ever writes it" (same doc comment) — so it is still 0.
-//  3. dispatchWorkBearing (controller.go) then calls RecordAssessmentCall
-//     again with the IDENTICAL (situation_id, input_version=1, retry_epoch=0,
-//     work_attempt=1, call_number=1) — colliding with the immutable pre-crash
-//     row on situation_assessment_calls' own
-//     UNIQUE(situation_id, input_version, retry_epoch, work_attempt, call_number)
-//     index (migration 0015_situation_controller.sql). The INSERT's own
-//     ON CONFLICT(id) clause only covers the primary key, not this separate
-//     unique index, so the raw SQLite constraint error propagates as
-//     RecordAssessmentCall's return error.
-//  4. dispatchWorkBearing wraps it as a generic transportErr; ClassifyL2Outcome
-//     has no case for it, so classifyTransportErr's own catch-all default
-//     classifies it L2OutcomeTransportFailure — the SAME literal string
-//     "transport_failure" sanitizeTransportError separately produces for an
-//     unrecognized network error, which is what led early debugging astray.
-//     Reconcile then takes the ordinary "no accepted proposal" branch:
-//     fallbackOrPreserve + a NORMAL, SUCCESSFUL CommitController commit
-//     (status=authoritative, derivation=deterministic_fallback), recording
-//     last_error_class="transport_failure" on situations as a diagnostic
-//     breadcrumb — Reconcile itself returns nil, so ControllerWorker never
-//     logs a warning either. No physical L2 request happens this cycle at
-//     all (RecordAssessmentCall fails before CompleteOnce is ever called).
-//
-// Net effect: a crash landing in any of these three windows causes the
-// Situation's first REAL post-crash controller cycle to silently waste
-// itself on a degraded deterministic_fallback Assessment — with zero visible
-// error anywhere — before self-healing on the SECOND post-restart cycle
-// (once current_material_fact_hash finally gets populated by this first
-// commit, so BeginControllerAttempt correctly advances work_attempt to 2 and
-// stops colliding). This is a genuine, previously undiscovered gap in the
-// crash-recovery bookkeeping (situation_assessment_calls' own UNIQUE index
-// does not account for controller_work_attempts legitimately resetting to 1
-// without input_version or controller_retry_epoch also advancing), not a
-// test-timing artifact and not either of this task's two already-verified
-// production fixes (internal/store/situation_controller.go's appendFactTx,
-// internal/situation/facts.go's factIdentityWithContent). Per this task's
-// own explicit instructions ("stop and report clearly rather than weakening
-// the assertion to match"), assertNoReconcileFailed is NOT weakened or
-// scoped away from these three boundaries — see the Task 10 fix report for
-// the full write-up; this is flagged there as a DONE_WITH_CONCERNS finding
-// for a dedicated follow-up fix, not something this task's own scope
-// (test coverage only) is authorized to change.
+// Boundaries 3, 4, and 5 below once reproduced a genuine production bug: a
+// crash landing after an L2 dispatch record but before that cycle's own
+// CommitController commit left situations.controller_work_attempts/
+// current_material_fact_hash behind the immutable pre-crash
+// situation_assessment_calls row, so the next real BeginControllerAttempt
+// call recomputed colliding (retry_epoch, work_attempt, call_number)
+// coordinates against that row's own UNIQUE index. Fixed in
+// internal/store/situation_controller.go's RecoverInterruptedAssessmentCalls
+// (loadStaleControllerBasisTx/advanceControllerBasisForRecoveryTx) — see
+// that commit and the Task 10 fix report for the full root-cause writeup.
 
 // Boundary 3: after L2 provider dispatch record but before response.
 func testReplayCrashAfterL2DispatchRecordBeforeResponse(t *testing.T) {

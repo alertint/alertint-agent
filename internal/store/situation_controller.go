@@ -946,8 +946,22 @@ func insertAssessmentAttemptTx(ctx context.Context, tx *sql.Tx, p preparedAttemp
 // is NULL, or its lease has expired) into one immutable "process_interrupted"
 // failed attempt with provider_request_started="unknown" — the call slot was
 // already durably consumed before I/O (spec: "the slot is never refunded"),
-// so this never re-dispatches it — and merges retry_due into that
-// Situation's due reasons so a controller cycle picks the input back up.
+// so this never re-dispatches it.
+//
+// It also catches up every touched Situation's controller basis projection
+// (advanceControllerBasisForRecoveryTx — see its own doc comment for the
+// full "why") to its own most-recently-dispatched situation_assessment_calls
+// row (loadStaleControllerBasisTx — deliberately broader than "outcome-less":
+// see that function's own doc comment for why a call that already has a
+// recorded rejected/failed outcome can STILL need this), and merges
+// retry_due into every touched Situation's due reasons so a controller cycle
+// picks the input back up. Without the projection catch-up, the crashed
+// cycle's own already-durable situation_assessment_calls row and the NEXT
+// real BeginControllerAttempt call would independently compute the SAME
+// (retry_epoch, work_attempt, call_number) coordinates, colliding on
+// situation_assessment_calls' own UNIQUE index
+// (migration 0015_situation_controller.sql) — see this fix's own commit
+// message for the full root-cause writeup.
 //
 // Like RecoverExpiredFoundationLeases and ListInterruptedIncidentTriage,
 // this is a startup-only primitive: call it once, before any worker resumes
@@ -966,12 +980,6 @@ func (s *Store) RecoverInterruptedAssessmentCalls(ctx context.Context, now time.
 	orphaned, err := loadOrphanedAssessmentCallsTx(ctx, tx, now)
 	if err != nil {
 		return 0, err
-	}
-	if len(orphaned) == 0 {
-		if err := tx.Commit(); err != nil {
-			return 0, fmt.Errorf("store: commit empty interrupted assessment call recovery: %w", err)
-		}
-		return 0, nil
 	}
 
 	touched := map[string]bool{}
@@ -1002,6 +1010,17 @@ func (s *Store) RecoverInterruptedAssessmentCalls(ctx context.Context, now time.
 		touched[call.SituationID] = true
 	}
 
+	staleBasis, err := loadStaleControllerBasisTx(ctx, tx, now)
+	if err != nil {
+		return 0, err
+	}
+	for _, basis := range staleBasis {
+		touched[basis.SituationID] = true
+		if err := advanceControllerBasisForRecoveryTx(ctx, tx, basis.SituationID, basis.MaterialFactHash, basis.WorkAttempt, now); err != nil {
+			return 0, err
+		}
+	}
+
 	for situationID := range touched {
 		if err := mergeSituationDueReasonTx(ctx, tx, situationID, situationmodel.DueRetry, now); err != nil {
 			return 0, err
@@ -1012,6 +1031,186 @@ func (s *Store) RecoverInterruptedAssessmentCalls(ctx context.Context, now time.
 		return 0, fmt.Errorf("store: commit recover interrupted assessment calls: %w", err)
 	}
 	return len(orphaned), nil
+}
+
+// staleControllerBasis is one Situation's own most-recently-dispatched
+// situation_assessment_calls row, returned by loadStaleControllerBasisTx
+// only when the Situation's projection has not yet caught up to it.
+type staleControllerBasis struct {
+	SituationID      string
+	MaterialFactHash string
+	WorkAttempt      int
+}
+
+// loadStaleControllerBasisTx finds every Situation not currently under an
+// active claim whose current_material_fact_hash/controller_work_attempts
+// projection has fallen behind its own most-recently-dispatched
+// situation_assessment_calls row — regardless of whether that call already
+// has a recorded outcome. This is deliberately BROADER than
+// loadOrphanedAssessmentCallsTx's own "outcome-less" definition: a call can
+// be fully resolved (e.g. a durably recorded status='rejected' outcome —
+// AppendAssessmentOutcome's own commit is a separate, already-durable
+// transaction from CommitController's) and its owning cycle can STILL have
+// never reached CommitController's own fenced commit, the only place
+// current_material_fact_hash/controller_work_attempts are normally
+// advanced — whether the crash landed between that outcome append and the
+// projection commit ("after rejected/failed attempt persistence"), or
+// inside CommitController's own now-fully-rolled-back transaction (SQLite's
+// atomicity makes that indistinguishable from no commit attempt at all —
+// "after authoritative insert but before commit"). In every one of these
+// cases the dispatch itself (situation_assessment_calls) is durable and
+// immutable, but nothing durable reflects it in the Situation's own
+// projection — exactly the condition that makes the NEXT real
+// BeginControllerAttempt call recompute a colliding coordinate.
+//
+// Under normal (non-crashed) operation this is always empty for any
+// Situation not under an active claim: every cycle that ever calls
+// BeginControllerAttempt/RecordAssessmentCall always eventually reaches
+// CommitController (success or failure) before its claim is released, and
+// that commit always advances current_material_fact_hash/controller_work_attempts
+// to reflect that SAME cycle's own dispatch — so only a genuine crash
+// between dispatch and that commit can leave a gap here.
+func loadStaleControllerBasisTx(ctx context.Context, tx *sql.Tx, now time.Time) ([]staleControllerBasis, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT s.id, c.material_fact_hash, c.work_attempt
+		FROM situations s
+		JOIN situation_assessment_calls c ON c.id = (
+			SELECT c2.id FROM situation_assessment_calls c2
+			WHERE c2.situation_id = s.id
+			ORDER BY c2.dispatched_at DESC, c2.work_attempt DESC, c2.call_number DESC, c2.id DESC
+			LIMIT 1
+		)
+		WHERE (s.lease_owner IS NULL OR s.lease_expires_at <= ?)
+		  AND (s.current_material_fact_hash IS NULL
+		       OR s.current_material_fact_hash != c.material_fact_hash
+		       OR s.controller_work_attempts < c.work_attempt)`, canonicalTime(now))
+	if err != nil {
+		return nil, fmt.Errorf("store: load stale controller basis: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := []staleControllerBasis{}
+	for rows.Next() {
+		var b staleControllerBasis
+		if err := rows.Scan(&b.SituationID, &b.MaterialFactHash, &b.WorkAttempt); err != nil {
+			return nil, fmt.Errorf("store: scan stale controller basis: %w", err)
+		}
+		out = append(out, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate stale controller basis: %w", err)
+	}
+	return out, nil
+}
+
+// advanceControllerBasisForRecoveryTx makes recovering situationID's
+// interrupted work (loadStaleControllerBasisTx's own call — an orphaned
+// dispatch, or one whose outcome resolved but whose cycle never committed)
+// functionally equivalent to what a normal BeginControllerAttempt-then-
+// commit cycle would have left behind, so the NEXT real BeginControllerAttempt
+// call can never recompute the EXACT SAME (retry_epoch, work_attempt,
+// call_number) coordinates the immutable pre-crash situation_assessment_calls
+// row already occupies — the collision on that table's own UNIQUE index
+// this whole fix exists to prevent.
+//
+// Two writes, together:
+//
+//  1. current_material_fact_hash = recoveredMaterialFactHash (that call's
+//     OWN material_fact_hash — the actual basis it was durably dispatched
+//     against) and controller_work_attempts = MAX(current,
+//     recoveredWorkAttempt). WHEN the next real cycle's freshly-derived
+//     Snapshot happens to re-derive the IDENTICAL basis (a fast restart, or
+//     any Situation whose material facts are not time-sensitive), this
+//     makes BeginControllerAttempt's sameBasis comparison match, so it
+//     correctly computes workAttempts+1 — continuing the SAME attempt
+//     budget the crashed call already spent one slot of, exactly as if the
+//     crash had never happened.
+//
+//  2. controller_retry_epoch = controller_retry_epoch + 1, UNCONDITIONALLY
+//     — even though write 1 above handles the same-basis case on its own.
+//     This is not redundant: some of a Situation's own material facts are
+//     time-derived (current_duration's DurationClass boundaries — see
+//     snapshot.go), so real wall-clock time passing between the crash and
+//     whenever the Situation is actually reclaimed and reconciled again
+//     (never instantaneous — a process restart, then a due-poll, then a
+//     full reconcile) can legitimately change MaterialFactHash with no
+//     external input ever changing, entirely independent of the crash. When
+//     that happens, current_material_fact_hash (write 1) will NOT match the
+//     next cycle's freshly-derived hash — correctly so, since the basis
+//     genuinely did change — and BeginControllerAttempt's sameBasis
+//     comparison takes its "reset to 1" branch, exactly like it already
+//     does for any other genuinely-new-input case (see
+//     TestControllerAttemptNewMaterialHashResetsToOne). Without also
+//     advancing retry_epoch, that reset would recompute the EXACT SAME
+//     work_attempt=1 the crashed call already occupies at the SAME
+//     retry_epoch, colliding again. Advancing retry_epoch here — mirroring
+//     exactly what wakeOneDependencyRecoveredSituationTx already does for
+//     its own "this Situation's coordinate space needs a fresh generation"
+//     case — guarantees a fresh, never-before-used (retry_epoch, work_attempt,
+//     call_number) lane regardless of which BeginControllerAttempt branch
+//     the next cycle takes: sameBasis's own work_attempt arithmetic (1, or
+//     workAttempts+1) is entirely orthogonal to retry_epoch, which is only
+//     ever a coordinate-space axis, never an input to that arithmetic. A
+//     Situation recovering from an interrupted call and a Situation waking
+//     from a dependency-recovered park are, from BeginControllerAttempt's
+//     own perspective, the identical situation: "the OLD coordinate space
+//     for this input cannot be safely continued; start counting again in a
+//     fresh one" — reusing the SAME mechanism for both, rather than
+//     inventing a second one, is a deliberate choice, not scope creep.
+//
+// Writing current_material_fact_hash here — normally the exclusive province
+// of CommitController's own fenced commit (BeginControllerAttempt's doc
+// comment: "last set by a prior fenced CommitController commit, never
+// written here" — a statement about BeginControllerAttempt itself, not a
+// whole-file rule) — and controller_retry_epoch (normally only the wake
+// primitive's) is safe specifically because this is a startup-only recovery
+// primitive that runs before any worker resumes live controller work
+// (RecoverInterruptedAssessmentCalls' own doc comment): nothing holds a
+// live claim on this Situation, so nothing else can be concurrently
+// advancing either column.
+//
+// Readers of current_material_fact_hash, and why this write does not break
+// either of them:
+//   - BeginControllerAttempt itself: see point 1 above — the intended fix
+//     for the common (unchanged-basis) case; point 2 covers the rest.
+//   - readControllerParkedStateTx / controllerParkBlocksDispatch
+//     (controller.go): a policy/capability park is only still-blocking when
+//     its recorded basis equals the CURRENT current_material_fact_hash.
+//     Advancing current_material_fact_hash without also addressing a
+//     currently-set controller_parked_reason would make a STALE park (one
+//     recorded against an OLDER basis than the crashed dispatch) look like
+//     it freshly covers the NEW basis, wrongly re-blocking dispatch forever
+//     — a real regression of controller.go's own "Finding I1" invariant
+//     ("a park recorded against a DIFFERENT (older) basis no longer
+//     applies... this cycle must proceed normally, not stay parked
+//     forever"). This is provably not reachable in reverse: Reconcile never
+//     lets a cycle reach BeginControllerAttempt/dispatch while a
+//     still-applicable park covers the CURRENT basis (controllerParkBlocksDispatch
+//     for policy/capability; BeginControllerAttempt's own 5-ceiling for
+//     malformed/dependency-exhausted, which only parks once workAttempts
+//     already reached 5 for the SAME basis, so a fresh dispatch at a lower
+//     workAttempt could not have happened under it either). So the mere
+//     existence of an orphaned call already proves any controller_parked_reason
+//     currently on this row was recorded against a superseded basis —
+//     exactly the same condition under which a live (non-crashed) Reconcile
+//     cycle would itself clear it (either via a clean commit, or via the
+//     freshEpoch branch of its retry/park switch). Clearing it here
+//     restores that same already-lifted state rather than leaving a stale
+//     marker that current_material_fact_hash's own advance would otherwise
+//     make look freshly applicable.
+func advanceControllerBasisForRecoveryTx(ctx context.Context, tx *sql.Tx, situationID, recoveredMaterialFactHash string, recoveredWorkAttempt int, now time.Time) error {
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE situations SET
+			current_material_fact_hash = ?,
+			controller_work_attempts = MAX(controller_work_attempts, ?),
+			controller_retry_epoch = controller_retry_epoch + 1,
+			controller_parked_at = NULL, controller_parked_reason = NULL,
+			updated_at = ?
+		WHERE id = ?`,
+		recoveredMaterialFactHash, recoveredWorkAttempt, canonicalTime(now), situationID); err != nil {
+		return fmt.Errorf("store: advance controller basis for interrupted-call recovery: %w", err)
+	}
+	return nil
 }
 
 type orphanedAssessmentCall struct {
@@ -1107,9 +1306,13 @@ func mergeSituationDueReasonTx(ctx context.Context, tx *sql.Tx, situationID stri
 // see the Task 8 report).
 //
 // sameBasis compares materialFactHash against the CURRENTLY PERSISTED
-// current_material_fact_hash (last set by a prior fenced CommitController
-// commit, never written here): unchanged means this is a continuation of
-// the same input's attempt budget (work_attempts+1, fenced at 5); changed
+// current_material_fact_hash (normally last set by a prior fenced
+// CommitController commit — never written here, in BeginControllerAttempt
+// itself; also written by advanceControllerBasisForRecoveryTx, under
+// RecoverInterruptedAssessmentCalls' own distinct startup-only recovery
+// contract — see that function's doc comment for why that write is safe):
+// unchanged means this is a continuation of the same input's attempt budget
+// (work_attempts+1, fenced at 5); changed
 // means a fresh epoch (work_attempts resets to 1) — this covers BOTH "a
 // genuinely new material input arrived" and "a dependency-recovery
 // generation already reset controller_work_attempts to 0 for this
@@ -1117,7 +1320,10 @@ func mergeSituationDueReasonTx(ctx context.Context, tx *sql.Tx, situationID stri
 // way, current_material_fact_hash still reads as unchanged from THIS
 // input's own perspective, controller_work_attempts reads 0, and 0+1=1
 // naturally starts a fresh attempt count. controller_retry_epoch is
-// returned read-only; only the wake primitive ever writes it.
+// returned read-only — BeginControllerAttempt itself never writes it;
+// wakeOneDependencyRecoveredSituationTx and advanceControllerBasisForRecoveryTx
+// (RecoverInterruptedAssessmentCalls' own recovery-only write — see that
+// function's doc comment) are its only two writers.
 //
 // Returns situation.ErrControllerAttemptsExhausted (not a generic error)
 // when advancing would exceed 5 — Reconcile treats that as "already
