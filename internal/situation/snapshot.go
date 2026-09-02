@@ -3,6 +3,7 @@
 package situation
 
 import (
+	"sort"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/situation/model"
@@ -70,6 +71,29 @@ type TriageState struct {
 	IncidentInputDigest  *string
 	AssessmentID         *string
 	DecidedAt            *time.Time
+
+	// LatestAttempt is the most recent completed incident_triage_attempts
+	// row's normalized result, when one exists — nil until Task 6 adds the
+	// store-side writer and a later task wires LoadReconciliationInput to
+	// populate it. DeriveStoreFacts's acute_finding fact must treat nil as
+	// "no Finding yet" (a legitimate state for a pending/in-flight
+	// Incident), never as confirmed-empty evidence.
+	LatestAttempt *TriageAttemptResult
+}
+
+// TriageAttemptResult is the most recent completed incident_triage_attempts
+// row's normalized result for one Incident. Its fields mirror that table's
+// completion columns exactly (migration 0016_incident_triage_controller.sql:
+// result_code, output_digest, finding_id, evidence_pack_digest,
+// completed_at) — the row's frozen claim-time identity/digest columns
+// belong to the store's own attempt ledger, not this snapshot-facing
+// projection of its outcome.
+type TriageAttemptResult struct {
+	ResultCode         string
+	OutputDigest       string
+	FindingID          *string
+	EvidencePackDigest *string
+	CompletedAt        time.Time
 }
 
 // IncidentState is one member Incident's durable identity/status/timing
@@ -101,4 +125,174 @@ type CompletedSituation struct {
 	EffectiveStartedAt time.Time
 	TerminalAt         time.Time
 	TerminalReason     model.TerminalReason
+}
+
+// ----------------------------------------------------------------------
+// Task 4: pure Snapshot/fact/hash/reason reduction over SnapshotInput. See
+// facts.go (DeriveStoreFacts, MaterialFactHash, AssessmentBasisHash),
+// incident_digest.go (MembershipDigest, IncidentInputDigest), and
+// reasons.go (EligibleReasons) for the rest of this task's pure functions.
+// ----------------------------------------------------------------------
+
+// Symptom is one normalized active symptom derived from a Situation's
+// immutable Deliveries. Plan 2's situation.Delivery (Task 3's deliberate
+// trim of store.AlertDelivery) carries no field distinguishing "the same
+// underlying Alert re-firing" from "a different Alert" beyond its own
+// Delivery.ID and its owning Incident's IncidentID — no alertname, no
+// labels, no fingerprint reach this pure layer. The finest symptom-identity
+// granularity actually available is therefore one Incident's own aggregate
+// delivery lifecycle: Key == IncidentID. Status is the status of the
+// Incident's most-recently-received Delivery (ReceivedAt order, not
+// SourceStartedAt order — the freshest thing the store actually heard is
+// what "currently observed" means); FirstObservedAt is the earliest
+// Delivery's ReceivedAt. This collapses what a later plan may split into a
+// genuine per-Alert-pattern symptom identity distinct from delivery
+// grouping; see the Task 4 report for the full reasoning.
+type Symptom struct {
+	Key             string
+	Status          model.DeliveryStatus
+	FirstObservedAt time.Time
+}
+
+// Snapshot is the canonical, deterministic reduction of one SnapshotInput:
+// everything a Situation controller cycle needs to validate an Assessment
+// proposal or derive a deterministic one, with stable hashes over only its
+// material content. BuildSnapshot is the sole producer.
+type Snapshot struct {
+	SituationID         string
+	InputVersion        int
+	Lifecycle           model.Lifecycle
+	ElapsedSeconds      int64
+	DurationClass       string
+	Facts               []model.Fact
+	Symptoms            []Symptom
+	Incidents           []IncidentState
+	EligibleReasons     []model.ReasonCandidate
+	MaterialFactHash    string
+	AssessmentBasisHash string
+}
+
+// Duration classes. Boundaries are half-open on the low end: subminute
+// covers [0, 1m), short [1m, 15m), medium [15m, 1h), long [1h, inf). These
+// are the only closed values DurationClass returns.
+const (
+	DurationClassSubminute = "subminute"
+	DurationClassShort     = "short"
+	DurationClassMedium    = "medium"
+	DurationClassLong      = "long"
+)
+
+// DurationClass reduces an elapsed duration to its closed class. A negative
+// elapsed value (defensive only — callers clamp via elapsedDuration) is
+// treated as subminute.
+func DurationClass(elapsed time.Duration) string {
+	switch {
+	case elapsed < time.Minute:
+		return DurationClassSubminute
+	case elapsed < 15*time.Minute:
+		return DurationClassShort
+	case elapsed < time.Hour:
+		return DurationClassMedium
+	default:
+		return DurationClassLong
+	}
+}
+
+// durationClassLowerBound returns the elapsed-duration lower bound at which
+// class begins — the "threshold crossing" offset added to
+// EffectiveStartedAt to get the current_duration fact's stable
+// threshold_crossed_at value. Unknown classes return 0 defensively; every
+// class DurationClass can return is handled explicitly.
+func durationClassLowerBound(class string) time.Duration {
+	switch class {
+	case DurationClassSubminute:
+		return 0
+	case DurationClassShort:
+		return time.Minute
+	case DurationClassMedium:
+		return 15 * time.Minute
+	case DurationClassLong:
+		return time.Hour
+	default:
+		return 0
+	}
+}
+
+// elapsedDuration is in.Now - in.Situation.EffectiveStartedAt, clamped to a
+// minimum of 0 so a clock/data anomaly (Now before EffectiveStartedAt)
+// never produces a negative elapsed value.
+func elapsedDuration(in SnapshotInput) time.Duration {
+	elapsed := in.Now.Sub(in.Situation.EffectiveStartedAt)
+	if elapsed < 0 {
+		return 0
+	}
+	return elapsed
+}
+
+// deriveSymptoms reduces deliveries to one Symptom per distinct IncidentID,
+// sorted by Key so the result never depends on deliveries' input order (row
+// order, map iteration, or receipt/retry order). See Symptom's doc comment
+// for why Key == IncidentID in this reduction.
+func deriveSymptoms(deliveries []Delivery) []Symptom {
+	byIncident := make(map[string][]Delivery, len(deliveries))
+	for _, d := range deliveries {
+		byIncident[d.IncidentID] = append(byIncident[d.IncidentID], d)
+	}
+	keys := make([]string, 0, len(byIncident))
+	for k := range byIncident {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	out := make([]Symptom, 0, len(keys))
+	for _, k := range keys {
+		ds := append([]Delivery(nil), byIncident[k]...)
+		sort.Slice(ds, func(i, j int) bool {
+			if !ds[i].ReceivedAt.Equal(ds[j].ReceivedAt) {
+				return ds[i].ReceivedAt.Before(ds[j].ReceivedAt)
+			}
+			return ds[i].ID < ds[j].ID
+		})
+		out = append(out, Symptom{
+			Key:             k,
+			Status:          ds[len(ds)-1].Status,
+			FirstObservedAt: ds[0].ReceivedAt,
+		})
+	}
+	return out
+}
+
+// sortIncidentsByID returns a copy of incidents ordered by ID, never
+// mutating the caller's slice — Snapshot.Incidents must never depend on
+// database row order.
+func sortIncidentsByID(incidents []IncidentState) []IncidentState {
+	out := append([]IncidentState(nil), incidents...)
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// BuildSnapshot is the canonical, deterministic reduction of in into a
+// Snapshot. It is pure: no I/O, no randomness, no clock read beyond in.Now.
+func BuildSnapshot(in SnapshotInput) Snapshot {
+	symptoms := deriveSymptoms(in.Deliveries)
+	elapsed := elapsedDuration(in)
+	class := DurationClass(elapsed)
+	facts := deriveStoreFactsWith(in, symptoms, class)
+	eligible := EligibleReasons(in, symptoms, class)
+	materialHash := MaterialFactHash(in, symptoms, class)
+	basisHash := AssessmentBasisHash(in, materialHash, eligible)
+
+	return Snapshot{
+		SituationID:         in.Situation.ID,
+		InputVersion:        in.Situation.InputVersion,
+		Lifecycle:           in.Situation.Lifecycle,
+		ElapsedSeconds:      int64(elapsed.Seconds()),
+		DurationClass:       class,
+		Facts:               facts,
+		Symptoms:            symptoms,
+		Incidents:           sortIncidentsByID(in.Incidents),
+		EligibleReasons:     eligible,
+		MaterialFactHash:    materialHash,
+		AssessmentBasisHash: basisHash,
+	}
 }
