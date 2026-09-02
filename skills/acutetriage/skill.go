@@ -413,45 +413,46 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	// notifier threads the reply on the existing card, or posts a new one if none.
 	// nil during replay (replayIncidentWith strips it), so this whole block —
 	// including the resolution ownership claim — is a no-op there.
+	incidentStatus, ownsNotification := "", false
 	if s.notifier != nil {
-		incidentStatus, ownsNotification := s.notificationStatus(ctx, inc.ID, p.rejudge)
-		if ownsNotification {
-			f := notify.Finding{
-				IncidentID:          inc.ID,
-				GroupKey:            inc.GroupKey,
-				AnalysisName:        resp.AnalysisName,
-				OverallIssue:        resp.OverallIssue,
-				CorrelationFindings: resp.CorrelationFindings,
-				Severity:            resp.Severity,
-				Confidence:          resp.Confidence,
-				AlertCount:          inc.AlertCount,
-				FirstAlertAt:        inc.FirstAlertAt,
-				AnalyzedAt:          time.Now().UTC(),
-				OutputJSON:          finalRaw,
-				Status:              incidentStatus,
-				Drill:               isDrill(alerts),
-				Evidence:            buildEvidenceSummary(decision.ShortCircuit, ar.metrics, ar.logs, ar.changes, ar.sentry, ar.zabbix),
-				// A degraded round (floor unfetchable, or call 2 lost) shipped without a
-				// full falsification pass — card renderers surface a caveat off this.
-				Unverified: ver != nil && ver.Outcome == verifyOutcomeDegraded,
-				// VerificationInvalidQueries counts locally-invalid/backend-rejected
-				// queries across every round — independent of Unverified, which only
-				// reflects connector/round-level degradation.
-				VerificationInvalidQueries: invalidQueryCount(ver),
-			}
-			if ver != nil {
-				f.DegradationReason = ver.DegradationReason
-			}
-			if p.rejudge && p.recurrenceEpisodes > 1 && !p.recurrenceLastSeen.IsZero() {
-				f.Recurrence = &notify.Recurrence{Episodes: p.recurrenceEpisodes, LastSeen: p.recurrenceLastSeen}
-			}
-			s.attachHistorySteering(ctx, inc, ar, ver, &f)
-			// Multi owns the per-sink notify outcome line(s): a quiet "notified" on
-			// success, a "notify partial"/"notify failed" summary plus one "notify
-			// sink failed" detail line per failing sink. The aggregated error it
-			// returns is already surfaced there, so we don't re-log it here.
-			_ = s.notifier.Notify(ctx, f)
+		incidentStatus, ownsNotification = s.notificationStatus(ctx, inc.ID, p.rejudge)
+	}
+	if ownsNotification {
+		f := notify.Finding{
+			IncidentID:          inc.ID,
+			GroupKey:            inc.GroupKey,
+			AnalysisName:        resp.AnalysisName,
+			OverallIssue:        resp.OverallIssue,
+			CorrelationFindings: resp.CorrelationFindings,
+			Severity:            resp.Severity,
+			Confidence:          resp.Confidence,
+			AlertCount:          inc.AlertCount,
+			FirstAlertAt:        inc.FirstAlertAt,
+			AnalyzedAt:          time.Now().UTC(),
+			OutputJSON:          finalRaw,
+			Status:              incidentStatus,
+			Drill:               isDrill(alerts),
+			Evidence:            buildEvidenceSummary(decision.ShortCircuit, ar.metrics, ar.logs, ar.changes, ar.sentry, ar.zabbix),
+			// A degraded round (floor unfetchable, or call 2 lost) shipped without a
+			// full falsification pass — card renderers surface a caveat off this.
+			Unverified: ver != nil && ver.Outcome == verifyOutcomeDegraded,
+			// VerificationInvalidQueries counts locally-invalid/backend-rejected
+			// queries across every round — independent of Unverified, which only
+			// reflects connector/round-level degradation.
+			VerificationInvalidQueries: invalidQueryCount(ver),
 		}
+		if ver != nil {
+			f.DegradationReason = ver.DegradationReason
+		}
+		if p.rejudge && p.recurrenceEpisodes > 1 && !p.recurrenceLastSeen.IsZero() {
+			f.Recurrence = &notify.Recurrence{Episodes: p.recurrenceEpisodes, LastSeen: p.recurrenceLastSeen}
+		}
+		s.attachHistorySteering(ctx, inc, ar, ver, &f)
+		// Multi owns the per-sink notify outcome line(s): a quiet "notified" on
+		// success, a "notify partial"/"notify failed" summary plus one "notify
+		// sink failed" detail line per failing sink. The aggregated error it
+		// returns is already surfaced there, so we don't re-log it here.
+		_ = s.notifier.Notify(ctx, f)
 	}
 
 	// Audit: incident analyzed (carrying the trigger on a re-judgment and the
