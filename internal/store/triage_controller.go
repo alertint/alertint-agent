@@ -49,6 +49,13 @@ var ErrTriageNotDecided = errors.New("store: incident triage row has no controll
 // conflict, not an idempotent replay.
 var ErrTriageAttemptCompletedDifferently = errors.New("store: incident triage attempt already completed with different content")
 
+// ErrTriageNotDue means a claim was attempted against an incident_triage row
+// that is pending/backoff and carries a controller decision, but whose
+// next_at has not yet arrived — the row exists and is claimable, just not
+// yet, unlike ErrNotFound (no such claimable row at all) or
+// ErrTriageNotDecided (claimable timing-wise, but never decided).
+var ErrTriageNotDue = errors.New("store: incident triage row is not yet due")
+
 const triageDecisionOriginController = "controller_decision"
 const triageDecisionOriginUpgrade = "upgrade_existing_schedule"
 
@@ -373,7 +380,8 @@ type ClaimedTriageAttempt struct {
 // ("Beginning an attempt likewise appends triage_retry_changed so the
 // controller can change the durable contract from planned to running").
 // Returns ErrNotFound if the row is not currently pending/backoff for a
-// ready Incident, or ErrTriageNotDecided if it has never received a
+// ready Incident, ErrTriageNotDue if it is pending/backoff but its next_at
+// has not yet arrived, or ErrTriageNotDecided if it has never received a
 // controller decision.
 func (s *Store) ClaimIncidentTriageAttempt(ctx context.Context, incidentID, owner string, now time.Time, lease time.Duration) (ClaimedTriageAttempt, error) {
 	if strings.TrimSpace(incidentID) == "" || strings.TrimSpace(owner) == "" || lease <= 0 {
@@ -389,13 +397,13 @@ func (s *Store) ClaimIncidentTriageAttempt(ctx context.Context, incidentID, owne
 
 	var phase string
 	var attempts int
-	var situationID, groupKey sql.NullString
+	var situationID, groupKey, nextAtStr sql.NullString
 	var decisionInputVersion sql.NullInt64
 	err = tx.QueryRowContext(ctx, `
-		SELECT t.phase, t.attempts, t.situation_id, t.decision_input_version, i.group_key
+		SELECT t.phase, t.attempts, t.situation_id, t.decision_input_version, t.next_at, i.group_key
 		FROM incident_triage t JOIN incidents i ON i.id = t.incident_id
 		WHERE t.incident_id = ? AND i.status = 'ready'`, incidentID).
-		Scan(&phase, &attempts, &situationID, &decisionInputVersion, &groupKey)
+		Scan(&phase, &attempts, &situationID, &decisionInputVersion, &nextAtStr, &groupKey)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ClaimedTriageAttempt{}, ErrNotFound
 	}
@@ -404,6 +412,13 @@ func (s *Store) ClaimIncidentTriageAttempt(ctx context.Context, incidentID, owne
 	}
 	if phase != "pending" && phase != "backoff" {
 		return ClaimedTriageAttempt{}, ErrNotFound
+	}
+	nextAt, err := timePtr(nextAtStr)
+	if err != nil {
+		return ClaimedTriageAttempt{}, err
+	}
+	if nextAt != nil && nextAt.After(now) {
+		return ClaimedTriageAttempt{}, ErrTriageNotDue
 	}
 	if !situationID.Valid || !decisionInputVersion.Valid {
 		return ClaimedTriageAttempt{}, ErrTriageNotDecided

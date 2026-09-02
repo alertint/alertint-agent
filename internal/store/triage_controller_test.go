@@ -495,6 +495,61 @@ func TestClaimDueIncidentTriageSecondClaimFailsWhileInFlight(t *testing.T) {
 	}
 }
 
+// TestClaimDueIncidentTriageBackoffRowNotYetDueFailsWithErrTriageNotDue pins
+// the claim boundary's due-gate: a backoff row whose next_at has not
+// arrived is claimable-shaped (decided, pending/backoff phase) but must
+// still be refused, distinctly from ErrNotFound/ErrTriageNotDecided.
+func TestClaimDueIncidentTriageBackoffRowNotYetDueFailsWithErrTriageNotDue(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "claim-not-due", now)
+	claim := mustClaim(t, st, f, now)
+
+	nextAt := now.Add(time.Hour)
+	if err := st.BackoffIncidentTriageAttempt(ctx, claim.AttemptID, f.IncidentID, nextAt, "timeout", "deadline exceeded", now.Add(time.Minute)); err != nil {
+		t.Fatalf("backoff: %v", err)
+	}
+
+	if _, err := st.ClaimIncidentTriageAttempt(ctx, f.IncidentID, "worker-2", nextAt.Add(-time.Second), time.Minute); !errors.Is(err, ErrTriageNotDue) {
+		t.Fatalf("claim one second before next_at = %v, want ErrTriageNotDue", err)
+	}
+
+	// The refused claim must not have disturbed the schedule at all.
+	tr := triageRow(t, st, f.IncidentID)
+	if tr.Phase != "backoff" {
+		t.Fatalf("phase after refused claim = %q, want backoff (untouched)", tr.Phase)
+	}
+}
+
+// TestClaimDueIncidentTriageBackoffRowDueClaimsSuccessfully is the positive
+// control for the above: the identical row, claimed at (not before) its own
+// next_at, succeeds and consumes the next attempt slot.
+func TestClaimDueIncidentTriageBackoffRowDueClaimsSuccessfully(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "claim-due", now)
+	claim := mustClaim(t, st, f, now)
+
+	nextAt := now.Add(time.Hour)
+	if err := st.BackoffIncidentTriageAttempt(ctx, claim.AttemptID, f.IncidentID, nextAt, "timeout", "deadline exceeded", now.Add(time.Minute)); err != nil {
+		t.Fatalf("backoff: %v", err)
+	}
+
+	got, err := st.ClaimIncidentTriageAttempt(ctx, f.IncidentID, "worker-2", nextAt, time.Minute)
+	if err != nil {
+		t.Fatalf("claim exactly at next_at: %v", err)
+	}
+	if got.AttemptNumber != 2 {
+		t.Fatalf("AttemptNumber = %d, want 2", got.AttemptNumber)
+	}
+	tr := triageRow(t, st, f.IncidentID)
+	if tr.Phase != "in_flight" || tr.Attempts != 2 {
+		t.Fatalf("phase=%q attempts=%d, want in_flight/2", tr.Phase, tr.Attempts)
+	}
+}
+
 // ----------------------------------------------------------------------
 // CompleteIncidentTriageAttempt / "TestCompleteIncidentTriageAttempt*".
 // ----------------------------------------------------------------------
@@ -754,6 +809,112 @@ func TestExhaustIncidentTriageAttemptClosesIncidentFailedAndAppendsExhausted(t *
 	}
 	if n := countSituationInputs(t, st, f.IncidentID, "triage_exhausted"); n != 1 {
 		t.Fatalf("triage_exhausted inputs = %d, want exactly 1", n)
+	}
+}
+
+// ----------------------------------------------------------------------
+// ExtendIncidentTriageLease.
+// ----------------------------------------------------------------------
+
+// leaseExpiresAt reads incident_triage.lease_expires_at directly for
+// incidentID — the column ExtendIncidentTriageLease's whole job is to push
+// forward.
+func leaseExpiresAt(t *testing.T, st *Store, incidentID string) time.Time {
+	t.Helper()
+	var s string
+	if err := st.db.QueryRowContext(context.Background(), `
+		SELECT lease_expires_at FROM incident_triage WHERE incident_id = ?`, incidentID).Scan(&s); err != nil {
+		t.Fatal(err)
+	}
+	got, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+func TestExtendIncidentTriageLeasePushesExpiryForwardForCurrentOwner(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "extend-basic", now)
+	claim := mustClaim(t, st, f, now)
+
+	extendAt := now.Add(30 * time.Second)
+	if err := st.ExtendIncidentTriageLease(ctx, claim.AttemptID, f.IncidentID, claim.LeaseOwner, extendAt, time.Minute); err != nil {
+		t.Fatalf("extend: %v", err)
+	}
+
+	got := leaseExpiresAt(t, st, f.IncidentID)
+	want := extendAt.Add(time.Minute)
+	if !got.Equal(want) {
+		t.Fatalf("lease_expires_at = %v, want %v (heartbeat pushed forward)", got, want)
+	}
+	// A successful heartbeat must not disturb phase/owner/attempt identity.
+	tr := triageRow(t, st, f.IncidentID)
+	if tr.Phase != "in_flight" {
+		t.Fatalf("phase = %q, want in_flight (unchanged by extend)", tr.Phase)
+	}
+	if !tr.LeaseOwner.Valid || tr.LeaseOwner.String != claim.LeaseOwner {
+		t.Fatalf("lease_owner = %v, want unchanged %q", tr.LeaseOwner, claim.LeaseOwner)
+	}
+	if !tr.CurrentAttemptID.Valid || tr.CurrentAttemptID.String != claim.AttemptID {
+		t.Fatalf("current_attempt_id = %v, want unchanged %q", tr.CurrentAttemptID, claim.AttemptID)
+	}
+}
+
+func TestExtendIncidentTriageLeaseWrongOwnerFailsWithLeaseLost(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "extend-wrong-owner", now)
+	claim := mustClaim(t, st, f, now)
+	before := leaseExpiresAt(t, st, f.IncidentID)
+
+	err := st.ExtendIncidentTriageLease(ctx, claim.AttemptID, f.IncidentID, "someone-else", now.Add(30*time.Second), time.Minute)
+	if !errors.Is(err, ErrTriageAttemptLeaseLost) {
+		t.Fatalf("extend with wrong owner = %v, want ErrTriageAttemptLeaseLost", err)
+	}
+	if got := leaseExpiresAt(t, st, f.IncidentID); !got.Equal(before) {
+		t.Fatalf("lease_expires_at changed by a rejected extend: %v, want unchanged %v", got, before)
+	}
+}
+
+func TestExtendIncidentTriageLeaseWrongAttemptIDFailsWithLeaseLost(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "extend-wrong-attempt", now)
+	claim := mustClaim(t, st, f, now)
+	before := leaseExpiresAt(t, st, f.IncidentID)
+
+	err := st.ExtendIncidentTriageLease(ctx, "not-the-current-attempt-id", f.IncidentID, claim.LeaseOwner, now.Add(30*time.Second), time.Minute)
+	if !errors.Is(err, ErrTriageAttemptLeaseLost) {
+		t.Fatalf("extend with a stale/wrong attempt id = %v, want ErrTriageAttemptLeaseLost", err)
+	}
+	if got := leaseExpiresAt(t, st, f.IncidentID); !got.Equal(before) {
+		t.Fatalf("lease_expires_at changed by a rejected extend: %v, want unchanged %v", got, before)
+	}
+}
+
+// TestExtendIncidentTriageLeaseAgainstNonInFlightRowFailsWithLeaseLost pins
+// the phase fence: once the schedule has moved off in_flight (here, backed
+// off by a recovery pass or a genuinely completing worker), a heartbeat
+// naming the old attempt/owner must fail rather than resurrect a dead lease.
+func TestExtendIncidentTriageLeaseAgainstNonInFlightRowFailsWithLeaseLost(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "extend-not-in-flight", now)
+	claim := mustClaim(t, st, f, now)
+
+	if err := st.BackoffIncidentTriageAttempt(ctx, claim.AttemptID, f.IncidentID, now.Add(time.Hour), "timeout", "x", now.Add(time.Minute)); err != nil {
+		t.Fatalf("backoff: %v", err)
+	}
+
+	err := st.ExtendIncidentTriageLease(ctx, claim.AttemptID, f.IncidentID, claim.LeaseOwner, now.Add(2*time.Minute), time.Minute)
+	if !errors.Is(err, ErrTriageAttemptLeaseLost) {
+		t.Fatalf("extend against a backed-off row = %v, want ErrTriageAttemptLeaseLost", err)
 	}
 }
 
