@@ -238,6 +238,54 @@ specific to your environment; see
 | `verification.max_rounds` | int | `1` | Reserved for future multi-round verification; values greater than 1 are rejected. Today only `1` is supported. |
 | `extra_selector_labels` | list | — | Extra alert-label keys (topology labels like `cluster` or `region`) added to the built-in selector allowlist (`namespace, service, job, pod, container, instance`) used to build metric/log enrichment queries and the verification floor's peer scope. Extras join every query and are never dropped by fallback queries. Use topology labels, not identity labels. |
 
+## `situations`
+
+**Integration-branch config, not yet the `main`-branch default.** This
+section configures the fenced Situation controller and the "B+" Acute
+Triage gate — durable, integration-tested work landing on the
+`state-controller` branch (see [Architecture: Situation foundation and
+controller](../concepts/architecture.md#3a-situation-foundation-and-controller)).
+A released binary built from `main` does not read this section at all.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `workers` | int | `2` | How many claimed Situations one controller poll reconciles concurrently. |
+| `reconcile_poll_seconds` | int | `1` | How often the controller's background loop wakes on its own, absent an earlier wake from a fresh Situation input. |
+| `lease_seconds` | int | `300` | How long a claimed Situation's lease is held before another poll may reclaim it as expired — shared by the controller and the Acute Triage attempt claim. |
+| `heartbeat_seconds` | int | `30` | How often a claimed Situation's (or Triage attempt's) lease is renewed while work is still running. |
+| `webhook_recovery_grace_seconds` | int | `120` | Fixed recovery-grace/observation-deadline base for a webhook (or receipt-fallback) delivery — how long a Situation waits past its last firing symptom before a lifecycle transition (recovered / closed-unknown) is considered. |
+| `cadence.fast_seconds` | int | `120` | Reconsideration tempo for a Situation currently in the fast cadence tier. Documents the fixed 2-minute fast-cadence interval `internal/situation` derives internally — not independently tunable yet (see below). |
+| `cadence.normal_seconds` | int | `300` | Reconsideration tempo for the normal cadence tier. Documents the fixed 5-minute interval — not independently tunable yet. |
+| `cadence.slow_seconds` | int | `900` | Reconsideration tempo for the slow cadence tier. Documents the fixed 15-minute interval — not independently tunable yet. |
+| `max_l2_calls_per_attempt` | int | `2` | Durable L2 (Situation Assessment) provider-dispatch slots one controller work attempt may consume: the draft call plus at most one immediate malformed-shape correction. Shipped as a config key so the wire shape documents the ceiling; any value other than `2` is rejected — not tunable in this build. |
+| `max_work_attempts_per_input` | int | `5` | Durable controller attempts one unchanged Situation input may consume before semantic work parks. Any value other than `5` is rejected — not tunable in this build. |
+| `attempt_wall_seconds` | int | `180` | Wall-clock budget for one controller reconcile cycle. |
+| `llm_concurrency` | int | `2` | Global semaphore bounding concurrent L2 provider calls across every Situation the controller is reconciling at once. |
+| `retry.min_seconds` | int | `5` | Floor of the controller's transient-failure retry backoff (exponential from here, capped at `retry.max_seconds`). |
+| `retry.max_seconds` | int | `300` | Ceiling of the controller's transient-failure retry backoff. |
+| `retry.jitter_percent` | int | `20` | Jitter fraction (±) applied to the computed backoff, so concurrently-parked Situations don't all retry in lockstep. |
+
+Cadence is persisted scheduling machinery, not card content — it only
+widens or narrows how soon the controller next reconciles a nonterminal
+Situation; there is no `off` setting. `cadence.*`'s three values are
+documentation of a fixed internal schedule today, not a live knob: nothing
+in `internal/situation` yet reads them back out. If a future release wires
+a live cadence parameter through, these same keys become the tunable
+source of truth.
+
+`max_l2_calls_per_attempt` and `max_work_attempts_per_input` are
+deliberately fixed. There is no `situations.budgets.max_l1_llm_calls` (or
+any other L1/Acute-Triage call-budget) key in this section — Acute Triage
+keeps its own, already-documented five-attempt schedule (see
+[`triage`](#triage) above and [Incident
+lifecycle](../concepts/architecture.md#incident-lifecycle)); the controller
+introduces no separate, parallel budget for it. A one-hour startup horizon
+that closes out any Situation-owned Triage schedule row still overdue an
+hour past boot is enforced automatically and is not configurable here —
+see [Incident lifecycle: Restart
+recovery](../concepts/architecture.md#incident-lifecycle) for that
+behavior.
+
 ## `health`
 
 Installation dependency health for the LLM. Real triage calls are the primary

@@ -133,6 +133,54 @@ func TestAppendSituationFactsConflictingContentFailsClosed(t *testing.T) {
 	}
 }
 
+// TestAppendSituationFactsLaterObservedAtSameContentSucceeds is the Task 10
+// replay finding's own regression test: DeriveStoreFacts (internal/situation/
+// facts.go) sets every fact's ObservedAt fresh to "now" on EVERY call — so a
+// genuine retry of Reconcile's own unconditional second step for an
+// UNCHANGED input (a transient L2 failure, a stale-claim race, or a crash
+// after this exact append but before the cycle's own CommitController ever
+// runs) always re-derives byte-identical semantic content (same Digest) at
+// a strictly LATER wall-clock instant. Before the fix, appendFactTx's own
+// conflict check additionally compared observed_at, so this exact retry
+// failed closed with ErrImmutableConflict every single time — permanently
+// wedging the Situation, since AppendSituationFacts runs before every other
+// failure mode Reconcile has. observed_at is bookkeeping, not content:
+// Digest already carries the fact's real semantic identity, so a later
+// observed_at on an otherwise-identical fact must succeed as a no-op,
+// exactly like TestAppendSituationFactsIdempotentReplaySucceeds's own
+// byte-identical replay — just discovered later.
+func TestAppendSituationFactsLaterObservedAtSameContentSucceeds(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-facts-later-observed", now)
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+
+	if err := st.AppendSituationFacts(context.Background(), claim, []situationmodel.Fact{factFixture("fact-1", sitID, 1, now)}); err != nil {
+		t.Fatalf("first append: %v", err)
+	}
+
+	retried := factFixture("fact-1", sitID, 1, now.Add(20*time.Minute))
+	if err := st.AppendSituationFacts(context.Background(), claim, []situationmodel.Fact{retried}); err != nil {
+		t.Fatalf("retry append with a later observed_at (same digest/content): %v", err)
+	}
+
+	var count int
+	if err := st.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM situation_facts WHERE id = 'fact-1'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("situation_facts rows for fact-1 = %d, want 1 (a later observed_at on an otherwise-identical fact must not duplicate)", count)
+	}
+
+	var storedObservedAt string
+	if err := st.db.QueryRowContext(context.Background(), `SELECT observed_at FROM situation_facts WHERE id = 'fact-1'`).Scan(&storedObservedAt); err != nil {
+		t.Fatal(err)
+	}
+	if want := canonicalTime(now); storedObservedAt != want {
+		t.Fatalf("stored observed_at = %q, want the FIRST write's %q preserved (never overwritten by a later retry)", storedObservedAt, want)
+	}
+}
+
 func TestAppendSituationFactsFencedOnStaleClaim(t *testing.T) {
 	st := newTestStore(t)
 	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)

@@ -132,6 +132,36 @@ func factIdentity(prefix, situationID string, inputVersion int, subject string) 
 	return fmt.Sprintf("%s:%s:%d:%s", prefix, situationID, inputVersion, subject)
 }
 
+// factIdentityWithContent extends factIdentity with the fact's own content
+// digest (Task 10 replay finding): incident_triage_state and acute_finding
+// are the two fact kinds whose content is not purely a function of
+// (situationID, inputVersion, subject) — both read live, controller-owned
+// Acute Triage schedule/attempt state (Phase/Attempts/Decision/
+// DecisionReason; LatestAttempt's ResultCode/OutputDigest/FindingID) that
+// legitimately advances WITHOUT the Situation's own input_version changing
+// at all: a controller commit for THIS SAME cycle (DecideTriage's own
+// request/skip decision, applied inside CommitController) already changes
+// what the VERY NEXT reconcile of the unchanged input observes, and so does
+// an independent Acute Triage worker completing/backing off/exhausting an
+// attempt in between two controller cycles. Every other fact kind
+// (incident_membership, source_symptom_state, current_duration, ...) reads
+// only data that changes exactly when input_version does, so
+// factIdentity's plain (prefix, situationID, inputVersion, subject) scheme
+// is already a stable identity for those. For these two, appending the
+// content digest makes each genuinely DISTINCT observation (a different
+// Phase, a newly-completed attempt) its own immutable row — collapsing back
+// to the SAME id, and so a safe idempotent no-op via AppendSituationFacts'
+// own ON CONFLICT DO NOTHING, only when the content is ALSO unchanged.
+// Without this, a second reconcile of an unchanged input that observes
+// live Triage progress the first reconcile's own commit (or an
+// independent Triage completion) just produced fails closed forever with
+// ErrImmutableConflict — not a crash-only edge case: any Situation
+// reconciled more than once at the same input_version while Triage
+// progresses hits it in ordinary operation.
+func factIdentityWithContent(prefix, situationID string, inputVersion int, subject string, digest string) string {
+	return factIdentity(prefix, situationID, inputVersion, subject) + ":" + digest
+}
+
 // sortFacts orders facts by (kind, subject, id) so DeriveStoreFacts' output
 // never depends on the order its private derive* helpers appended them in.
 func sortFacts(facts []model.Fact) {
@@ -309,12 +339,16 @@ func deriveIncidentTriageStateFacts(situationID string, inputVersion int, now ti
 		if inc.Triage.Phase == "" {
 			status = model.FactUnavailable
 		}
+		digest := canonicalDigest(value)
 		facts = append(facts, model.Fact{
-			ID:           factIdentity(factKindIncidentTriageState, situationID, inputVersion, inc.ID),
+			// factIdentityWithContent, not plain factIdentity: see its own
+			// doc comment — this fact's content (Phase/Attempts/Decision)
+			// legitimately advances within one unchanged input_version.
+			ID:           factIdentityWithContent(factKindIncidentTriageState, situationID, inputVersion, inc.ID, digest),
 			SituationID:  situationID,
 			Kind:         factKindIncidentTriageState,
 			Subject:      inc.ID,
-			Digest:       canonicalDigest(value),
+			Digest:       digest,
 			InputVersion: inputVersion,
 			Value:        mustMarshal(value),
 			ResultStatus: status,
@@ -352,12 +386,17 @@ func deriveAcuteFindingFacts(situationID string, inputVersion int, now time.Time
 			value.EvidencePackDigest = la.EvidencePackDigest
 			status = model.FactConfirmedValue
 		}
+		digest := canonicalDigest(value)
 		facts = append(facts, model.Fact{
-			ID:           factIdentity(factKindAcuteFinding, situationID, inputVersion, inc.ID),
+			// factIdentityWithContent, not plain factIdentity: see its own
+			// doc comment — LatestAttempt can advance (nil -> a completed
+			// attempt's ResultCode/OutputDigest/FindingID) within one
+			// unchanged input_version, independent of any controller commit.
+			ID:           factIdentityWithContent(factKindAcuteFinding, situationID, inputVersion, inc.ID, digest),
 			SituationID:  situationID,
 			Kind:         factKindAcuteFinding,
 			Subject:      inc.ID,
-			Digest:       canonicalDigest(value),
+			Digest:       digest,
 			InputVersion: inputVersion,
 			Value:        mustMarshal(value),
 			ResultStatus: status,

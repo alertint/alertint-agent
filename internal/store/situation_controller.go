@@ -545,18 +545,34 @@ func appendFactTx(ctx context.Context, tx *sql.Tx, p preparedFact) error {
 		return nil
 	}
 
-	var situationID, kind, subject, digest, valueJSON, resultStatus, evidenceRefsJSON, observedAt string
+	var situationID, kind, subject, digest, valueJSON, resultStatus, evidenceRefsJSON string
 	var inputVersion, material int
 	err = tx.QueryRowContext(ctx, `
-		SELECT situation_id, input_version, kind, subject, digest, value_json, result_status, evidence_refs_json, material, observed_at
+		SELECT situation_id, input_version, kind, subject, digest, value_json, result_status, evidence_refs_json, material
 		FROM situation_facts WHERE id = ?`, p.f.ID).Scan(
-		&situationID, &inputVersion, &kind, &subject, &digest, &valueJSON, &resultStatus, &evidenceRefsJSON, &material, &observedAt)
+		&situationID, &inputVersion, &kind, &subject, &digest, &valueJSON, &resultStatus, &evidenceRefsJSON, &material)
 	if err != nil {
 		return fmt.Errorf("store: read existing situation fact %s: %w", p.f.ID, err)
 	}
+	// observed_at is deliberately excluded from this equality check (Task 10
+	// replay finding): every DeriveStoreFacts call (facts.go) sets it fresh
+	// to the CURRENT "now", never as part of a fact's own semantic identity
+	// or content — Digest, already compared above, is what carries that. A
+	// genuine retry of the SAME unchanged input (a transient L2 failure, a
+	// stale-claim race releasing and re-claiming the same Situation, or a
+	// crash after this exact commit but before the cycle's own
+	// CommitController ever runs) always re-derives an IDENTICAL fact at a
+	// LATER wall-clock instant — comparing observed_at here made every such
+	// retry fail closed with ErrImmutableConflict forever, permanently
+	// wedging the Situation, since AppendSituationFacts runs unconditionally
+	// as Reconcile's own second step, before any other failure mode this
+	// package has. The row's own first-recorded observed_at (preserved by
+	// this method's ON CONFLICT DO NOTHING insert, untouched here) is
+	// authoritative and simply stands, exactly like the row's own immutable
+	// id.
 	if situationID != p.f.SituationID || inputVersion != p.f.InputVersion || kind != p.f.Kind || subject != p.f.Subject ||
 		digest != p.f.Digest || valueJSON != p.valueJSON || resultStatus != string(p.f.ResultStatus) ||
-		evidenceRefsJSON != p.evidenceRefsJSON || material != p.material || observedAt != p.observedAt {
+		evidenceRefsJSON != p.evidenceRefsJSON || material != p.material {
 		return fmt.Errorf("store: situation fact %s: %w", p.f.ID, ErrImmutableConflict)
 	}
 	return nil

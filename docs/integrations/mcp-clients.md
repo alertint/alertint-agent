@@ -135,8 +135,8 @@ restart Windsurf and check **Settings → MCP Servers**:
 | `alertint_search_alerts` | Search raw alerts by label key and value. |
 | `alertint_get_evidence_pack` | Get the evidence pack and Prometheus metrics for an incident. |
 | `alertint_verify_audit` | Verify the hash-chained audit log and report any tampering. |
-| `alertint_list_situations` | List durable Situations — the exact-group lineage that durably owns one or more Incidents — most recently updated first. Foundation state only: no controller Assessment or operator contract exists yet. |
-| `alertint_get_situation` | Get one Situation by id or public handle, with its member Incidents. `assessment` and `operator_contract` are always `null` — there is no Situation controller yet to produce either. |
+| `alertint_list_situations` | List durable Situations — the exact-group lineage that durably owns one or more Incidents — most recently updated first. A bounded summary: lifecycle/attention/scheduling fields and due reasons only, no Assessment or controller detail (use `alertint_get_situation` for that) and no Slack presence. |
+| `alertint_get_situation` | Get one Situation by id or public handle: its immutable member Incidents (each with its current Triage decision/phase/attempts/due time/covered digests), the current authoritative Assessment and derivation, current operator contract, material/Assessment-basis hashes, up to 20 bounded sanitized recent Assessment attempts, and controller retry/park state. `assessment`/`operator_contract`/the hash fields render as explicit `null`, and `recent_attempts` as an empty array, for a Situation the controller has not reconciled at least once yet — never an error, and never a fabricated placeholder. |
 | `prometheus_query` | Instant PromQL query against the connected Prometheus (requires Prometheus enabled). |
 | `prometheus_query_range` | Range PromQL query with auto-stepped resolution (requires Prometheus enabled). |
 | `loki_query_range` | Range-query the configured log backend using its native query language (requires a log source enabled). |
