@@ -211,6 +211,144 @@ func TestSituationControllerViewIncludesCurrentTriageState(t *testing.T) {
 	}
 }
 
+// TestSituationControllerViewIncludesCurrentAssessmentContentAndDerivation
+// proves Task 9's own MCP-facing extension: the current authoritative
+// Assessment's full content (persistence/impact/.../sufficient_reason with
+// its evidence refs/schema version) and its derivation are read straight off
+// the referenced attempt row's assessment_json/derivation columns — never a
+// rejected proposal, never provider content.
+func TestSituationControllerViewIncludesCurrentAssessmentContentAndDerivation(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-view-assessment-content", now)
+
+	fixture := validAssessmentFixture()
+	assessmentJSON, err := json.Marshal(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(context.Background(), `
+		INSERT INTO situation_assessment_attempts (
+			id, situation_id, sequence, input_version, work_attempt, status, derivation,
+			provider_request_started, material_fact_hash, assessment_json, created_at, completed_at
+		) VALUES ('attempt-content', ?, 1, 1, 1, 'authoritative', 'deterministic_controller', 'false', 'sha256:material-content', ?, ?, ?)`,
+		sitID, string(assessmentJSON), now.UTC().Format(time.RFC3339Nano), now.UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(context.Background(), `
+		UPDATE situations SET current_assessment_id = 'attempt-content' WHERE id = ?`, sitID); err != nil {
+		t.Fatal(err)
+	}
+
+	view, err := st.GetSituationControllerView(context.Background(), sitID)
+	if err != nil {
+		t.Fatalf("GetSituationControllerView: %v", err)
+	}
+	if view.CurrentAssessment == nil {
+		t.Fatal("current assessment = nil, want the full assessment content")
+	}
+	if view.CurrentAssessment.Persistence != fixture.Persistence || view.CurrentAssessment.Impact != fixture.Impact {
+		t.Fatalf("current assessment content = %+v, want %+v", view.CurrentAssessment, fixture)
+	}
+	if view.CurrentAssessment.SchemaVersion != fixture.SchemaVersion {
+		t.Fatalf("current assessment schema_version = %d, want %d", view.CurrentAssessment.SchemaVersion, fixture.SchemaVersion)
+	}
+	if view.CurrentDerivation == nil || *view.CurrentDerivation != situationmodel.DerivationDeterministic {
+		t.Fatalf("current derivation = %v, want deterministic_controller", view.CurrentDerivation)
+	}
+}
+
+// TestSituationControllerViewIncludesControllerRetryParkState proves Task
+// 9's own MCP-facing extension: retry epoch, work attempts, parked
+// at/reason, retry_at, and last_error_class read straight off situations'
+// own columns.
+func TestSituationControllerViewIncludesControllerRetryParkState(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-view-retry-park", now)
+
+	if _, err := st.db.ExecContext(context.Background(), `
+		UPDATE situations SET
+			controller_retry_epoch = 2, controller_work_attempts = 3,
+			controller_parked_at = ?, controller_parked_reason = 'dependency_exhausted',
+			retry_at = ?, last_error_class = 'transport_failure'
+		WHERE id = ?`,
+		now.UTC().Format(time.RFC3339Nano), now.Add(5*time.Minute).UTC().Format(time.RFC3339Nano), sitID); err != nil {
+		t.Fatal(err)
+	}
+
+	view, err := st.GetSituationControllerView(context.Background(), sitID)
+	if err != nil {
+		t.Fatalf("GetSituationControllerView: %v", err)
+	}
+	if view.Retry.RetryEpoch != 2 || view.Retry.WorkAttempts != 3 {
+		t.Fatalf("retry state = %+v, want retry_epoch=2 work_attempts=3", view.Retry)
+	}
+	if view.Retry.ParkedAt == nil || !view.Retry.ParkedAt.Equal(now) {
+		t.Fatalf("parked_at = %v, want %v", view.Retry.ParkedAt, now)
+	}
+	if view.Retry.ParkedReason == nil || *view.Retry.ParkedReason != "dependency_exhausted" {
+		t.Fatalf("parked_reason = %v, want dependency_exhausted", view.Retry.ParkedReason)
+	}
+	if view.Retry.RetryAt == nil || !view.Retry.RetryAt.Equal(now.Add(5*time.Minute)) {
+		t.Fatalf("retry_at = %v, want %v", view.Retry.RetryAt, now.Add(5*time.Minute))
+	}
+	if view.Retry.LastErrorClass == nil || *view.Retry.LastErrorClass != "transport_failure" {
+		t.Fatalf("last_error_class = %v, want transport_failure", view.Retry.LastErrorClass)
+	}
+}
+
+// TestSituationControllerViewIncludesTriageDueTimeAndCoveredDigests proves
+// Task 9's own MCP-facing extension: each member Incident's Triage view now
+// also carries its due time (next_at) and the covered digests (membership,
+// Incident-input) the decision was made against.
+func TestSituationControllerViewIncludesTriageDueTimeAndCoveredDigests(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	groupKey := "group-view-triage-digests"
+	incID, deliveryID := "inc-view-triage-digests", "delivery-view-triage-digests"
+	if _, err := st.AcceptDeliveries(context.Background(), []DeliveryInput{deliveryFixtureWithSource(
+		deliveryID, "fp-view-triage-digests", now, now, situationmodel.SourceTimeBasisSourcePayload,
+	)}); err != nil {
+		t.Fatal(err)
+	}
+	insertIncidentAndDeliveryInput(t, st, incID, "input-view-triage-digests", groupKey, deliveryID, now)
+	claim := claimOneInput(t, st, "worker-a", now)
+	if err := st.ApplySituationInput(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	var sitID string
+	if err := st.db.QueryRowContext(context.Background(), `SELECT id FROM situations WHERE group_key = ? AND lifecycle IN ('active','recovery_pending')`, groupKey).Scan(&sitID); err != nil {
+		t.Fatal(err)
+	}
+
+	nextAt := now.Add(2 * time.Minute)
+	if _, err := st.db.ExecContext(context.Background(), `
+		INSERT INTO incident_triage (incident_id, phase, attempts, next_at, membership_digest, incident_input_digest, updated_at)
+		VALUES (?, 'backoff', 1, ?, 'sha256:membership', 'sha256:incident-input', ?)`,
+		incID, nextAt.UTC().Format(time.RFC3339Nano), now.UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+
+	view, err := st.GetSituationControllerView(context.Background(), sitID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Triage) != 1 {
+		t.Fatalf("triage views = %+v, want exactly 1", view.Triage)
+	}
+	got := view.Triage[0]
+	if got.NextAt == nil || !got.NextAt.Equal(nextAt) {
+		t.Fatalf("next_at = %v, want %v", got.NextAt, nextAt)
+	}
+	if got.MembershipDigest == nil || *got.MembershipDigest != "sha256:membership" {
+		t.Fatalf("membership_digest = %v, want sha256:membership", got.MembershipDigest)
+	}
+	if got.IncidentInputDigest == nil || *got.IncidentInputDigest != "sha256:incident-input" {
+		t.Fatalf("incident_input_digest = %v, want sha256:incident-input", got.IncidentInputDigest)
+	}
+}
+
 func TestSituationControllerViewUnknownSituationReturnsErrNotFound(t *testing.T) {
 	st := newTestStore(t)
 	_, err := st.GetSituationControllerView(context.Background(), "does-not-exist")

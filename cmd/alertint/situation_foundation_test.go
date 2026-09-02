@@ -55,7 +55,11 @@ func assertTrace(t *testing.T, got, want []string) {
 }
 
 // tracedFoundationSequence builds a foundationSequence whose every phase
-// succeeds and appends its own name to tr, in call order.
+// succeeds and appends its own name to tr, in call order — including Task
+// 9's own two additional phases (backfillAndRecoverControllerWork,
+// startControllerWorkers), so this file's own order-proving tests exercise
+// the full six-phase sequence the plan's startup order actually specifies,
+// not just the four Plan 1 phases.
 func tracedFoundationSequence(tr *tracer) foundationSequence {
 	return foundationSequence{
 		reconstruct: func(context.Context) error {
@@ -65,6 +69,13 @@ func tracedFoundationSequence(tr *tracer) foundationSequence {
 			tr.add("reconstruct_incidents")
 			return nil
 		},
+		backfillAndRecoverControllerWork: func(context.Context) error {
+			tr.add("triage_migration_backfill")
+			tr.add("recover_interrupted_assessment_calls")
+			tr.add("recover_interrupted_triage_attempts")
+			tr.add("enforce_triage_startup_horizon")
+			return nil
+		},
 		startCorrelator: func(context.Context) error {
 			tr.add("start_correlator")
 			return nil
@@ -72,6 +83,10 @@ func tracedFoundationSequence(tr *tracer) foundationSequence {
 		startWorkers: func(context.Context) {
 			tr.add("start_input_worker")
 			tr.add("start_dispatch_worker")
+		},
+		startControllerWorkers: func(context.Context) {
+			tr.add("start_controller_worker")
+			tr.add("start_triage_worker")
 		},
 		startReceivers: func() error {
 			tr.add("start_receivers")
@@ -100,9 +115,15 @@ func TestFoundationSequenceOrdersEveryPhase(t *testing.T) {
 		"drain_deliveries",
 		"drain_inputs",
 		"reconstruct_incidents",
+		"triage_migration_backfill",
+		"recover_interrupted_assessment_calls",
+		"recover_interrupted_triage_attempts",
+		"enforce_triage_startup_horizon",
 		"start_correlator",
 		"start_input_worker",
 		"start_dispatch_worker",
+		"start_controller_worker",
+		"start_triage_worker",
 		"start_receivers",
 	}
 	assertTrace(t, tr.snapshot(), want)
@@ -144,13 +165,88 @@ func TestFoundationSequenceCorrelatorStartErrorPreventsReceiversStarting(t *test
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("run err = %v, want %v", err, wantErr)
 	}
-	want := []string{"recover_leases", "drain_deliveries", "drain_inputs", "reconstruct_incidents", "start_correlator"}
+	want := []string{
+		"recover_leases", "drain_deliveries", "drain_inputs", "reconstruct_incidents",
+		"triage_migration_backfill", "recover_interrupted_assessment_calls",
+		"recover_interrupted_triage_attempts", "enforce_triage_startup_horizon",
+		"start_correlator",
+	}
+	assertTrace(t, tr.snapshot(), want)
+}
+
+// TestFoundationSequenceControllerRecoveryErrorPreventsReceiversStarting
+// proves Task 9's own recovery/backfill phase (Triage migration backfill,
+// interrupted Assessment-call/Triage-attempt recovery, startup-horizon
+// enforcement) is just as gating as reconstruction itself: an error there
+// must prevent the Correlator, every worker, and Receivers from ever
+// starting — the whole reason it runs between reconstruction and
+// Correlator start, never concurrently with anything that could claim
+// controller/Triage work.
+func TestFoundationSequenceControllerRecoveryErrorPreventsReceiversStarting(t *testing.T) {
+	tr := &tracer{}
+	seq := tracedFoundationSequence(tr)
+	wantErr := errors.New("controller recovery failed")
+	seq.backfillAndRecoverControllerWork = func(context.Context) error {
+		tr.add("triage_migration_backfill")
+		return wantErr
+	}
+
+	err := seq.run(context.Background())
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("run err = %v, want %v", err, wantErr)
+	}
+	want := []string{"recover_leases", "drain_deliveries", "drain_inputs", "reconstruct_incidents", "triage_migration_backfill"}
 	assertTrace(t, tr.snapshot(), want)
 }
 
 // ----------------------------------------------------------------------
 // foundationStopSequence: shutdown ordering
 // ----------------------------------------------------------------------
+
+// TestFoundationStopSequenceOrdersAllSixPhases pins the full Task 9 shutdown
+// order: Receivers; drain controller/Triage work; drain foundation
+// dispatch/input work; stop the controller/Triage workers; stop the
+// foundation dispatch/input workers; stop the Correlator.
+func TestFoundationStopSequenceOrdersAllSixPhases(t *testing.T) {
+	tr := &tracer{}
+	seq := foundationStopSequence{
+		stopReceivers: func() error {
+			tr.add("stop_receivers")
+			return nil
+		},
+		drainControllerWork: func(context.Context) error {
+			tr.add("drain_controller_work")
+			return nil
+		},
+		drainFoundationWork: func(context.Context) error {
+			tr.add("drain_foundation_work")
+			return nil
+		},
+		stopControllerWorkers: func(context.Context) error {
+			tr.add("stop_triage_worker")
+			tr.add("stop_controller_worker")
+			return nil
+		},
+		stopWorkers: func(context.Context) error {
+			tr.add("stop_dispatch_worker")
+			tr.add("stop_input_worker")
+			return nil
+		},
+		stopCorrelator: func() {
+			tr.add("stop_correlator")
+		},
+	}
+
+	if err := seq.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	want := []string{
+		"stop_receivers", "drain_controller_work", "drain_foundation_work",
+		"stop_triage_worker", "stop_controller_worker",
+		"stop_dispatch_worker", "stop_input_worker", "stop_correlator",
+	}
+	assertTrace(t, tr.snapshot(), want)
+}
 
 // TestFoundationStopSequenceOrdersEveryPhase pins the exact shutdown order
 // this plan requires: Receivers, then the dispatch worker, then the input
@@ -224,6 +320,21 @@ func newTestFoundationStore(t *testing.T) *store.Store {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	return st
+}
+
+// TestFoundationRuntimeDrainOnEmptyStoreIsANoOp proves foundationRuntime.
+// Drain (Task 9) runs cleanly against a real, empty store — nothing due, so
+// both workers' Drain calls return immediately with zero handled.
+func TestFoundationRuntimeDrainOnEmptyStoreIsANoOp(t *testing.T) {
+	st := newTestFoundationStore(t)
+	cor := correlator.New(correlator.Config{}, st, nil, nil)
+	rt := newFoundationRuntime(st, cor, "test-owner", slog.Default())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := rt.Drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
 }
 
 func TestNewFoundationRuntimePanicsOnEmptyOwner(t *testing.T) {

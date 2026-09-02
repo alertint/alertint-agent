@@ -108,6 +108,38 @@ func TestCall1FailureMakesUnavailableAndOnlyCall1SuccessClears(t *testing.T) {
 	}
 }
 
+// TestCapabilityAssessmentDrivesUnavailableLikeTriageDraft proves Task 9's
+// own wiring: the Situation controller's own L2 dispatch capability
+// (CapabilityAssessment) is treated as a peer of CapabilityTriageDraft in
+// the rolled-up installation state (spec.md: "LLM health remains one
+// installation-level capability state fed by real Acute Triage and
+// Assessment outcomes") — a failure there alone makes the installation
+// unavailable, and only its own success (never a probe, and never a
+// Triage-draft success) clears it.
+func TestCapabilityAssessmentDrivesUnavailableLikeTriageDraft(t *testing.T) {
+	tr, _, c, _ := newTracker(t)
+	tr.Begin(llmhealth.CapabilityAssessment, "").Finish(err503)
+	if s := tr.Snapshot(); s.State != llmhealth.StateUnavailable || s.OutageGeneration != 1 {
+		t.Fatalf("after assessment failure: %+v", s)
+	}
+	// A probe success must not clear a real assessment failure.
+	tr.ObserveProbe(llm.ProbeResult{Outcome: llm.ProbeOK, Method: "GET", Path: "/v1/models/x"})
+	if s := tr.Snapshot(); s.State != llmhealth.StateUnavailable {
+		t.Fatalf("probe success cleared an assessment failure: %+v", s)
+	}
+	// A Triage-draft success must not clear it either — each capability's
+	// own success is the only thing that can clear its own failure.
+	tr.Begin(llmhealth.CapabilityTriageDraft, "inc-1").Finish(nil)
+	if s := tr.Snapshot(); s.State != llmhealth.StateUnavailable {
+		t.Fatalf("triage_draft success cleared an assessment failure: %+v", s)
+	}
+	c.add(12 * time.Minute)
+	tr.Begin(llmhealth.CapabilityAssessment, "").Finish(nil)
+	if s := tr.Snapshot(); s.State != llmhealth.StateHealthy || s.OutageGeneration != 1 {
+		t.Fatalf("after assessment success: %+v", s)
+	}
+}
+
 func TestCall2FailureDegradesOnly(t *testing.T) {
 	tr := newTrackerOnly(t)
 	tr.Begin(llmhealth.CapabilityVerificationRejudge, "inc-1").Finish(context.DeadlineExceeded)

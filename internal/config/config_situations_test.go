@@ -35,7 +35,10 @@ func TestSituationsDefaults(t *testing.T) {
 		{"lease_seconds", s.LeaseSeconds, 300},
 		{"heartbeat_seconds", s.HeartbeatSeconds, 30},
 		{"webhook_recovery_grace_seconds", s.WebhookRecoveryGraceSeconds, 120},
-		{"cadence.fast_seconds", s.Cadence.FastSeconds, 60},
+		// 120, not 60: Task 9 aligned this default with internal/situation/
+		// assessment.go's own hardcoded cadenceFastInterval (2m) — see
+		// SituationsCadenceConfig's own doc comment.
+		{"cadence.fast_seconds", s.Cadence.FastSeconds, 120},
 		{"cadence.normal_seconds", s.Cadence.NormalSeconds, 300},
 		{"cadence.slow_seconds", s.Cadence.SlowSeconds, 900},
 		{"max_l2_calls_per_attempt", s.MaxL2CallsPerAttempt, 2},

@@ -1060,6 +1060,125 @@ func (s *Store) CompleteIncidentTriageAttemptAsCleanSkip(ctx context.Context, at
 }
 
 // ----------------------------------------------------------------------
+// ExhaustOverdueUnclaimedIncidentTriage — the one-hour startup horizon
+// (ADR-0045), continued over the new controller-gated schedule (Task 9;
+// spec.md: "The one-hour startup horizon continues to exhaust overdue
+// unjudged work without a model call"). The pre-Plan-2 dispatch chain's own
+// applyStartupHorizon (internal/correlator/triage_retry.go, deleted by Task
+// 7) closed out any pending/backoff row whose due time was more than one
+// hour overdue so a long backlog could never become a boot-time LLM burst.
+// Task 7's own report flagged this as an intentionally deferred gap for
+// Task 9's runtime wiring to close, rather than build inside a task scoped
+// to dispatch refactoring (Task 7 report, Finding #4).
+// ----------------------------------------------------------------------
+
+// ExhaustOverdueUnclaimedIncidentTriage closes out every incident_triage row
+// still in phase pending/backoff whose next_at is more than horizon before
+// now — WITHOUT ever claiming it (no attempt ledger row is created, so
+// nothing here spends a model call) — mirroring ExhaustIncidentTriageAttempt's
+// own terminal projection (phase -> 'exhausted', Incident -> 'failed' when
+// still 'ready', one triage_exhausted input) but against a row that was
+// never claimed at all: a pending/backoff row's Incident is, by
+// construction, still 'ready' (only a claim moves it to 'processing' —
+// migration 0016's own CHECK). A condition that is still real re-fires and
+// opens a fresh Incident, so nothing live is lost (mirrors the deleted
+// applyStartupHorizon's own doc comment).
+//
+// Startup-only: call once, before any worker resumes
+// ClaimIncidentTriageAttempt — the same operational contract
+// RecoverInterruptedAssessmentCalls/RecoverExpiredIncidentTriageAttempts/
+// BackfillUpgradedIncidentTriageSchedule already document for their own
+// tables. horizon<=0 is a no-op (returns 0, nil) rather than exhausting
+// every due row. Returns the number of rows exhausted.
+func (s *Store) ExhaustOverdueUnclaimedIncidentTriage(ctx context.Context, now time.Time, horizon time.Duration) (int, error) {
+	if horizon <= 0 {
+		return 0, nil
+	}
+	now = now.UTC()
+	cutoff := now.Add(-horizon)
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT incident_id FROM incident_triage
+		WHERE phase IN ('pending','backoff') AND next_at IS NOT NULL AND next_at < ?
+		ORDER BY incident_id ASC`, canonicalTime(cutoff))
+	if err != nil {
+		return 0, fmt.Errorf("store: list overdue unclaimed incident triage: %w", err)
+	}
+	incidentIDs, err := scanStringRows(rows)
+	if err != nil {
+		return 0, fmt.Errorf("store: read overdue unclaimed incident triage ids: %w", err)
+	}
+
+	const code = "startup_retry_window_expired"
+	const detail = "due time exceeded the one-hour startup horizon"
+	exhausted := 0
+	for _, incidentID := range incidentIDs {
+		ok, err := exhaustOverdueUnclaimedIncidentTriageOneTx(ctx, s.db, incidentID, code, detail, now)
+		if err != nil {
+			return exhausted, err
+		}
+		if ok {
+			exhausted++
+		}
+	}
+	return exhausted, nil
+}
+
+// exhaustOverdueUnclaimedIncidentTriageOneTx closes one overdue unclaimed row
+// in its own transaction, fenced by its own phase check (WHERE phase IN
+// ('pending','backoff')): a row that raced away (claimed, resolved, or
+// already exhausted by an earlier call) between the listing query and this
+// transaction affects zero rows and is skipped — benign, not an error.
+func exhaustOverdueUnclaimedIncidentTriageOneTx(ctx context.Context, db *sql.DB, incidentID, code, detail string, now time.Time) (bool, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("store: begin exhaust overdue unclaimed incident triage: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	sanitized := sanitizeTriageDetail(detail)
+	res, err := tx.ExecContext(ctx, `
+		UPDATE incident_triage
+		SET phase = 'exhausted', next_at = NULL, last_error_code = ?, last_error_detail = ?, updated_at = ?
+		WHERE incident_id = ? AND phase IN ('pending','backoff')`,
+		code, sanitized, canonicalTime(now), incidentID)
+	if err != nil {
+		return false, fmt.Errorf("store: exhaust overdue unclaimed incident triage schedule: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: count exhausted overdue unclaimed incident triage: %w", err)
+	}
+	if n == 0 {
+		return false, tx.Commit()
+	}
+
+	// The Incident may already have moved off "ready" (e.g. a concurrent
+	// resolution canceled it) — this update's own affected-row count is not
+	// checked: either outcome is correct, only the schedule row's closure
+	// above is this primitive's own contract.
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE incidents SET status = 'failed', updated_at = ? WHERE id = ? AND status = 'ready'`,
+		canonicalTime(now), incidentID); err != nil {
+		return false, fmt.Errorf("store: mark incident failed after startup horizon: %w", err)
+	}
+
+	var groupKey string
+	if err := tx.QueryRowContext(ctx, `SELECT group_key FROM incidents WHERE id = ?`, incidentID).Scan(&groupKey); err != nil {
+		return false, fmt.Errorf("store: read incident group key for startup horizon triage_exhausted: %w", err)
+	}
+	idempotencyKey := "triage-exhausted:startup-horizon:" + incidentID
+	if err := insertTriageSituationInputTx(ctx, tx, "triage_exhausted", idempotencyKey, incidentID, groupKey, now); err != nil {
+		return false, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("store: commit exhaust overdue unclaimed incident triage: %w", err)
+	}
+	return true, nil
+}
+
+// ----------------------------------------------------------------------
 // RecoverExpiredIncidentTriageAttempts — startup/heartbeat-loss recovery
 // over the new attempt ledger, mirroring RecoverInterruptedIncidentTriage's
 // contract (ADR-0045: the interrupted attempt counts) for rows now carrying

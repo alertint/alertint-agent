@@ -481,6 +481,7 @@ type TriageWorker struct {
 	analyzer           AcuteAnalyzer
 	afterCommit        AfterCommitter
 	exhaustionNotifier ExhaustionNotifier
+	audit              AuditSink
 	cfg                TriageWorkerConfig
 	logger             *slog.Logger
 
@@ -489,6 +490,34 @@ type TriageWorker struct {
 	doneCh chan struct{}
 
 	startOnce sync.Once
+}
+
+// SetAuditSink wires Task 9's own audit trail for this worker's dispatch/
+// outcome lifecycle (incident.triage_attempt/triage_stale_input/
+// triage_completed/triage_exhausted — spec.md's own named events, distinct
+// from the Situation controller's assessment_*/triage_requested/skipped
+// events, which commit alongside the Assessment in controller.go). Optional:
+// nil (the default) leaves auditing disabled, mirroring
+// ControllerWorker.SetDependencyRecoveryWaker's own non-invasive
+// post-construction setter pattern — not a NewTriageWorker parameter, so no
+// existing call site (production or test) needs updating. Not safe to call
+// concurrently with Start/RunOnce; call it once, right after construction.
+func (w *TriageWorker) SetAuditSink(audit AuditSink) {
+	w.audit = audit
+}
+
+// auditAppend appends one bounded audit row for this worker's own dispatch/
+// outcome lifecycle. A nil sink (the default) or an append failure is a
+// silent (logged) no-op — audit is best-effort and never gates or repeats
+// the durable Triage work it describes (mirrors Controller.auditAppend's own
+// contract).
+func (w *TriageWorker) auditAppend(ctx context.Context, kind string, payload any) {
+	if w.audit == nil {
+		return
+	}
+	if err := w.audit.Append(ctx, "situation.triage_worker", kind, payload); err != nil {
+		w.logger.Warn("situation: triage worker audit append failed", "kind", kind, "err", err)
+	}
 }
 
 // NewTriageWorker creates a TriageWorker. afterCommit and exhaustionNotifier
@@ -644,6 +673,17 @@ func (w *TriageWorker) processOne(ctx context.Context, incidentID string) bool {
 		return false
 	}
 
+	// The claim itself is the consumed dispatch slot (spec.md's OTel/log
+	// requirement: "consumed dispatch/attempt counts") — Task 6's own
+	// ClaimIncidentTriageAttempt already durably moved the schedule to
+	// in_flight and incremented attempts before this point, so the slot is
+	// spent regardless of what Analyze itself goes on to do.
+	w.auditAppend(ctx, "incident.triage_attempt", map[string]any{
+		"situation_id": claim.SituationID, "incident_id": claim.IncidentID, "attempt_id": claim.AttemptID,
+		"attempt_number": claim.AttemptNumber, "input_version": claim.DecisionInputVersion,
+		"membership_digest": claim.MembershipDigest, "incident_input_digest": claim.IncidentInputDigest,
+	})
+
 	analyzeCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -750,10 +790,22 @@ func (w *TriageWorker) completeSuccessOrStale(ctx context.Context, claim TriageA
 		// to awaiting_decision. spec.md: "It persists no Finding,
 		// first-judgment time, Incident output projection, role, memory
 		// action, or notifier effect" — so AfterCommit must NOT run here.
+		// Audited as stale, never as a completion or a failure: the model
+		// work itself did not fail, its result was correctly discarded
+		// against a since-changed digest.
 		w.logger.Info("situation: triage worker: attempt completed stale; schedule restored to awaiting_decision",
 			"incident_id", claim.IncidentID, "attempt_id", claim.AttemptID, "outcome", outcome)
+		w.auditAppend(ctx, "incident.triage_stale_input", map[string]any{
+			"situation_id": claim.SituationID, "incident_id": claim.IncidentID, "attempt_id": claim.AttemptID,
+			"input_version": claim.DecisionInputVersion, "outcome": string(outcome),
+		})
 		return
 	}
+	w.auditAppend(ctx, "incident.triage_completed", map[string]any{
+		"situation_id": claim.SituationID, "incident_id": claim.IncidentID, "attempt_id": claim.AttemptID,
+		"input_version": claim.DecisionInputVersion, "evidence_pack_digest": result.EvidencePackDigest,
+		"duration_ms": now.Sub(claim.StartedAt).Milliseconds(),
+	})
 	if w.afterCommit == nil {
 		return
 	}
@@ -798,6 +850,10 @@ func (w *TriageWorker) completeFailure(ctx context.Context, claim TriageAttemptC
 				"incident_id", claim.IncidentID, "attempt_id", claim.AttemptID, "err", err)
 			return
 		}
+		w.auditAppend(ctx, "incident.triage_exhausted", map[string]any{
+			"situation_id": claim.SituationID, "incident_id": claim.IncidentID, "attempt_id": claim.AttemptID,
+			"attempt_number": claim.AttemptNumber, "input_version": claim.DecisionInputVersion, "code": code,
+		})
 		w.notifyExhaustion(ctx, claim, code, detail)
 		return
 	}

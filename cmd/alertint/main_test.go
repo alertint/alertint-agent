@@ -4,8 +4,44 @@ package main
 
 import (
 	"bytes"
+	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/alertint/alertint-agent/internal/situation"
+	"github.com/alertint/alertint-agent/skills/acutetriage"
+)
+
+// ----------------------------------------------------------------------
+// Task 9 production wiring proofs.
+// ----------------------------------------------------------------------
+
+// TestIncidentSinkCarriesNoDirectLLMDependency proves the Correlator's only
+// path to any LLM call is through the Acute Triage skill it is handed
+// (incidentSink{skill: skill}.OnIncidentReady -> skill.Run) — the
+// Correlator's own constructor (correlator.New) and Config carry no LLM
+// client field of their own, so this wrapper's field set is the complete
+// proof surface: exactly one field, the skill.
+func TestIncidentSinkCarriesNoDirectLLMDependency(t *testing.T) {
+	typ := reflect.TypeOf(incidentSink{})
+	if typ.NumField() != 1 {
+		t.Fatalf("incidentSink has %d fields, want exactly 1 (skill) — a Correlator dispatch/LLM dependency would be a Task 9 regression", typ.NumField())
+	}
+	if typ.Field(0).Name != "skill" || typ.Field(0).Type != reflect.TypeOf((*acutetriage.Skill)(nil)) {
+		t.Fatalf("incidentSink field = %s %s, want skill *acutetriage.Skill", typ.Field(0).Name, typ.Field(0).Type)
+	}
+}
+
+// The refactored Acute Triage skill structurally satisfies every interface
+// the Situation controller runtime's Triage worker needs — proven at
+// compile time, so a future signature drift on either side fails the build
+// long before any test runs. skills/acutetriage.Skill.Analyze/AfterCommit/
+// OnTriageExhausted (Task 7) are what newControllerRuntime passes as
+// situation.AcuteAnalyzer/AfterCommitter/ExhaustionNotifier respectively.
+var (
+	_ situation.AcuteAnalyzer      = (*acutetriage.Skill)(nil)
+	_ situation.AfterCommitter     = (*acutetriage.Skill)(nil)
+	_ situation.ExhaustionNotifier = (*acutetriage.Skill)(nil)
 )
 
 func TestRun_VersionFlagPrintsVersionAndExitsCleanly(t *testing.T) {

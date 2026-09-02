@@ -403,9 +403,38 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	// The durable Situation foundation runtime (Task 8): the dispatch and
 	// input workers Tasks 6-7 built, plus the Reconstructor that converges
 	// durable state before either worker, or Receivers, ever runs. owner is
-	// this process's own lease identity, minted once.
+	// this process's own lease identity, minted once — every worker this
+	// process runs (foundation's dispatch/input, and the Situation
+	// controller/Triage workers below) derives its own stable lease-owner
+	// suffix from this SAME identity, so no two workers from the same
+	// process can ever fence each other's claims.
 	owner := "alertint-" + uuid.NewString()
 	rt := newFoundationRuntime(st, cor, owner, logger)
+
+	// The Situation controller runtime (Task 9): the Situation controller
+	// worker (Reconcile) and the Acute Triage worker Tasks 7-8 built, plus
+	// the startup-only recovery/backfill pass both depend on having already
+	// run. assessClient is the controller's own one-shot, provider-neutral
+	// L2 boundary — the SAME configured provider client Acute Triage uses
+	// (buildLLMClient/llmClient), NOT wrapped in llmClient's own hidden-retry
+	// Complete method, and wrapped with the installation LLM-health observer
+	// (buildAssessmentClient). skill (already constructed above) structurally
+	// satisfies situation.AcuteAnalyzer/AfterCommitter/ExhaustionNotifier all
+	// three, so the Triage worker dispatches through the SAME refactored
+	// Acute Triage skill instance — never a second, separately-constructed
+	// one — while the unmodified `skill` variable used by incidentSink above
+	// keeps driving the Correlator's own tick-triggered compatibility path
+	// unchanged. Existing Acute Triage still receives the ordinary
+	// retry-capable llmClient (acutetriage.Config's own Config, unchanged);
+	// the Correlator itself (cor, constructed above) receives no LLM
+	// dependency of its own — corCfg/correlator.New's signature carries none,
+	// and its only path to Acute Triage is via incidentSink{skill: skill}.
+	assessClient, err := buildAssessmentClient(llmClient, llmHealth)
+	if err != nil {
+		return fmt.Errorf("situation controller: %w", err)
+	}
+	crt := newControllerRuntime(st, assessClient, skill, cfg.Situations, owner, auditor, logger)
+	crt.SetDependencyRecoveryWaker(llmHealthDependencyWaker{tracker: llmHealth, st: st})
 
 	// Probe enabled integrations in the background: quickly (with backoff)
 	// while one is failing — at startup a co-deployed dependency may still
@@ -423,6 +452,19 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 				return fmt.Errorf("situation foundation reconstruction: %w", err)
 			}
 			logReconstructionReport(logger, report)
+			return nil
+		},
+		// Task 9: Triage migration backfill, interrupted Assessment-call/
+		// Triage-attempt recovery, and the one-hour startup horizon — all
+		// startup-only, zero-outward-effect primitives that must run before
+		// any worker resumes claiming controller/Triage work, exactly like
+		// foundation reconstruction above.
+		backfillAndRecoverControllerWork: func(ctx context.Context) error {
+			report, err := crt.RecoverAndBackfill(ctx, time.Now().UTC())
+			if err != nil {
+				return fmt.Errorf("situation controller recovery: %w", err)
+			}
+			logControllerRecoveryReport(logger, report)
 			return nil
 		},
 		// SetAuditor/SetResolutionNotifier/SetOccurrenceNotifier are wired
@@ -446,7 +488,8 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 			cor.SetOccurrenceNotifier(notifier)
 			return cor.Start(ctx)
 		},
-		startWorkers: rt.Start,
+		startWorkers:           rt.Start,
+		startControllerWorkers: crt.Start,
 		startReceivers: func() error {
 			var err error
 			recvSrv, recvErrCh, err = startReceivers(cfg, st, auditor, healthReg, llmHealth, rt.WakeDispatch, logger)
@@ -480,15 +523,21 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), ingress.DefaultShutdownTimeout)
 	defer cancel()
 
-	// Receivers, then the foundation workers (rt.Stop: dispatch, then
-	// input), then the Correlator: Receivers stopping first means no new
-	// inbound work can be durably accepted; the queue workers stopping next
-	// means nothing already durably queued goes unclaimed mid-drain; the
-	// Correlator stopping last — via stopCorrelator, the same
-	// sync.Once-guarded call the defer above falls back to on every other
-	// exit path — means it keeps serving fixed-window expiry and Triage
-	// retry for exactly as long as anything upstream could still be handing
-	// it work.
+	// Receivers; drain due controller/Triage work (crt.Drain) and its
+	// resulting inputs (rt.Drain — runs second so it can mop up any fresh
+	// situation_input_outbox row the controller/Triage drain just produced,
+	// while the foundation workers are still running); stop the controller/
+	// Triage workers (crt.Stop); stop the foundation workers (rt.Stop:
+	// dispatch, then input); then the Correlator: Receivers stopping first
+	// means no new inbound work can be durably accepted; draining before
+	// stopping means due work gets a real chance to finish, bounded by
+	// shutdownCtx, before its workers' background loops are told to exit;
+	// the workers stopping next means nothing already durably queued goes
+	// unclaimed mid-drain; the Correlator stopping last — via
+	// stopCorrelator, the same sync.Once-guarded call the defer above falls
+	// back to on every other exit path — means it keeps serving fixed-window
+	// expiry and Triage retry for exactly as long as anything upstream could
+	// still be handing it work.
 	stopSeq := foundationStopSequence{
 		stopReceivers: func() error {
 			if recvSrv == nil {
@@ -496,8 +545,11 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 			}
 			return recvSrv.Shutdown(shutdownCtx)
 		},
-		stopWorkers:    rt.Stop,
-		stopCorrelator: stopCorrelator,
+		drainControllerWork:   crt.Drain,
+		drainFoundationWork:   rt.Drain,
+		stopControllerWorkers: crt.Stop,
+		stopWorkers:           rt.Stop,
+		stopCorrelator:        stopCorrelator,
 	}
 	if err := stopSeq.run(shutdownCtx); err != nil {
 		logger.Error("situation foundation shutdown failed", slog.String("err", err.Error()))

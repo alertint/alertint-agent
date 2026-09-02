@@ -109,6 +109,20 @@ type SituationsConfig struct {
 // reconsideration tempo (model.Cadence). Cadence is persisted machinery, not
 // card content: it only widens or narrows how soon the controller next
 // reconciles a nonterminal Situation.
+//
+// These three values are NOT actually wired into DeriveCadence today:
+// internal/situation/assessment.go's DeriveCadence/cadenceFastInterval etc.
+// hardcode their own fixed durations (2m/5m/15m) with no parameter to inject
+// a config value into (ControllerConfig's own doc comment, internal/
+// situation/controller.go, explains why: threading a real cadence parameter
+// through DeriveCadence is a change to Task 5's pure-Assessment-derivation
+// logic, out of scope for Task 9's runtime-wiring job). Task 9 resolved the
+// resulting discrepancy by setting these DEFAULTS to match the hardcoded
+// values exactly (FastSeconds 120, not 60) — the hardcoded durations are
+// treated as the real, binding spec; this config block's job for now is
+// documentation-and-parity, not live tuning. A future task that threads a
+// real cadence parameter through DeriveCadence should also make these
+// values live and remove this comment.
 type SituationsCadenceConfig struct {
 	FastSeconds   int `yaml:"fast_seconds"`
 	NormalSeconds int `yaml:"normal_seconds"`
@@ -621,7 +635,11 @@ func Defaults() Config {
 			HeartbeatSeconds:            30,
 			WebhookRecoveryGraceSeconds: 120,
 			Cadence: SituationsCadenceConfig{
-				FastSeconds:   60,
+				// 120/300/900 match internal/situation/assessment.go's own
+				// hardcoded cadenceFastInterval/cadenceNormalInterval/
+				// cadenceSlowInterval (2m/5m/15m) exactly — see
+				// SituationsCadenceConfig's own doc comment (Task 9).
+				FastSeconds:   120,
 				NormalSeconds: 300,
 				SlowSeconds:   900,
 			},

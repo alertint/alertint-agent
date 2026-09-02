@@ -913,7 +913,12 @@ func (c *Controller) buildControllerState(snap Snapshot, in SnapshotInput, lc li
 // commit calls c.store.CommitController and logs/audits the outcome —
 // including a stale-claim failure, which Reconcile treats as a clean,
 // expected race (spec.md: "the controller fails closed and the newer input
-// remains due") rather than an unexpected error.
+// remains due") rather than an unexpected error. commit_failed is a
+// supplementary diagnostic event beyond spec.md's own named 13-event
+// taxonomy ("Audit events cover AT LEAST" that list) — kept because a
+// commit failure (most commonly a stale-claim race) is operationally
+// worth its own audit trail distinct from any of the 13 named events, none
+// of which name a whole-commit failure.
 func (c *Controller) commit(ctx context.Context, claim Claim, commit ControllerCommit) error {
 	err := c.store.CommitController(ctx, claim, commit)
 	if err != nil {
@@ -923,14 +928,79 @@ func (c *Controller) commit(ctx context.Context, claim Claim, commit ControllerC
 		})
 		return err
 	}
-	c.auditAppend(ctx, "situation.controller", "situation.controller.committed", map[string]any{
-		"situation_id":  claim.Situation.ID,
-		"input_version": claim.Situation.InputVersion,
-		"lifecycle":     string(commit.Lifecycle),
-		"attention":     string(commit.Attention),
-		"has_attempt":   commit.Attempt.ID != "",
-	})
+	c.auditCommitSuccess(ctx, claim, commit)
 	return nil
+}
+
+// assessmentAuditKind maps a NEW authoritative attempt's own Derivation onto
+// spec.md's exact named audit event for that outcome. Only a genuinely fresh
+// authoritative row (commit.Attempt.ID != "") ever reaches this — a cycle
+// that only refreshes the bounded current projection (commit.Attempt is the
+// zero value: a still-parked cycle, or a preserve/fallback path whose result
+// was preserved unchanged) emits none of these three, matching spec.md's own
+// "reconciliation churn within an unchanged basis does not spend a model
+// call" — and correspondingly does not spend an audit event announcing a new
+// judgment that never happened. model_validated (a fresh L2-accepted
+// proposal) and deterministic_controller (a non-L2 derivation that is still
+// a genuine new judgment, e.g. an urgent-floor Situation's first
+// Assessment) both count as "authoritative" for audit purposes: the
+// distinguishing signal spec.md's taxonomy cares about is fallback
+// (L2 failed/blocked, no trustworthy prior) versus reused (an unchanged
+// prior's content carried forward) versus everything else that is a genuine
+// fresh judgment.
+func assessmentAuditKind(d model.AssessmentDerivation) (string, bool) {
+	switch d {
+	case model.DerivationModelValidated, model.DerivationDeterministic:
+		return "situation.assessment_authoritative", true
+	case model.DerivationDeterministicFallback:
+		return "situation.assessment_fallback", true
+	case model.DerivationRevalidatedReuse:
+		return "situation.assessment_reused", true
+	default:
+		return "", false
+	}
+}
+
+// auditCommitSuccess emits spec.md's own named audit events for a
+// successfully committed cycle: at most one of situation.assessment_
+// authoritative/reused/fallback (see assessmentAuditKind), plus one
+// situation.triage_requested or situation.triage_skipped per Triage
+// decision this same commit shares (spec.md: "Triage request/skip decisions
+// produced by the claimed snapshot" commit together with the Assessment).
+// Every payload carries only bounded, stable identity/digest attributes —
+// Situation/Incident ID, input version, attempt ID, and the material/basis/
+// membership/Incident-input digests spec.md's OTel/log-attribute
+// requirement names — never a proposal, prompt, or provider body.
+func (c *Controller) auditCommitSuccess(ctx context.Context, claim Claim, commit ControllerCommit) {
+	situationID := claim.Situation.ID
+	if commit.Attempt.ID != "" {
+		if kind, ok := assessmentAuditKind(commit.Attempt.Derivation); ok {
+			c.auditAppend(ctx, "situation.controller", kind, map[string]any{
+				"situation_id":          situationID,
+				"attempt_id":            commit.Attempt.ID,
+				"input_version":         commit.Attempt.InputVersion,
+				"derivation":            string(commit.Attempt.Derivation),
+				"material_fact_hash":    commit.MaterialFactHash,
+				"assessment_basis_hash": commit.AssessmentBasisHash,
+				"duration_ms":           commit.Attempt.CompletedAt.Sub(commit.Attempt.CreatedAt).Milliseconds(),
+			})
+		}
+	}
+	for _, d := range commit.TriageDecisions {
+		kind := "situation.triage_skipped"
+		if d.Decision == TriageDecisionRequest {
+			kind = "situation.triage_requested"
+		}
+		c.auditAppend(ctx, "situation.controller", kind, map[string]any{
+			"situation_id":          situationID,
+			"incident_id":           d.IncidentID,
+			"input_version":         d.SituationInputVersion,
+			"decision_reason":       d.DecisionReason,
+			"material_fact_hash":    d.MaterialFactHash,
+			"membership_digest":     d.MembershipDigest,
+			"incident_input_digest": d.IncidentInputDigest,
+		})
+	}
 }
 
 // Reconcile performs one claimed Situation's full reconciliation cycle:
@@ -1166,6 +1236,20 @@ func (c *Controller) commitResult(ctx context.Context, claim Claim, base Control
 			c.logger.Error("situation: controller: append stale outcome after commit failure",
 				"situation_id", claim.Situation.ID, "call_id", *callID, "err", appendErr)
 		}
+		// A late/stale completion race — a real L2 call already succeeded
+		// (RequestStarted proved it), but a concurrent newer input
+		// invalidated this cycle's own claim before the fenced commit — is
+		// audited as stale, never as a provider failure: the model work
+		// itself did not fail, it was correctly discarded (spec.md: "A
+		// stale proposal/attempt is retained as `stale` but changes no
+		// projection, Triage state, lifecycle, or outward effect"). Fired
+		// regardless of whether the durable stale-outcome append above
+		// itself succeeded — audit is best-effort and never gates or
+		// repeats the already-completed model work.
+		c.auditAppend(ctx, "situation.controller", "situation.assessment_stale", map[string]any{
+			"situation_id": claim.Situation.ID, "call_id": *callID, "attempt_id": stale.ID,
+			"input_version": stale.InputVersion,
+		})
 	}
 	return err
 }
@@ -1267,9 +1351,10 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 		if err := c.store.RecordAssessmentCall(ctx, claim, call); err != nil {
 			return nil, nil, callID, correctionUsed, fmt.Errorf("situation: record assessment call: %w", err)
 		}
-		c.auditAppend(ctx, "situation.controller", "situation.controller.l2_dispatch", map[string]any{
+		c.auditAppend(ctx, "situation.controller", "situation.assessment_call_dispatched", map[string]any{
 			"situation_id": claim.Situation.ID, "call_id": callID, "call_number": callNumber,
-			"retry_epoch": retryEpoch, "work_attempt": workAttempt,
+			"input_version": snap.InputVersion, "retry_epoch": retryEpoch, "work_attempt": workAttempt,
+			"material_fact_hash": snap.MaterialFactHash,
 		})
 
 		oneShot, callErr := c.client.CompleteOnce(ctx, "", prompt, nil)
@@ -1301,8 +1386,20 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 		if err := c.store.AppendAssessmentOutcome(ctx, outcome); err != nil {
 			c.logger.Error("situation: controller: append assessment outcome failed", "situation_id", claim.Situation.ID, "call_id", callID, "err", err)
 		}
-		c.auditAppend(ctx, "situation.controller", "situation.controller.l2_outcome", map[string]any{
+		// outcome.Status is buildOutcomeAttempt's own closed classification:
+		// "rejected" for a validated-but-rejected proposal (policy/capability/
+		// malformed-shape/stale-basis), "failed" for a transport-layer
+		// failure (timeout/network/rate-limit) — the exact split spec.md's
+		// named situation.assessment_rejected/situation.assessment_failed
+		// events distinguish.
+		kind := "situation.assessment_rejected"
+		if outcome.Status == "failed" {
+			kind = "situation.assessment_failed"
+		}
+		c.auditAppend(ctx, "situation.controller", kind, map[string]any{
 			"situation_id": claim.Situation.ID, "call_id": callID, "outcome": string(policy.Outcome),
+			"input_version": snap.InputVersion, "retry_epoch": retryEpoch, "work_attempt": workAttempt,
+			"duration_ms": outcome.CompletedAt.Sub(outcome.CreatedAt).Milliseconds(),
 		})
 
 		if policy.ImmediateCorrection && !correctionUsed && callNumber < c.cfg.MaxL2CallsPerAttempt {

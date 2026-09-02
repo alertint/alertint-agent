@@ -1,0 +1,424 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	"github.com/alertint/alertint-agent/internal/config"
+	"github.com/alertint/alertint-agent/internal/llm"
+	"github.com/alertint/alertint-agent/internal/llmhealth"
+	"github.com/alertint/alertint-agent/internal/situation"
+	"github.com/alertint/alertint-agent/internal/store"
+	"github.com/alertint/alertint-agent/skills/acutetriage"
+)
+
+// ----------------------------------------------------------------------
+// Situation controller runtime (Task 9)
+//
+// controllerRuntime bundles the two background workers Task 8/7 built but
+// nothing previously ran in production: the Situation controller worker
+// (Reconcile) and the Acute Triage worker. It mirrors foundationRuntime's
+// own shape (situation_foundation.go) — construction, a startup recovery
+// pass, Start, Drain, Stop — composed alongside it, never folded into it:
+// main.go owns exactly one foundationRuntime and one controllerRuntime, and
+// wires them together via the extended foundationSequence/
+// foundationStopSequence in situation_foundation.go.
+// ----------------------------------------------------------------------
+
+// situationsTriageStartupHorizon is the one-hour startup horizon (ADR-0045)
+// — see internal/store/triage_controller.go's own
+// ExhaustOverdueUnclaimedIncidentTriage doc comment for the full rationale.
+// Kept here, not in internal/store, because it is a runtime policy constant
+// (how stale is "too stale to dispatch at boot"), not a store-layer
+// invariant — the store primitive takes it as a plain parameter.
+const situationsTriageStartupHorizon = time.Hour
+
+// controllerRuntime bundles the Situation controller worker and the Acute
+// Triage worker, plus the startup-only recovery/backfill pass both depend
+// on having already run. main constructs exactly one per process.
+type controllerRuntime struct {
+	worker *situation.ControllerWorker
+	triage *situation.TriageWorker
+	st     *store.Store
+}
+
+// newControllerRuntime wires the controller runtime against a real store, the
+// configured one-shot provider-neutral L2 boundary (already wrapped with the
+// installation LLM-health observer — see buildAssessmentClient), and the
+// refactored Acute Triage skill (which structurally satisfies
+// situation.AcuteAnalyzer, situation.AfterCommitter, and
+// situation.ExhaustionNotifier all three — skills/acutetriage.Skill's own
+// Analyze/AfterCommit/OnTriageExhausted methods, Task 7). owner must be the
+// SAME non-empty, per-process identity foundationRuntime derives its own
+// lease-owner suffixes from — the controller and Triage workers derive
+// theirs ("<owner>:controller", "<owner>:triage") so no two workers from the
+// same process, or from foundationRuntime's own dispatch/input workers, can
+// ever fence each other's claims.
+func newControllerRuntime(
+	st *store.Store,
+	assessClient situation.AssessmentClient,
+	skill *acutetriage.Skill,
+	cfg config.SituationsConfig,
+	owner string,
+	auditSink situation.AuditSink,
+	logger *slog.Logger,
+) *controllerRuntime {
+	if strings.TrimSpace(owner) == "" {
+		panic("cmd/alertint: controller runtime requires a non-empty owner")
+	}
+	controllerCfg, workerCfg := situationsConfigToControllerConfig(cfg, owner)
+
+	worker := situation.NewControllerWorker(st, st, assessClient, controllerCfg, workerCfg, nil, auditSink, logger)
+
+	triageStore := &triageAttemptStoreAdapter{Store: st}
+	triageLister := &triageScheduleListerAdapter{Store: st}
+	triageCfg := situation.TriageWorkerConfig{
+		Owner:     owner + ":triage",
+		Lease:     time.Duration(cfg.LeaseSeconds) * time.Second,
+		Heartbeat: time.Duration(cfg.HeartbeatSeconds) * time.Second,
+		Interval:  time.Duration(cfg.ReconcilePollSeconds) * time.Second,
+	}
+	triage := situation.NewTriageWorker(triageStore, triageLister, skill, skill, skill, triageCfg, logger)
+	triage.SetAuditSink(auditSink)
+
+	return &controllerRuntime{worker: worker, triage: triage, st: st}
+}
+
+// situationsConfigToControllerConfig maps config.SituationsConfig onto
+// situation.ControllerConfig/situation.ControllerWorkerConfig exactly per
+// Task 8's own documented mapping (Task 8 report): Workers -> Workers,
+// ReconcilePollSeconds -> Interval, LeaseSeconds -> Lease, HeartbeatSeconds
+// -> Heartbeat, WebhookRecoveryGraceSeconds -> ControllerConfig.
+// WebhookRecoveryGrace, MaxL2CallsPerAttempt/MaxWorkAttemptsPerInput pass
+// straight through, AttemptWallSeconds -> AttemptWall, LLMConcurrency ->
+// L2Concurrency, Retry.{Min,Max,JitterPercent}Seconds -> RetryConfig.
+// PollingIntervalSeconds has no config.SituationsConfig source (no polling
+// connector exists in this build) and is left at its zero-value default —
+// see ControllerConfig's own doc comment.
+func situationsConfigToControllerConfig(cfg config.SituationsConfig, owner string) (situation.ControllerConfig, situation.ControllerWorkerConfig) {
+	controllerCfg := situation.ControllerConfig{
+		MaxL2CallsPerAttempt:    cfg.MaxL2CallsPerAttempt,
+		MaxWorkAttemptsPerInput: cfg.MaxWorkAttemptsPerInput,
+		AttemptWall:             time.Duration(cfg.AttemptWallSeconds) * time.Second,
+		WebhookRecoveryGrace:    time.Duration(cfg.WebhookRecoveryGraceSeconds) * time.Second,
+		Retry: situation.RetryConfig{
+			Min:           time.Duration(cfg.Retry.MinSeconds) * time.Second,
+			Max:           time.Duration(cfg.Retry.MaxSeconds) * time.Second,
+			JitterPercent: cfg.Retry.JitterPercent,
+		},
+	}
+	workerCfg := situation.ControllerWorkerConfig{
+		Owner:         owner + ":controller",
+		Lease:         time.Duration(cfg.LeaseSeconds) * time.Second,
+		Heartbeat:     time.Duration(cfg.HeartbeatSeconds) * time.Second,
+		Interval:      time.Duration(cfg.ReconcilePollSeconds) * time.Second,
+		Workers:       cfg.Workers,
+		L2Concurrency: cfg.LLMConcurrency,
+	}
+	return controllerCfg, workerCfg
+}
+
+// controllerRecovery is the startup-only recovery/backfill pass's report,
+// for logReconstructionReport's own sibling logging call.
+type controllerRecovery struct {
+	TriageBackfilled              int
+	AssessmentCallsRecovered      int
+	TriageAttemptsRecovered       int
+	TriageStartupHorizonExhausted int
+}
+
+// RecoverAndBackfill runs the startup-only, zero-outward-effect recovery
+// pass this plan's own startup sequence requires between foundation
+// reconstruction and starting any worker: Triage migration backfill
+// (BackfillUpgradedIncidentTriageSchedule), interrupted Assessment-call
+// recovery (RecoverInterruptedAssessmentCalls), interrupted Triage-attempt
+// recovery (RecoverExpiredIncidentTriageAttempts — TriageWorker.RunOnce
+// would also call this on its own first round, but starting a worker is
+// asynchronous, so this explicit call guarantees it has already run before
+// ANY worker's claim poll, matching RecoverInterruptedAssessmentCalls' own
+// "never concurrently with live controller work" contract), and the
+// one-hour startup horizon (ExhaustOverdueUnclaimedIncidentTriage — ADR-0045,
+// continued over the controller-gated schedule; see that primitive's own doc
+// comment in internal/store/triage_controller.go for why Task 9 owns
+// closing this gap). Callers must not start the controller or Triage
+// workers — or anything else that could concurrently claim controller/Triage
+// work — if this returns a non-nil error.
+func (r *controllerRuntime) RecoverAndBackfill(ctx context.Context, now time.Time) (controllerRecovery, error) {
+	var report controllerRecovery
+
+	backfilled, err := r.st.BackfillUpgradedIncidentTriageSchedule(ctx, now)
+	if err != nil {
+		return report, fmt.Errorf("situation controller: backfill upgraded incident triage schedule: %w", err)
+	}
+	report.TriageBackfilled = backfilled
+
+	recoveredCalls, err := r.st.RecoverInterruptedAssessmentCalls(ctx, now)
+	if err != nil {
+		return report, fmt.Errorf("situation controller: recover interrupted assessment calls: %w", err)
+	}
+	report.AssessmentCallsRecovered = recoveredCalls
+
+	recoveredAttempts, err := r.st.RecoverExpiredIncidentTriageAttempts(ctx, now)
+	if err != nil {
+		return report, fmt.Errorf("situation controller: recover expired incident triage attempts: %w", err)
+	}
+	report.TriageAttemptsRecovered = recoveredAttempts
+
+	exhausted, err := r.st.ExhaustOverdueUnclaimedIncidentTriage(ctx, now, situationsTriageStartupHorizon)
+	if err != nil {
+		return report, fmt.Errorf("situation controller: exhaust overdue unclaimed incident triage: %w", err)
+	}
+	report.TriageStartupHorizonExhausted = exhausted
+
+	return report, nil
+}
+
+// logControllerRecoveryReport logs one RecoverAndBackfill pass's report at
+// startup — the Task 9 sibling of situation_foundation.go's own
+// logReconstructionReport.
+func logControllerRecoveryReport(logger *slog.Logger, report controllerRecovery) {
+	logger.Info("situation controller recovered",
+		slog.Int("triage_schedule_backfilled", report.TriageBackfilled),
+		slog.Int("assessment_calls_recovered", report.AssessmentCallsRecovered),
+		slog.Int("triage_attempts_recovered", report.TriageAttemptsRecovered),
+		slog.Int("triage_startup_horizon_exhausted", report.TriageStartupHorizonExhausted),
+	)
+}
+
+// SetDependencyRecoveryWaker wires the pre-poll dependency-recovery wake
+// step onto the controller worker (situation.ControllerWorker.
+// SetDependencyRecoveryWaker's own doc comment) — a thin pass-through so
+// main.go's own wiring reads as "configure the runtime", never "reach
+// through it into its worker".
+func (r *controllerRuntime) SetDependencyRecoveryWaker(waker situation.DependencyRecoveryWaker) {
+	r.worker.SetDependencyRecoveryWaker(waker)
+}
+
+// Start launches the controller worker, then the Triage worker, each on its
+// own background schedule. Call only after RecoverAndBackfill has succeeded
+// (and, transitively, after foundationRuntime.Reconstruct — the controller
+// depends on coherently reconstructed deliveries/inputs).
+func (r *controllerRuntime) Start(ctx context.Context) {
+	r.worker.Start(ctx)
+	r.triage.Start(ctx)
+}
+
+// Drain runs both workers' due work to quiescence (repeat until a round
+// handles zero items, or ctx is done), for the shutdown sequence's own
+// "drain due controller/Triage work ... to quiescence" requirement — called
+// BEFORE Stop, while both background loops are still able to claim and
+// process due work, so whatever situation inputs a Triage completion or a
+// controller commit produces are at least durably queued (any not yet
+// consumed by the time shutdown proceeds simply wait, recoverable, for the
+// next startup's reconstruction pass — spec.md's own "leave remaining
+// durable work recoverable"). Bounded by ctx; a ctx deadline mid-drain is
+// not itself an error worth surfacing to the caller; a genuine store error
+// is.
+func (r *controllerRuntime) Drain(ctx context.Context) error {
+	if _, err := r.worker.Drain(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("situation controller: drain controller worker: %w", err)
+	}
+	if _, err := r.triage.Drain(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("situation controller: drain triage worker: %w", err)
+	}
+	return nil
+}
+
+// Stop stops the Triage worker, then the controller worker — the reverse of
+// Start's own order, mirroring foundationRuntime.Stop's own
+// stop-in-reverse-of-start discipline — each waiting for its current round
+// to finish before the next Stop call proceeds. Call after Drain, and after
+// foundationRuntime.Stop's own dispatch/input workers have stopped
+// accepting new claims.
+func (r *controllerRuntime) Stop(ctx context.Context) error {
+	var errs []error
+	if err := r.triage.Stop(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("triage worker stop: %w", err))
+	}
+	if err := r.worker.Stop(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("controller worker stop: %w", err))
+	}
+	return errors.Join(errs...)
+}
+
+// ----------------------------------------------------------------------
+// triageAttemptStoreAdapter / triageScheduleListerAdapter — the thin
+// store-shape adapters Task 7's own header comment names as Task 9's
+// runtime-wiring job: converting store.ClaimedTriageAttempt/TriageFinding/
+// TriageCompletionResult (and store's own sentinel errors) into this
+// package's transport-neutral situation.TriageAttemptClaim/
+// TriageFindingInput/TriageCompletionOutcome shapes, and projecting
+// []store.IncidentTriage down to the bare []string of Incident IDs
+// TriageScheduleLister needs. *store.Store already satisfies
+// situation.TriageAttemptStore's other five methods directly (identical
+// primitive-typed signatures — ExtendIncidentTriageLease,
+// BackoffIncidentTriageAttempt, ExhaustIncidentTriageAttempt,
+// CompleteIncidentTriageAttemptAsCleanSkip, RecoverExpiredIncidentTriageAttempts),
+// promoted here via embedding; only Claim/Complete need a real shim.
+// ----------------------------------------------------------------------
+
+type triageAttemptStoreAdapter struct {
+	*store.Store
+}
+
+func (a *triageAttemptStoreAdapter) ClaimIncidentTriageAttempt(ctx context.Context, incidentID, owner string, now time.Time, lease time.Duration) (situation.TriageAttemptClaim, error) {
+	claimed, err := a.Store.ClaimIncidentTriageAttempt(ctx, incidentID, owner, now, lease)
+	if err != nil {
+		return situation.TriageAttemptClaim{}, mapTriageStoreError(err)
+	}
+	return situation.TriageAttemptClaim{
+		AttemptID:            claimed.AttemptID,
+		IncidentID:           claimed.IncidentID,
+		AttemptNumber:        claimed.AttemptNumber,
+		SituationID:          claimed.SituationID,
+		DecisionInputVersion: claimed.DecisionInputVersion,
+		MembershipDigest:     claimed.MembershipDigest,
+		IncidentInputDigest:  claimed.IncidentInputDigest,
+		MemberDeliveryIDs:    claimed.MemberDeliveryIDs,
+		StartedAt:            claimed.StartedAt,
+		LeaseOwner:           claimed.LeaseOwner,
+		LeaseExpiresAt:       claimed.LeaseExpiresAt,
+		ClaimToken:           claimed.ClaimToken,
+	}, nil
+}
+
+func (a *triageAttemptStoreAdapter) CompleteIncidentTriageAttempt(ctx context.Context, attemptID, incidentID string, finding situation.TriageFindingInput, now time.Time) (situation.TriageCompletionOutcome, error) {
+	result, err := a.Store.CompleteIncidentTriageAttempt(ctx, attemptID, incidentID, store.TriageFinding{
+		OutputJSON: finding.OutputJSON, Summary: finding.Summary, RootCause: finding.RootCause,
+		Confidence: finding.Confidence, EnrichmentJSON: finding.EnrichmentJSON, EvidencePackDigest: finding.EvidencePackDigest,
+	}, now)
+	if err != nil {
+		return "", mapTriageStoreError(err)
+	}
+	return situation.TriageCompletionOutcome(result.Outcome), nil
+}
+
+// mapTriageStoreError maps internal/store's own Triage sentinel errors onto
+// this package's situation-native mirrors (internal/situation/triage_worker.go's
+// own doc comment: "mapping store's own ErrTriageNotDue/ErrTriageNotDecided/
+// ErrTriageAttemptLeaseLost/ErrTriageAttemptCompletedDifferently onto this
+// file's situation-native sentinels"). model.ErrNotFound is already a shared
+// value (store.ErrNotFound is a value alias of it), so it needs no mapping
+// here — it passes through unchanged.
+func mapTriageStoreError(err error) error {
+	switch {
+	case errors.Is(err, store.ErrTriageNotDue):
+		return situation.ErrTriageAttemptNotDue
+	case errors.Is(err, store.ErrTriageNotDecided):
+		return situation.ErrTriageAttemptNotDecided
+	case errors.Is(err, store.ErrTriageAttemptLeaseLost):
+		return situation.ErrTriageAttemptLeaseLost
+	case errors.Is(err, store.ErrTriageAttemptCompletedDifferently):
+		return situation.ErrTriageAttemptCompletedDifferently
+	default:
+		return err
+	}
+}
+
+type triageScheduleListerAdapter struct {
+	*store.Store
+}
+
+func (a *triageScheduleListerAdapter) ListDueIncidentTriage(ctx context.Context, now time.Time) ([]string, error) {
+	due, err := a.Store.ListDueIncidentTriage(ctx, now)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(due))
+	for _, d := range due {
+		ids = append(ids, d.IncidentID)
+	}
+	return ids, nil
+}
+
+// ----------------------------------------------------------------------
+// LLM health wiring: the L2 (Situation Assessment) observer decorator and
+// the dependency-recovery waker adapter. Both live here, in cmd/alertint,
+// because internal/llmhealth cannot be imported from internal/situation
+// (llmhealth imports internal/store, which already imports internal/
+// situation — see situation.DependencyRecoveryWaker's own doc comment for
+// the identical constraint).
+// ----------------------------------------------------------------------
+
+// healthObservingAssessmentClient wraps an AssessmentClient with the
+// installation-level LLM health observer for the controller's own L2 calls
+// — the sibling wiring to Acute Triage's own L1 (CapabilityTriageDraft)
+// observations, already wired inside skills/acutetriage via its Config.Health
+// (unchanged by this task). Wraps at exactly the same layer
+// semaphoreAssessmentClient (internal/situation/controller_worker.go)
+// already wraps — CompleteOnce — so a late/stale completion race (a
+// concurrent newer input invalidates the claim AFTER a real L2 call already
+// succeeded) is naturally observed as a SUCCESS here: the physical call
+// itself did not fail, it was correctly discarded downstream by
+// CommitController's own fencing. Task 9's brief: "Treat a late/stale
+// completion race as stale, not provider failure" — satisfied by
+// construction, not by any special-casing in this wrapper, because the
+// wrapper only ever sees CompleteOnce's own transport-level outcome.
+//
+// subject is always "" (Tracker.Begin's second argument, an Incident ID for
+// Acute Triage's own capabilities): situation.AssessmentClient.CompleteOnce
+// carries no Situation identity in its signature (Task 8 already shipped
+// this interface; threading one through is out of this task's "do not
+// modify Task 8's core logic" scope), so content-failure corroboration for
+// CapabilityAssessment aggregates across every Situation as one bucket
+// rather than per-Situation — a deliberate, documented limitation, not an
+// oversight.
+type healthObservingAssessmentClient struct {
+	inner   situation.AssessmentClient
+	tracker *llmhealth.Tracker
+}
+
+func (c healthObservingAssessmentClient) CompleteOnce(ctx context.Context, systemPrompt string, prompt llm.Prompt, requiredKeys []string) (llm.OneShotCompletion, error) {
+	obs := c.tracker.Begin(llmhealth.CapabilityAssessment, "")
+	result, err := c.inner.CompleteOnce(ctx, systemPrompt, prompt, requiredKeys)
+	obs.Finish(err) //nolint:contextcheck // matches skills/acutetriage's own established Finish(err) call-site pattern
+	return result, err
+}
+
+// buildAssessmentClient resolves the controller's own one-shot,
+// provider-neutral L2 boundary from the SAME configured LLM client Acute
+// Triage uses (buildLLMClient) — both llm/anthropic.Client and
+// llm/openaicompat.Client already implement CompleteOnce alongside the
+// hidden-retry Complete method acutetriage.LLMClient itself declares
+// (mirrors buildLLMProber's own type-assertion pattern for llm.Prober). A
+// client that does not implement it is a genuine wiring/config error: unlike
+// the idle probe (optional, WARN-and-disable), L2 dispatch is not optional
+// for a running controller, so this fails loud rather than degrading
+// silently. The result is then wrapped with the installation LLM-health
+// observer.
+func buildAssessmentClient(client acutetriage.LLMClient, tracker *llmhealth.Tracker) (situation.AssessmentClient, error) {
+	oneShot, ok := client.(situation.AssessmentClient)
+	if !ok {
+		return nil, fmt.Errorf("cmd/alertint: configured LLM client %T does not implement CompleteOnce; the Situation controller cannot dispatch L2 work", client)
+	}
+	return healthObservingAssessmentClient{inner: oneShot, tracker: tracker}, nil
+}
+
+// llmHealthDependencyWaker implements situation.DependencyRecoveryWaker by
+// combining internal/llmhealth.Tracker.Snapshot().OutageGeneration (once
+// healthy) with store.WakeDependencyRecoveredSituations — exactly the seam
+// situation.DependencyRecoveryWaker's own doc comment names as Task 9's
+// runtime-wiring job. Calling WakeDependencyRecoveredSituations while NOT
+// healthy would be premature (spec.md: a recovery generation only opens a
+// new retry epoch once the dependency is actually healthy again), so this
+// no-ops (0, nil) whenever the tracker does not currently report healthy —
+// the store primitive's own outageGeneration<=0 guard is a second,
+// independent line of defense, not relied on alone.
+type llmHealthDependencyWaker struct {
+	tracker *llmhealth.Tracker
+	st      *store.Store
+}
+
+func (w llmHealthDependencyWaker) WakeDependencyRecoveredSituations(ctx context.Context, now time.Time) (int, error) {
+	snap := w.tracker.Snapshot()
+	if snap.State != llmhealth.StateHealthy {
+		return 0, nil
+	}
+	return w.st.WakeDependencyRecoveredSituations(ctx, snap.OutageGeneration, now)
+}

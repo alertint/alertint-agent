@@ -117,6 +117,26 @@ func (r *foundationRuntime) Stop(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+// Drain runs the input worker's, then the dispatch worker's, due work to
+// quiescence (repeat until a round handles zero items, or ctx is done) —
+// the same order Start already uses. Task 9's shutdown sequence calls this
+// AFTER controllerRuntime.Drain, so any fresh situation_input_outbox row a
+// controller commit or a Triage completion just produced (while this
+// runtime's own workers are STILL running) gets at least a chance to be
+// consumed before shutdown proceeds; anything still queued when ctx expires
+// simply waits, durably, for the next startup's reconstruction pass.
+// Bounded by ctx; a ctx deadline mid-drain is not itself an error worth
+// surfacing to the caller — only a genuine store error is.
+func (r *foundationRuntime) Drain(ctx context.Context) error {
+	if _, err := r.inputs.Drain(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("input worker drain: %w", err)
+	}
+	if _, err := r.dispatch.Drain(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("dispatch worker drain: %w", err)
+	}
+	return nil
+}
+
 // WakeDispatch nudges the dispatch worker to run another round immediately
 // instead of waiting for its next interval tick. Wired as the wake
 // callback ingress.NewAlertReceiver/NewZabbixReceiver call once a durable
@@ -139,60 +159,112 @@ func (r *foundationRuntime) WakeDispatch() {
 // of only being provable by reading runServe's control flow.
 // ----------------------------------------------------------------------
 
-// foundationSequence composes reconstruction, Correlator start, worker
-// start, and Receiver start in the exact order this plan's startup
-// invariant requires: reconstruct -> start the Correlator -> start the
+// foundationSequence composes reconstruction, the Task 9 controller
+// recovery/backfill pass, Correlator start, worker start, the Task 9
+// controller/Triage worker start, and Receiver start in the exact order
+// this plan's startup invariant requires: reconstruct -> Triage migration
+// backfill + interrupted Assessment-call/Triage-attempt recovery +
+// startup-horizon enforcement -> start the Correlator -> start the
 // foundation workers (input, then dispatch — foundationRuntime.Start's own
-// order) -> start Receivers. run stops at the first failure, so a
-// reconstruction error — or a Correlator start failure — prevents
-// Receivers, and everything after it, from ever starting. startWorkers is
-// always the real process's foundationRuntime.Start: main wires it as
-// exactly rt.Start, never as separate per-worker closures, so the order
-// guarantee foundationRuntime.Start/Stop's own tests prove is the order
-// the real process actually executes.
+// order) -> start the Situation controller and Acute Triage workers ->
+// start Receivers. run stops at the first failure, so a reconstruction
+// error, a controller recovery/backfill error, or a Correlator start
+// failure prevents Receivers, and everything after it, from ever starting.
+// startWorkers is always the real process's foundationRuntime.Start: main
+// wires it as exactly rt.Start, never as separate per-worker closures, so
+// the order guarantee foundationRuntime.Start/Stop's own tests prove is the
+// order the real process actually executes.
+//
+// backfillAndRecoverControllerWork and startControllerWorkers are Task 9
+// additions; both may be left nil (a foundationSequence with no Plan 2
+// controller runtime composed in at all — the existing Plan-1-only tests in
+// this file's own tracedFoundationSequence helper exercise this), in which
+// case run behaves exactly as it did before Task 9. The real production
+// wiring (runServe) always sets both.
 type foundationSequence struct {
-	reconstruct     func(ctx context.Context) error
-	startCorrelator func(ctx context.Context) error
-	startWorkers    func(ctx context.Context)
-	startReceivers  func() error
+	reconstruct                      func(ctx context.Context) error
+	backfillAndRecoverControllerWork func(ctx context.Context) error
+	startCorrelator                  func(ctx context.Context) error
+	startWorkers                     func(ctx context.Context)
+	startControllerWorkers           func(ctx context.Context)
+	startReceivers                   func() error
 }
 
 func (f foundationSequence) run(ctx context.Context) error {
 	if err := f.reconstruct(ctx); err != nil {
 		return err
 	}
+	if f.backfillAndRecoverControllerWork != nil {
+		if err := f.backfillAndRecoverControllerWork(ctx); err != nil {
+			return err
+		}
+	}
 	if err := f.startCorrelator(ctx); err != nil {
 		return err
 	}
 	f.startWorkers(ctx)
+	if f.startControllerWorkers != nil {
+		f.startControllerWorkers(ctx)
+	}
 	return f.startReceivers()
 }
 
 // foundationStopSequence composes the shutdown mirror of
-// foundationSequence: stop Receivers, then the foundation workers
-// (dispatch, then input — foundationRuntime.Stop's own order), then the
-// Correlator. Receivers stopping first means no new inbound work can be
-// durably accepted; the workers stopping next means nothing already
-// durably queued goes unclaimed mid-drain; the Correlator stopping last
-// means it keeps serving its own fixed-window expiry and Triage retry
-// schedule for exactly as long as anything upstream could still be
-// handing it work. run collects every stop error with errors.Join rather
-// than stopping early, since every later stage must still get a chance to
-// shut down even if an earlier one failed. stopWorkers is always the real
-// process's foundationRuntime.Stop: main wires it as exactly rt.Stop,
-// never as separate per-worker closures, so
-// TestFoundationRuntimeStopsDispatchBeforeInputs proves the order the
-// real process actually executes.
+// foundationSequence: stop Receivers; drain due controller/Triage work to
+// quiescence (Task 9's controllerRuntime.Drain); drain the foundation
+// dispatch/input work to quiescence (Task 9's foundationRuntime.Drain —
+// this runs SECOND so it can mop up any fresh situation_input_outbox row
+// the controller/Triage drain just produced, while its own background
+// loops are still running); stop the Situation controller and Acute Triage
+// workers (Task 9's controllerRuntime.Stop); stop the foundation workers
+// (dispatch, then input — foundationRuntime.Stop's own order); then stop
+// the Correlator. Receivers stopping first means no new inbound work can be
+// durably accepted; draining before stopping means due work gets a chance
+// to finish (spec.md's own "leave remaining durable work recoverable" for
+// whatever a ctx deadline still catches mid-flight); the workers stopping
+// next means nothing already durably queued goes unclaimed mid-drain; the
+// Correlator stopping last means it keeps serving its own fixed-window
+// expiry and Triage retry schedule for exactly as long as anything
+// upstream could still be handing it work. run collects every stop error
+// with errors.Join rather than stopping early, since every later stage
+// must still get a chance to shut down even if an earlier one failed.
+// stopWorkers is always the real process's foundationRuntime.Stop: main
+// wires it as exactly rt.Stop, never as separate per-worker closures, so
+// TestFoundationRuntimeStopsDispatchBeforeInputs proves the order the real
+// process actually executes.
+//
+// drainControllerWork, drainFoundationWork, and stopControllerWorkers are
+// Task 9 additions; all three may be left nil (no Plan 2 controller runtime
+// composed in at all), in which case run behaves exactly as it did before
+// Task 9. The real production wiring (runServe) always sets all three.
 type foundationStopSequence struct {
-	stopReceivers  func() error
-	stopWorkers    func(ctx context.Context) error
-	stopCorrelator func()
+	stopReceivers         func() error
+	drainControllerWork   func(ctx context.Context) error
+	drainFoundationWork   func(ctx context.Context) error
+	stopControllerWorkers func(ctx context.Context) error
+	stopWorkers           func(ctx context.Context) error
+	stopCorrelator        func()
 }
 
 func (f foundationStopSequence) run(ctx context.Context) error {
 	var errs []error
 	if err := f.stopReceivers(); err != nil {
 		errs = append(errs, err)
+	}
+	if f.drainControllerWork != nil {
+		if err := f.drainControllerWork(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if f.drainFoundationWork != nil {
+		if err := f.drainFoundationWork(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if f.stopControllerWorkers != nil {
+		if err := f.stopControllerWorkers(ctx); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	if err := f.stopWorkers(ctx); err != nil {
 		errs = append(errs, err)

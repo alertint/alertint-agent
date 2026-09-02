@@ -34,6 +34,18 @@ const (
 	// could not be relied on to clear a failure.
 	CapabilityQueryRepair Capability = "query_repair"
 	CapabilityProbe       Capability = "probe"
+	// CapabilityAssessment is the Plan 2 Situation controller's own L2
+	// dispatch (internal/situation.Controller.Reconcile's dispatchWorkBearing,
+	// via the one-shot CompleteOnce boundary) — a real generation against the
+	// same provider Acute Triage's CapabilityTriageDraft uses, reported and
+	// rolled up like every other capability (spec.md: "LLM health remains one
+	// installation-level capability state fed by real Acute Triage and
+	// Assessment outcomes"). Wired from cmd/alertint, never from
+	// internal/situation itself (internal/situation must never import
+	// internal/llmhealth — see internal/situation/controller_worker.go's own
+	// DependencyRecoveryWaker doc comment for the identical import-cycle
+	// constraint).
+	CapabilityAssessment Capability = "assessment"
 )
 
 // Reason names why one call outcome was recorded, from success through every
