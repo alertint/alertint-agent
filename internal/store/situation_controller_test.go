@@ -965,7 +965,7 @@ func TestCommitControllerFailsClosedOnConcurrentInputVersionBump(t *testing.T) {
 	// A concurrent Situation input applies (a second Incident/delivery
 	// joining the same group), bumping input_version and clearing the lease
 	// — exactly ApplySituationInput's own joinSituationTx behavior.
-	newSituationForGroupSecondMember(t, st, sitID, "group-commit-concurrent-input", now)
+	newSituationForGroupSecondMember(t, st, "group-commit-concurrent-input", now)
 
 	commit := basicControllerCommit(sitID, claim.Situation.InputVersion, now)
 	err := st.CommitController(context.Background(), claim, commit)
@@ -988,7 +988,7 @@ func TestCommitControllerFailsClosedOnConcurrentInputVersionBump(t *testing.T) {
 // to groupKey's existing nonterminal Situation via a real
 // insertIncidentAndInput + ApplySituationInput round trip — simulating a
 // concurrent Situation input landing between claim and commit.
-func newSituationForGroupSecondMember(t *testing.T, st *Store, situationID, groupKey string, now time.Time) {
+func newSituationForGroupSecondMember(t *testing.T, st *Store, groupKey string, now time.Time) {
 	t.Helper()
 	incID, inputID := "inc2-"+groupKey, "input2-"+groupKey
 	insertIncidentAndInput(t, st, incID, inputID, groupKey, now.Add(time.Minute))

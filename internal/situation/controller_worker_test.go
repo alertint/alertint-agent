@@ -318,9 +318,9 @@ func TestControllerWorkerStartWakeStop(t *testing.T) {
 	defer cancel()
 	w.Start(ctx)
 
-	waitForAtLeast(t, func() int32 { return claimed.Load() }, 1, time.Second)
+	waitForAtLeast(t, claimed.Load, 1, time.Second)
 	w.Wake()
-	waitForAtLeast(t, func() int32 { return claimed.Load() }, 2, time.Second)
+	waitForAtLeast(t, claimed.Load, 2, time.Second)
 
 	stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer stopCancel()

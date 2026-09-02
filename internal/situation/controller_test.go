@@ -218,6 +218,7 @@ func acceptedProposalJSON(t *testing.T) json.RawMessage {
 }
 
 func acceptedResponse(t *testing.T) func() (llm.OneShotCompletion, error) {
+	t.Helper()
 	raw := acceptedProposalJSON(t)
 	return func() (llm.OneShotCompletion, error) {
 		return llm.OneShotCompletion{

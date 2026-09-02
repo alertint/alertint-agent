@@ -426,28 +426,6 @@ func anyDeliveryResolved(deliveries []Delivery) bool {
 	return false
 }
 
-// subtractDueReasons returns current with every reason in consumed removed,
-// preserving current's order — spec.md: "It subtracts only reasons present
-// in the claim. Reasons raised after the claim survive." A caller-side
-// convenience Reconcile uses to compute its OWN proposed remaining set;
-// CommitController's store-side implementation still re-reads the current
-// row fresh inside its own fenced transaction and performs the same
-// subtraction against whatever is current AT COMMIT TIME (never trusting
-// this proposed value as authoritative) — see store/situation_controller.go.
-func subtractDueReasons(current, consumed []model.DueReason) []model.DueReason {
-	remove := make(map[model.DueReason]bool, len(consumed))
-	for _, r := range consumed {
-		remove[r] = true
-	}
-	out := make([]model.DueReason, 0, len(current))
-	for _, r := range current {
-		if !remove[r] {
-			out = append(out, r)
-		}
-	}
-	return out
-}
-
 // proposalFromAssessment rebuilds the L2-authored subset of an existing
 // Assessment as an AssessmentProposal — the same subset AssessmentProposal's
 // own Go struct carries (Lifecycle/ActionContract/Cadence deliberately
@@ -641,7 +619,11 @@ func (c *Controller) resolveLifecycle(cur model.Situation, in SnapshotInput, sna
 		default:
 			return lifecycleResolution{Lifecycle: model.LifecycleRecoveryPending, RecoveryObservedAt: cur.RecoveryObservedAt, GraceUntil: cur.GraceUntil}
 		}
-	default: // recovered, closed_unknown: terminal, never reopen.
+	case model.LifecycleRecovered, model.LifecycleClosedUnknown: // terminal: never reopen.
+		return lifecycleResolution{Lifecycle: cur.Lifecycle, RecoveryObservedAt: cur.RecoveryObservedAt, GraceUntil: cur.GraceUntil, TerminalAt: cur.TerminalAt, TerminalReason: cur.TerminalReason}
+	default:
+		// Unreachable: model.Lifecycle is a closed four-value enum and every
+		// value is handled explicitly above. Defensive fallback only.
 		return lifecycleResolution{Lifecycle: cur.Lifecycle, RecoveryObservedAt: cur.RecoveryObservedAt, GraceUntil: cur.GraceUntil, TerminalAt: cur.TerminalAt, TerminalReason: cur.TerminalReason}
 	}
 }
@@ -801,7 +783,17 @@ func parkedReasonForOutcome(outcome L2Outcome) string {
 		return ParkedReasonCapabilityRejected
 	case L2OutcomeTransportFailure, L2OutcomeRateLimited:
 		return ParkedReasonDependency
-	default: // L2OutcomeMalformed, or any other durable-retry-eligible class.
+	case L2OutcomeMalformed:
+		return ParkedReasonMalformedExhausted
+	case L2OutcomeAccepted, L2OutcomeContradicted, L2OutcomeStaleBasis:
+		// Unreachable given this function's only two call sites in
+		// Reconcile: Accepted/Contradicted always short-circuit to
+		// commitResult before this is ever called, and StaleBasis can never
+		// arise from a call this SAME cycle's own dispatch loop dispatched
+		// (its AssessmentCall.InputVersion is always snap.InputVersion — the
+		// current input — by construction). Defensive fallback only.
+		return ParkedReasonMalformedExhausted
+	default:
 		return ParkedReasonMalformedExhausted
 	}
 }
@@ -957,7 +949,7 @@ func (c *Controller) Reconcile(ctx context.Context, claim Claim) error {
 	}
 	freshEpoch := workAttempt == 1
 
-	proposal, vr, transportErr, lastCallID, correctionUsed := c.dispatchWorkBearing(ctx, claim, snap, retryEpoch, workAttempt, now)
+	proposal, vr, lastCallID, correctionUsed, transportErr := c.dispatchWorkBearing(ctx, claim, snap, retryEpoch, workAttempt, now)
 	if proposal != nil {
 		result := DeriveAssessment(*proposal, snap, in, state, model.DerivationModelValidated, nil, now)
 		return c.commitResult(ctx, claim, base, result, &lastCallID, retryEpoch, workAttempt, now)
@@ -1096,10 +1088,10 @@ func (c *Controller) fallbackOrPreserveBlocked(situationID string, snap Snapshot
 // caller's own ClassifyL2Outcome re-classification of the final outcome
 // passes the real value rather than assuming the correction was always
 // spent.
-func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap Snapshot, retryEpoch, workAttempt int, now time.Time) (proposal *model.AssessmentProposal, lastVR *ValidationResult, lastTransportErr error, lastCallID string, correctionUsed bool) {
+func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap Snapshot, retryEpoch, workAttempt int, now time.Time) (proposal *model.AssessmentProposal, lastVR *ValidationResult, lastCallID string, correctionUsed bool, lastTransportErr error) {
 	prompt, err := BuildAssessmentPrompt(snap)
 	if err != nil {
-		return nil, nil, fmt.Errorf("situation: build assessment prompt: %w", err), "", false
+		return nil, nil, "", false, fmt.Errorf("situation: build assessment prompt: %w", err)
 	}
 
 	for callNumber := 1; callNumber <= c.cfg.MaxL2CallsPerAttempt; callNumber++ {
@@ -1110,7 +1102,7 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 			CallNumber: callNumber, DispatchedAt: now,
 		}
 		if err := c.store.RecordAssessmentCall(ctx, claim, call); err != nil {
-			return nil, nil, fmt.Errorf("situation: record assessment call: %w", err), callID, correctionUsed
+			return nil, nil, callID, correctionUsed, fmt.Errorf("situation: record assessment call: %w", err)
 		}
 		c.auditAppend(ctx, "situation.controller", "situation.controller.l2_dispatch", map[string]any{
 			"situation_id": claim.Situation.ID, "call_id": callID, "call_number": callNumber,
@@ -1138,7 +1130,7 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 		policy := ClassifyL2Outcome(vr, transportErr, correctionUsed)
 		if policy.Outcome == L2OutcomeAccepted || policy.Outcome == L2OutcomeContradicted {
 			p := vr.Proposal
-			return &p, nil, nil, callID, correctionUsed
+			return &p, nil, callID, correctionUsed, nil
 		}
 
 		outcomeSequence := synthesizeSequence(snap.InputVersion, retryEpoch, workAttempt, callNumber)
@@ -1156,5 +1148,5 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 		}
 		break
 	}
-	return nil, lastVR, lastTransportErr, lastCallID, correctionUsed
+	return nil, lastVR, lastCallID, correctionUsed, lastTransportErr
 }

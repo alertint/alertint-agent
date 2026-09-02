@@ -1197,12 +1197,10 @@ func readCurrentControllerProjectionTx(ctx context.Context, tx *sql.Tx, situatio
 }
 
 // subtractDueReasonsStore removes every reason in consumed from current,
-// preserving current's order — the store-side mirror of Reconcile's own
-// proposed subtraction (situation.subtractDueReasons, unexported in that
-// package), re-verified here against the row this transaction just read
-// fresh, never trusting the caller's claim-time snapshot. spec.md: "It
-// subtracts only reasons present in the claim. Reasons raised after the
-// claim survive."
+// preserving current's order — evaluated fresh against the row this
+// transaction just read inside its own fenced commit, never trusting the
+// caller's claim-time snapshot. spec.md: "It subtracts only reasons present
+// in the claim. Reasons raised after the claim survive."
 func subtractDueReasonsStore(current, consumed []situationmodel.DueReason) []situationmodel.DueReason {
 	remove := make(map[situationmodel.DueReason]bool, len(consumed))
 	for _, r := range consumed {
@@ -1383,7 +1381,7 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("store: commit commit controller: %w", err)
+		return fmt.Errorf("store: commit controller transaction: %w", err)
 	}
 	return nil
 }

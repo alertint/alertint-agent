@@ -40,6 +40,7 @@ const (
 // attempt outcome row, since CompleteOnce never itself persists anything.
 type OneShotCompletion struct {
 	Completion
+
 	RequestStarted RequestStartStatus
 }
 
