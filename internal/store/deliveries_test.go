@@ -895,3 +895,127 @@ func TestApplyCorrelatedDeliveryRejectsTerminalSituationOwner(t *testing.T) {
 	assertQueryCount(t, st.DB(), `SELECT COUNT(*) FROM incident_alert_deliveries WHERE delivery_id = 'd-late'`, 0)
 	assertQueryCount(t, st.DB(), `SELECT COUNT(*) FROM situation_input_outbox WHERE id = 'input-d-late'`, 0)
 }
+
+// ----------------------------------------------------------------------
+// GetAlertDeliveries (Task 7 fix, Finding #1): a bounded read of the
+// immutable AlertDelivery rows for an exact delivery id set — the frozen
+// input a claimed Triage attempt's MemberDeliveryIDs needs, never the
+// current mutable alerts/incident_alerts projection GetIncidentAlerts
+// reads.
+// ----------------------------------------------------------------------
+
+func TestGetAlertDeliveries_ReturnsExactSet(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 1, 2, 3, 0, time.UTC)
+
+	dels, err := st.AcceptDeliveries(ctx, []DeliveryInput{
+		deliveryFixture("d-1", "fp-1", now),
+		deliveryFixture("d-2", "fp-2", now.Add(time.Minute)),
+		deliveryFixture("d-3", "fp-3", now.Add(2*time.Minute)),
+	})
+	if err != nil || len(dels) != 3 {
+		t.Fatalf("accept deliveries: %v (%d)", err, len(dels))
+	}
+
+	got, err := st.GetAlertDeliveries(ctx, []string{"d-1", "d-3"})
+	if err != nil {
+		t.Fatalf("GetAlertDeliveries: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d deliveries, want 2", len(got))
+	}
+	byID := map[string]AlertDelivery{}
+	for _, d := range got {
+		byID[d.ID] = d
+	}
+	if _, ok := byID["d-1"]; !ok {
+		t.Error("missing d-1")
+	}
+	if _, ok := byID["d-3"]; !ok {
+		t.Error("missing d-3")
+	}
+	if _, ok := byID["d-2"]; ok {
+		t.Error("d-2 must not be returned — it was not requested")
+	}
+	if byID["d-1"].Alert.Fingerprint != "fp-1" {
+		t.Errorf("d-1 Alert.Fingerprint = %q, want fp-1", byID["d-1"].Alert.Fingerprint)
+	}
+}
+
+func TestGetAlertDeliveries_EmptyInputReturnsEmptySlice(t *testing.T) {
+	st := newTestStore(t)
+	got, err := st.GetAlertDeliveries(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("GetAlertDeliveries: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %d deliveries, want 0", len(got))
+	}
+}
+
+func TestGetAlertDeliveries_MissingIDFailsClosed(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 1, 2, 3, 0, time.UTC)
+	if _, err := st.AcceptDeliveries(ctx, []DeliveryInput{deliveryFixture("d-real", "fp-real", now)}); err != nil {
+		t.Fatalf("accept delivery: %v", err)
+	}
+
+	_, err := st.GetAlertDeliveries(ctx, []string{"d-real", "d-does-not-exist"})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound (a missing delivery id is a genuine identity error)", err)
+	}
+}
+
+// TestGetAlertDeliveries_ImmutableAcrossAlertMutation is the fix's own
+// regression proof: once a delivery is accepted, mutating the shared
+// alerts row for the same fingerprint (the re-fire race Finding #1
+// describes — a fresh delivery for an already-attached alert changes the
+// mutable alerts row in place via ON CONFLICT(fingerprint)) must never
+// change what GetAlertDeliveries returns for the ALREADY-accepted delivery
+// id — its content was frozen at accept time.
+func TestGetAlertDeliveries_ImmutableAcrossAlertMutation(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 1, 2, 3, 0, time.UTC)
+
+	original := deliveryFixture("d-frozen", "fp-mut", now)
+	original.Alert.Annotations = map[string]string{"summary": "original summary"}
+	dels, err := st.AcceptDeliveries(ctx, []DeliveryInput{original})
+	if err != nil || len(dels) != 1 {
+		t.Fatalf("accept delivery: %v (%d)", err, len(dels))
+	}
+	frozenAlertID := dels[0].Alert.ID
+
+	// Simulate a re-fire: a second delivery for the same fingerprint mutates
+	// the shared alerts row (upsertDeliveryAlertTx's own ON CONFLICT
+	// DO UPDATE) via a completely new, later delivery id.
+	mutated := deliveryFixture("d-later", "fp-mut", now.Add(time.Hour))
+	mutated.Alert.ID = frozenAlertID // same underlying alert (fingerprint match forces this anyway)
+	mutated.Alert.Annotations = map[string]string{"summary": "MUTATED after the frozen delivery was accepted"}
+	if _, err := st.AcceptDeliveries(ctx, []DeliveryInput{mutated}); err != nil {
+		t.Fatalf("accept mutating delivery: %v", err)
+	}
+
+	// The alerts row itself really did change underneath.
+	current, err := st.GetAlertByFingerprint(ctx, "fp-mut")
+	if err != nil {
+		t.Fatalf("get alert by fingerprint: %v", err)
+	}
+	if current.Annotations["summary"] != "MUTATED after the frozen delivery was accepted" {
+		t.Fatalf("current alerts row summary = %q, want the mutated value (test setup broken)", current.Annotations["summary"])
+	}
+
+	got, err := st.GetAlertDeliveries(ctx, []string{"d-frozen"})
+	if err != nil {
+		t.Fatalf("GetAlertDeliveries: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d deliveries, want 1", len(got))
+	}
+	if got[0].Alert.Annotations["summary"] != "original summary" {
+		t.Errorf("d-frozen Alert.Annotations[summary] = %q, want the frozen original — GetAlertDeliveries must never observe the later alerts-row mutation",
+			got[0].Alert.Annotations["summary"])
+	}
+}

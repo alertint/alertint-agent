@@ -1172,6 +1172,62 @@ func getDeliveryTx(ctx context.Context, tx *sql.Tx, id string) (AlertDelivery, e
 	return d, nil
 }
 
+// GetAlertDeliveries returns the immutable AlertDelivery rows — each
+// carrying its own per-delivery-frozen Alert snapshot — for an EXACT set of
+// delivery IDs. This is the bounded read a claimed Acute Triage attempt's
+// frozen TriageAttemptClaim.MemberDeliveryIDs (Task 6,
+// internal/store/triage_controller.go's ClaimIncidentTriageAttempt) needs:
+// every AlertDelivery.Alert field this returns (ID, Fingerprint, Status,
+// Labels, Annotations, StartsAt, EndsAt, ReceivedAt,
+// ReceiverGroupingIdentity) is read from alert_deliveries' own immutable
+// columns plus alerts.fingerprint (itself never rewritten by
+// upsertDeliveryAlertTx's own ON CONFLICT — only status/labels/annotations/
+// starts_at/ends_at/received_at are) — see hydrateDelivery — so nothing
+// here can ever observe a later mutation to the shared, mutable alerts row
+// the way GetIncidentAlerts does. Order is not guaranteed to match
+// deliveryIDs; callers that need a specific order must sort themselves.
+//
+// An empty deliveryIDs returns an empty slice, not an error. Returns
+// ErrNotFound if any requested id has no delivery row at all —
+// alert_deliveries rows are never deleted once accepted (immutable per its
+// own doc comment), so a miss here is a genuine identity error, never a
+// legitimate race to tolerate silently.
+func (s *Store) GetAlertDeliveries(ctx context.Context, deliveryIDs []string) ([]AlertDelivery, error) {
+	if len(deliveryIDs) == 0 {
+		return []AlertDelivery{}, nil
+	}
+	idsJSON, err := json.Marshal(deliveryIDs)
+	if err != nil {
+		return nil, fmt.Errorf("store: marshal alert delivery ids: %w", err)
+	}
+	rows, err := s.db.QueryContext(ctx, deliverySelect+`
+		WHERE ad.id IN (SELECT value FROM json_each(?))`, string(idsJSON))
+	if err != nil {
+		return nil, fmt.Errorf("store: get alert deliveries: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make([]AlertDelivery, 0, len(deliveryIDs))
+	seen := make(map[string]bool, len(deliveryIDs))
+	for rows.Next() {
+		d, err := scanDelivery(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: scan alert delivery: %w", err)
+		}
+		seen[d.ID] = true
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate alert deliveries: %w", err)
+	}
+	for _, id := range deliveryIDs {
+		if !seen[id] {
+			return nil, fmt.Errorf("store: alert delivery %s: %w", id, ErrNotFound)
+		}
+	}
+	return out, nil
+}
+
 // rawDeliveryFields holds the string-typed columns shared by deliverySelect
 // and dispatchSelect, scanned before being parsed/typed by hydrateDelivery.
 type rawDeliveryFields struct {

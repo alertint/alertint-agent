@@ -841,8 +841,12 @@ type failureOutputDTO struct {
 }
 
 // completeFailedAttemptTx marks attemptID's ledger row completed with a
-// bounded, sanitized typed failure — the one legal completing UPDATE shared
-// by BackoffIncidentTriageAttempt and ExhaustIncidentTriageAttempt.
+// bounded, sanitized typed code/detail — the one legal completing UPDATE
+// shared by BackoffIncidentTriageAttempt, ExhaustIncidentTriageAttempt, and
+// CompleteIncidentTriageAttemptAsCleanSkip. The name predates the clean-skip
+// caller (a clean skip is not a "failure"); the column pair itself is a
+// general "how did this attempt end" code/detail, not failure-only — see
+// each caller's own doc comment for what its code means.
 func completeFailedAttemptTx(ctx context.Context, tx *sql.Tx, attemptID, code, detail string, now time.Time) error {
 	sanitized := sanitizeTriageDetail(detail)
 	outputDigest := canonicalDigest(failureOutputDTO{Code: code, Detail: sanitized})
@@ -969,6 +973,86 @@ func (s *Store) ExhaustIncidentTriageAttempt(ctx context.Context, attemptID, inc
 	}
 	idempotencyKey := "triage-exhausted:" + attemptID
 	if err := insertTriageSituationInputTx(ctx, tx, "triage_exhausted", idempotencyKey, incidentID, groupKey, now); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// CompleteIncidentTriageAttemptAsCleanSkip closes a claimed attempt whose
+// AcuteAnalyzer found nothing worth judging (skills/acutetriage's own
+// ErrCleanSkip: too few member alerts, or a known-rule short circuit that
+// still consumed a claim) — distinct from DecideTriage's earlier B+-gate-
+// level skip (applySkipFromAwaitingDecisionTx), which never claims an
+// attempt at all. This clean skip DOES consume the attempt already claimed
+// for it (the attempt ledger row it closes proves that), but its end state
+// must read as a genuine skip, never a failure:
+//
+//   - the schedule closes to the SAME terminal 'skipped' phase the B+-gate
+//     skip uses, not 'exhausted' — consistency: both readings of "skip"
+//     land the same way;
+//   - the Incident is restored to "ready", never "failed" (Global
+//     Constraint: "Triage exhaustion never closes a Situation" — a skipped
+//     Incident must stay collapse-eligible, so a later re-fire is never
+//     blocked by ErrIncidentOwnerNotCollapsible the way a "failed" Incident
+//     would block it);
+//   - it appends exactly one triage_skipped input — reusing the SAME
+//     idempotent kind applySkipFromAwaitingDecisionTx's own B+ skip
+//     appends, since both mean "no Finding needed, a clean judgment", never
+//     triage_exhausted's own, unrelated meaning ("five attempts burned").
+//
+// Fenced identically to BackoffIncidentTriageAttempt/
+// ExhaustIncidentTriageAttempt: attemptID must still be the row's current
+// in_flight attempt, verified inside one transaction; a second call against
+// an already-completed attempt fails closed with ErrTriageAttemptLeaseLost
+// (completeFailedAttemptTx's own `WHERE ... AND completed_at IS NULL`
+// fence) rather than silently no-oping or re-appending a duplicate
+// Situation input.
+func (s *Store) CompleteIncidentTriageAttemptAsCleanSkip(ctx context.Context, attemptID, incidentID, code, detail string, now time.Time) error {
+	if strings.TrimSpace(attemptID) == "" || strings.TrimSpace(incidentID) == "" {
+		return errors.New("store: complete incident triage attempt as clean skip requires attempt id and incident id")
+	}
+	now = now.UTC()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin complete incident triage attempt as clean skip: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := completeFailedAttemptTx(ctx, tx, attemptID, code, detail, now); err != nil {
+		return err
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE incident_triage
+		SET phase = 'skipped', next_at = NULL, last_error_code = NULL, last_error_detail = NULL,
+		    lease_owner = NULL, lease_expires_at = NULL, current_attempt_id = NULL, updated_at = ?
+		WHERE incident_id = ? AND phase = 'in_flight' AND current_attempt_id = ?`,
+		canonicalTime(now), incidentID, attemptID)
+	if err != nil {
+		return fmt.Errorf("store: skip incident triage schedule: %w", err)
+	}
+	if err := requireOneRow(res, "store: skip incident triage schedule", ErrTriageAttemptLeaseLost); err != nil {
+		return err
+	}
+
+	res2, err := tx.ExecContext(ctx, `
+		UPDATE incidents SET status = 'ready', updated_at = ? WHERE id = ? AND status = 'processing'`,
+		canonicalTime(now), incidentID)
+	if err != nil {
+		return fmt.Errorf("store: restore incident ready after clean skip: %w", err)
+	}
+	if err := requireOneRow(res2, "store: restore incident ready after clean skip", ErrNotFound); err != nil {
+		return err
+	}
+
+	var groupKey string
+	if err := tx.QueryRowContext(ctx, `SELECT group_key FROM incidents WHERE id = ?`, incidentID).Scan(&groupKey); err != nil {
+		return fmt.Errorf("store: read incident group key for triage_skipped: %w", err)
+	}
+	idempotencyKey := "triage-skipped:" + attemptID
+	if err := insertTriageSituationInputTx(ctx, tx, "triage_skipped", idempotencyKey, incidentID, groupKey, now); err != nil {
 		return err
 	}
 

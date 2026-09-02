@@ -47,6 +47,16 @@ import (
 // value via internal/situation/model, no mapping needed there) is Task 9's
 // runtime-wiring job — see the Task 7 report for why that boundary is
 // unavoidable, not a shortcut.
+//
+// Task 7 fix round (see the Task 7 report's fix addendum for the full
+// investigation behind each): Analyze now loads exactly claim.
+// MemberDeliveryIDs' frozen content (store.GetAlertDeliveries), never the
+// current mutable alerts/incident_alerts projection; completeCleanSkip now
+// closes through the dedicated store.CompleteIncidentTriageAttemptAsClean-
+// Skip primitive instead of misusing ExhaustIncidentTriageAttempt;
+// classifyAttemptError restores llmhealth-aware granularity via the
+// optional ClassifiedError interface below; and a genuine exhaustion now
+// calls the optional ExhaustionNotifier hook, also below.
 // ----------------------------------------------------------------------
 
 // TriageAttemptClaim is the situation-native mirror of Task 6's
@@ -162,6 +172,66 @@ type AfterCommitter interface {
 	AfterCommit(ctx context.Context, result AcuteResult) error
 }
 
+// ExhaustionNotifier is TriageWorker's narrow hook for a genuine
+// attempt-schedule exhaustion (the final, MaxAttempts-th, consecutive
+// failed attempt) — mirroring how AfterCommitter is already a narrow
+// interface TriageWorker calls on a genuine success, this is the analogous
+// hook for TriageWorker's other terminal outcome. It restores the
+// operator-visible signal the deleted pre-Plan-2 dispatch chain's own
+// exhaustTriage produced (an incident.triage_exhausted audit row plus a
+// TriageFailureNotifier.OnTriageExhausted call), which TriageWorker had none
+// of before this fix (Task 7 report, Finding #3).
+//
+// TriageWorker calls this ONLY after a genuine exhaustion has actually
+// committed — never on a clean skip (completeCleanSkip's own, separate,
+// non-failure completion path — see CompleteIncidentTriageAttemptAsClean-
+// Skip) and never on a stale completion or a still-retryable backoff.
+//
+// This interface deliberately never mentions internal/notify or
+// internal/store — see this file's own header comment for why
+// internal/situation cannot import either — so skills/acutetriage (or
+// wherever else is architecturally appropriate) can implement it with a
+// thin adapter over the real notifier/auditor, exactly the pattern its own
+// AfterCommitter implementation (Skill.AfterCommit) already follows. May be
+// nil (exhaustion notification disabled — tests, or a caller that has not
+// wired one yet); TriageWorker treats a nil ExhaustionNotifier as a no-op,
+// exactly like a nil AfterCommitter.
+type ExhaustionNotifier interface {
+	OnTriageExhausted(ctx context.Context, incidentID, code, detail string) error
+}
+
+// ClassifiedError is an AcuteAnalyzer failure's own optional, bounded
+// failure classification — an escape hatch classifyAttemptError checks for
+// (via a plain type assertion, never a hard dependency: an AcuteAnalyzer
+// that never returns a ClassifiedError works exactly as before, falling
+// back to classifyAttemptError's own coarser context.*-only classification)
+// before falling back to its generic code.
+//
+// It exists to restore the pre-Plan-2 dispatch chain's own llmhealth-aware
+// classifyTriageError granularity (a dependency-class provider status, a
+// content-class schema/malformed-response code, or an LLM-origin-marked
+// timeout/network/canceled reason) without this package importing
+// internal/llmhealth itself — internal/llmhealth imports internal/store,
+// which already imports internal/situation, so the reverse would cycle the
+// same way this file's own header comment documents for
+// TriageAttemptStore. skills/acutetriage wraps whatever error Analyze
+// returns in a type satisfying this interface (see its own
+// classifyAnalyzeError) — a structural, not compile-time-declared,
+// implementation, so neither package needs to import the other's error
+// type by name.
+type ClassifiedError interface {
+	error
+	// Code is the bounded, stable, lowercase-identifier-shaped failure code
+	// to persist — never raw error text (mirrors the store layer's own
+	// last_error_class contract, internal/store/deliveries.go's
+	// errorClassPattern).
+	Code() string
+	// SafeDetail is the bounded, provider-text-free explanation to persist
+	// alongside Code — never a raw err.Error() (which could embed a
+	// provider response body or other sensitive/verbose text).
+	SafeDetail() string
+}
+
 // ErrCleanSkip is AcuteAnalyzer's typed "nothing to analyze" outcome — a
 // deterministic clean skip (too few member alerts to trigger analysis),
 // never a transient failure. Analyze returns this explicitly rather than a
@@ -227,15 +297,16 @@ var (
 	ErrTriageAttemptCompletedDifferently = errors.New("situation: incident triage attempt already completed with different content")
 )
 
-// TriageAttemptStore is the narrow claim/extend/complete/backoff/exhaust
-// surface TriageWorker depends on, phrased entirely in this package's own
-// types so it never needs to import internal/store. Every method here
-// mirrors one of Task 6's internal/store/triage_controller.go methods
-// exactly in intent; RecoverExpiredIncidentTriageAttempts/
+// TriageAttemptStore is the narrow claim/extend/complete/backoff/exhaust/
+// clean-skip surface TriageWorker depends on, phrased entirely in this
+// package's own types so it never needs to import internal/store. Every
+// method here mirrors one of Task 6/7's internal/store/triage_controller.go
+// methods exactly in intent; RecoverExpiredIncidentTriageAttempts/
 // ExtendIncidentTriageLease/BackoffIncidentTriageAttempt/
-// ExhaustIncidentTriageAttempt already use only primitive types, so
-// *store.Store satisfies those four directly — only Claim/Complete need a
-// real adapter (see this file's header comment).
+// ExhaustIncidentTriageAttempt/CompleteIncidentTriageAttemptAsCleanSkip
+// already use only primitive types, so *store.Store satisfies those five
+// directly — only Claim/Complete need a real adapter (see this file's
+// header comment).
 type TriageAttemptStore interface {
 	// ClaimIncidentTriageAttempt claims incidentID's due pending/backoff
 	// row. Returns model.ErrNotFound if the row is not currently
@@ -262,6 +333,15 @@ type TriageAttemptStore interface {
 	// ExhaustIncidentTriageAttempt completes attemptID with a bounded typed
 	// failure and closes the schedule out terminally.
 	ExhaustIncidentTriageAttempt(ctx context.Context, attemptID, incidentID, code, detail string, now time.Time) error
+
+	// CompleteIncidentTriageAttemptAsCleanSkip closes attemptID as a clean
+	// skip (Analyze's own ErrCleanSkip: nothing worth judging) — a terminal
+	// non-failure outcome distinct from both a real Finding and a genuine
+	// exhaustion. See store.CompleteIncidentTriageAttemptAsCleanSkip's own
+	// doc comment for the full contract this mirrors: schedule -> 'skipped',
+	// Incident restored to "ready" (never "failed"), exactly one
+	// triage_skipped input.
+	CompleteIncidentTriageAttemptAsCleanSkip(ctx context.Context, attemptID, incidentID, code, detail string, now time.Time) error
 
 	// RecoverExpiredIncidentTriageAttempts resolves every in_flight row
 	// whose lease has expired (a crash mid-attempt, or a heartbeat that
@@ -396,12 +476,13 @@ func triageBackoffDelay(attemptNumber int) time.Duration {
 // additionally be called directly (tests, or a one-shot CLI drain) without
 // ever calling Start.
 type TriageWorker struct {
-	store       TriageAttemptStore
-	lister      TriageScheduleLister
-	analyzer    AcuteAnalyzer
-	afterCommit AfterCommitter
-	cfg         TriageWorkerConfig
-	logger      *slog.Logger
+	store              TriageAttemptStore
+	lister             TriageScheduleLister
+	analyzer           AcuteAnalyzer
+	afterCommit        AfterCommitter
+	exhaustionNotifier ExhaustionNotifier
+	cfg                TriageWorkerConfig
+	logger             *slog.Logger
 
 	wakeCh chan struct{}
 	stopCh chan struct{}
@@ -410,24 +491,26 @@ type TriageWorker struct {
 	startOnce sync.Once
 }
 
-// NewTriageWorker creates a TriageWorker. afterCommit may be nil (post-commit
-// effects disabled — tests only). Passing nil for logger falls back to
-// slog.Default(). Call Start to run it on a schedule, or drive it directly
-// with RunOnce/Drain.
-func NewTriageWorker(store TriageAttemptStore, lister TriageScheduleLister, analyzer AcuteAnalyzer, afterCommit AfterCommitter, cfg TriageWorkerConfig, logger *slog.Logger) *TriageWorker {
+// NewTriageWorker creates a TriageWorker. afterCommit and exhaustionNotifier
+// may both be nil (post-commit / exhaustion-notify effects disabled — tests,
+// or a caller that has not wired one yet). Passing nil for logger falls back
+// to slog.Default(). Call Start to run it on a schedule, or drive it
+// directly with RunOnce/Drain.
+func NewTriageWorker(store TriageAttemptStore, lister TriageScheduleLister, analyzer AcuteAnalyzer, afterCommit AfterCommitter, exhaustionNotifier ExhaustionNotifier, cfg TriageWorkerConfig, logger *slog.Logger) *TriageWorker {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &TriageWorker{
-		store:       store,
-		lister:      lister,
-		analyzer:    analyzer,
-		afterCommit: afterCommit,
-		cfg:         cfg.withDefaults(),
-		logger:      logger,
-		wakeCh:      make(chan struct{}, 1),
-		stopCh:      make(chan struct{}),
-		doneCh:      make(chan struct{}),
+		store:              store,
+		lister:             lister,
+		analyzer:           analyzer,
+		afterCommit:        afterCommit,
+		exhaustionNotifier: exhaustionNotifier,
+		cfg:                cfg.withDefaults(),
+		logger:             logger,
+		wakeCh:             make(chan struct{}, 1),
+		stopCh:             make(chan struct{}),
+		doneCh:             make(chan struct{}),
 	}
 }
 
@@ -684,23 +767,18 @@ func (w *TriageWorker) completeSuccessOrStale(ctx context.Context, claim TriageA
 }
 
 // completeCleanSkip closes a claimed attempt that found nothing to analyze
-// (ErrCleanSkip).
-//
-// Known gap (flagged, not silently patched): Task 6's store API has no
-// "skip a claimed attempt" completion distinct from Exhaust/Backoff/
-// Complete — unlike the pre-Plan-2 dispatch chain's SkipIncidentTriage,
-// which returned the Incident to "ready" and closed the schedule
-// terminally without failure semantics. ExhaustIncidentTriageAttempt is the
-// closest available primitive (terminal, no further attempts wasted on a
-// condition retrying will not change), but it marks the Incident "failed"
-// rather than restoring it to "ready" the way the old clean-skip did. A
-// dedicated skip-completion method in internal/store would close this gap
-// properly; adding one is out of this task's Files list. See the Task 7
-// report.
+// (ErrCleanSkip) through the dedicated CompleteIncidentTriageAttemptAsClean-
+// Skip primitive (Task 7 fix, Finding #2): the schedule closes to 'skipped'
+// (not 'exhausted'), the Incident is restored to "ready" (never "failed" —
+// a clean skip must stay collapse-eligible), and exactly one triage_skipped
+// input is appended — never triage_exhausted, which spec.md reserves for a
+// genuine five-attempt failure. This never calls exhaustionNotifier: a
+// clean skip is not a failure, so it carries no operator-visible exhaustion
+// signal at all.
 func (w *TriageWorker) completeCleanSkip(ctx context.Context, claim TriageAttemptClaim, now time.Time) {
 	const code = "clean_skip"
 	const detail = "acute triage found nothing to analyze (below the minimum member alert count)"
-	if err := w.store.ExhaustIncidentTriageAttempt(ctx, claim.AttemptID, claim.IncidentID, code, detail, now); err != nil {
+	if err := w.store.CompleteIncidentTriageAttemptAsCleanSkip(ctx, claim.AttemptID, claim.IncidentID, code, detail, now); err != nil {
 		w.logger.Error("situation: triage worker: close clean-skip attempt failed",
 			"incident_id", claim.IncidentID, "attempt_id", claim.AttemptID, "err", err)
 	}
@@ -718,7 +796,9 @@ func (w *TriageWorker) completeFailure(ctx context.Context, claim TriageAttemptC
 		if err := w.store.ExhaustIncidentTriageAttempt(ctx, claim.AttemptID, claim.IncidentID, code, detail, now); err != nil {
 			w.logger.Error("situation: triage worker: exhaust attempt failed",
 				"incident_id", claim.IncidentID, "attempt_id", claim.AttemptID, "err", err)
+			return
 		}
+		w.notifyExhaustion(ctx, claim, code, detail)
 		return
 	}
 	next := now.Add(triageBackoffDelay(claim.AttemptNumber))
@@ -733,20 +813,41 @@ func (w *TriageWorker) completeFailure(ctx context.Context, claim TriageAttemptC
 		"retry_in", next.Sub(now), "err", cause)
 }
 
+// notifyExhaustion calls the configured ExhaustionNotifier, if any, after a
+// genuine attempt-schedule exhaustion has actually committed — mirroring
+// completeSuccessOrStale's own best-effort treatment of AfterCommit: a
+// notify failure here is logged, never treated as grounds to redo or
+// re-notify the (already durably exhausted) attempt.
+func (w *TriageWorker) notifyExhaustion(ctx context.Context, claim TriageAttemptClaim, code, detail string) {
+	if w.exhaustionNotifier == nil {
+		return
+	}
+	if err := w.exhaustionNotifier.OnTriageExhausted(ctx, claim.IncidentID, code, detail); err != nil {
+		w.logger.Warn("situation: triage worker: exhaustion notify failed (best-effort)",
+			"incident_id", claim.IncidentID, "attempt_id", claim.AttemptID, "err", err)
+	}
+}
+
 // classifyAttemptError produces the bounded, sanitized code/detail persisted
-// on a failed attempt. This is a deliberately coarser classification than
-// the pre-Plan-2 dispatch chain's llmhealth-aware classifyTriageError
-// (internal/correlator/triage_retry.go, removed by this task):
-// internal/llmhealth imports internal/store (for its Tracker persistence),
-// and internal/store already imports internal/situation, so importing
-// llmhealth here would cycle the same way importing internal/store
-// directly would. Richer LLM-health-aware classification — "typed LLM
-// outcomes to installation-level LLM health" per spec.md — is Task 8/9's
-// wiring concern; skills/acutetriage's Analyze already reports every LLM
-// call outcome to its configured llmhealth.Tracker regardless of caller
-// (Run, Rejudge, or this worker), so that requirement is met independently
-// of this classifier's coarseness. See the Task 7 report.
+// on a failed attempt. It first checks err (anywhere in its chain) for the
+// optional ClassifiedError interface above — an AcuteAnalyzer's own richer
+// classification, e.g. skills/acutetriage's classifyAnalyzeError, which
+// restores the pre-Plan-2 dispatch chain's llmhealth-aware granularity
+// (capability-aware provider codes, schema/malformed-response codes,
+// LLM-origin-marked timeout/network/canceled) without this package
+// importing internal/llmhealth itself (internal/llmhealth imports
+// internal/store, and internal/store already imports internal/situation, so
+// importing llmhealth here would cycle the same way importing internal/
+// store directly would). Only when no ClassifiedError is present does this
+// fall back to its own bare context.*-only classification — unchanged from
+// before this fix, and still the ONLY classification any non-acutetriage
+// AcuteAnalyzer (a test fake, or TriageWorker's own directly-canceled
+// analysis context on a RunOnce-level cancellation) ever gets.
 func classifyAttemptError(err error) (code, detail string) {
+	var ce ClassifiedError
+	if errors.As(err, &ce) {
+		return ce.Code(), sanitizeAttemptDetail(ce.SafeDetail())
+	}
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
 		return "timeout", sanitizeAttemptDetail(err.Error())

@@ -57,21 +57,22 @@ const (
 // here but held in the returned result's PostCommit.AuditRecords, appended
 // only by AfterCommit once the store has actually committed a success.
 //
-// Known gap (flagged, not silently patched — see the Task 7 report for the
-// full investigation): claim.MemberDeliveryIDs freezes delivery identities
-// from the NEW internal/situation ledger (alert_deliveries/
-// incident_alert_deliveries, Task 4/6), but this method loads Alert data via
-// the EXISTING GetIncidentAlerts(claim.IncidentID) — the legacy alerts/
-// incident_alerts tables the whole Acute Triage pipeline has always read.
-// There is no store method to load Alert records scoped to a specific
-// bounded delivery/alert id set, and this task's Files list does not
-// authorize adding one to internal/store. In practice both tables are
-// written together by the same correlation write path, so this rarely
-// diverges; when it does (a race between claim time and this read), the
-// store's own CompleteIncidentTriageAttempt digest fence — not this method
-// — is what actually protects durable state: a membership drift in that
-// window surfaces as a stale_membership/stale_incident_input completion,
-// never a corrupted Finding.
+// Fixed (Task 7 fix round, Finding #1 — see the Task 7 report's fix
+// addendum for the full investigation): Analyze now loads member content
+// through s.st.GetAlertDeliveries(claim.MemberDeliveryIDs) — the bounded,
+// immutable per-delivery Alert snapshots frozen at claim time — never
+// GetIncidentAlerts' current, mutable alerts/incident_alerts projection.
+// This closes the re-fire divergence the prior version's own digest-fence
+// "backstop" argument missed: a claimed ready/processing Incident's
+// fingerprint re-firing correlates to a DIFFERENT (new) Incident once the
+// claimed Incident has left "collecting" — so the claimed Incident's OWN
+// membership/incident-input digests never change (the fence never fires),
+// even though the SHARED alerts row (keyed by fingerprint, mutated in place
+// by AcceptDeliveries' own ON CONFLICT) does. dedupeFrozenAlerts collapses
+// the frozen per-delivery set back down to one entry per member Alert (the
+// same shape GetIncidentAlerts has always produced), using the latest
+// ReceivedAt among ONLY the frozen delivery set — never a later mutation
+// outside it.
 func (s *Skill) Analyze(ctx context.Context, claim situation.TriageAttemptClaim) (situation.AcuteResult, error) {
 	inc, err := s.st.GetIncidentByID(ctx, claim.IncidentID)
 	if err != nil {
@@ -81,10 +82,25 @@ func (s *Skill) Analyze(ctx context.Context, claim situation.TriageAttemptClaim)
 		return situation.AcuteResult{}, fmt.Errorf("acutetriage: analyze: incident %s: %w", claim.IncidentID, store.ErrNotFound)
 	}
 
-	alerts, err := s.st.GetIncidentAlerts(ctx, inc.ID)
+	alerts, err := s.loadFrozenClaimAlerts(ctx, claim)
 	if err != nil {
-		return situation.AcuteResult{}, fmt.Errorf("acutetriage: analyze: load alerts: %w", err)
+		return situation.AcuteResult{}, classifyAnalyzeError(err)
 	}
+	return s.analyzeFromAlerts(ctx, *inc, alerts)
+}
+
+// analyzeFromAlerts is Analyze's own shared core: the "no member alerts, or
+// fewer than the configured minimum -> ErrCleanSkip; else run analyzeCore
+// and assemble AcuteResult" logic, factored out so Run (skill.go) — which
+// has no frozen claim at all and instead loads the Incident's CURRENT
+// member alerts directly via GetIncidentAlerts, exactly as it always has —
+// can share this exact logic against its own differently-sourced alerts
+// slice. Analyze itself is the only caller that reaches this via frozen,
+// claim-scoped content; Run intentionally stays on current-state loading
+// (it is a direct-invocation compatibility path outside the durable
+// claim/lease mechanism entirely — see Run's own doc comment — so there is
+// nothing for it to freeze against).
+func (s *Skill) analyzeFromAlerts(ctx context.Context, inc store.Incident, alerts []store.Alert) (situation.AcuteResult, error) {
 	if len(alerts) == 0 {
 		s.logger.Warn("acutetriage: incident has no member alerts; skipping", "incident_id", inc.ID)
 		return situation.AcuteResult{}, ErrCleanSkip
@@ -99,9 +115,9 @@ func (s *Skill) Analyze(ctx context.Context, claim situation.TriageAttemptClaim)
 		return situation.AcuteResult{}, ErrCleanSkip
 	}
 
-	ta, err := s.analyzeCore(ctx, *inc, alerts, false, "", inc.FirstAlertAt, "", nil)
+	ta, err := s.analyzeCore(ctx, inc, alerts, false, "", inc.FirstAlertAt, "", nil)
 	if err != nil {
-		return situation.AcuteResult{}, err
+		return situation.AcuteResult{}, classifyAnalyzeError(err)
 	}
 
 	result := situation.AcuteResult{
@@ -119,8 +135,71 @@ func (s *Skill) Analyze(ctx context.Context, claim situation.TriageAttemptClaim)
 		EnrichmentJSON: ta.enrichmentJSON,
 		AlertRoles:     computeAlertRoles(alerts, ta.resp.Alerts, ta.ar.shortCircuit),
 	}
-	result.PostCommit = s.buildPostCommit(ctx, *inc, alerts, ta)
+	result.PostCommit = s.buildPostCommit(ctx, inc, alerts, ta)
 	return result, nil
+}
+
+// loadFrozenClaimAlerts loads exactly the bounded, immutable member content
+// claim.MemberDeliveryIDs froze at claim time — s.st.GetAlertDeliveries,
+// never GetIncidentAlerts' current mutable projection — and collapses it
+// back down to one entry per member Alert via dedupeFrozenAlerts. An empty
+// claim.MemberDeliveryIDs (no member deliveries at all) returns (nil, nil):
+// the caller treats a nil/empty result as a clean skip, matching the
+// pre-fix "no member alerts" check exactly.
+func (s *Skill) loadFrozenClaimAlerts(ctx context.Context, claim situation.TriageAttemptClaim) ([]store.Alert, error) {
+	if len(claim.MemberDeliveryIDs) == 0 {
+		return nil, nil
+	}
+	deliveries, err := s.st.GetAlertDeliveries(ctx, claim.MemberDeliveryIDs)
+	if err != nil {
+		return nil, fmt.Errorf("acutetriage: analyze: load frozen member deliveries: %w", err)
+	}
+	return dedupeFrozenAlerts(deliveries), nil
+}
+
+// dedupeFrozenAlerts collapses one AlertDelivery per Alert.ID. A claimed
+// attempt's MemberDeliveryIDs is a bounded set of DELIVERY identities, not
+// Alert identities: the same Alert can have re-fired more than once while
+// its Incident was still collecting (each re-fire is a fresh alert_deliveries
+// row sharing the same alert_id), producing more than one frozen delivery
+// for the same underlying alert before any claim ever froze it. Analyze's
+// rules/evidence/prompt code has always operated on one entry per member
+// Alert (GetIncidentAlerts' own contract — every downstream call in this
+// package's analyzeCore chain assumes that shape, e.g. len(alerts) driving
+// the min-alert-count/prompt-template decision), so this reduces the frozen
+// delivery set back down to it: for each Alert ID, the delivery with the
+// latest ReceivedAt among the FROZEN set wins (the most current state the
+// claim itself actually saw — never a later, unfrozen mutation outside that
+// set), ties broken by delivery ID for determinism; the output preserves
+// each Alert's first-seen order, mirroring GetIncidentAlerts' own "in the
+// order they were added" contract.
+func dedupeFrozenAlerts(deliveries []store.AlertDelivery) []store.Alert {
+	if len(deliveries) == 0 {
+		return nil
+	}
+	type chosen struct {
+		alert      store.Alert
+		receivedAt time.Time
+		deliveryID string
+	}
+	order := make([]string, 0, len(deliveries))
+	best := make(map[string]chosen, len(deliveries))
+	for _, d := range deliveries {
+		id := d.Alert.ID
+		cur, ok := best[id]
+		if !ok {
+			order = append(order, id)
+		}
+		if !ok || d.ReceivedAt.After(cur.receivedAt) ||
+			(d.ReceivedAt.Equal(cur.receivedAt) && d.ID > cur.deliveryID) {
+			best[id] = chosen{alert: d.Alert, receivedAt: d.ReceivedAt, deliveryID: d.ID}
+		}
+	}
+	out := make([]store.Alert, len(order))
+	for i, id := range order {
+		out[i] = best[id].alert
+	}
+	return out
 }
 
 // AfterCommit performs best-effort compatibility memory/notifier/audit work
@@ -167,6 +246,51 @@ func (s *Skill) AfterCommit(ctx context.Context, result situation.AcuteResult) e
 		}
 	}
 
+	return errors.Join(errs...)
+}
+
+// OnTriageExhausted implements situation.ExhaustionNotifier (Task 7 fix,
+// Finding #3): TriageWorker's hook for a genuine attempt-schedule
+// exhaustion (the final consecutive failed attempt), called only after the
+// store's own exhaust write has actually committed. It restores the
+// operator-visible signal the deleted pre-Plan-2 dispatch chain's own
+// exhaustTriage (internal/correlator/triage_retry.go) produced — one
+// incident.triage_exhausted audit row, plus one notifier call — TriageWorker
+// itself had none of before this fix. Best-effort, exactly like every other
+// AfterCommit-adjacent side effect: a failure here is logged, never treated
+// as grounds to redo or re-notify the already durably exhausted attempt.
+//
+// Known incomplete wiring (Task 9's runtime-wiring job, not this one): this
+// method is the concrete implementation Task 9 wires into a real
+// TriageWorker's exhaustionNotifier — cmd/alertint/main.go still only
+// calls the pre-Plan-2 Correlator.SetTriageFailureNotifier, which no
+// TriageWorker reads. s.notifier here reaches an operator only if it is (or
+// contains, via notify.Multi) a sink implementing notify.TriageFailureSink;
+// GroupKey/AlertCount are left zero-valued (TriageAttemptClaim carries
+// neither) — a reasonable minimal implementation of the interface Task 7
+// commits to, not a claim of full parity with the old event's richer
+// payload.
+func (s *Skill) OnTriageExhausted(ctx context.Context, incidentID, code, detail string) error {
+	var errs []error
+	if s.auditor != nil {
+		if err := s.auditor.Append(ctx, "skill:acute-triage", "incident.triage_exhausted", map[string]any{
+			"incident_id": incidentID,
+			"code":        code,
+			"detail":      detail,
+		}); err != nil {
+			s.logger.Warn("acutetriage: triage exhausted audit append failed", "incident_id", incidentID, "err", err)
+			errs = append(errs, err)
+		}
+	}
+	if s.notifier != nil {
+		if sink, ok := s.notifier.(notify.TriageFailureSink); ok {
+			ev := notify.TriageExhaustedEvent{IncidentID: incidentID, Error: code + ": " + detail}
+			if err := sink.OnTriageExhausted(ctx, ev); err != nil {
+				s.logger.Warn("acutetriage: triage exhausted notify failed", "incident_id", incidentID, "err", err)
+				errs = append(errs, err)
+			}
+		}
+	}
 	return errors.Join(errs...)
 }
 

@@ -8,10 +8,12 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/notify"
 	"github.com/alertint/alertint-agent/internal/situation"
+	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/skills/acutetriage"
 )
 
@@ -40,15 +42,17 @@ func TestAnalyze_NoDurableSideEffects(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
 	inc := insertTestIncident(t, st, ctx)
-	a1 := insertTestAlert(t, st, ctx, inc.ID, "fp-analyze-1", map[string]string{"alertname": "DiskFull", "host": "web1"})
-	a2 := insertTestAlert(t, st, ctx, inc.ID, "fp-analyze-2", map[string]string{"alertname": "DiskFull", "host": "web1"})
+	a1, d1 := insertTestAlertDelivery(t, st, ctx, inc.ID, "fp-analyze-1",
+		map[string]string{"alertname": "DiskFull", "host": "web1"}, map[string]string{"summary": "disk is full"})
+	a2, d2 := insertTestAlertDelivery(t, st, ctx, inc.ID, "fp-analyze-2",
+		map[string]string{"alertname": "DiskFull", "host": "web1"}, map[string]string{"summary": "disk is full"})
 
 	fllm := &fakeLLM{response: validLLMResponse([]string{a1.ID})}
 	auditor := audit.New(st.DB())
 	notifier := &spyNotifier{}
 	skill := acutetriage.New(acutetriage.Config{MinAlerts: 1}, st, fllm, auditor, notifier, nil)
 
-	claim := situation.TriageAttemptClaim{IncidentID: inc.ID, AttemptID: "attempt-1", AttemptNumber: 1}
+	claim := situation.TriageAttemptClaim{IncidentID: inc.ID, AttemptID: "attempt-1", AttemptNumber: 1, MemberDeliveryIDs: []string{d1, d2}}
 	result, err := skill.Analyze(ctx, claim)
 	if err != nil {
 		t.Fatalf("Analyze: %v", err)
@@ -179,10 +183,11 @@ func TestAnalyze_BelowMinAlertsReturnsErrCleanSkip(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
 	inc := insertTestIncident(t, st, ctx)
-	insertTestAlert(t, st, ctx, inc.ID, "fp-below-min", map[string]string{"alertname": "DiskFull"})
+	_, d1 := insertTestAlertDelivery(t, st, ctx, inc.ID, "fp-below-min",
+		map[string]string{"alertname": "DiskFull"}, map[string]string{"summary": "disk is full"})
 
 	skill := acutetriage.New(acutetriage.Config{MinAlerts: 2}, st, &fakeLLM{}, nil, nil, nil)
-	claim := situation.TriageAttemptClaim{IncidentID: inc.ID}
+	claim := situation.TriageAttemptClaim{IncidentID: inc.ID, MemberDeliveryIDs: []string{d1}}
 	_, err := skill.Analyze(ctx, claim)
 	if !errors.Is(err, acutetriage.ErrCleanSkip) {
 		t.Fatalf("Analyze err = %v, want ErrCleanSkip", err)
@@ -197,16 +202,72 @@ func TestAnalyze_ShortCircuitSkipsDefaultedRoles(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
 	inc := insertTestIncident(t, st, ctx)
-	a1 := insertTestAlert(t, st, ctx, inc.ID, "fp-sc-1", map[string]string{"alertname": "KnownDiskIssue"})
-	a2 := insertTestAlert(t, st, ctx, inc.ID, "fp-sc-2", map[string]string{"alertname": "KnownDiskIssue"})
+	a1, d1 := insertTestAlertDelivery(t, st, ctx, inc.ID, "fp-sc-1",
+		map[string]string{"alertname": "KnownDiskIssue"}, map[string]string{"summary": "disk is full"})
+	a2, d2 := insertTestAlertDelivery(t, st, ctx, inc.ID, "fp-sc-2",
+		map[string]string{"alertname": "KnownDiskIssue"}, map[string]string{"summary": "disk is full"})
 
 	skill := acutetriage.New(acutetriage.Config{MinAlerts: 1, Rules: newLocalRuleEngine(t)}, st, &fakeLLM{}, nil, nil, nil)
-	claim := situation.TriageAttemptClaim{IncidentID: inc.ID}
+	claim := situation.TriageAttemptClaim{IncidentID: inc.ID, MemberDeliveryIDs: []string{d1, d2}}
 	result, err := skill.Analyze(ctx, claim)
 	if err != nil {
 		t.Fatalf("Analyze: %v", err)
 	}
 	if result.AlertRoles[a1.ID] != "correlated" || result.AlertRoles[a2.ID] != "correlated" {
 		t.Errorf("AlertRoles = %+v, want both correlated (the rule's own itemization)", result.AlertRoles)
+	}
+}
+
+// TestAnalyze_UsesFrozenClaimContentNotLaterAlertMutation is the Task 7 fix
+// round's own regression proof for Finding #1: once a delivery is accepted
+// and a claim names it, mutating the SHARED alerts row for the same
+// fingerprint (the re-fire race Finding #1 describes — a fresh delivery for
+// an already-attached alert changes the mutable alerts row in place via
+// AcceptDeliveries' own ON CONFLICT(fingerprint)) must never change what
+// Analyze actually sees for that claim: it must keep using the frozen,
+// pre-mutation content, never the current mutated content. This is the
+// test that would have caught the pre-fix bug (Analyze reading
+// GetIncidentAlerts' current mutable projection).
+func TestAnalyze_UsesFrozenClaimContentNotLaterAlertMutation(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	a1, d1 := insertTestAlertDelivery(t, st, ctx, inc.ID, "fp-frozen",
+		map[string]string{"alertname": "DiskFull", "host": "web1"},
+		map[string]string{"summary": "ORIGINAL FROZEN SUMMARY"})
+
+	// Simulate the re-fire race: a LATER delivery for the same fingerprint
+	// mutates the shared alerts row in place, without this claim's own
+	// frozen membership/delivery set ever changing (this claim only ever
+	// names d1).
+	mutated := store.Alert{
+		ID:          a1.ID,
+		Fingerprint: "fp-frozen",
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "DiskFull", "host": "web1"},
+		Annotations: map[string]string{"summary": "MUTATED SUMMARY AFTER CLAIM"},
+		StartsAt:    time.Now().UTC(),
+		ReceivedAt:  time.Now().UTC(),
+	}
+	if _, err := st.UpsertAlertByFingerprint(ctx, mutated); err != nil {
+		t.Fatalf("mutate shared alerts row: %v", err)
+	}
+	current, err := st.GetAlertByFingerprint(ctx, "fp-frozen")
+	if err != nil || current.Annotations["summary"] != "MUTATED SUMMARY AFTER CLAIM" {
+		t.Fatalf("test setup broken: shared alerts row did not actually mutate: %+v, err=%v", current, err)
+	}
+
+	fllm := &fakeLLM{response: validLLMResponse([]string{a1.ID})}
+	skill := acutetriage.New(acutetriage.Config{MinAlerts: 1}, st, fllm, nil, nil, nil)
+	claim := situation.TriageAttemptClaim{IncidentID: inc.ID, AttemptID: "attempt-frozen", AttemptNumber: 1, MemberDeliveryIDs: []string{d1}}
+
+	if _, err := skill.Analyze(ctx, claim); err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if !strings.Contains(fllm.lastUser, "ORIGINAL FROZEN SUMMARY") {
+		t.Errorf("LLM prompt did not contain the frozen original content")
+	}
+	if strings.Contains(fllm.lastUser, "MUTATED SUMMARY AFTER CLAIM") {
+		t.Errorf("LLM prompt contained the LATER mutated content — Analyze read the current mutable alerts row instead of the frozen claim")
 	}
 }

@@ -813,6 +813,72 @@ func TestExhaustIncidentTriageAttemptClosesIncidentFailedAndAppendsExhausted(t *
 }
 
 // ----------------------------------------------------------------------
+// CompleteIncidentTriageAttemptAsCleanSkip (Task 7 fix, Finding #2): the
+// dedicated skip-completion primitive Analyze's own ErrCleanSkip needs,
+// distinct from both CompleteIncidentTriageAttempt (a real Finding) and
+// ExhaustIncidentTriageAttempt (a genuine 5-attempt failure).
+// ----------------------------------------------------------------------
+
+func TestCompleteIncidentTriageAttemptAsCleanSkipClosesSkippedRestoresReadyAndAppendsTriageSkippedOnce(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "clean-skip-basic", now)
+	claim := mustClaim(t, st, f, now)
+
+	if err := st.CompleteIncidentTriageAttemptAsCleanSkip(ctx, claim.AttemptID, f.IncidentID, "clean_skip", "nothing to analyze", now.Add(time.Minute)); err != nil {
+		t.Fatalf("complete as clean skip: %v", err)
+	}
+
+	tr := triageRow(t, st, f.IncidentID)
+	if tr.Phase != "skipped" {
+		t.Fatalf("phase = %q, want skipped (the same terminal phase the B+-gate skip uses)", tr.Phase)
+	}
+	if tr.LeaseOwner.Valid || tr.CurrentAttemptID.Valid {
+		t.Fatalf("lease not released: owner=%v attempt=%v", tr.LeaseOwner, tr.CurrentAttemptID)
+	}
+	if got := incidentStatus(t, st, f.IncidentID); got != "ready" {
+		t.Fatalf("incident status = %q, want ready — not failed: a clean skip must stay collapse-eligible "+
+			"(Global Constraint: triage exhaustion never closes a Situation)", got)
+	}
+	if n := countSituationInputs(t, st, f.IncidentID, "triage_skipped"); n != 1 {
+		t.Fatalf("triage_skipped inputs = %d, want exactly 1", n)
+	}
+	if n := countSituationInputs(t, st, f.IncidentID, "triage_exhausted"); n != 0 {
+		t.Fatalf("triage_exhausted inputs = %d, want 0 — a clean skip must never emit the code reserved for a genuine 5-attempt exhaustion", n)
+	}
+
+	var resultCode string
+	var completedAt sql.NullString
+	if err := st.db.QueryRowContext(ctx, `SELECT result_code, completed_at FROM incident_triage_attempts WHERE id = ?`, claim.AttemptID).Scan(&resultCode, &completedAt); err != nil {
+		t.Fatal(err)
+	}
+	if resultCode != "clean_skip" || !completedAt.Valid {
+		t.Fatalf("attempt ledger row after clean skip: code=%q completed=%v", resultCode, completedAt)
+	}
+}
+
+func TestCompleteIncidentTriageAttemptAsCleanSkipReplayFailsClosedWithoutDuplicateInput(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "clean-skip-replay", now)
+	claim := mustClaim(t, st, f, now)
+
+	if err := st.CompleteIncidentTriageAttemptAsCleanSkip(ctx, claim.AttemptID, f.IncidentID, "clean_skip", "nothing to analyze", now.Add(time.Minute)); err != nil {
+		t.Fatalf("complete as clean skip: %v", err)
+	}
+	err := st.CompleteIncidentTriageAttemptAsCleanSkip(ctx, claim.AttemptID, f.IncidentID, "clean_skip", "nothing to analyze", now.Add(2*time.Minute))
+	if !errors.Is(err, ErrTriageAttemptLeaseLost) {
+		t.Fatalf("second call err = %v, want ErrTriageAttemptLeaseLost — a replay against an already-completed "+
+			"attempt fails closed rather than silently no-oping or re-appending a duplicate Situation input", err)
+	}
+	if n := countSituationInputs(t, st, f.IncidentID, "triage_skipped"); n != 1 {
+		t.Fatalf("triage_skipped inputs after replay = %d, want still exactly 1", n)
+	}
+}
+
+// ----------------------------------------------------------------------
 // ExtendIncidentTriageLease.
 // ----------------------------------------------------------------------
 

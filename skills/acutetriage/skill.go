@@ -17,7 +17,6 @@ import (
 	"github.com/alertint/alertint-agent/internal/notify"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/rules"
-	"github.com/alertint/alertint-agent/internal/situation"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/internal/zabbix"
 )
@@ -220,16 +219,40 @@ type pipelineParams struct {
 // Run is retained only as a compatibility composition for existing
 // direct-triage tests; it is not used by the Plan 2 worker (internal/
 // situation.TriageWorker calls Skill.Analyze directly through the
-// AcuteAnalyzer interface). It composes Analyze, legacy persistence
-// (SaveIncidentOutput), then post-commit effects (AfterCommit) exactly
-// once, in that order — the same three phases TriageWorker itself runs,
-// just driven synchronously against a store.Incident the caller already
-// has in hand instead of a claimed TriageAttemptClaim.
+// AcuteAnalyzer interface). It composes analyzeFromAlerts (Analyze's own
+// shared core, result.go), legacy persistence (SaveIncidentOutput), then
+// post-commit effects (AfterCommit) exactly once, in that order — the same
+// three phases TriageWorker itself runs, just driven synchronously against
+// a store.Incident the caller already has in hand instead of a claimed
+// TriageAttemptClaim.
+//
+// Unlike Analyze, Run loads member alerts via GetIncidentAlerts' current,
+// mutable projection — deliberately, not a pre-fix oversight: Run has no
+// claim to freeze against at all (it is a direct-invocation path entirely
+// outside the durable claim/lease mechanism Task 6/7 built), so "the
+// Incident's current member alerts" is the only meaningful input it could
+// ever load. This is unchanged from before the Task 7 fix round.
+//
+// Run also re-reads inc fresh via GetIncidentByID before analyzing, exactly
+// as Analyze itself has always done (never trusting a caller-supplied
+// store.Incident's own possibly-stale AlertCount/FirstAlertAt/LastAlertAt —
+// see verify_integration_test.go's own TestKillSwitchSingleCall fixture,
+// which pins this exact freshness contract).
 func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 	s.logger.Info("triage started", "incident", inc.ID, "alerts", inc.AlertCount)
 
-	claim := situation.TriageAttemptClaim{IncidentID: inc.ID}
-	result, err := s.Analyze(ctx, claim)
+	fresh, err := s.st.GetIncidentByID(ctx, inc.ID)
+	if err != nil {
+		return fmt.Errorf("acutetriage: run: load incident: %w", err)
+	}
+	if fresh == nil {
+		return fmt.Errorf("acutetriage: run: incident %s: %w", inc.ID, store.ErrNotFound)
+	}
+	alerts, err := s.st.GetIncidentAlerts(ctx, fresh.ID)
+	if err != nil {
+		return fmt.Errorf("acutetriage: run: load alerts: %w", err)
+	}
+	result, err := s.analyzeFromAlerts(ctx, *fresh, alerts)
 	if errors.Is(err, ErrCleanSkip) {
 		return nil
 	}
@@ -238,7 +261,7 @@ func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 	}
 
 	if err := s.st.SaveIncidentOutput(ctx,
-		inc.ID, string(result.OutputJSON), result.Summary, result.RootCause, result.Confidence, result.EnrichmentJSON,
+		fresh.ID, string(result.OutputJSON), result.Summary, result.RootCause, result.Confidence, result.EnrichmentJSON,
 	); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			s.logger.Warn("acutetriage: incident not in a persistable state; finding dropped",

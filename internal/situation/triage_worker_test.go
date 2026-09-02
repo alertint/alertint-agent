@@ -5,6 +5,7 @@ package situation_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -35,19 +36,27 @@ type exhaustCall struct {
 	code, detail          string
 }
 
+type cleanSkipCall struct {
+	attemptID, incidentID string
+	code, detail          string
+}
+
 type fakeStore struct {
 	mu sync.Mutex
 
-	claimFn    func(ctx context.Context, incidentID, owner string, now time.Time, lease time.Duration) (situation.TriageAttemptClaim, error)
-	extendFn   func(ctx context.Context, attemptID, incidentID, owner string, now time.Time, lease time.Duration) error
-	completeFn func(ctx context.Context, attemptID, incidentID string, finding situation.TriageFindingInput, now time.Time) (situation.TriageCompletionOutcome, error)
-	recoverFn  func(ctx context.Context, now time.Time) (int, error)
+	claimFn     func(ctx context.Context, incidentID, owner string, now time.Time, lease time.Duration) (situation.TriageAttemptClaim, error)
+	extendFn    func(ctx context.Context, attemptID, incidentID, owner string, now time.Time, lease time.Duration) error
+	completeFn  func(ctx context.Context, attemptID, incidentID string, finding situation.TriageFindingInput, now time.Time) (situation.TriageCompletionOutcome, error)
+	recoverFn   func(ctx context.Context, now time.Time) (int, error)
+	cleanSkipFn func(ctx context.Context, attemptID, incidentID, code, detail string, now time.Time) error
+	exhaustFn   func(ctx context.Context, attemptID, incidentID, code, detail string, now time.Time) error
 
-	extendCalls   int
-	completeCalls []completeCall
-	backoffCalls  []backoffCall
-	exhaustCalls  []exhaustCall
-	recoverCalls  int
+	extendCalls    int
+	completeCalls  []completeCall
+	backoffCalls   []backoffCall
+	exhaustCalls   []exhaustCall
+	cleanSkipCalls []cleanSkipCall
+	recoverCalls   int
 }
 
 func (f *fakeStore) ClaimIncidentTriageAttempt(ctx context.Context, incidentID, owner string, now time.Time, lease time.Duration) (situation.TriageAttemptClaim, error) {
@@ -88,6 +97,19 @@ func (f *fakeStore) ExhaustIncidentTriageAttempt(ctx context.Context, attemptID,
 	f.mu.Lock()
 	f.exhaustCalls = append(f.exhaustCalls, exhaustCall{attemptID, incidentID, code, detail})
 	f.mu.Unlock()
+	if f.exhaustFn != nil {
+		return f.exhaustFn(ctx, attemptID, incidentID, code, detail, now)
+	}
+	return nil
+}
+
+func (f *fakeStore) CompleteIncidentTriageAttemptAsCleanSkip(ctx context.Context, attemptID, incidentID, code, detail string, now time.Time) error {
+	f.mu.Lock()
+	f.cleanSkipCalls = append(f.cleanSkipCalls, cleanSkipCall{attemptID, incidentID, code, detail})
+	f.mu.Unlock()
+	if f.cleanSkipFn != nil {
+		return f.cleanSkipFn(ctx, attemptID, incidentID, code, detail, now)
+	}
 	return nil
 }
 
@@ -105,6 +127,12 @@ func (f *fakeStore) snapshot() (extendCalls int, complete []completeCall, backof
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.extendCalls, append([]completeCall(nil), f.completeCalls...), append([]backoffCall(nil), f.backoffCalls...), append([]exhaustCall(nil), f.exhaustCalls...), f.recoverCalls
+}
+
+func (f *fakeStore) cleanSkips() []cleanSkipCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]cleanSkipCall(nil), f.cleanSkipCalls...)
 }
 
 type fakeLister struct {
@@ -171,6 +199,51 @@ func (f *fakeAfterCommit) callCount() int {
 	return f.calls
 }
 
+// exhaustionNotifyCall records one OnTriageExhausted call fakeExhaustion-
+// Notifier observed.
+type exhaustionNotifyCall struct {
+	incidentID, code, detail string
+}
+
+// fakeExhaustionNotifier is Finding #3's own fake — proving TriageWorker
+// calls the exhaustion hook exactly once on a genuine exhaustion, and never
+// on a clean skip or a stale completion.
+type fakeExhaustionNotifier struct {
+	mu    sync.Mutex
+	calls []exhaustionNotifyCall
+	fn    func(ctx context.Context, incidentID, code, detail string) error
+}
+
+func (f *fakeExhaustionNotifier) OnTriageExhausted(ctx context.Context, incidentID, code, detail string) error {
+	f.mu.Lock()
+	f.calls = append(f.calls, exhaustionNotifyCall{incidentID, code, detail})
+	f.mu.Unlock()
+	if f.fn != nil {
+		return f.fn(ctx, incidentID, code, detail)
+	}
+	return nil
+}
+
+func (f *fakeExhaustionNotifier) snapshot() []exhaustionNotifyCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]exhaustionNotifyCall(nil), f.calls...)
+}
+
+// fakeClassifiedError is Finding #4's own fake AcuteAnalyzer failure — a
+// bare struct satisfying situation.ClassifiedError, standing in for
+// skills/acutetriage's real classifyAnalyzeError wrapping (tested in that
+// package directly; here it proves TriageWorker's classifyAttemptError
+// checks for and trusts the interface at all, before ever reaching that
+// real implementation).
+type fakeClassifiedError struct {
+	msg, code, detail string
+}
+
+func (e *fakeClassifiedError) Error() string      { return e.msg }
+func (e *fakeClassifiedError) Code() string       { return e.code }
+func (e *fakeClassifiedError) SafeDetail() string { return e.detail }
+
 // --------------------------------------------------------------------------
 // Helpers
 // --------------------------------------------------------------------------
@@ -192,7 +265,14 @@ func testClaim(incidentID string, attemptNumber int) situation.TriageAttemptClai
 	}
 }
 
+// newWorker builds a TriageWorker with no exhaustion notifier wired — the
+// overwhelming majority of tests here don't exercise Finding #3's hook at
+// all. Use newWorkerFull for the tests that do.
 func newWorker(store *fakeStore, lister *fakeLister, analyzer *fakeAnalyzer, after *fakeAfterCommit, cfg situation.TriageWorkerConfig) *situation.TriageWorker {
+	return newWorkerFull(store, lister, analyzer, after, nil, cfg)
+}
+
+func newWorkerFull(store *fakeStore, lister *fakeLister, analyzer *fakeAnalyzer, after *fakeAfterCommit, exhaustion *fakeExhaustionNotifier, cfg situation.TriageWorkerConfig) *situation.TriageWorker {
 	if cfg.Owner == "" {
 		cfg.Owner = "test-owner"
 	}
@@ -200,7 +280,11 @@ func newWorker(store *fakeStore, lister *fakeLister, analyzer *fakeAnalyzer, aft
 	if after != nil {
 		ac = after
 	}
-	return situation.NewTriageWorker(store, lister, analyzer, ac, cfg, nil)
+	var en situation.ExhaustionNotifier
+	if exhaustion != nil {
+		en = exhaustion
+	}
+	return situation.NewTriageWorker(store, lister, analyzer, ac, en, cfg, nil)
 }
 
 // --------------------------------------------------------------------------
@@ -264,7 +348,8 @@ func TestTriageWorker_StaleMembership(t *testing.T) {
 	lister := &fakeLister{ids: []string{"inc-2"}}
 	analyzer := &fakeAnalyzer{}
 	after := &fakeAfterCommit{}
-	w := newWorker(store, lister, analyzer, after, situation.TriageWorkerConfig{})
+	exhaustion := &fakeExhaustionNotifier{}
+	w := newWorkerFull(store, lister, analyzer, after, exhaustion, situation.TriageWorkerConfig{})
 
 	if _, err := w.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
@@ -275,6 +360,9 @@ func TestTriageWorker_StaleMembership(t *testing.T) {
 	_, complete, backoff, exhaust, _ := store.snapshot()
 	if len(complete) != 1 || len(backoff) != 0 || len(exhaust) != 0 {
 		t.Fatalf("complete/backoff/exhaust = %d/%d/%d, want 1/0/0", len(complete), len(backoff), len(exhaust))
+	}
+	if n := len(exhaustion.snapshot()); n != 0 {
+		t.Fatalf("exhaustion notifier calls = %d, want 0 (stale completion is not a failure)", n)
 	}
 }
 
@@ -303,8 +391,13 @@ func TestTriageWorker_StaleIncidentInput(t *testing.T) {
 }
 
 // TestTriageWorker_CleanSkip: Analyze returning situation.ErrCleanSkip must
-// close the attempt via ExhaustIncidentTriageAttempt with a distinct
-// "clean_skip" code — never Complete, never Backoff.
+// close the attempt via CompleteIncidentTriageAttemptAsCleanSkip with a
+// distinct "clean_skip" code — never Complete, never Backoff, and (Task 7
+// fix, Finding #2) never Exhaust either: a clean skip is not a failure and
+// must not consume the terminal "attempts burned" signal or the "failed"
+// Incident status. Finding #3: it also must never reach the exhaustion
+// notifier — a clean skip carries no operator-visible failure signal at
+// all.
 func TestTriageWorker_CleanSkip(t *testing.T) {
 	claim := testClaim("inc-4", 2)
 	store := &fakeStore{claimFn: func(ctx context.Context, incidentID, owner string, now time.Time, lease time.Duration) (situation.TriageAttemptClaim, error) {
@@ -315,7 +408,8 @@ func TestTriageWorker_CleanSkip(t *testing.T) {
 		return situation.AcuteResult{}, situation.ErrCleanSkip
 	}}
 	after := &fakeAfterCommit{}
-	w := newWorker(store, lister, analyzer, after, situation.TriageWorkerConfig{})
+	exhaustion := &fakeExhaustionNotifier{}
+	w := newWorkerFull(store, lister, analyzer, after, exhaustion, situation.TriageWorkerConfig{})
 
 	if _, err := w.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
@@ -324,14 +418,21 @@ func TestTriageWorker_CleanSkip(t *testing.T) {
 	if len(complete) != 0 || len(backoff) != 0 {
 		t.Fatalf("complete/backoff = %d/%d, want 0/0", len(complete), len(backoff))
 	}
-	if len(exhaust) != 1 {
-		t.Fatalf("exhaust calls = %d, want 1", len(exhaust))
+	if len(exhaust) != 0 {
+		t.Fatalf("exhaust (ExhaustIncidentTriageAttempt) calls = %d, want 0 — a clean skip must never exhaust", len(exhaust))
 	}
-	if exhaust[0].code != "clean_skip" {
-		t.Errorf("exhaust code = %q, want clean_skip", exhaust[0].code)
+	cleanSkips := store.cleanSkips()
+	if len(cleanSkips) != 1 {
+		t.Fatalf("clean-skip calls = %d, want 1", len(cleanSkips))
+	}
+	if cleanSkips[0].code != "clean_skip" {
+		t.Errorf("clean-skip code = %q, want clean_skip", cleanSkips[0].code)
 	}
 	if after.callCount() != 0 {
 		t.Fatalf("AfterCommit calls = %d, want 0 (clean skip)", after.callCount())
+	}
+	if n := len(exhaustion.snapshot()); n != 0 {
+		t.Fatalf("exhaustion notifier calls = %d, want 0 (clean skip is not a failure)", n)
 	}
 }
 
@@ -367,9 +468,134 @@ func TestTriageWorker_RetryableProviderFailure(t *testing.T) {
 	}
 }
 
+// ----------------------------------------------------------------------
+// classifyAttemptError granularity (Task 7 fix, Finding #4): recreating the
+// spirit of the 4 deleted internal/correlator/triage_retry_test.go tests
+// (TestTriageBackoffRecordsCapabilityAwareCode,
+// TestTriageBackoffRecordsResponseMalformed,
+// TestTriageBackoffDoesNotMisattributeAmbiguousShapedErrors,
+// TestTriageBackoffRecordsLLMOriginTimeout) through TriageWorker's own
+// classifyAttemptError path, exercised via an AcuteAnalyzer failure
+// satisfying the optional situation.ClassifiedError interface — the exact
+// mechanism skills/acutetriage's real classifyAnalyzeError uses (see that
+// package's own classify_test.go for the llmhealth-integrated versions of
+// these same four cases).
+// ----------------------------------------------------------------------
+
+// TestTriageWorker_ClassifiesCapabilityAwareCode pins classifyAttemptError's
+// classified branch: an AcuteAnalyzer failure carrying its own bounded
+// code/detail (mirroring a dependency-class llmhealth reason, e.g.
+// "provider_unavailable") persists exactly that code/detail on the backoff
+// row, not the generic fallback.
+func TestTriageWorker_ClassifiesCapabilityAwareCode(t *testing.T) {
+	claim := testClaim("inc-classify-1", 1)
+	store := &fakeStore{claimFn: func(ctx context.Context, incidentID, owner string, now time.Time, lease time.Duration) (situation.TriageAttemptClaim, error) {
+		return claim, nil
+	}}
+	lister := &fakeLister{ids: []string{"inc-classify-1"}}
+	analyzer := &fakeAnalyzer{fn: func(ctx context.Context, c situation.TriageAttemptClaim) (situation.AcuteResult, error) {
+		return situation.AcuteResult{}, &fakeClassifiedError{msg: "HTTP 503", code: "provider_unavailable", detail: "HTTP 503"}
+	}}
+	w := newWorker(store, lister, analyzer, &fakeAfterCommit{}, situation.TriageWorkerConfig{})
+
+	if _, err := w.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	_, _, backoff, _, _ := store.snapshot()
+	if len(backoff) != 1 {
+		t.Fatalf("backoff calls = %d, want 1", len(backoff))
+	}
+	if backoff[0].code != "provider_unavailable" || backoff[0].detail != "HTTP 503" {
+		t.Fatalf("backoff code/detail = %q/%q, want provider_unavailable/HTTP 503", backoff[0].code, backoff[0].detail)
+	}
+}
+
+// TestTriageWorker_ClassifiesResponseMalformed pins the content-class side
+// of the same contract: a typed-decode failure classified as
+// "response_malformed" persists that code, not the generic fallback.
+func TestTriageWorker_ClassifiesResponseMalformed(t *testing.T) {
+	claim := testClaim("inc-classify-2", 1)
+	store := &fakeStore{claimFn: func(ctx context.Context, incidentID, owner string, now time.Time, lease time.Duration) (situation.TriageAttemptClaim, error) {
+		return claim, nil
+	}}
+	lister := &fakeLister{ids: []string{"inc-classify-2"}}
+	analyzer := &fakeAnalyzer{fn: func(ctx context.Context, c situation.TriageAttemptClaim) (situation.AcuteResult, error) {
+		return situation.AcuteResult{}, &fakeClassifiedError{msg: "decode failed", code: "response_malformed", detail: "typed response malformed"}
+	}}
+	w := newWorker(store, lister, analyzer, &fakeAfterCommit{}, situation.TriageWorkerConfig{})
+
+	if _, err := w.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	_, _, backoff, _, _ := store.snapshot()
+	if len(backoff) != 1 || backoff[0].code != "response_malformed" {
+		t.Fatalf("backoff = %+v, want exactly 1 with code response_malformed", backoff)
+	}
+}
+
+// TestTriageWorker_DoesNotMisattributeAmbiguousShapedErrors pins
+// classifyAttemptError's OTHER side: an AcuteAnalyzer failure that is NOT a
+// ClassifiedError falls back to classifyAttemptError's own bare
+// context.*-only classification, unchanged from before this fix — a plain
+// (non-ClassifiedError) error never gets misattributed the granular
+// treatment a real classifyAnalyzeError would have reserved for an
+// LLM-marked failure.
+func TestTriageWorker_DoesNotMisattributeAmbiguousShapedErrors(t *testing.T) {
+	claim := testClaim("inc-classify-3", 1)
+	store := &fakeStore{claimFn: func(ctx context.Context, incidentID, owner string, now time.Time, lease time.Duration) (situation.TriageAttemptClaim, error) {
+		return claim, nil
+	}}
+	lister := &fakeLister{ids: []string{"inc-classify-3"}}
+	// A bare, unclassified error shaped like a non-LLM ambiguous failure
+	// (e.g. a SQLite write timing out inside Analyze's own call chain) — no
+	// ClassifiedError wrapping at all.
+	analyzer := &fakeAnalyzer{fn: func(ctx context.Context, c situation.TriageAttemptClaim) (situation.AcuteResult, error) {
+		return situation.AcuteResult{}, fmt.Errorf("store: save output: %w", errors.New("busy"))
+	}}
+	w := newWorker(store, lister, analyzer, &fakeAfterCommit{}, situation.TriageWorkerConfig{})
+
+	if _, err := w.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	_, _, backoff, _, _ := store.snapshot()
+	if len(backoff) != 1 || backoff[0].code != "acute_triage_failed" {
+		t.Fatalf("backoff = %+v, want exactly 1 with the generic acute_triage_failed fallback", backoff)
+	}
+}
+
+// TestTriageWorker_ClassifiesLLMOriginTimeout pins the resolution of the
+// ambiguity above: a ClassifiedError explicitly carrying "timeout" (mirroring
+// skills/acutetriage's own llmhealth.MarkLLMOrigin(context.DeadlineExceeded)
+// case) persists that capability-aware code, distinct from
+// classifyAttemptError's own bare context.DeadlineExceeded fallback (which
+// also happens to produce "timeout" today, but via a completely different,
+// unclassified path — TestTriageWorker_Cancellation covers that one).
+func TestTriageWorker_ClassifiesLLMOriginTimeout(t *testing.T) {
+	claim := testClaim("inc-classify-4", 1)
+	store := &fakeStore{claimFn: func(ctx context.Context, incidentID, owner string, now time.Time, lease time.Duration) (situation.TriageAttemptClaim, error) {
+		return claim, nil
+	}}
+	lister := &fakeLister{ids: []string{"inc-classify-4"}}
+	analyzer := &fakeAnalyzer{fn: func(ctx context.Context, c situation.TriageAttemptClaim) (situation.AcuteResult, error) {
+		return situation.AcuteResult{}, &fakeClassifiedError{msg: "context deadline exceeded", code: "timeout", detail: "request timed out"}
+	}}
+	w := newWorker(store, lister, analyzer, &fakeAfterCommit{}, situation.TriageWorkerConfig{})
+
+	if _, err := w.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	_, _, backoff, _, _ := store.snapshot()
+	if len(backoff) != 1 || backoff[0].code != "timeout" || backoff[0].detail != "request timed out" {
+		t.Fatalf("backoff = %+v, want exactly 1 with code timeout / detail 'request timed out'", backoff)
+	}
+}
+
 // TestTriageWorker_FifthAttemptExhaustion: a failure on the final (5th, the
 // configured MaxAttempts) attempt closes the schedule terminally instead of
-// scheduling a 6th.
+// scheduling a 6th, and (Task 7 fix, Finding #3) calls the exhaustion
+// notifier hook exactly once with the Incident ID and the classified
+// code/detail — the operator-visible signal the pre-Plan-2 dispatch chain
+// produced and TriageWorker had none of before this fix.
 func TestTriageWorker_FifthAttemptExhaustion(t *testing.T) {
 	claim := testClaim("inc-6", 5)
 	store := &fakeStore{claimFn: func(ctx context.Context, incidentID, owner string, now time.Time, lease time.Duration) (situation.TriageAttemptClaim, error) {
@@ -379,7 +605,8 @@ func TestTriageWorker_FifthAttemptExhaustion(t *testing.T) {
 	analyzer := &fakeAnalyzer{fn: func(ctx context.Context, c situation.TriageAttemptClaim) (situation.AcuteResult, error) {
 		return situation.AcuteResult{}, errors.New("still failing")
 	}}
-	w := newWorker(store, lister, analyzer, &fakeAfterCommit{}, situation.TriageWorkerConfig{MaxAttempts: 5})
+	exhaustion := &fakeExhaustionNotifier{}
+	w := newWorkerFull(store, lister, analyzer, &fakeAfterCommit{}, exhaustion, situation.TriageWorkerConfig{MaxAttempts: 5})
 
 	if _, err := w.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
@@ -390,6 +617,46 @@ func TestTriageWorker_FifthAttemptExhaustion(t *testing.T) {
 	}
 	if len(exhaust) != 1 {
 		t.Fatalf("exhaust calls = %d, want 1", len(exhaust))
+	}
+	calls := exhaustion.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("exhaustion notifier calls = %d, want exactly 1", len(calls))
+	}
+	if calls[0].incidentID != "inc-6" {
+		t.Errorf("exhaustion notify incidentID = %q, want inc-6", calls[0].incidentID)
+	}
+	if calls[0].code != exhaust[0].code || calls[0].detail != exhaust[0].detail {
+		t.Errorf("exhaustion notify code/detail = %q/%q, want the same classified code/detail persisted on the exhaust write (%q/%q)",
+			calls[0].code, calls[0].detail, exhaust[0].code, exhaust[0].detail)
+	}
+}
+
+// TestTriageWorker_ExhaustionNotifierNotCalledWhenExhaustWriteFails proves
+// the notifier only fires after the durable exhaust write has actually
+// committed — never speculatively, and never when the store write itself
+// failed.
+func TestTriageWorker_ExhaustionNotifierNotCalledWhenExhaustWriteFails(t *testing.T) {
+	claim := testClaim("inc-6b", 5)
+	store := &fakeStore{
+		claimFn: func(ctx context.Context, incidentID, owner string, now time.Time, lease time.Duration) (situation.TriageAttemptClaim, error) {
+			return claim, nil
+		},
+		exhaustFn: func(ctx context.Context, attemptID, incidentID, code, detail string, now time.Time) error {
+			return errors.New("store unavailable")
+		},
+	}
+	lister := &fakeLister{ids: []string{"inc-6b"}}
+	analyzer := &fakeAnalyzer{fn: func(ctx context.Context, c situation.TriageAttemptClaim) (situation.AcuteResult, error) {
+		return situation.AcuteResult{}, errors.New("still failing")
+	}}
+	exhaustion := &fakeExhaustionNotifier{}
+	w := newWorkerFull(store, lister, analyzer, &fakeAfterCommit{}, exhaustion, situation.TriageWorkerConfig{MaxAttempts: 5})
+
+	if _, err := w.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if n := len(exhaustion.snapshot()); n != 0 {
+		t.Fatalf("exhaustion notifier calls = %d, want 0 (exhaust write failed)", n)
 	}
 }
 
