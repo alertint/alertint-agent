@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A recovery arriving while initial triage is in flight no longer produces two
+  independent `resolved` notifications. Acute triage now claims the incident's
+  existing resolution transition before publishing its model-severity finding;
+  whichever resolution path loses that atomic claim stays silent. (#76)
+
 ## [0.13.6] - 2026-09-01
 
 ### Added

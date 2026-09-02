@@ -412,46 +412,46 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	// Notify. On a re-judgment the finding flows the same gate — the Slack
 	// notifier threads the reply on the existing card, or posts a new one if none.
 	// nil during replay (replayIncidentWith strips it), so this whole block —
-	// including the resolved-status probe, which exists only to label the
-	// notification — is a no-op there.
+	// including the resolution ownership claim — is a no-op there.
 	if s.notifier != nil {
-		incidentStatus := s.resolvedStatusLabel(ctx, inc.ID)
-
-		f := notify.Finding{
-			IncidentID:          inc.ID,
-			GroupKey:            inc.GroupKey,
-			AnalysisName:        resp.AnalysisName,
-			OverallIssue:        resp.OverallIssue,
-			CorrelationFindings: resp.CorrelationFindings,
-			Severity:            resp.Severity,
-			Confidence:          resp.Confidence,
-			AlertCount:          inc.AlertCount,
-			FirstAlertAt:        inc.FirstAlertAt,
-			AnalyzedAt:          time.Now().UTC(),
-			OutputJSON:          finalRaw,
-			Status:              incidentStatus,
-			Drill:               isDrill(alerts),
-			Evidence:            buildEvidenceSummary(decision.ShortCircuit, ar.metrics, ar.logs, ar.changes, ar.sentry, ar.zabbix),
-			// A degraded round (floor unfetchable, or call 2 lost) shipped without a
-			// full falsification pass — card renderers surface a caveat off this.
-			Unverified: ver != nil && ver.Outcome == verifyOutcomeDegraded,
-			// VerificationInvalidQueries counts locally-invalid/backend-rejected
-			// queries across every round — independent of Unverified, which only
-			// reflects connector/round-level degradation.
-			VerificationInvalidQueries: invalidQueryCount(ver),
+		incidentStatus, ownsNotification := s.notificationStatus(ctx, inc.ID, p.rejudge)
+		if ownsNotification {
+			f := notify.Finding{
+				IncidentID:          inc.ID,
+				GroupKey:            inc.GroupKey,
+				AnalysisName:        resp.AnalysisName,
+				OverallIssue:        resp.OverallIssue,
+				CorrelationFindings: resp.CorrelationFindings,
+				Severity:            resp.Severity,
+				Confidence:          resp.Confidence,
+				AlertCount:          inc.AlertCount,
+				FirstAlertAt:        inc.FirstAlertAt,
+				AnalyzedAt:          time.Now().UTC(),
+				OutputJSON:          finalRaw,
+				Status:              incidentStatus,
+				Drill:               isDrill(alerts),
+				Evidence:            buildEvidenceSummary(decision.ShortCircuit, ar.metrics, ar.logs, ar.changes, ar.sentry, ar.zabbix),
+				// A degraded round (floor unfetchable, or call 2 lost) shipped without a
+				// full falsification pass — card renderers surface a caveat off this.
+				Unverified: ver != nil && ver.Outcome == verifyOutcomeDegraded,
+				// VerificationInvalidQueries counts locally-invalid/backend-rejected
+				// queries across every round — independent of Unverified, which only
+				// reflects connector/round-level degradation.
+				VerificationInvalidQueries: invalidQueryCount(ver),
+			}
+			if ver != nil {
+				f.DegradationReason = ver.DegradationReason
+			}
+			if p.rejudge && p.recurrenceEpisodes > 1 && !p.recurrenceLastSeen.IsZero() {
+				f.Recurrence = &notify.Recurrence{Episodes: p.recurrenceEpisodes, LastSeen: p.recurrenceLastSeen}
+			}
+			s.attachHistorySteering(ctx, inc, ar, ver, &f)
+			// Multi owns the per-sink notify outcome line(s): a quiet "notified" on
+			// success, a "notify partial"/"notify failed" summary plus one "notify
+			// sink failed" detail line per failing sink. The aggregated error it
+			// returns is already surfaced there, so we don't re-log it here.
+			_ = s.notifier.Notify(ctx, f)
 		}
-		if ver != nil {
-			f.DegradationReason = ver.DegradationReason
-		}
-		if p.rejudge && p.recurrenceEpisodes > 1 && !p.recurrenceLastSeen.IsZero() {
-			f.Recurrence = &notify.Recurrence{Episodes: p.recurrenceEpisodes, LastSeen: p.recurrenceLastSeen}
-		}
-		s.attachHistorySteering(ctx, inc, ar, ver, &f)
-		// Multi owns the per-sink notify outcome line(s): a quiet "notified" on
-		// success, a "notify partial"/"notify failed" summary plus one "notify
-		// sink failed" detail line per failing sink. The aggregated error it
-		// returns is already surfaced there, so we don't re-log it here.
-		_ = s.notifier.Notify(ctx, f)
 	}
 
 	// Audit: incident analyzed (carrying the trigger on a re-judgment and the
@@ -539,21 +539,38 @@ func (s *Skill) attachHistorySteering(ctx context.Context, inc store.Incident, a
 	}
 }
 
-// resolvedStatusLabel reports "resolved" when every member alert of
-// incidentID is resolved, "ongoing" otherwise (including on a load error —
-// the notification still fires, just without the resolved label).
-func (s *Skill) resolvedStatusLabel(ctx context.Context, incidentID string) string {
+// notificationStatus returns the finding status and whether this pipeline owns
+// the notification. Initial triage must claim the same analyzed -> resolved
+// transition as the correlator before publishing a resolved finding; losing
+// that CAS means another path owns the resolution notification. Re-judgments
+// keep their existing behavior because they update already-judged incidents
+// and intentionally publish without owning a lifecycle transition.
+func (s *Skill) notificationStatus(ctx context.Context, incidentID string, rejudge bool) (string, bool) {
 	incAlerts, err := s.st.GetIncidentAlerts(ctx, incidentID)
 	if err != nil || len(incAlerts) == 0 {
-		return "ongoing"
+		return "ongoing", true
 	}
 	for _, a := range incAlerts {
 		if a.Status != "resolved" {
-			return "ongoing"
+			return "ongoing", true
 		}
 	}
+	if rejudge {
+		return "resolved", true
+	}
+	if err := s.st.MarkIncidentResolved(ctx, incidentID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.logger.Info("incident resolution notification already claimed", "incident", incidentID)
+			return "", false
+		}
+		s.logger.Warn("acutetriage: claim incident resolution failed; notifying as ongoing",
+			"incident_id", incidentID,
+			"err", err,
+		)
+		return "ongoing", true
+	}
 	s.logger.Info("incident resolved", "incident", incidentID, "alerts", len(incAlerts))
-	return "resolved"
+	return "resolved", true
 }
 
 // auditEnrichmentDigests appends one hash-chained digest row per attempted
