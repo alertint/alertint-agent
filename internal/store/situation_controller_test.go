@@ -4,10 +4,13 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/alertint/alertint-agent/internal/situation"
 	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
@@ -736,24 +739,588 @@ func TestCommitControllerFencesOnInputVersionMismatch(t *testing.T) {
 	}
 }
 
-func TestCommitControllerFencingPassesButDecisionCommitNotYetImplemented(t *testing.T) {
+// basicControllerCommit builds one minimal, schema-valid ControllerCommit
+// for situationID/inputVersion: a fresh authoritative attempt (no call —
+// deterministic_controller), no Triage decisions, active/observe, and a
+// next_assessment_at one hour past now.
+func basicControllerCommit(situationID string, inputVersion int, now time.Time) situation.ControllerCommit {
+	assessment := validAssessmentFixture()
+	basisHash := "sha256:basis-" + situationID
+	materialHash := "sha256:material-" + situationID
+	return situation.ControllerCommit{
+		Attempt: situation.AssessmentAttempt{
+			ID: uuid.NewString(), SituationID: situationID, AssessmentBasisHash: basisHash,
+			InputVersion: inputVersion, WorkAttempt: 1,
+			Derivation: situationmodel.DerivationDeterministic, Status: "authoritative",
+			Validated:              mustMarshalJSON(nil, assessment),
+			ProviderRequestStarted: providerRequestStartedPtr(situationmodel.ProviderRequestStartedFalse),
+			CreatedAt:              now, CompletedAt: now,
+		},
+		Assessment:          assessment,
+		MaterialFactHash:    materialHash,
+		AssessmentBasisHash: basisHash,
+		Lifecycle:           situationmodel.LifecycleActive,
+		Attention:           situationmodel.AttentionObserve,
+		NextAssessmentAt:    now.Add(time.Hour),
+	}
+}
+
+func mustMarshalJSON(t *testing.T, v any) json.RawMessage {
+	b, err := json.Marshal(v)
+	if err != nil {
+		if t != nil {
+			t.Fatalf("marshal %#v: %v", v, err)
+		}
+		panic(err)
+	}
+	return b
+}
+
+func providerRequestStartedPtr(p situationmodel.ProviderRequestStarted) *situationmodel.ProviderRequestStarted {
+	return &p
+}
+
+// TestCommitControllerNextAssessmentAtAdvancesOnOrdinaryCommit proves the
+// checkpoint actually moves into the future on a normal commit — a Situation
+// is claimed BECAUSE next_assessment_at was already <= now (it was due), so
+// naively taking min(current, proposed) against that stale claim-time value
+// would pin next_assessment_at there forever (a proposed future checkpoint
+// can never win a min() against an already-past one), reconciling the same
+// Situation again on literally the next poll, forever.
+func TestCommitControllerNextAssessmentAtAdvancesOnOrdinaryCommit(t *testing.T) {
 	st := newTestStore(t)
 	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
-	sitID := newSituationForGroup(t, st, "group-commit-honest", now)
+	sitID := newSituationForGroup(t, st, "group-commit-advances", now)
 	claim := claimSituation(t, st, sitID, "controller-a", now)
 
-	err := st.CommitController(context.Background(), claim, situation.ControllerCommit{})
-	if err == nil {
-		t.Fatal("expected CommitController to report it is not yet implemented, not silently succeed")
-	}
-	if errors.Is(err, situationmodel.ErrSituationLeaseLost) || errors.Is(err, ErrSituationVersionConflict) {
-		t.Fatalf("expected the fence to pass (a real claim/version), got fencing error: %v", err)
+	if !claim.Situation.NextAssessmentAt.Before(now) && !claim.Situation.NextAssessmentAt.Equal(now) {
+		t.Fatalf("fixture invariant: claim.Situation.NextAssessmentAt = %v must be <= now = %v (the row was due)", claim.Situation.NextAssessmentAt, now)
 	}
 
-	// It must not have committed anything.
+	commit := basicControllerCommit(sitID, claim.Situation.InputVersion, now)
+	commit.NextAssessmentAt = now.Add(5 * time.Minute)
+	if err := st.CommitController(context.Background(), claim, commit); err != nil {
+		t.Fatalf("CommitController: %v", err)
+	}
+
 	sit := getSituationByID(t, st, sitID)
-	if sit.LeaseOwner == nil || *sit.LeaseOwner != "controller-a" {
-		t.Fatalf("lease_owner = %v, want unchanged controller-a (CommitController must roll back)", sit.LeaseOwner)
+	if !sit.NextAssessmentAt.Equal(commit.NextAssessmentAt) {
+		t.Fatalf("next_assessment_at = %v, want the proposed future checkpoint %v (must not stay pinned to the stale claim-time due value)", sit.NextAssessmentAt, commit.NextAssessmentAt)
+	}
+}
+
+func TestCommitControllerCommitsAuthoritativeAttemptAndProjection(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-commit-real", now)
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+
+	commit := basicControllerCommit(sitID, claim.Situation.InputVersion, now)
+	if err := st.CommitController(context.Background(), claim, commit); err != nil {
+		t.Fatalf("CommitController: %v", err)
+	}
+
+	sit := getSituationByID(t, st, sitID)
+	if sit.LeaseOwner != nil {
+		t.Fatalf("lease_owner = %v, want cleared after commit", sit.LeaseOwner)
+	}
+	if sit.Lifecycle != situationmodel.LifecycleActive || sit.Attention != situationmodel.AttentionObserve {
+		t.Fatalf("lifecycle/attention = %s/%s, want active/observe", sit.Lifecycle, sit.Attention)
+	}
+
+	var currentAssessmentID, basisHash, materialHash sql.NullString
+	if err := st.db.QueryRowContext(context.Background(),
+		`SELECT current_assessment_id, current_assessment_basis_hash, current_material_fact_hash FROM situations WHERE id = ?`, sitID).
+		Scan(&currentAssessmentID, &basisHash, &materialHash); err != nil {
+		t.Fatalf("read current assessment projection: %v", err)
+	}
+	if !currentAssessmentID.Valid || currentAssessmentID.String != commit.Attempt.ID {
+		t.Fatalf("current_assessment_id = %v, want %s", currentAssessmentID, commit.Attempt.ID)
+	}
+	if basisHash.String != commit.AssessmentBasisHash || materialHash.String != commit.MaterialFactHash {
+		t.Fatalf("current hashes = %s/%s, want %s/%s", basisHash.String, materialHash.String, commit.AssessmentBasisHash, commit.MaterialFactHash)
+	}
+
+	var status string
+	if err := st.db.QueryRowContext(context.Background(), `SELECT status FROM situation_assessment_attempts WHERE id = ?`, commit.Attempt.ID).Scan(&status); err != nil {
+		t.Fatalf("read inserted attempt: %v", err)
+	}
+	if status != "authoritative" {
+		t.Fatalf("status = %q, want authoritative", status)
+	}
+}
+
+func TestCommitControllerReplayWithSameStaleClaimFailsClosedNeverDoubleApplies(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-commit-idempotent", now)
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+	commit := basicControllerCommit(sitID, claim.Situation.InputVersion, now)
+
+	if err := st.CommitController(context.Background(), claim, commit); err != nil {
+		t.Fatalf("first commit: %v", err)
+	}
+
+	// A caller that could not observe the first commit's own success (e.g.
+	// a crash between tx.Commit() returning and the result reaching
+	// Reconcile) and retries with the EXACT SAME now-stale claim must never
+	// silently double-apply: the first commit already cleared the lease, so
+	// this fails closed with ErrSituationLeaseLost rather than either
+	// re-succeeding or corrupting the already-committed row.
+	err := st.CommitController(context.Background(), claim, commit)
+	if !errors.Is(err, situationmodel.ErrSituationLeaseLost) {
+		t.Fatalf("replay with stale claim err = %v, want ErrSituationLeaseLost", err)
+	}
+
+	// The projection from the FIRST commit must still stand, untouched.
+	var status string
+	if err := st.db.QueryRowContext(context.Background(), `SELECT status FROM situation_assessment_attempts WHERE id = ?`, commit.Attempt.ID).Scan(&status); err != nil {
+		t.Fatalf("read attempt after replay attempt: %v", err)
+	}
+	if status != "authoritative" {
+		t.Fatalf("status = %q, want authoritative (unchanged by the rejected replay)", status)
+	}
+}
+
+func TestCommitControllerSubtractsOnlyClaimedDueReasonsPreservingConcurrentOnes(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-commit-due-reasons", now)
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+
+	if len(claim.Situation.DueReasons) == 0 {
+		t.Fatal("fixture must claim at least one due reason")
+	}
+
+	// Between claim and commit, a concurrent input adds a new due reason and
+	// an earlier checkpoint — simulated directly via mergeSituationDueReasonTx
+	// and a manual next_assessment_at pull-forward, without touching the
+	// claim's own consumed set or its lease (a real concurrent
+	// ApplySituationInput would also clear the lease, which this test
+	// deliberately avoids so CommitController's OWN fence still passes —
+	// the due-reasons/checkpoint survival behavior is what this test
+	// isolates, not the lease-loss case TestCommitControllerFencesOn* below
+	// already covers).
+	ctx := context.Background()
+	if err := mergeSituationDueReasonTx2(t, st, sitID, situationmodel.DueOperatorJudgment); err != nil {
+		t.Fatalf("merge concurrent due reason: %v", err)
+	}
+	earlierCheckpoint := now.Add(-time.Minute)
+	if _, err := st.db.ExecContext(ctx, `UPDATE situations SET next_assessment_at = ? WHERE id = ?`, canonicalTime(earlierCheckpoint), sitID); err != nil {
+		t.Fatalf("pull checkpoint earlier: %v", err)
+	}
+
+	commit := basicControllerCommit(sitID, claim.Situation.InputVersion, now)
+	commit.ConsumedDueReasons = claim.Situation.DueReasons
+	commit.NextAssessmentAt = now.Add(time.Hour) // proposed LATER than the concurrently-persisted earlier checkpoint.
+
+	if err := st.CommitController(ctx, claim, commit); err != nil {
+		t.Fatalf("CommitController: %v", err)
+	}
+
+	sit := getSituationByID(t, st, sitID)
+	foundConcurrent := false
+	for _, r := range sit.DueReasons {
+		if r == situationmodel.DueOperatorJudgment {
+			foundConcurrent = true
+		}
+		for _, consumed := range claim.Situation.DueReasons {
+			if r == consumed {
+				t.Fatalf("claimed due reason %q survived; must have been subtracted", r)
+			}
+		}
+	}
+	if !foundConcurrent {
+		t.Fatal("concurrently-added due reason must survive the commit")
+	}
+	if !sit.NextAssessmentAt.Equal(earlierCheckpoint) {
+		t.Fatalf("next_assessment_at = %v, want the earlier concurrently-persisted checkpoint %v preserved", sit.NextAssessmentAt, earlierCheckpoint)
+	}
+}
+
+// mergeSituationDueReasonTx2 is a test-local wrapper calling the package's
+// own mergeSituationDueReasonTx via a fresh transaction (that function is
+// tx-scoped, unexported, and otherwise only reachable from inside another
+// store method).
+func mergeSituationDueReasonTx2(t *testing.T, st *Store, situationID string, reason situationmodel.DueReason) error {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := mergeSituationDueReasonTx(ctx, tx, situationID, reason, time.Now().UTC()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func TestCommitControllerFailsClosedOnConcurrentInputVersionBump(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-commit-concurrent-input", now)
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+
+	// A concurrent Situation input applies (a second Incident/delivery
+	// joining the same group), bumping input_version and clearing the lease
+	// — exactly ApplySituationInput's own joinSituationTx behavior.
+	newSituationForGroupSecondMember(t, st, sitID, "group-commit-concurrent-input", now)
+
+	commit := basicControllerCommit(sitID, claim.Situation.InputVersion, now)
+	err := st.CommitController(context.Background(), claim, commit)
+	if !errors.Is(err, situationmodel.ErrSituationLeaseLost) {
+		t.Fatalf("stale claim commit err = %v, want ErrSituationLeaseLost (lease cleared by the concurrent input)", err)
+	}
+
+	// The newer input's own due reason remains due — nothing from the
+	// failed commit clobbered it.
+	sit := getSituationByID(t, st, sitID)
+	if sit.InputVersion <= claim.Situation.InputVersion {
+		t.Fatalf("input_version = %d, want > claimed %d", sit.InputVersion, claim.Situation.InputVersion)
+	}
+	if len(sit.DueReasons) == 0 {
+		t.Fatal("the newer input's own due reason must remain due")
+	}
+}
+
+// newSituationForGroupSecondMember attaches one more fresh Incident/delivery
+// to groupKey's existing nonterminal Situation via a real
+// insertIncidentAndInput + ApplySituationInput round trip — simulating a
+// concurrent Situation input landing between claim and commit.
+func newSituationForGroupSecondMember(t *testing.T, st *Store, situationID, groupKey string, now time.Time) {
+	t.Helper()
+	incID, inputID := "inc2-"+groupKey, "input2-"+groupKey
+	insertIncidentAndInput(t, st, incID, inputID, groupKey, now.Add(time.Minute))
+	claim := claimOneInput(t, st, "concurrent:"+groupKey, now.Add(time.Minute))
+	if err := st.ApplySituationInput(context.Background(), claim); err != nil {
+		t.Fatalf("apply concurrent situation input for group %s: %v", groupKey, err)
+	}
+}
+
+// ----------------------------------------------------------------------
+// BeginControllerAttempt
+// ----------------------------------------------------------------------
+
+func TestControllerAttemptFirstCallStartsAtOne(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-begin-attempt", now)
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+
+	retryEpoch, workAttempt, err := st.BeginControllerAttempt(context.Background(), claim, "sha256:material-x", now)
+	if err != nil {
+		t.Fatalf("BeginControllerAttempt: %v", err)
+	}
+	if retryEpoch != 0 {
+		t.Fatalf("retryEpoch = %d, want 0", retryEpoch)
+	}
+	if workAttempt != 1 {
+		t.Fatalf("workAttempt = %d, want 1", workAttempt)
+	}
+}
+
+// beginAttemptThenCommitProjectionOnly simulates one full Reconcile cycle's
+// worth of durable state advancement for these BeginControllerAttempt
+// tests: BeginControllerAttempt (the real call under test), then a MINIMAL
+// projection-only commit (Attempt zero value — no new authoritative row,
+// exactly a "still working this input" cycle) that persists
+// current_material_fact_hash and leaves the Situation immediately due again
+// (NextAssessmentAt=now) so the test's next round can reclaim it. Mirrors
+// how a real Reconcile cycle always pairs BeginControllerAttempt with
+// exactly one later CommitController call — see BeginControllerAttempt's
+// own doc comment on why current_material_fact_hash is read-only there.
+func beginAttemptThenCommitProjectionOnly(t *testing.T, st *Store, claim situation.Claim, materialFactHash string, now time.Time) (retryEpoch, workAttempt int) {
+	t.Helper()
+	retryEpoch, workAttempt, err := st.BeginControllerAttempt(context.Background(), claim, materialFactHash, now)
+	if err != nil {
+		t.Fatalf("BeginControllerAttempt: %v", err)
+	}
+	commit := situation.ControllerCommit{
+		MaterialFactHash: materialFactHash, Lifecycle: situationmodel.LifecycleActive, Attention: situationmodel.AttentionObserve,
+		NextAssessmentAt: now,
+	}
+	if err := st.CommitController(context.Background(), claim, commit); err != nil {
+		t.Fatalf("projection-only commit: %v", err)
+	}
+	return retryEpoch, workAttempt
+}
+
+func TestControllerAttemptSameBasisIncrementsUpToFiveThenExhausts(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-begin-attempt-exhaust", now)
+
+	for want := 1; want <= 5; want++ {
+		claim := claimSituation(t, st, sitID, "controller-a", now)
+		_, got := beginAttemptThenCommitProjectionOnly(t, st, claim, "sha256:material-y", now)
+		if got != want {
+			t.Fatalf("attempt %d: workAttempt = %d, want %d", want, got, want)
+		}
+	}
+
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+	_, _, err := st.BeginControllerAttempt(context.Background(), claim, "sha256:material-y", now)
+	if !errors.Is(err, situation.ErrControllerAttemptsExhausted) {
+		t.Fatalf("6th attempt err = %v, want ErrControllerAttemptsExhausted", err)
+	}
+
+	// Never dispatch call 11: repeated exhausted calls never advance past 5
+	// or reset silently.
+	_, _, err = st.BeginControllerAttempt(context.Background(), claim, "sha256:material-y", now)
+	if !errors.Is(err, situation.ErrControllerAttemptsExhausted) {
+		t.Fatalf("7th attempt err = %v, want ErrControllerAttemptsExhausted (must stay exhausted)", err)
+	}
+}
+
+func TestControllerAttemptNewMaterialHashResetsToOne(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-begin-attempt-reset", now)
+
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+	if _, workAttempt := beginAttemptThenCommitProjectionOnly(t, st, claim, "sha256:material-a", now); workAttempt != 1 {
+		t.Fatalf("first attempt workAttempt = %d, want 1", workAttempt)
+	}
+
+	reclaim := claimSituation(t, st, sitID, "controller-b", now)
+	if _, workAttempt := beginAttemptThenCommitProjectionOnly(t, st, reclaim, "sha256:material-a", now); workAttempt != 2 {
+		t.Fatalf("same-hash continuation workAttempt = %d, want 2", workAttempt)
+	}
+
+	reclaim2 := claimSituation(t, st, sitID, "controller-c", now)
+	if _, workAttempt := beginAttemptThenCommitProjectionOnly(t, st, reclaim2, "sha256:material-b", now); workAttempt != 1 {
+		t.Fatalf("new-hash reset workAttempt = %d, want 1", workAttempt)
+	}
+}
+
+// ----------------------------------------------------------------------
+// LastTrustworthyAssessment
+// ----------------------------------------------------------------------
+
+func TestLastTrustworthyAssessmentReturnsNilWhenNoneExists(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-last-trustworthy-none", now)
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+
+	got, err := st.LastTrustworthyAssessment(context.Background(), claim)
+	if err != nil {
+		t.Fatalf("LastTrustworthyAssessment: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("got = %+v, want nil", got)
+	}
+}
+
+func TestLastTrustworthyAssessmentSkipsFallback(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-last-trustworthy-fallback", now)
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+
+	commit := basicControllerCommit(sitID, claim.Situation.InputVersion, now)
+	commit.Attempt.Derivation = situationmodel.DerivationDeterministicFallback
+	if err := st.CommitController(context.Background(), claim, commit); err != nil {
+		t.Fatalf("commit fallback: %v", err)
+	}
+
+	got, err := st.LastTrustworthyAssessment(context.Background(), claim)
+	if err != nil {
+		t.Fatalf("LastTrustworthyAssessment: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("got = %+v, want nil (a fallback is never a trustworthy source)", got)
+	}
+}
+
+func TestLastTrustworthyAssessmentFindsModelValidated(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-last-trustworthy-found", now)
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+
+	call := callFixture(uuid.NewString(), sitID, claim.Situation.InputVersion, 1, 1, now)
+	if err := st.RecordAssessmentCall(context.Background(), claim, call); err != nil {
+		t.Fatalf("record assessment call: %v", err)
+	}
+
+	commit := basicControllerCommit(sitID, claim.Situation.InputVersion, now)
+	commit.Attempt.Derivation = situationmodel.DerivationModelValidated
+	commit.Attempt.CallID = &call.ID // model_validated requires a linked call_id (migration 0015's own CHECK).
+	if err := st.CommitController(context.Background(), claim, commit); err != nil {
+		t.Fatalf("commit model_validated: %v", err)
+	}
+
+	got, err := st.LastTrustworthyAssessment(context.Background(), claim)
+	if err != nil {
+		t.Fatalf("LastTrustworthyAssessment: %v", err)
+	}
+	if got == nil || got.ID != commit.Attempt.ID {
+		t.Fatalf("got = %+v, want the model_validated attempt %s", got, commit.Attempt.ID)
+	}
+}
+
+// ----------------------------------------------------------------------
+// ClaimControllerWork / ExtendControllerLease / ReleaseControllerWork
+// ----------------------------------------------------------------------
+
+func TestClaimControllerWorkReturnsFencedClaims(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-claim-work", now)
+
+	claims, err := st.ClaimControllerWork(context.Background(), "worker-1", now, time.Minute, 10)
+	if err != nil {
+		t.Fatalf("ClaimControllerWork: %v", err)
+	}
+	found := false
+	for _, c := range claims {
+		if c.Situation.ID == sitID {
+			found = true
+			if c.ClaimOwner != "worker-1" || c.ClaimToken <= 0 {
+				t.Fatalf("claim = %+v, want owner=worker-1 and a positive claim token", c)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("situation %s not among %d claimed controller work items", sitID, len(claims))
+	}
+}
+
+func TestExtendControllerLeaseRenewsAndFencesOnStaleToken(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-extend-lease", now)
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+
+	if err := st.ExtendControllerLease(context.Background(), claim, now.Add(time.Minute), time.Minute); err != nil {
+		t.Fatalf("ExtendControllerLease: %v", err)
+	}
+
+	stale := claim
+	stale.ClaimToken = claim.ClaimToken + 1000
+	err := st.ExtendControllerLease(context.Background(), stale, now.Add(2*time.Minute), time.Minute)
+	if !errors.Is(err, situationmodel.ErrSituationLeaseLost) {
+		t.Fatalf("extend with stale token err = %v, want ErrSituationLeaseLost", err)
+	}
+}
+
+func TestReleaseControllerWorkReleasesLease(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-release-work", now)
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+
+	if err := st.ReleaseControllerWork(context.Background(), claim, now); err != nil {
+		t.Fatalf("ReleaseControllerWork: %v", err)
+	}
+	sit := getSituationByID(t, st, sitID)
+	if sit.LeaseOwner != nil {
+		t.Fatalf("lease_owner = %v, want nil after release", sit.LeaseOwner)
+	}
+}
+
+// ----------------------------------------------------------------------
+// WakeDependencyRecoveredSituations
+// ----------------------------------------------------------------------
+
+func parkSituationTx(t *testing.T, st *Store, situationID, reason string, generation int64, now time.Time) {
+	t.Helper()
+	if _, err := st.db.ExecContext(context.Background(), `
+		UPDATE situations SET controller_parked_at = ?, controller_parked_reason = ?,
+			controller_work_attempts = 5, last_consumed_recovery_generation = ?, updated_at = ?
+		WHERE id = ?`, canonicalTime(now), reason, generation, canonicalTime(now), situationID); err != nil {
+		t.Fatalf("park situation %s: %v", situationID, err)
+	}
+}
+
+func TestWakeDependencyRecoveredSituationsResetsExactlyDependencyParks(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+
+	depParked := newSituationForGroup(t, st, "group-wake-dependency", now)
+	parkSituationTx(t, st, depParked, situation.ParkedReasonDependency, 1, now)
+
+	policyParked := newSituationForGroup(t, st, "group-wake-policy", now)
+	parkSituationTx(t, st, policyParked, situation.ParkedReasonPolicyRejected, 1, now)
+
+	woken, err := st.WakeDependencyRecoveredSituations(context.Background(), 2, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("WakeDependencyRecoveredSituations: %v", err)
+	}
+	if woken != 1 {
+		t.Fatalf("woken = %d, want 1", woken)
+	}
+
+	dep := getSituationByID(t, st, depParked)
+	var retryEpoch, workAttempts int
+	var parkedReason sql.NullString
+	if err := st.db.QueryRowContext(context.Background(),
+		`SELECT controller_retry_epoch, controller_work_attempts, controller_parked_reason FROM situations WHERE id = ?`, depParked).
+		Scan(&retryEpoch, &workAttempts, &parkedReason); err != nil {
+		t.Fatalf("read woken situation: %v", err)
+	}
+	if retryEpoch != 1 {
+		t.Fatalf("retry_epoch = %d, want 1", retryEpoch)
+	}
+	if workAttempts != 0 {
+		t.Fatalf("work_attempts = %d, want 0 (reset)", workAttempts)
+	}
+	if parkedReason.Valid {
+		t.Fatalf("parked_reason = %v, want cleared", parkedReason)
+	}
+	found := false
+	for _, r := range dep.DueReasons {
+		if r == situationmodel.DueRetry {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("retry_due must be merged into due_reasons")
+	}
+
+	// Policy park is never re-armed by dependency recovery.
+	var policyParkedReason sql.NullString
+	if err := st.db.QueryRowContext(context.Background(), `SELECT controller_parked_reason FROM situations WHERE id = ?`, policyParked).Scan(&policyParkedReason); err != nil {
+		t.Fatalf("read untouched policy park: %v", err)
+	}
+	if !policyParkedReason.Valid || policyParkedReason.String != situation.ParkedReasonPolicyRejected {
+		t.Fatalf("policy park reason = %v, want unchanged %q", policyParkedReason, situation.ParkedReasonPolicyRejected)
+	}
+}
+
+func TestWakeDependencyRecoveredSituationsRepeatedPollsInSameGenerationDoNotReset(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-wake-repeated", now)
+	parkSituationTx(t, st, sitID, situation.ParkedReasonDependency, 1, now)
+
+	first, err := st.WakeDependencyRecoveredSituations(context.Background(), 2, now)
+	if err != nil || first != 1 {
+		t.Fatalf("first wake = %d, %v, want 1, nil", first, err)
+	}
+
+	// Simulate a fresh work-bearing attempt already in progress for the
+	// newly-opened epoch.
+	if _, err := st.db.ExecContext(context.Background(), `UPDATE situations SET controller_work_attempts = 3 WHERE id = ?`, sitID); err != nil {
+		t.Fatalf("simulate in-progress attempt: %v", err)
+	}
+
+	second, err := st.WakeDependencyRecoveredSituations(context.Background(), 2, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("second wake: %v", err)
+	}
+	if second != 0 {
+		t.Fatalf("second wake in the SAME generation = %d, want 0 (must not reopen)", second)
+	}
+
+	var workAttempts int
+	if err := st.db.QueryRowContext(context.Background(), `SELECT controller_work_attempts FROM situations WHERE id = ?`, sitID).Scan(&workAttempts); err != nil {
+		t.Fatalf("read work attempts: %v", err)
+	}
+	if workAttempts != 3 {
+		t.Fatalf("work_attempts = %d, want unchanged 3 (repeated poll in same generation must not reset counters)", workAttempts)
 	}
 }
 

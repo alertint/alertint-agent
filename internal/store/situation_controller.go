@@ -1035,35 +1035,204 @@ func mergeSituationDueReasonTx(ctx context.Context, tx *sql.Tx, situationID stri
 }
 
 // ----------------------------------------------------------------------
-// CommitController — fencing skeleton only. Task 8 completes the
-// decision/projection commit behavior inside the same fenced transaction.
+// BeginControllerAttempt — durable pre-registration of one work-bearing
+// controller attempt, before any provider work.
 // ----------------------------------------------------------------------
 
-// errCommitControllerNotImplemented is returned by every call to
-// CommitController in this build: the fencing skeleton is real (it opens a
-// transaction and verifies Situation ID, input version, lease owner, and
-// claim token all still match), but Task 8 has not yet implemented the
-// decision/projection commit itself, so this method always rolls back and
-// reports that honestly rather than silently no-oping or partially
-// committing.
-var errCommitControllerNotImplemented = errors.New("store: CommitController decision/projection commit is not yet implemented (Task 8)")
+// BeginControllerAttempt fences and durably advances the current unchanged
+// input's work-attempt counter before any provider work — spec.md: "the
+// five-attempt counter advances only for a work-bearing controller cycle
+// that dispatches or fails bounded Assessment work." It reads and writes
+// situations.controller_work_attempts and reads controller_retry_epoch/
+// current_material_fact_hash directly (Plan 1's model.Situation carries
+// none of Plan 2's own controller-projection columns; migration 0015 adds
+// them as raw ALTER TABLE columns with no Go struct field of their own —
+// see the Task 8 report).
+//
+// sameBasis compares materialFactHash against the CURRENTLY PERSISTED
+// current_material_fact_hash (last set by a prior fenced CommitController
+// commit, never written here): unchanged means this is a continuation of
+// the same input's attempt budget (work_attempts+1, fenced at 5); changed
+// means a fresh epoch (work_attempts resets to 1) — this covers BOTH "a
+// genuinely new material input arrived" and "a dependency-recovery
+// generation already reset controller_work_attempts to 0 for this
+// situation" (see the dependency-recovery wake primitive below) — either
+// way, current_material_fact_hash still reads as unchanged from THIS
+// input's own perspective, controller_work_attempts reads 0, and 0+1=1
+// naturally starts a fresh attempt count. controller_retry_epoch is
+// returned read-only; only the wake primitive ever writes it.
+//
+// Returns situation.ErrControllerAttemptsExhausted (not a generic error)
+// when advancing would exceed 5 — Reconcile treats that as "already
+// parked; refresh the projection only," never as a call failure.
+func (s *Store) BeginControllerAttempt(ctx context.Context, claim situation.Claim, materialFactHash string, now time.Time) (int, int, error) {
+	if strings.TrimSpace(claim.Situation.ID) == "" || strings.TrimSpace(claim.ClaimOwner) == "" || claim.ClaimToken <= 0 {
+		return 0, 0, errors.New("store: begin controller attempt requires a complete claim")
+	}
+	if strings.TrimSpace(materialFactHash) == "" {
+		return 0, 0, errors.New("store: begin controller attempt requires a material fact hash")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, fmt.Errorf("store: begin begin-controller-attempt: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := verifyClaimTx(ctx, tx, claim); err != nil {
+		return 0, 0, err
+	}
+
+	var currentHash sql.NullString
+	var retryEpoch, workAttempts int
+	err = tx.QueryRowContext(ctx, `
+		SELECT current_material_fact_hash, controller_retry_epoch, controller_work_attempts
+		FROM situations WHERE id = ?`, claim.Situation.ID).Scan(&currentHash, &retryEpoch, &workAttempts)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, 0, fmt.Errorf("store: read controller attempt counters: %w", err)
+	}
+
+	nextAttempt := 1
+	if currentHash.Valid && currentHash.String == materialFactHash {
+		nextAttempt = workAttempts + 1
+	}
+	if nextAttempt > 5 {
+		return 0, 0, situation.ErrControllerAttemptsExhausted
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE situations SET controller_work_attempts = ?, updated_at = ? WHERE id = ?`,
+		nextAttempt, canonicalTime(now), claim.Situation.ID); err != nil {
+		return 0, 0, fmt.Errorf("store: advance controller attempt counter: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, fmt.Errorf("store: commit begin controller attempt: %w", err)
+	}
+	return retryEpoch, nextAttempt, nil
+}
+
+// ----------------------------------------------------------------------
+// LastTrustworthyAssessment.
+// ----------------------------------------------------------------------
+
+// LastTrustworthyAssessment reads the most recent authoritative attempt for
+// claim's Situation whose own derivation is trustworthy in Task 5's sense
+// (model_validated, deterministic_controller, or revalidated_reuse — never
+// deterministic_fallback, spec.md: "that fallback is never a semantic reuse
+// source"), regardless of whether it is still the CURRENT pointer. Returns
+// (nil, nil) when no such attempt exists yet. This is a read-only
+// convenience surface (e.g. a future MCP/operator-facing "last real
+// judgment" view distinct from a current deterministic_fallback notice);
+// Reconcile's own fallback-vs-preserve decision deliberately uses only
+// claim's own current AuthoritativeAssessment (SnapshotInput.
+// CurrentAssessment), never this wider history scan — see the Task 8
+// report for the full rationale (reusing an OLDER trustworthy judgment
+// against a possibly-changed current basis without RevalidateReuse's own
+// revalidation would risk exactly the staleness bug its doc comment warns
+// against).
+func (s *Store) LastTrustworthyAssessment(ctx context.Context, claim situation.Claim) (*situation.AuthoritativeAssessment, error) {
+	if strings.TrimSpace(claim.Situation.ID) == "" {
+		return nil, errors.New("store: last trustworthy assessment requires a situation id")
+	}
+	var attemptID string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id FROM situation_assessment_attempts
+		WHERE situation_id = ? AND status = 'authoritative' AND derivation != 'deterministic_fallback'
+		ORDER BY sequence DESC LIMIT 1`, claim.Situation.ID).Scan(&attemptID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil //nolint:nilnil // no trustworthy attempt yet is a legitimate, common outcome, not an error
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: read last trustworthy assessment: %w", err)
+	}
+
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("store: begin last trustworthy assessment read: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	a, err := loadAuthoritativeAssessmentTx(ctx, tx, attemptID)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("store: commit last trustworthy assessment read: %w", err)
+	}
+	return a, nil
+}
+
+// ----------------------------------------------------------------------
+// CommitController — the fenced projection/decision commit.
+// ----------------------------------------------------------------------
+
+// currentControllerProjectionTx reads the current bounded controller
+// projection columns CommitController needs to merge/preserve, inside its
+// own transaction — never trusted from any caller-supplied snapshot.
+type currentControllerProjectionTx struct {
+	dueReasons       []situationmodel.DueReason
+	nextAssessmentAt string
+	parkedAt         sql.NullString
+	parkedReason     sql.NullString
+}
+
+func readCurrentControllerProjectionTx(ctx context.Context, tx *sql.Tx, situationID string) (currentControllerProjectionTx, error) {
+	var out currentControllerProjectionTx
+	var dueReasonsJSON string
+	err := tx.QueryRowContext(ctx, `
+		SELECT due_reasons_json, next_assessment_at, controller_parked_at, controller_parked_reason
+		FROM situations WHERE id = ?`, situationID).Scan(&dueReasonsJSON, &out.nextAssessmentAt, &out.parkedAt, &out.parkedReason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return currentControllerProjectionTx{}, ErrNotFound
+	}
+	if err != nil {
+		return currentControllerProjectionTx{}, fmt.Errorf("store: read current controller projection: %w", err)
+	}
+	if err := json.Unmarshal([]byte(dueReasonsJSON), &out.dueReasons); err != nil {
+		return currentControllerProjectionTx{}, fmt.Errorf("store: unmarshal current due reasons: %w", err)
+	}
+	return out, nil
+}
+
+// subtractDueReasonsStore removes every reason in consumed from current,
+// preserving current's order — the store-side mirror of Reconcile's own
+// proposed subtraction (situation.subtractDueReasons, unexported in that
+// package), re-verified here against the row this transaction just read
+// fresh, never trusting the caller's claim-time snapshot. spec.md: "It
+// subtracts only reasons present in the claim. Reasons raised after the
+// claim survive."
+func subtractDueReasonsStore(current, consumed []situationmodel.DueReason) []situationmodel.DueReason {
+	remove := make(map[situationmodel.DueReason]bool, len(consumed))
+	for _, r := range consumed {
+		remove[r] = true
+	}
+	out := make([]situationmodel.DueReason, 0, len(current))
+	for _, r := range current {
+		if !remove[r] {
+			out = append(out, r)
+		}
+	}
+	return out
+}
 
 // CommitController is the Situation controller's single fenced write
-// transaction. Task 3 implements only its fencing skeleton: it opens a
-// transaction, re-reads the current Situation row, and verifies Situation
-// ID, input version, lease owner, and claim token still match claim exactly
-// — returning ErrSituationLeaseLost for an owner/token mismatch or
-// ErrSituationVersionConflict for an input-version mismatch, matching the
-// spec's concurrency rule ("It commits only when Situation ID, input
-// version, lease owner, and claim token still match"). It never partially
-// commits: every path below either returns before touching a row, or rolls
-// back via the deferred Rollback because it never calls tx.Commit. Task 8
-// fills in the real body — persisting commit.Attempt (and, for a new
-// authoritative attempt, advancing current_assessment_id under the guard
-// trigger), commit.TriageDecisions, the projected lifecycle/Attention/
-// recovery/terminal/contract fields, subtracting only claim's consumed due
-// reasons while preserving concurrently added ones, and taking the earlier
-// of commit's proposed checkpoint and any concurrently persisted one.
+// transaction (spec.md's "fenced atomic controller commit"). It verifies
+// Situation ID, input version, lease owner, and claim token still match
+// claim exactly, then: inserts commit.Attempt (and its coverage rows) and
+// advances current_assessment_id only when Attempt.ID is non-empty
+// (situation.ControllerCommit's own doc comment: the zero value means "no
+// new authoritative row this cycle"); applies commit.TriageDecisions via
+// Task 6's applyTriageDecisionsTx inside this SAME transaction; refreshes
+// the bounded current lifecycle/Attention/contract/hash projection on
+// EVERY commit regardless of whether Attempt is populated; applies
+// commit.Parked's explicit touch/clear/set instruction; subtracts only
+// claim.Situation.DueReasons from the due-reasons row read fresh inside
+// this transaction (never claim's own possibly-stale snapshot); sets
+// next_assessment_at to SQL min(current, commit.NextAssessmentAt); and
+// clears the lease. It never partially commits: every failure path returns
+// before calling tx.Commit, so the deferred Rollback undoes everything.
 func (s *Store) CommitController(ctx context.Context, claim situation.Claim, commit situation.ControllerCommit) error {
 	if strings.TrimSpace(claim.Situation.ID) == "" || strings.TrimSpace(claim.ClaimOwner) == "" || claim.ClaimToken <= 0 {
 		return errors.New("store: commit controller requires a complete claim")
@@ -1086,6 +1255,351 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 		return ErrSituationVersionConflict
 	}
 
-	_ = commit // Task 8 persists commit's content inside this same fenced transaction.
-	return errCommitControllerNotImplemented
+	proj, err := readCurrentControllerProjectionTx(ctx, tx, claim.Situation.ID)
+	if err != nil {
+		return err
+	}
+
+	// 1. Insert the new authoritative attempt (if any) and its coverage.
+	var newAssessmentID sql.NullString
+	if commit.Attempt.ID != "" {
+		seq, err := nextAssessmentAttemptSequenceTx(ctx, tx, claim.Situation.ID)
+		if err != nil {
+			return err
+		}
+		attempt := commit.Attempt
+		attempt.Sequence = seq
+		p, err := prepareAssessmentAttempt(attempt, commit.MaterialFactHash)
+		if err != nil {
+			return err
+		}
+		if err := insertAssessmentAttemptTx(ctx, tx, p); err != nil {
+			return err
+		}
+		for _, cov := range commit.Coverage {
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO situation_assessment_coverage (assessment_attempt_id, incident_id, membership_digest, incident_input_digest)
+				VALUES (?, ?, ?, ?) ON CONFLICT(assessment_attempt_id, incident_id) DO NOTHING`,
+				attempt.ID, cov.IncidentID, cov.MembershipDigest, cov.IncidentInputDigest); err != nil {
+				return fmt.Errorf("store: insert assessment coverage: %w", err)
+			}
+		}
+		newAssessmentID = sql.NullString{String: attempt.ID, Valid: true}
+	}
+
+	// 2. Apply Triage decisions sharing this same commit.
+	if err := applyTriageDecisionsTx(ctx, tx, commit.TriageDecisions, canonicalCommitTime(commit)); err != nil {
+		return err
+	}
+
+	// 3. Projected lifecycle/Attention/contract/hashes.
+	actionContractJSON, err := json.Marshal(commit.Assessment.ActionContract)
+	if err != nil {
+		return fmt.Errorf("store: marshal current action contract: %w", err)
+	}
+
+	// 4. Parked state.
+	parkedAt, parkedReason := proj.parkedAt, proj.parkedReason
+	if commit.Parked.Touch {
+		if commit.Parked.Reason == "" {
+			parkedAt, parkedReason = sql.NullString{}, sql.NullString{}
+		} else {
+			parkedAt = sql.NullString{String: canonicalTime(commit.Parked.At), Valid: true}
+			parkedReason = sql.NullString{String: commit.Parked.Reason, Valid: true}
+		}
+	}
+
+	// 5. Due reasons: subtract only what claim itself consumed.
+	remainingDueReasons := subtractDueReasonsStore(proj.dueReasons, claim.Situation.DueReasons)
+	dueReasonsJSON, err := json.Marshal(remainingDueReasons)
+	if err != nil {
+		return fmt.Errorf("store: marshal remaining due reasons: %w", err)
+	}
+
+	// 6. next_assessment_at: spec.md's own checkpoint rule is
+	// min(controller proposed, any CONCURRENTLY PERSISTED earlier
+	// checkpoint) — deliberately NOT min(proposed, whatever next_assessment_at
+	// already held at claim time). The row was claimed BECAUSE
+	// next_assessment_at was already <= now (it was due), so claim.Situation.
+	// NextAssessmentAt is always a stale past due-time, not new information;
+	// naively taking min() against it would pin next_assessment_at to that
+	// stale value forever, since a freshly-derived proposed checkpoint is
+	// always > now by construction (nextUpdateAt's own clamp) and so can
+	// never win a min() against an already-past value. A genuinely
+	// concurrent write IS still possible without invalidating this claim's
+	// lease/token fence: WakeDependencyRecoveredSituations's own UPDATE
+	// (below) touches next_assessment_at without touching lease_owner/
+	// claim_token at all — exactly the case spec.md's rule protects. proj.
+	// nextAssessmentAt (read fresh, inside this same transaction) differing
+	// from claim.Situation.NextAssessmentAt (the claim-time snapshot) is
+	// what proves such a write happened since claim; only then does the
+	// earlier of the two survive.
+	nextAssessmentAt := canonicalTime(commit.NextAssessmentAt)
+	if proj.nextAssessmentAt != canonicalTime(claim.Situation.NextAssessmentAt) && proj.nextAssessmentAt < nextAssessmentAt {
+		nextAssessmentAt = proj.nextAssessmentAt
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE situations SET
+			lifecycle = ?, attention = ?,
+			recovery_observed_at = ?, grace_until = ?, terminal_at = ?, terminal_reason = ?,
+			current_assessment_id = COALESCE(?, current_assessment_id),
+			current_assessment_basis_hash = ?, current_material_fact_hash = ?,
+			current_action_contract_json = ?,
+			controller_parked_at = ?, controller_parked_reason = ?,
+			due_reasons_json = ?,
+			next_assessment_at = ?,
+			retry_at = ?, last_error_class = ?,
+			lease_owner = NULL, lease_expires_at = NULL,
+			updated_at = ?
+		WHERE id = ? AND lease_owner = ? AND claim_token = ? AND input_version = ?`,
+		string(commit.Lifecycle), string(commit.Attention),
+		nullableTimePtr(commit.RecoveryObservedAt), nullableTimePtr(commit.GraceUntil),
+		nullableTimePtr(commit.TerminalAt), nullableTerminalReason(commit.TerminalReason),
+		newAssessmentID,
+		nullableStringValue(commit.AssessmentBasisHash), nullableStringValue(commit.MaterialFactHash),
+		string(actionContractJSON),
+		parkedAt, parkedReason,
+		string(dueReasonsJSON),
+		nextAssessmentAt,
+		nullableTimePtr(commit.RetryAt), nullableString(commit.LastErrorClass),
+		canonicalTime(canonicalCommitTime(commit)),
+		claim.Situation.ID, claim.ClaimOwner, claim.ClaimToken, claim.Situation.InputVersion)
+	if err != nil {
+		return fmt.Errorf("store: commit controller projection: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: count commit controller projection: %w", err)
+	}
+	if n != 1 {
+		// The fence at the top of this method already re-read the row and
+		// confirmed owner/token/version match; a zero-row UPDATE here means
+		// something changed between that read and this write within the
+		// SAME transaction, which cannot happen under this store's
+		// single-writer/single-connection model — fail closed rather than
+		// silently no-op.
+		return situationmodel.ErrSituationLeaseLost
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit commit controller: %w", err)
+	}
+	return nil
+}
+
+// canonicalCommitTime is the single "now" CommitController's own writes
+// (Triage decision decided_at passthrough, updated_at) anchor to: the new
+// attempt's own CompletedAt when one exists (the actual moment this cycle's
+// work concluded), else the earliest due-reason timestamp available —
+// commit.NextAssessmentAt's own basis — falling back to time.Now() only if
+// neither is set (a defensive case that should not occur given Reconcile
+// always populates one of them).
+func canonicalCommitTime(commit situation.ControllerCommit) time.Time {
+	if !commit.Attempt.CompletedAt.IsZero() {
+		return commit.Attempt.CompletedAt
+	}
+	if len(commit.TriageDecisions) > 0 && !commit.TriageDecisions[0].DecidedAt.IsZero() {
+		return commit.TriageDecisions[0].DecidedAt
+	}
+	if !commit.NextAssessmentAt.IsZero() {
+		return commit.NextAssessmentAt
+	}
+	return time.Now().UTC()
+}
+
+func nullableTimePtr(t *time.Time) any {
+	if t == nil {
+		return nil
+	}
+	return canonicalTime(*t)
+}
+
+func nullableTerminalReason(r *situationmodel.TerminalReason) any {
+	if r == nil {
+		return nil
+	}
+	return string(*r)
+}
+
+func nullableStringValue(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// ----------------------------------------------------------------------
+// ClaimControllerWork / ExtendControllerLease / ReleaseControllerWork —
+// wrappers over Plan 1's ClaimDueSituations/ReleaseSituationClaim claim
+// state, converting model.Situation's own LeaseOwner/ClaimToken pair into
+// this package's transport-neutral situation.Claim (see controller.go's own
+// Claim doc comment).
+// ----------------------------------------------------------------------
+
+// ClaimControllerWork leases due Situations via ClaimDueSituations and
+// returns them as situation.Claim, ready for Controller.Reconcile.
+func (s *Store) ClaimControllerWork(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]situation.Claim, error) {
+	sits, err := s.ClaimDueSituations(ctx, owner, now, lease, limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]situation.Claim, 0, len(sits))
+	for _, sit := range sits {
+		if sit.LeaseOwner == nil {
+			continue // defensive: ClaimDueSituations always sets it; never surface an unclaimed row as a Claim.
+		}
+		out = append(out, situation.Claim{Situation: sit, ClaimOwner: *sit.LeaseOwner, ClaimToken: sit.ClaimToken})
+	}
+	return out, nil
+}
+
+// ExtendControllerLease renews claim's lease for another lease duration,
+// fenced on (id, lease_owner, claim_token) — the same fencing
+// ReleaseSituationClaim uses, reused directly rather than duplicated.
+func (s *Store) ExtendControllerLease(ctx context.Context, claim situation.Claim, now time.Time, lease time.Duration) error {
+	if strings.TrimSpace(claim.Situation.ID) == "" || strings.TrimSpace(claim.ClaimOwner) == "" || claim.ClaimToken <= 0 {
+		return errors.New("store: extend controller lease requires a complete claim")
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE situations SET lease_expires_at = ?, updated_at = ?
+		WHERE id = ? AND lease_owner = ? AND claim_token = ?`,
+		canonicalTime(now.Add(lease)), canonicalTime(now.UTC()), claim.Situation.ID, claim.ClaimOwner, claim.ClaimToken)
+	if err != nil {
+		return fmt.Errorf("store: extend controller lease: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: count extended controller lease: %w", err)
+	}
+	if n != 1 {
+		return situationmodel.ErrSituationLeaseLost
+	}
+	return nil
+}
+
+// ReleaseControllerWork releases claim's lease early — the worker's own
+// safety net when Reconcile returns before ever reaching CommitController
+// (which otherwise always clears the lease itself on a successful commit):
+// a plain wrapper over ReleaseSituationClaim, converting situation.Claim
+// back into the model.Situation shape it expects.
+func (s *Store) ReleaseControllerWork(ctx context.Context, claim situation.Claim, now time.Time) error {
+	owner := claim.ClaimOwner
+	sit := claim.Situation
+	sit.LeaseOwner = &owner
+	sit.ClaimToken = claim.ClaimToken
+	return s.ReleaseSituationClaim(ctx, sit, now)
+}
+
+// ----------------------------------------------------------------------
+// Dependency-recovery wake primitive.
+// ----------------------------------------------------------------------
+
+// WakeDependencyRecoveredSituations is the idempotent, startup-safe primitive
+// spec.md's retry/parking section names: "a durable dependency recovery
+// generation may open one new bounded retry epoch for work parked
+// specifically on that dependency." Called once before each controller
+// claim poll (never concurrently with live controller work on the same
+// Situation — the same discipline RecoverInterruptedAssessmentCalls/
+// RecoverExpiredFoundationLeases already document), it finds every
+// Situation parked with controller_parked_reason=situation.ParkedReasonDependency
+// whose last_consumed_recovery_generation is older than outageGeneration —
+// the caller supplies this from internal/llmhealth.Tracker.Snapshot().
+// OutageGeneration once healthy again (this package cannot import
+// internal/llmhealth: that package imports internal/store, so the reverse
+// import here would cycle) — and for each: increments controller_retry_epoch,
+// resets controller_work_attempts to 0, clears the parked marker, merges
+// retry_due into due_reasons, moves next_assessment_at earlier (to now), and
+// persists last_consumed_recovery_generation = outageGeneration, all in one
+// transaction per Situation. Repeated calls within the SAME generation are a
+// no-op (last_consumed_recovery_generation already >= outageGeneration), so
+// this never resets counters twice for one recovery event, and never
+// re-arms a policy/capability park (those never carry
+// ParkedReasonDependency). Returns how many Situations it woke.
+func (s *Store) WakeDependencyRecoveredSituations(ctx context.Context, outageGeneration int64, now time.Time) (int, error) {
+	if outageGeneration <= 0 {
+		return 0, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id FROM situations
+		WHERE lifecycle IN ('active','recovery_pending')
+		  AND controller_parked_reason = ?
+		  AND last_consumed_recovery_generation < ?`,
+		situation.ParkedReasonDependency, outageGeneration)
+	if err != nil {
+		return 0, fmt.Errorf("store: list dependency-parked situations: %w", err)
+	}
+	ids, err := scanStringRows(rows)
+	if err != nil {
+		return 0, fmt.Errorf("store: read dependency-parked situation ids: %w", err)
+	}
+
+	woken := 0
+	for _, id := range ids {
+		ok, err := wakeOneDependencyRecoveredSituationTx(ctx, s.db, id, outageGeneration, now)
+		if err != nil {
+			return woken, err
+		}
+		if ok {
+			woken++
+		}
+	}
+	return woken, nil
+}
+
+func wakeOneDependencyRecoveredSituationTx(ctx context.Context, db *sql.DB, situationID string, outageGeneration int64, now time.Time) (bool, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("store: begin wake dependency-recovered situation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	sit, err := getSituationTx(ctx, tx, situationID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return false, nil // raced away (e.g. terminalized) since the listing read; nothing to wake.
+		}
+		return false, err
+	}
+
+	var lastConsumed int64
+	if err := tx.QueryRowContext(ctx, `SELECT last_consumed_recovery_generation FROM situations WHERE id = ?`, situationID).Scan(&lastConsumed); err != nil {
+		return false, fmt.Errorf("store: read last consumed recovery generation: %w", err)
+	}
+	if lastConsumed >= outageGeneration {
+		return false, nil // already consumed by a prior poll within this same generation.
+	}
+
+	mergedReasons := mergeDueReason(sit.DueReasons, situationmodel.DueRetry)
+	dueReasonsJSON, err := json.Marshal(mergedReasons)
+	if err != nil {
+		return false, fmt.Errorf("store: marshal woken due reasons: %w", err)
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE situations SET
+			controller_retry_epoch = controller_retry_epoch + 1,
+			controller_work_attempts = 0,
+			controller_parked_at = NULL, controller_parked_reason = NULL,
+			last_consumed_recovery_generation = ?,
+			due_reasons_json = ?,
+			next_assessment_at = min(next_assessment_at, ?),
+			updated_at = ?
+		WHERE id = ? AND controller_parked_reason = ? AND last_consumed_recovery_generation < ?`,
+		outageGeneration, string(dueReasonsJSON), canonicalTime(now), canonicalTime(now),
+		situationID, situation.ParkedReasonDependency, outageGeneration)
+	if err != nil {
+		return false, fmt.Errorf("store: wake dependency-recovered situation: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: count woken dependency-recovered situation: %w", err)
+	}
+	if n != 1 {
+		return false, nil // raced away between the read above and this write.
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("store: commit wake dependency-recovered situation: %w", err)
+	}
+	return true, nil
 }
