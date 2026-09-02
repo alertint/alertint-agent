@@ -653,12 +653,22 @@ func TestKillSwitchSingleCall(t *testing.T) {
 		t.Errorf("disabled verification must not persist a verification key: %s", f.enrichment)
 	}
 
-	// Byte-identical prompt: rebuild the reference from the same inc + alerts.
+	// Byte-identical prompt: rebuild the reference from the same inc + alerts
+	// Skill.Analyze itself reads. Task 7's Analyze always re-fetches the
+	// Incident by id (GetIncidentByID) rather than trusting a caller-supplied
+	// value — the real worker path only ever has an incident id to start
+	// from — so the reference must reload too, not reuse the local `inc`
+	// captured before insertTestAlert denormalized its alert_count/
+	// last_alert_at.
+	fresh, err := st.GetIncidentByID(ctx, inc.ID)
+	if err != nil || fresh == nil {
+		t.Fatalf("reload incident: %v (fresh=%v)", err, fresh)
+	}
 	alerts, err := st.GetIncidentAlerts(ctx, inc.ID)
 	if err != nil {
 		t.Fatalf("load alerts: %v", err)
 	}
-	pack := acutetriage.BuildEvidencePack(inc, alerts, 0)
+	pack := acutetriage.BuildEvidencePack(*fresh, alerts, 0)
 	want := acutetriage.UserPrompt(pack, string(mustJSON(t, pack)), nil, nil, nil, nil, nil, nil, acutetriage.VerificationParams{})
 	if scripted.prompts[0] != want {
 		t.Errorf("call-1 prompt drifted from the pre-feature fixture:\n--- got ---\n%s\n--- want ---\n%s", scripted.prompts[0], want)

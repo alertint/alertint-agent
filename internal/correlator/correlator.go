@@ -9,8 +9,9 @@
 //     correlator groups all alerts sharing that key into one incident within
 //     the current open window.
 //   - Fixed window: ready_at = first_alert_at + WindowSeconds. Once the
-//     window closes the incident is marked "ready" and handed off via
-//     IncidentSink.OnIncidentReady.
+//     window closes the incident is marked "ready"
+//     (MarkIncidentReadyWithSituationInput), atomically creating the gated
+//     Acute Triage schedule row (Task 6) in the same transaction.
 //   - Deduplication: alerts with the same fingerprint are added to the
 //     incident at most once (incident_alerts has a composite PK).
 //   - Startup recovery: on Start the correlator scans incidents in
@@ -18,10 +19,12 @@
 //     not silently drop windows.
 //   - The MarkReady ticker wakes every TickInterval (default 5 s) and
 //     flushes every collecting incident whose ready_at is in the past.
-//   - Triage retry: when the sink returns an error the incident stays "ready"
-//     and is re-dispatched on later ticks with backoff; once the schedule is
-//     spent it moves to the terminal "failed" status. Start re-dispatches
-//     every incident still "ready" once (see triage_retry.go).
+//   - Acute Triage dispatch: NOT owned by this package (Task 7). Due Triage
+//     dispatch, retry/backoff, and exhaustion run from a dedicated
+//     internal/situation.TriageWorker polling the gated schedule
+//     independently — a Correlator tick never calls an LLM. IncidentSink
+//     below is retained only for API compatibility with existing callers;
+//     nothing in this package invokes it anymore.
 //
 // Thread-safety: Accept may be called from multiple goroutines; all
 // mutations go through a single serialised loop via a channel.
@@ -42,12 +45,12 @@ import (
 	"github.com/google/uuid"
 )
 
-// IncidentSink receives incidents that have exited the collecting window
-// and are ready for further processing. The Incident passed to
-// OnIncidentReady carries Status "processing", not "ready": the transition
-// to "processing" is a real durable lease taken before the sink is called
-// (R1), not a display value, so an implementation must not branch on
-// Status == "ready" here.
+// IncidentSink is retained for API compatibility only (Task 7): due Triage
+// dispatch moved out of the Correlator tick entirely, into a dedicated
+// internal/situation.TriageWorker, so nothing in this package calls
+// OnIncidentReady anymore. New code should not wire a real analysis path
+// through this interface; NopIncidentSink (or any other implementation) is
+// accepted but never invoked.
 type IncidentSink interface {
 	OnIncidentReady(ctx context.Context, inc store.Incident) error
 }
@@ -140,8 +143,11 @@ func (c *Config) defaults() {
 // Correlator groups incoming store.Alert values into incidents using a
 // fixed time window and notifies an IncidentSink when each window closes.
 type Correlator struct {
-	cfg                Config
-	st                 *store.Store
+	cfg Config
+	st  *store.Store
+	// sink is accepted for API compatibility only (Task 7) — nothing in this
+	// package calls it anymore; see the package doc comment and
+	// IncidentSink's own doc comment.
 	sink               IncidentSink
 	resolutionNotifier ResolutionNotifier
 	occNotifier        OccurrenceNotifier
@@ -285,19 +291,25 @@ func (c *Correlator) loop(ctx context.Context) {
 }
 
 // recover re-arms timers for any incidents that were "collecting" when the
-// process last exited, and reconciles the durable triage schedule (interrupted
-// in_flight rows, legacy ready rows with no triage row, and the one-hour
-// startup horizon — see recoverTriageState). It does NOT fire anything
-// immediately — the tick loop will catch due work on the next tick.
+// process last exited. It does NOT fire anything immediately — the tick loop
+// will catch due work on the next tick.
+//
+// Task 7: this used to also reconcile the durable Acute Triage schedule
+// (interrupted in_flight rows, legacy ready rows with no triage row, and the
+// one-hour startup horizon — internal/correlator/triage_retry.go's
+// recoverTriageState, removed by this task). Acute Triage dispatch itself
+// now runs from a dedicated internal/situation.TriageWorker, polling the
+// Task-6-gated schedule independently — its own crash/heartbeat-loss
+// recovery (store.RecoverExpiredIncidentTriageAttempts) runs at the start of
+// every TriageWorker.RunOnce, not from here. The equivalent of the old
+// one-hour startup-backlog horizon (ADR-0045) has no replacement yet; see
+// the Task 7 report's concerns for Task 9 (runtime wiring/startup order).
 func (c *Correlator) recover(ctx context.Context) error {
 	incs, err := listCollectingIncidents(ctx, c.st)
 	if err != nil {
 		return fmt.Errorf("correlator: startup recovery: %w", err)
 	}
 	c.logger.Info("correlator: startup recovery", "collecting_incidents", len(incs))
-	if err := c.recoverTriageState(ctx, c.now().UTC()); err != nil {
-		return fmt.Errorf("correlator: startup recovery: %w", err)
-	}
 	return nil
 }
 
@@ -453,9 +465,16 @@ func (c *Correlator) checkAllAlertsResolved(ctx context.Context, incidentID stri
 	return true, nil
 }
 
-// flushExpired marks every overdue collecting incident as ready, seeds its
-// durable triage row, and dispatches it, then dispatches every incident
-// whose durable backoff is due.
+// flushExpired marks every overdue collecting incident as ready. Task 7:
+// this used to also seed a durable triage row and dispatch it synchronously
+// (an LLM round-trip on the Correlator's own goroutine) — that dispatch
+// chain (SeedIncidentTriage + dispatchTriage + dispatchDueTriage,
+// internal/correlator/triage_retry.go) is removed. MarkIncidentReadyWith-
+// SituationInput already creates the gated "awaiting_decision" Triage
+// schedule row atomically with the ready transition (Task 6); dispatch from
+// that schedule is now internal/situation.TriageWorker's job, polling
+// independently — a Correlator tick makes zero model calls (see
+// TestFlushExpired_MakesNoModelCalls, correlator_test.go).
 func (c *Correlator) flushExpired(ctx context.Context) error {
 	incs, err := listCollectingIncidents(ctx, c.st)
 	if err != nil {
@@ -467,26 +486,16 @@ func (c *Correlator) flushExpired(ctx context.Context) error {
 		if now.Before(inc.ReadyAt) {
 			continue
 		}
-		// The ready transition and its incident_ready Situation input commit
-		// together (Task 5), so this is durably visible to the Situation even
-		// if the process crashes before SeedIncidentTriage below ever runs —
-		// Plan 2 replaces that immediate seed with "awaiting_decision".
+		// The ready transition, its incident_ready Situation input, and the
+		// gated awaiting_decision Triage schedule row all commit together
+		// (Task 5/6) — durably visible even if the process crashes right
+		// after this call returns.
 		if err := c.st.MarkIncidentReadyWithSituationInput(ctx, inc.ID, now); err != nil {
 			c.logger.Error("correlator: mark ready", "incident_id", inc.ID, "err", err)
 			continue
 		}
 		c.logger.Info("correlator: incident ready", "incident_id", inc.ID, "group_key", inc.GroupKey, "alert_count", inc.AlertCount)
-
-		if err := c.st.SeedIncidentTriage(ctx, inc.ID, now); err != nil {
-			c.logger.Error("correlator: seed triage", "incident_id", inc.ID, "err", err)
-			continue
-		}
-		c.dispatchTriage(ctx, inc.ID)
 	}
-
-	// Sink calls above may have taken a while (an LLM round-trip); re-read
-	// the clock so due retries are not pushed to the next tick.
-	c.dispatchDueTriage(ctx, c.now().UTC())
 
 	// Piggyback occurrence pruning on the flush ticker (~hourly at the default
 	// tick), so old occurrence rows are reclaimed without a separate job (R12).

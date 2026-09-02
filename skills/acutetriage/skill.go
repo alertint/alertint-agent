@@ -17,6 +17,7 @@ import (
 	"github.com/alertint/alertint-agent/internal/notify"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/rules"
+	"github.com/alertint/alertint-agent/internal/situation"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/internal/zabbix"
 )
@@ -216,40 +217,42 @@ type pipelineParams struct {
 	replay *replayRun
 }
 
-// Run executes the full triage pipeline for a newly-ready incident.
-// It is safe to call from the IncidentSink goroutine.
+// Run is retained only as a compatibility composition for existing
+// direct-triage tests; it is not used by the Plan 2 worker (internal/
+// situation.TriageWorker calls Skill.Analyze directly through the
+// AcuteAnalyzer interface). It composes Analyze, legacy persistence
+// (SaveIncidentOutput), then post-commit effects (AfterCommit) exactly
+// once, in that order — the same three phases TriageWorker itself runs,
+// just driven synchronously against a store.Incident the caller already
+// has in hand instead of a claimed TriageAttemptClaim.
 func (s *Skill) Run(ctx context.Context, inc store.Incident) error {
 	s.logger.Info("triage started", "incident", inc.ID, "alerts", inc.AlertCount)
 
-	alerts, err := s.st.GetIncidentAlerts(ctx, inc.ID)
+	claim := situation.TriageAttemptClaim{IncidentID: inc.ID}
+	result, err := s.Analyze(ctx, claim)
+	if errors.Is(err, ErrCleanSkip) {
+		return nil
+	}
 	if err != nil {
-		return fmt.Errorf("acutetriage: load alerts: %w", err)
-	}
-	if len(alerts) == 0 {
-		s.logger.Warn("acutetriage: incident has no member alerts; skipping", "incident_id", inc.ID)
-		return nil
+		return err
 	}
 
-	// Minimum-alert threshold gates the initial triage only (a re-judgment
-	// re-analyzes an incident that already cleared it).
-	minAlerts := s.cfg.MinAlerts
-	if minAlerts <= 0 {
-		minAlerts = 1 // Default: a lone first alert still produces a finding
-	}
-	if len(alerts) < minAlerts {
-		s.logger.Info("triage skipped",
-			"incident", inc.ID,
-			"alerts", len(alerts),
-			"min_required", minAlerts,
-			"group", inc.GroupKey,
-		)
-		return nil
+	if err := s.st.SaveIncidentOutput(ctx,
+		inc.ID, string(result.OutputJSON), result.Summary, result.RootCause, result.Confidence, result.EnrichmentJSON,
+	); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.logger.Warn("acutetriage: incident not in a persistable state; finding dropped",
+				"incident_id", inc.ID, "rejudge", false)
+			return nil
+		}
+		return fmt.Errorf("acutetriage: save output: %w", err)
 	}
 
-	return s.pipeline(ctx, inc, alerts, pipelineParams{
-		spanStart: inc.FirstAlertAt,
-		persist:   s.st.SaveIncidentOutput,
-	})
+	if err := s.AfterCommit(ctx, result); err != nil {
+		s.logger.Warn("acutetriage: post-commit effects failed (best-effort)", "incident_id", inc.ID, "err", err)
+	}
+	s.logger.Info("triage done", "incident", inc.ID, "confidence", result.Confidence)
+	return nil
 }
 
 // Rejudge re-runs the full triage pipeline for an already-judged incident and
@@ -283,11 +286,43 @@ func (s *Skill) Rejudge(ctx context.Context, inc store.Incident, trigger string)
 	})
 }
 
-// pipeline is the shared triage core: rules → evidence → LLM → persist → notify
-// → audit. p selects the initial-triage vs re-judgment differences.
-func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store.Alert, p pipelineParams) error {
-	start := time.Now()
+// triageAnalysis carries analyzeCore's full result: everything both the
+// pre-Task-7 pipeline (Rejudge's engine) and the new Analyze (Task 7's
+// AcuteAnalyzer boundary) need after the shared rules → evidence → LLM →
+// verification → caps sequence, but before any durable write or outward
+// call.
+type triageAnalysis struct {
+	decision           rules.Decision
+	ar                 analysisResult
+	resp               llmResponse
+	finalRaw           json.RawMessage
+	ver                *VerificationEnrichment
+	enrichmentJSON     string
+	evidencePackDigest string
+}
 
+// analyzeCore runs the shared, durable-write-free triage core: rule
+// evaluation, evidence pack assembly, the LLM call, the optional
+// verification round, and the deterministic evidence/steering confidence
+// caps. It is a pure "extract method" of what pipeline used to do inline
+// before persist (Task 7) — no analysis logic changed, only where it lives,
+// so Rejudge's existing behavior (still driven through pipeline) is
+// unaffected. The one observable timing change for BOTH callers:
+// auditEnrichmentDigests now fires from inside this shared core (before
+// persist) rather than from pipeline's own tail (after notify) — content
+// and kind are unchanged, only its position relative to persist/notify; see
+// the Task 7 report.
+//
+// It does no durable Incident/Finding write and calls no notifier — Global
+// Constraint: "No connector, LLM, Slack, notifier, audit sink, or OTel
+// exporter call occurs inside a database transaction," and analyzeCore never
+// opens one. It DOES call the configured audit sink for its own
+// non-terminal action-trail entries (analysis_started, enrichment digests,
+// verification planned/executed) — diagnostic trail rows, not "terminal
+// audit state" (the incident.analyzed row only fires from pipeline's own
+// tail, or — for the Analyze path — from AfterCommit via
+// PostCommit.AuditRecords).
+func (s *Skill) analyzeCore(ctx context.Context, inc store.Incident, alerts []store.Alert, rejudge bool, trigger string, spanStart time.Time, recurrence string, replay *replayRun) (triageAnalysis, error) {
 	// Evaluate the rule engine: it may pick a specialized analysis template or
 	// short-circuit the LLM entirely for known issues (correct and consistent on
 	// a re-judgment too — a known-issue rule replacing an LLM finding).
@@ -304,13 +339,13 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	pack := BuildEvidencePack(inc, alerts, s.cfg.WindowSeconds)
 	packJSON, err := json.Marshal(pack)
 	if err != nil {
-		return fmt.Errorf("acutetriage: marshal evidence pack: %w", err)
+		return triageAnalysis{}, fmt.Errorf("acutetriage: marshal evidence pack: %w", err)
 	}
 
 	if s.auditor != nil {
 		started := map[string]any{"incident_id": inc.ID, "alert_count": len(alerts)}
-		if p.rejudge {
-			started["trigger"] = p.trigger
+		if rejudge {
+			started["trigger"] = trigger
 		}
 		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.analysis_started", started)
 	}
@@ -318,9 +353,9 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	// Produce the analysis: from the matched rule (short-circuit) or from the LLM
 	// with the pack-selected system prompt, the span-anchored enrichments, and
 	// (on a re-judgment) the recurrence context prepended.
-	ar, err := s.analysis(ctx, inc, alerts, decision, pack, packJSON, p.spanStart, p.recurrence, p.replay)
+	ar, err := s.analysis(ctx, inc, alerts, decision, pack, packJSON, spanStart, recurrence, replay)
 	if err != nil {
-		return err
+		return triageAnalysis{}, err
 	}
 
 	// ar.health.Finish persists with its own bounded context.Background() by
@@ -329,12 +364,12 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	var resp llmResponse
 	if err := json.Unmarshal(ar.raw, &resp); err != nil {
 		// One reason-bearing error for both consumers: the tracker observes
-		// it, and the Correlator classifies the very same error for its
-		// durable triage code — so /health and the retry row can never
-		// disagree about why this attempt failed.
+		// it, and every completion boundary classifies the very same error
+		// for its durable triage code — so /health and the retry row can
+		// never disagree about why this attempt failed.
 		malformed := fmt.Errorf("%w: %v", llmhealth.ErrResponseMalformed, err)
 		ar.health.Finish(malformed) //nolint:contextcheck
-		return fmt.Errorf("acutetriage: parse llm response: %w", malformed)
+		return triageAnalysis{}, fmt.Errorf("acutetriage: parse llm response: %w", malformed)
 	}
 	ar.health.Finish(nil) //nolint:contextcheck
 	clampConfidence(&resp.Confidence)
@@ -348,7 +383,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	finalRaw := ar.raw
 	var ver *VerificationEnrichment
 	if s.cfg.Verification.Enabled && !ar.shortCircuit {
-		finalRaw, resp, ver = s.verifyAndRejudge(ctx, inc, alerts, ar, resp, p)
+		finalRaw, resp, ver = s.verifyAndRejudge(ctx, inc, alerts, ar, resp, replay)
 	}
 	// applyEvidenceCap sees the verification enrichment; live verification PromQL
 	// evidence lifts the annotations-only basis just like live metrics/logs do
@@ -357,16 +392,45 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	s.applyEvidenceCap(&resp, decision, ar.metrics, ar.logs, ar.changes, ar.sentry, ar.zabbix, ver, inc.ID)
 	s.applySteeringCap(&resp, governingOf(ar.memory), ver, inc.ID)
 
-	// Persist output, including the log-enrichment snapshot so the evidence pack
-	// can replay exactly what the model saw (empty on the short-circuit /
-	// logs-disabled path → stored NULL). On a verification round this is call 2's
-	// finding (or the draft when call 2 was lost).
-	outputJSON := string(finalRaw)
+	// enrichmentJSON is what a successful persist stores, including the
+	// log-enrichment snapshot so the evidence pack can replay exactly what the
+	// model saw (empty on the short-circuit / logs-disabled path → stored
+	// NULL). On a verification round this reflects call 2's finding (or the
+	// draft when call 2 was lost).
 	enrichmentJSON := marshalEnrichments(enrichmentSources(ar, ver), s.logger, inc.ID)
+	s.auditEnrichmentDigests(ctx, inc.ID, ar.metrics, ar.logs, ar.changes, ar.sentry, ar.zabbix)
+
+	return triageAnalysis{
+		decision:           decision,
+		ar:                 ar,
+		resp:               resp,
+		finalRaw:           finalRaw,
+		ver:                ver,
+		enrichmentJSON:     enrichmentJSON,
+		evidencePackDigest: evidencePackDigestOf(packJSON),
+	}, nil
+}
+
+// pipeline is Rejudge's own engine: analyzeCore → persist → roles → memory
+// → notify → audit. It is no longer used by Run (Task 7 — see Run's own
+// doc comment), only by Rejudge, so p.rejudge is always true here in
+// production; p.replay drives the hermetic grading-replay path unchanged.
+func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store.Alert, p pipelineParams) error {
+	start := time.Now()
+
+	ta, err := s.analyzeCore(ctx, inc, alerts, p.rejudge, p.trigger, p.spanStart, p.recurrence, p.replay)
+	if err != nil {
+		return err
+	}
+	resp, finalRaw, ver, decision, ar := ta.resp, ta.finalRaw, ta.ver, ta.decision, ta.ar
+
+	// Persist output. On a verification round this is call 2's finding (or
+	// the draft when call 2 was lost).
+	outputJSON := string(finalRaw)
 	if err := p.persist(ctx,
 		inc.ID, outputJSON,
 		resp.AnalysisName, resp.OverallIssue,
-		resp.Confidence, enrichmentJSON,
+		resp.Confidence, ta.enrichmentJSON,
 	); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			s.logger.Warn("acutetriage: incident not in a persistable state; finding dropped",
@@ -472,8 +536,6 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 		steeringAuditFields(analyzed, ar.memory, ver)
 		_ = s.auditor.Append(ctx, "skill:acute-triage", "incident.analyzed", analyzed)
 	}
-
-	s.auditEnrichmentDigests(ctx, inc.ID, ar.metrics, ar.logs, ar.changes, ar.sentry, ar.zabbix)
 
 	ruleID := "none"
 	if decision.Rule != nil {
@@ -955,7 +1017,7 @@ func (s *Skill) verifyParams() VerificationParams {
 // with its memory verdict cleared, so a lost re-judge never fails a triage the
 // draft could otherwise ship (the never-fails invariant) and never moves memory
 // marks on stale grounds (R16). resp is the draft (already clamped).
-func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts []store.Alert, ar analysisResult, resp llmResponse, p pipelineParams) (json.RawMessage, llmResponse, *VerificationEnrichment) {
+func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts []store.Alert, ar analysisResult, resp llmResponse, replay *replayRun) (json.RawMessage, llmResponse, *VerificationEnrichment) {
 	draft := DraftRef{RootCause: resp.OverallIssue, Confidence: resp.Confidence}
 	vp := s.verifyParams()
 	floor := composeFloor(vp, s.cfg.ZabbixParams.HostLabel, alerts)
@@ -990,8 +1052,8 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 	// operatorQ rebuilds identically on replay and the snapshot executor serves
 	// each query by kind+expr — no snapshot-format change.
 	var round *VerificationRound
-	if p.replay != nil {
-		round = runVerificationWith(ctx, p.replay.exec, vp, floor, draft, operatorQ, modelQ, time.Now().UTC())
+	if replay != nil {
+		round = runVerificationWith(ctx, replay.exec, vp, floor, draft, operatorQ, modelQ, time.Now().UTC())
 	} else {
 		round = runVerification(ctx, s.promQuerier(), s.cfg.Zabbix, s.st, vp, inc, floor, draft, operatorQ, modelQ, time.Now().UTC(), s.logger, ar.zabbixSeed)
 	}
