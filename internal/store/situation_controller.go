@@ -1043,33 +1043,57 @@ type staleControllerBasis struct {
 }
 
 // loadStaleControllerBasisTx finds every Situation not currently under an
-// active claim whose current_material_fact_hash/controller_work_attempts
-// projection has fallen behind its own most-recently-dispatched
-// situation_assessment_calls row — regardless of whether that call already
-// has a recorded outcome. This is deliberately BROADER than
-// loadOrphanedAssessmentCallsTx's own "outcome-less" definition: a call can
-// be fully resolved (e.g. a durably recorded status='rejected' outcome —
-// AppendAssessmentOutcome's own commit is a separate, already-durable
-// transaction from CommitController's) and its owning cycle can STILL have
-// never reached CommitController's own fenced commit, the only place
-// current_material_fact_hash/controller_work_attempts are normally
+// active claim whose current_material_fact_hash has fallen behind its own
+// most-recently-dispatched situation_assessment_calls row's own
+// material_fact_hash (including never having been set at all) —
+// regardless of whether that call already has a recorded outcome. This is
+// deliberately BROADER than loadOrphanedAssessmentCallsTx's own
+// "outcome-less" definition: a call can be fully resolved (e.g. a durably
+// recorded status='rejected' outcome — AppendAssessmentOutcome's own commit
+// is a separate, already-durable transaction from CommitController's) and
+// its owning cycle can STILL have never reached CommitController's own
+// fenced commit, the only place current_material_fact_hash is normally
 // advanced — whether the crash landed between that outcome append and the
 // projection commit ("after rejected/failed attempt persistence"), or
 // inside CommitController's own now-fully-rolled-back transaction (SQLite's
 // atomicity makes that indistinguishable from no commit attempt at all —
 // "after authoritative insert but before commit"). In every one of these
 // cases the dispatch itself (situation_assessment_calls) is durable and
-// immutable, but nothing durable reflects it in the Situation's own
+// immutable, but nothing durable reflects its basis in the Situation's own
 // projection — exactly the condition that makes the NEXT real
 // BeginControllerAttempt call recompute a colliding coordinate.
+//
+// This selection is deliberately narrower than an earlier version of this
+// query, which also matched "s.controller_work_attempts < c.work_attempt"
+// (same hash, counter behind) as a supposed second crash signature. That
+// third disjunct was itself a bug (Task 10 fix round 3, Finding C1): under
+// ordinary crash/restart, BeginControllerAttempt ALWAYS commits
+// controller_work_attempts in its own transaction BEFORE the corresponding
+// situation_assessment_calls row is even inserted (see BeginControllerAttempt's
+// own doc comment), so "same hash, counter behind" never arises from a
+// crash — controller_work_attempts is already caught up by construction.
+// The only real path to that state was wakeOneDependencyRecoveredSituationTx,
+// which resets controller_work_attempts to 0 while deliberately leaving
+// current_material_fact_hash untouched (a dependency-unavailability park has
+// nothing to do with the input basis) — a legitimate, freshly-opened
+// generation, not a crash gap. The old disjunct matched it anyway and
+// advanceControllerBasisForRecoveryTx's MAX(...) write silently restored
+// controller_work_attempts back up to the stale, already-exhausted call's
+// own work_attempt, permanently re-stranding a Situation this fix round's
+// regression tests exist to catch (see
+// TestRecoverInterruptedAssessmentCallDoesNotReExhaustFreshlyWokenSituation).
+// Matching on current_material_fact_hash alone (NULL-or-mismatch) is both
+// necessary and sufficient: it is exactly the condition CommitController's
+// own fenced commit is the only normal writer of, so a mismatch (or NULL)
+// can only mean that commit never ran for the most-recently-dispatched call.
 //
 // Under normal (non-crashed) operation this is always empty for any
 // Situation not under an active claim: every cycle that ever calls
 // BeginControllerAttempt/RecordAssessmentCall always eventually reaches
 // CommitController (success or failure) before its claim is released, and
-// that commit always advances current_material_fact_hash/controller_work_attempts
-// to reflect that SAME cycle's own dispatch — so only a genuine crash
-// between dispatch and that commit can leave a gap here.
+// that commit always advances current_material_fact_hash to reflect that
+// SAME cycle's own dispatch — so only a genuine crash between dispatch and
+// that commit can leave a gap here.
 func loadStaleControllerBasisTx(ctx context.Context, tx *sql.Tx, now time.Time) ([]staleControllerBasis, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT s.id, c.material_fact_hash, c.work_attempt
@@ -1082,8 +1106,7 @@ func loadStaleControllerBasisTx(ctx context.Context, tx *sql.Tx, now time.Time) 
 		)
 		WHERE (s.lease_owner IS NULL OR s.lease_expires_at <= ?)
 		  AND (s.current_material_fact_hash IS NULL
-		       OR s.current_material_fact_hash != c.material_fact_hash
-		       OR s.controller_work_attempts < c.work_attempt)`, canonicalTime(now))
+		       OR s.current_material_fact_hash != c.material_fact_hash)`, canonicalTime(now))
 	if err != nil {
 		return nil, fmt.Errorf("store: load stale controller basis: %w", err)
 	}
@@ -1117,14 +1140,39 @@ func loadStaleControllerBasisTx(ctx context.Context, tx *sql.Tx, now time.Time) 
 //
 //  1. current_material_fact_hash = recoveredMaterialFactHash (that call's
 //     OWN material_fact_hash — the actual basis it was durably dispatched
-//     against) and controller_work_attempts = MAX(current,
-//     recoveredWorkAttempt). WHEN the next real cycle's freshly-derived
-//     Snapshot happens to re-derive the IDENTICAL basis (a fast restart, or
-//     any Situation whose material facts are not time-sensitive), this
-//     makes BeginControllerAttempt's sameBasis comparison match, so it
-//     correctly computes workAttempts+1 — continuing the SAME attempt
-//     budget the crashed call already spent one slot of, exactly as if the
-//     crash had never happened.
+//     against) and controller_work_attempts = recoveredWorkAttempt (a plain
+//     assignment, not MAX(current, recoveredWorkAttempt) — see below for why
+//     that is provably equivalent given loadStaleControllerBasisTx's own
+//     NULL-or-mismatch-only selection). WHEN the next real cycle's
+//     freshly-derived Snapshot happens to re-derive the IDENTICAL basis (a
+//     fast restart, or any Situation whose material facts are not
+//     time-sensitive), this makes BeginControllerAttempt's sameBasis
+//     comparison match, so it correctly computes workAttempts+1 —
+//     continuing the SAME attempt budget the crashed call already spent one
+//     slot of, exactly as if the crash had never happened.
+//
+//     Why a plain assignment, not MAX: loadStaleControllerBasisTx (Task 10
+//     fix round 3, Finding C1) now selects a Situation ONLY when
+//     current_material_fact_hash is NULL or differs from the
+//     most-recently-dispatched call's own material_fact_hash — it no longer
+//     also matches "same hash, counter behind" (that disjunct was itself
+//     the bug; see loadStaleControllerBasisTx's own doc comment). And
+//     BeginControllerAttempt always commits controller_work_attempts, in
+//     its own transaction, BEFORE the corresponding situation_assessment_calls
+//     row is even inserted (see BeginControllerAttempt's own doc comment) —
+//     so at the moment this function reads/writes, controller_work_attempts
+//     is ALWAYS already exactly recoveredWorkAttempt: nothing else can have
+//     changed it since that same BeginControllerAttempt call (no live claim
+//     is held on a Situation this recovery pass selects — see the safety
+//     paragraph below — and the recovered call is by construction this
+//     Situation's own most-recently-dispatched one). MAX(current,
+//     recoveredWorkAttempt) and a plain `= recoveredWorkAttempt` therefore
+//     write the identical value for every row this query can select;
+//     confirmed by hand-tracing all three pre-existing regression tests
+//     (TestRecoverInterruptedAssessmentCallAdvancesBasisSoNextAttemptDoesNotCollide,
+//     TestRecoverInterruptedAssessmentCallsCatchUpStaleBasisAfterResolvedRejectedOutcome,
+//     TestRecoverInterruptedAssessmentCallClearsStalePolicyParkOnBasisAdvance)
+//     plus the new C1 regression test.
 //
 //  2. controller_retry_epoch = controller_retry_epoch + 1, UNCONDITIONALLY
 //     — even though write 1 above handles the same-basis case on its own.
@@ -1202,7 +1250,7 @@ func advanceControllerBasisForRecoveryTx(ctx context.Context, tx *sql.Tx, situat
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE situations SET
 			current_material_fact_hash = ?,
-			controller_work_attempts = MAX(controller_work_attempts, ?),
+			controller_work_attempts = ?,
 			controller_retry_epoch = controller_retry_epoch + 1,
 			controller_parked_at = NULL, controller_parked_reason = NULL,
 			updated_at = ?
@@ -1307,23 +1355,55 @@ func mergeSituationDueReasonTx(ctx context.Context, tx *sql.Tx, situationID stri
 //
 // sameBasis compares materialFactHash against the CURRENTLY PERSISTED
 // current_material_fact_hash (normally last set by a prior fenced
-// CommitController commit — never written here, in BeginControllerAttempt
-// itself; also written by advanceControllerBasisForRecoveryTx, under
-// RecoverInterruptedAssessmentCalls' own distinct startup-only recovery
-// contract — see that function's doc comment for why that write is safe):
-// unchanged means this is a continuation of the same input's attempt budget
-// (work_attempts+1, fenced at 5); changed
-// means a fresh epoch (work_attempts resets to 1) — this covers BOTH "a
-// genuinely new material input arrived" and "a dependency-recovery
-// generation already reset controller_work_attempts to 0 for this
-// situation" (see the dependency-recovery wake primitive below) — either
-// way, current_material_fact_hash still reads as unchanged from THIS
-// input's own perspective, controller_work_attempts reads 0, and 0+1=1
-// naturally starts a fresh attempt count. controller_retry_epoch is
-// returned read-only — BeginControllerAttempt itself never writes it;
-// wakeOneDependencyRecoveredSituationTx and advanceControllerBasisForRecoveryTx
+// CommitController commit; also written by advanceControllerBasisForRecoveryTx,
+// under RecoverInterruptedAssessmentCalls' own distinct startup-only
+// recovery contract — see that function's doc comment for why that write is
+// safe): unchanged means this is a continuation of the same input's attempt
+// budget (work_attempts+1, fenced at 5); changed means a fresh epoch
+// (work_attempts resets to 1) — this covers BOTH "a genuinely new material
+// input arrived" and "a dependency-recovery generation already reset
+// controller_work_attempts to 0 for this situation" (see the
+// dependency-recovery wake primitive below) — either way,
+// current_material_fact_hash still reads as unchanged from THIS input's own
+// perspective, controller_work_attempts reads 0, and 0+1=1 naturally starts
+// a fresh attempt count.
+//
+// controller_retry_epoch (Task 10 fix round 3, Finding I1): BeginControllerAttempt
+// now ALSO advances this, in the SAME transaction as controller_work_attempts,
+// but only when currentHash.Valid && currentHash.String != materialFactHash
+// — a genuine transition from one previously-committed basis to a different
+// one. It is deliberately NOT bumped when currentHash.Valid is false (this
+// Situation's controller has never committed at all — nothing exists yet to
+// collide with; TestControllerAttemptFirstCallStartsAtOne asserts
+// retryEpoch == 0 on exactly this first-ever call, and that expectation is
+// correct). The reason this is needed at all: current_material_fact_hash
+// only changes at a CommitController commit, but MaterialFactHash is
+// time-derived (e.g. current_duration's DurationClass can cross a boundary
+// between two ordinary, non-crashed reconcile cycles at the SAME
+// input_version — see facts.go/snapshot.go) — so two back-to-back
+// NON-crashed cycles can each independently derive a different hash, both
+// see sameBasis == false against the PRIOR cycle's committed hash, and
+// without an epoch bump both would compute work_attempt = 1 at the SAME
+// retry_epoch, colliding on situation_assessment_calls' own
+// UNIQUE(situation_id, input_version, retry_epoch, work_attempt,
+// call_number) index — the same collision class `2e6fa67`'s
+// crash-recovery fix addressed, but reachable here with no crash at all.
+// This mirrors exactly what wakeOneDependencyRecoveredSituationTx and
+// advanceControllerBasisForRecoveryTx already do for their own "this
+// Situation's coordinate space needs a fresh generation" cases — reusing
+// the SAME mechanism here rather than inventing a second one. It does not
+// conflict with either: wakeOneDependencyRecoveredSituationTx's own epoch
+// bump happens BEFORE the next BeginControllerAttempt call (which then sees
+// currentHash.Valid == true, hash unchanged from the wake's own perspective
+// — sameBasis true — so this new branch does not additionally fire); and
+// advanceControllerBasisForRecoveryTx's own epoch bump is a startup-only
+// recovery write with no live claim in play, entirely disjoint in time from
+// any live BeginControllerAttempt call. controller_retry_epoch has three
+// writers now: BeginControllerAttempt (this, narrowly conditioned),
+// wakeOneDependencyRecoveredSituationTx, and advanceControllerBasisForRecoveryTx
 // (RecoverInterruptedAssessmentCalls' own recovery-only write — see that
-// function's doc comment) are its only two writers.
+// function's doc comment). The NEW epoch value (not the stale read) is what
+// gets returned.
 //
 // Returns situation.ErrControllerAttemptsExhausted (not a generic error)
 // when advancing would exceed 5 — Reconcile treats that as "already
@@ -1359,22 +1439,31 @@ func (s *Store) BeginControllerAttempt(ctx context.Context, claim situation.Clai
 	}
 
 	nextAttempt := 1
+	nextEpoch := retryEpoch
 	if currentHash.Valid && currentHash.String == materialFactHash {
 		nextAttempt = workAttempts + 1
+	} else if currentHash.Valid {
+		// A genuine transition from an old, previously-committed basis to a
+		// different one (never on this Situation's first-ever dispatch,
+		// where currentHash.Valid is false) — advance the epoch so this
+		// fresh work_attempt=1 gets a never-before-used coordinate, even
+		// across two back-to-back, entirely non-crashed cycles (Finding
+		// I1 — see the doc comment above).
+		nextEpoch = retryEpoch + 1
 	}
 	if nextAttempt > 5 {
 		return 0, 0, situation.ErrControllerAttemptsExhausted
 	}
 
 	if _, err := tx.ExecContext(ctx, `
-		UPDATE situations SET controller_work_attempts = ?, updated_at = ? WHERE id = ?`,
-		nextAttempt, canonicalTime(now), claim.Situation.ID); err != nil {
+		UPDATE situations SET controller_work_attempts = ?, controller_retry_epoch = ?, updated_at = ? WHERE id = ?`,
+		nextAttempt, nextEpoch, canonicalTime(now), claim.Situation.ID); err != nil {
 		return 0, 0, fmt.Errorf("store: advance controller attempt counter: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, 0, fmt.Errorf("store: commit begin controller attempt: %w", err)
 	}
-	return retryEpoch, nextAttempt, nil
+	return nextEpoch, nextAttempt, nil
 }
 
 // ----------------------------------------------------------------------

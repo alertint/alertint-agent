@@ -690,6 +690,200 @@ func TestRecoverInterruptedAssessmentCallClearsStalePolicyParkOnBasisAdvance(t *
 	}
 }
 
+// TestRecoverInterruptedAssessmentCallDoesNotReExhaustFreshlyWokenSituation
+// is the Task 10 fix round 3 regression test for Finding C1: the reviewer's
+// own empirical probe that caught a Critical regression in loadStaleControllerBasisTx's
+// now-removed "s.controller_work_attempts < c.work_attempt" disjunct. A
+// Situation that genuinely exhausted its 5-attempt budget for one basis,
+// then got dependency-parked, then WOKE via WakeDependencyRecoveredSituations
+// (which resets controller_work_attempts to 0, bumps the epoch, and clears
+// the park — while deliberately leaving current_material_fact_hash
+// untouched, since a dependency-unavailability park has nothing to do with
+// the input basis) must NOT have any of that undone by a
+// RecoverInterruptedAssessmentCalls pass that runs immediately after, before
+// any new dispatch occurs — even though the old (exhausted) call still sits
+// at "same hash, counter behind" relative to the freshly-reset counter. The
+// removed disjunct matched exactly this state and
+// advanceControllerBasisForRecoveryTx's MAX(...) write silently restored
+// controller_work_attempts back up to the OLD call's own work_attempt (5),
+// permanently stranding the Situation exhausted and unparked.
+func TestRecoverInterruptedAssessmentCallDoesNotReExhaustFreshlyWokenSituation(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-wake-then-recover", now)
+	materialHash := "sha256:material-" + sitID
+
+	// Reach a genuine exhausted state for materialHash: four ordinary
+	// projection-only cycles, then a real 5th dispatch with a durably
+	// recorded (non-orphaned) rejected outcome and a real commit closing
+	// that cycle — establishing BOTH current_material_fact_hash =
+	// materialHash and a real situation_assessment_calls row at
+	// work_attempt=5 under that SAME hash, with no crash anywhere yet.
+	for want := 1; want <= 4; want++ {
+		c := claimSituation(t, st, sitID, "controller-a", now)
+		if _, workAttempt := beginAttemptThenCommitProjectionOnly(t, st, c, materialHash, now); workAttempt != want {
+			t.Fatalf("attempt %d: workAttempt = %d, want %d", want, workAttempt, want)
+		}
+	}
+	finalClaim := claimSituation(t, st, sitID, "controller-a", now)
+	_, workAttempt5, err := st.BeginControllerAttempt(context.Background(), finalClaim, materialHash, now)
+	if err != nil {
+		t.Fatalf("BeginControllerAttempt (5th): %v", err)
+	}
+	if workAttempt5 != 5 {
+		t.Fatalf("workAttempt = %d, want 5", workAttempt5)
+	}
+	call := callFixture(uuid.NewString(), sitID, finalClaim.Situation.InputVersion, workAttempt5, 1, now)
+	if err := st.RecordAssessmentCall(context.Background(), finalClaim, call); err != nil {
+		t.Fatalf("record 5th call: %v", err)
+	}
+	started := situationmodel.ProviderRequestStartedTrue
+	outcome := situation.AssessmentAttempt{
+		ID: uuid.NewString(), SituationID: sitID, CallID: &call.ID,
+		InputVersion: finalClaim.Situation.InputVersion, WorkAttempt: workAttempt5, Sequence: 1,
+		Status:                 "rejected",
+		ValidationErrors:       json.RawMessage(`["dependency_unavailable"]`),
+		ProviderRequestStarted: &started,
+		CreatedAt:              now, CompletedAt: now.Add(time.Second),
+	}
+	if err := st.AppendAssessmentOutcome(context.Background(), outcome); err != nil {
+		t.Fatalf("append 5th outcome: %v", err)
+	}
+	commit5 := situation.ControllerCommit{
+		MaterialFactHash: materialHash, Lifecycle: situationmodel.LifecycleActive, Attention: situationmodel.AttentionObserve,
+		NextAssessmentAt: now,
+	}
+	if err := st.CommitController(context.Background(), finalClaim, commit5); err != nil {
+		t.Fatalf("commit 5th cycle: %v", err)
+	}
+
+	// Genuinely dependency-park it (mirrors what a real exhausted-attempts
+	// dependency park would leave behind: controller_work_attempts=5,
+	// controller_parked_reason=dependency).
+	parkSituationTx(t, st, sitID, situation.ParkedReasonDependency, 1, now)
+
+	woken, err := st.WakeDependencyRecoveredSituations(context.Background(), 2, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("WakeDependencyRecoveredSituations: %v", err)
+	}
+	if woken != 1 {
+		t.Fatalf("woken = %d, want 1", woken)
+	}
+
+	readState := func() (workAttempts int, parkedReason sql.NullString) {
+		t.Helper()
+		if err := st.db.QueryRowContext(context.Background(), `
+			SELECT controller_work_attempts, controller_parked_reason FROM situations WHERE id = ?`, sitID).
+			Scan(&workAttempts, &parkedReason); err != nil {
+			t.Fatal(err)
+		}
+		return workAttempts, parkedReason
+	}
+
+	workAttempts, parkedReason := readState()
+	if workAttempts != 0 {
+		t.Fatalf("work_attempts after wake = %d, want 0 (reset)", workAttempts)
+	}
+	if parkedReason.Valid {
+		t.Fatalf("parked_reason after wake = %v, want cleared", parkedReason)
+	}
+
+	// Simulate a restart happening immediately after the wake, before any
+	// new dispatch occurs: zero actually-interrupted/orphaned calls exist
+	// for this Situation (the only dispatched call already has a real
+	// recorded outcome, so loadOrphanedAssessmentCallsTx's own
+	// outcome-less definition never matches it either).
+	recovered, err := st.RecoverInterruptedAssessmentCalls(context.Background(), now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("recover interrupted assessment calls: %v", err)
+	}
+	if recovered != 0 {
+		t.Fatalf("recovered = %d, want 0 (no actually-interrupted calls exist for this situation)", recovered)
+	}
+
+	workAttempts, parkedReason = readState()
+	if workAttempts != 0 {
+		t.Fatalf("work_attempts after post-wake recovery pass = %d, want unchanged 0 (C1 regression: a recovery pass must not re-exhaust a freshly-woken situation)", workAttempts)
+	}
+	if parkedReason.Valid {
+		t.Fatalf("parked_reason after post-wake recovery pass = %v, want unchanged nil (C1 regression: a recovery pass must not re-park a freshly-woken situation)", parkedReason)
+	}
+}
+
+// TestControllerAttemptCrashFreeHashChangeAdvancesEpochAvoidingCollision is
+// the Task 10 fix round 3 regression test for Finding I1: the bug `2e6fa67`
+// targeted (a colliding situation_assessment_calls row) is also reachable
+// with NO crash or restart at all. MaterialFactHash is time-derived (e.g.
+// current_duration's DurationClass can cross a boundary between two
+// ordinary reconcile cycles at the SAME input_version — see
+// facts.go/snapshot.go), so two back-to-back NON-crashed cycles can each
+// independently derive a different hash, both see sameBasis == false
+// against the PRIOR cycle's own committed hash, and — before this fix round
+// — both computed work_attempt=1 at the SAME retry_epoch (which
+// BeginControllerAttempt never advanced), colliding on
+// situation_assessment_calls' own UNIQUE(situation_id, input_version,
+// retry_epoch, work_attempt, call_number) index exactly like the crash case
+// did. This test reproduces the two-cycle sequence directly, with a real
+// CommitController committing the first cycle's hash in between and NO
+// crash/RecoverInterruptedAssessmentCalls call anywhere, and asserts the
+// second call's returned retryEpoch differs from the first, and that
+// dispatching a real RecordAssessmentCall for each (using the REAL
+// retryEpoch/workAttempt values each call returned) succeeds for both
+// without a UNIQUE-index collision.
+func TestControllerAttemptCrashFreeHashChangeAdvancesEpochAvoidingCollision(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-begin-attempt-crash-free-epoch", now)
+
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+	hash1 := "sha256:material-a"
+	retryEpoch1, workAttempt1, err := st.BeginControllerAttempt(context.Background(), claim, hash1, now)
+	if err != nil {
+		t.Fatalf("BeginControllerAttempt (1st): %v", err)
+	}
+	if workAttempt1 != 1 {
+		t.Fatalf("workAttempt1 = %d, want 1", workAttempt1)
+	}
+
+	call1 := callFixture(uuid.NewString(), sitID, claim.Situation.InputVersion, workAttempt1, 1, now)
+	call1.MaterialFactHash = hash1
+	call1.RetryEpoch = retryEpoch1
+	if err := st.RecordAssessmentCall(context.Background(), claim, call1); err != nil {
+		t.Fatalf("record call 1: %v", err)
+	}
+	commit1 := situation.ControllerCommit{
+		MaterialFactHash: hash1, Lifecycle: situationmodel.LifecycleActive, Attention: situationmodel.AttentionObserve,
+		NextAssessmentAt: now,
+	}
+	if err := st.CommitController(context.Background(), claim, commit1); err != nil {
+		t.Fatalf("commit cycle 1: %v", err)
+	}
+
+	// A second, entirely NON-crashed cycle at the SAME input_version derives
+	// a DIFFERENT material hash (e.g. a time-derived DurationClass boundary
+	// crossed between two ordinary reconcile cycles). No crash, no
+	// RecoverInterruptedAssessmentCalls call anywhere in this test.
+	reclaim := claimSituation(t, st, sitID, "controller-b", now)
+	hash2 := "sha256:material-b"
+	retryEpoch2, workAttempt2, err := st.BeginControllerAttempt(context.Background(), reclaim, hash2, now)
+	if err != nil {
+		t.Fatalf("BeginControllerAttempt (2nd): %v", err)
+	}
+	if workAttempt2 != 1 {
+		t.Fatalf("workAttempt2 = %d, want 1 (new basis resets the attempt budget)", workAttempt2)
+	}
+	if retryEpoch2 == retryEpoch1 {
+		t.Fatalf("retryEpoch2 = %d, want different from retryEpoch1 = %d (I1: a crash-free basis transition at the same input_version must still get a fresh coordinate space)", retryEpoch2, retryEpoch1)
+	}
+
+	call2 := callFixture(uuid.NewString(), sitID, reclaim.Situation.InputVersion, workAttempt2, 1, now)
+	call2.MaterialFactHash = hash2
+	call2.RetryEpoch = retryEpoch2
+	if err := st.RecordAssessmentCall(context.Background(), reclaim, call2); err != nil {
+		t.Fatalf("record call 2: %v (want no UNIQUE-index collision against call 1)", err)
+	}
+}
+
 func TestRecoverInterruptedAssessmentCallLeavesActivelyClaimedCallsUntouched(t *testing.T) {
 	st := newTestStore(t)
 	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
