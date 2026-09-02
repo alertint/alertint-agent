@@ -85,11 +85,24 @@ type AssessmentAttempt struct {
 // coverage tuples it recorded.
 type AuthoritativeAssessment struct {
 	ID, SituationID, AssessmentBasisHash string
-	InputVersion                         int
-	Assessment                           model.Assessment
-	Coverage                             []model.IncidentCoverage
-	Derivation                           model.AssessmentDerivation
-	ReusedFromAssessmentID               *string
+	// MaterialFactHash is the attempt's own situation_assessment_attempts.
+	// material_fact_hash column — the exact material fact hash this
+	// authoritative Assessment was derived against. Added for Task 6: the
+	// B+ Triage skip decision must compare a trustworthy Assessment's own
+	// material fact hash against the CURRENT Snapshot's MaterialFactHash
+	// (spec: "skip only when a trustworthy Assessment covers the unchanged
+	// material fact hash and current membership and Incident-input
+	// digests") — a check distinct from, and stricter-scoped than,
+	// AssessmentBasisHash equality (which RevalidateReuse uses for a
+	// different purpose: whether the whole reuse-eligible basis, including
+	// eligible reasons/lifecycle/attention/floor/schema versions, is
+	// unchanged).
+	MaterialFactHash       string
+	InputVersion           int
+	Assessment             model.Assessment
+	Coverage               []model.IncidentCoverage
+	Derivation             model.AssessmentDerivation
+	ReusedFromAssessmentID *string
 }
 
 // TriageDecision is one Incident's request/skip Acute Triage decision, made

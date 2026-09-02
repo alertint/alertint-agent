@@ -329,9 +329,9 @@ func loadAuthoritativeAssessmentTx(ctx context.Context, tx *sql.Tx, attemptID st
 	var derivation, assessmentJSON string
 	var reusedFrom sql.NullString
 	err := tx.QueryRowContext(ctx, `
-		SELECT situation_id, input_version, assessment_basis_hash, derivation, assessment_json, reused_from_assessment_id
+		SELECT situation_id, input_version, assessment_basis_hash, material_fact_hash, derivation, assessment_json, reused_from_assessment_id
 		FROM situation_assessment_attempts WHERE id = ? AND status = 'authoritative'`, attemptID).
-		Scan(&a.SituationID, &a.InputVersion, &basisHash, &derivation, &assessmentJSON, &reusedFrom)
+		Scan(&a.SituationID, &a.InputVersion, &basisHash, &a.MaterialFactHash, &derivation, &assessmentJSON, &reusedFrom)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("store: authoritative assessment %s: %w", attemptID, ErrNotFound)
 	}

@@ -708,7 +708,8 @@ func authoritativeFrom(t *testing.T, res AssessmentResult, id string, now time.T
 	}
 	return AuthoritativeAssessment{
 		ID: id, SituationID: "situation-1", AssessmentBasisHash: res.AssessmentBasisHash,
-		InputVersion: res.InputVersion, Assessment: res.Assessment, Coverage: res.Coverage,
+		MaterialFactHash: res.MaterialFactHash,
+		InputVersion:     res.InputVersion, Assessment: res.Assessment, Coverage: res.Coverage,
 		Derivation: res.Derivation,
 	}
 }

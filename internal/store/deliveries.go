@@ -620,14 +620,21 @@ func applyDuplicateCorrelatedDeliveryTx(ctx context.Context, tx *sql.Tx, m Corre
 }
 
 // MarkIncidentReadyWithSituationInput atomically transitions incidentID from
-// "collecting" to "ready" and appends its one delivery-independent
+// "collecting" to "ready", appends its one delivery-independent
 // incident_ready Situation input (idempotency key "incident-ready:<incident
-// id>") in the same commit. An already-"ready" Incident carrying the
-// matching input is a successful no-op — the idempotent replay a crash
-// between this method's commit and its caller's next step would produce.
-// Any other Incident state — "processing", "analyzed", "resolved",
-// "failed", or no such Incident at all — is ErrNotFound. This method does
-// not seed, begin, or complete incident_triage.
+// id>"), and creates its awaiting_decision Acute Triage schedule row at
+// attempt zero — all in the same commit (Task 6: "ready and schedule
+// awaiting_decision are committed together"). Every ready Incident begins in
+// awaiting_decision; no dispatch can happen before a controller decision
+// (Task 8's CommitController, via the unexported applyTriageDecisionsTx)
+// moves it to pending. An already-"ready" Incident carrying the matching
+// input is a successful no-op — the idempotent replay a crash between this
+// method's commit and its caller's next step would produce; INSERT OR
+// IGNORE on the schedule row makes that replay safe even if a prior attempt
+// committed the ready transition/input but crashed before this method
+// itself returned. Any other Incident state — "processing", "analyzed",
+// "resolved", "failed", or no such Incident at all — is ErrNotFound. This
+// method does not begin or complete incident_triage.
 func (s *Store) MarkIncidentReadyWithSituationInput(ctx context.Context, incidentID string, now time.Time) error {
 	if strings.TrimSpace(incidentID) == "" {
 		return errors.New("store: mark incident ready requires an incident id")
@@ -666,6 +673,9 @@ func (s *Store) MarkIncidentReadyWithSituationInput(ctx context.Context, inciden
 			"situation-input:"+idempotencyKey, idempotencyKey, incidentID, groupKey, canonicalTime(now)); err != nil {
 			return fmt.Errorf("store: insert incident ready situation input: %w", err)
 		}
+		if err := seedAwaitingDecisionTriageTx(ctx, tx, incidentID, now); err != nil {
+			return err
+		}
 	case "ready":
 		var exists int
 		err := tx.QueryRowContext(ctx, `SELECT 1 FROM situation_input_outbox WHERE idempotency_key = ?`, idempotencyKey).Scan(&exists)
@@ -675,8 +685,13 @@ func (s *Store) MarkIncidentReadyWithSituationInput(ctx context.Context, inciden
 		if err != nil {
 			return fmt.Errorf("store: check incident ready situation input: %w", err)
 		}
-		// Idempotent no-op: the ready transition and its input already
-		// committed together; fall through and commit without changes.
+		// Idempotent no-op for the ready transition and its input, which
+		// already committed together; the schedule row insert below is
+		// itself INSERT-OR-IGNORE, repairing a crash that landed between
+		// this method's own two inserts on an earlier call.
+		if err := seedAwaitingDecisionTriageTx(ctx, tx, incidentID, now); err != nil {
+			return err
+		}
 	default:
 		return ErrNotFound
 	}

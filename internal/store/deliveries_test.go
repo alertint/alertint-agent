@@ -685,6 +685,49 @@ func TestMarkIncidentReadyWithSituationInputIsAtomicAndIdempotent(t *testing.T) 
 	assertQueryCount(t, st.DB(), `SELECT COUNT(*) FROM situation_input_outbox WHERE idempotency_key=? AND kind='incident_ready'`, 1, "incident-ready:inc-ready")
 }
 
+// TestMarkIncidentReadyWithSituationInputCreatesAwaitingDecisionSchedule
+// pins Task 6's core mandate: the ready transition and the Acute Triage
+// awaiting_decision schedule row commit together, in one transaction, at
+// attempt zero — "every ready Incident begins in awaiting_decision."
+// Replaying the call (the idempotent "ready" branch) must not duplicate or
+// disturb that row.
+func TestMarkIncidentReadyWithSituationInputCreatesAwaitingDecisionSchedule(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 2, 5, 0, 0, time.UTC)
+	insertCollectingIncident(t, st, "inc-ready-schedule", "service=api", now.Add(-time.Minute))
+
+	if err := st.MarkIncidentReadyWithSituationInput(ctx, "inc-ready-schedule", now); err != nil {
+		t.Fatal(err)
+	}
+	var phase string
+	var attempts int
+	var situationID sql.NullString
+	if err := st.DB().QueryRowContext(ctx, `SELECT phase, attempts, situation_id FROM incident_triage WHERE incident_id = ?`, "inc-ready-schedule").
+		Scan(&phase, &attempts, &situationID); err != nil {
+		t.Fatalf("read incident_triage row: %v", err)
+	}
+	if phase != "awaiting_decision" || attempts != 0 {
+		t.Fatalf("phase=%q attempts=%d, want awaiting_decision/0", phase, attempts)
+	}
+	if situationID.Valid {
+		t.Fatalf("situation_id = %v, want null (no controller decision has run yet)", situationID)
+	}
+
+	// Idempotent replay must not disturb the row.
+	if err := st.MarkIncidentReadyWithSituationInput(ctx, "inc-ready-schedule", now); err != nil {
+		t.Fatal(err)
+	}
+	assertQueryCount(t, st.DB(), `SELECT COUNT(*) FROM incident_triage WHERE incident_id = ?`, 1, "inc-ready-schedule")
+	if err := st.DB().QueryRowContext(ctx, `SELECT phase, attempts FROM incident_triage WHERE incident_id = ?`, "inc-ready-schedule").
+		Scan(&phase, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if phase != "awaiting_decision" || attempts != 0 {
+		t.Fatalf("phase=%q attempts=%d after replay, want unchanged awaiting_decision/0", phase, attempts)
+	}
+}
+
 func TestMarkIncidentReadyWithSituationInputRejectsUnknownIncident(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
