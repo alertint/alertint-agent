@@ -33,7 +33,13 @@ const (
 	promptProfileVersion    = 1
 )
 
-const membershipDigestSchemaVersion = 1
+// membershipDigestSchemaVersion is bumped to 2 (round 2, Task 4 hygiene):
+// round 1 changed MembershipDigest's grouping from delivery identity to
+// Alert identity (Delivery.AlertID) without bumping this constant. A hash
+// produced under the old delivery-level grouping must never be silently
+// treated as compatible with one produced under the current Alert-level
+// grouping.
+const membershipDigestSchemaVersion = 2
 
 type membershipDigestDTO struct {
 	SchemaVersion    int      `json:"schema_version"`
@@ -109,7 +115,14 @@ func incidentDrillParity(scoped []Delivery) bool {
 	return false
 }
 
-const incidentInputDigestSchemaVersion = 1
+// incidentInputDigestSchemaVersion is bumped to 2 (round 2, Task 4 hygiene):
+// round 1 changed incidentDrillParity from a fixed placeholder constant to
+// live per-Incident Delivery.Drill data, and transitively depends on
+// MembershipDigest's now-bumped schema, without bumping this constant. A
+// hash produced under the old drill-parity-constant/delivery-level-
+// membership shape must never be silently treated as compatible with one
+// produced under the current live-data shape.
+const incidentInputDigestSchemaVersion = 2
 
 type incidentInputDeliveryDTO struct {
 	ID               string     `json:"id"`

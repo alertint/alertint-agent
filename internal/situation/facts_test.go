@@ -387,6 +387,54 @@ func TestMaterialFactHashOrderIndependentOfIncidentAndPriorSituationRowOrder(t *
 	}
 }
 
+// TestMaterialFactHashStableAcrossInputVersion is round 2's Finding B
+// regression: Situation.InputVersion increments on every applied Situation
+// input (every delivery correlation, every Triage outcome, every controller
+// commit), so a hash meant to answer "did anything MATERIAL change" must
+// return the IDENTICAL value across two SnapshotInputs that differ ONLY in
+// Situation.InputVersion, all other fields held constant. Before this fix,
+// materialFactHashDTO carried InputVersion directly, so MaterialFactHash —
+// and, transitively through it, AssessmentBasisHash — could never equal
+// itself across two input versions of the same Situation, defeating the
+// entire reuse guarantee even when nothing material changed.
+func TestMaterialFactHashStableAcrossInputVersion(t *testing.T) {
+	in := baseSnapshotInput(t)
+	h1 := materialHashFor(t, in)
+
+	bumped := in
+	bumped.Situation.InputVersion = in.Situation.InputVersion + 1
+	h2 := materialHashFor(t, bumped)
+
+	if h1 != h2 {
+		t.Fatal("Situation.InputVersion alone changed material fact hash — a hash answering \"did anything material change\" must not itself contain the ingredient that changes on every reconciliation by definition")
+	}
+}
+
+// TestMaterialFactHashUnchangedByRoutineResendSameAlert is round 2's Finding
+// C regression: a routine Alertmanager re-send (a new immutable
+// alert_deliveries row, same AlertID, same Incident, everything else about
+// the Incident's state unchanged) must not change MaterialFactHash. Before
+// this fix, materialIncidentDTO embedded the full delivery-level
+// IncidentInputDigest, which — by spec's own design — churns on every new
+// delivery row even when it names an Alert already counted as a member; only
+// MembershipDigest (Alert-identity, not delivery-identity) belongs in the
+// per-Incident materiality question.
+func TestMaterialFactHashUnchangedByRoutineResendSameAlert(t *testing.T) {
+	in := baseSnapshotInput(t)
+	h1 := materialHashFor(t, in)
+
+	resent := in
+	resent.Deliveries = append([]Delivery{}, in.Deliveries...)
+	resend := deliveryFor("delivery-1-resend", "incident-1", "payload-digest-1", in.Now)
+	resend.AlertID = in.Deliveries[0].AlertID // same underlying Alert re-firing, not a new member
+	resent.Deliveries = append(resent.Deliveries, resend)
+	h2 := materialHashFor(t, resent)
+
+	if h1 != h2 {
+		t.Fatal("a routine re-send (new delivery row, same AlertID, same Incident) changed material fact hash — Incident membership (which Alerts belong), not the delivery-level input digest, is what's material for Assessment-reuse purposes")
+	}
+}
+
 func TestMaterialFactHashDTOIncludesSchemaAndFactSchemaVersions(t *testing.T) {
 	base := materialFactHashDTO{SchemaVersion: 1, FactSchemaVersion: 1}
 

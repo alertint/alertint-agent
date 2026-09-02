@@ -116,14 +116,61 @@ func TestEligibleReasonsCriticalAnchorIneligibleWhenSeverityBelowCritical(t *tes
 }
 
 func TestEligibleReasonsCriticalAnchorIneligibleWhenCriticalSeverityIsResolvedOnly(t *testing.T) {
-	// A resolved delivery no longer confirms an *active* critical severity —
-	// criticalAnchorEligible requires DeliveryStatusFiring.
+	// A real firing-then-resolved sequence for the SAME Alert: delivery-1
+	// fires critical at T0, delivery-2 (same AlertID, chronologically later)
+	// resolves at T1. criticalAnchorEligible must look at each Alert's
+	// LATEST delivery, not "was any delivery for this Alert ever firing
+	// critical" — an Alert that has since resolved must not keep confirming
+	// an active critical severity forever.
 	in := baseSnapshotInput(t)
-	in.Deliveries = append([]Delivery{}, in.Deliveries...)
-	in.Deliveries[0].Severity = "critical"
-	in.Deliveries[0].Status = model.DeliveryStatusResolved
+	start := in.Situation.EffectiveStartedAt
+
+	firing := deliveryFor("delivery-1", "incident-1", "payload-digest-1", start)
+	firing.AlertID = "alert-A"
+	firing.Severity = "critical"
+	firing.Status = model.DeliveryStatusFiring
+
+	resolved := deliveryFor("delivery-2", "incident-1", "payload-digest-1", start.Add(time.Minute))
+	resolved.AlertID = "alert-A"
+	resolved.Severity = "critical"
+	resolved.Status = model.DeliveryStatusResolved
+
+	in.Deliveries = []Delivery{firing, resolved}
 	if criticalAnchorEligible(in.Deliveries) {
-		t.Fatal("critical_anchor must not be eligible when the only critical-severity delivery is resolved, not firing")
+		t.Fatal("critical_anchor must not be eligible when the same Alert's LATEST delivery has resolved, even though an earlier delivery for that Alert was firing critical")
+	}
+}
+
+// TestEligibleReasonsCriticalAnchorEligibleOnRecoveryThenRefire is the
+// inverse of the resolved-only case above: an earlier RESOLVED delivery
+// followed by a chronologically LATER FIRING critical delivery for the same
+// Alert (a recovery, then a re-fire). The original "ever fired critical"
+// latching bug would have accidentally passed this case too (it never
+// checked recency), so this test alone would not prove the fix — what makes
+// it a real regression test is that it also fails under the most likely
+// *wrong* fix: grouping by AlertID but picking the EARLIEST delivery per
+// Alert (mirroring MembershipDigest's FirstDeliveryIDs pattern instead of
+// its opposite). Under that wrong fix, the earliest delivery for alert-A is
+// the resolved one, and this predicate would wrongly return false. Only
+// selecting each Alert's LATEST delivery by deliveryLess gets both this test
+// and the resolved-only test above correct at once.
+func TestEligibleReasonsCriticalAnchorEligibleOnRecoveryThenRefire(t *testing.T) {
+	in := baseSnapshotInput(t)
+	start := in.Situation.EffectiveStartedAt
+
+	resolved := deliveryFor("delivery-1", "incident-1", "payload-digest-1", start)
+	resolved.AlertID = "alert-A"
+	resolved.Severity = "critical"
+	resolved.Status = model.DeliveryStatusResolved
+
+	firing := deliveryFor("delivery-2", "incident-1", "payload-digest-1", start.Add(time.Minute))
+	firing.AlertID = "alert-A"
+	firing.Severity = "critical"
+	firing.Status = model.DeliveryStatusFiring
+
+	in.Deliveries = []Delivery{resolved, firing}
+	if !criticalAnchorEligible(in.Deliveries) {
+		t.Fatal("critical_anchor must be eligible when the same Alert's LATEST delivery is firing critical, even though an earlier delivery for that Alert had resolved")
 	}
 }
 

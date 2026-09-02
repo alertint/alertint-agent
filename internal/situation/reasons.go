@@ -163,8 +163,23 @@ func reasonCandidateID(situationID string, inputVersion int, code string, catalo
 // per-delivery severity label the store layer extracts from
 // alert_deliveries.labels_json (see snapshot.go's Delivery doc comment);
 // this function, not the store, decides what counts as critical.
+//
+// "Currently firing" is evaluated per distinct Alert (Delivery.AlertID), not
+// per delivery row: only each Alert's chronologically LATEST delivery (by
+// deliveryLess' same total order MembershipDigest uses for the MINIMUM
+// element per AlertID — here we need the MAXIMUM) can prove that Alert is
+// still active. An Alert whose latest delivery has resolved must not count,
+// even if an earlier delivery for that same Alert was firing critical — that
+// earlier state has since been superseded, not merely supplemented.
 func criticalAnchorEligible(deliveries []Delivery) bool {
+	latestByAlert := make(map[string]Delivery, len(deliveries))
 	for _, d := range deliveries {
+		cur, ok := latestByAlert[d.AlertID]
+		if !ok || deliveryLess(cur, d) {
+			latestByAlert[d.AlertID] = d
+		}
+	}
+	for _, d := range latestByAlert {
 		if d.Status == model.DeliveryStatusFiring && severity.Rank(d.Severity) >= 4 {
 			return true
 		}

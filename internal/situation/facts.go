@@ -26,9 +26,18 @@ import (
 // hash's included-field set, or the Assessment validator's rules change in
 // a way that must invalidate old reuse/hash comparisons.
 const (
-	factSchemaVersion                = 1
-	materialFactHashSchemaVersion    = 1
-	assessmentBasisHashSchemaVersion = 1
+	factSchemaVersion = 1
+
+	// materialFactHashSchemaVersion and assessmentBasisHashSchemaVersion are
+	// bumped to 2 (round 2, Task 4): materialFactHashDTO's included-field set
+	// changed (Situation.InputVersion removed; per-Incident materiality is
+	// now MembershipDigest alone, not the delivery-level IncidentInputDigest)
+	// — see MaterialFactHash's doc comment. assessmentBasisHashDTO's own
+	// shape did not change, but it embeds MaterialFactHash's output string
+	// directly, so a hash produced before this fix must never be silently
+	// treated as compatible with one produced after it.
+	materialFactHashSchemaVersion    = 2
+	assessmentBasisHashSchemaVersion = 2
 
 	// assessmentValidatorVersion tracks Task 5's ValidateAssessmentProposal
 	// rule set. Task 4 has no validator of its own; this placeholder lets
@@ -494,10 +503,9 @@ type materialSymptomDTO struct {
 }
 
 type materialIncidentDTO struct {
-	IncidentID          string  `json:"incident_id"`
-	MembershipDigest    string  `json:"membership_digest"`
-	IncidentInputDigest string  `json:"incident_input_digest"`
-	TriageOutcomeClass  *string `json:"triage_outcome_class"`
+	IncidentID         string  `json:"incident_id"`
+	MembershipDigest   string  `json:"membership_digest"`
+	TriageOutcomeClass *string `json:"triage_outcome_class"`
 	// TriageOutputDigest is LatestAttempt.OutputDigest — the normalized
 	// Finding *content* digest, present whenever LatestAttempt is (see
 	// acute_finding's OutputDigest field for the same source). spec.md's
@@ -546,7 +554,6 @@ type materialFactHashDTO struct {
 	SchemaVersion              int                          `json:"schema_version"`
 	FactSchemaVersion          int                          `json:"fact_schema_version"`
 	SituationID                string                       `json:"situation_id"`
-	InputVersion               int                          `json:"input_version"`
 	DurationClass              string                       `json:"duration_class"`
 	DurationThresholdCrossedAt time.Time                    `json:"duration_threshold_crossed_at"`
 	Symptoms                   []materialSymptomDTO         `json:"symptoms"`
@@ -558,15 +565,36 @@ type materialFactHashDTO struct {
 // MaterialFactHash hashes only the evidence spec.md's "Material fact hash
 // and Assessment basis" section names as decision-relevant: active symptom
 // identity/lifecycle, duration class and threshold-crossing time, per-
-// Incident membership/input digests, normalized Acute Triage outcome class,
-// output digest, and evidence digest, comparable historical duration
-// classes, typed evidence limitations, and fact producer/schema versions. It
-// deliberately excludes exact elapsed seconds, raw payloads/prose,
-// retry/lease/claim state, Triage scheduling phase/attempts/decision
-// metadata (evidence-free machinery, not evidence), and Slack metadata —
-// none of which reach this function's DTO construction, since this function
-// only ever reads the specific fields it curates below rather than hashing
-// SnapshotInput wholesale.
+// Incident membership, normalized Acute Triage outcome class, output digest,
+// and evidence digest, comparable historical duration classes, typed
+// evidence limitations, and fact producer/schema versions. It deliberately
+// excludes exact elapsed seconds, raw payloads/prose, retry/lease/claim
+// state, Triage scheduling phase/attempts/decision metadata (evidence-free
+// machinery, not evidence), and Slack metadata — none of which reach this
+// function's DTO construction, since this function only ever reads the
+// specific fields it curates below rather than hashing SnapshotInput
+// wholesale.
+//
+// Deliberately excludes Situation.InputVersion itself, too: InputVersion
+// increments on every applied Situation input (every delivery correlation,
+// every Triage outcome, every controller commit), so a hash meant to answer
+// "did anything MATERIAL change" must not itself contain the one ingredient
+// that changes on every reconciliation by definition — otherwise the hash
+// could never equal itself across two input versions of the same Situation
+// even when nothing material changed, defeating the whole reuse guarantee
+// this function exists to serve. SituationID is kept (it does not change
+// across a Situation's own input versions, and is useful defense-in-depth
+// against hash collisions across unrelated Situations).
+//
+// Per-Incident materiality is MembershipDigest alone — WHICH Alerts belong
+// to the Incident — not the full IncidentInputDigest (which is, by design,
+// delivery-level granular: sorted immutable delivery identities, payload
+// digests, lifecycle, and source times, for Acute Triage's input-coverage
+// matching, a different question). Embedding the full IncidentInputDigest
+// here would mean every routine Alertmanager re-send of an already-known
+// Alert (a new immutable alert_deliveries row, same AlertID) still changes
+// this hash — reintroducing, one level up, the exact class of problem the
+// round-1 MembershipDigest fix solved for Delivery identity itself.
 func MaterialFactHash(in SnapshotInput, symptoms []Symptom, durationClass string) string {
 	symptomDTOs := make([]materialSymptomDTO, 0, len(symptoms))
 	for _, s := range symptoms {
@@ -577,9 +605,8 @@ func MaterialFactHash(in SnapshotInput, symptoms []Symptom, durationClass string
 	incidentDTOs := make([]materialIncidentDTO, 0, len(in.Incidents))
 	for _, inc := range in.Incidents {
 		d := materialIncidentDTO{
-			IncidentID:          inc.ID,
-			MembershipDigest:    MembershipDigest(inc.ID, in.Deliveries),
-			IncidentInputDigest: IncidentInputDigest(inc.ID, inc.GroupKey, in.Deliveries),
+			IncidentID:       inc.ID,
+			MembershipDigest: MembershipDigest(inc.ID, in.Deliveries),
 		}
 		if la := inc.Triage.LatestAttempt; la != nil {
 			rc := la.ResultCode
@@ -605,7 +632,6 @@ func MaterialFactHash(in SnapshotInput, symptoms []Symptom, durationClass string
 		SchemaVersion:              materialFactHashSchemaVersion,
 		FactSchemaVersion:          factSchemaVersion,
 		SituationID:                in.Situation.ID,
-		InputVersion:               in.Situation.InputVersion,
 		DurationClass:              durationClass,
 		DurationThresholdCrossedAt: in.Situation.EffectiveStartedAt.Add(durationClassLowerBound(durationClass)),
 		Symptoms:                   symptomDTOs,
