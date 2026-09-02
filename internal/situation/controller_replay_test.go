@@ -100,6 +100,54 @@ const advanceMargin = time.Minute
 // exercises (ExhaustOverdueUnclaimedIncidentTriage).
 const restartMargin = 35 * time.Minute
 
+// longClassMargin (Task 10 review Finding #2) advances the fixture's clock
+// far enough past DurationClass's own >= 1h "long" lower bound
+// (snapshot.go's DurationClassLong) that the owning Situation's elapsed
+// duration is durably inside DurationClassLong before the convergence pass
+// whose resulting Assessment a later idempotent-reconverge check
+// (assertIdempotentReconverge, or boundary 6's own manual re-run) re-checks.
+// "long" is the only duration class with no upper bound, so once elapsed
+// crosses into it there is no further class boundary a later
+// slowCadenceCheckpointMargin advance could ever cross — unlike "short"
+// ([1m, 15m), a 14-minute span narrower than the 15-minute slow-cadence
+// checkpoint delay itself) or "medium" ([15m, 1h), where the natural
+// accumulation of this file's own advanceMargin/restartMargin advances
+// leaves too little headroom to safely predict which side of the 1h
+// boundary a further +15m checkpoint advance lands on. Crossing a duration
+// class boundary changes MaterialFactHash (and so AssessmentBasisHash),
+// which makes RevalidateReuse's own basis-unchanged precondition fail and
+// forces a FRESH, L2-calling derivation instead of exercising the reuse
+// path idempotent reconvergence exists to prove — see
+// assertIdempotentReconverge's own doc comment. This fixture's own alerts
+// carry no critical severity and no prior-Situation history, so none of
+// EligibleReasons' duration-sensitive predicates (durationOutlierEligible
+// needs >= 5 prior comparable Situations; terminalUncertaintyEligible is an
+// unconditional stub — see reasons.go) or lifecycle.go's own
+// ObservationDeadlineAt (2h/24h/7d by class — 7 days once "long") ever
+// engage regardless of which class this margin lands in, so aging into
+// "long" is safe against every other duration-gated behavior in this
+// package.
+const longClassMargin = 90 * time.Minute
+
+// slowCadenceCheckpointMargin (Task 10 review Finding #2) comfortably
+// exceeds CadenceSlow's own +15m next_assessment_at checkpoint
+// (assessment.go's cadenceSlowInterval, the tier DeriveCadence returns for
+// attention=observe once Triage is no longer in_flight — the state every
+// affected subtest's committed Assessment reaches) so a reconverge pass
+// genuinely finds the checkpoint already due, instead of silently finding
+// nothing due at all. Before this fix, assertIdempotentReconverge's re-run
+// (and boundary 6's own separate re-run) only ever advanced the clock by
+// convergeAll's own per-round advanceMargin (1 minute) and returned the
+// instant one round claimed nothing — which a slow-cadence checkpoint 15
+// minutes out never is, so every "no new L2 call"/"hashes unchanged"
+// assertion downstream held vacuously: zero work ever executed, not
+// "reuse happened with zero new calls." Every Situation this margin is
+// applied to has already been aged into DurationClassLong by longClassMargin
+// before its own first tested convergence, so this additional advance can
+// never cross a duration-class boundary — see longClassMargin's own doc
+// comment.
+const slowCadenceCheckpointMargin = 20 * time.Minute
+
 // ----------------------------------------------------------------------
 // replayFixture: one file-backed Store behind a real ingress.Server,
 // reachable over real HTTP, plus the shared logical clock and owner prefix
@@ -298,6 +346,15 @@ func (f *replayFixture) restart() {
 	f.clock.Advance(restartMargin)
 }
 
+// ageIntoLongDurationClass advances the fixture's clock by longClassMargin —
+// see that constant's own doc comment for why "long" is the only duration
+// class this fixture can safely age a Situation into ahead of a later
+// idempotent-reconverge check without risking a class-boundary crossing.
+func (f *replayFixture) ageIntoLongDurationClass() {
+	f.t.Helper()
+	f.clock.Advance(longClassMargin)
+}
+
 // replayBootReport is bootReplay's own report, so a subtest that wants extra
 // rigor (e.g. "exactly one orphaned assessment call was recovered") can
 // assert on it directly instead of only on the eventual converged state.
@@ -389,18 +446,65 @@ func (f *replayFixture) oneControllerDrainPass(client situation.AssessmentClient
 	if _, err := cw.Drain(f.ctx); err != nil {
 		f.t.Fatalf("controller drain: %v", err)
 	}
+	f.assertNoReconcileFailed()
+}
+
+// assertNoReconcileFailed asserts no controller reconcile cycle has ever
+// left an error class recorded on any Situation in this fixture's own
+// on-disk database (Task 10 review Finding #1's systemic guard).
+// ControllerWorker.processOne (controller_worker.go) swallows a failed
+// Reconcile into a log line and a bounded typed retry/backoff rather than
+// propagating the error to anything a caller observes — so a regression
+// that makes reconcile fail (e.g. reintroducing the exact stale
+// fact-identity collision factIdentityWithContent fixes) would otherwise
+// only ever surface, if at all, as "a later cycle eventually succeeded
+// anyway": convergeAll's own quiescence loop keeps calling Drain regardless
+// of a failed attempt, and a later successful commit clears
+// last_error_class back to NULL (controller.go's commitResult), so checking
+// this only once at the very end of a convergence pass would itself risk
+// missing a mid-run failure that got silently retried away — never a red
+// assertion unless something checks last_error_class after EVERY round, not
+// just the last one. Called after every controller drain in both
+// convergence helpers below.
+func (f *replayFixture) assertNoReconcileFailed() {
+	f.t.Helper()
+	n := scalarInt(f.t, f.st, `SELECT COUNT(*) FROM situations WHERE last_error_class IS NOT NULL`)
+	if n == 0 {
+		return
+	}
+	detail := scalarString(f.t, f.st,
+		`SELECT group_concat(id || '=' || last_error_class) FROM situations WHERE last_error_class IS NOT NULL`)
+	f.t.Fatalf("%d situation(s) carry a non-nil last_error_class, want 0 (a reconcile cycle silently failed and was swallowed): %s", n, detail)
+}
+
+// convergeTotals is convergeAll's own tally of work items each drain
+// component actually claimed and handled, summed across every round it took
+// to reach quiescence — Task 10 review Finding #2's fix: assertIdempotentReconverge
+// (and boundary 6's own manual re-run) assert Controller > 0 on the totals
+// from their own re-run to prove a REAL second controller reconcile cycle
+// actually executed, not that nothing was ever due — the original bug: the
+// re-run's clock never reached the committed next_assessment_at checkpoint,
+// so every round claimed zero work and every "no new L2 call"/"hashes
+// unchanged" assertion downstream held vacuously.
+type convergeTotals struct {
+	Dispatch, Input, Controller, Triage int
 }
 
 // convergeAll drains dispatch/input/controller/Triage together, repeating
 // until one full round handles nothing at all — production's own "drain to
 // quiescence" shape (foundationRuntime.Drain/controllerRuntime.Drain), so a
 // Triage completion's own fresh Situation input still gets a chance to feed
-// back into another controller round within the same call.
-func (f *replayFixture) convergeAll(client situation.AssessmentClient, analyzer situation.AcuteAnalyzer, after situation.AfterCommitter, exhaustion situation.ExhaustionNotifier) {
+// back into another controller round within the same call. Returns the
+// summed per-component totals across every round, so a caller that needs to
+// prove a convergence pass genuinely did work (not just that it reached
+// quiescence) can assert on them directly — see convergeTotals' own doc
+// comment.
+func (f *replayFixture) convergeAll(client situation.AssessmentClient, analyzer situation.AcuteAnalyzer, after situation.AfterCommitter, exhaustion situation.ExhaustionNotifier) convergeTotals {
 	f.t.Helper()
 	auditor := audit.New(f.st.DB())
 	triageStore := &replayTriageStoreAdapter{f.st}
 	triageLister := &replayTriageListerAdapter{f.st}
+	var totals convergeTotals
 	for round := 0; round < 8; round++ {
 		f.clock.Advance(advanceMargin)
 		cor := correlator.New(correlator.Config{WindowSeconds: 60}, f.st, nil, nil)
@@ -421,6 +525,7 @@ func (f *replayFixture) convergeAll(client situation.AssessmentClient, analyzer 
 		if err != nil {
 			f.t.Fatalf("controller drain: %v", err)
 		}
+		f.assertNoReconcileFailed()
 
 		tw := situation.NewTriageWorker(triageStore, triageLister, analyzer, after, exhaustion,
 			situation.TriageWorkerConfig{Owner: f.owner + ":triage", Now: f.clock.Now}, nil)
@@ -430,11 +535,17 @@ func (f *replayFixture) convergeAll(client situation.AssessmentClient, analyzer 
 			f.t.Fatalf("triage drain: %v", err)
 		}
 
+		totals.Dispatch += nd
+		totals.Input += ni
+		totals.Controller += nc
+		totals.Triage += nt
+
 		if nd+ni+nc+nt == 0 {
-			return
+			return totals
 		}
 	}
 	f.t.Fatal("convergeAll: did not reach quiescence within bounded rounds")
+	return totals
 }
 
 // ----------------------------------------------------------------------
@@ -590,17 +701,44 @@ func assertL2CallCeiling(t *testing.T, st *store.Store, situationID string) {
 }
 
 // assertIdempotentReconverge re-runs convergeAll with the SAME (call-
-// counting) client/analyzer/afterCommit and asserts nothing changed: no new
-// L2 call, no new Analyze call, and the current Assessment's own identity
-// and both hashes are byte-identical — "stable hashes", "no repeated
-// Finding", and "unchanged bases reuse reasoning with zero model calls" in
-// one assertion.
+// counting) client/analyzer/afterCommit and asserts a genuine reuse cycle
+// happened: no new L2 call, no new Analyze call, both hashes byte-identical,
+// and the reused commit's own derivation is revalidated_reuse — "stable
+// hashes", "no repeated Finding", and "unchanged bases reuse reasoning with
+// zero model calls" in one assertion. The caller's Situation must already be
+// aged into DurationClassLong (replayFixture.ageIntoLongDurationClass,
+// called before its own first tested convergence) — this advances the clock
+// PAST the committed next_assessment_at checkpoint
+// (slowCadenceCheckpointMargin: see its own doc comment) before
+// reconverging, so this genuinely exercises a second controller reconcile
+// cycle (asserted via the returned totals' Controller count) rather than
+// proving nothing, because nothing was ever due (Task 10 review Finding #2).
+//
+// current_assessment_id is deliberately NOT asserted stable: a reuse commit
+// still writes its own new authoritative situation_assessment_attempts row
+// (never repointing the prior one) — internal/store/situation_controller_
+// reconcile_test.go's own TestControllerReconcileEndToEndReuseCommitsAgainstRealSchema
+// already pins this exact production behavior ("reuse must still write a
+// NEW authoritative attempt row, not just repoint the existing one"). An
+// earlier version of this assertion required current_assessment_id to stay
+// byte-identical too; that requirement was never actually exercised before
+// this fix (Finding #2's own bug meant zero reconciles ever ran here) and
+// turned out to contradict that already-established, deliberately tested
+// contract the moment a real second cycle finally ran — corrected here to
+// check identity where production actually promises stability (the hashes)
+// and check for a fresh, correctly-derived reuse attempt where it does not.
 func assertIdempotentReconverge(f *replayFixture, situationID string, client *scriptedL2Client, analyzer *scriptedAnalyzer, after *countingAfterCommitter) {
 	f.t.Helper()
 	beforeL2, beforeAnalyze := client.callCount(), analyzer.callCount()
 	before := readAssessmentIdentity(f.t, f.st, situationID)
 
-	f.convergeAll(client, analyzer, after, nil)
+	f.clock.Advance(slowCadenceCheckpointMargin)
+	totals := f.convergeAll(client, analyzer, after, nil)
+	if totals.Controller == 0 {
+		f.t.Fatal("idempotent reconverge: controller drain claimed 0 situations even after advancing past the committed " +
+			"next_assessment_at checkpoint, want > 0 — a real second reconcile cycle must actually run, or every assertion " +
+			"below (no new L2 call, unchanged hashes) is vacuously true rather than proving reuse")
+	}
 
 	if got := client.callCount(); got != beforeL2 {
 		f.t.Fatalf("L2 calls after an idempotent reconverge = %d, want unchanged %d (unchanged basis must reuse reasoning with zero model calls)", got, beforeL2)
@@ -609,8 +747,15 @@ func assertIdempotentReconverge(f *replayFixture, situationID string, client *sc
 		f.t.Fatalf("Analyze calls after an idempotent reconverge = %d, want unchanged %d (no repeated Finding)", got, beforeAnalyze)
 	}
 	after2 := readAssessmentIdentity(f.t, f.st, situationID)
-	if after2 != before {
-		f.t.Fatalf("assessment identity/hashes changed on an idempotent reconverge: %+v -> %+v (hashes must be stable)", before, after2)
+	if after2.MaterialFactHash != before.MaterialFactHash || after2.BasisHash != before.BasisHash {
+		f.t.Fatalf("assessment hashes changed on an idempotent reconverge: %+v -> %+v (hashes must be stable)", before, after2)
+	}
+	if after2.AssessmentID == before.AssessmentID {
+		f.t.Fatalf("current_assessment_id unchanged after a genuine second reconcile cycle (controller claimed %d situations) — "+
+			"a reuse commit still mints its own new authoritative attempt row (see this function's own doc comment)", totals.Controller)
+	}
+	if derivation := scalarString(f.t, f.st, `SELECT derivation FROM situation_assessment_attempts WHERE id = ?`, after2.AssessmentID); derivation != string(situationmodel.DerivationRevalidatedReuse) {
+		f.t.Fatalf("reconverged attempt %s derivation = %q, want %q", after2.AssessmentID, derivation, situationmodel.DerivationRevalidatedReuse)
 	}
 }
 
@@ -947,6 +1092,7 @@ func testReplayCrashAfterSituationInputApplied(t *testing.T) {
 	// stop here, close, and reopen.
 	f.restart()
 	f.bootReplay()
+	f.ageIntoLongDurationClass()
 
 	client := newAcceptingL2Client()
 	analyzer := newAcceptingAnalyzer()
@@ -979,6 +1125,7 @@ func testReplayCrashAfterSituationClaim(t *testing.T) {
 	// against it at all.
 	f.restart()
 	f.bootReplay()
+	f.ageIntoLongDurationClass()
 
 	client := newAcceptingL2Client()
 	analyzer := newAcceptingAnalyzer()
@@ -992,6 +1139,77 @@ func testReplayCrashAfterSituationClaim(t *testing.T) {
 	assertL2CallCeiling(t, f.st, sitID)
 	assertIdempotentReconverge(f, sitID, client, analyzer, after)
 }
+
+// KNOWN BUG (discovered by this task's own Finding #1 systemic
+// assertNoReconcileFailed check, NOT introduced by it, and NOT caused by
+// Finding #2's clock-advancement fix — reproduces identically with
+// ageIntoLongDurationClass removed): boundaries 3, 4, and 5 below currently
+// fail assertNoReconcileFailed with last_error_class = "transport_failure"
+// on their first post-restart convergeAll call. Root cause, traced via a
+// temporary debug wrapper on ControllerStore.RecordAssessmentCall (since
+// removed):
+//
+//  1. Each of these three boundaries crashes strictly BEFORE its cycle's own
+//     CommitController ever runs — by construction, that is the whole point
+//     of "after dispatch record but before response" /"after rejected
+//     attempt persisted" / "after authoritative insert but before
+//     commit". So situations.controller_work_attempts and
+//     current_material_fact_hash are left exactly as they were before this
+//     Situation's very first controller cycle: controller_work_attempts=0,
+//     current_material_fact_hash=NULL. The pre-crash cycle DID durably
+//     record one situation_assessment_calls row at
+//     (input_version=1, retry_epoch=0, work_attempt=1, call_number=1) —
+//     immutable, per migration 0015's own no-update/no-delete triggers.
+//  2. On replay, the first post-restart reconcile calls BeginControllerAttempt
+//     (internal/store/situation_controller.go): since current_material_fact_hash
+//     is NULL (never committed), it treats this as a fresh epoch and returns
+//     work_attempt=1 again — nextAttempt intentionally resets on ANY basis
+//     change, "this covers BOTH 'a genuinely new material input arrived' and
+//     '...already reset controller_work_attempts to 0'" (that function's own
+//     doc comment). controller_retry_epoch is untouched: "controller_retry_epoch
+//     is returned read-only; only the [dependency-recovery] wake primitive
+//     ever writes it" (same doc comment) — so it is still 0.
+//  3. dispatchWorkBearing (controller.go) then calls RecordAssessmentCall
+//     again with the IDENTICAL (situation_id, input_version=1, retry_epoch=0,
+//     work_attempt=1, call_number=1) — colliding with the immutable pre-crash
+//     row on situation_assessment_calls' own
+//     UNIQUE(situation_id, input_version, retry_epoch, work_attempt, call_number)
+//     index (migration 0015_situation_controller.sql). The INSERT's own
+//     ON CONFLICT(id) clause only covers the primary key, not this separate
+//     unique index, so the raw SQLite constraint error propagates as
+//     RecordAssessmentCall's return error.
+//  4. dispatchWorkBearing wraps it as a generic transportErr; ClassifyL2Outcome
+//     has no case for it, so classifyTransportErr's own catch-all default
+//     classifies it L2OutcomeTransportFailure — the SAME literal string
+//     "transport_failure" sanitizeTransportError separately produces for an
+//     unrecognized network error, which is what led early debugging astray.
+//     Reconcile then takes the ordinary "no accepted proposal" branch:
+//     fallbackOrPreserve + a NORMAL, SUCCESSFUL CommitController commit
+//     (status=authoritative, derivation=deterministic_fallback), recording
+//     last_error_class="transport_failure" on situations as a diagnostic
+//     breadcrumb — Reconcile itself returns nil, so ControllerWorker never
+//     logs a warning either. No physical L2 request happens this cycle at
+//     all (RecordAssessmentCall fails before CompleteOnce is ever called).
+//
+// Net effect: a crash landing in any of these three windows causes the
+// Situation's first REAL post-crash controller cycle to silently waste
+// itself on a degraded deterministic_fallback Assessment — with zero visible
+// error anywhere — before self-healing on the SECOND post-restart cycle
+// (once current_material_fact_hash finally gets populated by this first
+// commit, so BeginControllerAttempt correctly advances work_attempt to 2 and
+// stops colliding). This is a genuine, previously undiscovered gap in the
+// crash-recovery bookkeeping (situation_assessment_calls' own UNIQUE index
+// does not account for controller_work_attempts legitimately resetting to 1
+// without input_version or controller_retry_epoch also advancing), not a
+// test-timing artifact and not either of this task's two already-verified
+// production fixes (internal/store/situation_controller.go's appendFactTx,
+// internal/situation/facts.go's factIdentityWithContent). Per this task's
+// own explicit instructions ("stop and report clearly rather than weakening
+// the assertion to match"), assertNoReconcileFailed is NOT weakened or
+// scoped away from these three boundaries — see the Task 10 fix report for
+// the full write-up; this is flagged there as a DONE_WITH_CONCERNS finding
+// for a dedicated follow-up fix, not something this task's own scope
+// (test coverage only) is authorized to change.
 
 // Boundary 3: after L2 provider dispatch record but before response.
 func testReplayCrashAfterL2DispatchRecordBeforeResponse(t *testing.T) {
@@ -1028,6 +1246,7 @@ func testReplayCrashAfterL2DispatchRecordBeforeResponse(t *testing.T) {
 	if report.AssessmentCallsRecovered != 1 {
 		t.Fatalf("assessment calls recovered on restart = %d, want 1 (the orphaned dispatch record from before the crash)", report.AssessmentCallsRecovered)
 	}
+	f.ageIntoLongDurationClass()
 
 	client := newAcceptingL2Client()
 	analyzer := newAcceptingAnalyzer()
@@ -1068,6 +1287,7 @@ func testReplayCrashAfterRejectedAttemptPersisted(t *testing.T) {
 
 	f.restart()
 	f.bootReplay()
+	f.ageIntoLongDurationClass()
 
 	client := newAcceptingL2Client()
 	analyzer := newAcceptingAnalyzer()
@@ -1118,6 +1338,7 @@ func testReplayCrashAfterAuthoritativeInsertBeforeCommit(t *testing.T) {
 
 	f.restart()
 	f.bootReplay()
+	f.ageIntoLongDurationClass()
 
 	// A fresh client: the pre-crash client already spent its one real call,
 	// and it is never reused across a restart in production either.
@@ -1162,6 +1383,7 @@ func testReplayCrashAfterTriageAttemptBeginBeforeResult(t *testing.T) {
 	if report.TriageAttemptsRecovered != 1 {
 		t.Fatalf("triage attempts recovered on restart = %d, want 1 (the interrupted in_flight attempt from before the crash)", report.TriageAttemptsRecovered)
 	}
+	f.ageIntoLongDurationClass()
 
 	freshAnalyzer := newAcceptingAnalyzer()
 	after := &countingAfterCommitter{}
@@ -1174,9 +1396,21 @@ func testReplayCrashAfterTriageAttemptBeginBeforeResult(t *testing.T) {
 		t.Fatalf("Analyze calls after convergence = %d, want exactly 1 (the crashed attempt's own claim consumed a slot but never produced a result, so replay must run — and count — exactly one real analysis)", got)
 	}
 
-	// Idempotent re-run: no repeated Finding, no re-claimed attempt.
+	// Idempotent re-run: no repeated Finding, no re-claimed attempt. Advance
+	// PAST the situation's own committed next_assessment_at checkpoint first
+	// (slowCadenceCheckpointMargin — see its own doc comment) and assert the
+	// controller actually reconciled again (Controller > 0): otherwise
+	// nothing is ever due and "Analyze calls unchanged" is vacuously true,
+	// not proof that Triage genuinely skipped re-claiming a decided attempt
+	// (Task 10 review Finding #2).
 	before := freshAnalyzer.callCount()
-	f.convergeAll(newAcceptingL2Client(), freshAnalyzer, after, nil)
+	f.clock.Advance(slowCadenceCheckpointMargin)
+	totals := f.convergeAll(newAcceptingL2Client(), freshAnalyzer, after, nil)
+	if totals.Controller == 0 {
+		t.Fatal("idempotent re-run: controller drain claimed 0 situations even after advancing past the committed " +
+			"next_assessment_at checkpoint, want > 0 — a real second reconcile cycle must actually run, or " +
+			"\"Analyze calls unchanged\" below is vacuously true rather than proving no re-claimed attempt")
+	}
 	if got := freshAnalyzer.callCount(); got != before {
 		t.Fatalf("Analyze calls after an idempotent reconverge = %d, want unchanged %d", got, before)
 	}
@@ -1280,6 +1514,7 @@ func testReplayConcurrentInputRaisesNewDueReason(t *testing.T) {
 	// as an ungraceful process death would leave it.
 	f.restart()
 	f.bootReplay()
+	f.ageIntoLongDurationClass()
 
 	freshClient := newAcceptingL2Client()
 	analyzer := newAcceptingAnalyzer()

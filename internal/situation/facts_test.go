@@ -156,6 +156,71 @@ func TestStoreFactsIncidentTriageStateUnavailableBeforeFirstTriageRow(t *testing
 	}
 }
 
+// ----------------------------------------------------------------------
+// factIdentityWithContent (Task 10 replay Finding #1 regression coverage):
+// incident_triage_state and acute_finding read live controller/Triage state
+// that can legitimately advance WITHOUT the Situation's own input_version
+// changing (a controller commit's own request/skip decision landing this
+// same cycle, or an independent Triage attempt completing between two
+// controller cycles). Their fact identity must fold in the fact's own
+// content digest — factIdentityWithContent, not plain factIdentity — or two
+// genuinely distinct observations at the same (situationID, inputVersion,
+// subject) collide onto the same immutable fact ID, and
+// AppendSituationFacts' own idempotent conflict check (same ID, different
+// Value) fails closed with ErrImmutableConflict on the very next reconcile
+// of an unchanged input that observes the new Triage state — not a
+// crash-only edge case, ordinary operation. Revert factIdentityWithContent's
+// call sites in facts.go back to plain factIdentity (dropping the digest
+// argument) and these two tests go red; they are green on the current fix.
+// ----------------------------------------------------------------------
+
+func TestIncidentTriageStateFactIdentityChangesWithPhaseAtSameInputVersion(t *testing.T) {
+	in := baseSnapshotInput(t)
+	in.Incidents = append([]IncidentState{}, in.Incidents...)
+	in.Incidents[0].Triage = TriageState{Phase: "awaiting_decision", Attempts: 0}
+	first := findFact(t, DeriveStoreFacts(in), "incident_triage_state", "incident-1")
+
+	in2 := in
+	in2.Incidents = append([]IncidentState{}, in.Incidents...)
+	in2.Incidents[0].Triage = TriageState{Phase: "pending", Attempts: 0}
+	second := findFact(t, DeriveStoreFacts(in2), "incident_triage_state", "incident-1")
+
+	if in.Situation.InputVersion != in2.Situation.InputVersion {
+		t.Fatalf("test setup: input_version must be identical to isolate the content-keyed identity fix, got %d vs %d",
+			in.Situation.InputVersion, in2.Situation.InputVersion)
+	}
+	if first.ID == second.ID {
+		t.Fatalf("incident_triage_state fact ID unchanged despite Phase changing (%q -> %q) at the same input_version %d: %q — "+
+			"a genuinely distinct observation must get its own fact ID (factIdentityWithContent), or a second reconcile of an "+
+			"unchanged input that observes live Triage progress collides with AppendSituationFacts' own immutable-conflict check",
+			"awaiting_decision", "pending", in.Situation.InputVersion, first.ID)
+	}
+}
+
+func TestAcuteFindingFactIdentityChangesWhenLatestAttemptArrivesAtSameInputVersion(t *testing.T) {
+	in := baseSnapshotInput(t) // LatestAttempt nil by construction
+	before := findFact(t, DeriveStoreFacts(in), "acute_finding", "incident-1")
+
+	in2 := in
+	in2.Incidents = append([]IncidentState{}, in.Incidents...)
+	findingID := "finding-1"
+	in2.Incidents[0].Triage.LatestAttempt = &TriageAttemptResult{
+		ResultCode: "success", OutputDigest: "od-1", FindingID: &findingID, CompletedAt: in.Now,
+	}
+	after := findFact(t, DeriveStoreFacts(in2), "acute_finding", "incident-1")
+
+	if in.Situation.InputVersion != in2.Situation.InputVersion {
+		t.Fatalf("test setup: input_version must be identical to isolate the content-keyed identity fix, got %d vs %d",
+			in.Situation.InputVersion, in2.Situation.InputVersion)
+	}
+	if before.ID == after.ID {
+		t.Fatalf("acute_finding fact ID unchanged despite LatestAttempt arriving (nil -> a completed attempt) at the same "+
+			"input_version %d: %q — an independent Triage completion between two controller cycles must produce a new fact ID, "+
+			"or the second reconcile collides with AppendSituationFacts' own immutable-conflict check",
+			in.Situation.InputVersion, before.ID)
+	}
+}
+
 func TestStoreFactsSortedByKindSubjectID(t *testing.T) {
 	in := baseSnapshotInput(t)
 	facts := DeriveStoreFacts(in)
