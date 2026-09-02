@@ -412,11 +412,12 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	// Notify. On a re-judgment the finding flows the same gate — the Slack
 	// notifier threads the reply on the existing card, or posts a new one if none.
 	// nil during replay (replayIncidentWith strips it), so this whole block —
-	// including the resolved-status probe, which exists only to label the
-	// notification — is a no-op there.
+	// including the resolution ownership claim — is a no-op there.
+	incidentStatus, ownsNotification := "", false
 	if s.notifier != nil {
-		incidentStatus := s.resolvedStatusLabel(ctx, inc.ID)
-
+		incidentStatus, ownsNotification = s.notificationStatus(ctx, inc.ID, p.rejudge)
+	}
+	if ownsNotification {
 		f := notify.Finding{
 			IncidentID:          inc.ID,
 			GroupKey:            inc.GroupKey,
@@ -539,21 +540,38 @@ func (s *Skill) attachHistorySteering(ctx context.Context, inc store.Incident, a
 	}
 }
 
-// resolvedStatusLabel reports "resolved" when every member alert of
-// incidentID is resolved, "ongoing" otherwise (including on a load error —
-// the notification still fires, just without the resolved label).
-func (s *Skill) resolvedStatusLabel(ctx context.Context, incidentID string) string {
+// notificationStatus returns the finding status and whether this pipeline owns
+// the notification. Initial triage must claim the same analyzed -> resolved
+// transition as the correlator before publishing a resolved finding; losing
+// that CAS means another path owns the resolution notification. Re-judgments
+// keep their existing behavior because they update already-judged incidents
+// and intentionally publish without owning a lifecycle transition.
+func (s *Skill) notificationStatus(ctx context.Context, incidentID string, rejudge bool) (string, bool) {
 	incAlerts, err := s.st.GetIncidentAlerts(ctx, incidentID)
 	if err != nil || len(incAlerts) == 0 {
-		return "ongoing"
+		return "ongoing", true
 	}
 	for _, a := range incAlerts {
 		if a.Status != "resolved" {
-			return "ongoing"
+			return "ongoing", true
 		}
 	}
+	if rejudge {
+		return "resolved", true
+	}
+	if err := s.st.MarkIncidentResolved(ctx, incidentID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.logger.Info("incident resolution notification already claimed", "incident", incidentID)
+			return "", false
+		}
+		s.logger.Warn("acutetriage: claim incident resolution failed; notifying as ongoing",
+			"incident_id", incidentID,
+			"err", err,
+		)
+		return "ongoing", true
+	}
 	s.logger.Info("incident resolved", "incident", incidentID, "alerts", len(incAlerts))
-	return "resolved"
+	return "resolved", true
 }
 
 // auditEnrichmentDigests appends one hash-chained digest row per attempted
