@@ -30,9 +30,13 @@ type SnapshotInput struct {
 // store.AlertDelivery's identity-relevant fields (this package must never
 // import internal/store, so it cannot reuse that type directly). It
 // deliberately excludes store.Alert's mutable "latest wins" projection and
-// SQL-facing internals (labels/annotations, fingerprint, provenance mode):
-// Status is read from alert_deliveries.status, the immutable per-delivery
-// source lifecycle, never inferred from the mutable Alert row.
+// most SQL-facing internals (the full labels/annotations map, fingerprint,
+// provenance mode): Status is read from alert_deliveries.status, the
+// immutable per-delivery source lifecycle, never inferred from the mutable
+// Alert row. Two narrow exceptions are extracted from the immutable
+// alert_deliveries row at the store layer and threaded through as plain
+// values rather than a raw label map — see AlertID, Severity, and Drill
+// below; this pure package never parses labels JSON itself.
 type Delivery struct {
 	ID               string
 	IncidentID       string
@@ -43,6 +47,29 @@ type Delivery struct {
 	SourceResolvedAt *time.Time
 	ResolvedAtBasis  model.SourceTimeBasis
 	ReceivedAt       time.Time
+
+	// AlertID is the immutable alert_deliveries.alert_id foreign key — the
+	// underlying Alert this delivery represents, distinct from ID (this
+	// delivery's own identity). Alertmanager's routine re-send of an
+	// unchanged alert appends a new alert_deliveries row (a new ID) that
+	// still names the same AlertID; MembershipDigest uses this to collapse
+	// "the same Alert re-firing" into one member instead of manufacturing a
+	// new one on every routine re-fire. See incident_digest.go.
+	AlertID string
+
+	// Severity is the raw alert_deliveries.labels_json["severity"] value for
+	// this delivery, exactly as received from the source — empty when the
+	// label is absent. This package's pure layer, not the store, decides
+	// what counts as "critical" (via internal/severity.Rank); see
+	// criticalAnchorEligible in reasons.go.
+	Severity string
+
+	// Drill reports whether this delivery's labels carry the Drill marker —
+	// alert_deliveries.labels_json[store.DrillMarkerLabel] == "true", the
+	// same marker store.Alert.IsDrill checks, read here directly off the
+	// immutable per-delivery labels rather than the mutable Alert
+	// projection.
+	Drill bool
 }
 
 // TriageState is Acute Triage's durable per-Incident state, as far as this

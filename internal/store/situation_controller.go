@@ -122,11 +122,18 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 
 // loadSituationDeliveriesTx reads every immutable delivery belonging to any
 // current member Incident of situationID, across the whole Situation (not
-// grouped) — callers group by Delivery.IncidentID themselves.
+// grouped) — callers group by Delivery.IncidentID themselves. It also reads
+// the delivery's immutable alert_id FK straight into Delivery.AlertID, and
+// parses its immutable labels_json to extract two narrow, durable-per-
+// delivery values: the raw severity label (Delivery.Severity — ranking it
+// is internal/situation's job via internal/severity.Rank, not this store
+// layer's) and whether the Drill marker
+// (store.DrillMarkerLabel=store.DrillMarkerValue) is set (Delivery.Drill).
 func loadSituationDeliveriesTx(ctx context.Context, tx *sql.Tx, situationID string) ([]situation.Delivery, error) {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT ad.id, iad.incident_id, ad.status, ad.payload_digest,
-		       ad.source_started_at, ad.started_at_basis, ad.source_resolved_at, ad.resolved_at_basis, ad.received_at
+		SELECT ad.id, iad.incident_id, ad.alert_id, ad.status, ad.payload_digest,
+		       ad.source_started_at, ad.started_at_basis, ad.source_resolved_at, ad.resolved_at_basis, ad.received_at,
+		       ad.labels_json
 		FROM situation_incidents si
 		JOIN incident_alert_deliveries iad ON iad.incident_id = si.incident_id
 		JOIN alert_deliveries ad ON ad.id = iad.delivery_id
@@ -140,10 +147,10 @@ func loadSituationDeliveriesTx(ctx context.Context, tx *sql.Tx, situationID stri
 	out := []situation.Delivery{}
 	for rows.Next() {
 		var d situation.Delivery
-		var status, startedBasis, resolvedBasis, receivedAtStr string
+		var status, startedBasis, resolvedBasis, receivedAtStr, labelsJSON string
 		var sourceStarted, sourceResolved sql.NullString
-		if err := rows.Scan(&d.ID, &d.IncidentID, &status, &d.PayloadDigest,
-			&sourceStarted, &startedBasis, &sourceResolved, &resolvedBasis, &receivedAtStr); err != nil {
+		if err := rows.Scan(&d.ID, &d.IncidentID, &d.AlertID, &status, &d.PayloadDigest,
+			&sourceStarted, &startedBasis, &sourceResolved, &resolvedBasis, &receivedAtStr, &labelsJSON); err != nil {
 			return nil, fmt.Errorf("store: scan situation delivery: %w", err)
 		}
 		d.Status = situationmodel.DeliveryStatus(status)
@@ -162,6 +169,16 @@ func loadSituationDeliveriesTx(ctx context.Context, tx *sql.Tx, situationID stri
 		if d.ReceivedAt, err = time.Parse(time.RFC3339Nano, receivedAtStr); err != nil {
 			return nil, fmt.Errorf("store: parse situation delivery received_at: %w", err)
 		}
+		var labels map[string]string
+		if err := json.Unmarshal([]byte(labelsJSON), &labels); err != nil {
+			// Defensive only: labels_json carries a CHECK (json_valid(...))
+			// constraint, so a real row should never fail to unmarshal as an
+			// object. Fail closed rather than panic on a scan/decode edge
+			// case, matching this function's existing error-handling style.
+			return nil, fmt.Errorf("store: unmarshal situation delivery %s labels: %w", d.ID, err)
+		}
+		d.Severity = labels["severity"]
+		d.Drill = labels[DrillMarkerLabel] == DrillMarkerValue
 		out = append(out, d)
 	}
 	if err := rows.Err(); err != nil {

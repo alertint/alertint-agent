@@ -494,10 +494,26 @@ type materialSymptomDTO struct {
 }
 
 type materialIncidentDTO struct {
-	IncidentID           string  `json:"incident_id"`
-	MembershipDigest     string  `json:"membership_digest"`
-	IncidentInputDigest  string  `json:"incident_input_digest"`
-	TriageOutcomeClass   *string `json:"triage_outcome_class"`
+	IncidentID          string  `json:"incident_id"`
+	MembershipDigest    string  `json:"membership_digest"`
+	IncidentInputDigest string  `json:"incident_input_digest"`
+	TriageOutcomeClass  *string `json:"triage_outcome_class"`
+	// TriageOutputDigest is LatestAttempt.OutputDigest — the normalized
+	// Finding *content* digest, present whenever LatestAttempt is (see
+	// acute_finding's OutputDigest field for the same source). spec.md's
+	// material-hash inclusion list is plural — "normalized Acute Triage
+	// outcome classes and evidence digests" — and the acute_finding fact
+	// already carries both OutputDigest and FindingID; the hash previously
+	// carried neither, so a second Triage attempt with the same result_code
+	// and evidence_pack_digest but a materially different Finding hashed
+	// identically to the first. FindingID (the Finding row's own opaque
+	// storage identity) is deliberately NOT included here: it is not itself
+	// decision-relevant content — two attempts producing byte-identical
+	// output under two different FindingIDs (e.g. a replay that re-persists
+	// the same content) should reuse, not manufacture a spurious material
+	// change. OutputDigest is the actual content signal; FindingID is a
+	// storage pointer to it.
+	TriageOutputDigest   *string `json:"triage_output_digest"`
 	TriageEvidenceDigest *string `json:"triage_evidence_digest"`
 }
 
@@ -542,15 +558,15 @@ type materialFactHashDTO struct {
 // MaterialFactHash hashes only the evidence spec.md's "Material fact hash
 // and Assessment basis" section names as decision-relevant: active symptom
 // identity/lifecycle, duration class and threshold-crossing time, per-
-// Incident membership/input digests, normalized Acute Triage outcome class
-// and evidence digest, comparable historical duration classes, typed
-// evidence limitations, and fact producer/schema versions. It deliberately
-// excludes exact elapsed seconds, raw payloads/prose, retry/lease/claim
-// state, Triage scheduling phase/attempts/decision metadata (evidence-free
-// machinery, not evidence), and Slack metadata — none of which reach this
-// function's DTO construction, since this function only ever reads the
-// specific fields it curates below rather than hashing SnapshotInput
-// wholesale.
+// Incident membership/input digests, normalized Acute Triage outcome class,
+// output digest, and evidence digest, comparable historical duration
+// classes, typed evidence limitations, and fact producer/schema versions. It
+// deliberately excludes exact elapsed seconds, raw payloads/prose,
+// retry/lease/claim state, Triage scheduling phase/attempts/decision
+// metadata (evidence-free machinery, not evidence), and Slack metadata —
+// none of which reach this function's DTO construction, since this function
+// only ever reads the specific fields it curates below rather than hashing
+// SnapshotInput wholesale.
 func MaterialFactHash(in SnapshotInput, symptoms []Symptom, durationClass string) string {
 	symptomDTOs := make([]materialSymptomDTO, 0, len(symptoms))
 	for _, s := range symptoms {
@@ -568,6 +584,8 @@ func MaterialFactHash(in SnapshotInput, symptoms []Symptom, durationClass string
 		if la := inc.Triage.LatestAttempt; la != nil {
 			rc := la.ResultCode
 			d.TriageOutcomeClass = &rc
+			od := la.OutputDigest
+			d.TriageOutputDigest = &od
 			if la.EvidencePackDigest != nil {
 				ed := *la.EvidencePackDigest
 				d.TriageEvidenceDigest = &ed

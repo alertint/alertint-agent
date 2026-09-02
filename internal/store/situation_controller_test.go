@@ -583,6 +583,96 @@ func TestLoadReconciliationInputReadsCoherentSnapshot(t *testing.T) {
 	}
 }
 
+// loadOneSituationDeliveryForGroup is a minimal single-delivery,
+// single-Incident LoadReconciliationInput round trip: it accepts one
+// delivery (whose Alert labels the caller controls), links it to a fresh
+// Incident/Situation, and returns the resulting snap.Deliveries[0].
+func loadOneSituationDeliveryForGroup(t *testing.T, st *Store, groupKey string, fixture DeliveryInput, now time.Time) situation.Delivery {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := st.AcceptDeliveries(ctx, []DeliveryInput{fixture}); err != nil {
+		t.Fatalf("accept delivery: %v", err)
+	}
+	incID, inputID := "inc-"+groupKey, "input-"+groupKey
+	insertIncidentAndDeliveryInput(t, st, incID, inputID, groupKey, fixture.ID, now)
+	claim := claimOneInput(t, st, "seed:"+groupKey, now)
+	if err := st.ApplySituationInput(ctx, claim); err != nil {
+		t.Fatalf("apply situation input: %v", err)
+	}
+	var sitID string
+	if err := st.db.QueryRowContext(ctx, `SELECT id FROM situations WHERE group_key = ?`, groupKey).Scan(&sitID); err != nil {
+		t.Fatalf("find situation for group %s: %v", groupKey, err)
+	}
+	controllerClaim := claimSituation(t, st, sitID, "controller:"+groupKey, now.Add(time.Minute))
+	snap, err := st.LoadReconciliationInput(ctx, controllerClaim, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("LoadReconciliationInput: %v", err)
+	}
+	if len(snap.Deliveries) != 1 {
+		t.Fatalf("snapshot deliveries = %+v, want exactly 1", snap.Deliveries)
+	}
+	return snap.Deliveries[0]
+}
+
+// TestLoadSituationDeliveriesThreadsAlertIDSeverityAndDrill proves Finding
+// #1/#2's store-side fix: loadSituationDeliveriesTx now reads
+// alert_deliveries.alert_id straight into Delivery.AlertID, and parses
+// alert_deliveries.labels_json to extract the raw severity label and the
+// Drill marker — the two pieces of data criticalAnchorEligible and
+// MembershipDigest need that this task's SnapshotInput previously lacked.
+func TestLoadSituationDeliveriesThreadsAlertIDSeverityAndDrill(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+
+	fixture := deliveryFixture("delivery-critical-drill", "fp-critical-drill", now)
+	fixture.Alert.Labels = map[string]string{
+		"alertname":      "test",
+		"severity":       "critical",
+		DrillMarkerLabel: DrillMarkerValue,
+	}
+	accepted, err := st.AcceptDeliveries(context.Background(), []DeliveryInput{fixture})
+	if err != nil {
+		t.Fatalf("accept delivery: %v", err)
+	}
+	wantAlertID := accepted[0].Alert.ID
+	if wantAlertID == "" {
+		t.Fatal("test setup invalid: accepted delivery has no alert id")
+	}
+
+	d := loadOneSituationDeliveryForGroup(t, st, "group-critical-drill", fixture, now)
+	if d.AlertID != wantAlertID {
+		t.Fatalf("AlertID = %q, want %q", d.AlertID, wantAlertID)
+	}
+	if d.Severity != "critical" {
+		t.Fatalf("Severity = %q, want %q", d.Severity, "critical")
+	}
+	if !d.Drill {
+		t.Fatal("Drill = false, want true for a delivery carrying the Drill marker label")
+	}
+}
+
+// TestLoadSituationDeliveriesDefaultsSeverityAndDrillEmptyWhenLabelsAbsent
+// proves the absence case: a delivery with no severity label and no Drill
+// marker must read back Severity="" and Drill=false, never a parse failure
+// or a manufactured value.
+func TestLoadSituationDeliveriesDefaultsSeverityAndDrillEmptyWhenLabelsAbsent(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+
+	fixture := deliveryFixture("delivery-no-severity", "fp-no-severity", now) // default labels: alertname, fp only
+	d := loadOneSituationDeliveryForGroup(t, st, "group-no-severity", fixture, now)
+
+	if d.Severity != "" {
+		t.Fatalf("Severity = %q, want empty when no severity label is present", d.Severity)
+	}
+	if d.Drill {
+		t.Fatal("Drill = true, want false when no Drill marker label is present")
+	}
+	if d.AlertID == "" {
+		t.Fatal("AlertID must not be empty")
+	}
+}
+
 func TestLoadReconciliationInputUnknownSituationReturnsErrNotFound(t *testing.T) {
 	st := newTestStore(t)
 	claim := situation.Claim{Situation: situationmodel.Situation{ID: "does-not-exist"}, ClaimOwner: "controller-a", ClaimToken: 1}

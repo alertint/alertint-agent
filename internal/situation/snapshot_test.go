@@ -23,10 +23,14 @@ func mustTime(t *testing.T, s string) time.Time {
 	return parsed
 }
 
+// deliveryFor defaults AlertID to id — each delivery represents its own
+// distinct Alert unless a test explicitly overrides AlertID (e.g. to model a
+// re-fire: a second delivery naming the same AlertID as an earlier one).
 func deliveryFor(id, incidentID, payloadDigest string, receivedAt time.Time) Delivery {
 	return Delivery{
 		ID:            id,
 		IncidentID:    incidentID,
+		AlertID:       id,
 		Status:        model.DeliveryStatusFiring,
 		PayloadDigest: payloadDigest,
 		ReceivedAt:    receivedAt,

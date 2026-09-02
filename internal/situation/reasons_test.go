@@ -5,6 +5,8 @@ package situation
 import (
 	"testing"
 	"time"
+
+	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
 func TestEligibleReasonsCatalogOnlyEmitsReachableCodes(t *testing.T) {
@@ -36,19 +38,92 @@ func TestEligibleReasonsCatalogOnlyEmitsReachableCodes(t *testing.T) {
 	}
 }
 
-func TestEligibleReasonsCriticalAnchorUnreachableGivenCurrentData(t *testing.T) {
-	// situation.Delivery carries no severity signal at all (Task 3
-	// deliberately excluded labels/annotations as SQL-facing internals),
-	// so "confirmed active critical source severity" can never be proven
-	// from this task's inputs. Documented, not a bug — see
-	// criticalAnchorEligible's doc comment.
+func TestEligibleReasonsCriticalAnchorIneligibleWithoutCriticalSeverityData(t *testing.T) {
+	// baseSnapshotInput's fixture delivery carries no severity label
+	// (Delivery.Severity == "", severity.Rank("") == 0), so "confirmed
+	// active critical source severity" is not proven — not because the
+	// predicate is a stub (it is real now), but because this fixture
+	// supplies no critical-severity evidence.
 	in := baseSnapshotInput(t)
 	symptoms := deriveSymptoms(in.Deliveries)
 	class := DurationClass(elapsedDuration(in))
 	for _, r := range EligibleReasons(in, symptoms, class) {
 		if r.Code == reasonCodeCriticalAnchor {
-			t.Fatal("critical_anchor must not be reachable given current SnapshotInput data")
+			t.Fatal("critical_anchor must not be reachable without a critical-severity firing delivery")
 		}
+	}
+}
+
+func TestEligibleReasonsCriticalAnchorEligibleWithFiringCriticalSeverity(t *testing.T) {
+	in := baseSnapshotInput(t)
+	in.Deliveries = append([]Delivery{}, in.Deliveries...)
+	in.Deliveries[0].Severity = "critical"
+	in.Deliveries[0].Status = model.DeliveryStatusFiring
+	symptoms := deriveSymptoms(in.Deliveries)
+	class := DurationClass(elapsedDuration(in))
+
+	found := false
+	for _, r := range EligibleReasons(in, symptoms, class) {
+		if r.Code == reasonCodeCriticalAnchor {
+			found = true
+			if !r.DeterministicFloor {
+				t.Fatal("critical_anchor must be a deterministic floor — spec.md: the only reachable deterministic urgent floor")
+			}
+			if r.CatalogVersion != reasonCatalogVersion {
+				t.Fatalf("CatalogVersion = %d, want %d", r.CatalogVersion, reasonCatalogVersion)
+			}
+			if r.PredicateVersion != predicateVersionCriticalAnchor {
+				t.Fatalf("PredicateVersion = %d, want %d", r.PredicateVersion, predicateVersionCriticalAnchor)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("expected critical_anchor to be eligible with a firing critical-severity delivery")
+	}
+}
+
+func TestEligibleReasonsCriticalAnchorEligibleAboveCriticalTierToo(t *testing.T) {
+	// severity.Rank's ladder ranks "emergency" (5) above "critical" (4); the
+	// predicate must use >= 4, not == 4, so higher tiers still qualify.
+	in := baseSnapshotInput(t)
+	in.Deliveries = append([]Delivery{}, in.Deliveries...)
+	in.Deliveries[0].Severity = "emergency"
+	in.Deliveries[0].Status = model.DeliveryStatusFiring
+	symptoms := deriveSymptoms(in.Deliveries)
+	class := DurationClass(elapsedDuration(in))
+	if !criticalAnchorEligible(in.Deliveries) {
+		t.Fatal("critical_anchor must be eligible for a severity tier above critical, not just exactly critical")
+	}
+	found := false
+	for _, r := range EligibleReasons(in, symptoms, class) {
+		if r.Code == reasonCodeCriticalAnchor {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected critical_anchor to be eligible with an emergency-severity firing delivery")
+	}
+}
+
+func TestEligibleReasonsCriticalAnchorIneligibleWhenSeverityBelowCritical(t *testing.T) {
+	in := baseSnapshotInput(t)
+	in.Deliveries = append([]Delivery{}, in.Deliveries...)
+	in.Deliveries[0].Severity = "warning" // rank 2, below critical's rank 4
+	in.Deliveries[0].Status = model.DeliveryStatusFiring
+	if criticalAnchorEligible(in.Deliveries) {
+		t.Fatal("critical_anchor must not be eligible for a below-critical severity")
+	}
+}
+
+func TestEligibleReasonsCriticalAnchorIneligibleWhenCriticalSeverityIsResolvedOnly(t *testing.T) {
+	// A resolved delivery no longer confirms an *active* critical severity —
+	// criticalAnchorEligible requires DeliveryStatusFiring.
+	in := baseSnapshotInput(t)
+	in.Deliveries = append([]Delivery{}, in.Deliveries...)
+	in.Deliveries[0].Severity = "critical"
+	in.Deliveries[0].Status = model.DeliveryStatusResolved
+	if criticalAnchorEligible(in.Deliveries) {
+		t.Fatal("critical_anchor must not be eligible when the only critical-severity delivery is resolved, not firing")
 	}
 }
 
@@ -187,6 +262,51 @@ func TestEligibleReasonsCandidateIDStableAndNonEmpty(t *testing.T) {
 		if a[i].ID != b[i].ID {
 			t.Fatal("reason candidate ID not stable across identical calls")
 		}
+	}
+}
+
+// ----------------------------------------------------------------------
+// reasonCandidateID: predicate-version sensitivity, typed-result/evidence
+// sensitivity, and order independence (Finding #3).
+// ----------------------------------------------------------------------
+
+func TestReasonCandidateIDChangesOnPredicateVersionBump(t *testing.T) {
+	a := reasonCandidateID("situation-1", 1, "duration_outlier", 1, 1, false, []string{"fact:a"})
+	b := reasonCandidateID("situation-1", 1, "duration_outlier", 1, 2, false, []string{"fact:a"})
+	if a == b {
+		t.Fatal("bumping predicate version did not change the candidate ID")
+	}
+}
+
+func TestReasonCandidateIDChangesOnCatalogVersionBump(t *testing.T) {
+	a := reasonCandidateID("situation-1", 1, "duration_outlier", 1, 1, false, []string{"fact:a"})
+	b := reasonCandidateID("situation-1", 1, "duration_outlier", 2, 1, false, []string{"fact:a"})
+	if a == b {
+		t.Fatal("bumping catalog version did not change the candidate ID")
+	}
+}
+
+func TestReasonCandidateIDChangesOnDeterministicFloor(t *testing.T) {
+	a := reasonCandidateID("situation-1", 1, "critical_anchor", 1, 1, false, nil)
+	b := reasonCandidateID("situation-1", 1, "critical_anchor", 1, 1, true, nil)
+	if a == b {
+		t.Fatal("deterministic floor (typed result) change did not change the candidate ID")
+	}
+}
+
+func TestReasonCandidateIDChangesOnEvidenceRefs(t *testing.T) {
+	a := reasonCandidateID("situation-1", 1, "duration_outlier", 1, 1, false, []string{"fact:a"})
+	b := reasonCandidateID("situation-1", 1, "duration_outlier", 1, 1, false, []string{"fact:a", "fact:b"})
+	if a == b {
+		t.Fatal("evidence refs change did not change the candidate ID")
+	}
+}
+
+func TestReasonCandidateIDStableForUnchangedPredicateAndEvidence(t *testing.T) {
+	a := reasonCandidateID("situation-1", 1, "duration_outlier", 1, 1, false, []string{"fact:a", "fact:b"})
+	b := reasonCandidateID("situation-1", 1, "duration_outlier", 1, 1, false, []string{"fact:a", "fact:b"})
+	if a != b {
+		t.Fatal("identical code/versions/typed-result/evidence produced different candidate IDs")
 	}
 }
 

@@ -276,6 +276,35 @@ func TestMaterialFactHashReflectsNormalizedFindingOutcomeAndEvidenceDigest(t *te
 	}
 }
 
+// TestMaterialFactHashReflectsOutputDigestEvenWithUnchangedResultCodeAndEvidenceDigest
+// is Finding #4's regression: a second Triage attempt producing a
+// materially different Finding — same result_code, same (or absent)
+// evidence_pack_digest, but different output_digest — must still change
+// MaterialFactHash. Before this fix, materialIncidentDTO carried only
+// TriageOutcomeClass and TriageEvidenceDigest, so this exact scenario
+// hashed identically across two attempts with genuinely different Finding
+// content.
+func TestMaterialFactHashReflectsOutputDigestEvenWithUnchangedResultCodeAndEvidenceDigest(t *testing.T) {
+	in := baseSnapshotInput(t)
+	in.Incidents = append([]IncidentState{}, in.Incidents...)
+	evidenceDigest := "evidence-pack-1"
+	in.Incidents[0].Triage.LatestAttempt = &TriageAttemptResult{
+		ResultCode: "success", OutputDigest: "od-1", EvidencePackDigest: &evidenceDigest, CompletedAt: in.Now,
+	}
+	h1 := materialHashFor(t, in)
+
+	differentOutput := in
+	differentOutput.Incidents = append([]IncidentState{}, in.Incidents...)
+	differentOutput.Incidents[0].Triage.LatestAttempt = &TriageAttemptResult{
+		ResultCode: "success", OutputDigest: "od-2", EvidencePackDigest: &evidenceDigest, CompletedAt: in.Now,
+	}
+	h2 := materialHashFor(t, differentOutput)
+
+	if h1 == h2 {
+		t.Fatal("output digest change (same result_code, same evidence_pack_digest) did not change material fact hash")
+	}
+}
+
 func TestMaterialFactHashIgnoresTriageSchedulingMachinery(t *testing.T) {
 	in := baseSnapshotInput(t)
 	h1 := materialHashFor(t, in)

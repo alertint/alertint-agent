@@ -19,28 +19,18 @@ import (
 
 // Fixed version constants for pre-Triage input dimensions spec.md names
 // that Plan 2's SnapshotInput has no live data source for yet:
-//
-//   - acuteInputSchemaVersion / ruleCatalogVersion / promptProfileVersion:
-//     versioned identities for machinery (the Acute-input schema, the rule
-//     catalog, the prompt profile) that exists as build-time configuration,
-//     not per-Situation input — Plan 2 has exactly one of each, so a fixed
-//     version is the versioned identity until a later plan makes any of
-//     them selectable per Situation.
-//   - drillParity: situation.Delivery (Task 3's trim of
-//     store.AlertDelivery) carries no Drill flag — the alertint_drill
-//     marker lives on the mutable Alert/label projection Task 3
-//     deliberately excluded as an SQL-facing internal. Every
-//     IncidentInputDigest this build computes therefore treats drill
-//     parity as uniformly false. This is a genuine, documented data gap: a
-//     future task that needs to distinguish drill from real Incident input
-//     digests must thread a real per-Incident (or per-Delivery) Drill
-//     field through SnapshotInput before this constant can become live
-//     input. See the Task 4 report.
+// acuteInputSchemaVersion, ruleCatalogVersion, and promptProfileVersion are
+// versioned identities for machinery (the Acute-input schema, the rule
+// catalog, the prompt profile) that exists as build-time configuration, not
+// per-Situation input — Plan 2 has exactly one of each, so a fixed version
+// is the versioned identity until a later plan makes any of them selectable
+// per Situation. Drill parity, by contrast, is live per-Incident input now
+// — see incidentDrillParity below — because Delivery.Drill threads the
+// alertint_drill marker through from the store layer.
 const (
 	acuteInputSchemaVersion = 1
 	ruleCatalogVersion      = 1
 	promptProfileVersion    = 1
-	drillParity             = false
 )
 
 const membershipDigestSchemaVersion = 1
@@ -55,31 +45,68 @@ type membershipDigestDTO struct {
 // MembershipDigest hashes the sorted immutable member identities belonging
 // to incidentID plus their first-delivery identities, per spec.md: "hashes
 // the sorted immutable member identities and their first delivery
-// identities. It answers which Alerts belong to the Incident." Plan 2's
-// situation.Delivery carries no identity distinguishing "the Alert this
-// delivery represents" from "this delivery itself" — no separate Alert ID
-// reaches this pure layer (see Symptom's doc comment in snapshot.go for the
-// same gap). This reduction therefore treats each Delivery as its own
-// member, so MemberIDs and FirstDeliveryIDs are the same sorted Delivery-ID
-// list for now; the two fields are kept distinct in the DTO so a future
-// task that threads a genuine Alert-vs-delivery distinction into Delivery
-// can change FirstDeliveryIDs' derivation without changing this digest's
-// shape.
+// identities. It answers which Alerts belong to the Incident." A member
+// identity is a distinct Delivery.AlertID, not a distinct Delivery.ID:
+// Alertmanager's routine re-send of an unchanged alert appends a new
+// alert_deliveries row (a new delivery ID) that still names the same
+// underlying Alert, and that re-fire must not manufacture a new member or
+// change this digest. MemberIDs is therefore the sorted set of distinct
+// AlertIDs scoped to incidentID; FirstDeliveryIDs is, for each of those
+// AlertIDs in the same order, the ID of that Alert's chronologically
+// earliest delivery (deliveryLess' (source_time,received_at,id) ordering —
+// never row/slice/insertion order, and never a lexical comparison of IDs).
 func MembershipDigest(incidentID string, deliveries []Delivery) string {
-	ids := make([]string, 0, len(deliveries))
+	scoped := make([]Delivery, 0, len(deliveries))
 	for _, d := range deliveries {
 		if d.IncidentID != incidentID {
 			continue
 		}
-		ids = append(ids, d.ID)
+		scoped = append(scoped, d)
 	}
-	sort.Strings(ids)
+
+	earliestByAlert := make(map[string]Delivery, len(scoped))
+	for _, d := range scoped {
+		cur, ok := earliestByAlert[d.AlertID]
+		if !ok || deliveryLess(d, cur) {
+			earliestByAlert[d.AlertID] = d
+		}
+	}
+
+	alertIDs := make([]string, 0, len(earliestByAlert))
+	for alertID := range earliestByAlert {
+		alertIDs = append(alertIDs, alertID)
+	}
+	sort.Strings(alertIDs)
+
+	firstDeliveryIDs := make([]string, len(alertIDs))
+	for i, alertID := range alertIDs {
+		firstDeliveryIDs[i] = earliestByAlert[alertID].ID
+	}
+
 	return canonicalDigest(membershipDigestDTO{
 		SchemaVersion:    membershipDigestSchemaVersion,
 		IncidentID:       incidentID,
-		MemberIDs:        ids,
-		FirstDeliveryIDs: append([]string(nil), ids...),
+		MemberIDs:        alertIDs,
+		FirstDeliveryIDs: firstDeliveryIDs,
 	})
+}
+
+// incidentDrillParity reports whether scoped (already filtered to one
+// Incident's member deliveries) contains at least one Drill-marked
+// delivery. In practice every member of one Incident should agree on Drill
+// status (a real alert and a Drill alert should never correlate into the
+// same Incident), but this reduction does not assume that: any-drill-
+// delivery is treated as drill-true for the whole Incident rather than
+// requiring unanimous agreement, so a real disagreement (were one ever to
+// occur) fails safe toward treating the Incident as a Drill rather than
+// silently hiding it. See the Task 4 report for this policy call.
+func incidentDrillParity(scoped []Delivery) bool {
+	for _, d := range scoped {
+		if d.Drill {
+			return true
+		}
+	}
+	return false
 }
 
 const incidentInputDigestSchemaVersion = 1
@@ -107,15 +134,16 @@ type incidentInputDigestDTO struct {
 
 // IncidentInputDigest hashes MembershipDigest(incidentID, deliveries) plus
 // the bounded durable pre-Triage input spec.md names: exact group key,
-// Drill parity, and each member delivery's immutable identity/payload
-// digest/lifecycle/source times, sorted (source_time, received_at, id) so
-// database row order can never change the digest — plus the fixed
-// Acute-input schema, rule-catalog, and prompt-profile versions (see the
-// constants above for why these are fixed rather than live input). It
-// deliberately never reads TriageState: schedule phase, attempts, leases,
-// due times, Findings, generated prose, and post-begin connector evidence
-// cannot reach this function because it has no parameter that could carry
-// them.
+// Drill parity (incidentDrillParity, live per-Incident Delivery.Drill data
+// — see its doc comment), and each member delivery's immutable
+// identity/payload digest/lifecycle/source times, sorted (source_time,
+// received_at, id) so database row order can never change the digest — plus
+// the fixed Acute-input schema, rule-catalog, and prompt-profile versions
+// (see the constants above for why these are fixed rather than live input).
+// It deliberately never reads TriageState: schedule phase, attempts,
+// leases, due times, Findings, generated prose, and post-begin connector
+// evidence cannot reach this function because it has no parameter that
+// could carry them.
 func IncidentInputDigest(incidentID, groupKey string, deliveries []Delivery) string {
 	membership := MembershipDigest(incidentID, deliveries)
 
@@ -144,7 +172,7 @@ func IncidentInputDigest(incidentID, groupKey string, deliveries []Delivery) str
 		SchemaVersion:           incidentInputDigestSchemaVersion,
 		MembershipDigest:        membership,
 		GroupKey:                groupKey,
-		DrillParity:             drillParity,
+		DrillParity:             incidentDrillParity(scoped),
 		Deliveries:              dtos,
 		AcuteInputSchemaVersion: acuteInputSchemaVersion,
 		RuleCatalogVersion:      ruleCatalogVersion,

@@ -3,10 +3,10 @@
 package situation
 
 import (
-	"fmt"
 	"sort"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/severity"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
@@ -46,11 +46,12 @@ const (
 // EligibleReasons evaluates the closed Plan 2 predicate set against in,
 // symptoms, and durationClass, returning the reachable candidates in fixed
 // catalog order — never dependent on any input's row/map order. Of the
-// four candidates the catalog can reach in a later plan, only
-// duration_outlier is actually provable from this task's SnapshotInput
-// today; see criticalAnchorEligible, novelSymptomEligible, and
-// terminalUncertaintyEligible's doc comments for the specific missing data
-// each one needs, and the Task 4 report for the full accounting.
+// four candidates the catalog can reach in a later plan, critical_anchor and
+// duration_outlier are provable from this task's SnapshotInput today;
+// novel_symptom and terminal_uncertainty are not — see
+// criticalAnchorEligible, novelSymptomEligible, and
+// terminalUncertaintyEligible's doc comments for the specific data each one
+// needs (or now has), and the Task 4 report for the full accounting.
 func EligibleReasons(in SnapshotInput, symptoms []Symptom, durationClass string) []model.ReasonCandidate {
 	situationID := in.Situation.ID
 	inputVersion := in.Situation.InputVersion
@@ -97,7 +98,7 @@ func newReasonCandidate(situationID string, inputVersion int, code, summary stri
 	copy(refs, evidenceRefs)
 	sort.Strings(refs)
 	return model.ReasonCandidate{
-		ID:                 reasonCandidateID(situationID, inputVersion, code),
+		ID:                 reasonCandidateID(situationID, inputVersion, code, reasonCatalogVersion, predicateVersion, floor, refs),
 		Code:               code,
 		Summary:            summary,
 		CatalogVersion:     reasonCatalogVersion,
@@ -107,25 +108,67 @@ func newReasonCandidate(situationID string, inputVersion int, code, summary stri
 	}
 }
 
-// reasonCandidateID mirrors the "reason:<code>:v<version>:..." shape spec.md
-// itself uses for a candidate ID (see the rejected-attempt example's
-// reason_candidate_id).
-func reasonCandidateID(situationID string, inputVersion int, code string) string {
-	return fmt.Sprintf("reason:%s:v%d:%s:%d", code, reasonCatalogVersion, situationID, inputVersion)
+const reasonCandidateIDSchemaVersion = 1
+
+// reasonCandidateIDDTO is reasonCandidateID's canonical hash input — spec.md:
+// "Every candidate records an immutable ID, catalog version, predicate
+// version, code, typed predicate result, supporting evidence references,
+// and whether it is a deterministic floor." Code alone is not a stable
+// identity: two candidates for the same code but different predicate
+// versions, or the same predicate proving against different evidence, must
+// hash to different IDs — see reasonCandidateID's doc comment.
+type reasonCandidateIDDTO struct {
+	SchemaVersion      int      `json:"schema_version"`
+	SituationID        string   `json:"situation_id"`
+	InputVersion       int      `json:"input_version"`
+	Code               string   `json:"code"`
+	CatalogVersion     int      `json:"catalog_version"`
+	PredicateVersion   int      `json:"predicate_version"`
+	DeterministicFloor bool     `json:"deterministic_floor"`
+	EvidenceRefs       []string `json:"evidence_refs"`
+}
+
+// reasonCandidateID is the canonical digest of a Sufficient-reason
+// candidate's full identity — code, catalog version, predicate version, its
+// typed predicate result (DeterministicFloor), and its sorted evidence
+// references — plus the SituationID/InputVersion scoping the original
+// "reason:<code>:v<version>:<situation>:<input_version>" formula already
+// carried. Hashing every one of these fields (not just code) means bumping
+// a predicate's version, or the same predicate proving with a different
+// evidence set, produces a distinguishable ID instead of colliding
+// byte-for-byte with a prior candidate's ID for the same code — mirroring
+// the DTO-then-hash pattern MembershipDigest/MaterialFactHash already use.
+// sortedEvidenceRefs must already be sorted (newReasonCandidate guarantees
+// this before calling in).
+func reasonCandidateID(situationID string, inputVersion int, code string, catalogVersion, predicateVersion int, floor bool, sortedEvidenceRefs []string) string {
+	return canonicalDigest(reasonCandidateIDDTO{
+		SchemaVersion:      reasonCandidateIDSchemaVersion,
+		SituationID:        situationID,
+		InputVersion:       inputVersion,
+		Code:               code,
+		CatalogVersion:     catalogVersion,
+		PredicateVersion:   predicateVersion,
+		DeterministicFloor: floor,
+		EvidenceRefs:       sortedEvidenceRefs,
+	})
 }
 
 // criticalAnchorEligible is spec's "confirmed active critical source
-// severity" predicate. situation.Delivery (Task 3's deliberate trim of
-// store.AlertDelivery) carries no severity signal at all — labels and
-// annotations, the only place a severity concept lives in this codebase,
-// are explicitly excluded from Delivery as SQL-facing internals (see
-// Delivery's doc comment in snapshot.go). There is therefore no data in
-// this task's SnapshotInput from which "confirmed active critical source
-// severity" could ever be proven, so this predicate is always false:
-// critical_anchor is correctly unreachable given current data, not merely
-// untested. It becomes reachable only once a future task threads a
-// durable, immutable severity field into Delivery or IncidentState.
-func criticalAnchorEligible(_ []Delivery) bool {
+// severity" predicate: at least one of the Situation's deliveries is
+// currently firing (not merely historically observed — a resolved delivery
+// no longer confirms an active severity) at or above the "critical" tier of
+// internal/severity.Rank's shared ladder (rank 4, "critical"/"crit"; rank 5
+// — "alert"/"emergency"/"fatal"/"page"/"disaster" — is even more severe, so
+// the comparison is >= 4, not == 4). Delivery.Severity is the raw
+// per-delivery severity label the store layer extracts from
+// alert_deliveries.labels_json (see snapshot.go's Delivery doc comment);
+// this function, not the store, decides what counts as critical.
+func criticalAnchorEligible(deliveries []Delivery) bool {
+	for _, d := range deliveries {
+		if d.Status == model.DeliveryStatusFiring && severity.Rank(d.Severity) >= 4 {
+			return true
+		}
+	}
 	return false
 }
 
