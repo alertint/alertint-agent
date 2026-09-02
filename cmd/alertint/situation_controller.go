@@ -46,6 +46,13 @@ type controllerRuntime struct {
 	worker *situation.ControllerWorker
 	triage *situation.TriageWorker
 	st     *store.Store
+	// auditSink/logger back RecoverAndBackfill's own startup-horizon audit
+	// emission (Task 9 fix round, Finding #2) — retained here (rather than
+	// only passed into the worker/triage constructors above) because
+	// RecoverAndBackfill runs BEFORE either worker starts, outside both of
+	// their own audit-emitting call paths.
+	auditSink situation.AuditSink
+	logger    *slog.Logger
 }
 
 // newControllerRuntime wires the controller runtime against a real store, the
@@ -87,7 +94,37 @@ func newControllerRuntime(
 	triage := situation.NewTriageWorker(triageStore, triageLister, skill, skill, skill, triageCfg, logger)
 	triage.SetAuditSink(auditSink)
 
-	return &controllerRuntime{worker: worker, triage: triage, st: st}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &controllerRuntime{worker: worker, triage: triage, st: st, auditSink: auditSink, logger: logger}
+}
+
+// buildControllerRuntime resolves the controller's own one-shot L2
+// assessment client (buildAssessmentClient) and constructs the fully wired
+// controller runtime — the construction runServe used to inline directly.
+// Extracted out of runServe itself (Task 9 fix round, Finding #3: this,
+// together with runControllerRecovery/runFoundationReconstruction below and
+// in situation_foundation.go, keeps runServe's own golangci-lint gocyclo
+// complexity under the repo's threshold) with no behavior change: same
+// construction order, same SetDependencyRecoveryWaker wiring.
+func buildControllerRuntime(
+	st *store.Store,
+	llmClient acutetriage.LLMClient,
+	llmHealth *llmhealth.Tracker,
+	skill *acutetriage.Skill,
+	cfg config.SituationsConfig,
+	owner string,
+	auditSink situation.AuditSink,
+	logger *slog.Logger,
+) (*controllerRuntime, error) {
+	assessClient, err := buildAssessmentClient(llmClient, llmHealth)
+	if err != nil {
+		return nil, fmt.Errorf("situation controller: %w", err)
+	}
+	crt := newControllerRuntime(st, assessClient, skill, cfg, owner, auditSink, logger)
+	crt.SetDependencyRecoveryWaker(llmHealthDependencyWaker{tracker: llmHealth, st: st})
+	return crt, nil
 }
 
 // situationsConfigToControllerConfig maps config.SituationsConfig onto
@@ -174,9 +211,50 @@ func (r *controllerRuntime) RecoverAndBackfill(ctx context.Context, now time.Tim
 	if err != nil {
 		return report, fmt.Errorf("situation controller: exhaust overdue unclaimed incident triage: %w", err)
 	}
-	report.TriageStartupHorizonExhausted = exhausted
+	report.TriageStartupHorizonExhausted = len(exhausted)
+	// OUTSIDE the store: every one of ExhaustOverdueUnclaimedIncidentTriage's
+	// own per-row transactions has already committed by the time it returns
+	// above — auditing here satisfies the Global Constraint ("No connector,
+	// LLM, Slack, notifier, audit sink, or OTel exporter call occurs inside a
+	// database transaction") by construction, not by care taken at each call
+	// site.
+	r.auditStartupHorizonExhaustions(ctx, exhausted)
 
 	return report, nil
+}
+
+// auditStartupHorizonExhaustions emits one incident.triage_exhausted audit
+// row per Incident ExhaustOverdueUnclaimedIncidentTriage closed out at boot
+// — restoring the operator-visible signal the deleted pre-Plan-2
+// applyStartupHorizon/exhaustTriage produced (internal/correlator/
+// triage_retry.go, deleted by Task 7) and spec.md's own 13-event audit
+// taxonomy names, which Task 9's new ExhaustOverdueUnclaimedIncidentTriage
+// primitive had none of at all (Task 9 fix round, Finding #2).
+//
+// This is a direct audit append, never routed through TriageWorker's own
+// ExhaustionNotifier hook (skills/acutetriage.Skill.OnTriageExhausted): that
+// hook exists for a LIVE worker's genuine five-attempt exhaustion — no
+// worker has claimed, let alone run, a single attempt against any of these
+// rows at all — not a boot-time horizon sweep that never even created an
+// attempt ledger row. The payload's own "reason"/code matches the deleted
+// applyStartupHorizon's own convention exactly
+// ("startup_retry_window_expired"), the same value
+// ExhaustOverdueUnclaimedIncidentTriage already persists as last_error_code.
+func (r *controllerRuntime) auditStartupHorizonExhaustions(ctx context.Context, exhausted []store.ExhaustedTriageIncident) {
+	if r.auditSink == nil {
+		return
+	}
+	for _, e := range exhausted {
+		payload := map[string]any{
+			"situation_id": e.SituationID, "incident_id": e.IncidentID, "group_key": e.GroupKey,
+			"attempts": e.Attempts, "code": "startup_retry_window_expired",
+			"reason": "startup_retry_window_expired",
+		}
+		if err := r.auditSink.Append(ctx, "situation.controller_runtime", "incident.triage_exhausted", payload); err != nil {
+			r.logger.Warn("situation controller: startup horizon exhaustion audit append failed",
+				"incident_id", e.IncidentID, "err", err)
+		}
+	}
 }
 
 // logControllerRecoveryReport logs one RecoverAndBackfill pass's report at
@@ -189,6 +267,25 @@ func logControllerRecoveryReport(logger *slog.Logger, report controllerRecovery)
 		slog.Int("triage_attempts_recovered", report.TriageAttemptsRecovered),
 		slog.Int("triage_startup_horizon_exhausted", report.TriageStartupHorizonExhausted),
 	)
+}
+
+// runControllerRecovery runs one controllerRuntime.RecoverAndBackfill pass
+// and logs its report — the backfillAndRecoverControllerWork step of
+// runServe's own startupSeq. A named function, not a closure (Task 9 fix
+// round, Finding #3): its own `if err != nil` branch would otherwise count
+// toward runServe's own golangci-lint gocyclo complexity purely because of
+// Go's lexical nesting rules for closures, despite having nothing to do with
+// runServe's own control flow — mirrors logReconstructionReport's own
+// established "factored out to keep runServe's branching count where it
+// belongs" convention (situation_foundation.go), extended here to the
+// branch that convention alone could not itself absorb.
+func runControllerRecovery(ctx context.Context, crt *controllerRuntime, logger *slog.Logger) error {
+	report, err := crt.RecoverAndBackfill(ctx, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("situation controller recovery: %w", err)
+	}
+	logControllerRecoveryReport(logger, report)
+	return nil
 }
 
 // SetDependencyRecoveryWaker wires the pre-poll dependency-recovery wake

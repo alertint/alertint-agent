@@ -94,6 +94,25 @@ func logReconstructionReport(logger *slog.Logger, report situation.Reconstructio
 	}
 }
 
+// runFoundationReconstruction runs one foundationRuntime.Reconstruct pass
+// and logs its report — the reconstruct step of runServe's own startupSeq.
+// A named function, not a closure (Task 9 fix round, Finding #3): its own
+// `if err != nil` branch would otherwise count toward runServe's own
+// golangci-lint gocyclo complexity purely because of Go's lexical nesting
+// rules for closures, despite having nothing to do with runServe's own
+// control flow — mirrors logReconstructionReport's own established
+// "factored out to keep runServe's branching count where it belongs"
+// convention above, extended here to the branch that convention alone could
+// not itself absorb.
+func runFoundationReconstruction(ctx context.Context, rt *foundationRuntime, logger *slog.Logger) error {
+	report, err := rt.Reconstruct(ctx)
+	if err != nil {
+		return fmt.Errorf("situation foundation reconstruction: %w", err)
+	}
+	logReconstructionReport(logger, report)
+	return nil
+}
+
 // Start launches the input worker, then the dispatch worker, each on its
 // own background schedule. Call only after Reconstruct has succeeded.
 func (r *foundationRuntime) Start(ctx context.Context) {

@@ -1072,6 +1072,26 @@ func (s *Store) CompleteIncidentTriageAttemptAsCleanSkip(ctx context.Context, at
 // to dispatch refactoring (Task 7 report, Finding #4).
 // ----------------------------------------------------------------------
 
+// ExhaustedTriageIncident identifies one Incident
+// ExhaustOverdueUnclaimedIncidentTriage closed out at boot — enough
+// identifying content for a caller to emit its own incident.triage_exhausted
+// audit row AFTER this method has returned (Global Constraint: "No
+// connector, LLM, Slack, notifier, audit sink, or OTel exporter call occurs
+// inside a database transaction" — this store package itself never calls an
+// audit sink; cmd/alertint's controllerRuntime.RecoverAndBackfill is the
+// caller that does, strictly outside this method's own per-row
+// transactions, all of which have already committed by the time it
+// returns). SituationID mirrors incident_triage.situation_id, which
+// BackfillUpgradedIncidentTriageSchedule (called immediately before this
+// method in RecoverAndBackfill's own startup sequence) guarantees is set on
+// every retained pending/backoff row before this method ever runs.
+type ExhaustedTriageIncident struct {
+	IncidentID  string
+	SituationID string
+	GroupKey    string
+	Attempts    int
+}
+
 // ExhaustOverdueUnclaimedIncidentTriage closes out every incident_triage row
 // still in phase pending/backoff whose next_at is more than horizon before
 // now — WITHOUT ever claiming it (no attempt ledger row is created, so
@@ -1088,11 +1108,14 @@ func (s *Store) CompleteIncidentTriageAttemptAsCleanSkip(ctx context.Context, at
 // ClaimIncidentTriageAttempt — the same operational contract
 // RecoverInterruptedAssessmentCalls/RecoverExpiredIncidentTriageAttempts/
 // BackfillUpgradedIncidentTriageSchedule already document for their own
-// tables. horizon<=0 is a no-op (returns 0, nil) rather than exhausting
-// every due row. Returns the number of rows exhausted.
-func (s *Store) ExhaustOverdueUnclaimedIncidentTriage(ctx context.Context, now time.Time, horizon time.Duration) (int, error) {
+// tables. horizon<=0 is a no-op (returns nil, nil) rather than exhausting
+// every due row. Returns one ExhaustedTriageIncident per row actually
+// closed (len(result) is the count callers used to get directly) — Task 9
+// fix round, Finding #2: the caller needs enough identifying content to
+// audit each exhaustion itself, which a bare count could never carry.
+func (s *Store) ExhaustOverdueUnclaimedIncidentTriage(ctx context.Context, now time.Time, horizon time.Duration) ([]ExhaustedTriageIncident, error) {
 	if horizon <= 0 {
-		return 0, nil
+		return nil, nil
 	}
 	now = now.UTC()
 	cutoff := now.Add(-horizon)
@@ -1102,23 +1125,23 @@ func (s *Store) ExhaustOverdueUnclaimedIncidentTriage(ctx context.Context, now t
 		WHERE phase IN ('pending','backoff') AND next_at IS NOT NULL AND next_at < ?
 		ORDER BY incident_id ASC`, canonicalTime(cutoff))
 	if err != nil {
-		return 0, fmt.Errorf("store: list overdue unclaimed incident triage: %w", err)
+		return nil, fmt.Errorf("store: list overdue unclaimed incident triage: %w", err)
 	}
 	incidentIDs, err := scanStringRows(rows)
 	if err != nil {
-		return 0, fmt.Errorf("store: read overdue unclaimed incident triage ids: %w", err)
+		return nil, fmt.Errorf("store: read overdue unclaimed incident triage ids: %w", err)
 	}
 
 	const code = "startup_retry_window_expired"
 	const detail = "due time exceeded the one-hour startup horizon"
-	exhausted := 0
+	var exhausted []ExhaustedTriageIncident
 	for _, incidentID := range incidentIDs {
-		ok, err := exhaustOverdueUnclaimedIncidentTriageOneTx(ctx, s.db, incidentID, code, detail, now)
+		entry, err := exhaustOverdueUnclaimedIncidentTriageOneTx(ctx, s.db, incidentID, code, detail, now)
 		if err != nil {
 			return exhausted, err
 		}
-		if ok {
-			exhausted++
+		if entry != nil {
+			exhausted = append(exhausted, *entry)
 		}
 	}
 	return exhausted, nil
@@ -1128,29 +1151,32 @@ func (s *Store) ExhaustOverdueUnclaimedIncidentTriage(ctx context.Context, now t
 // in its own transaction, fenced by its own phase check (WHERE phase IN
 // ('pending','backoff')): a row that raced away (claimed, resolved, or
 // already exhausted by an earlier call) between the listing query and this
-// transaction affects zero rows and is skipped — benign, not an error.
-func exhaustOverdueUnclaimedIncidentTriageOneTx(ctx context.Context, db *sql.DB, incidentID, code, detail string, now time.Time) (bool, error) {
+// transaction affects zero rows and is skipped (nil, nil) — benign, not an
+// error. Returns the closed row's own identifying content via UPDATE ...
+// RETURNING (already an established convention in this package — see
+// ClaimIncidentTriageAttempt's own claim_token RETURNING) rather than a
+// second SELECT.
+func exhaustOverdueUnclaimedIncidentTriageOneTx(ctx context.Context, db *sql.DB, incidentID, code, detail string, now time.Time) (*ExhaustedTriageIncident, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return false, fmt.Errorf("store: begin exhaust overdue unclaimed incident triage: %w", err)
+		return nil, fmt.Errorf("store: begin exhaust overdue unclaimed incident triage: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
 	sanitized := sanitizeTriageDetail(detail)
-	res, err := tx.ExecContext(ctx, `
+	var situationID sql.NullString
+	var attempts int
+	err = tx.QueryRowContext(ctx, `
 		UPDATE incident_triage
 		SET phase = 'exhausted', next_at = NULL, last_error_code = ?, last_error_detail = ?, updated_at = ?
-		WHERE incident_id = ? AND phase IN ('pending','backoff')`,
-		code, sanitized, canonicalTime(now), incidentID)
-	if err != nil {
-		return false, fmt.Errorf("store: exhaust overdue unclaimed incident triage schedule: %w", err)
+		WHERE incident_id = ? AND phase IN ('pending','backoff')
+		RETURNING situation_id, attempts`,
+		code, sanitized, canonicalTime(now), incidentID).Scan(&situationID, &attempts)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, tx.Commit()
 	}
-	n, err := res.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("store: count exhausted overdue unclaimed incident triage: %w", err)
-	}
-	if n == 0 {
-		return false, tx.Commit()
+		return nil, fmt.Errorf("store: exhaust overdue unclaimed incident triage schedule: %w", err)
 	}
 
 	// The Incident may already have moved off "ready" (e.g. a concurrent
@@ -1160,22 +1186,27 @@ func exhaustOverdueUnclaimedIncidentTriageOneTx(ctx context.Context, db *sql.DB,
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE incidents SET status = 'failed', updated_at = ? WHERE id = ? AND status = 'ready'`,
 		canonicalTime(now), incidentID); err != nil {
-		return false, fmt.Errorf("store: mark incident failed after startup horizon: %w", err)
+		return nil, fmt.Errorf("store: mark incident failed after startup horizon: %w", err)
 	}
 
 	var groupKey string
 	if err := tx.QueryRowContext(ctx, `SELECT group_key FROM incidents WHERE id = ?`, incidentID).Scan(&groupKey); err != nil {
-		return false, fmt.Errorf("store: read incident group key for startup horizon triage_exhausted: %w", err)
+		return nil, fmt.Errorf("store: read incident group key for startup horizon triage_exhausted: %w", err)
 	}
 	idempotencyKey := "triage-exhausted:startup-horizon:" + incidentID
 	if err := insertTriageSituationInputTx(ctx, tx, "triage_exhausted", idempotencyKey, incidentID, groupKey, now); err != nil {
-		return false, err
+		return nil, err
 	}
 
 	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("store: commit exhaust overdue unclaimed incident triage: %w", err)
+		return nil, fmt.Errorf("store: commit exhaust overdue unclaimed incident triage: %w", err)
 	}
-	return true, nil
+	return &ExhaustedTriageIncident{
+		IncidentID:  incidentID,
+		SituationID: situationID.String,
+		GroupKey:    groupKey,
+		Attempts:    attempts,
+	}, nil
 }
 
 // ----------------------------------------------------------------------

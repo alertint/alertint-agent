@@ -686,7 +686,20 @@ func synthesizeSequence(inputVersion, retryEpoch, workAttempt, callNumber int) i
 // this situation inside its own fenced transaction and ignores whatever
 // value this function's result carries — see synthesizeSequence's doc
 // comment.
-func buildAuthoritativeAttempt(situationID string, result AssessmentResult, callID *string, retryEpoch, workAttempt int, now time.Time) AssessmentAttempt {
+//
+// duration is the REAL measured wall-clock time the backing L2 call took
+// (llm.OneShotCompletion.Latency, already computed by the provider client
+// itself — see dispatchWorkBearing's own CompleteOnce call site), or zero
+// for every derivation that never called out (callID == nil: deterministic/
+// fallback/reuse). CreatedAt is backdated by duration from now (the point
+// this row is being built, after the call — or immediately, for a no-call
+// derivation — has already finished) so CompletedAt.Sub(CreatedAt), the
+// value every "duration_ms" audit attribute actually reads, reflects a real
+// measurement instead of always being exactly zero (Task 9 fix round,
+// Finding #4: the prior version set CreatedAt=CompletedAt=now
+// unconditionally, so the duration these attempts recorded — durably, and
+// in every audit payload deriving it — could never be anything but zero).
+func buildAuthoritativeAttempt(situationID string, result AssessmentResult, callID *string, retryEpoch, workAttempt int, duration time.Duration, now time.Time) AssessmentAttempt {
 	started := model.ProviderRequestStartedFalse
 	if callID != nil {
 		started = model.ProviderRequestStartedTrue
@@ -711,7 +724,7 @@ func buildAuthoritativeAttempt(situationID string, result AssessmentResult, call
 		Validated:              assessmentJSON,
 		ProviderRequestStarted: &started,
 		ReusedFromAssessmentID: result.ReusedFromAssessmentID,
-		CreatedAt:              now,
+		CreatedAt:              now.Add(-duration),
 		CompletedAt:            now,
 	}
 }
@@ -724,8 +737,12 @@ func buildAuthoritativeAttempt(situationID string, result AssessmentResult, call
 // (timeout, network error, rate limit, malformed transport/decode error).
 // Exactly one of the two is meaningful, matching ClassifyL2Outcome's own
 // contract. sequence must already be unique for this situation — Reconcile
-// computes it via synthesizeSequence before calling this.
-func buildOutcomeAttempt(situationID, callID string, inputVersion, retryEpoch, workAttempt, sequence int, vr *ValidationResult, transportErr error, started model.ProviderRequestStarted, now time.Time) AssessmentAttempt {
+// computes it via synthesizeSequence before calling this. duration is the
+// REAL measured wall-clock time this call took (llm.OneShotCompletion.
+// Latency) — every outcome row built here is, by construction, backed by an
+// actual dispatched call (buildAuthoritativeAttempt's own doc comment
+// explains the CreatedAt backdating this shares).
+func buildOutcomeAttempt(situationID, callID string, inputVersion, retryEpoch, workAttempt, sequence int, vr *ValidationResult, transportErr error, started model.ProviderRequestStarted, duration time.Duration, now time.Time) AssessmentAttempt {
 	status := "failed"
 	var proposalJSON, validationErrorsJSON json.RawMessage
 	if vr != nil {
@@ -753,7 +770,7 @@ func buildOutcomeAttempt(situationID, callID string, inputVersion, retryEpoch, w
 		Proposal:               proposalJSON,
 		ValidationErrors:       validationErrorsJSON,
 		ProviderRequestStarted: &started,
-		CreatedAt:              now,
+		CreatedAt:              now.Add(-duration),
 		CompletedAt:            now,
 	}
 }
@@ -883,7 +900,10 @@ func (c *Controller) fallbackOrPreserve(situationID string, snap Snapshot, in Sn
 		}
 	}
 	result := DeterministicFallback(snap, in, state, now)
-	attempt := buildAuthoritativeAttempt(situationID, result, nil, retryEpoch, workAttempt, now)
+	// duration=0: this derivation never calls out (callID is always nil
+	// here), matching buildAuthoritativeAttempt's own "zero for every
+	// derivation that never called out" contract.
+	attempt := buildAuthoritativeAttempt(situationID, result, nil, retryEpoch, workAttempt, 0, now)
 	return result.Assessment, attempt, result.Coverage
 }
 
@@ -976,13 +996,14 @@ func (c *Controller) auditCommitSuccess(ctx context.Context, claim Claim, commit
 	if commit.Attempt.ID != "" {
 		if kind, ok := assessmentAuditKind(commit.Attempt.Derivation); ok {
 			c.auditAppend(ctx, "situation.controller", kind, map[string]any{
-				"situation_id":          situationID,
-				"attempt_id":            commit.Attempt.ID,
-				"input_version":         commit.Attempt.InputVersion,
-				"derivation":            string(commit.Attempt.Derivation),
-				"material_fact_hash":    commit.MaterialFactHash,
-				"assessment_basis_hash": commit.AssessmentBasisHash,
-				"duration_ms":           commit.Attempt.CompletedAt.Sub(commit.Attempt.CreatedAt).Milliseconds(),
+				"situation_id":             situationID,
+				"attempt_id":               commit.Attempt.ID,
+				"input_version":            commit.Attempt.InputVersion,
+				"derivation":               string(commit.Attempt.Derivation),
+				"material_fact_hash":       commit.MaterialFactHash,
+				"assessment_basis_hash":    commit.AssessmentBasisHash,
+				"provider_request_started": string(*commit.Attempt.ProviderRequestStarted),
+				"duration_ms":              commit.Attempt.CompletedAt.Sub(commit.Attempt.CreatedAt).Milliseconds(),
 			})
 		}
 	}
@@ -1067,7 +1088,9 @@ func (c *Controller) Reconcile(ctx context.Context, claim Claim) error {
 	if in.CurrentAssessment != nil {
 		rr := RevalidateReuse(*in.CurrentAssessment, snap, in, state, now)
 		if rr.Ok {
-			return c.commitResult(ctx, claim, base, rr.Result, nil, 0, 1, now)
+			// duration=0: a reuse commit never calls out (callID is always
+			// nil here).
+			return c.commitResult(ctx, claim, base, rr.Result, nil, 0, 1, 0, now)
 		}
 	}
 
@@ -1168,10 +1191,10 @@ func (c *Controller) Reconcile(ctx context.Context, claim Claim) error {
 	}
 	freshEpoch := workAttempt == 1
 
-	proposal, vr, lastCallID, correctionUsed, transportErr := c.dispatchWorkBearing(ctx, claim, snap, retryEpoch, workAttempt, now)
+	proposal, vr, lastCallID, lastDuration, correctionUsed, transportErr := c.dispatchWorkBearing(ctx, claim, snap, retryEpoch, workAttempt, now)
 	if proposal != nil {
 		result := DeriveAssessment(*proposal, snap, in, state, model.DerivationModelValidated, nil, now)
-		return c.commitResult(ctx, claim, base, result, &lastCallID, retryEpoch, workAttempt, now)
+		return c.commitResult(ctx, claim, base, result, &lastCallID, retryEpoch, workAttempt, lastDuration, now)
 	}
 
 	// No accepted/contradicted result: classify the last outcome (using
@@ -1208,9 +1231,12 @@ func (c *Controller) Reconcile(ctx context.Context, claim Claim) error {
 // commitResult finishes building base from a successful (no-L2-needed, or
 // accepted/contradicted L2) AssessmentResult and commits it. It always
 // clears any stale parked state — success (or a no-call derivation) proves
-// the Situation is not stuck.
-func (c *Controller) commitResult(ctx context.Context, claim Claim, base ControllerCommit, result AssessmentResult, callID *string, retryEpoch, workAttempt int, now time.Time) error {
-	base.Attempt = buildAuthoritativeAttempt(claim.Situation.ID, result, callID, retryEpoch, workAttempt, now)
+// the Situation is not stuck. duration is the real measured L2 call latency
+// when callID is non-nil (dispatchWorkBearing's own oneShot.Latency), or 0
+// for a no-call commit (reuse) — threaded straight through to
+// buildAuthoritativeAttempt.
+func (c *Controller) commitResult(ctx context.Context, claim Claim, base ControllerCommit, result AssessmentResult, callID *string, retryEpoch, workAttempt int, duration time.Duration, now time.Time) error {
+	base.Attempt = buildAuthoritativeAttempt(claim.Situation.ID, result, callID, retryEpoch, workAttempt, duration, now)
 	base.Assessment = result.Assessment
 	base.Coverage = result.Coverage
 	base.Parked = ParkedState{Touch: true, Reason: ""}
@@ -1248,7 +1274,9 @@ func (c *Controller) commitResult(ctx context.Context, claim Claim, base Control
 		// repeats the already-completed model work.
 		c.auditAppend(ctx, "situation.controller", "situation.assessment_stale", map[string]any{
 			"situation_id": claim.Situation.ID, "call_id": *callID, "attempt_id": stale.ID,
-			"input_version": stale.InputVersion,
+			"input_version":            stale.InputVersion,
+			"provider_request_started": string(*stale.ProviderRequestStarted),
+			"duration_ms":              stale.CompletedAt.Sub(stale.CreatedAt).Milliseconds(),
 		})
 	}
 	return err
@@ -1334,11 +1362,14 @@ func (c *Controller) fallbackOrPreserveBlocked(situationID string, snap Snapshot
 // permanent rejection or a non-malformed transport failure), so the
 // caller's own ClassifyL2Outcome re-classification of the final outcome
 // passes the real value rather than assuming the correction was always
-// spent.
-func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap Snapshot, retryEpoch, workAttempt int, now time.Time) (proposal *model.AssessmentProposal, lastVR *ValidationResult, lastCallID string, correctionUsed bool, lastTransportErr error) {
+// spent. lastDuration is the most recent dispatch's own real measured
+// latency (llm.OneShotCompletion.Latency) — for the caller to thread into
+// whichever attempt row it ends up building from this cycle's outcome
+// (Task 9 fix round, Finding #4).
+func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap Snapshot, retryEpoch, workAttempt int, now time.Time) (proposal *model.AssessmentProposal, lastVR *ValidationResult, lastCallID string, lastDuration time.Duration, correctionUsed bool, lastTransportErr error) {
 	prompt, err := BuildAssessmentPrompt(snap)
 	if err != nil {
-		return nil, nil, "", false, fmt.Errorf("situation: build assessment prompt: %w", err)
+		return nil, nil, "", 0, false, fmt.Errorf("situation: build assessment prompt: %w", err)
 	}
 
 	for callNumber := 1; callNumber <= c.cfg.MaxL2CallsPerAttempt; callNumber++ {
@@ -1349,7 +1380,7 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 			CallNumber: callNumber, DispatchedAt: now,
 		}
 		if err := c.store.RecordAssessmentCall(ctx, claim, call); err != nil {
-			return nil, nil, callID, correctionUsed, fmt.Errorf("situation: record assessment call: %w", err)
+			return nil, nil, callID, 0, correctionUsed, fmt.Errorf("situation: record assessment call: %w", err)
 		}
 		c.auditAppend(ctx, "situation.controller", "situation.assessment_call_dispatched", map[string]any{
 			"situation_id": claim.Situation.ID, "call_id": callID, "call_number": callNumber,
@@ -1373,16 +1404,16 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 			v := ValidateAssessmentProposal(oneShot.Raw, snap, call, now)
 			vr = &v
 		}
-		lastVR, lastTransportErr, lastCallID = vr, transportErr, callID
+		lastVR, lastTransportErr, lastCallID, lastDuration = vr, transportErr, callID, oneShot.Latency
 
 		policy := ClassifyL2Outcome(vr, transportErr, correctionUsed)
 		if policy.Outcome == L2OutcomeAccepted || policy.Outcome == L2OutcomeContradicted {
 			p := vr.Proposal
-			return &p, nil, callID, correctionUsed, nil
+			return &p, nil, callID, oneShot.Latency, correctionUsed, nil
 		}
 
 		outcomeSequence := synthesizeSequence(snap.InputVersion, retryEpoch, workAttempt, callNumber)
-		outcome := buildOutcomeAttempt(claim.Situation.ID, callID, snap.InputVersion, retryEpoch, workAttempt, outcomeSequence, vr, transportErr, started, now)
+		outcome := buildOutcomeAttempt(claim.Situation.ID, callID, snap.InputVersion, retryEpoch, workAttempt, outcomeSequence, vr, transportErr, started, oneShot.Latency, now)
 		if err := c.store.AppendAssessmentOutcome(ctx, outcome); err != nil {
 			c.logger.Error("situation: controller: append assessment outcome failed", "situation_id", claim.Situation.ID, "call_id", callID, "err", err)
 		}
@@ -1398,8 +1429,11 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 		}
 		c.auditAppend(ctx, "situation.controller", kind, map[string]any{
 			"situation_id": claim.Situation.ID, "call_id": callID, "outcome": string(policy.Outcome),
-			"input_version": snap.InputVersion, "retry_epoch": retryEpoch, "work_attempt": workAttempt,
-			"duration_ms": outcome.CompletedAt.Sub(outcome.CreatedAt).Milliseconds(),
+			"input_version":            snap.InputVersion,
+			"retry_epoch":              retryEpoch,
+			"work_attempt":             workAttempt,
+			"provider_request_started": string(started),
+			"duration_ms":              outcome.CompletedAt.Sub(outcome.CreatedAt).Milliseconds(),
 		})
 
 		if policy.ImmediateCorrection && !correctionUsed && callNumber < c.cfg.MaxL2CallsPerAttempt {
@@ -1408,5 +1442,5 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 		}
 		break
 	}
-	return nil, lastVR, lastCallID, correctionUsed, lastTransportErr
+	return nil, lastVR, lastCallID, lastDuration, correctionUsed, lastTransportErr
 }

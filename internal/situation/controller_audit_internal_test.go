@@ -70,14 +70,27 @@ func TestAssessmentAuditKindMapsEveryDerivationToItsSpecName(t *testing.T) {
 // spec.md's OTel/log requirement names (Situation ID, attempt ID, input
 // version, and the material/basis-hash digests) — never a proposal, prompt,
 // or provider body.
+//
+// Task 9 fix round, Finding #4: CreatedAt/CompletedAt here now carry a real
+// non-zero gap (1s) — a shape production code can genuinely produce since
+// buildAuthoritativeAttempt backdates CreatedAt by the attempt's own
+// measured call duration, no longer a hand-constructed fixture masking
+// "duration_ms" always being zero. This test still drives auditCommitSuccess
+// directly (not through a full Reconcile) to isolate the derivation ->
+// spec.md-event mapping itself; controller_audit_test.go's
+// TestControllerReconcileAuditsRealDurationAndProviderRequestStarted proves
+// the end-to-end path from an actual measured CompleteOnce latency through
+// to this same payload's duration_ms/provider_request_started values.
 func TestAuditCommitSuccessEmitsExactlyOneAssessmentEventForANewAttempt(t *testing.T) {
 	sink := &recordingAuditSink{}
 	c := NewController(nil, nil, ControllerConfig{}, nil, sink, nil)
 	claim := Claim{Situation: model.Situation{ID: "sit-1"}}
+	started := model.ProviderRequestStartedTrue
 	commit := ControllerCommit{
 		Attempt: AssessmentAttempt{
 			ID: "attempt-1", Derivation: model.DerivationModelValidated, InputVersion: 3,
-			CreatedAt: time.Unix(0, 0), CompletedAt: time.Unix(1, 0),
+			ProviderRequestStarted: &started,
+			CreatedAt:              time.Unix(0, 0), CompletedAt: time.Unix(1, 0),
 		},
 		MaterialFactHash: "mat-1", AssessmentBasisHash: "basis-1",
 	}
@@ -96,7 +109,7 @@ func TestAuditCommitSuccessEmitsExactlyOneAssessmentEventForANewAttempt(t *testi
 	}
 	for _, key := range []string{
 		"situation_id", "attempt_id", "input_version", "derivation",
-		"material_fact_hash", "assessment_basis_hash", "duration_ms",
+		"material_fact_hash", "assessment_basis_hash", "duration_ms", "provider_request_started",
 	} {
 		if _, ok := payload[key]; !ok {
 			t.Fatalf("payload missing key %q: %+v", key, payload)
@@ -104,6 +117,12 @@ func TestAuditCommitSuccessEmitsExactlyOneAssessmentEventForANewAttempt(t *testi
 	}
 	if payload["situation_id"] != "sit-1" || payload["attempt_id"] != "attempt-1" {
 		t.Fatalf("payload identity = %+v, want situation_id=sit-1 attempt_id=attempt-1", payload)
+	}
+	if payload["duration_ms"] != int64(1000) {
+		t.Fatalf("duration_ms = %v, want 1000", payload["duration_ms"])
+	}
+	if payload["provider_request_started"] != "true" {
+		t.Fatalf("provider_request_started = %v, want true", payload["provider_request_started"])
 	}
 }
 

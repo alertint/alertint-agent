@@ -94,9 +94,47 @@ func TestTriageWorkerAuditsStaleInputNotCompleted(t *testing.T) {
 	}
 }
 
+// auditingExhaustionNotifier mirrors the production shape closely enough to
+// catch Task 9 fix round Finding #1's double-emission regression:
+// skills/acutetriage.Skill.OnTriageExhausted appends its OWN
+// incident.triage_exhausted row to the SAME AuditSink the worker itself was
+// wired with (both share one audit sink in cmd/alertint's
+// newControllerRuntime) — unlike fakeExhaustionNotifier, which only records
+// calls on itself and never touches the shared sink, so it could never have
+// caught a double append.
+type auditingExhaustionNotifier struct {
+	sink situation.AuditSink
+}
+
+func (n *auditingExhaustionNotifier) OnTriageExhausted(ctx context.Context, incidentID, code, detail string) error {
+	return n.sink.Append(ctx, "skill:acute-triage", "incident.triage_exhausted", map[string]any{
+		"incident_id": incidentID, "code": code, "detail": detail,
+	})
+}
+
+// countKind returns how many of sink's recorded audit rows carry kind —
+// TestTriageWorkerAuditsExhaustionOnFifthAttempt's own exactly-once proof
+// needs a count, not merely fakeAuditSink.has's boolean "at least one".
+func countKind(sink *fakeAuditSink, kind string) int {
+	n := 0
+	for _, k := range sink.kinds {
+		if k == kind {
+			n++
+		}
+	}
+	return n
+}
+
 // TestTriageWorkerAuditsExhaustionOnFifthAttempt mirrors
 // TestTriageWorker_FifthAttemptExhaustion's exact scenario and proves it
-// audits incident.triage_exhausted after the durable exhaust write commits.
+// audits incident.triage_exhausted after the durable exhaust write commits —
+// and, Task 9 fix round Finding #1: EXACTLY ONCE, in the production
+// configuration where both the worker's own audit sink (SetAuditSink) AND a
+// real ExhaustionNotifier are wired into the SAME sink. The prior version of
+// this test wired a fakeExhaustionNotifier that never touched the shared
+// sink at all, so it could not have caught the double-emission regression
+// (the worker's own direct append plus the notifier's own real append,
+// wired here via auditingExhaustionNotifier, both landing in one sink).
 func TestTriageWorkerAuditsExhaustionOnFifthAttempt(t *testing.T) {
 	claim := testClaim("inc-audit-3", 5)
 	store := &fakeStore{claimFn: func(ctx context.Context, incidentID, owner string, now time.Time, lease time.Duration) (situation.TriageAttemptClaim, error) {
@@ -106,8 +144,9 @@ func TestTriageWorkerAuditsExhaustionOnFifthAttempt(t *testing.T) {
 	analyzer := &fakeAnalyzer{fn: func(ctx context.Context, c situation.TriageAttemptClaim) (situation.AcuteResult, error) {
 		return situation.AcuteResult{}, errors.New("still failing")
 	}}
-	w := newWorkerFull(store, lister, analyzer, &fakeAfterCommit{}, &fakeExhaustionNotifier{}, situation.TriageWorkerConfig{MaxAttempts: 5})
 	audit := &fakeAuditSink{}
+	notifier := &auditingExhaustionNotifier{sink: audit}
+	w := situation.NewTriageWorker(store, lister, analyzer, &fakeAfterCommit{}, notifier, situation.TriageWorkerConfig{MaxAttempts: 5, Owner: "test-owner"}, nil)
 	w.SetAuditSink(audit)
 
 	if _, err := w.RunOnce(context.Background()); err != nil {
@@ -116,6 +155,36 @@ func TestTriageWorkerAuditsExhaustionOnFifthAttempt(t *testing.T) {
 
 	if !audit.has("incident.triage_exhausted") {
 		t.Fatalf("audit kinds = %v, want incident.triage_exhausted", audit.kinds)
+	}
+	if n := countKind(audit, "incident.triage_exhausted"); n != 1 {
+		t.Fatalf("incident.triage_exhausted audit rows = %d, want exactly 1 (double-emission regression): kinds=%v", n, audit.kinds)
+	}
+}
+
+// TestTriageWorkerAuditsExhaustionFallbackWhenNoNotifierConfigured proves
+// the OTHER half of Finding #1's fix: when no ExhaustionNotifier is
+// configured at all (the worker's own SetAuditSink is still wired), the
+// worker's own direct append is the fallback — a genuine exhaustion is never
+// silently unaudited just because no notifier exists to own the row.
+func TestTriageWorkerAuditsExhaustionFallbackWhenNoNotifierConfigured(t *testing.T) {
+	claim := testClaim("inc-audit-3b", 5)
+	store := &fakeStore{claimFn: func(ctx context.Context, incidentID, owner string, now time.Time, lease time.Duration) (situation.TriageAttemptClaim, error) {
+		return claim, nil
+	}}
+	lister := &fakeLister{ids: []string{"inc-audit-3b"}}
+	analyzer := &fakeAnalyzer{fn: func(ctx context.Context, c situation.TriageAttemptClaim) (situation.AcuteResult, error) {
+		return situation.AcuteResult{}, errors.New("still failing")
+	}}
+	w := newWorker(store, lister, analyzer, &fakeAfterCommit{}, situation.TriageWorkerConfig{MaxAttempts: 5})
+	audit := &fakeAuditSink{}
+	w.SetAuditSink(audit)
+
+	if _, err := w.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if n := countKind(audit, "incident.triage_exhausted"); n != 1 {
+		t.Fatalf("incident.triage_exhausted audit rows = %d, want exactly 1 (fallback with no notifier configured): kinds=%v", n, audit.kinds)
 	}
 }
 

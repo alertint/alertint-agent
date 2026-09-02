@@ -38,13 +38,39 @@ func TestExhaustOverdueUnclaimedIncidentTriageClosesOutOverdueUnjudgedWork(t *te
 
 	// A "pending" row more than one hour overdue.
 	seedIncidentTriageSchedule(t, st, incID, "pending", now.Add(-2*time.Hour), now)
+	// seedIncidentTriageSchedule seeds attempts=1 and leaves situation_id
+	// NULL — set both here so the returned ExhaustedTriageIncident below has
+	// real content to assert against (mirrors what
+	// BackfillUpgradedIncidentTriageSchedule guarantees is already true by
+	// the time RecoverAndBackfill calls this method in production).
+	if _, err := st.db.ExecContext(context.Background(), `
+		UPDATE incident_triage SET situation_id = ?, attempts = 3 WHERE incident_id = ?`, sitID, incID); err != nil {
+		t.Fatal(err)
+	}
 
-	n, err := st.ExhaustOverdueUnclaimedIncidentTriage(context.Background(), now, time.Hour)
+	exhausted, err := st.ExhaustOverdueUnclaimedIncidentTriage(context.Background(), now, time.Hour)
 	if err != nil {
 		t.Fatalf("ExhaustOverdueUnclaimedIncidentTriage: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("exhausted = %d, want 1", n)
+	if len(exhausted) != 1 {
+		t.Fatalf("exhausted = %+v, want exactly 1 entry", exhausted)
+	}
+	// Task 9 fix round, Finding #2: the caller (cmd/alertint's
+	// controllerRuntime.RecoverAndBackfill) needs enough identifying content
+	// from each entry to emit its own incident.triage_exhausted audit row —
+	// a bare count could never carry this.
+	got := exhausted[0]
+	if got.IncidentID != incID {
+		t.Fatalf("IncidentID = %q, want %q", got.IncidentID, incID)
+	}
+	if got.SituationID != sitID {
+		t.Fatalf("SituationID = %q, want %q", got.SituationID, sitID)
+	}
+	if got.GroupKey != "group-horizon-overdue" {
+		t.Fatalf("GroupKey = %q, want group-horizon-overdue", got.GroupKey)
+	}
+	if got.Attempts != 3 {
+		t.Fatalf("Attempts = %d, want 3", got.Attempts)
 	}
 
 	var phase string
@@ -77,7 +103,6 @@ func TestExhaustOverdueUnclaimedIncidentTriageClosesOutOverdueUnjudgedWork(t *te
 	if inputCount != 1 {
 		t.Fatalf("triage_exhausted inputs = %d, want exactly 1", inputCount)
 	}
-	_ = sitID
 }
 
 func TestExhaustOverdueUnclaimedIncidentTriageLeavesRecentWorkUntouched(t *testing.T) {
@@ -90,12 +115,12 @@ func TestExhaustOverdueUnclaimedIncidentTriageLeavesRecentWorkUntouched(t *testi
 	// horizon — must survive untouched.
 	seedIncidentTriageSchedule(t, st, incID, "backoff", now.Add(-10*time.Minute), now)
 
-	n, err := st.ExhaustOverdueUnclaimedIncidentTriage(context.Background(), now, time.Hour)
+	exhausted, err := st.ExhaustOverdueUnclaimedIncidentTriage(context.Background(), now, time.Hour)
 	if err != nil {
 		t.Fatalf("ExhaustOverdueUnclaimedIncidentTriage: %v", err)
 	}
-	if n != 0 {
-		t.Fatalf("exhausted = %d, want 0 (still inside the horizon)", n)
+	if len(exhausted) != 0 {
+		t.Fatalf("exhausted = %+v, want none (still inside the horizon)", exhausted)
 	}
 
 	var phase string
@@ -125,12 +150,12 @@ func TestExhaustOverdueUnclaimedIncidentTriageNeverTouchesInFlightOrTerminalRows
 		t.Fatal(err)
 	}
 
-	n, err := st.ExhaustOverdueUnclaimedIncidentTriage(context.Background(), now, time.Hour)
+	exhausted, err := st.ExhaustOverdueUnclaimedIncidentTriage(context.Background(), now, time.Hour)
 	if err != nil {
 		t.Fatalf("ExhaustOverdueUnclaimedIncidentTriage: %v", err)
 	}
-	if n != 0 {
-		t.Fatalf("exhausted = %d, want 0 (in_flight is never this primitive's concern)", n)
+	if len(exhausted) != 0 {
+		t.Fatalf("exhausted = %+v, want none (in_flight is never this primitive's concern)", exhausted)
 	}
 }
 
@@ -141,11 +166,11 @@ func TestExhaustOverdueUnclaimedIncidentTriageZeroHorizonIsNoOp(t *testing.T) {
 	incID := "inc-group-horizon-zero"
 	seedIncidentTriageSchedule(t, st, incID, "pending", now.Add(-3*time.Hour), now)
 
-	n, err := st.ExhaustOverdueUnclaimedIncidentTriage(context.Background(), now, 0)
+	exhausted, err := st.ExhaustOverdueUnclaimedIncidentTriage(context.Background(), now, 0)
 	if err != nil {
 		t.Fatalf("ExhaustOverdueUnclaimedIncidentTriage: %v", err)
 	}
-	if n != 0 {
-		t.Fatalf("exhausted = %d, want 0 (horizon<=0 is a no-op)", n)
+	if len(exhausted) != 0 {
+		t.Fatalf("exhausted = %+v, want none (horizon<=0 is a no-op)", exhausted)
 	}
 }

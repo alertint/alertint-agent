@@ -429,12 +429,10 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	// the Correlator itself (cor, constructed above) receives no LLM
 	// dependency of its own — corCfg/correlator.New's signature carries none,
 	// and its only path to Acute Triage is via incidentSink{skill: skill}.
-	assessClient, err := buildAssessmentClient(llmClient, llmHealth)
+	crt, err := buildControllerRuntime(st, llmClient, llmHealth, skill, cfg.Situations, owner, auditor, logger)
 	if err != nil {
-		return fmt.Errorf("situation controller: %w", err)
+		return err
 	}
-	crt := newControllerRuntime(st, assessClient, skill, cfg.Situations, owner, auditor, logger)
-	crt.SetDependencyRecoveryWaker(llmHealthDependencyWaker{tracker: llmHealth, st: st})
 
 	// Probe enabled integrations in the background: quickly (with backoff)
 	// while one is failing — at startup a co-deployed dependency may still
@@ -447,12 +445,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	var recvErrCh <-chan error
 	startupSeq := foundationSequence{
 		reconstruct: func(ctx context.Context) error {
-			report, err := rt.Reconstruct(ctx)
-			if err != nil {
-				return fmt.Errorf("situation foundation reconstruction: %w", err)
-			}
-			logReconstructionReport(logger, report)
-			return nil
+			return runFoundationReconstruction(ctx, rt, logger)
 		},
 		// Task 9: Triage migration backfill, interrupted Assessment-call/
 		// Triage-attempt recovery, and the one-hour startup horizon — all
@@ -460,12 +453,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		// any worker resumes claiming controller/Triage work, exactly like
 		// foundation reconstruction above.
 		backfillAndRecoverControllerWork: func(ctx context.Context) error {
-			report, err := crt.RecoverAndBackfill(ctx, time.Now().UTC())
-			if err != nil {
-				return fmt.Errorf("situation controller recovery: %w", err)
-			}
-			logControllerRecoveryReport(logger, report)
-			return nil
+			return runControllerRecovery(ctx, crt, logger)
 		},
 		// SetAuditor/SetResolutionNotifier/SetOccurrenceNotifier are wired
 		// here — between reconstruct and cor.Start, never before — because

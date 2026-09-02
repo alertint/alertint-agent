@@ -350,6 +350,105 @@ func TestTriageScheduleListerAdapterProjectsIncidentIDs(t *testing.T) {
 	}
 }
 
+// ----------------------------------------------------------------------
+// RecoverAndBackfill's own startup-horizon audit emission (Task 9 fix
+// round, Finding #2).
+// ----------------------------------------------------------------------
+
+// auditRecordEntry is one Append call fakeControllerRuntimeAuditSink
+// observed.
+type auditRecordEntry struct {
+	actor, kind string
+	payload     any
+}
+
+// fakeControllerRuntimeAuditSink implements situation.AuditSink for this
+// file's own controllerRuntime-level tests — controller_audit_test.go's
+// fakeAuditSink (package situation_test) is not reachable from here.
+type fakeControllerRuntimeAuditSink struct {
+	records []auditRecordEntry
+}
+
+func (s *fakeControllerRuntimeAuditSink) Append(_ context.Context, actor, kind string, payload any) error {
+	s.records = append(s.records, auditRecordEntry{actor: actor, kind: kind, payload: payload})
+	return nil
+}
+
+func (s *fakeControllerRuntimeAuditSink) payloadsOfKind(kind string) []any {
+	var out []any
+	for _, r := range s.records {
+		if r.kind == kind {
+			out = append(out, r.payload)
+		}
+	}
+	return out
+}
+
+// TestSituationControllerRuntimeRecoverAndBackfillAuditsStartupHorizonExhaustion
+// proves a real startup-horizon exhaustion (Task 9's new
+// ExhaustOverdueUnclaimedIncidentTriage primitive, internal/store/
+// triage_controller.go) produces a real incident.triage_exhausted audit row
+// — restoring the operator-visible signal the deleted pre-Plan-2
+// applyStartupHorizon/exhaustTriage produced, which the new primitive had
+// none of at all before this fix (Task 9 fix round, Finding #2). Seeds a
+// genuine overdue pending row against a real store (never a hand-built
+// fixture standing in for one), so this exercises the exact
+// RecoverAndBackfill -> ExhaustOverdueUnclaimedIncidentTriage ->
+// auditStartupHorizonExhaustions path production runs at boot.
+func TestSituationControllerRuntimeRecoverAndBackfillAuditsStartupHorizonExhaustion(t *testing.T) {
+	st := newTestFoundationStore(t)
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	sitID := seedControllerRuntimeSituation(t, st, "group-horizon-audit", now)
+	incID := "inc-group-horizon-audit"
+
+	// A pending row more than the one-hour startup horizon overdue, with
+	// situation_id already set — mirrors what
+	// BackfillUpgradedIncidentTriageSchedule guarantees is already true by
+	// the time RecoverAndBackfill calls ExhaustOverdueUnclaimedIncidentTriage
+	// in its own startup sequence.
+	if _, err := st.DB().ExecContext(context.Background(), `
+		INSERT INTO incident_triage (incident_id, phase, attempts, next_at, situation_id, updated_at)
+		VALUES (?, 'pending', 2, ?, ?, ?)`,
+		incID, now.Add(-2*time.Hour).UTC().Format(time.RFC3339Nano), sitID, now.UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+
+	audit := &fakeControllerRuntimeAuditSink{}
+	rt := newControllerRuntime(st, &fakeOneShotClient{}, nil, config.SituationsConfig{}, "test-owner", audit, nil)
+
+	report, err := rt.RecoverAndBackfill(context.Background(), now)
+	if err != nil {
+		t.Fatalf("RecoverAndBackfill: %v", err)
+	}
+	if report.TriageStartupHorizonExhausted != 1 {
+		t.Fatalf("TriageStartupHorizonExhausted = %d, want 1", report.TriageStartupHorizonExhausted)
+	}
+
+	rows := audit.payloadsOfKind("incident.triage_exhausted")
+	if len(rows) != 1 {
+		t.Fatalf("incident.triage_exhausted audit rows = %d, want exactly 1: %+v", len(rows), audit.records)
+	}
+	payload, ok := rows[0].(map[string]any)
+	if !ok {
+		t.Fatalf("payload type = %T", rows[0])
+	}
+	if payload["incident_id"] != incID {
+		t.Fatalf("incident_id = %v, want %v", payload["incident_id"], incID)
+	}
+	if payload["situation_id"] != sitID {
+		t.Fatalf("situation_id = %v, want %v", payload["situation_id"], sitID)
+	}
+	if payload["reason"] != "startup_retry_window_expired" {
+		t.Fatalf("reason = %v, want startup_retry_window_expired", payload["reason"])
+	}
+	if payload["code"] != "startup_retry_window_expired" {
+		t.Fatalf("code = %v, want startup_retry_window_expired", payload["code"])
+	}
+	if payload["attempts"] != 2 {
+		t.Fatalf("attempts = %v, want 2", payload["attempts"])
+	}
+}
+
 // seedControllerRuntimeSituation seeds one fresh Situation for groupKey via
 // a real Incident + situation_input_outbox round trip (mirrors internal/
 // store's own test fixtures), returning its id. incidentID is always

@@ -4,6 +4,7 @@ package situation_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -200,6 +201,193 @@ func TestControllerReconcileAuditsAssessmentReusedOnUnchangedTrustworthyBasis(t 
 	}
 	if audit.has("situation.assessment_call_dispatched") || audit.has("situation.assessment_authoritative") || audit.has("situation.assessment_fallback") {
 		t.Fatalf("audit kinds = %v, want no dispatch/authoritative/fallback event for a zero-L2-call reuse", audit.kinds)
+	}
+}
+
+// ----------------------------------------------------------------------
+// Task 9 fix round, Finding #4: duration_ms and provider_request_started
+// must carry REAL values measured from an actual call, not a
+// hand-constructed fixture that only proves the audit payload KEY is
+// present. These tests mirror the reviewer's own diagnostic method: a fake
+// client with a controlled, non-trivial (non-zero, easy to distinguish from
+// a bug that always reports 0) Latency, verifying the resulting audit
+// payload reflects it exactly — across every call-backed outcome
+// (authoritative/rejected/failed/stale).
+// ----------------------------------------------------------------------
+
+// acceptedResponseWithLatency mirrors acceptedResponse but stamps a
+// caller-controlled llm.Completion.Latency — the field a real provider
+// client (internal/llm/anthropic, internal/llm/openaicompat) always
+// populates from its own measured c.now().Sub(start), on every CompleteOnce
+// outcome, success or failure alike.
+func acceptedResponseWithLatency(t *testing.T, latency time.Duration) func() (llm.OneShotCompletion, error) {
+	t.Helper()
+	raw := acceptedProposalJSON(t)
+	return func() (llm.OneShotCompletion, error) {
+		return llm.OneShotCompletion{
+			Completion:     llm.Completion{Raw: raw, Model: "test-model", Latency: latency},
+			RequestStarted: llm.RequestStartStatusTrue,
+		}, nil
+	}
+}
+
+// policyRejectedResponseWithLatency mirrors policyRejectedResponse but
+// stamps a caller-controlled Latency, for the same reason as
+// acceptedResponseWithLatency above.
+func policyRejectedResponseWithLatency(t *testing.T, latency time.Duration) func() (llm.OneShotCompletion, error) {
+	t.Helper()
+	p := model.AssessmentProposal{
+		SchemaVersion: model.AssessmentSchemaVersion,
+		Persistence:   model.PersistenceSustained,
+		Impact:        model.ImpactSuspected,
+		Novelty:       model.NoveltyFamiliar,
+		Causality:     model.CausalityCorrelated,
+		Attention:     model.AttentionUrgent,
+	}
+	raw, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal policy-rejected proposal: %v", err)
+	}
+	return func() (llm.OneShotCompletion, error) {
+		return llm.OneShotCompletion{
+			Completion:     llm.Completion{Raw: raw, Model: "test-model", Latency: latency},
+			RequestStarted: llm.RequestStartStatusTrue,
+		}, nil
+	}
+}
+
+// payloadOfKind returns the map[string]any payload of the first record in
+// audit matching kind, failing the test if none matches or the payload is
+// not a map.
+func payloadOfKind(t *testing.T, audit *fakeAuditSink, kind string) map[string]any {
+	t.Helper()
+	for i, k := range audit.kinds {
+		if k != kind {
+			continue
+		}
+		payload, ok := audit.payloads[i].(map[string]any)
+		if !ok {
+			t.Fatalf("payload for %q type = %T, want map[string]any", kind, audit.payloads[i])
+		}
+		return payload
+	}
+	t.Fatalf("audit kinds = %v, want to find %q", audit.kinds, kind)
+	return nil
+}
+
+// TestControllerReconcileAuditsRealDurationAndProviderRequestStartedOnAuthoritative
+// mirrors TestControllerReconcileAuditsAssessmentCallDispatchedAndAuthoritative's
+// exact scenario but with a controlled, non-trivial fake-client Latency,
+// proving situation.assessment_authoritative's own duration_ms/
+// provider_request_started reflect that REAL measured call — not the
+// structurally-always-zero duration a same-clock-read CreatedAt/CompletedAt
+// pair produced before this fix.
+func TestControllerReconcileAuditsRealDurationAndProviderRequestStartedOnAuthoritative(t *testing.T) {
+	in := ctBaseSnapshotInput()
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1, beginRetryEpoch: 0}
+	const latency = 250 * time.Millisecond
+	client := &fakeAssessmentClient{responses: []func() (llm.OneShotCompletion, error){acceptedResponseWithLatency(t, latency)}}
+	audit := &fakeAuditSink{}
+	c := ctControllerWithAudit(t, store, client, audit)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	payload := payloadOfKind(t, audit, "situation.assessment_authoritative")
+	if got := payload["duration_ms"]; got != latency.Milliseconds() {
+		t.Fatalf("duration_ms = %v, want %d (the fake client's own scripted Latency)", got, latency.Milliseconds())
+	}
+	if got := payload["provider_request_started"]; got != "true" {
+		t.Fatalf("provider_request_started = %v, want true (a real call was made)", got)
+	}
+}
+
+// TestControllerReconcileAuditsRealDurationAndProviderRequestStartedOnRejected
+// mirrors TestControllerReconcileAuditsAssessmentRejectedOnPolicyRejection's
+// exact scenario but with a controlled fake-client Latency, proving
+// situation.assessment_rejected's own duration_ms/provider_request_started
+// reflect the REAL measured call that produced the rejected outcome.
+func TestControllerReconcileAuditsRealDurationAndProviderRequestStartedOnRejected(t *testing.T) {
+	in := ctBaseSnapshotInput()
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1, beginRetryEpoch: 0}
+	const latency = 175 * time.Millisecond
+	client := &fakeAssessmentClient{responses: []func() (llm.OneShotCompletion, error){policyRejectedResponseWithLatency(t, latency)}}
+	audit := &fakeAuditSink{}
+	c := ctControllerWithAudit(t, store, client, audit)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	payload := payloadOfKind(t, audit, "situation.assessment_rejected")
+	if got := payload["duration_ms"]; got != latency.Milliseconds() {
+		t.Fatalf("duration_ms = %v, want %d (the fake client's own scripted Latency)", got, latency.Milliseconds())
+	}
+	if got := payload["provider_request_started"]; got != "true" {
+		t.Fatalf("provider_request_started = %v, want true (a real call was made)", got)
+	}
+}
+
+// TestControllerReconcileAuditsRealDurationAndProviderRequestStartedOnFailed
+// mirrors TestControllerReconcileAuditsAssessmentFailedAndFallback's exact
+// scenario but with a controlled fake-client Latency stamped on the
+// transport-failure outcome, proving situation.assessment_failed's own
+// duration_ms/provider_request_started reflect the real measured call
+// attempt even though it ultimately failed transport-side.
+func TestControllerReconcileAuditsRealDurationAndProviderRequestStartedOnFailed(t *testing.T) {
+	in := ctBaseSnapshotInput()
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1, beginRetryEpoch: 0}
+	const latency = 90 * time.Millisecond
+	client := &fakeAssessmentClient{responses: []func() (llm.OneShotCompletion, error){
+		func() (llm.OneShotCompletion, error) {
+			return llm.OneShotCompletion{
+				Completion:     llm.Completion{Latency: latency},
+				RequestStarted: llm.RequestStartStatusUnknown,
+			}, errors.New("dial tcp: connection refused")
+		},
+	}}
+	audit := &fakeAuditSink{}
+	c := ctControllerWithAudit(t, store, client, audit)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	payload := payloadOfKind(t, audit, "situation.assessment_failed")
+	if got := payload["duration_ms"]; got != latency.Milliseconds() {
+		t.Fatalf("duration_ms = %v, want %d (the fake client's own scripted Latency)", got, latency.Milliseconds())
+	}
+	if got := payload["provider_request_started"]; got != string(llm.RequestStartStatusUnknown) {
+		t.Fatalf("provider_request_started = %v, want %q (ambiguous transport failure)", got, llm.RequestStartStatusUnknown)
+	}
+}
+
+// TestControllerReconcileAuditsRealDurationAndProviderRequestStartedOnStale
+// mirrors TestControllerReconcileAuditsAssessmentStaleOnStaleClaimAfterAcceptedCall's
+// exact scenario but with a controlled fake-client Latency, proving
+// situation.assessment_stale's own duration_ms/provider_request_started
+// reflect the real measured call that succeeded before the fenced commit
+// itself lost the race.
+func TestControllerReconcileAuditsRealDurationAndProviderRequestStartedOnStale(t *testing.T) {
+	in := ctBaseSnapshotInput()
+	sentinel := errors.New("stale claim")
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1, beginRetryEpoch: 0, commitErr: sentinel}
+	const latency = 300 * time.Millisecond
+	client := &fakeAssessmentClient{responses: []func() (llm.OneShotCompletion, error){acceptedResponseWithLatency(t, latency)}}
+	audit := &fakeAuditSink{}
+	c := ctControllerWithAudit(t, store, client, audit)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); !errors.Is(err, sentinel) {
+		t.Fatalf("Reconcile err = %v, want to wrap %v", err, sentinel)
+	}
+
+	payload := payloadOfKind(t, audit, "situation.assessment_stale")
+	if got := payload["duration_ms"]; got != latency.Milliseconds() {
+		t.Fatalf("duration_ms = %v, want %d (the fake client's own scripted Latency)", got, latency.Milliseconds())
+	}
+	if got := payload["provider_request_started"]; got != "true" {
+		t.Fatalf("provider_request_started = %v, want true (a real call succeeded before the stale race)", got)
 	}
 }
 
