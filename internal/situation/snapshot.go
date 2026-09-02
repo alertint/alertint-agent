@@ -23,6 +23,33 @@ type SnapshotInput struct {
 	PriorSituations   []CompletedSituation
 	CurrentAssessment *AuthoritativeAssessment
 	Now               time.Time
+
+	// ControllerParked is the Situation's current controller_parked_at/
+	// controller_parked_reason projection, plus the material fact hash the
+	// park was recorded against — read directly off situations' raw ALTER
+	// TABLE columns (migration 0015), which carry no model.Situation Go
+	// struct field of their own (see store's BeginControllerAttempt doc
+	// comment for why: Plan 1's model.Situation predates Plan 2's controller
+	// projection columns). Reconcile uses this to decide whether a policy/
+	// capability park still covers the CURRENT basis before dispatching new
+	// L2 work (Finding I1 — spec.md: "Policy rejection, unsupported scope,
+	// and unsupported capability are permanent for the unchanged basis").
+	ControllerParked ControllerParkedState
+}
+
+// ControllerParkedState is SnapshotInput's own read of the Situation's
+// current controller_parked_at/controller_parked_reason columns plus the
+// material fact hash they were recorded against. Zero value (Reason=="")
+// means "not currently parked." MaterialFactHash reliably names the exact
+// basis a currently-active park refers to because situations.
+// current_material_fact_hash is refreshed on every CommitController commit
+// regardless of whether that commit touches Parked (ControllerCommit's own
+// doc comment) — so as long as Parked stays untouched, MaterialFactHash and
+// the park it pairs with always move together.
+type ControllerParkedState struct {
+	At               *time.Time
+	Reason           string
+	MaterialFactHash string
 }
 
 // Delivery is one immutable Alert delivery belonging to a member Incident of

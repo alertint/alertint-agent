@@ -51,8 +51,17 @@ type fakeControllerStore struct {
 	claimFn      func(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]situation.Claim, error)
 	extendCalls  []situation.Claim
 	extendErr    error
-	releaseCalls []situation.Claim
+	releaseCalls []releaseControllerWorkCall
 	releaseErr   error
+}
+
+// releaseControllerWorkCall records one ReleaseControllerWork invocation —
+// the claim it released plus the backoff (Finding I2) it was asked to write,
+// if any.
+type releaseControllerWorkCall struct {
+	Claim      situation.Claim
+	RetryAt    *time.Time
+	ErrorClass *string
 }
 
 func (f *fakeControllerStore) LoadReconciliationInput(ctx context.Context, claim situation.Claim, now time.Time) (situation.SnapshotInput, error) {
@@ -143,10 +152,10 @@ func (f *fakeControllerStore) ExtendControllerLease(ctx context.Context, claim s
 	return f.extendErr
 }
 
-func (f *fakeControllerStore) ReleaseControllerWork(ctx context.Context, claim situation.Claim, now time.Time) error {
+func (f *fakeControllerStore) ReleaseControllerWork(ctx context.Context, claim situation.Claim, now time.Time, retryAt *time.Time, errorClass *string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.releaseCalls = append(f.releaseCalls, claim)
+	f.releaseCalls = append(f.releaseCalls, releaseControllerWorkCall{Claim: claim, RetryAt: retryAt, ErrorClass: errorClass})
 	return f.releaseErr
 }
 
@@ -156,10 +165,10 @@ func (f *fakeControllerStore) snapshotExtendCalls() int {
 	return len(f.extendCalls)
 }
 
-func (f *fakeControllerStore) snapshotReleaseCalls() []situation.Claim {
+func (f *fakeControllerStore) snapshotReleaseCalls() []releaseControllerWorkCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]situation.Claim(nil), f.releaseCalls...)
+	return append([]releaseControllerWorkCall(nil), f.releaseCalls...)
 }
 
 func (f *fakeControllerStore) snapshotCommits() []situation.ControllerCommit {
@@ -377,31 +386,86 @@ func TestControllerReconcileUnchangedTrustworthyBasisReusesWithZeroL2Calls(t *te
 	if commit.Attempt.ID == "" {
 		t.Fatal("reuse must still write a new authoritative attempt row")
 	}
+	// Finding C1: a reuse commit must carry a schema-valid work_attempt (1,
+	// the documented nominal value for a non-work-bearing commit) — 0 fails
+	// migration 0015's CHECK (work_attempt BETWEEN 1 AND 5) against a real
+	// store; see TestCommitControllerRejectsWorkAttemptZeroCheckConstraint and
+	// the real-SQLite end-to-end reuse test in internal/store.
+	if commit.Attempt.WorkAttempt != 1 {
+		t.Fatalf("reuse commit work_attempt = %d, want 1 (migration 0015 requires >= 1; 0 violates the CHECK)", commit.Attempt.WorkAttempt)
+	}
 }
 
-func TestControllerReconcileDeterministicUrgentFloorCommitsWithoutL2(t *testing.T) {
+// TestControllerReconcileDeterministicFloorDispatchesL2AndForcesUrgentOnAccept
+// proves Finding I3's ruling: a deterministic urgent floor (critical severity)
+// no longer short-circuits Reconcile before ever consulting L2 — the first
+// cycle for a floor Situation with no prior trustworthy Assessment still
+// dispatches exactly like any other Situation. When L2 succeeds, the floor's
+// only effect is forcing Attention to urgent (Task 5's own validateProposalContent
+// adjustment mechanism, unconditionally applied here, not a Reconcile-level
+// special case) regardless of what the model itself proposed.
+func TestControllerReconcileDeterministicFloorDispatchesL2AndForcesUrgentOnAccept(t *testing.T) {
 	in := ctBaseSnapshotInput()
 	in.Deliveries = []situation.Delivery{ctDelivery("delivery-1", "incident-1", true, "critical")}
 
-	store := &fakeControllerStore{loadInput: in}
-	client := &fakeAssessmentClient{}
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1, beginRetryEpoch: 0}
+	// acceptedResponse proposes AttentionObserve — the floor must still force
+	// it up to urgent via the adjustment mechanism, not a Reconcile short-circuit.
+	client := &fakeAssessmentClient{responses: []func() (llm.OneShotCompletion, error){acceptedResponse(t)}}
 	c := ctController(t, store, client)
 
 	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if client.calls != 0 {
-		t.Fatalf("CompleteOnce calls = %d, want 0 (deterministic floor must not wait for L2)", client.calls)
+	if client.calls != 1 {
+		t.Fatalf("CompleteOnce calls = %d, want exactly 1 (a deterministic floor no longer skips L2 dispatch on the first cycle)", client.calls)
 	}
 	if len(store.commits) != 1 {
 		t.Fatalf("commits = %d, want 1", len(store.commits))
 	}
 	commit := store.commits[0]
-	if commit.Attempt.Derivation != model.DerivationDeterministic {
-		t.Fatalf("derivation = %q, want %q", commit.Attempt.Derivation, model.DerivationDeterministic)
+	if commit.Attempt.Derivation != model.DerivationModelValidated {
+		t.Fatalf("derivation = %q, want %q (a first cycle with a floor still consults L2)", commit.Attempt.Derivation, model.DerivationModelValidated)
 	}
 	if commit.Attention != model.AttentionUrgent {
-		t.Fatalf("attention = %q, want urgent", commit.Attention)
+		t.Fatalf("attention = %q, want urgent (the floor forces Attention up regardless of the model's own proposal)", commit.Attention)
+	}
+}
+
+// TestControllerReconcileDeterministicFloorFallsBackUrgentWhenL2Fails proves
+// the other half of Finding I3's ruling: when L2 genuinely fails on a floor
+// Situation's first cycle (no trustworthy prior Assessment exists), Reconcile
+// falls back to DeterministicFallback — which independently applies the same
+// floor check — so Attention is STILL immediately urgent from the very first
+// cycle regardless of L2 outcome, and a bounded retry is scheduled (not a
+// permanent stuck state) so the Situation gets a real L2 dispatch again on a
+// later cycle.
+func TestControllerReconcileDeterministicFloorFallsBackUrgentWhenL2Fails(t *testing.T) {
+	in := ctBaseSnapshotInput()
+	in.Deliveries = []situation.Delivery{ctDelivery("delivery-1", "incident-1", true, "critical")}
+
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1, beginRetryEpoch: 0}
+	client := &fakeAssessmentClient{} // no scripted responses: CompleteOnce fails.
+	c := ctController(t, store, client)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if client.calls != 1 {
+		t.Fatalf("CompleteOnce calls = %d, want exactly 1 (L2 must still be attempted before falling back)", client.calls)
+	}
+	if len(store.commits) != 1 {
+		t.Fatalf("commits = %d, want 1", len(store.commits))
+	}
+	commit := store.commits[0]
+	if commit.Attempt.Derivation != model.DerivationDeterministicFallback {
+		t.Fatalf("derivation = %q, want %q", commit.Attempt.Derivation, model.DerivationDeterministicFallback)
+	}
+	if commit.Attention != model.AttentionUrgent {
+		t.Fatalf("attention = %q, want urgent (the deterministic floor still applies to the fallback Assessment) even though L2 failed", commit.Attention)
+	}
+	if commit.RetryAt == nil {
+		t.Fatal("expected a bounded retry to be scheduled, not a permanent stuck state on conservative-default semantic fields")
 	}
 }
 
@@ -540,6 +604,95 @@ func TestControllerReconcilePolicyRejectionParksWithoutRetry(t *testing.T) {
 	}
 	if !commit.Parked.Touch || commit.Parked.Reason != situation.ParkedReasonPolicyRejected {
 		t.Fatalf("Parked = %+v, want Touch=true Reason=%q", commit.Parked, situation.ParkedReasonPolicyRejected)
+	}
+}
+
+// TestControllerReconcilePolicyParkSuppressesDispatchUntilBasisChanges proves
+// Finding I1: a policy/capability park is actually ENFORCED across cycles, not
+// merely recorded. The single-cycle test above only proves this cycle's own
+// RetryAt is nil — it says nothing about permanence. This test runs THREE
+// cycles: cycle 1 parks on a policy rejection; cycle 2 (the store now
+// reflecting the park CommitController would have persisted, same basis) must
+// NOT dispatch another L2 call or even call BeginControllerAttempt; cycle 3
+// (a changed basis — the stale park still recorded against the OLD hash,
+// exactly as a real store would leave it since nothing clears it just because
+// the input changed) must dispatch again, proving the park lifts naturally
+// rather than staying parked forever.
+func TestControllerReconcilePolicyParkSuppressesDispatchUntilBasisChanges(t *testing.T) {
+	in1 := ctBaseSnapshotInput()
+	in1.Now = ctBaseTime.Add(10 * time.Minute)
+	snap1 := situation.BuildSnapshot(in1)
+
+	store := &fakeControllerStore{loadInput: in1, beginWorkAttempt: 1, beginRetryEpoch: 0}
+	client := &fakeAssessmentClient{responses: []func() (llm.OneShotCompletion, error){policyRejectedResponse(t)}}
+	c := ctController(t, store, client)
+
+	// Cycle 1: policy rejection parks.
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("cycle 1 Reconcile: %v", err)
+	}
+	if client.calls != 1 {
+		t.Fatalf("cycle 1 CompleteOnce calls = %d, want 1", client.calls)
+	}
+	if len(store.commits) != 1 {
+		t.Fatalf("cycle 1 commits = %d, want 1", len(store.commits))
+	}
+	commit1 := store.commits[0]
+	if !commit1.Parked.Touch || commit1.Parked.Reason != situation.ParkedReasonPolicyRejected {
+		t.Fatalf("cycle 1 Parked = %+v, want Touch=true Reason=%q", commit1.Parked, situation.ParkedReasonPolicyRejected)
+	}
+
+	// Cycle 2: SAME basis, store now reflects the park a real CommitController
+	// commit would have persisted (parked reason + the material fact hash it
+	// was parked against, both taken from cycle 1's own commit) — must NOT
+	// dispatch another L2 call, and must not even call BeginControllerAttempt.
+	store.loadInput.ControllerParked = situation.ControllerParkedState{
+		Reason: commit1.Parked.Reason, MaterialFactHash: snap1.MaterialFactHash,
+	}
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("cycle 2 Reconcile: %v", err)
+	}
+	if client.calls != 1 {
+		t.Fatalf("cycle 2 CompleteOnce calls = %d, want still 1 (park must suppress dispatch on the unchanged basis)", client.calls)
+	}
+	if store.beginCalls != 1 {
+		t.Fatalf("cycle 2 BeginControllerAttempt calls = %d, want still 1 (park must skip BeginControllerAttempt entirely, not just skip dispatch after it)", store.beginCalls)
+	}
+	if len(store.commits) != 2 {
+		t.Fatalf("cycle 2 commits = %d, want 2", len(store.commits))
+	}
+	if store.commits[1].Parked.Touch {
+		t.Fatalf("cycle 2 must not re-touch parked state, got %+v", store.commits[1].Parked)
+	}
+
+	// Cycle 3: CHANGED basis (a second Incident joins the Situation) — the
+	// stale park (still recorded against the OLD hash) must be treated as
+	// lifted, and work-bearing dispatch must proceed again.
+	in3 := ctBaseSnapshotInput()
+	in3.Now = ctBaseTime.Add(10 * time.Minute)
+	in3.Incidents = append(in3.Incidents, ctIncident("incident-2"))
+	in3.Deliveries = append(in3.Deliveries, ctDelivery("delivery-2", "incident-2", true, "warning"))
+	snap3 := situation.BuildSnapshot(in3)
+	if snap3.MaterialFactHash == snap1.MaterialFactHash {
+		t.Fatal("fixture invariant: cycle 3's own input change must actually change MaterialFactHash, or this test proves nothing")
+	}
+	store.loadInput = in3
+	store.loadInput.ControllerParked = situation.ControllerParkedState{
+		Reason: commit1.Parked.Reason, MaterialFactHash: snap1.MaterialFactHash, // stale: still names the OLD hash.
+	}
+	client.responses = append(client.responses, acceptedResponse(t))
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("cycle 3 Reconcile: %v", err)
+	}
+	if client.calls != 2 {
+		t.Fatalf("cycle 3 CompleteOnce calls = %d, want 2 (a changed basis must lift the stale park and dispatch again)", client.calls)
+	}
+	if len(store.commits) != 3 {
+		t.Fatalf("cycle 3 commits = %d, want 3", len(store.commits))
+	}
+	if store.commits[2].Parked.Touch && store.commits[2].Parked.Reason != "" {
+		t.Fatalf("cycle 3's successful accepted dispatch must clear the park, got %+v", store.commits[2].Parked)
 	}
 }
 
@@ -747,5 +900,236 @@ func TestControllerReconcileTriageRequestAndAssessmentShareOneCommit(t *testing.
 	}
 	if commit.TriageDecisions[0].Decision != situation.TriageDecisionRequest {
 		t.Fatalf("decision = %q, want request (no trustworthy Assessment exists yet)", commit.TriageDecisions[0].Decision)
+	}
+}
+
+// --------------------------------------------------------------------------
+// Lifecycle transition tests (Finding C2 + the brief's originally-requested
+// coverage). resolveLifecycle is unexported, so these drive it through
+// Reconcile — lifecycle_test.go (package situation) only covers the pure
+// timing HELPERS (RecoveryGraceDuration, ObservationDeadlineAt,
+// ClosedUnknownReason, AnyFiring, AdvanceLifecycle) in isolation, never
+// resolveLifecycle/Reconcile actually driving a Situation through these
+// transitions end to end — exactly the gap that let Finding C2 through.
+// --------------------------------------------------------------------------
+
+// ctLifecycleController builds a Controller with a fixed clock returning now
+// — unlike ctController's hardcoded ctBaseTime+10m offset, these tests need
+// precise, test-specific control over elapsed time (DurationClass,
+// ObservationDeadlineAt) and grace timing.
+func ctLifecycleController(store situation.ControllerStore, client situation.AssessmentClient, now time.Time) *situation.Controller {
+	clock := func() time.Time { return now }
+	return situation.NewController(store, client, situation.ControllerConfig{}, clock, nil, nil)
+}
+
+func TestControllerReconcileLifecycleActiveStaysActiveWhileFiring(t *testing.T) {
+	now := ctBaseTime.Add(5 * time.Minute)
+	in := ctBaseSnapshotInput() // one firing delivery, active lifecycle.
+	in.Now = now
+
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
+	c := ctLifecycleController(store, &fakeAssessmentClient{}, now)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(store.commits) != 1 {
+		t.Fatalf("commits = %d, want 1", len(store.commits))
+	}
+	commit := store.commits[0]
+	if commit.Lifecycle != model.LifecycleActive {
+		t.Fatalf("lifecycle = %q, want active", commit.Lifecycle)
+	}
+	if commit.RecoveryObservedAt != nil || commit.GraceUntil != nil || commit.TerminalAt != nil || commit.TerminalReason != nil {
+		t.Fatalf("active must carry all four recovery/terminal fields nil (migration 0014's per-lifecycle CHECK), got %+v", commit)
+	}
+}
+
+func TestControllerReconcileLifecycleActiveTransitionsToRecoveryPendingOnResolution(t *testing.T) {
+	now := ctBaseTime.Add(5 * time.Minute)
+	in := ctBaseSnapshotInput()
+	in.Now = now
+	in.Deliveries = []situation.Delivery{ctDelivery("delivery-1", "incident-1", false, "warning")} // resolved, not firing.
+
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
+	c := ctLifecycleController(store, &fakeAssessmentClient{}, now)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	commit := store.commits[0]
+	if commit.Lifecycle != model.LifecycleRecoveryPending {
+		t.Fatalf("lifecycle = %q, want recovery_pending", commit.Lifecycle)
+	}
+	if commit.RecoveryObservedAt == nil || !commit.RecoveryObservedAt.Equal(now) {
+		t.Fatalf("recovery_observed_at = %v, want %v", commit.RecoveryObservedAt, now)
+	}
+	if commit.GraceUntil == nil {
+		t.Fatal("grace_until must be set on a fresh recovery_pending transition")
+	}
+	if commit.TerminalAt != nil || commit.TerminalReason != nil {
+		t.Fatalf("recovery_pending must carry both terminal fields nil, got %+v", commit)
+	}
+}
+
+func TestControllerReconcileLifecycleRefireDuringGraceReturnsToActive(t *testing.T) {
+	effectiveStartedAt := ctBaseTime
+	recoveryObservedAt := ctBaseTime.Add(5 * time.Minute)
+	graceUntil := recoveryObservedAt.Add(2 * time.Minute)
+	now := recoveryObservedAt.Add(time.Minute) // still within grace.
+
+	in := ctBaseSnapshotInput()
+	in.Now = now
+	in.Situation.EffectiveStartedAt = effectiveStartedAt
+	in.Situation.Lifecycle = model.LifecycleRecoveryPending
+	in.Situation.RecoveryObservedAt = &recoveryObservedAt
+	in.Situation.GraceUntil = &graceUntil
+	in.Deliveries = []situation.Delivery{ctDelivery("delivery-1", "incident-1", true, "warning")} // firing again.
+
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
+	c := ctLifecycleController(store, &fakeAssessmentClient{}, now)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	commit := store.commits[0]
+	if commit.Lifecycle != model.LifecycleActive {
+		t.Fatalf("lifecycle = %q, want active", commit.Lifecycle)
+	}
+	if commit.RecoveryObservedAt != nil || commit.GraceUntil != nil || commit.TerminalAt != nil || commit.TerminalReason != nil {
+		t.Fatalf("a refire returning to active must carry all four recovery/terminal fields nil, got %+v", commit)
+	}
+}
+
+func TestControllerReconcileLifecycleGraceExpiryReachesRecovered(t *testing.T) {
+	effectiveStartedAt := ctBaseTime
+	recoveryObservedAt := ctBaseTime.Add(5 * time.Minute)
+	graceUntil := recoveryObservedAt.Add(2 * time.Minute)
+	now := graceUntil.Add(time.Minute) // grace already expired.
+
+	in := ctBaseSnapshotInput()
+	in.Now = now
+	in.Situation.EffectiveStartedAt = effectiveStartedAt
+	in.Situation.Lifecycle = model.LifecycleRecoveryPending
+	in.Situation.RecoveryObservedAt = &recoveryObservedAt
+	in.Situation.GraceUntil = &graceUntil
+	in.Deliveries = []situation.Delivery{ctDelivery("delivery-1", "incident-1", false, "warning")} // still not firing.
+
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
+	c := ctLifecycleController(store, &fakeAssessmentClient{}, now)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	commit := store.commits[0]
+	if commit.Lifecycle != model.LifecycleRecovered {
+		t.Fatalf("lifecycle = %q, want recovered", commit.Lifecycle)
+	}
+	if commit.RecoveryObservedAt == nil || !commit.RecoveryObservedAt.Equal(recoveryObservedAt) {
+		t.Fatalf("recovery_observed_at = %v, want %v", commit.RecoveryObservedAt, recoveryObservedAt)
+	}
+	if commit.GraceUntil == nil || !commit.GraceUntil.Equal(graceUntil) {
+		t.Fatalf("grace_until = %v, want %v", commit.GraceUntil, graceUntil)
+	}
+	if commit.TerminalAt == nil || !commit.TerminalAt.Equal(now) {
+		t.Fatalf("terminal_at = %v, want %v", commit.TerminalAt, now)
+	}
+	if commit.TerminalReason != nil {
+		t.Fatalf("recovered must carry terminal_reason nil (migration 0014's per-lifecycle CHECK), got %v", commit.TerminalReason)
+	}
+}
+
+// TestControllerReconcileLifecycleDeadlineDuringRecoveryReachesClosedUnknownWithGraceCarried
+// is Finding C2's core regression test: recovery_pending -> closed_unknown
+// via the observation deadline being crossed WHILE still within the grace
+// window (deadline < grace_until) — the exact reachable window the reviewer
+// identified. Before the fix, this branch left GraceUntil nil while
+// RecoveryObservedAt stayed non-nil, violating migration 0014's unconditional
+// recovery-field pairing CHECK ((recovery_observed_at IS NULL) =
+// (grace_until IS NULL)).
+func TestControllerReconcileLifecycleDeadlineDuringRecoveryReachesClosedUnknownWithGraceCarried(t *testing.T) {
+	effectiveStartedAt := ctBaseTime
+	// "long" duration class (elapsed >= 1h) has no upper bound, so its own
+	// 7-day deadline can be crossed while still self-consistently "long" —
+	// see ObservationDeadlineDuration's own doc comment. This is the only
+	// class where pastDeadline is naturally reachable at all (short/medium's
+	// own deadlines — 2h/24h — always exceed their own class's elapsed
+	// range).
+	deadline := effectiveStartedAt.Add(7 * 24 * time.Hour)
+	recoveryObservedAt := deadline.Add(-time.Minute)      // observed shortly before the deadline.
+	graceUntil := recoveryObservedAt.Add(2 * time.Minute) // = deadline + 1 minute: expires AFTER the deadline.
+	now := deadline.Add(30 * time.Second)                 // past the deadline, still (barely) within grace.
+
+	if !now.Before(graceUntil) {
+		t.Fatalf("fixture invariant: now (%v) must be before graceUntil (%v) — this test exercises the deadline-crossed-while-still-in-grace window", now, graceUntil)
+	}
+
+	in := ctBaseSnapshotInput()
+	in.Now = now
+	in.Situation.EffectiveStartedAt = effectiveStartedAt
+	in.Situation.EffectiveStartedAtBasis = model.SourceTimeBasisSourcePayload
+	in.Situation.Lifecycle = model.LifecycleRecoveryPending
+	in.Situation.RecoveryObservedAt = &recoveryObservedAt
+	in.Situation.GraceUntil = &graceUntil
+	in.Deliveries = []situation.Delivery{ctDelivery("delivery-1", "incident-1", false, "warning")} // resolved, not firing.
+
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
+	c := ctLifecycleController(store, &fakeAssessmentClient{}, now)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(store.commits) != 1 {
+		t.Fatalf("commits = %d, want 1", len(store.commits))
+	}
+	commit := store.commits[0]
+	if commit.Lifecycle != model.LifecycleClosedUnknown {
+		t.Fatalf("lifecycle = %q, want closed_unknown", commit.Lifecycle)
+	}
+	if commit.RecoveryObservedAt == nil || !commit.RecoveryObservedAt.Equal(recoveryObservedAt) {
+		t.Fatalf("recovery_observed_at = %v, want %v", commit.RecoveryObservedAt, recoveryObservedAt)
+	}
+	if commit.GraceUntil == nil || !commit.GraceUntil.Equal(graceUntil) {
+		t.Fatalf("grace_until = %v, want %v carried forward (Finding C2) — nil violates migration 0014's recovery-field pairing CHECK", commit.GraceUntil, graceUntil)
+	}
+	if commit.TerminalAt == nil || !commit.TerminalAt.Equal(now) {
+		t.Fatalf("terminal_at = %v, want %v", commit.TerminalAt, now)
+	}
+	if commit.TerminalReason == nil {
+		t.Fatal("terminal_reason must be set for closed_unknown")
+	}
+}
+
+// TestControllerReconcileLifecycleActiveReachesClosedUnknownWithoutRecoveryFields
+// covers the OTHER reachable closed_unknown path — straight from active, no
+// recovery ever observed — proving RecoveryObservedAt/GraceUntil correctly
+// stay nil (never fabricated) when the Situation never entered recovery at
+// all, alongside the C2 test above's carried-forward-non-nil case.
+func TestControllerReconcileLifecycleActiveReachesClosedUnknownWithoutRecoveryFields(t *testing.T) {
+	effectiveStartedAt := ctBaseTime
+	now := effectiveStartedAt.Add(7*24*time.Hour + time.Minute) // just past the "long" class's 7-day deadline.
+
+	in := ctBaseSnapshotInput()
+	in.Now = now
+	in.Situation.EffectiveStartedAt = effectiveStartedAt
+	in.Situation.EffectiveStartedAtBasis = model.SourceTimeBasisSourcePayload
+	in.Situation.Lifecycle = model.LifecycleActive
+	in.Deliveries = []situation.Delivery{ctDelivery("delivery-1", "incident-1", false, "warning")} // resolved, not firing, never recovered through the controller.
+
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
+	c := ctLifecycleController(store, &fakeAssessmentClient{}, now)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	commit := store.commits[0]
+	if commit.Lifecycle != model.LifecycleClosedUnknown {
+		t.Fatalf("lifecycle = %q, want closed_unknown", commit.Lifecycle)
+	}
+	if commit.RecoveryObservedAt != nil || commit.GraceUntil != nil {
+		t.Fatalf("closed_unknown reached directly from active (recovery never observed) must carry both recovery fields nil, got RecoveryObservedAt=%v GraceUntil=%v", commit.RecoveryObservedAt, commit.GraceUntil)
+	}
+	if commit.TerminalAt == nil || commit.TerminalReason == nil {
+		t.Fatalf("closed_unknown must carry both terminal fields set, got TerminalAt=%v TerminalReason=%v", commit.TerminalAt, commit.TerminalReason)
 	}
 }

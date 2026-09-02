@@ -780,6 +780,106 @@ func providerRequestStartedPtr(p situationmodel.ProviderRequestStarted) *situati
 	return &p
 }
 
+// TestCommitControllerRejectsWorkAttemptZeroCheckConstraint is Finding C1's
+// regression test: migration 0015's situation_assessment_attempts CHECK
+// requires work_attempt BETWEEN 1 AND 5. Before the fix, controller.go's
+// revalidated-reuse and deterministic-urgent-floor commits both passed
+// workAttempt=0 — every one of those commits would have FAILED against this
+// real schema, completely hidden by controller_test.go's fake store (which
+// never enforces the CHECK at all). This reproduces the exact bug shape
+// directly and proves the CHECK genuinely rejects it.
+func TestCommitControllerRejectsWorkAttemptZeroCheckConstraint(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-commit-workattempt-zero", now)
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+
+	commit := basicControllerCommit(sitID, claim.Situation.InputVersion, now)
+	commit.Attempt.WorkAttempt = 0 // the exact pre-fix bug shape (Finding C1).
+	if err := st.CommitController(context.Background(), claim, commit); err == nil {
+		t.Fatal("CommitController with work_attempt=0 succeeded, want a CHECK constraint failure (migration 0015: work_attempt BETWEEN 1 AND 5)")
+	}
+}
+
+// TestCommitControllerClosedUnknownRequiresGraceUntilPairedWithRecoveryObservedAt
+// is Finding C2's regression test: migration 0014's unconditional recovery-
+// field pairing CHECK ((recovery_observed_at IS NULL) = (grace_until IS
+// NULL)) rejects a closed_unknown commit that carries RecoveryObservedAt
+// non-nil but GraceUntil nil — the exact shape resolveLifecycle's
+// recovery_pending -> closed_unknown-via-deadline branch produced before the
+// fix — and accepts the fixed shape (GraceUntil carried forward alongside
+// it).
+func TestCommitControllerClosedUnknownRequiresGraceUntilPairedWithRecoveryObservedAt(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	reason := situationmodel.TerminalReasonObservationDeadline
+
+	sitBuggy := newSituationForGroup(t, st, "group-commit-c2-buggy", now)
+	claimBuggy := claimSituation(t, st, sitBuggy, "controller-a", now)
+	commitBuggy := basicControllerCommit(sitBuggy, claimBuggy.Situation.InputVersion, now)
+	commitBuggy.Lifecycle = situationmodel.LifecycleClosedUnknown
+	commitBuggy.RecoveryObservedAt = timePtrValue(now.Add(-time.Minute))
+	commitBuggy.GraceUntil = nil // the exact pre-fix bug shape (Finding C2).
+	commitBuggy.TerminalAt = timePtrValue(now)
+	commitBuggy.TerminalReason = &reason
+	if err := st.CommitController(context.Background(), claimBuggy, commitBuggy); err == nil {
+		t.Fatal("CommitController with RecoveryObservedAt non-nil and GraceUntil nil for closed_unknown succeeded, want a CHECK constraint failure (migration 0014's recovery-field pairing CHECK)")
+	}
+
+	sitFixed := newSituationForGroup(t, st, "group-commit-c2-fixed", now)
+	claimFixed := claimSituation(t, st, sitFixed, "controller-a", now)
+	commitFixed := basicControllerCommit(sitFixed, claimFixed.Situation.InputVersion, now)
+	commitFixed.Lifecycle = situationmodel.LifecycleClosedUnknown
+	commitFixed.RecoveryObservedAt = timePtrValue(now.Add(-time.Minute))
+	commitFixed.GraceUntil = timePtrValue(now.Add(time.Minute)) // carried forward — the fixed shape.
+	commitFixed.TerminalAt = timePtrValue(now)
+	commitFixed.TerminalReason = &reason
+	if err := st.CommitController(context.Background(), claimFixed, commitFixed); err != nil {
+		t.Fatalf("CommitController with the fixed (GraceUntil carried forward) shape: %v", err)
+	}
+
+	sit := getSituationByID(t, st, sitFixed)
+	if sit.Lifecycle != situationmodel.LifecycleClosedUnknown {
+		t.Fatalf("lifecycle = %q, want closed_unknown", sit.Lifecycle)
+	}
+	if sit.GraceUntil == nil {
+		t.Fatal("grace_until must be persisted non-nil")
+	}
+}
+
+// TestLoadReconciliationInputReadsControllerParkedState proves Finding I1's
+// store-side read: LoadReconciliationInput surfaces controller_parked_at/
+// controller_parked_reason/current_material_fact_hash as
+// situation.ControllerParkedState — the data Reconcile needs to decide
+// whether a policy/capability park still covers the current basis before
+// dispatching new L2 work.
+func TestLoadReconciliationInputReadsControllerParkedState(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-parked-read", now)
+
+	if _, err := st.db.ExecContext(context.Background(), `
+		UPDATE situations SET controller_parked_at = ?, controller_parked_reason = ?, current_material_fact_hash = ?
+		WHERE id = ?`, canonicalTime(now), situation.ParkedReasonPolicyRejected, "sha256:parked-basis", sitID); err != nil {
+		t.Fatalf("seed parked state: %v", err)
+	}
+
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+	snap, err := st.LoadReconciliationInput(context.Background(), claim, now)
+	if err != nil {
+		t.Fatalf("LoadReconciliationInput: %v", err)
+	}
+	if snap.ControllerParked.Reason != situation.ParkedReasonPolicyRejected {
+		t.Fatalf("parked reason = %q, want %q", snap.ControllerParked.Reason, situation.ParkedReasonPolicyRejected)
+	}
+	if snap.ControllerParked.MaterialFactHash != "sha256:parked-basis" {
+		t.Fatalf("parked material fact hash = %q, want sha256:parked-basis", snap.ControllerParked.MaterialFactHash)
+	}
+	if snap.ControllerParked.At == nil || !snap.ControllerParked.At.Equal(now) {
+		t.Fatalf("parked at = %v, want %v", snap.ControllerParked.At, now)
+	}
+}
+
 // TestCommitControllerNextAssessmentAtAdvancesOnOrdinaryCommit proves the
 // checkpoint actually moves into the future on a normal commit — a Situation
 // is claimed BECAUSE next_assessment_at was already <= now (it was due), so
@@ -1212,12 +1312,77 @@ func TestReleaseControllerWorkReleasesLease(t *testing.T) {
 	sitID := newSituationForGroup(t, st, "group-release-work", now)
 	claim := claimSituation(t, st, sitID, "controller-a", now)
 
-	if err := st.ReleaseControllerWork(context.Background(), claim, now); err != nil {
+	if err := st.ReleaseControllerWork(context.Background(), claim, now, nil, nil); err != nil {
 		t.Fatalf("ReleaseControllerWork: %v", err)
 	}
 	sit := getSituationByID(t, st, sitID)
 	if sit.LeaseOwner != nil {
 		t.Fatalf("lease_owner = %v, want nil after release", sit.LeaseOwner)
+	}
+}
+
+// TestReleaseControllerWorkWithBackoffPushesCheckpointForward proves Finding
+// I2's store-level fix: releasing with a non-nil retryAt clears the lease AND
+// pushes next_assessment_at/retry_at forward and records errorClass, so the
+// row is not instantly re-claimable — without this, a persistently-failing
+// Situation would spin ControllerWorker.Drain at 100% CPU.
+func TestReleaseControllerWorkWithBackoffPushesCheckpointForward(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-release-work-backoff", now)
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+
+	if !claim.Situation.NextAssessmentAt.Before(now) && !claim.Situation.NextAssessmentAt.Equal(now) {
+		t.Fatalf("fixture invariant: claim.Situation.NextAssessmentAt = %v must be <= now = %v (the row was due)", claim.Situation.NextAssessmentAt, now)
+	}
+
+	retryAt := now.Add(30 * time.Second)
+	errClass := "controller_reconcile_failed"
+	if err := st.ReleaseControllerWork(context.Background(), claim, now, &retryAt, &errClass); err != nil {
+		t.Fatalf("ReleaseControllerWork with backoff: %v", err)
+	}
+
+	sit := getSituationByID(t, st, sitID)
+	if sit.LeaseOwner != nil {
+		t.Fatalf("lease_owner = %v, want nil after release", sit.LeaseOwner)
+	}
+	if sit.RetryAt == nil || !sit.RetryAt.Equal(retryAt) {
+		t.Fatalf("retry_at = %v, want %v", sit.RetryAt, retryAt)
+	}
+	if sit.LastErrorClass == nil || *sit.LastErrorClass != errClass {
+		t.Fatalf("last_error_class = %v, want %q", sit.LastErrorClass, errClass)
+	}
+	if !sit.NextAssessmentAt.Equal(retryAt) {
+		t.Fatalf("next_assessment_at = %v, want the pushed-forward backoff checkpoint %v (must not stay instantly due)", sit.NextAssessmentAt, retryAt)
+	}
+}
+
+// TestReleaseControllerWorkWithBackoffPreservesConcurrentlyEarlierCheckpoint
+// proves the backoff push never clobbers a genuinely earlier, concurrently
+// persisted next_assessment_at (e.g. a fresh material input landing between
+// claim and this release wants to be reprocessed SOONER, not later) — the
+// same min-against-a-detected-concurrent-write rule CommitController's own
+// next_assessment_at computation uses.
+func TestReleaseControllerWorkWithBackoffPreservesConcurrentlyEarlierCheckpoint(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-release-work-concurrent", now)
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+
+	earlierCheckpoint := now.Add(-time.Minute)
+	if _, err := st.db.ExecContext(context.Background(), `UPDATE situations SET next_assessment_at = ? WHERE id = ?`, canonicalTime(earlierCheckpoint), sitID); err != nil {
+		t.Fatalf("pull checkpoint earlier (simulate a concurrent write): %v", err)
+	}
+
+	retryAt := now.Add(30 * time.Second) // proposed LATER than the concurrently-persisted earlier checkpoint.
+	errClass := "controller_reconcile_failed"
+	if err := st.ReleaseControllerWork(context.Background(), claim, now, &retryAt, &errClass); err != nil {
+		t.Fatalf("ReleaseControllerWork with backoff: %v", err)
+	}
+
+	sit := getSituationByID(t, st, sitID)
+	if !sit.NextAssessmentAt.Equal(earlierCheckpoint) {
+		t.Fatalf("next_assessment_at = %v, want the earlier concurrently-persisted checkpoint %v preserved", sit.NextAssessmentAt, earlierCheckpoint)
 	}
 }
 

@@ -106,6 +106,11 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 		return situation.SnapshotInput{}, err
 	}
 
+	parked, err := readControllerParkedStateTx(ctx, tx, sit.ID)
+	if err != nil {
+		return situation.SnapshotInput{}, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return situation.SnapshotInput{}, fmt.Errorf("store: commit load reconciliation input: %w", err)
 	}
@@ -117,7 +122,43 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 		PriorSituations:   prior,
 		CurrentAssessment: current,
 		Now:               now.UTC(),
+		ControllerParked:  parked,
 	}, nil
+}
+
+// readControllerParkedStateTx reads situationID's current controller_parked_at/
+// controller_parked_reason/current_material_fact_hash columns directly — raw
+// ALTER TABLE columns (migration 0015) Plan 1's model.Situation carries no Go
+// struct field for (see BeginControllerAttempt's own doc comment for why),
+// mirroring exactly how BeginControllerAttempt itself reads them. Finding I1:
+// Reconcile needs this to decide whether a policy/capability park still
+// covers the CURRENT basis before dispatching new L2 work.
+func readControllerParkedStateTx(ctx context.Context, tx *sql.Tx, situationID string) (situation.ControllerParkedState, error) {
+	var parkedAt, parkedReason, materialFactHash sql.NullString
+	err := tx.QueryRowContext(ctx, `
+		SELECT controller_parked_at, controller_parked_reason, current_material_fact_hash
+		FROM situations WHERE id = ?`, situationID).Scan(&parkedAt, &parkedReason, &materialFactHash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return situation.ControllerParkedState{}, ErrNotFound
+	}
+	if err != nil {
+		return situation.ControllerParkedState{}, fmt.Errorf("store: read controller parked state: %w", err)
+	}
+	var out situation.ControllerParkedState
+	if parkedAt.Valid {
+		t, err := time.Parse(time.RFC3339Nano, parkedAt.String)
+		if err != nil {
+			return situation.ControllerParkedState{}, fmt.Errorf("store: parse controller_parked_at: %w", err)
+		}
+		out.At = &t
+	}
+	if parkedReason.Valid {
+		out.Reason = parkedReason.String
+	}
+	if materialFactHash.Valid {
+		out.MaterialFactHash = materialFactHash.String
+	}
+	return out, nil
 }
 
 // loadSituationDeliveriesTx reads every immutable delivery belonging to any
@@ -1478,15 +1519,81 @@ func (s *Store) ExtendControllerLease(ctx context.Context, claim situation.Claim
 
 // ReleaseControllerWork releases claim's lease early — the worker's own
 // safety net when Reconcile returns before ever reaching CommitController
-// (which otherwise always clears the lease itself on a successful commit):
-// a plain wrapper over ReleaseSituationClaim, converting situation.Claim
-// back into the model.Situation shape it expects.
-func (s *Store) ReleaseControllerWork(ctx context.Context, claim situation.Claim, now time.Time) error {
-	owner := claim.ClaimOwner
-	sit := claim.Situation
-	sit.LeaseOwner = &owner
-	sit.ClaimToken = claim.ClaimToken
-	return s.ReleaseSituationClaim(ctx, sit, now)
+// (which otherwise always clears the lease itself on a successful commit).
+//
+// Finding I2 fix: retryAt/errorClass, when non-nil, additionally push
+// next_assessment_at/retry_at forward and record errorClass — so a
+// persistently-failing Situation is not instantly re-claimable on the very
+// next poll (without this, ControllerWorker.Drain would spin at 100% CPU
+// reclaiming the same always-failing Situation forever — see
+// controller_worker.go's processOne). retryAt/errorClass both nil is a plain
+// release with no backoff, equivalent to the pre-fix behavior (a thin
+// wrapper over ReleaseSituationClaim) — used by any future caller with
+// nothing useful to classify.
+//
+// The next_assessment_at push mirrors CommitController's own rule: never
+// clobber a genuinely earlier, concurrently-persisted checkpoint (e.g. a
+// fresh material input landing mid-cycle wants to be reprocessed SOONER, not
+// pushed later by this failure's own backoff) — detected the same way
+// CommitController detects it, by comparing the freshly-read current value
+// against claim's own claim-time snapshot.
+func (s *Store) ReleaseControllerWork(ctx context.Context, claim situation.Claim, now time.Time, retryAt *time.Time, errorClass *string) error {
+	if retryAt == nil {
+		owner := claim.ClaimOwner
+		sit := claim.Situation
+		sit.LeaseOwner = &owner
+		sit.ClaimToken = claim.ClaimToken
+		return s.ReleaseSituationClaim(ctx, sit, now)
+	}
+	if strings.TrimSpace(claim.Situation.ID) == "" || strings.TrimSpace(claim.ClaimOwner) == "" || claim.ClaimToken <= 0 {
+		return errors.New("store: release controller work requires a complete claim")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin release controller work: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var currentNextAssessmentAt string
+	err = tx.QueryRowContext(ctx, `SELECT next_assessment_at FROM situations WHERE id = ?`, claim.Situation.ID).Scan(&currentNextAssessmentAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("store: read current next_assessment_at: %w", err)
+	}
+
+	nextAssessmentAt := canonicalTime(*retryAt)
+	if currentNextAssessmentAt != canonicalTime(claim.Situation.NextAssessmentAt) && currentNextAssessmentAt < nextAssessmentAt {
+		// A concurrent write (detected by divergence from the claim-time
+		// snapshot) already pulled the checkpoint earlier than our proposed
+		// backoff — that genuinely newer due time survives, never clobbered
+		// by this failure's own later backoff.
+		nextAssessmentAt = currentNextAssessmentAt
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE situations SET
+			lease_owner = NULL, lease_expires_at = NULL,
+			retry_at = ?, last_error_class = ?,
+			next_assessment_at = ?,
+			updated_at = ?
+		WHERE id = ? AND lease_owner = ? AND claim_token = ?`,
+		canonicalTime(*retryAt), nullableString(errorClass),
+		nextAssessmentAt, canonicalTime(now.UTC()),
+		claim.Situation.ID, claim.ClaimOwner, claim.ClaimToken)
+	if err != nil {
+		return fmt.Errorf("store: release controller work with backoff: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: count released controller work: %w", err)
+	}
+	if n != 1 {
+		return situationmodel.ErrSituationLeaseLost
+	}
+	return tx.Commit()
 }
 
 // ----------------------------------------------------------------------

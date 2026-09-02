@@ -21,10 +21,11 @@ import (
 // --------------------------------------------------------------------------
 
 // ctClaimFor builds a fully-fenced situation.Claim for a Situation whose
-// deterministic urgent floor (critical severity) lets Reconcile commit
-// without any L2 dispatch at all — the simplest possible reconciliation
-// cycle for worker-level tests that care about claim/heartbeat/concurrency
-// behavior, not Assessment content.
+// deterministic urgent floor (critical severity) is the simplest fixture for
+// worker-level tests that care about claim/heartbeat/concurrency behavior,
+// not Assessment content — its Reconcile cycle still dispatches (or falls
+// back) exactly once per Finding I3's ruling (no prior trustworthy
+// Assessment exists), not zero times.
 func ctClaimFor(id, owner string, token int64) situation.Claim {
 	sit := ctBaseSituation()
 	sit.ID = id
@@ -94,8 +95,12 @@ func TestControllerWorkerRunOnceClaimsAndReconciles(t *testing.T) {
 	if len(store.snapshotCommits()) != 1 {
 		t.Fatalf("commits = %d, want 1", len(store.snapshotCommits()))
 	}
-	if client.calls != 0 {
-		t.Fatalf("CompleteOnce calls = %d, want 0 (deterministic floor needs no L2)", client.calls)
+	// Finding I3: a deterministic floor no longer short-circuits L2 dispatch
+	// (ctFloorSnapshotInput has no prior trustworthy Assessment) — this
+	// cycle dispatches exactly once, falling back to DeterministicFallback
+	// since fakeAssessmentClient has no scripted response.
+	if client.calls != 1 {
+		t.Fatalf("CompleteOnce calls = %d, want exactly 1", client.calls)
 	}
 }
 
@@ -250,14 +255,78 @@ func TestControllerWorkerReleasesOnReconcileFailure(t *testing.T) {
 		},
 		commitErr: errors.New("commit failed"),
 	}
-	w := situation.NewControllerWorker(store, store, &fakeAssessmentClient{}, situation.ControllerConfig{}, newWorkerConfig("worker-a"), nil, nil, nil)
+	cfg := newWorkerConfig("worker-a")
+	fixedNow := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	cfg.Now = func() time.Time { return fixedNow }
+	w := situation.NewControllerWorker(store, store, &fakeAssessmentClient{}, situation.ControllerConfig{}, cfg, nil, nil, nil)
 
 	if _, err := w.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
 	releases := store.snapshotReleaseCalls()
-	if len(releases) != 1 || releases[0].Situation.ID != claim.Situation.ID {
+	if len(releases) != 1 || releases[0].Claim.Situation.ID != claim.Situation.ID {
 		t.Fatalf("release calls = %+v, want exactly one release of %s", releases, claim.Situation.ID)
+	}
+	// Finding I2: the release must carry a bounded backoff, not an instant
+	// re-claim — a persistently-failing Situation would otherwise spin
+	// Drain at 100% CPU (see TestControllerWorkerDrainTerminatesWhenReconcileAlwaysFails).
+	if releases[0].RetryAt == nil {
+		t.Fatal("release after a failed Reconcile must carry a backoff RetryAt, not release with no checkpoint pushed forward")
+	}
+	if !releases[0].RetryAt.After(fixedNow) {
+		t.Fatalf("release RetryAt = %v, want strictly after now = %v", releases[0].RetryAt, fixedNow)
+	}
+	if releases[0].ErrorClass == nil || *releases[0].ErrorClass == "" {
+		t.Fatal("release after a failed Reconcile must record a bounded error class")
+	}
+}
+
+// TestControllerWorkerDrainTerminatesWhenReconcileAlwaysFails proves Finding
+// I2's core claim: a persistently-failing Situation does not spin Drain
+// forever. claimFn simulates a real store's own "next_assessment_at <= now"
+// due filter — after the first (failing) round, it only returns the
+// Situation again if the recorded release carried no backoff, mirroring
+// exactly what a real ClaimDueSituations would do once processOne's release
+// has pushed next_assessment_at into the future.
+func TestControllerWorkerDrainTerminatesWhenReconcileAlwaysFails(t *testing.T) {
+	in := ctFloorSnapshotInput()
+	claim := ctClaimFor("situation-alwaysfail", "worker-a", 1)
+
+	var store *fakeControllerStore
+	rounds := 0
+	store = &fakeControllerStore{
+		loadInput: in,
+		commitErr: errors.New("commit always fails"),
+		claimFn: func(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]situation.Claim, error) {
+			rounds++
+			if rounds == 1 {
+				return []situation.Claim{claim}, nil
+			}
+			// Read store.releaseCalls directly (not via snapshotReleaseCalls,
+			// which would re-lock store.mu — this closure already runs while
+			// ClaimControllerWork holds it): no concurrent writer can be
+			// touching it right now either way, since Drain's rounds are
+			// strictly sequential (RunOnce fully completes, including every
+			// release, before the next round's claim call runs).
+			if len(store.releaseCalls) == 0 || store.releaseCalls[len(store.releaseCalls)-1].RetryAt == nil {
+				t.Fatalf("round %d: claiming again without a recorded backoff from the prior round's release", rounds)
+			}
+			// A real store would see next_assessment_at pushed into the
+			// future by the backoff and simply not return this row again.
+			return nil, nil
+		},
+	}
+	w := situation.NewControllerWorker(store, store, &fakeAssessmentClient{}, situation.ControllerConfig{}, newWorkerConfig("worker-a"), nil, nil, nil)
+
+	total, err := w.Drain(context.Background())
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if total != 1 {
+		t.Fatalf("Drain total = %d, want 1 (bounded — must not spin reclaiming the same always-failing situation)", total)
+	}
+	if rounds != 2 {
+		t.Fatalf("claim rounds = %d, want 2 (one failing round, one empty round that stops Drain)", rounds)
 	}
 }
 

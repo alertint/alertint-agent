@@ -34,7 +34,12 @@ import (
 type ControllerWorkStore interface {
 	ClaimControllerWork(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]Claim, error)
 	ExtendControllerLease(ctx context.Context, claim Claim, now time.Time, lease time.Duration) error
-	ReleaseControllerWork(ctx context.Context, claim Claim, now time.Time) error
+	// ReleaseControllerWork releases claim's lease early. retryAt/errorClass,
+	// when non-nil, additionally push next_assessment_at/retry_at forward and
+	// record errorClass — processOne's own failure path always supplies both
+	// (Finding I2), so a persistently-failing Situation is not instantly
+	// re-claimable; nil/nil is a plain release with no backoff.
+	ReleaseControllerWork(ctx context.Context, claim Claim, now time.Time, retryAt *time.Time, errorClass *string) error
 }
 
 // DependencyRecoveryWaker is the narrow "wake dependency-parked Situations
@@ -351,12 +356,61 @@ func (w *ControllerWorker) Stop(ctx context.Context) error {
 	}
 }
 
+// controllerWorkerRetryBase and controllerWorkerRetryCap define the
+// exponential backoff schedule processOne applies on a Reconcile failure
+// (Finding I2): 1s, 2s, 4s, ... doubling with each successive claim attempt
+// on this Situation, capped at five minutes. Mirrors input_worker.go's own
+// inputRetryBase/inputRetryCap exactly — the sibling worker's established
+// pattern for classifying a failure into a bounded, typed backoff rather
+// than blindly releasing the lease for instant re-claim.
+const (
+	controllerWorkerRetryBase = time.Second
+	controllerWorkerRetryCap  = 5 * time.Minute
+)
+
+// controllerWorkerRetryBackoff returns the delay before a Situation whose
+// Reconcile just failed becomes due again, given attempt (1-based, as
+// claim.Situation.AttemptCount already reads — Plan 1's generic claim/lease
+// counter, incremented on every ClaimDueSituations claim regardless of
+// worker). It never returns zero and never exceeds controllerWorkerRetryCap,
+// guarding against the shift overflowing for a very large attempt count —
+// the same shape as input_worker.go's inputRetryBackoff.
+func controllerWorkerRetryBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	if attempt > 32 { // 1s<<31 already exceeds the cap many times over
+		return controllerWorkerRetryCap
+	}
+	d := controllerWorkerRetryBase * time.Duration(uint64(1)<<uint(attempt-1)) // #nosec G115 -- attempt capped <= 32 immediately above
+	if d <= 0 || d > controllerWorkerRetryCap {
+		return controllerWorkerRetryCap
+	}
+	return d
+}
+
+// controllerReconcileFailedErrorClass is the bounded, grep-able error-class
+// string processOne persists via last_error_class on a Reconcile failure —
+// never the raw error text (Reconcile's own failure causes range from a
+// store I/O error to a build-prompt error and are not a bounded, closed set
+// worth a finer classification here; the store's own commit-failure audit
+// event already carries err.Error() for diagnosis — see Controller.commit).
+const controllerReconcileFailedErrorClass = "controller_reconcile_failed"
+
 // processOne runs claim's Reconcile cycle with a fenced lease heartbeat. On
 // any Reconcile failure it releases the lease early — CommitController's
 // own successful commit already clears it; a failure before ever reaching
 // CommitController (or CommitController's own fenced rejection) otherwise
 // leaves the lease held until it expires on its own, needlessly delaying
-// the next attempt.
+// the next attempt. Finding I2: the release also pushes next_assessment_at/
+// retry_at forward by a bounded typed backoff (controllerWorkerRetryBackoff)
+// so a persistently-failing Situation is not instantly re-claimable — without
+// this, Drain would spin at 100% CPU reclaiming the same always-failing
+// Situation on every round. This backoff-carrying release is safe even for a
+// clean stale-claim race (a newer input/claim already superseded this one):
+// the release's own fencing (WHERE lease_owner=? AND claim_token=?) simply
+// matches zero rows in that case — same as a plain release already would —
+// so the backoff write is a no-op rather than clobbering the newer claimant.
 func (w *ControllerWorker) processOne(ctx context.Context, claim Claim) {
 	reconcileCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -379,7 +433,10 @@ func (w *ControllerWorker) processOne(ctx context.Context, claim Claim) {
 		w.logger.Warn("situation: controller worker: reconcile failed", "situation_id", claim.Situation.ID, "err", err)
 		releaseCtx, releaseCancel := detachedControllerWorkerContext()
 		defer releaseCancel()
-		if rerr := w.store.ReleaseControllerWork(releaseCtx, claim, w.cfg.Now()); rerr != nil && !errors.Is(rerr, model.ErrSituationLeaseLost) {
+		now := w.cfg.Now()
+		retryAt := now.Add(controllerWorkerRetryBackoff(claim.Situation.AttemptCount))
+		errClass := controllerReconcileFailedErrorClass
+		if rerr := w.store.ReleaseControllerWork(releaseCtx, claim, now, &retryAt, &errClass); rerr != nil && !errors.Is(rerr, model.ErrSituationLeaseLost) {
 			w.logger.Error("situation: controller worker: release after failed reconcile failed",
 				"situation_id", claim.Situation.ID, "err", rerr)
 		}

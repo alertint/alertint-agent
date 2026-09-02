@@ -576,12 +576,23 @@ type lifecycleResolution struct {
 // and returns cur.Lifecycle unchanged with cur's own recovery/terminal
 // fields carried through when nothing has changed this cycle.
 //
-// The four field-combinations returned exactly satisfy migration 0014's
-// situations CHECK constraint: active carries all four nil; recovery_pending
-// carries RecoveryObservedAt+GraceUntil non-nil, both terminal fields nil;
-// recovered carries RecoveryObservedAt+GraceUntil+TerminalAt non-nil,
-// TerminalReason nil; closed_unknown carries TerminalAt+TerminalReason
-// non-nil (RecoveryObservedAt/GraceUntil unconstrained either way).
+// The field-combinations returned exactly satisfy migration 0014's two
+// situations CHECK constraints: the per-lifecycle combination check (active
+// carries all four nil; recovery_pending carries RecoveryObservedAt+
+// GraceUntil non-nil, both terminal fields nil; recovered carries
+// RecoveryObservedAt+GraceUntil+TerminalAt non-nil, TerminalReason nil;
+// closed_unknown carries TerminalAt+TerminalReason non-nil, RecoveryObservedAt/
+// GraceUntil unconstrained BY THAT check) AND the separate, UNCONDITIONAL
+// recovery-field pairing check CHECK ((recovery_observed_at IS NULL) =
+// (grace_until IS NULL)) — which applies regardless of lifecycle. This second
+// check is why closed_unknown reached FROM recovery_pending (the
+// pastDeadline branch below) must still carry GraceUntil alongside
+// RecoveryObservedAt even though the per-lifecycle check alone would not
+// have required it: cur.RecoveryObservedAt is already non-nil on entry to
+// that branch (recovery_pending's own invariant), so GraceUntil must travel
+// with it or the pairing check fails closed. closed_unknown reached FROM
+// active (no recovery ever observed) correctly leaves both nil instead, since
+// neither was ever set on this Situation.
 func (c *Controller) resolveLifecycle(cur model.Situation, in SnapshotInput, snap Snapshot, now time.Time) lifecycleResolution {
 	firing := AnyFiring(snap.Symptoms)
 	resolved := anyDeliveryResolved(in.Deliveries)
@@ -613,9 +624,16 @@ func (c *Controller) resolveLifecycle(cur model.Situation, in SnapshotInput, sna
 			lc, _ := AdvanceLifecycle(cur.Lifecycle, EventGraceExpired)
 			return lifecycleResolution{Lifecycle: lc, RecoveryObservedAt: cur.RecoveryObservedAt, GraceUntil: cur.GraceUntil, TerminalAt: timePtr(now)}
 		case pastDeadline:
+			// Finding C2 fix: cur.RecoveryObservedAt is already non-nil here
+			// (recovery_pending's own invariant) — migration 0014's recovery-
+			// field pairing CHECK is unconditional, so GraceUntil must be
+			// carried forward alongside it (cur.GraceUntil, the Situation's
+			// existing recorded grace deadline — mirroring the sibling
+			// grace-expiry branch above, which carries both fields for the
+			// same reason) or this commit fails closed against a real schema.
 			reason := ClosedUnknownReason(cur.EffectiveStartedAtBasis, resolved)
 			lc, _ := AdvanceLifecycle(cur.Lifecycle, EventLifecycleUnobservable)
-			return lifecycleResolution{Lifecycle: lc, RecoveryObservedAt: cur.RecoveryObservedAt, TerminalAt: timePtr(now), TerminalReason: terminalReasonPtr(reason)}
+			return lifecycleResolution{Lifecycle: lc, RecoveryObservedAt: cur.RecoveryObservedAt, GraceUntil: cur.GraceUntil, TerminalAt: timePtr(now), TerminalReason: terminalReasonPtr(reason)}
 		default:
 			return lifecycleResolution{Lifecycle: model.LifecycleRecoveryPending, RecoveryObservedAt: cur.RecoveryObservedAt, GraceUntil: cur.GraceUntil}
 		}
@@ -660,8 +678,10 @@ func synthesizeSequence(inputVersion, retryEpoch, workAttempt, callNumber int) i
 // forbids call_id on any derivation but model_validated); retryEpoch/
 // workAttempt are BeginControllerAttempt's own return values for a
 // work-bearing cycle, or the harmless nominal (0,1) for a cycle that never
-// called it (reuse, deterministic floor, or a preserve-existing/fallback
-// commit built without a fresh work-bearing attempt). Sequence is left at
+// called it (revalidated reuse, or a blocked preserve-existing/fallback
+// commit built without a fresh work-bearing attempt — commitBlocked). 0 is
+// never valid here: migration 0015's CHECK requires work_attempt BETWEEN 1
+// AND 5 (Finding C1). Sequence is left at
 // its zero value: CommitController computes the real next sequence for
 // this situation inside its own fenced transaction and ignores whatever
 // value this function's result carries — see synthesizeSequence's doc
@@ -798,6 +818,24 @@ func parkedReasonForOutcome(outcome L2Outcome) string {
 	}
 }
 
+// controllerParkBlocksDispatch reports whether p is a currently-active
+// PERMANENT park (Finding I1: policy_rejected or capability_rejected — never
+// malformed_exhausted or dependency_exhausted, which are attempt-budget-
+// bounded and re-armable by dependency recovery respectively, and are
+// already correctly blocked by BeginControllerAttempt's own 5-attempt
+// ceiling once genuinely exhausted) recorded against currentMaterialFactHash
+// — the SAME comparison BeginControllerAttempt itself makes against
+// situations.current_material_fact_hash to decide "unchanged input." A park
+// recorded against a DIFFERENT (older) basis no longer applies: the basis
+// changed since parking, so the park has naturally lifted and this cycle
+// must proceed normally, not stay parked forever.
+func controllerParkBlocksDispatch(p ControllerParkedState, currentMaterialFactHash string) bool {
+	if p.Reason != ParkedReasonPolicyRejected && p.Reason != ParkedReasonCapabilityRejected {
+		return false
+	}
+	return p.MaterialFactHash != "" && p.MaterialFactHash == currentMaterialFactHash
+}
+
 // fallbackOrPreserve builds the commit.Assessment/Attempt/Coverage triple
 // for a cycle that ends WITHOUT a fresh accepted/contradicted L2 result:
 // when in.CurrentAssessment already exists and is trustworthy (Task 5's own
@@ -923,16 +961,91 @@ func (c *Controller) Reconcile(ctx context.Context, claim Claim) error {
 	}
 
 	// 5. Deterministic/reuse check — no L2 call, no work attempt consumed.
+	// Finding C1 fix: workAttempt=1 (not 0) — buildAuthoritativeAttempt's own
+	// doc comment names this the nominal value for a non-work-bearing commit;
+	// migration 0015's CHECK requires work_attempt BETWEEN 1 AND 5, so 0
+	// fails closed against a real schema (this cycle never calls
+	// BeginControllerAttempt at all, so no real budget-counter value exists
+	// to report — 1 is a harmless placeholder satisfying the schema's
+	// identity/CHECK requirement, not a claim of real attempt consumption).
 	if in.CurrentAssessment != nil {
 		rr := RevalidateReuse(*in.CurrentAssessment, snap, in, state, now)
 		if rr.Ok {
-			return c.commitResult(ctx, claim, base, rr.Result, nil, 0, 0, now)
+			return c.commitResult(ctx, claim, base, rr.Result, nil, 0, 1, now)
 		}
 	}
-	if hasDeterministicFloor(snap.EligibleReasons) {
-		result := DeterministicAssessment(snap, in, state, model.DerivationDeterministic, nil, now)
-		return c.commitResult(ctx, claim, base, result, nil, 0, 0, now)
+
+	// Finding I1 fix: a policy/capability park recorded against the CURRENT
+	// basis is permanent (spec.md: "Policy rejection, unsupported scope, and
+	// unsupported capability are permanent for the unchanged basis.
+	// Dependency recovery cannot re-arm them.") — unlike malformed_exhausted/
+	// dependency_exhausted, which only park after genuinely spending all 5
+	// BeginControllerAttempt-budgeted attempts (so BeginControllerAttempt's
+	// own ceiling already blocks further dispatch on its own), a policy/
+	// capability rejection parks after just ONE attempt. Without this check,
+	// BeginControllerAttempt would happily keep succeeding for attempts 2-5
+	// on later cycles (it only tracks the attempt COUNT vs. the 5 ceiling, not
+	// "already permanently parked"), dispatching L2 again each time — costing
+	// up to 5 attempts/10 L2 calls for what spec.md mandates should cost
+	// exactly one. Skip work-bearing dispatch entirely (no
+	// BeginControllerAttempt call, no L2 call) while parked for one of these
+	// two reasons against the SAME basis; Triage decisions and the reuse/
+	// bounded-projection refresh above/below still proceed normally — parking
+	// only suppresses NEW semantic L2 work. If the basis has since changed,
+	// controllerParkBlocksDispatch returns false and this cycle proceeds
+	// exactly as if not parked, naturally lifting the park.
+	if controllerParkBlocksDispatch(in.ControllerParked, snap.MaterialFactHash) {
+		return c.commitBlocked(ctx, claim, base, situationID, snap, in, state, now)
 	}
+
+	// Finding I3 ruling: a deterministic urgent floor (critical_anchor) does
+	// NOT short-circuit L2 dispatch. An earlier version of this cycle
+	// committed DeterministicAssessment immediately and returned whenever
+	// hasDeterministicFloor(snap.EligibleReasons) was true — which, combined
+	// with RevalidateReuse's own trustworthiness rule (deterministic_
+	// controller/deterministic_fallback both pass ValidateShape and, for
+	// deterministic_controller specifically, are NOT excluded by trustworthy()
+	// the way deterministic_fallback is), meant a floor Situation's
+	// conservative-default semantic fields (persistence=unknown,
+	// impact=none_observed, novelty=insufficient_history, causality=unknown)
+	// got REUSED forever afterward — the highest-severity Situations
+	// (critical_anchor) never received a real semantic L2 judgment on any
+	// future cycle. That contradicts Task 5's own DeterministicAssessment doc
+	// comment (which scopes the deterministic_controller derivation to "the
+	// 'L2 failed' case" and a later terminal-closure Assessment, not "the
+	// primary path for critical Situations"), spec.md's "A deterministic
+	// urgent-floor Assessment is authoritative for its deterministic fields,
+	// but its unknown semantic fields cannot justify skipping Acute Triage
+	// when focused analysis still has decision value" (the floor's presence
+	// does not mean semantic judgment is no longer needed), and spec.md's own
+	// fallback-section example — "a reachable critical_anchor candidate still
+	// produces deterministic urgent Attention... DURING THE SAME L2 FAILURE"
+	// — which describes the floor applying ALONGSIDE an L2 failure (L2 was
+	// still attempted), not replacing the attempt.
+	//
+	// The floor's Attention-raising is Task 5's own DeriveAssessment/
+	// validateProposalContent adjustment mechanism, already correctly wired
+	// into every remaining path without any Reconcile-level special case:
+	// validateProposalContent forces Attention to urgent (recorded as a safe
+	// "adjustment", never a rejection) whenever the floor is active,
+	// regardless of what the model itself proposed, for BOTH the fresh
+	// model-validated path (ValidateAssessmentProposal) and reuse's own
+	// revalidation step (RevalidateReuse); DeterministicAssessment applies the
+	// identical floor check directly when it IS reached — genuinely, now,
+	// only via DeterministicFallback, i.e. when this cycle's own work-bearing
+	// L2 dispatch below actually failed and no trustworthy prior Assessment
+	// exists (fallbackOrPreserve). So a floor Situation with no prior
+	// Assessment still goes through work-bearing dispatch just like any other
+	// Situation: on success it becomes model_validated with Attention forced
+	// urgent; on failure it falls back to DeterministicFallback, which ALSO
+	// forces Attention to urgent via the same floor check — either way this
+	// cycle's own commit already carries Attention=urgent, satisfying "the
+	// floor's only special effect is guaranteeing Attention is raised to
+	// urgent (never lowered)" without ever needing to skip L2 to get there.
+	// Once a trustworthy Assessment exists, RevalidateReuse keeps reusing that
+	// REAL semantic judgment (not a conservative default) for as long as the
+	// basis stays unchanged — exactly the same reuse behavior any other
+	// Situation gets.
 
 	// 6. Work-bearing: consume a work attempt before any provider I/O.
 	retryEpoch, workAttempt, err := c.store.BeginControllerAttempt(ctx, claim, snap.MaterialFactHash, now)
@@ -940,10 +1053,7 @@ func (c *Controller) Reconcile(ctx context.Context, claim Claim) error {
 		if errors.Is(err, ErrControllerAttemptsExhausted) {
 			// Already parked from a prior cycle on this unchanged input:
 			// refresh the bounded projection only, touch no parked state.
-			assessment, attempt, coverage := c.fallbackOrPreserveBlocked(situationID, snap, in, state, now)
-			base.Assessment, base.Attempt, base.Coverage = assessment, attempt, coverage
-			c.finalizeCheckpoint(&base, now)
-			return c.commit(ctx, claim, base)
+			return c.commitBlocked(ctx, claim, base, situationID, snap, in, state, now)
 		}
 		return fmt.Errorf("situation: controller reconcile: begin attempt: %w", err)
 	}
@@ -1058,13 +1168,27 @@ func (c *Controller) finalizeCheckpoint(base *ControllerCommit, now time.Time) {
 	base.NextAssessmentAt = now.Add(time.Minute)
 }
 
+// commitBlocked commits the bounded projection refresh for a cycle that must
+// not dispatch further L2 work this cycle without ever calling
+// BeginControllerAttempt — either because a prior cycle already spent the
+// unchanged input's full five-attempt budget (BeginControllerAttempt itself
+// reports ErrControllerAttemptsExhausted), or because a still-active policy/
+// capability park already covers the current basis (Finding I1,
+// controllerParkBlocksDispatch). Neither case touches controller_parked_at/
+// reason (base.Parked stays the zero value/untouched — whatever was
+// persisted stands).
+func (c *Controller) commitBlocked(ctx context.Context, claim Claim, base ControllerCommit, situationID string, snap Snapshot, in SnapshotInput, state ControllerState, now time.Time) error {
+	assessment, attempt, coverage := c.fallbackOrPreserveBlocked(situationID, snap, in, state, now)
+	base.Assessment, base.Attempt, base.Coverage = assessment, attempt, coverage
+	c.finalizeCheckpoint(&base, now)
+	return c.commit(ctx, claim, base)
+}
+
 // fallbackOrPreserveBlocked is fallbackOrPreserve's counterpart for a cycle
-// that discovers it is ALREADY parked (BeginControllerAttempt returned
-// ErrControllerAttemptsExhausted) before attempting any work this cycle —
-// it must still refresh the bounded projection (a fresh ActionContract
-// timing promise), using SemanticRetryPhaseBlocked state, without touching
-// controller_parked_at/reason (base.Parked stays the zero value/untouched
-// by the caller).
+// that discovers it must not attempt any work this cycle before ever calling
+// BeginControllerAttempt (see commitBlocked's own doc comment for the two
+// cases) — it must still refresh the bounded projection (a fresh
+// ActionContract timing promise), using SemanticRetryPhaseBlocked state.
 func (c *Controller) fallbackOrPreserveBlocked(situationID string, snap Snapshot, in SnapshotInput, state ControllerState, now time.Time) (model.Assessment, AssessmentAttempt, []model.IncidentCoverage) {
 	state.SemanticRetry = SemanticRetryPhaseBlocked
 	return c.fallbackOrPreserve(situationID, snap, in, state, 0, 1, now)
