@@ -1,0 +1,39 @@
+alertint-agent has been deployed.
+
+{{- if and (not .Values.secret.create) (not .Values.secret.existingSecret) }}
+
+⚠️  No secret configured (secret.create is false and secret.existingSecret is
+    empty). Every "*_env" field referenced in `config` — webhook_token_env,
+    api_key_env, and any others you've set — needs a matching key in a
+    Secret named "{{ include "alertint-agent.secretName" . }}", or the
+    container will fail to start. Set secret.create=true with secret.data,
+    or point secret.existingSecret at a Secret you manage yourself.
+{{- end }}
+
+Check the rollout:
+  kubectl rollout status deployment/{{ include "alertint-agent.fullname" . }} -n {{ .Release.Namespace }}
+
+Check health once it's up:
+  kubectl port-forward svc/{{ include "alertint-agent.fullname" . }} -n {{ .Release.Namespace }} {{ .Values.service.webhookPort }}:{{ .Values.service.webhookPort }}
+  curl http://localhost:{{ .Values.service.webhookPort }}/health
+
+{{- if .Values.config.alertmanager.enabled }}
+
+Point your Alertmanager webhook receiver at:
+  http://{{ include "alertint-agent.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.webhookPort }}/webhook/alertmanager
+{{- end }}
+
+{{- if .Values.config.changes.ingress.enabled }}
+
+Change-event webhook (ArgoCD notifications, CI/CD deploy hooks, etc.):
+  http://{{ include "alertint-agent.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.webhookPort }}/webhook/change
+{{- end }}
+
+{{- if .Values.config.mcp.addr }}
+
+MCP endpoint (Claude Code, Cursor, and other MCP-compatible tools) — in-cluster:
+  http://{{ include "alertint-agent.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.mcpPort }}/mcp
+{{- if not (and .Values.ingress.enabled .Values.ingress.mcp.enabled) }}
+(set ingress.enabled and ingress.mcp.enabled to reach it from outside the cluster)
+{{- end }}
+{{- end }}

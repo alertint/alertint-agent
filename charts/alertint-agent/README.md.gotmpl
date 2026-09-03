@@ -1,0 +1,63 @@
+{{ template "chart.header" . }}
+{{ template "chart.deprecationWarning" . }}
+
+{{ template "chart.badgesSection" . }}
+
+{{ template "chart.description" . }}
+
+{{ template "chart.homepageLine" . }}
+
+## Prerequisites
+
+- Kubernetes 1.23+
+- Helm 3.8+
+- An LLM provider: either an Anthropic API key, or a self-hosted
+  OpenAI-compatible endpoint (SGLang, vLLM, Ollama, LM Studio) — see
+  [docs/integrations/openai-compatible.md](https://alertint.com/docs/integrations/openai-compatible)
+- Somewhere to send alerts from: Alertmanager, Zabbix, or both
+
+## Installing
+
+```bash
+helm install my-alertint ./charts/alertint-agent \
+  --set secret.create=true \
+  --set secret.data.ALERTINT_WEBHOOK_TOKEN=$(openssl rand -hex 32) \
+  --set secret.data.ANTHROPIC_API_KEY=sk-ant-...
+```
+
+For anything beyond a quick test, provide the secret yourself instead of
+`secret.create` (see the `secret` block below) and set a real
+`values.yaml` rather than passing everything via `--set`.
+
+## Configuring alertint-agent itself
+
+This chart intentionally does **not** turn every alertint-agent config field
+into its own typed Helm value — the config schema is large and evolves with
+the app. Instead, `values.yaml`'s `config:` block is rendered verbatim into
+the ConfigMap the container reads at `/etc/alertint/config.yaml`. It ships
+with a working default (Anthropic + Alertmanager only); extend or override
+any section the same way you would edit `config.example.yaml` directly. See
+[config.example.yaml](../../config.example.yaml) in this repo, or
+[docs/getting-started/configuration.md](https://alertint.com/docs/getting-started/configuration),
+for the complete schema.
+
+Every `*_env` field you reference anywhere in `config` (e.g.
+`webhook_token_env: ALERTINT_WEBHOOK_TOKEN`) needs a matching key in the
+Secret named by `secret.existingSecret` (or created via `secret.data`) — the
+chart exposes every key of that Secret to the container via `envFrom`, so
+there's nothing else to wire up.
+
+## A note on replicas
+
+`replicaCount` is fixed at 1 in the templates, not just defaulted — it
+cannot be overridden. alertint-agent's SQLite store is single-writer by
+design; running a second replica against the same database produces
+duplicate incident processing and duplicate notifications, not higher
+availability. Restart handling (`strategy.type: Recreate`) and persistence
+are built around this single-writer assumption.
+
+{{ template "chart.maintainersSection" . }}
+
+{{ template "chart.sourcesSection" . }}
+
+{{ template "chart.valuesSection" . }}

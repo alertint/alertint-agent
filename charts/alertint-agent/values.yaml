@@ -1,0 +1,224 @@
+# Default values for alertint-agent.
+#
+# NOTE: there is no replicaCount value. The Deployment template hardcodes
+# replicas: 1 and it is not overridable — the SQLite store is single-writer
+# by design (one connection, "v1 has one writer process" —
+# internal/store/store.go). Running a second replica against the same
+# database causes duplicate incident processing and duplicate
+# notifications, not higher availability. See the README for details.
+
+image:
+  repository: ghcr.io/alertint/alertint-agent
+  pullPolicy: IfNotPresent
+  # -- Overrides the image tag; defaults to .Chart.AppVersion.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+# The upstream image runs as a distroless "nonroot" image (USER 65532:65532).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+service:
+  type: ClusterIP
+  # -- Alertmanager/change/Zabbix webhooks + GET /health. Only served when at
+  # least one receiver under config.* is enabled (see values below).
+  webhookPort: 9911
+  # -- MCP HTTP server (AI coding agents). Harmless to expose even if
+  # config.mcp is left disabled — nothing listens on it in that case.
+  mcpPort: 9912
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  webhook:
+    host: ""
+    path: /
+    pathType: ImplementationSpecific
+    tls: []
+  mcp:
+    enabled: false
+    host: ""
+    path: /
+    pathType: ImplementationSpecific
+    tls: []
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 256Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+# -- Liveness/readiness probing. Uses GET /health, served alongside the
+# webhook receivers on service.webhookPort — this requires at least one
+# receiver (config.alertmanager, config.changes.ingress or config.zabbix.ingress)
+# to be enabled, which is the default here (alertmanager). If you disable
+# every receiver, disable these probes too, or the pod will never go Ready.
+probes:
+  enabled: true
+  initialDelaySeconds: 5
+  periodSeconds: 15
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+persistence:
+  # -- Persists the SQLite store across restarts. Disabling this means every
+  # restart starts from an empty incident/memory history — fine for a
+  # throwaway demo, not for a real deployment.
+  enabled: true
+  storageClassName: ""
+  accessMode: ReadWriteOnce
+  size: 1Gi
+  # -- Use a pre-existing PVC instead of creating one.
+  existingClaim: ""
+  mountPath: /data
+
+# -- Secret providing every *_env value referenced anywhere in `config` below
+# (webhook_token_env, api_key_env, bot_token_env, token_env, ...). All of its
+# keys are exposed to the container via envFrom, so any name you reference in
+# `config` just needs to exist as a key here.
+#
+# Two ways to provide it:
+#   1) secret.existingSecret: the name of a Secret you manage yourself
+#      (External Secrets, Sealed Secrets, SOPS, etc.) — the recommended path
+#      for anything beyond local testing.
+#   2) secret.create: true with secret.data — the chart creates a plain
+#      Secret from values. Convenient for a quick start; do not commit real
+#      tokens into a values file under version control.
+secret:
+  # -- Create a Secret from secret.data below.
+  create: false
+  # -- Name of a pre-existing Secret to use instead of creating one.
+  existingSecret: ""
+  # -- Secret keys/values to create, only used when secret.create is true.
+  # data:
+  #   ALERTINT_WEBHOOK_TOKEN: "changeme"
+  #   ANTHROPIC_API_KEY: "changeme"
+  data: {}
+
+extraEnv: []
+extraEnvFrom: []
+extraVolumes: []
+extraVolumeMounts: []
+
+# -- The complete alertint-agent config, rendered verbatim to
+# /etc/alertint/config.yaml. This mirrors config.example.yaml in the
+# alertint-agent repo (see also docs/getting-started/configuration.md) — that
+# file documents every available field; this chart intentionally does not
+# duplicate the schema into typed Helm values, since it evolves with the app
+# itself. Extend or override any section with your own values.
+# @default -- see config.example.yaml in the repo root for the full schema
+config:
+  receivers:
+    address: "0.0.0.0:9911"
+
+  alertmanager:
+    enabled: true
+    webhook_token_env: ALERTINT_WEBHOOK_TOKEN
+
+  storage:
+    sqlite_path: /data/alertint-agent.db
+
+  llm:
+    provider: anthropic
+    api_key_env: ANTHROPIC_API_KEY
+    model: claude-sonnet-5
+    timeout_seconds: 120
+
+  correlator:
+    window_seconds: 90
+    min_alerts: 1
+
+  memory:
+    attach_window_minutes: 30
+    judgment_ceiling_hours: 4
+    occurrence_cap: 100
+    lookback_days: 90
+
+  triage:
+    verification:
+      enabled: true
+      max_queries: 4
+      query_timeout_seconds: 10
+      max_rounds: 1
+
+  health:
+    llm_idle_probe_after_seconds: 300
+    broadcast_after_seconds: 300
+
+  notify:
+    stdout: true
+    slack:
+      enabled: false
+      bot_token_env: SLACK_BOT_TOKEN
+      channel: "#alerts"
+      min_severity: low
+      recurrence_mode: change-gated
+
+  mcp:
+    addr: "0.0.0.0:9912"
+    token_env: ALERTINT_MCP_TOKEN
+
+  rules: {}
+
+  prometheus:
+    timeout_seconds: 10
+    default_range_minutes: 60
+
+  logs:
+    provider: loki
+    timeout_seconds: 10
+    default_range_minutes: 15
+    max_window_minutes: 120
+    max_lines: 50
+    loki:
+      auth:
+        mode: none
+      label_map: {}
+
+  changes:
+    ingress:
+      enabled: false
+      webhook_token_env: ALERTINT_CHANGES_WEBHOOK_TOKEN
+    enrichment:
+      window_minutes: 120
+      max_events: 10
+    retention_days: 30
+
+  zabbix:
+    ingress:
+      enabled: false
+      webhook_token_env: ALERTINT_ZABBIX_WEBHOOK_TOKEN
+
+  sentry: {}
+
+  log_level: info
+  log_format: json

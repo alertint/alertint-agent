@@ -1,0 +1,67 @@
+{{- if .Values.ingress.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "alertint-agent.fullname" . }}-webhook
+  labels:
+    {{- include "alertint-agent.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.ingress.webhook.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - {{- with .Values.ingress.webhook.host }}
+      host: {{ . }}
+      {{- end }}
+      http:
+        paths:
+          - path: {{ .Values.ingress.webhook.path }}
+            pathType: {{ .Values.ingress.webhook.pathType }}
+            backend:
+              service:
+                name: {{ include "alertint-agent.fullname" . }}
+                port:
+                  number: {{ .Values.service.webhookPort }}
+---
+{{- end }}
+{{- if and .Values.ingress.enabled .Values.ingress.mcp.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "alertint-agent.fullname" . }}-mcp
+  labels:
+    {{- include "alertint-agent.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.ingress.mcp.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - {{- with .Values.ingress.mcp.host }}
+      host: {{ . }}
+      {{- end }}
+      http:
+        paths:
+          - path: {{ .Values.ingress.mcp.path }}
+            pathType: {{ .Values.ingress.mcp.pathType }}
+            backend:
+              service:
+                name: {{ include "alertint-agent.fullname" . }}
+                port:
+                  number: {{ .Values.service.mcpPort }}
+{{- end }}
