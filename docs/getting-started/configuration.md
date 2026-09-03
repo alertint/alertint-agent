@@ -254,9 +254,9 @@ A released binary built from `main` does not read this section at all.
 | `lease_seconds` | int | `300` | How long a claimed Situation's lease is held before another poll may reclaim it as expired — shared by the controller and the Acute Triage attempt claim. |
 | `heartbeat_seconds` | int | `30` | How often a claimed Situation's (or Triage attempt's) lease is renewed while work is still running. |
 | `webhook_recovery_grace_seconds` | int | `120` | Fixed recovery-grace/observation-deadline base for a webhook (or receipt-fallback) delivery — how long a Situation waits past its last firing symptom before a lifecycle transition (recovered / closed-unknown) is considered. |
-| `cadence.fast_seconds` | int | `120` | Reconsideration tempo for a Situation currently in the fast cadence tier. Documents the fixed 2-minute fast-cadence interval `internal/situation` derives internally — not independently tunable yet (see below). |
-| `cadence.normal_seconds` | int | `300` | Reconsideration tempo for the normal cadence tier. Documents the fixed 5-minute interval — not independently tunable yet. |
-| `cadence.slow_seconds` | int | `900` | Reconsideration tempo for the slow cadence tier. Documents the fixed 15-minute interval — not independently tunable yet. |
+| `cadence.fast_seconds` | int | `60` | Reconsideration tempo for a Situation in the fast cadence tier (urgent Attention, recovery pending, or AlertINT work durably running): how far past a reconcile the next self-scheduled checkpoint lands when nothing earlier is due. |
+| `cadence.normal_seconds` | int | `300` | Reconsideration tempo for the normal cadence tier (Attention `investigate`). |
+| `cadence.slow_seconds` | int | `900` | Reconsideration tempo for the slow cadence tier (active observe, waiting, blocked, or parked). Must satisfy `fast_seconds < normal_seconds < slow_seconds`; the loader rejects any other ordering. |
 | `max_l2_calls_per_attempt` | int | `2` | Durable L2 (Situation Assessment) provider-dispatch slots one controller work attempt may consume: the draft call plus at most one immediate malformed-shape correction. Shipped as a config key so the wire shape documents the ceiling; any value other than `2` is rejected — not tunable in this build. |
 | `max_work_attempts_per_input` | int | `5` | Durable controller attempts one unchanged Situation input may consume before semantic work parks. Any value other than `5` is rejected — not tunable in this build. |
 | `attempt_wall_seconds` | int | `180` | Wall-clock budget for one controller reconcile cycle. |
@@ -267,11 +267,12 @@ A released binary built from `main` does not read this section at all.
 
 Cadence is persisted scheduling machinery, not card content — it only
 widens or narrows how soon the controller next reconciles a nonterminal
-Situation; there is no `off` setting. `cadence.*`'s three values are
-documentation of a fixed internal schedule today, not a live knob: nothing
-in `internal/situation` yet reads them back out. If a future release wires
-a live cadence parameter through, these same keys become the tunable
-source of truth.
+Situation; there is no `off` setting, and the tier itself is never chosen
+by the model. The controller's own checkpoint is the earliest of
+`now + cadence`, the next Acute Triage due time, a pending Assessment
+retry, recovery-grace expiry, the lifecycle observation deadline, or a
+concurrently persisted earlier checkpoint — so a shorter cadence can only
+make the controller look again sooner, never later than those.
 
 `max_l2_calls_per_attempt` and `max_work_attempts_per_input` are
 deliberately fixed. There is no `situations.budgets.max_l1_llm_calls` (or

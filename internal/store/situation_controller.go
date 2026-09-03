@@ -1767,6 +1767,14 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 	if err != nil {
 		return fmt.Errorf("store: marshal remaining due reasons: %w", err)
 	}
+	eligibleReasons := commit.EligibleReasons
+	if eligibleReasons == nil {
+		eligibleReasons = []situationmodel.ReasonCandidate{}
+	}
+	eligibleReasonsJSON, err := json.Marshal(eligibleReasons)
+	if err != nil {
+		return fmt.Errorf("store: marshal eligible reasons: %w", err)
+	}
 
 	// 6. next_assessment_at: spec.md's own checkpoint rule is
 	// min(controller proposed, any CONCURRENTLY PERSISTED earlier
@@ -1798,6 +1806,7 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 			current_assessment_id = COALESCE(?, current_assessment_id),
 			current_assessment_basis_hash = ?, current_material_fact_hash = ?,
 			current_action_contract_json = ?,
+			current_eligible_reasons_json = ?,
 			controller_parked_at = ?, controller_parked_reason = ?,
 			due_reasons_json = ?,
 			next_assessment_at = ?,
@@ -1811,6 +1820,7 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 		newAssessmentID,
 		nullableStringValue(commit.AssessmentBasisHash), nullableStringValue(commit.MaterialFactHash),
 		string(actionContractJSON),
+		string(eligibleReasonsJSON),
 		parkedAt, parkedReason,
 		string(dueReasonsJSON),
 		nextAssessmentAt,

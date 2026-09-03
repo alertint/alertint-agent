@@ -2437,3 +2437,51 @@ func TestWakeDependencyRecoveredSituationsRepeatedPollsInSameGenerationDoNotRese
 // Bounded views (situation_views_test.go covers GetSituationControllerView
 // directly; this file's coverage stays scoped to situation_controller.go).
 // ----------------------------------------------------------------------
+
+// TestCommitControllerPersistsEligibleReasonCandidateSet proves the eligible
+// Sufficient-reason candidate set a cycle derived is committed as the
+// bounded current projection the read-only Situation view exposes — and
+// that a commit with none writes an empty array, never NULL/null.
+func TestCommitControllerPersistsEligibleReasonCandidateSet(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-commit-eligible", now)
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+
+	commit := basicControllerCommit(sitID, claim.Situation.InputVersion, now)
+	commit.EligibleReasons = []situationmodel.ReasonCandidate{{
+		ID: "reason-1", Code: "critical_anchor", Summary: "a critical symptom is firing",
+		CatalogVersion: 1, PredicateVersion: 1, EvidenceRefs: []string{"fact:symptom-1"}, DeterministicFloor: true,
+	}}
+	if err := st.CommitController(context.Background(), claim, commit); err != nil {
+		t.Fatalf("CommitController: %v", err)
+	}
+
+	view, err := st.GetSituationControllerView(context.Background(), sitID)
+	if err != nil {
+		t.Fatalf("GetSituationControllerView: %v", err)
+	}
+	if len(view.EligibleReasons) != 1 {
+		t.Fatalf("eligible reasons = %+v, want exactly the one committed candidate", view.EligibleReasons)
+	}
+	got := view.EligibleReasons[0]
+	if got.ID != "reason-1" || got.Code != "critical_anchor" || got.CatalogVersion != 1 || got.PredicateVersion != 1 ||
+		len(got.EvidenceRefs) != 1 || got.EvidenceRefs[0] != "fact:symptom-1" || !got.DeterministicFloor {
+		t.Fatalf("eligible reason = %+v, want the committed identity/code/versions/evidence/floor verbatim", got)
+	}
+
+	// A later cycle with no eligible candidates replaces the set with [].
+	claim2 := claimSituation(t, st, sitID, "controller-a", now.Add(time.Hour))
+	commit2 := basicControllerCommit(sitID, claim2.Situation.InputVersion, now.Add(time.Hour))
+	commit2.Attempt.Sequence = 2
+	if err := st.CommitController(context.Background(), claim2, commit2); err != nil {
+		t.Fatalf("second CommitController: %v", err)
+	}
+	view, err = st.GetSituationControllerView(context.Background(), sitID)
+	if err != nil {
+		t.Fatalf("GetSituationControllerView: %v", err)
+	}
+	if view.EligibleReasons == nil || len(view.EligibleReasons) != 0 {
+		t.Fatalf("eligible reasons after an empty commit = %#v, want a non-nil empty slice", view.EligibleReasons)
+	}
+}

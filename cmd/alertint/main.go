@@ -377,7 +377,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		OccurrenceCap:   cfg.Memory.OccurrenceCap,
 		Lookback:        time.Duration(cfg.Memory.LookbackDays) * 24 * time.Hour,
 	}
-	cor := correlator.New(corCfg, st, incidentSink{skill: skill}, logger)
+	cor := correlator.New(corCfg, st, productionIncidentSink(), logger)
 
 	// SetRejudger/SetTriageFailureNotifier are safe to wire here, before
 	// reconstruction: neither is reachable from ApplyDelivery's
@@ -511,21 +511,16 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), ingress.DefaultShutdownTimeout)
 	defer cancel()
 
-	// Receivers; drain due controller/Triage work (crt.Drain) and its
-	// resulting inputs (rt.Drain — runs second so it can mop up any fresh
-	// situation_input_outbox row the controller/Triage drain just produced,
-	// while the foundation workers are still running); stop the controller/
-	// Triage workers (crt.Stop); stop the foundation workers (rt.Stop:
-	// dispatch, then input); then the Correlator: Receivers stopping first
-	// means no new inbound work can be durably accepted; draining before
-	// stopping means due work gets a real chance to finish, bounded by
-	// shutdownCtx, before its workers' background loops are told to exit;
-	// the workers stopping next means nothing already durably queued goes
-	// unclaimed mid-drain; the Correlator stopping last — via
-	// stopCorrelator, the same sync.Once-guarded call the defer above falls
-	// back to on every other exit path — means it keeps serving fixed-window
-	// expiry and Triage retry for exactly as long as anything upstream could
-	// still be handing it work.
+	// Receivers; stop/flush the Correlator's fixed-window production; drain
+	// foundation delivery/input work and due controller/Triage work — and
+	// the inputs the latter produces — in rounds until a round handles
+	// nothing; then stop the controller/Triage workers (crt.Stop) and the
+	// foundation workers (rt.Stop: dispatch, then input). See
+	// foundationStopSequence's own doc comment for why the Correlator stops
+	// before the drain (its ticker is the one producer that could otherwise
+	// commit fresh durable work after the drain has finished) and why the
+	// drain is a loop. stopCorrelator is the same sync.Once-guarded call the
+	// defer above falls back to on every other exit path.
 	stopSeq := foundationStopSequence{
 		stopReceivers: func() error {
 			if recvSrv == nil {
@@ -533,11 +528,11 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 			}
 			return recvSrv.Shutdown(shutdownCtx)
 		},
-		drainControllerWork:   crt.Drain,
+		stopCorrelator:        stopCorrelator,
 		drainFoundationWork:   rt.Drain,
+		drainControllerWork:   crt.Drain,
 		stopControllerWorkers: crt.Stop,
 		stopWorkers:           rt.Stop,
-		stopCorrelator:        stopCorrelator,
 	}
 	if err := stopSeq.run(shutdownCtx); err != nil {
 		logger.Error("situation foundation shutdown failed", slog.String("err", err.Error()))
@@ -1227,13 +1222,19 @@ func llmanthropicCfg(cfg *config.Config) llmanthropic.Config {
 	}
 }
 
-// incidentSink wraps an acutetriage.Skill as a correlator.IncidentSink.
-type incidentSink struct {
-	skill *acutetriage.Skill
-}
-
-func (s incidentSink) OnIncidentReady(ctx context.Context, inc store.Incident) error {
-	return s.skill.Run(ctx, inc)
+// productionIncidentSink is the only IncidentSink production ever hands the
+// Correlator: a no-op. Acute Triage dispatch belongs to the Triage worker
+// (internal/situation.TriageWorker) polling the gated incident_triage
+// schedule; the Correlator owns grouping, readiness, and attachment only
+// and must carry no analyzer/LLM dispatch dependency at all — not even a
+// dormant one. An earlier wiring passed a Skill-backed sink here (whose
+// callback called Skill.Run); the Correlator never invoked it after Task 7,
+// but a live LLM dependency handed to a component that must have none is a
+// wiring bug regardless of whether it is reachable, and one refactor away
+// from becoming a second dispatch path. TestProductionCorrelatorHasNoAcuteTriageDispatchDependency
+// pins this.
+func productionIncidentSink() correlator.IncidentSink {
+	return correlator.NopIncidentSink{}
 }
 
 // buildLogger constructs the runtime logger applying precedence

@@ -41,6 +41,11 @@ type cleanSkipCall struct {
 	code, detail          string
 }
 
+type preClaimSkipCall struct {
+	incidentID string
+	minMembers int
+}
+
 type fakeStore struct {
 	mu sync.Mutex
 
@@ -50,6 +55,10 @@ type fakeStore struct {
 	recoverFn   func(ctx context.Context, now time.Time) (int, error)
 	cleanSkipFn func(ctx context.Context, attemptID, incidentID, code, detail string, now time.Time) error
 	exhaustFn   func(ctx context.Context, attemptID, incidentID, code, detail string, now time.Time) error
+	// preClaimSkipFn backs CleanSkipIncidentTriageBelowMinimumMembers; nil
+	// means "never skipped" (the eligible-Incident default).
+	preClaimSkipFn func(ctx context.Context, incidentID string, minMembers int, now time.Time) (situation.TriageCleanSkip, error)
+	preClaimSkips  []preClaimSkipCall
 
 	extendCalls    int
 	completeCalls  []completeCall
@@ -111,6 +120,22 @@ func (f *fakeStore) CompleteIncidentTriageAttemptAsCleanSkip(ctx context.Context
 		return f.cleanSkipFn(ctx, attemptID, incidentID, code, detail, now)
 	}
 	return nil
+}
+
+func (f *fakeStore) CleanSkipIncidentTriageBelowMinimumMembers(ctx context.Context, incidentID string, minMembers int, now time.Time) (situation.TriageCleanSkip, error) {
+	f.mu.Lock()
+	f.preClaimSkips = append(f.preClaimSkips, preClaimSkipCall{incidentID, minMembers})
+	f.mu.Unlock()
+	if f.preClaimSkipFn != nil {
+		return f.preClaimSkipFn(ctx, incidentID, minMembers, now)
+	}
+	return situation.TriageCleanSkip{}, nil
+}
+
+func (f *fakeStore) preClaimSkipCalls() []preClaimSkipCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]preClaimSkipCall(nil), f.preClaimSkips...)
 }
 
 func (f *fakeStore) RecoverExpiredIncidentTriageAttempts(ctx context.Context, now time.Time) (int, error) {
@@ -960,5 +985,127 @@ func TestTriageWorker_StartWakeStop(t *testing.T) {
 	defer stopCancel()
 	if err := w.Stop(stopCtx); err != nil {
 		t.Fatalf("Stop: %v", err)
+	}
+}
+
+// ----------------------------------------------------------------------
+// Pre-claim clean skip (MinimumMemberAlertsPolicy): a below-minimum Incident
+// is closed as a clean skip BEFORE any claim, so it consumes no attempt.
+// ----------------------------------------------------------------------
+
+// policyAnalyzer is a fakeAnalyzer that also exposes a minimum member-alert
+// count, the way skills/acutetriage.Skill does.
+type policyAnalyzer struct {
+	*fakeAnalyzer
+
+	minimum int
+}
+
+func (p *policyAnalyzer) MinimumMemberAlerts() int { return p.minimum }
+
+func TestTriageWorker_CleanSkipsBelowMinimumMembersBeforeClaimingAndConsumesNoAttempt(t *testing.T) {
+	store := &fakeStore{
+		claimFn: func(ctx context.Context, incidentID, owner string, now time.Time, lease time.Duration) (situation.TriageAttemptClaim, error) {
+			t.Fatalf("ClaimIncidentTriageAttempt(%s) was called — a below-minimum Incident must never be claimed", incidentID)
+			return situation.TriageAttemptClaim{}, nil
+		},
+		preClaimSkipFn: func(ctx context.Context, incidentID string, minMembers int, now time.Time) (situation.TriageCleanSkip, error) {
+			return situation.TriageCleanSkip{Skipped: true, SituationID: "sit-9", DecisionInputVersion: 3, MemberAlerts: 1}, nil
+		},
+	}
+	lister := &fakeLister{ids: []string{"inc-skip"}}
+	analyzer := &policyAnalyzer{fakeAnalyzer: &fakeAnalyzer{}, minimum: 2}
+	after := &fakeAfterCommit{}
+	audit := &fakeAuditSink{}
+	w := situation.NewTriageWorker(store, lister, analyzer, after, nil, situation.TriageWorkerConfig{Owner: "test-owner"}, nil)
+	w.SetAuditSink(audit)
+
+	n, err := w.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("RunOnce handled = %d, want 1 (the clean skip is durable work)", n)
+	}
+	calls := store.preClaimSkipCalls()
+	if len(calls) != 1 || calls[0].incidentID != "inc-skip" || calls[0].minMembers != 2 {
+		t.Fatalf("pre-claim skip calls = %+v, want exactly one for inc-skip with minimum 2", calls)
+	}
+	if analyzer.callCount() != 0 {
+		t.Fatalf("Analyze calls = %d, want 0 — nothing was dispatched", analyzer.callCount())
+	}
+	if len(store.cleanSkips()) != 0 {
+		t.Fatalf("post-claim clean-skip completions = %d, want 0", len(store.cleanSkips()))
+	}
+	if !audit.has("situation.triage_skipped") {
+		t.Fatalf("audit kinds = %v, want situation.triage_skipped", audit.kinds)
+	}
+	payload, ok := audit.payloads[0].(map[string]any)
+	if !ok || payload["situation_id"] != "sit-9" || payload["incident_id"] != "inc-skip" || payload["decision_reason"] != "below_minimum_member_alerts" {
+		t.Fatalf("audit payload = %+v, want situation/incident identity and decision_reason=below_minimum_member_alerts", audit.payloads[0])
+	}
+}
+
+func TestTriageWorker_EligibleIncidentIsClaimedAfterThePreClaimCheck(t *testing.T) {
+	claim := testClaim("inc-ok", 1)
+	store := &fakeStore{claimFn: func(ctx context.Context, incidentID, owner string, now time.Time, lease time.Duration) (situation.TriageAttemptClaim, error) {
+		return claim, nil
+	}}
+	lister := &fakeLister{ids: []string{"inc-ok"}}
+	analyzer := &policyAnalyzer{fakeAnalyzer: &fakeAnalyzer{}, minimum: 1}
+	after := &fakeAfterCommit{}
+	w := situation.NewTriageWorker(store, lister, analyzer, after, nil, situation.TriageWorkerConfig{Owner: "test-owner"}, nil)
+
+	if _, err := w.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if len(store.preClaimSkipCalls()) != 1 {
+		t.Fatalf("pre-claim skip calls = %d, want 1", len(store.preClaimSkipCalls()))
+	}
+	if analyzer.callCount() != 1 || len(store.snapshot().complete) != 1 {
+		t.Fatalf("Analyze/complete = %d/%d, want 1/1 — an eligible Incident proceeds through the ordinary claim", analyzer.callCount(), len(store.snapshot().complete))
+	}
+}
+
+func TestTriageWorker_PreClaimCheckErrorNeverClaims(t *testing.T) {
+	store := &fakeStore{
+		claimFn: func(ctx context.Context, incidentID, owner string, now time.Time, lease time.Duration) (situation.TriageAttemptClaim, error) {
+			t.Fatalf("ClaimIncidentTriageAttempt(%s) was called after the eligibility check failed — that could consume an attempt for an ineligible Incident", incidentID)
+			return situation.TriageAttemptClaim{}, nil
+		},
+		preClaimSkipFn: func(ctx context.Context, incidentID string, minMembers int, now time.Time) (situation.TriageCleanSkip, error) {
+			return situation.TriageCleanSkip{}, errors.New("database is locked")
+		},
+	}
+	lister := &fakeLister{ids: []string{"inc-err"}}
+	analyzer := &policyAnalyzer{fakeAnalyzer: &fakeAnalyzer{}, minimum: 2}
+	w := situation.NewTriageWorker(store, lister, analyzer, nil, nil, situation.TriageWorkerConfig{Owner: "test-owner"}, nil)
+
+	n, err := w.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("RunOnce handled = %d, want 0", n)
+	}
+}
+
+func TestTriageWorker_AnalyzerWithoutPolicySkipsThePreClaimCheck(t *testing.T) {
+	claim := testClaim("inc-nopolicy", 1)
+	store := &fakeStore{claimFn: func(ctx context.Context, incidentID, owner string, now time.Time, lease time.Duration) (situation.TriageAttemptClaim, error) {
+		return claim, nil
+	}}
+	lister := &fakeLister{ids: []string{"inc-nopolicy"}}
+	analyzer := &fakeAnalyzer{}
+	w := newWorker(store, lister, analyzer, &fakeAfterCommit{}, situation.TriageWorkerConfig{})
+
+	if _, err := w.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if len(store.preClaimSkipCalls()) != 0 {
+		t.Fatalf("pre-claim skip calls = %d, want 0 for an analyzer without MinimumMemberAlertsPolicy", len(store.preClaimSkipCalls()))
+	}
+	if analyzer.callCount() != 1 {
+		t.Fatalf("Analyze calls = %d, want 1", analyzer.callCount())
 	}
 }

@@ -1279,3 +1279,116 @@ func TestControllerReconcileLifecycleActiveReachesClosedUnknownWithoutRecoveryFi
 		t.Fatalf("closed_unknown must carry both terminal fields set, got TerminalAt=%v TerminalReason=%v", commit.TerminalAt, commit.TerminalReason)
 	}
 }
+
+// ----------------------------------------------------------------------
+// AssessmentHealthObserver: installation LLM health sees the FINAL typed
+// outcome, keyed by Situation.
+// ----------------------------------------------------------------------
+
+type healthObservation struct {
+	situationID  string
+	outcome      situation.L2Outcome
+	transportErr error
+}
+
+type fakeHealthObserver struct {
+	mu       sync.Mutex
+	begun    int
+	finished []healthObservation
+}
+
+type fakeHealthObservation struct {
+	f           *fakeHealthObserver
+	situationID string
+}
+
+func (f *fakeHealthObserver) BeginAssessmentCall(situationID string) situation.AssessmentCallObservation {
+	f.mu.Lock()
+	f.begun++
+	f.mu.Unlock()
+	return fakeHealthObservation{f: f, situationID: situationID}
+}
+
+func (o fakeHealthObservation) Finish(outcome situation.L2Outcome, transportErr error) {
+	o.f.mu.Lock()
+	o.f.finished = append(o.f.finished, healthObservation{o.situationID, outcome, transportErr})
+	o.f.mu.Unlock()
+}
+
+// TestControllerReportsFinalTypedOutcomeToHealthObserverPerSituation proves
+// the controller observes LLM health AFTER validation/classification — a
+// malformed proposal is reported as malformed even though the transport
+// returned it successfully — exactly once per dispatch, with the Situation
+// ID as the subject, and that a genuine transport failure carries its
+// error through.
+func TestControllerReportsFinalTypedOutcomeToHealthObserverPerSituation(t *testing.T) {
+	t.Run("malformed then accepted", func(t *testing.T) {
+		in := ctBaseSnapshotInput()
+		store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1, beginRetryEpoch: 0}
+		client := &fakeAssessmentClient{responses: []func() (llm.OneShotCompletion, error){
+			malformedResponse(), acceptedResponse(t),
+		}}
+		c := ctController(t, store, client)
+		obs := &fakeHealthObserver{}
+		c.SetAssessmentHealthObserver(obs)
+
+		claim := ctBaseClaim()
+		if err := c.Reconcile(context.Background(), claim); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if obs.begun != 2 || len(obs.finished) != 2 {
+			t.Fatalf("observations begun/finished = %d/%d, want 2/2 (one per dispatched call)", obs.begun, len(obs.finished))
+		}
+		want := []healthObservation{
+			{claim.Situation.ID, situation.L2OutcomeMalformed, nil},
+			{claim.Situation.ID, situation.L2OutcomeAccepted, nil},
+		}
+		for i, w := range want {
+			got := obs.finished[i]
+			if got.situationID != w.situationID || got.outcome != w.outcome || got.transportErr != nil {
+				t.Fatalf("observation %d = %+v, want %+v", i, got, w)
+			}
+		}
+	})
+
+	t.Run("transport failure carries the error", func(t *testing.T) {
+		in := ctBaseSnapshotInput()
+		store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1, beginRetryEpoch: 0}
+		transportErr := errors.New("dial tcp: connection refused")
+		client := &fakeAssessmentClient{responses: []func() (llm.OneShotCompletion, error){
+			func() (llm.OneShotCompletion, error) {
+				return llm.OneShotCompletion{RequestStarted: llm.RequestStartStatusUnknown}, transportErr
+			},
+		}}
+		c := ctController(t, store, client)
+		obs := &fakeHealthObserver{}
+		c.SetAssessmentHealthObserver(obs)
+
+		if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if len(obs.finished) != 1 {
+			t.Fatalf("observations = %d, want 1", len(obs.finished))
+		}
+		got := obs.finished[0]
+		if got.outcome != situation.L2OutcomeTransportFailure || !errors.Is(got.transportErr, transportErr) {
+			t.Fatalf("observation = %+v, want transport_failure carrying the CompleteOnce error", got)
+		}
+	})
+
+	t.Run("policy rejection is reported as policy_rejected", func(t *testing.T) {
+		in := ctBaseSnapshotInput()
+		store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1, beginRetryEpoch: 0}
+		client := &fakeAssessmentClient{responses: []func() (llm.OneShotCompletion, error){policyRejectedResponse(t)}}
+		c := ctController(t, store, client)
+		obs := &fakeHealthObserver{}
+		c.SetAssessmentHealthObserver(obs)
+
+		if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if len(obs.finished) != 1 || obs.finished[0].outcome != situation.L2OutcomePolicyRejected {
+			t.Fatalf("observations = %+v, want exactly one policy_rejected", obs.finished)
+		}
+	})
+}

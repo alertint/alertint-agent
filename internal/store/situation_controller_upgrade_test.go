@@ -119,18 +119,22 @@ func TestSituationControllerSchemaUpgradesMigration14Database(t *testing.T) {
 
 	var (
 		currentAssessmentID  sql.NullString
+		eligibleReasonsJSON  string
 		retryEpoch           int
 		workAttempts         int
 		lastConsumedRecovery int
 	)
 	if err := st.DB().QueryRowContext(ctx, `
-		SELECT current_assessment_id, controller_retry_epoch, controller_work_attempts, last_consumed_recovery_generation
+		SELECT current_assessment_id, current_eligible_reasons_json, controller_retry_epoch, controller_work_attempts, last_consumed_recovery_generation
 		FROM situations WHERE id = 'pre-controller-situation'
-	`).Scan(&currentAssessmentID, &retryEpoch, &workAttempts, &lastConsumedRecovery); err != nil {
+	`).Scan(&currentAssessmentID, &eligibleReasonsJSON, &retryEpoch, &workAttempts, &lastConsumedRecovery); err != nil {
 		t.Fatalf("read back upgraded situation: %v", err)
 	}
 	if currentAssessmentID.Valid {
 		t.Errorf("current_assessment_id = %q, want NULL on a pre-upgrade situation", currentAssessmentID.String)
+	}
+	if eligibleReasonsJSON != "[]" {
+		t.Errorf("current_eligible_reasons_json = %q, want [] on a pre-upgrade situation", eligibleReasonsJSON)
 	}
 	if retryEpoch != 0 || workAttempts != 0 || lastConsumedRecovery != 0 {
 		t.Errorf("controller projection = (retry_epoch=%d, work_attempts=%d, last_consumed=%d), want all zero", retryEpoch, workAttempts, lastConsumedRecovery)

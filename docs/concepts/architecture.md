@@ -147,9 +147,23 @@ one build runs one grouping/dispatch path at a time.
   see [MCP clients](../integrations/mcp-clients.md)
 - **Config:** `situations.*` — see
   [Configuration](../getting-started/configuration.md#situations)
+- **Observability:** every controller cycle, every consumed L2 dispatch
+  slot, and every consumed Acute Triage attempt is one OpenTelemetry span
+  (`situation.controller.reconcile`, `situation.assessment.dispatch`,
+  `incident.triage.attempt`) carrying only stable identity, digest, count,
+  closed result-class, and duration attributes — Situation/Incident/attempt
+  IDs, input version, material/basis hashes, membership/Incident-input/
+  evidence-pack digests, dispatch slot and attempt number — never a prompt,
+  proposal, provider body, or SQL text. Structured logs and the audit log
+  carry the same identities, so the three surfaces can be reconciled
+  against each other and against the store. Spans go through the
+  OpenTelemetry global tracer provider; **this build configures no
+  exporter**, so they stay inert until a later release adds an
+  operator-configured one — no telemetry leaves the process today.
 - **Not yet:** connector preparation, Assessment/Triage artifacts beyond the
   bounded recent-attempt history, Transition/Episode summary history,
-  Situation-owned Slack, the final v0.14 cutover
+  Situation-owned Slack, an OpenTelemetry exporter/config surface, the
+  final v0.14 cutover
 
 ### 4. Memory
 

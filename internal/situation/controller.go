@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/alertint/alertint-agent/internal/llm"
 	"github.com/alertint/alertint-agent/internal/situation/model"
@@ -161,19 +162,26 @@ type ControllerCommit struct {
 	Assessment          model.Assessment
 	MaterialFactHash    string
 	AssessmentBasisHash string
-	Coverage            []model.IncidentCoverage
-	TriageDecisions     []TriageDecision
-	Lifecycle           model.Lifecycle
-	Attention           model.Attention
-	RecoveryObservedAt  *time.Time
-	GraceUntil          *time.Time
-	TerminalAt          *time.Time
-	TerminalReason      *model.TerminalReason
-	NextAssessmentAt    time.Time
-	ConsumedDueReasons  []model.DueReason
-	RetryAt             *time.Time
-	LastErrorClass      *string
-	Parked              ParkedState
+	// EligibleReasons is this cycle's full eligible Sufficient-reason
+	// candidate set (Snapshot.EligibleReasons) — persisted as the bounded
+	// current projection the read-only Situation view exposes alongside the
+	// hashes, so MCP can show which reasons were eligible (with evidence
+	// references and catalog/predicate versions), not only the one the
+	// Assessment accepted.
+	EligibleReasons    []model.ReasonCandidate
+	Coverage           []model.IncidentCoverage
+	TriageDecisions    []TriageDecision
+	Lifecycle          model.Lifecycle
+	Attention          model.Attention
+	RecoveryObservedAt *time.Time
+	GraceUntil         *time.Time
+	TerminalAt         *time.Time
+	TerminalReason     *model.TerminalReason
+	NextAssessmentAt   time.Time
+	ConsumedDueReasons []model.DueReason
+	RetryAt            *time.Time
+	LastErrorClass     *string
+	Parked             ParkedState
 }
 
 // ParkedState is CommitController's explicit instruction for the
@@ -268,6 +276,39 @@ type AuditSink interface {
 	Append(ctx context.Context, actor, kind string, payload any) error
 }
 
+// AssessmentHealthObserver observes each L2 (Assessment) dispatch's FINAL
+// typed outcome for installation-level LLM dependency health — the
+// controller-side seam Task 9's runtime wiring implements over
+// internal/llmhealth.Tracker (which this package cannot import: llmhealth
+// imports internal/store, which imports internal/situation — the same
+// constraint DependencyRecoveryWaker documents). BeginAssessmentCall is
+// called immediately before the physical provider request, with the
+// Situation ID as the observation's subject (so content-class failures
+// corroborate across DISTINCT Situations, never one pathological Situation
+// alone); the returned observation's Finish is called exactly once, after
+// ValidateAssessmentProposal and ClassifyL2Outcome have produced the final
+// typed outcome. Observing at the transport layer instead (a CompleteOnce
+// decorator) mis-reports a malformed or policy-invalid proposal as a
+// healthy call, because the transport succeeded — health must see what the
+// controller concluded, not what the wire returned. Nil disables it.
+type AssessmentHealthObserver interface {
+	BeginAssessmentCall(situationID string) AssessmentCallObservation
+}
+
+// AssessmentCallObservation ends one AssessmentHealthObserver observation.
+// outcome is the final ClassifyL2Outcome classification of the call;
+// transportErr is the CompleteOnce error when the outcome is a transport-
+// layer failure (transport_failure/rate_limited), nil otherwise. A stale-
+// basis outcome is a correctly discarded late completion, not a provider
+// failure — implementations must treat it as a success.
+type AssessmentCallObservation interface {
+	Finish(outcome L2Outcome, transportErr error)
+}
+
+type noopAssessmentCallObservation struct{}
+
+func (noopAssessmentCallObservation) Finish(L2Outcome, error) {}
+
 // Clock returns the current time. Production callers pass
 // func() time.Time { return time.Now().UTC() }; tests pass a fixed or
 // scripted clock.
@@ -296,15 +337,16 @@ type RetryConfig struct {
 // unit-tested ahead of a later plan's real polling connector; Task 9's
 // wiring leaves it at its zero-value default (floor-clamped) until then.
 //
-// Cadence (fast/normal/slow durations) is deliberately NOT a field here:
-// assessment.go's DeriveCadence/cadenceInterval hardcode their own fixed
-// durations (cadenceFastInterval etc.) with no parameter to inject a
-// config value into, so a ControllerConfig field for it would be inert
-// decoration. See this task's report for the resulting fast-cadence
-// discrepancy against config.SituationsConfig.Cadence.FastSeconds's own
-// default (2m hardcoded vs. 60s configured) — a pre-existing Task 5
-// mismatch this task does not silently patch.
+// Cadence sizes the fast/normal/slow reconsideration tiers DeriveCadence
+// selects between; it reaches assessment.go's nextUpdateAt through
+// ControllerState.Tempo (buildControllerState). Zero-valued tiers fall
+// back to plan.md's executable defaults (60/300/900s) — the same values
+// config.SituationsConfig.Cadence defaults to, so the configured and the
+// derived tempo can never silently disagree.
 type ControllerConfig struct {
+	// Cadence is the configured reconsideration tempo — see CadenceTempo.
+	Cadence CadenceTempo
+
 	// MaxL2CallsPerAttempt bounds the durable dispatch slots one
 	// work-bearing controller attempt may consume: the draft call plus at
 	// most one immediate malformed-shape correction. Default 2
@@ -366,6 +408,7 @@ func (c ControllerConfig) withDefaults() ControllerConfig {
 	if c.Retry.JitterPercent <= 0 {
 		c.Retry.JitterPercent = defaultControllerRetryJitterPercent
 	}
+	c.Cadence = c.Cadence.withDefaults()
 	return c
 }
 
@@ -377,7 +420,25 @@ type Controller struct {
 	cfg    ControllerConfig
 	clock  Clock
 	audit  AuditSink
+	health AssessmentHealthObserver
 	logger *slog.Logger
+}
+
+// SetAssessmentHealthObserver wires the installation LLM-health observer
+// for this controller's L2 dispatches (see AssessmentHealthObserver). Not
+// safe to call concurrently with Reconcile; call once, after construction.
+func (c *Controller) SetAssessmentHealthObserver(o AssessmentHealthObserver) {
+	c.health = o
+}
+
+func (c *Controller) beginAssessmentObservation(situationID string) AssessmentCallObservation {
+	if c.health == nil {
+		return noopAssessmentCallObservation{}
+	}
+	if obs := c.health.BeginAssessmentCall(situationID); obs != nil {
+		return obs
+	}
+	return noopAssessmentCallObservation{}
 }
 
 // NewController constructs a Controller. clock and logger may be nil
@@ -943,6 +1004,7 @@ func (c *Controller) buildControllerState(snap Snapshot, in SnapshotInput, lc li
 		deadline = &d
 	}
 	return ControllerState{
+		Tempo:                          c.cfg.Cadence,
 		TriagePhase:                    aggregateTriagePhase(snap.Incidents, triageDecisions),
 		TriageDueAt:                    earliestTriageDue(snap.Incidents, triageDecisions, now),
 		RecoveryGraceUntil:             lc.GraceUntil,
@@ -966,11 +1028,36 @@ func (c *Controller) commit(ctx context.Context, claim Claim, commit ControllerC
 		c.auditAppend(ctx, "situation.controller.commit_failed", map[string]any{
 			"situation_id": claim.Situation.ID, "error": err.Error(),
 		})
-		return err
+		return &commitFailedError{err: err}
 	}
 	c.auditCommitSuccess(ctx, claim, commit)
+	// The enclosing reconcile span (Reconcile) learns what this cycle
+	// committed: the fresh attempt's identity/derivation, if any, and the
+	// hashes — identity and digests only.
+	span := trace.SpanFromContext(ctx)
+	span.SetAttributes(
+		AttrMaterialFactHash.String(commit.MaterialFactHash),
+		AttrAssessmentBasisHash.String(commit.AssessmentBasisHash),
+	)
+	if commit.Attempt.ID != "" {
+		span.SetAttributes(
+			AttrAttemptID.String(commit.Attempt.ID),
+			AttrAssessmentDerivation.String(string(commit.Attempt.Derivation)),
+		)
+	}
 	return nil
 }
+
+// commitFailedError marks an error as CommitController's own rejection (a
+// stale claim — lease lost or input version conflict — or a store failure
+// at the fenced commit), so Reconcile's span can classify it as
+// commit_failed without this package naming store-local sentinels. It is
+// transparent: Error() is the wrapped error's text verbatim and Unwrap
+// keeps every errors.Is/As chain intact.
+type commitFailedError struct{ err error }
+
+func (e *commitFailedError) Error() string { return e.err.Error() }
+func (e *commitFailedError) Unwrap() error { return e.err }
 
 // assessmentAuditKind maps a NEW authoritative attempt's own Derivation onto
 // spec.md's exact named audit event for that outcome. Only a genuinely fresh
@@ -1053,6 +1140,27 @@ func (c *Controller) auditCommitSuccess(ctx context.Context, claim Claim, commit
 // durable slot; one fenced final commit. See spec.md's own runtime-
 // ownership diagram (plan.md Task 8) for the exact order this mirrors.
 func (c *Controller) Reconcile(ctx context.Context, claim Claim) error {
+	ctx, span := tracer().Start(ctx, SpanControllerReconcile, trace.WithAttributes(
+		AttrSituationID.String(claim.Situation.ID),
+		AttrInputVersion.Int(claim.Situation.InputVersion),
+	))
+	defer span.End()
+	err := c.reconcile(ctx, claim)
+	var commitFailed *commitFailedError
+	switch {
+	case err == nil:
+		span.SetAttributes(AttrResultClass.String(ReconcileResultCommitted))
+	case errors.As(err, &commitFailed):
+		span.SetAttributes(AttrResultClass.String(ReconcileResultCommitFailed))
+	default:
+		// The error text itself is never recorded on the span: a wrapped
+		// store error can carry SQL fragments.
+		span.SetAttributes(AttrResultClass.String(ReconcileResultError))
+	}
+	return err
+}
+
+func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 	ctx, cancel := context.WithTimeout(ctx, c.cfg.AttemptWall)
 	defer cancel()
 	now := c.clock()
@@ -1088,6 +1196,7 @@ func (c *Controller) Reconcile(ctx context.Context, claim Claim) error {
 	base := ControllerCommit{
 		MaterialFactHash:    snap.MaterialFactHash,
 		AssessmentBasisHash: snap.AssessmentBasisHash,
+		EligibleReasons:     snap.EligibleReasons,
 		TriageDecisions:     triageDecisions,
 		Lifecycle:           lc.Lifecycle,
 		RecoveryObservedAt:  lc.RecoveryObservedAt,
@@ -1408,7 +1517,20 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 			"material_fact_hash": snap.MaterialFactHash,
 		})
 
-		oneShot, callErr := c.client.CompleteOnce(ctx, "", prompt, nil)
+		// One span per consumed dispatch slot, started only AFTER the
+		// durable call row committed above — it wraps the out-of-
+		// transaction provider I/O and classification, nothing durable.
+		callCtx, callSpan := tracer().Start(ctx, SpanAssessmentDispatch, trace.WithAttributes(
+			AttrSituationID.String(claim.Situation.ID),
+			AttrInputVersion.Int(snap.InputVersion),
+			AttrAssessmentCallID.String(callID),
+			AttrRetryEpoch.Int(retryEpoch),
+			AttrWorkAttempt.Int(workAttempt),
+			AttrDispatchSlot.Int(callNumber),
+			AttrMaterialFactHash.String(snap.MaterialFactHash),
+		))
+		healthObs := c.beginAssessmentObservation(claim.Situation.ID)
+		oneShot, callErr := c.client.CompleteOnce(callCtx, "", prompt, nil)
 		// oneShot.RequestStarted is the AssessmentClient's own authoritative
 		// classification (llm.ClassifyRequestStart, already applied inside
 		// CompleteOnce) — trust it directly rather than reclassifying callErr
@@ -1427,6 +1549,16 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 		lastVR, lastTransportErr, lastCallID, lastDuration = vr, transportErr, callID, oneShot.Latency
 
 		policy := ClassifyL2Outcome(vr, transportErr, correctionUsed)
+		// Installation LLM health observes the FINAL typed outcome — after
+		// validation and classification — with this Situation as its
+		// subject, never the bare transport result (AssessmentHealthObserver).
+		healthObs.Finish(policy.Outcome, transportErr)
+		callSpan.SetAttributes(
+			AttrProviderRequestStarted.String(string(started)),
+			AttrResultClass.String(string(policy.Outcome)),
+			AttrDurationMS.Int64(oneShot.Latency.Milliseconds()),
+		)
+		callSpan.End()
 		if policy.Outcome == L2OutcomeAccepted || policy.Outcome == L2OutcomeContradicted {
 			p := vr.Proposal
 			return &p, nil, callID, oneShot.Latency, correctionUsed, nil

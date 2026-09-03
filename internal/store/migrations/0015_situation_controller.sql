@@ -140,6 +140,14 @@ ALTER TABLE situations ADD COLUMN current_assessment_basis_hash TEXT;
 ALTER TABLE situations ADD COLUMN current_material_fact_hash TEXT;
 ALTER TABLE situations ADD COLUMN current_action_contract_json TEXT
     CHECK (current_action_contract_json IS NULL OR (json_valid(current_action_contract_json) AND json_type(current_action_contract_json) = 'object'));
+-- current_eligible_reasons_json is the bounded eligible Sufficient-reason
+-- candidate set (id/code/versions/evidence refs/deterministic floor) the
+-- controller's most recent commit derived from the current material facts —
+-- the "eligible reasons with evidence references and versions" the
+-- read-only Situation view exposes. Never the accepted reason alone (that
+-- lives inside the Assessment) and never free text.
+ALTER TABLE situations ADD COLUMN current_eligible_reasons_json TEXT NOT NULL DEFAULT '[]'
+    CHECK (json_valid(current_eligible_reasons_json) AND json_type(current_eligible_reasons_json) = 'array');
 -- controller_retry_epoch/controller_work_attempts are Plan 2's Assessment
 -- work counters and are distinct from Plan 1's generic claim/lease
 -- attempt_count: five durable controller attempts are budgeted per
@@ -163,3 +171,35 @@ WHEN NEW.current_assessment_id IS NOT NULL AND NOT EXISTS (
     WHERE a.id = NEW.current_assessment_id AND a.situation_id = NEW.id AND a.status = 'authoritative'
 )
 BEGIN SELECT RAISE(ABORT, 'current_assessment_id must reference an authoritative attempt owned by the same situation'); END;
+
+-- Installation LLM health learns the controller's own L2 capability. The
+-- Situation controller's Assessment dispatch feeds the same installation-
+-- level LLM dependency state Acute Triage does (spec: "LLM health remains
+-- one installation-level capability state fed by real Acute Triage and
+-- Assessment outcomes") under internal/llmhealth's CapabilityAssessment
+-- ("assessment"). 0012's llm_health_capabilities.capability CHECK is a
+-- closed enum that does not include it; SQLite cannot ALTER a CHECK
+-- constraint in place, so this rebuilds the table, preserving every
+-- existing row verbatim and widening only the enum. It never edits 0012.
+CREATE TABLE llm_health_capabilities_new (
+    capability       TEXT    NOT NULL PRIMARY KEY
+                     CHECK (capability IN ('triage_draft','verification_rejudge','memory_classifier','query_repair','probe','assessment')),
+    healthy          INTEGER NOT NULL CHECK (healthy IN (0, 1)),
+    reason_code      TEXT    NOT NULL DEFAULT '',
+    detail           TEXT    NOT NULL DEFAULT '',
+    last_success_at  TEXT,
+    last_failure_at  TEXT,
+    unhealthy_since  TEXT,
+    content_subjects TEXT    NOT NULL DEFAULT '[]'
+                     CHECK (json_valid(content_subjects) AND json_type(content_subjects) = 'array'),
+    updated_at       TEXT    NOT NULL
+) STRICT;
+
+INSERT INTO llm_health_capabilities_new (
+    capability, healthy, reason_code, detail, last_success_at, last_failure_at, unhealthy_since, content_subjects, updated_at
+)
+SELECT capability, healthy, reason_code, detail, last_success_at, last_failure_at, unhealthy_since, content_subjects, updated_at
+FROM llm_health_capabilities;
+
+DROP TABLE llm_health_capabilities;
+ALTER TABLE llm_health_capabilities_new RENAME TO llm_health_capabilities;

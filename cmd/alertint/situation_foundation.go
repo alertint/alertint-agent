@@ -138,22 +138,29 @@ func (r *foundationRuntime) Stop(ctx context.Context) error {
 
 // Drain runs the input worker's, then the dispatch worker's, due work to
 // quiescence (repeat until a round handles zero items, or ctx is done) —
-// the same order Start already uses. Task 9's shutdown sequence calls this
-// AFTER controllerRuntime.Drain, so any fresh situation_input_outbox row a
-// controller commit or a Triage completion just produced (while this
-// runtime's own workers are STILL running) gets at least a chance to be
-// consumed before shutdown proceeds; anything still queued when ctx expires
-// simply waits, durably, for the next startup's reconstruction pass.
-// Bounded by ctx; a ctx deadline mid-drain is not itself an error worth
-// surfacing to the caller — only a genuine store error is.
-func (r *foundationRuntime) Drain(ctx context.Context) error {
-	if _, err := r.inputs.Drain(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("input worker drain: %w", err)
+// the same order Start already uses — and reports how many items the two
+// handled in total, so foundationStopSequence's drain loop can tell a
+// productive round from an idle one. It runs in every round of that loop,
+// both before the controller/Triage drain (delivery and Situation-input
+// work already queued) and after it (the fresh situation_input_outbox rows
+// a controller commit or Triage completion just produced, while this
+// runtime's own workers are STILL running); anything still queued when ctx
+// expires simply waits, durably, for the next startup's reconstruction
+// pass. Bounded by ctx; a ctx deadline mid-drain is not itself an error
+// worth surfacing to the caller — only a genuine store error is.
+func (r *foundationRuntime) Drain(ctx context.Context) (int, error) {
+	handled := 0
+	n, err := r.inputs.Drain(ctx)
+	handled += n
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		return handled, fmt.Errorf("input worker drain: %w", err)
 	}
-	if _, err := r.dispatch.Drain(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("dispatch worker drain: %w", err)
+	n, err = r.dispatch.Drain(ctx)
+	handled += n
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		return handled, fmt.Errorf("dispatch worker drain: %w", err)
 	}
-	return nil
+	return handled, nil
 }
 
 // WakeDispatch nudges the dispatch worker to run another round immediately
@@ -229,56 +236,69 @@ func (f foundationSequence) run(ctx context.Context) error {
 }
 
 // foundationStopSequence composes the shutdown mirror of
-// foundationSequence: stop Receivers; drain due controller/Triage work to
-// quiescence (Task 9's controllerRuntime.Drain); drain the foundation
-// dispatch/input work to quiescence (Task 9's foundationRuntime.Drain —
-// this runs SECOND so it can mop up any fresh situation_input_outbox row
-// the controller/Triage drain just produced, while its own background
-// loops are still running); stop the Situation controller and Acute Triage
-// workers (Task 9's controllerRuntime.Stop); stop the foundation workers
-// (dispatch, then input — foundationRuntime.Stop's own order); then stop
-// the Correlator. Receivers stopping first means no new inbound work can be
-// durably accepted; draining before stopping means due work gets a chance
-// to finish (spec.md's own "leave remaining durable work recoverable" for
-// whatever a ctx deadline still catches mid-flight); the workers stopping
-// next means nothing already durably queued goes unclaimed mid-drain; the
-// Correlator stopping last means it keeps serving its own fixed-window
-// expiry and Triage retry schedule for exactly as long as anything
-// upstream could still be handing it work. run collects every stop error
-// with errors.Join rather than stopping early, since every later stage
-// must still get a chance to shut down even if an earlier one failed.
-// stopWorkers is always the real process's foundationRuntime.Stop: main
-// wires it as exactly rt.Stop, never as separate per-worker closures, so
+// foundationSequence, in the exact order plan.md Task 9 requires: stop
+// Receivers; stop/flush the Correlator's fixed-window production; drain the
+// foundation delivery/Situation-input work; drain due controller/Triage
+// work AND its resulting inputs to quiescence; then stop the workers
+// (controller/Triage first, then the foundation's dispatch/input pair).
+//
+// Receivers stopping first means no new inbound work can be durably
+// accepted. The Correlator stopping SECOND — before any drain — is what
+// makes the drain below reach a real quiescent state: its fixed-window
+// ticker is the one remaining producer of fresh durable work (an expiring
+// window commits a ready Incident, an awaiting_decision Triage row, and a
+// Situation input together), so leaving it running until the end let a
+// window expire after the controller drain had already finished and
+// strand that work for the next startup's recovery. Stopping it here
+// leaves any still-collecting window exactly where startup's own recovery
+// re-arms it; no ready transition is lost, it is merely deferred. The
+// Correlator's ApplyDelivery path (the dispatch worker's DeliveryApplier)
+// is a synchronous call that needs no running Correlator loop, so the
+// foundation drain that follows is unaffected.
+//
+// Draining is a loop, not a fixed pair of passes, because the two halves
+// feed each other: an applied Situation input makes a Situation due, a
+// controller commit or Triage completion appends fresh Situation inputs.
+// Each round drains the foundation (input worker, then dispatch worker)
+// and then the controller/Triage workers; the loop ends on the first
+// round that handles zero items in both, on a drain error, on ctx expiry,
+// or at maxShutdownDrainRounds (a defensive bound against a pathological
+// ping-pong — whatever remains is durable and recoverable at next
+// startup, spec.md's own "leave remaining durable work recoverable").
+// Workers stop only after that, so nothing durably queued goes unclaimed
+// mid-drain. run collects every stop error with errors.Join rather than
+// stopping early, since every later stage must still get a chance to shut
+// down even if an earlier one failed. stopWorkers is always the real
+// process's foundationRuntime.Stop: main wires it as exactly rt.Stop, never
+// as separate per-worker closures, so
 // TestFoundationRuntimeStopsDispatchBeforeInputs proves the order the real
 // process actually executes.
 //
 // drainControllerWork, drainFoundationWork, and stopControllerWorkers are
 // Task 9 additions; all three may be left nil (no Plan 2 controller runtime
-// composed in at all), in which case run behaves exactly as it did before
-// Task 9. The real production wiring (runServe) always sets all three.
+// composed in at all), in which case no drain loop runs and the sequence
+// degrades to Receivers -> Correlator -> workers. The real production
+// wiring (runServe) always sets all three.
 type foundationStopSequence struct {
 	stopReceivers         func() error
-	drainControllerWork   func(ctx context.Context) error
-	drainFoundationWork   func(ctx context.Context) error
+	stopCorrelator        func()
+	drainFoundationWork   func(ctx context.Context) (int, error)
+	drainControllerWork   func(ctx context.Context) (int, error)
 	stopControllerWorkers func(ctx context.Context) error
 	stopWorkers           func(ctx context.Context) error
-	stopCorrelator        func()
 }
+
+// maxShutdownDrainRounds bounds foundationStopSequence's drain loop.
+const maxShutdownDrainRounds = 8
 
 func (f foundationStopSequence) run(ctx context.Context) error {
 	var errs []error
 	if err := f.stopReceivers(); err != nil {
 		errs = append(errs, err)
 	}
-	if f.drainControllerWork != nil {
-		if err := f.drainControllerWork(ctx); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if f.drainFoundationWork != nil {
-		if err := f.drainFoundationWork(ctx); err != nil {
-			errs = append(errs, err)
-		}
+	f.stopCorrelator()
+	if err := f.drainToQuiescence(ctx); err != nil {
+		errs = append(errs, err)
 	}
 	if f.stopControllerWorkers != nil {
 		if err := f.stopControllerWorkers(ctx); err != nil {
@@ -288,6 +308,37 @@ func (f foundationStopSequence) run(ctx context.Context) error {
 	if err := f.stopWorkers(ctx); err != nil {
 		errs = append(errs, err)
 	}
-	f.stopCorrelator()
 	return errors.Join(errs...)
+}
+
+// drainToQuiescence runs the foundation-then-controller drain rounds
+// described on foundationStopSequence until a round handles nothing.
+func (f foundationStopSequence) drainToQuiescence(ctx context.Context) error {
+	if f.drainFoundationWork == nil && f.drainControllerWork == nil {
+		return nil
+	}
+	for round := 0; round < maxShutdownDrainRounds; round++ {
+		if ctx.Err() != nil {
+			return nil
+		}
+		handled := 0
+		if f.drainFoundationWork != nil {
+			n, err := f.drainFoundationWork(ctx)
+			if err != nil {
+				return err
+			}
+			handled += n
+		}
+		if f.drainControllerWork != nil {
+			n, err := f.drainControllerWork(ctx)
+			if err != nil {
+				return err
+			}
+			handled += n
+		}
+		if handled == 0 {
+			return nil
+		}
+	}
+	return nil
 }

@@ -979,14 +979,134 @@ func (s *Store) ExhaustIncidentTriageAttempt(ctx context.Context, attemptID, inc
 	return tx.Commit()
 }
 
+// CleanSkipIncidentTriageBelowMinimumMembers is the worker's pre-claim
+// clean skip (Global Constraint: "A clean skip is a first judgment without
+// Acute Triage dispatch and consumes no Triage attempt"). For a due,
+// controller-decided pending/backoff row on a ready Incident it counts the
+// Incident's current member alerts inside one transaction and, when that
+// count is below minMembers, closes the schedule to the same terminal
+// 'skipped' phase the B+-gate skip uses and appends exactly one
+// triage_skipped input — inserting NO attempt-ledger row, incrementing NO
+// attempt count, and never touching the Incident's own status (it stays
+// "ready", collapse-eligible). Counting and closing share the transaction
+// so a member attaching concurrently is either counted or lands on an
+// already-skipped (first-judged) Incident — never lost between a check and
+// a later claim.
+//
+// Members are counted from the delivery ledger (distinct alert IDs across
+// incident_alert_deliveries — the same frozen set a claim would hand
+// Analyze), falling back to incident_alerts for a legacy/pre-ledger
+// Incident with no delivery rows, exactly as skills/acutetriage's own
+// loadFrozenClaimAlerts falls back for an empty frozen set.
+//
+// Returns Skipped=false and changes nothing when the row is not
+// pending/backoff on a ready Incident, has no controller decision, is not
+// yet due, or the Incident meets the minimum — the ordinary claim then
+// proceeds and reports each of those cases with its own sentinel.
+func (s *Store) CleanSkipIncidentTriageBelowMinimumMembers(ctx context.Context, incidentID string, minMembers int, now time.Time) (situation.TriageCleanSkip, error) {
+	if strings.TrimSpace(incidentID) == "" || minMembers <= 0 {
+		return situation.TriageCleanSkip{}, errors.New("store: clean skip below minimum members requires incident id and a positive minimum")
+	}
+	now = now.UTC()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return situation.TriageCleanSkip{}, fmt.Errorf("store: begin clean skip below minimum members: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var phase string
+	var situationID, groupKey, nextAtStr sql.NullString
+	var decisionInputVersion sql.NullInt64
+	err = tx.QueryRowContext(ctx, `
+		SELECT t.phase, t.situation_id, t.decision_input_version, t.next_at, i.group_key
+		FROM incident_triage t JOIN incidents i ON i.id = t.incident_id
+		WHERE t.incident_id = ? AND i.status = 'ready'`, incidentID).
+		Scan(&phase, &situationID, &decisionInputVersion, &nextAtStr, &groupKey)
+	if errors.Is(err, sql.ErrNoRows) {
+		return situation.TriageCleanSkip{}, nil
+	}
+	if err != nil {
+		return situation.TriageCleanSkip{}, fmt.Errorf("store: read incident triage row for clean skip: %w", err)
+	}
+	if (phase != "pending" && phase != "backoff") || !situationID.Valid || !decisionInputVersion.Valid {
+		return situation.TriageCleanSkip{}, nil
+	}
+	nextAt, err := timePtr(nextAtStr)
+	if err != nil {
+		return situation.TriageCleanSkip{}, err
+	}
+	if nextAt != nil && nextAt.After(now) {
+		return situation.TriageCleanSkip{}, nil
+	}
+
+	members, err := memberAlertCountTx(ctx, tx, incidentID)
+	if err != nil {
+		return situation.TriageCleanSkip{}, err
+	}
+	result := situation.TriageCleanSkip{
+		SituationID: situationID.String, DecisionInputVersion: int(decisionInputVersion.Int64), MemberAlerts: members,
+	}
+	if members >= minMembers {
+		return result, nil
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE incident_triage
+		SET phase = 'skipped', next_at = NULL, last_error_code = NULL, last_error_detail = NULL,
+		    lease_owner = NULL, lease_expires_at = NULL, current_attempt_id = NULL, updated_at = ?
+		WHERE incident_id = ? AND phase IN ('pending','backoff')`,
+		canonicalTime(now), incidentID)
+	if err != nil {
+		return situation.TriageCleanSkip{}, fmt.Errorf("store: clean skip incident triage schedule: %w", err)
+	}
+	if err := requireOneRow(res, "store: clean skip incident triage schedule", ErrNotFound); err != nil {
+		return situation.TriageCleanSkip{}, err
+	}
+
+	idempotencyKey := fmt.Sprintf("triage-skipped:%s:%d", incidentID, decisionInputVersion.Int64)
+	if err := insertTriageSituationInputTx(ctx, tx, "triage_skipped", idempotencyKey, incidentID, groupKey.String, now); err != nil {
+		return situation.TriageCleanSkip{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return situation.TriageCleanSkip{}, fmt.Errorf("store: commit clean skip below minimum members: %w", err)
+	}
+	result.Skipped = true
+	return result, nil
+}
+
+// memberAlertCountTx counts incidentID's current member alerts: distinct
+// alert IDs across its delivery ledger, falling back to incident_alerts for
+// a legacy Incident with no delivery rows (see
+// CleanSkipIncidentTriageBelowMinimumMembers).
+func memberAlertCountTx(ctx context.Context, tx *sql.Tx, incidentID string) (int, error) {
+	var n int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(DISTINCT ad.alert_id)
+		FROM incident_alert_deliveries iad
+		JOIN alert_deliveries ad ON ad.id = iad.delivery_id
+		WHERE iad.incident_id = ?`, incidentID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("store: count incident member deliveries: %w", err)
+	}
+	if n > 0 {
+		return n, nil
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM incident_alerts WHERE incident_id = ?`, incidentID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("store: count incident member alerts: %w", err)
+	}
+	return n, nil
+}
+
 // CompleteIncidentTriageAttemptAsCleanSkip closes a claimed attempt whose
 // AcuteAnalyzer found nothing worth judging (skills/acutetriage's own
-// ErrCleanSkip: too few member alerts, or a known-rule short circuit that
-// still consumed a claim) — distinct from DecideTriage's earlier B+-gate-
-// level skip (applySkipFromAwaitingDecisionTx), which never claims an
-// attempt at all. This clean skip DOES consume the attempt already claimed
-// for it (the attempt ledger row it closes proves that), but its end state
-// must read as a genuine skip, never a failure:
+// ErrCleanSkip) — distinct from DecideTriage's earlier B+-gate-level skip
+// (applySkipFromAwaitingDecisionTx) and from the worker's own pre-claim
+// CleanSkipIncidentTriageBelowMinimumMembers, neither of which claims an
+// attempt at all. Those two are the intended clean-skip paths; this one is
+// defense in depth for an ineligibility only Analyze could see. It DOES
+// consume the attempt already claimed for it (the attempt ledger row it
+// closes proves that), but its end state must read as a genuine skip, never
+// a failure:
 //
 //   - the schedule closes to the SAME terminal 'skipped' phase the B+-gate
 //     skip uses, not 'exhausted' — consistency: both readings of "skip"

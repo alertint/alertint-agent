@@ -38,10 +38,15 @@ func TestSituationsConfigToControllerConfigMapsEveryField(t *testing.T) {
 		LeaseSeconds:                301,
 		HeartbeatSeconds:            31,
 		WebhookRecoveryGraceSeconds: 121,
-		MaxL2CallsPerAttempt:        2,
-		MaxWorkAttemptsPerInput:     5,
-		AttemptWallSeconds:          181,
-		LLMConcurrency:              3,
+		Cadence: config.SituationsCadenceConfig{
+			FastSeconds:   61,
+			NormalSeconds: 301,
+			SlowSeconds:   901,
+		},
+		MaxL2CallsPerAttempt:    2,
+		MaxWorkAttemptsPerInput: 5,
+		AttemptWallSeconds:      181,
+		LLMConcurrency:          3,
 		Retry: config.SituationsRetryConfig{
 			MinSeconds:    6,
 			MaxSeconds:    301,
@@ -58,6 +63,11 @@ func TestSituationsConfigToControllerConfigMapsEveryField(t *testing.T) {
 	}
 	if controllerCfg.WebhookRecoveryGrace != 121*time.Second {
 		t.Fatalf("WebhookRecoveryGrace = %v, want 121s", controllerCfg.WebhookRecoveryGrace)
+	}
+	// Cadence is live configuration, not documentation: every configured
+	// tier must reach the controller verbatim.
+	if controllerCfg.Cadence.Fast != 61*time.Second || controllerCfg.Cadence.Normal != 301*time.Second || controllerCfg.Cadence.Slow != 901*time.Second {
+		t.Fatalf("Cadence = %+v, want 61s/301s/901s", controllerCfg.Cadence)
 	}
 	if controllerCfg.Retry.Min != 6*time.Second || controllerCfg.Retry.Max != 301*time.Second || controllerCfg.Retry.JitterPercent != 21 {
 		t.Fatalf("Retry = %+v", controllerCfg.Retry)
@@ -113,7 +123,7 @@ func TestSituationControllerRuntimeStartDrainStop(t *testing.T) {
 
 	drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer drainCancel()
-	if err := rt.Drain(drainCtx); err != nil {
+	if _, err := rt.Drain(drainCtx); err != nil {
 		t.Fatalf("Drain: %v", err)
 	}
 
@@ -166,67 +176,95 @@ func newTestTracker(t *testing.T) *llmhealth.Tracker {
 }
 
 func TestBuildAssessmentClientRejectsClientWithoutCompleteOnce(t *testing.T) {
-	_, err := buildAssessmentClient(completeOnlyClient{}, newTestTracker(t))
+	_, err := buildAssessmentClient(completeOnlyClient{})
 	if err == nil {
 		t.Fatal("expected an error for a client lacking CompleteOnce")
 	}
 }
 
-// TestBuildAssessmentClientObservesEveryCallInInstallationLLMHealth proves
-// the wrapped client reports its outcome to the installation LLM-health
-// tracker under CapabilityAssessment — the L2 sibling of Acute Triage's own
-// already-wired L1 (CapabilityTriageDraft) observations.
-func TestBuildAssessmentClientObservesEveryCallInInstallationLLMHealth(t *testing.T) {
+// TestBuildAssessmentClientDoesNotDecorateTheTransport proves the resolved
+// L2 boundary is the configured client itself: installation LLM health is
+// observed on the controller's typed-outcome seam (llmHealthAssessmentObserver),
+// never by wrapping CompleteOnce — a wrapper there reports a parseable but
+// invalid proposal as a healthy call.
+func TestBuildAssessmentClientDoesNotDecorateTheTransport(t *testing.T) {
 	inner := &fakeOneShotClient{}
-	tracker := newTestTracker(t)
-	client, err := buildAssessmentClient(inner, tracker)
+	client, err := buildAssessmentClient(inner)
 	if err != nil {
 		t.Fatalf("buildAssessmentClient: %v", err)
 	}
-
-	if _, err := client.CompleteOnce(context.Background(), "", llm.Prompt{}, nil); err != nil {
-		t.Fatalf("CompleteOnce: %v", err)
-	}
-	if inner.completeOnceCalls != 1 {
-		t.Fatalf("inner CompleteOnce calls = %d, want 1", inner.completeOnceCalls)
-	}
-
-	snap := tracker.Snapshot()
-	found := false
-	for _, c := range snap.Capabilities {
-		if c.Capability == llmhealth.CapabilityAssessment {
-			found = true
-			if !c.Healthy {
-				t.Fatalf("capability %q healthy = false after a successful call", c.Capability)
-			}
-		}
-	}
-	if !found {
-		t.Fatalf("capabilities = %+v, want an entry for %q", snap.Capabilities, llmhealth.CapabilityAssessment)
+	if client != situation.AssessmentClient(inner) {
+		t.Fatalf("buildAssessmentClient returned %T, want the configured client itself", client)
 	}
 }
 
-// TestBuildAssessmentClientTreatsATransportFailureAsDependencyUnhealthy
-// proves a genuine transport failure IS observed as a dependency failure —
-// the counterpart proof to controller.go's own "a late/stale completion
-// race is stale, not a provider failure": here, a REAL failure (the wrapped
-// CompleteOnce call itself returning an error) is correctly NOT swallowed.
-func TestBuildAssessmentClientTreatsATransportFailureAsDependencyUnhealthy(t *testing.T) {
-	inner := &fakeOneShotClient{completeOnceErr: errors.New("dial tcp: connection refused")}
-	tracker := newTestTracker(t)
-	client, err := buildAssessmentClient(inner, tracker)
-	if err != nil {
-		t.Fatalf("buildAssessmentClient: %v", err)
+func assessmentCapability(t *testing.T, tracker *llmhealth.Tracker) llmhealth.CapabilitySnapshot {
+	t.Helper()
+	for _, c := range tracker.Snapshot().Capabilities {
+		if c.Capability == llmhealth.CapabilityAssessment {
+			return c
+		}
 	}
+	t.Fatalf("capabilities = %+v, want an entry for %q", tracker.Snapshot().Capabilities, llmhealth.CapabilityAssessment)
+	return llmhealth.CapabilitySnapshot{}
+}
 
-	if _, err := client.CompleteOnce(context.Background(), "", llm.Prompt{}, nil); err == nil {
-		t.Fatal("expected CompleteOnce to propagate the inner transport error")
-	}
+// TestLLMHealthAssessmentObserverReportsFinalTypedOutcome pins the
+// observer's mapping of the controller's final L2 outcome onto installation
+// LLM health: accepted/contradicted/stale are healthy; a transport failure
+// is a dependency-class failure (unhealthy at once); a malformed or
+// policy-invalid proposal is a content-class failure — recorded, but the
+// capability turns unhealthy only once two DISTINCT Situations corroborate
+// it, which is why the Situation ID must be the observation subject.
+func TestLLMHealthAssessmentObserverReportsFinalTypedOutcome(t *testing.T) {
+	t.Run("accepted, contradicted, and stale outcomes are healthy", func(t *testing.T) {
+		tracker := newTestTracker(t)
+		obs := llmHealthAssessmentObserver{tracker: tracker}
+		for _, outcome := range []situation.L2Outcome{situation.L2OutcomeAccepted, situation.L2OutcomeContradicted, situation.L2OutcomeStaleBasis} {
+			obs.BeginAssessmentCall("sit-1").Finish(outcome, nil)
+			if c := assessmentCapability(t, tracker); !c.Healthy || c.LastFailureAt != nil {
+				t.Fatalf("after %q: capability = %+v, want healthy with no failure", outcome, c)
+			}
+		}
+		if snap := tracker.Snapshot(); snap.State != llmhealth.StateHealthy {
+			t.Fatalf("installation state = %q, want healthy", snap.State)
+		}
+	})
 
-	snap := tracker.Snapshot()
-	if snap.State == llmhealth.StateHealthy {
-		t.Fatalf("installation LLM health state = %q, want degraded/unavailable after a transport failure", snap.State)
-	}
+	t.Run("transport failure is a dependency failure", func(t *testing.T) {
+		tracker := newTestTracker(t)
+		obs := llmHealthAssessmentObserver{tracker: tracker}
+		obs.BeginAssessmentCall("sit-1").Finish(situation.L2OutcomeTransportFailure, errors.New("dial tcp: connection refused"))
+		if snap := tracker.Snapshot(); snap.State == llmhealth.StateHealthy {
+			t.Fatalf("installation state = %q, want unavailable after a transport failure", snap.State)
+		}
+	})
+
+	t.Run("malformed proposal is a content failure corroborated across two Situations", func(t *testing.T) {
+		tracker := newTestTracker(t)
+		obs := llmHealthAssessmentObserver{tracker: tracker}
+
+		obs.BeginAssessmentCall("sit-1").Finish(situation.L2OutcomeMalformed, nil)
+		obs.BeginAssessmentCall("sit-1").Finish(situation.L2OutcomeMalformed, nil)
+		c := assessmentCapability(t, tracker)
+		if !c.Healthy || c.LastFailureAt == nil || c.Reason != llmhealth.ReasonResponseMalformed {
+			t.Fatalf("after two malformed proposals on ONE Situation: capability = %+v, want still healthy with response_malformed recorded", c)
+		}
+
+		obs.BeginAssessmentCall("sit-2").Finish(situation.L2OutcomePolicyRejected, nil)
+		c = assessmentCapability(t, tracker)
+		if c.Healthy {
+			t.Fatalf("after content failures on TWO distinct Situations: capability = %+v, want unhealthy", c)
+		}
+		if snap := tracker.Snapshot(); snap.State != llmhealth.StateUnavailable {
+			t.Fatalf("installation state = %q, want unavailable (assessment is a primary capability)", snap.State)
+		}
+
+		obs.BeginAssessmentCall("sit-3").Finish(situation.L2OutcomeAccepted, nil)
+		if snap := tracker.Snapshot(); snap.State != llmhealth.StateHealthy {
+			t.Fatalf("installation state = %q, want healthy again after a real accepted proposal", snap.State)
+		}
+	})
 }
 
 // ----------------------------------------------------------------------

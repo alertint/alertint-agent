@@ -1240,3 +1240,43 @@ func TestClassifyL2OutcomeAcceptedNeedsNoRetryOrCorrection(t *testing.T) {
 		t.Fatalf("a valid Assessment must not retry or correct, got %+v", got)
 	}
 }
+
+// TestDeriveActionContractHonorsConfiguredCadenceTempo proves the
+// configured tempo (ControllerState.Tempo, threaded from
+// ControllerConfig.Cadence) is what sizes next_update_at — not a fixed
+// internal constant — and that a zero tempo falls back to the plan's
+// executable defaults (60/300/900s).
+func TestDeriveActionContractHonorsConfiguredCadenceTempo(t *testing.T) {
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	base := ControllerState{Lifecycle: model.LifecycleActive, Attention: model.AttentionObserve}
+
+	configured := base
+	configured.Tempo = CadenceTempo{Fast: 7 * time.Second, Normal: 11 * time.Second, Slow: 13 * time.Second}
+	for _, tc := range []struct {
+		cadence model.Cadence
+		want    time.Duration
+	}{
+		{model.CadenceFast, 7 * time.Second},
+		{model.CadenceNormal, 11 * time.Second},
+		{model.CadenceSlow, 13 * time.Second},
+	} {
+		c := DeriveActionContract(configured, tc.cadence, now)
+		if c.NextUpdateAt == nil || !c.NextUpdateAt.Equal(now.Add(tc.want)) {
+			t.Fatalf("cadence %q: next_update_at = %v, want now+%v", tc.cadence, c.NextUpdateAt, tc.want)
+		}
+	}
+
+	for _, tc := range []struct {
+		cadence model.Cadence
+		want    time.Duration
+	}{
+		{model.CadenceFast, 60 * time.Second},
+		{model.CadenceNormal, 300 * time.Second},
+		{model.CadenceSlow, 900 * time.Second},
+	} {
+		c := DeriveActionContract(base, tc.cadence, now)
+		if c.NextUpdateAt == nil || !c.NextUpdateAt.Equal(now.Add(tc.want)) {
+			t.Fatalf("default cadence %q: next_update_at = %v, want now+%v", tc.cadence, c.NextUpdateAt, tc.want)
+		}
+	}
+}

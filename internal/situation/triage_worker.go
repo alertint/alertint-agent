@@ -3,6 +3,8 @@
 package situation
 
 import (
+	"go.opentelemetry.io/otel/trace"
+
 	"context"
 	"encoding/json"
 	"errors"
@@ -247,12 +249,44 @@ type ClassifiedError interface {
 	SafeDetail() string
 }
 
+// MinimumMemberAlertsPolicy is the optional eligibility policy an
+// AcuteAnalyzer may expose so TriageWorker can resolve "too few member
+// alerts to analyze" BEFORE claiming an attempt (Global Constraint: "A clean
+// skip is a first judgment without Acute Triage dispatch and consumes no
+// Triage attempt"). A claim durably increments the Incident's attempt count
+// and inserts an attempt-ledger row; discovering the Incident was never
+// eligible only after that would consume an attempt for a judgment that
+// dispatched nothing. TriageWorker checks for this interface structurally
+// at construction (skills/acutetriage.Skill implements it from its own
+// MinAlerts configuration) and, when present, asks the store to close the
+// due row as a clean skip — atomically with the member count that proves
+// ineligibility — before any claim. An analyzer without this policy gets
+// the pre-Plan-2 behavior: the claim happens first and Analyze's own
+// ErrCleanSkip closes the already-claimed attempt (defense in depth, never
+// the intended path).
+type MinimumMemberAlertsPolicy interface {
+	MinimumMemberAlerts() int
+}
+
+// TriageCleanSkip is TriageAttemptStore.CleanSkipIncidentTriageBelowMinimum-
+// Members' outcome: whether the due row was closed as a clean skip (with the
+// identity the worker audits), or left untouched for the ordinary claim.
+type TriageCleanSkip struct {
+	Skipped              bool
+	SituationID          string
+	DecisionInputVersion int
+	MemberAlerts         int
+}
+
 // ErrCleanSkip is AcuteAnalyzer's typed "nothing to analyze" outcome — a
 // deterministic clean skip (too few member alerts to trigger analysis),
 // never a transient failure. Analyze returns this explicitly rather than a
 // zero AcuteResult with a nil error, so every caller (skills/acutetriage's
 // own Run compatibility wrapper, and TriageWorker) must branch on it
-// instead of silently treating "nothing happened" as success. Defined here
+// instead of silently treating "nothing happened" as success. With a
+// MinimumMemberAlertsPolicy analyzer the worker resolves ineligibility
+// before claiming, so this is reached only as defense in depth (a
+// membership the pre-claim count could not see). Defined here
 // (not in skills/acutetriage) so TriageWorker can recognize it with
 // errors.Is without importing skills/acutetriage, which would cycle back
 // through this package (skills/acutetriage already imports
@@ -355,8 +389,19 @@ type TriageAttemptStore interface {
 	// exhaustion. See store.CompleteIncidentTriageAttemptAsCleanSkip's own
 	// doc comment for the full contract this mirrors: schedule -> 'skipped',
 	// Incident restored to "ready" (never "failed"), exactly one
-	// triage_skipped input.
+	// triage_skipped input. Defense in depth only: the intended clean-skip
+	// path is CleanSkipIncidentTriageBelowMinimumMembers, before any claim.
 	CompleteIncidentTriageAttemptAsCleanSkip(ctx context.Context, attemptID, incidentID, code, detail string, now time.Time) error
+
+	// CleanSkipIncidentTriageBelowMinimumMembers closes incidentID's due
+	// pending/backoff row as a clean skip — WITHOUT claiming, inserting an
+	// attempt-ledger row, or incrementing the attempt count — when the
+	// Incident currently has fewer than minMembers member alerts, counted
+	// inside the same transaction that closes the row. Returns Skipped=false
+	// (and changes nothing) when the Incident is eligible, not due, not
+	// decided, or no longer pending/backoff; the ordinary claim then
+	// proceeds and reports those cases itself.
+	CleanSkipIncidentTriageBelowMinimumMembers(ctx context.Context, incidentID string, minMembers int, now time.Time) (TriageCleanSkip, error)
 
 	// RecoverExpiredIncidentTriageAttempts resolves every in_flight row
 	// whose lease has expired (a crash mid-attempt, or a heartbeat that
@@ -500,6 +545,10 @@ type TriageWorker struct {
 	cfg                TriageWorkerConfig
 	logger             *slog.Logger
 
+	// minMemberAlerts is the analyzer's MinimumMemberAlertsPolicy value, or
+	// 0 when the analyzer exposes none (pre-claim clean skip disabled).
+	minMemberAlerts int
+
 	wakeCh chan struct{}
 	stopCh chan struct{}
 	doneCh chan struct{}
@@ -544,7 +593,7 @@ func NewTriageWorker(store TriageAttemptStore, lister TriageScheduleLister, anal
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &TriageWorker{
+	w := &TriageWorker{
 		store:              store,
 		lister:             lister,
 		analyzer:           analyzer,
@@ -556,6 +605,10 @@ func NewTriageWorker(store TriageAttemptStore, lister TriageScheduleLister, anal
 		stopCh:             make(chan struct{}),
 		doneCh:             make(chan struct{}),
 	}
+	if policy, ok := analyzer.(MinimumMemberAlertsPolicy); ok {
+		w.minMemberAlerts = policy.MinimumMemberAlerts()
+	}
+	return w
 }
 
 // RunOnce recovers any expired in-flight lease, lists every currently due
@@ -673,6 +726,9 @@ func (w *TriageWorker) Stop(ctx context.Context) error {
 // nothing left to do (the row raced away, was not yet due, or has no
 // controller decision yet).
 func (w *TriageWorker) processOne(ctx context.Context, incidentID string) bool {
+	if handled, done := w.cleanSkipBeforeClaim(ctx, incidentID); done {
+		return handled
+	}
 	claim, err := w.store.ClaimIncidentTriageAttempt(ctx, incidentID, w.cfg.Owner, w.cfg.Now(), w.cfg.Lease)
 	if err != nil {
 		switch {
@@ -692,7 +748,19 @@ func (w *TriageWorker) processOne(ctx context.Context, incidentID string) bool {
 	// requirement: "consumed dispatch/attempt counts") — Task 6's own
 	// ClaimIncidentTriageAttempt already durably moved the schedule to
 	// in_flight and incremented attempts before this point, so the slot is
-	// spent regardless of what Analyze itself goes on to do.
+	// spent regardless of what Analyze itself goes on to do. The attempt
+	// span starts here, after that durable claim, and carries the same
+	// identity/digest attributes the audit row does.
+	ctx, span := tracer().Start(ctx, SpanTriageAttempt, trace.WithAttributes(
+		AttrSituationID.String(claim.SituationID),
+		AttrIncidentID.String(claim.IncidentID),
+		AttrAttemptID.String(claim.AttemptID),
+		AttrTriageAttemptNumber.Int(claim.AttemptNumber),
+		AttrInputVersion.Int(claim.DecisionInputVersion),
+		AttrMembershipDigest.String(claim.MembershipDigest),
+		AttrIncidentInputDigest.String(claim.IncidentInputDigest),
+	))
+	defer span.End()
 	w.auditAppend(ctx, "incident.triage_attempt", map[string]any{
 		"situation_id": claim.SituationID, "incident_id": claim.IncidentID, "attempt_id": claim.AttemptID,
 		"attempt_number": claim.AttemptNumber, "input_version": claim.DecisionInputVersion,
@@ -719,11 +787,51 @@ func (w *TriageWorker) processOne(ctx context.Context, incidentID string) bool {
 		// belongs to whatever reclaimed it.
 		w.logger.Warn("situation: triage worker: lease lost mid-analysis; abandoning stale attempt",
 			"incident_id", claim.IncidentID, "attempt_id", claim.AttemptID)
+		span.SetAttributes(AttrResultClass.String("lease_lost"))
 		return true
 	}
 
-	w.completeAttempt(claim, result, analyzeErr)
+	if analyzeErr == nil && result.EvidencePackDigest != "" {
+		span.SetAttributes(AttrEvidencePackDigest.String(result.EvidencePackDigest))
+	}
+	class := w.completeAttempt(claim, result, analyzeErr) //nolint:contextcheck // by design: completeAttempt uses its own detachedWriteContext, independent of the possibly-canceled analysis context
+	span.SetAttributes(
+		AttrResultClass.String(class),
+		AttrDurationMS.Int64(w.cfg.Now().Sub(claim.StartedAt).Milliseconds()),
+	)
 	return true
+}
+
+// cleanSkipBeforeClaim resolves minimum-member eligibility BEFORE any claim
+// (MinimumMemberAlertsPolicy): when the analyzer exposes a minimum and the
+// store finds the due Incident below it, the row is already closed as a
+// clean skip with no attempt consumed, and this reports (handled=true,
+// done=true). A store error reports (false, true) — the claim is NOT
+// attempted, so a transient failure to prove eligibility can never consume
+// an attempt for an Incident that may not be eligible; the row stays due
+// for the next round. (false, false) means "not skipped: claim as usual".
+func (w *TriageWorker) cleanSkipBeforeClaim(ctx context.Context, incidentID string) (handled, done bool) {
+	if w.minMemberAlerts <= 0 {
+		return false, false
+	}
+	skip, err := w.store.CleanSkipIncidentTriageBelowMinimumMembers(ctx, incidentID, w.minMemberAlerts, w.cfg.Now())
+	if err != nil {
+		w.logger.Error("situation: triage worker: pre-claim clean-skip check failed; not claiming",
+			"incident_id", incidentID, "err", err)
+		return false, true
+	}
+	if !skip.Skipped {
+		return false, false
+	}
+	w.logger.Info("situation: triage worker: clean skip before claim (below minimum member alerts); no attempt consumed",
+		"situation_id", skip.SituationID, "incident_id", incidentID,
+		"member_alerts", skip.MemberAlerts, "minimum_member_alerts", w.minMemberAlerts)
+	w.auditAppend(ctx, "situation.triage_skipped", map[string]any{
+		"situation_id": skip.SituationID, "incident_id": incidentID, "input_version": skip.DecisionInputVersion,
+		"decision_reason": "below_minimum_member_alerts",
+		"member_alerts":   skip.MemberAlerts, "minimum_member_alerts": w.minMemberAlerts,
+	})
+	return true, true
 }
 
 // heartbeatLoop renews claim's lease every cfg.Heartbeat until ctx is done.
@@ -768,23 +876,24 @@ func detachedWriteContext() (context.Context, context.CancelFunc) {
 // completeAttempt resolves one claimed attempt against Analyze's outcome:
 // current-compatible success (complete + best-effort AfterCommit), a stale
 // completion (complete only — spec.md: no post-commit effect), a clean skip
-// (ErrCleanSkip), or a genuine failure (backoff or exhaust).
-func (w *TriageWorker) completeAttempt(claim TriageAttemptClaim, result AcuteResult, analyzeErr error) {
+// (ErrCleanSkip), or a genuine failure (backoff or exhaust). It returns the
+// closed result class the attempt span records (SpanTriageAttempt).
+func (w *TriageWorker) completeAttempt(claim TriageAttemptClaim, result AcuteResult, analyzeErr error) string {
 	writeCtx, cancel := detachedWriteContext()
 	defer cancel()
 	now := w.cfg.Now()
 
 	switch {
 	case analyzeErr == nil:
-		w.completeSuccessOrStale(writeCtx, claim, result, now)
+		return w.completeSuccessOrStale(writeCtx, claim, result, now)
 	case errors.Is(analyzeErr, ErrCleanSkip):
-		w.completeCleanSkip(writeCtx, claim, now)
+		return w.completeCleanSkip(writeCtx, claim, now)
 	default:
-		w.completeFailure(writeCtx, claim, analyzeErr, now)
+		return w.completeFailure(writeCtx, claim, analyzeErr, now)
 	}
 }
 
-func (w *TriageWorker) completeSuccessOrStale(ctx context.Context, claim TriageAttemptClaim, result AcuteResult, now time.Time) {
+func (w *TriageWorker) completeSuccessOrStale(ctx context.Context, claim TriageAttemptClaim, result AcuteResult, now time.Time) string {
 	finding := TriageFindingInput{
 		OutputJSON:         string(result.OutputJSON),
 		Summary:            result.Summary,
@@ -797,7 +906,7 @@ func (w *TriageWorker) completeSuccessOrStale(ctx context.Context, claim TriageA
 	if err != nil {
 		w.logger.Error("situation: triage worker: complete attempt failed",
 			"incident_id", claim.IncidentID, "attempt_id", claim.AttemptID, "err", err)
-		return
+		return "complete_failed"
 	}
 	if outcome != TriageCompletionSuccess {
 		// stale_membership / stale_incident_input: the atomic completion
@@ -814,7 +923,7 @@ func (w *TriageWorker) completeSuccessOrStale(ctx context.Context, claim TriageA
 			"situation_id": claim.SituationID, "incident_id": claim.IncidentID, "attempt_id": claim.AttemptID,
 			"input_version": claim.DecisionInputVersion, "outcome": string(outcome),
 		})
-		return
+		return string(outcome)
 	}
 	w.auditAppend(ctx, "incident.triage_completed", map[string]any{
 		"situation_id": claim.SituationID, "incident_id": claim.IncidentID, "attempt_id": claim.AttemptID,
@@ -822,7 +931,7 @@ func (w *TriageWorker) completeSuccessOrStale(ctx context.Context, claim TriageA
 		"duration_ms": now.Sub(claim.StartedAt).Milliseconds(),
 	})
 	if w.afterCommit == nil {
-		return
+		return string(TriageCompletionSuccess)
 	}
 	if err := w.afterCommit.AfterCommit(ctx, result); err != nil {
 		// Best-effort: the durable Finding already committed successfully.
@@ -831,24 +940,31 @@ func (w *TriageWorker) completeSuccessOrStale(ctx context.Context, claim TriageA
 		w.logger.Warn("situation: triage worker: post-commit effects failed (best-effort)",
 			"incident_id", claim.IncidentID, "attempt_id", claim.AttemptID, "err", err)
 	}
+	return string(TriageCompletionSuccess)
 }
 
 // completeCleanSkip closes a claimed attempt that found nothing to analyze
 // (ErrCleanSkip) through the dedicated CompleteIncidentTriageAttemptAsClean-
-// Skip primitive (Task 7 fix, Finding #2): the schedule closes to 'skipped'
+// Skip primitive (Task 7 fix, Finding #2). This is the defense-in-depth
+// path: with a MinimumMemberAlertsPolicy analyzer, ineligibility is resolved
+// by cleanSkipBeforeClaim and never consumes an attempt; reaching here means
+// Analyze itself found nothing after a claim was already durable, so the
+// attempt is spent and the schedule closes to 'skipped'
 // (not 'exhausted'), the Incident is restored to "ready" (never "failed" —
 // a clean skip must stay collapse-eligible), and exactly one triage_skipped
 // input is appended — never triage_exhausted, which spec.md reserves for a
 // genuine five-attempt failure. This never calls exhaustionNotifier: a
 // clean skip is not a failure, so it carries no operator-visible exhaustion
 // signal at all.
-func (w *TriageWorker) completeCleanSkip(ctx context.Context, claim TriageAttemptClaim, now time.Time) {
+func (w *TriageWorker) completeCleanSkip(ctx context.Context, claim TriageAttemptClaim, now time.Time) string {
 	const code = "clean_skip"
 	const detail = "acute triage found nothing to analyze (below the minimum member alert count)"
 	if err := w.store.CompleteIncidentTriageAttemptAsCleanSkip(ctx, claim.AttemptID, claim.IncidentID, code, detail, now); err != nil {
 		w.logger.Error("situation: triage worker: close clean-skip attempt failed",
 			"incident_id", claim.IncidentID, "attempt_id", claim.AttemptID, "err", err)
+		return "clean_skip_failed"
 	}
+	return code
 }
 
 // completeFailure classifies a genuine Analyze failure and either schedules
@@ -857,13 +973,13 @@ func (w *TriageWorker) completeCleanSkip(ctx context.Context, claim TriageAttemp
 // pre-Plan-2 dispatch chain's triageFailed/exhaustTriage split exactly,
 // against the new fenced attempt ledger instead of the old bare schedule
 // row.
-func (w *TriageWorker) completeFailure(ctx context.Context, claim TriageAttemptClaim, cause error, now time.Time) {
+func (w *TriageWorker) completeFailure(ctx context.Context, claim TriageAttemptClaim, cause error, now time.Time) string {
 	code, detail := classifyAttemptError(cause)
 	if claim.AttemptNumber >= w.cfg.MaxAttempts {
 		if err := w.store.ExhaustIncidentTriageAttempt(ctx, claim.AttemptID, claim.IncidentID, code, detail, now); err != nil {
 			w.logger.Error("situation: triage worker: exhaust attempt failed",
 				"incident_id", claim.IncidentID, "attempt_id", claim.AttemptID, "err", err)
-			return
+			return "exhaust_failed"
 		}
 		// Task 9 fix round 2: TriageWorker itself is the single,
 		// unconditional owner of the incident.triage_exhausted audit row —
@@ -886,18 +1002,19 @@ func (w *TriageWorker) completeFailure(ctx context.Context, claim TriageAttemptC
 			"attempt_number": claim.AttemptNumber, "input_version": claim.DecisionInputVersion, "code": code,
 		})
 		w.notifyExhaustion(ctx, claim, code, detail)
-		return
+		return "exhausted"
 	}
 	next := now.Add(triageBackoffDelay(claim.AttemptNumber))
 	if err := w.store.BackoffIncidentTriageAttempt(ctx, claim.AttemptID, claim.IncidentID, next, code, detail, now); err != nil {
 		w.logger.Error("situation: triage worker: backoff attempt failed",
 			"incident_id", claim.IncidentID, "attempt_id", claim.AttemptID, "err", err)
-		return
+		return "backoff_failed"
 	}
 	w.logger.Warn("situation: triage worker: attempt failed; will retry",
 		"incident_id", claim.IncidentID, "attempt_id", claim.AttemptID,
 		"attempt", claim.AttemptNumber, "max_attempts", w.cfg.MaxAttempts,
 		"retry_in", next.Sub(now), "err", cause)
+	return "backoff"
 }
 
 // notifyExhaustion calls the configured ExhaustionNotifier, if any, after a

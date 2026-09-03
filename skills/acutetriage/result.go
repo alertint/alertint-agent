@@ -96,6 +96,20 @@ func (s *Skill) Analyze(ctx context.Context, claim situation.TriageAttemptClaim)
 	return s.analyzeFromAlerts(ctx, *inc, alerts)
 }
 
+// MinimumMemberAlerts implements situation.MinimumMemberAlertsPolicy: the
+// member-alert count below which this skill has nothing to analyze
+// (Config.MinAlerts; a lone first alert still produces a Finding by
+// default). TriageWorker reads it once at construction and resolves
+// ineligibility BEFORE claiming an attempt, so a clean skip consumes no
+// Triage attempt; analyzeFromAlerts applies the same value as defense in
+// depth for whatever reaches Analyze anyway.
+func (s *Skill) MinimumMemberAlerts() int {
+	if s == nil || s.cfg.MinAlerts <= 0 {
+		return 1
+	}
+	return s.cfg.MinAlerts
+}
+
 // analyzeFromAlerts is Analyze's own shared core: the "no member alerts, or
 // fewer than the configured minimum -> ErrCleanSkip; else run analyzeCore
 // and assemble AcuteResult" logic, factored out so Run (skill.go) — which
@@ -112,10 +126,7 @@ func (s *Skill) analyzeFromAlerts(ctx context.Context, inc store.Incident, alert
 		s.logger.Warn("acutetriage: incident has no member alerts; skipping", "incident_id", inc.ID)
 		return situation.AcuteResult{}, ErrCleanSkip
 	}
-	minAlerts := s.cfg.MinAlerts
-	if minAlerts <= 0 {
-		minAlerts = 1 // Default: a lone first alert still produces a finding.
-	}
+	minAlerts := s.MinimumMemberAlerts()
 	if len(alerts) < minAlerts {
 		s.logger.Info("triage skipped",
 			"incident", inc.ID, "alerts", len(alerts), "min_required", minAlerts, "group", inc.GroupKey)

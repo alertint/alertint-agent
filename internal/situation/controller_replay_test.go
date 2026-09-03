@@ -131,7 +131,7 @@ const longClassMargin = 90 * time.Minute
 
 // slowCadenceCheckpointMargin (Task 10 review Finding #2) comfortably
 // exceeds CadenceSlow's own +15m next_assessment_at checkpoint
-// (assessment.go's cadenceSlowInterval, the tier DeriveCadence returns for
+// (assessment.go's defaultCadenceSlow, the tier DeriveCadence returns for
 // attention=observe once Triage is no longer in_flight — the state every
 // affected subtest's committed Assessment reaches) so a reconverge pass
 // genuinely finds the checkpoint already due, instead of silently finding

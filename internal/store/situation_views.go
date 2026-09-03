@@ -78,10 +78,11 @@ type ControllerRetryState struct {
 
 // SituationControllerView is the bounded, sanitized read surface MCP and
 // audit tooling use: the current Assessment's identity, full content, and
-// derivation, plus its bounded contract/hash projection (read straight off
-// situations' current_* columns — never by joining full attempt history),
-// current due reasons, up to 20 recent sanitized attempts, current
-// per-Incident Triage state, and controller retry/park state.
+// derivation, plus its bounded contract/hash/eligible-reason projection
+// (read straight off situations' current_* columns — never by joining full
+// attempt history), current due reasons, up to 20 recent sanitized
+// attempts, current per-Incident Triage state, and controller retry/park
+// state.
 type SituationControllerView struct {
 	SituationID                string
 	CurrentAssessmentID        *string
@@ -90,10 +91,15 @@ type SituationControllerView struct {
 	CurrentActionContract      *situationmodel.ActionContract
 	CurrentMaterialFactHash    *string
 	CurrentAssessmentBasisHash *string
-	DueReasons                 []situationmodel.DueReason
-	RecentAttempts             []SanitizedAssessmentAttempt
-	Triage                     []IncidentTriageView
-	Retry                      ControllerRetryState
+	// EligibleReasons is the eligible Sufficient-reason candidate set the
+	// most recent controller commit derived (identity, code, catalog/
+	// predicate versions, evidence references, deterministic-floor flag) —
+	// never nil, empty until the first commit.
+	EligibleReasons []situationmodel.ReasonCandidate
+	DueReasons      []situationmodel.DueReason
+	RecentAttempts  []SanitizedAssessmentAttempt
+	Triage          []IncidentTriageView
+	Retry           ControllerRetryState
 }
 
 // GetSituationControllerView reads situationID's bounded controller view.
@@ -106,14 +112,15 @@ func (s *Store) GetSituationControllerView(ctx context.Context, situationID stri
 
 	var currentAssessmentID, actionContractJSON, materialHash, basisHash, dueReasonsJSON sql.NullString
 	var parkedAt, parkedReason, retryAt, lastErrorClass sql.NullString
+	var eligibleReasonsJSON string
 	var retryEpoch, workAttempts int
 	err := s.db.QueryRowContext(ctx, `
 		SELECT current_assessment_id, current_action_contract_json, current_material_fact_hash,
-		       current_assessment_basis_hash, due_reasons_json,
+		       current_assessment_basis_hash, current_eligible_reasons_json, due_reasons_json,
 		       controller_retry_epoch, controller_work_attempts, controller_parked_at, controller_parked_reason,
 		       retry_at, last_error_class
 		FROM situations WHERE id = ?`, situationID).Scan(
-		&currentAssessmentID, &actionContractJSON, &materialHash, &basisHash, &dueReasonsJSON,
+		&currentAssessmentID, &actionContractJSON, &materialHash, &basisHash, &eligibleReasonsJSON, &dueReasonsJSON,
 		&retryEpoch, &workAttempts, &parkedAt, &parkedReason, &retryAt, &lastErrorClass)
 	if errors.Is(err, sql.ErrNoRows) {
 		return SituationControllerView{}, ErrNotFound
@@ -131,6 +138,13 @@ func (s *Store) GetSituationControllerView(ctx context.Context, situationID stri
 			return SituationControllerView{}, fmt.Errorf("store: unmarshal current action contract: %w", err)
 		}
 		view.CurrentActionContract = &contract
+	}
+	view.EligibleReasons = []situationmodel.ReasonCandidate{}
+	if err := json.Unmarshal([]byte(eligibleReasonsJSON), &view.EligibleReasons); err != nil {
+		return SituationControllerView{}, fmt.Errorf("store: unmarshal situation eligible reasons: %w", err)
+	}
+	if view.EligibleReasons == nil {
+		view.EligibleReasons = []situationmodel.ReasonCandidate{}
 	}
 	view.DueReasons = []situationmodel.DueReason{}
 	if dueReasonsJSON.Valid {

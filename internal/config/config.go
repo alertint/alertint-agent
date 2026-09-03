@@ -108,21 +108,11 @@ type SituationsConfig struct {
 // SituationsCadenceConfig sizes the controller's internal fast/normal/slow
 // reconsideration tempo (model.Cadence). Cadence is persisted machinery, not
 // card content: it only widens or narrows how soon the controller next
-// reconciles a nonterminal Situation.
-//
-// These three values are NOT actually wired into DeriveCadence today:
-// internal/situation/assessment.go's DeriveCadence/cadenceFastInterval etc.
-// hardcode their own fixed durations (2m/5m/15m) with no parameter to inject
-// a config value into (ControllerConfig's own doc comment, internal/
-// situation/controller.go, explains why: threading a real cadence parameter
-// through DeriveCadence is a change to Task 5's pure-Assessment-derivation
-// logic, out of scope for Task 9's runtime-wiring job). Task 9 resolved the
-// resulting discrepancy by setting these DEFAULTS to match the hardcoded
-// values exactly (FastSeconds 120, not 60) — the hardcoded durations are
-// treated as the real, binding spec; this config block's job for now is
-// documentation-and-parity, not live tuning. A future task that threads a
-// real cadence parameter through DeriveCadence should also make these
-// values live and remove this comment.
+// reconciles a nonterminal Situation. These three values are live
+// configuration — cmd/alertint maps them onto situation.ControllerConfig.
+// Cadence, and internal/situation's contract derivation reads them for
+// next_update_at — with the plan's executable defaults of 60/300/900
+// seconds and a strict fast < normal < slow ordering enforced at load.
 type SituationsCadenceConfig struct {
 	FastSeconds   int `yaml:"fast_seconds"`
 	NormalSeconds int `yaml:"normal_seconds"`
@@ -635,11 +625,7 @@ func Defaults() Config {
 			HeartbeatSeconds:            30,
 			WebhookRecoveryGraceSeconds: 120,
 			Cadence: SituationsCadenceConfig{
-				// 120/300/900 match internal/situation/assessment.go's own
-				// hardcoded cadenceFastInterval/cadenceNormalInterval/
-				// cadenceSlowInterval (2m/5m/15m) exactly — see
-				// SituationsCadenceConfig's own doc comment (Task 9).
-				FastSeconds:   120,
+				FastSeconds:   60,
 				NormalSeconds: 300,
 				SlowSeconds:   900,
 			},
@@ -1076,6 +1062,13 @@ func (c *Config) validateSituations() []string {
 		if p.v <= 0 {
 			errs = append(errs, fmt.Sprintf("%s must be > 0", p.name))
 		}
+	}
+
+	if s.Cadence.FastSeconds > 0 && s.Cadence.NormalSeconds > 0 && s.Cadence.SlowSeconds > 0 &&
+		(s.Cadence.FastSeconds >= s.Cadence.NormalSeconds || s.Cadence.NormalSeconds >= s.Cadence.SlowSeconds) {
+		errs = append(errs, fmt.Sprintf(
+			"situations.cadence must order fast_seconds < normal_seconds < slow_seconds (got %d/%d/%d)",
+			s.Cadence.FastSeconds, s.Cadence.NormalSeconds, s.Cadence.SlowSeconds))
 	}
 
 	if s.HeartbeatSeconds > 0 && s.LeaseSeconds > 0 && s.HeartbeatSeconds >= s.LeaseSeconds {

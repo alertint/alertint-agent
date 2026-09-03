@@ -108,6 +108,11 @@ type ControllerState struct {
 	TriagePhase   TriagePhase
 	SemanticRetry SemanticRetryPhase
 
+	// Tempo is the configured cadence tier sizing (ControllerConfig.Cadence,
+	// set by Controller.buildControllerState). Zero means the plan defaults
+	// (60/300/900s) — see CadenceTempo.
+	Tempo CadenceTempo
+
 	// TriageDueAt, SemanticRetryAt, RecoveryGraceUntil,
 	// LifecycleObservationDeadlineAt, and EarliestPersistedCheckpoint are
 	// candidate reconsideration times DeriveActionContract's next_update_at
@@ -120,14 +125,27 @@ type ControllerState struct {
 	EarliestPersistedCheckpoint    *time.Time
 }
 
-// Plan 2's cadence tempo. spec.md pins the relative ordering
-// (fast < normal < slow) and the branch conditions but no exact durations;
-// these are a Task 5 default, adjustable later without affecting Assessment
-// validity — only next_update_at scheduling.
+// CadenceTempo sizes the three internal reconsideration tiers DeriveCadence
+// selects between (model.Cadence fast/normal/slow): how far past now the
+// controller's own next checkpoint lands when no earlier candidate (Triage
+// due, L2 retry, recovery grace, observation deadline, concurrent earlier
+// checkpoint) wins. spec.md pins the relative ordering (fast < normal <
+// slow) and the branch conditions; plan.md pins the executable defaults
+// (60/300/900s) and makes them configuration
+// (config.SituationsConfig.Cadence), threaded here through
+// ControllerConfig.Cadence and ControllerState.Tempo. Zero-valued fields
+// fall back to those defaults so a caller building ControllerState by hand
+// (the unit tests) never has to spell them out. Cadence is persisted
+// internal machinery, never card content; changing the tempo changes only
+// next_update_at scheduling, never Assessment validity.
+type CadenceTempo struct {
+	Fast, Normal, Slow time.Duration
+}
+
 const (
-	cadenceFastInterval   = 2 * time.Minute
-	cadenceNormalInterval = 5 * time.Minute
-	cadenceSlowInterval   = 15 * time.Minute
+	defaultCadenceFast   = 60 * time.Second
+	defaultCadenceNormal = 300 * time.Second
+	defaultCadenceSlow   = 900 * time.Second
 
 	// minNextUpdateLead is the minimum lead DeriveActionContract clamps
 	// next_update_at to when every earliest-of candidate is already due
@@ -139,19 +157,34 @@ const (
 	minNextUpdateLead = time.Second
 )
 
-func cadenceInterval(c model.Cadence) time.Duration {
+func (t CadenceTempo) withDefaults() CadenceTempo {
+	if t.Fast <= 0 {
+		t.Fast = defaultCadenceFast
+	}
+	if t.Normal <= 0 {
+		t.Normal = defaultCadenceNormal
+	}
+	if t.Slow <= 0 {
+		t.Slow = defaultCadenceSlow
+	}
+	return t
+}
+
+// Interval returns the configured duration for one cadence tier.
+func (t CadenceTempo) Interval(c model.Cadence) time.Duration {
+	t = t.withDefaults()
 	switch c {
 	case model.CadenceFast:
-		return cadenceFastInterval
+		return t.Fast
 	case model.CadenceNormal:
-		return cadenceNormalInterval
+		return t.Normal
 	case model.CadenceSlow:
-		return cadenceSlowInterval
+		return t.Slow
 	default:
-		// Cadence("") (terminal) never reaches nextUpdateAt's cadenceInterval
-		// call — DeriveActionContract returns before computing next_update_at
-		// for a terminal lifecycle. Slow is the safe, defensive fallback.
-		return cadenceSlowInterval
+		// Cadence("") (terminal) never reaches nextUpdateAt's Interval call —
+		// DeriveActionContract returns before computing next_update_at for a
+		// terminal lifecycle. Slow is the safe, defensive fallback.
+		return t.Slow
 	}
 }
 
@@ -254,7 +287,7 @@ func actorFor(operatorRequired *model.OperatorAction, alertAction *model.AlertIN
 // forward to at least minNextUpdateLead past now so an already-due candidate
 // still satisfies the contract's future-time requirement.
 func nextUpdateAt(state ControllerState, cadence model.Cadence, now time.Time) time.Time {
-	earliest := now.Add(cadenceInterval(cadence))
+	earliest := now.Add(state.Tempo.Interval(cadence))
 	for _, t := range []*time.Time{
 		state.TriageDueAt, state.SemanticRetryAt, state.RecoveryGraceUntil,
 		state.LifecycleObservationDeadlineAt, state.EarliestPersistedCheckpoint,

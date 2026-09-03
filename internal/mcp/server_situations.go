@@ -233,8 +233,9 @@ func (s *Server) handleGetSituation(ctx context.Context, req mcplib.CallToolRequ
 
 	// view carries the bounded controller-derived state Task 9 adds:
 	// current authoritative Assessment/derivation, current Operator
-	// contract, material/basis hashes, up to 20 sanitized recent attempts,
-	// per-Incident Triage state, and controller retry/park state. A
+	// contract, material/basis hashes, the eligible reason candidate set,
+	// up to 20 sanitized recent attempts, per-Incident Triage state, and
+	// controller retry/park state. A
 	// never-reconciled Situation (no controller cycle has run against it
 	// yet) legitimately renders every one of these as null/empty — the
 	// same "no controller state yet" honesty the original two explicit
@@ -291,8 +292,14 @@ func (s *Server) handleGetSituation(ctx context.Context, req mcplib.CallToolRequ
 		"operator_contract":     view.CurrentActionContract,
 		"material_fact_hash":    view.CurrentMaterialFactHash,
 		"assessment_basis_hash": view.CurrentAssessmentBasisHash,
-		"recent_attempts":       attemptRows,
-		"controller_state":      controllerStateRowFrom(view.Retry),
+		// eligible_reasons is the full eligible Sufficient-reason candidate
+		// set the last commit derived — identity, code, catalog/predicate
+		// versions, evidence references, deterministic-floor flag — not only
+		// the one the Assessment accepted (sufficient_reason inside
+		// "assessment"). Empty array until the first reconcile.
+		"eligible_reasons": view.EligibleReasons,
+		"recent_attempts":  attemptRows,
+		"controller_state": controllerStateRowFrom(view.Retry),
 	}
 
 	result, err := mcplib.NewToolResultJSON(payload)

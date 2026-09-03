@@ -195,6 +195,14 @@ func (w *ControllerWorker) SetDependencyRecoveryWaker(waker DependencyRecoveryWa
 	w.waker = waker
 }
 
+// SetAssessmentHealthObserver wires the installation LLM-health observer
+// onto the Controller this worker drives (Controller.
+// SetAssessmentHealthObserver). Same contract as SetDependencyRecoveryWaker:
+// call once, after construction, before starting the worker.
+func (w *ControllerWorker) SetAssessmentHealthObserver(o AssessmentHealthObserver) {
+	w.controller.SetAssessmentHealthObserver(o)
+}
+
 // NewControllerWorker constructs a ControllerWorker. It builds its own
 // *Controller internally (via NewController) so it can wrap client in the
 // global L2 semaphore before Reconcile ever sees it — workStore is the

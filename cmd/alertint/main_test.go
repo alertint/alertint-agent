@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/alertint/alertint-agent/internal/correlator"
 	"github.com/alertint/alertint-agent/internal/situation"
 	"github.com/alertint/alertint-agent/skills/acutetriage"
 )
@@ -16,19 +17,20 @@ import (
 // Task 9 production wiring proofs.
 // ----------------------------------------------------------------------
 
-// TestIncidentSinkCarriesNoDirectLLMDependency proves the Correlator's only
-// path to any LLM call is through the Acute Triage skill it is handed
-// (incidentSink{skill: skill}.OnIncidentReady -> skill.Run) — the
-// Correlator's own constructor (correlator.New) and Config carry no LLM
-// client field of their own, so this wrapper's field set is the complete
-// proof surface: exactly one field, the skill.
-func TestIncidentSinkCarriesNoDirectLLMDependency(t *testing.T) {
-	typ := reflect.TypeOf(incidentSink{})
-	if typ.NumField() != 1 {
-		t.Fatalf("incidentSink has %d fields, want exactly 1 (skill) — a Correlator dispatch/LLM dependency would be a Task 9 regression", typ.NumField())
+// TestProductionCorrelatorHasNoAcuteTriageDispatchDependency proves the
+// Correlator production wires carries no analyzer/LLM dispatch dependency
+// at all: the one IncidentSink runServe hands correlator.New is the no-op
+// sink, never a Skill-backed wrapper. The Correlator's own constructor and
+// Config carry no LLM client field of their own, so the sink is the
+// complete proof surface. Acute Triage dispatch belongs exclusively to the
+// Triage worker polling the gated incident_triage schedule.
+func TestProductionCorrelatorHasNoAcuteTriageDispatchDependency(t *testing.T) {
+	sink := productionIncidentSink()
+	if _, ok := sink.(correlator.NopIncidentSink); !ok {
+		t.Fatalf("production IncidentSink = %T, want correlator.NopIncidentSink — any other sink hands the Correlator a dispatch dependency it must not own", sink)
 	}
-	if typ.Field(0).Name != "skill" || typ.Field(0).Type != reflect.TypeOf((*acutetriage.Skill)(nil)) {
-		t.Fatalf("incidentSink field = %s %s, want skill *acutetriage.Skill", typ.Field(0).Name, typ.Field(0).Type)
+	if reflect.TypeOf(sink).NumField() != 0 {
+		t.Fatalf("production IncidentSink %T carries %d fields, want 0 — it must hold no Skill, client, or store", sink, reflect.TypeOf(sink).NumField())
 	}
 }
 
@@ -42,6 +44,9 @@ var (
 	_ situation.AcuteAnalyzer      = (*acutetriage.Skill)(nil)
 	_ situation.AfterCommitter     = (*acutetriage.Skill)(nil)
 	_ situation.ExhaustionNotifier = (*acutetriage.Skill)(nil)
+	// MinimumMemberAlertsPolicy is what lets the Triage worker resolve a
+	// below-minimum clean skip BEFORE claiming, so it consumes no attempt.
+	_ situation.MinimumMemberAlertsPolicy = (*acutetriage.Skill)(nil)
 )
 
 func TestRun_VersionFlagPrintsVersionAndExitsCleanly(t *testing.T) {

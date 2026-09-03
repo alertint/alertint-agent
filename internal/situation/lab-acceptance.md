@@ -130,6 +130,32 @@ run against the lab tenant:
   leaves the Situation exhausted for that basis with no park marker until
   the basis changes — identical to what the startup recovery pass already
   produces for the same crash, not a new behaviour.
+- **OTel columns in this build.** The controller and Triage worker emit
+  the three spans `docs/concepts/architecture.md#3a` names, with the
+  attributes check 10 wants to cross-check (Situation/Incident/attempt IDs,
+  input version, hashes, digests, dispatch slot, attempt number, result
+  class, duration) — pinned by `internal/situation/telemetry_test.go`
+  against an in-memory span recorder. The binary configures **no exporter**
+  (spans go to the OpenTelemetry global provider, which is a no-op until
+  one is wired), so the lab has no OTel backend to read a trace/span ID
+  from: until an operator-configured exporter ships, the two OTel columns
+  read `n/a (no exporter wired)` and check 10 is evaluated across MCP,
+  audit, SQLite, and logs only. Do not fill those columns from the unit
+  test — they are for IDs read back from a real backend.
+- **Clean skip (checks 4 and 6).** A below-minimum-member Incident is
+  clean-skipped by the Triage worker BEFORE any attempt claim
+  (`CleanSkipIncidentTriageBelowMinimumMembers`): the schedule closes to
+  `skipped`, `incident_triage.attempts` stays at its pre-skip value, and
+  `incident_triage_attempts` gains no row. When reading back "consumed
+  Triage attempts" for a skipped Incident, expect zero for that skip; a
+  nonzero count there is a regression, not evidence.
+- **Installation LLM health (check 7).** The `assessment` capability under
+  `/health` reflects the controller's *classified* L2 outcome — a malformed
+  or policy-rejected proposal is a content failure (unhealthy only once two
+  distinct Situations corroborate it), a transport failure is unhealthy at
+  once, a stale-basis discard is a success. When forcing an L2 failure for
+  check 7, record which class the health snapshot reported alongside the
+  fallback Assessment.
 - `notify.slack.enabled` must read `false` and stdout must read enabled in
   the lab config before any of the above is exercised — verified by the
   lab-deployment step before firing anything, and re-confirmed by "exactly

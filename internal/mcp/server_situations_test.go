@@ -169,7 +169,7 @@ func TestGetSituationByIDExactContract(t *testing.T) {
 		// Task 9 additions: current Assessment derivation, material/basis
 		// hashes, bounded recent attempts, and controller retry/park state.
 		"assessment_derivation", "material_fact_hash", "assessment_basis_hash",
-		"recent_attempts", "controller_state",
+		"eligible_reasons", "recent_attempts", "controller_state",
 	}
 	if len(payload) != len(wantKeys) {
 		t.Fatalf("payload has %d keys, want exactly %d: %+v", len(payload), len(wantKeys), payload)
@@ -245,6 +245,9 @@ func assertNoControllerStateYet(t *testing.T, payload map[string]any) {
 	}
 	if attempts, ok := payload["recent_attempts"].([]any); !ok || len(attempts) != 0 {
 		t.Errorf("recent_attempts = %v, want an empty array", payload["recent_attempts"])
+	}
+	if reasons, ok := payload["eligible_reasons"].([]any); !ok || len(reasons) != 0 {
+		t.Errorf("eligible_reasons = %v, want an empty array before the first reconcile", payload["eligible_reasons"])
 	}
 	controllerState, ok := payload["controller_state"].(map[string]any)
 	if !ok {

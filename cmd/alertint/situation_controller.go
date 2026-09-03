@@ -56,8 +56,9 @@ type controllerRuntime struct {
 }
 
 // newControllerRuntime wires the controller runtime against a real store, the
-// configured one-shot provider-neutral L2 boundary (already wrapped with the
-// installation LLM-health observer — see buildAssessmentClient), and the
+// configured one-shot provider-neutral L2 boundary (buildAssessmentClient;
+// installation LLM health is wired separately, on the controller's own
+// typed-outcome seam — see llmHealthAssessmentObserver), and the
 // refactored Acute Triage skill (which structurally satisfies
 // situation.AcuteAnalyzer, situation.AfterCommitter, and
 // situation.ExhaustionNotifier all three — skills/acutetriage.Skill's own
@@ -106,8 +107,9 @@ func newControllerRuntime(
 // Extracted out of runServe itself (Task 9 fix round, Finding #3: this,
 // together with runControllerRecovery/runFoundationReconstruction below and
 // in situation_foundation.go, keeps runServe's own golangci-lint gocyclo
-// complexity under the repo's threshold) with no behavior change: same
-// construction order, same SetDependencyRecoveryWaker wiring.
+// complexity under the repo's threshold). It also wires both installation
+// LLM-health seams: the dependency-recovery waker and the L2 typed-outcome
+// observer (llmHealthAssessmentObserver).
 func buildControllerRuntime(
 	st *store.Store,
 	llmClient acutetriage.LLMClient,
@@ -118,12 +120,13 @@ func buildControllerRuntime(
 	auditSink situation.AuditSink,
 	logger *slog.Logger,
 ) (*controllerRuntime, error) {
-	assessClient, err := buildAssessmentClient(llmClient, llmHealth)
+	assessClient, err := buildAssessmentClient(llmClient)
 	if err != nil {
 		return nil, fmt.Errorf("situation controller: %w", err)
 	}
 	crt := newControllerRuntime(st, assessClient, skill, cfg, owner, auditSink, logger)
 	crt.SetDependencyRecoveryWaker(llmHealthDependencyWaker{tracker: llmHealth, st: st})
+	crt.SetAssessmentHealthObserver(llmHealthAssessmentObserver{tracker: llmHealth})
 	return crt, nil
 }
 
@@ -132,14 +135,20 @@ func buildControllerRuntime(
 // Task 8's own documented mapping (Task 8 report): Workers -> Workers,
 // ReconcilePollSeconds -> Interval, LeaseSeconds -> Lease, HeartbeatSeconds
 // -> Heartbeat, WebhookRecoveryGraceSeconds -> ControllerConfig.
-// WebhookRecoveryGrace, MaxL2CallsPerAttempt/MaxWorkAttemptsPerInput pass
-// straight through, AttemptWallSeconds -> AttemptWall, LLMConcurrency ->
-// L2Concurrency, Retry.{Min,Max,JitterPercent}Seconds -> RetryConfig.
+// WebhookRecoveryGrace, Cadence.{Fast,Normal,Slow}Seconds -> Cadence,
+// MaxL2CallsPerAttempt/MaxWorkAttemptsPerInput pass straight through,
+// AttemptWallSeconds -> AttemptWall, LLMConcurrency -> L2Concurrency,
+// Retry.{Min,Max,JitterPercent}Seconds -> RetryConfig.
 // PollingIntervalSeconds has no config.SituationsConfig source (no polling
 // connector exists in this build) and is left at its zero-value default —
 // see ControllerConfig's own doc comment.
 func situationsConfigToControllerConfig(cfg config.SituationsConfig, owner string) (situation.ControllerConfig, situation.ControllerWorkerConfig) {
 	controllerCfg := situation.ControllerConfig{
+		Cadence: situation.CadenceTempo{
+			Fast:   time.Duration(cfg.Cadence.FastSeconds) * time.Second,
+			Normal: time.Duration(cfg.Cadence.NormalSeconds) * time.Second,
+			Slow:   time.Duration(cfg.Cadence.SlowSeconds) * time.Second,
+		},
 		MaxL2CallsPerAttempt:    cfg.MaxL2CallsPerAttempt,
 		MaxWorkAttemptsPerInput: cfg.MaxWorkAttemptsPerInput,
 		AttemptWall:             time.Duration(cfg.AttemptWallSeconds) * time.Second,
@@ -297,6 +306,14 @@ func (r *controllerRuntime) SetDependencyRecoveryWaker(waker situation.Dependenc
 	r.worker.SetDependencyRecoveryWaker(waker)
 }
 
+// SetAssessmentHealthObserver wires the L2 typed-outcome health observer
+// onto the controller worker (situation.ControllerWorker.
+// SetAssessmentHealthObserver) — the same thin pass-through shape as
+// SetDependencyRecoveryWaker.
+func (r *controllerRuntime) SetAssessmentHealthObserver(o situation.AssessmentHealthObserver) {
+	r.worker.SetAssessmentHealthObserver(o)
+}
+
 // Start launches the controller worker, then the Triage worker, each on its
 // own background schedule. Call only after RecoverAndBackfill has succeeded
 // (and, transitively, after foundationRuntime.Reconstruct — the controller
@@ -307,24 +324,31 @@ func (r *controllerRuntime) Start(ctx context.Context) {
 }
 
 // Drain runs both workers' due work to quiescence (repeat until a round
-// handles zero items, or ctx is done), for the shutdown sequence's own
-// "drain due controller/Triage work ... to quiescence" requirement — called
-// BEFORE Stop, while both background loops are still able to claim and
-// process due work, so whatever situation inputs a Triage completion or a
-// controller commit produces are at least durably queued (any not yet
-// consumed by the time shutdown proceeds simply wait, recoverable, for the
-// next startup's reconstruction pass — spec.md's own "leave remaining
-// durable work recoverable"). Bounded by ctx; a ctx deadline mid-drain is
-// not itself an error worth surfacing to the caller; a genuine store error
-// is.
-func (r *controllerRuntime) Drain(ctx context.Context) error {
-	if _, err := r.worker.Drain(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("situation controller: drain controller worker: %w", err)
+// handles zero items, or ctx is done) and reports how many items they
+// handled in total, for the shutdown sequence's own "drain due controller/
+// Triage work and its resulting inputs to quiescence" loop
+// (foundationStopSequence, situation_foundation.go) — called BEFORE Stop,
+// while both background loops are still able to claim and process due
+// work, and interleaved with foundationRuntime.Drain so whatever Situation
+// inputs a Triage completion or a controller commit produces are applied
+// in the next round rather than merely queued (any not yet consumed by the
+// time shutdown proceeds simply wait, recoverable, for the next startup's
+// reconstruction pass — spec.md's own "leave remaining durable work
+// recoverable"). Bounded by ctx; a ctx deadline mid-drain is not itself an
+// error worth surfacing to the caller; a genuine store error is.
+func (r *controllerRuntime) Drain(ctx context.Context) (int, error) {
+	handled := 0
+	n, err := r.worker.Drain(ctx)
+	handled += n
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		return handled, fmt.Errorf("situation controller: drain controller worker: %w", err)
 	}
-	if _, err := r.triage.Drain(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("situation controller: drain triage worker: %w", err)
+	n, err = r.triage.Drain(ctx)
+	handled += n
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		return handled, fmt.Errorf("situation controller: drain triage worker: %w", err)
 	}
-	return nil
+	return handled, nil
 }
 
 // Stop stops the Triage worker, then the controller worker — the reverse of
@@ -435,47 +459,69 @@ func (a *triageScheduleListerAdapter) ListDueIncidentTriage(ctx context.Context,
 }
 
 // ----------------------------------------------------------------------
-// LLM health wiring: the L2 (Situation Assessment) observer decorator and
-// the dependency-recovery waker adapter. Both live here, in cmd/alertint,
-// because internal/llmhealth cannot be imported from internal/situation
-// (llmhealth imports internal/store, which already imports internal/
-// situation — see situation.DependencyRecoveryWaker's own doc comment for
-// the identical constraint).
+// LLM health wiring: the L2 (Situation Assessment) typed-outcome observer
+// and the dependency-recovery waker adapter. Both live here, in
+// cmd/alertint, because internal/llmhealth cannot be imported from
+// internal/situation (llmhealth imports internal/store, which already
+// imports internal/situation — see situation.DependencyRecoveryWaker's own
+// doc comment for the identical constraint).
 // ----------------------------------------------------------------------
 
-// healthObservingAssessmentClient wraps an AssessmentClient with the
-// installation-level LLM health observer for the controller's own L2 calls
-// — the sibling wiring to Acute Triage's own L1 (CapabilityTriageDraft)
-// observations, already wired inside skills/acutetriage via its Config.Health
-// (unchanged by this task). Wraps at exactly the same layer
-// semaphoreAssessmentClient (internal/situation/controller_worker.go)
-// already wraps — CompleteOnce — so a late/stale completion race (a
-// concurrent newer input invalidates the claim AFTER a real L2 call already
-// succeeded) is naturally observed as a SUCCESS here: the physical call
-// itself did not fail, it was correctly discarded downstream by
-// CommitController's own fencing. Task 9's brief: "Treat a late/stale
-// completion race as stale, not provider failure" — satisfied by
-// construction, not by any special-casing in this wrapper, because the
-// wrapper only ever sees CompleteOnce's own transport-level outcome.
-//
-// subject is always "" (Tracker.Begin's second argument, an Incident ID for
-// Acute Triage's own capabilities): situation.AssessmentClient.CompleteOnce
-// carries no Situation identity in its signature (Task 8 already shipped
-// this interface; threading one through is out of this task's "do not
-// modify Task 8's core logic" scope), so content-failure corroboration for
-// CapabilityAssessment aggregates across every Situation as one bucket
-// rather than per-Situation — a deliberate, documented limitation, not an
-// oversight.
-type healthObservingAssessmentClient struct {
-	inner   situation.AssessmentClient
+// llmHealthAssessmentObserver implements situation.AssessmentHealthObserver
+// over the installation LLM-health tracker for the controller's own L2
+// calls — the sibling wiring to Acute Triage's own L1 (CapabilityTriageDraft)
+// observations, already wired inside skills/acutetriage via its
+// Config.Health. It observes each dispatch's FINAL typed outcome, after the
+// controller has validated and classified the proposal, with the Situation
+// ID as the observation subject — so a malformed or policy-invalid
+// proposal is a content-class failure (corroborated across two distinct
+// Situations before the capability turns unhealthy, exactly like Acute
+// Triage's own malformed-response rule), a transport failure is a
+// dependency-class failure, and a stale-basis outcome (a real call that
+// succeeded but was correctly discarded because a newer input landed
+// mid-cycle — Task 9's "treat a late/stale completion race as stale, not
+// provider failure") is a success. An earlier wiring decorated CompleteOnce
+// instead and so reported every parseable-but-invalid response as healthy
+// and every observation under one empty subject, which made the two-
+// Situation corroboration rule unsatisfiable.
+type llmHealthAssessmentObserver struct {
 	tracker *llmhealth.Tracker
 }
 
-func (c healthObservingAssessmentClient) CompleteOnce(ctx context.Context, systemPrompt string, prompt llm.Prompt, requiredKeys []string) (llm.OneShotCompletion, error) {
-	obs := c.tracker.Begin(llmhealth.CapabilityAssessment, "")
-	result, err := c.inner.CompleteOnce(ctx, systemPrompt, prompt, requiredKeys)
-	obs.Finish(err) //nolint:contextcheck // matches skills/acutetriage's own established Finish(err) call-site pattern
-	return result, err
+func (o llmHealthAssessmentObserver) BeginAssessmentCall(situationID string) situation.AssessmentCallObservation {
+	return llmHealthAssessmentObservation{obs: o.tracker.Begin(llmhealth.CapabilityAssessment, situationID)}
+}
+
+type llmHealthAssessmentObservation struct {
+	obs *llmhealth.Observation
+}
+
+func (o llmHealthAssessmentObservation) Finish(outcome situation.L2Outcome, transportErr error) {
+	o.obs.Finish(assessmentHealthError(outcome, transportErr))
+}
+
+// assessmentHealthError maps one final L2 outcome onto the error shape
+// llmhealth.Classify reads: nil for a healthy call (accepted, contradicted,
+// or a correctly discarded stale completion), the real transport error for
+// a dependency-class failure, and a reason-bearing content-class error for
+// a malformed (ErrResponseMalformed) or contract-violating
+// (llm.ErrSchemaViolation) proposal.
+func assessmentHealthError(outcome situation.L2Outcome, transportErr error) error {
+	switch outcome {
+	case situation.L2OutcomeAccepted, situation.L2OutcomeContradicted, situation.L2OutcomeStaleBasis:
+		return nil
+	case situation.L2OutcomeTransportFailure, situation.L2OutcomeRateLimited:
+		if transportErr != nil {
+			return transportErr
+		}
+		return errors.New("assessment: transport-class outcome without a typed transport error")
+	case situation.L2OutcomeMalformed:
+		return fmt.Errorf("%w: assessment proposal did not parse as the required semantic proposal shape", llmhealth.ErrResponseMalformed)
+	case situation.L2OutcomePolicyRejected, situation.L2OutcomeCapabilityRejected:
+		return fmt.Errorf("%w: assessment proposal %s", llm.ErrSchemaViolation, outcome)
+	default:
+		return fmt.Errorf("%w: unrecognized assessment outcome %q", llm.ErrSchemaViolation, outcome)
+	}
 }
 
 // buildAssessmentClient resolves the controller's own one-shot,
@@ -487,14 +533,14 @@ func (c healthObservingAssessmentClient) CompleteOnce(ctx context.Context, syste
 // client that does not implement it is a genuine wiring/config error: unlike
 // the idle probe (optional, WARN-and-disable), L2 dispatch is not optional
 // for a running controller, so this fails loud rather than degrading
-// silently. The result is then wrapped with the installation LLM-health
-// observer.
-func buildAssessmentClient(client acutetriage.LLMClient, tracker *llmhealth.Tracker) (situation.AssessmentClient, error) {
+// silently. Installation LLM health is NOT layered here — it observes the
+// controller's typed outcome, not the transport (llmHealthAssessmentObserver).
+func buildAssessmentClient(client acutetriage.LLMClient) (situation.AssessmentClient, error) {
 	oneShot, ok := client.(situation.AssessmentClient)
 	if !ok {
 		return nil, fmt.Errorf("cmd/alertint: configured LLM client %T does not implement CompleteOnce; the Situation controller cannot dispatch L2 work", client)
 	}
-	return healthObservingAssessmentClient{inner: oneShot, tracker: tracker}, nil
+	return oneShot, nil
 }
 
 // llmHealthDependencyWaker implements situation.DependencyRecoveryWaker by

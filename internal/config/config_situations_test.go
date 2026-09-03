@@ -35,10 +35,7 @@ func TestSituationsDefaults(t *testing.T) {
 		{"lease_seconds", s.LeaseSeconds, 300},
 		{"heartbeat_seconds", s.HeartbeatSeconds, 30},
 		{"webhook_recovery_grace_seconds", s.WebhookRecoveryGraceSeconds, 120},
-		// 120, not 60: Task 9 aligned this default with internal/situation/
-		// assessment.go's own hardcoded cadenceFastInterval (2m) — see
-		// SituationsCadenceConfig's own doc comment.
-		{"cadence.fast_seconds", s.Cadence.FastSeconds, 120},
+		{"cadence.fast_seconds", s.Cadence.FastSeconds, 60},
 		{"cadence.normal_seconds", s.Cadence.NormalSeconds, 300},
 		{"cadence.slow_seconds", s.Cadence.SlowSeconds, 900},
 		{"max_l2_calls_per_attempt", s.MaxL2CallsPerAttempt, 2},
@@ -87,6 +84,11 @@ func TestSituationsValidation(t *testing.T) {
 		{"cadence.fast_seconds zero", func(s *SituationsConfig) { s.Cadence.FastSeconds = 0 }, true},
 		{"cadence.normal_seconds zero", func(s *SituationsConfig) { s.Cadence.NormalSeconds = 0 }, true},
 		{"cadence.slow_seconds zero", func(s *SituationsConfig) { s.Cadence.SlowSeconds = 0 }, true},
+		{"cadence fast equal to normal", func(s *SituationsConfig) { s.Cadence.FastSeconds = s.Cadence.NormalSeconds }, true},
+		{"cadence normal slower than slow", func(s *SituationsConfig) { s.Cadence.NormalSeconds = s.Cadence.SlowSeconds + 1 }, true},
+		{"cadence strictly ordered custom values", func(s *SituationsConfig) {
+			s.Cadence.FastSeconds, s.Cadence.NormalSeconds, s.Cadence.SlowSeconds = 30, 31, 32
+		}, false},
 		{"attempt_wall_seconds zero", func(s *SituationsConfig) { s.AttemptWallSeconds = 0 }, true},
 		{"llm_concurrency zero", func(s *SituationsConfig) { s.LLMConcurrency = 0 }, true},
 		{"retry.min_seconds zero", func(s *SituationsConfig) { s.Retry.MinSeconds = 0 }, true},

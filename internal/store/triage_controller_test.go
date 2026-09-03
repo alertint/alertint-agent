@@ -1195,3 +1195,167 @@ func TestUpgradeTriageSkipsIncidentsWithNoOwningSituationYet(t *testing.T) {
 		t.Fatalf("situation_id = %v, want null", situationID)
 	}
 }
+
+// ----------------------------------------------------------------------
+// CleanSkipIncidentTriageBelowMinimumMembers: the worker's PRE-CLAIM clean
+// skip. Global Constraint: "A clean skip is a first judgment without Acute
+// Triage dispatch and consumes no Triage attempt" — so, unlike
+// CompleteIncidentTriageAttemptAsCleanSkip, this must leave the attempt
+// count and the attempt ledger untouched.
+// ----------------------------------------------------------------------
+
+func countTriageAttemptRows(t *testing.T, st *Store, incidentID string) int {
+	t.Helper()
+	var n int
+	if err := st.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM incident_triage_attempts WHERE incident_id = ?`, incidentID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func TestCleanSkipBelowMinimumMembersClosesDueRowWithoutConsumingAnAttempt(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "preclaim-skip", now) // exactly one member alert
+	decideAndApplyRequest(t, st, f, now)
+
+	got, err := st.CleanSkipIncidentTriageBelowMinimumMembers(ctx, f.IncidentID, 2, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("clean skip below minimum: %v", err)
+	}
+	if !got.Skipped || got.SituationID != f.SituationID || got.MemberAlerts != 1 || got.DecisionInputVersion == 0 {
+		t.Fatalf("result = %+v, want Skipped with situation %s, 1 member alert, and the decided input version", got, f.SituationID)
+	}
+
+	tr := triageRow(t, st, f.IncidentID)
+	if tr.Phase != "skipped" {
+		t.Fatalf("phase = %q, want skipped (the same terminal phase the B+-gate skip uses)", tr.Phase)
+	}
+	if tr.Attempts != 0 {
+		t.Fatalf("attempts = %d, want 0 — a pre-claim clean skip consumes no Triage attempt", tr.Attempts)
+	}
+	if n := countTriageAttemptRows(t, st, f.IncidentID); n != 0 {
+		t.Fatalf("attempt ledger rows = %d, want 0 — nothing was ever claimed", n)
+	}
+	if tr.LeaseOwner.Valid || tr.CurrentAttemptID.Valid {
+		t.Fatalf("lease fields set on a never-claimed row: owner=%v attempt=%v", tr.LeaseOwner, tr.CurrentAttemptID)
+	}
+	if got := incidentStatus(t, st, f.IncidentID); got != "ready" {
+		t.Fatalf("incident status = %q, want ready — a clean skip must stay collapse-eligible", got)
+	}
+	if n := countSituationInputs(t, st, f.IncidentID, "triage_skipped"); n != 1 {
+		t.Fatalf("triage_skipped inputs = %d, want exactly 1", n)
+	}
+
+	// Replay is a no-op: the row is no longer pending/backoff.
+	again, err := st.CleanSkipIncidentTriageBelowMinimumMembers(ctx, f.IncidentID, 2, now.Add(2*time.Minute))
+	if err != nil || again.Skipped {
+		t.Fatalf("replay = %+v, %v; want not skipped and no error", again, err)
+	}
+	if n := countSituationInputs(t, st, f.IncidentID, "triage_skipped"); n != 1 {
+		t.Fatalf("triage_skipped inputs after replay = %d, want still exactly 1", n)
+	}
+	// And the ordinary claim now fails closed: nothing is claimable.
+	if _, err := st.ClaimIncidentTriageAttempt(ctx, f.IncidentID, "worker-1", now.Add(2*time.Minute), time.Minute); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("claim after clean skip err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestCleanSkipBelowMinimumMembersLeavesEligibleIncidentForTheOrdinaryClaim(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "preclaim-eligible", now)
+	decideAndApplyRequest(t, st, f, now)
+
+	got, err := st.CleanSkipIncidentTriageBelowMinimumMembers(ctx, f.IncidentID, 1, now.Add(time.Minute))
+	if err != nil || got.Skipped || got.MemberAlerts != 1 {
+		t.Fatalf("result = %+v, %v; want not skipped with 1 member alert", got, err)
+	}
+	if tr := triageRow(t, st, f.IncidentID); tr.Phase != "pending" {
+		t.Fatalf("phase = %q, want pending (untouched)", tr.Phase)
+	}
+	if n := countSituationInputs(t, st, f.IncidentID, "triage_skipped"); n != 0 {
+		t.Fatalf("triage_skipped inputs = %d, want 0", n)
+	}
+	claim := mustClaimExisting(t, st, f, now.Add(time.Minute))
+	if claim.AttemptNumber != 1 {
+		t.Fatalf("attempt number = %d, want 1", claim.AttemptNumber)
+	}
+}
+
+func TestCleanSkipBelowMinimumMembersNeverTouchesAnAwaitingDecisionRow(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "preclaim-undecided", now)
+	seedAwaitingDecisionRow(t, st, f.IncidentID, now)
+
+	got, err := st.CleanSkipIncidentTriageBelowMinimumMembers(ctx, f.IncidentID, 5, now.Add(time.Minute))
+	if err != nil || got.Skipped {
+		t.Fatalf("result = %+v, %v; want not skipped — only a controller-decided pending/backoff row is the worker's to close", got, err)
+	}
+	if tr := triageRow(t, st, f.IncidentID); tr.Phase != "awaiting_decision" {
+		t.Fatalf("phase = %q, want awaiting_decision (untouched)", tr.Phase)
+	}
+}
+
+func TestCleanSkipBelowMinimumMembersLeavesANotYetDueRowAlone(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "preclaim-notdue", now)
+	decideAndApplyRequest(t, st, f, now)
+	if _, err := st.db.ExecContext(ctx, `UPDATE incident_triage SET next_at = ? WHERE incident_id = ?`, canonicalTime(now.Add(time.Hour)), f.IncidentID); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.CleanSkipIncidentTriageBelowMinimumMembers(ctx, f.IncidentID, 5, now.Add(time.Minute))
+	if err != nil || got.Skipped {
+		t.Fatalf("result = %+v, %v; want not skipped before next_at", got, err)
+	}
+}
+
+// TestCleanSkipBelowMinimumMembersCountsLegacyIncidentAlertsWhenNoDeliveries
+// mirrors skills/acutetriage's own loadFrozenClaimAlerts fallback: an
+// Incident with incident_alerts rows but no delivery-ledger rows (pre-0013)
+// still has real members and must not be clean-skipped as empty.
+func TestCleanSkipBelowMinimumMembersCountsLegacyIncidentAlertsWhenNoDeliveries(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "preclaim-legacy", now)
+	decideAndApplyRequest(t, st, f, now)
+
+	var alertID string
+	if err := st.db.QueryRowContext(ctx, `SELECT alert_id FROM alert_deliveries WHERE id = ?`, f.DeliveryID).Scan(&alertID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `INSERT OR IGNORE INTO incident_alerts (incident_id, alert_id, created_at) VALUES (?, ?, ?)`, f.IncidentID, alertID, canonicalTime(now)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `DELETE FROM incident_alert_deliveries WHERE incident_id = ?`, f.IncidentID); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.CleanSkipIncidentTriageBelowMinimumMembers(ctx, f.IncidentID, 1, now.Add(time.Minute))
+	if err != nil || got.Skipped || got.MemberAlerts != 1 {
+		t.Fatalf("result = %+v, %v; want not skipped with 1 legacy member alert", got, err)
+	}
+	got, err = st.CleanSkipIncidentTriageBelowMinimumMembers(ctx, f.IncidentID, 2, now.Add(time.Minute))
+	if err != nil || !got.Skipped {
+		t.Fatalf("result = %+v, %v; want skipped below a minimum of 2", got, err)
+	}
+}
+
+// mustClaimExisting claims a row an earlier decideAndApplyRequest already
+// moved to pending, without re-seeding the decision.
+func mustClaimExisting(t *testing.T, st *Store, f triageFixture, now time.Time) ClaimedTriageAttempt {
+	t.Helper()
+	got, err := st.ClaimIncidentTriageAttempt(context.Background(), f.IncidentID, "worker-1", now, time.Minute)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	return got
+}

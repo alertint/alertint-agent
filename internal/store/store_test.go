@@ -438,11 +438,12 @@ func TestMaxSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	// 0017_llm_health_assessment_capability.sql is the newest migration
-	// today (Task 9: widens llm_health_capabilities.capability to accept
-	// "assessment").
-	if got != 17 {
-		t.Errorf("MaxSchemaVersion = %d, want 17", got)
+	// 0016_incident_triage_controller.sql is the newest migration today.
+	// Plan 2 owns exactly 0015 and 0016 (the llm_health_capabilities
+	// widening for "assessment" lives inside 0015); Plan 3 provisionally
+	// owns 0017/0018, so this number must not move before Plan 2 lands.
+	if got != 16 {
+		t.Errorf("MaxSchemaVersion = %d, want 16", got)
 	}
 }
 
