@@ -112,7 +112,10 @@ func deriveStoreFactsWith(in SnapshotInput, symptoms []Symptom, class string) []
 	situationID := in.Situation.ID
 	inputVersion := in.Situation.InputVersion
 
-	facts := []model.Fact{}
+	// Capacity 4 covers the guaranteed single-fact appends below (lifecycle
+	// summary, duration, prior-duration-distribution, capability limitation);
+	// the four variable-length appends still grow it as needed.
+	facts := make([]model.Fact, 0, 4)
 	facts = append(facts, deriveSymptomStateFacts(situationID, inputVersion, in.Now, symptoms)...)
 	facts = append(facts, deriveLifecycleSummaryFact(situationID, inputVersion, in.Now, symptoms))
 	facts = append(facts, deriveDurationFact(in, class))

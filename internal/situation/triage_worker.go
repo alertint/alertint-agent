@@ -155,7 +155,7 @@ type PostCommitData struct {
 // entirely outside any transaction, before the store's own completion
 // commits. skills/acutetriage.Skill implements this via its Analyze method.
 type AcuteAnalyzer interface {
-	Analyze(context.Context, TriageAttemptClaim) (AcuteResult, error)
+	Analyze(ctx context.Context, claim TriageAttemptClaim) (AcuteResult, error)
 }
 
 // AfterCommitter runs best-effort compatibility memory/notifier/audit
@@ -742,7 +742,7 @@ func (w *TriageWorker) heartbeatLoop(ctx context.Context, cancel context.CancelF
 			return
 		case <-ticker.C:
 			extendCtx, extendCancel := detachedWriteContext()
-			err := w.store.ExtendIncidentTriageLease(extendCtx, claim.AttemptID, claim.IncidentID, w.cfg.Owner, w.cfg.Now(), w.cfg.Lease)
+			err := w.store.ExtendIncidentTriageLease(extendCtx, claim.AttemptID, claim.IncidentID, w.cfg.Owner, w.cfg.Now(), w.cfg.Lease) //nolint:contextcheck // by design: extendCtx is detachedWriteContext, independent of the possibly-canceled analysis context
 			extendCancel()
 			if err != nil {
 				w.logger.Warn("situation: triage worker: heartbeat lease extend failed; canceling attempt",

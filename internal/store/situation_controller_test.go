@@ -58,6 +58,8 @@ func claimSituation(t *testing.T, st *Store, situationID, owner string, now time
 
 // factFixture builds one valid, minimal situationmodel.Fact for situationID
 // at inputVersion, keyed by id.
+//
+//nolint:unparam // id is a general fixture parameter; every current test happens to use "fact-1".
 func factFixture(id, situationID string, inputVersion int, observedAt time.Time) situationmodel.Fact {
 	return situationmodel.Fact{
 		ID:           id,
@@ -1246,7 +1248,15 @@ func basicControllerCommit(situationID string, inputVersion int, now time.Time) 
 	}
 }
 
+// mustMarshalJSON accepts a nil t for the rare package-level fixture built
+// outside any test function (see its own nil call site) — t.Helper() would
+// nil-panic there, so it is called only when t is non-nil.
+//
+//nolint:thelper // t.Helper() is conditional by design: this helper also runs with a nil t.
 func mustMarshalJSON(t *testing.T, v any) json.RawMessage {
+	if t != nil {
+		t.Helper()
+	}
 	b, err := json.Marshal(v)
 	if err != nil {
 		if t != nil {
@@ -1871,6 +1881,7 @@ func TestReleaseControllerWorkWithBackoffPreservesConcurrentlyEarlierCheckpoint(
 // WakeDependencyRecoveredSituations
 // ----------------------------------------------------------------------
 
+//nolint:unparam // generation is a general fixture parameter; every current test happens to use 1.
 func parkSituationTx(t *testing.T, st *Store, situationID, reason string, generation int64, now time.Time) {
 	t.Helper()
 	if _, err := st.db.ExecContext(context.Background(), `

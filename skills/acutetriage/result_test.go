@@ -58,9 +58,21 @@ func TestAnalyze_NoDurableSideEffects(t *testing.T) {
 		t.Fatalf("Analyze: %v", err)
 	}
 
-	// -- durable AcuteResult data --
-	if result.IncidentID != inc.ID {
-		t.Errorf("IncidentID = %q, want %q", result.IncidentID, inc.ID)
+	assertAnalyzeDurableResultFields(t, result, inc.ID, a1.ID, a2.ID)
+	assertAnalyzeNoIncidentMutation(t, ctx, st, inc.ID)
+	assertAnalyzeNoRoleWrite(t, ctx, st, inc.ID)
+	if notifier.calls != 0 {
+		t.Errorf("notifier called %d times, want 0 (Analyze must never notify)", notifier.calls)
+	}
+	assertAnalyzeNoTerminalAudit(t, ctx, st)
+	assertAnalyzePostCommitPayload(t, result)
+}
+
+// durable AcuteResult data.
+func assertAnalyzeDurableResultFields(t *testing.T, result situation.AcuteResult, incidentID, primaryAlertID, correlatedAlertID string) {
+	t.Helper()
+	if result.IncidentID != incidentID {
+		t.Errorf("IncidentID = %q, want %q", result.IncidentID, incidentID)
 	}
 	if result.EvidencePackDigest == "" || !strings.HasPrefix(result.EvidencePackDigest, "sha256:") {
 		t.Errorf("EvidencePackDigest = %q, want a sha256:... digest", result.EvidencePackDigest)
@@ -80,17 +92,20 @@ func TestAnalyze_NoDurableSideEffects(t *testing.T) {
 	if result.Confidence <= 0 {
 		t.Errorf("Confidence = %v, want > 0", result.Confidence)
 	}
-	// AlertRoles: itemized (a1) plus defaulted (a2) — computed, not yet
-	// written anywhere.
-	if result.AlertRoles[a1.ID] != "primary" {
-		t.Errorf("AlertRoles[a1] = %q, want primary (model itemized it)", result.AlertRoles[a1.ID])
+	// AlertRoles: itemized (primary) plus defaulted (correlated) — computed,
+	// not yet written anywhere.
+	if result.AlertRoles[primaryAlertID] != "primary" {
+		t.Errorf("AlertRoles[primary] = %q, want primary (model itemized it)", result.AlertRoles[primaryAlertID])
 	}
-	if result.AlertRoles[a2.ID] != "correlated" {
-		t.Errorf("AlertRoles[a2] = %q, want correlated (defaulted)", result.AlertRoles[a2.ID])
+	if result.AlertRoles[correlatedAlertID] != "correlated" {
+		t.Errorf("AlertRoles[correlated] = %q, want correlated (defaulted)", result.AlertRoles[correlatedAlertID])
 	}
+}
 
-	// -- no durable Incident change --
-	after, err := st.GetIncidentByID(ctx, inc.ID)
+// no durable Incident change.
+func assertAnalyzeNoIncidentMutation(t *testing.T, ctx context.Context, st *store.Store, incidentID string) {
+	t.Helper()
+	after, err := st.GetIncidentByID(ctx, incidentID)
 	if err != nil || after == nil {
 		t.Fatalf("reload incident: %v", err)
 	}
@@ -100,9 +115,12 @@ func TestAnalyze_NoDurableSideEffects(t *testing.T) {
 	if after.OutputJSON != "" || after.Summary != "" || after.RootCause != "" {
 		t.Errorf("incident output/summary/root_cause were written by Analyze: %+v", after)
 	}
+}
 
-	// -- no role write --
-	rows, err := st.DB().QueryContext(ctx, `SELECT role FROM incident_alerts WHERE incident_id = ?`, inc.ID)
+// no role write.
+func assertAnalyzeNoRoleWrite(t *testing.T, ctx context.Context, st *store.Store, incidentID string) {
+	t.Helper()
+	rows, err := st.DB().QueryContext(ctx, `SELECT role FROM incident_alerts WHERE incident_id = ?`, incidentID)
 	if err != nil {
 		t.Fatalf("query roles: %v", err)
 	}
@@ -116,13 +134,14 @@ func TestAnalyze_NoDurableSideEffects(t *testing.T) {
 			t.Errorf("incident_alerts.role = %q, want NULL (Analyze must not write roles)", *role)
 		}
 	}
-
-	// -- no notifier call --
-	if notifier.calls != 0 {
-		t.Errorf("notifier called %d times, want 0 (Analyze must never notify)", notifier.calls)
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate roles: %v", err)
 	}
+}
 
-	// -- no terminal audit state --
+// no terminal audit state.
+func assertAnalyzeNoTerminalAudit(t *testing.T, ctx context.Context, st *store.Store) {
+	t.Helper()
 	var analyzedCount int
 	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_log WHERE kind = 'incident.analyzed'`).Scan(&analyzedCount); err != nil {
 		t.Fatalf("count analyzed audit rows: %v", err)
@@ -130,8 +149,11 @@ func TestAnalyze_NoDurableSideEffects(t *testing.T) {
 	if analyzedCount != 0 {
 		t.Errorf("incident.analyzed audit rows = %d, want 0 (deferred to AfterCommit's PostCommit.AuditRecords)", analyzedCount)
 	}
+}
 
-	// -- PostCommit carries what AfterCommit needs --
+// PostCommit carries what AfterCommit needs.
+func assertAnalyzePostCommitPayload(t *testing.T, result situation.AcuteResult) {
+	t.Helper()
 	if len(result.PostCommit.CompatibilityFindingJSON) == 0 {
 		t.Fatal("PostCommit.CompatibilityFindingJSON is empty")
 	}

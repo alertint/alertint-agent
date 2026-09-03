@@ -1552,7 +1552,7 @@ func readCurrentControllerProjectionTx(ctx context.Context, tx *sql.Tx, situatio
 // preserving current's order — evaluated fresh against the row this
 // transaction just read inside its own fenced commit, never trusting the
 // caller's claim-time snapshot. spec.md: "It subtracts only reasons present
-// in the claim. Reasons raised after the claim survive."
+// in the claim. Reasons raised after the claim survive.".
 func subtractDueReasonsStore(current, consumed []situationmodel.DueReason) []situationmodel.DueReason {
 	remove := make(map[situationmodel.DueReason]bool, len(consumed))
 	for _, r := range consumed {

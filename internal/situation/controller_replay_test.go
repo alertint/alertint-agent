@@ -270,6 +270,8 @@ func (f *replayFixture) soleSituationID() string {
 // setupDueSituation POSTs one alert and drains it into a fresh, active
 // Situation with a due reason and no controller cycle ever run against it —
 // the shared starting point for the boundary-1-through-5 subtests.
+//
+//nolint:unparam // alertname is a general fixture parameter; every current subtest happens to use "HighLatency".
 func (f *replayFixture) setupDueSituation(group, alertname, fingerprint string) (situationID string) {
 	f.t.Helper()
 	f.postGroup(group, alertname, fingerprint)
@@ -499,6 +501,8 @@ type convergeTotals struct {
 // prove a convergence pass genuinely did work (not just that it reached
 // quiescence) can assert on them directly — see convergeTotals' own doc
 // comment.
+//
+//nolint:unparam // exhaustion is a general convergence-driver parameter; no current subtest exercises a non-nil ExhaustionNotifier.
 func (f *replayFixture) convergeAll(client situation.AssessmentClient, analyzer situation.AcuteAnalyzer, after situation.AfterCommitter, exhaustion situation.ExhaustionNotifier) convergeTotals {
 	f.t.Helper()
 	auditor := audit.New(f.st.DB())
@@ -829,6 +833,7 @@ func unreachableL2Client(t *testing.T, reason string) *scriptedL2Client {
 // subtest, which must crash immediately after that first rejected outcome
 // persists, never reaching a second dispatch.
 func rejectedThenUnreachableL2Client(t *testing.T) *scriptedL2Client {
+	t.Helper()
 	return &scriptedL2Client{fn: func(n int) (llm.OneShotCompletion, error) {
 		if n > 1 {
 			t.Fatalf("CompleteOnce called a second time (call #%d): the crash must happen after the first rejected outcome persists, before any further dispatch", n)

@@ -103,6 +103,8 @@ func insertIncidentAndDeliveryInput(t *testing.T, st *Store, incidentID, inputID
 // to additionally control the delivery's immutable SourceStartedAt/basis
 // independently of its ReceivedAt, so time-computation tests can pin exact
 // values for both.
+//
+//nolint:unparam // basis is a general fixture parameter; every current test happens to use SourceTimeBasisSourcePayload.
 func deliveryFixtureWithSource(id, fingerprint string, receivedAt, sourceStartedAt time.Time, basis situationmodel.SourceTimeBasis) DeliveryInput {
 	d := deliveryFixture(id, fingerprint, receivedAt)
 	start := sourceStartedAt

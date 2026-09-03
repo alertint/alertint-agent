@@ -245,13 +245,13 @@ var ErrControllerAttemptsExhausted = errors.New("situation: controller work atte
 // that convert Plan 1's SituationClaim/model.Situation shapes into this
 // package's transport-neutral Claim — see store/situation_controller.go.
 type ControllerStore interface {
-	LoadReconciliationInput(context.Context, Claim, time.Time) (SnapshotInput, error)
-	AppendSituationFacts(context.Context, Claim, []model.Fact) error
-	BeginControllerAttempt(context.Context, Claim, string, time.Time) (retryEpoch int, workAttempt int, err error)
-	RecordAssessmentCall(context.Context, Claim, AssessmentCall) error
-	AppendAssessmentOutcome(context.Context, AssessmentAttempt) error
-	LastTrustworthyAssessment(context.Context, Claim) (*AuthoritativeAssessment, error)
-	CommitController(context.Context, Claim, ControllerCommit) error
+	LoadReconciliationInput(ctx context.Context, claim Claim, now time.Time) (SnapshotInput, error)
+	AppendSituationFacts(ctx context.Context, claim Claim, facts []model.Fact) error
+	BeginControllerAttempt(ctx context.Context, claim Claim, materialFactHash string, now time.Time) (retryEpoch int, workAttempt int, err error)
+	RecordAssessmentCall(ctx context.Context, claim Claim, call AssessmentCall) error
+	AppendAssessmentOutcome(ctx context.Context, attempt AssessmentAttempt) error
+	LastTrustworthyAssessment(ctx context.Context, claim Claim) (*AuthoritativeAssessment, error)
+	CommitController(ctx context.Context, claim Claim, commit ControllerCommit) error
 }
 
 // AssessmentClient is the one-shot provider surface Reconcile's L2 dispatch
@@ -259,13 +259,13 @@ type ControllerStore interface {
 // both satisfy it structurally. Reconcile never uses the hidden-retry
 // Complete method: each dispatch permits at most one physical HTTP request.
 type AssessmentClient interface {
-	CompleteOnce(context.Context, string, llm.Prompt, []string) (llm.OneShotCompletion, error)
+	CompleteOnce(ctx context.Context, model string, prompt llm.Prompt, stop []string) (llm.OneShotCompletion, error)
 }
 
 // AuditSink is the narrow audit-append surface Reconcile emits to —
 // *audit.Auditor satisfies it structurally. May be nil (audit disabled).
 type AuditSink interface {
-	Append(context.Context, string, string, any) error
+	Append(ctx context.Context, actor, kind string, payload any) error
 }
 
 // Clock returns the current time. Production callers pass
@@ -400,14 +400,18 @@ func NewController(store ControllerStore, client AssessmentClient, cfg Controlle
 	}
 }
 
-func (c *Controller) auditAppend(ctx context.Context, actor, kind string, payload any) {
+func (c *Controller) auditAppend(ctx context.Context, kind string, payload any) {
 	if c.audit == nil {
 		return
 	}
-	if err := c.audit.Append(ctx, actor, kind, payload); err != nil {
+	if err := c.audit.Append(ctx, controllerAuditActor, kind, payload); err != nil {
 		c.logger.Warn("situation: controller audit append failed", "kind", kind, "err", err)
 	}
 }
+
+// controllerAuditActor is the fixed audit actor for every controller-emitted
+// event; the controller has no other actor identity to report.
+const controllerAuditActor = "situation.controller"
 
 // ----------------------------------------------------------------------
 // Small local helpers.
@@ -458,13 +462,13 @@ func retryBackoff(cfg RetryConfig, workAttempt int) time.Duration {
 	if shift > 30 { // guard against an absurd shift overflowing time.Duration
 		shift = 30
 	}
-	d := cfg.Min * time.Duration(uint64(1)<<uint(shift)) //nolint:gosec // shift bounded to <=30 immediately above
+	d := cfg.Min * time.Duration(uint64(1)<<uint(shift)) // #nosec G115 -- shift bounded to <=30 immediately above, so 1<<shift never exceeds 2^30, far below int64's range
 	if d <= 0 || d > cfg.Max {
 		d = cfg.Max
 	}
 	if cfg.JitterPercent > 0 {
 		frac := float64(cfg.JitterPercent) / 100
-		jitter := time.Duration(float64(d) * frac * (rand.Float64()*2 - 1))
+		jitter := time.Duration(float64(d) * frac * (rand.Float64()*2 - 1)) // #nosec G404 -- retry-backoff jitter is timing scatter, not security-sensitive; crypto/rand is unnecessary
 		d += jitter
 	}
 	if d <= 0 {
@@ -884,20 +888,10 @@ func controllerParkBlocksDispatch(p ControllerParkedState, currentMaterialFactHa
 // to the same DeterministicFallback path used when no trustworthy prior
 // exists at all — spec.md's "Deterministic fallback when L2 is unavailable
 // and no trustworthy prior Assessment exists" now also covers "...or the
-// prior's semantic content is no longer valid against the current basis."
+// prior's semantic content is no longer valid against the current basis.".
 func (c *Controller) fallbackOrPreserve(situationID string, snap Snapshot, in SnapshotInput, state ControllerState, retryEpoch, workAttempt int, now time.Time) (model.Assessment, AssessmentAttempt, []model.IncidentCoverage) {
-	if in.CurrentAssessment != nil {
-		if _, ok := trustworthy(*in.CurrentAssessment); ok {
-			proposal := proposalFromAssessment(in.CurrentAssessment.Assessment)
-			if rebound, ok := rebindSufficientReason(proposal.SufficientReason, snap.EligibleReasons); ok {
-				proposal.SufficientReason = rebound
-				revalidated := validateProposalContent(proposal, snap)
-				if revalidated.Outcome.accepted() {
-					result := DeriveAssessment(revalidated.Proposal, snap, in, state, in.CurrentAssessment.Derivation, in.CurrentAssessment.ReusedFromAssessmentID, now)
-					return result.Assessment, AssessmentAttempt{}, nil
-				}
-			}
-		}
+	if assessment, ok := revalidatedPreservedAssessment(snap, in, state, now); ok {
+		return assessment, AssessmentAttempt{}, nil
 	}
 	result := DeterministicFallback(snap, in, state, now)
 	// duration=0: this derivation never calls out (callID is always nil
@@ -905,6 +899,32 @@ func (c *Controller) fallbackOrPreserve(situationID string, snap Snapshot, in Sn
 	// derivation that never called out" contract.
 	attempt := buildAuthoritativeAttempt(situationID, result, nil, retryEpoch, workAttempt, 0, now)
 	return result.Assessment, attempt, result.Coverage
+}
+
+// revalidatedPreservedAssessment re-checks the current Assessment's semantic
+// content against snap's current basis (guard clauses, no nested branching):
+// it must exist, be trustworthy, rebind its sufficient reason onto the
+// current eligible-reason set, and pass full content revalidation. Any
+// failure at any step falls through to the caller's DeterministicFallback.
+func revalidatedPreservedAssessment(snap Snapshot, in SnapshotInput, state ControllerState, now time.Time) (model.Assessment, bool) {
+	if in.CurrentAssessment == nil {
+		return model.Assessment{}, false
+	}
+	if _, ok := trustworthy(*in.CurrentAssessment); !ok {
+		return model.Assessment{}, false
+	}
+	proposal := proposalFromAssessment(in.CurrentAssessment.Assessment)
+	rebound, ok := rebindSufficientReason(proposal.SufficientReason, snap.EligibleReasons)
+	if !ok {
+		return model.Assessment{}, false
+	}
+	proposal.SufficientReason = rebound
+	revalidated := validateProposalContent(proposal, snap)
+	if !revalidated.Outcome.accepted() {
+		return model.Assessment{}, false
+	}
+	result := DeriveAssessment(revalidated.Proposal, snap, in, state, in.CurrentAssessment.Derivation, in.CurrentAssessment.ReusedFromAssessmentID, now)
+	return result.Assessment, true
 }
 
 // buildControllerState composes the durable controller/Triage/lifecycle
@@ -943,7 +963,7 @@ func (c *Controller) commit(ctx context.Context, claim Claim, commit ControllerC
 	err := c.store.CommitController(ctx, claim, commit)
 	if err != nil {
 		c.logger.Warn("situation: controller commit failed", "situation_id", claim.Situation.ID, "err", err)
-		c.auditAppend(ctx, "situation.controller", "situation.controller.commit_failed", map[string]any{
+		c.auditAppend(ctx, "situation.controller.commit_failed", map[string]any{
 			"situation_id": claim.Situation.ID, "error": err.Error(),
 		})
 		return err
@@ -995,7 +1015,7 @@ func (c *Controller) auditCommitSuccess(ctx context.Context, claim Claim, commit
 	situationID := claim.Situation.ID
 	if commit.Attempt.ID != "" {
 		if kind, ok := assessmentAuditKind(commit.Attempt.Derivation); ok {
-			c.auditAppend(ctx, "situation.controller", kind, map[string]any{
+			c.auditAppend(ctx, kind, map[string]any{
 				"situation_id":             situationID,
 				"attempt_id":               commit.Attempt.ID,
 				"input_version":            commit.Attempt.InputVersion,
@@ -1012,7 +1032,7 @@ func (c *Controller) auditCommitSuccess(ctx context.Context, claim Claim, commit
 		if d.Decision == TriageDecisionRequest {
 			kind = "situation.triage_requested"
 		}
-		c.auditAppend(ctx, "situation.controller", kind, map[string]any{
+		c.auditAppend(ctx, kind, map[string]any{
 			"situation_id":          situationID,
 			"incident_id":           d.IncidentID,
 			"input_version":         d.SituationInputVersion,
@@ -1272,7 +1292,7 @@ func (c *Controller) commitResult(ctx context.Context, claim Claim, base Control
 		// regardless of whether the durable stale-outcome append above
 		// itself succeeded — audit is best-effort and never gates or
 		// repeats the already-completed model work.
-		c.auditAppend(ctx, "situation.controller", "situation.assessment_stale", map[string]any{
+		c.auditAppend(ctx, "situation.assessment_stale", map[string]any{
 			"situation_id": claim.Situation.ID, "call_id": *callID, "attempt_id": stale.ID,
 			"input_version":            stale.InputVersion,
 			"provider_request_started": string(*stale.ProviderRequestStarted),
@@ -1382,7 +1402,7 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 		if err := c.store.RecordAssessmentCall(ctx, claim, call); err != nil {
 			return nil, nil, callID, 0, correctionUsed, fmt.Errorf("situation: record assessment call: %w", err)
 		}
-		c.auditAppend(ctx, "situation.controller", "situation.assessment_call_dispatched", map[string]any{
+		c.auditAppend(ctx, "situation.assessment_call_dispatched", map[string]any{
 			"situation_id": claim.Situation.ID, "call_id": callID, "call_number": callNumber,
 			"input_version": snap.InputVersion, "retry_epoch": retryEpoch, "work_attempt": workAttempt,
 			"material_fact_hash": snap.MaterialFactHash,
@@ -1427,7 +1447,7 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 		if outcome.Status == "failed" {
 			kind = "situation.assessment_failed"
 		}
-		c.auditAppend(ctx, "situation.controller", kind, map[string]any{
+		c.auditAppend(ctx, kind, map[string]any{
 			"situation_id": claim.Situation.ID, "call_id": callID, "outcome": string(policy.Outcome),
 			"input_version":            snap.InputVersion,
 			"retry_epoch":              retryEpoch,

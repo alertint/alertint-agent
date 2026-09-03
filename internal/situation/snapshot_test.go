@@ -38,6 +38,7 @@ func deliveryFor(id, incidentID, payloadDigest string, receivedAt time.Time) Del
 }
 
 func baseIncident(t *testing.T, id string) IncidentState {
+	t.Helper()
 	start := mustTime(t, "2026-09-01T12:00:00Z")
 	return IncidentState{
 		ID:           id,
@@ -51,6 +52,7 @@ func baseIncident(t *testing.T, id string) IncidentState {
 }
 
 func baseSnapshotInput(t *testing.T) SnapshotInput {
+	t.Helper()
 	start := mustTime(t, "2026-09-01T12:00:00Z")
 	return SnapshotInput{
 		Situation: model.Situation{

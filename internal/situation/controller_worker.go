@@ -436,7 +436,7 @@ func (w *ControllerWorker) processOne(ctx context.Context, claim Claim) {
 		now := w.cfg.Now()
 		retryAt := now.Add(controllerWorkerRetryBackoff(claim.Situation.AttemptCount))
 		errClass := controllerReconcileFailedErrorClass
-		if rerr := w.store.ReleaseControllerWork(releaseCtx, claim, now, &retryAt, &errClass); rerr != nil && !errors.Is(rerr, model.ErrSituationLeaseLost) {
+		if rerr := w.store.ReleaseControllerWork(releaseCtx, claim, now, &retryAt, &errClass); rerr != nil && !errors.Is(rerr, model.ErrSituationLeaseLost) { //nolint:contextcheck // by design: releaseCtx is detachedControllerWorkerContext, independent of the possibly-canceled reconcile context
 			w.logger.Error("situation: controller worker: release after failed reconcile failed",
 				"situation_id", claim.Situation.ID, "err", rerr)
 		}
@@ -459,7 +459,7 @@ func (w *ControllerWorker) heartbeatLoop(ctx context.Context, cancel context.Can
 			return
 		case <-ticker.C:
 			extendCtx, extendCancel := detachedControllerWorkerContext()
-			err := w.store.ExtendControllerLease(extendCtx, claim, w.cfg.Now(), w.cfg.Lease)
+			err := w.store.ExtendControllerLease(extendCtx, claim, w.cfg.Now(), w.cfg.Lease) //nolint:contextcheck // by design: extendCtx is detachedControllerWorkerContext, independent of the possibly-canceled reconcile context
 			extendCancel()
 			if err != nil {
 				w.logger.Warn("situation: controller worker: heartbeat lease extend failed; canceling reconcile",

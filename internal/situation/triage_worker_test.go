@@ -123,10 +123,24 @@ func (f *fakeStore) RecoverExpiredIncidentTriageAttempts(ctx context.Context, no
 	return 0, nil
 }
 
-func (f *fakeStore) snapshot() (extendCalls int, complete []completeCall, backoff []backoffCall, exhaust []exhaustCall, recoverCalls int) {
+type storeSnapshot struct {
+	extendCalls  int
+	complete     []completeCall
+	backoff      []backoffCall
+	exhaust      []exhaustCall
+	recoverCalls int
+}
+
+func (f *fakeStore) snapshot() storeSnapshot {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.extendCalls, append([]completeCall(nil), f.completeCalls...), append([]backoffCall(nil), f.backoffCalls...), append([]exhaustCall(nil), f.exhaustCalls...), f.recoverCalls
+	return storeSnapshot{
+		extendCalls:  f.extendCalls,
+		complete:     append([]completeCall(nil), f.completeCalls...),
+		backoff:      append([]backoffCall(nil), f.backoffCalls...),
+		exhaust:      append([]exhaustCall(nil), f.exhaustCalls...),
+		recoverCalls: f.recoverCalls,
+	}
 }
 
 func (f *fakeStore) cleanSkips() []cleanSkipCall {
@@ -145,12 +159,6 @@ func (f *fakeLister) ListDueIncidentTriage(ctx context.Context, now time.Time) (
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.ids...), f.err
-}
-
-func (f *fakeLister) setIDs(ids []string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.ids = ids
 }
 
 type fakeAnalyzer struct {
@@ -315,15 +323,15 @@ func TestTriageWorker_CurrentCompatibleSuccess(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("handled = %d, want 1", n)
 	}
-	_, complete, backoff, exhaust, _ := store.snapshot()
-	if len(complete) != 1 {
-		t.Fatalf("complete calls = %d, want 1", len(complete))
+	snap := store.snapshot()
+	if len(snap.complete) != 1 {
+		t.Fatalf("complete calls = %d, want 1", len(snap.complete))
 	}
-	if complete[0].finding.RootCause != "r" || complete[0].finding.EvidencePackDigest != "sha256:pack" {
-		t.Errorf("finding = %+v, want RootCause=r EvidencePackDigest=sha256:pack", complete[0].finding)
+	if snap.complete[0].finding.RootCause != "r" || snap.complete[0].finding.EvidencePackDigest != "sha256:pack" {
+		t.Errorf("finding = %+v, want RootCause=r EvidencePackDigest=sha256:pack", snap.complete[0].finding)
 	}
-	if len(backoff) != 0 || len(exhaust) != 0 {
-		t.Fatalf("backoff/exhaust calls = %d/%d, want 0/0", len(backoff), len(exhaust))
+	if len(snap.backoff) != 0 || len(snap.exhaust) != 0 {
+		t.Fatalf("backoff/exhaust calls = %d/%d, want 0/0", len(snap.backoff), len(snap.exhaust))
 	}
 	if after.callCount() != 1 {
 		t.Fatalf("AfterCommit calls = %d, want 1", after.callCount())
@@ -357,9 +365,9 @@ func TestTriageWorker_StaleMembership(t *testing.T) {
 	if after.callCount() != 0 {
 		t.Fatalf("AfterCommit calls = %d, want 0 (stale completion)", after.callCount())
 	}
-	_, complete, backoff, exhaust, _ := store.snapshot()
-	if len(complete) != 1 || len(backoff) != 0 || len(exhaust) != 0 {
-		t.Fatalf("complete/backoff/exhaust = %d/%d/%d, want 1/0/0", len(complete), len(backoff), len(exhaust))
+	snap := store.snapshot()
+	if len(snap.complete) != 1 || len(snap.backoff) != 0 || len(snap.exhaust) != 0 {
+		t.Fatalf("complete/backoff/exhaust = %d/%d/%d, want 1/0/0", len(snap.complete), len(snap.backoff), len(snap.exhaust))
 	}
 	if n := len(exhaustion.snapshot()); n != 0 {
 		t.Fatalf("exhaustion notifier calls = %d, want 0 (stale completion is not a failure)", n)
@@ -414,12 +422,12 @@ func TestTriageWorker_CleanSkip(t *testing.T) {
 	if _, err := w.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
-	_, complete, backoff, exhaust, _ := store.snapshot()
-	if len(complete) != 0 || len(backoff) != 0 {
-		t.Fatalf("complete/backoff = %d/%d, want 0/0", len(complete), len(backoff))
+	snap := store.snapshot()
+	if len(snap.complete) != 0 || len(snap.backoff) != 0 {
+		t.Fatalf("complete/backoff = %d/%d, want 0/0", len(snap.complete), len(snap.backoff))
 	}
-	if len(exhaust) != 0 {
-		t.Fatalf("exhaust (ExhaustIncidentTriageAttempt) calls = %d, want 0 — a clean skip must never exhaust", len(exhaust))
+	if len(snap.exhaust) != 0 {
+		t.Fatalf("exhaust (ExhaustIncidentTriageAttempt) calls = %d, want 0 — a clean skip must never exhaust", len(snap.exhaust))
 	}
 	cleanSkips := store.cleanSkips()
 	if len(cleanSkips) != 1 {
@@ -453,18 +461,18 @@ func TestTriageWorker_RetryableProviderFailure(t *testing.T) {
 	if _, err := w.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
-	_, complete, backoff, exhaust, _ := store.snapshot()
-	if len(complete) != 0 || len(exhaust) != 0 {
-		t.Fatalf("complete/exhaust = %d/%d, want 0/0", len(complete), len(exhaust))
+	snap := store.snapshot()
+	if len(snap.complete) != 0 || len(snap.exhaust) != 0 {
+		t.Fatalf("complete/exhaust = %d/%d, want 0/0", len(snap.complete), len(snap.exhaust))
 	}
-	if len(backoff) != 1 {
-		t.Fatalf("backoff calls = %d, want 1", len(backoff))
+	if len(snap.backoff) != 1 {
+		t.Fatalf("backoff calls = %d, want 1", len(snap.backoff))
 	}
-	if backoff[0].code == "" {
+	if snap.backoff[0].code == "" {
 		t.Error("backoff code must not be empty")
 	}
-	if !backoff[0].nextAt.After(now) {
-		t.Errorf("backoff nextAt = %v, want after %v", backoff[0].nextAt, now)
+	if !snap.backoff[0].nextAt.After(now) {
+		t.Errorf("backoff nextAt = %v, want after %v", snap.backoff[0].nextAt, now)
 	}
 }
 
@@ -501,12 +509,12 @@ func TestTriageWorker_ClassifiesCapabilityAwareCode(t *testing.T) {
 	if _, err := w.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
-	_, _, backoff, _, _ := store.snapshot()
-	if len(backoff) != 1 {
-		t.Fatalf("backoff calls = %d, want 1", len(backoff))
+	snap := store.snapshot()
+	if len(snap.backoff) != 1 {
+		t.Fatalf("backoff calls = %d, want 1", len(snap.backoff))
 	}
-	if backoff[0].code != "provider_unavailable" || backoff[0].detail != "HTTP 503" {
-		t.Fatalf("backoff code/detail = %q/%q, want provider_unavailable/HTTP 503", backoff[0].code, backoff[0].detail)
+	if snap.backoff[0].code != "provider_unavailable" || snap.backoff[0].detail != "HTTP 503" {
+		t.Fatalf("backoff code/detail = %q/%q, want provider_unavailable/HTTP 503", snap.backoff[0].code, snap.backoff[0].detail)
 	}
 }
 
@@ -527,9 +535,9 @@ func TestTriageWorker_ClassifiesResponseMalformed(t *testing.T) {
 	if _, err := w.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
-	_, _, backoff, _, _ := store.snapshot()
-	if len(backoff) != 1 || backoff[0].code != "response_malformed" {
-		t.Fatalf("backoff = %+v, want exactly 1 with code response_malformed", backoff)
+	snap := store.snapshot()
+	if len(snap.backoff) != 1 || snap.backoff[0].code != "response_malformed" {
+		t.Fatalf("backoff = %+v, want exactly 1 with code response_malformed", snap.backoff)
 	}
 }
 
@@ -557,9 +565,9 @@ func TestTriageWorker_DoesNotMisattributeAmbiguousShapedErrors(t *testing.T) {
 	if _, err := w.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
-	_, _, backoff, _, _ := store.snapshot()
-	if len(backoff) != 1 || backoff[0].code != "acute_triage_failed" {
-		t.Fatalf("backoff = %+v, want exactly 1 with the generic acute_triage_failed fallback", backoff)
+	snap := store.snapshot()
+	if len(snap.backoff) != 1 || snap.backoff[0].code != "acute_triage_failed" {
+		t.Fatalf("backoff = %+v, want exactly 1 with the generic acute_triage_failed fallback", snap.backoff)
 	}
 }
 
@@ -584,9 +592,9 @@ func TestTriageWorker_ClassifiesLLMOriginTimeout(t *testing.T) {
 	if _, err := w.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
-	_, _, backoff, _, _ := store.snapshot()
-	if len(backoff) != 1 || backoff[0].code != "timeout" || backoff[0].detail != "request timed out" {
-		t.Fatalf("backoff = %+v, want exactly 1 with code timeout / detail 'request timed out'", backoff)
+	snap := store.snapshot()
+	if len(snap.backoff) != 1 || snap.backoff[0].code != "timeout" || snap.backoff[0].detail != "request timed out" {
+		t.Fatalf("backoff = %+v, want exactly 1 with code timeout / detail 'request timed out'", snap.backoff)
 	}
 }
 
@@ -611,12 +619,12 @@ func TestTriageWorker_FifthAttemptExhaustion(t *testing.T) {
 	if _, err := w.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
-	_, complete, backoff, exhaust, _ := store.snapshot()
-	if len(complete) != 0 || len(backoff) != 0 {
-		t.Fatalf("complete/backoff = %d/%d, want 0/0", len(complete), len(backoff))
+	snap := store.snapshot()
+	if len(snap.complete) != 0 || len(snap.backoff) != 0 {
+		t.Fatalf("complete/backoff = %d/%d, want 0/0", len(snap.complete), len(snap.backoff))
 	}
-	if len(exhaust) != 1 {
-		t.Fatalf("exhaust calls = %d, want 1", len(exhaust))
+	if len(snap.exhaust) != 1 {
+		t.Fatalf("exhaust calls = %d, want 1", len(snap.exhaust))
 	}
 	calls := exhaustion.snapshot()
 	if len(calls) != 1 {
@@ -625,9 +633,9 @@ func TestTriageWorker_FifthAttemptExhaustion(t *testing.T) {
 	if calls[0].incidentID != "inc-6" {
 		t.Errorf("exhaustion notify incidentID = %q, want inc-6", calls[0].incidentID)
 	}
-	if calls[0].code != exhaust[0].code || calls[0].detail != exhaust[0].detail {
+	if calls[0].code != snap.exhaust[0].code || calls[0].detail != snap.exhaust[0].detail {
 		t.Errorf("exhaustion notify code/detail = %q/%q, want the same classified code/detail persisted on the exhaust write (%q/%q)",
-			calls[0].code, calls[0].detail, exhaust[0].code, exhaust[0].detail)
+			calls[0].code, calls[0].detail, snap.exhaust[0].code, snap.exhaust[0].detail)
 	}
 }
 
@@ -681,12 +689,12 @@ func TestTriageWorker_Heartbeat(t *testing.T) {
 	if _, err := w.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
-	extendCalls, complete, _, _, _ := store.snapshot()
-	if extendCalls < 2 {
-		t.Fatalf("heartbeat extend calls = %d, want >= 2 for a 120ms analysis at a 20ms heartbeat", extendCalls)
+	snap := store.snapshot()
+	if snap.extendCalls < 2 {
+		t.Fatalf("heartbeat extend calls = %d, want >= 2 for a 120ms analysis at a 20ms heartbeat", snap.extendCalls)
 	}
-	if len(complete) != 1 {
-		t.Fatalf("complete calls = %d, want 1 (heartbeat must not itself complete the attempt)", len(complete))
+	if len(snap.complete) != 1 {
+		t.Fatalf("complete calls = %d, want 1 (heartbeat must not itself complete the attempt)", len(snap.complete))
 	}
 }
 
@@ -727,9 +735,9 @@ func TestTriageWorker_LeaseLoss(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Analyze's context was never canceled after lease loss")
 	}
-	_, complete, backoff, exhaust, _ := store.snapshot()
-	if len(complete) != 0 || len(backoff) != 0 || len(exhaust) != 0 {
-		t.Fatalf("complete/backoff/exhaust = %d/%d/%d, want 0/0/0 (abandoned stale attempt)", len(complete), len(backoff), len(exhaust))
+	snap := store.snapshot()
+	if len(snap.complete) != 0 || len(snap.backoff) != 0 || len(snap.exhaust) != 0 {
+		t.Fatalf("complete/backoff/exhaust = %d/%d/%d, want 0/0/0 (abandoned stale attempt)", len(snap.complete), len(snap.backoff), len(snap.exhaust))
 	}
 }
 
@@ -752,15 +760,15 @@ func TestTriageWorker_Cancellation(t *testing.T) {
 	w := newWorker(store, lister, analyzer, &fakeAfterCommit{}, situation.TriageWorkerConfig{})
 
 	_, _ = w.RunOnce(ctx) // may return the ctx error from a later loop check; the single processOne call still completes
-	_, complete, backoff, exhaust, _ := store.snapshot()
-	if len(complete) != 0 || len(exhaust) != 0 {
-		t.Fatalf("complete/exhaust = %d/%d, want 0/0", len(complete), len(exhaust))
+	snap := store.snapshot()
+	if len(snap.complete) != 0 || len(snap.exhaust) != 0 {
+		t.Fatalf("complete/exhaust = %d/%d, want 0/0", len(snap.complete), len(snap.exhaust))
 	}
-	if len(backoff) != 1 {
-		t.Fatalf("backoff calls = %d, want 1 (canceled attempt still recorded)", len(backoff))
+	if len(snap.backoff) != 1 {
+		t.Fatalf("backoff calls = %d, want 1 (canceled attempt still recorded)", len(snap.backoff))
 	}
-	if backoff[0].code != "canceled" {
-		t.Errorf("backoff code = %q, want canceled", backoff[0].code)
+	if snap.backoff[0].code != "canceled" {
+		t.Errorf("backoff code = %q, want canceled", snap.backoff[0].code)
 	}
 }
 
@@ -801,9 +809,9 @@ func TestTriageWorker_CrashRecovery(t *testing.T) {
 	if _, err := w.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
-	_, _, _, _, recoverCalls := store.snapshot()
-	if recoverCalls != 1 {
-		t.Fatalf("recover calls = %d, want 1", recoverCalls)
+	snap := store.snapshot()
+	if snap.recoverCalls != 1 {
+		t.Fatalf("recover calls = %d, want 1", snap.recoverCalls)
 	}
 }
 

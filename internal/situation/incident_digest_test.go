@@ -166,13 +166,13 @@ func TestIncidentDigestInputReflectsDrillMarker(t *testing.T) {
 // enough to treat the whole Incident as a Drill.
 func TestIncidentDigestInputAnyDrillDeliveryMakesIncidentDrillParityTrue(t *testing.T) {
 	base := mustTime(t, "2026-09-01T12:00:00Z")
-	real := deliveryFor("delivery-1", "incident-1", "pd-1", base)
-	real.Drill = false
+	nonDrill := deliveryFor("delivery-1", "incident-1", "pd-1", base)
+	nonDrill.Drill = false
 	drill := deliveryFor("delivery-2", "incident-1", "pd-2", base)
 	drill.Drill = true
 
-	allReal := IncidentInputDigest("incident-1", "group-1", []Delivery{real})
-	mixed := IncidentInputDigest("incident-1", "group-1", []Delivery{real, drill})
+	allReal := IncidentInputDigest("incident-1", "group-1", []Delivery{nonDrill})
+	mixed := IncidentInputDigest("incident-1", "group-1", []Delivery{nonDrill, drill})
 	if allReal == mixed {
 		t.Fatal("adding a Drill-marked delivery did not change incident input digest")
 	}

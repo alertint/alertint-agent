@@ -93,6 +93,7 @@ func EligibleReasons(in SnapshotInput, symptoms []Symptom, durationClass string)
 	return out
 }
 
+//nolint:unparam // predicateVersion is each predicate's own independent version constant (see predicateVersion* above); all four happen to be 1 today but are meant to diverge as individual predicates change.
 func newReasonCandidate(situationID string, inputVersion int, code, summary string, predicateVersion int, floor bool, evidenceRefs []string) model.ReasonCandidate {
 	refs := make([]string, len(evidenceRefs))
 	copy(refs, evidenceRefs)
