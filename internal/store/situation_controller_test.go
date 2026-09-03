@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -886,6 +887,159 @@ func TestControllerAttemptCrashFreeHashChangeAdvancesEpochAvoidingCollision(t *t
 	}
 }
 
+// TestRecoverInterruptedAssessmentCallSameHashCrashSelectsNothingAndBudgetContinues
+// pins the "same hash, counter already caught up" crash flavour: cycle 1
+// commits hash H; cycle 2 begins at the SAME H (work_attempt=2), dispatches,
+// then crashes before its own CommitController. loadStaleControllerBasisTx
+// deliberately selects nothing here (the projection hash already matches the
+// crashed call's own hash — see its doc comment on the removed
+// "counter behind" disjunct), which must still be safe: the next cycle at H
+// computes work_attempt=3 and dispatches without a UNIQUE collision, and the
+// budget continues rather than resetting.
+func TestRecoverInterruptedAssessmentCallSameHashCrashSelectsNothingAndBudgetContinues(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-recover-same-hash-crash", now)
+	h := "sha256:material-same-hash-crash"
+
+	c1 := claimSituation(t, st, sitID, "controller-a", now)
+	e1, w1 := beginAttemptThenCommitProjectionOnly(t, st, c1, h, now)
+	c1b := claimSituation(t, st, sitID, "controller-a", now)
+	call1 := callFixture(uuid.NewString(), sitID, c1b.Situation.InputVersion, w1, 1, now)
+	call1.MaterialFactHash, call1.RetryEpoch = h, e1
+	if err := st.RecordAssessmentCall(context.Background(), c1b, call1); err != nil {
+		t.Fatalf("record call 1: %v", err)
+	}
+	if err := st.ReleaseControllerWork(context.Background(), c1b, now, nil, nil); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	c2 := claimSituation(t, st, sitID, "controller-a", now)
+	e2, w2, err := st.BeginControllerAttempt(context.Background(), c2, h, now)
+	if err != nil {
+		t.Fatalf("BeginControllerAttempt (2): %v", err)
+	}
+	if w2 != 2 {
+		t.Fatalf("w2 = %d, want 2", w2)
+	}
+	call2 := callFixture(uuid.NewString(), sitID, c2.Situation.InputVersion, w2, 1, now)
+	call2.MaterialFactHash, call2.RetryEpoch = h, e2
+	if err := st.RecordAssessmentCall(context.Background(), c2, call2); err != nil {
+		t.Fatalf("record call 2: %v", err)
+	}
+	forceExpireLease(t, st, sitID, now.Add(-time.Second))
+
+	if _, err := st.RecoverInterruptedAssessmentCalls(context.Background(), now.Add(time.Minute)); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	row := readControllerBasis(t, st, sitID)
+	if !row.Hash.Valid || row.Hash.String != h || row.Epoch != 0 || row.Attempts != 2 {
+		t.Fatalf("post-recovery basis = (%v, epoch %d, attempts %d), want (%q, 0, 2) untouched", row.Hash, row.Epoch, row.Attempts, h)
+	}
+
+	c3 := claimSituation(t, st, sitID, "controller-b", now.Add(time.Minute))
+	e3, w3, err := st.BeginControllerAttempt(context.Background(), c3, h, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("BeginControllerAttempt (3): %v", err)
+	}
+	if w3 != 3 {
+		t.Fatalf("w3 = %d, want 3 (budget must continue, not reset)", w3)
+	}
+	call3 := callFixture(uuid.NewString(), sitID, c3.Situation.InputVersion, w3, 1, now)
+	call3.MaterialFactHash, call3.RetryEpoch = h, e3
+	if err := st.RecordAssessmentCall(context.Background(), c3, call3); err != nil {
+		t.Fatalf("record call 3: %v (UNIQUE collision — original bug reopened)", err)
+	}
+}
+
+// TestRecoverInterruptedAssessmentCallThenDriftedBasisTakesFreshEpoch is the
+// same crash as above but the post-restart cycle derives a DIFFERENT hash
+// (duration-class drift across the restart). Recovery selects nothing (the
+// crashed call's hash still matches the committed one), so the whole burden
+// falls on BeginControllerAttempt's own I1 epoch bump.
+func TestRecoverInterruptedAssessmentCallThenDriftedBasisTakesFreshEpoch(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-recover-same-hash-crash-drift", now)
+	h := "sha256:material-crash-drift"
+
+	c1 := claimSituation(t, st, sitID, "controller-a", now)
+	e1, w1 := beginAttemptThenCommitProjectionOnly(t, st, c1, h, now)
+	c1b := claimSituation(t, st, sitID, "controller-a", now)
+	call1 := callFixture(uuid.NewString(), sitID, c1b.Situation.InputVersion, w1, 1, now)
+	call1.MaterialFactHash, call1.RetryEpoch = h, e1
+	if err := st.RecordAssessmentCall(context.Background(), c1b, call1); err != nil {
+		t.Fatalf("record call 1: %v", err)
+	}
+	forceExpireLease(t, st, sitID, now.Add(-time.Second))
+
+	if _, err := st.RecoverInterruptedAssessmentCalls(context.Background(), now.Add(time.Minute)); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+
+	c2 := claimSituation(t, st, sitID, "controller-b", now.Add(time.Minute))
+	h2 := "sha256:material-crash-drift-drifted"
+	e2, w2, err := st.BeginControllerAttempt(context.Background(), c2, h2, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("BeginControllerAttempt (drifted): %v", err)
+	}
+	if e2 == e1 || w2 != 1 {
+		t.Fatalf("drifted cycle = (epoch %d, attempt %d), want (epoch != %d, 1)", e2, w2, e1)
+	}
+	call2 := callFixture(uuid.NewString(), sitID, c2.Situation.InputVersion, w2, 1, now)
+	call2.MaterialFactHash, call2.RetryEpoch = h2, e2
+	if err := st.RecordAssessmentCall(context.Background(), c2, call2); err != nil {
+		t.Fatalf("record call 2: %v (UNIQUE collision)", err)
+	}
+}
+
+// TestWakeDependencyRecoveredThenDriftedBasisDoubleEpochBumpIsHarmless: a
+// dependency wake (epoch+1, attempts reset) followed by a cycle whose basis
+// DRIFTED during the outage — both the wake and BeginControllerAttempt's I1
+// branch bump the epoch. Two bumps for one recovery are harmless: the
+// coordinate is fresh either way and the attempt budget starts at 1.
+func TestWakeDependencyRecoveredThenDriftedBasisDoubleEpochBumpIsHarmless(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-wake-drift", now)
+	h := "sha256:material-wake-drift"
+
+	c := claimSituation(t, st, sitID, "controller-a", now)
+	e1, w1 := beginAttemptThenCommitProjectionOnly(t, st, c, h, now)
+	cb := claimSituation(t, st, sitID, "controller-a", now)
+	call1 := callFixture(uuid.NewString(), sitID, cb.Situation.InputVersion, w1, 1, now)
+	call1.MaterialFactHash, call1.RetryEpoch = h, e1
+	if err := st.RecordAssessmentCall(context.Background(), cb, call1); err != nil {
+		t.Fatalf("record call 1: %v", err)
+	}
+	if err := st.ReleaseControllerWork(context.Background(), cb, now, nil, nil); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	parkSituationTx(t, st, sitID, situation.ParkedReasonDependency, 1, now)
+
+	if woken, err := st.WakeDependencyRecoveredSituations(context.Background(), 2, now.Add(time.Minute)); err != nil || woken != 1 {
+		t.Fatalf("wake = (%d, %v), want (1, nil)", woken, err)
+	}
+	if row := readControllerBasis(t, st, sitID); row.Epoch != 1 || row.Attempts != 0 {
+		t.Fatalf("after wake = (epoch %d, attempts %d), want (1, 0)", row.Epoch, row.Attempts)
+	}
+
+	c2 := claimSituation(t, st, sitID, "controller-b", now.Add(time.Minute))
+	h2 := "sha256:material-wake-drift-drifted"
+	e2, w2, err := st.BeginControllerAttempt(context.Background(), c2, h2, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("BeginControllerAttempt after wake: %v", err)
+	}
+	if e2 != 2 || w2 != 1 {
+		t.Fatalf("after wake+drift = (epoch %d, attempt %d), want (2, 1)", e2, w2)
+	}
+	call2 := callFixture(uuid.NewString(), sitID, c2.Situation.InputVersion, w2, 1, now)
+	call2.MaterialFactHash, call2.RetryEpoch = h2, e2
+	if err := st.RecordAssessmentCall(context.Background(), c2, call2); err != nil {
+		t.Fatalf("record call 2: %v", err)
+	}
+}
+
 func TestRecoverInterruptedAssessmentCallLeavesActivelyClaimedCallsUntouched(t *testing.T) {
 	st := newTestStore(t)
 	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
@@ -1619,8 +1773,10 @@ func TestControllerAttemptFirstCallStartsAtOne(t *testing.T) {
 // current_material_fact_hash and leaves the Situation immediately due again
 // (NextAssessmentAt=now) so the test's next round can reclaim it. Mirrors
 // how a real Reconcile cycle always pairs BeginControllerAttempt with
-// exactly one later CommitController call — see BeginControllerAttempt's
-// own doc comment on why current_material_fact_hash is read-only there.
+// exactly one later CommitController call — BeginControllerAttempt itself
+// only writes current_material_fact_hash when repairing a stranded
+// dispatch (see its doc comment), which never applies to these
+// commit-every-cycle tests.
 func beginAttemptThenCommitProjectionOnly(t *testing.T, st *Store, claim situation.Claim, materialFactHash string, now time.Time) (retryEpoch, workAttempt int) {
 	t.Helper()
 	retryEpoch, workAttempt, err := st.BeginControllerAttempt(context.Background(), claim, materialFactHash, now)
@@ -1682,6 +1838,302 @@ func TestControllerAttemptNewMaterialHashResetsToOne(t *testing.T) {
 	reclaim2 := claimSituation(t, st, sitID, "controller-c", now)
 	if _, workAttempt := beginAttemptThenCommitProjectionOnly(t, st, reclaim2, "sha256:material-b", now); workAttempt != 1 {
 		t.Fatalf("new-hash reset workAttempt = %d, want 1", workAttempt)
+	}
+}
+
+// ----------------------------------------------------------------------
+// BeginControllerAttempt — stranded-dispatch self-healing (no restart).
+//
+// RecoverInterruptedAssessmentCalls only runs at startup. A Situation whose
+// controller lease is lost MID-CYCLE with no process restart — a heartbeat
+// ExtendControllerLease failure cancels the in-flight Reconcile after
+// RecordAssessmentCall but before CommitController, or a stall outlives the
+// lease, or CommitController itself fails — leaves an immutable
+// situation_assessment_calls row that the projection never caught up to,
+// and the next claimant's BeginControllerAttempt used to recompute the
+// identical (retry_epoch, work_attempt, call_number) and collide. These
+// tests pin that BeginControllerAttempt now reconciles against the
+// dispatched-call ledger itself, under its own fenced claim, with no
+// recovery pass anywhere.
+// ----------------------------------------------------------------------
+
+// forceExpireLease rewinds situationID's lease_expires_at to at, simulating
+// the owning worker losing its lease (stall, heartbeat failure) without any
+// process restart — the ordinary expired-lease path of ClaimDueSituations
+// then lets a different worker claim it.
+func forceExpireLease(t *testing.T, st *Store, situationID string, at time.Time) {
+	t.Helper()
+	if _, err := st.db.ExecContext(context.Background(), `UPDATE situations SET lease_expires_at = ? WHERE id = ?`,
+		canonicalTime(at), situationID); err != nil {
+		t.Fatalf("force-expire lease for %s: %v", situationID, err)
+	}
+}
+
+// controllerBasisRow is the projection BeginControllerAttempt derives its
+// coordinates from, as readControllerBasis reads it.
+type controllerBasisRow struct {
+	Hash         sql.NullString
+	Epoch        int
+	Attempts     int
+	ParkedReason sql.NullString
+}
+
+func readControllerBasis(t *testing.T, st *Store, situationID string) controllerBasisRow {
+	t.Helper()
+	var r controllerBasisRow
+	if err := st.db.QueryRowContext(context.Background(), `
+		SELECT current_material_fact_hash, controller_retry_epoch, controller_work_attempts, controller_parked_reason
+		FROM situations WHERE id = ?`, situationID).Scan(&r.Hash, &r.Epoch, &r.Attempts, &r.ParkedReason); err != nil {
+		t.Fatalf("read controller basis for %s: %v", situationID, err)
+	}
+	return r
+}
+
+// strandDispatch runs worker A's cycle up to and including its durable
+// dispatch at materialFactHash, then loses A's lease without a restart:
+// BeginControllerAttempt + RecordAssessmentCall, then the lease is forced
+// expired. Returns the stranded call's coordinates.
+func strandDispatch(t *testing.T, st *Store, situationID, materialFactHash string, now time.Time) (retryEpoch, workAttempt int) {
+	t.Helper()
+	a := claimSituation(t, st, situationID, "controller-a", now)
+	retryEpoch, workAttempt, err := st.BeginControllerAttempt(context.Background(), a, materialFactHash, now)
+	if err != nil {
+		t.Fatalf("BeginControllerAttempt (stranded cycle): %v", err)
+	}
+	call := callFixture(uuid.NewString(), situationID, a.Situation.InputVersion, workAttempt, 1, now)
+	call.MaterialFactHash, call.RetryEpoch = materialFactHash, retryEpoch
+	if err := st.RecordAssessmentCall(context.Background(), a, call); err != nil {
+		t.Fatalf("record stranded call: %v", err)
+	}
+	forceExpireLease(t, st, situationID, now.Add(-time.Second))
+	return retryEpoch, workAttempt
+}
+
+func TestControllerAttemptHealsStrandedDispatchWithoutRestart(t *testing.T) {
+	const committedHash = "sha256:material-committed"
+	const strandedHash = "sha256:material-stranded"
+	const driftedHash = "sha256:material-drifted"
+
+	cases := []struct {
+		name string
+		// commitFirst runs one full committed cycle at committedHash before
+		// the stranded cycle, so the stranded dispatch is a basis
+		// TRANSITION (its BeginControllerAttempt already took a fresh
+		// epoch) rather than the Situation's first-ever dispatch (NULL
+		// current_material_fact_hash).
+		commitFirst bool
+		hashB       string
+		wantEpoch   int
+		wantAttempt int
+	}{
+		// The exact no-restart collision: first-ever dispatch stranded at
+		// (0, 1, 1) with the projection hash still NULL; worker B derives
+		// the same basis and must CONTINUE that budget at attempt 2 — the
+		// stranded slot is consumed, never refunded, never collided with.
+		{name: "first dispatch, same basis", hashB: strandedHash, wantEpoch: 0, wantAttempt: 2},
+		// Same stranding, but the basis drifted before B ran: a fresh epoch
+		// (the same I1 rule any committed-basis transition takes).
+		{name: "first dispatch, drifted basis", hashB: driftedHash, wantEpoch: 1, wantAttempt: 1},
+		// Stranded cycle was itself a basis transition (epoch 1, attempt 1)
+		// after a committed cycle at committedHash; projection still says
+		// committedHash. B at the stranded basis continues at (1, 2).
+		{name: "after commit, same stranded basis", commitFirst: true, hashB: strandedHash, wantEpoch: 1, wantAttempt: 2},
+		// ...and B at yet another basis takes epoch 2.
+		{name: "after commit, drifted again", commitFirst: true, hashB: driftedHash, wantEpoch: 2, wantAttempt: 1},
+		// ...and B flipping back to the OLD committed basis must not be
+		// fooled by the stale projection hash matching it: the ledger says
+		// the most recent dispatch was at strandedHash, so this is a
+		// transition too, never a silent continuation at (0, 2).
+		{name: "after commit, flip back to committed basis", commitFirst: true, hashB: committedHash, wantEpoch: 2, wantAttempt: 1},
+	}
+
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newTestStore(t)
+			now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+			sitID := newSituationForGroup(t, st, fmt.Sprintf("group-heal-stranded-%d", i), now)
+
+			if tc.commitFirst {
+				c := claimSituation(t, st, sitID, "controller-a", now)
+				e, w := beginAttemptThenCommitProjectionOnly(t, st, c, committedHash, now)
+				if e != 0 || w != 1 {
+					t.Fatalf("committed cycle = (epoch %d, attempt %d), want (0, 1)", e, w)
+				}
+			}
+			strandedEpoch, strandedAttempt := strandDispatch(t, st, sitID, strandedHash, now)
+			wantStranded := [2]int{0, 1}
+			if tc.commitFirst {
+				wantStranded = [2]int{1, 1}
+			}
+			if strandedEpoch != wantStranded[0] || strandedAttempt != wantStranded[1] {
+				t.Fatalf("stranded dispatch = (epoch %d, attempt %d), want %v", strandedEpoch, strandedAttempt, wantStranded)
+			}
+
+			// Worker B claims via the ordinary expired-lease path. NO
+			// RecoverInterruptedAssessmentCalls call anywhere in this test.
+			b := claimSituation(t, st, sitID, "controller-b", now.Add(time.Second))
+			gotEpoch, gotAttempt, err := st.BeginControllerAttempt(context.Background(), b, tc.hashB, now.Add(time.Second))
+			if err != nil {
+				t.Fatalf("BeginControllerAttempt (B): %v", err)
+			}
+			if gotEpoch != tc.wantEpoch || gotAttempt != tc.wantAttempt {
+				t.Fatalf("B = (epoch %d, attempt %d), want (%d, %d)", gotEpoch, gotAttempt, tc.wantEpoch, tc.wantAttempt)
+			}
+
+			callB := callFixture(uuid.NewString(), sitID, b.Situation.InputVersion, gotAttempt, 1, now.Add(time.Second))
+			callB.MaterialFactHash, callB.RetryEpoch = tc.hashB, gotEpoch
+			if err := st.RecordAssessmentCall(context.Background(), b, callB); err != nil {
+				t.Fatalf("record call B at (%d, %d, 1): %v (UNIQUE-index collision with the stranded dispatch)", gotEpoch, gotAttempt, err)
+			}
+
+			// The projection was repaired to the stranded call's own basis
+			// (what its cycle's CommitController would have written) before
+			// B's coordinate was minted, so a later cycle sees a consistent
+			// row. Note the repair records the STRANDED basis, not hashB —
+			// hashB becomes current only when B's own cycle commits.
+			row := readControllerBasis(t, st, sitID)
+			if !row.Hash.Valid || row.Hash.String != strandedHash {
+				t.Fatalf("current_material_fact_hash after B's begin = %v, want %q", row.Hash, strandedHash)
+			}
+			if row.Epoch != tc.wantEpoch || row.Attempts != tc.wantAttempt {
+				t.Fatalf("persisted (epoch %d, attempts %d), want (%d, %d)", row.Epoch, row.Attempts, tc.wantEpoch, tc.wantAttempt)
+			}
+		})
+	}
+}
+
+// A policy park recorded against an OLDER basis is provably stale once a
+// later dispatch happened at a different basis (controllerParkBlocksDispatch
+// would otherwise have blocked that dispatch). Repairing the projection hash
+// to the stranded call's basis WITHOUT also clearing that park would make it
+// look freshly applicable to the new basis — the same Finding I1 regression
+// advanceControllerBasisForRecoveryTx guards against, now at the live
+// BeginControllerAttempt boundary. Mirrors
+// TestRecoverInterruptedAssessmentCallClearsStalePolicyParkOnBasisAdvance
+// with no recovery pass.
+func TestControllerAttemptHealingStrandedDispatchClearsStalePolicyPark(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-heal-stranded-clears-park", now)
+
+	oldHash := "sha256:parked-basis"
+	if _, err := st.db.ExecContext(context.Background(), `
+		UPDATE situations SET controller_parked_at = ?, controller_parked_reason = ?, current_material_fact_hash = ?
+		WHERE id = ?`, canonicalTime(now), situation.ParkedReasonPolicyRejected, oldHash, sitID); err != nil {
+		t.Fatalf("seed stale park: %v", err)
+	}
+
+	newHash := "sha256:material-" + sitID
+	if e, w := strandDispatch(t, st, sitID, newHash, now); e != 1 || w != 1 {
+		t.Fatalf("stranded dispatch = (epoch %d, attempt %d), want (1, 1)", e, w)
+	}
+
+	b := claimSituation(t, st, sitID, "controller-b", now.Add(time.Second))
+	epoch, attempt, err := st.BeginControllerAttempt(context.Background(), b, newHash, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("BeginControllerAttempt (B): %v", err)
+	}
+	if epoch != 1 || attempt != 2 {
+		t.Fatalf("B = (epoch %d, attempt %d), want (1, 2)", epoch, attempt)
+	}
+
+	row := readControllerBasis(t, st, sitID)
+	if !row.Hash.Valid || row.Hash.String != newHash {
+		t.Fatalf("current_material_fact_hash = %v, want %q", row.Hash, newHash)
+	}
+	if row.ParkedReason.Valid {
+		t.Fatalf("controller_parked_reason = %q, want cleared (stale park must not be re-armed against the repaired basis)", row.ParkedReason.String)
+	}
+	var parkedAt sql.NullString
+	if err := st.db.QueryRowContext(context.Background(), `SELECT controller_parked_at FROM situations WHERE id = ?`, sitID).Scan(&parkedAt); err != nil {
+		t.Fatal(err)
+	}
+	if parkedAt.Valid {
+		t.Fatalf("controller_parked_at = %q, want cleared", parkedAt.String)
+	}
+}
+
+// The ledger reconciliation is scoped to the claim's own input_version: the
+// UNIQUE index includes input_version, so a stranded dispatch at an older
+// version can never collide with a new version's coordinates, and the new
+// input's attempt budget must start fresh rather than inherit the old
+// version's stranded slot.
+func TestControllerAttemptStrandedDispatchAtOlderInputVersionDoesNotBleedIntoNewOne(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	const group = "group-heal-stranded-old-version"
+	sitID := newSituationForGroup(t, st, group, now)
+	h := "sha256:material-" + sitID
+
+	if e, w := strandDispatch(t, st, sitID, h, now); e != 0 || w != 1 {
+		t.Fatalf("stranded dispatch = (epoch %d, attempt %d), want (0, 1)", e, w)
+	}
+	// A new material input lands (input_version 1 -> 2) before anyone
+	// reclaims the Situation.
+	newSituationForGroupSecondMember(t, st, group, now)
+
+	b := claimSituation(t, st, sitID, "controller-b", now.Add(2*time.Minute))
+	if b.Situation.InputVersion != 2 {
+		t.Fatalf("input_version = %d, want 2", b.Situation.InputVersion)
+	}
+	epoch, attempt, err := st.BeginControllerAttempt(context.Background(), b, h, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("BeginControllerAttempt (B, v2): %v", err)
+	}
+	if epoch != 0 || attempt != 1 {
+		t.Fatalf("B at v2 = (epoch %d, attempt %d), want (0, 1) (fresh budget for the new input; the v1 stranded slot is not in this version's coordinate space)", epoch, attempt)
+	}
+	callB := callFixture(uuid.NewString(), sitID, 2, attempt, 1, now.Add(2*time.Minute))
+	callB.MaterialFactHash, callB.RetryEpoch = h, epoch
+	if err := st.RecordAssessmentCall(context.Background(), b, callB); err != nil {
+		t.Fatalf("record call B at v2: %v", err)
+	}
+	if row := readControllerBasis(t, st, sitID); row.Hash.Valid {
+		t.Fatalf("current_material_fact_hash = %q, want still NULL (no cross-version repair)", row.Hash.String)
+	}
+}
+
+// A freshly-woken dependency-parked Situation (work_attempts reset to 0,
+// epoch bumped, current_material_fact_hash untouched) is NOT a stranded
+// dispatch: its most recent call's basis equals the projection hash, so
+// BeginControllerAttempt's ledger check selects nothing and the wake's fresh
+// budget stands — the live-path counterpart of Finding C1's regression test
+// for the startup recovery pass.
+func TestControllerAttemptDoesNotReExhaustFreshlyWokenSituation(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-heal-not-woken", now)
+	h := "sha256:material-" + sitID
+
+	c := claimSituation(t, st, sitID, "controller-a", now)
+	e1, w1, err := st.BeginControllerAttempt(context.Background(), c, h, now)
+	if err != nil {
+		t.Fatalf("BeginControllerAttempt (1): %v", err)
+	}
+	call := callFixture(uuid.NewString(), sitID, c.Situation.InputVersion, w1, 1, now)
+	call.MaterialFactHash, call.RetryEpoch = h, e1
+	if err := st.RecordAssessmentCall(context.Background(), c, call); err != nil {
+		t.Fatalf("record call 1: %v", err)
+	}
+	commit := situation.ControllerCommit{
+		MaterialFactHash: h, Lifecycle: situationmodel.LifecycleActive, Attention: situationmodel.AttentionObserve,
+		NextAssessmentAt: now,
+	}
+	if err := st.CommitController(context.Background(), c, commit); err != nil {
+		t.Fatalf("commit cycle 1: %v", err)
+	}
+	parkSituationTx(t, st, sitID, situation.ParkedReasonDependency, 1, now)
+	if woken, err := st.WakeDependencyRecoveredSituations(context.Background(), 2, now.Add(time.Minute)); err != nil || woken != 1 {
+		t.Fatalf("wake = (%d, %v), want (1, nil)", woken, err)
+	}
+
+	b := claimSituation(t, st, sitID, "controller-b", now.Add(time.Minute))
+	epoch, attempt, err := st.BeginControllerAttempt(context.Background(), b, h, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("BeginControllerAttempt after wake: %v", err)
+	}
+	if epoch != 1 || attempt != 1 {
+		t.Fatalf("after wake = (epoch %d, attempt %d), want (1, 1) (the wake's fresh budget, not re-exhausted from the old call)", epoch, attempt)
 	}
 }
 

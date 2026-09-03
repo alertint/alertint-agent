@@ -969,6 +969,14 @@ func insertAssessmentAttemptTx(ctx context.Context, tx *sql.Tx, p preparedAttemp
 // dispatched under a claim that is still actively held (fresh, unexpired
 // lease) is correctly left untouched, and calling this while a live
 // controller holds such a lease could, in principle, race with it.
+//
+// Because it is startup-only, it is NOT what protects a Situation whose
+// lease is lost mid-cycle with no restart (heartbeat failure, stall,
+// CommitController error): the projection catch-up for that case runs
+// inside BeginControllerAttempt itself, fenced per claim — see its doc
+// comment ("Stranded-dispatch self-healing"). The basis catch-up here is
+// therefore defense in depth at startup; the orphaned-outcome half (the
+// process_interrupted attempt rows) remains this primitive's alone.
 func (s *Store) RecoverInterruptedAssessmentCalls(ctx context.Context, now time.Time) (int, error) {
 	now = now.UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1206,16 +1214,16 @@ func loadStaleControllerBasisTx(ctx context.Context, tx *sql.Tx, now time.Time) 
 //     fresh one" — reusing the SAME mechanism for both, rather than
 //     inventing a second one, is a deliberate choice, not scope creep.
 //
-// Writing current_material_fact_hash here — normally the exclusive province
-// of CommitController's own fenced commit (BeginControllerAttempt's doc
-// comment: "last set by a prior fenced CommitController commit, never
-// written here" — a statement about BeginControllerAttempt itself, not a
-// whole-file rule) — and controller_retry_epoch (normally only the wake
-// primitive's) is safe specifically because this is a startup-only recovery
-// primitive that runs before any worker resumes live controller work
-// (RecoverInterruptedAssessmentCalls' own doc comment): nothing holds a
-// live claim on this Situation, so nothing else can be concurrently
-// advancing either column.
+// Writing current_material_fact_hash here — normally the province of
+// CommitController's own fenced commit, and of BeginControllerAttempt's own
+// fenced stranded-dispatch repair (the live-path twin of this write: same
+// three columns, same reasoning, scoped to the one claimed Situation) — and
+// controller_retry_epoch (normally only the wake primitive's and
+// BeginControllerAttempt's) is safe specifically because this is a
+// startup-only recovery primitive that runs before any worker resumes live
+// controller work (RecoverInterruptedAssessmentCalls' own doc comment):
+// nothing holds a live claim on this Situation, so nothing else can be
+// concurrently advancing either column.
 //
 // Readers of current_material_fact_hash, and why this write does not break
 // either of them:
@@ -1357,9 +1365,9 @@ func mergeSituationDueReasonTx(ctx context.Context, tx *sql.Tx, situationID stri
 // current_material_fact_hash (normally last set by a prior fenced
 // CommitController commit; also written by advanceControllerBasisForRecoveryTx,
 // under RecoverInterruptedAssessmentCalls' own distinct startup-only
-// recovery contract — see that function's doc comment for why that write is
-// safe): unchanged means this is a continuation of the same input's attempt
-// budget (work_attempts+1, fenced at 5); changed means a fresh epoch
+// recovery contract, and by this method's own stranded-dispatch repair —
+// see below): unchanged means this is a continuation of the same input's
+// attempt budget (work_attempts+1, fenced at 5); changed means a fresh epoch
 // (work_attempts resets to 1) — this covers BOTH "a genuinely new material
 // input arrived" and "a dependency-recovery generation already reset
 // controller_work_attempts to 0 for this situation" (see the
@@ -1367,6 +1375,40 @@ func mergeSituationDueReasonTx(ctx context.Context, tx *sql.Tx, situationID stri
 // current_material_fact_hash still reads as unchanged from THIS input's own
 // perspective, controller_work_attempts reads 0, and 0+1=1 naturally starts
 // a fresh attempt count.
+//
+// Stranded-dispatch self-healing (Task 10, residual lease-loss window): the
+// projection columns above are a cache of what the last CommitController
+// wrote, and a cycle can durably dispatch (RecordAssessmentCall) yet never
+// reach CommitController WITHOUT any process restart — the worker's own
+// heartbeat fails to extend the lease and cancels the in-flight Reconcile
+// (controller_worker.go's heartbeatLoop; any ExtendControllerLease error,
+// not only a lost fence), a stall outlives the lease, or CommitController
+// itself errors. The lease then expires and ClaimControllerWork's ordinary
+// expired-lease path hands the Situation to another claimant, with no
+// RecoverInterruptedAssessmentCalls pass in between (that primitive is
+// startup-only by contract). Reading the projection alone, this method
+// would recompute the stranded call's own (retry_epoch, work_attempt) and
+// the next RecordAssessmentCall would collide on situation_assessment_calls'
+// UNIQUE index. So before minting a coordinate, this method consults the
+// ledger itself (latestDispatchedCallBasisTx — this input_version's
+// most-recently-dispatched call): if current_material_fact_hash is NULL or
+// differs from that call's own material_fact_hash, its cycle never
+// committed, and the projection is repaired in this same fenced
+// transaction to exactly what that commit would have written
+// (current_material_fact_hash = the call's basis, controller_work_attempts =
+// the call's work_attempt, any park cleared — the same three writes as
+// advanceControllerBasisForRecoveryTx, for the same reasons) before the
+// sameBasis branches run. A same-basis claimant therefore continues the
+// stranded budget at work_attempt+1; a drifted-basis claimant takes the
+// ordinary I1 fresh epoch. This is safe to run concurrently with live
+// controller work precisely because it is scoped to the ONE Situation this
+// claim fences (verifyClaimTx above): the previous holder's lease is gone,
+// so its own BeginControllerAttempt/RecordAssessmentCall/CommitController
+// writes are all fenced out (its unfenced AppendAssessmentOutcome may still
+// land, but that touches only situation_assessment_attempts). The
+// startup-only recovery pass remains as-is for the orphaned-outcome half of
+// its job; its basis catch-up is now defense in depth, never the only
+// writer standing between a stranded dispatch and a collision.
 //
 // controller_retry_epoch (Task 10 fix round 3, Finding I1): BeginControllerAttempt
 // now ALSO advances this, in the SAME transaction as controller_work_attempts,
@@ -1438,6 +1480,23 @@ func (s *Store) BeginControllerAttempt(ctx context.Context, claim situation.Clai
 		return 0, 0, fmt.Errorf("store: read controller attempt counters: %w", err)
 	}
 
+	// Stranded-dispatch self-healing (see the doc comment above): if this
+	// input_version's most-recently-dispatched call was minted against a
+	// basis the projection never caught up to, that call's owning cycle
+	// never reached CommitController — repair the projection to exactly what
+	// that commit would have written (its basis and its already-consumed
+	// work_attempt) before minting a coordinate, so the branches below can
+	// never recompute the stranded call's own (retry_epoch, work_attempt).
+	latest, dispatched, err := latestDispatchedCallBasisTx(ctx, tx, claim.Situation.ID, claim.Situation.InputVersion)
+	if err != nil {
+		return 0, 0, err
+	}
+	repairStrandedBasis := dispatched && (!currentHash.Valid || currentHash.String != latest.MaterialFactHash)
+	if repairStrandedBasis {
+		currentHash = sql.NullString{String: latest.MaterialFactHash, Valid: true}
+		workAttempts = latest.WorkAttempt
+	}
+
 	nextAttempt := 1
 	nextEpoch := retryEpoch
 	if currentHash.Valid && currentHash.String == materialFactHash {
@@ -1455,6 +1514,20 @@ func (s *Store) BeginControllerAttempt(ctx context.Context, claim situation.Clai
 		return 0, 0, situation.ErrControllerAttemptsExhausted
 	}
 
+	if repairStrandedBasis {
+		// Persist the repaired basis, and clear any park: a park still on
+		// this row was recorded against an OLDER basis than the stranded
+		// dispatch (controllerParkBlocksDispatch would otherwise have blocked
+		// that dispatch), so it is provably stale — leaving it in place next
+		// to the repaired hash would make it look freshly applicable
+		// (Finding I1). Same reasoning as advanceControllerBasisForRecoveryTx.
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE situations SET current_material_fact_hash = ?,
+				controller_parked_at = NULL, controller_parked_reason = NULL
+			WHERE id = ?`, latest.MaterialFactHash, claim.Situation.ID); err != nil {
+			return 0, 0, fmt.Errorf("store: repair stranded controller basis: %w", err)
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE situations SET controller_work_attempts = ?, controller_retry_epoch = ?, updated_at = ? WHERE id = ?`,
 		nextAttempt, nextEpoch, canonicalTime(now), claim.Situation.ID); err != nil {
@@ -1464,6 +1537,35 @@ func (s *Store) BeginControllerAttempt(ctx context.Context, claim situation.Clai
 		return 0, 0, fmt.Errorf("store: commit begin controller attempt: %w", err)
 	}
 	return nextEpoch, nextAttempt, nil
+}
+
+// latestDispatchedCallBasisTx returns situationID's most-recently-dispatched
+// situation_assessment_calls row at inputVersion (its own material_fact_hash
+// and work_attempt) and true, or the zero value and false when this
+// input_version has no dispatch yet. It is the per-Situation,
+// input_version-scoped counterpart of
+// loadStaleControllerBasisTx's "most recent call" subquery (same ordering),
+// used by BeginControllerAttempt's stranded-dispatch self-healing. The
+// input_version scope is deliberate: the UNIQUE index this repair protects
+// includes input_version, so a stranded call at an older version can never
+// collide with a newer version's coordinates, and a new input's attempt
+// budget must start fresh rather than inherit the old version's stranded
+// slot.
+func latestDispatchedCallBasisTx(ctx context.Context, tx *sql.Tx, situationID string, inputVersion int) (staleControllerBasis, bool, error) {
+	var b staleControllerBasis
+	err := tx.QueryRowContext(ctx, `
+		SELECT situation_id, material_fact_hash, work_attempt
+		FROM situation_assessment_calls
+		WHERE situation_id = ? AND input_version = ?
+		ORDER BY dispatched_at DESC, work_attempt DESC, call_number DESC, id DESC
+		LIMIT 1`, situationID, inputVersion).Scan(&b.SituationID, &b.MaterialFactHash, &b.WorkAttempt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return staleControllerBasis{}, false, nil
+	}
+	if err != nil {
+		return staleControllerBasis{}, false, fmt.Errorf("store: read latest dispatched assessment call: %w", err)
+	}
+	return b, true, nil
 }
 
 // ----------------------------------------------------------------------

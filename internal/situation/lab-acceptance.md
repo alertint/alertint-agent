@@ -111,6 +111,25 @@ run against the lab tenant:
 
 ## Notes
 
+- Check 8 (stale-claim rejection) covers a lease that changes hands
+  *between* cycles. The harder variant — a lease lost *mid-cycle* with no
+  process restart (heartbeat `ExtendControllerLease` failure cancelling the
+  in-flight reconcile after the L2 dispatch row is durable but before
+  `CommitController`; a stall outliving the 300s lease; a `CommitController`
+  error) used to let the next claimant re-mint the stranded call's own
+  `(retry_epoch, work_attempt, call_number)` and collide on
+  `situation_assessment_calls`' UNIQUE index, wasting one cycle on a
+  `deterministic_fallback` Assessment, because `RecoverInterruptedAssessmentCalls`
+  is startup-only and never ran. `BeginControllerAttempt` now reconciles
+  against the dispatched-call ledger inside its own fenced claim
+  transaction, so this needs no restart and no lab step: it is pinned by
+  `TestControllerAttemptHealsStrandedDispatchWithoutRestart` and its
+  siblings in `internal/store/situation_controller_test.go`, which drive
+  the exact worker-A-dispatch / lease-expired / worker-B-claim sequence
+  against the real schema. Known, accepted edge: a stranded *fifth* attempt
+  leaves the Situation exhausted for that basis with no park marker until
+  the basis changes — identical to what the startup recovery pass already
+  produces for the same crash, not a new behaviour.
 - `notify.slack.enabled` must read `false` and stdout must read enabled in
   the lab config before any of the above is exercised — verified by the
   lab-deployment step before firing anything, and re-confirmed by "exactly
