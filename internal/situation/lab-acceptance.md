@@ -40,9 +40,20 @@ own — which in the longest duration class never happens. The ruling was to
 park on exhaustion: the controller's exhausted branch now records a
 dependency park when none is on record, so the existing recovery wake
 re-arms it once the dependency is healthy again
-(`TestControllerReconcileExhaustedWithoutParkParksAsDependency`). The fix
-is on this branch but has not yet been exercised on the lab; that is the
-fourth run.
+(`TestControllerReconcileExhaustedWithoutParkParksAsDependency`). The
+fourth run shipped the fix and repeated the forced restart, but the killed
+drain-time dispatch happened to be the fourth attempt of its epoch rather
+than the fifth, so the remaining attempt succeeded after the restart and
+the new park path never ran. It stands on its unit test until a run with a
+deterministic trigger (kill the process the instant a fifth attempt is
+dispatched under an unreachable LLM) exercises it.
+
+The fourth run also surfaced an older, unrelated defect: a Situation built
+on one long-firing alert (days old, cadence slow, its only wake reason the
+lifecycle observation deadline) recomputes its next assessment as one
+second ahead every cycle and so reuses its assessment every two seconds
+without end, appending an attempt row each time. It makes no model calls,
+but the row growth is unbounded. Root cause and fix are still open.
 
 Do not fill in a cell with a guess, an extrapolation from the local replay
 run, or a number that cannot be independently re-verified from the lab
