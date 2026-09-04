@@ -136,9 +136,14 @@ tasks:
       - go run ./docs/scripts
 
   release:
-    desc: "Cut a release end to end — roll CHANGELOG, confirm, commit to main, tag, push — e.g. `task release -- 0.7.0` (see RELEASING.md)"
+    desc: "Release the app and chart — e.g. `task release -- 0.14.0 --chart 0.2.0` (see RELEASING.md)"
     cmds:
       - ./scripts/release.sh {{.CLI_ARGS}}
+
+  release:chart:
+    desc: "Release only the chart, preserving appVersion — e.g. `task release:chart -- 0.2.1` (see RELEASING.md)"
+    cmds:
+      - ./scripts/release-chart.sh {{.CLI_ARGS}}
 
   release:prep:
     desc: "Roll CHANGELOG [Unreleased] into a version section before tagging, e.g. `task release:prep VERSION=0.7.0` (see RELEASING.md)"
@@ -149,6 +154,17 @@ tasks:
     desc: "Preview the release body for a version from CHANGELOG.md, e.g. `task release:notes VERSION=0.6.0`"
     cmds:
       - ./scripts/release-notes.sh "{{.VERSION}}"
+
+  release:chart:prep:
+    desc: "Roll chart metadata, e.g. `task release:chart:prep VERSION=0.2.1`"
+    cmds:
+      - ./scripts/chart-release-prep.sh "{{.VERSION}}"
+
+  release:test:
+    desc: Test release metadata and Git orchestration scripts
+    cmds:
+      - bash scripts/tests/release-scripts-test.sh
+      - go test ./scripts/tests
 
   tidy:
     desc: Run go mod tidy
