@@ -75,14 +75,6 @@ type OccurrenceNotifier interface {
 	OnOccurrenceAttached(ctx context.Context, ev notify.RecurrenceEvent) error
 }
 
-// Rejudger runs a fresh triage that replaces an incident's finding in place when
-// an escalation trigger or the Clock B ceiling fires. Implemented by the triage
-// skill and wired in U4 — nil means an escalation records its occurrence and
-// trigger but no re-judgment runs yet.
-type Rejudger interface {
-	Rejudge(ctx context.Context, inc store.Incident, trigger string) error
-}
-
 // TriageFailureNotifier receives one event when an incident's triage has
 // exhausted its retry schedule and the incident was marked "failed". nil
 // disables it.
@@ -151,7 +143,6 @@ type Correlator struct {
 	sink               IncidentSink
 	resolutionNotifier ResolutionNotifier
 	occNotifier        OccurrenceNotifier
-	rejudger           Rejudger
 	triageNotifier     TriageFailureNotifier
 	auditor            Auditor
 	logger             *slog.Logger
@@ -206,9 +197,6 @@ func (c *Correlator) SetResolutionNotifier(rn ResolutionNotifier) {
 
 // SetOccurrenceNotifier sets the collapse notifier (U5). Call after New, before Start.
 func (c *Correlator) SetOccurrenceNotifier(n OccurrenceNotifier) { c.occNotifier = n }
-
-// SetRejudger sets the re-judgment runner (U4). Call after New, before Start.
-func (c *Correlator) SetRejudger(r Rejudger) { c.rejudger = r }
 
 // SetTriageFailureNotifier sets the notifier for triage-exhausted events. Call
 // after New, before Start.
@@ -352,7 +340,7 @@ func (c *Correlator) handleAlert(ctx context.Context, a store.Alert) error {
 	// Recurrence collapse (M1): a firing re-fire with no open window may attach
 	// to an already-judged incident as an occurrence instead of minting a new
 	// incident + LLM call. This is a firing-side mirror of the resolved branch
-	// above. Loop-serialization invariant: re-judgment runs inline on this
+	// above. Loop-serialization invariant: attaches are applied inline on this
 	// goroutine, so attaches arriving mid-flight queue in alertCh behind it —
 	// that gives R7's single-flight and the no-double-mint property for free. A
 	// future async refactor reopens the mid-flight double-mint race.
@@ -874,10 +862,10 @@ func (c *Correlator) planDeliveryRecurrence(ctx context.Context, a store.Alert, 
 
 // applyRecurrenceDeliveryPlan converts planDeliveryRecurrence's verdict into
 // one durable commit. A newly inserted occurrence fires the (post-commit)
-// occurrence notifier; re-judgment is deliberately not invoked here — an LLM
-// call has no place inside (or synchronously after) a durable dispatch
-// commit, and the Situation controller (a later task) is what acts on a
-// "membership_changed" input's trigger going forward.
+// occurrence notifier; no re-judgment exists in this package — an LLM call
+// has no place inside (or synchronously after) a durable dispatch commit,
+// and the Situation controller is what acts on a "membership_changed"
+// input's trigger.
 func (c *Correlator) applyRecurrenceDeliveryPlan(ctx context.Context, claim store.AlertDispatch, a store.Alert, gk string) (bool, error) {
 	plan, ok := c.planDeliveryRecurrence(ctx, a, gk)
 	if !ok {

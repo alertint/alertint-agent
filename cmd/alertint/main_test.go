@@ -4,6 +4,10 @@ package main
 
 import (
 	"bytes"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -19,11 +23,19 @@ import (
 
 // TestProductionCorrelatorHasNoAcuteTriageDispatchDependency proves the
 // Correlator production wires carries no analyzer/LLM dispatch dependency
-// at all: the one IncidentSink runServe hands correlator.New is the no-op
-// sink, never a Skill-backed wrapper. The Correlator's own constructor and
-// Config carry no LLM client field of their own, so the sink is the
-// complete proof surface. Acute Triage dispatch belongs exclusively to the
-// Triage worker polling the gated incident_triage schedule.
+// at all, on two surfaces:
+//
+//  1. Wiring: the one IncidentSink runServe hands correlator.New is the
+//     no-op sink, never a Skill-backed wrapper, and the Correlator exposes
+//     no other seam (no Rejudger/SetRejudger — removed with Plan 2 Task 7)
+//     through which a Skill could be handed in.
+//  2. Structure: no non-test source file of internal/correlator imports
+//     internal/llm, internal/llmhealth, or any skills/* package, so the
+//     package cannot dispatch a model call even if a future seam were
+//     added by mistake.
+//
+// Acute Triage dispatch belongs exclusively to the Triage worker polling
+// the gated incident_triage schedule.
 func TestProductionCorrelatorHasNoAcuteTriageDispatchDependency(t *testing.T) {
 	sink := productionIncidentSink()
 	if _, ok := sink.(correlator.NopIncidentSink); !ok {
@@ -31,6 +43,54 @@ func TestProductionCorrelatorHasNoAcuteTriageDispatchDependency(t *testing.T) {
 	}
 	if reflect.TypeOf(sink).NumField() != 0 {
 		t.Fatalf("production IncidentSink %T carries %d fields, want 0 — it must hold no Skill, client, or store", sink, reflect.TypeOf(sink).NumField())
+	}
+	corType := reflect.TypeOf(correlator.Correlator{})
+	for i := 0; i < corType.NumField(); i++ {
+		f := corType.Field(i)
+		if strings.Contains(strings.ToLower(f.Name), "rejudg") || strings.Contains(f.Type.String(), "Rejudger") {
+			t.Fatalf("correlator.Correlator carries field %s %s — a re-judgment seam is an analyzer/LLM dispatch dependency the Correlator must not own", f.Name, f.Type)
+		}
+	}
+	if _, ok := corType.MethodByName("SetRejudger"); ok {
+		t.Fatal("correlator.Correlator has SetRejudger — a re-judgment seam is an analyzer/LLM dispatch dependency the Correlator must not own")
+	}
+	if _, ok := reflect.PointerTo(corType).MethodByName("SetRejudger"); ok {
+		t.Fatal("*correlator.Correlator has SetRejudger — a re-judgment seam is an analyzer/LLM dispatch dependency the Correlator must not own")
+	}
+
+	forbidden := []string{
+		"github.com/alertint/alertint-agent/internal/llm",
+		"github.com/alertint/alertint-agent/internal/llmhealth",
+		"github.com/alertint/alertint-agent/skills/",
+	}
+	dir := filepath.Join("..", "..", "internal", "correlator")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read %s: %v", dir, err)
+	}
+	fset := token.NewFileSet()
+	checked := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, parser.ImportsOnly)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		checked++
+		for _, imp := range f.Imports {
+			path := strings.Trim(imp.Path.Value, `"`)
+			for _, bad := range forbidden {
+				if strings.HasPrefix(path, bad) {
+					t.Errorf("internal/correlator/%s imports %s — the Correlator must carry no analyzer/LLM dispatch dependency", name, path)
+				}
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no non-test Go files found under internal/correlator — the structural check ran against nothing")
 	}
 }
 

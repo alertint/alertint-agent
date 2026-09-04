@@ -379,15 +379,16 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 	cor := correlator.New(corCfg, st, productionIncidentSink(), logger)
 
-	// SetRejudger/SetTriageFailureNotifier are safe to wire here, before
-	// reconstruction: neither is reachable from ApplyDelivery's
-	// durable-dispatch path (Rejudge is deliberately never called
-	// synchronously from a delivery commit, and the triage-exhausted
-	// notifier fires only from the correlator's own internal ticker loop,
-	// which isn't running during reconstruction). SetAuditor,
-	// SetResolutionNotifier, and SetOccurrenceNotifier are NOT wired here —
-	// all three ARE reachable from ApplyDelivery — see startCorrelator below.
-	cor.SetRejudger(skill)
+	// SetTriageFailureNotifier is safe to wire here, before reconstruction:
+	// it is not reachable from ApplyDelivery's durable-dispatch path (the
+	// triage-exhausted notifier fires only from the correlator's own
+	// internal ticker loop, which isn't running during reconstruction).
+	// The Correlator has no analyzer/LLM seam at all — no IncidentSink
+	// beyond the no-op one and no re-judgment runner (Plan 2 Task 7) —
+	// see TestProductionCorrelatorHasNoAcuteTriageDispatchDependency.
+	// SetAuditor, SetResolutionNotifier, and SetOccurrenceNotifier are NOT
+	// wired here — all three ARE reachable from ApplyDelivery — see
+	// startCorrelator below.
 	cor.SetTriageFailureNotifier(notifier)
 
 	// stopCorrelator is called exactly once, however runServe exits: inline,

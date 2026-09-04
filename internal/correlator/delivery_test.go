@@ -315,10 +315,8 @@ func TestApplyDelivery_RecurrenceCollapseAttachesOccurrenceAndNotifies(t *testin
 	st := openStore(t)
 	c := New(Config{}, st, NopIncidentSink{}, nil)
 	notifier := &fakeOccNotifier{}
-	rejudger := &fakeRejudger{}
 	aud := &fakeAuditor{}
 	c.SetOccurrenceNotifier(notifier)
-	c.SetRejudger(rejudger)
 	c.SetAuditor(aud)
 	now := time.Date(2026, 7, 8, 15, 30, 0, 0, time.UTC)
 	member := firingAlert("fp-orig", "DiskFull", "warning", now.Add(-5*time.Minute), false)
@@ -341,11 +339,6 @@ func TestApplyDelivery_RecurrenceCollapseAttachesOccurrenceAndNotifies(t *testin
 	}
 	if notifier.count() != 1 {
 		t.Fatalf("occurrence notifier calls = %d, want 1", notifier.count())
-	}
-	// Re-judgment is deliberately not invoked for durable deliveries: an LLM
-	// call has no place inside or synchronously after a dispatch commit.
-	if rejudger.count() != 0 {
-		t.Fatalf("rejudger calls = %d, want 0 (delivery path never re-judges inline)", rejudger.count())
 	}
 	// The durable path re-emits the occurrence-attach audit event
 	// attach.go's legacy path used to write — see docs/concepts/
