@@ -59,8 +59,24 @@ alert fired, but the passed deadline was still offered to the contract as
 a future checkpoint and clamped to the one-second minimum lead. The fix
 drops a passed deadline from the checkpoint candidates so the Situation
 idles at its cadence
-(`TestControllerReconcilePastObservationDeadlineWhileFiringIdlesAtCadence`);
-it too awaits the next lab run.
+(`TestControllerReconcilePastObservationDeadlineWhileFiringIdlesAtCadence`).
+
+A fifth run shipped both fixes and used a deterministic trigger: kill the
+process the instant a fifth attempt is dispatched under an unreachable
+model, then make the model reachable again. Both fixes held live. The
+exhausted Situations parked on their first cycle after the restart,
+refreshed their bounded projection once per cadence while the dependency
+was reported down, and were woken into a fresh epoch and a model-validated
+assessment the second it was reported healthy. The looping Situation
+stopped at the switch and has cycled at its slow cadence since.
+
+That run also showed a design gap still open for a ruling: the recovery
+wake waits for the model-health aggregate, and the assessment capability
+in that aggregate heals only on an assessment success, which parked
+Situations cannot produce. With every working Situation parked or held
+by a dead process's lease, the wake waited for an unrelated Situation's
+lease to expire. The likely fix is that a real success on any capability
+clears transport-class failures on all of them.
 
 Do not fill in a cell with a guess, an extrapolation from the local replay
 run, or a number that cannot be independently re-verified from the lab
