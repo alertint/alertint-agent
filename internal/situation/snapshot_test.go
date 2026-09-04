@@ -243,6 +243,7 @@ func TestSnapshotSymptomsGroupByIncidentAndTakeLatestStatus(t *testing.T) {
 	d1 := deliveryFor("delivery-1", "incident-1", "pd-1", first)
 	d1.Status = model.DeliveryStatusFiring
 	d2 := deliveryFor("delivery-2", "incident-1", "pd-2", last)
+	d2.AlertID = d1.AlertID // the SAME Alert resolving, not a second Alert.
 	d2.Status = model.DeliveryStatusResolved
 
 	// Deliberately shuffled input order — deriveSymptoms must not depend on
@@ -256,9 +257,77 @@ func TestSnapshotSymptomsGroupByIncidentAndTakeLatestStatus(t *testing.T) {
 		t.Fatalf("Key = %q, want %q", s.Key, "incident-1")
 	}
 	if s.Status != model.DeliveryStatusResolved {
-		t.Fatalf("Status = %q, want latest delivery's status %q", s.Status, model.DeliveryStatusResolved)
+		t.Fatalf("Status = %q, want the Alert's latest delivery's status %q", s.Status, model.DeliveryStatusResolved)
 	}
 	if !s.FirstObservedAt.Equal(first) {
 		t.Fatalf("FirstObservedAt = %s, want earliest delivery's ReceivedAt %s", s.FirstObservedAt, first)
+	}
+}
+
+// External review 2026-09-05 (P1): an Incident with two Alerts must not read
+// as resolved because ONE of them resolved — the earlier "latest delivery of
+// the Incident" reduction let a single resolved sibling drive
+// active → recovery_pending → recovered while the other Alert still fired.
+func TestSnapshotSymptomStaysFiringWhileAnyAlertOfTheIncidentStillFires(t *testing.T) {
+	start := mustTime(t, "2026-09-01T12:00:00Z")
+	later := mustTime(t, "2026-09-01T12:05:00Z")
+	a := deliveryFor("a-firing", "incident-1", "pd-a", start)
+	a.AlertID = "alert-A"
+	b := deliveryFor("b-firing", "incident-1", "pd-b", start)
+	b.AlertID = "alert-B"
+	bResolved := deliveryFor("b-resolved", "incident-1", "pd-b-resolved", later)
+	bResolved.AlertID = "alert-B"
+	bResolved.Status = model.DeliveryStatusResolved
+
+	// B's resolution is the most recently received delivery of the Incident;
+	// A has never resolved. Shuffled input order on purpose.
+	symptoms := deriveSymptoms([]Delivery{bResolved, a, b})
+	if len(symptoms) != 1 {
+		t.Fatalf("want 1 symptom, got %d", len(symptoms))
+	}
+	if symptoms[0].Status != model.DeliveryStatusFiring {
+		t.Fatalf("Status = %q, want firing: alert A's latest delivery is still firing even though alert B resolved after it", symptoms[0].Status)
+	}
+	if !symptoms[0].FirstObservedAt.Equal(start) {
+		t.Fatalf("FirstObservedAt = %s, want %s", symptoms[0].FirstObservedAt, start)
+	}
+
+	// Only once EVERY Alert's latest delivery has resolved is the Incident
+	// symptom resolved.
+	aResolved := deliveryFor("a-resolved", "incident-1", "pd-a-resolved", later.Add(time.Minute))
+	aResolved.AlertID = "alert-A"
+	aResolved.Status = model.DeliveryStatusResolved
+	symptoms = deriveSymptoms([]Delivery{a, bResolved, aResolved, b})
+	if symptoms[0].Status != model.DeliveryStatusResolved {
+		t.Fatalf("Status = %q, want resolved once both Alerts' latest deliveries have resolved", symptoms[0].Status)
+	}
+}
+
+// A re-fire of an already-resolved Alert (a later source start) makes the
+// Incident symptom firing again: per-Alert "latest" follows deliveryLess'
+// source-time-first order, the same order MembershipDigest and
+// criticalAnchorEligible use, so a re-fire after a resolution is the
+// Alert's latest observation even if the two deliveries were received in
+// the same instant.
+func TestSnapshotSymptomRefireAfterResolutionReadsFiring(t *testing.T) {
+	start := mustTime(t, "2026-09-01T12:00:00Z")
+	resolvedAt := mustTime(t, "2026-09-01T12:05:00Z")
+	refireAt := mustTime(t, "2026-09-01T12:07:00Z")
+	firing := deliveryFor("b-firing", "incident-1", "pd-b", start)
+	firing.AlertID, firing.SourceStartedAt = "alert-B", &start
+	resolved := deliveryFor("b-resolved", "incident-1", "pd-b-resolved", resolvedAt)
+	resolved.AlertID, resolved.SourceStartedAt = "alert-B", &start
+	resolved.Status = model.DeliveryStatusResolved
+	refire := deliveryFor("b-refire", "incident-1", "pd-b-refire", refireAt)
+	refire.AlertID, refire.SourceStartedAt = "alert-B", &refireAt
+
+	symptoms := deriveSymptoms([]Delivery{resolved, refire, firing})
+	if symptoms[0].Status != model.DeliveryStatusFiring {
+		t.Fatalf("Status = %q, want firing after the Alert re-fired", symptoms[0].Status)
+	}
+	// Without the re-fire, the same Alert's resolution stands.
+	symptoms = deriveSymptoms([]Delivery{resolved, firing})
+	if symptoms[0].Status != model.DeliveryStatusResolved {
+		t.Fatalf("Status = %q, want resolved", symptoms[0].Status)
 	}
 }

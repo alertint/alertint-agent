@@ -189,19 +189,25 @@ type CompletedSituation struct {
 // ----------------------------------------------------------------------
 
 // Symptom is one normalized active symptom derived from a Situation's
-// immutable Deliveries. Plan 2's situation.Delivery (Task 3's deliberate
-// trim of store.AlertDelivery) carries no field distinguishing "the same
-// underlying Alert re-firing" from "a different Alert" beyond its own
-// Delivery.ID and its owning Incident's IncidentID — no alertname, no
-// labels, no fingerprint reach this pure layer. The finest symptom-identity
-// granularity actually available is therefore one Incident's own aggregate
-// delivery lifecycle: Key == IncidentID. Status is the status of the
-// Incident's most-recently-received Delivery (ReceivedAt order, not
-// SourceStartedAt order — the freshest thing the store actually heard is
-// what "currently observed" means); FirstObservedAt is the earliest
-// Delivery's ReceivedAt. This collapses what a later plan may split into a
-// genuine per-Alert-pattern symptom identity distinct from delivery
-// grouping; see the Task 4 report for the full reasoning.
+// immutable Deliveries, one per member Incident: Key == IncidentID. Status
+// is the Incident's aggregate source lifecycle reduced PER ALERT: each
+// distinct Delivery.AlertID contributes only its chronologically latest
+// delivery (deliveryLess' total order, the same one MembershipDigest and
+// criticalAnchorEligible use), and the Incident is "firing" while ANY of its
+// Alerts' latest deliveries is firing — it is "resolved" only once every
+// Alert's latest delivery has resolved. One Alert resolving while a sibling
+// still fires must never read as a recovered Incident (external review of
+// 2026-09-05: the earlier "status of the Incident's most recently received
+// delivery" reduction let a single resolved sibling drive
+// active → recovery_pending → recovered under a still-firing Alert).
+// FirstObservedAt is the earliest Delivery's ReceivedAt.
+//
+// Key stays the Incident ID rather than a per-Alert-pattern identity: the
+// Incident is Plan 2's unit of Acute Triage coverage and the symptom facts,
+// lifecycle summary, and material hash are all keyed on it. A later plan may
+// split this into genuine per-Alert symptom identity (which novel_symptom
+// needs — see reasons.go); the per-Alert reduction inside each Incident is
+// what this slice needs for lifecycle truth.
 type Symptom struct {
 	Key             string
 	Status          model.DeliveryStatus
@@ -285,8 +291,8 @@ func elapsedDuration(in SnapshotInput) time.Duration {
 
 // deriveSymptoms reduces deliveries to one Symptom per distinct IncidentID,
 // sorted by Key so the result never depends on deliveries' input order (row
-// order, map iteration, or receipt/retry order). See Symptom's doc comment
-// for why Key == IncidentID in this reduction.
+// order, map iteration, or receipt/retry order). Status is per-Alert-latest
+// any-firing — see Symptom's doc comment for the rule and why.
 func deriveSymptoms(deliveries []Delivery) []Symptom {
 	byIncident := make(map[string][]Delivery, len(deliveries))
 	for _, d := range deliveries {
@@ -300,20 +306,46 @@ func deriveSymptoms(deliveries []Delivery) []Symptom {
 
 	out := make([]Symptom, 0, len(keys))
 	for _, k := range keys {
-		ds := append([]Delivery(nil), byIncident[k]...)
-		sort.Slice(ds, func(i, j int) bool {
-			if !ds[i].ReceivedAt.Equal(ds[j].ReceivedAt) {
-				return ds[i].ReceivedAt.Before(ds[j].ReceivedAt)
+		ds := byIncident[k]
+		first := ds[0].ReceivedAt
+		for _, d := range ds[1:] {
+			if d.ReceivedAt.Before(first) {
+				first = d.ReceivedAt
 			}
-			return ds[i].ID < ds[j].ID
-		})
+		}
 		out = append(out, Symptom{
 			Key:             k,
-			Status:          ds[len(ds)-1].Status,
-			FirstObservedAt: ds[0].ReceivedAt,
+			Status:          incidentSymptomStatus(ds),
+			FirstObservedAt: first,
 		})
 	}
 	return out
+}
+
+// incidentSymptomStatus is one Incident's aggregate source lifecycle: firing
+// while any distinct Alert's chronologically latest delivery is firing,
+// resolved once every Alert's latest delivery has resolved. Alert identity
+// is Delivery.AlertID (alert_deliveries.alert_id, NOT NULL); a delivery
+// with no AlertID (test fixtures only) counts as its own Alert so it can
+// never be superseded by an unrelated row.
+func incidentSymptomStatus(deliveries []Delivery) model.DeliveryStatus {
+	latestByAlert := make(map[string]Delivery, len(deliveries))
+	for _, d := range deliveries {
+		alertKey := d.AlertID
+		if alertKey == "" {
+			alertKey = "delivery:" + d.ID
+		}
+		cur, ok := latestByAlert[alertKey]
+		if !ok || deliveryLess(cur, d) {
+			latestByAlert[alertKey] = d
+		}
+	}
+	for _, d := range latestByAlert {
+		if d.Status == model.DeliveryStatusFiring {
+			return model.DeliveryStatusFiring
+		}
+	}
+	return model.DeliveryStatusResolved
 }
 
 // sortIncidentsByID returns a copy of incidents ordered by ID, never

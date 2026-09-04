@@ -1257,6 +1257,84 @@ func TestControllerReconcileLifecycleActiveTransitionsToRecoveryPendingOnResolut
 	}
 }
 
+// External review 2026-09-05 (P1): a two-Alert Incident whose second Alert
+// resolved while the first still fires must stay active through Reconcile —
+// and must not reach recovered at what would have been grace expiry. The
+// resolved delivery is deliberately the most recently received one.
+func TestControllerReconcilePartialResolutionKeepsSituationActive(t *testing.T) {
+	now := ctBaseTime.Add(10 * time.Minute)
+	in := ctBaseSnapshotInput()
+	in.Now = now
+	a := ctDelivery("a-firing", "incident-1", true, "warning")
+	a.AlertID, a.ReceivedAt = "alert-A", now.Add(-2*time.Second)
+	b := ctDelivery("b-firing", "incident-1", true, "warning")
+	b.AlertID = "alert-B"
+	bResolved := ctDelivery("b-resolved", "incident-1", false, "warning")
+	bResolved.AlertID, bResolved.ReceivedAt = "alert-B", now.Add(-time.Second)
+	in.Deliveries = []situation.Delivery{a, b, bResolved}
+	in.Incidents[0].AlertCount = 2
+
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
+	c := ctLifecycleController(store, &fakeAssessmentClient{}, now)
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(store.commits) != 1 {
+		t.Fatalf("commits = %d, want 1", len(store.commits))
+	}
+	commit := store.commits[0]
+	if commit.Lifecycle != model.LifecycleActive {
+		t.Fatalf("lifecycle = %q, want active: alert A still fires even though alert B resolved after it", commit.Lifecycle)
+	}
+	if commit.RecoveryObservedAt != nil || commit.GraceUntil != nil || commit.TerminalAt != nil || commit.TerminalReason != nil {
+		t.Fatalf("active must carry all four recovery/terminal fields nil, got %+v", commit)
+	}
+
+	// A later cycle, well past what a webhook recovery grace would have been,
+	// with the same deliveries: still active, never recovered.
+	later := now.Add(10 * time.Minute)
+	in.Now = later
+	store = &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
+	c = ctLifecycleController(store, &fakeAssessmentClient{}, later)
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile (later): %v", err)
+	}
+	if got := store.commits[0].Lifecycle; got != model.LifecycleActive {
+		t.Fatalf("later lifecycle = %q, want active", got)
+	}
+}
+
+// The counterpart: once the LAST firing Alert of the Incident resolves, the
+// Situation observes recovery exactly as a single-Alert one does.
+func TestControllerReconcileAllAlertsResolvedTransitionsToRecoveryPending(t *testing.T) {
+	now := ctBaseTime.Add(10 * time.Minute)
+	in := ctBaseSnapshotInput()
+	in.Now = now
+	a := ctDelivery("a-firing", "incident-1", true, "warning")
+	a.AlertID = "alert-A"
+	b := ctDelivery("b-firing", "incident-1", true, "warning")
+	b.AlertID = "alert-B"
+	bResolved := ctDelivery("b-resolved", "incident-1", false, "warning")
+	bResolved.AlertID, bResolved.ReceivedAt = "alert-B", now.Add(-2*time.Second)
+	aResolved := ctDelivery("a-resolved", "incident-1", false, "warning")
+	aResolved.AlertID, aResolved.ReceivedAt = "alert-A", now.Add(-time.Second)
+	in.Deliveries = []situation.Delivery{a, b, bResolved, aResolved}
+	in.Incidents[0].AlertCount = 2
+
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
+	c := ctLifecycleController(store, &fakeAssessmentClient{}, now)
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	commit := store.commits[0]
+	if commit.Lifecycle != model.LifecycleRecoveryPending {
+		t.Fatalf("lifecycle = %q, want recovery_pending once every Alert has resolved", commit.Lifecycle)
+	}
+	if commit.RecoveryObservedAt == nil || commit.GraceUntil == nil {
+		t.Fatalf("recovery_pending must carry recovery_observed_at and grace_until, got %+v", commit)
+	}
+}
+
 func TestControllerReconcileLifecycleRefireDuringGraceReturnsToActive(t *testing.T) {
 	effectiveStartedAt := ctBaseTime
 	recoveryObservedAt := ctBaseTime.Add(5 * time.Minute)
