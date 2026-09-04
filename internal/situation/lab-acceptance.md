@@ -9,21 +9,36 @@ canonical, dated evidence record lives beside the Plan 2 spec in the
 private planning directory (`02-controller-triage-coordination/
 lab-acceptance.md`) and is what the completion gate reads.
 
-State of that record as of 2026-09-04 (two lab runs against a fresh
-database each, Slack disabled, stdout notifier on, spans exported to the
-lab's own OpenTelemetry Collector): checks 1, 2, 3, 4, 5, 8 and 9 pass on
-live evidence; check 7 passed on the first run's evidence (content-failure
-class) and is to be repeated for the transport class; check 6 was not
-reached (no in-flight Acute Triage attempt occurred in the window); check
-10 agreed across audit, SQLite, logs and the collector's span metrics but
-**failed on the MCP column** — the Situation read projected consumed Triage
-attempts from the schedule row that a persisted Finding deletes. That
-projection now reads the durable attempt ledger (`internal/store/
-situation_views.go`) and is re-verified in the next run. The first run
-also exposed that the L2 prompt never stated the nested proposal shapes,
-so every proposal was rejected and the controller fell back
-deterministically as designed; fixed in `assessment_prompt.go` before the
-second run.
+State of that record as of 2026-09-04 (three lab runs, Slack disabled,
+stdout notifier on, spans exported to the lab's own OpenTelemetry
+Collector): **all ten checks pass on live evidence.** Checks 1–5, 8 and 9
+passed in the second run. Check 7 passed for both failure classes: the
+content class in the first run (every proposal rejected because the L2
+prompt never stated the nested proposal shapes — fixed in
+`assessment_prompt.go` before the second run) and the transport class in
+the third (the configured LLM made unreachable at the network level before
+the alerts arrived: transport failure, deterministic fallback in the same
+cycle, Attention forced urgent, installation health unavailable at once and
+healthy again on the first real success). Check 6 passed in the third run:
+a controlled restart three seconds into an in-flight Acute Triage attempt
+left that attempt recorded as canceled with the ordinary backoff, and the
+Finding came from exactly one effective attempt after the restart. Check
+10 first failed on the MCP column — the Situation read projected consumed
+Triage attempts from the schedule row that a persisted Finding deletes —
+and passed once that projection read the durable attempt ledger
+(`internal/store/situation_views.go`), re-read on the fixed build against
+the same rows.
+
+The third run also exposed an open controller defect, not yet fixed on
+this branch: a work attempt dispatched inside the shutdown drain and cut by
+the kill durably spends the last attempt of the budget, but the cycle that
+would have parked the Situation never commits, so the Situation comes back
+exhausted with no park recorded. Neither startup recovery (same material
+basis) nor the dependency-recovery wake (parked rows only) reaches it, and
+it emits a deterministic fallback every cadence with a healthy LLM until
+its material facts change on their own — which in the longest duration
+class never happens. The fix needs a design ruling (park on exhaustion, or
+widen the wake) and one more lab run.
 
 Do not fill in a cell with a guess, an extrapolation from the local replay
 run, or a number that cannot be independently re-verified from the lab
