@@ -9,6 +9,13 @@ and this chart adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-04
+
+
+### Changed
+
+- Update the default alertint-agent image to `v0.13.8`.
+
 ## [0.1.0] - 2026-09-03
 
 ### Added
