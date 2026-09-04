@@ -85,8 +85,12 @@ was not called keeps its own last-success time
 (`internal/llmhealth`, `TestSharedPrimarySuccessClearsDependencyFailuresAcrossCapabilities`,
 and the runtime-wiring proof
 `TestLLMHealthDependencyWakerWakesOnTriageDraftSuccessAfterAssessmentOutage`).
-A sixth run with the same trigger is to show the wake following the first
-successful Triage draft instead of a lease expiry.
+A sixth run with the same trigger showed exactly that: the first
+successful Triage draft after the restart healed the assessment capability,
+the aggregate went healthy, and the wake, the fresh epoch, and a
+model-validated assessment followed within the same few seconds, with no
+assessment dispatched in between. The exhausted-park path held again on
+both Situations of that run.
 
 The review of the same run also closed a membership race that the runs
 had not reached: the correlator plans a retry attach after reading that an
