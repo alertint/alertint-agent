@@ -70,13 +70,34 @@ was reported down, and were woken into a fresh epoch and a model-validated
 assessment the second it was reported healthy. The looping Situation
 stopped at the switch and has cycled at its slow cadence since.
 
-That run also showed a design gap still open for a ruling: the recovery
-wake waits for the model-health aggregate, and the assessment capability
-in that aggregate heals only on an assessment success, which parked
-Situations cannot produce. With every working Situation parked or held
-by a dead process's lease, the wake waited for an unrelated Situation's
-lease to expire. The likely fix is that a real success on any capability
-clears transport-class failures on all of them.
+That run also showed a liveness gap: the recovery wake waits for the
+model-health aggregate, and the assessment capability in that aggregate
+healed only on an assessment success, which parked Situations cannot
+produce. With every working Situation parked or held by a dead process's
+lease, the wake waited for an unrelated Situation's lease to expire. The
+ruling narrowed the fix to the capabilities that share the primary model
+client: a real success on any of triage draft, assessment, verification
+re-judgment, or query repair now clears a dependency-class failure on the
+others and on the probe, while content-class failures stay with their own
+capability, the memory classifier is outside the rule in both directions,
+a probe success still clears nothing but the probe, and a capability that
+was not called keeps its own last-success time
+(`internal/llmhealth`, `TestSharedPrimarySuccessClearsDependencyFailuresAcrossCapabilities`,
+and the runtime-wiring proof
+`TestLLMHealthDependencyWakerWakesOnTriageDraftSuccessAfterAssessmentOutage`).
+A sixth run with the same trigger is to show the wake following the first
+successful Triage draft instead of a lease expiry.
+
+The review of the same run also closed a membership race that the runs
+had not reached: the correlator plans a retry attach after reading that an
+Incident's Acute Triage schedule is in backoff, but the commit only checked
+that the Incident and its owning Situation were not terminal. A clean skip
+committed by the controller between that read and the commit is a first
+judgment that closes membership, so a later alert could attach behind it
+without any decision seeing it. The attach now carries the exact
+precondition it was planned under (the schedule is still in backoff at
+commit) and is rejected otherwise, so the correlator re-plans the delivery
+(`TestApplyCorrelatedDeliveryRejectsRetryAttachOnceTriageLeftBackoff`).
 
 Do not fill in a cell with a guess, an extrapolation from the local replay
 run, or a number that cannot be independently re-verified from the lab
