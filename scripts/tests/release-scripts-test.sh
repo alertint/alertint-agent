@@ -8,6 +8,19 @@ trap 'rm -rf "$tmp_root"' EXIT
 
 tests=0
 
+next_patch() {
+  local version="$1"
+  local major minor patch
+  IFS=. read -r major minor patch <<<"$version"
+  printf '%s.%s.%s\n' "$major" "$minor" "$((patch + 1))"
+}
+
+base_chart_version="$(sed -n 's/^version: *//p' "$repo_root/charts/alertint-agent/Chart.yaml")"
+base_app_version="$(sed -n 's/^appVersion: *"\{0,1\}\([^" ]*\)"\{0,1\}$/\1/p' "$repo_root/charts/alertint-agent/Chart.yaml")"
+test_chart_version="$(next_patch "$base_chart_version")"
+test_app_version="$(next_patch "$base_app_version")"
+mismatched_chart_version="$(next_patch "$test_chart_version")"
+
 fail() {
   echo "not ok $tests - $*" >&2
   exit 1
@@ -32,6 +45,23 @@ assert_not_contains() {
   fi
 }
 
+clear_unreleased() {
+  local changelog="$1"
+  local tmp="$changelog.tmp"
+
+  awk '
+    /^## \[Unreleased\]$/ {
+      print
+      print ""
+      in_unreleased = 1
+      next
+    }
+    in_unreleased && /^## / { in_unreleased = 0 }
+    !in_unreleased { print }
+  ' "$changelog" >"$tmp"
+  mv "$tmp" "$changelog"
+}
+
 new_fixture() {
   local name="$1"
   local fixture="$tmp_root/$name"
@@ -43,6 +73,7 @@ new_fixture() {
   cp "$repo_root/scripts/release-notes.sh" "$fixture/scripts/release-notes.sh"
   cp "$repo_root/scripts/chart-release-prep.sh" "$fixture/scripts/chart-release-prep.sh"
   cp "$repo_root/scripts/chart-release-validate.sh" "$fixture/scripts/chart-release-validate.sh"
+  clear_unreleased "$fixture/charts/alertint-agent/CHANGELOG.md"
   chmod +x "$fixture/scripts/"*.sh
   printf '%s\n' "$fixture"
 }
@@ -78,6 +109,8 @@ new_release_repo() {
   if [ -f "$repo_root/scripts/release-chart.sh" ]; then
     cp "$repo_root/scripts/release-chart.sh" "$fixture/scripts/release-chart.sh"
   fi
+  clear_unreleased "$fixture/CHANGELOG.md"
+  clear_unreleased "$fixture/charts/alertint-agent/CHANGELOG.md"
   chmod +x "$fixture/scripts/"*.sh
 
   git init -q --bare "$remote"
@@ -89,7 +122,7 @@ new_release_repo() {
     git config commit.gpgsign false
     git add .
     git commit -q -m "initial release fixture"
-    git tag v0.13.7
+    git tag "v$base_app_version"
     git remote add origin "$remote"
     git push -q origin main --tags
   )
@@ -119,14 +152,16 @@ tests=$((tests + 1))
 fixture="$(new_fixture app-bump)"
 (
   cd "$fixture"
-  ./scripts/chart-release-prep.sh 0.1.1 0.13.8 >/dev/null
+  ./scripts/chart-release-prep.sh "$test_chart_version" "$test_app_version" >/dev/null
 )
-assert_contains "$fixture/charts/alertint-agent/Chart.yaml" 'version: 0.1.1'
-assert_contains "$fixture/charts/alertint-agent/Chart.yaml" 'appVersion: "0.13.8"'
-assert_contains "$fixture/charts/alertint-agent/CHANGELOG.md" '## [0.1.1] - '
-assert_contains "$fixture/charts/alertint-agent/CHANGELOG.md" 'Update the default alertint-agent image to `v0.13.8`.'
-assert_contains "$fixture/charts/alertint-agent/README.md" 'Version-0.1.1-informational'
-assert_contains "$fixture/charts/alertint-agent/README.md" 'AppVersion-0.13.8-informational'
+assert_contains "$fixture/charts/alertint-agent/Chart.yaml" "version: $test_chart_version"
+assert_contains "$fixture/charts/alertint-agent/Chart.yaml" "appVersion: \"$test_app_version\""
+assert_contains "$fixture/charts/alertint-agent/CHANGELOG.md" "## [$test_chart_version] - "
+assert_contains "$fixture/charts/alertint-agent/CHANGELOG.md" "Update the default alertint-agent image to \`v$test_app_version\`."
+assert_contains "$fixture/charts/alertint-agent/README.md" "![Version: $test_chart_version]"
+assert_contains "$fixture/charts/alertint-agent/README.md" "Version-$test_chart_version-informational"
+assert_contains "$fixture/charts/alertint-agent/README.md" "![AppVersion: $test_app_version]"
+assert_contains "$fixture/charts/alertint-agent/README.md" "AppVersion-$test_app_version-informational"
 pass "application release updates and documents both chart metadata versions"
 
 tests=$((tests + 1))
@@ -143,19 +178,20 @@ awk '
 mv "$fixture/changelog.tmp" "$fixture/charts/alertint-agent/CHANGELOG.md"
 (
   cd "$fixture"
-  ./scripts/chart-release-prep.sh v0.1.1 >/dev/null
+  ./scripts/chart-release-prep.sh "v$test_chart_version" >/dev/null
+  ./scripts/release-notes.sh "$test_chart_version" charts/alertint-agent/CHANGELOG.md >chart-release-notes
 )
-assert_contains "$fixture/charts/alertint-agent/Chart.yaml" 'version: 0.1.1'
-assert_contains "$fixture/charts/alertint-agent/Chart.yaml" 'appVersion: "0.13.7"'
+assert_contains "$fixture/charts/alertint-agent/Chart.yaml" "version: $test_chart_version"
+assert_contains "$fixture/charts/alertint-agent/Chart.yaml" "appVersion: \"$base_app_version\""
 assert_contains "$fixture/charts/alertint-agent/CHANGELOG.md" '- Repair a chart-only template defect.'
-assert_not_contains "$fixture/charts/alertint-agent/CHANGELOG.md" 'Update the default alertint-agent image'
+assert_not_contains "$fixture/chart-release-notes" 'Update the default alertint-agent image'
 pass "chart-only release preserves appVersion and rolls pending chart notes"
 
 tests=$((tests + 1))
 fixture="$(new_fixture empty-chart-release)"
 if (
   cd "$fixture"
-  ./scripts/chart-release-prep.sh 0.1.1
+  ./scripts/chart-release-prep.sh "$test_chart_version"
 ) >"$fixture/output" 2>&1; then
   fail "chart-only release accepted an empty Unreleased section"
 fi
@@ -166,13 +202,13 @@ tests=$((tests + 1))
 fixture="$(new_fixture validate-app-tag)"
 (
   cd "$fixture"
-  ./scripts/chart-release-prep.sh 0.1.1 0.13.8 >/dev/null
+  ./scripts/chart-release-prep.sh "$test_chart_version" "$test_app_version" >/dev/null
 )
 init_git_fixture "$fixture"
 (
   cd "$fixture"
-  git tag v0.13.8
-  ./scripts/chart-release-validate.sh v0.13.8 >/dev/null
+  git tag "v$test_app_version"
+  ./scripts/chart-release-validate.sh "v$test_app_version" >/dev/null
 )
 pass "application tag validation accepts matching appVersion and chart notes"
 
@@ -180,14 +216,14 @@ tests=$((tests + 1))
 fixture="$(new_fixture validate-chart-tag)"
 (
   cd "$fixture"
-  ./scripts/chart-release-prep.sh 0.1.1 0.13.8 >/dev/null
+  ./scripts/chart-release-prep.sh "$test_chart_version" "$test_app_version" >/dev/null
 )
 init_git_fixture "$fixture"
 (
   cd "$fixture"
-  git tag v0.13.8
-  git tag chart-v0.1.1
-  ./scripts/chart-release-validate.sh chart-v0.1.1 >/dev/null
+  git tag "v$test_app_version"
+  git tag "chart-v$test_chart_version"
+  ./scripts/chart-release-validate.sh "chart-v$test_chart_version" >/dev/null
 )
 pass "chart tag validation accepts matching chart version and published app tag"
 
@@ -195,36 +231,36 @@ tests=$((tests + 1))
 fixture="$(new_fixture reject-mismatch)"
 (
   cd "$fixture"
-  ./scripts/chart-release-prep.sh 0.1.1 0.13.8 >/dev/null
+  ./scripts/chart-release-prep.sh "$test_chart_version" "$test_app_version" >/dev/null
 )
 init_git_fixture "$fixture"
 (
   cd "$fixture"
-  git tag v0.13.8
+  git tag "v$test_app_version"
 )
 if (
   cd "$fixture"
-  ./scripts/chart-release-validate.sh chart-v0.1.2
+  ./scripts/chart-release-validate.sh "chart-v$mismatched_chart_version"
 ) >"$fixture/output" 2>&1; then
   fail "chart tag validation accepted a mismatched Chart.yaml version"
 fi
-assert_contains "$fixture/output" 'does not match Chart.yaml version 0.1.1'
+assert_contains "$fixture/output" "does not match Chart.yaml version $test_chart_version"
 pass "chart tag validation rejects mismatched chart version"
 
 tests=$((tests + 1))
 fixture="$(new_fixture reject-missing-app-tag)"
 (
   cd "$fixture"
-  ./scripts/chart-release-prep.sh 0.1.1 0.13.8 >/dev/null
+  ./scripts/chart-release-prep.sh "$test_chart_version" "$test_app_version" >/dev/null
 )
 init_git_fixture "$fixture"
 if (
   cd "$fixture"
-  ./scripts/chart-release-validate.sh chart-v0.1.1
+  ./scripts/chart-release-validate.sh "chart-v$test_chart_version"
 ) >"$fixture/output" 2>&1; then
   fail "chart validation accepted an appVersion with no application tag"
 fi
-assert_contains "$fixture/output" 'referenced application tag v0.13.8 does not exist'
+assert_contains "$fixture/output" "referenced application tag v$test_app_version does not exist"
 pass "chart validation rejects an appVersion that was never tagged"
 
 tests=$((tests + 1))
@@ -235,17 +271,17 @@ add_unreleased_note "$fixture/CHANGELOG.md" "### Changed" "- Exercise the couple
   git add CHANGELOG.md
   git commit -q -m "add pending application notes"
   git push -q origin main
-  ./scripts/release.sh 0.13.8 --chart 0.1.1 --yes >release-output
+  ./scripts/release.sh "$test_app_version" --chart "$test_chart_version" --yes >release-output
 )
-assert_contains "$fixture/CHANGELOG.md" '## [0.13.8] - '
-assert_contains "$fixture/charts/alertint-agent/Chart.yaml" 'version: 0.1.1'
-assert_contains "$fixture/charts/alertint-agent/Chart.yaml" 'appVersion: "0.13.8"'
-assert_contains "$fixture/release-output" 'application v0.13.8 and chart 0.1.1 tagged for publication'
+assert_contains "$fixture/CHANGELOG.md" "## [$test_app_version] - "
+assert_contains "$fixture/charts/alertint-agent/Chart.yaml" "version: $test_chart_version"
+assert_contains "$fixture/charts/alertint-agent/Chart.yaml" "appVersion: \"$test_app_version\""
+assert_contains "$fixture/release-output" "application v$test_app_version and chart $test_chart_version tagged for publication"
 (
   cd "$fixture"
-  git rev-parse -q --verify refs/tags/v0.13.8 >/dev/null \
-    || fail "normal release did not create v0.13.8"
-  if git rev-parse -q --verify refs/tags/chart-v0.1.1 >/dev/null; then
+  git rev-parse -q --verify "refs/tags/v$test_app_version" >/dev/null \
+    || fail "normal release did not create v$test_app_version"
+  if git rev-parse -q --verify "refs/tags/chart-v$test_chart_version" >/dev/null; then
     fail "normal release unexpectedly created a chart-only tag"
   fi
   changed="$(git diff-tree --no-commit-id --name-only -r HEAD)"
@@ -268,16 +304,16 @@ add_unreleased_note "$fixture/charts/alertint-agent/CHANGELOG.md" "### Fixed" "-
   git add charts/alertint-agent/CHANGELOG.md
   git commit -q -m "add pending chart notes"
   git push -q origin main
-  ./scripts/release-chart.sh 0.1.1 --yes >release-output
+  ./scripts/release-chart.sh "$test_chart_version" --yes >release-output
 )
-assert_contains "$fixture/charts/alertint-agent/Chart.yaml" 'version: 0.1.1'
-assert_contains "$fixture/charts/alertint-agent/Chart.yaml" 'appVersion: "0.13.7"'
-assert_contains "$fixture/release-output" 'chart 0.1.1 tagged for publication'
+assert_contains "$fixture/charts/alertint-agent/Chart.yaml" "version: $test_chart_version"
+assert_contains "$fixture/charts/alertint-agent/Chart.yaml" "appVersion: \"$base_app_version\""
+assert_contains "$fixture/release-output" "chart $test_chart_version tagged for publication"
 (
   cd "$fixture"
-  git rev-parse -q --verify refs/tags/chart-v0.1.1 >/dev/null \
-    || fail "chart-only release did not create chart-v0.1.1"
-  if git rev-parse -q --verify refs/tags/v0.13.8 >/dev/null; then
+  git rev-parse -q --verify "refs/tags/chart-v$test_chart_version" >/dev/null \
+    || fail "chart-only release did not create chart-v$test_chart_version"
+  if git rev-parse -q --verify "refs/tags/v$test_app_version" >/dev/null; then
     fail "chart-only release unexpectedly created an application tag"
   fi
   changed="$(git diff-tree --no-commit-id --name-only -r HEAD)"
@@ -291,6 +327,31 @@ pass "chart-only release preserves appVersion and creates only its chart tag"
 
 tests=$((tests + 1))
 fixture="$(new_release_repo bootstrap-release)"
+(
+  cd "$fixture"
+  awk '
+    /^version:/ { print "version: 0.1.0"; next }
+    /^appVersion:/ { print "appVersion: \"0.13.7\""; next }
+    { print }
+  ' charts/alertint-agent/Chart.yaml >charts/alertint-agent/Chart.yaml.tmp
+  mv charts/alertint-agent/Chart.yaml.tmp charts/alertint-agent/Chart.yaml
+  awk '
+    {
+      gsub(/!\[Version: [0-9]+\.[0-9]+\.[0-9]+\]/, "![Version: 0.1.0]")
+      gsub(/shields\.io\/badge\/Version-[0-9]+\.[0-9]+\.[0-9]+-informational/,
+           "shields.io/badge/Version-0.1.0-informational")
+      gsub(/!\[AppVersion: [0-9]+\.[0-9]+\.[0-9]+\]/, "![AppVersion: 0.13.7]")
+      gsub(/shields\.io\/badge\/AppVersion-[0-9]+\.[0-9]+\.[0-9]+-informational/,
+           "shields.io/badge/AppVersion-0.13.7-informational")
+      print
+    }
+  ' charts/alertint-agent/README.md >charts/alertint-agent/README.md.tmp
+  mv charts/alertint-agent/README.md.tmp charts/alertint-agent/README.md
+  git add charts/alertint-agent/Chart.yaml charts/alertint-agent/README.md
+  git commit -q -m "set bootstrap chart metadata"
+  git tag v0.13.7
+  git push -q origin main --tags
+)
 before="$(git -C "$fixture" rev-parse HEAD)"
 (
   cd "$fixture"
@@ -310,15 +371,15 @@ tests=$((tests + 1))
 fixture="$(new_release_repo reused-chart-version)"
 (
   cd "$fixture"
-  ./scripts/chart-release-prep.sh 0.1.1 0.13.8 >/dev/null
+  ./scripts/chart-release-prep.sh "$test_chart_version" "$test_app_version" >/dev/null
   git add charts/alertint-agent/Chart.yaml charts/alertint-agent/CHANGELOG.md charts/alertint-agent/README.md
   git commit -q -m "prepare already-published chart metadata"
-  git tag v0.13.8
+  git tag "v$test_app_version"
   git push -q origin main --tags
 )
 if (
   cd "$fixture"
-  ./scripts/release-chart.sh 0.1.1 --yes
+  ./scripts/release-chart.sh "$test_chart_version" --yes
 ) >"$fixture/output" 2>&1; then
   fail "chart-only release reused a non-bootstrap current chart version"
 fi
