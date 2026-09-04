@@ -25,11 +25,16 @@ import (
 // Constraint).
 //
 // Spans are emitted through the OpenTelemetry global TracerProvider
-// (otel.GetTracerProvider). This build wires no exporter or provider of
-// its own, so with nothing configured every span is a no-op; an operator-
-// configured exporter (a later task's own configuration surface — never
-// unconsented telemetry egress) turns them on without touching this
-// package.
+// (otel.GetTracerProvider). This package installs no provider of its own:
+// with nothing configured every span is a no-op and no telemetry leaves
+// the process. The operator opts in through the `telemetry.otlp` config
+// section (internal/telemetry installs the OTLP exporter and provider at
+// startup) — never unconsented telemetry egress.
+//
+// Every span site also writes one structured log line carrying the same
+// stable identities plus the span's trace/span IDs (spanLogAttrs), so
+// logs, spans, audit rows, and the store reconcile against each other by
+// identity rather than by timestamp proximity.
 // ----------------------------------------------------------------------
 
 // tracerName is the instrumentation scope every span in this package uses.
@@ -85,4 +90,16 @@ const (
 
 func tracer() trace.Tracer {
 	return otel.GetTracerProvider().Tracer(tracerName)
+}
+
+// spanLogAttrs returns the trace_id/span_id slog attribute pair for span,
+// or nil when span carries no valid span context (no provider installed),
+// so a log line's identity attributes stay the same whether or not export
+// is configured and the trace/span pair simply appears once it is.
+func spanLogAttrs(span trace.Span) []any {
+	sc := span.SpanContext()
+	if !sc.IsValid() {
+		return nil
+	}
+	return []any{"trace_id", sc.TraceID().String(), "span_id", sc.SpanID().String()}
 }

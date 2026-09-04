@@ -1140,6 +1140,7 @@ func (c *Controller) auditCommitSuccess(ctx context.Context, claim Claim, commit
 // durable slot; one fenced final commit. See spec.md's own runtime-
 // ownership diagram (plan.md Task 8) for the exact order this mirrors.
 func (c *Controller) Reconcile(ctx context.Context, claim Claim) error {
+	startedAt := time.Now()
 	ctx, span := tracer().Start(ctx, SpanControllerReconcile, trace.WithAttributes(
 		AttrSituationID.String(claim.Situation.ID),
 		AttrInputVersion.Int(claim.Situation.InputVersion),
@@ -1147,16 +1148,32 @@ func (c *Controller) Reconcile(ctx context.Context, claim Claim) error {
 	defer span.End()
 	err := c.reconcile(ctx, claim)
 	var commitFailed *commitFailedError
+	class := ReconcileResultError
 	switch {
 	case err == nil:
-		span.SetAttributes(AttrResultClass.String(ReconcileResultCommitted))
+		class = ReconcileResultCommitted
 	case errors.As(err, &commitFailed):
-		span.SetAttributes(AttrResultClass.String(ReconcileResultCommitFailed))
+		class = ReconcileResultCommitFailed
 	default:
-		// The error text itself is never recorded on the span: a wrapped
-		// store error can carry SQL fragments.
-		span.SetAttributes(AttrResultClass.String(ReconcileResultError))
+		// The error text itself is never recorded on the span or the log
+		// line's stable attributes: a wrapped store error can carry SQL
+		// fragments.
 	}
+	durationMS := time.Since(startedAt).Milliseconds()
+	span.SetAttributes(AttrResultClass.String(class), AttrDurationMS.Int64(durationMS))
+	// One structured line per cycle carrying the same stable identities the
+	// span and the audit rows carry (spec.md: "Structured logs and OTel use
+	// stable Situation, Incident, attempt, input-version, and digest
+	// attributes"), plus the span's trace/span IDs so the three surfaces
+	// reconcile against each other and against the store.
+	attrs := append([]any{
+		"situation_id", claim.Situation.ID, "input_version", claim.Situation.InputVersion,
+		"result_class", class, "duration_ms", durationMS,
+	}, spanLogAttrs(span)...)
+	if err != nil {
+		attrs = append(attrs, "err", err)
+	}
+	c.logger.Info("situation: controller reconcile", attrs...)
 	return err
 }
 
@@ -1320,16 +1337,21 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 	}
 	freshEpoch := workAttempt == 1
 
-	proposal, vr, lastCallID, lastDuration, correctionUsed, transportErr := c.dispatchWorkBearing(ctx, claim, snap, retryEpoch, workAttempt, now)
-	if proposal != nil {
-		result := DeriveAssessment(*proposal, snap, in, state, model.DerivationModelValidated, nil, now)
-		return c.commitResult(ctx, claim, base, result, &lastCallID, retryEpoch, workAttempt, lastDuration, now)
+	disp, err := c.dispatchWorkBearing(ctx, claim, snap, retryEpoch, workAttempt, now)
+	if err != nil {
+		// The loop's own durable bookkeeping failed (see dispatchWorkBearing):
+		// nothing further may be derived, audited, or committed this cycle.
+		return fmt.Errorf("situation: controller reconcile: dispatch: %w", err)
+	}
+	if disp.proposal != nil {
+		result := DeriveAssessment(*disp.proposal, snap, in, state, model.DerivationModelValidated, nil, now)
+		return c.commitResult(ctx, claim, base, result, &disp.lastCallID, retryEpoch, workAttempt, disp.lastDuration, now)
 	}
 
 	// No accepted/contradicted result: classify the last outcome (using
 	// dispatchWorkBearing's own real correctionUsed, not an assumption) and
 	// decide retry vs. permanent park vs. bounded park.
-	policy := ClassifyL2Outcome(vr, transportErr, correctionUsed)
+	policy := ClassifyL2Outcome(disp.lastVR, disp.transportErr, disp.correctionUsed)
 
 	switch {
 	case !policy.DurableRetry:
@@ -1474,6 +1496,29 @@ func (c *Controller) fallbackOrPreserveBlocked(situationID string, snap Snapshot
 	return c.fallbackOrPreserve(situationID, snap, in, state, 0, 1, now)
 }
 
+// dispatchResult is dispatchWorkBearing's report of one work-bearing
+// attempt's L2 dispatch loop. proposal is non-nil only on an accepted or
+// contradicted response; otherwise the caller classifies lastVR/
+// transportErr via ClassifyL2Outcome to decide retry vs. park. lastCallID
+// is always the most recent dispatch's call ID, for the caller to link a
+// subsequent authoritative row to. correctionUsed reports whether this
+// cycle actually spent its one immediate-correction call — false when the
+// FIRST call itself was never eligible for one (a permanent rejection or a
+// non-malformed transport failure), so the caller's own ClassifyL2Outcome
+// re-classification of the final outcome passes the real value rather than
+// assuming the correction was always spent. lastDuration is the most recent
+// dispatch's own real measured latency (llm.OneShotCompletion.Latency) —
+// for the caller to thread into whichever attempt row it ends up building
+// from this cycle's outcome (Task 9 fix round, Finding #4).
+type dispatchResult struct {
+	proposal       *model.AssessmentProposal
+	lastVR         *ValidationResult
+	lastCallID     string
+	lastDuration   time.Duration
+	correctionUsed bool
+	transportErr   error
+}
+
 // dispatchWorkBearing runs one work-bearing controller attempt's L2 dispatch
 // loop: draft call, then — only for a malformed outcome, and only once —
 // one immediate correction call, per the outcome matrix's "at most one
@@ -1481,24 +1526,25 @@ func (c *Controller) fallbackOrPreserveBlocked(situationID string, snap Snapshot
 // (RecordAssessmentCall) before the physical HTTP request, so the call
 // budget is consumed regardless of what the request itself returns; a
 // rejected or failed outcome appends immediately (AppendAssessmentOutcome)
-// before the loop continues or returns. It returns a non-nil proposal only
-// on an accepted or contradicted response; otherwise proposal is nil and
-// the caller classifies vr/transportErr via ClassifyL2Outcome to decide
-// retry vs. park. lastCallID is always the most recent dispatch's call ID,
-// for the caller to link a subsequent authoritative row to. correctionUsed
-// reports whether this cycle actually spent its one immediate-correction
-// call — false when the FIRST call itself was never eligible for one (a
-// permanent rejection or a non-malformed transport failure), so the
-// caller's own ClassifyL2Outcome re-classification of the final outcome
-// passes the real value rather than assuming the correction was always
-// spent. lastDuration is the most recent dispatch's own real measured
-// latency (llm.OneShotCompletion.Latency) — for the caller to thread into
-// whichever attempt row it ends up building from this cycle's outcome
-// (Task 9 fix round, Finding #4).
-func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap Snapshot, retryEpoch, workAttempt int, now time.Time) (proposal *model.AssessmentProposal, lastVR *ValidationResult, lastCallID string, lastDuration time.Duration, correctionUsed bool, lastTransportErr error) {
+// before the loop continues or returns.
+//
+// The error return is an INFRASTRUCTURE failure of the loop's own durable
+// bookkeeping — the prompt could not be built, a call row could not be
+// recorded, or a rejected/failed outcome row could not be appended — and
+// aborts the whole reconcile cycle. It is deliberately distinct from
+// dispatchResult.transportErr, which is a provider-side outcome the caller
+// classifies and retries/parks durably. In particular, a failed
+// AppendAssessmentOutcome never lets the loop go on to a correction call or
+// a later commit: the durable record of the consumed slot is missing, so
+// nothing may be audited or derived from it (plan.md: audit follows the
+// corresponding durable write, never precedes it). The call row stays
+// without an outcome, which crash recovery will surface truthfully as
+// interrupted rather than as an outcome audit claims but SQLite lacks.
+func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap Snapshot, retryEpoch, workAttempt int, now time.Time) (dispatchResult, error) {
+	var res dispatchResult
 	prompt, err := BuildAssessmentPrompt(snap)
 	if err != nil {
-		return nil, nil, "", 0, false, fmt.Errorf("situation: build assessment prompt: %w", err)
+		return res, fmt.Errorf("situation: build assessment prompt: %w", err)
 	}
 
 	for callNumber := 1; callNumber <= c.cfg.MaxL2CallsPerAttempt; callNumber++ {
@@ -1509,7 +1555,8 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 			CallNumber: callNumber, DispatchedAt: now,
 		}
 		if err := c.store.RecordAssessmentCall(ctx, claim, call); err != nil {
-			return nil, nil, callID, 0, correctionUsed, fmt.Errorf("situation: record assessment call: %w", err)
+			res.lastCallID = callID
+			return res, fmt.Errorf("situation: record assessment call: %w", err)
 		}
 		c.auditAppend(ctx, "situation.assessment_call_dispatched", map[string]any{
 			"situation_id": claim.Situation.ID, "call_id": callID, "call_number": callNumber,
@@ -1533,9 +1580,11 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 		oneShot, callErr := c.client.CompleteOnce(callCtx, "", prompt, nil)
 		// oneShot.RequestStarted is the AssessmentClient's own authoritative
 		// classification (llm.ClassifyRequestStart, already applied inside
-		// CompleteOnce) — trust it directly rather than reclassifying callErr
-		// a second time here, which would silently diverge from whatever the
-		// client itself determined.
+		// CompleteOnce; a pre-request cancellation while waiting for the
+		// worker's L2 semaphore reports "false" the same way) — trust it
+		// directly rather than reclassifying callErr a second time here,
+		// which would silently diverge from whatever the client itself
+		// determined.
 		started := model.ProviderRequestStarted(oneShot.RequestStarted)
 
 		var vr *ValidationResult
@@ -1546,9 +1595,9 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 			v := ValidateAssessmentProposal(oneShot.Raw, snap, call, now)
 			vr = &v
 		}
-		lastVR, lastTransportErr, lastCallID, lastDuration = vr, transportErr, callID, oneShot.Latency
+		res.lastVR, res.transportErr, res.lastCallID, res.lastDuration = vr, transportErr, callID, oneShot.Latency
 
-		policy := ClassifyL2Outcome(vr, transportErr, correctionUsed)
+		policy := ClassifyL2Outcome(vr, transportErr, res.correctionUsed)
 		// Installation LLM health observes the FINAL typed outcome — after
 		// validation and classification — with this Situation as its
 		// subject, never the bare transport result (AssessmentHealthObserver).
@@ -1559,16 +1608,40 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 			AttrDurationMS.Int64(oneShot.Latency.Milliseconds()),
 		)
 		callSpan.End()
+		c.logger.Info("situation: assessment dispatch",
+			append([]any{
+				"situation_id", claim.Situation.ID, "call_id", callID, "dispatch_slot", callNumber,
+				"input_version", snap.InputVersion, "retry_epoch", retryEpoch, "work_attempt", workAttempt,
+				"material_fact_hash", snap.MaterialFactHash,
+				"result_class", string(policy.Outcome), "provider_request_started", string(started),
+				"duration_ms", oneShot.Latency.Milliseconds(),
+			}, spanLogAttrs(callSpan)...)...)
 		if policy.Outcome == L2OutcomeAccepted || policy.Outcome == L2OutcomeContradicted {
 			p := vr.Proposal
-			return &p, nil, callID, oneShot.Latency, correctionUsed, nil
+			res.proposal = &p
+			return res, nil
 		}
 
 		outcomeSequence := synthesizeSequence(snap.InputVersion, retryEpoch, workAttempt, callNumber)
 		outcome := buildOutcomeAttempt(claim.Situation.ID, callID, snap.InputVersion, retryEpoch, workAttempt, outcomeSequence, vr, transportErr, started, oneShot.Latency, now)
-		if err := c.store.AppendAssessmentOutcome(ctx, outcome); err != nil {
-			c.logger.Error("situation: controller: append assessment outcome failed", "situation_id", claim.Situation.ID, "call_id", callID, "err", err)
+		// The outcome row is the durable record of an already-consumed
+		// dispatch slot, so it is written on a short detached context when
+		// the cycle's own context is already done (attempt wall expired, or
+		// the worker canceled the reconcile while the call was waiting for
+		// its L2 semaphore slot) — mirroring triage_worker.go's
+		// detachedWriteContext: a canceled call still records why, with its
+		// real provider_request_started classification, rather than
+		// leaving the call row for crash recovery to guess at.
+		writeCtx, writeCancel := outcomeWriteContext(ctx)
+		err := c.store.AppendAssessmentOutcome(writeCtx, outcome)
+		if err != nil {
+			writeCancel()
+			return res, fmt.Errorf("situation: append assessment outcome: %w", err)
 		}
+		// Audited only AFTER the durable outcome row above committed, so the
+		// audit log never claims an outcome SQLite does not hold — on the
+		// same (possibly detached) write context, so the audit row lands
+		// whenever the outcome row did.
 		// outcome.Status is buildOutcomeAttempt's own closed classification:
 		// "rejected" for a validated-but-rejected proposal (policy/capability/
 		// malformed-shape/stale-basis), "failed" for a transport-layer
@@ -1579,7 +1652,7 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 		if outcome.Status == "failed" {
 			kind = "situation.assessment_failed"
 		}
-		c.auditAppend(ctx, kind, map[string]any{
+		c.auditAppend(writeCtx, kind, map[string]any{
 			"situation_id": claim.Situation.ID, "call_id": callID, "outcome": string(policy.Outcome),
 			"input_version":            snap.InputVersion,
 			"retry_epoch":              retryEpoch,
@@ -1587,12 +1660,24 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 			"provider_request_started": string(started),
 			"duration_ms":              outcome.CompletedAt.Sub(outcome.CreatedAt).Milliseconds(),
 		})
+		writeCancel()
 
-		if policy.ImmediateCorrection && !correctionUsed && callNumber < c.cfg.MaxL2CallsPerAttempt {
-			correctionUsed = true
+		if policy.ImmediateCorrection && !res.correctionUsed && callNumber < c.cfg.MaxL2CallsPerAttempt {
+			res.correctionUsed = true
 			continue
 		}
 		break
 	}
-	return nil, lastVR, lastCallID, lastDuration, correctionUsed, lastTransportErr
+	return res, nil
+}
+
+// outcomeWriteContext returns ctx itself while it is still live, or — once
+// ctx is already done — a short detached write context (detachedWriteContext)
+// so the durable record of a consumed dispatch slot still lands. The
+// returned cancel is always safe to call.
+func outcomeWriteContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx.Err() == nil {
+		return ctx, func() {}
+	}
+	return detachedWriteContext()
 }

@@ -38,6 +38,7 @@ type fakeControllerStore struct {
 	recordErr   error
 
 	outcomeCalls []situation.AssessmentAttempt
+	outcomeErr   error
 
 	lastTrustworthy *situation.AuthoritativeAssessment
 
@@ -102,7 +103,7 @@ func (f *fakeControllerStore) AppendAssessmentOutcome(ctx context.Context, attem
 	defer f.mu.Unlock()
 	f.outcomeCalls = append(f.outcomeCalls, attempt)
 	f.order = append(f.order, "append_outcome")
-	return nil
+	return f.outcomeErr
 }
 
 func (f *fakeControllerStore) LastTrustworthyAssessment(ctx context.Context, claim situation.Claim) (*situation.AuthoritativeAssessment, error) {

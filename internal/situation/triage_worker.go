@@ -795,10 +795,26 @@ func (w *TriageWorker) processOne(ctx context.Context, incidentID string) bool {
 		span.SetAttributes(AttrEvidencePackDigest.String(result.EvidencePackDigest))
 	}
 	class := w.completeAttempt(claim, result, analyzeErr) //nolint:contextcheck // by design: completeAttempt uses its own detachedWriteContext, independent of the possibly-canceled analysis context
+	durationMS := w.cfg.Now().Sub(claim.StartedAt).Milliseconds()
 	span.SetAttributes(
 		AttrResultClass.String(class),
-		AttrDurationMS.Int64(w.cfg.Now().Sub(claim.StartedAt).Milliseconds()),
+		AttrDurationMS.Int64(durationMS),
 	)
+	// One structured line per consumed attempt with the same stable
+	// identities/digests the span and the incident.triage_* audit rows
+	// carry, plus the span's trace/span IDs (see telemetry.go).
+	evidenceDigest := ""
+	if analyzeErr == nil {
+		evidenceDigest = result.EvidencePackDigest
+	}
+	w.logger.Info("situation: triage worker: attempt finished",
+		append([]any{
+			"situation_id", claim.SituationID, "incident_id", claim.IncidentID, "attempt_id", claim.AttemptID,
+			"attempt_number", claim.AttemptNumber, "input_version", claim.DecisionInputVersion,
+			"membership_digest", claim.MembershipDigest, "incident_input_digest", claim.IncidentInputDigest,
+			"evidence_pack_digest", evidenceDigest,
+			"result_class", class, "duration_ms", durationMS,
+		}, spanLogAttrs(span)...)...)
 	return true
 }
 

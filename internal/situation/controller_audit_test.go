@@ -414,3 +414,43 @@ func TestControllerReconcileAuditsTriageRequested(t *testing.T) {
 		t.Fatalf("audit kinds = %v, want no triage_skipped for a fresh request decision", audit.kinds)
 	}
 }
+
+// TestControllerReconcileAppendOutcomeFailureAbortsBeforeAuditAndCorrection
+// proves a failed AppendAssessmentOutcome aborts the cycle at that exact
+// point: the reconcile returns the store error, no assessment_rejected/
+// _failed audit event is emitted for an outcome SQLite does not hold (audit
+// follows the durable write, never precedes it), the one immediate
+// correction call the malformed draft would otherwise have earned is never
+// dispatched, and nothing is committed.
+func TestControllerReconcileAppendOutcomeFailureAbortsBeforeAuditAndCorrection(t *testing.T) {
+	in := ctBaseSnapshotInput()
+	sentinel := errors.New("disk I/O error")
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1, beginRetryEpoch: 0, outcomeErr: sentinel}
+	client := &fakeAssessmentClient{responses: []func() (llm.OneShotCompletion, error){
+		malformedResponse(), acceptedResponse(t),
+	}}
+	audit := &fakeAuditSink{}
+	c := ctControllerWithAudit(t, store, client, audit)
+
+	err := c.Reconcile(context.Background(), ctBaseClaim())
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Reconcile error = %v, want it to wrap the append failure %v", err, sentinel)
+	}
+	if client.calls != 1 {
+		t.Fatalf("CompleteOnce calls = %d, want exactly 1 — no correction call after the outcome append failed", client.calls)
+	}
+	if len(store.outcomeCalls) != 1 {
+		t.Fatalf("AppendAssessmentOutcome calls = %d, want 1", len(store.outcomeCalls))
+	}
+	if len(store.commits) != 0 {
+		t.Fatalf("commits = %d, want 0 — nothing may be committed after the durable outcome record failed", len(store.commits))
+	}
+	if !audit.has("situation.assessment_call_dispatched") {
+		t.Fatalf("audit kinds = %v, want the dispatch itself (its call row DID commit) to be audited", audit.kinds)
+	}
+	for _, kind := range []string{"situation.assessment_rejected", "situation.assessment_failed", "situation.assessment_fallback", "situation.assessment_authoritative"} {
+		if audit.has(kind) {
+			t.Fatalf("audit kinds = %v, want no %s — the audit log must never claim an outcome SQLite lacks", audit.kinds, kind)
+		}
+	}
+}

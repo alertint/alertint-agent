@@ -159,7 +159,11 @@ func (c *semaphoreAssessmentClient) CompleteOnce(ctx context.Context, systemProm
 	select {
 	case c.sem <- struct{}{}:
 	case <-ctx.Done():
-		return llm.OneShotCompletion{}, ctx.Err()
+		// Canceled while still waiting for a slot: no physical request was
+		// ever attempted, which is exactly llm.RequestStartStatusFalse —
+		// the deliberate, valid classification the controller records on
+		// the call's durable outcome row (the store rejects an empty one).
+		return llm.OneShotCompletion{RequestStarted: llm.RequestStartStatusFalse}, ctx.Err()
 	}
 	defer func() { <-c.sem }()
 	return c.inner.CompleteOnce(ctx, systemPrompt, prompt, requiredKeys)
