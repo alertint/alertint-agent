@@ -119,14 +119,13 @@ task release:chart -- 0.1.0
 The command recognizes the existing `0.1.0` metadata, shows its release notes,
 and creates `chart-v0.1.0` without manufacturing an empty commit.
 
-GHCR creates a package as private by default. After this first push, open the
-new `charts/alertint-agent` package under the AlertINT organization, enter
-**Package settings**, and change its visibility to **Public**. This is a
-one-time action and cannot be reversed, so confirm the package name before
-accepting GitHub's visibility warning. The workflow publishes with
-`GITHUB_TOKEN`, which links the package back to this repository automatically.
+The workflow publishes with `GITHUB_TOKEN`, which links the package back to
+this public repository automatically. With **Inherit access from source
+repository** enabled in the package settings, the package is public without a
+manual visibility change. Confirm that the package settings show it as public.
 
-Then smoke-check it without registry credentials:
+Then smoke-check it without registry credentials, using Helm 3.8 or later for
+OCI support:
 
 ```bash
 helm show chart oci://ghcr.io/alertint/charts/alertint-agent --version 0.1.0
