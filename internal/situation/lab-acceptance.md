@@ -29,16 +29,20 @@ and passed once that projection read the durable attempt ledger
 (`internal/store/situation_views.go`), re-read on the fixed build against
 the same rows.
 
-The third run also exposed an open controller defect, not yet fixed on
-this branch: a work attempt dispatched inside the shutdown drain and cut by
-the kill durably spends the last attempt of the budget, but the cycle that
-would have parked the Situation never commits, so the Situation comes back
-exhausted with no park recorded. Neither startup recovery (same material
-basis) nor the dependency-recovery wake (parked rows only) reaches it, and
-it emits a deterministic fallback every cadence with a healthy LLM until
-its material facts change on their own — which in the longest duration
-class never happens. The fix needs a design ruling (park on exhaustion, or
-widen the wake) and one more lab run.
+The third run also exposed a controller defect: a work attempt dispatched
+inside the shutdown drain and cut by the kill durably spends the last
+attempt of the budget, but the cycle that would have parked the Situation
+never commits, so the Situation comes back exhausted with no park recorded.
+Neither startup recovery (same material basis) nor the dependency-recovery
+wake (parked rows only) reaches it, and it emits a deterministic fallback
+every cadence with a healthy LLM until its material facts change on their
+own — which in the longest duration class never happens. The ruling was to
+park on exhaustion: the controller's exhausted branch now records a
+dependency park when none is on record, so the existing recovery wake
+re-arms it once the dependency is healthy again
+(`TestControllerReconcileExhaustedWithoutParkParksAsDependency`). The fix
+is on this branch but has not yet been exercised on the lab; that is the
+fourth run.
 
 Do not fill in a cell with a guess, an extrapolation from the local replay
 run, or a number that cannot be independently re-verified from the lab
