@@ -1,3 +1,4 @@
+{{- if not .Values.existingConfigMap -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -5,5 +6,20 @@ metadata:
   labels:
     {{- include "alertint-agent.labels" . | nindent 4 }}
 data:
+  {{- if .Values.configOverride }}
+  # Rendered from values.configOverride verbatim (true replacement — Helm
+  # never merges a plain string value with the chart's own default).
+  config.yaml: |
+    {{- .Values.configOverride | nindent 4 }}
+  {{- else }}
+  # Rendered from values.config. NOTE: this is a YAML map, so a values file
+  # or --set that only overrides part of it (e.g. just config.llm) is
+  # deep-merged with this chart's defaults, not replaced — you can end up
+  # with a mix of your values and the chart's own (e.g. an openai-compatible
+  # llm block that still inherits the default ANTHROPIC_API_KEY api_key_env).
+  # For a config you want taken as-is, use values.configOverride (a raw YAML
+  # string) or values.existingConfigMap instead.
   config.yaml: |
     {{- toYaml .Values.config | nindent 4 }}
+  {{- end }}
+{{- end }}

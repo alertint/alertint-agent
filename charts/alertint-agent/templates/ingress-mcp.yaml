@@ -1,0 +1,33 @@
+{{- if and .Values.ingress.enabled .Values.ingress.mcp.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "alertint-agent.fullname" . }}-mcp
+  labels:
+    {{- include "alertint-agent.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.ingress.mcp.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - {{- with .Values.ingress.mcp.host }}
+      host: {{ . | quote }}
+      {{- end }}
+      http:
+        paths:
+          - path: {{ .Values.ingress.mcp.path }}
+            pathType: {{ .Values.ingress.mcp.pathType }}
+            backend:
+              service:
+                name: {{ include "alertint-agent.fullname" . }}
+                port:
+                  number: {{ .Values.service.mcpPort }}
+{{- end }}

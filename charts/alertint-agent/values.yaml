@@ -10,7 +10,10 @@
 image:
   repository: ghcr.io/alertint/alertint-agent
   pullPolicy: IfNotPresent
-  # -- Overrides the image tag; defaults to .Chart.AppVersion.
+  # -- Overrides the image tag. Defaults to the "v"-prefixed release tag
+  # matching .Chart.AppVersion (e.g. AppVersion 0.13.7 -> tag v0.13.7),
+  # matching how alertint-agent's own images are actually published. An
+  # explicit value here is always used as-is, with no prefix added.
   tag: ""
 
 imagePullSecrets: []
@@ -42,11 +45,16 @@ securityContext:
 
 service:
   type: ClusterIP
-  # -- Alertmanager/change/Zabbix webhooks + GET /health. Only served when at
+  # -- External Service port for Alertmanager/change/Zabbix webhooks + GET
+  # /health. The container itself always listens on 9911 regardless of this
+  # value (it's fixed in the Deployment template and mapped by name) — this
+  # only changes what port the Service exposes it as. Only served when at
   # least one receiver under config.* is enabled (see values below).
   webhookPort: 9911
-  # -- MCP HTTP server (AI coding agents). Harmless to expose even if
-  # config.mcp is left disabled — nothing listens on it in that case.
+  # -- External Service port for the MCP HTTP server (AI coding agents). The
+  # container always listens on 9912 regardless of this value, mapped by
+  # name the same way as webhookPort. Harmless to expose even if config.mcp
+  # is left disabled — nothing listens on it in that case.
   mcpPort: 9912
 
 ingress:
@@ -55,8 +63,11 @@ ingress:
   annotations: {}
   webhook:
     host: ""
-    path: /
-    pathType: ImplementationSpecific
+    # -- Prefix-matches /webhook/alertmanager, /webhook/change, etc. Kept
+    # away from "/" deliberately so GET /health isn't reachable through this
+    # Ingress just because it shares the Service.
+    path: /webhook
+    pathType: Prefix
     tls: []
   mcp:
     enabled: false
@@ -106,14 +117,23 @@ persistence:
 # keys are exposed to the container via envFrom, so any name you reference in
 # `config` just needs to exist as a key here.
 #
-# Two ways to provide it:
+# Exactly one of these three shapes is required — the chart fails the render
+# with a clear message otherwise (both create and existingSecret set, or
+# neither with enabled left true):
 #   1) secret.existingSecret: the name of a Secret you manage yourself
 #      (External Secrets, Sealed Secrets, SOPS, etc.) — the recommended path
 #      for anything beyond local testing.
 #   2) secret.create: true with secret.data — the chart creates a plain
 #      Secret from values. Convenient for a quick start; do not commit real
 #      tokens into a values file under version control.
+#   3) secret.enabled: false — a deliberate opt-out of the built-in Secret
+#      entirely (e.g. every *_env value is supplied via extraEnv/extraEnvFrom
+#      instead). No envFrom is rendered in this case.
 secret:
+  # -- Set to false to opt out of the built-in Secret entirely (see mode 3
+  # above). Only meaningful when both create and existingSecret are also
+  # left unset — otherwise the chosen Secret is used regardless.
+  enabled: true
   # -- Create a Secret from secret.data below.
   create: false
   # -- Name of a pre-existing Secret to use instead of creating one.
@@ -129,12 +149,46 @@ extraEnvFrom: []
 extraVolumes: []
 extraVolumeMounts: []
 
+# -- Name of a pre-existing ConfigMap to mount at /etc/alertint instead of
+# the one this chart would otherwise create from `config`/`configOverride`.
+# You own its content and its key (must be named config.yaml) entirely —
+# the chart doesn't read or validate it. Takes priority over both `config`
+# and `configOverride` below.
+existingConfigMap: ""
+
+# -- Raw YAML config, used verbatim as config.yaml instead of `config`
+# below when non-empty. Unlike `config` (a YAML map, which Helm deep-merges
+# with the chart's defaults on a partial override — see the warning below),
+# a plain string value is never merged: whatever you put here is exactly
+# what ships, with nothing inherited from the chart's defaults. Prefer this
+# (or existingConfigMap above) over partially overriding `config` whenever
+# you want to be certain no default leaks through — e.g. switching
+# llm.provider to openai-compatible without also inheriting the default
+# llm.api_key_env: ANTHROPIC_API_KEY.
+# configOverride: |
+#   receivers:
+#     address: "0.0.0.0:9911"
+#   alertmanager:
+#     enabled: true
+#     webhook_token_env: ALERTINT_WEBHOOK_TOKEN
+#   ...
+configOverride: ""
+
 # -- The complete alertint-agent config, rendered verbatim to
-# /etc/alertint/config.yaml. This mirrors config.example.yaml in the
-# alertint-agent repo (see also docs/getting-started/configuration.md) — that
-# file documents every available field; this chart intentionally does not
-# duplicate the schema into typed Helm values, since it evolves with the app
-# itself. Extend or override any section with your own values.
+# /etc/alertint/config.yaml — but ONLY when both existingConfigMap and
+# configOverride above are empty. This mirrors config.example.yaml in the
+# alertint-agent repo (see also docs/getting-started/configuration.md) —
+# that file documents every available field; this chart intentionally does
+# not duplicate the schema into typed Helm values, since it evolves with
+# the app itself.
+#
+# WARNING: this is a YAML map, so Helm deep-merges a partial override with
+# the defaults below rather than replacing them — e.g. setting only
+# config.llm.provider and config.llm.base_url still inherits this chart's
+# default config.llm.api_key_env: ANTHROPIC_API_KEY alongside them, which is
+# very likely not what you want for a non-Anthropic setup. If you need a
+# config taken exactly as given with nothing inherited, use configOverride
+# or existingConfigMap above instead.
 # @default -- see config.example.yaml in the repo root for the full schema
 config:
   receivers:

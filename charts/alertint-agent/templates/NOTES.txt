@@ -1,15 +1,5 @@
 alertint-agent has been deployed.
 
-{{- if and (not .Values.secret.create) (not .Values.secret.existingSecret) }}
-
-⚠️  No secret configured (secret.create is false and secret.existingSecret is
-    empty). Every "*_env" field referenced in `config` — webhook_token_env,
-    api_key_env, and any others you've set — needs a matching key in a
-    Secret named "{{ include "alertint-agent.secretName" . }}", or the
-    container will fail to start. Set secret.create=true with secret.data,
-    or point secret.existingSecret at a Secret you manage yourself.
-{{- end }}
-
 Check the rollout:
   kubectl rollout status deployment/{{ include "alertint-agent.fullname" . }} -n {{ .Release.Namespace }}
 
@@ -29,11 +19,21 @@ Change-event webhook (ArgoCD notifications, CI/CD deploy hooks, etc.):
   http://{{ include "alertint-agent.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.webhookPort }}/webhook/change
 {{- end }}
 
-{{- if .Values.config.mcp.addr }}
+{{- $mcpState := include "alertint-agent.mcpState" . }}
+{{- if eq $mcpState "enabled" }}
 
 MCP endpoint (Claude Code, Cursor, and other MCP-compatible tools) — in-cluster:
   http://{{ include "alertint-agent.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.mcpPort }}/mcp
 {{- if not (and .Values.ingress.enabled .Values.ingress.mcp.enabled) }}
 (set ingress.enabled and ingress.mcp.enabled to reach it from outside the cluster)
 {{- end }}
+{{- else if eq $mcpState "unknown" }}
+
+MCP: enabled only if {{ .Values.config.mcp.token_env }} is set in your
+existingSecret/existingConfigMap — this can't be determined from chart
+values alone. If it is:
+  http://{{ include "alertint-agent.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.mcpPort }}/mcp
+{{- else }}
+
+MCP is not enabled (no value provided for {{ .Values.config.mcp.token_env }}).
 {{- end }}

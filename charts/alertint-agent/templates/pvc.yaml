@@ -5,6 +5,11 @@ metadata:
   name: {{ include "alertint-agent.fullname" . }}
   labels:
     {{- include "alertint-agent.labels" . | nindent 4 }}
+  annotations:
+    # Keep the PVC (and its data) around across `helm uninstall`. Deleting
+    # the stored incident/memory history is a deliberate, separate, manual
+    # action: `kubectl delete pvc {{ include "alertint-agent.fullname" . }}`.
+    helm.sh/resource-policy: "keep"
 spec:
   accessModes:
     - {{ .Values.persistence.accessMode }}

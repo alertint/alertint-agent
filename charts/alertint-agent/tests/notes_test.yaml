@@ -1,0 +1,55 @@
+suite: NOTES.txt
+templates:
+  - NOTES.txt
+tests:
+  - it: shows MCP instructions when enabled via secret.create with a token present
+    set:
+      secret.create: true
+      secret.data.ALERTINT_WEBHOOK_TOKEN: x
+      secret.data.ANTHROPIC_API_KEY: x
+      secret.data.ALERTINT_MCP_TOKEN: x
+    asserts:
+      - matchRegex:
+          path: raw
+          pattern: "MCP endpoint"
+
+  - it: says MCP is not enabled when secret.create has no token for it
+    set:
+      secret.create: true
+      secret.data.ALERTINT_WEBHOOK_TOKEN: x
+      secret.data.ANTHROPIC_API_KEY: x
+    asserts:
+      - matchRegex:
+          path: raw
+          pattern: "MCP is not enabled"
+
+  - it: hedges with an unknown state when using secret.existingSecret
+    set:
+      secret.create: false
+      secret.existingSecret: my-secret
+    asserts:
+      - matchRegex:
+          path: raw
+          pattern: "can't be determined from chart"
+
+  - it: shows MCP instructions when config.mcp.enabled is explicitly true, regardless of any token evidence
+    set:
+      secret.create: false
+      secret.existingSecret: my-secret
+      config.mcp.enabled: true
+    asserts:
+      - matchRegex:
+          path: raw
+          pattern: "MCP endpoint"
+
+  - it: says MCP is not enabled when config.mcp.enabled is explicitly false
+    set:
+      secret.create: true
+      secret.data.ALERTINT_WEBHOOK_TOKEN: x
+      secret.data.ANTHROPIC_API_KEY: x
+      secret.data.ALERTINT_MCP_TOKEN: x
+      config.mcp.enabled: false
+    asserts:
+      - matchRegex:
+          path: raw
+          pattern: "MCP is not enabled"

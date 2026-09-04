@@ -1,3 +1,4 @@
+{{- include "alertint-agent.validateSecret" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -17,6 +18,9 @@ spec:
     metadata:
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.secret.create }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -27,6 +31,7 @@ spec:
         {{- end }}
     spec:
       serviceAccountName: {{ include "alertint-agent.serviceAccountName" . }}
+      automountServiceAccountToken: false
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -35,16 +40,20 @@ spec:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: alertint-agent
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default (printf "v%s" .Chart.AppVersion) }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           ports:
+            # Fixed: this is where the binary actually listens by default
+            # (receivers.address / mcp.addr in config). service.webhookPort
+            # and service.mcpPort only control the Service's external port —
+            # changing them does not move where the container listens.
             - name: webhook
-              containerPort: {{ .Values.service.webhookPort }}
+              containerPort: 9911
               protocol: TCP
             - name: mcp
-              containerPort: {{ .Values.service.mcpPort }}
+              containerPort: 9912
               protocol: TCP
           {{- if .Values.probes.enabled }}
           livenessProbe:
@@ -64,12 +73,16 @@ spec:
             timeoutSeconds: {{ .Values.probes.timeoutSeconds }}
             failureThreshold: {{ .Values.probes.failureThreshold }}
           {{- end }}
+          {{- if or .Values.secret.enabled .Values.extraEnvFrom }}
           envFrom:
+            {{- if .Values.secret.enabled }}
             - secretRef:
                 name: {{ include "alertint-agent.secretName" . }}
+            {{- end }}
             {{- with .Values.extraEnvFrom }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          {{- end }}
           {{- with .Values.extraEnv }}
           env:
             {{- toYaml . | nindent 12 }}
@@ -88,7 +101,7 @@ spec:
       volumes:
         - name: config
           configMap:
-            name: {{ include "alertint-agent.fullname" . }}
+            name: {{ include "alertint-agent.configMapName" . }}
         - name: data
           {{- if .Values.persistence.enabled }}
           persistentVolumeClaim:

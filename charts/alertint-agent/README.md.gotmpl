@@ -33,28 +33,45 @@ For anything beyond a quick test, provide the secret yourself instead of
 
 This chart intentionally does **not** turn every alertint-agent config field
 into its own typed Helm value — the config schema is large and evolves with
-the app. Instead, `values.yaml`'s `config:` block is rendered verbatim into
-the ConfigMap the container reads at `/etc/alertint/config.yaml`. It ships
-with a working default (Anthropic + Alertmanager only); extend or override
-any section the same way you would edit `config.example.yaml` directly. See
+the app. Instead, `values.yaml`'s `config:` block is rendered into the
+ConfigMap the container reads at `/etc/alertint/config.yaml`. It ships with a
+working default (Anthropic + Alertmanager only); extend or override any
+section the same way you would edit `config.example.yaml` directly. See
 [config.example.yaml](../../config.example.yaml) in this repo, or
 [docs/getting-started/configuration.md](https://alertint.com/docs/getting-started/configuration),
 for the complete schema.
 
-Every `*_env` field you reference anywhere in `config` (e.g.
-`webhook_token_env: ALERTINT_WEBHOOK_TOKEN`) needs a matching key in the
-Secret named by `secret.existingSecret` (or created via `secret.data`) — the
-chart exposes every key of that Secret to the container via `envFrom`, so
-there's nothing else to wire up.
+**`config` is a YAML map, and Helm deep-merges a partial override with the
+chart's defaults rather than replacing them.** Setting only
+`config.llm.provider` and `config.llm.base_url` for an OpenAI-compatible
+setup still inherits this chart's default `config.llm.api_key_env:
+ANTHROPIC_API_KEY` alongside them — almost certainly not what you want. If
+you need a configuration taken exactly as given, with nothing inherited, use
+one of:
+
+- `configOverride`: a raw YAML string, rendered verbatim. A plain string
+  value is never merged, so this is a true replacement of `config`.
+- `existingConfigMap`: the name of a ConfigMap you manage entirely yourself
+  (must contain a `config.yaml` key) — the chart mounts it instead of
+  creating one, and doesn't create or need `config`/`configOverride` at all.
+
+Every `*_env` field you reference anywhere in your configuration (e.g.
+`webhook_token_env: ALERTINT_WEBHOOK_TOKEN`) needs a matching key in a
+Secret — see the `secret` block below for the three supported modes
+(`secret.create`, `secret.existingSecret`, or `secret.enabled: false` to
+opt out entirely). Exactly one applies; the chart fails the render with a
+clear message if that's ambiguous, rather than deploying a pod that can't
+start.
 
 ## A note on replicas
 
-`replicaCount` is fixed at 1 in the templates, not just defaulted — it
-cannot be overridden. alertint-agent's SQLite store is single-writer by
-design; running a second replica against the same database produces
-duplicate incident processing and duplicate notifications, not higher
-availability. Restart handling (`strategy.type: Recreate`) and persistence
-are built around this single-writer assumption.
+There is no `replicaCount` value — replicas is hardcoded at 1 in the
+Deployment template and cannot be overridden. alertint-agent's SQLite store
+is single-writer by design; running a second replica against the same
+database produces duplicate incident processing and duplicate
+notifications, not higher availability. Restart handling
+(`strategy.type: Recreate`) and persistence are built around this
+single-writer assumption.
 
 {{ template "chart.maintainersSection" . }}
 

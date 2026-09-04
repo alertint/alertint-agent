@@ -1,0 +1,114 @@
+suite: deployment
+templates:
+  - deployment.yaml
+  - configmap.yaml
+  - secret.yaml
+set:
+  secret.create: true
+  secret.data.ALERTINT_WEBHOOK_TOKEN: x
+  secret.data.ANTHROPIC_API_KEY: x
+tests:
+  - it: defaults the image tag to a v-prefixed AppVersion
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/alertint/alertint-agent:v0.13.7
+        template: deployment.yaml
+
+  - it: uses an explicit image.tag as-is, without adding a v prefix
+    set:
+      image.tag: custom-tag
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/alertint/alertint-agent:custom-tag
+        template: deployment.yaml
+
+  - it: keeps container ports fixed at 9911/9912 regardless of Service port overrides
+    set:
+      service.webhookPort: 8080
+      service.mcpPort: 8081
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].ports
+          value:
+            - name: webhook
+              containerPort: 9911
+              protocol: TCP
+            - name: mcp
+              containerPort: 9912
+              protocol: TCP
+        template: deployment.yaml
+
+  - it: adds a secret checksum annotation when secret.create is true
+    asserts:
+      - exists:
+          path: spec.template.metadata.annotations["checksum/secret"]
+        template: deployment.yaml
+
+  - it: omits the secret checksum annotation when not creating a Secret
+    set:
+      secret.create: false
+      secret.existingSecret: my-secret
+    asserts:
+      - notExists:
+          path: spec.template.metadata.annotations["checksum/secret"]
+        template: deployment.yaml
+
+  - it: fails when both secret.create and secret.existingSecret are set
+    set:
+      secret.existingSecret: my-secret
+    asserts:
+      - failedTemplate:
+          errorMessage: "secret.create and secret.existingSecret are mutually exclusive — set only one."
+        template: deployment.yaml
+
+  - it: fails when no Secret is configured and secret.enabled is left true
+    set:
+      secret.create: false
+    asserts:
+      - failedTemplate:
+          errorMessage: "No Secret configured: set secret.create=true (with secret.data), or secret.existingSecret to a Secret you manage yourself, or secret.enabled=false to deliberately opt out of the built-in Secret (e.g. if extraEnv/extraEnvFrom cover everything config.* references)."
+        template: deployment.yaml
+
+  - it: renders with no envFrom at all when secret.enabled is false and no extraEnvFrom is set
+    set:
+      secret.create: false
+      secret.enabled: false
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[0].envFrom
+        template: deployment.yaml
+
+  - it: references secret.existingSecret via envFrom when set
+    set:
+      secret.create: false
+      secret.existingSecret: my-secret
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].envFrom[0].secretRef.name
+          value: my-secret
+        template: deployment.yaml
+
+  - it: does not automount the service account token
+    asserts:
+      - equal:
+          path: spec.template.spec.automountServiceAccountToken
+          value: false
+        template: deployment.yaml
+
+  - it: mounts the ConfigMap this chart creates by default
+    asserts:
+      - equal:
+          path: spec.template.spec.volumes[0].configMap.name
+          value: RELEASE-NAME-alertint-agent
+        template: deployment.yaml
+
+  - it: mounts existingConfigMap instead when set
+    set:
+      existingConfigMap: my-cm
+    asserts:
+      - equal:
+          path: spec.template.spec.volumes[0].configMap.name
+          value: my-cm
+        template: deployment.yaml
