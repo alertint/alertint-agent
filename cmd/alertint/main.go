@@ -170,6 +170,16 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 
 	logConfigWarnings(logger, cfg)
 
+	// Operator-configured observability boundary: an OTLP trace exporter
+	// only when telemetry.otlp is enabled, otherwise nothing is installed
+	// and every span stays a no-op. Deferred so the final flush runs after
+	// the foundation stop sequence below has ended its last span.
+	stopTelemetry, err := startTelemetry(ctx, cfg, resolveVersion(), logger)
+	if err != nil {
+		return err
+	}
+	defer stopTelemetry()
+
 	applyServeOverrides(cfg, *receiversAddr, *mcpAddr)
 
 	st, stagedInfo, err := openStoreWithStagedRestore(ctx, cfg.Storage.SQLitePath, logger)
@@ -523,12 +533,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	// drain is a loop. stopCorrelator is the same sync.Once-guarded call the
 	// defer above falls back to on every other exit path.
 	stopSeq := foundationStopSequence{
-		stopReceivers: func() error {
-			if recvSrv == nil {
-				return nil
-			}
-			return recvSrv.Shutdown(shutdownCtx)
-		},
+		stopReceivers:         receiverShutdown(shutdownCtx, recvSrv),
 		stopCorrelator:        stopCorrelator,
 		drainFoundationWork:   rt.Drain,
 		drainControllerWork:   crt.Drain,
@@ -546,6 +551,18 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 	logger.Info("alertint stopped", slog.String("reason", "signal"))
 	return nil
+}
+
+// receiverShutdown is foundationStopSequence's stop-receivers step: a
+// graceful Shutdown of the receivers HTTP server bounded by ctx, or a no-op
+// when no receiver was started (nil server).
+func receiverShutdown(ctx context.Context, srv *http.Server) func() error {
+	return func() error {
+		if srv == nil {
+			return nil
+		}
+		return srv.Shutdown(ctx)
+	}
 }
 
 // stopLLMHealthRunner stops the LLM health runner — its final delivery pass

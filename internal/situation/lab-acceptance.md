@@ -36,8 +36,9 @@ run against the lab tenant:
    `alertint_get_incident` over MCP, a read-only `sqlite3` query against the
    lab database (`situations`, `situation_assessment_attempts`,
    `situation_assessment_calls`, `incident_triage`, `situation_facts`,
-   `audit_log`), `task lab:logs`, and the configured OTel backend for the
-   trace/span IDs covering the same cycle.
+   `audit_log`), `task lab:logs` (the per-cycle log lines carry the
+   trace/span IDs), and the lab Prometheus span-metrics series the
+   collector derives from the exported spans (see the OTel note below).
 3. Record every column with the exact value read back — not a paraphrase.
 4. Set **Result** to `pass` only once every column is filled with real,
    cross-checked evidence and the check's own pass condition (stated in its
@@ -133,18 +134,30 @@ run against the lab tenant:
   leaves the Situation exhausted for that basis with no park marker until
   the basis changes — identical to what the startup recovery pass already
   produces for the same crash, not a new behaviour.
-- **OTel columns in this build.** The controller and Triage worker emit
-  the three spans `docs/concepts/architecture.md#3a` names, with the
-  attributes check 10 wants to cross-check (Situation/Incident/attempt IDs,
-  input version, hashes, digests, dispatch slot, attempt number, result
-  class, duration) — pinned by `internal/situation/telemetry_test.go`
-  against an in-memory span recorder. The binary configures **no exporter**
-  (spans go to the OpenTelemetry global provider, which is a no-op until
-  one is wired), so the lab has no OTel backend to read a trace/span ID
-  from: until an operator-configured exporter ships, the two OTel columns
-  read `n/a (no exporter wired)` and check 10 is evaluated across MCP,
-  audit, SQLite, and logs only. Do not fill those columns from the unit
-  test — they are for IDs read back from a real backend.
+- **OTel columns (check 10).** The controller and Triage worker emit the
+  three spans `docs/concepts/architecture.md#3a` names, with the attributes
+  check 10 cross-checks (Situation/Incident/attempt IDs, input version,
+  hashes, digests, dispatch slot, attempt number, result class, duration)
+  — pinned by `internal/situation/telemetry_test.go` against an in-memory
+  span recorder — and export them over OTLP when the lab config enables
+  `telemetry.otlp` (`docs/getting-started/configuration.md#telemetry`),
+  pointed at the lab's own OpenTelemetry Collector. The lab collector's
+  traces pipeline feeds its span-metrics connector only (there is no trace
+  store in the lab), so the two OTel columns are filled from two places
+  that must agree: the **trace/span IDs** come from the agent's own
+  structured log lines for that cycle (`situation: controller reconcile`,
+  `situation: assessment dispatch`, `situation: triage worker: attempt
+  finished` — each carries `trace_id`/`span_id` next to the Situation/
+  Incident/attempt IDs), and the **consumed counts** come from the
+  collector-derived series in the lab Prometheus, e.g.
+  `traces_span_metrics_calls_total{service_name="alertint-agent",
+  span_name="situation.assessment.dispatch"}` and
+  `{span_name="incident.triage.attempt"}`, whose deltas over the drill
+  window must equal the `situation_assessment_calls` /
+  `incident_triage_attempts` row counts read back from SQLite. A span
+  count that disagrees with the ledger is a `fail`, not a rounding note.
+  Do not fill those columns from the unit test — they are for IDs and
+  counts read back from the live lab.
 - **Clean skip (checks 4 and 6).** A below-minimum-member Incident is
   clean-skipped by the Triage worker BEFORE any attempt claim
   (`CleanSkipIncidentTriageBelowMinimumMembers`): the schedule closes to

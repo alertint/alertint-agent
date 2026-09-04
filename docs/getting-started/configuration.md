@@ -287,6 +287,46 @@ see [Incident lifecycle: Restart
 recovery](../concepts/architecture.md#incident-lifecycle) for that
 behavior.
 
+## `telemetry`
+
+**Integration-branch config, not yet the `main`-branch default.** The
+operator-configured observability boundary. Disabled by default: the agent
+installs no exporter and no telemetry leaves the process; the OpenTelemetry
+spans the Situation controller and Acute Triage worker emit (see
+[Architecture: Situation foundation and
+controller](../concepts/architecture.md#3a-situation-foundation-and-controller))
+stay inert. Enabling it installs an OTLP trace exporter pointed at your
+collector. Spans carry only stable identities, digests, counts, closed result
+classes, and durations — never a prompt, proposal, provider response, SQL
+text, or secret — so what leaves is correlation keys, not content.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `otlp.enabled` | bool | `false` | Install the OTLP trace exporter. Leave off to send nothing anywhere. |
+| `otlp.endpoint` | string | — | Collector address. A bare `host:port` (e.g. `otel-collector:4317`) uses TLS unless `otlp.insecure` is set; a URL with a scheme (e.g. `http://otel-collector:4318`) decides TLS by its scheme. Required when enabled. |
+| `otlp.protocol` | string | `grpc` | `grpc` or `http` (OTLP/HTTP with protobuf). |
+| `otlp.insecure` | bool | `false` | Plaintext transport for a bare `host:port` endpoint (a lab or in-cluster collector without TLS). |
+| `otlp.service_name` | string | `alertint-agent` | The resource `service.name` your backend groups spans under. `OTEL_RESOURCE_ATTRIBUTES` in the environment is merged in as well, so `service.namespace` / `deployment.environment.name` need no config key. |
+| `otlp.timeout_seconds` | int | `10` | Per export batch. Also bounds the final flush at shutdown. |
+
+Spans are exported in batches from a background goroutine; ending a span
+never blocks the controller, and no export ever runs inside a database
+transaction. A collector that is unreachable is an export-time warning in
+the log, never a startup failure. Each span site also writes one structured
+log line (`situation: controller reconcile`, `situation: assessment
+dispatch`, `situation: triage worker: attempt finished`) carrying the same
+identities plus `trace_id`/`span_id`, so a log line, its span, and the
+audit rows for the same cycle reconcile by identity.
+
+```yaml
+telemetry:
+  otlp:
+    enabled: true
+    endpoint: otel-collector:4317
+    protocol: grpc
+    insecure: true
+```
+
 ## `health`
 
 Installation dependency health for the LLM. Real triage calls are the primary

@@ -53,8 +53,31 @@ type Config struct {
 	Triage       TriageConfig       `yaml:"triage,omitempty"`
 	Health       HealthConfig       `yaml:"health"`
 	Situations   SituationsConfig   `yaml:"situations"`
+	Telemetry    TelemetryConfig    `yaml:"telemetry,omitempty"`
 	LogLevel     string             `yaml:"log_level"`
 	LogFormat    string             `yaml:"log_format"`
+}
+
+// TelemetryConfig is the operator-configured observability boundary. With
+// telemetry.otlp.enabled false (the default) the agent installs no exporter
+// and no telemetry leaves the process: the OpenTelemetry spans the Situation
+// controller and Acute Triage worker emit stay no-ops. Enabling it installs
+// an OTLP trace exporter (internal/telemetry) pointed at the configured
+// collector. Spans carry only stable identities, digests, counts, result
+// classes, and durations — never prompts, proposals, provider bodies, SQL
+// text, or secrets — so the boundary is about egress consent, not content.
+type TelemetryConfig struct {
+	OTLP OTLPConfig `yaml:"otlp"`
+}
+
+// OTLPConfig configures the OTLP trace exporter.
+type OTLPConfig struct {
+	Enabled        bool   `yaml:"enabled"`         // install the exporter (default false)
+	Endpoint       string `yaml:"endpoint"`        // collector address: host:port, or a URL whose scheme decides TLS; required when enabled
+	Protocol       string `yaml:"protocol"`        // grpc | http (OTLP/HTTP protobuf); default grpc
+	Insecure       bool   `yaml:"insecure"`        // plaintext transport for a bare host:port endpoint
+	ServiceName    string `yaml:"service_name"`    // resource service.name; default alertint-agent
+	TimeoutSeconds int    `yaml:"timeout_seconds"` // per export batch; default 10
 }
 
 // HealthConfig tunes installation-level dependency health (today: the LLM).
@@ -639,6 +662,14 @@ func Defaults() Config {
 				JitterPercent: 20,
 			},
 		},
+		Telemetry: TelemetryConfig{
+			OTLP: OTLPConfig{
+				Enabled:        false,
+				Protocol:       "grpc",
+				ServiceName:    "alertint-agent",
+				TimeoutSeconds: 10,
+			},
+		},
 		LogLevel:  "info",
 		LogFormat: "auto",
 	}
@@ -754,6 +785,7 @@ func (c *Config) validate(offline bool) error {
 	errs = append(errs, c.validateTriageSelector()...)
 	errs = append(errs, c.validateMemory()...)
 	errs = append(errs, c.validateSituations()...)
+	errs = append(errs, c.validateTelemetry()...)
 	if !offline {
 		errs = append(errs, c.validateRules()...)
 	}
@@ -1092,6 +1124,32 @@ func (c *Config) validateSituations() []string {
 			situationsMaxWorkAttemptsPerInput))
 	}
 
+	return errs
+}
+
+// validateTelemetry checks the OTLP exporter block. Shape errors (an unknown
+// protocol, a non-positive timeout) are reported even while disabled, so a
+// block an operator has typed out is validated before the day it is switched
+// on; the endpoint itself is required only once enabled.
+func (c *Config) validateTelemetry() []string {
+	var errs []string
+	o := c.Telemetry.OTLP
+	switch o.Protocol {
+	case "grpc", "http":
+	default:
+		errs = append(errs, fmt.Sprintf("telemetry.otlp.protocol %q must be one of grpc, http", o.Protocol))
+	}
+	if o.TimeoutSeconds <= 0 {
+		errs = append(errs, "telemetry.otlp.timeout_seconds must be > 0")
+	}
+	if o.Enabled {
+		if strings.TrimSpace(o.Endpoint) == "" {
+			errs = append(errs, "telemetry.otlp.endpoint is required when telemetry.otlp.enabled is true (collector host:port or URL)")
+		}
+		if strings.TrimSpace(o.ServiceName) == "" {
+			errs = append(errs, "telemetry.otlp.service_name must not be empty when telemetry.otlp.enabled is true")
+		}
+	}
 	return errs
 }
 

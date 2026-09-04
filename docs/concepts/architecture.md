@@ -154,16 +154,19 @@ one build runs one grouping/dispatch path at a time.
   closed result-class, and duration attributes — Situation/Incident/attempt
   IDs, input version, material/basis hashes, membership/Incident-input/
   evidence-pack digests, dispatch slot and attempt number — never a prompt,
-  proposal, provider body, or SQL text. Structured logs and the audit log
-  carry the same identities, so the three surfaces can be reconciled
-  against each other and against the store. Spans go through the
-  OpenTelemetry global tracer provider; **this build configures no
-  exporter**, so they stay inert until a later release adds an
-  operator-configured one — no telemetry leaves the process today.
+  proposal, provider body, or SQL text. Each span site also writes one
+  structured log line with the same identities plus the span's
+  `trace_id`/`span_id`, and the audit log carries the same identities, so
+  the three surfaces can be reconciled against each other and against the
+  store by identity. Spans go through the OpenTelemetry global tracer
+  provider, which is a no-op unless the operator enables the OTLP trace
+  exporter under
+  [`telemetry.otlp`](../getting-started/configuration.md#telemetry) —
+  no telemetry leaves the process by default.
 - **Not yet:** connector preparation, Assessment/Triage artifacts beyond the
   bounded recent-attempt history, Transition/Episode summary history,
-  Situation-owned Slack, an OpenTelemetry exporter/config surface, the
-  final v0.14 cutover
+  Situation-owned Slack, OpenTelemetry metrics or logs export (traces only
+  today), the final v0.14 cutover
 
 ### 4. Memory
 
