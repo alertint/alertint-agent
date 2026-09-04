@@ -1,19 +1,29 @@
 # Plan 2 lab acceptance — Situation controller / Acute Triage coordination
 
-**Status: structure only — TODO.** This file's evidence table is a
-*structure*, seeded by Task 10 (`test(situation): prove controller crash
-boundaries`) alongside the real-store replay fixture
-(`controller_replay_test.go`) and this task's docs updates. It does **not**
-yet contain lab evidence: every data cell below is a placeholder. The
-follow-on lab-deployment step (a separate, carefully-scoped dispatch —
-`task lab:agent:snapshot` / `task lab:agent:ship` / `task lab:agent:switch` /
-`task lab:check` / `task lab:pause`, then firing real drill scenarios against
-the lab VPS) fills in every `TODO` cell with real evidence gathered from the
-live lab tenant, and that second pass is the one that actually closes this
-document out. This file is the repo-side structure; the canonical, dated
-evidence record lives beside the Plan 2 spec in the planning directory
-(`02-controller-triage-coordination/lab-acceptance.md`) and is what the
-completion gate reads.
+**Status: structure only in this file — the lab step has run.** This
+file's evidence table is a *structure*, seeded by Task 10 (`test(situation):
+prove controller crash boundaries`) alongside the real-store replay fixture
+(`controller_replay_test.go`). It deliberately carries no lab evidence
+(no Situation/Incident IDs, digests, or audit sequence numbers); the
+canonical, dated evidence record lives beside the Plan 2 spec in the
+private planning directory (`02-controller-triage-coordination/
+lab-acceptance.md`) and is what the completion gate reads.
+
+State of that record as of 2026-09-04 (two lab runs against a fresh
+database each, Slack disabled, stdout notifier on, spans exported to the
+lab's own OpenTelemetry Collector): checks 1, 2, 3, 4, 5, 8 and 9 pass on
+live evidence; check 7 passed on the first run's evidence (content-failure
+class) and is to be repeated for the transport class; check 6 was not
+reached (no in-flight Acute Triage attempt occurred in the window); check
+10 agreed across audit, SQLite, logs and the collector's span metrics but
+**failed on the MCP column** — the Situation read projected consumed Triage
+attempts from the schedule row that a persisted Finding deletes. That
+projection now reads the durable attempt ledger (`internal/store/
+situation_views.go`) and is re-verified in the next run. The first run
+also exposed that the L2 prompt never stated the nested proposal shapes,
+so every proposal was rejected and the controller fell back
+deterministically as designed; fixed in `assessment_prompt.go` before the
+second run.
 
 Do not fill in a cell with a guess, an extrapolation from the local replay
 run, or a number that cannot be independently re-verified from the lab
