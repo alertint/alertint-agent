@@ -108,14 +108,26 @@ func TestCall1FailureMakesUnavailableAndOnlyCall1SuccessClears(t *testing.T) {
 	}
 }
 
+// capSnap returns capability's entry in s, failing the test if absent.
+func capSnap(t *testing.T, s llmhealth.Snapshot, capability llmhealth.Capability) llmhealth.CapabilitySnapshot {
+	t.Helper()
+	for _, c := range s.Capabilities {
+		if c.Capability == capability {
+			return c
+		}
+	}
+	t.Fatalf("capability %q absent from snapshot: %+v", capability, s.Capabilities)
+	return llmhealth.CapabilitySnapshot{}
+}
+
 // TestCapabilityAssessmentDrivesUnavailableLikeTriageDraft proves Task 9's
 // own wiring: the Situation controller's own L2 dispatch capability
 // (CapabilityAssessment) is treated as a peer of CapabilityTriageDraft in
 // the rolled-up installation state (spec.md: "LLM health remains one
 // installation-level capability state fed by real Acute Triage and
 // Assessment outcomes") — a failure there alone makes the installation
-// unavailable, and only its own success (never a probe, and never a
-// Triage-draft success) clears it.
+// unavailable, and neither a probe success nor a classifier success clears
+// it; its own success does.
 func TestCapabilityAssessmentDrivesUnavailableLikeTriageDraft(t *testing.T) {
 	tr, _, c, _ := newTracker(t)
 	tr.Begin(llmhealth.CapabilityAssessment, "").Finish(err503)
@@ -127,11 +139,11 @@ func TestCapabilityAssessmentDrivesUnavailableLikeTriageDraft(t *testing.T) {
 	if s := tr.Snapshot(); s.State != llmhealth.StateUnavailable {
 		t.Fatalf("probe success cleared an assessment failure: %+v", s)
 	}
-	// A Triage-draft success must not clear it either — each capability's
-	// own success is the only thing that can clear its own failure.
-	tr.Begin(llmhealth.CapabilityTriageDraft, "inc-1").Finish(nil)
+	// A classifier success must not clear it either — the classifier may
+	// run on a separate model/client and proves nothing about the primary.
+	tr.Begin(llmhealth.CapabilityMemoryClassifier, "inc-1").Finish(nil)
 	if s := tr.Snapshot(); s.State != llmhealth.StateUnavailable {
-		t.Fatalf("triage_draft success cleared an assessment failure: %+v", s)
+		t.Fatalf("classifier success cleared an assessment failure: %+v", s)
 	}
 	c.add(12 * time.Minute)
 	tr.Begin(llmhealth.CapabilityAssessment, "").Finish(nil)
@@ -146,13 +158,127 @@ func TestCall2FailureDegradesOnly(t *testing.T) {
 	if s := tr.Snapshot(); s.State != llmhealth.StateDegraded || s.Reason != llmhealth.ReasonTimeout {
 		t.Fatalf("%+v", s)
 	}
-	tr.Begin(llmhealth.CapabilityTriageDraft, "inc-2").Finish(nil) // call 1 success does not clear call 2
+	tr.Begin(llmhealth.CapabilityMemoryClassifier, "inc-2").Finish(nil) // a classifier success never clears a primary failure
 	if s := tr.Snapshot(); s.State != llmhealth.StateDegraded {
-		t.Fatalf("call-1 success cleared call-2 failure: %+v", s)
+		t.Fatalf("classifier success cleared call-2 failure: %+v", s)
 	}
 	tr.Begin(llmhealth.CapabilityVerificationRejudge, "inc-2").Finish(nil)
 	if s := tr.Snapshot(); s.State != llmhealth.StateHealthy {
 		t.Fatalf("%+v", s)
+	}
+}
+
+// TestSharedPrimarySuccessClearsDependencyFailuresAcrossCapabilities pins
+// the lab-F10 rule: the capabilities served by the shared primary client
+// (triage_draft, assessment, verification_rejudge, query_repair) recover
+// together from a dependency-class failure on a real success on any one of
+// them, because that success proves the shared transport/provider is back.
+// The capability that was not actually called keeps its own last_success_at
+// (never fabricated) and its last_failure_at.
+func TestSharedPrimarySuccessClearsDependencyFailuresAcrossCapabilities(t *testing.T) {
+	tr, _, c, _ := newTracker(t)
+	failAt := c.now()
+	tr.Begin(llmhealth.CapabilityAssessment, "").Finish(context.DeadlineExceeded)
+	tr.Begin(llmhealth.CapabilityVerificationRejudge, "inc-0").Finish(err503)
+	tr.ProbeDue(c.now()) // reserve the activity generation, as the Runner does before a probe
+	tr.ObserveProbe(llm.ProbeResult{Outcome: llm.ProbeFailed, Method: "GET", Path: "/health", Err: err503})
+	if s := tr.Snapshot(); s.State != llmhealth.StateUnavailable || s.OutageGeneration != 1 {
+		t.Fatalf("after assessment timeout: %+v", s)
+	}
+
+	c.add(10 * time.Second)
+	successAt := c.now()
+	tr.Begin(llmhealth.CapabilityTriageDraft, "inc-1").Finish(nil)
+	s := tr.Snapshot()
+	if s.State != llmhealth.StateHealthy || s.OutageGeneration != 1 {
+		t.Fatalf("a Triage-draft success must clear the shared primary's dependency failures: %+v", s)
+	}
+	for _, capability := range []llmhealth.Capability{llmhealth.CapabilityAssessment, llmhealth.CapabilityVerificationRejudge, llmhealth.CapabilityProbe} {
+		cs := capSnap(t, s, capability)
+		if !cs.Healthy || cs.Reason != "" || cs.Detail != "" || cs.UnhealthySince != nil {
+			t.Fatalf("%s must be healthy again with no residual reason: %+v", capability, cs)
+		}
+		if cs.LastSuccessAt != nil {
+			t.Fatalf("%s was never called successfully; last_success_at must stay unset, got %v", capability, *cs.LastSuccessAt)
+		}
+		if cs.LastFailureAt == nil || !cs.LastFailureAt.Equal(failAt) {
+			t.Fatalf("%s must keep its own last_failure_at %v: %+v", capability, failAt, cs)
+		}
+	}
+	if cs := capSnap(t, s, llmhealth.CapabilityTriageDraft); cs.LastSuccessAt == nil || !cs.LastSuccessAt.Equal(successAt) {
+		t.Fatalf("the capability that actually succeeded records its own last_success_at: %+v", cs)
+	}
+
+	// The rule is symmetric: an assessment success clears a Triage-draft
+	// dependency failure the same way (the lab's real recovery order).
+	tr.Begin(llmhealth.CapabilityTriageDraft, "inc-2").Finish(err503)
+	if s := tr.Snapshot(); s.State != llmhealth.StateUnavailable || s.OutageGeneration != 2 {
+		t.Fatalf("second outage: %+v", s)
+	}
+	tr.Begin(llmhealth.CapabilityAssessment, "").Finish(nil)
+	if s := tr.Snapshot(); s.State != llmhealth.StateHealthy || s.OutageGeneration != 2 {
+		t.Fatalf("an assessment success must clear a Triage-draft dependency failure: %+v", s)
+	}
+}
+
+// TestSharedPrimarySuccessKeepsContentFailuresCapabilityLocal: a
+// corroborated content-class failure says the model's OUTPUT for that
+// capability is unusable, not that the provider is unreachable — another
+// capability's success proves nothing about it, so only its own success
+// clears it. A dependency failure recorded on the same record after the
+// content verdict is likewise not cleared, because the record's reason is
+// still the content one.
+func TestSharedPrimarySuccessKeepsContentFailuresCapabilityLocal(t *testing.T) {
+	tr := newTrackerOnly(t)
+	malformed := errors.Join(llmhealth.ErrResponseMalformed, errors.New("unexpected end of JSON"))
+	tr.Begin(llmhealth.CapabilityAssessment, "sit-1").Finish(malformed)
+	tr.Begin(llmhealth.CapabilityAssessment, "sit-2").Finish(malformed)
+	if s := tr.Snapshot(); s.State != llmhealth.StateUnavailable || s.Reason != llmhealth.ReasonResponseMalformed {
+		t.Fatalf("two subjects must corroborate an assessment content failure: %+v", s)
+	}
+	tr.Begin(llmhealth.CapabilityTriageDraft, "inc-1").Finish(nil)
+	s := tr.Snapshot()
+	if s.State != llmhealth.StateUnavailable || s.Reason != llmhealth.ReasonResponseMalformed {
+		t.Fatalf("a Triage-draft success must not clear an assessment content failure: %+v", s)
+	}
+	if cs := capSnap(t, s, llmhealth.CapabilityAssessment); cs.Healthy {
+		t.Fatalf("assessment must stay unhealthy on its content verdict: %+v", cs)
+	}
+	tr.Begin(llmhealth.CapabilityAssessment, "sit-3").Finish(nil)
+	if s := tr.Snapshot(); s.State != llmhealth.StateHealthy {
+		t.Fatalf("only its own success clears a content failure: %+v", s)
+	}
+}
+
+// TestClassifierAndProbeNeverCrossTheSharedPrimaryBoundary: memory_classifier
+// is outside the shared-primary rule in both directions (it may run on a
+// separate model/client), and probe is a receiver only — a probe success
+// never clears a real inference failure.
+func TestClassifierAndProbeNeverCrossTheSharedPrimaryBoundary(t *testing.T) {
+	tr := newTrackerOnly(t)
+	tr.Begin(llmhealth.CapabilityMemoryClassifier, "inc-0").Finish(err503)
+	tr.Begin(llmhealth.CapabilityTriageDraft, "inc-1").Finish(context.DeadlineExceeded)
+	if s := tr.Snapshot(); s.State != llmhealth.StateUnavailable {
+		t.Fatalf("after Triage-draft timeout: %+v", s)
+	}
+	tr.Begin(llmhealth.CapabilityMemoryClassifier, "inc-2").Finish(nil)
+	if s := tr.Snapshot(); s.State != llmhealth.StateUnavailable {
+		t.Fatalf("a classifier success must not clear a primary inference failure: %+v", s)
+	}
+	tr.ObserveProbe(llm.ProbeResult{Outcome: llm.ProbeOK, Method: "GET", Path: "/health"})
+	if s := tr.Snapshot(); s.State != llmhealth.StateUnavailable {
+		t.Fatalf("a probe success must not clear a primary inference failure: %+v", s)
+	}
+	// Re-fail the classifier, then recover the primary: the classifier's own
+	// dependency failure is untouched by the primary's success.
+	tr.Begin(llmhealth.CapabilityMemoryClassifier, "inc-3").Finish(err503)
+	tr.Begin(llmhealth.CapabilityAssessment, "").Finish(nil)
+	s := tr.Snapshot()
+	if s.State != llmhealth.StateHealthy {
+		t.Fatalf("an assessment success clears the Triage-draft timeout: %+v", s)
+	}
+	if cs := capSnap(t, s, llmhealth.CapabilityMemoryClassifier); cs.Healthy {
+		t.Fatalf("a primary success must not clear the classifier's own failure: %+v", cs)
 	}
 }
 
@@ -251,10 +377,17 @@ func TestProbeFailureMakesUnavailableUntilRealSuccess(t *testing.T) {
 	if s := tr.Snapshot(); s.State != llmhealth.StateHealthy {
 		t.Fatalf("probe success must clear a probe failure: %+v", s)
 	}
+	probeOKAt := capSnap(t, tr.Snapshot(), llmhealth.CapabilityProbe).LastSuccessAt
 	tr.ObserveProbe(llm.ProbeResult{Outcome: llm.ProbeFailed, Method: "GET", Path: "/health", Err: err503})
 	tr.Begin(llmhealth.CapabilityTriageDraft, "inc-1").Finish(nil)
-	if s := tr.Snapshot(); s.State != llmhealth.StateHealthy {
+	s := tr.Snapshot()
+	if s.State != llmhealth.StateHealthy {
 		t.Fatalf("real call-1 success must clear a probe failure: %+v", s)
+	}
+	// The probe itself did not succeed: its last_success_at is still the
+	// earlier real probe OK, never the inference call's time.
+	if cs := capSnap(t, s, llmhealth.CapabilityProbe); probeOKAt == nil || cs.LastSuccessAt == nil || !cs.LastSuccessAt.Equal(*probeOKAt) {
+		t.Fatalf("probe last_success_at must be its own earlier OK %v, got %+v", probeOKAt, cs)
 	}
 }
 

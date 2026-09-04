@@ -273,8 +273,8 @@ func (t *Tracker) finish(capability Capability, subject string, err error) {
 		t.markCapabilityHealthy(capability, now)
 		successAt := now
 		t.rec.LastRealSuccessAt = &successAt
-		if capability == CapabilityTriageDraft || capability == CapabilityVerificationRejudge || capability == CapabilityQueryRepair {
-			t.clearCapabilityIfPresent(CapabilityProbe, now)
+		if isSharedPrimaryCapability(capability) {
+			t.clearSharedDependencyFailures(capability)
 		}
 	case ClassDependency:
 		t.markCapabilityUnhealthy(capability, reason, SafeDetail(err), now)
@@ -436,16 +436,62 @@ func (t *Tracker) markCapabilityHealthy(capability Capability, now time.Time) {
 	}
 }
 
-// clearCapabilityIfPresent clears an existing unhealthy record for capability
-// without creating one — used when a stronger signal (a real primary-client
-// success) proves reachability the probe capability itself was never asked
-// about. A capability that has genuinely never been observed stays absent
-// from Snapshot rather than gaining a synthetic healthy entry.
-func (t *Tracker) clearCapabilityIfPresent(capability Capability, now time.Time) {
-	if _, ok := t.caps[capability]; !ok {
-		return
+// sharedPrimaryCapabilities are the capabilities served by the one configured
+// primary LLM client and model: a real generation succeeding on any of them
+// proves the shared transport, endpoint, credentials, and provider are back,
+// so it is evidence for every other one's dependency-class failure too.
+// memory_classifier is deliberately absent — it may run on a separate
+// model/client, so neither its success nor its failure says anything about
+// the primary path. probe is a receiver only (see clearSharedDependencyFailures):
+// a zero-generation reachability check can never clear a real inference
+// failure (spec: "probe success cannot erase a real inference failure").
+var sharedPrimaryCapabilities = []Capability{
+	CapabilityTriageDraft, CapabilityAssessment, CapabilityVerificationRejudge, CapabilityQueryRepair,
+}
+
+func isSharedPrimaryCapability(capability Capability) bool {
+	for _, c := range sharedPrimaryCapabilities {
+		if c == capability {
+			return true
+		}
 	}
-	t.markCapabilityHealthy(capability, now)
+	return false
+}
+
+// clearSharedDependencyFailures applies the shared-primary recovery rule
+// after a real success on succeeded (a shared primary capability): every
+// OTHER shared primary capability, plus probe, that is currently unhealthy
+// for a dependency-class reason is marked healthy again. Content-class
+// failures stay capability-local (a malformed assessment says nothing about
+// whether Triage drafts parse), memory_classifier is never touched, and a
+// capability that was never observed stays absent rather than gaining a
+// synthetic entry. The cleared capability was not actually called, so its
+// own LastSuccessAt, LastFailureAt, and content-corroboration evidence are
+// preserved as they were — only the unhealthy verdict is withdrawn.
+//
+// This is the lab-F10 rule: the dependency-recovery wake in cmd/alertint
+// waits for the rolled-up state to be healthy, and before this rule the
+// assessment capability could heal only on an assessment success, which is
+// impossible while every Situation is parked on that very outage — the
+// wake then waited on an unrelated lease expiry instead of the first Triage
+// draft that proved the provider was back.
+func (t *Tracker) clearSharedDependencyFailures(succeeded Capability) {
+	receivers := append(append([]Capability{}, sharedPrimaryCapabilities...), CapabilityProbe)
+	for _, capability := range receivers {
+		if capability == succeeded {
+			continue
+		}
+		c, ok := t.caps[capability]
+		if !ok || c.Healthy || Reason(c.ReasonCode).Class() != ClassDependency {
+			continue
+		}
+		c.Healthy = true
+		c.ReasonCode = ""
+		c.Detail = ""
+		c.UnhealthySince = nil
+		t.logger.Info("llm health: capability recovered on a shared primary success",
+			"capability", string(capability), "via", string(succeeded))
+	}
 }
 
 func (t *Tracker) markCapabilityUnhealthy(capability Capability, reason Reason, detail string, now time.Time) {

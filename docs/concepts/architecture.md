@@ -398,16 +398,27 @@ architecture item.
 
 The configured LLM is an installation-level dependency, observed below Acute
 Triage rather than owned by any Incident or Situation. Each distinct use of
-the LLM — the triage draft (Call 1), the bounded PromQL query repair, the
-verification re-judgment (Call 2), the optional memory classifier, and the
-idle probe — is its own **LLM capability**, cleared only by its own success:
+the LLM — the triage draft (Call 1), the Situation assessment, the bounded
+PromQL query repair, the verification re-judgment (Call 2), the optional
+memory classifier, and the idle probe — is its own **LLM capability**:
 
-- A `triage_draft` failure makes the installation `unavailable`; a
-  `verification_rejudge` failure makes it `degraded` while drafts continue
-  to ship. `memory_classifier` and `query_repair` (the one bounded PromQL
-  repair call before Call 2) are reported independently and never change
-  the rolled-up state — a repair only runs when the model proposed invalid
-  PromQL, so its success could never be relied on to clear a failure.
+- A `triage_draft` or `assessment` failure makes the installation
+  `unavailable`; a `verification_rejudge` failure makes it `degraded` while
+  drafts continue to ship. `memory_classifier` and `query_repair` (the one
+  bounded PromQL repair call before Call 2) are reported independently and
+  never change the rolled-up state — a repair only runs when the model
+  proposed invalid PromQL, so its success could never be relied on to clear
+  a failure.
+- A content-class failure (the model's output for that use is unusable,
+  corroborated across two Incidents) is cleared only by that capability's
+  own success. A dependency-class failure (timeout, network, provider
+  error) on any capability served by the shared primary client —
+  `triage_draft`, `assessment`, `verification_rejudge`, `query_repair` — is
+  cleared by a real success on any of those four, because that success
+  proves the shared transport and provider are back; the capability that
+  was not called keeps its own last-success time. A `memory_classifier`
+  success never clears them, and their success never clears the classifier
+  (it may run on a separate model).
 - After five idle minutes with zero in-flight calls, a strictly
   non-generating metadata `GET` probes reachability — never a completion,
   never a prompt. A dependency-class probe failure also makes the

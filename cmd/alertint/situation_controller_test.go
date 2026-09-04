@@ -341,6 +341,57 @@ func TestLLMHealthDependencyWakerWakesParkedSituationsWhenHealthy(t *testing.T) 
 	}
 }
 
+// TestLLMHealthDependencyWakerWakesOnTriageDraftSuccessAfterAssessmentOutage
+// is the lab-F10 scenario end to end: every Situation is parked on an
+// assessment outage (a timeout through the shared primary client), so no
+// assessment can run to heal the assessment capability; the first Acute
+// Triage draft that succeeds after the provider returns must be enough for
+// the rolled-up state to be healthy and the waker to open the new epoch —
+// not the next unrelated lease expiry.
+func TestLLMHealthDependencyWakerWakesOnTriageDraftSuccessAfterAssessmentOutage(t *testing.T) {
+	st := newTestFoundationStore(t)
+	now := time.Date(2026, 9, 4, 14, 49, 0, 0, time.UTC)
+	sitID := seedControllerRuntimeSituation(t, st, "group-f10", now)
+	if _, err := st.DB().ExecContext(context.Background(), `
+		UPDATE situations SET controller_parked_at = ?, controller_parked_reason = ?
+		WHERE id = ?`, now.UTC().Format(time.RFC3339Nano), situation.ParkedReasonDependency, sitID); err != nil {
+		t.Fatal(err)
+	}
+
+	tracker, err := llmhealth.New(context.Background(), st, llmhealth.Options{})
+	if err != nil {
+		t.Fatalf("llmhealth.New: %v", err)
+	}
+	tracker.Begin(llmhealth.CapabilityAssessment, "").Finish(context.DeadlineExceeded)
+	if tracker.Snapshot().State != llmhealth.StateUnavailable {
+		t.Fatal("test setup: expected unavailable after an assessment timeout")
+	}
+	waker := llmHealthDependencyWaker{tracker: tracker, st: st}
+	if n, err := waker.WakeDependencyRecoveredSituations(context.Background(), now); err != nil || n != 0 {
+		t.Fatalf("wake while unavailable = (%d, %v), want (0, nil)", n, err)
+	}
+
+	// The provider is back: a Triage draft succeeds; no assessment has run.
+	tracker.Begin(llmhealth.CapabilityTriageDraft, "inc-1").Finish(nil)
+	if s := tracker.Snapshot(); s.State != llmhealth.StateHealthy {
+		t.Fatalf("tracker state = %q after a Triage-draft success, want healthy", s.State)
+	}
+	n, err := waker.WakeDependencyRecoveredSituations(context.Background(), now.Add(10*time.Second))
+	if err != nil {
+		t.Fatalf("WakeDependencyRecoveredSituations: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("woke = %d, want 1 on the first Triage-draft success", n)
+	}
+	var parkedReason *string
+	if err := st.DB().QueryRowContext(context.Background(), `SELECT controller_parked_reason FROM situations WHERE id = ?`, sitID).Scan(&parkedReason); err != nil {
+		t.Fatal(err)
+	}
+	if parkedReason != nil {
+		t.Fatalf("controller_parked_reason = %v, want cleared after the wake", *parkedReason)
+	}
+}
+
 // ----------------------------------------------------------------------
 // triage store/lister adapters
 // ----------------------------------------------------------------------
