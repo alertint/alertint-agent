@@ -36,6 +36,19 @@ and proving the whole pipeline with one command:
 alertint drill --config config.yaml
 ```
 
+For Kubernetes, install the official OCI Helm chart:
+
+```bash
+helm install my-alertint oci://ghcr.io/alertint/charts/alertint-agent \
+  --set secret.create=true \
+  --set secret.data.ALERTINT_WEBHOOK_TOKEN="$(openssl rand -hex 32)" \
+  --set secret.data.ANTHROPIC_API_KEY=sk-ant-...
+```
+
+For a production installation, manage the Secret outside Helm and use a
+reviewed values file; the [chart README](charts/alertint-agent/README.md)
+documents all supported modes.
+
 The built-in incident drill plants a fake deploy, fires a burst of
 clearly-marked synthetic alerts through the production ingress, and polls
 until triage prints the finding — a causal analysis naming the planted

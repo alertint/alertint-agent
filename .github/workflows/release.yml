@@ -50,3 +50,11 @@ jobs:
           args: release --clean --release-notes /tmp/release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-chart:
+    name: publish Helm chart
+    needs: release
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/chart-release.yml

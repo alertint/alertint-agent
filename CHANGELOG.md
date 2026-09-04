@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Release automation now publishes the official Helm chart to GHCR as an OCI
+  artifact after each application image release. Application and chart
+  versions remain independent, while the normal `task release` command updates
+  both; `task release:chart` handles chart-only releases and the initial chart
+  publication.
+
 ## [0.13.7] - 2026-09-02
 
 ### Fixed

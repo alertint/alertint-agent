@@ -58,6 +58,9 @@ and this chart adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   that `README.md` matches what `helm-docs` would regenerate from
   `values.yaml`, and `helm unittest` rendering tests (see `tests/`) for all
   of the above.
+- OCI publication to `ghcr.io/alertint/charts/alertint-agent`, with application
+  releases publishing their image before the chart and an independent
+  `chart-v*` path for chart-only releases.
 
 ### Fixed
 

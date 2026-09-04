@@ -18,9 +18,9 @@ AI-powered alert-triage agent that correlates Alertmanager/Zabbix alerts into in
 ## Installing
 
 ```bash
-helm install my-alertint ./charts/alertint-agent \
+helm install my-alertint oci://ghcr.io/alertint/charts/alertint-agent \
   --set secret.create=true \
-  --set secret.data.ALERTINT_WEBHOOK_TOKEN=$(openssl rand -hex 32) \
+  --set secret.data.ALERTINT_WEBHOOK_TOKEN="$(openssl rand -hex 32)" \
   --set secret.data.ANTHROPIC_API_KEY=sk-ant-...
 ```
 
