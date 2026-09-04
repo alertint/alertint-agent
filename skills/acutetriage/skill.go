@@ -415,7 +415,7 @@ func (s *Skill) pipeline(ctx context.Context, inc store.Incident, alerts []store
 	// including the resolution ownership claim — is a no-op there.
 	incidentStatus, ownsNotification := "", false
 	if s.notifier != nil {
-		incidentStatus, ownsNotification = s.notificationStatus(ctx, inc.ID, p.rejudge)
+		incidentStatus, ownsNotification = s.notificationStatus(ctx, inc.ID, inc.Status, p.rejudge)
 	}
 	if ownsNotification {
 		f := notify.Finding{
@@ -543,10 +543,11 @@ func (s *Skill) attachHistorySteering(ctx context.Context, inc store.Incident, a
 // notificationStatus returns the finding status and whether this pipeline owns
 // the notification. Initial triage must claim the same analyzed -> resolved
 // transition as the correlator before publishing a resolved finding; losing
-// that CAS means another path owns the resolution notification. Re-judgments
-// keep their existing behavior because they update already-judged incidents
-// and intentionally publish without owning a lifecycle transition.
-func (s *Skill) notificationStatus(ctx context.Context, incidentID string, rejudge bool) (string, bool) {
+// that CAS means another path owns the resolution notification. A re-judgment
+// also claims the transition when a recurrence reopened the incident, but an
+// ErrNotFound still publishes its replacement finding because a re-judgment of
+// an incident that was already resolved remains valid.
+func (s *Skill) notificationStatus(ctx context.Context, incidentID, startingStatus string, rejudge bool) (string, bool) {
 	incAlerts, err := s.st.GetIncidentAlerts(ctx, incidentID)
 	if err != nil || len(incAlerts) == 0 {
 		return "ongoing", true
@@ -556,11 +557,11 @@ func (s *Skill) notificationStatus(ctx context.Context, incidentID string, rejud
 			return "ongoing", true
 		}
 	}
-	if rejudge {
-		return "resolved", true
-	}
 	if err := s.st.MarkIncidentResolved(ctx, incidentID); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
+			if rejudge && startingStatus == "resolved" {
+				return "resolved", true
+			}
 			s.logger.Info("incident resolution notification already claimed", "incident", incidentID)
 			return "", false
 		}

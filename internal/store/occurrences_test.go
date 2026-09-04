@@ -77,6 +77,40 @@ func TestInsertOccurrence_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestInsertOccurrenceAndAttach_ReopensResolvedWithExistingMembership(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	seedIncident(t, s, "inc_resolved", "service=api", "resolved", base)
+	a := Alert{
+		ID:          "alert_existing",
+		Fingerprint: "fp-existing",
+		Status:      "firing",
+		Labels:      map[string]string{"service": "api"},
+		Annotations: map[string]string{},
+		StartsAt:    base,
+		ReceivedAt:  base,
+	}
+	stored, err := s.UpsertAlertByFingerprint(ctx, a)
+	if err != nil {
+		t.Fatalf("upsert alert: %v", err)
+	}
+	if err := s.AddAlertToIncident(ctx, "inc_resolved", stored.ID, base); err != nil {
+		t.Fatalf("seed membership: %v", err)
+	}
+
+	if _, err := s.InsertOccurrenceAndAttach(ctx, sampleOccurrence("inc_resolved", base.Add(time.Minute)), stored.ID, base.Add(time.Minute)); err != nil {
+		t.Fatalf("InsertOccurrenceAndAttach: %v", err)
+	}
+	got, err := s.GetIncidentByID(ctx, "inc_resolved")
+	if err != nil {
+		t.Fatalf("get incident: %v", err)
+	}
+	if got.Status != "analyzed" {
+		t.Fatalf("status = %q, want analyzed after accepted occurrence", got.Status)
+	}
+}
+
 func TestLatestOccurrence_ReturnsMostRecent(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

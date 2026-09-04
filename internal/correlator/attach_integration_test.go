@@ -383,10 +383,10 @@ func TestMaybeAttach_CeilingRejudge(t *testing.T) {
 	}
 }
 
-// TestMaybeAttach_AttachToResolvedKeepsStatus covers R1: a firing re-fire whose
-// condition had fully recovered attaches to the resolved incident (a new
-// episode) without reversing its status.
-func TestMaybeAttach_AttachToResolvedKeepsStatus(t *testing.T) {
+// TestMaybeAttach_AttachToResolvedReopensIncident covers issue 81: a firing
+// re-fire whose condition had fully recovered attaches to the resolved incident
+// as a new episode and reopens it for a later one-shot resolution notification.
+func TestMaybeAttach_AttachToResolvedReopensIncident(t *testing.T) {
 	st := openStore(t)
 	c, _ := newCorrelatorFor(t, st)
 	ctx := context.Background()
@@ -406,8 +406,8 @@ func TestMaybeAttach_AttachToResolvedKeepsStatus(t *testing.T) {
 		t.Errorf("occurrences = %d, want 1 (a resolved incident still collects occurrences)", occCount(t, st, "inc_1"))
 	}
 	inc, _ := st.GetIncidentByID(ctx, "inc_1")
-	if inc.Status != "resolved" {
-		t.Errorf("status = %q, want resolved (an attach never reverses status)", inc.Status)
+	if inc.Status != "analyzed" {
+		t.Errorf("status = %q, want analyzed (a new episode reopens resolution)", inc.Status)
 	}
 }
 

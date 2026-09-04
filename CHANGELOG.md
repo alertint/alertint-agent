@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both; `task release:chart` handles chart-only releases and the initial chart
   publication.
 
+### Fixed
+
+- A recurrence attached to an already-resolved incident now reopens that
+  incident for recovery tracking, so resolving the recurrence updates the
+  existing Slack card back to `resolved`. Duplicate resolved deliveries remain
+  silent. (#81)
+
 ## [0.13.7] - 2026-09-02
 
 ### Fixed

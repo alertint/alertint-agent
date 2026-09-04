@@ -57,6 +57,17 @@ type Notifier struct {
 	after func(d time.Duration, fn func()) stopper
 	occMu sync.Mutex
 	occ   map[string]*occThrottle
+
+	// Root-card writes are serialized per incident so a trailing occurrence
+	// edit that is already in flight must finish before a later resolved or
+	// re-judged finding writes the authoritative card state.
+	cardWritesMu sync.Mutex
+	cardWrites   map[string]*cardWriteState
+}
+
+type cardWriteState struct {
+	mu   sync.Mutex
+	refs int
 }
 
 // Probe verifies the bot token against the Slack auth.test API. Used by
@@ -95,6 +106,7 @@ func newNotifier(client SlackClient, channel, minSeverity, recurrenceMode string
 		now:            time.Now,
 		after:          func(d time.Duration, fn func()) stopper { return time.AfterFunc(d, fn) },
 		occ:            make(map[string]*occThrottle),
+		cardWrites:     make(map[string]*cardWriteState),
 	}
 }
 
@@ -105,10 +117,38 @@ func (n *Notifier) Name() string { return "slack" }
 
 // Notify dispatches to notifyFiring or notifyResolved based on f.Status.
 func (n *Notifier) Notify(ctx context.Context, f notify.Finding) error {
+	unlock := n.lockCardWrite(f.IncidentID)
+	defer unlock()
 	if f.Status == "resolved" {
+		n.cancelPendingOcc(f.IncidentID)
 		return n.notifyResolved(ctx, f)
 	}
 	return n.notifyFiring(ctx, f)
+}
+
+// lockCardWrite takes a reference-counted per-incident lock and returns its
+// unlock function. Entries disappear when the final holder/waiter leaves, so
+// long-lived agents do not retain one mutex for every incident ever observed.
+func (n *Notifier) lockCardWrite(incidentID string) func() {
+	n.cardWritesMu.Lock()
+	state := n.cardWrites[incidentID]
+	if state == nil {
+		state = &cardWriteState{}
+		n.cardWrites[incidentID] = state
+	}
+	state.refs++
+	n.cardWritesMu.Unlock()
+
+	state.mu.Lock()
+	return func() {
+		state.mu.Unlock()
+		n.cardWritesMu.Lock()
+		state.refs--
+		if state.refs == 0 {
+			delete(n.cardWrites, incidentID)
+		}
+		n.cardWritesMu.Unlock()
+	}
 }
 
 func (n *Notifier) notifyFiring(ctx context.Context, f notify.Finding) error {

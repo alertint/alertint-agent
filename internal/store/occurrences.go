@@ -112,7 +112,9 @@ func (s *Store) InsertOccurrence(ctx context.Context, occ Occurrence) (int64, er
 // occurrence row whose alert never became a member (which a redelivery would
 // then re-count as a fresh episode). It mirrors AddAlertToIncident's counter
 // logic: the alert_count / last_alert_at bump runs only when the membership row
-// is newly inserted. Returns the new occurrence id.
+// is newly inserted. A new episode also reopens a resolved incident so its next
+// full recovery can win the normal one-shot resolved transition and notify.
+// Returns the new occurrence id.
 func (s *Store) InsertOccurrenceAndAttach(ctx context.Context, occ Occurrence, alertID string, alertTime time.Time) (int64, error) {
 	if alertID == "" {
 		return 0, errors.New("store: occurrence: alert_id is required")
@@ -174,16 +176,15 @@ func (s *Store) InsertOccurrenceAndAttach(ctx context.Context, occ Occurrence, a
 	if err != nil {
 		return 0, fmt.Errorf("store: attach occurrence alert rows: %w", err)
 	}
-	if inserted > 0 {
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE incidents
-			SET alert_count  = alert_count + 1,
-			    last_alert_at = MAX(last_alert_at, ?),
-			    updated_at    = ?
-			WHERE id = ?
-		`, alertTime.UTC().Format(time.RFC3339Nano), now, occ.IncidentID); err != nil {
-			return 0, fmt.Errorf("store: attach occurrence alert_count: %w", err)
-		}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE incidents
+		SET alert_count  = alert_count + ?,
+		    last_alert_at = CASE WHEN ? > 0 THEN MAX(last_alert_at, ?) ELSE last_alert_at END,
+		    status        = CASE WHEN status = 'resolved' THEN 'analyzed' ELSE status END,
+		    updated_at    = ?
+		WHERE id = ?
+	`, inserted, inserted, alertTime.UTC().Format(time.RFC3339Nano), now, occ.IncidentID); err != nil {
+		return 0, fmt.Errorf("store: update incident for occurrence: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("store: commit occurrence tx: %w", err)
