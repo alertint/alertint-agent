@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/alertint/alertint-agent/internal/store/storetest"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -512,7 +514,7 @@ func TestMarkIncidentResolved_ClearsTriageRow(t *testing.T) {
 	incID := readyIncident(t, s, "service=resolve-clears")
 	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
 
-	if err := s.SeedIncidentTriage(ctx, incID, now); err != nil {
+	if err := storetest.SeedIncidentTriage(ctx, s.db, incID, now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.BeginIncidentTriage(ctx, incID, now); err != nil {

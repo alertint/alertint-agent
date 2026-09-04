@@ -12,6 +12,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/alertint/alertint-agent/internal/situation"
+
+	"github.com/alertint/alertint-agent/internal/store/storetest"
 )
 
 // ----------------------------------------------------------------------
@@ -416,7 +418,7 @@ func TestClaimDueIncidentTriageRequiresADecidedRow(t *testing.T) {
 	f := newTriageFixture(t, st, "claim-undecided", now)
 	// A pending row seeded the OLD way (SeedIncidentTriage), never touched
 	// by applyTriageDecisionsTx, carries no situation_id/decision_input_version.
-	if err := st.SeedIncidentTriage(context.Background(), f.IncidentID, now); err != nil {
+	if err := storetest.SeedIncidentTriage(context.Background(), st.db, f.IncidentID, now); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1102,7 +1104,7 @@ func TestUpgradeTriageBackfillsSituationOwnershipOntoRetainedSchedulableRows(t *
 	f := newTriageFixture(t, st, "upgrade-backfill", now)
 	// A retained legacy pending row — situation_id/decision_input_version/
 	// membership_digest all null, exactly as migration 0016 preserves it.
-	if err := st.SeedIncidentTriage(ctx, f.IncidentID, now); err != nil {
+	if err := storetest.SeedIncidentTriage(ctx, st.db, f.IncidentID, now); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1176,7 +1178,7 @@ func TestUpgradeTriageSkipsIncidentsWithNoOwningSituationYet(t *testing.T) {
 	if err := st.MarkIncidentReady(ctx, incID); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SeedIncidentTriage(ctx, incID, now); err != nil {
+	if err := storetest.SeedIncidentTriage(ctx, st.db, incID, now); err != nil {
 		t.Fatal(err)
 	}
 

@@ -38,7 +38,7 @@ import (
 // ErrTriageNotDecided means a claim was attempted against an incident_triage
 // row with no recorded situation_id/decision_input_version — a row the
 // controller has never actually decided "request" for (e.g. one seeded by
-// the legacy pre-controller SeedIncidentTriage path, or an awaiting_decision
+// the legacy pre-controller seed path (now a test-only fixture), or an awaiting_decision
 // row no decision has touched yet). ClaimIncidentTriageAttempt needs both
 // values to build a valid incident_triage_attempts row.
 var ErrTriageNotDecided = errors.New("store: incident triage row has no controller decision to claim against")

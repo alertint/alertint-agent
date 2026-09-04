@@ -11,6 +11,8 @@ import (
 
 	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
+
+	"github.com/alertint/alertint-agent/internal/store/storetest"
 )
 
 // deliveryInputFor builds one DeliveryInput ready for AcceptDeliveries,
@@ -111,7 +113,7 @@ func insertBackoffIncident(t *testing.T, st *store.Store, id, groupKey string, a
 	if err := st.MarkIncidentReady(ctx, id); err != nil {
 		t.Fatalf("mark backoff incident ready: %v", err)
 	}
-	if err := st.SeedIncidentTriage(ctx, id, at); err != nil {
+	if err := storetest.SeedIncidentTriage(ctx, st.DB(), id, at); err != nil {
 		t.Fatalf("seed backoff triage: %v", err)
 	}
 	if _, err := st.BeginIncidentTriage(ctx, id, at); err != nil {

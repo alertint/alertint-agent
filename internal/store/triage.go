@@ -85,68 +85,6 @@ func seedAwaitingDecisionTriageTx(ctx context.Context, tx *sql.Tx, incidentID st
 	return nil
 }
 
-// SeedIncidentTriage moves incidentID's Acute Triage schedule into the live
-// pending/backoff dispatch loop, due at due. Since Task 6,
-// MarkIncidentReadyWithSituationInput already creates the awaiting_decision
-// row atomically with the ready transition — every ready Incident begins
-// gated, requiring a controller decision (Task 8's CommitController, via the
-// unexported applyTriageDecisionsTx) before Acute Triage may dispatch it.
-// internal/correlator is still the ONLY production caller of Acute Triage
-// dispatch in this build (Task 7 is the one that moves dispatch ownership to
-// a real worker driven by real controller decisions); until that lands,
-// this method promotes a fresh awaiting_decision row straight to pending —
-// deliberately NOT a controller decision (it calls neither DecideTriage nor
-// applyTriageDecisionsTx) — so Correlator's existing shipped dispatch
-// behavior, and every test built on it, keeps working unchanged across this
-// task's schema/atomicity change. A row with no incident_triage entry at
-// all (a caller that used the plain MarkIncidentReady, bypassing the
-// atomic-ready path entirely — every legacy/test fixture that predates Task
-// 6) still gets a fresh "pending" insert exactly as before. See the Task 6
-// report and the Task 2 report's "Task 9 ... should read this correction"
-// note: replacing this promotion with a real controller decision is Task
-// 7/8/9's call, not this task's.
-func (s *Store) SeedIncidentTriage(ctx context.Context, incidentID string, due time.Time) error {
-	now := time.Now().UTC()
-	dueStr := canonicalTime(due)
-	nowStr := canonicalTime(now)
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("store: begin seed incident triage: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	var phase string
-	var attempts int
-	err = tx.QueryRowContext(ctx, `SELECT phase, attempts FROM incident_triage WHERE incident_id = ?`, incidentID).Scan(&phase, &attempts)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO incident_triage (incident_id, phase, attempts, next_at, updated_at)
-			VALUES (?, 'pending', 0, ?, ?)`, incidentID, dueStr, nowStr); err != nil {
-			return fmt.Errorf("store: seed incident triage: %w", err)
-		}
-	case err != nil:
-		return fmt.Errorf("store: seed incident triage: read existing row: %w", err)
-	case phase == "awaiting_decision" && attempts == 0:
-		res, err := tx.ExecContext(ctx, `
-			UPDATE incident_triage SET phase = 'pending', next_at = ?, updated_at = ?
-			WHERE incident_id = ? AND phase = 'awaiting_decision'`, dueStr, nowStr, incidentID)
-		if err != nil {
-			return fmt.Errorf("store: seed incident triage: promote awaiting_decision: %w", err)
-		}
-		if n, rerr := res.RowsAffected(); rerr != nil {
-			return fmt.Errorf("store: seed incident triage: count promoted rows: %w", rerr)
-		} else if n != 1 {
-			return ErrNotFound
-		}
-	default:
-		return fmt.Errorf("store: seed incident triage: incident %s already has a triage row in phase %q", incidentID, phase)
-	}
-
-	return tx.Commit()
-}
-
 // BeginIncidentTriage atomically moves incidentID's Incident status from
 // "ready" to "processing" and its triage row to phase in_flight, incrementing
 // attempts and recording startedAt. Returns ErrNotFound if the Incident is

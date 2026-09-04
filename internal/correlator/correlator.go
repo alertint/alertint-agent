@@ -297,7 +297,7 @@ func (c *Correlator) loop(ctx context.Context) {
 // Task 7: this used to also reconcile the durable Acute Triage schedule
 // (interrupted in_flight rows, legacy ready rows with no triage row, and the
 // one-hour startup horizon — internal/correlator/triage_retry.go's
-// recoverTriageState, removed by this task). Acute Triage dispatch itself
+// the schedule-recovery helper removed by this task). Acute Triage dispatch itself
 // now runs from a dedicated internal/situation.TriageWorker, polling the
 // Task-6-gated schedule independently — its own crash/heartbeat-loss
 // recovery (store.RecoverExpiredIncidentTriageAttempts) runs at the start of
@@ -468,7 +468,7 @@ func (c *Correlator) checkAllAlertsResolved(ctx context.Context, incidentID stri
 // flushExpired marks every overdue collecting incident as ready. Task 7:
 // this used to also seed a durable triage row and dispatch it synchronously
 // (an LLM round-trip on the Correlator's own goroutine) — that dispatch
-// chain (SeedIncidentTriage + dispatchTriage + dispatchDueTriage,
+// chain (the seed, dispatch, and due-dispatch helpers,
 // internal/correlator/triage_retry.go) is removed. MarkIncidentReadyWith-
 // SituationInput already creates the gated "awaiting_decision" Triage
 // schedule row atomically with the ready transition (Task 6); dispatch from

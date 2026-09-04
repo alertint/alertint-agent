@@ -10,7 +10,10 @@ follow-on lab-deployment step (a separate, carefully-scoped dispatch —
 `task lab:check` / `task lab:pause`, then firing real drill scenarios against
 the lab VPS) fills in every `TODO` cell with real evidence gathered from the
 live lab tenant, and that second pass is the one that actually closes this
-document out.
+document out. This file is the repo-side structure; the canonical, dated
+evidence record lives beside the Plan 2 spec in the planning directory
+(`02-controller-triage-coordination/lab-acceptance.md`) and is what the
+completion gate reads.
 
 Do not fill in a cell with a guess, an extrapolation from the local replay
 run, or a number that cannot be independently re-verified from the lab

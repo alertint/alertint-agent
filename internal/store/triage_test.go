@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"github.com/alertint/alertint-agent/internal/store/storetest"
 )
 
 func TestIncidentTriageLifecycle(t *testing.T) {
@@ -19,7 +21,7 @@ func TestIncidentTriageLifecycle(t *testing.T) {
 	incID := readyIncident(t, st, groupKey)
 	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
 
-	if err := st.SeedIncidentTriage(ctx, incID, now); err != nil {
+	if err := storetest.SeedIncidentTriage(ctx, st.db, incID, now); err != nil {
 		t.Fatal(err)
 	}
 	active, err := st.BeginIncidentTriage(ctx, incID, now)
@@ -55,7 +57,7 @@ func TestIncidentTriageSkippedIsNotBackoff(t *testing.T) {
 	ctx := context.Background()
 	incID := readyIncident(t, st, "service=skip")
 	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
-	_ = st.SeedIncidentTriage(ctx, incID, now)
+	_ = storetest.SeedIncidentTriage(ctx, st.db, incID, now)
 	_, _ = st.BeginIncidentTriage(ctx, incID, now)
 	if err := st.SkipIncidentTriage(ctx, incID); err != nil {
 		t.Fatal(err)
@@ -70,7 +72,7 @@ func TestIncidentTriageDetailIsCapped(t *testing.T) {
 	ctx := context.Background()
 	incID := readyIncident(t, st, "service=cap")
 	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
-	_ = st.SeedIncidentTriage(ctx, incID, now)
+	_ = storetest.SeedIncidentTriage(ctx, st.db, incID, now)
 	_, _ = st.BeginIncidentTriage(ctx, incID, now)
 	long := "x\r\n" + string(make([]byte, 600))
 	if err := st.BackoffIncidentTriage(ctx, incID, now.Add(time.Minute), "timeout", long); err != nil {
@@ -117,7 +119,7 @@ func TestRecoverInterruptedIncidentTriage(t *testing.T) {
 	incID := readyIncident(t, st, "service=recover")
 	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
 
-	if err := st.SeedIncidentTriage(ctx, incID, now); err != nil {
+	if err := storetest.SeedIncidentTriage(ctx, st.db, incID, now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.BeginIncidentTriage(ctx, incID, now); err != nil {
@@ -156,7 +158,7 @@ func TestListLegacyReadyIncidents(t *testing.T) {
 
 	durableID := readyIncident(t, st, "service=durable")
 	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
-	if err := st.SeedIncidentTriage(ctx, durableID, now); err != nil {
+	if err := storetest.SeedIncidentTriage(ctx, st.db, durableID, now); err != nil {
 		t.Fatal(err)
 	}
 
@@ -181,7 +183,7 @@ func TestIncidentTriageSurvivesRestart(t *testing.T) {
 	}
 	incID := readyIncident(t, st, "service=restart")
 	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
-	if err := st.SeedIncidentTriage(ctx, incID, now); err != nil {
+	if err := storetest.SeedIncidentTriage(ctx, st.db, incID, now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.BeginIncidentTriage(ctx, incID, now); err != nil {
