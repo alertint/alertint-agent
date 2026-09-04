@@ -178,7 +178,9 @@ func TestEligibleReasonsNovelSymptomUnreachableGivenCurrentData(t *testing.T) {
 	// CompletedSituation carries no persisted symptom history, so "local
 	// history proves confirmed absence" can never be proven — not even
 	// with zero prior Situations, which might look like "confirmed
-	// absence" but is really "no data either way".
+	// absence" but is really "no data either way". Plan 2 scope revision
+	// of 2026-09-05: novel_symptom stays unreachable until a later plan
+	// persists per-Situation symptom identity (see reasons.go).
 	in := baseSnapshotInput(t)
 	in.PriorSituations = nil
 	symptoms := deriveSymptoms(in.Deliveries)
@@ -191,10 +193,11 @@ func TestEligibleReasonsNovelSymptomUnreachableGivenCurrentData(t *testing.T) {
 }
 
 func TestEligibleReasonsTerminalUncertaintyUnreachableGivenCurrentData(t *testing.T) {
-	// No source-aware lifecycle-observation-deadline machinery is
-	// available to this task's pure inputs (that formula belongs to Task
-	// 8's lifecycle.go) — even an implausibly long elapsed duration must
-	// not manufacture eligibility.
+	// The deadline formula exists (lifecycle.go's ObservationDeadlineAt),
+	// but the spec's second conjunct — "actionable uncertainty" — has no
+	// definition in Plan 2 (scope revision of 2026-09-05, see reasons.go),
+	// so even an implausibly long elapsed duration must not manufacture
+	// eligibility on timing alone.
 	in := baseSnapshotInput(t)
 	in.Now = in.Situation.EffectiveStartedAt.Add(365 * 24 * time.Hour)
 	symptoms := deriveSymptoms(in.Deliveries)

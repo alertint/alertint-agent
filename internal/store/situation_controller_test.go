@@ -1611,7 +1611,15 @@ func TestCommitControllerReplayWithSameStaleClaimFailsClosedNeverDoubleApplies(t
 	// Reconcile) and retries with the EXACT SAME now-stale claim must never
 	// silently double-apply: the first commit already cleared the lease, so
 	// this fails closed with ErrSituationLeaseLost rather than either
-	// re-succeeding or corrupting the already-committed row.
+	// re-succeeding or corrupting the already-committed row. This is the
+	// intended contract (spec.md "Controller commit and concurrency": the
+	// commit lands only while ID, version, owner, and claim token still
+	// match; otherwise the controller fails closed) — an identical replay
+	// converges through the NEXT claim, which finds the committed
+	// authoritative Assessment and projects it without redispatch
+	// (controller_replay_test.go boundary 9), not through a second
+	// successful commit. plan.md's Task 8 line was amended to say so on
+	// 2026-09-05.
 	err := st.CommitController(context.Background(), claim, commit)
 	if !errors.Is(err, situationmodel.ErrSituationLeaseLost) {
 		t.Fatalf("replay with stale claim err = %v, want ErrSituationLeaseLost", err)

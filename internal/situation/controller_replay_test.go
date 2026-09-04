@@ -15,7 +15,7 @@
 //
 // Task 10, brief item 1-2: one file-backed replay fixture entering through
 // real Receiver HTTP input — never a hand-seeded Situation, fact, Assessment,
-// or Triage envelope — with eight crash-boundary subtests, each closing and
+// or Triage envelope — with nine crash-boundary subtests, each closing and
 // reopening the SAME on-disk database file and running the real startup
 // recovery/replay sequence (situation.Reconstructor.Run, plus the exact
 // store.Store.BackfillUpgradedIncidentTriageSchedule/
@@ -325,7 +325,7 @@ func (f *replayFixture) close() {
 
 // reopen simulates a restart: open a fresh *store.Store against the SAME
 // on-disk file — the literal "reopen the database" this task's brief names
-// for every one of the eight crash-boundary subtests.
+// for every one of the nine crash-boundary subtests.
 func (f *replayFixture) reopen() {
 	f.t.Helper()
 	st, err := store.Open(f.ctx, f.path)
@@ -959,6 +959,10 @@ const (
 	crashPointRecordAssessmentCall    crashPoint = "crash_after_l2_dispatch_record_before_response"
 	crashPointAppendAssessmentOutcome crashPoint = "crash_after_rejected_attempt_persisted"
 	crashPointCommitController        crashPoint = "crash_after_authoritative_insert_before_commit"
+	// crashPointCommitControllerAfterCommit crashes strictly AFTER
+	// CommitController's transaction committed for real but before its
+	// result ever reached Reconcile (boundary 9).
+	crashPointCommitControllerAfterCommit crashPoint = "crash_after_commit_before_result_observed"
 )
 
 type replayCrash struct{ boundary string }
@@ -967,6 +971,9 @@ type faultyControllerStore struct {
 	*store.Store
 
 	armed crashPoint
+	// lastCommit is the ControllerCommit the wrapped store last committed
+	// for real — boundary 9 replays it verbatim against its now-stale claim.
+	lastCommit *situation.ControllerCommit
 }
 
 func (f *faultyControllerStore) RecordAssessmentCall(ctx context.Context, claim situation.Claim, call situation.AssessmentCall) error {
@@ -1010,7 +1017,15 @@ func (f *faultyControllerStore) CommitController(ctx context.Context, claim situ
 	if f.armed == crashPointCommitController {
 		panic(replayCrash{boundary: string(crashPointCommitController)})
 	}
-	return f.Store.CommitController(ctx, claim, commit)
+	err := f.Store.CommitController(ctx, claim, commit)
+	if err == nil {
+		c := commit
+		f.lastCommit = &c
+		if f.armed == crashPointCommitControllerAfterCommit {
+			panic(replayCrash{boundary: string(crashPointCommitControllerAfterCommit)})
+		}
+	}
+	return err
 }
 
 // simulateCrash runs fn and requires it to panic with exactly the expected
@@ -1037,7 +1052,7 @@ func simulateCrash(t *testing.T, boundary string, fn func()) {
 // TestControllerRealStoreReplay: the file-backed replay fixture, entering
 // through real Receiver HTTP input and production foundation/controller/
 // Triage assembly (never a hand-seeded Situation, fact, Assessment, or
-// Triage envelope), with eight crash-boundary subtests, per this task's
+// Triage envelope), with nine crash-boundary subtests, per this task's
 // brief:
 //
 //  1. after Plan 1 Situation input application
@@ -1048,6 +1063,8 @@ func simulateCrash(t *testing.T, boundary string, fn func()) {
 //  6. after Triage attempt begin but before Acute Triage result
 //  7. after Finding persistence but before worker return
 //  8. while a concurrent Situation input raises a new due reason
+//  9. after CommitController committed but before Reconcile observed it
+//     (external review 2026-09-05: the identical-replay contract)
 //
 // Every subtest closes and reopens the same on-disk database file and runs
 // the real startup recovery/replay sequence (replayFixture.bootReplay) before
@@ -1063,7 +1080,7 @@ func simulateCrash(t *testing.T, boundary string, fn func()) {
 func TestControllerRealStoreReplay(t *testing.T) {
 	// Each subtest is a named top-level function (not an inline closure):
 	// gocyclo counts every subtest's own branching against this one outer
-	// function when they are inlined, and eight independent crash-boundary
+	// function when they are inlined, and nine independent crash-boundary
 	// scenarios inlined together comfortably exceeds this repo's configured
 	// complexity ceiling even though no single scenario is itself complex.
 	// Extracting them keeps each scenario's own branching scoped to its own
@@ -1076,6 +1093,7 @@ func TestControllerRealStoreReplay(t *testing.T) {
 	t.Run("crash_after_triage_attempt_begin_before_result", testReplayCrashAfterTriageAttemptBeginBeforeResult)
 	t.Run("crash_after_finding_persisted_before_worker_return", testReplayCrashAfterFindingPersistedBeforeWorkerReturn)
 	t.Run("concurrent_input_raises_new_due_reason", testReplayConcurrentInputRaisesNewDueReason)
+	t.Run("crash_after_commit_before_result_observed", testReplayCrashAfterCommitBeforeResultObserved)
 }
 
 // Boundary 1: after Plan 1 Situation input application.
@@ -1287,6 +1305,86 @@ func testReplayCrashAfterAuthoritativeInsertBeforeCommit(t *testing.T) {
 
 	// A fresh client: the pre-crash client already spent its one real call,
 	// and it is never reused across a restart in production either.
+	freshClient := newAcceptingL2Client()
+	analyzer := newAcceptingAnalyzer()
+	after := &countingAfterCommitter{}
+	f.convergeAll(freshClient, analyzer, after, nil)
+
+	assertOneCurrentAssessment(t, f.st, sitID)
+	assertL2CallCeiling(t, f.st, sitID)
+	assertIdempotentReconverge(f, sitID, freshClient, analyzer, after)
+}
+
+// Boundary 9 (external review 2026-09-05, finding 3): after CommitController's
+// transaction committed for real but before Reconcile observed the result.
+// This is the boundary plan.md's Task 8 "idempotent replay of the same
+// commit" line was about. The contract is the spec's, not a second
+// successful commit: the commit that landed cleared the lease, so a verbatim
+// replay of the same commit against the same (now stale) claim fails closed
+// with ErrSituationLeaseLost and changes nothing; convergence comes from the
+// NEXT claim, which finds the committed authoritative Assessment and
+// projects it without redispatch. The lab saw this path as the "lease lost"
+// reconcile cycles in runs 3–6.
+func testReplayCrashAfterCommitBeforeResultObserved(t *testing.T) {
+	f := newReplayFixture(t, "b9")
+	sitID := f.setupDueSituation("boundary9-group", "HighLatency", "fp-b9")
+
+	f.clock.Advance(advanceMargin)
+	claims, err := f.st.ClaimControllerWork(f.ctx, "b9:controller", f.clock.Now(), 300*time.Second, 10)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("claim controller work: claims=%d err=%v", len(claims), err)
+	}
+	claim := claims[0]
+
+	faulty := &faultyControllerStore{Store: f.st, armed: crashPointCommitControllerAfterCommit}
+	client := newAcceptingL2Client()
+	controller := situation.NewController(faulty, client, situation.ControllerConfig{}, f.clock.Now, audit.New(f.st.DB()), nil)
+
+	simulateCrash(t, string(crashPointCommitControllerAfterCommit), func() {
+		_ = controller.Reconcile(f.ctx, claim)
+	})
+	if got := client.callCount(); got != 1 {
+		t.Fatalf("L2 calls before the simulated crash = %d, want 1", got)
+	}
+	if faulty.lastCommit == nil || faulty.lastCommit.Attempt.ID == "" {
+		t.Fatal("the crash must come strictly after a real, work-bearing commit landed")
+	}
+
+	// The commit is durable: one authoritative attempt, current pointer set
+	// to it, lease cleared — exactly what a crash one instruction later
+	// leaves behind.
+	committed := assertOneCurrentAssessment(t, f.st, sitID)
+	if committed.AssessmentID != faulty.lastCommit.Attempt.ID {
+		t.Fatalf("current_assessment_id = %s, want the committed attempt %s", committed.AssessmentID, faulty.lastCommit.Attempt.ID)
+	}
+	if owner := scalarNullableString(t, f.st, `SELECT lease_owner FROM situations WHERE id = ?`, sitID); owner != "" {
+		t.Fatalf("lease_owner = %q after the commit, want cleared", owner)
+	}
+
+	// A verbatim replay of the same commit with the same, now-stale claim
+	// (a process that never saw its own success and retries) fails closed
+	// and double-applies nothing.
+	err = f.st.CommitController(f.ctx, claim, *faulty.lastCommit)
+	if !errors.Is(err, situationmodel.ErrSituationLeaseLost) {
+		t.Fatalf("identical replay err = %v, want ErrSituationLeaseLost (spec.md: the commit lands only while owner and claim token still match)", err)
+	}
+	if n := scalarInt(t, f.st, `SELECT COUNT(*) FROM situation_assessment_attempts WHERE situation_id = ? AND status = 'authoritative'`, sitID); n != 1 {
+		t.Fatalf("authoritative attempts after the rejected replay = %d, want 1", n)
+	}
+	if again := readAssessmentIdentity(t, f.st, sitID); again != committed {
+		t.Fatalf("current assessment identity changed by the rejected replay: %+v -> %+v", committed, again)
+	}
+
+	// Restart: the next claim finds the committed Assessment. Before the
+	// duration class is aged, an unchanged basis means reuse, never a
+	// redispatch — the fresh client must not be called for it.
+	f.restart()
+	f.bootReplay()
+	if n := scalarInt(t, f.st, `SELECT COUNT(*) FROM situation_assessment_attempts WHERE situation_id = ? AND status = 'authoritative'`, sitID); n != 1 {
+		t.Fatalf("authoritative attempts after restart = %d, want 1 (startup replay must not re-derive a committed Assessment)", n)
+	}
+	f.ageIntoLongDurationClass()
+
 	freshClient := newAcceptingL2Client()
 	analyzer := newAcceptingAnalyzer()
 	after := &countingAfterCommitter{}

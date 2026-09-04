@@ -209,30 +209,31 @@ func durationOutlierEligible(elapsed time.Duration, priorSeconds []float64) bool
 }
 
 // novelSymptomEligible is spec's "only when local history proves confirmed
-// absence" predicate. CompletedSituation (this task's only prior-history
-// input) carries no persisted symptom identity at all — just ID, GroupKey,
-// EffectiveStartedAt, TerminalAt, and TerminalReason — so there is no way
-// to prove a given symptom Key was ever absent from any prior Situation,
-// let alone confirm it. This predicate is always false given current data:
-// novel_symptom is correctly unreachable until a later task threads
-// persisted per-Situation symptom identity into CompletedSituation or a
-// dedicated store read.
+// absence" predicate. It is deliberately unreachable in Plan 2 (scope
+// revision recorded in plan.md on 2026-09-05 after external review):
+// CompletedSituation — the only prior-history input — carries no persisted
+// symptom identity (just ID, GroupKey, EffectiveStartedAt, TerminalAt, and
+// TerminalReason), so "confirmed absence" of a symptom from every prior
+// Situation cannot be proven; and Symptom.Key is the Incident ID (see
+// snapshot.go), which is never comparable across Situations. Reaching this
+// code needs a durable per-Situation symptom-identity record (a schema
+// addition) plus a per-Alert-pattern symptom key — a later plan's work, not
+// a wiring gap in this one.
 func novelSymptomEligible(_ []Symptom, _ []CompletedSituation) bool {
 	return false
 }
 
 // terminalUncertaintyEligible is spec's "only when the source-aware
-// lifecycle deadline and actionable uncertainty predicate are proven"
-// gate. The full source-aware lifecycle-observation-deadline formula
-// (spec.md's "Lifecycle, Attention, and cadence" section: deadlines vary by
-// duration class and controller-owned recovery/grace state) is Task 8's
-// (lifecycle.go) to define and own as a single deterministic source of
-// truth. Implementing a second, simplified deadline formula here risks
-// silently disagreeing with Task 8's real one and creating two competing
-// answers to "is this Situation past its deadline?" — so this predicate is
-// always false given this task's inputs: terminal_uncertainty is correctly
-// unreachable until Task 8 exposes a deterministic deadline fact this
-// predicate can consume.
+// lifecycle deadline and actionable uncertainty predicate are proven" gate.
+// It is deliberately unreachable in Plan 2 (scope revision recorded in
+// plan.md on 2026-09-05 after external review). The deadline half IS
+// available now — lifecycle.go's ObservationDeadlineAt is the single
+// deterministic source of truth the controller already consults — but the
+// spec's second conjunct, "actionable uncertainty", has no definition in
+// this slice: no typed fact says what uncertainty is, when it is actionable,
+// or which evidence proves it. Emitting the code on the deadline alone would
+// make a reason admissible on timing only, which the catalog's authority
+// text forbids. Wire it once an owning stage defines that predicate.
 func terminalUncertaintyEligible(_ SnapshotInput, _ string) bool {
 	return false
 }
