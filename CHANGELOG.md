@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Coordinated releases now keep Helm README badge labels, chart tests, and
+  release-script fixtures aligned with the current versions, so the release
+  metadata commit passes the normal `main` CI checks.
+
 ## [0.13.8] - 2026-09-04
 
 ### Added

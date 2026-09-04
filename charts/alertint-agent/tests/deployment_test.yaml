@@ -9,10 +9,12 @@ set:
   secret.data.ANTHROPIC_API_KEY: x
 tests:
   - it: defaults the image tag to a v-prefixed AppVersion
+    chart:
+      appVersion: "9.8.7"
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
-          value: ghcr.io/alertint/alertint-agent:v0.13.7
+          value: ghcr.io/alertint/alertint-agent:v9.8.7
         template: deployment.yaml
 
   - it: uses an explicit image.tag as-is, without adding a v prefix

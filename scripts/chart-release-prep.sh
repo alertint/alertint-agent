@@ -111,8 +111,12 @@ awk -v chart_version="$chart_version" -v app_version="$effective_app_version" '
 
 awk -v chart_version="$chart_version" -v app_version="$effective_app_version" '
   {
+    gsub(/!\[Version: [0-9]+\.[0-9]+\.[0-9]+\]/,
+         "![Version: " chart_version "]")
     gsub(/shields\.io\/badge\/Version-[0-9]+\.[0-9]+\.[0-9]+-informational/,
          "shields.io/badge/Version-" chart_version "-informational")
+    gsub(/!\[AppVersion: [0-9]+\.[0-9]+\.[0-9]+\]/,
+         "![AppVersion: " app_version "]")
     gsub(/shields\.io\/badge\/AppVersion-[0-9]+\.[0-9]+\.[0-9]+-informational/,
          "shields.io/badge/AppVersion-" app_version "-informational")
     print
@@ -123,8 +127,12 @@ grep -Fq "version: $chart_version" "$tmp_dir/Chart.yaml" \
   || fail "failed to update chart version in $chart_yaml"
 grep -Fq "appVersion: \"$effective_app_version\"" "$tmp_dir/Chart.yaml" \
   || fail "failed to update appVersion in $chart_yaml"
+grep -Fq "![Version: $chart_version]" "$tmp_dir/README.md" \
+  || fail "failed to update chart version badge label in $readme"
 grep -Fq "Version-$chart_version-informational" "$tmp_dir/README.md" \
   || fail "failed to update chart version badge in $readme"
+grep -Fq "![AppVersion: $effective_app_version]" "$tmp_dir/README.md" \
+  || fail "failed to update appVersion badge label in $readme"
 grep -Fq "AppVersion-$effective_app_version-informational" "$tmp_dir/README.md" \
   || fail "failed to update appVersion badge in $readme"
 
