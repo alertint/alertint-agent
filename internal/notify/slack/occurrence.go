@@ -121,8 +121,8 @@ func milestoneHit(episodes int) bool {
 
 // cancelPendingOcc drops any armed trailing count-edit for an incident so a
 // coalesced stale render can't land after a re-judgment's fresh finding edit
-// (single-writer hygiene, ADR-0019). A flush already in flight is an accepted,
-// self-correcting residual.
+// (single-writer hygiene, ADR-0019). Per-incident card-write serialization
+// makes a flush already in flight finish before the authoritative finding edit.
 func (n *Notifier) cancelPendingOcc(incidentID string) {
 	n.occMu.Lock()
 	defer n.occMu.Unlock()
@@ -255,6 +255,9 @@ func averageCadence(s store.OccurrenceStats) string {
 // incident per occEditThrottle, coalesced, with a trailing flush that lands the
 // final count.
 func (n *Notifier) editOccurrenceCard(ctx context.Context, ev notify.RecurrenceEvent, ts, ch string) error {
+	unlock := n.lockCardWrite(ev.Incident.ID)
+	defer unlock()
+
 	occurrences := ev.Stats.Episodes()
 	edit := pendingEdit{
 		ts:       ts,
@@ -295,6 +298,9 @@ func (n *Notifier) editOccurrenceCard(ctx context.Context, ev notify.RecurrenceE
 // It runs on the timer goroutine, so it re-takes the lock and reads the latest
 // pending edit (a newer attach may have superseded it).
 func (n *Notifier) flushOccurrence(incidentID string) {
+	unlock := n.lockCardWrite(incidentID)
+	defer unlock()
+
 	n.occMu.Lock()
 	st := n.occ[incidentID]
 	if st == nil {

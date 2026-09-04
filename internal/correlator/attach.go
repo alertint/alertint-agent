@@ -354,6 +354,9 @@ func (c *Correlator) attachOccurrence(ctx context.Context, a store.Alert, inc st
 	if _, err := c.st.InsertOccurrenceAndAttach(ctx, occ, a.ID, a.ReceivedAt); err != nil {
 		return fmt.Errorf("correlator: attach occurrence: %w", err)
 	}
+	if inc.Status == "resolved" {
+		inc.Status = "analyzed"
+	}
 
 	if c.auditor != nil {
 		if err := c.auditor.Append(ctx, "correlator", "incident.occurrence_attached", map[string]any{

@@ -179,3 +179,65 @@ func TestRejudgeResolvedIncidentStillNotifies(t *testing.T) {
 		t.Errorf("Finding.Status = %q, want resolved", notifier.last.Status)
 	}
 }
+
+// TestRejudgeClaimsReopenedIncidentResolution covers the recurrence race: the
+// ingress path may persist the occurrence's resolved alert while a synchronous
+// re-judgment is still running. The re-judgment's resolved finding must claim
+// analyzed -> resolved before it notifies, so the queued correlator delivery
+// cannot publish the same recovery a second time.
+func TestRejudgeClaimsReopenedIncidentResolution(t *testing.T) {
+	ctx, st, _, _, analyzed, a := analyzedFixture(t)
+	if _, err := st.DB().ExecContext(ctx, `
+		CREATE TRIGGER resolve_member_after_rejudge
+		AFTER UPDATE OF last_judged_at ON incidents
+		BEGIN
+			UPDATE alerts SET status = 'resolved';
+		END
+	`); err != nil {
+		t.Fatalf("create resolved-during-rejudge trigger: %v", err)
+	}
+
+	notifier := &captureNotifier{}
+	rejudgeLLM := &fakeLLM{response: validLLMResponse([]string{a.ID})}
+	rejudgeSkill := acutetriage.New(acutetriage.Config{}, st, rejudgeLLM, nil, notifier, nil)
+	if err := rejudgeSkill.Rejudge(ctx, analyzed, "severity"); err != nil {
+		t.Fatalf("Rejudge: %v", err)
+	}
+	if notifier.last == nil || notifier.last.Status != "resolved" {
+		t.Fatalf("re-judgment finding = %+v, want resolved", notifier.last)
+	}
+	got, err := st.GetIncidentByID(ctx, analyzed.ID)
+	if err != nil {
+		t.Fatalf("load incident: %v", err)
+	}
+	if got.Status != "resolved" {
+		t.Fatalf("incident status = %q, want resolved before notification", got.Status)
+	}
+	if err := st.MarkIncidentResolved(ctx, analyzed.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("queued resolver = %v, want ErrNotFound from lost CAS", err)
+	}
+}
+
+func TestRejudgeSuppressesResolvedNotificationWhenAnotherPathWon(t *testing.T) {
+	ctx, st, _, _, analyzed, a := analyzedFixture(t)
+	if _, err := st.DB().ExecContext(ctx, `
+		CREATE TRIGGER win_resolution_during_rejudge
+		AFTER UPDATE OF last_judged_at ON incidents
+		BEGIN
+			UPDATE alerts SET status = 'resolved';
+			UPDATE incidents SET status = 'resolved' WHERE id = NEW.id;
+		END
+	`); err != nil {
+		t.Fatalf("create competing resolver trigger: %v", err)
+	}
+
+	notifier := &captureNotifier{}
+	rejudgeLLM := &fakeLLM{response: validLLMResponse([]string{a.ID})}
+	rejudgeSkill := acutetriage.New(acutetriage.Config{}, st, rejudgeLLM, nil, notifier, nil)
+	if err := rejudgeSkill.Rejudge(ctx, analyzed, "severity"); err != nil {
+		t.Fatalf("Rejudge: %v", err)
+	}
+	if notifier.last != nil {
+		t.Fatalf("losing re-judgment notified %+v, want no duplicate finding", *notifier.last)
+	}
+}

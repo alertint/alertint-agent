@@ -134,7 +134,7 @@ func (noopTimer) Stop() bool { return true }
 
 // occNotifier builds a Slack notifier wired with the fake client/store and a
 // controllable clock + captured trailing-flush timer.
-func occNotifier(t *testing.T, client *fakeSlack, ts *fakeThreadStore) (*Notifier, *time.Time, *func()) {
+func occNotifier(t *testing.T, client SlackClient, ts *fakeThreadStore) (*Notifier, *time.Time, *func()) {
 	t.Helper()
 	n := NewWithClient(client, "chan", "", "change-gated", ts, nil)
 	clockNow := time.Unix(1_000_000, 0).UTC()
@@ -475,6 +475,116 @@ func TestRecurrence_PendingFlushCanceledOnRejudge(t *testing.T) {
 	}
 	if !stopped {
 		t.Error("pending trailing count-edit timer was not stopped on a re-judging attach")
+	}
+}
+
+func TestRecurrence_PendingFlushCanceledOnResolution(t *testing.T) {
+	client := newFakeSlack(t)
+	n, now, _ := occNotifier(t, client, &fakeThreadStore{})
+	stopped := false
+	n.after = func(_ time.Duration, _ func()) stopper { return &recordingStopper{stopped: &stopped} }
+	if err := n.OnOccurrenceAttached(context.Background(), recurEvent("none", 1, *now)); err != nil {
+		t.Fatalf("attach 1: %v", err)
+	}
+	if err := n.OnOccurrenceAttached(context.Background(), recurEvent("none", 2, *now)); err != nil {
+		t.Fatalf("attach 2: %v", err)
+	}
+
+	if err := n.Notify(context.Background(), notify.Finding{
+		IncidentID:   "inc12345678",
+		AnalysisName: "Disk full",
+		Status:       "resolved",
+		FirstAlertAt: now.Add(-time.Hour),
+		AnalyzedAt:   *now,
+	}); err != nil {
+		t.Fatalf("notify resolved: %v", err)
+	}
+	if !stopped {
+		t.Error("pending trailing count-edit timer was not stopped on resolution")
+	}
+}
+
+type blockingUpdateClient struct {
+	mu             sync.Mutex
+	startedUpdates int
+	completed      []int
+	secondStarted  chan struct{}
+	thirdStarted   chan struct{}
+	releaseSecond  chan struct{}
+}
+
+func (c *blockingUpdateClient) PostMessageContext(_ context.Context, _ string, _ ...slacklib.MsgOption) (string, string, error) {
+	return "chan", "ts-1", nil
+}
+
+func (c *blockingUpdateClient) UpdateMessageContext(_ context.Context, _, _ string, _ ...slacklib.MsgOption) (string, string, string, error) {
+	c.mu.Lock()
+	c.startedUpdates++
+	call := c.startedUpdates
+	c.mu.Unlock()
+	switch call {
+	case 2:
+		close(c.secondStarted)
+		<-c.releaseSecond
+	case 3:
+		close(c.thirdStarted)
+	}
+	c.mu.Lock()
+	c.completed = append(c.completed, call)
+	c.mu.Unlock()
+	return "chan", "ts-1", "", nil
+}
+
+func TestRecurrence_InFlightFlushCompletesBeforeResolution(t *testing.T) {
+	client := &blockingUpdateClient{
+		secondStarted: make(chan struct{}),
+		thirdStarted:  make(chan struct{}),
+		releaseSecond: make(chan struct{}),
+	}
+	n, now, flush := occNotifier(t, client, &fakeThreadStore{})
+	if err := n.OnOccurrenceAttached(context.Background(), recurEvent("none", 1, *now)); err != nil {
+		t.Fatalf("attach 1: %v", err)
+	}
+	if err := n.OnOccurrenceAttached(context.Background(), recurEvent("none", 2, *now)); err != nil {
+		t.Fatalf("attach 2: %v", err)
+	}
+
+	flushDone := make(chan struct{})
+	go func() {
+		(*flush)()
+		close(flushDone)
+	}()
+	<-client.secondStarted
+
+	resolvedDone := make(chan error, 1)
+	go func() {
+		resolvedDone <- n.Notify(context.Background(), notify.Finding{
+			IncidentID:   "inc12345678",
+			AnalysisName: "Disk full",
+			Status:       "resolved",
+			FirstAlertAt: now.Add(-time.Hour),
+			AnalyzedAt:   *now,
+		})
+	}()
+
+	resolutionOvertookFlush := false
+	select {
+	case <-client.thirdStarted:
+		resolutionOvertookFlush = true
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(client.releaseSecond)
+	<-flushDone
+	if err := <-resolvedDone; err != nil {
+		t.Fatalf("notify resolved: %v", err)
+	}
+	if resolutionOvertookFlush {
+		t.Error("resolution update started before the in-flight recurrence edit completed")
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if got := fmt.Sprint(client.completed); got != "[1 2 3]" {
+		t.Errorf("completed root-card writes = %s, want [1 2 3]", got)
 	}
 }
 
