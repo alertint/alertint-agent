@@ -101,9 +101,12 @@ var ErrAlertDispatchLeaseLost = errors.New("store: alert dispatch lease lost")
 // attach) is no longer valid — the target Incident's status moved to a
 // terminal state between planning and commit, or the Incident's owning
 // Situation has reached a terminal lifecycle (a later firing must never
-// cross a terminal Situation boundary). The caller must discard the plan
-// and correlate the delivery as a fresh Incident instead; that fresh
-// Incident's Situation input then opens a linked new Situation.
+// cross a terminal Situation boundary), or — for a retry-backoff attach —
+// the Incident's Acute Triage schedule left the backoff phase (see
+// CorrelatedDeliveryMutation.RequireTriageBackoff). The caller must discard
+// the plan and re-plan the delivery (its next attachment path, else a fresh
+// Incident); a fresh Incident's Situation input then opens a linked new
+// Situation.
 var ErrIncidentOwnerNotCollapsible = errors.New("store: incident owner does not permit correlated attach")
 
 // CorrelatedDeliveryMutation is everything ApplyCorrelatedDelivery needs to
@@ -119,6 +122,15 @@ var ErrIncidentOwnerNotCollapsible = errors.New("store: incident owner does not 
 // Incident's own status and, per the spec's terminal-boundary rule, its
 // owning Situation's lifecycle, re-checked inside the transaction; it is
 // never set for a fresh-Incident or resolved-delivery-association plan.
+// RequireTriageBackoff is the retry-backoff attach's own exact precondition
+// on top of that: the plan was made against an Incident whose Acute Triage
+// schedule was durably in backoff, and the attach is legal only while that
+// is still true at commit. If the schedule moved on in between — the
+// controller committed a clean skip (a first judgment that closes
+// membership), a worker claimed the row in flight, or the schedule exhausted
+// — the plan is rejected with ErrIncidentOwnerNotCollapsible so the
+// correlator re-plans (recurrence collapse or a fresh Incident) instead of
+// attaching membership behind a decision that never saw it.
 type CorrelatedDeliveryMutation struct {
 	DeliveryID              string
 	DispatchOwner           string
@@ -127,6 +139,7 @@ type CorrelatedDeliveryMutation struct {
 	Occurrence              *Occurrence
 	Input                   SituationInput
 	RequireNonterminalOwner bool
+	RequireTriageBackoff    bool
 }
 
 // CorrelatedDeliveryResult is the durable outcome ApplyCorrelatedDelivery
@@ -519,6 +532,15 @@ func (s *Store) ApplyCorrelatedDelivery(ctx context.Context, m CorrelatedDeliver
 			return CorrelatedDeliveryResult{}, ErrIncidentOwnerNotCollapsible
 		}
 	}
+	if m.RequireTriageBackoff {
+		inBackoff, err := triageInBackoffTx(ctx, tx, m.Incident.ID)
+		if err != nil {
+			return CorrelatedDeliveryResult{}, err
+		}
+		if !inBackoff {
+			return CorrelatedDeliveryResult{}, ErrIncidentOwnerNotCollapsible
+		}
+	}
 
 	now := time.Now().UTC()
 	occurrenceID, err := applyCorrelatedOccurrenceTx(ctx, tx, m.Incident.ID, m.Occurrence, deliveryReceivedAt)
@@ -588,6 +610,23 @@ func terminalSituationOwnerTx(ctx context.Context, tx *sql.Tx, incidentID string
 		return false, fmt.Errorf("store: read correlated incident's situation owner: %w", err)
 	}
 	return lifecycle == "recovered" || lifecycle == "closed_unknown", nil
+}
+
+// triageInBackoffTx reports whether incidentID's Acute Triage schedule row is
+// still exactly in the "backoff" phase — the retry-backoff attach's
+// precondition (see CorrelatedDeliveryMutation.RequireTriageBackoff). A
+// missing row counts as not in backoff: the schedule rows are deleted on
+// completion, so "no row" means the Incident is no longer retrying.
+func triageInBackoffTx(ctx context.Context, tx *sql.Tx, incidentID string) (bool, error) {
+	var phase string
+	err := tx.QueryRowContext(ctx, `SELECT phase FROM incident_triage WHERE incident_id = ?`, incidentID).Scan(&phase)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("store: read correlated incident's triage phase: %w", err)
+	}
+	return TriagePhase(phase) == TriageBackoff, nil
 }
 
 // applyDuplicateCorrelatedDeliveryTx handles a delivery that already owns an

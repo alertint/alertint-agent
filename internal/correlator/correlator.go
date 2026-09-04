@@ -714,9 +714,21 @@ func (c *Correlator) applyRetryAttachDeliveryPlan(ctx context.Context, claim sto
 		return false, nil
 	}
 
-	result, err := c.applyExistingIncidentDeliveryPlan(ctx, claim, *candidate, "membership_changed", true)
+	m, err := c.correlatedDeliveryMutation(claim, *candidate, nil, "membership_changed", true)
+	if err != nil {
+		return false, err
+	}
+	// The exact precondition this plan was made under: the schedule is still
+	// in backoff at commit. A clean skip, an in-flight claim, or exhaustion
+	// that landed between the read above and the commit rejects the plan
+	// (ErrIncidentOwnerNotCollapsible), and the delivery falls through to
+	// the next attachment path — membership never attaches behind a
+	// decision that did not see it.
+	m.RequireTriageBackoff = true
+	result, err := c.st.ApplyCorrelatedDelivery(ctx, m)
 	if err != nil {
 		if errors.Is(err, store.ErrIncidentOwnerNotCollapsible) {
+			c.logger.Info("correlator: retry attach rejected at commit; triage schedule left backoff", "incident_id", candidate.ID, "group_key", gk, "delivery_id", claim.Delivery.ID)
 			return false, nil
 		}
 		return false, fmt.Errorf("correlator: attach retrying incident: %w", err)
