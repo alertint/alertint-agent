@@ -1094,6 +1094,7 @@ func TestControllerRealStoreReplay(t *testing.T) {
 	t.Run("crash_after_finding_persisted_before_worker_return", testReplayCrashAfterFindingPersistedBeforeWorkerReturn)
 	t.Run("concurrent_input_raises_new_due_reason", testReplayConcurrentInputRaisesNewDueReason)
 	t.Run("crash_after_commit_before_result_observed", testReplayCrashAfterCommitBeforeResultObserved)
+	t.Run("restart_after_commit_reuses_without_redispatch", testReplayRestartAfterCommitReusesWithoutRedispatch)
 }
 
 // Boundary 1: after Plan 1 Situation input application.
@@ -1393,6 +1394,62 @@ func testReplayCrashAfterCommitBeforeResultObserved(t *testing.T) {
 	assertOneCurrentAssessment(t, f.st, sitID)
 	assertL2CallCeiling(t, f.st, sitID)
 	assertIdempotentReconverge(f, sitID, freshClient, analyzer, after)
+}
+
+// Boundary 9's companion (external review 2026-09-05, follow-up): the same
+// post-commit crash, but the duration class is aged BEFORE the pre-crash
+// commit and left alone afterwards, so the basis after the restart is
+// unchanged and the proof is direct: startup replay plus one converge pass
+// over the committed Assessment dispatch ZERO L2 calls, grow no dispatch
+// rows, and produce exactly a revalidated_reuse row bound to the new claim.
+// Boundary 9 itself ages the class after the restart (as every other
+// boundary does, see longClassMargin), which forces a fresh derivation and
+// so cannot prove the zero-redispatch half on its own.
+func testReplayRestartAfterCommitReusesWithoutRedispatch(t *testing.T) {
+	f := newReplayFixture(t, "b9r")
+	sitID := f.setupDueSituation("boundary9r-group", "HighLatency", "fp-b9r")
+	f.ageIntoLongDurationClass()
+
+	claims, err := f.st.ClaimControllerWork(f.ctx, "b9r:controller", f.clock.Now(), 300*time.Second, 1)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("claim controller work: claims=%d err=%v", len(claims), err)
+	}
+	faulty := &faultyControllerStore{Store: f.st, armed: crashPointCommitControllerAfterCommit}
+	client := newAcceptingL2Client()
+	controller := situation.NewController(faulty, client, situation.ControllerConfig{}, f.clock.Now, audit.New(f.st.DB()), nil)
+	simulateCrash(t, string(crashPointCommitControllerAfterCommit), func() {
+		_ = controller.Reconcile(f.ctx, claims[0])
+	})
+	if got := client.callCount(); got != 1 {
+		t.Fatalf("L2 calls before the simulated crash = %d, want 1", got)
+	}
+	before := readAssessmentIdentity(t, f.st, sitID)
+	beforeCalls := scalarInt(t, f.st, `SELECT COUNT(*) FROM situation_assessment_calls WHERE situation_id = ?`, sitID)
+
+	f.restart()
+	f.bootReplay()
+	f.clock.Advance(slowCadenceCheckpointMargin)
+	freshClient := newAcceptingL2Client()
+	totals := f.convergeAll(freshClient, newAcceptingAnalyzer(), &countingAfterCommitter{}, nil)
+	if totals.Controller == 0 {
+		t.Fatal("no controller reconciliation ran after the restart")
+	}
+	if got := freshClient.callCount(); got != 0 {
+		t.Errorf("unchanged basis redispatched %d L2 calls after the restart, want 0", got)
+	}
+	if got := scalarInt(t, f.st, `SELECT COUNT(*) FROM situation_assessment_calls WHERE situation_id = ?`, sitID); got != beforeCalls {
+		t.Errorf("dispatch rows grew from %d to %d across the restart", beforeCalls, got)
+	}
+	after := readAssessmentIdentity(t, f.st, sitID)
+	if before.AssessmentID == after.AssessmentID {
+		t.Fatal("expected a newly derived revalidated_reuse Assessment bound to the post-restart claim, got the pre-crash row re-pointed")
+	}
+	if before.MaterialFactHash != after.MaterialFactHash || before.BasisHash != after.BasisHash {
+		t.Fatalf("hashes changed across the restart: %+v -> %+v", before, after)
+	}
+	if derivation := scalarString(t, f.st, `SELECT derivation FROM situation_assessment_attempts WHERE id = ?`, after.AssessmentID); derivation != "revalidated_reuse" {
+		t.Errorf("post-restart derivation = %s, want revalidated_reuse", derivation)
+	}
 }
 
 // Boundary 6: after Triage attempt begin but before Acute Triage result.
