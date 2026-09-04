@@ -53,7 +53,14 @@ on one long-firing alert (days old, cadence slow, its only wake reason the
 lifecycle observation deadline) recomputes its next assessment as one
 second ahead every cycle and so reuses its assessment every two seconds
 without end, appending an attempt row each time. It makes no model calls,
-but the row growth is unbounded. Root cause and fix are still open.
+but the row growth is unbounded. Root cause: the observation deadline had
+already passed, the lifecycle rightly kept the Situation open while the
+alert fired, but the passed deadline was still offered to the contract as
+a future checkpoint and clamped to the one-second minimum lead. The fix
+drops a passed deadline from the checkpoint candidates so the Situation
+idles at its cadence
+(`TestControllerReconcilePastObservationDeadlineWhileFiringIdlesAtCadence`);
+it too awaits the next lab run.
 
 Do not fill in a cell with a guess, an extrapolation from the local replay
 run, or a number that cannot be independently re-verified from the lab
