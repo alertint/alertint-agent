@@ -1135,6 +1135,78 @@ func ctLifecycleController(store situation.ControllerStore, client situation.Ass
 	return situation.NewController(store, client, situation.ControllerConfig{}, clock, nil, nil)
 }
 
+// Lab run 4, defect F8: a Situation whose observation deadline has already
+// passed but whose alert is still firing stays active (correct), yet the
+// past deadline kept being folded into next_update_at as a checkpoint, which
+// nextUpdateAt clamps to now + 1 s — so the worker re-claimed the Situation
+// on every 2 s poll, forever, one reuse row per cycle. A past deadline must
+// drop out of the contract; a future one must still be promised.
+func TestControllerReconcilePastObservationDeadlineWhileFiringIdlesAtCadence(t *testing.T) {
+	effectiveStartedAt := ctBaseTime
+	deadline := effectiveStartedAt.Add(7 * 24 * time.Hour) // "long" class: the only class whose deadline is reachable while still in class.
+
+	for _, tc := range []struct {
+		name         string
+		now          time.Time
+		wantDeadline bool
+	}{
+		// Closer than the slow cadence's own 15 m, so the deadline is the earliest candidate and must win.
+		{name: "deadline still ahead", now: deadline.Add(-5 * time.Minute), wantDeadline: true},
+		{name: "deadline passed", now: deadline.Add(3 * 24 * time.Hour), wantDeadline: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := ctBaseSnapshotInput() // one firing delivery, active lifecycle.
+			in.Now = tc.now
+			in.Situation.EffectiveStartedAt = effectiveStartedAt
+			if got := situation.BuildSnapshot(in).DurationClass; got != situation.DurationClassLong {
+				t.Fatalf("fixture invariant: duration class = %q, want long", got)
+			}
+
+			store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
+			client := &fakeAssessmentClient{responses: []func() (llm.OneShotCompletion, error){acceptedResponse(t)}}
+			c := ctLifecycleController(store, client, tc.now)
+
+			if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			if len(store.commits) != 1 {
+				t.Fatalf("commits = %d, want 1", len(store.commits))
+			}
+			commit := store.commits[0]
+			if commit.Lifecycle != model.LifecycleActive {
+				t.Fatalf("lifecycle = %q, want active (fresh firing truth always prevents closure)", commit.Lifecycle)
+			}
+			contract := commit.Assessment.ActionContract
+			if contract.NextUpdateAt == nil {
+				t.Fatal("non-terminal contract must carry next_update_at")
+			}
+			promised := false
+			for _, on := range contract.NextUpdateOn {
+				if on == model.NextUpdateOnLifecycleObservationDeadline {
+					promised = true
+				}
+			}
+			if promised != tc.wantDeadline {
+				t.Fatalf("next_update_on promises lifecycle_observation_deadline = %v, want %v (next_update_on = %v)", promised, tc.wantDeadline, contract.NextUpdateOn)
+			}
+			if tc.wantDeadline {
+				if !contract.NextUpdateAt.Equal(deadline) {
+					t.Fatalf("next_update_at = %v, want the still-future deadline %v", *contract.NextUpdateAt, deadline)
+				}
+				return
+			}
+			// Past deadline: the contract must fall back to the cadence, never
+			// to the 1 s minimum lead that produced the hot loop.
+			if lead := contract.NextUpdateAt.Sub(tc.now); lead < time.Minute {
+				t.Fatalf("next_update_at lead = %v, want the cadence interval (>= 1m), not the clamped minimum", lead)
+			}
+			if !commit.NextAssessmentAt.Equal(*contract.NextUpdateAt) {
+				t.Fatalf("NextAssessmentAt = %v, want the contract's next_update_at %v", commit.NextAssessmentAt, *contract.NextUpdateAt)
+			}
+		})
+	}
+}
+
 func TestControllerReconcileLifecycleActiveStaysActiveWhileFiring(t *testing.T) {
 	now := ctBaseTime.Add(5 * time.Minute)
 	in := ctBaseSnapshotInput() // one firing delivery, active lifecycle.

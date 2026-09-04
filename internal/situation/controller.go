@@ -1000,8 +1000,21 @@ func revalidatedPreservedAssessment(snap Snapshot, in SnapshotInput, state Contr
 func (c *Controller) buildControllerState(snap Snapshot, in SnapshotInput, lc lifecycleResolution, triageDecisions []TriageDecision, now time.Time) ControllerState {
 	var deadline *time.Time
 	if !lc.Lifecycle.Terminal() {
-		d := ObservationDeadlineAt(in.Situation.EffectiveStartedAt, snap.DurationClass)
-		deadline = &d
+		// The deadline is a "reconsider at" checkpoint only while it is
+		// still ahead. Once it has passed on a non-terminal Situation the
+		// lifecycle has already reconsidered it this very cycle
+		// (resolveLifecycle: fresh firing truth kept it open), so there is
+		// nothing left to wake up for at that instant — and carrying a past
+		// checkpoint forward made nextUpdateAt clamp every cycle to
+		// now + 1 s, re-claiming the Situation on every worker poll for as
+		// long as the alert kept firing (lab run 4, F8: one reuse row every
+		// 2 s on a week-old alert). A past deadline therefore drops out of
+		// the candidates and the promise, and the Situation idles at its
+		// cadence like any other; the deadline itself still governs closure
+		// the moment firing truth is gone, in resolveLifecycle.
+		if d := ObservationDeadlineAt(in.Situation.EffectiveStartedAt, snap.DurationClass); now.Before(d) {
+			deadline = &d
+		}
 	}
 	return ControllerState{
 		Tempo:                          c.cfg.Cadence,
