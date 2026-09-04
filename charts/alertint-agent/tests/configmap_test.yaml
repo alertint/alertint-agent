@@ -1,0 +1,36 @@
+suite: configmap
+templates:
+  - configmap.yaml
+tests:
+  - it: renders the default config block by default
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: "provider: anthropic"
+
+  - it: configOverride fully replaces the default config, with no trace of it merged in
+    set:
+      configOverride: |
+        receivers:
+          address: "0.0.0.0:9911"
+        llm:
+          provider: openai-compatible
+          base_url: http://localhost:30000
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: "provider: openai-compatible"
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: "anthropic"
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: "ANTHROPIC_API_KEY"
+
+  - it: renders nothing at all when existingConfigMap is set, even alongside configOverride
+    set:
+      existingConfigMap: my-cm
+      configOverride: "foo: bar"
+    asserts:
+      - hasDocuments:
+          count: 0

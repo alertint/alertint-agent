@@ -1,0 +1,49 @@
+alertint-agent has been deployed.
+
+Check the rollout:
+  kubectl rollout status deployment/{{ include "alertint-agent.fullname" . }} -n {{ .Release.Namespace }}
+
+Check health once it's up:
+  kubectl port-forward svc/{{ include "alertint-agent.fullname" . }} -n {{ .Release.Namespace }} {{ .Values.service.webhookPort }}:{{ .Values.service.webhookPort }}
+  curl http://localhost:{{ .Values.service.webhookPort }}/health
+
+{{- $usingChartConfig := and (not .Values.configOverride) (not .Values.existingConfigMap) }}
+{{- if not $usingChartConfig }}
+
+NOTE: you're using {{ if .Values.existingConfigMap }}existingConfigMap{{ else }}configOverride{{ end }}
+instead of the chart's `config` values, so which receivers/MCP are actually
+enabled can't be determined from chart values alone — check your own
+configuration for what's running and on which paths.
+{{- else }}
+{{- if .Values.config.alertmanager.enabled }}
+
+Point your Alertmanager webhook receiver at:
+  http://{{ include "alertint-agent.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.webhookPort }}/webhook/alertmanager
+{{- end }}
+
+{{- if .Values.config.changes.ingress.enabled }}
+
+Change-event webhook (ArgoCD notifications, CI/CD deploy hooks, etc.):
+  http://{{ include "alertint-agent.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.webhookPort }}/webhook/change
+{{- end }}
+{{- end }}
+
+{{- $mcpState := include "alertint-agent.mcpState" . }}
+{{- if eq $mcpState "enabled" }}
+
+MCP endpoint (Claude Code, Cursor, and other MCP-compatible tools) — in-cluster:
+  http://{{ include "alertint-agent.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.mcpPort }}/mcp
+{{- if not (and .Values.ingress.enabled .Values.ingress.mcp.enabled) }}
+(set ingress.enabled and ingress.mcp.enabled to reach it from outside the cluster)
+{{- end }}
+{{- else if eq $mcpState "unknown" }}
+
+MCP: cannot be determined from chart values alone — an external config
+source and/or externally-supplied credentials are in play (existingSecret,
+existingConfigMap, configOverride, or extraEnv/extraEnvFrom). If a token
+ends up configured for AlertINT's MCP server in your actual setup:
+  http://{{ include "alertint-agent.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.mcpPort }}/mcp
+{{- else }}
+
+MCP is not enabled{{ if $usingChartConfig }} (no value provided for {{ .Values.config.mcp.token_env }}){{ end }}.
+{{- end }}

@@ -1,0 +1,282 @@
+# Default values for alertint-agent.
+#
+# NOTE: there is no replicaCount value. The Deployment template hardcodes
+# replicas: 1 and it is not overridable — the SQLite store is single-writer
+# by design (one connection, "v1 has one writer process" —
+# internal/store/store.go). Running a second replica against the same
+# database causes duplicate incident processing and duplicate
+# notifications, not higher availability. See the README for details.
+
+image:
+  repository: ghcr.io/alertint/alertint-agent
+  pullPolicy: IfNotPresent
+  # -- Overrides the image tag. Defaults to the "v"-prefixed release tag
+  # matching .Chart.AppVersion (e.g. AppVersion 0.13.7 -> tag v0.13.7),
+  # matching how alertint-agent's own images are actually published. An
+  # explicit value here is always used as-is, with no prefix added.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+# The upstream image runs as a distroless "nonroot" image (USER 65532:65532).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+service:
+  type: ClusterIP
+  # -- External Service port for Alertmanager/change/Zabbix webhooks + GET
+  # /health. The container itself always listens on 9911 regardless of this
+  # value (it's fixed in the Deployment template and mapped by name) — this
+  # only changes what port the Service exposes it as. Only served when at
+  # least one receiver under config.* is enabled (see values below).
+  webhookPort: 9911
+  # -- External Service port for the MCP HTTP server (AI coding agents). The
+  # container always listens on 9912 regardless of this value, mapped by
+  # name the same way as webhookPort. Harmless to expose even if config.mcp
+  # is left disabled — nothing listens on it in that case.
+  mcpPort: 9912
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  webhook:
+    host: ""
+    # -- Prefix-matches /webhook/alertmanager, /webhook/change, etc. Kept
+    # away from "/" deliberately so GET /health isn't reachable through this
+    # Ingress just because it shares the Service.
+    path: /webhook
+    pathType: Prefix
+    tls: []
+  mcp:
+    enabled: false
+    host: ""
+    path: /
+    pathType: ImplementationSpecific
+    tls: []
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 256Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+# -- Liveness/readiness probing. Uses GET /health, served alongside the
+# webhook receivers on service.webhookPort — this requires at least one
+# receiver (config.alertmanager, config.changes.ingress or config.zabbix.ingress)
+# to be enabled, which is the default here (alertmanager). If you disable
+# every receiver, disable these probes too, or the pod will never go Ready.
+probes:
+  enabled: true
+  initialDelaySeconds: 5
+  periodSeconds: 15
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+persistence:
+  # -- Persists the SQLite store across restarts. Disabling this means every
+  # restart starts from an empty incident/memory history — fine for a
+  # throwaway demo, not for a real deployment.
+  enabled: true
+  storageClassName: ""
+  accessMode: ReadWriteOnce
+  size: 1Gi
+  # -- Use a pre-existing PVC instead of creating one.
+  existingClaim: ""
+  mountPath: /data
+
+# -- Secret providing every *_env value referenced anywhere in `config` below
+# (webhook_token_env, api_key_env, bot_token_env, token_env, ...). All of its
+# keys are exposed to the container via envFrom, so any name you reference in
+# `config` just needs to exist as a key here.
+#
+# Exactly one of these three shapes is required — the chart fails the render
+# with a clear message otherwise: both create and existingSecret set; neither
+# set while enabled stays true; or enabled: false alongside create/
+# existingSecret (a contradiction — with enabled false the Deployment never
+# references the built-in Secret at all, so whichever one you configured
+# here would be created/referenced but silently unused).
+#   1) secret.existingSecret: the name of a Secret you manage yourself
+#      (External Secrets, Sealed Secrets, SOPS, etc.) — the recommended path
+#      for anything beyond local testing.
+#   2) secret.create: true with secret.data — the chart creates a plain
+#      Secret from values. Convenient for a quick start; do not commit real
+#      tokens into a values file under version control.
+#   3) secret.enabled: false — a deliberate opt-out of the built-in Secret
+#      entirely (e.g. every *_env value is supplied via extraEnv/extraEnvFrom
+#      instead). No envFrom is rendered in this case. Requires both create
+#      and existingSecret to be left unset.
+secret:
+  # -- Set to false to opt out of the built-in Secret entirely (see mode 3
+  # above). Requires both create and existingSecret to be left unset —
+  # combining enabled: false with either of them fails the render.
+  enabled: true
+  # -- Create a Secret from secret.data below.
+  create: false
+  # -- Name of a pre-existing Secret to use instead of creating one.
+  existingSecret: ""
+  # -- Secret keys/values to create, only used when secret.create is true.
+  # data:
+  #   ALERTINT_WEBHOOK_TOKEN: "changeme"
+  #   ANTHROPIC_API_KEY: "changeme"
+  data: {}
+
+extraEnv: []
+extraEnvFrom: []
+extraVolumes: []
+extraVolumeMounts: []
+
+# -- Name of a pre-existing ConfigMap to mount at /etc/alertint instead of
+# the one this chart would otherwise create from `config`/`configOverride`.
+# You own its content and its key (must be named config.yaml) entirely —
+# the chart doesn't read or validate it. Takes priority over both `config`
+# and `configOverride` below.
+existingConfigMap: ""
+
+# -- Raw YAML config, used verbatim as config.yaml instead of `config`
+# below when non-empty. Unlike `config` (a YAML map, which Helm deep-merges
+# with the chart's defaults on a partial override — see the warning below),
+# a plain string value is never merged: whatever you put here is exactly
+# what ships, with nothing inherited from the chart's defaults. Prefer this
+# (or existingConfigMap above) over partially overriding `config` whenever
+# you want to be certain no default leaks through — e.g. switching
+# llm.provider to openai-compatible without also inheriting the default
+# llm.api_key_env: ANTHROPIC_API_KEY.
+# configOverride: |
+#   receivers:
+#     address: "0.0.0.0:9911"
+#   alertmanager:
+#     enabled: true
+#     webhook_token_env: ALERTINT_WEBHOOK_TOKEN
+#   ...
+configOverride: ""
+
+# -- The complete alertint-agent config, rendered verbatim to
+# /etc/alertint/config.yaml — but ONLY when both existingConfigMap and
+# configOverride above are empty. This mirrors config.example.yaml in the
+# alertint-agent repo (see also docs/getting-started/configuration.md) —
+# that file documents every available field; this chart intentionally does
+# not duplicate the schema into typed Helm values, since it evolves with
+# the app itself.
+#
+# WARNING: this is a YAML map, so Helm deep-merges a partial override with
+# the defaults below rather than replacing them — e.g. setting only
+# config.llm.provider and config.llm.base_url still inherits this chart's
+# default config.llm.api_key_env: ANTHROPIC_API_KEY alongside them, which is
+# very likely not what you want for a non-Anthropic setup. If you need a
+# config taken exactly as given with nothing inherited, use configOverride
+# or existingConfigMap above instead.
+# @default -- see config.example.yaml in the repo root for the full schema
+config:
+  receivers:
+    address: "0.0.0.0:9911"
+
+  alertmanager:
+    enabled: true
+    webhook_token_env: ALERTINT_WEBHOOK_TOKEN
+
+  storage:
+    sqlite_path: /data/alertint-agent.db
+
+  llm:
+    provider: anthropic
+    api_key_env: ANTHROPIC_API_KEY
+    model: claude-sonnet-5
+    timeout_seconds: 120
+
+  correlator:
+    window_seconds: 90
+    min_alerts: 1
+
+  memory:
+    attach_window_minutes: 30
+    judgment_ceiling_hours: 4
+    occurrence_cap: 100
+    lookback_days: 90
+
+  triage:
+    verification:
+      enabled: true
+      max_queries: 4
+      query_timeout_seconds: 10
+      max_rounds: 1
+
+  health:
+    llm_idle_probe_after_seconds: 300
+    broadcast_after_seconds: 300
+
+  notify:
+    stdout: true
+    slack:
+      enabled: false
+      bot_token_env: SLACK_BOT_TOKEN
+      channel: "#alerts"
+      min_severity: low
+      recurrence_mode: change-gated
+
+  mcp:
+    addr: "0.0.0.0:9912"
+    token_env: ALERTINT_MCP_TOKEN
+
+  rules: {}
+
+  prometheus:
+    timeout_seconds: 10
+    default_range_minutes: 60
+
+  logs:
+    provider: loki
+    timeout_seconds: 10
+    default_range_minutes: 15
+    max_window_minutes: 120
+    max_lines: 50
+    loki:
+      auth:
+        mode: none
+      label_map: {}
+
+  changes:
+    ingress:
+      enabled: false
+      webhook_token_env: ALERTINT_CHANGES_WEBHOOK_TOKEN
+    enrichment:
+      window_minutes: 120
+      max_events: 10
+    retention_days: 30
+
+  zabbix:
+    ingress:
+      enabled: false
+      webhook_token_env: ALERTINT_ZABBIX_WEBHOOK_TOKEN
+
+  sentry: {}
+
+  log_level: info
+  log_format: json

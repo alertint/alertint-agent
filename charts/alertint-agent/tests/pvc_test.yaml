@@ -1,0 +1,23 @@
+suite: pvc
+templates:
+  - pvc.yaml
+tests:
+  - it: annotates the created PVC to survive helm uninstall
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/resource-policy"]
+          value: keep
+
+  - it: renders nothing when using an existing claim
+    set:
+      persistence.existingClaim: my-claim
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders nothing when persistence is disabled
+    set:
+      persistence.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0

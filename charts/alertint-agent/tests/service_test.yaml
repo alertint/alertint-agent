@@ -1,0 +1,35 @@
+suite: service
+templates:
+  - service.yaml
+tests:
+  - it: uses the default ports and named targetPorts
+    asserts:
+      - equal:
+          path: spec.ports
+          value:
+            - port: 9911
+              targetPort: webhook
+              protocol: TCP
+              name: webhook
+            - port: 9912
+              targetPort: mcp
+              protocol: TCP
+              name: mcp
+
+  - it: honors custom Service ports while targetPort stays a fixed name
+    set:
+      service.webhookPort: 8080
+      service.mcpPort: 8081
+    asserts:
+      - equal:
+          path: spec.ports[0].port
+          value: 8080
+      - equal:
+          path: spec.ports[0].targetPort
+          value: webhook
+      - equal:
+          path: spec.ports[1].port
+          value: 8081
+      - equal:
+          path: spec.ports[1].targetPort
+          value: mcp

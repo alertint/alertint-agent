@@ -1,0 +1,114 @@
+name: Chart CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "charts/**"
+      - ".github/workflows/chart-ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "charts/**"
+      - ".github/workflows/chart-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-render:
+    name: lint + render
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: "v3.16.4"
+
+      - name: Install helm-unittest
+        run: helm plugin install https://github.com/helm-unittest/helm-unittest --version v0.5.2
+
+      - name: helm unittest
+        run: helm unittest charts/alertint-agent
+
+      # values.yaml's bare defaults deliberately fail the render (no Secret
+      # mode chosen) — lint and every render below pick one explicitly, the
+      # same way a real install must.
+      - name: helm lint
+        run: |
+          helm lint charts/alertint-agent \
+            --set secret.create=true \
+            --set secret.data.ALERTINT_WEBHOOK_TOKEN=test \
+            --set secret.data.ANTHROPIC_API_KEY=test
+
+      - name: helm template (default-shaped values)
+        run: |
+          helm template test charts/alertint-agent \
+            --set secret.create=true \
+            --set secret.data.ALERTINT_WEBHOOK_TOKEN=test \
+            --set secret.data.ANTHROPIC_API_KEY=test \
+            > /tmp/default.yaml
+
+      # Exercises every toggle at once so a broken conditional can't hide
+      # behind the chart's own defaults.
+      - name: helm template (every toggle enabled)
+        run: |
+          helm template test charts/alertint-agent \
+            --set secret.create=true \
+            --set secret.data.ALERTINT_WEBHOOK_TOKEN=test \
+            --set secret.data.ANTHROPIC_API_KEY=test \
+            --set secret.data.ALERTINT_MCP_TOKEN=test \
+            --set persistence.existingClaim=my-claim \
+            --set ingress.enabled=true \
+            --set ingress.webhook.host=hooks.example.com \
+            --set ingress.mcp.enabled=true \
+            --set ingress.mcp.host="*.example.com" \
+            > /tmp/full.yaml
+
+      - name: helm template (persistence disabled, no built-in Secret)
+        run: |
+          helm template test charts/alertint-agent \
+            --set secret.enabled=false \
+            --set persistence.enabled=false \
+            > /tmp/no-persistence.yaml
+
+      - name: helm template (configOverride and existingConfigMap)
+        run: |
+          helm template test charts/alertint-agent \
+            --set secret.enabled=false \
+            --set-string configOverride="receivers:
+              address: \"0.0.0.0:9911\"" \
+            > /tmp/config-override.yaml
+          helm template test charts/alertint-agent \
+            --set secret.enabled=false \
+            --set existingConfigMap=my-cm \
+            > /tmp/existing-configmap.yaml
+
+      - name: Validate rendered manifests against Kubernetes schemas
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz | tar xz kubeconform
+          ./kubeconform -strict -summary /tmp/default.yaml /tmp/full.yaml /tmp/no-persistence.yaml /tmp/config-override.yaml /tmp/existing-configmap.yaml
+
+  docs:
+    name: README matches values.yaml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.6"
+
+      - name: Install helm-docs
+        run: go install github.com/norwoodj/helm-docs/cmd/helm-docs@latest
+
+      - name: Regenerate and diff
+        run: |
+          helm-docs -c charts -s file
+          git diff --exit-code -- charts/alertint-agent/README.md || {
+            echo "::error::charts/alertint-agent/README.md is out of date — run 'helm-docs -c charts -s file' and commit the result."
+            exit 1
+          }
