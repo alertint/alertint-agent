@@ -118,8 +118,11 @@ persistence:
 # `config` just needs to exist as a key here.
 #
 # Exactly one of these three shapes is required — the chart fails the render
-# with a clear message otherwise (both create and existingSecret set, or
-# neither with enabled left true):
+# with a clear message otherwise: both create and existingSecret set; neither
+# set while enabled stays true; or enabled: false alongside create/
+# existingSecret (a contradiction — with enabled false the Deployment never
+# references the built-in Secret at all, so whichever one you configured
+# here would be created/referenced but silently unused).
 #   1) secret.existingSecret: the name of a Secret you manage yourself
 #      (External Secrets, Sealed Secrets, SOPS, etc.) — the recommended path
 #      for anything beyond local testing.
@@ -128,11 +131,12 @@ persistence:
 #      tokens into a values file under version control.
 #   3) secret.enabled: false — a deliberate opt-out of the built-in Secret
 #      entirely (e.g. every *_env value is supplied via extraEnv/extraEnvFrom
-#      instead). No envFrom is rendered in this case.
+#      instead). No envFrom is rendered in this case. Requires both create
+#      and existingSecret to be left unset.
 secret:
   # -- Set to false to opt out of the built-in Secret entirely (see mode 3
-  # above). Only meaningful when both create and existingSecret are also
-  # left unset — otherwise the chosen Secret is used regardless.
+  # above). Requires both create and existingSecret to be left unset —
+  # combining enabled: false with either of them fails the render.
   enabled: true
   # -- Create a Secret from secret.data below.
   create: false

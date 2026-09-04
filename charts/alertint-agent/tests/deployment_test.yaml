@@ -63,6 +63,24 @@ tests:
           errorMessage: "secret.create and secret.existingSecret are mutually exclusive — set only one."
         template: deployment.yaml
 
+  - it: fails when secret.enabled is false but secret.create is also true
+    set:
+      secret.enabled: false
+    asserts:
+      - failedTemplate:
+          errorMessage: "secret.enabled is false, but secret.create or secret.existingSecret is also set. With enabled=false the Deployment never references the built-in Secret, so whichever one you configured here would be created/referenced but silently ignored. Either remove secret.create/secret.existingSecret, or set secret.enabled=true (the default) to actually use them."
+        template: deployment.yaml
+
+  - it: fails when secret.enabled is false but secret.existingSecret is also set
+    set:
+      secret.create: false
+      secret.enabled: false
+      secret.existingSecret: my-secret
+    asserts:
+      - failedTemplate:
+          errorMessage: "secret.enabled is false, but secret.create or secret.existingSecret is also set. With enabled=false the Deployment never references the built-in Secret, so whichever one you configured here would be created/referenced but silently ignored. Either remove secret.create/secret.existingSecret, or set secret.enabled=true (the default) to actually use them."
+        template: deployment.yaml
+
   - it: fails when no Secret is configured and secret.enabled is left true
     set:
       secret.create: false

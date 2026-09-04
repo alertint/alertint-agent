@@ -2,7 +2,7 @@ suite: NOTES.txt
 templates:
   - NOTES.txt
 tests:
-  - it: shows MCP instructions when enabled via secret.create with a token present
+  - it: shows MCP instructions when secret.create provides a real token
     set:
       secret.create: true
       secret.data.ALERTINT_WEBHOOK_TOKEN: x
@@ -23,26 +23,21 @@ tests:
           path: raw
           pattern: "MCP is not enabled"
 
-  - it: hedges with an unknown state when using secret.existingSecret
+  - it: does NOT confidently advertise MCP just because config.mcp.enabled is explicitly true without a real token
     set:
-      secret.create: false
-      secret.existingSecret: my-secret
-    asserts:
-      - matchRegex:
-          path: raw
-          pattern: "can't be determined from chart"
-
-  - it: shows MCP instructions when config.mcp.enabled is explicitly true, regardless of any token evidence
-    set:
-      secret.create: false
-      secret.existingSecret: my-secret
+      secret.create: true
+      secret.data.ALERTINT_WEBHOOK_TOKEN: x
+      secret.data.ANTHROPIC_API_KEY: x
       config.mcp.enabled: true
     asserts:
       - matchRegex:
           path: raw
+          pattern: "MCP is not enabled"
+      - notMatchRegex:
+          path: raw
           pattern: "MCP endpoint"
 
-  - it: says MCP is not enabled when config.mcp.enabled is explicitly false
+  - it: explicit config.mcp.enabled false always wins, even with a real token present
     set:
       secret.create: true
       secret.data.ALERTINT_WEBHOOK_TOKEN: x
@@ -53,3 +48,78 @@ tests:
       - matchRegex:
           path: raw
           pattern: "MCP is not enabled"
+
+  - it: hedges with an unknown state when using secret.existingSecret
+    set:
+      secret.create: false
+      secret.existingSecret: my-secret
+    asserts:
+      - matchRegex:
+          path: raw
+          pattern: "cannot be determined from chart"
+
+  - it: treats a literal extraEnv value for the mcp token as confirmed present
+    set:
+      secret.enabled: false
+      extraEnv:
+        - name: ALERTINT_MCP_TOKEN
+          value: x
+    asserts:
+      - matchRegex:
+          path: raw
+          pattern: "MCP endpoint"
+
+  - it: treats an extraEnv valueFrom for the mcp token as unknown, not confirmed
+    set:
+      secret.enabled: false
+      extraEnv:
+        - name: ALERTINT_MCP_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: some-other-secret
+              key: token
+    asserts:
+      - matchRegex:
+          path: raw
+          pattern: "cannot be determined from chart"
+
+  - it: treats a non-empty extraEnvFrom as unknown, since its content is opaque
+    set:
+      secret.enabled: false
+      extraEnvFrom:
+        - secretRef:
+            name: some-other-secret
+    asserts:
+      - matchRegex:
+          path: raw
+          pattern: "cannot be determined from chart"
+
+  - it: with configOverride, neither Alertmanager/Changes nor MCP are read from the unused default config
+    set:
+      secret.enabled: false
+      configOverride: "receivers:\n  address: \"0.0.0.0:9911\""
+    asserts:
+      - matchRegex:
+          path: raw
+          pattern: "using configOverride"
+      - matchRegex:
+          path: raw
+          pattern: "cannot be determined from chart"
+      - notMatchRegex:
+          path: raw
+          pattern: "Point your Alertmanager"
+
+  - it: with existingConfigMap, neither Alertmanager/Changes nor MCP are read from the unused default config
+    set:
+      secret.enabled: false
+      existingConfigMap: my-cm
+    asserts:
+      - matchRegex:
+          path: raw
+          pattern: "using existingConfigMap"
+      - matchRegex:
+          path: raw
+          pattern: "cannot be determined from chart"
+      - notMatchRegex:
+          path: raw
+          pattern: "Point your Alertmanager"

@@ -37,8 +37,11 @@ and this chart adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   (`secret.create`, `secret.existingSecret`, or `secret.enabled: false` to
   opt out) are now explicit and mutually exclusive — the chart fails the
   render with a clear message if both create and existingSecret are set,
-  or if neither is set while enabled stays true, rather than deploying a
-  pod referencing a Secret that doesn't exist.
+  if neither is set while enabled stays true, or if enabled is false
+  alongside create/existingSecret (a contradiction: the Deployment would
+  never reference whichever one was configured), rather than deploying a
+  pod referencing a Secret that doesn't exist or silently ignoring one
+  that does.
 - `helm.sh/resource-policy: keep` on the chart-created PVC, so stored
   incident/memory history survives `helm uninstall`; deleting it is a
   separate, manual action.
@@ -71,12 +74,21 @@ and this chart adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 - Webhook Ingress now defaults to path `/webhook` with `pathType: Prefix`
   (previously `/` with `ImplementationSpecific`), so `GET /health` isn't
   unintentionally exposed through it.
-- `NOTES.txt`'s MCP instructions now reflect the app's own presence-based
-  enablement logic (an explicit `config.mcp.enabled`, or a token actually
-  present via `secret.create`) instead of the mere existence of
-  `config.mcp.addr`, which is set by default regardless of whether MCP
-  actually starts. When enablement can't be determined from chart values
-  alone (`secret.existingSecret`), the notes say so rather than guessing.
+- `NOTES.txt`'s MCP instructions now reflect whether a token is actually
+  checkable, not just the mere existence of `config.mcp.addr` (set by
+  default regardless of whether MCP starts) or an explicit
+  `config.mcp.enabled: true` on its own — AlertINT cannot start MCP
+  without a real token, so an explicit `enabled: true` with no
+  confirmable token now reads as not enabled too. Token evidence is
+  checked across `secret.create`+`secret.data`, and now also a literal
+  (non-`valueFrom`) `extraEnv` entry. An explicit `config.mcp.enabled:
+  false` always wins, regardless of any token evidence. When the token
+  can't be confirmed either way (`secret.existingSecret`, `extraEnvFrom`,
+  an `extraEnv` `valueFrom`, or `configOverride`/`existingConfigMap`
+  bypassing `config.mcp` entirely), the notes say so rather than
+  guessing. `configOverride`/`existingConfigMap` also now suppress the
+  Alertmanager/Changes-webhook instructions, which previously kept
+  reading `.Values.config` even though it goes unused in those modes.
 - Split the combined webhook+MCP Ingress template into
   `ingress-webhook.yaml` and `ingress-mcp.yaml` (previously one file with a
   hand-written `---` separator) — functionally identical output, but

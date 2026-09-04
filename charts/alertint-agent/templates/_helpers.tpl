@@ -72,17 +72,26 @@ supplied externally.
 {{- end }}
 
 {{/*
-Fails the render with a clear message if the Secret modes are misconfigured:
-secret.create and secret.existingSecret are mutually exclusive, and exactly
-one of them (or an explicit secret.enabled: false opt-out) must be chosen —
-there is no implicit default that silently references a Secret that was
-never created.
+Fails the render with a clear message if the Secret modes are misconfigured.
+Exactly one of these three shapes is valid:
+  - secret.enabled: false, with neither create nor existingSecret set (the
+    deliberate no-Secret opt-out).
+  - secret.enabled: true (default) with exactly one of create/existingSecret.
+Anything else — both create and existingSecret set (regardless of enabled),
+or enabled: false alongside create/existingSecret (the Deployment would
+ignore whichever Secret those select, since envFrom is only rendered when
+enabled is true), or enabled: true with neither set — fails loudly instead
+of silently referencing or creating a Secret nothing actually uses.
 */}}
 {{- define "alertint-agent.validateSecret" -}}
 {{- if and .Values.secret.create .Values.secret.existingSecret }}
 {{- fail "secret.create and secret.existingSecret are mutually exclusive — set only one." }}
 {{- end }}
-{{- if and .Values.secret.enabled (not .Values.secret.create) (not .Values.secret.existingSecret) }}
+{{- if not .Values.secret.enabled }}
+{{- if or .Values.secret.create .Values.secret.existingSecret }}
+{{- fail "secret.enabled is false, but secret.create or secret.existingSecret is also set. With enabled=false the Deployment never references the built-in Secret, so whichever one you configured here would be created/referenced but silently ignored. Either remove secret.create/secret.existingSecret, or set secret.enabled=true (the default) to actually use them." }}
+{{- end }}
+{{- else if and (not .Values.secret.create) (not .Values.secret.existingSecret) }}
 {{- fail "No Secret configured: set secret.create=true (with secret.data), or secret.existingSecret to a Secret you manage yourself, or secret.enabled=false to deliberately opt out of the built-in Secret (e.g. if extraEnv/extraEnvFrom cover everything config.* references)." }}
 {{- end }}
 {{- end }}
@@ -100,33 +109,58 @@ chart or supplied externally.
 {{- end }}
 
 {{/*
-Effective MCP enablement, mirroring the app's own presence-based config.mcp
-logic (internal/config: MCPConfig.Enabled is a *bool — nil means "on when
-the env var named by token_env holds a token") as closely as a chart
-rendered ahead of time can:
-  "enabled"  - config.mcp.enabled is explicitly true, OR it's unset and
-               secret.create provides a non-empty value for token_env.
-  "disabled" - config.mcp.enabled is explicitly false, OR it's unset with
-               no Secret able to supply token_env at all.
-  "unknown"  - config.mcp.enabled is unset and secret.existingSecret is
-               used — the chart cannot see whether that Secret actually
-               carries a value for token_env.
-Skipped entirely (using configOverride/existingConfigMap instead of
-config.mcp): treated as "unknown", for the same reason as existingSecret.
+Effective MCP enablement. AlertINT cannot start the MCP server without a
+non-empty token_env value regardless of config.mcp.enabled's own setting
+(per app behavior confirmed in review) — so, unlike a simple presence-based
+mirror, an explicit `enabled: true` is NOT on its own treated as "enabled"
+here: it still has to be backed by actual, checkable token evidence. An
+explicit `enabled: false` is the one case that always wins outright, since
+that's a deliberate opt-out independent of any token.
+  "enabled"  - config.mcp.enabled is not explicitly false, AND a non-empty
+               value for token_env is positively confirmed: either
+               secret.create carries it in secret.data, or extraEnv has a
+               literal (non-valueFrom) value for it.
+  "disabled" - config.mcp.enabled is explicitly false, OR no source the
+               chart can see supplies token_env at all.
+  "unknown"  - configOverride/existingConfigMap is used (config.mcp itself
+               is unused so nothing here can be trusted); OR
+               secret.existingSecret is used; OR extraEnvFrom is set; OR
+               extraEnv references token_env via valueFrom — in each case
+               something might supply the token, but the chart can't see
+               its actual value to confirm.
 */}}
 {{- define "alertint-agent.mcpState" -}}
 {{- if or .Values.configOverride .Values.existingConfigMap -}}
 unknown
 {{- else -}}
 {{- $mcp := .Values.config.mcp | default dict -}}
-{{- if hasKey $mcp "enabled" -}}
-{{- if $mcp.enabled }}enabled{{ else }}disabled{{ end -}}
-{{- else if and .Values.secret.create $mcp.token_env (index .Values.secret.data $mcp.token_env) -}}
+{{- $tokenEnv := $mcp.token_env -}}
+{{- if and (hasKey $mcp "enabled") (not $mcp.enabled) -}}
+disabled
+{{- else if and .Values.secret.create $tokenEnv (index .Values.secret.data $tokenEnv) -}}
 enabled
 {{- else if .Values.secret.existingSecret -}}
 unknown
+{{- else if .Values.extraEnvFrom -}}
+unknown
+{{- else -}}
+{{- $found := "" -}}
+{{- range .Values.extraEnv -}}
+{{- if eq .name $tokenEnv -}}
+{{- if .value -}}
+{{- $found = "present" -}}
+{{- else -}}
+{{- $found = "unknown" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $found "present" -}}
+enabled
+{{- else if eq $found "unknown" -}}
+unknown
 {{- else -}}
 disabled
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
