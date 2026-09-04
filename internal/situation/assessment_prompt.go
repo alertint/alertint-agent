@@ -5,6 +5,7 @@ package situation
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/alertint/alertint-agent/internal/llm"
 	"github.com/alertint/alertint-agent/internal/situation/model"
@@ -77,10 +78,18 @@ Situation snapshot:
 `
 
 // assessmentSchemaInstructions states the exact response schema and the
-// controller-exclusive fields the model must never author.
+// controller-exclusive fields the model must never author. It spells out the
+// nested shapes of sufficient_reason and limitations explicitly: the first
+// live lab run (2026-09-04) showed a model reading the bare "null" / "[]"
+// placeholders as "a candidate ID string" and "free-text strings", which
+// ValidateAssessmentProposal rejects as invalid_shape on every call — a
+// prompt-contract gap, not a model fault, so the contract is stated in full.
+// The allowed limitation codes are rendered from the same list the
+// validator checks (knownLimitationCode), so the two can never drift.
 const assessmentSchemaInstructions = `
 Respond with exactly one JSON object matching this schema and nothing else —
-no markdown fence, no commentary:
+no markdown fence, no commentary. Every value must have exactly the JSON type
+shown; there are no other fields:
 
 {
   "schema_version": 1,
@@ -93,10 +102,31 @@ no markdown fence, no commentary:
   "limitations": []
 }
 
-sufficient_reason, when present, must name exactly one candidate ID already
-listed in this snapshot's eligible_reasons above — you may select and explain
-only an eligible candidate; you may never invent a reason ID or evidence
-reference not present in this snapshot.
+sufficient_reason is either JSON null or exactly ONE object of this shape —
+never a bare string, never an array:
+
+  {"code": "<candidate code>", "candidate_id": "<candidate id, verbatim>",
+   "summary": "<one bounded sentence>", "evidence_refs": ["<fact id>", ...]}
+
+It must name exactly one candidate already listed in this snapshot's
+eligible_reasons above — copy both that candidate's "code" and its "id"
+verbatim; you may select and explain only an eligible candidate. evidence_refs
+may be empty and may contain only "id" values of entries in this snapshot's
+facts. You may never invent a reason ID or evidence reference not present in
+this snapshot.
+
+limitations is an array (possibly empty) of objects of this shape — never bare
+strings:
+
+  {"code": "<one of the allowed codes>", "detail": "<one bounded sentence>"}
+
+The only allowed limitation codes are:
+%s
+A limitation with any other code is rejected. Use [] when none applies; do not
+restate a capability_limitation fact that is already in the snapshot unless it
+bears on your judgment.
+
+Every "summary" and "detail" must be at most %d characters.
 
 The following fields are FORBIDDEN in your response and will be rejected if
 present: "lifecycle", "action_contract", and "cadence". The controller
@@ -105,6 +135,29 @@ derives these exclusively; do not propose them under any name or nesting.
 Ground every claim stronger than "unknown" in the snapshot's own evidence.
 Never claim urgent attention unless the snapshot proves a deterministic
 urgent anchor. Never present mere temporal overlap as a supported cause.`
+
+// promptLimitationCodes lists the limitation codes the schema instructions
+// offer the model: every capability limitation this build knows
+// (plan2UnsupportedCapabilities) — the same set knownLimitationCode accepts,
+// minus semantic_assessment_unavailable, which is the controller's own
+// fallback marker and never a model claim.
+func promptLimitationCodes() []string {
+	codes := make([]string, 0, len(plan2UnsupportedCapabilities))
+	for _, l := range plan2UnsupportedCapabilities {
+		codes = append(codes, l.Code)
+	}
+	return codes
+}
+
+func renderAssessmentSchemaInstructions() string {
+	var b strings.Builder
+	for _, code := range promptLimitationCodes() {
+		b.WriteString("  ")
+		b.WriteString(code)
+		b.WriteString("\n")
+	}
+	return fmt.Sprintf(assessmentSchemaInstructions, b.String(), maxBoundedTextLength)
+}
 
 // BuildAssessmentPrompt renders the L2 Assessment prompt from snap alone.
 // CachePrefix is set: the snapshot body is stable across a controller
@@ -115,7 +168,7 @@ func BuildAssessmentPrompt(snap Snapshot) (llm.Prompt, error) {
 	if err != nil {
 		return llm.Prompt{}, fmt.Errorf("situation: marshal assessment prompt snapshot: %w", err)
 	}
-	prefix := assessmentPromptPreamble + string(body) + "\n" + assessmentSchemaInstructions
+	prefix := assessmentPromptPreamble + string(body) + "\n" + renderAssessmentSchemaInstructions()
 	return llm.Prompt{
 		Prefix:          prefix,
 		CachePrefix:     true,
