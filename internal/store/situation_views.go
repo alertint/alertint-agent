@@ -281,9 +281,29 @@ func (s *Store) listRecentSanitizedAttempts(ctx context.Context, situationID str
 	return out, nil
 }
 
+// listIncidentTriageViews reads each member Incident's Triage state. Phase,
+// decision, due time and covered digests come from the incident_triage
+// schedule row; the consumed-attempt count is the durable
+// incident_triage_attempts ledger (never below the schedule's own counter),
+// because a persisted Finding deletes the schedule row
+// (CompleteIncidentTriage) while the consumed attempt stays on the ledger —
+// the 2026-09-04 lab acceptance run caught the MCP read reporting zero
+// attempts for a just-judged Incident. Once the schedule row is gone and a
+// successful attempt exists, the phase reads "completed" rather than the
+// pre-controller empty phase.
 func (s *Store) listIncidentTriageViews(ctx context.Context, situationID string) ([]IncidentTriageView, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT si.incident_id, COALESCE(t.phase, ''), COALESCE(t.attempts, 0), t.decision, t.decided_at,
+		SELECT si.incident_id,
+		       CASE
+		         WHEN t.incident_id IS NULL AND EXISTS (
+		           SELECT 1 FROM incident_triage_attempts a
+		           WHERE a.incident_id = si.incident_id AND a.result_code = 'success')
+		         THEN 'completed'
+		         ELSE COALESCE(t.phase, '')
+		       END,
+		       MAX(COALESCE(t.attempts, 0),
+		           (SELECT COUNT(*) FROM incident_triage_attempts a WHERE a.incident_id = si.incident_id)),
+		       t.decision, t.decided_at,
 		       t.next_at, t.membership_digest, t.incident_input_digest
 		FROM situation_incidents si
 		LEFT JOIN incident_triage t ON t.incident_id = si.incident_id

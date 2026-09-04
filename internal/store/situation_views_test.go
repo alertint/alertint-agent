@@ -211,6 +211,124 @@ func TestSituationControllerViewIncludesCurrentTriageState(t *testing.T) {
 	}
 }
 
+// TestSituationControllerViewCountsConsumedTriageAttemptsAfterCompletion
+// pins the lab finding from the 2026-09-04 Plan 2 acceptance run: a
+// successful Finding deletes the incident_triage schedule row
+// (CompleteIncidentTriage — membership closes at judgment), but the consumed
+// attempt is durable in incident_triage_attempts. The MCP read must keep
+// reporting that consumed attempt (check 10: MCP, audit, SQLite, logs and
+// OTel must agree on "consumed Triage attempts"), and must say the schedule
+// is completed rather than rendering the pre-controller "no Triage state"
+// empty phase.
+func TestSituationControllerViewCountsConsumedTriageAttemptsAfterCompletion(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 4, 8, 11, 0, 0, time.UTC)
+	groupKey := "group-view-triage-completed"
+	incID, deliveryID := "inc-view-triage-completed", "delivery-view-triage-completed"
+	if _, err := st.AcceptDeliveries(context.Background(), []DeliveryInput{deliveryFixtureWithSource(
+		deliveryID, "fp-view-triage-completed", now, now, situationmodel.SourceTimeBasisSourcePayload,
+	)}); err != nil {
+		t.Fatal(err)
+	}
+	insertIncidentAndDeliveryInput(t, st, incID, "input-view-triage-completed", groupKey, deliveryID, now)
+	claim := claimOneInput(t, st, "worker-a", now)
+	if err := st.ApplySituationInput(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	var sitID string
+	if err := st.db.QueryRowContext(context.Background(), `SELECT id FROM situations WHERE group_key = ? AND lifecycle IN ('active','recovery_pending')`, groupKey).Scan(&sitID); err != nil {
+		t.Fatal(err)
+	}
+
+	// One consumed, successful attempt in the ledger; the schedule row is
+	// already gone, exactly as the worker leaves it after a persisted Finding.
+	ts := now.UTC().Format(time.RFC3339Nano)
+	if _, err := st.db.ExecContext(context.Background(), `
+		INSERT INTO incident_triage_attempts (
+			id, incident_id, attempt_number, situation_id, decision_input_version,
+			membership_digest, incident_input_digest, member_delivery_ids_json, started_at,
+			result_code, output_digest, finding_id, completed_at
+		) VALUES (?, ?, 1, ?, 2, 'sha256:members', 'sha256:input', '[]', ?, 'success', 'sha256:out', 'finding:x', ?)`,
+		"attempt-view-triage-completed", incID, sitID, ts, ts); err != nil {
+		t.Fatal(err)
+	}
+	var scheduleRows int
+	if err := st.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM incident_triage WHERE incident_id = ?`, incID).Scan(&scheduleRows); err != nil {
+		t.Fatal(err)
+	}
+	if scheduleRows != 0 {
+		t.Fatalf("incident_triage rows = %d, want 0 (fixture must model the post-completion state)", scheduleRows)
+	}
+
+	view, err := st.GetSituationControllerView(context.Background(), sitID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Triage) != 1 {
+		t.Fatalf("triage views = %+v, want exactly 1", view.Triage)
+	}
+	got := view.Triage[0]
+	if got.IncidentID != incID || got.Phase != "completed" || got.Attempts != 1 {
+		t.Fatalf("triage view = %+v, want incident=%s phase=completed attempts=1", got, incID)
+	}
+	if got.Decision != nil || got.NextAt != nil {
+		t.Fatalf("triage view = %+v, want no decision/due time once the schedule row is gone", got)
+	}
+}
+
+// TestSituationControllerViewTriageAttemptsNeverBelowLedger proves the
+// attempt count reads the durable ledger even while the schedule row still
+// exists: a schedule counter that lags (a legacy row, or a migrated one) can
+// never make the MCP read under-report a consumed attempt.
+func TestSituationControllerViewTriageAttemptsNeverBelowLedger(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 4, 8, 11, 0, 0, time.UTC)
+	groupKey := "group-view-triage-ledger"
+	incID, deliveryID := "inc-view-triage-ledger", "delivery-view-triage-ledger"
+	if _, err := st.AcceptDeliveries(context.Background(), []DeliveryInput{deliveryFixtureWithSource(
+		deliveryID, "fp-view-triage-ledger", now, now, situationmodel.SourceTimeBasisSourcePayload,
+	)}); err != nil {
+		t.Fatal(err)
+	}
+	insertIncidentAndDeliveryInput(t, st, incID, "input-view-triage-ledger", groupKey, deliveryID, now)
+	claim := claimOneInput(t, st, "worker-a", now)
+	if err := st.ApplySituationInput(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	var sitID string
+	if err := st.db.QueryRowContext(context.Background(), `SELECT id FROM situations WHERE group_key = ? AND lifecycle IN ('active','recovery_pending')`, groupKey).Scan(&sitID); err != nil {
+		t.Fatal(err)
+	}
+	ts := now.UTC().Format(time.RFC3339Nano)
+	if _, err := st.db.ExecContext(context.Background(), `
+		INSERT INTO incident_triage (incident_id, phase, attempts, updated_at) VALUES (?, 'backoff', 0, ?)`, incID, ts); err != nil {
+		t.Fatal(err)
+	}
+	for i, code := range []string{"lease_expired", "success"} {
+		if _, err := st.db.ExecContext(context.Background(), `
+			INSERT INTO incident_triage_attempts (
+				id, incident_id, attempt_number, situation_id, decision_input_version,
+				membership_digest, incident_input_digest, member_delivery_ids_json, started_at,
+				result_code, completed_at
+			) VALUES (?, ?, ?, ?, 2, 'sha256:members', 'sha256:input', '[]', ?, ?, ?)`,
+			"attempt-view-triage-ledger-"+strconv.Itoa(i+1), incID, i+1, sitID, ts, code, ts); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	view, err := st.GetSituationControllerView(context.Background(), sitID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Triage) != 1 {
+		t.Fatalf("triage views = %+v, want exactly 1", view.Triage)
+	}
+	got := view.Triage[0]
+	if got.Phase != "backoff" || got.Attempts != 2 {
+		t.Fatalf("triage view = %+v, want phase=backoff (schedule) attempts=2 (ledger)", got)
+	}
+}
+
 // TestSituationControllerViewIncludesCurrentAssessmentContentAndDerivation
 // proves Task 9's own MCP-facing extension: the current authoritative
 // Assessment's full content (persistence/impact/.../sufficient_reason with
