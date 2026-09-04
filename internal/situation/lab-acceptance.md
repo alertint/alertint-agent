@@ -103,6 +103,34 @@ precondition it was planned under (the schedule is still in backoff at
 commit) and is rejected otherwise, so the correlator re-plans the delivery
 (`TestApplyCorrelatedDeliveryRejectsRetryAttachOnceTriageLeftBackoff`).
 
+An external review of the finished branch then reopened it with three
+findings. The first was a real defect no run had exercised: the symptom
+reduction keyed one symptom per Incident and took the status of the
+Incident's most recently received delivery, so one alert resolving while a
+sibling alert in the same Incident still fired read as a resolved Incident
+and drove the Situation through recovery to a terminal state under a
+still-firing alert. The rationale in the code ("no alert identity reaches
+the pure layer") had been stale since alert identity was threaded through
+deliveries for the critical-anchor predicate. The reduction now works per
+alert: each alert contributes only its latest delivery, and the Incident
+fires while any alert's latest delivery fires
+(`TestSnapshotSymptomStaysFiringWhileAnyAlertOfTheIncidentStillFires`,
+`TestControllerReconcilePartialResolutionKeepsSituationActive`). A seventh
+run verified it live: four drill alerts in one Incident, one resolved
+through the production webhook door while three still fired, and the
+Situation stayed active through three cycles and past the recovery grace;
+when the last three resolved, the same Situation went recovery-pending on
+the next cycle and recovered one second after grace expiry. The other two
+findings were plan-versus-code discrepancies resolved toward the spec: the
+two reason predicates that the plan listed as reachable stay unreachable
+under a dated scope revision (one needs persisted symptom history the plan
+never added; the other has its deadline half but no definition of
+"actionable uncertainty"), and the plan's line that an identical
+controller-commit replay succeeds was amended — the commit clears the
+lease, so a verbatim replay fails closed and convergence comes from the
+next claim, now proved on the real store as the ninth replay boundary
+(`crash_after_commit_before_result_observed`).
+
 Do not fill in a cell with a guess, an extrapolation from the local replay
 run, or a number that cannot be independently re-verified from the lab
 tenant's own durable state. In particular: **never claim an unverifiable
