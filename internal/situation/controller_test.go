@@ -875,6 +875,12 @@ func TestControllerReconcileValidContradictedStandsAfterOneCall(t *testing.T) {
 
 func TestControllerReconcileFiveWorkAttemptsExhaustedParksWithoutDispatch(t *testing.T) {
 	in := ctBaseSnapshotInput()
+	// The store already reflects the park cycle 5 persisted against this
+	// same basis — the steady-state "still exhausted" cycle.
+	in.ControllerParked = situation.ControllerParkedState{
+		At: &ctBaseTime, Reason: situation.ParkedReasonDependency,
+		MaterialFactHash: situation.BuildSnapshot(in).MaterialFactHash,
+	}
 	store := &fakeControllerStore{loadInput: in, beginErr: situation.ErrControllerAttemptsExhausted}
 	client := &fakeAssessmentClient{}
 	c := ctController(t, store, client)
@@ -897,6 +903,66 @@ func TestControllerReconcileFiveWorkAttemptsExhaustedParksWithoutDispatch(t *tes
 	}
 	if commit.Parked.Touch {
 		t.Fatalf("an already-parked steady-state cycle must not re-touch parked state, got %+v", commit.Parked)
+	}
+}
+
+// Lab run 3, defect F6: the fifth attempt's slot was reserved durably but
+// the cycle that spent it died before committing (a drain-time dispatch cut
+// off by SIGKILL), so the Situation comes back exhausted with NO park
+// recorded. Left alone, nothing re-arms it: the stranded repair skips the
+// unchanged material hash, every cycle re-enters the exhausted branch, and
+// WakeDependencyRecoveredSituations only selects dependency parks. The
+// exhausted branch must therefore park it as ParkedReasonDependency — once.
+func TestControllerReconcileExhaustedWithoutParkParksAsDependency(t *testing.T) {
+	in := ctBaseSnapshotInput()
+	if in.ControllerParked.Reason != "" {
+		t.Fatal("fixture invariant: the base input must carry no park")
+	}
+	store := &fakeControllerStore{loadInput: in, beginErr: situation.ErrControllerAttemptsExhausted}
+	client := &fakeAssessmentClient{}
+	c := ctController(t, store, client)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if client.calls != 0 {
+		t.Fatalf("CompleteOnce calls = %d, want 0 (exhausted must never dispatch)", client.calls)
+	}
+	if len(store.commits) != 1 {
+		t.Fatalf("commits = %d, want 1", len(store.commits))
+	}
+	commit := store.commits[0]
+	if !commit.Parked.Touch || commit.Parked.Reason != situation.ParkedReasonDependency {
+		t.Fatalf("Parked = %+v, want Touch=true Reason=%q", commit.Parked, situation.ParkedReasonDependency)
+	}
+	if commit.Parked.At.IsZero() {
+		t.Fatal("the repair park must carry a parked-at time")
+	}
+	if commit.RetryAt != nil {
+		t.Fatalf("RetryAt = %v, want nil (a park never schedules its own retry)", *commit.RetryAt)
+	}
+	if commit.Lifecycle == model.LifecycleClosedUnknown {
+		t.Fatal("exhausted L2 work must never close the Situation")
+	}
+
+	// Next cycle on the same basis: the store now reflects that park, and
+	// the steady-state branch must leave it alone (no second park, no
+	// re-touch that would move parked_at).
+	store.loadInput.ControllerParked = situation.ControllerParkedState{
+		At: &commit.Parked.At, Reason: commit.Parked.Reason,
+		MaterialFactHash: situation.BuildSnapshot(in).MaterialFactHash,
+	}
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("cycle 2 Reconcile: %v", err)
+	}
+	if len(store.commits) != 2 {
+		t.Fatalf("cycle 2 commits = %d, want 2", len(store.commits))
+	}
+	if store.commits[1].Parked.Touch {
+		t.Fatalf("cycle 2 must not re-touch parked state, got %+v", store.commits[1].Parked)
+	}
+	if client.calls != 0 {
+		t.Fatalf("cycle 2 CompleteOnce calls = %d, want 0", client.calls)
 	}
 }
 

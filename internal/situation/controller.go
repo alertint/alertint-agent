@@ -1329,8 +1329,24 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 	retryEpoch, workAttempt, err := c.store.BeginControllerAttempt(ctx, claim, snap.MaterialFactHash, now)
 	if err != nil {
 		if errors.Is(err, ErrControllerAttemptsExhausted) {
-			// Already parked from a prior cycle on this unchanged input:
-			// refresh the bounded projection only, touch no parked state.
+			if in.ControllerParked.Reason == "" {
+				// Exhausted with NO park recorded (lab run 3, F6): the fifth
+				// attempt's slot was reserved durably but the cycle that
+				// spent it never committed — the process died mid-dispatch
+				// (e.g. a drain-time dispatch cut off by SIGKILL). Without
+				// a park nothing can ever re-arm this input: the stranded
+				// repair skips it (same material hash), every later cycle
+				// lands here again, and WakeDependencyRecoveredSituations
+				// only selects ParkedReasonDependency. Park it as that now,
+				// so the next dependency recovery generation opens one new
+				// epoch; until then this stays the bounded blocked
+				// projection, exactly as an ordinary attempt-5 park would.
+				base.Parked = ParkedState{Touch: true, At: now, Reason: ParkedReasonDependency}
+				base.RetryAt = nil
+			}
+			// Otherwise already parked from a prior cycle on this unchanged
+			// input: refresh the bounded projection only, touch no parked
+			// state.
 			return c.commitBlocked(ctx, claim, base, situationID, snap, in, state, now)
 		}
 		return fmt.Errorf("situation: controller reconcile: begin attempt: %w", err)
@@ -1477,8 +1493,10 @@ func (c *Controller) finalizeCheckpoint(base *ControllerCommit, now time.Time) {
 // reports ErrControllerAttemptsExhausted), or because a still-active policy/
 // capability park already covers the current basis (Finding I1,
 // controllerParkBlocksDispatch). Neither case touches controller_parked_at/
-// reason (base.Parked stays the zero value/untouched — whatever was
-// persisted stands).
+// reason on its own (base.Parked stays whatever the caller set — normally
+// the zero value, so whatever was persisted stands; the one exception is
+// Reconcile's exhausted-but-never-parked repair, which hands in a
+// ParkedReasonDependency park for this commit to persist).
 func (c *Controller) commitBlocked(ctx context.Context, claim Claim, base ControllerCommit, situationID string, snap Snapshot, in SnapshotInput, state ControllerState, now time.Time) error {
 	assessment, attempt, coverage := c.fallbackOrPreserveBlocked(situationID, snap, in, state, now)
 	base.Assessment, base.Attempt, base.Coverage = assessment, attempt, coverage
