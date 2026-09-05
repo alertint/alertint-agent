@@ -119,7 +119,26 @@ const (
 	DueObservationDeadline    DueReason = "observation_deadline"
 	DueRetry                  DueReason = "retry_due"
 	DueUpgradeReconstruction  DueReason = "upgrade_reconstruction"
+	// DueOperatorArtifactRecorded marks a Situation due because a durable
+	// operator artifact input (an attributed annotation or a Captured
+	// verdict) was applied and awaits journaling (R5). It is distinct from
+	// DueOperatorJudgment, which stays reserved for Plan 5's steering
+	// catalog — an annotation or verdict must never read as a judgment.
+	DueOperatorArtifactRecorded DueReason = "operator_artifact_recorded"
 )
+
+// Validate reports an error unless d is one of the closed DueReason values.
+// The SQL due_reasons_json CHECK on situations (migration 0014) is a
+// JSON-array-only check, so this validator is the actual gate on DueReason's
+// closed vocabulary.
+func (d DueReason) Validate() error {
+	return validateEnum("due_reason", d,
+		DueIncidentCreated, DueMembershipChanged, DueNewSymptom, DueAlertResolved, DueAlertRefired,
+		DueDurationMilestone, DueConnectorHealthChanged, DueSemanticProfileChanged, DueTriageChanged,
+		DueOperatorJudgment, DueEnvelopeChanged, DueEnvelopeBoundary, DueJudgmentBoundary,
+		DueManualReassessment, DueRecoveryGraceExpired, DueObservationDeadline, DueRetry,
+		DueUpgradeReconstruction, DueOperatorArtifactRecorded)
+}
 
 // TerminalReason is the structured reason recorded when a Situation closes
 // as closed_unknown.
