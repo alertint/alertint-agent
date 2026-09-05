@@ -101,9 +101,12 @@ var ErrAlertDispatchLeaseLost = errors.New("store: alert dispatch lease lost")
 // attach) is no longer valid — the target Incident's status moved to a
 // terminal state between planning and commit, or the Incident's owning
 // Situation has reached a terminal lifecycle (a later firing must never
-// cross a terminal Situation boundary). The caller must discard the plan
-// and correlate the delivery as a fresh Incident instead; that fresh
-// Incident's Situation input then opens a linked new Situation.
+// cross a terminal Situation boundary), or — for a retry-backoff attach —
+// the Incident's Acute Triage schedule left the backoff phase (see
+// CorrelatedDeliveryMutation.RequireTriageBackoff). The caller must discard
+// the plan and re-plan the delivery (its next attachment path, else a fresh
+// Incident); a fresh Incident's Situation input then opens a linked new
+// Situation.
 var ErrIncidentOwnerNotCollapsible = errors.New("store: incident owner does not permit correlated attach")
 
 // CorrelatedDeliveryMutation is everything ApplyCorrelatedDelivery needs to
@@ -119,6 +122,15 @@ var ErrIncidentOwnerNotCollapsible = errors.New("store: incident owner does not 
 // Incident's own status and, per the spec's terminal-boundary rule, its
 // owning Situation's lifecycle, re-checked inside the transaction; it is
 // never set for a fresh-Incident or resolved-delivery-association plan.
+// RequireTriageBackoff is the retry-backoff attach's own exact precondition
+// on top of that: the plan was made against an Incident whose Acute Triage
+// schedule was durably in backoff, and the attach is legal only while that
+// is still true at commit. If the schedule moved on in between — the
+// controller committed a clean skip (a first judgment that closes
+// membership), a worker claimed the row in flight, or the schedule exhausted
+// — the plan is rejected with ErrIncidentOwnerNotCollapsible so the
+// correlator re-plans (recurrence collapse or a fresh Incident) instead of
+// attaching membership behind a decision that never saw it.
 type CorrelatedDeliveryMutation struct {
 	DeliveryID              string
 	DispatchOwner           string
@@ -127,6 +139,7 @@ type CorrelatedDeliveryMutation struct {
 	Occurrence              *Occurrence
 	Input                   SituationInput
 	RequireNonterminalOwner bool
+	RequireTriageBackoff    bool
 }
 
 // CorrelatedDeliveryResult is the durable outcome ApplyCorrelatedDelivery
@@ -519,6 +532,15 @@ func (s *Store) ApplyCorrelatedDelivery(ctx context.Context, m CorrelatedDeliver
 			return CorrelatedDeliveryResult{}, ErrIncidentOwnerNotCollapsible
 		}
 	}
+	if m.RequireTriageBackoff {
+		inBackoff, err := triageInBackoffTx(ctx, tx, m.Incident.ID)
+		if err != nil {
+			return CorrelatedDeliveryResult{}, err
+		}
+		if !inBackoff {
+			return CorrelatedDeliveryResult{}, ErrIncidentOwnerNotCollapsible
+		}
+	}
 
 	now := time.Now().UTC()
 	occurrenceID, err := applyCorrelatedOccurrenceTx(ctx, tx, m.Incident.ID, m.Occurrence, deliveryReceivedAt)
@@ -590,6 +612,23 @@ func terminalSituationOwnerTx(ctx context.Context, tx *sql.Tx, incidentID string
 	return lifecycle == "recovered" || lifecycle == "closed_unknown", nil
 }
 
+// triageInBackoffTx reports whether incidentID's Acute Triage schedule row is
+// still exactly in the "backoff" phase — the retry-backoff attach's
+// precondition (see CorrelatedDeliveryMutation.RequireTriageBackoff). A
+// missing row counts as not in backoff: the schedule rows are deleted on
+// completion, so "no row" means the Incident is no longer retrying.
+func triageInBackoffTx(ctx context.Context, tx *sql.Tx, incidentID string) (bool, error) {
+	var phase string
+	err := tx.QueryRowContext(ctx, `SELECT phase FROM incident_triage WHERE incident_id = ?`, incidentID).Scan(&phase)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("store: read correlated incident's triage phase: %w", err)
+	}
+	return TriagePhase(phase) == TriageBackoff, nil
+}
+
 // applyDuplicateCorrelatedDeliveryTx handles a delivery that already owns an
 // immutable incident_alert_deliveries link: steps 3–7 (the Incident/
 // Occurrence mutation, membership, and ownership link) never re-run, but
@@ -620,14 +659,21 @@ func applyDuplicateCorrelatedDeliveryTx(ctx context.Context, tx *sql.Tx, m Corre
 }
 
 // MarkIncidentReadyWithSituationInput atomically transitions incidentID from
-// "collecting" to "ready" and appends its one delivery-independent
+// "collecting" to "ready", appends its one delivery-independent
 // incident_ready Situation input (idempotency key "incident-ready:<incident
-// id>") in the same commit. An already-"ready" Incident carrying the
-// matching input is a successful no-op — the idempotent replay a crash
-// between this method's commit and its caller's next step would produce.
-// Any other Incident state — "processing", "analyzed", "resolved",
-// "failed", or no such Incident at all — is ErrNotFound. This method does
-// not seed, begin, or complete incident_triage.
+// id>"), and creates its awaiting_decision Acute Triage schedule row at
+// attempt zero — all in the same commit (Task 6: "ready and schedule
+// awaiting_decision are committed together"). Every ready Incident begins in
+// awaiting_decision; no dispatch can happen before a controller decision
+// (Task 8's CommitController, via the unexported applyTriageDecisionsTx)
+// moves it to pending. An already-"ready" Incident carrying the matching
+// input is a successful no-op — the idempotent replay a crash between this
+// method's commit and its caller's next step would produce; INSERT OR
+// IGNORE on the schedule row makes that replay safe even if a prior attempt
+// committed the ready transition/input but crashed before this method
+// itself returned. Any other Incident state — "processing", "analyzed",
+// "resolved", "failed", or no such Incident at all — is ErrNotFound. This
+// method does not begin or complete incident_triage.
 func (s *Store) MarkIncidentReadyWithSituationInput(ctx context.Context, incidentID string, now time.Time) error {
 	if strings.TrimSpace(incidentID) == "" {
 		return errors.New("store: mark incident ready requires an incident id")
@@ -666,6 +712,9 @@ func (s *Store) MarkIncidentReadyWithSituationInput(ctx context.Context, inciden
 			"situation-input:"+idempotencyKey, idempotencyKey, incidentID, groupKey, canonicalTime(now)); err != nil {
 			return fmt.Errorf("store: insert incident ready situation input: %w", err)
 		}
+		if err := seedAwaitingDecisionTriageTx(ctx, tx, incidentID, now); err != nil {
+			return err
+		}
 	case "ready":
 		var exists int
 		err := tx.QueryRowContext(ctx, `SELECT 1 FROM situation_input_outbox WHERE idempotency_key = ?`, idempotencyKey).Scan(&exists)
@@ -675,8 +724,13 @@ func (s *Store) MarkIncidentReadyWithSituationInput(ctx context.Context, inciden
 		if err != nil {
 			return fmt.Errorf("store: check incident ready situation input: %w", err)
 		}
-		// Idempotent no-op: the ready transition and its input already
-		// committed together; fall through and commit without changes.
+		// Idempotent no-op for the ready transition and its input, which
+		// already committed together; the schedule row insert below is
+		// itself INSERT-OR-IGNORE, repairing a crash that landed between
+		// this method's own two inserts on an earlier call.
+		if err := seedAwaitingDecisionTriageTx(ctx, tx, incidentID, now); err != nil {
+			return err
+		}
 	default:
 		return ErrNotFound
 	}
@@ -1155,6 +1209,62 @@ func getDeliveryTx(ctx context.Context, tx *sql.Tx, id string) (AlertDelivery, e
 		return AlertDelivery{}, fmt.Errorf("store: read delivery: %w", err)
 	}
 	return d, nil
+}
+
+// GetAlertDeliveries returns the immutable AlertDelivery rows — each
+// carrying its own per-delivery-frozen Alert snapshot — for an EXACT set of
+// delivery IDs. This is the bounded read a claimed Acute Triage attempt's
+// frozen TriageAttemptClaim.MemberDeliveryIDs (Task 6,
+// internal/store/triage_controller.go's ClaimIncidentTriageAttempt) needs:
+// every AlertDelivery.Alert field this returns (ID, Fingerprint, Status,
+// Labels, Annotations, StartsAt, EndsAt, ReceivedAt,
+// ReceiverGroupingIdentity) is read from alert_deliveries' own immutable
+// columns plus alerts.fingerprint (itself never rewritten by
+// upsertDeliveryAlertTx's own ON CONFLICT — only status/labels/annotations/
+// starts_at/ends_at/received_at are) — see hydrateDelivery — so nothing
+// here can ever observe a later mutation to the shared, mutable alerts row
+// the way GetIncidentAlerts does. Order is not guaranteed to match
+// deliveryIDs; callers that need a specific order must sort themselves.
+//
+// An empty deliveryIDs returns an empty slice, not an error. Returns
+// ErrNotFound if any requested id has no delivery row at all —
+// alert_deliveries rows are never deleted once accepted (immutable per its
+// own doc comment), so a miss here is a genuine identity error, never a
+// legitimate race to tolerate silently.
+func (s *Store) GetAlertDeliveries(ctx context.Context, deliveryIDs []string) ([]AlertDelivery, error) {
+	if len(deliveryIDs) == 0 {
+		return []AlertDelivery{}, nil
+	}
+	idsJSON, err := json.Marshal(deliveryIDs)
+	if err != nil {
+		return nil, fmt.Errorf("store: marshal alert delivery ids: %w", err)
+	}
+	rows, err := s.db.QueryContext(ctx, deliverySelect+`
+		WHERE ad.id IN (SELECT value FROM json_each(?))`, string(idsJSON))
+	if err != nil {
+		return nil, fmt.Errorf("store: get alert deliveries: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make([]AlertDelivery, 0, len(deliveryIDs))
+	seen := make(map[string]bool, len(deliveryIDs))
+	for rows.Next() {
+		d, err := scanDelivery(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: scan alert delivery: %w", err)
+		}
+		seen[d.ID] = true
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate alert deliveries: %w", err)
+	}
+	for _, id := range deliveryIDs {
+		if !seen[id] {
+			return nil, fmt.Errorf("store: alert delivery %s: %w", id, ErrNotFound)
+		}
+	}
+	return out, nil
 }
 
 // rawDeliveryFields holds the string-typed columns shared by deliverySelect

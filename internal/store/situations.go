@@ -16,43 +16,23 @@ import (
 	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 )
 
-// SituationInput is one durable, deterministically-idempotent fact destined
-// for the situation_input_outbox — the only channel through which a
-// correlation-side mutation (a correlated delivery, an Incident's ready
-// transition, ...) hands work to the Situation controller. Task 5 needs only
-// this struct to insert a Situation input atomically alongside an Incident
-// mutation; Task 7 extends this file with the rest of the Situation store
-// surface (claims, advancement, and friends).
-type SituationInput struct {
-	ID             string
-	IdempotencyKey string
-	IncidentID     string
-	Kind           string
-	GroupKey       string
-	DeliveryID     *string
-	OccurredAt     time.Time
-}
+// SituationInput is situationmodel.SituationInput, relocated there to break
+// internal/situation's former import of internal/store (see
+// internal/situation/model/foundation.go for the full rationale and the
+// canonical definition). Aliased here so this file's own and every other
+// existing store.SituationInput call site keeps compiling unchanged.
+type SituationInput = situationmodel.SituationInput
 
-// SituationClaim is one claimed situation_input_outbox row: the input's own
-// identity (embedded SituationInput) plus the lease-fencing triple recorded
-// at claim time. ApplySituationInput and RetrySituationInput both re-verify
-// this triple against the row's current state before writing anything —
-// receiving a SituationClaim is never itself proof the claim still holds.
-type SituationClaim struct {
-	SituationInput
+// SituationClaim is situationmodel.SituationClaim — see SituationInput above.
+type SituationClaim = situationmodel.SituationClaim
 
-	LeaseOwner   string
-	ClaimToken   int64
-	AttemptCount int
-}
-
-// ErrSituationLeaseLost means a caller no longer owns the lease it is trying
-// to act on — either a claimed situation_input_outbox row (ApplySituationInput,
-// RetrySituationInput) or a claimed Situation aggregate (ReleaseSituationClaim)
-// — because the lease's (owner, claim_token) pair was superseded, most often
-// by another worker reclaiming it after the original lease expired. Callers
-// must discard the stale claim, not retry with it, on receiving this error.
-var ErrSituationLeaseLost = errors.New("store: situation lease lost")
+// ErrSituationLeaseLost is situationmodel.ErrSituationLeaseLost, relocated
+// there (alongside ErrNotFound in store.go) for the same reason the structs
+// above moved: internal/situation compares an ApplySituationInput/
+// RetrySituationInput failure against this exact value via errors.Is, so it
+// must be one shared value both packages can see without either importing
+// the other. See internal/situation/model/foundation.go.
+var ErrSituationLeaseLost = situationmodel.ErrSituationLeaseLost
 
 // ErrSituationVersionConflict means a Situation's input_version advanced
 // between the moment a caller last observed it and the moment it tried to

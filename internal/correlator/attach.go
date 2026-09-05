@@ -27,9 +27,11 @@ const (
 	// actionAttach: a new episode inside the horizon with no escalation — record
 	// an occurrence and edit the card, no LLM.
 	actionAttach
-	// actionRejudge: a new episode that tripped an escalation trigger — record the
-	// occurrence with its trigger and run a fresh re-judgment.
-	actionRejudge
+	// actionEscalate: a new episode that tripped an escalation trigger — record
+	// the occurrence with its trigger. The trigger is durable state only; no
+	// re-judgment runs here (Acute Triage dispatch is not owned by this
+	// package — see the package doc comment).
+	actionEscalate
 )
 
 func (a attachAction) String() string {
@@ -40,8 +42,8 @@ func (a attachAction) String() string {
 		return "repeat_touch"
 	case actionAttach:
 		return "attach"
-	case actionRejudge:
-		return "rejudge"
+	case actionEscalate:
+		return "escalate"
 	default:
 		return "unknown"
 	}
@@ -110,21 +112,21 @@ func decideAttach(in attachInputs) attachDecision {
 	}
 	// Inside the horizon: escalation triggers, in priority order.
 	if in.incomingSeverityRank > in.baselineSeverityRank {
-		return attachDecision{action: actionRejudge, trigger: "severity"}
+		return attachDecision{action: actionEscalate, trigger: "severity"}
 	}
 	if in.incomingAlertname != "" && !in.knownAlertnames[in.incomingAlertname] {
-		return attachDecision{action: actionRejudge, trigger: "new_alertname"}
+		return attachDecision{action: actionEscalate, trigger: "new_alertname"}
 	}
 	if newInterval, median, ok := cadenceDelta(in.now, in.episodeTimes); ok {
-		return attachDecision{action: actionRejudge, trigger: "cadence", cadenceInterval: newInterval, cadenceMedian: median}
+		return attachDecision{action: actionEscalate, trigger: "cadence", cadenceInterval: newInterval, cadenceMedian: median}
 	}
 	if in.occurrencesSinceJudged+1 >= in.occurrenceCap {
-		return attachDecision{action: actionRejudge, trigger: "cap"}
+		return attachDecision{action: actionEscalate, trigger: "cap"}
 	}
 	// Clock B: a steady flapper that keeps sliding Clock A cannot evade
 	// re-examination past the ceiling.
 	if in.now.Sub(in.lastJudgedAt) > in.judgmentCeiling {
-		return attachDecision{action: actionRejudge, trigger: "ceiling"}
+		return attachDecision{action: actionEscalate, trigger: "ceiling"}
 	}
 	return attachDecision{action: actionAttach, trigger: "none"}
 }
@@ -287,7 +289,7 @@ func (c *Correlator) maybeAttachOccurrence(ctx context.Context, a store.Alert, g
 	switch decision.action {
 	case actionNewIncident:
 		return false, nil
-	case actionAttach, actionRejudge:
+	case actionAttach, actionEscalate:
 		return true, c.attachOccurrence(ctx, a, *candidate, gk, decision, delta)
 	case actionRepeatTouch:
 		// Unreachable: repeats are short-circuited above before decideAttach runs
@@ -326,12 +328,9 @@ func memberBaselines(members []store.Alert, incomingFP string) (maxSev int, maxS
 
 // attachOccurrence records one occurrence row (with its trigger), mirrors the
 // alert into incident_alerts, audits the attach, fires the collapse notifier,
-// and — for an escalation — runs the re-judgment (U4 wires the rejudger). A
-// re-judgment failure leaves the prior finding standing; last_judged_at is left
-// unreset, so a subsequent triggering attach re-attempts it. Note this is
-// retry-per-trigger, not a single retry: a persistently failing re-judgment
-// (e.g. a revoked key) re-fires on each new-episode trigger, rate-bounded only
-// by the LLM client's own timeout/backoff.
+// and — for an escalation — leaves the trigger on the occurrence row. No
+// re-judgment runs here or anywhere else in this package: the Correlator
+// owns grouping and readiness only, never analyzer/LLM dispatch.
 func (c *Correlator) attachOccurrence(ctx context.Context, a store.Alert, inc store.Incident, gk string, decision attachDecision, delta recurrenceDelta) error {
 	occ := store.Occurrence{
 		IncidentID:   inc.ID,
@@ -384,13 +383,6 @@ func (c *Correlator) attachOccurrence(ctx context.Context, a store.Alert, inc st
 	}
 	c.logger.Info("correlator: occurrence attached",
 		"incident_id", inc.ID, "group_key", gk, "trigger", decision.trigger, "occurrences", stats.Count)
-
-	if decision.action == actionRejudge && c.rejudger != nil {
-		if err := c.rejudger.Rejudge(ctx, inc, decision.trigger); err != nil {
-			c.logger.Error("correlator: re-judgment failed; prior finding stands",
-				"err", err, "incident_id", inc.ID, "trigger", decision.trigger)
-		}
-	}
 	return nil
 }
 

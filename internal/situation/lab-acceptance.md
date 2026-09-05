@@ -1,0 +1,305 @@
+# Plan 2 lab acceptance — Situation controller / Acute Triage coordination
+
+**Status: structure only in this file — the lab step has run.** This
+file's evidence table is a *structure*, seeded by Task 10 (`test(situation):
+prove controller crash boundaries`) alongside the real-store replay fixture
+(`controller_replay_test.go`). It deliberately carries no lab evidence
+(no Situation/Incident IDs, digests, or audit sequence numbers); the
+canonical, dated evidence record lives beside the Plan 2 spec in the
+private planning directory (`02-controller-triage-coordination/
+lab-acceptance.md`) and is what the completion gate reads.
+
+State of that record as of 2026-09-04 (three lab runs, Slack disabled,
+stdout notifier on, spans exported to the lab's own OpenTelemetry
+Collector): **all ten checks pass on live evidence.** Checks 1–5, 8 and 9
+passed in the second run. Check 7 passed for both failure classes: the
+content class in the first run (every proposal rejected because the L2
+prompt never stated the nested proposal shapes — fixed in
+`assessment_prompt.go` before the second run) and the transport class in
+the third (the configured LLM made unreachable at the network level before
+the alerts arrived: transport failure, deterministic fallback in the same
+cycle, Attention forced urgent, installation health unavailable at once and
+healthy again on the first real success). Check 6 passed in the third run:
+a controlled restart three seconds into an in-flight Acute Triage attempt
+left that attempt recorded as canceled with the ordinary backoff, and the
+Finding came from exactly one effective attempt after the restart. Check
+10 first failed on the MCP column — the Situation read projected consumed
+Triage attempts from the schedule row that a persisted Finding deletes —
+and passed once that projection read the durable attempt ledger
+(`internal/store/situation_views.go`), re-read on the fixed build against
+the same rows.
+
+The third run also exposed a controller defect: a work attempt dispatched
+inside the shutdown drain and cut by the kill durably spends the last
+attempt of the budget, but the cycle that would have parked the Situation
+never commits, so the Situation comes back exhausted with no park recorded.
+Neither startup recovery (same material basis) nor the dependency-recovery
+wake (parked rows only) reaches it, and it emits a deterministic fallback
+every cadence with a healthy LLM until its material facts change on their
+own — which in the longest duration class never happens. The ruling was to
+park on exhaustion: the controller's exhausted branch now records a
+dependency park when none is on record, so the existing recovery wake
+re-arms it once the dependency is healthy again
+(`TestControllerReconcileExhaustedWithoutParkParksAsDependency`). The
+fourth run shipped the fix and repeated the forced restart, but the killed
+drain-time dispatch happened to be the fourth attempt of its epoch rather
+than the fifth, so the remaining attempt succeeded after the restart and
+the new park path never ran. It stands on its unit test until a run with a
+deterministic trigger (kill the process the instant a fifth attempt is
+dispatched under an unreachable LLM) exercises it.
+
+The fourth run also surfaced an older, unrelated defect: a Situation built
+on one long-firing alert (days old, cadence slow, its only wake reason the
+lifecycle observation deadline) recomputes its next assessment as one
+second ahead every cycle and so reuses its assessment every two seconds
+without end, appending an attempt row each time. It makes no model calls,
+but the row growth is unbounded. Root cause: the observation deadline had
+already passed, the lifecycle rightly kept the Situation open while the
+alert fired, but the passed deadline was still offered to the contract as
+a future checkpoint and clamped to the one-second minimum lead. The fix
+drops a passed deadline from the checkpoint candidates so the Situation
+idles at its cadence
+(`TestControllerReconcilePastObservationDeadlineWhileFiringIdlesAtCadence`).
+
+A fifth run shipped both fixes and used a deterministic trigger: kill the
+process the instant a fifth attempt is dispatched under an unreachable
+model, then make the model reachable again. Both fixes held live. The
+exhausted Situations parked on their first cycle after the restart,
+refreshed their bounded projection once per cadence while the dependency
+was reported down, and were woken into a fresh epoch and a model-validated
+assessment the second it was reported healthy. The looping Situation
+stopped at the switch and has cycled at its slow cadence since.
+
+That run also showed a liveness gap: the recovery wake waits for the
+model-health aggregate, and the assessment capability in that aggregate
+healed only on an assessment success, which parked Situations cannot
+produce. With every working Situation parked or held by a dead process's
+lease, the wake waited for an unrelated Situation's lease to expire. The
+ruling narrowed the fix to the capabilities that share the primary model
+client: a real success on any of triage draft, assessment, verification
+re-judgment, or query repair now clears a dependency-class failure on the
+others and on the probe, while content-class failures stay with their own
+capability, the memory classifier is outside the rule in both directions,
+a probe success still clears nothing but the probe, and a capability that
+was not called keeps its own last-success time
+(`internal/llmhealth`, `TestSharedPrimarySuccessClearsDependencyFailuresAcrossCapabilities`,
+and the runtime-wiring proof
+`TestLLMHealthDependencyWakerWakesOnTriageDraftSuccessAfterAssessmentOutage`).
+A sixth run with the same trigger showed exactly that: the first
+successful Triage draft after the restart healed the assessment capability,
+the aggregate went healthy, and the wake, the fresh epoch, and a
+model-validated assessment followed within the same few seconds, with no
+assessment dispatched in between. The exhausted-park path held again on
+both Situations of that run.
+
+The review of the same run also closed a membership race that the runs
+had not reached: the correlator plans a retry attach after reading that an
+Incident's Acute Triage schedule is in backoff, but the commit only checked
+that the Incident and its owning Situation were not terminal. A clean skip
+committed by the controller between that read and the commit is a first
+judgment that closes membership, so a later alert could attach behind it
+without any decision seeing it. The attach now carries the exact
+precondition it was planned under (the schedule is still in backoff at
+commit) and is rejected otherwise, so the correlator re-plans the delivery
+(`TestApplyCorrelatedDeliveryRejectsRetryAttachOnceTriageLeftBackoff`).
+
+An external review of the finished branch then reopened it with three
+findings. The first was a real defect no run had exercised: the symptom
+reduction keyed one symptom per Incident and took the status of the
+Incident's most recently received delivery, so one alert resolving while a
+sibling alert in the same Incident still fired read as a resolved Incident
+and drove the Situation through recovery to a terminal state under a
+still-firing alert. The rationale in the code ("no alert identity reaches
+the pure layer") had been stale since alert identity was threaded through
+deliveries for the critical-anchor predicate. The reduction now works per
+alert: each alert contributes only its latest delivery, and the Incident
+fires while any alert's latest delivery fires
+(`TestSnapshotSymptomStaysFiringWhileAnyAlertOfTheIncidentStillFires`,
+`TestControllerReconcilePartialResolutionKeepsSituationActive`). A seventh
+run verified it live: four drill alerts in one Incident, one resolved
+through the production webhook door while three still fired, and the
+Situation stayed active through three cycles and past the recovery grace;
+when the last three resolved, the same Situation went recovery-pending on
+the next cycle and recovered one second after grace expiry. The other two
+findings were plan-versus-code discrepancies resolved toward the spec: the
+two reason predicates that the plan listed as reachable stay unreachable
+under a dated scope revision (one needs persisted symptom history the plan
+never added; the other has its deadline half but no definition of
+"actionable uncertainty"), and the plan's line that an identical
+controller-commit replay succeeds was amended — the commit clears the
+lease, so a verbatim replay fails closed and convergence comes from the
+next claim, now proved on the real store as the ninth replay boundary
+(`crash_after_commit_before_result_observed`).
+
+Do not fill in a cell with a guess, an extrapolation from the local replay
+run, or a number that cannot be independently re-verified from the lab
+tenant's own durable state. In particular: **never claim an unverifiable
+provider receipt count.** Every "consumed L2 dispatch slots" / "consumed
+Triage attempts" figure below must be read back from
+`situation_assessment_calls`, `situation_assessment_attempts`, and
+`incident_triage` (attempts) directly — not asserted from memory of how many
+calls a drill "should" have made — and cross-checked against the same
+Situation/Incident's own audit trail, MCP read, and OTel trace before the row
+is marked `pass`.
+
+## How to fill this in (lab-deployment step)
+
+For each of the ten checks below, once the corresponding drill/scenario has
+run against the lab tenant:
+
+1. Identify the exact Situation ID(s) and Incident ID(s) the check exercised.
+2. Read the durable state directly: `alertint_get_situation` /
+   `alertint_get_incident` over MCP, a read-only `sqlite3` query against the
+   lab database (`situations`, `situation_assessment_attempts`,
+   `situation_assessment_calls`, `incident_triage`, `situation_facts`,
+   `audit_log`), `task lab:logs` (the per-cycle log lines carry the
+   trace/span IDs), and the lab Prometheus span-metrics series the
+   collector derives from the exported spans (see the OTel note below).
+3. Record every column with the exact value read back — not a paraphrase.
+4. Set **Result** to `pass` only once every column is filled with real,
+   cross-checked evidence and the check's own pass condition (stated in its
+   row) holds; otherwise `fail` with a one-line reason in **Evidence
+   location**, or leave `TODO` if the check has not been run yet.
+5. Record **Date** as the UTC date the evidence was actually gathered (not
+   the date this structure was created).
+
+## Evidence table
+
+| # | Check | Date (UTC) | Situation ID | Incident ID(s) | Input version | Material fact hash | Assessment basis hash | Membership digest | Incident-input digest | Assessment derivation | Triage phase | Consumed L2 dispatch slots | Consumed Triage attempts | Audit IDs | OTel trace ID | OTel span ID | Restart point | Result | Evidence location |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | Receiver-to-Situation | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | n/a | TODO | TODO |
+| 2 | Within-class hash stability | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | n/a | TODO | TODO |
+| 3 | Unchanged-basis L2 reuse | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | n/a | TODO | TODO |
+| 4 | Deterministic request/skip | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | n/a | TODO | TODO |
+| 5 | Same-key attachment until first judgment | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | n/a | TODO | TODO |
+| 6 | Finding/Triage restart without another consumed Acute Triage attempt | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 7 | Deterministic L2 fallback | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | n/a | TODO | TODO |
+| 8 | Stale-claim rejection | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | n/a | TODO | TODO |
+| 9 | Concurrent due/checkpoint preservation | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | n/a | TODO | TODO |
+| 10 | Agreement across MCP/audit/SQLite/logs/OTel | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO | n/a | TODO | TODO |
+
+## Per-check pass condition (for the lab-deployment step to evaluate against)
+
+1. **Receiver-to-Situation.** A real Alertmanager (or Zabbix) webhook POST
+   against the lab tenant durably produces a Situation with a due reason,
+   with no hand-seeded row anywhere in the chain — confirmed by reading the
+   Situation back over MCP and by a direct SQLite read of `situations` and
+   `situation_input_outbox`.
+2. **Within-class hash stability.** Two reconcile cycles of the same
+   unchanged input (same duration class, same membership) produce byte-
+   identical `current_material_fact_hash`/`current_assessment_basis_hash`.
+3. **Unchanged-basis L2 reuse.** A reconcile cycle against an unchanged,
+   trustworthy basis consumes zero L2 dispatch slots (no new row in
+   `situation_assessment_calls`) yet still writes a fresh input-bound
+   `situation_assessment_attempts` row with `derivation = 'revalidated_reuse'`.
+4. **Deterministic request/skip.** `catalog-failure`/`payment-failure` (or
+   equivalent) drills produce the expected `request`/`skip` Triage decisions,
+   reproducibly, for the same Incident state.
+5. **Same-key attachment until first judgment.** A same-key repeat fired
+   before an Incident's first judgment attaches as membership on the
+   existing Incident/Triage schedule rather than minting a new one or
+   accelerating the due time.
+6. **Finding/Triage restart without another consumed Acute Triage attempt.**
+   A controlled process restart mid-Triage-attempt (`task lab:fire` followed
+   by a restart during the attempt window) recovers cleanly on the next
+   `RunOnce`/`Drain` pass, and the eventual Finding is produced by exactly
+   one *effective* consumed Acute Triage attempt (the interrupted attempt is
+   recorded as failed/backed-off, never silently repeated as a second billed
+   attempt for the same due work).
+7. **Deterministic L2 fallback.** With the configured LLM made unavailable
+   (or via a drill that forces an L2 failure) and no trustworthy prior
+   Assessment, the controller commits a deterministic fallback Assessment —
+   never a stale/absent one — and Attention is forced `urgent` when the
+   deterministic floor applies.
+8. **Stale-claim rejection.** A reconcile cycle whose claim has been
+   superseded by a concurrent newer input fails closed
+   (`ErrSituationVersionConflict`/`ErrSituationLeaseLost`) rather than
+   committing — confirmed via the audit log's `situation.controller.
+   commit_failed` row and the fact that the newer input's own due reason
+   survives.
+9. **Concurrent due/checkpoint preservation.** A concurrent Situation input
+   arriving mid-cycle is never lost: its due reason (and any earlier
+   checkpoint) survives a stale-claim rejection and is picked up by the next
+   cycle — confirmed by comparing `due_reasons_json`/`next_assessment_at`
+   before and after.
+10. **Agreement across MCP/audit/SQLite/logs/OTel.** For one representative
+    Situation/Incident pair, the consumed L2 dispatch slot count and
+    consumed Triage attempt count read identically from: `alertint_get_
+    situation`/`alertint_get_incident` (MCP), `alertint_verify_audit` (audit
+    log), a direct read-only SQLite query, `task lab:logs`, and the
+    configured OTel backend's trace/span attributes for the same cycle.
+
+## Notes
+
+- Check 8 (stale-claim rejection) covers a lease that changes hands
+  *between* cycles. The harder variant — a lease lost *mid-cycle* with no
+  process restart (heartbeat `ExtendControllerLease` failure cancelling the
+  in-flight reconcile after the L2 dispatch row is durable but before
+  `CommitController`; a stall outliving the 300s lease; a `CommitController`
+  error) used to let the next claimant re-mint the stranded call's own
+  `(retry_epoch, work_attempt, call_number)` and collide on
+  `situation_assessment_calls`' UNIQUE index, wasting one cycle on a
+  `deterministic_fallback` Assessment, because `RecoverInterruptedAssessmentCalls`
+  is startup-only and never ran. `BeginControllerAttempt` now reconciles
+  against the dispatched-call ledger inside its own fenced claim
+  transaction, so this needs no restart and no lab step: it is pinned by
+  `TestControllerAttemptHealsStrandedDispatchWithoutRestart` and its
+  siblings in `internal/store/situation_controller_test.go`, which drive
+  the exact worker-A-dispatch / lease-expired / worker-B-claim sequence
+  against the real schema. Known, accepted edge: a stranded *fifth* attempt
+  leaves the Situation exhausted for that basis with no park marker until
+  the basis changes — identical to what the startup recovery pass already
+  produces for the same crash, not a new behaviour.
+- **OTel columns (check 10).** The controller and Triage worker emit the
+  three spans `docs/concepts/architecture.md#3a` names, with the attributes
+  check 10 cross-checks (Situation/Incident/attempt IDs, input version,
+  hashes, digests, dispatch slot, attempt number, result class, duration)
+  — pinned by `internal/situation/telemetry_test.go` against an in-memory
+  span recorder — and export them over OTLP when the lab config enables
+  `telemetry.otlp` (`docs/getting-started/configuration.md#telemetry`),
+  pointed at the lab's own OpenTelemetry Collector. The lab collector's
+  traces pipeline feeds its span-metrics connector only (there is no trace
+  store in the lab), so the two OTel columns are filled from two places
+  that must agree: the **trace/span IDs** come from the agent's own
+  structured log lines for that cycle (`situation: controller reconcile`,
+  `situation: assessment dispatch`, `situation: triage worker: attempt
+  finished` — each carries `trace_id`/`span_id` next to the Situation/
+  Incident/attempt IDs), and the **consumed counts** come from the
+  collector-derived series in the lab Prometheus, e.g.
+  `traces_span_metrics_calls_total{service_name="alertint-agent",
+  span_name="situation.assessment.dispatch"}` and
+  `{span_name="incident.triage.attempt"}`, whose deltas over the drill
+  window must equal the `situation_assessment_calls` /
+  `incident_triage_attempts` row counts read back from SQLite. A span
+  count that disagrees with the ledger is a `fail`, not a rounding note.
+  Do not fill those columns from the unit test — they are for IDs and
+  counts read back from the live lab.
+- **Clean skip (checks 4 and 6).** A below-minimum-member Incident is
+  clean-skipped by the Triage worker BEFORE any attempt claim
+  (`CleanSkipIncidentTriageBelowMinimumMembers`): the schedule closes to
+  `skipped`, `incident_triage.attempts` stays at its pre-skip value, and
+  `incident_triage_attempts` gains no row. When reading back "consumed
+  Triage attempts" for a skipped Incident, expect zero for that skip; a
+  nonzero count there is a regression, not evidence.
+- **Installation LLM health (check 7).** The `assessment` capability under
+  `/health` reflects the controller's *classified* L2 outcome — a malformed
+  or policy-rejected proposal is a content failure (unhealthy only once two
+  distinct Situations corroborate it), a transport failure is unhealthy at
+  once, a stale-basis discard is a success. When forcing an L2 failure for
+  check 7, record which class the health snapshot reported alongside the
+  fallback Assessment.
+- `notify.slack.enabled` must read `false` and stdout must read enabled in
+  the lab config before any of the above is exercised — verified by the
+  lab-deployment step before firing anything, and re-confirmed by "exactly
+  zero Slack messages" once every check has run.
+- This structure intentionally never lists "provider receipt count" as a
+  column: the spec's own instruction is "do not claim unverifiable provider
+  receipt counts" — every consumed-slot/attempt figure here is read from
+  this system's own durable ledger (`situation_assessment_calls`,
+  `situation_assessment_attempts`, `incident_triage`), never from an
+  external provider dashboard or invoice this system cannot itself verify.
+- See `docs/concepts/architecture.md#3a-situation-foundation-and-controller`
+  for what "wired" vs. "not yet" means at the time this structure was
+  created, and `doctopus/agents/alertint-agent/planning/2026-08-19-proactive-
+  situation-controller/02-controller-triage-coordination/spec.md` for this
+  table's own ground-truth source.

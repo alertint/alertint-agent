@@ -685,6 +685,49 @@ func TestMarkIncidentReadyWithSituationInputIsAtomicAndIdempotent(t *testing.T) 
 	assertQueryCount(t, st.DB(), `SELECT COUNT(*) FROM situation_input_outbox WHERE idempotency_key=? AND kind='incident_ready'`, 1, "incident-ready:inc-ready")
 }
 
+// TestMarkIncidentReadyWithSituationInputCreatesAwaitingDecisionSchedule
+// pins Task 6's core mandate: the ready transition and the Acute Triage
+// awaiting_decision schedule row commit together, in one transaction, at
+// attempt zero — "every ready Incident begins in awaiting_decision."
+// Replaying the call (the idempotent "ready" branch) must not duplicate or
+// disturb that row.
+func TestMarkIncidentReadyWithSituationInputCreatesAwaitingDecisionSchedule(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 2, 5, 0, 0, time.UTC)
+	insertCollectingIncident(t, st, "inc-ready-schedule", "service=api", now.Add(-time.Minute))
+
+	if err := st.MarkIncidentReadyWithSituationInput(ctx, "inc-ready-schedule", now); err != nil {
+		t.Fatal(err)
+	}
+	var phase string
+	var attempts int
+	var situationID sql.NullString
+	if err := st.DB().QueryRowContext(ctx, `SELECT phase, attempts, situation_id FROM incident_triage WHERE incident_id = ?`, "inc-ready-schedule").
+		Scan(&phase, &attempts, &situationID); err != nil {
+		t.Fatalf("read incident_triage row: %v", err)
+	}
+	if phase != "awaiting_decision" || attempts != 0 {
+		t.Fatalf("phase=%q attempts=%d, want awaiting_decision/0", phase, attempts)
+	}
+	if situationID.Valid {
+		t.Fatalf("situation_id = %v, want null (no controller decision has run yet)", situationID)
+	}
+
+	// Idempotent replay must not disturb the row.
+	if err := st.MarkIncidentReadyWithSituationInput(ctx, "inc-ready-schedule", now); err != nil {
+		t.Fatal(err)
+	}
+	assertQueryCount(t, st.DB(), `SELECT COUNT(*) FROM incident_triage WHERE incident_id = ?`, 1, "inc-ready-schedule")
+	if err := st.DB().QueryRowContext(ctx, `SELECT phase, attempts FROM incident_triage WHERE incident_id = ?`, "inc-ready-schedule").
+		Scan(&phase, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if phase != "awaiting_decision" || attempts != 0 {
+		t.Fatalf("phase=%q attempts=%d after replay, want unchanged awaiting_decision/0", phase, attempts)
+	}
+}
+
 func TestMarkIncidentReadyWithSituationInputRejectsUnknownIncident(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
@@ -851,4 +894,212 @@ func TestApplyCorrelatedDeliveryRejectsTerminalSituationOwner(t *testing.T) {
 	}
 	assertQueryCount(t, st.DB(), `SELECT COUNT(*) FROM incident_alert_deliveries WHERE delivery_id = 'd-late'`, 0)
 	assertQueryCount(t, st.DB(), `SELECT COUNT(*) FROM situation_input_outbox WHERE id = 'input-d-late'`, 0)
+}
+
+// TestApplyCorrelatedDeliveryRejectsRetryAttachOnceTriageLeftBackoff proves
+// the retry-backoff attach's exact precondition holds inside the durable
+// mutation (lab F5): a plan made while the Incident's Acute Triage schedule
+// was in backoff commits only if the schedule is STILL in backoff; if the
+// controller's clean skip (a first judgment that closes membership) landed
+// between planning and commit, the attach is rejected with
+// ErrIncidentOwnerNotCollapsible and nothing is written, so the correlator
+// re-plans instead of attaching membership behind that decision.
+func TestApplyCorrelatedDeliveryRejectsRetryAttachOnceTriageLeftBackoff(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 4, 2, 0, 0, 0, time.UTC)
+
+	insertIncidentAndInput(t, st, "inc-1", "input-1", "service=api", now)
+	if err := st.ApplySituationInput(ctx, claimOneInput(t, st, "w", now)); err != nil {
+		t.Fatalf("apply situation input: %v", err)
+	}
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO incident_triage (incident_id, phase, attempts, next_at, updated_at)
+		VALUES ('inc-1', 'backoff', 1, ?, ?)`, canonicalTime(now.Add(time.Minute)), canonicalTime(now)); err != nil {
+		t.Fatalf("seed backoff triage row: %v", err)
+	}
+
+	attach := func(deliveryID, inputID string, at time.Time) error {
+		if _, err := st.AcceptDeliveries(ctx, []DeliveryInput{deliveryFixture(deliveryID, "fp-"+deliveryID, at)}); err != nil {
+			t.Fatalf("accept %s: %v", deliveryID, err)
+		}
+		claims, err := st.ClaimAlertDispatches(ctx, "dispatch-a", at, time.Minute, 10)
+		if err != nil {
+			t.Fatalf("claim %s: %v", deliveryID, err)
+		}
+		var claim *AlertDispatch
+		for i := range claims {
+			if claims[i].Delivery.ID == deliveryID {
+				claim = &claims[i]
+			}
+		}
+		if claim == nil {
+			t.Fatalf("delivery %s not among claimed dispatches", deliveryID)
+		}
+		_, err = st.ApplyCorrelatedDelivery(ctx, CorrelatedDeliveryMutation{
+			DeliveryID:              deliveryID,
+			DispatchOwner:           "dispatch-a",
+			DispatchClaimToken:      claim.ClaimToken,
+			Incident:                Incident{ID: "inc-1", GroupKey: "service=api", FirstAlertAt: now, LastAlertAt: now, ReadyAt: now.Add(time.Minute)},
+			Input:                   SituationInput{ID: inputID, IdempotencyKey: "delivery:" + deliveryID, IncidentID: "inc-1", DeliveryID: &deliveryID, Kind: "membership_changed", GroupKey: "service=api", OccurredAt: at},
+			RequireNonterminalOwner: true,
+			RequireTriageBackoff:    true,
+		})
+		return err
+	}
+
+	// Control: still in backoff at commit, the attach lands.
+	if err := attach("d-backoff", "input-d-backoff", now.Add(time.Minute)); err != nil {
+		t.Fatalf("attach while triage is in backoff: %v", err)
+	}
+	assertQueryCount(t, st.DB(), `SELECT COUNT(*) FROM incident_alert_deliveries WHERE delivery_id = 'd-backoff'`, 1)
+
+	// The race: the controller committed a clean skip after the correlator
+	// read the backoff row and before it committed its attach.
+	if _, err := st.db.ExecContext(ctx, `
+		UPDATE incident_triage SET phase = 'skipped', next_at = NULL, updated_at = ? WHERE incident_id = 'inc-1'`,
+		canonicalTime(now.Add(2*time.Minute))); err != nil {
+		t.Fatalf("skip fixture triage row: %v", err)
+	}
+	err := attach("d-late", "input-d-late", now.Add(3*time.Minute))
+	if !errors.Is(err, ErrIncidentOwnerNotCollapsible) {
+		t.Fatalf("attach after the skip: err = %v, want ErrIncidentOwnerNotCollapsible", err)
+	}
+	assertQueryCount(t, st.DB(), `SELECT COUNT(*) FROM incident_alert_deliveries WHERE delivery_id = 'd-late'`, 0)
+	assertQueryCount(t, st.DB(), `SELECT COUNT(*) FROM situation_input_outbox WHERE id = 'input-d-late'`, 0)
+	// Membership is exactly the one control attach; the rejected plan added none.
+	assertQueryCount(t, st.DB(), `SELECT COUNT(*) FROM incident_alerts WHERE incident_id = 'inc-1'`, 1)
+
+	// A schedule row that is gone entirely (deleted on completion) is not in
+	// backoff either.
+	if _, err := st.db.ExecContext(ctx, `DELETE FROM incident_triage WHERE incident_id = 'inc-1'`); err != nil {
+		t.Fatalf("delete fixture triage row: %v", err)
+	}
+	if err := attach("d-gone", "input-d-gone", now.Add(4*time.Minute)); !errors.Is(err, ErrIncidentOwnerNotCollapsible) {
+		t.Fatalf("attach with no triage row: err = %v, want ErrIncidentOwnerNotCollapsible", err)
+	}
+}
+
+// ----------------------------------------------------------------------
+// GetAlertDeliveries (Task 7 fix, Finding #1): a bounded read of the
+// immutable AlertDelivery rows for an exact delivery id set — the frozen
+// input a claimed Triage attempt's MemberDeliveryIDs needs, never the
+// current mutable alerts/incident_alerts projection GetIncidentAlerts
+// reads.
+// ----------------------------------------------------------------------
+
+func TestGetAlertDeliveries_ReturnsExactSet(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 1, 2, 3, 0, time.UTC)
+
+	dels, err := st.AcceptDeliveries(ctx, []DeliveryInput{
+		deliveryFixture("d-1", "fp-1", now),
+		deliveryFixture("d-2", "fp-2", now.Add(time.Minute)),
+		deliveryFixture("d-3", "fp-3", now.Add(2*time.Minute)),
+	})
+	if err != nil || len(dels) != 3 {
+		t.Fatalf("accept deliveries: %v (%d)", err, len(dels))
+	}
+
+	got, err := st.GetAlertDeliveries(ctx, []string{"d-1", "d-3"})
+	if err != nil {
+		t.Fatalf("GetAlertDeliveries: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d deliveries, want 2", len(got))
+	}
+	byID := map[string]AlertDelivery{}
+	for _, d := range got {
+		byID[d.ID] = d
+	}
+	if _, ok := byID["d-1"]; !ok {
+		t.Error("missing d-1")
+	}
+	if _, ok := byID["d-3"]; !ok {
+		t.Error("missing d-3")
+	}
+	if _, ok := byID["d-2"]; ok {
+		t.Error("d-2 must not be returned — it was not requested")
+	}
+	if byID["d-1"].Alert.Fingerprint != "fp-1" {
+		t.Errorf("d-1 Alert.Fingerprint = %q, want fp-1", byID["d-1"].Alert.Fingerprint)
+	}
+}
+
+func TestGetAlertDeliveries_EmptyInputReturnsEmptySlice(t *testing.T) {
+	st := newTestStore(t)
+	got, err := st.GetAlertDeliveries(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("GetAlertDeliveries: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %d deliveries, want 0", len(got))
+	}
+}
+
+func TestGetAlertDeliveries_MissingIDFailsClosed(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 1, 2, 3, 0, time.UTC)
+	if _, err := st.AcceptDeliveries(ctx, []DeliveryInput{deliveryFixture("d-real", "fp-real", now)}); err != nil {
+		t.Fatalf("accept delivery: %v", err)
+	}
+
+	_, err := st.GetAlertDeliveries(ctx, []string{"d-real", "d-does-not-exist"})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound (a missing delivery id is a genuine identity error)", err)
+	}
+}
+
+// TestGetAlertDeliveries_ImmutableAcrossAlertMutation is the fix's own
+// regression proof: once a delivery is accepted, mutating the shared
+// alerts row for the same fingerprint (the re-fire race Finding #1
+// describes — a fresh delivery for an already-attached alert changes the
+// mutable alerts row in place via ON CONFLICT(fingerprint)) must never
+// change what GetAlertDeliveries returns for the ALREADY-accepted delivery
+// id — its content was frozen at accept time.
+func TestGetAlertDeliveries_ImmutableAcrossAlertMutation(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 1, 2, 3, 0, time.UTC)
+
+	original := deliveryFixture("d-frozen", "fp-mut", now)
+	original.Alert.Annotations = map[string]string{"summary": "original summary"}
+	dels, err := st.AcceptDeliveries(ctx, []DeliveryInput{original})
+	if err != nil || len(dels) != 1 {
+		t.Fatalf("accept delivery: %v (%d)", err, len(dels))
+	}
+	frozenAlertID := dels[0].Alert.ID
+
+	// Simulate a re-fire: a second delivery for the same fingerprint mutates
+	// the shared alerts row (upsertDeliveryAlertTx's own ON CONFLICT
+	// DO UPDATE) via a completely new, later delivery id.
+	mutated := deliveryFixture("d-later", "fp-mut", now.Add(time.Hour))
+	mutated.Alert.ID = frozenAlertID // same underlying alert (fingerprint match forces this anyway)
+	mutated.Alert.Annotations = map[string]string{"summary": "MUTATED after the frozen delivery was accepted"}
+	if _, err := st.AcceptDeliveries(ctx, []DeliveryInput{mutated}); err != nil {
+		t.Fatalf("accept mutating delivery: %v", err)
+	}
+
+	// The alerts row itself really did change underneath.
+	current, err := st.GetAlertByFingerprint(ctx, "fp-mut")
+	if err != nil {
+		t.Fatalf("get alert by fingerprint: %v", err)
+	}
+	if current.Annotations["summary"] != "MUTATED after the frozen delivery was accepted" {
+		t.Fatalf("current alerts row summary = %q, want the mutated value (test setup broken)", current.Annotations["summary"])
+	}
+
+	got, err := st.GetAlertDeliveries(ctx, []string{"d-frozen"})
+	if err != nil {
+		t.Fatalf("GetAlertDeliveries: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d deliveries, want 1", len(got))
+	}
+	if got[0].Alert.Annotations["summary"] != "original summary" {
+		t.Errorf("d-frozen Alert.Annotations[summary] = %q, want the frozen original — GetAlertDeliveries must never observe the later alerts-row mutation",
+			got[0].Alert.Annotations["summary"])
+	}
 }

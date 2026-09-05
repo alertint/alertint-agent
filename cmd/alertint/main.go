@@ -170,6 +170,16 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 
 	logConfigWarnings(logger, cfg)
 
+	// Operator-configured observability boundary: an OTLP trace exporter
+	// only when telemetry.otlp is enabled, otherwise nothing is installed
+	// and every span stays a no-op. Deferred so the final flush runs after
+	// the foundation stop sequence below has ended its last span.
+	stopTelemetry, err := startTelemetry(ctx, cfg, resolveVersion(), logger)
+	if err != nil {
+		return err
+	}
+	defer stopTelemetry()
+
 	applyServeOverrides(cfg, *receiversAddr, *mcpAddr)
 
 	st, stagedInfo, err := openStoreWithStagedRestore(ctx, cfg.Storage.SQLitePath, logger)
@@ -377,17 +387,18 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		OccurrenceCap:   cfg.Memory.OccurrenceCap,
 		Lookback:        time.Duration(cfg.Memory.LookbackDays) * 24 * time.Hour,
 	}
-	cor := correlator.New(corCfg, st, incidentSink{skill: skill}, logger)
+	cor := correlator.New(corCfg, st, productionIncidentSink(), logger)
 
-	// SetRejudger/SetTriageFailureNotifier are safe to wire here, before
-	// reconstruction: neither is reachable from ApplyDelivery's
-	// durable-dispatch path (Rejudge is deliberately never called
-	// synchronously from a delivery commit, and the triage-exhausted
-	// notifier fires only from the correlator's own internal ticker loop,
-	// which isn't running during reconstruction). SetAuditor,
-	// SetResolutionNotifier, and SetOccurrenceNotifier are NOT wired here —
-	// all three ARE reachable from ApplyDelivery — see startCorrelator below.
-	cor.SetRejudger(skill)
+	// SetTriageFailureNotifier is safe to wire here, before reconstruction:
+	// it is not reachable from ApplyDelivery's durable-dispatch path (the
+	// triage-exhausted notifier fires only from the correlator's own
+	// internal ticker loop, which isn't running during reconstruction).
+	// The Correlator has no analyzer/LLM seam at all — no IncidentSink
+	// beyond the no-op one and no re-judgment runner (Plan 2 Task 7) —
+	// see TestProductionCorrelatorHasNoAcuteTriageDispatchDependency.
+	// SetAuditor, SetResolutionNotifier, and SetOccurrenceNotifier are NOT
+	// wired here — all three ARE reachable from ApplyDelivery — see
+	// startCorrelator below.
 	cor.SetTriageFailureNotifier(notifier)
 
 	// stopCorrelator is called exactly once, however runServe exits: inline,
@@ -403,9 +414,36 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	// The durable Situation foundation runtime (Task 8): the dispatch and
 	// input workers Tasks 6-7 built, plus the Reconstructor that converges
 	// durable state before either worker, or Receivers, ever runs. owner is
-	// this process's own lease identity, minted once.
+	// this process's own lease identity, minted once — every worker this
+	// process runs (foundation's dispatch/input, and the Situation
+	// controller/Triage workers below) derives its own stable lease-owner
+	// suffix from this SAME identity, so no two workers from the same
+	// process can ever fence each other's claims.
 	owner := "alertint-" + uuid.NewString()
 	rt := newFoundationRuntime(st, cor, owner, logger)
+
+	// The Situation controller runtime (Task 9): the Situation controller
+	// worker (Reconcile) and the Acute Triage worker Tasks 7-8 built, plus
+	// the startup-only recovery/backfill pass both depend on having already
+	// run. assessClient is the controller's own one-shot, provider-neutral
+	// L2 boundary — the SAME configured provider client Acute Triage uses
+	// (buildLLMClient/llmClient), NOT wrapped in llmClient's own hidden-retry
+	// Complete method, and wrapped with the installation LLM-health observer
+	// (buildAssessmentClient). skill (already constructed above) structurally
+	// satisfies situation.AcuteAnalyzer/AfterCommitter/ExhaustionNotifier all
+	// three, so the Triage worker dispatches through the SAME refactored
+	// Acute Triage skill instance — never a second, separately-constructed
+	// one — while the unmodified `skill` variable used by incidentSink above
+	// keeps driving the Correlator's own tick-triggered compatibility path
+	// unchanged. Existing Acute Triage still receives the ordinary
+	// retry-capable llmClient (acutetriage.Config's own Config, unchanged);
+	// the Correlator itself (cor, constructed above) receives no LLM
+	// dependency of its own — corCfg/correlator.New's signature carries none,
+	// and its only path to Acute Triage is via incidentSink{skill: skill}.
+	crt, err := buildControllerRuntime(st, llmClient, llmHealth, skill, cfg.Situations, owner, auditor, logger)
+	if err != nil {
+		return err
+	}
 
 	// Probe enabled integrations in the background: quickly (with backoff)
 	// while one is failing — at startup a co-deployed dependency may still
@@ -418,12 +456,15 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	var recvErrCh <-chan error
 	startupSeq := foundationSequence{
 		reconstruct: func(ctx context.Context) error {
-			report, err := rt.Reconstruct(ctx)
-			if err != nil {
-				return fmt.Errorf("situation foundation reconstruction: %w", err)
-			}
-			logReconstructionReport(logger, report)
-			return nil
+			return runFoundationReconstruction(ctx, rt, logger)
+		},
+		// Task 9: Triage migration backfill, interrupted Assessment-call/
+		// Triage-attempt recovery, and the one-hour startup horizon — all
+		// startup-only, zero-outward-effect primitives that must run before
+		// any worker resumes claiming controller/Triage work, exactly like
+		// foundation reconstruction above.
+		backfillAndRecoverControllerWork: func(ctx context.Context) error {
+			return runControllerRecovery(ctx, crt, logger)
 		},
 		// SetAuditor/SetResolutionNotifier/SetOccurrenceNotifier are wired
 		// here — between reconstruct and cor.Start, never before — because
@@ -446,7 +487,8 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 			cor.SetOccurrenceNotifier(notifier)
 			return cor.Start(ctx)
 		},
-		startWorkers: rt.Start,
+		startWorkers:           rt.Start,
+		startControllerWorkers: crt.Start,
 		startReceivers: func() error {
 			var err error
 			recvSrv, recvErrCh, err = startReceivers(cfg, st, auditor, healthReg, llmHealth, rt.WakeDispatch, logger)
@@ -480,24 +522,23 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), ingress.DefaultShutdownTimeout)
 	defer cancel()
 
-	// Receivers, then the foundation workers (rt.Stop: dispatch, then
-	// input), then the Correlator: Receivers stopping first means no new
-	// inbound work can be durably accepted; the queue workers stopping next
-	// means nothing already durably queued goes unclaimed mid-drain; the
-	// Correlator stopping last — via stopCorrelator, the same
-	// sync.Once-guarded call the defer above falls back to on every other
-	// exit path — means it keeps serving fixed-window expiry and Triage
-	// retry for exactly as long as anything upstream could still be handing
-	// it work.
+	// Receivers; stop/flush the Correlator's fixed-window production; drain
+	// foundation delivery/input work and due controller/Triage work — and
+	// the inputs the latter produces — in rounds until a round handles
+	// nothing; then stop the controller/Triage workers (crt.Stop) and the
+	// foundation workers (rt.Stop: dispatch, then input). See
+	// foundationStopSequence's own doc comment for why the Correlator stops
+	// before the drain (its ticker is the one producer that could otherwise
+	// commit fresh durable work after the drain has finished) and why the
+	// drain is a loop. stopCorrelator is the same sync.Once-guarded call the
+	// defer above falls back to on every other exit path.
 	stopSeq := foundationStopSequence{
-		stopReceivers: func() error {
-			if recvSrv == nil {
-				return nil
-			}
-			return recvSrv.Shutdown(shutdownCtx)
-		},
-		stopWorkers:    rt.Stop,
-		stopCorrelator: stopCorrelator,
+		stopReceivers:         receiverShutdown(shutdownCtx, recvSrv),
+		stopCorrelator:        stopCorrelator,
+		drainFoundationWork:   rt.Drain,
+		drainControllerWork:   crt.Drain,
+		stopControllerWorkers: crt.Stop,
+		stopWorkers:           rt.Stop,
 	}
 	if err := stopSeq.run(shutdownCtx); err != nil {
 		logger.Error("situation foundation shutdown failed", slog.String("err", err.Error()))
@@ -510,6 +551,18 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 	logger.Info("alertint stopped", slog.String("reason", "signal"))
 	return nil
+}
+
+// receiverShutdown is foundationStopSequence's stop-receivers step: a
+// graceful Shutdown of the receivers HTTP server bounded by ctx, or a no-op
+// when no receiver was started (nil server).
+func receiverShutdown(ctx context.Context, srv *http.Server) func() error {
+	return func() error {
+		if srv == nil {
+			return nil
+		}
+		return srv.Shutdown(ctx)
+	}
 }
 
 // stopLLMHealthRunner stops the LLM health runner — its final delivery pass
@@ -1187,13 +1240,19 @@ func llmanthropicCfg(cfg *config.Config) llmanthropic.Config {
 	}
 }
 
-// incidentSink wraps an acutetriage.Skill as a correlator.IncidentSink.
-type incidentSink struct {
-	skill *acutetriage.Skill
-}
-
-func (s incidentSink) OnIncidentReady(ctx context.Context, inc store.Incident) error {
-	return s.skill.Run(ctx, inc)
+// productionIncidentSink is the only IncidentSink production ever hands the
+// Correlator: a no-op. Acute Triage dispatch belongs to the Triage worker
+// (internal/situation.TriageWorker) polling the gated incident_triage
+// schedule; the Correlator owns grouping, readiness, and attachment only
+// and must carry no analyzer/LLM dispatch dependency at all — not even a
+// dormant one. An earlier wiring passed a Skill-backed sink here (whose
+// callback called Skill.Run); the Correlator never invoked it after Task 7,
+// but a live LLM dependency handed to a component that must have none is a
+// wiring bug regardless of whether it is reachable, and one refactor away
+// from becoming a second dispatch path. TestProductionCorrelatorHasNoAcuteTriageDispatchDependency
+// pins this.
+func productionIncidentSink() correlator.IncidentSink {
+	return correlator.NopIncidentSink{}
 }
 
 // buildLogger constructs the runtime logger applying precedence

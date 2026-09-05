@@ -11,6 +11,8 @@ import (
 
 	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
+
+	"github.com/alertint/alertint-agent/internal/store/storetest"
 )
 
 // deliveryInputFor builds one DeliveryInput ready for AcceptDeliveries,
@@ -111,7 +113,7 @@ func insertBackoffIncident(t *testing.T, st *store.Store, id, groupKey string, a
 	if err := st.MarkIncidentReady(ctx, id); err != nil {
 		t.Fatalf("mark backoff incident ready: %v", err)
 	}
-	if err := st.SeedIncidentTriage(ctx, id, at); err != nil {
+	if err := storetest.SeedIncidentTriage(ctx, st.DB(), id, at); err != nil {
 		t.Fatalf("seed backoff triage: %v", err)
 	}
 	if _, err := st.BeginIncidentTriage(ctx, id, at); err != nil {
@@ -313,10 +315,8 @@ func TestApplyDelivery_RecurrenceCollapseAttachesOccurrenceAndNotifies(t *testin
 	st := openStore(t)
 	c := New(Config{}, st, NopIncidentSink{}, nil)
 	notifier := &fakeOccNotifier{}
-	rejudger := &fakeRejudger{}
 	aud := &fakeAuditor{}
 	c.SetOccurrenceNotifier(notifier)
-	c.SetRejudger(rejudger)
 	c.SetAuditor(aud)
 	now := time.Date(2026, 7, 8, 15, 30, 0, 0, time.UTC)
 	member := firingAlert("fp-orig", "DiskFull", "warning", now.Add(-5*time.Minute), false)
@@ -339,11 +339,6 @@ func TestApplyDelivery_RecurrenceCollapseAttachesOccurrenceAndNotifies(t *testin
 	}
 	if notifier.count() != 1 {
 		t.Fatalf("occurrence notifier calls = %d, want 1", notifier.count())
-	}
-	// Re-judgment is deliberately not invoked for durable deliveries: an LLM
-	// call has no place inside or synchronously after a dispatch commit.
-	if rejudger.count() != 0 {
-		t.Fatalf("rejudger calls = %d, want 0 (delivery path never re-judges inline)", rejudger.count())
 	}
 	// The durable path re-emits the occurrence-attach audit event
 	// attach.go's legacy path used to write — see docs/concepts/

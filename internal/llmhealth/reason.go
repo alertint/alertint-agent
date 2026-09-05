@@ -18,7 +18,11 @@ import (
 )
 
 // Capability is one distinct use the agent makes of the LLM, each with its
-// own health that only its own success can clear (CONTEXT.md: LLM capability).
+// own health (CONTEXT.md: LLM capability). A content-class failure is
+// cleared only by that capability's own success; a dependency-class failure
+// on a capability served by the shared primary client is also cleared by a
+// real success on any other shared primary capability (Tracker's
+// clearSharedDependencyFailures), never by a probe or the memory classifier.
 type Capability string
 
 const (
@@ -34,6 +38,18 @@ const (
 	// could not be relied on to clear a failure.
 	CapabilityQueryRepair Capability = "query_repair"
 	CapabilityProbe       Capability = "probe"
+	// CapabilityAssessment is the Plan 2 Situation controller's own L2
+	// dispatch (internal/situation.Controller.Reconcile's dispatchWorkBearing,
+	// via the one-shot CompleteOnce boundary) — a real generation against the
+	// same provider Acute Triage's CapabilityTriageDraft uses, reported and
+	// rolled up like every other capability (spec.md: "LLM health remains one
+	// installation-level capability state fed by real Acute Triage and
+	// Assessment outcomes"). Wired from cmd/alertint, never from
+	// internal/situation itself (internal/situation must never import
+	// internal/llmhealth — see internal/situation/controller_worker.go's own
+	// DependencyRecoveryWaker doc comment for the identical import-cycle
+	// constraint).
+	CapabilityAssessment Capability = "assessment"
 )
 
 // Reason names why one call outcome was recorded, from success through every

@@ -68,16 +68,19 @@ func sanitizeTriageDetail(s string) string {
 	return s[:end]
 }
 
-// SeedIncidentTriage inserts the initial "pending" triage row for a freshly
-// ready Incident, due at due.
-func (s *Store) SeedIncidentTriage(ctx context.Context, incidentID string, due time.Time) error {
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO incident_triage (incident_id, phase, attempts, next_at, updated_at)
-		VALUES (?, 'pending', 0, ?, ?)
-	`, incidentID, due.UTC().Format(time.RFC3339Nano), now)
-	if err != nil {
-		return fmt.Errorf("store: seed incident triage: %w", err)
+// seedAwaitingDecisionTriageTx inserts the awaiting_decision schedule row at
+// attempt zero for incidentID, inside an existing transaction — the exact
+// shape migration 0016's own upgrade-mapping backfill uses for a "ready
+// Incident with no Triage row". INSERT OR IGNORE: a repeat call (the
+// idempotent-replay "ready" branch of MarkIncidentReadyWithSituationInput,
+// or a genuine race) against an incident_id that already has ANY triage
+// row — awaiting_decision or further along — is a safe no-op; it never
+// clobbers state a decision/claim/completion already advanced.
+func seedAwaitingDecisionTriageTx(ctx context.Context, tx *sql.Tx, incidentID string, now time.Time) error {
+	if _, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO incident_triage (incident_id, phase, attempts, updated_at)
+		VALUES (?, 'awaiting_decision', 0, ?)`, incidentID, canonicalTime(now)); err != nil {
+		return fmt.Errorf("store: seed awaiting_decision triage row: %w", err)
 	}
 	return nil
 }

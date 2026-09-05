@@ -36,26 +36,37 @@ re-route alerts, run scripts or runbooks, or page ticketing systems for
 you. Several of these are natural future directions — remediation, if it
 lands, will be gated behind explicit operator approval flows.
 
-## Durable Situation foundation
+## Durable Situation foundation and controller
 
 Every accepted alert delivery is now immutable and durably queued, and the
 Incidents it produces are grouped under a durable per-exact-group
 **Situation** — visible read-only through the `alertint_list_situations`
 and `alertint_get_situation` MCP tools (see [Architecture: Situation
-foundation](architecture.md), [MCP clients](../integrations/mcp-clients.md)).
-Be precise about what that is and isn't:
+foundation and controller](architecture.md#3a-situation-foundation-and-controller),
+[MCP clients](../integrations/mcp-clients.md)). Be precise about what that
+is and isn't:
 
 - **Is:** durable delivery acceptance and dispatch, crash-safe correlation,
   and durable exact-group Situation grouping across restarts — all visible
-  read-only over MCP.
-- **Is not (yet):** a Situation controller. Nothing here decides when
-  Triage runs, owns the Slack card, or produces an Assessment, an operator
-  contract, or an episode summary — every `alertint_get_situation` response
-  reads `assessment: null` and `operator_contract: null`, honestly,
-  because neither exists.
+  read-only over MCP. On the `state-controller` integration branch (not yet
+  the `main`-branch default a released binary runs), a fenced Situation
+  controller is also wired: local Store facts feed one authoritative
+  Assessment and operator-facing Attention/action contract per reconcile
+  cycle, and the "B+" Acute Triage gate durably holds every ready Incident
+  at `awaiting_decision` until that controller requests, skips, or leaves
+  it parked — nothing dispatches to the triage skill on its own anymore on
+  that branch.
+- **Is not (yet), even on `state-controller`:** connector preparation for
+  the controller's own evidence needs, durable Assessment/Triage artifacts
+  beyond the bounded recent-attempt history exposed over MCP, immutable
+  Transition/Episode summary history, or a Situation-owned Slack presence
+  (Slack, where enabled, still posts per-Incident, exactly as in Phase 1).
+  `alertint_get_situation` reads `assessment: null` and
+  `operator_contract: null`, honestly, for any Situation the controller has
+  not yet reconciled at least once — never a fabricated placeholder.
 - **No mode switch:** there is no `state_controller_mode`, shadow-output
-  path, or legacy/new runtime toggle to configure — this build has exactly
-  one grouping path.
+  path, or legacy/new runtime toggle to configure — one build runs one
+  grouping/dispatch path at a time.
 
 ## Known weaknesses
 

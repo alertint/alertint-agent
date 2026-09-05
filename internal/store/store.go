@@ -32,6 +32,8 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite" // registers driver name "sqlite"
+
+	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 )
 
 //go:embed migrations/*.sql
@@ -269,8 +271,12 @@ type Alert struct {
 	Role string
 }
 
-// ErrNotFound is returned when a lookup finds no matching row.
-var ErrNotFound = errors.New("store: not found")
+// ErrNotFound is situationmodel.ErrNotFound, relocated there to break
+// internal/situation's former import of internal/store: internal/situation
+// compares an ApplySituationInput failure against this exact value via
+// errors.Is, so it must be one shared value both packages can see without
+// either importing the other. See internal/situation/model/foundation.go.
+var ErrNotFound = situationmodel.ErrNotFound
 
 // UpsertAlertByFingerprint inserts the alert or, if a row with the same
 // fingerprint already exists, updates it in place ("latest wins"). The

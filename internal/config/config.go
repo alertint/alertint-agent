@@ -52,8 +52,32 @@ type Config struct {
 	Memory       MemoryConfig       `yaml:"memory"`
 	Triage       TriageConfig       `yaml:"triage,omitempty"`
 	Health       HealthConfig       `yaml:"health"`
+	Situations   SituationsConfig   `yaml:"situations"`
+	Telemetry    TelemetryConfig    `yaml:"telemetry,omitempty"`
 	LogLevel     string             `yaml:"log_level"`
 	LogFormat    string             `yaml:"log_format"`
+}
+
+// TelemetryConfig is the operator-configured observability boundary. With
+// telemetry.otlp.enabled false (the default) the agent installs no exporter
+// and no telemetry leaves the process: the OpenTelemetry spans the Situation
+// controller and Acute Triage worker emit stay no-ops. Enabling it installs
+// an OTLP trace exporter (internal/telemetry) pointed at the configured
+// collector. Spans carry only stable identities, digests, counts, result
+// classes, and durations — never prompts, proposals, provider bodies, SQL
+// text, or secrets — so the boundary is about egress consent, not content.
+type TelemetryConfig struct {
+	OTLP OTLPConfig `yaml:"otlp"`
+}
+
+// OTLPConfig configures the OTLP trace exporter.
+type OTLPConfig struct {
+	Enabled        bool   `yaml:"enabled"`         // install the exporter (default false)
+	Endpoint       string `yaml:"endpoint"`        // collector address: host:port, or a URL whose scheme decides TLS; required when enabled
+	Protocol       string `yaml:"protocol"`        // grpc | http (OTLP/HTTP protobuf); default grpc
+	Insecure       bool   `yaml:"insecure"`        // plaintext transport for a bare host:port endpoint
+	ServiceName    string `yaml:"service_name"`    // resource service.name; default alertint-agent
+	TimeoutSeconds int    `yaml:"timeout_seconds"` // per export batch; default 10
 }
 
 // HealthConfig tunes installation-level dependency health (today: the LLM).
@@ -64,6 +88,66 @@ type Config struct {
 type HealthConfig struct {
 	LLMIdleProbeAfterSeconds int `yaml:"llm_idle_probe_after_seconds"`
 	BroadcastAfterSeconds    int `yaml:"broadcast_after_seconds"`
+}
+
+// situationsMaxL2CallsPerAttempt and situationsMaxWorkAttemptsPerInput are
+// the Plan 2 situation controller's fixed L2 call/attempt accounting
+// (doctopus spec 02-controller-triage-coordination "L2 call and attempt
+// accounting"): two L2 provider calls per controller attempt, five durable
+// controller attempts per unchanged input. They are shipped as configuration
+// keys (so the wire shape documents the ceiling) but validateSituations
+// rejects any other value — Plan 2 does not make them tunable.
+const (
+	situationsMaxL2CallsPerAttempt    = 2
+	situationsMaxWorkAttemptsPerInput = 5
+)
+
+// SituationsConfig configures the Plan 2 situation controller: worker
+// concurrency, the reconcile poll interval, Situation claim lease/heartbeat
+// timing, the webhook source recovery grace, internal cadence tiers, the
+// fixed L2 call/work-attempt ceiling, the per-attempt wall clock, the shared
+// L2 provider semaphore, and bounded retry/jitter. It carries no Plan 3/4
+// settings: no L1 call budget, connector concurrency, or envelope review
+// interval. In particular, Plan 2 deliberately never adds
+// situations.budgets.max_l1_llm_calls (spec.md 02-controller-triage-coordination
+// "Attempt identity and completion": Acute Triage keeps its shipped
+// five-attempt schedule; a parsed budget with no distinct consuming behavior
+// would be removed rather than shipped unused) — strict YAML decoding
+// rejects it outright as an unknown field.
+type SituationsConfig struct {
+	Workers                     int                     `yaml:"workers"`
+	ReconcilePollSeconds        int                     `yaml:"reconcile_poll_seconds"`
+	LeaseSeconds                int                     `yaml:"lease_seconds"`
+	HeartbeatSeconds            int                     `yaml:"heartbeat_seconds"`
+	WebhookRecoveryGraceSeconds int                     `yaml:"webhook_recovery_grace_seconds"`
+	Cadence                     SituationsCadenceConfig `yaml:"cadence"`
+	MaxL2CallsPerAttempt        int                     `yaml:"max_l2_calls_per_attempt"`
+	MaxWorkAttemptsPerInput     int                     `yaml:"max_work_attempts_per_input"`
+	AttemptWallSeconds          int                     `yaml:"attempt_wall_seconds"`
+	LLMConcurrency              int                     `yaml:"llm_concurrency"`
+	Retry                       SituationsRetryConfig   `yaml:"retry"`
+}
+
+// SituationsCadenceConfig sizes the controller's internal fast/normal/slow
+// reconsideration tempo (model.Cadence). Cadence is persisted machinery, not
+// card content: it only widens or narrows how soon the controller next
+// reconciles a nonterminal Situation. These three values are live
+// configuration — cmd/alertint maps them onto situation.ControllerConfig.
+// Cadence, and internal/situation's contract derivation reads them for
+// next_update_at — with the plan's executable defaults of 60/300/900
+// seconds and a strict fast < normal < slow ordering enforced at load.
+type SituationsCadenceConfig struct {
+	FastSeconds   int `yaml:"fast_seconds"`
+	NormalSeconds int `yaml:"normal_seconds"`
+	SlowSeconds   int `yaml:"slow_seconds"`
+}
+
+// SituationsRetryConfig bounds the controller/store transient-error retry
+// range and its jitter fraction.
+type SituationsRetryConfig struct {
+	MinSeconds    int `yaml:"min_seconds"`
+	MaxSeconds    int `yaml:"max_seconds"`
+	JitterPercent int `yaml:"jitter_percent"`
 }
 
 // RulesConfig configures rule pack loading. The embedded baseline pack is
@@ -557,6 +641,35 @@ func Defaults() Config {
 			LLMIdleProbeAfterSeconds: 300,
 			BroadcastAfterSeconds:    300,
 		},
+		Situations: SituationsConfig{
+			Workers:                     2,
+			ReconcilePollSeconds:        1,
+			LeaseSeconds:                300,
+			HeartbeatSeconds:            30,
+			WebhookRecoveryGraceSeconds: 120,
+			Cadence: SituationsCadenceConfig{
+				FastSeconds:   60,
+				NormalSeconds: 300,
+				SlowSeconds:   900,
+			},
+			MaxL2CallsPerAttempt:    situationsMaxL2CallsPerAttempt,
+			MaxWorkAttemptsPerInput: situationsMaxWorkAttemptsPerInput,
+			AttemptWallSeconds:      180,
+			LLMConcurrency:          2,
+			Retry: SituationsRetryConfig{
+				MinSeconds:    5,
+				MaxSeconds:    300,
+				JitterPercent: 20,
+			},
+		},
+		Telemetry: TelemetryConfig{
+			OTLP: OTLPConfig{
+				Enabled:        false,
+				Protocol:       "grpc",
+				ServiceName:    "alertint-agent",
+				TimeoutSeconds: 10,
+			},
+		},
 		LogLevel:  "info",
 		LogFormat: "auto",
 	}
@@ -671,6 +784,8 @@ func (c *Config) validate(offline bool) error {
 	errs = append(errs, c.validateHealth()...)
 	errs = append(errs, c.validateTriageSelector()...)
 	errs = append(errs, c.validateMemory()...)
+	errs = append(errs, c.validateSituations()...)
+	errs = append(errs, c.validateTelemetry()...)
 	if !offline {
 		errs = append(errs, c.validateRules()...)
 	}
@@ -944,6 +1059,96 @@ func (c *Config) validateMemory() []string {
 	// positive only when the classifier is enabled (shadow or on).
 	if c.Memory.Classifier.Enabled() && c.Memory.Classifier.TimeoutSeconds <= 0 {
 		errs = append(errs, "memory: classifier: timeout_seconds: must be > 0 when mode is shadow or on")
+	}
+	return errs
+}
+
+// validateSituations checks the Plan 2 situation controller surface:
+// positive durations/concurrency, a lease heartbeat strictly shorter than
+// the lease it renews, a jitter fraction in [0,100], and the fixed L2
+// call/work-attempt ceiling (situationsMaxL2CallsPerAttempt,
+// situationsMaxWorkAttemptsPerInput) — Plan 2 does not make either tunable,
+// so any other configured value is rejected rather than silently accepted.
+func (c *Config) validateSituations() []string {
+	var errs []string
+	s := c.Situations
+
+	positive := []struct {
+		name string
+		v    int
+	}{
+		{"situations.workers", s.Workers},
+		{"situations.reconcile_poll_seconds", s.ReconcilePollSeconds},
+		{"situations.lease_seconds", s.LeaseSeconds},
+		{"situations.heartbeat_seconds", s.HeartbeatSeconds},
+		{"situations.webhook_recovery_grace_seconds", s.WebhookRecoveryGraceSeconds},
+		{"situations.cadence.fast_seconds", s.Cadence.FastSeconds},
+		{"situations.cadence.normal_seconds", s.Cadence.NormalSeconds},
+		{"situations.cadence.slow_seconds", s.Cadence.SlowSeconds},
+		{"situations.attempt_wall_seconds", s.AttemptWallSeconds},
+		{"situations.llm_concurrency", s.LLMConcurrency},
+		{"situations.retry.min_seconds", s.Retry.MinSeconds},
+		{"situations.retry.max_seconds", s.Retry.MaxSeconds},
+	}
+	for _, p := range positive {
+		if p.v <= 0 {
+			errs = append(errs, fmt.Sprintf("%s must be > 0", p.name))
+		}
+	}
+
+	if s.Cadence.FastSeconds > 0 && s.Cadence.NormalSeconds > 0 && s.Cadence.SlowSeconds > 0 &&
+		(s.Cadence.FastSeconds >= s.Cadence.NormalSeconds || s.Cadence.NormalSeconds >= s.Cadence.SlowSeconds) {
+		errs = append(errs, fmt.Sprintf(
+			"situations.cadence must order fast_seconds < normal_seconds < slow_seconds (got %d/%d/%d)",
+			s.Cadence.FastSeconds, s.Cadence.NormalSeconds, s.Cadence.SlowSeconds))
+	}
+
+	if s.HeartbeatSeconds > 0 && s.LeaseSeconds > 0 && s.HeartbeatSeconds >= s.LeaseSeconds {
+		errs = append(errs, fmt.Sprintf(
+			"situations.heartbeat_seconds (%d) must be shorter than situations.lease_seconds (%d)",
+			s.HeartbeatSeconds, s.LeaseSeconds))
+	}
+
+	if s.Retry.JitterPercent < 0 || s.Retry.JitterPercent > 100 {
+		errs = append(errs, fmt.Sprintf("situations.retry.jitter_percent (%d) must be between 0 and 100", s.Retry.JitterPercent))
+	}
+
+	if s.MaxL2CallsPerAttempt != situationsMaxL2CallsPerAttempt {
+		errs = append(errs, fmt.Sprintf(
+			"situations.max_l2_calls_per_attempt must be %d (fixed L2 call accounting; not yet tunable)",
+			situationsMaxL2CallsPerAttempt))
+	}
+	if s.MaxWorkAttemptsPerInput != situationsMaxWorkAttemptsPerInput {
+		errs = append(errs, fmt.Sprintf(
+			"situations.max_work_attempts_per_input must be %d (fixed work-attempt accounting; not yet tunable)",
+			situationsMaxWorkAttemptsPerInput))
+	}
+
+	return errs
+}
+
+// validateTelemetry checks the OTLP exporter block. Shape errors (an unknown
+// protocol, a non-positive timeout) are reported even while disabled, so a
+// block an operator has typed out is validated before the day it is switched
+// on; the endpoint itself is required only once enabled.
+func (c *Config) validateTelemetry() []string {
+	var errs []string
+	o := c.Telemetry.OTLP
+	switch o.Protocol {
+	case "grpc", "http":
+	default:
+		errs = append(errs, fmt.Sprintf("telemetry.otlp.protocol %q must be one of grpc, http", o.Protocol))
+	}
+	if o.TimeoutSeconds <= 0 {
+		errs = append(errs, "telemetry.otlp.timeout_seconds must be > 0")
+	}
+	if o.Enabled {
+		if strings.TrimSpace(o.Endpoint) == "" {
+			errs = append(errs, "telemetry.otlp.endpoint is required when telemetry.otlp.enabled is true (collector host:port or URL)")
+		}
+		if strings.TrimSpace(o.ServiceName) == "" {
+			errs = append(errs, "telemetry.otlp.service_name must not be empty when telemetry.otlp.enabled is true")
+		}
 	}
 	return errs
 }

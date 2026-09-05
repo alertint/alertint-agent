@@ -9,7 +9,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/alertint/alertint-agent/internal/store"
+	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
 // ----------------------------------------------------------------------
@@ -21,29 +21,36 @@ import (
 // operational Incident that still has no Situation. It never calls a
 // notifier, LLM, connector, or Slack dependency.
 //
-// LeaseRecovery and UpgradeIncident are internal/store's own types (see
-// internal/store/situation_reconstruction.go), re-exported here as type
-// aliases rather than redefined: this package already imports
-// internal/store — InputStore below (input_worker.go) names
-// store.SituationClaim directly — so internal/store cannot import this
-// package back without a cycle. Aliasing, instead of duplicating the
-// struct, is what lets *store.Store satisfy ReconstructStore without
-// store ever importing situation.
+// LeaseRecovery, UpgradeIncident, and DeadLetterCounts are
+// internal/situation/model's types (see
+// internal/situation/model/foundation.go), re-exported here as type
+// aliases purely so existing in-package call sites (this file and
+// reconstruct_test.go) keep using the short, unqualified names. They are
+// no longer internal/store's own types re-exported the other way: this
+// package used to import internal/store — InputStore (input_worker.go)
+// named store.SituationClaim directly, and ReconstructStore below named
+// these three types directly — so internal/store could not import this
+// package back without a cycle. Moving the canonical definitions into the
+// leaf internal/situation/model package broke that cycle; internal/store
+// now aliases situationmodel.LeaseRecovery/UpgradeIncident/DeadLetterCounts
+// as its own store.LeaseRecovery/UpgradeIncident/DeadLetterCounts (see
+// internal/store/situation_reconstruction.go), and this package no longer
+// imports internal/store at all.
 // ----------------------------------------------------------------------
 
 // LeaseRecovery reports how many rows one lease-recovery pass moved from
 // an expired claim back to unclaimed, per fenced table.
-type LeaseRecovery = store.LeaseRecovery
+type LeaseRecovery = model.LeaseRecovery
 
 // UpgradeIncident is one operational Incident with no Situation
 // membership yet, carrying the persisted Incident/delivery-derived times
 // ReconstructSituation needs to represent it.
-type UpgradeIncident = store.UpgradeIncident
+type UpgradeIncident = model.UpgradeIncident
 
 // DeadLetterCounts reports how many rows in each fenced dispatch/input
 // outbox table have permanently exhausted retries (status='failed') — see
-// store.DeadLetterCounts for why this exists.
-type DeadLetterCounts = store.DeadLetterCounts
+// model.DeadLetterCounts for why this exists.
+type DeadLetterCounts = model.DeadLetterCounts
 
 // ReconstructStore is the narrow slice of *store.Store the Reconstructor
 // depends on: recovering expired leases, counting dead-lettered work, and

@@ -104,7 +104,7 @@ here too: storm collapse, known-issue short-circuits, and prompt selection.
 - **Grouping identity:** Receiver default; optional `correlator.group_labels` override
 - **Window:** `correlator.window_seconds`, default 90 s
 
-### 3a. Situation foundation
+### 3a. Situation foundation and controller
 
 Every correlated delivery also feeds a **Situation** — a durable record
 that owns one or more Incidents under one exact group key across restarts,
@@ -115,23 +115,58 @@ group's later Incidents, so a re-fire after a prior resolution feeds the
 same Situation (or collapses into the judged Incident as an occurrence).
 The episode-boundary machinery — a closed Situation refusing new work, a
 fresh linked Situation opening in its place — is already enforced at the
-storage layer, but only becomes observable once the Situation controller
-ships lifecycle termination. This is a
-**foundation, not a controller**: today it durably groups Incidents and is
+storage layer, but only becomes observable once the controller ships
+lifecycle termination.
+
+**Honest status:** the durable Situation foundation *and* a fenced
+Situation controller are real, integration-tested work landing on the
+`state-controller` integration branch — not yet the `main`-branch default a
+released binary runs. On that branch: local Store facts (durability,
+correlation, exact-group grouping) are wired end to end, and so is the
+"B+" Acute Triage gate — every ready Incident is durably `awaiting_decision`
+until the controller's own fenced cycle requests, skips, or leaves it
+parked, and only a requested decision ever dispatches the triage skill (see
+["ready" in Incident lifecycle](#incident-lifecycle) below). Every reconcile
+cycle derives one authoritative Assessment (material facts, an
+operator-facing Attention level, and a bounded action contract) and is
 visible read-only through MCP (`alertint_list_situations`,
-`alertint_get_situation`) — it does not decide when Triage runs, does not
-own the Slack card, and produces no Assessment or operator contract yet
-(both fields read `null` on every Situation). Everything in Phase 1 below
-Correlation — memory, evidence, triage, verification, notification — still
-runs exactly as described, keyed off the Incident, unaffected by which
-Situation an Incident belongs to. There is no
+`alertint_get_situation`) once it has run at least once for a Situation.
+**Not yet wired, even on `state-controller`:** connector preparation for the
+controller's own evidence needs, durable Assessment/Triage artifacts beyond
+the bounded recent-attempt history, immutable Transition/Episode summary
+history, a Situation-owned Slack presence (the Slack card in Phase 1 below
+is still keyed off the Incident, not the Situation), and the final v0.14
+cutover that would make this the only grouping/dispatch path. Everything in
+Phase 1 below Correlation — memory, evidence, triage, verification,
+notification — still runs exactly as described, keyed off the Incident,
+unaffected by which Situation an Incident belongs to. There is no
 `state_controller_mode`, shadow-output path, or legacy/new runtime switch:
-this build has exactly one grouping path, and it's the one described here.
+one build runs one grouping/dispatch path at a time.
 
 - **MCP tools:** `alertint_list_situations`, `alertint_get_situation` —
   see [MCP clients](../integrations/mcp-clients.md)
-- **Not yet:** Triage scheduling, Slack ownership, Assessment, operator
-  contracts, episode summaries
+- **Config:** `situations.*` — see
+  [Configuration](../getting-started/configuration.md#situations)
+- **Observability:** every controller cycle, every consumed L2 dispatch
+  slot, and every consumed Acute Triage attempt is one OpenTelemetry span
+  (`situation.controller.reconcile`, `situation.assessment.dispatch`,
+  `incident.triage.attempt`) carrying only stable identity, digest, count,
+  closed result-class, and duration attributes — Situation/Incident/attempt
+  IDs, input version, material/basis hashes, membership/Incident-input/
+  evidence-pack digests, dispatch slot and attempt number — never a prompt,
+  proposal, provider body, or SQL text. Each span site also writes one
+  structured log line with the same identities plus the span's
+  `trace_id`/`span_id`, and the audit log carries the same identities, so
+  the three surfaces can be reconciled against each other and against the
+  store by identity. Spans go through the OpenTelemetry global tracer
+  provider, which is a no-op unless the operator enables the OTLP trace
+  exporter under
+  [`telemetry.otlp`](../getting-started/configuration.md#telemetry) —
+  no telemetry leaves the process by default.
+- **Not yet:** connector preparation, Assessment/Triage artifacts beyond the
+  bounded recent-attempt history, Transition/Episode summary history,
+  Situation-owned Slack, OpenTelemetry metrics or logs export (traces only
+  today), the final v0.14 cutover
 
 ### 4. Memory
 
@@ -288,8 +323,13 @@ collecting  →  ready  →  processing  →  analyzed
 - `collecting`: window is open, alerts arriving.
 - `ready`: window expired; a durable **triage schedule** — phase, attempt
   count, next-due time, attempt-start time, bounded last-error — is seeded
-  for the incident, one row per incident, and it dispatches to the triage
-  skill.
+  for the incident, one row per incident. On the `state-controller`
+  integration branch (see [Situation foundation and
+  controller](#3a-situation-foundation-and-controller) above), that
+  schedule starts in phase `awaiting_decision` and only dispatches to the
+  triage skill once the owning Situation's controller has recorded a
+  `request` decision against it — a `skip` decision, or the Situation
+  staying parked, leaves it undispatched instead.
 - `processing`: the transition to `processing` happens *before* the triage
   skill is called and is a real in-flight lease, not a display value — a
   crash mid-call is distinguishable from a clean run. If the skill errors
@@ -358,16 +398,27 @@ architecture item.
 
 The configured LLM is an installation-level dependency, observed below Acute
 Triage rather than owned by any Incident or Situation. Each distinct use of
-the LLM — the triage draft (Call 1), the bounded PromQL query repair, the
-verification re-judgment (Call 2), the optional memory classifier, and the
-idle probe — is its own **LLM capability**, cleared only by its own success:
+the LLM — the triage draft (Call 1), the Situation assessment, the bounded
+PromQL query repair, the verification re-judgment (Call 2), the optional
+memory classifier, and the idle probe — is its own **LLM capability**:
 
-- A `triage_draft` failure makes the installation `unavailable`; a
-  `verification_rejudge` failure makes it `degraded` while drafts continue
-  to ship. `memory_classifier` and `query_repair` (the one bounded PromQL
-  repair call before Call 2) are reported independently and never change
-  the rolled-up state — a repair only runs when the model proposed invalid
-  PromQL, so its success could never be relied on to clear a failure.
+- A `triage_draft` or `assessment` failure makes the installation
+  `unavailable`; a `verification_rejudge` failure makes it `degraded` while
+  drafts continue to ship. `memory_classifier` and `query_repair` (the one
+  bounded PromQL repair call before Call 2) are reported independently and
+  never change the rolled-up state — a repair only runs when the model
+  proposed invalid PromQL, so its success could never be relied on to clear
+  a failure.
+- A content-class failure (the model's output for that use is unusable,
+  corroborated across two Incidents) is cleared only by that capability's
+  own success. A dependency-class failure (timeout, network, provider
+  error) on any capability served by the shared primary client —
+  `triage_draft`, `assessment`, `verification_rejudge`, `query_repair` — is
+  cleared by a real success on any of those four, because that success
+  proves the shared transport and provider are back; the capability that
+  was not called keeps its own last-success time. A `memory_classifier`
+  success never clears them, and their success never clears the classifier
+  (it may run on a separate model).
 - After five idle minutes with zero in-flight calls, a strictly
   non-generating metadata `GET` probes reachability — never a completion,
   never a prompt. A dependency-class probe failure also makes the

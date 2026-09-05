@@ -9,6 +9,8 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/google/uuid"
+
+	"github.com/alertint/alertint-agent/internal/store/storetest"
 )
 
 // seedTriagePhase inserts a "ready" Incident on gkAPI with one member alert
@@ -45,7 +47,7 @@ func seedTriagePhase(t *testing.T, st *store.Store, phase store.TriagePhase, mem
 	if phase == "" {
 		return inc.ID, member
 	}
-	if err := st.SeedIncidentTriage(ctx, inc.ID, now); err != nil {
+	if err := storetest.SeedIncidentTriage(ctx, st.DB(), inc.ID, now); err != nil {
 		t.Fatalf("seed triage: %v", err)
 	}
 	if phase == store.TriagePending {

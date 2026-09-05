@@ -64,6 +64,19 @@ health:
   llm_idle_probe_after_seconds: 300  # default: probe after 5 minutes without a completed real LLM call
   broadcast_after_seconds: 300       # default: notify after 5 continuous unhealthy minutes
 
+# Operator-configured observability boundary. Off by default: no exporter is
+# installed and no telemetry leaves the process. Enabling it exports the
+# Situation controller / Acute Triage spans (identities, digests, counts,
+# durations — never prompts, proposals, or provider bodies) over OTLP.
+telemetry:
+  otlp:
+    enabled: false
+    endpoint: ""             # collector host:port (TLS unless insecure) or URL with scheme; required when enabled
+    protocol: grpc           # grpc | http
+    insecure: false          # plaintext transport for a bare host:port endpoint
+    service_name: alertint-agent
+    timeout_seconds: 10
+
 notify:
   stdout: true             # always emit one JSON line per finding to stdout
   slack:

@@ -55,7 +55,11 @@ func assertTrace(t *testing.T, got, want []string) {
 }
 
 // tracedFoundationSequence builds a foundationSequence whose every phase
-// succeeds and appends its own name to tr, in call order.
+// succeeds and appends its own name to tr, in call order — including Task
+// 9's own two additional phases (backfillAndRecoverControllerWork,
+// startControllerWorkers), so this file's own order-proving tests exercise
+// the full six-phase sequence the plan's startup order actually specifies,
+// not just the four Plan 1 phases.
 func tracedFoundationSequence(tr *tracer) foundationSequence {
 	return foundationSequence{
 		reconstruct: func(context.Context) error {
@@ -65,6 +69,13 @@ func tracedFoundationSequence(tr *tracer) foundationSequence {
 			tr.add("reconstruct_incidents")
 			return nil
 		},
+		backfillAndRecoverControllerWork: func(context.Context) error {
+			tr.add("triage_migration_backfill")
+			tr.add("recover_interrupted_assessment_calls")
+			tr.add("recover_interrupted_triage_attempts")
+			tr.add("enforce_triage_startup_horizon")
+			return nil
+		},
 		startCorrelator: func(context.Context) error {
 			tr.add("start_correlator")
 			return nil
@@ -72,6 +83,10 @@ func tracedFoundationSequence(tr *tracer) foundationSequence {
 		startWorkers: func(context.Context) {
 			tr.add("start_input_worker")
 			tr.add("start_dispatch_worker")
+		},
+		startControllerWorkers: func(context.Context) {
+			tr.add("start_controller_worker")
+			tr.add("start_triage_worker")
 		},
 		startReceivers: func() error {
 			tr.add("start_receivers")
@@ -100,9 +115,15 @@ func TestFoundationSequenceOrdersEveryPhase(t *testing.T) {
 		"drain_deliveries",
 		"drain_inputs",
 		"reconstruct_incidents",
+		"triage_migration_backfill",
+		"recover_interrupted_assessment_calls",
+		"recover_interrupted_triage_attempts",
+		"enforce_triage_startup_horizon",
 		"start_correlator",
 		"start_input_worker",
 		"start_dispatch_worker",
+		"start_controller_worker",
+		"start_triage_worker",
 		"start_receivers",
 	}
 	assertTrace(t, tr.snapshot(), want)
@@ -144,7 +165,37 @@ func TestFoundationSequenceCorrelatorStartErrorPreventsReceiversStarting(t *test
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("run err = %v, want %v", err, wantErr)
 	}
-	want := []string{"recover_leases", "drain_deliveries", "drain_inputs", "reconstruct_incidents", "start_correlator"}
+	want := []string{
+		"recover_leases", "drain_deliveries", "drain_inputs", "reconstruct_incidents",
+		"triage_migration_backfill", "recover_interrupted_assessment_calls",
+		"recover_interrupted_triage_attempts", "enforce_triage_startup_horizon",
+		"start_correlator",
+	}
+	assertTrace(t, tr.snapshot(), want)
+}
+
+// TestFoundationSequenceControllerRecoveryErrorPreventsReceiversStarting
+// proves Task 9's own recovery/backfill phase (Triage migration backfill,
+// interrupted Assessment-call/Triage-attempt recovery, startup-horizon
+// enforcement) is just as gating as reconstruction itself: an error there
+// must prevent the Correlator, every worker, and Receivers from ever
+// starting — the whole reason it runs between reconstruction and
+// Correlator start, never concurrently with anything that could claim
+// controller/Triage work.
+func TestFoundationSequenceControllerRecoveryErrorPreventsReceiversStarting(t *testing.T) {
+	tr := &tracer{}
+	seq := tracedFoundationSequence(tr)
+	wantErr := errors.New("controller recovery failed")
+	seq.backfillAndRecoverControllerWork = func(context.Context) error {
+		tr.add("triage_migration_backfill")
+		return wantErr
+	}
+
+	err := seq.run(context.Background())
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("run err = %v, want %v", err, wantErr)
+	}
+	want := []string{"recover_leases", "drain_deliveries", "drain_inputs", "reconstruct_incidents", "triage_migration_backfill"}
 	assertTrace(t, tr.snapshot(), want)
 }
 
@@ -152,10 +203,138 @@ func TestFoundationSequenceCorrelatorStartErrorPreventsReceiversStarting(t *test
 // foundationStopSequence: shutdown ordering
 // ----------------------------------------------------------------------
 
-// TestFoundationStopSequenceOrdersEveryPhase pins the exact shutdown order
-// this plan requires: Receivers, then the dispatch worker, then the input
-// worker, then the Correlator — so no newly accepted work appears after
-// the queue workers themselves stop.
+// TestFoundationStopSequenceOrdersAllPhases pins the full Task 9 shutdown
+// order plan.md requires: Receivers; stop/flush the Correlator; drain the
+// foundation dispatch/input work; drain controller/Triage work; stop the
+// controller/Triage workers; stop the foundation dispatch/input workers.
+// The Correlator stops BEFORE the drains so its fixed-window ticker cannot
+// commit fresh durable work after the drain has already run.
+func TestFoundationStopSequenceOrdersAllPhases(t *testing.T) {
+	tr := &tracer{}
+	seq := foundationStopSequence{
+		stopReceivers: func() error {
+			tr.add("stop_receivers")
+			return nil
+		},
+		stopCorrelator: func() {
+			tr.add("stop_correlator")
+		},
+		drainFoundationWork: func(context.Context) (int, error) {
+			tr.add("drain_foundation_work")
+			return 0, nil
+		},
+		drainControllerWork: func(context.Context) (int, error) {
+			tr.add("drain_controller_work")
+			return 0, nil
+		},
+		stopControllerWorkers: func(context.Context) error {
+			tr.add("stop_triage_worker")
+			tr.add("stop_controller_worker")
+			return nil
+		},
+		stopWorkers: func(context.Context) error {
+			tr.add("stop_dispatch_worker")
+			tr.add("stop_input_worker")
+			return nil
+		},
+	}
+
+	if err := seq.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	want := []string{
+		"stop_receivers", "stop_correlator",
+		"drain_foundation_work", "drain_controller_work",
+		"stop_triage_worker", "stop_controller_worker",
+		"stop_dispatch_worker", "stop_input_worker",
+	}
+	assertTrace(t, tr.snapshot(), want)
+}
+
+// TestFoundationStopSequenceDrainsResultingInputsToQuiescence proves the
+// drain is a loop: a controller/Triage drain that handles work (and so may
+// have appended fresh Situation inputs) is followed by another foundation
+// drain, and rounds continue until one handles nothing in both halves.
+func TestFoundationStopSequenceDrainsResultingInputsToQuiescence(t *testing.T) {
+	tr := &tracer{}
+	controllerRounds := 0
+	seq := foundationStopSequence{
+		stopReceivers:  func() error { return nil },
+		stopCorrelator: func() {},
+		drainFoundationWork: func(context.Context) (int, error) {
+			tr.add("drain_foundation_work")
+			// The second foundation pass applies the inputs the first
+			// controller pass produced; the third finds nothing.
+			if controllerRounds == 1 {
+				return 1, nil
+			}
+			return 0, nil
+		},
+		drainControllerWork: func(context.Context) (int, error) {
+			tr.add("drain_controller_work")
+			controllerRounds++
+			if controllerRounds == 1 {
+				return 2, nil
+			}
+			return 0, nil
+		},
+		stopControllerWorkers: func(context.Context) error {
+			tr.add("stop_controller_workers")
+			return nil
+		},
+		stopWorkers: func(context.Context) error {
+			tr.add("stop_workers")
+			return nil
+		},
+	}
+
+	if err := seq.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	want := []string{
+		"drain_foundation_work", "drain_controller_work", // round 1: controller handled 2
+		"drain_foundation_work", "drain_controller_work", // round 2: foundation applied 1 resulting input
+		"drain_foundation_work", "drain_controller_work", // round 3: nothing left
+		"stop_controller_workers", "stop_workers",
+	}
+	assertTrace(t, tr.snapshot(), want)
+}
+
+// TestFoundationStopSequenceDrainLoopIsBounded proves a drain that never
+// reaches quiescence still lets shutdown proceed after
+// maxShutdownDrainRounds rounds, leaving the remainder durably recoverable.
+func TestFoundationStopSequenceDrainLoopIsBounded(t *testing.T) {
+	rounds := 0
+	stopped := false
+	seq := foundationStopSequence{
+		stopReceivers:  func() error { return nil },
+		stopCorrelator: func() {},
+		drainFoundationWork: func(context.Context) (int, error) {
+			rounds++
+			return 1, nil
+		},
+		drainControllerWork: func(context.Context) (int, error) { return 1, nil },
+		stopControllerWorkers: func(context.Context) error {
+			stopped = true
+			return nil
+		},
+		stopWorkers: func(context.Context) error { return nil },
+	}
+	if err := seq.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if rounds != maxShutdownDrainRounds {
+		t.Fatalf("drain rounds = %d, want exactly maxShutdownDrainRounds (%d)", rounds, maxShutdownDrainRounds)
+	}
+	if !stopped {
+		t.Fatal("workers were never stopped after the bounded drain")
+	}
+}
+
+// TestFoundationStopSequenceOrdersEveryPhase pins the shutdown order with
+// no controller runtime composed in: Receivers, then the Correlator, then
+// the dispatch worker, then the input worker — the Correlator stops before
+// the queue workers so no fresh fixed-window work appears after they do.
 func TestFoundationStopSequenceOrdersEveryPhase(t *testing.T) {
 	tr := &tracer{}
 	seq := foundationStopSequence{
@@ -176,7 +355,7 @@ func TestFoundationStopSequenceOrdersEveryPhase(t *testing.T) {
 	if err := seq.run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	want := []string{"stop_receivers", "stop_dispatch_worker", "stop_input_worker", "stop_correlator"}
+	want := []string{"stop_receivers", "stop_correlator", "stop_dispatch_worker", "stop_input_worker"}
 	assertTrace(t, tr.snapshot(), want)
 }
 
@@ -207,7 +386,7 @@ func TestFoundationStopSequenceRunsEveryPhaseDespiteEarlierFailures(t *testing.T
 	if !errors.Is(err, receiversErr) || !errors.Is(err, dispatchErr) {
 		t.Fatalf("run err = %v, want it to join both receiversErr and dispatchErr", err)
 	}
-	want := []string{"stop_receivers", "stop_dispatch_worker", "stop_input_worker", "stop_correlator"}
+	want := []string{"stop_receivers", "stop_correlator", "stop_dispatch_worker", "stop_input_worker"}
 	assertTrace(t, tr.snapshot(), want)
 }
 
@@ -224,6 +403,21 @@ func newTestFoundationStore(t *testing.T) *store.Store {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	return st
+}
+
+// TestFoundationRuntimeDrainOnEmptyStoreIsANoOp proves foundationRuntime.
+// Drain (Task 9) runs cleanly against a real, empty store — nothing due, so
+// both workers' Drain calls return immediately with zero handled.
+func TestFoundationRuntimeDrainOnEmptyStoreIsANoOp(t *testing.T) {
+	st := newTestFoundationStore(t)
+	cor := correlator.New(correlator.Config{}, st, nil, nil)
+	rt := newFoundationRuntime(st, cor, "test-owner", slog.Default())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := rt.Drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
 }
 
 func TestNewFoundationRuntimePanicsOnEmptyOwner(t *testing.T) {

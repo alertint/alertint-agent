@@ -147,7 +147,7 @@ func (c *Client) Complete(
 		})
 	}
 
-	raw, usage, err := c.callWithRetry(ctx, systemPrompt, prompt)
+	raw, usage, err := c.callWithRetry(ctx, systemPrompt, prompt, MaxRetries)
 	latency := c.now().Sub(start)
 
 	if c.auditor != nil {
@@ -174,6 +174,72 @@ func (c *Client) Complete(
 		Latency:                  latency,
 		CacheCreationInputTokens: usage.cacheCreation,
 		CacheReadInputTokens:     usage.cacheRead,
+	}
+	if err != nil {
+		return comp, err
+	}
+	if err := llm.ValidateKeys(raw, requiredKeys); err != nil {
+		return comp, err
+	}
+	return comp, nil
+}
+
+// CompleteOnce is Complete's one-shot counterpart, for callers that must
+// bypass the provider client's hidden HTTP retry loop without changing
+// Complete's own shipped retry behavior (Plan 2's Situation controller:
+// each L2 dispatch permits at most one physical HTTP request, per its own
+// durable dispatch-slot accounting — see internal/situation/controller.go).
+// It shares doRequest/callWithRetry with Complete, calling callWithRetry
+// with maxRetries=0 so the shared backoff loop runs the request exactly
+// once and returns immediately on any error. It additionally classifies the
+// outcome into RequestStartStatus (llm.ClassifyRequestStart) so the caller
+// can record provider_request_started on its own immutable attempt outcome
+// row without needing to inspect the returned error itself.
+func (c *Client) CompleteOnce(
+	ctx context.Context,
+	systemPrompt string, prompt llm.Prompt,
+	requiredKeys []string,
+) (llm.OneShotCompletion, error) {
+	start := c.now()
+
+	reqHash := llm.PromptHash(systemPrompt, prompt.Text())
+	if c.auditor != nil {
+		_ = c.auditor.Append(ctx, "llm.anthropic", "llm.request", map[string]any{
+			"model":       c.cfg.Model,
+			"prompt_hash": reqHash,
+		})
+	}
+
+	raw, usage, err := c.callWithRetry(ctx, systemPrompt, prompt, 0)
+	latency := c.now().Sub(start)
+
+	if c.auditor != nil {
+		payload := map[string]any{
+			"model":                       c.cfg.Model,
+			"prompt_hash":                 reqHash,
+			"latency_ms":                  latency.Milliseconds(),
+			"input_tokens":                usage.input,
+			"output_tokens":               usage.output,
+			"cache_creation_input_tokens": usage.cacheCreation,
+			"cache_read_input_tokens":     usage.cacheRead,
+		}
+		if err != nil {
+			payload["error"] = err.Error()
+		}
+		_ = c.auditor.Append(ctx, "llm.anthropic", "llm.response", payload)
+	}
+
+	comp := llm.OneShotCompletion{
+		Completion: llm.Completion{
+			Raw:                      raw,
+			Model:                    c.cfg.Model,
+			InputTokens:              usage.input,
+			OutputTokens:             usage.output,
+			Latency:                  latency,
+			CacheCreationInputTokens: usage.cacheCreation,
+			CacheReadInputTokens:     usage.cacheRead,
+		},
+		RequestStarted: llm.ClassifyRequestStart(err),
 	}
 	if err != nil {
 		return comp, err
@@ -276,9 +342,13 @@ type apiError struct {
 
 // callWithRetry executes the HTTP request through the shared llm.CallWithRetry
 // backoff loop, retrying on 429/529 (wrapped by doRequest as
-// llm.RetryableError) up to MaxRetries times.
-func (c *Client) callWithRetry(ctx context.Context, system string, prompt llm.Prompt) (json.RawMessage, tokenUsage, error) {
-	return llm.CallWithRetry(ctx, c.logger, MaxRetries, c.cfg.BaseRetryDelay,
+// llm.RetryableError) up to maxRetries times. Complete calls this with
+// MaxRetries (Acute Triage's shipped retry behavior, unchanged); CompleteOnce
+// calls it with 0 so the shared loop runs doRequest exactly once and returns
+// immediately on any error — this alone already guarantees "at most one
+// physical HTTP request" for a one-shot caller.
+func (c *Client) callWithRetry(ctx context.Context, system string, prompt llm.Prompt, maxRetries int) (json.RawMessage, tokenUsage, error) {
+	return llm.CallWithRetry(ctx, c.logger, maxRetries, c.cfg.BaseRetryDelay,
 		func(ctx context.Context) (json.RawMessage, tokenUsage, error) {
 			return c.doRequest(ctx, system, prompt)
 		})
@@ -296,12 +366,12 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt
 	}
 	encoded, err := json.Marshal(body)
 	if err != nil {
-		return nil, tokenUsage{}, fmt.Errorf("llm: marshal request: %w", err)
+		return nil, tokenUsage{}, fmt.Errorf("%w: marshal request: %w", llm.ErrRequestNotSent, err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(encoded))
 	if err != nil {
-		return nil, tokenUsage{}, fmt.Errorf("llm: build request: %w", err)
+		return nil, tokenUsage{}, fmt.Errorf("%w: build request: %w", llm.ErrRequestNotSent, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Api-Key", c.cfg.APIKey)

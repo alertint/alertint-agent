@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/alertint/alertint-agent/internal/store/storetest"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -35,19 +37,24 @@ func TestOpen_AppliesEmbeddedMigrations(t *testing.T) {
 	defer func() { _ = rows.Close() }()
 
 	want := map[string]bool{
-		"alerts":                    false,
-		"audit_log":                 false,
-		"incident_alerts":           false,
-		"incidents":                 false,
-		"schema_migrations":         false,
-		"llm_health":                false,
-		"llm_health_capabilities":   false,
-		"alert_deliveries":          false,
-		"alert_delivery_dispatches": false,
-		"incident_alert_deliveries": false,
-		"situations":                false,
-		"situation_incidents":       false,
-		"situation_input_outbox":    false,
+		"alerts":                        false,
+		"audit_log":                     false,
+		"incident_alerts":               false,
+		"incidents":                     false,
+		"schema_migrations":             false,
+		"llm_health":                    false,
+		"llm_health_capabilities":       false,
+		"alert_deliveries":              false,
+		"alert_delivery_dispatches":     false,
+		"incident_alert_deliveries":     false,
+		"situations":                    false,
+		"situation_incidents":           false,
+		"situation_input_outbox":        false,
+		"situation_facts":               false,
+		"situation_assessment_calls":    false,
+		"situation_assessment_attempts": false,
+		"situation_assessment_coverage": false,
+		"incident_triage_attempts":      false,
 	}
 	for rows.Next() {
 		var name string
@@ -433,9 +440,12 @@ func TestMaxSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	// 0014_situation_foundation.sql is the newest migration today.
-	if got != 14 {
-		t.Errorf("MaxSchemaVersion = %d, want 14", got)
+	// 0016_incident_triage_controller.sql is the newest migration today.
+	// Plan 2 owns exactly 0015 and 0016 (the llm_health_capabilities
+	// widening for "assessment" lives inside 0015); Plan 3 provisionally
+	// owns 0017/0018, so this number must not move before Plan 2 lands.
+	if got != 16 {
+		t.Errorf("MaxSchemaVersion = %d, want 16", got)
 	}
 }
 
@@ -504,7 +514,7 @@ func TestMarkIncidentResolved_ClearsTriageRow(t *testing.T) {
 	incID := readyIncident(t, s, "service=resolve-clears")
 	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
 
-	if err := s.SeedIncidentTriage(ctx, incID, now); err != nil {
+	if err := storetest.SeedIncidentTriage(ctx, s.db, incID, now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.BeginIncidentTriage(ctx, incID, now); err != nil {

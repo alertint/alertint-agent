@@ -166,6 +166,10 @@ func TestGetSituationByIDExactContract(t *testing.T) {
 		"id", "previous_situation_id", "public_handle", "group_key", "lifecycle", "attention",
 		"input_version", "due_reasons", "opened_at", "effective_started_at", "first_received_at",
 		"next_assessment_at", "incidents", "assessment", "operator_contract",
+		// Task 9 additions: current Assessment derivation, material/basis
+		// hashes, bounded recent attempts, and controller retry/park state.
+		"assessment_derivation", "material_fact_hash", "assessment_basis_hash",
+		"eligible_reasons", "recent_attempts", "controller_state",
 	}
 	if len(payload) != len(wantKeys) {
 		t.Fatalf("payload has %d keys, want exactly %d: %+v", len(payload), len(wantKeys), payload)
@@ -201,13 +205,10 @@ func TestGetSituationByIDExactContract(t *testing.T) {
 	if len(dueReasons) != 2 || dueReasons[0] != "incident_created" || dueReasons[1] != "membership_changed" {
 		t.Errorf("due_reasons = %v, want [incident_created membership_changed]", dueReasons)
 	}
-	// The two explicit nulls this task's plan calls out by name.
-	if payload["assessment"] != nil {
-		t.Errorf("assessment = %v, want explicit null (no controller exists yet)", payload["assessment"])
-	}
-	if payload["operator_contract"] != nil {
-		t.Errorf("operator_contract = %v, want explicit null (no operator contract exists yet)", payload["operator_contract"])
-	}
+	// The two explicit nulls this task's plan calls out by name, plus every
+	// Task 9 addition — all still their "no controller cycle has run yet"
+	// shape for this fixture.
+	assertNoControllerStateYet(t, payload)
 
 	incidents, ok := payload["incidents"].([]any)
 	if !ok || len(incidents) != 2 {
@@ -220,6 +221,187 @@ func TestGetSituationByIDExactContract(t *testing.T) {
 	second, _ := incidents[1].(map[string]any)
 	if second["id"] != "inc-2" || second["status"] != "collecting" {
 		t.Errorf("incidents[1] = %+v, want {id:inc-2 status:collecting}", second)
+	}
+}
+
+// assertNoControllerStateYet checks every Task 9 controller-derived field on
+// an alertint_get_situation payload renders as its "no controller cycle has
+// run yet" shape: assessment/operator_contract/assessment_derivation/hashes
+// explicit null, recent_attempts an empty array, and controller_state a
+// present object with every field at its zero/null value.
+func assertNoControllerStateYet(t *testing.T, payload map[string]any) {
+	t.Helper()
+	if payload["assessment"] != nil {
+		t.Errorf("assessment = %v, want explicit null (no controller cycle has run yet)", payload["assessment"])
+	}
+	if payload["operator_contract"] != nil {
+		t.Errorf("operator_contract = %v, want explicit null (no operator contract exists yet)", payload["operator_contract"])
+	}
+	if payload["assessment_derivation"] != nil {
+		t.Errorf("assessment_derivation = %v, want explicit null", payload["assessment_derivation"])
+	}
+	if payload["material_fact_hash"] != nil || payload["assessment_basis_hash"] != nil {
+		t.Errorf("hashes = %v/%v, want explicit null", payload["material_fact_hash"], payload["assessment_basis_hash"])
+	}
+	if attempts, ok := payload["recent_attempts"].([]any); !ok || len(attempts) != 0 {
+		t.Errorf("recent_attempts = %v, want an empty array", payload["recent_attempts"])
+	}
+	if reasons, ok := payload["eligible_reasons"].([]any); !ok || len(reasons) != 0 {
+		t.Errorf("eligible_reasons = %v, want an empty array before the first reconcile", payload["eligible_reasons"])
+	}
+	controllerState, ok := payload["controller_state"].(map[string]any)
+	if !ok {
+		t.Fatalf("controller_state type = %T, want an object", payload["controller_state"])
+	}
+	wantZero := []string{"parked_at", "parked_reason", "retry_at", "last_error_class"}
+	for _, k := range wantZero {
+		if controllerState[k] != nil {
+			t.Errorf("controller_state[%q] = %v, want null", k, controllerState[k])
+		}
+	}
+	if controllerState["retry_epoch"] != float64(0) || controllerState["work_attempts"] != float64(0) {
+		t.Errorf("controller_state = %+v, want retry_epoch=0 work_attempts=0", controllerState)
+	}
+}
+
+// TestGetSituationExposesControllerAssessmentTriageAndRetryState proves
+// Task 9's own MCP extension end to end: once a Situation has a committed
+// authoritative Assessment, the get payload surfaces its full content and
+// derivation, the material/basis hashes, one bounded sanitized recent
+// attempt, the member Incident's Triage decision/phase/attempts/due
+// time/covered digests, and controller retry/park state — never a raw
+// proposal or provider body.
+func TestGetSituationExposesControllerAssessmentTriageAndRetryState(t *testing.T) {
+	st := newMCPStore(t)
+	at := time.Date(2026, 9, 1, 3, 0, 0, 0, time.UTC)
+	situationID := seedSituationForMCP(t, st, "inc-controller", "service=controller", "incident_created", at)
+	nextAt := at.Add(2 * time.Minute)
+	seedControllerAssessmentFixture(t, st, situationID, "inc-controller", at, nextAt)
+
+	s := NewServer(Config{}, st, audit.New(st.DB()))
+	res, err := s.handleGetSituation(context.Background(), reqWith(map[string]any{"id": situationID}))
+	if err != nil || res.IsError {
+		t.Fatalf("get situation errored: %v %s", err, resultText(t, res))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(resultText(t, res)), &payload); err != nil {
+		t.Fatal(err)
+	}
+
+	assertAssessmentContent(t, payload)
+	assertSanitizedRecentAttempt(t, payload)
+	assertControllerRetryState(t, payload)
+	assertIncidentTriageState(t, payload, nextAt)
+}
+
+// seedControllerAssessmentFixture seeds one committed authoritative
+// Assessment attempt, its current_* projection, controller retry/park
+// state, and one member Incident's Triage decision/covered digests —
+// directly via SQL, mirroring internal/store's own controller-view fixture
+// style (this package never constructs a real Controller/Reconcile cycle).
+func seedControllerAssessmentFixture(t *testing.T, st *store.Store, situationID, incidentID string, at, triageNextAt time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	assessmentJSON := []byte(`{
+		"schema_version": 1, "persistence": "sustained", "impact": "suspected",
+		"novelty": "familiar", "causality": "correlated", "attention": "observe",
+		"lifecycle": "active", "evidence_quality": "complete",
+		"sufficient_reason": {"code": "x", "candidate_id": "cand-1", "summary": "s", "evidence_refs": ["ref-1"]},
+		"action_contract": {"next_actor": "none", "next_update_at": "2026-09-01T04:00:00Z"},
+		"limitations": [], "cadence": "normal"
+	}`)
+	if _, err := st.DB().ExecContext(ctx, `
+		INSERT INTO situation_assessment_attempts (
+			id, situation_id, sequence, input_version, work_attempt, status, derivation,
+			provider_request_started, material_fact_hash, assessment_json, validation_errors_json, created_at, completed_at
+		) VALUES ('attempt-mcp', ?, 1, 1, 1, 'authoritative', 'deterministic_controller', 'false', 'sha256:material-mcp', ?, '[]', ?, ?)`,
+		situationID, string(assessmentJSON), at.UTC().Format(time.RFC3339Nano), at.UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `
+		UPDATE situations SET
+			current_assessment_id = 'attempt-mcp', current_material_fact_hash = 'sha256:material-mcp',
+			current_assessment_basis_hash = 'sha256:basis-mcp',
+			controller_retry_epoch = 1, controller_work_attempts = 2,
+			controller_parked_at = ?, controller_parked_reason = 'dependency_exhausted',
+			retry_at = ?, last_error_class = 'transport_failure'
+		WHERE id = ?`, at.UTC().Format(time.RFC3339Nano), at.Add(5*time.Minute).UTC().Format(time.RFC3339Nano), situationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `
+		INSERT INTO incident_triage (incident_id, phase, attempts, decision, decided_at, next_at, membership_digest, incident_input_digest, updated_at)
+		VALUES (?, 'backoff', 1, 'request', ?, ?, 'sha256:membership-mcp', 'sha256:input-mcp', ?)`,
+		incidentID, at.UTC().Format(time.RFC3339Nano), triageNextAt.UTC().Format(time.RFC3339Nano), at.UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertAssessmentContent(t *testing.T, payload map[string]any) {
+	t.Helper()
+	assessment, ok := payload["assessment"].(map[string]any)
+	if !ok {
+		t.Fatalf("assessment type = %T, want an object", payload["assessment"])
+	}
+	if assessment["persistence"] != "sustained" || assessment["impact"] != "suspected" {
+		t.Errorf("assessment content = %+v, want persistence=sustained impact=suspected", assessment)
+	}
+	if payload["assessment_derivation"] != "deterministic_controller" {
+		t.Errorf("assessment_derivation = %v, want deterministic_controller", payload["assessment_derivation"])
+	}
+	if payload["material_fact_hash"] != "sha256:material-mcp" || payload["assessment_basis_hash"] != "sha256:basis-mcp" {
+		t.Errorf("hashes = %v/%v", payload["material_fact_hash"], payload["assessment_basis_hash"])
+	}
+}
+
+func assertSanitizedRecentAttempt(t *testing.T, payload map[string]any) {
+	t.Helper()
+	attempts, ok := payload["recent_attempts"].([]any)
+	if !ok || len(attempts) != 1 {
+		t.Fatalf("recent_attempts = %v, want exactly 1", payload["recent_attempts"])
+	}
+	attempt, _ := attempts[0].(map[string]any)
+	if attempt["id"] != "attempt-mcp" || attempt["status"] != "authoritative" {
+		t.Errorf("attempt = %+v, want id=attempt-mcp status=authoritative", attempt)
+	}
+	for _, forbidden := range []string{"proposal", "validated", "proposal_json", "assessment_json"} {
+		if _, ok := attempt[forbidden]; ok {
+			t.Errorf("recent_attempts entry exposes forbidden key %q: %+v", forbidden, attempt)
+		}
+	}
+}
+
+func assertControllerRetryState(t *testing.T, payload map[string]any) {
+	t.Helper()
+	controllerState, ok := payload["controller_state"].(map[string]any)
+	if !ok {
+		t.Fatalf("controller_state type = %T", payload["controller_state"])
+	}
+	if controllerState["retry_epoch"] != float64(1) || controllerState["work_attempts"] != float64(2) {
+		t.Errorf("controller_state = %+v, want retry_epoch=1 work_attempts=2", controllerState)
+	}
+	if controllerState["parked_reason"] != "dependency_exhausted" {
+		t.Errorf("parked_reason = %v, want dependency_exhausted", controllerState["parked_reason"])
+	}
+	if controllerState["last_error_class"] != "transport_failure" {
+		t.Errorf("last_error_class = %v, want transport_failure", controllerState["last_error_class"])
+	}
+}
+
+func assertIncidentTriageState(t *testing.T, payload map[string]any, wantDueAt time.Time) {
+	t.Helper()
+	incidents, ok := payload["incidents"].([]any)
+	if !ok || len(incidents) != 1 {
+		t.Fatalf("incidents = %v, want exactly 1", payload["incidents"])
+	}
+	inc, _ := incidents[0].(map[string]any)
+	if inc["triage_phase"] != "backoff" || inc["triage_decision"] != "request" || inc["triage_attempts"] != float64(1) {
+		t.Errorf("incident triage state = %+v, want phase=backoff decision=request attempts=1", inc)
+	}
+	if inc["membership_digest"] != "sha256:membership-mcp" || inc["incident_input_digest"] != "sha256:input-mcp" {
+		t.Errorf("incident covered digests = %+v", inc)
+	}
+	if inc["triage_due_at"] != wantDueAt.Format(time.RFC3339Nano) {
+		t.Errorf("triage_due_at = %v, want %v", inc["triage_due_at"], wantDueAt.Format(time.RFC3339Nano))
 	}
 }
 

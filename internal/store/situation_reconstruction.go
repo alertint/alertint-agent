@@ -28,49 +28,34 @@ import (
 // dependency, and none of them run inside the same transaction as one —
 // they are pure database projections and lease releases.
 //
-// LeaseRecovery and UpgradeIncident are defined here, in internal/store,
-// rather than in internal/situation, and re-exported there as type
-// aliases (see internal/situation/reconstruct.go). internal/situation
-// already imports internal/store — its InputStore interface names
-// store.SituationClaim directly — so the reverse import store ->
-// situation would cycle. Defining the shared types on the store side and
-// aliasing them from situation is what lets *Store satisfy
-// situation.ReconstructStore without a cycle.
+// LeaseRecovery, DeadLetterCounts, and UpgradeIncident are
+// situationmodel.LeaseRecovery/DeadLetterCounts/UpgradeIncident, relocated
+// to internal/situation/model to break internal/situation's former import
+// of internal/store: internal/situation already imported internal/store —
+// its InputStore interface named store.SituationClaim directly, and its
+// ReconstructStore interface named these three types directly — so the
+// reverse import store -> situation (needed for Task 8's controller-facing
+// store methods) would have cycled. Defining the shared types in the leaf
+// internal/situation/model package, which both internal/store and
+// internal/situation already import one-directionally, and aliasing them
+// here is what lets *Store satisfy situation.ReconstructStore without a
+// cycle. See internal/situation/model/foundation.go for the canonical
+// definitions and internal/situation/reconstruct.go for situation's own
+// (now store-independent) aliases of the same types.
 // ----------------------------------------------------------------------
 
 // LeaseRecovery reports how many rows RecoverExpiredFoundationLeases moved
 // from an expired claim back to unclaimed, per fenced table.
-type LeaseRecovery struct {
-	AlertDispatches int64
-	SituationInputs int64
-	Situations      int64
-}
+type LeaseRecovery = situationmodel.LeaseRecovery
 
 // DeadLetterCounts reports how many rows in each fenced dispatch/input
-// outbox table have permanently exhausted retries (status='failed') —
-// dead-lettered work this plan promises is "never silently dropped"
-// (docs/concepts/architecture.md): the row is durably on disk, but is
-// excluded from every future claim and otherwise invisible without
-// hand-written SQL. CountDeadLetteredFoundationWork surfaces it once per
-// Reconstructor.Run pass so a stuck delivery or Situation input has a
-// startup-visible tripwire.
-type DeadLetterCounts struct {
-	AlertDispatches int
-	SituationInputs int
-}
+// outbox table have permanently exhausted retries (status='failed').
+type DeadLetterCounts = situationmodel.DeadLetterCounts
 
 // UpgradeIncident is one operational Incident with no Situation membership
 // yet, carrying the persisted Incident/delivery-derived times
-// ReconstructSituation needs to represent it — never a live read of
-// anything outward.
-type UpgradeIncident struct {
-	IncidentID              string
-	GroupKey                string
-	EffectiveStartedAt      time.Time
-	EffectiveStartedAtBasis situationmodel.SourceTimeBasis
-	FirstReceivedAt         time.Time
-	LastLifecycleObservedAt time.Time
-}
+// ReconstructSituation needs to represent it.
+type UpgradeIncident = situationmodel.UpgradeIncident
 
 // RecoverExpiredFoundationLeases releases every expired lease across the
 // three fenced foundation tables — claimed alert dispatches, claimed

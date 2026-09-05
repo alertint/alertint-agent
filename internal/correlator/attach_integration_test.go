@@ -75,23 +75,9 @@ func (a *fakeAuditor) rowsOfKind(kind string) []auditRow {
 	return out
 }
 
-type fakeRejudger struct {
-	mu       sync.Mutex
-	triggers []string
-}
-
-func (r *fakeRejudger) Rejudge(_ context.Context, _ store.Incident, trigger string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.triggers = append(r.triggers, trigger)
-	return nil
-}
-func (r *fakeRejudger) count() int { r.mu.Lock(); defer r.mu.Unlock(); return len(r.triggers) }
-
 type testDoubles struct {
 	notif *fakeOccNotifier
 	aud   *fakeAuditor
-	rej   *fakeRejudger
 }
 
 // --- helpers ---
@@ -106,15 +92,14 @@ func openStore(t *testing.T) *store.Store {
 	return st
 }
 
-// newCorrelatorFor builds a non-started correlator wired with the three test
+// newCorrelatorFor builds a non-started correlator wired with the two test
 // doubles, grouping on the "service" label.
 func newCorrelatorFor(t *testing.T, st *store.Store) (*Correlator, *testDoubles) {
 	t.Helper()
 	c := New(Config{GroupLabels: []string{"service"}}, st, NopIncidentSink{}, nil)
-	td := &testDoubles{notif: &fakeOccNotifier{}, aud: &fakeAuditor{}, rej: &fakeRejudger{}}
+	td := &testDoubles{notif: &fakeOccNotifier{}, aud: &fakeAuditor{}}
 	c.SetOccurrenceNotifier(td.notif)
 	c.SetAuditor(td.aud)
-	c.SetRejudger(td.rej)
 	return c, td
 }
 
@@ -206,8 +191,21 @@ func TestMaybeAttach_PlainAttach(t *testing.T) {
 	if td.notif.count() != 1 || td.notif.calls[0].Stats.Count != 1 {
 		t.Errorf("notifier calls = %d (%v), want 1 (count=1)", td.notif.count(), td.notif.calls)
 	}
-	if td.rej.count() != 0 {
-		t.Errorf("rejudger called %d times, want 0 (plain attach, no LLM)", td.rej.count())
+	assertLatestTrigger(t, st, "inc_1", "none")
+}
+
+// assertLatestTrigger checks the trigger_kind stamped on incidentID's most
+// recent occurrence row — the only durable effect an escalation trigger has
+// now that the Correlator runs no re-judgment (Acute Triage dispatch is not
+// this package's to own).
+func assertLatestTrigger(t *testing.T, st *store.Store, incidentID, want string) {
+	t.Helper()
+	latest, err := st.LatestOccurrence(context.Background(), incidentID)
+	if err != nil {
+		t.Fatalf("latest occurrence: %v", err)
+	}
+	if latest.TriggerKind != want {
+		t.Errorf("occurrence trigger_kind = %q, want %q", latest.TriggerKind, want)
 	}
 }
 
@@ -330,11 +328,11 @@ func TestMaybeAttach_RepeatTouchesOccurrenceLastSeen(t *testing.T) {
 	}
 }
 
-// runRejudgeCase seeds a standard analyzed incident (member: warning/DiskFull,
+// runEscalationCase seeds a standard analyzed incident (member: warning/DiskFull,
 // active 5m ago, judged at lastJudged) and feeds one incoming firing alert,
 // returning the store and doubles. It factors the shared shape of the
 // escalation-trigger tests.
-func runRejudgeCase(t *testing.T, incoming store.Alert, lastJudged time.Time) (*store.Store, *testDoubles) {
+func runEscalationCase(t *testing.T, incoming store.Alert, lastJudged time.Time) (*store.Store, *testDoubles) {
 	t.Helper()
 	st := openStore(t)
 	c, td := newCorrelatorFor(t, st)
@@ -351,33 +349,23 @@ func runRejudgeCase(t *testing.T, incoming store.Alert, lastJudged time.Time) (*
 	return st, td
 }
 
-func TestMaybeAttach_SeverityRejudge(t *testing.T) {
+func TestMaybeAttach_SeverityEscalation(t *testing.T) {
 	now := time.Date(2026, 7, 8, 15, 30, 0, 0, time.UTC)
-	_, td := runRejudgeCase(t, firingAlert("fp-new", "DiskFull", "critical", now, false), now.Add(-10*time.Minute))
-	if td.rej.count() != 1 || td.rej.triggers[0] != "severity" {
-		t.Errorf("rejudger triggers = %v, want [severity]", td.rej.triggers)
-	}
+	st, _ := runEscalationCase(t, firingAlert("fp-new", "DiskFull", "critical", now, false), now.Add(-10*time.Minute))
+	assertLatestTrigger(t, st, "inc_1", "severity")
 }
 
-func TestMaybeAttach_NewAlertnameRejudge(t *testing.T) {
+func TestMaybeAttach_NewAlertnameEscalation(t *testing.T) {
 	now := time.Date(2026, 7, 8, 15, 30, 0, 0, time.UTC)
-	_, td := runRejudgeCase(t, firingAlert("fp-new", "OOMKilled", "warning", now, false), now.Add(-10*time.Minute))
-	if td.rej.count() != 1 || td.rej.triggers[0] != "new_alertname" {
-		t.Errorf("rejudger triggers = %v, want [new_alertname]", td.rej.triggers)
-	}
+	st, _ := runEscalationCase(t, firingAlert("fp-new", "OOMKilled", "warning", now, false), now.Add(-10*time.Minute))
+	assertLatestTrigger(t, st, "inc_1", "new_alertname")
 }
 
-func TestMaybeAttach_CeilingRejudge(t *testing.T) {
+func TestMaybeAttach_CeilingEscalation(t *testing.T) {
 	now := time.Date(2026, 7, 8, 15, 30, 0, 0, time.UTC)
 	// Recent activity (inside Clock A) but judged 5h ago (past the 4h ceiling).
-	st, td := runRejudgeCase(t, firingAlert("fp-new", "DiskFull", "warning", now, false), now.Add(-5*time.Hour))
-	if td.rej.count() != 1 || td.rej.triggers[0] != "ceiling" {
-		t.Errorf("rejudger triggers = %v, want [ceiling]", td.rej.triggers)
-	}
-	latest, _ := st.LatestOccurrence(context.Background(), "inc_1")
-	if latest.TriggerKind != "ceiling" {
-		t.Errorf("occurrence trigger_kind = %q, want ceiling", latest.TriggerKind)
-	}
+	st, td := runEscalationCase(t, firingAlert("fp-new", "DiskFull", "warning", now, false), now.Add(-5*time.Hour))
+	assertLatestTrigger(t, st, "inc_1", "ceiling")
 	if td.aud.rows[0].trigger != "ceiling" {
 		t.Errorf("audit trigger = %q, want ceiling", td.aud.rows[0].trigger)
 	}
@@ -444,9 +432,6 @@ func TestMaybeAttach_CollapseArithmetic(t *testing.T) {
 	if td.notif.count() != n {
 		t.Errorf("notifier calls = %d, want %d", td.notif.count(), n)
 	}
-	if td.rej.count() != 0 {
-		t.Errorf("rejudger calls = %d, want 0 (steady cadence, no trigger)", td.rej.count())
-	}
 	var incidents int
 	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM incidents WHERE group_key = ?`, gkAPI).Scan(&incidents); err != nil {
 		t.Fatalf("count incidents: %v", err)
@@ -456,11 +441,11 @@ func TestMaybeAttach_CollapseArithmetic(t *testing.T) {
 	}
 }
 
-// TestMaybeAttach_CadenceRejudge covers AE3: a slow (nightly) key suddenly
+// TestMaybeAttach_CadenceEscalation covers AE3: a slow (nightly) key suddenly
 // firing fast trips the cadence trigger.
-func TestMaybeAttach_CadenceRejudge(t *testing.T) {
+func TestMaybeAttach_CadenceEscalation(t *testing.T) {
 	st := openStore(t)
-	c, td := newCorrelatorFor(t, st)
+	c, _ := newCorrelatorFor(t, st)
 	ctx := context.Background()
 	now := time.Date(2026, 7, 8, 2, 20, 0, 0, time.UTC)
 	// Four prior nightly incidents (episode times ~24h apart) for the key, the
@@ -478,9 +463,7 @@ func TestMaybeAttach_CadenceRejudge(t *testing.T) {
 	if _, err := c.maybeAttachOccurrence(ctx, incoming, gkAPI); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
-	if td.rej.count() != 1 || td.rej.triggers[0] != "cadence" {
-		t.Errorf("rejudger triggers = %v, want [cadence]", td.rej.triggers)
-	}
+	assertLatestTrigger(t, st, "inc_n4", "cadence")
 }
 
 func TestFlushExpired_PrunesOnSchedule(t *testing.T) {
@@ -513,7 +496,7 @@ func TestFlushExpired_PrunesOnSchedule(t *testing.T) {
 
 func TestMaybeAttach_EventCarriesSeverityDelta(t *testing.T) {
 	now := time.Date(2026, 7, 8, 15, 30, 0, 0, time.UTC)
-	_, td := runRejudgeCase(t, firingAlert("fp-new", "DiskFull", "critical", now, false), now.Add(-10*time.Minute))
+	_, td := runEscalationCase(t, firingAlert("fp-new", "DiskFull", "critical", now, false), now.Add(-10*time.Minute))
 	if td.notif.count() != 1 {
 		t.Fatalf("notifier calls = %d, want 1", td.notif.count())
 	}
@@ -529,7 +512,7 @@ func TestMaybeAttach_EventCarriesSeverityDelta(t *testing.T) {
 
 func TestMaybeAttach_EventCarriesNewAlertname(t *testing.T) {
 	now := time.Date(2026, 7, 8, 15, 30, 0, 0, time.UTC)
-	_, td := runRejudgeCase(t, firingAlert("fp-new", "OOMKilled", "warning", now, false), now.Add(-10*time.Minute))
+	_, td := runEscalationCase(t, firingAlert("fp-new", "OOMKilled", "warning", now, false), now.Add(-10*time.Minute))
 	ev := td.notif.calls[0]
 	if ev.Trigger != "new_alertname" || ev.NewAlertname != "OOMKilled" {
 		t.Errorf("new_alertname event = {trigger:%q name:%q}, want {new_alertname OOMKilled}", ev.Trigger, ev.NewAlertname)
@@ -552,16 +535,14 @@ func TestGroupKey_ZabbixReceiverIdentity(t *testing.T) {
 	}
 }
 
-// TestMaybeAttach_ZabbixDisasterSeverityRejudge proves the ladder extension
+// TestMaybeAttach_ZabbixDisasterSeverityEscalation proves the ladder extension
 // (ADR-0033) reaches the correlator's real severity-label path: a Zabbix
 // "disaster" alert attaching to a "warning"-baseline incident must trip the
-// severity re-judge trigger, not silently rank 0.
-func TestMaybeAttach_ZabbixDisasterSeverityRejudge(t *testing.T) {
+// severity escalation trigger, not silently rank 0.
+func TestMaybeAttach_ZabbixDisasterSeverityEscalation(t *testing.T) {
 	now := time.Date(2026, 7, 8, 15, 30, 0, 0, time.UTC)
-	_, td := runRejudgeCase(t, firingAlert("fp-new", "DiskFull", "disaster", now, false), now.Add(-10*time.Minute))
-	if td.rej.count() != 1 || td.rej.triggers[0] != "severity" {
-		t.Errorf("rejudger triggers = %v, want [severity]", td.rej.triggers)
-	}
+	st, _ := runEscalationCase(t, firingAlert("fp-new", "DiskFull", "disaster", now, false), now.Add(-10*time.Minute))
+	assertLatestTrigger(t, st, "inc_1", "severity")
 }
 
 func TestMaybeAttach_EventCarriesCadenceDelta(t *testing.T) {

@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: FSL-1.1-ALv2
 
-package situation
+// package situation_test (external test package), not package situation:
+// this file drives *store.Store end to end, and internal/store now imports
+// internal/situation (Task 3, situation_controller.go) for the controller's
+// transport-neutral types — an internal (same-package) test file here that
+// also imported internal/store would create the exact "import cycle not
+// allowed in test" Go forbids for a package's own test files. See the Task
+// 3 report for the full rationale. fixedClock is a local duplicate of
+// input_worker_test.go's package-private helper of the same name, needed
+// because this file can no longer see that unexported symbol from outside
+// package situation.
+package situation_test
 
 import (
 	"context"
@@ -11,9 +21,18 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/correlator"
 	"github.com/alertint/alertint-agent/internal/notify"
+	"github.com/alertint/alertint-agent/internal/situation"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
 )
+
+// fixedClock is a deterministic clock for tests that must not depend on
+// wall-clock timing — a local duplicate of input_worker_test.go's
+// package-private helper of the same name (see the package doc comment
+// above for why this file cannot import that one directly).
+func fixedClock() time.Time {
+	return time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+}
 
 // ----------------------------------------------------------------------
 // Fixtures
@@ -115,10 +134,10 @@ func insertRawIncidentForReconstruction(t *testing.T, st *store.Store, id, group
 // Situation input, one expired Situation claim, and one incident per
 // operational status plus one settled resolved incident, none of them
 // owned by a Situation yet. It returns the store plus a DispatchWorker and
-// InputWorker wired to it (and to a Correlator whose sink/resolution
+// situation.InputWorker wired to it (and to a Correlator whose sink/resolution
 // notifier is the returned callCounter canary), ready for
 // Reconstructor.WithReplay.
-func reconstructionFixture(t *testing.T) (*store.Store, *correlator.DispatchWorker, *InputWorker, *callCounter) {
+func reconstructionFixture(t *testing.T) (*store.Store, *correlator.DispatchWorker, *situation.InputWorker, *callCounter) {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -197,7 +216,7 @@ func reconstructionFixture(t *testing.T) (*store.Store, *correlator.DispatchWork
 	cor := correlator.New(correlator.Config{WindowSeconds: 60}, st, notifier, nil)
 	cor.SetResolutionNotifier(notifier)
 	dispatch := correlator.NewDispatchWorker(st, cor, correlator.WorkerConfig{Owner: "recon:dispatch"}, nil)
-	inputs := NewInputWorker(st, WorkerConfig{Owner: "recon:input"}, nil)
+	inputs := situation.NewInputWorker(st, situation.WorkerConfig{Owner: "recon:input"}, nil)
 
 	return st, dispatch, inputs, notifier
 }
@@ -220,7 +239,7 @@ func reconstructionFixture(t *testing.T) (*store.Store, *correlator.DispatchWork
 // returns the Correlator itself, unlike reconstructionFixture, so a test can
 // control exactly when — relative to calling Reconstructor.Run — those two
 // notifiers get wired.
-func reconstructionFixtureWithNotifiableDeliveries(t *testing.T) (*store.Store, *correlator.Correlator, *correlator.DispatchWorker, *InputWorker, *callCounter) {
+func reconstructionFixtureWithNotifiableDeliveries(t *testing.T) (*store.Store, *correlator.Correlator, *correlator.DispatchWorker, *situation.InputWorker, *callCounter) {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -264,7 +283,7 @@ func reconstructionFixtureWithNotifiableDeliveries(t *testing.T) (*store.Store, 
 	notifier := &callCounter{}
 	cor := correlator.New(correlator.Config{WindowSeconds: 60}, st, notifier, nil)
 	dispatch := correlator.NewDispatchWorker(st, cor, correlator.WorkerConfig{Owner: "recon-notify:dispatch"}, nil)
-	inputs := NewInputWorker(st, WorkerConfig{Owner: "recon-notify:input"}, nil)
+	inputs := situation.NewInputWorker(st, situation.WorkerConfig{Owner: "recon-notify:input"}, nil)
 
 	return st, cor, dispatch, inputs, notifier
 }
@@ -301,7 +320,7 @@ func assertOperationalIncidentsRepresented(t *testing.T, st *store.Store) {
 
 func TestReconstructorRepresentsEveryOperationalIncidentWithoutPublishing(t *testing.T) {
 	st, dispatch, inputs, notifier := reconstructionFixture(t)
-	r := NewReconstructor(st, fixedClock).WithReplay(dispatch, inputs)
+	r := situation.NewReconstructor(st, fixedClock).WithReplay(dispatch, inputs)
 	report, err := r.Run(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -339,7 +358,7 @@ func TestReconstructorReportsDeadLetteredWork(t *testing.T) {
 		t.Fatalf("dead-letter dispatch: %v", err)
 	}
 
-	r := NewReconstructor(st, fixedClock)
+	r := situation.NewReconstructor(st, fixedClock)
 	report, err := r.Run(ctx)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -354,7 +373,7 @@ func TestReconstructorReportsDeadLetteredWork(t *testing.T) {
 
 func TestReconstructorSecondRunCreatesOrAttachesNothingNew(t *testing.T) {
 	st, dispatch, inputs, notifier := reconstructionFixture(t)
-	r := NewReconstructor(st, fixedClock).WithReplay(dispatch, inputs)
+	r := situation.NewReconstructor(st, fixedClock).WithReplay(dispatch, inputs)
 	ctx := context.Background()
 
 	if _, err := r.Run(ctx); err != nil {
@@ -407,7 +426,7 @@ func TestReconstructorSecondRunCreatesOrAttachesNothingNew(t *testing.T) {
 // before Run instead, does leak.
 func TestReconstructorNeverCallsNotifiersWiredAfterReconstruction(t *testing.T) {
 	st, cor, dispatch, inputs, notifier := reconstructionFixtureWithNotifiableDeliveries(t)
-	r := NewReconstructor(st, fixedClock).WithReplay(dispatch, inputs)
+	r := situation.NewReconstructor(st, fixedClock).WithReplay(dispatch, inputs)
 
 	if _, err := r.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -436,7 +455,7 @@ func TestNotifiersWiredBeforeReconstructionWouldLeakOutward(t *testing.T) {
 	st, cor, dispatch, inputs, notifier := reconstructionFixtureWithNotifiableDeliveries(t)
 	cor.SetResolutionNotifier(notifier)
 	cor.SetOccurrenceNotifier(notifier)
-	r := NewReconstructor(st, fixedClock).WithReplay(dispatch, inputs)
+	r := situation.NewReconstructor(st, fixedClock).WithReplay(dispatch, inputs)
 
 	if _, err := r.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -455,31 +474,31 @@ func TestNotifiersWiredBeforeReconstructionWouldLeakOutward(t *testing.T) {
 // from any real database.
 type fakeReconstructStore struct {
 	recoverErr error
-	recovered  LeaseRecovery
+	recovered  situation.LeaseRecovery
 
-	deadLettered    DeadLetterCounts
+	deadLettered    situation.DeadLetterCounts
 	deadLetteredErr error
 
-	incidents    []UpgradeIncident
+	incidents    []situation.UpgradeIncident
 	incidentsErr error
 
 	reconstructErr map[string]error // group key -> error, if any
 	reconstructed  []string         // group keys actually reconstructed, in call order
 }
 
-func (f *fakeReconstructStore) RecoverExpiredFoundationLeases(context.Context, time.Time) (LeaseRecovery, error) {
+func (f *fakeReconstructStore) RecoverExpiredFoundationLeases(context.Context, time.Time) (situation.LeaseRecovery, error) {
 	return f.recovered, f.recoverErr
 }
 
-func (f *fakeReconstructStore) CountDeadLetteredFoundationWork(context.Context) (DeadLetterCounts, error) {
+func (f *fakeReconstructStore) CountDeadLetteredFoundationWork(context.Context) (situation.DeadLetterCounts, error) {
 	return f.deadLettered, f.deadLetteredErr
 }
 
-func (f *fakeReconstructStore) UnrepresentedOperationalIncidents(context.Context) ([]UpgradeIncident, error) {
+func (f *fakeReconstructStore) UnrepresentedOperationalIncidents(context.Context) ([]situation.UpgradeIncident, error) {
 	return f.incidents, f.incidentsErr
 }
 
-func (f *fakeReconstructStore) ReconstructSituation(_ context.Context, groupKey string, _ []UpgradeIncident, _ time.Time) (string, error) {
+func (f *fakeReconstructStore) ReconstructSituation(_ context.Context, groupKey string, _ []situation.UpgradeIncident, _ time.Time) (string, error) {
 	f.reconstructed = append(f.reconstructed, groupKey)
 	if err, ok := f.reconstructErr[groupKey]; ok {
 		return "", err
@@ -502,7 +521,7 @@ func TestReconstructorRunShortCircuitsOnLeaseRecoveryFailure(t *testing.T) {
 	fs := &fakeReconstructStore{recoverErr: errors.New("boom")}
 	dispatch := &fakeReplayer{}
 	inputs := &fakeReplayer{}
-	r := NewReconstructor(fs, fixedClock).WithReplay(dispatch, inputs)
+	r := situation.NewReconstructor(fs, fixedClock).WithReplay(dispatch, inputs)
 
 	if _, err := r.Run(context.Background()); err == nil {
 		t.Fatal("expected an error when lease recovery fails")
@@ -516,7 +535,7 @@ func TestReconstructorRunShortCircuitsOnDrainFailure(t *testing.T) {
 	fs := &fakeReconstructStore{}
 	dispatch := &fakeReplayer{err: errors.New("dispatch drain failed")}
 	inputs := &fakeReplayer{}
-	r := NewReconstructor(fs, fixedClock).WithReplay(dispatch, inputs)
+	r := situation.NewReconstructor(fs, fixedClock).WithReplay(dispatch, inputs)
 
 	if _, err := r.Run(context.Background()); err == nil {
 		t.Fatal("expected an error when the delivery drain fails")
@@ -528,14 +547,14 @@ func TestReconstructorRunShortCircuitsOnDrainFailure(t *testing.T) {
 
 func TestReconstructorRunOneBadGroupDoesNotBlockTheRest(t *testing.T) {
 	fs := &fakeReconstructStore{
-		incidents: []UpgradeIncident{
+		incidents: []situation.UpgradeIncident{
 			{IncidentID: "inc-1", GroupKey: "group-a"},
 			{IncidentID: "inc-2", GroupKey: "group-b"},
 			{IncidentID: "inc-3", GroupKey: "group-c"},
 		},
 		reconstructErr: map[string]error{"group-b": errors.New("malformed group")},
 	}
-	r := NewReconstructor(fs, fixedClock)
+	r := situation.NewReconstructor(fs, fixedClock)
 
 	report, err := r.Run(context.Background())
 	if err == nil {
@@ -560,7 +579,7 @@ func TestReconstructorRunOrdersRecoverDrainDrainRepresent(t *testing.T) {
 	fs := &traceReconstructStore{trace: &trace}
 	dispatch := &traceReplayer{trace: &trace, label: "drain_deliveries"}
 	inputs := &traceReplayer{trace: &trace, label: "drain_inputs"}
-	r := NewReconstructor(fs, fixedClock).WithReplay(dispatch, inputs)
+	r := situation.NewReconstructor(fs, fixedClock).WithReplay(dispatch, inputs)
 
 	if _, err := r.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -585,20 +604,20 @@ type traceReconstructStore struct {
 	trace *[]string
 }
 
-func (f *traceReconstructStore) RecoverExpiredFoundationLeases(context.Context, time.Time) (LeaseRecovery, error) {
+func (f *traceReconstructStore) RecoverExpiredFoundationLeases(context.Context, time.Time) (situation.LeaseRecovery, error) {
 	*f.trace = append(*f.trace, "recover_leases")
-	return LeaseRecovery{}, nil
+	return situation.LeaseRecovery{}, nil
 }
 
-func (f *traceReconstructStore) CountDeadLetteredFoundationWork(context.Context) (DeadLetterCounts, error) {
-	return DeadLetterCounts{}, nil
+func (f *traceReconstructStore) CountDeadLetteredFoundationWork(context.Context) (situation.DeadLetterCounts, error) {
+	return situation.DeadLetterCounts{}, nil
 }
 
-func (f *traceReconstructStore) UnrepresentedOperationalIncidents(context.Context) ([]UpgradeIncident, error) {
-	return []UpgradeIncident{{IncidentID: "inc-1", GroupKey: "group-a"}}, nil
+func (f *traceReconstructStore) UnrepresentedOperationalIncidents(context.Context) ([]situation.UpgradeIncident, error) {
+	return []situation.UpgradeIncident{{IncidentID: "inc-1", GroupKey: "group-a"}}, nil
 }
 
-func (f *traceReconstructStore) ReconstructSituation(context.Context, string, []UpgradeIncident, time.Time) (string, error) {
+func (f *traceReconstructStore) ReconstructSituation(context.Context, string, []situation.UpgradeIncident, time.Time) (string, error) {
 	*f.trace = append(*f.trace, "reconstruct_incidents")
 	return "sit-a", nil
 }

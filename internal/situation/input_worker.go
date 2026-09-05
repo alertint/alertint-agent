@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/alertint/alertint-agent/internal/store"
+	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
 // ----------------------------------------------------------------------
@@ -34,9 +34,9 @@ import (
 // *Correlator applier), claim/apply/retry for a Situation input all live on
 // *store.Store itself, so one interface covers the whole dependency.
 type InputStore interface {
-	ClaimSituationInputs(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]store.SituationClaim, error)
-	ApplySituationInput(ctx context.Context, claim store.SituationClaim) error
-	RetrySituationInput(ctx context.Context, claim store.SituationClaim, class string, retryAt time.Time, terminal bool) error
+	ClaimSituationInputs(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]model.SituationClaim, error)
+	ApplySituationInput(ctx context.Context, claim model.SituationClaim) error
+	RetrySituationInput(ctx context.Context, claim model.SituationClaim, class string, retryAt time.Time, terminal bool) error
 }
 
 // WorkerConfig controls InputWorker's claim lease, schedule, batch size,
@@ -161,7 +161,7 @@ func inputRetryBackoff(attempt int) time.Duration {
 
 // inputErrorClass maps an ApplySituationInput failure to the stable
 // lowercase identifier RetrySituationInput persists, and whether it is
-// terminal. store.ErrNotFound (the referenced Incident, or a delivery it
+// terminal. model.ErrNotFound (the referenced Incident, or a delivery it
 // claims to own, genuinely does not exist) is a permanent local dead
 // letter — no amount of retrying changes that; anything else is treated as
 // a transient dependency failure worth retrying, including
@@ -170,7 +170,7 @@ func inputRetryBackoff(attempt int) time.Duration {
 // which is not itself proof the input can never apply).
 func inputErrorClass(err error) (class string, terminal bool) {
 	switch {
-	case errors.Is(err, store.ErrNotFound):
+	case errors.Is(err, model.ErrNotFound):
 		return "invalid_input", true
 	default:
 		return "transient", false
@@ -180,7 +180,7 @@ func inputErrorClass(err error) (class string, terminal bool) {
 // RunOnce claims at most cfg.Batch due situation inputs and applies them
 // sequentially, returning how many it handled (committed, terminally
 // failed, or scheduled for retry). A claim whose ApplySituationInput call
-// fails with context cancellation or store.ErrSituationLeaseLost is neither
+// fails with context cancellation or model.ErrSituationLeaseLost is neither
 // counted nor written back — RunOnce stops the round immediately and
 // returns that error, since continuing to claim or apply more work under a
 // cancelled context or a lease that already moved on cannot succeed. Any
@@ -210,13 +210,13 @@ func (w *InputWorker) RunOnce(ctx context.Context) (int, error) {
 // cancellation or a lost lease — cases where RunOnce must not keep claiming
 // or applying further work, and must not attempt to rewrite this claim (the
 // lease already moved on, or the caller is shutting down).
-func (w *InputWorker) applyOne(ctx context.Context, claim store.SituationClaim) (stop bool, err error) {
+func (w *InputWorker) applyOne(ctx context.Context, claim model.SituationClaim) (stop bool, err error) {
 	applyErr := w.store.ApplySituationInput(ctx, claim)
 	if applyErr == nil {
 		return false, nil
 	}
 
-	if errors.Is(applyErr, context.Canceled) || errors.Is(applyErr, context.DeadlineExceeded) || errors.Is(applyErr, store.ErrSituationLeaseLost) {
+	if errors.Is(applyErr, context.Canceled) || errors.Is(applyErr, context.DeadlineExceeded) || errors.Is(applyErr, model.ErrSituationLeaseLost) {
 		w.logger.Warn("situation: input worker round stopped",
 			"input_id", claim.ID, "attempt", claim.AttemptCount, "err", applyErr)
 		return true, applyErr
