@@ -1,0 +1,289 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package situation
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/alertint/alertint-agent/internal/situation/model"
+)
+
+// ----------------------------------------------------------------------
+// Plan 3 Task 4: pure notification-intent planning. Publication authority
+// is decided here, inside the authoritative controller commit's own
+// derivation — Slack delivery never makes a second publication decision,
+// and nothing in this file renders Slack.
+// ----------------------------------------------------------------------
+
+// PublicationInput is one committed reconciliation plus the delivery-side
+// context the publication decision needs.
+type PublicationInput struct {
+	Situation model.Situation
+	// Transitions is this commit's, in sequence order; empty on a
+	// non-material cycle.
+	Transitions []model.Transition
+	// Summary is the Episode summary current after the fold. On a
+	// non-material cycle it is the unchanged current summary.
+	Summary model.EpisodeSummary
+	// PriorTransition is the Situation's current Transition before this
+	// commit — the authority a non-material R4 deadline refresh references,
+	// since such a cycle creates no Transition of its own.
+	PriorTransition *model.Transition
+	// ContractDeadlineAt is the committed nonterminal next_update_at (R4):
+	// the promise the root renders. Nil for a terminal commit.
+	ContractDeadlineAt          *time.Time
+	RootPublished               bool
+	LatestRootSyncVersion       *int
+	LastDeliveredRootDeadlineAt *time.Time
+	LastMainChannelPokeAt       *time.Time
+	SlackFloor                  model.InterruptionPriority
+	RepageCooldown              time.Duration
+	Drill                       bool
+	Now                         time.Time
+}
+
+// PlanNotificationIntents derives every durable Slack obligation one
+// committed reconciliation creates:
+//
+//   - one coalescible `root_sync` carrying the current Episode-summary
+//     version and the committed contract deadline it renders (R4);
+//   - one immutable `thread_append` per journaled Transition, in sequence
+//     order, each rendering only its own Transition's stored journal data;
+//   - at most one `broadcast_handoff` — the single new main-channel poke a
+//     commit may create, when the permitted poke class allows it, the
+//     repage cooldown has elapsed for the one class it gates, and the root
+//     is already published (an unpublished root's first post IS the poke);
+//   - on a non-material cycle, only the R4 deadline refresh, and only when
+//     the root is published, its last delivered promise has passed, and
+//     this commit carries a different deadline.
+//
+// A poke below the operator's Slack floor becomes a durable
+// `withheld_by_operator_slack_floor` decision, never an absent row, and the
+// floor never suppresses a non-broadcast journal entry.
+func PlanNotificationIntents(in PublicationInput) ([]model.NotificationIntent, error) {
+	if err := validatePublicationInput(in); err != nil {
+		return nil, err
+	}
+	if len(in.Transitions) == 0 {
+		return planDeadlineRefresh(in)
+	}
+
+	out := make([]model.NotificationIntent, 0, len(in.Transitions)+2)
+	authority := in.Transitions[len(in.Transitions)-1]
+
+	// The root: a first publication is itself the main-channel poke; every
+	// later synchronization is a silent edit.
+	rootPoke := !in.RootPublished
+	root := newIntent(in, model.EffectRootSync, authority, rootSyncKey(in.Situation.ID, in.Summary.Version, authority.ID, in.ContractDeadlineAt))
+	root.SummaryVersion = intPtrOf(in.Summary.Version)
+	if !authority.Lifecycle.Terminal() {
+		root.ContractDeadlineAt = in.ContractDeadlineAt
+	}
+	if rootPoke {
+		priority := DeriveInterruptionPriority(authority)
+		root.MainChannelPoke = true
+		root.InterruptionPriority = &priority
+		if !MeetsSlackFloor(priority, in.SlackFloor) {
+			root.Status = model.IntentWithheld
+		}
+	}
+	out = append(out, root)
+
+	// Immutable journal entries, one per journaled Transition, in sequence
+	// order. These are never pokes and never carry a summary version.
+	for _, tr := range in.Transitions {
+		if tr.JournalKind == model.JournalNone {
+			continue
+		}
+		out = append(out, newIntent(in, model.EffectThreadAppend, tr, threadKey(model.EffectThreadAppend, in.Situation.ID, tr.Sequence)))
+	}
+
+	// At most one new main-channel poke per commit, and none at all when
+	// the root post above already is one.
+	if !rootPoke {
+		if poke, ok := selectPoke(in); ok {
+			priority := DeriveInterruptionPriority(poke)
+			broadcast := newIntent(in, model.EffectBroadcastHandoff, poke,
+				threadKey(model.EffectBroadcastHandoff, in.Situation.ID, poke.Sequence))
+			broadcast.MainChannelPoke = true
+			broadcast.InterruptionPriority = &priority
+			if !MeetsSlackFloor(priority, in.SlackFloor) {
+				broadcast.Status = model.IntentWithheld
+			}
+			out = append(out, broadcast)
+		}
+	}
+
+	for i := range out {
+		if err := out[i].Validate(); err != nil {
+			return nil, fmt.Errorf("situation: planned notification intent %d: %w", i, err)
+		}
+	}
+	return out, nil
+}
+
+func validatePublicationInput(in PublicationInput) error {
+	if in.Situation.ID == "" {
+		return errors.New("situation: publication input: situation id is required")
+	}
+	if in.Now.IsZero() || in.Now.Location() != time.UTC {
+		return fmt.Errorf("situation: publication input: now must be a non-zero UTC instant, got %s", in.Now)
+	}
+	if in.SlackFloor != "" {
+		if err := in.SlackFloor.Validate(); err != nil {
+			return fmt.Errorf("situation: publication input: %w", err)
+		}
+	}
+	if in.RepageCooldown < 0 {
+		return fmt.Errorf("situation: publication input: repage cooldown must be >= 0, got %s", in.RepageCooldown)
+	}
+	if in.Summary.SituationID != "" && in.Summary.SituationID != in.Situation.ID {
+		return fmt.Errorf("situation: publication input: summary belongs to situation %q, not %q",
+			in.Summary.SituationID, in.Situation.ID)
+	}
+	if in.LatestRootSyncVersion != nil && in.Summary.Version != 0 && in.Summary.Version < *in.LatestRootSyncVersion {
+		return fmt.Errorf("situation: publication input: summary version %d is older than the latest root sync version %d",
+			in.Summary.Version, *in.LatestRootSyncVersion)
+	}
+	if len(in.Transitions) == 0 {
+		return nil
+	}
+	if in.Summary.SituationID == "" || in.Summary.Version < 1 {
+		return errors.New("situation: publication input: a commit with transitions requires the folded episode summary")
+	}
+	for i, tr := range in.Transitions {
+		if tr.SituationID != in.Situation.ID {
+			return fmt.Errorf("situation: publication input: transition %d belongs to situation %q, not %q",
+				i, tr.SituationID, in.Situation.ID)
+		}
+		if i > 0 && tr.Sequence <= in.Transitions[i-1].Sequence {
+			return fmt.Errorf("situation: publication input: transition %d sequence %d does not follow %d",
+				i, tr.Sequence, in.Transitions[i-1].Sequence)
+		}
+	}
+	if last := in.Transitions[len(in.Transitions)-1]; in.Summary.SourceTransitionSequence != last.Sequence {
+		return fmt.Errorf("situation: publication input: summary source sequence %d is not this commit's last transition %d",
+			in.Summary.SourceTransitionSequence, last.Sequence)
+	}
+	return nil
+}
+
+// planDeadlineRefresh implements R4's single permitted non-material effect:
+// a coalescible silent root edit that replaces an expired promised-update
+// time. It is never a poke and never a thread entry.
+func planDeadlineRefresh(in PublicationInput) ([]model.NotificationIntent, error) {
+	switch {
+	case !in.RootPublished:
+		// Nothing is on screen to leave sitting on an expired promise.
+		return nil, nil
+	case in.ContractDeadlineAt == nil:
+		return nil, nil
+	case in.LastDeliveredRootDeadlineAt == nil:
+		return nil, nil
+	case in.LastDeliveredRootDeadlineAt.After(in.Now):
+		// The delivered promise has not passed yet.
+		return nil, nil
+	case in.ContractDeadlineAt.Equal(*in.LastDeliveredRootDeadlineAt):
+		return nil, nil
+	}
+	if in.PriorTransition == nil {
+		return nil, errors.New("situation: publication input: a published root requires its authority transition to refresh the promised update")
+	}
+	if in.Summary.Version < 1 {
+		return nil, errors.New("situation: publication input: a deadline refresh requires the current episode summary")
+	}
+
+	refresh := newIntent(in, model.EffectRootSync, *in.PriorTransition,
+		rootSyncKey(in.Situation.ID, in.Summary.Version, in.PriorTransition.ID, in.ContractDeadlineAt))
+	refresh.SummaryVersion = intPtrOf(in.Summary.Version)
+	refresh.ContractDeadlineAt = in.ContractDeadlineAt
+	if err := refresh.Validate(); err != nil {
+		return nil, fmt.Errorf("situation: planned deadline refresh: %w", err)
+	}
+	return []model.NotificationIntent{refresh}, nil
+}
+
+// selectPoke returns the one Transition in this commit that may create a
+// new main-channel poke, applying spec's closed list of permitted poke
+// classes and the configured repage cooldown for the one class it gates.
+// When several qualify, the highest-priority (then latest) wins: a commit
+// interrupts the channel at most once.
+func selectPoke(in PublicationInput) (model.Transition, bool) {
+	prev := in.PriorTransition
+	var best model.Transition
+	found := false
+	for i := range in.Transitions {
+		tr := in.Transitions[i]
+		class := ClassifyPoke(prev, tr)
+		prev = &in.Transitions[i]
+		if class == PokeNone {
+			continue
+		}
+		if class.CooldownApplies() && !cooldownElapsed(in) {
+			continue
+		}
+		if !found || !DeriveInterruptionPriority(tr).Less(DeriveInterruptionPriority(best)) {
+			best = tr
+			found = true
+		}
+	}
+	return best, found
+}
+
+func cooldownElapsed(in PublicationInput) bool {
+	if in.LastMainChannelPokeAt == nil {
+		return true
+	}
+	return !in.Now.Before(in.LastMainChannelPokeAt.Add(in.RepageCooldown))
+}
+
+// newIntent fills the fields every Situation-scoped intent shares:
+// deterministic identity, the effect's own subject references, the
+// class-determined root dependency, and a pending status.
+func newIntent(in PublicationInput, class model.EffectClass, subject model.Transition, key string) model.NotificationIntent {
+	return model.NotificationIntent{
+		ID:                 intentIdentity("intent:" + key),
+		IdempotencyKey:     key,
+		EffectClass:        class,
+		SituationID:        stringPtrOf(in.Situation.ID),
+		TransitionID:       stringPtrOf(subject.ID),
+		TransitionSequence: intPtrOf(subject.Sequence),
+		RequiresRoot:       class == model.EffectThreadAppend || class == model.EffectBroadcastHandoff,
+		ClientMessageID:    intentIdentity("client_message:" + key),
+		Status:             model.IntentPending,
+		CreatedAt:          in.Now,
+	}
+}
+
+// intentIdentity derives a stable UUIDv5 from the fixed AlertINT namespace
+// and the intent's idempotency key, so a timeout, an uncertain success, a
+// crash, and a restart all reuse the identical client message ID and
+// payload identity.
+func intentIdentity(scopedKey string) string {
+	return uuid.NewSHA1(historyNamespace, []byte(scopedKey)).String()
+}
+
+// rootSyncKey folds the summary version and the rendered contract deadline
+// into the root projection's identity (R4), so a deadline refresh is a
+// distinct coalescible projection rather than a duplicate of the root it
+// replaces.
+func rootSyncKey(situationID string, summaryVersion int, transitionID string, deadline *time.Time) string {
+	stamp := "none"
+	if deadline != nil {
+		stamp = deadline.UTC().Format(time.RFC3339)
+	}
+	return boundedText(fmt.Sprintf("root_sync:%s:v%d:%s:%s", situationID, summaryVersion, transitionID, stamp), maxHistoryIdentifier)
+}
+
+// threadKey identifies one immutable historical effect by its Transition's
+// sequence, matching migration 0018's
+// (situation_id, transition_sequence, effect_class) uniqueness.
+func threadKey(class model.EffectClass, situationID string, sequence int) string {
+	return boundedText(fmt.Sprintf("%s:%s:%d", class, situationID, sequence), maxHistoryIdentifier)
+}
+
+func intPtrOf(i int) *int { return &i }

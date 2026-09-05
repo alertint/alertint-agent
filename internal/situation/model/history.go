@@ -327,10 +327,16 @@ func (p ProjectionFacts) Validate() error {
 			return fmt.Errorf("projection_facts: %w", err)
 		}
 	}
-	switch {
-	case p.TerminalAt != nil && p.TerminalReason == nil:
-		return errors.New("projection_facts: terminal_at requires terminal_reason")
-	case p.TerminalAt == nil && p.TerminalReason != nil:
+	// A terminal instant may stand alone. Migration 0014's own lifecycle
+	// CHECK records a RECOVERED Situation as terminal_at NOT NULL with
+	// terminal_reason NULL — TerminalReason is documented as "the structured
+	// reason recorded when a Situation closes as closed_unknown", and its
+	// closed vocabulary (observation_deadline, resolution_missing,
+	// source_unavailable, budget_exhausted) has no value that could honestly
+	// describe a recovery. Requiring the pair here would make every
+	// `recovered` Transition unrepresentable. A reason without an instant is
+	// still incoherent.
+	if p.TerminalAt == nil && p.TerminalReason != nil {
 		return errors.New("projection_facts: terminal_reason requires terminal_at")
 	}
 	if p.TerminalReason != nil {
@@ -649,6 +655,73 @@ type NotificationIntent struct {
 	DeliveredAt          *time.Time
 }
 
+// validateBoundedRefs checks every nullable identifier/coordinate-shaped
+// field: set means non-empty and within the identifier bound.
+func (n NotificationIntent) validateBoundedRefs() error {
+	for _, ptrField := range []struct {
+		name string
+		v    *string
+	}{
+		{"situation_id", n.SituationID}, {"transition_id", n.TransitionID},
+		{"gap_generation", n.GapGeneration}, {"claim_owner", n.ClaimOwner},
+		{"last_error_class", n.LastErrorClass}, {"supersession_reason", n.SupersessionReason},
+		{"replacement_intent_id", n.ReplacementIntentID}, {"delivered_as", n.DeliveredAs},
+		{"channel", n.Channel}, {"message_ts", n.MessageTS},
+	} {
+		if ptrField.v == nil {
+			continue
+		}
+		if strings.TrimSpace(*ptrField.v) == "" {
+			return fmt.Errorf("notification_intent: %s must not be empty when set", ptrField.name)
+		}
+		if len(*ptrField.v) > maxIdentifierLength {
+			return fmt.Errorf("notification_intent: %s exceeds %d bytes", ptrField.name, maxIdentifierLength)
+		}
+	}
+	return nil
+}
+
+// validateEffectClassRefs checks the reference shape each effect class
+// requires: installation_gap_recovery is installation-level (no Situation,
+// Transition, or summary reference, but a gap generation), while the three
+// Situation effects each reference the Situation and the Transition that
+// created their content, and only root_sync additionally references the
+// Episode-summary version it renders.
+func (n NotificationIntent) validateEffectClassRefs() error {
+	switch n.EffectClass {
+	case EffectInstallationGapRecovery:
+		if n.SituationID != nil {
+			return errors.New("notification_intent: installation_gap_recovery must not set situation_id")
+		}
+		if n.TransitionID != nil {
+			return errors.New("notification_intent: installation_gap_recovery must not set transition_id")
+		}
+		if n.TransitionSequence != nil {
+			return errors.New("notification_intent: installation_gap_recovery must not set transition_sequence")
+		}
+		if n.SummaryVersion != nil {
+			return errors.New("notification_intent: installation_gap_recovery must not set summary_version")
+		}
+		if n.GapGeneration == nil {
+			return errors.New("notification_intent: installation_gap_recovery requires gap_generation")
+		}
+	case EffectRootSync, EffectThreadAppend, EffectBroadcastHandoff:
+		if n.SituationID == nil {
+			return fmt.Errorf("notification_intent: %s requires situation_id", n.EffectClass)
+		}
+		if n.TransitionID == nil {
+			return fmt.Errorf("notification_intent: %s requires transition_id", n.EffectClass)
+		}
+		if n.GapGeneration != nil {
+			return fmt.Errorf("notification_intent: gap_generation is accepted only on %s, not %s", EffectInstallationGapRecovery, n.EffectClass)
+		}
+		if n.EffectClass == EffectRootSync && n.SummaryVersion == nil {
+			return errors.New("notification_intent: root_sync requires summary_version")
+		}
+	}
+	return nil
+}
+
 // Validate checks NotificationIntent's required, bounded identity fields;
 // its closed effect-class/status/priority codes; the effect-class-specific
 // reference rules (installation_gap_recovery forbids Situation/Transition
@@ -690,57 +763,11 @@ func (n NotificationIntent) Validate() error {
 	if n.AttemptCount < 0 {
 		return errors.New("notification_intent: attempt_count must be >= 0")
 	}
-	for _, ptrField := range []struct {
-		name string
-		v    *string
-	}{
-		{"situation_id", n.SituationID}, {"transition_id", n.TransitionID},
-		{"gap_generation", n.GapGeneration}, {"claim_owner", n.ClaimOwner},
-		{"last_error_class", n.LastErrorClass}, {"supersession_reason", n.SupersessionReason},
-		{"replacement_intent_id", n.ReplacementIntentID}, {"delivered_as", n.DeliveredAs},
-		{"channel", n.Channel}, {"message_ts", n.MessageTS},
-	} {
-		if ptrField.v == nil {
-			continue
-		}
-		if strings.TrimSpace(*ptrField.v) == "" {
-			return fmt.Errorf("notification_intent: %s must not be empty when set", ptrField.name)
-		}
-		if len(*ptrField.v) > maxIdentifierLength {
-			return fmt.Errorf("notification_intent: %s exceeds %d bytes", ptrField.name, maxIdentifierLength)
-		}
+	if err := n.validateBoundedRefs(); err != nil {
+		return err
 	}
-
-	switch n.EffectClass {
-	case EffectInstallationGapRecovery:
-		if n.SituationID != nil {
-			return errors.New("notification_intent: installation_gap_recovery must not set situation_id")
-		}
-		if n.TransitionID != nil {
-			return errors.New("notification_intent: installation_gap_recovery must not set transition_id")
-		}
-		if n.TransitionSequence != nil {
-			return errors.New("notification_intent: installation_gap_recovery must not set transition_sequence")
-		}
-		if n.SummaryVersion != nil {
-			return errors.New("notification_intent: installation_gap_recovery must not set summary_version")
-		}
-		if n.GapGeneration == nil {
-			return errors.New("notification_intent: installation_gap_recovery requires gap_generation")
-		}
-	case EffectRootSync, EffectThreadAppend, EffectBroadcastHandoff:
-		if n.SituationID == nil {
-			return fmt.Errorf("notification_intent: %s requires situation_id", n.EffectClass)
-		}
-		if n.TransitionID == nil {
-			return fmt.Errorf("notification_intent: %s requires transition_id", n.EffectClass)
-		}
-		if n.GapGeneration != nil {
-			return fmt.Errorf("notification_intent: gap_generation is accepted only on %s, not %s", EffectInstallationGapRecovery, n.EffectClass)
-		}
-		if n.EffectClass == EffectRootSync && n.SummaryVersion == nil {
-			return errors.New("notification_intent: root_sync requires summary_version")
-		}
+	if err := n.validateEffectClassRefs(); err != nil {
+		return err
 	}
 
 	if n.ContractDeadlineAt != nil {

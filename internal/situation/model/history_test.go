@@ -295,11 +295,16 @@ func TestProjectionFactsValidate(t *testing.T) {
 		}
 	})
 
-	t.Run("terminal_at without terminal_reason rejected", func(t *testing.T) {
+	// A recovered Situation is terminal with no terminal reason: migration
+	// 0014's lifecycle CHECK is
+	// (lifecycle='recovered' AND ... terminal_at IS NOT NULL AND
+	// terminal_reason IS NULL), and TerminalReason's closed vocabulary only
+	// describes a closed_unknown closure.
+	t.Run("terminal_at without terminal_reason accepted (recovered)", func(t *testing.T) {
 		p := fullProjectionFacts(now)
 		p.TerminalAt = ptr(now)
-		if err := p.Validate(); err == nil {
-			t.Fatal("want error, got nil")
+		if err := p.Validate(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
 		}
 	})
 
