@@ -58,6 +58,9 @@ func TestOpen_AppliesEmbeddedMigrations(t *testing.T) {
 		"situation_transitions":         false,
 		"situation_episode_summaries":   false,
 		"situation_transition_stream":   false,
+		"notification_intents":          false,
+		"slack_delivery_state":          false,
+		"slack_delivery_gaps":           false,
 	}
 	for rows.Next() {
 		var name string
@@ -443,12 +446,12 @@ func TestMaxSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	// 0017_situation_history.sql is the newest migration today. Plan 2 owns
-	// 0015/0016; Plan 3 owns exactly 0017/0018 (spec.md "Persistence and
-	// migration ownership") and this task lands 0017, so the number moves
-	// from 16 to 17 — 0018 (notification_intents et al.) is a later task.
-	if got != 17 {
-		t.Errorf("MaxSchemaVersion = %d, want 17", got)
+	// 0018_situation_notifications.sql is the newest migration today. Plan 2
+	// owns 0015/0016; Plan 3 owns exactly 0017/0018 (spec.md "Persistence
+	// and migration ownership") and both now land, so the number moves from
+	// 17 to 18 — this is Plan 3's final schema migration.
+	if got != 18 {
+		t.Errorf("MaxSchemaVersion = %d, want 18", got)
 	}
 }
 
