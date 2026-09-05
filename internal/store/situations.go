@@ -62,9 +62,25 @@ func dueReasonForInputKind(kind string) (situationmodel.DueReason, error) {
 		return situationmodel.DueTriageChanged, nil
 	case "incident_resolved":
 		return situationmodel.DueAlertResolved, nil
+	case "operator_annotation_recorded", "captured_verdict_recorded":
+		// R5 (decided): an attributed annotation or a Captured verdict marks
+		// the Situation due because a durable operator artifact awaits
+		// journaling — never DueOperatorJudgment, which stays reserved for
+		// Plan 5's steering catalog.
+		return situationmodel.DueOperatorArtifactRecorded, nil
 	default:
 		return "", fmt.Errorf("store: unsupported situation input kind %q", kind)
 	}
+}
+
+// isOperatorArtifactKind reports whether kind is one of the two durable
+// operator artifact input kinds (R5): an attributed annotation or a
+// Captured verdict. These are the only situation_input_outbox kinds whose
+// application follows R1's journaling-cursor discipline and R2's
+// owner-terminal handling; every other kind keeps Plan 2's ordinary
+// join/create behaviour unconditionally.
+func isOperatorArtifactKind(kind string) bool {
+	return kind == "operator_annotation_recorded" || kind == "captured_verdict_recorded"
 }
 
 // ----------------------------------------------------------------------
@@ -263,6 +279,17 @@ func readSituationInputTx(ctx context.Context, tx *sql.Tx, id string) (situation
 // the mapped due reason once, mark applied to the owning Situation. It is
 // fenced by the SituationClaim's (lease_owner, claim_token) pair and is
 // idempotent: an input already marked applied is a successful no-op.
+//
+// R2: for the two operator artifact kinds only, when the Incident's already
+// existing owner (situationOwnerForIncidentTx) is terminal
+// (recovered/closed_unknown), this does not join — no input_version bump, no
+// due reason merged, no lease clear — and instead marks the row applied with
+// journal_state='owner_terminal' against that owner. Every other case
+// (an active/recovery_pending owner, a fresh group join, or a brand-new
+// Situation) follows Plan 2's ordinary join/create path and additionally
+// stamps the exact applied_input_version this input landed at, plus
+// journal_state='pending' for an artifact kind or 'not_applicable' for
+// every other kind (R1).
 func (s *Store) ApplySituationInput(ctx context.Context, claim SituationClaim) error {
 	if strings.TrimSpace(claim.ID) == "" || strings.TrimSpace(claim.LeaseOwner) == "" || claim.ClaimToken <= 0 {
 		return errors.New("store: apply situation input requires a complete claim")
@@ -322,14 +349,31 @@ func (s *Store) ApplySituationInput(ctx context.Context, claim SituationClaim) e
 	}
 
 	now := time.Now().UTC()
-	situationID, err := resolveAndApplySituationTx(ctx, tx, row, startAt, basis, receivedAt, dueReason, now)
+	outcome, err := resolveAndApplySituationTx(ctx, tx, row, startAt, basis, receivedAt, dueReason, now)
 	if err != nil {
 		return err
 	}
-	if err := attachSituationMembershipTx(ctx, tx, situationID, row.incidentID, now); err != nil {
+
+	if outcome.ownerTerminal {
+		// R2: the owner resolved at application time is already terminal.
+		// Record the artifact against it without joining — the terminal
+		// Episode stays immutable, and no membership attach is needed since
+		// situationOwnerForIncidentTx already found this exact Incident
+		// attached to this exact Situation.
+		if err := markSituationInputAppliedTx(ctx, tx, row.id, claim.LeaseOwner, claim.ClaimToken, outcome.situationID, outcome.inputVersion, "owner_terminal", now); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+
+	if err := attachSituationMembershipTx(ctx, tx, outcome.situationID, row.incidentID, now); err != nil {
 		return err
 	}
-	if err := markSituationInputAppliedTx(ctx, tx, row.id, claim.LeaseOwner, claim.ClaimToken, situationID, now); err != nil {
+	journalState := "not_applicable"
+	if isOperatorArtifactKind(row.kind) {
+		journalState = "pending"
+	}
+	if err := markSituationInputAppliedTx(ctx, tx, row.id, claim.LeaseOwner, claim.ClaimToken, outcome.situationID, outcome.inputVersion, journalState, now); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -378,37 +422,90 @@ func sourceTimesForInputTx(ctx context.Context, tx *sql.Tx, deliveryID *string, 
 	return receivedAt, situationmodel.SourceTimeBasisReceiptFallback, receivedAt, nil
 }
 
+// situationApplyOutcome is resolveAndApplySituationTx's result: which
+// Situation the input landed on, the input_version this input's application
+// stamped (the resulting post-join/post-create version, or — for R2's
+// owner-terminal outcome — the terminal owner's own unchanged current
+// version), and whether R2's owner-terminal short-circuit fired.
+type situationApplyOutcome struct {
+	situationID   string
+	inputVersion  int
+	ownerTerminal bool // R2: kind is an artifact kind and the resolved owner is already terminal
+}
+
 // resolveAndApplySituationTx implements the owner-selection precedence: an
 // Incident that already owns a Situation always continues feeding it
 // (regardless of that Situation's own lifecycle — correlation already
 // refuses to attach NEW deliveries to an Incident whose owner is terminal,
 // see terminalSituationOwnerTx, so the only inputs that reach a terminal
-// owner here are ones already queued when the owner terminalized — a race
-// the future controller must settle explicitly); otherwise the exact
-// group's nonterminal Situation joins; otherwise a new active "observe"
-// Situation is created, linked via previous_situation_id to the newest
-// terminal same-group Situation, if any. It returns the id of the Situation
-// the input was applied to.
-func resolveAndApplySituationTx(ctx context.Context, tx *sql.Tx, row situationInputRow, startAt time.Time, basis situationmodel.SourceTimeBasis, receivedAt time.Time, dueReason situationmodel.DueReason, now time.Time) (string, error) {
-	situationID, err := situationOwnerForIncidentTx(ctx, tx, row.incidentID)
+// owner here are ones already queued when the owner terminalized); otherwise
+// the exact group's nonterminal Situation joins; otherwise a new active
+// "observe" Situation is created, linked via previous_situation_id to the
+// newest terminal same-group Situation, if any.
+//
+// R2 settles that terminal-owner race for the two operator artifact kinds
+// only: when the Incident's already-existing owner is terminal, this
+// short-circuits before ever calling joinSituationTx, returning
+// ownerTerminal=true with the owner's own unchanged input_version. Every
+// other kind keeps Plan 2's behaviour unconditionally — the future
+// controller settling that race for non-artifact kinds is still open, as
+// documented above.
+func resolveAndApplySituationTx(ctx context.Context, tx *sql.Tx, row situationInputRow, startAt time.Time, basis situationmodel.SourceTimeBasis, receivedAt time.Time, dueReason situationmodel.DueReason, now time.Time) (situationApplyOutcome, error) {
+	owner, err := situationOwnerForIncidentTx(ctx, tx, row.incidentID)
 	if err != nil {
-		return "", err
+		return situationApplyOutcome{}, err
 	}
+
+	if owner != "" && isOperatorArtifactKind(row.kind) {
+		lifecycle, version, err := situationLifecycleAndVersionTx(ctx, tx, owner)
+		if err != nil {
+			return situationApplyOutcome{}, err
+		}
+		if lifecycle.Terminal() {
+			return situationApplyOutcome{situationID: owner, inputVersion: version, ownerTerminal: true}, nil
+		}
+	}
+
+	situationID := owner
 	if situationID == "" {
 		situationID, err = nonterminalSituationIDByGroupTx(ctx, tx, row.groupKey)
 		if err != nil {
-			return "", err
+			return situationApplyOutcome{}, err
 		}
 	}
 
 	if situationID != "" {
-		if err := joinSituationTx(ctx, tx, situationID, startAt, basis, receivedAt, dueReason, row.occurredAt, now); err != nil {
-			return "", err
+		version, err := joinSituationTx(ctx, tx, situationID, startAt, basis, receivedAt, dueReason, row.occurredAt, now)
+		if err != nil {
+			return situationApplyOutcome{}, err
 		}
-		return situationID, nil
+		return situationApplyOutcome{situationID: situationID, inputVersion: version}, nil
 	}
 
-	return createSituationTx(ctx, tx, row.groupKey, startAt, basis, receivedAt, dueReason, row.occurredAt, now)
+	newID, err := createSituationTx(ctx, tx, row.groupKey, startAt, basis, receivedAt, dueReason, row.occurredAt, now)
+	if err != nil {
+		return situationApplyOutcome{}, err
+	}
+	return situationApplyOutcome{situationID: newID, inputVersion: 1}, nil
+}
+
+// situationLifecycleAndVersionTx reads a Situation's current lifecycle and
+// input_version inside an existing transaction, without pulling the full
+// row scanSituation would — resolveAndApplySituationTx's R2 owner-terminal
+// check needs only these two fields to decide whether an artifact input has
+// reached a terminal owner, and if so, at what unchanged input_version to
+// stamp.
+func situationLifecycleAndVersionTx(ctx context.Context, tx *sql.Tx, id string) (situationmodel.Lifecycle, int, error) {
+	var lifecycle string
+	var version int
+	err := tx.QueryRowContext(ctx, `SELECT lifecycle, input_version FROM situations WHERE id = ?`, id).Scan(&lifecycle, &version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", 0, ErrNotFound
+	}
+	if err != nil {
+		return "", 0, fmt.Errorf("store: read situation lifecycle: %w", err)
+	}
+	return situationmodel.Lifecycle(lifecycle), version, nil
 }
 
 // situationOwnerForIncidentTx returns the Situation id this Incident already
@@ -505,11 +602,12 @@ func earlierTime(a, b time.Time) time.Time {
 // a controller that claimed this Situation before this input's application
 // holds a lease_owner/claim_token pair that can no longer match once
 // lease_owner goes NULL here, fencing it out of committing a decision based
-// on stale input_version data.
-func joinSituationTx(ctx context.Context, tx *sql.Tx, situationID string, startAt time.Time, basis situationmodel.SourceTimeBasis, receivedAt time.Time, dueReason situationmodel.DueReason, occurredAt, now time.Time) error {
+// on stale input_version data. Returns the resulting (post-increment)
+// input_version.
+func joinSituationTx(ctx context.Context, tx *sql.Tx, situationID string, startAt time.Time, basis situationmodel.SourceTimeBasis, receivedAt time.Time, dueReason situationmodel.DueReason, occurredAt, now time.Time) (int, error) {
 	current, err := getSituationTx(ctx, tx, situationID)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	newStart := earlierTime(current.EffectiveStartedAt, startAt)
@@ -520,7 +618,7 @@ func joinSituationTx(ctx context.Context, tx *sql.Tx, situationID string, startA
 
 	dueReasonsJSON, err := json.Marshal(newDueReasons)
 	if err != nil {
-		return fmt.Errorf("store: marshal situation due reasons: %w", err)
+		return 0, fmt.Errorf("store: marshal situation due reasons: %w", err)
 	}
 
 	res, err := tx.ExecContext(ctx, `
@@ -534,16 +632,16 @@ func joinSituationTx(ctx context.Context, tx *sql.Tx, situationID string, startA
 		canonicalTime(newStart), string(newBasis), canonicalTime(newFirstReceived), canonicalTime(newNextAssessment), string(dueReasonsJSON),
 		canonicalTime(now), situationID, current.InputVersion)
 	if err != nil {
-		return fmt.Errorf("store: update situation: %w", err)
+		return 0, fmt.Errorf("store: update situation: %w", err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("store: count updated situation: %w", err)
+		return 0, fmt.Errorf("store: count updated situation: %w", err)
 	}
 	if n != 1 {
-		return ErrSituationVersionConflict
+		return 0, ErrSituationVersionConflict
 	}
-	return nil
+	return current.InputVersion + 1, nil
 }
 
 // createSituationTx inserts a brand-new active "observe" Situation at
@@ -600,14 +698,19 @@ func attachSituationMembershipTx(ctx context.Context, tx *sql.Tx, situationID, i
 
 // markSituationInputAppliedTx fences the applied transition on the exact
 // claim this call verified at the top of ApplySituationInput's transaction,
-// so nothing else could have moved the lease in between.
-func markSituationInputAppliedTx(ctx context.Context, tx *sql.Tx, id, owner string, token int64, situationID string, at time.Time) error {
+// so nothing else could have moved the lease in between. appliedInputVersion
+// is the exact situations.input_version this input's application landed at
+// (join/create's resulting version, or R2's owner-terminal unchanged
+// version) and journalState is "not_applicable" for a non-artifact kind,
+// "pending" for an artifact kind normally joined, or "owner_terminal" for
+// R2's short-circuit.
+func markSituationInputAppliedTx(ctx context.Context, tx *sql.Tx, id, owner string, token int64, situationID string, appliedInputVersion int, journalState string, at time.Time) error {
 	res, err := tx.ExecContext(ctx, `
 		UPDATE situation_input_outbox
 		SET status = 'applied', lease_owner = NULL, lease_expires_at = NULL, retry_at = NULL,
-		    applied_situation_id = ?, applied_at = ?
+		    applied_situation_id = ?, applied_at = ?, applied_input_version = ?, journal_state = ?
 		WHERE id = ? AND status = 'claimed' AND lease_owner = ? AND claim_token = ?`,
-		situationID, canonicalTime(at), id, owner, token)
+		situationID, canonicalTime(at), appliedInputVersion, journalState, id, owner, token)
 	if err != nil {
 		return fmt.Errorf("store: mark situation input applied: %w", err)
 	}

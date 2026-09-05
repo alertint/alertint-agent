@@ -55,6 +55,9 @@ func TestOpen_AppliesEmbeddedMigrations(t *testing.T) {
 		"situation_assessment_attempts": false,
 		"situation_assessment_coverage": false,
 		"incident_triage_attempts":      false,
+		"situation_transitions":         false,
+		"situation_episode_summaries":   false,
+		"situation_transition_stream":   false,
 	}
 	for rows.Next() {
 		var name string
@@ -440,12 +443,12 @@ func TestMaxSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	// 0016_incident_triage_controller.sql is the newest migration today.
-	// Plan 2 owns exactly 0015 and 0016 (the llm_health_capabilities
-	// widening for "assessment" lives inside 0015); Plan 3 provisionally
-	// owns 0017/0018, so this number must not move before Plan 2 lands.
-	if got != 16 {
-		t.Errorf("MaxSchemaVersion = %d, want 16", got)
+	// 0017_situation_history.sql is the newest migration today. Plan 2 owns
+	// 0015/0016; Plan 3 owns exactly 0017/0018 (spec.md "Persistence and
+	// migration ownership") and this task lands 0017, so the number moves
+	// from 16 to 17 — 0018 (notification_intents et al.) is a later task.
+	if got != 17 {
+		t.Errorf("MaxSchemaVersion = %d, want 17", got)
 	}
 }
 
