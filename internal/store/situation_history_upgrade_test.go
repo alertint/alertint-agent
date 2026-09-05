@@ -15,9 +15,10 @@ import (
 
 // ----------------------------------------------------------------------
 // Step 1: migration 0017 upgrade tests — a populated Plan 2 (migration 16)
-// fixture must gain the new STRICT tables and MaxSchemaVersion 17, pass
-// PRAGMA foreign_key_check, and acquire zero fabricated Transition history
-// for its pre-existing nonterminal/terminal Situations.
+// fixture must gain the new STRICT tables, land migration 17 in
+// schema_migrations, pass PRAGMA foreign_key_check, and acquire zero
+// fabricated Transition history for its pre-existing nonterminal/terminal
+// Situations.
 // ----------------------------------------------------------------------
 
 // seedMigration16HistoryFixture builds a database file shaped like the
@@ -112,10 +113,17 @@ func seedMigration16HistoryFixture(t *testing.T, path string) (nonterminalID, te
 
 // TestSituationHistoryUpgrade_CreatesStrictTablesAndBumpsSchemaVersion is
 // the brief's literal Step 1 test: opening a migration-16 database with the
-// current Open must apply 0017, create its three new STRICT tables, bump
-// MaxSchemaVersion to 17, pass PRAGMA foreign_key_check, and leave the
-// fixture's pre-existing nonterminal/terminal Situations with zero
+// current Open must apply 0017, create its three new STRICT tables, land
+// migration 17 in schema_migrations, pass PRAGMA foreign_key_check, and
+// leave the fixture's pre-existing nonterminal/terminal Situations with zero
 // Transitions.
+//
+// This intentionally does not also assert MaxSchemaVersion()'s exact value:
+// that is a global fact about every embedded migration, owned by
+// store_test.go's dedicated TestMaxSchemaVersion, not by any one migration's
+// own upgrade test — asserting an exact global max here would go stale the
+// moment a later task (0018 onward) adds another migration, exactly as
+// happened once Task 3 landed 0018.
 func TestSituationHistoryUpgrade_CreatesStrictTablesAndBumpsSchemaVersion(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "migration16-history.db")
@@ -133,14 +141,6 @@ func TestSituationHistoryUpgrade_CreatesStrictTablesAndBumpsSchemaVersion(t *tes
 	}
 	if applied != 1 {
 		t.Fatalf("migration 17 applied count = %d, want 1", applied)
-	}
-
-	got, err := MaxSchemaVersion()
-	if err != nil {
-		t.Fatalf("MaxSchemaVersion: %v", err)
-	}
-	if got != 17 {
-		t.Fatalf("MaxSchemaVersion = %d, want 17", got)
 	}
 
 	for _, table := range []string{"situation_transitions", "situation_episode_summaries", "situation_transition_stream"} {
