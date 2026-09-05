@@ -35,6 +35,46 @@ type SnapshotInput struct {
 	// L2 work (Finding I1 — spec.md: "Policy rejection, unsupported scope,
 	// and unsupported capability are permanent for the unchanged basis").
 	ControllerParked ControllerParkedState
+
+	// ----------------------------------------------------------------
+	// Plan 3 Task 5: the minimum coherent history/delivery context one
+	// reconciliation needs to derive its own durable history, all read
+	// inside LoadReconciliationInput's single read transaction so a
+	// caller can never combine a newer Episode summary with an
+	// unavailable source Transition.
+	// ----------------------------------------------------------------
+
+	// PriorTransition is the Situation's current Transition (situations.
+	// current_transition_id) before this cycle commits, or nil when no
+	// Transition exists yet — a fresh Plan 3 Situation, or a Plan 1/2
+	// Situation that predates migration 0017.
+	PriorTransition *model.Transition
+	// CurrentSummary is the Situation's one current Episode-summary
+	// projection, or nil when no Transition has ever been folded. It is
+	// always coherent with PriorTransition: both come from the same read
+	// transaction.
+	CurrentSummary *model.EpisodeSummary
+	// RootPublished reports whether the Situation's Slack root has durable
+	// coordinates (situations.slack_channel/slack_root_ts, migration 0018).
+	// An unpublished root's first post IS the main-channel poke.
+	RootPublished bool
+	// LatestRootSyncVersion is the highest Episode-summary version any
+	// root_sync intent for this Situation already renders, or nil when
+	// none exists — the guard that keeps a commit from planning a root
+	// older than one already queued or delivered.
+	LatestRootSyncVersion *int
+	// LastDeliveredRootDeadlineAt is the promised-update instant the most
+	// recently DELIVERED root_sync actually put on screen (R4). A refresh
+	// is due only once this promise has passed and the committed contract
+	// carries a different one.
+	LastDeliveredRootDeadlineAt *time.Time
+	// LastMainChannelPokeAt is when this Situation last delivered a
+	// main-channel poke — the basis for the configured repage cooldown.
+	LastMainChannelPokeAt *time.Time
+	// PendingArtifacts is every applied-and-unjournaled durable operator
+	// artifact input for this Situation, ordered by (applied_input_version,
+	// occurred_at, id) exactly as R1 requires. Empty on an ordinary cycle.
+	PendingArtifacts []OperatorArtifactInput
 }
 
 // ControllerParkedState is SnapshotInput's own read of the Situation's

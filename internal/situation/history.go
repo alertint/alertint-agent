@@ -854,15 +854,29 @@ func ProjectEpisode(prior *model.EpisodeSummary, t model.Transition) (model.Epis
 
 // validateFold rejects every incoherent fold: a Transition from another
 // Situation, one that skips or repeats a sequence, one that moves time
-// backwards, and any fold at all onto a terminal Episode — a later firing
+// backwards, and any fold onto an already-terminal Episode — a later firing
 // creates a separately linked Situation through Plan 1/2 recurrence
 // ownership.
+//
+// The one permitted fold onto a terminal summary is the rest of the SAME
+// terminal commit. R1 journals every pending operator artifact before the
+// controller-state Transition, and every Transition of one commit carries
+// the same captured projection (R3) — so a commit that both journals an
+// artifact and closes the Situation folds an artifact Transition that
+// already reports the closure, then the terminal Transition itself. A
+// Transition reporting the identical terminal instant is by construction
+// part of the commit that closed the Episode, never a later reopening: a
+// terminal Situation is never claimed again (ClaimDueSituations selects
+// only active/recovery_pending) and a later artifact is recorded, never
+// journaled (R2).
 func validateFold(prior model.EpisodeSummary, t model.Transition) error {
+	sameTerminalCommit := prior.TerminalAt != nil && t.Projection.TerminalAt != nil &&
+		t.Projection.TerminalAt.Equal(*prior.TerminalAt)
 	switch {
 	case prior.SituationID != t.SituationID:
 		return fmt.Errorf("situation: project episode: transition belongs to situation %q, summary to %q",
 			t.SituationID, prior.SituationID)
-	case prior.TerminalAt != nil:
+	case prior.TerminalAt != nil && !sameTerminalCommit:
 		return fmt.Errorf("situation: project episode: episode is terminal at %s and never reopens", prior.TerminalAt)
 	case t.Sequence != prior.SourceTransitionSequence+1:
 		return fmt.Errorf("situation: project episode: transition sequence %d is not contiguous with summary sequence %d",

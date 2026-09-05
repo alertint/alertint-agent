@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -111,19 +113,195 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 		return situation.SnapshotInput{}, err
 	}
 
+	// Plan 3 Task 5: the durable history/delivery context this cycle needs
+	// to derive its own history, read inside this same transaction so the
+	// prior Transition, the current Episode summary, and the pending
+	// artifacts can never be combined across two different snapshots.
+	priorTransition, err := loadCurrentTransitionTx(ctx, tx, sit.ID)
+	if err != nil {
+		return situation.SnapshotInput{}, err
+	}
+	currentSummary, err := loadEpisodeSummaryTx(ctx, tx, sit.ID)
+	if err != nil {
+		return situation.SnapshotInput{}, err
+	}
+	publication, err := loadPublicationContextTx(ctx, tx, sit.ID)
+	if err != nil {
+		return situation.SnapshotInput{}, err
+	}
+	artifacts, err := loadPendingOperatorArtifactsTx(ctx, tx, sit.ID)
+	if err != nil {
+		return situation.SnapshotInput{}, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return situation.SnapshotInput{}, fmt.Errorf("store: commit load reconciliation input: %w", err)
 	}
 
 	return situation.SnapshotInput{
-		Situation:         sit,
-		Deliveries:        deliveries,
-		Incidents:         incidents,
-		PriorSituations:   prior,
-		CurrentAssessment: current,
-		Now:               now.UTC(),
-		ControllerParked:  parked,
+		Situation:                   sit,
+		Deliveries:                  deliveries,
+		Incidents:                   incidents,
+		PriorSituations:             prior,
+		CurrentAssessment:           current,
+		Now:                         now.UTC(),
+		ControllerParked:            parked,
+		PriorTransition:             priorTransition,
+		CurrentSummary:              currentSummary,
+		RootPublished:               publication.rootPublished,
+		LatestRootSyncVersion:       publication.latestRootSyncVersion,
+		LastDeliveredRootDeadlineAt: publication.lastDeliveredRootDeadlineAt,
+		LastMainChannelPokeAt:       publication.lastMainChannelPokeAt,
+		PendingArtifacts:            artifacts,
 	}, nil
+}
+
+// publicationContext is the Slack-delivery side of one coherent load: what
+// is already on screen for this Situation and what promise it currently
+// makes (R4).
+type publicationContext struct {
+	rootPublished               bool
+	latestRootSyncVersion       *int
+	lastDeliveredRootDeadlineAt *time.Time
+	lastMainChannelPokeAt       *time.Time
+}
+
+// loadPublicationContextTx reads the Situation's durable Slack root
+// coordinates (migration 0018) plus the three delivery facts publication
+// planning needs: the newest Episode-summary version any root projection
+// already renders, the promised-update instant the last DELIVERED root
+// actually put on screen, and when this Situation last poked the main
+// channel.
+func loadPublicationContextTx(ctx context.Context, tx *sql.Tx, situationID string) (publicationContext, error) {
+	var out publicationContext
+	var channel, rootTS sql.NullString
+	err := tx.QueryRowContext(ctx, `SELECT slack_channel, slack_root_ts FROM situations WHERE id = ?`, situationID).
+		Scan(&channel, &rootTS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return publicationContext{}, ErrNotFound
+	}
+	if err != nil {
+		return publicationContext{}, fmt.Errorf("store: read situation slack root: %w", err)
+	}
+	out.rootPublished = channel.Valid && rootTS.Valid
+
+	var latestVersion sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT MAX(summary_version) FROM notification_intents
+		WHERE situation_id = ? AND effect_class = 'root_sync'`, situationID).Scan(&latestVersion); err != nil {
+		return publicationContext{}, fmt.Errorf("store: read latest root sync version: %w", err)
+	}
+	if latestVersion.Valid {
+		v := int(latestVersion.Int64)
+		out.latestRootSyncVersion = &v
+	}
+
+	var deadline sql.NullString
+	err = tx.QueryRowContext(ctx, `
+		SELECT contract_deadline_at FROM notification_intents
+		WHERE situation_id = ? AND effect_class = 'root_sync' AND status = 'delivered'
+		ORDER BY delivered_at DESC, id DESC LIMIT 1`, situationID).Scan(&deadline)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return publicationContext{}, fmt.Errorf("store: read last delivered root deadline: %w", err)
+	}
+	if out.lastDeliveredRootDeadlineAt, err = timePtr(deadline); err != nil {
+		return publicationContext{}, err
+	}
+
+	var poke sql.NullString
+	if err := tx.QueryRowContext(ctx, `
+		SELECT MAX(delivered_at) FROM notification_intents
+		WHERE situation_id = ? AND main_channel_poke = 1 AND status = 'delivered'`, situationID).Scan(&poke); err != nil {
+		return publicationContext{}, fmt.Errorf("store: read last main channel poke: %w", err)
+	}
+	if out.lastMainChannelPokeAt, err = timePtr(poke); err != nil {
+		return publicationContext{}, err
+	}
+	return out, nil
+}
+
+// loadPendingOperatorArtifactsTx reads every applied-and-unjournaled
+// operator artifact input this Situation owns, in R1's exact
+// (applied_input_version, occurred_at, id) order, with the bounded content
+// its journal entry renders read from the durable artifact itself. An
+// annotation carries no attributed actor column of its own (migration
+// 0010), so only a Captured verdict's label provenance is attributed here.
+func loadPendingOperatorArtifactsTx(ctx context.Context, tx *sql.Tx, situationID string) ([]situation.OperatorArtifactInput, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT o.id, o.kind, o.annotation_id, o.verdict_id,
+		       COALESCE(o.applied_input_version, 0), o.occurred_at,
+		       a.kind, a.note, v.verdict, v.source, v.cause_category
+		FROM situation_input_outbox o
+		LEFT JOIN incident_annotations a ON a.id = o.annotation_id
+		LEFT JOIN incident_verdicts v ON v.id = o.verdict_id
+		WHERE o.applied_situation_id = ? AND o.journal_state = 'pending'
+		ORDER BY o.applied_input_version ASC, o.occurred_at ASC, o.id ASC`, situationID)
+	if err != nil {
+		return nil, fmt.Errorf("store: load pending operator artifacts: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := []situation.OperatorArtifactInput{}
+	for rows.Next() {
+		var a situation.OperatorArtifactInput
+		var annotationID, verdictID sql.NullInt64
+		var occurredAt string
+		var annotationKind, annotationNote, verdict, source, causeCategory sql.NullString
+		if err := rows.Scan(&a.InputID, &a.Kind, &annotationID, &verdictID, &a.AppliedInputVersion, &occurredAt,
+			&annotationKind, &annotationNote, &verdict, &source, &causeCategory); err != nil {
+			return nil, fmt.Errorf("store: scan pending operator artifact: %w", err)
+		}
+		if a.OccurredAt, err = time.Parse(time.RFC3339Nano, occurredAt); err != nil {
+			return nil, fmt.Errorf("store: parse operator artifact %s occurred_at: %w", a.InputID, err)
+		}
+		a.OccurredAt = a.OccurredAt.UTC()
+		switch {
+		case annotationID.Valid:
+			id := strconv.FormatInt(annotationID.Int64, 10)
+			a.AnnotationID = &id
+			a.Headline = boundedArtifactText("Operator note recorded"+parenthetical(annotationKind), maxArtifactHeadline)
+			a.Detail = boundedArtifactText(annotationNote.String, maxArtifactDetail)
+		case verdictID.Valid:
+			id := strconv.FormatInt(verdictID.Int64, 10)
+			a.VerdictID = &id
+			a.Headline = boundedArtifactText("Captured verdict recorded"+parenthetical(verdict), maxArtifactHeadline)
+			a.Detail = boundedArtifactText(causeCategory.String, maxArtifactDetail)
+			a.AttributedActor = boundedArtifactText(source.String, maxArtifactActor)
+		}
+		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate pending operator artifacts: %w", err)
+	}
+	return out, nil
+}
+
+// Bounds mirroring internal/situation's own Transition/journal bounds, so a
+// value read here can never be rejected for length by model validation.
+const (
+	maxArtifactHeadline = 200
+	maxArtifactDetail   = 2000
+	maxArtifactActor    = 200
+)
+
+func parenthetical(v sql.NullString) string {
+	if !v.Valid || strings.TrimSpace(v.String) == "" {
+		return ""
+	}
+	return " (" + v.String + ")"
+}
+
+// boundedArtifactText truncates s to at most limit bytes without splitting a
+// rune.
+func boundedArtifactText(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	cut := s[:limit]
+	for len(cut) > 0 && !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut
 }
 
 // readControllerParkedStateTx reads situationID's current controller_parked_at/
@@ -1713,30 +1891,9 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 	}
 
 	// 1. Insert the new authoritative attempt (if any) and its coverage.
-	var newAssessmentID sql.NullString
-	if commit.Attempt.ID != "" {
-		seq, err := nextAssessmentAttemptSequenceTx(ctx, tx, claim.Situation.ID)
-		if err != nil {
-			return err
-		}
-		attempt := commit.Attempt
-		attempt.Sequence = seq
-		p, err := prepareAssessmentAttempt(attempt, commit.MaterialFactHash)
-		if err != nil {
-			return err
-		}
-		if err := insertAssessmentAttemptTx(ctx, tx, p); err != nil {
-			return err
-		}
-		for _, cov := range commit.Coverage {
-			if _, err := tx.ExecContext(ctx, `
-				INSERT INTO situation_assessment_coverage (assessment_attempt_id, incident_id, membership_digest, incident_input_digest)
-				VALUES (?, ?, ?, ?) ON CONFLICT(assessment_attempt_id, incident_id) DO NOTHING`,
-				attempt.ID, cov.IncidentID, cov.MembershipDigest, cov.IncidentInputDigest); err != nil {
-				return fmt.Errorf("store: insert assessment coverage: %w", err)
-			}
-		}
-		newAssessmentID = sql.NullString{String: attempt.ID, Valid: true}
+	newAssessmentID, err := commitAuthoritativeAttemptTx(ctx, tx, claim.Situation.ID, commit)
+	if err != nil {
+		return err
 	}
 
 	// 2. Apply Triage decisions sharing this same commit.
@@ -1844,10 +2001,51 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 		return situationmodel.ErrSituationLeaseLost
 	}
 
+	// 7. Plan 3 Task 5: this reconciliation's durable history, in the SAME
+	// transaction as the authoritative state above. Every step rolls back
+	// with the rest of the commit, so a Situation's history and its
+	// authoritative state can never diverge.
+	if err := applyHistoryCommitTx(ctx, tx, claim.Situation.ID, commit.History, canonicalCommitTime(commit)); err != nil {
+		return err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: commit controller transaction: %w", err)
 	}
 	return nil
+}
+
+// commitAuthoritativeAttemptTx inserts this commit's new authoritative
+// Assessment attempt and its per-Incident coverage tuples, returning the
+// attempt id for the current_assessment_id projection (invalid when this
+// cycle produced no new attempt at all — a preserve/blocked/still-parked
+// cycle, whose current_assessment_id is COALESCEd unchanged).
+func commitAuthoritativeAttemptTx(ctx context.Context, tx *sql.Tx, situationID string, commit situation.ControllerCommit) (sql.NullString, error) {
+	if commit.Attempt.ID == "" {
+		return sql.NullString{}, nil
+	}
+	seq, err := nextAssessmentAttemptSequenceTx(ctx, tx, situationID)
+	if err != nil {
+		return sql.NullString{}, err
+	}
+	attempt := commit.Attempt
+	attempt.Sequence = seq
+	p, err := prepareAssessmentAttempt(attempt, commit.MaterialFactHash)
+	if err != nil {
+		return sql.NullString{}, err
+	}
+	if err := insertAssessmentAttemptTx(ctx, tx, p); err != nil {
+		return sql.NullString{}, err
+	}
+	for _, cov := range commit.Coverage {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO situation_assessment_coverage (assessment_attempt_id, incident_id, membership_digest, incident_input_digest)
+			VALUES (?, ?, ?, ?) ON CONFLICT(assessment_attempt_id, incident_id) DO NOTHING`,
+			attempt.ID, cov.IncidentID, cov.MembershipDigest, cov.IncidentInputDigest); err != nil {
+			return sql.NullString{}, fmt.Errorf("store: insert assessment coverage: %w", err)
+		}
+	}
+	return sql.NullString{String: attempt.ID, Valid: true}, nil
 }
 
 // canonicalCommitTime is the single "now" CommitController's own writes

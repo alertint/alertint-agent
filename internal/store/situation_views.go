@@ -342,3 +342,196 @@ func (s *Store) listIncidentTriageViews(ctx context.Context, situationID string)
 	}
 	return out, nil
 }
+
+// ----------------------------------------------------------------------
+// Plan 3 Task 5: bounded, coherent history read views. Slack delivery, MCP,
+// the stdout stream, and replay all read durable history through these —
+// never by joining the ledger ad hoc. Every page takes an explicit limit
+// and a stable (sequence, id) cursor, and the Episode view reads its
+// summary and that summary's source Transition inside ONE snapshot
+// transaction so a caller can never combine a newer summary with a source
+// Transition it cannot see.
+// ----------------------------------------------------------------------
+
+// maxSituationHistoryPage bounds one Transition/stream page. A caller may
+// ask for less; it never gets more.
+const maxSituationHistoryPage = 100
+
+// TransitionCursor is the stable position of one Transition page: resume
+// strictly after this (sequence, id). The zero value starts at the
+// beginning.
+type TransitionCursor struct {
+	Sequence int
+	ID       string
+}
+
+// SituationEpisodeView is a Situation's current Episode-summary projection
+// together with the exact Transition it was folded from — read coherently,
+// so the two can never disagree.
+type SituationEpisodeView struct {
+	Summary          situationmodel.EpisodeSummary
+	SourceTransition situationmodel.Transition
+}
+
+// GetSituationEpisodeView reads situationID's current Episode summary and
+// its source Transition in one snapshot transaction. Returns ErrNotFound
+// when the Situation has no Transition folded yet.
+func (s *Store) GetSituationEpisodeView(ctx context.Context, situationID string) (SituationEpisodeView, error) {
+	if strings.TrimSpace(situationID) == "" {
+		return SituationEpisodeView{}, errors.New("store: situation episode view requires a situation id")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return SituationEpisodeView{}, fmt.Errorf("store: begin situation episode view: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	summary, err := loadEpisodeSummaryTx(ctx, tx, situationID)
+	if err != nil {
+		return SituationEpisodeView{}, err
+	}
+	if summary == nil {
+		return SituationEpisodeView{}, ErrNotFound
+	}
+	source, err := scanTransition(tx.QueryRowContext(ctx,
+		`SELECT `+transitionColumns+` FROM situation_transitions WHERE situation_id = ? AND sequence = ?`,
+		situationID, summary.SourceTransitionSequence))
+	if errors.Is(err, sql.ErrNoRows) {
+		// Unreachable through the fenced commit (the summary's composite
+		// foreign key names this exact row), so this can only mean a
+		// hand-edited database — fail closed rather than return a summary
+		// whose authority is missing.
+		return SituationEpisodeView{}, fmt.Errorf("store: episode summary for %s names transition sequence %d, which does not exist",
+			situationID, summary.SourceTransitionSequence)
+	}
+	if err != nil {
+		return SituationEpisodeView{}, fmt.Errorf("store: read episode source transition: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return SituationEpisodeView{}, fmt.Errorf("store: commit situation episode view: %w", err)
+	}
+	return SituationEpisodeView{Summary: *summary, SourceTransition: source}, nil
+}
+
+// ListSituationTransitions reads one ordered page of situationID's
+// immutable Transition ledger, strictly after cursor, oldest first. limit
+// is clamped to maxSituationHistoryPage.
+func (s *Store) ListSituationTransitions(ctx context.Context, situationID string, cursor TransitionCursor, limit int) ([]situationmodel.Transition, error) {
+	if strings.TrimSpace(situationID) == "" {
+		return nil, errors.New("store: situation transition page requires a situation id")
+	}
+	if limit <= 0 || limit > maxSituationHistoryPage {
+		limit = maxSituationHistoryPage
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+transitionColumns+`
+		FROM situation_transitions
+		WHERE situation_id = ? AND (sequence > ? OR (sequence = ? AND id > ?))
+		ORDER BY sequence ASC, id ASC
+		LIMIT ?`, situationID, cursor.Sequence, cursor.Sequence, cursor.ID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: list situation transitions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := []situationmodel.Transition{}
+	for rows.Next() {
+		tr, err := scanTransition(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: scan situation transition: %w", err)
+		}
+		out = append(out, tr)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate situation transitions: %w", err)
+	}
+	return out, nil
+}
+
+// GetSituationTransition reads one exact Transition by ID. Returns
+// ErrNotFound when no such Transition exists.
+func (s *Store) GetSituationTransition(ctx context.Context, transitionID string) (situationmodel.Transition, error) {
+	if strings.TrimSpace(transitionID) == "" {
+		return situationmodel.Transition{}, errors.New("store: situation transition read requires a transition id")
+	}
+	tr, err := scanTransition(s.db.QueryRowContext(ctx,
+		`SELECT `+transitionColumns+` FROM situation_transitions WHERE id = ?`, transitionID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return situationmodel.Transition{}, ErrNotFound
+	}
+	if err != nil {
+		return situationmodel.Transition{}, fmt.Errorf("store: read situation transition: %w", err)
+	}
+	return tr, nil
+}
+
+// GetNotificationIntent reads one exact durable notification intent by ID.
+// Returns ErrNotFound when no such intent exists.
+func (s *Store) GetNotificationIntent(ctx context.Context, intentID string) (situationmodel.NotificationIntent, error) {
+	if strings.TrimSpace(intentID) == "" {
+		return situationmodel.NotificationIntent{}, errors.New("store: notification intent read requires an intent id")
+	}
+	intent, err := scanNotificationIntent(s.db.QueryRowContext(ctx,
+		`SELECT `+notificationIntentColumns+` FROM notification_intents WHERE id = ?`, intentID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return situationmodel.NotificationIntent{}, ErrNotFound
+	}
+	if err != nil {
+		return situationmodel.NotificationIntent{}, fmt.Errorf("store: read notification intent: %w", err)
+	}
+	return intent, nil
+}
+
+// PendingTransitionStreamEntry is one undelivered stdout-stream row plus the
+// immutable Transition it records — everything the stdout writer needs
+// without a second lookup.
+type PendingTransitionStreamEntry struct {
+	StreamID   string
+	Transition situationmodel.Transition
+}
+
+// ListPendingTransitionStream reads one ordered page of undelivered
+// stdout-stream rows across every Situation, oldest first, joined to their
+// Transitions in one snapshot transaction so an entry can never name a
+// Transition the same read cannot see. limit is clamped to
+// maxSituationHistoryPage.
+func (s *Store) ListPendingTransitionStream(ctx context.Context, limit int) ([]PendingTransitionStreamEntry, error) {
+	if limit <= 0 || limit > maxSituationHistoryPage {
+		limit = maxSituationHistoryPage
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("store: begin pending transition stream page: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT st.id, `+prefixedTransitionColumns+`
+		FROM situation_transition_stream st
+		JOIN situation_transitions t ON t.id = st.transition_id
+		WHERE st.status = 'pending'
+		ORDER BY st.created_at ASC, st.situation_id ASC, st.sequence ASC
+		LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: list pending transition stream: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := []PendingTransitionStreamEntry{}
+	for rows.Next() {
+		var entry PendingTransitionStreamEntry
+		tr, err := scanStreamEntry(rows, &entry.StreamID)
+		if err != nil {
+			return nil, err
+		}
+		entry.Transition = tr
+		out = append(out, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate pending transition stream: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("store: commit pending transition stream page: %w", err)
+	}
+	return out, nil
+}

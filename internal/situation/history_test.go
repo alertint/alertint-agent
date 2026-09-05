@@ -1450,3 +1450,57 @@ func TestBuildTransitionsMarksDrills(t *testing.T) {
 		}
 	}
 }
+
+// TestProjectEpisodeFoldsTheRestOfOneTerminalCommitButNeverReopens pins the
+// one permitted fold onto a terminal summary (Plan 3 Task 5 integration): a
+// commit that journals a pending artifact AND closes the Situation folds
+// both of its Transitions, because every Transition of one commit carries
+// the same terminal instant (R1/R3). A Transition reporting a DIFFERENT
+// terminal instant — or none — still never reopens a closed Episode.
+func TestProjectEpisodeFoldsTheRestOfOneTerminalCommitButNeverReopens(t *testing.T) {
+	c := hsNext(t)
+	hsClosedUnknown(&c)
+	c.OperatorArtifacts = []OperatorArtifactInput{hsArtifact("input-terminal", artifactKindAnnotation, c.Now)}
+
+	commit, err := BuildHistoryCommit(c, PublicationInput{Situation: c.Situation, Now: c.Now})
+	if err != nil {
+		t.Fatalf("BuildHistoryCommit: %v", err)
+	}
+	if len(commit.Transitions) != 2 {
+		t.Fatalf("transitions = %d, want the artifact then the terminal state", len(commit.Transitions))
+	}
+	if commit.Summary == nil {
+		t.Fatal("a terminal commit that journals an artifact must still fold a summary")
+	}
+	if commit.Summary.Version != c.PriorSummary.Version+2 {
+		t.Fatalf("summary version = %d, want one fold per Transition (%d)", commit.Summary.Version, c.PriorSummary.Version+2)
+	}
+	if commit.Summary.SourceTransitionSequence != commit.Transitions[1].Sequence {
+		t.Fatalf("summary source sequence = %d, want the terminal Transition's %d",
+			commit.Summary.SourceTransitionSequence, commit.Transitions[1].Sequence)
+	}
+	if len(commit.Summary.RecordedOperatorContext) != 1 {
+		t.Fatalf("recorded operator context = %v, want the journaled artifact", commit.Summary.RecordedOperatorContext)
+	}
+
+	// A later Transition reporting a different closure never reopens it.
+	later := commit.Transitions[1]
+	later.Sequence++
+	later.CreatedAt = later.CreatedAt.Add(time.Hour)
+	shifted := later.CreatedAt
+	later.Projection.TerminalAt = &shifted
+	if _, err := ProjectEpisode(commit.Summary, later); err == nil {
+		t.Fatal("a Transition from a different closure must never fold onto a terminal Episode")
+	}
+
+	// So does one that reports no closure at all.
+	reopening := commit.Transitions[1]
+	reopening.Sequence++
+	reopening.Projection.TerminalAt = nil
+	reopening.Projection.TerminalReason = nil
+	reopening.Lifecycle = model.LifecycleActive
+	reopening.ActionContract = hsRunningTriageContract(c.Now.Add(time.Minute))
+	if _, err := ProjectEpisode(commit.Summary, reopening); err == nil {
+		t.Fatal("a nonterminal Transition must never reopen a terminal Episode")
+	}
+}

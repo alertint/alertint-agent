@@ -474,3 +474,162 @@ func TestSituationControllerViewUnknownSituationReturnsErrNotFound(t *testing.T)
 		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
 }
+
+// ----------------------------------------------------------------------
+// Plan 3 Task 5: bounded history read views.
+// ----------------------------------------------------------------------
+
+// shSeedTwoCommitHistory lands two real fenced commits for one Situation and
+// returns its id plus the second commit, so the history views below read
+// genuinely committed durable records rather than hand-inserted rows.
+func shSeedTwoCommitHistory(t *testing.T, st *Store, group string, now time.Time) (string, situation.ControllerCommit) {
+	t.Helper()
+	ctx := context.Background()
+	sitID := newSituationForGroup(t, st, group, now)
+
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+	first := shDerive(t, shPrepare(t, claim, shRunningTriageContract(now.Add(time.Minute)),
+		situationmodel.LifecycleActive, situationmodel.AttentionInvestigate, now))
+	if err := st.CommitController(ctx, claim, first); err != nil {
+		t.Fatalf("first CommitController: %v", err)
+	}
+
+	later := now.Add(time.Minute)
+	shMakeDue(t, st, sitID, now.Add(-time.Minute))
+	claim2 := claimSituation(t, st, sitID, "controller-a", later)
+	cycle2 := shPrepare(t, claim2, shOperatorContract(later.Add(time.Minute)),
+		situationmodel.LifecycleActive, situationmodel.AttentionInvestigate, later)
+	cycle2.Change.PriorTransition = &first.History.Transitions[0]
+	cycle2.Change.PriorSummary = first.History.Summary
+	cycle2.Publish.PriorTransition = &first.History.Transitions[0]
+	cycle2.Publish.RootPublished = true
+	second := shDerive(t, cycle2)
+	if err := st.CommitController(ctx, claim2, second); err != nil {
+		t.Fatalf("second CommitController: %v", err)
+	}
+	return sitID, second
+}
+
+func TestSituationHistoryViewReadsCurrentEpisodeWithItsSourceTransition(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	sitID, second := shSeedTwoCommitHistory(t, st, "group-view-episode", now)
+
+	view, err := st.GetSituationEpisodeView(context.Background(), sitID)
+	if err != nil {
+		t.Fatalf("GetSituationEpisodeView: %v", err)
+	}
+	if view.Summary.Version != 2 {
+		t.Fatalf("summary version = %d, want 2", view.Summary.Version)
+	}
+	want := second.History.Transitions[0]
+	if view.SourceTransition.ID != want.ID {
+		t.Fatalf("source transition = %q, want %q", view.SourceTransition.ID, want.ID)
+	}
+	if view.Summary.SourceTransitionSequence != view.SourceTransition.Sequence {
+		t.Fatalf("summary source sequence %d does not match the returned transition sequence %d",
+			view.Summary.SourceTransitionSequence, view.SourceTransition.Sequence)
+	}
+	if view.SourceTransition.Reason != want.Reason || view.SourceTransition.JournalKind != want.JournalKind {
+		t.Fatalf("source transition round trip lost typed fields: %+v", view.SourceTransition)
+	}
+}
+
+func TestSituationHistoryViewUnknownSituationEpisodeReturnsErrNotFound(t *testing.T) {
+	st := newTestStore(t)
+	if _, err := st.GetSituationEpisodeView(context.Background(), "no-such-situation"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetSituationEpisodeView(unknown) = %v, want ErrNotFound", err)
+	}
+}
+
+func TestSituationHistoryViewPagesTransitionsByStableCursorAndLimit(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	sitID, _ := shSeedTwoCommitHistory(t, st, "group-view-page", now)
+
+	page, err := st.ListSituationTransitions(ctx, sitID, TransitionCursor{}, 1)
+	if err != nil {
+		t.Fatalf("ListSituationTransitions(first page): %v", err)
+	}
+	if len(page) != 1 || page[0].Sequence != 1 {
+		t.Fatalf("first page = %d transitions (%+v), want exactly sequence 1", len(page), page)
+	}
+	next, err := st.ListSituationTransitions(ctx, sitID, TransitionCursor{Sequence: page[0].Sequence, ID: page[0].ID}, 10)
+	if err != nil {
+		t.Fatalf("ListSituationTransitions(second page): %v", err)
+	}
+	if len(next) != 1 || next[0].Sequence != 2 {
+		t.Fatalf("second page = %+v, want exactly sequence 2", next)
+	}
+	tail, err := st.ListSituationTransitions(ctx, sitID, TransitionCursor{Sequence: next[0].Sequence, ID: next[0].ID}, 10)
+	if err != nil {
+		t.Fatalf("ListSituationTransitions(tail): %v", err)
+	}
+	if len(tail) != 0 {
+		t.Fatalf("tail page = %+v, want empty", tail)
+	}
+}
+
+func TestSituationHistoryViewReadsExactTransitionAndIntentByID(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	_, second := shSeedTwoCommitHistory(t, st, "group-view-exact", now)
+
+	want := second.History.Transitions[0]
+	got, err := st.GetSituationTransition(ctx, want.ID)
+	if err != nil {
+		t.Fatalf("GetSituationTransition: %v", err)
+	}
+	if got.ID != want.ID || got.Sequence != want.Sequence || got.Journal.Headline != want.Journal.Headline {
+		t.Fatalf("GetSituationTransition = %+v, want the committed %+v", got, want)
+	}
+	if _, err := st.GetSituationTransition(ctx, "no-such-transition"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetSituationTransition(unknown) = %v, want ErrNotFound", err)
+	}
+
+	wantIntent := shIntentOfClass(t, second.History.Intents, "root_sync")
+	gotIntent, err := st.GetNotificationIntent(ctx, wantIntent.ID)
+	if err != nil {
+		t.Fatalf("GetNotificationIntent: %v", err)
+	}
+	if gotIntent.IdempotencyKey != wantIntent.IdempotencyKey || gotIntent.EffectClass != wantIntent.EffectClass {
+		t.Fatalf("GetNotificationIntent = %+v, want the committed %+v", gotIntent, wantIntent)
+	}
+	if gotIntent.SummaryVersion == nil || *gotIntent.SummaryVersion != *wantIntent.SummaryVersion {
+		t.Fatalf("root_sync summary version round trip = %v, want %v", gotIntent.SummaryVersion, wantIntent.SummaryVersion)
+	}
+	if _, err := st.GetNotificationIntent(ctx, "no-such-intent"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetNotificationIntent(unknown) = %v, want ErrNotFound", err)
+	}
+}
+
+func TestSituationHistoryViewPendingStdoutPageJoinsItsTransition(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	sitID, _ := shSeedTwoCommitHistory(t, st, "group-view-stream", now)
+
+	page, err := st.ListPendingTransitionStream(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListPendingTransitionStream: %v", err)
+	}
+	mine := []PendingTransitionStreamEntry{}
+	for _, e := range page {
+		if e.Transition.SituationID == sitID {
+			mine = append(mine, e)
+		}
+	}
+	if len(mine) != 2 {
+		t.Fatalf("pending stream entries for %s = %d, want 2", sitID, len(mine))
+	}
+	for i, e := range mine {
+		if e.StreamID == "" {
+			t.Fatalf("entry %d carries no stream id", i)
+		}
+		if e.Transition.Sequence != i+1 {
+			t.Fatalf("entry %d transition sequence = %d, want %d", i, e.Transition.Sequence, i+1)
+		}
+	}
+}
