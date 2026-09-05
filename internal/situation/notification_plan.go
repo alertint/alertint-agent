@@ -213,13 +213,21 @@ func planDeadlineRefresh(in PublicationInput) ([]model.NotificationIntent, error
 // When several qualify, the highest-priority (then latest) wins: a commit
 // interrupts the channel at most once.
 func selectPoke(in PublicationInput) (model.Transition, bool) {
-	prev := in.PriorTransition
 	var best model.Transition
 	found := false
 	for i := range in.Transitions {
 		tr := in.Transitions[i]
-		class := ClassifyPoke(prev, tr)
-		prev = &in.Transitions[i]
+		// Every Transition is classified against the state BEFORE this
+		// commit, never against an earlier Transition of the same commit.
+		// An `operator_artifact_recorded` Transition copies this commit's
+		// new lifecycle/Attention/contract verbatim (it changes none of
+		// them), so advancing the comparison basis through one would make
+		// the controller-state Transition — always last, per R1 — compare
+		// new state against itself and silently swallow the escalation it
+		// is entitled to. This also keeps the plan's poke decision
+		// identical to the InterruptionPriority already stamped on the
+		// durable Transition by controllerTransition.
+		class := ClassifyPoke(in.PriorTransition, tr)
 		if class == PokeNone {
 			continue
 		}

@@ -1391,6 +1391,32 @@ func TestBuildTransitionsRejectsIncoherentInput(t *testing.T) {
 		}
 	})
 
+	// Migration 0014's lifecycle CHECK, both directions: closed_unknown
+	// carries a terminal reason, recovered never does. ProjectionFacts
+	// alone cannot enforce this (it has no lifecycle), and without it a
+	// closed_unknown with no reason folds into the Episode summary as a
+	// clean recovery.
+	t.Run("closed_unknown without a terminal reason", func(t *testing.T) {
+		c := hsNext(t)
+		hsClosedUnknown(&c)
+		c.Situation.TerminalReason = nil
+		c.Projection.TerminalReason = nil
+		if _, err := BuildTransitions(c); err == nil {
+			t.Fatal("want error, got nil")
+		}
+	})
+
+	t.Run("recovered with a terminal reason", func(t *testing.T) {
+		c := hsNext(t)
+		hsRecovered(&c)
+		reason := model.TerminalReasonObservationDeadline
+		c.Situation.TerminalReason = &reason
+		c.Projection.TerminalReason = &reason
+		if _, err := BuildTransitions(c); err == nil {
+			t.Fatal("want error, got nil")
+		}
+	})
+
 	t.Run("non-UTC now", func(t *testing.T) {
 		c := hsNext(t)
 		c.Now = c.Now.In(time.FixedZone("test", 3600))

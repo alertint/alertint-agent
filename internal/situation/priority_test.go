@@ -250,6 +250,46 @@ func TestInterruptionPriorityFloorComparison(t *testing.T) {
 	}
 }
 
+// TestInterruptionPriorityArtifactSiblingIsNotAComparisonBasis pins why
+// selectPoke classifies every Transition against the state BEFORE the
+// commit rather than against the preceding Transition of the same commit.
+// An `operator_artifact_recorded` Transition copies the commit's NEW
+// lifecycle/Attention/contract verbatim (it changes none of them), so using
+// it as the comparison basis makes the controller-state Transition compare
+// new state against itself — no crossing, no escalation, no poke.
+func TestInterruptionPriorityArtifactSiblingIsNotAComparisonBasis(t *testing.T) {
+	c := hsNext(t)
+	c.Situation.Attention = model.AttentionUrgent
+	c.Assessment.Attention = model.AttentionUrgent
+	c.OperatorArtifacts = []OperatorArtifactInput{hsArtifact("input-1", artifactKindAnnotation, hsNow(t))}
+	got, err := BuildTransitions(c)
+	if err != nil {
+		t.Fatalf("BuildTransitions: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d transitions, want the artifact plus the escalation", len(got))
+	}
+	artifact, escalation := got[0], got[1]
+
+	if artifact.Attention != escalation.Attention {
+		t.Fatalf("fixture no longer models the hazard: artifact attention %q vs escalation %q",
+			artifact.Attention, escalation.Attention)
+	}
+	if class := ClassifyPoke(&artifact, escalation); class != PokeNone {
+		t.Errorf("classifying against a same-commit artifact sibling = %q; the characterization this "+
+			"test guards has changed, so recheck selectPoke", class)
+	}
+	if class := ClassifyPoke(c.PriorTransition, escalation); class != PokeUrgentAttention {
+		t.Errorf("classifying against the true pre-commit prior = %q, want %q", class, PokeUrgentAttention)
+	}
+	// The durable Transition and the intent plan must agree that this is a
+	// poke: controllerTransition stamps the priority from the same
+	// classification the planner uses.
+	if escalation.InterruptionPriority == nil {
+		t.Error("the escalation transition records no interruption priority")
+	}
+}
+
 func TestInterruptionPriorityArtifactsNeverPoke(t *testing.T) {
 	c := hsNext(t)
 	c.OperatorArtifacts = []OperatorArtifactInput{hsArtifact("input-1", artifactKindAnnotation, hsNow(t))}

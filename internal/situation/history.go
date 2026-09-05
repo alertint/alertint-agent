@@ -211,6 +211,28 @@ func validateChange(change AuthoritativeChange) error {
 		return fmt.Errorf("situation: authoritative change: lifecycle %q and projection terminal_at %v disagree",
 			change.Situation.Lifecycle, change.Projection.TerminalAt)
 	}
+	// Which terminal lifecycle carries a terminal reason, mirroring
+	// migration 0014's own lifecycle CHECK in both directions.
+	// ProjectionFacts.Validate deliberately allows a bare terminal_at (a
+	// `recovered` Situation has no terminal reason), so this is the only
+	// place that catches a closed_unknown with no reason — which would
+	// otherwise fold into the Episode summary as a clean recovery, since
+	// the outcome/uncertainty text keys off the terminal reason.
+	switch change.Situation.Lifecycle {
+	case model.LifecycleClosedUnknown:
+		if change.Projection.TerminalReason == nil {
+			return errors.New("situation: authoritative change: closed_unknown requires projection terminal_reason")
+		}
+	case model.LifecycleRecovered:
+		if change.Projection.TerminalReason != nil {
+			return fmt.Errorf("situation: authoritative change: recovered must not set projection terminal_reason, got %q",
+				*change.Projection.TerminalReason)
+		}
+	case model.LifecycleActive, model.LifecycleRecoveryPending:
+		// Nonterminal: the terminal_at agreement check above already
+		// guarantees no terminal instant, and ProjectionFacts.Validate
+		// guarantees no reason without an instant.
+	}
 	if err := change.Projection.Validate(); err != nil {
 		return fmt.Errorf("situation: authoritative change: %w", err)
 	}

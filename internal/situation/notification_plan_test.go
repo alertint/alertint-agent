@@ -316,17 +316,88 @@ func TestPlanNotificationIntentsOperatorHandoffBroadcast(t *testing.T) {
 	}
 }
 
+// TestPlanNotificationIntentsAtMostOneBroadcastPerCommit pins BOTH bounds:
+// several qualifying escalations in one commit still interrupt the channel
+// only once, and a commit that qualifies at all always produces that one
+// broadcast — including when operator artifacts are journaled ahead of the
+// controller-state Transition in the same commit (R1). An artifact
+// Transition copies the commit's new state verbatim, so classifying the
+// controller-state Transition against it would compare new state with
+// itself and silently swallow the poke.
 func TestPlanNotificationIntentsAtMostOneBroadcastPerCommit(t *testing.T) {
-	c := hsNext(t)
-	c.Situation.Attention = model.AttentionUrgent
-	c.Assessment.Attention = model.AttentionUrgent
-	c.Assessment.ActionContract = hsOperatorContract(c.Now.Add(time.Minute))
-	c.OperatorArtifacts = []OperatorArtifactInput{hsArtifact("input-1", artifactKindAnnotation, hsNow(t))}
-	trs, sum := hsCommitOf(t, c)
-	got := hsPlan(t, hsPub(c, trs, sum))
+	build := func(t *testing.T, artifacts ...OperatorArtifactInput) []model.NotificationIntent {
+		t.Helper()
+		c := hsNext(t)
+		c.Situation.Attention = model.AttentionUrgent
+		c.Assessment.Attention = model.AttentionUrgent
+		c.Assessment.ActionContract = hsOperatorContract(c.Now.Add(time.Minute))
+		c.OperatorArtifacts = artifacts
+		trs, sum := hsCommitOf(t, c)
+		return hsPlan(t, hsPub(c, trs, sum))
+	}
 
-	if broadcasts := hsIntentsOfClass(got, model.EffectBroadcastHandoff); len(broadcasts) > 1 {
-		t.Fatalf("got %d broadcast effects, want at most one", len(broadcasts))
+	cases := []struct {
+		name      string
+		artifacts []OperatorArtifactInput
+	}{
+		{name: "no pending artifacts"},
+		{name: "one pending artifact", artifacts: []OperatorArtifactInput{
+			hsArtifact("input-1", artifactKindAnnotation, hsNow(t)),
+		}},
+		{name: "two pending artifacts", artifacts: []OperatorArtifactInput{
+			hsArtifact("input-1", artifactKindAnnotation, hsNow(t)),
+			hsArtifact("input-2", artifactKindVerdict, hsNow(t).Add(time.Second)),
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := build(t, tc.artifacts...)
+			broadcasts := hsIntentsOfClass(got, model.EffectBroadcastHandoff)
+			if len(broadcasts) != 1 {
+				t.Fatalf("got %d broadcast effects, want exactly one escalation poke", len(broadcasts))
+			}
+			if !broadcasts[0].MainChannelPoke || broadcasts[0].InterruptionPriority == nil {
+				t.Error("the escalation broadcast must be a poke carrying its evaluated priority")
+			}
+			// The broadcast must name the controller-state Transition (last
+			// in the commit, per R1) — the same authority the root_sync
+			// references — never an artifact Transition.
+			roots := hsIntentsOfClass(got, model.EffectRootSync)
+			if len(roots) != 1 {
+				t.Fatalf("got %d root_sync intents, want 1", len(roots))
+			}
+			if broadcasts[0].TransitionID == nil || roots[0].TransitionID == nil ||
+				*broadcasts[0].TransitionID != *roots[0].TransitionID {
+				t.Errorf("broadcast references %v, want the commit's authority transition %v",
+					broadcasts[0].TransitionID, roots[0].TransitionID)
+			}
+		})
+	}
+}
+
+// TestPlanNotificationIntentsEscalationSurvivesJournaledArtifacts is the
+// direct regression for the same defect, stated as a comparison: the same
+// escalation must produce the same poke with and without an operator
+// artifact journaled ahead of it in the same commit.
+func TestPlanNotificationIntentsEscalationSurvivesJournaledArtifacts(t *testing.T) {
+	escalate := func(t *testing.T, artifacts []OperatorArtifactInput) int {
+		t.Helper()
+		c := hsNext(t)
+		c.Situation.Attention = model.AttentionUrgent
+		c.Assessment.Attention = model.AttentionUrgent
+		c.OperatorArtifacts = artifacts
+		trs, sum := hsCommitOf(t, c)
+		return len(hsIntentsOfClass(hsPlan(t, hsPub(c, trs, sum)), model.EffectBroadcastHandoff))
+	}
+
+	without := escalate(t, nil)
+	with := escalate(t, []OperatorArtifactInput{hsArtifact("input-1", artifactKindAnnotation, hsNow(t))})
+	if without != 1 {
+		t.Fatalf("urgent escalation alone produced %d broadcasts, want 1", without)
+	}
+	if with != without {
+		t.Errorf("a journaled operator artifact changed the escalation poke: %d broadcasts with, %d without", with, without)
 	}
 }
 
