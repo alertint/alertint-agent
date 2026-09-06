@@ -451,7 +451,7 @@ func TestMaxSchemaVersion(t *testing.T) {
 	// migration ownership") plus 0019, which adds one partial index and no
 	// schema of its own — 0017 and 0018 are final and are never edited, so a
 	// new migration is the only sanctioned way to add it.
-	if got != 20 {
+	if got != 21 {
 		t.Errorf("MaxSchemaVersion = %d, want 19", got)
 	}
 }

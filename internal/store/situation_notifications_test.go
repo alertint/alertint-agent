@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -1245,4 +1246,68 @@ func snDump(t *testing.T, st *Store) string {
 		t.Fatalf("iterate intents: %v", err)
 	}
 	return out.String()
+}
+
+// ----------------------------------------------------------------------
+// The claim poll never scans resolved history (review round 2, R2-F3).
+// ----------------------------------------------------------------------
+
+func TestNotificationClaimQueryUsesTheLiveIndex(t *testing.T) {
+	st := newTestStore(t)
+	rows, err := st.db.QueryContext(context.Background(), `EXPLAIN QUERY PLAN `+notificationClaimRankingQuery,
+		"2026-09-06T10:00:00Z", "2026-09-06T10:00:00Z", 25)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var plan []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan = append(plan, detail)
+		if strings.Contains(detail, "SCAN ni") {
+			t.Errorf("claim poll scans notification history rather than an index restricted to live statuses: %s", detail)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(plan, "\n"), "notification_intents_live_idx") {
+		t.Fatalf("claim poll does not use notification_intents_live_idx:\n%s", strings.Join(plan, "\n"))
+	}
+}
+
+// ----------------------------------------------------------------------
+// Reactivation coalesces older live roots whatever the keeper's status
+// (review round 2, R2-F4).
+// ----------------------------------------------------------------------
+
+func TestNotificationReactivationRetiresAnOlderBlockedRootBehindADeliveredOne(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "reactivate-delivered.db")
+	blockedRootID, deliveredRootID := seedMigration19SupersedeFixture(t, path)
+	st, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+
+	n, err := st.ReactivateConfigurationBlocked(ctx, 1, time.Now().UTC().Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("reactivated %d root projections, want 0: the delivered newer projection is the root on screen", n)
+	}
+	older := snIntent(t, st, blockedRootID)
+	if older.Status != situationmodel.IntentSuperseded || older.ReplacementIntentID == nil || *older.ReplacementIntentID != deliveredRootID {
+		t.Fatalf("pre-upgrade blocked root after reactivation = %q (replacement %v), want superseded by the delivered %s: an obsolete root must never be revived",
+			older.Status, older.ReplacementIntentID, deliveredRootID)
+	}
+	if got := snIntent(t, st, deliveredRootID); got.Status != situationmodel.IntentDelivered || got.MessageTS == nil {
+		t.Fatalf("delivered root after reactivation = %+v, want its delivered outcome untouched", got)
+	}
 }

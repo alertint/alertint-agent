@@ -249,6 +249,36 @@ func deliveryGapGateTx(ctx context.Context, tx *sql.Tx) (deliveryGapGate, error)
 	return gate, nil
 }
 
+// notificationClaimRankingQuery is the claim poll's ranking query: live
+// rows only (the predicate is spelled exactly as migration 0021's partial
+// index WHERE clause, so the poll never scans resolved history), one
+// claimable head per Situation, in notificationClaimOrder. Bound values:
+// now (lease), now (retry), limit.
+const notificationClaimRankingQuery = `
+		WITH ranked AS (
+			SELECT ni.id AS id,
+			       ni.gap_generation AS gap_generation,
+			       ni.situation_id AS situation_id,
+			       ni.transition_sequence AS transition_sequence,
+			       ` + notificationRootFirst + ` AS root_first,
+			       ` + notificationClassRank + ` AS class_rank,
+			       (ni.status = 'pending') AS claimable,
+			       (ni.claim_owner IS NULL OR ni.lease_expires_at <= ?) AS unleased,
+			       (ni.retry_at IS NULL OR ni.retry_at <= ?) AS due,
+			       (ni.requires_root = 0 OR (s.slack_channel IS NOT NULL AND s.slack_root_ts IS NOT NULL)) AS root_ready,
+			       ROW_NUMBER() OVER (
+			           PARTITION BY ni.situation_id
+			           ORDER BY ` + notificationRootFirst + ` ASC, ni.transition_sequence ASC, ` + notificationClassRank + ` ASC, ni.id ASC
+			       ) AS rn
+			FROM notification_intents ni
+			LEFT JOIN situations s ON s.id = ni.situation_id
+			WHERE ni.status IN ('pending', 'blocked_configuration', 'failed')
+		)
+		SELECT id FROM ranked
+		WHERE (situation_id IS NULL OR rn = 1) AND claimable AND unleased AND due AND root_ready
+		` + notificationClaimOrder + `
+		LIMIT ?`
+
 // dueNotificationIntentIDsTx selects the ids this round may claim, in
 // notificationClaimOrder.
 func dueNotificationIntentIDsTx(ctx context.Context, tx *sql.Tx, gate deliveryGapGate,
@@ -273,30 +303,7 @@ func dueNotificationIntentIDsTx(ctx context.Context, tx *sql.Tx, gate deliveryGa
 		return ids, nil
 	}
 
-	rows, err := tx.QueryContext(ctx, `
-		WITH ranked AS (
-			SELECT ni.id AS id,
-			       ni.gap_generation AS gap_generation,
-			       ni.situation_id AS situation_id,
-			       ni.transition_sequence AS transition_sequence,
-			       `+notificationRootFirst+` AS root_first,
-			       `+notificationClassRank+` AS class_rank,
-			       (ni.status = 'pending') AS claimable,
-			       (ni.claim_owner IS NULL OR ni.lease_expires_at <= ?) AS unleased,
-			       (ni.retry_at IS NULL OR ni.retry_at <= ?) AS due,
-			       (ni.requires_root = 0 OR (s.slack_channel IS NOT NULL AND s.slack_root_ts IS NOT NULL)) AS root_ready,
-			       ROW_NUMBER() OVER (
-			           PARTITION BY ni.situation_id
-			           ORDER BY `+notificationRootFirst+` ASC, ni.transition_sequence ASC, `+notificationClassRank+` ASC, ni.id ASC
-			       ) AS rn
-			FROM notification_intents ni
-			LEFT JOIN situations s ON s.id = ni.situation_id
-			WHERE ni.status IN ('pending', 'blocked_configuration', 'failed')
-		)
-		SELECT id FROM ranked
-		WHERE (situation_id IS NULL OR rn = 1) AND claimable AND unleased AND due AND root_ready
-		`+notificationClaimOrder+`
-		LIMIT ?`, nowStr, nowStr, limit)
+	rows, err := tx.QueryContext(ctx, notificationClaimRankingQuery, nowStr, nowStr, limit)
 	if err != nil {
 		return nil, fmt.Errorf("store: select due notification intents: %w", err)
 	}
