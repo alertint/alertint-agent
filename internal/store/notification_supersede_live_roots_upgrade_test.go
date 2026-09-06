@@ -128,19 +128,7 @@ func TestNotificationSupersedeLiveRootsUpgrade(t *testing.T) {
 	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_foreign_key_check`).Scan(&fkViolations); err != nil || fkViolations != 0 {
 		t.Fatalf("foreign_key_check violations = %d (err=%v), want 0", fkViolations, err)
 	}
-	var triggers string
-	rows, err := st.db.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'notification_intents_supersede%'`)
-	if err != nil {
-		t.Fatalf("list triggers: %v", err)
-	}
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			t.Fatalf("scan trigger: %v", err)
-		}
-		triggers += name + ";"
-	}
-	_ = rows.Close()
+	triggers := supersessionTriggerNames(t, st)
 	if strings.Contains(triggers, "from_pending_only") || !strings.Contains(triggers, "from_live_only") {
 		t.Fatalf("supersession triggers after upgrade = %q, want only notification_intents_supersede_from_live_only", triggers)
 	}
@@ -162,4 +150,28 @@ func TestNotificationSupersedeLiveRootsUpgrade(t *testing.T) {
 		WHERE id = ?`, blockedRootID, deliveredRootID); err == nil || !strings.Contains(err.Error(), "live root_sync") {
 		t.Fatalf("superseding a delivered root = %v, want the 0020 trigger's rejection", err)
 	}
+}
+
+// supersessionTriggerNames lists the supersession triggers currently
+// defined on notification_intents, ";"-joined.
+func supersessionTriggerNames(t *testing.T, st *Store) string {
+	t.Helper()
+	rows, err := st.db.QueryContext(context.Background(),
+		`SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'notification_intents_supersede%'`)
+	if err != nil {
+		t.Fatalf("list triggers: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var triggers string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan trigger: %v", err)
+		}
+		triggers += name + ";"
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate triggers: %v", err)
+	}
+	return triggers
 }

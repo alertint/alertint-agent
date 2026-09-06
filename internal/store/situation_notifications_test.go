@@ -1073,9 +1073,8 @@ func TestMarkNotificationDeliveredSupersededFirstPostKeepsCoordinates(t *testing
 		t.Fatalf("claimed %s, want the replacement root projection", replacement.Intent.EffectClass)
 	}
 	snDeliver(t, st, replacement, "100.1", now.Add(4*time.Second))
-	_, ts, _, _ = st.GetSituationRootCoordinates(ctx, id)
-	if ts != "100.1" {
-		t.Fatalf("root coordinates = %q after the replacement delivered, want the first post's 100.1", ts)
+	if _, ts, _, err := st.GetSituationRootCoordinates(ctx, id); err != nil || ts != "100.1" {
+		t.Fatalf("root coordinates = %q (err=%v) after the replacement delivered, want the first post's 100.1", ts, err)
 	}
 }
 
@@ -1241,6 +1240,9 @@ func snDump(t *testing.T, st *Store) string {
 		}
 		fmt.Fprintf(&out, "\n  %s class=%s status=%s seq=%d retry_at=%q owner=%q err=%q requires_root=%d",
 			id[:8], class, status, seq, retryAt, owner, errClass, requiresRoot)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate intents: %v", err)
 	}
 	return out.String()
 }
