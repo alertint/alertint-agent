@@ -145,8 +145,16 @@ restart Windsurf and check **Settings → MCP Servers**:
 | `alertint_recent_changes` | List recent deploys/releases/PRs matching a label selector (requires change enrichment enabled). |
 | `sentry_issues_list` | List live, distilled Sentry issues for a project (+ optional environment) by status (`unresolved`/`resolved`/`ignored`); requires the Sentry Error source enabled. |
 | `sentry_issues_trace` | Return full distilled stacktraces (`file:line`, function, `in_app`) for up to 10 Sentry issue ids; requires the Sentry Error source enabled. |
-| `alertint_incident_annotate` | Attach a permanent, age-stamped operator note to an incident — context for the next investigator; never affects triage or memory recall. |
-| `alertint_incident_capture_verdict` | Capture an operator-confirmed correction or confirmation as a replayable, graded record. A correction steers the next triage of its failure group (tested against live evidence, ruling-gated — never blended in) and demotes the corrected prior from strong recall; a confirmation retires steering. |
+| `alertint_incident_annotate` | Attach a permanent, age-stamped operator note to an incident — context for the next investigator; never affects triage or memory recall. On the `state-controller` branch it is also journalled, attributed to the operator, into the owning Situation's Slack thread in the same transaction — as recorded context, never as a change to the assessment, the attention level, or publication authority, and never as proof that anyone touched the operated system. |
+| `alertint_incident_capture_verdict` | Capture an operator-confirmed correction or confirmation as a replayable, graded record. A correction steers the next triage of its failure group (tested against live evidence, ruling-gated — never blended in) and demotes the corrected prior from strong recall; a confirmation retires steering. On the `state-controller` branch it is separately attributed in the owning Situation's journal and keeps exactly the authority it already had — no more. |
+
+Both feedback writes land whether or not a Situation currently owns the
+incident. With **no current owner** — none was ever assigned, or the owner
+had already closed — the write still persists and stays visible through the
+incident's own history here and in the audit log; against an already-closed
+Situation it appears in that Situation's `artifacts_recorded_after_closure`,
+never journalled into the closed episode and never lost. No old Incident
+Slack card is resurrected or rewritten either way.
 
 Read-only toward your systems, always; feedback writes (the last two tools
 above) land only in AlertINT's own incident state, additive and

@@ -175,10 +175,14 @@ func (s *Store) ClaimNotificationIntents(ctx context.Context, owner string, now 
 
 	placeholders, args := inPlaceholders(ids)
 	updateArgs := append([]any{owner, leaseExpires}, args...)
+	// #nosec G202 -- placeholders is a fixed "?,?,..." run built from len(ids); every value is bound.
+	// The annotation sits on its own line ABOVE the statement: gosec attaches
+	// a #nosec comment to the node it precedes, and a trailing comment on the
+	// closing line of a multi-line call is not honored.
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE notification_intents
 		SET claim_owner = ?, lease_expires_at = ?, claim_token = claim_token + 1, attempt_count = attempt_count + 1
-		WHERE id IN (`+placeholders+`)`, updateArgs...); err != nil { // #nosec G202 -- placeholders is a fixed "?,?,..." run built from len(ids); every value is bound
+		WHERE id IN (`+placeholders+`)`, updateArgs...); err != nil {
 		return nil, fmt.Errorf("store: claim notification intents: %w", err)
 	}
 

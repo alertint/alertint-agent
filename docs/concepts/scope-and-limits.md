@@ -56,17 +56,28 @@ is and isn't:
   at `awaiting_decision` until that controller requests, skips, or leaves
   it parked — nothing dispatches to the triage skill on its own anymore on
   that branch.
+  That branch also commits an **immutable Transition** and a versioned
+  **Episode summary** for every authoritative material change, in the same
+  fenced transaction as the state itself, and makes the Situation delivery
+  worker the only Slack writer in runtime assembly: Slack shows one
+  Situation root plus an immutable ordered journal, delivered from durable
+  intents that retry indefinitely, and no Incident-shaped card, resolve
+  edit, or recurrence reply is reachable there any more. Local delivery
+  intent is idempotent across crashes and restarts; **external delivery is
+  at-least-once**, so an uncertain Slack response followed by a retry can
+  rarely leave a duplicate message in the channel (AlertINT requests no
+  history-read scope and never reads the channel back to reconcile).
 - **Is not (yet), even on `state-controller`:** connector preparation for
   the controller's own evidence needs, durable Assessment/Triage artifacts
-  beyond the bounded recent-attempt history exposed over MCP, immutable
-  Transition/Episode summary history, or a Situation-owned Slack presence
-  (Slack, where enabled, still posts per-Incident, exactly as in Phase 1).
+  beyond the bounded recent-attempt history exposed over MCP, operator
+  questions, Situation judgments, or expected-behaviour envelopes.
   `alertint_get_situation` reads `assessment: null` and
   `operator_contract: null`, honestly, for any Situation the controller has
   not yet reconciled at least once — never a fabricated placeholder.
 - **No mode switch:** there is no `state_controller_mode`, shadow-output
   path, or legacy/new runtime toggle to configure — one build runs one
-  grouping/dispatch path at a time.
+  grouping/dispatch path, and one Slack writer, at a time. There is no dual
+  or shadow notification mode.
 
 ## Known weaknesses
 

@@ -264,6 +264,16 @@ A released binary built from `main` does not read this section at all.
 | `retry.min_seconds` | int | `5` | Floor of the controller's transient-failure retry backoff (exponential from here, capped at `retry.max_seconds`). |
 | `retry.max_seconds` | int | `300` | Ceiling of the controller's transient-failure retry backoff. |
 | `retry.jitter_percent` | int | `20` | Jitter fraction (±) applied to the computed backoff, so concurrently-parked Situations don't all retry in lockstep. |
+| `slack.repage_cooldown_seconds` | int | `900` | How long a *materially changed required action* must wait after a delivered main-channel interruption before it may create another one. It gates exactly that one case: a first publication, newly crossed criticality, newly urgent attention, and an operator hand-off all bypass it, because a cooldown must never swallow an escalation. |
+
+Slack delivery adds no other knobs. Retry timing (exponential 5 s → 5 min
+with jitter, honouring a longer Slack `Retry-After`), batch size, and the
+five-minute Delivery-gap threshold are protocol constants, and the delivery
+worker reuses `lease_seconds`, `heartbeat_seconds`, and
+`reconcile_poll_seconds` above. There is deliberately **no attempt ceiling
+and no dead-letter setting**: a valid effect retries indefinitely, and a
+definite configuration rejection blocks durably instead of being discarded
+(see [Slack](../notifications/slack.md#delivery-durable-intent-indefinite-retry-at-least-once)).
 
 Cadence is persisted scheduling machinery, not card content — it only
 widens or narrows how soon the controller next reconciles a nonterminal
@@ -359,11 +369,11 @@ starts when the aggregate LLM dependency state first becomes `degraded` or
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `stdout` | bool | `true` | Deliver the finding to **stdout** as one JSON line. The full JSON is verbose detail: it is written **only at `--log-level=debug`** (consistently, in every format). At `info` the sink is still active — a send is confirmed on the `notified` line — but no JSON is written; the result shows as the one-line `finding` summary instead. Recommended to leave on. |
-| `slack.enabled` | bool | `false` | Post a Block Kit message to a Slack channel via the bot-token API (message updated in-place on resolve) |
-| `slack.bot_token_env` | string | — | Required when `slack.enabled: true`. Env var name holding the Slack bot token (`xoxb-…`, requires the `chat:write` scope) |
+| `slack.enabled` | bool | `false` | Turn on Slack delivery. In a released binary this posts a Block Kit Incident card, updated in-place on resolve; on the `state-controller` branch it turns on the Situation delivery worker — the only Slack writer there — which posts one Situation root plus an immutable ordered journal thread. |
+| `slack.bot_token_env` | string | — | Required when `slack.enabled: true`. Env var name holding the Slack bot token (`xoxb-…`, requires the `chat:write` scope; no history-read scope is ever requested) |
 | `slack.channel` | string | — | Required when `slack.enabled: true`. Channel name (e.g. `#alerts`) or ID (e.g. `C1234567890`) |
-| `slack.min_severity` | string | `low` | Findings below this severity (`low` \| `medium` \| `high`) are not posted to Slack; stdout always emits. An incident suppressed at firing is also suppressed at resolution. The default posts everything. |
-| `slack.recurrence_mode` | string | `change-gated` | How a recurring incident resurfaces in its thread: `change-gated` posts a thread reply only on a real-world change (severity rise, new symptom, faster cadence) or a milestone (×5/×10/×25/×50/×100, then every ×100) — replies stay in the thread, nothing extra is sent to the channel; `off` keeps recurrence to a silent card count-bump. See [Slack](../notifications/slack.md) for details. |
+| `slack.min_severity` | string | `low` | The channel-noise floor (`low` \| `medium` \| `high`); stdout always emits regardless. In a released binary it compares against the finding's severity, and an incident suppressed at firing is also suppressed at resolution. On the `state-controller` branch it is the minimum **interruption priority** a *new* main-channel interruption must meet — never alert severity and never a model claim; `critical` always passes, a withheld interruption is durably recorded, and the floor never suppresses Situation state, MCP history, a root edit, or a journal reply. The default posts everything. |
+| `slack.recurrence_mode` | string | `change-gated` | How a recurring incident resurfaces in its thread: `change-gated` posts a thread reply only on a real-world change (severity rise, new symptom, faster cadence) or a milestone (×5/×10/×25/×50/×100, then every ×100) — replies stay in the thread, nothing extra is sent to the channel; `off` keeps recurrence to a silent card count-bump. **No effect on the `state-controller` branch** (recurrence is carried by the owning Situation's own journal at the same milestone rungs); the key is still accepted so an existing config keeps loading. See [Slack](../notifications/slack.md) for details. |
 
 At startup the agent logs one `notifiers ready` line listing the active sinks
 (and the Slack channel) so you can see where findings will go. Every analysis
@@ -381,6 +391,15 @@ finding: a recurrence attach (`"kind":"occurrence"`), an operator annotation
 (`"kind":"annotation"`), and an incident whose triage failed on every retry
 (`"kind":"triage_exhausted"`, carrying the incident id, attempt count, and the
 last error).
+
+On the `state-controller` branch the stdout stream additionally emits one
+`{"kind":"situation.transition","version":1,…}` line for every committed
+Situation Transition — identities, closed codes, hashes, counts, and instants
+only, never prose. That line means the change is **durably committed**; it
+never implies Slack delivery, and a quiet or floor-withheld Situation still
+emits it. **Deduplicate by `transition_id`**: a consumer that restarts, or
+reads a replayed stream, may legitimately see the same transition line more
+than once.
 
 See [Slack](../notifications/slack.md) for the full setup walkthrough.
 
