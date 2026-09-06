@@ -189,10 +189,11 @@ context for the analysis — at the cost of a slower first finding.
 Incident memory stops an unchanged, already-analyzed condition from being
 re-triaged as brand new every time it re-fires. When an alert whose group key
 matches an already-analyzed incident fires again inside the collapse horizon,
-it attaches as a lightweight occurrence — the incident's Slack card edits to
-`recurred ×N` — instead of minting a new incident and spending another LLM
-call. This is deterministic, free, and always on; there is no enable switch,
-only the knobs below.
+it attaches as a lightweight occurrence instead of minting a new incident and
+spending another LLM call — a released binary edits the Incident card in place
+to `recurred ×N`, and on the `state-controller` branch the owning Situation's
+own journal carries the recurrence milestone instead. This is deterministic,
+free, and always on; there is no enable switch, only the knobs below.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
