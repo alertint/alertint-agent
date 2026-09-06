@@ -1540,3 +1540,46 @@ func TestProjectEpisodeFoldsTheRestOfOneTerminalCommitButNeverReopens(t *testing
 		t.Fatal("a later commit reusing the same terminal instant must never fold onto a terminal Episode")
 	}
 }
+
+// Lab 2026-09-06 run C: a Situation published from the deterministic critical
+// floor while L2 was unreachable carried retry_situation_assessment in its
+// FIRST contract, so no later Transition could be classified
+// investigation_started; Triage then ran and investigation_concluded was
+// journaled, but the summary flag stayed false and the root fell from
+// Investigating back to Observed at the conclusion. A concluded
+// investigation necessarily started. (A contract that merely names
+// investigation work does not set the flag — see the clean-skip and direct
+// closed_unknown tests above.)
+func TestProjectEpisodeInvestigationConcludedMarksTheInvestigationStarted(t *testing.T) {
+	first := hsFirst(t) // baseline contract: run_acute_triage running, no start Transition
+	if first.Reason != model.ReasonFirstAuthoritativeState {
+		t.Fatalf("first reason = %q", first.Reason)
+	}
+	sum, err := ProjectEpisode(nil, first)
+	if err != nil {
+		t.Fatalf("ProjectEpisode(first): %v", err)
+	}
+	if sum.InvestigationStarted {
+		t.Fatal("a contract that names investigation work must not by itself mark the investigation started")
+	}
+	if got := DeriveOrientation(sum, first); got != OrientationInvestigating {
+		t.Fatalf("orientation while the contract investigates = %q, want %q", got, OrientationInvestigating)
+	}
+
+	c := hsNext(t)
+	c.Assessment.ActionContract = hsMonitoringContract(c.Now.Add(time.Minute))
+	concluded := hsOnly(t, c)
+	if concluded.Reason != model.ReasonInvestigationConcluded {
+		t.Fatalf("reason = %q, want investigation_concluded", concluded.Reason)
+	}
+	sum, err = ProjectEpisode(&sum, concluded)
+	if err != nil {
+		t.Fatalf("ProjectEpisode(concluded): %v", err)
+	}
+	if !sum.InvestigationStarted {
+		t.Fatal("investigation_concluded must leave InvestigationStarted true")
+	}
+	if got := DeriveOrientation(sum, concluded); got != OrientationInvestigating {
+		t.Fatalf("orientation after conclusion = %q, want %q", got, OrientationInvestigating)
+	}
+}

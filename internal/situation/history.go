@@ -853,6 +853,20 @@ func ProjectEpisode(prior *model.EpisodeSummary, t model.Transition) (model.Epis
 		out.ImpactSummary = impactSummary(concl.Impact)
 	}
 
+	// A concluded investigation necessarily started. A first authoritative
+	// state whose fallback contract is already retry_situation_assessment
+	// (an L2 outage at publication) never yields a later Transition
+	// classified investigation_started, yet Triage runs and
+	// investigation_concluded is journaled under it; without this the
+	// summary flag stayed false and the root fell back from Investigating
+	// to Observed at the conclusion (lab 2026-09-06, run C). A contract
+	// that merely names investigation work does NOT set the flag here: a
+	// clean Triage skip and a direct closed_unknown must never read as an
+	// investigation having run.
+	if t.Reason == model.ReasonInvestigationConcluded {
+		out.InvestigationStarted = true
+	}
+
 	switch t.JournalKind { //nolint:exhaustive // only the accumulating journal kinds contribute to the two bounded summary lists; every other kind updates the scalar fields above.
 	case model.JournalInvestigationStarted:
 		out.InvestigationStarted = true
