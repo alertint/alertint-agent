@@ -863,15 +863,26 @@ func ProjectEpisode(prior *model.EpisodeSummary, t model.Transition) (model.Epis
 // controller-state Transition, and every Transition of one commit carries
 // the same captured projection (R3) — so a commit that both journals an
 // artifact and closes the Situation folds an artifact Transition that
-// already reports the closure, then the terminal Transition itself. A
-// Transition reporting the identical terminal instant is by construction
-// part of the commit that closed the Episode, never a later reopening: a
-// terminal Situation is never claimed again (ClaimDueSituations selects
-// only active/recovery_pending) and a later artifact is recorded, never
-// journaled (R2).
+// already reports the closure, then the terminal Transition itself.
+//
+// "Same commit" is established by TWO facts together, because neither alone
+// identifies a commit. The terminal instant is a DURABLE value that
+// resolveLifecycle carries forward unchanged on every later cycle, so a
+// matching Projection.TerminalAt proves only "the same closure", not "the
+// same write". The commit identity is the instant: every Transition of one
+// commit is stamped with that reconciliation's single Now (newTransition),
+// and each fold copies it onto the summary as UpdatedAt — so
+// t.CreatedAt.Equal(prior.UpdatedAt) holds for the rest of this commit and
+// for nothing later. Requiring both keeps "a terminal Episode never
+// reopens" an invariant of THIS function rather than something only
+// ClaimDueSituations' active/recovery_pending filter happens to prevent —
+// which matters for any future path that reconciles an already-terminal
+// Situation (migration 0017's own header contemplates one: an idempotent
+// upgrade_reconstruction for Plan 1/2 Situations that predate the ledger).
 func validateFold(prior model.EpisodeSummary, t model.Transition) error {
 	sameTerminalCommit := prior.TerminalAt != nil && t.Projection.TerminalAt != nil &&
-		t.Projection.TerminalAt.Equal(*prior.TerminalAt)
+		t.Projection.TerminalAt.Equal(*prior.TerminalAt) &&
+		t.CreatedAt.Equal(prior.UpdatedAt)
 	switch {
 	case prior.SituationID != t.SituationID:
 		return fmt.Errorf("situation: project episode: transition belongs to situation %q, summary to %q",

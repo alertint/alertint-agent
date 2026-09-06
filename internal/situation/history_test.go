@@ -1503,4 +1503,20 @@ func TestProjectEpisodeFoldsTheRestOfOneTerminalCommitButNeverReopens(t *testing
 	if _, err := ProjectEpisode(commit.Summary, reopening); err == nil {
 		t.Fatal("a nonterminal Transition must never reopen a terminal Episode")
 	}
+
+	// And so does a LATER commit that carries the SAME terminal instant —
+	// which is exactly what a future reconciliation of an already-terminal
+	// Situation would look like, since resolveLifecycle carries terminal_at
+	// forward unchanged. The terminal instant alone never identifies a
+	// commit; only the reconciliation instant does.
+	sameClosureLater := commit.Transitions[1]
+	sameClosureLater.Sequence++
+	sameClosureLater.CreatedAt = commit.Summary.UpdatedAt.Add(time.Hour)
+	if sameClosureLater.Projection.TerminalAt == nil ||
+		!sameClosureLater.Projection.TerminalAt.Equal(*commit.Summary.TerminalAt) {
+		t.Fatalf("fixture must reuse the committed terminal instant, got %v", sameClosureLater.Projection.TerminalAt)
+	}
+	if _, err := ProjectEpisode(commit.Summary, sameClosureLater); err == nil {
+		t.Fatal("a later commit reusing the same terminal instant must never fold onto a terminal Episode")
+	}
 }
