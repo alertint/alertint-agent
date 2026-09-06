@@ -207,6 +207,10 @@ func TestInterruptionPriorityRequiredActionChangeIsCooldownGated(t *testing.T) {
 		t.Fatalf("ProjectEpisode: %v", err)
 	}
 
+	// AlertINT's own machinery moves (a different reconsideration trigger)
+	// while the operator is asked for exactly the same thing: material,
+	// journaled, but never a poke — a cooldown restricts a changed action,
+	// it does not turn an unchanged one into one (review round 3, R3-F1).
 	changed := hsChange(t)
 	changed.Now = handedOff.CreatedAt.Add(time.Minute)
 	changed.Situation.InputVersion = 9
@@ -216,10 +220,16 @@ func TestInterruptionPriorityRequiredActionChangeIsCooldownGated(t *testing.T) {
 	contract.NextUpdateOn = []model.NextUpdateOn{model.NextUpdateOnSourceResolution}
 	changed.Assessment.ActionContract = contract
 	next := hsOnly(t, changed)
-
-	if got := ClassifyPoke(&handedOff, next); got != PokeRequiredActionChanged {
-		t.Fatalf("poke class = %q, want %q", got, PokeRequiredActionChanged)
+	if next.Reason != model.ReasonOperatorContractChanged {
+		t.Fatalf("fixture: reason = %q, want operator_contract_changed (still material)", next.Reason)
 	}
+	if got := ClassifyPoke(&handedOff, next); got != PokeNone {
+		t.Fatalf("poke class for internal work progress = %q, want %q", got, PokeNone)
+	}
+
+	// The reserved class itself: gated by the cooldown, unlike every
+	// escalation class. Reachable only once a second supported operator
+	// action exists (the catalog has one today).
 	if !PokeRequiredActionChanged.CooldownApplies() {
 		t.Error("a materially changed required action must respect the repage cooldown")
 	}
@@ -227,6 +237,31 @@ func TestInterruptionPriorityRequiredActionChangeIsCooldownGated(t *testing.T) {
 		if escalation.CooldownApplies() {
 			t.Errorf("%q must bypass the repage cooldown", escalation)
 		}
+	}
+}
+
+// TestInterruptionPriorityInternalWorkProgressNeverPokes pins review round
+// 3, R3-F1, on contracts derived through production DeriveActionContract:
+// Triage starting and Triage finishing keep investigate_situation
+// outstanding and are not a changed required action.
+func TestInterruptionPriorityInternalWorkProgressNeverPokes(t *testing.T) {
+	for name, phase := range map[string]TriagePhase{"triage_started": TriagePhaseInFlight, "triage_finished": TriagePhaseNone} {
+		t.Run(name, func(t *testing.T) {
+			c := hsNext(t)
+			hsUseReason(&c, reasonCodeDurationOutlier)
+			action := model.OperatorActionInvestigateSituation
+			state := ControllerState{Lifecycle: model.LifecycleActive, Attention: model.AttentionInvestigate,
+				OperatorActionRequired: &action, TriagePhase: TriagePhaseAwaitingDecision}
+			c.PriorTransition.ActionContract = DeriveActionContract(state, DeriveCadence(state), c.Now.Add(-20*time.Minute))
+			c.PriorTransition.Projection = c.Projection
+			c.PriorSummary.ActionContract = c.PriorTransition.ActionContract
+			state.TriagePhase = phase
+			c.Assessment.ActionContract = DeriveActionContract(state, DeriveCadence(state), c.Now)
+			next := hsOnly(t, c)
+			if got := ClassifyPoke(c.PriorTransition, next); got != PokeNone {
+				t.Fatalf("poke class = %q, want %q: unchanged investigate_situation plus internal progress", got, PokeNone)
+			}
+		})
 	}
 }
 

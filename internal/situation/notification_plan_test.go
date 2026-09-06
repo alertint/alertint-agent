@@ -615,30 +615,46 @@ func TestPlanNotificationIntentsRepageCooldown(t *testing.T) {
 		return c
 	}
 
-	t.Run("a changed required action inside the cooldown does not repage", func(t *testing.T) {
-		c := changeAt(2*time.Minute, nil)
-		trs, folded := hsCommitOf(t, c)
-		in := hsPub(c, trs, folded)
-		in.LastMainChannelPokeAt = timePtr(handedOff.CreatedAt)
+	// An internal contract change (a different reconsideration trigger,
+	// same human action) is material and journaled but never a poke —
+	// inside OR outside the cooldown (review round 3, R3-F1): the cooldown
+	// gates a changed required action, and its expiry grants nothing.
+	for name, offset := range map[string]time.Duration{"inside the cooldown": 2 * time.Minute, "after the cooldown": 20 * time.Minute} {
+		t.Run("internal work progress never repages "+name, func(t *testing.T) {
+			c := changeAt(offset, nil)
+			trs, folded := hsCommitOf(t, c)
+			in := hsPub(c, trs, folded)
+			in.LastMainChannelPokeAt = timePtr(handedOff.CreatedAt)
 
-		got := hsPlan(t, in)
-		if broadcasts := hsIntentsOfClass(got, model.EffectBroadcastHandoff); len(broadcasts) != 0 {
-			t.Errorf("got %d broadcasts inside the cooldown, want 0", len(broadcasts))
+			got := hsPlan(t, in)
+			if broadcasts := hsIntentsOfClass(got, model.EffectBroadcastHandoff); len(broadcasts) != 0 {
+				t.Errorf("got %d broadcasts, want 0: unchanged human action", len(broadcasts))
+			}
+			if threads := hsIntentsOfClass(got, model.EffectThreadAppend); len(threads) != 1 {
+				t.Errorf("the journal entry is never cooled down, got %d", len(threads))
+			}
+			if roots := hsIntentsOfClass(got, model.EffectRootSync); len(roots) != 1 {
+				t.Errorf("internal progress still edits the root, got %d", len(roots))
+			}
+		})
+	}
+
+	// The cooldown gate itself, tested on its helper: the reserved
+	// changed-action class is the only one it applies to and no Transition
+	// this build can produce reaches it.
+	t.Run("the cooldown helper", func(t *testing.T) {
+		in := hsPub(hsChange(t), nil, model.EpisodeSummary{})
+		in.LastMainChannelPokeAt = timePtr(in.Now.Add(-2 * time.Minute))
+		if cooldownElapsed(in) {
+			t.Error("2 minutes after the last poke is inside a 15-minute cooldown")
 		}
-		if threads := hsIntentsOfClass(got, model.EffectThreadAppend); len(threads) != 1 {
-			t.Errorf("the journal entry is never cooled down, got %d", len(threads))
+		in.LastMainChannelPokeAt = timePtr(in.Now.Add(-20 * time.Minute))
+		if !cooldownElapsed(in) {
+			t.Error("20 minutes after the last poke is past a 15-minute cooldown")
 		}
-	})
-
-	t.Run("a changed required action after the cooldown repages", func(t *testing.T) {
-		c := changeAt(20*time.Minute, nil)
-		trs, folded := hsCommitOf(t, c)
-		in := hsPub(c, trs, folded)
-		in.LastMainChannelPokeAt = timePtr(handedOff.CreatedAt)
-
-		got := hsPlan(t, in)
-		if broadcasts := hsIntentsOfClass(got, model.EffectBroadcastHandoff); len(broadcasts) != 1 {
-			t.Errorf("got %d broadcasts after the cooldown, want 1", len(broadcasts))
+		in.LastMainChannelPokeAt = nil
+		if !cooldownElapsed(in) {
+			t.Error("no prior poke means no cooldown")
 		}
 	})
 
@@ -1097,5 +1113,43 @@ func TestPlanNotificationIntentsRecurrenceModeChangeGatedPostsAQuietMilestone(t 
 	}
 	if broadcasts := hsIntentsOfClass(got, model.EffectBroadcastHandoff); len(broadcasts) != 0 {
 		t.Fatalf("a recurrence milestone must never re-page the channel, got %+v", broadcasts)
+	}
+}
+
+// TestPlanNotificationIntentsInternalWorkProgressNeverRepages is review
+// round 3's reproduction, kept verbatim in intent: production-derived
+// contracts for Triage starting and finishing, same human action, a poke
+// 20 minutes ago — the planner edits the root and journals, and creates no
+// main-channel poke.
+func TestPlanNotificationIntentsInternalWorkProgressNeverRepages(t *testing.T) {
+	for name, phase := range map[string]TriagePhase{"triage_started": TriagePhaseInFlight, "triage_finished": TriagePhaseNone} {
+		t.Run(name, func(t *testing.T) {
+			c := hsNext(t)
+			hsUseReason(&c, reasonCodeDurationOutlier)
+			action := model.OperatorActionInvestigateSituation
+			state := ControllerState{Lifecycle: model.LifecycleActive, Attention: model.AttentionInvestigate,
+				OperatorActionRequired: &action, TriagePhase: TriagePhaseAwaitingDecision}
+			c.PriorTransition.ActionContract = DeriveActionContract(state, DeriveCadence(state), c.Now.Add(-20*time.Minute))
+			c.PriorTransition.Projection = c.Projection
+			c.PriorSummary.ActionContract = c.PriorTransition.ActionContract
+			state.TriagePhase = phase
+			c.Assessment.ActionContract = DeriveActionContract(state, DeriveCadence(state), c.Now)
+			transitions, summary := hsCommitOf(t, c)
+			if len(transitions) == 0 {
+				t.Fatal("internal progress should still update the root/history")
+			}
+			in := hsPub(c, transitions, summary)
+			lastPoke := c.Now.Add(-20 * time.Minute)
+			in.LastMainChannelPokeAt = &lastPoke
+			intents := hsPlan(t, in)
+			if n := len(hsIntentsOfClass(intents, model.EffectRootSync)); n != 1 {
+				t.Fatalf("got %d root edits, want 1", n)
+			}
+			for _, intent := range intents {
+				if intent.MainChannelPoke {
+					t.Errorf("unchanged investigate_situation action plus internal Triage progress created a %s channel poke; cooldown expiry alone grants no publication authority", intent.EffectClass)
+				}
+			}
+		})
 	}
 }

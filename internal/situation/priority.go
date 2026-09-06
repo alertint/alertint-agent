@@ -112,8 +112,16 @@ const (
 	PokeUrgentAttention PokeClass = "urgent_attention"
 	// PokeOperatorHandoff is a no-action to operator-judgment/action handoff.
 	PokeOperatorHandoff PokeClass = "operator_handoff"
-	// PokeRequiredActionChanged is a materially changed required action; it
-	// is the one class the configured repage cooldown gates.
+	// PokeRequiredActionChanged is a materially changed required HUMAN
+	// action — the operator is now asked for something different; it is the
+	// one class the configured repage cooldown gates. AlertINT's own work
+	// progress (Triage starting or finishing, a wait reason, an update
+	// trigger) changes the Operator contract but not what the operator is
+	// asked to do, and is never this class: a cooldown restricts a changed
+	// action, its expiry does not turn an unchanged one into a poke (review
+	// round 3, R3-F1). With this build's one-entry operator-action catalog
+	// the class is reserved: reachable once a second supported action
+	// exists, never by broadening authority.
 	PokeRequiredActionChanged PokeClass = "required_action_changed"
 )
 
@@ -157,8 +165,8 @@ func ClassifyPoke(prior *model.Transition, t model.Transition) PokeClass {
 		return PokeUrgentAttention
 	case t.ActionContract.OperatorActionRequired != nil && prior.ActionContract.OperatorActionRequired == nil:
 		return PokeOperatorHandoff
-	case t.ActionContract.OperatorActionRequired != nil &&
-		operatorContractTuple(prior.ActionContract) != operatorContractTuple(t.ActionContract):
+	case t.ActionContract.OperatorActionRequired != nil && prior.ActionContract.OperatorActionRequired != nil &&
+		derefOperatorAction(t.ActionContract.OperatorActionRequired) != derefOperatorAction(prior.ActionContract.OperatorActionRequired):
 		return PokeRequiredActionChanged
 	default:
 		return PokeNone
@@ -186,15 +194,8 @@ func ClassifyPoke(prior *model.Transition, t model.Transition) PokeClass {
 //     Attention, newly crossed criticality) is current while its Attention
 //     still holds.
 //
-// This is deliberately narrower than PokeRequiredActionChanged's basis
-// (the whole contract without its deadline): that class decides whether a
-// NEW interruption is warranted, this function decides whether an
-// interruption already owed may be demoted. With the current one-entry
-// operator-action catalog the two can disagree on an internal contract
-// change — the queued handoff still broadcasts as current, and the newer
-// Transition may broadcast again once the repage cooldown allows — which is
-// the side to err on: the spec demotes only when the requested action is
-// no longer current.
+// PokeRequiredActionChanged is judged on the same basis, so an internal
+// contract change neither demotes an owed handoff nor earns a new poke.
 //
 // A summary that does not yet include the handoff cannot confirm it and
 // counts as not current.
