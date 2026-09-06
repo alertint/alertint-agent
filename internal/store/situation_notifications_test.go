@@ -5,6 +5,8 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -601,20 +603,23 @@ func TestNotificationSupersessionTakesTheClaimFromAnInFlightRootSync(t *testing.
 	}
 	after := snIntent(t, st, claim.Intent.ID)
 	if after.Status != situationmodel.IntentSuperseded || after.DeliveredAt != nil {
-		t.Fatalf("superseded root after a refused ack = %+v, want it untouched", after)
+		t.Fatalf("superseded root after its ack = %+v, want the row itself untouched", after)
 	}
-	if _, _, ok, err := st.GetSituationRootCoordinates(ctx, sitID); err != nil || ok {
-		t.Fatalf("root coordinates after a refused ack = (ok=%v, err=%v), want (false, nil)", ok, err)
+	// The post Slack accepted IS the Situation's root: its coordinates are
+	// kept so the replacement edits it rather than posting a second one
+	// (review round 1, R1-F3).
+	if _, ts, ok, err := st.GetSituationRootCoordinates(ctx, sitID); err != nil || !ok || ts != "100.1" {
+		t.Fatalf("root coordinates after the superseded first post's ack = (ok=%v, ts=%q, err=%v), want (true, 100.1, nil)", ok, ts, err)
 	}
 
 	// The replacement projection is the claimable head, and its own
-	// delivery still works normally.
+	// delivery edits that same root.
 	next := snClaimOne(t, st, now.Add(3*time.Minute))
 	replacement := shIntentOfClass(t, second.History.Intents, situationmodel.EffectRootSync)
 	if next.Intent.ID != replacement.ID {
 		t.Fatalf("next head = %s, want the replacement root %s", next.Intent.ID, replacement.ID)
 	}
-	snDeliver(t, st, next, "101.1", now.Add(3*time.Minute))
+	snDeliver(t, st, next, "100.1", now.Add(3*time.Minute))
 }
 
 // TestNotificationSupersessionLeavesImmutableEntriesAndOtherEpisodes proves
@@ -827,10 +832,16 @@ func TestNotificationAckReactivationKeepsOnePendingRootProjection(t *testing.T) 
 	if err := st.BlockNotificationConfiguration(ctx, blocked, "channel_not_found", now); err != nil {
 		t.Fatalf("BlockNotificationConfiguration: %v", err)
 	}
-	// A later material commit inserts a NEW root projection. Supersession
-	// only ever retires a pending one, so the blocked one survives beside it.
+	// A later material commit inserts a NEW root projection and supersedes
+	// the blocked one at commit: an obsolete root is never left holding
+	// its Situation's queue.
 	second := snCommit(t, st, sitID, &first, now.Add(time.Minute))
 	secondRoot := shIntentOfClass(t, second.History.Intents, situationmodel.EffectRootSync)
+	if older := snIntent(t, st, firstRoot.ID); older.Status != situationmodel.IntentSuperseded ||
+		older.ReplacementIntentID == nil || *older.ReplacementIntentID != secondRoot.ID {
+		t.Fatalf("blocked root after a newer commit = %q (replacement %v), want superseded by %s",
+			older.Status, older.ReplacementIntentID, secondRoot.ID)
+	}
 
 	n, err := st.ReactivateConfigurationBlocked(ctx, 1, now.Add(2*time.Minute))
 	if err != nil {
@@ -843,7 +854,7 @@ func TestNotificationAckReactivationKeepsOnePendingRootProjection(t *testing.T) 
 		t.Fatalf("newer root status = %q, want pending", got.Status)
 	}
 	if got := snIntent(t, st, firstRoot.ID); got.Status == situationmodel.IntentPending {
-		t.Fatal("the superseded-by-newer blocked root must not be returned to pending")
+		t.Fatal("the superseded blocked root must not be returned to pending")
 	}
 	if n := shCountRows(t, st,
 		`SELECT COUNT(*) FROM notification_intents WHERE situation_id = ? AND effect_class = 'root_sync' AND status = 'pending'`,
@@ -914,11 +925,15 @@ func TestNotificationAckReactivationCoalescesOlderBlockedRootProjections(t *test
 	}
 }
 
-// TestNotificationAckRedriveRefusesBehindANewerRootProjection proves the
-// same uniqueness hazard cannot reach an operator redrive either: redriving
-// an older failed root behind a newer pending one is refused with a typed
-// error, not a raw constraint violation.
-func TestNotificationAckRedriveRefusesBehindANewerRootProjection(t *testing.T) {
+// TestNotificationAckFailedRootIsSupersededByANewerProjection proves a
+// failed root projection is not a permanent blocker: the next commit's
+// projection supersedes it at commit and is itself claimable at the head
+// of the queue (a failed row holds the queue until then — see
+// TestNotificationClaimBlockedRootEditHoldsItsHandoff), so a later valid
+// projection repairs the Situation with no operator redrive. The
+// superseded row is then no longer failed and cannot be redriven — the
+// obligation lives in its replacement.
+func TestNotificationAckFailedRootIsSupersededByANewerProjection(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
 	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
@@ -929,18 +944,25 @@ func TestNotificationAckRedriveRefusesBehindANewerRootProjection(t *testing.T) {
 	if err := st.FailNotificationIntent(ctx, failed, "invalid_payload", now); err != nil {
 		t.Fatalf("FailNotificationIntent: %v", err)
 	}
+	// The failed root holds the queue: its dependent journal entry is not
+	// claimable behind it.
+	if claims, err := st.ClaimNotificationIntents(ctx, snOwner, now.Add(30*time.Second), time.Minute, 25); err != nil || len(claims) != 0 {
+		t.Fatalf("claimed %v behind a failed root (err=%v), want nothing", snClasses(claims), err)
+	}
 	second := snCommit(t, st, sitID, &first, now.Add(time.Minute))
 	secondRoot := shIntentOfClass(t, second.History.Intents, situationmodel.EffectRootSync)
 
-	err := st.RedriveFailedNotificationIntent(ctx, firstRoot.ID, now.Add(2*time.Minute))
-	if !errors.Is(err, ErrNewerRootProjectionPending) {
-		t.Fatalf("redrive behind a newer pending root = %v, want ErrNewerRootProjectionPending", err)
+	older := snIntent(t, st, firstRoot.ID)
+	if older.Status != situationmodel.IntentSuperseded || older.ReplacementIntentID == nil || *older.ReplacementIntentID != secondRoot.ID {
+		t.Fatalf("failed root after a newer commit = %q (replacement %v), want superseded by %s",
+			older.Status, older.ReplacementIntentID, secondRoot.ID)
 	}
-	if got := snIntent(t, st, firstRoot.ID); got.Status != situationmodel.IntentFailed {
-		t.Fatalf("refused redrive changed the failed root to %q", got.Status)
+	if err := st.RedriveFailedNotificationIntent(ctx, firstRoot.ID, now.Add(2*time.Minute)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("redrive of a superseded root = %v, want ErrNotFound: it is no longer failed", err)
 	}
-	if got := snIntent(t, st, secondRoot.ID); got.Status != situationmodel.IntentPending {
-		t.Fatalf("newer root status = %q, want an untouched pending", got.Status)
+	claim := snClaimOne(t, st, now.Add(2*time.Minute))
+	if claim.Intent.ID != secondRoot.ID {
+		t.Fatalf("claimed %s, want the replacement root %s at the head of the queue", claim.Intent.ID, secondRoot.ID)
 	}
 }
 
@@ -1107,4 +1129,118 @@ func TestMarkNotificationDeliveredSupersededEditNeverMovesTheRoot(t *testing.T) 
 	if _, ts, _, _ := st.GetSituationRootCoordinates(ctx, id); ts != "100.1" {
 		t.Fatalf("root coordinates = %q, want the original 100.1: an edit never re-anchors a root", ts)
 	}
+}
+
+// ----------------------------------------------------------------------
+// Blocked and failed effects hold the queue (review round 1, R1-F2).
+// ----------------------------------------------------------------------
+
+func TestNotificationClaimBlockedRootEditHoldsItsHandoff(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	id, first := snSeedOneCycle(t, st, "review-blocked-edit", now)
+	snDeliver(t, st, snClaimOne(t, st, now), "100.1", now)
+	snDeliver(t, st, snClaimOne(t, st, now), "100.2", now)
+	now = now.Add(time.Minute)
+	snCommit(t, st, id, &first, now)
+	root := snClaimOne(t, st, now)
+	if root.Intent.EffectClass != situationmodel.EffectRootSync {
+		t.Fatal("expected root edit")
+	}
+	if err := st.BlockNotificationConfiguration(ctx, root, "missing_scope", now); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := st.ClaimNotificationIntents(ctx, snOwner, now, time.Minute, 25)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != 0 {
+		t.Fatalf("claimed %v before its blocked root edit was delivered: an existing timestamp proves a root exists, not that this projection reached it", snClasses(claims))
+	}
+	// Corrected configuration returns the edit to pending; it delivers
+	// FIRST, and only then is the handoff claimable.
+	if _, err := st.ReactivateConfigurationBlocked(ctx, 1, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	edit := snClaimOne(t, st, now.Add(time.Minute))
+	if edit.Intent.ID != root.Intent.ID {
+		t.Fatalf("claimed %s after reactivation, want the reactivated root edit %s", edit.Intent.ID, root.Intent.ID)
+	}
+	snDeliver(t, st, edit, "100.1", now.Add(time.Minute))
+	handoff := snClaimOne(t, st, now.Add(2*time.Minute))
+	if handoff.Intent.EffectClass != situationmodel.EffectBroadcastHandoff {
+		t.Fatalf("claimed %s after the root edit delivered, want the handoff", handoff.Intent.EffectClass)
+	}
+}
+
+func TestNotificationClaimBlockedReplyHoldsLaterHistoryInOrder(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	id, first := snSeedOneCycle(t, st, "review-blocked-reply", now)
+	snDeliver(t, st, snClaimOne(t, st, now), "100.1", now) // root
+	reply1 := snClaimOne(t, st, now)                       // journal entry #1
+	if reply1.Intent.EffectClass != situationmodel.EffectThreadAppend {
+		t.Fatalf("claimed %s, want the first journal entry", reply1.Intent.EffectClass)
+	}
+	if err := st.BlockNotificationConfiguration(ctx, reply1, "channel_not_found", now); err != nil {
+		t.Fatal(err)
+	}
+	// A later commit (an operator handoff) adds a root edit and a newer
+	// journal effect. The root edit is claimable (root projections come
+	// first); the newer effect is not, because the blocked older entry
+	// holds the queue.
+	now = now.Add(time.Minute)
+	snCommit(t, st, id, &first, now)
+	edit := snClaimOne(t, st, now)
+	if edit.Intent.EffectClass != situationmodel.EffectRootSync {
+		t.Fatalf("claimed %s, want the root edit", edit.Intent.EffectClass)
+	}
+	snDeliver(t, st, edit, "100.1", now)
+	if claims, err := st.ClaimNotificationIntents(ctx, snOwner, now, time.Minute, 25); err != nil || len(claims) != 0 {
+		t.Fatalf("claimed %v behind a blocked older journal entry (err=%v); reactivation must never deliver newer history before older", snClasses(claims), err)
+	}
+	if _, err := st.ReactivateConfigurationBlocked(ctx, 1, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := st.ClaimNotificationIntents(ctx, snOwner, now.Add(time.Minute), 5*time.Minute, 25)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("claimed %d after reactivation (err=%v), want the older entry:%s", len(claims), err, snDump(t, st))
+	}
+	older := claims[0]
+	if older.Intent.ID != reply1.Intent.ID {
+		t.Fatalf("claimed %s after reactivation, want the older entry %s first", older.Intent.ID, reply1.Intent.ID)
+	}
+	snDeliver(t, st, older, "100.3", now.Add(time.Minute))
+	newer := snClaimOne(t, st, now.Add(2*time.Minute))
+	if newer.Intent.EffectClass == situationmodel.EffectRootSync || *newer.Intent.TransitionSequence <= *reply1.Intent.TransitionSequence {
+		t.Fatalf("claimed %s #%d after the older entry delivered, want the newer journal effect",
+			newer.Intent.EffectClass, *newer.Intent.TransitionSequence)
+	}
+}
+
+// snDump renders every notification intent as one line per row, for
+// failure messages.
+func snDump(t *testing.T, st *Store) string {
+	t.Helper()
+	rows, err := st.db.QueryContext(context.Background(), `
+		SELECT id, effect_class, status, COALESCE(transition_sequence, 0), COALESCE(retry_at, ''), COALESCE(claim_owner, ''),
+		       COALESCE(last_error_class, ''), requires_root
+		FROM notification_intents ORDER BY created_at, id`)
+	if err != nil {
+		t.Fatalf("dump intents: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out strings.Builder
+	for rows.Next() {
+		var id, class, status, retryAt, owner, errClass string
+		var seq, requiresRoot int
+		if err := rows.Scan(&id, &class, &status, &seq, &retryAt, &owner, &errClass, &requiresRoot); err != nil {
+			t.Fatalf("scan intent: %v", err)
+		}
+		fmt.Fprintf(&out, "\n  %s class=%s status=%s seq=%d retry_at=%q owner=%q err=%q requires_root=%d",
+			id[:8], class, status, seq, retryAt, owner, errClass, requiresRoot)
+	}
+	return out.String()
 }

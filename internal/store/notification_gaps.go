@@ -506,29 +506,13 @@ type liveRootProjection struct {
 // reactivateBlockedRootSyncTx restores exactly one pending root projection
 // for situationID and reports how many blocked roots it reactivated (0 or 1).
 //
-// The newest live projection is the one corrected configuration should
-// deliver — it renders current state, and every older one would render state
-// already superseded by it. Two cases:
-//
-//   - The newest is ALREADY pending. It holds the slot and says everything
-//     the older blocked ones would; they stay blocked_configuration, which
-//     migration 0018 explicitly calls a resolved outcome ("never one already
-//     delivered/blocked/failed/withheld ... not live candidates a newer
-//     root_sync coalesces away"). Nothing is stranded: the pending projection
-//     delivers the root coordinates every dependent effect waits on.
-//
-//   - The newest is blocked. It is reactivated, and every older live
-//     projection is coalesced into it through Task 5's own
-//     supersedePendingRootSyncTx — the same supersession a newer commit
-//     performs. An older BLOCKED one reaches `superseded` the only way the
-//     schema permits, by being reactivated first: that is exactly what
-//     happened (corrected configuration returned it to pending) immediately
-//     followed by the newer projection coalescing it.
-//
-// The order is what keeps the unique index satisfied at every step: the
-// pre-existing pending row is retired first, then each older blocked row is
-// made pending and immediately coalesced, and only then does the keeper
-// become pending. At no point do two root projections hold the slot.
+// A newer root projection supersedes every older live one at commit
+// (supersedeLiveRootSyncTx), so a Situation normally holds ONE live root:
+// if it is pending, corrected configuration has nothing to do here — that
+// projection delivers the coordinates every dependent effect waits on; if
+// it is blocked, it becomes pending. Any older live projection that somehow
+// survived is coalesced into the newest one first, so migration 0018's
+// single-pending-root index is satisfied at every step.
 func reactivateBlockedRootSyncTx(ctx context.Context, tx *sql.Tx, situationID, nowStr string) (int, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT id, status FROM notification_intents
@@ -549,21 +533,8 @@ func reactivateBlockedRootSyncTx(ctx context.Context, tx *sql.Tx, situationID, n
 	if keeper.status == string(situationmodel.IntentPending) {
 		return 0, nil
 	}
-
-	// Retire whichever projection currently holds the pending slot, if any.
-	if err := supersedePendingRootSyncTx(ctx, tx, situationID, keeper.id); err != nil {
+	if err := supersedeLiveRootSyncTx(ctx, tx, situationID, keeper.id); err != nil {
 		return 0, err
-	}
-	for _, older := range live[:len(live)-1] {
-		if older.status != string(situationmodel.IntentBlockedConfiguration) {
-			continue // already retired by the supersession above
-		}
-		if err := setNotificationIntentPendingTx(ctx, tx, older.id, "blocked_configuration", nowStr); err != nil {
-			return 0, err
-		}
-		if err := supersedePendingRootSyncTx(ctx, tx, situationID, keeper.id); err != nil {
-			return 0, err
-		}
 	}
 	if err := setNotificationIntentPendingTx(ctx, tx, keeper.id, "blocked_configuration", nowStr); err != nil {
 		return 0, err

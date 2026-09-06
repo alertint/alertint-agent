@@ -124,6 +124,16 @@ func validateNotificationErrorClass(class string) error {
 //     Transition SEQUENCE (effect class decides only ties within one
 //     sequence), so a later immutable entry can never pass an
 //     earlier pending one — including one merely waiting out a retry delay.
+//     A blocked_configuration or failed effect still holds the head of
+//     that queue without being claimable itself: a handoff whose root edit
+//     never delivered is not claimable just because an OLDER root exists
+//     (an existing timestamp proves a root exists, not that this
+//     projection reached it), and a blocked reply holds every later reply
+//     so reactivation can never deliver newer history before older
+//     (review round 1, R1-F2). Only a live root projection can hold the
+//     queue: a newer root projection supersedes an older pending, blocked,
+//     OR failed one at commit (supersedeLiveRootSyncTx), so an obsolete
+//     root is never a permanent blocker.
 //
 // A gap generation gates the whole claim: while one is open nothing is
 // claimable at all (Slack is down and the recovery notice must precede the
@@ -271,6 +281,7 @@ func dueNotificationIntentIDsTx(ctx context.Context, tx *sql.Tx, gate deliveryGa
 			       ni.transition_sequence AS transition_sequence,
 			       `+notificationRootFirst+` AS root_first,
 			       `+notificationClassRank+` AS class_rank,
+			       (ni.status = 'pending') AS claimable,
 			       (ni.claim_owner IS NULL OR ni.lease_expires_at <= ?) AS unleased,
 			       (ni.retry_at IS NULL OR ni.retry_at <= ?) AS due,
 			       (ni.requires_root = 0 OR (s.slack_channel IS NOT NULL AND s.slack_root_ts IS NOT NULL)) AS root_ready,
@@ -280,10 +291,10 @@ func dueNotificationIntentIDsTx(ctx context.Context, tx *sql.Tx, gate deliveryGa
 			       ) AS rn
 			FROM notification_intents ni
 			LEFT JOIN situations s ON s.id = ni.situation_id
-			WHERE ni.status = 'pending'
+			WHERE ni.status IN ('pending', 'blocked_configuration', 'failed')
 		)
 		SELECT id FROM ranked
-		WHERE (situation_id IS NULL OR rn = 1) AND unleased AND due AND root_ready
+		WHERE (situation_id IS NULL OR rn = 1) AND claimable AND unleased AND due AND root_ready
 		`+notificationClaimOrder+`
 		LIMIT ?`, nowStr, nowStr, limit)
 	if err != nil {
@@ -404,7 +415,7 @@ func classifyLostNotificationClaim(ctx context.Context, q rowQueryer, intentID s
 //
 // One acknowledgement is honored even though its row is no longer pending:
 // a root projection that a concurrent controller commit SUPERSEDED while
-// this very claim was in flight (supersedePendingRootSyncTx clears the
+// this very claim was in flight (supersedeLiveRootSyncTx clears the
 // claim but keeps its token). Slack has already accepted that post; if the
 // Situation has no root yet, those coordinates ARE its root, and the
 // replacement projection must edit them, not post a second root. The row
@@ -671,7 +682,7 @@ func clearPendingRootForRedriveTx(ctx context.Context, tx *sql.Tx, situationID, 
 	if pendingCreatedAt > createdAt || (pendingCreatedAt == createdAt && pendingID > intentID) {
 		return ErrNewerRootProjectionPending
 	}
-	return supersedePendingRootSyncTx(ctx, tx, situationID, intentID)
+	return supersedeLiveRootSyncTx(ctx, tx, situationID, intentID)
 }
 
 // GetSituationRootCoordinates reads situationID's durable Slack root

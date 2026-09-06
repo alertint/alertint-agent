@@ -490,7 +490,7 @@ func insertNotificationIntentsTx(ctx context.Context, tx *sql.Tx, situationID st
 		if intent.EffectClass != situationmodel.EffectRootSync {
 			continue
 		}
-		if err := supersedePendingRootSyncTx(ctx, tx, situationID, intent.ID); err != nil {
+		if err := supersedeLiveRootSyncTx(ctx, tx, situationID, intent.ID); err != nil {
 			return err
 		}
 		break // PlanNotificationIntents never plans two root projections per commit.
@@ -503,13 +503,28 @@ func insertNotificationIntentsTx(ctx context.Context, tx *sql.Tx, situationID st
 	return nil
 }
 
-// supersedePendingRootSyncTx retires every currently-pending root_sync for
-// situationID in favour of replacementID. replacementID is inserted later
-// in this same transaction, so foreign-key enforcement is deferred to
-// COMMIT for the duration: the self-referencing replacement_intent_id FK
-// and the "at most one pending root_sync" index would otherwise make the
-// two writes impossible to order. Deferral changes when a violation is
-// reported, never whether the transaction is atomic.
+// supersedeLiveRootSyncTx retires every LIVE root_sync for situationID —
+// pending, configuration-blocked, or failed — in favour of replacementID
+// (itself excluded, so a caller may name a row that already exists).
+// spec.md: "Older root projections for the same Situation may become
+// superseded by the latest root sync." Retiring the blocked and failed ones
+// too, not only the pending one, is what keeps an obsolete projection from
+// holding its Situation's queue forever: a blocked or failed root still
+// ranks at the head of the claim order (ClaimNotificationIntents, review
+// round 1 R1-F2), and a newer projection renders everything it would have,
+// so the delivery obligation continues in the replacement rather than
+// waiting on a reactivation or redrive of state nobody wants on screen.
+// The invariant this leaves is one live root projection per Situation.
+// Migration 0020 owns the trigger that permits exactly these three source
+// statuses; a delivered, withheld, or already-superseded row still never
+// becomes superseded.
+//
+// replacementID may be inserted later in this same transaction, so
+// foreign-key enforcement is deferred to COMMIT for the duration: the
+// self-referencing replacement_intent_id FK and the "at most one pending
+// root_sync" index would otherwise make the two writes impossible to
+// order. Deferral changes when a violation is reported, never whether the
+// transaction is atomic.
 //
 // FOR THE NOTIFICATION WORKER: superseding CLEARS the intent's
 // claim_owner/lease_expires_at (migration 0018's
@@ -527,14 +542,16 @@ func insertNotificationIntentsTx(ctx context.Context, tx *sql.Tx, situationID st
 // instead of posting a second root. Supersession is performed here, inside
 // the authoritative commit, precisely because the pending-root index makes
 // it unorderable anywhere else; the worker must not reimplement it.
-func supersedePendingRootSyncTx(ctx context.Context, tx *sql.Tx, situationID, replacementID string) error {
-	var pending int
+func supersedeLiveRootSyncTx(ctx context.Context, tx *sql.Tx, situationID, replacementID string) error {
+	var live int
 	if err := tx.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM notification_intents
-		WHERE situation_id = ? AND effect_class = 'root_sync' AND status = 'pending'`, situationID).Scan(&pending); err != nil {
-		return fmt.Errorf("store: count pending root projections: %w", err)
+		WHERE situation_id = ? AND effect_class = 'root_sync'
+		  AND status IN ('pending', 'blocked_configuration', 'failed') AND id <> ?`,
+		situationID, replacementID).Scan(&live); err != nil {
+		return fmt.Errorf("store: count live root projections: %w", err)
 	}
-	if pending == 0 {
+	if live == 0 {
 		return nil
 	}
 	if _, err := tx.ExecContext(ctx, `PRAGMA defer_foreign_keys = ON`); err != nil {
@@ -544,9 +561,10 @@ func supersedePendingRootSyncTx(ctx context.Context, tx *sql.Tx, situationID, re
 		UPDATE notification_intents
 		SET status = 'superseded', supersession_reason = ?, replacement_intent_id = ?,
 		    claim_owner = NULL, lease_expires_at = NULL, retry_at = NULL
-		WHERE situation_id = ? AND effect_class = 'root_sync' AND status = 'pending'`,
-		SupersessionReasonNewerRootProjection, replacementID, situationID); err != nil {
-		return fmt.Errorf("store: supersede pending root projections: %w", err)
+		WHERE situation_id = ? AND effect_class = 'root_sync'
+		  AND status IN ('pending', 'blocked_configuration', 'failed') AND id <> ?`,
+		SupersessionReasonNewerRootProjection, replacementID, situationID, replacementID); err != nil {
+		return fmt.Errorf("store: supersede live root projections: %w", err)
 	}
 	return nil
 }
