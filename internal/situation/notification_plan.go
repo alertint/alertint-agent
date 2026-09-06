@@ -51,19 +51,24 @@ type PublicationInput struct {
 //
 //   - one coalescible `root_sync` carrying the current Episode-summary
 //     version and the committed contract deadline it renders (R4);
-//   - one immutable `thread_append` per journaled Transition, in sequence
-//     order, each rendering only its own Transition's stored journal data;
-//   - at most one `broadcast_handoff` — the single new main-channel poke a
-//     commit may create, when the permitted poke class allows it, the
-//     repage cooldown has elapsed for the one class it gates, and the root
-//     is already published (an unpublished root's first post IS the poke);
+//   - exactly one immutable reply per journaled Transition, in sequence
+//     order, each rendering only its own Transition's stored journal data:
+//     `thread_append` for a quiet entry, or `broadcast_handoff` for the one
+//     Transition (at most) that may create a new main-channel poke — when
+//     the permitted poke class allows it, the repage cooldown has elapsed
+//     for the one class it gates, and the root is already published (an
+//     unpublished root's first post IS the poke). The two classes render
+//     the same journal data, so a poked Transition never also gets a
+//     thread entry: that would post it to Slack twice;
 //   - on a non-material cycle, only the R4 deadline refresh, and only when
 //     the root is published, its last delivered promise has passed, and
 //     this commit carries a different deadline.
 //
 // A poke below the operator's Slack floor becomes a durable
 // `withheld_by_operator_slack_floor` decision, never an absent row, and the
-// floor never suppresses a non-broadcast journal entry.
+// floor never suppresses a non-broadcast journal entry — a withheld
+// broadcast is therefore the one case where a Transition carries two
+// intents, of which only the quiet thread entry is ever delivered.
 func PlanNotificationIntents(in PublicationInput) ([]model.NotificationIntent, error) {
 	if err := validatePublicationInput(in); err != nil {
 		return nil, err
@@ -93,29 +98,51 @@ func PlanNotificationIntents(in PublicationInput) ([]model.NotificationIntent, e
 	}
 	out = append(out, root)
 
-	// Immutable journal entries, one per journaled Transition, in sequence
-	// order. These are never pokes and never carry a summary version.
-	for _, tr := range in.Transitions {
-		if tr.JournalKind == model.JournalNone {
-			continue
-		}
-		out = append(out, newIntent(in, model.EffectThreadAppend, tr, threadKey(model.EffectThreadAppend, in.Situation.ID, tr.Sequence)))
-	}
-
 	// At most one new main-channel poke per commit, and none at all when
-	// the root post above already is one.
+	// the root post above already is one. Deciding this BEFORE the journal
+	// loop is what keeps a poked Transition from being delivered twice.
+	pokeSequence := 0
 	if !rootPoke {
 		if poke, ok := selectPoke(in); ok {
-			priority := DeriveInterruptionPriority(poke)
-			broadcast := newIntent(in, model.EffectBroadcastHandoff, poke,
-				threadKey(model.EffectBroadcastHandoff, in.Situation.ID, poke.Sequence))
-			broadcast.MainChannelPoke = true
-			broadcast.InterruptionPriority = &priority
-			if !MeetsSlackFloor(priority, in.SlackFloor) {
-				broadcast.Status = model.IntentWithheld
-			}
-			out = append(out, broadcast)
+			pokeSequence = poke.Sequence
 		}
+	}
+
+	// Immutable journal entries, one per journaled Transition, in sequence
+	// order. Each Transition produces exactly ONE reply: the poked one is
+	// broadcast (a handoff edits the root and then creates one broadcast
+	// reply), every other one is a quiet thread entry. Both classes render
+	// the same stored journal data, so emitting both for one Transition
+	// would post it to Slack twice.
+	for _, tr := range in.Transitions {
+		poked := pokeSequence != 0 && tr.Sequence == pokeSequence
+		if tr.JournalKind == model.JournalNone && !poked {
+			continue
+		}
+		if !poked {
+			out = append(out, newIntent(in, model.EffectThreadAppend, tr,
+				threadKey(model.EffectThreadAppend, in.Situation.ID, tr.Sequence)))
+			continue
+		}
+
+		priority := DeriveInterruptionPriority(tr)
+		broadcast := newIntent(in, model.EffectBroadcastHandoff, tr,
+			threadKey(model.EffectBroadcastHandoff, in.Situation.ID, tr.Sequence))
+		broadcast.MainChannelPoke = true
+		broadcast.InterruptionPriority = &priority
+		if MeetsSlackFloor(priority, in.SlackFloor) {
+			out = append(out, broadcast)
+			continue
+		}
+		// Below the operator's floor the poke is withheld as a durable
+		// decision, never an absent row — but the floor "never suppresses
+		// ... a non-broadcast journal entry", so the same Transition still
+		// gets its quiet thread entry. Only one of the two is ever
+		// delivered, so this is not the duplicate the branch above avoids.
+		broadcast.Status = model.IntentWithheld
+		out = append(out,
+			newIntent(in, model.EffectThreadAppend, tr, threadKey(model.EffectThreadAppend, in.Situation.ID, tr.Sequence)),
+			broadcast)
 	}
 
 	for i := range out {

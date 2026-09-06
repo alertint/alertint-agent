@@ -77,6 +77,20 @@ func hsIntentsOfClass(intents []model.NotificationIntent, class model.EffectClas
 	return out
 }
 
+// hsReplyIntents returns the in-thread journal replies in planned order,
+// across BOTH reply classes: spec's "immutable journal replies deliver in
+// Transition-sequence order" applies to the combined set, and exactly one
+// reply exists per journaled Transition.
+func hsReplyIntents(intents []model.NotificationIntent) []model.NotificationIntent {
+	out := []model.NotificationIntent{}
+	for _, i := range intents {
+		if i.EffectClass == model.EffectThreadAppend || i.EffectClass == model.EffectBroadcastHandoff {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
 // ----------------------------------------------------------------------
 // Roots.
 // ----------------------------------------------------------------------
@@ -261,25 +275,35 @@ func TestPlanNotificationIntentsJournalAppendsInSequenceOrder(t *testing.T) {
 	trs, sum := hsCommitOf(t, c)
 	got := hsPlan(t, hsPub(c, trs, sum))
 
-	threads := hsIntentsOfClass(got, model.EffectThreadAppend)
-	if len(threads) != len(trs) {
-		t.Fatalf("got %d thread entries, want one per journaled transition (%d)", len(threads), len(trs))
+	// Exactly one reply per journaled Transition, across BOTH reply
+	// classes, in Transition-sequence order: the two artifacts as quiet
+	// thread entries, the escalating controller-state Transition as the one
+	// broadcast — never both for the same Transition.
+	replies := hsReplyIntents(got)
+	if len(replies) != len(trs) {
+		t.Fatalf("got %d journal replies, want exactly one per journaled transition (%d)", len(replies), len(trs))
 	}
-	for i, intent := range threads {
+	wantClasses := []model.EffectClass{
+		model.EffectThreadAppend, model.EffectThreadAppend, model.EffectBroadcastHandoff,
+	}
+	for i, intent := range replies {
 		if intent.TransitionID == nil || *intent.TransitionID != trs[i].ID {
-			t.Errorf("thread entry %d references %v, want %q", i, intent.TransitionID, trs[i].ID)
+			t.Errorf("reply %d references %v, want %q", i, intent.TransitionID, trs[i].ID)
 		}
 		if intent.TransitionSequence == nil || *intent.TransitionSequence != trs[i].Sequence {
-			t.Errorf("thread entry %d sequence = %v, want %d", i, intent.TransitionSequence, trs[i].Sequence)
+			t.Errorf("reply %d sequence = %v, want %d", i, intent.TransitionSequence, trs[i].Sequence)
+		}
+		if intent.EffectClass != wantClasses[i] {
+			t.Errorf("reply %d class = %q, want %q", i, intent.EffectClass, wantClasses[i])
 		}
 		if !intent.RequiresRoot {
-			t.Errorf("thread entry %d must wait for durable root coordinates", i)
+			t.Errorf("reply %d must wait for durable root coordinates", i)
 		}
-		if intent.MainChannelPoke {
-			t.Errorf("thread entry %d must never be a poke", i)
+		if intent.MainChannelPoke != (intent.EffectClass == model.EffectBroadcastHandoff) {
+			t.Errorf("reply %d poke flag %v does not match its class %q", i, intent.MainChannelPoke, intent.EffectClass)
 		}
 		if intent.SummaryVersion != nil {
-			t.Errorf("thread entry %d must render its own transition, not a summary version", i)
+			t.Errorf("reply %d must render its own transition, not a summary version", i)
 		}
 	}
 }
@@ -290,13 +314,18 @@ func TestPlanNotificationIntentsOperatorHandoffBroadcast(t *testing.T) {
 	trs, sum := hsCommitOf(t, c)
 	got := hsPlan(t, hsPub(c, trs, sum))
 
-	threads := hsIntentsOfClass(got, model.EffectThreadAppend)
-	if len(threads) != 1 {
-		t.Fatalf("got %d thread entries, want exactly one journal entry", len(threads))
-	}
 	broadcasts := hsIntentsOfClass(got, model.EffectBroadcastHandoff)
 	if len(broadcasts) != 1 {
 		t.Fatalf("got %d broadcast effects, want at most one (and exactly one here)", len(broadcasts))
+	}
+	// "A handoff edits the root first and then creates ONE broadcast reply"
+	// — the handoff Transition's journal entry is that broadcast, never a
+	// broadcast plus a duplicate quiet thread reply of the same content.
+	if threads := hsIntentsOfClass(got, model.EffectThreadAppend); len(threads) != 0 {
+		t.Fatalf("got %d thread entries alongside the broadcast, want 0 — the same journal data would post twice", len(threads))
+	}
+	if replies := hsReplyIntents(got); len(replies) != len(trs) {
+		t.Fatalf("got %d journal replies for %d journaled transitions, want exactly one each", len(replies), len(trs))
 	}
 	if !broadcasts[0].MainChannelPoke {
 		t.Error("the handoff broadcast must be the main-channel poke")
@@ -360,6 +389,20 @@ func TestPlanNotificationIntentsAtMostOneBroadcastPerCommit(t *testing.T) {
 			if !broadcasts[0].MainChannelPoke || broadcasts[0].InterruptionPriority == nil {
 				t.Error("the escalation broadcast must be a poke carrying its evaluated priority")
 			}
+			// One reply per journaled Transition: the artifacts as quiet
+			// thread entries, the escalation as the broadcast — and never a
+			// thread entry duplicating the broadcast's own Transition.
+			threads := hsIntentsOfClass(got, model.EffectThreadAppend)
+			if len(threads) != len(tc.artifacts) {
+				t.Errorf("got %d thread entries, want one per artifact (%d)", len(threads), len(tc.artifacts))
+			}
+			for _, thread := range threads {
+				if thread.TransitionSequence != nil && broadcasts[0].TransitionSequence != nil &&
+					*thread.TransitionSequence == *broadcasts[0].TransitionSequence {
+					t.Errorf("transition sequence %d has both a thread entry and a broadcast; it would post twice",
+						*thread.TransitionSequence)
+				}
+			}
 			// The broadcast must name the controller-state Transition (last
 			// in the commit, per R1) — the same authority the root_sync
 			// references — never an artifact Transition.
@@ -381,23 +424,78 @@ func TestPlanNotificationIntentsAtMostOneBroadcastPerCommit(t *testing.T) {
 // escalation must produce the same poke with and without an operator
 // artifact journaled ahead of it in the same commit.
 func TestPlanNotificationIntentsEscalationSurvivesJournaledArtifacts(t *testing.T) {
-	escalate := func(t *testing.T, artifacts []OperatorArtifactInput) int {
+	escalate := func(t *testing.T, artifacts []OperatorArtifactInput) (broadcasts, threads, replies, journaled int) {
 		t.Helper()
 		c := hsNext(t)
 		c.Situation.Attention = model.AttentionUrgent
 		c.Assessment.Attention = model.AttentionUrgent
 		c.OperatorArtifacts = artifacts
 		trs, sum := hsCommitOf(t, c)
-		return len(hsIntentsOfClass(hsPlan(t, hsPub(c, trs, sum)), model.EffectBroadcastHandoff))
+		got := hsPlan(t, hsPub(c, trs, sum))
+		return len(hsIntentsOfClass(got, model.EffectBroadcastHandoff)),
+			len(hsIntentsOfClass(got, model.EffectThreadAppend)),
+			len(hsReplyIntents(got)), len(trs)
 	}
 
-	without := escalate(t, nil)
-	with := escalate(t, []OperatorArtifactInput{hsArtifact("input-1", artifactKindAnnotation, hsNow(t))})
-	if without != 1 {
-		t.Fatalf("urgent escalation alone produced %d broadcasts, want 1", without)
+	withoutB, withoutT, withoutR, withoutN := escalate(t, nil)
+	withB, withT, withR, withN := escalate(t, []OperatorArtifactInput{hsArtifact("input-1", artifactKindAnnotation, hsNow(t))})
+
+	if withoutB != 1 {
+		t.Fatalf("urgent escalation alone produced %d broadcasts, want 1", withoutB)
 	}
-	if with != without {
-		t.Errorf("a journaled operator artifact changed the escalation poke: %d broadcasts with, %d without", with, without)
+	if withB != withoutB {
+		t.Errorf("a journaled operator artifact changed the escalation poke: %d broadcasts with, %d without", withB, withoutB)
+	}
+	if withoutT != 0 {
+		t.Errorf("the escalation alone produced %d thread entries, want 0 — the broadcast IS its journal entry", withoutT)
+	}
+	if withT != 1 {
+		t.Errorf("got %d thread entries, want exactly the artifact's own", withT)
+	}
+	if withoutR != withoutN || withR != withN {
+		t.Errorf("journal replies (%d for %d transitions, %d for %d) must be exactly one per journaled transition",
+			withoutR, withoutN, withR, withN)
+	}
+}
+
+// TestPlanNotificationIntentsPokedTransitionIsBroadcastOnly is the direct
+// regression: in a commit with two journaled Transitions where the second
+// qualifies as a poke, the artifact gets a thread entry, the poked
+// controller-state Transition gets a broadcast, and neither Transition ever
+// gets both. Task 6 renders both classes from the same stored journal data,
+// so a Transition carrying both would be posted to Slack twice.
+func TestPlanNotificationIntentsPokedTransitionIsBroadcastOnly(t *testing.T) {
+	c := hsNext(t)
+	c.Assessment.ActionContract = hsOperatorContract(c.Now.Add(time.Minute))
+	c.OperatorArtifacts = []OperatorArtifactInput{hsArtifact("input-1", artifactKindAnnotation, hsNow(t))}
+	trs, sum := hsCommitOf(t, c)
+	if len(trs) != 2 {
+		t.Fatalf("fixture built %d transitions, want the artifact plus the handoff", len(trs))
+	}
+	artifact, handoff := trs[0], trs[1]
+
+	got := hsPlan(t, hsPub(c, trs, sum))
+	replies := hsReplyIntents(got)
+	if len(replies) != 2 {
+		t.Fatalf("got %d journal replies, want exactly one per journaled transition: %+v", len(replies), replies)
+	}
+	if replies[0].EffectClass != model.EffectThreadAppend || *replies[0].TransitionID != artifact.ID {
+		t.Errorf("reply 0 = %q for %v, want a thread_append for the artifact %q",
+			replies[0].EffectClass, replies[0].TransitionID, artifact.ID)
+	}
+	if replies[1].EffectClass != model.EffectBroadcastHandoff || *replies[1].TransitionID != handoff.ID {
+		t.Errorf("reply 1 = %q for %v, want a broadcast_handoff for the handoff %q",
+			replies[1].EffectClass, replies[1].TransitionID, handoff.ID)
+	}
+	// Sequence order is preserved across the combined reply set.
+	if *replies[0].TransitionSequence >= *replies[1].TransitionSequence {
+		t.Errorf("replies are out of transition-sequence order: %d then %d",
+			*replies[0].TransitionSequence, *replies[1].TransitionSequence)
+	}
+	for _, intent := range hsIntentsOfClass(got, model.EffectThreadAppend) {
+		if *intent.TransitionID == handoff.ID {
+			t.Error("the poked transition also got a thread entry; its journal data would post twice")
+		}
 	}
 }
 
