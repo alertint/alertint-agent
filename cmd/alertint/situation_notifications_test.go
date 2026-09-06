@@ -13,6 +13,7 @@ import (
 	slacklib "github.com/slack-go/slack"
 
 	"github.com/alertint/alertint-agent/internal/notify/slack"
+	"github.com/alertint/alertint-agent/internal/situation"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
 )
@@ -177,7 +178,7 @@ type fakeDelivererStore struct {
 	rootOK      bool
 	rootErr     error
 
-	gap    GapSnapshot
+	gap    store.GapSnapshot
 	gapErr error
 }
 
@@ -220,9 +221,9 @@ func (f *fakeDelivererStore) GetSituationRootCoordinates(context.Context, string
 	return f.rootChannel, f.rootTS, f.rootOK, nil
 }
 
-func (f *fakeDelivererStore) GetDeliveryGap(context.Context, string) (GapSnapshot, error) {
+func (f *fakeDelivererStore) GetDeliveryGap(context.Context, string) (store.GapSnapshot, error) {
 	if f.gapErr != nil {
-		return GapSnapshot{}, f.gapErr
+		return store.GapSnapshot{}, f.gapErr
 	}
 	return f.gap, nil
 }
@@ -291,7 +292,7 @@ func TestSituationDelivererRootSyncPostsFirstRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Deliver() error = %v", err)
 	}
-	if got != (NotificationDelivery{Channel: "C-root", MessageTS: "100.1", DeliveredAs: "root"}) {
+	if got != (situation.NotificationDelivery{Channel: "C-root", MessageTS: "100.1", DeliveredAs: "root"}) {
 		t.Fatalf("Deliver() = %+v, want the posted root coordinates", got)
 	}
 	if len(api.posts) != 1 || len(api.updates) != 0 {
@@ -523,7 +524,7 @@ func TestSituationDelivererGapRecoveryPostsSystemNotice(t *testing.T) {
 	recovered := sdMustTime(t, "2026-09-05T09:10:00Z")
 	now := recovered
 
-	fs := &fakeDelivererStore{gap: GapSnapshot{
+	fs := &fakeDelivererStore{gap: store.GapSnapshot{
 		ID: "gap-1", OpenedAt: opened, RecoveredAt: recovered, AffectedSituationCount: 2, DelayedEffectCount: 5,
 	}}
 	api := &fakeSlackAPI{postResult: slack.MessageResult{Channel: "C-default", TS: "70.7"}}
@@ -534,7 +535,7 @@ func TestSituationDelivererGapRecoveryPostsSystemNotice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Deliver() error = %v", err)
 	}
-	if got != (NotificationDelivery{Channel: "C-default", MessageTS: "70.7", DeliveredAs: "system"}) {
+	if got != (situation.NotificationDelivery{Channel: "C-default", MessageTS: "70.7", DeliveredAs: "system"}) {
 		t.Fatalf("Deliver() = %+v, want the posted system notice coordinates", got)
 	}
 	if len(api.posts) != 1 || api.posts[0].Channel != "C-default" {

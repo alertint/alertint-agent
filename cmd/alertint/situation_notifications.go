@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/notify/slack"
+	"github.com/alertint/alertint-agent/internal/situation"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
 )
@@ -25,50 +26,33 @@ import (
 // tracking, and acknowledging the result back into the Store are Task 7's
 // notification worker, not this file.
 //
-// NotificationDelivery below is a TEMPORARY stand-in. The plan's
-// Cross-Task Contracts define `NotificationDelivery{Channel, MessageTS,
-// DeliveredAs}` and `NotificationDeliverer{Probe, Deliver}` in
-// internal/situation/notification_worker.go — which is Task 7's file and
-// does not exist yet. This type carries EXACTLY those field names and
-// shapes so Task 7's dispatch can replace this file's `NotificationDelivery`
-// references with `situation.NotificationDelivery` (and delete this local
-// definition) as a mechanical rename, with no other change to
-// SituationDeliverer's logic expected.
+// Task 7 alignment: the delivery result and deliverer contract now live
+// where the plan's Cross-Task Contracts put them —
+// situation.NotificationDelivery and situation.NotificationDeliverer — and
+// the gap-rendering snapshot is store.GapSnapshot; this file's own
+// placeholders for all three are retired. SituationDeliverer's rendering
+// and Slack-call logic is unchanged by that alignment. What it gained is
+// classifyDeliveryError below, which translates one failed call into the
+// closed situation.DeliveryFailure classification the worker resolves its
+// retry / configuration-block / fail outcome from. That translation lives
+// here on purpose: this package already owns the Slack wire, so
+// internal/situation stays free of any Slack dependency.
 // ----------------------------------------------------------------------
 
-// NotificationDelivery is the durable Slack coordinate and delivery shape
-// one Deliver call returns. DeliveredAs is one of: root | thread |
-// broadcast | delayed_thread | system.
-type NotificationDelivery struct {
-	Channel     string
-	MessageTS   string
-	DeliveredAs string
-}
-
-// GapSnapshot is the durable installation-level Delivery-gap generation
-// RenderDeliveryGapNotice renders one recovery notice from: opened_at,
-// recovered_at, and the affected/delayed counts recorded on
-// slack_delivery_gaps (migration 0018). No Task 5 reader exposes this
-// table today (Task 5's situation_views.go covers Situation/Transition/
-// intent reads only); Task 7's internal/store/notification_gaps.go is
-// expected to add a matching GetDeliveryGap(ctx, id) (GapSnapshot, error)
-// reader on *store.Store so it satisfies DelivererStore unchanged.
-type GapSnapshot struct {
-	ID                     string
-	OpenedAt               time.Time
-	RecoveredAt            time.Time
-	AffectedSituationCount int
-	DelayedEffectCount     int
-}
+// Compile-time proof of the assembly this task closes: the Slack adapter is
+// a situation.NotificationDeliverer, and *store.Store satisfies both this
+// file's reader contract and the worker's whole durable contract.
+var (
+	_ situation.NotificationDeliverer = (*SituationDeliverer)(nil)
+	_ DelivererStore                  = (*store.Store)(nil)
+	_ situation.NotificationStore     = (*store.Store)(nil)
+)
 
 // DelivererStore is exactly what SituationDeliverer reads. The first three
-// methods are Task 5's existing bounded readers
-// (internal/store/situation_views.go) — *store.Store already satisfies
-// them. The last two are new readers this task's design found missing (see
-// their own doc comments): Task 7 (or a follow-up to Task 5) is expected to
-// add them to *store.Store with exactly these signatures so *store.Store
-// satisfies DelivererStore unchanged; this task's own tests exercise
-// SituationDeliverer against a hand-rolled fake instead.
+// methods are Task 5's bounded readers (internal/store/situation_views.go);
+// the last two are Task 7's (internal/store/situation_notifications.go and
+// internal/store/notification_gaps.go). *store.Store satisfies all five —
+// asserted above.
 type DelivererStore interface {
 	GetSituationEpisodeView(ctx context.Context, situationID string) (store.SituationEpisodeView, error)
 	GetSituationTransition(ctx context.Context, transitionID string) (model.Transition, error)
@@ -80,7 +64,7 @@ type DelivererStore interface {
 	GetSituationRootCoordinates(ctx context.Context, situationID string) (channel, messageTS string, ok bool, err error)
 
 	// GetDeliveryGap reads one durable gap generation's rendering facts.
-	GetDeliveryGap(ctx context.Context, gapGeneration string) (GapSnapshot, error)
+	GetDeliveryGap(ctx context.Context, gapGeneration string) (store.GapSnapshot, error)
 }
 
 // slackDeliveryAPI is exactly what SituationDeliverer calls on the narrow
@@ -130,9 +114,20 @@ func (d *SituationDeliverer) Probe(ctx context.Context) error {
 // exact durable records it references through DelivererStore. It never
 // decides whether a root is durably delivered before a reply is claimable
 // (Task 7's ordering) and never writes Store state itself.
-func (d *SituationDeliverer) Deliver(ctx context.Context, intent model.NotificationIntent) (NotificationDelivery, error) {
+func (d *SituationDeliverer) Deliver(ctx context.Context, intent model.NotificationIntent) (situation.NotificationDelivery, error) {
+	delivery, err := d.deliver(ctx, intent)
+	if err != nil {
+		return situation.NotificationDelivery{}, classifyDeliveryError(err)
+	}
+	return delivery, nil
+}
+
+// deliver is Deliver's undecorated body: it renders and sends, and returns
+// raw errors that Deliver classifies on the way out.
+func (d *SituationDeliverer) deliver(ctx context.Context, intent model.NotificationIntent) (situation.NotificationDelivery, error) {
 	if err := intent.Validate(); err != nil {
-		return NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: %w", err)
+		return situation.NotificationDelivery{}, invalidDelivery("invalid_intent",
+			fmt.Errorf("cmd/alertint: situation deliverer: %w", err))
 	}
 	switch intent.EffectClass {
 	case model.EffectRootSync:
@@ -144,7 +139,8 @@ func (d *SituationDeliverer) Deliver(ctx context.Context, intent model.Notificat
 	case model.EffectInstallationGapRecovery:
 		return d.deliverGapRecovery(ctx, intent)
 	default:
-		return NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: unknown effect class %q", intent.EffectClass)
+		return situation.NotificationDelivery{}, invalidDelivery("unknown_effect_class",
+			fmt.Errorf("cmd/alertint: situation deliverer: unknown effect class %q", intent.EffectClass))
 	}
 }
 
@@ -152,22 +148,23 @@ func (d *SituationDeliverer) Deliver(ctx context.Context, intent model.Notificat
 // (including the R4 deadline refresh, which is a plain chat.update): the
 // selected Episode-summary version renders only from GetSituationEpisodeView's
 // own coherent (summary, source Transition) pair.
-func (d *SituationDeliverer) deliverRootSync(ctx context.Context, intent model.NotificationIntent) (NotificationDelivery, error) {
+func (d *SituationDeliverer) deliverRootSync(ctx context.Context, intent model.NotificationIntent) (situation.NotificationDelivery, error) {
 	if intent.SituationID == nil || intent.SummaryVersion == nil {
-		return NotificationDelivery{}, errors.New("cmd/alertint: situation deliverer: root_sync intent missing situation_id/summary_version")
+		return situation.NotificationDelivery{}, invalidDelivery("incomplete_intent",
+			errors.New("cmd/alertint: situation deliverer: root_sync intent missing situation_id/summary_version"))
 	}
 	view, err := d.store.GetSituationEpisodeView(ctx, *intent.SituationID)
 	if err != nil {
-		return NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load episode view: %w", err)
+		return situation.NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load episode view: %w", err)
 	}
 	if view.Summary.Version != *intent.SummaryVersion {
-		return NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: intent names summary version %d, current is %d",
+		return situation.NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: intent names summary version %d, current is %d",
 			*intent.SummaryVersion, view.Summary.Version)
 	}
 
 	recoveryEverObserved, err := d.recoveryEverObserved(ctx, view)
 	if err != nil {
-		return NotificationDelivery{}, err
+		return situation.NotificationDelivery{}, err
 	}
 
 	rendered, err := slack.RenderSituationRoot(slack.SituationRootInput{
@@ -178,12 +175,13 @@ func (d *SituationDeliverer) deliverRootSync(ctx context.Context, intent model.N
 		RecoveryEverObserved: recoveryEverObserved,
 	})
 	if err != nil {
-		return NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: render root: %w", err)
+		return situation.NotificationDelivery{}, invalidDelivery("render_failed",
+			fmt.Errorf("cmd/alertint: situation deliverer: render root: %w", err))
 	}
 
 	channel, ts, ok, err := d.store.GetSituationRootCoordinates(ctx, *intent.SituationID)
 	if err != nil {
-		return NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load root coordinates: %w", err)
+		return situation.NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load root coordinates: %w", err)
 	}
 	if !ok {
 		res, err := d.api.PostMessage(ctx, slack.PostMessageRequest{
@@ -193,9 +191,9 @@ func (d *SituationDeliverer) deliverRootSync(ctx context.Context, intent model.N
 			ClientMsgID: intent.ClientMessageID,
 		})
 		if err != nil {
-			return NotificationDelivery{}, err
+			return situation.NotificationDelivery{}, err
 		}
-		return NotificationDelivery{Channel: res.Channel, MessageTS: res.TS, DeliveredAs: "root"}, nil
+		return situation.NotificationDelivery{Channel: res.Channel, MessageTS: res.TS, DeliveredAs: "root"}, nil
 	}
 	res, err := d.api.UpdateMessage(ctx, slack.UpdateMessageRequest{
 		Channel:     channel,
@@ -205,32 +203,34 @@ func (d *SituationDeliverer) deliverRootSync(ctx context.Context, intent model.N
 		ClientMsgID: intent.ClientMessageID,
 	})
 	if err != nil {
-		return NotificationDelivery{}, err
+		return situation.NotificationDelivery{}, err
 	}
-	return NotificationDelivery{Channel: res.Channel, MessageTS: res.TS, DeliveredAs: "root"}, nil
+	return situation.NotificationDelivery{Channel: res.Channel, MessageTS: res.TS, DeliveredAs: "root"}, nil
 }
 
 // deliverThreadAppend appends one immutable journal entry to the
 // Situation's existing root thread, rendering only from its own referenced
 // Transition.
-func (d *SituationDeliverer) deliverThreadAppend(ctx context.Context, intent model.NotificationIntent) (NotificationDelivery, error) {
+func (d *SituationDeliverer) deliverThreadAppend(ctx context.Context, intent model.NotificationIntent) (situation.NotificationDelivery, error) {
 	if intent.SituationID == nil || intent.TransitionID == nil {
-		return NotificationDelivery{}, errors.New("cmd/alertint: situation deliverer: thread_append intent missing situation_id/transition_id")
+		return situation.NotificationDelivery{}, invalidDelivery("incomplete_intent",
+			errors.New("cmd/alertint: situation deliverer: thread_append intent missing situation_id/transition_id"))
 	}
 	tr, err := d.store.GetSituationTransition(ctx, *intent.TransitionID)
 	if err != nil {
-		return NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load transition: %w", err)
+		return situation.NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load transition: %w", err)
 	}
 	channel, rootTS, ok, err := d.store.GetSituationRootCoordinates(ctx, *intent.SituationID)
 	if err != nil {
-		return NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load root coordinates: %w", err)
+		return situation.NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load root coordinates: %w", err)
 	}
 	if !ok {
-		return NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: situation %s has no delivered root to reply under", *intent.SituationID)
+		return situation.NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: situation %s has no delivered root to reply under", *intent.SituationID)
 	}
 	rendered, err := slack.RenderSituationJournal(tr)
 	if err != nil {
-		return NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: render journal: %w", err)
+		return situation.NotificationDelivery{}, invalidDelivery("render_failed",
+			fmt.Errorf("cmd/alertint: situation deliverer: render journal: %w", err))
 	}
 	res, err := d.api.PostMessage(ctx, slack.PostMessageRequest{
 		Channel:     channel,
@@ -240,9 +240,9 @@ func (d *SituationDeliverer) deliverThreadAppend(ctx context.Context, intent mod
 		ClientMsgID: intent.ClientMessageID,
 	})
 	if err != nil {
-		return NotificationDelivery{}, err
+		return situation.NotificationDelivery{}, err
 	}
-	return NotificationDelivery{Channel: res.Channel, MessageTS: res.TS, DeliveredAs: "thread"}, nil
+	return situation.NotificationDelivery{Channel: res.Channel, MessageTS: res.TS, DeliveredAs: "thread"}, nil
 }
 
 // deliverBroadcastHandoff optionally broadcasts a current handoff.
@@ -252,24 +252,25 @@ func (d *SituationDeliverer) deliverThreadAppend(ctx context.Context, intent mod
 // newer Transition has since superseded it, the same Transition is
 // delivered instead as a plain, delayed, no-longer-current thread reply —
 // never a channel broadcast.
-func (d *SituationDeliverer) deliverBroadcastHandoff(ctx context.Context, intent model.NotificationIntent) (NotificationDelivery, error) {
+func (d *SituationDeliverer) deliverBroadcastHandoff(ctx context.Context, intent model.NotificationIntent) (situation.NotificationDelivery, error) {
 	if intent.SituationID == nil || intent.TransitionID == nil {
-		return NotificationDelivery{}, errors.New("cmd/alertint: situation deliverer: broadcast_handoff intent missing situation_id/transition_id")
+		return situation.NotificationDelivery{}, invalidDelivery("incomplete_intent",
+			errors.New("cmd/alertint: situation deliverer: broadcast_handoff intent missing situation_id/transition_id"))
 	}
 	tr, err := d.store.GetSituationTransition(ctx, *intent.TransitionID)
 	if err != nil {
-		return NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load transition: %w", err)
+		return situation.NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load transition: %w", err)
 	}
 	channel, rootTS, ok, err := d.store.GetSituationRootCoordinates(ctx, *intent.SituationID)
 	if err != nil {
-		return NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load root coordinates: %w", err)
+		return situation.NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load root coordinates: %w", err)
 	}
 	if !ok {
-		return NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: situation %s has no delivered root to reply under", *intent.SituationID)
+		return situation.NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: situation %s has no delivered root to reply under", *intent.SituationID)
 	}
 	view, err := d.store.GetSituationEpisodeView(ctx, *intent.SituationID)
 	if err != nil {
-		return NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load episode view: %w", err)
+		return situation.NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load episode view: %w", err)
 	}
 	current := view.Summary.SourceTransitionSequence == tr.Sequence
 
@@ -280,7 +281,8 @@ func (d *SituationDeliverer) deliverBroadcastHandoff(ctx context.Context, intent
 	}
 	rendered, err := slack.RenderSituationJournal(renderTr)
 	if err != nil {
-		return NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: render journal: %w", err)
+		return situation.NotificationDelivery{}, invalidDelivery("render_failed",
+			fmt.Errorf("cmd/alertint: situation deliverer: render journal: %w", err))
 	}
 
 	res, err := d.api.PostMessage(ctx, slack.PostMessageRequest{
@@ -292,25 +294,26 @@ func (d *SituationDeliverer) deliverBroadcastHandoff(ctx context.Context, intent
 		ClientMsgID:    intent.ClientMessageID,
 	})
 	if err != nil {
-		return NotificationDelivery{}, err
+		return situation.NotificationDelivery{}, err
 	}
 	deliveredAs := "broadcast"
 	if !current {
 		deliveredAs = "delayed_thread"
 	}
-	return NotificationDelivery{Channel: res.Channel, MessageTS: res.TS, DeliveredAs: deliveredAs}, nil
+	return situation.NotificationDelivery{Channel: res.Channel, MessageTS: res.TS, DeliveredAs: deliveredAs}, nil
 }
 
 // deliverGapRecovery posts the one bounded installation recovery notice for
 // gap generation intent.GapGeneration names, rendering only from that
 // generation's own durable facts.
-func (d *SituationDeliverer) deliverGapRecovery(ctx context.Context, intent model.NotificationIntent) (NotificationDelivery, error) {
+func (d *SituationDeliverer) deliverGapRecovery(ctx context.Context, intent model.NotificationIntent) (situation.NotificationDelivery, error) {
 	if intent.GapGeneration == nil {
-		return NotificationDelivery{}, errors.New("cmd/alertint: situation deliverer: installation_gap_recovery intent missing gap_generation")
+		return situation.NotificationDelivery{}, invalidDelivery("incomplete_intent",
+			errors.New("cmd/alertint: situation deliverer: installation_gap_recovery intent missing gap_generation"))
 	}
 	gap, err := d.store.GetDeliveryGap(ctx, *intent.GapGeneration)
 	if err != nil {
-		return NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load delivery gap: %w", err)
+		return situation.NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load delivery gap: %w", err)
 	}
 	rendered, err := slack.RenderDeliveryGapNotice(slack.GapNoticeInput{
 		GapID:                  gap.ID,
@@ -320,7 +323,8 @@ func (d *SituationDeliverer) deliverGapRecovery(ctx context.Context, intent mode
 		DelayedEffectCount:     gap.DelayedEffectCount,
 	})
 	if err != nil {
-		return NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: render gap notice: %w", err)
+		return situation.NotificationDelivery{}, invalidDelivery("render_failed",
+			fmt.Errorf("cmd/alertint: situation deliverer: render gap notice: %w", err))
 	}
 	res, err := d.api.PostMessage(ctx, slack.PostMessageRequest{
 		Channel:     d.channel,
@@ -329,9 +333,9 @@ func (d *SituationDeliverer) deliverGapRecovery(ctx context.Context, intent mode
 		ClientMsgID: intent.ClientMessageID,
 	})
 	if err != nil {
-		return NotificationDelivery{}, err
+		return situation.NotificationDelivery{}, err
 	}
-	return NotificationDelivery{Channel: res.Channel, MessageTS: res.TS, DeliveredAs: "system"}, nil
+	return situation.NotificationDelivery{Channel: res.Channel, MessageTS: res.TS, DeliveredAs: "system"}, nil
 }
 
 // recoveryEverObserved answers SituationRootInput.RecoveryEverObserved: it
@@ -365,4 +369,65 @@ func (d *SituationDeliverer) recoveryEverObserved(ctx context.Context, view stor
 	}
 	return false, fmt.Errorf("cmd/alertint: situation deliverer: transition ledger for %s exceeds %d pages",
 		view.Summary.SituationID, maxLedgerScanPages)
+}
+
+// ----------------------------------------------------------------------
+// Failure classification (Task 7 alignment).
+// ----------------------------------------------------------------------
+
+// deliveryAdapterError carries one classified delivery failure across the
+// package boundary as a situation.DeliveryFailure, so the notification
+// worker resolves retry / configuration-block / fail without ever
+// importing internal/notify/slack.
+type deliveryAdapterError struct {
+	class      situation.DeliveryErrorClass
+	code       string
+	retryAfter time.Duration
+	err        error
+}
+
+func (e *deliveryAdapterError) Error() string { return e.err.Error() }
+func (e *deliveryAdapterError) Unwrap() error { return e.err }
+
+func (e *deliveryAdapterError) DeliveryErrorClass() situation.DeliveryErrorClass { return e.class }
+func (e *deliveryAdapterError) DeliveryErrorCode() string                        { return e.code }
+func (e *deliveryAdapterError) DeliveryRetryAfter() time.Duration                { return e.retryAfter }
+
+// invalidDelivery marks one of this adapter's own errors as a
+// non-recoverable programming/data error: a durable intent this build
+// cannot render or send at all, however many times it retries.
+func invalidDelivery(code string, err error) error {
+	return &deliveryAdapterError{class: situation.DeliveryInvalid, code: code, err: err}
+}
+
+// classifyDeliveryError resolves one failed Deliver call into the closed
+// situation.DeliveryFailure classification.
+//
+// Slack's own typed classification (slack.APIError) passes straight
+// through: retryable transport/5xx/rate-limit/uncertain outcomes keep their
+// Retry-After, definite token/scope/channel rejections block on
+// configuration, and a malformed payload this build sent is invalid.
+// Anything this adapter already proved invalid keeps that verdict. EVERY
+// other error — a Store read failure, a stale summary version, a reply
+// whose root is not published yet — stays retryable: none of them proves a
+// permanent condition, and only a proven one may ever close a durable
+// delivery obligation.
+func classifyDeliveryError(err error) error {
+	var adapterErr *deliveryAdapterError
+	if errors.As(err, &adapterErr) {
+		return adapterErr
+	}
+	var apiErr *slack.APIError
+	if errors.As(err, &apiErr) {
+		class := situation.DeliveryRetryable
+		switch apiErr.Class {
+		case slack.ErrorClassConfiguration:
+			class = situation.DeliveryConfigurationBlocking
+		case slack.ErrorClassInvalid:
+			class = situation.DeliveryInvalid
+		case slack.ErrorClassRetryable:
+		}
+		return &deliveryAdapterError{class: class, code: apiErr.Code, retryAfter: apiErr.RetryAfter, err: err}
+	}
+	return &deliveryAdapterError{class: situation.DeliveryRetryable, code: "delivery_failed", err: err}
 }
