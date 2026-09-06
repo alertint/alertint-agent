@@ -121,6 +121,25 @@ func (c *Client) QueryRange(ctx context.Context, expr string, start, end time.Ti
 	return c.apiGet(ctx, "/api/v1/query_range", params)
 }
 
+// QueryRangeBounded is QueryRange with an added server-side series cap (the
+// Prometheus API's optional "limit" param on query_range; 0 = unbounded).
+// The proactive preparation path (spec.md "Prometheus range calls currently
+// lack the proactive server series cap") uses this instead of QueryRange so
+// a wide selector can never return an unbounded matrix; existing QueryRange
+// callers are unaffected.
+func (c *Client) QueryRangeBounded(ctx context.Context, expr string, start, end time.Time, step time.Duration, limit int) (json.RawMessage, error) {
+	params := url.Values{
+		"query": {expr},
+		"start": {formatTS(start)},
+		"end":   {formatTS(end)},
+		"step":  {autoStep(step, end.Sub(start))},
+	}
+	if limit > 0 {
+		params.Set("limit", strconv.Itoa(limit))
+	}
+	return c.apiGet(ctx, "/api/v1/query_range", params)
+}
+
 // apiGet issues a GET to path?params, unwraps the Prometheus envelope, and
 // returns the raw data JSON on success or an error on API/network failure.
 func (c *Client) apiGet(ctx context.Context, path string, params url.Values) (json.RawMessage, error) {

@@ -117,6 +117,52 @@ func (c *Client) FetchRecent(ctx context.Context, sel logs.Selector, start, end 
 	return logs.Fetched{Lines: fbLines, Query: matcher}, nil
 }
 
+// FetchRecentBounded is FetchRecent with a per-physical-request hook, for
+// the proactive preparation path (spec.md: "Loki records every physical
+// filtered/fallback request ... Existing Loki fallback ... behavior must
+// participate in reservation accounting, not hide requests inside one
+// apparent call"). before is called immediately before each physical
+// request (the filtered pass, and — only if it returned zero lines with a
+// line_filter configured — the unfiltered fallback); a non-nil error aborts
+// before that request is made. after reports whether the request itself
+// started and its outcome, immediately once each dispatched request
+// completes. Matcher translation and the empty-selector short circuit are
+// identical to FetchRecent — that path performs no I/O and calls neither
+// hook.
+func (c *Client) FetchRecentBounded(ctx context.Context, sel logs.Selector, start, end time.Time, limit int,
+	before func() error, after func(started bool, err error)) (logs.Fetched, error) {
+	matcher := c.buildMatcher(sel)
+	if matcher == "" {
+		return logs.Fetched{}, nil
+	}
+
+	query := matcher
+	if c.lineFilter != "" {
+		query = matcher + " " + c.lineFilter
+	}
+	if err := before(); err != nil {
+		return logs.Fetched{Query: query}, err
+	}
+	lines, err := c.queryRangeLines(ctx, query, start, end, limit)
+	after(true, err)
+	if err != nil {
+		return logs.Fetched{Query: query}, err
+	}
+	if len(lines) > 0 || c.lineFilter == "" {
+		return logs.Fetched{Lines: lines, Query: query}, nil
+	}
+
+	if err := before(); err != nil {
+		return logs.Fetched{Query: matcher}, err
+	}
+	fbLines, err := c.queryRangeLines(ctx, matcher, start, end, limit)
+	after(true, err)
+	if err != nil {
+		return logs.Fetched{Query: matcher}, err
+	}
+	return logs.Fetched{Lines: fbLines, Query: matcher}, nil
+}
+
 // QueryRange powers the MCP passthrough: it returns the raw provider "data"
 // payload for the given native LogQL query. dir defaults to "backward".
 func (c *Client) QueryRange(ctx context.Context, query string, start, end time.Time, limit int, dir string) (json.RawMessage, error) {
