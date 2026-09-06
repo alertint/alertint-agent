@@ -75,15 +75,39 @@ type rpcError struct {
 // call issues one JSON-RPC method and unmarshals result into out. withAuth=false
 // for apiinfo.version (which needs no token). A non-nil error object → Go error.
 func (c *Client) call(ctx context.Context, method string, params any, withAuth bool, out any) error {
+	return c.callInstrumented(ctx, method, params, withAuth, out, nil, nil)
+}
+
+// callInstrumented is call with a per-physical-request hook, for the
+// proactive preparation path: before is called immediately before the one
+// physical HTTP request this method issues (a non-nil error aborts before
+// it is made); after reports its outcome immediately once it completes.
+// Both may be nil (call's own uninstrumented behavior). Every Zabbix
+// *.get call this package makes — including a secondary item/recovery
+// lookup — goes through this one method, so every physical dispatch is
+// individually reservable by a caller in internal/observation/connectors.
+func (c *Client) callInstrumented(ctx context.Context, method string, params any, withAuth bool, out any,
+	before func() error, after func(started bool, err error)) error {
 	if params == nil {
 		params = map[string]any{}
 	}
+	if before != nil {
+		if err := before(); err != nil {
+			return err
+		}
+	}
 	reqBody, err := json.Marshal(rpcRequest{JSONRPC: "2.0", Method: method, Params: params, ID: 1})
 	if err != nil {
+		if after != nil {
+			after(false, err)
+		}
 		return err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(reqBody))
 	if err != nil {
+		if after != nil {
+			after(false, err)
+		}
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json-rpc")
@@ -92,11 +116,17 @@ func (c *Client) call(ctx context.Context, method string, params any, withAuth b
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		if after != nil {
+			after(true, err)
+		}
 		return fmt.Errorf("zabbix request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		if after != nil {
+			after(true, err)
+		}
 		return fmt.Errorf("zabbix: read response: %w", err)
 	}
 	var envelope struct {
@@ -104,10 +134,20 @@ func (c *Client) call(ctx context.Context, method string, params any, withAuth b
 		Error  *rpcError       `json:"error"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil {
+		if after != nil {
+			after(true, err)
+		}
 		return fmt.Errorf("zabbix: decode response: %w", err)
 	}
 	if envelope.Error != nil {
-		return fmt.Errorf("zabbix %s: %s (%s)", method, envelope.Error.Message, envelope.Error.Data)
+		rpcErr := fmt.Errorf("zabbix %s: %s (%s)", method, envelope.Error.Message, envelope.Error.Data)
+		if after != nil {
+			after(true, rpcErr)
+		}
+		return rpcErr
+	}
+	if after != nil {
+		after(true, nil)
 	}
 	if out == nil {
 		return nil
@@ -125,19 +165,21 @@ func (c *Client) APIVersion(ctx context.Context) (string, error) {
 	return v, nil
 }
 
-// resolveItem looks up an item's id + value_type by host (technical name) + key.
-// resolveItem looks up an item's id + value_type by host (technical name) +
-// key. It tries an EXACT key match first, falling back to a fuzzy substring
-// search only when no exact item exists — so an unambiguous key (e.g.
-// system.cpu.util) is never shadowed by an unrelated longer key that happens
-// to substring-match it (e.g. system.cpu.util[,iowait]) under a bare `search`.
-func (c *Client) resolveItem(ctx context.Context, host, key string) (zItem, error) {
-	item, ok, err := c.lookupItem(ctx, host, key, false)
+// resolveItemInstrumented looks up an item's id + value_type by host
+// (technical name) + key, with a per-physical-request hook threaded
+// through both lookups (both may be nil for uninstrumented use). It tries
+// an EXACT key match first, falling back to a fuzzy substring search only
+// when no exact item exists — so an unambiguous key (e.g. system.cpu.util)
+// is never shadowed by an unrelated longer key that happens to
+// substring-match it (e.g. system.cpu.util[,iowait]) under a bare `search`.
+func (c *Client) resolveItemInstrumented(ctx context.Context, host, key string,
+	before func() error, after func(started bool, err error)) (zItem, error) {
+	item, ok, err := c.lookupItemInstrumented(ctx, host, key, false, before, after)
 	if err != nil {
 		return zItem{}, err
 	}
 	if !ok {
-		item, ok, err = c.lookupItem(ctx, host, key, true)
+		item, ok, err = c.lookupItemInstrumented(ctx, host, key, true, before, after)
 		if err != nil {
 			return zItem{}, err
 		}
@@ -148,8 +190,10 @@ func (c *Client) resolveItem(ctx context.Context, host, key string) (zItem, erro
 	return item, nil
 }
 
-// lookupItem runs one item.get, exact (filter) or fuzzy (search) on key_.
-func (c *Client) lookupItem(ctx context.Context, host, key string, fuzzy bool) (zItem, bool, error) {
+// lookupItemInstrumented runs one item.get, exact (filter) or fuzzy
+// (search) on key_.
+func (c *Client) lookupItemInstrumented(ctx context.Context, host, key string, fuzzy bool,
+	before func() error, after func(started bool, err error)) (zItem, bool, error) {
 	params := map[string]any{
 		"output": []string{"itemid", "value_type", "name", "units"},
 		"host":   host,
@@ -161,7 +205,7 @@ func (c *Client) lookupItem(ctx context.Context, host, key string, fuzzy bool) (
 		params["filter"] = map[string]string{"key_": key}
 	}
 	var items []zItem
-	if err := c.call(ctx, "item.get", params, true, &items); err != nil {
+	if err := c.callInstrumented(ctx, "item.get", params, true, &items, before, after); err != nil {
 		return zItem{}, false, err
 	}
 	if len(items) == 0 {
@@ -175,7 +219,16 @@ func (c *Client) lookupItem(ctx context.Context, host, key string, fuzzy bool) (
 // for floats under the default history=3) and falls back to trends for windows
 // older than the configured history retention.
 func (c *Client) MetricHistory(ctx context.Context, host, itemKey string, from, to time.Time, limit int) (Series, error) {
-	item, err := c.resolveItem(ctx, host, itemKey)
+	return c.MetricHistoryBounded(ctx, host, itemKey, from, to, limit, nil, nil)
+}
+
+// MetricHistoryBounded is MetricHistory with a per-physical-request hook
+// threaded through item resolution (up to two lookups) and the final
+// history/trend request — every real request this call can make,
+// individually reservable by a caller in internal/observation/connectors.
+func (c *Client) MetricHistoryBounded(ctx context.Context, host, itemKey string, from, to time.Time, limit int,
+	before func() error, after func(started bool, err error)) (Series, error) {
+	item, err := c.resolveItemInstrumented(ctx, host, itemKey, before, after)
 	if err != nil {
 		return Series{}, err
 	}
@@ -186,13 +239,13 @@ func (c *Client) MetricHistory(ctx context.Context, host, itemKey string, from, 
 			ValueMin string `json:"value_min"`
 			ValueMax string `json:"value_max"`
 		}
-		if err := c.call(ctx, "trend.get", map[string]any{
+		if err := c.callInstrumented(ctx, "trend.get", map[string]any{
 			"output":    "extend",
 			"itemids":   item.ItemID,
 			"time_from": from.Unix(),
 			"time_till": to.Unix(),
 			"limit":     limit,
-		}, true, &rows); err != nil {
+		}, true, &rows, before, after); err != nil {
 			return Series{}, err
 		}
 		pts := make([]SeriesPoint, 0, len(rows))
@@ -206,7 +259,7 @@ func (c *Client) MetricHistory(ctx context.Context, host, itemKey string, from, 
 		Clock string `json:"clock"`
 		Value string `json:"value"`
 	}
-	if err := c.call(ctx, "history.get", map[string]any{
+	if err := c.callInstrumented(ctx, "history.get", map[string]any{
 		"output":    "extend",
 		"history":   item.ValueType, // the fix: resolved type, not default 3
 		"itemids":   item.ItemID,
@@ -215,7 +268,7 @@ func (c *Client) MetricHistory(ctx context.Context, host, itemKey string, from, 
 		"sortfield": "clock",
 		"sortorder": "DESC",
 		"limit":     limit,
-	}, true, &rows); err != nil {
+	}, true, &rows, before, after); err != nil {
 		return Series{}, err
 	}
 	pts := make([]SeriesPoint, 0, len(rows))
