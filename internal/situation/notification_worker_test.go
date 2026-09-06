@@ -7,9 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
@@ -820,4 +825,231 @@ func TestNotificationWorkerReactivateConfigurationIsIdempotentForStartup(t *test
 			t.Fatalf("reactivated with generations %v, want exactly [8]", s.reactivated)
 		}
 	})
+}
+
+// ----------------------------------------------------------------------
+// Plan 3 Task 9: the delivery span and the audit trail
+// ----------------------------------------------------------------------
+
+// nwSpanRecorder swaps the global TracerProvider for an in-memory recorder
+// for one test. The production binary installs no provider at all; this is
+// the only place one exists inside this package's own tests.
+func nwSpanRecorder(t *testing.T) *tracetest.InMemoryExporter {
+	t.Helper()
+	exporter := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sdktrace.NewSimpleSpanProcessor(exporter)))
+	previous := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() {
+		otel.SetTracerProvider(previous)
+		_ = tp.Shutdown(context.Background())
+	})
+	return exporter
+}
+
+type nwAuditRow struct {
+	actor   string
+	kind    string
+	payload map[string]any
+}
+
+type nwAuditSink struct {
+	mu   sync.Mutex
+	rows []nwAuditRow
+}
+
+func (a *nwAuditSink) Append(_ context.Context, actor, kind string, payload any) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	m, _ := payload.(map[string]any)
+	a.rows = append(a.rows, nwAuditRow{actor: actor, kind: kind, payload: m})
+	return nil
+}
+
+func (a *nwAuditSink) kinds() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]string, 0, len(a.rows))
+	for _, r := range a.rows {
+		out = append(out, r.kind)
+	}
+	return out
+}
+
+func nwHasKind(kinds []string, want string) bool {
+	for _, k := range kinds {
+		if k == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestTelemetryNotificationDeliverSpanCarriesIntentIdentity proves R8's
+// second new span: one span per claimed intent, on Plan 2's tracer scope,
+// carrying the intent identity/effect class/attempt and the closed outcome
+// class — and never a Slack response body, a channel token, or a claim
+// owner.
+func TestTelemetryNotificationDeliverSpanCarriesIntentIdentity(t *testing.T) {
+	exporter := nwSpanRecorder(t)
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	store := &nwStore{batches: [][]NotificationClaim{{nwClaim("intent-span", 3)}}}
+	deliverer := &nwDeliverer{deliver: func(model.NotificationIntent) (NotificationDelivery, error) {
+		return NotificationDelivery{Channel: "C1", MessageTS: "100.1", DeliveredAs: "root"}, nil
+	}}
+	w := nwWorker(store, deliverer, now)
+	if _, err := w.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	var span *tracetest.SpanStub
+	for i, s := range exporter.GetSpans() {
+		if s.Name == SpanNotificationDeliver {
+			span = &exporter.GetSpans()[i]
+		}
+	}
+	if span == nil {
+		t.Fatalf("no %s span recorded", SpanNotificationDeliver)
+	}
+	got := map[string]string{}
+	for _, kv := range span.Attributes {
+		got[string(kv.Key)] = kv.Value.String()
+		if !strings.HasPrefix(string(kv.Key), "alertint.") {
+			t.Errorf("delivery span carries a non-alertint attribute %q", kv.Key)
+		}
+	}
+	for key, want := range map[string]string{
+		string(AttrIntentID):          "intent-span",
+		string(AttrIntentEffectClass): string(model.EffectRootSync),
+		string(AttrIntentAttempt):     "3",
+		string(AttrResultClass):       DeliverResultDelivered,
+		string(AttrSituationID):       "sit-1",
+	} {
+		if got[key] != want {
+			t.Errorf("delivery span %s = %q, want %q", key, got[key], want)
+		}
+	}
+	for key := range got {
+		for _, forbidden := range []string{"claim_owner", "lease", "token", "response"} {
+			if strings.Contains(key, forbidden) {
+				t.Errorf("delivery span carries forbidden attribute %q", key)
+			}
+		}
+	}
+	// The delivered Slack coordinates are durable operator history and
+	// belong in the AUDIT trail, not on the span's identity attributes.
+	if _, ok := got["alertint.slack.channel"]; ok {
+		t.Error("delivery span carries a Slack channel attribute")
+	}
+}
+
+// TestSituationNotificationAuditTrailCoversTheDeliveryLifecycle proves the
+// worker emits the durable operator trail spec.md requires — claim,
+// delivery (with its coordinates), retry, configuration block, permanent
+// failure, and supersession — with bounded payloads that never carry a raw
+// error, a provider body, or a claim owner.
+func TestSituationNotificationAuditTrailCoversTheDeliveryLifecycle(t *testing.T) {
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+
+	delivered := &nwAuditSink{}
+	store := &nwStore{batches: [][]NotificationClaim{{nwClaim("intent-ok", 1)}}}
+	w := nwWorker(store, &nwDeliverer{deliver: func(model.NotificationIntent) (NotificationDelivery, error) {
+		return NotificationDelivery{Channel: "C1", MessageTS: "100.1", DeliveredAs: "root"}, nil
+	}}, now)
+	w.SetAuditSink(delivered)
+	if _, err := w.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce (delivered): %v", err)
+	}
+	kinds := delivered.kinds()
+	for _, want := range []string{auditKindNotificationClaimed, auditKindNotificationDelivered} {
+		if !nwHasKind(kinds, want) {
+			t.Errorf("audit kinds = %v, want one %s row", kinds, want)
+		}
+	}
+	for _, row := range delivered.rows {
+		if row.actor != notificationAuditActor {
+			t.Errorf("audit actor = %q, want %q", row.actor, notificationAuditActor)
+		}
+		for key := range row.payload {
+			if key == "claim_owner" || key == "claim_token" || key == "error" {
+				t.Errorf("audit payload carries %q", key)
+			}
+		}
+		if row.kind == auditKindNotificationDelivered {
+			if row.payload["channel"] != "C1" || row.payload["delivered_as"] != "root" {
+				t.Errorf("delivered audit row lost its coordinates: %v", row.payload)
+			}
+		}
+	}
+
+	failures := &nwAuditSink{}
+	store2 := &nwStore{batches: [][]NotificationClaim{
+		{nwClaim("intent-retry", 1)},
+		{nwClaim("intent-config", 1)},
+		{nwClaim("intent-invalid", 1)},
+	}}
+	w2 := nwWorker(store2, &nwDeliverer{deliver: func(intent model.NotificationIntent) (NotificationDelivery, error) {
+		switch intent.ID {
+		case "intent-config":
+			return NotificationDelivery{}, nwDeliveryError{class: DeliveryConfigurationBlocking, code: "invalid_auth"}
+		case "intent-invalid":
+			return NotificationDelivery{}, nwDeliveryError{class: DeliveryInvalid, code: "missing_text"}
+		default:
+			return NotificationDelivery{}, nwDeliveryError{class: DeliveryRetryable, code: "ratelimited"}
+		}
+	}}, now)
+	w2.SetAuditSink(failures)
+	for i := range 3 {
+		if _, err := w2.RunOnce(context.Background()); err != nil {
+			t.Fatalf("RunOnce (failures) %d: %v", i, err)
+		}
+	}
+	kinds2 := failures.kinds()
+	for _, want := range []string{
+		auditKindNotificationRetried, auditKindConfigurationBlocked, auditKindNotificationFailed,
+	} {
+		if !nwHasKind(kinds2, want) {
+			t.Errorf("failure audit kinds = %v, want one %s row", kinds2, want)
+		}
+	}
+	for _, row := range failures.rows {
+		if raw, ok := row.payload["error_class"].(string); ok && strings.ContainsAny(raw, " :") {
+			t.Errorf("audit error_class %q is raw error text, not a bounded class", raw)
+		}
+	}
+
+	superseded := &nwAuditSink{}
+	store3 := &nwStore{
+		batches:       [][]NotificationClaim{{nwClaim("intent-superseded", 1)}},
+		deliverAckErr: ErrNotificationIntentSuperseded,
+	}
+	w3 := nwWorker(store3, &nwDeliverer{deliver: func(model.NotificationIntent) (NotificationDelivery, error) {
+		return NotificationDelivery{Channel: "C1", MessageTS: "100.1", DeliveredAs: "root"}, nil
+	}}, now)
+	w3.SetAuditSink(superseded)
+	if _, err := w3.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce (superseded): %v", err)
+	}
+	if !nwHasKind(superseded.kinds(), auditKindNotificationSuperseded) {
+		t.Errorf("superseded audit kinds = %v, want one %s row", superseded.kinds(), auditKindNotificationSuperseded)
+	}
+}
+
+// TestSituationNotificationAuditIsOptional proves a worker with no audit
+// sink still delivers: auditing is an added trail, never a delivery
+// precondition.
+func TestSituationNotificationAuditIsOptional(t *testing.T) {
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	store := &nwStore{batches: [][]NotificationClaim{{nwClaim("intent-noaudit", 1)}}}
+	w := nwWorker(store, &nwDeliverer{deliver: func(model.NotificationIntent) (NotificationDelivery, error) {
+		return NotificationDelivery{Channel: "C1", MessageTS: "100.1", DeliveredAs: "root"}, nil
+	}}, now)
+	if _, err := w.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	var delivered []string
+	store.snapshot(func(s *nwStore) { delivered = append(delivered, s.delivered...) })
+	if len(delivered) != 1 {
+		t.Fatalf("delivered = %v, want the one intent to deliver with no audit sink wired", delivered)
+	}
 }

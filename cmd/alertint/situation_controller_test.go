@@ -12,6 +12,7 @@ import (
 	"github.com/alertint/alertint-agent/internal/llm"
 	"github.com/alertint/alertint-agent/internal/llmhealth"
 	"github.com/alertint/alertint-agent/internal/situation"
+	"github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -26,7 +27,7 @@ func TestSituationControllerRuntimePanicsOnEmptyOwner(t *testing.T) {
 			t.Fatal("expected a panic for an empty owner")
 		}
 	}()
-	newControllerRuntime(st, &fakeOneShotClient{}, nil, config.SituationsConfig{}, "  ", nil, nil)
+	newControllerRuntime(st, &fakeOneShotClient{}, nil, config.SituationsConfig{}, "", "  ", nil, nil)
 }
 
 // TestSituationsConfigToControllerConfigMapsEveryField pins Task 8's own
@@ -53,7 +54,18 @@ func TestSituationsConfigToControllerConfigMapsEveryField(t *testing.T) {
 			JitterPercent: 21,
 		},
 	}
-	controllerCfg, workerCfg := situationsConfigToControllerConfig(cfg, "owner-1")
+	cfg.Slack = config.SituationSlackConfig{RepageCooldownSeconds: 600}
+	controllerCfg, workerCfg := situationsConfigToControllerConfig(cfg, model.InterruptionHigh, "owner-1")
+
+	// Plan 3 Task 9: the two publication-policy fields Task 5 added but left
+	// unwired must carry real operator configuration, not their zero values
+	// (which would silently mean "no floor" and the 900s default).
+	if controllerCfg.SlackFloor != model.InterruptionHigh {
+		t.Fatalf("SlackFloor = %q, want the configured notify.slack.min_severity floor", controllerCfg.SlackFloor)
+	}
+	if controllerCfg.RepageCooldown != 600*time.Second {
+		t.Fatalf("RepageCooldown = %v, want 600s from situations.slack.repage_cooldown_seconds", controllerCfg.RepageCooldown)
+	}
 
 	if controllerCfg.MaxL2CallsPerAttempt != 2 || controllerCfg.MaxWorkAttemptsPerInput != 5 {
 		t.Fatalf("controllerCfg budgets = %+v", controllerCfg)
@@ -92,6 +104,29 @@ func TestSituationsConfigToControllerConfigMapsEveryField(t *testing.T) {
 	}
 }
 
+// TestSituationControllerRuntimeSlackFloorMapsMinSeverity pins the
+// compatibility reinterpretation spec.md states explicitly: notify.slack.
+// min_severity keeps its existing low|medium|high values, but the Situation
+// path reads the selected value ONLY as a minimum deterministic Interruption
+// priority — never as Alert or model severity. An unset or unrecognized
+// value is "no floor", never a silently stricter one.
+func TestSituationControllerRuntimeSlackFloorMapsMinSeverity(t *testing.T) {
+	for _, tc := range []struct {
+		minSeverity string
+		want        model.InterruptionPriority
+	}{
+		{"low", model.InterruptionLow},
+		{"medium", model.InterruptionMedium},
+		{"high", model.InterruptionHigh},
+		{"", ""},
+		{"URGENT", ""},
+	} {
+		if got := slackInterruptionFloor(tc.minSeverity); got != tc.want {
+			t.Errorf("slackInterruptionFloor(%q) = %q, want %q", tc.minSeverity, got, tc.want)
+		}
+	}
+}
+
 // ----------------------------------------------------------------------
 // controllerRuntime.RecoverAndBackfill / Start / Drain / Stop, against a
 // real (empty) store — proves the plumbing runs cleanly with nothing due,
@@ -100,7 +135,7 @@ func TestSituationsConfigToControllerConfigMapsEveryField(t *testing.T) {
 
 func TestSituationControllerRuntimeRecoverAndBackfillOnEmptyStoreIsANoOp(t *testing.T) {
 	st := newTestFoundationStore(t)
-	rt := newControllerRuntime(st, &fakeOneShotClient{}, nil, config.SituationsConfig{}, "test-owner", nil, nil)
+	rt := newControllerRuntime(st, &fakeOneShotClient{}, nil, config.SituationsConfig{}, "", "test-owner", nil, nil)
 
 	report, err := rt.RecoverAndBackfill(context.Background(), time.Now().UTC())
 	if err != nil {
@@ -115,7 +150,7 @@ func TestSituationControllerRuntimeRecoverAndBackfillOnEmptyStoreIsANoOp(t *test
 func TestSituationControllerRuntimeStartDrainStop(t *testing.T) {
 	st := newTestFoundationStore(t)
 	cfg := config.SituationsConfig{ReconcilePollSeconds: 3600, LeaseSeconds: 300, HeartbeatSeconds: 30}
-	rt := newControllerRuntime(st, &fakeOneShotClient{}, nil, cfg, "test-owner", nil, nil)
+	rt := newControllerRuntime(st, &fakeOneShotClient{}, nil, cfg, "", "test-owner", nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -503,7 +538,7 @@ func TestSituationControllerRuntimeRecoverAndBackfillAuditsStartupHorizonExhaust
 	}
 
 	audit := &fakeControllerRuntimeAuditSink{}
-	rt := newControllerRuntime(st, &fakeOneShotClient{}, nil, config.SituationsConfig{}, "test-owner", audit, nil)
+	rt := newControllerRuntime(st, &fakeOneShotClient{}, nil, config.SituationsConfig{}, "", "test-owner", audit, nil)
 
 	report, err := rt.RecoverAndBackfill(context.Background(), now)
 	if err != nil {

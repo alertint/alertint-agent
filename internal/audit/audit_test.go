@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -255,4 +256,109 @@ func TestAppend_RollbackLeavesNoRow(t *testing.T) {
 	}
 	// Channel referenced to silence "declared and not used" suspicion.
 	_ = fmt.Sprintf("%v", err)
+}
+
+// ----------------------------------------------------------------------
+// Plan 3 Task 9: the Situation history/delivery event catalog
+// ----------------------------------------------------------------------
+
+// TestSituationAuditCatalogCoversEveryPlan3Event pins that the catalog names
+// every event spec.md requires Plan 3 to audit: Transition commit, summary
+// projection, intent creation, claim, retry, configuration block, permanent
+// failure, delivery, withholding, supersession, operator-artifact linkage
+// (including owner_terminal), and gap open/recovery/completion.
+func TestSituationAuditCatalogCoversEveryPlan3Event(t *testing.T) {
+	want := []string{
+		"situation.history.transition_committed",
+		"situation.history.summary_projected",
+		"situation.history.artifact_journaled",
+		"situation.history.artifact_owner_terminal",
+		"situation.notification.intent_created",
+		"situation.notification.claimed",
+		"situation.notification.delivered",
+		"situation.notification.retried",
+		"situation.notification.configuration_blocked",
+		"situation.notification.failed",
+		"situation.notification.withheld",
+		"situation.notification.superseded",
+		"situation.notification.gap_opened",
+		"situation.notification.gap_recovered",
+		"situation.notification.gap_completed",
+		"situation.transition_stream.emitted",
+		"situation.transition_stream.failed",
+	}
+	got := map[string]bool{}
+	for _, kind := range SituationHistoryKinds() {
+		if got[kind] {
+			t.Errorf("catalog lists %q twice", kind)
+		}
+		got[kind] = true
+	}
+	for _, kind := range want {
+		if !got[kind] {
+			t.Errorf("catalog is missing the required event %q", kind)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("catalog has %d kinds, want exactly the %d spec.md names", len(got), len(want))
+	}
+}
+
+// TestSituationAuditCatalogNeverCollidesWithPlan2 proves the naming rule
+// plan.md Task 9 Step 7 states: every new event lives under
+// situation.history.*, situation.notification.*, or
+// situation.transition_stream.*, and none of them collides with Plan 2's
+// existing situation.assessment_*, situation.triage_*,
+// situation.controller.commit_failed, or incident.triage_* catalog.
+func TestSituationAuditCatalogNeverCollidesWithPlan2(t *testing.T) {
+	reserved := map[string]bool{}
+	for _, kind := range ReservedPlan2Kinds() {
+		reserved[kind] = true
+	}
+	if len(reserved) == 0 {
+		t.Fatal("the reserved Plan 2 catalog is empty; the collision check would prove nothing")
+	}
+	prefixes := []string{"situation.history.", "situation.notification.", "situation.transition_stream."}
+	for _, kind := range SituationHistoryKinds() {
+		if reserved[kind] {
+			t.Errorf("new event %q collides with Plan 2's existing catalog", kind)
+		}
+		ok := false
+		for _, p := range prefixes {
+			if strings.HasPrefix(kind, p) {
+				ok = true
+			}
+		}
+		if !ok {
+			t.Errorf("new event %q is outside the three sanctioned Plan 3 prefixes %v", kind, prefixes)
+		}
+		// A Plan 2 prefix ("situation.assessment_", "situation.triage_") is
+		// underscore-separated where Plan 3's are dot-separated, so a
+		// prefix clash is impossible by construction — assert it anyway, so
+		// a future rename cannot quietly reintroduce one.
+		for _, r := range ReservedPlan2Kinds() {
+			if strings.HasPrefix(kind, r) || strings.HasPrefix(r, kind) {
+				t.Errorf("new event %q shares a prefix with Plan 2's %q", kind, r)
+			}
+		}
+	}
+}
+
+// TestSituationAuditCatalogAppendsAndVerifies proves every catalog name is
+// actually appendable and keeps the hash chain intact — a name the Auditor
+// rejects would be a silently missing audit trail.
+func TestSituationAuditCatalogAppendsAndVerifies(t *testing.T) {
+	a, _, ctx := newAuditor(t)
+	for _, kind := range SituationHistoryKinds() {
+		if err := a.Append(ctx, "situation.controller", kind, map[string]any{"situation_id": "sit-1"}); err != nil {
+			t.Fatalf("append %q: %v", kind, err)
+		}
+	}
+	report, err := a.Verify(ctx)
+	if err != nil || !report.OK {
+		t.Fatalf("verify after the catalog appends: %v %+v", err, report)
+	}
+	if report.RowsChecked != len(SituationHistoryKinds()) {
+		t.Fatalf("rows = %d, want %d", report.RowsChecked, len(SituationHistoryKinds()))
+	}
 }

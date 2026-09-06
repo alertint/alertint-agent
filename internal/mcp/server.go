@@ -112,6 +112,12 @@ func NewServer(cfg Config, st *store.Store, auditor *audit.Auditor) *Server {
 	// envelope, Assessment, or reassessment request.
 	ms.AddTool(s.toolListSituations())
 	ms.AddTool(s.toolGetSituation())
+	// Plan 3 Task 9: the two bounded read-only history/delivery surfaces.
+	// Always registered alongside the two above — there is no connector to
+	// gate them on, and a Situation with no history yet answers honestly
+	// rather than erroring.
+	ms.AddTool(s.toolListSituationTransitions())
+	ms.AddTool(s.toolGetDeliveryState())
 
 	// Log passthrough tool, registered only when a log source is configured.
 	// Named after the active backend (loki_query_range) so multiple sources can

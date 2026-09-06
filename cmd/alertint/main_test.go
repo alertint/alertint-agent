@@ -235,3 +235,64 @@ func TestBuildLogger_Precedence(t *testing.T) {
 		})
 	}
 }
+
+// TestSituationNotificationRuntimeAssemblyGatesSlackOnConfiguration proves
+// Plan 3 Task 9's assembly rule: exactly one Situation Slack writer is
+// constructed, and only when Situation Slack is actually usable. With Slack
+// off (or with no resolvable token) no Slack credential is constructed on
+// this path at all, while the stdout Transition-stream worker always runs —
+// the authoritative outward state stream is never Slack-gated.
+func TestSituationNotificationRuntimeAssemblyGatesSlackOnConfiguration(t *testing.T) {
+	st := newTestFoundationStore(t)
+	logger := slog.New(slog.DiscardHandler)
+
+	off := config.Defaults()
+	off.Notify.Slack.Enabled = false
+	nrt := buildSituationNotificationRuntime(&off, st, nil, "owner-off", logger)
+	if nrt.worker != nil || nrt.probe != nil {
+		t.Error("a Slack notification worker was constructed with notify.slack disabled")
+	}
+	if nrt.stream == nil {
+		t.Error("the stdout Transition-stream worker must run regardless of Slack configuration")
+	}
+
+	noToken := config.Defaults()
+	noToken.Notify.Slack.Enabled = true
+	noToken.Notify.Slack.Channel = "#alerts"
+	noToken.Notify.Slack.BotTokenEnv = "ALERTINT_TEST_SITUATION_SLACK_ABSENT"
+	if nrt := buildSituationNotificationRuntime(&noToken, st, nil, "owner-untokened", logger); nrt.worker != nil {
+		t.Error("a Slack notification worker was constructed with no resolvable bot token")
+	}
+
+	on := config.Defaults()
+	on.Notify.Slack.Enabled = true
+	on.Notify.Slack.Channel = "#alerts"
+	on.Notify.Slack.BotTokenEnv = "ALERTINT_TEST_SITUATION_SLACK_TOKEN"
+	t.Setenv("ALERTINT_TEST_SITUATION_SLACK_TOKEN", "xoxb-test")
+	nrt = buildSituationNotificationRuntime(&on, st, nil, "owner-on", logger)
+	if nrt.worker == nil || nrt.probe == nil {
+		t.Fatal("no Situation Slack notification worker was constructed with Slack fully configured")
+	}
+	if _, ok := nrt.worker.(*situation.NotificationWorker); !ok {
+		t.Fatalf("Situation Slack writer is %T, want exactly one *situation.NotificationWorker", nrt.worker)
+	}
+}
+
+// TestSituationNotificationRuntimeIsTheOnlySituationSlackWriterInAssembly is
+// a source-text scan proving cmd/alertint constructs a Slack API credential
+// on exactly two paths: buildNotifier's ADR-0042/ADR-0046 System-message
+// notifier, and buildSituationSlackWorker's Situation deliverer.
+func TestSituationNotificationRuntimeIsTheOnlySituationSlackWriterInAssembly(t *testing.T) {
+	constructors := 0
+	for _, name := range []string{"main.go", "situation_notifications.go", "situation_controller.go", "situation_foundation.go"} {
+		src, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		constructors += strings.Count(string(src), "notifyslack.New(") + strings.Count(string(src), "slack.NewClient(")
+	}
+	if constructors != 2 {
+		t.Fatalf("cmd/alertint constructs %d Slack clients in its assembly files, want exactly 2 "+
+			"(the System-message notifier and the Situation deliverer)", constructors)
+	}
+}

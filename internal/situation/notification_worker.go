@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
@@ -406,6 +408,59 @@ type NotificationWorker struct {
 
 	stats   NotificationWorkerStats
 	statsMu sync.Mutex
+
+	// audit is Plan 3 Task 9's durable operator trail for this ledger's
+	// whole lifecycle (claim, delivery, retry, configuration block,
+	// permanent failure, supersession, and the gap generation's own three
+	// events). Optional: a nil sink simply emits nothing, exactly like
+	// TriageWorker's own SetAuditSink seam.
+	audit AuditSink
+}
+
+// SetAuditSink wires the audit trail for this worker's delivery lifecycle
+// (Plan 3 Task 9). Call before Start; a nil sink leaves auditing off.
+func (w *NotificationWorker) SetAuditSink(sink AuditSink) { w.audit = sink }
+
+// auditAppend emits one bounded audit row. Payloads carry identities,
+// closed codes, and counts only — never a Slack response body, a channel
+// token, a claim owner, or journal prose.
+func (w *NotificationWorker) auditAppend(ctx context.Context, kind string, payload map[string]any) {
+	if w.audit == nil {
+		return
+	}
+	if err := w.audit.Append(ctx, notificationAuditActor, kind, payload); err != nil {
+		w.logger.Warn("situation: notification worker: audit append failed", "kind", kind, "err", err)
+	}
+}
+
+// notificationAuditActor identifies this worker in the hash-chained audit
+// log, alongside Plan 2's "situation.controller"/"situation.triage_worker".
+const notificationAuditActor = "situation.notification_worker"
+
+// intentAuditPayload is the bounded identity payload every notification
+// audit row starts from.
+func intentAuditPayload(claim NotificationClaim) map[string]any {
+	payload := map[string]any{
+		"intent_id":     claim.Intent.ID,
+		"effect_class":  string(claim.Intent.EffectClass),
+		"attempt_count": claim.Intent.AttemptCount,
+	}
+	if claim.Intent.SituationID != nil {
+		payload["situation_id"] = *claim.Intent.SituationID
+	}
+	if claim.Intent.TransitionID != nil {
+		payload["transition_id"] = *claim.Intent.TransitionID
+	}
+	if claim.Intent.TransitionSequence != nil {
+		payload["transition_sequence"] = *claim.Intent.TransitionSequence
+	}
+	if claim.Intent.SummaryVersion != nil {
+		payload["summary_version"] = *claim.Intent.SummaryVersion
+	}
+	if claim.Intent.GapGeneration != nil {
+		payload["gap_generation"] = *claim.Intent.GapGeneration
+	}
+	return payload
 }
 
 // NewNotificationWorker creates a NotificationWorker. A nil clock falls back
@@ -494,6 +549,10 @@ func (w *NotificationWorker) advanceGapState(ctx context.Context, state SlackDel
 			w.logger.Error("situation: notification worker: open delivery gap failed", "err", err)
 		} else if opened {
 			w.count(func(s *NotificationWorkerStats) { s.GapsOpened++ })
+			w.auditAppend(ctx, auditKindGapOpened, map[string]any{
+				"first_failure_at":  state.FirstFailureAt.UTC().Format(time.RFC3339Nano),
+				"continuous_for_ms": now.Sub(*state.FirstFailureAt).Milliseconds(),
+			})
 			w.logger.Warn("situation: notification worker: slack delivery gap opened",
 				"first_failure_at", state.FirstFailureAt.Format(time.RFC3339),
 				"continuous_for", now.Sub(*state.FirstFailureAt).String())
@@ -505,6 +564,7 @@ func (w *NotificationWorker) advanceGapState(ctx context.Context, state SlackDel
 		w.logger.Error("situation: notification worker: complete delivery gap failed", "err", err)
 	} else if done {
 		w.count(func(s *NotificationWorkerStats) { s.GapsCompleted++ })
+		w.auditAppend(ctx, auditKindGapCompleted, map[string]any{"gap_generation": generation})
 		w.logger.Info("situation: notification worker: slack delivery gap replay complete", "gap_generation", generation)
 	}
 }
@@ -570,6 +630,7 @@ func (w *NotificationWorker) probe(ctx context.Context, state SlackDeliveryState
 		w.logger.Error("situation: notification worker: recover delivery gap failed", "err", err)
 	} else if recovered {
 		w.count(func(s *NotificationWorkerStats) { s.GapsRecovered++ })
+		w.auditAppend(ctx, auditKindGapRecovered, map[string]any{"gap_generation": generation})
 		w.logger.Warn("situation: notification worker: slack delivery recovered; replaying gap",
 			"gap_generation", generation)
 	}
@@ -654,6 +715,35 @@ func (w *NotificationWorker) processOne(ctx context.Context, claim NotificationC
 	w.trackClaim(claim)
 	defer w.untrackClaim(claim)
 
+	// R8: one span per claimed intent, on Plan 2's tracer scope. It starts
+	// AFTER the claim is durable and wraps only the out-of-transaction Slack
+	// call plus the outcome class, so no exporter call ever happens inside a
+	// database transaction.
+	startedAt := time.Now()
+	spanCtx, span := tracer().Start(ctx, SpanNotificationDeliver, trace.WithAttributes(
+		AttrIntentID.String(claim.Intent.ID),
+		AttrIntentEffectClass.String(string(claim.Intent.EffectClass)),
+		AttrIntentAttempt.Int(claim.Intent.AttemptCount),
+	))
+	defer span.End()
+	if claim.Intent.SituationID != nil {
+		span.SetAttributes(AttrSituationID.String(*claim.Intent.SituationID))
+	}
+	if claim.Intent.TransitionSequence != nil {
+		span.SetAttributes(AttrTransitionSequence.Int(*claim.Intent.TransitionSequence))
+	}
+	if claim.Intent.SummaryVersion != nil {
+		span.SetAttributes(AttrSummaryVersion.Int(*claim.Intent.SummaryVersion))
+	}
+	if claim.Intent.GapGeneration != nil {
+		span.SetAttributes(AttrGapGeneration.String(*claim.Intent.GapGeneration))
+	}
+	w.auditAppend(ctx, auditKindNotificationClaimed, intentAuditPayload(claim))
+	defer func() {
+		span.SetAttributes(AttrDurationMS.Int64(time.Since(startedAt).Milliseconds()))
+	}()
+	ctx = spanCtx
+
 	deliverCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -671,6 +761,7 @@ func (w *NotificationWorker) processOne(ctx context.Context, claim NotificationC
 		// concurrent commit superseded this root projection). Acknowledging
 		// now would race whatever owns the row; the durable outcome is
 		// whatever that owner writes.
+		span.SetAttributes(AttrResultClass.String(DeliverResultClaimLost))
 		w.count(func(s *NotificationWorkerStats) { s.ClaimsLost++ })
 		w.logger.Warn("situation: notification worker: lease lost mid-delivery; abandoning claim",
 			"intent_id", claim.Intent.ID, "effect_class", string(claim.Intent.EffectClass))
@@ -684,14 +775,14 @@ func (w *NotificationWorker) processOne(ctx context.Context, claim NotificationC
 	now := w.now().UTC()
 
 	if deliverErr == nil {
-		w.acknowledgeDelivered(writeCtx, claim, delivery, now) //nolint:contextcheck // by design: detached from the possibly-canceled delivery context
+		w.acknowledgeDelivered(writeCtx, claim, delivery, now, span) //nolint:contextcheck // by design: detached from the possibly-canceled delivery context
 		return
 	}
-	w.acknowledgeFailure(writeCtx, claim, deliverErr, now) //nolint:contextcheck // by design: detached from the possibly-canceled delivery context
+	w.acknowledgeFailure(writeCtx, claim, deliverErr, now, span) //nolint:contextcheck // by design: detached from the possibly-canceled delivery context
 }
 
 func (w *NotificationWorker) acknowledgeDelivered(ctx context.Context, claim NotificationClaim,
-	delivery NotificationDelivery, now time.Time) {
+	delivery NotificationDelivery, now time.Time, span trace.Span) {
 	// Slack answered, so the dependency is healthy regardless of whether
 	// this particular intent's row was still ours to write.
 	if err := w.store.ObserveSlackSuccess(ctx, now); err != nil {
@@ -701,15 +792,29 @@ func (w *NotificationWorker) acknowledgeDelivered(ctx context.Context, claim Not
 	switch {
 	case err == nil:
 		w.count(func(s *NotificationWorkerStats) { s.Delivered++ })
+		span.SetAttributes(AttrResultClass.String(DeliverResultDelivered))
+		payload := intentAuditPayload(claim)
+		// Delivered COORDINATES are durable operator history and belong in
+		// the trail; the Slack response body never is.
+		payload["delivered_as"] = delivery.DeliveredAs
+		payload["channel"] = delivery.Channel
+		payload["message_ts"] = delivery.MessageTS
+		w.auditAppend(ctx, auditKindNotificationDelivered, payload)
+		w.logger.Info("situation: notification delivered",
+			append([]any{"intent_id", claim.Intent.ID, "effect_class", string(claim.Intent.EffectClass),
+				"delivered_as", delivery.DeliveredAs}, spanLogAttrs(span)...)...)
 	case errors.Is(err, ErrNotificationIntentSuperseded):
 		// R4: a newer root projection replaced this one mid-flight. The
 		// message that just went out is the older projection's; the newer
 		// one edits the same root next round. Expected, not a failure.
 		w.count(func(s *NotificationWorkerStats) { s.Superseded++ })
+		span.SetAttributes(AttrResultClass.String(DeliverResultSuperseded))
+		w.auditAppend(ctx, auditKindNotificationSuperseded, intentAuditPayload(claim))
 		w.logger.Info("situation: notification worker: root projection superseded mid-delivery",
 			"intent_id", claim.Intent.ID, "situation_id", derefString(claim.Intent.SituationID))
 	case errors.Is(err, ErrNotificationClaimLost):
 		w.count(func(s *NotificationWorkerStats) { s.ClaimsLost++ })
+		span.SetAttributes(AttrResultClass.String(DeliverResultClaimLost))
 		w.logger.Warn("situation: notification worker: delivered acknowledgement lost its claim",
 			"intent_id", claim.Intent.ID)
 	default:
@@ -718,7 +823,8 @@ func (w *NotificationWorker) acknowledgeDelivered(ctx context.Context, claim Not
 	}
 }
 
-func (w *NotificationWorker) acknowledgeFailure(ctx context.Context, claim NotificationClaim, deliverErr error, now time.Time) {
+func (w *NotificationWorker) acknowledgeFailure(ctx context.Context, claim NotificationClaim,
+	deliverErr error, now time.Time, span trace.Span) {
 	class, code, retryAfter := classifyDeliveryFailure(deliverErr)
 
 	state, stateErr := w.store.GetSlackDeliveryState(ctx)
@@ -731,26 +837,43 @@ func (w *NotificationWorker) acknowledgeFailure(ctx context.Context, claim Notif
 		w.observeFailure(ctx, state, code, now)
 	}
 
+	payload := intentAuditPayload(claim)
+	// The bounded closed error CLASS only: never the deliverer's error text
+	// and never a provider response body.
+	payload["error_class"] = code
+
 	var ackErr error
 	switch class {
 	case DeliveryRetryable:
 		ackErr = w.retryClaim(ctx, claim, code, retryAfter, now)
+		if ackErr == nil {
+			span.SetAttributes(AttrResultClass.String(DeliverResultRetried))
+			w.auditAppend(ctx, auditKindNotificationRetried, payload)
+		}
 	case DeliveryConfigurationBlocking:
 		ackErr = w.store.BlockNotificationConfiguration(ctx, claim, code, now)
 		if ackErr == nil {
 			w.count(func(s *NotificationWorkerStats) { s.Blocked++ })
+			span.SetAttributes(AttrResultClass.String(DeliverResultBlocked))
+			w.auditAppend(ctx, auditKindConfigurationBlocked, payload)
 			w.logger.Warn("situation: notification worker: slack configuration rejected the effect; blocking until corrected",
-				"intent_id", claim.Intent.ID, "error_class", code)
+				append([]any{"intent_id", claim.Intent.ID, "error_class", code}, spanLogAttrs(span)...)...)
 		}
 	case DeliveryInvalid:
 		ackErr = w.store.FailNotificationIntent(ctx, claim, code, now)
 		if ackErr == nil {
 			w.count(func(s *NotificationWorkerStats) { s.Failed++ })
+			span.SetAttributes(AttrResultClass.String(DeliverResultFailed))
+			w.auditAppend(ctx, auditKindNotificationFailed, payload)
 			w.logger.Error("situation: notification worker: invalid durable intent; failed pending operator redrive",
-				"intent_id", claim.Intent.ID, "error_class", code)
+				append([]any{"intent_id", claim.Intent.ID, "error_class", code}, spanLogAttrs(span)...)...)
 		}
 	default:
 		ackErr = w.retryClaim(ctx, claim, code, retryAfter, now)
+		if ackErr == nil {
+			span.SetAttributes(AttrResultClass.String(DeliverResultRetried))
+			w.auditAppend(ctx, auditKindNotificationRetried, payload)
+		}
 	}
 	switch {
 	case ackErr == nil:

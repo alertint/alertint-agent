@@ -6,7 +6,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -692,5 +694,337 @@ func TestSituationDelivererDeliverRejectsInvalidIntent(t *testing.T) {
 	}
 	if len(api.posts) != 0 || len(api.updates) != 0 {
 		t.Fatal("an invalid intent must never reach Slack")
+	}
+}
+
+// ----------------------------------------------------------------------
+// notificationRuntime: startup recovery, worker lifecycle, shutdown (Task 9)
+// ----------------------------------------------------------------------
+
+// nrTracer records the exact order the startup pass drives its steps in.
+type nrTracer struct {
+	mu    sync.Mutex
+	trace []string
+}
+
+func (n *nrTracer) add(s string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.trace = append(n.trace, s)
+}
+
+func (n *nrTracer) snapshot() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	out := make([]string, len(n.trace))
+	copy(out, n.trace)
+	return out
+}
+
+type nrFakeStore struct {
+	tr      *nrTracer
+	state   situation.SlackDeliveryState
+	gapID   string
+	gapDone bool
+}
+
+func (f *nrFakeStore) RecoverExpiredNotificationClaims(context.Context, time.Time) (int, error) {
+	f.tr.add("recover_notification_claims")
+	return 2, nil
+}
+
+func (f *nrFakeStore) RecoverExpiredTransitionStreamClaims(context.Context, time.Time) (int, error) {
+	f.tr.add("recover_transition_stream_claims")
+	return 1, nil
+}
+
+func (f *nrFakeStore) ScheduleSituationsMissingFirstTransition(context.Context, time.Time) (int, error) {
+	f.tr.add("schedule_situations_missing_first_transition")
+	return 3, nil
+}
+
+func (f *nrFakeStore) ScheduleSituationsWithStaleRootProjection(context.Context, time.Time) (int, error) {
+	f.tr.add("schedule_stale_root_projections")
+	return 1, nil
+}
+
+func (f *nrFakeStore) GetSlackDeliveryState(context.Context) (situation.SlackDeliveryState, error) {
+	f.tr.add("read_slack_delivery_state")
+	return f.state, nil
+}
+
+func (f *nrFakeStore) RecoverDeliveryGap(context.Context, time.Time) (string, bool, error) {
+	f.tr.add("resume_gap_replay")
+	return f.gapID, f.gapDone, nil
+}
+
+type nrFakeProbe struct {
+	tr  *nrTracer
+	err error
+}
+
+func (p *nrFakeProbe) Probe(context.Context) error {
+	p.tr.add("validate_slack_configuration")
+	return p.err
+}
+
+type nrFakeWorker struct {
+	tr            *nrTracer
+	reactivated   int
+	stopBlocks    bool
+	started       bool
+	stopCallCount int
+}
+
+func (w *nrFakeWorker) Start(context.Context) {
+	w.tr.add("start_notification_worker")
+	w.started = true
+}
+
+func (w *nrFakeWorker) Stop(ctx context.Context) error {
+	w.tr.add("stop_notification_worker")
+	w.stopCallCount++
+	if w.stopBlocks {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return nil
+}
+
+func (w *nrFakeWorker) ReactivateConfiguration(context.Context) (int, error) {
+	w.tr.add("reactivate_configuration_blocked")
+	w.reactivated++
+	return 2, nil
+}
+
+type nrFakeStream struct{ tr *nrTracer }
+
+func (s *nrFakeStream) Start(context.Context) { s.tr.add("start_transition_stream_worker") }
+func (s *nrFakeStream) Stop(context.Context) error {
+	s.tr.add("stop_transition_stream_worker")
+	return nil
+}
+
+// nrRuntime takes its probe/worker as INTERFACES so a test can pass a true
+// nil (Slack disabled) rather than a typed-nil pointer that would read as a
+// present dependency.
+func nrRuntime(tr *nrTracer, st *nrFakeStore, probe slackConfigurationProbe, worker situationNotificationWorker) *notificationRuntime {
+	return &notificationRuntime{
+		store:  st,
+		probe:  probe,
+		worker: worker,
+		stream: &nrFakeStream{tr: tr},
+		logger: slog.New(slog.DiscardHandler),
+	}
+}
+
+// TestSituationNotificationRuntimeStartupFollowsTheSpecOrder pins spec.md's
+// own startup steps 2-6, in order, between Plan 1/2 reconstruction and the
+// workers starting: recover abandoned notification and stream claims;
+// schedule every nonterminal Situation missing its first Transition;
+// validate the Slack configuration and read back its durable generation;
+// reactivate configuration-blocked intents; then schedule stale root
+// projections and resume any interrupted gap replay.
+func TestSituationNotificationRuntimeStartupFollowsTheSpecOrder(t *testing.T) {
+	tr := &nrTracer{}
+	generation := int64(7)
+	st := &nrFakeStore{tr: tr, state: situation.SlackDeliveryState{
+		ConfigurationGeneration: generation, BlockedConfigurationCount: 2,
+	}, gapID: "gap-1", gapDone: true}
+	worker := &nrFakeWorker{tr: tr}
+	rt := nrRuntime(tr, st, &nrFakeProbe{tr: tr}, worker)
+
+	report, err := rt.RecoverAndReactivate(context.Background(), time.Now().UTC())
+	if err != nil {
+		t.Fatalf("RecoverAndReactivate: %v", err)
+	}
+	want := []string{
+		"recover_notification_claims",
+		"recover_transition_stream_claims",
+		"schedule_situations_missing_first_transition",
+		"validate_slack_configuration",
+		"read_slack_delivery_state",
+		"reactivate_configuration_blocked",
+		"schedule_stale_root_projections",
+		"resume_gap_replay",
+	}
+	got := tr.snapshot()
+	if len(got) != len(want) {
+		t.Fatalf("startup trace = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("startup trace = %v, want %v", got, want)
+		}
+	}
+	if report.ConfigurationGeneration != generation {
+		t.Errorf("configuration generation = %d, want %d", report.ConfigurationGeneration, generation)
+	}
+	if report.Reactivated != 2 || report.NotificationClaimsRecovered != 2 || report.StreamClaimsRecovered != 1 {
+		t.Errorf("report = %+v, want the fakes' own counts", report)
+	}
+	if !report.GapReplayResumed {
+		t.Error("an interrupted gap replay was not reported as resumed")
+	}
+	if worker.reactivated != 1 {
+		t.Errorf("ReactivateConfiguration called %d times, want exactly 1", worker.reactivated)
+	}
+}
+
+// TestSituationNotificationRuntimeStartupKeepsBlockedIntentsWhenSlackFails
+// proves a Slack configuration that does not validate at boot is an ordinary
+// delay, never a startup failure and never a reactivation: blocked intents
+// stay durably blocked, no gap is recovered, and the process still starts.
+func TestSituationNotificationRuntimeStartupKeepsBlockedIntentsWhenSlackFails(t *testing.T) {
+	tr := &nrTracer{}
+	st := &nrFakeStore{tr: tr, state: situation.SlackDeliveryState{BlockedConfigurationCount: 4}}
+	worker := &nrFakeWorker{tr: tr}
+	rt := nrRuntime(tr, st, &nrFakeProbe{tr: tr, err: errors.New("invalid_auth")}, worker)
+
+	report, err := rt.RecoverAndReactivate(context.Background(), time.Now().UTC())
+	if err != nil {
+		t.Fatalf("RecoverAndReactivate must not fail on an unreachable Slack: %v", err)
+	}
+	if report.SlackConfigurationValid {
+		t.Error("report claims a valid Slack configuration after a failed probe")
+	}
+	if report.BlockedConfigurationRetained != 4 {
+		t.Errorf("retained blocked intents = %d, want 4", report.BlockedConfigurationRetained)
+	}
+	if worker.reactivated != 0 {
+		t.Error("configuration-blocked intents were reactivated on a failed probe")
+	}
+	for _, phase := range tr.snapshot() {
+		if phase == "resume_gap_replay" {
+			t.Error("a gap was recovered while Slack was still unreachable")
+		}
+	}
+}
+
+// TestSituationNotificationRuntimeStartupWithoutSlackRetainsDurableWork
+// proves the Slack-disabled assembly: no worker and no probe exist at all,
+// the claim-recovery and scheduling steps still run, and every durable
+// blocked intent is retained rather than failed.
+func TestSituationNotificationRuntimeStartupWithoutSlackRetainsDurableWork(t *testing.T) {
+	tr := &nrTracer{}
+	st := &nrFakeStore{tr: tr, state: situation.SlackDeliveryState{BlockedConfigurationCount: 3}}
+	rt := nrRuntime(tr, st, nil, nil)
+
+	report, err := rt.RecoverAndReactivate(context.Background(), time.Now().UTC())
+	if err != nil {
+		t.Fatalf("RecoverAndReactivate: %v", err)
+	}
+	if report.SlackConfigurationValid {
+		t.Error("report claims a valid Slack configuration with Slack disabled")
+	}
+	if report.BlockedConfigurationRetained != 3 {
+		t.Errorf("retained blocked intents = %d, want 3", report.BlockedConfigurationRetained)
+	}
+	want := []string{
+		"recover_notification_claims",
+		"recover_transition_stream_claims",
+		"schedule_situations_missing_first_transition",
+		"read_slack_delivery_state",
+	}
+	got := tr.snapshot()
+	if len(got) != len(want) {
+		t.Fatalf("startup trace = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("startup trace = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestSituationNotificationRuntimeStartsAndStopsInMirroredOrder pins the
+// lifecycle order: the notification worker starts first and stops last, with
+// the stdout stream worker inside it.
+func TestSituationNotificationRuntimeStartsAndStopsInMirroredOrder(t *testing.T) {
+	tr := &nrTracer{}
+	st := &nrFakeStore{tr: tr}
+	rt := nrRuntime(tr, st, &nrFakeProbe{tr: tr}, &nrFakeWorker{tr: tr})
+
+	rt.Start(context.Background())
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	want := []string{
+		"start_notification_worker", "start_transition_stream_worker",
+		"stop_transition_stream_worker", "stop_notification_worker",
+	}
+	got := tr.snapshot()
+	if len(got) != len(want) {
+		t.Fatalf("lifecycle trace = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("lifecycle trace = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestSituationNotificationRuntimeStopEndsWithinTheShutdownContext is R6's
+// operational guarantee: a final delivery pass wedged on an unreachable
+// Slack ends when the shutdown context does. The runtime reports the
+// deadline rather than hanging, and its committed intents stay pending for
+// the next startup to reclaim — they are never failed.
+func TestSituationNotificationRuntimeStopEndsWithinTheShutdownContext(t *testing.T) {
+	tr := &nrTracer{}
+	st := &nrFakeStore{tr: tr}
+	worker := &nrFakeWorker{tr: tr, stopBlocks: true}
+	rt := nrRuntime(tr, st, &nrFakeProbe{tr: tr}, worker)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- rt.Stop(ctx) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Stop err = %v, want the shutdown context's deadline error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop never returned: a Slack outage held shutdown open")
+	}
+	if worker.stopCallCount != 1 {
+		t.Fatalf("notification worker stopped %d times, want exactly one bounded final pass", worker.stopCallCount)
+	}
+}
+
+// TestSituationNotificationRuntimeRestartAlonePublishesNothing is the
+// spec's "startup never publishes merely because the binary restarted"
+// invariant, against a real store: two full startup passes over a Situation
+// that has no history yet create no Transition, no Episode summary, and no
+// notification intent — they only make it due, so the ordinary controller
+// path decides, under the ordinary materiality rules, what (if anything) to
+// commit.
+func TestSituationNotificationRuntimeRestartAlonePublishesNothing(t *testing.T) {
+	st := newTestFoundationStore(t)
+	now := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	sitID := seedControllerRuntimeSituation(t, st, "group-restart", now)
+
+	rt := newNotificationRuntime(st, nil, nil, nil, slog.New(slog.DiscardHandler))
+	for pass := range 2 {
+		if _, err := rt.RecoverAndReactivate(context.Background(), now); err != nil {
+			t.Fatalf("RecoverAndReactivate pass %d: %v", pass+1, err)
+		}
+		for _, q := range []struct {
+			table string
+			query string
+		}{
+			{"situation_transitions", `SELECT COUNT(*) FROM situation_transitions WHERE situation_id = ?`},
+			{"situation_episode_summaries", `SELECT COUNT(*) FROM situation_episode_summaries WHERE situation_id = ?`},
+			{"notification_intents", `SELECT COUNT(*) FROM notification_intents WHERE situation_id = ?`},
+			{"situation_transition_stream", `SELECT COUNT(*) FROM situation_transition_stream WHERE situation_id = ?`},
+		} {
+			var n int
+			if err := st.DB().QueryRowContext(context.Background(), q.query, sitID).Scan(&n); err != nil {
+				t.Fatalf("count %s: %v", q.table, err)
+			}
+			if n != 0 {
+				t.Fatalf("pass %d created %d %s rows; a restart alone must publish nothing", pass+1, n, q.table)
+			}
+		}
 	}
 }

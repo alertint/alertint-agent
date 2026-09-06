@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/alertint/alertint-agent/internal/llm"
@@ -1084,6 +1085,7 @@ type historyBasis struct {
 // state warrants, so the whole reconciliation fails closed and the
 // Situation stays due.
 func (c *Controller) commit(ctx context.Context, claim Claim, basis historyBasis, commit ControllerCommit) error {
+	startedAt := time.Now()
 	history, err := c.buildHistory(claim, basis, commit)
 	if err != nil {
 		c.logger.Error("situation: controller history derivation failed",
@@ -1104,6 +1106,7 @@ func (c *Controller) commit(ctx context.Context, claim Claim, basis historyBasis
 		return &commitFailedError{err: err}
 	}
 	c.auditCommitSuccess(ctx, claim, commit)
+	c.observeHistoryCommit(ctx, claim, commit, startedAt)
 	// The enclosing reconcile span (Reconcile) learns what this cycle
 	// committed: the fresh attempt's identity/derivation, if any, and the
 	// hashes — identity and digests only.
@@ -1356,6 +1359,122 @@ func (c *Controller) auditCommitSuccess(ctx context.Context, claim Claim, commit
 			"membership_digest":     d.MembershipDigest,
 			"incident_input_digest": d.IncidentInputDigest,
 		})
+	}
+}
+
+// observeHistoryCommit is Plan 3 Task 9's audit + OTel surface for one
+// landed commit's durable history (R8). It runs AFTER CommitController has
+// returned, so no audit append or exporter call ever happens inside a
+// database transaction (Global Constraint), and it records identities,
+// sequences, versions, closed codes, and one duration — never journal
+// prose, an Episode narrative, a proposal, or a provider body.
+//
+// A non-material cycle still opens the span, with result class
+// "no_history": "this cycle deliberately wrote nothing" is an operational
+// answer worth having, and its absence would read as a lost commit.
+func (c *Controller) observeHistoryCommit(ctx context.Context, claim Claim, commit ControllerCommit, startedAt time.Time) {
+	_, span := tracer().Start(ctx, SpanHistoryCommit, trace.WithAttributes(
+		AttrSituationID.String(claim.Situation.ID),
+		AttrInputVersion.Int(claim.Situation.InputVersion),
+	))
+	defer span.End()
+
+	if commit.History == nil {
+		span.SetAttributes(
+			AttrResultClass.String(HistoryResultNoHistory),
+			AttrDurationMS.Int64(time.Since(startedAt).Milliseconds()),
+		)
+		return
+	}
+	history := commit.History
+	attrs := []attribute.KeyValue{
+		AttrResultClass.String(HistoryResultCommitted),
+		AttrDurationMS.Int64(time.Since(startedAt).Milliseconds()),
+	}
+	logAttrs := []any{
+		"situation_id", claim.Situation.ID,
+		"input_version", claim.Situation.InputVersion,
+		"transitions", len(history.Transitions),
+		"intents", len(history.Intents),
+	}
+	// A commit can legitimately carry intents but NO Transition: the R4
+	// deadline refresh of an already-published root is the one Slack effect
+	// a non-material reconciliation may create.
+	if len(history.Transitions) > 0 {
+		last := history.Transitions[len(history.Transitions)-1]
+		attrs = append(attrs,
+			AttrTransitionID.String(last.ID),
+			AttrTransitionSequence.Int(last.Sequence))
+		logAttrs = append(logAttrs,
+			"latest_transition_id", last.ID,
+			"latest_transition_sequence", last.Sequence)
+	}
+	if history.Summary != nil {
+		attrs = append(attrs, AttrSummaryVersion.Int(history.Summary.Version))
+	}
+	span.SetAttributes(attrs...)
+	c.logger.Info("situation: history committed", append(logAttrs, spanLogAttrs(span)...)...)
+
+	c.auditHistoryCommit(ctx, claim, history)
+}
+
+// auditHistoryCommit appends the bounded Plan 3 audit trail for one landed
+// commit: one row per immutable Transition (with the consumed operator
+// artifact's identity when the Transition is an artifact journaling, R1),
+// one for the Episode-summary version folded across them, and one per
+// notification intent created. Payloads carry identities and closed codes
+// only — never headline/detail prose or a Slack coordinate that does not
+// exist yet.
+func (c *Controller) auditHistoryCommit(ctx context.Context, claim Claim, history *HistoryCommit) {
+	for i := range history.Transitions {
+		t := history.Transitions[i]
+		payload := map[string]any{
+			"situation_id": t.SituationID, "transition_id": t.ID, "sequence": t.Sequence,
+			"input_version": t.InputVersion, "reason": string(t.Reason),
+			"journal_kind": string(t.JournalKind), "lifecycle": string(t.Lifecycle),
+			"attention": string(t.Attention), "actor": string(t.Actor),
+			"material_fact_hash": t.MaterialFactHash, "drill": t.Drill,
+		}
+		kind := auditKindTransitionCommitted
+		if t.OperatorArtifactInputID != nil {
+			kind = auditKindArtifactJournaled
+			payload["operator_artifact_input_id"] = *t.OperatorArtifactInputID
+		}
+		c.auditAppend(ctx, kind, payload)
+	}
+	if history.Summary != nil {
+		c.auditAppend(ctx, auditKindSummaryProjected, map[string]any{
+			"situation_id": history.Summary.SituationID, "version": history.Summary.Version,
+			"source_transition_sequence": history.Summary.SourceTransitionSequence,
+			"current_attention":          string(history.Summary.CurrentAttention),
+			"peak_attention":             string(history.Summary.PeakAttention),
+			"recurrence_count":           history.Summary.RecurrenceCount,
+		})
+	}
+	for i := range history.Intents {
+		n := history.Intents[i]
+		payload := map[string]any{
+			"situation_id": claim.Situation.ID, "intent_id": n.ID,
+			"effect_class": string(n.EffectClass), "status": string(n.Status),
+			"main_channel_poke": n.MainChannelPoke, "requires_root": n.RequiresRoot,
+		}
+		if n.InterruptionPriority != nil {
+			payload["interruption_priority"] = string(*n.InterruptionPriority)
+		}
+		if n.TransitionSequence != nil {
+			payload["transition_sequence"] = *n.TransitionSequence
+		}
+		if n.SummaryVersion != nil {
+			payload["summary_version"] = *n.SummaryVersion
+		}
+		kind := auditKindIntentCreated
+		if n.Status == model.IntentWithheld {
+			// A floor-withheld poke is a durable DECISION, not an absent
+			// row: it gets its own event so an operator can see what the
+			// configured floor actually suppressed.
+			kind = auditKindNotificationWithheld
+		}
+		c.auditAppend(ctx, kind, payload)
 	}
 }
 

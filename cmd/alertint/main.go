@@ -451,10 +451,21 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	// the Correlator itself (cor, constructed above) receives no LLM
 	// dependency of its own — corCfg/correlator.New's signature carries none,
 	// and its only path to Acute Triage is via incidentSink{skill: skill}.
-	crt, err := buildControllerRuntime(st, llmClient, llmHealth, skill, cfg.Situations, owner, auditor, logger)
+	crt, err := buildControllerRuntime(st, llmClient, llmHealth, skill, cfg.Situations,
+		cfg.Notify.Slack.MinSeverity, owner, auditor, logger)
 	if err != nil {
 		return err
 	}
+
+	// The Situation notification runtime (Plan 3 Task 9): the single
+	// reachable Situation Slack writer (present only when Situation Slack is
+	// actually configured — buildSituationNotificationRuntime) plus the
+	// stdout Transition-stream worker, which always runs because the
+	// authoritative outward state stream is not Slack-gated. Its own
+	// startup-only recovery pass (spec.md startup steps 2-6) runs after
+	// Plan 2's controller recovery and before the Correlator, and both its
+	// workers stop LAST, outside the shutdown drain rounds (R6).
+	nrt := buildSituationNotificationRuntime(cfg, st, auditor, owner, logger)
 
 	// Probe enabled integrations in the background: quickly (with backoff)
 	// while one is failing — at startup a co-deployed dependency may still
@@ -476,6 +487,15 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		// foundation reconstruction above.
 		backfillAndRecoverControllerWork: func(ctx context.Context) error {
 			return runControllerRecovery(ctx, crt, logger)
+		},
+		// Plan 3 Task 9: recover abandoned notification/stream claims,
+		// schedule Situations whose durable history is missing or whose root
+		// projection is stale, validate the Slack configuration and record
+		// its generation, reactivate configuration-blocked effects, and
+		// resume an interrupted gap replay — all startup-only and all
+		// publication-free, exactly like the two recovery passes above.
+		recoverNotificationWork: func(ctx context.Context) error {
+			return runNotificationRecovery(ctx, nrt, logger)
 		},
 		// SetAuditor is wired here — between reconstruct and cor.Start, never
 		// before — because it is synchronously reachable from ApplyDelivery's
@@ -499,8 +519,9 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 			cor.SetAuditor(auditor)
 			return cor.Start(ctx)
 		},
-		startWorkers:           rt.Start,
-		startControllerWorkers: crt.Start,
+		startWorkers:             rt.Start,
+		startControllerWorkers:   crt.Start,
+		startNotificationWorkers: nrt.Start,
 		startReceivers: func() error {
 			var err error
 			recvSrv, recvErrCh, err = startReceivers(cfg, st, auditor, healthReg, llmHealth, rt.WakeDispatch, logger)
@@ -551,6 +572,10 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		drainControllerWork:   crt.Drain,
 		stopControllerWorkers: crt.Stop,
 		stopWorkers:           rt.Stop,
+		// R6, last and outside the drain rounds: one bounded final delivery
+		// and stdout pass under the shutdown context, then claim release. An
+		// unreachable Slack delays the pass, it never holds the process.
+		stopNotificationWorkers: nrt.Stop,
 	}
 	if err := stopSeq.run(shutdownCtx); err != nil {
 		logger.Error("situation foundation shutdown failed", slog.String("err", err.Error()))

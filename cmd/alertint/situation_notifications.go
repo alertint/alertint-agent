@@ -6,9 +6,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"os"
+	"strings"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/audit"
+	"github.com/alertint/alertint-agent/internal/config"
+
 	"github.com/alertint/alertint-agent/internal/notify/slack"
+	"github.com/alertint/alertint-agent/internal/notify/stdout"
 	"github.com/alertint/alertint-agent/internal/situation"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
@@ -430,4 +437,359 @@ func classifyDeliveryError(err error) error {
 		return &deliveryAdapterError{class: class, code: apiErr.Code, retryAfter: apiErr.RetryAfter, err: err}
 	}
 	return &deliveryAdapterError{class: situation.DeliveryRetryable, code: "delivery_failed", err: err}
+}
+
+// ----------------------------------------------------------------------
+// Situation notification runtime (Plan 3 Task 9)
+//
+// notificationRuntime bundles the two Plan 3 consumers of already-committed
+// history — the Situation notification worker (the single reachable Slack
+// writer) and the stdout Transition-stream worker — plus the startup-only
+// recovery pass both depend on having already run.
+//
+// It is a THIRD runtime alongside foundationRuntime and controllerRuntime
+// rather than an extension of either, and deliberately so. controllerRuntime
+// exposes Drain, because its workers are producers whose queued work
+// shutdown must drain to quiescence; these two workers must never be
+// drained (R6: an external Slack outage would spin the bounded drain loop to
+// its round cap and hold the whole process open). Giving them a Drain they
+// may never be called with would make that guarantee a comment; leaving them
+// in their own runtime with only Start/Stop makes it structural. The second
+// reason is construction: the notification worker exists only when Situation
+// Slack is configured, while the stdout stream always runs, and folding an
+// optional Slack dependency into the always-present controller runtime would
+// leak that optionality into every controller call site.
+//
+// main constructs exactly one per process and composes it into
+// foundationSequence (recoverNotificationWork, startNotificationWorkers) and
+// foundationStopSequence (stopNotificationWorkers, last).
+// ----------------------------------------------------------------------
+
+// notificationStartupStore is exactly the durable surface the startup pass
+// drives. *store.Store satisfies it — asserted below.
+type notificationStartupStore interface {
+	RecoverExpiredNotificationClaims(ctx context.Context, now time.Time) (int, error)
+	RecoverExpiredTransitionStreamClaims(ctx context.Context, now time.Time) (int, error)
+	ScheduleSituationsMissingFirstTransition(ctx context.Context, now time.Time) (int, error)
+	ScheduleSituationsWithStaleRootProjection(ctx context.Context, now time.Time) (int, error)
+	GetSlackDeliveryState(ctx context.Context) (situation.SlackDeliveryState, error)
+	RecoverDeliveryGap(ctx context.Context, now time.Time) (string, bool, error)
+}
+
+// slackConfigurationProbe is the readiness check startup step 4 runs.
+// *SituationDeliverer satisfies it; it is nil when Slack is not configured.
+type slackConfigurationProbe interface {
+	Probe(ctx context.Context) error
+}
+
+// situationNotificationWorker is exactly what this runtime drives on the
+// notification worker. *situation.NotificationWorker satisfies it.
+type situationNotificationWorker interface {
+	Start(ctx context.Context)
+	Stop(ctx context.Context) error
+	ReactivateConfiguration(ctx context.Context) (int, error)
+}
+
+// transitionStreamWorker is exactly what this runtime drives on the stdout
+// stream worker. *stdout.TransitionStreamWorker satisfies it.
+type transitionStreamWorker interface {
+	Start(ctx context.Context)
+	Stop(ctx context.Context) error
+}
+
+var (
+	_ notificationStartupStore     = (*store.Store)(nil)
+	_ stdout.TransitionStreamStore = (*store.Store)(nil)
+)
+
+// notificationRuntime owns the Slack notification worker (nil when
+// Situation Slack is not configured) and the stdout Transition-stream
+// worker (always present — the state stream is not Slack-gated).
+type notificationRuntime struct {
+	store  notificationStartupStore
+	probe  slackConfigurationProbe
+	worker situationNotificationWorker
+	stream transitionStreamWorker
+	logger *slog.Logger
+}
+
+// newNotificationRuntime wires the runtime. worker/probe may both be nil
+// (Situation Slack disabled or unconfigured), in which case durable blocked
+// intents are retained untouched and only the stdout stream runs. stream may
+// be nil only in tests that exercise the startup pass alone.
+func newNotificationRuntime(st notificationStartupStore, probe slackConfigurationProbe,
+	worker situationNotificationWorker, stream transitionStreamWorker, logger *slog.Logger) *notificationRuntime {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &notificationRuntime{store: st, probe: probe, worker: worker, stream: stream, logger: logger}
+}
+
+// notificationRecovery is the startup pass's report, for
+// logNotificationRecoveryReport's sibling logging call.
+type notificationRecovery struct {
+	NotificationClaimsRecovered  int
+	StreamClaimsRecovered        int
+	ScheduledMissingHistory      int
+	ScheduledStaleRoot           int
+	SlackConfigurationValid      bool
+	ConfigurationGeneration      int64
+	Reactivated                  int
+	BlockedConfigurationRetained int
+	GapReplayResumed             bool
+	GapGeneration                string
+}
+
+// RecoverAndReactivate runs spec.md's own startup steps 2 through 6, in that
+// exact order, after Plan 1/2 reconstruction and Plan 2's controller
+// recovery and BEFORE any worker or Receiver starts:
+//
+//  2. recover expired notification and stdout-stream claims;
+//  3. schedule every nonterminal Situation missing its first Transition;
+//  4. validate the Slack configuration and record its generation;
+//  5. reactivate eligible configuration-blocked intents; and
+//  6. perform stale-root supersession and resume ordered recovery replay.
+//
+// It publishes nothing. Steps 3 and 6 only pull a Situation's next
+// assessment forward, so the ordinary controller path decides — under the
+// ordinary materiality and publication rules — whether anything is committed
+// at all; a restart on unchanged truth therefore creates no Transition and
+// no Slack effect ("Startup never publishes merely because the binary
+// restarted").
+//
+// A failed Slack probe is NOT an error: an unreachable or misconfigured
+// Slack at boot is an ordinary delay, so steps 5 and 6 are skipped, every
+// blocked intent stays durably blocked, and the process still starts. Only a
+// genuine Store failure returns an error — and then the caller must not
+// start Receivers.
+func (r *notificationRuntime) RecoverAndReactivate(ctx context.Context, now time.Time) (notificationRecovery, error) {
+	var report notificationRecovery
+
+	recovered, err := r.store.RecoverExpiredNotificationClaims(ctx, now)
+	if err != nil {
+		return report, fmt.Errorf("situation notifications: recover expired notification claims: %w", err)
+	}
+	report.NotificationClaimsRecovered = recovered
+
+	recoveredStream, err := r.store.RecoverExpiredTransitionStreamClaims(ctx, now)
+	if err != nil {
+		return report, fmt.Errorf("situation notifications: recover expired transition stream claims: %w", err)
+	}
+	report.StreamClaimsRecovered = recoveredStream
+
+	scheduled, err := r.store.ScheduleSituationsMissingFirstTransition(ctx, now)
+	if err != nil {
+		return report, fmt.Errorf("situation notifications: schedule situations missing a first transition: %w", err)
+	}
+	report.ScheduledMissingHistory = scheduled
+
+	report.SlackConfigurationValid = r.validateSlackConfiguration(ctx)
+
+	state, err := r.store.GetSlackDeliveryState(ctx)
+	if err != nil {
+		return report, fmt.Errorf("situation notifications: read slack delivery state: %w", err)
+	}
+	report.ConfigurationGeneration = state.ConfigurationGeneration
+	report.BlockedConfigurationRetained = state.BlockedConfigurationCount
+
+	if !report.SlackConfigurationValid {
+		return report, nil
+	}
+	if err := r.reactivateAndResume(ctx, now, &report); err != nil {
+		return report, err
+	}
+	return report, nil
+}
+
+// validateSlackConfiguration is startup step 4. No probe at all (Slack
+// disabled) and a failed probe are both "not validated": neither may
+// reactivate a blocked intent, since only a corrected configuration may, and
+// neither is a startup failure.
+func (r *notificationRuntime) validateSlackConfiguration(ctx context.Context) bool {
+	if r.probe == nil {
+		return false
+	}
+	if err := r.probe.Probe(ctx); err != nil {
+		r.logger.Warn("situation notifications: slack configuration did not validate at startup; "+
+			"blocked effects are retained and delivery is delayed", slog.String("err", err.Error()))
+		return false
+	}
+	return true
+}
+
+// reactivateAndResume is startup steps 5 and 6, reached only once the Slack
+// configuration has actually validated.
+func (r *notificationRuntime) reactivateAndResume(ctx context.Context, now time.Time, report *notificationRecovery) error {
+	if r.worker != nil {
+		// Exactly once per process (the worker's own one-shot guard makes
+		// this idempotent against its first steady-state probe, whichever
+		// runs first).
+		n, err := r.worker.ReactivateConfiguration(ctx)
+		if err != nil {
+			return fmt.Errorf("situation notifications: reactivate configuration-blocked intents: %w", err)
+		}
+		report.Reactivated = n
+		if n > 0 && report.BlockedConfigurationRetained >= n {
+			report.BlockedConfigurationRetained -= n
+		}
+	}
+	staleRoots, err := r.store.ScheduleSituationsWithStaleRootProjection(ctx, now)
+	if err != nil {
+		return fmt.Errorf("situation notifications: schedule situations with a stale root projection: %w", err)
+	}
+	report.ScheduledStaleRoot = staleRoots
+
+	generation, resumed, err := r.store.RecoverDeliveryGap(ctx, now)
+	if err != nil {
+		return fmt.Errorf("situation notifications: resume delivery gap replay: %w", err)
+	}
+	report.GapReplayResumed = resumed
+	report.GapGeneration = generation
+	return nil
+}
+
+// Start launches the notification worker, then the stdout stream worker,
+// each on its own background schedule. Call only after RecoverAndReactivate
+// has succeeded, and after the controller/Triage workers have started.
+func (r *notificationRuntime) Start(ctx context.Context) {
+	if r.worker != nil {
+		r.worker.Start(ctx)
+	}
+	if r.stream != nil {
+		r.stream.Start(ctx)
+	}
+}
+
+// Stop stops the stdout stream worker, then the notification worker — the
+// reverse of Start, mirroring the other two runtimes' stop-in-reverse
+// discipline. Each runs its own ONE bounded final pass under ctx and then
+// releases every claim it still holds (R6). Neither ever joins the shutdown
+// drain rounds, so an unreachable Slack cannot hold the process open past
+// the shutdown context's own deadline; whatever stays pending is reclaimed
+// at the next startup.
+func (r *notificationRuntime) Stop(ctx context.Context) error {
+	var errs []error
+	if r.stream != nil {
+		if err := r.stream.Stop(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("transition stream worker stop: %w", err))
+		}
+	}
+	if r.worker != nil {
+		if err := r.worker.Stop(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("notification worker stop: %w", err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// logNotificationRecoveryReport logs one RecoverAndReactivate pass at
+// startup — the sibling of logReconstructionReport and
+// logControllerRecoveryReport.
+func logNotificationRecoveryReport(logger *slog.Logger, report notificationRecovery) {
+	logger.Info("situation notifications recovered",
+		slog.Int("notification_claims_recovered", report.NotificationClaimsRecovered),
+		slog.Int("transition_stream_claims_recovered", report.StreamClaimsRecovered),
+		slog.Int("situations_scheduled_for_first_transition", report.ScheduledMissingHistory),
+		slog.Int("situations_scheduled_for_stale_root", report.ScheduledStaleRoot),
+		slog.Bool("slack_configuration_valid", report.SlackConfigurationValid),
+		slog.Int64("slack_configuration_generation", report.ConfigurationGeneration),
+		slog.Int("configuration_blocked_reactivated", report.Reactivated),
+		slog.Int("configuration_blocked_retained", report.BlockedConfigurationRetained),
+		slog.Bool("gap_replay_resumed", report.GapReplayResumed),
+	)
+	if report.BlockedConfigurationRetained > 0 {
+		logger.Warn("situation notifications: durable effects remain blocked on Slack configuration; "+
+			"they are retained, never failed, and reactivate after a restart with corrected configuration",
+			slog.Int("blocked_effects", report.BlockedConfigurationRetained))
+	}
+}
+
+// runNotificationRecovery runs one notificationRuntime.RecoverAndReactivate
+// pass and logs its report — the recoverNotificationWork step of runServe's
+// own startupSeq. A named function, not a closure, for the same
+// gocyclo reason runFoundationReconstruction and runControllerRecovery are.
+func runNotificationRecovery(ctx context.Context, nrt *notificationRuntime, logger *slog.Logger) error {
+	report, err := nrt.RecoverAndReactivate(ctx, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("situation notification recovery: %w", err)
+	}
+	logNotificationRecoveryReport(logger, report)
+	return nil
+}
+
+// buildSituationNotificationRuntime assembles the process's one
+// notificationRuntime from configuration.
+//
+// The stdout Transition-stream worker is ALWAYS built: spec.md makes
+// Situation Transition events the authoritative outward state stream, and a
+// silent, floor-withheld, or Slack-disabled installation still emits its
+// complete history there. `notify.stdout` gates the legacy Finding JSON
+// lines only, never this stream.
+//
+// The Slack notification worker is built only when Situation Slack is
+// actually usable: enabled, with a resolvable bot token and a channel. When
+// it is not, no Slack credential is constructed on this path at all and
+// every durable blocked intent is retained untouched — never failed, never
+// silently dropped — so a restart with corrected configuration reactivates
+// it. Together with buildNotifier's System-message-only Slack notifier
+// (ADR-0042/ADR-0046), these are the only two places in production that
+// receive a Slack credential.
+func buildSituationNotificationRuntime(cfg *config.Config, st *store.Store, auditor *audit.Auditor,
+	owner string, logger *slog.Logger) *notificationRuntime {
+	// TRUE nil interfaces, never typed nils: a nil *audit.Auditor stored in
+	// an interface is non-nil and would panic on its first Append (the same
+	// typed-nil trap sentryErrorSource/zabbixContextSource guard against).
+	var streamAudit stdout.TransitionStreamAuditSink
+	var deliveryAudit situation.AuditSink
+	if auditor != nil {
+		streamAudit = auditor
+		deliveryAudit = auditor
+	}
+	stream := stdout.NewTransitionStreamWorker(os.Stdout, st,
+		stdout.TransitionStreamConfig{Owner: owner + ":transition-stream"}, streamAudit,
+		func() time.Time { return time.Now().UTC() }, logger)
+
+	probe, worker := buildSituationSlackWorker(cfg, st, owner, deliveryAudit, logger)
+	if worker == nil {
+		logger.Info("situation notifications: slack delivery is not configured; "+
+			"Situation history is complete in the store, MCP, audit, and the stdout Transition stream",
+			slog.Bool("slack_enabled", cfg.Notify.Slack.Enabled))
+	} else {
+		logger.Info("situation notifications: slack delivery ready",
+			slog.String("slack_channel", cfg.Notify.Slack.Channel))
+	}
+	return newNotificationRuntime(st, probe, worker, stream, logger)
+}
+
+// buildSituationSlackWorker resolves the Slack credential and, when it is
+// usable, constructs the deliverer and the single notification worker. It
+// returns (nil, nil) — TRUE nil interfaces, never typed nils — whenever
+// Situation Slack cannot be used.
+func buildSituationSlackWorker(cfg *config.Config, st *store.Store, owner string,
+	auditSink situation.AuditSink, logger *slog.Logger) (slackConfigurationProbe, situationNotificationWorker) {
+	if !cfg.Notify.Slack.Enabled || strings.TrimSpace(cfg.Notify.Slack.Channel) == "" {
+		return nil, nil
+	}
+	token, err := cfg.SlackBotToken()
+	if err != nil || strings.TrimSpace(token) == "" {
+		logger.Warn("situation notifications: slack is enabled but no bot token resolved; " +
+			"Situation Slack delivery stays off and durable effects are retained")
+		return nil, nil
+	}
+	api := slack.NewClient(slack.Config{BotToken: token})
+	deliverer := NewSituationDeliverer(st, api, cfg.Notify.Slack.Channel, func() time.Time { return time.Now().UTC() })
+	worker := situation.NewNotificationWorker(st, deliverer,
+		situation.NotificationWorkerConfig{
+			// Lease/heartbeat reuse Plan 2's existing situations.* settings
+			// (plan.md: "Plan 3 adds no duplicate notification knobs"); Poll,
+			// Batch, the retry schedule, and the five-minute gap threshold are
+			// the protocol's own constants, not operator knobs.
+			Owner:     owner + ":notifications",
+			Lease:     time.Duration(cfg.Situations.LeaseSeconds) * time.Second,
+			Heartbeat: time.Duration(cfg.Situations.HeartbeatSeconds) * time.Second,
+			Poll:      time.Duration(cfg.Situations.ReconcilePollSeconds) * time.Second,
+		},
+		func() time.Time { return time.Now().UTC() }, logger)
+	worker.SetAuditSink(auditSink)
+	return deliverer, worker
 }

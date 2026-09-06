@@ -14,6 +14,7 @@ import (
 	"github.com/alertint/alertint-agent/internal/llm"
 	"github.com/alertint/alertint-agent/internal/llmhealth"
 	"github.com/alertint/alertint-agent/internal/situation"
+	"github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/skills/acutetriage"
 )
@@ -73,6 +74,7 @@ func newControllerRuntime(
 	assessClient situation.AssessmentClient,
 	skill *acutetriage.Skill,
 	cfg config.SituationsConfig,
+	slackMinSeverity string,
 	owner string,
 	auditSink situation.AuditSink,
 	logger *slog.Logger,
@@ -80,7 +82,7 @@ func newControllerRuntime(
 	if strings.TrimSpace(owner) == "" {
 		panic("cmd/alertint: controller runtime requires a non-empty owner")
 	}
-	controllerCfg, workerCfg := situationsConfigToControllerConfig(cfg, owner)
+	controllerCfg, workerCfg := situationsConfigToControllerConfig(cfg, slackInterruptionFloor(slackMinSeverity), owner)
 
 	worker := situation.NewControllerWorker(st, st, assessClient, controllerCfg, workerCfg, nil, auditSink, logger)
 
@@ -116,6 +118,7 @@ func buildControllerRuntime(
 	llmHealth *llmhealth.Tracker,
 	skill *acutetriage.Skill,
 	cfg config.SituationsConfig,
+	slackMinSeverity string,
 	owner string,
 	auditSink situation.AuditSink,
 	logger *slog.Logger,
@@ -124,7 +127,7 @@ func buildControllerRuntime(
 	if err != nil {
 		return nil, fmt.Errorf("situation controller: %w", err)
 	}
-	crt := newControllerRuntime(st, assessClient, skill, cfg, owner, auditSink, logger)
+	crt := newControllerRuntime(st, assessClient, skill, cfg, slackMinSeverity, owner, auditSink, logger)
 	crt.SetDependencyRecoveryWaker(llmHealthDependencyWaker{tracker: llmHealth, st: st})
 	crt.SetAssessmentHealthObserver(llmHealthAssessmentObserver{tracker: llmHealth})
 	return crt, nil
@@ -142,8 +145,20 @@ func buildControllerRuntime(
 // PollingIntervalSeconds has no config.SituationsConfig source (no polling
 // connector exists in this build) and is left at its zero-value default —
 // see ControllerConfig's own doc comment.
-func situationsConfigToControllerConfig(cfg config.SituationsConfig, owner string) (situation.ControllerConfig, situation.ControllerWorkerConfig) {
+//
+// Plan 3 Task 9 adds the two publication-policy fields Task 5 declared but
+// left unwired: notify.slack.min_severity -> ControllerConfig.SlackFloor
+// (through slackInterruptionFloor, since the Situation path reads that
+// setting as an Interruption-priority floor, never as Alert severity) and
+// situations.slack.repage_cooldown_seconds -> ControllerConfig.
+// RepageCooldown. Left at their zero values they would silently mean "no
+// floor" and "the built-in 900s default", so an operator who configured
+// either would have been ignored.
+func situationsConfigToControllerConfig(cfg config.SituationsConfig, slackFloor model.InterruptionPriority,
+	owner string) (situation.ControllerConfig, situation.ControllerWorkerConfig) {
 	controllerCfg := situation.ControllerConfig{
+		SlackFloor:     slackFloor,
+		RepageCooldown: time.Duration(cfg.Slack.RepageCooldownSeconds) * time.Second,
 		Cadence: situation.CadenceTempo{
 			Fast:   time.Duration(cfg.Cadence.FastSeconds) * time.Second,
 			Normal: time.Duration(cfg.Cadence.NormalSeconds) * time.Second,
@@ -168,6 +183,32 @@ func situationsConfigToControllerConfig(cfg config.SituationsConfig, owner strin
 		L2Concurrency: cfg.LLMConcurrency,
 	}
 	return controllerCfg, workerCfg
+}
+
+// slackInterruptionFloor maps the operator's existing notify.slack.
+// min_severity setting onto the Situation path's minimum Interruption
+// priority (spec.md "Publication authority and Interruption priority": the
+// setting keeps its accepted low|medium|high values but is compared with
+// Interruption priority ONLY — never with Alert or model severity).
+//
+// An empty or unrecognized value maps to the empty floor, which
+// situation.MeetsSlackFloor treats as "no floor": a setting this build does
+// not understand must never silently become a stricter one that withholds
+// operator history. "critical" is a valid Interruption priority with no
+// min_severity equivalent, so this compatibility setting can never select
+// it (internal/config's own
+// TestNotifySlackMinSeverityIsInterruptionPriorityFloor pins the value set).
+func slackInterruptionFloor(minSeverity string) model.InterruptionPriority {
+	switch strings.ToLower(strings.TrimSpace(minSeverity)) {
+	case string(model.InterruptionLow):
+		return model.InterruptionLow
+	case string(model.InterruptionMedium):
+		return model.InterruptionMedium
+	case string(model.InterruptionHigh):
+		return model.InterruptionHigh
+	default:
+		return ""
+	}
 }
 
 // controllerRecovery is the startup-only recovery/backfill pass's report,

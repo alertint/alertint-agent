@@ -210,9 +210,11 @@ func (r *foundationRuntime) WakeDispatch() {
 type foundationSequence struct {
 	reconstruct                      func(ctx context.Context) error
 	backfillAndRecoverControllerWork func(ctx context.Context) error
+	recoverNotificationWork          func(ctx context.Context) error
 	startCorrelator                  func(ctx context.Context) error
 	startWorkers                     func(ctx context.Context)
 	startControllerWorkers           func(ctx context.Context)
+	startNotificationWorkers         func(ctx context.Context)
 	startReceivers                   func() error
 }
 
@@ -225,12 +227,20 @@ func (f foundationSequence) run(ctx context.Context) error {
 			return err
 		}
 	}
+	if f.recoverNotificationWork != nil {
+		if err := f.recoverNotificationWork(ctx); err != nil {
+			return err
+		}
+	}
 	if err := f.startCorrelator(ctx); err != nil {
 		return err
 	}
 	f.startWorkers(ctx)
 	if f.startControllerWorkers != nil {
 		f.startControllerWorkers(ctx)
+	}
+	if f.startNotificationWorkers != nil {
+		f.startNotificationWorkers(ctx)
 	}
 	return f.startReceivers()
 }
@@ -286,6 +296,20 @@ type foundationStopSequence struct {
 	drainControllerWork   func(ctx context.Context) (int, error)
 	stopControllerWorkers func(ctx context.Context) error
 	stopWorkers           func(ctx context.Context) error
+	// stopNotificationWorkers is Plan 3's own final stage (R6). It runs
+	// LAST — after every producer of durable history has stopped — and
+	// deliberately outside drainToQuiescence: the Situation notification
+	// worker and the stdout Transition-stream worker consume history that
+	// is already committed, so they owe shutdown exactly one bounded final
+	// pass under ctx followed by the release of every claim they still
+	// hold, never a share of the drain rounds. An unreachable Slack is the
+	// reason: joining the rounds would let an external outage spin the loop
+	// to maxShutdownDrainRounds and hold the whole process open, while a
+	// stage bounded by the shutdown context simply ends and leaves its
+	// committed intents pending for the next startup to reclaim. May be nil
+	// (no Plan 3 notification runtime composed in), in which case the
+	// sequence ends at stopWorkers exactly as it did before Plan 3.
+	stopNotificationWorkers func(ctx context.Context) error
 }
 
 // maxShutdownDrainRounds bounds foundationStopSequence's drain loop.
@@ -307,6 +331,11 @@ func (f foundationStopSequence) run(ctx context.Context) error {
 	}
 	if err := f.stopWorkers(ctx); err != nil {
 		errs = append(errs, err)
+	}
+	if f.stopNotificationWorkers != nil {
+		if err := f.stopNotificationWorkers(ctx); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	return errors.Join(errs...)
 }

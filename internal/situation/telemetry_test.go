@@ -4,6 +4,8 @@ package situation_test
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +15,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
+	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/llm"
 	"github.com/alertint/alertint-agent/internal/situation"
 	"github.com/alertint/alertint-agent/internal/situation/model"
@@ -239,4 +242,153 @@ func TestTelemetryTriageAttemptSpanCarriesAttemptIdentityAndDigests(t *testing.T
 		t.Fatalf("input version = %d, want %d", got, claim.DecisionInputVersion)
 	}
 	attrValue(t, a, situation.AttrDurationMS)
+}
+
+// ----------------------------------------------------------------------
+// Plan 3 Task 9 (R8): the three additional spans, on the same scope
+// ----------------------------------------------------------------------
+
+// TestTelemetryHistoryCommitSpanCarriesTransitionAndSummaryIdentity drives
+// one work-bearing controller cycle and proves the new
+// situation.history.commit span exists on Plan 2's tracer scope, carries the
+// Transition/summary identity attributes R8 names, and carries nothing that
+// could be journal prose, an Episode narrative, a proposal, or SQL text.
+func TestTelemetryHistoryCommitSpanCarriesTransitionAndSummaryIdentity(t *testing.T) {
+	exporter := installSpanRecorder(t)
+
+	in := ctBaseSnapshotInput()
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 2, beginRetryEpoch: 1}
+	client := &fakeAssessmentClient{responses: []func() (llm.OneShotCompletion, error){acceptedResponse(t)}}
+	c := ctController(t, store, client)
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	spans := spansNamed(exporter.GetSpans(), situation.SpanHistoryCommit)
+	if len(spans) != 1 {
+		t.Fatalf("history commit spans = %d, want exactly 1", len(spans))
+	}
+	span := spans[0]
+	if got := attrValue(t, span, situation.AttrResultClass).AsString(); got != situation.HistoryResultCommitted {
+		t.Errorf("result class = %q, want %q", got, situation.HistoryResultCommitted)
+	}
+	if attrValue(t, span, situation.AttrSituationID).AsString() == "" {
+		t.Error("history commit span carries no situation id")
+	}
+	if attrValue(t, span, situation.AttrTransitionID).AsString() == "" {
+		t.Error("history commit span carries no transition id")
+	}
+	if attrValue(t, span, situation.AttrTransitionSequence).AsInt64() < 1 {
+		t.Error("history commit span carries no transition sequence")
+	}
+	if attrValue(t, span, situation.AttrSummaryVersion).AsInt64() < 1 {
+		t.Error("history commit span carries no episode summary version")
+	}
+	if attrValue(t, span, situation.AttrDurationMS).AsInt64() < 0 {
+		t.Error("history commit span carries a negative duration")
+	}
+	assertNoPayloadAttributes(t, span)
+}
+
+// assertNoPayloadAttributes is the existing payload-absence pattern applied
+// to a Plan 3 span: every attribute must be a bounded identity, closed code,
+// digest, count, or duration — never prose, a token, a Slack response body,
+// or SQL text.
+func assertNoPayloadAttributes(t *testing.T, span tracetest.SpanStub) {
+	t.Helper()
+	forbiddenSubstrings := []string{"SELECT ", "INSERT ", "xoxb-", "Bearer ", "{\"blocks\"", "\"ok\":"}
+	for _, kv := range span.Attributes {
+		if !strings.HasPrefix(string(kv.Key), "alertint.") {
+			t.Errorf("span %q carries a non-alertint attribute %q", span.Name, kv.Key)
+		}
+		value := kv.Value.String()
+		if len(value) > 128 {
+			t.Errorf("span %q attribute %q is %d bytes; bounded identities are never that long", span.Name, kv.Key, len(value))
+		}
+		for _, forbidden := range forbiddenSubstrings {
+			if strings.Contains(value, forbidden) {
+				t.Errorf("span %q attribute %q leaks %q", span.Name, kv.Key, forbidden)
+			}
+		}
+	}
+}
+
+// TestTelemetryPlan3SpansShareTheExistingScopeAndAddNoMetrics proves R8's
+// two structural rules at once: the three new span names are declared on the
+// same instrumentation scope Plan 2 uses (there is exactly one tracerName in
+// this package), and Plan 3 introduces no OTel metric instrument anywhere in
+// the packages it touches — the operational counts live in bounded MCP
+// fields and log fields instead.
+func TestTelemetryPlan3SpansShareTheExistingScopeAndAddNoMetrics(t *testing.T) {
+	for _, name := range []string{
+		situation.SpanHistoryCommit, situation.SpanNotificationDeliver, situation.SpanTransitionStreamEmit,
+	} {
+		if !strings.HasPrefix(name, "situation.") {
+			t.Errorf("span name %q is outside the situation.* family", name)
+		}
+	}
+	// The existing three must be untouched.
+	for name, want := range map[string]string{
+		situation.SpanControllerReconcile: "situation.controller.reconcile",
+		situation.SpanAssessmentDispatch:  "situation.assessment.dispatch",
+		situation.SpanTriageAttempt:       "incident.triage.attempt",
+	} {
+		if name != want {
+			t.Errorf("existing span renamed to %q, want %q", name, want)
+		}
+	}
+	for _, dir := range []string{".", "../notify/stdout", "../mcp"} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("read %s: %v", dir, err)
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
+				continue
+			}
+			src, err := os.ReadFile(filepath.Join(dir, e.Name()))
+			if err != nil {
+				t.Fatalf("read %s/%s: %v", dir, e.Name(), err)
+			}
+			for _, forbidden := range []string{"otel/metric", "GetMeterProvider", "Int64Counter", "Float64Histogram"} {
+				if strings.Contains(string(src), forbidden) {
+					t.Errorf("%s/%s references %q; R8 forbids OTel metric instruments in Plan 3", dir, e.Name(), forbidden)
+				}
+			}
+		}
+	}
+}
+
+// TestTelemetryAuditKindsMatchTheAuditCatalog pins that the audit event
+// names internal/situation emits (restated there because it cannot import
+// internal/audit without closing an import cycle in that package's own test
+// binary) are exactly a subset of internal/audit's catalog of record, and
+// that the catalog itself covers every name any emitter uses.
+func TestTelemetryAuditKindsMatchTheAuditCatalog(t *testing.T) {
+	catalog := map[string]bool{}
+	for _, kind := range audit.SituationHistoryKinds() {
+		catalog[kind] = true
+	}
+	for _, kind := range situation.AuditKindsEmittedHere() {
+		if !catalog[kind] {
+			t.Errorf("internal/situation emits %q, which internal/audit's catalog does not name", kind)
+		}
+	}
+	// The two the stdout stream worker owns complete the catalog; nothing
+	// else may be left unclaimed.
+	claimed := map[string]bool{
+		audit.KindTransitionStreamEmitted: true,
+		audit.KindTransitionStreamFailed:  true,
+		// R2's owner_terminal event belongs to the input-application path
+		// (internal/store), which records the artifact without journaling it.
+		audit.KindHistoryArtifactOwnerTerminal: true,
+	}
+	for _, kind := range situation.AuditKindsEmittedHere() {
+		claimed[kind] = true
+	}
+	for kind := range catalog {
+		if !claimed[kind] {
+			t.Errorf("catalog names %q but no emitter claims it", kind)
+		}
+	}
 }

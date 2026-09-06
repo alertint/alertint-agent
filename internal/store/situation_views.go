@@ -535,3 +535,241 @@ func (s *Store) ListPendingTransitionStream(ctx context.Context, limit int) ([]P
 	}
 	return out, nil
 }
+
+// ----------------------------------------------------------------------
+// Plan 3 Task 9: bounded delivery read views. MCP's read-only history and
+// delivery surfaces read ONLY these — never the ledger tables directly, and
+// never a claim owner, claim token, lease, Slack token, or provider error
+// body. Every count below is derived from durable columns; Plan 3 adds no
+// OTel metric instruments (R8), so these bounded fields plus the worker's
+// log lines are the whole operational signal.
+// ----------------------------------------------------------------------
+
+// ListSituationNotificationIntents reads one Situation's durable delivery
+// obligations in the order spec.md's own ordering rules read them: root
+// projection first, then Transition sequence, then id. limit is clamped to
+// maxSituationHistoryPage.
+func (s *Store) ListSituationNotificationIntents(ctx context.Context, situationID string, limit int) ([]situationmodel.NotificationIntent, error) {
+	if strings.TrimSpace(situationID) == "" {
+		return nil, errors.New("store: situation notification intents read requires a situation id")
+	}
+	if limit <= 0 || limit > maxSituationHistoryPage {
+		limit = maxSituationHistoryPage
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+notificationIntentColumns+`
+		FROM notification_intents
+		WHERE situation_id = ?
+		ORDER BY (effect_class = 'root_sync') DESC, transition_sequence ASC, id ASC
+		LIMIT ?`, situationID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: list situation notification intents: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := []situationmodel.NotificationIntent{}
+	for rows.Next() {
+		intent, err := scanNotificationIntent(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: scan situation notification intent: %w", err)
+		}
+		out = append(out, intent)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate situation notification intents: %w", err)
+	}
+	return out, nil
+}
+
+// EffectClassDeliveryStats is one effect class's bounded delivery counters.
+type EffectClassDeliveryStats struct {
+	EffectClass   string `json:"effect_class"`
+	Pending       int    `json:"pending"`
+	Retrying      int    `json:"retrying"`
+	Delivered     int    `json:"delivered"`
+	Blocked       int    `json:"blocked_configuration"`
+	Failed        int    `json:"failed"`
+	Withheld      int    `json:"withheld_by_operator_slack_floor"`
+	Superseded    int    `json:"superseded"`
+	RetryAttempts int    `json:"retry_attempts"`
+}
+
+// NotificationDeliveryStats is the installation-level bounded delivery
+// snapshot MCP exposes: retries by effect class, open gap age, replay
+// backlog, and uncertain-outcome counts (spec.md "MCP, audit, logs, OTel,
+// and stdout"; R8 keeps them fields, never metric instruments).
+type NotificationDeliveryStats struct {
+	ByEffectClass []EffectClassDeliveryStats `json:"by_effect_class"`
+	// OpenGapAgeSeconds is how long the currently open-or-replaying gap
+	// generation has existed, nil when there is none.
+	OpenGapAgeSeconds *int64 `json:"open_gap_age_seconds"`
+	// ReplayBacklog is how many Situation-scoped intents a currently
+	// replaying generation still has to deliver — the same "existed when
+	// this generation recovered" definition the claim gate uses. Zero when
+	// no generation is replaying.
+	ReplayBacklog int `json:"replay_backlog"`
+	// UncertainOutcomes counts intents whose last recorded failure class is
+	// one where Slack's answer did not prove either success or failure
+	// (transport error, timeout, undecodable response). It is the durable
+	// trace of ADR-0049's accepted rare external-duplicate risk.
+	UncertainOutcomes int `json:"uncertain_outcomes"`
+	// BlockedConfigurationCount counts intents held in
+	// blocked_configuration. BlockedConfigurationSubsumed is how many of
+	// those are stale root projections a newer pending root projection for
+	// the same Situation already replaces — they can never be reactivated
+	// into a delivery, so an operator reading the first number needs the
+	// second to know how much of it is actionable.
+	BlockedConfigurationCount    int `json:"blocked_configuration_count"`
+	BlockedConfigurationSubsumed int `json:"blocked_configuration_subsumed"`
+	// TransitionStreamPending/Failed are the stdout Transition stream's own
+	// backlog. Stdout delivery is independent of Slack: a pending stream row
+	// says nothing about Slack, and a delivered one implies no Slack effect.
+	TransitionStreamPending int `json:"transition_stream_pending"`
+	TransitionStreamFailed  int `json:"transition_stream_failed"`
+}
+
+// uncertainDeliveryErrorClasses are the bounded last_error_class values that
+// mean "Slack's answer did not prove either outcome" — the exact codes
+// internal/notify/slack's client records for a transport failure, a timeout,
+// and a 2xx body it could not decode.
+var uncertainDeliveryErrorClasses = []string{"transport_error", "timeout", "undecodable_response"}
+
+// GetNotificationDeliveryStats reads the bounded installation-level delivery
+// snapshot in one snapshot transaction, so its counters can never disagree
+// with each other. It returns counts only — never an intent body, a claim
+// owner, a Slack coordinate, or a provider error body.
+func (s *Store) GetNotificationDeliveryStats(ctx context.Context, now time.Time) (NotificationDeliveryStats, error) {
+	nowStr := canonicalTime(now.UTC())
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return NotificationDeliveryStats{}, fmt.Errorf("store: begin notification delivery stats: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stats := NotificationDeliveryStats{ByEffectClass: []EffectClassDeliveryStats{}}
+	if err := readEffectClassStatsTx(ctx, tx, nowStr, &stats); err != nil {
+		return NotificationDeliveryStats{}, err
+	}
+	if err := readGapStatsTx(ctx, tx, now, &stats); err != nil {
+		return NotificationDeliveryStats{}, err
+	}
+	if err := readUncertainAndBlockedStatsTx(ctx, tx, &stats); err != nil {
+		return NotificationDeliveryStats{}, err
+	}
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(status = 'pending'), 0), COALESCE(SUM(status = 'failed'), 0)
+		FROM situation_transition_stream`).
+		Scan(&stats.TransitionStreamPending, &stats.TransitionStreamFailed); err != nil {
+		return NotificationDeliveryStats{}, fmt.Errorf("store: count transition stream backlog: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return NotificationDeliveryStats{}, fmt.Errorf("store: commit notification delivery stats: %w", err)
+	}
+	return stats, nil
+}
+
+func readEffectClassStatsTx(ctx context.Context, tx *sql.Tx, nowStr string, stats *NotificationDeliveryStats) error {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT effect_class,
+		       COALESCE(SUM(status = 'pending'), 0),
+		       COALESCE(SUM(status = 'pending' AND retry_at IS NOT NULL AND retry_at > ?), 0),
+		       COALESCE(SUM(status = 'delivered'), 0),
+		       COALESCE(SUM(status = 'blocked_configuration'), 0),
+		       COALESCE(SUM(status = 'failed'), 0),
+		       COALESCE(SUM(status = 'withheld_by_operator_slack_floor'), 0),
+		       COALESCE(SUM(status = 'superseded'), 0),
+		       COALESCE(SUM(MAX(attempt_count - 1, 0)), 0)
+		FROM notification_intents
+		GROUP BY effect_class
+		ORDER BY effect_class ASC`, nowStr)
+	if err != nil {
+		return fmt.Errorf("store: count notification intents by effect class: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var e EffectClassDeliveryStats
+		if err := rows.Scan(&e.EffectClass, &e.Pending, &e.Retrying, &e.Delivered, &e.Blocked,
+			&e.Failed, &e.Withheld, &e.Superseded, &e.RetryAttempts); err != nil {
+			return fmt.Errorf("store: scan notification intent counts: %w", err)
+		}
+		stats.ByEffectClass = append(stats.ByEffectClass, e)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("store: iterate notification intent counts: %w", err)
+	}
+	return nil
+}
+
+func readGapStatsTx(ctx context.Context, tx *sql.Tx, now time.Time, stats *NotificationDeliveryStats) error {
+	var openedAt, recoveredAt sql.NullString
+	err := tx.QueryRowContext(ctx, `
+		SELECT g.opened_at, g.recovered_at
+		FROM slack_delivery_gaps g
+		JOIN slack_delivery_state st ON st.open_gap_generation = g.id
+		WHERE st.id = 1`).Scan(&openedAt, &recoveredAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("store: read open delivery gap: %w", err)
+	}
+	opened, err := timePtr(openedAt)
+	if err != nil {
+		return fmt.Errorf("store: parse open delivery gap opened_at: %w", err)
+	}
+	if opened != nil {
+		age := int64(now.UTC().Sub(*opened).Seconds())
+		if age < 0 {
+			age = 0
+		}
+		stats.OpenGapAgeSeconds = &age
+	}
+	recovered, err := timePtr(recoveredAt)
+	if err != nil {
+		return fmt.Errorf("store: parse open delivery gap recovered_at: %w", err)
+	}
+	if recovered == nil {
+		return nil
+	}
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM notification_intents
+		WHERE status = 'pending' AND situation_id IS NOT NULL AND created_at <= ?`,
+		canonicalTime(*recovered)).Scan(&stats.ReplayBacklog); err != nil {
+		return fmt.Errorf("store: count delivery gap replay backlog: %w", err)
+	}
+	return nil
+}
+
+func readUncertainAndBlockedStatsTx(ctx context.Context, tx *sql.Tx, stats *NotificationDeliveryStats) error {
+	placeholders, args := inPlaceholders(uncertainDeliveryErrorClasses)
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM notification_intents WHERE last_error_class IN (`+placeholders+`)`, args...). // #nosec G202 -- placeholders is a fixed "?,?,?" run over a package-local constant list; every value is bound
+		Scan(&stats.UncertainOutcomes); err != nil {
+		return fmt.Errorf("store: count uncertain delivery outcomes: %w", err)
+	}
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM notification_intents WHERE status = 'blocked_configuration'`).
+		Scan(&stats.BlockedConfigurationCount); err != nil {
+		return fmt.Errorf("store: count blocked notification intents: %w", err)
+	}
+	// A blocked root projection that a newer PENDING root projection for the
+	// same Situation already replaces can never deliver: the newer one edits
+	// the same root with strictly newer content, and 0018 forbids retiring
+	// the blocked row through supersession (only a pending row may become
+	// superseded). Reactivating it would post yesterday's projection. Task 7
+	// accepted that as a permanent resident of the blocked count; reporting
+	// it separately is what lets an operator see the actionable remainder
+	// reach zero.
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM notification_intents blocked
+		WHERE blocked.status = 'blocked_configuration' AND blocked.effect_class = 'root_sync'
+		  AND EXISTS (
+		      SELECT 1 FROM notification_intents newer
+		      WHERE newer.situation_id = blocked.situation_id
+		        AND newer.effect_class = 'root_sync' AND newer.status = 'pending'
+		        AND newer.summary_version > blocked.summary_version)`).
+		Scan(&stats.BlockedConfigurationSubsumed); err != nil {
+		return fmt.Errorf("store: count subsumed blocked notification intents: %w", err)
+	}
+	return nil
+}

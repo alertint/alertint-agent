@@ -681,6 +681,17 @@ func scanStreamEntry(rows *sql.Rows, streamID *string) (situationmodel.Transitio
 	return tr, nil
 }
 
+// scanClaimedStreamEntry scans one
+// `SELECT st.id, st.claim_token, <prefixedTransitionColumns>` row: the
+// stream row's own id and current claim token, then the joined Transition.
+func scanClaimedStreamEntry(rows *sql.Rows, streamID *string, claimToken *int64) (situationmodel.Transition, error) {
+	tr, err := scanTransition(prefixedScanner{rows: rows, prefix: []any{streamID, claimToken}})
+	if err != nil {
+		return situationmodel.Transition{}, fmt.Errorf("store: scan claimed transition stream entry: %w", err)
+	}
+	return tr, nil
+}
+
 // prefixedScanner lets scanTransition consume a row that carries extra
 // leading columns (store.scanner's own shape), without duplicating its
 // column list.

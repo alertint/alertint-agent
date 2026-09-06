@@ -76,6 +76,14 @@ func tracedFoundationSequence(tr *tracer) foundationSequence {
 			tr.add("enforce_triage_startup_horizon")
 			return nil
 		},
+		recoverNotificationWork: func(context.Context) error {
+			tr.add("recover_notification_claims")
+			tr.add("schedule_situations_missing_first_transition")
+			tr.add("validate_slack_configuration")
+			tr.add("reactivate_configuration_blocked")
+			tr.add("supersede_stale_roots_and_resume_replay")
+			return nil
+		},
 		startCorrelator: func(context.Context) error {
 			tr.add("start_correlator")
 			return nil
@@ -87,6 +95,10 @@ func tracedFoundationSequence(tr *tracer) foundationSequence {
 		startControllerWorkers: func(context.Context) {
 			tr.add("start_controller_worker")
 			tr.add("start_triage_worker")
+		},
+		startNotificationWorkers: func(context.Context) {
+			tr.add("start_notification_worker")
+			tr.add("start_transition_stream_worker")
 		},
 		startReceivers: func() error {
 			tr.add("start_receivers")
@@ -119,11 +131,18 @@ func TestFoundationSequenceOrdersEveryPhase(t *testing.T) {
 		"recover_interrupted_assessment_calls",
 		"recover_interrupted_triage_attempts",
 		"enforce_triage_startup_horizon",
+		"recover_notification_claims",
+		"schedule_situations_missing_first_transition",
+		"validate_slack_configuration",
+		"reactivate_configuration_blocked",
+		"supersede_stale_roots_and_resume_replay",
 		"start_correlator",
 		"start_input_worker",
 		"start_dispatch_worker",
 		"start_controller_worker",
 		"start_triage_worker",
+		"start_notification_worker",
+		"start_transition_stream_worker",
 		"start_receivers",
 	}
 	assertTrace(t, tr.snapshot(), want)
@@ -169,6 +188,9 @@ func TestFoundationSequenceCorrelatorStartErrorPreventsReceiversStarting(t *test
 		"recover_leases", "drain_deliveries", "drain_inputs", "reconstruct_incidents",
 		"triage_migration_backfill", "recover_interrupted_assessment_calls",
 		"recover_interrupted_triage_attempts", "enforce_triage_startup_horizon",
+		"recover_notification_claims", "schedule_situations_missing_first_transition",
+		"validate_slack_configuration", "reactivate_configuration_blocked",
+		"supersede_stale_roots_and_resume_replay",
 		"start_correlator",
 	}
 	assertTrace(t, tr.snapshot(), want)
@@ -237,6 +259,11 @@ func TestFoundationStopSequenceOrdersAllPhases(t *testing.T) {
 			tr.add("stop_input_worker")
 			return nil
 		},
+		stopNotificationWorkers: func(context.Context) error {
+			tr.add("stop_transition_stream_worker")
+			tr.add("stop_notification_worker")
+			return nil
+		},
 	}
 
 	if err := seq.run(context.Background()); err != nil {
@@ -247,8 +274,97 @@ func TestFoundationStopSequenceOrdersAllPhases(t *testing.T) {
 		"drain_foundation_work", "drain_controller_work",
 		"stop_triage_worker", "stop_controller_worker",
 		"stop_dispatch_worker", "stop_input_worker",
+		"stop_transition_stream_worker", "stop_notification_worker",
 	}
 	assertTrace(t, tr.snapshot(), want)
+}
+
+// TestFoundationStopSequenceNeverDrainsNotificationWorkers proves R6
+// structurally: the notification and stdout-stream workers are consumers of
+// already-committed history, so they are stopped ONCE, after the foundation
+// workers, and never take part in a single drain round. A Slack outage that
+// makes every delivery attempt fail must not be able to keep the bounded
+// drain loop spinning to its round cap.
+func TestFoundationStopSequenceNeverDrainsNotificationWorkers(t *testing.T) {
+	tr := &tracer{}
+	notificationStops := 0
+	drainRounds := 0
+	seq := foundationStopSequence{
+		stopReceivers:  func() error { return nil },
+		stopCorrelator: func() {},
+		drainFoundationWork: func(context.Context) (int, error) {
+			drainRounds++
+			tr.add("drain_foundation_work")
+			if drainRounds == 1 {
+				return 1, nil
+			}
+			return 0, nil
+		},
+		drainControllerWork: func(context.Context) (int, error) {
+			tr.add("drain_controller_work")
+			return 0, nil
+		},
+		stopControllerWorkers: func(context.Context) error { return nil },
+		stopWorkers:           func(context.Context) error { return nil },
+		stopNotificationWorkers: func(context.Context) error {
+			notificationStops++
+			tr.add("stop_notification_workers")
+			return nil
+		},
+	}
+	if err := seq.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if notificationStops != 1 {
+		t.Fatalf("notification workers stopped %d times, want exactly 1", notificationStops)
+	}
+	got := tr.snapshot()
+	if got[len(got)-1] != "stop_notification_workers" {
+		t.Fatalf("trace = %v, want stop_notification_workers last", got)
+	}
+	for _, phase := range got[:len(got)-1] {
+		if phase == "stop_notification_workers" {
+			t.Fatalf("trace = %v, want the notification stop to appear exactly once, at the end", got)
+		}
+	}
+}
+
+// TestFoundationStopSequenceSurvivesASlackOutageAtShutdown proves the
+// R6 guarantee that matters operationally: a notification stop whose one
+// bounded final pass is still blocked on an unreachable Slack ends when the
+// shutdown context does, and the sequence itself returns rather than
+// hanging. The stage reports the context error (its committed intents stay
+// pending, to be reclaimed at the next startup) and every earlier stage has
+// already run.
+func TestFoundationStopSequenceSurvivesASlackOutageAtShutdown(t *testing.T) {
+	tr := &tracer{}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	seq := foundationStopSequence{
+		stopReceivers:  func() error { tr.add("stop_receivers"); return nil },
+		stopCorrelator: func() { tr.add("stop_correlator") },
+		stopWorkers:    func(context.Context) error { tr.add("stop_workers"); return nil },
+		stopNotificationWorkers: func(ctx context.Context) error {
+			tr.add("stop_notification_workers")
+			// A final delivery pass against an unreachable Slack: it must
+			// honour the shutdown deadline, never outlive it.
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	done := make(chan error, 1)
+	go func() { done <- seq.run(ctx) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("run err = %v, want the shutdown context's deadline error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown never returned: a Slack outage held the process open")
+	}
+	assertTrace(t, tr.snapshot(), []string{
+		"stop_receivers", "stop_correlator", "stop_workers", "stop_notification_workers",
+	})
 }
 
 // TestFoundationStopSequenceDrainsResultingInputsToQuiescence proves the
