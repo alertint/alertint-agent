@@ -401,3 +401,49 @@ func TestHandoffStillCurrentEscalationPokeNeedsNoOperatorAction(t *testing.T) {
 		t.Error("an escalation poke is demoted once Attention de-escalates")
 	}
 }
+
+// TestHandoffStillCurrentIgnoresAlertINTMachinery pins review round 2,
+// R2-F2: contracts derived through the production DeriveActionContract for
+// "Triage in flight" and "Triage complete" differ in AlertINT's action,
+// status, and update triggers while the required human action is
+// identical — the queued handoff is still current.
+func TestHandoffStillCurrentIgnoresAlertINTMachinery(t *testing.T) {
+	c := hsNext(t)
+	action := model.OperatorActionInvestigateSituation
+	state := ControllerState{Lifecycle: model.LifecycleActive, Attention: model.AttentionInvestigate,
+		OperatorActionRequired: &action, TriagePhase: TriagePhaseInFlight}
+	handoff := *c.PriorTransition
+	handoff.ActionContract = DeriveActionContract(state, DeriveCadence(state), c.Now)
+	summary := *c.PriorSummary
+	summary.SourceTransitionSequence = handoff.Sequence + 1
+
+	// Triage completed; nothing is in flight; the human action is still owed.
+	state.TriagePhase = TriagePhaseNone
+	summary.ActionContract = DeriveActionContract(state, DeriveCadence(state), c.Now)
+	if err := summary.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if operatorContractTuple(summary.ActionContract) == operatorContractTuple(handoff.ActionContract) {
+		t.Fatal("fixture: the two contracts must differ in AlertINT machinery")
+	}
+	if !HandoffStillCurrent(handoff, summary) {
+		t.Fatal("AlertINT work completed, but the identical outstanding operator action was treated as no longer current")
+	}
+
+	// Different reconsideration triggers, same human action: still current.
+	summary.ActionContract = handoff.ActionContract
+	summary.ActionContract.NextUpdateOn = []model.NextUpdateOn{model.NextUpdateOnSourceResolution}
+	if !HandoffStillCurrent(handoff, summary) {
+		t.Fatal("a changed update trigger is AlertINT machinery, not a changed human action")
+	}
+
+	// The human action withdrawn: demoted.
+	summary.ActionContract = DeriveActionContract(ControllerState{Lifecycle: model.LifecycleActive,
+		Attention: model.AttentionInvestigate, TriagePhase: TriagePhaseNone}, model.CadenceNormal, c.Now)
+	if summary.ActionContract.OperatorActionRequired != nil {
+		t.Fatal("fixture: the withdrawn contract must carry no operator action")
+	}
+	if HandoffStillCurrent(handoff, summary) {
+		t.Fatal("a withdrawn human action must demote the handoff")
+	}
+}

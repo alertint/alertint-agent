@@ -177,11 +177,24 @@ func ClassifyPoke(prior *model.Transition, t model.Transition) PokeClass {
 //   - a terminal Situation has no current interruption;
 //   - de-escalated Attention demotes the poke it followed;
 //   - a handoff that asked the operator for something stays current only
-//     while the current Operator contract still asks for the same thing
-//     (operatorContractTuple, the same basis PokeRequiredActionChanged is
-//     judged on); an escalation poke that asked for no operator action
-//     (newly urgent Attention, newly crossed criticality) is current while
-//     its Attention still holds.
+//     while the current Operator contract still asks the operator for the
+//     SAME HUMAN ACTION — compared on its own, never on the rest of the
+//     contract: AlertINT's action/status, wait reason, and update triggers
+//     move as Triage progresses or completes while the outstanding human
+//     action is exactly as outstanding (review round 2, R2-F2); an
+//     escalation poke that asked for no operator action (newly urgent
+//     Attention, newly crossed criticality) is current while its Attention
+//     still holds.
+//
+// This is deliberately narrower than PokeRequiredActionChanged's basis
+// (the whole contract without its deadline): that class decides whether a
+// NEW interruption is warranted, this function decides whether an
+// interruption already owed may be demoted. With the current one-entry
+// operator-action catalog the two can disagree on an internal contract
+// change — the queued handoff still broadcasts as current, and the newer
+// Transition may broadcast again once the repage cooldown allows — which is
+// the side to err on: the spec demotes only when the requested action is
+// no longer current.
 //
 // A summary that does not yet include the handoff cannot confirm it and
 // counts as not current.
@@ -196,5 +209,5 @@ func HandoffStillCurrent(handoff model.Transition, summary model.EpisodeSummary)
 		return true
 	}
 	return summary.ActionContract.OperatorActionRequired != nil &&
-		operatorContractTuple(summary.ActionContract) == operatorContractTuple(handoff.ActionContract)
+		derefOperatorAction(summary.ActionContract.OperatorActionRequired) == derefOperatorAction(handoff.ActionContract.OperatorActionRequired)
 }
