@@ -2027,6 +2027,15 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 		return err
 	}
 
+	// 8. Plan 4 Task 2: seal this cycle's preparation (if any) in the SAME
+	// fenced transaction, even for a reuse/fallback/schedule-only commit —
+	// spec.md's "CommitController seals the cycle and advances its
+	// generation in the existing authoritative transaction." A commit with
+	// no preparation cycle (PreparationCycleID == "") is a no-op here.
+	if err := sealPreparationCycleTx(ctx, tx, claim.Situation.ID, commit.PreparationCycleID, canonicalCommitTime(commit)); err != nil {
+		return err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: commit controller transaction: %w", err)
 	}

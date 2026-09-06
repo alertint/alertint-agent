@@ -446,13 +446,12 @@ func TestMaxSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	// 0019_notification_blocked_index.sql is the newest migration today.
-	// Plan 2 owns 0015/0016; Plan 3 owns 0017/0018 (spec.md "Persistence and
-	// migration ownership") plus 0019, which adds one partial index and no
-	// schema of its own — 0017 and 0018 are final and are never edited, so a
-	// new migration is the only sanctioned way to add it.
-	if got != 21 {
-		t.Errorf("MaxSchemaVersion = %d, want 19", got)
+	// 0022_situation_preparation.sql is the newest migration today. Plan 2
+	// owns 0015/0016; Plan 3 owns 0017-0021; Plan 4 adds bounded evidence
+	// preparation starting at 0022 (spec.md R1: "Plan 3 owns migrations
+	// 0017-0021; MaxSchemaVersion is 21. Add migrations starting at 0022").
+	if got != 22 {
+		t.Errorf("MaxSchemaVersion = %d, want 22", got)
 	}
 }
 

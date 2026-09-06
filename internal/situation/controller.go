@@ -193,6 +193,19 @@ type ControllerCommit struct {
 	// reconciliation with no pending artifact and no R4 deadline refresh
 	// due); the commit then behaves exactly as Plan 2's did.
 	History *HistoryCommit
+
+	// PreparationCycleID and PreparationGeneration are Plan 4 Task 2's
+	// addition: the frozen preparation cycle (if any) this reconciliation's
+	// evidence was prepared under. CommitController seals it in the SAME
+	// fenced transaction as the authoritative state above (spec.md:
+	// "CommitController seals the cycle and advances its generation in the
+	// existing authoritative transaction, even for reuse/fallback/
+	// schedule-only commits"). PreparationCycleID == "" means this cycle
+	// never began preparation at all (no EvidencePreparer configured, or a
+	// local-only compatibility path) — sealing is then a no-op, and the
+	// commit behaves exactly as it did before Plan 4.
+	PreparationCycleID    string
+	PreparationGeneration int64
 }
 
 // ParkedState is CommitController's explicit instruction for the
