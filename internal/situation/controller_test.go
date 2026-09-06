@@ -1609,3 +1609,497 @@ func TestControllerReportsFinalTypedOutcomeToHealthObserverPerSituation(t *testi
 		}
 	})
 }
+
+// --------------------------------------------------------------------------
+// Plan 3 Task 5: the controller derives durable history from the SAME
+// authoritative result Plan 2 commits, and hands it to the store as one
+// ControllerCommit. These tests exercise every result class that commits.
+// --------------------------------------------------------------------------
+
+// ctReuseInput returns a SnapshotInput whose current authoritative
+// Assessment matches the basis the live Reconcile cycle will compute, so
+// the deterministic/reuse check succeeds and no L2 call is made.
+func ctReuseInput(t *testing.T) situation.SnapshotInput {
+	t.Helper()
+	in := ctBaseSnapshotInput()
+	in.Now = ctBaseTime.Add(10 * time.Minute)
+	snap := situation.BuildSnapshot(in)
+	in.CurrentAssessment = &situation.AuthoritativeAssessment{
+		ID: "assessment-prior", SituationID: "situation-1",
+		AssessmentBasisHash: snap.AssessmentBasisHash, MaterialFactHash: snap.MaterialFactHash,
+		InputVersion: 2, Derivation: model.DerivationModelValidated,
+		Assessment: model.Assessment{
+			SchemaVersion: model.AssessmentSchemaVersion, Persistence: model.PersistenceSustained,
+			Impact: model.ImpactSuspected, Novelty: model.NoveltyFamiliar, Causality: model.CausalityCorrelated,
+			Attention: model.AttentionObserve, Lifecycle: model.LifecycleActive,
+			EvidenceQuality: model.EvidenceQualityComplete, Cadence: model.CadenceSlow,
+			ActionContract: model.ActionContract{
+				NextActor: model.NextActorNone, NextUpdateAt: &ctBaseTime,
+			},
+		},
+	}
+	return in
+}
+
+// ctReconcileOnce runs one full cycle against a fake store and returns the
+// single ControllerCommit it produced.
+func ctReconcileOnce(t *testing.T, in situation.SnapshotInput, claim situation.Claim,
+	tune func(*fakeControllerStore)) situation.ControllerCommit {
+	t.Helper()
+	return ctReconcileWith(t, in, claim, &fakeAssessmentClient{}, tune)
+}
+
+// ctReconcileWith is ctReconcileOnce with a caller-supplied provider client,
+// for the work-bearing cycles a changed basis forces.
+func ctReconcileWith(t *testing.T, in situation.SnapshotInput, claim situation.Claim,
+	client situation.AssessmentClient, tune func(*fakeControllerStore)) situation.ControllerCommit {
+	t.Helper()
+	store := &fakeControllerStore{loadInput: in}
+	if tune != nil {
+		tune(store)
+	}
+	c := ctController(t, store, client)
+	if err := c.Reconcile(context.Background(), claim); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	commits := store.snapshotCommits()
+	if len(commits) != 1 {
+		t.Fatalf("commits = %d, want 1", len(commits))
+	}
+	return commits[0]
+}
+
+// TestControllerHistoryFirstPublicationCommitsTransitionSummaryAndIntents
+// pins the fresh-publication class: one first_authoritative_state
+// Transition, its folded Episode summary, and the Slack obligations it
+// warrants, all inside the ONE ControllerCommit Plan 2 already fences.
+func TestControllerHistoryFirstPublicationCommitsTransitionSummaryAndIntents(t *testing.T) {
+	// A critical firing delivery makes critical_anchor eligible: the
+	// deterministic floor is the publication authority a first cycle can
+	// carry (a quiet observe/no-reason Situation creates no Slack intent).
+	// The fake client has no scripted answer, so the controller derives the
+	// deterministic fallback — which selects that floor.
+	in := ctBaseSnapshotInput()
+	in.Deliveries = []situation.Delivery{ctDelivery("delivery-1", "incident-1", true, "critical")}
+	commit := ctReconcileOnce(t, in, ctBaseClaim(), nil)
+
+	if commit.History == nil {
+		t.Fatal("a first authoritative state must commit durable history")
+	}
+	if len(commit.History.Transitions) != 1 {
+		t.Fatalf("transitions = %d, want 1: %+v", len(commit.History.Transitions), commit.History.Transitions)
+	}
+	tr := commit.History.Transitions[0]
+	if tr.Reason != model.ReasonFirstAuthoritativeState {
+		t.Fatalf("transition reason = %q, want first_authoritative_state", tr.Reason)
+	}
+	if tr.Sequence != 1 {
+		t.Fatalf("transition sequence = %d, want 1", tr.Sequence)
+	}
+	if tr.SituationID != "situation-1" || tr.InputVersion != 3 {
+		t.Fatalf("transition identity = (%q,%d), want (situation-1,3)", tr.SituationID, tr.InputVersion)
+	}
+	if tr.AssessmentID == nil || *tr.AssessmentID != commit.Attempt.ID {
+		t.Fatalf("transition assessment id = %v, want this commit's own attempt %q", tr.AssessmentID, commit.Attempt.ID)
+	}
+	if tr.Lifecycle != commit.Lifecycle || tr.Attention != commit.Attention {
+		t.Fatalf("transition state (%q,%q) does not match the committed projection (%q,%q)",
+			tr.Lifecycle, tr.Attention, commit.Lifecycle, commit.Attention)
+	}
+	if commit.History.Summary == nil || commit.History.Summary.Version != 1 {
+		t.Fatalf("episode summary = %+v, want version 1", commit.History.Summary)
+	}
+	if commit.History.Summary.SourceTransitionSequence != tr.Sequence {
+		t.Fatalf("summary source sequence = %d, want %d", commit.History.Summary.SourceTransitionSequence, tr.Sequence)
+	}
+	root := 0
+	for _, intent := range commit.History.Intents {
+		if intent.EffectClass == model.EffectRootSync {
+			root++
+			if !intent.MainChannelPoke {
+				t.Fatal("an unpublished root's first projection IS the main-channel poke")
+			}
+		}
+	}
+	if root != 1 {
+		t.Fatalf("root_sync intents = %d, want exactly 1", root)
+	}
+}
+
+// TestControllerHistoryRevalidatedReuseCommitsNoHistory pins R4: a reuse
+// cycle writes a new Assessment with new IDs and a refreshed next_update_at
+// and still creates no Transition, no Episode version, and no Slack intent.
+func TestControllerHistoryRevalidatedReuseCommitsNoHistory(t *testing.T) {
+	in := ctReuseInput(t)
+	first := ctReconcileOnce(t, in, ctBaseClaim(), nil)
+
+	in.PriorTransition = &first.History.Transitions[0]
+	in.CurrentSummary = first.History.Summary
+	claim := ctBaseClaim()
+	claim.Situation.DueReasons = nil
+
+	second := ctReconcileOnce(t, in, claim, nil)
+	if second.Attempt.Derivation != model.DerivationRevalidatedReuse {
+		t.Fatalf("second cycle derivation = %q, want revalidated_reuse", second.Attempt.Derivation)
+	}
+	if second.History != nil {
+		t.Fatalf("a revalidated_reuse cycle must commit no history, got %+v", second.History)
+	}
+}
+
+// TestControllerHistoryDeadlineRefreshIsTheOnlyNonMaterialSlackEffect pins
+// R4's one narrowing: a published root whose delivered promise has passed
+// gets exactly one coalescible root_sync refresh — no Transition, no
+// journal entry, no poke.
+func TestControllerHistoryDeadlineRefreshIsTheOnlyNonMaterialSlackEffect(t *testing.T) {
+	in := ctReuseInput(t)
+	first := ctReconcileOnce(t, in, ctBaseClaim(), nil)
+
+	expired := ctBaseTime.Add(-time.Hour)
+	in.PriorTransition = &first.History.Transitions[0]
+	in.CurrentSummary = first.History.Summary
+	in.RootPublished = true
+	in.LastDeliveredRootDeadlineAt = &expired
+	claim := ctBaseClaim()
+	claim.Situation.DueReasons = nil
+
+	second := ctReconcileOnce(t, in, claim, nil)
+	if second.History == nil {
+		t.Fatal("a due deadline refresh must still commit history")
+	}
+	if len(second.History.Transitions) != 0 {
+		t.Fatalf("a deadline refresh creates no Transition, got %+v", second.History.Transitions)
+	}
+	if second.History.Summary != nil {
+		t.Fatalf("a deadline refresh creates no Episode version, got %+v", second.History.Summary)
+	}
+	if len(second.History.Intents) != 1 {
+		t.Fatalf("deadline-refresh intents = %d, want exactly 1: %+v", len(second.History.Intents), second.History.Intents)
+	}
+	refresh := second.History.Intents[0]
+	if refresh.EffectClass != model.EffectRootSync {
+		t.Fatalf("refresh effect class = %q, want root_sync", refresh.EffectClass)
+	}
+	if refresh.MainChannelPoke {
+		t.Fatal("a deadline refresh is a silent edit, never a poke")
+	}
+	if refresh.ContractDeadlineAt == nil || refresh.ContractDeadlineAt.Equal(expired) {
+		t.Fatalf("refresh contract deadline = %v, want the newly committed one", refresh.ContractDeadlineAt)
+	}
+	if refresh.TransitionID == nil || *refresh.TransitionID != first.History.Transitions[0].ID {
+		t.Fatalf("refresh authority = %v, want the prior Transition %q", refresh.TransitionID, first.History.Transitions[0].ID)
+	}
+}
+
+// TestControllerHistoryJournalsPendingArtifactsBeforeControllerState pins
+// R1: every applied-and-unjournaled artifact is journaled in this one
+// commit, in the loaded order, before any controller-state Transition.
+func TestControllerHistoryJournalsPendingArtifactsBeforeControllerState(t *testing.T) {
+	in := ctReuseInput(t)
+	in.PendingArtifacts = []situation.OperatorArtifactInput{
+		{
+			InputID: "input-1", Kind: "operator_annotation_recorded",
+			AnnotationID: stringPtrForTest("11"), AppliedInputVersion: 3,
+			OccurredAt: ctBaseTime.Add(time.Minute), AttributedActor: "",
+			Headline: "Operator note recorded (observation)", Detail: "Checked the deploy log.",
+		},
+		{
+			InputID: "input-2", Kind: "captured_verdict_recorded",
+			VerdictID: stringPtrForTest("22"), AppliedInputVersion: 3,
+			OccurredAt: ctBaseTime.Add(2 * time.Minute), AttributedActor: "human",
+			Headline: "Captured verdict recorded (confirmation)", Detail: "",
+		},
+	}
+
+	commit := ctReconcileOnce(t, in, ctBaseClaim(), nil)
+	if commit.History == nil || len(commit.History.Transitions) != 3 {
+		t.Fatalf("transitions = %+v, want two artifacts then the controller state", commit.History)
+	}
+	for i, want := range []string{"input-1", "input-2"} {
+		tr := commit.History.Transitions[i]
+		if tr.Reason != model.ReasonOperatorArtifactRecorded {
+			t.Fatalf("transition %d reason = %q, want operator_artifact_recorded", i, tr.Reason)
+		}
+		if tr.OperatorArtifactInputID == nil || *tr.OperatorArtifactInputID != want {
+			t.Fatalf("transition %d artifact input = %v, want %q", i, tr.OperatorArtifactInputID, want)
+		}
+		if tr.Actor != model.ActorAttributedOperator {
+			t.Fatalf("transition %d actor = %q, want attributed_operator", i, tr.Actor)
+		}
+		if tr.Sequence != i+1 {
+			t.Fatalf("transition %d sequence = %d, want %d", i, tr.Sequence, i+1)
+		}
+	}
+	last := commit.History.Transitions[2]
+	if last.Reason != model.ReasonFirstAuthoritativeState || last.Sequence != 3 {
+		t.Fatalf("last transition = (%q,%d), want (first_authoritative_state,3)", last.Reason, last.Sequence)
+	}
+	if commit.History.Summary == nil || commit.History.Summary.Version != 3 {
+		t.Fatalf("episode summary = %+v, want one version per Transition (3)", commit.History.Summary)
+	}
+}
+
+// TestControllerHistoryUsesThisCycleConsumedDueReasons is the two-cycle
+// regression the artifact/Triage materiality rule depends on: history must
+// be derived against the due reasons THIS claim consumed, never against the
+// remainder Plan 2's own commit leaves behind. Cycle one consumes
+// triage_changed and must record a triage_state_changed Transition on an
+// otherwise unchanged tuple; cycle two, with the reason consumed, must
+// record nothing.
+func TestControllerHistoryUsesThisCycleConsumedDueReasons(t *testing.T) {
+	in := ctReuseInput(t)
+	first := ctReconcileOnce(t, in, ctBaseClaim(), nil)
+
+	in.PriorTransition = &first.History.Transitions[0]
+	in.CurrentSummary = first.History.Summary
+
+	consuming := ctBaseClaim()
+	consuming.Situation.DueReasons = []model.DueReason{model.DueTriageChanged}
+	second := ctReconcileOnce(t, in, consuming, nil)
+	if second.History == nil || len(second.History.Transitions) != 1 {
+		t.Fatalf("a consumed triage_changed on an unchanged tuple must record one Transition, got %+v", second.History)
+	}
+	if got := second.History.Transitions[0].Reason; got != model.ReasonTriageStateChanged {
+		t.Fatalf("transition reason = %q, want triage_state_changed", got)
+	}
+
+	in.PriorTransition = &second.History.Transitions[0]
+	in.CurrentSummary = second.History.Summary
+	settled := ctBaseClaim()
+	settled.Situation.DueReasons = nil
+	third := ctReconcileOnce(t, in, settled, nil)
+	if third.History != nil {
+		t.Fatalf("the next cycle must not re-record a consumed triage change, got %+v", third.History)
+	}
+}
+
+// TestControllerHistoryRecurrenceCountComesFromPriorTerminalSituations pins
+// where the Episode summary's recurrence count comes from: durable local
+// Store facts — this exact group's prior terminal Situations — not a new
+// counter.
+func TestControllerHistoryRecurrenceCountComesFromPriorTerminalSituations(t *testing.T) {
+	in := ctReuseInput(t)
+	in.PriorSituations = []situation.CompletedSituation{
+		{ID: "prior-a", GroupKey: "group-1", EffectiveStartedAt: ctBaseTime.Add(-48 * time.Hour), TerminalAt: ctBaseTime.Add(-47 * time.Hour), TerminalReason: model.TerminalReasonObservationDeadline},
+		{ID: "prior-b", GroupKey: "group-1", EffectiveStartedAt: ctBaseTime.Add(-24 * time.Hour), TerminalAt: ctBaseTime.Add(-23 * time.Hour), TerminalReason: model.TerminalReasonObservationDeadline},
+	}
+
+	commit := ctReconcileOnce(t, in, ctBaseClaim(), nil)
+	if commit.History == nil || commit.History.Summary == nil {
+		t.Fatalf("expected history, got %+v", commit.History)
+	}
+	if got := commit.History.Summary.RecurrenceCount; got != 2 {
+		t.Fatalf("summary recurrence count = %d, want 2 (the prior terminal Situations in this group)", got)
+	}
+	if got := commit.History.Transitions[0].Journal.RecurrenceCount; got != 2 {
+		t.Fatalf("transition journal recurrence count = %d, want 2", got)
+	}
+}
+
+// TestControllerHistoryRecurrenceCountAddsMemberOccurrences pins the other
+// half of the durable recurrence count: every re-fire that attached to a
+// member Incident as a recurrence-collapse occurrence, which is what lets a
+// milestone be reached while the Situation is open (review round 1, R1-F6).
+func TestControllerHistoryRecurrenceCountAddsMemberOccurrences(t *testing.T) {
+	in := ctReuseInput(t)
+	in.PriorSituations = []situation.CompletedSituation{
+		{ID: "prior-a", GroupKey: "group-1", EffectiveStartedAt: ctBaseTime.Add(-48 * time.Hour), TerminalAt: ctBaseTime.Add(-47 * time.Hour), TerminalReason: model.TerminalReasonObservationDeadline},
+	}
+	in.Incidents[0].Occurrences = 4
+
+	commit := ctReconcileOnce(t, in, ctBaseClaim(), nil)
+	if commit.History == nil || commit.History.Summary == nil {
+		t.Fatalf("expected history, got %+v", commit.History)
+	}
+	if got := commit.History.Summary.RecurrenceCount; got != 5 {
+		t.Fatalf("summary recurrence count = %d, want 5 (one prior Situation plus four occurrences)", got)
+	}
+}
+
+// TestControllerHistoryBlockedCycleStillCommitsHistory covers the blocked
+// result class: a cycle that may not dispatch further L2 work still
+// establishes authoritative state, so it still records the history that
+// state warrants.
+func TestControllerHistoryBlockedCycleStillCommitsHistory(t *testing.T) {
+	in := ctBaseSnapshotInput()
+	in.Now = ctBaseTime.Add(10 * time.Minute)
+	in.ControllerParked = situation.ControllerParkedState{
+		At: &ctBaseTime, Reason: situation.ParkedReasonDependency,
+		MaterialFactHash: situation.BuildSnapshot(in).MaterialFactHash,
+	}
+
+	commit := ctReconcileOnce(t, in, ctBaseClaim(), func(f *fakeControllerStore) {
+		f.beginErr = situation.ErrControllerAttemptsExhausted
+	})
+	if commit.History == nil || len(commit.History.Transitions) != 1 {
+		t.Fatalf("a blocked cycle that establishes first authoritative state must record it, got %+v", commit.History)
+	}
+	if got := commit.History.Transitions[0].Reason; got != model.ReasonFirstAuthoritativeState {
+		t.Fatalf("blocked-cycle transition reason = %q, want first_authoritative_state", got)
+	}
+}
+
+// TestControllerHistoryFallbackCycleCommitsHistory covers the fallback
+// result class: L2 failed, a deterministic fallback Assessment became
+// authoritative, and that IS the Situation's first durable state.
+func TestControllerHistoryFallbackCycleCommitsHistory(t *testing.T) {
+	in := ctBaseSnapshotInput()
+	in.Now = ctBaseTime.Add(10 * time.Minute)
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
+	client := &fakeAssessmentClient{responses: []func() (llm.OneShotCompletion, error){
+		func() (llm.OneShotCompletion, error) {
+			return llm.OneShotCompletion{RequestStarted: llm.RequestStartStatusFalse}, errors.New("provider unreachable")
+		},
+	}}
+	c := ctController(t, store, client)
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	commits := store.snapshotCommits()
+	if len(commits) != 1 {
+		t.Fatalf("commits = %d, want 1", len(commits))
+	}
+	commit := commits[0]
+	if commit.Attempt.Derivation != model.DerivationDeterministicFallback {
+		t.Fatalf("derivation = %q, want deterministic_fallback", commit.Attempt.Derivation)
+	}
+	if commit.History == nil || len(commit.History.Transitions) != 1 {
+		t.Fatalf("a fallback cycle's first authoritative state must be recorded, got %+v", commit.History)
+	}
+	if got := commit.History.Transitions[0].Actor; got != model.ActorDeterministicController {
+		t.Fatalf("fallback transition actor = %q, want deterministic_controller", got)
+	}
+}
+
+// TestControllerHistoryCrashBeforeCommitCreatesNothing pins the crash
+// boundary: when the fenced commit itself is rejected, the cycle reports
+// failure and no durable history exists — the store never partially
+// applies a ControllerCommit.
+func TestControllerHistoryCrashBeforeCommitCreatesNothing(t *testing.T) {
+	store := &fakeControllerStore{loadInput: ctReuseInput(t), commitErr: model.ErrSituationLeaseLost}
+	c := ctController(t, store, &fakeAssessmentClient{})
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err == nil {
+		t.Fatal("Reconcile with a rejected commit must report the failure")
+	}
+	commits := store.snapshotCommits()
+	if len(commits) != 1 {
+		t.Fatalf("commit attempts = %d, want exactly 1 (never retried in-cycle)", len(commits))
+	}
+	if commits[0].History == nil {
+		t.Fatal("the rejected commit must still have carried its derived history: the store, not the controller, decides atomicity")
+	}
+}
+
+func stringPtrForTest(s string) *string { return &s }
+
+// ctResolvedInput is ctReuseInput with every member delivery resolved — the
+// durable shape that moves an active Situation to recovery_pending.
+func ctResolvedInput(t *testing.T) situation.SnapshotInput {
+	t.Helper()
+	in := ctReuseInput(t)
+	in.Deliveries = []situation.Delivery{ctDelivery("delivery-1", "incident-1", false, "warning")}
+	return in
+}
+
+// TestControllerHistoryRecordsRecoveryThenRefire walks the lifecycle paths a
+// real Situation takes through three cycles: first publication, recovery
+// observation, and a refire — each a separate immutable Transition on the
+// same Episode.
+func TestControllerHistoryRecordsRecoveryThenRefire(t *testing.T) {
+	in := ctReuseInput(t)
+	first := ctReconcileOnce(t, in, ctBaseClaim(), nil)
+
+	// Cycle 2: the source resolved. The basis changed, so this is a
+	// work-bearing cycle; the provider is unavailable and the deterministic
+	// path still establishes recovery_pending.
+	recovering := ctResolvedInput(t)
+	recovering.PriorTransition = &first.History.Transitions[0]
+	recovering.CurrentSummary = first.History.Summary
+	second := ctReconcileWith(t, recovering, ctBaseClaim(), &fakeAssessmentClient{}, func(f *fakeControllerStore) {
+		f.beginWorkAttempt = 1
+	})
+	if second.Lifecycle != model.LifecycleRecoveryPending {
+		t.Fatalf("cycle 2 lifecycle = %q, want recovery_pending", second.Lifecycle)
+	}
+	if second.History == nil || len(second.History.Transitions) != 1 {
+		t.Fatalf("cycle 2 history = %+v, want one Transition", second.History)
+	}
+	if got := second.History.Transitions[0].Reason; got != model.ReasonRecoveryObserved {
+		t.Fatalf("cycle 2 transition reason = %q, want recovery_observed", got)
+	}
+	if second.History.Summary.Version != 2 {
+		t.Fatalf("cycle 2 summary version = %d, want 2", second.History.Summary.Version)
+	}
+
+	// Cycle 3: it fired again before the grace deadline.
+	refiring := ctReuseInput(t)
+	refiring.Situation.Lifecycle = model.LifecycleRecoveryPending
+	refiring.Situation.RecoveryObservedAt = &ctBaseTime
+	graceUntil := ctBaseTime.Add(time.Hour)
+	refiring.Situation.GraceUntil = &graceUntil
+	refiring.PriorTransition = &second.History.Transitions[0]
+	refiring.CurrentSummary = second.History.Summary
+	third := ctReconcileWith(t, refiring, ctBaseClaim(), &fakeAssessmentClient{}, func(f *fakeControllerStore) {
+		f.beginWorkAttempt = 1
+	})
+	if third.Lifecycle != model.LifecycleActive {
+		t.Fatalf("cycle 3 lifecycle = %q, want active", third.Lifecycle)
+	}
+	if third.History == nil || len(third.History.Transitions) != 1 {
+		t.Fatalf("cycle 3 history = %+v, want one Transition", third.History)
+	}
+	if got := third.History.Transitions[0].Reason; got != model.ReasonRecoveryFailed {
+		t.Fatalf("cycle 3 transition reason = %q, want recovery_failed", got)
+	}
+	if got := third.History.Transitions[0].Sequence; got != 3 {
+		t.Fatalf("cycle 3 transition sequence = %d, want 3", got)
+	}
+}
+
+// TestControllerHistoryTerminalCycleJournalsPendingArtifactFirst pins R1's
+// terminal ordering: an artifact still pending when the Situation
+// terminalizes is journaled in the same commit, BEFORE the terminal
+// Transition — a terminal Episode never reopens to absorb it later.
+func TestControllerHistoryTerminalCycleJournalsPendingArtifactFirst(t *testing.T) {
+	in := ctReuseInput(t)
+	first := ctReconcileOnce(t, in, ctBaseClaim(), nil)
+
+	closing := ctResolvedInput(t)
+	closing.Situation.Lifecycle = model.LifecycleRecoveryPending
+	closing.Situation.RecoveryObservedAt = &ctBaseTime
+	expiredGrace := ctBaseTime.Add(time.Minute)
+	closing.Situation.GraceUntil = &expiredGrace
+	closing.PriorTransition = &first.History.Transitions[0]
+	closing.CurrentSummary = first.History.Summary
+	closing.PendingArtifacts = []situation.OperatorArtifactInput{{
+		InputID: "input-late", Kind: "operator_annotation_recorded",
+		AnnotationID: stringPtrForTest("77"), AppliedInputVersion: 3,
+		OccurredAt: ctBaseTime.Add(time.Minute), Headline: "Operator note recorded (observation)",
+	}}
+
+	commit := ctReconcileWith(t, closing, ctBaseClaim(), &fakeAssessmentClient{}, func(f *fakeControllerStore) {
+		f.beginWorkAttempt = 1
+	})
+	if commit.Lifecycle != model.LifecycleRecovered {
+		t.Fatalf("lifecycle = %q, want recovered", commit.Lifecycle)
+	}
+	if commit.History == nil || len(commit.History.Transitions) != 2 {
+		t.Fatalf("history = %+v, want the artifact then the terminal Transition", commit.History)
+	}
+	artifact, terminal := commit.History.Transitions[0], commit.History.Transitions[1]
+	if artifact.Reason != model.ReasonOperatorArtifactRecorded || artifact.Sequence != 2 {
+		t.Fatalf("first transition = (%q,%d), want (operator_artifact_recorded,2)", artifact.Reason, artifact.Sequence)
+	}
+	if terminal.Reason != model.ReasonRecovered || terminal.Sequence != 3 {
+		t.Fatalf("second transition = (%q,%d), want (recovered,3)", terminal.Reason, terminal.Sequence)
+	}
+	if terminal.Projection.TerminalAt == nil {
+		t.Fatal("a terminal Transition must carry the committed terminal instant")
+	}
+	if commit.History.Summary == nil || commit.History.Summary.TerminalAt == nil {
+		t.Fatalf("terminal Episode summary = %+v, want a terminal instant", commit.History.Summary)
+	}
+	if commit.History.Summary.DurationSeconds == nil {
+		t.Fatal("a terminal Episode summary must carry its derived duration")
+	}
+}

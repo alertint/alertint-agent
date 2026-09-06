@@ -4,6 +4,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"reflect"
@@ -64,6 +65,25 @@ func insertInputForExistingIncident(t *testing.T, st *Store, incidentID, inputID
 func insertIncidentAndInput(t *testing.T, st *Store, incidentID, inputID, groupKey string, occurredAt time.Time) {
 	t.Helper()
 	insertIncidentAndInputKind(t, st, incidentID, inputID, groupKey, "incident_created", occurredAt)
+}
+
+// insertArtifactSituationInput inserts one pending operator-artifact
+// situation_input_outbox row (kind operator_annotation_recorded or
+// captured_verdict_recorded) for an Incident that already exists, with
+// journal_state='pending' from creation — matching what a later task's
+// enqueue path will do; this task's own tests exercise only
+// ApplySituationInput's R1/R2 handling of an already-pending artifact row,
+// never the enqueue path itself.
+func insertArtifactSituationInput(t *testing.T, st *Store, incidentID, inputID, groupKey, kind string, annotationID, verdictID any, occurredAt time.Time) {
+	t.Helper()
+	if _, err := st.db.ExecContext(context.Background(), `
+		INSERT INTO situation_input_outbox (
+			id, idempotency_key, incident_id, kind, group_key, occurred_at,
+			status, annotation_id, verdict_id, journal_state
+		) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, 'pending')`,
+		inputID, "idem:"+inputID, incidentID, kind, groupKey, canonicalTime(occurredAt), annotationID, verdictID); err != nil {
+		t.Fatalf("insert artifact situation input %s: %v", inputID, err)
+	}
 }
 
 // insertIncidentAndDeliveryInput inserts a fresh collecting Incident, links
@@ -203,14 +223,16 @@ func dueSituationFixture(t *testing.T) (*Store, string, time.Time) {
 
 func TestDueReasonForInputKindMapsAllKnownKinds(t *testing.T) {
 	cases := map[string]situationmodel.DueReason{
-		"incident_created":     situationmodel.DueIncidentCreated,
-		"membership_changed":   situationmodel.DueMembershipChanged,
-		"incident_ready":       situationmodel.DueMembershipChanged,
-		"finding_persisted":    situationmodel.DueNewSymptom,
-		"triage_skipped":       situationmodel.DueTriageChanged,
-		"triage_retry_changed": situationmodel.DueTriageChanged,
-		"triage_exhausted":     situationmodel.DueTriageChanged,
-		"incident_resolved":    situationmodel.DueAlertResolved,
+		"incident_created":             situationmodel.DueIncidentCreated,
+		"membership_changed":           situationmodel.DueMembershipChanged,
+		"incident_ready":               situationmodel.DueMembershipChanged,
+		"finding_persisted":            situationmodel.DueNewSymptom,
+		"triage_skipped":               situationmodel.DueTriageChanged,
+		"triage_retry_changed":         situationmodel.DueTriageChanged,
+		"triage_exhausted":             situationmodel.DueTriageChanged,
+		"incident_resolved":            situationmodel.DueAlertResolved,
+		"operator_annotation_recorded": situationmodel.DueOperatorArtifactRecorded,
+		"captured_verdict_recorded":    situationmodel.DueOperatorArtifactRecorded,
 	}
 	for kind, want := range cases {
 		got, err := dueReasonForInputKind(kind)
@@ -631,6 +653,251 @@ func TestApplySituationInputClearsControllerLeaseFencingStaleRelease(t *testing.
 
 	if err := st.ReleaseSituationClaim(context.Background(), staleClaim, now.Add(2*time.Minute)); !errors.Is(err, ErrSituationLeaseLost) {
 		t.Fatalf("stale release after input-triggered lease clear = %v, want ErrSituationLeaseLost", err)
+	}
+}
+
+// ----------------------------------------------------------------------
+// Step 5 (R1/R2): ApplySituationInput's handling of the two durable
+// operator artifact input kinds.
+// ----------------------------------------------------------------------
+
+// TestApplySituationInputArtifactAppliedToActiveOwnerMarksPending is the
+// R1 "active owner" case: an artifact applied while its owner is
+// active/recovery_pending joins normally — input_version bumps, the
+// DueOperatorArtifactRecorded reason merges, and the outbox row is stamped
+// journal_state='pending' plus the exact applied_input_version it landed at.
+func TestApplySituationInputArtifactAppliedToActiveOwnerMarksPending(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 20, 0, 0, 0, time.UTC)
+
+	insertIncidentAndInput(t, st, "inc-artifact-active", "input-artifact-active-seed", "service=artifact-active", now)
+	seedClaim := claimOneInput(t, st, "w", now)
+	if err := st.ApplySituationInput(ctx, seedClaim); err != nil {
+		t.Fatalf("seed apply: %v", err)
+	}
+	sits := listSituations(t, st)
+	if len(sits) != 1 || sits[0].InputVersion != 1 {
+		t.Fatalf("seed situations = %+v, want exactly 1 at version 1", sits)
+	}
+	situationID := sits[0].ID
+
+	annID, err := insertAnnotationRow(ctx, st, "inc-artifact-active")
+	if err != nil {
+		t.Fatalf("seed annotation: %v", err)
+	}
+	insertArtifactSituationInput(t, st, "inc-artifact-active", "input-artifact-active", "service=artifact-active", "operator_annotation_recorded", annID, nil, now.Add(time.Minute))
+	artifactClaim := claimOneInput(t, st, "w", now.Add(time.Minute))
+	if err := st.ApplySituationInput(ctx, artifactClaim); err != nil {
+		t.Fatalf("apply artifact input: %v", err)
+	}
+
+	got := getSituationByID(t, st, situationID)
+	if got.InputVersion != 2 {
+		t.Fatalf("input_version = %d, want 2 (artifact bumped it)", got.InputVersion)
+	}
+	want := []situationmodel.DueReason{situationmodel.DueIncidentCreated, situationmodel.DueOperatorArtifactRecorded}
+	if !reflect.DeepEqual(got.DueReasons, want) {
+		t.Fatalf("due_reasons = %v, want %v", got.DueReasons, want)
+	}
+
+	var journalState string
+	var appliedInputVersion sql.NullInt64
+	var appliedSituationID sql.NullString
+	if err := st.db.QueryRowContext(ctx, `SELECT journal_state, applied_input_version, applied_situation_id FROM situation_input_outbox WHERE id = ?`, "input-artifact-active").
+		Scan(&journalState, &appliedInputVersion, &appliedSituationID); err != nil {
+		t.Fatal(err)
+	}
+	if journalState != "pending" {
+		t.Fatalf("journal_state = %q, want pending", journalState)
+	}
+	if !appliedInputVersion.Valid || appliedInputVersion.Int64 != 2 {
+		t.Fatalf("applied_input_version = %v, want 2", appliedInputVersion)
+	}
+	if !appliedSituationID.Valid || appliedSituationID.String != situationID {
+		t.Fatalf("applied_situation_id = %v, want %s", appliedSituationID, situationID)
+	}
+}
+
+// TestApplySituationInputVerdictArtifactAppliedToActiveOwnerMarksPending
+// proves the captured_verdict_recorded kind is treated identically to
+// operator_annotation_recorded by isOperatorArtifactKind.
+func TestApplySituationInputVerdictArtifactAppliedToActiveOwnerMarksPending(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC)
+
+	insertIncidentAndInput(t, st, "inc-verdict-active", "input-verdict-active-seed", "service=verdict-active", now)
+	seedClaim := claimOneInput(t, st, "w", now)
+	if err := st.ApplySituationInput(ctx, seedClaim); err != nil {
+		t.Fatalf("seed apply: %v", err)
+	}
+	sits := listSituations(t, st)
+	situationID := sits[0].ID
+
+	verdID, err := insertVerdictRow(ctx, st, "inc-verdict-active", 1)
+	if err != nil {
+		t.Fatalf("seed verdict: %v", err)
+	}
+	insertArtifactSituationInput(t, st, "inc-verdict-active", "input-verdict-active", "service=verdict-active", "captured_verdict_recorded", nil, verdID, now.Add(time.Minute))
+	claim := claimOneInput(t, st, "w", now.Add(time.Minute))
+	if err := st.ApplySituationInput(ctx, claim); err != nil {
+		t.Fatalf("apply verdict input: %v", err)
+	}
+
+	got := getSituationByID(t, st, situationID)
+	if got.InputVersion != 2 {
+		t.Fatalf("input_version = %d, want 2", got.InputVersion)
+	}
+	var journalState string
+	if err := st.db.QueryRowContext(ctx, `SELECT journal_state FROM situation_input_outbox WHERE id = 'input-verdict-active'`).Scan(&journalState); err != nil {
+		t.Fatal(err)
+	}
+	if journalState != "pending" {
+		t.Fatalf("journal_state = %q, want pending", journalState)
+	}
+}
+
+// TestApplySituationInputArtifactAppliedAfterTerminalOwnerMarksOwnerTerminal
+// is the R2 case: an artifact applied after its owner already terminalized
+// must not join — input_version and due_reasons_json stay exactly as they
+// were, the outbox row is stamped journal_state='owner_terminal', and
+// ClaimDueSituations never returns the terminalized owner.
+func TestApplySituationInputArtifactAppliedAfterTerminalOwnerMarksOwnerTerminal(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 21, 0, 0, 0, time.UTC)
+
+	insertIncidentAndInput(t, st, "inc-artifact-term", "input-artifact-term-seed", "service=artifact-term", now)
+	seedClaim := claimOneInput(t, st, "w", now)
+	if err := st.ApplySituationInput(ctx, seedClaim); err != nil {
+		t.Fatalf("seed apply: %v", err)
+	}
+	sits := listSituations(t, st)
+	situationID := sits[0].ID
+
+	terminalAt := now.Add(time.Hour)
+	if _, err := st.db.ExecContext(ctx, `
+		UPDATE situations SET lifecycle='closed_unknown', terminal_at=?, terminal_reason='resolution_missing', updated_at=?
+		WHERE id=?`, canonicalTime(terminalAt), canonicalTime(terminalAt), situationID); err != nil {
+		t.Fatalf("terminalize fixture situation: %v", err)
+	}
+	before := getSituationByID(t, st, situationID)
+
+	annID, err := insertAnnotationRow(ctx, st, "inc-artifact-term")
+	if err != nil {
+		t.Fatalf("seed annotation: %v", err)
+	}
+	insertArtifactSituationInput(t, st, "inc-artifact-term", "input-artifact-term", "service=artifact-term", "operator_annotation_recorded", annID, nil, now.Add(2*time.Hour))
+	artifactClaim := claimOneInput(t, st, "w", now.Add(2*time.Hour))
+	if err := st.ApplySituationInput(ctx, artifactClaim); err != nil {
+		t.Fatalf("apply artifact input to terminal owner: %v", err)
+	}
+
+	after := getSituationByID(t, st, situationID)
+	if after.InputVersion != before.InputVersion {
+		t.Fatalf("input_version changed: before %d, after %d, want unchanged", before.InputVersion, after.InputVersion)
+	}
+	if !reflect.DeepEqual(after.DueReasons, before.DueReasons) {
+		t.Fatalf("due_reasons changed: before %v, after %v, want unchanged", before.DueReasons, after.DueReasons)
+	}
+
+	var journalState string
+	var appliedSituationID sql.NullString
+	if err := st.db.QueryRowContext(ctx, `SELECT journal_state, applied_situation_id FROM situation_input_outbox WHERE id = ?`, "input-artifact-term").
+		Scan(&journalState, &appliedSituationID); err != nil {
+		t.Fatal(err)
+	}
+	if journalState != "owner_terminal" {
+		t.Fatalf("journal_state = %q, want owner_terminal", journalState)
+	}
+	if !appliedSituationID.Valid || appliedSituationID.String != situationID {
+		t.Fatalf("applied_situation_id = %v, want %s", appliedSituationID, situationID)
+	}
+
+	due, err := st.ClaimDueSituations(ctx, "controller-x", now.Add(3*time.Hour), time.Minute, 10)
+	if err != nil {
+		t.Fatalf("claim due situations: %v", err)
+	}
+	for _, d := range due {
+		if d.ID == situationID {
+			t.Fatalf("ClaimDueSituations returned terminalized situation %s", situationID)
+		}
+	}
+}
+
+// TestApplySituationInputArtifactActiveOwnerReplayIsNoOp proves idempotent
+// replay of the R1 active-owner path: re-applying an already-applied
+// artifact claim changes nothing.
+func TestApplySituationInputArtifactActiveOwnerReplayIsNoOp(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 22, 0, 0, 0, time.UTC)
+
+	insertIncidentAndInput(t, st, "inc-artifact-replay", "input-artifact-replay-seed", "service=artifact-replay", now)
+	seedClaim := claimOneInput(t, st, "w", now)
+	if err := st.ApplySituationInput(ctx, seedClaim); err != nil {
+		t.Fatalf("seed apply: %v", err)
+	}
+
+	annID, err := insertAnnotationRow(ctx, st, "inc-artifact-replay")
+	if err != nil {
+		t.Fatalf("seed annotation: %v", err)
+	}
+	insertArtifactSituationInput(t, st, "inc-artifact-replay", "input-artifact-replay", "service=artifact-replay", "operator_annotation_recorded", annID, nil, now.Add(time.Minute))
+	claim := claimOneInput(t, st, "w", now.Add(time.Minute))
+	if err := st.ApplySituationInput(ctx, claim); err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	before := listSituations(t, st)
+
+	if err := st.ApplySituationInput(ctx, claim); err != nil {
+		t.Fatalf("replay apply: %v", err)
+	}
+	after := listSituations(t, st)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("replay changed situations:\nbefore=%+v\nafter=%+v", before, after)
+	}
+}
+
+// TestApplySituationInputArtifactOwnerTerminalReplayIsNoOp proves idempotent
+// replay of the R2 owner-terminal path.
+func TestApplySituationInputArtifactOwnerTerminalReplayIsNoOp(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 23, 0, 0, 0, time.UTC)
+
+	insertIncidentAndInput(t, st, "inc-artifact-term-replay", "input-artifact-term-replay-seed", "service=artifact-term-replay", now)
+	seedClaim := claimOneInput(t, st, "w", now)
+	if err := st.ApplySituationInput(ctx, seedClaim); err != nil {
+		t.Fatalf("seed apply: %v", err)
+	}
+	sits := listSituations(t, st)
+	situationID := sits[0].ID
+	terminalAt := now.Add(time.Hour)
+	if _, err := st.db.ExecContext(ctx, `
+		UPDATE situations SET lifecycle='closed_unknown', terminal_at=?, terminal_reason='resolution_missing', updated_at=?
+		WHERE id=?`, canonicalTime(terminalAt), canonicalTime(terminalAt), situationID); err != nil {
+		t.Fatalf("terminalize fixture situation: %v", err)
+	}
+
+	annID, err := insertAnnotationRow(ctx, st, "inc-artifact-term-replay")
+	if err != nil {
+		t.Fatalf("seed annotation: %v", err)
+	}
+	insertArtifactSituationInput(t, st, "inc-artifact-term-replay", "input-artifact-term-replay", "service=artifact-term-replay", "operator_annotation_recorded", annID, nil, now.Add(2*time.Hour))
+	claim := claimOneInput(t, st, "w", now.Add(2*time.Hour))
+	if err := st.ApplySituationInput(ctx, claim); err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	before := listSituations(t, st)
+
+	if err := st.ApplySituationInput(ctx, claim); err != nil {
+		t.Fatalf("replay apply: %v", err)
+	}
+	after := listSituations(t, st)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("replay changed situations:\nbefore=%+v\nafter=%+v", before, after)
 	}
 }
 

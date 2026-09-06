@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/alertint/alertint-agent/internal/llm"
@@ -182,6 +183,16 @@ type ControllerCommit struct {
 	RetryAt            *time.Time
 	LastErrorClass     *string
 	Parked             ParkedState
+
+	// History is Plan 3 Task 5's addition: this reconciliation's immutable
+	// Transitions, the Episode summary folded across them, and every
+	// notification intent they warrant — derived by BuildHistoryCommit
+	// AFTER Plan 2 has established the authoritative state above, and
+	// committed by the SAME fenced CommitController transaction. nil means
+	// this cycle produced no durable history at all (a non-material
+	// reconciliation with no pending artifact and no R4 deadline refresh
+	// due); the commit then behaves exactly as Plan 2's did.
+	History *HistoryCommit
 }
 
 // ParkedState is CommitController's explicit instruction for the
@@ -374,7 +385,37 @@ type ControllerConfig struct {
 	// Retry bounds the transient transport-failure/rate-limit retry
 	// schedule. Default Min=5s, Max=300s, JitterPercent=20.
 	Retry RetryConfig
+
+	// SlackFloor is the operator's configured minimum Interruption priority
+	// (config notify.slack.min_severity) that a NEW main-channel poke must
+	// meet. The empty value is "no floor". A poke below the floor still
+	// creates a durable withheld_by_operator_slack_floor intent — never an
+	// absent row — and the floor never suppresses a non-broadcast journal
+	// entry (Plan 3 Task 4, PlanNotificationIntents).
+	SlackFloor model.InterruptionPriority
+
+	// RepageCooldown is how long a materially changed required action must
+	// wait after a delivered main-channel poke before it may create another
+	// one (config situations.slack.repage_cooldown_seconds). Default 900s;
+	// it gates exactly one poke class (PokeRequiredActionChanged).
+	RepageCooldown time.Duration
+
+	// RecurrenceMode is the operator's notify.slack.recurrence_mode, kept
+	// from the legacy presentation path (spec.md "Journal": "Plan 3
+	// preserves current recurrence configuration and milestones"):
+	// RecurrenceModeChangeGated (the default, also for the empty value)
+	// posts a recurrence milestone as a quiet thread entry in the owning
+	// Situation thread; RecurrenceModeOff never posts one — the milestone
+	// Transition still exists and still edits the root's count. Neither
+	// ever re-pages the channel.
+	RecurrenceMode string
 }
+
+// Recurrence modes — the accepted values of notify.slack.recurrence_mode.
+const (
+	RecurrenceModeChangeGated = "change-gated"
+	RecurrenceModeOff         = "off"
+)
 
 const (
 	defaultControllerMaxL2CallsPerAttempt    = 2
@@ -384,6 +425,7 @@ const (
 	defaultControllerRetryMin                = 5 * time.Second
 	defaultControllerRetryMax                = 300 * time.Second
 	defaultControllerRetryJitterPercent      = 20
+	defaultControllerRepageCooldown          = 900 * time.Second
 )
 
 func (c ControllerConfig) withDefaults() ControllerConfig {
@@ -407,6 +449,9 @@ func (c ControllerConfig) withDefaults() ControllerConfig {
 	}
 	if c.Retry.JitterPercent <= 0 {
 		c.Retry.JitterPercent = defaultControllerRetryJitterPercent
+	}
+	if c.RepageCooldown <= 0 {
+		c.RepageCooldown = defaultControllerRepageCooldown
 	}
 	c.Cadence = c.Cadence.withDefaults()
 	return c
@@ -1025,17 +1070,50 @@ func (c *Controller) buildControllerState(snap Snapshot, in SnapshotInput, lc li
 	}
 }
 
-// commit calls c.store.CommitController and logs/audits the outcome —
-// including a stale-claim failure, which Reconcile treats as a clean,
-// expected race (spec.md: "the controller fails closed and the newer input
-// remains due") rather than an unexpected error. commit_failed is a
-// supplementary diagnostic event beyond spec.md's own named 13-event
-// taxonomy ("Audit events cover AT LEAST" that list) — kept because a
-// commit failure (most commonly a stale-claim race) is operationally
-// worth its own audit trail distinct from any of the 13 named events, none
-// of which name a whole-commit failure.
-func (c *Controller) commit(ctx context.Context, claim Claim, commit ControllerCommit) error {
-	err := c.store.CommitController(ctx, claim, commit)
+// historyBasis is the coherent-cycle context every commit path needs to
+// derive its own durable history: LoadReconciliationInput's single read,
+// this cycle's Snapshot, and the one reconciliation instant. It is threaded
+// through c.commit — the single choke point all four result classes (reuse,
+// fresh L2, fallback, blocked) already funnel through — precisely so
+// history is derived in exactly one place and no future commit path can
+// silently skip it.
+type historyBasis struct {
+	In   SnapshotInput
+	Snap Snapshot
+	Now  time.Time
+}
+
+// commit derives this reconciliation's durable history from the
+// authoritative result Plan 2 just finished building, attaches it to the
+// same ControllerCommit, and calls c.store.CommitController — one fenced,
+// all-or-nothing transaction. It logs/audits the outcome, including a
+// stale-claim failure, which Reconcile treats as a clean, expected race
+// (spec.md: "the controller fails closed and the newer input remains due")
+// rather than an unexpected error. commit_failed is a supplementary
+// diagnostic event beyond spec.md's own named 13-event taxonomy ("Audit
+// events cover AT LEAST" that list) — kept because a commit failure (most
+// commonly a stale-claim race) is operationally worth its own audit trail
+// distinct from any of the 13 named events, none of which name a
+// whole-commit failure.
+//
+// A history-derivation failure aborts the cycle BEFORE any write: a
+// Situation's authoritative state must never land without the history that
+// state warrants, so the whole reconciliation fails closed and the
+// Situation stays due.
+func (c *Controller) commit(ctx context.Context, claim Claim, basis historyBasis, commit ControllerCommit) error {
+	startedAt := time.Now()
+	history, err := c.buildHistory(claim, basis, commit)
+	if err != nil {
+		c.logger.Error("situation: controller history derivation failed",
+			"situation_id", claim.Situation.ID, "err", err)
+		c.auditAppend(ctx, "situation.controller.commit_failed", map[string]any{
+			"situation_id": claim.Situation.ID, "error": err.Error(),
+		})
+		return fmt.Errorf("situation: controller reconcile: derive history: %w", err)
+	}
+	commit.History = history
+
+	err = c.store.CommitController(ctx, claim, commit)
 	if err != nil {
 		c.logger.Warn("situation: controller commit failed", "situation_id", claim.Situation.ID, "err", err)
 		c.auditAppend(ctx, "situation.controller.commit_failed", map[string]any{
@@ -1044,6 +1122,7 @@ func (c *Controller) commit(ctx context.Context, claim Claim, commit ControllerC
 		return &commitFailedError{err: err}
 	}
 	c.auditCommitSuccess(ctx, claim, commit)
+	c.observeHistoryCommit(ctx, claim, commit, startedAt)
 	// The enclosing reconcile span (Reconcile) learns what this cycle
 	// committed: the fresh attempt's identity/derivation, if any, and the
 	// hashes — identity and digests only.
@@ -1059,6 +1138,178 @@ func (c *Controller) commit(ctx context.Context, claim Claim, commit ControllerC
 		)
 	}
 	return nil
+}
+
+// buildHistory derives this commit's immutable Transitions, the Episode
+// summary folded across them, and the Slack obligations they warrant — the
+// pure Plan 3 Task 4 composition, run only AFTER Plan 2 has established the
+// authoritative state it reads. It returns nil when the cycle produced no
+// durable history at all: a non-material reconciliation with no pending
+// operator artifact and no R4 deadline refresh due.
+func (c *Controller) buildHistory(claim Claim, basis historyBasis, commit ControllerCommit) (*HistoryCommit, error) {
+	change := authoritativeChangeOf(claim, basis, commit)
+	publication := PublicationInput{
+		Situation:                   change.Situation,
+		PriorTransition:             basis.In.PriorTransition,
+		RootPublished:               basis.In.RootPublished,
+		LatestRootSyncVersion:       basis.In.LatestRootSyncVersion,
+		RootPublicationOwed:         basis.In.RootPublicationOwed,
+		LastDeliveredRootDeadlineAt: basis.In.LastDeliveredRootDeadlineAt,
+		LastMainChannelPokeAt:       basis.In.LastMainChannelPokeAt,
+		SlackFloor:                  c.cfg.SlackFloor,
+		RepageCooldown:              c.cfg.RepageCooldown,
+		RecurrenceRepliesOff:        c.cfg.RecurrenceMode == RecurrenceModeOff,
+		Drill:                       change.Drill,
+		Now:                         basis.Now,
+	}
+	// R4: the root renders the committed nonterminal promise, captured here
+	// from the committed Operator contract — never from the Episode summary.
+	if !commit.Lifecycle.Terminal() {
+		publication.ContractDeadlineAt = commit.Assessment.ActionContract.NextUpdateAt
+	}
+
+	history, err := BuildHistoryCommit(change, publication)
+	if err != nil {
+		return nil, err
+	}
+	if len(history.Transitions) == 0 && len(history.Intents) == 0 {
+		return nil, nil //nolint:nilnil // "this cycle warranted no history" is a legitimate, non-error result.
+	}
+	return &history, nil
+}
+
+// recurrenceCountOf is the Situation's durable recurrence count: prior
+// terminal Situations in its exact group plus its member Incidents'
+// recurrence-collapse occurrences.
+func recurrenceCountOf(in SnapshotInput) int {
+	count := len(in.PriorSituations)
+	for _, inc := range in.Incidents {
+		count += inc.Occurrences
+	}
+	return count
+}
+
+// authoritativeChangeOf reduces one committed reconciliation to exactly what
+// deriving durable history needs. The Situation it carries is the COMMITTED
+// projection — Plan 2's own lifecycle/Attention/recovery/terminal decisions
+// overlaid on the coherent read — never the pre-commit row.
+func authoritativeChangeOf(claim Claim, basis historyBasis, commit ControllerCommit) AuthoritativeChange {
+	sit := basis.In.Situation
+	sit.InputVersion = claim.Situation.InputVersion
+	sit.Lifecycle = commit.Lifecycle
+	sit.Attention = commit.Attention
+	sit.RecoveryObservedAt = commit.RecoveryObservedAt
+	sit.GraceUntil = commit.GraceUntil
+	sit.TerminalAt = commit.TerminalAt
+	sit.TerminalReason = commit.TerminalReason
+	sit.NextAssessmentAt = commit.NextAssessmentAt
+	sit.UpdatedAt = basis.Now
+	// This cycle's CONSUMED due reasons, never the remainder CommitController
+	// leaves behind after subtracting them: Triage materiality reads the
+	// consumed `triage_changed`, so handing it the post-commit remainder
+	// would make every Triage change after the first one invisible.
+	sit.DueReasons = commit.ConsumedDueReasons
+
+	conclusion := assessmentConclusionOf(commit.Assessment)
+	change := AuthoritativeChange{
+		Situation:  sit,
+		Assessment: commit.Assessment,
+		Derivation: commit.Attempt.Derivation,
+		// R3: bounded projection facts captured from the coherent claim and
+		// this commit's own lifecycle fields — the only thing the Episode
+		// fold may read.
+		Projection: model.ProjectionFacts{
+			PublicHandle:            sit.PublicHandle,
+			EffectiveStartedAt:      sit.EffectiveStartedAt,
+			EffectiveStartedAtBasis: sit.EffectiveStartedAtBasis,
+			RecoveryObservedAt:      commit.RecoveryObservedAt,
+			GraceUntil:              commit.GraceUntil,
+			TerminalAt:              commit.TerminalAt,
+			TerminalReason:          commit.TerminalReason,
+			Assessment:              &conclusion,
+		},
+		PriorTransition:  basis.In.PriorTransition,
+		PriorSummary:     basis.In.CurrentSummary,
+		MaterialFactHash: commit.MaterialFactHash,
+		EvidenceRefs:     materialFactRefs(basis.Snap),
+		Incidents:        basis.Snap.Incidents,
+		TriageDecisions:  commit.TriageDecisions,
+		// spec.md: "recurrence count available from durable local Store
+		// facts" — this exact group's prior terminal Situations (the same
+		// durable lineage Plan 2 already loads for its duration
+		// distribution) plus every re-fire that attached to a member
+		// Incident as a recurrence-collapse occurrence. The prior count
+		// alone is fixed for a Situation's whole lifetime (one nonterminal
+		// Situation per group), so occurrences are what let a milestone
+		// actually be reached while it is open (review round 1, R1-F6).
+		RecurrenceCount:   recurrenceCountOf(basis.In),
+		OperatorArtifacts: basis.In.PendingArtifacts,
+		Drill:             situationDrill(basis.In),
+		Now:               basis.Now,
+	}
+	switch {
+	case commit.Attempt.ID != "":
+		change.AssessmentID = stringPtrOf(commit.Attempt.ID)
+	case basis.In.CurrentAssessment != nil:
+		// A cycle that wrote no new attempt still records the Assessment
+		// that stays authoritative (situations.current_assessment_id is
+		// COALESCEd, not cleared).
+		change.AssessmentID = stringPtrOf(basis.In.CurrentAssessment.ID)
+	}
+	if change.Derivation == "" && basis.In.CurrentAssessment != nil {
+		change.Derivation = basis.In.CurrentAssessment.Derivation
+	}
+	return change
+}
+
+// assessmentConclusionOf reduces an Assessment to the closed judgment codes
+// and the bounded Sufficient-reason summary a Transition's projection may
+// carry (R3) — never the full Assessment, which stays referenced by ID.
+func assessmentConclusionOf(a model.Assessment) model.AssessmentConclusion {
+	codes := make([]string, 0, len(a.Limitations))
+	for _, l := range a.Limitations {
+		codes = append(codes, l.Code)
+	}
+	out := model.AssessmentConclusion{
+		Persistence:     a.Persistence,
+		Impact:          a.Impact,
+		Novelty:         a.Novelty,
+		Causality:       a.Causality,
+		EvidenceQuality: a.EvidenceQuality,
+		LimitationCodes: codes,
+	}
+	if a.SufficientReason != nil {
+		out.SufficientReasonCode = a.SufficientReason.Code
+		out.SufficientReasonSummary = a.SufficientReason.Summary
+	}
+	return out
+}
+
+// materialFactRefs is this cycle's supporting evidence: every material
+// derived fact's identity. BuildTransitions canonicalizes, deduplicates,
+// and bounds the list, and merges the accepted Sufficient reason's own
+// references into it.
+func materialFactRefs(snap Snapshot) []string {
+	refs := make([]string, 0, len(snap.Facts))
+	for _, f := range snap.Facts {
+		if f.Material {
+			refs = append(refs, f.ID)
+		}
+	}
+	return refs
+}
+
+// situationDrill reports whether this Situation carries the Drill marker,
+// using the same any-drill-delivery reduction incidentDrillParity applies
+// per Incident: a disagreement fails safe toward treating the Situation as
+// a Drill rather than silently publishing it as real.
+func situationDrill(in SnapshotInput) bool {
+	for _, d := range in.Deliveries {
+		if d.Drill {
+			return true
+		}
+	}
+	return false
 }
 
 // commitFailedError marks an error as CommitController's own rejection (a
@@ -1144,6 +1395,122 @@ func (c *Controller) auditCommitSuccess(ctx context.Context, claim Claim, commit
 	}
 }
 
+// observeHistoryCommit is Plan 3 Task 9's audit + OTel surface for one
+// landed commit's durable history (R8). It runs AFTER CommitController has
+// returned, so no audit append or exporter call ever happens inside a
+// database transaction (Global Constraint), and it records identities,
+// sequences, versions, closed codes, and one duration — never journal
+// prose, an Episode narrative, a proposal, or a provider body.
+//
+// A non-material cycle still opens the span, with result class
+// "no_history": "this cycle deliberately wrote nothing" is an operational
+// answer worth having, and its absence would read as a lost commit.
+func (c *Controller) observeHistoryCommit(ctx context.Context, claim Claim, commit ControllerCommit, startedAt time.Time) {
+	_, span := tracer().Start(ctx, SpanHistoryCommit, trace.WithAttributes(
+		AttrSituationID.String(claim.Situation.ID),
+		AttrInputVersion.Int(claim.Situation.InputVersion),
+	))
+	defer span.End()
+
+	if commit.History == nil {
+		span.SetAttributes(
+			AttrResultClass.String(HistoryResultNoHistory),
+			AttrDurationMS.Int64(time.Since(startedAt).Milliseconds()),
+		)
+		return
+	}
+	history := commit.History
+	attrs := []attribute.KeyValue{
+		AttrResultClass.String(HistoryResultCommitted),
+		AttrDurationMS.Int64(time.Since(startedAt).Milliseconds()),
+	}
+	logAttrs := []any{
+		"situation_id", claim.Situation.ID,
+		"input_version", claim.Situation.InputVersion,
+		"transitions", len(history.Transitions),
+		"intents", len(history.Intents),
+	}
+	// A commit can legitimately carry intents but NO Transition: the R4
+	// deadline refresh of an already-published root is the one Slack effect
+	// a non-material reconciliation may create.
+	if len(history.Transitions) > 0 {
+		last := history.Transitions[len(history.Transitions)-1]
+		attrs = append(attrs,
+			AttrTransitionID.String(last.ID),
+			AttrTransitionSequence.Int(last.Sequence))
+		logAttrs = append(logAttrs,
+			"latest_transition_id", last.ID,
+			"latest_transition_sequence", last.Sequence)
+	}
+	if history.Summary != nil {
+		attrs = append(attrs, AttrSummaryVersion.Int(history.Summary.Version))
+	}
+	span.SetAttributes(attrs...)
+	c.logger.Info("situation: history committed", append(logAttrs, spanLogAttrs(span)...)...)
+
+	c.auditHistoryCommit(ctx, claim, history)
+}
+
+// auditHistoryCommit appends the bounded Plan 3 audit trail for one landed
+// commit: one row per immutable Transition (with the consumed operator
+// artifact's identity when the Transition is an artifact journaling, R1),
+// one for the Episode-summary version folded across them, and one per
+// notification intent created. Payloads carry identities and closed codes
+// only — never headline/detail prose or a Slack coordinate that does not
+// exist yet.
+func (c *Controller) auditHistoryCommit(ctx context.Context, claim Claim, history *HistoryCommit) {
+	for i := range history.Transitions {
+		t := history.Transitions[i]
+		payload := map[string]any{
+			"situation_id": t.SituationID, "transition_id": t.ID, "sequence": t.Sequence,
+			"input_version": t.InputVersion, "reason": string(t.Reason),
+			"journal_kind": string(t.JournalKind), "lifecycle": string(t.Lifecycle),
+			"attention": string(t.Attention), "actor": string(t.Actor),
+			"material_fact_hash": t.MaterialFactHash, "drill": t.Drill,
+		}
+		kind := auditKindTransitionCommitted
+		if t.OperatorArtifactInputID != nil {
+			kind = auditKindArtifactJournaled
+			payload["operator_artifact_input_id"] = *t.OperatorArtifactInputID
+		}
+		c.auditAppend(ctx, kind, payload)
+	}
+	if history.Summary != nil {
+		c.auditAppend(ctx, auditKindSummaryProjected, map[string]any{
+			"situation_id": history.Summary.SituationID, "version": history.Summary.Version,
+			"source_transition_sequence": history.Summary.SourceTransitionSequence,
+			"current_attention":          string(history.Summary.CurrentAttention),
+			"peak_attention":             string(history.Summary.PeakAttention),
+			"recurrence_count":           history.Summary.RecurrenceCount,
+		})
+	}
+	for i := range history.Intents {
+		n := history.Intents[i]
+		payload := map[string]any{
+			"situation_id": claim.Situation.ID, "intent_id": n.ID,
+			"effect_class": string(n.EffectClass), "status": string(n.Status),
+			"main_channel_poke": n.MainChannelPoke, "requires_root": n.RequiresRoot,
+		}
+		if n.InterruptionPriority != nil {
+			payload["interruption_priority"] = string(*n.InterruptionPriority)
+		}
+		if n.TransitionSequence != nil {
+			payload["transition_sequence"] = *n.TransitionSequence
+		}
+		if n.SummaryVersion != nil {
+			payload["summary_version"] = *n.SummaryVersion
+		}
+		kind := auditKindIntentCreated
+		if n.Status == model.IntentWithheld {
+			// A floor-withheld poke is a durable DECISION, not an absent
+			// row: it gets its own event so an operator can see what the
+			// configured floor actually suppressed.
+			kind = auditKindNotificationWithheld
+		}
+		c.auditAppend(ctx, kind, payload)
+	}
+}
+
 // Reconcile performs one claimed Situation's full reconciliation cycle:
 // coherent load; local fact derivation/append; Snapshot/hashes/reasons/
 // floors; pure Triage decisions; deterministic/reuse check; only then
@@ -1223,6 +1590,10 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 
 	state := c.buildControllerState(snap, in, lc, triageDecisions, now)
 
+	// The coherent-cycle context every commit path below derives its own
+	// durable history from (Plan 3 Task 5).
+	basis := historyBasis{In: in, Snap: snap, Now: now}
+
 	base := ControllerCommit{
 		MaterialFactHash:    snap.MaterialFactHash,
 		AssessmentBasisHash: snap.AssessmentBasisHash,
@@ -1249,7 +1620,7 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 		if rr.Ok {
 			// duration=0: a reuse commit never calls out (callID is always
 			// nil here).
-			return c.commitResult(ctx, claim, base, rr.Result, nil, 0, 1, 0, now)
+			return c.commitResult(ctx, claim, basis, base, rr.Result, nil, 0, 1, 0)
 		}
 	}
 
@@ -1273,7 +1644,7 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 	// controllerParkBlocksDispatch returns false and this cycle proceeds
 	// exactly as if not parked, naturally lifting the park.
 	if controllerParkBlocksDispatch(in.ControllerParked, snap.MaterialFactHash) {
-		return c.commitBlocked(ctx, claim, base, situationID, snap, in, state, now)
+		return c.commitBlocked(ctx, claim, basis, base, state)
 	}
 
 	// Finding I3 ruling: a deterministic urgent floor (critical_anchor) does
@@ -1360,7 +1731,7 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 			// Otherwise already parked from a prior cycle on this unchanged
 			// input: refresh the bounded projection only, touch no parked
 			// state.
-			return c.commitBlocked(ctx, claim, base, situationID, snap, in, state, now)
+			return c.commitBlocked(ctx, claim, basis, base, state)
 		}
 		return fmt.Errorf("situation: controller reconcile: begin attempt: %w", err)
 	}
@@ -1374,7 +1745,7 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 	}
 	if disp.proposal != nil {
 		result := DeriveAssessment(*disp.proposal, snap, in, state, model.DerivationModelValidated, nil, now)
-		return c.commitResult(ctx, claim, base, result, &disp.lastCallID, retryEpoch, workAttempt, disp.lastDuration, now)
+		return c.commitResult(ctx, claim, basis, base, result, &disp.lastCallID, retryEpoch, workAttempt, disp.lastDuration)
 	}
 
 	// No accepted/contradicted result: classify the last outcome (using
@@ -1405,7 +1776,7 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 	assessment, attempt, coverage := c.fallbackOrPreserve(situationID, snap, in, state, retryEpoch, workAttempt, now)
 	base.Assessment, base.Attempt, base.Coverage = assessment, attempt, coverage
 	c.finalizeCheckpoint(&base, now)
-	return c.commit(ctx, claim, base)
+	return c.commit(ctx, claim, basis, base)
 }
 
 // commitResult finishes building base from a successful (no-L2-needed, or
@@ -1415,7 +1786,8 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 // when callID is non-nil (dispatchWorkBearing's own oneShot.Latency), or 0
 // for a no-call commit (reuse) — threaded straight through to
 // buildAuthoritativeAttempt.
-func (c *Controller) commitResult(ctx context.Context, claim Claim, base ControllerCommit, result AssessmentResult, callID *string, retryEpoch, workAttempt int, duration time.Duration, now time.Time) error {
+func (c *Controller) commitResult(ctx context.Context, claim Claim, basis historyBasis, base ControllerCommit, result AssessmentResult, callID *string, retryEpoch, workAttempt int, duration time.Duration) error {
+	now := basis.Now
 	base.Attempt = buildAuthoritativeAttempt(claim.Situation.ID, result, callID, retryEpoch, workAttempt, duration, now)
 	base.Assessment = result.Assessment
 	base.Coverage = result.Coverage
@@ -1424,7 +1796,7 @@ func (c *Controller) commitResult(ctx context.Context, claim Claim, base Control
 	base.LastErrorClass = nil
 
 	c.finalizeCheckpoint(&base, now)
-	err := c.commit(ctx, claim, base)
+	err := c.commit(ctx, claim, basis, base)
 	if err != nil && callID != nil {
 		// spec.md: "A stale proposal/attempt is retained as `stale` but
 		// changes no projection, Triage state, lifecycle, or outward
@@ -1510,11 +1882,11 @@ func (c *Controller) finalizeCheckpoint(base *ControllerCommit, now time.Time) {
 // the zero value, so whatever was persisted stands; the one exception is
 // Reconcile's exhausted-but-never-parked repair, which hands in a
 // ParkedReasonDependency park for this commit to persist).
-func (c *Controller) commitBlocked(ctx context.Context, claim Claim, base ControllerCommit, situationID string, snap Snapshot, in SnapshotInput, state ControllerState, now time.Time) error {
-	assessment, attempt, coverage := c.fallbackOrPreserveBlocked(situationID, snap, in, state, now)
+func (c *Controller) commitBlocked(ctx context.Context, claim Claim, basis historyBasis, base ControllerCommit, state ControllerState) error {
+	assessment, attempt, coverage := c.fallbackOrPreserveBlocked(claim.Situation.ID, basis.Snap, basis.In, state, basis.Now)
 	base.Assessment, base.Attempt, base.Coverage = assessment, attempt, coverage
-	c.finalizeCheckpoint(&base, now)
-	return c.commit(ctx, claim, base)
+	c.finalizeCheckpoint(&base, basis.Now)
+	return c.commit(ctx, claim, basis, base)
 }
 
 // fallbackOrPreserveBlocked is fallbackOrPreserve's counterpart for a cycle

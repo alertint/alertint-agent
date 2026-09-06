@@ -22,9 +22,14 @@ under the [`memory`](../getting-started/configuration.md#memory) config block.
 
 When a firing alert's group key matches an already-analyzed incident and lands
 inside the **collapse horizon**, AlertINT attaches it as an **occurrence** of
-that incident instead of minting a new one and spending another analysis. The
-incident's Slack card edits in place — `recurred ×N · last HH:MM` — and a JSON
-occurrence line is written to stdout. No second LLM call.
+that incident instead of minting a new one and spending another analysis. In a
+released binary the incident's Slack card edits in place — `recurred ×N ·
+last HH:MM`. On the `state-controller` branch the attach moves the owning
+Situation's recurrence count (its closed predecessors plus its own re-fires):
+the root shows `recurred ×N`, and a crossed milestone rung records a
+`recurrence_milestone` Transition with one quiet reply in the Situation's
+thread. Either way a JSON occurrence line is written to stdout. No second LLM
+call.
 
 The horizon is two clocks: a sliding attach window (default 30 minutes from the
 last occurrence) and a hard ceiling on the time since the last analysis (default
@@ -101,8 +106,11 @@ on every recurrence, and live evidence can retire it. A **confirmation** verdict
 retires steering — it records that the machine's conclusion is right.
 
 Notes written with `alertint_incident_annotate` are context for the next
-investigator: they render on the incident's Slack thread (history line plus
-a bounded notes list) and in MCP incident reads (`operator_history`),
+investigator: in a released binary they render on the incident's Slack thread
+(history line plus a bounded notes list); on the `state-controller` branch
+they are journalled instead as one attributed `operator_note` entry in the
+owning Situation's thread, and only while a nonterminal Situation owns the
+incident. Either way they appear in MCP incident reads (`operator_history`),
 permanent and age-stamped, and never enter the triage prompt or influence
 recall.
 

@@ -106,9 +106,10 @@ const (
 // concurrency, the reconcile poll interval, Situation claim lease/heartbeat
 // timing, the webhook source recovery grace, internal cadence tiers, the
 // fixed L2 call/work-attempt ceiling, the per-attempt wall clock, the shared
-// L2 provider semaphore, and bounded retry/jitter. It carries no Plan 3/4
-// settings: no L1 call budget, connector concurrency, or envelope review
-// interval. In particular, Plan 2 deliberately never adds
+// L2 provider semaphore, and bounded retry/jitter — plus Plan 3's single
+// Slack policy setting (Slack, SituationSlackConfig). It carries no other
+// Plan 3/4 settings: no L1 call budget, connector concurrency, or envelope
+// review interval. In particular, Plan 2 deliberately never adds
 // situations.budgets.max_l1_llm_calls (spec.md 02-controller-triage-coordination
 // "Attempt identity and completion": Acute Triage keeps its shipped
 // five-attempt schedule; a parsed budget with no distinct consuming behavior
@@ -126,6 +127,22 @@ type SituationsConfig struct {
 	AttemptWallSeconds          int                     `yaml:"attempt_wall_seconds"`
 	LLMConcurrency              int                     `yaml:"llm_concurrency"`
 	Retry                       SituationsRetryConfig   `yaml:"retry"`
+	Slack                       SituationSlackConfig    `yaml:"slack"`
+}
+
+// SituationSlackConfig is Plan 3's only Situation-Slack policy setting: how
+// long a warranted required-action change must wait after a delivered
+// main-channel poke before it may create another one (the repage cooldown
+// in "a materially changed required action after the configured cooldown",
+// spec.md "Publication authority and Interruption priority"). Every other
+// Slack delivery behavior — retry timing, lease/heartbeat, batch size,
+// attempt accounting — reuses Plan 2's existing situations.retry/lease/
+// heartbeat settings and NotificationWorkerConfig's fixed spec constants;
+// Plan 3 adds no duplicate notification knobs, no attempt ceiling (delivery
+// retries indefinitely), and no Slack channel-history or
+// read-before-redrive reconciliation setting.
+type SituationSlackConfig struct {
+	RepageCooldownSeconds int `yaml:"repage_cooldown_seconds"`
 }
 
 // SituationsCadenceConfig sizes the controller's internal fast/normal/slow
@@ -661,6 +678,9 @@ func Defaults() Config {
 				MaxSeconds:    300,
 				JitterPercent: 20,
 			},
+			Slack: SituationSlackConfig{
+				RepageCooldownSeconds: 900,
+			},
 		},
 		Telemetry: TelemetryConfig{
 			OTLP: OTLPConfig{
@@ -1089,6 +1109,7 @@ func (c *Config) validateSituations() []string {
 		{"situations.llm_concurrency", s.LLMConcurrency},
 		{"situations.retry.min_seconds", s.Retry.MinSeconds},
 		{"situations.retry.max_seconds", s.Retry.MaxSeconds},
+		{"situations.slack.repage_cooldown_seconds", s.Slack.RepageCooldownSeconds},
 	}
 	for _, p := range positive {
 		if p.v <= 0 {

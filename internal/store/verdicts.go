@@ -112,6 +112,16 @@ func (s *Store) PersistVerdictCapture(ctx context.Context, c VerdictCapture) (*I
 			return nil, nil, fmt.Errorf("store: verdict demotion: %w", err)
 		}
 	}
+	// Task 8: enqueue exactly one captured_verdict_recorded situation input —
+	// never operator_annotation_recorded, even though the verdict insert
+	// above (via insertAnnotationTx) also writes a matching
+	// incident_annotations row — under the same active/no-owner/terminal-
+	// owner rules InsertIncidentAnnotation uses (enqueueOperatorArtifactInputTx,
+	// annotations.go).
+	idempotencyKey := fmt.Sprintf("captured-verdict:%d", id)
+	if err := enqueueOperatorArtifactInputTx(ctx, tx, c.IncidentID, "captured_verdict_recorded", idempotencyKey, nil, id, now); err != nil {
+		return nil, nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, nil, fmt.Errorf("store: commit verdict: %w", err)
 	}

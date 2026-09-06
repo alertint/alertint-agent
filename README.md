@@ -14,7 +14,7 @@
 
 > AlertINT turns infrastructure alerts into investigated incidents and serves them to the AI tools you already use, over MCP — a self-hosted agent that runs inside your own network.
 
-A single Go binary that sits between your monitoring stack and your AI agent. It ingests alert webhooks from Alertmanager and Zabbix, correlates them into incidents through an open rule engine, and runs an LLM triage that falsifies its own draft verdict before the finding ships. Findings go to Slack; the incident state — plus read-only Prometheus, Loki, and Zabbix access — is exposed to any MCP client. Corrections your agent captures over MCP steer the next triage of the same failure. Read-only by design. Local state. You bring the LLM key.
+A single Go binary that sits between your monitoring stack and your AI agent. It ingests alert webhooks from Alertmanager and Zabbix, correlates them into incidents through an open rule engine, and runs an LLM triage that falsifies its own draft verdict before the finding ships. Findings go to stdout and, when configured, to one Slack channel; the incident state — plus read-only Prometheus, Loki, and Zabbix access — is exposed to any MCP client. Corrections your agent captures over MCP steer the next triage of the same failure. Read-only by design. Local state. You bring the LLM key.
 
 **Full documentation: [alertint.com/docs](https://alertint.com/docs)**
 
@@ -56,6 +56,16 @@ the next triage of that failure group.
 The whole pipeline — receivers, correlation, the evidence pack, both loops, and
 the MCP surface — is diagrammed and walked through step by step in
 **[Architecture](https://alertint.com/docs/concepts/architecture)**.
+
+On the `state-controller` integration branch (not the released default), a
+durable **Situation** owns each failure group's history: every authoritative
+material change commits one immutable transition and one version of a current
+episode summary, and Slack shows one evolving Situation root plus an
+immutable ordered journal thread instead of a per-incident card. Delivery is
+driven from durable intents that retry indefinitely, open a visible gap after
+five continuous minutes of Slack failure, and replay every affected episode
+in order once Slack returns — see
+**[Slack](https://alertint.com/docs/notifications/slack)**.
 
 ## Documentation
 

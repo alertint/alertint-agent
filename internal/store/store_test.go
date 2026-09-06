@@ -55,6 +55,12 @@ func TestOpen_AppliesEmbeddedMigrations(t *testing.T) {
 		"situation_assessment_attempts": false,
 		"situation_assessment_coverage": false,
 		"incident_triage_attempts":      false,
+		"situation_transitions":         false,
+		"situation_episode_summaries":   false,
+		"situation_transition_stream":   false,
+		"notification_intents":          false,
+		"slack_delivery_state":          false,
+		"slack_delivery_gaps":           false,
 	}
 	for rows.Next() {
 		var name string
@@ -440,12 +446,13 @@ func TestMaxSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	// 0016_incident_triage_controller.sql is the newest migration today.
-	// Plan 2 owns exactly 0015 and 0016 (the llm_health_capabilities
-	// widening for "assessment" lives inside 0015); Plan 3 provisionally
-	// owns 0017/0018, so this number must not move before Plan 2 lands.
-	if got != 16 {
-		t.Errorf("MaxSchemaVersion = %d, want 16", got)
+	// 0019_notification_blocked_index.sql is the newest migration today.
+	// Plan 2 owns 0015/0016; Plan 3 owns 0017/0018 (spec.md "Persistence and
+	// migration ownership") plus 0019, which adds one partial index and no
+	// schema of its own — 0017 and 0018 are final and are never edited, so a
+	// new migration is the only sanctioned way to add it.
+	if got != 21 {
+		t.Errorf("MaxSchemaVersion = %d, want 19", got)
 	}
 }
 

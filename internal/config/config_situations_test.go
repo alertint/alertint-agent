@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
 // situationsBaseYAML is a minimal valid config with the SQLite path
@@ -45,6 +47,7 @@ func TestSituationsDefaults(t *testing.T) {
 		{"retry.min_seconds", s.Retry.MinSeconds, 5},
 		{"retry.max_seconds", s.Retry.MaxSeconds, 300},
 		{"retry.jitter_percent", s.Retry.JitterPercent, 20},
+		{"slack.repage_cooldown_seconds", s.Slack.RepageCooldownSeconds, 900},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -110,6 +113,8 @@ func TestSituationsValidation(t *testing.T) {
 		{"max_l2_calls_per_attempt above fixed value", func(s *SituationsConfig) { s.MaxL2CallsPerAttempt = 3 }, true},
 		{"max_work_attempts_per_input below fixed value", func(s *SituationsConfig) { s.MaxWorkAttemptsPerInput = 4 }, true},
 		{"max_work_attempts_per_input above fixed value", func(s *SituationsConfig) { s.MaxWorkAttemptsPerInput = 6 }, true},
+		{"slack.repage_cooldown_seconds zero", func(s *SituationsConfig) { s.Slack.RepageCooldownSeconds = 0 }, true},
+		{"slack.repage_cooldown_seconds negative", func(s *SituationsConfig) { s.Slack.RepageCooldownSeconds = -1 }, true},
 	}
 
 	for _, tc := range cases {
@@ -190,5 +195,77 @@ situations:
 	}
 	if cfg.Situations.MaxL2CallsPerAttempt != 2 {
 		t.Errorf("default max_l2_calls_per_attempt = %d, want 2", cfg.Situations.MaxL2CallsPerAttempt)
+	}
+}
+
+// TestLoad_SituationsSlackValidAndDefaults proves situations.slack.
+// repage_cooldown_seconds loads and overrides the 900-second default.
+func TestLoad_SituationsSlackValidAndDefaults(t *testing.T) {
+	yaml := situationsBaseYAML(t) + `
+situations:
+  slack:
+    repage_cooldown_seconds: 600
+`
+	path := writeConfig(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Situations.Slack.RepageCooldownSeconds != 600 {
+		t.Errorf("slack.repage_cooldown_seconds = %d, want 600", cfg.Situations.Slack.RepageCooldownSeconds)
+	}
+}
+
+// TestLoad_SituationsSlackRejectsAttemptCeiling proves Plan 3 adds no
+// notification-worker attempt-ceiling knob under situations.slack:
+// NotificationWorkerConfig retries valid Slack effects indefinitely (plan.md
+// Cross-Task Contracts, "It has no maximum attempts field"), so a configured
+// ceiling must fail strict decoding rather than being silently accepted and
+// ignored.
+func TestLoad_SituationsSlackRejectsAttemptCeiling(t *testing.T) {
+	yaml := situationsBaseYAML(t) + `
+situations:
+  slack:
+    max_attempts: 5
+`
+	path := writeConfig(t, yaml)
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected strict-decode error for situations.slack.max_attempts")
+	}
+}
+
+// TestLoad_SituationsSlackRejectsReadReconciliation proves Plan 3 adds no
+// Slack channel-history-read or read-before-redrive reconciliation setting
+// (Global Constraints: "Do not request Slack channel-history scopes and do
+// not implement read-before-redrive reconciliation").
+func TestLoad_SituationsSlackRejectsReadReconciliation(t *testing.T) {
+	yaml := situationsBaseYAML(t) + `
+situations:
+  slack:
+    read_before_redrive: true
+`
+	path := writeConfig(t, yaml)
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected strict-decode error for situations.slack.read_before_redrive")
+	}
+}
+
+// TestNotifySlackMinSeverityIsInterruptionPriorityFloor documents the
+// compatibility contract (spec.md "Publication authority and Interruption
+// priority"): notify.slack.min_severity keeps its existing accepted values
+// low|medium|high unchanged, but in the Situation path the selected value is
+// read only as a minimum deterministic Interruption priority — never Alert
+// or model severity. Every accepted min_severity value must therefore
+// already be one of model.InterruptionPriority's closed values; "critical"
+// is a valid Interruption priority with no min_severity equivalent, so the
+// compatibility setting can never select it as a floor.
+func TestNotifySlackMinSeverityIsInterruptionPriorityFloor(t *testing.T) {
+	for _, v := range []string{"low", "medium", "high"} {
+		if err := model.InterruptionPriority(v).Validate(); err != nil {
+			t.Errorf("notify.slack.min_severity value %q must be a valid Interruption priority: %v", v, err)
+		}
+	}
+	if err := model.InterruptionPriority("critical").Validate(); err != nil {
+		t.Errorf("critical must be a valid Interruption priority: %v", err)
 	}
 }

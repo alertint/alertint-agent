@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -98,7 +100,15 @@ func seedAnalyzedIncidentOnKey(t *testing.T, st *store.Store) store.Incident {
 	return *got
 }
 
-func TestAnnotate_CorrectionAuditsNotifiesNoDemote(t *testing.T) {
+// TestAnnotate_CorrectionAuditsNoDemote proves Annotate's persist-only
+// contract post-Task-8: the annotation lands, is audited, pulls no D7 lever,
+// and — since Task 8 removed capture.go's own notifyAnnotation fan-out —
+// never calls a notifier directly any more. Presentation is the Situation
+// controller/notification worker's job (Task 6/7); this engine's own job is
+// now limited to persisting the annotation and (situationOwnedIncident
+// cases below) durably enqueuing the Situation input that makes it visible
+// there.
+func TestAnnotate_CorrectionAuditsNoDemote(t *testing.T) {
 	st := newTestStore(t)
 	inc := seedAnalyzedIncidentOnKey(t, st)
 	sink := &fakeAnnotationSink{}
@@ -129,8 +139,88 @@ func TestAnnotate_CorrectionAuditsNotifiesNoDemote(t *testing.T) {
 		t.Fatalf("audit chain must verify: report=%+v err=%v", rep, err)
 	}
 
-	if len(sink.events) != 1 || sink.events[0].Kind != "correction" || sink.events[0].Note != "not an AZ outage" {
-		t.Fatalf("annotation sink saw %+v", sink.events)
+	if len(sink.events) != 0 {
+		t.Fatalf("Annotate must never call a notifier directly (Task 8: the Situation controller/worker owns presentation); sink saw %+v", sink.events)
+	}
+}
+
+// situationOwnedIncident builds one real Incident and durably attaches it to
+// a brand-new active Situation the same way the durable pipeline does —
+// InsertIncident, a queued incident_created situation_input_outbox row,
+// ClaimSituationInputs, ApplySituationInput (mirrors internal/mcp's
+// seedSituationForMCP and internal/store's own situationOwnedIncident) —
+// never an INSERT INTO situations by hand. Task 8's write-back enqueue
+// (InsertIncidentAnnotation/PersistVerdictCapture, called through
+// CaptureEngine here) only reaches situation_input_outbox when the target
+// Incident currently belongs to a nonterminal Situation, so the tests below
+// that assert on that enqueue call this first.
+func situationOwnedIncident(t *testing.T, st *store.Store, groupKey string) string {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	incidentID := uuid.NewString()
+	if err := st.InsertIncident(ctx, store.Incident{
+		ID: incidentID, GroupKey: groupKey, FirstAlertAt: now, LastAlertAt: now, ReadyAt: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("insert incident: %v", err)
+	}
+	if err := st.MarkIncidentReady(ctx, incidentID); err != nil {
+		t.Fatalf("mark incident ready: %v", err)
+	}
+	inputID := "input-" + incidentID
+	if _, err := st.DB().ExecContext(ctx, `
+		INSERT INTO situation_input_outbox (id, idempotency_key, incident_id, kind, group_key, occurred_at, status)
+		VALUES (?, ?, ?, 'incident_created', ?, ?, 'pending')`,
+		inputID, "idem:"+inputID, incidentID, groupKey, now.Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("seed situation input: %v", err)
+	}
+	claims, err := st.ClaimSituationInputs(ctx, "test-worker", now, time.Minute, 1)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("claim seed situation input: claims=%d err=%v", len(claims), err)
+	}
+	if err := st.ApplySituationInput(ctx, claims[0]); err != nil {
+		t.Fatalf("apply seed situation input: %v", err)
+	}
+	return incidentID
+}
+
+// countSituationInputKind counts situation_input_outbox rows of kind for
+// incidentID — the write-back enqueue's own visible effect.
+func countSituationInputKind(t *testing.T, st *store.Store, incidentID, kind string) int {
+	t.Helper()
+	var n int
+	if err := st.DB().QueryRowContext(context.Background(), `
+		SELECT COUNT(*) FROM situation_input_outbox WHERE incident_id = ? AND kind = ?`, incidentID, kind).Scan(&n); err != nil {
+		t.Fatalf("count situation inputs: %v", err)
+	}
+	return n
+}
+
+// TestAnnotate_NoDirectNotifyEnqueuesOperatorAnnotationRecordedInput proves
+// Task 8's Step 5 cutover end to end from the CaptureEngine's own entry
+// point: Annotate never calls a notifier directly (no direct Slack call),
+// and — because the target Incident belongs to an active Situation — the
+// durable write-back enqueues exactly one operator_annotation_recorded
+// situation_input_outbox row (the "one attributable Situation journal"
+// input a later controller reconciliation cycle folds into a Transition).
+func TestAnnotate_NoDirectNotifyEnqueuesOperatorAnnotationRecordedInput(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	incidentID := situationOwnedIncident(t, st, "service=annotate-situation")
+	sink := &fakeAnnotationSink{}
+	eng := acutetriage.NewCaptureEngine(skillForCapture(t, st, sink))
+
+	if _, err := eng.Annotate(ctx, acutetriage.AnnotateRequest{
+		IncidentID: incidentID, Kind: "observation", Note: "fyi",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(sink.events) != 0 {
+		t.Fatalf("Annotate must never call a notifier directly; sink saw %+v", sink.events)
+	}
+	if n := countSituationInputKind(t, st, incidentID, "operator_annotation_recorded"); n != 1 {
+		t.Fatalf("operator_annotation_recorded situation inputs = %d, want 1", n)
 	}
 }
 
@@ -237,6 +327,37 @@ func TestCaptureVerdict_PersistPhase(t *testing.T) {
 	rep, err := audit.New(st.DB()).Verify(ctx)
 	if err != nil || !rep.OK {
 		t.Fatalf("audit chain must verify: report=%+v err=%v", rep, err)
+	}
+}
+
+// TestCaptureVerdict_NoDirectNotifyEnqueuesCapturedVerdictRecordedInput
+// mirrors TestAnnotate_NoDirectNotifyEnqueuesOperatorAnnotationRecordedInput
+// for the CaptureVerdict persist phase: no direct notifier call, and exactly
+// one captured_verdict_recorded situation input when the Incident belongs to
+// an active Situation.
+func TestCaptureVerdict_NoDirectNotifyEnqueuesCapturedVerdictRecordedInput(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	incidentID := situationOwnedIncident(t, st, "service=verdict-situation")
+	insertTestAlert(t, st, ctx, incidentID, "fp-"+incidentID, map[string]string{"alertname": "TargetDown"})
+	if err := st.SaveIncidentOutput(ctx, incidentID, `{"analysis_name":"x","overall_issue":"y"}`, "x", "y", 0.7, "{}"); err != nil {
+		t.Fatalf("save incident output: %v", err)
+	}
+	sink := &fakeAnnotationSink{}
+	eng := acutetriage.NewCaptureEngine(skillForCaptureWithProm(t, st, sink, promHealthy(t)))
+
+	if _, err := eng.CaptureVerdict(ctx, acutetriage.CaptureRequest{
+		IncidentID: incidentID, Verdict: "correction",
+		Expectation: json.RawMessage(`{"must_not_conclude":["AZ outage"]}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(sink.events) != 0 {
+		t.Fatalf("CaptureVerdict must never call a notifier directly; sink saw %+v", sink.events)
+	}
+	if n := countSituationInputKind(t, st, incidentID, "captured_verdict_recorded"); n != 1 {
+		t.Fatalf("captured_verdict_recorded situation inputs = %d, want 1", n)
 	}
 }
 
@@ -897,25 +1018,30 @@ func TestCaptureEngineCloseJoinsGrading(t *testing.T) {
 	}
 }
 
-// blockingSink holds the annotation fan-out (the last step of the persist
-// phase, strictly before grading) until released.
-type blockingSink struct {
-	started chan struct{}
-	release chan struct{}
-	once    sync.Once
-}
-
-func (b *blockingSink) Name() string                                 { return "blocking" }
-func (b *blockingSink) Notify(context.Context, notify.Finding) error { return nil }
-func (b *blockingSink) OnAnnotation(context.Context, notify.AnnotationEvent) error {
-	b.once.Do(func() { close(b.started) })
-	<-b.release
-	return nil
+// blockingWidenProm builds a Prometheus test server whose query handler
+// blocks until release is closed, signaling started exactly once first. It
+// is TestCaptureEngineCloseWaitsForThePersistPhase's mid-persist observation
+// point: since Task 8 removed capture.go's own notifyAnnotation fan-out (the
+// former last step of the persist phase, strictly before grading), the live
+// widen() fetch is the only externally-blockable step left inside
+// persistCapture, so this replaces the former blockingSink.
+func blockingWidenProm(t *testing.T, started, release chan struct{}) *promclient.Client {
+	t.Helper()
+	var once sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		once.Do(func() { close(started) })
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(vectorValue3))
+	}))
+	t.Cleanup(srv.Close)
+	return promclient.NewClient(promclient.Config{BaseURL: srv.URL, TimeoutSeconds: 30})
 }
 
 // TestCaptureEngineCloseWaitsForThePersistPhase: the engine's join must cover
 // the WHOLE Captured-verdict operation, not just its grade. A handler still
-// persisting (store writes, audit, widening, fan-out) is invisible to an
+// persisting (store writes, audit, widening) is invisible to an
 // http.Server.Shutdown that has given up, so if Close could return while one
 // is in the persist phase, the owner would close the store underneath it —
 // and the runner's final pass would run with a producer about to enter
@@ -925,15 +1051,18 @@ func (b *blockingSink) OnAnnotation(context.Context, notify.AnnotationEvent) err
 func TestCaptureEngineCloseWaitsForThePersistPhase(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
-	prom := promHealthy(t)
-	inc := seedGradableIncident(t, st, prom)
+	seedProm := promHealthy(t)
+	inc := seedGradableIncident(t, st, seedProm)
 	tr, err := llmhealth.New(ctx, st, llmhealth.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := verifyConfig(prom)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	cfg := verifyConfig(blockingWidenProm(t, started, release))
+	cfg.Verification.QueryTimeoutSeconds = 30
 	cfg.Health = tr
-	sink := &blockingSink{started: make(chan struct{}), release: make(chan struct{})}
+	sink := &fakeAnnotationSink{}
 	gradeLLM := &blockingLLM{started: make(chan struct{})}
 	eng := acutetriage.NewCaptureEngine(acutetriage.New(cfg, st, gradeLLM, audit.New(st.DB()), notify.NewMulti(nil, sink), nil))
 
@@ -945,11 +1074,12 @@ func TestCaptureEngineCloseWaitsForThePersistPhase(t *testing.T) {
 	go func() {
 		res, err := eng.CaptureVerdict(ctx, acutetriage.CaptureRequest{
 			IncidentID: inc.ID, Verdict: "correction",
-			Expectation: json.RawMessage(`{"must_mention":["worker-14"]}`),
+			Expectation:  json.RawMessage(`{"must_mention":["worker-14"]}`),
+			WidenQueries: []string{"node_network_up"},
 		})
 		got <- outcome{res, err}
 	}()
-	<-sink.started // the operation is mid-persist, before enterGrade
+	<-started // the operation is mid-persist (a live widen fetch), before enterGrade
 
 	closed := make(chan error, 1)
 	go func() {
@@ -963,7 +1093,7 @@ func TestCaptureEngineCloseWaitsForThePersistPhase(t *testing.T) {
 	case <-time.After(150 * time.Millisecond):
 	}
 
-	close(sink.release)
+	close(release)
 	select {
 	case err := <-closed:
 		if err != nil {

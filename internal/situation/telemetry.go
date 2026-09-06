@@ -53,6 +53,30 @@ const (
 	// (TriageWorker.processOne): the claim is already durable when it
 	// starts; it measures analysis plus completion.
 	SpanTriageAttempt = "incident.triage.attempt"
+
+	// Plan 3 Task 9 (R8): three additional spans on this SAME scope. Plan 3
+	// adds no metric instruments, no exporter, and no configuration surface
+	// — the operational signals spec.md lists (retries by class, open gap
+	// age, replay backlog, uncertain outcomes) are bounded MCP fields and
+	// log fields instead. See plan.md R8 for why: telemetry.otlp exports
+	// traces only, so a counter would be unobservable dead code and a
+	// metrics exporter is a config surface this plan does not own.
+
+	// SpanHistoryCommit covers one fenced controller commit's durable
+	// history: the immutable Transitions, the Episode-summary version folded
+	// across them, the stdout stream rows, and the notification intents they
+	// warranted. It starts AFTER CommitController has returned, so no
+	// exporter call ever happens inside a database transaction.
+	SpanHistoryCommit = "situation.history.commit"
+	// SpanNotificationDeliver covers one claimed notification intent's
+	// single Slack call: the claim is already durable when it starts, and
+	// it wraps only the out-of-transaction provider I/O plus the fenced
+	// acknowledgement's outcome class.
+	SpanNotificationDeliver = "situation.notification.deliver"
+	// SpanTransitionStreamEmit covers one stdout Transition-stream row's
+	// write and acknowledgement. Emitted from internal/notify/stdout through
+	// Tracer(), so it lands on this same scope.
+	SpanTransitionStreamEmit = "situation.transition_stream.emit"
 )
 
 // Attribute keys (stable). Identity, digests, counts, closed result
@@ -76,7 +100,88 @@ const (
 	AttrEvidencePackDigest     = attribute.Key("alertint.triage.evidence_pack_digest")
 	AttrResultClass            = attribute.Key("alertint.result.class")
 	AttrDurationMS             = attribute.Key("alertint.duration_ms")
+
+	// AttrTransitionID and the six keys below are Plan 3 Task 9's (R8)
+	// additions: identities, sequences, versions, counts, and closed classes
+	// only — never journal prose, an Episode narrative, a Slack response
+	// body, a channel token, or a claim owner.
+	AttrTransitionID       = attribute.Key("alertint.transition.id")
+	AttrTransitionSequence = attribute.Key("alertint.transition.sequence")
+	AttrSummaryVersion     = attribute.Key("alertint.summary.version")
+	AttrIntentID           = attribute.Key("alertint.intent.id")
+	AttrIntentEffectClass  = attribute.Key("alertint.intent.effect_class")
+	AttrIntentAttempt      = attribute.Key("alertint.intent.attempt")
+	AttrGapGeneration      = attribute.Key("alertint.gap.generation")
 )
+
+// Closed result classes for SpanHistoryCommit's AttrResultClass.
+const (
+	// HistoryResultCommitted means this cycle committed durable history.
+	HistoryResultCommitted = "committed"
+	// HistoryResultNoHistory means the cycle was non-material and warranted
+	// no Transition, Episode version, stream row, or intent at all (R4).
+	HistoryResultNoHistory = "no_history"
+)
+
+// Closed result classes for SpanNotificationDeliver's AttrResultClass.
+const (
+	DeliverResultDelivered  = "delivered"
+	DeliverResultRetried    = "retried"
+	DeliverResultBlocked    = "configuration_blocked"
+	DeliverResultFailed     = "failed"
+	DeliverResultSuperseded = "superseded"
+	DeliverResultClaimLost  = "claim_lost"
+)
+
+// Closed result classes for SpanTransitionStreamEmit's AttrResultClass.
+const (
+	StreamResultEmitted = "emitted"
+	StreamResultRetried = "retried"
+	StreamResultFailed  = "failed"
+)
+
+// ----------------------------------------------------------------------
+// Plan 3 Task 9 audit event kinds emitted from THIS package.
+//
+// The catalog of record is internal/audit (audit.SituationHistoryKinds),
+// where it can be checked for completeness against spec.md and for
+// non-collision with Plan 2's names. This package cannot import it: the
+// audit package's own in-package tests import internal/store, and
+// internal/store imports this package, so internal/situation ->
+// internal/audit closes an import cycle in that test binary. The values are
+// therefore restated here, and telemetry_test.go's
+// TestTelemetryAuditKindsMatchTheAuditCatalog — an EXTERNAL test package,
+// which can import both — fails if the two ever drift apart. Emitters
+// outside this package (internal/notify/stdout, cmd/alertint) use the audit
+// package's constants directly.
+const (
+	auditKindTransitionCommitted    = "situation.history.transition_committed"
+	auditKindSummaryProjected       = "situation.history.summary_projected"
+	auditKindArtifactJournaled      = "situation.history.artifact_journaled"
+	auditKindIntentCreated          = "situation.notification.intent_created"
+	auditKindNotificationClaimed    = "situation.notification.claimed"
+	auditKindNotificationDelivered  = "situation.notification.delivered"
+	auditKindNotificationRetried    = "situation.notification.retried"
+	auditKindConfigurationBlocked   = "situation.notification.configuration_blocked"
+	auditKindNotificationFailed     = "situation.notification.failed"
+	auditKindNotificationWithheld   = "situation.notification.withheld"
+	auditKindNotificationSuperseded = "situation.notification.superseded"
+	auditKindGapOpened              = "situation.notification.gap_opened"
+	auditKindGapRecovered           = "situation.notification.gap_recovered"
+	auditKindGapCompleted           = "situation.notification.gap_completed"
+)
+
+// AuditKindsEmittedHere lists every audit kind this package emits, for the
+// external drift test described above.
+func AuditKindsEmittedHere() []string {
+	return []string{
+		auditKindTransitionCommitted, auditKindSummaryProjected, auditKindArtifactJournaled,
+		auditKindIntentCreated, auditKindNotificationClaimed, auditKindNotificationDelivered,
+		auditKindNotificationRetried, auditKindConfigurationBlocked, auditKindNotificationFailed,
+		auditKindNotificationWithheld, auditKindNotificationSuperseded,
+		auditKindGapOpened, auditKindGapRecovered, auditKindGapCompleted,
+	}
+}
 
 // Closed result classes for SpanControllerReconcile's AttrResultClass.
 // SpanAssessmentDispatch uses L2Outcome values; SpanTriageAttempt uses the
@@ -91,6 +196,19 @@ const (
 func tracer() trace.Tracer {
 	return otel.GetTracerProvider().Tracer(tracerName)
 }
+
+// Tracer exposes this package's instrumentation scope so the one Plan 3 span
+// site that lives outside it — the stdout Transition-stream worker in
+// internal/notify/stdout, which cannot import this package's unexported
+// tracer — emits on the SAME scope rather than opening a second one (R8:
+// "on Plan 2's tracer scope"). It installs no provider: with nothing
+// configured every span it returns is a no-op.
+func Tracer() trace.Tracer { return tracer() }
+
+// SpanLogAttrs is spanLogAttrs, exported for the same single out-of-package
+// span site, so its paired structured log line carries the identical
+// trace_id/span_id pair every span site in this package writes.
+func SpanLogAttrs(span trace.Span) []any { return spanLogAttrs(span) }
 
 // spanLogAttrs returns the trace_id/span_id slog attribute pair for span,
 // or nil when span carries no valid span context (no provider installed),

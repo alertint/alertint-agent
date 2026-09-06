@@ -109,14 +109,16 @@ here too: storm collapse, known-issue short-circuits, and prompt selection.
 Every correlated delivery also feeds a **Situation** — a durable record
 that owns one or more Incidents under one exact group key across restarts,
 so a fresh firing of the same group finds its durable history waiting
-rather than starting from nothing. Nothing closes a Situation in this
-build: a group's Situation stays active indefinitely and keeps owning that
-group's later Incidents, so a re-fire after a prior resolution feeds the
-same Situation (or collapses into the judged Incident as an occurrence).
-The episode-boundary machinery — a closed Situation refusing new work, a
-fresh linked Situation opening in its place — is already enforced at the
-storage layer, but only becomes observable once the controller ships
-lifecycle termination.
+rather than starting from nothing. In a released binary nothing closes a
+Situation: a group's Situation stays active indefinitely and keeps owning
+that group's later Incidents, so a re-fire after a prior resolution feeds
+the same Situation (or collapses into the judged Incident as an
+occurrence). The episode-boundary machinery — a closed Situation refusing
+new work, a fresh linked Situation opening in its place — is enforced at
+the storage layer there and becomes observable on the `state-controller`
+branch, where the controller does terminate an episode (recovered, or
+closed with uncertainty once the lifecycle-observation deadline expires)
+and a later firing opens a fresh linked Situation.
 
 **Honest status:** the durable Situation foundation *and* a fenced
 Situation controller are real, integration-tested work landing on the
@@ -131,17 +133,26 @@ cycle derives one authoritative Assessment (material facts, an
 operator-facing Attention level, and a bounded action contract) and is
 visible read-only through MCP (`alertint_list_situations`,
 `alertint_get_situation`) once it has run at least once for a Situation.
+Also on that branch, every authoritative material change now commits one
+**immutable Transition** and one version of a **current Episode summary** in
+the same fenced transaction as the state it describes, together with every
+notification intent that change warrants — and the Situation delivery worker
+is the **only** Slack writer in runtime assembly. The Incident-keyed Slack
+card, its resolve edit, and its recurrence replies described in
+[Outbound notification](#8-outbound-notification) below are removed there;
+Slack presents one Situation root plus an immutable ordered journal instead
+(see [Slack](../notifications/slack.md#situation-owned-slack)). The two
+`AlertINT system` installation messages — LLM dependency health and
+Slack-delivery-gap recovery — are the only sanctioned exceptions.
 **Not yet wired, even on `state-controller`:** connector preparation for the
 controller's own evidence needs, durable Assessment/Triage artifacts beyond
-the bounded recent-attempt history, immutable Transition/Episode summary
-history, a Situation-owned Slack presence (the Slack card in Phase 1 below
-is still keyed off the Incident, not the Situation), and the final v0.14
-cutover that would make this the only grouping/dispatch path. Everything in
-Phase 1 below Correlation — memory, evidence, triage, verification,
-notification — still runs exactly as described, keyed off the Incident,
-unaffected by which Situation an Incident belongs to. There is no
-`state_controller_mode`, shadow-output path, or legacy/new runtime switch:
-one build runs one grouping/dispatch path at a time.
+the bounded recent-attempt history, operator questions or judgments, and the
+final v0.14 cutover that would make this the only grouping/dispatch path.
+Everything in Phase 1 below Correlation — memory, evidence, triage,
+verification — still runs keyed off the Incident, unaffected by which
+Situation an Incident belongs to. There is no `state_controller_mode`,
+shadow-output path, or legacy/new runtime switch: one build runs one
+grouping/dispatch path, and one Slack writer, at a time.
 
 - **MCP tools:** `alertint_list_situations`, `alertint_get_situation` —
   see [MCP clients](../integrations/mcp-clients.md)
@@ -163,17 +174,28 @@ one build runs one grouping/dispatch path at a time.
   exporter under
   [`telemetry.otlp`](../getting-started/configuration.md#telemetry) —
   no telemetry leaves the process by default.
+- **Slack:** one root per published Situation plus an immutable ordered
+  journal, delivered from durable intents with indefinite retry, five-minute
+  Delivery gaps, and complete recovery replay — see
+  [Slack](../notifications/slack.md#situation-owned-slack)
+- **stdout:** one `{"kind":"situation.transition",…}` line per committed
+  Transition, deduplicated by `transition_id`; it means the change is
+  durable, never that Slack has seen it
 - **Not yet:** connector preparation, Assessment/Triage artifacts beyond the
-  bounded recent-attempt history, Transition/Episode summary history,
-  Situation-owned Slack, OpenTelemetry metrics or logs export (traces only
-  today), the final v0.14 cutover
+  bounded recent-attempt history, operator questions or judgments,
+  OpenTelemetry metrics or logs export (traces only today), the final v0.14
+  cutover
 
 ### 4. Memory
 
 Before spending an analysis, **AlertINT** checks whether it has seen this
 condition before. A re-fire of an already-analyzed group key inside the
-collapse horizon attaches as an **occurrence** — the Slack card edits in
-place, no second LLM call. A genuinely new incident whose key matches a past
+collapse horizon attaches as an **occurrence** — no second LLM call; a
+released binary edits the Incident card in place. On the `state-controller`
+branch the attach moves the owning Situation's recurrence count (closed
+predecessors plus its own re-fires): the root shows `recurred ×N`, and a
+crossed milestone rung is one quiet reply in the Situation's thread — never a
+channel message. A genuinely new incident whose key matches a past
 analysis gets the prior finding **recalled** into its prompt as a past
 hypothesis, never as evidence. See [incident
 memory](incident-memory.md).
@@ -229,12 +251,22 @@ confidence. See [verification round](verification-round.md).
 ### 8. Outbound notification
 
 The final finding — the post-verification judgment, not the draft — is
-emitted as one JSON line on stdout and, when configured, posted to a Slack
-channel. When all alerts recover, **AlertINT** updates the original Slack
-message in-place (🔴 → ✅) and posts a short resolution note in the thread.
+emitted as one JSON line on stdout and, in a released binary, posted to a
+Slack channel. When all alerts recover, that build updates the original
+Slack message in-place (🔴 → ✅) and posts a short resolution note in the
+thread.
+
+On the `state-controller` branch this Incident-keyed Slack path is removed
+from runtime assembly entirely: the finding still reaches stdout, and Slack
+is written only by the Situation delivery worker described in
+[3a](#3a-situation-foundation-and-controller) — one root per Situation plus
+an immutable ordered journal, from durable intents that retry indefinitely
+(see [Slack](../notifications/slack.md#situation-owned-slack)). Nothing
+in this build posts an Incident-shaped card, thread reply, or recurrence
+reply any more.
 
 - **Method:** stdout (always available) and Slack Bot Token API
-  (`chat.postMessage` / `chat.update`)
+  (`chat.postMessage` / `chat.update`), written by exactly one path
 
 ## Phase 2 — Investigate
 

@@ -201,29 +201,9 @@ func controllerStateRowFrom(r store.ControllerRetryState) controllerStateRow {
 // a fixed, generic message — never a wrapped store/SQL error — so a lookup
 // failure can never leak driver or query text to an MCP client.
 func (s *Server) handleGetSituation(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
-	id := mcplib.ParseString(req, "id", "")
-	handle := mcplib.ParseString(req, "handle", "")
-	if (id == "") == (handle == "") {
-		return errResult("exactly one of id or handle is required"), nil
-	}
-
-	var (
-		sit situationmodel.Situation
-		err error
-	)
-	if id != "" {
-		sit, err = s.st.GetSituation(ctx, id)
-	} else {
-		sit, err = s.st.GetSituationByHandle(ctx, handle)
-	}
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			if id != "" {
-				return errResult(fmt.Sprintf("situation %q not found", id)), nil
-			}
-			return errResult(fmt.Sprintf("situation with handle %q not found", handle)), nil
-		}
-		return errResult("failed to get situation"), nil
+	sit, failed := s.resolveSituation(ctx, req)
+	if failed != nil {
+		return failed, nil
 	}
 
 	members, err := s.st.ListSituationIncidents(ctx, sit.ID)
@@ -302,9 +282,415 @@ func (s *Server) handleGetSituation(ctx context.Context, req mcplib.CallToolRequ
 		"controller_state": controllerStateRowFrom(view.Retry),
 	}
 
+	// Plan 3 Task 9: the durable operator history and Slack presence. episode
+	// is an explicit null for a Situation with no Transition yet — history is
+	// never reconstructed from current state — and slack_delivery always
+	// answers, saying "published: false" with no effects for a Situation that
+	// warranted no Slack at all.
+	history, err := s.situationHistoryFor(ctx, sit.ID)
+	if err != nil {
+		return errResult("failed to get situation history"), nil
+	}
+	if history.Episode == nil {
+		payload["episode"] = nil
+	} else {
+		payload["episode"] = history.Episode
+	}
+	payload["slack_delivery"] = history.Delivery
+	// R2: recorded after closure, never journaled, never lost. An empty
+	// array, never null — "none" is an answer, not an absence.
+	payload["artifacts_recorded_after_closure"] = history.Artifacts
+
 	result, err := mcplib.NewToolResultJSON(payload)
 	if err != nil {
 		return errResult("failed to serialize situation: " + err.Error()), nil
 	}
 	return result, nil
+}
+
+// ----------------------------------------------------------------------
+// Plan 3 Task 9: bounded read-only history and delivery views.
+//
+// Three additions, all read-only and all reading ONLY Task 5's coherent
+// Store views (internal/store/situation_views.go) — never a raw ledger
+// join, never a reconstruction of history from current state:
+//
+//   - alertint_get_situation gains "episode" (the current Episode summary
+//     read in one snapshot with the exact Transition it was folded from),
+//     "slack_delivery" (the current root coordinates plus every durable
+//     effect's status, including the withheld/superseded/delayed decisions
+//     that are durable rows rather than absent ones), and
+//     "artifacts_recorded_after_closure" (R2's operator artifacts that
+//     reached an already-terminal owner: recorded, never journaled, and
+//     otherwise invisible from the Situation they name);
+//   - alertint_list_situation_transitions pages the immutable Transition
+//     journal by a stable (sequence, id) cursor; and
+//   - alertint_get_delivery_state exposes the installation-level Slack
+//     delivery snapshot: gap generation/status/age, replay backlog, retries
+//     by effect class, uncertain outcomes, and the blocked backlog.
+//
+// None of them returns a claim owner, claim token, lease, bot token, raw
+// Slack response, provider error body, or SQL text. The last of those is the
+// reason every failure path returns a fixed generic message.
+// ----------------------------------------------------------------------
+
+// maxSituationTransitionPage mirrors internal/store's own
+// maxSituationHistoryPage: the largest Transition page this tool will ever
+// return, and the value an oversized `limit` is clamped to. It is stated
+// here as well as in the store because the handler's own cursor gate
+// compares against the limit it actually used — the two must agree or a
+// clamped page would advertise itself as the last one.
+// defaultSituationTransitionPage is what an absent or nonsensical limit gets.
+const (
+	maxSituationTransitionPage     = 100
+	defaultSituationTransitionPage = 50
+)
+
+func (s *Server) toolListSituationTransitions() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
+	tool := mcplib.NewTool("alertint_list_situation_transitions",
+		mcplib.WithDescription("Page one Situation's immutable Transition journal, oldest first. A Transition "+
+			"is one authoritative material change: its lifecycle/attention, operator contract, transition reason, "+
+			"journal kind and bounded journal entry, evidence references, actor, and drill marker. History is never "+
+			"reconstructed from current state — a Situation with no Transition yet returns an empty array. Page with "+
+			"the returned next_cursor; it is stable across concurrent commits because it names a (sequence, id) "+
+			"position, not an offset."),
+		mcplib.WithString("id", mcplib.Description("Situation ID. Exactly one of id/handle is required.")),
+		mcplib.WithString("handle", mcplib.Description("Situation public handle. Exactly one of id/handle is required.")),
+		mcplib.WithInteger("limit", mcplib.Description("Maximum transitions to return (1-100, default 50).")),
+		mcplib.WithInteger("cursor_sequence", mcplib.Description("Resume strictly after this Transition sequence (from next_cursor).")),
+		mcplib.WithString("cursor_id", mcplib.Description("Resume strictly after this Transition id at cursor_sequence (from next_cursor).")),
+	)
+	return tool, s.handleListSituationTransitions
+}
+
+func (s *Server) toolGetDeliveryState() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
+	tool := mcplib.NewTool("alertint_get_delivery_state",
+		mcplib.WithDescription("Get the installation-level Situation Slack delivery state: the continuous-failure "+
+			"window, the durable Slack configuration generation and how many effects are blocked on it, the current "+
+			"Delivery-gap generation with its status/age and replay backlog, retries and outcomes by effect class, "+
+			"how many outcomes Slack never confirmed either way, and the stdout Transition-stream backlog. Counts "+
+			"and closed codes only — never a token, a Slack response, or a provider error body."),
+	)
+	return tool, s.handleGetDeliveryState
+}
+
+// situationTransitionRow is one immutable Transition as MCP renders it:
+// identity, closed codes, hashes, the bounded journal entry, and instants.
+type situationTransitionRow struct {
+	ID                   string                        `json:"id"`
+	Sequence             int                           `json:"sequence"`
+	InputVersion         int                           `json:"input_version"`
+	Lifecycle            string                        `json:"lifecycle"`
+	Attention            string                        `json:"attention"`
+	Reason               string                        `json:"reason"`
+	JournalKind          string                        `json:"journal_kind"`
+	Journal              situationmodel.JournalData    `json:"journal"`
+	ActionContract       situationmodel.ActionContract `json:"action_contract"`
+	MaterialFactHash     string                        `json:"material_fact_hash"`
+	AssessmentID         *string                       `json:"assessment_id"`
+	SufficientReasonID   *string                       `json:"sufficient_reason_id"`
+	InterruptionPriority *string                       `json:"interruption_priority"`
+	EvidenceRefs         []string                      `json:"evidence_refs"`
+	Actor                string                        `json:"actor"`
+	Drill                bool                          `json:"drill"`
+	CreatedAt            time.Time                     `json:"created_at"`
+}
+
+func situationTransitionRowFrom(t situationmodel.Transition) situationTransitionRow {
+	row := situationTransitionRow{
+		ID: t.ID, Sequence: t.Sequence, InputVersion: t.InputVersion,
+		Lifecycle: string(t.Lifecycle), Attention: string(t.Attention),
+		Reason: string(t.Reason), JournalKind: string(t.JournalKind), Journal: t.Journal,
+		ActionContract: t.ActionContract, MaterialFactHash: t.MaterialFactHash,
+		AssessmentID: t.AssessmentID, SufficientReasonID: t.SufficientReasonID,
+		EvidenceRefs: t.EvidenceRefs, Actor: string(t.Actor), Drill: t.Drill, CreatedAt: t.CreatedAt,
+	}
+	if row.EvidenceRefs == nil {
+		row.EvidenceRefs = []string{}
+	}
+	if t.InterruptionPriority != nil {
+		p := string(*t.InterruptionPriority)
+		row.InterruptionPriority = &p
+	}
+	return row
+}
+
+// situationEpisodeRow is the current Episode-summary projection together
+// with the exact Transition it was folded from. The two ALWAYS travel
+// together: showing a summary beside a source Transition a caller cannot
+// see is exactly the incoherence Task 5's snapshot read exists to prevent.
+type situationEpisodeRow struct {
+	Version                  int                    `json:"version"`
+	SourceTransitionSequence int                    `json:"source_transition_sequence"`
+	PublicHandle             string                 `json:"public_handle,omitempty"`
+	Title                    string                 `json:"title"`
+	InitialPublicationReason string                 `json:"initial_publication_reason,omitempty"`
+	LatestMaterialReason     string                 `json:"latest_material_reason,omitempty"`
+	EvidenceConclusion       string                 `json:"evidence_conclusion,omitempty"`
+	ImpactSummary            string                 `json:"impact_summary,omitempty"`
+	InvestigationWork        []string               `json:"investigation_work"`
+	InvestigationStarted     bool                   `json:"investigation_started"`
+	CurrentAttention         string                 `json:"current_attention"`
+	PeakAttention            string                 `json:"peak_attention"`
+	RecordedOperatorContext  []string               `json:"recorded_operator_context"`
+	EffectiveStartedAt       time.Time              `json:"effective_started_at"`
+	RecoveryObservedAt       *time.Time             `json:"recovery_observed_at"`
+	TerminalAt               *time.Time             `json:"terminal_at"`
+	DurationSeconds          *int64                 `json:"duration_seconds"`
+	RecurrenceCount          int                    `json:"recurrence_count"`
+	FinalOutcome             string                 `json:"final_outcome,omitempty"`
+	RemainingUncertainty     string                 `json:"remaining_uncertainty,omitempty"`
+	UpdatedAt                time.Time              `json:"updated_at"`
+	SourceTransition         situationTransitionRow `json:"source_transition"`
+}
+
+func situationEpisodeRowFrom(view store.SituationEpisodeView) situationEpisodeRow {
+	s := view.Summary
+	row := situationEpisodeRow{
+		Version: s.Version, SourceTransitionSequence: s.SourceTransitionSequence,
+		PublicHandle: s.PublicHandle, Title: s.Title,
+		InitialPublicationReason: s.InitialPublicationReason, LatestMaterialReason: s.LatestMaterialReason,
+		EvidenceConclusion: s.EvidenceConclusion, ImpactSummary: s.ImpactSummary,
+		InvestigationWork: s.InvestigationWork, InvestigationStarted: s.InvestigationStarted,
+		CurrentAttention: string(s.CurrentAttention), PeakAttention: string(s.PeakAttention),
+		RecordedOperatorContext: s.RecordedOperatorContext, EffectiveStartedAt: s.EffectiveStartedAt,
+		RecoveryObservedAt: s.RecoveryObservedAt, TerminalAt: s.TerminalAt, DurationSeconds: s.DurationSeconds,
+		RecurrenceCount: s.RecurrenceCount, FinalOutcome: s.FinalOutcome,
+		RemainingUncertainty: s.RemainingUncertainty, UpdatedAt: s.UpdatedAt,
+		SourceTransition: situationTransitionRowFrom(view.SourceTransition),
+	}
+	if row.InvestigationWork == nil {
+		row.InvestigationWork = []string{}
+	}
+	if row.RecordedOperatorContext == nil {
+		row.RecordedOperatorContext = []string{}
+	}
+	return row
+}
+
+// situationEffectRow is one durable notification intent as MCP renders it.
+// Deliberately absent: claim_owner, claim_token, lease_expires_at, and the
+// idempotency/client message identities — a delivery obligation's operator
+// meaning is its class, subject, status, priority, reason, and where it
+// actually landed, never who currently holds its lease.
+type situationEffectRow struct {
+	EffectClass          string     `json:"effect_class"`
+	Status               string     `json:"status"`
+	TransitionID         *string    `json:"transition_id"`
+	TransitionSequence   *int       `json:"transition_sequence"`
+	SummaryVersion       *int       `json:"summary_version"`
+	MainChannelPoke      bool       `json:"main_channel_poke"`
+	InterruptionPriority *string    `json:"interruption_priority"`
+	RequiresRoot         bool       `json:"requires_root"`
+	ContractDeadlineAt   *time.Time `json:"contract_deadline_at"`
+	AttemptCount         int        `json:"attempt_count"`
+	LastErrorClass       *string    `json:"last_error_class"`
+	RetryAt              *time.Time `json:"retry_at"`
+	SupersessionReason   *string    `json:"supersession_reason"`
+	DeliveredAs          *string    `json:"delivered_as"`
+	Channel              *string    `json:"channel"`
+	MessageTS            *string    `json:"message_ts"`
+	CreatedAt            time.Time  `json:"created_at"`
+	DeliveredAt          *time.Time `json:"delivered_at"`
+}
+
+func situationEffectRowFrom(n situationmodel.NotificationIntent) situationEffectRow {
+	row := situationEffectRow{
+		EffectClass: string(n.EffectClass), Status: string(n.Status),
+		TransitionID: n.TransitionID, TransitionSequence: n.TransitionSequence,
+		SummaryVersion: n.SummaryVersion, MainChannelPoke: n.MainChannelPoke,
+		RequiresRoot: n.RequiresRoot, ContractDeadlineAt: n.ContractDeadlineAt,
+		AttemptCount: n.AttemptCount, LastErrorClass: n.LastErrorClass, RetryAt: n.RetryAt,
+		SupersessionReason: n.SupersessionReason, DeliveredAs: n.DeliveredAs,
+		Channel: n.Channel, MessageTS: n.MessageTS, CreatedAt: n.CreatedAt, DeliveredAt: n.DeliveredAt,
+	}
+	if n.InterruptionPriority != nil {
+		p := string(*n.InterruptionPriority)
+		row.InterruptionPriority = &p
+	}
+	return row
+}
+
+// situationDeliveryRow is one Situation's whole Slack presence: whether a
+// root is durably published, where it lives, and every durable effect.
+type situationDeliveryRow struct {
+	Published     bool                 `json:"published"`
+	Channel       string               `json:"channel,omitempty"`
+	RootMessageTS string               `json:"root_message_ts,omitempty"`
+	Effects       []situationEffectRow `json:"effects"`
+}
+
+// situationHistoryFor reads one Situation's Episode view and Slack delivery
+// state through Task 5's bounded readers. A Situation with no Transition yet
+// legitimately has no episode at all: that renders as an explicit null, never
+// as history reconstructed from current state.
+func (s *Server) situationHistoryFor(ctx context.Context, situationID string) (situationHistoryView, error) {
+	view := situationHistoryView{
+		Delivery:  situationDeliveryRow{Effects: []situationEffectRow{}},
+		Artifacts: []store.OwnerTerminalArtifact{},
+	}
+	delivery := &view.Delivery
+
+	channel, messageTS, published, err := s.st.GetSituationRootCoordinates(ctx, situationID)
+	if err != nil {
+		return view, err
+	}
+	delivery.Published = published
+	if published {
+		delivery.Channel = channel
+		delivery.RootMessageTS = messageTS
+	}
+	intents, err := s.st.ListSituationNotificationIntents(ctx, situationID, 0)
+	if err != nil {
+		return view, err
+	}
+	for _, intent := range intents {
+		delivery.Effects = append(delivery.Effects, situationEffectRowFrom(intent))
+	}
+
+	// R2: operator artifacts that reached this Situation after it had already
+	// terminalized. They are recorded, never journaled — the terminal Episode
+	// is immutable — so no Transition names them and they appear in no
+	// journal page. Without this list they would exist durably and be
+	// invisible from the Situation they were written against.
+	artifacts, err := s.st.ListOwnerTerminalArtifacts(ctx, situationID, 0)
+	if err != nil {
+		return view, err
+	}
+	if len(artifacts) > 0 {
+		view.Artifacts = artifacts
+	}
+
+	episodeView, err := s.st.GetSituationEpisodeView(ctx, situationID)
+	if errors.Is(err, store.ErrNotFound) {
+		return view, nil
+	}
+	if err != nil {
+		return view, err
+	}
+	episode := situationEpisodeRowFrom(episodeView)
+	view.Episode = &episode
+	return view, nil
+}
+
+// situationHistoryView bundles the three bounded history reads
+// alertint_get_situation renders: the current Episode projection (nil when
+// the Situation has no Transition yet — history is never reconstructed from
+// current state), the Situation's whole Slack presence, and R2's
+// after-closure operator artifacts.
+type situationHistoryView struct {
+	Episode   *situationEpisodeRow
+	Delivery  situationDeliveryRow
+	Artifacts []store.OwnerTerminalArtifact
+}
+
+// transitionCursorRow is the stable page position a caller resumes from.
+type transitionCursorRow struct {
+	Sequence int    `json:"sequence"`
+	ID       string `json:"id"`
+}
+
+func (s *Server) handleListSituationTransitions(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	sit, failed := s.resolveSituation(ctx, req)
+	if failed != nil {
+		return failed, nil
+	}
+	// BOTH bounds are clamped here, not only the lower one. The Store's own
+	// ListSituationTransitions clamps internally too, so an unclamped
+	// oversized limit would come back short while this handler's
+	// `len(rows) == limit` cursor gate went false — handing the caller a
+	// truncated journal with next_cursor: null, which reads as "complete".
+	limit := mcplib.ParseInt(req, "limit", defaultSituationTransitionPage)
+	if limit < 1 {
+		limit = defaultSituationTransitionPage
+	}
+	if limit > maxSituationTransitionPage {
+		limit = maxSituationTransitionPage
+	}
+	cursor := store.TransitionCursor{
+		Sequence: mcplib.ParseInt(req, "cursor_sequence", 0),
+		ID:       mcplib.ParseString(req, "cursor_id", ""),
+	}
+	transitions, err := s.st.ListSituationTransitions(ctx, sit.ID, cursor, limit)
+	if err != nil {
+		return errResult("failed to list situation transitions"), nil
+	}
+	rows := make([]situationTransitionRow, 0, len(transitions))
+	for _, t := range transitions {
+		rows = append(rows, situationTransitionRowFrom(t))
+	}
+	payload := map[string]any{"situation_id": sit.ID, "transitions": rows, "next_cursor": nil}
+	// A full page is the only reason to hand back a cursor: a short page has
+	// nothing after it, and claiming otherwise would make a caller poll
+	// forever.
+	if len(rows) == limit && len(rows) > 0 {
+		last := rows[len(rows)-1]
+		payload["next_cursor"] = transitionCursorRow{Sequence: last.Sequence, ID: last.ID}
+	}
+	result, err := mcplib.NewToolResultJSON(payload)
+	if err != nil {
+		return errResult("failed to serialize situation transitions: " + err.Error()), nil
+	}
+	return result, nil
+}
+
+func (s *Server) handleGetDeliveryState(ctx context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	now := time.Now().UTC()
+	state, err := s.st.GetSlackDeliveryState(ctx)
+	if err != nil {
+		return errResult("failed to get slack delivery state"), nil
+	}
+	stats, err := s.st.GetNotificationDeliveryStats(ctx, now)
+	if err != nil {
+		return errResult("failed to get notification delivery stats"), nil
+	}
+	payload := map[string]any{
+		"slack": map[string]any{
+			// first_failure_at anchors the CONTINUOUS failure window a gap
+			// opens after five minutes of; a nil value means Slack delivery
+			// is currently healthy.
+			"first_failure_at":            state.FirstFailureAt,
+			"last_success_at":             state.LastSuccessAt,
+			"open_gap_generation":         state.OpenGapGeneration,
+			"open_gap_status":             state.OpenGapStatus,
+			"configuration_generation":    state.ConfigurationGeneration,
+			"blocked_configuration_count": state.BlockedConfigurationCount,
+			"updated_at":                  state.UpdatedAt,
+		},
+		"delivery": stats,
+	}
+	result, err := mcplib.NewToolResultJSON(payload)
+	if err != nil {
+		return errResult("failed to serialize delivery state: " + err.Error()), nil
+	}
+	return result, nil
+}
+
+// resolveSituation resolves exactly one of id/handle, returning a ready
+// error result rather than an error when the request is unusable.
+func (s *Server) resolveSituation(ctx context.Context, req mcplib.CallToolRequest) (situationmodel.Situation, *mcplib.CallToolResult) {
+	id := mcplib.ParseString(req, "id", "")
+	handle := mcplib.ParseString(req, "handle", "")
+	if (id == "") == (handle == "") {
+		return situationmodel.Situation{}, errResult("exactly one of id or handle is required")
+	}
+	var (
+		sit situationmodel.Situation
+		err error
+	)
+	if id != "" {
+		sit, err = s.st.GetSituation(ctx, id)
+	} else {
+		sit, err = s.st.GetSituationByHandle(ctx, handle)
+	}
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			if id != "" {
+				return situationmodel.Situation{}, errResult(fmt.Sprintf("situation %q not found", id))
+			}
+			return situationmodel.Situation{}, errResult(fmt.Sprintf("situation with handle %q not found", handle))
+		}
+		return situationmodel.Situation{}, errResult("failed to get situation")
+	}
+	return sit, nil
 }
