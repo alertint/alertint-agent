@@ -384,17 +384,46 @@ func transitionIdentity(situationID string, inputVersion, sequence int, reason m
 // actually model-validated. Lifecycle, the Operator contract, Triage state,
 // and recurrence are controller-derived, so they are always
 // deterministic_controller. Plan 3 never produces `operator_policy`.
+//
+// investigation_concluded is the one reason with both bases: it is selected
+// because the Operator contract's investigation phase ENDED (controller-
+// derived, from the Triage result), and it renders the Assessment's
+// evidence conclusion. It records `llm` only when that conclusion actually
+// changed in this commit. Otherwise the model authored nothing new here —
+// whether the concluding cycle happened to consult it or reuse its prior
+// answer is a scheduling accident (the crash-replay harness proved a crash
+// mid-dispatch flipped the actor), and durable history must not depend on
+// scheduling.
 func controllerActor(change AuthoritativeChange, reason model.TransitionReason) model.TransitionActor {
 	if change.Derivation != model.DerivationModelValidated {
 		return model.ActorDeterministicController
 	}
 	switch reason { //nolint:exhaustive // the default is the point: every other reason records controller-derived lifecycle, contract, Triage, or recurrence state, which is never the model's authorship.
 	case model.ReasonFirstAuthoritativeState, model.ReasonMaterialAssessmentChanged,
-		model.ReasonAttentionChanged, model.ReasonInvestigationConcluded:
+		model.ReasonAttentionChanged:
 		return model.ActorLLM
+	case model.ReasonInvestigationConcluded:
+		if conclusionContentChanged(change) {
+			return model.ActorLLM
+		}
+		return model.ActorDeterministicController
 	default:
 		return model.ActorDeterministicController
 	}
+}
+
+// conclusionContentChanged reports whether the Assessment's closed
+// conclusion (the model-authored part of the materiality tuple) differs
+// from the prior Transition's. A first Transition has nothing to compare
+// against and counts as changed.
+func conclusionContentChanged(change AuthoritativeChange) bool {
+	prior := change.PriorTransition
+	if prior == nil {
+		return true
+	}
+	cur := tupleOf("", "", model.ActionContract{}, change.Projection.Assessment, 0)
+	prev := tupleOf("", "", model.ActionContract{}, prior.Projection.Assessment, 0)
+	return canonicalDigest(cur) != canonicalDigest(prev)
 }
 
 // controllerEvidenceRefs retains every supporting evidence reference for

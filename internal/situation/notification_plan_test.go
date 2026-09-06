@@ -855,3 +855,201 @@ func TestPlanNotificationIntentsRejectsIncoherentInput(t *testing.T) {
 		}
 	})
 }
+
+// ----------------------------------------------------------------------
+// Publication authority precedes the floor (review round 1, R1-F1).
+// ----------------------------------------------------------------------
+
+// hsQuietChange is a first authoritative state with NO publication
+// authority: observe Attention and no accepted Sufficient reason. It has
+// state and history, but no claim on Slack.
+func hsQuietChange(t *testing.T) AuthoritativeChange {
+	t.Helper()
+	c := hsChange(t)
+	c.Situation.Attention = model.AttentionObserve
+	concl := *c.Projection.Assessment
+	concl.SufficientReasonCode = ""
+	concl.SufficientReasonSummary = ""
+	c.Projection.Assessment = &concl
+	c.Assessment = hsAssessment(hsMonitoringContract(c.Now.Add(time.Minute)), concl, model.LifecycleActive, model.AttentionObserve)
+	return c
+}
+
+func TestPlanNotificationIntentsQuietInitialStateHasNoSlackAuthority(t *testing.T) {
+	c := hsQuietChange(t)
+	trs, sum := hsCommitOf(t, c)
+	if len(trs) != 1 || trs[0].Reason != model.ReasonFirstAuthoritativeState {
+		t.Fatalf("fixture: want one first_authoritative_state transition, got %+v", trs)
+	}
+	if PublicationAuthority(trs[0]) {
+		t.Fatal("a quiet first state must carry no publication authority")
+	}
+	in := hsPub(c, trs, sum)
+	in.RootPublished = false
+	in.SlackFloor = model.InterruptionLow
+
+	if got := hsPlan(t, in); len(got) != 0 {
+		t.Fatalf("a quiet Situation with no Sufficient reason created %d Slack intents, want 0: %+v", len(got), got)
+	}
+}
+
+func TestPlanNotificationIntentsQuietSituationStaysSilentAtEveryFloor(t *testing.T) {
+	for _, floor := range []model.InterruptionPriority{"", model.InterruptionLow, model.InterruptionMedium,
+		model.InterruptionHigh, model.InterruptionCritical} {
+		c := hsQuietChange(t)
+		trs, sum := hsCommitOf(t, c)
+		in := hsPub(c, trs, sum)
+		in.RootPublished = false
+		in.SlackFloor = floor
+		if got := hsPlan(t, in); len(got) != 0 {
+			t.Errorf("floor %q: a quiet Situation created %d Slack intents, want 0 (the floor ranks a permitted poke; it never grants one)",
+				floor, len(got))
+		}
+	}
+}
+
+func TestPlanNotificationIntentsQuietArtifactCycleCreatesNothing(t *testing.T) {
+	// An attributed annotation "grants no new reasoning or publication
+	// authority" (spec.md "Domain model"): journaled on a quiet, never
+	// published Situation, it still leaves Slack untouched.
+	c := hsQuietChange(t)
+	first := hsOnly(t, c)
+	sum, err := ProjectEpisode(nil, first)
+	if err != nil {
+		t.Fatalf("ProjectEpisode: %v", err)
+	}
+	c.PriorTransition = &first
+	c.PriorSummary = &sum
+	c.Now = c.Now.Add(time.Minute)
+	c.Situation.InputVersion++
+	c.OperatorArtifacts = []OperatorArtifactInput{hsArtifact("a-quiet-1", artifactKindAnnotation, c.Now.Add(-time.Minute))}
+
+	trs, next := hsCommitOf(t, c)
+	if len(trs) != 1 || trs[0].Reason != model.ReasonOperatorArtifactRecorded {
+		t.Fatalf("fixture: want exactly the artifact transition, got %+v", trs)
+	}
+	in := hsPub(c, trs, next)
+	in.RootPublished = false
+	if got := hsPlan(t, in); len(got) != 0 {
+		t.Fatalf("an annotation on a quiet Situation created %d Slack intents, want 0: %+v", len(got), got)
+	}
+}
+
+func TestPlanNotificationIntentsQuietClosureDoesNotGainPublicationAuthority(t *testing.T) {
+	c := hsQuietChange(t)
+	trs, sum := hsCommitOf(t, c)
+	c.PriorTransition = &trs[len(trs)-1]
+	c.PriorSummary = &sum
+	c.Now = c.Now.Add(time.Hour)
+	c.Situation.InputVersion++
+	hsClosedUnknown(&c)
+
+	trs, sum = hsCommitOf(t, c)
+	if len(trs) != 1 || trs[0].Reason != model.ReasonClosedUnknown {
+		t.Fatalf("fixture: want one closed_unknown transition, got %+v", trs)
+	}
+	for _, floor := range []model.InterruptionPriority{"", model.InterruptionMedium} {
+		in := hsPub(c, trs, sum)
+		in.RootPublished = false
+		in.SlackFloor = floor
+		for _, intent := range hsPlan(t, in) {
+			if intent.Status == model.IntentPending {
+				t.Errorf("floor %q: a quiet Situation closing with uncertainty gained a pending %s (priority %v): lifecycle alone is not publication authority",
+					floor, intent.EffectClass, intent.InterruptionPriority)
+			}
+		}
+	}
+}
+
+func TestPlanNotificationIntentsQuietRecoveryCreatesNothing(t *testing.T) {
+	c := hsQuietChange(t)
+	trs, sum := hsCommitOf(t, c)
+	c.PriorTransition = &trs[len(trs)-1]
+	c.PriorSummary = &sum
+	c.Now = c.Now.Add(time.Hour)
+	c.Situation.InputVersion++
+	hsRecovered(&c)
+
+	trs, sum = hsCommitOf(t, c)
+	in := hsPub(c, trs, sum)
+	in.RootPublished = false
+	if got := hsPlan(t, in); len(got) != 0 {
+		t.Fatalf("a quiet Situation recovering created %d Slack intents, want 0: %+v", len(got), got)
+	}
+}
+
+func TestPlanNotificationIntentsPublishedRootKeepsSynchronizingWithoutAReason(t *testing.T) {
+	// Authority gates the FIRST publication only. Once the root is on
+	// screen, a later commit whose Assessment no longer names a Sufficient
+	// reason still edits it and still journals — the floor (and the
+	// authority test) "never suppresses ... an already-published root edit".
+	c := hsQuietChange(t)
+	first := hsOnly(t, c)
+	sum, err := ProjectEpisode(nil, first)
+	if err != nil {
+		t.Fatalf("ProjectEpisode: %v", err)
+	}
+	c.PriorTransition = &first
+	c.PriorSummary = &sum
+	c.Now = c.Now.Add(time.Minute)
+	c.Situation.InputVersion++
+	// A quiet material change: Attention moves to investigate with still
+	// no Sufficient reason.
+	c.Situation.Attention = model.AttentionInvestigate
+	c.Assessment.Attention = model.AttentionInvestigate
+
+	trs, next := hsCommitOf(t, c)
+	if len(trs) != 1 || trs[0].Reason != model.ReasonAttentionChanged {
+		t.Fatalf("fixture: want one attention_changed transition, got %+v", trs)
+	}
+	in := hsPub(c, trs, next)
+	in.RootPublished = true
+
+	got := hsPlan(t, in)
+	if roots := hsIntentsOfClass(got, model.EffectRootSync); len(roots) != 1 || roots[0].Status != model.IntentPending {
+		t.Fatalf("published root: want one pending root_sync, got %+v", roots)
+	}
+	if threads := hsIntentsOfClass(got, model.EffectThreadAppend); len(threads) != 1 {
+		t.Errorf("published root: want the journal entry, got %d", len(threads))
+	}
+}
+
+func TestPlanNotificationIntentsOwedRootKeepsSynchronizingWithoutAReason(t *testing.T) {
+	// Likewise for a root that was earned earlier and is merely still
+	// queued: spec.md's ordinary-delay rule publishes the latest informative
+	// root rather than erasing an earned one.
+	c := hsQuietChange(t)
+	trs, sum := hsCommitOf(t, c)
+	in := hsPub(c, trs, sum)
+	in.RootPublished = false
+	in.RootPublicationOwed = true
+
+	got := hsPlan(t, in)
+	if roots := hsIntentsOfClass(got, model.EffectRootSync); len(roots) != 1 || roots[0].Status != model.IntentPending {
+		t.Fatalf("owed root: want one pending root_sync, got %+v", roots)
+	}
+}
+
+func TestPublicationAuthorityComesFromFloorOrValidatedReason(t *testing.T) {
+	quiet := hsOnly(t, hsQuietChange(t))
+	if PublicationAuthority(quiet) {
+		t.Error("observe + no reason must carry no authority")
+	}
+	critical := hsOnly(t, hsChange(t)) // hsConclusion selects the deterministic critical floor
+	if !PublicationAuthority(critical) {
+		t.Error("the deterministic critical floor is publication authority")
+	}
+	reasoned := hsChange(t)
+	hsUseReason(&reasoned, reasonCodeDurationOutlier)
+	if !PublicationAuthority(hsOnly(t, reasoned)) {
+		t.Error("a validated non-floor Sufficient reason is publication authority")
+	}
+	// A floored proposal whose model omitted the anchor still had its
+	// Attention raised to urgent by validation; that Attention is the floor.
+	floored := hsQuietChange(t)
+	floored.Situation.Attention = model.AttentionUrgent
+	floored.Assessment.Attention = model.AttentionUrgent
+	if !PublicationAuthority(hsOnly(t, floored)) {
+		t.Error("urgent Attention is only reachable through a deterministic floor and is publication authority")
+	}
+}

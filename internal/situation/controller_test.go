@@ -1674,7 +1674,14 @@ func ctReconcileWith(t *testing.T, in situation.SnapshotInput, claim situation.C
 // Transition, its folded Episode summary, and the Slack obligations it
 // warrants, all inside the ONE ControllerCommit Plan 2 already fences.
 func TestControllerHistoryFirstPublicationCommitsTransitionSummaryAndIntents(t *testing.T) {
-	commit := ctReconcileOnce(t, ctReuseInput(t), ctBaseClaim(), nil)
+	// A critical firing delivery makes critical_anchor eligible: the
+	// deterministic floor is the publication authority a first cycle can
+	// carry (a quiet observe/no-reason Situation creates no Slack intent).
+	// The fake client has no scripted answer, so the controller derives the
+	// deterministic fallback — which selects that floor.
+	in := ctBaseSnapshotInput()
+	in.Deliveries = []situation.Delivery{ctDelivery("delivery-1", "incident-1", true, "critical")}
+	commit := ctReconcileOnce(t, in, ctBaseClaim(), nil)
 
 	if commit.History == nil {
 		t.Fatal("a first authoritative state must commit durable history")

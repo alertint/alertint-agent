@@ -51,7 +51,10 @@ type PublicationInput struct {
 }
 
 // PlanNotificationIntents derives every durable Slack obligation one
-// committed reconciliation creates:
+// committed reconciliation creates. A commit for a Situation that has
+// never earned Slack (no published or owed root) creates NOTHING unless its
+// authority Transition carries publication authority (PublicationAuthority);
+// otherwise it creates:
 //
 //   - one coalescible `root_sync` carrying the current Episode-summary
 //     version and the committed contract deadline it renders (R4);
@@ -81,8 +84,25 @@ func PlanNotificationIntents(in PublicationInput) ([]model.NotificationIntent, e
 		return planDeadlineRefresh(in)
 	}
 
-	out := make([]model.NotificationIntent, 0, len(in.Transitions)+2)
 	authority := in.Transitions[len(in.Transitions)-1]
+
+	// Publication authority comes BEFORE the floor. A Situation that has
+	// never earned Slack — no published root, no root still owed — and
+	// whose authority Transition carries neither a deterministic floor nor
+	// a validated Sufficient reason is quiet: it creates no intent at all,
+	// not a withheld one, because nothing was ever permitted that could be
+	// withheld (spec.md: "quiet and floor-withheld Situations leave no
+	// Slack trace"; the priority scale ranks a PERMITTED poke, it does not
+	// grant permission). Once a root is on screen or owed, every later
+	// commit keeps synchronizing it regardless of the Sufficient reason:
+	// the floor "never suppresses ... an already-published root edit", and
+	// a quiet terminal Transition is exactly the "latest informative
+	// terminal Episode summary" the ordinary-delay rule posts.
+	if !in.RootPublished && !in.RootPublicationOwed && !PublicationAuthority(authority) {
+		return nil, nil
+	}
+
+	out := make([]model.NotificationIntent, 0, len(in.Transitions)+2)
 
 	// The root: a first publication is itself the main-channel poke; every
 	// later synchronization is a silent edit.

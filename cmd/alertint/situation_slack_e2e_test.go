@@ -348,18 +348,47 @@ func e2eFirstNonFloorCandidate(prompt llm.Prompt) (model.ReasonCandidate, bool) 
 	return model.ReasonCandidate{}, false
 }
 
-// seed creates one Situation for groupKey through the real Incident +
-// situation-input round trip, then runs one controller cycle so it has a
+// seed creates one WARRANTED Situation for groupKey — one that carries
+// publication authority at its first controller cycle — through the real
+// Incident + situation-input round trip, then runs that cycle so it has a
 // first authoritative Transition, an Episode summary, and its publication
 // intents. Returns the Situation ID.
+//
+// A quiet Situation (observe Attention, no accepted Sufficient reason) has
+// state and history but no claim on Slack at all, and a fresh group can
+// reach no Sufficient reason on its own: duration_outlier — this build's
+// only reachable non-floor candidate — needs at least five comparable
+// prior durations. So seed builds exactly that lineage first, lets enough
+// time pass that the live Situation's elapsed duration is an outlier, and
+// has the model claim it at observe Attention: the lowest interruption
+// priority a warranted Situation can publish at. Tests that need the
+// quiet case use seedQuiet.
 func (f *e2eFixture) seed(groupKey string) string {
 	f.t.Helper()
+	f.seedPriorTerminalLineage(groupKey, 5)
 	seedControllerRuntimeSituation(f.t, f.st, groupKey, f.clock.Now())
-	// Resolve by INCIDENT, not by group key: a group may already carry
-	// several terminal Situations (seedPriorTerminalLineage), and
-	// seedControllerRuntimeSituation's own group-key lookup would then
-	// return an arbitrary one of them.
+	// Resolve by INCIDENT, not by group key: the group carries several
+	// terminal Situations, and seedControllerRuntimeSituation's own
+	// group-key lookup would return an arbitrary one of them.
 	sitID := f.situationIDForIncident("inc-" + groupKey)
+	// 45 minutes: an outlier against the minutes-long priors, still inside
+	// the "medium" duration class so a later scenario step can cross into
+	// "long" and change the Assessment basis when it needs the model
+	// consulted again.
+	f.clock.advance(45 * time.Minute)
+	f.l2.steer(model.AttentionObserve, true)
+	f.controllerCycle()
+	return sitID
+}
+
+// seedQuiet creates one QUIET Situation for groupKey — observe Attention,
+// no Sufficient reason, no prior lineage — and runs its first cycle. Such
+// a Situation must leave no Slack trace.
+func (f *e2eFixture) seedQuiet(groupKey string) string {
+	f.t.Helper()
+	seedControllerRuntimeSituation(f.t, f.st, groupKey, f.clock.Now())
+	sitID := f.situationIDForIncident("inc-" + groupKey)
+	f.l2.steer(model.AttentionObserve, false)
 	f.controllerCycle()
 	return sitID
 }
@@ -954,11 +983,6 @@ func (f *e2eFixture) terminalize(situationID string) {
 func TestSituationSlackE2EStaleHandoffIsDemotedToADelayedThreadEntry(t *testing.T) {
 	f := newE2EFixture(t)
 	f.slack.setScript(alwaysOK)
-	// Five completed Situations for this group first: duration_outlier —
-	// the only non-floor Sufficient-reason candidate this build can reach,
-	// and therefore the only path to an operator handoff — needs at least
-	// five comparable prior durations.
-	f.seedPriorTerminalLineage("group=e2e-stale-handoff", 5)
 	sitID := f.seed("group=e2e-stale-handoff")
 	f.deliverUntilQuiet(12)
 
@@ -1152,13 +1176,16 @@ func TestSituationSlackE2EBelowFloorRootNeverStrandsTheQueuedRootItReplaces(t *t
 	f.slackFloor = model.InterruptionMedium
 	f.slack.setScript(alwaysOK)
 
-	// The Situation opens below the operator's floor, so its first root is a
-	// durably withheld decision and nothing is on screen.
+	// The Situation opens warranted but below the operator's floor (a
+	// duration_outlier claimed at observe Attention ranks low), so its
+	// first root is a durably withheld decision and nothing is on screen.
 	sitID := f.seed("group=e2e-floor-strand")
 
-	// It then escalates above the floor and earns publication. Nothing is
-	// delivered yet: that root projection is committed and merely queued.
-	f.l2.steer(model.AttentionInvestigate, false)
+	// It then escalates above the floor: the same reason accepted at
+	// investigate Attention derives an operator handoff, which ranks high.
+	// Nothing is delivered yet: that root projection is committed and
+	// merely queued.
+	f.l2.steer(model.AttentionInvestigate, true)
 	f.clock.advance(20 * time.Minute)
 	if n := f.controllerCycle(); n == 0 {
 		t.Fatal("no controller work was due; the scenario needs an above-floor escalation")
@@ -1208,5 +1235,34 @@ func TestSituationSlackE2EBelowFloorRootNeverStrandsTheQueuedRootItReplaces(t *t
 	}
 	if failing := f.scalarInt(`SELECT COUNT(*) FROM slack_delivery_state WHERE first_failure_at IS NOT NULL`); failing != 0 {
 		t.Fatal("a Slack-dependency failure window opened although Slack never failed")
+	}
+}
+
+// ----------------------------------------------------------------------
+// 9. A quiet Situation — observe, no Sufficient reason — leaves no Slack
+//    trace at all (review round 1, R1-F1).
+// ----------------------------------------------------------------------
+
+func TestSituationSlackE2EQuietSituationSendsNothing(t *testing.T) {
+	f := newE2EFixture(t)
+	f.slack.setScript(alwaysOK)
+	id := f.seedQuiet("group=e2e-quiet")
+	view, err := f.st.GetSituationEpisodeView(f.ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.SourceTransition.Attention != model.AttentionObserve || view.SourceTransition.Projection.Assessment.SufficientReasonCode != "" {
+		t.Fatalf("fixture not quiet: %+v", view.SourceTransition)
+	}
+	f.deliverUntilQuiet(10)
+	if calls := f.slack.accepted(); len(calls) != 0 {
+		t.Fatalf("observe/no-reason Situation sent %d Slack messages", len(calls))
+	}
+	if n := f.scalarInt(`SELECT COUNT(*) FROM notification_intents`); n != 0 {
+		t.Fatalf("a quiet Situation created %d notification intent(s), want 0 (not even a withheld one)%s", n, f.intentSummary())
+	}
+	// Its history is intact: quiet means no Slack, never no state.
+	if n := f.scalarInt(`SELECT COUNT(*) FROM situation_transitions WHERE situation_id = ?`, id); n == 0 {
+		t.Fatal("the quiet Situation has no Transition; silence must not erase history")
 	}
 }

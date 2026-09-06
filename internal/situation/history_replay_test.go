@@ -328,6 +328,11 @@ func (f *historyFixture) postJSON(payload map[string]any) {
 // converge runs one full quiescence pass: dispatch/input/controller/Triage
 // (replayFixture.convergeAll) followed by delivery rounds until the
 // notification ledger is quiescent too.
+// converge drives the whole pipeline to quiescence at Plan 2's own
+// convergeAll definition (a round that dispatched, applied, reconciled, and
+// triaged nothing), then drains delivery. Every warranted scenario here
+// runs at observe Attention on the slow cadence (openWarrantedSituation),
+// so a round with nothing due is reachable.
 func (f *historyFixture) converge() {
 	f.t.Helper()
 	f.convergeAll(f.l2(), newAcceptingAnalyzer(), &countingAfterCommitter{}, nil)
@@ -352,7 +357,11 @@ func (f *historyFixture) oneRound() {
 // fixture's own delivery crash boundary exactly once.
 func (f *historyFixture) deliver() {
 	f.t.Helper()
-	if f.crashDelivery {
+	// The crash boundary sits BETWEEN a Slack call and its acknowledgement,
+	// so it can only be exercised by a round that actually makes one. Arm
+	// it on the first round with a claimable intent; runHistoryScenario
+	// fails a scenario that never produced one.
+	if f.crashDelivery && f.claimableIntents() > 0 {
 		f.crashDelivery = false
 		f.deliverer.crashAfterCall = true
 		simulateCrash(f.t, crashBoundaryDeliveryAcknowledgement, func() {
@@ -371,6 +380,19 @@ func (f *historyFixture) deliver() {
 		}
 	}
 	f.t.Fatal("deliver: notification ledger did not reach quiescence within bounded rounds")
+}
+
+// claimableIntents counts pending intents that are due now and, for a
+// reply, whose root is published — what one worker round could deliver.
+func (f *historyFixture) claimableIntents() int {
+	f.t.Helper()
+	return scalarInt(f.t, f.st, `
+		SELECT COUNT(*) FROM notification_intents ni
+		LEFT JOIN situations s ON s.id = ni.situation_id
+		WHERE ni.status = 'pending'
+		  AND (ni.retry_at IS NULL OR ni.retry_at <= ?)
+		  AND (ni.requires_root = 0 OR s.slack_root_ts IS NOT NULL)`,
+		f.clock.Now().UTC().Format(time.RFC3339Nano))
 }
 
 func (f *historyFixture) newNotificationWorker() *situation.NotificationWorker {
@@ -910,6 +932,9 @@ func runHistoryScenario(t *testing.T, sc historyScenario) {
 		t.Parallel()
 		f := newHistoryFixture(t, sanitizeOwner(sc.name)+"-delivery", "", true)
 		sc.run(f)
+		if f.crashDelivery {
+			t.Fatal("the scenario never delivered anything, so the delivery crash boundary was never exercised; a scenario proving delivery replay must publish")
+		}
 		got := assertConverged(t, f.st)
 		if got != want {
 			t.Fatalf("canonical history after crashing between the Slack call and its durable acknowledgement differs from the uninterrupted run.\n--- uninterrupted ---\n%s\n--- after crash+replay ---\n%s", got, want)
@@ -951,8 +976,7 @@ func scenarioFirstPublication() historyScenario {
 	return historyScenario{
 		name: "first-publication",
 		run: func(f *historyFixture) {
-			f.postAlert("hist-first", "HighLatency", "fp-hist-first", "firing", "warning")
-			f.drainFoundation()
+			f.openWarrantedSituation("hist-first", "fp-hist-first")
 			f.crashControllerCycle()
 			f.converge()
 		},
@@ -1016,11 +1040,10 @@ func scenarioOperatorArtifacts() historyScenario {
 	return historyScenario{
 		name: "operator-artifacts",
 		run: func(f *historyFixture) {
-			f.postAlert("hist-artifacts", "HighLatency", "fp-hist-artifacts", "firing", "warning")
-			f.drainFoundation()
+			f.openWarrantedSituation("hist-artifacts", "fp-hist-artifacts")
 			f.converge()
 
-			inc := f.soleIncidentID()
+			inc := f.newestIncidentID()
 			f.annotate(inc, "api-2 is the canary host; rollout paused.")
 			f.captureVerdict(inc, "confirmed: this is the known canary pattern.")
 
@@ -1046,8 +1069,7 @@ func scenarioArtifactAfterClosure() historyScenario {
 	return historyScenario{
 		name: "artifact-after-closure",
 		run: func(f *historyFixture) {
-			f.postAlert("hist-closure", "HighLatency", "fp-hist-closure", "firing", "warning")
-			f.drainFoundation()
+			f.openWarrantedSituation("hist-closure", "fp-hist-closure")
 			// The crash boundary sits on the first publication commit: the
 			// R2 sequence below must run against an already-converged,
 			// published Situation, because a crash INSIDE it would (quite
@@ -1066,7 +1088,7 @@ func scenarioArtifactAfterClosure() historyScenario {
 			// enqueued. Nothing applies it yet: controllerOnlyDrain below
 			// deliberately runs the controller WITHOUT the input worker, so
 			// the owner terminalizes first — exactly R2's race.
-			f.annotate(f.soleIncidentID(), "checked the dashboards after recovery.")
+			f.annotate(f.newestIncidentID(), "checked the dashboards after recovery.")
 			f.clock.Advance(10 * time.Minute)
 			f.controllerOnlyDrain()
 			assertLifecycle(f.t, f.st, "recovered")
@@ -1096,8 +1118,7 @@ func scenarioRecoveryRefireRecovered() historyScenario {
 	return historyScenario{
 		name: "recovery-refire-recovered",
 		run: func(f *historyFixture) {
-			f.postAlert("hist-recovery", "HighLatency", "fp-hist-recovery", "firing", "warning")
-			f.drainFoundation()
+			f.openWarrantedSituation("hist-recovery", "fp-hist-recovery")
 			f.converge()
 
 			// One round per lifecycle step: converge() loops to quiescence,
@@ -1142,8 +1163,7 @@ func scenarioClosedUnknown() historyScenario {
 	return historyScenario{
 		name: "closed-unknown",
 		run: func(f *historyFixture) {
-			f.postAlert("hist-unknown", "HighLatency", "fp-hist-unknown", "firing", "warning")
-			f.drainFoundation()
+			f.openWarrantedSituation("hist-unknown", "fp-hist-unknown")
 			f.converge()
 
 			// Resolve, then let the observation deadline pass BEFORE any
@@ -1183,8 +1203,7 @@ func scenarioDeadlineRefresh() historyScenario {
 	return historyScenario{
 		name: "deadline-refresh",
 		run: func(f *historyFixture) {
-			f.postAlert("hist-refresh", "HighLatency", "fp-hist-refresh", "firing", "warning")
-			f.drainFoundation()
+			f.openWarrantedSituation("hist-refresh", "fp-hist-refresh")
 			f.converge()
 
 			// Let the delivered root's promised update time pass, then run
@@ -1208,8 +1227,10 @@ func scenarioDeadlineRefresh() historyScenario {
 				t.Fatalf("main-channel pokes across %d root_sync intents = %d, want exactly 1 (only the first publication pokes; a deadline refresh never does)", roots, pokes)
 			}
 			// The refresh must not have created a second Transition: a
-			// non-material reconciliation creates no history at all.
-			reasons := transitionReasons(t, st)
+			// non-material reconciliation creates no history at all. Scoped
+			// to the live Situation: its five prior episodes have history
+			// of their own.
+			reasons := liveTransitionReasons(t, st)
 			if len(reasons) != 1 || reasons[0] != "first_authoritative_state" {
 				t.Fatalf("transition reasons = %v, want exactly [first_authoritative_state]: an R4 refresh must create no Transition", reasons)
 			}
@@ -1220,6 +1241,32 @@ func scenarioDeadlineRefresh() historyScenario {
 // ----------------------------------------------------------------------
 // Scenario-specific assertion helpers.
 // ----------------------------------------------------------------------
+
+// liveTransitionReasons is transitionReasons scoped to the newest
+// Situation — the one a warranted scenario is about, after its lineage.
+func liveTransitionReasons(t *testing.T, st *store.Store) []string {
+	t.Helper()
+	rows, err := st.DB().QueryContext(context.Background(), `
+		SELECT reason FROM situation_transitions
+		 WHERE situation_id = (SELECT id FROM situations ORDER BY created_at DESC, id DESC LIMIT 1)
+		 ORDER BY sequence ASC`)
+	if err != nil {
+		t.Fatalf("read live transition reasons: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var r string
+		if err := rows.Scan(&r); err != nil {
+			t.Fatalf("scan live transition reason: %v", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate live transition reasons: %v", err)
+	}
+	return out
+}
 
 func assertArtifactJournalStates(t *testing.T, st *store.Store, want map[string]int) {
 	t.Helper()
@@ -1341,13 +1388,12 @@ func scenarioInvestigation() historyScenario {
 	return historyScenario{
 		name: "investigation",
 		run: func(f *historyFixture) {
-			f.postAlert("hist-investigation", "HighLatency", "fp-hist-investigation", "firing", "warning")
-			f.drainFoundation()
+			f.openWarrantedSituation("hist-investigation", "fp-hist-investigation")
 			f.converge()
 
 			// A collecting Incident is a clean minimum-member Triage skip;
 			// a ready one is what makes the controller request Acute Triage.
-			f.markReady(f.soleIncidentID())
+			f.markReady(f.newestIncidentID())
 
 			f.crashControllerCycle()
 			f.converge()
@@ -1358,7 +1404,8 @@ func scenarioInvestigation() historyScenario {
 			requireJournalKind(t, st, "investigation_started")
 			var started int
 			if err := st.DB().QueryRowContext(context.Background(),
-				`SELECT json_extract(summary_json,'$.investigation_started') FROM situation_episode_summaries`).Scan(&started); err != nil {
+				`SELECT json_extract(summary_json,'$.investigation_started') FROM situation_episode_summaries
+				  WHERE situation_id = (SELECT id FROM situations ORDER BY created_at DESC, id DESC LIMIT 1)`).Scan(&started); err != nil {
 				t.Fatalf("read investigation_started: %v", err)
 			}
 			if started != 1 {
@@ -1390,34 +1437,61 @@ func (f *historyFixture) shortEpisode(group, fingerprint string) {
 	assertLifecycle(f.t, f.st, "recovered")
 }
 
+// openWarrantedSituation opens the Situation a scenario is about in a state
+// that carries publication authority at its FIRST controller cycle.
+//
+// A quiet Situation — observe Attention, no accepted Sufficient reason —
+// has state, Transitions, and MCP history but no claim on Slack at all
+// (PlanNotificationIntents, review round 1), and a fresh group can reach no
+// Sufficient reason on its own: critical_anchor needs a critical delivery
+// (whose urgent fast cadence is exactly advanceMargin, so the R4 deadline
+// refresh would re-edit the root on every round of this harness and it
+// could never look quiescent), novel_symptom and terminal_uncertainty are
+// unreachable in this build, and duration_outlier needs at least five
+// comparable prior durations. So this helper builds exactly that lineage —
+// five short quiet episodes for group — posts the live alert, and lets
+// enough time pass that its elapsed duration is an outlier before the
+// first cycle claims duration_outlier at observe Attention: the lowest
+// interruption priority a warranted Situation can publish at, on the slow
+// cadence that lets the harness converge.
+func (f *historyFixture) openWarrantedSituation(group, fingerprint string) {
+	f.t.Helper()
+	for i := 0; i < 5; i++ {
+		f.shortEpisode(group, fmt.Sprintf("%s-prior-%d", fingerprint, i))
+	}
+	f.postAlert(group, "HighLatency", fingerprint, "firing", "warning")
+	f.drainFoundation()
+	// 45 minutes: an outlier against the minutes-long priors, but still
+	// inside the "medium" duration class, so a scenario that later needs a
+	// fresh L2 judgment (the handoff) can cross into "long" and change the
+	// Assessment basis — a reuse cycle never consults the model.
+	f.clock.Advance(45 * time.Minute)
+	f.script = l2Script{ClaimNonFloorReason: true}
+}
+
 func (f *historyFixture) newestIncidentID() string {
 	f.t.Helper()
 	return scalarString(f.t, f.st, `SELECT id FROM incidents ORDER BY created_at DESC, id DESC LIMIT 1`)
 }
 
-// scenarioRecurrenceLineageAndHandoff: five completed episodes for one
-// group make the sixth Situation carry a recurrence count at the first
-// milestone rung AND make duration_outlier — the only non-floor eligible
-// Sufficient reason this build can reach — admissible once it runs long.
-// Claiming it while Attention is investigate is exactly what makes the
-// controller derive an operator handoff (assessment.go's
-// operatorActionRequired), which is the one transition class that earns a
-// broadcast reply.
+// scenarioRecurrenceLineageAndHandoff: the five completed episodes every
+// warranted scenario opens with make the sixth Situation carry a recurrence
+// count at the first milestone rung; claiming duration_outlier while
+// Attention is investigate is exactly what makes the controller derive an
+// operator handoff (assessment.go's operatorActionRequired), which is the
+// one transition class that earns a broadcast reply.
 func scenarioRecurrenceLineageAndHandoff() historyScenario {
 	return historyScenario{
 		name: "recurrence-handoff",
 		run: func(f *historyFixture) {
-			for i := 0; i < 5; i++ {
-				f.shortEpisode("hist-lineage", fmt.Sprintf("fp-hist-lineage-%d", i))
-			}
-
-			f.postAlert("hist-lineage", "HighLatency", "fp-hist-lineage-live", "firing", "warning")
-			f.drainFoundation()
+			f.openWarrantedSituation("hist-lineage", "fp-hist-lineage-live")
 			f.converge()
 
-			// Run long enough that this Situation's elapsed duration
-			// exceeds both the p95 and twice the median of the five short
-			// episodes above, then let the model claim that candidate.
+			// Cross into the "long" duration class so the next cycle's
+			// Assessment basis changes and the model is consulted again;
+			// investigate while still claiming duration_outlier: a
+			// validated non-floor reason accepted at investigate Attention
+			// is what derives the operator handoff.
 			f.clock.Advance(3 * time.Hour)
 			f.script = l2Script{Attention: situationmodel.AttentionInvestigate, ClaimNonFloorReason: true}
 

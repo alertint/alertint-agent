@@ -2,7 +2,11 @@
 
 package situation
 
-import "github.com/alertint/alertint-agent/internal/situation/model"
+import (
+	"strings"
+
+	"github.com/alertint/alertint-agent/internal/situation/model"
+)
 
 // ----------------------------------------------------------------------
 // Plan 3 Task 4: deterministic Interruption priority and main-channel poke
@@ -57,6 +61,32 @@ func DeriveInterruptionPriority(t model.Transition) model.InterruptionPriority {
 // Plan 2 can reach).
 func deterministicCriticalFloor(t model.Transition) bool {
 	return t.Projection.Assessment != nil && t.Projection.Assessment.SufficientReasonCode == reasonCodeCriticalAnchor
+}
+
+// PublicationAuthority reports whether t carries the controller's
+// deterministic publication authority: an unquieted deterministic floor or
+// a validated Sufficient reason (spec.md "Publication authority and
+// Interruption priority": "The controller derives publication authority
+// from deterministic floors and a validated Sufficient reason"). A
+// Situation whose authority Transition carries neither is quiet — it keeps
+// its state, Transitions, and MCP history, but has no claim on Slack at
+// all, so it never creates a Slack intent (not even a withheld one). The
+// operator's Slack floor is a separate, later question: it ranks a
+// PERMITTED new poke against the operator's minimum and can never grant an
+// authority the Transition does not have. Lifecycle alone grants none
+// either: a quiet Situation closing with uncertainty is still quiet.
+//
+// Urgent Attention counts as the floor: validateProposalContent rejects
+// urgent without a deterministic anchor (`urgent_without_floor`) and raises
+// Attention to urgent whenever one is active, but it does not select the
+// anchor as the Sufficient reason when the model omitted it — so a floored
+// Transition may carry urgent Attention with no reason code, and that
+// Attention is itself proof of the proven floor.
+func PublicationAuthority(t model.Transition) bool {
+	if deterministicCriticalFloor(t) || t.Attention == model.AttentionUrgent {
+		return true
+	}
+	return t.Projection.Assessment != nil && strings.TrimSpace(t.Projection.Assessment.SufficientReasonCode) != ""
 }
 
 // MeetsSlackFloor reports whether priority is at or above the operator's

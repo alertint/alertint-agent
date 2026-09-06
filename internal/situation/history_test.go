@@ -395,11 +395,31 @@ func TestBuildTransitionsCatalog(t *testing.T) {
 			pokeAllowed: false,
 		},
 		{
+			// The contract's investigation phase ended with the model's
+			// conclusion unchanged: the controller authored this change.
 			name: "investigation concluded",
 			change: func(t *testing.T) AuthoritativeChange {
 				t.Helper()
 				c := hsNext(t)
 				c.Assessment.ActionContract = hsMonitoringContract(c.Now.Add(time.Minute))
+				return c
+			},
+			reason:      model.ReasonInvestigationConcluded,
+			actor:       model.ActorDeterministicController,
+			journal:     model.JournalEvidenceConclusion,
+			pokeAllowed: false,
+		},
+		{
+			// The same phase end, but the model-validated Assessment also
+			// changed its conclusion: that content is the model's.
+			name: "investigation concluded with a changed conclusion",
+			change: func(t *testing.T) AuthoritativeChange {
+				t.Helper()
+				c := hsNext(t)
+				c.Assessment.ActionContract = hsMonitoringContract(c.Now.Add(time.Minute))
+				concl := *c.Projection.Assessment
+				concl.Impact = model.ImpactConfirmed
+				c.Projection.Assessment = &concl
 				return c
 			},
 			reason:      model.ReasonInvestigationConcluded,
