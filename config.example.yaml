@@ -203,5 +203,23 @@ sentry:
     fetch_timeout_seconds: 15                # bounds the WHOLE 1+K fetch
     include_message: true                    # include the exception message across prompt/SQLite/MCP
 
+# Proactive Situation preparation and advisory semantic profiles. Bounded,
+# read-only evidence gathering from the configured connectors above (store,
+# Prometheus, Zabbix, Loki, Sentry, changes) feeds each Situation's next
+# Assessment; a separate durable worker infers advisory profiles that can
+# only widen which capabilities/horizon are checked, never assert lifecycle
+# or policy. Entirely optional — every field below is already the shipped
+# default, shown here for discoverability. See docs/getting-started/
+# configuration.md#situations.
+situations:
+  preparation:
+    max_source_calls_per_cycle: 6   # physical connector requests per preparation cycle (1-32)
+    max_wall_seconds: 20            # wall-clock budget for one preparation attempt (1-30; must be < situations.attempt_wall_seconds)
+    refresh_seconds: 300            # minimum re-check cadence per subject/capability (60-3600)
+  semantic_profiles:
+    workers: 1                      # inference worker goroutines polling for due jobs (1-4; shares the L0+L2 LLM limiter — at most one profile call runs at a time)
+    max_attempts: 3                 # durable attempts before a job exhausts (1-5)
+    attempt_wall_seconds: 30        # wall-clock budget for one inference attempt (1-60)
+
 log_level: info            # debug | info | warn | error
 log_format: auto           # auto | console | json (auto → console on a TTY, json otherwise)

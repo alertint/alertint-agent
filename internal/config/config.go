@@ -107,27 +107,56 @@ const (
 // timing, the webhook source recovery grace, internal cadence tiers, the
 // fixed L2 call/work-attempt ceiling, the per-attempt wall clock, the shared
 // L2 provider semaphore, and bounded retry/jitter — plus Plan 3's single
-// Slack policy setting (Slack, SituationSlackConfig). It carries no other
-// Plan 3/4 settings: no L1 call budget, connector concurrency, or envelope
-// review interval. In particular, Plan 2 deliberately never adds
-// situations.budgets.max_l1_llm_calls (spec.md 02-controller-triage-coordination
-// "Attempt identity and completion": Acute Triage keeps its shipped
-// five-attempt schedule; a parsed budget with no distinct consuming behavior
-// would be removed rather than shipped unused) — strict YAML decoding
-// rejects it outright as an unknown field.
+// Slack policy setting (Slack, SituationSlackConfig) and Plan 4's bounded
+// evidence-preparation and semantic-profile-worker surfaces (Preparation,
+// SemanticProfiles). It carries no other settings: no L1 call budget,
+// connector concurrency, or envelope review interval. In particular, Plan 2
+// deliberately never adds situations.budgets.max_l1_llm_calls (spec.md
+// 02-controller-triage-coordination "Attempt identity and completion": Acute
+// Triage keeps its shipped five-attempt schedule; a parsed budget with no
+// distinct consuming behavior would be removed rather than shipped unused)
+// — strict YAML decoding rejects it outright as an unknown field.
 type SituationsConfig struct {
-	Workers                     int                     `yaml:"workers"`
-	ReconcilePollSeconds        int                     `yaml:"reconcile_poll_seconds"`
-	LeaseSeconds                int                     `yaml:"lease_seconds"`
-	HeartbeatSeconds            int                     `yaml:"heartbeat_seconds"`
-	WebhookRecoveryGraceSeconds int                     `yaml:"webhook_recovery_grace_seconds"`
-	Cadence                     SituationsCadenceConfig `yaml:"cadence"`
-	MaxL2CallsPerAttempt        int                     `yaml:"max_l2_calls_per_attempt"`
-	MaxWorkAttemptsPerInput     int                     `yaml:"max_work_attempts_per_input"`
-	AttemptWallSeconds          int                     `yaml:"attempt_wall_seconds"`
-	LLMConcurrency              int                     `yaml:"llm_concurrency"`
-	Retry                       SituationsRetryConfig   `yaml:"retry"`
-	Slack                       SituationSlackConfig    `yaml:"slack"`
+	Workers                     int                        `yaml:"workers"`
+	ReconcilePollSeconds        int                        `yaml:"reconcile_poll_seconds"`
+	LeaseSeconds                int                        `yaml:"lease_seconds"`
+	HeartbeatSeconds            int                        `yaml:"heartbeat_seconds"`
+	WebhookRecoveryGraceSeconds int                        `yaml:"webhook_recovery_grace_seconds"`
+	Cadence                     SituationsCadenceConfig    `yaml:"cadence"`
+	MaxL2CallsPerAttempt        int                        `yaml:"max_l2_calls_per_attempt"`
+	MaxWorkAttemptsPerInput     int                        `yaml:"max_work_attempts_per_input"`
+	AttemptWallSeconds          int                        `yaml:"attempt_wall_seconds"`
+	LLMConcurrency              int                        `yaml:"llm_concurrency"`
+	Retry                       SituationsRetryConfig      `yaml:"retry"`
+	Slack                       SituationSlackConfig       `yaml:"slack"`
+	Preparation                 SituationPreparationConfig `yaml:"preparation"`
+	SemanticProfiles            SemanticProfilesConfig     `yaml:"semantic_profiles"`
+}
+
+// SituationPreparationConfig is Plan 4's bounded evidence-preparation
+// surface: the physical connector-request cap per preparation cycle, the
+// wall-clock budget for the whole preparation attempt (shared by both the
+// lifecycle and assessment phases), and the per-subject/capability refresh
+// cadence (spec.md "Defaults and hard limits"). This is intentionally
+// small — the many hard caps (16 plans/cycle, 100 facts/run, window
+// ceilings, the one-third investigative-fairness credit rule, ...) are
+// fixed in internal/observation/model, never configurable.
+type SituationPreparationConfig struct {
+	MaxSourceCallsPerCycle int `yaml:"max_source_calls_per_cycle"`
+	MaxWallSeconds         int `yaml:"max_wall_seconds"`
+	RefreshSeconds         int `yaml:"refresh_seconds"`
+}
+
+// SemanticProfilesConfig bounds the durable advisory semantic-inference
+// worker: how many worker goroutines poll for due jobs (Workers shares the
+// L0+L2 primary-LLM concurrency limiter with Assessment calls — at most one
+// profile slot is ever used regardless of this value), how many durable
+// attempts one job may spend before exhausting, and the wall-clock budget
+// for a single attempt's model dispatch.
+type SemanticProfilesConfig struct {
+	Workers            int `yaml:"workers"`
+	MaxAttempts        int `yaml:"max_attempts"`
+	AttemptWallSeconds int `yaml:"attempt_wall_seconds"`
 }
 
 // SituationSlackConfig is Plan 3's only Situation-Slack policy setting: how
@@ -681,6 +710,16 @@ func Defaults() Config {
 			Slack: SituationSlackConfig{
 				RepageCooldownSeconds: 900,
 			},
+			Preparation: SituationPreparationConfig{
+				MaxSourceCallsPerCycle: 6,
+				MaxWallSeconds:         20,
+				RefreshSeconds:         300,
+			},
+			SemanticProfiles: SemanticProfilesConfig{
+				Workers:            1,
+				MaxAttempts:        3,
+				AttemptWallSeconds: 30,
+			},
 		},
 		Telemetry: TelemetryConfig{
 			OTLP: OTLPConfig{
@@ -1145,6 +1184,60 @@ func (c *Config) validateSituations() []string {
 			situationsMaxWorkAttemptsPerInput))
 	}
 
+	errs = append(errs, c.validateSituationPreparation()...)
+	errs = append(errs, c.validateSemanticProfiles()...)
+
+	return errs
+}
+
+// validateSituationPreparation checks Plan 4's bounded evidence-preparation
+// surface (spec.md "Defaults and hard limits"): max_source_calls_per_cycle
+// in [1,32], max_wall_seconds in [1,30] and strictly less than
+// situations.attempt_wall_seconds (the preparation wall is bounded by the
+// enclosing controller attempt's own wall), and refresh_seconds in
+// [60,3600].
+func (c *Config) validateSituationPreparation() []string {
+	var errs []string
+	p := c.Situations.Preparation
+
+	if p.MaxSourceCallsPerCycle < 1 || p.MaxSourceCallsPerCycle > 32 {
+		errs = append(errs, fmt.Sprintf(
+			"situations.preparation.max_source_calls_per_cycle (%d) must be between 1 and 32", p.MaxSourceCallsPerCycle))
+	}
+	if p.MaxWallSeconds < 1 || p.MaxWallSeconds > 30 {
+		errs = append(errs, fmt.Sprintf(
+			"situations.preparation.max_wall_seconds (%d) must be between 1 and 30", p.MaxWallSeconds))
+	}
+	if p.MaxWallSeconds > 0 && c.Situations.AttemptWallSeconds > 0 && p.MaxWallSeconds >= c.Situations.AttemptWallSeconds {
+		errs = append(errs, fmt.Sprintf(
+			"situations.preparation.max_wall_seconds (%d) must be less than situations.attempt_wall_seconds (%d)",
+			p.MaxWallSeconds, c.Situations.AttemptWallSeconds))
+	}
+	if p.RefreshSeconds < 60 || p.RefreshSeconds > 3600 {
+		errs = append(errs, fmt.Sprintf(
+			"situations.preparation.refresh_seconds (%d) must be between 60 and 3600", p.RefreshSeconds))
+	}
+	return errs
+}
+
+// validateSemanticProfiles checks Plan 4's durable advisory-inference
+// worker surface: workers in [1,4] (sharing the L0+L2 primary limiter — at
+// most one profile slot is ever used regardless of this value), max_attempts
+// in [1,5], and attempt_wall_seconds in [1,60].
+func (c *Config) validateSemanticProfiles() []string {
+	var errs []string
+	sp := c.Situations.SemanticProfiles
+
+	if sp.Workers < 1 || sp.Workers > 4 {
+		errs = append(errs, fmt.Sprintf("situations.semantic_profiles.workers (%d) must be between 1 and 4", sp.Workers))
+	}
+	if sp.MaxAttempts < 1 || sp.MaxAttempts > 5 {
+		errs = append(errs, fmt.Sprintf("situations.semantic_profiles.max_attempts (%d) must be between 1 and 5", sp.MaxAttempts))
+	}
+	if sp.AttemptWallSeconds < 1 || sp.AttemptWallSeconds > 60 {
+		errs = append(errs, fmt.Sprintf(
+			"situations.semantic_profiles.attempt_wall_seconds (%d) must be between 1 and 60", sp.AttemptWallSeconds))
+	}
 	return errs
 }
 

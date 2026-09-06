@@ -270,6 +270,17 @@ A released binary built from `main` does not read this section at all.
 | `retry.max_seconds` | int | `300` | Ceiling of the controller's transient-failure retry backoff. |
 | `retry.jitter_percent` | int | `20` | Jitter fraction (±) applied to the computed backoff, so concurrently-parked Situations don't all retry in lockstep. |
 | `slack.repage_cooldown_seconds` | int | `900` | How long a *materially changed required action* must wait after a delivered main-channel interruption before it may create another one. It gates exactly that one case: a first publication, newly crossed criticality, newly urgent attention, and an operator hand-off all bypass it, because a cooldown must never swallow an escalation. |
+| `preparation.max_source_calls_per_cycle` | int | `6` | Physical connector requests (store, Prometheus, Zabbix, Loki, Sentry, changes) one preparation cycle may spend, including retries and secondary lookups. Accepts 1-32. |
+| `preparation.max_wall_seconds` | int | `20` | Wall-clock budget for one preparation attempt (both lifecycle and assessment reads share it). Accepts 1-30 and must be strictly less than `attempt_wall_seconds`. |
+| `preparation.refresh_seconds` | int | `300` | Minimum re-check cadence for an unchanged subject/capability — a re-delivery or controller retry cannot bypass it. Accepts 60-3600. |
+| `semantic_profiles.workers` | int | `1` | Inference-worker goroutines polling for due advisory-profile jobs. Accepts 1-4; they share the same L0+L2 primary-LLM concurrency limiter as Assessment calls, so at most one profile inference ever runs at a time regardless of this value. |
+| `semantic_profiles.max_attempts` | int | `3` | Durable attempts one inference job may spend before it exhausts. Accepts 1-5. |
+| `semantic_profiles.attempt_wall_seconds` | int | `30` | Wall-clock budget for one inference attempt's model dispatch. Accepts 1-60. |
+
+Preparation and semantic-profile evidence never write to Slack, grant
+policy authority, or assert source lifecycle on their own — see
+[Architecture: bounded evidence preparation](../concepts/architecture.md)
+and [Scope and limits](../concepts/scope-and-limits.md).
 
 Slack delivery adds no other knobs. Retry timing (exponential 5 s → 5 min
 with jitter, honouring a longer Slack `Retry-After`), batch size, and the
