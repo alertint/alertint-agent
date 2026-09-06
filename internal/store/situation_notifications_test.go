@@ -48,6 +48,37 @@ func snCommit(t *testing.T, st *Store, sitID string, prior *situation.Controller
 	return commit
 }
 
+// snCommitBelowFloor is snCommit's second-cycle form with an operator Slack
+// floor high enough to withhold the poke: the poked Transition then carries
+// BOTH a durably withheld broadcast_handoff and the quiet thread_append the
+// floor never suppresses (Task 4's `3ab73d6`).
+func snCommitBelowFloor(t *testing.T, st *Store, sitID string, prior situation.ControllerCommit,
+	now time.Time) situation.ControllerCommit {
+	t.Helper()
+	shMakeDue(t, st, sitID, now.Add(-time.Minute))
+	claim := claimSituation(t, st, sitID, "controller-a", now)
+	cycle := shPrepare(t, claim, shOperatorContract(now.Add(time.Minute)),
+		situationmodel.LifecycleActive, situationmodel.AttentionInvestigate, now)
+	last := prior.History.Transitions[len(prior.History.Transitions)-1]
+	cycle.Change.PriorTransition = &last
+	cycle.Change.PriorSummary = prior.History.Summary
+	cycle.Publish.PriorTransition = &last
+	cycle.Publish.RootPublished = true
+	cycle.Publish.SlackFloor = situationmodel.InterruptionCritical
+	// The shared fixture anchors every conclusion on the deterministic
+	// critical floor, which always passes any floor. Swap in an ordinary
+	// Sufficient reason so this poke derives `high` and the operator's
+	// critical floor can actually withhold it.
+	concl := *cycle.Change.Projection.Assessment
+	concl.SufficientReasonCode = "duration_outlier"
+	cycle.Change.Projection.Assessment = &concl
+	commit := shDerive(t, cycle)
+	if err := st.CommitController(context.Background(), claim, commit); err != nil {
+		t.Fatalf("CommitController: %v", err)
+	}
+	return commit
+}
+
 // snSeedOneCycle creates a Situation with exactly one committed cycle: a
 // pending root_sync plus one immutable thread_append at sequence 1.
 func snSeedOneCycle(t *testing.T, st *Store, group string, now time.Time) (string, situation.ControllerCommit) {
@@ -634,5 +665,63 @@ func TestNotificationSupersessionRecordsDelayedThreadDelivery(t *testing.T) {
 	_, ts, ok, err := st.GetSituationRootCoordinates(ctx, *stored.SituationID)
 	if err != nil || !ok || ts != "100.1" {
 		t.Fatalf("root coordinates = (%q,%v,%v), want the root's own 100.1", ts, ok, err)
+	}
+}
+
+// TestNotificationClaimNeverClaimsAFloorWithheldEffect pins the one shape
+// where a Transition still carries two intents after Task 4's `3ab73d6`: a
+// poke below the operator's Slack floor keeps a durably withheld
+// broadcast_handoff AND the quiet thread_append the floor never suppresses.
+// The withheld decision must never become claimable — only the quiet entry
+// is ever delivered — and the withheld row must not shadow it in its own
+// Situation's queue.
+func TestNotificationClaimNeverClaimsAFloorWithheldEffect(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	sitID, first := snSeedOneCycle(t, st, "group-claim-withheld", now)
+	second := snCommitBelowFloor(t, st, sitID, first, now.Add(time.Minute))
+
+	withheld := shIntentOfClass(t, second.History.Intents, situationmodel.EffectBroadcastHandoff)
+	if withheld.Status != situationmodel.IntentWithheld {
+		t.Fatalf("broadcast below the Slack floor has status %q, want withheld_by_operator_slack_floor", withheld.Status)
+	}
+	quiet := shIntentOfClass(t, second.History.Intents, situationmodel.EffectThreadAppend)
+	if quiet.TransitionSequence == nil || withheld.TransitionSequence == nil ||
+		*quiet.TransitionSequence != *withheld.TransitionSequence {
+		t.Fatalf("the withheld broadcast and its quiet entry must share one Transition sequence: %v vs %v",
+			withheld.TransitionSequence, quiet.TransitionSequence)
+	}
+
+	// Drain the Situation, proving the withheld row is never handed out and
+	// never blocks the queue behind it.
+	claimed := []string{}
+	for round := 0; round < 6; round++ {
+		at := now.Add(time.Duration(2+round) * time.Minute)
+		claims, err := st.ClaimNotificationIntents(context.Background(), snOwner, at, 5*time.Minute, 25)
+		if err != nil {
+			t.Fatalf("claim round %d: %v", round, err)
+		}
+		if len(claims) == 0 {
+			break
+		}
+		for i, c := range claims {
+			if c.Intent.ID == withheld.ID {
+				t.Fatal("a withheld_by_operator_slack_floor intent was claimed")
+			}
+			claimed = append(claimed, c.Intent.ID)
+			snDeliver(t, st, c, "30"+string(rune('0'+round))+"."+string(rune('0'+i)), at)
+		}
+	}
+	var sawQuiet bool
+	for _, id := range claimed {
+		if id == quiet.ID {
+			sawQuiet = true
+		}
+	}
+	if !sawQuiet {
+		t.Fatalf("claimed %v, want the quiet journal entry %s to have been delivered", claimed, quiet.ID)
+	}
+	if got := snIntent(t, st, withheld.ID); got.Status != situationmodel.IntentWithheld || got.AttemptCount != 0 {
+		t.Fatalf("withheld intent = %+v, want an untouched durable decision with no attempts", got)
 	}
 }
