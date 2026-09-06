@@ -214,11 +214,11 @@ type Plan struct {
 // requests this cycle may spend, which optional plan (if any) is protected,
 // and how much of the preparation wall that protected plan reserves.
 type PhaseAllocation struct {
-	TimeSensitiveRequests    int
-	RoutineLifecycleRequests int
-	OptionalRequests         int
-	OptionalPlanID           string
-	OptionalWallMilliseconds int64
+	TimeSensitiveRequests    int    `json:"time_sensitive_requests"`
+	RoutineLifecycleRequests int    `json:"routine_lifecycle_requests"`
+	OptionalRequests         int    `json:"optional_requests"`
+	OptionalPlanID           string `json:"optional_plan_id,omitempty"`
+	OptionalWallMilliseconds int64  `json:"optional_wall_milliseconds"`
 }
 
 // ProfileGuidance is the bounded, frozen advisory guidance from one semantic
@@ -226,11 +226,11 @@ type PhaseAllocation struct {
 // to widen horizon/capabilities within hard caps, never enough to grant
 // authority over identity or lifecycle.
 type ProfileGuidance struct {
-	SignatureKey       string
-	VersionID          string
-	HorizonTier        string
-	UsefulCapabilities []Capability
-	CandidateScope     []string
+	SignatureKey       string       `json:"signature_key"`
+	VersionID          string       `json:"version_id"`
+	HorizonTier        string       `json:"horizon_tier"`
+	UsefulCapabilities []Capability `json:"useful_capabilities,omitempty"`
+	CandidateScope     []string     `json:"candidate_scope,omitempty"`
 }
 
 // CycleDraft is BeginPreparation's input: the proposed frozen cycle content
@@ -347,4 +347,39 @@ type RunRecord struct {
 	Run             Run
 	DetailState     string
 	DetailExpiredAt *time.Time
+}
+
+// LocalSituationSummary is one bounded, existing-delivery-truth prior
+// Situation the store_read capability may cite — durable Situation
+// lifecycle history, never a lack-of-prior-rows-implies-anything claim
+// (spec.md: "a lack of prior rows is insufficient history").
+type LocalSituationSummary struct {
+	ID                 string    `json:"id"`
+	EffectiveStartedAt time.Time `json:"effective_started_at"`
+	TerminalAt         time.Time `json:"terminal_at,omitempty"`
+	TerminalReason     string    `json:"terminal_reason,omitempty"`
+}
+
+// LocalFinding is one bounded, durable Acute Triage finding the store_read
+// capability may cite as prior evidence for the same group.
+type LocalFinding struct {
+	IncidentID string    `json:"incident_id"`
+	AnalyzedAt time.Time `json:"analyzed_at"`
+	Summary    string    `json:"summary,omitempty"`
+	RootCause  string    `json:"root_cause,omitempty"`
+	Confidence float64   `json:"confidence"`
+}
+
+// LocalChange is one bounded, locally ingested change-ledger event the
+// change_events capability may cite — temporal correlation evidence only,
+// never supported causality or an urgent policy signal.
+type LocalChange struct {
+	ID         string            `json:"id"`
+	Source     string            `json:"source"`
+	Kind       string            `json:"kind"`
+	Title      string            `json:"title"`
+	Labels     map[string]string `json:"labels,omitempty"`
+	Version    string            `json:"version,omitempty"`
+	Link       string            `json:"link,omitempty"`
+	OccurredAt time.Time         `json:"occurred_at"`
 }
