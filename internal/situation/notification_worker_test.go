@@ -436,8 +436,8 @@ func TestNotificationWorkerBlocksConfigurationAndFailsInvalid(t *testing.T) {
 		if len(s.retried) != 0 {
 			t.Fatalf("retried = %v, want neither outcome to schedule a retry", s.retried)
 		}
-		if len(s.failures) != 1 || s.failures[0] != "invalid_auth" {
-			t.Fatalf("observed slack failures = %v, want only the configuration rejection", s.failures)
+		if len(s.failures) != 0 {
+			t.Fatalf("observed slack failures = %v, want none: a configuration rejection is durable per-intent state, not an outage", s.failures)
 		}
 	})
 }
@@ -627,8 +627,22 @@ func TestNotificationWorkerProbesWhileAFailureWindowExists(t *testing.T) {
 		t.Fatalf("probe calls with an open failure window = %d, want 2", deliverer.probeCalls)
 	}
 	store.snapshot(func(s *nwStore) {
+		// No failure landed in any of these rounds (every probe
+		// succeeded), so nothing proved the window continuous: a gap is
+		// opened by a failure, never by the passage of time.
+		if len(s.gapOpens) != 0 {
+			t.Fatalf("OpenDueDeliveryGap calls = %d, want 0 without a fresh failure", len(s.gapOpens))
+		}
+	})
+	// A fresh retryable failure inside the window asks the store.
+	deliverer.probeErr = errors.New("slack unreachable")
+	clock.advance(time.Minute)
+	if _, err := w.RunOnce(context.Background()); err != nil {
+		t.Fatalf("fifth RunOnce: %v", err)
+	}
+	store.snapshot(func(s *nwStore) {
 		if len(s.gapOpens) == 0 {
-			t.Fatal("a failure window must ask the store whether a gap is due")
+			t.Fatal("a failure inside an open window must ask the store whether a gap is due")
 		}
 		if s.gapOpens[len(s.gapOpens)-1] != defaultDeliveryGapThreshold {
 			t.Fatalf("gap threshold = %s, want the fixed %s", s.gapOpens[len(s.gapOpens)-1], defaultDeliveryGapThreshold)
@@ -637,9 +651,10 @@ func TestNotificationWorkerProbesWhileAFailureWindowExists(t *testing.T) {
 }
 
 // TestNotificationWorkerRecoveryReactivatesConfigurationAndReplaysGap
-// proves a successful probe closes the failure window, increments the
-// durable configuration generation for blocked intents, and recovers the
-// open gap — in that order, before any backlog claim.
+// proves a successful probe increments the durable configuration generation
+// for blocked intents and recovers the open gap — in that order, before any
+// backlog claim — and never closes the failure window: auth.test is token
+// readiness, not delivery health (review round 1, R1-F4).
 func TestNotificationWorkerRecoveryReactivatesConfigurationAndReplaysGap(t *testing.T) {
 	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
 	failedAt := now.Add(-10 * time.Minute)
@@ -660,8 +675,8 @@ func TestNotificationWorkerRecoveryReactivatesConfigurationAndReplaysGap(t *test
 		t.Fatalf("RunOnce: %v", err)
 	}
 	store.snapshot(func(s *nwStore) {
-		if s.successes == 0 {
-			t.Fatal("a successful probe must close the failure window")
+		if s.successes != 0 {
+			t.Fatal("a successful probe closed the failure window; only a delivery success may")
 		}
 		if len(s.reactivated) != 1 || s.reactivated[0] != 4 {
 			t.Fatalf("reactivated with generations %v, want exactly the incremented [4]", s.reactivated)
@@ -673,6 +688,69 @@ func TestNotificationWorkerRecoveryReactivatesConfigurationAndReplaysGap(t *test
 	stats := w.Stats()
 	if stats.GapsRecovered != 1 || stats.Reactivated != 1 {
 		t.Fatalf("stats = %+v, want one recovery and one reactivation", stats)
+	}
+}
+
+// TestNotificationWorkerProbeSuccessNeverClearsTheFailureWindow pins the
+// partial-outage case directly: auth.test keeps succeeding while every
+// write fails, and the window still reaches the gap threshold.
+func TestNotificationWorkerProbeSuccessNeverClearsTheFailureWindow(t *testing.T) {
+	clock := &nwClock{at: time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)}
+	failedAt := clock.at
+	store := &nwStore{state: SlackDeliveryState{FirstFailureAt: &failedAt}}
+	for i := 0; i < 8; i++ {
+		store.batches = append(store.batches, []NotificationClaim{nwClaim(fmt.Sprintf("intent-%d", i), i+1)})
+	}
+	deliverer := &nwDeliverer{deliver: func(model.NotificationIntent) (NotificationDelivery, error) {
+		return NotificationDelivery{}, nwDeliveryError{class: DeliveryRetryable, code: "http_503"}
+	}}
+	w := NewNotificationWorker(store, deliverer, NotificationWorkerConfig{
+		Owner: "notify-a", Heartbeat: time.Hour, Rand: func() float64 { return 0.5 },
+	}, clock.now, nwLogger())
+	for i := 0; i < 8; i++ {
+		if _, err := w.RunOnce(context.Background()); err != nil {
+			t.Fatalf("RunOnce %d: %v", i, err)
+		}
+		clock.advance(time.Minute)
+	}
+	if deliverer.probeCalls < 2 {
+		t.Fatalf("probe calls = %d, want the worker to keep probing while the window is open", deliverer.probeCalls)
+	}
+	store.snapshot(func(s *nwStore) {
+		if s.successes != 0 {
+			t.Fatalf("ObserveSlackSuccess calls = %d, want 0: %d successful token probes are not delivery successes", s.successes, deliverer.probeCalls)
+		}
+		if len(s.failures) != 8 {
+			t.Fatalf("observed slack failures = %d, want one per failed write", len(s.failures))
+		}
+		if len(s.gapOpens) == 0 {
+			t.Fatal("the failure window never asked the store whether a gap is due")
+		}
+	})
+}
+
+// TestNotificationWorkerDoesNotProbeWhileReplaying proves that once a
+// generation is replaying the recovery notice's own retries are the
+// write-health probe: no token probe runs (it could change nothing).
+func TestNotificationWorkerDoesNotProbeWhileReplaying(t *testing.T) {
+	clock := &nwClock{at: time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)}
+	failedAt := clock.at.Add(-10 * time.Minute)
+	generation := "gap-1"
+	store := &nwStore{state: SlackDeliveryState{
+		FirstFailureAt: &failedAt, OpenGapGeneration: &generation, OpenGapStatus: "replaying",
+	}}
+	deliverer := &nwDeliverer{}
+	w := NewNotificationWorker(store, deliverer, NotificationWorkerConfig{
+		Owner: "notify-a", Heartbeat: time.Hour, Rand: func() float64 { return 0.5 },
+	}, clock.now, nwLogger())
+	for i := 0; i < 3; i++ {
+		if _, err := w.RunOnce(context.Background()); err != nil {
+			t.Fatalf("RunOnce %d: %v", i, err)
+		}
+		clock.advance(time.Minute)
+	}
+	if deliverer.probeCalls != 1 {
+		t.Fatalf("probe calls while replaying = %d, want exactly the one startup probe", deliverer.probeCalls)
 	}
 }
 

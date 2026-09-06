@@ -283,6 +283,11 @@ func TestDeliveryGapReplaySecondOutageStartsADistinctGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RecoverDeliveryGap: %v", err)
 	}
+	// The recovery notice lands: a real delivery success closes the first
+	// outage's window.
+	if err := st.ObserveSlackSuccess(ctx, now.Add(7*time.Minute+30*time.Second)); err != nil {
+		t.Fatalf("ObserveSlackSuccess: %v", err)
+	}
 
 	// Slack fails again mid-replay.
 	secondWindow := now.Add(8 * time.Minute)
@@ -300,6 +305,54 @@ func TestDeliveryGapReplaySecondOutageStartsADistinctGeneration(t *testing.T) {
 	}
 	if n := shCountRows(t, st, `SELECT COUNT(*) FROM slack_delivery_gaps`); n != 2 {
 		t.Fatalf("gap generations = %d, want 2 distinct ones", n)
+	}
+}
+
+// TestDeliveryGapRecoveryKeepsTheFailureWindowUntilAWriteLands proves a
+// readiness probe's recovery does not close the failure window: while the
+// recovery notice keeps failing, the same outage keeps naming the same
+// generation and no second one opens (review round 1, R1-F4).
+func TestDeliveryGapRecoveryKeepsTheFailureWindowUntilAWriteLands(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	snSeedOneCycle(t, st, "group-gap-keep-window", now)
+
+	snFail(t, st, now)
+	if _, err := st.OpenDueDeliveryGap(ctx, now.Add(snGapThreshold), snGapThreshold); err != nil {
+		t.Fatalf("OpenDueDeliveryGap: %v", err)
+	}
+	if _, ok, err := st.RecoverDeliveryGap(ctx, now.Add(7*time.Minute)); err != nil || !ok {
+		t.Fatalf("RecoverDeliveryGap = (%v, %v), want recovered", ok, err)
+	}
+	state := snState(t, st)
+	if state.FirstFailureAt == nil || !state.FirstFailureAt.Equal(now) {
+		t.Fatalf("first_failure_at after recovery = %v, want the original anchor %s: a token probe is not a delivery success", state.FirstFailureAt, now)
+	}
+	if state.OpenGapStatus != "replaying" {
+		t.Fatalf("gap status after recovery = %q, want replaying", state.OpenGapStatus)
+	}
+	// The notice keeps failing for well over five more minutes: same
+	// outage, same generation, no second one.
+	snFail(t, st, now.Add(8*time.Minute))
+	snFail(t, st, now.Add(14*time.Minute))
+	if opened, err := st.OpenDueDeliveryGap(ctx, now.Add(15*time.Minute), snGapThreshold); err != nil || opened {
+		t.Fatalf("OpenDueDeliveryGap while the recovered outage continues = (%v, %v), want (false, nil)", opened, err)
+	}
+	if n := shCountRows(t, st, `SELECT COUNT(*) FROM slack_delivery_gaps`); n != 1 {
+		t.Fatalf("gap generations = %d, want exactly 1 for one continuous outage", n)
+	}
+	// The notice finally lands; the window closes and a LATER failure
+	// starts a fresh window of its own.
+	if err := st.ObserveSlackSuccess(ctx, now.Add(16*time.Minute)); err != nil {
+		t.Fatalf("ObserveSlackSuccess: %v", err)
+	}
+	if snState(t, st).FirstFailureAt != nil {
+		t.Fatal("a delivery success must close the failure window")
+	}
+	snFail(t, st, now.Add(17*time.Minute))
+	if opened, err := st.OpenDueDeliveryGap(ctx, now.Add(17*time.Minute+snGapThreshold), snGapThreshold); err != nil || !opened {
+		t.Fatalf("OpenDueDeliveryGap for a second outage after a real success = (%v, %v), want (true, nil)", opened, err)
 	}
 }
 

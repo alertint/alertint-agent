@@ -26,9 +26,14 @@ import (
 //	open --successful readiness probe--> replaying (+ one recovery notice)
 //	replaying --backlog drained--> complete
 //
-// A success at any point clears the failure window, so only CONTINUOUS
-// failure ever opens a gap. Generations are never deleted and never merged:
-// a second outage during replay gets its own identity after its own full
+// A DELIVERY success at any point clears the failure window, so only
+// CONTINUOUS failure ever opens a gap. A readiness probe does not: it
+// authorizes replay (the recovery notice becomes claimable) but proves only
+// the token, so the window it found stays anchored until a write actually
+// lands — while the notice keeps failing, the anchor keeps naming the same
+// generation and no second one opens for the same outage. Generations are
+// never deleted and never merged: a second outage during replay — failures
+// after a real success — gets its own identity after its own full
 // five-minute window.
 //
 // Which intents a generation is replaying is DERIVED, not stored: migration
@@ -251,17 +256,21 @@ func (s *Store) OpenDueDeliveryGap(ctx context.Context, now time.Time, threshold
 }
 
 // RecoverDeliveryGap moves the oldest open generation into replay in one
-// idempotent transaction: it closes the failure window, recomputes the
-// backlog the notice reports, and creates the single claimable
-// installation_gap_recovery intent that must deliver before any of that
-// backlog does. It reports the generation it recovered.
+// idempotent transaction: it recomputes the backlog the notice reports and
+// creates the single claimable installation_gap_recovery intent that must
+// deliver before any of that backlog does. It reports the generation it
+// recovered.
 //
-// Closing the window here as well as in ObserveSlackSuccess is deliberate,
-// not redundant: recovery is by definition proof that Slack answered, and
-// the next generation's identity is derived from the NEXT window's anchor
-// (NewGapGenerationID). A caller that recovered without first clearing the
-// old anchor would leave a second outage unable to open a generation of its
-// own, because it would keep computing the completed generation's id.
+// It deliberately does NOT close the failure window. The readiness check
+// that drives it is auth.test — token readiness, not delivery health — so
+// clearing the anchor here would let a gap be declared recovered while
+// writes still fail, and a second generation would open five minutes later
+// for the same outage, with a second notice, and so on (review round 1,
+// R1-F4). The anchor is cleared by ObserveSlackSuccess when a delivery —
+// the recovery notice first of all — actually lands; until then a new
+// failure keeps computing this generation's id (NewGapGenerationID) and
+// OpenDueDeliveryGap opens nothing. A genuine second outage begins after
+// that success, from a fresh anchor, and gets its own generation.
 func (s *Store) RecoverDeliveryGap(ctx context.Context, now time.Time) (string, bool, error) {
 	now = now.UTC()
 	nowStr := canonicalTime(now)
@@ -308,11 +317,6 @@ func (s *Store) RecoverDeliveryGap(ctx context.Context, now time.Time) (string, 
 		WHERE id = ? AND status = 'open'`,
 		nowStr, affected, delayed, notice.ID, generation); err != nil {
 		return "", false, fmt.Errorf("store: move delivery gap into replay: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE slack_delivery_state SET first_failure_at = NULL, last_success_at = ?, updated_at = ?
-		WHERE id = 1`, nowStr, nowStr); err != nil {
-		return "", false, fmt.Errorf("store: close the recovered failure window: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return "", false, fmt.Errorf("store: commit recover delivery gap: %w", err)

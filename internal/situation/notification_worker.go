@@ -80,8 +80,10 @@ type NotificationDelivery struct {
 type SlackDeliveryState struct {
 	// FirstFailureAt anchors the current CONTINUOUS failure window. Nil
 	// means Slack delivery is currently healthy. It is set by the first
-	// retryable/configuration failure and cleared by any success — it never
-	// slides forward while failures continue.
+	// retryable/uncertain delivery failure and cleared only by an actual
+	// delivery success — never by a readiness probe, which proves the token
+	// and nothing else — and it never slides forward while failures
+	// continue.
 	FirstFailureAt *time.Time
 	LastSuccessAt  *time.Time
 	// OpenGapGeneration is the generation currently open or replaying, nil
@@ -173,22 +175,20 @@ const (
 	DeliveryInvalid DeliveryErrorClass = "invalid"
 )
 
-// isSlackOutcome reports whether this class is evidence about the Slack
-// dependency itself. Only a real transport/API result is: an invalid
-// payload is this build's own bug, and a local data-state condition never
-// reached the wire. Neither may open a Delivery gap or hold the
-// continuous-failure window open (spec.md's gap lifecycle is defined over
-// "Slack delivery failure", not over every failed attempt).
-func (c DeliveryErrorClass) isSlackOutcome() bool {
-	switch c {
-	case DeliveryInvalid, DeliveryLocalRetryable:
-		return false
-	case DeliveryRetryable, DeliveryConfigurationBlocking:
-		return true
-	default:
-		// An unknown class is not proof that Slack answered.
-		return false
-	}
+// anchorsFailureWindow reports whether this class is evidence of a Slack
+// OUTAGE — what the continuous-failure window and the Delivery-gap
+// lifecycle are defined over (spec.md: "A first retryable or uncertain
+// Slack delivery failure is an ordinary delay ... If failures remain
+// continuous for five minutes, AlertINT opens one durable Delivery-gap
+// generation"). Only a retryable or uncertain transport/API result is: an
+// invalid payload is this build's own bug, a local data-state condition
+// never reached the wire, and a definite configuration rejection is
+// durable per-intent state (`blocked_configuration`, visible as the blocked
+// backlog) rather than an outage — a wrong channel with a valid token is
+// not Slack being down, and must never open a gap or hold one open
+// (review round 1, R1-F4).
+func (c DeliveryErrorClass) anchorsFailureWindow() bool {
+	return c == DeliveryRetryable
 }
 
 // DeliveryFailure is the classification a deliverer error may carry. An
@@ -565,28 +565,14 @@ func (w *NotificationWorker) RunOnce(ctx context.Context) (int, error) {
 	return handled, nil
 }
 
-// advanceGapState drives the whole gap lifecycle for one round: probe while
-// a failure window or gap exists, open a generation once failures have been
-// continuous for the threshold, recover it once Slack answers again, and
-// complete it once nothing replayable remains.
+// advanceGapState drives the gap lifecycle for one round: probe while a
+// failure window or gap exists, recover an open generation once the token
+// answers again, and complete a replaying one once nothing replayable
+// remains. Opening a generation is not a per-round question — it happens in
+// observeFailure, on the failure that proves the window continuous.
 func (w *NotificationWorker) advanceGapState(ctx context.Context, state SlackDeliveryState, now time.Time) {
 	if w.shouldProbe(state, now) {
 		w.probe(ctx, state, now)
-	}
-	if state.FirstFailureAt != nil {
-		opened, err := w.store.OpenDueDeliveryGap(ctx, now, w.cfg.GapThreshold)
-		if err != nil {
-			w.logger.Error("situation: notification worker: open delivery gap failed", "err", err)
-		} else if opened {
-			w.count(func(s *NotificationWorkerStats) { s.GapsOpened++ })
-			w.auditAppend(ctx, auditKindGapOpened, map[string]any{
-				"first_failure_at":  state.FirstFailureAt.UTC().Format(time.RFC3339Nano),
-				"continuous_for_ms": now.Sub(*state.FirstFailureAt).Milliseconds(),
-			})
-			w.logger.Warn("situation: notification worker: slack delivery gap opened",
-				"first_failure_at", state.FirstFailureAt.Format(time.RFC3339),
-				"continuous_for", now.Sub(*state.FirstFailureAt).String())
-		}
 	}
 	// Bounded: at most one completion per round keeps this cheap, and a
 	// second finished generation completes on the next tick.
@@ -610,24 +596,41 @@ func (w *NotificationWorker) shouldProbe(state SlackDeliveryState, now time.Time
 	if !w.probedOnce {
 		return true
 	}
-	// A REPLAYING generation is a recovered one: its own deliveries prove
-	// Slack health. Durably blocked configuration justifies probing only
-	// until this process has applied its startup correction — after that a
-	// probe can no longer change the outcome (only a restart with corrected
+	// Durably blocked configuration justifies probing only until this
+	// process has applied its startup correction — after that a probe can
+	// no longer change the outcome (only a restart with corrected
 	// configuration can), and probing on it forever is the treadmill this
 	// worker must not run.
 	blockedStillMatters := state.BlockedConfigurationCount > 0 && !w.configurationReactivated.Load()
 	if state.FirstFailureAt == nil && state.OpenGapStatus != "open" && !blockedStillMatters {
 		return false
 	}
+	// While a generation is REPLAYING, the recovery notice's own retries
+	// are the write-health probe (they gate the backlog until one lands),
+	// and a token probe could change nothing: it never clears the window.
+	if state.OpenGapStatus == "replaying" && !blockedStillMatters {
+		return false
+	}
 	wait := notificationRetryDelay(w.probeFailures, 0, w.cfg.RetryInitial, w.cfg.RetryMax, 0, 0)
 	return !now.Before(w.lastProbeAt.Add(wait))
 }
 
-// probe asks the deliverer whether Slack is usable and applies the outcome:
-// a success clears the failure window, reactivates configuration-blocked
-// intents, and moves any open gap into replay; a failure keeps the window
-// continuous.
+// probe asks the deliverer whether Slack is reachable with this
+// installation's token and applies the outcome: a success reactivates
+// configuration-blocked intents (once per process) and moves any open gap
+// into replay; a retryable failure keeps the window continuous.
+//
+// A successful probe is TOKEN readiness, not delivery health: Probe is
+// auth.test, which says nothing about whether chat.postMessage or
+// chat.update work. It therefore never clears the continuous-failure
+// window — only an actual delivery success does (acknowledgeDelivered).
+// Otherwise a partial outage with auth healthy would reset the window on
+// every probe, the mandatory five-minute gap could never open, and a gap
+// could be declared recovered while writes still fail (review round 1,
+// R1-F4). Moving an open gap into replay on a probe is still right: while
+// a gap is open nothing is claimable, so the probe is the only signal;
+// once replaying, the recovery notice's own retries are the write-health
+// probe and gate the backlog until one lands.
 func (w *NotificationWorker) probe(ctx context.Context, state SlackDeliveryState, now time.Time) {
 	w.mu.Lock()
 	w.probedOnce = true
@@ -641,7 +644,7 @@ func (w *NotificationWorker) probe(ctx context.Context, state SlackDeliveryState
 		w.mu.Unlock()
 		w.count(func(s *NotificationWorkerStats) { s.ProbeFailures++ })
 		class, code, _ := classifyDeliveryFailure(err)
-		if class.isSlackOutcome() {
+		if class.anchorsFailureWindow() {
 			w.observeFailure(ctx, state, code, now)
 		}
 		return
@@ -650,9 +653,6 @@ func (w *NotificationWorker) probe(ctx context.Context, state SlackDeliveryState
 	w.mu.Lock()
 	w.probeFailures = 0
 	w.mu.Unlock()
-	if err := w.store.ObserveSlackSuccess(ctx, now); err != nil {
-		w.logger.Error("situation: notification worker: record slack success failed", "err", err)
-	}
 	if _, err := w.ReactivateConfiguration(ctx); err != nil {
 		w.logger.Error("situation: notification worker: reactivate configuration-blocked intents failed", "err", err)
 	}
@@ -725,6 +725,13 @@ func (w *NotificationWorker) ReactivateConfiguration(ctx context.Context) (int, 
 // observeFailure records one Slack failure against the continuous window and
 // emits the bounded WARNs the console action trail expects: one on the first
 // failure of a window, then paced retry WARNs — never one per attempt.
+// observeFailure records one outage-evidence failure (anchorsFailureWindow)
+// and, when it lands at least the gap threshold after the window's anchor
+// with no delivery success in between, opens the Delivery-gap generation.
+// spec.md: "If failures remain continuous for five minutes" — continuity
+// is proven by a FAILURE that far into the window, never inferred from the
+// absence of a success: a single failure followed by five quiet minutes
+// (a retry not yet due, a process that was down) is an ordinary delay.
 func (w *NotificationWorker) observeFailure(ctx context.Context, state SlackDeliveryState, code string, now time.Time) {
 	if err := w.store.ObserveSlackFailure(ctx, code, now); err != nil {
 		w.logger.Error("situation: notification worker: record slack failure failed", "err", err)
@@ -737,6 +744,18 @@ func (w *NotificationWorker) observeFailure(ctx context.Context, state SlackDeli
 		w.logger.Warn("situation: notification worker: slack delivery failing; effects are delayed",
 			"error_class", code)
 		return
+	}
+	if opened, err := w.store.OpenDueDeliveryGap(ctx, now, w.cfg.GapThreshold); err != nil {
+		w.logger.Error("situation: notification worker: open delivery gap failed", "err", err)
+	} else if opened {
+		w.count(func(s *NotificationWorkerStats) { s.GapsOpened++ })
+		w.auditAppend(ctx, auditKindGapOpened, map[string]any{
+			"first_failure_at":  state.FirstFailureAt.UTC().Format(time.RFC3339Nano),
+			"continuous_for_ms": now.Sub(*state.FirstFailureAt).Milliseconds(),
+		})
+		w.logger.Warn("situation: notification worker: slack delivery gap opened",
+			"first_failure_at", state.FirstFailureAt.Format(time.RFC3339),
+			"continuous_for", now.Sub(*state.FirstFailureAt).String())
 	}
 	w.mu.Lock()
 	due := now.Sub(w.lastWarnAt) >= notificationWarnCadence
@@ -880,11 +899,10 @@ func (w *NotificationWorker) acknowledgeFailure(ctx context.Context, claim Notif
 	if stateErr != nil {
 		w.logger.Error("situation: notification worker: read slack delivery state failed", "err", stateErr)
 	}
-	if class.isSlackOutcome() {
-		// Only a real Slack answer moves the dependency-health window. An
-		// invalid payload is this build's own bug, and a local data-state
-		// condition never reached the wire; neither may open a Delivery
-		// gap or report an outage that is not happening.
+	if class.anchorsFailureWindow() {
+		// Only a retryable/uncertain Slack answer moves the dependency-
+		// health window (anchorsFailureWindow): nothing else may open a
+		// Delivery gap or report an outage that is not happening.
 		w.observeFailure(ctx, state, code, now)
 	}
 

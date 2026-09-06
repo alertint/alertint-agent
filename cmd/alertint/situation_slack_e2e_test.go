@@ -250,8 +250,9 @@ type e2eFixture struct {
 	// controller cycle runs under. Empty (the default) is "no floor".
 	slackFloor model.InterruptionPriority
 
-	worker *situation.NotificationWorker
-	l2     *e2eAssessmentClient
+	deliverer *SituationDeliverer
+	worker    *situation.NotificationWorker
+	l2        *e2eAssessmentClient
 }
 
 func newE2EFixture(t *testing.T) *e2eFixture {
@@ -270,11 +271,20 @@ func newE2EFixture(t *testing.T) *e2eFixture {
 	})
 	deliverer := NewSituationDeliverer(st, client, e2eChannel, clock.Now)
 
-	f := &e2eFixture{t: t, ctx: ctx, st: st, clock: clock, slack: fake, l2: &e2eAssessmentClient{}}
-	f.worker = situation.NewNotificationWorker(st, deliverer,
-		situation.NotificationWorkerConfig{Owner: e2eOwner + ":notify"}, clock.Now,
-		slog.New(slog.DiscardHandler))
+	f := &e2eFixture{t: t, ctx: ctx, st: st, clock: clock, slack: fake, deliverer: deliverer, l2: &e2eAssessmentClient{}}
+	f.restartWorker()
 	return f
+}
+
+// restartWorker replaces the notification worker with a fresh one over the
+// same Store and deliverer — what a process restart with corrected
+// configuration looks like to the durable ledger (the worker applies its
+// configuration correction exactly once per process).
+func (f *e2eFixture) restartWorker() {
+	f.t.Helper()
+	f.worker = situation.NewNotificationWorker(f.st, f.deliverer,
+		situation.NotificationWorkerConfig{Owner: e2eOwner + ":notify"}, f.clock.Now,
+		slog.New(slog.DiscardHandler))
 }
 
 // e2eAssessmentClient answers every L2 dispatch with one accepted, schema-
@@ -1306,5 +1316,144 @@ func TestSituationSlackE2ESupersededSuccessfulFirstPostDoesNotCreateSecondRoot(t
 	}
 	if remaining := len(f.pendingBesidesDelivered()); remaining != 0 {
 		t.Fatalf("%d effect(s) still owed once the queue drained%s", remaining, f.intentSummary())
+	}
+}
+
+// ----------------------------------------------------------------------
+// 10. A successful auth.test is token readiness, not delivery health: with
+//     writes failing continuously the five-minute Delivery gap still opens
+//     (review round 1, R1-F4).
+// ----------------------------------------------------------------------
+
+func TestSituationSlackE2EAuthSuccessDoesNotEraseContinuousWriteFailure(t *testing.T) {
+	f := newE2EFixture(t)
+	f.seed("group=e2e-write-outage")
+	f.slack.setScript(func(method string, _ *e2eSlackCall) e2eSlackReply {
+		if method == "auth.test" {
+			return e2eSlackReply{}
+		}
+		return e2eSlackReply{HTTPStatus: http.StatusServiceUnavailable}
+	})
+	for i := 0; i < 8; i++ {
+		f.deliverRound()
+		f.clock.advance(time.Minute)
+	}
+	failed := 0
+	for _, c := range f.slack.snapshot() {
+		if c.Method == "chat.postMessage" && !c.Accepted {
+			failed++
+		}
+	}
+	if failed < 2 {
+		t.Fatal("fixture did not repeatedly fail actual writes")
+	}
+	if n := f.scalarInt(`SELECT COUNT(*) FROM slack_delivery_gaps`); n == 0 {
+		t.Fatalf("%d write failures over 8 minutes but no Delivery gap; a successful auth.test must not reset the failure anchor", failed)
+	}
+}
+
+// ----------------------------------------------------------------------
+// 12. A recovery notice that keeps failing holds the backlog and opens no
+//     second generation for the same outage; the notice is the write-health
+//     probe (review round 1, R1-F4).
+// ----------------------------------------------------------------------
+
+func TestSituationSlackE2ERecoveryNoticeFailureHoldsTheBacklog(t *testing.T) {
+	f := newE2EFixture(t)
+	f.slack.setScript(alwaysStatus(http.StatusServiceUnavailable, 0))
+	sitID := f.seed("group=e2e-notice-fails")
+	f.deliverRound()
+	for elapsed := time.Duration(0); elapsed < 6*time.Minute; elapsed += time.Minute {
+		f.clock.advance(time.Minute)
+		f.deliverRound()
+	}
+	if gaps := f.scalarInt(`SELECT COUNT(*) FROM slack_delivery_gaps`); gaps != 1 {
+		t.Fatalf("delivery gap generations = %d, want 1%s", gaps, f.intentSummary())
+	}
+
+	// The token comes back but writes do not: the probe recovers the
+	// generation, and the recovery notice then fails on every attempt.
+	f.slack.setScript(func(method string, _ *e2eSlackCall) e2eSlackReply {
+		if method == "auth.test" {
+			return e2eSlackReply{}
+		}
+		return e2eSlackReply{HTTPStatus: http.StatusServiceUnavailable}
+	})
+	for i := 0; i < 12; i++ {
+		f.clock.advance(time.Minute)
+		f.deliverRound()
+	}
+	if got := f.scalarInt(`SELECT COUNT(*) FROM slack_delivery_gaps WHERE status = 'replaying'`); got != 1 {
+		t.Fatalf("replaying generations = %d, want the recovered one%s", got, f.intentSummary())
+	}
+	if gaps := f.scalarInt(`SELECT COUNT(*) FROM slack_delivery_gaps`); gaps != 1 {
+		t.Fatalf("delivery gap generations = %d after twelve more failing minutes, want still 1: the same outage never opens a second generation%s", gaps, f.intentSummary())
+	}
+	if accepted := len(f.slack.accepted()); accepted != 0 {
+		t.Fatalf("%d message(s) reached Slack while the recovery notice was still failing; the notice must precede the backlog", accepted)
+	}
+	notices := f.intentsOfClass("installation_gap_recovery")
+	if len(notices) != 1 || notices[0].Status != "pending" {
+		t.Fatalf("recovery notices = %+v, want exactly one, still pending (retrying indefinitely)", notices)
+	}
+
+	// Writes come back: the notice lands first, then the backlog replays
+	// in order and the generation completes.
+	f.slack.setScript(alwaysOK)
+	f.clock.advance(6 * time.Minute)
+	f.deliverUntilQuiet(40)
+	calls := f.slack.accepted()
+	if len(calls) == 0 || !strings.Contains(calls[0].Text, "AlertINT's Slack delivery was interrupted") {
+		t.Fatalf("the first accepted message is not the recovery notice; accepted = %d", len(calls))
+	}
+	_, rootTS := f.rootCoordinates(sitID)
+	if rootTS == "" {
+		t.Fatal("the Situation's root never published after the notice landed")
+	}
+	assertJournalRepliesInSequenceOrder(t, f, sitID, rootTS)
+	if got := f.scalarInt(`SELECT COUNT(*) FROM slack_delivery_gaps WHERE status = 'complete'`); got != 1 {
+		t.Fatalf("complete generations = %d, want 1%s", got, f.intentSummary())
+	}
+	if failing := f.scalarInt(`SELECT COUNT(*) FROM slack_delivery_state WHERE first_failure_at IS NOT NULL`); failing != 0 {
+		t.Fatal("the failure window is still open after deliveries succeeded")
+	}
+}
+
+// ----------------------------------------------------------------------
+// 13. A blocked channel with a valid token is configuration, not an
+//     outage: effects block, no Delivery gap ever opens, and correcting
+//     the configuration delivers them (review round 1, R1-F4).
+// ----------------------------------------------------------------------
+
+func TestSituationSlackE2EBlockedChannelOpensNoGap(t *testing.T) {
+	f := newE2EFixture(t)
+	f.slack.setScript(func(method string, _ *e2eSlackCall) e2eSlackReply {
+		if method == "auth.test" {
+			return e2eSlackReply{}
+		}
+		return e2eSlackReply{ErrorCode: "channel_not_found"}
+	})
+	f.seed("group=e2e-blocked-channel")
+	for i := 0; i < 8; i++ {
+		f.deliverRound()
+		f.clock.advance(time.Minute)
+	}
+	if blocked := f.scalarInt(`SELECT COUNT(*) FROM notification_intents WHERE status = 'blocked_configuration'`); blocked == 0 {
+		t.Fatalf("no intent reached blocked_configuration%s", f.intentSummary())
+	}
+	if gaps := f.scalarInt(`SELECT COUNT(*) FROM slack_delivery_gaps`); gaps != 0 {
+		t.Fatalf("delivery gap generations = %d, want 0: a configuration rejection is not a Slack outage%s", gaps, f.intentSummary())
+	}
+	if failing := f.scalarInt(`SELECT COUNT(*) FROM slack_delivery_state WHERE first_failure_at IS NOT NULL`); failing != 0 {
+		t.Fatal("a configuration rejection anchored the continuous-failure window")
+	}
+	// With a valid token the worker already applied its one per-process
+	// configuration correction when the blocks appeared; corrected
+	// configuration means a restart.
+	f.slack.setScript(alwaysOK)
+	f.restartWorker()
+	f.deliverUntilQuiet(12)
+	if remaining := len(f.pendingBesidesDelivered()); remaining != 0 {
+		t.Fatalf("%d intent(s) still owed after corrected configuration%s", remaining, f.intentSummary())
 	}
 }

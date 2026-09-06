@@ -110,9 +110,11 @@ func NewSituationDeliverer(delivererStore DelivererStore, api slackDeliveryAPI, 
 	return &SituationDeliverer{store: delivererStore, api: api, channel: channel, now: now}
 }
 
-// Probe verifies Slack readiness (auth.test) — the readiness check Task 7's
+// Probe verifies TOKEN readiness (auth.test) — the readiness check Task 7's
 // gap lifecycle drives before recovery replay and before reactivating
-// configuration-blocked intents.
+// configuration-blocked intents. It proves the token can reach Slack and
+// nothing about chat.postMessage/chat.update, so the worker never treats a
+// successful probe as delivery health (NotificationWorker.probe).
 func (d *SituationDeliverer) Probe(ctx context.Context) error {
 	return d.api.AuthTest(ctx)
 }
