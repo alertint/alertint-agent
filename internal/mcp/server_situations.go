@@ -287,16 +287,19 @@ func (s *Server) handleGetSituation(ctx context.Context, req mcplib.CallToolRequ
 	// never reconstructed from current state — and slack_delivery always
 	// answers, saying "published: false" with no effects for a Situation that
 	// warranted no Slack at all.
-	episode, delivery, err := s.situationHistoryFor(ctx, sit.ID)
+	history, err := s.situationHistoryFor(ctx, sit.ID)
 	if err != nil {
 		return errResult("failed to get situation history"), nil
 	}
-	if episode == nil {
+	if history.Episode == nil {
 		payload["episode"] = nil
 	} else {
-		payload["episode"] = episode
+		payload["episode"] = history.Episode
 	}
-	payload["slack_delivery"] = delivery
+	payload["slack_delivery"] = history.Delivery
+	// R2: recorded after closure, never journaled, never lost. An empty
+	// array, never null — "none" is an answer, not an absence.
+	payload["artifacts_recorded_after_closure"] = history.Artifacts
 
 	result, err := mcplib.NewToolResultJSON(payload)
 	if err != nil {
@@ -313,10 +316,13 @@ func (s *Server) handleGetSituation(ctx context.Context, req mcplib.CallToolRequ
 // join, never a reconstruction of history from current state:
 //
 //   - alertint_get_situation gains "episode" (the current Episode summary
-//     read in one snapshot with the exact Transition it was folded from) and
+//     read in one snapshot with the exact Transition it was folded from),
 //     "slack_delivery" (the current root coordinates plus every durable
 //     effect's status, including the withheld/superseded/delayed decisions
-//     that are durable rows rather than absent ones);
+//     that are durable rows rather than absent ones), and
+//     "artifacts_recorded_after_closure" (R2's operator artifacts that
+//     reached an already-terminal owner: recorded, never journaled, and
+//     otherwise invisible from the Situation they name);
 //   - alertint_list_situation_transitions pages the immutable Transition
 //     journal by a stable (sequence, id) cursor; and
 //   - alertint_get_delivery_state exposes the installation-level Slack
@@ -327,6 +333,18 @@ func (s *Server) handleGetSituation(ctx context.Context, req mcplib.CallToolRequ
 // Slack response, provider error body, or SQL text. The last of those is the
 // reason every failure path returns a fixed generic message.
 // ----------------------------------------------------------------------
+
+// maxSituationTransitionPage mirrors internal/store's own
+// maxSituationHistoryPage: the largest Transition page this tool will ever
+// return, and the value an oversized `limit` is clamped to. It is stated
+// here as well as in the store because the handler's own cursor gate
+// compares against the limit it actually used — the two must agree or a
+// clamped page would advertise itself as the last one.
+// defaultSituationTransitionPage is what an absent or nonsensical limit gets.
+const (
+	maxSituationTransitionPage     = 100
+	defaultSituationTransitionPage = 50
+)
 
 func (s *Server) toolListSituationTransitions() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 	tool := mcplib.NewTool("alertint_list_situation_transitions",
@@ -506,12 +524,16 @@ type situationDeliveryRow struct {
 // state through Task 5's bounded readers. A Situation with no Transition yet
 // legitimately has no episode at all: that renders as an explicit null, never
 // as history reconstructed from current state.
-func (s *Server) situationHistoryFor(ctx context.Context, situationID string) (*situationEpisodeRow, situationDeliveryRow, error) {
-	delivery := situationDeliveryRow{Effects: []situationEffectRow{}}
+func (s *Server) situationHistoryFor(ctx context.Context, situationID string) (situationHistoryView, error) {
+	view := situationHistoryView{
+		Delivery:  situationDeliveryRow{Effects: []situationEffectRow{}},
+		Artifacts: []store.OwnerTerminalArtifact{},
+	}
+	delivery := &view.Delivery
 
 	channel, messageTS, published, err := s.st.GetSituationRootCoordinates(ctx, situationID)
 	if err != nil {
-		return nil, delivery, err
+		return view, err
 	}
 	delivery.Published = published
 	if published {
@@ -520,21 +542,46 @@ func (s *Server) situationHistoryFor(ctx context.Context, situationID string) (*
 	}
 	intents, err := s.st.ListSituationNotificationIntents(ctx, situationID, 0)
 	if err != nil {
-		return nil, delivery, err
+		return view, err
 	}
 	for _, intent := range intents {
 		delivery.Effects = append(delivery.Effects, situationEffectRowFrom(intent))
 	}
 
-	view, err := s.st.GetSituationEpisodeView(ctx, situationID)
+	// R2: operator artifacts that reached this Situation after it had already
+	// terminalized. They are recorded, never journaled — the terminal Episode
+	// is immutable — so no Transition names them and they appear in no
+	// journal page. Without this list they would exist durably and be
+	// invisible from the Situation they were written against.
+	artifacts, err := s.st.ListOwnerTerminalArtifacts(ctx, situationID, 0)
+	if err != nil {
+		return view, err
+	}
+	if len(artifacts) > 0 {
+		view.Artifacts = artifacts
+	}
+
+	episodeView, err := s.st.GetSituationEpisodeView(ctx, situationID)
 	if errors.Is(err, store.ErrNotFound) {
-		return nil, delivery, nil
+		return view, nil
 	}
 	if err != nil {
-		return nil, delivery, err
+		return view, err
 	}
-	episode := situationEpisodeRowFrom(view)
-	return &episode, delivery, nil
+	episode := situationEpisodeRowFrom(episodeView)
+	view.Episode = &episode
+	return view, nil
+}
+
+// situationHistoryView bundles the three bounded history reads
+// alertint_get_situation renders: the current Episode projection (nil when
+// the Situation has no Transition yet — history is never reconstructed from
+// current state), the Situation's whole Slack presence, and R2's
+// after-closure operator artifacts.
+type situationHistoryView struct {
+	Episode   *situationEpisodeRow
+	Delivery  situationDeliveryRow
+	Artifacts []store.OwnerTerminalArtifact
 }
 
 // transitionCursorRow is the stable page position a caller resumes from.
@@ -548,9 +595,17 @@ func (s *Server) handleListSituationTransitions(ctx context.Context, req mcplib.
 	if failed != nil {
 		return failed, nil
 	}
-	limit := mcplib.ParseInt(req, "limit", 50)
+	// BOTH bounds are clamped here, not only the lower one. The Store's own
+	// ListSituationTransitions clamps internally too, so an unclamped
+	// oversized limit would come back short while this handler's
+	// `len(rows) == limit` cursor gate went false — handing the caller a
+	// truncated journal with next_cursor: null, which reads as "complete".
+	limit := mcplib.ParseInt(req, "limit", defaultSituationTransitionPage)
 	if limit < 1 {
-		limit = 50
+		limit = defaultSituationTransitionPage
+	}
+	if limit > maxSituationTransitionPage {
+		limit = maxSituationTransitionPage
 	}
 	cursor := store.TransitionCursor{
 		Sequence: mcplib.ParseInt(req, "cursor_sequence", 0),

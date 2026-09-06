@@ -374,21 +374,47 @@ func TestTelemetryAuditKindsMatchTheAuditCatalog(t *testing.T) {
 			t.Errorf("internal/situation emits %q, which internal/audit's catalog does not name", kind)
 		}
 	}
-	// The two the stdout stream worker owns complete the catalog; nothing
-	// else may be left unclaimed.
+	// Every catalog name must be claimed by some emitter — except the ones
+	// explicitly listed below as knowingly unemitted, which is the ONLY way
+	// this assertion stays honest: silently folding an unemitted name into
+	// the claimed set would make "no catalog name is unclaimed" unable to
+	// catch the very thing it exists to catch.
 	claimed := map[string]bool{
+		// Emitted by internal/notify/stdout's TransitionStreamWorker.
 		audit.KindTransitionStreamEmitted: true,
 		audit.KindTransitionStreamFailed:  true,
-		// R2's owner_terminal event belongs to the input-application path
-		// (internal/store), which records the artifact without journaling it.
-		audit.KindHistoryArtifactOwnerTerminal: true,
 	}
 	for _, kind := range situation.AuditKindsEmittedHere() {
 		claimed[kind] = true
 	}
+	// RESERVED, NOT YET EMITTED. R2's owner-terminal outcome is decided inside
+	// Store.ApplySituationInput, which returns only an error — no caller can
+	// tell that outcome from an ordinary attach, and neither the store nor
+	// the input worker has an audit seam. Wiring it requires widening that
+	// function's return contract (Plan 3's input-application boundary, closed
+	// and reviewed in an earlier task), so it is a tracked follow-up. The
+	// name is catalogued because spec.md's event list requires it; it is
+	// listed HERE, separately and by name, so this test says out loud that it
+	// has no emitter rather than pretending it has one.
+	knownUnemitted := map[string]string{
+		audit.KindHistoryArtifactOwnerTerminal: "follow-up: needs Store.ApplySituationInput to report its R2 outcome",
+	}
 	for kind := range catalog {
-		if !claimed[kind] {
-			t.Errorf("catalog names %q but no emitter claims it", kind)
+		if claimed[kind] {
+			continue
+		}
+		if why, ok := knownUnemitted[kind]; ok {
+			t.Logf("catalog name %q is reserved with no emitter (%s)", kind, why)
+			continue
+		}
+		t.Errorf("catalog names %q but no emitter claims it", kind)
+	}
+	// The reserved list must stay a list of genuinely unemitted names: if an
+	// emitter ever appears for one, this fails so the entry is removed rather
+	// than left as a stale excuse.
+	for kind := range knownUnemitted {
+		if claimed[kind] {
+			t.Errorf("%q is listed as unemitted but an emitter now claims it; drop it from knownUnemitted", kind)
 		}
 	}
 }

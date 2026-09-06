@@ -550,6 +550,11 @@ type notificationRecovery struct {
 //  5. reactivate eligible configuration-blocked intents; and
 //  6. perform stale-root supersession and resume ordered recovery replay.
 //
+// Step 6's supersession half runs unconditionally; step 5 and step 6's replay
+// half are the only two pieces that require the Slack probe to have
+// succeeded, because only a corrected configuration may reactivate a blocked
+// intent and only a live Slack may move a gap generation into replay.
+//
 // It publishes nothing. Steps 3 and 6 only pull a Situation's next
 // assessment forward, so the ordinary controller path decides — under the
 // ordinary materiality and publication rules — whether anything is committed
@@ -592,11 +597,35 @@ func (r *notificationRuntime) RecoverAndReactivate(ctx context.Context, now time
 	report.ConfigurationGeneration = state.ConfigurationGeneration
 	report.BlockedConfigurationRetained = state.BlockedConfigurationCount
 
-	if !report.SlackConfigurationValid {
-		return report, nil
+	// Step 5 — gated: only a CORRECTED Slack configuration may return a
+	// blocked intent to pending, and a failed probe has not corrected
+	// anything. The worker's own first successful probe applies it later if
+	// Slack comes back within this process's lifetime.
+	if report.SlackConfigurationValid {
+		if err := r.reactivateConfiguration(ctx, &report); err != nil {
+			return report, err
+		}
 	}
-	if err := r.reactivateAndResume(ctx, now, &report); err != nil {
-		return report, err
+
+	// Step 6a — UNCONDITIONAL. Stale-root supersession scheduling is
+	// publication-free and touches only durable root-supersession state, so
+	// it needs no reachable Slack at all. It is also startup-only with no
+	// steady-state equivalent, so gating it on the probe would let one
+	// transient boot-time Slack blip skip it for the whole process lifetime.
+	staleRoots, err := r.store.ScheduleSituationsWithStaleRootProjection(ctx, now)
+	if err != nil {
+		return report, fmt.Errorf("situation notifications: schedule situations with a stale root projection: %w", err)
+	}
+	report.ScheduledStaleRoot = staleRoots
+
+	// Step 6b — gated: a gap generation may only move to replaying once
+	// Slack actually answers again. Unlike step 6a this HAS a steady-state
+	// equivalent — the worker's probe loop calls RecoverDeliveryGap on every
+	// successful probe — so skipping it here costs latency, never coverage.
+	if report.SlackConfigurationValid {
+		if err := r.resumeGapReplay(ctx, now, &report); err != nil {
+			return report, err
+		}
 	}
 	return report, nil
 }
@@ -617,28 +646,30 @@ func (r *notificationRuntime) validateSlackConfiguration(ctx context.Context) bo
 	return true
 }
 
-// reactivateAndResume is startup steps 5 and 6, reached only once the Slack
-// configuration has actually validated.
-func (r *notificationRuntime) reactivateAndResume(ctx context.Context, now time.Time, report *notificationRecovery) error {
-	if r.worker != nil {
-		// Exactly once per process (the worker's own one-shot guard makes
-		// this idempotent against its first steady-state probe, whichever
-		// runs first).
-		n, err := r.worker.ReactivateConfiguration(ctx)
-		if err != nil {
-			return fmt.Errorf("situation notifications: reactivate configuration-blocked intents: %w", err)
-		}
-		report.Reactivated = n
-		if n > 0 && report.BlockedConfigurationRetained >= n {
-			report.BlockedConfigurationRetained -= n
-		}
+// reactivateConfiguration is startup step 5: return every eligible
+// configuration-blocked intent to pending under a fresh configuration
+// generation, exactly once per process (the worker's own one-shot guard makes
+// this idempotent against its first steady-state probe, whichever runs
+// first). A no-Slack build has no worker and nothing to reactivate.
+func (r *notificationRuntime) reactivateConfiguration(ctx context.Context, report *notificationRecovery) error {
+	if r.worker == nil {
+		return nil
 	}
-	staleRoots, err := r.store.ScheduleSituationsWithStaleRootProjection(ctx, now)
+	n, err := r.worker.ReactivateConfiguration(ctx)
 	if err != nil {
-		return fmt.Errorf("situation notifications: schedule situations with a stale root projection: %w", err)
+		return fmt.Errorf("situation notifications: reactivate configuration-blocked intents: %w", err)
 	}
-	report.ScheduledStaleRoot = staleRoots
+	report.Reactivated = n
+	if n > 0 && report.BlockedConfigurationRetained >= n {
+		report.BlockedConfigurationRetained -= n
+	}
+	return nil
+}
 
+// resumeGapReplay is startup step 6's replay half: move a generation left
+// open by the previous process into replaying now that Slack has answered,
+// rather than waiting for the worker's first steady-state probe.
+func (r *notificationRuntime) resumeGapReplay(ctx context.Context, now time.Time, report *notificationRecovery) error {
 	generation, resumed, err := r.store.RecoverDeliveryGap(ctx, now)
 	if err != nil {
 		return fmt.Errorf("situation notifications: resume delivery gap replay: %w", err)

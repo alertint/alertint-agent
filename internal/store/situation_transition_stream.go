@@ -45,6 +45,14 @@ type TransitionStreamClaim struct {
 	Transition situationmodel.Transition
 	ClaimOwner string
 	ClaimToken int64
+	// AttemptCount is the row's durable attempt count INCLUDING this claim
+	// (claiming increments it). It is what a worker's retry schedule must
+	// key off — the same role situation.NotificationClaim.Intent.AttemptCount
+	// plays for the notification worker. Keying a backoff off the
+	// Transition's sequence instead would make a Situation's first
+	// Transition retry at the initial delay forever while a later one
+	// started at the cap.
+	AttemptCount int
 }
 
 // ClaimTransitionStream leases up to limit due, pending stream rows in one
@@ -121,7 +129,7 @@ func (s *Store) ClaimTransitionStream(ctx context.Context, owner string, now tim
 func loadClaimedTransitionStreamTx(ctx context.Context, tx *sql.Tx, ids []string, owner string) ([]TransitionStreamClaim, error) {
 	placeholders, args := inPlaceholders(ids)
 	rows, err := tx.QueryContext(ctx, `
-		SELECT st.id, st.claim_token, `+prefixedTransitionColumns+`
+		SELECT st.id, st.claim_token, st.attempt_count, `+prefixedTransitionColumns+`
 		FROM situation_transition_stream st
 		JOIN situation_transitions t ON t.id = st.transition_id
 		WHERE st.id IN (`+placeholders+`)
@@ -134,7 +142,7 @@ func loadClaimedTransitionStreamTx(ctx context.Context, tx *sql.Tx, ids []string
 	out := make([]TransitionStreamClaim, 0, len(ids))
 	for rows.Next() {
 		claim := TransitionStreamClaim{ClaimOwner: owner}
-		tr, err := scanClaimedStreamEntry(rows, &claim.StreamID, &claim.ClaimToken)
+		tr, err := scanClaimedStreamEntry(rows, &claim.StreamID, &claim.ClaimToken, &claim.AttemptCount)
 		if err != nil {
 			return nil, err
 		}

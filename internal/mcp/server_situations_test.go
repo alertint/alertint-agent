@@ -175,6 +175,9 @@ func TestGetSituationByIDExactContract(t *testing.T) {
 		// coherently with its source Transition (explicit null before any
 		// Transition exists) and the Situation's whole Slack presence.
 		"episode", "slack_delivery",
+		// R2: recorded after closure, never journaled — an empty array here,
+		// never null, for a Situation nothing was written against post-hoc.
+		"artifacts_recorded_after_closure",
 	}
 	if len(payload) != len(wantKeys) {
 		t.Fatalf("payload has %d keys, want exactly %d: %+v", len(payload), len(wantKeys), payload)
@@ -632,6 +635,34 @@ func TestSituationMCPTransitionJournalPagesByStableCursor(t *testing.T) {
 		t.Fatalf("next_cursor = %+v, want the last row's stable position", page.NextCursor)
 	}
 
+	// An over-large limit is clamped to the tool's advertised maximum, and —
+	// the part that matters — next_cursor must still signal that more data
+	// remains. Before this was clamped here, the Store's own internal clamp
+	// silently capped the page while the handler's `len(rows) == limit` gate
+	// went false, so an immutable journal LOOKED complete when it was not.
+	over, err := s.handleListSituationTransitions(context.Background(),
+		reqWith(map[string]any{"id": situationID, "limit": 1000}))
+	if err != nil || over.IsError {
+		t.Fatalf("over-large limit errored: %v %s", err, resultText(t, over))
+	}
+	var overPage struct {
+		Transitions []struct {
+			Sequence int `json:"sequence"`
+		} `json:"transitions"`
+		NextCursor *struct {
+			Sequence int `json:"sequence"`
+		} `json:"next_cursor"`
+	}
+	if err := json.Unmarshal([]byte(resultText(t, over)), &overPage); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if len(overPage.Transitions) != 5 {
+		t.Fatalf("over-large limit returned %d transitions, want all 5", len(overPage.Transitions))
+	}
+	if overPage.NextCursor != nil {
+		t.Fatalf("next_cursor = %+v when the whole ledger fits, want null", overPage.NextCursor)
+	}
+
 	res2, err := s.handleListSituationTransitions(context.Background(), reqWith(map[string]any{
 		"id": situationID, "limit": 10,
 		"cursor_sequence": page.NextCursor.Sequence, "cursor_id": page.NextCursor.ID,
@@ -653,6 +684,71 @@ func TestSituationMCPTransitionJournalPagesByStableCursor(t *testing.T) {
 	}
 	if page2.NextCursor != nil {
 		t.Fatalf("next_cursor = %+v on the final page, want null", page2.NextCursor)
+	}
+}
+
+// TestSituationMCPTransitionJournalClampsAnOverLargeLimitAndStillPages is the
+// finding-#1 regression: with MORE rows than the clamp, an over-large limit
+// must return exactly the clamped page AND a next_cursor, so a caller can
+// never mistake a truncated page for a complete journal.
+func TestSituationMCPTransitionJournalClampsAnOverLargeLimitAndStillPages(t *testing.T) {
+	st := newMCPStore(t)
+	at := time.Date(2026, 9, 5, 10, 0, 0, 0, time.UTC)
+	situationID := seedSituationForMCP(t, st, "inc-clamp", "service=clamp", "incident_created", at)
+	seedSituationHistoryForMCP(t, st, situationID, at, maxSituationTransitionPage+5)
+
+	s := NewServer(Config{}, st, audit.New(st.DB()))
+	res, err := s.handleListSituationTransitions(context.Background(),
+		reqWith(map[string]any{"id": situationID, "limit": 1000}))
+	if err != nil || res.IsError {
+		t.Fatalf("list transitions errored: %v %s", err, resultText(t, res))
+	}
+	var page struct {
+		Transitions []struct {
+			ID       string `json:"id"`
+			Sequence int    `json:"sequence"`
+		} `json:"transitions"`
+		NextCursor *struct {
+			Sequence int    `json:"sequence"`
+			ID       string `json:"id"`
+		} `json:"next_cursor"`
+	}
+	if err := json.Unmarshal([]byte(resultText(t, res)), &page); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if len(page.Transitions) != maxSituationTransitionPage {
+		t.Fatalf("limit 1000 returned %d transitions, want the clamped %d",
+			len(page.Transitions), maxSituationTransitionPage)
+	}
+	if page.NextCursor == nil {
+		t.Fatal("next_cursor is null on a clamped page; the caller cannot tell the journal is incomplete")
+	}
+	if page.NextCursor.Sequence != maxSituationTransitionPage {
+		t.Errorf("next_cursor sequence = %d, want %d", page.NextCursor.Sequence, maxSituationTransitionPage)
+	}
+
+	// Resuming from it returns the remainder and then stops.
+	rest, err := s.handleListSituationTransitions(context.Background(), reqWith(map[string]any{
+		"id": situationID, "limit": 1000,
+		"cursor_sequence": page.NextCursor.Sequence, "cursor_id": page.NextCursor.ID,
+	}))
+	if err != nil || rest.IsError {
+		t.Fatalf("second page errored: %v %s", err, resultText(t, rest))
+	}
+	var restPage struct {
+		Transitions []struct {
+			Sequence int `json:"sequence"`
+		} `json:"transitions"`
+		NextCursor *struct{} `json:"next_cursor"`
+	}
+	if err := json.Unmarshal([]byte(resultText(t, rest)), &restPage); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if len(restPage.Transitions) != 5 {
+		t.Fatalf("remainder = %d transitions, want 5", len(restPage.Transitions))
+	}
+	if restPage.NextCursor != nil {
+		t.Error("next_cursor is non-null on the final page")
 	}
 }
 
@@ -818,5 +914,104 @@ func TestSituationMCPHistoryIsAbsentNotFabricated(t *testing.T) {
 	}
 	if !strings.Contains(resultText(t, res2), `"transitions":[]`) {
 		t.Errorf("journal for a Situation with no history = %s, want an empty array", resultText(t, res2))
+	}
+}
+
+// seedOwnerTerminalArtifactForMCP writes one operator artifact that reached
+// an already-terminal owner (R2): applied, recorded against that owner, and
+// deliberately never journaled — `journal_state = 'owner_terminal'`.
+func seedOwnerTerminalArtifactForMCP(t *testing.T, st *store.Store, situationID, incidentID string, at time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	res, err := st.DB().ExecContext(ctx, `
+		INSERT INTO incident_annotations (incident_id, kind, note, created_at)
+		VALUES (?, 'observation', 'operator note recorded after closure', ?)`,
+		incidentID, at.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		t.Fatalf("insert annotation: %v", err)
+	}
+	annotationID, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("annotation id: %v", err)
+	}
+	id := "input-owner-terminal-" + incidentID
+	if _, err := st.DB().ExecContext(ctx, `
+		INSERT INTO situation_input_outbox (
+			id, idempotency_key, incident_id, kind, group_key, occurred_at, status,
+			applied_situation_id, applied_at, applied_input_version, annotation_id, journal_state
+		) VALUES (?, ?, ?, 'operator_annotation_recorded', 'service=closed', ?, 'applied', ?, ?, 1, ?, 'owner_terminal')`,
+		id, "idem:"+id, incidentID, at.UTC().Format(time.RFC3339Nano),
+		situationID, at.UTC().Format(time.RFC3339Nano), annotationID); err != nil {
+		t.Fatalf("insert owner_terminal outbox row: %v", err)
+	}
+}
+
+// TestSituationMCPListsArtifactsRecordedAfterClosure is R2's completion-gate
+// requirement: an operator artifact applied after its Situation closed is
+// recorded as owner_terminal, never journaled, and must remain VISIBLE in the
+// Situation MCP view — not silently lost between the Incident surfaces and
+// the immutable Transition journal it was deliberately kept out of.
+func TestSituationMCPListsArtifactsRecordedAfterClosure(t *testing.T) {
+	st := newMCPStore(t)
+	at := time.Date(2026, 9, 5, 10, 0, 0, 0, time.UTC)
+	situationID := seedSituationForMCP(t, st, "inc-closed", "service=closed", "incident_created", at)
+	seedSituationHistoryForMCP(t, st, situationID, at, 1)
+	seedOwnerTerminalArtifactForMCP(t, st, situationID, "inc-closed", at.Add(time.Hour))
+
+	s := NewServer(Config{}, st, audit.New(st.DB()))
+	res, err := s.handleGetSituation(context.Background(), reqWith(map[string]any{"id": situationID}))
+	if err != nil || res.IsError {
+		t.Fatalf("get situation errored: %v %s", err, resultText(t, res))
+	}
+	raw := resultText(t, res)
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	artifacts, ok := payload["artifacts_recorded_after_closure"].([]any)
+	if !ok {
+		t.Fatalf("payload has no artifacts_recorded_after_closure array: %v", payload["artifacts_recorded_after_closure"])
+	}
+	if len(artifacts) != 1 {
+		t.Fatalf("artifacts_recorded_after_closure = %v, want exactly the one owner_terminal artifact", artifacts)
+	}
+	row, _ := artifacts[0].(map[string]any)
+	if row["kind"] != "operator_annotation_recorded" {
+		t.Errorf("artifact kind = %v", row["kind"])
+	}
+	if row["incident_id"] != "inc-closed" {
+		t.Errorf("artifact incident_id = %v, want inc-closed", row["incident_id"])
+	}
+	if row["annotation_id"] == nil {
+		t.Error("artifact carries no annotation id; the operator cannot follow it to the Incident surface")
+	}
+	if row["occurred_at"] == nil || row["applied_at"] == nil {
+		t.Errorf("artifact lost its instants: %v", row)
+	}
+	// It is recorded, never journaled: no Transition names it.
+	if _, ok := row["journaled_transition_id"]; ok {
+		t.Error("an owner_terminal artifact must never claim a journaling Transition")
+	}
+	for _, forbidden := range []string{"lease_owner", "claim_token", "SELECT "} {
+		if strings.Contains(raw, forbidden) {
+			t.Errorf("payload leaks %q", forbidden)
+		}
+	}
+}
+
+// TestSituationMCPArtifactsAfterClosureIsEmptyWhenNoneExist proves the
+// ordinary case renders as an empty array, never null and never an error.
+func TestSituationMCPArtifactsAfterClosureIsEmptyWhenNoneExist(t *testing.T) {
+	st := newMCPStore(t)
+	at := time.Date(2026, 9, 5, 10, 0, 0, 0, time.UTC)
+	situationID := seedSituationForMCP(t, st, "inc-open", "service=open", "incident_created", at)
+
+	s := NewServer(Config{}, st, audit.New(st.DB()))
+	res, err := s.handleGetSituation(context.Background(), reqWith(map[string]any{"id": situationID}))
+	if err != nil || res.IsError {
+		t.Fatalf("get situation errored: %v %s", err, resultText(t, res))
+	}
+	if !strings.Contains(resultText(t, res), `"artifacts_recorded_after_closure":[]`) {
+		t.Errorf("payload = %s, want an empty artifacts_recorded_after_closure array", resultText(t, res))
 	}
 }

@@ -74,6 +74,11 @@ func TestTransitionStreamClaimJoinsItsTransitionAndFencesAcknowledgement(t *test
 		if c.ClaimOwner != "stdout-a" || c.ClaimToken < 1 {
 			t.Errorf("claim %d fencing pair = (%q, %d)", i, c.ClaimOwner, c.ClaimToken)
 		}
+		// The claim carries the row's own durable attempt count (claiming
+		// increments it), which is what a worker's retry schedule keys off.
+		if c.AttemptCount != 1 {
+			t.Errorf("claim %d attempt count = %d, want 1 after the first claim", i, c.AttemptCount)
+		}
 	}
 
 	// A held lease is not re-claimable until it expires.
@@ -145,6 +150,9 @@ func TestTransitionStreamRetryFailAndRecoverExpiredClaims(t *testing.T) {
 	due, err := st.ClaimTransitionStream(ctx, "stdout-a", now.Add(time.Minute), time.Minute, 10)
 	if err != nil || len(due) != 1 {
 		t.Fatalf("claim after retry_at = %d rows, %v; want 1", len(due), err)
+	}
+	if due[0].AttemptCount != 2 {
+		t.Errorf("attempt count on the re-claim = %d, want 2 (it advances so the backoff does too)", due[0].AttemptCount)
 	}
 
 	// An abandoned lease is swept without changing status or attempt count.
@@ -376,5 +384,84 @@ func TestNotificationDeliveryStatsAreBoundedCounts(t *testing.T) {
 	}
 	if intents[0].EffectClass != "root_sync" {
 		t.Errorf("first intent = %q, want the root projection first", intents[0].EffectClass)
+	}
+}
+
+// TestListOwnerTerminalArtifactsReadsOnlyRecordedNeverJournaledOnes is R2's
+// read half: an artifact applied to an already-terminal owner is recorded
+// with journal_state='owner_terminal' and must surface here, while a pending
+// or journaled artifact — which the Transition journal already carries —
+// must not.
+func TestListOwnerTerminalArtifactsReadsOnlyRecordedNeverJournaledOnes(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "service=closed-owner", now)
+
+	var incidentID string
+	if err := st.db.QueryRowContext(ctx,
+		`SELECT incident_id FROM situation_incidents WHERE situation_id = ?`, sitID).Scan(&incidentID); err != nil {
+		t.Fatalf("read member incident: %v", err)
+	}
+	res, err := st.db.ExecContext(ctx, `
+		INSERT INTO incident_annotations (incident_id, kind, note, created_at)
+		VALUES (?, 'observation', 'recorded after closure', ?)`,
+		incidentID, canonicalTime(now))
+	if err != nil {
+		t.Fatalf("insert annotation: %v", err)
+	}
+	annotationID, err := res.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	insert := func(id, journalState string, at time.Time) {
+		t.Helper()
+		if _, err := st.db.ExecContext(ctx, `
+			INSERT INTO situation_input_outbox (
+				id, idempotency_key, incident_id, kind, group_key, occurred_at, status,
+				applied_situation_id, applied_at, applied_input_version, annotation_id, journal_state
+			) VALUES (?, ?, ?, 'operator_annotation_recorded', 'service=closed-owner', ?, 'applied', ?, ?, 1, ?, ?)`,
+			id, "idem:"+id, incidentID, canonicalTime(at), sitID, canonicalTime(at), annotationID, journalState); err != nil {
+			t.Fatalf("insert %s outbox row: %v", journalState, err)
+		}
+	}
+	insert("in-terminal-b", "owner_terminal", now.Add(2*time.Minute))
+	insert("in-terminal-a", "owner_terminal", now.Add(time.Minute))
+	insert("in-pending", "pending", now.Add(3*time.Minute))
+
+	artifacts, err := st.ListOwnerTerminalArtifacts(ctx, sitID, 0)
+	if err != nil {
+		t.Fatalf("ListOwnerTerminalArtifacts: %v", err)
+	}
+	if len(artifacts) != 2 {
+		t.Fatalf("artifacts = %+v, want exactly the two owner_terminal rows", artifacts)
+	}
+	if artifacts[0].InputID != "in-terminal-a" || artifacts[1].InputID != "in-terminal-b" {
+		t.Fatalf("order = %q,%q; want oldest first", artifacts[0].InputID, artifacts[1].InputID)
+	}
+	a := artifacts[0]
+	if a.Kind != "operator_annotation_recorded" || a.IncidentID != incidentID {
+		t.Errorf("artifact provenance = %+v", a)
+	}
+	if a.AnnotationID == nil || *a.AnnotationID != annotationID {
+		t.Errorf("annotation id = %v, want %d", a.AnnotationID, annotationID)
+	}
+	if a.VerdictID != nil {
+		t.Errorf("verdict id = %v on an annotation artifact", *a.VerdictID)
+	}
+	if a.OccurredAt.IsZero() || a.AppliedAt.IsZero() {
+		t.Errorf("artifact lost its instants: %+v", a)
+	}
+
+	// A Situation nothing was recorded against post-hoc reads as an empty
+	// slice, never nil — "none" is an answer.
+	other := newSituationForGroup(t, st, "service=untouched", now)
+	empty, err := st.ListOwnerTerminalArtifacts(ctx, other, 0)
+	if err != nil {
+		t.Fatalf("ListOwnerTerminalArtifacts (empty): %v", err)
+	}
+	if empty == nil || len(empty) != 0 {
+		t.Fatalf("artifacts for an untouched Situation = %v, want an empty slice", empty)
 	}
 }

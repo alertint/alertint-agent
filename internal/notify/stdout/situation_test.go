@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -142,6 +143,10 @@ func (f *tsFakeStore) ClaimTransitionStream(_ context.Context, owner string, now
 		r.leased = true
 		r.claim.ClaimOwner = owner
 		r.claim.ClaimToken++
+		// The real store increments attempt_count in the same claiming
+		// UPDATE; the fake must too, or the retry schedule under test would
+		// never advance.
+		r.claim.AttemptCount++
 		out = append(out, r.claim)
 	}
 	return out, nil
@@ -283,7 +288,8 @@ func (a *tsFakeAuditor) kinds() []string {
 
 func tsWorker(w *tsFailingWriter, st TransitionStreamStore, auditor TransitionStreamAuditSink) *TransitionStreamWorker {
 	clock := func() time.Time { return time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC) }
-	return NewTransitionStreamWorker(w, st, TransitionStreamConfig{Owner: "test-owner"}, auditor, clock, nil)
+	return NewTransitionStreamWorker(w, st, TransitionStreamConfig{Owner: "test-owner"}, auditor, clock,
+		slog.New(slog.DiscardHandler))
 }
 
 func tsLines(t *testing.T, out string) []map[string]any {
@@ -645,5 +651,63 @@ func TestSituationTransitionStreamEmitSpanUsesTheSituationScope(t *testing.T) {
 		if strings.Contains(value, tr.Journal.Headline) || strings.Contains(value, tr.Journal.Detail) {
 			t.Errorf("span attribute %q leaks journal prose", key)
 		}
+	}
+}
+
+// TestSituationTransitionStreamBacksOffByAttemptNotSequence pins the fix for
+// review finding #3: the retry schedule is keyed off the row's own durable
+// attempt count, exactly like the sibling notification worker's, NOT off the
+// Transition's sequence number.
+//
+// Keying it off sequence produced two opposite bugs at once: a Situation's
+// FIRST Transition (sequence 1) retried at the initial delay forever — a hot
+// loop against an unwritable stdout — while a Transition at sequence 6 or
+// beyond jumped straight to the cap on its very first failure, never trying
+// the fast retries that recover from a momentary blip.
+func TestSituationTransitionStreamBacksOffByAttemptNotSequence(t *testing.T) {
+	// A high-sequence Transition on its FIRST attempt must use the INITIAL
+	// delay, not the cap.
+	high := tsTransition(t, 9, model.LifecycleActive, model.ReasonAttentionChanged)
+	st := newTSFakeStore(high)
+	w := &tsFailingWriter{fail: true}
+	worker := tsWorker(w, st, nil)
+	if _, err := worker.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	row := st.snapshot()[0]
+	if row.retryAt == nil {
+		t.Fatal("no retry scheduled")
+	}
+	firstDelay := row.retryAt.Sub(worker.now())
+	if firstDelay != defaultStreamRetryInitial {
+		t.Fatalf("first attempt on a sequence-9 Transition scheduled %v out, want the initial %v "+
+			"(the schedule must key off attempt count, not sequence)", firstDelay, defaultStreamRetryInitial)
+	}
+
+	// A LOW-sequence Transition must still back off as its attempts pile up,
+	// rather than hammering at the initial delay forever.
+	low := tsTransition(t, 1, model.LifecycleActive, model.ReasonFirstAuthoritativeState)
+	st2 := newTSFakeStore(low)
+	w2 := &tsFailingWriter{fail: true}
+	worker2 := tsWorker(w2, st2, nil)
+	delays := make([]time.Duration, 0, 4)
+	for range 4 {
+		st2.rows[0].retryAt = nil
+		if _, err := worker2.RunOnce(context.Background()); err != nil {
+			t.Fatalf("RunOnce: %v", err)
+		}
+		r := st2.snapshot()[0]
+		if r.retryAt == nil {
+			t.Fatal("no retry scheduled")
+		}
+		delays = append(delays, r.retryAt.Sub(worker2.now()))
+	}
+	for i := 1; i < len(delays); i++ {
+		if delays[i] <= delays[i-1] {
+			t.Fatalf("delays = %v; a sequence-1 Transition must back off across attempts, not retry at a fixed interval", delays)
+		}
+	}
+	if delays[0] != defaultStreamRetryInitial {
+		t.Errorf("first delay = %v, want the initial %v", delays[0], defaultStreamRetryInitial)
 	}
 }

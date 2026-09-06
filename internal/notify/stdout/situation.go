@@ -397,7 +397,10 @@ func (w *TransitionStreamWorker) acknowledge(ctx context.Context, claim store.Tr
 		w.audit(ctx, AuditTransitionStreamFailed, claim, streamErrorInvalid)
 		return nil
 	default:
-		delay := streamRetryDelay(claim.Transition.Sequence, w.cfg.RetryInitial, w.cfg.RetryMax)
+		// The row's own durable attempt count, never the Transition's
+		// sequence: sequence is an ordering position with no relationship to
+		// how many times THIS row has failed.
+		delay := streamRetryDelay(claim.AttemptCount, w.cfg.RetryInitial, w.cfg.RetryMax)
 		if err := w.store.RetryTransitionStreamEntry(ctx, claim, streamErrorUnavailable, now.Add(delay)); err != nil {
 			w.noteClaimLoss(err)
 			return err

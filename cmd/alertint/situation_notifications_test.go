@@ -899,6 +899,23 @@ func TestSituationNotificationRuntimeStartupKeepsBlockedIntentsWhenSlackFails(t 
 			t.Error("a gap was recovered while Slack was still unreachable")
 		}
 	}
+	// Finding #4: the stale-root sweep is publication-free and touches only
+	// durable root-supersession state, so it must NOT be gated on the probe.
+	// It is startup-only with no steady-state equivalent, so skipping it on a
+	// transient boot-time Slack blip would mean it never runs again for this
+	// whole process lifetime.
+	sawStaleRootSweep := false
+	for _, phase := range tr.snapshot() {
+		if phase == "schedule_stale_root_projections" {
+			sawStaleRootSweep = true
+		}
+	}
+	if !sawStaleRootSweep {
+		t.Error("the stale-root sweep was skipped because the Slack probe failed; it needs no Slack at all")
+	}
+	if report.ScheduledStaleRoot != 1 {
+		t.Errorf("stale roots scheduled = %d, want 1 even with Slack unreachable", report.ScheduledStaleRoot)
+	}
 }
 
 // TestSituationNotificationRuntimeStartupWithoutSlackRetainsDurableWork
@@ -925,6 +942,9 @@ func TestSituationNotificationRuntimeStartupWithoutSlackRetainsDurableWork(t *te
 		"recover_transition_stream_claims",
 		"schedule_situations_missing_first_transition",
 		"read_slack_delivery_state",
+		// Publication-free and Slack-independent: it runs even with Slack
+		// switched off entirely (finding #4).
+		"schedule_stale_root_projections",
 	}
 	got := tr.snapshot()
 	if len(got) != len(want) {

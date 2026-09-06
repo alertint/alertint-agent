@@ -773,3 +773,87 @@ func readUncertainAndBlockedStatsTx(ctx context.Context, tx *sql.Tx, stats *Noti
 	}
 	return nil
 }
+
+// OwnerTerminalArtifact is one operator artifact that reached an
+// already-terminal Situation owner (R2): applied and recorded against that
+// owner, deliberately never journaled, and never lost.
+//
+// It carries provenance and instants only — the artifact's own content
+// (annotation note, verdict expectation) stays where it already lives, on
+// the Incident surfaces, which AnnotationID/VerdictID point at.
+type OwnerTerminalArtifact struct {
+	InputID             string    `json:"input_id"`
+	Kind                string    `json:"kind"`
+	IncidentID          string    `json:"incident_id"`
+	AnnotationID        *int64    `json:"annotation_id"`
+	VerdictID           *int64    `json:"verdict_id"`
+	OccurredAt          time.Time `json:"occurred_at"`
+	AppliedAt           time.Time `json:"applied_at"`
+	AppliedInputVersion *int      `json:"applied_input_version"`
+}
+
+// ListOwnerTerminalArtifacts reads the operator artifacts recorded against
+// situationID after it had already terminalized (R2's `journal_state =
+// 'owner_terminal'`), oldest first. limit is clamped to
+// maxSituationHistoryPage.
+//
+// This is the read half of R2's "the artifact stays visible through Incident
+// MCP/audit, and the Situation MCP view lists it under 'operator artifacts
+// recorded after closure'": the terminal Episode is immutable, so these
+// artifacts have no Transition and appear in no journal — without this view
+// they would exist durably and be invisible from the Situation they name.
+func (s *Store) ListOwnerTerminalArtifacts(ctx context.Context, situationID string, limit int) ([]OwnerTerminalArtifact, error) {
+	if strings.TrimSpace(situationID) == "" {
+		return nil, errors.New("store: owner-terminal artifact read requires a situation id")
+	}
+	if limit <= 0 || limit > maxSituationHistoryPage {
+		limit = maxSituationHistoryPage
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, kind, incident_id, annotation_id, verdict_id, occurred_at, applied_at, applied_input_version
+		FROM situation_input_outbox
+		WHERE applied_situation_id = ? AND journal_state = 'owner_terminal'
+		ORDER BY occurred_at ASC, id ASC
+		LIMIT ?`, situationID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: list owner-terminal artifacts: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := []OwnerTerminalArtifact{}
+	for rows.Next() {
+		var a OwnerTerminalArtifact
+		var annotationID, verdictID, appliedVersion sql.NullInt64
+		var occurredAt, appliedAt string
+		if err := rows.Scan(&a.InputID, &a.Kind, &a.IncidentID, &annotationID, &verdictID,
+			&occurredAt, &appliedAt, &appliedVersion); err != nil {
+			return nil, fmt.Errorf("store: scan owner-terminal artifact: %w", err)
+		}
+		if annotationID.Valid {
+			a.AnnotationID = &annotationID.Int64
+		}
+		if verdictID.Valid {
+			a.VerdictID = &verdictID.Int64
+		}
+		if appliedVersion.Valid {
+			v := int(appliedVersion.Int64)
+			a.AppliedInputVersion = &v
+		}
+		for _, f := range []struct {
+			name string
+			src  string
+			dst  *time.Time
+		}{{"occurred_at", occurredAt, &a.OccurredAt}, {"applied_at", appliedAt, &a.AppliedAt}} {
+			parsed, err := time.Parse(time.RFC3339Nano, f.src)
+			if err != nil {
+				return nil, fmt.Errorf("store: parse owner-terminal artifact %s: %w", f.name, err)
+			}
+			*f.dst = parsed.UTC()
+		}
+		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate owner-terminal artifacts: %w", err)
+	}
+	return out, nil
+}

@@ -682,10 +682,12 @@ func scanStreamEntry(rows *sql.Rows, streamID *string) (situationmodel.Transitio
 }
 
 // scanClaimedStreamEntry scans one
-// `SELECT st.id, st.claim_token, <prefixedTransitionColumns>` row: the
-// stream row's own id and current claim token, then the joined Transition.
-func scanClaimedStreamEntry(rows *sql.Rows, streamID *string, claimToken *int64) (situationmodel.Transition, error) {
-	tr, err := scanTransition(prefixedScanner{rows: rows, prefix: []any{streamID, claimToken}})
+// `SELECT st.id, st.claim_token, st.attempt_count, <prefixedTransitionColumns>`
+// row: the stream row's own id, current claim token, and durable attempt
+// count, then the joined Transition.
+func scanClaimedStreamEntry(rows *sql.Rows, streamID *string, claimToken *int64,
+	attemptCount *int) (situationmodel.Transition, error) {
+	tr, err := scanTransition(prefixedScanner{rows: rows, prefix: []any{streamID, claimToken, attemptCount}})
 	if err != nil {
 		return situationmodel.Transition{}, fmt.Errorf("store: scan claimed transition stream entry: %w", err)
 	}
