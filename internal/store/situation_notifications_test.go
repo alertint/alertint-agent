@@ -943,3 +943,71 @@ func TestNotificationAckRedriveRefusesBehindANewerRootProjection(t *testing.T) {
 		t.Fatalf("newer root status = %q, want an untouched pending", got.Status)
 	}
 }
+
+// TestCommitWithheldRootRetiresThePendingRootItReplaces proves migration
+// 0018's "one live root projection per Situation" survives a replacement
+// the operator's Slack floor withheld. Superseding only when the newer
+// projection is itself deliverable would leave the older, now-stale one
+// pending forever: it claims ahead of every reply its Situation owns, fails
+// its pre-I/O summary-version check on every attempt, and nothing ever
+// supersedes it — stranding the Situation's whole later history behind a
+// root that can never deliver.
+func TestCommitWithheldRootRetiresThePendingRootItReplaces(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	sitID, first := snSeedOneCycle(t, st, "group-withheld-root", now)
+	queued := shIntentOfClass(t, first.History.Intents, situationmodel.EffectRootSync)
+	if queued.Status != situationmodel.IntentPending {
+		t.Fatalf("seeded root projection has status %q, want pending", queued.Status)
+	}
+
+	// A second cycle whose first publication falls below the operator's
+	// floor. The publication context is supplied directly here, so this
+	// exercises the LEDGER's own invariant rather than the planner's.
+	later := now.Add(10 * time.Minute)
+	shMakeDue(t, st, sitID, later.Add(-time.Minute))
+	claim := claimSituation(t, st, sitID, "controller-a", later)
+	cycle := shPrepare(t, claim, shOperatorContract(later.Add(time.Minute)),
+		situationmodel.LifecycleActive, situationmodel.AttentionInvestigate, later)
+	last := first.History.Transitions[len(first.History.Transitions)-1]
+	cycle.Change.PriorTransition = &last
+	cycle.Change.PriorSummary = first.History.Summary
+	cycle.Publish.PriorTransition = &last
+	cycle.Publish.SlackFloor = situationmodel.InterruptionCritical
+	concl := *cycle.Change.Projection.Assessment
+	concl.SufficientReasonCode = "duration_outlier"
+	cycle.Change.Projection.Assessment = &concl
+
+	commit := shDerive(t, cycle)
+	withheld := shIntentOfClass(t, commit.History.Intents, situationmodel.EffectRootSync)
+	if withheld.Status != situationmodel.IntentWithheld {
+		t.Fatalf("replacement root projection has status %q, want withheld_by_operator_slack_floor", withheld.Status)
+	}
+	if err := st.CommitController(context.Background(), claim, commit); err != nil {
+		t.Fatalf("CommitController: %v", err)
+	}
+
+	retired := snIntent(t, st, queued.ID)
+	if retired.Status != situationmodel.IntentSuperseded {
+		t.Fatalf("the replaced root projection has status %q, want superseded", retired.Status)
+	}
+	if retired.ReplacementIntentID == nil || *retired.ReplacementIntentID != withheld.ID {
+		t.Fatalf("replacement_intent_id = %v, want the withheld replacement %s", retired.ReplacementIntentID, withheld.ID)
+	}
+	if retired.SupersessionReason == nil || *retired.SupersessionReason == "" {
+		t.Fatal("a superseded root projection must record why")
+	}
+	if retired.ClaimOwner != nil || retired.LeaseExpiresAt != nil || retired.RetryAt != nil {
+		t.Fatalf("a superseded root projection keeps no claim or retry state: %+v", retired)
+	}
+
+	var pending int
+	if err := st.DB().QueryRowContext(context.Background(), `
+		SELECT COUNT(*) FROM notification_intents
+		WHERE situation_id = ? AND effect_class = 'root_sync' AND status = 'pending'`, sitID).Scan(&pending); err != nil {
+		t.Fatalf("count pending root projections: %v", err)
+	}
+	if pending != 0 {
+		t.Fatalf("%d root projection(s) still pending behind a withheld replacement", pending)
+	}
+}

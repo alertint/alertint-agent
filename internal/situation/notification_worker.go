@@ -153,6 +153,16 @@ const (
 	// DeliveryRetryable covers transport failures, 5xx, rate limiting, and
 	// every uncertain outcome. It retries indefinitely.
 	DeliveryRetryable DeliveryErrorClass = "retryable"
+	// DeliveryLocalRetryable covers an adapter-internal condition that
+	// stopped the attempt BEFORE any Slack call was made: a Store read
+	// failure, an intent whose summary version is no longer current, or a
+	// reply whose root is not published yet. It retries exactly like
+	// DeliveryRetryable — none of them proves a permanent condition — but
+	// it is deliberately NOT a Slack outcome, so it never moves the
+	// dependency-health window or the Delivery-gap machinery. Attributing
+	// a purely local data-state mismatch to Slack would report an outage
+	// that is not happening.
+	DeliveryLocalRetryable DeliveryErrorClass = "local_retryable"
 	// DeliveryConfigurationBlocking covers a definite token/scope/channel/
 	// authentication rejection. It is durable, keeps its attempts, and
 	// waits for a corrected configuration generation — never exhausted.
@@ -162,6 +172,24 @@ const (
 	// only class that becomes `failed`, and even that is redriveable.
 	DeliveryInvalid DeliveryErrorClass = "invalid"
 )
+
+// isSlackOutcome reports whether this class is evidence about the Slack
+// dependency itself. Only a real transport/API result is: an invalid
+// payload is this build's own bug, and a local data-state condition never
+// reached the wire. Neither may open a Delivery gap or hold the
+// continuous-failure window open (spec.md's gap lifecycle is defined over
+// "Slack delivery failure", not over every failed attempt).
+func (c DeliveryErrorClass) isSlackOutcome() bool {
+	switch c {
+	case DeliveryInvalid, DeliveryLocalRetryable:
+		return false
+	case DeliveryRetryable, DeliveryConfigurationBlocking:
+		return true
+	default:
+		// An unknown class is not proof that Slack answered.
+		return false
+	}
+}
 
 // DeliveryFailure is the classification a deliverer error may carry. An
 // error that does not implement it is treated as retryable: this worker
@@ -191,6 +219,8 @@ func classifyDeliveryFailure(err error) (DeliveryErrorClass, string, time.Durati
 			return DeliveryConfigurationBlocking, code, 0
 		case DeliveryInvalid:
 			return DeliveryInvalid, code, 0
+		case DeliveryLocalRetryable:
+			return DeliveryLocalRetryable, code, failure.DeliveryRetryAfter()
 		case DeliveryRetryable:
 			return DeliveryRetryable, code, failure.DeliveryRetryAfter()
 		default:
@@ -611,7 +641,7 @@ func (w *NotificationWorker) probe(ctx context.Context, state SlackDeliveryState
 		w.mu.Unlock()
 		w.count(func(s *NotificationWorkerStats) { s.ProbeFailures++ })
 		class, code, _ := classifyDeliveryFailure(err)
-		if class != DeliveryInvalid {
+		if class.isSlackOutcome() {
 			w.observeFailure(ctx, state, code, now)
 		}
 		return
@@ -657,14 +687,26 @@ func (w *NotificationWorker) probe(ctx context.Context, state SlackDeliveryState
 // instead drive it explicitly at step 5 of spec.md's startup order, before
 // Receivers start; whichever runs first applies the correction.
 func (w *NotificationWorker) ReactivateConfiguration(ctx context.Context) (int, error) {
-	if w.configurationReactivated.Swap(true) {
+	if w.configurationReactivated.Load() {
 		return 0, nil
 	}
+	// Read and decide BEFORE consuming the one-shot. Burning it on a failed
+	// Store read, or on a healthy process that simply had nothing blocked at
+	// its first probe, would mean a configuration block arising LATER in this
+	// process's life could never be reactivated without a restart. The flag
+	// still guards the loop it was added for: an actual reactivation sets it,
+	// so intents that immediately re-block are not reactivated again here.
 	state, err := w.store.GetSlackDeliveryState(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("situation: notification worker: read slack delivery state: %w", err)
 	}
 	if state.BlockedConfigurationCount == 0 {
+		return 0, nil
+	}
+	if w.configurationReactivated.Swap(true) {
+		// Another goroutine got here first (the worker's own startup probe
+		// racing Task 9's explicit startup call); whichever won applies the
+		// correction.
 		return 0, nil
 	}
 	generation := state.ConfigurationGeneration + 1
@@ -831,9 +873,11 @@ func (w *NotificationWorker) acknowledgeFailure(ctx context.Context, claim Notif
 	if stateErr != nil {
 		w.logger.Error("situation: notification worker: read slack delivery state failed", "err", stateErr)
 	}
-	if class != DeliveryInvalid {
-		// An invalid payload is this build's own bug, not a Slack outage:
-		// it must never open a Delivery gap.
+	if class.isSlackOutcome() {
+		// Only a real Slack answer moves the dependency-health window. An
+		// invalid payload is this build's own bug, and a local data-state
+		// condition never reached the wire; neither may open a Delivery
+		// gap or report an outage that is not happening.
 		w.observeFailure(ctx, state, code, now)
 	}
 
@@ -844,7 +888,7 @@ func (w *NotificationWorker) acknowledgeFailure(ctx context.Context, claim Notif
 
 	var ackErr error
 	switch class {
-	case DeliveryRetryable:
+	case DeliveryRetryable, DeliveryLocalRetryable:
 		ackErr = w.retryClaim(ctx, claim, code, retryAfter, now)
 		if ackErr == nil {
 			span.SetAttributes(AttrResultClass.String(DeliverResultRetried))

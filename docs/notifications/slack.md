@@ -94,10 +94,10 @@ A published Situation owns exactly **one** main-channel message — its
 
 Journal entries are created for first publication, material investigation
 changes and conclusions, operator-contract changes, recovery pending,
-recovery refire, permitted recurrence milestones, recovery, closure with
-uncertainty, and operator write-backs. Routine reconciliation, retry
-accounting, and elapsed seconds ticking by create **nothing** — no entry, no
-edit, no interruption.
+recovery refire, recovery, closure with uncertainty, and operator
+write-backs. Routine reconciliation, retry accounting, elapsed seconds
+ticking by, and a re-fire attaching to the Situation that is already open
+create **nothing** — no entry, no edit, no interruption.
 
 ### Orientation
 
@@ -186,6 +186,27 @@ database transaction open across a Slack call.
   rejection moves the effect to `blocked_configuration`, where it waits
   durably. Restarting with corrected configuration returns it to pending and
   it delivers. Nothing is dropped to silence Slack.
+- **An effect Slack rejects as impossible is parked in `failed`, visibly.**
+  `failed` is reserved for a durable intent this build cannot send at all —
+  a payload Slack rejects outright, or any Slack rejection code this build
+  does not recognise as retryable or as a configuration problem. The
+  commonest way to reach it
+  is to **delete a Situation's root message in Slack by hand**: every later
+  edit of that root then comes back `message_not_found`, and the root effect
+  parks in `failed`. It is never retried on its own, and effects that wait
+  on that root stay pending behind it rather than failing in a chain.
+  `failed` effects are visible in the durable ledger and over MCP alongside
+  every other delivery outcome, so a Situation that stops updating in Slack
+  is diagnosable rather than silent.
+
+  **Honest limitation:** redriving a `failed` effect is a Store operation
+  (`RedriveFailedNotificationIntent`) with **no operator-facing command in
+  front of it yet** — recovering one today means direct database access or a
+  small program against the Store, not a CLI flag. Deleting a Situation's
+  root message is therefore best avoided: a redrive alone will not bring it
+  back, because the coordinates AlertINT holds still point at the message
+  you removed. An operator control surface for redrive, and a specific
+  recovery for a deleted root, are both deliberately out of this slice.
 - **Ordering is preserved.** A Situation's root must be durably delivered
   before any reply is claimable; journal replies deliver in change order; a
   hand-off's root edit delivers before its broadcast reply; and a stale root
@@ -397,10 +418,14 @@ notify:
 - `off` — recurrence never posts replies; the card's occurrence count still
   updates in place, silently.
 
-On the integration branch this setting has **no effect**: recurrence is
-carried by the owning Situation's own journal at the same milestone rungs, so
-a quiet Situation leaves no recurrence trace in Slack at all. The key is still
-accepted so an existing `config.yaml` keeps loading.
+On the integration branch this setting has **no effect**, and neither does a
+re-fire that attaches to a Situation that is already open: it posts no reply
+and edits no root. A Situation's recurrence count is the number of *closed*
+Situations that preceded it in the same group, and only one Situation per
+group can be open at a time — so that count is fixed for the Situation's whole
+lifetime. `recurred ×N` therefore appears exactly once per Situation, on the
+root of the **next** Situation the group opens, at its first publication. The
+key is still accepted so an existing `config.yaml` keeps loading.
 
 ## System messages
 

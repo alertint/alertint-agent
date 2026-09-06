@@ -151,10 +151,13 @@ restart Windsurf and check **Settings → MCP Servers**:
 Both feedback writes land whether or not a Situation currently owns the
 incident. With **no current owner** — none was ever assigned, or the owner
 had already closed — the write still persists and stays visible through the
-incident's own history here and in the audit log; against an already-closed
-Situation it appears in that Situation's `artifacts_recorded_after_closure`,
-never journalled into the closed episode and never lost. No old Incident
-Slack card is resurrected or rewritten either way.
+incident's own history here and in the audit log, never journalled into a
+closed episode and never lost. A closed Situation's
+`artifacts_recorded_after_closure` is narrower than that: it holds only the
+race where the owner closed *between* the write being accepted and being
+applied. A write against a Situation that was already closed when it landed
+is visible through the incident's own history and the audit log only. No old
+Incident Slack card is resurrected or rewritten in any of these cases.
 
 Read-only toward your systems, always; feedback writes (the last two tools
 above) land only in AlertINT's own incident state, additive and

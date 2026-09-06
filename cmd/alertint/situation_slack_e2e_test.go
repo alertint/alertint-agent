@@ -246,6 +246,10 @@ type e2eFixture struct {
 	clock *e2eClock
 	slack *fakeSlackServer
 
+	// slackFloor is the operator's notify.slack.min_severity floor every
+	// controller cycle runs under. Empty (the default) is "no floor".
+	slackFloor model.InterruptionPriority
+
 	worker *situation.NotificationWorker
 	l2     *e2eAssessmentClient
 }
@@ -365,7 +369,7 @@ func (f *e2eFixture) seed(groupKey string) string {
 func (f *e2eFixture) controllerCycle() int {
 	f.t.Helper()
 	f.clock.advance(time.Minute)
-	cw := situation.NewControllerWorker(f.st, f.st, f.l2, situation.ControllerConfig{},
+	cw := situation.NewControllerWorker(f.st, f.st, f.l2, situation.ControllerConfig{SlackFloor: f.slackFloor},
 		situation.ControllerWorkerConfig{Owner: e2eOwner + ":controller", Now: f.clock.Now},
 		f.clock.Now, audit.New(f.st.DB()), slog.New(slog.DiscardHandler))
 	n, err := cw.Drain(f.ctx)
@@ -1135,4 +1139,74 @@ func TestSituationSlackE2EFailingRootUpdateKeepsCoordinatesAndRecovers(t *testin
 		t.Fatalf("%d effect(s) still owed after the edit recovered%s", remaining, f.intentSummary())
 	}
 	assertJournalRepliesInSequenceOrder(t, f, sitID, publishedTS)
+}
+
+// ----------------------------------------------------------------------
+// 8. A root the operator's Slack floor withholds never strands the earlier
+//    root projection it replaces — and a purely local data-state mismatch
+//    is never reported as a Slack dependency failure.
+// ----------------------------------------------------------------------
+
+func TestSituationSlackE2EBelowFloorRootNeverStrandsTheQueuedRootItReplaces(t *testing.T) {
+	f := newE2EFixture(t)
+	f.slackFloor = model.InterruptionMedium
+	f.slack.setScript(alwaysOK)
+
+	// The Situation opens below the operator's floor, so its first root is a
+	// durably withheld decision and nothing is on screen.
+	sitID := f.seed("group=e2e-floor-strand")
+
+	// It then escalates above the floor and earns publication. Nothing is
+	// delivered yet: that root projection is committed and merely queued.
+	f.l2.steer(model.AttentionInvestigate, false)
+	f.clock.advance(20 * time.Minute)
+	if n := f.controllerCycle(); n == 0 {
+		t.Fatal("no controller work was due; the scenario needs an above-floor escalation")
+	}
+	queued := ""
+	for _, i := range f.intentsOfClass("root_sync") {
+		if i.Status == "pending" {
+			if queued != "" {
+				t.Fatalf("two root projections are pending at once%s", f.intentSummary())
+			}
+			queued = i.ID
+		}
+	}
+	if queued == "" {
+		t.Fatalf("the escalation above the floor earned no pending root projection%s", f.intentSummary())
+	}
+
+	// Cycle two calms the Situation below the floor while that earned root
+	// is still queued.
+	f.l2.steer(model.AttentionObserve, false)
+	f.clock.advance(20 * time.Minute)
+	if n := f.controllerCycle(); n == 0 {
+		t.Fatal("no controller work was due; the scenario needs a second material cycle")
+	}
+	for _, i := range f.intentsOfClass("root_sync") {
+		if i.ID == queued && i.Status == "pending" {
+			t.Fatalf("the earlier root projection is still pending after a newer one replaced it%s", f.intentSummary())
+		}
+	}
+
+	f.deliverUntilQuiet(30)
+
+	// The publication the floor already permitted is not erased by a later
+	// below-floor commit: spec.md's ordinary-delay rule publishes the
+	// LATEST informative root rather than dropping an earned, queued one.
+	if _, ts := f.rootCoordinates(sitID); ts == "" {
+		t.Fatalf("the Situation never published despite earning publication before the floor engaged%s", f.intentSummary())
+	}
+	if remaining := len(f.pendingBesidesDelivered()); remaining != 0 {
+		t.Fatalf("%d effect(s) still owed once the queue drained%s", remaining, f.intentSummary())
+	}
+
+	// A local data-state mismatch is not a Slack outcome: nothing here may
+	// register as a Slack dependency failure or open a Delivery gap.
+	if gaps := f.scalarInt(`SELECT COUNT(*) FROM slack_delivery_gaps`); gaps != 0 {
+		t.Fatalf("delivery gap generations = %d, want 0: Slack answered every call in this scenario", gaps)
+	}
+	if failing := f.scalarInt(`SELECT COUNT(*) FROM slack_delivery_state WHERE first_failure_at IS NOT NULL`); failing != 0 {
+		t.Fatal("a Slack-dependency failure window opened although Slack never failed")
+	}
 }

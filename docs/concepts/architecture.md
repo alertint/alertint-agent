@@ -191,9 +191,11 @@ grouping/dispatch path, and one Slack writer, at a time.
 Before spending an analysis, **AlertINT** checks whether it has seen this
 condition before. A re-fire of an already-analyzed group key inside the
 collapse horizon attaches as an **occurrence** — no second LLM call; a
-released binary edits the Incident card in place, and on the
-`state-controller` branch the owning Situation's own journal carries the
-recurrence milestone instead. A genuinely new incident whose key matches a past
+released binary edits the Incident card in place. On the `state-controller`
+branch that attach leaves no Slack trace at all: the owning Situation's
+recurrence count counts its already-closed predecessors and cannot move while
+it is open, so `recurred ×N` shows only on the root of the next Situation the
+group opens. A genuinely new incident whose key matches a past
 analysis gets the prior finding **recalled** into its prompt as a past
 hypothesis, never as evidence. See [incident
 memory](incident-memory.md).

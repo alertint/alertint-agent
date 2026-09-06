@@ -536,6 +536,39 @@ func TestPlanNotificationIntentsFloorWithholdsThePoke(t *testing.T) {
 	}
 }
 
+// TestPlanNotificationIntentsFloorNeverRevokesAnOwedPublication is the
+// other half of the floor rule: it gates a NEW interruption, never one the
+// operator already permitted. While an earlier root projection is still
+// owed to Slack, this commit's root is that same unmet first publication
+// re-rendered at the current summary version — spec.md's ordinary-delay
+// rule publishes the latest informative root rather than erasing an
+// earned, merely-queued one, and withholding here would strand the
+// projection it replaces along with every journal entry waiting on it.
+func TestPlanNotificationIntentsFloorNeverRevokesAnOwedPublication(t *testing.T) {
+	c := hsChange(t)
+	c.Situation.Attention = model.AttentionObserve
+	c.Assessment.Attention = model.AttentionObserve
+	hsUseReason(&c, reasonCodeDurationOutlier)
+	c.Assessment.ActionContract = hsMonitoringContract(c.Now.Add(time.Minute))
+
+	trs, sum := hsCommitOf(t, c)
+	in := hsPub(c, trs, sum)
+	in.RootPublished = false
+	in.SlackFloor = model.InterruptionHigh
+	in.RootPublicationOwed = true
+
+	roots := hsIntentsOfClass(hsPlan(t, in), model.EffectRootSync)
+	if len(roots) != 1 {
+		t.Fatalf("got %d root_sync intents, want 1", len(roots))
+	}
+	if roots[0].Status != model.IntentPending {
+		t.Errorf("status = %q, want pending: the floor may not revoke a publication already owed to Slack", roots[0].Status)
+	}
+	if !roots[0].MainChannelPoke || roots[0].InterruptionPriority == nil {
+		t.Error("the root still records that it is a poke and the priority it was judged against")
+	}
+}
+
 func TestPlanNotificationIntentsWithheldBroadcastKeepsTheJournal(t *testing.T) {
 	c := hsNext(t)
 	hsUseReason(&c, reasonCodeDurationOutlier)

@@ -121,12 +121,14 @@ func TestSituationNotificationsUpgrade_CreatesStrictTablesAndBumpsSchemaVersion(
 		t.Fatalf("migration 18 applied count = %d, want 1", applied)
 	}
 
+	// This test owns "0018 landed", not "0018 is the head": the head number
+	// itself is TestMaxSchemaVersion's, and later migrations may follow.
 	got, err := MaxSchemaVersion()
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	if got != 18 {
-		t.Fatalf("MaxSchemaVersion = %d, want 18", got)
+	if got < 18 {
+		t.Fatalf("MaxSchemaVersion = %d, want at least 18", got)
 	}
 
 	for _, table := range []string{"notification_intents", "slack_delivery_gaps", "slack_delivery_state"} {

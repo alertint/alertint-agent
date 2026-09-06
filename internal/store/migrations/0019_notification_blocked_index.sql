@@ -1,0 +1,21 @@
+-- SPDX-License-Identifier: FSL-1.1-ALv2
+--
+-- One index, no schema change: the blocked-configuration backlog count that
+-- GetSlackDeliveryState reads on every notification-worker round (once per
+-- second for the life of the process, plus once per failed delivery
+-- acknowledgement and once at startup).
+--
+-- notification_intents is durable delivery history — migration 0018 forbids
+-- DELETE on it — and it gains a row on every material commit and every
+-- journal/broadcast effect, so it only ever grows. 0018's status-related
+-- partial indexes are all predicated on OTHER statuses
+-- (notification_intents_claim_idx on `status = 'pending'`,
+-- notification_intents_root_dependency_idx on root_sync), so none of them
+-- covers `status = 'blocked_configuration'` and that count was a full table
+-- scan whose cost grew without bound over an installation's life.
+--
+-- This migration adds no table, no column, and no row: it fabricates
+-- nothing for any Situation that predates it, exactly like 0018.
+-- ----------------------------------------------------------------------
+CREATE INDEX notification_intents_blocked_configuration_idx ON notification_intents(status)
+    WHERE status = 'blocked_configuration';

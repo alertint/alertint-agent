@@ -71,6 +71,7 @@ type nwStore struct {
 
 	deliverAckErr error
 	heartbeatErr  error
+	stateErr      error
 	openGap       bool
 	recoverGap    string
 	recoverOK     bool
@@ -148,7 +149,17 @@ func (s *nwStore) CompleteDeliveryGap(_ context.Context, _ time.Time) (string, b
 func (s *nwStore) GetSlackDeliveryState(context.Context) (SlackDeliveryState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.stateErr != nil {
+		return SlackDeliveryState{}, s.stateErr
+	}
 	return s.state, nil
+}
+
+// setState replaces the health snapshot the next read returns.
+func (s *nwStore) setState(mutate func(*nwStore)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	mutate(s)
 }
 
 func (s *nwStore) ClaimNotificationIntents(_ context.Context, _ string, _ time.Time, _ time.Duration, _ int) ([]NotificationClaim, error) {
@@ -417,6 +428,51 @@ func TestNotificationWorkerBlocksConfigurationAndFailsInvalid(t *testing.T) {
 		}
 		if len(s.failures) != 1 || s.failures[0] != "invalid_auth" {
 			t.Fatalf("observed slack failures = %v, want only the configuration rejection", s.failures)
+		}
+	})
+}
+
+// TestNotificationWorkerLocalRejectionsNeverOpenADeliveryGap proves an
+// adapter-internal rejection — a stale summary version, a Store read
+// failure, a reply whose root is not published yet — still retries but is
+// never attributed to Slack health. No HTTP call was made at all in any of
+// those cases, so however long they run they must leave the continuous
+// failure window closed and open no Delivery gap: a purely local data-state
+// mismatch is not evidence that Slack is down.
+func TestNotificationWorkerLocalRejectionsNeverOpenADeliveryGap(t *testing.T) {
+	clock := &nwClock{at: time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)}
+	store := &nwStore{}
+	const rounds = 4
+	for i := 0; i < rounds; i++ {
+		store.batches = append(store.batches, []NotificationClaim{nwClaim(fmt.Sprintf("intent-%d", i), i+1)})
+	}
+	deliverer := &nwDeliverer{deliver: func(model.NotificationIntent) (NotificationDelivery, error) {
+		return NotificationDelivery{}, nwDeliveryError{class: DeliveryLocalRetryable, code: "stale_summary_version"}
+	}}
+	w := NewNotificationWorker(store, deliverer, NotificationWorkerConfig{
+		Owner: "notify-a", Heartbeat: time.Hour, Rand: func() float64 { return 0.5 },
+	}, clock.now, nwLogger())
+
+	// Well past the five-minute continuous-failure threshold.
+	for i := 0; i < rounds; i++ {
+		if _, err := w.RunOnce(context.Background()); err != nil {
+			t.Fatalf("RunOnce %d: %v", i, err)
+		}
+		clock.advance(2 * time.Minute)
+	}
+
+	store.snapshot(func(s *nwStore) {
+		if len(s.retried) != rounds {
+			t.Fatalf("retried %d intents, want %d: a local mismatch still retries indefinitely", len(s.retried), rounds)
+		}
+		if len(s.failed) != 0 || len(s.blocked) != 0 {
+			t.Fatalf("failed=%v blocked=%v, want a local mismatch to close no delivery obligation", s.failed, s.blocked)
+		}
+		if len(s.failures) != 0 {
+			t.Fatalf("observed slack failures = %v, want none: no Slack call was ever made", s.failures)
+		}
+		if len(s.gapOpens) != 0 {
+			t.Fatalf("the gap machinery ran %d time(s) on a purely local condition", len(s.gapOpens))
 		}
 	})
 }
@@ -823,6 +879,46 @@ func TestNotificationWorkerReactivateConfigurationIsIdempotentForStartup(t *test
 	store.snapshot(func(s *nwStore) {
 		if len(s.reactivated) != 1 || s.reactivated[0] != 8 {
 			t.Fatalf("reactivated with generations %v, want exactly [8]", s.reactivated)
+		}
+	})
+}
+
+// TestNotificationWorkerReactivationOneShotIsSpentOnlyOnRealWork is the
+// regression for consuming the once-per-process reactivation on something
+// that reactivated nothing. The one-shot exists to stop the
+// reactivate/re-block loop above — so it must be spent by an actual
+// reactivation, never by a transient Store read failure and never by a
+// healthy process that simply had nothing blocked when it first probed. A
+// configuration block that arises LATER in the same process must still be
+// reactivatable without a restart.
+func TestNotificationWorkerReactivationOneShotIsSpentOnlyOnRealWork(t *testing.T) {
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	store := &nwStore{stateErr: errors.New("store: temporarily unavailable")}
+	w := nwWorker(store, &nwDeliverer{}, now)
+
+	// A failed read reactivates nothing and spends nothing.
+	if _, err := w.ReactivateConfiguration(context.Background()); err == nil {
+		t.Fatal("ReactivateConfiguration returned nil on a failed state read")
+	}
+
+	// A healthy process with nothing blocked also spends nothing.
+	store.setState(func(s *nwStore) { s.stateErr = nil; s.state = SlackDeliveryState{ConfigurationGeneration: 4} })
+	if n, err := w.ReactivateConfiguration(context.Background()); err != nil || n != 0 {
+		t.Fatalf("ReactivateConfiguration with nothing blocked = (%d, %v), want (0, nil)", n, err)
+	}
+
+	// A block that appears later in this same process is still correctable.
+	store.setState(func(s *nwStore) { s.state.BlockedConfigurationCount = 2 })
+	if n, err := w.ReactivateConfiguration(context.Background()); err != nil || n != 1 {
+		t.Fatalf("ReactivateConfiguration after a later block = (%d, %v), want (1, nil)", n, err)
+	}
+	// And the loop guard still holds: the real reactivation spent the one-shot.
+	if n, err := w.ReactivateConfiguration(context.Background()); err != nil || n != 0 {
+		t.Fatalf("ReactivateConfiguration after the real one = (%d, %v), want (0, nil)", n, err)
+	}
+	store.snapshot(func(s *nwStore) {
+		if len(s.reactivated) != 1 || s.reactivated[0] != 5 {
+			t.Fatalf("reactivated with generations %v, want exactly one [5]", s.reactivated)
 		}
 	})
 }

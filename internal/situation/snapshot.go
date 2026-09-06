@@ -63,6 +63,15 @@ type SnapshotInput struct {
 	// none exists — the guard that keeps a commit from planning a root
 	// older than one already queued or delivered.
 	LatestRootSyncVersion *int
+	// RootPublicationOwed reports whether an earlier root projection for
+	// this Situation is still an UNMET publication obligation: pending,
+	// configuration-blocked, or failed. It is false for a Situation whose
+	// only earlier projections were withheld by the operator's Slack floor
+	// or already superseded. Publication the floor once permitted is not
+	// revoked by a later below-floor commit — spec.md's ordinary-delay rule
+	// publishes the latest informative root rather than erasing an earned,
+	// merely-queued one.
+	RootPublicationOwed bool
 	// LastDeliveredRootDeadlineAt is the promised-update instant the most
 	// recently DELIVERED root_sync actually put on screen (R4). A refresh
 	// is due only once this promise has passed and the committed contract

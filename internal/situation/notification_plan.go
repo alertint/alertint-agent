@@ -35,9 +35,13 @@ type PublicationInput struct {
 	PriorTransition *model.Transition
 	// ContractDeadlineAt is the committed nonterminal next_update_at (R4):
 	// the promise the root renders. Nil for a terminal commit.
-	ContractDeadlineAt          *time.Time
-	RootPublished               bool
-	LatestRootSyncVersion       *int
+	ContractDeadlineAt    *time.Time
+	RootPublished         bool
+	LatestRootSyncVersion *int
+	// RootPublicationOwed reports whether an earlier root projection for
+	// this Situation is still owed to Slack (pending, configuration-blocked,
+	// or failed) — see SnapshotInput.RootPublicationOwed.
+	RootPublicationOwed         bool
 	LastDeliveredRootDeadlineAt *time.Time
 	LastMainChannelPokeAt       *time.Time
 	SlackFloor                  model.InterruptionPriority
@@ -92,7 +96,15 @@ func PlanNotificationIntents(in PublicationInput) ([]model.NotificationIntent, e
 		priority := DeriveInterruptionPriority(authority)
 		root.MainChannelPoke = true
 		root.InterruptionPriority = &priority
-		if !MeetsSlackFloor(priority, in.SlackFloor) {
+		// The floor gates a NEW interruption. It does not revoke one the
+		// operator already permitted: while an earlier root projection is
+		// still owed to Slack, this projection is that same unmet first
+		// publication re-rendered at the current summary version, and
+		// spec.md's ordinary-delay rule publishes the latest informative
+		// root rather than erasing an earned, merely-queued one. Withholding
+		// here would also strand the projection it replaces — every later
+		// journal entry waits on a root that would then never deliver.
+		if !MeetsSlackFloor(priority, in.SlackFloor) && !in.RootPublicationOwed {
 			root.Status = model.IntentWithheld
 		}
 	}

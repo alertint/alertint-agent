@@ -150,6 +150,7 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 		CurrentSummary:              currentSummary,
 		RootPublished:               publication.rootPublished,
 		LatestRootSyncVersion:       publication.latestRootSyncVersion,
+		RootPublicationOwed:         publication.rootPublicationOwed,
 		LastDeliveredRootDeadlineAt: publication.lastDeliveredRootDeadlineAt,
 		LastMainChannelPokeAt:       publication.lastMainChannelPokeAt,
 		PendingArtifacts:            artifacts,
@@ -162,16 +163,17 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 type publicationContext struct {
 	rootPublished               bool
 	latestRootSyncVersion       *int
+	rootPublicationOwed         bool
 	lastDeliveredRootDeadlineAt *time.Time
 	lastMainChannelPokeAt       *time.Time
 }
 
 // loadPublicationContextTx reads the Situation's durable Slack root
-// coordinates (migration 0018) plus the three delivery facts publication
+// coordinates (migration 0018) plus the four delivery facts publication
 // planning needs: the newest Episode-summary version any root projection
-// already renders, the promised-update instant the last DELIVERED root
-// actually put on screen, and when this Situation last poked the main
-// channel.
+// already renders, whether an earlier root projection is still owed to
+// Slack, the promised-update instant the last DELIVERED root actually put
+// on screen, and when this Situation last poked the main channel.
 func loadPublicationContextTx(ctx context.Context, tx *sql.Tx, situationID string) (publicationContext, error) {
 	var out publicationContext
 	var channel, rootTS sql.NullString
@@ -194,6 +196,19 @@ func loadPublicationContextTx(ctx context.Context, tx *sql.Tx, situationID strin
 	if latestVersion.Valid {
 		v := int(latestVersion.Int64)
 		out.latestRootSyncVersion = &v
+	}
+
+	// An earlier root projection still owed to Slack: one this Situation
+	// has already earned (the operator's floor permitted it) and that has
+	// not been delivered, superseded, or withheld. `delivered` is excluded
+	// because it is not owed and rootPublished already reports it.
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS (
+		    SELECT 1 FROM notification_intents
+		    WHERE situation_id = ? AND effect_class = 'root_sync'
+		      AND status IN ('pending','blocked_configuration','failed'))`, situationID).
+		Scan(&out.rootPublicationOwed); err != nil {
+		return publicationContext{}, fmt.Errorf("store: read owed root projection: %w", err)
 	}
 
 	var deadline sql.NullString

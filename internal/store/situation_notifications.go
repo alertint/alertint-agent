@@ -543,6 +543,17 @@ func (s *Store) RecoverExpiredNotificationClaims(ctx context.Context, now time.T
 // only way out of `failed`, and the way a failed root releases the
 // dependent history waiting behind it.
 //
+// It has NO operator-facing caller in this build, deliberately: spec.md
+// specifies redrive SEMANTICS ("explicitly redriveable after the underlying
+// code or data condition changes"), not a control surface, and Plan 3 adds
+// no new operator write surface. Recovering a failed intent today therefore
+// means direct Store access. docs/notifications/slack.md states that limit
+// plainly under "Delivery: durable intent, indefinite retry, at-least-once"
+// rather than leaving it as an undocumented gap; an operator command is
+// follow-up work, and should land together with a real recovery for a
+// hand-deleted root (a bare redrive cannot fix that case, since the stored
+// root coordinates still point at the removed message).
+//
 // A failed ROOT projection shares reactivation's uniqueness hazard: its
 // Situation may have acquired a newer pending root_sync while this one sat
 // failed. When the redriven projection is the newer of the two, the pending

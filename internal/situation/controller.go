@@ -1137,6 +1137,7 @@ func (c *Controller) buildHistory(claim Claim, basis historyBasis, commit Contro
 		PriorTransition:             basis.In.PriorTransition,
 		RootPublished:               basis.In.RootPublished,
 		LatestRootSyncVersion:       basis.In.LatestRootSyncVersion,
+		RootPublicationOwed:         basis.In.RootPublicationOwed,
 		LastDeliveredRootDeadlineAt: basis.In.LastDeliveredRootDeadlineAt,
 		LastMainChannelPokeAt:       basis.In.LastMainChannelPokeAt,
 		SlackFloor:                  c.cfg.SlackFloor,

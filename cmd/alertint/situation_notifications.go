@@ -162,11 +162,13 @@ func (d *SituationDeliverer) deliverRootSync(ctx context.Context, intent model.N
 	}
 	view, err := d.store.GetSituationEpisodeView(ctx, *intent.SituationID)
 	if err != nil {
-		return situation.NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load episode view: %w", err)
+		return situation.NotificationDelivery{}, localDelivery("episode_view_unavailable",
+			fmt.Errorf("cmd/alertint: situation deliverer: load episode view: %w", err))
 	}
 	if view.Summary.Version != *intent.SummaryVersion {
-		return situation.NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: intent names summary version %d, current is %d",
-			*intent.SummaryVersion, view.Summary.Version)
+		return situation.NotificationDelivery{}, localDelivery("stale_summary_version",
+			fmt.Errorf("cmd/alertint: situation deliverer: intent names summary version %d, current is %d",
+				*intent.SummaryVersion, view.Summary.Version))
 	}
 
 	recoveryEverObserved, err := d.recoveryEverObserved(ctx, view)
@@ -188,7 +190,8 @@ func (d *SituationDeliverer) deliverRootSync(ctx context.Context, intent model.N
 
 	channel, ts, ok, err := d.store.GetSituationRootCoordinates(ctx, *intent.SituationID)
 	if err != nil {
-		return situation.NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load root coordinates: %w", err)
+		return situation.NotificationDelivery{}, localDelivery("root_coordinates_unavailable",
+			fmt.Errorf("cmd/alertint: situation deliverer: load root coordinates: %w", err))
 	}
 	if !ok {
 		res, err := d.api.PostMessage(ctx, slack.PostMessageRequest{
@@ -225,14 +228,17 @@ func (d *SituationDeliverer) deliverThreadAppend(ctx context.Context, intent mod
 	}
 	tr, err := d.store.GetSituationTransition(ctx, *intent.TransitionID)
 	if err != nil {
-		return situation.NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load transition: %w", err)
+		return situation.NotificationDelivery{}, localDelivery("transition_unavailable",
+			fmt.Errorf("cmd/alertint: situation deliverer: load transition: %w", err))
 	}
 	channel, rootTS, ok, err := d.store.GetSituationRootCoordinates(ctx, *intent.SituationID)
 	if err != nil {
-		return situation.NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load root coordinates: %w", err)
+		return situation.NotificationDelivery{}, localDelivery("root_coordinates_unavailable",
+			fmt.Errorf("cmd/alertint: situation deliverer: load root coordinates: %w", err))
 	}
 	if !ok {
-		return situation.NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: situation %s has no delivered root to reply under", *intent.SituationID)
+		return situation.NotificationDelivery{}, localDelivery("root_not_published",
+			fmt.Errorf("cmd/alertint: situation deliverer: situation %s has no delivered root to reply under", *intent.SituationID))
 	}
 	rendered, err := slack.RenderSituationJournal(tr)
 	if err != nil {
@@ -266,18 +272,22 @@ func (d *SituationDeliverer) deliverBroadcastHandoff(ctx context.Context, intent
 	}
 	tr, err := d.store.GetSituationTransition(ctx, *intent.TransitionID)
 	if err != nil {
-		return situation.NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load transition: %w", err)
+		return situation.NotificationDelivery{}, localDelivery("transition_unavailable",
+			fmt.Errorf("cmd/alertint: situation deliverer: load transition: %w", err))
 	}
 	channel, rootTS, ok, err := d.store.GetSituationRootCoordinates(ctx, *intent.SituationID)
 	if err != nil {
-		return situation.NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load root coordinates: %w", err)
+		return situation.NotificationDelivery{}, localDelivery("root_coordinates_unavailable",
+			fmt.Errorf("cmd/alertint: situation deliverer: load root coordinates: %w", err))
 	}
 	if !ok {
-		return situation.NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: situation %s has no delivered root to reply under", *intent.SituationID)
+		return situation.NotificationDelivery{}, localDelivery("root_not_published",
+			fmt.Errorf("cmd/alertint: situation deliverer: situation %s has no delivered root to reply under", *intent.SituationID))
 	}
 	view, err := d.store.GetSituationEpisodeView(ctx, *intent.SituationID)
 	if err != nil {
-		return situation.NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load episode view: %w", err)
+		return situation.NotificationDelivery{}, localDelivery("episode_view_unavailable",
+			fmt.Errorf("cmd/alertint: situation deliverer: load episode view: %w", err))
 	}
 	current := view.Summary.SourceTransitionSequence == tr.Sequence
 
@@ -320,7 +330,8 @@ func (d *SituationDeliverer) deliverGapRecovery(ctx context.Context, intent mode
 	}
 	gap, err := d.store.GetDeliveryGap(ctx, *intent.GapGeneration)
 	if err != nil {
-		return situation.NotificationDelivery{}, fmt.Errorf("cmd/alertint: situation deliverer: load delivery gap: %w", err)
+		return situation.NotificationDelivery{}, localDelivery("delivery_gap_unavailable",
+			fmt.Errorf("cmd/alertint: situation deliverer: load delivery gap: %w", err))
 	}
 	rendered, err := slack.RenderDeliveryGapNotice(slack.GapNoticeInput{
 		GapID:                  gap.ID,
@@ -361,7 +372,8 @@ func (d *SituationDeliverer) recoveryEverObserved(ctx context.Context, view stor
 	for page := 0; page < maxLedgerScanPages; page++ {
 		transitions, err := d.store.ListSituationTransitions(ctx, view.Summary.SituationID, cursor, 0)
 		if err != nil {
-			return false, fmt.Errorf("cmd/alertint: situation deliverer: scan transition ledger: %w", err)
+			return false, localDelivery("transition_ledger_unavailable",
+				fmt.Errorf("cmd/alertint: situation deliverer: scan transition ledger: %w", err))
 		}
 		if len(transitions) == 0 {
 			return false, nil
@@ -407,18 +419,33 @@ func invalidDelivery(code string, err error) error {
 	return &deliveryAdapterError{class: situation.DeliveryInvalid, code: code, err: err}
 }
 
+// localDelivery marks one of this adapter's own errors as a LOCAL
+// data-state condition that stopped the attempt before any Slack call was
+// made: a Store read that failed, an intent whose summary version is no
+// longer current, or a reply whose root is not published yet. It retries
+// exactly like any other retryable outcome — none of these proves a
+// permanent condition — but it is not a Slack answer, so it must never move
+// the dependency-health window or the Delivery-gap machinery. Reporting
+// "Slack delivery failing" for a purely local mismatch would name an outage
+// that is not happening.
+func localDelivery(code string, err error) error {
+	return &deliveryAdapterError{class: situation.DeliveryLocalRetryable, code: code, err: err}
+}
+
 // classifyDeliveryError resolves one failed Deliver call into the closed
 // situation.DeliveryFailure classification.
 //
 // Slack's own typed classification (slack.APIError) passes straight
 // through: retryable transport/5xx/rate-limit/uncertain outcomes keep their
 // Retry-After, definite token/scope/channel rejections block on
-// configuration, and a malformed payload this build sent is invalid.
-// Anything this adapter already proved invalid keeps that verdict. EVERY
-// other error — a Store read failure, a stale summary version, a reply
-// whose root is not published yet — stays retryable: none of them proves a
-// permanent condition, and only a proven one may ever close a durable
-// delivery obligation.
+// configuration, and a malformed payload this build sent is invalid. That
+// is the ONLY source of a Slack-attributed outcome here: internal/notify/
+// slack wraps every wire result — including a failed round trip — in a
+// *slack.APIError, so an error that is not one never reached Slack.
+// Anything this adapter already classified keeps its verdict. EVERY other
+// error is therefore local: it retries (none of them proves a permanent
+// condition, and only a proven one may ever close a durable delivery
+// obligation) without being attributed to Slack health.
 func classifyDeliveryError(err error) error {
 	var adapterErr *deliveryAdapterError
 	if errors.As(err, &adapterErr) {
@@ -436,7 +463,7 @@ func classifyDeliveryError(err error) error {
 		}
 		return &deliveryAdapterError{class: class, code: apiErr.Code, retryAfter: apiErr.RetryAfter, err: err}
 	}
-	return &deliveryAdapterError{class: situation.DeliveryRetryable, code: "delivery_failed", err: err}
+	return &deliveryAdapterError{class: situation.DeliveryLocalRetryable, code: "delivery_failed", err: err}
 }
 
 // ----------------------------------------------------------------------
@@ -563,10 +590,11 @@ type notificationRecovery struct {
 // restarted").
 //
 // A failed Slack probe is NOT an error: an unreachable or misconfigured
-// Slack at boot is an ordinary delay, so steps 5 and 6 are skipped, every
-// blocked intent stays durably blocked, and the process still starts. Only a
-// genuine Store failure returns an error — and then the caller must not
-// start Receivers.
+// Slack at boot is an ordinary delay, so step 5 and step 6's REPLAY half are
+// skipped — step 6's stale-root supersession still runs — every blocked
+// intent stays durably blocked, and the process still starts. Only a genuine
+// Store failure returns an error, and then the caller must not start
+// Receivers.
 func (r *notificationRuntime) RecoverAndReactivate(ctx context.Context, now time.Time) (notificationRecovery, error) {
 	var report notificationRecovery
 

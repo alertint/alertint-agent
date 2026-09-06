@@ -249,7 +249,7 @@ func (d *drillCmd) run(ctx context.Context) error {
 				return err
 			}
 		} else {
-			d.printf("fired the rerun; mcp is not usable from here — check the DRILL card edit to \"recurred ×N\".")
+			d.printf("fired the rerun; mcp is not usable from here — the occurrence count is visible over mcp or in the incidents table (an attach to a live Situation posts nothing to Slack).")
 		}
 		return d.maybeResolve(ctx, run, recvBase, webhookToken)
 	}
@@ -499,7 +499,9 @@ func (d *drillCmd) fetchDrillCandidates(ctx context.Context, mcpEndpoint, mcpTok
 
 // pollOccurrenceRerun polls the matched incident until its occurrence count
 // registers the collapsed re-fire, then prints the "recurred ×N" payoff. It
-// exits as soon as the count increments; a timeout points at the card edit.
+// exits as soon as the count increments; the count is the whole payoff, since
+// an attach to a live Situation creates no Transition and therefore no Slack
+// effect of any kind.
 func (d *drillCmd) pollOccurrenceRerun(ctx context.Context, mcpEndpoint, mcpToken, incidentID string) error {
 	client := newMCPOneShotClient(mcpEndpoint, mcpToken, d.http)
 	if err := client.initialize(ctx); err != nil {
@@ -518,7 +520,7 @@ func (d *drillCmd) pollOccurrenceRerun(ctx context.Context, mcpEndpoint, mcpToke
 				Occurrences int `json:"occurrences"`
 			}
 			if json.Unmarshal(raw, &p) == nil && p.Occurrences > 0 {
-				d.printf("collapsed: incident %s recurred ×%d — no second triage, the existing card edits in place", incidentID, p.Occurrences+1)
+				d.printf("collapsed: incident %s recurred ×%d — no second triage, and no new Slack message", incidentID, p.Occurrences+1)
 				return nil
 			}
 		}
@@ -528,7 +530,7 @@ func (d *drillCmd) pollOccurrenceRerun(ctx context.Context, mcpEndpoint, mcpToke
 			}
 		}
 	}
-	d.printf("the occurrence has not registered yet; check the DRILL card edit to \"recurred ×N\", or re-run with --result %s", incidentID)
+	d.printf("the occurrence has not registered yet; re-run with --result %s (an attach to a live Situation posts nothing to Slack, so there is no card edit to watch for)", incidentID)
 	return nil
 }
 

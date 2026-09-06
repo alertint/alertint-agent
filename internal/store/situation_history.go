@@ -470,12 +470,24 @@ func journalOperatorArtifactTx(ctx context.Context, tx *sql.Tx, inputID, transit
 // 0018 allows at most one pending, unsuperseded root_sync per Situation, so
 // the supersession and its replacement have to happen in this one
 // transaction or not at all (R4).
+//
+// The new root projection retires the older one WHATEVER status it is
+// inserted with, `withheld_by_operator_slack_floor` included. A withheld
+// replacement is still the current projection of this Situation's root, and
+// the older one is still stale: leaving that older row pending would leave
+// a projection of a summary version that is not current any more claimable
+// forever — it would fail its pre-I/O version check on every attempt and
+// nothing would ever supersede it, stranding the Situation's whole later
+// history behind a root that can never deliver. Migration 0018 permits this
+// exactly: superseding only requires the older row to be pending and the
+// replacement to be recorded, never that the replacement itself be
+// deliverable.
 func insertNotificationIntentsTx(ctx context.Context, tx *sql.Tx, situationID string, intents []situationmodel.NotificationIntent) error {
 	if len(intents) == 0 {
 		return nil
 	}
 	for _, intent := range intents {
-		if intent.EffectClass != situationmodel.EffectRootSync || intent.Status != situationmodel.IntentPending {
+		if intent.EffectClass != situationmodel.EffectRootSync {
 			continue
 		}
 		if err := supersedePendingRootSyncTx(ctx, tx, situationID, intent.ID); err != nil {
