@@ -304,3 +304,100 @@ func TestInterruptionPriorityArtifactsNeverPoke(t *testing.T) {
 		t.Errorf("artifact poke class = %q, want %q", class, PokeNone)
 	}
 }
+
+// ----------------------------------------------------------------------
+// Handoff revalidation (review round 1, R1-F5).
+// ----------------------------------------------------------------------
+
+func TestHandoffStillCurrentComparesTheActionBasis(t *testing.T) {
+	now := hsNow(t)
+	handoffChange := hsChange(t)
+	handoffChange.Assessment.ActionContract = hsOperatorContract(now.Add(time.Minute))
+	handoff := hsOnly(t, handoffChange)
+	if handoff.ActionContract.OperatorActionRequired == nil {
+		t.Fatal("fixture: the handoff transition carries no operator action")
+	}
+	base, err := ProjectEpisode(nil, handoff)
+	if err != nil {
+		t.Fatalf("ProjectEpisode: %v", err)
+	}
+
+	// An annotation folded after the handoff: sequence advanced, nothing
+	// steered.
+	annotated := base
+	annotated.Version++
+	annotated.SourceTransitionSequence = handoff.Sequence + 1
+	annotated.RecordedOperatorContext = []string{"operator: checked the deploy log"}
+	if !HandoffStillCurrent(handoff, annotated) {
+		t.Error("an annotation must not cancel a still-required handoff")
+	}
+
+	// The same action refreshed with a new deadline is the same action.
+	refreshed := base
+	refreshed.SourceTransitionSequence = handoff.Sequence + 1
+	refreshed.ActionContract.NextUpdateAt = timePtr(now.Add(time.Hour))
+	if !HandoffStillCurrent(handoff, refreshed) {
+		t.Error("a refreshed deadline does not change the requested action")
+	}
+
+	// The action was withdrawn: AlertINT took the Situation back.
+	withdrawn := base
+	withdrawn.SourceTransitionSequence = handoff.Sequence + 1
+	withdrawn.ActionContract = hsMonitoringContract(now.Add(time.Minute))
+	if HandoffStillCurrent(handoff, withdrawn) {
+		t.Error("a handoff whose action was withdrawn is no longer current")
+	}
+
+	// The Situation terminalized.
+	terminal := base
+	terminal.SourceTransitionSequence = handoff.Sequence + 1
+	terminal.TerminalAt = timePtr(now.Add(time.Hour))
+	terminal.ActionContract = hsTerminalContract()
+	if HandoffStillCurrent(handoff, terminal) {
+		t.Error("a terminal Situation has no current interruption")
+	}
+
+	// Attention de-escalated below the handoff's while the action text
+	// happened to survive.
+	calmer := base
+	calmer.SourceTransitionSequence = handoff.Sequence + 1
+	calmer.CurrentAttention = model.AttentionObserve
+	if handoff.Attention == model.AttentionObserve {
+		t.Fatal("fixture: the handoff is already at observe Attention")
+	}
+	if HandoffStillCurrent(handoff, calmer) {
+		t.Error("de-escalated Attention demotes the poke it followed")
+	}
+
+	// A summary that predates the handoff cannot confirm it.
+	stale := base
+	stale.SourceTransitionSequence = handoff.Sequence - 1
+	if HandoffStillCurrent(handoff, stale) {
+		t.Error("a summary older than the handoff cannot confirm it as current")
+	}
+}
+
+func TestHandoffStillCurrentEscalationPokeNeedsNoOperatorAction(t *testing.T) {
+	// hsChange's conclusion is the deterministic critical floor: an urgent
+	// escalation poke with no operator action.
+	c := hsChange(t)
+	c.Situation.Attention = model.AttentionUrgent
+	c.Assessment.Attention = model.AttentionUrgent
+	poke := hsOnly(t, c)
+	if poke.ActionContract.OperatorActionRequired != nil {
+		t.Fatal("fixture: the escalation poke must carry no operator action")
+	}
+	sum, err := ProjectEpisode(nil, poke)
+	if err != nil {
+		t.Fatalf("ProjectEpisode: %v", err)
+	}
+	later := sum
+	later.SourceTransitionSequence = poke.Sequence + 1
+	if !HandoffStillCurrent(poke, later) {
+		t.Error("an escalation poke stays current while its Attention holds")
+	}
+	later.CurrentAttention = model.AttentionInvestigate
+	if HandoffStillCurrent(poke, later) {
+		t.Error("an escalation poke is demoted once Attention de-escalates")
+	}
+}

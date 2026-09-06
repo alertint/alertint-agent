@@ -1048,3 +1048,46 @@ func TestSituationNotificationRuntimeRestartAlonePublishesNothing(t *testing.T) 
 		}
 	}
 }
+
+// TestSituationDelivererAnnotationDoesNotInvalidateUnchangedHandoff pins
+// review round 1, R1-F5: a broadcast_handoff is revalidated against the
+// durable ACTION basis, never against equality with the latest Transition
+// sequence. An attributed annotation necessarily advances the sequence
+// while changing neither Attention, lifecycle, nor the required operator
+// action — it must not demote a still-current handoff.
+func TestSituationDelivererAnnotationDoesNotInvalidateUnchangedHandoff(t *testing.T) {
+	occurred := sdMustTime(t, "2026-09-05T09:15:00Z")
+	now := sdMustTime(t, "2026-09-05T10:00:00Z")
+	action := model.OperatorActionInvestigateSituation
+	contract := model.ActionContract{
+		NextActor: model.NextActorOperator, OperatorActionRequired: &action,
+		NextUpdateAt: sdTimePtr(now.Add(time.Hour)), NextUpdateOn: []model.NextUpdateOn{model.NextUpdateOnMaterialInput},
+	}
+	handoff := sdTransition(6, model.LifecycleActive, contract, model.ReasonOperatorContractChanged, model.JournalOperatorContractChanged,
+		model.JournalData{Headline: "Operator action required: investigate_situation", OccurredAt: occurred},
+		model.ProjectionFacts{EffectiveStartedAt: occurred, EffectiveStartedAtBasis: model.SourceTimeBasisSourcePayload}, occurred)
+	note := handoff
+	note.ID = "annotation-transition"
+	note.Sequence = 7
+	note.Reason = model.ReasonOperatorArtifactRecorded
+	note.JournalKind = model.JournalOperatorNote
+	note.Actor = model.ActorAttributedOperator
+	artifact := "annotation-input"
+	note.OperatorArtifactInputID = &artifact
+	note.Journal = model.JournalData{Headline: "Added context", AttributedActor: "operator", OccurredAt: now}
+
+	fs := &fakeDelivererStore{
+		episode:     store.SituationEpisodeView{Summary: sdSummary(7, contract, occurred, now), SourceTransition: note},
+		transitions: map[string]model.Transition{handoff.ID: handoff},
+		rootOK:      true, rootChannel: "C-existing", rootTS: "50.5",
+	}
+	api := &fakeSlackAPI{}
+	d := NewSituationDeliverer(fs, api, "C-default", func() time.Time { return now })
+	got, err := d.Deliver(context.Background(), sdThreadIntent(model.EffectBroadcastHandoff, handoff.ID, handoff.Sequence, now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DeliveredAs != "broadcast" {
+		t.Fatalf("annotation with identical Attention/lifecycle/operator action suppressed a still-current handoff: delivered_as=%s", got.DeliveredAs)
+	}
+}

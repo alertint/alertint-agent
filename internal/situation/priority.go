@@ -164,3 +164,37 @@ func ClassifyPoke(prior *model.Transition, t model.Transition) PokeClass {
 		return PokeNone
 	}
 }
+
+// HandoffStillCurrent answers the deliverer's revalidation question for one
+// broadcast_handoff (spec.md "Recovery replay": "if its requested action is
+// no longer current, the same Transition is delivered as a non-broadcast
+// entry marked delayed and no longer current"). It compares the poke's
+// durable INTERRUPTION BASIS with the Situation's current authoritative
+// state — never mere equality with the latest Transition sequence, which
+// an attributed annotation advances without steering anything (review
+// round 1, R1-F5):
+//
+//   - a terminal Situation has no current interruption;
+//   - de-escalated Attention demotes the poke it followed;
+//   - a handoff that asked the operator for something stays current only
+//     while the current Operator contract still asks for the same thing
+//     (operatorContractTuple, the same basis PokeRequiredActionChanged is
+//     judged on); an escalation poke that asked for no operator action
+//     (newly urgent Attention, newly crossed criticality) is current while
+//     its Attention still holds.
+//
+// A summary that does not yet include the handoff cannot confirm it and
+// counts as not current.
+func HandoffStillCurrent(handoff model.Transition, summary model.EpisodeSummary) bool {
+	if summary.SourceTransitionSequence < handoff.Sequence || summary.TerminalAt != nil {
+		return false
+	}
+	if attentionRank(summary.CurrentAttention) < attentionRank(handoff.Attention) {
+		return false
+	}
+	if handoff.ActionContract.OperatorActionRequired == nil {
+		return true
+	}
+	return summary.ActionContract.OperatorActionRequired != nil &&
+		operatorContractTuple(summary.ActionContract) == operatorContractTuple(handoff.ActionContract)
+}

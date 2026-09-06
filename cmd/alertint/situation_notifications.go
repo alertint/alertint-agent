@@ -289,7 +289,10 @@ func (d *SituationDeliverer) deliverBroadcastHandoff(ctx context.Context, intent
 		return situation.NotificationDelivery{}, localDelivery("episode_view_unavailable",
 			fmt.Errorf("cmd/alertint: situation deliverer: load episode view: %w", err))
 	}
-	current := view.Summary.SourceTransitionSequence == tr.Sequence
+	// Revalidate the ACTION, not equality with the latest sequence: an
+	// annotation advances the sequence without changing what the operator
+	// is asked to do (situation.HandoffStillCurrent).
+	current := situation.HandoffStillCurrent(tr, view.Summary)
 
 	renderTr := tr // a local copy: the durable ledger row is never mutated.
 	if !current {
