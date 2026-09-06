@@ -46,8 +46,12 @@ type PublicationInput struct {
 	LastMainChannelPokeAt       *time.Time
 	SlackFloor                  model.InterruptionPriority
 	RepageCooldown              time.Duration
-	Drill                       bool
-	Now                         time.Time
+	// RecurrenceRepliesOff is notify.slack.recurrence_mode = off: a
+	// recurrence milestone still creates its Transition and still edits
+	// the root (the count updates in place), but posts no thread entry.
+	RecurrenceRepliesOff bool
+	Drill                bool
+	Now                  time.Time
 }
 
 // PlanNotificationIntents derives every durable Slack obligation one
@@ -149,6 +153,12 @@ func PlanNotificationIntents(in PublicationInput) ([]model.NotificationIntent, e
 	for _, tr := range in.Transitions {
 		poked := pokeSequence != 0 && tr.Sequence == pokeSequence
 		if tr.JournalKind == model.JournalNone && !poked {
+			continue
+		}
+		if tr.Reason == model.ReasonRecurrenceMilestone && in.RecurrenceRepliesOff {
+			// recurrence_mode: off keeps recurrence to the root's silent
+			// count update (the root_sync above); a milestone is never a
+			// poke, so nothing else is lost.
 			continue
 		}
 		if !poked {

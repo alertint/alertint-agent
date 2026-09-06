@@ -1509,16 +1509,16 @@ func scenarioRecurrenceLineageAndHandoff() historyScenario {
 // assertRecurrenceMilestoneReached proves the live Situation's durable
 // recurrence count reached want, and that its Episode summary carries it.
 //
-// Note deliberately NOT asserted here: a `recurrence_milestone` Transition
-// REASON. RecurrenceCount is len(prior terminal Situations for this exact
-// group), and migration 0014's situations_one_nonterminal_group_idx allows
-// at most one nonterminal Situation per group — so no sibling can
-// terminalize while this Situation is live, and the count (hence the
-// milestone rung in the materiality tuple) is fixed for its whole lifetime.
-// The reason itself is therefore unreachable from the natural pipeline in
-// this build; history_test.go's own TestBuildTransitionsCatalog covers it
-// at the derivation level. What replay must prove here is that the durable
-// recurrence count and its milestone rung survive a crash unchanged.
+// The count is prior terminal Situations for this exact group plus member
+// Incidents' recurrence-collapse occurrences; this scenario drives only the
+// lineage half, so the rung is reached at the first Transition rather than
+// by a later `recurrence_milestone` Transition. That later path — a re-fire
+// attaching as an occurrence, the membership input, the milestone
+// Transition and its quiet thread entry — is driven end to end by
+// cmd/alertint's fake-Slack test
+// (TestSituationSlackE2ERecurrenceMilestoneStaysInThread). What replay
+// must prove here is that the durable recurrence count and its milestone
+// rung survive a crash unchanged.
 func assertRecurrenceMilestoneReached(t *testing.T, st *store.Store, want int) {
 	t.Helper()
 	var got int

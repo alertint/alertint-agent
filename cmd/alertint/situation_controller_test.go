@@ -27,7 +27,7 @@ func TestSituationControllerRuntimePanicsOnEmptyOwner(t *testing.T) {
 			t.Fatal("expected a panic for an empty owner")
 		}
 	}()
-	newControllerRuntime(st, &fakeOneShotClient{}, nil, config.SituationsConfig{}, "", "  ", nil, nil)
+	newControllerRuntime(st, &fakeOneShotClient{}, nil, config.SituationsConfig{}, "", "", "  ", nil, nil)
 }
 
 // TestSituationsConfigToControllerConfigMapsEveryField pins Task 8's own
@@ -55,7 +55,7 @@ func TestSituationsConfigToControllerConfigMapsEveryField(t *testing.T) {
 		},
 	}
 	cfg.Slack = config.SituationSlackConfig{RepageCooldownSeconds: 600}
-	controllerCfg, workerCfg := situationsConfigToControllerConfig(cfg, model.InterruptionHigh, "owner-1")
+	controllerCfg, workerCfg := situationsConfigToControllerConfig(cfg, model.InterruptionHigh, " Off ", "owner-1")
 
 	// Plan 3 Task 9: the two publication-policy fields Task 5 added but left
 	// unwired must carry real operator configuration, not their zero values
@@ -65,6 +65,9 @@ func TestSituationsConfigToControllerConfigMapsEveryField(t *testing.T) {
 	}
 	if controllerCfg.RepageCooldown != 600*time.Second {
 		t.Fatalf("RepageCooldown = %v, want 600s from situations.slack.repage_cooldown_seconds", controllerCfg.RepageCooldown)
+	}
+	if controllerCfg.RecurrenceMode != situation.RecurrenceModeOff {
+		t.Fatalf("RecurrenceMode = %q, want the normalized notify.slack.recurrence_mode %q", controllerCfg.RecurrenceMode, situation.RecurrenceModeOff)
 	}
 
 	if controllerCfg.MaxL2CallsPerAttempt != 2 || controllerCfg.MaxWorkAttemptsPerInput != 5 {
@@ -135,7 +138,7 @@ func TestSituationControllerRuntimeSlackFloorMapsMinSeverity(t *testing.T) {
 
 func TestSituationControllerRuntimeRecoverAndBackfillOnEmptyStoreIsANoOp(t *testing.T) {
 	st := newTestFoundationStore(t)
-	rt := newControllerRuntime(st, &fakeOneShotClient{}, nil, config.SituationsConfig{}, "", "test-owner", nil, nil)
+	rt := newControllerRuntime(st, &fakeOneShotClient{}, nil, config.SituationsConfig{}, "", "", "test-owner", nil, nil)
 
 	report, err := rt.RecoverAndBackfill(context.Background(), time.Now().UTC())
 	if err != nil {
@@ -150,7 +153,7 @@ func TestSituationControllerRuntimeRecoverAndBackfillOnEmptyStoreIsANoOp(t *test
 func TestSituationControllerRuntimeStartDrainStop(t *testing.T) {
 	st := newTestFoundationStore(t)
 	cfg := config.SituationsConfig{ReconcilePollSeconds: 3600, LeaseSeconds: 300, HeartbeatSeconds: 30}
-	rt := newControllerRuntime(st, &fakeOneShotClient{}, nil, cfg, "", "test-owner", nil, nil)
+	rt := newControllerRuntime(st, &fakeOneShotClient{}, nil, cfg, "", "", "test-owner", nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -538,7 +541,7 @@ func TestSituationControllerRuntimeRecoverAndBackfillAuditsStartupHorizonExhaust
 	}
 
 	audit := &fakeControllerRuntimeAuditSink{}
-	rt := newControllerRuntime(st, &fakeOneShotClient{}, nil, config.SituationsConfig{}, "", "test-owner", audit, nil)
+	rt := newControllerRuntime(st, &fakeOneShotClient{}, nil, config.SituationsConfig{}, "", "", "test-owner", audit, nil)
 
 	report, err := rt.RecoverAndBackfill(context.Background(), now)
 	if err != nil {

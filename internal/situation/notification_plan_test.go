@@ -1053,3 +1053,49 @@ func TestPublicationAuthorityComesFromFloorOrValidatedReason(t *testing.T) {
 		t.Error("urgent Attention is only reachable through a deterministic floor and is publication authority")
 	}
 }
+
+// ----------------------------------------------------------------------
+// Recurrence mode (review round 1, R1-F6).
+// ----------------------------------------------------------------------
+
+// hsMilestoneCommit builds a published Situation's recurrence-milestone
+// commit: the recurrence count crosses the first rung with nothing else
+// changing.
+func hsMilestoneCommit(t *testing.T) (AuthoritativeChange, []model.Transition, model.EpisodeSummary) {
+	t.Helper()
+	c := hsNext(t)
+	c.RecurrenceCount = 5
+	trs, sum := hsCommitOf(t, c)
+	if len(trs) != 1 || trs[0].Reason != model.ReasonRecurrenceMilestone {
+		t.Fatalf("fixture: want one recurrence_milestone transition, got %+v", trs)
+	}
+	return c, trs, sum
+}
+
+func TestPlanNotificationIntentsRecurrenceModeOffKeepsTheRootEditOnly(t *testing.T) {
+	c, trs, sum := hsMilestoneCommit(t)
+	in := hsPub(c, trs, sum)
+	in.RecurrenceRepliesOff = true
+
+	got := hsPlan(t, in)
+	if roots := hsIntentsOfClass(got, model.EffectRootSync); len(roots) != 1 || roots[0].Status != model.IntentPending {
+		t.Fatalf("recurrence_mode off: want the silent root edit (the count updates in place), got %+v", roots)
+	}
+	if replies := hsReplyIntents(got); len(replies) != 0 {
+		t.Fatalf("recurrence_mode off: a milestone posted %d thread entries, want none", len(replies))
+	}
+}
+
+func TestPlanNotificationIntentsRecurrenceModeChangeGatedPostsAQuietMilestone(t *testing.T) {
+	c, trs, sum := hsMilestoneCommit(t)
+	in := hsPub(c, trs, sum) // RecurrenceRepliesOff false: change-gated
+
+	got := hsPlan(t, in)
+	threads := hsIntentsOfClass(got, model.EffectThreadAppend)
+	if len(threads) != 1 || threads[0].Status != model.IntentPending {
+		t.Fatalf("change-gated: want one quiet milestone thread entry, got %+v", threads)
+	}
+	if broadcasts := hsIntentsOfClass(got, model.EffectBroadcastHandoff); len(broadcasts) != 0 {
+		t.Fatalf("a recurrence milestone must never re-page the channel, got %+v", broadcasts)
+	}
+}

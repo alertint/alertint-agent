@@ -452,7 +452,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	// dependency of its own — corCfg/correlator.New's signature carries none,
 	// and its only path to Acute Triage is via incidentSink{skill: skill}.
 	crt, err := buildControllerRuntime(st, llmClient, llmHealth, skill, cfg.Situations,
-		cfg.Notify.Slack.MinSeverity, owner, auditor, logger)
+		cfg.Notify.Slack.MinSeverity, cfg.Notify.Slack.RecurrenceMode, owner, auditor, logger)
 	if err != nil {
 		return err
 	}

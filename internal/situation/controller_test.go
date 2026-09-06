@@ -1896,6 +1896,26 @@ func TestControllerHistoryRecurrenceCountComesFromPriorTerminalSituations(t *tes
 	}
 }
 
+// TestControllerHistoryRecurrenceCountAddsMemberOccurrences pins the other
+// half of the durable recurrence count: every re-fire that attached to a
+// member Incident as a recurrence-collapse occurrence, which is what lets a
+// milestone be reached while the Situation is open (review round 1, R1-F6).
+func TestControllerHistoryRecurrenceCountAddsMemberOccurrences(t *testing.T) {
+	in := ctReuseInput(t)
+	in.PriorSituations = []situation.CompletedSituation{
+		{ID: "prior-a", GroupKey: "group-1", EffectiveStartedAt: ctBaseTime.Add(-48 * time.Hour), TerminalAt: ctBaseTime.Add(-47 * time.Hour), TerminalReason: model.TerminalReasonObservationDeadline},
+	}
+	in.Incidents[0].Occurrences = 4
+
+	commit := ctReconcileOnce(t, in, ctBaseClaim(), nil)
+	if commit.History == nil || commit.History.Summary == nil {
+		t.Fatalf("expected history, got %+v", commit.History)
+	}
+	if got := commit.History.Summary.RecurrenceCount; got != 5 {
+		t.Fatalf("summary recurrence count = %d, want 5 (one prior Situation plus four occurrences)", got)
+	}
+}
+
 // TestControllerHistoryBlockedCycleStillCommitsHistory covers the blocked
 // result class: a cycle that may not dispatch further L2 work still
 // establishes authoritative state, so it still records the history that

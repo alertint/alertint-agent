@@ -418,14 +418,20 @@ notify:
 - `off` — recurrence never posts replies; the card's occurrence count still
   updates in place, silently.
 
-On the integration branch this setting has **no effect**, and neither does a
-re-fire that attaches to a Situation that is already open: it posts no reply
-and edits no root. A Situation's recurrence count is the number of *closed*
-Situations that preceded it in the same group, and only one Situation per
-group can be open at a time — so that count is fixed for the Situation's whole
-lifetime. `recurred ×N` therefore appears exactly once per Situation, on the
-root of the **next** Situation the group opens, at its first publication. The
-key is still accepted so an existing `config.yaml` keeps loading.
+On the `state-controller` branch recurrence is owned by the Situation. A
+Situation's recurrence count is the number of *closed* Situations that
+preceded it in the same group **plus** every re-fire that attached to one of
+its member incidents as an occurrence, so the count moves while the Situation
+is open. The root renders it as `recurred ×N`. When the count crosses a
+milestone rung (×5, ×10, ×25, ×50, ×100, then every ×100) the Situation
+records a `recurrence_milestone` Transition, edits its root, and — under
+`change-gated` — posts one quiet reply in its own thread; under `off` the
+root edit still happens and no reply is posted. A milestone never re-pages
+the channel, and a quiet Situation (one that never published) has no Slack
+recurrence trace at all. The `why:` real-world-change replies above are a
+released-binary feature; on this branch a real-world change reaches Slack as
+the material Transition it is (a severity rise raises Attention, a new
+symptom changes the assessment), not as a recurrence reply.
 
 ## System messages
 

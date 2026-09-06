@@ -249,6 +249,9 @@ type e2eFixture struct {
 	// slackFloor is the operator's notify.slack.min_severity floor every
 	// controller cycle runs under. Empty (the default) is "no floor".
 	slackFloor model.InterruptionPriority
+	// recurrenceMode is the operator's notify.slack.recurrence_mode. Empty
+	// (the default) is change-gated.
+	recurrenceMode string
 
 	deliverer *SituationDeliverer
 	worker    *situation.NotificationWorker
@@ -408,7 +411,8 @@ func (f *e2eFixture) seedQuiet(groupKey string) string {
 func (f *e2eFixture) controllerCycle() int {
 	f.t.Helper()
 	f.clock.advance(time.Minute)
-	cw := situation.NewControllerWorker(f.st, f.st, f.l2, situation.ControllerConfig{SlackFloor: f.slackFloor},
+	cw := situation.NewControllerWorker(f.st, f.st, f.l2,
+		situation.ControllerConfig{SlackFloor: f.slackFloor, RecurrenceMode: f.recurrenceMode},
 		situation.ControllerWorkerConfig{Owner: e2eOwner + ":controller", Now: f.clock.Now},
 		f.clock.Now, audit.New(f.st.DB()), slog.New(slog.DiscardHandler))
 	n, err := cw.Drain(f.ctx)
@@ -1455,5 +1459,137 @@ func TestSituationSlackE2EBlockedChannelOpensNoGap(t *testing.T) {
 	f.deliverUntilQuiet(12)
 	if remaining := len(f.pendingBesidesDelivered()); remaining != 0 {
 		t.Fatalf("%d intent(s) still owed after corrected configuration%s", remaining, f.intentSummary())
+	}
+}
+
+// ----------------------------------------------------------------------
+// 14. Recurrence milestones come from durable Store facts and stay in the
+//     owning Situation thread: re-fires attaching as occurrences move the
+//     count, a crossed rung is one quiet thread entry (never a broadcast),
+//     and recurrence_mode: off keeps only the silent root edit
+//     (review round 1, R1-F6).
+// ----------------------------------------------------------------------
+
+// refire attaches one recurrence-collapse occurrence to the Situation's
+// member Incident through the store's own occurrence path and enqueues
+// the membership_changed Situation input a re-fire produces, then applies
+// it — the same durable inputs ApplyCorrelatedDelivery leaves behind for a
+// re-fire the Correlator collapsed onto a judged Incident.
+func (f *e2eFixture) refire(groupKey string, n int) {
+	f.t.Helper()
+	incID := "inc-" + groupKey
+	for i := 0; i < n; i++ {
+		f.clock.advance(time.Minute)
+		now := f.clock.Now()
+		alertID := fmt.Sprintf("alert-%s-refire-%d", groupKey, i)
+		if _, err := f.st.DB().ExecContext(f.ctx, `
+			INSERT INTO alerts (id, fingerprint, status, labels_json, annotations_json, starts_at, received_at)
+			VALUES (?, ?, 'firing', '{"alertname":"HighLatency"}', '{}', ?, ?)`,
+			alertID, "fp-"+alertID, now.UTC().Format(time.RFC3339Nano), now.UTC().Format(time.RFC3339Nano)); err != nil {
+			f.t.Fatalf("insert re-fire alert: %v", err)
+		}
+		if _, err := f.st.InsertOccurrenceAndAttach(f.ctx, store.Occurrence{
+			IncidentID: incID, OccurredAt: now, Fingerprints: []string{"fp-" + alertID},
+			Payload: []store.OccurrenceMember{}, TriggerKind: "none",
+		}, alertID, now); err != nil {
+			f.t.Fatalf("attach occurrence: %v", err)
+		}
+		inputID := fmt.Sprintf("input-%s-refire-%d", groupKey, i)
+		if _, err := f.st.DB().ExecContext(f.ctx, `
+			INSERT INTO situation_input_outbox (id, idempotency_key, incident_id, kind, group_key, occurred_at, status)
+			VALUES (?, ?, ?, 'membership_changed', ?, ?, 'pending')`,
+			inputID, "idem:"+inputID, incID, groupKey, now.UTC().Format(time.RFC3339Nano)); err != nil {
+			f.t.Fatalf("insert re-fire situation input: %v", err)
+		}
+		claims, err := f.st.ClaimSituationInputs(f.ctx, "e2e-refire:"+inputID, now, time.Minute, 1)
+		if err != nil || len(claims) != 1 {
+			f.t.Fatalf("claim re-fire input: claims=%d err=%v", len(claims), err)
+		}
+		if err := f.st.ApplySituationInput(f.ctx, claims[0]); err != nil {
+			f.t.Fatalf("apply re-fire input: %v", err)
+		}
+	}
+}
+
+func TestSituationSlackE2ERecurrenceMilestoneStaysInThread(t *testing.T) {
+	f := newE2EFixture(t)
+	f.slack.setScript(alwaysOK)
+	// seed's five prior episodes put the live Situation at recurrence 5 —
+	// the first rung — on its first Transition.
+	sitID := f.seed("group=e2e-milestone")
+	f.deliverUntilQuiet(12)
+	_, rootTS := f.rootCoordinates(sitID)
+	if rootTS == "" {
+		t.Fatal("the first root never published")
+	}
+	before := len(f.slack.accepted())
+
+	// Five re-fires attach as occurrences: the count reaches 10, the next
+	// rung. Four of the five cycles cross no rung and are non-material.
+	f.refire("group=e2e-milestone", 5)
+	if n := f.controllerCycle(); n == 0 {
+		t.Fatal("no controller work was due after the re-fires")
+	}
+	milestones := f.scalarInt(`SELECT COUNT(*) FROM situation_transitions WHERE situation_id = ? AND reason = 'recurrence_milestone'`, sitID)
+	if milestones != 1 {
+		t.Fatalf("recurrence_milestone transitions = %d, want exactly 1 (the ×10 rung)%s", milestones, f.intentSummary())
+	}
+	if count := f.scalarInt(`SELECT json_extract(summary_json,'$.recurrence_count') FROM situation_episode_summaries WHERE situation_id = ?`, sitID); count != 10 {
+		t.Fatalf("episode recurrence count = %d, want 10 (five prior Situations plus five occurrences)", count)
+	}
+	f.deliverUntilQuiet(12)
+
+	var threadReplies, broadcasts, rootEdits int
+	for _, c := range f.slack.accepted()[before:] {
+		switch {
+		case c.Method == "chat.update":
+			rootEdits++
+		case c.Method == "chat.postMessage" && c.ThreadTS == rootTS && !c.Broadcast:
+			threadReplies++
+		case c.Method == "chat.postMessage" && (c.ThreadTS != rootTS || c.Broadcast):
+			broadcasts++
+		}
+	}
+	if rootEdits != 1 || threadReplies != 1 || broadcasts != 0 {
+		t.Fatalf("milestone delivery = %d root edit(s), %d quiet thread reply(ies), %d channel message(s); want 1, 1, 0: a milestone stays in the owning thread and never re-pages%s",
+			rootEdits, threadReplies, broadcasts, f.intentSummary())
+	}
+	if !strings.Contains(f.slack.accepted()[len(f.slack.accepted())-1].Text, "Recurrence milestone") {
+		t.Fatalf("the milestone reply does not render the milestone: %q", f.slack.accepted()[len(f.slack.accepted())-1].Text)
+	}
+}
+
+func TestSituationSlackE2ERecurrenceModeOffEditsTheRootOnly(t *testing.T) {
+	f := newE2EFixture(t)
+	f.recurrenceMode = situation.RecurrenceModeOff
+	f.slack.setScript(alwaysOK)
+	sitID := f.seed("group=e2e-milestone-off")
+	f.deliverUntilQuiet(12)
+	_, rootTS := f.rootCoordinates(sitID)
+	if rootTS == "" {
+		t.Fatal("the first root never published")
+	}
+	before := len(f.slack.accepted())
+
+	f.refire("group=e2e-milestone-off", 5)
+	if n := f.controllerCycle(); n == 0 {
+		t.Fatal("no controller work was due after the re-fires")
+	}
+	if milestones := f.scalarInt(`SELECT COUNT(*) FROM situation_transitions WHERE situation_id = ? AND reason = 'recurrence_milestone'`, sitID); milestones != 1 {
+		t.Fatalf("recurrence_milestone transitions = %d, want 1: off never suppresses history%s", milestones, f.intentSummary())
+	}
+	f.deliverUntilQuiet(12)
+	var rootEdits, posts int
+	for _, c := range f.slack.accepted()[before:] {
+		switch c.Method {
+		case "chat.update":
+			rootEdits++
+		case "chat.postMessage":
+			posts++
+		}
+	}
+	if rootEdits != 1 || posts != 0 {
+		t.Fatalf("recurrence_mode off delivered %d root edit(s) and %d post(s); want 1 and 0: only the silent count update%s",
+			rootEdits, posts, f.intentSummary())
 	}
 }

@@ -24,11 +24,12 @@ When a firing alert's group key matches an already-analyzed incident and lands
 inside the **collapse horizon**, AlertINT attaches it as an **occurrence** of
 that incident instead of minting a new one and spending another analysis. In a
 released binary the incident's Slack card edits in place — `recurred ×N ·
-last HH:MM`. On the `state-controller` branch nothing is written to Slack at
-all for that attach: the owning Situation's recurrence count counts the
-Situations that closed before it and cannot move while it is open, so
-`recurred ×N` shows only on the root of the next Situation the group opens.
-Either way a JSON occurrence line is written to stdout. No second LLM call.
+last HH:MM`. On the `state-controller` branch the attach moves the owning
+Situation's recurrence count (its closed predecessors plus its own re-fires):
+the root shows `recurred ×N`, and a crossed milestone rung records a
+`recurrence_milestone` Transition with one quiet reply in the Situation's
+thread. Either way a JSON occurrence line is written to stdout. No second LLM
+call.
 
 The horizon is two clocks: a sliding attach window (default 30 minutes from the
 last occurrence) and a hard ceiling on the time since the last analysis (default

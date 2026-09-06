@@ -399,7 +399,23 @@ type ControllerConfig struct {
 	// one (config situations.slack.repage_cooldown_seconds). Default 900s;
 	// it gates exactly one poke class (PokeRequiredActionChanged).
 	RepageCooldown time.Duration
+
+	// RecurrenceMode is the operator's notify.slack.recurrence_mode, kept
+	// from the legacy presentation path (spec.md "Journal": "Plan 3
+	// preserves current recurrence configuration and milestones"):
+	// RecurrenceModeChangeGated (the default, also for the empty value)
+	// posts a recurrence milestone as a quiet thread entry in the owning
+	// Situation thread; RecurrenceModeOff never posts one — the milestone
+	// Transition still exists and still edits the root's count. Neither
+	// ever re-pages the channel.
+	RecurrenceMode string
 }
+
+// Recurrence modes — the accepted values of notify.slack.recurrence_mode.
+const (
+	RecurrenceModeChangeGated = "change-gated"
+	RecurrenceModeOff         = "off"
+)
 
 const (
 	defaultControllerMaxL2CallsPerAttempt    = 2
@@ -1142,6 +1158,7 @@ func (c *Controller) buildHistory(claim Claim, basis historyBasis, commit Contro
 		LastMainChannelPokeAt:       basis.In.LastMainChannelPokeAt,
 		SlackFloor:                  c.cfg.SlackFloor,
 		RepageCooldown:              c.cfg.RepageCooldown,
+		RecurrenceRepliesOff:        c.cfg.RecurrenceMode == RecurrenceModeOff,
 		Drill:                       change.Drill,
 		Now:                         basis.Now,
 	}
@@ -1159,6 +1176,17 @@ func (c *Controller) buildHistory(claim Claim, basis historyBasis, commit Contro
 		return nil, nil //nolint:nilnil // "this cycle warranted no history" is a legitimate, non-error result.
 	}
 	return &history, nil
+}
+
+// recurrenceCountOf is the Situation's durable recurrence count: prior
+// terminal Situations in its exact group plus its member Incidents'
+// recurrence-collapse occurrences.
+func recurrenceCountOf(in SnapshotInput) int {
+	count := len(in.PriorSituations)
+	for _, inc := range in.Incidents {
+		count += inc.Occurrences
+	}
+	return count
 }
 
 // authoritativeChangeOf reduces one committed reconciliation to exactly what
@@ -1207,10 +1235,14 @@ func authoritativeChangeOf(claim Claim, basis historyBasis, commit ControllerCom
 		Incidents:        basis.Snap.Incidents,
 		TriageDecisions:  commit.TriageDecisions,
 		// spec.md: "recurrence count available from durable local Store
-		// facts" — this exact group's prior terminal Situations, the same
+		// facts" — this exact group's prior terminal Situations (the same
 		// durable lineage Plan 2 already loads for its duration
-		// distribution. No new counting machinery.
-		RecurrenceCount:   len(basis.In.PriorSituations),
+		// distribution) plus every re-fire that attached to a member
+		// Incident as a recurrence-collapse occurrence. The prior count
+		// alone is fixed for a Situation's whole lifetime (one nonterminal
+		// Situation per group), so occurrences are what let a milestone
+		// actually be reached while it is open (review round 1, R1-F6).
+		RecurrenceCount:   recurrenceCountOf(basis.In),
 		OperatorArtifacts: basis.In.PendingArtifacts,
 		Drill:             situationDrill(basis.In),
 		Now:               basis.Now,

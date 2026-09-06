@@ -423,14 +423,17 @@ func loadSituationDeliveriesTx(ctx context.Context, tx *sql.Tx, situationID stri
 
 // loadSituationIncidentStatesTx reads every current member Incident of
 // situationID plus its current incident_triage row (LEFT JOIN: an Incident
-// that has never reached "ready" has none — TriageState.Phase stays "").
+// that has never reached "ready" has none — TriageState.Phase stays "") and
+// its recurrence-collapse occurrence count (incident_occurrences), the
+// durable fact behind the Situation's recurrence milestones.
 func loadSituationIncidentStatesTx(ctx context.Context, tx *sql.Tx, situationID string) ([]situation.IncidentState, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT i.id, i.group_key, i.status, i.first_alert_at, i.last_alert_at, i.ready_at, i.alert_count,
 		       COALESCE(t.phase, ''), COALESCE(t.attempts, 0), t.next_at,
 		       t.decision, t.decision_reason, t.decision_input_version,
 		       t.material_fact_hash, t.membership_digest, t.incident_input_digest,
-		       t.assessment_id, t.decided_at
+		       t.assessment_id, t.decided_at,
+		       (SELECT COUNT(*) FROM incident_occurrences o WHERE o.incident_id = i.id)
 		FROM situation_incidents si
 		JOIN incidents i ON i.id = si.incident_id
 		LEFT JOIN incident_triage t ON t.incident_id = i.id
@@ -451,7 +454,7 @@ func loadSituationIncidentStatesTx(ctx context.Context, tx *sql.Tx, situationID 
 			&st.Triage.Phase, &st.Triage.Attempts, &nextAt,
 			&decision, &decisionReason, &decisionInputVersion,
 			&materialHash, &membershipDigest, &incidentInputDigest,
-			&assessmentID, &decidedAt); err != nil {
+			&assessmentID, &decidedAt, &st.Occurrences); err != nil {
 			return nil, fmt.Errorf("store: scan situation incident state: %w", err)
 		}
 

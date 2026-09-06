@@ -215,6 +215,16 @@ type IncidentState struct {
 	ReadyAt      time.Time
 	AlertCount   int
 	Triage       TriageState
+
+	// Occurrences is how many times this Incident's condition re-fired and
+	// attached as a recurrence-collapse occurrence (incident_occurrences
+	// rows) — the durable local Store fact behind the Situation's
+	// recurrence count and its milestones (spec.md: "recurrence count
+	// available from durable local Store facts"; review round 1, R1-F6).
+	// It is not part of any digest or hash: a re-fire reaches the
+	// controller as its own Situation input, and only the milestone RUNG
+	// is material.
+	Occurrences int
 }
 
 // CompletedSituation is one prior terminal Situation in the same exact-group

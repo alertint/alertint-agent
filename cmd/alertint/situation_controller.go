@@ -75,6 +75,7 @@ func newControllerRuntime(
 	skill *acutetriage.Skill,
 	cfg config.SituationsConfig,
 	slackMinSeverity string,
+	recurrenceMode string,
 	owner string,
 	auditSink situation.AuditSink,
 	logger *slog.Logger,
@@ -82,7 +83,7 @@ func newControllerRuntime(
 	if strings.TrimSpace(owner) == "" {
 		panic("cmd/alertint: controller runtime requires a non-empty owner")
 	}
-	controllerCfg, workerCfg := situationsConfigToControllerConfig(cfg, slackInterruptionFloor(slackMinSeverity), owner)
+	controllerCfg, workerCfg := situationsConfigToControllerConfig(cfg, slackInterruptionFloor(slackMinSeverity), recurrenceMode, owner)
 
 	worker := situation.NewControllerWorker(st, st, assessClient, controllerCfg, workerCfg, nil, auditSink, logger)
 
@@ -119,6 +120,7 @@ func buildControllerRuntime(
 	skill *acutetriage.Skill,
 	cfg config.SituationsConfig,
 	slackMinSeverity string,
+	recurrenceMode string,
 	owner string,
 	auditSink situation.AuditSink,
 	logger *slog.Logger,
@@ -127,7 +129,7 @@ func buildControllerRuntime(
 	if err != nil {
 		return nil, fmt.Errorf("situation controller: %w", err)
 	}
-	crt := newControllerRuntime(st, assessClient, skill, cfg, slackMinSeverity, owner, auditSink, logger)
+	crt := newControllerRuntime(st, assessClient, skill, cfg, slackMinSeverity, recurrenceMode, owner, auditSink, logger)
 	crt.SetDependencyRecoveryWaker(llmHealthDependencyWaker{tracker: llmHealth, st: st})
 	crt.SetAssessmentHealthObserver(llmHealthAssessmentObserver{tracker: llmHealth})
 	return crt, nil
@@ -153,12 +155,15 @@ func buildControllerRuntime(
 // situations.slack.repage_cooldown_seconds -> ControllerConfig.
 // RepageCooldown. Left at their zero values they would silently mean "no
 // floor" and "the built-in 900s default", so an operator who configured
-// either would have been ignored.
+// either would have been ignored. notify.slack.recurrence_mode ->
+// ControllerConfig.RecurrenceMode carries the preserved recurrence
+// configuration into Situation planning (review round 1, R1-F6).
 func situationsConfigToControllerConfig(cfg config.SituationsConfig, slackFloor model.InterruptionPriority,
-	owner string) (situation.ControllerConfig, situation.ControllerWorkerConfig) {
+	recurrenceMode, owner string) (situation.ControllerConfig, situation.ControllerWorkerConfig) {
 	controllerCfg := situation.ControllerConfig{
 		SlackFloor:     slackFloor,
 		RepageCooldown: time.Duration(cfg.Slack.RepageCooldownSeconds) * time.Second,
+		RecurrenceMode: strings.ToLower(strings.TrimSpace(recurrenceMode)),
 		Cadence: situation.CadenceTempo{
 			Fast:   time.Duration(cfg.Cadence.FastSeconds) * time.Second,
 			Normal: time.Duration(cfg.Cadence.NormalSeconds) * time.Second,

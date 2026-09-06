@@ -1206,6 +1206,9 @@ func TestLoadReconciliationInputReadsCoherentSnapshot(t *testing.T) {
 	if len(snap.Incidents) != 1 || snap.Incidents[0].ID != incID {
 		t.Fatalf("snapshot incidents = %+v, want exactly the one member incident", snap.Incidents)
 	}
+	if snap.Incidents[0].Occurrences != 0 {
+		t.Fatalf("occurrences = %d before any re-fire, want 0", snap.Incidents[0].Occurrences)
+	}
 	if snap.Incidents[0].Triage.Phase != "awaiting_decision" {
 		t.Fatalf("triage phase = %q, want awaiting_decision", snap.Incidents[0].Triage.Phase)
 	}
@@ -2491,5 +2494,38 @@ func TestCommitControllerPersistsEligibleReasonCandidateSet(t *testing.T) {
 	}
 	if view.EligibleReasons == nil || len(view.EligibleReasons) != 0 {
 		t.Fatalf("eligible reasons after an empty commit = %#v, want a non-nil empty slice", view.EligibleReasons)
+	}
+}
+
+// TestLoadReconciliationInputCountsMemberOccurrences proves a member
+// Incident's recurrence-collapse occurrences reach the snapshot — the
+// durable fact behind the Situation's recurrence milestones (review round
+// 1, R1-F6).
+func TestLoadReconciliationInputCountsMemberOccurrences(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	sitID, _ := snSeedOneCycle(t, st, "group-occurrences", now)
+
+	var incID string
+	if err := st.db.QueryRowContext(ctx, `SELECT incident_id FROM situation_incidents WHERE situation_id = ?`, sitID).Scan(&incID); err != nil {
+		t.Fatalf("member incident: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := st.InsertOccurrence(ctx, Occurrence{
+			IncidentID: incID, OccurredAt: now.Add(time.Duration(i+1) * time.Minute),
+			Fingerprints: []string{"fp-occ"}, Payload: []OccurrenceMember{}, TriggerKind: "none",
+		}); err != nil {
+			t.Fatalf("InsertOccurrence %d: %v", i, err)
+		}
+	}
+	shMakeDue(t, st, sitID, now.Add(-time.Minute))
+	claim := claimSituation(t, st, sitID, "controller-occ", now.Add(5*time.Minute))
+	in, err := st.LoadReconciliationInput(ctx, claim, now.Add(5*time.Minute))
+	if err != nil {
+		t.Fatalf("LoadReconciliationInput: %v", err)
+	}
+	if len(in.Incidents) != 1 || in.Incidents[0].Occurrences != 3 {
+		t.Fatalf("member occurrences = %+v, want exactly 3 on the one member", in.Incidents)
 	}
 }

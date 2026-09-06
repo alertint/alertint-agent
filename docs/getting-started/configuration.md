@@ -191,13 +191,13 @@ re-triaged as brand new every time it re-fires. When an alert whose group key
 matches an already-analyzed incident fires again inside the collapse horizon,
 it attaches as a lightweight occurrence instead of minting a new incident and
 spending another LLM call — a released binary edits the Incident card in place
-to `recurred ×N`. On the `state-controller` branch an attach to a Situation
-that is still live produces **no Slack trace at all**: a Situation's recurrence
-count is the number of *already-closed* Situations for its group and is
-therefore fixed for its whole lifetime, so `recurred ×N` appears only on the
-root of the **next** Situation that opens for the group, rendered once at that
-Situation's first publication. This is deterministic, free, and always on;
-there is no enable switch, only the knobs below.
+to `recurred ×N`. On the `state-controller` branch the attach feeds the owning
+Situation's recurrence count (its closed predecessors plus its own re-fires);
+the root shows `recurred ×N`, and crossing a milestone rung records a
+`recurrence_milestone` Transition with one quiet thread reply (see
+[Slack](../notifications/slack.md#recurrence-resurfacing)). This is
+deterministic, free, and always on; there is no enable switch, only the knobs
+below.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -378,7 +378,7 @@ starts when the aggregate LLM dependency state first becomes `degraded` or
 | `slack.bot_token_env` | string | — | Required when `slack.enabled: true`. Env var name holding the Slack bot token (`xoxb-…`, requires the `chat:write` scope; no history-read scope is ever requested) |
 | `slack.channel` | string | — | Required when `slack.enabled: true`. Channel name (e.g. `#alerts`) or ID (e.g. `C1234567890`) |
 | `slack.min_severity` | string | `low` | The channel-noise floor (`low` \| `medium` \| `high`); stdout always emits regardless. In a released binary it compares against the finding's severity, and an incident suppressed at firing is also suppressed at resolution. On the `state-controller` branch it is the minimum **interruption priority** a *new* main-channel interruption must meet — never alert severity and never a model claim; `critical` always passes, a withheld interruption is durably recorded, and the floor never suppresses Situation state, MCP history, a root edit, or a journal reply. The default posts everything. |
-| `slack.recurrence_mode` | string | `change-gated` | How a recurring incident resurfaces in its thread: `change-gated` posts a thread reply only on a real-world change (severity rise, new symptom, faster cadence) or a milestone (×5/×10/×25/×50/×100, then every ×100) — replies stay in the thread, nothing extra is sent to the channel; `off` keeps recurrence to a silent card count-bump. **No effect on the `state-controller` branch**: an occurrence attaching to a live Situation posts nothing and edits nothing there, because that Situation's recurrence count cannot change while it is open — `recurred ×N` shows only on the root of the *next* Situation that opens for the group. The key is still accepted so an existing config keeps loading. See [Slack](../notifications/slack.md) for details. |
+| `slack.recurrence_mode` | string | `change-gated` | How a recurring incident resurfaces in its thread: `change-gated` posts a thread reply only on a real-world change (severity rise, new symptom, faster cadence) or a milestone (×5/×10/×25/×50/×100, then every ×100) — replies stay in the thread, nothing extra is sent to the channel; `off` keeps recurrence to a silent card count-bump. On the `state-controller` branch the setting governs the owning Situation's milestone replies: `change-gated` posts one quiet reply in the Situation thread when the recurrence count crosses a rung, `off` keeps only the silent root edit; the `why:` change replies are released-binary only. See [Slack](../notifications/slack.md) for details. |
 
 At startup the agent logs one `notifiers ready` line listing the active sinks
 (and the Slack channel) so you can see where findings will go. Every analysis
