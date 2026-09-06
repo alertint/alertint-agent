@@ -401,6 +401,18 @@ func classifyLostNotificationClaim(ctx context.Context, q rowQueryer, intentID s
 // a root projection only, the Situation's durable root coordinates — the
 // single place slack_channel/slack_root_ts is ever written, and only when
 // the matching fenced root delivery is acknowledged.
+//
+// One acknowledgement is honored even though its row is no longer pending:
+// a root projection that a concurrent controller commit SUPERSEDED while
+// this very claim was in flight (supersedePendingRootSyncTx clears the
+// claim but keeps its token). Slack has already accepted that post; if the
+// Situation has no root yet, those coordinates ARE its root, and the
+// replacement projection must edit them, not post a second root. The row
+// itself stays superseded (migration 0018 forbids a superseded row becoming
+// delivered) and the call still reports ErrNotificationIntentSuperseded; the
+// claim token proves the acknowledging worker was the last holder, so a
+// stale worker whose lease had already been reclaimed can never write
+// coordinates (ADR-0049's accepted external duplicate stays external).
 func (s *Store) MarkNotificationDelivered(ctx context.Context, claim situation.NotificationClaim,
 	delivery situation.NotificationDelivery, now time.Time) error {
 	if err := validateNotificationClaim(claim); err != nil {
@@ -438,7 +450,7 @@ func (s *Store) MarkNotificationDelivered(ctx context.Context, claim situation.N
 		return fmt.Errorf("store: count delivered notification intent: %w", err)
 	}
 	if n != 1 {
-		return classifyLostNotificationClaim(ctx, tx, claim.Intent.ID)
+		return s.acknowledgeSupersededDeliveryTx(ctx, tx, claim, delivery)
 	}
 
 	// Which Situation's root this is comes from the intent ROW, never from
@@ -456,6 +468,45 @@ func (s *Store) MarkNotificationDelivered(ctx context.Context, claim situation.N
 		return fmt.Errorf("store: commit mark notification delivered: %w", err)
 	}
 	return nil
+}
+
+// acknowledgeSupersededDeliveryTx handles the one lost-fence case a
+// successful delivery may still act on (see MarkNotificationDelivered): the
+// row was superseded under this exact claim token. For a root projection it
+// records the accepted post as the Situation's root coordinates when none
+// exist yet — never overwriting a root that already exists, since a
+// superseded EDIT changed nothing about where the root is. Every other
+// lost fence is classified as before.
+func (s *Store) acknowledgeSupersededDeliveryTx(ctx context.Context, tx *sql.Tx, claim situation.NotificationClaim,
+	delivery situation.NotificationDelivery) error {
+	var status, effectClass string
+	var token int64
+	var situationID sql.NullString
+	err := tx.QueryRowContext(ctx,
+		`SELECT status, effect_class, claim_token, situation_id FROM notification_intents WHERE id = ?`, claim.Intent.ID).
+		Scan(&status, &effectClass, &token, &situationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("store: notification intent %s: %w", claim.Intent.ID, ErrNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("store: classify lost notification claim: %w", err)
+	}
+	if situationmodel.IntentStatus(status) != situationmodel.IntentSuperseded {
+		return ErrNotificationClaimLost
+	}
+	if token != claim.ClaimToken || situationmodel.EffectClass(effectClass) != situationmodel.EffectRootSync || !situationID.Valid {
+		return ErrNotificationIntentSuperseded
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE situations SET slack_channel = ?, slack_root_ts = ?
+		WHERE id = ? AND slack_root_ts IS NULL`,
+		delivery.Channel, delivery.MessageTS, situationID.String); err != nil {
+		return fmt.Errorf("store: persist superseded first-post root coordinates: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit superseded first-post root coordinates: %w", err)
+	}
+	return ErrNotificationIntentSuperseded
 }
 
 // RetryNotificationIntent releases a claimed intent back for a later retry.

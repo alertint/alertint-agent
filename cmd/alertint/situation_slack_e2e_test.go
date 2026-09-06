@@ -1266,3 +1266,45 @@ func TestSituationSlackE2EQuietSituationSendsNothing(t *testing.T) {
 		t.Fatal("the quiet Situation has no Transition; silence must not erase history")
 	}
 }
+
+// ----------------------------------------------------------------------
+// 11. A first root post that Slack accepted is never discarded because a
+//     concurrent controller commit superseded its projection mid-flight:
+//     the replacement edits that root, it does not post a second one
+//     (review round 1, R1-F3).
+// ----------------------------------------------------------------------
+
+func TestSituationSlackE2ESupersededSuccessfulFirstPostDoesNotCreateSecondRoot(t *testing.T) {
+	f := newE2EFixture(t)
+	f.seed("group=e2e-post-race")
+	changed := false
+	f.slack.setScript(func(method string, call *e2eSlackCall) e2eSlackReply {
+		if method == "chat.postMessage" && call.ThreadTS == "" && !changed {
+			changed = true
+			// Slack has accepted this post; before the worker can
+			// acknowledge it, a material commit replaces its projection.
+			f.l2.steer(model.AttentionInvestigate, true)
+			f.clock.advance(3 * time.Hour)
+			if f.controllerCycle() == 0 {
+				t.Error("fixture did not run concurrent controller commit")
+			}
+		}
+		return e2eSlackReply{}
+	})
+	f.deliverUntilQuiet(20)
+	if !changed {
+		t.Fatal("the fixture never intercepted a first root post")
+	}
+	roots := 0
+	for _, c := range f.slack.accepted() {
+		if c.Method == "chat.postMessage" && c.ThreadTS == "" {
+			roots++
+		}
+	}
+	if roots != 1 {
+		t.Fatalf("%d successful root posts with no transport uncertainty or process crash; in-flight supersession discarded the first coordinates%s", roots, f.intentSummary())
+	}
+	if remaining := len(f.pendingBesidesDelivered()); remaining != 0 {
+		t.Fatalf("%d effect(s) still owed once the queue drained%s", remaining, f.intentSummary())
+	}
+}

@@ -514,17 +514,19 @@ func insertNotificationIntentsTx(ctx context.Context, tx *sql.Tx, situationID st
 // FOR THE NOTIFICATION WORKER: superseding CLEARS the intent's
 // claim_owner/lease_expires_at (migration 0018's
 // `claim_owner IS NULL OR status = 'pending'` CHECK forbids leaving them on
-// a non-pending row) and its retry_at. A worker holding a live claim on a
-// root_sync can therefore have that claim taken out from under it by a
-// concurrent controller commit, and must re-read the intent's status before
-// writing any delivery outcome: a superseded row can never become
-// 'delivered', because 0018's
+// a non-pending row) and its retry_at, but KEEPS claim_token. A worker
+// holding a live claim on a root_sync can therefore have that claim taken
+// out from under it by a concurrent controller commit; a superseded row can
+// never become 'delivered', because 0018's
 // `CHECK ((status = 'superseded') = (supersession_reason IS NOT NULL))`
 // aborts that write. Treat the lost claim as the expected R4 outcome — the
 // newer root projection supersedes what this one would have posted — not as
-// a delivery failure. Supersession is performed here, inside the
-// authoritative commit, precisely because the pending-root index makes it
-// unorderable anywhere else; the worker must not reimplement it.
+// a delivery failure. The kept token is what lets MarkNotificationDelivered
+// still honor a FIRST POST Slack already accepted under it: those
+// coordinates become the Situation's root, so the replacement edits them
+// instead of posting a second root. Supersession is performed here, inside
+// the authoritative commit, precisely because the pending-root index makes
+// it unorderable anywhere else; the worker must not reimplement it.
 func supersedePendingRootSyncTx(ctx context.Context, tx *sql.Tx, situationID, replacementID string) error {
 	var pending int
 	if err := tx.QueryRowContext(ctx, `

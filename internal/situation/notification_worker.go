@@ -848,12 +848,19 @@ func (w *NotificationWorker) acknowledgeDelivered(ctx context.Context, claim Not
 	case errors.Is(err, ErrNotificationIntentSuperseded):
 		// R4: a newer root projection replaced this one mid-flight. The
 		// message that just went out is the older projection's; the newer
-		// one edits the same root next round. Expected, not a failure.
+		// one edits the same root next round — the store keeps a first
+		// post's coordinates as the Situation's root precisely so that it
+		// edits rather than posts again. Expected, not a failure.
 		w.count(func(s *NotificationWorkerStats) { s.Superseded++ })
 		span.SetAttributes(AttrResultClass.String(DeliverResultSuperseded))
-		w.auditAppend(ctx, auditKindNotificationSuperseded, intentAuditPayload(claim))
+		payload := intentAuditPayload(claim)
+		payload["delivered_as"] = delivery.DeliveredAs
+		payload["channel"] = delivery.Channel
+		payload["message_ts"] = delivery.MessageTS
+		w.auditAppend(ctx, auditKindNotificationSuperseded, payload)
 		w.logger.Info("situation: notification worker: root projection superseded mid-delivery",
-			"intent_id", claim.Intent.ID, "situation_id", derefString(claim.Intent.SituationID))
+			"intent_id", claim.Intent.ID, "situation_id", derefString(claim.Intent.SituationID),
+			"channel", delivery.Channel, "message_ts", delivery.MessageTS)
 	case errors.Is(err, ErrNotificationClaimLost):
 		w.count(func(s *NotificationWorkerStats) { s.ClaimsLost++ })
 		span.SetAttributes(AttrResultClass.String(DeliverResultClaimLost))
@@ -959,6 +966,19 @@ func (w *NotificationWorker) heartbeatLoop(ctx context.Context, cancel context.C
 			beatCtx, beatCancel := detachedWriteContext()
 			err := w.store.HeartbeatNotificationClaim(beatCtx, claim, w.now().UTC(), w.cfg.Lease) //nolint:contextcheck // by design: detached from the possibly-canceled delivery context
 			beatCancel()
+			if errors.Is(err, ErrNotificationIntentSuperseded) {
+				// A concurrent controller commit replaced this root
+				// projection. Nobody else can claim a superseded row, so
+				// the in-flight Slack call is still ours to finish and
+				// acknowledge: canceling it here would manufacture an
+				// uncertain outcome, and a first post Slack has already
+				// accepted must reach the store (MarkNotificationDelivered
+				// keeps its coordinates). Stop renewing a lease the row no
+				// longer carries.
+				w.logger.Info("situation: notification worker: root projection superseded mid-delivery; finishing the attempt",
+					"intent_id", claim.Intent.ID)
+				return
+			}
 			if err != nil {
 				w.logger.Warn("situation: notification worker: heartbeat failed; abandoning claim",
 					"intent_id", claim.Intent.ID, "err", err)

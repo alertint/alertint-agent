@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -219,6 +220,9 @@ type nwDeliverer struct {
 	probeCalls int
 	calls      []model.NotificationIntent
 	deliver    func(model.NotificationIntent) (NotificationDelivery, error)
+	// onCtx, when set, observes the delivery context after deliver
+	// returns — for tests that need to know whether it was canceled.
+	onCtx func(ctx context.Context)
 }
 
 func (d *nwDeliverer) Probe(context.Context) error {
@@ -236,8 +240,14 @@ func (d *nwDeliverer) Deliver(ctx context.Context, intent model.NotificationInte
 	if fn == nil {
 		return NotificationDelivery{Channel: "C", MessageTS: "1.1", DeliveredAs: "root"}, nil
 	}
-	_ = ctx
-	return fn(intent)
+	out, err := fn(intent)
+	d.mu.Lock()
+	observe := d.onCtx
+	d.mu.Unlock()
+	if observe != nil {
+		observe(ctx)
+	}
+	return out, err
 }
 
 func (d *nwDeliverer) clientMessageIDs() []string {
@@ -739,6 +749,66 @@ func TestNotificationWorkerHeartbeatLossAbandonsTheClaim(t *testing.T) {
 	})
 	if got := w.Stats().ClaimsLost; got != 1 {
 		t.Fatalf("Stats().ClaimsLost = %d, want 1", got)
+	}
+}
+
+// TestNotificationWorkerHeartbeatSupersessionFinishesTheAttempt proves the
+// other lost-fence case is NOT abandoned: a root projection superseded by a
+// concurrent commit mid-flight has no other holder, so the in-flight Slack
+// call completes and its outcome is acknowledged (the store keeps a first
+// post's coordinates) instead of being canceled into an uncertain result
+// (review round 1, R1-F3).
+func TestNotificationWorkerHeartbeatSupersessionFinishesTheAttempt(t *testing.T) {
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	store := &nwStore{
+		batches:       [][]NotificationClaim{{nwClaim("intent-superseded-inflight", 1)}},
+		heartbeatErr:  ErrNotificationIntentSuperseded,
+		deliverAckErr: ErrNotificationIntentSuperseded,
+	}
+	released := make(chan struct{})
+	var canceled atomic.Bool
+	deliverer := &nwDeliverer{deliver: func(model.NotificationIntent) (NotificationDelivery, error) {
+		<-released
+		return NotificationDelivery{Channel: "C", MessageTS: "1.1", DeliveredAs: "root"}, nil
+	}}
+	deliverer.onCtx = func(ctx context.Context) {
+		<-released
+		if ctx.Err() != nil {
+			canceled.Store(true)
+		}
+	}
+	w := NewNotificationWorker(store, deliverer, NotificationWorkerConfig{
+		Owner:     "notify-a",
+		Heartbeat: time.Millisecond,
+		Rand:      func() float64 { return 0.5 },
+	}, func() time.Time { return now }, nwLogger())
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := w.RunOnce(context.Background()); err != nil {
+			t.Errorf("RunOnce: %v", err)
+		}
+	}()
+	for {
+		var beats int
+		store.snapshot(func(s *nwStore) { beats = s.heartbeats })
+		if beats > 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(released)
+	<-done
+
+	if canceled.Load() {
+		t.Fatal("the in-flight delivery was canceled on supersession; the attempt must finish and be acknowledged")
+	}
+	if got := w.Stats().ClaimsLost; got != 0 {
+		t.Fatalf("Stats().ClaimsLost = %d, want 0: supersession is not a lost lease", got)
+	}
+	if got := w.Stats().Superseded; got != 1 {
+		t.Fatalf("Stats().Superseded = %d, want 1: the outcome was acknowledged", got)
 	}
 }
 

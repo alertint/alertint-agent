@@ -1011,3 +1011,100 @@ func TestCommitWithheldRootRetiresThePendingRootItReplaces(t *testing.T) {
 		t.Fatalf("%d root projection(s) still pending behind a withheld replacement", pending)
 	}
 }
+
+// ----------------------------------------------------------------------
+// In-flight supersession keeps a successful first post (review round 1,
+// R1-F3).
+// ----------------------------------------------------------------------
+
+func TestMarkNotificationDeliveredSupersededFirstPostKeepsCoordinates(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	id, first := snSeedOneCycle(t, st, "review-inflight-post", now)
+	posted := snClaimOne(t, st, now)
+	if posted.Intent.EffectClass != situationmodel.EffectRootSync {
+		t.Fatalf("claimed %s, want the first root projection", posted.Intent.EffectClass)
+	}
+	// Slack accepts the first post, but another controller commit replaces
+	// its projection before the success response is acknowledged.
+	snCommit(t, st, id, &first, now.Add(time.Second))
+	err := st.MarkNotificationDelivered(ctx, posted,
+		situation.NotificationDelivery{Channel: "C-sit", MessageTS: "100.1", DeliveredAs: "root"}, now.Add(2*time.Second))
+	if !errors.Is(err, ErrNotificationIntentSuperseded) {
+		t.Fatalf("ack error = %v, want ErrNotificationIntentSuperseded: the row itself stays superseded", err)
+	}
+	_, ts, ok, readErr := st.GetSituationRootCoordinates(ctx, id)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !ok || ts != "100.1" {
+		t.Fatalf("successful first post lost coordinates after supersession: published=%v ts=%q; the replacement would post a second root", ok, ts)
+	}
+	if got := snIntent(t, st, posted.Intent.ID).Status; got != situationmodel.IntentSuperseded {
+		t.Fatalf("superseded row status = %s, want superseded (never delivered)", got)
+	}
+	// The replacement projection now edits that root: it is claimable and
+	// its delivery lands on the same coordinates.
+	replacement := snClaimOne(t, st, now.Add(3*time.Second))
+	if replacement.Intent.EffectClass != situationmodel.EffectRootSync {
+		t.Fatalf("claimed %s, want the replacement root projection", replacement.Intent.EffectClass)
+	}
+	snDeliver(t, st, replacement, "100.1", now.Add(4*time.Second))
+	_, ts, _, _ = st.GetSituationRootCoordinates(ctx, id)
+	if ts != "100.1" {
+		t.Fatalf("root coordinates = %q after the replacement delivered, want the first post's 100.1", ts)
+	}
+}
+
+func TestMarkNotificationDeliveredSupersededAckFromAStaleHolderWritesNothing(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	id, first := snSeedOneCycle(t, st, "review-stale-holder", now)
+	stale := snClaimOne(t, st, now)
+	// The stale holder's five-minute lease expires and a second worker
+	// reclaims the same projection (a new claim token); only then is it
+	// superseded.
+	if _, err := st.RecoverExpiredNotificationClaims(ctx, now.Add(6*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	fresh := snClaimOne(t, st, now.Add(6*time.Minute))
+	if fresh.ClaimToken == stale.ClaimToken {
+		t.Fatal("fixture: the reclaim did not advance the claim token")
+	}
+	snCommit(t, st, id, &first, now.Add(7*time.Minute))
+	err := st.MarkNotificationDelivered(ctx, stale,
+		situation.NotificationDelivery{Channel: "C-sit", MessageTS: "77.7", DeliveredAs: "root"}, now.Add(8*time.Minute))
+	if !errors.Is(err, ErrNotificationIntentSuperseded) {
+		t.Fatalf("ack error = %v, want ErrNotificationIntentSuperseded", err)
+	}
+	if _, _, ok, _ := st.GetSituationRootCoordinates(ctx, id); ok {
+		t.Fatal("a stale holder's acknowledgement wrote root coordinates; only the last claim holder may")
+	}
+}
+
+func TestMarkNotificationDeliveredSupersededEditNeverMovesTheRoot(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	id, first := snSeedOneCycle(t, st, "review-superseded-edit", now)
+	snDeliver(t, st, snClaimOne(t, st, now), "100.1", now)
+	snDeliver(t, st, snClaimOne(t, st, now), "100.2", now)
+	second := snCommit(t, st, id, &first, now.Add(time.Minute))
+	edit := snClaimOne(t, st, now.Add(time.Minute))
+	if edit.Intent.EffectClass != situationmodel.EffectRootSync {
+		t.Fatalf("claimed %s, want the root edit", edit.Intent.EffectClass)
+	}
+	// A third material commit (the contract hands the next move back to
+	// AlertINT) replaces the claimed edit's projection mid-flight.
+	snCommitWith(t, st, id, &second, shRunningTriageContract(now.Add(3*time.Minute)), now.Add(2*time.Minute))
+	err := st.MarkNotificationDelivered(ctx, edit,
+		situation.NotificationDelivery{Channel: "C-sit", MessageTS: "100.1", DeliveredAs: "root"}, now.Add(3*time.Minute))
+	if !errors.Is(err, ErrNotificationIntentSuperseded) {
+		t.Fatalf("ack error = %v, want ErrNotificationIntentSuperseded", err)
+	}
+	if _, ts, _, _ := st.GetSituationRootCoordinates(ctx, id); ts != "100.1" {
+		t.Fatalf("root coordinates = %q, want the original 100.1: an edit never re-anchors a root", ts)
+	}
+}
