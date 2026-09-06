@@ -395,3 +395,138 @@ func TestDeliveryGapConfigurationGenerationReactivatesBlockedIntents(t *testing.
 		t.Fatalf("reactivated intent = %+v, want pending with its attempts preserved", reactivated)
 	}
 }
+
+// TestDeliveryGapWithheldEpisodeDoesNotHoldReplay pins review round 2,
+// R2-F1: a floor-withheld, never-published Situation's pending journal is
+// not delayed Slack work — it neither counts toward the recovery notice
+// nor keeps a generation replaying once every actual obligation drained.
+func TestDeliveryGapWithheldEpisodeDoesNotHoldReplay(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	withheldID := snSeedWithheldEpisode(t, st, "review-withheld", now)
+	snSeedOneCycle(t, st, "review-deliverable", now)
+
+	snFail(t, st, now)
+	if _, err := st.OpenDueDeliveryGap(ctx, now.Add(5*time.Minute), 5*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	generation, _, err := st.RecoverDeliveryGap(ctx, now.Add(7*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gap, err := st.GetDeliveryGap(ctx, generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gap.AffectedSituationCount != 1 {
+		t.Errorf("recovery notice counts %d affected Situations, want 1: the floor-withheld episode had no Slack delivery obligation", gap.AffectedSituationCount)
+	}
+	for round := 0; round < 8; round++ {
+		at := now.Add(8*time.Minute + time.Duration(round)*time.Second)
+		claims, err := st.ClaimNotificationIntents(ctx, snOwner, at, time.Minute, 25)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range claims {
+			snDeliver(t, st, c, "100.1", at)
+		}
+	}
+	if _, complete, err := st.CompleteDeliveryGap(ctx, now.Add(9*time.Minute)); err != nil || !complete {
+		t.Fatalf("CompleteDeliveryGap = (%v, %v): all deliverable backlog drained, but the withheld root's pending journal keeps the gap replaying", complete, err)
+	}
+
+	// Later publication authority makes that journal an obligation again:
+	// a second outage's generation counts it, and completes only once it
+	// (and its root) delivered.
+	// The worker records the replay's delivery successes; that closes the
+	// first outage's window before the second outage begins.
+	if err := st.ObserveSlackSuccess(ctx, now.Add(9*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	snCommitAboveFloor(t, st, withheldID, now.Add(20*time.Minute))
+	snFail(t, st, now.Add(21*time.Minute))
+	if opened, err := st.OpenDueDeliveryGap(ctx, now.Add(26*time.Minute), 5*time.Minute); err != nil || !opened {
+		t.Fatalf("second generation = (%v, %v), want opened", opened, err)
+	}
+	second, _, err := st.RecoverDeliveryGap(ctx, now.Add(27*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gap, err = st.GetDeliveryGap(ctx, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gap.AffectedSituationCount != 1 || gap.DelayedEffectCount < 2 {
+		t.Fatalf("second notice = %d affected / %d delayed, want the now-warranted Situation with its root and journal", gap.AffectedSituationCount, gap.DelayedEffectCount)
+	}
+	if _, complete, err := st.CompleteDeliveryGap(ctx, now.Add(28*time.Minute)); err != nil || complete {
+		t.Fatalf("second generation completed before its backlog delivered (complete=%v err=%v)", complete, err)
+	}
+	for round := 0; round < 8; round++ {
+		at := now.Add(28*time.Minute + time.Duration(round)*time.Second)
+		claims, err := st.ClaimNotificationIntents(ctx, snOwner, at, time.Minute, 25)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range claims {
+			snDeliver(t, st, c, "200.1", at)
+		}
+	}
+	if _, complete, err := st.CompleteDeliveryGap(ctx, now.Add(29*time.Minute)); err != nil || !complete {
+		t.Fatalf("second generation did not complete after its backlog delivered (complete=%v err=%v)", complete, err)
+	}
+}
+
+// snSeedWithheldEpisode commits one warranted-but-below-floor first cycle
+// for group: a withheld root plus a pending requires_root journal entry.
+func snSeedWithheldEpisode(t *testing.T, st *Store, group string, now time.Time) string {
+	t.Helper()
+	ctx := context.Background()
+	id := newSituationForGroup(t, st, group, now)
+	claim := claimSituation(t, st, id, "controller-a", now)
+	cycle := shPrepare(t, claim, shRunningTriageContract(now.Add(time.Minute)),
+		situationmodel.LifecycleActive, situationmodel.AttentionInvestigate, now)
+	conclusion := *cycle.Change.Projection.Assessment
+	conclusion.SufficientReasonCode = "duration_outlier"
+	cycle.Change.Projection.Assessment = &conclusion
+	cycle.Publish.SlackFloor = situationmodel.InterruptionHigh
+	commit := shDerive(t, cycle)
+	if err := st.CommitController(ctx, claim, commit); err != nil {
+		t.Fatal(err)
+	}
+	if n := shCountRows(t, st, `SELECT COUNT(*) FROM notification_intents WHERE situation_id = ? AND status = 'withheld_by_operator_slack_floor'`, id); n != 1 {
+		t.Fatalf("fixture: withheld roots = %d, want 1", n)
+	}
+	return id
+}
+
+// snCommitAboveFloor commits a second cycle for the withheld Situation that
+// earns publication: an operator handoff ranks high, above the fixture's
+// high floor (critical anchor conclusion).
+func snCommitAboveFloor(t *testing.T, st *Store, id string, now time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	shMakeDue(t, st, id, now.Add(-time.Minute))
+	claim := claimSituation(t, st, id, "controller-a", now)
+	cycle := shPrepare(t, claim, shOperatorContract(now.Add(time.Minute)),
+		situationmodel.LifecycleActive, situationmodel.AttentionInvestigate, now)
+	var prior situationmodel.Transition
+	var summary situationmodel.EpisodeSummary
+	view, err := st.GetSituationEpisodeView(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior, summary = view.SourceTransition, view.Summary
+	cycle.Change.PriorTransition = &prior
+	cycle.Change.PriorSummary = &summary
+	cycle.Publish.PriorTransition = &prior
+	cycle.Publish.SlackFloor = situationmodel.InterruptionHigh
+	commit := shDerive(t, cycle)
+	if err := st.CommitController(ctx, claim, commit); err != nil {
+		t.Fatal(err)
+	}
+	if n := shCountRows(t, st, `SELECT COUNT(*) FROM notification_intents WHERE situation_id = ? AND effect_class = 'root_sync' AND status = 'pending'`, id); n != 1 {
+		t.Fatalf("fixture: pending roots after earning publication = %d, want 1", n)
+	}
+}

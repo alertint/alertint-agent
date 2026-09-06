@@ -38,10 +38,12 @@ import (
 //
 // Which intents a generation is replaying is DERIVED, not stored: migration
 // 0018 deliberately allows gap_generation only on the recovery notice
-// itself, so "replayable" means "a pending Situation-scoped intent that
-// already existed when this generation recovered" (created_at <=
-// recovered_at). That keeps work committed after recovery — ordinary
-// delivery, not replay — from holding a generation open forever.
+// itself, so "replayable" means "a pending Situation-scoped intent that is
+// an actual delivery obligation and already existed when this generation
+// recovered" (replayableIntentPredicate, created_at <= recovered_at). That
+// keeps work committed after recovery — ordinary delivery, not replay —
+// and history that has no root to deliver under from holding a generation
+// open forever.
 // ----------------------------------------------------------------------
 
 // GapSnapshot is one durable gap generation's bounded rendering facts: the
@@ -357,8 +359,8 @@ func (s *Store) CompleteDeliveryGap(ctx context.Context, now time.Time) (string,
 
 	var remaining int
 	if err := tx.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM notification_intents
-		WHERE status = 'pending' AND situation_id IS NOT NULL AND created_at <= ?`, recoveredAt).
+		SELECT COUNT(*) FROM notification_intents ni
+		WHERE `+replayableIntentPredicate, recoveredAt).
 		Scan(&remaining); err != nil {
 		return "", false, fmt.Errorf("store: count replayable notification intents: %w", err)
 	}
@@ -438,15 +440,33 @@ func (s *Store) ReactivateConfigurationBlocked(ctx context.Context, configuratio
 	return n, nil
 }
 
+// replayableIntentPredicate selects the pending Situation-scoped intents
+// that are an ACTUAL delivery obligation as of the bound instant (the one
+// `?`): a root projection always is; a reply is only while its Situation
+// has a published root or a live (pending, configuration-blocked, or
+// failed) root projection still owed to Slack. A reply planned under an
+// unpublished, floor-withheld root has no root to hang under and none
+// coming — it is immutable local history, not delayed Slack work — so it
+// neither counts toward a recovery notice nor holds a generation in replay
+// (review round 2, R2-F1). It becomes an obligation again the moment a
+// later commit earns the Situation a root.
+const replayableIntentPredicate = `ni.status = 'pending' AND ni.situation_id IS NOT NULL AND ni.created_at <= ?
+		  AND (ni.requires_root = 0
+		       OR EXISTS (SELECT 1 FROM situations s WHERE s.id = ni.situation_id AND s.slack_root_ts IS NOT NULL)
+		       OR EXISTS (SELECT 1 FROM notification_intents r
+		                  WHERE r.situation_id = ni.situation_id AND r.effect_class = 'root_sync'
+		                    AND r.status IN ('pending', 'blocked_configuration', 'failed')))`
+
 // replayableBacklogTx counts the Situation-scoped delivery obligations
-// outstanding as of asOf: how many distinct Situations, and how many
-// effects. These are exactly the numbers the recovery notice reports.
+// outstanding as of asOf (replayableIntentPredicate): how many distinct
+// Situations, and how many effects. These are exactly the numbers the
+// recovery notice reports.
 func replayableBacklogTx(ctx context.Context, tx *sql.Tx, asOf string) (int, int, error) {
 	var affected, delayed int
 	if err := tx.QueryRowContext(ctx, `
-		SELECT COUNT(DISTINCT situation_id), COUNT(*)
-		FROM notification_intents
-		WHERE status = 'pending' AND situation_id IS NOT NULL AND created_at <= ?`, asOf).
+		SELECT COUNT(DISTINCT ni.situation_id), COUNT(*)
+		FROM notification_intents ni
+		WHERE `+replayableIntentPredicate, asOf).
 		Scan(&affected, &delayed); err != nil {
 		return 0, 0, fmt.Errorf("store: count delayed notification backlog: %w", err)
 	}
@@ -507,38 +527,54 @@ type liveRootProjection struct {
 	status string
 }
 
-// reactivateBlockedRootSyncTx restores exactly one pending root projection
-// for situationID and reports how many blocked roots it reactivated (0 or 1).
+// reactivateBlockedRootSyncTx normalizes situationID's root projections on
+// corrected configuration and reports how many blocked roots it
+// reactivated (0 or 1).
 //
-// A newer root projection supersedes every older live one at commit
-// (supersedeLiveRootSyncTx), so a Situation normally holds ONE live root:
-// if it is pending, corrected configuration has nothing to do here — that
-// projection delivers the coordinates every dependent effect waits on; if
-// it is blocked, it becomes pending. Any older live projection that somehow
-// survived is coalesced into the newest one first, so migration 0018's
-// single-pending-root index is satisfied at every step.
+// The keeper is the NEWEST root projection of any delivered or live status
+// (by summary version, then creation) — the one that renders the most
+// current state. Every OTHER live projection (pending, blocked, failed) is
+// coalesced into it first, whatever the keeper's own status: a newer
+// commit does exactly this at commit time (supersedeLiveRootSyncTx), but a
+// ledger written under migration 0018's "supersede from pending only"
+// trigger can still hold an older blocked root beside a newer pending or
+// delivered one, and with blocked rows holding the claim queue such a row
+// would stall the Situation forever — a terminal Situation gets no
+// controller commit to repair it (review round 2, R2-F4). Then:
+//
+//   - keeper pending: nothing more to do; it delivers the coordinates every
+//     dependent effect waits on;
+//   - keeper delivered: nothing more to do; the Situation's root is on
+//     screen and an older blocked projection was obsolete;
+//   - keeper blocked: it becomes pending;
+//   - keeper failed: left for an explicit redrive (spec.md: failed is never
+//     auto-retried).
+//
+// Migration 0018's single-pending-root index is satisfied at every step:
+// the coalescing retires every other pending row before the keeper is
+// made pending.
 func reactivateBlockedRootSyncTx(ctx context.Context, tx *sql.Tx, situationID, nowStr string) (int, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT id, status FROM notification_intents
 		WHERE situation_id = ? AND effect_class = 'root_sync'
-		  AND status IN ('pending','blocked_configuration')
-		ORDER BY created_at ASC, id ASC`, situationID)
+		  AND status IN ('pending', 'blocked_configuration', 'failed', 'delivered')
+		ORDER BY summary_version ASC, created_at ASC, id ASC`, situationID)
 	if err != nil {
-		return 0, fmt.Errorf("store: list live root projections for %s: %w", situationID, err)
+		return 0, fmt.Errorf("store: list root projections for %s: %w", situationID, err)
 	}
-	live, err := scanLiveRootProjections(rows)
+	roots, err := scanLiveRootProjections(rows)
 	if err != nil {
 		return 0, err
 	}
-	if len(live) == 0 {
+	if len(roots) == 0 {
 		return 0, nil
 	}
-	keeper := live[len(live)-1]
-	if keeper.status == string(situationmodel.IntentPending) {
-		return 0, nil
-	}
+	keeper := roots[len(roots)-1]
 	if err := supersedeLiveRootSyncTx(ctx, tx, situationID, keeper.id); err != nil {
 		return 0, err
+	}
+	if keeper.status != string(situationmodel.IntentBlockedConfiguration) {
+		return 0, nil
 	}
 	if err := setNotificationIntentPendingTx(ctx, tx, keeper.id, "blocked_configuration", nowStr); err != nil {
 		return 0, err

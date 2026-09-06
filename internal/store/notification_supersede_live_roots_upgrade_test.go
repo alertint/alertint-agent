@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 )
 
 // ----------------------------------------------------------------------
@@ -117,12 +119,12 @@ func TestNotificationSupersedeLiveRootsUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	if got != 20 {
-		t.Fatalf("MaxSchemaVersion = %d, want 20", got)
+	if got != 21 {
+		t.Fatalf("MaxSchemaVersion = %d, want 21", got)
 	}
 	var version int
-	if err := st.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 20 {
-		t.Fatalf("applied schema version = %d (err=%v), want 20", version, err)
+	if err := st.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 21 {
+		t.Fatalf("applied schema version = %d (err=%v), want 21", version, err)
 	}
 	var fkViolations int
 	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_foreign_key_check`).Scan(&fkViolations); err != nil || fkViolations != 0 {
@@ -174,4 +176,50 @@ func supersessionTriggerNames(t *testing.T, st *Store) string {
 		t.Fatalf("iterate triggers: %v", err)
 	}
 	return triggers
+}
+
+// TestNotificationUpgradeCoalescesOlderBlockedRootBeforeClaims pins review
+// round 2, R2-F4: a schema-19 ledger could hold an older blocked root beside
+// its newer pending projection (its trigger forbade retiring the former).
+// After the upgrade, corrected configuration must coalesce the old blocked
+// root into the pending keeper BEFORE the claim poll, or the blocked row
+// holds the queue head forever.
+func TestNotificationUpgradeCoalescesOlderBlockedRootBeforeClaims(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "review-upgrade.db")
+	blocked, _ := seedMigration19SupersedeFixture(t, path)
+	db, err := sql.Open("sqlite", buildDSN(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.ExecContext(ctx, `INSERT INTO notification_intents
+		(id, idempotency_key, effect_class, situation_id, transition_id, transition_sequence, summary_version, requires_root,
+		 main_channel_poke, client_message_id, status, created_at)
+		SELECT 'root-new-pending', 'idem:new-pending', effect_class, situation_id, transition_id, transition_sequence, summary_version,
+		       requires_root, main_channel_poke, 'client:new-pending', 'pending', created_at
+		FROM notification_intents WHERE id = ?`, blocked); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	now := time.Now().UTC().Add(time.Minute)
+	if _, err := st.ReactivateConfigurationBlocked(ctx, 1, now); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := st.ClaimNotificationIntents(ctx, snOwner, now, time.Minute, 25)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != 1 || claims[0].Intent.ID != "root-new-pending" {
+		t.Fatalf("upgraded schema-19 backlog still blocked after corrected configuration: got %d claims, want the newest pending root", len(claims))
+	}
+	if older := snIntent(t, st, blocked); older.Status != situationmodel.IntentSuperseded {
+		t.Fatalf("pre-upgrade blocked root = %q, want superseded by the pending keeper", older.Status)
+	}
 }
