@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/situation"
+	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 )
 
 // ----------------------------------------------------------------------
@@ -385,6 +386,13 @@ func (s *Store) CompleteDeliveryGap(ctx context.Context, now time.Time) (string,
 // The generation is a compare-and-set, not a blind write: a value that does
 // not advance the stored one reactivates nothing, so a restart loop can
 // never replay the same correction twice.
+//
+// Root projections need care (see reactivateBlockedRootSyncTx): returning
+// every blocked row to pending in one statement violates migration 0018's
+// single-pending-root_sync index the moment a Situation holds both a blocked
+// root and a newer pending one, which would roll back the whole
+// configuration-generation advance and strand EVERY Situation's
+// reactivation, permanently.
 func (s *Store) ReactivateConfigurationBlocked(ctx context.Context, configurationGeneration int64,
 	now time.Time) (int, error) {
 	if configurationGeneration <= 0 {
@@ -416,21 +424,14 @@ func (s *Store) ReactivateConfigurationBlocked(ctx context.Context, configuratio
 		return 0, nil
 	}
 
-	reactivated, err := tx.ExecContext(ctx, `
-		UPDATE notification_intents
-		SET status = 'pending', retry_at = ?, claim_owner = NULL, lease_expires_at = NULL
-		WHERE status = 'blocked_configuration'`, nowStr)
+	n, err := reactivateBlockedIntentsTx(ctx, tx, nowStr)
 	if err != nil {
-		return 0, fmt.Errorf("store: reactivate configuration-blocked intents: %w", err)
-	}
-	n, err := reactivated.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("store: count reactivated notification intents: %w", err)
+		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("store: commit reactivate configuration-blocked intents: %w", err)
 	}
-	return int(n), nil
+	return n, nil
 }
 
 // replayableBacklogTx counts the Situation-scoped delivery obligations
@@ -446,4 +447,163 @@ func replayableBacklogTx(ctx context.Context, tx *sql.Tx, asOf string) (int, int
 		return 0, 0, fmt.Errorf("store: count delayed notification backlog: %w", err)
 	}
 	return affected, delayed, nil
+}
+
+// reactivateBlockedIntentsTx returns every eligible blocked_configuration
+// intent to pending, due now, attempts preserved.
+//
+// It is split by effect class on purpose. thread_append, broadcast_handoff,
+// and installation_gap_recovery are immutable one-per-subject effects with no
+// pending-uniqueness constraint, so they reactivate in one statement. Root
+// projections cannot: migration 0018's
+// notification_intents_root_sync_pending_idx allows a Situation exactly ONE
+// pending root_sync, and supersession only ever retires a PENDING one — so a
+// Situation can legitimately hold a blocked root beside a newer pending root,
+// and blindly reactivating the blocked one aborts the transaction.
+func reactivateBlockedIntentsTx(ctx context.Context, tx *sql.Tx, nowStr string) (int, error) {
+	res, err := tx.ExecContext(ctx, `
+		UPDATE notification_intents
+		SET status = 'pending', retry_at = ?, claim_owner = NULL, lease_expires_at = NULL
+		WHERE status = 'blocked_configuration' AND effect_class != 'root_sync'`, nowStr)
+	if err != nil {
+		return 0, fmt.Errorf("store: reactivate configuration-blocked effects: %w", err)
+	}
+	total, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("store: count reactivated notification effects: %w", err)
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT DISTINCT situation_id FROM notification_intents
+		WHERE status = 'blocked_configuration' AND effect_class = 'root_sync' AND situation_id IS NOT NULL
+		ORDER BY situation_id ASC`)
+	if err != nil {
+		return 0, fmt.Errorf("store: list situations with blocked root projections: %w", err)
+	}
+	situationIDs, err := scanStringRows(rows)
+	if err != nil {
+		return 0, fmt.Errorf("store: read situations with blocked root projections: %w", err)
+	}
+	for _, situationID := range situationIDs {
+		n, err := reactivateBlockedRootSyncTx(ctx, tx, situationID, nowStr)
+		if err != nil {
+			return 0, err
+		}
+		total += int64(n)
+	}
+	return int(total), nil
+}
+
+// liveRootProjection is one root_sync still capable of holding its
+// Situation's single pending-root slot: pending, or blocked on
+// configuration. delivered/failed/withheld/superseded rows are resolved
+// outcomes and never compete for it.
+type liveRootProjection struct {
+	id     string
+	status string
+}
+
+// reactivateBlockedRootSyncTx restores exactly one pending root projection
+// for situationID and reports how many blocked roots it reactivated (0 or 1).
+//
+// The newest live projection is the one corrected configuration should
+// deliver — it renders current state, and every older one would render state
+// already superseded by it. Two cases:
+//
+//   - The newest is ALREADY pending. It holds the slot and says everything
+//     the older blocked ones would; they stay blocked_configuration, which
+//     migration 0018 explicitly calls a resolved outcome ("never one already
+//     delivered/blocked/failed/withheld ... not live candidates a newer
+//     root_sync coalesces away"). Nothing is stranded: the pending projection
+//     delivers the root coordinates every dependent effect waits on.
+//
+//   - The newest is blocked. It is reactivated, and every older live
+//     projection is coalesced into it through Task 5's own
+//     supersedePendingRootSyncTx — the same supersession a newer commit
+//     performs. An older BLOCKED one reaches `superseded` the only way the
+//     schema permits, by being reactivated first: that is exactly what
+//     happened (corrected configuration returned it to pending) immediately
+//     followed by the newer projection coalescing it.
+//
+// The order is what keeps the unique index satisfied at every step: the
+// pre-existing pending row is retired first, then each older blocked row is
+// made pending and immediately coalesced, and only then does the keeper
+// become pending. At no point do two root projections hold the slot.
+func reactivateBlockedRootSyncTx(ctx context.Context, tx *sql.Tx, situationID, nowStr string) (int, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, status FROM notification_intents
+		WHERE situation_id = ? AND effect_class = 'root_sync'
+		  AND status IN ('pending','blocked_configuration')
+		ORDER BY created_at ASC, id ASC`, situationID)
+	if err != nil {
+		return 0, fmt.Errorf("store: list live root projections for %s: %w", situationID, err)
+	}
+	live, err := scanLiveRootProjections(rows)
+	if err != nil {
+		return 0, err
+	}
+	if len(live) == 0 {
+		return 0, nil
+	}
+	keeper := live[len(live)-1]
+	if keeper.status == string(situationmodel.IntentPending) {
+		return 0, nil
+	}
+
+	// Retire whichever projection currently holds the pending slot, if any.
+	if err := supersedePendingRootSyncTx(ctx, tx, situationID, keeper.id); err != nil {
+		return 0, err
+	}
+	for _, older := range live[:len(live)-1] {
+		if older.status != string(situationmodel.IntentBlockedConfiguration) {
+			continue // already retired by the supersession above
+		}
+		if err := setNotificationIntentPendingTx(ctx, tx, older.id, "blocked_configuration", nowStr); err != nil {
+			return 0, err
+		}
+		if err := supersedePendingRootSyncTx(ctx, tx, situationID, keeper.id); err != nil {
+			return 0, err
+		}
+	}
+	if err := setNotificationIntentPendingTx(ctx, tx, keeper.id, "blocked_configuration", nowStr); err != nil {
+		return 0, err
+	}
+	return 1, nil
+}
+
+func scanLiveRootProjections(rows *sql.Rows) ([]liveRootProjection, error) {
+	defer func() { _ = rows.Close() }()
+	out := []liveRootProjection{}
+	for rows.Next() {
+		var p liveRootProjection
+		if err := rows.Scan(&p.id, &p.status); err != nil {
+			return nil, fmt.Errorf("store: scan live root projection: %w", err)
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate live root projections: %w", err)
+	}
+	return out, nil
+}
+
+// setNotificationIntentPendingTx returns one intent in fromStatus to pending,
+// due now, keeping its attempt count. It is fenced on the expected status so
+// a row that moved on changes nothing.
+func setNotificationIntentPendingTx(ctx context.Context, tx *sql.Tx, intentID, fromStatus, nowStr string) error {
+	res, err := tx.ExecContext(ctx, `
+		UPDATE notification_intents
+		SET status = 'pending', retry_at = ?, claim_owner = NULL, lease_expires_at = NULL
+		WHERE id = ? AND status = ?`, nowStr, intentID, fromStatus)
+	if err != nil {
+		return fmt.Errorf("store: return notification intent %s to pending: %w", intentID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: count notification intent %s returned to pending: %w", intentID, err)
+	}
+	if n != 1 {
+		return fmt.Errorf("store: notification intent %s is no longer %s", intentID, fromStatus)
+	}
+	return nil
 }

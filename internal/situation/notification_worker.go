@@ -388,6 +388,9 @@ type NotificationWorker struct {
 	startOnce sync.Once
 	stopOnce  sync.Once
 	started   atomic.Bool
+	// configurationReactivated is this PROCESS's one-shot guard for the
+	// startup configuration reactivation. See ReactivateConfiguration.
+	configurationReactivated atomic.Bool
 
 	mu sync.Mutex
 	// inflight holds every claim this worker currently owns, so Stop can
@@ -518,9 +521,13 @@ func (w *NotificationWorker) shouldProbe(state SlackDeliveryState, now time.Time
 		return true
 	}
 	// A REPLAYING generation is a recovered one: its own deliveries prove
-	// Slack health, so only an outage window, a still-open generation, or
-	// durably blocked configuration keeps probing.
-	if state.FirstFailureAt == nil && state.OpenGapStatus != "open" && state.BlockedConfigurationCount == 0 {
+	// Slack health. Durably blocked configuration justifies probing only
+	// until this process has applied its startup correction — after that a
+	// probe can no longer change the outcome (only a restart with corrected
+	// configuration can), and probing on it forever is the treadmill this
+	// worker must not run.
+	blockedStillMatters := state.BlockedConfigurationCount > 0 && !w.configurationReactivated.Load()
+	if state.FirstFailureAt == nil && state.OpenGapStatus != "open" && !blockedStillMatters {
 		return false
 	}
 	wait := notificationRetryDelay(w.probeFailures, 0, w.cfg.RetryInitial, w.cfg.RetryMax, 0, 0)
@@ -556,15 +563,8 @@ func (w *NotificationWorker) probe(ctx context.Context, state SlackDeliveryState
 	if err := w.store.ObserveSlackSuccess(ctx, now); err != nil {
 		w.logger.Error("situation: notification worker: record slack success failed", "err", err)
 	}
-	if state.BlockedConfigurationCount > 0 {
-		n, err := w.store.ReactivateConfigurationBlocked(ctx, state.ConfigurationGeneration+1, now)
-		if err != nil {
-			w.logger.Error("situation: notification worker: reactivate configuration-blocked intents failed", "err", err)
-		} else if n > 0 {
-			w.count(func(s *NotificationWorkerStats) { s.Reactivated += int64(n) })
-			w.logger.Info("situation: notification worker: slack configuration corrected; reactivated blocked intents",
-				"count", n, "configuration_generation", state.ConfigurationGeneration+1)
-		}
+	if _, err := w.ReactivateConfiguration(ctx); err != nil {
+		w.logger.Error("situation: notification worker: reactivate configuration-blocked intents failed", "err", err)
 	}
 	if generation, recovered, err := w.store.RecoverDeliveryGap(ctx, now); err != nil {
 		w.logger.Error("situation: notification worker: recover delivery gap failed", "err", err)
@@ -573,6 +573,50 @@ func (w *NotificationWorker) probe(ctx context.Context, state SlackDeliveryState
 		w.logger.Warn("situation: notification worker: slack delivery recovered; replaying gap",
 			"gap_generation", generation)
 	}
+}
+
+// ReactivateConfiguration applies corrected Slack configuration exactly ONCE
+// per process: it advances the durable configuration generation and returns
+// every eligible blocked_configuration intent to pending. It reports how
+// many it reactivated, and (0, nil) once this process has already done it.
+//
+// Once per process, not once per successful probe, because Probe is only
+// auth.test — it proves the TOKEN works and says nothing about the channel.
+// With a valid token and a misconfigured channel, reactivating on every
+// probe is a permanent loop: reactivate, claim, get channel_not_found, block,
+// reactivate. That grows the configuration generation and every intent's
+// attempt count without bound, and resets the continuous-failure window each
+// cycle so a real Delivery gap can never open. spec.md ties this to startup —
+// "Startup with corrected configuration increments a durable configuration
+// generation" — and only a restart can actually change the configuration a
+// blocked intent is blocked on.
+//
+// The worker calls this itself on its first successful probe (its startup
+// probe). It is exported and idempotent so Task 9's startup sequence can
+// instead drive it explicitly at step 5 of spec.md's startup order, before
+// Receivers start; whichever runs first applies the correction.
+func (w *NotificationWorker) ReactivateConfiguration(ctx context.Context) (int, error) {
+	if w.configurationReactivated.Swap(true) {
+		return 0, nil
+	}
+	state, err := w.store.GetSlackDeliveryState(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("situation: notification worker: read slack delivery state: %w", err)
+	}
+	if state.BlockedConfigurationCount == 0 {
+		return 0, nil
+	}
+	generation := state.ConfigurationGeneration + 1
+	n, err := w.store.ReactivateConfigurationBlocked(ctx, generation, w.now().UTC())
+	if err != nil {
+		return 0, fmt.Errorf("situation: notification worker: reactivate configuration-blocked intents: %w", err)
+	}
+	if n > 0 {
+		w.count(func(s *NotificationWorkerStats) { s.Reactivated += int64(n) })
+		w.logger.Info("situation: notification worker: slack configuration corrected; reactivated blocked intents",
+			"count", n, "configuration_generation", generation)
+	}
+	return n, nil
 }
 
 // observeFailure records one Slack failure against the continuous window and

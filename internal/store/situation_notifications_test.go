@@ -30,6 +30,18 @@ func snCommit(t *testing.T, st *Store, sitID string, prior *situation.Controller
 	contract := shRunningTriageContract(now.Add(time.Minute))
 	if prior != nil {
 		contract = shOperatorContract(now.Add(time.Minute))
+	}
+	return snCommitWith(t, st, sitID, prior, contract, now)
+}
+
+// snCommitWith is snCommit with an explicit Operator contract, so a test can
+// choose whether a cycle qualifies as a main-channel poke (an
+// OperatorActionRequired appearing for the first time is PokeOperatorHandoff;
+// handing the next move back to AlertINT is material but PokeNone).
+func snCommitWith(t *testing.T, st *Store, sitID string, prior *situation.ControllerCommit,
+	contract situationmodel.ActionContract, now time.Time) situation.ControllerCommit {
+	t.Helper()
+	if prior != nil {
 		shMakeDue(t, st, sitID, now.Add(-time.Minute))
 	}
 	claim := claimSituation(t, st, sitID, "controller-a", now)
@@ -723,5 +735,211 @@ func TestNotificationClaimNeverClaimsAFloorWithheldEffect(t *testing.T) {
 	}
 	if got := snIntent(t, st, withheld.ID); got.Status != situationmodel.IntentWithheld || got.AttemptCount != 0 {
 		t.Fatalf("withheld intent = %+v, want an untouched durable decision with no attempts", got)
+	}
+}
+
+// TestNotificationClaimOrdersJournalBySequenceAcrossEffectClasses is the
+// regression for a claim order that ranked effect class ABOVE Transition
+// sequence: every thread_append then sorted ahead of every
+// broadcast_handoff, so an older poke could be delivered after newer quiet
+// entries. spec.md's ordering is "immutable journal replies deliver in
+// Transition-sequence order" — the only class ordering it requires is that
+// the root projection precede its replies.
+//
+// The fixture is deliberately the one shape the earlier ordering tests did
+// not have: a broadcast_handoff at a LOWER sequence than a pending
+// thread_append.
+func TestNotificationClaimOrdersJournalBySequenceAcrossEffectClasses(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	sitID, first := snSeedOneCycle(t, st, "group-claim-class-order", now)
+	// Cycle 2 hands the next move to an operator: a poke, so its journal
+	// entry is a broadcast_handoff at sequence 2.
+	second := snCommit(t, st, sitID, &first, now.Add(time.Minute))
+	// Cycle 3 takes the next move back: material, but PokeNone, so its
+	// journal entry is a quiet thread_append at sequence 3.
+	_ = snCommitWith(t, st, sitID, &second, shRunningTriageContract(now.Add(3*time.Minute)), now.Add(2*time.Minute))
+
+	root := snClaimOne(t, st, now.Add(4*time.Minute))
+	if root.Intent.EffectClass != situationmodel.EffectRootSync {
+		t.Fatalf("head = %q, want the root projection first", root.Intent.EffectClass)
+	}
+	snDeliver(t, st, root, "100.1", now.Add(4*time.Minute))
+
+	type entry struct {
+		sequence int
+		class    string
+	}
+	got := []entry{}
+	for round := 0; round < 5; round++ {
+		at := now.Add(time.Duration(5+round) * time.Minute)
+		claims, err := st.ClaimNotificationIntents(context.Background(), snOwner, at, 5*time.Minute, 25)
+		if err != nil {
+			t.Fatalf("claim round %d: %v", round, err)
+		}
+		if len(claims) == 0 {
+			break
+		}
+		c := claims[0]
+		got = append(got, entry{sequence: *c.Intent.TransitionSequence, class: string(c.Intent.EffectClass)})
+		snDeliver(t, st, c, "10"+string(rune('0'+round))+".2", at)
+	}
+	want := []entry{
+		{sequence: 1, class: "thread_append"},
+		{sequence: 2, class: "broadcast_handoff"},
+		{sequence: 3, class: "thread_append"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("delivered %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("delivered %v, want %v — the immutable journal must drain in Transition-sequence order, "+
+				"never with every quiet entry ahead of an older broadcast", got, want)
+		}
+	}
+	_ = sitID
+}
+
+// TestNotificationAckReactivationKeepsOnePendingRootProjection is the
+// regression for a reactivation that returned EVERY blocked intent to
+// pending in one statement: when a Situation had both a blocked root_sync
+// and a newer pending one, that violated migration 0018's
+// notification_intents_root_sync_pending_idx, rolled the whole transaction
+// back, and left the configuration generation unadvanced — so nothing
+// reactivated for any Situation, permanently.
+//
+// Case A: the newest projection is already pending. It renders the current
+// state, so the older blocked one is a resolved outcome (migration 0018's
+// own words) and stays blocked; reactivation must still succeed for
+// everything else.
+func TestNotificationAckReactivationKeepsOnePendingRootProjection(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	sitID, first := snSeedOneCycle(t, st, "group-ack-reactivate-newer", now)
+	firstRoot := shIntentOfClass(t, first.History.Intents, situationmodel.EffectRootSync)
+
+	blocked := snClaimOne(t, st, now)
+	if blocked.Intent.ID != firstRoot.ID {
+		t.Fatalf("claimed %s, want the first root %s", blocked.Intent.ID, firstRoot.ID)
+	}
+	if err := st.BlockNotificationConfiguration(ctx, blocked, "channel_not_found", now); err != nil {
+		t.Fatalf("BlockNotificationConfiguration: %v", err)
+	}
+	// A later material commit inserts a NEW root projection. Supersession
+	// only ever retires a pending one, so the blocked one survives beside it.
+	second := snCommit(t, st, sitID, &first, now.Add(time.Minute))
+	secondRoot := shIntentOfClass(t, second.History.Intents, situationmodel.EffectRootSync)
+
+	n, err := st.ReactivateConfigurationBlocked(ctx, 1, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("ReactivateConfigurationBlocked with a newer pending root: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("reactivated %d root projections, want 0 — the newer pending one already renders current state", n)
+	}
+	if got := snIntent(t, st, secondRoot.ID); got.Status != situationmodel.IntentPending {
+		t.Fatalf("newer root status = %q, want pending", got.Status)
+	}
+	if got := snIntent(t, st, firstRoot.ID); got.Status == situationmodel.IntentPending {
+		t.Fatal("the superseded-by-newer blocked root must not be returned to pending")
+	}
+	if n := shCountRows(t, st,
+		`SELECT COUNT(*) FROM notification_intents WHERE situation_id = ? AND effect_class = 'root_sync' AND status = 'pending'`,
+		sitID); n != 1 {
+		t.Fatalf("pending root projections = %d, want exactly 1", n)
+	}
+	// The configuration generation really advanced, so the whole
+	// reactivation transaction committed.
+	if state := snState(t, st); state.ConfigurationGeneration != 1 {
+		t.Fatalf("configuration generation = %d, want the advanced 1", state.ConfigurationGeneration)
+	}
+}
+
+// Case B: every live root projection for the Situation is blocked. The
+// newest is the one corrected configuration should deliver; the older ones
+// are coalesced into it, exactly as a newer projection always coalesces an
+// older one.
+func TestNotificationAckReactivationCoalescesOlderBlockedRootProjections(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	sitID, first := snSeedOneCycle(t, st, "group-ack-reactivate-both", now)
+	firstRoot := shIntentOfClass(t, first.History.Intents, situationmodel.EffectRootSync)
+
+	blocked := snClaimOne(t, st, now)
+	if err := st.BlockNotificationConfiguration(ctx, blocked, "channel_not_found", now); err != nil {
+		t.Fatalf("BlockNotificationConfiguration: %v", err)
+	}
+	second := snCommit(t, st, sitID, &first, now.Add(time.Minute))
+	secondRoot := shIntentOfClass(t, second.History.Intents, situationmodel.EffectRootSync)
+	blockedAgain := snClaimOne(t, st, now.Add(2*time.Minute))
+	if blockedAgain.Intent.ID != secondRoot.ID {
+		t.Fatalf("claimed %s, want the second root %s", blockedAgain.Intent.ID, secondRoot.ID)
+	}
+	if err := st.BlockNotificationConfiguration(ctx, blockedAgain, "channel_not_found", now.Add(2*time.Minute)); err != nil {
+		t.Fatalf("BlockNotificationConfiguration: %v", err)
+	}
+
+	n, err := st.ReactivateConfigurationBlocked(ctx, 1, now.Add(3*time.Minute))
+	if err != nil {
+		t.Fatalf("ReactivateConfigurationBlocked with two blocked roots: %v", err)
+	}
+	if n < 1 {
+		t.Fatalf("reactivated %d intents, want at least the newest root projection", n)
+	}
+	if got := snIntent(t, st, secondRoot.ID); got.Status != situationmodel.IntentPending {
+		t.Fatalf("newest root status = %q, want pending", got.Status)
+	}
+	older := snIntent(t, st, firstRoot.ID)
+	if older.Status != situationmodel.IntentSuperseded {
+		t.Fatalf("older root status = %q, want superseded by the newest projection", older.Status)
+	}
+	if older.ReplacementIntentID == nil || *older.ReplacementIntentID != secondRoot.ID {
+		t.Fatalf("older root replacement = %v, want %q", older.ReplacementIntentID, secondRoot.ID)
+	}
+	if older.SupersessionReason == nil || *older.SupersessionReason == "" {
+		t.Fatal("a superseded root projection must record why")
+	}
+	if n := shCountRows(t, st,
+		`SELECT COUNT(*) FROM notification_intents WHERE situation_id = ? AND effect_class = 'root_sync' AND status = 'pending'`,
+		sitID); n != 1 {
+		t.Fatalf("pending root projections = %d, want exactly 1", n)
+	}
+	// The reactivated root really is claimable and deliverable.
+	claim := snClaimOne(t, st, now.Add(4*time.Minute))
+	if claim.Intent.ID != secondRoot.ID {
+		t.Fatalf("claimed %s after reactivation, want the reactivated root %s", claim.Intent.ID, secondRoot.ID)
+	}
+}
+
+// TestNotificationAckRedriveRefusesBehindANewerRootProjection proves the
+// same uniqueness hazard cannot reach an operator redrive either: redriving
+// an older failed root behind a newer pending one is refused with a typed
+// error, not a raw constraint violation.
+func TestNotificationAckRedriveRefusesBehindANewerRootProjection(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	sitID, first := snSeedOneCycle(t, st, "group-ack-redrive-newer", now)
+	firstRoot := shIntentOfClass(t, first.History.Intents, situationmodel.EffectRootSync)
+
+	failed := snClaimOne(t, st, now)
+	if err := st.FailNotificationIntent(ctx, failed, "invalid_payload", now); err != nil {
+		t.Fatalf("FailNotificationIntent: %v", err)
+	}
+	second := snCommit(t, st, sitID, &first, now.Add(time.Minute))
+	secondRoot := shIntentOfClass(t, second.History.Intents, situationmodel.EffectRootSync)
+
+	err := st.RedriveFailedNotificationIntent(ctx, firstRoot.ID, now.Add(2*time.Minute))
+	if !errors.Is(err, ErrNewerRootProjectionPending) {
+		t.Fatalf("redrive behind a newer pending root = %v, want ErrNewerRootProjectionPending", err)
+	}
+	if got := snIntent(t, st, firstRoot.ID); got.Status != situationmodel.IntentFailed {
+		t.Fatalf("refused redrive changed the failed root to %q", got.Status)
+	}
+	if got := snIntent(t, st, secondRoot.ID); got.Status != situationmodel.IntentPending {
+		t.Fatalf("newer root status = %q, want an untouched pending", got.Status)
 	}
 }

@@ -41,19 +41,39 @@ var (
 	ErrNotificationIntentSuperseded = situation.ErrNotificationIntentSuperseded
 )
 
-// notificationClaimOrder is the exact claim ordering the plan names: gap
-// generation first (the installation recovery notice precedes every
-// Situation's backlog), then Situation, then — within a Situation — the
-// coalescible root projection ahead of the immutable journal, then
+// ErrNewerRootProjectionPending means a root projection could not be
+// returned to pending because a NEWER one already holds its Situation's
+// single pending-root slot (migration 0018's
+// notification_intents_root_sync_pending_idx). The newer projection renders
+// the same current state, so the older one has nothing left to say — this
+// is a refusal, never a constraint violation.
+var ErrNewerRootProjectionPending = errors.New("store: a newer root projection is already pending")
+
+// The claim ordering the plan names: gap generation first (the installation
+// recovery notice precedes every Situation's backlog), then Situation, then
 // Transition sequence, then creation identity.
 //
-// notificationClassRank is that within-Situation rank as a SQL expression:
-// root_sync (0) before thread_append (1) before broadcast_handoff (2), so a
-// root edit for a handoff always delivers before its broadcast reply
-// (spec.md "Local idempotency, external delivery, and ordering", rule 3).
+// Effect class enters that order in exactly ONE place — the coalescible root
+// projection sorts ahead of every reply (notificationRootFirst), which is the
+// only class ordering the spec requires ("a root edit for a handoff delivers
+// before its broadcast reply"; the root's own rank alone achieves it).
+// Class must NOT outrank Transition sequence: doing so put every quiet
+// thread_append ahead of every broadcast_handoff regardless of sequence, so
+// an older poke could deliver after newer entries, against spec.md's
+// "immutable journal replies deliver in Transition-sequence order".
+// notificationClassRank therefore survives only as an intra-sequence
+// tiebreak — the one case it decides is a floor-withheld poke's Transition,
+// which carries both a broadcast_handoff and a quiet thread_append at the
+// same sequence.
 const (
+	notificationRootFirst  = `(ni.effect_class <> 'root_sync')`
 	notificationClassRank  = `CASE ni.effect_class WHEN 'root_sync' THEN 0 WHEN 'thread_append' THEN 1 ELSE 2 END`
-	notificationClaimOrder = `ORDER BY (gap_generation IS NULL) ASC, gap_generation ASC, situation_id ASC, class_rank ASC, transition_sequence ASC, id ASC`
+	notificationQueueOrder = `root_first ASC, transition_sequence ASC, class_rank ASC, id ASC`
+	notificationClaimOrder = `ORDER BY (gap_generation IS NULL) ASC, gap_generation ASC, situation_id ASC, ` + notificationQueueOrder
+	// notificationReloadOrder is notificationClaimOrder expressed directly
+	// against the table (alias ni), for the post-claim reload.
+	notificationReloadOrder = `ORDER BY (ni.gap_generation IS NULL) ASC, ni.gap_generation ASC, ni.situation_id ASC, ` +
+		notificationRootFirst + ` ASC, ni.transition_sequence ASC, ` + notificationClassRank + ` ASC, ni.id ASC`
 )
 
 // validateNotificationClaim rejects a claim that cannot fence anything.
@@ -101,7 +121,8 @@ func validateNotificationErrorClass(class string) error {
 //     dead-lettering them; and
 //   - the HEAD of its Situation's queue. Exactly one intent per Situation
 //     is claimable at a time, ranked root projection first and then by
-//     Transition sequence, so a later immutable entry can never pass an
+//     Transition SEQUENCE (effect class decides only ties within one
+//     sequence), so a later immutable entry can never pass an
 //     earlier pending one — including one merely waiting out a retry delay.
 //
 // A gap generation gates the whole claim: while one is open nothing is
@@ -244,13 +265,14 @@ func dueNotificationIntentIDsTx(ctx context.Context, tx *sql.Tx, gate deliveryGa
 			       ni.gap_generation AS gap_generation,
 			       ni.situation_id AS situation_id,
 			       ni.transition_sequence AS transition_sequence,
+			       `+notificationRootFirst+` AS root_first,
 			       `+notificationClassRank+` AS class_rank,
 			       (ni.claim_owner IS NULL OR ni.lease_expires_at <= ?) AS unleased,
 			       (ni.retry_at IS NULL OR ni.retry_at <= ?) AS due,
 			       (ni.requires_root = 0 OR (s.slack_channel IS NOT NULL AND s.slack_root_ts IS NOT NULL)) AS root_ready,
 			       ROW_NUMBER() OVER (
 			           PARTITION BY ni.situation_id
-			           ORDER BY `+notificationClassRank+` ASC, ni.transition_sequence ASC, ni.id ASC
+			           ORDER BY `+notificationRootFirst+` ASC, ni.transition_sequence ASC, `+notificationClassRank+` ASC, ni.id ASC
 			       ) AS rn
 			FROM notification_intents ni
 			LEFT JOIN situations s ON s.id = ni.situation_id
@@ -279,11 +301,10 @@ func loadClaimedNotificationIntentsTx(ctx context.Context, tx *sql.Tx, ids []str
 	placeholders, args := inPlaceholders(ids)
 	args = append(args, owner)
 	query := `
-		SELECT ` + qualifyColumns(notificationIntentColumns, "ni") + `,
-		       ` + notificationClassRank + ` AS class_rank
+		SELECT ` + qualifyColumns(notificationIntentColumns, "ni") + `
 		FROM notification_intents ni
 		WHERE ni.id IN (` + placeholders + `) AND ni.claim_owner = ?
-		` + notificationClaimOrder // #nosec G202 -- placeholders is a fixed "?,?,..." run built from len(ids); every value is bound
+		` + notificationReloadOrder // #nosec G202 -- placeholders is a fixed "?,?,..." run built from len(ids); every value is bound
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("store: read claimed notification intents: %w", err)
@@ -292,8 +313,7 @@ func loadClaimedNotificationIntentsTx(ctx context.Context, tx *sql.Tx, ids []str
 
 	out := make([]situation.NotificationClaim, 0, len(ids))
 	for rows.Next() {
-		var classRank int
-		intent, err := scanNotificationIntent(suffixedScanner{rows: rows, suffix: []any{&classRank}})
+		intent, err := scanNotificationIntent(rows)
 		if err != nil {
 			return nil, fmt.Errorf("store: scan claimed notification intent: %w", err)
 		}
@@ -303,21 +323,6 @@ func loadClaimedNotificationIntentsTx(ctx context.Context, tx *sql.Tx, ids []str
 		return nil, fmt.Errorf("store: iterate claimed notification intents: %w", err)
 	}
 	return out, nil
-}
-
-// suffixedScanner lets scanNotificationIntent consume a row carrying extra
-// TRAILING columns (the ORDER BY's own class_rank), mirroring
-// prefixedScanner one direction over.
-type suffixedScanner struct {
-	rows   *sql.Rows
-	suffix []any
-}
-
-func (p suffixedScanner) Scan(dest ...any) error {
-	all := make([]any, 0, len(dest)+len(p.suffix))
-	all = append(all, dest...)
-	all = append(all, p.suffix...)
-	return p.rows.Scan(all...)
 }
 
 // inPlaceholders builds a "?,?,..." run of len(values) and the matching
@@ -533,25 +538,74 @@ func (s *Store) RecoverExpiredNotificationClaims(ctx context.Context, now time.T
 // intent to pending, due now, with its attempt count preserved. It is the
 // only way out of `failed`, and the way a failed root releases the
 // dependent history waiting behind it.
+//
+// A failed ROOT projection shares reactivation's uniqueness hazard: its
+// Situation may have acquired a newer pending root_sync while this one sat
+// failed. When the redriven projection is the newer of the two, the pending
+// one is coalesced into it exactly as a newer commit would; when it is the
+// OLDER, the redrive is refused with ErrNewerRootProjectionPending — the
+// newer projection already renders the same current state — rather than
+// aborting on migration 0018's index.
 func (s *Store) RedriveFailedNotificationIntent(ctx context.Context, intentID string, now time.Time) error {
 	if strings.TrimSpace(intentID) == "" {
 		return errors.New("store: notification redrive requires an intent id")
 	}
-	res, err := s.db.ExecContext(ctx, `
-		UPDATE notification_intents
-		SET status = 'pending', retry_at = ?, claim_owner = NULL, lease_expires_at = NULL
-		WHERE id = ? AND status = 'failed'`, canonicalTime(now.UTC()), intentID)
+	nowStr := canonicalTime(now.UTC())
+
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("store: redrive failed notification intent: %w", err)
+		return fmt.Errorf("store: begin redrive failed notification intent: %w", err)
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("store: count redriven notification intent: %w", err)
-	}
-	if n != 1 {
+	defer func() { _ = tx.Rollback() }()
+
+	var effectClass, createdAt string
+	var situationID sql.NullString
+	err = tx.QueryRowContext(ctx,
+		`SELECT effect_class, situation_id, created_at FROM notification_intents WHERE id = ? AND status = 'failed'`,
+		intentID).Scan(&effectClass, &situationID, &createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("store: notification intent %s is not in failed status: %w", intentID, ErrNotFound)
 	}
+	if err != nil {
+		return fmt.Errorf("store: read failed notification intent: %w", err)
+	}
+
+	if situationmodel.EffectClass(effectClass) == situationmodel.EffectRootSync && situationID.Valid {
+		if err := clearPendingRootForRedriveTx(ctx, tx, situationID.String, intentID, createdAt); err != nil {
+			return err
+		}
+	}
+	if err := setNotificationIntentPendingTx(ctx, tx, intentID, "failed", nowStr); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit redrive failed notification intent: %w", err)
+	}
 	return nil
+}
+
+// clearPendingRootForRedriveTx frees the Situation's single pending-root slot
+// for the projection being redriven, or refuses when a newer projection
+// already holds it.
+func clearPendingRootForRedriveTx(ctx context.Context, tx *sql.Tx, situationID, intentID, createdAt string) error {
+	var pendingID, pendingCreatedAt string
+	err := tx.QueryRowContext(ctx, `
+		SELECT id, created_at FROM notification_intents
+		WHERE situation_id = ? AND effect_class = 'root_sync' AND status = 'pending'`, situationID).
+		Scan(&pendingID, &pendingCreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("store: read pending root projection for redrive: %w", err)
+	}
+	// created_at is canonical RFC3339Nano UTC, so string order is time
+	// order; the id breaks a same-instant tie the same way the claim
+	// ordering does.
+	if pendingCreatedAt > createdAt || (pendingCreatedAt == createdAt && pendingID > intentID) {
+		return ErrNewerRootProjectionPending
+	}
+	return supersedePendingRootSyncTx(ctx, tx, situationID, intentID)
 }
 
 // GetSituationRootCoordinates reads situationID's durable Slack root

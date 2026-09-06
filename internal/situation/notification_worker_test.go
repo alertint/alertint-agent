@@ -747,3 +747,77 @@ func TestNotificationWorkerStopReleasesHeldClaims(t *testing.T) {
 		}
 	})
 }
+
+// TestNotificationWorkerReactivatesConfigurationOncePerProcess is the
+// regression for reactivating on EVERY successful probe. Probe is only
+// auth.test: with a valid token and a misconfigured CHANNEL it succeeds
+// forever, so reactivating on it looped every poll — reactivate, claim,
+// chat.postMessage fails channel_not_found, block, reactivate again. That
+// grew configuration_generation and attempt_count without bound and reset
+// first_failure_at every cycle, so a real five-minute Delivery gap could
+// never open and the operator never got a recovery notice for what was, in
+// effect, a permanent outage.
+//
+// The spec ties reactivation to STARTUP: "Successful startup probe
+// reactivates configuration-blocked intents".
+func TestNotificationWorkerReactivatesConfigurationOncePerProcess(t *testing.T) {
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	// A permanently misconfigured channel: auth.test keeps succeeding and
+	// intents stay blocked, round after round.
+	store := &nwStore{state: SlackDeliveryState{ConfigurationGeneration: 3, BlockedConfigurationCount: 2}}
+	deliverer := &nwDeliverer{}
+	clock := &nwClock{at: now}
+	w := NewNotificationWorker(store, deliverer, NotificationWorkerConfig{
+		Owner:     "notify-a",
+		Heartbeat: time.Hour,
+		Rand:      func() float64 { return 0.5 },
+	}, clock.now, nwLogger())
+
+	for round := 0; round < 5; round++ {
+		if _, err := w.RunOnce(context.Background()); err != nil {
+			t.Fatalf("RunOnce %d: %v", round, err)
+		}
+		clock.advance(10 * time.Minute) // well past any probe backoff
+	}
+	store.snapshot(func(s *nwStore) {
+		if len(s.reactivated) != 1 || s.reactivated[0] != 4 {
+			t.Fatalf("reactivated with generations %v, want exactly one startup reactivation [4]", s.reactivated)
+		}
+	})
+	if got := w.Stats().Reactivated; got != 1 {
+		t.Fatalf("Stats().Reactivated = %d, want 1", got)
+	}
+	// Once configuration has been applied for this process, durably blocked
+	// intents no longer justify probing — otherwise the worker probes every
+	// few seconds forever against a configuration only a restart can change.
+	if deliverer.probeCalls != 1 {
+		t.Fatalf("probe calls = %d, want the single startup probe", deliverer.probeCalls)
+	}
+}
+
+// TestNotificationWorkerReactivateConfigurationIsIdempotentForStartup proves
+// the explicit entry point Task 9's startup sequence calls is safe to invoke
+// alongside the worker's own first probe: whichever runs first applies the
+// correction, the other reports nothing to do.
+func TestNotificationWorkerReactivateConfigurationIsIdempotentForStartup(t *testing.T) {
+	now := time.Date(2026, 9, 6, 10, 0, 0, 0, time.UTC)
+	store := &nwStore{state: SlackDeliveryState{ConfigurationGeneration: 7, BlockedConfigurationCount: 1}}
+	w := nwWorker(store, &nwDeliverer{}, now)
+
+	n, err := w.ReactivateConfiguration(context.Background())
+	if err != nil || n != 1 {
+		t.Fatalf("first ReactivateConfiguration = (%d, %v), want (1, nil)", n, err)
+	}
+	n, err = w.ReactivateConfiguration(context.Background())
+	if err != nil || n != 0 {
+		t.Fatalf("second ReactivateConfiguration = (%d, %v), want (0, nil)", n, err)
+	}
+	if _, err := w.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	store.snapshot(func(s *nwStore) {
+		if len(s.reactivated) != 1 || s.reactivated[0] != 8 {
+			t.Fatalf("reactivated with generations %v, want exactly [8]", s.reactivated)
+		}
+	})
+}
