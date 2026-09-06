@@ -6,12 +6,14 @@ import (
 	"bytes"
 	"go/parser"
 	"go/token"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/alertint/alertint-agent/internal/config"
 	"github.com/alertint/alertint-agent/internal/correlator"
 	"github.com/alertint/alertint-agent/internal/situation"
 	"github.com/alertint/alertint-agent/skills/acutetriage"
@@ -108,6 +110,81 @@ var (
 	// below-minimum clean skip BEFORE claiming, so it consumes no attempt.
 	_ situation.MinimumMemberAlertsPolicy = (*acutetriage.Skill)(nil)
 )
+
+// ----------------------------------------------------------------------
+// Task 8 one-writer topology proofs: the Situation notification worker
+// (Task 6/7) is the sole production Slack writer for anything Incident-
+// shaped. internal/notify/slack/system.go (ADR-0042/0046 System messages)
+// and llmhealth's own publisher stay the one other reachable Slack surface —
+// unaffected by these checks.
+// ----------------------------------------------------------------------
+
+// TestMainAssembly_BuildNotifierNeverRegistersSlackForIncidentFanout proves
+// buildNotifier's Incident notify.Multi registration never includes a
+// Slack-backed sink, even when Slack is fully enabled and its bot token
+// resolves — Task 8 removed exactly that one `nn = append(nn, slackNotifier)`
+// line. The llmhealth.Publisher return (the same concrete Slack *Notifier,
+// wired for ADR-0042/0046 System messages only) is untouched and must stay
+// non-nil.
+func TestMainAssembly_BuildNotifierNeverRegistersSlackForIncidentFanout(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Notify.Stdout = true
+	cfg.Notify.Slack.Enabled = true
+	cfg.Notify.Slack.BotTokenEnv = "ALERTINT_TEST_SLACK_OWNERSHIP_TOKEN"
+	cfg.Notify.Slack.Channel = "#alerts"
+	t.Setenv("ALERTINT_TEST_SLACK_OWNERSHIP_TOKEN", "xoxb-test")
+
+	multi, pub := buildNotifier(&cfg, nil, nil, slog.Default(), false)
+	if multi == nil {
+		t.Fatal("buildNotifier returned a nil *notify.Multi")
+	}
+	if pub == nil {
+		t.Fatal("buildNotifier must still return a non-nil llmhealth.Publisher when Slack resolves (ADR-0042/0046 System messages) — Task 8 only removes Slack from the Incident fan-out, not the System-message surface")
+	}
+
+	notifiers := reflect.ValueOf(*multi).FieldByName("notifiers")
+	if !notifiers.IsValid() {
+		t.Fatal("notify.Multi has no 'notifiers' field any more — update this structural check")
+	}
+	if notifiers.Len() == 0 {
+		t.Fatal("buildNotifier registered no sinks at all with stdout+slack both configured")
+	}
+	for i := 0; i < notifiers.Len(); i++ {
+		elemType := notifiers.Index(i).Elem().Type()
+		named := elemType
+		if named.Kind() == reflect.Pointer {
+			named = named.Elem()
+		}
+		if strings.Contains(named.PkgPath(), "/internal/notify/slack") {
+			t.Fatalf("buildNotifier registered a Slack-backed notifier (%s, package %s) into the Incident fan-out — Task 8 requires the Situation notification worker to be the sole Slack writer", elemType, named.PkgPath())
+		}
+	}
+}
+
+// TestMainAssembly_NeverWiresLegacyIncidentNotifiersIntoCorrelator is a
+// source-text scan (not just "did it compile") proving cmd/alertint never
+// calls SetResolutionNotifier, SetOccurrenceNotifier, or
+// SetTriageFailureNotifier on the Correlator any more — the three legacy
+// Incident-shaped notifier injections Task 8 removed. Their durable
+// Situation inputs (incident_resolved, membership_changed for an occurrence
+// attach, triage_exhausted) are written directly by domain logic inside the
+// relevant atomic store commit, independent of any notifier — see
+// correlator.go's ResolutionNotifier/OccurrenceNotifier/TriageFailureNotifier
+// doc comments.
+func TestMainAssembly_NeverWiresLegacyIncidentNotifiersIntoCorrelator(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"SetResolutionNotifier(", "SetOccurrenceNotifier(", "SetTriageFailureNotifier("} {
+		if strings.Contains(string(src), forbidden) {
+			t.Errorf("main.go calls %s — production must leave the Correlator's legacy Incident notifier setters unwired", forbidden)
+		}
+	}
+	if strings.Contains(string(src), "notify/resolution") {
+		t.Error("main.go still references internal/notify/resolution — Task 8 deletes that adapter package")
+	}
+}
 
 func TestRun_VersionFlagPrintsVersionAndExitsCleanly(t *testing.T) {
 	var stdout, stderr bytes.Buffer

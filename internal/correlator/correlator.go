@@ -55,8 +55,17 @@ type IncidentSink interface {
 	OnIncidentReady(ctx context.Context, inc store.Incident) error
 }
 
-// ResolutionNotifier receives notifications when an incident becomes fully resolved
-// (all alerts have status="resolved").
+// ResolutionNotifier receives notifications when an incident becomes fully
+// resolved (all alerts have status="resolved"). Task 8: cmd/alertint no
+// longer calls SetResolutionNotifier with a Slack-backed instance in
+// production — the Situation notification worker (Task 6/7) is now the sole
+// production Slack writer, and the durable "incident_resolved" Situation
+// input is written directly by ApplyCorrelatedDelivery/
+// correlatedSituationInputKindTx (internal/store/deliveries.go) inside the
+// same atomic commit, strictly before this notifier (if any) is even
+// considered — so leaving it nil costs nothing durable. The interface stays
+// a real Go shape the Correlator can still be wired with (delivery_test.go's
+// own fakes keep doing exactly that).
 type ResolutionNotifier interface {
 	OnIncidentResolved(ctx context.Context, inc store.Incident) error
 }
@@ -67,17 +76,32 @@ type NopIncidentSink struct{}
 
 func (NopIncidentSink) OnIncidentReady(_ context.Context, _ store.Incident) error { return nil }
 
-// OccurrenceNotifier receives a deterministic, zero-LLM notification each time a
-// re-fire attaches as an occurrence (recurrence collapse). The stdout notifier
-// emits one line; the Slack notifier edits the card and/or posts the "why" as a
-// thread reply. nil means no occurrence notifications.
+// OccurrenceNotifier receives a deterministic, zero-LLM notification each
+// time a re-fire attaches as an occurrence (recurrence collapse). nil means
+// no occurrence notifications — which is production's own default as of
+// Task 8: cmd/alertint no longer calls SetOccurrenceNotifier with a
+// Slack-backed instance (the Situation notification worker, Task 6/7, is now
+// the sole production Slack writer), and the durable "membership_changed"
+// Situation input for the attach is written directly by
+// ApplyCorrelatedDelivery inside the same atomic commit, strictly before
+// this notifier (if any) is even considered.
 type OccurrenceNotifier interface {
 	OnOccurrenceAttached(ctx context.Context, ev notify.RecurrenceEvent) error
 }
 
 // TriageFailureNotifier receives one event when an incident's triage has
 // exhausted its retry schedule and the incident was marked "failed". nil
-// disables it.
+// disables it — production's own default, both before and after Task 8:
+// the exhaustion notification path that actually reaches an operator is
+// skills/acutetriage.Skill.OnTriageExhausted (wired as TriageWorker's
+// ExhaustionNotifier in cmd/alertint/situation_controller.go), never this
+// Correlator field — c.triageNotifier has had no reachable caller inside
+// this package since Task 7 removed the Correlator's own dispatch/
+// exhaustion chain, and cmd/alertint stopped calling SetTriageFailureNotifier
+// in Task 8 accordingly. The durable "triage_exhausted" Situation input is
+// written directly by TriageWorker's own store commit
+// (internal/store/triage_controller.go's ExhaustIncidentTriageAttempt),
+// independent of any notifier.
 type TriageFailureNotifier interface {
 	OnTriageExhausted(ctx context.Context, ev notify.TriageExhaustedEvent) error
 }

@@ -331,6 +331,17 @@ func memberBaselines(members []store.Alert, incomingFP string) (maxSev int, maxS
 // and — for an escalation — leaves the trigger on the occurrence row. No
 // re-judgment runs here or anywhere else in this package: the Correlator
 // owns grouping and readiness only, never analyzer/LLM dispatch.
+//
+// This whole path (maybeAttachOccurrence/attachOccurrence, reached only via
+// handleAlert) has been unreachable from any production Receiver since Task
+// 4 — production correlates through the durable ApplyDelivery/
+// applyRecurrenceDeliveryPlan path in correlator.go instead, which writes
+// the equivalent "membership_changed" Situation input directly inside
+// ApplyCorrelatedDelivery's atomic commit. c.occNotifier here is exercised
+// only by this file's own legacy in-memory fixtures (attach_integration_test.go);
+// Task 8 does not need to touch it to close off Slack reachability — that is
+// already true — but see correlator.go's OccurrenceNotifier doc for
+// production's own (equally nil-by-default) wiring since Task 8.
 func (c *Correlator) attachOccurrence(ctx context.Context, a store.Alert, inc store.Incident, gk string, decision attachDecision, delta recurrenceDelta) error {
 	occ := store.Occurrence{
 		IncidentID:   inc.ID,

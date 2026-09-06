@@ -570,3 +570,56 @@ func TestMaybeAttach_EventCarriesCadenceDelta(t *testing.T) {
 		t.Errorf("cadence delta = {new:%s median:%s}, want new*8 < median with both > 0", ev.NewInterval, ev.PriorMedian)
 	}
 }
+
+// TestApplyDelivery_ResolutionAndOccurrenceWorkWithNoNotifiersWired pins
+// Task 8's new production default: cmd/alertint no longer calls
+// SetResolutionNotifier/SetOccurrenceNotifier/SetTriageFailureNotifier at
+// all — the Situation notification worker (Task 6/7) is now the sole
+// production Slack writer, and a legacy Incident-shaped notifier is never
+// constructed there any more. ResolutionNotifier/OccurrenceNotifier/
+// TriageFailureNotifier stay real Go interfaces the Correlator can still be
+// wired with (this package's own tests keep doing exactly that with fakes,
+// e.g. TestApplyDelivery_RecurrenceCollapseAttachesOccurrenceAndNotifies /
+// TestApplyDelivery_ResolvedDeliveryResolvesIncidentAndNotifies in
+// delivery_test.go); production simply leaves all three nil now. This test
+// proves both durable ApplyDelivery outcomes — a resolved delivery flipping
+// an Incident to "resolved" and a firing re-fire collapsing into an
+// occurrence — commit their Incident/Occurrence mutation and Situation input
+// correctly with every notifier left nil, since notification was always a
+// best-effort side effect layered strictly AFTER the durable commit, never
+// a dependency of it (correlator.go's applyResolvedDeliveryPlan/
+// applyRecurrenceDeliveryPlan call ApplyCorrelatedDelivery first and only
+// then check "if c.resolutionNotifier != nil" / "if c.occNotifier != nil").
+func TestApplyDelivery_ResolutionAndOccurrenceWorkWithNoNotifiersWired(t *testing.T) {
+	t.Run("resolution", func(t *testing.T) {
+		st := openStore(t)
+		c := New(Config{}, st, NopIncidentSink{}, nil) // no Set*Notifier call at all
+		now := time.Date(2026, 9, 6, 3, 0, 0, 0, time.UTC)
+		member := firingAlert("fp-only", "DiskFull", "warning", now.Add(-time.Hour), false)
+		seedJudged(t, st, "inc_1", "ready", now.Add(-time.Hour), now.Add(-time.Hour), member)
+
+		claim := claimOneDelivery(t, st, deliveryInputFor("d1", "fp-only", gkAPI, "resolved", now), now)
+		if err := c.ApplyDelivery(context.Background(), claim); err != nil {
+			t.Fatalf("resolved delivery with no notifier wired: %v", err)
+		}
+		inc, err := st.GetIncidentByID(context.Background(), "inc_1")
+		if err != nil || inc.Status != "resolved" {
+			t.Fatalf("incident must still resolve with no notifier wired: %+v, %v", inc, err)
+		}
+	})
+	t.Run("occurrence", func(t *testing.T) {
+		st := openStore(t)
+		c := New(Config{}, st, NopIncidentSink{}, nil) // no Set*Notifier call at all
+		now := time.Date(2026, 9, 6, 3, 0, 0, 0, time.UTC)
+		member := firingAlert("fp-orig", "DiskFull", "warning", now.Add(-5*time.Minute), false)
+		seedJudged(t, st, "inc_1", "analyzed", now.Add(-5*time.Minute), now.Add(-10*time.Minute), member)
+
+		claim := claimOneDelivery(t, st, deliveryInputFor("d1", "fp-new", gkAPI, "firing", now), now)
+		if err := c.ApplyDelivery(context.Background(), claim); err != nil {
+			t.Fatalf("recurrence collapse with no notifier wired: %v", err)
+		}
+		if occCount(t, st, "inc_1") != 1 {
+			t.Fatalf("occurrence must still attach with no notifier wired: %d", occCount(t, st, "inc_1"))
+		}
+	})
+}

@@ -51,7 +51,6 @@ import (
 	"github.com/alertint/alertint-agent/internal/logs/loki"
 	internalmcp "github.com/alertint/alertint-agent/internal/mcp"
 	"github.com/alertint/alertint-agent/internal/notify"
-	notifyresolution "github.com/alertint/alertint-agent/internal/notify/resolution"
 	notifyslack "github.com/alertint/alertint-agent/internal/notify/slack"
 	notifystdout "github.com/alertint/alertint-agent/internal/notify/stdout"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
@@ -389,17 +388,29 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 	cor := correlator.New(corCfg, st, productionIncidentSink(), logger)
 
-	// SetTriageFailureNotifier is safe to wire here, before reconstruction:
-	// it is not reachable from ApplyDelivery's durable-dispatch path (the
-	// triage-exhausted notifier fires only from the correlator's own
-	// internal ticker loop, which isn't running during reconstruction).
+	// Task 8: production wires NO notifier onto the Correlator at all any
+	// more — not SetTriageFailureNotifier here, and not
+	// SetResolutionNotifier/SetOccurrenceNotifier inside startCorrelator
+	// below either. The Situation notification worker (Task 6/7) is now the
+	// sole production Slack writer; the Correlator's own
+	// ResolutionNotifier/OccurrenceNotifier/TriageFailureNotifier setters
+	// stay real Go shape (this package's own tests, and
+	// internal/correlator's, keep exercising them with fakes) but are never
+	// handed a live instance here. Each domain outcome's durable Situation
+	// input (incident_resolved, membership_changed for an occurrence
+	// attach, triage_exhausted) is written directly by domain logic inside
+	// the relevant atomic store commit — see correlator.go's own doc
+	// comments on the three interfaces — so leaving all three unwired loses
+	// no durable history, only the retired Incident-card Slack/stdout
+	// fan-out.
+	//
 	// The Correlator has no analyzer/LLM seam at all — no IncidentSink
 	// beyond the no-op one and no re-judgment runner (Plan 2 Task 7) —
 	// see TestProductionCorrelatorHasNoAcuteTriageDispatchDependency.
-	// SetAuditor, SetResolutionNotifier, and SetOccurrenceNotifier are NOT
-	// wired here — all three ARE reachable from ApplyDelivery — see
-	// startCorrelator below.
-	cor.SetTriageFailureNotifier(notifier)
+	// SetAuditor IS still wired — inside startCorrelator below, alongside
+	// this comment's former SetResolutionNotifier/SetOccurrenceNotifier
+	// neighbors — because it alone remains reachable from ApplyDelivery's
+	// durable-dispatch path.
 
 	// stopCorrelator is called exactly once, however runServe exits: inline,
 	// in the right relative position, by foundationStopSequence on the
@@ -466,25 +477,26 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		backfillAndRecoverControllerWork: func(ctx context.Context) error {
 			return runControllerRecovery(ctx, crt, logger)
 		},
-		// SetAuditor/SetResolutionNotifier/SetOccurrenceNotifier are wired
-		// here — between reconstruct and cor.Start, never before — because
-		// all three are synchronously reachable from ApplyDelivery's
-		// durable-dispatch path (a queued resolved delivery whose commit
-		// settles an Incident calls the resolution notifier; a queued firing
-		// delivery that collapses into a recurrence occurrence calls the
-		// occurrence notifier and appends the occurrence_attached audit
-		// event; a queued retry attach appends triage_member_attached).
-		// Wiring them before reconstruction would let a plain
-		// crash-and-restart with ordinary queued webhook traffic post to
-		// Slack — or append audit rows — from reconstruction: exactly the
-		// outward effects the spec's "reconstruction invokes no notifier,
-		// audit callback, ..." acceptance forbids. The Setters' own doc
-		// comments require only "after New, before Start", so this ordering
-		// is legal; the Correlator's loop itself isn't running yet either.
+		// SetAuditor is wired here — between reconstruct and cor.Start, never
+		// before — because it is synchronously reachable from ApplyDelivery's
+		// durable-dispatch path (a queued retry attach appends
+		// triage_member_attached; a queued firing delivery that collapses
+		// into a recurrence occurrence appends occurrence_attached).
+		// Wiring it before reconstruction would let a plain crash-and-restart
+		// with ordinary queued webhook traffic append audit rows from
+		// reconstruction: exactly the outward effect the spec's
+		// "reconstruction invokes no notifier, audit callback, ..."
+		// acceptance forbids. The Setter's own doc comment requires only
+		// "after New, before Start", so this ordering is legal; the
+		// Correlator's loop itself isn't running yet either.
+		//
+		// Task 8: SetResolutionNotifier/SetOccurrenceNotifier are NOT called
+		// here (or anywhere in production) any more — see the comment above
+		// cor's construction. Their durable Situation inputs are written
+		// directly by ApplyCorrelatedDelivery, in the same atomic commit
+		// this dispatch path already runs, independent of any notifier.
 		startCorrelator: func(ctx context.Context) error {
 			cor.SetAuditor(auditor)
-			cor.SetResolutionNotifier(notifyresolution.New(notifier, st))
-			cor.SetOccurrenceNotifier(notifier)
 			return cor.Start(ctx)
 		},
 		startWorkers:           rt.Start,
@@ -1110,11 +1122,14 @@ func buildHealthChecks(cfg *config.Config, prom *promclient.Client, logSrc logs.
 //   - stdout: always an active sink when notify.stdout is set, so a send is
 //     confirmed (notified · stdout=ok) at INFO. Its verbose full JSON line is
 //     written only at debug level (consistently, in every format).
-//   - slack: when enabled and a bot token resolves.
 //
-// buildNotifier also returns the llmhealth.Publisher for the installation's
-// one system-message surface: the same Slack *Notifier when Slack is wired,
-// else nil (LLM dependency health then lives in state/audit/logs only).
+// Task 8: Slack is never registered into this Incident fan-out any more —
+// the Situation notification worker (Task 6/7) is the sole production Slack
+// writer for anything Incident-shaped now (findings, resolutions, occurrence
+// attaches, annotations/Captured verdicts). buildNotifier still constructs
+// the concrete Slack *Notifier and returns it as the llmhealth.Publisher
+// below when Slack is enabled and its bot token resolves — that remaining
+// production Slack use (ADR-0042/0046 System messages) is unaffected.
 func buildNotifier(cfg *config.Config, st *store.Store, auditor *audit.Auditor, logger *slog.Logger, debug bool) (*notify.Multi, llmhealth.Publisher) {
 	var nn []notify.Notifier
 	var sinks []string
@@ -1126,9 +1141,11 @@ func buildNotifier(cfg *config.Config, st *store.Store, auditor *audit.Auditor, 
 	}
 	if cfg.Notify.Slack.Enabled {
 		if token, err := cfg.SlackBotToken(); err == nil && token != "" {
+			// Constructed for the System-message surface only
+			// (ADR-0042/0046, the llmhealth.Publisher return below) — never
+			// appended to nn: an Incident Slack card or thread reply is the
+			// Situation notification worker's job now, not this fan-out's.
 			slackNotifier := notifyslack.New(token, cfg.Notify.Slack.Channel, cfg.Notify.Slack.MinSeverity, cfg.Notify.Slack.RecurrenceMode, st, auditor)
-			nn = append(nn, slackNotifier)
-			sinks = append(sinks, "slack")
 			slackWired = true
 			publisher = slackNotifier
 		}
