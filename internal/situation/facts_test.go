@@ -222,6 +222,42 @@ func TestAcuteFindingFactIdentityChangesWhenLatestAttemptArrivesAtSameInputVersi
 	}
 }
 
+// TestCapabilityLimitationFactIdentityChangesWhenReservedListChangesAtSameInputVersion
+// is Plan 4 Task 10's own live lab finding: reservedUnsupportedCapabilities
+// is build-scoped, not input-derived — an old, still-nonterminal Situation
+// reconciled by a NEWER binary (an upgrade, not a fresh input) observes a
+// DIFFERENT limitation list at the exact same (situationID, inputVersion)
+// an OLDER binary already committed a capability_limitation fact for.
+// Discovered live: reconciling four pre-Plan-4 Situations against the
+// upgraded binary failed with AppendSituationFacts' own immutable-conflict
+// check (same ID, different Value) on every cycle, permanently — not a
+// crash-only edge case, ordinary post-upgrade operation. Mirrors
+// TestIncidentTriageStateFactIdentityChangesWithPhaseAtSameInputVersion's
+// own fix exactly: factIdentityWithContent, not plain factIdentity.
+func TestCapabilityLimitationFactIdentityChangesWhenReservedListChangesAtSameInputVersion(t *testing.T) {
+	in := baseSnapshotInput(t)
+
+	original := reservedUnsupportedCapabilities
+	t.Cleanup(func() { reservedUnsupportedCapabilities = original })
+
+	reservedUnsupportedCapabilities = []model.Limitation{
+		{Code: "prometheus_unavailable", Detail: "pre-Plan-4 blanket statement"},
+	}
+	before := findFact(t, DeriveStoreFacts(in), "capability_limitation", "plan2")
+
+	reservedUnsupportedCapabilities = []model.Limitation{
+		{Code: "semantic_profile_unavailable", Detail: "Semantic profile binding/correction authority is not available until Plan 5."},
+	}
+	after := findFact(t, DeriveStoreFacts(in), "capability_limitation", "plan2")
+
+	if before.ID == after.ID {
+		t.Fatalf("capability_limitation fact ID unchanged despite the reserved-capability list changing at the same "+
+			"input_version %d: %q — a build upgrade that changes the reserved list must produce a new fact ID, or "+
+			"reconciling an old still-nonterminal Situation collides with AppendSituationFacts' own immutable-conflict check",
+			in.Situation.InputVersion, before.ID)
+	}
+}
+
 func TestStoreFactsSortedByKindSubjectID(t *testing.T) {
 	in := baseSnapshotInput(t)
 	facts := DeriveStoreFacts(in)

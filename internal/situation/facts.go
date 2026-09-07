@@ -540,12 +540,20 @@ type capabilityLimitationFactValue struct {
 
 func deriveCapabilityLimitationFact(situationID string, inputVersion int, now time.Time) model.Fact {
 	value := capabilityLimitationFactValue{Limitations: append([]model.Limitation(nil), reservedUnsupportedCapabilities...)}
+	digest := canonicalDigest(value)
 	return model.Fact{
-		ID:           factIdentity(factKindCapabilityLimitation, situationID, inputVersion, capabilityLimitationSubject),
+		// factIdentityWithContent, not plain factIdentity (Task 10 live lab
+		// finding): reservedUnsupportedCapabilities is build-scoped, not
+		// input-derived, so its content can legitimately differ at the SAME
+		// (situationID, inputVersion) across a binary upgrade that changes
+		// the reserved list — an old, still-nonterminal Situation reconciled
+		// post-upgrade must get a new fact ID, or it collides with
+		// AppendSituationFacts' own immutable-conflict check on every cycle.
+		ID:           factIdentityWithContent(factKindCapabilityLimitation, situationID, inputVersion, capabilityLimitationSubject, digest),
 		SituationID:  situationID,
 		Kind:         factKindCapabilityLimitation,
 		Subject:      capabilityLimitationSubject,
-		Digest:       canonicalDigest(value),
+		Digest:       digest,
 		InputVersion: inputVersion,
 		Value:        mustMarshal(value),
 		// Never confirmed_empty: these capabilities are not absent from a
