@@ -1,0 +1,2 @@
+# Synthetic idempotency key in a notification-intent test fixture; not a credential.
+0c75d4ca9136a51e96e8490967d3467b0238981f:internal/store/situation_notifications_upgrade_test.go:generic-api-key:813

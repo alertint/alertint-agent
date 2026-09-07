@@ -17,18 +17,22 @@ spec:
   template:
     metadata:
       annotations:
-        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- $annotations := dict "checksum/config" (include (print $.Template.BasePath "/configmap.yaml") . | sha256sum) }}
         {{- if .Values.secret.create }}
-        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- $annotations = set $annotations "checksum/secret" (include (print $.Template.BasePath "/secret.yaml") . | sha256sum) }}
         {{- end }}
-        {{- with .Values.podAnnotations }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
+        {{- $annotations = mergeOverwrite $annotations .Values.podAnnotations }}
+        {{- toYaml $annotations | nindent 8 }}
       labels:
-        {{- include "alertint-agent.labels" . | nindent 8 }}
-        {{- with .Values.podLabels }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
+        {{- $podLabels := include "alertint-agent.labels" . | fromYaml }}
+        {{- $podLabels = mergeOverwrite $podLabels .Values.podLabels }}
+        {{- /* app.kubernetes.io/name and app.kubernetes.io/instance must match
+               spec.selector.matchLabels exactly — the pod template's labels
+               have to be a superset of it, or Kubernetes rejects the
+               Deployment. podLabels can override any other label, but never
+               these two. */ -}}
+        {{- $podLabels = mergeOverwrite $podLabels (include "alertint-agent.selectorLabels" . | fromYaml) }}
+        {{- toYaml $podLabels | nindent 8 }}
     spec:
       serviceAccountName: {{ include "alertint-agent.serviceAccountName" . }}
       automountServiceAccountToken: false

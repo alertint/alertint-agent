@@ -25,7 +25,13 @@ serviceAccount:
   annotations: {}
   name: ""
 
+# -- Merged onto the pod template's annotations, in addition to the chart's
+# own checksum/config and checksum/secret annotations. A key here overrides
+# the chart's own annotation of the same name.
 podAnnotations: {}
+# -- Merged onto the pod template's labels, in addition to the chart's
+# standard labels. A key here overrides the chart's own label of the same
+# name.
 podLabels: {}
 
 # The upstream image runs as a distroless "nonroot" image (USER 65532:65532).
@@ -45,6 +51,10 @@ securityContext:
 
 service:
   type: ClusterIP
+  # -- Extra labels merged onto the Service, in addition to the chart's
+  # standard labels (same precedence as podLabels: a key here overrides the
+  # chart's own label of the same name).
+  labels: {}
   # -- External Service port for Alertmanager/change/Zabbix webhooks + GET
   # /health. The container itself always listens on 9911 regardless of this
   # value (it's fixed in the Deployment template and mapped by name) — this
@@ -57,11 +67,17 @@ service:
   # is left disabled — nothing listens on it in that case.
   mcpPort: 9912
 
+# -- className is a shared infra setting (which ingress controller handles
+# both resources); annotations are per-Ingress below, since the two commonly
+# need different controller behavior (auth, IP allowlisting, rewrites, ...).
+# webhook.enabled and mcp.enabled are fully independent — either, both, or
+# neither can be created.
 ingress:
-  enabled: false
   className: ""
-  annotations: {}
   webhook:
+    # -- Set to true to create the webhook Ingress, independent of mcp.enabled.
+    enabled: false
+    annotations: {}
     host: ""
     # -- Prefix-matches /webhook/alertmanager, /webhook/change, etc. Kept
     # away from "/" deliberately so GET /health isn't reachable through this
@@ -70,7 +86,10 @@ ingress:
     pathType: Prefix
     tls: []
   mcp:
+    # -- Set to true to also (or only) expose the MCP Ingress — independent
+    # of webhook.enabled above.
     enabled: false
+    annotations: {}
     host: ""
     path: /
     pathType: ImplementationSpecific

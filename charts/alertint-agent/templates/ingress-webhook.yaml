@@ -1,11 +1,11 @@
-{{- if .Values.ingress.enabled -}}
+{{- if .Values.ingress.webhook.enabled -}}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: {{ include "alertint-agent.fullname" . }}-webhook
   labels:
     {{- include "alertint-agent.labels" . | nindent 4 }}
-  {{- with .Values.ingress.annotations }}
+  {{- with .Values.ingress.webhook.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
