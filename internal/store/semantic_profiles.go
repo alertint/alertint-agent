@@ -132,10 +132,14 @@ type semanticSignatureAttachment struct {
 // (admitSemanticProfileInferenceTx) needs. Mapping is unconditional: the
 // delivery itself is real and immutable the instant it exists, independent
 // of its owning Situation's current lifecycle. An oversize/invalid
-// signature material is a best-effort miss (no row, no job, no error): a
-// signature failure must never block the owning Situation's own lifecycle,
-// mirroring Plan 4 Task 6's own "connector failure is durable evidence
-// limitation, never a fatal Reconcile error" principle.
+// signature material is a durable miss (an append-only
+// delivery_semantic_signature_misses row carrying only the bounded
+// semanticprofile.SignatureMissReason class — never the offending key or
+// value — so neither the backfill nor a replay ever retries it; no mapping
+// row, no job, no error): a signature failure must never block the owning
+// Situation's own lifecycle, mirroring Plan 4 Task 6's own "connector
+// failure is durable evidence limitation, never a fatal Reconcile error"
+// principle.
 func mapDeliverySemanticSignatureTx(ctx context.Context, tx *sql.Tx, deliveryID string, now time.Time) (semanticSignatureAttachment, error) {
 	in, err := semanticSignatureInputForDeliveryTx(ctx, tx, deliveryID)
 	if err != nil {
@@ -143,7 +147,7 @@ func mapDeliverySemanticSignatureTx(ctx context.Context, tx *sql.Tx, deliveryID 
 	}
 	sig, err := semanticprofile.BuildSignature(in)
 	if err != nil {
-		return semanticSignatureAttachment{}, nil //nolint:nilerr // best-effort: oversize/invalid signature material never blocks Situation lifecycle.
+		return semanticSignatureAttachment{}, recordDeliverySemanticSignatureMissTx(ctx, tx, deliveryID, semanticprofile.SignatureMissReason(err), now)
 	}
 	att := semanticSignatureAttachment{signatureKey: sig.Key, input: in, mapped: true}
 
@@ -168,6 +172,18 @@ func mapDeliverySemanticSignatureTx(ctx context.Context, tx *sql.Tx, deliveryID 
 		return semanticSignatureAttachment{}, fmt.Errorf("store: insert delivery semantic signature: %w", err)
 	}
 	return att, nil
+}
+
+// recordDeliverySemanticSignatureMissTx appends deliveryID's permanent
+// signature miss (idempotent: a replay of the same delivery finds its row
+// already present and leaves it untouched — the table is immutable).
+func recordDeliverySemanticSignatureMissTx(ctx context.Context, tx *sql.Tx, deliveryID, reason string, now time.Time) error {
+	if _, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO delivery_semantic_signature_misses (delivery_id, reason, created_at)
+		VALUES (?, ?, ?)`, deliveryID, reason, canonicalTime(now)); err != nil {
+		return fmt.Errorf("store: record delivery semantic signature miss: %w", err)
+	}
+	return nil
 }
 
 // admitSemanticProfileInferenceTx is the ADMISSION step: only for a
@@ -295,13 +311,18 @@ func deliveryHasNonterminalOwnerTx(ctx context.Context, tx *sql.Tx, deliveryID s
 
 // BackfillActiveSemanticMappings attaches a semantic signature (and, for a
 // brand-new signature, enqueues its inference job) for up to limit
-// deliveries belonging to a nonterminal Situation that have no
-// delivery_semantic_signatures row yet — recovering rows an interrupted
-// ApplySituationInput crash left unattached, or upgrading a pre-Task-7
-// database. Deliveries whose only owning Situation is already terminal are
-// left for lazy, non-job-creating derivation at read time (spec.md:
-// "without queueing inference for terminal-only episodes") — this function
-// never attaches them. Returns the number of deliveries attached.
+// deliveries belonging to a nonterminal Situation that have neither a
+// delivery_semantic_signatures row nor a delivery_semantic_signature_misses
+// row yet — recovering rows an interrupted ApplySituationInput crash left
+// unattached, or upgrading a pre-Task-7 database. Deliveries whose only
+// owning Situation is already terminal are left for lazy, non-job-creating
+// derivation at read time (spec.md: "without queueing inference for
+// terminal-only episodes") — this function never attaches them. A delivery
+// whose signature material is unsupported is settled with a durable miss
+// row instead, so it is never reselected. Returns the number of deliveries
+// durably settled this call (attached or recorded as a miss) — a caller's
+// drain loop stops on 0 and can never spin on a permanently unsupported
+// row.
 func (s *Store) BackfillActiveSemanticMappings(ctx context.Context, now time.Time, limit int) (int, error) {
 	if limit <= 0 {
 		limit = 100
@@ -314,7 +335,9 @@ func (s *Store) BackfillActiveSemanticMappings(ctx context.Context, now time.Tim
 		JOIN situation_incidents si ON si.incident_id = iad.incident_id
 		JOIN situations s ON s.id = si.situation_id
 		LEFT JOIN delivery_semantic_signatures dss ON dss.delivery_id = ad.id
-		WHERE dss.delivery_id IS NULL AND s.lifecycle IN ('active', 'recovery_pending')
+		LEFT JOIN delivery_semantic_signature_misses dsm ON dsm.delivery_id = ad.id
+		WHERE dss.delivery_id IS NULL AND dsm.delivery_id IS NULL
+		  AND s.lifecycle IN ('active', 'recovery_pending')
 		ORDER BY ad.received_at ASC, ad.id ASC
 		LIMIT ?`, limit)
 	if err != nil {
@@ -335,7 +358,7 @@ func (s *Store) BackfillActiveSemanticMappings(ctx context.Context, now time.Tim
 	defer func() { _ = tx.Rollback() }()
 
 	maxAttempts := s.maxSemanticProfileAttempts()
-	attached := 0
+	settled := 0
 	for _, id := range ids {
 		nonterminal, err := deliveryHasNonterminalOwnerTx(ctx, tx, id)
 		if err != nil {
@@ -348,18 +371,18 @@ func (s *Store) BackfillActiveSemanticMappings(ctx context.Context, now time.Tim
 		if err != nil {
 			return 0, err
 		}
+		settled++ // mapped, or durably recorded as a miss — either way never reselected.
 		if !att.mapped {
 			continue
 		}
 		if err := admitSemanticProfileInferenceTx(ctx, tx, att, maxAttempts, now); err != nil {
 			return 0, err
 		}
-		attached++
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("store: commit backfill active semantic mappings: %w", err)
 	}
-	return attached, nil
+	return settled, nil
 }
 
 // RecoverSemanticInference releases every inference job whose lease expired

@@ -287,6 +287,16 @@ var ErrVersionConflict = errors.New("semanticprofile: expected version does not 
 // collision.
 var ErrOversizeSignatureMaterial = errors.New("semanticprofile: signature material exceeds size bound")
 
+// ErrSignatureMissingSource is returned by BuildSignature when the input
+// names no source at all — no advisory identity can be derived.
+var ErrSignatureMissingSource = errors.New("semanticprofile: signature requires a source")
+
+// ErrSignatureKeyTooLong is returned by BuildSignature when a label or
+// annotation KEY exceeds MaxSignatureKeyChars — refused outright rather
+// than truncated into a collision. The offending key is never carried in
+// the error.
+var ErrSignatureKeyTooLong = errors.New("semanticprofile: signature key exceeds length bound")
+
 // ErrLeaseLost is returned by profile-store methods when a caller's
 // owner/token no longer matches the live job claim.
 var ErrLeaseLost = errors.New("semanticprofile: job lease lost")

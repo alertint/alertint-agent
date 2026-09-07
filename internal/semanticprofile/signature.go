@@ -43,7 +43,7 @@ type signatureMaterial struct {
 // cannot accidentally consume them.
 func BuildSignature(in profilemodel.SignatureInput) (profilemodel.Signature, error) {
 	if in.Source == "" {
-		return profilemodel.Signature{}, errors.New("semanticprofile: signature requires a source")
+		return profilemodel.Signature{}, profilemodel.ErrSignatureMissingSource
 	}
 	if err := validateKeyChars(in.LabelKeys); err != nil {
 		return profilemodel.Signature{}, fmt.Errorf("semanticprofile: label keys: %w", err)
@@ -108,8 +108,39 @@ func sortedCopy(in []string) []string {
 func validateKeyChars(keys []string) error {
 	for _, k := range keys {
 		if len(k) > profilemodel.MaxSignatureKeyChars {
-			return fmt.Errorf("key %q exceeds %d characters", k, profilemodel.MaxSignatureKeyChars)
+			// Length only — the key itself is caller content and never
+			// travels in an error that may be logged.
+			return fmt.Errorf("%w: a key of %d characters exceeds %d", profilemodel.ErrSignatureKeyTooLong, len(k), profilemodel.MaxSignatureKeyChars)
 		}
 	}
 	return nil
+}
+
+// Signature-miss reasons — the closed, bounded vocabulary a durable
+// delivery_semantic_signature_misses row records for a delivery whose
+// signature material BuildSignature refused. Identity classes only: never
+// the offending key, value, or material.
+const (
+	SignatureMissMissingSource    = "missing_source"
+	SignatureMissKeyTooLong       = "key_too_long"
+	SignatureMissOversizeMaterial = "oversize_material"
+	SignatureMissUnsupported      = "unsupported"
+)
+
+// SignatureMissReason classifies one BuildSignature error onto the closed
+// miss vocabulary above; any error outside the typed set is
+// SignatureMissUnsupported. nil has no reason ("").
+func SignatureMissReason(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, profilemodel.ErrSignatureMissingSource):
+		return SignatureMissMissingSource
+	case errors.Is(err, profilemodel.ErrSignatureKeyTooLong):
+		return SignatureMissKeyTooLong
+	case errors.Is(err, profilemodel.ErrOversizeSignatureMaterial):
+		return SignatureMissOversizeMaterial
+	default:
+		return SignatureMissUnsupported
+	}
 }

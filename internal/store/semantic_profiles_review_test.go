@@ -6,9 +6,11 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/semanticprofile"
 	profilemodel "github.com/alertint/alertint-agent/internal/semanticprofile/model"
 	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 )
@@ -408,6 +410,104 @@ func TestRearmDependencyExhaustedSemanticJobsSkipsSignatureWithHead(t *testing.T
 	}
 	if r.rearmedGeneration != 4 {
 		t.Fatalf("rearmed_generation = %d, want 4 (considered once, never rescanned for this generation)", r.rearmedGeneration)
+	}
+}
+
+// oversizeKeyDelivery builds one delivery carrying a label KEY one character
+// past MaxSignatureKeyChars — signature material BuildSignature refuses
+// permanently.
+func oversizeKeyDelivery(id string, now time.Time) DeliveryInput {
+	del := deliveryFixture(id, "fp-"+id, now)
+	del.Alert.Labels[strings.Repeat("k", profilemodel.MaxSignatureKeyChars+1)] = "secret-value-never-persisted"
+	return del
+}
+
+func countSignatureMisses(t *testing.T, st *Store, deliveryID string) (n int, reason string) {
+	t.Helper()
+	var r sql.NullString
+	if err := st.db.QueryRowContext(context.Background(), `
+		SELECT COUNT(*), MAX(reason) FROM delivery_semantic_signature_misses WHERE delivery_id = ?`, deliveryID).Scan(&n, &r); err != nil {
+		t.Fatalf("count misses for %s: %v", deliveryID, err)
+	}
+	return n, r.String
+}
+
+// TestBackfillActiveSemanticMappingsSettlesUnsupportedSignatureOnce (F22):
+// a delivery whose signature cannot be built (a 257-character label key)
+// is selected exactly once, durably recorded as a miss with a bounded
+// reason class, and never reselected — two further backfill calls return
+// 0, so a caller's drain loop terminates.
+func TestBackfillActiveSemanticMappingsSettlesUnsupportedSignatureOnce(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+
+	_, _ = signatureDeliveryFixture(t, st, "miss-seed", "group-miss", now)
+	deliveryID := "delivery-miss-unattached"
+	if _, err := st.AcceptDeliveries(ctx, []DeliveryInput{oversizeKeyDelivery(deliveryID, now)}); err != nil {
+		t.Fatalf("accept oversize-key delivery: %v", err)
+	}
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO incident_alert_deliveries (incident_id, delivery_id, created_at) VALUES (?, ?, ?)`,
+		"inc-miss-seed", deliveryID, canonicalTime(now)); err != nil {
+		t.Fatalf("attach unattached delivery to incident: %v", err)
+	}
+
+	first, err := st.BackfillActiveSemanticMappings(ctx, now, 100)
+	if err != nil {
+		t.Fatalf("first backfill: %v", err)
+	}
+	if first != 1 {
+		t.Fatalf("first backfill settled = %d, want 1 (the miss is durable progress)", first)
+	}
+	if _, _, _, found := getDeliverySignature(t, st, deliveryID); found {
+		t.Fatal("an unsupported signature must never produce a mapping row")
+	}
+	n, reason := countSignatureMisses(t, st, deliveryID)
+	if n != 1 || reason != semanticprofile.SignatureMissKeyTooLong {
+		t.Fatalf("misses = %d reason %q, want 1 with the bounded class %q", n, reason, semanticprofile.SignatureMissKeyTooLong)
+	}
+	if strings.Contains(reason, "secret-value") || strings.Contains(reason, "kkkk") {
+		t.Fatalf("miss reason %q leaks label content", reason)
+	}
+
+	for i := 2; i <= 3; i++ {
+		n, err := st.BackfillActiveSemanticMappings(ctx, now.Add(time.Duration(i)*time.Minute), 100)
+		if err != nil {
+			t.Fatalf("backfill call %d: %v", i, err)
+		}
+		if n != 0 {
+			t.Fatalf("backfill call %d settled = %d, want 0: a recorded miss is never reselected", i, n)
+		}
+	}
+	if n, _ := countSignatureMisses(t, st, deliveryID); n != 1 {
+		t.Fatalf("miss rows = %d, want exactly 1", n)
+	}
+}
+
+// TestApplySituationInputRecordsUnsupportedSignatureMiss (F22, ingress
+// half): the same unsupported delivery arriving through the real
+// ApplySituationInput applies cleanly, records its miss, and is not picked
+// up by the backfill afterwards.
+func TestApplySituationInputRecordsUnsupportedSignatureMiss(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+
+	deliveryID := "delivery-miss-ingress"
+	if _, err := st.AcceptDeliveries(ctx, []DeliveryInput{oversizeKeyDelivery(deliveryID, now)}); err != nil {
+		t.Fatalf("accept oversize-key delivery: %v", err)
+	}
+	insertIncidentAndDeliveryInput(t, st, "inc-miss-ingress", "input-miss-ingress", "group-miss-ingress", deliveryID, now)
+	claim := claimOneInput(t, st, "seed:miss-ingress", now)
+	if err := st.ApplySituationInput(ctx, claim); err != nil {
+		t.Fatalf("apply situation input with an unsupported signature: %v", err)
+	}
+	if n, reason := countSignatureMisses(t, st, deliveryID); n != 1 || reason != semanticprofile.SignatureMissKeyTooLong {
+		t.Fatalf("misses after ingress = %d reason %q, want 1/%q", n, reason, semanticprofile.SignatureMissKeyTooLong)
+	}
+	if n, err := st.BackfillActiveSemanticMappings(ctx, now.Add(time.Minute), 100); err != nil || n != 0 {
+		t.Fatalf("backfill after an ingress miss = (%d, %v), want (0, nil)", n, err)
 	}
 }
 
