@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/alertint/alertint-agent/internal/llm"
+	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
@@ -183,6 +184,9 @@ type ControllerCommit struct {
 	RetryAt            *time.Time
 	LastErrorClass     *string
 	Parked             ParkedState
+	// BudgetDeniedCallID refunds a proved-unsent first call in this same
+	// fenced commit. Its immutable call/outcome records remain intact.
+	BudgetDeniedCallID *string
 
 	// History is Plan 3 Task 5's addition: this reconciliation's immutable
 	// Transitions, the Episode summary folded across them, and every
@@ -193,6 +197,19 @@ type ControllerCommit struct {
 	// reconciliation with no pending artifact and no R4 deadline refresh
 	// due); the commit then behaves exactly as Plan 2's did.
 	History *HistoryCommit
+
+	// PreparationCycleID and PreparationGeneration are Plan 4 Task 2's
+	// addition: the frozen preparation cycle (if any) this reconciliation's
+	// evidence was prepared under. CommitController seals it in the SAME
+	// fenced transaction as the authoritative state above (spec.md:
+	// "CommitController seals the cycle and advances its generation in the
+	// existing authoritative transaction, even for reuse/fallback/
+	// schedule-only commits"). PreparationCycleID == "" means this cycle
+	// never began preparation at all (no EvidencePreparer configured, or a
+	// local-only compatibility path) — sealing is then a no-op, and the
+	// commit behaves exactly as it did before Plan 4.
+	PreparationCycleID    string
+	PreparationGeneration int64
 }
 
 // ParkedState is CommitController's explicit instruction for the
@@ -460,13 +477,14 @@ func (c ControllerConfig) withDefaults() ControllerConfig {
 // Controller is the fenced Situation controller: one Reconcile call performs
 // exactly one claimed Situation's reconciliation cycle end to end.
 type Controller struct {
-	store  ControllerStore
-	client AssessmentClient
-	cfg    ControllerConfig
-	clock  Clock
-	audit  AuditSink
-	health AssessmentHealthObserver
-	logger *slog.Logger
+	store    ControllerStore
+	client   AssessmentClient
+	cfg      ControllerConfig
+	clock    Clock
+	audit    AuditSink
+	health   AssessmentHealthObserver
+	logger   *slog.Logger
+	preparer EvidencePreparer
 }
 
 // SetAssessmentHealthObserver wires the installation LLM-health observer
@@ -703,11 +721,46 @@ type lifecycleResolution struct {
 // with it or the pairing check fails closed. closed_unknown reached FROM
 // active (no recovery ever observed) correctly leaves both nil instead, since
 // neither was ever set on this Situation.
-func (c *Controller) resolveLifecycle(cur model.Situation, in SnapshotInput, snap Snapshot, now time.Time) lifecycleResolution {
-	firing := AnyFiring(snap.Symptoms)
-	resolved := anyDeliveryResolved(in.Deliveries)
-	deadline := ObservationDeadlineAt(cur.EffectiveStartedAt, snap.DurationClass)
-	pastDeadline := !now.Before(deadline)
+// resolveLifecycle derives this cycle's lifecycle transition. When a
+// preparation cycle is durably underway for this input (in.Prepared.CycleID
+// != "" — set only by the reload after a real EvidencePreparer ran,
+// preparation.go's own doc comment), sl (this SAME cycle's
+// ReduceSourceLifecycle fold, computed by the caller from prepared source
+// observations and latest deliveries) REPLACES the pre-Plan-4 Delivery/Symptom
+// inference entirely (spec.md R13: source acquisition mode and interval,
+// never Delivery.StartedAtBasis alone). recoveryObserved marks "genuinely
+// have complete resolved evidence, begin the grace clock": in the prepared
+// world that is sl.AllResolved specifically, NOT sl.AnyResolved or the mere
+// existence of a cycle — a poll-provenance member that has simply not been
+// observed yet (no connector silence, no total preparation failure) must
+// never be mistaken for resolved (plan.md: "cannot... invent source state,
+// or remove a source failure"). A cycle whose lifecycle-phase evidence
+// turned up nothing at all and has no delivery truth (in.Prepared.CycleID
+// != "" but sl is its zero value) safely falls through to the "stay active" default
+// the pre-Plan-4 empty-Symptoms edge case already used, rather than reading
+// silence as recovery. In the local-only fallback (no cycle at all — every
+// pre-Task-6 fixture), recoveryObserved is len(snap.Symptoms) > 0, exactly
+// as before: this branch's behavior is byte-for-byte unchanged from
+// pre-Plan-4 Reconcile.
+func (c *Controller) resolveLifecycle(cur model.Situation, in SnapshotInput, snap Snapshot, sl SourceLifecycle, now time.Time) lifecycleResolution {
+	prepared := in.Prepared.CycleID != ""
+
+	var firing, resolved, pastDeadline, recoveryObserved bool
+	var graceDuration time.Duration
+	if prepared {
+		firing = sl.AnyFiring
+		resolved = sl.AnyResolved
+		pastDeadline = sl.ClosureDue
+		recoveryObserved = sl.AllResolved
+		graceDuration = sl.Grace
+	} else {
+		firing = AnyFiring(snap.Symptoms)
+		resolved = anyDeliveryResolved(in.Deliveries)
+		deadline := ObservationDeadlineAt(cur.EffectiveStartedAt, snap.DurationClass)
+		pastDeadline = !now.Before(deadline)
+		recoveryObserved = len(snap.Symptoms) > 0
+		graceDuration = RecoveryGraceDuration(in.Deliveries, c.cfg.WebhookRecoveryGrace, c.cfg.PollingIntervalSeconds)
+	}
 
 	switch cur.Lifecycle {
 	case model.LifecycleActive:
@@ -718,9 +771,9 @@ func (c *Controller) resolveLifecycle(cur model.Situation, in SnapshotInput, sna
 			reason := ClosedUnknownReason(cur.EffectiveStartedAtBasis, resolved)
 			lc, _ := AdvanceLifecycle(cur.Lifecycle, EventLifecycleUnobservable)
 			return lifecycleResolution{Lifecycle: lc, TerminalAt: timePtr(now), TerminalReason: terminalReasonPtr(reason)}
-		case len(snap.Symptoms) > 0:
+		case recoveryObserved:
 			lc, _ := AdvanceLifecycle(cur.Lifecycle, EventRecoveryObserved)
-			graceUntil := RecoveryGraceUntil(now, in.Deliveries, c.cfg.WebhookRecoveryGrace, c.cfg.PollingIntervalSeconds)
+			graceUntil := now.Add(graceDuration)
 			return lifecycleResolution{Lifecycle: lc, RecoveryObservedAt: timePtr(now), GraceUntil: timePtr(graceUntil)}
 		default:
 			return lifecycleResolution{Lifecycle: model.LifecycleActive}
@@ -754,6 +807,114 @@ func (c *Controller) resolveLifecycle(cur model.Situation, in SnapshotInput, sna
 		// value is handled explicitly above. Defensive fallback only.
 		return lifecycleResolution{Lifecycle: cur.Lifecycle, RecoveryObservedAt: cur.RecoveryObservedAt, GraceUntil: cur.GraceUntil, TerminalAt: cur.TerminalAt, TerminalReason: cur.TerminalReason}
 	}
+}
+
+// reduceSourceLifecycle folds prepared observations and authoritative latest
+// deliveries across in's expected member Alerts, or returns zero when no
+// preparation cycle exists yet for this input (in.Prepared.CycleID == "") —
+// resolveLifecycle's prepared branch only ever runs once a cycle exists, so
+// an unpopulated fold is never consulted in that case.
+func reduceSourceLifecycle(cfg ControllerConfig, in SnapshotInput, now time.Time) SourceLifecycle {
+	if in.Prepared.CycleID == "" {
+		return SourceLifecycle{}
+	}
+	latest := make(map[string]Delivery, len(in.Deliveries))
+	for _, d := range in.Deliveries {
+		id := d.AlertID
+		if id == "" {
+			id = "delivery:" + d.ID
+		}
+		cur, ok := latest[id]
+		newer := deliveryLess(cur, d)
+		// Preserve source-episode/receipt ordering, but never let an
+		// arbitrary row ID resolve a simultaneous firing observation.
+		if ok && sourceTimeKey(d).Equal(sourceTimeKey(cur)) && d.ReceivedAt.Equal(cur.ReceivedAt) && d.Status != cur.Status {
+			newer = d.Status == model.DeliveryStatusFiring
+		}
+		if !ok || newer {
+			latest[id] = d
+		}
+	}
+	observations := make([]SourceObservation, 0, len(in.Prepared.Lifecycle)+len(latest))
+	observations = append(observations, in.Prepared.Lifecycle...)
+	for id, d := range latest {
+		// Receipt time is when this delivery was observed, not this cycle's
+		// now: newer prepared source evidence must still supersede it.
+		observations = append(observations, SourceObservation{
+			AlertID: id, EpisodeKey: d.EpisodeKey, Source: d.Source,
+			State: string(d.Status), ObservedAt: d.ReceivedAt,
+			EventStartedAt: d.SourceStartedAt, EventResolvedAt: d.SourceResolvedAt,
+			AcquisitionMode: d.AcquisitionMode, PollIntervalSeconds: d.PollIntervalSeconds,
+		})
+	}
+	return ReduceSourceLifecycle(observations, expectedAlertIDs(in.Deliveries), now, cfg.WebhookRecoveryGrace)
+}
+
+// prepareLifecyclePhase runs the lifecycle-phase EvidencePreparer (plan.md's
+// control-flow contract: "if preparer configured and Situation nonterminal:
+// prepare lifecycle phase ... reload input for the selected cycle") and
+// returns the freshly reloaded input. A nil preparer, or an already-terminal
+// Situation, returns in unchanged — no prepare, no reload.
+func (c *Controller) prepareLifecyclePhase(ctx context.Context, claim Claim, in SnapshotInput, now time.Time) (SnapshotInput, error) {
+	if c.preparer == nil {
+		return in, nil
+	}
+	nonterminal := in.Situation.Lifecycle != model.LifecycleRecovered && in.Situation.Lifecycle != model.LifecycleClosedUnknown
+	if !nonterminal {
+		return in, nil
+	}
+	prepCtx, span := tracer().Start(ctx, SpanEvidencePreparation, trace.WithAttributes(
+		AttrSituationID.String(in.Situation.ID), AttrPreparationPhase.String(string(observationmodel.PhaseLifecycle)),
+	))
+	_, err := c.preparer.Prepare(prepCtx, PreparationRequest{Claim: claim, Input: in, Phase: observationmodel.PhaseLifecycle, Now: now})
+	if err != nil {
+		span.SetAttributes(AttrResultClass.String(PreparationResultError))
+		span.End()
+		return SnapshotInput{}, fmt.Errorf("situation: controller reconcile: prepare lifecycle phase: %w", err)
+	}
+	span.SetAttributes(AttrResultClass.String(PreparationResultCommitted))
+	span.End()
+	reloaded, err := c.store.LoadReconciliationInput(ctx, claim, now)
+	if err != nil {
+		return SnapshotInput{}, fmt.Errorf("situation: controller reconcile: reload after lifecycle preparation: %w", err)
+	}
+	return reloaded, nil
+}
+
+// prepareAssessmentPhaseIfActive is the "if active" half of plan.md's
+// control-flow contract: sl (this cycle's already-reduced source lifecycle,
+// unchanged by the lifecycle-phase reload above) decides whether the
+// Situation would resolve active — resolveLifecycle's prepared branch never
+// reads snap, so calling it with the zero Snapshot{} here, before
+// BuildSnapshot has run, is safe. Only then does the assessment-phase
+// preparer run, followed by its own reload and re-reduction (assessment
+// preparation never touches lifecycle evidence, but the reload IS a fresh
+// coherent read, so sl must be recomputed against it rather than reused). A
+// nil preparer, or a non-active gate, returns in/sl unchanged.
+func (c *Controller) prepareAssessmentPhaseIfActive(ctx context.Context, claim Claim, in SnapshotInput, sl SourceLifecycle, now time.Time) (SnapshotInput, SourceLifecycle, error) {
+	if c.preparer == nil {
+		return in, sl, nil
+	}
+	gate := c.resolveLifecycle(in.Situation, in, Snapshot{}, sl, now)
+	if gate.Lifecycle != model.LifecycleActive {
+		return in, sl, nil
+	}
+	prepCtx, span := tracer().Start(ctx, SpanEvidencePreparation, trace.WithAttributes(
+		AttrSituationID.String(in.Situation.ID), AttrPreparationPhase.String(string(observationmodel.PhaseAssessment)),
+	))
+	_, err := c.preparer.Prepare(prepCtx, PreparationRequest{Claim: claim, Input: in, Phase: observationmodel.PhaseAssessment, Now: now})
+	if err != nil {
+		span.SetAttributes(AttrResultClass.String(PreparationResultError))
+		span.End()
+		return SnapshotInput{}, SourceLifecycle{}, fmt.Errorf("situation: controller reconcile: prepare assessment phase: %w", err)
+	}
+	span.SetAttributes(AttrResultClass.String(PreparationResultCommitted))
+	span.End()
+	reloaded, err := c.store.LoadReconciliationInput(ctx, claim, now)
+	if err != nil {
+		return SnapshotInput{}, SourceLifecycle{}, fmt.Errorf("situation: controller reconcile: reload after assessment preparation: %w", err)
+	}
+	return reloaded, reduceSourceLifecycle(c.cfg, reloaded, now), nil
 }
 
 // ----------------------------------------------------------------------
@@ -901,6 +1062,8 @@ func outcomeErrorCodes(issues []ValidationIssue) []string {
 // provider response body, a URL with query parameters, or similar.
 func sanitizeTransportError(err error) string {
 	switch {
+	case errors.Is(err, llm.ErrBudgetExhausted) && errors.Is(err, llm.ErrRequestNotSent):
+		return BudgetDeferralErrorClass
 	case errors.Is(err, llm.ErrSchemaViolation):
 		return "schema_violation"
 	case errors.Is(err, llm.ErrResponseTruncated):
@@ -1569,6 +1732,22 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 		return fmt.Errorf("situation: controller reconcile: load: %w", err)
 	}
 
+	// Plan 4 Task 6: bounded evidence preparation, under this SAME attempt
+	// wall (ctx, already cancel-scoped to c.cfg.AttemptWall above) — plan.md's
+	// "attempt's child preparation wall." A nil preparer (every pre-Task-6
+	// fixture, and any build that has not wired cmd/alertint's production
+	// adapter yet) skips both phases below entirely: in.Prepared then stays
+	// whatever LoadReconciliationInput already read — its zero value for a
+	// nil preparer — so DeriveStoreFacts/BuildSnapshot/resolveLifecycle all
+	// take their pre-Plan-4 local-only path unchanged.
+	if in, err = c.prepareLifecyclePhase(ctx, claim, in, now); err != nil {
+		return err
+	}
+	sl := reduceSourceLifecycle(c.cfg, in, now)
+	if in, sl, err = c.prepareAssessmentPhaseIfActive(ctx, claim, in, sl, now); err != nil {
+		return err
+	}
+
 	// 2. Local fact derivation/append.
 	facts := DeriveStoreFacts(in)
 	if err := c.store.AppendSituationFacts(ctx, claim, facts); err != nil {
@@ -1582,7 +1761,7 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 	// derivation: DeriveAssessment reads state.Lifecycle == snap.Lifecycle,
 	// so a fresh transition this cycle discovers must already be reflected
 	// on snap before any derivation path runs.
-	lc := c.resolveLifecycle(in.Situation, in, snap, now)
+	lc := c.resolveLifecycle(in.Situation, in, snap, sl, now)
 	snap.Lifecycle = lc.Lifecycle
 
 	// 4. Pure Triage decisions.
@@ -1595,16 +1774,18 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 	basis := historyBasis{In: in, Snap: snap, Now: now}
 
 	base := ControllerCommit{
-		MaterialFactHash:    snap.MaterialFactHash,
-		AssessmentBasisHash: snap.AssessmentBasisHash,
-		EligibleReasons:     snap.EligibleReasons,
-		TriageDecisions:     triageDecisions,
-		Lifecycle:           lc.Lifecycle,
-		RecoveryObservedAt:  lc.RecoveryObservedAt,
-		GraceUntil:          lc.GraceUntil,
-		TerminalAt:          lc.TerminalAt,
-		TerminalReason:      lc.TerminalReason,
-		ConsumedDueReasons:  claim.Situation.DueReasons,
+		MaterialFactHash:      snap.MaterialFactHash,
+		AssessmentBasisHash:   snap.AssessmentBasisHash,
+		EligibleReasons:       snap.EligibleReasons,
+		TriageDecisions:       triageDecisions,
+		Lifecycle:             lc.Lifecycle,
+		RecoveryObservedAt:    lc.RecoveryObservedAt,
+		GraceUntil:            lc.GraceUntil,
+		TerminalAt:            lc.TerminalAt,
+		TerminalReason:        lc.TerminalReason,
+		ConsumedDueReasons:    claim.Situation.DueReasons,
+		PreparationCycleID:    in.Prepared.CycleID,
+		PreparationGeneration: in.Prepared.Generation,
 	}
 
 	// 5. Deterministic/reuse check — no L2 call, no work attempt consumed.
@@ -1643,6 +1824,10 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 	// only suppresses NEW semantic L2 work. If the basis has since changed,
 	// controllerParkBlocksDispatch returns false and this cycle proceeds
 	// exactly as if not parked, naturally lifting the park.
+	if in.ControllerParked.Reason == ParkedReasonBudget && (in.Situation.RetryAt == nil || now.Before(*in.Situation.RetryAt)) {
+		base.RetryAt = in.Situation.RetryAt
+		return c.commitBudgetDeferred(ctx, claim, basis, base, state, 0, 1)
+	}
 	if controllerParkBlocksDispatch(in.ControllerParked, snap.MaterialFactHash) {
 		return c.commitBlocked(ctx, claim, basis, base, state)
 	}
@@ -1745,7 +1930,16 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 	}
 	if disp.proposal != nil {
 		result := DeriveAssessment(*disp.proposal, snap, in, state, model.DerivationModelValidated, nil, now)
-		return c.commitResult(ctx, claim, basis, base, result, &disp.lastCallID, retryEpoch, workAttempt, disp.lastDuration)
+		return c.commitResult(ctx, claim, basis, base, result, &disp.lastCallID, retryEpoch, workAttempt, disp.lastDuration, disp.lastUsage)
+	}
+	if disp.budgetDeniedBeforeDispatch {
+		var deferred *llm.BudgetDeferredError
+		if errors.As(disp.transportErr, &deferred) {
+			base.RetryAt = deferred.RetryAt
+		}
+		base.BudgetDeniedCallID = &disp.lastCallID
+		base.Parked = ParkedState{Touch: true, At: now, Reason: ParkedReasonBudget}
+		return c.commitBudgetDeferred(ctx, claim, basis, base, state, retryEpoch, workAttempt)
 	}
 
 	// No accepted/contradicted result: classify the last outcome (using
@@ -1786,9 +1980,12 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 // when callID is non-nil (dispatchWorkBearing's own oneShot.Latency), or 0
 // for a no-call commit (reuse) — threaded straight through to
 // buildAuthoritativeAttempt.
-func (c *Controller) commitResult(ctx context.Context, claim Claim, basis historyBasis, base ControllerCommit, result AssessmentResult, callID *string, retryEpoch, workAttempt int, duration time.Duration) error {
+func (c *Controller) commitResult(ctx context.Context, claim Claim, basis historyBasis, base ControllerCommit, result AssessmentResult, callID *string, retryEpoch, workAttempt int, duration time.Duration, usage ...llm.Completion) error {
 	now := basis.Now
 	base.Attempt = buildAuthoritativeAttempt(claim.Situation.ID, result, callID, retryEpoch, workAttempt, duration, now)
+	if callID != nil && len(usage) > 0 {
+		setAssessmentUsage(&base.Attempt, usage[0])
+	}
 	base.Assessment = result.Assessment
 	base.Coverage = result.Coverage
 	base.Parked = ParkedState{Touch: true, Reason: ""}
@@ -1914,12 +2111,14 @@ func (c *Controller) fallbackOrPreserveBlocked(situationID string, snap Snapshot
 // for the caller to thread into whichever attempt row it ends up building
 // from this cycle's outcome (Task 9 fix round, Finding #4).
 type dispatchResult struct {
-	proposal       *model.AssessmentProposal
-	lastVR         *ValidationResult
-	lastCallID     string
-	lastDuration   time.Duration
-	correctionUsed bool
-	transportErr   error
+	budgetDeniedBeforeDispatch bool
+	lastUsage                  llm.Completion
+	proposal                   *model.AssessmentProposal
+	lastVR                     *ValidationResult
+	lastCallID                 string
+	lastDuration               time.Duration
+	correctionUsed             bool
+	transportErr               error
 }
 
 // dispatchWorkBearing runs one work-bearing controller attempt's L2 dispatch
@@ -1989,6 +2188,8 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 		// which would silently diverge from whatever the client itself
 		// determined.
 		started := model.ProviderRequestStarted(oneShot.RequestStarted)
+		res.budgetDeniedBeforeDispatch = callNumber == 1 && started == model.ProviderRequestStartedFalse &&
+			errors.Is(callErr, llm.ErrRequestNotSent) && errors.Is(callErr, llm.ErrBudgetExhausted)
 
 		var vr *ValidationResult
 		var transportErr error
@@ -1999,6 +2200,7 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 			vr = &v
 		}
 		res.lastVR, res.transportErr, res.lastCallID, res.lastDuration = vr, transportErr, callID, oneShot.Latency
+		res.lastUsage = oneShot.Completion
 
 		policy := ClassifyL2Outcome(vr, transportErr, res.correctionUsed)
 		// Installation LLM health observes the FINAL typed outcome — after
@@ -2027,6 +2229,7 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 
 		outcomeSequence := synthesizeSequence(snap.InputVersion, retryEpoch, workAttempt, callNumber)
 		outcome := buildOutcomeAttempt(claim.Situation.ID, callID, snap.InputVersion, retryEpoch, workAttempt, outcomeSequence, vr, transportErr, started, oneShot.Latency, now)
+		setAssessmentUsage(&outcome, oneShot.Completion)
 		// The outcome row is the durable record of an already-consumed
 		// dispatch slot, so it is written on a short detached context when
 		// the cycle's own context is already done (attempt wall expired, or

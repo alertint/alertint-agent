@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
 func TestAssessmentPromptBuildRoundTripsSnapshotContent(t *testing.T) {
@@ -32,6 +34,28 @@ func TestAssessmentPromptBuildRoundTripsSnapshotContent(t *testing.T) {
 	}
 	if !strings.Contains(p.Prefix, snap.EligibleReasons[0].ID) {
 		t.Fatal("prompt does not carry the eligible reason candidate ID the model must cite verbatim")
+	}
+}
+
+func TestAssessmentPromptCarriesPriorSemanticAssessment(t *testing.T) {
+	in := criticalInput(t)
+	in.CurrentAssessment = &AuthoritativeAssessment{Assessment: model.Assessment{
+		Persistence:     model.PersistenceSustained,
+		Impact:          model.ImpactSuspected,
+		Novelty:         model.NoveltyInsufficientHistory,
+		Causality:       model.CausalityUnknown,
+		EvidenceQuality: model.EvidenceQualityInsufficient,
+		Limitations:     []model.Limitation{{Code: "envelope_unavailable", Detail: "not available"}},
+	}}
+	snap := snapshotFor(t, in)
+	p, err := BuildAssessmentPrompt(snap)
+	if err != nil {
+		t.Fatalf("BuildAssessmentPrompt: %v", err)
+	}
+	for _, want := range []string{"prior_assessment", "sustained", "suspected", "insufficient_history", "preserve"} {
+		if !strings.Contains(p.Prefix, want) {
+			t.Fatalf("prompt does not carry stability input %q", want)
+		}
 	}
 }
 
@@ -126,7 +150,7 @@ func TestAssessmentPromptStatesNestedShapesAndAllowedLimitationCodes(t *testing.
 			t.Fatalf("prompt does not state %q", want)
 		}
 	}
-	for _, l := range plan2UnsupportedCapabilities {
+	for _, l := range reservedUnsupportedCapabilities {
 		if !strings.Contains(p.Prefix, "  "+l.Code+"\n") {
 			t.Fatalf("prompt does not list allowed limitation code %q", l.Code)
 		}
@@ -162,7 +186,7 @@ func TestValidateAssessmentProposalRejectsLiveLabShapeAndAcceptsDocumentedShape(
 	documented := `{"schema_version":1,"persistence":"unknown","impact":"unknown","novelty":"insufficient_history",` +
 		`"causality":"unknown","attention":"observe",` +
 		`"sufficient_reason":{"code":"` + cand.Code + `","candidate_id":"` + cand.ID + `","summary":"Confirmed active critical source severity.","evidence_refs":[]},` +
-		`"limitations":[{"code":"` + plan2UnsupportedCapabilities[0].Code + `","detail":"No metric evidence in this build."}]}`
+		`"limitations":[{"code":"` + reservedUnsupportedCapabilities[0].Code + `","detail":"No metric evidence in this build."}]}`
 	vr = ValidateAssessmentProposal(json.RawMessage(documented), snap, call, now)
 	if vr.Outcome == ProposalOutcomeMalformed || vr.Outcome == ProposalOutcomeCapabilityRejected {
 		t.Fatalf("documented shape: outcome=%s errors=%v, want the shape and capability gates to pass", vr.Outcome, vr.Errors)

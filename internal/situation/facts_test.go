@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
@@ -221,6 +222,42 @@ func TestAcuteFindingFactIdentityChangesWhenLatestAttemptArrivesAtSameInputVersi
 	}
 }
 
+// TestCapabilityLimitationFactIdentityChangesWhenReservedListChangesAtSameInputVersion
+// is Plan 4 Task 10's own live lab finding: reservedUnsupportedCapabilities
+// is build-scoped, not input-derived — an old, still-nonterminal Situation
+// reconciled by a NEWER binary (an upgrade, not a fresh input) observes a
+// DIFFERENT limitation list at the exact same (situationID, inputVersion)
+// an OLDER binary already committed a capability_limitation fact for.
+// Discovered live: reconciling four pre-Plan-4 Situations against the
+// upgraded binary failed with AppendSituationFacts' own immutable-conflict
+// check (same ID, different Value) on every cycle, permanently — not a
+// crash-only edge case, ordinary post-upgrade operation. Mirrors
+// TestIncidentTriageStateFactIdentityChangesWithPhaseAtSameInputVersion's
+// own fix exactly: factIdentityWithContent, not plain factIdentity.
+func TestCapabilityLimitationFactIdentityChangesWhenReservedListChangesAtSameInputVersion(t *testing.T) {
+	in := baseSnapshotInput(t)
+
+	original := reservedUnsupportedCapabilities
+	t.Cleanup(func() { reservedUnsupportedCapabilities = original })
+
+	reservedUnsupportedCapabilities = []model.Limitation{
+		{Code: "prometheus_unavailable", Detail: "pre-Plan-4 blanket statement"},
+	}
+	before := findFact(t, DeriveStoreFacts(in), "capability_limitation", "plan2")
+
+	reservedUnsupportedCapabilities = []model.Limitation{
+		{Code: "semantic_profile_unavailable", Detail: "Semantic profile binding/correction authority is not available until Plan 5."},
+	}
+	after := findFact(t, DeriveStoreFacts(in), "capability_limitation", "plan2")
+
+	if before.ID == after.ID {
+		t.Fatalf("capability_limitation fact ID unchanged despite the reserved-capability list changing at the same "+
+			"input_version %d: %q — a build upgrade that changes the reserved list must produce a new fact ID, or "+
+			"reconciling an old still-nonterminal Situation collides with AppendSituationFacts' own immutable-conflict check",
+			in.Situation.InputVersion, before.ID)
+	}
+}
+
 func TestStoreFactsSortedByKindSubjectID(t *testing.T) {
 	in := baseSnapshotInput(t)
 	facts := DeriveStoreFacts(in)
@@ -418,17 +455,87 @@ func TestMaterialFactHashAndAssessmentBasisHashIgnoreLeaseClaimRetryState(t *tes
 	}
 }
 
-func TestMaterialFactHashChangesOnLimitationSet(t *testing.T) {
+func TestMaterialFactHashIgnoresStaticLimitationSet(t *testing.T) {
 	in := baseSnapshotInput(t)
 	before := materialHashFor(t, in)
 
-	orig := plan2UnsupportedCapabilities
-	plan2UnsupportedCapabilities = append(append([]model.Limitation{}, orig...), model.Limitation{Code: "test_extra_limitation", Detail: "test"})
-	defer func() { plan2UnsupportedCapabilities = orig }()
+	orig := reservedUnsupportedCapabilities
+	reservedUnsupportedCapabilities = append(append([]model.Limitation{}, orig...), model.Limitation{Code: "test_extra_limitation", Detail: "test"})
+	defer func() { reservedUnsupportedCapabilities = orig }()
 
 	after := materialHashFor(t, in)
-	if before == after {
-		t.Fatal("adding a limitation code did not change material fact hash")
+	if before != after {
+		t.Fatal("static limitation set changed material fact hash")
+	}
+}
+
+// TestMaterialFactHashUnaffectedByPreparationWhenNoPreparerConfigured proves
+// a zero-valued Prepared (no preparer configured, or no cycle has begun
+// yet) computes the exact same hash as before Plan 4 — every existing
+// local-only fixture and test.
+func TestMaterialFactHashUnaffectedByPreparationWhenNoPreparerConfigured(t *testing.T) {
+	in := baseSnapshotInput(t)
+	if in.Prepared.CycleID != "" {
+		t.Fatal("test fixture precondition: expected a zero-valued Prepared state")
+	}
+	h1 := materialHashFor(t, in)
+	h2 := materialHashFor(t, in)
+	if h1 != h2 {
+		t.Fatal("material hash must be stable across repeated calls with no prepared state")
+	}
+}
+
+// TestMaterialFactHashChangesOnPreparedObservationEvidence proves prepared
+// observation evidence (Plan 4 Task 6) is folded into the material hash:
+// identical prepared facts keep the hash stable, but a changed material
+// fact value changes it (spec.md A7).
+func TestMaterialFactHashChangesOnPreparedObservationEvidence(t *testing.T) {
+	in := baseSnapshotInput(t)
+	in.Prepared = PreparedState{
+		CycleID: "cycle-1",
+		Runs: []observationmodel.Run{{
+			ID: "run-1", CycleID: "cycle-1", PlanID: "plan-1",
+			Facts: []observationmodel.Fact{{
+				ID: "fact-1", RunID: "run-1", Kind: "metric_summary", Subject: "signal-a",
+				SchemaVersion: observationmodel.FactSchemaVersion, Value: []byte(`{"up":1}`),
+				ResultStatus: observationmodel.ResultConfirmedValue, Freshness: observationmodel.FreshnessFresh,
+				Material: true,
+			}},
+		}},
+	}
+	before := materialHashFor(t, in)
+
+	// Identical prepared evidence (even under a different run ID —
+	// collection identity, never material) keeps the hash stable.
+	inSame := in
+	inSame.Prepared.Runs = []observationmodel.Run{{
+		ID: "run-2", CycleID: "cycle-1", PlanID: "plan-1",
+		Facts: []observationmodel.Fact{{
+			ID: "fact-2", RunID: "run-2", Kind: "metric_summary", Subject: "signal-a",
+			SchemaVersion: observationmodel.FactSchemaVersion, Value: []byte(`{"up":1}`),
+			ResultStatus: observationmodel.ResultConfirmedValue, Freshness: observationmodel.FreshnessFresh,
+			Material: true,
+		}},
+	}}
+	same := materialHashFor(t, inSame)
+	if before != same {
+		t.Fatal("collection-identity churn (run/fact IDs) must not change the material hash")
+	}
+
+	// A genuinely changed material value changes the hash.
+	inChanged := in
+	inChanged.Prepared.Runs = []observationmodel.Run{{
+		ID: "run-1", CycleID: "cycle-1", PlanID: "plan-1",
+		Facts: []observationmodel.Fact{{
+			ID: "fact-1", RunID: "run-1", Kind: "metric_summary", Subject: "signal-a",
+			SchemaVersion: observationmodel.FactSchemaVersion, Value: []byte(`{"up":0}`),
+			ResultStatus: observationmodel.ResultConfirmedValue, Freshness: observationmodel.FreshnessFresh,
+			Material: true,
+		}},
+	}}
+	changed := materialHashFor(t, inChanged)
+	if before == changed {
+		t.Fatal("a changed material observation value did not change the material fact hash")
 	}
 }
 

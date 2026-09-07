@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/llm"
+	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
 	"github.com/alertint/alertint-agent/internal/situation"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
@@ -27,6 +28,12 @@ type fakeControllerStore struct {
 
 	loadInput situation.SnapshotInput
 	loadErr   error
+	// loadInputs, when non-empty, overrides loadInput one call at a time (FIFO) —
+	// lets a Plan 4 Task 6 test simulate a preparer's reload returning freshly
+	// prepared evidence on the SECOND LoadReconciliationInput call within one
+	// Reconcile. Every pre-Task-6 test leaves this nil, so loadInput alone
+	// still answers every call exactly as before.
+	loadInputs []situation.SnapshotInput
 
 	factsAppended []model.Fact
 
@@ -70,6 +77,10 @@ func (f *fakeControllerStore) LoadReconciliationInput(ctx context.Context, claim
 	defer f.mu.Unlock()
 	f.order = append(f.order, "load")
 	in := f.loadInput
+	if len(f.loadInputs) > 0 {
+		in = f.loadInputs[0]
+		f.loadInputs = f.loadInputs[1:]
+	}
 	in.Now = now
 	return in, f.loadErr
 }
@@ -1494,6 +1505,196 @@ func TestControllerReconcileLifecycleActiveReachesClosedUnknownWithoutRecoveryFi
 	}
 	if commit.TerminalAt == nil || commit.TerminalReason == nil {
 		t.Fatalf("closed_unknown must carry both terminal fields set, got TerminalAt=%v TerminalReason=%v", commit.TerminalAt, commit.TerminalReason)
+	}
+}
+
+// ----------------------------------------------------------------------
+// Plan 4 Task 6: EvidencePreparer wiring — Reconcile dispatches a bounded
+// preparation phase before deriving Snapshot/lifecycle, and its own
+// reload of durable state (never the in-memory receipt below) becomes the
+// authoritative basis. fakeEvidencePreparer never touches the store
+// itself: it only records which phase(s) it was asked to prepare, mirroring
+// how the real cmd/alertint adapter (Task 9) is the one that actually
+// persists Runs/Facts — the fake proves Reconcile's OWN gating/reload
+// contract in isolation from that adapter.
+// ----------------------------------------------------------------------
+
+type fakeEvidencePreparer struct {
+	mu     sync.Mutex
+	calls  []situation.PreparationRequest
+	err    error
+	result situation.PreparedState
+}
+
+func (f *fakeEvidencePreparer) Prepare(ctx context.Context, req situation.PreparationRequest) (situation.PreparedState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, req)
+	return f.result, f.err
+}
+
+func (f *fakeEvidencePreparer) phasesCalled() []observationmodel.Phase {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	phases := make([]observationmodel.Phase, len(f.calls))
+	for i, c := range f.calls {
+		phases[i] = c.Phase
+	}
+	return phases
+}
+
+// TestControllerReconcilePreparedEvidenceOverridesStaleLocalDeliveryOnReload
+// proves the two load-bearing halves of Task 6's control-flow contract at
+// once: the lifecycle-phase preparer is invoked before any lifecycle
+// resolution, and Reconcile's SECOND LoadReconciliationInput call (the
+// "reload", never the in-memory Prepare() receipt — preparation.go's own
+// doc comment) is what Reconcile actually reasons from. The fixture's
+// FIRST load still shows a firing Delivery (stale local truth); only the
+// RELOAD carries a durable preparation cycle whose source_lifecycle
+// evidence shows the one expected member fully resolved. A Situation still
+// reading its stale first load would stay active; reading the reload
+// correctly reaches recovery_pending.
+func TestControllerReconcilePreparedEvidenceOverridesStaleLocalDeliveryOnReload(t *testing.T) {
+	now := ctBaseTime.Add(5 * time.Minute)
+
+	firstLoad := ctBaseSnapshotInput() // one firing delivery — stale once prepared evidence lands.
+	firstLoad.Now = now
+
+	reloaded := firstLoad
+	reloaded.Prepared = situation.PreparedState{
+		CycleID:    "cycle-1",
+		Generation: 2,
+		Lifecycle: []situation.SourceObservation{
+			{AlertID: "delivery-1", EpisodeKey: "delivery-1:1", Source: "alertmanager", State: situation.SourceStateResolved,
+				ObservedAt: now, AcquisitionMode: "webhook", DeadlineAt: now.Add(24 * time.Hour)},
+		},
+	}
+
+	store := &fakeControllerStore{loadInput: firstLoad, loadInputs: []situation.SnapshotInput{firstLoad, reloaded}, beginWorkAttempt: 1}
+	c := ctLifecycleController(store, &fakeAssessmentClient{}, now)
+	preparer := &fakeEvidencePreparer{}
+	c.SetEvidencePreparer(preparer)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(store.commits) != 1 {
+		t.Fatalf("commits = %d, want 1", len(store.commits))
+	}
+	commit := store.commits[0]
+	if commit.Lifecycle != model.LifecycleRecoveryPending {
+		t.Fatalf("lifecycle = %q, want recovery_pending: the reload's prepared evidence (fully resolved), not the stale first load's firing delivery, must be authoritative", commit.Lifecycle)
+	}
+	if commit.PreparationCycleID != "cycle-1" || commit.PreparationGeneration != 2 {
+		t.Fatalf("PreparationCycleID/Generation = %q/%d, want cycle-1/2 (the reloaded cycle)", commit.PreparationCycleID, commit.PreparationGeneration)
+	}
+
+	// The Situation left ACTIVE only in the STALE first load — reading it
+	// correctly means resolveLifecycle never even runs before the reload,
+	// so the gate for the assessment phase must be decided from the
+	// RELOADED (recovery_pending) state: no assessment-phase prepare.
+	phases := preparer.phasesCalled()
+	if len(phases) != 1 || phases[0] != observationmodel.PhaseLifecycle {
+		t.Fatalf("preparer phases = %v, want exactly [lifecycle]: recovery_pending must skip the assessment phase", phases)
+	}
+}
+
+// TestControllerReconcilePreparerRunsAssessmentPhaseWhileStillActive proves
+// the OTHER half of the "if active" gate: when the reloaded prepared
+// evidence still leaves the Situation active (a mixed member set — one
+// resolved, one not yet past its own observation deadline — deliberately
+// NOT reachable in the pre-Plan-4 local-only model, which has no
+// "unobserved" state), the assessment-phase preparer call happens too, in
+// order, under the reloaded input.
+func TestControllerReconcilePreparerRunsAssessmentPhaseWhileStillActive(t *testing.T) {
+	now := ctBaseTime.Add(5 * time.Minute)
+
+	firstLoad := ctBaseSnapshotInput()
+	firstLoad.Now = now
+	a := ctDelivery("a", "incident-1", true, "warning")
+	a.AlertID = "alert-A"
+	b := ctDelivery("b", "incident-1", true, "warning")
+	b.AlertID = "alert-B"
+	firstLoad.Deliveries = []situation.Delivery{a, b}
+	firstLoad.Incidents[0].AlertCount = 2
+
+	reloaded := firstLoad
+	reloaded.Prepared = situation.PreparedState{
+		CycleID:    "cycle-1",
+		Generation: 1,
+		Lifecycle: []situation.SourceObservation{
+			{AlertID: "alert-A", State: situation.SourceStateResolved, ObservedAt: now, AcquisitionMode: "webhook", DeadlineAt: now.Add(24 * time.Hour)},
+			// alert-B carries NO observation at all this cycle and its
+			// deadline has not passed: genuinely unresolved uncertainty, not
+			// evidence of recovery — the Situation must stay active.
+		},
+	}
+
+	store := &fakeControllerStore{loadInput: firstLoad, loadInputs: []situation.SnapshotInput{firstLoad, reloaded}, beginWorkAttempt: 1}
+	client := &fakeAssessmentClient{responses: []func() (llm.OneShotCompletion, error){acceptedResponse(t)}}
+	c := ctLifecycleController(store, client, now)
+	preparer := &fakeEvidencePreparer{}
+	c.SetEvidencePreparer(preparer)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	commit := store.commits[0]
+	if commit.Lifecycle != model.LifecycleActive {
+		t.Fatalf("lifecycle = %q, want active: alert-B is genuinely unresolved (no observation, deadline not passed), not evidence of recovery", commit.Lifecycle)
+	}
+	phases := preparer.phasesCalled()
+	if len(phases) != 2 || phases[0] != observationmodel.PhaseLifecycle || phases[1] != observationmodel.PhaseAssessment {
+		t.Fatalf("preparer phases = %v, want [lifecycle assessment]", phases)
+	}
+}
+
+// TestControllerReconcileSkipsPreparerWhenNoneConfigured documents the
+// local-only compatibility guarantee every pre-Task-6 test already relies
+// on implicitly: a nil preparer (the default) makes Reconcile behave
+// exactly as it always did, and PreparationCycleID/Generation stay at
+// their zero values so CommitController's cycle-sealing step is a no-op.
+func TestControllerReconcileSkipsPreparerWhenNoneConfigured(t *testing.T) {
+	now := ctBaseTime.Add(5 * time.Minute)
+	in := ctBaseSnapshotInput()
+	in.Now = now
+
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
+	c := ctLifecycleController(store, &fakeAssessmentClient{}, now)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := len(store.commits[0].PreparationCycleID); got != 0 {
+		t.Fatalf("PreparationCycleID = %q, want empty with no preparer configured", store.commits[0].PreparationCycleID)
+	}
+	// Exactly one load (no reload): the preparer gate never ran at all.
+	if got := len(store.order); got == 0 || store.order[0] != "load" {
+		t.Fatalf("store.order = %v, want to start with a single load", store.order)
+	}
+}
+
+// TestControllerReconcilePreparerErrorStopsCycleWithoutCommit proves
+// plan.md's "store failures stop the cycle" rule: a hard error from
+// Prepare() (reserved for a durable STORE failure, never an ordinary
+// connector outage — those surface as PreparedState.Limitations instead)
+// must abort Reconcile before any commit, exactly like a
+// LoadReconciliationInput failure already does.
+func TestControllerReconcilePreparerErrorStopsCycleWithoutCommit(t *testing.T) {
+	now := ctBaseTime.Add(5 * time.Minute)
+	in := ctBaseSnapshotInput()
+	in.Now = now
+
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
+	c := ctLifecycleController(store, &fakeAssessmentClient{}, now)
+	preparer := &fakeEvidencePreparer{err: errors.New("store: durable failure")}
+	c.SetEvidencePreparer(preparer)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err == nil {
+		t.Fatal("Reconcile: want an error when the preparer fails, got nil")
+	}
+	if len(store.commits) != 0 {
+		t.Fatalf("commits = %d, want 0: a preparer failure must stop the cycle before any commit", len(store.commits))
 	}
 }
 

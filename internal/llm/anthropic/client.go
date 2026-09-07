@@ -53,6 +53,8 @@ const (
 
 // Config holds tunables for the Anthropic client.
 type Config struct {
+	// Budget is the installation-wide durable guard; nil preserves unlimited behavior.
+	Budget *llm.Budget
 	// APIKey is the Anthropic API key. Required.
 	APIKey string
 	// Model defaults to DefaultModel when empty.
@@ -113,7 +115,7 @@ func NewWithHTTPClient(cfg Config, auditor *audit.Auditor, logger *slog.Logger, 
 	}
 	return &Client{
 		cfg:      cfg,
-		http:     &http.Client{Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second},
+		http:     &http.Client{Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second, Transport: cfg.Budget.Transport(nil)},
 		auditor:  auditor,
 		logger:   logger,
 		now:      func() time.Time { return time.Now().UTC() },

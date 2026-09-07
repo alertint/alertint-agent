@@ -183,6 +183,18 @@ func (c *Client) ListDeploys(ctx context.Context, project, version string) ([]De
 // returns a typed *APIError carrying the status. The caller owns Body.Close on
 // success.
 func (c *Client) doGET(ctx context.Context, path string, query url.Values) (*http.Response, error) {
+	return c.doGETInstrumented(ctx, path, query, nil, nil)
+}
+
+// doGETInstrumented is doGET with a per-physical-attempt hook, for the
+// proactive preparation path (spec.md: "Existing ... Sentry retry behavior
+// must participate in reservation accounting, not hide requests inside one
+// apparent call"): before is called immediately before EACH physical
+// attempt, including 429/5xx retries — a non-nil error aborts before that
+// attempt is made; after reports each attempt's outcome immediately once
+// it completes. Both may be nil (doGET's own uninstrumented behavior).
+func (c *Client) doGETInstrumented(ctx context.Context, path string, query url.Values,
+	before func() error, after func(started bool, err error)) (*http.Response, error) {
 	target := c.baseURL + path
 	if enc := query.Encode(); enc != "" {
 		target += "?" + enc
@@ -192,17 +204,32 @@ func (c *Client) doGET(ctx context.Context, path string, query url.Values) (*htt
 	// retries exhausted, or cancelled mid-backoff), so there is no reachable
 	// post-loop exit to handle.
 	for attempt := 0; ; attempt++ {
+		if before != nil {
+			if err := before(); err != nil {
+				return nil, err
+			}
+		}
+
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 		if err != nil {
+			if after != nil {
+				after(false, err)
+			}
 			return nil, err
 		}
 		req.Header.Set("Authorization", c.authHeader)
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
+			if after != nil {
+				after(true, err)
+			}
 			return nil, fmt.Errorf("sentry request: %w", err)
 		}
 		if resp.StatusCode == http.StatusOK {
+			if after != nil {
+				after(true, nil)
+			}
 			return resp, nil
 		}
 
@@ -212,7 +239,13 @@ func (c *Client) doGET(ctx context.Context, path string, query url.Values) (*htt
 		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
 		if !retryable || attempt >= c.maxRetries {
 			_ = resp.Body.Close()
+			if after != nil {
+				after(true, apiErr)
+			}
 			return nil, apiErr
+		}
+		if after != nil {
+			after(true, apiErr)
 		}
 
 		delay := c.backoffDelay(resp, attempt)

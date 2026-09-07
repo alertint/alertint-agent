@@ -208,9 +208,10 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	llmClient := buildLLMClient(cfg, apiKey, auditor, logger)
+	llmBudget := llm.NewBudget(st, cfg.LLM.Budget)
+	llmClient := buildLLMClient(cfg, apiKey, auditor, logger, llmBudget)
 
-	classifierClient := buildClassifierClient(cfg, apiKey, auditor, logger)
+	classifierClient := buildClassifierClient(cfg, apiKey, auditor, logger, llmBudget)
 
 	notifier, llmSystemPublisher := buildNotifier(cfg, st, auditor, logger, strings.EqualFold(level, "debug"))
 
@@ -457,6 +458,19 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		return err
 	}
 
+	// The bounded evidence-preparation runtime (Plan 4 Task 9): the
+	// concrete EvidencePreparer adapter — injected into the SAME controller
+	// crt drives, so every Reconcile cycle prepares real evidence through it
+	// — the semantic-profile inference workers, and the bounded profile-
+	// change/backfill/detail-cleanup sweeps. Extracted into
+	// buildPreparationRuntime (mirroring buildControllerRuntime's own
+	// extraction, and — see that function's own doc comment — panicking
+	// instead of returning a third "impossible in production" error) to
+	// keep runServe's own golangci-lint gocyclo complexity under the repo's
+	// threshold (Task 9 fix round, Finding #3's own established
+	// convention).
+	prt := buildPreparationRuntime(st, cfg, owner, llmClient, llmHealth, prom, logSrc, sentryClient, zbxClient, crt, auditor, logger)
+
 	// The Situation notification runtime (Plan 3 Task 9): the single
 	// reachable Situation Slack writer (present only when Situation Slack is
 	// actually configured — buildSituationNotificationRuntime) plus the
@@ -488,6 +502,12 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		backfillAndRecoverControllerWork: func(ctx context.Context) error {
 			return runControllerRecovery(ctx, crt, logger)
 		},
+		// Plan 4 Task 9: release stranded semantic-inference job leases and
+		// backfill any missed delivery-to-signature attachment — startup-only,
+		// zero-outward-effect, positioned right after controller recovery
+		// (the preparer it recovers state for is injected into that SAME
+		// controller) and before notification recovery.
+		recoverPreparationWork: prt.Recover,
 		// Plan 3 Task 9: recover abandoned notification/stream claims,
 		// schedule Situations whose durable history is missing or whose root
 		// projection is stale, validate the Slack configuration and record
@@ -521,6 +541,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		},
 		startWorkers:             rt.Start,
 		startControllerWorkers:   crt.Start,
+		startPreparationWorkers:  prt.Start,
 		startNotificationWorkers: nrt.Start,
 		startReceivers: func() error {
 			var err error
@@ -566,12 +587,14 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	// drain is a loop. stopCorrelator is the same sync.Once-guarded call the
 	// defer above falls back to on every other exit path.
 	stopSeq := foundationStopSequence{
-		stopReceivers:         receiverShutdown(shutdownCtx, recvSrv),
-		stopCorrelator:        stopCorrelator,
-		drainFoundationWork:   rt.Drain,
-		drainControllerWork:   crt.Drain,
-		stopControllerWorkers: crt.Stop,
-		stopWorkers:           rt.Stop,
+		stopReceivers:          receiverShutdown(shutdownCtx, recvSrv),
+		stopCorrelator:         stopCorrelator,
+		drainFoundationWork:    rt.Drain,
+		drainControllerWork:    crt.Drain,
+		drainPreparationWork:   prt.Drain,
+		stopControllerWorkers:  crt.Stop,
+		stopPreparationWorkers: prt.Stop,
+		stopWorkers:            rt.Stop,
 		// R6, last and outside the drain rounds: one bounded final delivery
 		// and stdout pass under the shutdown context, then claim release. An
 		// unreachable Slack delays the pass, it never holds the process.
@@ -1193,11 +1216,11 @@ func llmProviderIsOpenAI(cfg *config.Config) bool {
 
 // buildLLMClient constructs the triage LLM client for the configured
 // provider. Exactly one provider serves an install (ADR-0026).
-func buildLLMClient(cfg *config.Config, apiKey string, auditor *audit.Auditor, logger *slog.Logger) acutetriage.LLMClient {
+func buildLLMClient(cfg *config.Config, apiKey string, auditor *audit.Auditor, logger *slog.Logger, budget ...*llm.Budget) acutetriage.LLMClient {
 	if llmProviderIsOpenAI(cfg) {
-		return llmopenai.New(llmopenaiCfg(cfg, apiKey, cfg.LLM.TimeoutSeconds, cfg.LLM.Model, cfg.LLM.MaxTokens), auditor, logger)
+		return llmopenai.New(llmopenaiCfg(cfg, apiKey, cfg.LLM.TimeoutSeconds, cfg.LLM.Model, cfg.LLM.MaxTokens, budget...), auditor, logger)
 	}
-	return llmanthropic.New(llmanthropicCfg(cfg), auditor, logger)
+	return llmanthropic.New(llmanthropicCfg(cfg, budget...), auditor, logger)
 }
 
 // buildLLMProber type-asserts the primary LLM client into an llm.Prober for
@@ -1216,8 +1239,9 @@ func buildLLMProber(cfg *config.Config, client acutetriage.LLMClient, logger *sl
 
 // llmopenaiCfg builds an openaicompat.Config; model/maxTokens/timeout are
 // parameters because the classifier client reuses this with its own values.
-func llmopenaiCfg(cfg *config.Config, apiKey string, timeoutSeconds int, model string, maxTokens int) llmopenai.Config {
+func llmopenaiCfg(cfg *config.Config, apiKey string, timeoutSeconds int, model string, maxTokens int, budget ...*llm.Budget) llmopenai.Config {
 	return llmopenai.Config{
+		Budget:          configuredLLMBudget(cfg, budget),
 		BaseURL:         cfg.LLM.BaseURL,
 		APIKey:          apiKey,
 		Model:           model,
@@ -1241,7 +1265,7 @@ const classifierThinkingMaxTokens = 8192
 // serve, and requesting the Haiku constant there would 404 every call,
 // silently poisoning the ADR-0018 graduation evidence with fail-open
 // "unsure" verdicts. Returns a true nil interface when the mode is off.
-func buildClassifierClient(cfg *config.Config, apiKey string, auditor *audit.Auditor, logger *slog.Logger) acutetriage.LLMClient {
+func buildClassifierClient(cfg *config.Config, apiKey string, auditor *audit.Auditor, logger *slog.Logger, budget ...*llm.Budget) acutetriage.LLMClient {
 	if !cfg.Memory.Classifier.Enabled() {
 		return nil
 	}
@@ -1258,13 +1282,14 @@ func buildClassifierClient(cfg *config.Config, apiKey string, auditor *audit.Aud
 		if cfg.LLM.Thinking {
 			maxTokens = classifierThinkingMaxTokens
 		}
-		return llmopenai.New(llmopenaiCfg(cfg, apiKey, cfg.Memory.Classifier.TimeoutSeconds, cfg.LLM.Model, maxTokens), auditor, logger)
+		return llmopenai.New(llmopenaiCfg(cfg, apiKey, cfg.Memory.Classifier.TimeoutSeconds, cfg.LLM.Model, maxTokens, budget...), auditor, logger)
 	}
 	logger.Info("memory shadow classifier enabled",
 		slog.String("mode", string(cfg.Memory.Classifier.Mode)),
 		slog.String("model", acutetriage.ClassifierModel),
 	)
 	return llmanthropic.New(llmanthropic.Config{
+		Budget:         configuredLLMBudget(cfg, budget),
 		APIKey:         apiKey,
 		Model:          acutetriage.ClassifierModel,
 		TimeoutSeconds: cfg.Memory.Classifier.TimeoutSeconds,
@@ -1272,9 +1297,10 @@ func buildClassifierClient(cfg *config.Config, apiKey string, auditor *audit.Aud
 }
 
 // llmanthropicCfg builds an llm/anthropic.Config from the loaded config.
-func llmanthropicCfg(cfg *config.Config) llmanthropic.Config {
+func llmanthropicCfg(cfg *config.Config, budget ...*llm.Budget) llmanthropic.Config {
 	key, _ := cfg.LLMAPIKey()
 	return llmanthropic.Config{
+		Budget:         configuredLLMBudget(cfg, budget),
 		APIKey:         key,
 		Model:          cfg.LLM.Model,
 		MaxTokens:      cfg.LLM.MaxTokens,

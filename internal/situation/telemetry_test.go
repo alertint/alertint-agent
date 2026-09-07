@@ -4,6 +4,7 @@ package situation_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/llm"
+	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
 	"github.com/alertint/alertint-agent/internal/situation"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
@@ -415,6 +417,105 @@ func TestTelemetryAuditKindsMatchTheAuditCatalog(t *testing.T) {
 	for kind := range knownUnemitted {
 		if claimed[kind] {
 			t.Errorf("%q is listed as unemitted but an emitter now claims it; drop it from knownUnemitted", kind)
+		}
+	}
+}
+
+// TestSpanEvidencePreparationCoversBothPhasesAsChildrenOfReconcile proves
+// Plan 4 Task 9's "situation.preparation" span: one span per
+// EvidencePreparer.Prepare call (lifecycle, then assessment, when the
+// reloaded evidence leaves the Situation active), each a child of the
+// reconcile span, carrying the Situation's identity, the closed phase it
+// ran, and a committed/error result class.
+func TestSpanEvidencePreparationCoversBothPhasesAsChildrenOfReconcile(t *testing.T) {
+	exporter := installSpanRecorder(t)
+	now := ctBaseTime.Add(5 * time.Minute)
+
+	firstLoad := ctBaseSnapshotInput()
+	firstLoad.Now = now
+	a := ctDelivery("a", "incident-1", true, "warning")
+	a.AlertID = "alert-A"
+	b := ctDelivery("b", "incident-1", true, "warning")
+	b.AlertID = "alert-B"
+	firstLoad.Deliveries = []situation.Delivery{a, b}
+	firstLoad.Incidents[0].AlertCount = 2
+
+	reloaded := firstLoad
+	reloaded.Prepared = situation.PreparedState{
+		CycleID:    "cycle-1",
+		Generation: 1,
+		Lifecycle: []situation.SourceObservation{
+			{AlertID: "alert-A", State: situation.SourceStateResolved, ObservedAt: now, AcquisitionMode: "webhook", DeadlineAt: now.Add(24 * time.Hour)},
+		},
+	}
+
+	store := &fakeControllerStore{loadInput: firstLoad, loadInputs: []situation.SnapshotInput{firstLoad, reloaded}, beginWorkAttempt: 1}
+	client := &fakeAssessmentClient{responses: []func() (llm.OneShotCompletion, error){acceptedResponse(t)}}
+	c := ctLifecycleController(store, client, now)
+	c.SetEvidencePreparer(&fakeEvidencePreparer{})
+	claim := ctBaseClaim()
+
+	if err := c.Reconcile(context.Background(), claim); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	spans := exporter.GetSpans()
+	preps := spansNamed(spans, situation.SpanEvidencePreparation)
+	if len(preps) != 2 {
+		t.Fatalf("preparation spans = %d, want 2 (lifecycle then assessment)", len(preps))
+	}
+	wantPhases := []string{string(observationmodel.PhaseLifecycle), string(observationmodel.PhaseAssessment)}
+	for i, p := range preps {
+		if got := attrValue(t, p, situation.AttrSituationID).AsString(); got != claim.Situation.ID {
+			t.Fatalf("preparation span %d situation id = %q, want %q", i, got, claim.Situation.ID)
+		}
+		if got := attrValue(t, p, situation.AttrPreparationPhase).AsString(); got != wantPhases[i] {
+			t.Fatalf("preparation span %d phase = %q, want %q", i, got, wantPhases[i])
+		}
+		if got := attrValue(t, p, situation.AttrResultClass).AsString(); got != situation.PreparationResultCommitted {
+			t.Fatalf("preparation span %d result class = %q, want committed", i, got)
+		}
+	}
+	reconciles := spansNamed(spans, situation.SpanControllerReconcile)
+	if len(reconciles) != 1 {
+		t.Fatalf("reconcile spans = %d, want 1", len(reconciles))
+	}
+	for i, p := range preps {
+		if p.Parent.SpanID() != reconciles[0].SpanContext.SpanID() {
+			t.Fatalf("preparation span %d is not a child of the reconcile span", i)
+		}
+	}
+}
+
+// TestSpanEvidencePreparationClassifiesAPreparerFailureAsError proves a
+// failing Prepare call is reported on the span as an error result — never
+// left uncategorized, and never carrying the raw error text (this
+// package's own no-payload convention every other span already follows).
+func TestSpanEvidencePreparationClassifiesAPreparerFailureAsError(t *testing.T) {
+	exporter := installSpanRecorder(t)
+	now := ctBaseTime.Add(5 * time.Minute)
+
+	in := ctBaseSnapshotInput()
+	in.Now = now
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
+	c := ctLifecycleController(store, &fakeAssessmentClient{}, now)
+	c.SetEvidencePreparer(&fakeEvidencePreparer{err: errors.New("store: durable failure")})
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err == nil {
+		t.Fatal("expected Reconcile to return the preparer's error")
+	}
+
+	spans := exporter.GetSpans()
+	preps := spansNamed(spans, situation.SpanEvidencePreparation)
+	if len(preps) != 1 {
+		t.Fatalf("preparation spans = %d, want 1", len(preps))
+	}
+	if got := attrValue(t, preps[0], situation.AttrResultClass).AsString(); got != situation.PreparationResultError {
+		t.Fatalf("preparation span result class = %q, want error", got)
+	}
+	for _, kv := range preps[0].Attributes {
+		if strings.Contains(kv.Value.String(), "durable failure") {
+			t.Fatalf("preparation span attribute %q leaks the raw error text: %v", kv.Key, kv.Value)
 		}
 	}
 }

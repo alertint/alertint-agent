@@ -122,3 +122,54 @@ func TestIsInvalidQueryRejectsNonQueryFailures(t *testing.T) {
 		}
 	}
 }
+
+// TestQueryRangeBounded_LimitParamAndScope proves the proactive preparation
+// path's bounded range query sends the exact frozen selector/window and the
+// caller's overflow-sentinel limit (spec.md "add a bounded sibling API";
+// plan.md Task 4: query limit+1 then keep the requested count and
+// truncation bit).
+func TestQueryRangeBounded_LimitParamAndScope(t *testing.T) {
+	var gotLimit, gotQuery string
+	var limitPresent bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotLimit = r.URL.Query().Get("limit")
+		_, limitPresent = r.URL.Query()["limit"]
+		gotQuery = r.URL.Query().Get("query")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[]}}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(Config{BaseURL: srv.URL, TimeoutSeconds: 5})
+	end := time.Now()
+	start := end.Add(-time.Hour)
+	expr := `up{cluster="lab",service="checkout"}`
+	if _, err := c.QueryRangeBounded(context.Background(), expr, start, end, 0, 21); err != nil {
+		t.Fatalf("QueryRangeBounded: %v", err)
+	}
+	if !limitPresent || gotLimit != "21" {
+		t.Fatalf("limit param = %q (present=%v), want one overflow sentinel 21", gotLimit, limitPresent)
+	}
+	if gotQuery != expr {
+		t.Fatalf("scope changed: got %q, want %q", gotQuery, expr)
+	}
+}
+
+func TestQueryRangeBounded_ZeroLimitOmitsParam(t *testing.T) {
+	var present bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, present = r.URL.Query()["limit"]
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[]}}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(Config{BaseURL: srv.URL, TimeoutSeconds: 5})
+	end := time.Now()
+	if _, err := c.QueryRangeBounded(context.Background(), `up`, end.Add(-time.Hour), end, 0, 0); err != nil {
+		t.Fatalf("QueryRangeBounded: %v", err)
+	}
+	if present {
+		t.Fatal("limit param must be absent for limit=0")
+	}
+}

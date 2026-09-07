@@ -11,6 +11,7 @@ import (
 	"sort"
 	"time"
 
+	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
@@ -26,7 +27,12 @@ import (
 // hash's included-field set, or the Assessment validator's rules change in
 // a way that must invalidate old reuse/hash comparisons.
 const (
-	factSchemaVersion = 1
+	// factSchemaVersion is bumped to 2 (Plan 4 Task 6): a Situation's
+	// material fact composition now includes bounded prepared observation
+	// evidence alongside the existing local Plan 2/3 facts (see
+	// MaterialFactHash's own doc comment) — a hash produced before Plan 4
+	// must never be silently treated as compatible with one produced after.
+	factSchemaVersion = 2
 
 	// materialFactHashSchemaVersion and assessmentBasisHashSchemaVersion are
 	// bumped to 2 (round 2, Task 4): materialFactHashDTO's included-field set
@@ -36,23 +42,36 @@ const (
 	// shape did not change, but it embeds MaterialFactHash's output string
 	// directly, so a hash produced before this fix must never be silently
 	// treated as compatible with one produced after it.
-	materialFactHashSchemaVersion = 2
+	//
+	// Bumped again to 3 (Plan 4 Task 6): materialFactHashDTO gained
+	// ObservationDigest, folding in prepared observation evidence's own
+	// MaterialDigest (normalized meaning/coverage only — never collection
+	// time, run ID, generation, or reservation count).
+	// Bumped to 4 for static capability limitations, then 5 for the coherent
+	// retained evidence view and explicit run outcome/coverage materiality.
+	materialFactHashSchemaVersion = 5
 
 	// assessmentBasisHashSchemaVersion is bumped to 3 (Task 5): the carried-
 	// forward InputVersion-instability bug documented on
 	// assessmentBasisReasonDTO is fixed by dropping that DTO's ID field. A
 	// hash produced under the old ID-bearing shape must never be silently
 	// treated as compatible with one produced under the fixed shape.
-	assessmentBasisHashSchemaVersion = 3
+	//
+	// Bumped again to 4 (Plan 4 Task 6): embeds the new
+	// materialFactHashSchemaVersion-3 MaterialFactHash output plus the
+	// bumped assessmentValidatorVersion.
+	// Bumped to 6 to embed the coherent evidence hash schema version 5.
+	assessmentBasisHashSchemaVersion = 6
 
-	// assessmentValidatorVersion tracks Task 5's ValidateAssessmentProposal
-	// rule set. Task 4 has no validator of its own; this placeholder lets
-	// AssessmentBasisHash include "Assessment... validator versions" per
-	// spec now, so a hash produced before Task 5 lands is never silently
-	// treated as compatible with one produced after a validator rule
-	// change. Task 5 must bump this the first time it changes what
-	// "passes validation" means for a previously-accepted reuse candidate.
-	assessmentValidatorVersion = 1
+	// assessmentValidatorVersion tracks ValidateAssessmentProposal's rule
+	// set. Bumped to 2 (Plan 4 Task 6): reservedUnsupportedCapabilities
+	// replaces the old plan2UnsupportedCapabilities as the known/allowed
+	// limitation codes knownLimitationCode accepts — a previously-accepted reuse
+	// candidate citing one of the now-removed capability-unavailable codes
+	// (prometheus_unavailable, logs_unavailable, sentry_unavailable,
+	// zabbix_history_unavailable, changes_unavailable) must never be
+	// silently treated as still passing validation.
+	assessmentValidatorVersion = 2
 )
 
 const (
@@ -76,24 +95,26 @@ const sourceLifecycleSummarySubject = "situation"
 
 const capabilityLimitationSubject = "plan2"
 
-// plan2UnsupportedCapabilities is Plan 2's fixed, versioned set of
-// capabilities with no production fact producer yet (spec: "Prometheus,
-// logs, Sentry, Zabbix history reads, changes, semantic profiles, Signal
-// bindings, envelopes, and operator judgments do not have production fact
-// producers in Plan 2."). It is controller/configuration state, not
-// input-derived, so it is the same for every Situation in this build — a
-// package var (not const) only so tests can prove MaterialFactHash
-// actually threads it through; production code never mutates it.
-var plan2UnsupportedCapabilities = []model.Limitation{
-	{Code: "prometheus_unavailable", Detail: "Prometheus is not a Plan 2 fact producer."},
-	{Code: "logs_unavailable", Detail: "Log evidence is not a Plan 2 fact producer."},
-	{Code: "sentry_unavailable", Detail: "Sentry evidence is not a Plan 2 fact producer."},
-	{Code: "zabbix_history_unavailable", Detail: "Zabbix history reads are not a Plan 2 fact producer."},
-	{Code: "changes_unavailable", Detail: "Change evidence is not a Plan 2 fact producer."},
-	{Code: "semantic_profile_unavailable", Detail: "Semantic profiles are not a Plan 2 fact producer."},
-	{Code: "signal_binding_unavailable", Detail: "Signal bindings are not a Plan 2 fact producer."},
-	{Code: "envelope_unavailable", Detail: "Expected-behaviour envelopes are not a Plan 2 fact producer."},
-	{Code: "operator_judgment_unavailable", Detail: "Operator judgments are not a Plan 2 fact producer."},
+// reservedUnsupportedCapabilities replaces Plan 2/3's
+// plan2UnsupportedCapabilities blanket statement (spec.md "Normalized
+// evidence and lifecycle": "Replace plan2UnsupportedCapabilities as a
+// blanket statement with per-capability states from durable preparation;
+// retain explicit unsupported entries for Plan 5 policy"). Prometheus,
+// logs, Sentry, Zabbix history, changes, and store_read are now real Plan 4
+// fact producers with dynamic per-cycle capability_result facts (Task 6
+// integration) — they are never blanket-"unavailable" limitations a model
+// may cite anymore. Only what remains genuinely unreachable until Plan 5
+// stays in this closed set: semantic-profile binding/correction authority,
+// Signal bindings, expected-behaviour envelopes, and operator judgments. It
+// is controller/configuration state, not input-derived, so it is the same
+// for every Situation in this build — a package var (not const) only so
+// tests can prove MaterialFactHash actually threads it through; production
+// code never mutates it.
+var reservedUnsupportedCapabilities = []model.Limitation{
+	{Code: "semantic_profile_unavailable", Detail: "Semantic profile binding/correction authority is not available until Plan 5."},
+	{Code: "signal_binding_unavailable", Detail: "Signal bindings are not available until Plan 5."},
+	{Code: "envelope_unavailable", Detail: "Expected-behaviour envelopes are not available until Plan 5."},
+	{Code: "operator_judgment_unavailable", Detail: "Operator judgments are not available until Plan 5."},
 }
 
 // DeriveStoreFacts reduces in into the closed set of Plan 2 fact kinds:
@@ -521,13 +542,21 @@ type capabilityLimitationFactValue struct {
 }
 
 func deriveCapabilityLimitationFact(situationID string, inputVersion int, now time.Time) model.Fact {
-	value := capabilityLimitationFactValue{Limitations: append([]model.Limitation(nil), plan2UnsupportedCapabilities...)}
+	value := capabilityLimitationFactValue{Limitations: append([]model.Limitation(nil), reservedUnsupportedCapabilities...)}
+	digest := canonicalDigest(value)
 	return model.Fact{
-		ID:           factIdentity(factKindCapabilityLimitation, situationID, inputVersion, capabilityLimitationSubject),
+		// factIdentityWithContent, not plain factIdentity (Task 10 live lab
+		// finding): reservedUnsupportedCapabilities is build-scoped, not
+		// input-derived, so its content can legitimately differ at the SAME
+		// (situationID, inputVersion) across a binary upgrade that changes
+		// the reserved list — an old, still-nonterminal Situation reconciled
+		// post-upgrade must get a new fact ID, or it collides with
+		// AppendSituationFacts' own immutable-conflict check on every cycle.
+		ID:           factIdentityWithContent(factKindCapabilityLimitation, situationID, inputVersion, capabilityLimitationSubject, digest),
 		SituationID:  situationID,
 		Kind:         factKindCapabilityLimitation,
 		Subject:      capabilityLimitationSubject,
-		Digest:       canonicalDigest(value),
+		Digest:       digest,
 		InputVersion: inputVersion,
 		Value:        mustMarshal(value),
 		// Never confirmed_empty: these capabilities are not absent from a
@@ -607,7 +636,14 @@ type materialFactHashDTO struct {
 	Symptoms                   []materialSymptomDTO         `json:"symptoms"`
 	Incidents                  []materialIncidentDTO        `json:"incidents"`
 	PriorDurationHistogram     materialDurationHistogramDTO `json:"prior_duration_histogram"`
-	LimitationCodes            []string                     `json:"limitation_codes"`
+	// ObservationDigest folds in this cycle's prepared evidence (Plan 4 Task
+	// 6): observationmodel.MaterialDigest's own hash over every Material
+	// fact across the selected preparation cycle's runs — normalized
+	// meaning and coverage class only, never collection time, run ID,
+	// generation, or reservation count (MaterialDigest's own exclusions).
+	// Empty when no preparer is configured or no cycle has begun yet, so
+	// every pre-Plan-4 fixture/test keeps its exact prior hash.
+	ObservationDigest string `json:"observation_digest,omitempty"`
 }
 
 // MaterialFactHash hashes only the evidence spec.md's "Material fact hash
@@ -670,12 +706,6 @@ func MaterialFactHash(in SnapshotInput, symptoms []Symptom, durationClass string
 	}
 	sort.Slice(incidentDTOs, func(i, j int) bool { return incidentDTOs[i].IncidentID < incidentDTOs[j].IncidentID })
 
-	limitationCodes := make([]string, 0, len(plan2UnsupportedCapabilities))
-	for _, l := range plan2UnsupportedCapabilities {
-		limitationCodes = append(limitationCodes, l.Code)
-	}
-	sort.Strings(limitationCodes)
-
 	dto := materialFactHashDTO{
 		SchemaVersion:              materialFactHashSchemaVersion,
 		FactSchemaVersion:          factSchemaVersion,
@@ -685,9 +715,30 @@ func MaterialFactHash(in SnapshotInput, symptoms []Symptom, durationClass string
 		Symptoms:                   symptomDTOs,
 		Incidents:                  incidentDTOs,
 		PriorDurationHistogram:     priorDurationHistogram(priorDurationsSeconds(in.PriorSituations)),
-		LimitationCodes:            limitationCodes,
+		ObservationDigest:          observationMaterialDigest(in.Prepared),
 	}
 	return canonicalDigest(dto)
+}
+
+// observationMaterialDigest folds the coherent bounded evidence view's facts
+// and check outcomes into one MaterialDigest, or "" when no preparer is configured or no
+// cycle has begun yet (prepared.CycleID == "") — every pre-Plan-4 fixture
+// and test therefore computes the exact same hash as before this field
+// existed, up to the schema-version bump alone.
+func observationMaterialDigest(prepared PreparedState) string {
+	if prepared.CycleID == "" {
+		return ""
+	}
+	facts := preparedObservationFacts(prepared)
+	digest, err := observationmodel.MaterialDigest(facts)
+	if err != nil {
+		// facts here are always already-validated, already-persisted
+		// observationmodel.Fact values (ValidateRun ran before commit) —
+		// this can only fail on a programming-time invariant violation,
+		// matching this file's own mustMarshal panic convention.
+		panic(fmt.Sprintf("situation: material digest for prepared observation facts: %v", err))
+	}
+	return digest
 }
 
 // assessmentBasisReasonDTO deliberately omits ReasonCandidate.ID — Task 5's

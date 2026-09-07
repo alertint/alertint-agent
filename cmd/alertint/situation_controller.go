@@ -13,6 +13,7 @@ import (
 	"github.com/alertint/alertint-agent/internal/config"
 	"github.com/alertint/alertint-agent/internal/llm"
 	"github.com/alertint/alertint-agent/internal/llmhealth"
+	"github.com/alertint/alertint-agent/internal/semanticprofile"
 	"github.com/alertint/alertint-agent/internal/situation"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
@@ -360,6 +361,21 @@ func (r *controllerRuntime) SetAssessmentHealthObserver(o situation.AssessmentHe
 	r.worker.SetAssessmentHealthObserver(o)
 }
 
+// SetEvidencePreparer wires Plan 4's production EvidencePreparer onto the
+// controller worker (situation.ControllerWorker.SetEvidencePreparer) — the
+// same thin pass-through shape as SetDependencyRecoveryWaker.
+func (r *controllerRuntime) SetEvidencePreparer(p situation.EvidencePreparer) {
+	r.worker.SetEvidencePreparer(p)
+}
+
+// SetInferenceLimiter wires the SHARED llm.InferenceLimiter L2 dispatch
+// gates through from here on (situation.ControllerWorker.
+// SetInferenceLimiter) — the same pool Plan 4's semantic-profile workers
+// acquire from with llm.InferenceProfile priority.
+func (r *controllerRuntime) SetInferenceLimiter(l *llm.InferenceLimiter) {
+	r.worker.SetInferenceLimiter(l)
+}
+
 // Start launches the controller worker, then the Triage worker, each on its
 // own background schedule. Call only after RecoverAndBackfill has succeeded
 // (and, transitively, after foundationRuntime.Reconstruct — the controller
@@ -568,6 +584,27 @@ func assessmentHealthError(outcome situation.L2Outcome, transportErr error) erro
 	default:
 		return fmt.Errorf("%w: unrecognized assessment outcome %q", llm.ErrSchemaViolation, outcome)
 	}
+}
+
+// llmHealthProfileObserver implements semanticprofile.HealthObserver over
+// the installation LLM-health tracker for the semantic-profile worker's own
+// L0 dispatches — the sibling wiring to llmHealthAssessmentObserver, using
+// llmhealth.CapabilitySemanticProfile with the advisory signature as the
+// observation subject.
+type llmHealthProfileObserver struct {
+	tracker *llmhealth.Tracker
+}
+
+func (o llmHealthProfileObserver) BeginInferenceCall(signature string) semanticprofile.InferenceCallObservation {
+	return llmHealthProfileObservation{obs: o.tracker.Begin(llmhealth.CapabilitySemanticProfile, signature)}
+}
+
+type llmHealthProfileObservation struct {
+	obs *llmhealth.Observation
+}
+
+func (o llmHealthProfileObservation) Finish(err error) {
+	o.obs.Finish(err)
 }
 
 // buildAssessmentClient resolves the controller's own one-shot,

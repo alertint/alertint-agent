@@ -62,6 +62,82 @@ func TestChanges_InsertQueryPrune(t *testing.T) {
 	}
 }
 
+func TestChangesInScopeWindow_ScopedAndBounded(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	base := time.Date(2026, 6, 18, 10, 0, 0, 0, time.UTC)
+	mk := func(id, service, env string, mins int) Change {
+		return Change{
+			ID: id, Source: "github-actions", Kind: "deploy", Title: "deploy",
+			Labels:     map[string]string{"service": service, "environment": env},
+			OccurredAt: base.Add(time.Duration(mins) * time.Minute),
+			ReceivedAt: base.Add(time.Duration(mins) * time.Minute),
+		}
+	}
+	changes := []Change{
+		mk("checkout-1", "checkout", "prod", 0),
+		mk("checkout-2", "checkout", "prod", 10),
+		mk("checkout-3", "checkout", "prod", 20),
+		mk("other-service", "worker", "prod", 5),  // wrong service: never returned
+		mk("wrong-env", "checkout", "staging", 5), // wrong environment: never returned
+	}
+	for _, c := range changes {
+		if err := st.InsertChange(ctx, c); err != nil {
+			t.Fatalf("insert %s: %v", c.ID, err)
+		}
+	}
+
+	got, truncated, err := st.ChangesInScopeWindow(ctx,
+		map[string]string{"service": "checkout", "environment": "prod"},
+		base.Add(-time.Hour), base.Add(time.Hour), 10)
+	if err != nil {
+		t.Fatalf("scope window: %v", err)
+	}
+	if truncated {
+		t.Fatal("expected no truncation under the cap")
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d changes, want 3 (exact service+environment match only)", len(got))
+	}
+	for _, c := range got {
+		if c.Labels["service"] != "checkout" || c.Labels["environment"] != "prod" {
+			t.Fatalf("scope leaked a non-matching change: %#v", c)
+		}
+	}
+
+	// Bounded: limit=2 truncates the 3 matching changes.
+	limited, truncated, err := st.ChangesInScopeWindow(ctx,
+		map[string]string{"service": "checkout", "environment": "prod"},
+		base.Add(-time.Hour), base.Add(time.Hour), 2)
+	if err != nil {
+		t.Fatalf("scope window limited: %v", err)
+	}
+	if !truncated {
+		t.Fatal("expected truncation when limit < matching row count")
+	}
+	if len(limited) != 2 {
+		t.Fatalf("got %d changes, want 2 (bounded)", len(limited))
+	}
+}
+
+func TestChangesInScopeWindow_RejectsEmptySelector(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	if _, _, err := st.ChangesInScopeWindow(ctx, nil, time.Now().Add(-time.Hour), time.Now(), 10); err == nil {
+		t.Fatal("expected error for empty selector")
+	}
+}
+
 func TestInsertChange_Validation(t *testing.T) {
 	ctx := context.Background()
 	st, _ := Open(ctx, ":memory:")

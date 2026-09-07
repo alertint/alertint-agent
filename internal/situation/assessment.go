@@ -383,6 +383,15 @@ func DeriveEvidenceQuality(snap Snapshot) model.EvidenceQuality {
 			confirmed++
 		}
 	}
+	for _, f := range snap.Observations {
+		if !f.Material {
+			continue
+		}
+		total++
+		if f.Freshness == "fresh" && (f.ResultStatus == "confirmed_value" || f.ResultStatus == "confirmed_empty") {
+			confirmed++
+		}
+	}
 	switch {
 	case total == 0 || confirmed == 0:
 		return model.EvidenceQualityInsufficient
@@ -820,19 +829,24 @@ var allowedProposalTopLevelKeys = map[string]bool{
 	"limitations":       true,
 }
 
-// knownLimitationCode reports whether code is one of Plan 2's known/allowed
-// Limitation codes: the fixed plan2UnsupportedCapabilities set (facts.go —
-// the closed set of capability gaps this build's fact producers can name)
-// plus this file's own controller-authored fallback code
-// (limitationSemanticAssessmentUnavailable). spec.md: unsupported-capability
-// absence "is never represented as confirmed empty, healthy, or fetched" —
-// a model citing a fabricated code (e.g. "prometheus_confirmed_healthy")
-// must be rejected, not stored as if it were a recognized caveat.
+// knownLimitationCode reports whether code is one of this build's
+// known/allowed Limitation codes: the fixed reservedUnsupportedCapabilities
+// set (facts.go — the closed set of capability gaps still reserved for
+// Plan 5) plus this file's own controller-authored fallback code
+// (limitationSemanticAssessmentUnavailable). A now-supported Plan 4
+// capability (prometheus, logs, Sentry, Zabbix history, changes,
+// store_read) is never a limitation the model may cite — its evidence
+// already reached the model as an ordinary current-cycle fact, so
+// knownLimitationCode() no longer accepts codes like
+// "prometheus_unavailable". spec.md: unsupported-capability absence "is
+// never represented as confirmed empty, healthy, or fetched" — a model
+// citing a fabricated code must be rejected, not stored as if it were a
+// recognized caveat.
 func knownLimitationCode(code string) bool {
 	if code == limitationSemanticAssessmentUnavailable {
 		return true
 	}
-	for _, l := range plan2UnsupportedCapabilities {
+	for _, l := range reservedUnsupportedCapabilities {
 		if l.Code == code {
 			return true
 		}
@@ -908,7 +922,7 @@ func validateProposalContent(proposal model.AssessmentProposal, snap Snapshot) V
 			return capabilityResult("reason_id_unknown", "sufficient_reason.candidate_id", "candidate ID not present in this Snapshot's eligible_reasons")
 		}
 		for _, ref := range proposal.SufficientReason.EvidenceRefs {
-			if !factExists(snap.Facts, ref) {
+			if !factExists(snap.Facts, ref) && !observationExists(snap, ref) {
 				return policyResult("evidence_ref_missing", "sufficient_reason.evidence_refs", "evidence reference not present in the claimed snapshot")
 			}
 		}
