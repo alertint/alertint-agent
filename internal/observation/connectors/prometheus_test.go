@@ -109,6 +109,43 @@ func TestPrometheusExecutorTruncatesOverLimit(t *testing.T) {
 	if len(run.LimitationCodes) == 0 {
 		t.Fatal("expected a truncated limitation code")
 	}
+	if run.Coverage.Complete || run.Coverage.Returned != 2 || run.Coverage.Omitted < 1 {
+		t.Fatalf("coverage = %+v, want incomplete with 2 returned and the sentinel counted as omitted", run.Coverage)
+	}
+}
+
+// TestPrometheusSeriesPermutationIsImmaterial proves F28: the same series
+// set in a different source order yields the same summary bytes, so the
+// same fact digest and id.
+func TestPrometheusSeriesPermutationIsImmaterial(t *testing.T) {
+	a := json.RawMessage(`{"resultType":"matrix","result":[{"metric":{"service":"a"},"values":[[1,"1"]]},{"metric":{"service":"b"},"values":[[1,"2"]]},{"metric":{"env":"x","service":"a"},"values":[[1,"3"]]}]}`)
+	b := json.RawMessage(`{"resultType":"matrix","result":[{"metric":{"env":"x","service":"a"},"values":[[1,"3"]]},{"metric":{"service":"b"},"values":[[1,"2"]]},{"metric":{"service":"a"},"values":[[1,"1"]]}]}`)
+	sa, _, err := summarizePrometheusMatrix(a, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, _, err := summarizePrometheusMatrix(b, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	va, err := json.Marshal(sa)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vb, err := json.Marshal(sb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digestOf(va) != digestOf(vb) {
+		t.Fatalf("same series set changes evidence digest after permutation: %s vs %s", digestOf(va), digestOf(vb))
+	}
+	// Truncation also picks the same prefix regardless of source order.
+	ta, _, _ := summarizePrometheusMatrix(a, 2)
+	tb, _, _ := summarizePrometheusMatrix(b, 2)
+	if len(ta.Series) != 2 || canonicalLabelIdentity(ta.Series[0].Labels) != canonicalLabelIdentity(tb.Series[0].Labels) ||
+		canonicalLabelIdentity(ta.Series[1].Labels) != canonicalLabelIdentity(tb.Series[1].Labels) {
+		t.Fatalf("truncation kept a different prefix under permutation: %+v vs %+v", ta.Series, tb.Series)
+	}
 }
 
 func TestPrometheusExecutorRejectsNonfiniteSamples(t *testing.T) {

@@ -19,10 +19,12 @@ type fakeSentryClient struct {
 	page          sentry.IssuePage
 	err           error
 	physicalCalls int
+	gotLimit      int
 }
 
 func (f *fakeSentryClient) ListIssuesBounded(ctx context.Context, project, env string, start, end time.Time, query string, limit int,
 	before func() error, after func(started bool, err error)) (sentry.IssuePage, error) {
+	f.gotLimit = limit
 	if err := before(); err != nil {
 		return sentry.IssuePage{}, err
 	}
@@ -102,6 +104,57 @@ func TestSentryExecutorUnresolvedWithoutMapping(t *testing.T) {
 	}
 	if run.Status != "vocabulary_unresolved" {
 		t.Fatalf("status = %q, want vocabulary_unresolved", run.Status)
+	}
+}
+
+// TestSentryExecutorHardCapIsNotCompletenessProof proves F20 for Sentry:
+// the executor requests limit+1 so an absent/omitted Link header can never
+// pass a full page off as complete; more than limit issues → truncated,
+// incomplete, omission counted, newest ids kept under canonical order.
+func TestSentryExecutorHardCapIsNotCompletenessProof(t *testing.T) {
+	const limit = 2
+	client := &fakeSentryClient{page: sentry.IssuePage{Issues: []sentry.Issue{{ID: "7"}, {ID: "10"}, {ID: "9"}}, HasMore: false}}
+	e := &SentryExecutor{Client: client, ProjectEnv: mappedProjectEnv("checkout", "prod")}
+	plan := testStorePlan()
+	plan.Limit = limit
+
+	run, err := e.Execute(context.Background(), plan, &noopRecorder{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.gotLimit != limit+1 {
+		t.Fatalf("requested limit = %d, want %d (overflow sentinel)", client.gotLimit, limit+1)
+	}
+	if run.Coverage.Complete || run.Status != model.ResultTruncated || run.Coverage.Returned != limit || run.Coverage.Omitted < 1 {
+		t.Fatalf("run = status %q complete=%v returned=%d omitted=%d, want truncated/incomplete", run.Status, run.Coverage.Complete, run.Coverage.Returned, run.Coverage.Omitted)
+	}
+	var summary sentryIssuesSummary
+	if err := json.Unmarshal(run.Facts[0].Value, &summary); err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Issues) != limit || summary.Issues[0].ID != "10" || summary.Issues[1].ID != "9" || !summary.HasMore {
+		t.Fatalf("summary = %+v, want the two newest ids (numeric order) and has_more", summary)
+	}
+}
+
+// TestSentryExecutorPermutationIsImmaterial proves F28 for issues: the
+// same issue set in a different source order yields the same fact digest.
+func TestSentryExecutorPermutationIsImmaterial(t *testing.T) {
+	issues := []sentry.Issue{{ID: "3", Level: "error"}, {ID: "12", Level: "warning"}, {ID: "5"}}
+	reversed := slices.Clone(issues)
+	slices.Reverse(reversed)
+	plan := testStorePlan()
+
+	runA, err := (&SentryExecutor{Client: &fakeSentryClient{page: sentry.IssuePage{Issues: issues}}, ProjectEnv: mappedProjectEnv("checkout", "prod")}).Execute(context.Background(), plan, &noopRecorder{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runB, err := (&SentryExecutor{Client: &fakeSentryClient{page: sentry.IssuePage{Issues: reversed}}, ProjectEnv: mappedProjectEnv("checkout", "prod")}).Execute(context.Background(), plan, &noopRecorder{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runA.Facts[0].Digest != runB.Facts[0].Digest || runA.Facts[0].ID != runB.Facts[0].ID {
+		t.Fatalf("permutation changed evidence identity: %s vs %s", runA.Facts[0].Digest, runB.Facts[0].Digest)
 	}
 }
 

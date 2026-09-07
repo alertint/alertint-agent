@@ -163,11 +163,13 @@ func summarizePrometheusMatrix(raw json.RawMessage, limit int) (metricSummary, b
 		return metricSummary{}, false, fmt.Errorf("decode matrix: %w", err)
 	}
 
-	truncated := limit > 0 && len(payload.Result) > limit
-	series := payload.Result
-	if truncated {
-		series = series[:limit]
-	}
+	// Canonical order before truncation and hashing: a source-side
+	// permutation of the same series must never change which series are
+	// kept or the resulting fact digest (F28).
+	sort.SliceStable(payload.Result, func(i, j int) bool {
+		return canonicalLabelIdentity(payload.Result[i].Metric) < canonicalLabelIdentity(payload.Result[j].Metric)
+	})
+	series, _, truncated := truncateToLimit(payload.Result, limit)
 
 	out := metricSummary{Series: make([]seriesSummary, 0, len(series))}
 	for _, s := range series {

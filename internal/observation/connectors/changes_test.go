@@ -79,6 +79,30 @@ func TestChangesExecutorTruncated(t *testing.T) {
 	}
 }
 
+// TestChangesExecutorPermutationIsImmaterial proves F28 for the local
+// change ledger: reversed store order yields the same fact digest and id.
+func TestChangesExecutorPermutationIsImmaterial(t *testing.T) {
+	changes := []model.LocalChange{
+		{ID: "c2", OccurredAt: time.Unix(100, 0).UTC()}, {ID: "c1", OccurredAt: time.Unix(100, 0).UTC()}, {ID: "c3", OccurredAt: time.Unix(200, 0).UTC()},
+	}
+	reversed := slices.Clone(changes)
+	slices.Reverse(reversed)
+	plan := testStorePlan()
+	plan.Scope.Labels = map[string]string{"service": "checkout"}
+
+	runA, err := (&ChangesExecutor{Store: &fakeChangesStore{changes: changes}}).Execute(context.Background(), plan, &noopRecorder{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runB, err := (&ChangesExecutor{Store: &fakeChangesStore{changes: reversed}}).Execute(context.Background(), plan, &noopRecorder{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runA.Facts[0].Digest != runB.Facts[0].Digest || runA.Facts[0].ID != runB.Facts[0].ID {
+		t.Fatalf("permutation changed evidence identity: %s vs %s", runA.Facts[0].Digest, runB.Facts[0].Digest)
+	}
+}
+
 // TestChangesExecutorCapsFactBytes proves the change_event fact never
 // exceeds model.MaxFactBytes even for a wide local change ledger.
 func TestChangesExecutorCapsFactBytes(t *testing.T) {

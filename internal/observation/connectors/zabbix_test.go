@@ -17,12 +17,14 @@ import (
 )
 
 type fakeZabbixMetricClient struct {
-	series zabbix.Series
-	err    error
+	series   zabbix.Series
+	err      error
+	gotLimit int
 }
 
 func (f *fakeZabbixMetricClient) MetricHistoryBounded(ctx context.Context, host, itemKey string, from, to time.Time, limit int,
 	before func() error, after func(started bool, err error)) (zabbix.Series, error) {
+	f.gotLimit = limit
 	if err := before(); err != nil {
 		return zabbix.Series{}, err
 	}
@@ -165,6 +167,90 @@ func TestZabbixProblemExecutorUnresolvedWithoutTriggerID(t *testing.T) {
 	if run.Status != "vocabulary_unresolved" {
 		t.Fatalf("status = %q, want vocabulary_unresolved", run.Status)
 	}
+}
+
+// TestZabbixMetricExecutorHardCapIsNotCompletenessProof proves F20 for
+// metric history: limit+1 is requested, and more than limit points →
+// truncated, incomplete, omission counted, newest points kept.
+func TestZabbixMetricExecutorHardCapIsNotCompletenessProof(t *testing.T) {
+	const limit = 2
+	client := &fakeZabbixMetricClient{series: zabbix.Series{ItemID: "1", Points: []zabbix.SeriesPoint{
+		{Clock: time.Unix(100, 0).UTC(), Value: "1"},
+		{Clock: time.Unix(300, 0).UTC(), Value: "3"},
+		{Clock: time.Unix(200, 0).UTC(), Value: "2"},
+	}}}
+	plan := planWithParams(zabbixMetricParameters{Host: "web01", ItemKey: "system.cpu.util"})
+	plan.Limit = limit
+
+	run, err := (&ZabbixMetricExecutor{Client: client}).Execute(context.Background(), plan, &noopRecorder{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.gotLimit != limit+1 {
+		t.Fatalf("requested limit = %d, want %d (overflow sentinel)", client.gotLimit, limit+1)
+	}
+	if run.Coverage.Complete || run.Status != model.ResultTruncated || run.Coverage.Returned != limit || run.Coverage.Omitted < 1 {
+		t.Fatalf("run = status %q complete=%v returned=%d omitted=%d, want truncated/incomplete", run.Status, run.Coverage.Complete, run.Coverage.Returned, run.Coverage.Omitted)
+	}
+	if !slices.Contains(run.LimitationCodes, "truncated") {
+		t.Fatalf("limitation codes = %v, want truncated", run.LimitationCodes)
+	}
+	var series zabbix.Series
+	if err := json.Unmarshal(run.Facts[0].Value, &series); err != nil {
+		t.Fatal(err)
+	}
+	if len(series.Points) != limit || series.Points[0].Value != "3" || series.Points[1].Value != "2" {
+		t.Fatalf("kept points = %+v, want the newest two in canonical order", series.Points)
+	}
+}
+
+// TestZabbixExecutorsPermutationIsImmaterial proves F28 for both Zabbix
+// facts: reversed source order yields the same fact digest and id.
+func TestZabbixExecutorsPermutationIsImmaterial(t *testing.T) {
+	t.Run("metric points", func(t *testing.T) {
+		points := []zabbix.SeriesPoint{
+			{Clock: time.Unix(1, 0).UTC(), Value: "b"}, {Clock: time.Unix(1, 0).UTC(), Value: "a"}, {Clock: time.Unix(2, 0).UTC(), Value: "c"},
+		}
+		reversed := slices.Clone(points)
+		slices.Reverse(reversed)
+		plan := planWithParams(zabbixMetricParameters{Host: "web01", ItemKey: "k"})
+		runA, err := (&ZabbixMetricExecutor{Client: &fakeZabbixMetricClient{series: zabbix.Series{ItemID: "1", Points: points}}}).Execute(context.Background(), plan, &noopRecorder{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		runB, err := (&ZabbixMetricExecutor{Client: &fakeZabbixMetricClient{series: zabbix.Series{ItemID: "1", Points: reversed}}}).Execute(context.Background(), plan, &noopRecorder{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if runA.Facts[0].Digest != runB.Facts[0].Digest || runA.Facts[0].ID != runB.Facts[0].ID {
+			t.Fatalf("permutation changed evidence identity: %s vs %s", runA.Facts[0].Digest, runB.Facts[0].Digest)
+		}
+	})
+	t.Run("problem episodes", func(t *testing.T) {
+		episodes := []zabbix.ProblemEpisode{{EventID: "9"}, {EventID: "100"}, {EventID: "42"}}
+		reversed := slices.Clone(episodes)
+		slices.Reverse(reversed)
+		plan := testStorePlan()
+		plan.Parameters = mustMarshal(zabbixProblemParameters{Host: "web01", TriggerID: "1"})
+		runA, err := (&ZabbixProblemExecutor{Client: &fakeZabbixProblemClient{result: zabbix.ProblemHistoryResult{Episodes: episodes, Complete: true}}}).Execute(context.Background(), plan, &noopRecorder{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		runB, err := (&ZabbixProblemExecutor{Client: &fakeZabbixProblemClient{result: zabbix.ProblemHistoryResult{Episodes: reversed, Complete: true}}}).Execute(context.Background(), plan, &noopRecorder{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if runA.Facts[0].Digest != runB.Facts[0].Digest || runA.Facts[0].ID != runB.Facts[0].ID {
+			t.Fatalf("permutation changed evidence identity: %s vs %s", runA.Facts[0].Digest, runB.Facts[0].Digest)
+		}
+		var got []zabbix.ProblemEpisode
+		if err := json.Unmarshal(runA.Facts[0].Value, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got[0].EventID != "100" || got[1].EventID != "42" || got[2].EventID != "9" {
+			t.Fatalf("episodes = %+v, want newest numeric event id first", got)
+		}
+	})
 }
 
 // TestZabbixExecutorsOversizedResponseIsTruncatedWithoutData proves both

@@ -63,6 +63,42 @@ func TestOutcomeCodeClosedVocabulary(t *testing.T) {
 	}
 }
 
+func TestCanonicalLabelIdentityIsOrderIndependent(t *testing.T) {
+	a := canonicalLabelIdentity(map[string]string{"service": "checkout", "cluster": "lab"})
+	if a != "cluster=lab,service=checkout" {
+		t.Fatalf("identity = %q", a)
+	}
+	if canonicalLabelIdentity(map[string]string{}) != "" {
+		t.Fatal("empty label set must render empty")
+	}
+}
+
+func TestCompareIDsNumericAware(t *testing.T) {
+	if compareIDs("9", "10") >= 0 || compareIDs("10", "9") <= 0 {
+		t.Fatal("all-digit ids must compare numerically (9 < 10)")
+	}
+	if compareIDs("100", "100") != 0 {
+		t.Fatal("equal ids compare equal")
+	}
+	if compareIDs("abc", "abd") >= 0 || compareIDs("9", "a") >= 0 {
+		t.Fatal("non-digit ids fall back to lexicographic order")
+	}
+}
+
+func TestTruncateToLimitSentinel(t *testing.T) {
+	kept, omitted, truncated := truncateToLimit([]int{1, 2, 3}, 2)
+	if len(kept) != 2 || omitted != 1 || !truncated {
+		t.Fatalf("kept=%v omitted=%d truncated=%v", kept, omitted, truncated)
+	}
+	kept, omitted, truncated = truncateToLimit([]int{1, 2}, 2)
+	if len(kept) != 2 || omitted != 0 || truncated {
+		t.Fatalf("exactly limit rows must be complete: kept=%v omitted=%d truncated=%v", kept, omitted, truncated)
+	}
+	if _, _, truncated = truncateToLimit([]int{1, 2, 3}, 0); truncated {
+		t.Fatal("limit 0 means no client-side cap")
+	}
+}
+
 func TestFitFactValueKeepsLargestFittingPrefix(t *testing.T) {
 	item := strings.Repeat("x", 1000)
 	marshal := func(n int) ([]byte, error) {

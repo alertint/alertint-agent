@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/observation"
@@ -63,7 +64,10 @@ func (e *SentryExecutor) Execute(ctx context.Context, plan model.Plan, recorder 
 		limit = defaultMaxSentryIssues
 	}
 	expiresAt := now.Add(model.MaxWindowDaysHistory * 24 * time.Hour)
-	page, err := e.Client.ListIssuesBounded(ctx, project, env, plan.Start, plan.End, "", limit, before, after)
+	// limit+1: one overflow sentinel issue proves "more than limit" even when
+	// the Link header is absent; the header's own more-pages signal is still
+	// honoured when present (F20).
+	page, err := e.Client.ListIssuesBounded(ctx, project, env, plan.Start, plan.End, "", limit+1, before, after)
 	if err != nil {
 		if *budgetExhausted {
 			return withheldRun(plan, now), nil
@@ -86,20 +90,26 @@ func (e *SentryExecutor) Execute(ctx context.Context, plan model.Plan, recorder 
 		}
 		issues = append(issues, s)
 	}
+	// Canonical order (newest issue id first) before truncation and hashing
+	// (F28); the source's own date sort is not a stable identity.
+	slices.SortFunc(issues, func(a, b sentryIssueSummary) int { return compareIDs(b.ID, a.ID) })
+	issues, omitted, truncated := truncateToLimit(issues, limit)
+	if page.HasMore {
+		truncated = true
+		if omitted == 0 {
+			omitted = 1 // the source reports at least one further page
+		}
+	}
 
 	value, kept, err := fitFactValue(len(issues), func(n int) ([]byte, error) {
-		return json.Marshal(sentryIssuesSummary{Project: project, Environment: env, HasMore: page.HasMore, Issues: issues[:n]})
+		return json.Marshal(sentryIssuesSummary{Project: project, Environment: env, HasMore: truncated, Issues: issues[:n]})
 	})
 	if err != nil {
 		return model.Run{}, fmt.Errorf("connectors: marshal sentry issues summary: %w", err)
 	}
-	omitted := len(issues) - kept
-	if page.HasMore {
-		omitted++ // the source reports at least one further page
-	}
 	return boundedRun(plan, now, boundedResult{
-		Kind: "error_issue", Value: value, Returned: kept, Omitted: omitted,
-		Truncated: page.HasMore, Capped: kept < len(issues), ExpiresAt: expiresAt,
+		Kind: "error_issue", Value: value, Returned: kept, Omitted: omitted + len(issues) - kept,
+		Truncated: truncated, Capped: kept < len(issues), ExpiresAt: expiresAt,
 	}), nil
 }
 

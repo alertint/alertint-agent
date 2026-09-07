@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/observation"
@@ -57,9 +59,18 @@ func (e *ChangesExecutor) Execute(ctx context.Context, plan model.Plan, _ observ
 		return model.Run{}, fmt.Errorf("connectors: changes in scope window: %w", err)
 	}
 
+	// Canonical order (newest first, then id) before hashing (F28); an empty
+	// ledger marshals as "[]", never "null".
+	changes = slices.Clone(changes)
 	if changes == nil {
-		changes = []model.LocalChange{} // a confirmed-empty fact is "[]", never "null"
+		changes = []model.LocalChange{}
 	}
+	slices.SortFunc(changes, func(a, b model.LocalChange) int {
+		if c := b.OccurredAt.Compare(a.OccurredAt); c != 0 {
+			return c
+		}
+		return strings.Compare(a.ID, b.ID)
+	})
 	value, kept, err := fitFactValue(len(changes), func(n int) ([]byte, error) {
 		return json.Marshal(changes[:n])
 	})

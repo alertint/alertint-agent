@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/logs"
@@ -57,7 +59,9 @@ func (e *LokiExecutor) Execute(ctx context.Context, plan model.Plan, recorder ob
 		limit = 100
 	}
 	expiresAt := now.Add(model.MaxWindowHoursMetricsLogs * time.Hour)
-	fetched, err := e.Client.FetchRecentBounded(ctx, sel, plan.Start, plan.End, limit, before, after)
+	// limit+1: one overflow sentinel line proves "more than limit" without
+	// ever treating the hard cap itself as completeness (F20).
+	fetched, err := e.Client.FetchRecentBounded(ctx, sel, plan.Start, plan.End, limit+1, before, after)
 	if err != nil {
 		if *budgetExhausted {
 			return withheldRun(plan, now), nil
@@ -73,25 +77,36 @@ func (e *LokiExecutor) Execute(ctx context.Context, plan model.Plan, recorder ob
 		return unresolvedRun(plan, now), nil
 	}
 
-	samples := make([]lokiSample, 0, min(len(fetched.Lines), maxLokiSampleLines))
-	for i := 0; i < len(fetched.Lines) && i < maxLokiSampleLines; i++ {
-		line := fetched.Lines[i]
-		text := line.Line
+	// Canonical order (newest first, then line text) before truncation and
+	// hashing: Loki lays lines out grouped by stream, so the same line set
+	// can arrive in different orders (F28).
+	lines := slices.Clone(fetched.Lines)
+	slices.SortFunc(lines, func(a, b logs.Line) int {
+		if c := b.Timestamp.Compare(a.Timestamp); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Line, b.Line)
+	})
+	lines, omitted, truncated := truncateToLimit(lines, limit)
+
+	samples := make([]lokiSample, 0, min(len(lines), maxLokiSampleLines))
+	for i := 0; i < len(lines) && i < maxLokiSampleLines; i++ {
+		text := lines[i].Line
 		if len(text) > maxLokiSampleLineChars {
 			text = text[:maxLokiSampleLineChars]
 		}
-		samples = append(samples, lokiSample{Timestamp: line.Timestamp, Line: text})
+		samples = append(samples, lokiSample{Timestamp: lines[i].Timestamp, Line: text})
 	}
 
 	value, kept, err := fitFactValue(len(samples), func(n int) ([]byte, error) {
-		return json.Marshal(lokiSummary{Query: fetched.Query, LineCount: len(fetched.Lines), Samples: samples[:n]})
+		return json.Marshal(lokiSummary{Query: fetched.Query, LineCount: len(lines), Samples: samples[:n]})
 	})
 	if err != nil {
 		return model.Run{}, fmt.Errorf("connectors: marshal loki summary: %w", err)
 	}
 	return boundedRun(plan, now, boundedResult{
-		Kind: "log_summary", Value: value, Returned: len(fetched.Lines), Omitted: len(samples) - kept,
-		Capped: kept < len(samples), ExpiresAt: expiresAt,
+		Kind: "log_summary", Value: value, Returned: len(lines), Omitted: omitted + len(samples) - kept,
+		Truncated: truncated, Capped: kept < len(samples), ExpiresAt: expiresAt,
 	}), nil
 }
 

@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/observation"
@@ -75,7 +77,9 @@ func (e *ZabbixMetricExecutor) Execute(ctx context.Context, plan model.Plan, rec
 		limit = 100
 	}
 	expiresAt := now.Add(model.MaxWindowHoursMetricsLogs * time.Hour)
-	series, err := e.Client.MetricHistoryBounded(ctx, host, params.ItemKey, plan.Start, plan.End, limit, before, after)
+	// limit+1: one overflow sentinel row proves "more than limit" without
+	// ever treating the hard cap itself as completeness (F20).
+	series, err := e.Client.MetricHistoryBounded(ctx, host, params.ItemKey, plan.Start, plan.End, limit+1, before, after)
 	if err != nil {
 		if *budgetExhausted {
 			return withheldRun(plan, now), nil
@@ -89,7 +93,17 @@ func (e *ZabbixMetricExecutor) Execute(ctx context.Context, plan model.Plan, rec
 		return model.Run{}, fmt.Errorf("connectors: zabbix metric history: %w", err)
 	}
 
-	points := series.Points
+	// Canonical order (newest clock first, then value) before truncation and
+	// hashing (F28): trend.get has no sort parameter at all.
+	points := slices.Clone(series.Points)
+	slices.SortFunc(points, func(a, b zabbix.SeriesPoint) int {
+		if c := b.Clock.Compare(a.Clock); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Value, b.Value)
+	})
+	points, omitted, truncated := truncateToLimit(points, limit)
+
 	value, kept, err := fitFactValue(len(points), func(n int) ([]byte, error) {
 		bounded := series
 		bounded.Points = points[:n]
@@ -99,8 +113,8 @@ func (e *ZabbixMetricExecutor) Execute(ctx context.Context, plan model.Plan, rec
 		return model.Run{}, fmt.Errorf("connectors: marshal zabbix series: %w", err)
 	}
 	return boundedRun(plan, now, boundedResult{
-		Kind: "metric_summary", Value: value, Returned: kept, Omitted: len(points) - kept,
-		Capped: kept < len(points), ExpiresAt: expiresAt,
+		Kind: "metric_summary", Value: value, Returned: kept, Omitted: omitted + len(points) - kept,
+		Truncated: truncated, Capped: kept < len(points), ExpiresAt: expiresAt,
 	}), nil
 }
 
@@ -159,7 +173,11 @@ func (e *ZabbixProblemExecutor) Execute(ctx context.Context, plan model.Plan, re
 		return model.Run{}, fmt.Errorf("connectors: zabbix problem history: %w", err)
 	}
 
-	episodes := result.Episodes
+	// Canonical order (newest event id first) before hashing (F28). The
+	// client already applied its own limit+1 truncation under the source's
+	// clock/eventid sort.
+	episodes := slices.Clone(result.Episodes)
+	slices.SortFunc(episodes, func(a, b zabbix.ProblemEpisode) int { return compareIDs(b.EventID, a.EventID) })
 	value, kept, err := fitFactValue(len(episodes), func(n int) ([]byte, error) {
 		return json.Marshal(episodes[:n])
 	})

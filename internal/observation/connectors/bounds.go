@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/logs/loki"
@@ -177,6 +179,64 @@ func boundedRun(plan model.Plan, now time.Time, r boundedResult) model.Run {
 		LimitationCodes: limitationCodes,
 		ObservedAt:      now, ExpiresAt: r.ExpiresAt,
 	}
+}
+
+// canonicalLabelIdentity renders a label set as its sorted k=v pairs joined
+// by "," — the stable identity an unordered series collection is sorted by
+// before truncation and hashing, so a source-side permutation of the same
+// series never changes a fact digest (F28).
+func canonicalLabelIdentity(labels map[string]string) string {
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var sb strings.Builder
+	for i, k := range keys {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(k)
+		sb.WriteByte('=')
+		sb.WriteString(labels[k])
+	}
+	return sb.String()
+}
+
+// compareIDs orders two source identifiers deterministically: two all-digit
+// ids compare numerically (shorter first, then lexicographically), any other
+// pair lexicographically. Sentry issue ids and Zabbix event ids are decimal
+// strings, so "newest first" is the descending numeric order.
+func compareIDs(a, b string) int {
+	if allDigits(a) && allDigits(b) {
+		if len(a) != len(b) {
+			return len(a) - len(b)
+		}
+	}
+	return strings.Compare(a, b)
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// truncateToLimit applies the limit+1 overflow-sentinel rule to an already
+// canonically ordered collection: when more than limit rows came back the
+// first limit are kept and the rest counted as omitted — a hard cap is
+// never completeness proof (F20).
+func truncateToLimit[T any](rows []T, limit int) (kept []T, omitted int, truncated bool) {
+	if limit > 0 && len(rows) > limit {
+		return rows[:limit], len(rows) - limit, true
+	}
+	return rows, 0, false
 }
 
 // fitFactValue finds the largest prefix n (0 <= n <= count) of a
