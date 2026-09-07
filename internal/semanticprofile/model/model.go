@@ -107,23 +107,23 @@ type Profile struct {
 // responsible for supplying only genuinely adapter-proven fields; an
 // untrusted annotation cannot claim a source version merely by naming one.
 type SignatureInput struct {
-	Source string
+	Source string `json:"source"`
 	// AlertName is the rule-attached alert name, used only in the fallback
 	// material (never combined with a proven signal ID/version, which are
 	// already sufficient identity on their own).
-	AlertName string
+	AlertName string `json:"alert_name,omitempty"`
 	// ProvenSignalID and ProvenVersion are the source adapter's own proven
 	// signal identity/version (never derived from arbitrary annotations).
 	// ProvenVersion may be empty even when ProvenSignalID is set — spec.md:
 	// "If ID exists without version, keep the ID and explicit missing
 	// version in advisory material."
-	ProvenSignalID string
-	ProvenVersion  string
+	ProvenSignalID string `json:"proven_signal_id,omitempty"`
+	ProvenVersion  string `json:"proven_version,omitempty"`
 	// ProvenTemplateID is adapter-proven rule/template identity, used only
 	// in the fallback material when no proven signal ID exists.
-	ProvenTemplateID string
-	LabelKeys        []string
-	AnnotationKeys   []string
+	ProvenTemplateID string   `json:"proven_template_id,omitempty"`
+	LabelKeys        []string `json:"label_keys,omitempty"`
+	AnnotationKeys   []string `json:"annotation_keys,omitempty"`
 }
 
 // Signature provenance modes — the closed three-value classification of how

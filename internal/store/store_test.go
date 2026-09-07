@@ -446,12 +446,11 @@ func TestMaxSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	// 0022_situation_preparation.sql is the newest migration today. Plan 2
-	// owns 0015/0016; Plan 3 owns 0017-0021; Plan 4 adds bounded evidence
-	// preparation starting at 0022 (spec.md R1: "Plan 3 owns migrations
-	// 0017-0021; MaxSchemaVersion is 21. Add migrations starting at 0022").
-	if got != 22 {
-		t.Errorf("MaxSchemaVersion = %d, want 22", got)
+	// 0023_semantic_profiles.sql is the newest migration today. Plan 2 owns
+	// 0015/0016; Plan 3 owns 0017-0021; Plan 4 adds bounded evidence
+	// preparation and semantic profiles at 0022-0023.
+	if got != 23 {
+		t.Errorf("MaxSchemaVersion = %d, want 23", got)
 	}
 }
 

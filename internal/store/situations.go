@@ -349,6 +349,20 @@ func (s *Store) ApplySituationInput(ctx context.Context, claim SituationClaim) e
 	}
 
 	now := time.Now().UTC()
+
+	// Plan 4 Task 7: the deterministic advisory-signature mapping (and, for
+	// a genuinely new signature, its missing-profile inference job) is
+	// inserted with durable Situation-input application — spec.md "Source
+	// identity and advisory signatures". Runs for every delivery-carrying
+	// input regardless of which routing branch below the input takes
+	// afterward (including an owner-terminal R2 attach): the delivery
+	// itself is real and immutable the instant it exists, independent of
+	// its owning Situation's own current lifecycle.
+	if row.deliveryID != nil {
+		if err := attachDeliverySemanticSignatureTx(ctx, tx, *row.deliveryID, s.maxSemanticProfileAttempts(), now); err != nil {
+			return err
+		}
+	}
 	outcome, err := resolveAndApplySituationTx(ctx, tx, row, startAt, basis, receivedAt, dueReason, now)
 	if err != nil {
 		return err
