@@ -1048,12 +1048,17 @@ func (s *Store) CompleteSemanticInference(ctx context.Context, callID, owner str
 // spec.md's "paginated, 100 Situations/transaction" — every nonterminal
 // (active|recovery_pending) Situation with a member delivery under the
 // change's own signature that has not yet received this exact
-// (change_id, situation_id) delivery. Each newly-woken Situation gets the
-// existing DueSemanticProfileChanged reason merged and its
-// next_assessment_at pulled forward, mirroring
-// wakeOneDependencyRecoveredSituationTx's own lightweight wake pattern — no
-// input_version bump, no parked-state reset: a profile change is advisory
-// guidance, never a material policy change. The outbox row is acknowledged
+// (change_id, situation_id) delivery. Each newly-woken Situation is
+// advanced exactly the way joinSituationTx advances it for a new delivery
+// (wakeSituationForSemanticProfileChangeTx): input_version bumped once, the
+// DueSemanticProfileChanged reason merged, next_assessment_at pulled
+// forward, and the controller lease cleared — so an in-flight controller
+// cycle that froze the OLD profile basis fails closed at CommitController's
+// own input-version/lease fencing instead of committing that stale basis
+// and consuming the wake. No parked-state reset: a profile change is
+// advisory guidance, never a dependency recovery. The unique
+// (change_id, situation_id) delivery row makes the bump exactly-once per
+// change and Situation even when a batch is replayed. The outbox row is acknowledged
 // only once a page returns fewer than batchSize matches (this page reached
 // every remaining match). A concurrent attachment under the same signature
 // that lands on either side of the cursor is never lost: an unmatched
@@ -1110,13 +1115,8 @@ func (s *Store) DeliverSemanticProfileChanges(ctx context.Context, now time.Time
 			VALUES (?, ?, ?)`, changeID, situationID, canonicalTime(now)); err != nil {
 			return 0, fmt.Errorf("store: record semantic profile change delivery: %w", err)
 		}
-		if err := mergeSituationDueReasonTx(ctx, tx, situationID, situationmodel.DueSemanticProfileChanged, now); err != nil {
+		if err := wakeSituationForSemanticProfileChangeTx(ctx, tx, situationID, now); err != nil {
 			return 0, err
-		}
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE situations SET next_assessment_at = min(next_assessment_at, ?), updated_at = ? WHERE id = ?`,
-			canonicalTime(now), canonicalTime(now), situationID); err != nil {
-			return 0, fmt.Errorf("store: pull semantic profile change wake forward: %w", err)
 		}
 	}
 
@@ -1137,6 +1137,46 @@ func (s *Store) DeliverSemanticProfileChanges(ctx context.Context, now time.Time
 		return 0, fmt.Errorf("store: commit deliver semantic profile changes: %w", err)
 	}
 	return len(ids), nil
+}
+
+// wakeSituationForSemanticProfileChangeTx invalidates situationID's frozen
+// input for one head-change delivery exactly the way joinSituationTx does
+// for a newly applied delivery: input_version advances once (CAS-fenced on
+// the version just read, so a concurrent input application is never
+// double-counted), due_reasons_json merges DueSemanticProfileChanged,
+// next_assessment_at takes the earlier of its current value and now, and
+// the controller lease owner/expiry are cleared while claim_token stays
+// monotonic — a controller that claimed before this wake can no longer
+// commit a decision frozen on the old profile basis.
+func wakeSituationForSemanticProfileChangeTx(ctx context.Context, tx *sql.Tx, situationID string, now time.Time) error {
+	current, err := getSituationTx(ctx, tx, situationID)
+	if err != nil {
+		return err
+	}
+	dueReasonsJSON, err := json.Marshal(mergeDueReason(current.DueReasons, situationmodel.DueSemanticProfileChanged))
+	if err != nil {
+		return fmt.Errorf("store: marshal semantic profile change due reasons: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `
+		UPDATE situations
+		SET input_version = input_version + 1,
+		    next_assessment_at = ?, due_reasons_json = ?,
+		    lease_owner = NULL, lease_expires_at = NULL,
+		    updated_at = ?
+		WHERE id = ? AND input_version = ?`,
+		canonicalTime(earlierTime(current.NextAssessmentAt, now)), string(dueReasonsJSON),
+		canonicalTime(now), situationID, current.InputVersion)
+	if err != nil {
+		return fmt.Errorf("store: wake situation for semantic profile change: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: count woken situation for semantic profile change: %w", err)
+	}
+	if n != 1 {
+		return ErrSituationVersionConflict
+	}
+	return nil
 }
 
 // commitAcceptedInferenceTx creates the accepted inference's immutable

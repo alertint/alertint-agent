@@ -9,7 +9,110 @@ import (
 	"time"
 
 	profilemodel "github.com/alertint/alertint-agent/internal/semanticprofile/model"
+	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 )
+
+// signatureKeyOf reads deliveryID's attached signature key, failing the test
+// when the delivery has no mapping.
+func signatureKeyOf(t *testing.T, st *Store, deliveryID string) string {
+	t.Helper()
+	key, _, _, found := getDeliverySignature(t, st, deliveryID)
+	if !found {
+		t.Fatalf("delivery %s has no semantic signature mapping", deliveryID)
+	}
+	return key
+}
+
+// correctProfileForSignature lands one operator correction for signatureKey
+// at expectedVersion, enqueueing exactly one head-change outbox row.
+func correctProfileForSignature(t *testing.T, st *Store, signatureKey string, expectedVersion int, now time.Time) {
+	t.Helper()
+	correction := profilemodel.Correction{
+		Signature: signatureKey, ExpectedVersion: expectedVersion,
+		Profile: profilemodel.Profile{
+			SubjectKind: "service", EventKind: "availability", PossibleRole: "symptom",
+			CandidateScope: []string{"service"}, HorizonTier: "hours",
+		},
+		Confirm: true, AssertedBy: "operator:review",
+	}
+	if _, err := st.CorrectSemanticProfile(context.Background(), correction, now); err != nil {
+		t.Fatalf("CorrectSemanticProfile (expected version %d): %v", expectedVersion, err)
+	}
+}
+
+// TestDeliverSemanticProfileChangesBumpsInputVersionExactlyOnce (F8): one
+// head-change delivery advances the follower's input_version exactly once
+// — a replayed fan-out call finds the (change, situation) delivery already
+// recorded and bumps nothing — while a genuinely NEW head change bumps
+// again.
+func TestDeliverSemanticProfileChangesBumpsInputVersionExactlyOnce(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	deliveryID, situationID := signatureDeliveryFixture(t, st, "bump", "group-bump", now)
+	key := signatureKeyOf(t, st, deliveryID)
+	before := getSituationByID(t, st, situationID).InputVersion
+
+	correctProfileForSignature(t, st, key, 0, now)
+	if n, err := st.DeliverSemanticProfileChanges(context.Background(), now, 100); err != nil || n != 1 {
+		t.Fatalf("first fan-out = (%d, %v), want (1, nil)", n, err)
+	}
+	after := getSituationByID(t, st, situationID)
+	if after.InputVersion != before+1 {
+		t.Fatalf("input_version after fan-out = %d, want %d (bumped exactly once)", after.InputVersion, before+1)
+	}
+	if !hasDueReason(after.DueReasons, situationmodel.DueSemanticProfileChanged) {
+		t.Fatal("expected the semantic_profile_changed due reason to be merged")
+	}
+
+	// Replay: nothing left for this change, and no second bump.
+	if n, err := st.DeliverSemanticProfileChanges(context.Background(), now, 100); err != nil || n != 0 {
+		t.Fatalf("replayed fan-out = (%d, %v), want (0, nil)", n, err)
+	}
+	if got := getSituationByID(t, st, situationID).InputVersion; got != before+1 {
+		t.Fatalf("input_version after replay = %d, want unchanged %d", got, before+1)
+	}
+
+	// A NEW head change is a new invalidation.
+	correctProfileForSignature(t, st, key, 1, now.Add(time.Minute))
+	if n, err := st.DeliverSemanticProfileChanges(context.Background(), now.Add(time.Minute), 100); err != nil || n != 1 {
+		t.Fatalf("second change fan-out = (%d, %v), want (1, nil)", n, err)
+	}
+	if got := getSituationByID(t, st, situationID).InputVersion; got != before+2 {
+		t.Fatalf("input_version after second change = %d, want %d", got, before+2)
+	}
+}
+
+// TestDeliverSemanticProfileChangesFencesStaleControllerCommit (F8): a
+// controller that claimed the follower BEFORE the head change froze the
+// old profile basis; the fan-out must invalidate that frozen input so its
+// CommitController fails closed rather than committing the stale basis
+// and consuming the semantic_profile_changed wake.
+func TestDeliverSemanticProfileChangesFencesStaleControllerCommit(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	deliveryID, situationID := signatureDeliveryFixture(t, st, "fence", "group-fence", now)
+	key := signatureKeyOf(t, st, deliveryID)
+
+	claim := claimSituation(t, st, situationID, "controller-stale", now.Add(2*time.Minute))
+
+	correctProfileForSignature(t, st, key, 0, now.Add(3*time.Minute))
+	if n, err := st.DeliverSemanticProfileChanges(context.Background(), now.Add(3*time.Minute), 100); err != nil || n != 1 {
+		t.Fatalf("fan-out = (%d, %v), want (1, nil)", n, err)
+	}
+
+	commit := basicControllerCommit(situationID, claim.Situation.InputVersion, now.Add(4*time.Minute))
+	err := st.CommitController(context.Background(), claim, commit)
+	if !errors.Is(err, situationmodel.ErrSituationLeaseLost) && !errors.Is(err, ErrSituationVersionConflict) {
+		t.Fatalf("stale commit err = %v, want ErrSituationLeaseLost or ErrSituationVersionConflict (the frozen profile basis is invalid)", err)
+	}
+	sit := getSituationByID(t, st, situationID)
+	if sit.InputVersion != claim.Situation.InputVersion+1 {
+		t.Fatalf("input_version = %d, want %d", sit.InputVersion, claim.Situation.InputVersion+1)
+	}
+	if !hasDueReason(sit.DueReasons, situationmodel.DueSemanticProfileChanged) {
+		t.Fatal("the semantic_profile_changed wake must survive the rejected stale commit")
+	}
+}
 
 // ----------------------------------------------------------------------
 // Plan 4 review round 1 — durable semantic-profile inference fixes.
