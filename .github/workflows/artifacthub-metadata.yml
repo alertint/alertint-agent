@@ -23,7 +23,9 @@ jobs:
       - name: Set up ORAS
         uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
         with:
-          version: 1.3.4
+          # The pinned action's embedded version list predates ORAS 1.3.4.
+          url: https://github.com/oras-project/oras/releases/download/v1.3.4/oras_1.3.4_linux_amd64.tar.gz
+          checksum: f27adb935022d94df8dc77719c322dda592c78a0d57a6f7dcdd8d900b248c454
 
       - name: Log in to GitHub Container Registry
         env:
