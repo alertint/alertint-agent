@@ -449,8 +449,8 @@ func TestMaxSchemaVersion(t *testing.T) {
 	// 0023_semantic_profiles.sql is the newest migration today. Plan 2 owns
 	// 0015/0016; Plan 3 owns 0017-0021; Plan 4 adds bounded evidence
 	// preparation and semantic profiles at 0022-0023.
-	if got != 23 {
-		t.Errorf("MaxSchemaVersion = %d, want 23", got)
+	if got != 24 {
+		t.Errorf("MaxSchemaVersion = %d, want 24", got)
 	}
 }
 

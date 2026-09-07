@@ -419,8 +419,39 @@ func latestFrozenInputDigestTx(ctx context.Context, tx *sql.Tx, signatureKey str
 // ErrSemanticInferenceAttemptsExhausted is returned by
 // ReserveSemanticInferenceCall when the job's frozen max_attempts is
 // already spent — the job is durably marked exhausted in the SAME
-// transaction, so the caller never needs a separate call to record it.
-var ErrSemanticInferenceAttemptsExhausted = errors.New("store: semantic inference job attempts exhausted")
+// transaction, so the caller never needs a separate call to record it. It
+// IS semanticprofile.ErrAttemptsExhausted (the same value, not a lookalike
+// duplicate) — internal/semanticprofile's own Worker recognizes exhaustion
+// via errors.Is against that package's sentinel, and it must never import
+// internal/store to reference this one directly, so *Store structurally
+// satisfying Worker's ProfileStore interface requires returning the exact
+// same underlying error here, mirroring how profilemodel.ErrLeaseLost/
+// ErrVersionConflict are already reused directly rather than duplicated.
+var ErrSemanticInferenceAttemptsExhausted = semanticprofile.ErrAttemptsExhausted
+
+// ExtendSemanticInferenceJobLease renews jobID's lease to now+lease,
+// fenced by owner/token exactly like ExtendControllerLease — the worker's
+// own heartbeat while a single bounded CompleteOnce call is still running
+// (plan.md: "Heartbeat the job's own owner/token; cancel on lease loss").
+// Returns profilemodel.ErrLeaseLost if owner/token no longer match the live
+// claim.
+func (s *Store) ExtendSemanticInferenceJobLease(ctx context.Context, jobID, owner string, token int64, now time.Time, lease time.Duration) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE semantic_profile_inference_jobs SET lease_expires_at = ?
+		WHERE id = ? AND status = 'running' AND owner = ? AND token = ?`,
+		canonicalTime(now.Add(lease)), jobID, owner, token)
+	if err != nil {
+		return fmt.Errorf("store: extend semantic inference job lease: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: count extended semantic inference job lease: %w", err)
+	}
+	if n != 1 {
+		return profilemodel.ErrLeaseLost
+	}
+	return nil
+}
 
 // ClaimSemanticInferenceJob claims one due pending job (retry_at NULL or
 // already past) for owner, fencing it with a fresh token and a lease

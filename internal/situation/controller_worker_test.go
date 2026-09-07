@@ -104,6 +104,50 @@ func TestControllerWorkerRunOnceClaimsAndReconciles(t *testing.T) {
 	}
 }
 
+// TestControllerWorkerSetInferenceLimiterGatesL2ThroughSharedPool proves
+// Plan 4 Task 8's own "factor the current L2-only semaphore into the
+// shared L0/L2 limiter" wiring actually takes effect: with a
+// capacity-1 llm.InferenceLimiter's one slot already held by an external
+// (Profile-priority) acquisition, a ControllerWorker wired to that SAME
+// limiter via SetInferenceLimiter must have its own L2 dispatch BLOCK
+// waiting for it — proving the call genuinely went through the shared pool
+// rather than the worker's own private per-instance semaphore (which would
+// let it through immediately, unaffected by an external acquisition it has
+// never heard of).
+func TestControllerWorkerSetInferenceLimiterGatesL2ThroughSharedPool(t *testing.T) {
+	limiter := llm.NewInferenceLimiter(1)
+	release, err := limiter.Acquire(context.Background(), llm.InferenceProfile)
+	if err != nil {
+		t.Fatalf("pre-acquire the shared limiter's one slot: %v", err)
+	}
+	defer release()
+
+	in := ctFloorSnapshotInput()
+	claim := ctClaimFor("situation-limited", "worker-a", 1)
+	store := &fakeControllerStore{
+		loadInput: in, beginWorkAttempt: 1,
+		claimFn: func(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]situation.Claim, error) {
+			return []situation.Claim{claim}, nil
+		},
+	}
+	client := &fakeAssessmentClient{}
+	cfg := newWorkerConfig("worker-a")
+	w := situation.NewControllerWorker(store, store, client, situation.ControllerConfig{AttemptWall: 50 * time.Millisecond}, cfg, nil, nil, nil)
+	w.SetInferenceLimiter(limiter)
+
+	if _, err := w.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	// The controller's own AttemptWall (50ms) expired while L2 dispatch was
+	// still blocked waiting for the shared limiter's one slot (held by this
+	// test the entire time) — CompleteOnce was therefore never actually
+	// invoked; RunOnce absorbs the resulting reconcile failure (its own
+	// per-Situation error handling, not propagated as a RunOnce error).
+	if client.calls != 0 {
+		t.Fatalf("CompleteOnce calls = %d, want 0 (still blocked on the shared limiter)", client.calls)
+	}
+}
+
 func TestControllerWorkerRunOnceRespectsBoundedBatch(t *testing.T) {
 	store := &fakeControllerStore{
 		claimFn: func(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]situation.Claim, error) {

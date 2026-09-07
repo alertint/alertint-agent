@@ -141,28 +141,59 @@ func (c ControllerWorkerConfig) withDefaults() ControllerWorkerConfig {
 }
 
 // semaphoreAssessmentClient wraps an AssessmentClient with a bounded
-// concurrent-call semaphore — ControllerWorker's own "global L2 semaphore":
-// at most the configured L2Concurrency CompleteOnce calls run at once
+// concurrent-call gate — ControllerWorker's own "global L2 semaphore": at
+// most the configured concurrency's worth of CompleteOnce calls run at once
 // across every Situation this worker is concurrently reconciling,
 // regardless of how many of its Workers goroutines are active. Blocks
 // (never drops or errors early) until a slot frees or ctx is done.
+//
+// Plan 4 Task 8: when limiter is non-nil (SetInferenceLimiter was called
+// before the first CompleteOnce), it gates through that SHARED llm.
+// InferenceLimiter instead of the private sem channel below — the same
+// pool internal/semanticprofile's own worker acquires from with
+// llm.InferenceProfile priority, so L0+L2 share one real bound (spec.md:
+// "extends that limiter to L0+L2"). Exactly one of the two paths runs per
+// call, never both — "Acquire once, never in both wrapper and worker".
 type semaphoreAssessmentClient struct {
 	inner AssessmentClient
 	sem   chan struct{}
+
+	mu      sync.Mutex
+	limiter *llm.InferenceLimiter
 }
 
 func newSemaphoreAssessmentClient(inner AssessmentClient, concurrency int) *semaphoreAssessmentClient {
 	return &semaphoreAssessmentClient{inner: inner, sem: make(chan struct{}, concurrency)}
 }
 
+func (c *semaphoreAssessmentClient) setInferenceLimiter(l *llm.InferenceLimiter) {
+	c.mu.Lock()
+	c.limiter = l
+	c.mu.Unlock()
+}
+
 func (c *semaphoreAssessmentClient) CompleteOnce(ctx context.Context, systemPrompt string, prompt llm.Prompt, requiredKeys []string) (llm.OneShotCompletion, error) {
+	c.mu.Lock()
+	limiter := c.limiter
+	c.mu.Unlock()
+
+	if limiter != nil {
+		release, err := limiter.Acquire(ctx, llm.InferenceAssessment)
+		if err != nil {
+			// Canceled while still waiting for a slot: no physical request
+			// was ever attempted, which is exactly llm.RequestStartStatusFalse
+			// — the deliberate, valid classification the controller records
+			// on the call's durable outcome row (the store rejects an empty
+			// one).
+			return llm.OneShotCompletion{RequestStarted: llm.RequestStartStatusFalse}, err
+		}
+		defer release()
+		return c.inner.CompleteOnce(ctx, systemPrompt, prompt, requiredKeys)
+	}
+
 	select {
 	case c.sem <- struct{}{}:
 	case <-ctx.Done():
-		// Canceled while still waiting for a slot: no physical request was
-		// ever attempted, which is exactly llm.RequestStartStatusFalse —
-		// the deliberate, valid classification the controller records on
-		// the call's durable outcome row (the store rejects an empty one).
 		return llm.OneShotCompletion{RequestStarted: llm.RequestStartStatusFalse}, ctx.Err()
 	}
 	defer func() { <-c.sem }()
@@ -177,11 +208,12 @@ func (c *semaphoreAssessmentClient) CompleteOnce(ctx context.Context, systemProm
 // be called directly (tests, or a one-shot CLI drain) without ever calling
 // Start.
 type ControllerWorker struct {
-	store      ControllerWorkStore
-	controller *Controller
-	cfg        ControllerWorkerConfig
-	logger     *slog.Logger
-	waker      DependencyRecoveryWaker
+	store        ControllerWorkStore
+	controller   *Controller
+	assessClient *semaphoreAssessmentClient
+	cfg          ControllerWorkerConfig
+	logger       *slog.Logger
+	waker        DependencyRecoveryWaker
 
 	wakeCh chan struct{}
 	stopCh chan struct{}
@@ -207,6 +239,18 @@ func (w *ControllerWorker) SetAssessmentHealthObserver(o AssessmentHealthObserve
 	w.controller.SetAssessmentHealthObserver(o)
 }
 
+// SetInferenceLimiter wires a SHARED llm.InferenceLimiter that L2 dispatch
+// gates through from here on, in place of this worker's own private
+// L2Concurrency-sized channel — the same limiter internal/semanticprofile's
+// worker acquires from with llm.InferenceProfile priority (Plan 4 Task 8:
+// "Factor the current L2-only semaphore into the shared L0/L2 limiter").
+// Optional: nil (the default) leaves the private per-worker semaphore in
+// place, unchanged from pre-Task-8 behavior. Not safe to call concurrently
+// with Start/RunOnce; call it once, right after construction.
+func (w *ControllerWorker) SetInferenceLimiter(l *llm.InferenceLimiter) {
+	w.assessClient.setInferenceLimiter(l)
+}
+
 // NewControllerWorker constructs a ControllerWorker. It builds its own
 // *Controller internally (via NewController) so it can wrap client in the
 // global L2 semaphore before Reconcile ever sees it — workStore is the
@@ -226,13 +270,14 @@ func NewControllerWorker(
 	wrapped := newSemaphoreAssessmentClient(client, cfg.L2Concurrency)
 	controller := NewController(controllerStore, wrapped, controllerCfg, clock, auditSink, logger)
 	return &ControllerWorker{
-		store:      workStore,
-		controller: controller,
-		cfg:        cfg,
-		logger:     logger,
-		wakeCh:     make(chan struct{}, 1),
-		stopCh:     make(chan struct{}),
-		doneCh:     make(chan struct{}),
+		store:        workStore,
+		controller:   controller,
+		assessClient: wrapped,
+		cfg:          cfg,
+		logger:       logger,
+		wakeCh:       make(chan struct{}, 1),
+		stopCh:       make(chan struct{}),
+		doneCh:       make(chan struct{}),
 	}
 }
 

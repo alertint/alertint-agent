@@ -532,6 +532,42 @@ func TestReserveSemanticInferenceCallRejectsStaleClaim(t *testing.T) {
 	}
 }
 
+func TestExtendSemanticInferenceJobLeaseExtendsLiveClaim(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	seedPendingInferenceJob(t, st, "job-heartbeat", "sig:heartbeat", 3, nil, now)
+	claim, _, err := st.ClaimSemanticInferenceJob(context.Background(), "worker-a", now, time.Minute)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	later := now.Add(30 * time.Second)
+	if err := st.ExtendSemanticInferenceJobLease(context.Background(), claim.JobID, claim.Owner, claim.Token, later, time.Minute); err != nil {
+		t.Fatalf("ExtendSemanticInferenceJobLease: %v", err)
+	}
+	var leaseExpiresAt string
+	if err := st.db.QueryRowContext(context.Background(), `
+		SELECT lease_expires_at FROM semantic_profile_inference_jobs WHERE id = ?`, claim.JobID).Scan(&leaseExpiresAt); err != nil {
+		t.Fatalf("read lease: %v", err)
+	}
+	if leaseExpiresAt != canonicalTime(later.Add(time.Minute)) {
+		t.Fatalf("lease_expires_at = %q, want %q", leaseExpiresAt, canonicalTime(later.Add(time.Minute)))
+	}
+}
+
+func TestExtendSemanticInferenceJobLeaseRejectsStaleClaim(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	seedPendingInferenceJob(t, st, "job-heartbeat-stale", "sig:heartbeat-stale", 3, nil, now)
+	claim, _, err := st.ClaimSemanticInferenceJob(context.Background(), "worker-a", now, time.Minute)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := st.ExtendSemanticInferenceJobLease(context.Background(), claim.JobID, claim.Owner, claim.Token+1, now, time.Minute); !errors.Is(err, profilemodel.ErrLeaseLost) {
+		t.Fatalf("wrong token: got %v, want ErrLeaseLost", err)
+	}
+}
+
 func TestCompleteSemanticInferenceAcceptedCreatesVersionAndHead(t *testing.T) {
 	st := newTestStore(t)
 	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
