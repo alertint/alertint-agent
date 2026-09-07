@@ -5,6 +5,9 @@ package connectors
 import (
 	"context"
 	"encoding/json"
+	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,5 +102,56 @@ func TestSentryExecutorUnresolvedWithoutMapping(t *testing.T) {
 	}
 	if run.Status != "vocabulary_unresolved" {
 		t.Fatalf("status = %q, want vocabulary_unresolved", run.Status)
+	}
+}
+
+// TestSentryExecutorOversizedResponseIsTruncatedWithoutData proves the
+// transport's ErrResponseTooLarge (F10) maps to a truncated, incomplete,
+// response_too_large run with no facts and a response_too_large outcome.
+func TestSentryExecutorOversizedResponseIsTruncatedWithoutData(t *testing.T) {
+	client := &fakeSentryClient{err: sentry.ErrResponseTooLarge}
+	e := &SentryExecutor{Client: client, ProjectEnv: mappedProjectEnv("checkout", "prod")}
+	rec := &capturingRecorder{}
+
+	run, err := e.Execute(context.Background(), testStorePlan(), rec)
+	if err != nil {
+		t.Fatalf("an over-limit response is a limitation, not an execution error: %v", err)
+	}
+	if got := rec.codes(); len(got) != 1 || got[0] != "response_too_large" {
+		t.Fatalf("outcome codes = %v, want [response_too_large]", got)
+	}
+	if run.Status != model.ResultTruncated || run.Coverage.Complete || len(run.Facts) != 0 {
+		t.Fatalf("run = %+v, want truncated/incomplete with no facts", run)
+	}
+	if len(run.LimitationCodes) != 1 || run.LimitationCodes[0] != "response_too_large" {
+		t.Fatalf("limitation codes = %v", run.LimitationCodes)
+	}
+}
+
+// TestSentryExecutorCapsFactBytes proves the error_issue fact never exceeds
+// model.MaxFactBytes: issues past the cap are dropped deterministically and
+// the run says so.
+func TestSentryExecutorCapsFactBytes(t *testing.T) {
+	issues := make([]sentry.Issue, 40)
+	for i := range issues {
+		issues[i] = sentry.Issue{ID: strconv.Itoa(1000 + i), Culprit: strings.Repeat("c", 800), Level: "error"}
+	}
+	client := &fakeSentryClient{page: sentry.IssuePage{Issues: issues}}
+	e := &SentryExecutor{Client: client, ProjectEnv: mappedProjectEnv("payments", "staging")}
+	plan := testStorePlan()
+	plan.Limit = 50
+
+	run, err := e.Execute(context.Background(), plan, &noopRecorder{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(run.Facts) != 1 || len(run.Facts[0].Value) > model.MaxFactBytes {
+		t.Fatalf("fact value = %d bytes, must never exceed %d", len(run.Facts[0].Value), model.MaxFactBytes)
+	}
+	if !slices.Contains(run.LimitationCodes, "fact_bytes_capped") || run.Coverage.Complete || run.Status != model.ResultTruncated {
+		t.Fatalf("run = status %q complete=%v codes=%v, want truncated/fact_bytes_capped", run.Status, run.Coverage.Complete, run.LimitationCodes)
+	}
+	if run.Coverage.Returned+run.Coverage.Omitted != 40 || run.Coverage.Omitted < 1 {
+		t.Fatalf("coverage returned=%d omitted=%d, want a sum of 40 with omitted >= 1", run.Coverage.Returned, run.Coverage.Omitted)
 	}
 }

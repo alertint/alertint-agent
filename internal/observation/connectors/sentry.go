@@ -5,7 +5,6 @@ package connectors
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 
@@ -58,46 +57,24 @@ func (e *SentryExecutor) Execute(ctx context.Context, plan model.Plan, recorder 
 		return unresolvedRun(plan, now), nil
 	}
 
-	var lastReservationID string
-	var budgetExhausted bool
-	before := func() error {
-		r, err := recorder.BeforeRequest(ctx)
-		if err != nil {
-			if errors.Is(err, model.ErrBudgetExhausted) {
-				budgetExhausted = true
-			}
-			return err
-		}
-		lastReservationID = r.ID
-		return nil
-	}
-	after := func(started bool, callErr error) {
-		code := "ok"
-		s := model.RequestStartedTrue
-		if callErr != nil {
-			code = "transport_failure"
-		}
-		if !started {
-			s = model.RequestStartedFalse
-		}
-		_ = recorder.AfterRequest(ctx, model.RequestOutcome{
-			ReservationID: lastReservationID, RequestStarted: s, Code: code, CompletedAt: e.clock(),
-		})
-	}
-
+	before, after, budgetExhausted := requestHooks(ctx, recorder, e.clock)
 	limit := plan.Limit
 	if limit <= 0 {
 		limit = defaultMaxSentryIssues
 	}
+	expiresAt := now.Add(model.MaxWindowDaysHistory * 24 * time.Hour)
 	page, err := e.Client.ListIssuesBounded(ctx, project, env, plan.Start, plan.End, "", limit, before, after)
 	if err != nil {
-		if budgetExhausted {
+		if *budgetExhausted {
 			return withheldRun(plan, now), nil
+		}
+		if isResponseTooLarge(err) {
+			return responseTooLargeRun(plan, now, expiresAt), nil
 		}
 		return model.Run{}, fmt.Errorf("connectors: sentry list issues: %w", err)
 	}
 
-	summary := sentryIssuesSummary{Project: project, Environment: env, HasMore: page.HasMore}
+	issues := make([]sentryIssueSummary, 0, len(page.Issues))
 	for _, issue := range page.Issues {
 		s := sentryIssueSummary{
 			ID: issue.ID, ExceptionType: issue.Metadata.Type, Culprit: issue.Culprit, Level: issue.Level,
@@ -107,41 +84,23 @@ func (e *SentryExecutor) Execute(ctx context.Context, plan model.Plan, recorder 
 		if e.IncludeMessage {
 			s.ExceptionMessage = issue.Metadata.Value
 		}
-		summary.Issues = append(summary.Issues, s)
+		issues = append(issues, s)
 	}
 
-	status := model.ResultConfirmedEmpty
-	if len(summary.Issues) > 0 {
-		status = model.ResultConfirmedValue
-	}
-	if page.HasMore {
-		status = model.ResultTruncated
-	}
-
-	value, err := json.Marshal(summary)
+	value, kept, err := fitFactValue(len(issues), func(n int) ([]byte, error) {
+		return json.Marshal(sentryIssuesSummary{Project: project, Environment: env, HasMore: page.HasMore, Issues: issues[:n]})
+	})
 	if err != nil {
 		return model.Run{}, fmt.Errorf("connectors: marshal sentry issues summary: %w", err)
 	}
-	expiresAt := now.Add(model.MaxWindowDaysHistory * 24 * time.Hour)
-	fact := model.Fact{
-		ID: factID(plan.ID, "error_issue", value), RunID: "run:" + plan.ID,
-		Kind: "error_issue", Subject: plan.Scope.SubjectID, Digest: digestOf(value),
-		SchemaVersion: model.FactSchemaVersion, Value: value,
-		ResultStatus: status, Freshness: model.FreshnessFresh,
-		ObservedAt: now, ExpiresAt: expiresAt, Material: true,
-	}
-
-	var limitationCodes []string
+	omitted := len(issues) - kept
 	if page.HasMore {
-		limitationCodes = []string{"truncated"}
+		omitted++ // the source reports at least one further page
 	}
-	return model.Run{
-		ID: "run:" + plan.ID, CycleID: plan.CycleID, PlanID: plan.ID, Status: status,
-		Coverage:        model.Coverage{Start: plan.Start, End: plan.End, Complete: !page.HasMore, Returned: len(summary.Issues)},
-		Facts:           []model.Fact{fact},
-		LimitationCodes: limitationCodes,
-		ObservedAt:      now, ExpiresAt: expiresAt,
-	}, nil
+	return boundedRun(plan, now, boundedResult{
+		Kind: "error_issue", Value: value, Returned: kept, Omitted: omitted,
+		Truncated: page.HasMore, Capped: kept < len(issues), ExpiresAt: expiresAt,
+	}), nil
 }
 
 type sentryIssueSummary struct {

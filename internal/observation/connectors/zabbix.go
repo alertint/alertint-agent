@@ -69,11 +69,12 @@ func (e *ZabbixMetricExecutor) Execute(ctx context.Context, plan model.Plan, rec
 		return unresolvedRun(plan, now), nil
 	}
 
-	before, after, budgetExhausted := zabbixHooks(ctx, recorder, e.clock)
+	before, after, budgetExhausted := requestHooks(ctx, recorder, e.clock)
 	limit := plan.Limit
 	if limit <= 0 {
 		limit = 100
 	}
+	expiresAt := now.Add(model.MaxWindowHoursMetricsLogs * time.Hour)
 	series, err := e.Client.MetricHistoryBounded(ctx, host, params.ItemKey, plan.Start, plan.End, limit, before, after)
 	if err != nil {
 		if *budgetExhausted {
@@ -82,31 +83,25 @@ func (e *ZabbixMetricExecutor) Execute(ctx context.Context, plan model.Plan, rec
 		if errors.Is(err, zabbix.ErrNotFound) {
 			return unresolvedRun(plan, now), nil
 		}
+		if isResponseTooLarge(err) {
+			return responseTooLargeRun(plan, now, expiresAt), nil
+		}
 		return model.Run{}, fmt.Errorf("connectors: zabbix metric history: %w", err)
 	}
 
-	status := model.ResultConfirmedEmpty
-	if len(series.Points) > 0 {
-		status = model.ResultConfirmedValue
-	}
-	value, err := json.Marshal(series)
+	points := series.Points
+	value, kept, err := fitFactValue(len(points), func(n int) ([]byte, error) {
+		bounded := series
+		bounded.Points = points[:n]
+		return json.Marshal(bounded)
+	})
 	if err != nil {
 		return model.Run{}, fmt.Errorf("connectors: marshal zabbix series: %w", err)
 	}
-	expiresAt := now.Add(model.MaxWindowHoursMetricsLogs * time.Hour)
-	fact := model.Fact{
-		ID: factID(plan.ID, "metric_summary", value), RunID: "run:" + plan.ID,
-		Kind: "metric_summary", Subject: plan.Scope.SubjectID, Digest: digestOf(value),
-		SchemaVersion: model.FactSchemaVersion, Value: value,
-		ResultStatus: status, Freshness: model.FreshnessFresh,
-		ObservedAt: now, ExpiresAt: expiresAt, Material: true,
-	}
-	return model.Run{
-		ID: "run:" + plan.ID, CycleID: plan.CycleID, PlanID: plan.ID, Status: status,
-		Coverage:   model.Coverage{Start: plan.Start, End: plan.End, Complete: true, Returned: len(series.Points)},
-		Facts:      []model.Fact{fact},
-		ObservedAt: now, ExpiresAt: expiresAt,
-	}, nil
+	return boundedRun(plan, now, boundedResult{
+		Kind: "metric_summary", Value: value, Returned: kept, Omitted: len(points) - kept,
+		Capped: kept < len(points), ExpiresAt: expiresAt,
+	}), nil
 }
 
 // zabbixProblemParameters is zabbix_problem_history's own typed
@@ -147,88 +142,51 @@ func (e *ZabbixProblemExecutor) Execute(ctx context.Context, plan model.Plan, re
 		return unresolvedRun(plan, now), nil
 	}
 
-	before, after, budgetExhausted := zabbixHooks(ctx, recorder, e.clock)
+	before, after, budgetExhausted := requestHooks(ctx, recorder, e.clock)
 	limit := plan.Limit
 	if limit <= 0 {
 		limit = 20
 	}
+	expiresAt := now.Add(model.MaxWindowDaysHistory * 24 * time.Hour)
 	result, err := e.Client.ProblemHistory(ctx, host, params.TriggerID, plan.Start, plan.End, params.SeverityMin, limit, before, after)
 	if err != nil {
 		if *budgetExhausted {
 			return withheldRun(plan, now), nil
 		}
+		if isResponseTooLarge(err) {
+			return responseTooLargeRun(plan, now, expiresAt), nil
+		}
 		return model.Run{}, fmt.Errorf("connectors: zabbix problem history: %w", err)
 	}
 
-	status := model.ResultConfirmedEmpty
-	if len(result.Episodes) > 0 {
-		status = model.ResultConfirmedValue
-	}
-	if result.Truncated {
-		status = model.ResultTruncated
-	}
-
-	value, err := json.Marshal(result.Episodes)
+	episodes := result.Episodes
+	value, kept, err := fitFactValue(len(episodes), func(n int) ([]byte, error) {
+		return json.Marshal(episodes[:n])
+	})
 	if err != nil {
 		return model.Run{}, fmt.Errorf("connectors: marshal zabbix episodes: %w", err)
 	}
-	expiresAt := now.Add(model.MaxWindowDaysHistory * 24 * time.Hour)
-	fact := model.Fact{
-		ID: factID(plan.ID, "problem_episode", value), RunID: "run:" + plan.ID,
-		Kind: "problem_episode", Subject: plan.Scope.SubjectID, Digest: digestOf(value),
-		SchemaVersion: model.FactSchemaVersion, Value: value,
-		ResultStatus: status, Freshness: model.FreshnessFresh,
-		ObservedAt: now, ExpiresAt: expiresAt, Material: true,
-	}
-
-	var limitationCodes []string
+	omitted := len(episodes) - kept
 	if result.Truncated {
-		limitationCodes = append(limitationCodes, "truncated")
+		omitted++ // the overflow sentinel row: at least one more episode exists
 	}
+	var extra []string
 	if result.UnresolvedRecoveryCount > 0 {
-		limitationCodes = append(limitationCodes, "recovery_unknown")
+		extra = append(extra, limitationRecoveryUnknown)
 	}
-	return model.Run{
-		ID: "run:" + plan.ID, CycleID: plan.CycleID, PlanID: plan.ID, Status: status,
-		Coverage:        model.Coverage{Start: plan.Start, End: plan.End, Complete: result.Complete, Returned: len(result.Episodes)},
-		Facts:           []model.Fact{fact},
-		LimitationCodes: limitationCodes,
-		ObservedAt:      now, ExpiresAt: expiresAt,
-	}, nil
+	return boundedRun(plan, now, boundedResult{
+		Kind: "problem_episode", Value: value, Returned: kept, Omitted: omitted,
+		Truncated: result.Truncated || !result.Complete, Capped: kept < len(episodes),
+		ExtraLimitations: extra, ExpiresAt: expiresAt,
+	}), nil
 }
 
-// zabbixHooks builds a before/after pair bridging observation.RequestRecorder
-// into the zabbix client's own before()/after(started, err) instrumentation
-// shape, shared by both Zabbix executors. The returned bool pointer is set
-// true if any BeforeRequest call fails with model.ErrBudgetExhausted, so
-// the caller can distinguish "withheld by budget" from a real transport
-// failure after the client call returns.
+// limitationRecoveryUnknown marks a problem-history run in which at least
+// one resolved episode's recovery clock could not be confirmed.
+const limitationRecoveryUnknown = "recovery_unknown"
+
+// zabbixHooks is requestHooks under its original Zabbix-specific name,
+// kept for the existing hook tests.
 func zabbixHooks(ctx context.Context, recorder observation.RequestRecorder, clock func() time.Time) (func() error, func(started bool, err error), *bool) {
-	var lastReservationID string
-	budgetExhausted := new(bool)
-	before := func() error {
-		r, err := recorder.BeforeRequest(ctx)
-		if err != nil {
-			if errors.Is(err, model.ErrBudgetExhausted) {
-				*budgetExhausted = true
-			}
-			return err
-		}
-		lastReservationID = r.ID
-		return nil
-	}
-	after := func(started bool, callErr error) {
-		code := "ok"
-		s := model.RequestStartedTrue
-		if callErr != nil {
-			code = "transport_failure"
-		}
-		if !started {
-			s = model.RequestStartedFalse
-		}
-		_ = recorder.AfterRequest(ctx, model.RequestOutcome{
-			ReservationID: lastReservationID, RequestStarted: s, Code: code, CompletedAt: clock(),
-		})
-	}
-	return before, after, budgetExhausted
+	return requestHooks(ctx, recorder, clock)
 }

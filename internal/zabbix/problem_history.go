@@ -77,7 +77,7 @@ func (c *Client) ProblemHistory(ctx context.Context, host, triggerID string, sta
 		CauseEventID string `json:"cause_eventid"`
 		Tags         []KV   `json:"tags"`
 	}
-	if err := c.callInstrumented(ctx, "event.get", params, true, &rows, before, after); err != nil {
+	if err := c.callInstrumented(ctx, "event.get", params, &rows, before, after); err != nil {
 		return ProblemHistoryResult{}, err
 	}
 
@@ -100,7 +100,7 @@ func (c *Client) ProblemHistory(ctx context.Context, host, triggerID string, sta
 		}
 		if err := c.callInstrumented(ctx, "event.get", map[string]any{
 			"output": []string{"eventid", "clock"}, "eventids": recoveryIDs,
-		}, true, &recRows, before, after); err == nil {
+		}, &recRows, before, after); err == nil {
 			for _, rr := range recRows {
 				recoveryClocks[rr.EventID] = unixStr(rr.Clock)
 			}
@@ -163,7 +163,7 @@ func (c *Client) EventLifecycle(ctx context.Context, eventID string,
 	}
 	if err := c.callInstrumented(ctx, "event.get", map[string]any{
 		"output": []string{"eventid", "clock", "r_eventid"}, "eventids": []string{eventID},
-	}, true, &rows, before, after); err != nil {
+	}, &rows, before, after); err != nil {
 		return EventLifecycleResult{}, err
 	}
 	if len(rows) == 0 {
@@ -182,7 +182,7 @@ func (c *Client) EventLifecycle(ctx context.Context, eventID string,
 	}
 	if err := c.callInstrumented(ctx, "event.get", map[string]any{
 		"output": []string{"clock"}, "eventids": []string{r.REventID},
-	}, true, &recRows, before, after); err == nil && len(recRows) > 0 {
+	}, &recRows, before, after); err == nil && len(recRows) > 0 {
 		t := unixStr(recRows[0].Clock)
 		result.Recovery = &t
 	} else {

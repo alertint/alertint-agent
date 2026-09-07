@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,7 +28,14 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/logs"
+	model "github.com/alertint/alertint-agent/internal/observation/model"
 )
+
+// ErrResponseTooLarge is returned by the bounded (proactive preparation)
+// request path when the DECODED response body exceeds
+// model.MaxDecodedResponseBytes. The excess is never read into memory.
+// Callers classify it with errors.Is.
+var ErrResponseTooLarge = errors.New("loki: response exceeds the bounded decoded-body limit")
 
 // Client is a read-only Loki HTTP API v1 client implementing logs.Source.
 type Client struct {
@@ -143,7 +151,7 @@ func (c *Client) FetchRecentBounded(ctx context.Context, sel logs.Selector, star
 	if err := before(); err != nil {
 		return logs.Fetched{Query: query}, err
 	}
-	lines, err := c.queryRangeLines(ctx, query, start, end, limit)
+	lines, err := c.queryRangeLinesBounded(ctx, query, start, end, limit)
 	after(true, err)
 	if err != nil {
 		return logs.Fetched{Query: query}, err
@@ -155,7 +163,7 @@ func (c *Client) FetchRecentBounded(ctx context.Context, sel logs.Selector, star
 	if err := before(); err != nil {
 		return logs.Fetched{Query: matcher}, err
 	}
-	fbLines, err := c.queryRangeLines(ctx, matcher, start, end, limit)
+	fbLines, err := c.queryRangeLinesBounded(ctx, matcher, start, end, limit)
 	after(true, err)
 	if err != nil {
 		return logs.Fetched{Query: matcher}, err
@@ -184,6 +192,17 @@ func (c *Client) QueryRange(ctx context.Context, query string, start, end time.T
 // queryRangeLines runs a backward range query and decodes the streams result
 // into a single newest-first slice of lines.
 func (c *Client) queryRangeLines(ctx context.Context, query string, start, end time.Time, limit int) ([]logs.Line, error) {
+	return c.queryRangeLinesWith(ctx, query, start, end, limit, false)
+}
+
+// queryRangeLinesBounded is queryRangeLines over the bounded transport
+// path (decoded body capped at model.MaxDecodedResponseBytes) — the
+// proactive preparation path only.
+func (c *Client) queryRangeLinesBounded(ctx context.Context, query string, start, end time.Time, limit int) ([]logs.Line, error) {
+	return c.queryRangeLinesWith(ctx, query, start, end, limit, true)
+}
+
+func (c *Client) queryRangeLinesWith(ctx context.Context, query string, start, end time.Time, limit int, bounded bool) ([]logs.Line, error) {
 	params := url.Values{
 		"query":     {query},
 		"start":     {start.UTC().Format(time.RFC3339Nano)},
@@ -193,7 +212,7 @@ func (c *Client) queryRangeLines(ctx context.Context, query string, start, end t
 	if limit > 0 {
 		params.Set("limit", strconv.Itoa(limit))
 	}
-	data, err := c.apiGet(ctx, "/loki/api/v1/query_range", params)
+	data, err := c.doAPIGet(ctx, "/loki/api/v1/query_range", params, bounded)
 	if err != nil {
 		return nil, err
 	}
@@ -279,8 +298,17 @@ func dedupeSorted(in []string) []string {
 }
 
 // apiGet issues a GET to path?params, sets auth and tenancy headers, unwraps the
-// Loki envelope, and returns the raw data JSON on success.
+// Loki envelope, and returns the raw data JSON on success. This is the
+// legacy (MCP passthrough / Acute Triage) path: its body read is unbounded
+// and its redirect policy is http.Client's default.
 func (c *Client) apiGet(ctx context.Context, path string, params url.Values) (json.RawMessage, error) {
+	return c.doAPIGet(ctx, path, params, false)
+}
+
+// doAPIGet is apiGet's shared body. bounded selects the proactive
+// preparation path: the decoded body is capped at
+// model.MaxDecodedResponseBytes (ErrResponseTooLarge past it).
+func (c *Client) doAPIGet(ctx context.Context, path string, params url.Values, bounded bool) (json.RawMessage, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path+"?"+params.Encode(), nil)
 	if err != nil {
 		return nil, err
@@ -300,8 +328,16 @@ func (c *Client) apiGet(ctx context.Context, path string, params url.Values) (js
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
+	var body []byte
+	if bounded {
+		body, err = readBounded(resp.Body, model.MaxDecodedResponseBytes)
+	} else {
+		body, err = io.ReadAll(resp.Body)
+	}
 	if err != nil {
+		if errors.Is(err, ErrResponseTooLarge) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("loki: read response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -319,6 +355,23 @@ func (c *Client) apiGet(ctx context.Context, path string, params url.Values) (js
 		return nil, fmt.Errorf("loki: query status %q", envelope.Status)
 	}
 	return envelope.Data, nil
+}
+
+// readBounded reads at most limit bytes of the (already transport-decoded)
+// body, reading limit+1 through an io.LimitReader so an over-limit body is
+// detected without buffering the remainder (ErrResponseTooLarge). Go's
+// http.Transport transparently gunzips a body it negotiated itself (the
+// client never sets Accept-Encoding), so the cap applies to the DECODED
+// stream, never the compressed wire size.
+func readBounded(r io.Reader, limit int64) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, ErrResponseTooLarge
+	}
+	return body, nil
 }
 
 // parseStreams decodes a Loki "streams" result and flattens every stream's

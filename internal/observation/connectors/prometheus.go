@@ -60,17 +60,16 @@ func (e *PrometheusExecutor) Execute(ctx context.Context, plan model.Plan, recor
 	}
 	raw, execErr := e.Client.QueryRangeBounded(ctx, expr, plan.Start, plan.End, 0, limit+1)
 
-	started := model.RequestStartedTrue
-	code := "ok"
-	if execErr != nil {
-		code = "transport_failure"
-	}
 	if outcomeErr := recorder.AfterRequest(ctx, model.RequestOutcome{
-		ReservationID: reservation.ID, RequestStarted: started, Code: code, CompletedAt: e.clock(),
+		ReservationID: reservation.ID, RequestStarted: model.RequestStartedTrue, Code: outcomeCode(execErr), CompletedAt: e.clock(),
 	}); outcomeErr != nil {
 		return model.Run{}, fmt.Errorf("connectors: record prometheus outcome: %w", outcomeErr)
 	}
+	expiresAt := now.Add(model.MaxWindowHoursMetricsLogs * time.Hour)
 	if execErr != nil {
+		if isResponseTooLarge(execErr) {
+			return responseTooLargeRun(plan, now, expiresAt), nil
+		}
 		return model.Run{}, fmt.Errorf("connectors: prometheus query: %w", execErr)
 	}
 
@@ -79,38 +78,20 @@ func (e *PrometheusExecutor) Execute(ctx context.Context, plan model.Plan, recor
 		return model.Run{}, fmt.Errorf("connectors: parse prometheus response: %w", err)
 	}
 
-	status := model.ResultConfirmedEmpty
-	if len(summary.Series) > 0 {
-		status = model.ResultConfirmedValue
-	}
-	if truncated {
-		status = model.ResultTruncated
-	}
-
-	value, err := json.Marshal(summary)
+	value, kept, err := fitFactValue(len(summary.Series), func(n int) ([]byte, error) {
+		return json.Marshal(metricSummary{Series: summary.Series[:n]})
+	})
 	if err != nil {
 		return model.Run{}, fmt.Errorf("connectors: marshal metric summary: %w", err)
 	}
-	expiresAt := now.Add(model.MaxWindowHoursMetricsLogs * time.Hour)
-	fact := model.Fact{
-		ID: factID(plan.ID, "metric_summary", value), RunID: "run:" + plan.ID,
-		Kind: "metric_summary", Subject: plan.Scope.SubjectID, Digest: digestOf(value),
-		SchemaVersion: model.FactSchemaVersion, Value: value,
-		ResultStatus: status, Freshness: model.FreshnessFresh,
-		ObservedAt: now, ExpiresAt: expiresAt, Material: true,
-	}
-
-	var limitationCodes []string
+	omitted := len(summary.Series) - kept
 	if truncated {
-		limitationCodes = []string{"truncated"}
+		omitted++ // the overflow sentinel series: at least one more exists
 	}
-	return model.Run{
-		ID: "run:" + plan.ID, CycleID: plan.CycleID, PlanID: plan.ID, Status: status,
-		Coverage:        model.Coverage{Start: plan.Start, End: plan.End, Complete: !truncated, Returned: len(summary.Series), Omitted: 0},
-		Facts:           []model.Fact{fact},
-		LimitationCodes: limitationCodes,
-		ObservedAt:      now, ExpiresAt: expiresAt,
-	}, nil
+	return boundedRun(plan, now, boundedResult{
+		Kind: "metric_summary", Value: value, Returned: kept, Omitted: omitted,
+		Truncated: truncated, Capped: kept < len(summary.Series), ExpiresAt: expiresAt,
+	}), nil
 }
 
 func withheldRun(plan model.Plan, now time.Time) model.Run {

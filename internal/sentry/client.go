@@ -15,6 +15,7 @@ package sentry
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,6 +24,14 @@ import (
 	"strings"
 	"time"
 )
+
+// ErrResponseTooLarge is returned by the bounded (proactive preparation)
+// request path when the DECODED response body exceeds
+// observation/model.MaxDecodedResponseBytes — a much tighter cap than the legacy
+// maxRespBody below, because one reserved preparation request must never
+// allocate more than the fixed versioned limit. The excess is never read
+// into memory. Callers classify it with errors.Is.
+var ErrResponseTooLarge = errors.New("sentry: response exceeds the bounded decoded-body limit")
 
 // defaultTimeout matches the Prometheus/Loki clients.
 const defaultTimeout = 10 * time.Second
@@ -351,6 +360,23 @@ func linkAttr(seg, name string) string {
 		return ""
 	}
 	return rest[:j]
+}
+
+// readBounded reads at most limit bytes of the (already transport-decoded)
+// body, reading limit+1 through an io.LimitReader so an over-limit body is
+// detected without buffering the remainder (ErrResponseTooLarge). Go's
+// http.Transport transparently gunzips a body it negotiated itself (the
+// client never sets Accept-Encoding), so the cap applies to the DECODED
+// stream, never the compressed wire size.
+func readBounded(r io.Reader, limit int64) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, ErrResponseTooLarge
+	}
+	return body, nil
 }
 
 // snippet returns a short single-line excerpt of a response body for errors.

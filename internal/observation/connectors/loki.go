@@ -5,7 +5,6 @@ package connectors
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 
@@ -52,43 +51,19 @@ func (e *LokiExecutor) Execute(ctx context.Context, plan model.Plan, recorder ob
 		return unresolvedRun(plan, now), nil
 	}
 
-	var lastReservationID string
-	var budgetExhausted bool
-	requestCount := 0
-	before := func() error {
-		r, err := recorder.BeforeRequest(ctx)
-		if err != nil {
-			if errors.Is(err, model.ErrBudgetExhausted) {
-				budgetExhausted = true
-			}
-			return err
-		}
-		lastReservationID = r.ID
-		requestCount++
-		return nil
-	}
-	after := func(started bool, callErr error) {
-		code := "ok"
-		s := model.RequestStartedTrue
-		if callErr != nil {
-			code = "transport_failure"
-		}
-		if !started {
-			s = model.RequestStartedFalse
-		}
-		_ = recorder.AfterRequest(ctx, model.RequestOutcome{
-			ReservationID: lastReservationID, RequestStarted: s, Code: code, CompletedAt: e.clock(),
-		})
-	}
-
+	before, after, budgetExhausted := requestHooks(ctx, recorder, e.clock)
 	limit := plan.Limit
 	if limit <= 0 {
 		limit = 100
 	}
+	expiresAt := now.Add(model.MaxWindowHoursMetricsLogs * time.Hour)
 	fetched, err := e.Client.FetchRecentBounded(ctx, sel, plan.Start, plan.End, limit, before, after)
 	if err != nil {
-		if budgetExhausted {
+		if *budgetExhausted {
 			return withheldRun(plan, now), nil
+		}
+		if isResponseTooLarge(err) {
+			return responseTooLargeRun(plan, now, expiresAt), nil
 		}
 		return model.Run{}, fmt.Errorf("connectors: loki fetch: %w", err)
 	}
@@ -98,44 +73,26 @@ func (e *LokiExecutor) Execute(ctx context.Context, plan model.Plan, recorder ob
 		return unresolvedRun(plan, now), nil
 	}
 
-	summary := lokiSummary{Query: fetched.Query, LineCount: len(fetched.Lines)}
-	sampleN := len(fetched.Lines)
-	if sampleN > maxLokiSampleLines {
-		sampleN = maxLokiSampleLines
-	}
-	for i := 0; i < sampleN; i++ {
+	samples := make([]lokiSample, 0, min(len(fetched.Lines), maxLokiSampleLines))
+	for i := 0; i < len(fetched.Lines) && i < maxLokiSampleLines; i++ {
 		line := fetched.Lines[i]
 		text := line.Line
 		if len(text) > maxLokiSampleLineChars {
 			text = text[:maxLokiSampleLineChars]
 		}
-		summary.Samples = append(summary.Samples, lokiSample{Timestamp: line.Timestamp, Line: text})
+		samples = append(samples, lokiSample{Timestamp: line.Timestamp, Line: text})
 	}
 
-	status := model.ResultConfirmedEmpty
-	if len(fetched.Lines) > 0 {
-		status = model.ResultConfirmedValue
-	}
-
-	value, err := json.Marshal(summary)
+	value, kept, err := fitFactValue(len(samples), func(n int) ([]byte, error) {
+		return json.Marshal(lokiSummary{Query: fetched.Query, LineCount: len(fetched.Lines), Samples: samples[:n]})
+	})
 	if err != nil {
 		return model.Run{}, fmt.Errorf("connectors: marshal loki summary: %w", err)
 	}
-	expiresAt := now.Add(model.MaxWindowHoursMetricsLogs * time.Hour)
-	fact := model.Fact{
-		ID: factID(plan.ID, "log_summary", value), RunID: "run:" + plan.ID,
-		Kind: "log_summary", Subject: plan.Scope.SubjectID, Digest: digestOf(value),
-		SchemaVersion: model.FactSchemaVersion, Value: value,
-		ResultStatus: status, Freshness: model.FreshnessFresh,
-		ObservedAt: now, ExpiresAt: expiresAt, Material: true,
-	}
-
-	return model.Run{
-		ID: "run:" + plan.ID, CycleID: plan.CycleID, PlanID: plan.ID, Status: status,
-		Coverage:   model.Coverage{Start: plan.Start, End: plan.End, Complete: true, Returned: len(fetched.Lines)},
-		Facts:      []model.Fact{fact},
-		ObservedAt: now, ExpiresAt: expiresAt,
-	}, nil
+	return boundedRun(plan, now, boundedResult{
+		Kind: "log_summary", Value: value, Returned: len(fetched.Lines), Omitted: len(samples) - kept,
+		Capped: kept < len(samples), ExpiresAt: expiresAt,
+	}), nil
 }
 
 func selectorFromScope(scope model.Scope) logs.Selector {
