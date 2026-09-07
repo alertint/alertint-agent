@@ -138,12 +138,12 @@ urgent anchor. Never present mere temporal overlap as a supported cause.`
 
 // promptLimitationCodes lists the limitation codes the schema instructions
 // offer the model: every capability limitation this build knows
-// (plan2UnsupportedCapabilities) — the same set knownLimitationCode accepts,
+// (reservedUnsupportedCapabilities) — the same set knownLimitationCode accepts,
 // minus semantic_assessment_unavailable, which is the controller's own
 // fallback marker and never a model claim.
 func promptLimitationCodes() []string {
-	codes := make([]string, 0, len(plan2UnsupportedCapabilities))
-	for _, l := range plan2UnsupportedCapabilities {
+	codes := make([]string, 0, len(reservedUnsupportedCapabilities))
+	for _, l := range reservedUnsupportedCapabilities {
 		codes = append(codes, l.Code)
 	}
 	return codes

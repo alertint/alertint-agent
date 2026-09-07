@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
+	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
 	"github.com/alertint/alertint-agent/internal/situation"
 	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 )
@@ -1525,6 +1526,85 @@ func TestLoadReconciliationInputReadsControllerParkedState(t *testing.T) {
 	}
 	if snap.ControllerParked.At == nil || !snap.ControllerParked.At.Equal(now) {
 		t.Fatalf("parked at = %v, want %v", snap.ControllerParked.At, now)
+	}
+}
+
+// TestLoadReconciliationInputReadsPreparedState proves Plan 4 Task 6's
+// reload contract end to end: a durable preparation cycle (Task 2's own
+// BeginPreparation/CommitObservationRun) becomes SnapshotInput.Prepared —
+// Runs/Facts for MaterialFactHash, ProfileVersionIDs/Guidance frozen on the
+// cycle row, and the "source_lifecycle"-kind fact decoded into
+// []situation.SourceObservation for ReduceSourceLifecycle. It never trusts
+// an in-memory EvidencePreparer receipt — this IS the store's own read,
+// exactly like every other LoadReconciliationInput field.
+func TestLoadReconciliationInputReadsPreparedState(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 6, 17, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-prepared-read", now)
+	claim := claimSituation(t, st, sitID, "controller-prepared", now)
+	f := observationmodel.Fence{SituationID: sitID, InputVersion: claim.Situation.InputVersion,
+		Owner: claim.ClaimOwner, Token: claim.ClaimToken}
+
+	p := testPlan(now)
+	cycle, err := st.BeginPreparation(ctx, f, observationmodel.CycleDraft{
+		Anchor: now, ConfigDigest: "cfg-1", Plans: []observationmodel.Plan{p},
+		ProfileVersionIDs: []string{"profile-a@1"},
+		ProfileGuidance:   []observationmodel.ProfileGuidance{{SignatureKey: "sig-a", VersionID: "profile-a@1", HorizonTier: "extended"}},
+	}, 6)
+	if err != nil {
+		t.Fatalf("BeginPreparation: %v", err)
+	}
+	planID := cycle.Draft.Plans[0].ID
+
+	lifecycleValue, err := json.Marshal([]situation.SourceObservation{
+		{AlertID: "alert-A", EpisodeKey: "alert-A:1", Source: "zabbix", State: situation.SourceStateResolved,
+			ObservedAt: now, AcquisitionMode: "poll", PollIntervalSeconds: 60, DeadlineAt: now.Add(time.Hour)},
+	})
+	if err != nil {
+		t.Fatalf("marshal source observations: %v", err)
+	}
+	run := observationmodel.Run{
+		ID: "run:prepared-read:1", CycleID: cycle.ID, PlanID: planID,
+		Status:   observationmodel.ResultConfirmedValue,
+		Coverage: observationmodel.Coverage{Start: p.Start, End: p.End, Complete: true, Returned: 1},
+		Facts: []observationmodel.Fact{{
+			ID: "fact:prepared-read:1", RunID: "run:prepared-read:1", Kind: "source_lifecycle", Subject: "alert-A",
+			Digest: "d1", SchemaVersion: observationmodel.FactSchemaVersion, Value: lifecycleValue,
+			ResultStatus: observationmodel.ResultConfirmedValue, Freshness: observationmodel.FreshnessFresh,
+			ObservedAt: now, ExpiresAt: now.Add(24 * time.Hour), Material: true,
+		}},
+		ObservedAt: now, ExpiresAt: now.Add(24 * time.Hour),
+	}
+	if err := st.CommitObservationRun(ctx, f, run, now); err != nil {
+		t.Fatalf("CommitObservationRun: %v", err)
+	}
+
+	snap, err := st.LoadReconciliationInput(ctx, claim, now)
+	if err != nil {
+		t.Fatalf("LoadReconciliationInput: %v", err)
+	}
+	if snap.Prepared.CycleID != cycle.ID {
+		t.Fatalf("Prepared.CycleID = %q, want %q", snap.Prepared.CycleID, cycle.ID)
+	}
+	if snap.Prepared.Generation != cycle.Generation {
+		t.Fatalf("Prepared.Generation = %d, want %d", snap.Prepared.Generation, cycle.Generation)
+	}
+	if len(snap.Prepared.ProfileVersionIDs) != 1 || snap.Prepared.ProfileVersionIDs[0] != "profile-a@1" {
+		t.Fatalf("Prepared.ProfileVersionIDs = %v, want [profile-a@1]", snap.Prepared.ProfileVersionIDs)
+	}
+	if len(snap.Prepared.ProfileGuidance) != 1 || snap.Prepared.ProfileGuidance[0].VersionID != "profile-a@1" {
+		t.Fatalf("Prepared.ProfileGuidance = %+v, want one entry for profile-a@1", snap.Prepared.ProfileGuidance)
+	}
+	if len(snap.Prepared.Runs) != 1 || len(snap.Prepared.Runs[0].Facts) != 1 {
+		t.Fatalf("Prepared.Runs = %+v, want exactly one run carrying one fact", snap.Prepared.Runs)
+	}
+	if len(snap.Prepared.Lifecycle) != 1 {
+		t.Fatalf("Prepared.Lifecycle = %+v, want exactly one decoded SourceObservation", snap.Prepared.Lifecycle)
+	}
+	obs := snap.Prepared.Lifecycle[0]
+	if obs.AlertID != "alert-A" || obs.State != situation.SourceStateResolved || obs.AcquisitionMode != "poll" || obs.PollIntervalSeconds != 60 {
+		t.Fatalf("decoded SourceObservation = %+v, want alert-A resolved via a 60s poll", obs)
 	}
 }
 

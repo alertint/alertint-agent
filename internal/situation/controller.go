@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/alertint/alertint-agent/internal/llm"
+	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
@@ -473,13 +474,14 @@ func (c ControllerConfig) withDefaults() ControllerConfig {
 // Controller is the fenced Situation controller: one Reconcile call performs
 // exactly one claimed Situation's reconciliation cycle end to end.
 type Controller struct {
-	store  ControllerStore
-	client AssessmentClient
-	cfg    ControllerConfig
-	clock  Clock
-	audit  AuditSink
-	health AssessmentHealthObserver
-	logger *slog.Logger
+	store    ControllerStore
+	client   AssessmentClient
+	cfg      ControllerConfig
+	clock    Clock
+	audit    AuditSink
+	health   AssessmentHealthObserver
+	logger   *slog.Logger
+	preparer EvidencePreparer
 }
 
 // SetAssessmentHealthObserver wires the installation LLM-health observer
@@ -716,11 +718,46 @@ type lifecycleResolution struct {
 // with it or the pairing check fails closed. closed_unknown reached FROM
 // active (no recovery ever observed) correctly leaves both nil instead, since
 // neither was ever set on this Situation.
-func (c *Controller) resolveLifecycle(cur model.Situation, in SnapshotInput, snap Snapshot, now time.Time) lifecycleResolution {
-	firing := AnyFiring(snap.Symptoms)
-	resolved := anyDeliveryResolved(in.Deliveries)
-	deadline := ObservationDeadlineAt(cur.EffectiveStartedAt, snap.DurationClass)
-	pastDeadline := !now.Before(deadline)
+// resolveLifecycle derives this cycle's lifecycle transition. When a
+// preparation cycle is durably underway for this input (in.Prepared.CycleID
+// != "" — set only by the reload after a real EvidencePreparer ran,
+// preparation.go's own doc comment), sl (this SAME cycle's
+// ReduceSourceLifecycle fold, computed by the caller from
+// in.Prepared.Lifecycle) REPLACES the pre-Plan-4 local-only Delivery/Symptom
+// inference entirely (spec.md R13: source acquisition mode and interval,
+// never Delivery.StartedAtBasis alone). recoveryObserved marks "genuinely
+// have complete resolved evidence, begin the grace clock": in the prepared
+// world that is sl.AllResolved specifically, NOT sl.AnyResolved or the mere
+// existence of a cycle — a poll-provenance member that has simply not been
+// observed yet (no connector silence, no total preparation failure) must
+// never be mistaken for resolved (plan.md: "cannot... invent source state,
+// or remove a source failure"). A cycle whose lifecycle-phase evidence
+// turned up nothing at all (in.Prepared.CycleID != "" but sl is its zero
+// value) therefore safely falls through to the SAME "stay active" default
+// the pre-Plan-4 empty-Symptoms edge case already used, rather than reading
+// silence as recovery. In the local-only fallback (no cycle at all — every
+// pre-Task-6 fixture), recoveryObserved is len(snap.Symptoms) > 0, exactly
+// as before: this branch's behavior is byte-for-byte unchanged from
+// pre-Plan-4 Reconcile.
+func (c *Controller) resolveLifecycle(cur model.Situation, in SnapshotInput, snap Snapshot, sl SourceLifecycle, now time.Time) lifecycleResolution {
+	prepared := in.Prepared.CycleID != ""
+
+	var firing, resolved, pastDeadline, recoveryObserved bool
+	var graceDuration time.Duration
+	if prepared {
+		firing = sl.AnyFiring
+		resolved = sl.AnyResolved
+		pastDeadline = sl.ClosureDue
+		recoveryObserved = sl.AllResolved
+		graceDuration = sl.Grace
+	} else {
+		firing = AnyFiring(snap.Symptoms)
+		resolved = anyDeliveryResolved(in.Deliveries)
+		deadline := ObservationDeadlineAt(cur.EffectiveStartedAt, snap.DurationClass)
+		pastDeadline = !now.Before(deadline)
+		recoveryObserved = len(snap.Symptoms) > 0
+		graceDuration = RecoveryGraceDuration(in.Deliveries, c.cfg.WebhookRecoveryGrace, c.cfg.PollingIntervalSeconds)
+	}
 
 	switch cur.Lifecycle {
 	case model.LifecycleActive:
@@ -731,9 +768,9 @@ func (c *Controller) resolveLifecycle(cur model.Situation, in SnapshotInput, sna
 			reason := ClosedUnknownReason(cur.EffectiveStartedAtBasis, resolved)
 			lc, _ := AdvanceLifecycle(cur.Lifecycle, EventLifecycleUnobservable)
 			return lifecycleResolution{Lifecycle: lc, TerminalAt: timePtr(now), TerminalReason: terminalReasonPtr(reason)}
-		case len(snap.Symptoms) > 0:
+		case recoveryObserved:
 			lc, _ := AdvanceLifecycle(cur.Lifecycle, EventRecoveryObserved)
-			graceUntil := RecoveryGraceUntil(now, in.Deliveries, c.cfg.WebhookRecoveryGrace, c.cfg.PollingIntervalSeconds)
+			graceUntil := now.Add(graceDuration)
 			return lifecycleResolution{Lifecycle: lc, RecoveryObservedAt: timePtr(now), GraceUntil: timePtr(graceUntil)}
 		default:
 			return lifecycleResolution{Lifecycle: model.LifecycleActive}
@@ -767,6 +804,69 @@ func (c *Controller) resolveLifecycle(cur model.Situation, in SnapshotInput, sna
 		// value is handled explicitly above. Defensive fallback only.
 		return lifecycleResolution{Lifecycle: cur.Lifecycle, RecoveryObservedAt: cur.RecoveryObservedAt, GraceUntil: cur.GraceUntil, TerminalAt: cur.TerminalAt, TerminalReason: cur.TerminalReason}
 	}
+}
+
+// reduceSourceLifecycle folds in.Prepared.Lifecycle across in's expected
+// member Alerts, or returns the zero SourceLifecycle when no preparation
+// cycle exists yet for this input (in.Prepared.CycleID == "") —
+// resolveLifecycle's prepared branch only ever runs once a cycle exists, so
+// an unpopulated fold is never consulted in that case.
+func reduceSourceLifecycle(cfg ControllerConfig, in SnapshotInput, now time.Time) SourceLifecycle {
+	if in.Prepared.CycleID == "" {
+		return SourceLifecycle{}
+	}
+	return ReduceSourceLifecycle(in.Prepared.Lifecycle, expectedAlertIDs(in.Deliveries), now, cfg.WebhookRecoveryGrace)
+}
+
+// prepareLifecyclePhase runs the lifecycle-phase EvidencePreparer (plan.md's
+// control-flow contract: "if preparer configured and Situation nonterminal:
+// prepare lifecycle phase ... reload input for the selected cycle") and
+// returns the freshly reloaded input. A nil preparer, or an already-terminal
+// Situation, returns in unchanged — no prepare, no reload.
+func (c *Controller) prepareLifecyclePhase(ctx context.Context, claim Claim, in SnapshotInput, now time.Time) (SnapshotInput, error) {
+	if c.preparer == nil {
+		return in, nil
+	}
+	nonterminal := in.Situation.Lifecycle != model.LifecycleRecovered && in.Situation.Lifecycle != model.LifecycleClosedUnknown
+	if !nonterminal {
+		return in, nil
+	}
+	if _, err := c.preparer.Prepare(ctx, PreparationRequest{Claim: claim, Input: in, Phase: observationmodel.PhaseLifecycle, Now: now}); err != nil {
+		return SnapshotInput{}, fmt.Errorf("situation: controller reconcile: prepare lifecycle phase: %w", err)
+	}
+	reloaded, err := c.store.LoadReconciliationInput(ctx, claim, now)
+	if err != nil {
+		return SnapshotInput{}, fmt.Errorf("situation: controller reconcile: reload after lifecycle preparation: %w", err)
+	}
+	return reloaded, nil
+}
+
+// prepareAssessmentPhaseIfActive is the "if active" half of plan.md's
+// control-flow contract: sl (this cycle's already-reduced source lifecycle,
+// unchanged by the lifecycle-phase reload above) decides whether the
+// Situation would resolve active — resolveLifecycle's prepared branch never
+// reads snap, so calling it with the zero Snapshot{} here, before
+// BuildSnapshot has run, is safe. Only then does the assessment-phase
+// preparer run, followed by its own reload and re-reduction (assessment
+// preparation never touches lifecycle evidence, but the reload IS a fresh
+// coherent read, so sl must be recomputed against it rather than reused). A
+// nil preparer, or a non-active gate, returns in/sl unchanged.
+func (c *Controller) prepareAssessmentPhaseIfActive(ctx context.Context, claim Claim, in SnapshotInput, sl SourceLifecycle, now time.Time) (SnapshotInput, SourceLifecycle, error) {
+	if c.preparer == nil {
+		return in, sl, nil
+	}
+	gate := c.resolveLifecycle(in.Situation, in, Snapshot{}, sl, now)
+	if gate.Lifecycle != model.LifecycleActive {
+		return in, sl, nil
+	}
+	if _, err := c.preparer.Prepare(ctx, PreparationRequest{Claim: claim, Input: in, Phase: observationmodel.PhaseAssessment, Now: now}); err != nil {
+		return SnapshotInput{}, SourceLifecycle{}, fmt.Errorf("situation: controller reconcile: prepare assessment phase: %w", err)
+	}
+	reloaded, err := c.store.LoadReconciliationInput(ctx, claim, now)
+	if err != nil {
+		return SnapshotInput{}, SourceLifecycle{}, fmt.Errorf("situation: controller reconcile: reload after assessment preparation: %w", err)
+	}
+	return reloaded, reduceSourceLifecycle(c.cfg, reloaded, now), nil
 }
 
 // ----------------------------------------------------------------------
@@ -1582,6 +1682,22 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 		return fmt.Errorf("situation: controller reconcile: load: %w", err)
 	}
 
+	// Plan 4 Task 6: bounded evidence preparation, under this SAME attempt
+	// wall (ctx, already cancel-scoped to c.cfg.AttemptWall above) — plan.md's
+	// "attempt's child preparation wall." A nil preparer (every pre-Task-6
+	// fixture, and any build that has not wired cmd/alertint's production
+	// adapter yet) skips both phases below entirely: in.Prepared then stays
+	// whatever LoadReconciliationInput already read — its zero value for a
+	// nil preparer — so DeriveStoreFacts/BuildSnapshot/resolveLifecycle all
+	// take their pre-Plan-4 local-only path unchanged.
+	if in, err = c.prepareLifecyclePhase(ctx, claim, in, now); err != nil {
+		return err
+	}
+	sl := reduceSourceLifecycle(c.cfg, in, now)
+	if in, sl, err = c.prepareAssessmentPhaseIfActive(ctx, claim, in, sl, now); err != nil {
+		return err
+	}
+
 	// 2. Local fact derivation/append.
 	facts := DeriveStoreFacts(in)
 	if err := c.store.AppendSituationFacts(ctx, claim, facts); err != nil {
@@ -1595,7 +1711,7 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 	// derivation: DeriveAssessment reads state.Lifecycle == snap.Lifecycle,
 	// so a fresh transition this cycle discovers must already be reflected
 	// on snap before any derivation path runs.
-	lc := c.resolveLifecycle(in.Situation, in, snap, now)
+	lc := c.resolveLifecycle(in.Situation, in, snap, sl, now)
 	snap.Lifecycle = lc.Lifecycle
 
 	// 4. Pure Triage decisions.
@@ -1608,16 +1724,18 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 	basis := historyBasis{In: in, Snap: snap, Now: now}
 
 	base := ControllerCommit{
-		MaterialFactHash:    snap.MaterialFactHash,
-		AssessmentBasisHash: snap.AssessmentBasisHash,
-		EligibleReasons:     snap.EligibleReasons,
-		TriageDecisions:     triageDecisions,
-		Lifecycle:           lc.Lifecycle,
-		RecoveryObservedAt:  lc.RecoveryObservedAt,
-		GraceUntil:          lc.GraceUntil,
-		TerminalAt:          lc.TerminalAt,
-		TerminalReason:      lc.TerminalReason,
-		ConsumedDueReasons:  claim.Situation.DueReasons,
+		MaterialFactHash:      snap.MaterialFactHash,
+		AssessmentBasisHash:   snap.AssessmentBasisHash,
+		EligibleReasons:       snap.EligibleReasons,
+		TriageDecisions:       triageDecisions,
+		Lifecycle:             lc.Lifecycle,
+		RecoveryObservedAt:    lc.RecoveryObservedAt,
+		GraceUntil:            lc.GraceUntil,
+		TerminalAt:            lc.TerminalAt,
+		TerminalReason:        lc.TerminalReason,
+		ConsumedDueReasons:    claim.Situation.DueReasons,
+		PreparationCycleID:    in.Prepared.CycleID,
+		PreparationGeneration: in.Prepared.Generation,
 	}
 
 	// 5. Deterministic/reuse check — no L2 call, no work attempt consumed.

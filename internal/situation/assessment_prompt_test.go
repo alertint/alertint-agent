@@ -126,7 +126,7 @@ func TestAssessmentPromptStatesNestedShapesAndAllowedLimitationCodes(t *testing.
 			t.Fatalf("prompt does not state %q", want)
 		}
 	}
-	for _, l := range plan2UnsupportedCapabilities {
+	for _, l := range reservedUnsupportedCapabilities {
 		if !strings.Contains(p.Prefix, "  "+l.Code+"\n") {
 			t.Fatalf("prompt does not list allowed limitation code %q", l.Code)
 		}
@@ -162,7 +162,7 @@ func TestValidateAssessmentProposalRejectsLiveLabShapeAndAcceptsDocumentedShape(
 	documented := `{"schema_version":1,"persistence":"unknown","impact":"unknown","novelty":"insufficient_history",` +
 		`"causality":"unknown","attention":"observe",` +
 		`"sufficient_reason":{"code":"` + cand.Code + `","candidate_id":"` + cand.ID + `","summary":"Confirmed active critical source severity.","evidence_refs":[]},` +
-		`"limitations":[{"code":"` + plan2UnsupportedCapabilities[0].Code + `","detail":"No metric evidence in this build."}]}`
+		`"limitations":[{"code":"` + reservedUnsupportedCapabilities[0].Code + `","detail":"No metric evidence in this build."}]}`
 	vr = ValidateAssessmentProposal(json.RawMessage(documented), snap, call, now)
 	if vr.Outcome == ProposalOutcomeMalformed || vr.Outcome == ProposalOutcomeCapabilityRejected {
 		t.Fatalf("documented shape: outcome=%s errors=%v, want the shape and capability gates to pass", vr.Outcome, vr.Errors)

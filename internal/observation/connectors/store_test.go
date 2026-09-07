@@ -92,6 +92,30 @@ func TestStoreReadExecutorConfirmedValueWithFacts(t *testing.T) {
 	}
 }
 
+// TestStoreReadExecutorPriorSituationFactUsesCapabilityResultKind guards
+// against a naming collision with migration 0022's DEDICATED
+// "source_lifecycle" fact kind (Plan 4 Task 6: per-Alert firing/resolved
+// SourceObservation evidence a lifecycle-phase connector writes). store_read
+// has no lifecycle evidence of its own — the "prior Situations" fact must
+// use the same generic "capability_result" kind findingsFact already uses,
+// never "source_lifecycle": tagging it that way would make
+// internal/store's prepared-state reload misread unrelated prior-Situation
+// summaries as source lifecycle observations.
+func TestStoreReadExecutorPriorSituationFactUsesCapabilityResultKind(t *testing.T) {
+	store := &fakeLocalStore{situations: []model.LocalSituationSummary{{ID: "s1", TerminalReason: "recovered"}}}
+	e := &StoreReadExecutor{Store: store}
+	run, err := e.Execute(context.Background(), testStorePlan(), &noopRecorder{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(run.Facts) != 1 {
+		t.Fatalf("facts = %d, want 1 (situations only)", len(run.Facts))
+	}
+	if run.Facts[0].Kind != "capability_result" {
+		t.Fatalf("prior situation fact kind = %q, want capability_result (source_lifecycle is reserved for Task 6 lifecycle evidence)", run.Facts[0].Kind)
+	}
+}
+
 func TestStoreReadExecutorConfirmedEmptyWithNoRows(t *testing.T) {
 	store := &fakeLocalStore{}
 	e := &StoreReadExecutor{Store: store}

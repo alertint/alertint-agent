@@ -119,14 +119,18 @@ func unresolvedRun(plan model.Plan, now time.Time) model.Run {
 	}
 }
 
+// situationSummaryFact uses Kind "capability_result" — the same generic kind
+// findingsFact below uses — never "source_lifecycle": that kind is reserved
+// for Plan 4 Task 6's own per-Alert firing/resolved SourceObservation
+// evidence, which store_read has none of.
 func situationSummaryFact(plan model.Plan, situations []model.LocalSituationSummary, now, expiresAt time.Time) (model.Fact, error) {
 	value, err := json.Marshal(situations)
 	if err != nil {
 		return model.Fact{}, fmt.Errorf("connectors: marshal prior situation summaries: %w", err)
 	}
 	return model.Fact{
-		ID: factID(plan.ID, "source_lifecycle", value), RunID: "run:" + plan.ID,
-		Kind: "source_lifecycle", Subject: plan.Scope.SubjectID, Digest: digestOf(value),
+		ID: factID(plan.ID, "prior_situation", value), RunID: "run:" + plan.ID,
+		Kind: "capability_result", Subject: plan.Scope.SubjectID, Digest: digestOf(value),
 		SchemaVersion: model.FactSchemaVersion, Value: value,
 		ResultStatus: model.ResultConfirmedValue, Freshness: model.FreshnessFresh,
 		ObservedAt: now, ExpiresAt: expiresAt, Material: true,
