@@ -11,10 +11,13 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
+	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
 	"github.com/alertint/alertint-agent/internal/semanticprofile"
 	profilemodel "github.com/alertint/alertint-agent/internal/semanticprofile/model"
 	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
@@ -306,6 +309,68 @@ func (s *Store) RecoverSemanticInference(ctx context.Context, now time.Time) (in
 	return len(jobs), nil
 }
 
+// LoadProfileGuidanceForDeliveries reads the CURRENT head profile for every
+// distinct signature deliveryIDs map to (via delivery_semantic_signatures),
+// projected down to the narrow observationmodel.ProfileGuidance shape the
+// planner consumes — never the full advisory Profile content (subject_kind/
+// event_kind/possible_role/companion_signal_kinds/uncertainty are the
+// model's own prose, meaningless to plan construction). A delivery with no
+// signature mapping yet, or a signature with no head yet (never corrected
+// or inferred), contributes nothing — never a synthesized placeholder. The
+// result is deduplicated by signature: multiple deliveries sharing one
+// signature contribute exactly one guidance entry. versionIDs is the
+// parallel slice of frozen version IDs the returned guidance came from,
+// for CycleDraft.ProfileVersionIDs.
+func (s *Store) LoadProfileGuidanceForDeliveries(ctx context.Context, deliveryIDs []string) ([]observationmodel.ProfileGuidance, []string, error) {
+	if len(deliveryIDs) == 0 {
+		return nil, nil, nil
+	}
+
+	placeholders := make([]string, len(deliveryIDs))
+	args := make([]any, len(deliveryIDs))
+	for i, id := range deliveryIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT dss.signature_key, h.version_id, v.profile_json
+		FROM delivery_semantic_signatures dss
+		JOIN semantic_profile_heads h ON h.signature_key = dss.signature_key
+		JOIN semantic_profile_versions v ON v.id = h.version_id
+		WHERE dss.delivery_id IN (`+strings.Join(placeholders, ",")+`)
+		ORDER BY dss.signature_key ASC`, args...) // #nosec G202 -- placeholders is a fixed "?,?,..." run built from len(deliveryIDs) only; all runtime values bound via ? in args
+	if err != nil {
+		return nil, nil, fmt.Errorf("store: query profile guidance for deliveries: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var guidance []observationmodel.ProfileGuidance
+	var versionIDs []string
+	for rows.Next() {
+		var signatureKey, versionID, profileJSON string
+		if err := rows.Scan(&signatureKey, &versionID, &profileJSON); err != nil {
+			return nil, nil, fmt.Errorf("store: scan profile guidance: %w", err)
+		}
+		var profile profilemodel.Profile
+		if err := json.Unmarshal([]byte(profileJSON), &profile); err != nil {
+			return nil, nil, fmt.Errorf("store: unmarshal profile guidance content: %w", err)
+		}
+		capabilities := make([]observationmodel.Capability, 0, len(profile.UsefulCapabilities))
+		for _, c := range profile.UsefulCapabilities {
+			capabilities = append(capabilities, observationmodel.Capability(c))
+		}
+		guidance = append(guidance, observationmodel.ProfileGuidance{
+			SignatureKey: signatureKey, VersionID: versionID, HorizonTier: profile.HorizonTier,
+			UsefulCapabilities: capabilities, CandidateScope: profile.CandidateScope,
+		})
+		versionIDs = append(versionIDs, versionID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("store: iterate profile guidance: %w", err)
+	}
+	return guidance, versionIDs, nil
+}
+
 // CorrectSemanticProfile applies an MCP-submitted, confirmed operator
 // override: Correction.ExpectedVersion must equal the signature's current
 // head version exactly (0 permits creating a missing head) or
@@ -389,6 +454,211 @@ func (s *Store) CorrectSemanticProfile(ctx context.Context, c profilemodel.Corre
 		SemanticInputDigest: inputDigest, Origin: profilemodel.OriginCorrection,
 		Profile: c.Profile, AssertedBy: c.AssertedBy,
 	}, nil
+}
+
+// GetSemanticProfile reads one advisory signature's bounded profile
+// history for alertint_get_semantic_profile: its current head (nil when no
+// version has ever been committed — a signature that has only ever had
+// inference jobs run/fail), a bounded page of ALL its immutable versions
+// newest-first, and its current LIVE inference job state (nil when no job
+// is pending/running — the partial unique index on
+// semantic_profile_inference_jobs guarantees at most one). limit is
+// clamped to [1,100], defaulting to 20; cursor resumes strictly below the
+// last page's oldest version number.
+func (s *Store) GetSemanticProfile(ctx context.Context, signatureKey, cursor string, limit int) (profilemodel.History, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	var currentVersion int
+	err := s.db.QueryRowContext(ctx, `SELECT current_version FROM semantic_profile_heads WHERE signature_key = ?`, signatureKey).Scan(&currentVersion)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return profilemodel.History{}, fmt.Errorf("store: read semantic profile head: %w", err)
+	}
+
+	query := `
+		SELECT id, version, schema_version, prompt_version, semantic_input_digest, origin, provider, model,
+		       usage_input_tokens, usage_output_tokens, profile_json, created_at, asserted_by
+		FROM semantic_profile_versions WHERE signature_key = ?`
+	args := []any{signatureKey}
+	if cursor != "" {
+		before, err := strconv.Atoi(cursor)
+		if err != nil {
+			return profilemodel.History{}, fmt.Errorf("store: malformed semantic profile cursor %q", cursor)
+		}
+		query += ` AND version < ?`
+		args = append(args, before)
+	}
+	query += ` ORDER BY version DESC LIMIT ?`
+	args = append(args, limit+1)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return profilemodel.History{}, fmt.Errorf("store: query semantic profile versions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var versions []profilemodel.Version
+	for rows.Next() {
+		v, err := scanSemanticProfileVersionRow(rows, signatureKey)
+		if err != nil {
+			return profilemodel.History{}, err
+		}
+		versions = append(versions, v)
+	}
+	if err := rows.Err(); err != nil {
+		return profilemodel.History{}, fmt.Errorf("store: iterate semantic profile versions: %w", err)
+	}
+	// Close explicitly before the further queries below (current-version
+	// fallback lookup, live job state) — the store's single pooled
+	// connection (SetMaxOpenConns(1)) would self-deadlock on a nested query
+	// while this rows cursor is still open. The deferred Close above becomes
+	// a safe no-op afterward.
+	if err := rows.Close(); err != nil {
+		return profilemodel.History{}, fmt.Errorf("store: close semantic profile versions query: %w", err)
+	}
+
+	nextCursor := ""
+	if len(versions) > limit {
+		nextCursor = strconv.Itoa(versions[limit-1].Version)
+		versions = versions[:limit]
+	}
+
+	var current *profilemodel.Version
+	if currentVersion > 0 {
+		v, err := s.loadSemanticProfileVersionByNumber(ctx, signatureKey, currentVersion)
+		if err != nil {
+			return profilemodel.History{}, err
+		}
+		current = &v
+	}
+
+	job, err := s.loadLiveSemanticInferenceJobState(ctx, signatureKey)
+	if err != nil {
+		return profilemodel.History{}, err
+	}
+
+	return profilemodel.History{Current: current, Versions: versions, Job: job, NextCursor: nextCursor}, nil
+}
+
+// scanSemanticProfileVersionRow scans one semantic_profile_versions row (id,
+// version, schema_version, prompt_version, semantic_input_digest, origin,
+// provider, model, usage_input_tokens, usage_output_tokens, profile_json,
+// created_at, asserted_by, in that order) into a profilemodel.Version.
+func scanSemanticProfileVersionRow(rows *sql.Rows, signatureKey string) (profilemodel.Version, error) {
+	var (
+		id, origin, provider, model, profileJSON, createdAt, assertedBy string
+		version, schemaVersion, promptVersion, inTokens, outTokens      int
+		semanticInputDigest                                             string
+	)
+	if err := rows.Scan(&id, &version, &schemaVersion, &promptVersion, &semanticInputDigest, &origin, &provider, &model,
+		&inTokens, &outTokens, &profileJSON, &createdAt, &assertedBy); err != nil {
+		return profilemodel.Version{}, fmt.Errorf("store: scan semantic profile version: %w", err)
+	}
+	var profile profilemodel.Profile
+	if err := json.Unmarshal([]byte(profileJSON), &profile); err != nil {
+		return profilemodel.Version{}, fmt.Errorf("store: unmarshal semantic profile version content: %w", err)
+	}
+	created, err := time.Parse(time.RFC3339Nano, createdAt)
+	if err != nil {
+		return profilemodel.Version{}, fmt.Errorf("store: parse semantic profile version created_at: %w", err)
+	}
+	return profilemodel.Version{
+		ID: id, Signature: signatureKey, Version: version, SchemaVersion: schemaVersion, PromptVersion: promptVersion,
+		SemanticInputDigest: semanticInputDigest, Origin: origin, Provider: provider, Model: model,
+		UsageInputTokens: inTokens, UsageOutputTokens: outTokens, Profile: profile, CreatedAt: created, AssertedBy: assertedBy,
+	}, nil
+}
+
+// loadSemanticProfileVersionByNumber reads exactly one immutable version by
+// its (signature_key, version) unique key — used to resolve the head's
+// current version directly rather than relying on it appearing inside
+// whatever bounded page GetSemanticProfile's caller happened to request.
+func (s *Store) loadSemanticProfileVersionByNumber(ctx context.Context, signatureKey string, version int) (profilemodel.Version, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, version, schema_version, prompt_version, semantic_input_digest, origin, provider, model,
+		       usage_input_tokens, usage_output_tokens, profile_json, created_at, asserted_by
+		FROM semantic_profile_versions WHERE signature_key = ? AND version = ?`, signatureKey, version)
+	var (
+		id, origin, provider, model, profileJSON, createdAt, assertedBy string
+		v, schemaVersion, promptVersion, inTokens, outTokens            int
+		semanticInputDigest                                             string
+	)
+	if err := row.Scan(&id, &v, &schemaVersion, &promptVersion, &semanticInputDigest, &origin, &provider, &model,
+		&inTokens, &outTokens, &profileJSON, &createdAt, &assertedBy); err != nil {
+		return profilemodel.Version{}, fmt.Errorf("store: read semantic profile head version: %w", err)
+	}
+	var profile profilemodel.Profile
+	if err := json.Unmarshal([]byte(profileJSON), &profile); err != nil {
+		return profilemodel.Version{}, fmt.Errorf("store: unmarshal semantic profile head version content: %w", err)
+	}
+	created, err := time.Parse(time.RFC3339Nano, createdAt)
+	if err != nil {
+		return profilemodel.Version{}, fmt.Errorf("store: parse semantic profile head version created_at: %w", err)
+	}
+	return profilemodel.Version{
+		ID: id, Signature: signatureKey, Version: v, SchemaVersion: schemaVersion, PromptVersion: promptVersion,
+		SemanticInputDigest: semanticInputDigest, Origin: origin, Provider: provider, Model: model,
+		UsageInputTokens: inTokens, UsageOutputTokens: outTokens, Profile: profile, CreatedAt: created, AssertedBy: assertedBy,
+	}, nil
+}
+
+// loadLiveSemanticInferenceJobState reads signatureKey's current
+// pending/running job, if one exists — the partial unique index on
+// semantic_profile_inference_jobs guarantees at most one such row per
+// signature, so no ordering/limit is needed to pick "the" live job.
+func (s *Store) loadLiveSemanticInferenceJobState(ctx context.Context, signatureKey string) (*profilemodel.JobState, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT status, attempt, retry_at, error_class FROM semantic_profile_inference_jobs
+		WHERE signature_key = ? AND status IN ('pending', 'running')`, signatureKey)
+	var status string
+	var attempt int
+	var retryAt, errorClass sql.NullString
+	err := row.Scan(&status, &attempt, &retryAt, &errorClass)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil //nolint:nilnil // no live pending/running job is a legitimate, common outcome, not an error
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: read live semantic inference job: %w", err)
+	}
+	state := &profilemodel.JobState{Status: status, Attempt: attempt}
+	if retryAt.Valid {
+		t, err := time.Parse(time.RFC3339Nano, retryAt.String)
+		if err != nil {
+			return nil, fmt.Errorf("store: parse semantic inference job retry_at: %w", err)
+		}
+		state.RetryAt = &t
+	}
+	if errorClass.Valid {
+		ec := errorClass.String
+		state.ErrorClass = &ec
+	}
+	return state, nil
+}
+
+// ListSituationSemanticSignatures returns the distinct advisory signature
+// keys among situationID's current member deliveries — 1 in the common
+// case, more when the Situation's deliveries span sources/schemas with
+// different proven identity. Used by alertint_get_semantic_profile's
+// Situation-handle lookup path to resolve which signature(s) to read.
+func (s *Store) ListSituationSemanticSignatures(ctx context.Context, situationID string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT dss.signature_key
+		FROM delivery_semantic_signatures dss
+		JOIN incident_alert_deliveries iad ON iad.delivery_id = dss.delivery_id
+		JOIN situation_incidents si ON si.incident_id = iad.incident_id
+		WHERE si.situation_id = ?
+		ORDER BY dss.signature_key ASC`, situationID)
+	if err != nil {
+		return nil, fmt.Errorf("store: query situation semantic signatures: %w", err)
+	}
+	keys, err := scanStringRows(rows)
+	if err != nil {
+		return nil, fmt.Errorf("store: read situation semantic signatures: %w", err)
+	}
+	return keys, nil
 }
 
 func latestFrozenInputDigestTx(ctx context.Context, tx *sql.Tx, signatureKey string) (string, error) {

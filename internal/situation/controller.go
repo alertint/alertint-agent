@@ -831,9 +831,17 @@ func (c *Controller) prepareLifecyclePhase(ctx context.Context, claim Claim, in 
 	if !nonterminal {
 		return in, nil
 	}
-	if _, err := c.preparer.Prepare(ctx, PreparationRequest{Claim: claim, Input: in, Phase: observationmodel.PhaseLifecycle, Now: now}); err != nil {
+	prepCtx, span := tracer().Start(ctx, SpanEvidencePreparation, trace.WithAttributes(
+		AttrSituationID.String(in.Situation.ID), AttrPreparationPhase.String(string(observationmodel.PhaseLifecycle)),
+	))
+	_, err := c.preparer.Prepare(prepCtx, PreparationRequest{Claim: claim, Input: in, Phase: observationmodel.PhaseLifecycle, Now: now})
+	if err != nil {
+		span.SetAttributes(AttrResultClass.String(PreparationResultError))
+		span.End()
 		return SnapshotInput{}, fmt.Errorf("situation: controller reconcile: prepare lifecycle phase: %w", err)
 	}
+	span.SetAttributes(AttrResultClass.String(PreparationResultCommitted))
+	span.End()
 	reloaded, err := c.store.LoadReconciliationInput(ctx, claim, now)
 	if err != nil {
 		return SnapshotInput{}, fmt.Errorf("situation: controller reconcile: reload after lifecycle preparation: %w", err)
@@ -859,9 +867,17 @@ func (c *Controller) prepareAssessmentPhaseIfActive(ctx context.Context, claim C
 	if gate.Lifecycle != model.LifecycleActive {
 		return in, sl, nil
 	}
-	if _, err := c.preparer.Prepare(ctx, PreparationRequest{Claim: claim, Input: in, Phase: observationmodel.PhaseAssessment, Now: now}); err != nil {
+	prepCtx, span := tracer().Start(ctx, SpanEvidencePreparation, trace.WithAttributes(
+		AttrSituationID.String(in.Situation.ID), AttrPreparationPhase.String(string(observationmodel.PhaseAssessment)),
+	))
+	_, err := c.preparer.Prepare(prepCtx, PreparationRequest{Claim: claim, Input: in, Phase: observationmodel.PhaseAssessment, Now: now})
+	if err != nil {
+		span.SetAttributes(AttrResultClass.String(PreparationResultError))
+		span.End()
 		return SnapshotInput{}, SourceLifecycle{}, fmt.Errorf("situation: controller reconcile: prepare assessment phase: %w", err)
 	}
+	span.SetAttributes(AttrResultClass.String(PreparationResultCommitted))
+	span.End()
 	reloaded, err := c.store.LoadReconciliationInput(ctx, claim, now)
 	if err != nil {
 		return SnapshotInput{}, SourceLifecycle{}, fmt.Errorf("situation: controller reconcile: reload after assessment preparation: %w", err)

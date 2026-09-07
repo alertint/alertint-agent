@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/alertint/alertint-agent/internal/llm"
 	profilemodel "github.com/alertint/alertint-agent/internal/semanticprofile/model"
 )
@@ -69,6 +71,14 @@ type InferenceCallObservation interface {
 // llmhealth.Tracker.Begin(llmhealth.CapabilitySemanticProfile, signature).
 type HealthObserver interface {
 	BeginInferenceCall(signature string) InferenceCallObservation
+}
+
+// AuditSink is the narrow audit-append surface Worker emits to —
+// structurally identical to internal/situation.AuditSink (this package
+// cannot import internal/situation): *audit.Auditor satisfies it directly.
+// A nil sink (the default) disables audit emission.
+type AuditSink interface {
+	Append(ctx context.Context, actor, kind string, payload any) error
 }
 
 type noopInferenceCallObservation struct{}
@@ -208,6 +218,7 @@ type Worker struct {
 	cfg     WorkerConfig
 	logger  *slog.Logger
 	health  HealthObserver
+	audit   AuditSink
 
 	wakeCh chan struct{}
 	stopCh chan struct{}
@@ -251,6 +262,29 @@ func (w *Worker) SetHealthObserver(h HealthObserver) {
 		w.health = h
 	}
 }
+
+// SetAuditSink wires the audit log. Optional: nil (the default) disables
+// audit emission. Not safe to call concurrently with Start/RunOnce; call
+// once, right after construction.
+func (w *Worker) SetAuditSink(a AuditSink) {
+	w.audit = a
+}
+
+// auditAppend is a best-effort audit emission: a failure is logged and
+// swallowed, exactly like internal/situation.Controller.auditAppend — an
+// audit-log failure must never lose the durable state change it describes.
+func (w *Worker) auditAppend(ctx context.Context, kind string, payload any) {
+	if w.audit == nil {
+		return
+	}
+	if err := w.audit.Append(ctx, workerAuditActor, kind, payload); err != nil {
+		w.logger.Warn("semanticprofile: worker audit append failed", "kind", kind, "err", err)
+	}
+}
+
+// workerAuditActor is the fixed audit actor for every event this package
+// emits.
+const workerAuditActor = "semantic_profile.worker"
 
 func detachedWorkerContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), 10*time.Second)
@@ -297,6 +331,13 @@ func (w *Worker) processOne(ctx context.Context, claim profilemodel.JobClaim) er
 		}
 		return fmt.Errorf("semanticprofile: reserve inference call: %w", err)
 	}
+	// Audited immediately after the reservation durably commits — the
+	// dispatch slot is spent whether or not the physical call below ever
+	// starts, mirroring situation.Controller's own
+	// "situation.assessment_call_dispatched" ordering.
+	w.auditAppend(ctx, "semantic_profile.call_dispatched", map[string]any{
+		"signature": claim.Signature, "job_id": claim.JobID, "call_id": callID, "attempt": attempt,
+	})
 
 	prompt, err := BuildInferencePrompt(claim.FrozenInputJSON)
 	if err != nil {
@@ -307,6 +348,14 @@ func (w *Worker) processOne(ctx context.Context, claim profilemodel.JobClaim) er
 	var leaseLost atomic.Bool
 	hbDone := make(chan struct{})
 	go w.heartbeatLoop(callCtx, cancel, claim, &leaseLost, hbDone)
+
+	// One span per consumed dispatch slot, started only AFTER the durable
+	// call row committed above — it wraps only the out-of-transaction
+	// provider I/O and classification, nothing durable (mirrors
+	// situation.SpanAssessmentDispatch's own contract exactly).
+	callCtx, span := tracer().Start(callCtx, SpanSemanticInference, trace.WithAttributes(
+		AttrJobID.String(claim.JobID), AttrCallID.String(callID), AttrAttempt.Int(attempt),
+	))
 
 	release, acquireErr := w.limiter.Acquire(callCtx, llm.InferenceProfile)
 	var result profilemodel.InferenceResult
@@ -323,6 +372,8 @@ func (w *Worker) processOne(ctx context.Context, claim profilemodel.JobClaim) er
 		result, classifyErr = classifyCompletion(oneShot, callErr, w.cfg.Provider)
 		obs.Finish(classifyErr)
 	}
+	span.SetAttributes(AttrResultClass.String(result.Outcome))
+	span.End()
 
 	cancel()
 	<-hbDone
@@ -338,6 +389,21 @@ func (w *Worker) processOne(ctx context.Context, claim profilemodel.JobClaim) er
 	}
 	if err := w.store.CompleteSemanticInference(ctx, callID, claim.Owner, claim.Token, result, w.cfg.Now(), retryAt); err != nil {
 		return fmt.Errorf("semanticprofile: complete inference: %w", err)
+	}
+	// Audited from the worker's OWN pre-CAS classification of result.Outcome
+	// — the durable outcome CompleteSemanticInference actually committed may
+	// differ (an accepted result downgraded to stale by a winning
+	// correction/sibling job), which is by design not a worker- or
+	// health-visible distinction (spec.md's "stale-CAS-loss is healthy
+	// transport"). The true persisted outcome, including any such downgrade,
+	// always remains readable from semantic_profile_call_outcomes itself.
+	w.auditAppend(ctx, "semantic_profile.call_completed", map[string]any{
+		"signature": claim.Signature, "job_id": claim.JobID, "call_id": callID, "outcome": result.Outcome,
+	})
+	if result.Outcome == profilemodel.InferenceOutcomeAccepted {
+		w.auditAppend(ctx, "semantic_profile.head_advanced", map[string]any{
+			"signature": claim.Signature, "job_id": claim.JobID,
+		})
 	}
 	return nil
 }

@@ -532,6 +532,109 @@ func TestReserveSemanticInferenceCallRejectsStaleClaim(t *testing.T) {
 	}
 }
 
+func TestLoadProfileGuidanceForDeliveriesReturnsCurrentHeadsOnly(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+
+	deliveryID, _ := signatureDeliveryFixture(t, st, "guidance-a", "group-guidance-a", now)
+	var signatureKey string
+	if err := st.db.QueryRowContext(ctx, `SELECT signature_key FROM delivery_semantic_signatures WHERE delivery_id = ?`, deliveryID).Scan(&signatureKey); err != nil {
+		t.Fatalf("read signature key: %v", err)
+	}
+
+	// A second delivery with no signature mapping at all, and a third under
+	// a signature that has never received a head: neither should produce
+	// guidance.
+	unmappedDeliveryID := "delivery-guidance-unmapped"
+	del := deliveryFixture(unmappedDeliveryID, "fp-guidance-unmapped", now)
+	if _, err := st.AcceptDeliveries(ctx, []DeliveryInput{del}); err != nil {
+		t.Fatalf("accept unmapped delivery: %v", err)
+	}
+
+	guidance, versionIDs, err := st.LoadProfileGuidanceForDeliveries(ctx, []string{deliveryID, unmappedDeliveryID})
+	if err != nil {
+		t.Fatalf("LoadProfileGuidanceForDeliveries (no head yet): %v", err)
+	}
+	if len(guidance) != 0 || len(versionIDs) != 0 {
+		t.Fatalf("guidance = %+v versionIDs = %v, want none before any correction/inference exists", guidance, versionIDs)
+	}
+
+	correction := profilemodel.Correction{
+		Signature: signatureKey,
+		Profile: profilemodel.Profile{
+			SubjectKind: "service", EventKind: "availability", PossibleRole: "symptom",
+			CandidateScope: []string{"service"}, HorizonTier: "hours",
+			UsefulCapabilities: []string{"prometheus_query", "loki_query"},
+		},
+		Confirm: true, AssertedBy: "operator:guidance",
+	}
+	v1, err := st.CorrectSemanticProfile(ctx, correction, now)
+	if err != nil {
+		t.Fatalf("CorrectSemanticProfile: %v", err)
+	}
+
+	guidance, versionIDs, err = st.LoadProfileGuidanceForDeliveries(ctx, []string{deliveryID, unmappedDeliveryID})
+	if err != nil {
+		t.Fatalf("LoadProfileGuidanceForDeliveries: %v", err)
+	}
+	if len(guidance) != 1 {
+		t.Fatalf("guidance = %+v, want exactly 1 entry (the unmapped delivery contributes none)", guidance)
+	}
+	g := guidance[0]
+	if g.SignatureKey != signatureKey || g.VersionID != v1.ID || g.HorizonTier != "hours" {
+		t.Fatalf("guidance[0] = %+v, want signature=%s version=%s horizon=hours", g, signatureKey, v1.ID)
+	}
+	if len(g.UsefulCapabilities) != 2 {
+		t.Fatalf("useful_capabilities = %v, want 2 entries", g.UsefulCapabilities)
+	}
+	if len(g.CandidateScope) != 1 || g.CandidateScope[0] != "service" {
+		t.Fatalf("candidate_scope = %v, want [service]", g.CandidateScope)
+	}
+	if len(versionIDs) != 1 || versionIDs[0] != v1.ID {
+		t.Fatalf("versionIDs = %v, want [%s]", versionIDs, v1.ID)
+	}
+}
+
+func TestLoadProfileGuidanceForDeliveriesDedupesSharedSignature(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+
+	d1, _ := signatureDeliveryFixture(t, st, "guidance-shared-a", "group-guidance-shared-a", now)
+	d2, _ := signatureDeliveryFixture(t, st, "guidance-shared-b", "group-guidance-shared-b", now)
+	var sig1, sig2 string
+	if err := st.db.QueryRowContext(ctx, `SELECT signature_key FROM delivery_semantic_signatures WHERE delivery_id = ?`, d1).Scan(&sig1); err != nil {
+		t.Fatalf("read signature 1: %v", err)
+	}
+	if err := st.db.QueryRowContext(ctx, `SELECT signature_key FROM delivery_semantic_signatures WHERE delivery_id = ?`, d2).Scan(&sig2); err != nil {
+		t.Fatalf("read signature 2: %v", err)
+	}
+	if sig1 != sig2 {
+		t.Fatalf("fixture invariant: expected both deliveries to share one signature (same proven signal id/version), got %q and %q", sig1, sig2)
+	}
+
+	correction := profilemodel.Correction{
+		Signature: sig1,
+		Profile: profilemodel.Profile{
+			SubjectKind: "service", EventKind: "availability", PossibleRole: "symptom",
+			CandidateScope: []string{"service"}, HorizonTier: "minutes",
+		},
+		Confirm: true, AssertedBy: "operator:guidance-shared",
+	}
+	if _, err := st.CorrectSemanticProfile(ctx, correction, now); err != nil {
+		t.Fatalf("CorrectSemanticProfile: %v", err)
+	}
+
+	guidance, _, err := st.LoadProfileGuidanceForDeliveries(ctx, []string{d1, d2})
+	if err != nil {
+		t.Fatalf("LoadProfileGuidanceForDeliveries: %v", err)
+	}
+	if len(guidance) != 1 {
+		t.Fatalf("guidance = %+v, want exactly 1 deduped entry for the shared signature", guidance)
+	}
+}
+
 func TestExtendSemanticInferenceJobLeaseExtendsLiveClaim(t *testing.T) {
 	st := newTestStore(t)
 	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
@@ -1023,5 +1126,187 @@ func TestCorrectSemanticProfileEnqueuesChangeForFanOut(t *testing.T) {
 	}
 	if changeCount != 1 {
 		t.Fatalf("change outbox rows = %d, want 1", changeCount)
+	}
+}
+
+// ----------------------------------------------------------------------
+// GetSemanticProfile / ListSituationSemanticSignatures: Task 9's
+// alertint_get_semantic_profile MCP read surface.
+// ----------------------------------------------------------------------
+
+func TestGetSemanticProfileUnknownSignatureReturnsEmptyHistory(t *testing.T) {
+	st := newTestStore(t)
+	history, err := st.GetSemanticProfile(context.Background(), "no:such:signature", "", 20)
+	if err != nil {
+		t.Fatalf("GetSemanticProfile: %v", err)
+	}
+	if history.Current != nil {
+		t.Fatalf("Current = %+v, want nil for an unknown signature", history.Current)
+	}
+	if len(history.Versions) != 0 {
+		t.Fatalf("Versions = %+v, want empty", history.Versions)
+	}
+	if history.Job != nil {
+		t.Fatalf("Job = %+v, want nil", history.Job)
+	}
+	if history.NextCursor != "" {
+		t.Fatalf("NextCursor = %q, want empty", history.NextCursor)
+	}
+}
+
+func TestGetSemanticProfileReturnsCurrentHeadAndVersionHistoryNewestFirst(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	sig := "zabbix:advisory:sha256:history"
+	base := profilemodel.Correction{
+		Signature: sig,
+		Profile: profilemodel.Profile{
+			SubjectKind: "service", EventKind: "availability", PossibleRole: "symptom",
+			CandidateScope: []string{"service"}, HorizonTier: "hours",
+		},
+		Confirm: true, AssertedBy: "operator:test",
+	}
+	if _, err := st.CorrectSemanticProfile(ctx, base, now); err != nil {
+		t.Fatalf("correction v1: %v", err)
+	}
+	base.ExpectedVersion = 1
+	if _, err := st.CorrectSemanticProfile(ctx, base, now.Add(time.Minute)); err != nil {
+		t.Fatalf("correction v2: %v", err)
+	}
+	base.ExpectedVersion = 2
+	if _, err := st.CorrectSemanticProfile(ctx, base, now.Add(2*time.Minute)); err != nil {
+		t.Fatalf("correction v3: %v", err)
+	}
+
+	history, err := st.GetSemanticProfile(ctx, sig, "", 20)
+	if err != nil {
+		t.Fatalf("GetSemanticProfile: %v", err)
+	}
+	if history.Current == nil || history.Current.Version != 3 {
+		t.Fatalf("Current = %+v, want version 3", history.Current)
+	}
+	if len(history.Versions) != 3 {
+		t.Fatalf("Versions = %+v, want 3 entries", history.Versions)
+	}
+	for i, want := range []int{3, 2, 1} {
+		if history.Versions[i].Version != want {
+			t.Fatalf("Versions[%d].Version = %d, want %d (newest first)", i, history.Versions[i].Version, want)
+		}
+	}
+	if history.NextCursor != "" {
+		t.Fatalf("NextCursor = %q, want empty (page holds every version)", history.NextCursor)
+	}
+	if history.Job != nil {
+		t.Fatalf("Job = %+v, want nil (a correction has no inference job)", history.Job)
+	}
+}
+
+func TestGetSemanticProfilePaginatesVersionsWithCursor(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	sig := "zabbix:advisory:sha256:paged"
+	base := profilemodel.Correction{
+		Signature: sig,
+		Profile: profilemodel.Profile{
+			SubjectKind: "service", EventKind: "availability", PossibleRole: "symptom",
+			CandidateScope: []string{"service"}, HorizonTier: "hours",
+		},
+		Confirm: true, AssertedBy: "operator:test",
+	}
+	if _, err := st.CorrectSemanticProfile(ctx, base, now); err != nil {
+		t.Fatalf("correction v1: %v", err)
+	}
+	base.ExpectedVersion = 1
+	if _, err := st.CorrectSemanticProfile(ctx, base, now.Add(time.Minute)); err != nil {
+		t.Fatalf("correction v2: %v", err)
+	}
+	base.ExpectedVersion = 2
+	if _, err := st.CorrectSemanticProfile(ctx, base, now.Add(2*time.Minute)); err != nil {
+		t.Fatalf("correction v3: %v", err)
+	}
+
+	page1, err := st.GetSemanticProfile(ctx, sig, "", 1)
+	if err != nil {
+		t.Fatalf("GetSemanticProfile page1: %v", err)
+	}
+	if len(page1.Versions) != 1 || page1.Versions[0].Version != 3 || page1.NextCursor == "" {
+		t.Fatalf("page1 = %+v, want [3] with a next cursor", page1)
+	}
+
+	page2, err := st.GetSemanticProfile(ctx, sig, page1.NextCursor, 1)
+	if err != nil {
+		t.Fatalf("GetSemanticProfile page2: %v", err)
+	}
+	if len(page2.Versions) != 1 || page2.Versions[0].Version != 2 || page2.NextCursor == "" {
+		t.Fatalf("page2 = %+v, want [2] with a next cursor", page2)
+	}
+
+	page3, err := st.GetSemanticProfile(ctx, sig, page2.NextCursor, 1)
+	if err != nil {
+		t.Fatalf("GetSemanticProfile page3: %v", err)
+	}
+	if len(page3.Versions) != 1 || page3.Versions[0].Version != 1 || page3.NextCursor != "" {
+		t.Fatalf("page3 = %+v, want [1] with no next cursor (last page)", page3)
+	}
+}
+
+func TestGetSemanticProfileReportsLiveJobState(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	seedPendingInferenceJob(t, st, "job-live", "zabbix:advisory:sha256:live", 3, nil, now)
+
+	history, err := st.GetSemanticProfile(context.Background(), "zabbix:advisory:sha256:live", "", 20)
+	if err != nil {
+		t.Fatalf("GetSemanticProfile: %v", err)
+	}
+	if history.Current != nil {
+		t.Fatalf("Current = %+v, want nil (no version has ever been committed)", history.Current)
+	}
+	if history.Job == nil || history.Job.Status != profilemodel.JobStatePending {
+		t.Fatalf("Job = %+v, want a live pending job", history.Job)
+	}
+}
+
+func TestListSituationSemanticSignaturesReturnsDistinctKeysAcrossDeliveries(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	_, situationID := signatureDeliveryFixture(t, st, "sig-list-1", "grp-sig-list", now)
+
+	second := deliveryFixture("delivery-sig-list-2", "fp-sig-list-2", now)
+	second.Source = "zabbix"
+	sigID2, sigVersion2 := "item:999", "v7"
+	second.SourceProvenance.SignalID = &sigID2
+	second.SourceProvenance.SignalVersion = &sigVersion2
+	if _, err := st.AcceptDeliveries(context.Background(), []DeliveryInput{second}); err != nil {
+		t.Fatalf("accept second delivery: %v", err)
+	}
+	// Attach the second delivery to the SAME already-ready incident
+	// insertIncidentAndDeliveryInput's own InsertIncident/MarkIncidentReady
+	// steps must not repeat (the incident row and its ready state already
+	// exist from signatureDeliveryFixture above).
+	if _, err := st.db.ExecContext(context.Background(), `
+		INSERT INTO incident_alert_deliveries (incident_id, delivery_id, created_at) VALUES (?, ?, ?)`,
+		"inc-sig-list-1", "delivery-sig-list-2", canonicalTime(now)); err != nil {
+		t.Fatalf("link second delivery: %v", err)
+	}
+	if _, err := st.db.ExecContext(context.Background(), `
+		INSERT INTO situation_input_outbox (id, idempotency_key, incident_id, delivery_id, kind, group_key, occurred_at, status)
+		VALUES (?, ?, ?, ?, 'membership_changed', ?, ?, 'pending')`,
+		"input-sig-list-2", "idem:input-sig-list-2", "inc-sig-list-1", "delivery-sig-list-2", "grp-sig-list", canonicalTime(now)); err != nil {
+		t.Fatalf("insert second situation input: %v", err)
+	}
+	claim := claimOneInput(t, st, "seed:sig-list-2", now)
+	if err := st.ApplySituationInput(context.Background(), claim); err != nil {
+		t.Fatalf("apply second situation input: %v", err)
+	}
+
+	keys, err := st.ListSituationSemanticSignatures(context.Background(), situationID)
+	if err != nil {
+		t.Fatalf("ListSituationSemanticSignatures: %v", err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("keys = %v, want 2 distinct signatures", keys)
 	}
 }

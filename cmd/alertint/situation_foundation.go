@@ -207,13 +207,26 @@ func (r *foundationRuntime) WakeDispatch() {
 // this file's own tracedFoundationSequence helper exercise this), in which
 // case run behaves exactly as it did before Task 9. The real production
 // wiring (runServe) always sets both.
+// recoverPreparationWork and startPreparationWorkers are Plan 4 Task 9
+// additions, following the exact same "optional, nil degrades gracefully"
+// convention backfillAndRecoverControllerWork/startControllerWorkers
+// established: startup-only recovery for stranded observation/semantic-
+// profile work (RecoverSemanticInference, an active-mapping backfill pass),
+// positioned right after controller recovery (the preparer these workers
+// serve is injected into the SAME controller) and before notification
+// recovery, and worker start positioned right after the controller/Triage
+// workers, before notification workers. Both may be left nil (no Plan 4
+// preparation runtime composed in), in which case run behaves exactly as it
+// did before this addition.
 type foundationSequence struct {
 	reconstruct                      func(ctx context.Context) error
 	backfillAndRecoverControllerWork func(ctx context.Context) error
+	recoverPreparationWork           func(ctx context.Context) error
 	recoverNotificationWork          func(ctx context.Context) error
 	startCorrelator                  func(ctx context.Context) error
 	startWorkers                     func(ctx context.Context)
 	startControllerWorkers           func(ctx context.Context)
+	startPreparationWorkers          func(ctx context.Context)
 	startNotificationWorkers         func(ctx context.Context)
 	startReceivers                   func() error
 }
@@ -224,6 +237,11 @@ func (f foundationSequence) run(ctx context.Context) error {
 	}
 	if f.backfillAndRecoverControllerWork != nil {
 		if err := f.backfillAndRecoverControllerWork(ctx); err != nil {
+			return err
+		}
+	}
+	if f.recoverPreparationWork != nil {
+		if err := f.recoverPreparationWork(ctx); err != nil {
 			return err
 		}
 	}
@@ -238,6 +256,9 @@ func (f foundationSequence) run(ctx context.Context) error {
 	f.startWorkers(ctx)
 	if f.startControllerWorkers != nil {
 		f.startControllerWorkers(ctx)
+	}
+	if f.startPreparationWorkers != nil {
+		f.startPreparationWorkers(ctx)
 	}
 	if f.startNotificationWorkers != nil {
 		f.startNotificationWorkers(ctx)
@@ -295,7 +316,16 @@ type foundationStopSequence struct {
 	drainFoundationWork   func(ctx context.Context) (int, error)
 	drainControllerWork   func(ctx context.Context) (int, error)
 	stopControllerWorkers func(ctx context.Context) error
-	stopWorkers           func(ctx context.Context) error
+	// drainPreparationWork and stopPreparationWorkers are Plan 4 Task 9
+	// additions: due observation/semantic-profile work (and the Situation
+	// inputs a completed job or a fanned-out profile change produces) joins
+	// the SAME per-round drain loop drainControllerWork already runs in,
+	// and its workers stop right after the controller/Triage workers —
+	// both may be left nil (no Plan 4 preparation runtime composed in), in
+	// which case run behaves exactly as it did before this addition.
+	drainPreparationWork   func(ctx context.Context) (int, error)
+	stopPreparationWorkers func(ctx context.Context) error
+	stopWorkers            func(ctx context.Context) error
 	// stopNotificationWorkers is Plan 3's own final stage (R6). It runs
 	// LAST — after every producer of durable history has stopped — and
 	// deliberately outside drainToQuiescence: the Situation notification
@@ -329,6 +359,11 @@ func (f foundationStopSequence) run(ctx context.Context) error {
 			errs = append(errs, err)
 		}
 	}
+	if f.stopPreparationWorkers != nil {
+		if err := f.stopPreparationWorkers(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if err := f.stopWorkers(ctx); err != nil {
 		errs = append(errs, err)
 	}
@@ -343,7 +378,7 @@ func (f foundationStopSequence) run(ctx context.Context) error {
 // drainToQuiescence runs the foundation-then-controller drain rounds
 // described on foundationStopSequence until a round handles nothing.
 func (f foundationStopSequence) drainToQuiescence(ctx context.Context) error {
-	if f.drainFoundationWork == nil && f.drainControllerWork == nil {
+	if f.drainFoundationWork == nil && f.drainControllerWork == nil && f.drainPreparationWork == nil {
 		return nil
 	}
 	for round := 0; round < maxShutdownDrainRounds; round++ {
@@ -360,6 +395,13 @@ func (f foundationStopSequence) drainToQuiescence(ctx context.Context) error {
 		}
 		if f.drainControllerWork != nil {
 			n, err := f.drainControllerWork(ctx)
+			if err != nil {
+				return err
+			}
+			handled += n
+		}
+		if f.drainPreparationWork != nil {
+			n, err := f.drainPreparationWork(ctx)
 			if err != nil {
 				return err
 			}

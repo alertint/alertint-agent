@@ -11,6 +11,7 @@
 package observation
 
 import (
+	"encoding/json"
 	"sort"
 	"time"
 
@@ -29,14 +30,21 @@ const optionalRequestCreditCost = 3
 // and how to admit into this cycle — the planner's own working unit before
 // it becomes a frozen Plan.
 type Candidate struct {
-	Subject       string
-	Capability    model.Capability
-	Scope         model.Scope
-	Phase         model.Phase
-	Window        [2]time.Time
-	Limit         int
-	MaxRequests   int
-	Purpose       string
+	Subject     string
+	Capability  model.Capability
+	Scope       model.Scope
+	Phase       model.Phase
+	Window      [2]time.Time
+	Limit       int
+	MaxRequests int
+	Purpose     string
+	// Parameters is this candidate's typed, capability-specific Plan.
+	// Parameters payload — set only from adapter-proven MemberSubject
+	// fields (buildCandidate), never a model- or scope-derived guess. Most
+	// capabilities need none (nil); zabbix_metric_range/zabbix_problem_
+	// history need it for ItemKey/TriggerID, which have no Scope.SubjectID
+	// fallback the way Host does.
+	Parameters    json.RawMessage
 	TimeSensitive bool
 	// Deadline is the earliest checkpoint making this candidate
 	// time-sensitive (a member observation deadline or active recovery-grace

@@ -148,6 +148,33 @@ func TestControllerWorkerSetInferenceLimiterGatesL2ThroughSharedPool(t *testing.
 	}
 }
 
+// TestControllerWorkerSetEvidencePreparerWiresThroughToReconcile proves
+// Plan 4 Task 9's own preparer pass-through: cmd/alertint only ever holds a
+// *ControllerWorker, never the *Controller it builds internally, so
+// SetEvidencePreparer must reach the same Controller.SetEvidencePreparer
+// seam Task 6's own controller_test.go already proves in isolation.
+func TestControllerWorkerSetEvidencePreparerWiresThroughToReconcile(t *testing.T) {
+	in := ctBaseSnapshotInput()
+	claim := ctClaimFor("situation-preparer", "worker-a", 1)
+	store := &fakeControllerStore{
+		loadInput: in, beginWorkAttempt: 1,
+		claimFn: func(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]situation.Claim, error) {
+			return []situation.Claim{claim}, nil
+		},
+	}
+	client := &fakeAssessmentClient{}
+	w := situation.NewControllerWorker(store, store, client, situation.ControllerConfig{}, newWorkerConfig("worker-a"), nil, nil, nil)
+	preparer := &fakeEvidencePreparer{}
+	w.SetEvidencePreparer(preparer)
+
+	if _, err := w.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if len(preparer.calls) == 0 {
+		t.Fatal("expected the wired preparer to be invoked during Reconcile")
+	}
+}
+
 func TestControllerWorkerRunOnceRespectsBoundedBatch(t *testing.T) {
 	store := &fakeControllerStore{
 		claimFn: func(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]situation.Claim, error) {

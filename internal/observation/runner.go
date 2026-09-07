@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+
 	model "github.com/alertint/alertint-agent/internal/observation/model"
 )
 
@@ -93,11 +95,21 @@ func (r *Runner) runOne(ctx context.Context, f model.Fence, cycle model.Cycle, p
 		return unresolvedRun(p, r.clock())
 	}
 
+	// One span per plan dispatch, wrapping only the out-of-transaction
+	// connector I/O — nothing durable happens inside it.
+	ctx, span := tracer().Start(ctx, SpanObservationRun, trace.WithAttributes(
+		AttrCycleID.String(cycle.ID), AttrPlanID.String(p.ID),
+		AttrCapability.String(string(p.Capability)), AttrPhase.String(string(p.Phase)),
+	))
+	defer span.End()
+
 	recorder := &reservingRecorder{store: r.store, fence: f, cycleID: cycle.ID, planID: p.ID, clock: r.clock}
 	run, err := executor.Execute(ctx, p, recorder)
 	if err != nil {
+		span.SetAttributes(AttrResultClass.String(string(model.ResultFailed)))
 		return failedRun(p, r.clock())
 	}
+	span.SetAttributes(AttrResultClass.String(string(run.Status)))
 	return run
 }
 

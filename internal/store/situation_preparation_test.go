@@ -283,6 +283,71 @@ func TestListObservationRunsPagination(t *testing.T) {
 	}
 }
 
+func TestRecordAndLoadObservationRefreshAdmissions(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC()
+	id := newSituationForGroup(t, st, "service=refresh", now)
+	claim := claimSituation(t, st, id, "p4-refresh", now)
+	f := observationmodel.Fence{SituationID: id, InputVersion: claim.Situation.InputVersion,
+		Owner: claim.ClaimOwner, Token: claim.ClaimToken}
+
+	empty, err := st.LoadObservationRefreshCursors(ctx, id)
+	if err != nil {
+		t.Fatalf("LoadObservationRefreshCursors (none yet): %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("cursors = %+v, want none before any admission", empty)
+	}
+
+	p := testPlan(now)
+	cycle, err := st.BeginPreparation(ctx, f,
+		observationmodel.CycleDraft{Anchor: now, ConfigDigest: "cfg-1", Plans: []observationmodel.Plan{p}}, 6)
+	if err != nil {
+		t.Fatalf("BeginPreparation: %v", err)
+	}
+	p = cycle.Draft.Plans[0]
+	if err := st.RecordObservationRefreshAdmissions(ctx, id, cycle.ID, []observationmodel.Plan{p}, 5*time.Minute, now); err != nil {
+		t.Fatalf("RecordObservationRefreshAdmissions: %v", err)
+	}
+
+	cursors, err := st.LoadObservationRefreshCursors(ctx, id)
+	if err != nil {
+		t.Fatalf("LoadObservationRefreshCursors: %v", err)
+	}
+	if len(cursors) != 1 {
+		t.Fatalf("cursors = %+v, want exactly 1", cursors)
+	}
+	c := cursors[0]
+	if c.Subject != p.Scope.SubjectID || c.Capability != string(p.Capability) {
+		t.Fatalf("cursor = %+v, want subject=%s capability=%s", c, p.Scope.SubjectID, p.Capability)
+	}
+	if c.ScopeDigest == "" {
+		t.Fatal("expected a non-empty scope digest")
+	}
+	wantNextRefresh := now.Add(5 * time.Minute)
+	if !c.NextRefreshAt.Equal(wantNextRefresh) {
+		t.Fatalf("next_refresh_at = %v, want %v", c.NextRefreshAt, wantNextRefresh)
+	}
+
+	// A later admission for the SAME (subject, capability, scope) upserts
+	// in place — never a second row — advancing next_refresh_at forward.
+	later := now.Add(10 * time.Minute)
+	if err := st.RecordObservationRefreshAdmissions(ctx, id, cycle.ID, []observationmodel.Plan{p}, 5*time.Minute, later); err != nil {
+		t.Fatalf("RecordObservationRefreshAdmissions (later): %v", err)
+	}
+	cursors2, err := st.LoadObservationRefreshCursors(ctx, id)
+	if err != nil {
+		t.Fatalf("LoadObservationRefreshCursors (later): %v", err)
+	}
+	if len(cursors2) != 1 {
+		t.Fatalf("cursors after re-admission = %+v, want still exactly 1 (upsert, not a new row)", cursors2)
+	}
+	if !cursors2[0].NextRefreshAt.Equal(later.Add(5 * time.Minute)) {
+		t.Fatalf("next_refresh_at after re-admission = %v, want %v", cursors2[0].NextRefreshAt, later.Add(5*time.Minute))
+	}
+}
+
 func TestPruneUnusedObservationDetailsExactBoundary(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)

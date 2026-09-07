@@ -457,6 +457,19 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		return err
 	}
 
+	// The bounded evidence-preparation runtime (Plan 4 Task 9): the
+	// concrete EvidencePreparer adapter — injected into the SAME controller
+	// crt drives, so every Reconcile cycle prepares real evidence through it
+	// — the semantic-profile inference workers, and the bounded profile-
+	// change/backfill/detail-cleanup sweeps. Extracted into
+	// buildPreparationRuntime (mirroring buildControllerRuntime's own
+	// extraction, and — see that function's own doc comment — panicking
+	// instead of returning a third "impossible in production" error) to
+	// keep runServe's own golangci-lint gocyclo complexity under the repo's
+	// threshold (Task 9 fix round, Finding #3's own established
+	// convention).
+	prt := buildPreparationRuntime(st, cfg, owner, llmClient, llmHealth, prom, logSrc, sentryClient, zbxClient, crt, auditor, logger)
+
 	// The Situation notification runtime (Plan 3 Task 9): the single
 	// reachable Situation Slack writer (present only when Situation Slack is
 	// actually configured — buildSituationNotificationRuntime) plus the
@@ -488,6 +501,12 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		backfillAndRecoverControllerWork: func(ctx context.Context) error {
 			return runControllerRecovery(ctx, crt, logger)
 		},
+		// Plan 4 Task 9: release stranded semantic-inference job leases and
+		// backfill any missed delivery-to-signature attachment — startup-only,
+		// zero-outward-effect, positioned right after controller recovery
+		// (the preparer it recovers state for is injected into that SAME
+		// controller) and before notification recovery.
+		recoverPreparationWork: prt.Recover,
 		// Plan 3 Task 9: recover abandoned notification/stream claims,
 		// schedule Situations whose durable history is missing or whose root
 		// projection is stale, validate the Slack configuration and record
@@ -521,6 +540,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		},
 		startWorkers:             rt.Start,
 		startControllerWorkers:   crt.Start,
+		startPreparationWorkers:  prt.Start,
 		startNotificationWorkers: nrt.Start,
 		startReceivers: func() error {
 			var err error
@@ -566,12 +586,14 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	// drain is a loop. stopCorrelator is the same sync.Once-guarded call the
 	// defer above falls back to on every other exit path.
 	stopSeq := foundationStopSequence{
-		stopReceivers:         receiverShutdown(shutdownCtx, recvSrv),
-		stopCorrelator:        stopCorrelator,
-		drainFoundationWork:   rt.Drain,
-		drainControllerWork:   crt.Drain,
-		stopControllerWorkers: crt.Stop,
-		stopWorkers:           rt.Stop,
+		stopReceivers:          receiverShutdown(shutdownCtx, recvSrv),
+		stopCorrelator:         stopCorrelator,
+		drainFoundationWork:    rt.Drain,
+		drainControllerWork:    crt.Drain,
+		drainPreparationWork:   prt.Drain,
+		stopControllerWorkers:  crt.Stop,
+		stopPreparationWorkers: prt.Stop,
+		stopWorkers:            rt.Stop,
 		// R6, last and outside the drain rounds: one bounded final delivery
 		// and stdout pass under the shutdown context, then claim release. An
 		// unreachable Slack delays the pass, it never holds the process.

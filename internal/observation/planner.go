@@ -3,6 +3,7 @@
 package observation
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -201,10 +202,53 @@ func buildCandidate(anchor time.Time, m MemberSubject, capability model.Capabili
 	if phase == model.PhaseLifecycle {
 		purpose = "lifecycle_watch"
 	}
+	params, err := capabilityParameters(capability, m.Labels)
+	if err != nil {
+		return Candidate{}, err
+	}
 	return Candidate{
 		Subject: m.SubjectID, Capability: capability, Scope: scope, Phase: phase,
 		Window: [2]time.Time{start, anchor}, Limit: limit, MaxRequests: maxRequests, Purpose: purpose,
+		Parameters: params,
 	}, nil
+}
+
+// capabilityParameters derives capability's own typed Plan.Parameters
+// payload from labels — the member's immutable, adapter-decoded label set
+// (never a raw label map any executor itself parses; see connectors/
+// store.go's own "this pure package never parses labels JSON itself"
+// convention). Only zabbix_metric_range/zabbix_problem_history need one:
+// ZabbixMetricExecutor/ZabbixProblemExecutor's own ItemKey/TriggerID have
+// no Scope.SubjectID fallback the way Host does (their own doc comments).
+// zabbix_trigger_id and item_key are internal/ingress/zabbix.go's own
+// established webhook label conventions — adapter-proven, never invented
+// here. A capability with no label to offer gets nil Parameters (the
+// connector's own "no fallback" check then honestly reports
+// vocabulary_unresolved, never a guessed target).
+func capabilityParameters(capability model.Capability, labels map[string]string) (json.RawMessage, error) {
+	switch capability {
+	case model.CapabilityZabbixMetricRange:
+		itemKey := labels["item_key"]
+		if itemKey == "" {
+			return nil, nil
+		}
+		return json.Marshal(struct {
+			ItemKey string `json:"item_key"`
+		}{ItemKey: itemKey})
+	case model.CapabilityZabbixProblemHist:
+		triggerID := labels["zabbix_trigger_id"]
+		if triggerID == "" {
+			return nil, nil
+		}
+		return json.Marshal(struct {
+			TriggerID string `json:"trigger_id"`
+		}{TriggerID: triggerID})
+	case model.CapabilityStoreRead, model.CapabilityPrometheusQuery, model.CapabilityLokiQuery,
+		model.CapabilitySentryIssues, model.CapabilityChangeEvents:
+		return nil, nil // no typed parameters needed — Scope alone (plus store_read's own GroupKey fallback) is enough.
+	default:
+		return nil, nil
+	}
 }
 
 // windowCapFor mirrors internal/observation/model's unexported windowCapFor
@@ -232,5 +276,6 @@ func candidateToPlan(c Candidate) model.Plan {
 		Capability: c.Capability, Phase: c.Phase, Scope: c.Scope,
 		Start: c.Window[0], End: c.Window[1], EligibleAt: c.Window[1],
 		Limit: c.Limit, MaxRequests: c.MaxRequests, Purpose: c.Purpose,
+		Parameters: c.Parameters,
 	}
 }

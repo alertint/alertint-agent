@@ -251,6 +251,17 @@ func (w *ControllerWorker) SetInferenceLimiter(l *llm.InferenceLimiter) {
 	w.assessClient.setInferenceLimiter(l)
 }
 
+// SetEvidencePreparer wires the production EvidencePreparer onto the
+// Controller this worker drives (Controller.SetEvidencePreparer) — the
+// same thin pass-through shape as SetAssessmentHealthObserver/
+// SetDependencyRecoveryWaker. cmd/alertint only ever holds a
+// *ControllerWorker, never the *Controller it builds internally, so this
+// is the seam Task 9's runtime wiring calls. Not safe to call concurrently
+// with Start/RunOnce; call it once, right after construction.
+func (w *ControllerWorker) SetEvidencePreparer(p EvidencePreparer) {
+	w.controller.SetEvidencePreparer(p)
+}
+
 // NewControllerWorker constructs a ControllerWorker. It builds its own
 // *Controller internally (via NewController) so it can wrap client in the
 // global L2 semaphore before Reconcile ever sees it — workStore is the

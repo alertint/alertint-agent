@@ -1023,6 +1023,116 @@ func decodeRunCursor(cursor string) ([2]string, error) {
 	return [2]string{}, fmt.Errorf("store: malformed observation run cursor %q", cursor)
 }
 
+// ObservationRefreshCursor is one (subject, capability, scope) admission
+// cursor's read-only projection for the planner (converted to
+// observation.RefreshCursor by the runtime adapter, cmd/alertint — this
+// package returns a plain transport-neutral struct rather than importing
+// internal/observation, the same "store stays shape-neutral" convention
+// triageAttemptStoreAdapter's own doc comment documents).
+type ObservationRefreshCursor struct {
+	Subject, Capability, ScopeDigest string
+	NextRefreshAt                    time.Time
+}
+
+// LoadObservationRefreshCursors reads every currently-tracked refresh
+// cursor for situationID — spec.md: "A separate per-subject/capability
+// refresh cursor survives cycles and input versions." An empty result
+// means every capability/subject pair is due (no admission has ever been
+// recorded), matching BuildPlans' own "no cursor -> due" default.
+func (s *Store) LoadObservationRefreshCursors(ctx context.Context, situationID string) ([]ObservationRefreshCursor, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT subject, capability, scope_digest, next_refresh_at
+		FROM situation_observation_refresh WHERE situation_id = ?`, situationID)
+	if err != nil {
+		return nil, fmt.Errorf("store: query observation refresh cursors: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []ObservationRefreshCursor
+	for rows.Next() {
+		var c ObservationRefreshCursor
+		var nextRefreshAt string
+		if err := rows.Scan(&c.Subject, &c.Capability, &c.ScopeDigest, &nextRefreshAt); err != nil {
+			return nil, fmt.Errorf("store: scan observation refresh cursor: %w", err)
+		}
+		t, err := time.Parse(time.RFC3339Nano, nextRefreshAt)
+		if err != nil {
+			return nil, fmt.Errorf("store: parse observation refresh cursor next_refresh_at: %w", err)
+		}
+		c.NextRefreshAt = t
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate observation refresh cursors: %w", err)
+	}
+	return out, nil
+}
+
+// RecordObservationRefreshAdmissions upserts one refresh cursor per
+// distinct (subject, capability, scope) among plans, admitting a fresh
+// read as of now and setting next_refresh_at to now+refreshInterval —
+// spec.md: "Record admission of a fresh read with its first durable
+// request reservation, not only with a successful run commit." This
+// implementation's own anchor is "once this phase's plans have been
+// handed to the Runner" rather than literally the first physical
+// reservation inside a multi-request plan — a deliberate, documented
+// simplification: both anchors equally prevent an immediate re-plan storm
+// next cycle, and the plan set handed to RunPhase is exactly the same
+// bounded, deduplicated set a true per-reservation hook would admit onto.
+// A later admission for an already-tracked (subject, capability, scope)
+// upserts in place (never a second row), always moving next_refresh_at
+// forward from the call's own now.
+func (s *Store) RecordObservationRefreshAdmissions(ctx context.Context, situationID, cycleID string, plans []observationmodel.Plan, refreshInterval time.Duration, now time.Time) error {
+	if len(plans) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin record observation refresh admissions: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	servedAt := canonicalTime(now)
+	nextRefreshAt := canonicalTime(now.Add(refreshInterval))
+	seen := make(map[string]bool, len(plans))
+	for _, p := range plans {
+		digest, err := scopeDigest(p.Scope)
+		if err != nil {
+			return fmt.Errorf("store: digest observation plan scope: %w", err)
+		}
+		key := p.Scope.SubjectID + "|" + string(p.Capability) + "|" + digest
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO situation_observation_refresh (
+				situation_id, subject, capability, scope_digest, last_served_at, next_refresh_at, admitted_cycle_id
+			) VALUES (?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(situation_id, subject, capability, scope_digest) DO UPDATE SET
+				last_served_at = excluded.last_served_at, next_refresh_at = excluded.next_refresh_at,
+				admitted_cycle_id = excluded.admitted_cycle_id`,
+			situationID, p.Scope.SubjectID, string(p.Capability), digest, servedAt, nextRefreshAt, cycleID); err != nil {
+			return fmt.Errorf("store: upsert observation refresh cursor: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit record observation refresh admissions: %w", err)
+	}
+	return nil
+}
+
+// scopeDigest deterministically hashes p's Scope — json.Marshal already
+// sorts map keys, so this is stable regardless of Labels' iteration order.
+func scopeDigest(scope observationmodel.Scope) (string, error) {
+	b, err := json.Marshal(scope)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:]), nil
+}
+
 // PruneUnusedObservationDetails deletes unused (unreferenced) fact-value
 // payloads whose owning run completed at least ten days ago, in batches of
 // at most 100 runs per transaction, and records an immutable expiration

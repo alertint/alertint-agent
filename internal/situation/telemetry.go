@@ -77,6 +77,23 @@ const (
 	// write and acknowledgement. Emitted from internal/notify/stdout through
 	// Tracer(), so it lands on this same scope.
 	SpanTransitionStreamEmit = "situation.transition_stream.emit"
+
+	// Plan 4 Task 9: one additional span on this SAME scope, wrapping each
+	// EvidencePreparer.Prepare call reconcile's own prepareLifecyclePhase/
+	// prepareAssessmentPhaseIfActive make (Task 6). Started only after
+	// c.preparer is known non-nil (a build with no preparer configured
+	// emits nothing for this span, exactly like every other nil-guarded
+	// optional dependency in this package).
+
+	// SpanEvidencePreparation covers one bounded preparation phase call:
+	// planning, executing connector reads, and durably committing this
+	// cycle's evidence, entirely inside the EvidencePreparer adapter
+	// (cmd/alertint). Each individual plan's own connector dispatch gets
+	// its own NESTED internal/observation.SpanObservationRun; each
+	// profile-inference dispatch its own semanticprofile.SpanSemanticInference —
+	// neither of which this package can import, so those two spans are
+	// defined and started in their own packages instead.
+	SpanEvidencePreparation = "situation.preparation"
 )
 
 // Attribute keys (stable). Identity, digests, counts, closed result
@@ -112,6 +129,11 @@ const (
 	AttrIntentEffectClass  = attribute.Key("alertint.intent.effect_class")
 	AttrIntentAttempt      = attribute.Key("alertint.intent.attempt")
 	AttrGapGeneration      = attribute.Key("alertint.gap.generation")
+
+	// AttrPreparationPhase is Plan 4 Task 9's own addition, for
+	// SpanEvidencePreparation: the closed two-value observationmodel.Phase
+	// ("lifecycle"|"assessment") this Prepare call ran.
+	AttrPreparationPhase = attribute.Key("alertint.preparation.phase")
 )
 
 // Closed result classes for SpanHistoryCommit's AttrResultClass.
@@ -138,6 +160,12 @@ const (
 	StreamResultEmitted = "emitted"
 	StreamResultRetried = "retried"
 	StreamResultFailed  = "failed"
+)
+
+// Closed result classes for SpanEvidencePreparation's AttrResultClass.
+const (
+	PreparationResultCommitted = "committed"
+	PreparationResultError     = "error"
 )
 
 // ----------------------------------------------------------------------

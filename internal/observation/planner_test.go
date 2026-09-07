@@ -3,6 +3,7 @@
 package observation
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -47,6 +48,92 @@ func TestBuildPlansDeterministicForFixedInput(t *testing.T) {
 	}
 	if !plans1[0].End.Equal(anchor) {
 		t.Fatalf("plan end = %v, want anchor %v", plans1[0].End, anchor)
+	}
+}
+
+// TestBuildPlansDerivesZabbixParametersFromMemberLabels proves the planner
+// carries adapter-proven zabbix_trigger_id/item_key labels (internal/
+// ingress/zabbix.go's own webhook receiver sets both) through into each
+// candidate's typed Plan.Parameters — the ONLY way ZabbixMetricExecutor/
+// ZabbixProblemExecutor's own ItemKey/TriggerID (documented as having "no
+// fallback") can ever resolve; Host already falls back to Scope.SubjectID
+// without this.
+func TestBuildPlansDerivesZabbixParametersFromMemberLabels(t *testing.T) {
+	anchor := time.Date(2026, 9, 6, 17, 0, 0, 0, time.UTC)
+	in := PlannerInput{
+		Anchor: anchor, GroupKey: "service=checkout", Phase: model.PhaseAssessment,
+		Members: []MemberSubject{
+			{SubjectID: "host-a", Source: "zabbix", Labels: map[string]string{
+				"zabbix_trigger_id": "trigger-123", "item_key": "vfs.fs.size[/,pfree]",
+			}},
+		},
+		Configured: []CapabilityDescriptor{
+			{Capability: model.CapabilityZabbixMetricRange, DefaultWindow: time.Hour, DefaultLimit: 20, MaxRequestsHint: 1},
+			{Capability: model.CapabilityZabbixProblemHist, DefaultWindow: time.Hour, DefaultLimit: 20, MaxRequestsHint: 1},
+		},
+		CycleCap: 6,
+	}
+	plans, _, err := BuildPlans(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plans) != 2 {
+		t.Fatalf("plans = %d, want 2", len(plans))
+	}
+	byCapability := make(map[model.Capability]model.Plan, len(plans))
+	for _, p := range plans {
+		byCapability[p.Capability] = p
+	}
+
+	metricPlan := byCapability[model.CapabilityZabbixMetricRange]
+	var metricParams struct {
+		ItemKey string `json:"item_key"`
+	}
+	if err := json.Unmarshal(metricPlan.Parameters, &metricParams); err != nil {
+		t.Fatalf("unmarshal zabbix_metric_range parameters: %v (raw=%s)", err, metricPlan.Parameters)
+	}
+	if metricParams.ItemKey != "vfs.fs.size[/,pfree]" {
+		t.Fatalf("item_key = %q, want vfs.fs.size[/,pfree]", metricParams.ItemKey)
+	}
+
+	problemPlan := byCapability[model.CapabilityZabbixProblemHist]
+	var problemParams struct {
+		TriggerID string `json:"trigger_id"`
+	}
+	if err := json.Unmarshal(problemPlan.Parameters, &problemParams); err != nil {
+		t.Fatalf("unmarshal zabbix_problem_history parameters: %v (raw=%s)", err, problemPlan.Parameters)
+	}
+	if problemParams.TriggerID != "trigger-123" {
+		t.Fatalf("trigger_id = %q, want trigger-123", problemParams.TriggerID)
+	}
+}
+
+// TestBuildPlansOmitsZabbixParametersWhenLabelsAbsent proves a member with
+// no proven zabbix_trigger_id/item_key label produces a plan with empty
+// Parameters — never a fabricated identifier — so the connector's own
+// "no fallback" ItemKey/TriggerID check correctly, honestly reports
+// vocabulary_unresolved rather than querying an invented target.
+func TestBuildPlansOmitsZabbixParametersWhenLabelsAbsent(t *testing.T) {
+	anchor := time.Date(2026, 9, 6, 17, 0, 0, 0, time.UTC)
+	in := PlannerInput{
+		Anchor: anchor, GroupKey: "service=checkout", Phase: model.PhaseAssessment,
+		Members: []MemberSubject{
+			{SubjectID: "host-b", Source: "zabbix", Labels: map[string]string{}},
+		},
+		Configured: []CapabilityDescriptor{
+			{Capability: model.CapabilityZabbixMetricRange, DefaultWindow: time.Hour, DefaultLimit: 20, MaxRequestsHint: 1},
+		},
+		CycleCap: 6,
+	}
+	plans, _, err := BuildPlans(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plans) != 1 {
+		t.Fatalf("plans = %d, want 1", len(plans))
+	}
+	if len(plans[0].Parameters) != 0 {
+		t.Fatalf("parameters = %s, want empty (no proven item_key label)", plans[0].Parameters)
 	}
 }
 
