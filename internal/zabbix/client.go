@@ -27,6 +27,14 @@ import (
 // read into memory. Callers classify it with errors.Is.
 var ErrResponseTooLarge = errors.New("zabbix: response exceeds the bounded decoded-body limit")
 
+// ErrRedirectRefused is returned by the bounded (proactive preparation)
+// request path — every callInstrumented dispatch — when the frontend
+// answers 3xx. Following a redirect would be a second physical request
+// (a re-POST of the JSON-RPC body) outside the one durable reservation
+// that wrapped this call, so the bounded path never follows one. Callers
+// classify it with errors.Is.
+var ErrRedirectRefused = errors.New("zabbix: redirect refused on the bounded request path")
+
 type Config struct {
 	BaseURL              string // Zabbix frontend; "/api_jsonrpc.php" is appended
 	APIToken             string
@@ -36,8 +44,12 @@ type Config struct {
 }
 
 type Client struct {
-	endpoint         string
-	httpClient       *http.Client
+	endpoint   string
+	httpClient *http.Client
+	// boundedHTTP is httpClient with redirects disabled — the transport the
+	// bounded (proactive) callInstrumented path uses so one reservation is
+	// exactly one physical request.
+	boundedHTTP      *http.Client
 	authHeader       string
 	historyRetention time.Duration
 	flapWindow       time.Duration
@@ -56,13 +68,24 @@ func NewClient(cfg Config) *Client {
 	if fw <= 0 {
 		fw = 24
 	}
+	httpClient := &http.Client{Timeout: timeout}
 	return &Client{
 		endpoint:         strings.TrimRight(cfg.BaseURL, "/") + "/api_jsonrpc.php",
-		httpClient:       &http.Client{Timeout: timeout},
+		httpClient:       httpClient,
+		boundedHTTP:      noRedirectClient(httpClient),
 		authHeader:       "Bearer " + cfg.APIToken,
 		historyRetention: time.Duration(hr) * 24 * time.Hour,
 		flapWindow:       time.Duration(fw) * time.Hour,
 	}
+}
+
+// noRedirectClient returns a shallow copy of base whose redirect policy
+// hands every 3xx back as the final response (http.ErrUseLastResponse)
+// instead of issuing a further, unreserved physical request.
+func noRedirectClient(base *http.Client) *http.Client {
+	cp := *base
+	cp.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &cp
 }
 
 // FlapWindow exposes the configured flap look-back for callers computing "since".
@@ -138,7 +161,11 @@ func (c *Client) rpc(ctx context.Context, method string, params any, withAuth bo
 	if withAuth {
 		req.Header.Set("Authorization", c.authHeader)
 	}
-	resp, err := c.httpClient.Do(req)
+	httpClient := c.httpClient
+	if bounded {
+		httpClient = c.boundedHTTP
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		if after != nil {
 			after(true, err)
@@ -146,6 +173,12 @@ func (c *Client) rpc(ctx context.Context, method string, params any, withAuth bo
 		return fmt.Errorf("zabbix request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if bounded && resp.StatusCode >= 300 && resp.StatusCode <= 399 {
+		if after != nil {
+			after(true, ErrRedirectRefused)
+		}
+		return ErrRedirectRefused
+	}
 	var body []byte
 	if bounded {
 		body, err = readBounded(resp.Body, model.MaxDecodedResponseBytes)

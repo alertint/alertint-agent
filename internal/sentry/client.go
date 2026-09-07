@@ -33,6 +33,13 @@ import (
 // into memory. Callers classify it with errors.Is.
 var ErrResponseTooLarge = errors.New("sentry: response exceeds the bounded decoded-body limit")
 
+// ErrRedirectRefused is returned by the bounded (proactive preparation)
+// request path when the source answers 3xx. Following a redirect would be
+// a second physical request outside the one durable reservation that
+// wrapped this attempt, so the bounded path never follows one; a 3xx is
+// also never retried. Callers classify it with errors.Is.
+var ErrRedirectRefused = errors.New("sentry: redirect refused on the bounded request path")
+
 // defaultTimeout matches the Prometheus/Loki clients.
 const defaultTimeout = 10 * time.Second
 
@@ -82,7 +89,11 @@ type Client struct {
 	baseURL    string
 	org        string
 	httpClient *http.Client
-	authHeader string
+	// boundedHTTP is httpClient with redirects disabled — the transport the
+	// bounded (proactive) methods use so one reservation is exactly one
+	// physical request.
+	boundedHTTP *http.Client
+	authHeader  string
 
 	// clk and maxRetries are overridable by same-package tests for
 	// deterministic rate-limit/backoff coverage without real sleeps.
@@ -108,14 +119,25 @@ func NewClient(cfg Config) *Client {
 	if timeout == 0 {
 		timeout = defaultTimeout
 	}
+	httpClient := &http.Client{Timeout: timeout}
 	return &Client{
-		baseURL:    strings.TrimRight(cfg.BaseURL, "/"),
-		org:        cfg.Org,
-		httpClient: &http.Client{Timeout: timeout},
-		authHeader: "Bearer " + cfg.Token,
-		clk:        realClock{},
-		maxRetries: defaultMaxRetries,
+		baseURL:     strings.TrimRight(cfg.BaseURL, "/"),
+		org:         cfg.Org,
+		httpClient:  httpClient,
+		boundedHTTP: noRedirectClient(httpClient),
+		authHeader:  "Bearer " + cfg.Token,
+		clk:         realClock{},
+		maxRetries:  defaultMaxRetries,
 	}
+}
+
+// noRedirectClient returns a shallow copy of base whose redirect policy
+// hands every 3xx back as the final response (http.ErrUseLastResponse)
+// instead of issuing a further, unreserved physical request.
+func noRedirectClient(base *http.Client) *http.Client {
+	cp := *base
+	cp.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &cp
 }
 
 // BaseURL returns the host-root base URL the client was built with (used by the
@@ -192,7 +214,7 @@ func (c *Client) ListDeploys(ctx context.Context, project, version string) ([]De
 // returns a typed *APIError carrying the status. The caller owns Body.Close on
 // success.
 func (c *Client) doGET(ctx context.Context, path string, query url.Values) (*http.Response, error) {
-	return c.doGETInstrumented(ctx, path, query, nil, nil)
+	return c.doGETLoop(ctx, path, query, nil, nil, false)
 }
 
 // doGETInstrumented is doGET with a per-physical-attempt hook, for the
@@ -201,10 +223,23 @@ func (c *Client) doGET(ctx context.Context, path string, query url.Values) (*htt
 // apparent call"): before is called immediately before EACH physical
 // attempt, including 429/5xx retries — a non-nil error aborts before that
 // attempt is made; after reports each attempt's outcome immediately once
-// it completes. Both may be nil (doGET's own uninstrumented behavior).
+// it completes. Both may be nil. Unlike doGET it never follows a redirect
+// (ErrRedirectRefused, reported through after and never retried), so each
+// before/after pair is exactly one physical request.
 func (c *Client) doGETInstrumented(ctx context.Context, path string, query url.Values,
 	before func() error, after func(started bool, err error)) (*http.Response, error) {
+	return c.doGETLoop(ctx, path, query, before, after, true)
+}
+
+// doGETLoop is the shared retry loop behind doGET (bounded=false: legacy
+// redirect-following transport) and doGETInstrumented (bounded=true).
+func (c *Client) doGETLoop(ctx context.Context, path string, query url.Values,
+	before func() error, after func(started bool, err error), bounded bool) (*http.Response, error) {
 	target := c.baseURL + path
+	httpClient := c.httpClient
+	if bounded {
+		httpClient = c.boundedHTTP
+	}
 	if enc := query.Encode(); enc != "" {
 		target += "?" + enc
 	}
@@ -228,7 +263,7 @@ func (c *Client) doGETInstrumented(ctx context.Context, path string, query url.V
 		}
 		req.Header.Set("Authorization", c.authHeader)
 
-		resp, err := c.httpClient.Do(req)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			if after != nil {
 				after(true, err)
@@ -240,6 +275,13 @@ func (c *Client) doGETInstrumented(ctx context.Context, path string, query url.V
 				after(true, nil)
 			}
 			return resp, nil
+		}
+		if bounded && resp.StatusCode >= 300 && resp.StatusCode <= 399 {
+			_ = resp.Body.Close()
+			if after != nil {
+				after(true, ErrRedirectRefused)
+			}
+			return nil, ErrRedirectRefused
 		}
 
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrBody))

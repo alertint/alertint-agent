@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -89,6 +90,56 @@ func TestQueryRangeBounded_GzipIsCappedAfterDecoding(t *testing.T) {
 	_, err := c.QueryRangeBounded(context.Background(), `up`, end.Add(-time.Hour), end, 0, 21)
 	if !errors.Is(err, ErrResponseTooLarge) {
 		t.Fatalf("err = %v, want ErrResponseTooLarge for a gzip body that inflates past the cap", err)
+	}
+}
+
+// redirectServer answers every request with a 302 to a fresh path and
+// counts the physical requests received, so a redirect-following client is
+// visibly distinguishable from a refusing one.
+func redirectServer(t *testing.T, final []byte) (*httptest.Server, *int32) {
+	t.Helper()
+	var physical int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		physical++
+		if physical < 3 {
+			http.Redirect(w, r, "/hop/"+strconv.Itoa(int(physical)), http.StatusFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(final)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &physical
+}
+
+// TestQueryRangeBounded_RefusesRedirect proves the bounded path treats a
+// 3xx as the final answer (ErrRedirectRefused) after exactly one physical
+// request — a followed redirect would be an unreserved second dispatch
+// (F19).
+func TestQueryRangeBounded_RefusesRedirect(t *testing.T) {
+	srv, physical := redirectServer(t, []byte(`{"status":"success","data":{"resultType":"matrix","result":[]}}`))
+	c := NewClient(Config{BaseURL: srv.URL, TimeoutSeconds: 5})
+	end := time.Now()
+	_, err := c.QueryRangeBounded(context.Background(), `up`, end.Add(-time.Hour), end, 0, 21)
+	if !errors.Is(err, ErrRedirectRefused) {
+		t.Fatalf("err = %v, want ErrRedirectRefused", err)
+	}
+	if *physical != 1 {
+		t.Fatalf("physical requests = %d, want 1", *physical)
+	}
+}
+
+// TestQueryRange_LegacyFollowsRedirect pins that the legacy path keeps
+// http.Client's default redirect policy.
+func TestQueryRange_LegacyFollowsRedirect(t *testing.T) {
+	srv, physical := redirectServer(t, []byte(`{"status":"success","data":{"resultType":"matrix","result":[]}}`))
+	c := NewClient(Config{BaseURL: srv.URL, TimeoutSeconds: 5})
+	end := time.Now()
+	if _, err := c.QueryRange(context.Background(), `up`, end.Add(-time.Hour), end, 0); err != nil {
+		t.Fatalf("legacy QueryRange must still follow redirects: %v", err)
+	}
+	if *physical != 3 {
+		t.Fatalf("physical requests = %d, want 3 (two hops followed)", *physical)
 	}
 }
 

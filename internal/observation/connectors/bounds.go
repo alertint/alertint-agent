@@ -24,10 +24,14 @@ import (
 //   - response_too_large: the DECODED body exceeded
 //     model.MaxDecodedResponseBytes; the connector persists a truncated,
 //     incomplete run with NO data from that response (F10).
+//   - redirect_refused: the source answered 3xx; the bounded path never
+//     follows it (that would be a second, unreserved physical request), so
+//     the plan fails with exactly one dispatch accounted for (F19).
 const (
 	outcomeOK               = "ok"
 	outcomeTransportFailure = "transport_failure"
 	outcomeResponseTooLarge = "response_too_large"
+	outcomeRedirectRefused  = "redirect_refused"
 )
 
 // Limitation codes shared across connectors (per-connector ones such as
@@ -46,9 +50,20 @@ func outcomeCode(err error) string {
 		return outcomeOK
 	case isResponseTooLarge(err):
 		return outcomeResponseTooLarge
+	case isRedirectRefused(err):
+		return outcomeRedirectRefused
 	default:
 		return outcomeTransportFailure
 	}
+}
+
+// isRedirectRefused reports whether err is any transport package's
+// refused-redirect sentinel.
+func isRedirectRefused(err error) bool {
+	return errors.Is(err, prometheus.ErrRedirectRefused) ||
+		errors.Is(err, loki.ErrRedirectRefused) ||
+		errors.Is(err, sentry.ErrRedirectRefused) ||
+		errors.Is(err, zabbix.ErrRedirectRefused)
 }
 
 // isResponseTooLarge reports whether err is any transport package's

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -64,6 +65,57 @@ func TestMetricHistoryBounded_RefusesOversizedDecodedBody(t *testing.T) {
 		func() error { return nil }, func(bool, error) {})
 	if !errors.Is(err, zabbix.ErrResponseTooLarge) {
 		t.Fatalf("err = %v, want ErrResponseTooLarge", err)
+	}
+}
+
+// redirectServer answers the first two requests with a 307 (which a
+// following client would re-POST) and the third with body, counting
+// physical requests.
+func redirectServer(t *testing.T, body string) (*httptest.Server, *int32) {
+	t.Helper()
+	var physical int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		physical++
+		if physical < 3 {
+			http.Redirect(w, r, "/hop/"+strconv.Itoa(int(physical))+"/api_jsonrpc.php", http.StatusTemporaryRedirect)
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &physical
+}
+
+// TestProblemHistory_RefusesRedirect proves the instrumented JSON-RPC path
+// treats a 3xx as the final answer (ErrRedirectRefused, reported through
+// after()) after exactly one physical request — never a re-POST (F19).
+func TestProblemHistory_RefusesRedirect(t *testing.T) {
+	srv, physical := redirectServer(t, `{"jsonrpc":"2.0","id":1,"result":[]}`)
+	c := zabbix.NewClient(zabbix.Config{BaseURL: srv.URL, APIToken: "tok"})
+	var befores int
+	var afterErrs []error
+	_, err := c.ProblemHistory(context.Background(), "web01", "1", time.Now().Add(-time.Hour), time.Now(), "", 20,
+		func() error { befores++; return nil },
+		func(started bool, err error) { afterErrs = append(afterErrs, err) })
+	if !errors.Is(err, zabbix.ErrRedirectRefused) {
+		t.Fatalf("err = %v, want ErrRedirectRefused", err)
+	}
+	if *physical != 1 || befores != 1 || len(afterErrs) != 1 || !errors.Is(afterErrs[0], zabbix.ErrRedirectRefused) {
+		t.Fatalf("physical=%d befores=%d afters=%v, want one accounted request carrying the sentinel", *physical, befores, afterErrs)
+	}
+}
+
+// TestMetricHistory_LegacyFollowsRedirect pins that the legacy
+// uninstrumented path keeps http.Client's default redirect policy.
+func TestMetricHistory_LegacyFollowsRedirect(t *testing.T) {
+	srv, physical := redirectServer(t, `{"jsonrpc":"2.0","id":1,"result":[{"itemid":"100","value_type":"0"}]}`)
+	c := zabbix.NewClient(zabbix.Config{BaseURL: srv.URL, APIToken: "tok"})
+	now := time.Now()
+	if _, err := c.MetricHistory(context.Background(), "web01", "k", now.Add(-time.Hour), now, 10); err != nil {
+		t.Fatalf("legacy MetricHistory must still follow redirects: %v", err)
+	}
+	if *physical < 3 {
+		t.Fatalf("physical requests = %d, want the two hops followed", *physical)
 	}
 }
 

@@ -37,14 +37,25 @@ import (
 // Callers classify it with errors.Is.
 var ErrResponseTooLarge = errors.New("loki: response exceeds the bounded decoded-body limit")
 
+// ErrRedirectRefused is returned by the bounded (proactive preparation)
+// request path when the source answers 3xx. Following a redirect would be
+// a second physical request outside the one durable reservation that
+// wrapped this call, so the bounded path never follows one. Callers
+// classify it with errors.Is.
+var ErrRedirectRefused = errors.New("loki: redirect refused on the bounded request path")
+
 // Client is a read-only Loki HTTP API v1 client implementing logs.Source.
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
-	authHeader string
-	orgID      string
-	lineFilter string
-	labelMap   map[string]string
+	// boundedHTTP is httpClient with redirects disabled — the transport the
+	// bounded (proactive) methods use so one reservation is exactly one
+	// physical request.
+	boundedHTTP *http.Client
+	authHeader  string
+	orgID       string
+	lineFilter  string
+	labelMap    map[string]string
 }
 
 // Config holds the values needed to construct a Client. The secret (bearer
@@ -69,12 +80,14 @@ func NewClient(cfg Config) *Client {
 	if timeout == 0 {
 		timeout = 10 * time.Second
 	}
+	httpClient := &http.Client{Timeout: timeout}
 	c := &Client{
-		baseURL:    strings.TrimRight(cfg.BaseURL, "/"),
-		httpClient: &http.Client{Timeout: timeout},
-		orgID:      cfg.OrgID,
-		lineFilter: cfg.LineFilter,
-		labelMap:   cfg.LabelMap,
+		baseURL:     strings.TrimRight(cfg.BaseURL, "/"),
+		httpClient:  httpClient,
+		boundedHTTP: noRedirectClient(httpClient),
+		orgID:       cfg.OrgID,
+		lineFilter:  cfg.LineFilter,
+		labelMap:    cfg.LabelMap,
 	}
 	switch cfg.AuthMode {
 	case "bearer":
@@ -322,13 +335,20 @@ func (c *Client) doAPIGet(ctx context.Context, path string, params url.Values, b
 		req.Header["X-Scope-OrgID"] = []string{c.orgID}
 	}
 
-	resp, err := c.httpClient.Do(req)
+	httpClient := c.httpClient
+	if bounded {
+		httpClient = c.boundedHTTP
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("loki request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	var body []byte
+	if bounded && resp.StatusCode >= 300 && resp.StatusCode <= 399 {
+		return nil, ErrRedirectRefused
+	}
 	if bounded {
 		body, err = readBounded(resp.Body, model.MaxDecodedResponseBytes)
 	} else {
@@ -355,6 +375,15 @@ func (c *Client) doAPIGet(ctx context.Context, path string, params url.Values, b
 		return nil, fmt.Errorf("loki: query status %q", envelope.Status)
 	}
 	return envelope.Data, nil
+}
+
+// noRedirectClient returns a shallow copy of base whose redirect policy
+// hands every 3xx back as the final response (http.ErrUseLastResponse)
+// instead of issuing a further, unreserved physical request.
+func noRedirectClient(base *http.Client) *http.Client {
+	cp := *base
+	cp.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &cp
 }
 
 // readBounded reads at most limit bytes of the (already transport-decoded)
