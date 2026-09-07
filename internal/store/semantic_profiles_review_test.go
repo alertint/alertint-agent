@@ -4,6 +4,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"testing"
 	"time"
@@ -207,6 +208,206 @@ func TestClaimSemanticInferenceJobExhaustsFinalReservationCrashOnReclaim(t *test
 	status, ownerSet := getJobStatus(t, st, claim.JobID)
 	if status != profilemodel.JobStateExhausted || ownerSet {
 		t.Fatalf("status = %q ownerSet=%v, want exhausted with the lease released", status, ownerSet)
+	}
+}
+
+// semanticJobRow is the bounded job-row projection the review tests below
+// assert on.
+type semanticJobRow struct {
+	status             string
+	attempt            int
+	attemptBudget      int
+	rearmedGeneration  int64
+	errorClass         sql.NullString
+	retryAt            sql.NullString
+	ownerSet           bool
+	frozenInputDigest  string
+	maxAttemptsFrozen  int
+	signatureKeyOfRow  string
+	expectedHeadVerion int
+}
+
+func readSemanticJobRow(t *testing.T, st *Store, jobID string) semanticJobRow {
+	t.Helper()
+	var r semanticJobRow
+	var owner sql.NullString
+	if err := st.db.QueryRowContext(context.Background(), `
+		SELECT status, attempt, attempt_budget, rearmed_generation, error_class, retry_at, owner,
+		       frozen_input_digest, max_attempts, signature_key, expected_head_version
+		FROM semantic_profile_inference_jobs WHERE id = ?`, jobID).
+		Scan(&r.status, &r.attempt, &r.attemptBudget, &r.rearmedGeneration, &r.errorClass, &r.retryAt, &owner,
+			&r.frozenInputDigest, &r.maxAttemptsFrozen, &r.signatureKeyOfRow, &r.expectedHeadVerion); err != nil {
+		t.Fatalf("read job %s: %v", jobID, err)
+	}
+	r.ownerSet = owner.Valid
+	return r
+}
+
+// completeOneSemanticAttempt claims the one due job as owner, reserves one
+// call, and completes it with outcome through the real dispatch surface.
+func completeOneSemanticAttempt(t *testing.T, st *Store, owner string, now time.Time, outcome string) profilemodel.JobClaim {
+	t.Helper()
+	ctx := context.Background()
+	claim, found, err := st.ClaimSemanticInferenceJob(ctx, owner, now, time.Minute)
+	if err != nil || !found {
+		t.Fatalf("claim as %s: found=%v err=%v", owner, found, err)
+	}
+	callID, _, err := st.ReserveSemanticInferenceCall(ctx, claim.JobID, claim.Owner, claim.Token, now)
+	if err != nil {
+		t.Fatalf("reserve as %s: %v", owner, err)
+	}
+	result := profilemodel.InferenceResult{Outcome: outcome, RequestStarted: "unknown", PromptVersion: profilemodel.PromptVersion}
+	if outcome == profilemodel.InferenceOutcomeAccepted {
+		result.Profile = &profilemodel.Profile{
+			SubjectKind: "service", EventKind: "availability", PossibleRole: "symptom",
+			CandidateScope: []string{"service"}, HorizonTier: "hours",
+		}
+		result.RequestStarted = "true"
+	}
+	retryAt := now.Add(time.Minute)
+	if err := st.CompleteSemanticInference(ctx, callID, claim.Owner, claim.Token, result, now, &retryAt); err != nil {
+		t.Fatalf("complete as %s with %s: %v", owner, outcome, err)
+	}
+	return claim
+}
+
+// TestCompleteSemanticInferencePersistsTypedErrorClass (F14): every
+// non-accepted completion persists its closed error class on the job — a
+// transport failure is dependency-class, a malformed response is
+// content-class — and a healthy completion clears it.
+func TestCompleteSemanticInferencePersistsTypedErrorClass(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+
+	seedPendingInferenceJob(t, st, "job-class-dep", "sig:class-dep", 3, nil, now)
+	claim := completeOneSemanticAttempt(t, st, "worker-a", now, profilemodel.InferenceOutcomeFailed)
+	if r := readSemanticJobRow(t, st, claim.JobID); !r.errorClass.Valid || r.errorClass.String != profilemodel.ErrorClassDependency {
+		t.Fatalf("error_class after a transport failure = %v, want %q", r.errorClass, profilemodel.ErrorClassDependency)
+	}
+	completeOneSemanticAttempt(t, st, "worker-b", now.Add(2*time.Minute), profilemodel.InferenceOutcomeMalformed)
+	if r := readSemanticJobRow(t, st, claim.JobID); !r.errorClass.Valid || r.errorClass.String != profilemodel.ErrorClassContent {
+		t.Fatalf("error_class after a malformed response = %v, want %q", r.errorClass, profilemodel.ErrorClassContent)
+	}
+	completeOneSemanticAttempt(t, st, "worker-c", now.Add(4*time.Minute), profilemodel.InferenceOutcomeAccepted)
+	r := readSemanticJobRow(t, st, claim.JobID)
+	if r.errorClass.Valid {
+		t.Fatalf("error_class after an accepted completion = %q, want cleared", r.errorClass.String)
+	}
+	if r.status != profilemodel.JobStateComplete {
+		t.Fatalf("status = %q, want complete", r.status)
+	}
+}
+
+// TestRearmDependencyExhaustedSemanticJobsOncePerHealthyGeneration (F14):
+// a dependency-exhausted job re-arms exactly once per newer durable
+// healthy generation — one more full max_attempts of budget, immediately
+// claimable — a replay within the same generation is a no-op, and a job
+// that exhausts again waits for the NEXT generation.
+func TestRearmDependencyExhaustedSemanticJobsOncePerHealthyGeneration(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	seedPendingInferenceJob(t, st, "job-rearm", "sig:rearm", 1, nil, now)
+
+	claim := completeOneSemanticAttempt(t, st, "worker-a", now, profilemodel.InferenceOutcomeFailed)
+	if r := readSemanticJobRow(t, st, claim.JobID); r.status != profilemodel.JobStateExhausted {
+		t.Fatalf("status after the only attempt failed = %q, want exhausted", r.status)
+	}
+	if _, found, err := st.ClaimSemanticInferenceJob(ctx, "worker-b", now.Add(time.Minute), time.Minute); err != nil || found {
+		t.Fatalf("claim of an exhausted job = (found=%v, %v), want (false, nil)", found, err)
+	}
+
+	// Generation 0 is never a recovery.
+	if n, err := st.RearmDependencyExhaustedSemanticJobs(ctx, 0, now.Add(time.Minute)); err != nil || n != 0 {
+		t.Fatalf("rearm at generation 0 = (%d, %v), want (0, nil)", n, err)
+	}
+
+	n, err := st.RearmDependencyExhaustedSemanticJobs(ctx, 1, now.Add(time.Minute))
+	if err != nil || n != 1 {
+		t.Fatalf("rearm at generation 1 = (%d, %v), want (1, nil)", n, err)
+	}
+	r := readSemanticJobRow(t, st, claim.JobID)
+	if r.status != profilemodel.JobStatePending || r.ownerSet || r.retryAt.Valid {
+		t.Fatalf("after rearm: status=%q ownerSet=%v retryAt=%v, want pending, no owner, no retry_at", r.status, r.ownerSet, r.retryAt)
+	}
+	if r.attemptBudget != 2 || r.maxAttemptsFrozen != 1 || r.rearmedGeneration != 1 {
+		t.Fatalf("after rearm: attempt_budget=%d max_attempts=%d rearmed_generation=%d, want 2/1/1", r.attemptBudget, r.maxAttemptsFrozen, r.rearmedGeneration)
+	}
+
+	// Replay within the same generation: nothing to do, no double budget.
+	if n, err := st.RearmDependencyExhaustedSemanticJobs(ctx, 1, now.Add(2*time.Minute)); err != nil || n != 0 {
+		t.Fatalf("replayed rearm at generation 1 = (%d, %v), want (0, nil)", n, err)
+	}
+	if r := readSemanticJobRow(t, st, claim.JobID); r.attemptBudget != 2 {
+		t.Fatalf("attempt_budget after replay = %d, want unchanged 2", r.attemptBudget)
+	}
+
+	// The re-armed job is claimable and spends its one extra attempt; a
+	// second dependency failure exhausts it again for THIS generation.
+	claim2 := completeOneSemanticAttempt(t, st, "worker-c", now.Add(3*time.Minute), profilemodel.InferenceOutcomeFailed)
+	if claim2.JobID != claim.JobID || claim2.Attempt != 1 {
+		t.Fatalf("re-armed claim = job %s attempt %d, want the same job at attempt 1", claim2.JobID, claim2.Attempt)
+	}
+	if r := readSemanticJobRow(t, st, claim.JobID); r.status != profilemodel.JobStateExhausted || r.attempt != 2 {
+		t.Fatalf("after the extra attempt failed: status=%q attempt=%d, want exhausted/2", r.status, r.attempt)
+	}
+	if n, err := st.RearmDependencyExhaustedSemanticJobs(ctx, 1, now.Add(4*time.Minute)); err != nil || n != 0 {
+		t.Fatalf("rearm again at generation 1 = (%d, %v), want (0, nil): one rearm per generation", n, err)
+	}
+	if n, err := st.RearmDependencyExhaustedSemanticJobs(ctx, 2, now.Add(5*time.Minute)); err != nil || n != 1 {
+		t.Fatalf("rearm at generation 2 = (%d, %v), want (1, nil)", n, err)
+	}
+	if r := readSemanticJobRow(t, st, claim.JobID); r.attemptBudget != 3 || r.rearmedGeneration != 2 || r.status != profilemodel.JobStatePending {
+		t.Fatalf("after generation 2: attempt_budget=%d rearmed_generation=%d status=%q, want 3/2/pending", r.attemptBudget, r.rearmedGeneration, r.status)
+	}
+}
+
+// TestRearmDependencyExhaustedSemanticJobsNeverTouchesContentExhaustion
+// (F14): a job exhausted on malformed responses is content-class — the
+// provider recovering is no evidence its answers will parse — so no
+// healthy generation ever re-arms it.
+func TestRearmDependencyExhaustedSemanticJobsNeverTouchesContentExhaustion(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	seedPendingInferenceJob(t, st, "job-content", "sig:content", 1, nil, now)
+	claim := completeOneSemanticAttempt(t, st, "worker-a", now, profilemodel.InferenceOutcomeMalformed)
+
+	for gen := int64(1); gen <= 3; gen++ {
+		if n, err := st.RearmDependencyExhaustedSemanticJobs(ctx, gen, now.Add(time.Duration(gen)*time.Minute)); err != nil || n != 0 {
+			t.Fatalf("rearm at generation %d = (%d, %v), want (0, nil) for content exhaustion", gen, n, err)
+		}
+	}
+	r := readSemanticJobRow(t, st, claim.JobID)
+	if r.status != profilemodel.JobStateExhausted || r.attemptBudget != 1 || r.rearmedGeneration != 0 {
+		t.Fatalf("content-exhausted job = status %q budget %d rearmed_generation %d, want exhausted/1/0 (untouched)", r.status, r.attemptBudget, r.rearmedGeneration)
+	}
+	if !r.errorClass.Valid || r.errorClass.String != profilemodel.ErrorClassContent {
+		t.Fatalf("error_class = %v, want %q", r.errorClass, profilemodel.ErrorClassContent)
+	}
+}
+
+// TestRearmDependencyExhaustedSemanticJobsSkipsSignatureWithHead (F14): a
+// dependency-exhausted job whose signature meanwhile gained a head (an
+// operator correction) has nothing left to infer: it is stamped as
+// considered for the generation, never re-armed into a stale call.
+func TestRearmDependencyExhaustedSemanticJobsSkipsSignatureWithHead(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	seedPendingInferenceJob(t, st, "job-headed", "sig:headed", 1, nil, now)
+	claim := completeOneSemanticAttempt(t, st, "worker-a", now, profilemodel.InferenceOutcomeFailed)
+	correctProfileForSignature(t, st, "sig:headed", 0, now.Add(time.Minute))
+
+	if n, err := st.RearmDependencyExhaustedSemanticJobs(ctx, 4, now.Add(2*time.Minute)); err != nil || n != 0 {
+		t.Fatalf("rearm with a head present = (%d, %v), want (0, nil)", n, err)
+	}
+	r := readSemanticJobRow(t, st, claim.JobID)
+	if r.status != profilemodel.JobStateExhausted || r.attemptBudget != 1 {
+		t.Fatalf("job with a head = status %q budget %d, want exhausted/1", r.status, r.attemptBudget)
+	}
+	if r.rearmedGeneration != 4 {
+		t.Fatalf("rearmed_generation = %d, want 4 (considered once, never rescanned for this generation)", r.rearmedGeneration)
 	}
 }
 

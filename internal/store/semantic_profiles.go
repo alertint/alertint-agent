@@ -233,9 +233,9 @@ func insertSemanticProfileInferenceJobTx(ctx context.Context, tx *sql.Tx, signat
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO semantic_profile_inference_jobs (
 			id, signature_key, frozen_input_json, frozen_input_digest, expected_head_version,
-			status, attempt, max_attempts, created_at
-		) VALUES (?, ?, ?, ?, 0, ?, 0, ?, ?)`,
-		uuid.NewString(), signatureKey, frozenJSON, digest, profilemodel.JobStatePending, maxAttempts, createdAt); err != nil {
+			status, attempt, max_attempts, attempt_budget, created_at
+		) VALUES (?, ?, ?, ?, 0, ?, 0, ?, ?, ?)`,
+		uuid.NewString(), signatureKey, frozenJSON, digest, profilemodel.JobStatePending, maxAttempts, maxAttempts, createdAt); err != nil {
 		return fmt.Errorf("store: insert semantic profile inference job: %w", err)
 	}
 	return nil
@@ -400,13 +400,14 @@ const expiredSemanticInferenceLeaseReclaimLimit = 100
 // releaseExpiredSemanticInferenceLeasesTx releases up to limit (0 =
 // unbounded) running jobs whose lease_expires_at <= now inside tx,
 // preserving final-reservation exhaustion semantics: a job that already
-// spent its last reserved call becomes exhausted, never pending. Each
+// spent its last reserved call (attempt >= attempt_budget — the rearmable
+// budget, not the frozen max_attempts) becomes exhausted, never pending. Each
 // release is fenced on the job still being 'running' with that same
 // expired lease, so a heartbeat that renewed the lease between the read
 // and the write is never clobbered. Returns the number of jobs released.
 func releaseExpiredSemanticInferenceLeasesTx(ctx context.Context, tx *sql.Tx, now time.Time, limit int) (int, error) {
 	query := `
-		SELECT id, attempt, max_attempts, lease_expires_at FROM semantic_profile_inference_jobs
+		SELECT id, attempt, attempt_budget, lease_expires_at FROM semantic_profile_inference_jobs
 		WHERE status = 'running' AND lease_expires_at <= ?
 		ORDER BY lease_expires_at ASC, id ASC`
 	args := []any{canonicalTime(now)}
@@ -420,13 +421,13 @@ func releaseExpiredSemanticInferenceLeasesTx(ctx context.Context, tx *sql.Tx, no
 	}
 	defer func() { _ = rows.Close() }()
 	type stranded struct {
-		id, leaseExpiresAt   string
-		attempt, maxAttempts int
+		id, leaseExpiresAt     string
+		attempt, attemptBudget int
 	}
 	var jobs []stranded
 	for rows.Next() {
 		var j stranded
-		if err := rows.Scan(&j.id, &j.attempt, &j.maxAttempts, &j.leaseExpiresAt); err != nil {
+		if err := rows.Scan(&j.id, &j.attempt, &j.attemptBudget, &j.leaseExpiresAt); err != nil {
 			return 0, fmt.Errorf("store: scan stranded semantic inference job: %w", err)
 		}
 		jobs = append(jobs, j)
@@ -441,7 +442,7 @@ func releaseExpiredSemanticInferenceLeasesTx(ctx context.Context, tx *sql.Tx, no
 	released := 0
 	for _, j := range jobs {
 		status := profilemodel.JobStatePending
-		if j.attempt >= j.maxAttempts {
+		if j.attempt >= j.attemptBudget {
 			status = profilemodel.JobStateExhausted
 		}
 		res, err := tx.ExecContext(ctx, `
@@ -943,7 +944,8 @@ func (s *Store) ClaimSemanticInferenceJob(ctx context.Context, owner string, now
 // internal/observation.ReserveObservationRequest's own contract). Returns
 // ErrLeaseLost if owner/token no longer match the live claim, or
 // ErrSemanticInferenceAttemptsExhausted (marking the job exhausted in the
-// same transaction) if every configured attempt is already spent.
+// same transaction) if the job's whole attempt_budget — its frozen
+// max_attempts plus every later dependency rearm — is already spent.
 func (s *Store) ReserveSemanticInferenceCall(ctx context.Context, jobID, owner string, token int64, now time.Time) (string, int, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -954,10 +956,10 @@ func (s *Store) ReserveSemanticInferenceCall(ctx context.Context, jobID, owner s
 	var rowOwner sql.NullString
 	var rowToken int64
 	var status string
-	var attempt, maxAttempts int
+	var attempt, attemptBudget int
 	err = tx.QueryRowContext(ctx, `
-		SELECT owner, token, status, attempt, max_attempts FROM semantic_profile_inference_jobs WHERE id = ?`, jobID).
-		Scan(&rowOwner, &rowToken, &status, &attempt, &maxAttempts)
+		SELECT owner, token, status, attempt, attempt_budget FROM semantic_profile_inference_jobs WHERE id = ?`, jobID).
+		Scan(&rowOwner, &rowToken, &status, &attempt, &attemptBudget)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", 0, fmt.Errorf("store: reserve semantic inference call: job %s: %w", jobID, ErrNotFound)
 	}
@@ -968,7 +970,7 @@ func (s *Store) ReserveSemanticInferenceCall(ctx context.Context, jobID, owner s
 		return "", 0, profilemodel.ErrLeaseLost
 	}
 
-	if attempt >= maxAttempts {
+	if attempt >= attemptBudget {
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE semantic_profile_inference_jobs
 			SET status = 'exhausted', owner = NULL, lease_expires_at = NULL
@@ -1007,9 +1009,13 @@ func (s *Store) ReserveSemanticInferenceCall(ctx context.Context, jobID, owner s
 // head") — this CAS check and the version/head/change-outbox insert happen
 // in the SAME transaction, so no concurrent correction can race between
 // the check and the write. A non-accepted outcome retries (status=pending,
-// retryAt) while attempts remain, or exhausts once max_attempts is spent.
-// retryAt is ignored for an accepted (or downgraded-to-stale) outcome, and
-// may be nil for a final (exhausting) non-accepted one.
+// retryAt) while attempts remain, or exhausts once attempt_budget is spent;
+// either way its closed error class (profilemodel.ErrorClassForOutcome:
+// dependency for a transport failure, content for a malformed/rejected
+// response) is persisted on the job so a later durable healthy generation
+// can re-arm dependency exhaustion and only that. A healthy outcome clears
+// the class. retryAt is ignored for an accepted (or downgraded-to-stale)
+// outcome, and may be nil for a final (exhausting) non-accepted one.
 func (s *Store) CompleteSemanticInference(ctx context.Context, callID, owner string, token int64, result profilemodel.InferenceResult, now time.Time, retryAt *time.Time) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1021,12 +1027,12 @@ func (s *Store) CompleteSemanticInference(ctx context.Context, callID, owner str
 	var rowOwner sql.NullString
 	var rowToken int64
 	var status string
-	var attempt, maxAttempts int
+	var attempt, attemptBudget int
 	err = tx.QueryRowContext(ctx, `
-		SELECT c.job_id, j.signature_key, j.owner, j.token, j.status, j.attempt, j.max_attempts
+		SELECT c.job_id, j.signature_key, j.owner, j.token, j.status, j.attempt, j.attempt_budget
 		FROM semantic_profile_calls c JOIN semantic_profile_inference_jobs j ON j.id = c.job_id
 		WHERE c.id = ?`, callID).
-		Scan(&jobID, &signatureKey, &rowOwner, &rowToken, &status, &attempt, &maxAttempts)
+		Scan(&jobID, &signatureKey, &rowOwner, &rowToken, &status, &attempt, &attemptBudget)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("store: complete semantic inference: call %s: %w", callID, ErrNotFound)
 	}
@@ -1055,7 +1061,7 @@ func (s *Store) CompleteSemanticInference(ctx context.Context, callID, owner str
 			}
 		}
 	default:
-		if attempt >= maxAttempts {
+		if attempt >= attemptBudget {
 			newJobStatus = profilemodel.JobStateExhausted
 		} else {
 			newJobStatus = profilemodel.JobStatePending
@@ -1063,6 +1069,10 @@ func (s *Store) CompleteSemanticInference(ctx context.Context, callID, owner str
 				newRetryAt = canonicalTime(*retryAt)
 			}
 		}
+	}
+	var errorClass any
+	if class := profilemodel.ErrorClassForOutcome(outcome); class != "" {
+		errorClass = class
 	}
 
 	if _, err := tx.ExecContext(ctx, `
@@ -1077,15 +1087,15 @@ func (s *Store) CompleteSemanticInference(ctx context.Context, callID, owner str
 	if newJobStatus == profilemodel.JobStatePending {
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE semantic_profile_inference_jobs
-			SET status = ?, owner = NULL, lease_expires_at = NULL, retry_at = ?
-			WHERE id = ?`, newJobStatus, newRetryAt, jobID); err != nil {
+			SET status = ?, owner = NULL, lease_expires_at = NULL, retry_at = ?, error_class = ?
+			WHERE id = ?`, newJobStatus, newRetryAt, errorClass, jobID); err != nil {
 			return fmt.Errorf("store: return semantic inference job to pending: %w", err)
 		}
 	} else {
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE semantic_profile_inference_jobs
-			SET status = ?, owner = NULL, lease_expires_at = NULL
-			WHERE id = ?`, newJobStatus, jobID); err != nil {
+			SET status = ?, owner = NULL, lease_expires_at = NULL, error_class = ?
+			WHERE id = ?`, newJobStatus, errorClass, jobID); err != nil {
 			return fmt.Errorf("store: finish semantic inference job: %w", err)
 		}
 	}
@@ -1094,6 +1104,103 @@ func (s *Store) CompleteSemanticInference(ctx context.Context, callID, owner str
 		return fmt.Errorf("store: commit complete semantic inference: %w", err)
 	}
 	return nil
+}
+
+// dependencyExhaustedSemanticJobRearmLimit bounds one
+// RearmDependencyExhaustedSemanticJobs batch; a call runs before every
+// controller claim poll, so a larger backlog drains across polls.
+const dependencyExhaustedSemanticJobRearmLimit = 100
+
+// RearmDependencyExhaustedSemanticJobs is the semantic-profile counterpart
+// of WakeDependencyRecoveredSituations (spec.md R6/A8: "a durable
+// dependency recovery generation may open one new bounded retry epoch for
+// work parked specifically on that dependency"): for up to a bounded batch
+// of exhausted jobs whose LAST failure was dependency-class and whose
+// rearmed_generation is older than healthyGeneration — the caller supplies
+// llmhealth's outage generation once the tracker is healthy again, exactly
+// as for Situations — it sets status pending (immediately claimable, no
+// retry_at), grants one more full max_attempts of budget
+// (attempt_budget += max_attempts) and stamps rearmed_generation =
+// healthyGeneration, all in one transaction. Repeated calls within the
+// same generation are a no-op, so one recovery never grants budget twice;
+// a content-exhausted job (the model answered outside the schema) is never
+// touched — only a changed frozen input or an operator correction moves
+// it. A job whose signature already has a head, or already holds a live
+// sibling job under the partial one-live-job index, is stamped as
+// considered for this generation without re-arming (nothing to infer, or
+// no free slot). Returns the number of jobs actually re-armed.
+func (s *Store) RearmDependencyExhaustedSemanticJobs(ctx context.Context, healthyGeneration int64, now time.Time) (int, error) {
+	if healthyGeneration <= 0 {
+		return 0, nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("store: begin rearm dependency-exhausted semantic jobs: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT j.id,
+		       EXISTS (SELECT 1 FROM semantic_profile_heads h WHERE h.signature_key = j.signature_key),
+		       EXISTS (SELECT 1 FROM semantic_profile_inference_jobs l
+		               WHERE l.signature_key = j.signature_key AND l.status IN ('pending', 'running'))
+		FROM semantic_profile_inference_jobs j
+		WHERE j.status = 'exhausted' AND j.error_class = ? AND j.rearmed_generation < ?
+		ORDER BY j.created_at ASC, j.id ASC LIMIT ?`,
+		profilemodel.ErrorClassDependency, healthyGeneration, dependencyExhaustedSemanticJobRearmLimit)
+	if err != nil {
+		return 0, fmt.Errorf("store: query dependency-exhausted semantic jobs: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	type candidate struct {
+		id                   string
+		headExists, liveJobs bool
+	}
+	var candidates []candidate
+	for rows.Next() {
+		var c candidate
+		if err := rows.Scan(&c.id, &c.headExists, &c.liveJobs); err != nil {
+			return 0, fmt.Errorf("store: scan dependency-exhausted semantic job: %w", err)
+		}
+		candidates = append(candidates, c)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("store: iterate dependency-exhausted semantic jobs: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, fmt.Errorf("store: close dependency-exhausted semantic jobs query: %w", err)
+	}
+
+	rearmed := 0
+	for _, c := range candidates {
+		if c.headExists || c.liveJobs {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE semantic_profile_inference_jobs SET rearmed_generation = ?
+				WHERE id = ? AND status = 'exhausted' AND rearmed_generation < ?`,
+				healthyGeneration, c.id, healthyGeneration); err != nil {
+				return 0, fmt.Errorf("store: stamp unrearmable semantic job %s: %w", c.id, err)
+			}
+			continue
+		}
+		res, err := tx.ExecContext(ctx, `
+			UPDATE semantic_profile_inference_jobs
+			SET status = ?, attempt_budget = attempt_budget + max_attempts, rearmed_generation = ?,
+			    owner = NULL, lease_expires_at = NULL, retry_at = NULL
+			WHERE id = ? AND status = 'exhausted' AND error_class = ? AND rearmed_generation < ?`,
+			profilemodel.JobStatePending, healthyGeneration, c.id, profilemodel.ErrorClassDependency, healthyGeneration)
+		if err != nil {
+			return 0, fmt.Errorf("store: rearm dependency-exhausted semantic job %s: %w", c.id, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("store: count rearmed semantic job %s: %w", c.id, err)
+		}
+		rearmed += int(n)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("store: commit rearm dependency-exhausted semantic jobs: %w", err)
+	}
+	return rearmed, nil
 }
 
 // DeliverSemanticProfileChanges advances ONE currently-unacknowledged

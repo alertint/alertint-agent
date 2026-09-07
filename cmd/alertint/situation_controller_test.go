@@ -5,12 +5,14 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/config"
 	"github.com/alertint/alertint-agent/internal/llm"
 	"github.com/alertint/alertint-agent/internal/llmhealth"
+	"github.com/alertint/alertint-agent/internal/semanticprofile"
 	"github.com/alertint/alertint-agent/internal/situation"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
@@ -305,9 +307,132 @@ func TestLLMHealthAssessmentObserverReportsFinalTypedOutcome(t *testing.T) {
 	})
 }
 
+func semanticProfileCapability(t *testing.T, tracker *llmhealth.Tracker) llmhealth.CapabilitySnapshot {
+	t.Helper()
+	const want = llmhealth.CapabilitySemanticProfile
+	for _, c := range tracker.Snapshot().Capabilities {
+		if c.Capability == want {
+			return c
+		}
+	}
+	t.Fatalf("capabilities = %+v, want an entry for %q", tracker.Snapshot().Capabilities, want)
+	return llmhealth.CapabilitySnapshot{}
+}
+
+// TestLLMHealthProfileObserverMalformedProfileIsContentClass (F15) drives
+// the REAL adapter and the real llmhealth.Tracker: a malformed profile
+// (semanticprofile.ErrProfileMalformed) is a content-class failure — one
+// bad signature never flips the capability or installation health — while
+// a transport failure still marks the capability unhealthy at once; and an
+// unrelated shared-primary success does not erase the content evidence, so
+// a second distinct malformed signature still corroborates it.
+func TestLLMHealthProfileObserverMalformedProfileIsContentClass(t *testing.T) {
+	tracker := newTestTracker(t)
+	obs := llmHealthProfileObserver{tracker: tracker}
+	malformed := fmt.Errorf("semanticprofile: decode profile: %w", semanticprofile.ErrProfileMalformed)
+
+	obs.BeginInferenceCall("sig-a").Finish(malformed)
+	if snap := tracker.Snapshot(); snap.State != llmhealth.StateHealthy {
+		t.Fatalf("installation state after one malformed profile = %q, want healthy (content needs corroboration)", snap.State)
+	}
+	capA := semanticProfileCapability(t, tracker)
+	if !capA.Healthy || capA.Reason != llmhealth.ReasonResponseMalformed {
+		t.Fatalf("semantic_profile after one malformed = healthy %v reason %q, want healthy with reason %q recorded", capA.Healthy, capA.Reason, llmhealth.ReasonResponseMalformed)
+	}
+
+	// An unrelated shared-primary success clears DEPENDENCY evidence only.
+	tracker.Begin(llmhealth.CapabilityTriageDraft, "inc-1").Finish(nil)
+	if c := semanticProfileCapability(t, tracker); c.LastFailureAt == nil {
+		t.Fatal("the content failure must survive an unrelated capability's success")
+	}
+	obs.BeginInferenceCall("sig-b").Finish(malformed)
+	if c := semanticProfileCapability(t, tracker); c.Healthy {
+		t.Fatal("two distinct malformed signatures must corroborate the content failure into an unhealthy semantic_profile capability")
+	}
+
+	// Contrast: a transport failure is dependency-class, unhealthy at once.
+	fresh := newTestTracker(t)
+	llmHealthProfileObserver{tracker: fresh}.BeginInferenceCall("sig-c").Finish(errors.New("dial tcp: connection refused"))
+	if c := semanticProfileCapability(t, fresh); c.Healthy {
+		t.Fatal("a transport failure must mark semantic_profile unhealthy immediately")
+	}
+	// And a nil (healthy or stale-CAS) finish stays healthy.
+	llmHealthProfileObserver{tracker: fresh}.BeginInferenceCall("sig-c").Finish(nil)
+	if c := semanticProfileCapability(t, fresh); !c.Healthy {
+		t.Fatal("a successful call must restore the capability")
+	}
+}
+
 // ----------------------------------------------------------------------
 // llmHealthDependencyWaker
 // ----------------------------------------------------------------------
+
+// seedDependencyExhaustedSemanticJob inserts one exhausted inference job
+// whose last failure was dependency-class, directly, the shape a transport
+// outage leaves behind once every attempt is spent.
+func seedDependencyExhaustedSemanticJob(t *testing.T, st *store.Store, id string, now time.Time) {
+	t.Helper()
+	if _, err := st.DB().ExecContext(context.Background(), `
+		INSERT INTO semantic_profile_inference_jobs (
+			id, signature_key, frozen_input_json, frozen_input_digest, expected_head_version,
+			status, attempt, max_attempts, attempt_budget, error_class, created_at
+		) VALUES (?, ?, '{}', ?, 0, 'exhausted', 1, 1, 1, 'dependency', ?)`,
+		id, "sig:"+id, "digest-"+id, now.UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("seed exhausted semantic job %s: %v", id, err)
+	}
+}
+
+// TestLLMHealthDependencyWakerRearmsDependencyExhaustedSemanticJobs (F14)
+// proves the waker's second delegation: the same durable healthy generation
+// that wakes dependency-parked Situations re-arms dependency-exhausted
+// semantic-profile jobs exactly once, and never while unhealthy.
+func TestLLMHealthDependencyWakerRearmsDependencyExhaustedSemanticJobs(t *testing.T) {
+	st := newTestFoundationStore(t)
+	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	seedDependencyExhaustedSemanticJob(t, st, "job-dep", now)
+
+	tracker, err := llmhealth.New(context.Background(), st, llmhealth.Options{})
+	if err != nil {
+		t.Fatalf("llmhealth.New: %v", err)
+	}
+	waker := llmHealthDependencyWaker{tracker: tracker, st: st}
+	tracker.Begin(llmhealth.CapabilityAssessment, "").Finish(context.DeadlineExceeded)
+	if _, err := waker.WakeDependencyRecoveredSituations(context.Background(), now); err != nil {
+		t.Fatalf("wake while unavailable: %v", err)
+	}
+	readJob := func() (status string, budget int, gen int64) {
+		t.Helper()
+		if err := st.DB().QueryRowContext(context.Background(), `
+			SELECT status, attempt_budget, rearmed_generation FROM semantic_profile_inference_jobs WHERE id = 'job-dep'`).
+			Scan(&status, &budget, &gen); err != nil {
+			t.Fatal(err)
+		}
+		return status, budget, gen
+	}
+	if status, _, _ := readJob(); status != "exhausted" {
+		t.Fatalf("status while unavailable = %q, want exhausted (no premature rearm)", status)
+	}
+
+	tracker.Begin(llmhealth.CapabilityTriageDraft, "inc-1").Finish(nil)
+	snap := tracker.Snapshot()
+	if snap.State != llmhealth.StateHealthy || snap.OutageGeneration == 0 {
+		t.Fatalf("tracker = %q gen %d, want healthy with a nonzero generation", snap.State, snap.OutageGeneration)
+	}
+	if _, err := waker.WakeDependencyRecoveredSituations(context.Background(), now.Add(time.Minute)); err != nil {
+		t.Fatalf("wake once healthy: %v", err)
+	}
+	status, budget, gen := readJob()
+	if status != "pending" || budget != 2 || gen != snap.OutageGeneration {
+		t.Fatalf("after the healthy wake: status=%q attempt_budget=%d rearmed_generation=%d, want pending/2/%d", status, budget, gen, snap.OutageGeneration)
+	}
+	// Same generation again: no second budget grant.
+	if _, err := waker.WakeDependencyRecoveredSituations(context.Background(), now.Add(2*time.Minute)); err != nil {
+		t.Fatalf("second wake: %v", err)
+	}
+	if _, budget, _ := readJob(); budget != 2 {
+		t.Fatalf("attempt_budget after a same-generation replay = %d, want unchanged 2", budget)
+	}
+}
 
 func TestLLMHealthDependencyWakerNoOpsWhenNotHealthy(t *testing.T) {
 	st := newTestFoundationStore(t)

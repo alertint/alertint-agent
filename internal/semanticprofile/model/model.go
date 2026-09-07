@@ -234,6 +234,33 @@ const (
 	InferenceOutcomeStale     = "stale"
 )
 
+// Error classes — the closed two-value classification persisted on an
+// inference job from its LAST non-accepted outcome (cleared by a healthy
+// one). Only a dependency-exhausted job is ever re-armed by a newer durable
+// healthy LLM generation; a content-exhausted one (the model answered, but
+// outside the closed schema) is re-armed only by a changed frozen input or
+// an operator correction, since the provider recovering says nothing about
+// the response content improving.
+const (
+	ErrorClassDependency = "dependency"
+	ErrorClassContent    = "content"
+)
+
+// ErrorClassForOutcome maps one non-accepted inference outcome onto its
+// persisted error class: a transport/provider failure is dependency-class;
+// a malformed or rejected response is content-class. It returns "" for
+// accepted and stale (no failure at all).
+func ErrorClassForOutcome(outcome string) string {
+	switch outcome {
+	case InferenceOutcomeFailed:
+		return ErrorClassDependency
+	case InferenceOutcomeMalformed, InferenceOutcomeRejected:
+		return ErrorClassContent
+	default:
+		return ""
+	}
+}
+
 // InferenceResult is one dispatched attempt's outcome: an optional validated
 // Profile (present only for InferenceOutcomeAccepted), the closed outcome,
 // whether the request physically started, and bounded usage/provenance

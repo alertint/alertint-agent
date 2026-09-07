@@ -331,9 +331,9 @@ func seedRunningInferenceJob(t *testing.T, st *Store, id, signatureKey string, a
 	if _, err := st.db.ExecContext(context.Background(), `
 		INSERT INTO semantic_profile_inference_jobs (
 			id, signature_key, frozen_input_json, frozen_input_digest, expected_head_version,
-			status, attempt, max_attempts, owner, token, lease_expires_at, created_at
-		) VALUES (?, ?, '{}', ?, 0, 'running', ?, ?, 'owner-a', 1, ?, ?)`,
-		id, signatureKey, "digest-"+id, attempt, maxAttempts, leaseExpiresAt, canonicalTime(now)); err != nil {
+			status, attempt, max_attempts, attempt_budget, owner, token, lease_expires_at, created_at
+		) VALUES (?, ?, '{}', ?, 0, 'running', ?, ?, ?, 'owner-a', 1, ?, ?)`,
+		id, signatureKey, "digest-"+id, attempt, maxAttempts, maxAttempts, leaseExpiresAt, canonicalTime(now)); err != nil {
 		t.Fatalf("seed running inference job %s: %v", id, err)
 	}
 }
@@ -424,9 +424,9 @@ func seedPendingInferenceJob(t *testing.T, st *Store, id, signatureKey string, m
 	if _, err := st.db.ExecContext(context.Background(), `
 		INSERT INTO semantic_profile_inference_jobs (
 			id, signature_key, frozen_input_json, frozen_input_digest, expected_head_version,
-			status, attempt, max_attempts, retry_at, created_at
-		) VALUES (?, ?, '{}', ?, 0, 'pending', 0, ?, ?, ?)`,
-		id, signatureKey, "digest-"+id, maxAttempts, retryAtStr, canonicalTime(now)); err != nil {
+			status, attempt, max_attempts, attempt_budget, retry_at, created_at
+		) VALUES (?, ?, '{}', ?, 0, 'pending', 0, ?, ?, ?, ?)`,
+		id, signatureKey, "digest-"+id, maxAttempts, maxAttempts, retryAtStr, canonicalTime(now)); err != nil {
 		t.Fatalf("seed pending inference job %s: %v", id, err)
 	}
 }

@@ -257,6 +257,36 @@ func TestWorkerRunOnceMalformedResponseRecordsMalformedAndUnhealthy(t *testing.T
 	if len(health.finished) != 1 || health.finished[0] == nil {
 		t.Fatal("expected health.Finish to be called with a non-nil error for a malformed response")
 	}
+	// F15: the health error must be recognizable as CONTENT (the model
+	// answered, outside the closed schema), so the cmd/alertint adapter can
+	// map it to llmhealth's content class instead of a dependency outage.
+	if !errors.Is(health.finished[0], semanticprofile.ErrProfileMalformed) {
+		t.Fatalf("health error = %v, want it to wrap semanticprofile.ErrProfileMalformed", health.finished[0])
+	}
+}
+
+// TestParseAndValidateProfileWrapErrProfileMalformed (F15) pins the
+// sentinel contract on every failure path both parse and validate own.
+func TestParseAndValidateProfileWrapErrProfileMalformed(t *testing.T) {
+	for name, raw := range map[string]string{
+		"undecodable":    `{"subject_kind": `,
+		"duplicate key":  `{"subject_kind":"a","subject_kind":"b"}`,
+		"unknown field":  `{"subject_kind":"service","event_kind":"availability","possible_role":"symptom","horizon_tier":"hours","attention":"observe"}`,
+		"bound violated": `{"subject_kind":"","event_kind":"availability","possible_role":"symptom","horizon_tier":"hours"}`,
+		"trailing":       `{"subject_kind":"service","event_kind":"availability","possible_role":"symptom","horizon_tier":"hours"} {}`,
+	} {
+		_, err := semanticprofile.ParseProfile([]byte(raw))
+		if !errors.Is(err, semanticprofile.ErrProfileMalformed) {
+			t.Fatalf("%s: ParseProfile err = %v, want ErrProfileMalformed", name, err)
+		}
+	}
+	if err := semanticprofile.ValidateProfile(profilemodel.Profile{HorizonTier: "hours"}); !errors.Is(err, semanticprofile.ErrProfileMalformed) {
+		t.Fatalf("ValidateProfile err = %v, want ErrProfileMalformed", err)
+	}
+	// Transport failures never carry the content sentinel.
+	if errors.Is(errors.New("dial tcp: connection refused"), semanticprofile.ErrProfileMalformed) {
+		t.Fatal("a transport error must not match ErrProfileMalformed")
+	}
 }
 
 func TestWorkerRunOnceTransportFailureRecordsFailed(t *testing.T) {
