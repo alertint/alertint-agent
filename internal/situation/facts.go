@@ -47,7 +47,9 @@ const (
 	// ObservationDigest, folding in prepared observation evidence's own
 	// MaterialDigest (normalized meaning/coverage only — never collection
 	// time, run ID, generation, or reservation count).
-	materialFactHashSchemaVersion = 3
+	// Bumped to 4 for the stability hotfix: static capability limitations
+	// no longer contribute to material evidence identity.
+	materialFactHashSchemaVersion = 4
 
 	// assessmentBasisHashSchemaVersion is bumped to 3 (Task 5): the carried-
 	// forward InputVersion-instability bug documented on
@@ -58,7 +60,8 @@ const (
 	// Bumped again to 4 (Plan 4 Task 6): embeds the new
 	// materialFactHashSchemaVersion-3 MaterialFactHash output plus the
 	// bumped assessmentValidatorVersion.
-	assessmentBasisHashSchemaVersion = 4
+	// Bumped to 5 to embed the hotfix's material hash schema version 4.
+	assessmentBasisHashSchemaVersion = 5
 
 	// assessmentValidatorVersion tracks ValidateAssessmentProposal's rule
 	// set. Bumped to 2 (Plan 4 Task 6): reservedUnsupportedCapabilities
@@ -633,7 +636,6 @@ type materialFactHashDTO struct {
 	Symptoms                   []materialSymptomDTO         `json:"symptoms"`
 	Incidents                  []materialIncidentDTO        `json:"incidents"`
 	PriorDurationHistogram     materialDurationHistogramDTO `json:"prior_duration_histogram"`
-	LimitationCodes            []string                     `json:"limitation_codes"`
 	// ObservationDigest folds in this cycle's prepared evidence (Plan 4 Task
 	// 6): observationmodel.MaterialDigest's own hash over every Material
 	// fact across the selected preparation cycle's runs — normalized
@@ -704,12 +706,6 @@ func MaterialFactHash(in SnapshotInput, symptoms []Symptom, durationClass string
 	}
 	sort.Slice(incidentDTOs, func(i, j int) bool { return incidentDTOs[i].IncidentID < incidentDTOs[j].IncidentID })
 
-	limitationCodes := make([]string, 0, len(reservedUnsupportedCapabilities))
-	for _, l := range reservedUnsupportedCapabilities {
-		limitationCodes = append(limitationCodes, l.Code)
-	}
-	sort.Strings(limitationCodes)
-
 	dto := materialFactHashDTO{
 		SchemaVersion:              materialFactHashSchemaVersion,
 		FactSchemaVersion:          factSchemaVersion,
@@ -719,7 +715,6 @@ func MaterialFactHash(in SnapshotInput, symptoms []Symptom, durationClass string
 		Symptoms:                   symptomDTOs,
 		Incidents:                  incidentDTOs,
 		PriorDurationHistogram:     priorDurationHistogram(priorDurationsSeconds(in.PriorSituations)),
-		LimitationCodes:            limitationCodes,
 		ObservationDigest:          observationMaterialDigest(in.Prepared),
 	}
 	return canonicalDigest(dto)

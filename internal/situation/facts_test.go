@@ -455,7 +455,7 @@ func TestMaterialFactHashAndAssessmentBasisHashIgnoreLeaseClaimRetryState(t *tes
 	}
 }
 
-func TestMaterialFactHashChangesOnLimitationSet(t *testing.T) {
+func TestMaterialFactHashIgnoresStaticLimitationSet(t *testing.T) {
 	in := baseSnapshotInput(t)
 	before := materialHashFor(t, in)
 
@@ -464,8 +464,8 @@ func TestMaterialFactHashChangesOnLimitationSet(t *testing.T) {
 	defer func() { reservedUnsupportedCapabilities = orig }()
 
 	after := materialHashFor(t, in)
-	if before == after {
-		t.Fatal("adding a limitation code did not change material fact hash")
+	if before != after {
+		t.Fatal("static limitation set changed material fact hash")
 	}
 }
 

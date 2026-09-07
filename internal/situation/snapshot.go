@@ -331,6 +331,7 @@ type Snapshot struct {
 	Symptoms            []Symptom
 	Incidents           []IncidentState
 	EligibleReasons     []model.ReasonCandidate
+	PriorAssessment     *model.Assessment
 	MaterialFactHash    string
 	AssessmentBasisHash string
 }
@@ -481,7 +482,16 @@ func BuildSnapshot(in SnapshotInput) Snapshot {
 		Symptoms:            symptoms,
 		Incidents:           sortIncidentsByID(in.Incidents),
 		EligibleReasons:     eligible,
+		PriorAssessment:     priorAssessment(in.CurrentAssessment),
 		MaterialFactHash:    materialHash,
 		AssessmentBasisHash: basisHash,
 	}
+}
+
+func priorAssessment(current *AuthoritativeAssessment) *model.Assessment {
+	if current == nil {
+		return nil
+	}
+	a := current.Assessment
+	return &a
 }
