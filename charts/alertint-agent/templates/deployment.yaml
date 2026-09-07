@@ -26,6 +26,12 @@ spec:
       labels:
         {{- $podLabels := include "alertint-agent.labels" . | fromYaml }}
         {{- $podLabels = mergeOverwrite $podLabels .Values.podLabels }}
+        {{- /* app.kubernetes.io/name and app.kubernetes.io/instance must match
+               spec.selector.matchLabels exactly — the pod template's labels
+               have to be a superset of it, or Kubernetes rejects the
+               Deployment. podLabels can override any other label, but never
+               these two. */ -}}
+        {{- $podLabels = mergeOverwrite $podLabels (include "alertint-agent.selectorLabels" . | fromYaml) }}
         {{- toYaml $podLabels | nindent 8 }}
     spec:
       serviceAccountName: {{ include "alertint-agent.serviceAccountName" . }}

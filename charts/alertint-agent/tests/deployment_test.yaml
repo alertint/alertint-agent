@@ -156,18 +156,42 @@ tests:
           path: spec.template.metadata.annotations["checksum/config"]
         template: deployment.yaml
 
-  - it: lets a colliding podLabel/podAnnotation key override the chart's own
+  - it: lets a colliding podAnnotation key override the chart's own
     set:
-      podLabels:
-        app.kubernetes.io/name: overridden
       podAnnotations:
         checksum/config: overridden
     asserts:
       - equal:
+          path: spec.template.metadata.annotations["checksum/config"]
+          value: overridden
+        template: deployment.yaml
+
+  - it: never lets podLabels override the two labels spec.selector.matchLabels depends on
+    set:
+      podLabels:
+        app.kubernetes.io/name: overridden
+        app.kubernetes.io/instance: overridden
+        helm.sh/chart: overridden
+    asserts:
+      # app.kubernetes.io/name and app.kubernetes.io/instance stay the
+      # chart's own values — overriding them would desync the pod template's
+      # labels from spec.selector.matchLabels, which Kubernetes rejects.
+      - equal:
           path: spec.template.metadata.labels["app.kubernetes.io/name"]
+          value: alertint-agent
+        template: deployment.yaml
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/instance"]
+          value: RELEASE-NAME
+        template: deployment.yaml
+      # any other label (not part of the selector) still overrides normally.
+      - equal:
+          path: spec.template.metadata.labels["helm.sh/chart"]
           value: overridden
         template: deployment.yaml
       - equal:
-          path: spec.template.metadata.annotations["checksum/config"]
-          value: overridden
+          path: spec.selector.matchLabels
+          value:
+            app.kubernetes.io/name: alertint-agent
+            app.kubernetes.io/instance: RELEASE-NAME
         template: deployment.yaml

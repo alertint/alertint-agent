@@ -37,7 +37,12 @@ and this chart adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   (e.g. `app.kubernetes.io/name`, `checksum/config`), which most YAML
   parsers accept via a silent last-key-wins, but which is invalid,
   fragile YAML that stricter tooling can reject outright. A colliding
-  key now cleanly overrides the chart's own value instead.
+  key now cleanly overrides the chart's own value instead — except
+  `app.kubernetes.io/name` and `app.kubernetes.io/instance` in `podLabels`,
+  which are exempt from this override behavior: they always resolve to the
+  chart's own values, since `spec.selector.matchLabels` (immutable, and
+  built from those same two labels) requires them, and Kubernetes rejects a
+  Deployment whose pod template labels don't stay a superset of it.
 
 ## [0.1.1] - 2026-09-04
 
