@@ -67,10 +67,18 @@ is and isn't:
   at-least-once**, so an uncertain Slack response followed by a retry can
   rarely leave a duplicate message in the channel (AlertINT requests no
   history-read scope and never reads the channel back to reconcile).
-- **Is not (yet), even on `state-controller`:** connector preparation for
-  the controller's own evidence needs, durable Assessment/Triage artifacts
-  beyond the bounded recent-attempt history exposed over MCP, operator
-  questions, Situation judgments, or expected-behaviour envelopes.
+  On that same branch, a fenced evidence-preparation pass plans and executes
+  a bounded set of read-only capability checks ahead of each Assessment, and
+  a durable advisory semantic-profile worker infers a bounded interpretation
+  hint per distinct alert source identity — both read-only over MCP
+  (`alertint_list_observation_runs`, `alertint_get_semantic_profile`,
+  `alertint_correct_semantic_profile`). A profile is **advisory only**: it
+  can widen which capabilities get planned, never assert firing/resolved
+  state, grant investigative authority, create a Sufficient reason, resolve
+  a sibling, or reach Slack directly.
+- **Is not (yet), even on `state-controller`:** durable Assessment/Triage
+  artifacts beyond the bounded recent-attempt history exposed over MCP,
+  operator questions, Situation judgments, or expected-behaviour envelopes.
   `alertint_get_situation` reads `assessment: null` and
   `operator_contract: null`, honestly, for any Situation the controller has
   not yet reconciled at least once — never a fabricated placeholder.
