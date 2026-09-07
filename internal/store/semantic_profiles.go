@@ -112,37 +112,50 @@ func sortedMapKeys(m map[string]string) []string {
 	return keys
 }
 
-// attachDeliverySemanticSignatureTx attaches deliveryID's deterministic
-// advisory signature inside an already-open transaction — idempotent (a
-// delivery already mapped is a no-op, matching ApplySituationInput's own
-// replay safety) — and, only for a genuinely brand-new signature (no head
-// and no live job yet: "the missing-profile job", spec.md), enqueues its
-// pending inference job with a frozen semantic input digest that later
-// arrivals under the SAME signature never touch again. An oversize/invalid
+// semanticSignatureAttachment is mapDeliverySemanticSignatureTx's result:
+// the delivery's deterministic signature key and the frozen semantic input
+// admitSemanticProfileInferenceTx would enqueue a missing-profile job from.
+// mapped is false when the delivery's signature material is unsupported
+// (oversize/invalid) — no mapping row exists, and nothing may be admitted.
+type semanticSignatureAttachment struct {
+	signatureKey string
+	input        profilemodel.SignatureInput
+	mapped       bool
+}
+
+// mapDeliverySemanticSignatureTx is the MAPPING step of Plan 4 Task 7's
+// delivery-to-signature attachment: it inserts deliveryID's immutable
+// advisory-signature mapping inside an already-open transaction —
+// idempotent (a delivery already mapped is re-derived, never re-inserted,
+// matching ApplySituationInput's own replay safety) — and returns the
+// signature/frozen-input pair the separate ADMISSION step
+// (admitSemanticProfileInferenceTx) needs. Mapping is unconditional: the
+// delivery itself is real and immutable the instant it exists, independent
+// of its owning Situation's current lifecycle. An oversize/invalid
 // signature material is a best-effort miss (no row, no job, no error): a
 // signature failure must never block the owning Situation's own lifecycle,
 // mirroring Plan 4 Task 6's own "connector failure is durable evidence
 // limitation, never a fatal Reconcile error" principle.
-func attachDeliverySemanticSignatureTx(ctx context.Context, tx *sql.Tx, deliveryID string, maxAttempts int, now time.Time) error {
-	var exists int
-	err := tx.QueryRowContext(ctx, `SELECT 1 FROM delivery_semantic_signatures WHERE delivery_id = ?`, deliveryID).Scan(&exists)
-	if err == nil {
-		return nil // already attached — immutable, nothing to redo.
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("store: check existing delivery semantic signature: %w", err)
-	}
-
+func mapDeliverySemanticSignatureTx(ctx context.Context, tx *sql.Tx, deliveryID string, now time.Time) (semanticSignatureAttachment, error) {
 	in, err := semanticSignatureInputForDeliveryTx(ctx, tx, deliveryID)
 	if err != nil {
-		return err
+		return semanticSignatureAttachment{}, err
 	}
 	sig, err := semanticprofile.BuildSignature(in)
 	if err != nil {
-		return nil //nolint:nilerr // best-effort: oversize/invalid signature material never blocks Situation lifecycle.
+		return semanticSignatureAttachment{}, nil //nolint:nilerr // best-effort: oversize/invalid signature material never blocks Situation lifecycle.
+	}
+	att := semanticSignatureAttachment{signatureKey: sig.Key, input: in, mapped: true}
+
+	var exists int
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM delivery_semantic_signatures WHERE delivery_id = ?`, deliveryID).Scan(&exists)
+	if err == nil {
+		return att, nil // already attached — immutable, nothing to redo.
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return semanticSignatureAttachment{}, fmt.Errorf("store: check existing delivery semantic signature: %w", err)
 	}
 
-	createdAt := canonicalTime(now)
 	advisoryOnly := 0
 	if sig.AdvisoryOnly {
 		advisoryOnly = 1
@@ -151,12 +164,32 @@ func attachDeliverySemanticSignatureTx(ctx context.Context, tx *sql.Tx, delivery
 		INSERT INTO delivery_semantic_signatures (
 			delivery_id, signature_key, signature_digest, schema_version, material_json, mode, advisory_only, created_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		deliveryID, sig.Key, sig.Digest, sig.SchemaVersion, string(sig.Material), sig.Mode, advisoryOnly, createdAt); err != nil {
-		return fmt.Errorf("store: insert delivery semantic signature: %w", err)
+		deliveryID, sig.Key, sig.Digest, sig.SchemaVersion, string(sig.Material), sig.Mode, advisoryOnly, canonicalTime(now)); err != nil {
+		return semanticSignatureAttachment{}, fmt.Errorf("store: insert delivery semantic signature: %w", err)
 	}
+	return att, nil
+}
 
+// admitSemanticProfileInferenceTx is the ADMISSION step: only for a
+// genuinely missing profile (no head yet) it enqueues the signature's
+// pending inference job with a frozen semantic input digest that later
+// arrivals under the SAME signature never touch again ("the missing-profile
+// job", spec.md). Callers run it only once the delivery's owning Situation
+// is transactionally known to be nonterminal (spec.md: "without queueing
+// inference for terminal-only episodes") — the mapping step above never
+// depends on that. Deduplication covers EVERY job status, not only live
+// ones: an identical (signature, frozen digest) job that already ran to
+// complete or exhausted is reused as-is — an exhausted job stays exhausted
+// (re-armed only by a changed input digest, an operator correction, or a
+// newer durable healthy generation), never re-inserted against the table's
+// UNIQUE(signature_key, frozen_input_digest) in a way that would roll back
+// the owning Situation's own input application.
+func admitSemanticProfileInferenceTx(ctx context.Context, tx *sql.Tx, att semanticSignatureAttachment, maxAttempts int, now time.Time) error {
+	if !att.mapped {
+		return nil
+	}
 	var headExists int
-	err = tx.QueryRowContext(ctx, `SELECT 1 FROM semantic_profile_heads WHERE signature_key = ?`, sig.Key).Scan(&headExists)
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM semantic_profile_heads WHERE signature_key = ?`, att.signatureKey).Scan(&headExists)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("store: check existing semantic profile head: %w", err)
 	}
@@ -164,36 +197,100 @@ func attachDeliverySemanticSignatureTx(ctx context.Context, tx *sql.Tx, delivery
 		return nil // a profile already exists for this signature — no fresh job needed.
 	}
 
-	var liveJobExists int
-	err = tx.QueryRowContext(ctx, `
-		SELECT 1 FROM semantic_profile_inference_jobs WHERE signature_key = ? AND status IN ('pending','running')`,
-		sig.Key).Scan(&liveJobExists)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("store: check existing live inference job: %w", err)
-	}
-	if err == nil {
-		return nil // another delivery under this same signature already enqueued the (deduplicated) job.
-	}
-
-	return insertSemanticProfileInferenceJobTx(ctx, tx, sig.Key, in, maxAttempts, createdAt)
-}
-
-func insertSemanticProfileInferenceJobTx(ctx context.Context, tx *sql.Tx, signatureKey string, frozenInput profilemodel.SignatureInput, maxAttempts int, createdAt string) error {
-	frozenJSON, err := json.Marshal(frozenInput)
+	frozenJSON, err := json.Marshal(att.input)
 	if err != nil {
 		return fmt.Errorf("store: marshal frozen semantic input: %w", err)
 	}
 	sum := sha256.Sum256(frozenJSON)
 	digest := hex.EncodeToString(sum[:])
+
+	var sameJobExists int
+	err = tx.QueryRowContext(ctx, `
+		SELECT 1 FROM semantic_profile_inference_jobs WHERE signature_key = ? AND frozen_input_digest = ?`,
+		att.signatureKey, digest).Scan(&sameJobExists)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("store: check existing identical inference job: %w", err)
+	}
+	if err == nil {
+		return nil // this exact frozen input already has its job, in whatever state it reached.
+	}
+
+	var liveJobExists int
+	err = tx.QueryRowContext(ctx, `
+		SELECT 1 FROM semantic_profile_inference_jobs WHERE signature_key = ? AND status IN ('pending','running')`,
+		att.signatureKey).Scan(&liveJobExists)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("store: check existing live inference job: %w", err)
+	}
+	if err == nil {
+		return nil // another frozen input under this same signature already holds the one live job slot.
+	}
+
+	return insertSemanticProfileInferenceJobTx(ctx, tx, att.signatureKey, string(frozenJSON), digest, maxAttempts, canonicalTime(now))
+}
+
+func insertSemanticProfileInferenceJobTx(ctx context.Context, tx *sql.Tx, signatureKey, frozenJSON, digest string, maxAttempts int, createdAt string) error {
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO semantic_profile_inference_jobs (
 			id, signature_key, frozen_input_json, frozen_input_digest, expected_head_version,
 			status, attempt, max_attempts, created_at
 		) VALUES (?, ?, ?, ?, 0, ?, 0, ?, ?)`,
-		uuid.NewString(), signatureKey, string(frozenJSON), digest, profilemodel.JobStatePending, maxAttempts, createdAt); err != nil {
+		uuid.NewString(), signatureKey, frozenJSON, digest, profilemodel.JobStatePending, maxAttempts, createdAt); err != nil {
 		return fmt.Errorf("store: insert semantic profile inference job: %w", err)
 	}
 	return nil
+}
+
+// mapSituationInputDeliverySemanticSignatureTx is ApplySituationInput's own
+// mapping-step entry: a delivery-less input (nil deliveryID) has nothing to
+// map and yields an unmapped attachment that the admission step ignores.
+func mapSituationInputDeliverySemanticSignatureTx(ctx context.Context, tx *sql.Tx, deliveryID *string, now time.Time) (semanticSignatureAttachment, error) {
+	if deliveryID == nil {
+		return semanticSignatureAttachment{}, nil
+	}
+	return mapDeliverySemanticSignatureTx(ctx, tx, *deliveryID, now)
+}
+
+// admitSemanticProfileInferenceForOwnerTx is ApplySituationInput's own
+// admission-step entry, run AFTER resolveAndApplySituationTx settled which
+// Situation the input landed on: an R2 owner-terminal short-circuit, or a
+// pre-controller join into an already-terminal owner, both leave the
+// delivery mapped but never queue inference for a terminal-only episode.
+func (s *Store) admitSemanticProfileInferenceForOwnerTx(ctx context.Context, tx *sql.Tx, att semanticSignatureAttachment, outcome situationApplyOutcome, now time.Time) error {
+	if !att.mapped || outcome.ownerTerminal {
+		return nil
+	}
+	lifecycle, _, err := situationLifecycleAndVersionTx(ctx, tx, outcome.situationID)
+	if err != nil {
+		return err
+	}
+	if lifecycle.Terminal() {
+		return nil
+	}
+	return admitSemanticProfileInferenceTx(ctx, tx, att, s.maxSemanticProfileAttempts(), now)
+}
+
+// deliveryHasNonterminalOwnerTx reports whether deliveryID currently belongs
+// (via its Incident) to an active/recovery_pending Situation — re-checked
+// INSIDE the backfill's write transaction so a Situation that terminalized
+// between the backfill's candidate read and its write never gets a
+// missing-profile job admitted against it.
+func deliveryHasNonterminalOwnerTx(ctx context.Context, tx *sql.Tx, deliveryID string) (bool, error) {
+	var one int
+	err := tx.QueryRowContext(ctx, `
+		SELECT 1
+		FROM incident_alert_deliveries iad
+		JOIN situation_incidents si ON si.incident_id = iad.incident_id
+		JOIN situations s ON s.id = si.situation_id
+		WHERE iad.delivery_id = ? AND s.lifecycle IN ('active', 'recovery_pending')
+		LIMIT 1`, deliveryID).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("store: check delivery nonterminal owner: %w", err)
+	}
+	return true, nil
 }
 
 // BackfillActiveSemanticMappings attaches a semantic signature (and, for a
@@ -238,15 +335,31 @@ func (s *Store) BackfillActiveSemanticMappings(ctx context.Context, now time.Tim
 	defer func() { _ = tx.Rollback() }()
 
 	maxAttempts := s.maxSemanticProfileAttempts()
+	attached := 0
 	for _, id := range ids {
-		if err := attachDeliverySemanticSignatureTx(ctx, tx, id, maxAttempts, now); err != nil {
+		nonterminal, err := deliveryHasNonterminalOwnerTx(ctx, tx, id)
+		if err != nil {
 			return 0, err
 		}
+		if !nonterminal {
+			continue // terminalized since the candidate read: left for lazy derivation, never queued.
+		}
+		att, err := mapDeliverySemanticSignatureTx(ctx, tx, id, now)
+		if err != nil {
+			return 0, err
+		}
+		if !att.mapped {
+			continue
+		}
+		if err := admitSemanticProfileInferenceTx(ctx, tx, att, maxAttempts, now); err != nil {
+			return 0, err
+		}
+		attached++
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("store: commit backfill active semantic mappings: %w", err)
 	}
-	return len(ids), nil
+	return attached, nil
 }
 
 // RecoverSemanticInference releases every inference job whose lease expired
