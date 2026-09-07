@@ -36,14 +36,14 @@ const (
 	// shape did not change, but it embeds MaterialFactHash's output string
 	// directly, so a hash produced before this fix must never be silently
 	// treated as compatible with one produced after it.
-	materialFactHashSchemaVersion = 2
+	materialFactHashSchemaVersion = 3
 
 	// assessmentBasisHashSchemaVersion is bumped to 3 (Task 5): the carried-
 	// forward InputVersion-instability bug documented on
 	// assessmentBasisReasonDTO is fixed by dropping that DTO's ID field. A
 	// hash produced under the old ID-bearing shape must never be silently
 	// treated as compatible with one produced under the fixed shape.
-	assessmentBasisHashSchemaVersion = 3
+	assessmentBasisHashSchemaVersion = 4
 
 	// assessmentValidatorVersion tracks Task 5's ValidateAssessmentProposal
 	// rule set. Task 4 has no validator of its own; this placeholder lets
@@ -607,7 +607,6 @@ type materialFactHashDTO struct {
 	Symptoms                   []materialSymptomDTO         `json:"symptoms"`
 	Incidents                  []materialIncidentDTO        `json:"incidents"`
 	PriorDurationHistogram     materialDurationHistogramDTO `json:"prior_duration_histogram"`
-	LimitationCodes            []string                     `json:"limitation_codes"`
 }
 
 // MaterialFactHash hashes only the evidence spec.md's "Material fact hash
@@ -670,12 +669,6 @@ func MaterialFactHash(in SnapshotInput, symptoms []Symptom, durationClass string
 	}
 	sort.Slice(incidentDTOs, func(i, j int) bool { return incidentDTOs[i].IncidentID < incidentDTOs[j].IncidentID })
 
-	limitationCodes := make([]string, 0, len(plan2UnsupportedCapabilities))
-	for _, l := range plan2UnsupportedCapabilities {
-		limitationCodes = append(limitationCodes, l.Code)
-	}
-	sort.Strings(limitationCodes)
-
 	dto := materialFactHashDTO{
 		SchemaVersion:              materialFactHashSchemaVersion,
 		FactSchemaVersion:          factSchemaVersion,
@@ -685,7 +678,6 @@ func MaterialFactHash(in SnapshotInput, symptoms []Symptom, durationClass string
 		Symptoms:                   symptomDTOs,
 		Incidents:                  incidentDTOs,
 		PriorDurationHistogram:     priorDurationHistogram(priorDurationsSeconds(in.PriorSituations)),
-		LimitationCodes:            limitationCodes,
 	}
 	return canonicalDigest(dto)
 }

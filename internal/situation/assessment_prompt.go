@@ -22,7 +22,7 @@ import (
 // A future task bumps it (never silently) when the instructions or the
 // snapshot projection change in a way that should invalidate any cached
 // prompt-hash comparison.
-const assessmentPromptSchemaVersion = 1
+const assessmentPromptSchemaVersion = 2
 
 // assessmentPromptMaxOutputTokens bounds the semantic-proposal JSON reply.
 // The proposal schema is small and fixed; this is a Task 5 default, not a
@@ -48,9 +48,29 @@ type assessmentPromptDTO struct {
 	Symptoms        []Symptom               `json:"symptoms"`
 	Incidents       []IncidentState         `json:"incidents"`
 	EligibleReasons []model.ReasonCandidate `json:"eligible_reasons"`
+	PriorAssessment *assessmentPriorDTO     `json:"prior_assessment,omitempty"`
+}
+
+type assessmentPriorDTO struct {
+	Persistence      model.Persistence       `json:"persistence"`
+	Impact           model.Impact            `json:"impact"`
+	Novelty          model.Novelty           `json:"novelty"`
+	Causality        model.Causality         `json:"causality"`
+	EvidenceQuality  model.EvidenceQuality   `json:"evidence_quality"`
+	SufficientReason *model.SufficientReason `json:"sufficient_reason,omitempty"`
+	Limitations      []model.Limitation      `json:"limitations"`
 }
 
 func newAssessmentPromptDTO(snap Snapshot) assessmentPromptDTO {
+	var prior *assessmentPriorDTO
+	if a := snap.PriorAssessment; a != nil {
+		prior = &assessmentPriorDTO{
+			Persistence: a.Persistence, Impact: a.Impact, Novelty: a.Novelty,
+			Causality: a.Causality, EvidenceQuality: a.EvidenceQuality,
+			SufficientReason: a.SufficientReason,
+			Limitations:      append([]model.Limitation(nil), a.Limitations...),
+		}
+	}
 	return assessmentPromptDTO{
 		SchemaVersion:   assessmentPromptSchemaVersion,
 		SituationID:     snap.SituationID,
@@ -62,6 +82,7 @@ func newAssessmentPromptDTO(snap Snapshot) assessmentPromptDTO {
 		Symptoms:        snap.Symptoms,
 		Incidents:       snap.Incidents,
 		EligibleReasons: snap.EligibleReasons,
+		PriorAssessment: prior,
 	}
 }
 
@@ -133,6 +154,9 @@ present: "lifecycle", "action_contract", and "cadence". The controller
 derives these exclusively; do not propose them under any name or nesting.
 
 Ground every claim stronger than "unknown" in the snapshot's own evidence.
+If prior_assessment is present, preserve each prior semantic value unless a
+current fact contradicts it; cite that contradicting fact in evidence_refs.
+Do not oscillate between equivalent values on unchanged evidence.
 Never claim urgent attention unless the snapshot proves a deterministic
 urgent anchor. Never present mere temporal overlap as a supported cause.`
 
