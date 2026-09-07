@@ -1129,6 +1129,33 @@ func TestCorrectSemanticProfileEnqueuesChangeForFanOut(t *testing.T) {
 	}
 }
 
+// TestCorrectSemanticProfileReturnedVersionCarriesCreatedAt is Plan 4 Task
+// 10's own live lab finding: CorrectSemanticProfile's returned
+// profilemodel.Version left CreatedAt at its zero value even though the row
+// it just durably committed carries the real correction instant — an MCP
+// caller reading alertint_correct_semantic_profile's own synchronous
+// response (not a follow-up alertint_get_semantic_profile read) saw
+// "0001-01-01T00:00:00Z" for a correction that had genuinely just landed.
+func TestCorrectSemanticProfileReturnedVersionCarriesCreatedAt(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	correction := profilemodel.Correction{
+		Signature: "zabbix:advisory:sha256:created-at",
+		Profile: profilemodel.Profile{
+			SubjectKind: "service", EventKind: "availability", PossibleRole: "symptom",
+			CandidateScope: []string{"service"}, HorizonTier: "hours",
+		},
+		Confirm: true, AssertedBy: "operator:test",
+	}
+	v, err := st.CorrectSemanticProfile(context.Background(), correction, now)
+	if err != nil {
+		t.Fatalf("CorrectSemanticProfile: %v", err)
+	}
+	if !v.CreatedAt.Equal(now) {
+		t.Fatalf("returned CreatedAt = %v, want %v", v.CreatedAt, now)
+	}
+}
+
 // ----------------------------------------------------------------------
 // GetSemanticProfile / ListSituationSemanticSignatures: Task 9's
 // alertint_get_semantic_profile MCP read surface.

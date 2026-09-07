@@ -452,7 +452,7 @@ func (s *Store) CorrectSemanticProfile(ctx context.Context, c profilemodel.Corre
 		ID: versionID, Signature: c.Signature, Version: newVersion,
 		SchemaVersion: profilemodel.ProfileSchemaVersion, PromptVersion: profilemodel.PromptVersion,
 		SemanticInputDigest: inputDigest, Origin: profilemodel.OriginCorrection,
-		Profile: c.Profile, AssertedBy: c.AssertedBy,
+		Profile: c.Profile, AssertedBy: c.AssertedBy, CreatedAt: now.UTC(),
 	}, nil
 }
 
