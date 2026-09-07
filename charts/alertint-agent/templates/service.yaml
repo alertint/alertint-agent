@@ -1,9 +1,11 @@
+{{- $labels := include "alertint-agent.labels" . | fromYaml -}}
+{{- $labels = mergeOverwrite $labels .Values.service.labels -}}
 apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "alertint-agent.fullname" . }}
   labels:
-    {{- include "alertint-agent.labels" . | nindent 4 }}
+    {{- toYaml $labels | nindent 4 }}
 spec:
   type: {{ .Values.service.type }}
   ports:

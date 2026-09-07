@@ -95,8 +95,8 @@ single-writer assumption.
 | serviceAccount.create | bool | `true` |  |
 | serviceAccount.annotations | object | `{}` |  |
 | serviceAccount.name | string | `""` |  |
-| podAnnotations | object | `{}` |  |
-| podLabels | object | `{}` |  |
+| podAnnotations | object | `{}` | Merged onto the pod template's annotations, in addition to the chart's own checksum/config and checksum/secret annotations. A key here overrides the chart's own annotation of the same name. |
+| podLabels | object | `{}` | Merged onto the pod template's labels, in addition to the chart's standard labels. A key here overrides the chart's own label of the same name. |
 | podSecurityContext.runAsNonRoot | bool | `true` |  |
 | podSecurityContext.runAsUser | int | `65532` |  |
 | podSecurityContext.runAsGroup | int | `65532` |  |
@@ -106,20 +106,13 @@ single-writer assumption.
 | securityContext.readOnlyRootFilesystem | bool | `true` |  |
 | securityContext.capabilities.drop[0] | string | `"ALL"` |  |
 | service.type | string | `"ClusterIP"` |  |
+| service.labels | object | `{}` | Extra labels merged onto the Service, in addition to the chart's standard labels (same precedence as podLabels: a key here overrides the chart's own label of the same name). |
 | service.webhookPort | int | `9911` | External Service port for Alertmanager/change/Zabbix webhooks + GET /health. The container itself always listens on 9911 regardless of this value (it's fixed in the Deployment template and mapped by name) — this only changes what port the Service exposes it as. Only served when at least one receiver under config.* is enabled (see values below). |
 | service.mcpPort | int | `9912` | External Service port for the MCP HTTP server (AI coding agents). The container always listens on 9912 regardless of this value, mapped by name the same way as webhookPort. Harmless to expose even if config.mcp is left disabled — nothing listens on it in that case. |
-| ingress.enabled | bool | `false` |  |
-| ingress.className | string | `""` |  |
-| ingress.annotations | object | `{}` |  |
-| ingress.webhook.host | string | `""` |  |
+| ingress | object | `{"className":"","mcp":{"annotations":{},"enabled":false,"host":"","path":"/","pathType":"ImplementationSpecific","tls":[]},"webhook":{"annotations":{},"enabled":false,"host":"","path":"/webhook","pathType":"Prefix","tls":[]}}` | className is a shared infra setting (which ingress controller handles both resources); annotations are per-Ingress below, since the two commonly need different controller behavior (auth, IP allowlisting, rewrites, ...). webhook.enabled and mcp.enabled are fully independent — either, both, or neither can be created. |
+| ingress.webhook.enabled | bool | `false` | Set to true to create the webhook Ingress, independent of mcp.enabled. |
 | ingress.webhook.path | string | `"/webhook"` | Prefix-matches /webhook/alertmanager, /webhook/change, etc. Kept away from "/" deliberately so GET /health isn't reachable through this Ingress just because it shares the Service. |
-| ingress.webhook.pathType | string | `"Prefix"` |  |
-| ingress.webhook.tls | list | `[]` |  |
-| ingress.mcp.enabled | bool | `false` |  |
-| ingress.mcp.host | string | `""` |  |
-| ingress.mcp.path | string | `"/"` |  |
-| ingress.mcp.pathType | string | `"ImplementationSpecific"` |  |
-| ingress.mcp.tls | list | `[]` |  |
+| ingress.mcp.enabled | bool | `false` | Set to true to also (or only) expose the MCP Ingress — independent of webhook.enabled above. |
 | resources.requests.cpu | string | `"100m"` |  |
 | resources.requests.memory | string | `"128Mi"` |  |
 | resources.limits.memory | string | `"256Mi"` |  |

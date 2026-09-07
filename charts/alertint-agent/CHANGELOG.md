@@ -9,8 +9,37 @@ and this chart adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
-## [0.1.1] - 2026-09-04
+### Changed
 
+- The webhook and MCP Ingresses are now configured fully independently:
+  `ingress.enabled` (a shared master switch) is removed in favor of
+  `ingress.webhook.enabled` and `ingress.mcp.enabled`, each defaulting to
+  `false` — either, both, or neither Ingress can now be created without one
+  implicitly gating the other. `ingress.annotations` moved to
+  `ingress.webhook.annotations`/`ingress.mcp.annotations` (also
+  independent per Ingress, since the two commonly need different
+  controller behavior — auth, IP allowlisting, rewrites). `ingress.className`
+  remains a single shared setting, since it picks the ingress controller
+  for the whole install rather than per-endpoint behavior.
+
+### Added
+
+- `service.labels`, for extra labels merged onto the Service alongside the
+  chart's standard labels (mirrors `podLabels`' precedence: a key here
+  overrides the chart's own label of the same name).
+
+### Fixed
+
+- `podLabels`/`podAnnotations` are now merged into the pod template's own
+  labels/annotations rather than concatenated after them — the previous
+  concatenation produced literal duplicate YAML keys whenever a
+  `podLabels`/`podAnnotations` key collided with one of the chart's own
+  (e.g. `app.kubernetes.io/name`, `checksum/config`), which most YAML
+  parsers accept via a silent last-key-wins, but which is invalid,
+  fragile YAML that stricter tooling can reject outright. A colliding
+  key now cleanly overrides the chart's own value instead.
+
+## [0.1.1] - 2026-09-04
 
 ### Changed
 

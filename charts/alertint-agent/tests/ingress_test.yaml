@@ -3,9 +3,7 @@ templates:
   - ingress-webhook.yaml
   - ingress-mcp.yaml
 tests:
-  - it: renders nothing when ingress is disabled
-    set:
-      ingress.enabled: false
+  - it: renders neither Ingress by default
     asserts:
       - hasDocuments:
           count: 0
@@ -16,7 +14,7 @@ tests:
 
   - it: defaults the webhook path to /webhook with Prefix matching
     set:
-      ingress.enabled: true
+      ingress.webhook.enabled: true
     asserts:
       - equal:
           path: spec.rules[0].http.paths[0].path
@@ -29,7 +27,7 @@ tests:
 
   - it: quotes a wildcard webhook host so it stays valid YAML
     set:
-      ingress.enabled: true
+      ingress.webhook.enabled: true
       ingress.webhook.host: "*.example.com"
     asserts:
       - equal:
@@ -39,7 +37,6 @@ tests:
 
   - it: quotes a wildcard mcp host too, when the mcp ingress is enabled
     set:
-      ingress.enabled: true
       ingress.mcp.enabled: true
       ingress.mcp.host: "*.example.com"
     asserts:
@@ -48,14 +45,75 @@ tests:
           value: "*.example.com"
         template: ingress-mcp.yaml
 
-  - it: does not render the mcp Ingress unless both ingress.enabled and ingress.mcp.enabled are true
+  - it: exposes only the webhook Ingress when only webhook.enabled is true
     set:
-      ingress.enabled: true
-      ingress.mcp.enabled: false
+      ingress.webhook.enabled: true
     asserts:
       - hasDocuments:
           count: 1
         template: ingress-webhook.yaml
       - hasDocuments:
           count: 0
+        template: ingress-mcp.yaml
+
+  - it: exposes only the mcp Ingress when only mcp.enabled is true
+    set:
+      ingress.mcp.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+        template: ingress-webhook.yaml
+      - hasDocuments:
+          count: 1
+        template: ingress-mcp.yaml
+
+  - it: exposes both Ingresses when both are enabled
+    set:
+      ingress.webhook.enabled: true
+      ingress.mcp.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+        template: ingress-webhook.yaml
+      - hasDocuments:
+          count: 1
+        template: ingress-mcp.yaml
+
+  - it: shares className across both Ingresses
+    set:
+      ingress.webhook.enabled: true
+      ingress.mcp.enabled: true
+      ingress.className: nginx
+    asserts:
+      - equal:
+          path: spec.ingressClassName
+          value: nginx
+        template: ingress-webhook.yaml
+      - equal:
+          path: spec.ingressClassName
+          value: nginx
+        template: ingress-mcp.yaml
+
+  - it: keeps annotations independent per Ingress
+    set:
+      ingress.webhook.enabled: true
+      ingress.mcp.enabled: true
+      ingress.webhook.annotations:
+        webhook-only: yes-please
+      ingress.mcp.annotations:
+        mcp-only: yes-please
+    asserts:
+      - equal:
+          path: metadata.annotations.webhook-only
+          value: yes-please
+        template: ingress-webhook.yaml
+      - notExists:
+          path: metadata.annotations["mcp-only"]
+        template: ingress-webhook.yaml
+      - equal:
+          path: metadata.annotations.mcp-only
+          value: yes-please
+        template: ingress-mcp.yaml
+      - notExists:
+          path: metadata.annotations["webhook-only"]
         template: ingress-mcp.yaml

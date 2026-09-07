@@ -33,3 +33,24 @@ tests:
       - equal:
           path: spec.ports[1].targetPort
           value: mcp
+
+  - it: merges custom labels onto the Service alongside the chart's standard labels
+    set:
+      service.labels:
+        team: sre
+    asserts:
+      - equal:
+          path: metadata.labels.team
+          value: sre
+      - equal:
+          path: metadata.labels["app.kubernetes.io/name"]
+          value: alertint-agent
+
+  - it: lets a custom label override a standard one of the same name
+    set:
+      service.labels:
+        app.kubernetes.io/name: overridden
+    asserts:
+      - equal:
+          path: metadata.labels["app.kubernetes.io/name"]
+          value: overridden
