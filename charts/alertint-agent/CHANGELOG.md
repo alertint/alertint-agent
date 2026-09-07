@@ -9,6 +9,8 @@ and this chart adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-07
+
 ### Changed
 
 - The webhook and MCP Ingresses are now configured fully independently:
