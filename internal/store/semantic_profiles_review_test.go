@@ -143,6 +143,73 @@ func exhaustJobByFinalReservation(t *testing.T, st *Store, now time.Time) profil
 	return claim
 }
 
+// TestClaimSemanticInferenceJobReclaimsLeaseExpiredAfterStartup (F13): a
+// job whose worker died AFTER startup (so RecoverSemanticInference never
+// sees it) is reclaimed by the next ordinary claim once its lease expires —
+// by another owner, with a fresh fencing token — while a still-live lease
+// is left untouched.
+func TestClaimSemanticInferenceJobReclaimsLeaseExpiredAfterStartup(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	seedPendingInferenceJob(t, st, "job-died-late", "sig:died-late", 3, nil, now)
+
+	first, found, err := st.ClaimSemanticInferenceJob(ctx, "worker-a", now, time.Minute)
+	if err != nil || !found {
+		t.Fatalf("first claim: found=%v err=%v", found, err)
+	}
+	// worker-a never completes. Before the lease expires nobody else can
+	// claim it.
+	if _, found, err := st.ClaimSemanticInferenceJob(ctx, "worker-b", now.Add(30*time.Second), time.Minute); err != nil || found {
+		t.Fatalf("claim under a live lease = (found=%v, %v), want (false, nil)", found, err)
+	}
+
+	// Lease expired: an ordinary claim by another owner reclaims it — no
+	// RecoverSemanticInference call in between.
+	second, found, err := st.ClaimSemanticInferenceJob(ctx, "worker-b", now.Add(2*time.Minute), time.Minute)
+	if err != nil || !found {
+		t.Fatalf("claim after lease expiry: found=%v err=%v", found, err)
+	}
+	if second.JobID != first.JobID {
+		t.Fatalf("reclaimed job = %s, want %s", second.JobID, first.JobID)
+	}
+	if second.Owner != "worker-b" || second.Token <= first.Token {
+		t.Fatalf("reclaim = owner %q token %d, want worker-b with a token above %d", second.Owner, second.Token, first.Token)
+	}
+	// The original holder is fenced out.
+	if _, _, err := st.ReserveSemanticInferenceCall(ctx, first.JobID, first.Owner, first.Token, now.Add(2*time.Minute)); !errors.Is(err, profilemodel.ErrLeaseLost) {
+		t.Fatalf("stale holder reserve err = %v, want ErrLeaseLost", err)
+	}
+}
+
+// TestClaimSemanticInferenceJobExhaustsFinalReservationCrashOnReclaim
+// (F13): a lease that expires after the job's LAST reserved call is
+// recovered as exhausted by the claim path — exactly RecoverSemanticInference's
+// own final-reservation rule — never handed out as pending again.
+func TestClaimSemanticInferenceJobExhaustsFinalReservationCrashOnReclaim(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	seedPendingInferenceJob(t, st, "job-final-crash", "sig:final-crash", 1, nil, now)
+
+	claim, found, err := st.ClaimSemanticInferenceJob(ctx, "worker-a", now, time.Minute)
+	if err != nil || !found {
+		t.Fatalf("claim: found=%v err=%v", found, err)
+	}
+	if _, _, err := st.ReserveSemanticInferenceCall(ctx, claim.JobID, claim.Owner, claim.Token, now); err != nil {
+		t.Fatalf("reserve the only attempt: %v", err)
+	}
+	// Crash: no completion; the lease expires.
+	_, found, err = st.ClaimSemanticInferenceJob(ctx, "worker-b", now.Add(2*time.Minute), time.Minute)
+	if err != nil || found {
+		t.Fatalf("claim after a final-reservation crash = (found=%v, %v), want (false, nil): nothing claimable", found, err)
+	}
+	status, ownerSet := getJobStatus(t, st, claim.JobID)
+	if status != profilemodel.JobStateExhausted || ownerSet {
+		t.Fatalf("status = %q ownerSet=%v, want exhausted with the lease released", status, ownerSet)
+	}
+}
+
 // TestApplySituationInputReusesExhaustedIdenticalJob (F6): once a
 // signature's job is exhausted, the next delivery under the SAME signature
 // and the SAME frozen semantic input must apply cleanly and reuse that job

@@ -363,13 +363,16 @@ func (s *Store) BackfillActiveSemanticMappings(ctx context.Context, now time.Tim
 }
 
 // RecoverSemanticInference releases every inference job whose lease expired
-// before now (a worker process died mid-attempt): a job that had not yet
-// spent its last attempt returns to pending, immediately eligible for a
+// at or before now (a worker process died mid-attempt): a job that had not
+// yet spent its last attempt returns to pending, immediately eligible for a
 // fresh claim; one already at its own frozen max_attempts is recovered
 // directly as exhausted (spec.md: "A crash after the final reservation is
 // recovered as exhausted even if no outcome committed") — never re-armed by
 // recovery alone, only by a later correction or a newer durable healthy
 // generation (Task 8's own concern). Returns the number of jobs recovered.
+// This startup pass is unbounded; the SAME release runs bounded inside
+// every ClaimSemanticInferenceJob, so a lease that expires after startup is
+// reclaimed by the next ordinary claim rather than waiting for a restart.
 func (s *Store) RecoverSemanticInference(ctx context.Context, now time.Time) (int, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -377,21 +380,53 @@ func (s *Store) RecoverSemanticInference(ctx context.Context, now time.Time) (in
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	rows, err := tx.QueryContext(ctx, `
-		SELECT id, attempt, max_attempts FROM semantic_profile_inference_jobs
-		WHERE status = 'running' AND lease_expires_at < ?`, canonicalTime(now))
+	recovered, err := releaseExpiredSemanticInferenceLeasesTx(ctx, tx, now, 0)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("store: commit recover semantic inference: %w", err)
+	}
+	return recovered, nil
+}
+
+// expiredSemanticInferenceLeaseReclaimLimit bounds how many expired running
+// leases one ClaimSemanticInferenceJob call releases before claiming, so a
+// large stranded backlog never turns a single claim poll into an unbounded
+// transaction (the startup RecoverSemanticInference pass is the unbounded
+// one).
+const expiredSemanticInferenceLeaseReclaimLimit = 100
+
+// releaseExpiredSemanticInferenceLeasesTx releases up to limit (0 =
+// unbounded) running jobs whose lease_expires_at <= now inside tx,
+// preserving final-reservation exhaustion semantics: a job that already
+// spent its last reserved call becomes exhausted, never pending. Each
+// release is fenced on the job still being 'running' with that same
+// expired lease, so a heartbeat that renewed the lease between the read
+// and the write is never clobbered. Returns the number of jobs released.
+func releaseExpiredSemanticInferenceLeasesTx(ctx context.Context, tx *sql.Tx, now time.Time, limit int) (int, error) {
+	query := `
+		SELECT id, attempt, max_attempts, lease_expires_at FROM semantic_profile_inference_jobs
+		WHERE status = 'running' AND lease_expires_at <= ?
+		ORDER BY lease_expires_at ASC, id ASC`
+	args := []any{canonicalTime(now)}
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return 0, fmt.Errorf("store: query stranded semantic inference jobs: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 	type stranded struct {
-		id                   string
+		id, leaseExpiresAt   string
 		attempt, maxAttempts int
 	}
 	var jobs []stranded
 	for rows.Next() {
 		var j stranded
-		if err := rows.Scan(&j.id, &j.attempt, &j.maxAttempts); err != nil {
+		if err := rows.Scan(&j.id, &j.attempt, &j.maxAttempts, &j.leaseExpiresAt); err != nil {
 			return 0, fmt.Errorf("store: scan stranded semantic inference job: %w", err)
 		}
 		jobs = append(jobs, j)
@@ -403,23 +438,26 @@ func (s *Store) RecoverSemanticInference(ctx context.Context, now time.Time) (in
 		return 0, fmt.Errorf("store: close stranded semantic inference jobs query: %w", err)
 	}
 
+	released := 0
 	for _, j := range jobs {
 		status := profilemodel.JobStatePending
-		var retryAt any
 		if j.attempt >= j.maxAttempts {
 			status = profilemodel.JobStateExhausted
 		}
-		if _, err := tx.ExecContext(ctx, `
+		res, err := tx.ExecContext(ctx, `
 			UPDATE semantic_profile_inference_jobs
-			SET status = ?, owner = NULL, lease_expires_at = NULL, retry_at = ?
-			WHERE id = ?`, status, retryAt, j.id); err != nil {
+			SET status = ?, owner = NULL, lease_expires_at = NULL, retry_at = NULL
+			WHERE id = ? AND status = 'running' AND lease_expires_at = ?`, status, j.id, j.leaseExpiresAt)
+		if err != nil {
 			return 0, fmt.Errorf("store: recover stranded semantic inference job %s: %w", j.id, err)
 		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("store: count recovered stranded semantic inference job %s: %w", j.id, err)
+		}
+		released += int(n)
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("store: commit recover semantic inference: %w", err)
-	}
-	return len(jobs), nil
+	return released, nil
 }
 
 // LoadProfileGuidanceForDeliveries reads the CURRENT head profile for every
@@ -840,13 +878,22 @@ func (s *Store) ExtendSemanticInferenceJobLease(ctx context.Context, jobID, owne
 // already past) for owner, fencing it with a fresh token and a lease
 // expiring in lease. found is false (no error) when no job is currently
 // due — an ordinary empty-queue poll, not a failure. Claiming never touches
-// attempt or spends a call.
+// attempt or spends a call. Before selecting, the same transaction releases
+// a bounded batch of running jobs whose lease has already expired
+// (releaseExpiredSemanticInferenceLeasesTx — the exact recovery
+// RecoverSemanticInference runs at startup, including final-reservation
+// exhaustion), so a worker that died AFTER startup never strands its job
+// until the next process restart.
 func (s *Store) ClaimSemanticInferenceJob(ctx context.Context, owner string, now time.Time, lease time.Duration) (profilemodel.JobClaim, bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return profilemodel.JobClaim{}, false, fmt.Errorf("store: begin claim semantic inference job: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	if _, err := releaseExpiredSemanticInferenceLeasesTx(ctx, tx, now, expiredSemanticInferenceLeaseReclaimLimit); err != nil {
+		return profilemodel.JobClaim{}, false, err
+	}
 
 	var id, signatureKey, frozenInputJSON, frozenInputDigest string
 	var expectedHeadVersion, attempt, token int
@@ -857,6 +904,12 @@ func (s *Store) ClaimSemanticInferenceJob(ctx context.Context, owner string, now
 		ORDER BY created_at ASC, id ASC LIMIT 1`, canonicalTime(now)).
 		Scan(&id, &signatureKey, &frozenInputJSON, &frozenInputDigest, &expectedHeadVersion, &attempt, &token)
 	if errors.Is(err, sql.ErrNoRows) {
+		// Nothing claimable, but the expired-lease release above (an
+		// exhausted final-reservation crash, or a job that became pending
+		// yet not due) must still commit durably.
+		if err := tx.Commit(); err != nil {
+			return profilemodel.JobClaim{}, false, fmt.Errorf("store: commit claim semantic inference job (none due): %w", err)
+		}
 		return profilemodel.JobClaim{}, false, nil
 	}
 	if err != nil {
