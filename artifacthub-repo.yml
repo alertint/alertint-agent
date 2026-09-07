@@ -1,4 +1,4 @@
 # Artifact Hub verification for oci://ghcr.io/alertint/charts/alertint-agent.
-# Publish this file to the chart's artifacthub.io OCI tag; GitHub alone is not sufficient.
+# Run the Artifact Hub Metadata workflow to publish this file to the chart's artifacthub.io OCI tag.
 # https://artifacthub.io/docs/topics/repositories/helm-charts/#oci-support
 repositoryID: 3a81b301-6c43-4ce6-9be8-9f74d38199c1
