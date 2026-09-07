@@ -138,10 +138,26 @@ func ReduceSourceLifecycle(observations []SourceObservation, expectedAlertIDs []
 }
 
 // preferObservation reports whether candidate should replace current as the
-// authoritative observation for one Alert: a strictly later ObservedAt
-// always wins; an exact tie prefers firing (spec.md: "On an ordering
-// conflict prefer firing").
+// authoritative observation for one Alert. Proven source episode ordering
+// precedes observation time, so late delivery of an older episode cannot
+// end a refire. Within an episode (or without proven episode ordering), the
+// latest ObservedAt wins and an exact tie prefers firing.
 func preferObservation(candidate, current SourceObservation) bool {
+	sameEpisode := candidate.EpisodeKey != "" && candidate.EpisodeKey == current.EpisodeKey
+	if !sameEpisode && candidate.EventStartedAt != nil && !candidate.EventStartedAt.IsZero() && current.EventStartedAt != nil && !current.EventStartedAt.IsZero() {
+		if !candidate.EventStartedAt.Equal(*current.EventStartedAt) {
+			return candidate.EventStartedAt.After(*current.EventStartedAt)
+		}
+		sameEpisode = true
+	}
+	if !sameEpisode {
+		if resolvedBeforeEpisode(candidate, current) {
+			return false
+		}
+		if resolvedBeforeEpisode(current, candidate) {
+			return true
+		}
+	}
 	if candidate.ObservedAt.After(current.ObservedAt) {
 		return true
 	}
@@ -149,6 +165,16 @@ func preferObservation(candidate, current SourceObservation) bool {
 		return true
 	}
 	return false
+}
+
+// A source resolution ending before another episode starts proves ordering
+// even when the resolution has no start time. Otherwise an end timestamp
+// must not outrank a later live poll of the same or an unproven episode.
+func resolvedBeforeEpisode(resolved, other SourceObservation) bool {
+	return resolved.State == SourceStateResolved &&
+		resolved.EventResolvedAt != nil && !resolved.EventResolvedAt.IsZero() &&
+		other.EventStartedAt != nil && !other.EventStartedAt.IsZero() &&
+		resolved.EventResolvedAt.Before(*other.EventStartedAt)
 }
 
 // expectedAlertIDs reduces deliveries to the deduplicated, deterministically

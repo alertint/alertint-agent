@@ -6,6 +6,7 @@ import (
 	"sort"
 	"time"
 
+	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
@@ -322,6 +323,10 @@ type Symptom struct {
 // proposal or derive a deterministic one, with stable hashes over only its
 // material content. BuildSnapshot is the sole producer.
 type Snapshot struct {
+	// Observations are the same bounded prepared evidence used by material
+	// identity. They remain separate from the local fact table's closed schema.
+	Observations        []observationmodel.Fact
+	ObservationChecks   []ObservationCheck
 	SituationID         string
 	InputVersion        int
 	Lifecycle           model.Lifecycle
@@ -331,6 +336,7 @@ type Snapshot struct {
 	Symptoms            []Symptom
 	Incidents           []IncidentState
 	EligibleReasons     []model.ReasonCandidate
+	PriorAssessment     *model.Assessment
 	MaterialFactHash    string
 	AssessmentBasisHash string
 }
@@ -472,6 +478,8 @@ func BuildSnapshot(in SnapshotInput) Snapshot {
 	basisHash := AssessmentBasisHash(in, materialHash, eligible)
 
 	return Snapshot{
+		Observations:        preparedObservationFacts(in.Prepared),
+		ObservationChecks:   preparedObservationChecks(in.Prepared),
 		SituationID:         in.Situation.ID,
 		InputVersion:        in.Situation.InputVersion,
 		Lifecycle:           in.Situation.Lifecycle,
@@ -481,7 +489,16 @@ func BuildSnapshot(in SnapshotInput) Snapshot {
 		Symptoms:            symptoms,
 		Incidents:           sortIncidentsByID(in.Incidents),
 		EligibleReasons:     eligible,
+		PriorAssessment:     priorAssessment(in.CurrentAssessment),
 		MaterialFactHash:    materialHash,
 		AssessmentBasisHash: basisHash,
 	}
+}
+
+func priorAssessment(current *AuthoritativeAssessment) *model.Assessment {
+	if current == nil {
+		return nil
+	}
+	a := current.Assessment
+	return &a
 }

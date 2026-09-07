@@ -208,9 +208,10 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	llmClient := buildLLMClient(cfg, apiKey, auditor, logger)
+	llmBudget := llm.NewBudget(st, cfg.LLM.Budget)
+	llmClient := buildLLMClient(cfg, apiKey, auditor, logger, llmBudget)
 
-	classifierClient := buildClassifierClient(cfg, apiKey, auditor, logger)
+	classifierClient := buildClassifierClient(cfg, apiKey, auditor, logger, llmBudget)
 
 	notifier, llmSystemPublisher := buildNotifier(cfg, st, auditor, logger, strings.EqualFold(level, "debug"))
 
@@ -1215,11 +1216,11 @@ func llmProviderIsOpenAI(cfg *config.Config) bool {
 
 // buildLLMClient constructs the triage LLM client for the configured
 // provider. Exactly one provider serves an install (ADR-0026).
-func buildLLMClient(cfg *config.Config, apiKey string, auditor *audit.Auditor, logger *slog.Logger) acutetriage.LLMClient {
+func buildLLMClient(cfg *config.Config, apiKey string, auditor *audit.Auditor, logger *slog.Logger, budget ...*llm.Budget) acutetriage.LLMClient {
 	if llmProviderIsOpenAI(cfg) {
-		return llmopenai.New(llmopenaiCfg(cfg, apiKey, cfg.LLM.TimeoutSeconds, cfg.LLM.Model, cfg.LLM.MaxTokens), auditor, logger)
+		return llmopenai.New(llmopenaiCfg(cfg, apiKey, cfg.LLM.TimeoutSeconds, cfg.LLM.Model, cfg.LLM.MaxTokens, budget...), auditor, logger)
 	}
-	return llmanthropic.New(llmanthropicCfg(cfg), auditor, logger)
+	return llmanthropic.New(llmanthropicCfg(cfg, budget...), auditor, logger)
 }
 
 // buildLLMProber type-asserts the primary LLM client into an llm.Prober for
@@ -1238,8 +1239,9 @@ func buildLLMProber(cfg *config.Config, client acutetriage.LLMClient, logger *sl
 
 // llmopenaiCfg builds an openaicompat.Config; model/maxTokens/timeout are
 // parameters because the classifier client reuses this with its own values.
-func llmopenaiCfg(cfg *config.Config, apiKey string, timeoutSeconds int, model string, maxTokens int) llmopenai.Config {
+func llmopenaiCfg(cfg *config.Config, apiKey string, timeoutSeconds int, model string, maxTokens int, budget ...*llm.Budget) llmopenai.Config {
 	return llmopenai.Config{
+		Budget:          configuredLLMBudget(cfg, budget),
 		BaseURL:         cfg.LLM.BaseURL,
 		APIKey:          apiKey,
 		Model:           model,
@@ -1263,7 +1265,7 @@ const classifierThinkingMaxTokens = 8192
 // serve, and requesting the Haiku constant there would 404 every call,
 // silently poisoning the ADR-0018 graduation evidence with fail-open
 // "unsure" verdicts. Returns a true nil interface when the mode is off.
-func buildClassifierClient(cfg *config.Config, apiKey string, auditor *audit.Auditor, logger *slog.Logger) acutetriage.LLMClient {
+func buildClassifierClient(cfg *config.Config, apiKey string, auditor *audit.Auditor, logger *slog.Logger, budget ...*llm.Budget) acutetriage.LLMClient {
 	if !cfg.Memory.Classifier.Enabled() {
 		return nil
 	}
@@ -1280,13 +1282,14 @@ func buildClassifierClient(cfg *config.Config, apiKey string, auditor *audit.Aud
 		if cfg.LLM.Thinking {
 			maxTokens = classifierThinkingMaxTokens
 		}
-		return llmopenai.New(llmopenaiCfg(cfg, apiKey, cfg.Memory.Classifier.TimeoutSeconds, cfg.LLM.Model, maxTokens), auditor, logger)
+		return llmopenai.New(llmopenaiCfg(cfg, apiKey, cfg.Memory.Classifier.TimeoutSeconds, cfg.LLM.Model, maxTokens, budget...), auditor, logger)
 	}
 	logger.Info("memory shadow classifier enabled",
 		slog.String("mode", string(cfg.Memory.Classifier.Mode)),
 		slog.String("model", acutetriage.ClassifierModel),
 	)
 	return llmanthropic.New(llmanthropic.Config{
+		Budget:         configuredLLMBudget(cfg, budget),
 		APIKey:         apiKey,
 		Model:          acutetriage.ClassifierModel,
 		TimeoutSeconds: cfg.Memory.Classifier.TimeoutSeconds,
@@ -1294,9 +1297,10 @@ func buildClassifierClient(cfg *config.Config, apiKey string, auditor *audit.Aud
 }
 
 // llmanthropicCfg builds an llm/anthropic.Config from the loaded config.
-func llmanthropicCfg(cfg *config.Config) llmanthropic.Config {
+func llmanthropicCfg(cfg *config.Config, budget ...*llm.Budget) llmanthropic.Config {
 	key, _ := cfg.LLMAPIKey()
 	return llmanthropic.Config{
+		Budget:         configuredLLMBudget(cfg, budget),
 		APIKey:         key,
 		Model:          cfg.LLM.Model,
 		MaxTokens:      cfg.LLM.MaxTokens,

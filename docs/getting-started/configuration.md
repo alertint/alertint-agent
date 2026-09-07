@@ -148,6 +148,16 @@ its behavior against it is undefined.
 | `thinking` | bool | `false` | `openai-compatible` only: opt a hybrid-reasoning model into thinking. Requires `max_tokens` 8000–16000 or triage fails with the truncation error |
 | `reasoning_effort` | string | — | `openai-compatible` only, requires `thinking: true`: sent as `chat_template_kwargs.reasoning_effort` alongside `enable_thinking`. Model-specific values (e.g. Qwen3.8: `xhigh`/`medium`/`low`), passed through unvalidated; empty omits the field and leaves the model/server default in effect |
 | `timeout_seconds` | int | `120` | Whole-request LLM timeout, either provider. Local endpoints under storm concurrency typically need ~300 |
+| `budget.calls_per_hour` | int | `0` | Shared ceiling on generation HTTP attempts in the preceding rolling 60 minutes, including retries; `0` is unlimited. Reservations commit before dispatch and survive restart in `connector_state` under `llm.budget.v1`. Metadata/health GETs are excluded. |
+| `budget.total_tokens` | int | `0` | Shared cumulative token ceiling with no time reset; `0` is unlimited. Each concurrent request reserves encoded request bytes + output cap + 1024, then settles to reported usage including cache tokens (without double-counting OpenAI detail fields). Unknown usage retains the charge and blocks further token-budgeted calls pending manual reconciliation; crashes retain unresolved allowances. Accounting begins when either limit is enabled, without historical backfill. This conservative text allowance cannot guarantee an exact cap for arbitrary compatible servers; reported overruns return an error. See `config.example.yaml` for recovery and limit semantics. |
+
+Situation assessments deferred by the hourly limit retry admission at its expiry;
+proved-unsent denials do not consume inference attempts. Token/unknown-usage
+deferrals require manual recovery: reconcile the budget with the agent stopped,
+then explicitly rearm the affected `budget_deferred` Situations through reviewed
+database maintenance. Current MCP Situation tools are read-only. Restarting or
+raising limits alone does not clear these parks or unknown usage; preserve actual
+attempt counts, provider charges, and unrelated parks.
 
 This is the model that triages your incidents and writes the finding
 summaries, so every dispatched incident consumes LLM tokens — Anthropic API
@@ -155,8 +165,8 @@ tokens on the default provider, or your own compute on a self-hosted
 `openai-compatible` endpoint. The Sonnet default gives the strongest
 analysis in its price class; set `model: claude-haiku-4-5` to cut
 per-incident cost when volume matters more than finding depth. Keep an eye
-on your spend in the Anthropic console — the agent does not yet meter or
-cap usage (budget tracking is planned).
+on your spend in the provider console and configure finite limits above for
+the shared guard; both limits default to `0` (unlimited).
 
 `max_tokens` bounds the finding reply. The finding JSON lists every member
 alert, so a very large correlated incident can exceed the default and truncate

@@ -321,6 +321,12 @@ type Fact struct {
 // — distinct from ObservedAt (source observation time) and from collection/
 // generation churn, which never enters material identity.
 type Run struct {
+	// ScopeKey and Capability are read projections from the owning plan. They
+	// identify an evidence slot across collection cycles, never a dispatch.
+	ScopeKey            string
+	Capability          Capability
+	Scope               *Scope
+	Parameters          json.RawMessage
 	ID, CycleID, PlanID string
 	Status              ResultStatus
 	Coverage            Coverage

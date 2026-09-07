@@ -26,6 +26,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/alertint/alertint-agent/internal/llm"
 	"github.com/alertint/alertint-agent/internal/logs"
 	"gopkg.in/yaml.v3"
 )
@@ -435,9 +436,10 @@ type StorageConfig struct {
 
 // LLMConfig configures the LLM provider used by skills.
 type LLMConfig struct {
-	Provider  string `yaml:"provider"`
-	APIKeyEnv string `yaml:"api_key_env"`
-	Model     string `yaml:"model"`
+	Budget    llm.BudgetLimits `yaml:"budget"`
+	Provider  string           `yaml:"provider"`
+	APIKeyEnv string           `yaml:"api_key_env"`
+	Model     string           `yaml:"model"`
 	// MaxTokens is the output-token ceiling for the triage reply. The finding
 	// schema emits one entry per member alert, so a large correlated incident
 	// needs well over the old 1024 default or the JSON is truncated mid-object
@@ -933,6 +935,12 @@ func (c *Config) validateStorage(offline bool) []string {
 
 func (c *Config) validateLLM() []string {
 	var errs []string
+	if c.LLM.Budget.CallsPerHour < 0 {
+		errs = append(errs, "llm.budget.calls_per_hour must be >= 0 (0 means unlimited)")
+	}
+	if c.LLM.Budget.TotalTokens < 0 {
+		errs = append(errs, "llm.budget.total_tokens must be >= 0 (0 means unlimited)")
+	}
 	provider := strings.ToLower(c.LLM.Provider)
 	switch provider {
 	case "anthropic":
