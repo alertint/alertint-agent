@@ -17,6 +17,7 @@ var errBoom = errors.New("boom")
 type fakeLocalStore struct {
 	situations []model.LocalSituationSummary
 	findings   []model.LocalFinding
+	lifecycle  []model.SourceLifecycleObservation
 	err        error
 }
 
@@ -32,6 +33,13 @@ func (f *fakeLocalStore) RecentFindingsForGroup(ctx context.Context, groupKey st
 		return nil, f.err
 	}
 	return f.findings, nil
+}
+
+func (f *fakeLocalStore) SourceLifecycleObservations(ctx context.Context, situationID, horizonTier string) ([]model.SourceLifecycleObservation, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.lifecycle, nil
 }
 
 type noopRecorder struct{ calls int }

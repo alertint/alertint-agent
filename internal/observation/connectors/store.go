@@ -23,6 +23,10 @@ import (
 type LocalStore interface {
 	PriorTerminalSituationSummaries(ctx context.Context, groupKey, excludeSituationID string, limit int) ([]model.LocalSituationSummary, error)
 	RecentFindingsForGroup(ctx context.Context, groupKey string, since time.Time, limit int) ([]model.LocalFinding, error)
+	// SourceLifecycleObservations derives the Situation's per-member
+	// authoritative lifecycle observations from its durable deliveries,
+	// with deadlines anchored at each observation plus the horizon tier.
+	SourceLifecycleObservations(ctx context.Context, situationID, horizonTier string) ([]model.SourceLifecycleObservation, error)
 }
 
 // StoreReadExecutor implements observation.Executor for store_read: bounded
@@ -41,7 +45,9 @@ type StoreReadExecutor struct {
 // out of its "prior Situations" evidence.
 type storeReadParameters struct {
 	GroupKey           string `json:"group_key"`
+	SituationID        string `json:"situation_id,omitempty"`
 	ExcludeSituationID string `json:"exclude_situation_id,omitempty"`
+	HorizonTier        string `json:"horizon_tier,omitempty"`
 }
 
 func (e *StoreReadExecutor) clock() time.Time {
@@ -83,6 +89,25 @@ func (e *StoreReadExecutor) Execute(ctx context.Context, plan model.Plan, _ obse
 
 	expiresAt := now.Add(model.MaxWindowDaysHistory * 24 * time.Hour)
 	var facts []model.Fact
+	// The lifecycle phase's authoritative evidence (review F1): one
+	// source_lifecycle fact carrying every member's latest delivery
+	// observation, so the controller's reducer folds real firing/resolved
+	// truth with observation-anchored deadlines. Non-material: the
+	// Situation's symptoms already cover lifecycle state in the material
+	// hash, and an observation clock must never churn it.
+	if plan.Phase == model.PhaseLifecycle && params.SituationID != "" {
+		observations, err := e.Store.SourceLifecycleObservations(ctx, params.SituationID, params.HorizonTier)
+		if err != nil {
+			return model.Run{}, fmt.Errorf("connectors: store_read source lifecycle: %w", err)
+		}
+		if len(observations) > 0 {
+			f, err := sourceLifecycleFact(plan, observations, now, expiresAt)
+			if err != nil {
+				return model.Run{}, err
+			}
+			facts = append(facts, f)
+		}
+	}
 	if len(situations) > 0 {
 		f, err := situationSummaryFact(plan, situations, now, expiresAt)
 		if err != nil {
@@ -148,6 +173,23 @@ func findingsFact(plan model.Plan, findings []model.LocalFinding, now, expiresAt
 		SchemaVersion: model.FactSchemaVersion, Value: value,
 		ResultStatus: model.ResultConfirmedValue, Freshness: model.FreshnessFresh,
 		ObservedAt: now, ExpiresAt: expiresAt, Material: true,
+	}, nil
+}
+
+// sourceLifecycleFact carries the lifecycle phase's per-member
+// observations (kind "source_lifecycle", the JSON array shape internal/
+// situation's reload decodes).
+func sourceLifecycleFact(plan model.Plan, observations []model.SourceLifecycleObservation, now, expiresAt time.Time) (model.Fact, error) {
+	value, err := json.Marshal(observations)
+	if err != nil {
+		return model.Fact{}, fmt.Errorf("connectors: marshal source lifecycle observations: %w", err)
+	}
+	return model.Fact{
+		ID: factID(plan.ID, "source_lifecycle", value), RunID: "run:" + plan.ID,
+		Kind: "source_lifecycle", Subject: plan.Scope.SubjectID, Digest: digestOf(value),
+		SchemaVersion: model.FactSchemaVersion, Value: value,
+		ResultStatus: model.ResultConfirmedValue, Freshness: model.FreshnessFresh,
+		ObservedAt: now, ExpiresAt: expiresAt, Material: false,
 	}, nil
 }
 

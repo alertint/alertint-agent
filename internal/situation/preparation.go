@@ -36,6 +36,21 @@ type PreparedState struct {
 	NextRefreshAt     *time.Time
 	Lifecycle         []SourceObservation
 	Limitations       []model.Limitation
+	// Deferred lists the capability:subject reads this cycle could not
+	// admit under its request cap or credit (frozen in the cycle's
+	// allocation) — surfaced to the Assessment as an explicit limitation
+	// rather than silently discarded.
+	Deferred []string
+	// PlansByID maps each frozen plan ID of the cycle to its plan, so the
+	// projection can name the capability/subject behind every run.
+	PlansByID map[string]observationmodel.Plan
+	// LoadedAt is the coherent read time the store reloaded this state at
+	// — the clock expiry classes are computed against.
+	LoadedAt time.Time
+}
+
+func (p PreparedState) now() time.Time {
+	return p.LoadedAt
 }
 
 // EvidencePreparer performs one bounded preparation phase — planning,

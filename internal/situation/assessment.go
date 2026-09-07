@@ -845,6 +845,26 @@ func knownLimitationCode(code string) bool {
 	return false
 }
 
+// allowedLimitationCode extends knownLimitationCode with the Snapshot's
+// own dynamic per-cycle catalog (Plan 4 review F2): a "<capability>_
+// <status>" code is allowed only when this Snapshot's capability results
+// actually produced it, so a model can never cite a limitation the
+// prepared evidence does not carry.
+func allowedLimitationCode(snap Snapshot, code string) bool {
+	if knownLimitationCode(code) {
+		return true
+	}
+	if !dynamicLimitationCode(code) {
+		return false
+	}
+	for _, c := range DynamicLimitationCodes(snap.CapabilityResults, snap.Deferred) {
+		if c == code {
+			return true
+		}
+	}
+	return false
+}
+
 // maxBoundedTextLength bounds every free-text field a proposal may carry
 // (SufficientReason.Summary, each Limitation.Detail) — "bounded structured
 // proposal fields," per the plan's global retention constraint.
@@ -902,7 +922,7 @@ func validateProposalContent(proposal model.AssessmentProposal, snap Snapshot) V
 	}
 
 	for i, l := range proposal.Limitations {
-		if !knownLimitationCode(l.Code) {
+		if !allowedLimitationCode(snap, l.Code) {
 			return capabilityResult("limitation_code_unknown", fmt.Sprintf("limitations[%d].code", i), "limitation code not present in this build's known/allowed set")
 		}
 	}
@@ -913,7 +933,7 @@ func validateProposalContent(proposal model.AssessmentProposal, snap Snapshot) V
 			return capabilityResult("reason_id_unknown", "sufficient_reason.candidate_id", "candidate ID not present in this Snapshot's eligible_reasons")
 		}
 		for _, ref := range proposal.SufficientReason.EvidenceRefs {
-			if !factExists(snap.Facts, ref) {
+			if !factExists(snap.Facts, ref) && !observationFactExists(snap.Observations, ref) {
 				return policyResult("evidence_ref_missing", "sufficient_reason.evidence_refs", "evidence reference not present in the claimed snapshot")
 			}
 		}

@@ -98,6 +98,13 @@ func ReduceSourceLifecycle(observations []SourceObservation, expectedAlertIDs []
 		if ok {
 			state = obs.State
 		}
+		// A firing observation is only authoritative until its own
+		// deadline (anchored at that observation): past it, with no fresher
+		// firing evidence, the member is unobserved (spec.md: "Webhook
+		// evidence becomes unobserved after its observation deadline").
+		if state == SourceStateFiring && !obs.DeadlineAt.IsZero() && !now.Before(obs.DeadlineAt) {
+			state = SourceStateUnobserved
+		}
 
 		switch state {
 		case SourceStateFiring:

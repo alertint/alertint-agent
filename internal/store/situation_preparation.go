@@ -37,21 +37,81 @@ const investigationCreditCostPerRequest = 3
 // instead of a full situation.Claim (internal/observation/model imports
 // nothing but the standard library, so it cannot depend on internal/
 // situation's Claim type).
-func verifyFenceTx(ctx context.Context, tx *sql.Tx, f observationmodel.Fence) error {
+//
+// Review round 1 (F3): the lease must also still be LIVE at now — an
+// expired lease is no fence at all, exactly as claim recovery treats it.
+func verifyFenceTx(ctx context.Context, tx *sql.Tx, f observationmodel.Fence, now time.Time) error {
 	var inputVersion int
+	var leaseExpiresAt sql.NullString
 	err := tx.QueryRowContext(ctx, `
-		SELECT input_version FROM situations WHERE id = ? AND lease_owner = ? AND claim_token = ?`,
-		f.SituationID, f.Owner, f.Token).Scan(&inputVersion)
+		SELECT input_version, lease_expires_at FROM situations WHERE id = ? AND lease_owner = ? AND claim_token = ?`,
+		f.SituationID, f.Owner, f.Token).Scan(&inputVersion, &leaseExpiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return situationmodel.ErrSituationLeaseLost
 	}
 	if err != nil {
 		return fmt.Errorf("store: verify observation fence: %w", err)
 	}
+	if !leaseExpiresAt.Valid || leaseExpiresAt.String <= canonicalTime(now) {
+		return situationmodel.ErrSituationLeaseLost
+	}
 	if inputVersion != f.InputVersion {
 		return ErrSituationVersionConflict
 	}
 	return nil
+}
+
+// ErrPreparationCycleSealed is returned when a new run or reservation is
+// attempted against an already-sealed cycle (spec.md A3: writes require
+// the matching OPEN cycle). Outcome-only appends are deliberately exempt.
+var ErrPreparationCycleSealed = errors.New("store: preparation cycle is already sealed")
+
+// ErrPreparationCycleNotCurrent is returned when a reservation or run
+// names a cycle that is not the fence's current-input, current-pointer
+// cycle.
+var ErrPreparationCycleNotCurrent = errors.New("store: preparation cycle is not the situation's current cycle for this input")
+
+// openCycleForWriteTx loads the cycle-level facts every fenced write needs
+// and enforces, in one place, that cycleID belongs to f's Situation, was
+// frozen for f's exact input version, is the Situation's current cycle,
+// and is still open.
+type openCycle struct {
+	situationID    string
+	inputVersion   int
+	maxRequests    int
+	allocationJSON string
+	anchor         string
+	refreshSeconds int
+	sealed         bool
+}
+
+func openCycleForWriteTx(ctx context.Context, tx *sql.Tx, f observationmodel.Fence, cycleID string) (openCycle, error) {
+	var c openCycle
+	var sealed int
+	var currentCycle sql.NullString
+	err := tx.QueryRowContext(ctx, `
+		SELECT c.situation_id, c.input_version, c.max_requests, c.allocation_json, c.anchor, c.refresh_seconds, c.sealed,
+		       s.current_preparation_cycle_id
+		FROM situation_preparation_cycles c JOIN situations s ON s.id = c.situation_id
+		WHERE c.id = ?`, cycleID).
+		Scan(&c.situationID, &c.inputVersion, &c.maxRequests, &c.allocationJSON, &c.anchor, &c.refreshSeconds, &sealed, &currentCycle)
+	if errors.Is(err, sql.ErrNoRows) {
+		return c, fmt.Errorf("store: unknown cycle %q", cycleID)
+	}
+	if err != nil {
+		return c, fmt.Errorf("store: load cycle for write: %w", err)
+	}
+	c.sealed = sealed == 1
+	if c.situationID != f.SituationID {
+		return c, fmt.Errorf("store: cycle %q does not belong to situation %q", cycleID, f.SituationID)
+	}
+	if c.inputVersion != f.InputVersion {
+		return c, ErrSituationVersionConflict
+	}
+	if !currentCycle.Valid || currentCycle.String != cycleID {
+		return c, ErrPreparationCycleNotCurrent
+	}
+	return c, nil
 }
 
 // deterministicCycleID derives a stable, reproducible cycle identity from
@@ -89,7 +149,7 @@ func (s *Store) BeginPreparation(ctx context.Context, f observationmodel.Fence, 
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if err := verifyFenceTx(ctx, tx, f); err != nil {
+	if err := verifyFenceTx(ctx, tx, f, draft.Anchor); err != nil {
 		return observationmodel.Cycle{}, err
 	}
 
@@ -124,8 +184,22 @@ func (s *Store) BeginPreparation(ctx context.Context, f observationmodel.Fence, 
 		p.ID = id
 		p.CycleID = cycleID
 		preparedPlans[i] = p
+		// The planner names its protected optional plan by capability:
+		// subject (it cannot know canonical IDs before the cycle exists);
+		// freeze the resolved canonical plan ID so reservations debit the
+		// right plan (review F11).
+		if p.Tier == observationmodel.TierOptional && draft.Allocation.OptionalPlanID == string(p.Capability)+":"+p.Scope.SubjectID {
+			draft.Allocation.OptionalPlanID = id
+		}
 	}
 	draft.Plans = preparedPlans
+	if draft.RefreshInterval <= 0 {
+		draft.RefreshInterval = 5 * time.Minute
+	}
+	refreshSeconds := int(draft.RefreshInterval / time.Second)
+	if refreshSeconds < 1 {
+		refreshSeconds = 1
+	}
 
 	profileVersionIDs := draft.ProfileVersionIDs
 	if profileVersionIDs == nil {
@@ -152,10 +226,10 @@ func (s *Store) BeginPreparation(ctx context.Context, f observationmodel.Fence, 
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO situation_preparation_cycles (
 			id, situation_id, input_version, generation, anchor, config_digest,
-			profile_version_ids_json, profile_guidance_json, max_requests, allocation_json, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			profile_version_ids_json, profile_guidance_json, max_requests, allocation_json, created_at, refresh_seconds
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		cycleID, f.SituationID, f.InputVersion, generation, createdAt, draft.ConfigDigest,
-		string(profileVersionIDsJSON), string(profileGuidanceJSON), maxRequests, string(allocationJSON), createdAt); err != nil {
+		string(profileVersionIDsJSON), string(profileGuidanceJSON), maxRequests, string(allocationJSON), createdAt, refreshSeconds); err != nil {
 		return observationmodel.Cycle{}, fmt.Errorf("store: insert preparation cycle: %w", err)
 	}
 
@@ -163,20 +237,30 @@ func (s *Store) BeginPreparation(ctx context.Context, f observationmodel.Fence, 
 		if err := insertObservationPlanTx(ctx, tx, cycleID, p, createdAt); err != nil {
 			return observationmodel.Cycle{}, err
 		}
+		// An explicit reuse plan takes its current-cycle protection NOW,
+		// in the same transaction that supersedes the previous cycle's —
+		// spec.md "Transfer temporary current-cycle protection atomically"
+		// (review F16). A source run whose detail has already expired is
+		// never referenced (the runner projects it as stale instead).
+		if p.Tier == observationmodel.TierReuse {
+			if err := insertCurrentCycleReferenceTx(ctx, tx, f.SituationID, cycleID, p.ReuseRunID, createdAt); err != nil {
+				return observationmodel.Cycle{}, err
+			}
+		}
 	}
 
 	// A genuinely new cycle supersedes any still-live current/open-cycle
-	// reference this Situation's PREVIOUS cycle held — transferring
-	// current-cycle protection forward, per spec.md "Transfer temporary
-	// current-cycle protection atomically."
+	// reference this Situation's PREVIOUS cycles held — the references the
+	// new cycle itself just took (owner_id = cycleID) are the transferred
+	// protection and stay live.
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE situation_observation_references SET superseded = 1
-		WHERE superseded = 0 AND reference_kind IN ('current_cycle','open_cycle')
+		WHERE superseded = 0 AND reference_kind IN ('current_cycle','open_cycle') AND owner_id != ?
 		  AND run_id IN (
 		      SELECT r.id FROM situation_observation_runs r
 		      JOIN situation_preparation_cycles c ON c.id = r.cycle_id
-		      WHERE c.situation_id = ? AND c.id != ?
-		  )`, f.SituationID, cycleID); err != nil {
+		      WHERE c.situation_id = ?
+		  )`, cycleID, f.SituationID); err != nil {
 		return observationmodel.Cycle{}, fmt.Errorf("store: supersede prior cycle references: %w", err)
 	}
 
@@ -227,13 +311,66 @@ func insertObservationPlanTx(ctx context.Context, tx *sql.Tx, cycleID string, p 
 		INSERT INTO situation_observation_plans (
 			id, cycle_id, capability, phase, scope_json, parameters_json,
 			start_at, end_at, eligible_at, limit_count, max_requests, purpose,
-			reconsider_on_json, stop_on_json, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			reconsider_on_json, stop_on_json, created_at, tier, reuse_run_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.ID, cycleID, string(p.Capability), string(p.Phase), string(scopeJSON), string(params),
 		canonicalTime(p.Start), canonicalTime(p.End), canonicalTime(p.EligibleAt),
-		p.Limit, p.MaxRequests, p.Purpose, string(reconsiderJSON), string(stopOnJSON), createdAt)
+		p.Limit, p.MaxRequests, p.Purpose, string(reconsiderJSON), string(stopOnJSON), createdAt,
+		planTier(p), nullableString(optionalString(p.ReuseRunID)))
 	if err != nil {
 		return fmt.Errorf("store: insert observation plan: %w", err)
+	}
+	return nil
+}
+
+// planTier resolves the persisted tier for p: an explicit tier, else local
+// for a plan that spends no physical request, else routine.
+func planTier(p observationmodel.Plan) string {
+	if p.Tier != "" {
+		return p.Tier
+	}
+	if p.MaxRequests == 0 {
+		return observationmodel.TierLocal
+	}
+	return observationmodel.TierRoutine
+}
+
+func optionalString(v string) *string {
+	if v == "" {
+		return nil
+	}
+	return &v
+}
+
+// insertCurrentCycleReferenceTx protects runID (which must belong to
+// situationID) on behalf of cycleID with a temporary current_cycle
+// reference — idempotent, and skipped (never an error) when the run's
+// detail has already expired, since referencing expired detail is
+// forbidden by migration 0026.
+func insertCurrentCycleReferenceTx(ctx context.Context, tx *sql.Tx, situationID, cycleID, runID, now string) error {
+	var ownerSituation string
+	var expired int
+	err := tx.QueryRowContext(ctx, `
+		SELECT c.situation_id, EXISTS(SELECT 1 FROM situation_observation_detail_expirations e WHERE e.run_id = r.id)
+		FROM situation_observation_runs r JOIN situation_preparation_cycles c ON c.id = r.cycle_id
+		WHERE r.id = ?`, runID).Scan(&ownerSituation, &expired)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("store: reusable run %q does not exist", runID)
+	}
+	if err != nil {
+		return fmt.Errorf("store: load reusable run %s: %w", runID, err)
+	}
+	if ownerSituation != situationID {
+		return fmt.Errorf("store: reusable run %q belongs to another situation", runID)
+	}
+	if expired == 1 {
+		return nil
+	}
+	refID := "ref:current_cycle:" + cycleID + ":" + runID
+	if _, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO situation_observation_references (id, run_id, reference_kind, owner_id, permanent, created_at)
+		VALUES (?, ?, 'current_cycle', ?, 0, ?)`, refID, runID, cycleID, now); err != nil {
+		return fmt.Errorf("store: insert current-cycle reference for run %s: %w", runID, err)
 	}
 	return nil
 }
@@ -245,7 +382,7 @@ func loadCycleByKeyTx(ctx context.Context, tx *sql.Tx, situationID string, input
 	var (
 		cycleID, anchor, configDigest              string
 		profileVersionIDsJSON, profileGuidanceJSON string
-		maxRequests                                int
+		maxRequests, refreshSeconds                int
 		allocationJSON                             string
 		sealed                                     int
 		owner                                      string
@@ -253,14 +390,14 @@ func loadCycleByKeyTx(ctx context.Context, tx *sql.Tx, situationID string, input
 	)
 	row := tx.QueryRowContext(ctx, `
 		SELECT c.id, c.anchor, c.config_digest, c.profile_version_ids_json, c.profile_guidance_json,
-		       c.max_requests, c.allocation_json, c.sealed, s.lease_owner, s.claim_token
+		       c.max_requests, c.allocation_json, c.sealed, c.refresh_seconds, s.lease_owner, s.claim_token
 		FROM situation_preparation_cycles c
 		JOIN situations s ON s.id = c.situation_id
 		WHERE c.situation_id = ? AND c.input_version = ? AND c.generation = ?`,
 		situationID, inputVersion, generation)
 	var leaseOwner sql.NullString
 	if err := row.Scan(&cycleID, &anchor, &configDigest, &profileVersionIDsJSON, &profileGuidanceJSON,
-		&maxRequests, &allocationJSON, &sealed, &leaseOwner, &token); err != nil {
+		&maxRequests, &allocationJSON, &sealed, &refreshSeconds, &leaseOwner, &token); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return observationmodel.Cycle{}, false, nil
 		}
@@ -297,7 +434,7 @@ func loadCycleByKeyTx(ctx context.Context, tx *sql.Tx, situationID string, input
 		Fence:      observationmodel.Fence{SituationID: situationID, InputVersion: inputVersion, Owner: owner, Token: token},
 		Generation: generation,
 		Draft: observationmodel.CycleDraft{
-			Anchor: anchorTime, ConfigDigest: configDigest,
+			Anchor: anchorTime, ConfigDigest: configDigest, RefreshInterval: time.Duration(refreshSeconds) * time.Second,
 			ProfileVersionIDs: profileVersionIDs, ProfileGuidance: profileGuidance,
 			Plans: plans, Allocation: allocation,
 		},
@@ -309,7 +446,7 @@ func loadCycleByKeyTx(ctx context.Context, tx *sql.Tx, situationID string, input
 func loadObservationPlansTx(ctx context.Context, tx *sql.Tx, cycleID string) ([]observationmodel.Plan, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT id, capability, phase, scope_json, parameters_json, start_at, end_at, eligible_at,
-		       limit_count, max_requests, purpose, reconsider_on_json, stop_on_json
+		       limit_count, max_requests, purpose, reconsider_on_json, stop_on_json, tier, reuse_run_id
 		FROM situation_observation_plans WHERE cycle_id = ? ORDER BY id`, cycleID)
 	if err != nil {
 		return nil, fmt.Errorf("store: query observation plans: %w", err)
@@ -322,10 +459,11 @@ func loadObservationPlansTx(ctx context.Context, tx *sql.Tx, cycleID string) ([]
 			id, capability, phase, scopeJSON, paramsJSON string
 			startAt, endAt, eligibleAt                   string
 			limitCount, maxRequests                      int
-			purpose, reconsiderJSON, stopOnJSON          string
+			purpose, reconsiderJSON, stopOnJSON, tier    string
+			reuseRunID                                   sql.NullString
 		)
 		if err := rows.Scan(&id, &capability, &phase, &scopeJSON, &paramsJSON, &startAt, &endAt, &eligibleAt,
-			&limitCount, &maxRequests, &purpose, &reconsiderJSON, &stopOnJSON); err != nil {
+			&limitCount, &maxRequests, &purpose, &reconsiderJSON, &stopOnJSON, &tier, &reuseRunID); err != nil {
 			return nil, fmt.Errorf("store: scan observation plan: %w", err)
 		}
 		var scope observationmodel.Scope
@@ -355,7 +493,7 @@ func loadObservationPlansTx(ctx context.Context, tx *sql.Tx, cycleID string) ([]
 			ID: id, CycleID: cycleID, Capability: observationmodel.Capability(capability),
 			Phase: observationmodel.Phase(phase), Scope: scope, Parameters: json.RawMessage(paramsJSON),
 			Start: start, End: end, EligibleAt: eligible, Limit: limitCount, MaxRequests: maxRequests,
-			Purpose: purpose, ReconsiderOn: reconsiderOn, StopOn: stopOn,
+			Purpose: purpose, ReconsiderOn: reconsiderOn, StopOn: stopOn, Tier: tier, ReuseRunID: reuseRunID.String,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -370,6 +508,12 @@ func loadObservationPlansTx(ctx context.Context, tx *sql.Tx, cycleID string) ([]
 // optional plan — debiting the Situation's durable investigation credit.
 // ordinal is a per-cycle monotonic counter shared across every plan, which
 // trivially also satisfies plan-scoped uniqueness.
+//
+// The FIRST reservation of a plan also records the subject/capability's
+// fresh-read admission (spec.md G4: "Record admission of a fresh read with
+// its first durable request reservation"), anchored at the frozen cycle
+// anchor plus the cycle's own frozen refresh cadence — idempotent per
+// cycle, so a retry never slides the cadence.
 func (s *Store) ReserveObservationRequest(ctx context.Context, f observationmodel.Fence, cycleID, planID string, now time.Time) (observationmodel.RequestReservation, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -377,29 +521,21 @@ func (s *Store) ReserveObservationRequest(ctx context.Context, f observationmode
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if err := verifyFenceTx(ctx, tx, f); err != nil {
+	if err := verifyFenceTx(ctx, tx, f, now); err != nil {
 		return observationmodel.RequestReservation{}, err
 	}
-
-	var cycleSituationID, allocationJSON string
-	var cycleMaxRequests, sealed int
-	if err := tx.QueryRowContext(ctx, `SELECT situation_id, max_requests, allocation_json, sealed FROM situation_preparation_cycles WHERE id = ?`, cycleID).
-		Scan(&cycleSituationID, &cycleMaxRequests, &allocationJSON, &sealed); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return observationmodel.RequestReservation{}, fmt.Errorf("store: unknown cycle %q", cycleID)
-		}
-		return observationmodel.RequestReservation{}, fmt.Errorf("store: load cycle for reservation: %w", err)
+	cycle, err := openCycleForWriteTx(ctx, tx, f, cycleID)
+	if err != nil {
+		return observationmodel.RequestReservation{}, err
 	}
-	if cycleSituationID != f.SituationID {
-		return observationmodel.RequestReservation{}, fmt.Errorf("store: cycle %q does not belong to situation %q", cycleID, f.SituationID)
-	}
-	if sealed == 1 {
-		return observationmodel.RequestReservation{}, fmt.Errorf("store: cycle %q is already sealed", cycleID)
+	if cycle.sealed {
+		return observationmodel.RequestReservation{}, ErrPreparationCycleSealed
 	}
 
 	var planMaxRequests int
-	if err := tx.QueryRowContext(ctx, `SELECT max_requests FROM situation_observation_plans WHERE id = ? AND cycle_id = ?`, planID, cycleID).
-		Scan(&planMaxRequests); err != nil {
+	var planTier, planCapability, planScopeJSON string
+	if err := tx.QueryRowContext(ctx, `SELECT max_requests, tier, capability, scope_json FROM situation_observation_plans WHERE id = ? AND cycle_id = ?`, planID, cycleID).
+		Scan(&planMaxRequests, &planTier, &planCapability, &planScopeJSON); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return observationmodel.RequestReservation{}, fmt.Errorf("store: unknown plan %q in cycle %q", planID, cycleID)
 		}
@@ -413,15 +549,15 @@ func (s *Store) ReserveObservationRequest(ctx context.Context, f observationmode
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM situation_observation_requests WHERE plan_id = ?`, planID).Scan(&planCount); err != nil {
 		return observationmodel.RequestReservation{}, fmt.Errorf("store: count plan reservations: %w", err)
 	}
-	if cycleCount >= cycleMaxRequests || planCount >= planMaxRequests {
+	if cycleCount >= cycle.maxRequests || planCount >= planMaxRequests {
 		return observationmodel.RequestReservation{}, observationmodel.ErrBudgetExhausted
 	}
 
 	var allocation observationmodel.PhaseAllocation
-	if err := json.Unmarshal([]byte(allocationJSON), &allocation); err != nil {
+	if err := json.Unmarshal([]byte(cycle.allocationJSON), &allocation); err != nil {
 		return observationmodel.RequestReservation{}, fmt.Errorf("store: unmarshal allocation: %w", err)
 	}
-	if allocation.OptionalPlanID != "" && allocation.OptionalPlanID == planID {
+	if planTier == observationmodel.TierOptional || (allocation.OptionalPlanID != "" && allocation.OptionalPlanID == planID) {
 		var credit int
 		if err := tx.QueryRowContext(ctx, `SELECT investigation_credit FROM situations WHERE id = ?`, f.SituationID).Scan(&credit); err != nil {
 			return observationmodel.RequestReservation{}, fmt.Errorf("store: read investigation credit: %w", err)
@@ -448,10 +584,52 @@ func (s *Store) ReserveObservationRequest(ctx context.Context, f observationmode
 		return observationmodel.RequestReservation{}, fmt.Errorf("store: insert observation request reservation: %w", err)
 	}
 
+	if planCount == 0 {
+		var scope observationmodel.Scope
+		if err := json.Unmarshal([]byte(planScopeJSON), &scope); err != nil {
+			return observationmodel.RequestReservation{}, fmt.Errorf("store: unmarshal plan scope: %w", err)
+		}
+		if err := admitRefreshTx(ctx, tx, f.SituationID, cycle, cycleID, scope, planCapability, ""); err != nil {
+			return observationmodel.RequestReservation{}, err
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return observationmodel.RequestReservation{}, fmt.Errorf("store: commit reserve observation request: %w", err)
 	}
 	return observationmodel.RequestReservation{ID: id, CycleID: cycleID, PlanID: planID, Ordinal: ordinal, ReservedAt: now.UTC()}, nil
+}
+
+// admitRefreshTx records one (subject, capability, scope) fresh-read
+// admission for cycleID: last_served_at = the frozen cycle anchor,
+// next_refresh_at = anchor + the cycle's frozen refresh cadence. A cursor
+// already admitted by THIS cycle is left untouched (a retry never slides
+// cadence); a cursor admitted by an earlier cycle moves forward. lastRunID,
+// when non-empty, records the committed run this admission produced.
+func admitRefreshTx(ctx context.Context, tx *sql.Tx, situationID string, cycle openCycle, cycleID string, scope observationmodel.Scope, capability, lastRunID string) error {
+	digest, err := scopeDigest(scope)
+	if err != nil {
+		return fmt.Errorf("store: digest observation plan scope: %w", err)
+	}
+	anchor, err := time.Parse(time.RFC3339Nano, cycle.anchor)
+	if err != nil {
+		return fmt.Errorf("store: parse cycle anchor: %w", err)
+	}
+	servedAt := canonicalTime(anchor)
+	nextRefreshAt := canonicalTime(anchor.Add(time.Duration(cycle.refreshSeconds) * time.Second))
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO situation_observation_refresh (
+			situation_id, subject, capability, scope_digest, last_served_at, next_refresh_at, admitted_cycle_id, last_run_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(situation_id, subject, capability, scope_digest) DO UPDATE SET
+			last_served_at = CASE WHEN situation_observation_refresh.admitted_cycle_id = excluded.admitted_cycle_id THEN situation_observation_refresh.last_served_at ELSE excluded.last_served_at END,
+			next_refresh_at = CASE WHEN situation_observation_refresh.admitted_cycle_id = excluded.admitted_cycle_id THEN situation_observation_refresh.next_refresh_at ELSE excluded.next_refresh_at END,
+			last_run_id = COALESCE(excluded.last_run_id, situation_observation_refresh.last_run_id),
+			admitted_cycle_id = excluded.admitted_cycle_id`,
+		situationID, scope.SubjectID, capability, digest, servedAt, nextRefreshAt, cycleID, nullableString(optionalString(lastRunID))); err != nil {
+		return fmt.Errorf("store: upsert observation refresh cursor: %w", err)
+	}
+	return nil
 }
 
 // CompleteObservationRequest finishes one reservation with its closed
@@ -525,9 +703,21 @@ func (s *Store) CompleteObservationRequest(ctx context.Context, outcome observat
 // if the store receives that clock value, never calling time.Now()
 // internally). Repeating an identical run under the same ID is a no-op
 // success; differing content under the same ID is ErrConflictingReplay.
+//
+// A NEW run requires the open, current cycle for f's exact input (review
+// F3); an identical replay of an already-committed run stays a no-op even
+// after sealing. A run whose normalized payloads would push the cycle past
+// MaxNormalizedBytesPerCycle commits with its facts dropped, status
+// truncated, and limitation "cycle_bytes_capped" — bounded honest evidence
+// rather than an aborted cycle (review F10). Every non-reuse commit also
+// records the plan's refresh cursor (admission for a local plan that never
+// reserves, plus the committed run id every reuse projection points at).
 func (s *Store) CommitObservationRun(ctx context.Context, f observationmodel.Fence, run observationmodel.Run, now time.Time) error {
 	if err := observationmodel.ValidateRun(run); err != nil {
 		return err
+	}
+	if run.ReusedFromRunID != nil && len(run.Facts) > 0 {
+		return errors.New("store: a reused run projects its source run's facts and carries none of its own")
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -536,21 +726,27 @@ func (s *Store) CommitObservationRun(ctx context.Context, f observationmodel.Fen
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if err := verifyFenceTx(ctx, tx, f); err != nil {
+	if err := verifyFenceTx(ctx, tx, f, now); err != nil {
+		return err
+	}
+	cycle, err := openCycleForWriteTx(ctx, tx, f, run.CycleID)
+	if err != nil {
 		return err
 	}
 
-	var cycleSituationID string
-	var sealed int
-	if err := tx.QueryRowContext(ctx, `SELECT situation_id, sealed FROM situation_preparation_cycles WHERE id = ?`, run.CycleID).
-		Scan(&cycleSituationID, &sealed); err != nil {
+	var planMaxRequests int
+	var planTier, planCapability, planScopeJSON string
+	if err := tx.QueryRowContext(ctx, `SELECT max_requests, tier, capability, scope_json FROM situation_observation_plans WHERE id = ? AND cycle_id = ?`, run.PlanID, run.CycleID).
+		Scan(&planMaxRequests, &planTier, &planCapability, &planScopeJSON); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("store: unknown cycle %q", run.CycleID)
+			return fmt.Errorf("store: unknown plan %q in cycle %q", run.PlanID, run.CycleID)
 		}
-		return fmt.Errorf("store: load cycle for run commit: %w", err)
+		return fmt.Errorf("store: load plan for run commit: %w", err)
 	}
-	if cycleSituationID != f.SituationID {
-		return fmt.Errorf("store: cycle %q does not belong to situation %q", run.CycleID, f.SituationID)
+
+	run, err = capCycleBytesTx(ctx, tx, run)
+	if err != nil {
+		return err
 	}
 
 	existingCanonical, found, err := loadRunCanonicalTx(ctx, tx, run.ID)
@@ -566,6 +762,9 @@ func (s *Store) CommitObservationRun(ctx context.Context, f observationmodel.Fen
 			return tx.Commit()
 		}
 		return observationmodel.ErrConflictingReplay
+	}
+	if cycle.sealed {
+		return ErrPreparationCycleSealed
 	}
 
 	completedAt := canonicalTime(now)
@@ -595,11 +794,16 @@ func (s *Store) CommitObservationRun(ctx context.Context, f observationmodel.Fen
 		return fmt.Errorf("store: insert open-cycle reference: %w", err)
 	}
 	if run.ReusedFromRunID != nil {
-		reuseRefID := "ref:current_cycle:" + run.CycleID + ":" + *run.ReusedFromRunID
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO situation_observation_references (id, run_id, reference_kind, owner_id, permanent, created_at)
-			VALUES (?, ?, 'current_cycle', ?, 0, ?)`, reuseRefID, *run.ReusedFromRunID, run.CycleID, completedAt); err != nil {
-			return fmt.Errorf("store: insert reused-run current-cycle reference: %w", err)
+		if err := insertCurrentCycleReferenceTx(ctx, tx, f.SituationID, run.CycleID, *run.ReusedFromRunID, completedAt); err != nil {
+			return err
+		}
+	} else {
+		var scope observationmodel.Scope
+		if err := json.Unmarshal([]byte(planScopeJSON), &scope); err != nil {
+			return fmt.Errorf("store: unmarshal plan scope: %w", err)
+		}
+		if err := admitRefreshTx(ctx, tx, f.SituationID, cycle, run.CycleID, scope, planCapability, run.ID); err != nil {
+			return err
 		}
 	}
 
@@ -607,6 +811,45 @@ func (s *Store) CommitObservationRun(ctx context.Context, f observationmodel.Fen
 		return fmt.Errorf("store: commit observation run: %w", err)
 	}
 	return nil
+}
+
+// LimitationCycleBytesCapped marks a run whose facts were dropped because
+// the cycle's aggregate normalized payload cap would otherwise be exceeded.
+const LimitationCycleBytesCapped = "cycle_bytes_capped"
+
+// capCycleBytesTx enforces observationmodel.MaxNormalizedBytesPerCycle
+// across every fact payload already committed in run's cycle: if run's own
+// payloads would exceed the remaining allowance, its facts are dropped and
+// the run becomes a truncated, explicitly limited result.
+func capCycleBytesTx(ctx context.Context, tx *sql.Tx, run observationmodel.Run) (observationmodel.Run, error) {
+	if len(run.Facts) == 0 {
+		return run, nil
+	}
+	var used int64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(LENGTH(p.value_json)), 0)
+		FROM situation_observation_fact_payloads p
+		JOIN situation_observation_facts f ON f.id = p.fact_id
+		JOIN situation_observation_runs r ON r.id = f.run_id
+		WHERE r.cycle_id = ? AND r.id != ?`, run.CycleID, run.ID).Scan(&used); err != nil {
+		return run, fmt.Errorf("store: sum cycle normalized bytes: %w", err)
+	}
+	var incoming int64
+	for _, f := range run.Facts {
+		v := f.Value
+		if len(v) == 0 {
+			v = json.RawMessage("null")
+		}
+		incoming += int64(len(v))
+	}
+	if used+incoming <= observationmodel.MaxNormalizedBytesPerCycle {
+		return run, nil
+	}
+	run.Facts = nil
+	run.Status = observationmodel.ResultTruncated
+	run.Coverage.Complete = false
+	run.LimitationCodes = append(append([]string(nil), run.LimitationCodes...), LimitationCycleBytesCapped)
+	return run, nil
 }
 
 func limitationCodesJSON(codes []string) string {
@@ -841,8 +1084,17 @@ func (s *Store) ListObservationRuns(ctx context.Context, situationID, cycleID, c
 		observedAt, expiresAt, completedAt                                       string
 		reusedFrom, expiredAt                                                    sql.NullString
 	}
+	// One read transaction for the page AND its payload state (review F25):
+	// a racing retention pass can no longer commit between the metadata
+	// read and the payload read, so detail_state and facts always agree.
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, "", fmt.Errorf("store: begin list observation runs: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	var raws []rawRun
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, "", fmt.Errorf("store: query observation runs: %w", err)
 	}
@@ -867,12 +1119,15 @@ func (s *Store) ListObservationRuns(ctx context.Context, situationID, cycleID, c
 
 	var records []observationmodel.RunRecord
 	for _, r := range raws {
-		record, err := buildRunRecord(ctx, s.db, r.id, r.cycleID, r.planID, r.status, r.coverageStart, r.coverageEnd,
+		record, err := buildRunRecord(ctx, tx, r.id, r.cycleID, r.planID, r.status, r.coverageStart, r.coverageEnd,
 			r.complete, r.returned, r.omitted, r.limitationCodes, r.observedAt, r.expiresAt, r.completedAt, r.reusedFrom, r.expiredAt)
 		if err != nil {
 			return nil, "", err
 		}
 		records = append(records, record)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, "", fmt.Errorf("store: commit list observation runs: %w", err)
 	}
 
 	nextCursor := ""
@@ -893,6 +1148,7 @@ func (s *Store) ListObservationRuns(ctx context.Context, situationID, cycleID, c
 // holding.
 type dbQuerier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
 func buildRunRecord(ctx context.Context, db dbQuerier, id, cycleID, planID, status, coverageStart, coverageEnd string,
@@ -931,6 +1187,36 @@ func buildRunRecord(ctx context.Context, db dbQuerier, id, cycleID, planID, stat
 	}
 
 	record := observationmodel.RunRecord{Run: run, DetailState: observationmodel.DetailStateRetained}
+	var capability, subjectJSON, phase, tier string
+	if err := db.QueryRowContext(ctx, `SELECT capability, json_extract(scope_json, '$.subject_id'), phase, tier FROM situation_observation_plans WHERE id = ?`, planID).
+		Scan(&capability, &subjectJSON, &phase, &tier); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return observationmodel.RunRecord{}, fmt.Errorf("store: load run plan identity: %w", err)
+	}
+	record.Capability, record.Subject, record.Phase, record.Tier = observationmodel.Capability(capability), subjectJSON, observationmodel.Phase(phase), tier
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*), COUNT(o.reservation_id)
+		FROM situation_observation_requests q
+		LEFT JOIN situation_observation_request_outcomes o ON o.reservation_id = q.id
+		WHERE q.plan_id = ?`, planID).Scan(&record.RequestsReserved, &record.RequestsCompleted); err != nil {
+		return observationmodel.RunRecord{}, fmt.Errorf("store: load run request ledger: %w", err)
+	}
+	record.RequestsUnknown = record.RequestsReserved - record.RequestsCompleted
+
+	// A reuse projection carries its SOURCE run's facts and inherits the
+	// source's detail state: expiry of the source is expiry of every
+	// projection that points at it.
+	factsRunID := id
+	if reusedFrom.Valid {
+		factsRunID = reusedFrom.String
+		var srcExpired sql.NullString
+		err := db.QueryRowContext(ctx, `SELECT expired_at FROM situation_observation_detail_expirations WHERE run_id = ?`, factsRunID).Scan(&srcExpired)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return observationmodel.RunRecord{}, fmt.Errorf("store: load reused run expiration: %w", err)
+		}
+		if err == nil && srcExpired.Valid && !expiredAt.Valid {
+			expiredAt = srcExpired
+		}
+	}
 	if expiredAt.Valid {
 		record.DetailState = observationmodel.DetailStateExpired
 		t, err := time.Parse(time.RFC3339Nano, expiredAt.String)
@@ -938,15 +1224,68 @@ func buildRunRecord(ctx context.Context, db dbQuerier, id, cycleID, planID, stat
 			return observationmodel.RunRecord{}, fmt.Errorf("store: parse detail expired_at: %w", err)
 		}
 		record.DetailExpiredAt = &t
-		return record, nil
 	}
 
-	facts, err := loadFactsForRun(ctx, db, id)
+	// Fact METADATA (ids, digests, statuses) is immutable and always
+	// readable; only the Value payload expires — an expired fact reads with
+	// a JSON null Value (review F25).
+	facts, err := loadFactsForRun(ctx, db, factsRunID)
 	if err != nil {
 		return observationmodel.RunRecord{}, err
 	}
+	for i := range facts {
+		facts[i].RunID = id
+	}
 	record.Run.Facts = facts
 	return record, nil
+}
+
+// LoadObservationRun reads one committed run by id — the runner's source for
+// an explicit reuse projection. found=false when no such run exists.
+func (s *Store) LoadObservationRun(ctx context.Context, runID string) (observationmodel.RunRecord, bool, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return observationmodel.RunRecord{}, false, fmt.Errorf("store: begin load observation run: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	rec, found, err := loadRunRecordTx(ctx, tx, runID)
+	if err != nil {
+		return observationmodel.RunRecord{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return observationmodel.RunRecord{}, false, fmt.Errorf("store: commit load observation run: %w", err)
+	}
+	return rec, found, nil
+}
+
+func loadRunRecordTx(ctx context.Context, tx *sql.Tx, runID string) (observationmodel.RunRecord, bool, error) {
+	var (
+		cycleID, planID, status, coverageStart, coverageEnd, limitationCodes string
+		complete, returned, omitted                                          int
+		observedAt, expiresAt, completedAt                                   string
+		reusedFrom, expiredAt                                                sql.NullString
+	)
+	err := tx.QueryRowContext(ctx, `
+		SELECT r.cycle_id, r.plan_id, r.status, r.coverage_start, r.coverage_end, r.coverage_complete,
+		       r.coverage_returned, r.coverage_omitted, r.limitation_codes_json, r.observed_at, r.expires_at,
+		       r.completed_at, r.reused_from_run_id, e.expired_at
+		FROM situation_observation_runs r
+		LEFT JOIN situation_observation_detail_expirations e ON e.run_id = r.id
+		WHERE r.id = ?`, runID).
+		Scan(&cycleID, &planID, &status, &coverageStart, &coverageEnd, &complete, &returned, &omitted,
+			&limitationCodes, &observedAt, &expiresAt, &completedAt, &reusedFrom, &expiredAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return observationmodel.RunRecord{}, false, nil
+	}
+	if err != nil {
+		return observationmodel.RunRecord{}, false, fmt.Errorf("store: load observation run: %w", err)
+	}
+	rec, err := buildRunRecord(ctx, tx, runID, cycleID, planID, status, coverageStart, coverageEnd,
+		complete, returned, omitted, limitationCodes, observedAt, expiresAt, completedAt, reusedFrom, expiredAt)
+	if err != nil {
+		return observationmodel.RunRecord{}, false, err
+	}
+	return rec, true, nil
 }
 
 func parseCoverage(start, end string, complete, returned, omitted int) (observationmodel.Coverage, error) {
@@ -964,9 +1303,9 @@ func parseCoverage(start, end string, complete, returned, omitted int) (observat
 func loadFactsForRun(ctx context.Context, db dbQuerier, runID string) ([]observationmodel.Fact, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT f.id, f.kind, f.subject, f.digest, f.schema_version, f.result_status, f.freshness,
-		       f.observed_at, f.expires_at, f.evidence_refs_json, f.material, p.value_json
+		       f.observed_at, f.expires_at, f.evidence_refs_json, f.material, COALESCE(p.value_json, 'null')
 		FROM situation_observation_facts f
-		JOIN situation_observation_fact_payloads p ON p.fact_id = f.id
+		LEFT JOIN situation_observation_fact_payloads p ON p.fact_id = f.id
 		WHERE f.run_id = ? ORDER BY f.id`, runID)
 	if err != nil {
 		return nil, fmt.Errorf("store: query observation facts: %w", err)
@@ -1032,6 +1371,10 @@ func decodeRunCursor(cursor string) ([2]string, error) {
 type ObservationRefreshCursor struct {
 	Subject, Capability, ScopeDigest string
 	NextRefreshAt                    time.Time
+	// LastRunID is the last committed run for this pair whose detail is
+	// still retained — empty once it expired, so no reuse plan can ever
+	// reference expired detail.
+	LastRunID string
 }
 
 // LoadObservationRefreshCursors reads every currently-tracked refresh
@@ -1041,8 +1384,11 @@ type ObservationRefreshCursor struct {
 // recorded), matching BuildPlans' own "no cursor -> due" default.
 func (s *Store) LoadObservationRefreshCursors(ctx context.Context, situationID string) ([]ObservationRefreshCursor, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT subject, capability, scope_digest, next_refresh_at
-		FROM situation_observation_refresh WHERE situation_id = ?`, situationID)
+		SELECT c.subject, c.capability, c.scope_digest, c.next_refresh_at,
+		       CASE WHEN c.last_run_id IS NOT NULL
+		                 AND NOT EXISTS (SELECT 1 FROM situation_observation_detail_expirations e WHERE e.run_id = c.last_run_id)
+		            THEN c.last_run_id ELSE '' END
+		FROM situation_observation_refresh c WHERE c.situation_id = ?`, situationID)
 	if err != nil {
 		return nil, fmt.Errorf("store: query observation refresh cursors: %w", err)
 	}
@@ -1052,7 +1398,7 @@ func (s *Store) LoadObservationRefreshCursors(ctx context.Context, situationID s
 	for rows.Next() {
 		var c ObservationRefreshCursor
 		var nextRefreshAt string
-		if err := rows.Scan(&c.Subject, &c.Capability, &c.ScopeDigest, &nextRefreshAt); err != nil {
+		if err := rows.Scan(&c.Subject, &c.Capability, &c.ScopeDigest, &nextRefreshAt, &c.LastRunID); err != nil {
 			return nil, fmt.Errorf("store: scan observation refresh cursor: %w", err)
 		}
 		t, err := time.Parse(time.RFC3339Nano, nextRefreshAt)
@@ -1157,6 +1503,10 @@ func (s *Store) PruneUnusedObservationDetails(ctx context.Context, now time.Time
 		WHERE r.completed_at <= ?
 		  AND NOT EXISTS (SELECT 1 FROM situation_observation_detail_expirations e WHERE e.run_id = r.id)
 		  AND NOT EXISTS (SELECT 1 FROM situation_observation_references ref WHERE ref.run_id = r.id AND ref.superseded = 0)
+		  AND NOT EXISTS (
+		      SELECT 1 FROM situation_observation_runs p
+		      JOIN situation_observation_references pref ON pref.run_id = p.id AND pref.superseded = 0
+		      WHERE p.reused_from_run_id = r.id)
 		ORDER BY r.completed_at ASC, r.id ASC
 		LIMIT ?`, cutoff, limit)
 	if err != nil {
@@ -1169,14 +1519,17 @@ func (s *Store) PruneUnusedObservationDetails(ctx context.Context, now time.Time
 
 	expiredAt := canonicalTime(now)
 	for _, runID := range runIDs {
+		// The expiration record is written FIRST: migration 0026's guarded
+		// delete trigger only lets a payload go once its run's expiration
+		// record exists and no live reference protects it.
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO situation_observation_detail_expirations (run_id, expired_at) VALUES (?, ?)`, runID, expiredAt); err != nil {
+			return 0, fmt.Errorf("store: record detail expiration for run %s: %w", runID, err)
+		}
 		if _, err := tx.ExecContext(ctx, `
 			DELETE FROM situation_observation_fact_payloads
 			WHERE fact_id IN (SELECT id FROM situation_observation_facts WHERE run_id = ?)`, runID); err != nil {
 			return 0, fmt.Errorf("store: delete expired fact payloads for run %s: %w", runID, err)
-		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO situation_observation_detail_expirations (run_id, expired_at) VALUES (?, ?)`, runID, expiredAt); err != nil {
-			return 0, fmt.Errorf("store: record detail expiration for run %s: %w", runID, err)
 		}
 	}
 
@@ -1256,7 +1609,7 @@ func (s *Store) AccrueInvestigationCredit(ctx context.Context, situationID strin
 // No connector in this build writes that kind yet (Task 9 wires the real
 // adapter); this decode path is exercised here by direct fixture only,
 // exactly like RecoveryGraceDuration's own not-yet-reachable polling branch.
-func loadPreparedStateTx(ctx context.Context, tx *sql.Tx, situationID string) (situation.PreparedState, error) {
+func loadPreparedStateTx(ctx context.Context, tx *sql.Tx, situationID string, now time.Time) (situation.PreparedState, error) {
 	var cycleID sql.NullString
 	err := tx.QueryRowContext(ctx, `SELECT current_preparation_cycle_id FROM situations WHERE id = ?`, situationID).Scan(&cycleID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1270,11 +1623,12 @@ func loadPreparedStateTx(ctx context.Context, tx *sql.Tx, situationID string) (s
 	}
 
 	var generation int64
-	var profileVersionIDsJSON, profileGuidanceJSON string
+	var cycleInputVersion, situationInputVersion int
+	var profileVersionIDsJSON, profileGuidanceJSON, allocationJSON string
 	err = tx.QueryRowContext(ctx, `
-		SELECT generation, profile_version_ids_json, profile_guidance_json
-		FROM situation_preparation_cycles WHERE id = ?`, cycleID.String).
-		Scan(&generation, &profileVersionIDsJSON, &profileGuidanceJSON)
+		SELECT c.generation, c.input_version, c.profile_version_ids_json, c.profile_guidance_json, c.allocation_json, s.input_version
+		FROM situation_preparation_cycles c JOIN situations s ON s.id = c.situation_id WHERE c.id = ?`, cycleID.String).
+		Scan(&generation, &cycleInputVersion, &profileVersionIDsJSON, &profileGuidanceJSON, &allocationJSON, &situationInputVersion)
 	if err != nil {
 		// current_preparation_cycle_id references situation_preparation_cycles
 		// by foreign key: a missing row here means a corrupted database, not
@@ -1289,16 +1643,34 @@ func loadPreparedStateTx(ctx context.Context, tx *sql.Tx, situationID string) (s
 	if err := json.Unmarshal([]byte(profileGuidanceJSON), &profileGuidance); err != nil {
 		return situation.PreparedState{}, fmt.Errorf("store: unmarshal profile guidance: %w", err)
 	}
+	// A cycle frozen for an earlier input version is never this input's
+	// prepared state (review F16): the controller sees "no cycle yet" and
+	// prepares afresh rather than reasoning from a superseded projection.
+	if cycleInputVersion != situationInputVersion {
+		return situation.PreparedState{}, nil
+	}
+	var allocation observationmodel.PhaseAllocation
+	if err := json.Unmarshal([]byte(allocationJSON), &allocation); err != nil {
+		return situation.PreparedState{}, fmt.Errorf("store: unmarshal phase allocation: %w", err)
+	}
 
 	runs, lifecycle, err := loadCycleRunsAndLifecycleTx(ctx, tx, cycleID.String)
 	if err != nil {
 		return situation.PreparedState{}, err
 	}
+	plans, err := loadObservationPlansTx(ctx, tx, cycleID.String)
+	if err != nil {
+		return situation.PreparedState{}, err
+	}
+	plansByID := make(map[string]observationmodel.Plan, len(plans))
+	for _, p := range plans {
+		plansByID[p.ID] = p
+	}
 
 	return situation.PreparedState{
 		CycleID: cycleID.String, Generation: generation,
 		Runs: runs, ProfileVersionIDs: profileVersionIDs, ProfileGuidance: profileGuidance,
-		Lifecycle: lifecycle,
+		Lifecycle: lifecycle, Deferred: allocation.Deferred, PlansByID: plansByID, LoadedAt: now.UTC(),
 	}, nil
 }
 
@@ -1353,6 +1725,14 @@ func loadCycleRunsAndLifecycleTx(ctx context.Context, tx *sql.Tx, cycleID string
 		if err != nil {
 			return nil, nil, err
 		}
+		// Expired detail never enters the live reducer (ADR-0051): the run
+		// keeps its metadata but its facts are withheld and it reads as
+		// stale, explicitly limited evidence.
+		if record.DetailState == observationmodel.DetailStateExpired {
+			record.Run.Facts = nil
+			record.Run.Status = observationmodel.ResultStale
+			record.Run.LimitationCodes = append(append([]string(nil), record.Run.LimitationCodes...), "detail_expired")
+		}
 		runs = append(runs, record.Run)
 		for _, f := range record.Run.Facts {
 			if f.Kind != "source_lifecycle" {
@@ -1366,6 +1746,49 @@ func loadCycleRunsAndLifecycleTx(ctx context.Context, tx *sql.Tx, cycleID string
 		}
 	}
 	return runs, lifecycle, nil
+}
+
+// Permanent observation reference kinds (migration 0022): a dispatched
+// Assessment attempt, a committed lifecycle decision, and a Transition each
+// protect their complete evidence basis forever (ADR-0051, review F7).
+const (
+	ObservationReferenceAssessmentAttempt = "assessment_attempt"
+	ObservationReferenceLifecycleDecision = "lifecycle_decision"
+	ObservationReferenceTransition        = "transition"
+)
+
+// insertPermanentObservationReferencesTx protects every run of cycleID —
+// and, for a reuse projection, the source run it projects — with a
+// permanent reference of kind on behalf of ownerID. Idempotent (INSERT OR
+// IGNORE on the deterministic id). A run whose detail already expired is
+// skipped: it never was part of a live basis, and 0026 forbids referencing
+// it.
+func insertPermanentObservationReferencesTx(ctx context.Context, tx *sql.Tx, cycleID, kind, ownerID string, now time.Time) error {
+	if cycleID == "" || ownerID == "" {
+		return nil
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT DISTINCT COALESCE(r.reused_from_run_id, r.id) FROM situation_observation_runs r
+		WHERE r.cycle_id = ?
+		  AND NOT EXISTS (SELECT 1 FROM situation_observation_detail_expirations e WHERE e.run_id = COALESCE(r.reused_from_run_id, r.id))
+		ORDER BY 1`, cycleID)
+	if err != nil {
+		return fmt.Errorf("store: query cycle runs for permanent references: %w", err)
+	}
+	runIDs, err := scanStringRows(rows)
+	if err != nil {
+		return fmt.Errorf("store: read cycle run ids for permanent references: %w", err)
+	}
+	createdAt := canonicalTime(now)
+	for _, runID := range runIDs {
+		refID := "ref:" + kind + ":" + ownerID + ":" + runID
+		if _, err := tx.ExecContext(ctx, `
+			INSERT OR IGNORE INTO situation_observation_references (id, run_id, reference_kind, owner_id, permanent, created_at)
+			VALUES (?, ?, ?, ?, 1, ?)`, refID, runID, kind, ownerID, createdAt); err != nil {
+			return fmt.Errorf("store: insert permanent %s reference for run %s: %w", kind, runID, err)
+		}
+	}
+	return nil
 }
 
 // sealPreparationCycleTx seals cycleID inside an already-open transaction —
@@ -1411,7 +1834,9 @@ func sealPreparationCycleTx(ctx context.Context, tx *sql.Tx, situationID, cycleI
 	// current_cycle protection persists until BeginPreparation supersedes
 	// it on behalf of a genuinely later cycle — never merely because this
 	// one sealed.
-	runRows, err := tx.QueryContext(ctx, `SELECT id FROM situation_observation_runs WHERE cycle_id = ?`, cycleID)
+	runRows, err := tx.QueryContext(ctx, `
+		SELECT DISTINCT COALESCE(reused_from_run_id, id) FROM situation_observation_runs r WHERE cycle_id = ?
+		  AND NOT EXISTS (SELECT 1 FROM situation_observation_detail_expirations e WHERE e.run_id = COALESCE(r.reused_from_run_id, r.id))`, cycleID)
 	if err != nil {
 		return fmt.Errorf("store: query sealed cycle runs: %w", err)
 	}
@@ -1433,4 +1858,159 @@ func sealPreparationCycleTx(ctx context.Context, tx *sql.Tx, situationID, cycleI
 		}
 	}
 	return nil
+}
+
+// SituationPreparationView is the bounded current-preparation projection
+// alertint_get_situation exposes (review F23): the current cycle's identity
+// and frozen inputs, one row per plan with its run outcome and request
+// ledger, and the profile versions/guidance the cycle was planned under.
+// Nothing here is reconstructed: every field reads a durable row.
+type SituationPreparationView struct {
+	CycleID           string                             `json:"cycle_id"`
+	Generation        int64                              `json:"generation"`
+	InputVersion      int                                `json:"input_version"`
+	Anchor            time.Time                          `json:"anchor"`
+	Sealed            bool                               `json:"sealed"`
+	SealedAt          *time.Time                         `json:"sealed_at"`
+	MaxRequests       int                                `json:"max_requests"`
+	RequestsReserved  int                                `json:"requests_reserved"`
+	OptionalCredit    int                                `json:"optional_credit_spent"`
+	Deferred          []string                           `json:"deferred"`
+	ProfileVersionIDs []string                           `json:"profile_version_ids"`
+	ProfileGuidance   []observationmodel.ProfileGuidance `json:"profile_guidance"`
+	Plans             []SituationPreparationPlanView     `json:"plans"`
+}
+
+// SituationPreparationPlanView is one frozen plan and its (possibly
+// absent) run outcome.
+type SituationPreparationPlanView struct {
+	PlanID            string  `json:"plan_id"`
+	Capability        string  `json:"capability"`
+	Subject           string  `json:"subject"`
+	Phase             string  `json:"phase"`
+	Tier              string  `json:"tier"`
+	ReuseRunID        *string `json:"reuse_run_id"`
+	RunID             *string `json:"run_id"`
+	RunStatus         *string `json:"run_status"`
+	DetailState       *string `json:"detail_state"`
+	RequestsReserved  int     `json:"requests_reserved"`
+	RequestsCompleted int     `json:"requests_completed"`
+	RequestsUnknown   int     `json:"requests_unknown"`
+}
+
+// GetSituationPreparationView reads situationID's current preparation
+// cycle projection in one read transaction; found=false when the Situation
+// has no current cycle.
+func (s *Store) GetSituationPreparationView(ctx context.Context, situationID string) (SituationPreparationView, bool, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return SituationPreparationView{}, false, fmt.Errorf("store: begin preparation view: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var cycleID sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT current_preparation_cycle_id FROM situations WHERE id = ?`, situationID).Scan(&cycleID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return SituationPreparationView{}, false, ErrNotFound
+		}
+		return SituationPreparationView{}, false, fmt.Errorf("store: read current preparation cycle pointer: %w", err)
+	}
+	if !cycleID.Valid || cycleID.String == "" {
+		return SituationPreparationView{}, false, nil
+	}
+
+	var view SituationPreparationView
+	var anchor, allocationJSON, versionsJSON, guidanceJSON string
+	var sealed, credit int
+	var sealedAt sql.NullString
+	if err := tx.QueryRowContext(ctx, `
+		SELECT id, generation, input_version, anchor, sealed, sealed_at, max_requests, optional_credit_spent,
+		       allocation_json, profile_version_ids_json, profile_guidance_json
+		FROM situation_preparation_cycles WHERE id = ?`, cycleID.String).
+		Scan(&view.CycleID, &view.Generation, &view.InputVersion, &anchor, &sealed, &sealedAt, &view.MaxRequests, &credit,
+			&allocationJSON, &versionsJSON, &guidanceJSON); err != nil {
+		return SituationPreparationView{}, false, fmt.Errorf("store: load current preparation cycle: %w", err)
+	}
+	view.Sealed = sealed == 1
+	view.OptionalCredit = credit
+	if t, err := time.Parse(time.RFC3339Nano, anchor); err == nil {
+		view.Anchor = t
+	}
+	if sealedAt.Valid {
+		if t, err := time.Parse(time.RFC3339Nano, sealedAt.String); err == nil {
+			view.SealedAt = &t
+		}
+	}
+	var allocation observationmodel.PhaseAllocation
+	if err := json.Unmarshal([]byte(allocationJSON), &allocation); err != nil {
+		return SituationPreparationView{}, false, fmt.Errorf("store: unmarshal phase allocation: %w", err)
+	}
+	view.Deferred = allocation.Deferred
+	if view.Deferred == nil {
+		view.Deferred = []string{}
+	}
+	if err := json.Unmarshal([]byte(versionsJSON), &view.ProfileVersionIDs); err != nil {
+		return SituationPreparationView{}, false, fmt.Errorf("store: unmarshal profile version ids: %w", err)
+	}
+	if err := json.Unmarshal([]byte(guidanceJSON), &view.ProfileGuidance); err != nil {
+		return SituationPreparationView{}, false, fmt.Errorf("store: unmarshal profile guidance: %w", err)
+	}
+	if view.ProfileVersionIDs == nil {
+		view.ProfileVersionIDs = []string{}
+	}
+	if view.ProfileGuidance == nil {
+		view.ProfileGuidance = []observationmodel.ProfileGuidance{}
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM situation_observation_requests WHERE cycle_id = ?`, cycleID.String).Scan(&view.RequestsReserved); err != nil {
+		return SituationPreparationView{}, false, fmt.Errorf("store: count cycle reservations: %w", err)
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT p.id, p.capability, json_extract(p.scope_json, '$.subject_id'), p.phase, p.tier, p.reuse_run_id,
+		       r.id, r.status, e.expired_at,
+		       (SELECT COUNT(*) FROM situation_observation_requests q WHERE q.plan_id = p.id),
+		       (SELECT COUNT(*) FROM situation_observation_requests q JOIN situation_observation_request_outcomes o ON o.reservation_id = q.id WHERE q.plan_id = p.id)
+		FROM situation_observation_plans p
+		LEFT JOIN situation_observation_runs r ON r.plan_id = p.id
+		LEFT JOIN situation_observation_detail_expirations e ON e.run_id = COALESCE(r.reused_from_run_id, r.id)
+		WHERE p.cycle_id = ? ORDER BY p.id`, cycleID.String)
+	if err != nil {
+		return SituationPreparationView{}, false, fmt.Errorf("store: query preparation plans: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	view.Plans = []SituationPreparationPlanView{}
+	for rows.Next() {
+		var pv SituationPreparationPlanView
+		var subject, reuseRunID, runID, runStatus, expiredAt sql.NullString
+		if err := rows.Scan(&pv.PlanID, &pv.Capability, &subject, &pv.Phase, &pv.Tier, &reuseRunID,
+			&runID, &runStatus, &expiredAt, &pv.RequestsReserved, &pv.RequestsCompleted); err != nil {
+			return SituationPreparationView{}, false, fmt.Errorf("store: scan preparation plan: %w", err)
+		}
+		pv.Subject = subject.String
+		pv.RequestsUnknown = pv.RequestsReserved - pv.RequestsCompleted
+		if reuseRunID.Valid {
+			v := reuseRunID.String
+			pv.ReuseRunID = &v
+		}
+		if runID.Valid {
+			v, st := runID.String, runStatus.String
+			pv.RunID, pv.RunStatus = &v, &st
+			detail := observationmodel.DetailStateRetained
+			if expiredAt.Valid {
+				detail = observationmodel.DetailStateExpired
+			}
+			pv.DetailState = &detail
+		}
+		view.Plans = append(view.Plans, pv)
+	}
+	if err := rows.Err(); err != nil {
+		return SituationPreparationView{}, false, fmt.Errorf("store: iterate preparation plans: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return SituationPreparationView{}, false, fmt.Errorf("store: close preparation plans: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return SituationPreparationView{}, false, fmt.Errorf("store: commit preparation view: %w", err)
+	}
+	return view, true, nil
 }

@@ -143,7 +143,7 @@ func TestMembersFromDeliveriesCollapsesARepeatSendIntoItsExistingMember(t *testi
 	appendResolvedRepeatDelivery(t, st, firstDeliveryID, "service=checkout-wall", now)
 
 	req := preparationRequestFor(t, st, sitID, "members-owner", model.PhaseAssessment, now.Add(2*time.Minute))
-	members := membersFromDeliveries(req.Input)
+	members := membersFromDeliveries(req.Input, nil, "")
 
 	if len(members) != 1 {
 		t.Fatalf("members = %+v, want exactly 1 (the repeat must collapse, not add a second member)", members)
@@ -217,6 +217,7 @@ func testProductionPreparer(st *store.Store, exec observation.Executor, prepCfg 
 		},
 		configDigest: "test-digest",
 		prepCfg:      prepCfg,
+		selectorKeys: []string{"service"},
 		logger:       slog.Default(),
 	}
 }
@@ -478,7 +479,7 @@ func TestPreparationConfigDigestChangesWithCadenceKnobs(t *testing.T) {
 
 func TestExecutorsFromClientsOmitsUnconfiguredCapabilitiesAndAlwaysIncludesLocalReads(t *testing.T) {
 	st := newTestFoundationStore(t)
-	execs := executorsFromClients(st, nil, nil, nil, nil, func() time.Time { return time.Now().UTC() })
+	execs := executorsFromClients(st, nil, nil, nil, nil, false, func() time.Time { return time.Now().UTC() })
 
 	if _, ok := execs[model.CapabilityStoreRead]; !ok {
 		t.Fatal("store_read executor missing even though it needs no external client")

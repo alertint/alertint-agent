@@ -206,6 +206,35 @@ type Plan struct {
 	Purpose      string          `json:"purpose"`
 	ReconsiderOn []string        `json:"reconsider_on,omitempty"`
 	StopOn       []string        `json:"stop_on,omitempty"`
+	// Tier is the investigative-fairness tier the planner froze this plan
+	// into (Tier* constants); it decides execution order and which
+	// reservations debit optional credit. Empty means routine.
+	Tier string `json:"tier,omitempty"`
+	// ReuseRunID names the still-fresh prior run this plan projects into the
+	// current cycle by explicit reference instead of a fresh read (Tier ==
+	// TierReuse). Such a plan never performs I/O and never spends a request.
+	ReuseRunID string `json:"reuse_run_id,omitempty"`
+}
+
+// Plan tiers — the closed vocabulary situation_observation_plans.tier
+// accepts. local marks a plan that consumes no physical request (store_read,
+// change_events); reuse marks an explicit projection of a prior run.
+const (
+	TierTimeSensitive = "time_sensitive"
+	TierOptional      = "optional"
+	TierRoutine       = "routine"
+	TierLocal         = "local"
+	TierReuse         = "reuse"
+)
+
+// ValidTier reports whether t is one of the closed plan tiers (an empty
+// tier is treated as routine by every consumer).
+func ValidTier(t string) bool {
+	switch t {
+	case "", TierTimeSensitive, TierOptional, TierRoutine, TierLocal, TierReuse:
+		return true
+	}
+	return false
 }
 
 // PhaseAllocation freezes, once per cycle, the investigative-fairness
@@ -219,6 +248,10 @@ type PhaseAllocation struct {
 	OptionalRequests         int    `json:"optional_requests"`
 	OptionalPlanID           string `json:"optional_plan_id,omitempty"`
 	OptionalWallMilliseconds int64  `json:"optional_wall_milliseconds"`
+	// Deferred lists (bounded, MaxPlansPerCycle entries) the capability:
+	// subject keys this cycle could not admit under its request cap or
+	// credit, so a deferral is durable and visible rather than discarded.
+	Deferred []string `json:"deferred,omitempty"`
 }
 
 // ProfileGuidance is the bounded, frozen advisory guidance from one semantic
@@ -238,8 +271,12 @@ type ProfileGuidance struct {
 // A retry recomputes its own CycleDraft, but BeginPreparation returns the
 // EXISTING cycle's Draft unchanged when one is already open for this Fence.
 type CycleDraft struct {
-	Anchor            time.Time
-	ConfigDigest      string
+	Anchor       time.Time
+	ConfigDigest string
+	// RefreshInterval is the source cadence frozen into the cycle: the
+	// first durable request reservation records fresh-read admission as
+	// Anchor+RefreshInterval without consulting live configuration.
+	RefreshInterval   time.Duration
 	ProfileVersionIDs []string
 	ProfileGuidance   []ProfileGuidance
 	Plans             []Plan
@@ -347,6 +384,78 @@ type RunRecord struct {
 	Run             Run
 	DetailState     string
 	DetailExpiredAt *time.Time
+
+	// Plan identity behind the run (review F23): which capability read
+	// which subject, in which phase and fairness tier.
+	Capability Capability
+	Subject    string
+	Phase      Phase
+	Tier       string
+	// Request ledger (immutable reservations/outcomes): how many physical
+	// requests were reserved for this plan, how many recorded an outcome,
+	// and how many remain reserved with no outcome (a crash before the
+	// outcome was written — legitimately unknown, never invented).
+	RequestsReserved  int
+	RequestsCompleted int
+	RequestsUnknown   int
+}
+
+// SourceLifecycleObservation is one member Alert's authoritative lifecycle
+// observation as the store_read lifecycle phase emits it (fact kind
+// "source_lifecycle", Value = JSON array of these). Its JSON shape is
+// exactly internal/situation.SourceObservation's, so the controller's
+// reload decodes it without this package ever importing internal/situation.
+type SourceLifecycleObservation struct {
+	AlertID             string     `json:"alert_id"`
+	EpisodeKey          string     `json:"episode_key"`
+	Source              string     `json:"source"`
+	State               string     `json:"state"`
+	ObservedAt          time.Time  `json:"observed_at"`
+	EventStartedAt      *time.Time `json:"event_started_at,omitempty"`
+	EventResolvedAt     *time.Time `json:"event_resolved_at,omitempty"`
+	TimeBasis           string     `json:"time_basis,omitempty"`
+	AcquisitionMode     string     `json:"acquisition_mode"`
+	PollIntervalSeconds int        `json:"poll_interval_seconds,omitempty"`
+	DeadlineAt          time.Time  `json:"deadline_at"`
+	HorizonTier         string     `json:"horizon_tier,omitempty"`
+	EvidenceRefs        []string   `json:"evidence_refs,omitempty"`
+}
+
+// Lifecycle horizon tiers (spec.md "Normalized evidence and lifecycle"):
+// the default unknown horizon is 24 h; a profile may widen to hours (24 h)
+// or days (7 d), never shorten the baseline.
+const (
+	HorizonTierUnknown = "unknown"
+	HorizonTierMinutes = "minutes"
+	HorizonTierHours   = "hours"
+	HorizonTierDays    = "days"
+
+	DefaultLifecycleHorizon = 24 * time.Hour
+)
+
+// LifecycleHorizon resolves the observation horizon for tier, widening
+// only: minutes/unknown/empty keep the 24 h default, hours is 24 h, days is
+// 7 d.
+func LifecycleHorizon(tier string) time.Duration {
+	if tier == HorizonTierDays {
+		return MaxWindowDaysHistory * 24 * time.Hour
+	}
+	return DefaultLifecycleHorizon
+}
+
+// WidestHorizonTier picks the widest tier among guidance — the effective
+// advisory widening a cycle applies uniformly to its members.
+func WidestHorizonTier(guidance []ProfileGuidance) string {
+	widest := HorizonTierUnknown
+	for _, g := range guidance {
+		if g.HorizonTier == HorizonTierDays {
+			return HorizonTierDays
+		}
+		if g.HorizonTier == HorizonTierHours {
+			widest = HorizonTierHours
+		}
+	}
+	return widest
 }
 
 // LocalSituationSummary is one bounded, existing-delivery-truth prior

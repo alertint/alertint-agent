@@ -57,6 +57,10 @@ type AssessmentCall struct {
 	ProviderProfile                                   *string
 	InputVersion, RetryEpoch, WorkAttempt, CallNumber int
 	DispatchedAt                                      time.Time
+	// PreparationCycleID names the frozen preparation cycle whose evidence
+	// this dispatch reasons from ("" when no cycle exists); the store pins
+	// that basis permanently when the dispatch row commits (ADR-0051).
+	PreparationCycleID string
 }
 
 // AssessmentAttempt is one immutable Assessment outcome — a validated,
@@ -1493,6 +1497,16 @@ func assessmentAuditKind(d model.AssessmentDerivation) (string, bool) {
 // requirement names — never a proposal, prompt, or provider body.
 func (c *Controller) auditCommitSuccess(ctx context.Context, claim Claim, commit ControllerCommit) {
 	situationID := claim.Situation.ID
+	if commit.PreparationCycleID != "" {
+		// Review F24: CommitController sealed this cycle in the same fenced
+		// transaction it just committed; audit that durable transition here,
+		// after the commit, with bounded identities only.
+		c.auditAppend(ctx, "situation.preparation.cycle_sealed", map[string]any{
+			"situation_id": situationID, "cycle_id": commit.PreparationCycleID,
+			"generation": commit.PreparationGeneration, "input_version": claim.Situation.InputVersion,
+			"lifecycle": string(commit.Lifecycle),
+		})
+	}
 	if commit.Attempt.ID != "" {
 		if kind, ok := assessmentAuditKind(commit.Attempt.Derivation); ok {
 			c.auditAppend(ctx, kind, map[string]any{
@@ -2102,7 +2116,7 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 		call := AssessmentCall{
 			ID: callID, SituationID: claim.Situation.ID, MaterialFactHash: snap.MaterialFactHash,
 			InputVersion: snap.InputVersion, RetryEpoch: retryEpoch, WorkAttempt: workAttempt,
-			CallNumber: callNumber, DispatchedAt: now,
+			CallNumber: callNumber, DispatchedAt: now, PreparationCycleID: snap.PreparationCycleID,
 		}
 		if err := c.store.RecordAssessmentCall(ctx, claim, call); err != nil {
 			res.lastCallID = callID

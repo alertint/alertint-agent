@@ -41,6 +41,15 @@ func (f *fakePreparationStore) HasObservationRun(ctx context.Context, planID str
 	return f.hasRun[planID], nil
 }
 
+func (f *fakePreparationStore) LoadObservationRun(ctx context.Context, runID string) (model.RunRecord, bool, error) {
+	for _, r := range f.committed {
+		if r.ID == runID {
+			return model.RunRecord{Run: r, DetailState: model.DetailStateRetained}, true, nil
+		}
+	}
+	return model.RunRecord{}, false, nil
+}
+
 type fakeExecutor struct {
 	run   model.Run
 	err   error

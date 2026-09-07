@@ -730,15 +730,58 @@ func MaterialFactHash(in SnapshotInput, symptoms []Symptom, durationClass string
 // cycle has begun yet (prepared.CycleID == "") — every pre-Plan-4 fixture
 // and test therefore computes the exact same hash as before this field
 // existed, up to the schema-version bump alone.
+//
+// Review F16: beyond the facts' own MaterialDigest, the digest covers each
+// run's RESULT state (status, coverage class, expiry class, limitation
+// codes — a failed/withheld/stale run carries no facts yet still changes
+// what the Assessment may conclude) and the cycle's effective profile
+// guidance (horizon tier, useful capabilities), keyed by the run's plan
+// identity rather than its run ID so a cadence reuse of unchanged evidence
+// hashes identically to the original read.
 func observationMaterialDigest(prepared PreparedState) string {
 	if prepared.CycleID == "" {
 		return ""
 	}
 	var facts []observationmodel.Fact
+	runs := make([]materialRunDTO, 0, len(prepared.Runs))
 	for _, run := range prepared.Runs {
 		facts = append(facts, run.Facts...)
+		capability, subject := "", ""
+		if p, ok := prepared.PlansByID[run.PlanID]; ok {
+			capability, subject = string(p.Capability), p.Scope.SubjectID
+		}
+		expiryClass := "fresh"
+		if run.Status == observationmodel.ResultStale || (!run.ExpiresAt.IsZero() && !prepared.now().Before(run.ExpiresAt)) {
+			expiryClass = "stale"
+		}
+		codes := append([]string(nil), run.LimitationCodes...)
+		sort.Strings(codes)
+		runs = append(runs, materialRunDTO{
+			Capability: capability, Subject: subject, Status: string(run.Status),
+			Complete: run.Coverage.Complete, Omitted: run.Coverage.Omitted > 0, ExpiryClass: expiryClass, LimitationCodes: codes,
+		})
 	}
-	digest, err := observationmodel.MaterialDigest(facts)
+	sort.Slice(runs, func(i, j int) bool {
+		if runs[i].Capability != runs[j].Capability {
+			return runs[i].Capability < runs[j].Capability
+		}
+		if runs[i].Subject != runs[j].Subject {
+			return runs[i].Subject < runs[j].Subject
+		}
+		return runs[i].Status < runs[j].Status
+	})
+	guidance := make([]materialGuidanceDTO, 0, len(prepared.ProfileGuidance))
+	for _, g := range prepared.ProfileGuidance {
+		caps := make([]string, 0, len(g.UsefulCapabilities))
+		for _, c := range g.UsefulCapabilities {
+			caps = append(caps, string(c))
+		}
+		sort.Strings(caps)
+		guidance = append(guidance, materialGuidanceDTO{SignatureKey: g.SignatureKey, HorizonTier: g.HorizonTier, UsefulCapabilities: caps})
+	}
+	sort.Slice(guidance, func(i, j int) bool { return guidance[i].SignatureKey < guidance[j].SignatureKey })
+
+	factDigest, err := observationmodel.MaterialDigest(facts)
 	if err != nil {
 		// facts here are always already-validated, already-persisted
 		// observationmodel.Fact values (ValidateRun ran before commit) —
@@ -746,7 +789,30 @@ func observationMaterialDigest(prepared PreparedState) string {
 		// matching this file's own mustMarshal panic convention.
 		panic(fmt.Sprintf("situation: material digest for prepared observation facts: %v", err))
 	}
-	return digest
+	return canonicalDigest(materialObservationDTO{FactDigest: factDigest, Runs: runs, Guidance: guidance, Deferred: len(prepared.Deferred) > 0})
+}
+
+type materialRunDTO struct {
+	Capability      string   `json:"capability"`
+	Subject         string   `json:"subject"`
+	Status          string   `json:"status"`
+	Complete        bool     `json:"complete"`
+	Omitted         bool     `json:"omitted"`
+	ExpiryClass     string   `json:"expiry_class"`
+	LimitationCodes []string `json:"limitation_codes"`
+}
+
+type materialGuidanceDTO struct {
+	SignatureKey       string   `json:"signature_key"`
+	HorizonTier        string   `json:"horizon_tier"`
+	UsefulCapabilities []string `json:"useful_capabilities"`
+}
+
+type materialObservationDTO struct {
+	FactDigest string                `json:"fact_digest"`
+	Runs       []materialRunDTO      `json:"runs"`
+	Guidance   []materialGuidanceDTO `json:"guidance"`
+	Deferred   bool                  `json:"deferred"`
 }
 
 // assessmentBasisReasonDTO deliberately omits ReasonCandidate.ID — Task 5's

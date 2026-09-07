@@ -3,6 +3,7 @@
 package situation
 
 import (
+	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
 	"sort"
 	"time"
 
@@ -333,6 +334,18 @@ type Snapshot struct {
 	EligibleReasons     []model.ReasonCandidate
 	MaterialFactHash    string
 	AssessmentBasisHash string
+
+	// PreparationCycleID names the frozen preparation cycle this Snapshot
+	// was built from ("" when none): dispatch pins that basis permanently.
+	PreparationCycleID string
+	// Observations are the bounded, normalized connector facts of the
+	// current preparation cycle (Plan 4 review F2) — a separate collection
+	// from the closed Plan 2 store Facts above; CapabilityResults is the
+	// per-run result catalog, and Deferred lists the capability:subject
+	// reads this cycle could not admit.
+	Observations      []observationmodel.Fact
+	CapabilityResults []CapabilityResult
+	Deferred          []string
 }
 
 // Duration classes. Boundaries are half-open on the low end: subminute
@@ -470,6 +483,7 @@ func BuildSnapshot(in SnapshotInput) Snapshot {
 	eligible := EligibleReasons(in, symptoms, class)
 	materialHash := MaterialFactHash(in, symptoms, class)
 	basisHash := AssessmentBasisHash(in, materialHash, eligible)
+	observations, results := ProjectObservations(in.Prepared, in.Prepared.PlansByID, in.Now)
 
 	return Snapshot{
 		SituationID:         in.Situation.ID,
@@ -483,5 +497,9 @@ func BuildSnapshot(in SnapshotInput) Snapshot {
 		EligibleReasons:     eligible,
 		MaterialFactHash:    materialHash,
 		AssessmentBasisHash: basisHash,
+		PreparationCycleID:  in.Prepared.CycleID,
+		Observations:        observations,
+		CapabilityResults:   results,
+		Deferred:            in.Prepared.Deferred,
 	}
 }

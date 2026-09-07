@@ -138,7 +138,7 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 	// (Runs/Facts, frozen profile guidance, source lifecycle observations) —
 	// read fresh inside this SAME coherent transaction. See
 	// SnapshotInput.Prepared's own doc comment.
-	prepared, err := loadPreparedStateTx(ctx, tx, sit.ID)
+	prepared, err := loadPreparedStateTx(ctx, tx, sit.ID, now)
 	if err != nil {
 		return situation.SnapshotInput{}, err
 	}
@@ -826,6 +826,12 @@ func (s *Store) RecordAssessmentCall(ctx context.Context, claim situation.Claim,
 		return err
 	}
 	if err := insertAssessmentCallTx(ctx, tx, call); err != nil {
+		return err
+	}
+	// Review F7: a dispatched attempt (even one later rejected) protects
+	// its complete evidence basis permanently, in the same transaction that
+	// consumes the dispatch slot.
+	if err := insertPermanentObservationReferencesTx(ctx, tx, call.PreparationCycleID, ObservationReferenceAssessmentAttempt, call.ID, call.DispatchedAt); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -2054,6 +2060,31 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 	// no preparation cycle (PreparationCycleID == "") is a no-op here.
 	if err := sealPreparationCycleTx(ctx, tx, claim.Situation.ID, commit.PreparationCycleID, canonicalCommitTime(commit)); err != nil {
 		return err
+	}
+
+	// 9. Review F7 (ADR-0051): the decision evidence basis is protected
+	// permanently in this same transaction — a new authoritative attempt,
+	// a lifecycle change, and every Transition each pin the cycle's runs.
+	if commit.PreparationCycleID != "" {
+		commitTime := canonicalCommitTime(commit)
+		if newAssessmentID.Valid {
+			if err := insertPermanentObservationReferencesTx(ctx, tx, commit.PreparationCycleID, ObservationReferenceAssessmentAttempt, newAssessmentID.String, commitTime); err != nil {
+				return err
+			}
+		}
+		if current.Lifecycle != commit.Lifecycle {
+			owner := fmt.Sprintf("%s:v%d:%s", claim.Situation.ID, claim.Situation.InputVersion, commit.Lifecycle)
+			if err := insertPermanentObservationReferencesTx(ctx, tx, commit.PreparationCycleID, ObservationReferenceLifecycleDecision, owner, commitTime); err != nil {
+				return err
+			}
+		}
+		if commit.History != nil {
+			for _, tr := range commit.History.Transitions {
+				if err := insertPermanentObservationReferencesTx(ctx, tx, commit.PreparationCycleID, ObservationReferenceTransition, tr.ID, commitTime); err != nil {
+					return err
+				}
+			}
+		}
 	}
 
 	if err := tx.Commit(); err != nil {

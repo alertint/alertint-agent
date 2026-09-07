@@ -65,8 +65,10 @@ func TestBeginPreparationRetryReturnsFrozenDraft(t *testing.T) {
 	// A later retry with a DIFFERENT recomputed draft (different anchor,
 	// different config digest, different window) must return the ORIGINAL
 	// frozen cycle unchanged — spec.md: "Retry uses those exact values even
-	// if the wall clock ... has changed."
-	later := now.Add(10 * time.Minute)
+	// if the wall clock ... has changed." The retry still runs under a LIVE
+	// lease (review F3: an expired lease is no fence at all), so it stays
+	// inside the one-minute claim lease this fixture holds.
+	later := now.Add(30 * time.Second)
 	changedPlan := testPlan(later)
 	second, err := st.BeginPreparation(ctx, f,
 		observationmodel.CycleDraft{Anchor: later, ConfigDigest: "cfg-2-different", Plans: []observationmodel.Plan{changedPlan}}, 6)
@@ -420,8 +422,18 @@ func TestPruneUnusedObservationDetailsExactBoundary(t *testing.T) {
 	if runs[0].DetailState != observationmodel.DetailStateExpired {
 		t.Fatalf("detail_state = %q, want expired", runs[0].DetailState)
 	}
-	if len(runs[0].Run.Facts) != 0 {
-		t.Fatal("expired run must not expose fact values through the archive read")
+	// Review F25: fact METADATA (ids/digests) survives expiry and stays
+	// readable; only the Value payload is gone (a JSON null).
+	if len(runs[0].Run.Facts) == 0 {
+		t.Fatal("expired run must still expose its immutable fact metadata")
+	}
+	for _, f := range runs[0].Run.Facts {
+		if string(f.Value) != "null" {
+			t.Fatalf("expired run must not expose fact values through the archive read: %s", f.Value)
+		}
+		if f.ID == "" || f.Digest == "" {
+			t.Fatal("expired fact must keep its immutable id and digest")
+		}
 	}
 	// Immutable identity/accounting survive expiry.
 	if runs[0].Run.ID != run.ID {

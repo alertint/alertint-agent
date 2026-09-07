@@ -79,19 +79,28 @@ type observationFactRow struct {
 }
 
 type observationRunRow struct {
-	ID              string                 `json:"id"`
-	CycleID         string                 `json:"cycle_id"`
-	PlanID          string                 `json:"plan_id"`
-	Status          string                 `json:"status"`
-	Coverage        observationCoverageRow `json:"coverage"`
-	Facts           []observationFactRow   `json:"facts"`
-	LimitationCodes []string               `json:"limitation_codes"`
-	ObservedAt      time.Time              `json:"observed_at"`
-	ExpiresAt       time.Time              `json:"expires_at"`
-	CompletedAt     time.Time              `json:"completed_at"`
-	ReusedFromRunID *string                `json:"reused_from_run_id"`
-	DetailState     string                 `json:"detail_state"`
-	DetailExpiredAt *time.Time             `json:"detail_expired_at"`
+	ID         string `json:"id"`
+	CycleID    string `json:"cycle_id"`
+	PlanID     string `json:"plan_id"`
+	Capability string `json:"capability"`
+	Subject    string `json:"subject"`
+	Phase      string `json:"phase"`
+	Tier       string `json:"tier"`
+	// Request ledger: reserved physical requests, those with a recorded
+	// outcome, and those left reserved with no outcome (crash-unknown).
+	RequestsReserved  int                    `json:"requests_reserved"`
+	RequestsCompleted int                    `json:"requests_completed"`
+	RequestsUnknown   int                    `json:"requests_unknown"`
+	Status            string                 `json:"status"`
+	Coverage          observationCoverageRow `json:"coverage"`
+	Facts             []observationFactRow   `json:"facts"`
+	LimitationCodes   []string               `json:"limitation_codes"`
+	ObservedAt        time.Time              `json:"observed_at"`
+	ExpiresAt         time.Time              `json:"expires_at"`
+	CompletedAt       time.Time              `json:"completed_at"`
+	ReusedFromRunID   *string                `json:"reused_from_run_id"`
+	DetailState       string                 `json:"detail_state"`
+	DetailExpiredAt   *time.Time             `json:"detail_expired_at"`
 }
 
 func observationRunRowFrom(rec observationmodel.RunRecord) observationRunRow {
@@ -110,6 +119,8 @@ func observationRunRowFrom(rec observationmodel.RunRecord) observationRunRow {
 	}
 	return observationRunRow{
 		ID: run.ID, CycleID: run.CycleID, PlanID: run.PlanID, Status: string(run.Status),
+		Capability: string(rec.Capability), Subject: rec.Subject, Phase: string(rec.Phase), Tier: rec.Tier,
+		RequestsReserved: rec.RequestsReserved, RequestsCompleted: rec.RequestsCompleted, RequestsUnknown: rec.RequestsUnknown,
 		Coverage: observationCoverageRow{
 			Start: run.Coverage.Start, End: run.Coverage.End, Complete: run.Coverage.Complete,
 			Returned: run.Coverage.Returned, Omitted: run.Coverage.Omitted,

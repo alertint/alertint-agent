@@ -52,33 +52,40 @@ func TestBuildPlansDeterministicForFixedInput(t *testing.T) {
 }
 
 // TestBuildPlansDerivesZabbixParametersFromMemberLabels proves the planner
-// carries adapter-proven zabbix_trigger_id/item_key labels (internal/
-// ingress/zabbix.go's own webhook receiver sets both) through into each
-// candidate's typed Plan.Parameters — the ONLY way ZabbixMetricExecutor/
-// ZabbixProblemExecutor's own ItemKey/TriggerID (documented as having "no
-// fallback") can ever resolve; Host already falls back to Scope.SubjectID
-// without this.
+// carries adapter-proven host/zabbix_trigger_id/item_key labels (internal/
+// ingress/zabbix.go's own webhook receiver sets all three) through into
+// each candidate's typed Plan.Parameters — the ONLY way ZabbixMetricExecutor/
+// ZabbixProblemExecutor can ever resolve an exact technical host and item/
+// trigger (review F17: no Scope.SubjectID fallback for Host any more).
+// zabbix_problem_history is lifecycle-phase evidence; zabbix_metric_range
+// is assessment-phase corroboration, so each phase yields exactly one plan.
 func TestBuildPlansDerivesZabbixParametersFromMemberLabels(t *testing.T) {
 	anchor := time.Date(2026, 9, 6, 17, 0, 0, 0, time.UTC)
 	in := PlannerInput{
 		Anchor: anchor, GroupKey: "service=checkout", Phase: model.PhaseAssessment,
 		Members: []MemberSubject{
 			{SubjectID: "host-a", Source: "zabbix", Labels: map[string]string{
-				"zabbix_trigger_id": "trigger-123", "item_key": "vfs.fs.size[/,pfree]",
+				"host": "db-01", "zabbix_trigger_id": "trigger-123", "item_key": "vfs.fs.size[/,pfree]",
 			}},
 		},
 		Configured: []CapabilityDescriptor{
-			{Capability: model.CapabilityZabbixMetricRange, DefaultWindow: time.Hour, DefaultLimit: 20, MaxRequestsHint: 1},
-			{Capability: model.CapabilityZabbixProblemHist, DefaultWindow: time.Hour, DefaultLimit: 20, MaxRequestsHint: 1},
+			{Capability: model.CapabilityZabbixMetricRange, DefaultWindow: time.Hour, DefaultLimit: 20, MaxRequestsHint: 2},
+			{Capability: model.CapabilityZabbixProblemHist, DefaultWindow: time.Hour, DefaultLimit: 20, MaxRequestsHint: 2},
 		},
 		CycleCap: 6,
 	}
-	plans, _, err := BuildPlans(in)
+	assessmentPlans, _, err := BuildPlans(in)
 	if err != nil {
 		t.Fatal(err)
 	}
+	in.Phase = model.PhaseLifecycle
+	lifecyclePlans, _, err := BuildPlans(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plans := append(append([]model.Plan(nil), assessmentPlans...), lifecyclePlans...)
 	if len(plans) != 2 {
-		t.Fatalf("plans = %d, want 2", len(plans))
+		t.Fatalf("plans = %d, want 2 (one per phase)", len(plans))
 	}
 	byCapability := make(map[model.Capability]model.Plan, len(plans))
 	for _, p := range plans {
@@ -86,25 +93,36 @@ func TestBuildPlansDerivesZabbixParametersFromMemberLabels(t *testing.T) {
 	}
 
 	metricPlan := byCapability[model.CapabilityZabbixMetricRange]
+	if metricPlan.Phase != model.PhaseAssessment {
+		t.Fatalf("zabbix_metric_range phase = %q, want assessment", metricPlan.Phase)
+	}
 	var metricParams struct {
+		Host    string `json:"host"`
 		ItemKey string `json:"item_key"`
 	}
 	if err := json.Unmarshal(metricPlan.Parameters, &metricParams); err != nil {
 		t.Fatalf("unmarshal zabbix_metric_range parameters: %v (raw=%s)", err, metricPlan.Parameters)
 	}
-	if metricParams.ItemKey != "vfs.fs.size[/,pfree]" {
-		t.Fatalf("item_key = %q, want vfs.fs.size[/,pfree]", metricParams.ItemKey)
+	if metricParams.ItemKey != "vfs.fs.size[/,pfree]" || metricParams.Host != "db-01" {
+		t.Fatalf("zabbix_metric_range parameters = %+v, want host db-01 + item key", metricParams)
+	}
+	if metricPlan.MaxRequests != 2 {
+		t.Fatalf("zabbix_metric_range max requests = %d, want 2 (item lookup + history read)", metricPlan.MaxRequests)
 	}
 
 	problemPlan := byCapability[model.CapabilityZabbixProblemHist]
+	if problemPlan.Phase != model.PhaseLifecycle {
+		t.Fatalf("zabbix_problem_history phase = %q, want lifecycle", problemPlan.Phase)
+	}
 	var problemParams struct {
+		Host      string `json:"host"`
 		TriggerID string `json:"trigger_id"`
 	}
 	if err := json.Unmarshal(problemPlan.Parameters, &problemParams); err != nil {
 		t.Fatalf("unmarshal zabbix_problem_history parameters: %v (raw=%s)", err, problemPlan.Parameters)
 	}
-	if problemParams.TriggerID != "trigger-123" {
-		t.Fatalf("trigger_id = %q, want trigger-123", problemParams.TriggerID)
+	if problemParams.TriggerID != "trigger-123" || problemParams.Host != "db-01" {
+		t.Fatalf("zabbix_problem_history parameters = %+v, want host db-01 + trigger id", problemParams)
 	}
 }
 
@@ -167,17 +185,27 @@ func TestBuildPlansAdmitsWhenRefreshCursorDue(t *testing.T) {
 	}
 }
 
+// TestBuildPlansSeparatesLifecycleAndAssessmentPhases: phase is decided by
+// CAPABILITY (review F11) — store_read and zabbix_problem_history decide
+// recovery/closure and run in the lifecycle phase; every corroborating
+// capability runs in the assessment phase. A member checkpoint falling
+// within the next refresh makes its LIFECYCLE reads time-sensitive; it never
+// pulls a corroborating capability into the lifecycle phase.
 func TestBuildPlansSeparatesLifecycleAndAssessmentPhases(t *testing.T) {
 	anchor := time.Date(2026, 9, 6, 17, 0, 0, 0, time.UTC)
 	in := basicInput(anchor)
-	in.Members[0].ObservationDeadlineAt = anchor.Add(-time.Minute) // past deadline: time-sensitive -> lifecycle
+	in.Members[0].ObservationDeadlineAt = anchor.Add(-time.Minute) // past deadline
+	in.Configured = append(in.Configured, CapabilityDescriptor{Capability: model.CapabilityZabbixProblemHist, DefaultWindow: time.Hour, DefaultLimit: 20, MaxRequestsHint: 2})
 
 	assessmentPlans, _, err := BuildPlans(in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(assessmentPlans) != 0 {
-		t.Fatalf("expected 0 assessment-phase plans for a time-sensitive member, got %d", len(assessmentPlans))
+	if len(assessmentPlans) != 1 || assessmentPlans[0].Capability != model.CapabilityPrometheusQuery {
+		t.Fatalf("assessment plans = %+v, want exactly the prometheus_query corroboration", assessmentPlans)
+	}
+	if assessmentPlans[0].Tier == model.TierTimeSensitive {
+		t.Fatalf("a corroborating read is never time-sensitive lifecycle work: tier = %q", assessmentPlans[0].Tier)
 	}
 
 	in.Phase = model.PhaseLifecycle
@@ -188,8 +216,11 @@ func TestBuildPlansSeparatesLifecycleAndAssessmentPhases(t *testing.T) {
 	if len(lifecyclePlans) != 1 {
 		t.Fatalf("expected 1 lifecycle-phase plan, got %d", len(lifecyclePlans))
 	}
-	if lifecyclePlans[0].Phase != model.PhaseLifecycle {
-		t.Fatalf("plan phase = %q, want lifecycle", lifecyclePlans[0].Phase)
+	if lifecyclePlans[0].Phase != model.PhaseLifecycle || lifecyclePlans[0].Capability != model.CapabilityZabbixProblemHist {
+		t.Fatalf("lifecycle plan = %+v, want the zabbix_problem_history lifecycle read", lifecyclePlans[0])
+	}
+	if lifecyclePlans[0].Tier != model.TierTimeSensitive {
+		t.Fatalf("lifecycle plan tier = %q, want time_sensitive (deadline already passed)", lifecyclePlans[0].Tier)
 	}
 }
 

@@ -57,6 +57,11 @@ type Candidate struct {
 	// routine lifecycle cadence — the class the one-third credit rule
 	// protects a turn for.
 	Optional bool
+	// Tier is the frozen fairness tier (model.Tier*), assigned by BuildPlans.
+	Tier string
+	// ReuseRunID is the retained prior run this candidate can project by
+	// explicit reference when it is not due or cannot be admitted.
+	ReuseRunID string
 }
 
 // Allocation is BuildPlans' own decision record — the same shape persisted
@@ -116,18 +121,14 @@ func allocateFairly(cycleCap int, credit int, timeSensitive, optional, routine [
 	remainingCapacity = cycleCap - used
 	routineUsed := 0
 	for _, c := range routine {
-		if remainingCapacity <= 0 {
+		if remainingCapacity <= 0 || c.MaxRequests > remainingCapacity {
 			deferred = append(deferred, c)
 			continue
 		}
-		take := c.MaxRequests
-		if take > remainingCapacity {
-			take = remainingCapacity
-		}
 		admitted = append(admitted, c)
-		routineUsed += take
-		remainingCapacity -= take
-		used += take
+		routineUsed += c.MaxRequests
+		remainingCapacity -= c.MaxRequests
+		used += c.MaxRequests
 	}
 
 	return Allocation{

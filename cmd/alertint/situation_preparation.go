@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -58,6 +59,10 @@ type productionPreparer struct {
 	capabilities []observation.CapabilityDescriptor
 	configDigest string
 	prepCfg      config.SituationPreparationConfig
+	// selectorKeys is the Selector allowlist every constructed metric/log/
+	// change selector may assert: the built-in six keys, configured extra
+	// selector labels, and the correlator's group-key labels.
+	selectorKeys []string
 	logger       *slog.Logger
 	// auditor is optional — nil disables audit emission, matching
 	// internal/situation.Controller's own auditSink convention (there it is
@@ -86,17 +91,16 @@ type productionPreparer struct {
 // and assessment-phase Prepare calls, so a phase that already consumed part
 // of the shared budget correctly leaves less of it for the other.
 func (p *productionPreparer) Prepare(ctx context.Context, req situation.PreparationRequest) (situation.PreparedState, error) {
+	// The preparation wall bounds connector I/O ONLY (review F9): every
+	// durable write below runs under the caller's own context, whose
+	// lease-bounded wall the controller still owns, so a slow source can
+	// never turn into a lost run commit or a blocked controller commit.
 	deadline := req.Now.Add(time.Duration(p.prepCfg.MaxWallSeconds) * time.Second)
-	ctx, cancel := context.WithDeadline(ctx, deadline)
+	ioCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 
 	sit := req.Claim.Situation
 	fence := model.Fence{SituationID: sit.ID, InputVersion: sit.InputVersion, Owner: req.Claim.ClaimOwner, Token: req.Claim.ClaimToken}
-
-	members := membersFromDeliveries(req.Input)
-	if len(members) == 0 {
-		return situation.PreparedState{}, nil
-	}
 
 	deliveryIDs := make([]string, 0, len(req.Input.Deliveries))
 	for _, d := range req.Input.Deliveries {
@@ -107,6 +111,11 @@ func (p *productionPreparer) Prepare(ctx context.Context, req situation.Preparat
 		return situation.PreparedState{}, fmt.Errorf("cmd/alertint: load profile guidance: %w", err)
 	}
 
+	members := membersFromDeliveries(req.Input, p.selectorKeys, model.WidestHorizonTier(guidance))
+	if len(members) == 0 {
+		return situation.PreparedState{}, nil
+	}
+
 	rawCursors, err := p.st.LoadObservationRefreshCursors(ctx, sit.ID)
 	if err != nil {
 		return situation.PreparedState{}, fmt.Errorf("cmd/alertint: load observation refresh cursors: %w", err)
@@ -115,7 +124,7 @@ func (p *productionPreparer) Prepare(ctx context.Context, req situation.Preparat
 	for _, c := range rawCursors {
 		cursors = append(cursors, observation.RefreshCursor{
 			Subject: c.Subject, Capability: model.Capability(c.Capability),
-			ScopeDigest: c.ScopeDigest, NextRefreshAt: c.NextRefreshAt,
+			ScopeDigest: c.ScopeDigest, NextRefreshAt: c.NextRefreshAt, LastRunID: c.LastRunID,
 		})
 	}
 
@@ -125,25 +134,30 @@ func (p *productionPreparer) Prepare(ctx context.Context, req situation.Preparat
 		return situation.PreparedState{}, fmt.Errorf("cmd/alertint: accrue investigation credit: %w", err)
 	}
 
+	// Both phases' plans are frozen together under one fairness allocation
+	// (review F11); BeginPreparation then returns this same frozen cycle to
+	// the assessment-phase call, which executes only its own subset.
 	plans, alloc, err := observation.BuildPlans(observation.PlannerInput{
-		Anchor: req.Now, GroupKey: sit.GroupKey, Phase: req.Phase,
+		Anchor: req.Now, GroupKey: sit.GroupKey, SituationID: sit.ID, Phase: "",
 		Members: members, Configured: p.capabilities, ProfileGuidance: guidance,
 		RefreshCursors: cursors, CycleCap: p.prepCfg.MaxSourceCallsPerCycle,
 		InvestigationCredit: credit, RecoveryPending: sit.Lifecycle == situationmodel.LifecycleRecoveryPending,
+		RefreshInterval: refreshInterval, PreparationWall: deadline.Sub(req.Now),
 	})
 	if err != nil {
 		return situation.PreparedState{}, fmt.Errorf("cmd/alertint: build observation plans: %w", err)
 	}
-	if len(plans) == 0 {
-		return situation.PreparedState{}, nil
-	}
 
+	// Every nonterminal reconcile freezes (or reloads) its cycle — even a
+	// phase whose plan set is entirely reuse projections — so the current
+	// cycle is always a complete, explicit projection (review F16).
 	cycle, err := p.st.BeginPreparation(ctx, fence, model.CycleDraft{
-		Anchor: req.Now, ConfigDigest: p.configDigest,
+		Anchor: req.Now, ConfigDigest: p.configDigest, RefreshInterval: refreshInterval,
 		ProfileVersionIDs: versionIDs, ProfileGuidance: guidance,
 		Plans: plans, Allocation: alloc.PhaseAllocation,
 	}, p.prepCfg.MaxSourceCallsPerCycle)
 	if err != nil {
+		p.auditRefusal(ctx, sit.ID, string(req.Phase), "begin_preparation", err)
 		return situation.PreparedState{}, fmt.Errorf("cmd/alertint: begin preparation: %w", err)
 	}
 	// Audited immediately after the frozen cycle durably commits —
@@ -152,24 +166,41 @@ func (p *productionPreparer) Prepare(ctx context.Context, req situation.Preparat
 	// like the reservation/outcome events it sits beside.
 	p.auditAppend(ctx, "situation.preparation.cycle_begun", map[string]any{
 		"situation_id": sit.ID, "cycle_id": cycle.ID, "generation": cycle.Generation,
-		"phase": string(req.Phase), "plan_count": len(plans),
+		"phase": string(req.Phase), "plan_count": len(plans), "deferred": alloc.PhaseAllocation.Deferred,
 	})
 
-	if err := p.runner.RunPhase(ctx, fence, cycle, req.Phase); err != nil {
+	if err := p.runner.RunPhaseBounded(ctx, ioCtx, fence, cycle, req.Phase); err != nil {
+		p.auditRefusal(ctx, sit.ID, string(req.Phase), "run_phase", err)
 		return situation.PreparedState{}, fmt.Errorf("cmd/alertint: run preparation phase: %w", err)
 	}
-
-	phasePlans := make([]model.Plan, 0, len(cycle.Draft.Plans))
-	for _, plan := range cycle.Draft.Plans {
-		if plan.Phase == req.Phase {
-			phasePlans = append(phasePlans, plan)
-		}
-	}
-	if err := p.st.RecordObservationRefreshAdmissions(ctx, sit.ID, cycle.ID, phasePlans, refreshInterval, req.Now); err != nil {
-		return situation.PreparedState{}, fmt.Errorf("cmd/alertint: record observation refresh admissions: %w", err)
-	}
+	p.auditAppend(ctx, "situation.preparation.phase_completed", map[string]any{
+		"situation_id": sit.ID, "cycle_id": cycle.ID, "generation": cycle.Generation, "phase": string(req.Phase),
+	})
 
 	return situation.PreparedState{CycleID: cycle.ID, Generation: cycle.Generation}, nil
+}
+
+// auditRefusal records a fenced preparation write the store refused
+// (lease lost, input version moved on, cycle sealed/not current) — the
+// "stale refusal" event spec.md's audit list requires — as a bounded class,
+// never the raw error text.
+func (p *productionPreparer) auditRefusal(ctx context.Context, situationID, phase, step string, err error) {
+	class := "store_error"
+	switch {
+	case errors.Is(err, situationmodel.ErrSituationLeaseLost):
+		class = "lease_lost"
+	case errors.Is(err, store.ErrSituationVersionConflict):
+		class = "input_version_conflict"
+	case errors.Is(err, store.ErrPreparationCycleSealed):
+		class = "cycle_sealed"
+	case errors.Is(err, store.ErrPreparationCycleNotCurrent):
+		class = "cycle_not_current"
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		class = "context_done"
+	}
+	p.auditAppend(ctx, "situation.preparation.refused", map[string]any{
+		"situation_id": situationID, "phase": phase, "step": step, "class": class,
+	})
 }
 
 // auditAppend is a best-effort audit emission: a failure is logged and
@@ -190,17 +221,16 @@ func (p *productionPreparer) auditAppend(ctx context.Context, kind string, paylo
 // productionPreparer emits.
 const preparationAuditActor = "situation.preparer"
 
-// membersFromDeliveries reduces req's deliveries to one MemberSubject per
+// membersFromDeliveries reduces in's deliveries to one MemberSubject per
 // distinct Alert (Delivery.AlertID, chronologically-latest delivery wins —
 // the same identity/ordering internal/situation's own incidentSymptomStatus
-// uses), Firing from that latest delivery's own Status, and
-// ObservationDeadlineAt/RecoveryGraceUntil derived from the Situation's own
-// current lifecycle timing (situation.BuildSnapshot/ObservationDeadlineAt,
-// both exported pure functions) — applied uniformly to every member, since
-// this build has no per-Alert observation-deadline concept distinct from
-// the Situation's own (Task 6's own resolveLifecycle works the same way
-// for its local-only fallback path).
-func membersFromDeliveries(in situation.SnapshotInput) []observation.MemberSubject {
+// uses): Firing from that latest delivery's own Status, Labels the full
+// immutable delivery label set (typed parameters only), SelectorLabels the
+// allowlisted subset (review F18), and ObservationDeadlineAt anchored at
+// that member's LAST trustworthy observation plus the lifecycle horizon
+// (review F1: spec.md "Deadlines are anchored at the last trustworthy
+// observation, not the first start"; a profile may widen the horizon).
+func membersFromDeliveries(in situation.SnapshotInput, selectorKeys []string, horizonTier string) []observation.MemberSubject {
 	latest := make(map[string]situation.Delivery, len(in.Deliveries))
 	for _, d := range in.Deliveries {
 		key := d.AlertID
@@ -216,25 +246,64 @@ func membersFromDeliveries(in situation.SnapshotInput) []observation.MemberSubje
 		return nil
 	}
 
-	snap := situation.BuildSnapshot(in)
-	deadline := situation.ObservationDeadlineAt(in.Situation.EffectiveStartedAt, snap.DurationClass)
-
 	keys := make([]string, 0, len(latest))
 	for k := range latest {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 
+	horizon := model.LifecycleHorizon(horizonTier)
 	members := make([]observation.MemberSubject, 0, len(keys))
 	for _, k := range keys {
 		d := latest[k]
 		members = append(members, observation.MemberSubject{
-			SubjectID: k, Source: d.Source, Labels: d.Labels,
-			ObservationDeadlineAt: deadline, RecoveryGraceUntil: in.Situation.GraceUntil,
+			SubjectID: k, Source: d.Source, Labels: d.Labels, SelectorLabels: selectorLabels(d.Labels, selectorKeys),
+			ObservationDeadlineAt: d.ReceivedAt.UTC().Add(horizon), RecoveryGraceUntil: in.Situation.GraceUntil,
 			Firing: d.Status == situationmodel.DeliveryStatusFiring,
 		})
 	}
 	return members
+}
+
+// selectorKeysFromConfig resolves the Selector allowlist (glossary
+// "Selector allowlist"): the built-in six keys, cfg.Triage.
+// ExtraSelectorLabels, and the correlator group-key labels — exactly what
+// skills/acutetriage/selector.go's own allowedSelectorKeys admits, plus the
+// group identity every scope must preserve. Sorted, deduplicated.
+func selectorKeysFromConfig(cfg *config.Config) []string {
+	seen := make(map[string]bool)
+	for _, k := range logs.AllowedSelectorKeys {
+		seen[k] = true
+	}
+	for _, k := range cfg.Triage.ExtraSelectorLabels {
+		seen[k] = true
+	}
+	for _, k := range cfg.Correlator.GroupLabels {
+		seen[k] = true
+	}
+	keys := make([]string, 0, len(seen))
+	for k := range seen {
+		if k != "" {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// selectorLabels projects labels onto the allowlist — alert-only metadata
+// (alertname, severity, ...) never becomes a metric/log/change matcher.
+func selectorLabels(labels map[string]string, keys []string) map[string]string {
+	out := make(map[string]string, len(keys))
+	for _, k := range keys {
+		if v, ok := labels[k]; ok && v != "" {
+			out[k] = v
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // capabilityDescriptorsFromConfig resolves the currently ENABLED capability
@@ -254,13 +323,27 @@ func capabilityDescriptorsFromConfig(cfg *config.Config) []observation.Capabilit
 		})
 	}
 	if cfg.LogsEnabled() {
+		// Review F21: the configured tighter log bounds win over the
+		// versioned defaults (spec.md: "configured tighter limits win").
+		window := time.Hour
+		if m := cfg.Logs.MaxWindowMinutes; m > 0 && time.Duration(m)*time.Minute < window {
+			window = time.Duration(m) * time.Minute
+		}
+		limit := 200
+		if cfg.Logs.MaxLines > 0 && cfg.Logs.MaxLines < limit {
+			limit = cfg.Logs.MaxLines
+		}
 		descs = append(descs, observation.CapabilityDescriptor{
-			Capability: model.CapabilityLokiQuery, DefaultWindow: time.Hour, DefaultLimit: 200, MaxRequestsHint: 2,
+			Capability: model.CapabilityLokiQuery, DefaultWindow: window, DefaultLimit: limit, MaxRequestsHint: 2,
 		})
 	}
 	if cfg.Sentry.Issues.Enabled {
+		limit := 10
+		if cfg.Sentry.Issues.MaxIssues > 0 && cfg.Sentry.Issues.MaxIssues < limit {
+			limit = cfg.Sentry.Issues.MaxIssues
+		}
 		descs = append(descs, observation.CapabilityDescriptor{
-			Capability: model.CapabilitySentryIssues, DefaultWindow: 24 * time.Hour, DefaultLimit: 10, MaxRequestsHint: 2,
+			Capability: model.CapabilitySentryIssues, DefaultWindow: 24 * time.Hour, DefaultLimit: limit, MaxRequestsHint: 2,
 		})
 	}
 	if cfg.ChangesEnrichmentEnabled() {
@@ -269,8 +352,10 @@ func capabilityDescriptorsFromConfig(cfg *config.Config) []observation.Capabilit
 		})
 	}
 	if cfg.ZabbixAPIEnabled() {
+		// zabbix_metric_range needs an exact item lookup PLUS the history/
+		// trend read: two physical requests (review F17).
 		descs = append(descs,
-			observation.CapabilityDescriptor{Capability: model.CapabilityZabbixMetricRange, DefaultWindow: time.Hour, DefaultLimit: 100, MaxRequestsHint: 1},
+			observation.CapabilityDescriptor{Capability: model.CapabilityZabbixMetricRange, DefaultWindow: time.Hour, DefaultLimit: 100, MaxRequestsHint: 2},
 			observation.CapabilityDescriptor{Capability: model.CapabilityZabbixProblemHist, DefaultWindow: 24 * time.Hour, DefaultLimit: 20, MaxRequestsHint: 2},
 		)
 	}
@@ -306,7 +391,7 @@ func preparationConfigDigest(descs []observation.CapabilityDescriptor, prepCfg c
 // production client type directly (each connector file's own doc comment
 // names this: "*prometheus.Client structurally satisfies it", etc.) — no
 // adapter shim needed anywhere in this function.
-func executorsFromClients(st *store.Store, prom *promclient.Client, lokiClient *loki.Client, sentryClient *sentry.Client, zbxClient *zabbix.Client, now func() time.Time) map[model.Capability]observation.Executor {
+func executorsFromClients(st *store.Store, prom *promclient.Client, lokiClient *loki.Client, sentryClient *sentry.Client, zbxClient *zabbix.Client, includeSentryMessage bool, now func() time.Time) map[model.Capability]observation.Executor {
 	execs := map[model.Capability]observation.Executor{
 		model.CapabilityStoreRead:    &connectors.StoreReadExecutor{Store: st, Clock: now},
 		model.CapabilityChangeEvents: &connectors.ChangesExecutor{Store: st, Clock: now},
@@ -319,7 +404,7 @@ func executorsFromClients(st *store.Store, prom *promclient.Client, lokiClient *
 	}
 	if sentryClient != nil {
 		execs[model.CapabilitySentryIssues] = &connectors.SentryExecutor{
-			Client: sentryClient, ProjectEnv: sentryProjectEnvFromScope, IncludeMessage: false, Clock: now,
+			Client: sentryClient, ProjectEnv: sentryProjectEnvFromScope, IncludeMessage: includeSentryMessage, Clock: now,
 		}
 	}
 	if zbxClient != nil {
@@ -427,14 +512,20 @@ func newPreparationRuntime(
 
 	prepCfg := cfg.Situations.Preparation
 	descs := capabilityDescriptorsFromConfig(cfg)
-	execs := executorsFromClients(st, prom, lokiClient, sentryClient, zbxClient, now)
-	runner := observation.NewRunner(st, execs, now)
+	execs := executorsFromClients(st, prom, lokiClient, sentryClient, zbxClient, cfg.Sentry.Issues.MessageIncluded(), now)
+	runner := observation.NewRunner(&auditingPreparationStore{Store: st, auditor: auditor, logger: logger}, execs, now)
 	preparer := &productionPreparer{
-		st: st, runner: runner, capabilities: descs,
+		st: st, runner: runner, capabilities: descs, selectorKeys: selectorKeysFromConfig(cfg),
 		configDigest: preparationConfigDigest(descs, prepCfg), prepCfg: prepCfg, logger: logger, auditor: auditor,
 	}
 
 	profileCfg := cfg.Situations.SemanticProfiles
+	// Review F12: the operator's max_attempts (validated 1..5) freezes onto
+	// every job this process creates — set before recovery/backfill/ingress
+	// can enqueue one.
+	if profileCfg.MaxAttempts > 0 {
+		st.SetSemanticProfileMaxAttempts(profileCfg.MaxAttempts)
+	}
 	workerCount := profileCfg.Workers
 	if workerCount <= 0 {
 		workerCount = 1
@@ -684,4 +775,57 @@ func (s *preparationSweep) Stop(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// auditingPreparationStore decorates the real store for the Runner so every
+// durable reservation, outcome, and run commit is audited AFTER its commit
+// (review F24; plan.md: audit follows the corresponding durable write).
+type auditingPreparationStore struct {
+	*store.Store
+	auditor *audit.Auditor
+	logger  *slog.Logger
+}
+
+func (a *auditingPreparationStore) audit(ctx context.Context, kind string, payload map[string]any) {
+	if a.auditor == nil {
+		return
+	}
+	if err := a.auditor.Append(ctx, preparationAuditActor, kind, payload); err != nil && a.logger != nil {
+		a.logger.Warn("cmd/alertint: preparation audit append failed", "kind", kind, "err", err)
+	}
+}
+
+func (a *auditingPreparationStore) ReserveObservationRequest(ctx context.Context, f model.Fence, cycleID, planID string, now time.Time) (model.RequestReservation, error) {
+	res, err := a.Store.ReserveObservationRequest(ctx, f, cycleID, planID, now)
+	if err == nil {
+		a.audit(ctx, "situation.preparation.request_reserved", map[string]any{
+			"situation_id": f.SituationID, "cycle_id": cycleID, "plan_id": planID, "reservation_id": res.ID, "ordinal": res.Ordinal,
+		})
+	}
+	return res, err
+}
+
+func (a *auditingPreparationStore) CompleteObservationRequest(ctx context.Context, outcome model.RequestOutcome) error {
+	err := a.Store.CompleteObservationRequest(ctx, outcome)
+	if err == nil {
+		a.audit(ctx, "situation.preparation.request_completed", map[string]any{
+			"reservation_id": outcome.ReservationID, "request_started": outcome.RequestStarted, "code": outcome.Code,
+		})
+	}
+	return err
+}
+
+func (a *auditingPreparationStore) CommitObservationRun(ctx context.Context, f model.Fence, run model.Run, now time.Time) error {
+	err := a.Store.CommitObservationRun(ctx, f, run, now)
+	if err == nil {
+		payload := map[string]any{
+			"situation_id": f.SituationID, "cycle_id": run.CycleID, "plan_id": run.PlanID, "run_id": run.ID,
+			"status": string(run.Status), "fact_count": len(run.Facts), "limitation_codes": run.LimitationCodes,
+		}
+		if run.ReusedFromRunID != nil {
+			payload["reused_from_run_id"] = *run.ReusedFromRunID
+		}
+		a.audit(ctx, "situation.preparation.run_committed", payload)
+	}
+	return err
 }

@@ -75,6 +75,12 @@ func ValidatePlan(p Plan) error {
 	if p.Purpose == "" {
 		return errors.New("observation/model: plan requires a purpose code")
 	}
+	if !ValidTier(p.Tier) {
+		return fmt.Errorf("observation/model: unknown plan tier %q", p.Tier)
+	}
+	if (p.Tier == TierReuse) != (p.ReuseRunID != "") {
+		return errors.New("observation/model: reuse tier and reuse run id must travel together")
+	}
 	if len(p.Parameters) > MaxPlanParametersBytes {
 		return fmt.Errorf("observation/model: plan parameters exceed %d bytes", MaxPlanParametersBytes)
 	}
