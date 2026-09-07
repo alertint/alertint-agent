@@ -138,7 +138,7 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 	// (Runs/Facts, frozen profile guidance, source lifecycle observations) —
 	// read fresh inside this SAME coherent transaction. See
 	// SnapshotInput.Prepared's own doc comment.
-	prepared, err := loadPreparedStateTx(ctx, tx, sit.ID)
+	prepared, err := loadPreparedStateTx(ctx, tx, sit.ID, now)
 	if err != nil {
 		return situation.SnapshotInput{}, err
 	}
@@ -1925,6 +1925,9 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 
 	proj, err := readCurrentControllerProjectionTx(ctx, tx, claim.Situation.ID)
 	if err != nil {
+		return err
+	}
+	if err := refundBudgetDeniedAttemptTx(ctx, tx, claim, commit); err != nil {
 		return err
 	}
 

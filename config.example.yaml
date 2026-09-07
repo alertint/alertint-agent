@@ -15,6 +15,41 @@ llm:
   # model: claude-haiku-4-5                   # faster + cheaper alternative for cost-sensitive setups
   timeout_seconds: 120                        # whole-request LLM timeout; local endpoints typically want 300
 
+  # Shared runaway guard: all generation workloads, models and controller
+  # cycles using this database. Each retry/redirected POST reserves separately
+  # BEFORE dispatch; non-generating metadata/health GETs are excluded.
+  budget:
+    calls_per_hour: 0                         # 0 = unlimited; e.g. 30 for a bounded lab
+    total_tokens: 0                           # 0 = unlimited; e.g. 100000 for a bounded lab
+  # Calls use the preceding rolling 60 minutes (not clock-hour buckets).
+  # Tokens have NO time reset. State survives restart in connector_state under
+  # llm.budget.v1. Accounting starts when either limit is enabled; historical
+  # audit rows and traffic while both limits are zero are not backfilled.
+  # Each POST reserves encoded request bytes + max_tokens + 1024 for framing.
+  # Concurrent reservations are allowed when their combined allowances fit.
+  # Valid usage replaces the allowance with input + output + Anthropic cache
+  # creation/read tokens. OpenAI prompt/completion totals already include
+  # cached/reasoning tokens, so their detail fields are not counted twice.
+  # Errors with unknown usage (including missing/invalid usage or >512 KiB
+  # responses) retain the allowance and latch unknown: future token-budgeted
+  # dispatch fails closed. Crash/unsettled reservations remain fully charged,
+  # without automatic refund. Database failures prevent dispatch/refund.
+  # Exhaustion returns an actionable inference error. For call exhaustion,
+  # wait for the rolling window; for known token exhaustion, review and raise
+  # total_tokens or reduce prompt/output size. Unknown usage requires manual
+  # reconciliation of provider usage and llm.budget.v1 with the agent stopped;
+  # raising the limit alone cannot clear it. No automatic reset/recovery tool.
+  # Situation assessments deferred by an hourly limit retry at its expiry,
+  # without spending an inference attempt for a proved-unsent denial. A
+  # token/unknown-usage deferral has no automatic retry. After reconciling the
+  # budget, affected budget_deferred Situations also require explicit reviewed
+  # database rearming while stopped; current MCP Situation tools are read-only.
+  # Do not clear unrelated parks, actual attempt counts, or provider charges.
+  # This is a conservative text-request allowance, not an exact tokenizer or
+  # dollar cap. A compatible server with extra hidden input, inaccurate usage,
+  # or an ignored output cap can exceed it; reported overruns fail explicitly
+  # and remain charged. Preserve the database to preserve the budget.
+
   # Self-hosted alternative — any OpenAI-compatible endpoint (SGLang, vLLM,
   # Ollama, LM Studio). See docs/integrations/openai-compatible.md.
   # provider: openai-compatible

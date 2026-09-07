@@ -134,7 +134,11 @@ func (p *productionPreparer) Prepare(ctx context.Context, req situation.Preparat
 	if err != nil {
 		return situation.PreparedState{}, fmt.Errorf("cmd/alertint: build observation plans: %w", err)
 	}
-	if len(plans) == 0 {
+	// An empty assessment still freezes the current input/configuration
+	// fence. Do not leave an older cycle authoritative after reads are
+	// disabled or deferred. An empty lifecycle phase must not freeze out
+	// the assessment phase's plans, which are selected next.
+	if len(plans) == 0 && req.Phase == model.PhaseLifecycle {
 		return situation.PreparedState{}, nil
 	}
 

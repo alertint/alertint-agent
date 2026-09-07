@@ -47,9 +47,9 @@ const (
 	// ObservationDigest, folding in prepared observation evidence's own
 	// MaterialDigest (normalized meaning/coverage only — never collection
 	// time, run ID, generation, or reservation count).
-	// Bumped to 4 for the stability hotfix: static capability limitations
-	// no longer contribute to material evidence identity.
-	materialFactHashSchemaVersion = 4
+	// Bumped to 4 for static capability limitations, then 5 for the coherent
+	// retained evidence view and explicit run outcome/coverage materiality.
+	materialFactHashSchemaVersion = 5
 
 	// assessmentBasisHashSchemaVersion is bumped to 3 (Task 5): the carried-
 	// forward InputVersion-instability bug documented on
@@ -60,8 +60,8 @@ const (
 	// Bumped again to 4 (Plan 4 Task 6): embeds the new
 	// materialFactHashSchemaVersion-3 MaterialFactHash output plus the
 	// bumped assessmentValidatorVersion.
-	// Bumped to 5 to embed the hotfix's material hash schema version 4.
-	assessmentBasisHashSchemaVersion = 5
+	// Bumped to 6 to embed the coherent evidence hash schema version 5.
+	assessmentBasisHashSchemaVersion = 6
 
 	// assessmentValidatorVersion tracks ValidateAssessmentProposal's rule
 	// set. Bumped to 2 (Plan 4 Task 6): reservedUnsupportedCapabilities
@@ -720,8 +720,8 @@ func MaterialFactHash(in SnapshotInput, symptoms []Symptom, durationClass string
 	return canonicalDigest(dto)
 }
 
-// observationMaterialDigest folds the selected preparation cycle's prepared
-// facts into one MaterialDigest, or "" when no preparer is configured or no
+// observationMaterialDigest folds the coherent bounded evidence view's facts
+// and check outcomes into one MaterialDigest, or "" when no preparer is configured or no
 // cycle has begun yet (prepared.CycleID == "") — every pre-Plan-4 fixture
 // and test therefore computes the exact same hash as before this field
 // existed, up to the schema-version bump alone.
@@ -729,10 +729,7 @@ func observationMaterialDigest(prepared PreparedState) string {
 	if prepared.CycleID == "" {
 		return ""
 	}
-	var facts []observationmodel.Fact
-	for _, run := range prepared.Runs {
-		facts = append(facts, run.Facts...)
-	}
+	facts := preparedObservationFacts(prepared)
 	digest, err := observationmodel.MaterialDigest(facts)
 	if err != nil {
 		// facts here are always already-validated, already-persisted

@@ -28,8 +28,11 @@ type PreparationRequest struct {
 // concurrent head-change or a crash between preparation and reload can
 // never let a stale in-memory receipt substitute for durable truth.
 type PreparedState struct {
-	CycleID           string
-	Generation        int64
+	CycleID    string
+	Generation int64
+	// Runs is the latest bounded evidence per capability/subject across
+	// compatible cycles, not just the reads dispatched this cycle. Audit
+	// APIs continue to expose immutable per-cycle runs separately.
 	Runs              []observationmodel.Run
 	ProfileVersionIDs []string
 	ProfileGuidance   []observationmodel.ProfileGuidance

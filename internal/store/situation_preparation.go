@@ -1240,7 +1240,7 @@ func (s *Store) AccrueInvestigationCredit(ctx context.Context, situationID strin
 	return credit, nil
 }
 
-// loadPreparedStateTx reads situationID's CURRENT preparation cycle (the
+// loadPreparedStateTx reads situationID's CURRENT preparation cycle fence (the
 // situations.current_preparation_cycle_id pointer BeginPreparation
 // maintains) inside an already-open transaction — LoadReconciliationInput's
 // own "reload" (preparation.go's own doc comment: the durable truth a
@@ -1249,14 +1249,15 @@ func (s *Store) AccrueInvestigationCredit(ctx context.Context, situationID strin
 // returns the zero PreparedState, matching SnapshotInput.Prepared's own
 // documented "no preparer configured, or no cycle has begun yet" meaning.
 //
-// Lifecycle decodes every run's "source_lifecycle"-kind Fact Values —
+// Runs carry a bounded latest-per-subject view across compatible cycles.
+// Lifecycle decodes fresh "source_lifecycle"-kind Fact Values —
 // each one a JSON array of situation.SourceObservation (the same
 // one-fact-per-run-holds-an-array convention situationSummaryFact/
 // findingsFact already use) — into ReduceSourceLifecycle's own input shape.
 // No connector in this build writes that kind yet (Task 9 wires the real
 // adapter); this decode path is exercised here by direct fixture only,
 // exactly like RecoveryGraceDuration's own not-yet-reachable polling branch.
-func loadPreparedStateTx(ctx context.Context, tx *sql.Tx, situationID string) (situation.PreparedState, error) {
+func loadPreparedStateTx(ctx context.Context, tx *sql.Tx, situationID string, now time.Time) (situation.PreparedState, error) {
 	var cycleID sql.NullString
 	err := tx.QueryRowContext(ctx, `SELECT current_preparation_cycle_id FROM situations WHERE id = ?`, situationID).Scan(&cycleID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1290,7 +1291,7 @@ func loadPreparedStateTx(ctx context.Context, tx *sql.Tx, situationID string) (s
 		return situation.PreparedState{}, fmt.Errorf("store: unmarshal profile guidance: %w", err)
 	}
 
-	runs, lifecycle, err := loadCycleRunsAndLifecycleTx(ctx, tx, cycleID.String)
+	runs, lifecycle, err := loadCurrentEvidenceTx(ctx, tx, situationID, cycleID.String, now)
 	if err != nil {
 		return situation.PreparedState{}, err
 	}
@@ -1300,72 +1301,6 @@ func loadPreparedStateTx(ctx context.Context, tx *sql.Tx, situationID string) (s
 		Runs: runs, ProfileVersionIDs: profileVersionIDs, ProfileGuidance: profileGuidance,
 		Lifecycle: lifecycle,
 	}, nil
-}
-
-// loadCycleRunsAndLifecycleTx loads every durable run belonging to cycleID
-// (reusing buildRunRecord/loadFactsForRun's exact queries via the dbQuerier
-// seam, tx-scoped) and, in the same pass, decodes every "source_lifecycle"
-// fact it finds into situation.SourceObservation.
-func loadCycleRunsAndLifecycleTx(ctx context.Context, tx *sql.Tx, cycleID string) ([]observationmodel.Run, []situation.SourceObservation, error) {
-	rows, err := tx.QueryContext(ctx, `
-		SELECT r.id, r.plan_id, r.status, r.coverage_start, r.coverage_end, r.coverage_complete,
-		       r.coverage_returned, r.coverage_omitted, r.limitation_codes_json, r.observed_at, r.expires_at,
-		       r.completed_at, r.reused_from_run_id,
-		       e.expired_at
-		FROM situation_observation_runs r
-		LEFT JOIN situation_observation_detail_expirations e ON e.run_id = r.id
-		WHERE r.cycle_id = ? ORDER BY r.id`, cycleID)
-	if err != nil {
-		return nil, nil, fmt.Errorf("store: query prepared cycle runs: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	type rawRun struct {
-		id, planID, status, coverageStart, coverageEnd, limitationCodes string
-		complete, returned, omitted                                     int
-		observedAt, expiresAt, completedAt                              string
-		reusedFrom, expiredAt                                           sql.NullString
-	}
-	var raws []rawRun
-	for rows.Next() {
-		var r rawRun
-		if err := rows.Scan(&r.id, &r.planID, &r.status, &r.coverageStart, &r.coverageEnd, &r.complete,
-			&r.returned, &r.omitted, &r.limitationCodes, &r.observedAt, &r.expiresAt, &r.completedAt, &r.reusedFrom, &r.expiredAt); err != nil {
-			return nil, nil, fmt.Errorf("store: scan prepared cycle run: %w", err)
-		}
-		raws = append(raws, r)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, nil, fmt.Errorf("store: iterate prepared cycle runs: %w", err)
-	}
-	// Close explicitly now (the deferred Close above becomes a safe no-op) —
-	// same single-connection deadlock hazard ListObservationRuns' own doc
-	// comment already explains — before buildRunRecord's own per-run queries
-	// below.
-	if err := rows.Close(); err != nil {
-		return nil, nil, fmt.Errorf("store: close prepared cycle runs query: %w", err)
-	}
-
-	runs := make([]observationmodel.Run, 0, len(raws))
-	var lifecycle []situation.SourceObservation
-	for _, r := range raws {
-		record, err := buildRunRecord(ctx, tx, r.id, cycleID, r.planID, r.status, r.coverageStart, r.coverageEnd,
-			r.complete, r.returned, r.omitted, r.limitationCodes, r.observedAt, r.expiresAt, r.completedAt, r.reusedFrom, r.expiredAt)
-		if err != nil {
-			return nil, nil, err
-		}
-		runs = append(runs, record.Run)
-		for _, f := range record.Run.Facts {
-			if f.Kind != "source_lifecycle" {
-				continue
-			}
-			var batch []situation.SourceObservation
-			if err := json.Unmarshal(f.Value, &batch); err != nil {
-				return nil, nil, fmt.Errorf("store: unmarshal source lifecycle fact %s: %w", f.ID, err)
-			}
-			lifecycle = append(lifecycle, batch...)
-		}
-	}
-	return runs, lifecycle, nil
 }
 
 // sealPreparationCycleTx seals cycleID inside an already-open transaction —

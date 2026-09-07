@@ -53,6 +53,8 @@ const responseFormatHint = `set llm.response_format: "off" if your runtime does 
 
 // Config holds tunables for the openai-compatible client.
 type Config struct {
+	// Budget is the installation-wide durable guard; nil preserves unlimited behavior.
+	Budget *llm.Budget
 	// BaseURL is the endpoint root, already normalized by internal/config
 	// (no trailing slash or /v1). Required.
 	BaseURL string
@@ -116,7 +118,7 @@ func New(cfg Config, auditor *audit.Auditor, logger *slog.Logger) *Client {
 	}
 	return &Client{
 		cfg:      cfg,
-		http:     &http.Client{Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second},
+		http:     &http.Client{Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second, Transport: cfg.Budget.Transport(nil)},
 		auditor:  auditor,
 		logger:   logger,
 		now:      func() time.Time { return time.Now().UTC() },

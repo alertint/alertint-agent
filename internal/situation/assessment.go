@@ -383,6 +383,15 @@ func DeriveEvidenceQuality(snap Snapshot) model.EvidenceQuality {
 			confirmed++
 		}
 	}
+	for _, f := range snap.Observations {
+		if !f.Material {
+			continue
+		}
+		total++
+		if f.Freshness == "fresh" && (f.ResultStatus == "confirmed_value" || f.ResultStatus == "confirmed_empty") {
+			confirmed++
+		}
+	}
 	switch {
 	case total == 0 || confirmed == 0:
 		return model.EvidenceQualityInsufficient
@@ -913,7 +922,7 @@ func validateProposalContent(proposal model.AssessmentProposal, snap Snapshot) V
 			return capabilityResult("reason_id_unknown", "sufficient_reason.candidate_id", "candidate ID not present in this Snapshot's eligible_reasons")
 		}
 		for _, ref := range proposal.SufficientReason.EvidenceRefs {
-			if !factExists(snap.Facts, ref) {
+			if !factExists(snap.Facts, ref) && !observationExists(snap, ref) {
 				return policyResult("evidence_ref_missing", "sufficient_reason.evidence_refs", "evidence reference not present in the claimed snapshot")
 			}
 		}
