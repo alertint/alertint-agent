@@ -199,9 +199,12 @@ type UsageStats struct {
 	LLMByModel             []ModelUsage
 
 	// SlackCardsPosted counts operator pokes: notify.slack/notify.sent rows
-	// whose event is "firing", i.e. a new incident card landing in the
-	// channel. In-place re-judgment edits, resolved updates and thread
-	// replies are not pokes and are excluded.
+	// that put a new top-level card in the channel — a first firing card,
+	// or a resolved card for an incident that resolved before it ever had
+	// one. In-place re-judgment edits, resolved updates and thread replies
+	// are not pokes and are excluded. The notifier marks new cards with
+	// new_card=true; rows written before that field existed are counted
+	// when their event is "firing", the only new-card path at the time.
 	SlackCardsPosted int
 	// SlackSkipped counts notify.skipped rows: incidents held back by the
 	// min_severity gate.
@@ -232,10 +235,11 @@ type ModelUsage struct {
 }
 
 // UsageStats aggregates operational counters from the audit log over the
-// half-open window [since, until). It runs three scoped queries: one grouped
-// count over (actor, kind) for the Slack-skipped and incident counters, one
-// pair of JSON-aware counts (alert intake volume, Slack cards posted), and
-// one scan of llm.response rows to sum token fields out of their
+// half-open window [since, until). It runs four queries, each built by a
+// usage*Query helper so the planner test can pin their index use: one
+// grouped count over (actor, kind) for the Slack-skipped and incident
+// counters, two JSON-aware counts (alert intake volume, Slack cards posted),
+// and one scan of llm.response rows to sum token fields out of their
 // payload_json (that column already carries input/output/cache token
 // counts — see internal/llm/anthropic and internal/llm/openaicompat) and
 // build the per-model breakdown.
@@ -272,10 +276,12 @@ type tsWindowPred struct {
 const tsNormalizedCol = `(substr(ts, 1, 19) || '.' || substr(ltrim(rtrim(substr(ts, 20), 'Z'), '.') || '000000000', 1, 9))`
 
 // tsWindow builds the [since, until) predicate. The exact comparison runs
-// on tsNormalizedCol, which cannot use audit_log_ts_idx; a coarse
-// whole-second range on the raw column (floor(since) ≤ ts < floor(until)+1s,
-// compared as 19-char prefixes so both "…Z" and "….fZ" rows sort after the
-// bound) keeps the index in play and is a strict superset of the exact window.
+// on tsNormalizedCol, which no index can serve; a coarse whole-second range
+// on the raw column (floor(since) ≤ ts < floor(until)+1s, compared as
+// 19-char prefixes so both "…Z" and "….fZ" rows sort after the bound) is a
+// strict superset of the exact window and lets the planner bound the scan
+// with audit_log_ts_idx, or with audit_log_kind_ts_idx when the query is
+// also scoped to one kind.
 func tsWindow(since, until time.Time) tsWindowPred {
 	const exactLayout = "2006-01-02T15:04:05.000000000"
 	const coarseLayout = "2006-01-02T15:04:05"
@@ -296,12 +302,7 @@ func tsWindow(since, until time.Time) tsWindowPred {
 // named below is deliberately ignored — alertint_usage_stats returns a
 // curated summary, not a raw per-kind dump.
 func (a *Auditor) scanUsageCounts(ctx context.Context, w tsWindowPred, out *UsageStats) error {
-	rows, err := a.db.QueryContext(ctx, `
-		SELECT actor, kind, COUNT(*)
-		FROM audit_log
-		WHERE `+w.sql+`
-		GROUP BY actor, kind
-	`, w.args...)
+	rows, err := a.db.QueryContext(ctx, usageCountsQuery(w), w.args...)
 	if err != nil {
 		return fmt.Errorf("audit: usage stats counts: %w", err)
 	}
@@ -329,25 +330,58 @@ func (a *Auditor) scanUsageCounts(ctx context.Context, w tsWindowPred, out *Usag
 // posted counter. Both need a field out of payload_json, so they run as one
 // query per counter rather than through the grouped (actor, kind) count.
 func (a *Auditor) scanIntakeAndPokes(ctx context.Context, w tsWindowPred, out *UsageStats) error {
-	err := a.db.QueryRowContext(ctx, `
-		SELECT COUNT(*), COALESCE(SUM(COALESCE(json_extract(payload_json, '$.alert_count'), 1)), 0)
-		FROM audit_log
-		WHERE kind = 'alert.received' AND `+w.sql, w.args...,
-	).Scan(&out.AlertDeliveries, &out.AlertsReceived)
+	err := a.db.QueryRowContext(ctx, usageAlertIntakeQuery(w), w.args...).
+		Scan(&out.AlertDeliveries, &out.AlertsReceived)
 	if err != nil {
 		return fmt.Errorf("audit: usage stats alert intake: %w", err)
 	}
 
-	err = a.db.QueryRowContext(ctx, `
-		SELECT COUNT(*)
-		FROM audit_log
-		WHERE actor = 'notify.slack' AND kind = 'notify.sent'
-		  AND json_extract(payload_json, '$.event') = 'firing' AND `+w.sql, w.args...,
-	).Scan(&out.SlackCardsPosted)
+	err = a.db.QueryRowContext(ctx, usageSlackCardsQuery(w), w.args...).Scan(&out.SlackCardsPosted)
 	if err != nil {
 		return fmt.Errorf("audit: usage stats slack cards: %w", err)
 	}
 	return nil
+}
+
+// usageCountsQuery is the grouped (actor, kind) count over the window. With
+// no kind restriction the planner bounds it with audit_log_ts_idx.
+func usageCountsQuery(w tsWindowPred) string {
+	return `
+		SELECT actor, kind, COUNT(*)
+		FROM audit_log
+		WHERE ` + w.sql + `
+		GROUP BY actor, kind`
+}
+
+// usageAlertIntakeQuery counts alert.received rows in the window and sums the
+// alerts they carried (alert_count when present, else one per row).
+func usageAlertIntakeQuery(w tsWindowPred) string {
+	return `
+		SELECT COUNT(*), COALESCE(SUM(COALESCE(json_extract(payload_json, '$.alert_count'), 1)), 0)
+		FROM audit_log
+		WHERE kind = 'alert.received' AND ` + w.sql
+}
+
+// usageSlackCardsQuery counts new-card notify.sent rows in the window: rows
+// carrying new_card use it directly; older rows without the field count
+// when their event is "firing" (see UsageStats.SlackCardsPosted).
+func usageSlackCardsQuery(w tsWindowPred) string {
+	return `
+		SELECT COUNT(*)
+		FROM audit_log
+		WHERE kind = 'notify.sent' AND actor = 'notify.slack'
+		  AND COALESCE(json_extract(payload_json, '$.new_card'),
+		               json_extract(payload_json, '$.event') = 'firing') = 1
+		  AND ` + w.sql
+}
+
+// usageLLMResponsesQuery selects the llm.response rows in the window whose
+// payloads scanLLMUsage sums.
+func usageLLMResponsesQuery(w tsWindowPred) string {
+	return `
+		SELECT actor, payload_json
+		FROM audit_log
+		WHERE kind = 'llm.response' AND ` + w.sql
 }
 
 // llmResponsePayload is the subset of an llm.response audit payload
@@ -366,10 +400,7 @@ type llmResponsePayload struct {
 // unmarshal into llmResponsePayload is skipped rather than failing the whole
 // call — it stays out of both the total and the per-model breakdown.
 func (a *Auditor) scanLLMUsage(ctx context.Context, w tsWindowPred, out *UsageStats) error {
-	rows, err := a.db.QueryContext(ctx, `
-		SELECT actor, payload_json
-		FROM audit_log
-		WHERE kind = 'llm.response' AND `+w.sql, w.args...)
+	rows, err := a.db.QueryContext(ctx, usageLLMResponsesQuery(w), w.args...)
 	if err != nil {
 		return fmt.Errorf("audit: usage stats llm scan: %w", err)
 	}
