@@ -28,6 +28,19 @@ For anything beyond a quick test, provide the secret yourself instead of
 `secret.create` (see the `secret` block below) and set a real
 `values.yaml` rather than passing everything via `--set`.
 
+## Verifying the chart signature
+
+Every chart release is signed with [cosign](https://github.com/sigstore/cosign)
+keyless, using the release workflow's GitHub Actions identity — there is no
+long-lived signing key. To check a version before installing it:
+
+```bash
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/alertint/alertint-agent/\.github/workflows/chart-release\.yml@refs/tags/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/alertint/charts/alertint-agent:<version>
+```
+
 ## Configuring alertint-agent itself
 
 This chart intentionally does **not** turn every alertint-agent config field

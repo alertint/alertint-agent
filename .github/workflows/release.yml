@@ -57,4 +57,5 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write # keyless cosign signing in the called workflow
     uses: ./.github/workflows/chart-release.yml
