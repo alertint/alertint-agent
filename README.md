@@ -40,8 +40,8 @@ alertint drill --config config.yaml
 For Kubernetes, install the official Helm chart. It is published as an OCI
 artifact on GHCR and listed on
 [Artifact Hub](https://artifacthub.io/packages/helm/alertint-agent/alertint-agent)
-under AlertINT as a verified publisher; every release is cosign-signed and
-ships a values schema:
+as an Official repository, published by AlertINT as a verified publisher;
+every release is cosign-signed and ships a values schema:
 
 ```bash
 helm install my-alertint oci://ghcr.io/alertint/charts/alertint-agent \

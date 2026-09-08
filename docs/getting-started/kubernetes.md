@@ -1,6 +1,6 @@
 ---
 title: "Kubernetes (Helm)"
-description: "Install the agent on Kubernetes with the AlertINT Helm chart: an OCI chart on GHCR, listed on Artifact Hub under a verified publisher, with signed releases and a values schema."
+description: "Install the agent on Kubernetes with the AlertINT Helm chart: an OCI chart on GHCR, listed on Artifact Hub as an Official repository under a verified publisher, with signed releases and a values schema."
 section: "Getting started"
 order: 2
 slug: "kubernetes"
@@ -14,7 +14,8 @@ so a chart version always references an image that actually exists.
 
 - Chart: `oci://ghcr.io/alertint/charts/alertint-agent`
 - Listing: [Artifact Hub](https://artifacthub.io/packages/helm/alertint-agent/alertint-agent),
-  published by the AlertINT organization as a verified publisher
+  an Official repository published by the AlertINT organization as a
+  verified publisher
 - Every release is signed with cosign; a values schema validates your values
   on install, upgrade, lint and template
 - Full values reference and every supported mode:
