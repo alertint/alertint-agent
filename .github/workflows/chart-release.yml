@@ -6,9 +6,12 @@ on:
       - "chart-v*"
   workflow_call:
 
+# id-token lets cosign obtain a GitHub OIDC identity for keyless signing; no
+# signing key is stored anywhere. A caller via workflow_call must grant it too.
 permissions:
   contents: read
   packages: write
+  id-token: write
 
 jobs:
   publish:
@@ -23,6 +26,9 @@ jobs:
         uses: azure/setup-helm@v4
         with:
           version: "v3.16.4"
+
+      - name: Set up cosign
+        uses: sigstore/cosign-installer@v3
 
       - name: Validate release metadata
         run: ./scripts/chart-release-validate.sh "${GITHUB_REF_NAME}"
@@ -60,6 +66,34 @@ jobs:
       # Helm infers alertint-agent:<Chart.yaml version> from the packaged chart;
       # the push destination intentionally omits both chart name and tag.
       - name: Push chart
+        id: push
         run: |
+          set -o pipefail
           chart_version="$(sed -n 's/^version: *//p' charts/alertint-agent/Chart.yaml)"
-          helm push "dist/alertint-agent-${chart_version}.tgz" oci://ghcr.io/alertint/charts
+          helm push "dist/alertint-agent-${chart_version}.tgz" oci://ghcr.io/alertint/charts \
+            | tee "$RUNNER_TEMP/helm-push.log"
+          digest="$(sed -n 's/^Digest: *//p' "$RUNNER_TEMP/helm-push.log")"
+          [ -n "$digest" ] || { echo "::error::helm push did not report a digest"; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      # Keyless signing: the certificate is bound to this workflow's GitHub
+      # OIDC identity and recorded in the Rekor transparency log. Artifact Hub
+      # detects the signature and shows the "signed" badge; users verify with
+      # the command in the chart README. Registry credentials come from the
+      # docker/login-action step above.
+      - name: Sign chart with cosign
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/alertint/charts/alertint-agent@${DIGEST}"
+
+      # For a chart-only release the identity ref is refs/tags/chart-vX.Y.Z;
+      # when called from release.yml it is refs/tags/vX.Y.Z (the reusable
+      # workflow keeps its own path, the ref is the caller's tag).
+      - name: Verify chart signature
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          cosign verify \
+            --certificate-identity-regexp '^https://github\.com/alertint/alertint-agent/\.github/workflows/chart-release\.yml@refs/tags/' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "ghcr.io/alertint/charts/alertint-agent@${DIGEST}" >/dev/null
