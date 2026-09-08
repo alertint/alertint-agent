@@ -307,3 +307,47 @@ func TestBriefingReviewPersistsActualReplyDifferences(t *testing.T) {
 		}
 	}
 }
+
+// TestBriefingReplyGateDistinguishesRefireFromCountRung pins decision E2 of
+// the B0 integration contract against slide 1 (edge `refire`) and slide 4
+// (gate node): a refire that moves Recovery pending back to Active earns a
+// thread reply, while a recurrence-count rung alone refreshes the root and
+// stays quiet.
+func TestBriefingReplyGateDistinguishesRefireFromCountRung(t *testing.T) {
+	briefing := &model.OperatorBriefing{Scope: "checkout", Firing: 1, Total: 2}
+	clone := func(tr model.Transition) model.Transition {
+		raw, err := json.Marshal(tr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out model.Transition
+		if err := json.Unmarshal(raw, &out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	t.Run("refire during recovery earns a reply", func(t *testing.T) {
+		prior := hsFirst(t)
+		prior.Lifecycle = model.LifecycleRecoveryPending
+		prior.Projection.Briefing = briefing
+		tr := clone(prior)
+		tr.Lifecycle = model.LifecycleActive
+		tr.Reason = model.ReasonMaterialAssessmentChanged
+		if !operatorReplyWarranted(&prior, tr) {
+			t.Fatal("Recovery pending → Active refire must pass the reply gate")
+		}
+	})
+
+	t.Run("count rung alone stays quiet", func(t *testing.T) {
+		prior := hsFirst(t)
+		prior.Lifecycle = model.LifecycleActive
+		prior.Projection.Briefing = briefing
+		tr := clone(prior)
+		tr.Reason = model.ReasonRecurrenceMilestone
+		tr.Journal.RecurrenceCount = 10
+		if operatorReplyWarranted(&prior, tr) {
+			t.Fatal("a recurrence-count rung with unchanged facts must not earn a thread reply")
+		}
+	})
+}
