@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- New read-only MCP tool `alertint_usage_stats` reports an operational usage
+  summary over a time window: alert deliveries and alerts received, LLM
+  call/token volume with a per-model breakdown, Slack cards posted (new
+  incident cards only) and skipped, incident analyses completed and triage
+  exhaustions. Every counter is derived from the audit log, so historical
+  windows stay stable as new deliveries arrive. Slack `notify.sent` audit
+  rows now carry `new_card` so a resolved card posted for a never-notified
+  incident counts as a card; migration 0013 adds a composite `(kind, ts)`
+  audit-log index so windowed reads walk only the window.
+
 ### Changed
 
 - Docs: new [Kubernetes (Helm)](docs/getting-started/kubernetes.md) page

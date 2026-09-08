@@ -193,7 +193,7 @@ func (n *Notifier) notifyFiring(ctx context.Context, f notify.Finding) error {
 			slacklib.MsgOptionBlocks(firingDetailBlocks(f)...),
 		)
 	}
-	n.audit(ctx, f.IncidentID, "firing")
+	n.audit(ctx, f.IncidentID, "firing", true)
 	return nil
 }
 
@@ -219,7 +219,7 @@ func (n *Notifier) updateFiringInPlace(ctx context.Context, f notify.Finding, or
 	); err != nil {
 		return fmt.Errorf("channel %s: post thread reply: %w", channel, err)
 	}
-	n.audit(ctx, f.IncidentID, "rejudge")
+	n.audit(ctx, f.IncidentID, "rejudge", false)
 	return nil
 }
 
@@ -244,7 +244,7 @@ func (n *Notifier) notifyResolved(ctx context.Context, f notify.Finding) error {
 	if err != nil {
 		return fmt.Errorf("channel %s: post resolved message: %w", n.channel, err)
 	}
-	n.audit(ctx, f.IncidentID, "resolved")
+	n.audit(ctx, f.IncidentID, "resolved", true)
 	return nil
 }
 
@@ -272,7 +272,7 @@ func (n *Notifier) updateAndThread(ctx context.Context, f notify.Finding, origin
 		return fmt.Errorf("channel %s: post thread reply: %w", channel, err)
 	}
 
-	n.audit(ctx, f.IncidentID, "resolved")
+	n.audit(ctx, f.IncidentID, "resolved", false)
 	return nil
 }
 
@@ -313,7 +313,13 @@ func (n *Notifier) auditSkipped(ctx context.Context, f notify.Finding) {
 	})
 }
 
-func (n *Notifier) audit(ctx context.Context, incidentID, event string) {
+// audit records one notify.sent row. newCard is true when this delivery put
+// a new top-level card in the channel (an operator poke: a first firing
+// card, or a resolved card for an incident that never had a firing card),
+// and false when it edited an existing card and/or threaded under it. The
+// usage-stats aggregation reads this field to count cards posted; before it
+// existed, event == "firing" was the only new-card signal.
+func (n *Notifier) audit(ctx context.Context, incidentID, event string, newCard bool) {
 	if n.auditor == nil {
 		return
 	}
@@ -321,6 +327,7 @@ func (n *Notifier) audit(ctx context.Context, incidentID, event string) {
 		"incident_id": incidentID,
 		"event":       event,
 		"recipient":   "slack",
+		"new_card":    newCard,
 	})
 }
 
