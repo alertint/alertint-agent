@@ -10,6 +10,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-blue" alt="license"></a>
   <a href="https://github.com/alertint/alertint-agent/releases"><img src="https://img.shields.io/github/v/release/alertint/alertint-agent?include_prereleases" alt="release"></a>
   <a href="https://github.com/alertint/alertint-agent/actions/workflows/ci.yml"><img src="https://github.com/alertint/alertint-agent/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://artifacthub.io/packages/helm/alertint-agent/alertint-agent"><img src="https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/alertint-agent" alt="Artifact Hub"></a>
 </p>
 
 > AlertINT turns infrastructure alerts into investigated incidents and serves them to the AI tools you already use, over MCP — a self-hosted agent that runs inside your own network.
@@ -36,7 +37,11 @@ and proving the whole pipeline with one command:
 alertint drill --config config.yaml
 ```
 
-For Kubernetes, install the official OCI Helm chart:
+For Kubernetes, install the official Helm chart. It is published as an OCI
+artifact on GHCR and listed on
+[Artifact Hub](https://artifacthub.io/packages/helm/alertint-agent/alertint-agent)
+under AlertINT as a verified publisher; every release is cosign-signed and
+ships a values schema:
 
 ```bash
 helm install my-alertint oci://ghcr.io/alertint/charts/alertint-agent \
@@ -46,8 +51,10 @@ helm install my-alertint oci://ghcr.io/alertint/charts/alertint-agent \
 ```
 
 For a production installation, manage the Secret outside Helm and use a
-reviewed values file; the [chart README](charts/alertint-agent/README.md)
-documents all supported modes.
+reviewed values file. The
+**[Kubernetes (Helm)](https://alertint.com/docs/getting-started/kubernetes)**
+guide covers that layout and signature verification; the
+[chart README](charts/alertint-agent/README.md) documents every value.
 
 The built-in incident drill plants a fake deploy, fires a burst of
 clearly-marked synthetic alerts through the production ingress, and polls

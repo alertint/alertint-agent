@@ -23,6 +23,9 @@ real alerts is the last step — the drill needs nothing but the agent.
 
 ## 1. Run the agent
 
+Running on Kubernetes? Install the Helm chart instead, then come back here
+for the drill: [Kubernetes (Helm)](kubernetes.md).
+
 ### Option A — Docker Compose
 
 The fastest first run: **AlertINT** plus Prometheus and Alertmanager,

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Docs: new [Kubernetes (Helm)](docs/getting-started/kubernetes.md) page
+  covering the Artifact Hub listing (verified publisher), signature
+  verification, the values schema and a production values layout; the
+  README and Quickstart point at it.
+
 ### Fixed
 
 - Coordinated releases now keep Helm README badge labels, chart tests, and
