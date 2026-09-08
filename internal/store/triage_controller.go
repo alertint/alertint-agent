@@ -399,11 +399,14 @@ func (s *Store) ClaimIncidentTriageAttempt(ctx context.Context, incidentID, owne
 	var attempts int
 	var situationID, groupKey, nextAtStr sql.NullString
 	var decisionInputVersion sql.NullInt64
+	var decidedMembershipDigest, decidedIncidentInputDigest sql.NullString
 	err = tx.QueryRowContext(ctx, `
-		SELECT t.phase, t.attempts, t.situation_id, t.decision_input_version, t.next_at, i.group_key
+		SELECT t.phase, t.attempts, t.situation_id, t.decision_input_version, t.next_at, i.group_key,
+		       t.membership_digest, t.incident_input_digest
 		FROM incident_triage t JOIN incidents i ON i.id = t.incident_id
 		WHERE t.incident_id = ? AND i.status = 'ready'`, incidentID).
-		Scan(&phase, &attempts, &situationID, &decisionInputVersion, &nextAtStr, &groupKey)
+		Scan(&phase, &attempts, &situationID, &decisionInputVersion, &nextAtStr, &groupKey,
+			&decidedMembershipDigest, &decidedIncidentInputDigest)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ClaimedTriageAttempt{}, ErrNotFound
 	}
@@ -427,6 +430,19 @@ func (s *Store) ClaimIncidentTriageAttempt(ctx context.Context, incidentID, owne
 	membership, inputDigest, err := incidentDigestsTx(ctx, tx, incidentID)
 	if err != nil {
 		return ClaimedTriageAttempt{}, err
+	}
+	// S2-05: the controller's own decision (applyRequestFromAwaitingDecisionTx
+	// / applyRefreshDecisionTx) froze membership_digest/incident_input_digest
+	// onto this row at decision time. If current membership no longer
+	// matches — a fresh alert joined or an existing one changed between that
+	// decision and this claim — that decision no longer authorizes today's
+	// inputs. Refuse the claim exactly like any other "nothing legitimately
+	// claimable right now" race (ErrNotFound): the controller's next
+	// reconciliation cycle re-decides against the changed material fact hash
+	// and refreshes this row: this must never silently re-stamp a stale
+	// decision with fresh digests and dispatch under it.
+	if decidedMembershipDigest.String != membership || decidedIncidentInputDigest.String != inputDigest {
+		return ClaimedTriageAttempt{}, ErrNotFound
 	}
 	memberDeliveryIDs, err := memberDeliveryIDsTx(ctx, tx, incidentID)
 	if err != nil {

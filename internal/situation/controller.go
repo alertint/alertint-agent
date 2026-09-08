@@ -717,14 +717,22 @@ func (c *Controller) resolveLifecycle(cur model.Situation, in SnapshotInput, sna
 		switch {
 		case firing:
 			return lifecycleResolution{Lifecycle: model.LifecycleActive}
+		case len(snap.Symptoms) > 0:
+			// S1-03: a known resolution (every currently-tracked symptom
+			// already resolved, not merely absent) must not be discarded in
+			// favor of the deadline-driven closed_unknown fallback just
+			// because the Situation itself has been open a long time —
+			// "known resolution does not become unknown from age". Checked
+			// ahead of pastDeadline so a genuinely observed all-clear always
+			// starts recovery confirmation, even past the observation
+			// deadline.
+			lc, _ := AdvanceLifecycle(cur.Lifecycle, EventRecoveryObserved)
+			graceUntil := RecoveryGraceUntil(now, in.Deliveries, c.cfg.WebhookRecoveryGrace, c.cfg.PollingIntervalSeconds)
+			return lifecycleResolution{Lifecycle: lc, RecoveryObservedAt: timePtr(now), GraceUntil: timePtr(graceUntil)}
 		case pastDeadline:
 			reason := ClosedUnknownReason(cur.EffectiveStartedAtBasis, resolved)
 			lc, _ := AdvanceLifecycle(cur.Lifecycle, EventLifecycleUnobservable)
 			return lifecycleResolution{Lifecycle: lc, TerminalAt: timePtr(now), TerminalReason: terminalReasonPtr(reason)}
-		case len(snap.Symptoms) > 0:
-			lc, _ := AdvanceLifecycle(cur.Lifecycle, EventRecoveryObserved)
-			graceUntil := RecoveryGraceUntil(now, in.Deliveries, c.cfg.WebhookRecoveryGrace, c.cfg.PollingIntervalSeconds)
-			return lifecycleResolution{Lifecycle: lc, RecoveryObservedAt: timePtr(now), GraceUntil: timePtr(graceUntil)}
 		default:
 			return lifecycleResolution{Lifecycle: model.LifecycleActive}
 		}
@@ -733,20 +741,25 @@ func (c *Controller) resolveLifecycle(cur model.Situation, in SnapshotInput, sna
 		case firing:
 			lc, _ := AdvanceLifecycle(cur.Lifecycle, EventRefired)
 			return lifecycleResolution{Lifecycle: lc}
-		case cur.GraceUntil != nil && !now.Before(*cur.GraceUntil):
-			lc, _ := AdvanceLifecycle(cur.Lifecycle, EventGraceExpired)
-			return lifecycleResolution{Lifecycle: lc, RecoveryObservedAt: cur.RecoveryObservedAt, GraceUntil: cur.GraceUntil, TerminalAt: timePtr(now)}
 		case pastDeadline:
-			// Finding C2 fix: cur.RecoveryObservedAt is already non-nil here
-			// (recovery_pending's own invariant) — migration 0014's recovery-
-			// field pairing CHECK is unconditional, so GraceUntil must be
-			// carried forward alongside it (cur.GraceUntil, the Situation's
-			// existing recorded grace deadline — mirroring the sibling
-			// grace-expiry branch above, which carries both fields for the
-			// same reason) or this commit fails closed against a real schema.
+			// S1-03: checked ahead of grace expiry — "grace expiry cannot
+			// recover without current authoritative all-clear". Grace can
+			// expire on the strength of a stale, undated all-clear if the
+			// SEPARATE, independent observation deadline has also elapsed
+			// with nothing newer than the original resolution; silence
+			// through that deadline must not be interpreted as sustained
+			// recovery. Finding C2 fix retained: cur.RecoveryObservedAt is
+			// already non-nil here (recovery_pending's own invariant) —
+			// migration 0014's recovery-field pairing CHECK is
+			// unconditional, so GraceUntil must be carried forward alongside
+			// it (cur.GraceUntil, the Situation's existing recorded grace
+			// deadline) or this commit fails closed against a real schema.
 			reason := ClosedUnknownReason(cur.EffectiveStartedAtBasis, resolved)
 			lc, _ := AdvanceLifecycle(cur.Lifecycle, EventLifecycleUnobservable)
 			return lifecycleResolution{Lifecycle: lc, RecoveryObservedAt: cur.RecoveryObservedAt, GraceUntil: cur.GraceUntil, TerminalAt: timePtr(now), TerminalReason: terminalReasonPtr(reason)}
+		case cur.GraceUntil != nil && !now.Before(*cur.GraceUntil):
+			lc, _ := AdvanceLifecycle(cur.Lifecycle, EventGraceExpired)
+			return lifecycleResolution{Lifecycle: lc, RecoveryObservedAt: cur.RecoveryObservedAt, GraceUntil: cur.GraceUntil, TerminalAt: timePtr(now)}
 		default:
 			return lifecycleResolution{Lifecycle: model.LifecycleRecoveryPending, RecoveryObservedAt: cur.RecoveryObservedAt, GraceUntil: cur.GraceUntil}
 		}

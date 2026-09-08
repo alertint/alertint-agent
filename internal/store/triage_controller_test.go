@@ -497,6 +497,67 @@ func TestClaimDueIncidentTriageSecondClaimFailsWhileInFlight(t *testing.T) {
 	}
 }
 
+// TestClaimDueIncidentTriageMembershipChangedSinceDecisionRefusesToClaim is
+// S2-05: "inputs change between decision and claim" (slide 2). The
+// controller decided "request" against the fixture's ORIGINAL one-delivery
+// membership (the membership_digest/incident_input_digest
+// applyRequestFromAwaitingDecisionTx froze onto the incident_triage row
+// itself). A second alert then joins the SAME incident before any worker
+// claims the row — changing what incidentDigestsTx would compute right now.
+// ClaimIncidentTriageAttempt must detect that its own decision-time digests
+// no longer match current membership and refuse to claim, rather than
+// silently re-stamping the attempt with today's digests under yesterday's
+// decision — changed membership/material input must never execute under
+// stale authorization.
+func TestClaimDueIncidentTriageMembershipChangedSinceDecisionRefusesToClaim(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "claim-stale-membership", now)
+	decideAndApplyRequest(t, st, f, now)
+	before := triageRow(t, st, f.IncidentID)
+
+	// A second alert joins the same incident after the decision was made.
+	dels, err := st.AcceptDeliveries(ctx, []DeliveryInput{deliveryFixture("delivery-claim-stale-membership-2", "fp-claim-stale-membership-2", now.Add(30*time.Second))})
+	if err != nil || len(dels) != 1 {
+		t.Fatalf("accept second delivery: %v (%d)", err, len(dels))
+	}
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO incident_alert_deliveries (incident_id, delivery_id, created_at) VALUES (?, ?, ?)`,
+		f.IncidentID, dels[0].ID, canonicalTime(now.Add(30*time.Second))); err != nil {
+		t.Fatalf("link second delivery: %v", err)
+	}
+	freshMembership, freshInput := digestsForTest(t, st, f.IncidentID)
+	if freshMembership == f.MembershipDigest && freshInput == f.IncidentInputDigest {
+		t.Fatal("fixture invariant: the second delivery must actually change at least one digest")
+	}
+
+	if _, err := st.ClaimIncidentTriageAttempt(ctx, f.IncidentID, "worker-1", now.Add(time.Minute), time.Minute); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("claim against a decision made stale by a membership change = %v, want ErrNotFound", err)
+	}
+
+	after := triageRow(t, st, f.IncidentID)
+	if after.Phase != "pending" || after.Attempts != 0 {
+		t.Fatalf("phase=%q attempts=%d after a refused claim, want pending/0 (untouched)", after.Phase, after.Attempts)
+	}
+	if after.CurrentAttemptID.Valid {
+		t.Fatalf("current_attempt_id = %v, want unset: a refused claim must never assign an attempt", after.CurrentAttemptID)
+	}
+	if after.MembershipDigest != before.MembershipDigest || after.IncidentInputDigest != before.IncidentInputDigest {
+		t.Fatalf("stored decision digests changed on a refused claim: before=%+v after=%+v", before, after)
+	}
+	if gotStatus := incidentStatus(t, st, f.IncidentID); gotStatus != "ready" {
+		t.Fatalf("incident status = %q, want ready (a refused claim must not mark it processing)", gotStatus)
+	}
+	var attemptCount int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM incident_triage_attempts WHERE incident_id = ?`, f.IncidentID).Scan(&attemptCount); err != nil {
+		t.Fatal(err)
+	}
+	if attemptCount != 0 {
+		t.Fatalf("incident_triage_attempts rows = %d, want 0 (a refused claim must never insert an attempt ledger row)", attemptCount)
+	}
+}
+
 // TestClaimDueIncidentTriageBackoffRowNotYetDueFailsWithErrTriageNotDue pins
 // the claim boundary's due-gate: a backoff row whose next_at has not
 // arrived is claimable-shaped (decided, pending/backoff phase) but must

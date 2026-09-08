@@ -826,6 +826,69 @@ func TestApplySituationInputArtifactAppliedAfterTerminalOwnerMarksOwnerTerminal(
 	}
 }
 
+// TestApplySituationInputLateNonArtifactAgainstTerminalOwnerNeverReopensLifecycle
+// is S1-01's admission guard for the NON-artifact kinds (a plain
+// membership/triage/resolution event, not operator_annotation_recorded or
+// captured_verdict_recorded): situationOwnerForIncidentTx's membership link
+// is immutable, so a late event for an Incident whose owner already
+// terminalized resolves right back to that SAME terminal owner and takes
+// the ordinary join path (isOperatorArtifactKind is false, so R2's
+// owner-terminal branch never triggers for it — deliberate per
+// isOperatorArtifactKind's doc comment). This does not claim the row is
+// wholly immutable (plan.md: "Do not claim the entire terminal database row
+// is immutable") — only the guard the slide actually requires: lifecycle
+// itself must never flip back to active/recovery_pending, no second
+// Situation is spuriously created for the same Incident, and the
+// terminalized owner never becomes claimable for reconciliation again.
+func TestApplySituationInputLateNonArtifactAgainstTerminalOwnerNeverReopensLifecycle(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 23, 0, 0, 0, time.UTC)
+
+	insertIncidentAndInput(t, st, "inc-late-nonartifact", "input-late-nonartifact-seed", "service=late-nonartifact", now)
+	seedClaim := claimOneInput(t, st, "w", now)
+	if err := st.ApplySituationInput(ctx, seedClaim); err != nil {
+		t.Fatalf("seed apply: %v", err)
+	}
+	sits := listSituations(t, st)
+	if len(sits) != 1 {
+		t.Fatalf("situations = %+v, want 1", sits)
+	}
+	situationID := sits[0].ID
+
+	terminalAt := now.Add(time.Hour)
+	if _, err := st.db.ExecContext(ctx, `
+		UPDATE situations SET lifecycle='closed_unknown', terminal_at=?, terminal_reason='resolution_missing', updated_at=?
+		WHERE id=?`, canonicalTime(terminalAt), canonicalTime(terminalAt), situationID); err != nil {
+		t.Fatalf("terminalize fixture situation: %v", err)
+	}
+
+	insertInputForExistingIncident(t, st, "inc-late-nonartifact", "input-late-nonartifact", "service=late-nonartifact", "triage_skipped", now.Add(2*time.Hour))
+	lateClaim := claimOneInput(t, st, "w", now.Add(2*time.Hour))
+	if err := st.ApplySituationInput(ctx, lateClaim); err != nil {
+		t.Fatalf("apply late non-artifact input against terminal owner: %v", err)
+	}
+
+	all := listSituations(t, st)
+	if len(all) != 1 {
+		t.Fatalf("situations = %+v, want still exactly 1 (no spurious new Situation for an Incident already attached)", all)
+	}
+	after := getSituationByID(t, st, situationID)
+	if after.Lifecycle != situationmodel.LifecycleClosedUnknown {
+		t.Fatalf("lifecycle = %s, want closed_unknown (terminal must never reopen on a late non-artifact event)", after.Lifecycle)
+	}
+
+	due, err := st.ClaimDueSituations(ctx, "controller-x", now.Add(3*time.Hour), time.Minute, 10)
+	if err != nil {
+		t.Fatalf("claim due situations: %v", err)
+	}
+	for _, d := range due {
+		if d.ID == situationID {
+			t.Fatalf("ClaimDueSituations returned terminalized situation %s after a late non-artifact input", situationID)
+		}
+	}
+}
+
 // TestApplySituationInputArtifactActiveOwnerReplayIsNoOp proves idempotent
 // replay of the R1 active-owner path: re-applying an already-applied
 // artifact claim changes nothing.

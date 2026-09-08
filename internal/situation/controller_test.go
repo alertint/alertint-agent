@@ -1514,6 +1514,14 @@ func TestControllerReconcileLifecycleDeadlineDuringRecoveryReachesClosedUnknownW
 // recovery ever observed — proving RecoveryObservedAt/GraceUntil correctly
 // stay nil (never fabricated) when the Situation never entered recovery at
 // all, alongside the C2 test above's carried-forward-non-nil case.
+//
+// S1-03 fix: the fixture must carry zero deliveries (no symptom at all), not
+// a resolved one — a genuinely observed all-clear is itself a recovery
+// signal (deriveSymptoms/AnyFiring), so resolveLifecycle now honors it ahead
+// of the deadline fallback ("known resolution does not become unknown from
+// age") and would instead reach recovery_pending. The previous fixture
+// supplied a resolved delivery while its own comment claimed "no recovery
+// ever observed" — exactly the priority bug S1-03 fixes.
 func TestControllerReconcileLifecycleActiveReachesClosedUnknownWithoutRecoveryFields(t *testing.T) {
 	effectiveStartedAt := ctBaseTime
 	now := effectiveStartedAt.Add(7*24*time.Hour + time.Minute) // just past the "long" class's 7-day deadline.
@@ -1523,7 +1531,7 @@ func TestControllerReconcileLifecycleActiveReachesClosedUnknownWithoutRecoveryFi
 	in.Situation.EffectiveStartedAt = effectiveStartedAt
 	in.Situation.EffectiveStartedAtBasis = model.SourceTimeBasisSourcePayload
 	in.Situation.Lifecycle = model.LifecycleActive
-	in.Deliveries = []situation.Delivery{ctDelivery("delivery-1", "incident-1", false, "warning")} // resolved, not firing, never recovered through the controller.
+	in.Deliveries = nil // no delivery ever received for this Situation: no recovery, no firing, no symptom at all.
 
 	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
 	c := ctLifecycleController(store, &fakeAssessmentClient{}, now)
@@ -1540,6 +1548,44 @@ func TestControllerReconcileLifecycleActiveReachesClosedUnknownWithoutRecoveryFi
 	}
 	if commit.TerminalAt == nil || commit.TerminalReason == nil {
 		t.Fatalf("closed_unknown must carry both terminal fields set, got TerminalAt=%v TerminalReason=%v", commit.TerminalAt, commit.TerminalReason)
+	}
+}
+
+// TestControllerReconcileExhaustedAssessmentDoesNotAlterLifecycleTransition
+// is S1-02's positive control: "LLM failure or budget exhaustion is
+// insufficient" to affect source lifecycle (slide 1 edge loss-a). This
+// drives Reconcile through the SAME steady-state "already exhausted, no
+// re-touch" path as TestControllerReconcileFiveWorkAttemptsExhaustedParksWithoutDispatch,
+// but with a resolved (not firing) delivery — resolveLifecycle's signature
+// (cur, in, snap, now) never receives Assessment/L2 state at all, so an
+// exhausted L2 must neither manufacture source recovery/closure nor block
+// the genuine recovery_pending transition a resolved delivery earns.
+func TestControllerReconcileExhaustedAssessmentDoesNotAlterLifecycleTransition(t *testing.T) {
+	in := ctBaseSnapshotInput()
+	in.Deliveries = []situation.Delivery{ctDelivery("delivery-1", "incident-1", false, "warning")} // resolved, not firing.
+	in.ControllerParked = situation.ControllerParkedState{
+		At: &ctBaseTime, Reason: situation.ParkedReasonDependency,
+		MaterialFactHash: situation.BuildSnapshot(in).MaterialFactHash,
+	}
+	store := &fakeControllerStore{loadInput: in, beginErr: situation.ErrControllerAttemptsExhausted}
+	client := &fakeAssessmentClient{}
+	c := ctController(t, store, client)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if client.calls != 0 {
+		t.Fatalf("CompleteOnce calls = %d, want 0 (exhausted must never dispatch)", client.calls)
+	}
+	if len(store.commits) != 1 {
+		t.Fatalf("commits = %d, want 1", len(store.commits))
+	}
+	commit := store.commits[0]
+	if commit.Lifecycle != model.LifecycleRecoveryPending {
+		t.Fatalf("lifecycle = %q, want recovery_pending: an exhausted L2 must not suppress a genuine source recovery observation", commit.Lifecycle)
+	}
+	if commit.RecoveryObservedAt == nil || commit.GraceUntil == nil {
+		t.Fatalf("recovery_pending must carry recovery_observed_at and grace_until, got %+v", commit)
 	}
 }
 
