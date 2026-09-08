@@ -89,7 +89,10 @@ Use this for a chart template, values, or chart documentation change that does
 not require a new application build.
 
 1. Add the change under `[Unreleased]` in
-   `charts/alertint-agent/CHANGELOG.md`.
+   `charts/alertint-agent/CHANGELOG.md`, and replace the
+   `artifacthub.io/changes` annotation in `charts/alertint-agent/Chart.yaml`
+   with a one-line-per-change summary of the release (Artifact Hub renders
+   it on the package page; it is not derived from the changelog).
 2. Pick the next chart SemVer and run:
 
    ```bash

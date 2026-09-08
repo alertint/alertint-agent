@@ -76,7 +76,7 @@ single-writer assumption.
 
 | Name | Email | Url |
 | ---- | ------ | --- |
-| AlertINT maintainers |  | <https://github.com/alertint/alertint-agent> |
+| AlertINT maintainers | <ernests@alertint.com> | <https://github.com/alertint/alertint-agent> |
 
 ## Source Code
 

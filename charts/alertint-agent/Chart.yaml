@@ -4,6 +4,7 @@ description: AI-powered alert-triage agent that correlates Alertmanager/Zabbix a
 type: application
 version: 0.2.0
 appVersion: "0.13.8"
+icon: https://raw.githubusercontent.com/alertint/alertint-agent/main/docs/assets/alertint-logo.svg
 home: https://alertint.com
 sources:
   - https://github.com/alertint/alertint-agent
@@ -14,4 +15,30 @@ keywords:
   - llm
 maintainers:
   - name: AlertINT maintainers
+    email: ernests@alertint.com
     url: https://github.com/alertint/alertint-agent
+# Artifact Hub listing metadata. Keep artifacthub.io/images in sync with
+# appVersion (scripts/chart-release-prep.sh rewrites it; the release
+# workflow's validate step refuses a mismatch) and roll
+# artifacthub.io/changes for every chart release (see RELEASING.md).
+# Reference: https://artifacthub.io/docs/topics/annotations/helm/
+annotations:
+  artifacthub.io/license: FSL-1.1-ALv2
+  artifacthub.io/category: monitoring-logging
+  artifacthub.io/images: |
+    - name: alertint-agent
+      image: ghcr.io/alertint/alertint-agent:v0.13.8
+  artifacthub.io/links: |
+    - name: Documentation
+      url: https://alertint.com/docs/
+    - name: Chart changelog
+      url: https://github.com/alertint/alertint-agent/blob/main/charts/alertint-agent/CHANGELOG.md
+    - name: Releasing
+      url: https://github.com/alertint/alertint-agent/blob/main/RELEASING.md
+  artifacthub.io/changes: |
+    - kind: added
+      description: values.schema.json validates values on install, upgrade, lint and template
+    - kind: added
+      description: Artifact Hub listing metadata (icon, license, container image, links, category)
+    - kind: added
+      description: Chart releases are signed with cosign (keyless, GitHub Actions OIDC)

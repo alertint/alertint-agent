@@ -103,9 +103,16 @@ awk -v version="$chart_version" -v date="$today" '
   { print }
 ' "$pending_changelog" > "$tmp_dir/CHANGELOG.md"
 
+# The artifacthub.io/images annotation must reference the same application
+# image as appVersion, so it is rewritten together with it.
 awk -v chart_version="$chart_version" -v app_version="$effective_app_version" '
   /^version:/    { print "version: " chart_version; next }
   /^appVersion:/ { print "appVersion: \"" app_version "\""; next }
+  /^ *image: ghcr\.io\/alertint\/alertint-agent:v/ {
+    sub(/alertint-agent:v[^ ]*$/, "alertint-agent:v" app_version)
+    print
+    next
+  }
   { print }
 ' "$chart_yaml" > "$tmp_dir/Chart.yaml"
 
@@ -127,6 +134,8 @@ grep -Fq "version: $chart_version" "$tmp_dir/Chart.yaml" \
   || fail "failed to update chart version in $chart_yaml"
 grep -Fq "appVersion: \"$effective_app_version\"" "$tmp_dir/Chart.yaml" \
   || fail "failed to update appVersion in $chart_yaml"
+grep -Fq "image: ghcr.io/alertint/alertint-agent:v$effective_app_version" "$tmp_dir/Chart.yaml" \
+  || fail "failed to update artifacthub.io/images annotation in $chart_yaml"
 grep -Fq "![Version: $chart_version]" "$tmp_dir/README.md" \
   || fail "failed to update chart version badge label in $readme"
 grep -Fq "Version-$chart_version-informational" "$tmp_dir/README.md" \

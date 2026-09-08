@@ -44,6 +44,14 @@ printf '%s' "$app_version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' \
 git rev-parse -q --verify "refs/tags/v$app_version" >/dev/null \
   || fail "referenced application tag v$app_version does not exist"
 
+# The Artifact Hub images annotation drives the listing's security scan and
+# image links; it must point at the image appVersion selects.
+images_version="$(sed -n 's/^ *image: ghcr\.io\/alertint\/alertint-agent:v\([^ ]*\)$/\1/p' "$chart_yaml")"
+[ -n "$images_version" ] \
+  || fail "artifacthub.io/images annotation in $chart_yaml does not reference ghcr.io/alertint/alertint-agent"
+[ "$images_version" = "$app_version" ] \
+  || fail "artifacthub.io/images annotation references v$images_version but appVersion is $app_version"
+
 ./scripts/release-notes.sh "$chart_version" charts/alertint-agent/CHANGELOG.md >/dev/null \
   || fail "chart changelog has no release notes for $chart_version"
 
