@@ -719,6 +719,100 @@ func TestCompleteIncidentTriageAttemptSuccessPersistsFindingAndClosesSchedule(t 
 	}
 }
 
+// TestCompleteIncidentTriageAttemptOwnerTerminalizedDuringExecutionNeverPromotesFinding
+// is R3's repair regression (lead review 2026-09-08, S2-06): the claim-time
+// terminal-owner guard (TestClaimDueIncidentTriageAgainstTerminalOwnerRefusesToClaim)
+// only fences closure BEFORE claim. Before this fix, an attempt claimed
+// while its owner was still open, whose owner then terminalized WHILE the
+// attempt was in flight, still completed as an ordinary success once it
+// finished: the closed Situation's Incident was promoted to "analyzed" with
+// current output, and a finding_persisted input was appended against the
+// closed owner (the lead's own TestLeadB1CompletionAfterOwnerClosure
+// reproduced outcome=success incident=analyzed finding_inputs=1). The fix
+// checks the owner's CURRENT lifecycle at completion time too: a terminal
+// owner settles the schedule to 'exhausted' (S2-04's mechanism) with the
+// produced content preserved only as attempt-ledger audit evidence — never
+// promoted to a current Finding, never overwriting the Incident's current
+// output, and the terminal owner itself stays closed and unreopened.
+func TestCompleteIncidentTriageAttemptOwnerTerminalizedDuringExecutionNeverPromotesFinding(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "owner-terminal-during-execution", now)
+	claim := mustClaim(t, st, f, now)
+
+	terminalAt := now.Add(5 * time.Second)
+	if _, err := st.db.ExecContext(ctx, `
+		UPDATE situations SET lifecycle='closed_unknown', terminal_at=?, terminal_reason='resolution_missing', updated_at=?
+		WHERE id=?`, canonicalTime(terminalAt), canonicalTime(terminalAt), f.SituationID); err != nil {
+		t.Fatalf("terminalize fixture situation mid-flight: %v", err)
+	}
+
+	result, err := st.CompleteIncidentTriageAttempt(ctx, claim.AttemptID, f.IncidentID, sampleFinding(), now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("complete after owner closure: %v", err)
+	}
+	if result.Outcome != TriageCompletionOwnerTerminal {
+		t.Fatalf("Outcome = %q, want owner_terminal", result.Outcome)
+	}
+	if result.FindingID != "" {
+		t.Fatalf("FindingID = %q, want empty — an owner-terminal completion promotes no Finding", result.FindingID)
+	}
+
+	if got := incidentStatus(t, st, f.IncidentID); got != "failed" {
+		t.Fatalf("incident status = %q, want failed (never promoted to analyzed against a closed owner)", got)
+	}
+	inc, err := st.GetIncidentByID(ctx, f.IncidentID)
+	if err != nil || inc == nil {
+		t.Fatalf("get incident: %v", err)
+	}
+	if inc.OutputJSON != "" || inc.LastJudgedAt != nil {
+		t.Fatalf("incident output/last_judged_at were set from a non-promoted attempt: output=%q last_judged_at=%v", inc.OutputJSON, inc.LastJudgedAt)
+	}
+	if n := countSituationInputs(t, st, f.IncidentID, "finding_persisted"); n != 0 {
+		t.Fatalf("finding_persisted inputs = %d, want 0 (never persisted against a closed owner)", n)
+	}
+
+	tr := triageRow(t, st, f.IncidentID)
+	if tr.Phase != "exhausted" {
+		t.Fatalf("phase = %q, want exhausted (settled, not left claimable-looking)", tr.Phase)
+	}
+	due, err := st.ListDueIncidentTriage(ctx, now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range due {
+		if d.IncidentID == f.IncidentID {
+			t.Fatalf("incident reported due after an owner-terminal completion: phase=%s", d.Phase)
+		}
+	}
+
+	var count int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM incident_triage_attempts WHERE id = ?`, claim.AttemptID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("incident_triage_attempts rows for the completed attempt = %d, want 1 (audit evidence retained)", count)
+	}
+	var situationLifecycle string
+	if err := st.db.QueryRowContext(ctx, `SELECT lifecycle FROM situations WHERE id = ?`, f.SituationID).Scan(&situationLifecycle); err != nil {
+		t.Fatal(err)
+	}
+	if situationLifecycle != "closed_unknown" {
+		t.Fatalf("situation lifecycle = %q, want closed_unknown (never reopened by a late completion)", situationLifecycle)
+	}
+
+	// Idempotent replay with the SAME finding content returns the same
+	// committed owner_terminal outcome rather than erroring or re-promoting.
+	replay, err := st.CompleteIncidentTriageAttempt(ctx, claim.AttemptID, f.IncidentID, sampleFinding(), now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("idempotent replay: %v", err)
+	}
+	if replay.Outcome != TriageCompletionOwnerTerminal || replay.OutputDigest != result.OutputDigest {
+		t.Fatalf("replay = %+v, want the same committed owner_terminal result %+v", replay, result)
+	}
+}
+
 func TestCompleteIncidentTriageAttemptSuccessIdempotentReplayReturnsCommittedResult(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
@@ -859,21 +953,25 @@ func TestCompleteIncidentTriageAttemptStaleIncidentInputRestoresAwaitingDecision
 	}
 }
 
-// TestCompleteIncidentTriageAttemptFinalAttemptStaleThenRenewedDecisionStaysBounded
-// is S2-04: "Exercise the final allowed attempt becoming stale, renewed
-// decision... Verify bounded attempt accounting and no stranded runnable
-// schedule from a constraint failure. This sequence is a risk to
-// investigate, not a previously proven runaway bug" (plan.md). A stale
-// completion (unlike a failure) does not go through
+// TestCompleteIncidentTriageAttemptFinalAttemptStaleSettlesExhaustedNotAwaitingDecision
+// is R2's repair regression (lead review 2026-09-08, S2-04): a stale
+// completion (unlike a failure) used to go through none of
 // BackoffIncidentTriageAttempt/ExhaustIncidentTriageAttempt's own
-// attempts>=MaxAttempts ceiling (triage_worker.go) at all —
-// completeStaleTx unconditionally restores awaiting_decision regardless of
-// how many attempts remain. If the row's FIFTH (final, migration 0016's own
-// attempts<=5 CHECK) attempt completes stale and the controller then
-// renews its decision (a fresh "request"), the exact same schedule is one
-// claim away from a sixth attempt — verify that claim is refused cleanly,
-// not left to fail on a raw SQL CHECK-constraint violation.
-func TestCompleteIncidentTriageAttemptFinalAttemptStaleThenRenewedDecisionStaysBounded(t *testing.T) {
+// attempts>=MaxAttempts machinery at all — completeStaleTx unconditionally
+// restored awaiting_decision regardless of how many attempts remained. When
+// the row's FIFTH (final, migration 0016's own attempts<=5 CHECK) attempt
+// completed stale, the schedule went back to awaiting_decision/pending
+// forever: every renewed controller decision, every worker tick, and every
+// restart rediscovered a "due" row that the ceiling guard could only ever
+// refuse at claim time — stranded work, not bounded work (the lead's own
+// TestLeadB1FinalStaleAttemptMustSettle reproduced this across three ticks
+// and a restart). The fix settles the schedule directly to the same
+// terminal 'exhausted' phase / Incident 'failed' status / triage_exhausted
+// input ExhaustIncidentTriageAttempt already uses for an ordinary exhausted
+// failure — this test verifies the schedule is durably settled (no due row,
+// no reopened awaiting_decision, no refunded attempt, no sixth attempt ever
+// claimable) rather than merely that a sixth claim fails.
+func TestCompleteIncidentTriageAttemptFinalAttemptStaleSettlesExhaustedNotAwaitingDecision(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
 	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
@@ -917,29 +1015,60 @@ func TestCompleteIncidentTriageAttemptFinalAttemptStaleThenRenewedDecisionStaysB
 	if result.Outcome != TriageCompletionStaleMembership {
 		t.Fatalf("Outcome = %q, want stale_membership", result.Outcome)
 	}
+
+	// R2 repair: the FINAL attempt going stale settles the schedule directly
+	// to 'exhausted' — never back to awaiting_decision/pending, which is
+	// exactly the state that used to strand a permanently-due, permanently-
+	// refused row.
 	tr := triageRow(t, st, f.IncidentID)
-	if tr.Phase != "awaiting_decision" || tr.Attempts != 5 {
-		t.Fatalf("phase=%q attempts=%d after the final attempt goes stale, want awaiting_decision/5 (consumed, not refunded)", tr.Phase, tr.Attempts)
+	if tr.Phase != "exhausted" || tr.Attempts != 5 {
+		t.Fatalf("phase=%q attempts=%d after the final attempt goes stale, want exhausted/5 (settled, not reopened, not refunded)", tr.Phase, tr.Attempts)
+	}
+	if got := incidentStatus(t, st, f.IncidentID); got != "failed" {
+		t.Fatalf("incident status = %q, want failed (matches ExhaustIncidentTriageAttempt's own terminal projection)", got)
+	}
+	if n := countSituationInputs(t, st, f.IncidentID, "triage_exhausted"); n != 1 {
+		t.Fatalf("triage_exhausted situation inputs = %d, want 1 (the controller's existing 'analysis ended' work feedback)", n)
+	}
+	// The claim itself already appended one triage_retry_changed input
+	// (":begin", unrelated to completion) — completeStaleTx's own ":stale"
+	// triage_retry_changed append must NOT additionally fire once the row
+	// settles exhausted instead.
+	if n := countSituationInputs(t, st, f.IncidentID, "triage_retry_changed"); n != 1 {
+		t.Fatalf("triage_retry_changed situation inputs = %d, want 1 (only the claim's own ':begin' input — a settled final attempt is not itself a retry signal)", n)
 	}
 
-	// The controller renews its decision against the now-current inputs —
-	// applyRequestFromAwaitingDecisionTx itself carries no attempts ceiling
-	// (that bound lives in triage_worker.go's failure-completion path, which
-	// a stale completion never goes through).
+	// No due row survives — repeated ticks must never rediscover this
+	// incident as claimable work (the lead's own TestLeadB1FinalStaleAttemptMustSettle
+	// reproduced exactly this across three ticks and a restart).
+	for i, tick := range []time.Time{now.Add(2 * time.Minute), now.Add(10 * time.Minute), now.Add(time.Hour)} {
+		due, err := st.ListDueIncidentTriage(ctx, tick)
+		if err != nil {
+			t.Fatalf("tick %d: list due incident triage: %v", i, err)
+		}
+		for _, d := range due {
+			if d.IncidentID == f.IncidentID {
+				t.Fatalf("tick %d: incident %s still reported due (phase=%q) after settling exhausted — stranded work", i, f.IncidentID, d.Phase)
+			}
+		}
+	}
+
+	// A renewed controller decision against the now-exhausted row is
+	// silently dropped (applyOneTriageDecisionTx's default case) — it must
+	// never reopen the settled schedule.
 	freshMembership, freshInput := digestsForTest(t, st, f.IncidentID)
 	renewed := requestDecisionFor(f, "membership_changed", now.Add(2*time.Minute))
 	renewed.MembershipDigest, renewed.IncidentInputDigest = freshMembership, freshInput
 	applyDecisionsTx(t, st, []situation.TriageDecision{renewed}, now.Add(2*time.Minute))
-	if got := triageRow(t, st, f.IncidentID); got.Phase != "pending" {
-		t.Fatalf("phase after renewed decision = %q, want pending (fixture invariant)", got.Phase)
+	if got := triageRow(t, st, f.IncidentID); got.Phase != "exhausted" {
+		t.Fatalf("phase after a renewed decision against an exhausted row = %q, want exhausted (unchanged — no refund/reopen)", got.Phase)
 	}
 
-	// The sixth claim must fail cleanly (a typed sentinel from a bounded
-	// check), never as a raw SQL CHECK-constraint violation surfacing out of
-	// ClaimIncidentTriageAttempt.
+	// A sixth claim must still fail cleanly — now because the phase itself
+	// is no longer pending/backoff, not merely because of the ceiling guard.
 	_, claimErr := st.ClaimIncidentTriageAttempt(ctx, f.IncidentID, "worker-2", now.Add(3*time.Minute), time.Minute)
 	if claimErr == nil {
-		t.Fatal("a sixth claim succeeded — the bounded five-attempt schedule was not preserved across a stale-then-renewed final attempt")
+		t.Fatal("a sixth claim succeeded — the bounded five-attempt schedule was not preserved after the final attempt settled exhausted")
 	}
 	if !errors.Is(claimErr, ErrNotFound) && !errors.Is(claimErr, ErrTriageNotDecided) {
 		t.Fatalf("sixth claim failed with %v, want a typed sentinel (ErrNotFound/ErrTriageNotDecided), not a raw constraint error surfacing to the caller", claimErr)

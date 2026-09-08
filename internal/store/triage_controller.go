@@ -604,6 +604,16 @@ const (
 	TriageCompletionSuccess            TriageCompletionOutcome = "success"
 	TriageCompletionStaleMembership    TriageCompletionOutcome = "stale_membership"
 	TriageCompletionStaleIncidentInput TriageCompletionOutcome = "stale_incident_input"
+	// TriageCompletionOwnerTerminal is S2-06/R3's completion-side fence: the
+	// owning Situation terminalized after this attempt was claimed but
+	// before it completed. The claim-time guard in ClaimIncidentTriageAttempt
+	// only covers closure BEFORE claim; this covers closure DURING
+	// execution. Symmetric with the stale outcomes above — the decision
+	// that authorized this attempt no longer holds, this time because its
+	// owner authority itself ended, not because membership/input changed —
+	// so the produced content is preserved as attempt-ledger audit evidence
+	// only, never promoted to a current Finding or Incident output.
+	TriageCompletionOwnerTerminal TriageCompletionOutcome = "owner_terminal"
 )
 
 // TriageCompletionResult is CompleteIncidentTriageAttempt's committed (or,
@@ -642,6 +652,8 @@ type staleAttemptOutputDTO struct {
 // CompleteIncidentTriageAttempt reads it inside its own transaction.
 type triageAttemptRow struct {
 	incidentID                            string
+	attemptNumber                         int
+	situationID                           string
 	membershipDigest, incidentInputDigest string
 	resultCode, outputDigest, findingID   sql.NullString
 	evidencePackDigest                    sql.NullString
@@ -652,10 +664,10 @@ func readTriageAttemptTx(ctx context.Context, tx *sql.Tx, attemptID string) (tri
 	var r triageAttemptRow
 	var completedAt sql.NullString
 	err := tx.QueryRowContext(ctx, `
-		SELECT incident_id, membership_digest, incident_input_digest,
+		SELECT incident_id, attempt_number, situation_id, membership_digest, incident_input_digest,
 		       result_code, output_digest, finding_id, evidence_pack_digest, completed_at
 		FROM incident_triage_attempts WHERE id = ?`, attemptID).Scan(
-		&r.incidentID, &r.membershipDigest, &r.incidentInputDigest,
+		&r.incidentID, &r.attemptNumber, &r.situationID, &r.membershipDigest, &r.incidentInputDigest,
 		&r.resultCode, &r.outputDigest, &r.findingID, &r.evidencePackDigest, &completedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return triageAttemptRow{}, ErrNotFound
@@ -713,15 +725,30 @@ func (s *Store) CompleteIncidentTriageAttempt(ctx context.Context, attemptID, in
 		return TriageCompletionResult{}, err
 	}
 
+	// S2-06 (R3 repair): the claim-time guard in ClaimIncidentTriageAttempt
+	// only fences closure BEFORE claim — it cannot see a Situation that
+	// terminalizes AFTER this attempt was claimed but WHILE it is still in
+	// flight. Check the owner's CURRENT lifecycle here too, ahead of the
+	// digest-staleness checks below: a closed owner must never receive a
+	// current Finding or Incident-output promotion regardless of whether
+	// membership/input happen to still match.
+	var ownerLifecycle string
+	if err := tx.QueryRowContext(ctx, `SELECT lifecycle FROM situations WHERE id = ?`, attempt.situationID).Scan(&ownerLifecycle); err != nil {
+		return TriageCompletionResult{}, fmt.Errorf("store: read owner situation lifecycle for completion: %w", err)
+	}
+	if situationmodel.Lifecycle(ownerLifecycle).Terminal() {
+		return completeOwnerTerminalTx(ctx, tx, attemptID, incidentID, finding, now)
+	}
+
 	switch {
 	case currentMembership != attempt.membershipDigest:
-		return completeStaleTx(ctx, tx, attemptID, incidentID, TriageCompletionStaleMembership,
+		return completeStaleTx(ctx, tx, attemptID, incidentID, attempt.attemptNumber, TriageCompletionStaleMembership,
 			staleAttemptOutputDTO{
 				FrozenMembershipDigest: attempt.membershipDigest, CurrentMembershipDigest: currentMembership,
 				FrozenIncidentInputDigest: attempt.incidentInputDigest, CurrentIncidentInputDigest: currentInputDigest,
 			}, now)
 	case currentInputDigest != attempt.incidentInputDigest:
-		return completeStaleTx(ctx, tx, attemptID, incidentID, TriageCompletionStaleIncidentInput,
+		return completeStaleTx(ctx, tx, attemptID, incidentID, attempt.attemptNumber, TriageCompletionStaleIncidentInput,
 			staleAttemptOutputDTO{
 				FrozenMembershipDigest: attempt.membershipDigest, CurrentMembershipDigest: currentMembership,
 				FrozenIncidentInputDigest: attempt.incidentInputDigest, CurrentIncidentInputDigest: currentInputDigest,
@@ -763,6 +790,20 @@ func idempotentReplayResult(attempt triageAttemptRow, finding TriageFinding) (Tr
 			outputDigest = attempt.outputDigest.String
 		}
 		return TriageCompletionResult{Outcome: TriageCompletionOutcome(code), OutputDigest: outputDigest}, true
+	case string(TriageCompletionOwnerTerminal):
+		// Real content WAS produced (unlike the stale outcomes above), so
+		// replay verifies it against the same recorded digest success uses —
+		// a byte-identical replay is idempotent; different content still
+		// fails closed via ErrTriageAttemptCompletedDifferently below.
+		wantDigest := findingOutputDigest(finding)
+		gotDigest := ""
+		if attempt.outputDigest.Valid {
+			gotDigest = attempt.outputDigest.String
+		}
+		if gotDigest != wantDigest {
+			return TriageCompletionResult{}, false
+		}
+		return TriageCompletionResult{Outcome: TriageCompletionOwnerTerminal, OutputDigest: gotDigest}, true
 	default:
 		return TriageCompletionResult{}, false
 	}
@@ -822,7 +863,38 @@ func completeSuccessTx(ctx context.Context, tx *sql.Tx, attemptID, incidentID st
 	return TriageCompletionResult{Outcome: TriageCompletionSuccess, FindingID: findingID, OutputDigest: outputDigest}, nil
 }
 
-func completeStaleTx(ctx context.Context, tx *sql.Tx, attemptID, incidentID string, outcome TriageCompletionOutcome, dto staleAttemptOutputDTO, now time.Time) (TriageCompletionResult, error) {
+// completeOwnerTerminalTx is S2-06's (R3) completion-side fence: the owning
+// Situation terminalized after this attempt was claimed but before it
+// completed. finding's real content is preserved on the attempt ledger row
+// as audit evidence (its digest, exactly like a genuine success) but is
+// never promoted — no finding_id, no Incident output/status overwrite, no
+// finding_persisted input against the now-closed owner. The schedule
+// settles directly to 'exhausted' (reusing completeExhaustedStaleTx, S2-04's
+// R2 mechanism) rather than awaiting_decision: a terminal owner can never
+// become claimable again (ClaimIncidentTriageAttempt's own S2-06 claim-time
+// guard refuses it permanently), so bouncing through awaiting_decision/
+// pending here would only manufacture the exact "stranded due row" R2
+// already fixed for the final-attempt case — this owner-terminal case is
+// terminal for the SAME reason regardless of which attempt number it is.
+func completeOwnerTerminalTx(ctx context.Context, tx *sql.Tx, attemptID, incidentID string, finding TriageFinding, now time.Time) (TriageCompletionResult, error) {
+	outputDigest := findingOutputDigest(finding)
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE incident_triage_attempts
+		SET result_code = ?, output_digest = ?, evidence_pack_digest = ?, completed_at = ?
+		WHERE id = ? AND completed_at IS NULL`,
+		string(TriageCompletionOwnerTerminal), outputDigest, finding.EvidencePackDigest, canonicalTime(now), attemptID)
+	if err != nil {
+		return TriageCompletionResult{}, fmt.Errorf("store: complete incident triage attempt owner terminal: %w", err)
+	}
+	if err := requireOneRow(res, "store: complete incident triage attempt owner terminal", ErrTriageAttemptLeaseLost); err != nil {
+		return TriageCompletionResult{}, err
+	}
+
+	return completeExhaustedStaleTx(ctx, tx, attemptID, incidentID, TriageCompletionOwnerTerminal, outputDigest, now)
+}
+
+func completeStaleTx(ctx context.Context, tx *sql.Tx, attemptID, incidentID string, attemptNumber int, outcome TriageCompletionOutcome, dto staleAttemptOutputDTO, now time.Time) (TriageCompletionResult, error) {
 	outputDigest := canonicalDigest(dto)
 
 	res, err := tx.ExecContext(ctx, `
@@ -835,6 +907,20 @@ func completeStaleTx(ctx context.Context, tx *sql.Tx, attemptID, incidentID stri
 	}
 	if err := requireOneRow(res, "store: complete incident triage attempt stale", ErrTriageAttemptLeaseLost); err != nil {
 		return TriageCompletionResult{}, err
+	}
+
+	// S2-04 (R2 repair): a stale completion of the FINAL bounded attempt must
+	// durably settle the schedule exactly like an ordinary exhausted failure
+	// (ExhaustIncidentTriageAttempt), not restore awaiting_decision — a
+	// renewed decision against an already-spent final attempt would only
+	// ever refuse at claim time (the ceiling guard in
+	// ClaimIncidentTriageAttempt), leaving a due, claimable-looking row that
+	// every subsequent tick, restart, and renewed decision re-discovers and
+	// re-refuses forever: stranded work, not bounded work. "Stale" and
+	// "exhausted" both mean this attempt slot is spent with no Finding; the
+	// FINAL slot going stale is exhaustion, not a retryable race.
+	if attemptNumber >= maxIncidentTriageAttempts {
+		return completeExhaustedStaleTx(ctx, tx, attemptID, incidentID, outcome, outputDigest, now)
 	}
 
 	res2, err := tx.ExecContext(ctx, `
@@ -871,6 +957,54 @@ func completeStaleTx(ctx context.Context, tx *sql.Tx, attemptID, incidentID stri
 
 	if err := tx.Commit(); err != nil {
 		return TriageCompletionResult{}, fmt.Errorf("store: commit complete incident triage attempt stale: %w", err)
+	}
+	return TriageCompletionResult{Outcome: outcome, OutputDigest: outputDigest}, nil
+}
+
+// completeExhaustedStaleTx is completeStaleTx's S2-04 branch for a stale
+// completion of the final bounded attempt: it settles incident_triage to
+// the same terminal 'exhausted' phase and Incident 'failed' status
+// ExhaustIncidentTriageAttempt uses for an ordinary exhausted failure, and
+// appends the same triage_exhausted input — the controller's existing
+// "analysis ended" work feedback — rather than triage_retry_changed's
+// "something changed, try again" signal, since no attempt slot remains to
+// retry with.
+func completeExhaustedStaleTx(ctx context.Context, tx *sql.Tx, attemptID, incidentID string, outcome TriageCompletionOutcome, outputDigest string, now time.Time) (TriageCompletionResult, error) {
+	res, err := tx.ExecContext(ctx, `
+		UPDATE incident_triage
+		SET phase = 'exhausted', next_at = NULL, last_error_code = ?, last_error_detail = ?,
+		    lease_owner = NULL, lease_expires_at = NULL, current_attempt_id = NULL, updated_at = ?
+		WHERE incident_id = ? AND phase = 'in_flight' AND current_attempt_id = ?`,
+		string(outcome), "final bounded attempt completed stale: no attempt slot remains to retry with",
+		canonicalTime(now), incidentID, attemptID)
+	if err != nil {
+		return TriageCompletionResult{}, fmt.Errorf("store: exhaust incident triage schedule after stale final attempt: %w", err)
+	}
+	if err := requireOneRow(res, "store: exhaust incident triage schedule after stale final attempt", ErrTriageAttemptLeaseLost); err != nil {
+		return TriageCompletionResult{}, err
+	}
+
+	res2, err := tx.ExecContext(ctx, `
+		UPDATE incidents SET status = 'failed', updated_at = ? WHERE id = ? AND status = 'processing'`,
+		canonicalTime(now), incidentID)
+	if err != nil {
+		return TriageCompletionResult{}, fmt.Errorf("store: mark incident failed after stale final attempt: %w", err)
+	}
+	if err := requireOneRow(res2, "store: mark incident failed after stale final attempt", ErrNotFound); err != nil {
+		return TriageCompletionResult{}, err
+	}
+
+	var groupKey string
+	if err := tx.QueryRowContext(ctx, `SELECT group_key FROM incidents WHERE id = ?`, incidentID).Scan(&groupKey); err != nil {
+		return TriageCompletionResult{}, fmt.Errorf("store: read incident group key for triage_exhausted: %w", err)
+	}
+	idempotencyKey := "triage-exhausted:" + attemptID
+	if err := insertTriageSituationInputTx(ctx, tx, "triage_exhausted", idempotencyKey, incidentID, groupKey, now); err != nil {
+		return TriageCompletionResult{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return TriageCompletionResult{}, fmt.Errorf("store: commit exhaust incident triage schedule after stale final attempt: %w", err)
 	}
 	return TriageCompletionResult{Outcome: outcome, OutputDigest: outputDigest}, nil
 }
