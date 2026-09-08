@@ -9,6 +9,8 @@ and this chart adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-08
+
 ### Added
 
 - `values.schema.json`: Helm now validates values on install, upgrade, lint
