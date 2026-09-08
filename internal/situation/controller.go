@@ -543,6 +543,9 @@ func anyDeliveryResolved(deliveries []Delivery) bool {
 // received at or after since — R1's "current authoritative clearance"
 // signal: proof the source is still reachable, distinct from pastDeadline's
 // mere elapsed-time check (see resolveLifecycle's RecoveryPending case).
+// since is the grace-contract anchor (cur.RecoveryObservedAt), never the
+// fixed episode deadline — a receipt's freshness is judged against when
+// THIS grace period started, not an unrelated historical cutoff.
 func deliverySeenSince(deliveries []Delivery, since time.Time) bool {
 	for _, d := range deliveries {
 		if !d.ReceivedAt.Before(since) {
@@ -754,28 +757,36 @@ func (c *Controller) resolveLifecycle(cur model.Situation, in SnapshotInput, sna
 		case firing:
 			lc, _ := AdvanceLifecycle(cur.Lifecycle, EventRefired)
 			return lifecycleResolution{Lifecycle: lc}
-		case pastDeadline && !deliverySeenSince(in.Deliveries, deadline):
-			// R1 repair (S1-03): pastDeadline alone must not veto a genuine
-			// grace-based recovery — "no recovery from silence... real
-			// current clearance can complete grace regardless of episode
-			// age" (canonical loss-r/allclear). The observation deadline is
-			// anchored at the episode's original EffectiveStartedAt, so for
-			// an old episode it stays permanently "past" and would
-			// otherwise always shadow the grace-expiry case below,
-			// regardless of how fresh the actual clearance is. Only genuine
-			// SILENCE — no delivery of any kind received at/after the
-			// deadline, proving the source has gone dark rather than merely
-			// confirming an old resolution — still forces closed_unknown
-			// here; once any delivery has arrived at/after the deadline the
-			// source is provably still reachable, and this case falls
-			// through to the ordinary grace-expiry check below no matter how
-			// old the episode itself is. Finding C2 fix retained:
-			// cur.RecoveryObservedAt is already non-nil here (recovery_
-			// pending's own invariant) — migration 0014's recovery-field
-			// pairing CHECK is unconditional, so GraceUntil must be carried
-			// forward alongside it (cur.GraceUntil, the Situation's existing
-			// recorded grace deadline) or this commit fails closed against a
-			// real schema.
+		case pastDeadline && !deliverySeenSince(in.Deliveries, *cur.RecoveryObservedAt):
+			// R1 repair, round 2 (S1-03, lead review 2026-09-08): the first
+			// R1 repair compared delivery receipt against deadline (the
+			// episode's fixed, never-moving ObservationDeadlineAt) — an
+			// arbitrary boundary from the grace/clearance process's own
+			// point of view. A delivery received one second before that
+			// boundary and one received one second after it carry the exact
+			// same clearance age relative to RecoveryObservedAt/GraceUntil,
+			// yet only the latter counted as "seen". The source-clearance/
+			// grace contract this branch must honor is: has the source been
+			// heard from at all since THIS Situation started waiting on
+			// grace (cur.RecoveryObservedAt, stamped when the current
+			// recovery_pending confirmation began) — not "since some fixed
+			// historical episode-age cutoff". Comparing against
+			// RecoveryObservedAt instead makes both straddling receipts (and
+			// the delivery that itself started grace, per
+			// TestLeadB1FreshClearanceStraddlesDeadline) count as seen,
+			// while Finding C2's genuinely stale single delivery (received
+			// at episode start, days before RecoveryObservedAt) still reads
+			// as silence. Only true silence — no delivery of any kind at or
+			// after grace began — still forces closed_unknown here; any
+			// delivery at/after RecoveryObservedAt falls through to the
+			// ordinary grace-expiry check below no matter how old the
+			// episode itself is. Finding C2 fix retained: cur.
+			// RecoveryObservedAt is already non-nil here (recovery_pending's
+			// own invariant, hence the direct dereference above) — migration
+			// 0014's recovery-field pairing CHECK is unconditional, so
+			// GraceUntil must be carried forward alongside it (cur.
+			// GraceUntil, the Situation's existing recorded grace deadline)
+			// or this commit fails closed against a real schema.
 			reason := ClosedUnknownReason(cur.EffectiveStartedAtBasis, resolved)
 			lc, _ := AdvanceLifecycle(cur.Lifecycle, EventLifecycleUnobservable)
 			return lifecycleResolution{Lifecycle: lc, RecoveryObservedAt: cur.RecoveryObservedAt, GraceUntil: cur.GraceUntil, TerminalAt: timePtr(now), TerminalReason: terminalReasonPtr(reason)}

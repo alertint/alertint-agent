@@ -1580,6 +1580,79 @@ func TestControllerReconcileFreshClearanceSurvivesGraceExpiryDespiteEpisodeAge(t
 	}
 }
 
+// TestControllerReconcileFreshClearanceSurvivesDeadlineStraddle is R1's
+// round-2 repair regression (lead review 2026-09-08 update, S1-03): the
+// first R1 repair compared delivery receipt against deadline (the episode's
+// own fixed ObservationDeadlineAt), so a delivery received one second
+// BEFORE that boundary was judged "unseen" (forcing closed_unknown) while
+// the exact same clearance received one second AFTER it was judged "seen" —
+// an arbitrary boundary artifact, not a real silence/reachability
+// distinction (matches the lead's own independent
+// TestLeadB1FreshClearanceStraddlesDeadline probe). Drives the SAME
+// resolved delivery, straddling the deadline by one second in each
+// direction, through two real Reconcile cycles (Active -> RecoveryPending,
+// then RecoveryPending -> grace expiry): both must reach recovered
+// identically, since the delivery's clearance age relative to
+// RecoveryObservedAt/GraceUntil — the grace contract this branch must
+// honor — is exactly the same in both subtests, regardless of which side of
+// the unrelated fixed deadline it happens to fall on.
+func TestControllerReconcileFreshClearanceSurvivesDeadlineStraddle(t *testing.T) {
+	deadline := ctBaseTime.Add(7 * 24 * time.Hour)
+	for _, tc := range []struct {
+		name   string
+		offset time.Duration
+	}{
+		{"one_second_before_deadline", -time.Second},
+		{"one_second_after_deadline", time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			firstNow := deadline.Add(tc.offset)
+
+			in := ctBaseSnapshotInput()
+			in.Now = firstNow
+			in.Situation.EffectiveStartedAt = deadline.Add(-7 * 24 * time.Hour)
+			in.Situation.EffectiveStartedAtBasis = model.SourceTimeBasisSourcePayload
+			delivery := ctDelivery("delivery-1", "incident-1", false, "warning")
+			delivery.ReceivedAt = firstNow
+			in.Deliveries = []situation.Delivery{delivery}
+
+			store1 := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
+			c1 := ctLifecycleController(store1, &fakeAssessmentClient{}, firstNow)
+			if err := c1.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+				t.Fatalf("first Reconcile: %v", err)
+			}
+			first := store1.commits[0]
+			if first.Lifecycle != model.LifecycleRecoveryPending {
+				t.Fatalf("first cycle lifecycle = %q, want recovery_pending", first.Lifecycle)
+			}
+			if first.RecoveryObservedAt == nil || first.GraceUntil == nil {
+				t.Fatalf("recovery_pending must carry recovery_observed_at and grace_until, got %+v", first)
+			}
+
+			secondNow := *first.GraceUntil // exactly at grace expiry.
+
+			in2 := ctBaseSnapshotInput()
+			in2.Now = secondNow
+			in2.Situation.EffectiveStartedAt = in.Situation.EffectiveStartedAt
+			in2.Situation.EffectiveStartedAtBasis = model.SourceTimeBasisSourcePayload
+			in2.Situation.Lifecycle = model.LifecycleRecoveryPending
+			in2.Situation.RecoveryObservedAt = first.RecoveryObservedAt
+			in2.Situation.GraceUntil = first.GraceUntil
+			in2.Deliveries = []situation.Delivery{delivery} // the exact same delivery, unchanged.
+
+			store2 := &fakeControllerStore{loadInput: in2, beginWorkAttempt: 1}
+			c2 := ctLifecycleController(store2, &fakeAssessmentClient{}, secondNow)
+			if err := c2.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+				t.Fatalf("second Reconcile: %v", err)
+			}
+			second := store2.commits[0]
+			if second.Lifecycle != model.LifecycleRecovered {
+				t.Fatalf("second cycle lifecycle = %q, want recovered (receipt %s)", second.Lifecycle, tc.name)
+			}
+		})
+	}
+}
+
 // TestControllerReconcileLifecycleActiveReachesClosedUnknownWithoutRecoveryFields
 // covers the OTHER reachable closed_unknown path — straight from active, no
 // recovery ever observed — proving RecoveryObservedAt/GraceUntil correctly
