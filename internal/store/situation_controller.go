@@ -1908,6 +1908,10 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 		return err
 	}
 
+	if err := refundBudgetDeniedAttemptTx(ctx, tx, claim, commit); err != nil {
+		return err
+	}
+
 	// 1. Insert the new authoritative attempt (if any) and its coverage.
 	newAssessmentID, err := commitAuthoritativeAttemptTx(ctx, tx, claim.Situation.ID, commit)
 	if err != nil {

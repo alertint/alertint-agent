@@ -183,6 +183,9 @@ type ControllerCommit struct {
 	RetryAt            *time.Time
 	LastErrorClass     *string
 	Parked             ParkedState
+	// BudgetDeniedCallID refunds a proved-unsent first call in this same
+	// fenced commit. Its immutable call/outcome records remain intact.
+	BudgetDeniedCallID *string
 
 	// History is Plan 3 Task 5's addition: this reconciliation's immutable
 	// Transitions, the Episode summary folded across them, and every
@@ -901,6 +904,8 @@ func outcomeErrorCodes(issues []ValidationIssue) []string {
 // provider response body, a URL with query parameters, or similar.
 func sanitizeTransportError(err error) string {
 	switch {
+	case errors.Is(err, llm.ErrBudgetExhausted) && errors.Is(err, llm.ErrRequestNotSent):
+		return BudgetDeferralErrorClass
 	case errors.Is(err, llm.ErrSchemaViolation):
 		return "schema_violation"
 	case errors.Is(err, llm.ErrResponseTruncated):
@@ -1643,6 +1648,10 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 	// only suppresses NEW semantic L2 work. If the basis has since changed,
 	// controllerParkBlocksDispatch returns false and this cycle proceeds
 	// exactly as if not parked, naturally lifting the park.
+	if in.ControllerParked.Reason == ParkedReasonBudget && (in.Situation.RetryAt == nil || now.Before(*in.Situation.RetryAt)) {
+		base.RetryAt = in.Situation.RetryAt
+		return c.commitBudgetDeferred(ctx, claim, basis, base, state, 0, 1)
+	}
 	if controllerParkBlocksDispatch(in.ControllerParked, snap.MaterialFactHash) {
 		return c.commitBlocked(ctx, claim, basis, base, state)
 	}
@@ -1745,7 +1754,16 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 	}
 	if disp.proposal != nil {
 		result := DeriveAssessment(*disp.proposal, snap, in, state, model.DerivationModelValidated, nil, now)
-		return c.commitResult(ctx, claim, basis, base, result, &disp.lastCallID, retryEpoch, workAttempt, disp.lastDuration)
+		return c.commitResult(ctx, claim, basis, base, result, &disp.lastCallID, retryEpoch, workAttempt, disp.lastDuration, disp.lastUsage)
+	}
+	if disp.budgetDeniedBeforeDispatch {
+		var deferred *llm.BudgetDeferredError
+		if errors.As(disp.transportErr, &deferred) {
+			base.RetryAt = deferred.RetryAt
+		}
+		base.BudgetDeniedCallID = &disp.lastCallID
+		base.Parked = ParkedState{Touch: true, At: now, Reason: ParkedReasonBudget}
+		return c.commitBudgetDeferred(ctx, claim, basis, base, state, retryEpoch, workAttempt)
 	}
 
 	// No accepted/contradicted result: classify the last outcome (using
@@ -1786,9 +1804,12 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 // when callID is non-nil (dispatchWorkBearing's own oneShot.Latency), or 0
 // for a no-call commit (reuse) — threaded straight through to
 // buildAuthoritativeAttempt.
-func (c *Controller) commitResult(ctx context.Context, claim Claim, basis historyBasis, base ControllerCommit, result AssessmentResult, callID *string, retryEpoch, workAttempt int, duration time.Duration) error {
+func (c *Controller) commitResult(ctx context.Context, claim Claim, basis historyBasis, base ControllerCommit, result AssessmentResult, callID *string, retryEpoch, workAttempt int, duration time.Duration, usage ...llm.Completion) error {
 	now := basis.Now
 	base.Attempt = buildAuthoritativeAttempt(claim.Situation.ID, result, callID, retryEpoch, workAttempt, duration, now)
+	if callID != nil && len(usage) > 0 {
+		setAssessmentUsage(&base.Attempt, usage[0])
+	}
 	base.Assessment = result.Assessment
 	base.Coverage = result.Coverage
 	base.Parked = ParkedState{Touch: true, Reason: ""}
@@ -1914,12 +1935,14 @@ func (c *Controller) fallbackOrPreserveBlocked(situationID string, snap Snapshot
 // for the caller to thread into whichever attempt row it ends up building
 // from this cycle's outcome (Task 9 fix round, Finding #4).
 type dispatchResult struct {
-	proposal       *model.AssessmentProposal
-	lastVR         *ValidationResult
-	lastCallID     string
-	lastDuration   time.Duration
-	correctionUsed bool
-	transportErr   error
+	budgetDeniedBeforeDispatch bool
+	lastUsage                  llm.Completion
+	proposal                   *model.AssessmentProposal
+	lastVR                     *ValidationResult
+	lastCallID                 string
+	lastDuration               time.Duration
+	correctionUsed             bool
+	transportErr               error
 }
 
 // dispatchWorkBearing runs one work-bearing controller attempt's L2 dispatch
@@ -1989,6 +2012,8 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 		// which would silently diverge from whatever the client itself
 		// determined.
 		started := model.ProviderRequestStarted(oneShot.RequestStarted)
+		res.budgetDeniedBeforeDispatch = callNumber == 1 && started == model.ProviderRequestStartedFalse &&
+			errors.Is(callErr, llm.ErrRequestNotSent) && errors.Is(callErr, llm.ErrBudgetExhausted)
 
 		var vr *ValidationResult
 		var transportErr error
@@ -1999,6 +2024,7 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 			vr = &v
 		}
 		res.lastVR, res.transportErr, res.lastCallID, res.lastDuration = vr, transportErr, callID, oneShot.Latency
+		res.lastUsage = oneShot.Completion
 
 		policy := ClassifyL2Outcome(vr, transportErr, res.correctionUsed)
 		// Installation LLM health observes the FINAL typed outcome — after
@@ -2027,6 +2053,7 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 
 		outcomeSequence := synthesizeSequence(snap.InputVersion, retryEpoch, workAttempt, callNumber)
 		outcome := buildOutcomeAttempt(claim.Situation.ID, callID, snap.InputVersion, retryEpoch, workAttempt, outcomeSequence, vr, transportErr, started, oneShot.Latency, now)
+		setAssessmentUsage(&outcome, oneShot.Completion)
 		// The outcome row is the durable record of an already-consumed
 		// dispatch slot, so it is written on a short detached context when
 		// the cycle's own context is already done (attempt wall expired, or
