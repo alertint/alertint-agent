@@ -9,34 +9,27 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/audit"
-	"github.com/alertint/alertint-agent/internal/store"
 )
 
-func TestHandleUsageStats_AggregatesAcrossStoreAndAudit(t *testing.T) {
+func TestHandleUsageStats_AggregatesFromAudit(t *testing.T) {
 	st := newMCPStore(t)
 	ctx := context.Background()
-	now := time.Now().UTC()
-
-	if _, err := st.UpsertAlertByFingerprint(ctx, store.Alert{
-		ID: "a1", Fingerprint: "fp1", Status: "firing",
-		Labels: map[string]string{}, Annotations: map[string]string{},
-		StartsAt: now, ReceivedAt: now,
-	}); err != nil {
-		t.Fatalf("seed alert: %v", err)
-	}
 
 	a := audit.New(st.DB())
-	if err := a.Append(ctx, "llm.anthropic", "llm.response", map[string]any{
+	seed := func(actor, kind string, payload map[string]any) {
+		t.Helper()
+		if err := a.Append(ctx, actor, kind, payload); err != nil {
+			t.Fatalf("seed %s/%s: %v", actor, kind, err)
+		}
+	}
+	seed("alertmanager", "alert.received", map[string]any{"alert_count": 2, "persisted_count": 2})
+	seed("llm.anthropic", "llm.response", map[string]any{
 		"model": "claude-x", "input_tokens": int64(10), "output_tokens": int64(5),
-	}); err != nil {
-		t.Fatalf("seed llm.response: %v", err)
-	}
-	if err := a.Append(ctx, "notify.slack", "notify.sent", nil); err != nil {
-		t.Fatalf("seed notify.sent: %v", err)
-	}
-	if err := a.Append(ctx, "skill:acute-triage", "incident.analyzed", nil); err != nil {
-		t.Fatalf("seed incident.analyzed: %v", err)
-	}
+	})
+	seed("notify.slack", "notify.sent", map[string]any{"incident_id": "inc-1", "event": "firing", "recipient": "slack"})
+	seed("notify.slack", "notify.sent", map[string]any{"incident_id": "inc-1", "event": "rejudge", "recipient": "slack"})
+	seed("skill:acute-triage", "incident.analyzed", nil)
+	seed("correlator", "incident.triage_exhausted", nil)
 
 	s := NewServer(Config{}, st, a)
 	res, err := s.handleUsageStats(ctx, reqWith(nil))
@@ -49,8 +42,9 @@ func TestHandleUsageStats_AggregatesAcrossStoreAndAudit(t *testing.T) {
 		t.Fatalf("payload not JSON: %v", err)
 	}
 
-	if payload["alerts_received"] != float64(1) {
-		t.Errorf("alerts_received = %v, want 1", payload["alerts_received"])
+	alerts, ok := payload["alerts"].(map[string]any)
+	if !ok || alerts["deliveries"] != float64(1) || alerts["received"] != float64(2) {
+		t.Errorf("alerts block wrong: %v", payload["alerts"])
 	}
 	llm, ok := payload["llm"].(map[string]any)
 	if !ok || llm["calls"] != float64(1) || llm["input_tokens"] != float64(10) {
@@ -61,11 +55,11 @@ func TestHandleUsageStats_AggregatesAcrossStoreAndAudit(t *testing.T) {
 		t.Errorf("llm.by_model wrong: %v", llm["by_model"])
 	}
 	slack, ok := payload["slack"].(map[string]any)
-	if !ok || slack["sent"] != float64(1) {
+	if !ok || slack["cards_posted"] != float64(1) || slack["skipped"] != float64(0) {
 		t.Errorf("slack block wrong: %v", payload["slack"])
 	}
 	incidents, ok := payload["incidents"].(map[string]any)
-	if !ok || incidents["processed"] != float64(1) {
+	if !ok || incidents["analyzed"] != float64(1) || incidents["triage_exhausted"] != float64(1) {
 		t.Errorf("incidents block wrong: %v", payload["incidents"])
 	}
 	if _, ok := payload["window"].(map[string]any); !ok {

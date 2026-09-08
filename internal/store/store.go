@@ -1036,22 +1036,6 @@ func (s *Store) SearchAlerts(ctx context.Context, f AlertFilter) ([]Alert, error
 	return scanAlertRows(rows)
 }
 
-// CountAlertsReceived returns the number of alerts whose received_at falls in
-// the half-open window [since, until) — for the alertint_usage_stats MCP tool.
-// Reuses SearchAlerts's Since/Until range-filter convention (string comparison
-// against the same received_at index), half-open so adjacent windows never
-// double-count a boundary row.
-func (s *Store) CountAlertsReceived(ctx context.Context, since, until time.Time) (int, error) {
-	var count int
-	err := s.db.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM alerts WHERE received_at >= ? AND received_at < ?
-	`, since.UTC().Format(time.RFC3339Nano), until.UTC().Format(time.RFC3339Nano)).Scan(&count)
-	if err != nil {
-		return 0, fmt.Errorf("store: count alerts received: %w", err)
-	}
-	return count, nil
-}
-
 // GetIncidentAlertsWithRoles is like GetIncidentAlerts but also populates
 // Alert.Role from the incident_alerts.role column.
 func (s *Store) GetIncidentAlertsWithRoles(ctx context.Context, incidentID string) ([]Alert, error) {

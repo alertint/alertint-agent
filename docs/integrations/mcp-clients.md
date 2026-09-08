@@ -135,7 +135,7 @@ restart Windsurf and check **Settings → MCP Servers**:
 | `alertint_search_alerts` | Search raw alerts by label key and value. |
 | `alertint_get_evidence_pack` | Get the evidence pack and Prometheus metrics for an incident. |
 | `alertint_verify_audit` | Verify the hash-chained audit log and report any tampering. |
-| `alertint_usage_stats` | Operational usage summary over a time window: alerts received, LLM call/token volume (with a per-model breakdown), Slack messages sent, and incidents processed. A usage snapshot, not a billing meter. |
+| `alertint_usage_stats` | Operational usage summary over a time window: alert deliveries and alerts received, LLM call/token volume (with a per-model breakdown), Slack cards posted (new incident cards only) and skipped, incident analyses completed and triage exhaustions. Aggregated from the audit log — a usage snapshot, not a billing meter. |
 | `prometheus_query` | Instant PromQL query against the connected Prometheus (requires Prometheus enabled). |
 | `prometheus_query_range` | Range PromQL query with auto-stepped resolution (requires Prometheus enabled). |
 | `loki_query_range` | Range-query the configured log backend using its native query language (requires a log source enabled). |

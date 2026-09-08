@@ -236,9 +236,10 @@ func (s *Server) toolVerifyAudit() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 
 func (s *Server) toolUsageStats() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 	tool := mcplib.NewTool("alertint_usage_stats",
-		mcplib.WithDescription("Operational usage summary over a time window: alerts received, LLM call/token "+
-			"volume (with a per-model breakdown), Slack messages sent, and incidents processed. Aggregated from "+
-			"the audit log and alert intake — a usage snapshot, not a billing meter. Read-only."),
+		mcplib.WithDescription("Operational usage summary over a time window: alert deliveries and alerts received, "+
+			"LLM call/token volume (with a per-model breakdown), Slack cards posted (new incident cards only; edits "+
+			"and thread replies excluded) and skipped, incident analyses completed and triage exhaustions. "+
+			"Aggregated from the audit log — a usage snapshot, not a billing meter. Read-only."),
 		mcplib.WithString("since",
 			mcplib.Description("Window start (RFC3339). Defaults to 24h before now."),
 		),
@@ -724,10 +725,6 @@ func (s *Server) handleUsageStats(ctx context.Context, req mcplib.CallToolReques
 		return errResult("since must be before until"), nil
 	}
 
-	alertsReceived, err := s.st.CountAlertsReceived(ctx, since, until)
-	if err != nil {
-		return errResult("failed to count alerts received: " + err.Error()), nil
-	}
 	stats, err := s.auditor.UsageStats(ctx, since, until)
 	if err != nil {
 		return errResult("failed to aggregate usage stats: " + err.Error()), nil
@@ -752,8 +749,11 @@ func (s *Server) handleUsageStats(ctx context.Context, req mcplib.CallToolReques
 	}
 
 	payload := map[string]any{
-		"window":          map[string]any{"since": since, "until": until},
-		"alerts_received": alertsReceived,
+		"window": map[string]any{"since": since, "until": until},
+		"alerts": map[string]any{
+			"deliveries": stats.AlertDeliveries,
+			"received":   stats.AlertsReceived,
+		},
 		"llm": map[string]any{
 			"calls":                 stats.LLMCalls,
 			"input_tokens":          stats.LLMInputTokens,
@@ -763,12 +763,12 @@ func (s *Server) handleUsageStats(ctx context.Context, req mcplib.CallToolReques
 			"by_model":              byModel,
 		},
 		"slack": map[string]any{
-			"sent":    stats.SlackSent,
-			"skipped": stats.SlackSkipped,
+			"cards_posted": stats.SlackCardsPosted,
+			"skipped":      stats.SlackSkipped,
 		},
 		"incidents": map[string]any{
-			"processed": stats.IncidentsProcessed,
-			"failed":    stats.IncidentsFailed,
+			"analyzed":         stats.IncidentsAnalyzed,
+			"triage_exhausted": stats.IncidentsTriageExhausted,
 		},
 	}
 

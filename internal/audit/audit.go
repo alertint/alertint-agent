@@ -175,13 +175,21 @@ func (a *Auditor) Verify(ctx context.Context) (*VerifyReport, error) {
 }
 
 // UsageStats is the aggregate operational summary backing the
-// alertint_usage_stats MCP tool: LLM call/token volume (with a per-model
-// breakdown), Slack delivery outcomes, and incident processing counts, over
-// the half-open window [Since, Until). Alert intake is deliberately absent —
-// no "alert received" kind is ever appended to the audit log, so the MCP
-// handler sources that count from store.CountAlertsReceived instead.
+// alertint_usage_stats MCP tool over the half-open window [Since, Until).
+// Every counter is sourced from the audit log alone, so the numbers are
+// stable over time: a repeat delivery of an already-known alert appends a
+// new alert.received row rather than rewriting an old one, which the alerts
+// table (fingerprint upsert overwrites received_at) does not guarantee.
 type UsageStats struct {
 	Since, Until time.Time
+
+	// AlertDeliveries counts alert.received rows: one per inbound webhook
+	// call, whichever receiver (Alertmanager, Zabbix) emitted it.
+	AlertDeliveries int
+	// AlertsReceived sums the alerts carried by those deliveries: the
+	// payload's alert_count when the receiver records one (Alertmanager
+	// batches), otherwise one alert per row (Zabbix).
+	AlertsReceived int
 
 	LLMCalls               int
 	LLMInputTokens         int64
@@ -190,11 +198,24 @@ type UsageStats struct {
 	LLMCacheReadTokens     int64
 	LLMByModel             []ModelUsage
 
-	SlackSent    int
+	// SlackCardsPosted counts operator pokes: notify.slack/notify.sent rows
+	// whose event is "firing", i.e. a new incident card landing in the
+	// channel. In-place re-judgment edits, resolved updates and thread
+	// replies are not pokes and are excluded.
+	SlackCardsPosted int
+	// SlackSkipped counts notify.skipped rows: incidents held back by the
+	// min_severity gate.
 	SlackSkipped int
 
-	IncidentsProcessed int
-	IncidentsFailed    int
+	// IncidentsAnalyzed counts incident.analyzed rows — analysis completions.
+	// A re-judged incident completes more than once and counts each time.
+	IncidentsAnalyzed int
+	// IncidentsTriageExhausted counts incident.triage_exhausted rows: the
+	// terminal event an incident emits once when it runs out of triage
+	// retries, whatever the failing step was (LLM error, response decoding,
+	// persistence). It is the per-incident failure count; intermediate
+	// incident.analysis_failed rows are not counted.
+	IncidentsTriageExhausted int
 }
 
 // ModelUsage is one (provider, model) breakdown row within
@@ -211,37 +232,76 @@ type ModelUsage struct {
 }
 
 // UsageStats aggregates operational counters from the audit log over the
-// half-open window [since, until). It runs two scoped queries: one grouped
-// count over (actor, kind) for the Slack/incident counters, and one scan of
-// llm.response rows in-window to sum token fields out of their payload_json
-// (that column already carries input/output/cache token counts — see
-// internal/llm/anthropic and internal/llm/openaicompat) and build the
-// per-model breakdown.
+// half-open window [since, until). It runs three scoped queries: one grouped
+// count over (actor, kind) for the Slack-skipped and incident counters, one
+// pair of JSON-aware counts (alert intake volume, Slack cards posted), and
+// one scan of llm.response rows to sum token fields out of their
+// payload_json (that column already carries input/output/cache token
+// counts — see internal/llm/anthropic and internal/llm/openaicompat) and
+// build the per-model breakdown.
 func (a *Auditor) UsageStats(ctx context.Context, since, until time.Time) (UsageStats, error) {
-	sinceStr := since.UTC().Format(time.RFC3339Nano)
-	untilStr := until.UTC().Format(time.RFC3339Nano)
 	out := UsageStats{Since: since.UTC(), Until: until.UTC()}
+	w := tsWindow(since, until)
 
-	if err := a.scanUsageCounts(ctx, sinceStr, untilStr, &out); err != nil {
+	if err := a.scanUsageCounts(ctx, w, &out); err != nil {
 		return UsageStats{}, err
 	}
-	if err := a.scanLLMUsage(ctx, sinceStr, untilStr, &out); err != nil {
+	if err := a.scanIntakeAndPokes(ctx, w, &out); err != nil {
+		return UsageStats{}, err
+	}
+	if err := a.scanLLMUsage(ctx, w, &out); err != nil {
 		return UsageStats{}, err
 	}
 	return out, nil
 }
 
-// scanUsageCounts fills the Slack and incident counters via one grouped
-// COUNT(*) query over (actor, kind). Any (actor, kind) pair not named below
-// is deliberately ignored — alertint_usage_stats returns a curated summary,
-// not a raw per-kind dump.
-func (a *Auditor) scanUsageCounts(ctx context.Context, sinceStr, untilStr string, out *UsageStats) error {
+// tsWindowPred is a SQL predicate (with its positional args) selecting
+// audit_log rows whose ts falls in a half-open [since, until) window.
+type tsWindowPred struct {
+	sql  string
+	args []any
+}
+
+// tsNormalizedCol rewrites audit_log.ts into a fixed-width form that
+// compares correctly as text. Append writes ts with time.RFC3339Nano, which
+// trims trailing zeros, so rows carry variable precision: "…:05Z",
+// "…:05.5Z", "…:05.123456789Z". Comparing those lexically is wrong at the
+// boundaries ('.' sorts before 'Z', so "…:05.5Z" < "…:05Z"). This expression
+// pads every row to "YYYY-MM-DDTHH:MM:SS.nnnnnnnnn" (nine fractional digits,
+// no zone suffix) so that text order equals time order.
+const tsNormalizedCol = `(substr(ts, 1, 19) || '.' || substr(ltrim(rtrim(substr(ts, 20), 'Z'), '.') || '000000000', 1, 9))`
+
+// tsWindow builds the [since, until) predicate. The exact comparison runs
+// on tsNormalizedCol, which cannot use audit_log_ts_idx; a coarse
+// whole-second range on the raw column (floor(since) ≤ ts < floor(until)+1s,
+// compared as 19-char prefixes so both "…Z" and "….fZ" rows sort after the
+// bound) keeps the index in play and is a strict superset of the exact window.
+func tsWindow(since, until time.Time) tsWindowPred {
+	const exactLayout = "2006-01-02T15:04:05.000000000"
+	const coarseLayout = "2006-01-02T15:04:05"
+	since, until = since.UTC(), until.UTC()
+	return tsWindowPred{
+		sql: `ts >= ? AND ts < ? AND ` + tsNormalizedCol + ` >= ? AND ` + tsNormalizedCol + ` < ?`,
+		args: []any{
+			since.Truncate(time.Second).Format(coarseLayout),
+			until.Truncate(time.Second).Add(time.Second).Format(coarseLayout),
+			since.Format(exactLayout),
+			until.Format(exactLayout),
+		},
+	}
+}
+
+// scanUsageCounts fills the Slack-skipped and incident counters via one
+// grouped COUNT(*) query over (actor, kind). Any (actor, kind) pair not
+// named below is deliberately ignored — alertint_usage_stats returns a
+// curated summary, not a raw per-kind dump.
+func (a *Auditor) scanUsageCounts(ctx context.Context, w tsWindowPred, out *UsageStats) error {
 	rows, err := a.db.QueryContext(ctx, `
 		SELECT actor, kind, COUNT(*)
 		FROM audit_log
-		WHERE ts >= ? AND ts < ?
+		WHERE `+w.sql+`
 		GROUP BY actor, kind
-	`, sinceStr, untilStr)
+	`, w.args...)
 	if err != nil {
 		return fmt.Errorf("audit: usage stats counts: %w", err)
 	}
@@ -254,17 +314,40 @@ func (a *Auditor) scanUsageCounts(ctx context.Context, sinceStr, untilStr string
 			return fmt.Errorf("audit: usage stats scan: %w", err)
 		}
 		switch {
-		case actor == "notify.slack" && kind == "notify.sent":
-			out.SlackSent = n
 		case actor == "notify.slack" && kind == "notify.skipped":
 			out.SlackSkipped = n
 		case kind == "incident.analyzed":
-			out.IncidentsProcessed = n
-		case kind == "incident.analysis_failed":
-			out.IncidentsFailed = n
+			out.IncidentsAnalyzed = n
+		case kind == "incident.triage_exhausted":
+			out.IncidentsTriageExhausted = n
 		}
 	}
 	return rows.Err()
+}
+
+// scanIntakeAndPokes fills the alert intake counters and the Slack cards
+// posted counter. Both need a field out of payload_json, so they run as one
+// query per counter rather than through the grouped (actor, kind) count.
+func (a *Auditor) scanIntakeAndPokes(ctx context.Context, w tsWindowPred, out *UsageStats) error {
+	err := a.db.QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(SUM(COALESCE(json_extract(payload_json, '$.alert_count'), 1)), 0)
+		FROM audit_log
+		WHERE kind = 'alert.received' AND `+w.sql, w.args...,
+	).Scan(&out.AlertDeliveries, &out.AlertsReceived)
+	if err != nil {
+		return fmt.Errorf("audit: usage stats alert intake: %w", err)
+	}
+
+	err = a.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM audit_log
+		WHERE actor = 'notify.slack' AND kind = 'notify.sent'
+		  AND json_extract(payload_json, '$.event') = 'firing' AND `+w.sql, w.args...,
+	).Scan(&out.SlackCardsPosted)
+	if err != nil {
+		return fmt.Errorf("audit: usage stats slack cards: %w", err)
+	}
+	return nil
 }
 
 // llmResponsePayload is the subset of an llm.response audit payload
@@ -282,12 +365,11 @@ type llmResponsePayload struct {
 // scanning llm.response rows in-window. A row whose payload_json doesn't
 // unmarshal into llmResponsePayload is skipped rather than failing the whole
 // call — it stays out of both the total and the per-model breakdown.
-func (a *Auditor) scanLLMUsage(ctx context.Context, sinceStr, untilStr string, out *UsageStats) error {
+func (a *Auditor) scanLLMUsage(ctx context.Context, w tsWindowPred, out *UsageStats) error {
 	rows, err := a.db.QueryContext(ctx, `
 		SELECT actor, payload_json
 		FROM audit_log
-		WHERE ts >= ? AND ts < ? AND kind = 'llm.response'
-	`, sinceStr, untilStr)
+		WHERE kind = 'llm.response' AND `+w.sql, w.args...)
 	if err != nil {
 		return fmt.Errorf("audit: usage stats llm scan: %w", err)
 	}
