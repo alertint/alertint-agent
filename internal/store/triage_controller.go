@@ -891,7 +891,8 @@ func completeOwnerTerminalTx(ctx context.Context, tx *sql.Tx, attemptID, inciden
 		return TriageCompletionResult{}, err
 	}
 
-	return completeExhaustedStaleTx(ctx, tx, attemptID, incidentID, TriageCompletionOwnerTerminal, outputDigest, now)
+	return completeExhaustedStaleTx(ctx, tx, attemptID, incidentID, TriageCompletionOwnerTerminal, outputDigest,
+		"owner situation terminalized before completion: closure fenced, no current finding promoted", now)
 }
 
 func completeStaleTx(ctx context.Context, tx *sql.Tx, attemptID, incidentID string, attemptNumber int, outcome TriageCompletionOutcome, dto staleAttemptOutputDTO, now time.Time) (TriageCompletionResult, error) {
@@ -920,7 +921,8 @@ func completeStaleTx(ctx context.Context, tx *sql.Tx, attemptID, incidentID stri
 	// "exhausted" both mean this attempt slot is spent with no Finding; the
 	// FINAL slot going stale is exhaustion, not a retryable race.
 	if attemptNumber >= maxIncidentTriageAttempts {
-		return completeExhaustedStaleTx(ctx, tx, attemptID, incidentID, outcome, outputDigest, now)
+		return completeExhaustedStaleTx(ctx, tx, attemptID, incidentID, outcome, outputDigest,
+			"final bounded attempt completed stale: no attempt slot remains to retry with", now)
 	}
 
 	res2, err := tx.ExecContext(ctx, `
@@ -961,21 +963,31 @@ func completeStaleTx(ctx context.Context, tx *sql.Tx, attemptID, incidentID stri
 	return TriageCompletionResult{Outcome: outcome, OutputDigest: outputDigest}, nil
 }
 
-// completeExhaustedStaleTx is completeStaleTx's S2-04 branch for a stale
-// completion of the final bounded attempt: it settles incident_triage to
-// the same terminal 'exhausted' phase and Incident 'failed' status
+// completeExhaustedStaleTx is the shared S2-04/S2-06 settlement path for a
+// completion that can never retry: a stale completion of the final bounded
+// attempt (completeStaleTx), or an owner-terminal completion at any attempt
+// number (completeOwnerTerminalTx). It settles incident_triage to the same
+// terminal 'exhausted' phase and Incident 'failed' status
 // ExhaustIncidentTriageAttempt uses for an ordinary exhausted failure, and
 // appends the same triage_exhausted input — the controller's existing
 // "analysis ended" work feedback — rather than triage_retry_changed's
 // "something changed, try again" signal, since no attempt slot remains to
 // retry with.
-func completeExhaustedStaleTx(ctx context.Context, tx *sql.Tx, attemptID, incidentID string, outcome TriageCompletionOutcome, outputDigest string, now time.Time) (TriageCompletionResult, error) {
+//
+// reason is the caller's own accurate last_error_detail (R4 repair, lead
+// review 2026-09-08 update): the two callers settle here for genuinely
+// different reasons — attempt exhaustion vs. owner closure — and one fixed
+// string previously claimed "final bounded attempt completed stale" even
+// for an owner-terminal completion of attempt 1, which is untrue. outcome
+// alone (last_error_code) already distinguishes the two cases machine-
+// readably; reason keeps the human-readable detail equally honest.
+func completeExhaustedStaleTx(ctx context.Context, tx *sql.Tx, attemptID, incidentID string, outcome TriageCompletionOutcome, outputDigest, reason string, now time.Time) (TriageCompletionResult, error) {
 	res, err := tx.ExecContext(ctx, `
 		UPDATE incident_triage
 		SET phase = 'exhausted', next_at = NULL, last_error_code = ?, last_error_detail = ?,
 		    lease_owner = NULL, lease_expires_at = NULL, current_attempt_id = NULL, updated_at = ?
 		WHERE incident_id = ? AND phase = 'in_flight' AND current_attempt_id = ?`,
-		string(outcome), "final bounded attempt completed stale: no attempt slot remains to retry with",
+		string(outcome), reason,
 		canonicalTime(now), incidentID, attemptID)
 	if err != nil {
 		return TriageCompletionResult{}, fmt.Errorf("store: exhaust incident triage schedule after stale final attempt: %w", err)

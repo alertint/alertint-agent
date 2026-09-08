@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -787,6 +788,24 @@ func TestCompleteIncidentTriageAttemptOwnerTerminalizedDuringExecutionNeverPromo
 		}
 	}
 
+	// R4 (lead review 2026-09-08 update): this attempt was the FIRST
+	// (attemptNumber=1), not the final bounded one — a detail claiming
+	// attempt exhaustion here would be false. The recorded reason must
+	// name the real cause: owner closure, not attempt-slot exhaustion.
+	var lastErrorCode, lastErrorDetail string
+	if err := st.db.QueryRowContext(ctx, `SELECT last_error_code, last_error_detail FROM incident_triage WHERE incident_id = ?`, f.IncidentID).Scan(&lastErrorCode, &lastErrorDetail); err != nil {
+		t.Fatal(err)
+	}
+	if lastErrorCode != "owner_terminal" {
+		t.Fatalf("last_error_code = %q, want owner_terminal", lastErrorCode)
+	}
+	if strings.Contains(lastErrorDetail, "final bounded attempt") || strings.Contains(lastErrorDetail, "no attempt slot remains") {
+		t.Fatalf("last_error_detail = %q, falsely claims attempt-slot exhaustion for an attempt-1 owner-terminal completion", lastErrorDetail)
+	}
+	if !strings.Contains(lastErrorDetail, "owner") {
+		t.Fatalf("last_error_detail = %q, want it to name owner closure as the actual reason", lastErrorDetail)
+	}
+
 	var count int
 	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM incident_triage_attempts WHERE id = ?`, claim.AttemptID).Scan(&count); err != nil {
 		t.Fatal(err)
@@ -1023,6 +1042,21 @@ func TestCompleteIncidentTriageAttemptFinalAttemptStaleSettlesExhaustedNotAwaiti
 	tr := triageRow(t, st, f.IncidentID)
 	if tr.Phase != "exhausted" || tr.Attempts != 5 {
 		t.Fatalf("phase=%q attempts=%d after the final attempt goes stale, want exhausted/5 (settled, not reopened, not refunded)", tr.Phase, tr.Attempts)
+	}
+
+	// R4 (lead review 2026-09-08 update): this genuinely IS the final
+	// bounded attempt, so the "no attempt slot remains" detail is accurate
+	// here — unlike the owner-terminal path, which must never claim it (see
+	// TestCompleteIncidentTriageAttemptOwnerTerminalizedDuringExecutionNeverPromotesFinding).
+	var lastErrorCode, lastErrorDetail string
+	if err := st.db.QueryRowContext(ctx, `SELECT last_error_code, last_error_detail FROM incident_triage WHERE incident_id = ?`, f.IncidentID).Scan(&lastErrorCode, &lastErrorDetail); err != nil {
+		t.Fatal(err)
+	}
+	if lastErrorCode != string(TriageCompletionStaleMembership) {
+		t.Fatalf("last_error_code = %q, want stale_membership", lastErrorCode)
+	}
+	if !strings.Contains(lastErrorDetail, "no attempt slot remains") {
+		t.Fatalf("last_error_detail = %q, want it to name attempt-slot exhaustion as the actual reason", lastErrorDetail)
 	}
 	if got := incidentStatus(t, st, f.IncidentID); got != "failed" {
 		t.Fatalf("incident status = %q, want failed (matches ExhaustIncidentTriageAttempt's own terminal projection)", got)

@@ -320,6 +320,15 @@ const (
 	TriageCompletionSuccess            TriageCompletionOutcome = "success"
 	TriageCompletionStaleMembership    TriageCompletionOutcome = "stale_membership"
 	TriageCompletionStaleIncidentInput TriageCompletionOutcome = "stale_incident_input"
+	// TriageCompletionOwnerTerminal mirrors store.TriageCompletionOwnerTerminal
+	// (R4 repair, lead review 2026-09-08 update): the owning Situation
+	// terminalized after this attempt was claimed but before it completed.
+	// Named here so this package's own documented closed outcome set stays
+	// complete — completeSuccessOrStale below already handles any non-
+	// success outcome generically (never promotes a Finding), so adding
+	// this constant changes no behavior, only the vocabulary available to
+	// describe it accurately.
+	TriageCompletionOwnerTerminal TriageCompletionOutcome = "owner_terminal"
 )
 
 // Sentinel errors a TriageAttemptStore implementation must return (wrapped
@@ -925,15 +934,32 @@ func (w *TriageWorker) completeSuccessOrStale(ctx context.Context, claim TriageA
 		return "complete_failed"
 	}
 	if outcome != TriageCompletionSuccess {
-		// stale_membership / stale_incident_input: the atomic completion
-		// boundary already restored the Incident to ready and the schedule
-		// to awaiting_decision. spec.md: "It persists no Finding,
-		// first-judgment time, Incident output projection, role, memory
-		// action, or notifier effect" — so AfterCommit must NOT run here.
-		// Audited as stale, never as a completion or a failure: the model
-		// work itself did not fail, its result was correctly discarded
-		// against a since-changed digest.
-		w.logger.Info("situation: triage worker: attempt completed stale; schedule restored to awaiting_decision",
+		// spec.md: "It persists no Finding, first-judgment time, Incident
+		// output projection, role, memory action, or notifier effect" — so
+		// AfterCommit must NOT run for any non-success outcome. Audited as
+		// stale/closed, never as a completion or a failure: the model work
+		// itself did not fail, its result was correctly discarded or fenced.
+		//
+		// R4 repair (lead review 2026-09-08 update): the completion
+		// boundary's actual settlement differs by outcome and this worker
+		// has no signal beyond outcome itself to distinguish them further —
+		// stale_membership/stale_incident_input restores the schedule to
+		// awaiting_decision UNLESS this was the final bounded attempt, in
+		// which case the store settles it straight to exhausted instead
+		// (S2-04); owner_terminal always settles to exhausted (S2-06),
+		// never awaiting_decision. The log/audit text below must therefore
+		// describe the committed outcome itself, not assume a specific
+		// schedule phase that outcome alone cannot confirm.
+		if outcome == TriageCompletionOwnerTerminal {
+			w.logger.Info("situation: triage worker: attempt completed after owner closure; no finding promoted, schedule exhausted",
+				"incident_id", claim.IncidentID, "attempt_id", claim.AttemptID, "outcome", outcome)
+			w.auditAppend(ctx, "incident.triage_owner_terminal", map[string]any{
+				"situation_id": claim.SituationID, "incident_id": claim.IncidentID, "attempt_id": claim.AttemptID,
+				"input_version": claim.DecisionInputVersion, "outcome": string(outcome),
+			})
+			return string(outcome)
+		}
+		w.logger.Info("situation: triage worker: attempt completed against changed input; schedule updated by the store's own bounded-attempt policy",
 			"incident_id", claim.IncidentID, "attempt_id", claim.AttemptID, "outcome", outcome)
 		w.auditAppend(ctx, "incident.triage_stale_input", map[string]any{
 			"situation_id": claim.SituationID, "incident_id": claim.IncidentID, "attempt_id": claim.AttemptID,
