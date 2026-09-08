@@ -9,6 +9,21 @@ and this chart adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+### Added
+
+- `values.schema.json`: Helm now validates values on install, upgrade, lint
+  and template — a typo'd key, a wrong type, or a key removed in 0.2.0
+  (`ingress.enabled`, `ingress.annotations`) fails fast with a schema error
+  instead of rendering silently. `config`, `resources`, the security
+  contexts and the `extra*` lists stay free-form on purpose.
+- Artifact Hub listing metadata in `Chart.yaml`: chart icon, license
+  (`FSL-1.1-ALv2`), the referenced application image, documentation and
+  changelog links, category, and a per-release `artifacthub.io/changes`
+  summary. Maintainers now carry an email so Artifact Hub lists them.
+- Chart releases are signed with cosign (keyless, GitHub Actions OIDC);
+  Artifact Hub shows the signed badge and the signature can be verified
+  with `cosign verify` (see the chart README).
+
 ## [0.2.0] - 2026-09-07
 
 ### Changed

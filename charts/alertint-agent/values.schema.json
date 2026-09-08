@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "alertint-agent Helm chart values",
+  "type": "object",
+  "additionalProperties": false,
+  "definitions": {
+    "stringMap": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "ingressEndpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "annotations": { "$ref": "#/definitions/stringMap" },
+        "host": { "type": "string" },
+        "path": { "type": "string", "minLength": 1 },
+        "pathType": { "type": "string", "enum": ["Prefix", "Exact", "ImplementationSpecific"] },
+        "tls": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "hosts": { "type": "array", "items": { "type": "string" } },
+              "secretName": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  },
+  "properties": {
+    "global": { "type": "object" },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] },
+        "tag": { "type": "string" }
+      }
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": { "name": { "type": "string" } },
+        "required": ["name"]
+      }
+    },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" },
+        "annotations": { "$ref": "#/definitions/stringMap" },
+        "name": { "type": "string" }
+      }
+    },
+    "podAnnotations": { "$ref": "#/definitions/stringMap" },
+    "podLabels": { "$ref": "#/definitions/stringMap" },
+    "podSecurityContext": { "type": "object" },
+    "securityContext": { "type": "object" },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "labels": { "$ref": "#/definitions/stringMap" },
+        "webhookPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "mcpPort": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "ingress": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "className": { "type": "string" },
+        "webhook": { "$ref": "#/definitions/ingressEndpoint" },
+        "mcp": { "$ref": "#/definitions/ingressEndpoint" }
+      }
+    },
+    "resources": { "type": "object" },
+    "nodeSelector": { "$ref": "#/definitions/stringMap" },
+    "tolerations": { "type": "array", "items": { "type": "object" } },
+    "affinity": { "type": "object" },
+    "topologySpreadConstraints": { "type": "array", "items": { "type": "object" } },
+    "probes": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "initialDelaySeconds": { "type": "integer", "minimum": 0 },
+        "periodSeconds": { "type": "integer", "minimum": 1 },
+        "timeoutSeconds": { "type": "integer", "minimum": 1 },
+        "failureThreshold": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "storageClassName": { "type": "string" },
+        "accessMode": { "type": "string", "enum": ["ReadWriteOnce", "ReadOnlyMany", "ReadWriteMany", "ReadWriteOncePod"] },
+        "size": { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?([EPTGMK]i?|[eEpPtTgGmMkK])?$" },
+        "existingClaim": { "type": "string" },
+        "mountPath": { "type": "string", "pattern": "^/" }
+      }
+    },
+    "secret": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "create": { "type": "boolean" },
+        "existingSecret": { "type": "string" },
+        "data": { "$ref": "#/definitions/stringMap" }
+      }
+    },
+    "extraEnv": { "type": "array", "items": { "type": "object" } },
+    "extraEnvFrom": { "type": "array", "items": { "type": "object" } },
+    "extraVolumes": { "type": "array", "items": { "type": "object" } },
+    "extraVolumeMounts": { "type": "array", "items": { "type": "object" } },
+    "existingConfigMap": { "type": "string" },
+    "configOverride": { "type": "string" },
+    "config": { "type": "object" }
+  }
+}

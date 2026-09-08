@@ -61,7 +61,7 @@ jobs:
             --set secret.data.ANTHROPIC_API_KEY=test \
             --set secret.data.ALERTINT_MCP_TOKEN=test \
             --set persistence.existingClaim=my-claim \
-            --set ingress.enabled=true \
+            --set ingress.webhook.enabled=true \
             --set ingress.webhook.host=hooks.example.com \
             --set ingress.mcp.enabled=true \
             --set ingress.mcp.host="*.example.com" \
