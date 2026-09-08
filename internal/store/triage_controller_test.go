@@ -215,6 +215,7 @@ type triageRowSnapshot struct {
 	Phase                                 string
 	Attempts                              int
 	SituationID, Decision, DecisionOrigin sql.NullString
+	DecisionReason                        sql.NullString
 	DecisionInputVersion                  sql.NullInt64
 	MembershipDigest, IncidentInputDigest sql.NullString
 	LeaseOwner, CurrentAttemptID          sql.NullString
@@ -224,10 +225,10 @@ func triageRow(t *testing.T, st *Store, incidentID string) triageRowSnapshot {
 	t.Helper()
 	var r triageRowSnapshot
 	err := st.db.QueryRowContext(context.Background(), `
-		SELECT phase, attempts, situation_id, decision, decision_origin, decision_input_version,
+		SELECT phase, attempts, situation_id, decision, decision_origin, decision_reason, decision_input_version,
 		       membership_digest, incident_input_digest, lease_owner, current_attempt_id
 		FROM incident_triage WHERE incident_id = ?`, incidentID).Scan(
-		&r.Phase, &r.Attempts, &r.SituationID, &r.Decision, &r.DecisionOrigin, &r.DecisionInputVersion,
+		&r.Phase, &r.Attempts, &r.SituationID, &r.Decision, &r.DecisionOrigin, &r.DecisionReason, &r.DecisionInputVersion,
 		&r.MembershipDigest, &r.IncidentInputDigest, &r.LeaseOwner, &r.CurrentAttemptID)
 	if err != nil {
 		t.Fatalf("read triage row: %v", err)
@@ -1626,6 +1627,43 @@ func TestCleanSkipBelowMinimumMembersClosesDueRowWithoutConsumingAnAttempt(t *te
 	// And the ordinary claim now fails closed: nothing is claimable.
 	if _, err := st.ClaimIncidentTriageAttempt(ctx, f.IncidentID, "worker-1", now.Add(2*time.Minute), time.Minute); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("claim after clean skip err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestCleanSkipBelowMinimumMembersRecordsItsOwnReason is S2-03's red test
+// (traceability.json: "minimum-members reason round trip"): a policy-driven
+// clean skip must record ITS OWN decision_reason, not silently keep the
+// prior request decision's reason under a newly skipped row (plan.md
+// checklist item 4, "do not keep an old request reason under a newly
+// skipped result"). Before this fix the UPDATE never touched decision/
+// decision_reason at all.
+func TestCleanSkipBelowMinimumMembersRecordsItsOwnReason(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "preclaim-reason", now)
+	decideAndApplyRequest(t, st, f, now) // decision_reason = a REQUEST reason
+
+	before := triageRow(t, st, f.IncidentID)
+	if !before.DecisionReason.Valid || before.DecisionReason.String == situation.DecisionReasonEligibilityPolicyMinimumMembers {
+		t.Fatalf("fixture precondition: decision_reason = %+v, want a request reason before the skip", before.DecisionReason)
+	}
+
+	got, err := st.CleanSkipIncidentTriageBelowMinimumMembers(ctx, f.IncidentID, 2, now.Add(time.Minute))
+	if err != nil || !got.Skipped {
+		t.Fatalf("clean skip below minimum: %+v, %v", got, err)
+	}
+
+	after := triageRow(t, st, f.IncidentID)
+	if after.Phase != "skipped" {
+		t.Fatalf("phase = %q, want skipped", after.Phase)
+	}
+	if !after.Decision.Valid || after.Decision.String != situation.TriageDecisionSkip {
+		t.Fatalf("decision = %+v, want %q", after.Decision, situation.TriageDecisionSkip)
+	}
+	if !after.DecisionReason.Valid || after.DecisionReason.String != situation.DecisionReasonEligibilityPolicyMinimumMembers {
+		t.Fatalf("decision_reason = %+v, want %q — the eligibility-policy skip's own reason, not the earlier request's",
+			after.DecisionReason, situation.DecisionReasonEligibilityPolicyMinimumMembers)
 	}
 }
 

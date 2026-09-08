@@ -206,6 +206,7 @@ func briefingDisplayScope(labels map[string]string) string {
 func committedOperatorBriefing(in SnapshotInput, commit ControllerCommit) *model.OperatorBriefing {
 	in = committedBriefingInput(in, commit.TriageDecisions)
 	b := BuildOperatorBriefing(in, commit.Lifecycle)
+	b.Work = BuildWorkProjection(in.Incidents, commit.GraceUntil, commit.Assessment.ActionContract.NextUpdateAt)
 	c := commit.Assessment.ActionContract
 	if commit.Lifecycle.Terminal() || c.AlertINTAction == nil || c.AlertINTStatus == nil || *c.AlertINTStatus != model.AlertINTStatusWaiting || c.WaitReason == nil {
 		return b
@@ -247,27 +248,33 @@ func briefingWorkCounts(incidents []IncidentState) (failed, pending, unavailable
 	return failed, pending, unavailable
 }
 
-// Overlay only the work phases this commit will persist, on a presentation
-// copy. The coherent input and snapshot remain the original assessment basis.
+// Overlay only the work phases (and, for a freshly skipped row, the exact
+// reason this cycle decided) this commit will persist, on a presentation
+// copy. The coherent input and snapshot remain the original assessment
+// basis. Shares effectiveTriagePhase with aggregateTriagePhase/
+// earliestTriageDue (controller.go) so the presentation overlay and the
+// controller's own aggregate can never disagree (B0 integration contract
+// §3; S2-02's "committed projection agrees with durable work").
 func committedBriefingInput(in SnapshotInput, decisions []TriageDecision) SnapshotInput {
+	byIncident := decisionsByIncident(decisions)
 	in.Incidents = append([]IncidentState(nil), in.Incidents...)
 	for i := range in.Incidents {
-		// A refresh request on pending/backoff work does not change its
-		// persisted phase or due time. Only awaiting_decision advances here.
-		if in.Incidents[i].Triage.Phase != "awaiting_decision" {
+		inc := &in.Incidents[i]
+		phase := effectiveTriagePhase(*inc, byIncident)
+		if phase == inc.Triage.Phase {
 			continue
 		}
-		for _, d := range decisions {
-			if d.IncidentID != in.Incidents[i].ID {
-				continue
-			}
-			switch d.Decision {
-			case TriageDecisionSkip:
-				in.Incidents[i].Triage.Phase = "skipped"
-			case TriageDecisionRequest:
-				in.Incidents[i].Triage.Phase = "pending"
-			}
+		inc.Triage.Phase = phase
+		// A phase move only ever happens from awaiting_decision, where the
+		// prior decision_reason is always nil — this cycle's fresh reason
+		// is the only one that can apply, never a stale reason left over
+		// from a different decision (plan.md: "do not keep an old request
+		// reason under a newly skipped result").
+		if d, ok := byIncident[inc.ID]; ok {
+			reason := d.DecisionReason
+			inc.Triage.DecisionReason = &reason
 		}
+		inc.Triage.SkipReason = triageSkipReason(inc.Triage)
 	}
 	return in
 }
@@ -288,7 +295,24 @@ func briefingValues(values map[string]bool, limit int) []string {
 }
 
 func operatorBriefingChanged(a, b *model.OperatorBriefing) bool {
-	return canonicalDigest(a) != canonicalDigest(b)
+	return canonicalDigest(briefingMaterialityView(a)) != canonicalDigest(briefingMaterialityView(b))
+}
+
+// briefingMaterialityView strips Work.StatusCheckpointAt before comparison:
+// ActionContract.NextUpdateAt (its source, see BuildWorkProjection) ticks
+// every cadence cycle by design and must never by itself make an R4
+// deadline-refresh cycle look materially changed — the exact reason
+// operatorContractTuple already excludes NextUpdateAt from the Operator
+// contract's own materiality tuple. This changes only whether a Transition
+// gets created (history.go's selectControllerReason), never reply
+// eligibility or rendering.
+func briefingMaterialityView(b *model.OperatorBriefing) *model.OperatorBriefing {
+	if b == nil {
+		return nil
+	}
+	cp := *b
+	cp.Work.StatusCheckpointAt = nil
+	return &cp
 }
 
 // A repeated judgment's clock or paraphrased cause does not establish new

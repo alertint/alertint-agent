@@ -1246,10 +1246,11 @@ func (s *Store) CleanSkipIncidentTriageBelowMinimumMembers(ctx context.Context, 
 
 	res, err := tx.ExecContext(ctx, `
 		UPDATE incident_triage
-		SET phase = 'skipped', next_at = NULL, last_error_code = NULL, last_error_detail = NULL,
+		SET phase = 'skipped', decision = 'skip', decision_reason = ?,
+		    next_at = NULL, last_error_code = NULL, last_error_detail = NULL,
 		    lease_owner = NULL, lease_expires_at = NULL, current_attempt_id = NULL, updated_at = ?
 		WHERE incident_id = ? AND phase IN ('pending','backoff')`,
-		canonicalTime(now), incidentID)
+		situation.DecisionReasonEligibilityPolicyMinimumMembers, canonicalTime(now), incidentID)
 	if err != nil {
 		return situation.TriageCleanSkip{}, fmt.Errorf("store: clean skip incident triage schedule: %w", err)
 	}

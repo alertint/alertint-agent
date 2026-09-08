@@ -128,6 +128,17 @@ type TriageDecision struct {
 	DecidedAt                                               time.Time
 }
 
+// DecisionReasonEligibilityPolicyMinimumMembers is the store-initiated
+// clean-skip reason CleanSkipIncidentTriageBelowMinimumMembers records: an
+// eligibility policy (minimum member count), not exact prior coverage,
+// excluded this Incident's Acute Triage. Declared here (situation package,
+// this package's own closed vocabulary for decision_reason codes — the same
+// pattern DecisionReasonCleanSkip and the ParkedReason* codes use) so the
+// store can reference it without owning the meaning, and so
+// WorkProjection.SkipReason can tell coverage reuse apart from a policy
+// exclusion (S2-03).
+const DecisionReasonEligibilityPolicyMinimumMembers = "eligibility_policy_minimum_members"
+
 // ControllerCommit is everything one fenced CommitController transaction
 // commits together: the Assessment attempt and its content, the Triage
 // decisions sharing that commit, the projected lifecycle/Attention/
@@ -609,18 +620,58 @@ func retryBackoff(cfg RetryConfig, workAttempt int) time.Duration {
 	return d
 }
 
-// earliestTriageDue returns the earliest NextAt among incidents' pending or
-// backoff Triage rows, treating any Incident this cycle's decisions just
-// moved from awaiting_decision to pending as due immediately (now) — the
-// exact timing applyRequestFromAwaitingDecisionTx persists (next_at=now).
-// Returns nil when no Incident carries pending/backoff Triage work.
-func earliestTriageDue(incidents []IncidentState, decisions []TriageDecision, now time.Time) *time.Time {
-	freshlyRequested := make(map[string]bool, len(decisions))
+// decisionsByIncident indexes decisions by IncidentID for the one lookup
+// every effective-phase computation in this file needs — every cycle
+// commits at most one decision per Incident.
+func decisionsByIncident(decisions []TriageDecision) map[string]TriageDecision {
+	m := make(map[string]TriageDecision, len(decisions))
 	for _, d := range decisions {
-		if d.Decision == TriageDecisionRequest {
-			freshlyRequested[d.IncidentID] = true
-		}
+		m[d.IncidentID] = d
 	}
+	return m
+}
+
+// effectiveTriagePhase returns inc's Triage phase exactly as it will read
+// immediately after this cycle's decisions commit — the same transition
+// applyOneTriageDecisionTx performs (store/triage_controller.go), so a
+// projection built from it can never disagree with the transaction actually
+// committed (B0 integration contract §3; S2-02).
+//
+// Only a decision against an awaiting_decision row is a real phase move
+// (awaiting_decision -> pending on request, awaiting_decision -> skipped on
+// skip). A decision against an existing pending/backoff row is a REFRESH:
+// applyRefreshDecisionTx updates only the decision/digest columns and
+// deliberately leaves phase and next_at untouched, so a refreshed backoff
+// row is still backoff with its own persisted due time — never forced back
+// to "pending, due now" merely because a request decision exists this
+// cycle.
+func effectiveTriagePhase(inc IncidentState, decisions map[string]TriageDecision) string {
+	if inc.Triage.Phase != "awaiting_decision" {
+		return inc.Triage.Phase
+	}
+	d, ok := decisions[inc.ID]
+	if !ok {
+		return inc.Triage.Phase
+	}
+	switch d.Decision {
+	case TriageDecisionRequest:
+		return "pending"
+	case TriageDecisionSkip:
+		return "skipped"
+	default:
+		return inc.Triage.Phase
+	}
+}
+
+// earliestTriageDue returns the earliest NextAt among incidents' pending or
+// backoff Triage rows (using effectiveTriagePhase, so a refreshed backoff
+// row's persisted due time is preserved rather than overridden), treating
+// an Incident this cycle's decisions genuinely just moved from
+// awaiting_decision to pending as due immediately (now) — the exact timing
+// applyRequestFromAwaitingDecisionTx persists (next_at=now). Returns nil
+// when no Incident carries pending/backoff Triage work.
+func earliestTriageDue(incidents []IncidentState, decisions []TriageDecision, now time.Time) *time.Time {
+	byIncident := decisionsByIncident(decisions)
 
 	var earliest *time.Time
 	consider := func(t time.Time) {
@@ -629,11 +680,13 @@ func earliestTriageDue(incidents []IncidentState, decisions []TriageDecision, no
 		}
 	}
 	for _, inc := range incidents {
-		if freshlyRequested[inc.ID] {
-			consider(now)
-			continue
+		if inc.Triage.Phase == "awaiting_decision" {
+			if d, ok := byIncident[inc.ID]; ok && d.Decision == TriageDecisionRequest {
+				consider(now)
+				continue
+			}
 		}
-		switch inc.Triage.Phase {
+		switch effectiveTriagePhase(inc, byIncident) {
 		case "pending", "backoff":
 			if inc.Triage.NextAt != nil {
 				consider(*inc.Triage.NextAt)
@@ -645,27 +698,19 @@ func earliestTriageDue(incidents []IncidentState, decisions []TriageDecision, no
 	return earliest
 }
 
-// aggregateTriagePhase reduces every member Incident's Triage phase (as it
-// will read AFTER this cycle's decisions apply — a fresh request decision
-// moves an awaiting_decision row to pending) to the single closed TriagePhase
-// DeriveActionContract's priority list consumes: in_flight outranks
-// awaiting/pending, which outranks backoff, which outranks "no AlertINT
-// Triage work pending at all".
+// aggregateTriagePhase reduces every member Incident's Triage phase — as it
+// will read AFTER this cycle's decisions apply, via effectiveTriagePhase —
+// to the single closed TriagePhase DeriveActionContract's priority list
+// consumes: in_flight outranks awaiting/pending, which outranks backoff,
+// which outranks "no AlertINT Triage work pending at all". A committed skip
+// (effective phase "skipped") contributes to none of these buckets: it must
+// not still project as outstanding awaiting-decision work (S2-02).
 func aggregateTriagePhase(incidents []IncidentState, decisions []TriageDecision) TriagePhase {
-	freshlyRequested := make(map[string]bool, len(decisions))
-	for _, d := range decisions {
-		if d.Decision == TriageDecisionRequest {
-			freshlyRequested[d.IncidentID] = true
-		}
-	}
+	byIncident := decisionsByIncident(decisions)
 
 	hasInFlight, hasAwaiting, hasBackoff := false, false, false
 	for _, inc := range incidents {
-		phase := inc.Triage.Phase
-		if freshlyRequested[inc.ID] {
-			phase = "pending"
-		}
-		switch phase {
+		switch effectiveTriagePhase(inc, byIncident) {
 		case "in_flight":
 			hasInFlight = true
 		case "awaiting_decision", "pending":
@@ -683,6 +728,143 @@ func aggregateTriagePhase(incidents []IncidentState, decisions []TriageDecision)
 		return TriagePhaseBackoff
 	default:
 		return TriagePhaseNone
+	}
+}
+
+// workPhaseOf maps one Incident's raw effective Triage phase string
+// (effectiveTriagePhase's return value) to the richer, closed
+// model.WorkPhase vocabulary S2-01/S2-02/S2-03/S2-07 need.
+func workPhaseOf(rawPhase string) model.WorkPhase {
+	switch rawPhase {
+	case "":
+		return model.WorkPhaseCollecting
+	case "awaiting_decision":
+		return model.WorkPhaseAwaitingDecision
+	case "pending":
+		return model.WorkPhaseQueued
+	case "in_flight":
+		return model.WorkPhaseExecuting
+	case "backoff":
+		return model.WorkPhaseRetryWait
+	case "skipped":
+		return model.WorkPhaseSettled
+	case "exhausted":
+		return model.WorkPhaseExhausted
+	default:
+		return model.WorkPhaseNone
+	}
+}
+
+// aggregateWorkPhase reduces every member Incident's WorkPhase to the
+// Situation-level disposition (B0 integration contract §3): executing
+// outranks everything; a queued Incident ranks above retry_wait only once
+// some OTHER Incident in this Situation has actually executed
+// (executionStarted) — otherwise queued/awaiting-decision work that has
+// never executed anywhere in this Situation ranks below retry_wait. Settled
+// work ranks below exhausted: a Situation is not "done" while it still has
+// a genuinely undecided/unstarted Incident, even if a sibling already
+// exhausted its own schedule (this mirrors the canonical HTML's
+// "exhausted-other-running" example: one exhausted plus one running still
+// aggregates to executing).
+func aggregateWorkPhase(phases []model.WorkPhase, executionStarted bool) model.WorkPhase {
+	has := func(p model.WorkPhase) bool {
+		for _, ph := range phases {
+			if ph == p {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case has(model.WorkPhaseExecuting):
+		return model.WorkPhaseExecuting
+	case has(model.WorkPhaseQueued) && executionStarted:
+		return model.WorkPhaseQueued
+	case has(model.WorkPhaseRetryWait):
+		return model.WorkPhaseRetryWait
+	case has(model.WorkPhaseQueued):
+		return model.WorkPhaseQueued
+	case has(model.WorkPhaseAwaitingDecision):
+		return model.WorkPhaseAwaitingDecision
+	case has(model.WorkPhaseExhausted):
+		return model.WorkPhaseExhausted
+	case has(model.WorkPhaseSettled):
+		return model.WorkPhaseSettled
+	case has(model.WorkPhaseCollecting):
+		return model.WorkPhaseCollecting
+	default:
+		return model.WorkPhaseNone
+	}
+}
+
+// triageSkipReason maps t's recorded disposition to WorkProjection's closed
+// SkipReason vocabulary. "" unless t.Phase == "skipped": an unrecognized or
+// absent decision_reason under a skipped schedule reports "" rather than
+// guessing, so a caller can tell "genuinely unknown" apart from a mapped
+// value.
+func triageSkipReason(t TriageState) string {
+	if t.Phase != "skipped" {
+		return ""
+	}
+	if t.DecisionReason == nil {
+		return ""
+	}
+	switch *t.DecisionReason {
+	case DecisionReasonCleanSkip:
+		return "prior_coverage"
+	case DecisionReasonEligibilityPolicyMinimumMembers:
+		return "eligibility_policy"
+	default:
+		return ""
+	}
+}
+
+// BuildWorkProjection reduces incidents — already overlaid with this
+// cycle's committed decisions by committedBriefingInput, so their Triage
+// fields read exactly as they will after commit — to the single coherent
+// Situation-level WorkProjection B3/B4/B5 consume (B0 integration contract
+// §3; required outcome: "scope, reasons and deadlines have provenance and
+// are not guessed from display text"). graceUntil and statusCheckpointAt
+// are threaded straight through from this cycle's committed lifecycle
+// resolution and Operator contract; BuildWorkProjection derives nothing
+// about them itself.
+func BuildWorkProjection(incidents []IncidentState, graceUntil, statusCheckpointAt *time.Time) model.WorkProjection {
+	phases := make([]model.WorkPhase, 0, len(incidents))
+	executionStarted := false
+	remaining := 0
+	skipReason := ""
+	var retryAt *time.Time
+
+	for _, inc := range incidents {
+		phase := workPhaseOf(inc.Triage.Phase)
+		phases = append(phases, phase)
+		if inc.Triage.Attempts > 0 {
+			executionStarted = true
+		}
+		switch phase {
+		case model.WorkPhaseAwaitingDecision, model.WorkPhaseQueued, model.WorkPhaseExecuting, model.WorkPhaseRetryWait:
+			remaining++
+		}
+		if phase == model.WorkPhaseRetryWait && inc.Triage.NextAt != nil {
+			if retryAt == nil || inc.Triage.NextAt.Before(*retryAt) {
+				retryAt = inc.Triage.NextAt
+			}
+		}
+		if phase == model.WorkPhaseSettled && skipReason == "" {
+			if reason := triageSkipReason(inc.Triage); reason != "" {
+				skipReason = reason
+			}
+		}
+	}
+
+	return model.WorkProjection{
+		Phase:              aggregateWorkPhase(phases, executionStarted),
+		ExecutionStarted:   executionStarted,
+		RemainingIncidents: remaining,
+		SkipReason:         skipReason,
+		RetryEligibleAt:    retryAt,
+		SourceGraceUntil:   graceUntil,
+		StatusCheckpointAt: statusCheckpointAt,
 	}
 }
 

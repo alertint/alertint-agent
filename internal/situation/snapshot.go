@@ -195,6 +195,41 @@ type TriageState struct {
 	// "no Finding yet" (a legitimate state for a pending/in-flight
 	// Incident), never as confirmed-empty evidence.
 	LatestAttempt *TriageAttemptResult
+
+	// ActiveAttempt is the current in_flight row named by current_attempt_id,
+	// and LastExecution is the most recent attempt row regardless of
+	// outcome (B0 integration contract §3) — both nil until
+	// internal/store/situation_controller.go's loadSituationIncidentStatesTx
+	// joins incident_triage_attempts to populate them. That file is outside
+	// this chunk's (B2's) file allowlist; B2 declares the accepted shape
+	// here without wiring the read, and does not infer ExecutionStarted
+	// from these two fields (see WorkProjection.ExecutionStarted, which
+	// uses the already-durable Attempts counter instead). Reported to the
+	// lead as an open interface gap for a future chunk, not silently
+	// expanded into.
+	ActiveAttempt *TriageExecution
+	LastExecution *TriageExecution
+
+	// SkipReason is this Incident's own mapped skip disposition — ""
+	// unless Phase == "skipped" — set by the presentation-copy overlay in
+	// committedBriefingInput from the exact decision this cycle committed
+	// (never a stale prior request reason under a newly skipped result).
+	// See WorkProjection.SkipReason for the Situation-level aggregate B3/B4
+	// actually consume.
+	SkipReason string
+}
+
+// TriageExecution is one incident_triage_attempts row's frozen claim-time
+// identity and inputs, as far as this package can express it today (B0
+// integration contract §3): the actual execution start plus the exact
+// member delivery IDs claimed with it, distinct from an Incident's current
+// (possibly since-changed) membership. See TriageState.ActiveAttempt/
+// LastExecution's doc comment for why this tree cannot yet populate one.
+type TriageExecution struct {
+	AttemptID         string
+	AttemptNumber     int
+	StartedAt         time.Time
+	MemberDeliveryIDs []string
 }
 
 // TriageAttemptResult is the most recent completed incident_triage_attempts

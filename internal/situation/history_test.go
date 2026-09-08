@@ -1297,8 +1297,13 @@ func TestProjectEpisodeOrientationStateMachine(t *testing.T) {
 		c.Situation.RecoveryObservedAt = timePtr(c.Now)
 		c.Projection.RecoveryObservedAt = timePtr(c.Now)
 	})
-	if got := DeriveOrientation(sum, monitoring); got != OrientationMonitoring {
-		t.Fatalf("orientation = %q, want %q", got, OrientationMonitoring)
+	// B2 (S1-05/S4-01): recovery_pending is now its own distinct
+	// Confirming-recovery orientation rather than collapsing into the same
+	// Monitoring label ordinary settled/exhausted work uses — the canonical
+	// slides require operators be able to tell "still confirming recovery"
+	// apart from "no current investigation work remains".
+	if got := DeriveOrientation(sum, monitoring); got != OrientationConfirmingRecovery {
+		t.Fatalf("orientation = %q, want %q", got, OrientationConfirmingRecovery)
 	}
 
 	refired, refiredSum := step(monitoring, sum, 10, nil)

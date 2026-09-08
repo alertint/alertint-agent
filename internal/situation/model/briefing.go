@@ -87,6 +87,100 @@ type OperatorBriefing struct {
 	Unavailable   int                `json:"unavailable,omitempty"`
 	Analyses      []IncidentAnalysis `json:"analyses,omitempty"`
 	Historical    bool               `json:"historical,omitempty"`
+
+	// Work is the aggregate, per-Situation acute-triage work disposition
+	// (B0 integration contract §3, accepted 2026-09-08): a coherent
+	// projection of durable IncidentState/TriageState facts B3/B4/B5
+	// consume instead of re-deriving their own reading of raw Triage
+	// phases. Zero value (Work.Phase == "") means this Transition predates
+	// the field (legacy replay) — never a real "no work" disposition,
+	// which is WorkPhaseNone.
+	Work WorkProjection `json:"work"`
+}
+
+// WorkPhase is one closed-vocabulary Acute Triage work disposition, richer
+// than the older 4-value TriagePhase enum DeriveActionContract still reads:
+// it tells apart "not yet reached ready" from "decided but not yet
+// executing" from "actually executing" from "settled with no further
+// automatic work" — the distinctions slide 2 (MINIMAL 2.2) requires and the
+// ported presentation collapsed (S2-01/S2-02/S2-03/S2-07).
+type WorkPhase string
+
+const (
+	// WorkPhaseCollecting is an Incident that has not yet reached "ready" —
+	// no incident_triage row exists yet (TriageState.Phase == "").
+	WorkPhaseCollecting WorkPhase = "collecting"
+	// WorkPhaseAwaitingDecision is a ready Incident whose Triage schedule
+	// has never received a controller decision.
+	WorkPhaseAwaitingDecision WorkPhase = "awaiting_decision"
+	// WorkPhaseQueued is a durable request with no attempt claimed yet —
+	// never evidence that execution has actually begun.
+	WorkPhaseQueued WorkPhase = "queued"
+	// WorkPhaseExecuting is a fenced attempt actually running.
+	WorkPhaseExecuting WorkPhase = "executing"
+	// WorkPhaseRetryWait is a failed attempt with a persisted, bounded
+	// retry time — distinct from a generic status checkpoint.
+	WorkPhaseRetryWait WorkPhase = "retry_wait"
+	// WorkPhaseSettled is a clean skip (coverage reuse or an eligibility
+	// policy) — no further automatic work on this schedule, and never a
+	// fabricated analysis success.
+	WorkPhaseSettled WorkPhase = "settled"
+	// WorkPhaseExhausted is a schedule that spent its final failure/attempt
+	// budget — the investigation's own end, independent of source
+	// lifecycle/monitoring.
+	WorkPhaseExhausted WorkPhase = "exhausted"
+	// WorkPhaseNone means no member Incident carries any Triage work at
+	// all — a genuine "nothing outstanding", not a legacy zero value.
+	WorkPhaseNone WorkPhase = "none"
+)
+
+// WorkProjection is the aggregate, per-Situation acute-triage work
+// disposition B2 derives from durable IncidentState/TriageState facts —
+// never guessed from display text and never inferred from a request or
+// decision alone (B0 integration contract §3).
+type WorkProjection struct {
+	// Phase is the aggregate disposition across every member Incident's
+	// Triage schedule. Precedence: executing > queued (once some Incident
+	// has actually executed) > retry_wait > awaiting_decision/queued
+	// (before any execution) > exhausted > settled > collecting > none.
+	Phase WorkPhase `json:"phase"`
+	// ExecutionStarted is true only when some member Incident's Triage
+	// schedule has actually claimed an attempt (TriageState.Attempts > 0,
+	// equivalently ActiveAttempt/LastExecution once a future chunk wires
+	// their durable read) — NEVER inferred from a request or decision
+	// alone, and NEVER from a clean skip (a skip is a decision, not an
+	// attempt).
+	ExecutionStarted bool `json:"execution_started"`
+	// InvestigatedAlertIDs/InvestigatedNames are the recorded investigation
+	// input this Situation's actual execution(s) used — bounded, and
+	// distinct from Situation.Total. Left empty until a future chunk wires
+	// TriageState.ActiveAttempt/LastExecution's member-delivery provenance
+	// (internal/store/situation_controller.go's loadSituationIncidentStatesTx,
+	// outside this chunk's file allowlist — see TriageExecution's doc
+	// comment).
+	InvestigatedAlertIDs []string `json:"investigated_alert_ids,omitempty"`
+	InvestigatedNames    []string `json:"investigated_names,omitempty"`
+	// RemainingIncidents counts member Incidents whose Triage schedule
+	// still has outstanding automatic work (awaiting_decision, queued,
+	// executing, or retry_wait) — not the Situation's total member count.
+	RemainingIncidents int `json:"remaining_incidents"`
+	// SkipReason is the dominant settled Incident's recorded disposition:
+	// "" (none settled), "prior_coverage" (exact trustworthy coverage
+	// reuse), or "eligibility_policy" (a policy such as minimum members
+	// excluded the work) — mapped from the durable decision_reason /
+	// clean-skip code, never guessed from display text.
+	SkipReason string `json:"skip_reason,omitempty"`
+	// RetryEligibleAt is the earliest persisted retry_wait next_at across
+	// member Incidents, or nil when no retry exists (including every
+	// exhausted schedule, which never has one).
+	RetryEligibleAt *time.Time `json:"retry_eligible_at,omitempty"`
+	// SourceGraceUntil is the committed recovery-grace deadline, carried
+	// here so a renderer never needs a second read to tell a retry-due time
+	// apart from the recovery deadline.
+	SourceGraceUntil *time.Time `json:"source_grace_until,omitempty"`
+	// StatusCheckpointAt is ActionContract.NextUpdateAt — a status check,
+	// never a reply promise (spec.md's status-checkpoint fallback).
+	StatusCheckpointAt *time.Time `json:"status_checkpoint_at,omitempty"`
 }
 
 // OperatorDelta captures what changed relative to the prior committed state.
