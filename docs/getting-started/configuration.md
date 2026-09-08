@@ -2,7 +2,7 @@
 title: "Configuration"
 description: "Complete YAML configuration reference for the AlertINT agent."
 section: "Getting started"
-order: 2
+order: 3
 slug: "configuration"
 ---
 

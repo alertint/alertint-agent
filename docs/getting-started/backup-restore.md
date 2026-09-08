@@ -2,7 +2,7 @@
 title: "Backup & restore"
 description: "Consistent live backups of the agent's SQLite state, and a restore path that works without stopping anything but the agent itself — including on Kubernetes."
 section: "Getting started"
-order: 3
+order: 4
 slug: "backup-restore"
 ---
 
