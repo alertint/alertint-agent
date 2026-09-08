@@ -59,6 +59,17 @@ var ErrTriageNotDue = errors.New("store: incident triage row is not yet due")
 const triageDecisionOriginController = "controller_decision"
 const triageDecisionOriginUpgrade = "upgrade_existing_schedule"
 
+// maxIncidentTriageAttempts mirrors migration 0016's own hard schema bound
+// (incident_triage.attempts and incident_triage_attempts.attempt_number both
+// CHECK <= 5) and triage_worker.go's defaultTriageWorkerMaxAttempts. A stale
+// completion (unlike a failure) restores awaiting_decision unconditionally,
+// with no attempts ceiling of its own (S2-04) — ClaimIncidentTriageAttempt
+// checks this bound explicitly so a schedule already at its final attempt,
+// renewed by a fresh controller decision, fails closed with a typed
+// sentinel instead of a raw CHECK-constraint violation surfacing from the
+// insert below.
+const maxIncidentTriageAttempts = 5
+
 // ----------------------------------------------------------------------
 // Shared helpers.
 // ----------------------------------------------------------------------
@@ -397,16 +408,17 @@ func (s *Store) ClaimIncidentTriageAttempt(ctx context.Context, incidentID, owne
 
 	var phase string
 	var attempts int
-	var situationID, groupKey, nextAtStr sql.NullString
+	var situationID, groupKey, nextAtStr, situationLifecycle sql.NullString
 	var decisionInputVersion sql.NullInt64
 	var decidedMembershipDigest, decidedIncidentInputDigest sql.NullString
 	err = tx.QueryRowContext(ctx, `
 		SELECT t.phase, t.attempts, t.situation_id, t.decision_input_version, t.next_at, i.group_key,
-		       t.membership_digest, t.incident_input_digest
+		       t.membership_digest, t.incident_input_digest, s.lifecycle
 		FROM incident_triage t JOIN incidents i ON i.id = t.incident_id
+		LEFT JOIN situations s ON s.id = t.situation_id
 		WHERE t.incident_id = ? AND i.status = 'ready'`, incidentID).
 		Scan(&phase, &attempts, &situationID, &decisionInputVersion, &nextAtStr, &groupKey,
-			&decidedMembershipDigest, &decidedIncidentInputDigest)
+			&decidedMembershipDigest, &decidedIncidentInputDigest, &situationLifecycle)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ClaimedTriageAttempt{}, ErrNotFound
 	}
@@ -425,6 +437,25 @@ func (s *Store) ClaimIncidentTriageAttempt(ctx context.Context, incidentID, owne
 	}
 	if !situationID.Valid || !decisionInputVersion.Valid {
 		return ClaimedTriageAttempt{}, ErrTriageNotDecided
+	}
+	// S2-04: a stale completion (unlike a failure) restores awaiting_decision
+	// unconditionally regardless of attempts already spent (completeStaleTx
+	// carries no ceiling of its own); a renewed controller decision against
+	// an already-exhausted schedule must fail closed here, not on the raw
+	// CHECK constraints below.
+	if attempts >= maxIncidentTriageAttempts {
+		return ClaimedTriageAttempt{}, ErrNotFound
+	}
+	// S2-06: the owning Situation may have terminalized (closure) after this
+	// row's decision was recorded but before any worker claimed it — a
+	// pending decision authorized triage against the Situation as it stood
+	// at decision time, not against a Situation whose own lifecycle has
+	// since ended. Refuse exactly like any other "nothing legitimately
+	// claimable right now" race (ErrNotFound); a genuinely new firing is
+	// admitted as a separate linked Situation, never by resurrecting work
+	// under the terminal one.
+	if situationLifecycle.Valid && situationmodel.Lifecycle(situationLifecycle.String).Terminal() {
+		return ClaimedTriageAttempt{}, ErrNotFound
 	}
 
 	membership, inputDigest, err := incidentDigestsTx(ctx, tx, incidentID)
@@ -1421,7 +1452,7 @@ func (s *Store) RecoverExpiredIncidentTriageAttempts(ctx context.Context, now ti
 	recovered := 0
 	for _, r := range expired {
 		var opErr error
-		if r.attempts >= 5 {
+		if r.attempts >= maxIncidentTriageAttempts {
 			opErr = s.ExhaustIncidentTriageAttempt(ctx, r.attemptID, r.incidentID, code, detail, now)
 		} else {
 			opErr = s.BackoffIncidentTriageAttempt(ctx, r.attemptID, r.incidentID, now, code, detail, now)

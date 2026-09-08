@@ -558,6 +558,53 @@ func TestClaimDueIncidentTriageMembershipChangedSinceDecisionRefusesToClaim(t *t
 	}
 }
 
+// TestClaimDueIncidentTriageAgainstTerminalOwnerRefusesToClaim is S2-06's
+// claim-side closure race (slide 2 notes: "source lifecycle closes before
+// claim... Verify current authorization, bounded work and no misleading
+// resurrection" — a required release check, not a reproduced bug). The
+// owning Situation terminalizes while the incident's decided request is
+// still sitting pending, before any worker claims it. A pending decision
+// authorized triage against the Situation as it stood at decision time; it
+// does not authorize dispatching new analysis work once that Situation's
+// own lifecycle has since ended.
+func TestClaimDueIncidentTriageAgainstTerminalOwnerRefusesToClaim(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "claim-terminal-owner", now)
+	decideAndApplyRequest(t, st, f, now)
+
+	terminalAt := now.Add(time.Hour)
+	if _, err := st.db.ExecContext(ctx, `
+		UPDATE situations SET lifecycle='closed_unknown', terminal_at=?, terminal_reason='resolution_missing', updated_at=?
+		WHERE id=?`, canonicalTime(terminalAt), canonicalTime(terminalAt), f.SituationID); err != nil {
+		t.Fatalf("terminalize fixture situation: %v", err)
+	}
+
+	if _, err := st.ClaimIncidentTriageAttempt(ctx, f.IncidentID, "worker-1", now.Add(2*time.Hour), time.Minute); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("claim against an incident whose owning Situation already terminalized = %v, want ErrNotFound", err)
+	}
+
+	after := triageRow(t, st, f.IncidentID)
+	if after.Phase != "pending" || after.Attempts != 0 || after.CurrentAttemptID.Valid {
+		t.Fatalf("triage row changed by a refused claim: %+v", after)
+	}
+	var attemptCount int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM incident_triage_attempts WHERE incident_id = ?`, f.IncidentID).Scan(&attemptCount); err != nil {
+		t.Fatal(err)
+	}
+	if attemptCount != 0 {
+		t.Fatalf("incident_triage_attempts rows = %d, want 0 (no unauthorized work admitted after owner closure)", attemptCount)
+	}
+	var situationLifecycle string
+	if err := st.db.QueryRowContext(ctx, `SELECT lifecycle FROM situations WHERE id = ?`, f.SituationID).Scan(&situationLifecycle); err != nil {
+		t.Fatal(err)
+	}
+	if situationLifecycle != "closed_unknown" {
+		t.Fatalf("situation lifecycle = %q, want closed_unknown (a refused claim must never resurrect the owner)", situationLifecycle)
+	}
+}
+
 // TestClaimDueIncidentTriageBackoffRowNotYetDueFailsWithErrTriageNotDue pins
 // the claim boundary's due-gate: a backoff row whose next_at has not
 // arrived is claimable-shaped (decided, pending/backoff phase) but must
@@ -809,6 +856,100 @@ func TestCompleteIncidentTriageAttemptStaleIncidentInputRestoresAwaitingDecision
 	tr := triageRow(t, st, f.IncidentID)
 	if tr.Phase != "awaiting_decision" {
 		t.Fatalf("phase = %q, want awaiting_decision", tr.Phase)
+	}
+}
+
+// TestCompleteIncidentTriageAttemptFinalAttemptStaleThenRenewedDecisionStaysBounded
+// is S2-04: "Exercise the final allowed attempt becoming stale, renewed
+// decision... Verify bounded attempt accounting and no stranded runnable
+// schedule from a constraint failure. This sequence is a risk to
+// investigate, not a previously proven runaway bug" (plan.md). A stale
+// completion (unlike a failure) does not go through
+// BackoffIncidentTriageAttempt/ExhaustIncidentTriageAttempt's own
+// attempts>=MaxAttempts ceiling (triage_worker.go) at all —
+// completeStaleTx unconditionally restores awaiting_decision regardless of
+// how many attempts remain. If the row's FIFTH (final, migration 0016's own
+// attempts<=5 CHECK) attempt completes stale and the controller then
+// renews its decision (a fresh "request"), the exact same schedule is one
+// claim away from a sixth attempt — verify that claim is refused cleanly,
+// not left to fail on a raw SQL CHECK-constraint violation.
+func TestCompleteIncidentTriageAttemptFinalAttemptStaleThenRenewedDecisionStaysBounded(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "stale-final-attempt", now)
+	decideAndApplyRequest(t, st, f, now)
+
+	// Fast-forward straight to "four attempts already spent" rather than
+	// looping four real claim/complete cycles — attempts/attempt_number are
+	// independent columns (incident_triage vs. incident_triage_attempts), so
+	// this claim will legitimately mint attempt_number 5, the schedule's
+	// last allowed one.
+	if _, err := st.db.ExecContext(ctx, `UPDATE incident_triage SET attempts = 4 WHERE incident_id = ?`, f.IncidentID); err != nil {
+		t.Fatalf("fast-forward attempts: %v", err)
+	}
+
+	claim, err := st.ClaimIncidentTriageAttempt(ctx, f.IncidentID, "worker-1", now, time.Minute)
+	if err != nil {
+		t.Fatalf("claim the final (5th) attempt: %v", err)
+	}
+	if claim.AttemptNumber != 5 {
+		t.Fatalf("AttemptNumber = %d, want 5 (the fixture invariant this test depends on)", claim.AttemptNumber)
+	}
+
+	// Membership changes mid-flight, same shape as
+	// TestCompleteIncidentTriageAttemptStaleMembershipRestoresAwaitingDecision
+	// — this final attempt's own output is not current authority.
+	dels, err := st.AcceptDeliveries(ctx, []DeliveryInput{deliveryFixture("delivery-2-"+f.GroupKey, "fp-2-"+f.GroupKey, now.Add(30*time.Second))})
+	if err != nil || len(dels) != 1 {
+		t.Fatalf("accept second delivery: %v", err)
+	}
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO incident_alert_deliveries (incident_id, delivery_id, created_at) VALUES (?, ?, ?)`,
+		f.IncidentID, dels[0].ID, canonicalTime(now.Add(30*time.Second))); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := st.CompleteIncidentTriageAttempt(ctx, claim.AttemptID, f.IncidentID, sampleFinding(), now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("complete final attempt as stale: %v", err)
+	}
+	if result.Outcome != TriageCompletionStaleMembership {
+		t.Fatalf("Outcome = %q, want stale_membership", result.Outcome)
+	}
+	tr := triageRow(t, st, f.IncidentID)
+	if tr.Phase != "awaiting_decision" || tr.Attempts != 5 {
+		t.Fatalf("phase=%q attempts=%d after the final attempt goes stale, want awaiting_decision/5 (consumed, not refunded)", tr.Phase, tr.Attempts)
+	}
+
+	// The controller renews its decision against the now-current inputs —
+	// applyRequestFromAwaitingDecisionTx itself carries no attempts ceiling
+	// (that bound lives in triage_worker.go's failure-completion path, which
+	// a stale completion never goes through).
+	freshMembership, freshInput := digestsForTest(t, st, f.IncidentID)
+	renewed := requestDecisionFor(f, "membership_changed", now.Add(2*time.Minute))
+	renewed.MembershipDigest, renewed.IncidentInputDigest = freshMembership, freshInput
+	applyDecisionsTx(t, st, []situation.TriageDecision{renewed}, now.Add(2*time.Minute))
+	if got := triageRow(t, st, f.IncidentID); got.Phase != "pending" {
+		t.Fatalf("phase after renewed decision = %q, want pending (fixture invariant)", got.Phase)
+	}
+
+	// The sixth claim must fail cleanly (a typed sentinel from a bounded
+	// check), never as a raw SQL CHECK-constraint violation surfacing out of
+	// ClaimIncidentTriageAttempt.
+	_, claimErr := st.ClaimIncidentTriageAttempt(ctx, f.IncidentID, "worker-2", now.Add(3*time.Minute), time.Minute)
+	if claimErr == nil {
+		t.Fatal("a sixth claim succeeded — the bounded five-attempt schedule was not preserved across a stale-then-renewed final attempt")
+	}
+	if !errors.Is(claimErr, ErrNotFound) && !errors.Is(claimErr, ErrTriageNotDecided) {
+		t.Fatalf("sixth claim failed with %v, want a typed sentinel (ErrNotFound/ErrTriageNotDecided), not a raw constraint error surfacing to the caller", claimErr)
+	}
+	var attemptCount int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM incident_triage_attempts WHERE incident_id = ?`, f.IncidentID).Scan(&attemptCount); err != nil {
+		t.Fatal(err)
+	}
+	if attemptCount != 1 {
+		t.Fatalf("incident_triage_attempts rows = %d, want 1 (no sixth attempt ledger row ever inserted)", attemptCount)
 	}
 }
 
