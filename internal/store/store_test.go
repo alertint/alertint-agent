@@ -129,6 +129,41 @@ func TestUpsertAlert_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestCountAlertsReceived_WindowIsHalfOpen(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	base := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	seed := func(fingerprint string, receivedAt time.Time) {
+		t.Helper()
+		if _, err := s.UpsertAlertByFingerprint(ctx, Alert{
+			ID:          uuid.NewString(),
+			Fingerprint: fingerprint,
+			Status:      "firing",
+			Labels:      map[string]string{"alertname": "X"},
+			Annotations: map[string]string{},
+			StartsAt:    receivedAt,
+			ReceivedAt:  receivedAt,
+		}); err != nil {
+			t.Fatalf("upsert %s: %v", fingerprint, err)
+		}
+	}
+
+	seed("before", base.Add(-time.Second)) // outside window: before since
+	seed("at-since", base)                 // inside: since is inclusive
+	seed("middle", base.Add(30*time.Minute))
+	seed("at-until", base.Add(time.Hour)) // outside window: until is exclusive
+	seed("after", base.Add(2*time.Hour))  // outside window: after until
+
+	got, err := s.CountAlertsReceived(ctx, base, base.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("CountAlertsReceived: %v", err)
+	}
+	if got != 2 {
+		t.Errorf("CountAlertsReceived = %d, want 2 (at-since, middle)", got)
+	}
+}
+
 func TestUpsertAlert_FingerprintDedupeUpdatesInPlace(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

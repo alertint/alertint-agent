@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -171,6 +172,171 @@ func (a *Auditor) Verify(ctx context.Context) (*VerifyReport, error) {
 		return nil, fmt.Errorf("audit: iterate rows: %w", err)
 	}
 	return report, nil
+}
+
+// UsageStats is the aggregate operational summary backing the
+// alertint_usage_stats MCP tool: LLM call/token volume (with a per-model
+// breakdown), Slack delivery outcomes, and incident processing counts, over
+// the half-open window [Since, Until). Alert intake is deliberately absent —
+// no "alert received" kind is ever appended to the audit log, so the MCP
+// handler sources that count from store.CountAlertsReceived instead.
+type UsageStats struct {
+	Since, Until time.Time
+
+	LLMCalls               int
+	LLMInputTokens         int64
+	LLMOutputTokens        int64
+	LLMCacheCreationTokens int64
+	LLMCacheReadTokens     int64
+	LLMByModel             []ModelUsage
+
+	SlackSent    int
+	SlackSkipped int
+
+	IncidentsProcessed int
+	IncidentsFailed    int
+}
+
+// ModelUsage is one (provider, model) breakdown row within
+// UsageStats.LLMByModel. Provider is the audit actor that emitted the calls
+// ("llm.anthropic" or "llm.openaicompat"), not a free-form label.
+type ModelUsage struct {
+	Provider            string
+	Model               string
+	Calls               int
+	InputTokens         int64
+	OutputTokens        int64
+	CacheCreationTokens int64
+	CacheReadTokens     int64
+}
+
+// UsageStats aggregates operational counters from the audit log over the
+// half-open window [since, until). It runs two scoped queries: one grouped
+// count over (actor, kind) for the Slack/incident counters, and one scan of
+// llm.response rows in-window to sum token fields out of their payload_json
+// (that column already carries input/output/cache token counts — see
+// internal/llm/anthropic and internal/llm/openaicompat) and build the
+// per-model breakdown.
+func (a *Auditor) UsageStats(ctx context.Context, since, until time.Time) (UsageStats, error) {
+	sinceStr := since.UTC().Format(time.RFC3339Nano)
+	untilStr := until.UTC().Format(time.RFC3339Nano)
+	out := UsageStats{Since: since.UTC(), Until: until.UTC()}
+
+	if err := a.scanUsageCounts(ctx, sinceStr, untilStr, &out); err != nil {
+		return UsageStats{}, err
+	}
+	if err := a.scanLLMUsage(ctx, sinceStr, untilStr, &out); err != nil {
+		return UsageStats{}, err
+	}
+	return out, nil
+}
+
+// scanUsageCounts fills the Slack and incident counters via one grouped
+// COUNT(*) query over (actor, kind). Any (actor, kind) pair not named below
+// is deliberately ignored — alertint_usage_stats returns a curated summary,
+// not a raw per-kind dump.
+func (a *Auditor) scanUsageCounts(ctx context.Context, sinceStr, untilStr string, out *UsageStats) error {
+	rows, err := a.db.QueryContext(ctx, `
+		SELECT actor, kind, COUNT(*)
+		FROM audit_log
+		WHERE ts >= ? AND ts < ?
+		GROUP BY actor, kind
+	`, sinceStr, untilStr)
+	if err != nil {
+		return fmt.Errorf("audit: usage stats counts: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var actor, kind string
+		var n int
+		if err := rows.Scan(&actor, &kind, &n); err != nil {
+			return fmt.Errorf("audit: usage stats scan: %w", err)
+		}
+		switch {
+		case actor == "notify.slack" && kind == "notify.sent":
+			out.SlackSent = n
+		case actor == "notify.slack" && kind == "notify.skipped":
+			out.SlackSkipped = n
+		case kind == "incident.analyzed":
+			out.IncidentsProcessed = n
+		case kind == "incident.analysis_failed":
+			out.IncidentsFailed = n
+		}
+	}
+	return rows.Err()
+}
+
+// llmResponsePayload is the subset of an llm.response audit payload
+// UsageStats needs — see internal/llm/anthropic/client.go and
+// internal/llm/openaicompat/client.go for the full shape written at Append time.
+type llmResponsePayload struct {
+	Model                    string `json:"model"`
+	InputTokens              int64  `json:"input_tokens"`
+	OutputTokens             int64  `json:"output_tokens"`
+	CacheCreationInputTokens int64  `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int64  `json:"cache_read_input_tokens"`
+}
+
+// scanLLMUsage fills the LLM call/token totals and per-model breakdown by
+// scanning llm.response rows in-window. A row whose payload_json doesn't
+// unmarshal into llmResponsePayload is skipped rather than failing the whole
+// call — it stays out of both the total and the per-model breakdown.
+func (a *Auditor) scanLLMUsage(ctx context.Context, sinceStr, untilStr string, out *UsageStats) error {
+	rows, err := a.db.QueryContext(ctx, `
+		SELECT actor, payload_json
+		FROM audit_log
+		WHERE ts >= ? AND ts < ? AND kind = 'llm.response'
+	`, sinceStr, untilStr)
+	if err != nil {
+		return fmt.Errorf("audit: usage stats llm scan: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	byModel := map[[2]string]*ModelUsage{}
+	for rows.Next() {
+		var actor, payload string
+		if err := rows.Scan(&actor, &payload); err != nil {
+			return fmt.Errorf("audit: usage stats llm row scan: %w", err)
+		}
+		var p llmResponsePayload
+		if err := json.Unmarshal([]byte(payload), &p); err != nil {
+			continue
+		}
+
+		out.LLMCalls++
+		out.LLMInputTokens += p.InputTokens
+		out.LLMOutputTokens += p.OutputTokens
+		out.LLMCacheCreationTokens += p.CacheCreationInputTokens
+		out.LLMCacheReadTokens += p.CacheReadInputTokens
+
+		key := [2]string{actor, p.Model}
+		mu, ok := byModel[key]
+		if !ok {
+			mu = &ModelUsage{Provider: actor, Model: p.Model}
+			byModel[key] = mu
+		}
+		mu.Calls++
+		mu.InputTokens += p.InputTokens
+		mu.OutputTokens += p.OutputTokens
+		mu.CacheCreationTokens += p.CacheCreationInputTokens
+		mu.CacheReadTokens += p.CacheReadInputTokens
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("audit: usage stats llm iterate: %w", err)
+	}
+
+	out.LLMByModel = make([]ModelUsage, 0, len(byModel))
+	for _, mu := range byModel {
+		out.LLMByModel = append(out.LLMByModel, *mu)
+	}
+	sort.Slice(out.LLMByModel, func(i, j int) bool {
+		if out.LLMByModel[i].Provider != out.LLMByModel[j].Provider {
+			return out.LLMByModel[i].Provider < out.LLMByModel[j].Provider
+		}
+		return out.LLMByModel[i].Model < out.LLMByModel[j].Model
+	})
+	return nil
 }
 
 // computeHash returns the hex-encoded SHA-256 of the chained input.
