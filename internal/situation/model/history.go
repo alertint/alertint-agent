@@ -283,9 +283,11 @@ func (a AssessmentConclusion) Validate() error {
 }
 
 // ProjectionFacts is the bounded, immutable slice of the coherent claim the
-// Episode fold and renderers may read (R3). Closed codes and instants only;
-// no prose beyond the bounded Sufficient-reason summary.
+// Episode fold and renderers may read (R3). The optional operator briefing
+// adds bounded selected analysis prose; it never enters assessment prompts.
 type ProjectionFacts struct {
+	OperatorDelta           *OperatorDelta        `json:"operator_delta,omitempty"`
+	Briefing                *OperatorBriefing     `json:"briefing,omitempty"`
 	PublicHandle            *string               `json:"public_handle,omitempty"`
 	EffectiveStartedAt      time.Time             `json:"effective_started_at"`
 	EffectiveStartedAtBasis SourceTimeBasis       `json:"effective_started_at_basis"`
@@ -491,29 +493,30 @@ func (t Transition) Validate() error {
 // content the Situation-owned Slack root renders. Every fold advances
 // Version by exactly one.
 type EpisodeSummary struct {
-	SituationID              string         `json:"situation_id"`
-	PublicHandle             string         `json:"public_handle,omitempty"`
-	Version                  int            `json:"version"`
-	SourceTransitionSequence int            `json:"source_transition_sequence"`
-	Title                    string         `json:"title"`
-	InitialPublicationReason string         `json:"initial_publication_reason,omitempty"`
-	LatestMaterialReason     string         `json:"latest_material_reason,omitempty"`
-	EvidenceConclusion       string         `json:"evidence_conclusion,omitempty"`
-	ImpactSummary            string         `json:"impact_summary,omitempty"`
-	InvestigationWork        []string       `json:"investigation_work"`
-	InvestigationStarted     bool           `json:"investigation_started"`
-	CurrentAttention         Attention      `json:"current_attention"`
-	PeakAttention            Attention      `json:"peak_attention"`
-	ActionContract           ActionContract `json:"action_contract"`
-	RecordedOperatorContext  []string       `json:"recorded_operator_context"`
-	EffectiveStartedAt       time.Time      `json:"effective_started_at"`
-	RecoveryObservedAt       *time.Time     `json:"recovery_observed_at,omitempty"`
-	TerminalAt               *time.Time     `json:"terminal_at,omitempty"`
-	DurationSeconds          *int64         `json:"duration_seconds,omitempty"`
-	RecurrenceCount          int            `json:"recurrence_count"`
-	FinalOutcome             string         `json:"final_outcome,omitempty"`
-	RemainingUncertainty     string         `json:"remaining_uncertainty,omitempty"`
-	UpdatedAt                time.Time      `json:"updated_at"`
+	Briefing                 *OperatorBriefing `json:"briefing,omitempty"`
+	SituationID              string            `json:"situation_id"`
+	PublicHandle             string            `json:"public_handle,omitempty"`
+	Version                  int               `json:"version"`
+	SourceTransitionSequence int               `json:"source_transition_sequence"`
+	Title                    string            `json:"title"`
+	InitialPublicationReason string            `json:"initial_publication_reason,omitempty"`
+	LatestMaterialReason     string            `json:"latest_material_reason,omitempty"`
+	EvidenceConclusion       string            `json:"evidence_conclusion,omitempty"`
+	ImpactSummary            string            `json:"impact_summary,omitempty"`
+	InvestigationWork        []string          `json:"investigation_work"`
+	InvestigationStarted     bool              `json:"investigation_started"`
+	CurrentAttention         Attention         `json:"current_attention"`
+	PeakAttention            Attention         `json:"peak_attention"`
+	ActionContract           ActionContract    `json:"action_contract"`
+	RecordedOperatorContext  []string          `json:"recorded_operator_context"`
+	EffectiveStartedAt       time.Time         `json:"effective_started_at"`
+	RecoveryObservedAt       *time.Time        `json:"recovery_observed_at,omitempty"`
+	TerminalAt               *time.Time        `json:"terminal_at,omitempty"`
+	DurationSeconds          *int64            `json:"duration_seconds,omitempty"`
+	RecurrenceCount          int               `json:"recurrence_count"`
+	FinalOutcome             string            `json:"final_outcome,omitempty"`
+	RemainingUncertainty     string            `json:"remaining_uncertainty,omitempty"`
+	UpdatedAt                time.Time         `json:"updated_at"`
 }
 
 // MarshalJSON canonicalizes InvestigationWork and RecordedOperatorContext

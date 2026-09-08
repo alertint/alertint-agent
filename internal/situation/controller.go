@@ -1224,6 +1224,7 @@ func authoritativeChangeOf(claim Claim, basis historyBasis, commit ControllerCom
 		// this commit's own lifecycle fields — the only thing the Episode
 		// fold may read.
 		Projection: model.ProjectionFacts{
+			Briefing:                committedOperatorBriefing(basis.In, commit),
 			PublicHandle:            sit.PublicHandle,
 			EffectiveStartedAt:      sit.EffectiveStartedAt,
 			EffectiveStartedAtBasis: sit.EffectiveStartedAtBasis,

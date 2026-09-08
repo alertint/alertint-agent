@@ -1251,8 +1251,8 @@ func TestProjectEpisodeRejectsIncoherentFolds(t *testing.T) {
 }
 
 func TestProjectEpisodeOrientationStateMachine(t *testing.T) {
-	// Observed -> Investigating -> Monitoring -> Recovered, plus the refire
-	// return from Monitoring to Investigating.
+	// Current monitoring -> Investigating -> recovery Monitoring -> Recovered,
+	// plus the refire return from Monitoring to Investigating.
 	observedChange := hsChange(t)
 	observedChange.Assessment.ActionContract = hsMonitoringContract(observedChange.Now.Add(time.Minute))
 	observed := hsOnly(t, observedChange)
@@ -1260,8 +1260,8 @@ func TestProjectEpisodeOrientationStateMachine(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProjectEpisode: %v", err)
 	}
-	if got := DeriveOrientation(sum, observed); got != OrientationObserved {
-		t.Fatalf("orientation = %q, want %q", got, OrientationObserved)
+	if got := DeriveOrientation(sum, observed); got != OrientationMonitoring {
+		t.Fatalf("current monitoring contract: orientation = %q, want %q", got, OrientationMonitoring)
 	}
 
 	step := func(prior model.Transition, priorSum model.EpisodeSummary, version int, mut func(c *AuthoritativeChange)) (model.Transition, model.EpisodeSummary) {
@@ -1579,7 +1579,7 @@ func TestProjectEpisodeInvestigationConcludedMarksTheInvestigationStarted(t *tes
 	if !sum.InvestigationStarted {
 		t.Fatal("investigation_concluded must leave InvestigationStarted true")
 	}
-	if got := DeriveOrientation(sum, concluded); got != OrientationInvestigating {
-		t.Fatalf("orientation after conclusion = %q, want %q", got, OrientationInvestigating)
+	if got := DeriveOrientation(sum, concluded); got != OrientationMonitoring {
+		t.Fatalf("orientation after conclusion = %q, want %q", got, OrientationMonitoring)
 	}
 }

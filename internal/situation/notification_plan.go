@@ -151,14 +151,19 @@ func PlanNotificationIntents(in PublicationInput) ([]model.NotificationIntent, e
 	// the same stored journal data, so emitting both for one Transition
 	// would post it to Slack twice.
 	for _, tr := range in.Transitions {
+		// Legacy projections retain their original publication semantics on
+		// replay. Every newly reconciled projection carries a briefing.
+		if tr.Projection.Briefing != nil && !operatorReplyWarranted(in.PriorTransition, tr) {
+			continue
+		}
 		poked := pokeSequence != 0 && tr.Sequence == pokeSequence
 		if tr.JournalKind == model.JournalNone && !poked {
 			continue
 		}
-		if tr.Reason == model.ReasonRecurrenceMilestone && in.RecurrenceRepliesOff {
-			// recurrence_mode: off keeps recurrence to the root's silent
-			// count update (the root_sync above); a milestone is never a
-			// poke, so nothing else is lost.
+		if tr.Projection.Briefing == nil && tr.Reason == model.ReasonRecurrenceMilestone && in.RecurrenceRepliesOff {
+			// Preserve the legacy recurrence filter. New projections use the
+			// semantic gate above: recurrence alone is quiet, but milestone
+			// reason precedence must not hide newly useful analysis.
 			continue
 		}
 		if !poked {
@@ -286,6 +291,9 @@ func selectPoke(in PublicationInput) (model.Transition, bool) {
 	found := false
 	for i := range in.Transitions {
 		tr := in.Transitions[i]
+		if tr.Projection.Briefing != nil && !operatorReplyWarranted(in.PriorTransition, tr) {
+			continue
+		}
 		// Every Transition is classified against the state BEFORE this
 		// commit, never against an earlier Transition of the same commit.
 		// An `operator_artifact_recorded` Transition copies this commit's

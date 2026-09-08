@@ -17,9 +17,12 @@ import (
 // one coherent transaction — no external I/O, no derived/computed content.
 // now enters the pure layer through Now rather than a global clock.
 type SnapshotInput struct {
-	Situation         model.Situation
-	Deliveries        []Delivery
-	Incidents         []IncidentState
+	Situation  model.Situation
+	Deliveries []Delivery
+	Incidents  []IncidentState
+	// Analyses is publication-only prose; BuildSnapshot and all L2 hashes ignore it.
+	Analyses          []model.IncidentAnalysis
+	AnalysisCount     int // completed analyses before the bounded selection
 	PriorSituations   []CompletedSituation
 	CurrentAssessment *AuthoritativeAssessment
 	Now               time.Time
@@ -146,6 +149,16 @@ type Delivery struct {
 	// immutable per-delivery labels rather than the mutable Alert
 	// projection.
 	Drill bool
+
+	// Labels is this delivery's immutable, already-decoded alert_deliveries.
+	// labels_json label set (B0 compatibility port, 2026-09-08). It exists
+	// so the operator briefing can select a descriptive scope and stable
+	// alert names from the same immutable per-delivery row Severity/Drill
+	// come from — the store layer decodes labels_json exactly once and this
+	// pure package still never parses JSON itself. It is presentation input
+	// only: no digest, hash, fact, or assessment prompt reads it (see
+	// MaterialFactHash / IncidentInputDigest, which name their own fields).
+	Labels map[string]string
 }
 
 // TriageState is Acute Triage's durable per-Incident state, as far as this
@@ -389,23 +402,44 @@ func deriveSymptoms(deliveries []Delivery) []Symptom {
 // with no AlertID (test fixtures only) counts as its own Alert so it can
 // never be superseded by an unrelated row.
 func incidentSymptomStatus(deliveries []Delivery) model.DeliveryStatus {
-	latestByAlert := make(map[string]Delivery, len(deliveries))
-	for _, d := range deliveries {
-		alertKey := d.AlertID
-		if alertKey == "" {
-			alertKey = "delivery:" + d.ID
-		}
-		cur, ok := latestByAlert[alertKey]
-		if !ok || deliveryLess(cur, d) {
-			latestByAlert[alertKey] = d
-		}
-	}
-	for _, d := range latestByAlert {
+	for _, d := range latestDeliveryPerAlert(deliveries) {
 		if d.Status == model.DeliveryStatusFiring {
 			return model.DeliveryStatusFiring
 		}
 	}
 	return model.DeliveryStatusResolved
+}
+
+// alertKeyOf is the per-Alert identity every source-lifecycle fold groups
+// by: Delivery.AlertID (alert_deliveries.alert_id, NOT NULL), or the
+// delivery's own ID for a fixture without one, so an unrelated row can never
+// supersede it.
+func alertKeyOf(d Delivery) string {
+	if d.AlertID != "" {
+		return d.AlertID
+	}
+	return "delivery:" + d.ID
+}
+
+// latestDeliveryPerAlert is the ONE authoritative Plan 3 source fold: each
+// distinct Alert's chronologically latest delivery (deliveryLess' total
+// order), keyed by alertKeyOf. Lifecycle truth (incidentSymptomStatus →
+// deriveSymptoms → resolveLifecycle) and operator presentation
+// (BuildOperatorBriefing) both consume exactly this fold, so the counts an
+// operator sees can never disagree with the lifecycle the controller
+// commits (B0 integration contract §2). Plan 4's prepared-observation
+// reducer is not part of this tree; there is no "unobserved" state here —
+// a Plan 3 Alert is firing or resolved.
+func latestDeliveryPerAlert(deliveries []Delivery) map[string]Delivery {
+	latest := make(map[string]Delivery, len(deliveries))
+	for _, d := range deliveries {
+		key := alertKeyOf(d)
+		cur, ok := latest[key]
+		if !ok || deliveryLess(cur, d) {
+			latest[key] = d
+		}
+	}
+	return latest
 }
 
 // sortIncidentsByID returns a copy of incidents ordered by ID, never

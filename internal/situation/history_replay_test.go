@@ -919,7 +919,17 @@ func runHistoryScenario(t *testing.T, sc historyScenario) {
 			f := newHistoryFixture(t, sanitizeOwner(sc.name)+"-"+sanitizeOwner(string(boundary)), boundary, false)
 			sc.run(f)
 			got := assertConverged(t, f.st)
-			if got != want {
+			comparisonWant, comparisonGot := want, got
+			if sc.name == "investigation" && (boundary == crashPointRecordAssessmentCall || boundary == crashPointCommitControllerAfterCommit) {
+				// Only these two executions can reuse coverage to skip triage
+				// where the reference completes it. Assert each persisted outcome
+				// and its exact earned-reply sequence before excluding that one
+				// reply line from cross-run equality. Every ledger/root/other intent
+				// still compares verbatim; no global sequence normalization.
+				comparisonWant = assertInvestigationReply(t, reference.st, want, false)
+				comparisonGot = assertInvestigationReply(t, f.st, got, true)
+			}
+			if comparisonGot != comparisonWant {
 				t.Fatalf("canonical history after crashing at %s differs from the uninterrupted run.\n--- uninterrupted ---\n%s\n--- after crash+replay ---\n%s", boundary, want, got)
 			}
 			if sc.assert != nil {
@@ -943,6 +953,93 @@ func runHistoryScenario(t *testing.T, sc historyScenario) {
 			sc.assert(t, f.st)
 		}
 	})
+}
+
+// assertInvestigationReply checks the one intentional cross-crash difference:
+// completed analysis earns its sequence-3 reply, while a same-commit clean skip
+// earns its sequence-2 reply, not a delayed or duplicate sequence-3 echo.
+// assertConverged has already checked sequence continuity, summary fences,
+// root uniqueness, delivery state and non-supersession of immutable replies.
+func assertInvestigationReply(t *testing.T, st *store.Store, history string, skipped bool) string {
+	t.Helper()
+	ctx := context.Background()
+	sits := canonicalSituationRows(t, st, ctx)
+	if len(sits) != 6 || sits[5].group != "group=hist-investigation" {
+		t.Fatal("investigation exception must target only its sixth Situation")
+	}
+	sid := sits[5].id
+	trs, err := st.ListSituationTransitions(ctx, sid, store.TransitionCursor{}, 10)
+	if err != nil || len(trs) != 3 {
+		t.Fatalf("investigation ledger: got %d transitions, err %v", len(trs), err)
+	}
+	assertInvestigationOutcome(t, st, sid, trs, skipped)
+	wantSequence := 3
+	if skipped {
+		wantSequence = 2
+	}
+	var replies, correct int
+	err = st.DB().QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(SUM(CASE WHEN i.effect_class='thread_append'
+		  AND i.status='delivered' AND i.main_channel_poke=0 AND i.requires_root=1
+		  AND i.delivered_as='thread' AND tr.sequence=? THEN 1 ELSE 0 END),0)
+		FROM notification_intents i LEFT JOIN situation_transitions tr ON tr.id=i.transition_id
+		WHERE i.situation_id=? AND i.effect_class IN ('thread_append','broadcast_handoff')`, wantSequence, sid).Scan(&replies, &correct)
+	if err != nil || replies != 1 || correct != 1 {
+		t.Fatalf("want exactly one delivered quiet reply attached to authoritative sequence %d; replies=%d correct=%d err=%v", wantSequence, replies, correct, err)
+	}
+	line := fmt.Sprintf("  intent S6 class=thread_append status=delivered poke=0 priority= requires_root=1 summary_version=0 transition_sequence=%d delivered_as=\"thread\"", wantSequence)
+	lines := strings.Split(history, "\n")
+	var rest []string
+	removed := 0
+	for _, s := range lines {
+		if s == line {
+			removed++
+			continue
+		}
+		rest = append(rest, s)
+	}
+	if removed != 1 {
+		t.Fatalf("expected exactly one fully validated reply line, found %d", removed)
+	}
+	return strings.Join(rest, "\n")
+}
+
+func assertInvestigationOutcome(t *testing.T, st *store.Store, sid string, trs []situationmodel.Transition, skipped bool) {
+	t.Helper()
+	wantPending, wantUnavailable, wantAnalysis := []int{1, 1, 0}, []int{0, 0, 0}, []int{0, 0, 1}
+	wantStatus, wantSummary := "analyzed", "replay finding summary"
+	if skipped {
+		wantPending, wantUnavailable, wantAnalysis = []int{1, 0, 0}, []int{0, 1, 1}, []int{0, 0, 0}
+		wantStatus, wantSummary = "ready", ""
+	}
+	var status, summary, phase string
+	err := st.DB().QueryRowContext(context.Background(), `
+		SELECT i.status, COALESCE(i.summary,''), COALESCE(t.phase,'') FROM situation_incidents si
+		JOIN incidents i ON i.id=si.incident_id LEFT JOIN incident_triage t ON t.incident_id=i.id
+		WHERE si.situation_id=?`, sid).Scan(&status, &summary, &phase)
+	if err != nil || status != wantStatus || summary != wantSummary || (skipped && phase != "skipped") {
+		t.Fatalf("persisted investigation outcome: status=%s summary=%q phase=%s err=%v", status, summary, phase, err)
+	}
+	for i, tr := range trs {
+		b := tr.Projection.Briefing
+		if tr.Sequence != i+1 || b == nil || b.Pending != wantPending[i] || b.Unavailable != wantUnavailable[i] || b.AnalysisCount != wantAnalysis[i] || len(b.Analyses) != wantAnalysis[i] {
+			t.Fatalf("sequence %d must freeze its actual authoritative work outcome: %+v", i+1, b)
+		}
+	}
+	if skipped {
+		if trs[1].Projection.OperatorDelta == nil || !trs[1].Projection.OperatorDelta.AbilityLost {
+			t.Fatal("same-commit skip must persist its loss-of-analysis delta")
+		}
+	} else if d := trs[2].Projection.OperatorDelta; d == nil || len(d.Analyses) != 1 || d.Analyses[0].Title != wantSummary {
+		t.Fatal("completed analysis must persist the useful finding in its earned reply")
+	}
+	view, err := st.GetSituationEpisodeView(context.Background(), sid)
+	if err != nil || view.Summary.Briefing == nil {
+		t.Fatalf("read investigation summary: %v", err)
+	}
+	if b := view.Summary.Briefing; b.Pending != 0 || b.Unavailable != wantUnavailable[2] || b.AnalysisCount != wantAnalysis[2] {
+		t.Fatalf("summary must retain the final persisted outcome: %+v", b)
+	}
 }
 
 func sanitizeOwner(s string) string {

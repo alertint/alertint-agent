@@ -312,6 +312,7 @@ func controllerTransition(change AuthoritativeChange, reason model.TransitionRea
 		OccurredAt:      change.Now,
 	}, controllerEvidenceRefs(change))
 	tr.Actor = controllerActor(change, reason)
+	tr.Projection.OperatorDelta = buildOperatorDelta(change.PriorTransition, tr)
 	if class := ClassifyPoke(change.PriorTransition, tr); class != PokeNone {
 		priority := DeriveInterruptionPriority(tr)
 		tr.InterruptionPriority = &priority
@@ -578,7 +579,7 @@ func selectControllerReason(change AuthoritativeChange) (model.TransitionReason,
 	current := currentTuple(change)
 	previous := priorTuple(change)
 	triage := triageStateChanged(change)
-	if canonicalDigest(current) == canonicalDigest(previous) && !triage {
+	if canonicalDigest(current) == canonicalDigest(previous) && !triage && !operatorBriefingChanged(prior.Projection.Briefing, change.Projection.Briefing) {
 		return "", false
 	}
 
@@ -823,6 +824,9 @@ func ProjectEpisode(prior *model.EpisodeSummary, t model.Transition) (model.Epis
 	}
 
 	out.SourceTransitionSequence = t.Sequence
+	if t.Projection.Briefing != nil {
+		out.Briefing = t.Projection.Briefing
+	}
 	out.CurrentAttention = t.Attention
 	out.ActionContract = t.ActionContract
 	out.UpdatedAt = t.CreatedAt
@@ -1060,9 +1064,9 @@ const (
 //	Observed -> Investigating -> Monitoring -> Recovered
 //	Observed -> Investigating -> Closed uncertain
 //
-// A refire returns emphasis from Monitoring to Investigating (the summary
-// keeps InvestigationStarted), and a direct closed_unknown never invents
-// Monitoring. Which phases the rendered chain SHOWS — in particular whether
+// Current monitoring work takes precedence over past investigation. A refire
+// with renewed investigation returns emphasis to Investigating, and a direct
+// closed_unknown never invents Monitoring. Which phases the chain SHOWS — whether
 // a closed_unknown chain includes Monitoring at all — additionally needs
 // the Situation's Transition history, which the Slack renderer reads.
 func DeriveOrientation(summary model.EpisodeSummary, latest model.Transition) Orientation {
@@ -1074,6 +1078,14 @@ func DeriveOrientation(summary model.EpisodeSummary, latest model.Transition) Or
 	case model.LifecycleRecoveryPending:
 		return OrientationMonitoring
 	default:
+		// A current monitoring contract outranks historical investigation.
+		// Attention can remain urgent while automation watches alert changes.
+		c := latest.ActionContract
+		if c.AlertINTAction != nil && c.AlertINTStatus != nil &&
+			(*c.AlertINTAction == model.AlertINTActionMonitorSituation || *c.AlertINTAction == model.AlertINTActionVerifyRecovery) &&
+			(*c.AlertINTStatus == model.AlertINTStatusWaiting || *c.AlertINTStatus == model.AlertINTStatusRunning || *c.AlertINTStatus == model.AlertINTStatusPlanned) {
+			return OrientationMonitoring
+		}
 		if summary.InvestigationStarted || investigationCurrent(latest.ActionContract) ||
 			latest.ActionContract.OperatorActionRequired != nil {
 			return OrientationInvestigating

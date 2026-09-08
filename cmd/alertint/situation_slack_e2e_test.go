@@ -1511,7 +1511,7 @@ func (f *e2eFixture) refire(groupKey string, n int) {
 	}
 }
 
-func TestSituationSlackE2ERecurrenceMilestoneStaysInThread(t *testing.T) {
+func TestSituationSlackE2ERecurrenceMilestoneOnlyKeepsRootCurrent(t *testing.T) {
 	f := newE2EFixture(t)
 	f.slack.setScript(alwaysOK)
 	// seed's five prior episodes put the live Situation at recurrence 5 —
@@ -1550,12 +1550,12 @@ func TestSituationSlackE2ERecurrenceMilestoneStaysInThread(t *testing.T) {
 			broadcasts++
 		}
 	}
-	if rootEdits != 1 || threadReplies != 1 || broadcasts != 0 {
-		t.Fatalf("milestone delivery = %d root edit(s), %d quiet thread reply(ies), %d channel message(s); want 1, 1, 0: a milestone stays in the owning thread and never re-pages%s",
+	if rootEdits != 1 || threadReplies != 0 || broadcasts != 0 {
+		t.Fatalf("milestone delivery = %d root edit(s), %d quiet thread reply(ies), %d channel message(s); want 1, 0, 0: a count alone updates the root and remains audit-only%s",
 			rootEdits, threadReplies, broadcasts, f.intentSummary())
 	}
-	if !strings.Contains(f.slack.accepted()[len(f.slack.accepted())-1].Text, "Recurrence milestone") {
-		t.Fatalf("the milestone reply does not render the milestone: %q", f.slack.accepted()[len(f.slack.accepted())-1].Text)
+	if f.slack.accepted()[len(f.slack.accepted())-1].Method != "chat.update" {
+		t.Fatal("the recurrence count must end with a quiet update to the owning root")
 	}
 }
 

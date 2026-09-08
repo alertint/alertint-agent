@@ -397,6 +397,52 @@ func TestControllerReconcileUnchangedTrustworthyBasisReusesWithZeroL2Calls(t *te
 	}
 }
 
+func TestBriefingReviewCommittedSkipIsVisibleWithoutChangingAssessmentBasis(t *testing.T) {
+	in := ctBaseSnapshotInput()
+	in.Now = ctBaseTime.Add(10 * time.Minute)
+	in.Incidents[0].Triage.Phase = "awaiting_decision"
+	snap := situation.BuildSnapshot(in)
+	in.CurrentAssessment = &situation.AuthoritativeAssessment{
+		ID: "assessment-prior", SituationID: "situation-1", InputVersion: 2,
+		AssessmentBasisHash: snap.AssessmentBasisHash, MaterialFactHash: snap.MaterialFactHash,
+		Derivation: model.DerivationModelValidated,
+		Coverage:   []model.IncidentCoverage{{IncidentID: "incident-1", MembershipDigest: situation.MembershipDigest("incident-1", in.Deliveries), IncidentInputDigest: situation.IncidentInputDigest("incident-1", "group-1", in.Deliveries)}},
+		Assessment: model.Assessment{
+			SchemaVersion: model.AssessmentSchemaVersion, Persistence: model.PersistenceSustained,
+			Impact: model.ImpactSuspected, Novelty: model.NoveltyFamiliar, Causality: model.CausalityCorrelated,
+			Attention: model.AttentionObserve, Lifecycle: model.LifecycleActive,
+			EvidenceQuality: model.EvidenceQualityComplete, Cadence: model.CadenceSlow,
+			ActionContract: model.ActionContract{NextActor: model.NextActorNone, NextUpdateAt: &ctBaseTime},
+		},
+	}
+	st := &fakeControllerStore{loadInput: in}
+	client := &fakeAssessmentClient{}
+	if err := ctController(t, st, client).Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.commits) != 1 {
+		t.Fatalf("expected one controller commit, got %d", len(st.commits))
+	}
+	commit := st.commits[0]
+	if len(commit.TriageDecisions) != 1 || commit.TriageDecisions[0].Decision != situation.TriageDecisionSkip {
+		t.Fatalf("fixture must commit a clean skip: %+v", commit.TriageDecisions)
+	}
+	if commit.History == nil || commit.History.Summary == nil || len(commit.History.Transitions) == 0 {
+		t.Fatal("missing committed history")
+	}
+	for _, b := range []*model.OperatorBriefing{commit.History.Summary.Briefing, commit.History.Transitions[0].Projection.Briefing} {
+		if b == nil || b.Pending != 0 || b.Unavailable != 1 {
+			t.Errorf("same-commit skip still promises analysis: %+v", b)
+		}
+	}
+	if in.Incidents[0].Triage.Phase != "awaiting_decision" || st.loadInput.Incidents[0].Triage.Phase != "awaiting_decision" {
+		t.Fatal("presentation mutated coherent assessment input")
+	}
+	if client.calls != 0 || commit.MaterialFactHash != snap.MaterialFactHash || commit.Attempt.AssessmentBasisHash != snap.AssessmentBasisHash {
+		t.Fatal("presentation changed assessment basis or dispatched L2")
+	}
+}
+
 // TestControllerReconcileDeterministicFloorDispatchesL2AndForcesUrgentOnAccept
 // proves Finding I3's ruling: a deterministic urgent floor (critical severity)
 // no longer short-circuits Reconcile before ever consulting L2 — the first

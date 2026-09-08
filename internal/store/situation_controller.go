@@ -97,6 +97,10 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 	if err != nil {
 		return situation.SnapshotInput{}, err
 	}
+	analyses, analysisCount, err := loadSituationAnalysesTx(ctx, tx, sit.ID)
+	if err != nil {
+		return situation.SnapshotInput{}, err
+	}
 
 	prior, err := loadPriorTerminalSituationsTx(ctx, tx, sit.GroupKey, sit.ID)
 	if err != nil {
@@ -142,6 +146,8 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 		Situation:                   sit,
 		Deliveries:                  deliveries,
 		Incidents:                   incidents,
+		Analyses:                    analyses,
+		AnalysisCount:               analysisCount,
 		PriorSituations:             prior,
 		CurrentAssessment:           current,
 		Now:                         now.UTC(),
@@ -413,6 +419,7 @@ func loadSituationDeliveriesTx(ctx context.Context, tx *sql.Tx, situationID stri
 		}
 		d.Severity = labels["severity"]
 		d.Drill = labels[DrillMarkerLabel] == DrillMarkerValue
+		d.Labels = labels
 		out = append(out, d)
 	}
 	if err := rows.Err(); err != nil {

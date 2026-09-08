@@ -89,6 +89,9 @@ func RenderSituationRoot(in SituationRootInput) (RenderedMessage, error) {
 	if err := validateRootInput(in); err != nil {
 		return RenderedMessage{}, err
 	}
+	if in.Summary.Briefing != nil {
+		return renderBriefingRoot(in), nil
+	}
 
 	orientation := situation.DeriveOrientation(in.Summary, in.SourceTransition)
 	recoveryEverObserved := in.RecoveryEverObserved || in.SourceTransition.Projection.RecoveryObservedAt != nil
@@ -375,11 +378,7 @@ func causalityLine(a *model.AssessmentConclusion) string {
 }
 
 func handleBlock(s model.EpisodeSummary) slacklib.Block {
-	handle := s.PublicHandle
-	if handle == "" {
-		handle = s.SituationID
-	}
-	return contextBlock(fmt.Sprintf(":robot_face: Situation `%s` · `get situation %s using alertint`", handle, handle))
+	return contextBlock(briefingFooter(s))
 }
 
 func rootFallback(s model.EpisodeSummary, o situation.Orientation, drill bool) string {
@@ -414,10 +413,20 @@ func RenderSituationJournal(t model.Transition) (RenderedMessage, error) {
 	}
 
 	prefix := drillPrefix(t.Drill)
-	headline := prefix + "*" + t.Journal.Headline + "*"
+	label, detail := t.Journal.Headline, t.Journal.Detail
+	fallback := prefix + label
+	if t.Projection.Briefing != nil {
+		label, detail = briefingJournal(t)
+		fallback = prefix + label + "\n" + detail
+	}
+	headline := prefix + "*" + label + "*"
 	blocks := []slacklib.Block{sectionBlock(headline)}
-	if t.Journal.Detail != "" {
-		blocks = append(blocks, sectionBlock(t.Journal.Detail))
+	if detail != "" {
+		if t.Projection.Briefing != nil {
+			blocks = append(blocks, briefingDetailBlocks(detail)...)
+		} else {
+			blocks = append(blocks, sectionBlock(detail))
+		}
 	}
 
 	var markers []string
@@ -433,9 +442,25 @@ func RenderSituationJournal(t model.Transition) (RenderedMessage, error) {
 	blocks = append(blocks, contextBlock(SlackDateToken(t.Journal.OccurredAt, "{date_short} {time}")))
 
 	return RenderedMessage{
-		Text:   prefix + t.Journal.Headline,
+		Text:   fallback,
 		Blocks: blocks,
 	}, nil
+}
+
+// Keep the operational next step outside bounded evidence sections: a long
+// investigation must never truncate the human action.
+func briefingDetailBlocks(detail string) []slacklib.Block {
+	at := strings.LastIndex(detail, "\n*AlertINT:*")
+	if at < 0 {
+		return []slacklib.Block{sectionBlock(detail)}
+	}
+	var blocks []slacklib.Block
+	for _, part := range strings.Split(detail[:at], "\n\n") {
+		if part != "" {
+			blocks = append(blocks, sectionBlock(part))
+		}
+	}
+	return append(blocks, sectionBlock(detail[at+1:]))
 }
 
 // ----------------------------------------------------------------------
@@ -546,10 +571,12 @@ func reasonLabel(reason string) string {
 
 // contractLine renders the compact Operator-contract action, e.g. "AlertINT
 // is running Acute Triage" or "Watching for sustained recovery." Monitoring
-// always reads as watching for recovery regardless of the underlying
-// contract's own fields — the phase itself already says why.
+// includes watching still-firing alerts; it does not itself imply clearance.
 func contractLine(o situation.Orientation, c model.ActionContract) string {
 	if o == situation.OrientationMonitoring {
+		if c.AlertINTAction != nil && *c.AlertINTAction == model.AlertINTActionMonitorSituation {
+			return "Monitoring alert changes"
+		}
 		return "Watching for sustained recovery"
 	}
 	switch {
