@@ -1631,74 +1631,80 @@ func testReplayConcurrentInputRaisesNewDueReason(t *testing.T) {
 	assertIdempotentReconverge(f, sitID, freshClient, analyzer, after)
 }
 
-// TestControllerRealStoreFreshClearanceSurvivesDeadlineStraddle is R1's
-// round-2 repair regression (lead review 2026-09-08 update, S1-03), run
-// through the real HTTP receiver, correlator, and store rather than the
-// reducer directly — the lead's own review asked for exactly this ("this
-// new failing boundary was tested at the reducer, not through HTTP").
+// TestControllerRealStoreFreshClearanceSurvivesDeadlineStraddle is the
+// real-store (HTTP receiver → correlator → controller → SQLite) counterpart
+// of TestControllerReconcileFreshClearanceSurvivesDeadlineStraddle, proving
+// the S1-03 R1 repair survives real ingestion, correlation and durable
+// persistence of every field involved (effective_started_at,
+// recovery_observed_at, grace_until) on both sides of the episode deadline
+// AND with the delivery's receipt strictly before the reconcile that
+// consumes it (lead review round 3: receipt necessarily precedes its
+// consuming reconcile; that ordering is not source silence).
 //
 // ingress.NewAlertReceiver hardcodes real wall-clock received_at with no
 // clock-injection point (a pre-existing, out-of-allowlist limitation — see
-// this package's other real-store lifecycle tests). That makes it
-// structurally impossible to land a delivery within one second of a
-// backdated deadline by simply posting it at the right moment: real test
-// execution and this fixture's independently-advanceable fake clock do not
-// share a timeline once the fake clock has been advanced. So, exactly like
-// the backdated effective_started_at technique the lead's own corrected
-// TestLeadB1FreshClearanceRealStore probe already uses, this test
-// additionally SQL-patches the just-ingested delivery's own received_at
-// onto the SAME fake-clock timeline as the backdated deadline, letting the
-// real pipeline exercise the exact one-second straddle the reducer already
-// proved (TestControllerReconcileFreshClearanceSurvivesDeadlineStraddle):
-// both directions must reach recovered identically, and — unlike that
-// pure-reducer test — this one also proves the fix survives real
-// ingestion, correlation, and durable persistence of every field involved
-// (effective_started_at, recovery_observed_at, grace_until).
+// this package's other real-store lifecycle tests), so real execution and
+// this fixture's independently-advanceable fake clock do not share a
+// timeline once the fake clock has been advanced. Exactly like the
+// backdated effective_started_at technique the lead's own corrected
+// TestLeadB1FreshClearanceRealStore probe uses, this test additionally
+// SQL-patches the just-ingested delivery's received_at onto the SAME
+// fake-clock timeline as the backdated deadline — at the reconcile instant
+// or a chosen delay before it — so the real pipeline exercises the exact
+// straddle and delay geometry the reducer test proves.
 func TestControllerRealStoreFreshClearanceSurvivesDeadlineStraddle(t *testing.T) {
-	for _, tc := range []struct {
+	for _, side := range []struct {
 		name   string
 		offset time.Duration
 	}{
 		{"one_second_before_deadline", -time.Second},
 		{"one_second_after_deadline", time.Second},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newHistoryFixture(t, "b1r1-straddle-"+tc.name, "", false)
-			f.openWarrantedSituation("straddle", "fp-straddle")
-			f.converge()
-			assertLifecycle(t, f.st, "active")
+		for _, delay := range []struct {
+			name string
+			d    time.Duration
+		}{
+			{"receipt_equals_reconcile", 0},
+			{"receipt_1ms_before_reconcile", time.Millisecond},
+			{"receipt_30s_before_reconcile", 30 * time.Second},
+		} {
+			t.Run(side.name+"/"+delay.name, func(t *testing.T) {
+				f := newHistoryFixture(t, "b1r1-straddle-"+side.name+"-"+delay.name, "", false)
+				f.openWarrantedSituation("straddle", "fp-straddle")
+				f.converge()
+				assertLifecycle(t, f.st, "active")
 
-			// firstNow (the entry reconcile's fake "now", left unadvanced)
-			// must equal deadline+offset, exactly mirroring the reducer
-			// test's construction.
-			base := f.clock.Now()
-			deadline := base.Add(-tc.offset)
-			effectiveStartedAt := deadline.Add(-7 * 24 * time.Hour)
-			if _, err := f.st.DB().ExecContext(f.ctx,
-				`UPDATE situations SET effective_started_at = ? WHERE lifecycle = 'active'`,
-				effectiveStartedAt.UTC().Format(time.RFC3339Nano)); err != nil {
-				t.Fatalf("backdate effective_started_at: %v", err)
-			}
+				// The entry reconcile's fake "now" (left unadvanced) must
+				// equal deadline+offset, exactly mirroring the reducer test.
+				base := f.clock.Now()
+				deadline := base.Add(-side.offset)
+				effectiveStartedAt := deadline.Add(-7 * 24 * time.Hour)
+				if _, err := f.st.DB().ExecContext(f.ctx,
+					`UPDATE situations SET effective_started_at = ? WHERE lifecycle = 'active'`,
+					effectiveStartedAt.UTC().Format(time.RFC3339Nano)); err != nil {
+					t.Fatalf("backdate effective_started_at: %v", err)
+				}
 
-			f.postAlert("straddle", "HighLatency", "fp-straddle", "resolved", "warning")
-			if _, err := f.st.DB().ExecContext(f.ctx,
-				`UPDATE alert_deliveries SET received_at = ? WHERE status = 'resolved'`,
-				base.UTC().Format(time.RFC3339Nano)); err != nil {
-				t.Fatalf("pin resolved delivery received_at onto the fake-clock timeline: %v", err)
-			}
+				f.postAlert("straddle", "HighLatency", "fp-straddle", "resolved", "warning")
+				if _, err := f.st.DB().ExecContext(f.ctx,
+					`UPDATE alert_deliveries SET received_at = ? WHERE status = 'resolved'`,
+					base.Add(-delay.d).UTC().Format(time.RFC3339Nano)); err != nil {
+					t.Fatalf("pin resolved delivery received_at onto the fake-clock timeline: %v", err)
+				}
 
-			f.oneRound()
-			assertLifecycle(t, f.st, "recovery_pending")
+				f.oneRound()
+				assertLifecycle(t, f.st, "recovery_pending")
 
-			graceUntilRaw := scalarString(t, f.st, `SELECT grace_until FROM situations WHERE lifecycle = 'recovery_pending'`)
-			graceUntil, err := time.Parse(time.RFC3339Nano, graceUntilRaw)
-			if err != nil {
-				t.Fatalf("parse grace_until %q: %v", graceUntilRaw, err)
-			}
-			f.clock.Advance(graceUntil.Sub(base))
+				graceUntilRaw := scalarString(t, f.st, `SELECT grace_until FROM situations WHERE lifecycle = 'recovery_pending'`)
+				graceUntil, err := time.Parse(time.RFC3339Nano, graceUntilRaw)
+				if err != nil {
+					t.Fatalf("parse grace_until %q: %v", graceUntilRaw, err)
+				}
+				f.clock.Advance(graceUntil.Sub(base))
 
-			f.oneRound() // no new delivery: the SAME receipt must still count as seen, whichever side of the deadline it landed on.
-			assertLifecycle(t, f.st, "recovered")
-		})
+				f.oneRound() // no new delivery: the SAME receipt must still hold, whichever side of the deadline it landed on and however far ahead of its reconcile it arrived.
+				assertLifecycle(t, f.st, "recovered")
+			})
+		}
 	}
 }
