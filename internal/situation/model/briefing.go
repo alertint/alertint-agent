@@ -3,6 +3,9 @@
 package model
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -20,6 +23,71 @@ type IncidentAnalysis struct {
 	VerificationGaps  int        `json:"verification_gaps,omitempty"`
 	AnalyzedAt        *time.Time `json:"analyzed_at,omitempty"`
 	Stale             bool       `json:"stale,omitempty"`
+	// EvidenceFingerprint is EvidenceFingerprint() over this analysis's
+	// recorded observations and verification limitation as they stood
+	// BEFORE the display bounds above cut them (lead authorization, round 4,
+	// 2026-09-09) — presentation-only comparison provenance, so materiality
+	// never mistakes a shorter display for different evidence. "" means the
+	// projection recorded none (a legacy snapshot, or a shape built outside
+	// the loader): unknown, never an empty result.
+	EvidenceFingerprint string `json:"evidence_fingerprint,omitempty"`
+}
+
+// AnalysisFindingsBound and CompletionObservationsBound are the two DISPLAY
+// bounds one Incident's recorded observations pass through: the analysis
+// overview keeps three (BoundIncidentAnalysis below), an EndedWork
+// completion keeps six. Named because materiality has to know a list may be
+// cut at exactly these lengths and at no other — a shorter list is complete
+// as recorded.
+const (
+	AnalysisFindingsBound       = 3
+	CompletionObservationsBound = 6
+)
+
+// EvidenceFingerprint is the one shared, presentation-only structural
+// fingerprint of one Incident's evidence: its recorded observations and its
+// decision-relevant verification limitation/gap count, normalized the same
+// way on every path and hashed BEFORE any display truncation. Hypothesis and
+// title prose, judgment/completion times, attempt identity and the outcome
+// enum are deliberately excluded — canonical slide 4 row 577, "Neither
+// paraphrasing nor an evidence enum change earns a reply". An absent list
+// and an empty one produce the same fingerprint, so a persistence round trip
+// is never a change; an evidence set that is genuinely empty still has a
+// fingerprint, so "" can only ever mean unknown provenance.
+//
+// It is comparison provenance only: it never enters an assessment or reuse
+// digest, delivery history, dispatch authority or any schema.
+func EvidenceFingerprint(observations []string, verificationLimit string, verificationGaps int) string {
+	var b strings.Builder
+	for _, o := range observations {
+		o = normalizeEvidenceText(o)
+		if o == "" {
+			continue
+		}
+		// Length-prefixed so no observation's content can imitate the
+		// framing of a different list.
+		b.WriteString("o")
+		b.WriteString(strconv.Itoa(len(o)))
+		b.WriteString(":")
+		b.WriteString(o)
+		b.WriteString("\x1e")
+	}
+	limit := normalizeEvidenceText(verificationLimit)
+	b.WriteString("l")
+	b.WriteString(strconv.Itoa(len(limit)))
+	b.WriteString(":")
+	b.WriteString(limit)
+	b.WriteString("\x1eg:")
+	b.WriteString(strconv.Itoa(verificationGaps))
+	sum := sha256.Sum256([]byte(b.String()))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// normalizeEvidenceText is the whitespace normalization briefingBound
+// already applies to displayed text, hoisted so a fingerprint taken before
+// truncation and a comparison of the bounded text after it agree.
+func normalizeEvidenceText(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // BoundIncidentAnalysis owns the byte bounds at both snapshot and publication
@@ -30,10 +98,11 @@ func BoundIncidentAnalysis(a IncidentAnalysis) IncidentAnalysis {
 	a.Summary = briefingBound(a.Summary, 500)
 	a.Verification = briefingBound(a.Verification, 40)
 	a.VerificationLimit = briefingBound(a.VerificationLimit, 100)
+	a.EvidenceFingerprint = briefingBound(a.EvidenceFingerprint, 80)
 	findings := a.Findings
 	a.Findings = nil
 	for i, f := range findings {
-		if i == 3 {
+		if i == AnalysisFindingsBound {
 			break
 		}
 		if strings.TrimSpace(f) != "" {
@@ -48,7 +117,7 @@ func BoundIncidentAnalysis(a IncidentAnalysis) IncidentAnalysis {
 }
 
 func briefingBound(s string, limit int) string {
-	s = strings.Join(strings.Fields(s), " ")
+	s = normalizeEvidenceText(s)
 	if len(s) <= limit {
 		return s
 	}
@@ -365,6 +434,11 @@ type FindingFacts struct {
 	Observations []string   `json:"observations,omitempty"`
 	Unknowns     []string   `json:"unknowns,omitempty"`
 	AnalyzedAt   *time.Time `json:"analyzed_at,omitempty"`
+	// EvidenceFingerprint is the same pre-truncation comparison provenance
+	// IncidentAnalysis carries, for evidence that reaches materiality as a
+	// completion instead of an overview entry. Projections carry it; the
+	// MaterialCandidate handed to B4/B5 never does.
+	EvidenceFingerprint string `json:"evidence_fingerprint,omitempty"`
 }
 
 // MemberFacts are actual recorded member-alert names and counts — never a

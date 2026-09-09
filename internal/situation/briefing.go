@@ -5,7 +5,6 @@ package situation
 import (
 	"fmt"
 	"reflect"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -507,7 +506,7 @@ func usefulAnalysisChanged(prior, current *model.OperatorBriefing) bool {
 		if a.Summary == "" && a.Title == "" {
 			continue
 		}
-		if analysisStructurallyChanged(findAnalysis(prior, a.IncidentID), a) {
+		if findingStructurallyChanged(priorKnownFinding(prior, a.IncidentID), findingFactsOf(a)) {
 			return true
 		}
 	}
@@ -526,12 +525,6 @@ func findAnalysis(b *model.OperatorBriefing, incidentID string) *model.IncidentA
 		}
 	}
 	return nil
-}
-
-// analysisStructurallyChanged is the one shared materiality predicate for
-// one Incident's analysis (S3-04, S3-03): structured-fact inequality only.
-func analysisStructurallyChanged(old *model.IncidentAnalysis, a model.IncidentAnalysis) bool {
-	return old == nil || !reflect.DeepEqual(old.Findings, a.Findings) || old.VerificationLimit != a.VerificationLimit || old.VerificationGaps != a.VerificationGaps
 }
 
 // analysisHypothesis is the same "likely cause" text notify/slack's
@@ -553,10 +546,11 @@ func analysisHypothesis(a model.IncidentAnalysis) string {
 // an invented "cause unproven" boilerplate line.
 func findingFactsOf(a model.IncidentAnalysis) *model.FindingFacts {
 	f := &model.FindingFacts{
-		IncidentID:   a.IncidentID,
-		Hypothesis:   analysisHypothesis(a),
-		Observations: append([]string(nil), a.Findings...),
-		AnalyzedAt:   a.AnalyzedAt,
+		IncidentID:          a.IncidentID,
+		Hypothesis:          analysisHypothesis(a),
+		Observations:        append([]string(nil), a.Findings...),
+		AnalyzedAt:          a.AnalyzedAt,
+		EvidenceFingerprint: a.EvidenceFingerprint,
 	}
 	f.Unknowns = verificationUnknowns(a.VerificationLimit, a.VerificationGaps)
 	return f
@@ -639,9 +633,15 @@ func membersChangedCandidate(a, b *model.OperatorBriefing, priorAttention, atten
 }
 
 // findingCandidates emits one useful_finding candidate per member Incident
-// whose analysis structurally changed (S4-04) — the same predicate
-// usefulAnalysisChanged uses for the legacy reply gate, so the two paths
-// can never disagree about what counts as a new finding. An analysis that
+// whose analysis structurally changed (S4-04) — findingStructurallyChanged
+// against whatever this Incident's evidence was last known to be, wherever
+// the PRIOR transition carried it, which is the same comparison the legacy
+// reply gate and the completion path use, so no path can disagree about what
+// counts as a new finding and none of them can mistake movement between the
+// paths for new evidence (R2 repair, lead review round 4, 2026-09-09). An
+// unchanged accepted result re-entering the three-item overview is a repeat
+// of a reported result; a member delta that reorders the overview does not
+// make old evidence new. An analysis that
 // recorded no root cause is not a useful finding: its title is a name, not a
 // causal hypothesis (lead decision D, round 2, 2026-09-09), and an accepted
 // completion without a hypothesis is endedWorkCandidates' inconclusive
@@ -655,8 +655,9 @@ func findingCandidates(a, b *model.OperatorBriefing) []model.MaterialCandidate {
 		if an.Summary == "" {
 			continue
 		}
-		if analysisStructurallyChanged(findAnalysis(a, an.IncidentID), an) {
-			out = append(out, model.MaterialCandidate{Kind: model.CandidateUsefulFinding, Finding: findingFactsOf(an), Next: workNextStep(b)})
+		f := findingFactsOf(an)
+		if findingStructurallyChanged(priorKnownFinding(a, an.IncidentID), f) {
+			out = append(out, model.MaterialCandidate{Kind: model.CandidateUsefulFinding, Finding: candidateFinding(f), Next: workNextStep(b)})
 		}
 	}
 	return out
@@ -677,8 +678,8 @@ func findingCandidates(a, b *model.OperatorBriefing) []model.MaterialCandidate {
 // stale-input and owner-terminal outcomes (never promoted as an accepted
 // finding), a re-run whose retained observations and unknowns repeat what
 // this Incident's evidence was already known to be (R2 repair, lead review
-// round 3, 2026-09-09), a repeated reconciliation/reload of the same ended
-// work, and any prior transition whose ended work is unknown (legacy
+// rounds 3 and 4, 2026-09-09), a repeated reconciliation/reload of the same
+// ended work, and any prior transition whose ended work is unknown (legacy
 // replay), where only the aggregate exhaustion edge is reported and nothing
 // is attributed to an incident — never retrospective phantom completions.
 func endedWorkCandidates(a, b *model.OperatorBriefing) []model.MaterialCandidate {
@@ -724,16 +725,16 @@ func endedWorkCandidate(a, b *model.OperatorBriefing, o model.IncidentWorkOutcom
 			// The overview bound decides which PATH reports a useful
 			// result, never whether it is material: outside it the same
 			// structural rule applies against whatever this Incident's
-			// evidence was last known to be (R2 repair, lead review round 3,
-			// 2026-09-09). A fresh attempt id, a later completion time and a
-			// rephrased hypothesis over identical retained checks are a
-			// repeat of a reported result, not a new finding.
+			// evidence was last known to be (R2 repair, lead review rounds 3
+			// and 4, 2026-09-09). A fresh attempt id, a later completion
+			// time and a rephrased hypothesis over identical retained checks
+			// are a repeat of a reported result, not a new finding.
 			if !findingStructurallyChanged(priorKnownFinding(a, o.IncidentID), o.Finding) {
 				return model.MaterialCandidate{}, false
 			}
-			return model.MaterialCandidate{Kind: model.CandidateUsefulFinding, Finding: copyFindingFacts(o.Finding), Outcome: outcome, Next: workNextStep(b)}, true
+			return model.MaterialCandidate{Kind: model.CandidateUsefulFinding, Finding: candidateFinding(o.Finding), Outcome: outcome, Next: workNextStep(b)}, true
 		}
-		return model.MaterialCandidate{Kind: model.CandidateInconclusiveCompletion, Finding: copyFindingFacts(o.Finding), Outcome: outcome, Next: workNextStep(b)}, true
+		return model.MaterialCandidate{Kind: model.CandidateInconclusiveCompletion, Finding: candidateFinding(o.Finding), Outcome: outcome, Next: workNextStep(b)}, true
 	}
 	if o.Phase != model.WorkPhaseExhausted {
 		return model.MaterialCandidate{}, false
@@ -758,8 +759,9 @@ func endedWorkCandidate(a, b *model.OperatorBriefing, o model.IncidentWorkOutcom
 // committed for one Incident, wherever that transition carried it: its own
 // matched completion evidence when the prior ended work held it, otherwise
 // its entry in the prior analysis overview — so a result does not become
-// "new" merely by moving between the two paths. nil means nothing was known
-// about this Incident before, and any recorded result is genuinely new.
+// "new" merely by moving between the two paths, in either direction. nil
+// means nothing was known about this Incident before, and any recorded result
+// is genuinely new.
 func priorKnownFinding(a *model.OperatorBriefing, incidentID string) *model.FindingFacts {
 	if a == nil {
 		return nil
@@ -775,18 +777,89 @@ func priorKnownFinding(a *model.OperatorBriefing, incidentID string) *model.Find
 	return nil
 }
 
-// findingStructurallyChanged applies analysisStructurallyChanged's rule to
-// the same structured facts in completion-evidence form: the retained
+// findingStructurallyChanged is the ONE materiality comparison both reporting
+// paths use (R2 repair, lead review round 4, 2026-09-09): the retained
 // observations and the decision-relevant unknowns only. Hypothesis prose,
-// attempt identity and completion time are deliberately excluded — canonical
-// slide 4 row 577, "Neither paraphrasing nor an evidence enum change earns a
-// reply" (S3-04). An absent list and an empty one are the same fact, so a
-// persistence round trip is never a change.
+// attempt identity, judgment/completion time and the outcome enum are
+// deliberately excluded — canonical slide 4 row 577, "Neither paraphrasing nor
+// an evidence enum change earns a reply" (S3-04).
+//
+// Comparison provenance is separated from display truncation. When both sides
+// recorded an EvidenceFingerprint, that fingerprint decides: it was taken from
+// the full recorded evidence BEFORE the three-item overview bound and the
+// six-item completion bound, so a genuine change past either bound is still a
+// change and a mere change of display path is not. When either side carries
+// none — a legacy projection, or a shape built outside the loader — provenance
+// is UNKNOWN, never an empty result, and only what the two displays can prove
+// counts as a difference.
 func findingStructurallyChanged(old, f *model.FindingFacts) bool {
 	if old == nil || f == nil {
 		return true
 	}
-	return !slices.Equal(old.Observations, f.Observations) || !slices.Equal(old.Unknowns, f.Unknowns)
+	if old.EvidenceFingerprint != "" && f.EvidenceFingerprint != "" {
+		return old.EvidenceFingerprint != f.EvidenceFingerprint
+	}
+	return !sameDisplayedEvidence(old.Observations, f.Observations) || !sameDisplayedEvidence(old.Unknowns, f.Unknowns)
+}
+
+// sameDisplayedEvidence reports whether two recorded lists are the same
+// evidence as far as DISPLAY bounds alone can prove, for the legacy case
+// where at least one side carries no comparison fingerprint. A list can only
+// hide entries where a bound actually cut it — the overview keeps three, a
+// completion six — so a shorter list is complete as recorded and a difference
+// in it is a real difference, while a list sitting exactly at one of those
+// bounds proves nothing about what follows it. An absent list and an empty one
+// are the same fact, so a persistence round trip is never a change.
+func sameDisplayedEvidence(old, cur []string) bool {
+	short, long := old, cur
+	if len(long) < len(short) {
+		short, long = long, short
+	}
+	if len(short) != len(long) && !displayBoundedLen(len(short)) {
+		return false
+	}
+	for i := range short {
+		if !sameDisplayedText(short[i], long[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// displayBoundedLen reports whether a list of n entries could have been cut
+// by one of the two display bounds it may have passed through.
+func displayBoundedLen(n int) bool {
+	return n == model.AnalysisFindingsBound || n == model.CompletionObservationsBound
+}
+
+// sameDisplayedText compares two recorded texts under the same rule: equal
+// once whitespace is normalized, or one is the other marked as cut.
+// model.BoundIncidentAnalysis bounds an overview limitation to a hundred
+// bytes and marks the cut with an ellipsis, while the completion path carries
+// the same limitation whole; that difference is display, not evidence.
+func sameDisplayedText(x, y string) bool {
+	x, y = strings.Join(strings.Fields(x), " "), strings.Join(strings.Fields(y), " ")
+	if x == y {
+		return true
+	}
+	return markedAsCut(x, y) || markedAsCut(y, x)
+}
+
+func markedAsCut(short, long string) bool {
+	cut, ok := strings.CutSuffix(short, "…")
+	return ok && cut != "" && strings.HasPrefix(long, cut)
+}
+
+// candidateFinding is the FindingFacts a MaterialCandidate carries: the
+// operator-visible facts, never the comparison fingerprint. Materiality is
+// decided here in B3 from the committed projections; B4 renders and B5 owns
+// delivery history, and neither may key anything on comparison provenance.
+func candidateFinding(f *model.FindingFacts) *model.FindingFacts {
+	cp := copyFindingFacts(f)
+	if cp != nil {
+		cp.EvidenceFingerprint = ""
+	}
+	return cp
 }
 
 // endedWorkKey is the stable identity two committed EndedWork records are

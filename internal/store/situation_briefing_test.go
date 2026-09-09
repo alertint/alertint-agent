@@ -659,3 +659,142 @@ func TestSecondAttemptCompletionIsAttributedToItsOwnAttempt(t *testing.T) {
 		t.Fatalf("candidate must carry the second attempt's own evidence: %+v", inconclusive)
 	}
 }
+
+// ----------------------------------------------------------------------
+// R2 continued (lead review round 4, 2026-09-09): the real load →
+// projection → commit → reload path, where the analysis overview and the
+// matched completion evidence pass through DIFFERENT display bounds.
+// Nothing below hand-builds an analysis or a FindingFacts.
+// ----------------------------------------------------------------------
+
+// One Incident whose accepted completion recorded FOUR observations and a
+// limitation longer than the overview's hundred-byte bound: the overview
+// keeps three and marks its cut, the matched completion keeps all four
+// whole. Both projections record the same pre-truncation comparison
+// provenance, so the display difference is never an evidence change — while a
+// later attempt that changes only the FOURTH observation, which the overview
+// cannot display at all, is still reported.
+func TestEvidenceComparisonSeparatesDisplayBoundsFromEvidence(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 10, 0, 0, 0, time.UTC)
+	f := ewpFixture(t, st, "ewp-bounds", "a", 2, now)
+	claimed := mustClaim(t, st, f, now)
+	ewpCycle(t, st, f.SituationID, "controller-bounds", now.Add(time.Minute), shRunningTriageContract(now.Add(2*time.Minute)))
+
+	limit := "metrics_source_unavailable: " + strings.Repeat("the recorded degradation reason keeps going ", 3)
+	complete := func(fixture triageFixture, attemptID string, observations []string, at time.Time) {
+		t.Helper()
+		finding := TriageFinding{
+			OutputJSON:     `{"analysis_name":"Checkout analysis","correlation_findings":["` + strings.Join(observations, `","`) + `"]}`,
+			Summary:        "Checkout analysis",
+			RootCause:      "Deployment broke checkout",
+			Confidence:     0.7,
+			EnrichmentJSON: `{"verification":{"outcome":"degraded","degradation_reason":"` + limit + `","rounds":[{"queries":[{"outcome":"failed"}]}]}}`,
+		}
+		result, err := st.CompleteIncidentTriageAttempt(ctx, attemptID, fixture.IncidentID, finding, at)
+		if err != nil || result.Outcome != TriageCompletionSuccess {
+			t.Fatalf("complete %s: %+v %v", attemptID, result, err)
+		}
+	}
+	recorded := []string{"check one", "check two", "check three", "check four"}
+	complete(f, claimed.AttemptID, recorded, now.Add(90*time.Second))
+
+	// Cycle 2: the accepted result is reported once. The two projections
+	// disagree about what to DISPLAY and agree about what was recorded.
+	later := now.Add(3 * time.Minute)
+	second, in := ewpCycle(t, st, f.SituationID, "controller-bounds", later, shRunningTriageContract(later.Add(time.Minute)))
+	if len(in.Analyses) != 1 || len(in.Analyses[0].Findings) != model.AnalysisFindingsBound || !strings.HasSuffix(in.Analyses[0].VerificationLimit, "…") {
+		t.Fatalf("the overview must apply its own list and text bounds: %+v", in.Analyses)
+	}
+	exec := in.Incidents[0].Triage.LastExecution
+	if exec == nil || exec.Evidence == nil || len(exec.Evidence.Observations) != 4 || exec.Evidence.VerificationLimit != limit {
+		t.Fatalf("the matched completion keeps the whole recorded evidence: %+v", exec)
+	}
+	an := ewpAnalysis(t, second, f.IncidentID)
+	outcome, ok := ewpEndedWork(second, f.IncidentID)
+	if !ok || outcome.Finding == nil {
+		t.Fatalf("ended work must carry the matched evidence: %+v", outcome)
+	}
+	if an.EvidenceFingerprint == "" || outcome.Finding.EvidenceFingerprint != an.EvidenceFingerprint {
+		t.Fatalf("the two projections must record the same pre-truncation provenance: overview=%q completion=%q",
+			an.EvidenceFingerprint, outcome.Finding.EvidenceFingerprint)
+	}
+	if useful := ewpCandidates(second, model.CandidateUsefulFinding); len(useful) != 1 || useful[0].Finding.IncidentID != f.IncidentID {
+		t.Fatalf("the accepted result must be reported exactly once: %+v", useful)
+	} else if useful[0].Finding.EvidenceFingerprint != "" {
+		t.Fatalf("a candidate must not carry comparison provenance downstream: %+v", useful[0].Finding)
+	}
+
+	// Cycle 3: a second Incident joins the Situation — a real material
+	// change that records a Transition — while the first Incident's evidence
+	// is unchanged. Its three-item overview entry must not read as different
+	// evidence from the four-item completion it already reported.
+	ewpFixture(t, st, "ewp-bounds", "b", 1, now.Add(time.Second))
+	third := now.Add(6 * time.Minute)
+	joined, _ := ewpCycle(t, st, f.SituationID, "controller-bounds", third, shRunningTriageContract(third.Add(time.Minute)))
+	if joined.ID == "" {
+		t.Fatal("a new member is a material change and must record a transition")
+	}
+	for _, c := range ewpCandidates(joined, model.CandidateUsefulFinding) {
+		if c.Finding.IncidentID == f.IncidentID {
+			t.Fatalf("unchanged evidence displayed through a different bound became a new finding: %+v", c.Finding)
+		}
+	}
+
+	// Cycle 4: a real second attempt whose only change is the FOURTH
+	// observation — invisible in the overview, and still a material change.
+	if _, err := st.db.ExecContext(ctx, `UPDATE incidents SET status='ready' WHERE id=?`, f.IncidentID); err != nil {
+		t.Fatalf("reopen incident for a second analysis: %v", err)
+	}
+	rerunFixture := f
+	rerunFixture.MembershipDigest, rerunFixture.IncidentInputDigest = digestsForTest(t, st, f.IncidentID)
+	// The re-analysis schedule is seeded directly, carrying the attempt the
+	// first analysis already spent: this chunk owns no re-open writer, and
+	// everything after it — decision, claim, completion, load, projection,
+	// commit and reload — is the real path.
+	reopenedAt := now.Add(7 * time.Minute)
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO incident_triage (incident_id, phase, attempts, updated_at) VALUES (?, 'awaiting_decision', 1, ?)`,
+		f.IncidentID, canonicalTime(reopenedAt)); err != nil {
+		t.Fatalf("seed re-analysis schedule: %v", err)
+	}
+	applyDecisionsTx(t, st, []situation.TriageDecision{requestDecisionFor(rerunFixture, "test_fixture", reopenedAt)}, reopenedAt)
+	rerun := mustClaimExisting(t, st, rerunFixture, reopenedAt)
+	complete(rerunFixture, rerun.AttemptID, []string{"check one", "check two", "check three", "check four, rerun"}, now.Add(8*time.Minute))
+	fourth := now.Add(9 * time.Minute)
+	reported, _ := ewpCycle(t, st, f.SituationID, "controller-bounds", fourth, shRunningTriageContract(fourth.Add(time.Minute)))
+	changed := 0
+	for _, c := range ewpCandidates(reported, model.CandidateUsefulFinding) {
+		if c.Finding.IncidentID == f.IncidentID {
+			changed++
+		}
+	}
+	// Exactly one: the Incident is inside the overview, so the analysis path
+	// reports it and the completion path defers, as it does for any
+	// in-overview result.
+	if changed != 1 {
+		t.Fatalf("a changed observation beyond the overview's bound was reported %d times: %+v", changed, reported.Projection.OperatorDelta)
+	}
+	rerunOutcome, ok := ewpEndedWork(reported, f.IncidentID)
+	if !ok || rerunOutcome.AttemptID != rerun.AttemptID || rerunOutcome.Finding == nil ||
+		strings.Join(rerunOutcome.Finding.Observations, ";") != "check one;check two;check three;check four, rerun" {
+		t.Fatalf("the change must come from the second attempt's own matched evidence: %+v", rerunOutcome)
+	}
+	if rerunOutcome.Finding.EvidenceFingerprint == an.EvidenceFingerprint {
+		t.Fatalf("changed evidence must not reproduce the first attempt's fingerprint: %q", an.EvidenceFingerprint)
+	}
+}
+
+func ewpAnalysis(t *testing.T, tr model.Transition, incidentID string) model.IncidentAnalysis {
+	t.Helper()
+	if tr.Projection.Briefing != nil {
+		for _, a := range tr.Projection.Briefing.Analyses {
+			if a.IncidentID == incidentID {
+				return a
+			}
+		}
+	}
+	t.Fatalf("committed briefing carries no analysis for %s", incidentID)
+	return model.IncidentAnalysis{}
+}

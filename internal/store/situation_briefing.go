@@ -16,7 +16,10 @@ import (
 )
 
 // Select only bounded operator fields in the same transaction as membership,
-// assessment and journal. Raw outputs, queries and enrichment never cross it.
+// assessment and journal. Raw outputs, queries and enrichment never cross it —
+// the untruncated observations and limitation are read only to compute the
+// analysis's pre-truncation EvidenceFingerprint here, exactly as
+// loadMatchedCompletionEvidenceTx reads raw output only to recompute a digest.
 func loadSituationAnalysesTx(ctx context.Context, tx *sql.Tx, id string) ([]model.IncidentAnalysis, int, error) {
 	rows, err := tx.QueryContext(ctx, `
  SELECT i.id, substr(COALESCE(i.summary,''),1,181), substr(COALESCE(i.root_cause,''),1,501),
@@ -24,7 +27,9 @@ func loadSituationAnalysesTx(ctx context.Context, tx *sql.Tx, id string) ([]mode
      SELECT substr(value,1,401) AS value FROM json_each(CASE WHEN json_valid(i.output_json) THEN i.output_json ELSE '{}' END, '$.correlation_findings')
      WHERE type='text' LIMIT 3)),
    substr(COALESCE(json_extract(CASE WHEN json_valid(i.enrichment_json) THEN i.enrichment_json ELSE '{}' END,'$.verification.outcome'),''),1,40),
-   substr(COALESCE(json_extract(CASE WHEN json_valid(i.enrichment_json) THEN i.enrichment_json ELSE '{}' END,'$.verification.degradation_reason'),''),1,100),
+   substr(COALESCE(json_extract(CASE WHEN json_valid(i.enrichment_json) THEN i.enrichment_json ELSE '{}' END,'$.verification.degradation_reason'),''),1,101),
+   (SELECT json_group_array(value) FROM json_each(CASE WHEN json_valid(i.output_json) THEN i.output_json ELSE '{}' END, '$.correlation_findings') WHERE type='text'),
+   COALESCE(json_extract(CASE WHEN json_valid(i.enrichment_json) THEN i.enrichment_json ELSE '{}' END,'$.verification.degradation_reason'),''),
    i.last_judged_at, i.last_alert_at,
    (SELECT COUNT(*) FROM json_each(CASE WHEN json_valid(i.enrichment_json) THEN i.enrichment_json ELSE '{}' END,'$.verification.rounds') r,
      json_each(CASE WHEN r.type='object' THEN r.value ELSE '{}' END,'$.queries') q
@@ -42,14 +47,27 @@ func loadSituationAnalysesTx(ctx context.Context, tx *sql.Tx, id string) ([]mode
 	var total int
 	for rows.Next() {
 		var a model.IncidentAnalysis
-		var findings, last string
+		var findings, allFindings, fullLimit, last string
 		var judged sql.NullString
-		if err := rows.Scan(&a.IncidentID, &a.Title, &a.Summary, &findings, &a.Verification, &a.VerificationLimit, &judged, &last, &a.VerificationGaps, &total); err != nil {
+		if err := rows.Scan(&a.IncidentID, &a.Title, &a.Summary, &findings, &a.Verification, &a.VerificationLimit,
+			&allFindings, &fullLimit, &judged, &last, &a.VerificationGaps, &total); err != nil {
 			return nil, 0, fmt.Errorf("store: scan situation analysis: %w", err)
 		}
 		if err := json.Unmarshal([]byte(findings), &a.Findings); err != nil {
 			return nil, 0, fmt.Errorf("store: decode selected analysis findings: %w", err)
 		}
+		// Comparison provenance is taken from the FULL recorded observations
+		// and limitation, before the display bounds this query already
+		// applied above: the same fingerprint the matched completion
+		// evidence carries, so materiality never reads a three-item overview
+		// as different evidence from a six-item completion (lead
+		// authorization, round 4, 2026-09-09). The untruncated text is used
+		// only to compute it and never crosses the transaction.
+		var recorded []string
+		if err := json.Unmarshal([]byte(allFindings), &recorded); err != nil {
+			return nil, 0, fmt.Errorf("store: decode recorded analysis findings: %w", err)
+		}
+		a.EvidenceFingerprint = model.EvidenceFingerprint(recorded, fullLimit, a.VerificationGaps)
 		if judged.Valid {
 			at, err := time.Parse(time.RFC3339Nano, judged.String)
 			if err != nil {

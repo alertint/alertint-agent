@@ -692,3 +692,143 @@ func TestEndedWorkRepeatedWordingDoesNotSuppressADistinctInconclusiveCompletion(
 		t.Fatalf("a distinct inconclusive completion identity must survive the materiality gate: %+v", c)
 	}
 }
+
+// ----------------------------------------------------------------------
+// R2 continued (lead review round 4, 2026-09-09): materiality must not
+// depend on WHICH path displays a result, and a display bound must never
+// read as an evidence change. The overview keeps three observations and
+// bounds a limitation to a hundred bytes; a completion keeps six and carries
+// the limitation whole. Comparison provenance is the pre-truncation
+// EvidenceFingerprint the loader and the matched completion both record;
+// where it is missing the comparison falls back to what the two displays can
+// prove, and a list shorter than any bound proves itself complete.
+// ----------------------------------------------------------------------
+
+// The lead's probe in repo form: an unchanged accepted result whose incident
+// re-enters the three-item overview. The prior overview lookup is nil, but
+// the prior EndedWork already reported exactly this evidence.
+func TestMaterialityUnchangedResultReturningToOverviewStaysQuiet(t *testing.T) {
+	now := ewNow(t)
+	o := ewSettledOutcome("target", "attempt-1", "Deployment broke checkout", now)
+	a, b := ewBriefing(model.WorkPhaseSettled, o), ewBriefing(model.WorkPhaseSettled, o)
+	a.Analyses = ewOverview()
+	// A legitimate member delta reorders the overview: "target" takes the
+	// third slot from "other3" with the same evidence it already reported.
+	b.Analyses = []model.IncidentAnalysis{a.Analyses[0], a.Analyses[1], {
+		IncidentID: "target", Summary: o.Finding.Hypothesis,
+		Findings: append([]string(nil), o.Finding.Observations...), VerificationLimit: "metrics_source_unavailable",
+	}}
+	prior := mcTransition(model.LifecycleActive, a)
+	cands := MaterialCandidates(&prior, mcTransition(model.LifecycleActive, b))
+	if c := ewUsefulFor(cands, "target"); c != nil {
+		t.Fatalf("the same reported result re-entering the overview became a new finding: %+v", c.Finding)
+	}
+	// Per incident, not a blanket silence: the same movement with actually
+	// changed observations is still a finding.
+	b.Analyses[2].Findings = []string{"Pod events checked", "Config rollout compared"}
+	cands = MaterialCandidates(&prior, mcTransition(model.LifecycleActive, b))
+	if c := ewUsefulFor(cands, "target"); c == nil {
+		t.Fatalf("changed observations on the returning incident were suppressed: %v", candidateKinds(cands))
+	}
+}
+
+// The lead's second probe in repo form: the prior overview retained three of
+// the four observations the completion carries. Its omission of the fourth is
+// display, not proof the fourth was absent.
+func TestMaterialityDisplayBoundsAreNotEvidenceChanges(t *testing.T) {
+	now := ewNow(t)
+	observations := []string{"check one", "check two", "check three", "check four"}
+	a := ewBriefing(model.WorkPhaseExecuting)
+	a.Analyses = []model.IncidentAnalysis{{IncidentID: "target", Summary: "Known hypothesis", Findings: observations[:model.AnalysisFindingsBound]}}
+	o := ewSettledOutcome("target", "attempt-2", "Known hypothesis", now)
+	o.Finding.Observations, o.Finding.Unknowns = observations, nil
+	b := ewBriefing(model.WorkPhaseSettled, o)
+	b.Analyses = ewOverview()
+	prior := mcTransition(model.LifecycleActive, a)
+	if c := ewUsefulFor(MaterialCandidates(&prior, mcTransition(model.LifecycleActive, b)), "target"); c != nil {
+		t.Fatalf("a three-item display against a four-item completion fabricated a change: %+v", c.Finding)
+	}
+	// A list shorter than every display bound was never cut, so a new
+	// observation added to it is a real change and must still be reported.
+	a.Analyses[0].Findings = observations[:2]
+	o.Finding.Observations = observations[:3]
+	b = ewBriefing(model.WorkPhaseSettled, o)
+	b.Analyses = ewOverview()
+	prior = mcTransition(model.LifecycleActive, a)
+	if c := ewUsefulFor(MaterialCandidates(&prior, mcTransition(model.LifecycleActive, b)), "target"); c == nil {
+		t.Fatalf("an observation added to a complete two-item list is a real change and was suppressed")
+	}
+}
+
+// The differing text bounds: the overview marks its hundred-byte cut with an
+// ellipsis, the completion carries the same limitation whole.
+func TestMaterialityLimitationTextBoundIsNotAnEvidenceChange(t *testing.T) {
+	now := ewNow(t)
+	limit := "metrics_source_unavailable: " + strings.Repeat("the recorded degradation reason keeps going ", 4)
+	o := ewSettledOutcome("outside", "attempt-1", "Deployment broke checkout", now)
+	o.Finding.Unknowns = verificationUnknowns(limit, 0)
+	a := ewBriefing(model.WorkPhaseExecuting)
+	a.Analyses = []model.IncidentAnalysis{model.BoundIncidentAnalysis(model.IncidentAnalysis{
+		IncidentID: "outside", Summary: "Deployment broke checkout",
+		Findings: append([]string(nil), o.Finding.Observations...), VerificationLimit: limit,
+	})}
+	if got := a.Analyses[0].VerificationLimit; !strings.HasSuffix(got, "…") || len(got) > 100 {
+		t.Fatalf("fixture must exercise the real hundred-byte overview bound: %q", got)
+	}
+	b := ewBriefing(model.WorkPhaseSettled, o)
+	b.Analyses = ewOverview()
+	prior := mcTransition(model.LifecycleActive, a)
+	if c := ewUsefulFor(MaterialCandidates(&prior, mcTransition(model.LifecycleActive, b)), "outside"); c != nil {
+		t.Fatalf("a bounded limitation against the whole one fabricated a change: %+v", c.Finding)
+	}
+	// A genuinely different limitation is still a change.
+	o.Finding.Unknowns = verificationUnknowns("logs_source_unavailable", 0)
+	b = ewBriefing(model.WorkPhaseSettled, o)
+	b.Analyses = ewOverview()
+	if c := ewUsefulFor(MaterialCandidates(&prior, mcTransition(model.LifecycleActive, b)), "outside"); c == nil {
+		t.Fatalf("a different recorded limitation is a real change and was suppressed")
+	}
+}
+
+// Comparison provenance is what preserves a change the overview cannot show:
+// the same three displayed observations, a different fourth one.
+func TestMaterialityFingerprintPreservesChangesBeyondTheOverviewBound(t *testing.T) {
+	now := ewNow(t)
+	shown := []string{"check one", "check two", "check three"}
+	recorded := append(append([]string(nil), shown...), "check four")
+	changed := append(append([]string(nil), shown...), "check four, rerun")
+
+	// The prior transition reported the completion; the incident then enters
+	// the overview, where only the first three observations are displayed.
+	priorFor := func(observations []string) *model.OperatorBriefing {
+		o := ewSettledOutcome("target", "attempt-1", "Known hypothesis", now)
+		o.Finding.Observations, o.Finding.Unknowns = observations, nil
+		o.Finding.EvidenceFingerprint = model.EvidenceFingerprint(observations, "", 0)
+		p := ewBriefing(model.WorkPhaseSettled, o)
+		p.Analyses = ewOverview()
+		return p
+	}
+	current := func(observations []string) *model.OperatorBriefing {
+		b := ewBriefing(model.WorkPhaseSettled)
+		b.Analyses = []model.IncidentAnalysis{{
+			IncidentID: "target", Summary: "Known hypothesis", Findings: shown,
+			EvidenceFingerprint: model.EvidenceFingerprint(observations, "", 0),
+		}}
+		return b
+	}
+
+	prior := mcTransition(model.LifecycleActive, priorFor(recorded))
+	if c := ewUsefulFor(MaterialCandidates(&prior, mcTransition(model.LifecycleActive, current(recorded))), "target"); c != nil {
+		t.Fatalf("unchanged evidence displayed through a different bound became a finding: %+v", c.Finding)
+	}
+	cands := MaterialCandidates(&prior, mcTransition(model.LifecycleActive, current(changed)))
+	c := ewUsefulFor(cands, "target")
+	if c == nil {
+		t.Fatalf("a changed fourth observation the overview cannot display was suppressed: %v", candidateKinds(cands))
+	}
+	// Comparison provenance stays in B3: the candidate handed downstream
+	// carries the operator-visible facts only.
+	if c.Finding.EvidenceFingerprint != "" {
+		t.Fatalf("a material candidate must not carry comparison provenance: %+v", c.Finding)
+	}
+}

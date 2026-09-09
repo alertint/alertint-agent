@@ -931,9 +931,14 @@ func incidentWorkOutcome(inc IncidentState, phase model.WorkPhase) model.Inciden
 		out.Finding = &model.FindingFacts{
 			IncidentID:   inc.ID,
 			Hypothesis:   boundedText(ev.Hypothesis, 500),
-			Observations: boundedEach(ev.Observations, 6, 400),
+			Observations: boundedEach(ev.Observations, model.CompletionObservationsBound, 400),
 			Unknowns:     verificationUnknowns(ev.VerificationLimit, ev.VerificationGaps),
 			AnalyzedAt:   ev.JudgedAt,
+			// Taken from the matched attempt's own evidence BEFORE the
+			// bounds above, so materiality compares the same fact the
+			// three-item analysis overview fingerprints (lead
+			// authorization, round 4, 2026-09-09).
+			EvidenceFingerprint: model.EvidenceFingerprint(ev.Observations, ev.VerificationLimit, ev.VerificationGaps),
 		}
 	}
 	return out
