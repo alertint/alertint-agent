@@ -1101,15 +1101,29 @@ func DeriveOrientation(summary model.EpisodeSummary, latest model.Transition) Or
 		if b == nil || b.Work.Phase == "" {
 			return legacyOrientation(summary, latest)
 		}
-		switch b.Work.Phase { //nolint:exhaustive // collecting/awaiting_decision/none all fall to the Observed default below.
+		switch b.Work.Phase { //nolint:exhaustive // collecting/none fall to the Observed default below.
 		case model.WorkPhaseExecuting, model.WorkPhaseRetryWait:
 			return OrientationInvestigating
-		case model.WorkPhaseQueued:
+		case model.WorkPhaseQueued, model.WorkPhaseAwaitingDecision:
+			// R2 repair (lead review 2026-09-09): outstanding work after
+			// execution began — a stale completion restored awaiting_decision
+			// (completeStaleTx) while attempts remain spent, or a sibling
+			// Incident in this Situation already executed — is still
+			// Investigating (slide 4: "Investigating includes work that
+			// remains outstanding after it began"), never Observed. Only
+			// work that has genuinely never executed anywhere in this
+			// Situation reads as Observed.
 			if b.Work.ExecutionStarted {
 				return OrientationInvestigating
 			}
 			return OrientationObserved
 		case model.WorkPhaseSettled, model.WorkPhaseExhausted:
+			// Settled/exhausted outrank ExecutionStarted: a policy/coverage
+			// skip that never executed at all is still Monitoring once no
+			// work remains, per the canonical HTML's investigation:skip and
+			// skip-policy examples (lead review 2026-09-09 contract
+			// clarification) — "no execution -> Observed" applies to
+			// unstarted outstanding/collecting work, not a settled skip.
 			return OrientationMonitoring
 		default:
 			return OrientationObserved

@@ -187,6 +187,50 @@ func TestBuildWorkProjectionCompletionWithoutUsefulFindingStaysExhausted(t *test
 	}
 }
 
+// TestBuildWorkProjectionAnalyzedIncidentWithoutScheduleIsSettled is R1
+// (lead review 2026-09-09): a successful completion DELETES the
+// incident_triage row (triage_controller.go completeSuccessTx), so a bare
+// Phase=="" must not read identically to "never reached ready" — the
+// Incident's own durable Status distinguishes them. ExecutionStarted must
+// also survive the Attempts counter resetting to 0 once that row is gone,
+// via LastExecution.
+func TestBuildWorkProjectionAnalyzedIncidentWithoutScheduleIsSettled(t *testing.T) {
+	started := wpNow(t)
+	inc := []IncidentState{{
+		ID:     "i",
+		Status: "analyzed",
+		Triage: TriageState{
+			Phase:         "",
+			Attempts:      0,
+			LastExecution: &TriageExecution{AttemptID: "a1", AttemptNumber: 1, StartedAt: started, MemberDeliveryIDs: []string{"d1"}},
+		},
+	}}
+	got := BuildWorkProjection(inc, nil, nil)
+	if got.Phase != model.WorkPhaseSettled {
+		t.Fatalf("Phase = %v, want WorkPhaseSettled — an analyzed Incident with a closed schedule is settled work, not collecting", got.Phase)
+	}
+	if !got.ExecutionStarted {
+		t.Fatal("ExecutionStarted = false, want true — LastExecution proves a real attempt ran even though Attempts reset to 0")
+	}
+	if got.RemainingIncidents != 0 {
+		t.Fatalf("RemainingIncidents = %d, want 0", got.RemainingIncidents)
+	}
+}
+
+// TestBuildWorkProjectionCollectingIncidentNeverReachedReadyStaysCollecting
+// is the negative control: Phase=="" with no LastExecution and a Status
+// that never reached "analyzed" is genuinely still collecting, not settled.
+func TestBuildWorkProjectionCollectingIncidentNeverReachedReadyStaysCollecting(t *testing.T) {
+	inc := []IncidentState{{ID: "i", Status: "collecting", Triage: TriageState{Phase: ""}}}
+	got := BuildWorkProjection(inc, nil, nil)
+	if got.Phase != model.WorkPhaseCollecting {
+		t.Fatalf("Phase = %v, want WorkPhaseCollecting", got.Phase)
+	}
+	if got.ExecutionStarted {
+		t.Fatal("ExecutionStarted = true, want false — nothing has ever executed here")
+	}
+}
+
 // ----------------------------------------------------------------------
 // S2-03: "Prior coverage OR eligibility policy" — coverage reuse and
 // eligibility/minimum-members skip retain distinct actual reasons.
@@ -233,6 +277,49 @@ func TestCommittedBriefingInputDoesNotKeepAnOldRequestReasonUnderANewSkip(t *tes
 	}
 	if tr.SkipReason != "eligibility_policy" {
 		t.Fatalf("SkipReason = %q, want %q", tr.SkipReason, "eligibility_policy")
+	}
+}
+
+// ----------------------------------------------------------------------
+// R3 (lead review 2026-09-09): the committed Assessment-level retry
+// (situations.retry_at, ControllerCommit.RetryAt — contract §3's "next_at /
+// retry_at") must reach WorkProjection.RetryEligibleAt, truthfully distinct
+// from a per-incident Triage backoff and from a status checkpoint.
+// BuildWorkProjection's own 3-parameter shape is a pinned external test
+// boundary, so committedOperatorBriefing carries it instead — see its own
+// doc comment.
+// ----------------------------------------------------------------------
+
+func TestCommittedOperatorBriefingProjectsAssessmentRetryEvenWithoutTriageBackoff(t *testing.T) {
+	due := wpNow(t).Add(time.Minute)
+	commit := ControllerCommit{Lifecycle: model.LifecycleActive, RetryAt: &due}
+	b := committedOperatorBriefing(SnapshotInput{}, commit)
+	if b.Work.RetryEligibleAt == nil || !b.Work.RetryEligibleAt.Equal(due) {
+		t.Fatalf("RetryEligibleAt = %v, want the committed Assessment retry %s", b.Work.RetryEligibleAt, due)
+	}
+}
+
+func TestCommittedOperatorBriefingRetryEligibleAtIsTheEarlierOfTriageBackoffAndAssessmentRetry(t *testing.T) {
+	now := wpNow(t)
+	triageBackoff := now.Add(30 * time.Minute)
+	assessmentRetry := now.Add(5 * time.Minute)
+	in := SnapshotInput{Incidents: []IncidentState{wpIncident("i", "backoff", 1, &triageBackoff, nil)}}
+	commit := ControllerCommit{Lifecycle: model.LifecycleActive, RetryAt: &assessmentRetry}
+	b := committedOperatorBriefing(in, commit)
+	if b.Work.RetryEligibleAt == nil || !b.Work.RetryEligibleAt.Equal(assessmentRetry) {
+		t.Fatalf("RetryEligibleAt = %v, want the earlier assessment retry %s — a later triage backoff must not shadow it", b.Work.RetryEligibleAt, assessmentRetry)
+	}
+}
+
+func TestCommittedOperatorBriefingRetryEligibleAtPrefersEarlierTriageBackoffOverLaterAssessmentRetry(t *testing.T) {
+	now := wpNow(t)
+	triageBackoff := now.Add(2 * time.Minute)
+	assessmentRetry := now.Add(30 * time.Minute)
+	in := SnapshotInput{Incidents: []IncidentState{wpIncident("i", "backoff", 1, &triageBackoff, nil)}}
+	commit := ControllerCommit{Lifecycle: model.LifecycleActive, RetryAt: &assessmentRetry}
+	b := committedOperatorBriefing(in, commit)
+	if b.Work.RetryEligibleAt == nil || !b.Work.RetryEligibleAt.Equal(triageBackoff) {
+		t.Fatalf("RetryEligibleAt = %v, want the earlier triage backoff %s — a later assessment retry must not shadow it", b.Work.RetryEligibleAt, triageBackoff)
 	}
 }
 
@@ -290,6 +377,12 @@ func TestDeriveOrientationFromWorkProjection(t *testing.T) {
 	}{
 		{"queued before any execution", model.WorkProjection{Phase: model.WorkPhaseQueued, ExecutionStarted: false}, OrientationObserved},
 		{"awaiting decision", model.WorkProjection{Phase: model.WorkPhaseAwaitingDecision}, OrientationObserved},
+		// R2 repair (lead review 2026-09-09): a stale completion can restore
+		// awaiting_decision while attempts remain spent (completeStaleTx), or
+		// a sibling Incident in this Situation may already have executed —
+		// either way outstanding work after execution began is still
+		// Investigating, never Observed.
+		{"awaiting decision after execution began", model.WorkProjection{Phase: model.WorkPhaseAwaitingDecision, ExecutionStarted: true}, OrientationInvestigating},
 		{"executing", model.WorkProjection{Phase: model.WorkPhaseExecuting, ExecutionStarted: true}, OrientationInvestigating},
 		{"retry wait", model.WorkProjection{Phase: model.WorkPhaseRetryWait, ExecutionStarted: true}, OrientationInvestigating},
 		{"settled skip, no execution", model.WorkProjection{Phase: model.WorkPhaseSettled}, OrientationMonitoring},

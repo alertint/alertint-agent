@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/alertint/alertint-agent/internal/situation"
+	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 
 	"github.com/alertint/alertint-agent/internal/store/storetest"
 )
@@ -1763,4 +1764,261 @@ func mustClaimExisting(t *testing.T, st *Store, f triageFixture, now time.Time) 
 		t.Fatalf("claim: %v", err)
 	}
 	return got
+}
+
+// ----------------------------------------------------------------------
+// B2 repair (lead review 2026-09-09, evaluation/lead-b2-2026-09-09/review.md):
+// R1 (successful completion loses execution history) and R4 (post-claim
+// clean skip retains the request decision) regressions, plus the required
+// real-store controller-reconciliation coverage for S2-02 (refresh
+// preserves backoff, committed skip clears outstanding work) that goes
+// through a REAL transaction + loadSituationIncidentStatesTx reload rather
+// than a hand-constructed IncidentState.
+// ----------------------------------------------------------------------
+
+// TestSuccessfulCompletionRemainsSettledWithFrozenProvenance is R1: a
+// successful completion DELETES the incident_triage row
+// (completeSuccessTx), so the projection must read Status=="analyzed" as
+// settled work, never "collecting" — and LastExecution/ActiveAttempt must
+// come from the frozen incident_triage_attempts ledger, which the delete
+// never touches, never from the (now zeroed) attempts counter.
+func TestSuccessfulCompletionRemainsSettledWithFrozenProvenance(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "success-provenance", now)
+	claim := mustClaim(t, st, f, now)
+
+	result, err := st.CompleteIncidentTriageAttempt(ctx, claim.AttemptID, f.IncidentID, sampleFinding(), now.Add(time.Minute))
+	if err != nil || result.Outcome != TriageCompletionSuccess {
+		t.Fatalf("completion: %+v %v", result, err)
+	}
+
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	inc, err := loadSituationIncidentStatesTx(ctx, tx, f.SituationID)
+	if err != nil {
+		t.Fatalf("load situation incident states: %v", err)
+	}
+	if len(inc) != 1 {
+		t.Fatalf("incidents = %d, want 1", len(inc))
+	}
+
+	if inc[0].Triage.Phase != "" || inc[0].Triage.Attempts != 0 {
+		t.Fatalf("phase=%q attempts=%d, want the schedule row gone (success deletes it)", inc[0].Triage.Phase, inc[0].Triage.Attempts)
+	}
+	if inc[0].Triage.LastExecution == nil {
+		t.Fatal("LastExecution must survive the schedule row's deletion")
+	}
+	if inc[0].Triage.LastExecution.AttemptID != claim.AttemptID {
+		t.Fatalf("LastExecution.AttemptID = %q, want %q", inc[0].Triage.LastExecution.AttemptID, claim.AttemptID)
+	}
+	if got := inc[0].Triage.LastExecution.MemberDeliveryIDs; len(got) != 1 || got[0] != f.DeliveryID {
+		t.Fatalf("LastExecution.MemberDeliveryIDs = %v, want exactly the frozen claim-time set [%s]", got, f.DeliveryID)
+	}
+	if inc[0].Triage.ActiveAttempt != nil {
+		t.Fatalf("ActiveAttempt = %+v, want nil once completed", inc[0].Triage.ActiveAttempt)
+	}
+
+	work := situation.BuildWorkProjection(inc, nil, nil)
+	if work.Phase != situationmodel.WorkPhaseSettled {
+		t.Fatalf("Phase = %s, want settled", work.Phase)
+	}
+	if !work.ExecutionStarted {
+		t.Fatal("ExecutionStarted = false, want true for a real completed execution")
+	}
+	if work.RemainingIncidents != 0 {
+		t.Fatalf("RemainingIncidents = %d, want 0", work.RemainingIncidents)
+	}
+}
+
+// TestActiveAttemptProvenanceStaysFrozenAfterMembershipChanges proves R1's
+// other required case (lead repair handoff: "changed membership after
+// claim"): while a claim is still in_flight, a new alert joining the
+// Incident must never leak into ActiveAttempt's frozen claim-time member
+// deliveries — the actual investigation input, not the Situation's current
+// (possibly since-grown) membership.
+func TestActiveAttemptProvenanceStaysFrozenAfterMembershipChanges(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "active-frozen-membership", now)
+	claim := mustClaim(t, st, f, now)
+
+	dels, err := st.AcceptDeliveries(ctx, []DeliveryInput{deliveryFixture("delivery-active-frozen-2", "fp-active-frozen-2", now.Add(30*time.Second))})
+	if err != nil || len(dels) != 1 {
+		t.Fatalf("accept second (post-claim) delivery: %v (%d)", err, len(dels))
+	}
+	if _, err := st.db.ExecContext(ctx, `INSERT INTO incident_alert_deliveries (incident_id, delivery_id, created_at) VALUES (?, ?, ?)`,
+		f.IncidentID, dels[0].ID, canonicalTime(now.Add(30*time.Second))); err != nil {
+		t.Fatalf("attach post-claim delivery: %v", err)
+	}
+
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	inc, err := loadSituationIncidentStatesTx(ctx, tx, f.SituationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inc) != 1 {
+		t.Fatalf("incidents = %d, want 1", len(inc))
+	}
+
+	if inc[0].Triage.ActiveAttempt == nil {
+		t.Fatal("ActiveAttempt must be populated while the claim is still in_flight")
+	}
+	if inc[0].Triage.ActiveAttempt.AttemptID != claim.AttemptID {
+		t.Fatalf("ActiveAttempt.AttemptID = %q, want %q", inc[0].Triage.ActiveAttempt.AttemptID, claim.AttemptID)
+	}
+	if got := inc[0].Triage.ActiveAttempt.MemberDeliveryIDs; len(got) != 1 || got[0] != f.DeliveryID {
+		t.Fatalf("ActiveAttempt.MemberDeliveryIDs = %v, want only the frozen claim-time delivery [%s] — never the one that joined afterward", got, f.DeliveryID)
+	}
+	if inc[0].Triage.LastExecution == nil || inc[0].Triage.LastExecution.AttemptID != claim.AttemptID {
+		t.Fatalf("LastExecution must also name the same in-flight attempt while it is the only one: %+v", inc[0].Triage.LastExecution)
+	}
+}
+
+// TestCompleteIncidentTriageAttemptAsCleanSkipRecordsEligibilityReasonNotStaleRequest
+// is R4: the post-claim defense-in-depth clean skip (skills/acutetriage's
+// own ErrCleanSkip, closed via CompleteIncidentTriageAttemptAsCleanSkip)
+// must record its own actual eligibility disposition, not leave the earlier
+// request decision/reason in place — the same guarantee B2's original pass
+// already gave the PRE-claim CleanSkipIncidentTriageBelowMinimumMembers path.
+func TestCompleteIncidentTriageAttemptAsCleanSkipRecordsEligibilityReasonNotStaleRequest(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "postclaim-reason", now)
+	claim := mustClaim(t, st, f, now)
+
+	before := triageRow(t, st, f.IncidentID)
+	if !before.Decision.Valid || before.Decision.String != situation.TriageDecisionRequest {
+		t.Fatalf("fixture precondition: decision = %+v, want request before the clean skip", before.Decision)
+	}
+
+	if err := st.CompleteIncidentTriageAttemptAsCleanSkip(ctx, claim.AttemptID, f.IncidentID,
+		"clean_skip", "acute triage found nothing to analyze (below the minimum member alert count)", now.Add(time.Minute)); err != nil {
+		t.Fatalf("complete as clean skip: %v", err)
+	}
+
+	after := triageRow(t, st, f.IncidentID)
+	if after.Phase != "skipped" {
+		t.Fatalf("phase = %q, want skipped", after.Phase)
+	}
+	if !after.Decision.Valid || after.Decision.String != situation.TriageDecisionSkip {
+		t.Fatalf("decision = %+v, want %q — not the stale earlier request", after.Decision, situation.TriageDecisionSkip)
+	}
+	if !after.DecisionReason.Valid || after.DecisionReason.String != situation.DecisionReasonEligibilityPolicyMinimumMembers {
+		t.Fatalf("decision_reason = %+v, want %q", after.DecisionReason, situation.DecisionReasonEligibilityPolicyMinimumMembers)
+	}
+
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	inc, err := loadSituationIncidentStatesTx(ctx, tx, f.SituationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	work := situation.BuildWorkProjection(inc, nil, nil)
+	if work.SkipReason != "eligibility_policy" {
+		t.Fatalf("SkipReason = %q, want eligibility_policy", work.SkipReason)
+	}
+	if work.Phase != situationmodel.WorkPhaseSettled {
+		t.Fatalf("Phase = %s, want settled", work.Phase)
+	}
+}
+
+// TestRealStoreRefreshPreservesBackoffPhaseAndDueInReloadedProjection is
+// S2-02's real-transaction/projection boundary (lead repair handoff:
+// "existing new B2 tests cover reducers... but not this required full
+// transaction/projection boundary"): a same-cycle refresh decision against
+// an already-backoff row must leave phase/next_at untouched all the way
+// through a real commit and a fresh reload, not just in a hand-constructed
+// IncidentState.
+func TestRealStoreRefreshPreservesBackoffPhaseAndDueInReloadedProjection(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "refresh-backoff-real", now)
+	claim := mustClaim(t, st, f, now)
+
+	backoffDue := now.Add(time.Hour)
+	if err := st.BackoffIncidentTriageAttempt(ctx, claim.AttemptID, f.IncidentID, backoffDue, "timeout", "deadline exceeded", now.Add(time.Minute)); err != nil {
+		t.Fatalf("backoff: %v", err)
+	}
+
+	applyDecisionsTx(t, st, []situation.TriageDecision{requestDecisionFor(f, "refresh_reason", now.Add(2*time.Minute))}, now.Add(2*time.Minute))
+
+	if row := triageRow(t, st, f.IncidentID); row.Phase != "backoff" {
+		t.Fatalf("phase = %q after refresh, want backoff (untouched)", row.Phase)
+	}
+
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	inc, err := loadSituationIncidentStatesTx(ctx, tx, f.SituationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inc[0].Triage.NextAt == nil || !inc[0].Triage.NextAt.Equal(backoffDue) {
+		t.Fatalf("reloaded NextAt = %v, want the original backoff due %s — never reset to now by the refresh", inc[0].Triage.NextAt, backoffDue)
+	}
+
+	work := situation.BuildWorkProjection(inc, nil, nil)
+	if work.Phase != situationmodel.WorkPhaseRetryWait {
+		t.Fatalf("Phase = %s, want retry_wait", work.Phase)
+	}
+	if work.RetryEligibleAt == nil || !work.RetryEligibleAt.Equal(backoffDue) {
+		t.Fatalf("RetryEligibleAt = %v, want the real persisted backoff due %s", work.RetryEligibleAt, backoffDue)
+	}
+}
+
+// TestRealStoreCommittedSkipClearsOutstandingWorkInReloadedProjection is
+// S2-02's other half: a same-commit skip decision must remove outstanding
+// work from the projection all the way through a real commit and reload,
+// not merely in the pure reducer (aggregateTriagePhase's own unit tests).
+func TestRealStoreCommittedSkipClearsOutstandingWorkInReloadedProjection(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "commit-skip-clears", now)
+	seedAwaitingDecisionRow(t, st, f.IncidentID, now)
+
+	assessmentID := insertMinimalAuthoritativeAssessment(t, st, f.SituationID)
+	applyDecisionsTx(t, st, []situation.TriageDecision{skipDecisionFor(f, assessmentID, now)}, now)
+
+	if row := triageRow(t, st, f.IncidentID); row.Phase != "skipped" {
+		t.Fatalf("phase = %q, want skipped", row.Phase)
+	}
+
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	inc, err := loadSituationIncidentStatesTx(ctx, tx, f.SituationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	work := situation.BuildWorkProjection(inc, nil, nil)
+	if work.Phase != situationmodel.WorkPhaseSettled {
+		t.Fatalf("Phase = %s, want settled — a committed skip must never still project as outstanding awaiting_decision work (S2-02)", work.Phase)
+	}
+	if work.RemainingIncidents != 0 {
+		t.Fatalf("RemainingIncidents = %d, want 0", work.RemainingIncidents)
+	}
+	if work.SkipReason != "prior_coverage" {
+		t.Fatalf("SkipReason = %q, want prior_coverage", work.SkipReason)
+	}
 }

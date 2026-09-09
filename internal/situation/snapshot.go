@@ -198,15 +198,15 @@ type TriageState struct {
 
 	// ActiveAttempt is the current in_flight row named by current_attempt_id,
 	// and LastExecution is the most recent attempt row regardless of
-	// outcome (B0 integration contract §3) — both nil until
+	// outcome (B0 integration contract §3) — both read by
 	// internal/store/situation_controller.go's loadSituationIncidentStatesTx
-	// joins incident_triage_attempts to populate them. That file is outside
-	// this chunk's (B2's) file allowlist; B2 declares the accepted shape
-	// here without wiring the read, and does not infer ExecutionStarted
-	// from these two fields (see WorkProjection.ExecutionStarted, which
-	// uses the already-durable Attempts counter instead). Reported to the
-	// lead as an open interface gap for a future chunk, not silently
-	// expanded into.
+	// from incident_triage_attempts (R1 repair, lead review 2026-09-09,
+	// narrow allowlist extension). LastExecution in particular survives a
+	// successful completion that deletes this Incident's incident_triage
+	// row entirely (triage_controller.go completeSuccessTx): Attempts
+	// resets to 0 (COALESCE default) once that row is gone, so
+	// BuildWorkProjection's ExecutionStarted also checks these two fields,
+	// never inferring execution from a request or decision alone.
 	ActiveAttempt *TriageExecution
 	LastExecution *TriageExecution
 

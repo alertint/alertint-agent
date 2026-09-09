@@ -430,16 +430,23 @@ func loadSituationDeliveriesTx(ctx context.Context, tx *sql.Tx, situationID stri
 
 // loadSituationIncidentStatesTx reads every current member Incident of
 // situationID plus its current incident_triage row (LEFT JOIN: an Incident
-// that has never reached "ready" has none — TriageState.Phase stays "") and
-// its recurrence-collapse occurrence count (incident_occurrences), the
-// durable fact behind the Situation's recurrence milestones.
+// that has never reached "ready" has none — TriageState.Phase stays ""),
+// its recurrence-collapse occurrence count (incident_occurrences), and its
+// frozen attempt-ledger provenance (ActiveAttempt/LastExecution, via
+// loadSituationTriageExecutionsTx — B0 integration contract §3, R1 repair
+// 2026-09-09): a successful completion DELETES the incident_triage row
+// (triage_controller.go completeSuccessTx) so phase/attempts alone cannot
+// tell "analyzed with a closed schedule" apart from "never reached ready";
+// the attempt ledger survives that delete and is the only durable source
+// left. Every other settlement (exhausted/skipped) keeps its incident_triage
+// row, so this join is read unconditionally rather than only when Phase=="".
 func loadSituationIncidentStatesTx(ctx context.Context, tx *sql.Tx, situationID string) ([]situation.IncidentState, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT i.id, i.group_key, i.status, i.first_alert_at, i.last_alert_at, i.ready_at, i.alert_count,
 		       COALESCE(t.phase, ''), COALESCE(t.attempts, 0), t.next_at,
 		       t.decision, t.decision_reason, t.decision_input_version,
 		       t.material_fact_hash, t.membership_digest, t.incident_input_digest,
-		       t.assessment_id, t.decided_at,
+		       t.assessment_id, t.decided_at, t.current_attempt_id,
 		       (SELECT COUNT(*) FROM incident_occurrences o WHERE o.incident_id = i.id)
 		FROM situation_incidents si
 		JOIN incidents i ON i.id = si.incident_id
@@ -452,16 +459,21 @@ func loadSituationIncidentStatesTx(ctx context.Context, tx *sql.Tx, situationID 
 	defer func() { _ = rows.Close() }()
 
 	out := []situation.IncidentState{}
+	// activeAttemptID names, per incident id, the in_flight row's own
+	// current_attempt_id — read alongside the main scan so the second
+	// (attempt-ledger) query below can tell ActiveAttempt apart from an
+	// older LastExecution without a further round trip.
+	activeAttemptID := make(map[string]string)
 	for rows.Next() {
 		var st situation.IncidentState
 		var firstStr, lastStr, readyStr string
-		var nextAt, decision, decisionReason, materialHash, membershipDigest, incidentInputDigest, assessmentID, decidedAt sql.NullString
+		var nextAt, decision, decisionReason, materialHash, membershipDigest, incidentInputDigest, assessmentID, decidedAt, currentAttemptID sql.NullString
 		var decisionInputVersion sql.NullInt64
 		if err := rows.Scan(&st.ID, &st.GroupKey, &st.Status, &firstStr, &lastStr, &readyStr, &st.AlertCount,
 			&st.Triage.Phase, &st.Triage.Attempts, &nextAt,
 			&decision, &decisionReason, &decisionInputVersion,
 			&materialHash, &membershipDigest, &incidentInputDigest,
-			&assessmentID, &decidedAt, &st.Occurrences); err != nil {
+			&assessmentID, &decidedAt, &currentAttemptID, &st.Occurrences); err != nil {
 			return nil, fmt.Errorf("store: scan situation incident state: %w", err)
 		}
 
@@ -491,10 +503,87 @@ func loadSituationIncidentStatesTx(ctx context.Context, tx *sql.Tx, situationID 
 			v := int(decisionInputVersion.Int64)
 			st.Triage.DecisionInputVersion = &v
 		}
+		if st.Triage.Phase == "in_flight" && currentAttemptID.Valid {
+			activeAttemptID[st.ID] = currentAttemptID.String
+		}
 		out = append(out, st)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("store: iterate situation incident states: %w", err)
+	}
+
+	incidentIDs := make([]string, len(out))
+	for i, st := range out {
+		incidentIDs[i] = st.ID
+	}
+	executions, err := loadSituationTriageExecutionsTx(ctx, tx, incidentIDs)
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		attempts := executions[out[i].ID]
+		if len(attempts) == 0 {
+			continue
+		}
+		last := attempts[len(attempts)-1] // ordered ascending by attempt_number
+		out[i].Triage.LastExecution = &last
+		if activeID, ok := activeAttemptID[out[i].ID]; ok {
+			for j := range attempts {
+				if attempts[j].AttemptID == activeID {
+					out[i].Triage.ActiveAttempt = &attempts[j]
+					break
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
+// loadSituationTriageExecutionsTx reads every incident_triage_attempts row
+// belonging to incidentIDs — the frozen claim-time attempt identity, start
+// time, and exact member delivery IDs claimed with it (B0 integration
+// contract §3's TriageExecution) — ordered per incident by attempt_number
+// ascending, so the caller can take the last entry as LastExecution
+// (surviving even a completion that later deletes the incident_triage
+// schedule row, R1 repair 2026-09-09) and match current_attempt_id against
+// it for ActiveAttempt. Returns an empty map for an empty incidentIDs (never
+// queries with an empty IN (...)).
+func loadSituationTriageExecutionsTx(ctx context.Context, tx *sql.Tx, incidentIDs []string) (map[string][]situation.TriageExecution, error) {
+	out := make(map[string][]situation.TriageExecution, len(incidentIDs))
+	if len(incidentIDs) == 0 {
+		return out, nil
+	}
+	placeholders, args := inPlaceholders(incidentIDs)
+	rows, err := tx.QueryContext(ctx, `
+		SELECT incident_id, id, attempt_number, started_at, member_delivery_ids_json
+		FROM incident_triage_attempts
+		WHERE incident_id IN (`+placeholders+`)
+		ORDER BY incident_id ASC, attempt_number ASC`, args...) // #nosec G202 -- placeholders is a fixed "?,?,..." run built from len(incidentIDs); every value is bound
+	if err != nil {
+		return nil, fmt.Errorf("store: load situation triage executions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var incidentID, attemptID, startedStr, memberJSON string
+		var attemptNumber int
+		if err := rows.Scan(&incidentID, &attemptID, &attemptNumber, &startedStr, &memberJSON); err != nil {
+			return nil, fmt.Errorf("store: scan situation triage execution: %w", err)
+		}
+		started, err := time.Parse(time.RFC3339Nano, startedStr)
+		if err != nil {
+			return nil, fmt.Errorf("store: parse triage attempt started_at: %w", err)
+		}
+		var memberDeliveryIDs []string
+		if err := json.Unmarshal([]byte(memberJSON), &memberDeliveryIDs); err != nil {
+			return nil, fmt.Errorf("store: unmarshal triage attempt member delivery ids: %w", err)
+		}
+		out[incidentID] = append(out[incidentID], situation.TriageExecution{
+			AttemptID: attemptID, AttemptNumber: attemptNumber, StartedAt: started, MemberDeliveryIDs: memberDeliveryIDs,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate situation triage executions: %w", err)
 	}
 	return out, nil
 }

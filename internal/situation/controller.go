@@ -827,7 +827,10 @@ func triageSkipReason(t TriageState) string {
 // are not guessed from display text"). graceUntil and statusCheckpointAt
 // are threaded straight through from this cycle's committed lifecycle
 // resolution and Operator contract; BuildWorkProjection derives nothing
-// about them itself.
+// about them itself. Assessment-level retry (situations.retry_at) is not an
+// input here — committedOperatorBriefing overlays it onto the returned
+// RetryEligibleAt, since this function's exact 3-parameter shape is a pinned
+// external test boundary (lead review 2026-09-09, R3).
 func BuildWorkProjection(incidents []IncidentState, graceUntil, statusCheckpointAt *time.Time) model.WorkProjection {
 	phases := make([]model.WorkPhase, 0, len(incidents))
 	executionStarted := false
@@ -836,9 +839,27 @@ func BuildWorkProjection(incidents []IncidentState, graceUntil, statusCheckpoint
 	var retryAt *time.Time
 
 	for _, inc := range incidents {
-		phase := workPhaseOf(inc.Triage.Phase)
+		// R1 repair (lead review 2026-09-09): a successful completion
+		// DELETES the incident_triage row (triage_controller.go
+		// completeSuccessTx), so a bare raw-phase=="" reads identically to
+		// an Incident that never reached "ready" unless the durable
+		// Incident.Status is also consulted. An analyzed Incident with no
+		// schedule is settled work, never "collecting" — the schedule
+		// closed because the investigation finished, not because it never
+		// began.
+		var phase model.WorkPhase
+		if inc.Triage.Phase == "" && inc.Status == "analyzed" {
+			phase = model.WorkPhaseSettled
+		} else {
+			phase = workPhaseOf(inc.Triage.Phase)
+		}
 		phases = append(phases, phase)
-		if inc.Triage.Attempts > 0 {
+		// ExecutionStarted must survive that same delete: Attempts resets to
+		// 0 (COALESCE default) once the row is gone, so LastExecution/
+		// ActiveAttempt — sourced from the immutable incident_triage_attempts
+		// ledger, which the delete never touches — are consulted too. Still
+		// never inferred from a request or decision alone (B0 §3).
+		if inc.Triage.Attempts > 0 || inc.Triage.LastExecution != nil || inc.Triage.ActiveAttempt != nil {
 			executionStarted = true
 		}
 		switch phase {

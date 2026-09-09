@@ -1338,12 +1338,23 @@ func (s *Store) CompleteIncidentTriageAttemptAsCleanSkip(ctx context.Context, at
 		return err
 	}
 
+	// R4 repair (lead review 2026-09-09): record this schedule's own actual
+	// disposition rather than leaving whatever decision/decision_reason an
+	// earlier request left in place. ErrCleanSkip today means exactly one
+	// thing — analyzeFromAlerts's member-count floor (skills/acutetriage/
+	// result.go) — so this defense-in-depth post-claim skip maps to the SAME
+	// eligibility_policy_minimum_members reason the pre-claim
+	// CleanSkipIncidentTriageBelowMinimumMembers records, never
+	// DecisionReasonCleanSkip (prior coverage): this attempt genuinely ran
+	// and found too few members to judge, it did not reuse a trustworthy
+	// prior finding.
 	res, err := tx.ExecContext(ctx, `
 		UPDATE incident_triage
-		SET phase = 'skipped', next_at = NULL, last_error_code = NULL, last_error_detail = NULL,
+		SET phase = 'skipped', decision = 'skip', decision_reason = ?,
+		    next_at = NULL, last_error_code = NULL, last_error_detail = NULL,
 		    lease_owner = NULL, lease_expires_at = NULL, current_attempt_id = NULL, updated_at = ?
 		WHERE incident_id = ? AND phase = 'in_flight' AND current_attempt_id = ?`,
-		canonicalTime(now), incidentID, attemptID)
+		situation.DecisionReasonEligibilityPolicyMinimumMembers, canonicalTime(now), incidentID, attemptID)
 	if err != nil {
 		return fmt.Errorf("store: skip incident triage schedule: %w", err)
 	}

@@ -152,12 +152,14 @@ type WorkProjection struct {
 	// attempt).
 	ExecutionStarted bool `json:"execution_started"`
 	// InvestigatedAlertIDs/InvestigatedNames are the recorded investigation
-	// input this Situation's actual execution(s) used — bounded, and
-	// distinct from Situation.Total. Left empty until a future chunk wires
-	// TriageState.ActiveAttempt/LastExecution's member-delivery provenance
-	// (internal/store/situation_controller.go's loadSituationIncidentStatesTx,
-	// outside this chunk's file allowlist — see TriageExecution's doc
-	// comment).
+	// input this Situation's actual execution(s) used — the union of each
+	// member Incident's current execution's frozen claim-time member
+	// deliveries, resolved to Alert identity/name (never Situation.Total;
+	// never current membership, which may have changed since the claim).
+	// Bounded, deterministically ordered by Alert ID. Populated by
+	// committedOperatorBriefing's investigatedAlertIdentities from
+	// TriageState.ActiveAttempt/LastExecution (R1 repair, lead review
+	// 2026-09-09).
 	InvestigatedAlertIDs []string `json:"investigated_alert_ids,omitempty"`
 	InvestigatedNames    []string `json:"investigated_names,omitempty"`
 	// RemainingIncidents counts member Incidents whose Triage schedule
@@ -170,9 +172,11 @@ type WorkProjection struct {
 	// excluded the work) — mapped from the durable decision_reason /
 	// clean-skip code, never guessed from display text.
 	SkipReason string `json:"skip_reason,omitempty"`
-	// RetryEligibleAt is the earliest persisted retry_wait next_at across
-	// member Incidents, or nil when no retry exists (including every
-	// exhausted schedule, which never has one).
+	// RetryEligibleAt is the earliest of the persisted retry_wait next_at
+	// across member Incidents' Triage schedules and the committed
+	// Assessment-level retry (situations.retry_at, ControllerCommit.RetryAt
+	// — R3 repair, lead review 2026-09-09), or nil when neither exists
+	// (including every exhausted schedule, which never has one).
 	RetryEligibleAt *time.Time `json:"retry_eligible_at,omitempty"`
 	// SourceGraceUntil is the committed recovery-grace deadline, carried
 	// here so a renderer never needs a second read to tell a retry-due time

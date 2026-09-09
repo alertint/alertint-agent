@@ -207,6 +207,21 @@ func committedOperatorBriefing(in SnapshotInput, commit ControllerCommit) *model
 	in = committedBriefingInput(in, commit.TriageDecisions)
 	b := BuildOperatorBriefing(in, commit.Lifecycle)
 	b.Work = BuildWorkProjection(in.Incidents, commit.GraceUntil, commit.Assessment.ActionContract.NextUpdateAt)
+	// R3 repair (lead review 2026-09-09): BuildWorkProjection's own
+	// 3-parameter shape is a pinned external test boundary (see its doc
+	// comment) and only ever sees per-incident Triage backoff. The committed
+	// Assessment-level retry (situations.retry_at, ControllerCommit.RetryAt
+	// — contract §3's "next_at / retry_at") is carried here instead,
+	// truthfully distinct from a status checkpoint. Earliest of the two
+	// wins: a Triage backoff and an Assessment retry are independently
+	// scheduled and either can be outstanding at once; RetryEligibleAt
+	// promises the actual next one, not only the triage-schedule one.
+	b.Work.RetryEligibleAt = earliestNonNil(b.Work.RetryEligibleAt, commit.RetryAt)
+	// R1 repair (lead review 2026-09-09): the actual investigation input —
+	// the frozen claim-time member deliveries each Incident's current
+	// execution ran against, resolved to Alert identity/name — never
+	// Situation.Total (plan.md item 3).
+	b.Work.InvestigatedAlertIDs, b.Work.InvestigatedNames = investigatedAlertIdentities(in.Incidents, in.Deliveries)
 	c := commit.Assessment.ActionContract
 	if commit.Lifecycle.Terminal() || c.AlertINTAction == nil || c.AlertINTStatus == nil || *c.AlertINTStatus != model.AlertINTStatusWaiting || c.WaitReason == nil {
 		return b
@@ -226,6 +241,86 @@ func committedOperatorBriefing(in SnapshotInput, commit ControllerCommit) *model
 		b.RetryAt = timePtr(due.UTC())
 	}
 	return b
+}
+
+// earliestNonNil returns whichever of a, b is earlier, either one when the
+// other is nil, or nil when both are — the shared "truthful distinct
+// timing" rule WorkProjection's independent instants use (R3).
+func earliestNonNil(a, b *time.Time) *time.Time {
+	switch {
+	case a == nil:
+		return b
+	case b == nil:
+		return a
+	case b.Before(*a):
+		return b
+	default:
+		return a
+	}
+}
+
+// investigatedAlertIdentities unions each Incident's CURRENT execution's
+// frozen claim-time member delivery IDs (ActiveAttempt when one is running,
+// else the most recent LastExecution) into the actual Alert identities/
+// names that execution analyzed — resolved through in's own Deliveries,
+// never the Situation's current membership, which may have grown or changed
+// since that attempt was claimed (B0 integration contract §3;
+// plan.md item 3: "Situation.Total is not investigation input count"). A
+// member delivery id this Situation no longer carries (a legacy/reassigned
+// row) is silently skipped rather than fabricated. Bounded and
+// deterministically ordered by Alert ID, same naming as BriefingAlert.Name
+// (newBriefingAlert) — an unrecognized name still reports "Unnamed alert"
+// rather than an empty string.
+func investigatedAlertIdentities(incidents []IncidentState, deliveries []Delivery) (ids, names []string) {
+	byDeliveryID := make(map[string]Delivery, len(deliveries))
+	for _, d := range deliveries {
+		byDeliveryID[d.ID] = d
+	}
+
+	order := make([]string, 0, len(incidents))
+	nameByID := make(map[string]string, len(incidents))
+	for _, inc := range incidents {
+		exec := inc.Triage.ActiveAttempt
+		if exec == nil {
+			exec = inc.Triage.LastExecution
+		}
+		if exec == nil {
+			continue
+		}
+		for _, deliveryID := range exec.MemberDeliveryIDs {
+			d, ok := byDeliveryID[deliveryID]
+			if !ok {
+				continue
+			}
+			id := d.AlertID
+			if id == "" {
+				id = "delivery:" + d.ID
+			}
+			if len(id) > 200 { // never truncate identity into a collision — same bound newBriefingAlert uses
+				id = canonicalDigest(id)
+			}
+			if _, dup := nameByID[id]; dup {
+				continue
+			}
+			name := briefingLabel(d.Labels["alertname"], 160)
+			if name == "" {
+				name = "Unnamed alert"
+			}
+			nameByID[id] = name
+			order = append(order, id)
+		}
+	}
+	sort.Strings(order)
+	if len(order) > 8 {
+		order = order[:8]
+	}
+	ids = make([]string, 0, len(order))
+	names = make([]string, 0, len(order))
+	for _, id := range order {
+		ids = append(ids, id)
+		names = append(names, nameByID[id])
+	}
+	return ids, names
 }
 
 func briefingWorkCounts(incidents []IncidentState) (failed, pending, unavailable int) {
