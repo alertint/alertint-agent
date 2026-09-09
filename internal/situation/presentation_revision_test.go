@@ -249,6 +249,38 @@ func TestPresentationRevisionStableIdentityAcrossDeliveriesAndBounds(t *testing.
 	}
 }
 
+// S3-04 (B0 integration contract §4): a changed Verification enum ALONE —
+// with Observations/Unknowns unchanged — is a text-comparison outcome, not
+// a material Slack update. Only a changed Findings/Observations set, or a
+// changed VerificationLimit/VerificationGaps (an actual new decision-
+// relevant limitation), earns a reply.
+func TestBriefingVerificationEnumAloneIsNotMaterial(t *testing.T) {
+	prior := &model.OperatorBriefing{Analyses: []model.IncidentAnalysis{{IncidentID: "i", Summary: "A deployment may explain errors", Findings: []string{"Restarts and errors began together"}, Verification: "supported"}}}
+	current := &model.OperatorBriefing{Analyses: []model.IncidentAnalysis{{IncidentID: "i", Summary: "A deployment may explain errors", Findings: []string{"Restarts and errors began together"}, Verification: "revised"}}}
+	if usefulAnalysisChanged(prior, current) {
+		t.Fatal("a changed Verification enum alone, with identical Observations, must not be material")
+	}
+	changedFindings := &model.OperatorBriefing{Analyses: []model.IncidentAnalysis{{IncidentID: "i", Summary: "A deployment may explain errors", Findings: []string{"All failing pods run the new image"}, Verification: "supported"}}}
+	if !usefulAnalysisChanged(prior, changedFindings) {
+		t.Fatal("a changed Observations set must remain material")
+	}
+	changedLimit := &model.OperatorBriefing{Analyses: []model.IncidentAnalysis{{IncidentID: "i", Summary: "A deployment may explain errors", Findings: []string{"Restarts and errors began together"}, Verification: "supported", VerificationLimit: "verification_source_unavailable"}}}
+	if !usefulAnalysisChanged(prior, changedLimit) {
+		t.Fatal("a new decision-relevant verification limitation must remain material")
+	}
+}
+
+// S3-03 (B0 integration contract §4): "Stale flips are not evidence." A
+// previously-stale analysis becoming fresh again, with no other structural
+// change, must not by itself earn a reply.
+func TestBriefingStaleFlipAloneIsNotMaterial(t *testing.T) {
+	prior := &model.OperatorBriefing{Analyses: []model.IncidentAnalysis{{IncidentID: "i", Summary: "A deployment may explain errors", Findings: []string{"Restarts and errors began together"}, Verification: "supported", Stale: true}}}
+	current := &model.OperatorBriefing{Analyses: []model.IncidentAnalysis{{IncidentID: "i", Summary: "A deployment may explain errors", Findings: []string{"Restarts and errors began together"}, Verification: "supported", Stale: false}}}
+	if usefulAnalysisChanged(prior, current) {
+		t.Fatal("a Stale flip alone must not be material")
+	}
+}
+
 func TestPresentationRevisionUnknownAndOmittedAlertsDoNotInventDeltas(t *testing.T) {
 	prior := &model.OperatorBriefing{Alerts: []model.BriefingAlert{{ID: "a", Name: "Alert A", State: "firing"}}, AlertsOmitted: 2}
 	current := &model.OperatorBriefing{Alerts: []model.BriefingAlert{{ID: "a", Name: "Alert A", State: "unknown"}, {ID: "b", Name: "Alert B", State: "firing"}}}

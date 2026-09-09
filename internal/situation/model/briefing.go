@@ -210,4 +210,133 @@ type OperatorDelta struct {
 	AttentionIncreased  bool               `json:"attention_increased,omitempty"`
 	HumanRequestChanged bool               `json:"human_request_changed,omitempty"`
 	AbilityLost         bool               `json:"ability_lost,omitempty"`
+
+	// Candidates are the structured material-evidence facts B3 derives from
+	// (prior, current) (B0 integration contract §4), immutable and legacy-
+	// compatible: every field above stays populated exactly as before for
+	// old readers/replay. B5 filters Candidates against DeliveredHistory
+	// (ReplyEligible) to decide what actually posts; B4 renders only
+	// Summary.Briefing(+Work) and this slice, never re-deriving materiality.
+	Candidates []MaterialCandidate `json:"candidates,omitempty"`
+}
+
+// CandidateKind is the closed set of structured material-evidence facts a
+// committed Transition can carry (B0 integration contract §4). A candidate
+// existing here is a materiality FACT, never a delivery decision — B5's
+// ReplyEligible (DeliveredHistory-aware) and B4's renderer are the only
+// consumers that decide whether/how it reaches Slack.
+type CandidateKind string
+
+const (
+	// CandidateFirstExecutionAssurance marks Work.ExecutionStarted's false
+	// -> true edge for this Situation — never a request/decision alone, and
+	// never re-emitted on a later commit once execution has started.
+	CandidateFirstExecutionAssurance CandidateKind = "first_execution_assurance"
+	// CandidateUsefulFinding marks a structured-fact change in a member
+	// Incident's analysis: Observations, Unknowns or Hypothesis differ from
+	// the prior committed analysis for that Incident — never a Verification
+	// enum flip or a paraphrase alone.
+	CandidateUsefulFinding CandidateKind = "useful_finding"
+	// CandidateInconclusiveCompletion marks a member Incident's Triage
+	// schedule newly settling (exhausted or a clean skip) with no useful
+	// finding to report — the investigation's own honest end.
+	CandidateInconclusiveCompletion CandidateKind = "inconclusive_completion"
+	// CandidateMembersChanged marks a source scope/urgency/membership
+	// change while the Situation stays Active — distinct from AllClear/
+	// Refire, which already carry their own lifecycle-edge member facts.
+	CandidateMembersChanged CandidateKind = "members_changed"
+	// CandidateAbilityChanged marks a new or newly-cleared investigation
+	// limitation (e.g. an evidence source becoming unavailable or recovering)
+	// — never a repeated, already-communicated limitation.
+	CandidateAbilityChanged CandidateKind = "ability_changed"
+	// CandidateActionChanged marks ActionContract.OperatorActionRequired
+	// newly appearing, changing or clearing.
+	CandidateActionChanged CandidateKind = "action_changed"
+	// CandidateAllClear marks every member alert reaching authoritative
+	// clearance (Lifecycle -> RecoveryPending).
+	CandidateAllClear CandidateKind = "all_clear"
+	// CandidateRefire marks a source refire interrupting recovery
+	// confirmation (Lifecycle RecoveryPending -> Active) — distinct from a
+	// recurrence-count milestone rung, which is not a candidate (E2).
+	CandidateRefire CandidateKind = "refire"
+	// CandidateTerminalEnd marks the Situation's lifecycle newly reaching a
+	// terminal outcome (Recovered or ClosedUnknown).
+	CandidateTerminalEnd CandidateKind = "terminal_end"
+)
+
+// NextStepKind names what a candidate's actual next step actually is —
+// never a fabricated retry or execution ETA.
+type NextStepKind string
+
+const (
+	NextStepStatusCheck   NextStepKind = "status_check"
+	NextStepRetryEligible NextStepKind = "retry_eligible"
+	NextStepGraceDeadline NextStepKind = "grace_deadline"
+	NextStepWorkEnded     NextStepKind = "work_ended"
+	NextStepTrackingEnded NextStepKind = "tracking_ended"
+)
+
+// FindingFacts are the structured pieces of one member Incident's analysis
+// that materiality compares by structural inequality, never prose equality
+// (B0 integration contract §4): a changed Verification enum or wording-only
+// Hypothesis rewrite alone is NOT a candidate; a changed Observations or
+// Unknowns set IS.
+type FindingFacts struct {
+	IncidentID   string     `json:"incident_id,omitempty"`
+	Hypothesis   string     `json:"hypothesis,omitempty"`
+	Observations []string   `json:"observations,omitempty"`
+	Unknowns     []string   `json:"unknowns,omitempty"`
+	AnalyzedAt   *time.Time `json:"analyzed_at,omitempty"`
+}
+
+// MemberFacts are actual recorded member-alert names and counts — never a
+// common-cause inference from grouping, and never Situation.Total standing
+// in for the investigation's own recorded input count.
+type MemberFacts struct {
+	Cleared     []string `json:"cleared,omitempty"`
+	NowFiring   []string `json:"now_firing,omitempty"`
+	StillFiring []string `json:"still_firing,omitempty"`
+	FiringCount int      `json:"firing_count"`
+	Total       int      `json:"total"`
+}
+
+// LimitationFacts names one recorded investigation-ability limitation code
+// (never free prose) and whether this candidate reports it appearing or
+// clearing.
+type LimitationFacts struct {
+	Code    string `json:"code,omitempty"`
+	Cleared bool   `json:"cleared,omitempty"`
+}
+
+// ActionFacts distinguishes a recorded operator Action newly introduced,
+// revised, or withdrawn. A withdrawal only corrects an earlier DELIVERED
+// request (B5's DeliveredHistory.CommunicatedAction, §5) — B3 emits the raw
+// structural fact; B5 decides delivery-aware eligibility.
+type ActionFacts struct {
+	Introduced bool           `json:"introduced,omitempty"`
+	Revised    bool           `json:"revised,omitempty"`
+	Withdrawn  bool           `json:"withdrawn,omitempty"`
+	Action     OperatorAction `json:"action,omitempty"`
+}
+
+// NextStepFacts is the actual recorded next step a candidate's reply may
+// state — a status checkpoint, a real retry/grace time, or an explicit end.
+// Never an invented retry or execution ETA.
+type NextStepFacts struct {
+	Kind NextStepKind `json:"kind,omitempty"`
+	At   *time.Time   `json:"at,omitempty"`
+}
+
+// MaterialCandidate is one structured material-evidence fact B3's
+// MaterialCandidates derives from (prior, current) committed Transitions
+// (B0 integration contract §4). Exactly one of Finding/Members/Limitation/
+// Action is populated, matching Kind; Next is always the actual recorded
+// next step, never fabricated.
+type MaterialCandidate struct {
+	Kind       CandidateKind    `json:"kind"`
+	Finding    *FindingFacts    `json:"finding,omitempty"`
+	Members    *MemberFacts     `json:"members,omitempty"`
+	Limitation *LimitationFacts `json:"limitation,omitempty"`
+	Action     *ActionFacts     `json:"action,omitempty"`
+	Next       NextStepFacts    `json:"next,omitempty"`
 }

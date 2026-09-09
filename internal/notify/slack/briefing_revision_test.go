@@ -200,6 +200,107 @@ func TestBriefingRevisionInconclusiveEvidenceAndLongReplyKeepNextStep(t *testing
 	}
 }
 
+// S3-03 (B0 integration contract §4): a newer alert delivery arriving after
+// analysis (Stale) alone does not invalidate the hypothesis. Keep the
+// AnalyzedAt date and the honest "Earlier hypothesis" label; never claim
+// reduced relevance from the timestamp comparison alone.
+func TestBriefingRevisionStaleAloneDoesNotInvalidateHypothesis(t *testing.T) {
+	in := briefingRootFixture(t, `{"briefing":{"scope":"checkout","firing":1,"total":1,"analyses":[{"summary":"Deployment may explain errors","findings":["Restarts and errors began together"],"verification":"supported","stale":true,"analyzed_at":"2026-09-07T09:00:00Z"}]}}`)
+	root, err := RenderSituationRoot(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, txt := range []string{root.Text, rsFallbackBlocksText(root)} {
+		if !strings.Contains(txt, "Earlier hypothesis") || !strings.Contains(txt, "Finding at") {
+			t.Errorf("stale finding lost its honest label or date: %s", txt)
+		}
+		if strings.Contains(txt, "limit relevance") {
+			t.Errorf("newer alert timestamp alone must not claim invalidated relevance: %s", txt)
+		}
+	}
+	tr := in.SourceTransition
+	tr.Projection.Briefing = in.Summary.Briefing
+	tr.Projection.OperatorDelta = &model.OperatorDelta{Analyses: in.Summary.Briefing.Analyses}
+	reply, err := RenderSituationJournal(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(reply.Text, "limit relevance") {
+		t.Errorf("detailed evidence reply must not claim a stale-alone relevance loss: %s", reply.Text)
+	}
+}
+
+// S4-09 (B0 integration contract §4): introduce/revise/withdraw are
+// distinguished in the reply text — a withdrawal explicitly says the
+// earlier request is no longer needed, never the same generic "changed"
+// wording for both directions.
+func TestBriefingRevisionActionChangeDistinguishesIntroducedAndWithdrawn(t *testing.T) {
+	action := model.OperatorActionInvestigateSituation
+	in := briefingRootFixture(t, `{"briefing":{"scope":"checkout","firing":1,"total":1}}`)
+	tr := in.SourceTransition
+	tr.Projection.Briefing = in.Summary.Briefing
+	tr.Projection.OperatorDelta = &model.OperatorDelta{
+		HumanRequestChanged: true,
+		Candidates:          []model.MaterialCandidate{{Kind: model.CandidateActionChanged, Action: &model.ActionFacts{Introduced: true, Action: action}}},
+	}
+	introduced, err := RenderSituationJournal(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(introduced.Text, "Operator action newly required") {
+		t.Errorf("introduced action must say a new request now applies: %s", introduced.Text)
+	}
+	if strings.Contains(introduced.Text, "no longer needed") {
+		t.Errorf("introduced action must not claim a withdrawal: %s", introduced.Text)
+	}
+
+	tr.Projection.OperatorDelta = &model.OperatorDelta{
+		HumanRequestChanged: true,
+		Candidates:          []model.MaterialCandidate{{Kind: model.CandidateActionChanged, Action: &model.ActionFacts{Withdrawn: true, Action: action}}},
+	}
+	withdrawn, err := RenderSituationJournal(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(withdrawn.Text, "earlier operator action request is no longer needed") {
+		t.Errorf("withdrawn action must correct the earlier request: %s", withdrawn.Text)
+	}
+	if strings.Contains(withdrawn.Text, "newly required") {
+		t.Errorf("withdrawn action must not claim a new introduction: %s", withdrawn.Text)
+	}
+}
+
+// S4-05 (B0 integration contract §4): an investigation newly reaching
+// Exhausted with no useful finding earns one structured inconclusive-
+// completion reply — actual checks, decision-relevant unknowns and an
+// explicit no-retry next step, never a silent or generic "coverage
+// incomplete" line alone.
+func TestBriefingRevisionInconclusiveCompletionIsStructured(t *testing.T) {
+	in := briefingRootFixture(t, `{"briefing":{"scope":"checkout","firing":1,"total":1}}`)
+	tr := in.SourceTransition
+	tr.Projection.Briefing = in.Summary.Briefing
+	tr.Projection.OperatorDelta = &model.OperatorDelta{
+		AnalysisFailed: true,
+		Candidates: []model.MaterialCandidate{{
+			Kind:    model.CandidateInconclusiveCompletion,
+			Finding: &model.FindingFacts{Observations: []string{"Checked pod events and application errors"}},
+			Next:    model.NextStepFacts{Kind: model.NextStepWorkEnded},
+		}},
+	}
+	msg, err := RenderSituationJournal(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Investigation inconclusive", "Checked pod events and application errors", "No further analysis retry is scheduled"} {
+		if !strings.Contains(msg.Text, want) {
+			t.Errorf("inconclusive completion lost %q: %s", want, msg.Text)
+		}
+	}
+	if strings.Contains(msg.Text, "coverage is incomplete") {
+		t.Errorf("structured inconclusive reply must not fall back to the generic line: %s", msg.Text)
+	}
+}
+
 func TestBriefingRevisionVerificationChangeAndPartialAvailability(t *testing.T) {
 	in := briefingRootFixture(t, `{"briefing":{"scope":"checkout","firing":2,"total":2,"pending":1,"unavailable":1,"analyses":[{"summary":"Deployment hypothesis","verification":"supported"}]}}`)
 	tr := in.SourceTransition

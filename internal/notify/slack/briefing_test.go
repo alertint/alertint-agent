@@ -271,7 +271,7 @@ func TestBriefingRootHonestAnalysisAndIndependentHumanAction(t *testing.T) {
 						t.Errorf("missing %q: %s", want, txt)
 					}
 				}
-				for _, bad := range []string{"No action currently required", "No impact observed", "has accepted"} {
+				for _, bad := range []string{"No action currently required", "No impact observed", "has accepted", "Newer observations limit relevance", "limit relevance"} {
 					if strings.Contains(txt, bad) {
 						t.Errorf("misleading %q: %s", bad, txt)
 					}

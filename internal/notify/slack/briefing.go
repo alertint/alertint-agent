@@ -197,9 +197,11 @@ func briefingFinding(a model.IncidentAnalysis, historical bool) []string {
 	if a.Verification != "supported" || a.VerificationGaps > 0 || a.VerificationLimit != "" {
 		qualification = "Verification limited; cause unconfirmed."
 	}
-	if a.Stale && !historical {
-		qualification += " Newer observations limit relevance."
-	}
+	// S3-03 (B0 integration contract §4): a newer alert delivery arriving
+	// after analysis (Stale) alone does not invalidate the hypothesis — the
+	// "Earlier hypothesis" label above and the analyzed-at date already say
+	// this finding predates the newest observation, honestly, without
+	// claiming its relevance is reduced.
 	return append(lines, qualification)
 }
 
@@ -223,9 +225,9 @@ func briefingUncertainty(a model.IncidentAnalysis) string {
 	if a.VerificationGaps > 0 {
 		parts = append(parts, fmt.Sprintf("%d verification checks unavailable or invalid.", a.VerificationGaps))
 	}
-	if a.Stale {
-		parts = append(parts, "Later observations or missing analysis time limit relevance.")
-	}
+	// S3-03: a Stale flip (a newer alert delivery, or a missing analysis
+	// time) is not itself evidence against the hypothesis — say nothing
+	// here rather than invent an invalidation claim from the timestamp.
 	return strings.Join(parts, " ")
 }
 
@@ -406,12 +408,56 @@ func briefingDeltaLines(d *model.OperatorDelta, b *model.OperatorBriefing) []str
 		}
 	}
 	if d.HumanRequestChanged {
-		lines = append(lines, "Human action request changed; a recorded next actor does not confirm accepted ownership.")
+		lines = append(lines, briefingActionChangeLine(d))
 	}
 	if d.AnalysisFailed {
-		lines = append(lines, "Analysis failed; coverage is incomplete.")
+		lines = append(lines, briefingInconclusiveLine(d))
 	}
 	return lines
+}
+
+// briefingInconclusiveLine renders the structured inconclusive-completion
+// reply (S4-05: B0 integration contract §4) — actual checks, a
+// decision-relevant unknown when one was recorded, and the honest no-retry
+// next step. Falls back to the legacy-compatible generic wording when no
+// structured Candidate rode this delta (an older persisted transition).
+func briefingInconclusiveLine(d *model.OperatorDelta) string {
+	for _, c := range d.Candidates {
+		if c.Kind != model.CandidateInconclusiveCompletion {
+			continue
+		}
+		line := "Investigation inconclusive."
+		if c.Finding != nil && len(c.Finding.Observations) > 0 {
+			line += " " + briefingText(strings.Join(c.Finding.Observations, "; "), 300) + "; the available evidence did not establish a cause."
+		} else {
+			line += " No supporting observations were recorded; the available evidence did not establish a cause."
+		}
+		return line + " No further analysis retry is scheduled on this schedule."
+	}
+	return "Analysis failed; coverage is incomplete."
+}
+
+// briefingActionChangeLine distinguishes an introduced, revised or
+// withdrawn operator Action (S4-09: B0 integration contract §4) — a
+// withdrawal explicitly corrects the earlier request rather than repeating
+// the same "changed" wording for both directions. Falls back to the
+// legacy-compatible generic wording when no structured Candidate rode this
+// delta (an older persisted transition, before this field existed).
+func briefingActionChangeLine(d *model.OperatorDelta) string {
+	for _, c := range d.Candidates {
+		if c.Kind != model.CandidateActionChanged || c.Action == nil {
+			continue
+		}
+		switch {
+		case c.Action.Withdrawn:
+			return "The earlier operator action request is no longer needed."
+		case c.Action.Introduced:
+			return "Operator action newly required; see Action below."
+		case c.Action.Revised:
+			return "Operator action changed; see Action below."
+		}
+	}
+	return "Human action request changed; a recorded next actor does not confirm accepted ownership."
 }
 
 func briefingSymptoms(symptoms []string) string {

@@ -3,6 +3,7 @@
 package situation
 
 import (
+	"fmt"
 	"reflect"
 	"sort"
 	"strings"
@@ -411,7 +412,17 @@ func briefingMaterialityView(b *model.OperatorBriefing) *model.OperatorBriefing 
 }
 
 // A repeated judgment's clock or paraphrased cause does not establish new
-// evidence. A first analysis, changed findings or verification does.
+// evidence. A first analysis or changed structured facts (Observations,
+// i.e. Findings, or a new decision-relevant verification limitation) does.
+//
+// B0 integration contract §4: materiality is structured-fact inequality,
+// never prose equality — a changed Verification enum ALONE (supported vs
+// revised vs degraded) is a text-comparison outcome internal to one
+// analysis's own draft/final judgment, not proof the operator-visible
+// Observations/Unknowns changed, so it is deliberately excluded here
+// (S3-04). A Stale flip is also excluded (S3-03: "Stale flips are not
+// evidence") — a newer alert delivery arriving alone does not invalidate or
+// re-validate a hypothesis.
 func usefulAnalysisChanged(prior, current *model.OperatorBriefing) bool {
 	if current == nil {
 		return false
@@ -420,20 +431,242 @@ func usefulAnalysisChanged(prior, current *model.OperatorBriefing) bool {
 		if a.Summary == "" && a.Title == "" {
 			continue
 		}
-		var old *model.IncidentAnalysis
-		if prior != nil {
-			for i := range prior.Analyses {
-				if prior.Analyses[i].IncidentID == a.IncidentID {
-					old = &prior.Analyses[i]
-					break
-				}
-			}
-		}
-		if old == nil || !reflect.DeepEqual(old.Findings, a.Findings) || old.Verification != a.Verification || old.VerificationLimit != a.VerificationLimit || old.VerificationGaps != a.VerificationGaps || (old.Stale && !a.Stale) {
+		if analysisStructurallyChanged(findAnalysis(prior, a.IncidentID), a) {
 			return true
 		}
 	}
 	return false
+}
+
+// findAnalysis returns the prior committed analysis for incidentID, or nil
+// when b is nil or carries none — never a name/index match, only identity.
+func findAnalysis(b *model.OperatorBriefing, incidentID string) *model.IncidentAnalysis {
+	if b == nil {
+		return nil
+	}
+	for i := range b.Analyses {
+		if b.Analyses[i].IncidentID == incidentID {
+			return &b.Analyses[i]
+		}
+	}
+	return nil
+}
+
+// analysisStructurallyChanged is the one shared materiality predicate for
+// one Incident's analysis (S3-04, S3-03): structured-fact inequality only.
+func analysisStructurallyChanged(old *model.IncidentAnalysis, a model.IncidentAnalysis) bool {
+	return old == nil || !reflect.DeepEqual(old.Findings, a.Findings) || old.VerificationLimit != a.VerificationLimit || old.VerificationGaps != a.VerificationGaps
+}
+
+// analysisHypothesis is the same "likely cause" text notify/slack's
+// briefingInterpretation selects — Summary when recorded, else Title —
+// duplicated here (not exported from notify/slack, which depends on this
+// package) so FindingFacts.Hypothesis matches what the operator actually
+// sees.
+func analysisHypothesis(a model.IncidentAnalysis) string {
+	if a.Summary != "" {
+		return a.Summary
+	}
+	return a.Title
+}
+
+// findingFactsOf converts one persisted IncidentAnalysis into the
+// structured FindingFacts a MaterialCandidate carries (B0 integration
+// contract §4) — Observations is exactly the recorded Findings; Unknowns is
+// the recorded decision-relevant verification limitation/gap count, never
+// an invented "cause unproven" boilerplate line.
+func findingFactsOf(a model.IncidentAnalysis) *model.FindingFacts {
+	f := &model.FindingFacts{
+		IncidentID:   a.IncidentID,
+		Hypothesis:   analysisHypothesis(a),
+		Observations: append([]string(nil), a.Findings...),
+		AnalyzedAt:   a.AnalyzedAt,
+	}
+	if a.VerificationLimit != "" {
+		f.Unknowns = append(f.Unknowns, a.VerificationLimit)
+	}
+	if a.VerificationGaps > 0 {
+		f.Unknowns = append(f.Unknowns, fmt.Sprintf("%d verification checks unavailable or invalid", a.VerificationGaps))
+	}
+	return f
+}
+
+// workNextStep is the actual recorded next step a candidate's reply may
+// state: a real retry time when one is due, otherwise the status
+// checkpoint, otherwise nothing — never a fabricated retry or ETA.
+func workNextStep(b *model.OperatorBriefing) model.NextStepFacts {
+	if b == nil {
+		return model.NextStepFacts{}
+	}
+	if b.Work.RetryEligibleAt != nil {
+		return model.NextStepFacts{Kind: model.NextStepRetryEligible, At: b.Work.RetryEligibleAt}
+	}
+	if b.Work.StatusCheckpointAt != nil {
+		return model.NextStepFacts{Kind: model.NextStepStatusCheck, At: b.Work.StatusCheckpointAt}
+	}
+	return model.NextStepFacts{}
+}
+
+// stillFiringNames lists the recorded still-firing member names — the same
+// identity/name pairs BriefingAlert.Name carries, never a Situation total.
+func stillFiringNames(b *model.OperatorBriefing) []string {
+	var out []string
+	for _, alert := range b.Alerts {
+		if alert.State == "firing" {
+			out = append(out, alert.Name)
+		}
+	}
+	return out
+}
+
+// findingCandidates emits one useful_finding candidate per member Incident
+// whose analysis structurally changed (S4-04) — the same predicate
+// usefulAnalysisChanged uses for the legacy reply gate, so the two paths
+// can never disagree about what counts as a new finding.
+func findingCandidates(a, b *model.OperatorBriefing) []model.MaterialCandidate {
+	if b == nil {
+		return nil
+	}
+	var out []model.MaterialCandidate
+	for _, an := range b.Analyses {
+		if an.Summary == "" && an.Title == "" {
+			continue
+		}
+		if analysisStructurallyChanged(findAnalysis(a, an.IncidentID), an) {
+			out = append(out, model.MaterialCandidate{Kind: model.CandidateUsefulFinding, Finding: findingFactsOf(an), Next: workNextStep(b)})
+		}
+	}
+	return out
+}
+
+// inconclusiveCompletionCandidate fires once when the aggregate work
+// disposition newly reaches WorkPhaseExhausted (S4-05: "Investigation ends
+// without a useful finding") — never repeated while it stays exhausted, and
+// never confused with a settled clean skip (S2-03's own disposition,
+// outside this candidate).
+func inconclusiveCompletionCandidate(a, b *model.OperatorBriefing) (model.MaterialCandidate, bool) {
+	if b == nil || b.Work.Phase != model.WorkPhaseExhausted {
+		return model.MaterialCandidate{}, false
+	}
+	if a != nil && a.Work.Phase == model.WorkPhaseExhausted {
+		return model.MaterialCandidate{}, false
+	}
+	cand := model.MaterialCandidate{Kind: model.CandidateInconclusiveCompletion, Next: model.NextStepFacts{Kind: model.NextStepWorkEnded}}
+	if len(b.Analyses) > 0 {
+		cand.Finding = findingFactsOf(b.Analyses[0])
+	}
+	return cand, true
+}
+
+// abilityChangedCandidate fires when the recorded investigation ability
+// newly blocks (operatorBlocked, or a fresh not-investigated count) or
+// newly clears — never a repeated, already-blocked cycle.
+func abilityChangedCandidate(a, b *model.OperatorBriefing, priorBlocked, blocked bool, waitReason *model.WaitReason) (model.MaterialCandidate, bool) {
+	unavailableIncreased := a != nil && b != nil && b.Unavailable > a.Unavailable
+	code := ""
+	if waitReason != nil {
+		code = string(*waitReason)
+	}
+	switch {
+	case blocked && !priorBlocked, unavailableIncreased:
+		return model.MaterialCandidate{Kind: model.CandidateAbilityChanged, Limitation: &model.LimitationFacts{Code: code, Cleared: false}}, true
+	case priorBlocked && !blocked:
+		return model.MaterialCandidate{Kind: model.CandidateAbilityChanged, Limitation: &model.LimitationFacts{Code: code, Cleared: true}}, true
+	}
+	return model.MaterialCandidate{}, false
+}
+
+// actionChangedCandidate distinguishes a recorded operator Action newly
+// introduced, revised or withdrawn (S4-09) — never a guessed impact or
+// synthetic ownership; withdrawal correction against delivered history is
+// B5's job (§5), this only reports the structural fact.
+func actionChangedCandidate(prior, current *model.OperatorAction) (model.MaterialCandidate, bool) {
+	switch {
+	case prior == nil && current != nil:
+		return model.MaterialCandidate{Kind: model.CandidateActionChanged, Action: &model.ActionFacts{Introduced: true, Action: *current}}, true
+	case prior != nil && current == nil:
+		return model.MaterialCandidate{Kind: model.CandidateActionChanged, Action: &model.ActionFacts{Withdrawn: true, Action: *prior}}, true
+	case prior != nil && current != nil && *prior != *current:
+		return model.MaterialCandidate{Kind: model.CandidateActionChanged, Action: &model.ActionFacts{Revised: true, Action: *current}}, true
+	default:
+		return model.MaterialCandidate{}, false
+	}
+}
+
+// MaterialCandidates derives the structured material-evidence facts a
+// committed Transition carries (B0 integration contract §4), replacing
+// buildOperatorDelta's own booleans as the eligibility source for B5's
+// ReplyEligible. Pure: never queries delivery history, never schedules
+// work, never calls an LLM. Returns nil for the very first transition
+// (prior == nil) — there is no delta without a baseline, and the first root
+// conveys itself without an echoed reply.
+func MaterialCandidates(prior *model.Transition, tr model.Transition) []model.MaterialCandidate {
+	b := tr.Projection.Briefing
+	if prior == nil || b == nil {
+		return nil
+	}
+	a := prior.Projection.Briefing
+	priorLifecycle := prior.Lifecycle
+	priorExecutionStarted := a != nil && a.Work.ExecutionStarted
+
+	var out []model.MaterialCandidate
+
+	if tr.Lifecycle.Terminal() && priorLifecycle != tr.Lifecycle {
+		next := model.NextStepFacts{Kind: model.NextStepWorkEnded}
+		if tr.Lifecycle == model.LifecycleClosedUnknown {
+			next.Kind = model.NextStepTrackingEnded
+		}
+		out = append(out, model.MaterialCandidate{Kind: model.CandidateTerminalEnd, Next: next})
+	}
+
+	switch {
+	case tr.Lifecycle == model.LifecycleRecoveryPending && priorLifecycle != model.LifecycleRecoveryPending:
+		_, cleared, _ := briefingAlertDelta(a, b)
+		out = append(out, model.MaterialCandidate{
+			Kind:    model.CandidateAllClear,
+			Members: &model.MemberFacts{Cleared: cleared, FiringCount: b.Firing, Total: b.Total},
+			Next:    model.NextStepFacts{Kind: model.NextStepGraceDeadline, At: b.Work.SourceGraceUntil},
+		})
+	case priorLifecycle == model.LifecycleRecoveryPending && tr.Lifecycle == model.LifecycleActive:
+		_, _, firing := briefingAlertDelta(a, b)
+		out = append(out, model.MaterialCandidate{
+			Kind:    model.CandidateRefire,
+			Members: &model.MemberFacts{NowFiring: firing, StillFiring: stillFiringNames(b), FiringCount: b.Firing, Total: b.Total},
+			Next:    workNextStep(b),
+		})
+	case tr.Lifecycle == model.LifecycleActive && priorLifecycle == model.LifecycleActive:
+		if changed, cleared, firing := briefingAlertDelta(a, b); changed {
+			out = append(out, model.MaterialCandidate{
+				Kind:    model.CandidateMembersChanged,
+				Members: &model.MemberFacts{Cleared: cleared, NowFiring: firing, StillFiring: stillFiringNames(b), FiringCount: b.Firing, Total: b.Total},
+				Next:    workNextStep(b),
+			})
+		}
+	}
+
+	out = append(out, findingCandidates(a, b)...)
+
+	if cand, ok := inconclusiveCompletionCandidate(a, b); ok {
+		out = append(out, cand)
+	}
+
+	if cand, ok := abilityChangedCandidate(a, b, operatorBlocked(prior.ActionContract), operatorBlocked(tr.ActionContract), tr.ActionContract.WaitReason); ok {
+		out = append(out, cand)
+	}
+
+	if cand, ok := actionChangedCandidate(prior.ActionContract.OperatorActionRequired, tr.ActionContract.OperatorActionRequired); ok {
+		out = append(out, cand)
+	}
+
+	if b.Work.ExecutionStarted && !priorExecutionStarted {
+		out = append(out, model.MaterialCandidate{
+			Kind:    model.CandidateFirstExecutionAssurance,
+			Members: &model.MemberFacts{NowFiring: b.Work.InvestigatedNames, FiringCount: len(b.Work.InvestigatedNames), Total: b.Total},
+			Next:    workNextStep(b),
+		})
+	}
+
+	return out
 }
 
 func operatorBlocked(c model.ActionContract) bool {
@@ -477,6 +710,7 @@ func buildOperatorDelta(prior *model.Transition, tr model.Transition) *model.Ope
 	if a != nil && b.Unavailable > a.Unavailable {
 		d.AbilityLost = true
 	}
+	d.Candidates = MaterialCandidates(prior, tr)
 	return d
 }
 
