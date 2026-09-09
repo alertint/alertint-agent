@@ -453,25 +453,9 @@ func briefingReplyTitle(headline string, t model.Transition, b *model.OperatorBr
 }
 
 func briefingDeltaLines(d *model.OperatorDelta, b *model.OperatorBriefing) []string {
-	var lines []string
-	if d.StateChanged {
-		lines = append(lines, fmt.Sprintf("%d/%d → %d/%d alerts firing.", d.PreviousFiring, d.PreviousTotal, b.Firing, b.Total))
-		if len(d.ClearedAlerts) > 0 {
-			lines = append(lines, "*Cleared:* "+briefingNames(d.ClearedAlerts))
-		}
-		if len(d.NewFiringAlerts) > 0 {
-			lines = append(lines, "*Now firing:* "+briefingNames(d.NewFiringAlerts))
-		}
-		lines = append(lines, briefingRemainingAlerts(b)...)
-	}
-	if d.ScopeChanged {
-		lines = append(lines, "Affected scope changed from "+briefingText(d.PreviousScope, 140)+" to "+briefingText(b.Scope, 140)+".")
-	}
+	lines := briefingMemberLines(d, b)
 	if d.SymptomsChanged {
 		lines = append(lines, "Observed symptoms: "+briefingSymptoms(d.PreviousSymptoms)+" → "+briefingSymptoms(b.Symptoms)+"; reassess the affected service.")
-	}
-	if d.AttentionIncreased {
-		lines = append(lines, "Urgency increased; review current service impact now.")
 	}
 	// Every line below is driven by the delta's own structured Candidates
 	// first and falls back to the legacy boolean only when no candidate of
@@ -480,9 +464,7 @@ func briefingDeltaLines(d *model.OperatorDelta, b *model.OperatorBriefing) []str
 	// count behind it, a cleared obstacle that has no legacy boolean at
 	// all), so gating them on the old flags dropped the fact entirely
 	// (R1 repair, lead review 2026-09-09).
-	if line := briefingAbilityChangeLine(d, b); line != "" {
-		lines = append(lines, line)
-	}
+	lines = append(lines, briefingAbilityChangeLines(d, b)...)
 	if line := briefingActionChangeLine(d); line != "" {
 		lines = append(lines, line)
 	}
@@ -494,50 +476,198 @@ func briefingDeltaLines(d *model.OperatorDelta, b *model.OperatorBriefing) []str
 	return lines
 }
 
-// briefingAbilityChangeLine states the operational consequence of a
-// recorded investigation-ability change (S4-07, canonical "capability-lost"
-// and "capability-restored": "Explain operational consequences and recorded
-// retry eligibility — not internal error noise"). A CLEARED obstacle has no
-// legacy delta boolean of its own — AbilityLost only ever marks a loss — so
-// before this repair a restored capability rendered nothing at all.
+// briefingMemberLines render the recorded member-alert change: which alerts
+// cleared, which are newly firing, which still are, and the scope or
+// urgency the change moved (S4-06, canonical "scope-expanded" and
+// "recovery-interrupted" replies).
 //
-// The candidate carries a closed limitation CODE, never an evidence-source
-// name, so no source is named here. A cleared obstacle is also not proof
-// that execution resumed: the line reports the obstacle only, and the work
-// facts elsewhere in the reply say what is actually running.
-func briefingAbilityChangeLine(d *model.OperatorDelta, b *model.OperatorBriefing) string {
+// The member-carrying candidates — members_changed, all_clear and refire —
+// are the source when the delta carries one. Gating these lines on the
+// legacy booleans dropped a candidate-only member change whole, and the
+// candidate's own scope/urgency pair is the only place a change that moved
+// no alert at all is recorded (R1 repair, lead review round 2,
+// 2026-09-09). A production delta carries BOTH forms, so nothing here
+// repeats what the candidate already stated; a fact no candidate carries
+// still falls back to its legacy field individually, never all-or-nothing.
+func briefingMemberLines(d *model.OperatorDelta, b *model.OperatorBriefing) []string {
+	var selected []model.MaterialCandidate
+	for _, c := range d.Candidates {
+		switch c.Kind {
+		case model.CandidateMembersChanged, model.CandidateAllClear, model.CandidateRefire:
+			if c.Members != nil {
+				selected = append(selected, c)
+			}
+		case model.CandidateFirstExecutionAssurance, model.CandidateUsefulFinding,
+			model.CandidateInconclusiveCompletion, model.CandidateAbilityChanged,
+			model.CandidateActionChanged, model.CandidateTerminalEnd:
+			// Rendered by their own lines below. terminal_end carries no
+			// member facts at all, and the assurance candidate's member
+			// facts are its recorded investigation input, not a change.
+		}
+	}
+	if len(selected) == 0 {
+		return briefingLegacyMemberLines(d, b)
+	}
+	var lines []string
+	scopeStated, urgencyStated, namesStated := false, false, false
+	for i, c := range selected {
+		m := c.Members
+		if i == 0 {
+			// One recorded state, whichever member candidate carried it:
+			// every member candidate reads the same current Situation
+			// counts, so a second copy would only repeat the first.
+			lines = append(lines, briefingMemberStateLine(d, m))
+		}
+		namesStated = namesStated || len(m.Cleared)+len(m.NowFiring)+len(m.StillFiring) > 0
+		if len(m.Cleared) > 0 {
+			lines = append(lines, "*Cleared:* "+briefingNames(m.Cleared))
+		}
+		if len(m.NowFiring) > 0 {
+			lines = append(lines, "*Now firing:* "+briefingNames(m.NowFiring))
+		}
+		if len(m.StillFiring) > 0 {
+			lines = append(lines, "*Still firing:* "+briefingNames(m.StillFiring))
+		}
+		if m.PreviousScope != "" && m.Scope != "" {
+			lines = append(lines, "Affected scope changed from "+briefingText(m.PreviousScope, 140)+" to "+briefingText(m.Scope, 140)+".")
+			scopeStated = true
+		}
+		if m.PreviousUrgency != "" && m.Urgency != "" {
+			lines = append(lines, "Urgency increased from "+briefingText(m.PreviousUrgency, 60)+" to "+briefingText(m.Urgency, 60)+"; review current service impact now.")
+			urgencyStated = true
+		}
+	}
+	// The alert inventory's remaining honesty lines are the root briefing's
+	// own display bounds, not member facts: an unknown alert state and the
+	// omitted-alert count stay visible whichever form carried the names.
+	lines = append(lines, briefingAlertInventory(b, namesStated)...)
+	if !scopeStated && d.ScopeChanged {
+		lines = append(lines, "Affected scope changed from "+briefingText(d.PreviousScope, 140)+" to "+briefingText(b.Scope, 140)+".")
+	}
+	if !urgencyStated && d.AttentionIncreased {
+		lines = append(lines, "Urgency increased; review current service impact now.")
+	}
+	return lines
+}
+
+// briefingMemberStateLine states the recorded alert counts, using the
+// delta's own prior counts only when it actually recorded them: a
+// candidate-only delta has none, and rendering its zero-valued fields as a
+// prior state would invent a Situation that never existed.
+func briefingMemberStateLine(d *model.OperatorDelta, m *model.MemberFacts) string {
+	if d.StateChanged && d.PreviousTotal > 0 {
+		return fmt.Sprintf("%d/%d → %d/%d alerts firing.", d.PreviousFiring, d.PreviousTotal, m.FiringCount, m.Total)
+	}
+	return fmt.Sprintf("%d/%d alerts firing.", m.FiringCount, m.Total)
+}
+
+// briefingLegacyMemberLines are the pre-candidate rendering, kept for a
+// delta that carries no member candidate at all — an older persisted
+// transition being replayed, or a change B3 records only as a boolean.
+func briefingLegacyMemberLines(d *model.OperatorDelta, b *model.OperatorBriefing) []string {
+	var lines []string
+	if d.StateChanged {
+		lines = append(lines, fmt.Sprintf("%d/%d → %d/%d alerts firing.", d.PreviousFiring, d.PreviousTotal, b.Firing, b.Total))
+		if len(d.ClearedAlerts) > 0 {
+			lines = append(lines, "*Cleared:* "+briefingNames(d.ClearedAlerts))
+		}
+		if len(d.NewFiringAlerts) > 0 {
+			lines = append(lines, "*Now firing:* "+briefingNames(d.NewFiringAlerts))
+		}
+		lines = append(lines, briefingAlertInventory(b, false)...)
+	}
+	if d.ScopeChanged {
+		lines = append(lines, "Affected scope changed from "+briefingText(d.PreviousScope, 140)+" to "+briefingText(b.Scope, 140)+".")
+	}
+	if d.AttentionIncreased {
+		lines = append(lines, "Urgency increased; review current service impact now.")
+	}
+	return lines
+}
+
+// briefingAbilityChangeLines state the operational consequence of EVERY
+// recorded investigation-ability change this delta carries (S4-07,
+// canonical "capability-lost" and "capability-restored": "Explain
+// operational consequences and recorded retry eligibility — not internal
+// error noise"). A CLEARED obstacle has no legacy delta boolean of its own
+// — AbilityLost only ever marks a loss — so before the first repair a
+// restored capability rendered nothing at all.
+//
+// B3's abilityChangedCandidates emits the contract obstacle and the
+// coverage aggregate as two INDEPENDENT facts that can occur in the same
+// cycle and in opposite directions. Returning after the first candidate
+// dropped the second one whole, so a parked assessment clearing beside a
+// newly unavailable analysis reported only the good news (R2 repair, lead
+// review round 2, 2026-09-09). Identical repeats of one fact still render
+// once.
+func briefingAbilityChangeLines(d *model.OperatorDelta, b *model.OperatorBriefing) []string {
+	var lines []string
+	seen := map[model.LimitationFacts]bool{}
+	candidate := false
 	for _, c := range d.Candidates {
 		if c.Kind != model.CandidateAbilityChanged || c.Limitation == nil {
 			continue
 		}
-		obstacle := briefingLimitationObstacle(c.Limitation.Code)
-		line := "Investigation limited by " + obstacle + ": that evidence could not be retrieved, so the analysis remains incomplete."
-		if c.Limitation.Cleared {
-			line = "Investigation limitation cleared: " + obstacle + " no longer applies, and that evidence is available again."
+		candidate = true
+		if seen[*c.Limitation] {
+			continue
 		}
+		seen[*c.Limitation] = true
+		line := briefingLimitationLine(*c.Limitation)
 		if next := briefingCandidateNext(c.Next); next != "" {
 			line += " " + next
 		}
-		return line
+		lines = append(lines, line)
 	}
-	if !d.AbilityLost {
-		return ""
+	if candidate || !d.AbilityLost {
+		return lines
 	}
 	if b.Unavailable > 0 {
-		return fmt.Sprintf("Analysis unavailable for %d incident(s); not scheduled for these incidents.", b.Unavailable)
+		return []string{fmt.Sprintf("Analysis unavailable for %d incident(s); not scheduled for these incidents.", b.Unavailable)}
 	}
-	return "Automatic work cannot proceed; next steps below."
+	return []string{"Automatic work cannot proceed; next steps below."}
 }
 
-// briefingLimitationObstacle names one closed limitation code as the
-// obstacle an operator would recognize. These are recorded wait-reason and
-// limitation codes, not free prose: an unrecognized code stays explicit
-// without exposing internal transport detail (canonical "capability-lost":
-// "Explain effect, not low-level transport diagnostics").
+// briefingLimitationLine describes one recorded limitation and NOTHING
+// beyond it. The recorded codes are of two kinds and neither carries an
+// evidence-source identity or an execution fact:
+//
+//   - the coverage aggregate (LimitationInvestigationUnavailable) records
+//     that some member incident's analysis is unavailable, and its
+//     clearance records only that the aggregate reached zero — which the
+//     B3 producer documents can also follow member removal, so it is not
+//     proof that a previously unavailable analysis resumed;
+//   - a contract wait reason records why automatic work cannot proceed;
+//     scheduling says nothing at all about whether evidence was reachable.
+//
+// Canonical "capability-lost"/"capability-restored" assume an actual
+// evidence-access loss and an actual resumption under existing authority.
+// Asserting either from these codes fabricated a fact the model never
+// recorded (R3 repair, lead review round 2, 2026-09-09); a future capability
+// that really does record evidence-source access needs its own supporting
+// fact before the canonical wording can be earned.
+func briefingLimitationLine(l model.LimitationFacts) string {
+	if l.Code == model.LimitationInvestigationUnavailable {
+		if l.Cleared {
+			return "Investigation coverage limitation cleared: unavailable analysis is no longer recorded for any member incident."
+		}
+		return "Investigation coverage limited by unavailable analysis for some member incidents: the recorded analysis for this Situation is incomplete."
+	}
+	obstacle := briefingLimitationObstacle(l.Code)
+	if l.Cleared {
+		return "Investigation limitation cleared: " + obstacle + " no longer applies."
+	}
+	return "Investigation limited by " + obstacle + ": automatic investigation cannot proceed while it applies."
+}
+
+// briefingLimitationObstacle names one closed contract wait reason as the
+// obstacle an operator would recognize. These are recorded codes, not free
+// prose: an unrecognized code stays explicit without exposing internal
+// transport detail (canonical "capability-lost": "Explain effect, not
+// low-level transport diagnostics"). The coverage aggregate has its own
+// sentence pair above and never reaches this mapping.
 func briefingLimitationObstacle(code string) string {
 	switch code {
-	case model.LimitationInvestigationUnavailable:
-		return "unavailable analysis for some member incidents"
 	case string(model.WaitReasonAcuteTriageDecision):
 		return "a pending investigation decision"
 	case string(model.WaitReasonAcuteTriageBackoff):

@@ -113,24 +113,53 @@ func briefingWork(c model.ActionContract, b *model.OperatorBriefing, now time.Ti
 // quieter than the recorded work says (R3 repair, lead review 2026-09-09).
 // Every branch reads one recorded Work fact: nothing here claims work
 // finished, and nothing invents a new work loop.
+//
+// Phase and RemainingIncidents answer two different questions and neither
+// may be read as the other (R4 repair, lead review round 2, 2026-09-09):
+// aggregateWorkPhase reports the highest-priority phase any member schedule
+// is in, while RemainingIncidents counts EVERY schedule with outstanding
+// automatic work — awaiting_decision, queued, executing and retry_wait
+// alike (B0 §3; BuildWorkProjection). One executing schedule beside two
+// waiting ones is phase executing with three outstanding, so the count
+// proves how much work remains, never how much of it is running.
 func briefingOutstandingWork(b *model.OperatorBriefing) string {
-	switch b.Work.Phase {
+	w := b.Work
+	switch w.Phase {
 	case model.WorkPhaseExecuting:
-		if n := b.Work.RemainingIncidents; n > 1 {
-			return fmt.Sprintf("Investigation is still running for %d incidents.", n)
+		if w.RemainingIncidents == 1 {
+			return "One investigation is still running."
 		}
-		return "One investigation is still running."
+		return "An investigation is still running." + briefingOutstandingTotal(w)
 	case model.WorkPhaseRetryWait:
-		if at := b.Work.RetryEligibleAt; at != nil {
-			return "One investigation retry is eligible at " + SlackDateToken(*at, "{time}") + "."
+		if at := w.RetryEligibleAt; at != nil {
+			// RetryEligibleAt is the EARLIEST recorded retry across the
+			// member schedules, so it dates one retry, not all of them.
+			if w.RemainingIncidents == 1 {
+				return "One investigation retry is eligible at " + SlackDateToken(*at, "{time}") + "."
+			}
+			return "The earliest investigation retry is eligible at " + SlackDateToken(*at, "{time}") + "." + briefingOutstandingTotal(w)
 		}
-		return "One investigation is waiting in back-off; no retry time is recorded."
+		if w.RemainingIncidents == 1 {
+			return "One investigation is waiting in back-off; no retry time is recorded."
+		}
+		return "An investigation is waiting in back-off; no retry time is recorded." + briefingOutstandingTotal(w)
 	case model.WorkPhaseQueued, model.WorkPhaseAwaitingDecision:
-		return "Investigation work is still outstanding; it has not started yet."
+		return "Investigation work is still outstanding; it has not started yet." + briefingOutstandingTotal(w)
 	case model.WorkPhaseCollecting, model.WorkPhaseSettled, model.WorkPhaseExhausted, model.WorkPhaseNone:
 		// No outstanding automatic work to disclose. A legacy projection
 		// (Phase "") falls through to the same silence: unknown work is not
 		// a claim that work is running.
+	}
+	return ""
+}
+
+// briefingOutstandingTotal states the recorded outstanding-work aggregate
+// when it proves more work than the phase sentence already did. A count of
+// one is already carried by that sentence, and a zero count is an
+// unpopulated legacy projection rather than a recorded absence.
+func briefingOutstandingTotal(w model.WorkProjection) string {
+	if w.RemainingIncidents > 1 {
+		return fmt.Sprintf(" In total, %d member investigations have outstanding work.", w.RemainingIncidents)
 	}
 	return ""
 }
@@ -246,7 +275,13 @@ func briefingNames(names []string) string {
 	return strings.Join(clean, ", ")
 }
 
-func briefingRemainingAlerts(b *model.OperatorBriefing) []string {
+// briefingAlertInventory renders the current alert inventory.
+// memberNamesStated is true when a member candidate already listed the
+// recorded names from its own facts: the firing list must not be printed
+// twice, and "names were not captured" would contradict names the reply
+// just gave. The unknown-state and omitted-alert lines are the briefing's
+// own display bounds and stay visible either way.
+func briefingAlertInventory(b *model.OperatorBriefing, memberNamesStated bool) []string {
 	var firing, unknown []string
 	for _, a := range b.Alerts {
 		switch a.State {
@@ -257,13 +292,13 @@ func briefingRemainingAlerts(b *model.OperatorBriefing) []string {
 		}
 	}
 	var lines []string
-	if len(firing) > 0 {
+	if !memberNamesStated && len(firing) > 0 {
 		lines = append(lines, "*Still firing:* "+briefingNames(firing))
 	}
 	if len(unknown) > 0 {
 		lines = append(lines, "*State unknown:* "+briefingNames(unknown))
 	}
-	if len(b.Alerts) == 0 && (b.Firing > 0 || b.Unknown > 0) {
+	if !memberNamesStated && len(b.Alerts) == 0 && (b.Firing > 0 || b.Unknown > 0) {
 		lines = append(lines, "Alert names were not captured in this update; details via MCP.")
 	}
 	if b.AlertsOmitted > 0 {

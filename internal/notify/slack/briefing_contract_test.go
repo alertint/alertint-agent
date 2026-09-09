@@ -205,8 +205,11 @@ func TestJournalRendersAbilityChangeWithoutLegacyFlag(t *testing.T) {
 		cleared bool
 		want    string
 	}{
-		{"lost", false, "could not be retrieved"},
-		{"restored", true, "available again"},
+		// Expectation corrected in the round-2 repair (R3): the recorded
+		// coverage code proves an unavailable analysis, never that an
+		// evidence source failed or became reachable again.
+		{"lost", false, "unavailable analysis"},
+		{"restored", true, "no longer recorded"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d := &model.OperatorDelta{Candidates: []model.MaterialCandidate{{
@@ -676,6 +679,81 @@ func TestB4ReadableSamples(t *testing.T) {
 				}}},
 		},
 		{
+			name: "scope-expanded", lifecycle: model.LifecycleActive, attention: model.AttentionInvestigate,
+			contract: rsRunningTriageContract(checkpoint),
+			briefing: func(b *model.OperatorBriefing) {
+				b.Scope, b.Firing, b.Total = "checkout and payments", 3, 5
+				b.Work = executing
+			},
+			delta: &model.OperatorDelta{
+				StateChanged: true, PreviousFiring: 1, PreviousTotal: 3,
+				ScopeChanged: true, PreviousScope: "checkout", AttentionIncreased: true,
+				NewFiringAlerts: []string{"PaymentGatewayErrors", "PaymentLatency"},
+				Candidates: []model.MaterialCandidate{{
+					Kind: model.CandidateMembersChanged,
+					Members: &model.MemberFacts{
+						PreviousScope: "checkout", Scope: "checkout and payments",
+						PreviousUrgency: string(model.AttentionObserve), Urgency: string(model.AttentionInvestigate),
+						NowFiring:   []string{"PaymentGatewayErrors", "PaymentLatency"},
+						StillFiring: []string{"CheckoutErrorRate"},
+						FiringCount: 3, Total: 5,
+					},
+					Next: model.NextStepFacts{Kind: model.NextStepStatusCheck, At: rsTimePtr(checkpoint)},
+				}},
+			},
+		},
+		{
+			name: "recovery-interrupted", lifecycle: model.LifecycleActive, attention: model.AttentionObserve,
+			contract: bcObserveMonitorContract(checkpoint),
+			briefing: func(b *model.OperatorBriefing) {
+				b.Firing, b.Resolved, b.Total = 1, 3, 4
+				b.Work = model.WorkProjection{Phase: model.WorkPhaseSettled}
+			},
+			delta: &model.OperatorDelta{Candidates: []model.MaterialCandidate{{
+				Kind: model.CandidateRefire,
+				Members: &model.MemberFacts{
+					NowFiring: []string{"CheckoutErrorRate"}, FiringCount: 1, Total: 4,
+				},
+				Next: model.NextStepFacts{Kind: model.NextStepStatusCheck, At: rsTimePtr(checkpoint)},
+			}}},
+		},
+		{
+			name: "two-independent-limitations", lifecycle: model.LifecycleActive, attention: model.AttentionObserve,
+			contract: bcObserveMonitorContract(checkpoint),
+			briefing: func(b *model.OperatorBriefing) {
+				b.Unavailable = 1
+				b.Work = model.WorkProjection{Phase: model.WorkPhaseExecuting, ExecutionStarted: true, RemainingIncidents: 2}
+			},
+			delta: &model.OperatorDelta{Candidates: []model.MaterialCandidate{
+				{
+					Kind:       model.CandidateAbilityChanged,
+					Limitation: &model.LimitationFacts{Code: string(model.WaitReasonAssessmentParked), Cleared: true},
+					Next:       model.NextStepFacts{Kind: model.NextStepStatusCheck, At: rsTimePtr(checkpoint)},
+				},
+				{
+					Kind:       model.CandidateAbilityChanged,
+					Limitation: &model.LimitationFacts{Code: model.LimitationInvestigationUnavailable},
+					Next:       model.NextStepFacts{Kind: model.NextStepRetryEligible, At: rsTimePtr(retry)},
+				},
+			}},
+		},
+		{
+			name: "recovery-with-mixed-outstanding-work", lifecycle: model.LifecycleRecoveryPending, attention: model.AttentionObserve,
+			contract: rsMonitoringContract(checkpoint),
+			briefing: func(b *model.OperatorBriefing) {
+				b.Firing, b.Resolved = 0, 4
+				w := executing
+				// One executing schedule beside two waiting ones.
+				w.RemainingIncidents, w.SourceGraceUntil = 3, rsTimePtr(grace)
+				b.Work = w
+			},
+			delta: &model.OperatorDelta{Candidates: []model.MaterialCandidate{{
+				Kind:    model.CandidateAllClear,
+				Members: &model.MemberFacts{Cleared: []string{"PodCrashLooping", "LatencyP99"}, FiringCount: 0, Total: 4},
+				Next:    model.NextStepFacts{Kind: model.NextStepGraceDeadline, At: rsTimePtr(grace)},
+			}}},
+		},
+		{
 			name: "action-required", lifecycle: model.LifecycleActive, attention: model.AttentionInvestigate,
 			contract: requested,
 			briefing: func(b *model.OperatorBriefing) { b.Work = model.WorkProjection{Phase: model.WorkPhaseSettled} },
@@ -727,4 +805,269 @@ func TestB4ReadableSamples(t *testing.T) {
 				s.name, root.Text, rsFallbackBlocksText(root), journal.Text, rsFallbackBlocksText(journal))
 		})
 	}
+}
+
+// ----------------------------------------------------------------------
+// B4 repair regressions, round 2 — lead review 2026-09-09.
+//
+// R1: a candidate-only member change must render its OWN names, scope and
+// urgency (canonical "scope-expanded" and "recovery-interrupted" replies).
+// R2: B3 emits the contract obstacle and the coverage aggregate as two
+// independent facts; both must survive.
+// R3: a recorded scheduling or coverage obstacle says only what it is —
+// canonical "capability-lost"/"capability-restored" assume an actual
+// evidence-access loss and an actual resumption, which no recorded code
+// here carries.
+// R4: WorkProjection.RemainingIncidents counts awaiting_decision, queued,
+// executing and retry_wait alike, so it is never the number executing.
+// ----------------------------------------------------------------------
+
+func TestJournalRendersCandidateOnlyMemberChange(t *testing.T) {
+	now := bcNow(t)
+	b := bcBriefing()
+	b.Scope, b.Firing, b.Total = "payments", 2, 4
+	d := &model.OperatorDelta{Candidates: []model.MaterialCandidate{{
+		Kind: model.CandidateMembersChanged,
+		Members: &model.MemberFacts{
+			PreviousScope:   "checkout",
+			Scope:           "payments",
+			PreviousUrgency: string(model.AttentionObserve),
+			Urgency:         string(model.AttentionInvestigate),
+			NowFiring:       []string{"PaymentGatewayErrors"},
+			StillFiring:     []string{"CheckoutErrorRate"},
+			FiringCount:     2,
+			Total:           4,
+		},
+		Next: model.NextStepFacts{Kind: model.NextStepStatusCheck, At: rsTimePtr(now.Add(time.Minute))},
+	}}}
+	tr := bcJournal(t, bcObserveMonitorContract(now.Add(time.Minute)), b, d)
+
+	msg, err := RenderSituationJournal(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bcBothSurfaces(t, msg,
+		"PaymentGatewayErrors",
+		"CheckoutErrorRate",
+		"from checkout to payments",
+		"2/4 alerts firing",
+		"Urgency increased",
+	)
+	bcNoInventedPriorState(t, msg)
+}
+
+// bcNoInventedPriorState guards the other half of a candidate-only delta:
+// it recorded no prior counts at all, so a "0/0 → 2/4" transition would
+// describe a Situation that never existed.
+func bcNoInventedPriorState(t *testing.T, msg RenderedMessage) {
+	t.Helper()
+	for _, body := range []string{msg.Text, rsFallbackBlocksText(msg)} {
+		for _, bad := range []string{"→", "0/0"} {
+			if strings.Contains(body, bad) {
+				t.Errorf("candidate-only delta invented a prior state (%q):\n%s", bad, body)
+			}
+		}
+	}
+}
+
+// The lifecycle-edge member candidates carry their own recorded names too.
+func TestJournalRendersAllClearAndRefireCandidateMembers(t *testing.T) {
+	now := bcNow(t)
+	t.Run("all_clear", func(t *testing.T) {
+		b := bcBriefing()
+		b.Firing, b.Resolved = 0, 4
+		in := bcRoot(t, model.LifecycleRecoveryPending, model.AttentionObserve, rsMonitoringContract(now.Add(time.Minute)), b)
+		in.SourceTransition.Projection.OperatorDelta = &model.OperatorDelta{Candidates: []model.MaterialCandidate{{
+			Kind: model.CandidateAllClear,
+			Members: &model.MemberFacts{
+				Cleared: []string{"CheckoutErrorRate", "QueueBacklog"}, FiringCount: 0, Total: 4,
+			},
+			Next: model.NextStepFacts{Kind: model.NextStepGraceDeadline, At: rsTimePtr(now.Add(20 * time.Minute))},
+		}}}
+		msg, err := RenderSituationJournal(in.SourceTransition)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bcBothSurfaces(t, msg, "CheckoutErrorRate", "QueueBacklog", "0/4 alerts firing")
+		bcNoInventedPriorState(t, msg)
+	})
+	t.Run("refire", func(t *testing.T) {
+		b := bcBriefing()
+		b.Firing, b.Total = 2, 4
+		d := &model.OperatorDelta{Candidates: []model.MaterialCandidate{{
+			Kind: model.CandidateRefire,
+			Members: &model.MemberFacts{
+				NowFiring: []string{"CheckoutErrorRate"}, StillFiring: []string{"LatencyP99"},
+				FiringCount: 2, Total: 4,
+			},
+			Next: model.NextStepFacts{Kind: model.NextStepStatusCheck, At: rsTimePtr(now.Add(time.Minute))},
+		}}}
+		msg, err := RenderSituationJournal(t2Journal(t, b, d))
+		if err != nil {
+			t.Fatal(err)
+		}
+		bcBothSurfaces(t, msg, "CheckoutErrorRate", "LatencyP99", "2/4 alerts firing")
+		bcNoInventedPriorState(t, msg)
+	})
+}
+
+// t2Journal is bcJournal with the round-2 default contract.
+func t2Journal(t *testing.T, b *model.OperatorBriefing, d *model.OperatorDelta) model.Transition {
+	t.Helper()
+	return bcJournal(t, bcObserveMonitorContract(bcNow(t).Add(time.Minute)), b, d)
+}
+
+// A production delta carries the legacy booleans AND the candidate. Each
+// member fact must be stated exactly once ("Keep the attention cost
+// bounded").
+func TestJournalDoesNotDuplicateMemberFactsCarriedByBothForms(t *testing.T) {
+	b := bcBriefing()
+	b.Scope, b.Firing, b.Total = "payments", 2, 4
+	d := &model.OperatorDelta{
+		StateChanged: true, PreviousFiring: 1, PreviousTotal: 4,
+		ScopeChanged: true, PreviousScope: "checkout",
+		AttentionIncreased: true,
+		NewFiringAlerts:    []string{"PaymentGatewayErrors"},
+		Candidates: []model.MaterialCandidate{{
+			Kind: model.CandidateMembersChanged,
+			Members: &model.MemberFacts{
+				PreviousScope: "checkout", Scope: "payments",
+				PreviousUrgency: string(model.AttentionObserve), Urgency: string(model.AttentionInvestigate),
+				NowFiring: []string{"PaymentGatewayErrors"}, StillFiring: []string{"CheckoutErrorRate"},
+				FiringCount: 2, Total: 4,
+			},
+		}},
+	}
+	msg, err := RenderSituationJournal(t2Journal(t, b, d))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, once := range []string{"PaymentGatewayErrors", "Affected scope changed", "Urgency increased", "1/4 → 2/4 alerts firing."} {
+		if n := strings.Count(msg.Text, once); n != 1 {
+			t.Errorf("member fact %q rendered %d times, want exactly 1:\n%s", once, n, msg.Text)
+		}
+	}
+}
+
+// A scope or urgency change that no candidate carries still renders from
+// the legacy fields — the fallback is per fact, not all-or-nothing.
+func TestJournalKeepsLegacyScopeChangeBesideALifecycleCandidate(t *testing.T) {
+	b := bcBriefing()
+	b.Scope, b.Firing, b.Total = "payments", 2, 4
+	d := &model.OperatorDelta{
+		ScopeChanged: true, PreviousScope: "checkout", AttentionIncreased: true,
+		Candidates: []model.MaterialCandidate{{
+			Kind:    model.CandidateRefire,
+			Members: &model.MemberFacts{NowFiring: []string{"CheckoutErrorRate"}, FiringCount: 2, Total: 4},
+		}},
+	}
+	msg, err := RenderSituationJournal(t2Journal(t, b, d))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bcBothSurfaces(t, msg, "CheckoutErrorRate", "from checkout to payments", "Urgency increased")
+}
+
+// R2 — two independent limitations, one clearing and one appearing.
+func TestJournalRendersEveryDistinctLimitation(t *testing.T) {
+	now := bcNow(t)
+	b := bcBriefing()
+	b.Unavailable = 1
+	d := &model.OperatorDelta{Candidates: []model.MaterialCandidate{
+		{
+			Kind:       model.CandidateAbilityChanged,
+			Limitation: &model.LimitationFacts{Code: string(model.WaitReasonAssessmentParked), Cleared: true},
+			Next:       model.NextStepFacts{Kind: model.NextStepStatusCheck, At: rsTimePtr(now.Add(time.Minute))},
+		},
+		{
+			Kind:       model.CandidateAbilityChanged,
+			Limitation: &model.LimitationFacts{Code: model.LimitationInvestigationUnavailable},
+			Next:       model.NextStepFacts{Kind: model.NextStepRetryEligible, At: rsTimePtr(now.Add(5 * time.Minute))},
+		},
+	}}
+	msg, err := RenderSituationJournal(t2Journal(t, b, d))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bcBothSurfaces(t, msg, "parked assessment", "unavailable analysis")
+}
+
+// R3 — a recorded obstacle states itself and nothing about evidence access
+// or resumed execution, in either direction.
+func TestJournalLimitationStatesOnlyTheRecordedObstacle(t *testing.T) {
+	now := bcNow(t)
+	for _, code := range []string{
+		string(model.WaitReasonAssessmentParked),
+		string(model.WaitReasonAcuteTriageBackoff),
+		model.LimitationInvestigationUnavailable,
+	} {
+		for _, cleared := range []bool{false, true} {
+			d := &model.OperatorDelta{Candidates: []model.MaterialCandidate{{
+				Kind:       model.CandidateAbilityChanged,
+				Limitation: &model.LimitationFacts{Code: code, Cleared: cleared},
+				Next:       model.NextStepFacts{Kind: model.NextStepStatusCheck, At: rsTimePtr(now.Add(time.Minute))},
+			}}}
+			msg, err := RenderSituationJournal(t2Journal(t, bcBriefing(), d))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, body := range []string{msg.Text, rsFallbackBlocksText(msg)} {
+				for _, bad := range []string{
+					"evidence could not be retrieved",
+					"evidence is available again",
+					"evidence is accessible",
+					"Investigation resumed",
+				} {
+					if strings.Contains(body, bad) {
+						t.Errorf("code %q cleared=%v claimed %q, which no recorded fact supports:\n%s", code, cleared, bad, body)
+					}
+				}
+			}
+		}
+	}
+}
+
+// R4 — the outstanding aggregate is not an execution count.
+func TestRootOutstandingWorkIsNotAnExecutionCount(t *testing.T) {
+	now := bcNow(t)
+	c := rsMonitoringContract(now.Add(time.Minute))
+	b := bcBriefing()
+	b.Firing, b.Resolved = 0, 4
+	// One executing schedule plus two waiting ones: phase executing,
+	// RemainingIncidents 3.
+	b.Work = model.WorkProjection{
+		Phase: model.WorkPhaseExecuting, ExecutionStarted: true, RemainingIncidents: 3,
+		SourceGraceUntil: rsTimePtr(now.Add(20 * time.Minute)), StatusCheckpointAt: c.NextUpdateAt,
+	}
+	msg, err := RenderSituationRoot(bcRoot(t, model.LifecycleRecoveryPending, model.AttentionObserve, c, b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(msg.Text, "running for 3 incidents") {
+		t.Errorf("outstanding work presented as an execution count:\n%s", msg.Text)
+	}
+	bcBothSurfaces(t, msg, "investigation is still running", "3 member investigations have outstanding work")
+}
+
+// The same rule on the retry-wait aggregate: one recorded earliest retry
+// time is not proof that exactly one schedule is waiting.
+func TestRootRetryWaitDoesNotClaimASingleWaitingInvestigation(t *testing.T) {
+	now := bcNow(t)
+	retry := now.Add(5 * time.Minute)
+	c := rsMonitoringContract(now.Add(time.Minute))
+	b := bcBriefing()
+	b.Firing, b.Resolved = 0, 4
+	b.Work = model.WorkProjection{
+		Phase: model.WorkPhaseRetryWait, ExecutionStarted: true, RemainingIncidents: 2,
+		RetryEligibleAt: rsTimePtr(retry), SourceGraceUntil: rsTimePtr(now.Add(20 * time.Minute)),
+		StatusCheckpointAt: c.NextUpdateAt,
+	}
+	msg, err := RenderSituationRoot(bcRoot(t, model.LifecycleRecoveryPending, model.AttentionObserve, c, b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(msg.Text, "One investigation retry") {
+		t.Errorf("two outstanding schedules reported as one waiting retry:\n%s", msg.Text)
+	}
+	bcBothSurfaces(t, msg, "retry is eligible at "+SlackDateToken(retry, "{time}"), "2 member investigations have outstanding work")
 }
