@@ -87,6 +87,13 @@ type SnapshotInput struct {
 	// artifact input for this Situation, ordered by (applied_input_version,
 	// occurred_at, id) exactly as R1 requires. Empty on an ordinary cycle.
 	PendingArtifacts []OperatorArtifactInput
+
+	// DeliveredHistory is B5's durable, delivery-aware context (B0
+	// integration contract §4/§5), read inside this same coherent
+	// transaction so ReplyEligible can never combine it with a stale
+	// Transition/summary snapshot. Forwarded unchanged into
+	// PublicationInput.DeliveredHistory by buildHistory.
+	DeliveredHistory DeliveredHistory
 }
 
 // ControllerParkedState is SnapshotInput's own read of the Situation's

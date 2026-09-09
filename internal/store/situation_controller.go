@@ -137,6 +137,10 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 	if err != nil {
 		return situation.SnapshotInput{}, err
 	}
+	deliveredHistory, err := loadDeliveredHistoryTx(ctx, tx, sit.ID, publication.rootPublished)
+	if err != nil {
+		return situation.SnapshotInput{}, err
+	}
 
 	if err := tx.Commit(); err != nil {
 		return situation.SnapshotInput{}, fmt.Errorf("store: commit load reconciliation input: %w", err)
@@ -160,6 +164,7 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 		LastDeliveredRootDeadlineAt: publication.lastDeliveredRootDeadlineAt,
 		LastMainChannelPokeAt:       publication.lastMainChannelPokeAt,
 		PendingArtifacts:            artifacts,
+		DeliveredHistory:            deliveredHistory,
 	}, nil
 }
 
@@ -2154,6 +2159,13 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 	// with the rest of the commit, so a Situation's history and its
 	// authoritative state can never diverge.
 	if err := applyHistoryCommitTx(ctx, tx, claim.Situation.ID, commit.History, canonicalCommitTime(commit)); err != nil {
+		return err
+	}
+
+	// 8. B5 (§5.3, E1): obsolete-start supersession, in this SAME fenced
+	// transaction and after the step above so the replacement reply row it
+	// may point at already exists.
+	if err := supersedeObsoleteAssuranceTx(ctx, tx, claim.Situation.ID, commit.History); err != nil {
 		return err
 	}
 

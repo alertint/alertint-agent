@@ -1502,6 +1502,7 @@ func (c *Controller) buildHistory(claim Claim, basis historyBasis, commit Contro
 		RecurrenceRepliesOff:        c.cfg.RecurrenceMode == RecurrenceModeOff,
 		Drill:                       change.Drill,
 		Now:                         basis.Now,
+		DeliveredHistory:            basis.In.DeliveredHistory,
 	}
 	// R4: the root renders the committed nonterminal promise, captured here
 	// from the committed Operator contract — never from the Episode summary.

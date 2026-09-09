@@ -714,3 +714,213 @@ func (s *Store) GetSituationRootCoordinates(ctx context.Context, situationID str
 	}
 	return channel.String, ts.String, true, nil
 }
+
+// ----------------------------------------------------------------------
+// B5: DeliveredHistory (B0 integration contract §4/§5)
+// ----------------------------------------------------------------------
+
+// loadDeliveredHistoryTx reads situationID's durable, delivery-aware
+// context inside the caller's coherent transaction: every DELIVERED reply's
+// own persisted candidates, folded in Transition-sequence order, plus the
+// one still-undelivered assurance intent if one exists. rootPublished is
+// SnapshotInput.RootPublished, already known to the caller — passed in
+// rather than re-derived so this function's own AssuranceConveyed check can
+// short-circuit without a second root-coordinates query when a delivered
+// reply already proves it.
+func loadDeliveredHistoryTx(ctx context.Context, tx *sql.Tx, situationID string, rootPublished bool) (situation.DeliveredHistory, error) {
+	var out situation.DeliveredHistory
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT `+transitionColumns+`
+		FROM situation_transitions
+		WHERE situation_id = ? AND id IN (
+			SELECT transition_id FROM notification_intents
+			WHERE situation_id = ? AND effect_class IN ('thread_append','broadcast_handoff') AND status = 'delivered'
+		)
+		ORDER BY sequence ASC`, situationID, situationID)
+	if err != nil {
+		return out, fmt.Errorf("store: query delivered reply transitions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var limitations []string // the NET set of currently-communicated codes, in first-appearance order
+	var action *situationmodel.OperatorAction
+	for rows.Next() {
+		tr, err := scanTransition(rows)
+		if err != nil {
+			return out, fmt.Errorf("store: scan delivered reply transition: %w", err)
+		}
+		if tr.Sequence > out.LastDeliveredSequence {
+			out.LastDeliveredSequence = tr.Sequence
+		}
+		if tr.JournalKind == situationmodel.JournalInvestigationStarted {
+			out.AssuranceConveyed = true
+		}
+		if tr.Projection.OperatorDelta == nil {
+			continue
+		}
+		for _, c := range tr.Projection.OperatorDelta.Candidates {
+			switch c.Kind { //nolint:exhaustive // only these two kinds carry delivered-history state to fold; every other kind needs no running total here.
+			case situationmodel.CandidateAbilityChanged:
+				if c.Limitation == nil {
+					continue
+				}
+				if c.Limitation.Cleared {
+					limitations = removeString(limitations, c.Limitation.Code)
+				} else {
+					limitations = appendMissingString(limitations, c.Limitation.Code)
+				}
+			case situationmodel.CandidateActionChanged:
+				if c.Action == nil {
+					continue
+				}
+				if c.Action.Withdrawn {
+					action = nil
+				} else {
+					a := c.Action.Action
+					action = &a
+				}
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return out, fmt.Errorf("store: iterate delivered reply transitions: %w", err)
+	}
+	out.CommunicatedLimitationCodes = limitations
+	out.CommunicatedAction = action
+
+	var liveID sql.NullString
+	err = tx.QueryRowContext(ctx, `
+		SELECT i.id FROM notification_intents i
+		JOIN situation_transitions t ON t.id = i.transition_id
+		WHERE i.situation_id = ? AND i.effect_class = 'thread_append'
+		  AND i.status IN ('pending', 'blocked_configuration', 'failed')
+		  AND t.journal_kind = 'investigation_started'
+		ORDER BY t.sequence ASC LIMIT 1`, situationID).Scan(&liveID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return out, fmt.Errorf("store: query live assurance intent: %w", err)
+	}
+	if liveID.Valid {
+		id := liveID.String
+		out.LiveAssuranceIntentID = &id
+	}
+
+	// Root-conveyed case (§5.2, "no new column"): the root is always edited
+	// in place to the CURRENT Episode summary, so a delivered root that
+	// currently shows InvestigationStarted conveys the assurance right now,
+	// regardless of when it started showing that.
+	if rootPublished && !out.AssuranceConveyed {
+		summary, err := loadEpisodeSummaryTx(ctx, tx, situationID)
+		if err != nil {
+			return out, err
+		}
+		if summary != nil && summary.InvestigationStarted {
+			out.AssuranceConveyed = true
+		}
+	}
+
+	return out, nil
+}
+
+// appendMissingString appends s to list if not already present.
+func appendMissingString(list []string, s string) []string {
+	for _, v := range list {
+		if v == s {
+			return list
+		}
+	}
+	return append(list, s)
+}
+
+// removeString returns list with every occurrence of s removed, preserving
+// order.
+func removeString(list []string, s string) []string {
+	out := make([]string, 0, len(list))
+	for _, v := range list {
+		if v != s {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// ----------------------------------------------------------------------
+// B5: obsolete-start supersession (B0 integration contract §5.3, E1)
+// ----------------------------------------------------------------------
+
+// Supersession reasons this store writes for a superseded thread_append —
+// the store's own closed vocabulary, the same way
+// SupersessionReasonNewerRootProjection is for a superseded root_sync.
+const (
+	SupersessionReasonFinding     = "superseded_by_finding"
+	SupersessionReasonTerminalEnd = "superseded_by_terminal_end"
+)
+
+// supersedeObsoleteAssuranceTx marks any still-live (pending,
+// blocked_configuration, or failed) first-execution-assurance thread_append
+// for situationID superseded when history's own just-committed Transitions
+// carry a useful_finding, inconclusive_completion or terminal_end
+// candidate — in the SAME fenced CommitController transaction this call
+// runs inside (B0 integration contract §5.3). Call it AFTER the commit's
+// own new reply intents are inserted (applyHistoryCommitTx), so the
+// replacement row this UPDATE points at already exists — no self-reference
+// FK deferral needed, unlike supersedeLiveRootSyncTx's same-statement case.
+//
+// A delivered assurance is material history (ADR 0042/0052) and untouched:
+// the live-status filter here is the same one 0020/0022 encode as a CHECK.
+// A no-op when history carries no overtaking candidate, when no live
+// assurance exists, or when the overtaking Transition itself earned no
+// reply (nothing has actually taken the assurance's place on screen yet).
+func supersedeObsoleteAssuranceTx(ctx context.Context, tx *sql.Tx, situationID string, history *situation.HistoryCommit) error {
+	if history == nil {
+		return nil
+	}
+	var overtakingTransitionID, reason string
+outer:
+	for _, tr := range history.Transitions {
+		if tr.Projection.OperatorDelta == nil {
+			continue
+		}
+		for _, c := range tr.Projection.OperatorDelta.Candidates {
+			switch c.Kind { //nolint:exhaustive // only these three candidate kinds ever overtake a stale assurance (§5.3); every other kind is irrelevant to this decision.
+			case situationmodel.CandidateTerminalEnd:
+				overtakingTransitionID, reason = tr.ID, SupersessionReasonTerminalEnd
+				break outer
+			case situationmodel.CandidateUsefulFinding, situationmodel.CandidateInconclusiveCompletion:
+				if overtakingTransitionID == "" {
+					overtakingTransitionID, reason = tr.ID, SupersessionReasonFinding
+				}
+			}
+		}
+	}
+	if overtakingTransitionID == "" {
+		return nil
+	}
+
+	var replacementID string
+	for _, in := range history.Intents {
+		if in.TransitionID != nil && *in.TransitionID == overtakingTransitionID &&
+			(in.EffectClass == situationmodel.EffectThreadAppend || in.EffectClass == situationmodel.EffectBroadcastHandoff) {
+			replacementID = in.ID
+			break
+		}
+	}
+	if replacementID == "" {
+		return nil
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE notification_intents
+		SET status = 'superseded', supersession_reason = ?, replacement_intent_id = ?,
+		    claim_owner = NULL, lease_expires_at = NULL, retry_at = NULL
+		WHERE situation_id = ? AND effect_class = 'thread_append'
+		  AND status IN ('pending', 'blocked_configuration', 'failed')
+		  AND id != ?
+		  AND transition_id IN (
+		      SELECT id FROM situation_transitions WHERE situation_id = ? AND journal_kind = 'investigation_started'
+		  )`,
+		reason, replacementID, situationID, replacementID, situationID); err != nil {
+		return fmt.Errorf("store: supersede obsolete assurance: %w", err)
+	}
+	return nil
+}

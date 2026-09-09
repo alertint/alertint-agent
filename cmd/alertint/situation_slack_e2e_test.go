@@ -1593,3 +1593,30 @@ func TestSituationSlackE2ERecurrenceModeOffEditsTheRootOnly(t *testing.T) {
 			rootEdits, posts, f.intentSummary())
 	}
 }
+
+// TestSituationSlackE2ENeverRendersAnUnsupportedUpdatePromise is B5's own
+// silence test for §7 (B0 integration contract): this minimal release
+// chose the status-check fallback, so no rendered root or reply may ever
+// contain "update by"/"Update by" wording through the REAL delivery path —
+// real store, real controller, real notification worker, real renderer,
+// only the Slack Web API faked. B4 already pins this at the renderer-unit
+// level (TestBriefingNextStepStatusCheckIsNeverAPromise); this is the
+// end-to-end proof over actual delivered payloads.
+func TestSituationSlackE2ENeverRendersAnUnsupportedUpdatePromise(t *testing.T) {
+	f := newE2EFixture(t)
+	f.slack.setScript(alwaysOK)
+	f.seed("group=e2e-no-update-promise")
+	f.deliverUntilQuiet(12)
+
+	calls := f.slack.accepted()
+	if len(calls) == 0 {
+		t.Fatal("seed produced no delivered Slack calls to check")
+	}
+	for _, c := range calls {
+		for _, bad := range []string{"update by", "Update by"} {
+			if strings.Contains(c.Text, bad) {
+				t.Fatalf("delivered %s payload contains unsupported promise wording %q: %s", c.Method, bad, c.Text)
+			}
+		}
+	}
+}
