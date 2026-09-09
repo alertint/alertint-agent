@@ -145,11 +145,17 @@ type WorkProjection struct {
 	// (before any execution) > exhausted > settled > collecting > none.
 	Phase WorkPhase `json:"phase"`
 	// ExecutionStarted is true only when some member Incident's Triage
-	// schedule has actually claimed an attempt (TriageState.Attempts > 0,
-	// equivalently ActiveAttempt/LastExecution once a future chunk wires
-	// their durable read) — NEVER inferred from a request or decision
-	// alone, and NEVER from a clean skip (a skip is a decision, not an
-	// attempt).
+	// schedule has actually claimed an attempt: TriageState.Attempts > 0,
+	// or equivalently ActiveAttempt/LastExecution, both sourced from the
+	// immutable incident_triage_attempts ledger (BuildWorkProjection) —
+	// NEVER inferred from a request or decision alone, and NEVER from a
+	// PRE-claim clean skip (CleanSkipIncidentTriageBelowMinimumMembers
+	// consumes no attempt, so a skip decision alone is not execution). A
+	// POST-claim clean skip (CompleteIncidentTriageAttemptAsCleanSkip) DOES
+	// still read as execution having started: an attempt was claimed and
+	// consumed before the coverage-reuse decision closed it (repair, lead
+	// review round 3, 2026-09-09 — this field was already wired, not
+	// pending a future chunk).
 	ExecutionStarted bool `json:"execution_started"`
 	// InvestigatedAlertIDs/InvestigatedNames are the recorded investigation
 	// input this Situation's actual execution(s) used — the union of each

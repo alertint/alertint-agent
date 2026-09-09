@@ -1128,12 +1128,61 @@ func assertInvestigationOutcome(t *testing.T, st *store.Store, sid string, trs [
 	if err != nil || view.Summary.Briefing == nil {
 		t.Fatalf("read investigation summary: %v", err)
 	}
+	// R5 repair (lead review round 3, 2026-09-09): canonicalTransitions and
+	// canonicalEpisode drop EVERY field of S6#2/#3 and the S6 episode line
+	// from cross-run comparison, not just the branch-dependent
+	// reason/journal-kind/headline/detail already pinned above — including
+	// final_outcome, which a negative-control mutant proved could silently
+	// render "Recovered" on this still-active, non-terminal episode. Every
+	// other field of these three records is IDENTICAL between the real-
+	// investigation and crash-split skip outcomes (captured from real
+	// store output for both branches), so they are asserted here explicitly
+	// instead of restoring them to the excluded string comparison.
+	wantAlertIntAction2 := situationmodel.AlertINTActionRunAcuteTriage
+	if skipped {
+		wantAlertIntAction2 = situationmodel.AlertINTActionMonitorSituation
+	}
+	assertInvestigationTransitionShape(t, trs[1], skipped, wantAlertIntAction2)
+	assertInvestigationTransitionShape(t, trs[2], skipped, situationmodel.AlertINTActionMonitorSituation)
+	if view.Summary.Version != 3 || view.Summary.SourceTransitionSequence != 3 ||
+		view.Summary.CurrentAttention != situationmodel.AttentionObserve || view.Summary.PeakAttention != situationmodel.AttentionObserve ||
+		view.Summary.RecurrenceCount != 5 || view.Summary.InitialPublicationReason != string(situationmodel.ReasonFirstAuthoritativeState) ||
+		view.Summary.FinalOutcome != "" || view.Summary.RemainingUncertainty != "" ||
+		len(view.Summary.InvestigationWork) != 2 || len(view.Summary.RecordedOperatorContext) != 0 {
+		t.Fatalf("episode summary (skipped=%v): unexpected shape version=%d source_seq=%d current_attn=%s peak_attn=%s recurrence=%d initial=%q final_outcome=%q remaining_uncertainty=%q work_entries=%d operator_entries=%d",
+			skipped, view.Summary.Version, view.Summary.SourceTransitionSequence, view.Summary.CurrentAttention, view.Summary.PeakAttention,
+			view.Summary.RecurrenceCount, view.Summary.InitialPublicationReason, view.Summary.FinalOutcome, view.Summary.RemainingUncertainty,
+			len(view.Summary.InvestigationWork), len(view.Summary.RecordedOperatorContext))
+	}
 	if b := view.Summary.Briefing; b.Pending != 0 || b.Unavailable != wantUnavailable[2] || b.AnalysisCount != wantAnalysis[2] {
 		t.Fatalf("summary must retain the final persisted outcome: %+v", b)
 	}
 	if view.Summary.InvestigationStarted != wantInvestigationStarted || view.Summary.LatestMaterialReason != wantLatestReason {
 		t.Fatalf("episode summary investigation_started=%v latest=%q, want %v/%q",
 			view.Summary.InvestigationStarted, view.Summary.LatestMaterialReason, wantInvestigationStarted, wantLatestReason)
+	}
+}
+
+// assertInvestigationTransitionShape asserts every field canonicalTransitions
+// dumps for one S6#2/#3 transition (R5 repair, lead review round 3,
+// 2026-09-09), other than the reason/journal-kind/headline/detail already
+// pinned by assertInvestigationOutcome's own branch-specific "want" values.
+// These remaining fields are identical between the real-investigation and
+// crash-split coverage-reuse-skip outcomes, except each transition's own
+// alertint_action, which the caller supplies.
+func assertInvestigationTransitionShape(t *testing.T, tr situationmodel.Transition, skipped bool, wantAlertIntAction situationmodel.AlertINTAction) {
+	t.Helper()
+	var alertintAction situationmodel.AlertINTAction
+	if tr.ActionContract.AlertINTAction != nil {
+		alertintAction = *tr.ActionContract.AlertINTAction
+	}
+	if tr.Lifecycle != situationmodel.LifecycleActive || tr.Attention != situationmodel.AttentionObserve ||
+		tr.Actor != situationmodel.ActorDeterministicController || tr.InterruptionPriority != nil || tr.Drill ||
+		tr.OperatorArtifactInputID != nil || tr.ActionContract.NextActor != situationmodel.NextActorAlertINT ||
+		alertintAction != wantAlertIntAction || tr.ActionContract.OperatorActionRequired != nil {
+		t.Fatalf("sequence %d (skipped=%v): unexpected transition shape lifecycle=%s attention=%s actor=%s priority=%v drill=%v artifact=%v next_actor=%s alertint_action=%s operator_action=%v, want alertint_action=%s",
+			tr.Sequence, skipped, tr.Lifecycle, tr.Attention, tr.Actor, tr.InterruptionPriority, tr.Drill, tr.OperatorArtifactInputID != nil,
+			tr.ActionContract.NextActor, alertintAction, tr.ActionContract.OperatorActionRequired, wantAlertIntAction)
 	}
 }
 
