@@ -249,11 +249,11 @@ func (d *SituationDeliverer) deliverThreadAppend(ctx context.Context, intent mod
 		return situation.NotificationDelivery{}, localDelivery("root_not_published",
 			fmt.Errorf("cmd/alertint: situation deliverer: situation %s has no delivered root to reply under", *intent.SituationID))
 	}
-	renderTr, err := d.selectedTransition(ctx, intent, tr)
+	reply, err := d.selectedReply(ctx, intent, tr)
 	if err != nil {
 		return situation.NotificationDelivery{}, err
 	}
-	rendered, err := slack.RenderSituationJournal(renderTr)
+	rendered, err := slack.RenderSituationReply(reply)
 	if err != nil {
 		return situation.NotificationDelivery{}, invalidDelivery("render_failed",
 			fmt.Errorf("cmd/alertint: situation deliverer: render journal: %w", err))
@@ -271,7 +271,7 @@ func (d *SituationDeliverer) deliverThreadAppend(ctx context.Context, intent mod
 	return situation.NotificationDelivery{Channel: res.Channel, MessageTS: res.TS, DeliveredAs: "thread"}, nil
 }
 
-// selectedTransition returns tr narrowed to the candidates the operator is
+// selectedReply returns tr narrowed to the candidates the operator is
 // actually owed by THIS reply. ReplyEligible already made that decision at
 // plan time against the same durable history; re-reading it here, bounded
 // to replies below this Transition's own sequence, is what carries the
@@ -301,22 +301,31 @@ func (d *SituationDeliverer) deliverThreadAppend(ctx context.Context, intent mod
 // selection does not govern — a changed symptom above all — so it is never
 // an empty Slack message; what it never carries is a rejected fact.
 //
+// The same read answers a second, separate question the reply cannot ask
+// about itself: whether the automatic execution its own contract describes
+// has since been overtaken. That answer governs one rendered sentence, not
+// the selection — a reply that carries no candidate of its own can still
+// restate a superseded investigation as current, and the renderer decides
+// from this Transition's own contract whether it does (lead review round 4,
+// 2026-09-10, R1; slack.SituationReplyInput).
+//
 // The durable Transition is never mutated: the delta is copied first.
-func (d *SituationDeliverer) selectedTransition(ctx context.Context, intent model.NotificationIntent, tr model.Transition) (model.Transition, error) {
+func (d *SituationDeliverer) selectedReply(ctx context.Context, intent model.NotificationIntent, tr model.Transition) (slack.SituationReplyInput, error) {
 	delta := tr.Projection.OperatorDelta
 	if delta == nil || len(delta.Candidates) == 0 || intent.SituationID == nil {
-		return tr, nil
+		return slack.SituationReplyInput{Transition: tr}, nil
 	}
 	history, err := d.store.GetCommunicatedHistory(ctx, *intent.SituationID, tr.Sequence)
 	if err != nil {
-		return tr, localDelivery("communicated_history_unavailable",
+		return slack.SituationReplyInput{Transition: tr}, localDelivery("communicated_history_unavailable",
 			fmt.Errorf("cmd/alertint: situation deliverer: load communicated history: %w", err))
 	}
+	reply := slack.SituationReplyInput{Transition: tr, ExecutionSuperseded: history.AssuranceSuperseded}
 	// A reply is only ever delivered under an existing root, so the
 	// initial-publication rule cannot apply here.
 	eligible := situation.ReplyEligible(delta.Candidates, history, true)
 	if len(eligible) == len(delta.Candidates) {
-		return tr, nil
+		return reply, nil
 	}
 
 	selected := *delta
@@ -327,8 +336,8 @@ func (d *SituationDeliverer) selectedTransition(ctx context.Context, intent mode
 	if kindRejectedInFull(delta.Candidates, eligible, model.CandidateActionChanged) {
 		selected.HumanRequestChanged = false
 	}
-	tr.Projection.OperatorDelta = &selected
-	return tr, nil
+	reply.Transition.Projection.OperatorDelta = &selected
+	return reply, nil
 }
 
 // kindRejectedInFull reports whether every candidate of kind was dropped —
@@ -387,15 +396,15 @@ func (d *SituationDeliverer) deliverBroadcastHandoff(ctx context.Context, intent
 	// is asked to do (situation.HandoffStillCurrent).
 	current := situation.HandoffStillCurrent(tr, view.Summary)
 
-	renderTr, err := d.selectedTransition(ctx, intent, tr) // a local copy: the durable ledger row is never mutated.
+	reply, err := d.selectedReply(ctx, intent, tr) // a local copy: the durable ledger row is never mutated.
 	if err != nil {
 		return situation.NotificationDelivery{}, err
 	}
 	if !current {
-		renderTr.Journal.Delayed = true
-		renderTr.Journal.NoLongerCurrent = true
+		reply.Transition.Journal.Delayed = true
+		reply.Transition.Journal.NoLongerCurrent = true
 	}
-	rendered, err := slack.RenderSituationJournal(renderTr)
+	rendered, err := slack.RenderSituationReply(reply)
 	if err != nil {
 		return situation.NotificationDelivery{}, invalidDelivery("render_failed",
 			fmt.Errorf("cmd/alertint: situation deliverer: render journal: %w", err))

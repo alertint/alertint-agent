@@ -181,22 +181,24 @@ func TestB5TerminalEndOvertakesARetainedAssurance(t *testing.T) {
 	}
 }
 
-// R1/4, restart: the answer is derived from durable rows alone, so a
-// process restart between the finding and the delayed delivery changes
-// nothing.
-func TestB5OvertakenAssuranceSurvivesARestart(t *testing.T) {
+// b5r4RestartSelection commits the retained mixed start, then one later
+// overtaking cycle, closes the file-backed store and reopens it, and
+// returns the delivery-time answer the deliverer would get after the
+// restart. Every input is a durable row: nothing is carried in memory.
+func b5r4RestartSelection(t *testing.T, group string, later *model.OperatorBriefing) (situation.DeliveredHistory, map[model.CandidateKind]bool) {
+	t.Helper()
 	ctx := context.Background()
 	now := time.Date(2026, 9, 9, 10, 0, 0, 0, time.UTC)
-	path := filepath.Join(t.TempDir(), "b5r4-restart.db")
+	path := filepath.Join(t.TempDir(), group+".db")
 
 	st, err := Open(ctx, path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	id := newSituationForGroup(t, st, "b5r4-restart", now)
+	id := newSituationForGroup(t, st, group, now)
 	start := b5r4MixedStart(t, st, id, now)
 	osCycle(t, st, id, now.Add(2*time.Minute), osMonitoringContract(now.Add(3*time.Minute)),
-		model.LifecycleActive, b5r4Settled(), true)
+		model.LifecycleActive, later, true)
 	if err := st.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -206,8 +208,14 @@ func TestB5OvertakenAssuranceSurvivesARestart(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	t.Cleanup(func() { _ = reopened.Close() })
+	return b5r4Selection(t, reopened, id, start)
+}
 
-	h, selected := b5r4Selection(t, reopened, id, start)
+// R1/4, restart: the answer is derived from durable rows alone, so a
+// process restart between the finding and the delayed delivery changes
+// nothing.
+func TestB5OvertakenAssuranceSurvivesARestart(t *testing.T) {
+	h, selected := b5r4RestartSelection(t, "b5r4-restart", b5r4Settled())
 	if !h.AssuranceSuperseded {
 		t.Errorf("the overtaking finding was forgotten across the restart: %+v", h)
 	}
