@@ -1631,6 +1631,45 @@ func TestCleanSkipBelowMinimumMembersClosesDueRowWithoutConsumingAnAttempt(t *te
 	}
 }
 
+// TestLoadedSkipReasonMatchesBothEligibilityPolicyPaths is R6's remaining
+// coverage requirement (lead review round 2, 2026-09-09: "Populate the field
+// consistently from recorded reasons for coverage reuse and both eligibility
+// paths"): CleanSkipIncidentTriageBelowMinimumMembers (the worker's PRE-CLAIM
+// clean skip) and CompleteIncidentTriageAttemptAsCleanSkip (the store's
+// POST-CLAIM defense-in-depth skip, covered directly in
+// TestCompleteIncidentTriageAttemptAsCleanSkipRecordsEligibilityReasonNotStaleRequest)
+// both record situation.DecisionReasonEligibilityPolicyMinimumMembers, and a
+// same-transaction load must map BOTH to the identical "eligibility_policy"
+// TriageState.SkipReason — never a path-specific reading.
+func TestLoadedSkipReasonMatchesBothEligibilityPolicyPaths(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	f := newTriageFixture(t, st, "preclaim-skip-loaded-reason", now)
+	decideAndApplyRequest(t, st, f, now)
+
+	got, err := st.CleanSkipIncidentTriageBelowMinimumMembers(ctx, f.IncidentID, 2, now.Add(time.Minute))
+	if err != nil || !got.Skipped {
+		t.Fatalf("clean skip below minimum: %+v, %v", got, err)
+	}
+
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	inc, err := loadSituationIncidentStatesTx(ctx, tx, f.SituationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inc[0].Triage.SkipReason != "eligibility_policy" {
+		t.Fatalf("loaded Triage.SkipReason = %q, want eligibility_policy (pre-claim path)", inc[0].Triage.SkipReason)
+	}
+	if work := situation.BuildWorkProjection(inc, nil, nil); work.SkipReason != "eligibility_policy" {
+		t.Fatalf("Work.SkipReason = %q, want eligibility_policy", work.SkipReason)
+	}
+}
+
 // TestCleanSkipBelowMinimumMembersRecordsItsOwnReason is S2-03's red test
 // (traceability.json: "minimum-members reason round trip"): a policy-driven
 // clean skip must record ITS OWN decision_reason, not silently keep the
@@ -1922,17 +1961,52 @@ func TestCompleteIncidentTriageAttemptAsCleanSkipRecordsEligibilityReasonNotStal
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = tx.Rollback() }()
 	inc, err := loadSituationIncidentStatesTx(ctx, tx, f.SituationID)
 	if err != nil {
+		_ = tx.Rollback()
 		t.Fatal(err)
 	}
 	work := situation.BuildWorkProjection(inc, nil, nil)
 	if work.SkipReason != "eligibility_policy" {
+		_ = tx.Rollback()
 		t.Fatalf("SkipReason = %q, want eligibility_policy", work.SkipReason)
 	}
 	if work.Phase != situationmodel.WorkPhaseSettled {
+		_ = tx.Rollback()
 		t.Fatalf("Phase = %s, want settled", work.Phase)
+	}
+	// R6 repair (lead review round 2, 2026-09-09): the declared
+	// TriageState.SkipReason field itself — the same-transaction input §3
+	// names, distinct from WorkProjection's own aggregate above — must be
+	// populated too, not just left at its zero value while the aggregate
+	// happens to already read the right thing from DecisionReason directly.
+	if inc[0].Triage.SkipReason != "eligibility_policy" {
+		_ = tx.Rollback()
+		t.Fatalf("loaded Triage.SkipReason = %q, want eligibility_policy", inc[0].Triage.SkipReason)
+	}
+	// Close this read transaction before opening the next one: the store
+	// serializes SQLite connections, so a second BeginTx while this one is
+	// still open deadlocks rather than failing loudly.
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A later cycle's fresh load (a new transaction against the same
+	// already-committed row, never the one that just wrote it) must see the
+	// identical mapped SkipReason — proving this is a durable read of the
+	// committed decision_reason, not an artifact of the write transaction
+	// still being open.
+	tx2, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx2.Rollback() }()
+	incLater, err := loadSituationIncidentStatesTx(ctx, tx2, f.SituationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if incLater[0].Triage.SkipReason != "eligibility_policy" {
+		t.Fatalf("later-cycle loaded Triage.SkipReason = %q, want eligibility_policy", incLater[0].Triage.SkipReason)
 	}
 }
 
@@ -2005,20 +2079,49 @@ func TestRealStoreCommittedSkipClearsOutstandingWorkInReloadedProjection(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = tx.Rollback() }()
 	inc, err := loadSituationIncidentStatesTx(ctx, tx, f.SituationID)
 	if err != nil {
+		_ = tx.Rollback()
 		t.Fatal(err)
 	}
 
 	work := situation.BuildWorkProjection(inc, nil, nil)
 	if work.Phase != situationmodel.WorkPhaseSettled {
+		_ = tx.Rollback()
 		t.Fatalf("Phase = %s, want settled — a committed skip must never still project as outstanding awaiting_decision work (S2-02)", work.Phase)
 	}
 	if work.RemainingIncidents != 0 {
+		_ = tx.Rollback()
 		t.Fatalf("RemainingIncidents = %d, want 0", work.RemainingIncidents)
 	}
 	if work.SkipReason != "prior_coverage" {
+		_ = tx.Rollback()
 		t.Fatalf("SkipReason = %q, want prior_coverage", work.SkipReason)
+	}
+	// R6 repair (lead review round 2, 2026-09-09): the declared
+	// TriageState.SkipReason field itself must carry the coverage-reuse
+	// mapping too, both within this same transaction and from a later
+	// cycle's independent fresh load against the already-committed row.
+	if inc[0].Triage.SkipReason != "prior_coverage" {
+		_ = tx.Rollback()
+		t.Fatalf("loaded Triage.SkipReason = %q, want prior_coverage", inc[0].Triage.SkipReason)
+	}
+	// Close this read transaction before opening the next one: the store
+	// serializes SQLite connections, so a second BeginTx while this one is
+	// still open deadlocks rather than failing loudly.
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	tx2, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx2.Rollback() }()
+	incLater, err := loadSituationIncidentStatesTx(ctx, tx2, f.SituationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if incLater[0].Triage.SkipReason != "prior_coverage" {
+		t.Fatalf("later-cycle loaded Triage.SkipReason = %q, want prior_coverage", incLater[0].Triage.SkipReason)
 	}
 }

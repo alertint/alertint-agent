@@ -369,7 +369,7 @@ func committedBriefingInput(in SnapshotInput, decisions []TriageDecision) Snapsh
 			reason := d.DecisionReason
 			inc.Triage.DecisionReason = &reason
 		}
-		inc.Triage.SkipReason = triageSkipReason(inc.Triage)
+		inc.Triage.SkipReason = TriageSkipReason(inc.Triage)
 	}
 	return in
 }

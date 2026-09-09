@@ -974,13 +974,19 @@ func runHistoryScenario(t *testing.T, sc historyScenario) {
 // sequences (repair, lead review 2026-09-09, finding 3: "B2's corrected
 // aggregate exposes different history beyond the old single-reply-line
 // exception... the existing outcome assertions pass before the equality
-// failure"). assertInvestigationOutcome already proves each sequence's
-// PERSISTED projection/journal content is the actual committed truth for
-// its own run; the free-text headline pair naming HOW that truth was
-// reached (real investigation vs. crash-split coverage-reuse skip) is
-// therefore excluded from the cross-run string comparison here, exactly
-// like the one reply-sequence exception below — every other Situation, and
-// S6's own sequence-1 publication, still compares verbatim.
+// failure"). Those two sequences' free-text headline/detail pair — naming
+// HOW the outcome was reached (real investigation vs. crash-split
+// coverage-reuse skip) — therefore cannot be compared ACROSS the two runs
+// (they legitimately differ), so this exact pair of lines is excluded from
+// the cross-run string comparison below, exactly like the one reply-
+// sequence exception. That exclusion is safe only because
+// assertInvestigationOutcome independently pins each run's own actual
+// Reason/JournalKind/Journal.Headline/Journal.Detail at sequences 2 and 3
+// against the real truthful values for that outcome (R5 repair, lead review
+// round 2, 2026-09-09) — a false "successful analysis"/fabricated-proof
+// mutation now fails there, not merely wherever the raw string happened to
+// still mention it. Every other Situation, and S6's own sequence-1
+// publication, still compares verbatim here too.
 func assertInvestigationReply(t *testing.T, st *store.Store, history string, skipped bool) string {
 	t.Helper()
 	ctx := context.Background()
@@ -1079,6 +1085,37 @@ func assertInvestigationOutcome(t *testing.T, st *store.Store, sid string, trs [
 		if tr.Sequence != i+1 || b == nil || b.Pending != wantPending[i] || b.Unavailable != wantUnavailable[i] || b.AnalysisCount != wantAnalysis[i] || len(b.Analyses) != wantAnalysis[i] {
 			t.Fatalf("sequence %d must freeze its actual authoritative work outcome: %+v", i+1, b)
 		}
+	}
+	// R5 repair (lead review round 2, 2026-09-09): assertInvestigationReply's
+	// cross-run comparison excludes S6's own sequence-2/3 transition lines —
+	// and canonicalTransitions never dumps Journal.Detail in the first
+	// place — so neither run's actual reason/journal-kind/headline/detail
+	// content for those two Transitions was ever checked. A deliberate
+	// mutant proved this: with a skip's real "Closed as a clean skip before
+	// any attempt was claimed" detail replaced by a false "Investigation
+	// completed successfully and proved the cause." sentence, the full
+	// replay suite still passed. These four values, captured from the
+	// actual real-store output of both real outcomes this scenario can
+	// produce, close that gap: a run that fabricates success/proof, drops
+	// the true clean-skip disclosure, or renders the wrong reason/journal
+	// kind for either sequence now fails here.
+	wantReason2, wantKind2 := situationmodel.ReasonInvestigationStarted, situationmodel.JournalInvestigationStarted
+	wantHeadline2, wantDetail2 := "AlertINT investigation started", "AlertINT action: run_acute_triage (planned)"
+	wantReason3, wantKind3 := situationmodel.ReasonInvestigationConcluded, situationmodel.JournalEvidenceConclusion
+	wantHeadline3, wantDetail3 := "AlertINT investigation concluded", "Elapsed duration is a statistical outlier against this group's own history."
+	if skipped {
+		wantReason2, wantKind2 = situationmodel.ReasonTriageStateChanged, situationmodel.JournalInvestigationChanged
+		wantHeadline2, wantDetail2 = "Acute Triage skipped", "Decision: "+situation.DecisionReasonCleanSkip
+		wantReason3, wantKind3 = situationmodel.ReasonTriageStateChanged, situationmodel.JournalInvestigationChanged
+		wantHeadline3, wantDetail3 = "Acute Triage skipped", "Closed as a clean skip before any attempt was claimed; no attempt was consumed."
+	}
+	if tr := trs[1]; tr.Reason != wantReason2 || tr.JournalKind != wantKind2 || tr.Journal.Headline != wantHeadline2 || tr.Journal.Detail != wantDetail2 {
+		t.Fatalf("sequence 2 (skipped=%v): reason=%q journal_kind=%q headline=%q detail=%q, want reason=%q journal_kind=%q headline=%q detail=%q",
+			skipped, tr.Reason, tr.JournalKind, tr.Journal.Headline, tr.Journal.Detail, wantReason2, wantKind2, wantHeadline2, wantDetail2)
+	}
+	if tr := trs[2]; tr.Reason != wantReason3 || tr.JournalKind != wantKind3 || tr.Journal.Headline != wantHeadline3 || tr.Journal.Detail != wantDetail3 {
+		t.Fatalf("sequence 3 (skipped=%v): reason=%q journal_kind=%q headline=%q detail=%q, want reason=%q journal_kind=%q headline=%q detail=%q",
+			skipped, tr.Reason, tr.JournalKind, tr.Journal.Headline, tr.Journal.Detail, wantReason3, wantKind3, wantHeadline3, wantDetail3)
 	}
 	if skipped {
 		if trs[1].Projection.OperatorDelta == nil || !trs[1].Projection.OperatorDelta.AbilityLost {

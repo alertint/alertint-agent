@@ -495,6 +495,16 @@ func loadSituationIncidentStatesTx(ctx context.Context, tx *sql.Tx, situationID 
 		}
 		st.Triage.Decision = stringPtr(decision)
 		st.Triage.DecisionReason = stringPtr(decisionReason)
+		// R6 repair (lead review round 2, 2026-09-09): populate the same
+		// declared TriageState.SkipReason field committedBriefingInput's
+		// current-cycle overlay sets, from this row's own durable
+		// phase/decision_reason — needed here because a schedule already
+		// committed 'skipped' in an EARLIER cycle takes committedBriefingInput's
+		// early continue (its phase never moves this cycle) and would
+		// otherwise leave SkipReason at its zero value forever, even though
+		// BuildWorkProjection's own aggregate reads DecisionReason directly and
+		// so was never wrong.
+		st.Triage.SkipReason = situation.TriageSkipReason(st.Triage)
 		st.Triage.MaterialFactHash = stringPtr(materialHash)
 		st.Triage.MembershipDigest = stringPtr(membershipDigest)
 		st.Triage.IncidentInputDigest = stringPtr(incidentInputDigest)

@@ -797,12 +797,17 @@ func aggregateWorkPhase(phases []model.WorkPhase, executionStarted bool) model.W
 	}
 }
 
-// triageSkipReason maps t's recorded disposition to WorkProjection's closed
+// TriageSkipReason maps t's recorded disposition to WorkProjection's closed
 // SkipReason vocabulary. "" unless t.Phase == "skipped": an unrecognized or
 // absent decision_reason under a skipped schedule reports "" rather than
 // guessing, so a caller can tell "genuinely unknown" apart from a mapped
-// value.
-func triageSkipReason(t TriageState) string {
+// value. Exported so internal/store's loadSituationIncidentStatesTx can
+// populate the same declared TriageState.SkipReason field a same-transaction
+// load reads (R6 repair, lead review round 2, 2026-09-09: §3 declares this
+// field on the same-transaction input, not only on the commit-cycle overlay
+// committedBriefingInput already applied for a phase move happening in the
+// current cycle).
+func TriageSkipReason(t TriageState) string {
 	if t.Phase != "skipped" {
 		return ""
 	}
@@ -872,7 +877,7 @@ func BuildWorkProjection(incidents []IncidentState, graceUntil, statusCheckpoint
 			}
 		}
 		if phase == model.WorkPhaseSettled && skipReason == "" {
-			if reason := triageSkipReason(inc.Triage); reason != "" {
+			if reason := TriageSkipReason(inc.Triage); reason != "" {
 				skipReason = reason
 			}
 		}
