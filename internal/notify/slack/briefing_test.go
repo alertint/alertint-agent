@@ -266,12 +266,19 @@ func TestBriefingRootHonestAnalysisAndIndependentHumanAction(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, txt := range []string{rsFallbackBlocksText(msg), msg.Text} {
-				for _, want := range []string{tc.want, "AlertINT:", "Action:", "On-call: check current service health for checkout", "Impact unknown"} {
+				// The Action line stays independent of analysis state, and
+				// (R4 repair, lead review 2026-09-09) is now equally
+				// independent of source counts and attention: this fixture
+				// records NO operator request, so the canonical slide-4 rule
+				// "Add a concrete Action: only when the operator contract
+				// requires one" forbids the health-check ask this assertion
+				// previously demanded.
+				for _, want := range []string{tc.want, "AlertINT:", "Action:", "None required from on-call", "Impact unknown"} {
 					if !strings.Contains(txt, want) {
 						t.Errorf("missing %q: %s", want, txt)
 					}
 				}
-				for _, bad := range []string{"No action currently required", "No impact observed", "has accepted", "Newer observations limit relevance", "limit relevance"} {
+				for _, bad := range []string{"On-call: ", "No action currently required", "No impact observed", "has accepted", "Newer observations limit relevance", "limit relevance"} {
 					if strings.Contains(txt, bad) {
 						t.Errorf("misleading %q: %s", bad, txt)
 					}

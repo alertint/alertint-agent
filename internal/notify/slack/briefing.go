@@ -246,29 +246,75 @@ func briefingVerificationLimit(reason string) string {
 	}
 }
 
+// briefingAction renders the operator Action line from the RECORDED
+// operator contract alone (canonical slide 4 thread contract: "Add a
+// concrete Action: only when the operator contract requires one"; the
+// "Required operator action changes" row: "Introduce, revise or explicitly
+// withdraw the concrete request... do not leave obsolete instructions
+// uncorrected").
+//
+// Firing counts, raised attention and a blocked or exhausted automatic
+// status are AlertINT's own facts about its OWN work. None of them is a
+// human request, and deriving one from them put an on-call ask nobody
+// recorded in front of an operator — including on the canonical
+// "investigation:exhausted" example, whose assumption is explicitly "no
+// separate human action requested" (R4 repair, lead review 2026-09-09).
+// The line itself stays present in every state; only its content changed,
+// so absence of a request is stated rather than left ambiguous.
+//
+// Interface limit reported with this repair: model.OperatorAction is a
+// closed single-value enum (investigate_situation) carrying no affected
+// source or alert, so the canonical "action-required" example's concrete
+// naming ("check [affected source] for missing lifecycle updates for
+// [affected alert]") cannot be rendered from recorded facts. The recorded
+// request is stated as recorded; nothing is invented to fill that gap.
 func briefingAction(b *model.OperatorBriefing, t model.Transition) string {
 	scope := briefingScope(b)
-	if t.ActionContract.OperatorActionRequired != nil || operatorWorkBlocked(t.ActionContract) {
-		return "On-call: investigate " + scope + " via MCP and check current service health."
+	if a := t.ActionContract.OperatorActionRequired; a != nil {
+		return "On-call: " + briefingRequestSubject(*a, scope) + " via MCP and check current service health."
 	}
-	// S1-04/S4-11: a closed_unknown outcome alone is not a concrete concern —
-	// requesting an MCP health check here regardless of the recorded contract
-	// invents a generic human-health request the canonical slide explicitly
-	// forbids ("no generic MCP/human-health request without concrete
-	// concern"). Only a recorded OperatorActionRequired above earns one.
-	if t.Lifecycle == model.LifecycleClosedUnknown {
+	if withdrawn, action := briefingWithdrawnAction(t); withdrawn {
+		return "None required from on-call; the earlier request to " + briefingRequestSubject(action, scope) + " is no longer needed."
+	}
+	switch {
+	case t.Lifecycle == model.LifecycleClosedUnknown:
 		return "None required from on-call; recovery could not be confirmed."
+	case b.Total == 0:
+		return "None required from on-call; the current alert state is unavailable."
+	case b.Firing == 0 && b.Unknown == 0:
+		return "None required from on-call; alerts resolved."
 	}
-	if t.Attention != model.AttentionObserve || b.Critical > 0 || b.Unknown > 0 {
-		return "On-call: check current service health for " + scope + " now."
+	// The generic close: true in every remaining state, and — unlike a
+	// work-status claim — it cannot contradict an exhausted or blocked
+	// schedule described elsewhere in the same message.
+	return "None required from on-call; no operator action is recorded."
+}
+
+// briefingRequestSubject names one recorded OperatorAction code in operator
+// words. Unrecognized codes stay deliberately unspecific rather than
+// inventing a task the contract never recorded.
+func briefingRequestSubject(a model.OperatorAction, scope string) string {
+	if a == model.OperatorActionInvestigateSituation {
+		return "investigate " + scope
 	}
-	if b.Firing > 0 {
-		return "On-call: assess current impact on " + scope + "."
+	return "act on " + scope
+}
+
+// briefingWithdrawnAction reports the recorded withdrawal of an earlier
+// operator request (B0 §4 ActionFacts.Withdrawn). B3 emits the structural
+// fact; B5 decides whether the withdrawal is actually delivered. Rendering
+// it here is what keeps an obsolete instruction from standing uncorrected.
+func briefingWithdrawnAction(t model.Transition) (bool, model.OperatorAction) {
+	d := t.Projection.OperatorDelta
+	if d == nil {
+		return false, ""
 	}
-	if b.Total == 0 {
-		return "On-call: check current service health for " + scope + "; alert state is unavailable."
+	for _, c := range d.Candidates {
+		if c.Kind == model.CandidateActionChanged && c.Action != nil && c.Action.Withdrawn {
+			return true, c.Action.Action
+		}
 	}
-	return "None required from on-call; alerts resolved."
+	return false, ""
 }
 
 func operatorWorkBlocked(c model.ActionContract) bool {
@@ -337,6 +383,12 @@ func briefingJournal(t model.Transition) (string, string) {
 		// as a copy of the root's current work inventory.
 		selected.Failed, selected.Pending, selected.Unavailable = 0, 0, 0
 		lines = append(lines, briefingDeltaLines(d, b)...)
+		// A useful finding reported as a candidate alone still headlines as
+		// evidence: the overview-driven branch below cannot see it, because
+		// the bounded Analyses list is exactly what it fell outside of.
+		if t.Lifecycle == model.LifecycleActive && briefingHasCandidateFinding(d) {
+			headline = "Evidence update"
+		}
 		if t.Lifecycle == model.LifecycleActive && d.StateChanged && b.Firing < d.PreviousFiring && b.Firing > 0 {
 			headline = "Partial recovery · " + briefingState(b)
 		}
@@ -355,7 +407,20 @@ func briefingJournal(t model.Transition) (string, string) {
 	}
 	marker, _ := briefingStatus(t)
 	headline = marker + " " + headline
-	lines = append(lines, "*AlertINT:* "+briefingNextStep(t, b, t.ActionContract.NextUpdateAt, t.CreatedAt), "*Action:* "+briefingAction(b, t))
+	// A reply that already carries the initial execution assurance has
+	// stated the recorded count and names once; the activity line then says
+	// what happens next without repeating the same scope sentence back
+	// (canonical "Keep the attention cost bounded"). The root is the
+	// opposite case: it carries no assurance line, so its activity line is
+	// where the recorded execution scope belongs.
+	activity := b
+	if t.Projection.OperatorDelta != nil && briefingAssuranceLine(t.Projection.OperatorDelta, b) != "" {
+		trimmed := *b
+		trimmed.Work.InvestigatedNames = nil
+		trimmed.Work.InvestigatedCount, trimmed.Work.InvestigatedCountKnown = 0, false
+		activity = &trimmed
+	}
+	lines = append(lines, "*AlertINT:* "+briefingNextStep(t, activity, t.ActionContract.NextUpdateAt, t.CreatedAt), "*Action:* "+briefingAction(b, t))
 	// Each bounded delta/evidence group gets its own section. Combining long
 	// alert names with evidence must not truncate the hypothesis qualification.
 	detail := strings.Join(lines, "\n\n")
@@ -408,20 +473,182 @@ func briefingDeltaLines(d *model.OperatorDelta, b *model.OperatorBriefing) []str
 	if d.AttentionIncreased {
 		lines = append(lines, "Urgency increased; review current service impact now.")
 	}
-	if d.AbilityLost {
-		if b.Unavailable > 0 {
-			lines = append(lines, fmt.Sprintf("Analysis unavailable for %d incident(s); not scheduled for these incidents.", b.Unavailable))
-		} else {
-			lines = append(lines, "Automatic work cannot proceed; next steps below.")
-		}
+	// Every line below is driven by the delta's own structured Candidates
+	// first and falls back to the legacy boolean only when no candidate of
+	// that kind rode this delta. B3 emits candidate-ONLY events by design
+	// (an out-of-overview finding, a completion with no aggregate failure
+	// count behind it, a cleared obstacle that has no legacy boolean at
+	// all), so gating them on the old flags dropped the fact entirely
+	// (R1 repair, lead review 2026-09-09).
+	if line := briefingAbilityChangeLine(d, b); line != "" {
+		lines = append(lines, line)
 	}
-	if d.HumanRequestChanged {
-		lines = append(lines, briefingActionChangeLine(d))
+	if line := briefingActionChangeLine(d); line != "" {
+		lines = append(lines, line)
 	}
-	if d.AnalysisFailed {
-		lines = append(lines, briefingInconclusiveLine(d))
+	lines = append(lines, briefingInconclusiveLines(d)...)
+	lines = append(lines, briefingCandidateFindingLines(d)...)
+	if line := briefingAssuranceLine(d, b); line != "" {
+		lines = append(lines, line)
 	}
 	return lines
+}
+
+// briefingAbilityChangeLine states the operational consequence of a
+// recorded investigation-ability change (S4-07, canonical "capability-lost"
+// and "capability-restored": "Explain operational consequences and recorded
+// retry eligibility — not internal error noise"). A CLEARED obstacle has no
+// legacy delta boolean of its own — AbilityLost only ever marks a loss — so
+// before this repair a restored capability rendered nothing at all.
+//
+// The candidate carries a closed limitation CODE, never an evidence-source
+// name, so no source is named here. A cleared obstacle is also not proof
+// that execution resumed: the line reports the obstacle only, and the work
+// facts elsewhere in the reply say what is actually running.
+func briefingAbilityChangeLine(d *model.OperatorDelta, b *model.OperatorBriefing) string {
+	for _, c := range d.Candidates {
+		if c.Kind != model.CandidateAbilityChanged || c.Limitation == nil {
+			continue
+		}
+		obstacle := briefingLimitationObstacle(c.Limitation.Code)
+		line := "Investigation limited by " + obstacle + ": that evidence could not be retrieved, so the analysis remains incomplete."
+		if c.Limitation.Cleared {
+			line = "Investigation limitation cleared: " + obstacle + " no longer applies, and that evidence is available again."
+		}
+		if next := briefingCandidateNext(c.Next); next != "" {
+			line += " " + next
+		}
+		return line
+	}
+	if !d.AbilityLost {
+		return ""
+	}
+	if b.Unavailable > 0 {
+		return fmt.Sprintf("Analysis unavailable for %d incident(s); not scheduled for these incidents.", b.Unavailable)
+	}
+	return "Automatic work cannot proceed; next steps below."
+}
+
+// briefingLimitationObstacle names one closed limitation code as the
+// obstacle an operator would recognize. These are recorded wait-reason and
+// limitation codes, not free prose: an unrecognized code stays explicit
+// without exposing internal transport detail (canonical "capability-lost":
+// "Explain effect, not low-level transport diagnostics").
+func briefingLimitationObstacle(code string) string {
+	switch code {
+	case model.LimitationInvestigationUnavailable:
+		return "unavailable analysis for some member incidents"
+	case string(model.WaitReasonAcuteTriageDecision):
+		return "a pending investigation decision"
+	case string(model.WaitReasonAcuteTriageBackoff):
+		return "an investigation back-off"
+	case string(model.WaitReasonAssessmentRetry):
+		return "a pending assessment retry"
+	case string(model.WaitReasonAssessmentParked):
+		return "a parked assessment"
+	case string(model.WaitReasonSourceChange):
+		return "an unsettled source state"
+	case string(model.WaitReasonRecoveryGrace):
+		return "the recovery grace period"
+	}
+	return "a recorded obstacle"
+}
+
+// briefingCandidateNext states a candidate's OWN recorded next step (B0 §4
+// NextStepFacts) — a status checkpoint, a real retry or grace time, or an
+// explicit end. Never a fabricated retry or completion ETA; a kind with no
+// recorded time says so instead of borrowing another clock.
+func briefingCandidateNext(n model.NextStepFacts) string {
+	switch n.Kind {
+	case model.NextStepRetryEligible:
+		if n.At != nil {
+			return "Next: retry eligible at " + SlackDateToken(*n.At, "{time}") + "."
+		}
+		return "Next: a retry is eligible; no retry time is recorded."
+	case model.NextStepGraceDeadline:
+		if n.At != nil {
+			return "Next: confirm recovery through " + SlackDateToken(*n.At, "{time}") + "."
+		}
+		return "Next: confirm recovery; no grace deadline is recorded."
+	case model.NextStepStatusCheck:
+		if n.At != nil {
+			return "Next: status check at " + SlackDateToken(*n.At, "{time}") + "."
+		}
+		return "Next: no status check is scheduled."
+	case model.NextStepWorkEnded:
+		return "Next: no further automatic work is scheduled on this schedule."
+	case model.NextStepTrackingEnded:
+		return "Next: tracking for this Situation has ended."
+	}
+	return ""
+}
+
+// briefingCandidateFindingLines renders every useful-finding candidate whose
+// Incident the bounded Analyses overview does NOT already show (S4-04,
+// canonical "evidence-map"/reply: "Finding, structured supporting
+// observations, decision-relevant unknowns and next step"). B3 emits a
+// candidate wherever an Incident's evidence structurally changed; the
+// overview keeps at most model.AnalysisFindingsBound entries, so a finding
+// outside it reached the renderer as a candidate alone and was dropped
+// whole. An Incident carried by BOTH forms renders once, from the overview,
+// so the repair adds no duplicate content.
+func briefingCandidateFindingLines(d *model.OperatorDelta) []string {
+	shown := make(map[string]bool, len(d.Analyses))
+	for _, a := range d.Analyses {
+		shown[a.IncidentID] = true
+	}
+	var lines []string
+	for _, c := range d.Candidates {
+		if c.Kind != model.CandidateUsefulFinding || c.Finding == nil || shown[c.Finding.IncidentID] {
+			continue
+		}
+		lines = append(lines, briefingFindingCandidateLine(c))
+	}
+	return lines
+}
+
+// briefingFindingCandidateLine renders one candidate finding from its own
+// recorded facts. A recorded hypothesis is the finding; an absent one is not
+// filled in from a title (a name is not a causal hypothesis, lead decision
+// D, round 2). Missing observations are stated as missing, never as health.
+func briefingFindingCandidateLine(c model.MaterialCandidate) string {
+	f := c.Finding
+	var parts []string
+	if strings.TrimSpace(f.Hypothesis) != "" {
+		parts = append(parts, "*Finding:* "+briefingText(f.Hypothesis, 240))
+	}
+	if len(f.Observations) > 0 {
+		parts = append(parts, "*Evidence:* "+briefingText(strings.Join(f.Observations, "; "), 300))
+	} else {
+		parts = append(parts, "*Evidence:* No supporting observations were recorded; this does not establish that the service is healthy.")
+	}
+	if len(f.Unknowns) > 0 {
+		parts = append(parts, "*Still unknown:* "+briefingText(strings.Join(f.Unknowns, "; "), 300))
+	}
+	parts = append(parts, "Hypothesis; not a confirmed cause.")
+	if next := briefingCandidateNext(c.Next); next != "" {
+		parts = append(parts, next)
+	}
+	return strings.Join(parts, "\n")
+}
+
+// briefingAssuranceLine renders the one initial execution assurance from a
+// first_execution_assurance candidate's own recorded member facts (canonical
+// slide 4 row 576 and the "first-root-running" example). B5 decides whether
+// this assurance is actually delivered, and suppresses it when a finding
+// already supersedes it; B4 only renders the facts it would carry.
+func briefingAssuranceLine(d *model.OperatorDelta, b *model.OperatorBriefing) string {
+	for _, c := range d.Candidates {
+		if c.Kind != model.CandidateFirstExecutionAssurance || c.Members == nil {
+			continue
+		}
+		line := "Investigating" + briefingInputScope(c.Members.CountKnown, c.Members.FiringCount, c.Members.NowFiring, briefingScope(b))
+		if next := briefingCandidateNext(c.Next); next != "" {
+			line += " " + next
+		}
+		return line
+	}
+	return ""
 }
 
 // briefingInconclusiveLine renders the structured inconclusive-completion
@@ -434,6 +661,32 @@ func briefingInconclusiveLine(d *model.OperatorDelta) string {
 		if c.Kind != model.CandidateInconclusiveCompletion {
 			continue
 		}
+		return briefingInconclusiveCandidateLine(c)
+	}
+	return "Analysis failed; coverage is incomplete."
+}
+
+// briefingInconclusiveLines renders EVERY recorded inconclusive completion,
+// each keyed to its own incident/attempt identity, and falls back to the
+// legacy aggregate wording only when the delta carried no candidate at all
+// (an older persisted transition). Gating this on d.AnalysisFailed dropped
+// a candidate-only completion whose aggregate failure count never moved
+// (R1 repair, lead review 2026-09-09).
+func briefingInconclusiveLines(d *model.OperatorDelta) []string {
+	var lines []string
+	for _, c := range d.Candidates {
+		if c.Kind == model.CandidateInconclusiveCompletion {
+			lines = append(lines, briefingInconclusiveCandidateLine(c))
+		}
+	}
+	if len(lines) == 0 && d.AnalysisFailed {
+		lines = append(lines, "Analysis failed; coverage is incomplete.")
+	}
+	return lines
+}
+
+func briefingInconclusiveCandidateLine(c model.MaterialCandidate) string {
+	{
 		line := "Investigation inconclusive."
 		switch {
 		case c.Outcome != nil && !c.Outcome.EvidenceKnown:
@@ -457,7 +710,6 @@ func briefingInconclusiveLine(d *model.OperatorDelta) string {
 		}
 		return line + " " + briefingInconclusiveRetry(c.Next)
 	}
-	return "Analysis failed; coverage is incomplete."
 }
 
 // briefingInconclusiveRetry reads the candidate's OWN recorded next step
@@ -492,7 +744,16 @@ func briefingActionChangeLine(d *model.OperatorDelta) string {
 			return "Operator action changed; see Action below."
 		}
 	}
+	if !d.HumanRequestChanged {
+		return ""
+	}
 	return "Human action request changed; a recorded next actor does not confirm accepted ownership."
+}
+
+// briefingHasCandidateFinding reports whether this delta carries a
+// useful-finding candidate the bounded Analyses overview does not show.
+func briefingHasCandidateFinding(d *model.OperatorDelta) bool {
+	return len(briefingCandidateFindingLines(d)) > 0
 }
 
 func briefingSymptoms(symptoms []string) string {

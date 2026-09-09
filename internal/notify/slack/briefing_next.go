@@ -58,7 +58,7 @@ func briefingWork(c model.ActionContract, b *model.OperatorBriefing, now time.Ti
 	switch *c.AlertINTAction {
 	case model.AlertINTActionRunAcuteTriage:
 		if *c.AlertINTStatus == model.AlertINTStatusRunning {
-			return "Investigating."
+			return "Investigating" + briefingExecutionScope(b)
 		}
 		if *c.AlertINTStatus == model.AlertINTStatusPlanned {
 			return "Investigation is queued; it has not started yet."
@@ -79,7 +79,21 @@ func briefingWork(c model.ActionContract, b *model.OperatorBriefing, now time.Ti
 		}
 		return "Assessment is waiting; no retry time is recorded."
 	case model.AlertINTActionVerifyRecovery:
-		return "Watching for sustained recovery; the next check will reassess whether alerts remain clear."
+		step := "Watching for sustained recovery"
+		if grace := b.Work.SourceGraceUntil; grace != nil {
+			// The recovery grace deadline is its OWN recorded time, distinct
+			// from the status checkpoint briefingNextStep appends below
+			// (canonical "recovery-with-work": "confirm recovery through
+			// [recorded grace deadline]; investigation status check at
+			// [recorded checkpoint]").
+			step += " through " + SlackDateToken(*grace, "{time}") + "."
+		} else {
+			step += "; the next check will reassess whether alerts remain clear."
+		}
+		if outstanding := briefingOutstandingWork(b); outstanding != "" {
+			step += " " + outstanding
+		}
+		return step
 	case model.AlertINTActionMonitorSituation:
 		step := "Monitoring alert changes."
 		if briefingHasUncertainty(b) {
@@ -88,6 +102,88 @@ func briefingWork(c model.ActionContract, b *model.OperatorBriefing, now time.Ti
 		return step
 	}
 	return "Automatic work is not recognized; no retry can be promised."
+}
+
+// briefingOutstandingWork discloses investigation that is still outstanding
+// while the Situation's own orientation has moved elsewhere (canonical
+// slide 4 "Confirming recovery": "Disclose any investigation still running
+// separately", and the "recovery-with-work" example's "One investigation is
+// still running"). Recovery confirmation is about the monitored alerts
+// alone; hiding live execution behind it told the operator the episode was
+// quieter than the recorded work says (R3 repair, lead review 2026-09-09).
+// Every branch reads one recorded Work fact: nothing here claims work
+// finished, and nothing invents a new work loop.
+func briefingOutstandingWork(b *model.OperatorBriefing) string {
+	switch b.Work.Phase {
+	case model.WorkPhaseExecuting:
+		if n := b.Work.RemainingIncidents; n > 1 {
+			return fmt.Sprintf("Investigation is still running for %d incidents.", n)
+		}
+		return "One investigation is still running."
+	case model.WorkPhaseRetryWait:
+		if at := b.Work.RetryEligibleAt; at != nil {
+			return "One investigation retry is eligible at " + SlackDateToken(*at, "{time}") + "."
+		}
+		return "One investigation is waiting in back-off; no retry time is recorded."
+	case model.WorkPhaseQueued, model.WorkPhaseAwaitingDecision:
+		return "Investigation work is still outstanding; it has not started yet."
+	case model.WorkPhaseCollecting, model.WorkPhaseSettled, model.WorkPhaseExhausted, model.WorkPhaseNone:
+		// No outstanding automatic work to disclose. A legacy projection
+		// (Phase "") falls through to the same silence: unknown work is not
+		// a claim that work is running.
+	}
+	return ""
+}
+
+// briefingExecutionScope names what the running investigation actually took
+// as input (canonical slide 4 "first-root-running": "Investigating
+// [recorded count] alerts for [recorded scope]: [alert names]"). It reads
+// only the Work projection's own frozen claim-time provenance. A projection
+// that recorded neither a count nor names is legacy: it says nothing extra
+// rather than asserting an unknown that was never a recorded fact.
+func briefingExecutionScope(b *model.OperatorBriefing) string {
+	w := b.Work
+	if !w.InvestigatedCountKnown && len(w.InvestigatedNames) == 0 {
+		return "."
+	}
+	return briefingInputScope(w.InvestigatedCountKnown, w.InvestigatedCount, w.InvestigatedNames, briefingScope(b))
+}
+
+// briefingInputScope renders one investigation's recorded input as a
+// sentence ending, so a caller writes "Investigating" + this. It is the one
+// place the count/name rule lives, shared by the root's Work projection and
+// by a first_execution_assurance candidate's own MemberFacts.
+//
+// countKnown is the ONLY authority for stating a number (B0 §3
+// InvestigatedCountKnown / §4 MemberFacts.CountKnown, lead decision B,
+// round 2): Situation.Total, the firing count and the separately bounded
+// name list's length are three different numbers, and none of them may
+// stand in for an unrecorded count. The names are bounded on their own, so
+// a name list shorter than a known count is introduced with "including",
+// never as the complete input (canonical row 576: "Count the actual
+// investigation inputs, not every Situation member or only the still-firing
+// members").
+func briefingInputScope(countKnown bool, count int, names []string, scope string) string {
+	switch {
+	case countKnown && len(names) > 0:
+		joiner := ": "
+		if count > len(names) {
+			joiner = ", including "
+		}
+		return " " + briefingAlertCount(count) + " for " + scope + joiner + briefingNames(names) + "."
+	case countKnown:
+		return " " + briefingAlertCount(count) + " for " + scope + "."
+	case len(names) > 0:
+		return " " + scope + ": " + briefingNames(names) + "; the complete investigated alert count is not recorded."
+	}
+	return " " + scope + "."
+}
+
+func briefingAlertCount(n int) string {
+	if n == 1 {
+		return "1 alert"
+	}
+	return fmt.Sprintf("%d alerts", n)
 }
 
 func briefingRetry(work string, at *time.Time, now time.Time) string {
