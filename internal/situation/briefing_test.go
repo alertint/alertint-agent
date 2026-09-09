@@ -188,8 +188,18 @@ func TestBriefingMeaningfulDeltaSurvivesDelayedRoot(t *testing.T) {
 	pub.RootPublished = false
 	pub.RootPublicationOwed = true
 	intents := hsPlan(t, pub)
-	if len(hsReplyIntents(intents)) != 1 {
-		t.Fatalf("an undelivered root swallowed new analysis: %+v", intents)
+	// The canonical slide-4 gate is "Initial publication has no duplicate
+	// reply"/"or no earlier root": while the FIRST root is still owed, the
+	// new analysis is not swallowed — it is carried by the root projection
+	// itself, which renders the current Episode summary, and echoing it into
+	// a thread that does not exist yet would duplicate it (lead review
+	// 2026-09-09, R4, which overrides this planner expectation).
+	if len(hsReplyIntents(intents)) != 0 {
+		t.Fatalf("a still-unpublished first root also queued a thread echo: %+v", hsReplyIntents(intents))
+	}
+	roots := hsIntentsOfClass(intents, model.EffectRootSync)
+	if len(roots) != 1 || roots[0].SummaryVersion == nil || *roots[0].SummaryVersion != sum.Version {
+		t.Fatalf("the delayed root must still carry the current summary that holds the new analysis: %+v", roots)
 	}
 }
 

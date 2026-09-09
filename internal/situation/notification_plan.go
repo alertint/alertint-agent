@@ -32,11 +32,15 @@ type DeliveredHistory struct {
 	// 0 when none has.
 	LastDeliveredSequence int
 	// AssuranceConveyed is true once the operator has actually seen the
-	// first-execution assurance: a delivered thread_append/broadcast_handoff
-	// whose own Transition is journal_kind investigation_started, or a
-	// delivered root already showing the current Episode summary's
-	// InvestigationStarted. Defensive idempotency only — MaterialCandidates
-	// emits CandidateFirstExecutionAssurance at most once per Situation.
+	// first-execution assurance: a DELIVERED reply that carried a
+	// first_execution_assurance candidate, or a DELIVERED root_sync whose
+	// own authority Transition recorded Briefing.Work.ExecutionStarted
+	// (B0 integration contract §5.2 — "the delivered root version's own work
+	// provenance"). The CURRENT Episode summary answers a different
+	// question, since the root edit that would show execution may still be
+	// queued; EpisodeSummary.InvestigationStarted answers a third, since the
+	// legacy action-contract journal fold sets it for merely PLANNED triage
+	// (lead review 2026-09-09, R2).
 	AssuranceConveyed bool
 	// LiveAssuranceIntentID names a still-undelivered (pending,
 	// blocked_configuration, or failed) assurance reply intent, if one
@@ -55,13 +59,46 @@ type DeliveredHistory struct {
 	// introduced or revised, or nil once a delivered candidate withdraws it
 	// (or none has ever been communicated).
 	CommunicatedAction *model.OperatorAction
+	// OwedLimitationCodes is the set of LimitationFacts.Code values carried
+	// by a reply that is planned and still deliverable (pending,
+	// blocked_configuration or failed) but has NOT reached Slack yet. An
+	// obstacle waiting behind a delivery gap is not "unreported": it is
+	// still owed, and it WILL be published. A correction planned while it
+	// waits must therefore survive, or the stale obstacle lands with
+	// nothing behind it to correct it (lead review 2026-09-09, R5).
+	OwedLimitationCodes []string
+	// OwedAction is the operator Action introduced or revised by a reply
+	// that is still owed to the operator, for the same reason. Nil when the
+	// owed replies withdraw it or request nothing.
+	OwedAction *model.OperatorAction
 }
 
 // communicatedLimitation reports whether code is currently in h's
 // communicated set.
 func (h DeliveredHistory) communicatedLimitation(code string) bool {
-	for _, c := range h.CommunicatedLimitationCodes {
-		if c == code {
+	return containsString(h.CommunicatedLimitationCodes, code)
+}
+
+// limitationOnScreen reports whether the operator either already knows about
+// code or is going to: a delivered appearance, or one queued behind a
+// delivery gap that has not reached Slack yet. Both make a later clearing a
+// real correction, and both make a repeated appearance a duplicate.
+// Delivered-only was the incomplete boundary the lead's R5 exposed — a
+// stale obstacle published after its clearance had been dropped as
+// "unreported" leaves the operator with a limitation nothing ever corrects.
+func (h DeliveredHistory) limitationOnScreen(code string) bool {
+	return h.communicatedLimitation(code) || containsString(h.OwedLimitationCodes, code)
+}
+
+// requestOnScreen reports the same for a recorded operator action: one
+// already delivered, or one still owed.
+func (h DeliveredHistory) requestOnScreen() bool {
+	return h.CommunicatedAction != nil || h.OwedAction != nil
+}
+
+func containsString(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
 			return true
 		}
 	}
@@ -80,37 +117,50 @@ func (h DeliveredHistory) communicatedLimitation(code string) bool {
 // conveys a fresh first_execution_assurance candidate itself, so no reply is
 // warranted for it (spec.md "If the first root already conveys this
 // assurance, do not echo it").
+//
+// That last rule is not special to the assurance. The canonical slide-4
+// gate states it for the whole reply decision — "Initial publication has no
+// duplicate reply" (gate), "Never echo the first root into its thread"
+// (root), "or no earlier root" (quiet path), "existing root" (reply path) —
+// because the first root renders the CURRENT truth, terminal outcome
+// included. So a commit that is itself the first publication earns no
+// reply for ANY candidate kind (lead review 2026-09-09, R4).
 func ReplyEligible(cands []model.MaterialCandidate, h DeliveredHistory, rootPublished bool) []model.MaterialCandidate {
+	if !rootPublished {
+		return nil
+	}
 	out := make([]model.MaterialCandidate, 0, len(cands))
 	for _, c := range cands {
 		switch c.Kind { //nolint:exhaustive // every other candidate kind is an unconditional structural fact B3 already decided; only these three carry a delivery-history-dependent eligibility rule.
 		case model.CandidateFirstExecutionAssurance:
-			if !rootPublished || h.AssuranceConveyed {
+			if h.AssuranceConveyed {
 				continue
 			}
 		case model.CandidateAbilityChanged:
 			if c.Limitation == nil {
 				continue
 			}
-			communicated := h.communicatedLimitation(c.Limitation.Code)
+			onScreen := h.limitationOnScreen(c.Limitation.Code)
 			if c.Limitation.Cleared {
-				if !communicated {
-					// Unreported transient obstacle restoration is not
+				if !onScreen {
+					// A genuinely unreported transient obstacle — never
+					// delivered and not waiting in the queue either — is not
 					// useful history (plan.md item 4): nothing was ever
 					// said, so there is nothing to correct.
 					continue
 				}
-			} else if communicated {
-				// Defensive idempotency: an already-communicated appearance
-				// must not be replanned as new.
+			} else if onScreen {
+				// Defensive idempotency: an appearance the operator already
+				// has, or is already owed, must not be replanned as new.
 				continue
 			}
 		case model.CandidateActionChanged:
 			if c.Action == nil {
 				continue
 			}
-			if c.Action.Withdrawn && h.CommunicatedAction == nil {
-				// A withdrawal only corrects an earlier DELIVERED request.
+			if c.Action.Withdrawn && !h.requestOnScreen() {
+				// A withdrawal only corrects a request the operator has
+				// received or is still owed.
 				continue
 			}
 		}
@@ -140,6 +190,12 @@ func ReplyEligible(cands []model.MaterialCandidate, h DeliveredHistory, rootPubl
 // briefing.go, model/briefing.go); this is the one residual escalation for
 // this handoff.
 func replyEligibleTransition(in PublicationInput, tr model.Transition) bool {
+	if !in.RootPublished {
+		// Initial publication has no duplicate reply — the symptoms
+		// fallback below included. The first root carries this commit's own
+		// truth already (R4).
+		return false
+	}
 	var cands []model.MaterialCandidate
 	if tr.Projection.OperatorDelta != nil {
 		cands = tr.Projection.OperatorDelta.Candidates

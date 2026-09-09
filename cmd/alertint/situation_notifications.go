@@ -72,6 +72,12 @@ type DelivererStore interface {
 
 	// GetDeliveryGap reads one durable gap generation's rendering facts.
 	GetDeliveryGap(ctx context.Context, gapGeneration string) (store.GapSnapshot, error)
+
+	// GetCommunicatedHistory reads what the operator has already been told,
+	// or is still owed, before the reply being delivered — the same
+	// DeliveredHistory the planner filtered against, re-read at delivery
+	// time so the outbound payload carries only the selected facts.
+	GetCommunicatedHistory(ctx context.Context, situationID string, beforeSequence int) (situation.DeliveredHistory, error)
 }
 
 // slackDeliveryAPI is exactly what SituationDeliverer calls on the narrow
@@ -242,7 +248,11 @@ func (d *SituationDeliverer) deliverThreadAppend(ctx context.Context, intent mod
 		return situation.NotificationDelivery{}, localDelivery("root_not_published",
 			fmt.Errorf("cmd/alertint: situation deliverer: situation %s has no delivered root to reply under", *intent.SituationID))
 	}
-	rendered, err := slack.RenderSituationJournal(tr)
+	renderTr, err := d.selectedTransition(ctx, intent, tr)
+	if err != nil {
+		return situation.NotificationDelivery{}, err
+	}
+	rendered, err := slack.RenderSituationJournal(renderTr)
 	if err != nil {
 		return situation.NotificationDelivery{}, invalidDelivery("render_failed",
 			fmt.Errorf("cmd/alertint: situation deliverer: render journal: %w", err))
@@ -258,6 +268,73 @@ func (d *SituationDeliverer) deliverThreadAppend(ctx context.Context, intent mod
 		return situation.NotificationDelivery{}, err
 	}
 	return situation.NotificationDelivery{Channel: res.Channel, MessageTS: res.TS, DeliveredAs: "thread"}, nil
+}
+
+// selectedTransition returns tr narrowed to the candidates the operator is
+// actually owed by THIS reply. ReplyEligible already made that decision at
+// plan time against the same durable history; re-reading it here, bounded
+// to replies below this Transition's own sequence, is what carries the
+// decision through persistence, restart and both reply classes without a
+// second materiality judgement or a new persisted payload (B0 integration
+// contract §4/§5; lead review 2026-09-09, R1).
+//
+// Two rules keep the narrowing honest:
+//
+//   - a rejected candidate must not return through B4's legacy-boolean
+//     fallback, which fires exactly when no candidate of that kind rode the
+//     delta — so a kind rejected in full takes its legacy twin with it;
+//   - narrowing never empties a reply the planner earned. If nothing
+//     survives, the planned payload is delivered unchanged: an empty Slack
+//     message would be a worse answer than a redundant one.
+//
+// The durable Transition is never mutated: the delta is copied first.
+func (d *SituationDeliverer) selectedTransition(ctx context.Context, intent model.NotificationIntent, tr model.Transition) (model.Transition, error) {
+	delta := tr.Projection.OperatorDelta
+	if delta == nil || len(delta.Candidates) == 0 || intent.SituationID == nil {
+		return tr, nil
+	}
+	history, err := d.store.GetCommunicatedHistory(ctx, *intent.SituationID, tr.Sequence)
+	if err != nil {
+		return tr, localDelivery("communicated_history_unavailable",
+			fmt.Errorf("cmd/alertint: situation deliverer: load communicated history: %w", err))
+	}
+	// A reply is only ever delivered under an existing root, so the
+	// initial-publication rule cannot apply here.
+	eligible := situation.ReplyEligible(delta.Candidates, history, true)
+	if len(eligible) == 0 || len(eligible) == len(delta.Candidates) {
+		return tr, nil
+	}
+
+	selected := *delta
+	selected.Candidates = eligible
+	if kindRejectedInFull(delta.Candidates, eligible, model.CandidateAbilityChanged) {
+		selected.AbilityLost = false
+	}
+	if kindRejectedInFull(delta.Candidates, eligible, model.CandidateActionChanged) {
+		selected.HumanRequestChanged = false
+	}
+	tr.Projection.OperatorDelta = &selected
+	return tr, nil
+}
+
+// kindRejectedInFull reports whether every candidate of kind was dropped —
+// the one case where B4 falls back to that kind's legacy boolean.
+func kindRejectedInFull(all, eligible []model.MaterialCandidate, kind model.CandidateKind) bool {
+	had := false
+	for _, c := range all {
+		if c.Kind == kind {
+			had = true
+		}
+	}
+	if !had {
+		return false
+	}
+	for _, c := range eligible {
+		if c.Kind == kind {
+			return false
+		}
+	}
+	return true
 }
 
 // deliverBroadcastHandoff optionally broadcasts a current handoff.
@@ -296,7 +373,10 @@ func (d *SituationDeliverer) deliverBroadcastHandoff(ctx context.Context, intent
 	// is asked to do (situation.HandoffStillCurrent).
 	current := situation.HandoffStillCurrent(tr, view.Summary)
 
-	renderTr := tr // a local copy: the durable ledger row is never mutated.
+	renderTr, err := d.selectedTransition(ctx, intent, tr) // a local copy: the durable ledger row is never mutated.
+	if err != nil {
+		return situation.NotificationDelivery{}, err
+	}
 	if !current {
 		renderTr.Journal.Delayed = true
 		renderTr.Journal.NoLongerCurrent = true

@@ -719,43 +719,163 @@ func (s *Store) GetSituationRootCoordinates(ctx context.Context, situationID str
 // B5: DeliveredHistory (B0 integration contract §4/§5)
 // ----------------------------------------------------------------------
 
+// Reply effect classes and the two intent-status families the delivery
+// history folds: what the operator has actually SEEN, and what is still
+// owed to them behind a delivery gap.
+const (
+	historyReplyClasses = `'thread_append','broadcast_handoff'`
+	historyDelivered    = `'delivered'`
+	historyLive         = `'pending','blocked_configuration','failed'`
+)
+
 // loadDeliveredHistoryTx reads situationID's durable, delivery-aware
-// context inside the caller's coherent transaction: every DELIVERED reply's
-// own persisted candidates, folded in Transition-sequence order, plus the
-// one still-undelivered assurance intent if one exists. rootPublished is
-// SnapshotInput.RootPublished, already known to the caller — passed in
-// rather than re-derived so this function's own AssuranceConveyed check can
-// short-circuit without a second root-coordinates query when a delivered
-// reply already proves it.
+// context inside the caller's coherent transaction. Three reads, each
+// answering its own question and none standing in for another:
+//
+//   - DELIVERED replies, folded in Transition-sequence order, are what the
+//     operator has actually been told;
+//   - LIVE replies (pending, blocked_configuration or failed) are what they
+//     are still owed — an obstacle waiting behind a delivery gap WILL be
+//     published, so a correction planned meanwhile must survive (R5);
+//   - DELIVERED root_sync rows carry the assurance only through their own
+//     authority Transition's recorded Briefing.Work.ExecutionStarted
+//     (§5.2). The CURRENT Episode summary cannot answer this — the root
+//     edit that would show execution may still be queued — and
+//     EpisodeSummary.InvestigationStarted answers a different question
+//     again, since the legacy action-contract journal fold sets it for
+//     merely PLANNED triage (R2).
+//
+// rootPublished is SnapshotInput.RootPublished, already known to the
+// caller: when it is false no root has ever been delivered, so the
+// delivered-root read is skipped rather than run against a set that cannot
+// yet contain one.
 func loadDeliveredHistoryTx(ctx context.Context, tx *sql.Tx, situationID string, rootPublished bool) (situation.DeliveredHistory, error) {
+	return loadCommunicatedHistoryTx(ctx, tx, situationID, rootPublished, 0)
+}
+
+// loadCommunicatedHistoryTx is loadDeliveredHistoryTx with an optional
+// bound: beforeSequence, when positive, restricts every read to replies
+// whose own Transition sequence is strictly lower — the delivery-time
+// question "what did the operator have before THIS message?".
+func loadCommunicatedHistoryTx(ctx context.Context, tx *sql.Tx, situationID string, rootPublished bool, beforeSequence int) (situation.DeliveredHistory, error) {
 	var out situation.DeliveredHistory
 
-	rows, err := tx.QueryContext(ctx, `
-		SELECT `+transitionColumns+`
-		FROM situation_transitions
-		WHERE situation_id = ? AND id IN (
-			SELECT transition_id FROM notification_intents
-			WHERE situation_id = ? AND effect_class IN ('thread_append','broadcast_handoff') AND status = 'delivered'
-		)
-		ORDER BY sequence ASC`, situationID, situationID)
+	delivered, err := historyTransitionsTx(ctx, tx, situationID, historyReplyClasses, historyDelivered, beforeSequence)
 	if err != nil {
-		return out, fmt.Errorf("store: query delivered reply transitions: %w", err)
+		return out, err
 	}
-	defer func() { _ = rows.Close() }()
-
-	var limitations []string // the NET set of currently-communicated codes, in first-appearance order
-	var action *situationmodel.OperatorAction
-	for rows.Next() {
-		tr, err := scanTransition(rows)
-		if err != nil {
-			return out, fmt.Errorf("store: scan delivered reply transition: %w", err)
-		}
+	for _, tr := range delivered {
 		if tr.Sequence > out.LastDeliveredSequence {
 			out.LastDeliveredSequence = tr.Sequence
 		}
-		if tr.JournalKind == situationmodel.JournalInvestigationStarted {
+		if transitionConveysAssurance(tr) {
 			out.AssuranceConveyed = true
 		}
+	}
+	out.CommunicatedLimitationCodes, out.CommunicatedAction = foldLimitationsAndAction(delivered)
+
+	live, err := historyTransitionsTx(ctx, tx, situationID, historyReplyClasses, historyLive, beforeSequence)
+	if err != nil {
+		return out, err
+	}
+	out.OwedLimitationCodes, out.OwedAction = foldLimitationsAndAction(live)
+
+	if rootPublished && !out.AssuranceConveyed {
+		roots, err := historyTransitionsTx(ctx, tx, situationID, `'root_sync'`, historyDelivered, beforeSequence)
+		if err != nil {
+			return out, err
+		}
+		for _, tr := range roots {
+			// The delivered root VERSION's own work provenance: this
+			// Transition's briefing is what that summary version folded.
+			if b := tr.Projection.Briefing; b != nil && b.Work.ExecutionStarted {
+				out.AssuranceConveyed = true
+				break
+			}
+		}
+	}
+
+	liveAssurance, err := liveTransientAssuranceIntentIDsTx(ctx, tx, situationID)
+	if err != nil {
+		return out, err
+	}
+	if len(liveAssurance) > 0 {
+		id := liveAssurance[0]
+		out.LiveAssuranceIntentID = &id
+	}
+	return out, nil
+}
+
+// historyTransitionsTx loads, in Transition-sequence order, every
+// Transition referenced by one of situationID's notification intents in the
+// given effect-class and status families. classes and statuses are
+// constant SQL literal lists owned by this file, never caller input.
+func historyTransitionsTx(ctx context.Context, tx *sql.Tx, situationID, classes, statuses string, beforeSequence int) ([]situationmodel.Transition, error) {
+	query := `
+		SELECT ` + transitionColumns + `
+		FROM situation_transitions
+		WHERE situation_id = ? AND id IN (
+			SELECT transition_id FROM notification_intents
+			WHERE situation_id = ? AND effect_class IN (` + classes + `) AND status IN (` + statuses + `)
+		)`
+	args := []any{situationID, situationID}
+	if beforeSequence > 0 {
+		query += ` AND sequence < ?`
+		args = append(args, beforeSequence)
+	}
+	query += ` ORDER BY sequence ASC`
+
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: query notification history transitions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []situationmodel.Transition
+	for rows.Next() {
+		tr, err := scanTransition(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: scan notification history transition: %w", err)
+		}
+		out = append(out, tr)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate notification history transitions: %w", err)
+	}
+	return out, nil
+}
+
+// transitionConveysAssurance reports whether a reply rendered from tr told
+// the operator that execution actually began. B3's candidate list is the
+// accepted fact; the investigation_started journal LABEL is consulted only
+// for a legacy projection that carries no candidate list at all, because
+// that label also covers merely planned triage (R2).
+func transitionConveysAssurance(tr situationmodel.Transition) bool {
+	if d := tr.Projection.OperatorDelta; d != nil && len(d.Candidates) > 0 {
+		for _, c := range d.Candidates {
+			if c.Kind == situationmodel.CandidateFirstExecutionAssurance {
+				return true
+			}
+		}
+		return false
+	}
+	return tr.JournalKind == situationmodel.JournalInvestigationStarted
+}
+
+// foldLimitationsAndAction folds one sequence-ordered set of reply
+// Transitions into the NET limitation codes and operator action they leave
+// standing. Distinct codes stay independent.
+//
+// The fold reads every persisted candidate, not the subset the deliverer
+// selected, and still equals what actually rendered: ReplyEligible only ever
+// drops a candidate whose fold here is a no-op against the same history —
+// a repeated appearance re-adds a code already present, a clearing with
+// nothing on screen removes a code that is absent, and a withdrawal with no
+// request outstanding clears an action already nil.
+func foldLimitationsAndAction(trs []situationmodel.Transition) ([]string, *situationmodel.OperatorAction) {
+	var codes []string
+	var action *situationmodel.OperatorAction
+	for _, tr := range trs {
 		if tr.Projection.OperatorDelta == nil {
 			continue
 		}
@@ -766,9 +886,9 @@ func loadDeliveredHistoryTx(ctx context.Context, tx *sql.Tx, situationID string,
 					continue
 				}
 				if c.Limitation.Cleared {
-					limitations = removeString(limitations, c.Limitation.Code)
+					codes = removeString(codes, c.Limitation.Code)
 				} else {
-					limitations = appendMissingString(limitations, c.Limitation.Code)
+					codes = appendMissingString(codes, c.Limitation.Code)
 				}
 			case situationmodel.CandidateActionChanged:
 				if c.Action == nil {
@@ -783,43 +903,113 @@ func loadDeliveredHistoryTx(ctx context.Context, tx *sql.Tx, situationID string,
 			}
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return out, fmt.Errorf("store: iterate delivered reply transitions: %w", err)
-	}
-	out.CommunicatedLimitationCodes = limitations
-	out.CommunicatedAction = action
+	return codes, action
+}
 
-	var liveID sql.NullString
-	err = tx.QueryRowContext(ctx, `
-		SELECT i.id FROM notification_intents i
+// liveTransientAssuranceIntentIDsTx names the still-deliverable
+// thread_append replies whose own Transition is a PURELY transient start
+// assurance — the only replies §5.3 permits superseding. A row that also
+// carries a member/scope change, a finding, an action or a limitation is
+// material history (ADR 0042/0052) and is not disposable, whatever its
+// journal label says (lead review 2026-09-09, R3).
+func liveTransientAssuranceIntentIDsTx(ctx context.Context, tx *sql.Tx, situationID string) ([]string, error) {
+	transient := map[string]bool{}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT `+transitionColumns+`
+		FROM situation_transitions
+		WHERE situation_id = ? AND journal_kind = 'investigation_started' AND id IN (
+			SELECT transition_id FROM notification_intents
+			WHERE situation_id = ? AND effect_class = 'thread_append' AND status IN (`+historyLive+`)
+		)`, situationID, situationID)
+	if err != nil {
+		return nil, fmt.Errorf("store: query live assurance transitions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		tr, err := scanTransition(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: scan live assurance transition: %w", err)
+		}
+		transient[tr.ID] = purelyTransientAssurance(tr)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate live assurance transitions: %w", err)
+	}
+	if len(transient) == 0 {
+		return nil, nil
+	}
+
+	pairs, err := tx.QueryContext(ctx, `
+		SELECT i.id, i.transition_id
+		FROM notification_intents i
 		JOIN situation_transitions t ON t.id = i.transition_id
 		WHERE i.situation_id = ? AND i.effect_class = 'thread_append'
-		  AND i.status IN ('pending', 'blocked_configuration', 'failed')
+		  AND i.status IN (`+historyLive+`)
 		  AND t.journal_kind = 'investigation_started'
-		ORDER BY t.sequence ASC LIMIT 1`, situationID).Scan(&liveID)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return out, fmt.Errorf("store: query live assurance intent: %w", err)
+		ORDER BY t.sequence ASC, i.id ASC`, situationID)
+	if err != nil {
+		return nil, fmt.Errorf("store: query live assurance intents: %w", err)
 	}
-	if liveID.Valid {
-		id := liveID.String
-		out.LiveAssuranceIntentID = &id
-	}
-
-	// Root-conveyed case (§5.2, "no new column"): the root is always edited
-	// in place to the CURRENT Episode summary, so a delivered root that
-	// currently shows InvestigationStarted conveys the assurance right now,
-	// regardless of when it started showing that.
-	if rootPublished && !out.AssuranceConveyed {
-		summary, err := loadEpisodeSummaryTx(ctx, tx, situationID)
-		if err != nil {
-			return out, err
+	defer func() { _ = pairs.Close() }()
+	var out []string
+	for pairs.Next() {
+		var intentID, transitionID string
+		if err := pairs.Scan(&intentID, &transitionID); err != nil {
+			return nil, fmt.Errorf("store: scan live assurance intent: %w", err)
 		}
-		if summary != nil && summary.InvestigationStarted {
-			out.AssuranceConveyed = true
+		if transient[transitionID] {
+			out = append(out, intentID)
 		}
 	}
-
+	if err := pairs.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate live assurance intents: %w", err)
+	}
 	return out, nil
+}
+
+// purelyTransientAssurance reports whether every fact tr would put on
+// screen is the disposable start assurance. A legacy projection carrying no
+// candidate list at all keeps the original journal-label behavior, since
+// there is nothing else recorded to inspect.
+func purelyTransientAssurance(tr situationmodel.Transition) bool {
+	if tr.JournalKind != situationmodel.JournalInvestigationStarted {
+		return false
+	}
+	d := tr.Projection.OperatorDelta
+	if d == nil || len(d.Candidates) == 0 {
+		return true
+	}
+	for _, c := range d.Candidates {
+		if c.Kind != situationmodel.CandidateFirstExecutionAssurance {
+			return false
+		}
+	}
+	return true
+}
+
+// GetCommunicatedHistory reads what the operator has already been told —
+// or is still owed — for situationID, bounded to replies whose Transition
+// sequence is strictly below beforeSequence (0 or less means unbounded).
+// The Slack deliverer calls it immediately before rendering one reply, so
+// the payload it posts carries exactly the facts ReplyEligible accepted
+// (B0 integration contract §4/§5; lead review 2026-09-09, R1).
+func (s *Store) GetCommunicatedHistory(ctx context.Context, situationID string, beforeSequence int) (situation.DeliveredHistory, error) {
+	if strings.TrimSpace(situationID) == "" {
+		return situation.DeliveredHistory{}, errors.New("store: communicated history requires a situation id")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return situation.DeliveredHistory{}, fmt.Errorf("store: begin communicated history: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	h, err := loadCommunicatedHistoryTx(ctx, tx, situationID, true, beforeSequence)
+	if err != nil {
+		return situation.DeliveredHistory{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return situation.DeliveredHistory{}, fmt.Errorf("store: commit communicated history: %w", err)
+	}
+	return h, nil
 }
 
 // appendMissingString appends s to list if not already present.
@@ -868,9 +1058,16 @@ const (
 //
 // A delivered assurance is material history (ADR 0042/0052) and untouched:
 // the live-status filter here is the same one 0020/0022 encode as a CHECK.
-// A no-op when history carries no overtaking candidate, when no live
-// assurance exists, or when the overtaking Transition itself earned no
-// reply (nothing has actually taken the assurance's place on screen yet).
+// The journal-kind guard 0022 adds is NECESSARY, not sufficient — reason
+// precedence lets one Transition carry the start AND a member/scope change,
+// and that row's material history is not disposable. Only a row whose every
+// candidate is the transient assurance is superseded (lead review
+// 2026-09-09, R3).
+//
+// A no-op when history carries no overtaking candidate, when no purely
+// transient live assurance exists, or when the overtaking Transition itself
+// earned no reply (nothing has actually taken the assurance's place on
+// screen yet).
 func supersedeObsoleteAssuranceTx(ctx context.Context, tx *sql.Tx, situationID string, history *situation.HistoryCommit) error {
 	if history == nil {
 		return nil
@@ -909,17 +1106,34 @@ outer:
 		return nil
 	}
 
+	obsolete, err := liveTransientAssuranceIntentIDsTx(ctx, tx, situationID)
+	if err != nil {
+		return err
+	}
+	args := []any{reason, replacementID, situationID, replacementID}
+	placeholders := ""
+	for _, id := range obsolete {
+		if id == replacementID {
+			continue
+		}
+		if placeholders != "" {
+			placeholders += ","
+		}
+		placeholders += "?"
+		args = append(args, id)
+	}
+	if placeholders == "" {
+		return nil
+	}
+
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE notification_intents
 		SET status = 'superseded', supersession_reason = ?, replacement_intent_id = ?,
 		    claim_owner = NULL, lease_expires_at = NULL, retry_at = NULL
 		WHERE situation_id = ? AND effect_class = 'thread_append'
-		  AND status IN ('pending', 'blocked_configuration', 'failed')
+		  AND status IN (`+historyLive+`)
 		  AND id != ?
-		  AND transition_id IN (
-		      SELECT id FROM situation_transitions WHERE situation_id = ? AND journal_kind = 'investigation_started'
-		  )`,
-		reason, replacementID, situationID, replacementID, situationID); err != nil {
+		  AND id IN (`+placeholders+`)`, args...); err != nil {
 		return fmt.Errorf("store: supersede obsolete assurance: %w", err)
 	}
 	return nil

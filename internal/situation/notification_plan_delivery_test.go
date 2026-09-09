@@ -65,7 +65,10 @@ func TestReplyEligibleFirstExecutionAssurance(t *testing.T) {
 
 // 4/5/6: structural material facts B3 already decided (finding, inconclusive
 // completion, member/lifecycle-edge facts, terminal end) are never gated by
-// delivery history — they are always eligible.
+// what was already communicated — under an existing root they are always
+// eligible. They ARE gated by the canonical initial-publication rule, which
+// applies to every kind alike (lead review 2026-09-09, R4): see
+// TestReplyEligibleFirstPublicationEarnsNoReplyForAnyKind.
 func TestReplyEligibleUnconditionalKinds(t *testing.T) {
 	for _, kind := range []model.CandidateKind{
 		model.CandidateUsefulFinding, model.CandidateInconclusiveCompletion,
@@ -73,9 +76,9 @@ func TestReplyEligibleUnconditionalKinds(t *testing.T) {
 		model.CandidateTerminalEnd,
 	} {
 		cands := []model.MaterialCandidate{{Kind: kind}}
-		got := ReplyEligible(cands, DeliveredHistory{}, false)
+		got := ReplyEligible(cands, DeliveredHistory{}, true)
 		if len(got) != 1 || got[0].Kind != kind {
-			t.Errorf("%s must always be eligible regardless of history, got %v", kind, got)
+			t.Errorf("%s must be eligible regardless of communicated history, got %v", kind, got)
 		}
 	}
 }
