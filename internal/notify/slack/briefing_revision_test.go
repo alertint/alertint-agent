@@ -346,3 +346,39 @@ func TestBriefingRevisionCombinedDeltaPreservesEvidenceLimitations(t *testing.T)
 		}
 	}
 }
+
+// R1 (lead review 2026-09-09): the inconclusive-completion helper must keep
+// the decision-relevant unknowns it was handed and read the candidate's own
+// recorded next step instead of always denying a retry.
+func TestBriefingInconclusiveKeepsUnknownsAndRecordedNextStep(t *testing.T) {
+	withNext := func(next model.NextStepFacts) *model.OperatorDelta {
+		return &model.OperatorDelta{Candidates: []model.MaterialCandidate{{
+			Kind: model.CandidateInconclusiveCompletion,
+			Finding: &model.FindingFacts{
+				Observations: []string{"Pod events checked"},
+				Unknowns:     []string{"Application errors unavailable"},
+			},
+			Next: next,
+		}}}
+	}
+
+	ended := briefingInconclusiveLine(withNext(model.NextStepFacts{Kind: model.NextStepWorkEnded}))
+	for _, want := range []string{"Pod events checked", "Application errors unavailable", "No further analysis retry is scheduled"} {
+		if !strings.Contains(ended, want) {
+			t.Errorf("inconclusive line lost %q: %s", want, ended)
+		}
+	}
+
+	retrying := briefingInconclusiveLine(withNext(model.NextStepFacts{Kind: model.NextStepRetryEligible}))
+	if strings.Contains(retrying, "No further analysis retry is scheduled") {
+		t.Errorf("a recorded retry must not be denied: %s", retrying)
+	}
+	if !strings.Contains(retrying, "retry") {
+		t.Errorf("a recorded retry must be stated: %s", retrying)
+	}
+
+	legacy := briefingInconclusiveLine(&model.OperatorDelta{})
+	if legacy != "Analysis failed; coverage is incomplete." {
+		t.Errorf("a delta with no candidate keeps the legacy wording: %s", legacy)
+	}
+}

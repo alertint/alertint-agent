@@ -154,3 +154,106 @@ func TestLoadReconciliationInputCarriesDeliveryLabels(t *testing.T) {
 		}
 	}
 }
+
+// shParkedTriageContract is a valid nonterminal contract in which AlertINT's
+// own work is blocked under a recorded, operator-visible reason.
+func shParkedTriageContract(next time.Time) model.ActionContract {
+	c := shRunningTriageContract(next)
+	blocked, parked := model.AlertINTStatusBlocked, model.WaitReasonAssessmentParked
+	c.AlertINTStatus, c.WaitReason = &blocked, &parked
+	return c
+}
+
+// A reply composed hours later reads these facts back from the row, not from
+// mutable current state, so the repaired candidate provenance has to survive
+// real derivation against the STORED prior transition, the fenced commit and
+// reload: the cleared limitation's own code (R4), the scope/urgency change
+// that moved no member (R2), and the exact investigation input count kept
+// apart from the bounded display list (R3).
+func TestCommittedTransitionPersistsMaterialCandidateProvenance(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 10, 0, 0, 0, time.UTC)
+	sitID := newSituationForGroup(t, st, "group-candidate-provenance", now)
+	claim := claimSituation(t, st, sitID, "controller-candidates", now)
+
+	// Cycle 1: parked under a recorded reason, narrow scope, nothing running.
+	first := shPrepare(t, claim, shParkedTriageContract(now.Add(time.Minute)),
+		model.LifecycleActive, model.AttentionObserve, now)
+	first.Change.Projection.Briefing = &model.OperatorBriefing{Scope: "checkout", Firing: 9, Total: 12}
+	if err := st.CommitController(ctx, claim, shDerive(t, first)); err != nil {
+		t.Fatalf("first CommitController: %v", err)
+	}
+
+	// Cycle 2: the block cleared, the scope widened, urgency rose, and the
+	// investigation actually started against nine frozen inputs.
+	later := now.Add(time.Minute)
+	shMakeDue(t, st, sitID, now.Add(-time.Minute))
+	claim2 := claimSituation(t, st, sitID, "controller-candidates", later)
+	in, err := st.LoadReconciliationInput(ctx, claim2, later)
+	if err != nil {
+		t.Fatalf("LoadReconciliationInput: %v", err)
+	}
+	if in.PriorTransition == nil {
+		t.Fatal("second cycle must read the committed prior transition")
+	}
+
+	var ids, names []string
+	for i := 0; i < 9; i++ {
+		ids = append(ids, fmt.Sprintf("alert-%02d", i))
+		if i < 8 {
+			names = append(names, fmt.Sprintf("Alert %02d", i))
+		}
+	}
+	second := shPrepare(t, claim2, shRunningTriageContract(later.Add(time.Minute)),
+		model.LifecycleActive, model.AttentionUrgent, later)
+	second.Change.PriorTransition = in.PriorTransition
+	second.Change.PriorSummary = in.CurrentSummary
+	second.Change.Projection.Briefing = &model.OperatorBriefing{
+		Scope: "checkout and payments", Firing: 9, Total: 12,
+		Work: model.WorkProjection{
+			ExecutionStarted: true, Phase: model.WorkPhaseExecuting,
+			InvestigatedAlertIDs: ids, InvestigatedNames: names, InvestigatedCount: 9,
+		},
+	}
+	commit := shDerive(t, second)
+	if err := st.CommitController(ctx, claim2, commit); err != nil {
+		t.Fatalf("second CommitController: %v", err)
+	}
+
+	stored, err := st.GetSituationTransition(ctx, commit.History.Transitions[0].ID)
+	if err != nil {
+		t.Fatalf("GetSituationTransition: %v", err)
+	}
+	if stored.Projection.Briefing == nil || stored.Projection.Briefing.Work.InvestigatedCount != 9 {
+		t.Fatalf("exact investigation input count lost in persistence: %+v", stored.Projection.Briefing)
+	}
+	if got := len(stored.Projection.Briefing.Work.InvestigatedNames); got != 8 {
+		t.Fatalf("bounded display names = %d, want 8 alongside the exact count", got)
+	}
+	if stored.Projection.OperatorDelta == nil {
+		t.Fatal("operator delta lost in persistence")
+	}
+	byKind := map[model.CandidateKind]model.MaterialCandidate{}
+	for _, c := range stored.Projection.OperatorDelta.Candidates {
+		byKind[c.Kind] = c
+	}
+	assurance, ok := byKind[model.CandidateFirstExecutionAssurance]
+	if !ok || assurance.Members == nil || assurance.Members.FiringCount != 9 {
+		t.Fatalf("assurance count must reload as the actual nine inputs: %+v", assurance.Members)
+	}
+	ability, ok := byKind[model.CandidateAbilityChanged]
+	if !ok || ability.Limitation == nil || !ability.Limitation.Cleared ||
+		ability.Limitation.Code != string(model.WaitReasonAssessmentParked) {
+		t.Fatalf("cleared limitation identity must reload for B5 to match it: %+v", ability.Limitation)
+	}
+	members, ok := byKind[model.CandidateMembersChanged]
+	if !ok || members.Members == nil || members.Members.PreviousScope != "checkout" ||
+		members.Members.Scope != "checkout and payments" {
+		t.Fatalf("scope change must reload: %+v", members.Members)
+	}
+	if members.Members.PreviousUrgency != string(model.AttentionObserve) ||
+		members.Members.Urgency != string(model.AttentionUrgent) {
+		t.Fatalf("urgency change must reload: %+v", members.Members)
+	}
+}

@@ -432,9 +432,29 @@ func briefingInconclusiveLine(d *model.OperatorDelta) string {
 		} else {
 			line += " No supporting observations were recorded; the available evidence did not establish a cause."
 		}
-		return line + " No further analysis retry is scheduled on this schedule."
+		// A recorded unknown is the decision-relevant half of an
+		// inconclusive result — "checked X, still could not see Y" is what
+		// makes the reply actionable. Dropping supplied Unknowns silently
+		// turned a limited result into an unexplained dead end (R1 repair,
+		// lead review 2026-09-09).
+		if c.Finding != nil && len(c.Finding.Unknowns) > 0 {
+			line += " Still unknown: " + briefingText(strings.Join(c.Finding.Unknowns, "; "), 300) + "."
+		}
+		return line + " " + briefingInconclusiveRetry(c.Next)
 	}
 	return "Analysis failed; coverage is incomplete."
+}
+
+// briefingInconclusiveRetry reads the candidate's OWN recorded next step
+// rather than asserting an absence: a retry that really is eligible must not
+// be denied by a fixed sentence, and every other recorded next step (a status
+// check, a grace deadline, work having ended, or nothing recorded at all)
+// genuinely schedules no further analysis retry.
+func briefingInconclusiveRetry(next model.NextStepFacts) string {
+	if next.Kind == model.NextStepRetryEligible {
+		return "An investigation retry remains scheduled."
+	}
+	return "No further analysis retry is scheduled on this schedule."
 }
 
 // briefingActionChangeLine distinguishes an introduced, revised or

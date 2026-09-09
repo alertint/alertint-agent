@@ -3,6 +3,7 @@
 package situation
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -234,5 +235,145 @@ func TestMaterialCandidatesTerminalEndDistinguishesRecoveredAndUnknown(t *testin
 		if c == nil || c.Next.Kind != tc.want {
 			t.Fatalf("%s: expected terminal_end with next step %s, got %+v", tc.lifecycle, tc.want, c)
 		}
+	}
+}
+
+// R4 (lead review 2026-09-09): clearing an obstacle must carry the identity
+// of the obstacle that was actually reported, not whatever WaitReason the
+// now-running contract happens to hold. B5 §5 matches a cleared code against
+// CommunicatedLimitationCodes, so an empty code can never be recognized.
+func TestMaterialCandidatesClearedLimitationKeepsReportedCode(t *testing.T) {
+	blocked, running := model.AlertINTStatusBlocked, model.AlertINTStatusRunning
+	parked := model.WaitReason("assessment_parked")
+	checkpoint := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+
+	prior := mcTransition(model.LifecycleActive, &model.OperatorBriefing{Firing: 1, Total: 1})
+	prior.ActionContract = model.ActionContract{AlertINTStatus: &blocked, WaitReason: &parked}
+	tr := mcTransition(model.LifecycleActive, &model.OperatorBriefing{Firing: 1, Total: 1, Work: model.WorkProjection{StatusCheckpointAt: &checkpoint}})
+	tr.ActionContract = model.ActionContract{AlertINTStatus: &running}
+
+	c := hasCandidate(MaterialCandidates(&prior, tr), model.CandidateAbilityChanged)
+	if c == nil || c.Limitation == nil || !c.Limitation.Cleared || c.Limitation.Code != string(parked) {
+		t.Fatalf("a cleared limitation must keep the reported code: %+v", c)
+	}
+	if c.Next.Kind != model.NextStepStatusCheck || c.Next.At == nil || !c.Next.At.Equal(checkpoint) {
+		t.Fatalf("a cleared limitation must carry the actual next step: %+v", c.Next)
+	}
+}
+
+// R4: a block that stays blocked under a DIFFERENT recorded reason is a new
+// obstacle, not the already-communicated one — and an unchanged code stays
+// quiet.
+func TestMaterialCandidatesBlockedCodeChangeIsMaterial(t *testing.T) {
+	blocked := model.AlertINTStatusBlocked
+	parked, budget := model.WaitReason("assessment_parked"), model.WaitReason("llm_budget_exhausted")
+
+	prior := mcTransition(model.LifecycleActive, &model.OperatorBriefing{Firing: 1, Total: 1})
+	prior.ActionContract = model.ActionContract{AlertINTStatus: &blocked, WaitReason: &parked}
+	tr := mcTransition(model.LifecycleActive, &model.OperatorBriefing{Firing: 1, Total: 1})
+	tr.ActionContract = model.ActionContract{AlertINTStatus: &blocked, WaitReason: &budget}
+
+	c := hasCandidate(MaterialCandidates(&prior, tr), model.CandidateAbilityChanged)
+	if c == nil || c.Limitation == nil || c.Limitation.Cleared || c.Limitation.Code != string(budget) {
+		t.Fatalf("a changed blocked code must be a candidate naming the new obstacle: %+v", c)
+	}
+	if quiet := hasCandidate(MaterialCandidates(&prior, prior), model.CandidateAbilityChanged); quiet != nil {
+		t.Fatalf("an unchanged blocked code must stay quiet: %+v", quiet)
+	}
+}
+
+// R2 (lead review 2026-09-09): an attention increase or a changed scope with
+// the same member set is a material operator change (S4-06). Without it the
+// fact disappears at the replacement eligibility interface B5 adopts.
+func TestMaterialCandidatesScopeAndUrgencyAreMaterial(t *testing.T) {
+	newPair := func() (model.Transition, model.Transition) {
+		p := mcTransition(model.LifecycleActive, &model.OperatorBriefing{Scope: "checkout", Firing: 1, Total: 1})
+		c := mcTransition(model.LifecycleActive, &model.OperatorBriefing{Scope: "checkout", Firing: 1, Total: 1})
+		p.Attention, c.Attention = model.AttentionObserve, model.AttentionObserve
+		return p, c
+	}
+
+	p, c := newPair()
+	c.Attention = model.AttentionUrgent
+	got := hasCandidate(MaterialCandidates(&p, c), model.CandidateMembersChanged)
+	if got == nil || got.Members == nil || got.Members.Urgency != string(model.AttentionUrgent) || got.Members.PreviousUrgency != string(model.AttentionObserve) {
+		t.Fatalf("an attention increase must be a material candidate carrying both urgencies: %+v", got)
+	}
+
+	p, c = newPair()
+	c.Projection.Briefing.Scope = "checkout and payments"
+	got = hasCandidate(MaterialCandidates(&p, c), model.CandidateMembersChanged)
+	if got == nil || got.Members == nil || got.Members.Scope != "checkout and payments" || got.Members.PreviousScope != "checkout" {
+		t.Fatalf("a changed scope must be a material candidate carrying both scopes: %+v", got)
+	}
+
+	p, c = newPair()
+	c.Attention = model.AttentionObserve
+	if quiet := hasCandidate(MaterialCandidates(&p, c), model.CandidateMembersChanged); quiet != nil {
+		t.Fatalf("an unchanged scope and urgency must stay quiet: %+v", quiet)
+	}
+
+	p, c = newPair()
+	p.Attention = model.AttentionUrgent
+	if quiet := hasCandidate(MaterialCandidates(&p, c), model.CandidateMembersChanged); quiet != nil {
+		t.Fatalf("a de-escalation is not a positive material change: %+v", quiet)
+	}
+}
+
+// R3 (lead review 2026-09-09): the assurance count is the actual number of
+// frozen claim-time investigation inputs, never the length of the bounded
+// display name list and never Situation.Total.
+func TestMaterialCandidatesFirstExecutionCountsActualInputs(t *testing.T) {
+	var deliveries []Delivery
+	var frozen []string
+	for i := 0; i < 9; i++ {
+		id := fmt.Sprintf("alert-%02d", i)
+		deliveries = append(deliveries, Delivery{ID: id, AlertID: id, Labels: map[string]string{"alertname": id}})
+		frozen = append(frozen, id)
+	}
+	incidents := []IncidentState{{Triage: TriageState{ActiveAttempt: &TriageExecution{MemberDeliveryIDs: frozen}}}}
+	ids, names := investigatedAlertIdentities(incidents, deliveries)
+	if len(ids) != 9 {
+		t.Fatalf("identities are the count provenance and must not be display-truncated: %d", len(ids))
+	}
+	if len(names) != 8 {
+		t.Fatalf("display names stay bounded at eight: %d", len(names))
+	}
+
+	prior := mcTransition(model.LifecycleActive, &model.OperatorBriefing{Total: 12})
+	tr := mcTransition(model.LifecycleActive, &model.OperatorBriefing{Total: 12, Work: model.WorkProjection{
+		ExecutionStarted: true, InvestigatedAlertIDs: ids, InvestigatedNames: names,
+	}})
+	c := hasCandidate(MaterialCandidates(&prior, tr), model.CandidateFirstExecutionAssurance)
+	if c == nil || c.Members == nil || c.Members.FiringCount != 9 {
+		t.Fatalf("nine actual inputs must be reported as nine: %+v", c)
+	}
+
+	tr.Projection.Briefing.Work.InvestigatedCount = 40
+	tr.Projection.Briefing.Work.InvestigatedAlertIDs = ids
+	c = hasCandidate(MaterialCandidates(&prior, tr), model.CandidateFirstExecutionAssurance)
+	if c == nil || c.Members == nil || c.Members.FiringCount != 40 {
+		t.Fatalf("the recorded exact count outranks the bounded identity list: %+v", c)
+	}
+}
+
+// R1 (lead review 2026-09-09): an exhausted schedule's candidate must not
+// borrow an unrelated incident's accepted finding as evidence of what the
+// failed attempt actually checked.
+func TestMaterialCandidatesExhaustionDoesNotBorrowAnotherFinding(t *testing.T) {
+	prior := mcTransition(model.LifecycleActive, &model.OperatorBriefing{
+		Firing: 1, Total: 1, Work: model.WorkProjection{Phase: model.WorkPhaseExecuting, ExecutionStarted: true},
+		Analyses: []model.IncidentAnalysis{{IncidentID: "other", Summary: "Deployment explains checkout errors", Findings: []string{"Crashes followed deployment"}}},
+	})
+	tr := mcTransition(model.LifecycleActive, &model.OperatorBriefing{
+		Firing: 1, Total: 1, Work: model.WorkProjection{Phase: model.WorkPhaseExhausted, ExecutionStarted: true},
+		Analyses: []model.IncidentAnalysis{{IncidentID: "other", Summary: "Deployment explains checkout errors", Findings: []string{"Crashes followed deployment"}}},
+	})
+	c := hasCandidate(MaterialCandidates(&prior, tr), model.CandidateInconclusiveCompletion)
+	if c == nil {
+		t.Fatalf("expected an inconclusive_completion candidate on the exhaustion edge")
+	}
+	if c.Finding != nil {
+		t.Fatalf("the exhausted schedule is unidentified, so no finding may be attributed to it: %+v", c.Finding)
 	}
 }

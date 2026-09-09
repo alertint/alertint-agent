@@ -222,7 +222,7 @@ func committedOperatorBriefing(in SnapshotInput, commit ControllerCommit) *model
 	// the frozen claim-time member deliveries each Incident's current
 	// execution ran against, resolved to Alert identity/name — never
 	// Situation.Total (plan.md item 3).
-	b.Work.InvestigatedAlertIDs, b.Work.InvestigatedNames = investigatedAlertIdentities(in.Incidents, in.Deliveries)
+	b.Work.InvestigatedAlertIDs, b.Work.InvestigatedNames, b.Work.InvestigatedCount = investigatedAlertInputs(in.Incidents, in.Deliveries)
 	c := commit.Assessment.ActionContract
 	if commit.Lifecycle.Terminal() || c.AlertINTAction == nil || c.AlertINTStatus == nil || *c.AlertINTStatus != model.AlertINTStatusWaiting || c.WaitReason == nil {
 		return b
@@ -273,6 +273,27 @@ func earliestNonNil(a, b *time.Time) *time.Time {
 // (newBriefingAlert) — an unrecognized name still reports "Unnamed alert"
 // rather than an empty string.
 func investigatedAlertIdentities(incidents []IncidentState, deliveries []Delivery) (ids, names []string) {
+	ids, names, _ = investigatedAlertInputs(incidents, deliveries)
+	return ids, names
+}
+
+// investigatedIdentityLimit bounds the persisted identity list and
+// investigatedNameLimit the display names one reply lists. They are
+// deliberately different: the identities are provenance a later reader can
+// resolve, the names are what fits a Slack reply. Neither bound is ever the
+// investigation's input count — investigatedAlertInputs returns that
+// separately, counted before either is applied (R3 repair, lead review
+// 2026-09-09).
+const (
+	investigatedIdentityLimit = 64
+	investigatedNameLimit     = 8
+)
+
+// investigatedAlertInputs is investigatedAlertIdentities plus the exact
+// number of distinct frozen claim-time inputs that execution ran against,
+// so a reply can state the real count without a caller re-deriving the
+// union or mistaking a bounded list length for it.
+func investigatedAlertInputs(incidents []IncidentState, deliveries []Delivery) (ids, names []string, count int) {
 	byDeliveryID := make(map[string]Delivery, len(deliveries))
 	for _, d := range deliveries {
 		byDeliveryID[d.ID] = d
@@ -312,16 +333,30 @@ func investigatedAlertIdentities(incidents []IncidentState, deliveries []Deliver
 		}
 	}
 	sort.Strings(order)
-	if len(order) > 8 {
-		order = order[:8]
+	count = len(order)
+	ids = make([]string, 0, min(count, investigatedIdentityLimit))
+	names = make([]string, 0, min(count, investigatedNameLimit))
+	for i, id := range order {
+		if i < investigatedIdentityLimit {
+			ids = append(ids, id)
+		}
+		if i < investigatedNameLimit {
+			names = append(names, nameByID[id])
+		}
 	}
-	ids = make([]string, 0, len(order))
-	names = make([]string, 0, len(order))
-	for _, id := range order {
-		ids = append(ids, id)
-		names = append(names, nameByID[id])
+	return ids, names, count
+}
+
+// investigatedInputCount is the truthful number of investigation inputs a
+// reply may state: the exact recorded count when this projection carries one,
+// otherwise the identity list length — which is bounded, but is still
+// recorded identity rather than the eight-name display list. Never
+// Situation.Total, which counts current membership, not what executed.
+func investigatedInputCount(w model.WorkProjection) int {
+	if w.InvestigatedCount > 0 {
+		return w.InvestigatedCount
 	}
-	return ids, names
+	return len(w.InvestigatedAlertIDs)
 }
 
 func briefingWorkCounts(incidents []IncidentState) (failed, pending, unavailable int) {
@@ -519,6 +554,38 @@ func stillFiringNames(b *model.OperatorBriefing) []string {
 	return out
 }
 
+// membersChangedCandidate reports a material source change while the
+// Situation stays Active (S4-06): a moved member set, a changed recorded
+// scope, or a raised attention. Scope and urgency are carried explicitly
+// because either can change while every alert keeps firing — slide 4's
+// "scope-expanded" reply and an observe -> urgent escalation are real
+// operator-visible changes that had no candidate at all, so they vanished
+// once candidates became the eligibility source (R2 repair, lead review
+// 2026-09-09). Only a POSITIVE change qualifies: a de-escalation and an
+// unchanged scope stay quiet, and grouping still infers no common cause.
+func membersChangedCandidate(a, b *model.OperatorBriefing, priorAttention, attention model.Attention) (model.MaterialCandidate, bool) {
+	changed, cleared, firing := briefingAlertDelta(a, b)
+	scopeChanged := a != nil && a.Scope != b.Scope
+	urgencyIncreased := attentionRank(attention) > attentionRank(priorAttention)
+	if !changed && !scopeChanged && !urgencyIncreased {
+		return model.MaterialCandidate{}, false
+	}
+	facts := &model.MemberFacts{
+		Cleared:     cleared,
+		NowFiring:   firing,
+		StillFiring: stillFiringNames(b),
+		FiringCount: b.Firing,
+		Total:       b.Total,
+	}
+	if scopeChanged {
+		facts.PreviousScope, facts.Scope = a.Scope, b.Scope
+	}
+	if urgencyIncreased {
+		facts.PreviousUrgency, facts.Urgency = string(priorAttention), string(attention)
+	}
+	return model.MaterialCandidate{Kind: model.CandidateMembersChanged, Members: facts, Next: workNextStep(b)}, true
+}
+
 // findingCandidates emits one useful_finding candidate per member Incident
 // whose analysis structurally changed (S4-04) — the same predicate
 // usefulAnalysisChanged uses for the legacy reply gate, so the two paths
@@ -551,27 +618,59 @@ func inconclusiveCompletionCandidate(a, b *model.OperatorBriefing) (model.Materi
 	if a != nil && a.Work.Phase == model.WorkPhaseExhausted {
 		return model.MaterialCandidate{}, false
 	}
-	cand := model.MaterialCandidate{Kind: model.CandidateInconclusiveCompletion, Next: model.NextStepFacts{Kind: model.NextStepWorkEnded}}
-	if len(b.Analyses) > 0 {
-		cand.Finding = findingFactsOf(b.Analyses[0])
+	// No Finding facts: the aggregate disposition does not name WHICH
+	// member schedule exhausted, and another incident's accepted analysis is
+	// not evidence of what the failed attempt checked (R1 repair, lead
+	// review 2026-09-09). The checks/limitation content this reply should
+	// carry needs the per-incident completion provenance recorded as a lead
+	// prerequisite; inventing it here would be a fabricated result.
+	return model.MaterialCandidate{Kind: model.CandidateInconclusiveCompletion, Next: model.NextStepFacts{Kind: model.NextStepWorkEnded}}, true
+}
+
+// waitReasonCode is the recorded obstacle code a contract carries, or ""
+// when it names none — never a substitute code from elsewhere.
+func waitReasonCode(r *model.WaitReason) string {
+	if r == nil {
+		return ""
 	}
-	return cand, true
+	return string(*r)
 }
 
 // abilityChangedCandidate fires when the recorded investigation ability
-// newly blocks (operatorBlocked, or a fresh not-investigated count) or
-// newly clears — never a repeated, already-blocked cycle.
-func abilityChangedCandidate(a, b *model.OperatorBriefing, priorBlocked, blocked bool, waitReason *model.WaitReason) (model.MaterialCandidate, bool) {
-	unavailableIncreased := a != nil && b != nil && b.Unavailable > a.Unavailable
-	code := ""
-	if waitReason != nil {
-		code = string(*waitReason)
+// newly blocks, blocks under a DIFFERENT recorded reason, or newly clears —
+// never a repeated, unchanged blocked cycle.
+//
+// The code always identifies the limitation this candidate actually reports:
+// the newly recorded obstacle when blocking, and the obstacle that was
+// reported BEFORE when clearing it. Taking the current contract's WaitReason
+// while clearing produced an empty (or unrelated) code, which B5 §5 can never
+// match against CommunicatedLimitationCodes — the capability-restored reply
+// could not name the obstacle it was removing (R4 repair, lead review
+// 2026-09-09). Next carries the actual recorded next step, so a resumed
+// investigation states its real checkpoint instead of nothing.
+func abilityChangedCandidate(a, b *model.OperatorBriefing, prior, current model.ActionContract) (model.MaterialCandidate, bool) {
+	limitation := func(code string, cleared bool) (model.MaterialCandidate, bool) {
+		return model.MaterialCandidate{
+			Kind:       model.CandidateAbilityChanged,
+			Limitation: &model.LimitationFacts{Code: code, Cleared: cleared},
+			Next:       workNextStep(b),
+		}, true
 	}
+	priorBlocked, blocked := operatorBlocked(prior), operatorBlocked(current)
+	priorCode, code := waitReasonCode(prior.WaitReason), waitReasonCode(current.WaitReason)
 	switch {
-	case blocked && !priorBlocked, unavailableIncreased:
-		return model.MaterialCandidate{Kind: model.CandidateAbilityChanged, Limitation: &model.LimitationFacts{Code: code, Cleared: false}}, true
+	case blocked && !priorBlocked:
+		return limitation(code, false)
+	case blocked && priorBlocked && code != priorCode:
+		return limitation(code, false)
 	case priorBlocked && !blocked:
-		return model.MaterialCandidate{Kind: model.CandidateAbilityChanged, Limitation: &model.LimitationFacts{Code: code, Cleared: true}}, true
+		return limitation(priorCode, true)
+	case a != nil && b != nil && b.Unavailable > a.Unavailable:
+		// A member investigation became unavailable while the contract
+		// itself stayed unblocked: a real coverage limitation with no
+		// WaitReason of its own, so it carries its own stable code rather
+		// than borrowing an unrelated one.
+		return limitation(model.LimitationInvestigationUnavailable, false)
 	}
 	return model.MaterialCandidate{}, false
 }
@@ -635,12 +734,8 @@ func MaterialCandidates(prior *model.Transition, tr model.Transition) []model.Ma
 			Next:    workNextStep(b),
 		})
 	case tr.Lifecycle == model.LifecycleActive && priorLifecycle == model.LifecycleActive:
-		if changed, cleared, firing := briefingAlertDelta(a, b); changed {
-			out = append(out, model.MaterialCandidate{
-				Kind:    model.CandidateMembersChanged,
-				Members: &model.MemberFacts{Cleared: cleared, NowFiring: firing, StillFiring: stillFiringNames(b), FiringCount: b.Firing, Total: b.Total},
-				Next:    workNextStep(b),
-			})
+		if cand, ok := membersChangedCandidate(a, b, prior.Attention, tr.Attention); ok {
+			out = append(out, cand)
 		}
 	}
 
@@ -650,7 +745,7 @@ func MaterialCandidates(prior *model.Transition, tr model.Transition) []model.Ma
 		out = append(out, cand)
 	}
 
-	if cand, ok := abilityChangedCandidate(a, b, operatorBlocked(prior.ActionContract), operatorBlocked(tr.ActionContract), tr.ActionContract.WaitReason); ok {
+	if cand, ok := abilityChangedCandidate(a, b, prior.ActionContract, tr.ActionContract); ok {
 		out = append(out, cand)
 	}
 
@@ -659,9 +754,14 @@ func MaterialCandidates(prior *model.Transition, tr model.Transition) []model.Ma
 	}
 
 	if b.Work.ExecutionStarted && !priorExecutionStarted {
+		// FiringCount is the actual number of frozen investigation inputs,
+		// never the bounded display-name list length and never
+		// Situation.Total — slide 4's "investigating [recorded count] alerts"
+		// states a real count or none at all (R3 repair, lead review
+		// 2026-09-09).
 		out = append(out, model.MaterialCandidate{
 			Kind:    model.CandidateFirstExecutionAssurance,
-			Members: &model.MemberFacts{NowFiring: b.Work.InvestigatedNames, FiringCount: len(b.Work.InvestigatedNames), Total: b.Total},
+			Members: &model.MemberFacts{NowFiring: b.Work.InvestigatedNames, FiringCount: investigatedInputCount(b.Work), Total: b.Total},
 			Next:    workNextStep(b),
 		})
 	}

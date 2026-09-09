@@ -166,8 +166,19 @@ type WorkProjection struct {
 	// committedOperatorBriefing's investigatedAlertIdentities from
 	// TriageState.ActiveAttempt/LastExecution (R1 repair, lead review
 	// 2026-09-09).
+	// InvestigatedAlertIDs carries the identities themselves, bounded only
+	// by investigatedIdentityLimit, so it is count provenance rather than a
+	// display list; InvestigatedNames is separately truncated to the eight
+	// names a reply shows. Never read one as the other.
 	InvestigatedAlertIDs []string `json:"investigated_alert_ids,omitempty"`
 	InvestigatedNames    []string `json:"investigated_names,omitempty"`
+	// InvestigatedCount is the EXACT number of distinct frozen claim-time
+	// investigation inputs, counted before either bound above is applied —
+	// the only truthful number a reply may state as "investigating N alerts"
+	// (R3 repair, lead review 2026-09-09). Zero on transitions that predate
+	// this field (legacy replay), never a real "no inputs" count, which only
+	// occurs when ExecutionStarted is false.
+	InvestigatedCount int `json:"investigated_count,omitempty"`
 	// RemainingIncidents counts member Incidents whose Triage schedule
 	// still has outstanding automatic work (awaiting_decision, queued,
 	// executing, or retry_wait) — not the Situation's total member count.
@@ -298,6 +309,17 @@ type MemberFacts struct {
 	StillFiring []string `json:"still_firing,omitempty"`
 	FiringCount int      `json:"firing_count"`
 	Total       int      `json:"total"`
+	// PreviousScope/Scope and PreviousUrgency/Urgency carry a material
+	// scope or attention change that moved no member at all (R2 repair,
+	// lead review 2026-09-09: S4-06's "scope-expanded" reply must not
+	// vanish at B5's candidate-only eligibility interface just because the
+	// same alerts are still firing). Both sides of a pair are populated
+	// together, and only for a POSITIVE recorded change — an unchanged
+	// scope, or a de-escalation, leaves them empty.
+	PreviousScope   string `json:"previous_scope,omitempty"`
+	Scope           string `json:"scope,omitempty"`
+	PreviousUrgency string `json:"previous_urgency,omitempty"`
+	Urgency         string `json:"urgency,omitempty"`
 }
 
 // LimitationFacts names one recorded investigation-ability limitation code
@@ -307,6 +329,15 @@ type LimitationFacts struct {
 	Code    string `json:"code,omitempty"`
 	Cleared bool   `json:"cleared,omitempty"`
 }
+
+// LimitationInvestigationUnavailable is the stable code for the one recorded
+// limitation that has no WaitReason of its own: a member Incident's
+// investigation became unavailable (OperatorBriefing.Unavailable rose), so
+// the Situation's evidence coverage shrank without the contract itself
+// blocking. It is a LimitationFacts.Code so B5's CommunicatedLimitationCodes
+// can recognize and later clear it; borrowing an unrelated current WaitReason
+// here would report the wrong obstacle (R4 repair, lead review 2026-09-09).
+const LimitationInvestigationUnavailable = "investigation_unavailable"
 
 // ActionFacts distinguishes a recorded operator Action newly introduced,
 // revised, or withdrawn. A withdrawal only corrects an earlier DELIVERED
