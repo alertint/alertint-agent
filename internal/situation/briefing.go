@@ -5,6 +5,7 @@ package situation
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -307,6 +308,13 @@ const (
 // under-reported; an execution with no recorded member deliveries at all
 // (a pre-ledger claim that fell back to incident_alerts) is likewise
 // unknown, never a known zero.
+//
+// Completeness is judged per EXECUTION, not per resolved identity (R1
+// repair, lead review round 3, 2026-09-09): every member that actually ran
+// must have recorded the inputs it ran against, so one execution missing
+// that provenance makes the union incomplete even while another resolves
+// completely. The identities that DID resolve are still returned as partial
+// facts; only the exact numeric claim is withheld.
 func investigatedAlertInputs(incidents []IncidentState, deliveries []Delivery) (ids, names []string, count int, known bool) {
 	byDeliveryID := make(map[string]Delivery, len(deliveries))
 	for _, d := range deliveries {
@@ -315,20 +323,32 @@ func investigatedAlertInputs(incidents []IncidentState, deliveries []Delivery) (
 
 	order := make([]string, 0, len(incidents))
 	nameByID := make(map[string]string, len(incidents))
-	executed, unresolved := false, false
+	executed, incomplete := false, false
 	for _, inc := range incidents {
 		exec := inc.Triage.ActiveAttempt
 		if exec == nil {
 			exec = inc.Triage.LastExecution
 		}
 		if exec == nil {
+			// A member that counted attempts but carries no attempt-ledger
+			// row (a pre-ledger claim) ran against inputs this projection
+			// cannot name. A member that never ran contributes no inputs and
+			// is not a gap.
+			if inc.Triage.Attempts > 0 {
+				executed, incomplete = true, true
+			}
 			continue
 		}
 		executed = true
+		// An attempt row whose frozen member list is empty analyzed inputs
+		// it did not record: unknown, exactly as a lone such execution is.
+		if len(exec.MemberDeliveryIDs) == 0 {
+			incomplete = true
+		}
 		for _, deliveryID := range exec.MemberDeliveryIDs {
 			d, ok := byDeliveryID[deliveryID]
 			if !ok {
-				unresolved = true
+				incomplete = true
 				continue
 			}
 			id := d.AlertID
@@ -351,7 +371,7 @@ func investigatedAlertInputs(incidents []IncidentState, deliveries []Delivery) (
 	}
 	sort.Strings(order)
 	count = len(order)
-	known = executed && !unresolved && count > 0
+	known = executed && !incomplete && count > 0
 	ids = make([]string, 0, min(count, investigatedIdentityLimit))
 	names = make([]string, 0, min(count, investigatedNameLimit))
 	for i, id := range order {
@@ -655,10 +675,12 @@ func findingCandidates(a, b *model.OperatorBriefing) []model.MaterialCandidate {
 // accepted result whose evidence could not be matched to its own attempt
 // (unmatched evidence establishes neither a hypothesis nor its absence),
 // stale-input and owner-terminal outcomes (never promoted as an accepted
-// finding), a repeated reconciliation/reload of the same ended work, and any
-// prior transition whose ended work is unknown (legacy replay), where only
-// the aggregate exhaustion edge is reported and nothing is attributed to an
-// incident — never retrospective phantom completions.
+// finding), a re-run whose retained observations and unknowns repeat what
+// this Incident's evidence was already known to be (R2 repair, lead review
+// round 3, 2026-09-09), a repeated reconciliation/reload of the same ended
+// work, and any prior transition whose ended work is unknown (legacy
+// replay), where only the aggregate exhaustion edge is reported and nothing
+// is attributed to an incident — never retrospective phantom completions.
 func endedWorkCandidates(a, b *model.OperatorBriefing) []model.MaterialCandidate {
 	if b == nil {
 		return nil
@@ -677,7 +699,7 @@ func endedWorkCandidates(a, b *model.OperatorBriefing) []model.MaterialCandidate
 		}
 		outcome := o
 		outcome.Finding = nil
-		if cand, ok := endedWorkCandidate(b, o, &outcome); ok {
+		if cand, ok := endedWorkCandidate(a, b, o, &outcome); ok {
 			out = append(out, cand)
 		}
 	}
@@ -686,7 +708,7 @@ func endedWorkCandidates(a, b *model.OperatorBriefing) []model.MaterialCandidate
 
 // endedWorkCandidate classifies one newly ended, attempt-bearing outcome —
 // see endedWorkCandidates for the full rule set.
-func endedWorkCandidate(b *model.OperatorBriefing, o model.IncidentWorkOutcome, outcome *model.IncidentWorkOutcome) (model.MaterialCandidate, bool) {
+func endedWorkCandidate(a, b *model.OperatorBriefing, o model.IncidentWorkOutcome, outcome *model.IncidentWorkOutcome) (model.MaterialCandidate, bool) {
 	if o.Phase == model.WorkPhaseSettled {
 		if o.ResultCode != "success" || !o.EvidenceKnown || o.Finding == nil {
 			return model.MaterialCandidate{}, false
@@ -697,6 +719,16 @@ func endedWorkCandidate(b *model.OperatorBriefing, o model.IncidentWorkOutcome, 
 			// analysis overview; outside that bound it is reported here
 			// from its own matched evidence so it is not silently dropped.
 			if findAnalysis(b, o.IncidentID) != nil {
+				return model.MaterialCandidate{}, false
+			}
+			// The overview bound decides which PATH reports a useful
+			// result, never whether it is material: outside it the same
+			// structural rule applies against whatever this Incident's
+			// evidence was last known to be (R2 repair, lead review round 3,
+			// 2026-09-09). A fresh attempt id, a later completion time and a
+			// rephrased hypothesis over identical retained checks are a
+			// repeat of a reported result, not a new finding.
+			if !findingStructurallyChanged(priorKnownFinding(a, o.IncidentID), o.Finding) {
 				return model.MaterialCandidate{}, false
 			}
 			return model.MaterialCandidate{Kind: model.CandidateUsefulFinding, Finding: copyFindingFacts(o.Finding), Outcome: outcome, Next: workNextStep(b)}, true
@@ -720,6 +752,41 @@ func endedWorkCandidate(b *model.OperatorBriefing, o model.IncidentWorkOutcome, 
 		Outcome: outcome,
 		Next:    workNextStep(b),
 	}, true
+}
+
+// priorKnownFinding is the structured evidence the PRIOR transition already
+// committed for one Incident, wherever that transition carried it: its own
+// matched completion evidence when the prior ended work held it, otherwise
+// its entry in the prior analysis overview — so a result does not become
+// "new" merely by moving between the two paths. nil means nothing was known
+// about this Incident before, and any recorded result is genuinely new.
+func priorKnownFinding(a *model.OperatorBriefing, incidentID string) *model.FindingFacts {
+	if a == nil {
+		return nil
+	}
+	for _, o := range a.Work.EndedWork {
+		if o.IncidentID == incidentID && o.EvidenceKnown && o.Finding != nil {
+			return o.Finding
+		}
+	}
+	if an := findAnalysis(a, incidentID); an != nil {
+		return findingFactsOf(*an)
+	}
+	return nil
+}
+
+// findingStructurallyChanged applies analysisStructurallyChanged's rule to
+// the same structured facts in completion-evidence form: the retained
+// observations and the decision-relevant unknowns only. Hypothesis prose,
+// attempt identity and completion time are deliberately excluded — canonical
+// slide 4 row 577, "Neither paraphrasing nor an evidence enum change earns a
+// reply" (S3-04). An absent list and an empty one are the same fact, so a
+// persistence round trip is never a change.
+func findingStructurallyChanged(old, f *model.FindingFacts) bool {
+	if old == nil || f == nil {
+		return true
+	}
+	return !slices.Equal(old.Observations, f.Observations) || !slices.Equal(old.Unknowns, f.Unknowns)
 }
 
 // endedWorkKey is the stable identity two committed EndedWork records are

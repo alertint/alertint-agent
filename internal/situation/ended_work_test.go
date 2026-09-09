@@ -528,3 +528,167 @@ func TestFindingCandidatesRequireARecordedHypothesis(t *testing.T) {
 		t.Fatalf("an analysis title is not a causal hypothesis: useful=%v", useful)
 	}
 }
+
+// ----------------------------------------------------------------------
+// Lead round-3 review (2026-09-09).
+//
+// R1: decision B's complete-union rule is per EXECUTION, not per resolved
+// identity — one execution that recorded no frozen inputs makes the count
+// unknown even while another execution resolves completely.
+// R2: an accepted result outside the top-three overview must clear the same
+// structural materiality bar the overview applies (canonical slide 3 revised
+// node, slide 4 row 577: "Neither paraphrasing nor an evidence enum change
+// earns a reply"), independently of which path reports it.
+// ----------------------------------------------------------------------
+
+func TestInvestigatedAlertInputsMixedIncompleteExecutionIsUnknown(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		legacy IncidentState
+	}{
+		// A recorded attempt row whose frozen member list is empty: the
+		// pre-ledger fallback claim, which analyzed inputs this projection
+		// cannot name.
+		{"empty_ledger_inputs", IncidentState{ID: "legacy", Triage: TriageState{Attempts: 1, LastExecution: &TriageExecution{AttemptID: "legacy-attempt"}}}},
+		// A counted attempt with no ledger row at all.
+		{"counter_without_ledger", IncidentState{ID: "legacy", Triage: TriageState{Attempts: 1}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ds, frozen := ewDeliveries(9)
+			incidents := append(ewExecutedIncident(frozen), tc.legacy)
+			ids, _, count, known := investigatedAlertInputs(incidents, ds)
+			if known {
+				t.Fatalf("an execution with no frozen input provenance still claimed an exact count=%d", count)
+			}
+			// The identities the complete execution did resolve stay
+			// provenance a later reader can check: only the numeric claim goes.
+			if len(ids) != 9 {
+				t.Fatalf("resolved identities must survive as partial facts: %d", len(ids))
+			}
+			if got := investigatedInputCount(model.WorkProjection{InvestigatedCount: count, InvestigatedCountKnown: known}); got != 0 {
+				t.Fatalf("an incomplete union reported as exact %d", got)
+			}
+		})
+	}
+}
+
+func TestInvestigatedAlertInputsTwoCompleteExecutionsStayKnown(t *testing.T) {
+	ds, frozen := ewDeliveries(4)
+	incidents := make([]IncidentState, 0, 3)
+	incidents = append(incidents,
+		IncidentState{ID: "inc-a", Triage: TriageState{Attempts: 1, LastExecution: &TriageExecution{AttemptID: "a1", MemberDeliveryIDs: frozen[:2]}}},
+		IncidentState{ID: "inc-b", Triage: TriageState{Attempts: 2, LastExecution: &TriageExecution{AttemptID: "b1", MemberDeliveryIDs: frozen[2:]}}},
+	)
+	_, _, count, known := investigatedAlertInputs(incidents, ds)
+	if count != 4 || !known {
+		t.Fatalf("count=%d known=%v, want the complete four-input union", count, known)
+	}
+	// A member that never ran is not missing provenance: it contributes no
+	// inputs and leaves the union complete.
+	incidents = append(incidents, IncidentState{ID: "inc-c", Triage: TriageState{Phase: "ready"}})
+	if _, _, count, known = investigatedAlertInputs(incidents, ds); count != 4 || !known {
+		t.Fatalf("an unexecuted member made the union unknown: count=%d known=%v", count, known)
+	}
+}
+
+// ewOverview is a stable three-item analysis overview naming other
+// incidents, so the incident under test is outside the bound in both
+// transitions and nothing else in the projection changes.
+func ewOverview() []model.IncidentAnalysis {
+	return []model.IncidentAnalysis{
+		{IncidentID: "other1", Summary: "Other hypothesis 1"},
+		{IncidentID: "other2", Summary: "Other hypothesis 2"},
+		{IncidentID: "other3", Summary: "Other hypothesis 3"},
+	}
+}
+
+func TestEndedWorkOutsideOverviewWordingOnlyRepeatStaysQuiet(t *testing.T) {
+	now := ewNow(t)
+	a := ewBriefing(model.WorkPhaseSettled, ewSettledOutcome("outside", "attempt-1", "Deployment broke checkout", now))
+	b := ewBriefing(model.WorkPhaseSettled, ewSettledOutcome("outside", "attempt-2", "Checkout affected by the deployment", now.Add(time.Minute)))
+	a.Analyses, b.Analyses = ewOverview(), ewOverview()
+	prior := mcTransition(model.LifecycleActive, a)
+	cands := MaterialCandidates(&prior, mcTransition(model.LifecycleActive, b))
+	if c := hasCandidate(cands, model.CandidateUsefulFinding); c != nil {
+		t.Fatalf("a re-run that only rephrased the same retained checks is not a new finding: %+v", c.Finding)
+	}
+	if c := hasCandidate(cands, model.CandidateInconclusiveCompletion); c != nil {
+		t.Fatalf("an accepted result that recorded a cause is never inconclusive: %+v", c.Finding)
+	}
+}
+
+func TestEndedWorkOutsideOverviewChangedEvidenceIsStillReported(t *testing.T) {
+	now := ewNow(t)
+	for _, tc := range []struct {
+		name   string
+		mutate func(*model.IncidentWorkOutcome)
+	}{
+		{"new_observation", func(o *model.IncidentWorkOutcome) {
+			o.Finding.Observations = append(o.Finding.Observations, "Database saturation checked")
+		}},
+		{"unknown_resolved", func(o *model.IncidentWorkOutcome) { o.Finding.Unknowns = nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := ewBriefing(model.WorkPhaseSettled, ewSettledOutcome("outside", "attempt-1", "Deployment broke checkout", now))
+			current := ewSettledOutcome("outside", "attempt-2", "Deployment broke checkout", now.Add(time.Minute))
+			tc.mutate(&current)
+			b := ewBriefing(model.WorkPhaseSettled, current)
+			a.Analyses, b.Analyses = ewOverview(), ewOverview()
+			prior := mcTransition(model.LifecycleActive, a)
+			c := hasCandidate(MaterialCandidates(&prior, mcTransition(model.LifecycleActive, b)), model.CandidateUsefulFinding)
+			if c == nil || c.Outcome == nil || c.Outcome.AttemptID != "attempt-2" {
+				t.Fatalf("changed retained evidence outside the overview is a real finding: %+v", c)
+			}
+		})
+	}
+}
+
+func TestEndedWorkOutsideOverviewComparesAgainstThePriorOverview(t *testing.T) {
+	// The incident WAS in the prior overview with exactly these structured
+	// facts and has now fallen out of it. The result is not new merely
+	// because the comparison moved to the completion path.
+	now := ewNow(t)
+	outcome := ewSettledOutcome("outside", "attempt-1", "Deployment broke checkout", now)
+	a := ewBriefing(model.WorkPhaseExecuting)
+	a.Analyses = []model.IncidentAnalysis{{
+		IncidentID: "outside", Summary: "Deployment broke checkout",
+		Findings: append([]string(nil), outcome.Finding.Observations...), VerificationLimit: "metrics_source_unavailable",
+	}}
+	b := ewBriefing(model.WorkPhaseSettled, outcome)
+	b.Analyses = ewOverview()
+	prior := mcTransition(model.LifecycleActive, a)
+	cands := MaterialCandidates(&prior, mcTransition(model.LifecycleActive, b))
+	if c := ewUsefulFor(cands, "outside"); c != nil {
+		t.Fatalf("the same known result leaving the overview is not a new finding: %+v", c.Finding)
+	}
+	// The three analyses that newly entered the overview are still reported:
+	// this gate is per incident, not a blanket silence.
+	if ewUsefulFor(cands, "other1") == nil {
+		t.Fatalf("a genuinely new overview finding was suppressed: %v", candidateKinds(cands))
+	}
+}
+
+// ewUsefulFor returns the useful_finding candidate for one incident, or nil
+// when this cycle emitted none for it.
+func ewUsefulFor(cands []model.MaterialCandidate, incidentID string) *model.MaterialCandidate {
+	for i := range cands {
+		if cands[i].Kind == model.CandidateUsefulFinding && cands[i].Finding != nil && cands[i].Finding.IncidentID == incidentID {
+			return &cands[i]
+		}
+	}
+	return nil
+}
+
+func TestEndedWorkRepeatedWordingDoesNotSuppressADistinctInconclusiveCompletion(t *testing.T) {
+	// Materiality gates the useful-finding path only: a second accepted
+	// completion that recorded NO cause is its own event even when the
+	// retained checks are identical, because the operator was never told
+	// this attempt ended.
+	now := ewNow(t)
+	prior := mcTransition(model.LifecycleActive, ewBriefing(model.WorkPhaseSettled, ewSettledOutcome("inc-a", "a-1", "", now)))
+	tr := mcTransition(model.LifecycleActive, ewBriefing(model.WorkPhaseSettled, ewSettledOutcome("inc-a", "a-2", "", now.Add(time.Hour))))
+	c := hasCandidate(MaterialCandidates(&prior, tr), model.CandidateInconclusiveCompletion)
+	if c == nil || c.Outcome == nil || c.Outcome.AttemptID != "a-2" {
+		t.Fatalf("a distinct inconclusive completion identity must survive the materiality gate: %+v", c)
+	}
+}
