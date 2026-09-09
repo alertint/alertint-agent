@@ -271,10 +271,13 @@ func (d *SituationDeliverer) deliverThreadAppend(ctx context.Context, intent mod
 	return situation.NotificationDelivery{Channel: res.Channel, MessageTS: res.TS, DeliveredAs: "thread"}, nil
 }
 
-// selectedReply returns tr narrowed to the candidates the operator is
-// actually owed by THIS reply. ReplyEligible already made that decision at
-// plan time against the same durable history; re-reading it here, bounded
-// to replies below this Transition's own sequence, is what carries the
+// selectedReply reads this Situation's delivery history once, bounded to
+// replies below this Transition's own sequence, and returns the rendering
+// input that read produces: tr narrowed to the candidates the operator is
+// actually owed by THIS reply, plus the presentation fact below.
+//
+// ReplyEligible already made the narrowing decision at plan time against
+// the same durable history; re-reading it here is what carries the
 // decision through persistence, restart and both reply classes without a
 // second materiality judgement or a new persisted payload (B0 integration
 // contract §4/§5; lead review 2026-09-09, R1).
@@ -309,18 +312,38 @@ func (d *SituationDeliverer) deliverThreadAppend(ctx context.Context, intent mod
 // from this Transition's own contract whether it does (lead review round 4,
 // 2026-09-10, R1; slack.SituationReplyInput).
 //
+// That is why the read is unconditional and the SELECTION is not (lead
+// decisions 2026-09-10, §46/2). Every reply asks what the operator has
+// already been told — the canonical thread gate asks exactly that of every
+// reply, "Compare accepted information with what was already communicated"
+// — and only a reply that carries candidates has anything to narrow. A
+// recorded operator note or captured verdict carries this cycle's contract
+// verbatim and no candidate at all; gated on candidates, it skipped the
+// read and republished a superseded investigation with its old checkpoint.
+//
+// A read that fails leaves that question unanswered, and an unanswered
+// reply is not delivered: the attempt stops as a LOCAL retryable failure
+// with nothing sent, rather than posting the old contract on the strength
+// of a read that did not happen. The obligation survives for the retry.
+//
 // The durable Transition is never mutated: the delta is copied first.
 func (d *SituationDeliverer) selectedReply(ctx context.Context, intent model.NotificationIntent, tr model.Transition) (slack.SituationReplyInput, error) {
-	delta := tr.Projection.OperatorDelta
-	if delta == nil || len(delta.Candidates) == 0 || intent.SituationID == nil {
+	if intent.SituationID == nil {
+		// Both callers reject an intent with no Situation identity before
+		// reaching here; that validation stays theirs, and this guard only
+		// keeps the read from being attempted without one.
 		return slack.SituationReplyInput{Transition: tr}, nil
 	}
 	history, err := d.store.GetCommunicatedHistory(ctx, *intent.SituationID, tr.Sequence)
 	if err != nil {
-		return slack.SituationReplyInput{Transition: tr}, localDelivery("communicated_history_unavailable",
+		return slack.SituationReplyInput{}, localDelivery("communicated_history_unavailable",
 			fmt.Errorf("cmd/alertint: situation deliverer: load communicated history: %w", err))
 	}
 	reply := slack.SituationReplyInput{Transition: tr, ExecutionSuperseded: history.AssuranceSuperseded}
+	delta := tr.Projection.OperatorDelta
+	if delta == nil || len(delta.Candidates) == 0 {
+		return reply, nil
+	}
 	// A reply is only ever delivered under an existing root, so the
 	// initial-publication rule cannot apply here.
 	eligible := situation.ReplyEligible(delta.Candidates, history, true)

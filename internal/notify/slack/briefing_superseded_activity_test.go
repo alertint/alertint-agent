@@ -172,15 +172,42 @@ func TestReplyNonExecutionActivitySurvivesASupersededExecution(t *testing.T) {
 
 // R1/6, bound: a terminal reply states the end of monitoring from its own
 // lifecycle, never from a supersession boolean, and keeps saying so.
+//
+// The second shape reaches the lifecycle guard on its own: a terminal row
+// whose contract still records the triage as running is a valid Transition
+// (only its checkpoint must be gone), and its rendered line is the recorded
+// terminal outcome. Replacing that with the supersession sentence would
+// withdraw the one fact the operator most needs.
 func TestReplyTerminalActivitySurvivesASupersededExecution(t *testing.T) {
-	tr, _ := bsaMixedStart(t)
-	tr.Lifecycle = model.LifecycleRecovered
-	tr.ActionContract = model.ActionContract{NextActor: model.NextActorNone}
-	tr.JournalKind = model.JournalRecovered
-	for surface, text := range bsaSurfaces(t, SituationReplyInput{Transition: tr, ExecutionSuperseded: true}) {
-		if !strings.Contains(text, "monitoring for this episode has ended") {
-			t.Errorf("%s lost the terminal reply's own recorded end: %s", surface, text)
-		}
+	cleared, _ := bsaMixedStart(t)
+	cleared.Lifecycle = model.LifecycleRecovered
+	cleared.ActionContract = model.ActionContract{NextActor: model.NextActorNone}
+	cleared.JournalKind = model.JournalRecovered
+
+	staleContract, _ := bsaMixedStart(t)
+	staleContract.Lifecycle = model.LifecycleRecovered
+	staleContract.JournalKind = model.JournalRecovered
+	action := model.AlertINTActionRunAcuteTriage
+	status := model.AlertINTStatusRunning
+	staleContract.ActionContract = model.ActionContract{NextActor: model.NextActorAlertINT,
+		AlertINTAction: &action, AlertINTStatus: &status}
+
+	for name, tr := range map[string]model.Transition{
+		"cleared contract": cleared, "stale running contract": staleContract,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := tr.Validate(); err != nil {
+				t.Fatalf("fixture: %v", err)
+			}
+			for surface, text := range bsaSurfaces(t, SituationReplyInput{Transition: tr, ExecutionSuperseded: true}) {
+				if !strings.Contains(text, "monitoring for this episode has ended") {
+					t.Errorf("%s lost the terminal reply's own recorded end: %s", surface, text)
+				}
+				if strings.Contains(text, "superseded") {
+					t.Errorf("%s withdrew a terminal outcome on a supersession boolean: %s", surface, text)
+				}
+			}
+		})
 	}
 }
 

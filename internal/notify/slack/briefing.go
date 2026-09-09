@@ -3,7 +3,6 @@
 package slack
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 
@@ -376,11 +375,16 @@ func briefingFooter(s model.EpisodeSummary) string {
 // a useful finding can coexist with another investigation that is still
 // running (canonical "recovery-interrupted": "Use Investigating only if
 // actual aggregate work supports it"; "recovery-with-work": "Do not claim
-// investigation completion or invent a new work loop"). The current
-// picture lives where it is always kept current: the main message, which
-// is edited in place.
+// investigation completion or invent a new work loop").
+//
+// It says nothing about the root either. The main message is refreshed by
+// its own delivery, which the canonical thread gate keeps a separate
+// decision ("Root can refresh without a thread post") and which may be
+// queued, blocked or failed at this instant. Pointing the operator at it
+// as though it were already current would replace one unverified claim
+// with another (lead decisions 2026-09-10, §46/3).
 const supersededExecutionStep = "This update's recorded investigation status and checkpoint have been superseded; " +
-	"they are not current. The Situation's main message carries the current status."
+	"they are not current."
 
 // briefingExecutionClaimed reports whether this Transition's own recorded
 // contract asserts that the automatic investigation is still in flight —
@@ -430,54 +434,23 @@ type SituationReplyInput struct {
 	ExecutionSuperseded bool
 }
 
-// RenderSituationReply renders one earned reply. It is RenderSituationJournal
-// plus the presentation fact above, and with that fact absent the two are
-// the same rendering — RenderSituationJournal remains the entry point for
-// every caller that has no delivery-time answer to give.
+// RenderSituationReply renders one earned reply: situation.go's journal
+// assembly plus the presentation fact above, and nothing else. Validation,
+// the fallback text, the block shape, the staleness markers and the
+// recorded instant have exactly one implementation, so with that fact
+// absent the two entry points are byte-identical and cannot drift (lead
+// decisions 2026-09-10, §46/1).
+//
+// RenderSituationJournal remains the entry point for every caller with no
+// delivery-time answer to give.
 func RenderSituationReply(in SituationReplyInput) (RenderedMessage, error) {
-	t := in.Transition
-	if !in.ExecutionSuperseded || t.Projection.Briefing == nil || !briefingExecutionClaimed(t) {
-		return RenderSituationJournal(t)
-	}
-	if err := t.Validate(); err != nil {
-		return RenderedMessage{}, fmt.Errorf("slack: render situation reply: %w", err)
-	}
-	if t.JournalKind == model.JournalNone {
-		return RenderedMessage{}, errors.New("slack: render situation reply: transition carries no journal entry")
-	}
-	prefix := drillPrefix(t.Drill)
-	label, detail := briefingJournalPresented(t, true)
-	blocks := []slacklib.Block{sectionBlock(prefix + "*" + label + "*")}
-	if detail != "" {
-		blocks = append(blocks, briefingDetailBlocks(detail)...)
-	}
-	blocks = append(blocks, journalMarkerBlocks(t)...)
-	return RenderedMessage{Text: prefix + label + "\n" + detail, Blocks: blocks}, nil
-}
-
-// journalMarkerBlocks is the tail every reply ends with: the delivery-time
-// staleness markers RenderSituationJournal sets on its local copy, then the
-// entry's own recorded instant. It is the one piece of that renderer this
-// file restates, and
-// TestRenderSituationReplyChangesOnlyTheActivitySentence holds the two
-// together.
-func journalMarkerBlocks(t model.Transition) []slacklib.Block {
-	var markers []string
-	if t.Journal.NoLongerCurrent {
-		markers = append(markers, "no longer current")
-	}
-	if t.Journal.Delayed {
-		markers = append(markers, "delayed")
-	}
-	var blocks []slacklib.Block
-	if len(markers) > 0 {
-		blocks = append(blocks, contextBlock(":clock3: "+strings.Join(markers, " · ")))
-	}
-	return append(blocks, contextBlock(SlackDateToken(t.Journal.OccurredAt, "{date_short} {time}")))
+	return renderJournalEntry(in.Transition, in.ExecutionSuperseded)
 }
 
 // briefingJournal renders one reply from its Transition alone, exactly as
-// that Transition recorded itself.
+// that Transition recorded itself. Production reaches the body through
+// renderJournalEntry; this name survives for the renderer tests that read
+// the plain rendering directly.
 func briefingJournal(t model.Transition) (string, string) {
 	return briefingJournalPresented(t, false)
 }

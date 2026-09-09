@@ -396,7 +396,21 @@ func drillPlainPrefix(drill bool) string {
 // that a broadcast handoff is no longer current renders from a local copy
 // of t with those two fields set — the stored ledger row itself is never
 // mutated.
+//
+// It is this file's entry point for every caller with no delivery-time
+// answer to give. RenderSituationReply is the same rendering plus one
+// presentation fact; both run the assembly below, so validation, fallback
+// text, block shape, staleness markers and the recorded instant have one
+// implementation and cannot drift apart.
 func RenderSituationJournal(t model.Transition) (RenderedMessage, error) {
+	return renderJournalEntry(t, false)
+}
+
+// renderJournalEntry is that one assembly. executionSuperseded is the
+// delivery-time presentation fact documented on SituationReplyInput: it
+// reaches exactly one sentence of the briefing body (see
+// briefingJournalPresented) and changes nothing else here.
+func renderJournalEntry(t model.Transition, executionSuperseded bool) (RenderedMessage, error) {
 	if err := t.Validate(); err != nil {
 		return RenderedMessage{}, fmt.Errorf("slack: render situation journal: %w", err)
 	}
@@ -408,7 +422,7 @@ func RenderSituationJournal(t model.Transition) (RenderedMessage, error) {
 	label, detail := t.Journal.Headline, t.Journal.Detail
 	fallback := prefix + label
 	if t.Projection.Briefing != nil {
-		label, detail = briefingJournal(t)
+		label, detail = briefingJournalPresented(t, executionSuperseded)
 		fallback = prefix + label + "\n" + detail
 	}
 	headline := prefix + "*" + label + "*"
