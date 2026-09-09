@@ -18,14 +18,21 @@ func briefingNextStep(t model.Transition, b *model.OperatorBriefing, deadline *t
 		return "Recovery confirmed after the observation period; monitoring for this episode has ended."
 	}
 	if t.Lifecycle == model.LifecycleClosedUnknown {
-		return "Stopped without confirming recovery; further automatic progress is unavailable."
+		return "Recovery could not be confirmed; tracking for this Situation has ended. No automatic retry or resumption is scheduled."
 	}
 	step := briefingWork(t.ActionContract, b, now)
 	if deadline == nil {
 		deadline = t.ActionContract.NextUpdateAt
 	}
 	if deadline != nil {
-		step += " Next status check: " + RenderDeadline(*deadline, now)
+		// S4-08: this is a status checkpoint, never a reply promise — a check
+		// may happen quietly, with no guaranteed reply. RenderDeadline's
+		// "update by"/"update overdue" wording is reserved for an actual
+		// enforceable notification commitment (the legacy root's own
+		// ContractDeadlineAt line, contractAndDeadlineBlock); using it here
+		// would claim a promise nothing in this minimal implementation
+		// enforces.
+		step += " Next status check: " + SlackDateToken(*deadline, "{time}") + "."
 	} else {
 		step += " Next status check is not scheduled."
 	}

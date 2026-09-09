@@ -59,21 +59,12 @@ type RenderedMessage struct {
 //
 // RecoveryEverObserved answers a question the source Transition alone
 // cannot always answer: whether a recovery_pending Transition occurred
-// anywhere earlier in this Situation's Transition ledger. It changes the
-// rendered chain only when SourceTransition is itself a closed_unknown
-// Transition reached directly from `active` with no recovery observation
-// of its OWN (Projection.RecoveryObservedAt nil) — a refire clears that
-// field on every Transition after it (internal/situation/controller.go's
-// resolveLifecycle, EventRefired branch), so a closed_unknown that follows
-// a refire cannot see the earlier recovery_pending phase through the
-// source Transition alone. DeriveOrientation's own doc comment names this
-// gap: "whether a closed_unknown chain includes Monitoring at all...
-// additionally needs the Situation's Transition history, which the Slack
-// renderer reads." Every other orientation decides the chain from
-// SourceTransition alone, so a caller may safely pass false when it has
-// not needed to scan the ledger (e.g. SourceTransition.Projection.
-// RecoveryObservedAt is already non-nil, or the Transition is not a
-// closed_unknown at all).
+// anywhere earlier in this Situation's Transition ledger. Earlier revisions
+// of the rendered phase chain hid Monitoring from a closed_unknown chain
+// unless this was true; the canonical revised slide 4 chain (S4-01) always
+// previews the full fixed roadmap regardless of history, so this field is
+// no longer read by rendering — kept only so cmd/alertint's existing caller
+// (outside this package's allowlist) keeps compiling unchanged.
 type SituationRootInput struct {
 	Summary              model.EpisodeSummary
 	SourceTransition     model.Transition
@@ -94,12 +85,11 @@ func RenderSituationRoot(in SituationRootInput) (RenderedMessage, error) {
 	}
 
 	orientation := situation.DeriveOrientation(in.Summary, in.SourceTransition)
-	recoveryEverObserved := in.RecoveryEverObserved || in.SourceTransition.Projection.RecoveryObservedAt != nil
 	terminal := in.SourceTransition.Lifecycle.Terminal()
 
 	blocks := []slacklib.Block{
 		headerBlock(in.Summary, in.SourceTransition.Drill),
-		orientationBlock(orientation, recoveryEverObserved),
+		orientationBlock(orientation),
 	}
 
 	if terminal {
@@ -156,31 +146,34 @@ func headerBlock(s model.EpisodeSummary, drill bool) slacklib.Block {
 	return sectionBlock(drillPrefix(drill) + "*" + s.Title + "*")
 }
 
-func orientationBlock(o situation.Orientation, recoveryEverObserved bool) slacklib.Block {
-	return contextBlock(renderOrientationChain(o, recoveryEverObserved))
+func orientationBlock(o situation.Orientation) slacklib.Block {
+	return contextBlock(renderOrientationChain(o))
 }
 
-// renderOrientationChain renders the compact phase chain with exactly one
-// current phase emphasized (spec.md "Root and journal rendering"). The
-// nonterminal chains always preview the full roadmap — Monitoring and the
-// generic "Outcome" placeholder included — since an active Situation has
-// not yet learned whether it will ever be observed recovering. A terminal
-// chain instead reports what actually happened: Recovered always implies
-// Monitoring (AdvanceLifecycle only reaches `recovered` from
-// `recovery_pending`); closed_unknown includes Monitoring only when
-// recoveryEverObserved says the episode passed through it.
-func renderOrientationChain(o situation.Orientation, recoveryEverObserved bool) string {
+// phaseTrackingEnded is the canonical closed_unknown terminal phase name
+// (S4-01/S1-04): "tracking ended", never "Closed uncertain" — recovery was
+// never confirmed, but AlertINT itself stopped, and the chain must say so
+// in the same words the rest of the closed_unknown copy uses.
+const phaseTrackingEnded = "Tracking ended · recovery unconfirmed"
+
+// renderOrientationChain renders the fixed compact roadmap with exactly one
+// current position marked (canonical slide 4, S4-01: "Separators replace
+// arrows... Observed / Investigating / Monitoring / Confirming recovery /
+// actual terminal outcome"). Unlike the earlier arrow chain, this fixed
+// five-slot roadmap never conditionally omits a position from history: only
+// the marked position's own text and the terminal slot's actual outcome
+// name change — an operator reads the same static shape every time, "▸"
+// naming only the current position, never a completed-step or "now" claim.
+func renderOrientationChain(o situation.Orientation) string {
 	const (
-		phaseObserved      = "Observed"
-		phaseInvestigating = "Investigating"
-		phaseMonitoring    = "Monitoring"
-		phasePlaceholder   = "Outcome"
+		phaseObserved           = "Observed"
+		phaseInvestigating      = "Investigating"
+		phaseMonitoring         = "Monitoring"
+		phaseConfirmingRecovery = "Confirming recovery"
+		phasePlaceholder        = "Outcome"
 	)
 
-	outcome := phasePlaceholder
 	var bold string
-	showMonitoring := true
-
 	switch o {
 	case situation.OrientationObserved:
 		bold = phaseObserved
@@ -188,32 +181,31 @@ func renderOrientationChain(o situation.Orientation, recoveryEverObserved bool) 
 		bold = phaseInvestigating
 	case situation.OrientationMonitoring:
 		bold = phaseMonitoring
+	case situation.OrientationConfirmingRecovery:
+		bold = phaseConfirmingRecovery
 	case situation.OrientationRecovered:
-		outcome = "Recovered"
-		bold = outcome
+		bold = "Recovered"
 	case situation.OrientationClosedUncertain:
-		outcome = "Closed uncertain"
-		bold = outcome
-		showMonitoring = recoveryEverObserved
+		bold = phaseTrackingEnded
 	default:
 		bold = phaseObserved
 	}
 
-	phases := []string{phaseObserved, phaseInvestigating}
-	if showMonitoring {
-		phases = append(phases, phaseMonitoring)
+	outcome := phasePlaceholder
+	if bold == "Recovered" || bold == phaseTrackingEnded {
+		outcome = bold
 	}
-	phases = append(phases, outcome)
 
+	phases := []string{phaseObserved, phaseInvestigating, phaseMonitoring, phaseConfirmingRecovery, outcome}
 	rendered := make([]string, len(phases))
 	for i, p := range phases {
 		if p == bold {
-			rendered[i] = "*" + p + "*"
+			rendered[i] = "*▸ " + p + "*"
 		} else {
 			rendered[i] = p
 		}
 	}
-	return strings.Join(rendered, " → ")
+	return strings.Join(rendered, " · ")
 }
 
 // contractAndDeadlineBlock renders who acts next and what happens next and
@@ -573,6 +565,9 @@ func reasonLabel(reason string) string {
 // is running Acute Triage" or "Watching for sustained recovery." Monitoring
 // includes watching still-firing alerts; it does not itself imply clearance.
 func contractLine(o situation.Orientation, c model.ActionContract) string {
+	if o == situation.OrientationConfirmingRecovery {
+		return "Watching for sustained recovery"
+	}
 	if o == situation.OrientationMonitoring {
 		if c.AlertINTAction != nil && *c.AlertINTAction == model.AlertINTActionMonitorSituation {
 			return "Monitoring alert changes"

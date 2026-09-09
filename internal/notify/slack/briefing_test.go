@@ -232,7 +232,7 @@ func TestBriefingStoredAnalysisFlowsThroughControllerAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Likely cause", "Deployment may explain checkout errors", "Finding at", "resolved", "*Recovered*"} {
+	for _, want := range []string{"Likely cause", "Deployment may explain checkout errors", "Finding at", "resolved", "*▸ Recovered*"} {
 		if !strings.Contains(root.Text, want) {
 			t.Errorf("terminal root lost %q: %s", want, root.Text)
 		}
@@ -291,8 +291,8 @@ func TestBriefingRootBoundsEscapingPhaseAndPlainCommand(t *testing.T) {
 	if strings.Contains(txt, "<!channel>") || strings.Contains(txt, "<@U123>") || strings.Contains(txt, "*problem*") {
 		t.Fatalf("untrusted markup escaped containment: %s", txt)
 	}
-	if !strings.Contains(txt, "Observed → *Investigating* → Monitoring → Outcome") {
-		t.Fatalf("phase must be bold only: %s", txt)
+	if !strings.Contains(txt, "Observed · *▸ Investigating* · Monitoring · Confirming recovery · Outcome") {
+		t.Fatalf("phase must be marked only: %s", txt)
 	}
 	command := "get situation checkout-42 using alertint"
 	for _, body := range []string{txt, msg.Text} {

@@ -404,3 +404,78 @@ func TestBriefingInconclusiveStatesRetainedLimitWhenEvidenceUnknown(t *testing.T
 		t.Errorf("unknown evidence must not be described as examined evidence: %s", line)
 	}
 }
+
+// S4-08 (canonical slide 4, "Two different time promises"): a status
+// checkpoint may happen quietly and is never a reply promise. "Update
+// by"/"update overdue" wording is reserved for an actual enforceable
+// notification commitment; nothing in this minimal renderer enforces one
+// for the compact overview or its replies, so that vocabulary must never
+// appear on the "Next status check:" line.
+func TestBriefingNextStepStatusCheckIsNeverAPromise(t *testing.T) {
+	in := briefingRootFixture(t, `{"briefing":{"scope":"checkout","firing":1,"total":1}}`)
+	root, err := RenderSituationRoot(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(root.Text, "Next status check:") {
+		t.Fatalf("root lost the status checkpoint: %s", root.Text)
+	}
+	for _, bad := range []string{"update by", "update overdue"} {
+		if strings.Contains(root.Text, bad) {
+			t.Fatalf("root status checkpoint must never use promise wording %q: %s", bad, root.Text)
+		}
+	}
+
+	tr := in.SourceTransition
+	tr.Projection.Briefing = in.Summary.Briefing
+	journal, err := RenderSituationJournal(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(journal.Text, "Next status check:") {
+		t.Fatalf("reply lost the status checkpoint: %s", journal.Text)
+	}
+	for _, bad := range []string{"update by", "update overdue"} {
+		if strings.Contains(journal.Text, bad) {
+			t.Fatalf("reply status checkpoint must never use promise wording %q: %s", bad, journal.Text)
+		}
+	}
+}
+
+// S1-04/S4-11: a closed_unknown outcome alone is not a concrete concern.
+// Requesting an MCP/human-health check unconditionally for every
+// closed_unknown invents a generic request the canonical slide explicitly
+// forbids ("no generic MCP/human-health request without concrete concern").
+// Only a recorded OperatorActionRequired earns one; the terminal line must
+// say tracking ended, never an ambiguous "stopped".
+func TestBriefingActionAndNextStepClosedUnknownWithoutConcreteConcern(t *testing.T) {
+	in := briefingRootFixture(t, `{"briefing":{"scope":"checkout","firing":0,"total":1,"resolved":1}}`)
+	tr := in.SourceTransition
+	tr.Lifecycle = model.LifecycleClosedUnknown
+	tr.ActionContract.OperatorActionRequired = nil
+	tr.ActionContract.AlertINTStatus = nil
+	tr.ActionContract.NextUpdateAt = nil
+
+	action := briefingAction(in.Summary.Briefing, tr)
+	if strings.Contains(action, "check current service health") || strings.Contains(action, "via MCP") {
+		t.Errorf("closed_unknown without a recorded action must not invent an MCP/health request: %s", action)
+	}
+	if !strings.Contains(strings.ToLower(action), "on-call") {
+		t.Errorf("action has no audience: %s", action)
+	}
+
+	step := briefingNextStep(tr, in.Summary.Briefing, nil, in.Now)
+	for _, want := range []string{"Recovery could not be confirmed", "tracking for this Situation has ended"} {
+		if !strings.Contains(step, want) {
+			t.Errorf("closed_unknown next step lost %q: %s", want, step)
+		}
+	}
+
+	// A concrete recorded action still earns the MCP request.
+	concreteAction := model.OperatorActionInvestigateSituation
+	tr.ActionContract.OperatorActionRequired = &concreteAction
+	action = briefingAction(in.Summary.Briefing, tr)
+	if !strings.Contains(action, "via MCP") {
+		t.Errorf("a recorded concrete action must still earn an MCP request: %s", action)
+	}
+}

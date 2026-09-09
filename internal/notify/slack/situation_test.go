@@ -156,8 +156,11 @@ func rsFallbackBlocksText(msg RenderedMessage) string {
 	return b.String()
 }
 
+// rsCountBold counts occurrences of the orientation chain's one marked
+// current position (S4-01: "*▸ <phase>*" — a neutral ▸ prefix inside the
+// bold, never a bare "*<phase>*").
 func rsCountBold(s, phase string) int {
-	return strings.Count(s, "*"+phase+"*")
+	return strings.Count(s, "*▸ "+phase+"*")
 }
 
 // ----------------------------------------------------------------------
@@ -230,10 +233,11 @@ func TestRenderSituationRootFirstAndUpdated(t *testing.T) {
 			if rsCountBold(text, c.wantBoldPhase) != 1 {
 				t.Fatalf("orientation chain = %q, want exactly one bold phase %q", text, c.wantBoldPhase)
 			}
-			// Exactly one bolded phase overall (no other phase word wrapped
-			// in "*...*").
-			totalBoldMarkers := strings.Count(text, "*Observed*") + strings.Count(text, "*Investigating*") +
-				strings.Count(text, "*Monitoring*") + strings.Count(text, "*Recovered*") + strings.Count(text, "*Closed uncertain*")
+			// Exactly one marked phase overall (no other phase word wrapped
+			// in "*▸ ...*").
+			totalBoldMarkers := rsCountBold(text, "Observed") + rsCountBold(text, "Investigating") +
+				rsCountBold(text, "Monitoring") + rsCountBold(text, "Confirming recovery") +
+				rsCountBold(text, "Recovered") + rsCountBold(text, phaseTrackingEnded)
 			if totalBoldMarkers != 1 {
 				t.Fatalf("expected exactly one bolded orientation phase, got %d in %q", totalBoldMarkers, text)
 			}
@@ -383,7 +387,12 @@ func TestRenderSituationRootValidatesCoherence(t *testing.T) {
 // Monitoring / recovered / closed-uncertain orientation coverage.
 // ----------------------------------------------------------------------
 
-func TestRenderSituationRootMonitoringOrientation(t *testing.T) {
+// S4-01: recovery_pending is its own "Confirming recovery" position in the
+// fixed roadmap, distinct from Monitoring — never the old Monitoring
+// expectation this test used before the canonical revision (B4 handoff:
+// "fix it against the canonical Confirming recovery requirement, not by
+// restoring the old Monitoring expectation").
+func TestRenderSituationRootConfirmingRecoveryOrientation(t *testing.T) {
 	started := rsMustTime(t, "2026-09-05T09:00:00Z")
 	now := rsMustTime(t, "2026-09-05T10:00:00Z")
 	graceUntil := now.Add(10 * time.Minute)
@@ -406,11 +415,14 @@ func TestRenderSituationRootMonitoringOrientation(t *testing.T) {
 		t.Fatalf("RenderSituationRoot() error = %v", err)
 	}
 	text := rsFallbackBlocksText(got)
-	if rsCountBold(text, "Monitoring") != 1 {
-		t.Fatalf("body = %q, want Monitoring bolded", text)
+	if rsCountBold(text, "Confirming recovery") != 1 {
+		t.Fatalf("body = %q, want Confirming recovery bolded", text)
+	}
+	if rsCountBold(text, "Monitoring") != 0 {
+		t.Fatalf("body = %q, Monitoring must not be bolded for recovery_pending", text)
 	}
 	if !strings.Contains(text, "Watching for sustained recovery") {
-		t.Fatalf("body = %q, want the fixed Monitoring contract phrase", text)
+		t.Fatalf("body = %q, want the confirming-recovery contract phrase", text)
 	}
 }
 
@@ -441,8 +453,8 @@ func TestRenderSituationRootRecoveredAlwaysIncludesMonitoring(t *testing.T) {
 		t.Fatalf("RenderSituationRoot() error = %v", err)
 	}
 	text := rsFallbackBlocksText(got)
-	if !strings.Contains(text, "Observed → Investigating → Monitoring → *Recovered*") {
-		t.Fatalf("chain = %q, recovered must always show Monitoring with exactly Recovered bolded", text)
+	if !strings.Contains(text, "Observed · Investigating · Monitoring · Confirming recovery · *▸ Recovered*") {
+		t.Fatalf("chain = %q, recovered must always show the full fixed roadmap with exactly Recovered marked", text)
 	}
 	if !strings.Contains(text, "without recorded operator intervention") {
 		t.Fatalf("body = %q, want the exact no-recorded-operator-intervention phrase", text)
@@ -455,7 +467,13 @@ func TestRenderSituationRootRecoveredAlwaysIncludesMonitoring(t *testing.T) {
 	}
 }
 
-func TestRenderSituationRootClosedUncertainMonitoringVisibility(t *testing.T) {
+// S4-01: the canonical revised chain is a fixed five-slot roadmap that never
+// conditionally omits a position from ledger history — unlike the earlier
+// arrow chain this test originally pinned (recoveryEverObserved/
+// RecoveryObservedAt no longer change which positions appear, only the
+// terminal slot's own name). This regression guards against reintroducing
+// that conditional omission.
+func TestRenderSituationRootClosedUncertainAlwaysShowsFullRoadmap(t *testing.T) {
 	started := rsMustTime(t, "2026-09-05T09:00:00Z")
 	terminalAt := rsMustTime(t, "2026-09-06T09:00:00Z")
 	now := terminalAt
@@ -464,23 +482,11 @@ func TestRenderSituationRootClosedUncertainMonitoringVisibility(t *testing.T) {
 	cases := []struct {
 		name                 string
 		recoveryObservedAt   *time.Time // on the closing Transition's OWN projection
-		recoveryEverObserved bool       // caller-supplied ledger-scan fact
-		wantMonitoring       bool
+		recoveryEverObserved bool       // caller-supplied ledger-scan fact; must not affect the chain
 	}{
-		{
-			name:           "never recovery-pending anywhere in the episode",
-			wantMonitoring: false,
-		},
-		{
-			name:               "closing directly out of recovery_pending",
-			recoveryObservedAt: rsTimePtr(started.Add(time.Hour)),
-			wantMonitoring:     true,
-		},
-		{
-			name:                 "refired earlier, closed later from active (ledger scan says yes)",
-			recoveryEverObserved: true,
-			wantMonitoring:       true,
-		},
+		{name: "never recovery-pending anywhere in the episode"},
+		{name: "closing directly out of recovery_pending", recoveryObservedAt: rsTimePtr(started.Add(time.Hour))},
+		{name: "refired earlier, closed later from active (ledger scan says yes)", recoveryEverObserved: true},
 	}
 
 	for _, c := range cases {
@@ -507,12 +513,11 @@ func TestRenderSituationRootClosedUncertainMonitoringVisibility(t *testing.T) {
 				t.Fatalf("RenderSituationRoot() error = %v", err)
 			}
 			text := rsFallbackBlocksText(got)
-			hasMonitoring := strings.Contains(text, "Monitoring")
-			if hasMonitoring != c.wantMonitoring {
-				t.Fatalf("chain = %q, Monitoring present = %v, want %v", text, hasMonitoring, c.wantMonitoring)
+			if !strings.Contains(text, "Observed · Investigating · Monitoring · Confirming recovery · *▸ "+phaseTrackingEnded+"*") {
+				t.Fatalf("chain = %q, want the full fixed roadmap with the terminal slot marked", text)
 			}
-			if rsCountBold(text, "Closed uncertain") != 1 {
-				t.Fatalf("chain = %q, want exactly one bolded Closed uncertain", text)
+			if rsCountBold(text, phaseTrackingEnded) != 1 {
+				t.Fatalf("chain = %q, want exactly one marked %s", text, phaseTrackingEnded)
 			}
 			if !strings.Contains(text, "reporting observed symptoms and checks only") {
 				t.Fatalf("body = %q, unknown causality must stay observed symptoms, never a root cause", text)

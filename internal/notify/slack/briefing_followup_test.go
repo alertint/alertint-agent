@@ -21,7 +21,7 @@ func TestBriefingFollowupPhaseMatchesCurrentWork(t *testing.T) {
 	for _, started := range []bool{true, false} {
 		in.Summary.InvestigationStarted = started
 		msg := renderBriefingRoot(in)
-		if !strings.Contains(msg.Text, "→ *Monitoring* →") || !strings.Contains(msg.Text, "Monitoring alert changes.") || strings.Contains(msg.Text, "*Investigating*") {
+		if !strings.Contains(msg.Text, "· *▸ Monitoring* ·") || !strings.Contains(msg.Text, "Monitoring alert changes.") || strings.Contains(msg.Text, "*▸ Investigating*") {
 			t.Errorf("phase and current work disagree (started=%v): %s", started, msg.Text)
 		}
 	}
@@ -29,7 +29,7 @@ func TestBriefingFollowupPhaseMatchesCurrentWork(t *testing.T) {
 	status := model.AlertINTStatusRunning
 	in.SourceTransition.ActionContract.AlertINTStatus = &status
 	msg := renderBriefingRoot(in)
-	if !strings.Contains(msg.Text, "*Investigating*") || !strings.Contains(msg.Text, "*AlertINT:* Investigating.") {
+	if !strings.Contains(msg.Text, "*▸ Investigating*") || !strings.Contains(msg.Text, "*AlertINT:* Investigating.") {
 		t.Errorf("renewed investigation not reflected: %s", msg.Text)
 	}
 }
@@ -45,7 +45,7 @@ func TestBriefingFollowupLegacyMonitoringDoesNotInventRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := rsFallbackBlocksText(msg)
-	if !strings.Contains(text, "*Monitoring*") || !strings.Contains(text, "Monitoring alert changes") || strings.Contains(text, "Watching for sustained recovery") {
+	if !strings.Contains(text, "*▸ Monitoring*") || !strings.Contains(text, "Monitoring alert changes") || strings.Contains(text, "Watching for sustained recovery") {
 		t.Errorf("active legacy monitoring invents recovery: %s", text)
 	}
 }

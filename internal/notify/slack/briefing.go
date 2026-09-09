@@ -248,8 +248,16 @@ func briefingVerificationLimit(reason string) string {
 
 func briefingAction(b *model.OperatorBriefing, t model.Transition) string {
 	scope := briefingScope(b)
-	if t.Lifecycle == model.LifecycleClosedUnknown || t.ActionContract.OperatorActionRequired != nil || operatorWorkBlocked(t.ActionContract) {
+	if t.ActionContract.OperatorActionRequired != nil || operatorWorkBlocked(t.ActionContract) {
 		return "On-call: investigate " + scope + " via MCP and check current service health."
+	}
+	// S1-04/S4-11: a closed_unknown outcome alone is not a concrete concern —
+	// requesting an MCP health check here regardless of the recorded contract
+	// invents a generic human-health request the canonical slide explicitly
+	// forbids ("no generic MCP/human-health request without concrete
+	// concern"). Only a recorded OperatorActionRequired above earns one.
+	if t.Lifecycle == model.LifecycleClosedUnknown {
+		return "None required from on-call; recovery could not be confirmed."
 	}
 	if t.Attention != model.AttentionObserve || b.Critical > 0 || b.Unknown > 0 {
 		return "On-call: check current service health for " + scope + " now."
@@ -273,7 +281,7 @@ func renderBriefingRoot(in SituationRootInput) RenderedMessage {
 	orientation := situation.DeriveOrientation(in.Summary, t)
 	marker, label := briefingStatus(t)
 	title := drillPrefix(t.Drill) + marker + " *" + label + " · " + briefingTitleContext(b) + "*"
-	phase := renderOrientationChain(orientation, in.RecoveryEverObserved || t.Projection.RecoveryObservedAt != nil)
+	phase := renderOrientationChain(orientation)
 	status := briefingState(b) + " · " + briefingImpact(t)
 	if b.Critical > 0 {
 		status += fmt.Sprintf(" · %d active critical alert(s)", b.Critical)
