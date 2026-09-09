@@ -293,7 +293,7 @@ func TestCommittedBriefingInputDoesNotKeepAnOldRequestReasonUnderANewSkip(t *tes
 func TestCommittedOperatorBriefingProjectsAssessmentRetryEvenWithoutTriageBackoff(t *testing.T) {
 	due := wpNow(t).Add(time.Minute)
 	commit := ControllerCommit{Lifecycle: model.LifecycleActive, RetryAt: &due}
-	b := committedOperatorBriefing(SnapshotInput{}, commit)
+	b := CommittedOperatorBriefing(SnapshotInput{}, commit)
 	if b.Work.RetryEligibleAt == nil || !b.Work.RetryEligibleAt.Equal(due) {
 		t.Fatalf("RetryEligibleAt = %v, want the committed Assessment retry %s", b.Work.RetryEligibleAt, due)
 	}
@@ -305,7 +305,7 @@ func TestCommittedOperatorBriefingRetryEligibleAtIsTheEarlierOfTriageBackoffAndA
 	assessmentRetry := now.Add(5 * time.Minute)
 	in := SnapshotInput{Incidents: []IncidentState{wpIncident("i", "backoff", 1, &triageBackoff, nil)}}
 	commit := ControllerCommit{Lifecycle: model.LifecycleActive, RetryAt: &assessmentRetry}
-	b := committedOperatorBriefing(in, commit)
+	b := CommittedOperatorBriefing(in, commit)
 	if b.Work.RetryEligibleAt == nil || !b.Work.RetryEligibleAt.Equal(assessmentRetry) {
 		t.Fatalf("RetryEligibleAt = %v, want the earlier assessment retry %s — a later triage backoff must not shadow it", b.Work.RetryEligibleAt, assessmentRetry)
 	}
@@ -317,7 +317,7 @@ func TestCommittedOperatorBriefingRetryEligibleAtPrefersEarlierTriageBackoffOver
 	assessmentRetry := now.Add(30 * time.Minute)
 	in := SnapshotInput{Incidents: []IncidentState{wpIncident("i", "backoff", 1, &triageBackoff, nil)}}
 	commit := ControllerCommit{Lifecycle: model.LifecycleActive, RetryAt: &assessmentRetry}
-	b := committedOperatorBriefing(in, commit)
+	b := CommittedOperatorBriefing(in, commit)
 	if b.Work.RetryEligibleAt == nil || !b.Work.RetryEligibleAt.Equal(triageBackoff) {
 		t.Fatalf("RetryEligibleAt = %v, want the earlier triage backoff %s — a later assessment retry must not shadow it", b.Work.RetryEligibleAt, triageBackoff)
 	}

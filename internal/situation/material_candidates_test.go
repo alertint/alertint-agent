@@ -340,12 +340,16 @@ func TestMaterialCandidatesFirstExecutionCountsActualInputs(t *testing.T) {
 		t.Fatalf("display names stay bounded at eight: %d", len(names))
 	}
 
+	// The projection carries the exact count with its completeness proof —
+	// the nine identities alone would be an unknown count (lead decision B,
+	// round 2, 2026-09-09: a list length never proves completeness).
+	_, _, count, known := investigatedAlertInputs(incidents, deliveries)
 	prior := mcTransition(model.LifecycleActive, &model.OperatorBriefing{Total: 12})
 	tr := mcTransition(model.LifecycleActive, &model.OperatorBriefing{Total: 12, Work: model.WorkProjection{
-		ExecutionStarted: true, InvestigatedAlertIDs: ids, InvestigatedNames: names,
+		ExecutionStarted: true, InvestigatedAlertIDs: ids, InvestigatedNames: names, InvestigatedCount: count, InvestigatedCountKnown: known,
 	}})
 	c := hasCandidate(MaterialCandidates(&prior, tr), model.CandidateFirstExecutionAssurance)
-	if c == nil || c.Members == nil || c.Members.FiringCount != 9 {
+	if c == nil || c.Members == nil || c.Members.FiringCount != 9 || !c.Members.CountKnown {
 		t.Fatalf("nine actual inputs must be reported as nine: %+v", c)
 	}
 

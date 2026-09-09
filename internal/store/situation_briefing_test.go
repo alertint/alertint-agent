@@ -213,7 +213,7 @@ func TestCommittedTransitionPersistsMaterialCandidateProvenance(t *testing.T) {
 		Scope: "checkout and payments", Firing: 9, Total: 12,
 		Work: model.WorkProjection{
 			ExecutionStarted: true, Phase: model.WorkPhaseExecuting,
-			InvestigatedAlertIDs: ids, InvestigatedNames: names, InvestigatedCount: 9,
+			InvestigatedAlertIDs: ids, InvestigatedNames: names, InvestigatedCount: 9, InvestigatedCountKnown: true,
 		},
 	}
 	commit := shDerive(t, second)
@@ -239,7 +239,7 @@ func TestCommittedTransitionPersistsMaterialCandidateProvenance(t *testing.T) {
 		byKind[c.Kind] = c
 	}
 	assurance, ok := byKind[model.CandidateFirstExecutionAssurance]
-	if !ok || assurance.Members == nil || assurance.Members.FiringCount != 9 {
+	if !ok || assurance.Members == nil || assurance.Members.FiringCount != 9 || !assurance.Members.CountKnown {
 		t.Fatalf("assurance count must reload as the actual nine inputs: %+v", assurance.Members)
 	}
 	ability, ok := byKind[model.CandidateAbilityChanged]
@@ -255,5 +255,407 @@ func TestCommittedTransitionPersistsMaterialCandidateProvenance(t *testing.T) {
 	if members.Members.PreviousUrgency != string(model.AttentionObserve) ||
 		members.Members.Urgency != string(model.AttentionUrgent) {
 		t.Fatalf("urgency change must reload: %+v", members.Members)
+	}
+}
+
+// ----------------------------------------------------------------------
+// Lead decisions B/D (round 2, 2026-09-09): provenance through the REAL
+// frozen-claim load → projection → commit → reload path. Nothing below
+// hand-builds a WorkProjection; every fact comes from the store's own
+// claim/completion writers and LoadReconciliationInput.
+// ----------------------------------------------------------------------
+
+// ewpFixture is newTriageFixture with n immutable deliveries linked to one
+// ready Incident attached to the group's Situation, so a claim freezes n
+// member delivery ids.
+func ewpFixture(t *testing.T, st *Store, groupKey, incidentSuffix string, n int, now time.Time) triageFixture {
+	t.Helper()
+	ctx := context.Background()
+	var inputs []DeliveryInput
+	for i := 0; i < n; i++ {
+		fp := fmt.Sprintf("fp-%s-%s-%02d", groupKey, incidentSuffix, i)
+		inputs = append(inputs, deliveryFixture("delivery-"+fp, fp, now.Add(time.Duration(i)*time.Second)))
+	}
+	dels, err := st.AcceptDeliveries(ctx, inputs)
+	if err != nil || len(dels) != n {
+		t.Fatalf("accept deliveries: %v (%d)", err, len(dels))
+	}
+	incidentID := "inc-" + groupKey + "-" + incidentSuffix
+	if err := st.InsertIncident(ctx, Incident{ID: incidentID, GroupKey: groupKey, FirstAlertAt: now, LastAlertAt: now, ReadyAt: now.Add(time.Minute)}); err != nil {
+		t.Fatalf("insert incident: %v", err)
+	}
+	for _, d := range dels {
+		if _, err := st.db.ExecContext(ctx, `INSERT INTO incident_alert_deliveries (incident_id, delivery_id, created_at) VALUES (?, ?, ?)`, incidentID, d.ID, canonicalTime(now)); err != nil {
+			t.Fatalf("link delivery: %v", err)
+		}
+	}
+	if err := st.MarkIncidentReady(ctx, incidentID); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	inputID := "input-" + incidentID
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO situation_input_outbox (id, idempotency_key, incident_id, delivery_id, kind, group_key, occurred_at, status)
+		VALUES (?, ?, ?, ?, 'membership_changed', ?, ?, 'pending')`,
+		inputID, "idem:"+inputID, incidentID, dels[0].ID, groupKey, canonicalTime(now)); err != nil {
+		t.Fatalf("insert situation input: %v", err)
+	}
+	claim := claimOneInput(t, st, "seed:"+incidentID, now)
+	if err := st.ApplySituationInput(ctx, claim); err != nil {
+		t.Fatalf("apply situation input: %v", err)
+	}
+	var situationID string
+	var count int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM situations WHERE group_key = ?`, groupKey).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("situations for group %s = %d (%v), want exactly one shared Situation", groupKey, count, err)
+	}
+	if err := st.db.QueryRowContext(ctx, `SELECT id FROM situations WHERE group_key = ?`, groupKey).Scan(&situationID); err != nil {
+		t.Fatalf("find situation: %v", err)
+	}
+	membership, incidentInput := digestsForTest(t, st, incidentID)
+	return triageFixture{IncidentID: incidentID, SituationID: situationID, GroupKey: groupKey, DeliveryID: dels[0].ID,
+		MembershipDigest: membership, IncidentInputDigest: incidentInput}
+}
+
+// ewpCycle runs one real controller cycle for sitID: claim, coherent load,
+// the exported committed projection, fenced commit, and a reload of the
+// committed Transition — returning both the Transition as persisted and the
+// loaded input it was derived from. A cycle whose committed projection is
+// materially unchanged records NO Transition at all (history.go's
+// selectControllerReason); ewpCycle then returns the zero Transition, which
+// ewpCandidates reads as carrying no candidates.
+func ewpCycle(t *testing.T, st *Store, sitID, owner string, now time.Time, contract model.ActionContract) (model.Transition, situation.SnapshotInput) {
+	t.Helper()
+	ctx := context.Background()
+	shMakeDue(t, st, sitID, now.Add(-time.Second))
+	claim := claimSituation(t, st, sitID, owner, now)
+	in, err := st.LoadReconciliationInput(ctx, claim, now)
+	if err != nil {
+		t.Fatalf("LoadReconciliationInput: %v", err)
+	}
+	cycle := shPrepare(t, claim, contract, model.LifecycleActive, model.AttentionObserve, now)
+	cycle.Change.PriorTransition = in.PriorTransition
+	cycle.Change.PriorSummary = in.CurrentSummary
+	cycle.Change.Projection.Briefing = situation.CommittedOperatorBriefing(in, cycle.Commit)
+	commit := shDerive(t, cycle)
+	if err := st.CommitController(ctx, claim, commit); err != nil {
+		t.Fatalf("CommitController: %v", err)
+	}
+	if commit.History == nil || len(commit.History.Transitions) > 1 {
+		t.Fatalf("expected at most one committed transition, got %+v", commit.History)
+	}
+	if len(commit.History.Transitions) == 0 {
+		return model.Transition{}, in
+	}
+	stored, err := st.GetSituationTransition(ctx, commit.History.Transitions[0].ID)
+	if err != nil {
+		t.Fatalf("GetSituationTransition: %v", err)
+	}
+	return stored, in
+}
+
+func ewpCandidates(tr model.Transition, kind model.CandidateKind) []model.MaterialCandidate {
+	var out []model.MaterialCandidate
+	if tr.Projection.OperatorDelta == nil {
+		return nil
+	}
+	for _, c := range tr.Projection.OperatorDelta.Candidates {
+		if c.Kind == kind {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func ewpEndedWork(tr model.Transition, incidentID string) (model.IncidentWorkOutcome, bool) {
+	if tr.Projection.Briefing == nil {
+		return model.IncidentWorkOutcome{}, false
+	}
+	for _, o := range tr.Projection.Briefing.Work.EndedWork {
+		if o.IncidentID == incidentID {
+			return o, true
+		}
+	}
+	return model.IncidentWorkOutcome{}, false
+}
+
+// Nine frozen claim-time inputs, counted from the REAL attempt row's member
+// delivery ids resolved through the coherent load — never the eight-name
+// display list — survive projection, commit and reload with completeness.
+func TestFrozenClaimCountProvenanceSurvivesLoadProjectionCommitReload(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 9, 10, 0, 0, 0, time.UTC)
+	f := ewpFixture(t, st, "ewp-count", "a", 9, now)
+
+	// Cycle 1: nothing has executed yet.
+	first, _ := ewpCycle(t, st, f.SituationID, "controller-count", now, shRunningTriageContract(now.Add(time.Minute)))
+	if first.Projection.Briefing == nil || first.Projection.Briefing.Work.ExecutionStarted {
+		t.Fatalf("cycle 1 must precede any execution: %+v", first.Projection.Briefing)
+	}
+
+	// The worker claims the decided schedule: the attempt row freezes the
+	// nine member delivery ids.
+	claimed := mustClaim(t, st, f, now.Add(time.Minute))
+	if len(claimed.MemberDeliveryIDs) != 9 {
+		t.Fatalf("frozen member deliveries = %d, want 9", len(claimed.MemberDeliveryIDs))
+	}
+
+	// Cycle 2: the coherent load resolves the frozen union through the
+	// Situation's own deliveries and the projection records the exact count.
+	later := now.Add(2 * time.Minute)
+	second, in := ewpCycle(t, st, f.SituationID, "controller-count", later, shRunningTriageContract(later.Add(time.Minute)))
+	if len(in.Incidents) != 1 || in.Incidents[0].Triage.ActiveAttempt == nil || in.Incidents[0].Triage.ActiveAttempt.AttemptID != claimed.AttemptID {
+		t.Fatalf("load must carry the in-flight attempt: %+v", in.Incidents)
+	}
+	w := second.Projection.Briefing.Work
+	if !w.ExecutionStarted || w.InvestigatedCount != 9 || !w.InvestigatedCountKnown {
+		t.Fatalf("reloaded projection count provenance: %+v", w)
+	}
+	if len(w.InvestigatedAlertIDs) != 9 || len(w.InvestigatedNames) != 8 {
+		t.Fatalf("identities=%d names=%d, want 9 identities and the bounded eight names", len(w.InvestigatedAlertIDs), len(w.InvestigatedNames))
+	}
+	assurance := ewpCandidates(second, model.CandidateFirstExecutionAssurance)
+	if len(assurance) != 1 || assurance[0].Members == nil || assurance[0].Members.FiringCount != 9 || !assurance[0].Members.CountKnown {
+		t.Fatalf("assurance must reload as the known nine inputs: %+v", assurance)
+	}
+}
+
+// An accepted completion that recorded checks but no root cause: the load
+// matches the incident output to the attempt's own digest, the projection
+// records a known empty hypothesis, and the committed Transition carries
+// exactly one inconclusive completion keyed on that attempt. A reload of the
+// same state stays quiet.
+func TestAcceptedCompletionWithoutHypothesisBecomesInconclusiveCandidate(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 10, 0, 0, 0, time.UTC)
+	f := ewpFixture(t, st, "ewp-inconclusive", "a", 3, now)
+	claimed := mustClaim(t, st, f, now)
+
+	// Cycle 1: the attempt is running.
+	first, _ := ewpCycle(t, st, f.SituationID, "controller-inc", now.Add(time.Minute), shRunningTriageContract(now.Add(2*time.Minute)))
+	if !first.Projection.Briefing.Work.EndedWorkKnown || len(first.Projection.Briefing.Work.EndedWork) != 0 {
+		t.Fatalf("cycle 1 ended work: %+v", first.Projection.Briefing.Work)
+	}
+
+	finding := TriageFinding{
+		OutputJSON:         `{"analysis_name":"Checkout analysis","correlation_findings":["Pod events checked","Application errors checked"]}`,
+		Summary:            "Checkout analysis",
+		RootCause:          "",
+		Confidence:         0.35,
+		EnrichmentJSON:     `{"verification":{"outcome":"degraded","degradation_reason":"logs_source_unavailable","rounds":[{"queries":[{"outcome":"fetched"},{"outcome":"failed"}]}]}}`,
+		EvidencePackDigest: "sha256:evidence-inconclusive",
+	}
+	completedAt := now.Add(90 * time.Second)
+	result, err := st.CompleteIncidentTriageAttempt(ctx, claimed.AttemptID, f.IncidentID, finding, completedAt)
+	if err != nil || result.Outcome != TriageCompletionSuccess {
+		t.Fatalf("complete: %+v %v", result, err)
+	}
+
+	// Cycle 2: the completion is loaded with matched evidence.
+	later := now.Add(3 * time.Minute)
+	second, in := ewpCycle(t, st, f.SituationID, "controller-inc", later, shRunningTriageContract(later.Add(time.Minute)))
+	ewpAssertMatchedLoad(t, in, claimed.AttemptID, result.OutputDigest, completedAt)
+	ewpAssertInconclusiveCommit(t, second, f.IncidentID, claimed.AttemptID)
+
+	// Cycle 3: nothing changed — a reload of the same completion is quiet
+	// (materially unchanged, so no Transition is recorded at all).
+	third, _ := ewpCycle(t, st, f.SituationID, "controller-inc", later.Add(time.Minute), shRunningTriageContract(later.Add(2*time.Minute)))
+	if third.ID != "" {
+		t.Fatalf("a reload of unchanged ended work recorded a new transition: %+v", third.Projection.OperatorDelta)
+	}
+	if got := ewpCandidates(third, model.CandidateInconclusiveCompletion); len(got) != 0 {
+		t.Fatalf("a repeated reconciliation must not repeat the completion: %+v", got)
+	}
+	if got := ewpCandidates(third, model.CandidateUsefulFinding); len(got) != 0 {
+		t.Fatalf("reload produced a phantom finding: %+v", got)
+	}
+}
+
+func ewpAssertMatchedLoad(t *testing.T, in situation.SnapshotInput, attemptID, outputDigest string, completedAt time.Time) {
+	t.Helper()
+	exec := in.Incidents[0].Triage.LastExecution
+	if exec == nil || exec.AttemptID != attemptID || exec.ResultCode != "success" || exec.OutputDigest != outputDigest || exec.CompletedAt == nil || !exec.CompletedAt.Equal(completedAt) {
+		t.Fatalf("last execution completion metadata: %+v", exec)
+	}
+	if exec.Evidence == nil {
+		t.Fatal("accepted output must be matched to its own attempt through the recorded digest")
+	}
+	if exec.Evidence.Hypothesis != "" || strings.Join(exec.Evidence.Observations, ";") != "Pod events checked;Application errors checked" ||
+		exec.Evidence.VerificationLimit != "logs_source_unavailable" || exec.Evidence.VerificationGaps != 1 || exec.Evidence.JudgedAt == nil {
+		t.Fatalf("matched evidence: %+v", exec.Evidence)
+	}
+}
+
+func ewpAssertInconclusiveCommit(t *testing.T, tr model.Transition, incidentID, attemptID string) {
+	t.Helper()
+	outcome, ok := ewpEndedWork(tr, incidentID)
+	if !ok || outcome.AttemptID != attemptID || outcome.Phase != model.WorkPhaseSettled || outcome.ResultCode != "success" || !outcome.EvidenceKnown || outcome.Finding == nil || outcome.Finding.Hypothesis != "" {
+		t.Fatalf("reloaded ended work: %+v", outcome)
+	}
+	inconclusive := ewpCandidates(tr, model.CandidateInconclusiveCompletion)
+	if len(inconclusive) != 1 || inconclusive[0].Outcome == nil || inconclusive[0].Outcome.AttemptID != attemptID || inconclusive[0].Finding == nil {
+		t.Fatalf("expected exactly one inconclusive completion for the accepted attempt: %+v", inconclusive)
+	}
+	if strings.Join(inconclusive[0].Finding.Observations, ";") != "Pod events checked;Application errors checked" ||
+		strings.Join(inconclusive[0].Finding.Unknowns, ";") != "logs_source_unavailable;1 verification checks unavailable or invalid" {
+		t.Fatalf("candidate must carry the attempt's own checks and unknowns: %+v", inconclusive[0].Finding)
+	}
+	if got := ewpCandidates(tr, model.CandidateUsefulFinding); len(got) != 0 {
+		t.Fatalf("a title without a root cause is not a useful finding: %+v", got)
+	}
+}
+
+// Evidence is matched to the attempt, never borrowed from whatever the
+// incident row says now: an output rewritten after the attempt no longer
+// reproduces the recorded digest, so the completion's evidence is unknown
+// and nothing is attributed.
+func TestCompletionEvidenceUnmatchedAfterOutputRewriteAttributesNothing(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 10, 0, 0, 0, time.UTC)
+	f := ewpFixture(t, st, "ewp-unmatched", "a", 1, now)
+	claimed := mustClaim(t, st, f, now)
+	ewpCycle(t, st, f.SituationID, "controller-unmatched", now.Add(time.Minute), shRunningTriageContract(now.Add(2*time.Minute)))
+	if _, err := st.CompleteIncidentTriageAttempt(ctx, claimed.AttemptID, f.IncidentID, TriageFinding{OutputJSON: `{}`, Summary: "Checkout analysis", Confidence: 0.2}, now.Add(90*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE incidents SET root_cause = 'Rewritten by a later path' WHERE id = ?`, f.IncidentID); err != nil {
+		t.Fatal(err)
+	}
+	later := now.Add(3 * time.Minute)
+	second, in := ewpCycle(t, st, f.SituationID, "controller-unmatched", later, shRunningTriageContract(later.Add(time.Minute)))
+	if in.Incidents[0].Triage.LastExecution == nil || in.Incidents[0].Triage.LastExecution.Evidence != nil {
+		t.Fatalf("rewritten output must not match the attempt: %+v", in.Incidents[0].Triage.LastExecution)
+	}
+	outcome, ok := ewpEndedWork(second, f.IncidentID)
+	if !ok || outcome.EvidenceKnown || outcome.Finding != nil || outcome.AttemptID != claimed.AttemptID {
+		t.Fatalf("ended work must record unmatched evidence: %+v", outcome)
+	}
+	if got := ewpCandidates(second, model.CandidateInconclusiveCompletion); len(got) != 0 {
+		t.Fatalf("unmatched evidence establishes no inconclusive result: %+v", got)
+	}
+}
+
+// Four accepted useful completions in one Situation: the overview keeps
+// three, but every attempt's own matched evidence is loaded, so the fourth
+// is reported from its own attempt rather than dropped.
+func TestUsefulCompletionOutsideTopThreeKeepsItsOwnMatchedEvidence(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 10, 0, 0, 0, time.UTC)
+	var fixtures []triageFixture
+	for i := 0; i < 4; i++ {
+		fixtures = append(fixtures, ewpFixture(t, st, "ewp-overview", fmt.Sprintf("%d", i), 1, now.Add(time.Duration(i)*time.Second)))
+	}
+	sitID := fixtures[0].SituationID
+	first, in := ewpCycle(t, st, sitID, "controller-overview", now.Add(time.Minute), shRunningTriageContract(now.Add(2*time.Minute)))
+	if len(in.Incidents) != 4 || first.Projection.Briefing.Total < 4 {
+		t.Fatalf("all four incidents must share the Situation: incidents=%d briefing=%+v", len(in.Incidents), first.Projection.Briefing)
+	}
+	for i, f := range fixtures {
+		claimed := mustClaim(t, st, f, now.Add(2*time.Minute))
+		finding := TriageFinding{OutputJSON: `{"correlation_findings":["Observation ` + f.IncidentID + `"]}`, Summary: "Analysis " + f.IncidentID, RootCause: "Hypothesis " + f.IncidentID, Confidence: 0.6}
+		if _, err := st.CompleteIncidentTriageAttempt(ctx, claimed.AttemptID, f.IncidentID, finding, now.Add(3*time.Minute).Add(time.Duration(i)*time.Minute)); err != nil {
+			t.Fatalf("complete %s: %v", f.IncidentID, err)
+		}
+	}
+	later := now.Add(10 * time.Minute)
+	second, in := ewpCycle(t, st, sitID, "controller-overview", later, shRunningTriageContract(later.Add(time.Minute)))
+	if len(in.Analyses) != 3 || in.AnalysisCount != 4 {
+		t.Fatalf("overview selection: %d of %d", len(in.Analyses), in.AnalysisCount)
+	}
+	for _, inc := range in.Incidents {
+		if inc.Triage.LastExecution == nil || inc.Triage.LastExecution.Evidence == nil || inc.Triage.LastExecution.Evidence.Hypothesis != "Hypothesis "+inc.ID {
+			t.Fatalf("evidence must be matched independently of the overview: %s %+v", inc.ID, inc.Triage.LastExecution)
+		}
+	}
+	useful := make([]string, 0, 4)
+	for _, c := range ewpCandidates(second, model.CandidateUsefulFinding) {
+		useful = append(useful, c.Finding.IncidentID)
+	}
+	if len(useful) != 4 {
+		t.Fatalf("useful findings = %v, want all four accepted completions", useful)
+	}
+	if got := ewpCandidates(second, model.CandidateInconclusiveCompletion); len(got) != 0 {
+		t.Fatalf("useful completions are never inconclusive: %+v", got)
+	}
+}
+
+// A post-claim clean skip and a typed exhaustion in the same Situation: the
+// skip stays quiet under its own recorded disposition; the exhaustion is one
+// inconclusive completion naming its own attempt and result code, with no
+// checks invented.
+func TestPostClaimCleanSkipStaysQuietAndTypedExhaustionNamesItsAttempt(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 10, 0, 0, 0, time.UTC)
+	skipped := ewpFixture(t, st, "ewp-ends", "skip", 1, now)
+	exhausted := ewpFixture(t, st, "ewp-ends", "fail", 1, now.Add(time.Second))
+	ewpCycle(t, st, skipped.SituationID, "controller-ends", now.Add(time.Minute), shRunningTriageContract(now.Add(2*time.Minute)))
+
+	skipClaim := mustClaim(t, st, skipped, now.Add(2*time.Minute))
+	if err := st.CompleteIncidentTriageAttemptAsCleanSkip(ctx, skipClaim.AttemptID, skipped.IncidentID, "clean_skip", "too few members", now.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	failClaim := mustClaim(t, st, exhausted, now.Add(2*time.Minute))
+	if err := st.ExhaustIncidentTriageAttempt(ctx, failClaim.AttemptID, exhausted.IncidentID, "provider_error", "upstream unavailable", now.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	later := now.Add(5 * time.Minute)
+	second, _ := ewpCycle(t, st, skipped.SituationID, "controller-ends", later, shRunningTriageContract(later.Add(time.Minute)))
+	skipOutcome, ok := ewpEndedWork(second, skipped.IncidentID)
+	if !ok || skipOutcome.Phase != model.WorkPhaseSettled || skipOutcome.SkipReason != "eligibility_policy" || skipOutcome.AttemptID != skipClaim.AttemptID || skipOutcome.ResultCode != "clean_skip" {
+		t.Fatalf("post-claim clean skip outcome: %+v", skipOutcome)
+	}
+	failOutcome, ok := ewpEndedWork(second, exhausted.IncidentID)
+	if !ok || failOutcome.Phase != model.WorkPhaseExhausted || failOutcome.AttemptID != failClaim.AttemptID || failOutcome.ResultCode != "provider_error" || failOutcome.EvidenceKnown || failOutcome.Finding != nil {
+		t.Fatalf("exhaustion outcome: %+v", failOutcome)
+	}
+	inconclusive := ewpCandidates(second, model.CandidateInconclusiveCompletion)
+	if len(inconclusive) != 1 || inconclusive[0].Outcome == nil || inconclusive[0].Outcome.IncidentID != exhausted.IncidentID || inconclusive[0].Outcome.AttemptID != failClaim.AttemptID {
+		t.Fatalf("exactly one inconclusive completion, for the exhausted attempt only: %+v", inconclusive)
+	}
+	if inconclusive[0].Finding == nil || len(inconclusive[0].Finding.Observations) != 0 || inconclusive[0].Outcome.EvidenceKnown {
+		t.Fatalf("checks were not retained and must not be invented: %+v", inconclusive[0].Finding)
+	}
+}
+
+// Two attempts for one Incident: a backoff attempt then an accepted
+// completion. The ended work names the attempt that actually ended the
+// schedule, and the evidence is matched to that attempt.
+func TestSecondAttemptCompletionIsAttributedToItsOwnAttempt(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 10, 0, 0, 0, time.UTC)
+	f := ewpFixture(t, st, "ewp-two-attempts", "a", 2, now)
+	firstClaim := mustClaim(t, st, f, now)
+	if err := st.BackoffIncidentTriageAttempt(ctx, firstClaim.AttemptID, f.IncidentID, now.Add(time.Minute), "provider_timeout", "slow", now.Add(30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	ewpCycle(t, st, f.SituationID, "controller-two", now.Add(45*time.Second), shRunningTriageContract(now.Add(2*time.Minute)))
+	secondClaim, err := st.ClaimIncidentTriageAttempt(ctx, f.IncidentID, "worker-2", now.Add(2*time.Minute), time.Minute)
+	if err != nil {
+		t.Fatalf("second claim: %v", err)
+	}
+	if secondClaim.AttemptNumber != 2 {
+		t.Fatalf("attempt number = %d, want 2", secondClaim.AttemptNumber)
+	}
+	if _, err := st.CompleteIncidentTriageAttempt(ctx, secondClaim.AttemptID, f.IncidentID, TriageFinding{OutputJSON: `{"correlation_findings":["Second attempt checked pod events"]}`, Summary: "Checkout analysis", Confidence: 0.3}, now.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	later := now.Add(5 * time.Minute)
+	tr, in := ewpCycle(t, st, f.SituationID, "controller-two", later, shRunningTriageContract(later.Add(time.Minute)))
+	exec := in.Incidents[0].Triage.LastExecution
+	if exec == nil || exec.AttemptID != secondClaim.AttemptID || exec.AttemptNumber != 2 || exec.Evidence == nil {
+		t.Fatalf("last execution must be the second attempt with its own evidence: %+v", exec)
+	}
+	outcome, ok := ewpEndedWork(tr, f.IncidentID)
+	if !ok || outcome.AttemptID != secondClaim.AttemptID {
+		t.Fatalf("ended work must name the attempt that ended the schedule: %+v", outcome)
+	}
+	inconclusive := ewpCandidates(tr, model.CandidateInconclusiveCompletion)
+	if len(inconclusive) != 1 || inconclusive[0].Outcome.AttemptID != secondClaim.AttemptID || strings.Join(inconclusive[0].Finding.Observations, ";") != "Second attempt checked pod events" {
+		t.Fatalf("candidate must carry the second attempt's own evidence: %+v", inconclusive)
 	}
 }

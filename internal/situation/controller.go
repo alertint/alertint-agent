@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -842,6 +844,7 @@ func BuildWorkProjection(incidents []IncidentState, graceUntil, statusCheckpoint
 	remaining := 0
 	skipReason := ""
 	var retryAt *time.Time
+	var ended []model.IncidentWorkOutcome
 
 	for _, inc := range incidents {
 		// R1 repair (lead review 2026-09-09): a successful completion
@@ -881,7 +884,11 @@ func BuildWorkProjection(incidents []IncidentState, graceUntil, statusCheckpoint
 				skipReason = reason
 			}
 		}
+		if phase == model.WorkPhaseSettled || phase == model.WorkPhaseExhausted {
+			ended = append(ended, incidentWorkOutcome(inc, phase))
+		}
 	}
+	sort.Slice(ended, func(i, j int) bool { return ended[i].IncidentID < ended[j].IncidentID })
 
 	return model.WorkProjection{
 		Phase:              aggregateWorkPhase(phases, executionStarted),
@@ -891,7 +898,62 @@ func BuildWorkProjection(incidents []IncidentState, graceUntil, statusCheckpoint
 		RetryEligibleAt:    retryAt,
 		SourceGraceUntil:   graceUntil,
 		StatusCheckpointAt: statusCheckpointAt,
+		EndedWork:          ended,
+		EndedWorkKnown:     true,
 	}
+}
+
+// incidentWorkOutcome projects one ended member schedule's completion
+// provenance (lead decision D, round 2, 2026-09-09) from facts the
+// same-transaction load already carries: the schedule's own disposition,
+// the most recent attempt-ledger row that ended it (LastExecution — an
+// in-flight ActiveAttempt never ends a schedule), and that attempt's
+// positively matched accepted output. A schedule that ended with no attempt
+// ever claimed (a pre-claim clean skip; an Incident analyzed before the
+// attempt ledger) carries incident identity only, so nothing is ever
+// attributed to an execution that did not happen.
+func incidentWorkOutcome(inc IncidentState, phase model.WorkPhase) model.IncidentWorkOutcome {
+	out := model.IncidentWorkOutcome{
+		IncidentID: inc.ID,
+		Phase:      phase,
+		SkipReason: TriageSkipReason(inc.Triage),
+	}
+	exec := inc.Triage.LastExecution
+	if exec == nil || exec.CompletedAt == nil {
+		return out
+	}
+	out.AttemptID = exec.AttemptID
+	out.ResultCode = exec.ResultCode
+	completed := exec.CompletedAt.UTC()
+	out.CompletedAt = &completed
+	if ev := exec.Evidence; ev != nil {
+		out.EvidenceKnown = true
+		out.Finding = &model.FindingFacts{
+			IncidentID:   inc.ID,
+			Hypothesis:   boundedText(ev.Hypothesis, 500),
+			Observations: boundedEach(ev.Observations, 6, 400),
+			Unknowns:     verificationUnknowns(ev.VerificationLimit, ev.VerificationGaps),
+			AnalyzedAt:   ev.JudgedAt,
+		}
+	}
+	return out
+}
+
+// boundedEach copies at most limit non-blank entries of in, each bounded to
+// width bytes — the per-record text bound EndedWork applies instead of a
+// list-level truncation that could drop a newly ended Incident.
+func boundedEach(in []string, limit, width int) []string {
+	var out []string
+	for _, s := range in {
+		if len(out) == limit {
+			break
+		}
+		if strings.TrimSpace(s) == "" {
+			continue
+		}
+		out = append(out, boundedText(s, width))
+	}
+	return out
 }
 
 // ----------------------------------------------------------------------
@@ -1493,7 +1555,7 @@ func authoritativeChangeOf(claim Claim, basis historyBasis, commit ControllerCom
 		// this commit's own lifecycle fields — the only thing the Episode
 		// fold may read.
 		Projection: model.ProjectionFacts{
-			Briefing:                committedOperatorBriefing(basis.In, commit),
+			Briefing:                CommittedOperatorBriefing(basis.In, commit),
 			PublicHandle:            sit.PublicHandle,
 			EffectiveStartedAt:      sit.EffectiveStartedAt,
 			EffectiveStartedAtBasis: sit.EffectiveStartedAtBasis,

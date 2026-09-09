@@ -175,10 +175,35 @@ type WorkProjection struct {
 	// InvestigatedCount is the EXACT number of distinct frozen claim-time
 	// investigation inputs, counted before either bound above is applied —
 	// the only truthful number a reply may state as "investigating N alerts"
-	// (R3 repair, lead review 2026-09-09). Zero on transitions that predate
-	// this field (legacy replay), never a real "no inputs" count, which only
-	// occurs when ExecutionStarted is false.
+	// (R3 repair, lead review 2026-09-09). Meaningful ONLY when
+	// InvestigatedCountKnown is true.
 	InvestigatedCount int `json:"investigated_count,omitempty"`
+	// InvestigatedCountKnown is true only when the COMPLETE frozen input
+	// union was resolved to Alert identity and counted before truncation
+	// (lead decision B, round 2, 2026-09-09). False — "unknown" — on a
+	// transition that predates the field (legacy replay carried at most
+	// eight bounded IDs, which could mean eight or ninety), and whenever any
+	// frozen member delivery id could not be resolved through this
+	// Situation's own deliveries (a legacy/moved row), so the count is never
+	// silently under-reported. Unknown is neither zero inputs nor the bounded
+	// list length: B4/B5 omit an unqualified numeric assurance when unknown.
+	InvestigatedCountKnown bool `json:"investigated_count_known,omitempty"`
+	// EndedWork lists every member Incident whose Triage schedule has ended
+	// (settled or exhausted), each with the actual attempt identity and
+	// durable completion facts that ended it (lead decision D, round 2,
+	// 2026-09-09) — the per-incident completion provenance B3's
+	// inconclusive-completion candidate compares by stable incident/attempt/
+	// outcome identity, never by aggregate phase alone. Presentation facts
+	// only: nothing here is a new stored outcome, an LLM authority, or a
+	// dispatch trigger. Never truncated to a display bound — text is bounded
+	// within each record instead.
+	EndedWork []IncidentWorkOutcome `json:"ended_work,omitempty"`
+	// EndedWorkKnown is true on every projection built with per-incident
+	// completion provenance. False means a transition that predates
+	// EndedWork (legacy replay): its ended work is UNKNOWN, not empty, so a
+	// later projection must never manufacture retrospective phantom
+	// completions against it.
+	EndedWorkKnown bool `json:"ended_work_known,omitempty"`
 	// RemainingIncidents counts member Incidents whose Triage schedule
 	// still has outstanding automatic work (awaiting_decision, queued,
 	// executing, or retry_wait) — not the Situation's total member count.
@@ -202,6 +227,48 @@ type WorkProjection struct {
 	// StatusCheckpointAt is ActionContract.NextUpdateAt — a status check,
 	// never a reply promise (spec.md's status-checkpoint fallback).
 	StatusCheckpointAt *time.Time `json:"status_checkpoint_at,omitempty"`
+}
+
+// IncidentWorkOutcome is one member Incident's ended Triage work with the
+// completion provenance that ended it (lead decision D, round 2,
+// 2026-09-09). It is a projection of existing durable facts — the
+// incident_triage row's phase/decision_reason, the incident_triage_attempts
+// ledger's result_code/completed_at/output_digest, and the accepted Incident
+// output matched to that attempt — never a new stored outcome.
+type IncidentWorkOutcome struct {
+	IncidentID string `json:"incident_id"`
+	// AttemptID is the actual execution that ended this schedule, "" when no
+	// attempt was ever claimed (a pre-claim clean skip, or an Incident
+	// analyzed before the attempt ledger existed). Identity for comparison:
+	// a second completion for the same Incident is a different attempt.
+	AttemptID string `json:"attempt_id,omitempty"`
+	// Phase is WorkPhaseSettled or WorkPhaseExhausted — the only two ended
+	// dispositions.
+	Phase WorkPhase `json:"phase"`
+	// SkipReason is this Incident's own mapped clean-skip disposition
+	// (WorkProjection.SkipReason vocabulary), "" when the schedule did not
+	// end by a skip.
+	SkipReason string `json:"skip_reason,omitempty"`
+	// ResultCode/CompletedAt are the attempt ledger's durable completion
+	// columns for AttemptID — "success", a stale/owner-terminal outcome, a
+	// typed failure class, or the clean-skip code; empty/nil without an
+	// attempt.
+	ResultCode  string     `json:"result_code,omitempty"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	// EvidenceKnown is true only when the accepted success output was
+	// positively matched to THIS attempt through the recorded output digest
+	// (never joined on incident id alone), so Finding below is that
+	// attempt's own recorded result — including a positively loaded EMPTY
+	// hypothesis. False means evidence unavailable/unmatched: an absent
+	// Finding then establishes nothing, neither a hypothesis nor its
+	// absence.
+	EvidenceKnown bool `json:"evidence_known,omitempty"`
+	// Finding is the matched attempt's recorded result: Hypothesis is the
+	// recorded root cause only (an analysis title is not a causal
+	// hypothesis), Observations the recorded findings, Unknowns the recorded
+	// verification limitations, AnalyzedAt the actual judgment time. Nil
+	// when EvidenceKnown is false.
+	Finding *FindingFacts `json:"finding,omitempty"`
 }
 
 // OperatorDelta captures what changed relative to the prior committed state.
@@ -309,6 +376,15 @@ type MemberFacts struct {
 	StillFiring []string `json:"still_firing,omitempty"`
 	FiringCount int      `json:"firing_count"`
 	Total       int      `json:"total"`
+	// CountKnown qualifies FiringCount on a first_execution_assurance
+	// candidate only (lead decision B, round 2, 2026-09-09): true when
+	// FiringCount is the exact, completely resolved frozen input count
+	// (WorkProjection.InvestigatedCountKnown); false means the count is
+	// UNKNOWN — FiringCount is then 0 and must not be rendered as a number.
+	// Total stays the Situation total and is never the analyzed count or a
+	// denominator. Every other candidate kind keeps FiringCount/Total's
+	// existing source semantics and leaves this false.
+	CountKnown bool `json:"count_known,omitempty"`
 	// PreviousScope/Scope and PreviousUrgency/Urgency carry a material
 	// scope or attention change that moved no member at all (R2 repair,
 	// lead review 2026-09-09: S4-06's "scope-expanded" reply must not
@@ -370,4 +446,15 @@ type MaterialCandidate struct {
 	Limitation *LimitationFacts `json:"limitation,omitempty"`
 	Action     *ActionFacts     `json:"action,omitempty"`
 	Next       NextStepFacts    `json:"next,omitempty"`
+	// Outcome is the per-incident completion provenance behind an
+	// inconclusive_completion (or an EndedWork-sourced useful_finding)
+	// candidate (lead decision D, round 2, 2026-09-09): the actual
+	// incident/attempt identity, durable result code and completion time,
+	// and whether the attempt's evidence was positively matched. B5 keys
+	// repeat suppression on this identity, never on aggregate phase; B4
+	// states the "checks not retained" limit when EvidenceKnown is false
+	// instead of inventing checked sources. Its Finding is carried in the
+	// candidate's own Finding field, not duplicated here. Nil on every
+	// other candidate kind and on a legacy aggregate-only exhaustion edge.
+	Outcome *IncidentWorkOutcome `json:"outcome,omitempty"`
 }

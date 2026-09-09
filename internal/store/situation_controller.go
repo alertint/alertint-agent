@@ -536,6 +536,19 @@ func loadSituationIncidentStatesTx(ctx context.Context, tx *sql.Tx, situationID 
 			continue
 		}
 		last := attempts[len(attempts)-1] // ordered ascending by attempt_number
+		// Lead decision D (round 2, 2026-09-09): a successful last attempt's
+		// accepted output is matched to THAT attempt through its recorded
+		// output digest, read in this same transaction and independently of
+		// the top-three analysis overview — never joined on incident id alone.
+		if last.ResultCode == string(TriageCompletionSuccess) && last.OutputDigest != "" {
+			evidence, matched, err := loadMatchedCompletionEvidenceTx(ctx, tx, out[i].ID, last.OutputDigest)
+			if err != nil {
+				return nil, err
+			}
+			if matched {
+				last.Evidence = evidence
+			}
+		}
 		out[i].Triage.LastExecution = &last
 		if activeID, ok := activeAttemptID[out[i].ID]; ok {
 			for j := range attempts {
@@ -565,7 +578,8 @@ func loadSituationTriageExecutionsTx(ctx context.Context, tx *sql.Tx, incidentID
 	}
 	placeholders, args := inPlaceholders(incidentIDs)
 	rows, err := tx.QueryContext(ctx, `
-		SELECT incident_id, id, attempt_number, started_at, member_delivery_ids_json
+		SELECT incident_id, id, attempt_number, started_at, member_delivery_ids_json,
+		       COALESCE(result_code, ''), COALESCE(output_digest, ''), completed_at
 		FROM incident_triage_attempts
 		WHERE incident_id IN (`+placeholders+`)
 		ORDER BY incident_id ASC, attempt_number ASC`, args...) // #nosec G202 -- placeholders is a fixed "?,?,..." run built from len(incidentIDs); every value is bound
@@ -575,14 +589,19 @@ func loadSituationTriageExecutionsTx(ctx context.Context, tx *sql.Tx, incidentID
 	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
-		var incidentID, attemptID, startedStr, memberJSON string
+		var incidentID, attemptID, startedStr, memberJSON, resultCode, outputDigest string
 		var attemptNumber int
-		if err := rows.Scan(&incidentID, &attemptID, &attemptNumber, &startedStr, &memberJSON); err != nil {
+		var completedAt sql.NullString
+		if err := rows.Scan(&incidentID, &attemptID, &attemptNumber, &startedStr, &memberJSON, &resultCode, &outputDigest, &completedAt); err != nil {
 			return nil, fmt.Errorf("store: scan situation triage execution: %w", err)
 		}
 		started, err := time.Parse(time.RFC3339Nano, startedStr)
 		if err != nil {
 			return nil, fmt.Errorf("store: parse triage attempt started_at: %w", err)
+		}
+		completed, err := timePtr(completedAt)
+		if err != nil {
+			return nil, err
 		}
 		var memberDeliveryIDs []string
 		if err := json.Unmarshal([]byte(memberJSON), &memberDeliveryIDs); err != nil {
@@ -590,6 +609,7 @@ func loadSituationTriageExecutionsTx(ctx context.Context, tx *sql.Tx, incidentID
 		}
 		out[incidentID] = append(out[incidentID], situation.TriageExecution{
 			AttemptID: attemptID, AttemptNumber: attemptNumber, StartedAt: started, MemberDeliveryIDs: memberDeliveryIDs,
+			ResultCode: resultCode, OutputDigest: outputDigest, CompletedAt: completed,
 		})
 	}
 	if err := rows.Err(); err != nil {

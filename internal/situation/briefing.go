@@ -202,9 +202,16 @@ func briefingDisplayScope(labels map[string]string) string {
 	return strings.Join(parts, " · ")
 }
 
-// Only the current committed work contract can select a retry timestamp.
-// NextUpdateAt is a status checkpoint, not proof that work is due then.
-func committedOperatorBriefing(in SnapshotInput, commit ControllerCommit) *model.OperatorBriefing {
+// CommittedOperatorBriefing is the committed publication projection of one
+// reconciliation: BuildOperatorBriefing over the decision-overlaid input plus
+// the coherent WorkProjection (contract §3) with its investigation-input and
+// ended-work provenance. Exported so internal/store's own provenance tests
+// can drive the real frozen-claim load → projection → commit → reload path
+// (lead decision B/D, round 2, 2026-09-09); Reconcile is its one production
+// caller. Only the current committed work contract can select a retry
+// timestamp. NextUpdateAt is a status checkpoint, not proof that work is due
+// then.
+func CommittedOperatorBriefing(in SnapshotInput, commit ControllerCommit) *model.OperatorBriefing {
 	in = committedBriefingInput(in, commit.TriageDecisions)
 	b := BuildOperatorBriefing(in, commit.Lifecycle)
 	b.Work = BuildWorkProjection(in.Incidents, commit.GraceUntil, commit.Assessment.ActionContract.NextUpdateAt)
@@ -222,7 +229,7 @@ func committedOperatorBriefing(in SnapshotInput, commit ControllerCommit) *model
 	// the frozen claim-time member deliveries each Incident's current
 	// execution ran against, resolved to Alert identity/name — never
 	// Situation.Total (plan.md item 3).
-	b.Work.InvestigatedAlertIDs, b.Work.InvestigatedNames, b.Work.InvestigatedCount = investigatedAlertInputs(in.Incidents, in.Deliveries)
+	b.Work.InvestigatedAlertIDs, b.Work.InvestigatedNames, b.Work.InvestigatedCount, b.Work.InvestigatedCountKnown = investigatedAlertInputs(in.Incidents, in.Deliveries)
 	c := commit.Assessment.ActionContract
 	if commit.Lifecycle.Terminal() || c.AlertINTAction == nil || c.AlertINTStatus == nil || *c.AlertINTStatus != model.AlertINTStatusWaiting || c.WaitReason == nil {
 		return b
@@ -273,7 +280,7 @@ func earliestNonNil(a, b *time.Time) *time.Time {
 // (newBriefingAlert) — an unrecognized name still reports "Unnamed alert"
 // rather than an empty string.
 func investigatedAlertIdentities(incidents []IncidentState, deliveries []Delivery) (ids, names []string) {
-	ids, names, _ = investigatedAlertInputs(incidents, deliveries)
+	ids, names, _, _ = investigatedAlertInputs(incidents, deliveries)
 	return ids, names
 }
 
@@ -292,8 +299,15 @@ const (
 // investigatedAlertInputs is investigatedAlertIdentities plus the exact
 // number of distinct frozen claim-time inputs that execution ran against,
 // so a reply can state the real count without a caller re-deriving the
-// union or mistaking a bounded list length for it.
-func investigatedAlertInputs(incidents []IncidentState, deliveries []Delivery) (ids, names []string, count int) {
+// union or mistaking a bounded list length for it. known is true ONLY when
+// the complete frozen union was resolved and counted before truncation
+// (lead decision B, round 2, 2026-09-09): a frozen member delivery id this
+// Situation's deliveries cannot resolve (a legacy/moved row) is skipped from
+// the list as before, but it makes the count unknown rather than silently
+// under-reported; an execution with no recorded member deliveries at all
+// (a pre-ledger claim that fell back to incident_alerts) is likewise
+// unknown, never a known zero.
+func investigatedAlertInputs(incidents []IncidentState, deliveries []Delivery) (ids, names []string, count int, known bool) {
 	byDeliveryID := make(map[string]Delivery, len(deliveries))
 	for _, d := range deliveries {
 		byDeliveryID[d.ID] = d
@@ -301,6 +315,7 @@ func investigatedAlertInputs(incidents []IncidentState, deliveries []Delivery) (
 
 	order := make([]string, 0, len(incidents))
 	nameByID := make(map[string]string, len(incidents))
+	executed, unresolved := false, false
 	for _, inc := range incidents {
 		exec := inc.Triage.ActiveAttempt
 		if exec == nil {
@@ -309,9 +324,11 @@ func investigatedAlertInputs(incidents []IncidentState, deliveries []Delivery) (
 		if exec == nil {
 			continue
 		}
+		executed = true
 		for _, deliveryID := range exec.MemberDeliveryIDs {
 			d, ok := byDeliveryID[deliveryID]
 			if !ok {
+				unresolved = true
 				continue
 			}
 			id := d.AlertID
@@ -334,6 +351,7 @@ func investigatedAlertInputs(incidents []IncidentState, deliveries []Delivery) (
 	}
 	sort.Strings(order)
 	count = len(order)
+	known = executed && !unresolved && count > 0
 	ids = make([]string, 0, min(count, investigatedIdentityLimit))
 	names = make([]string, 0, min(count, investigatedNameLimit))
 	for i, id := range order {
@@ -344,19 +362,22 @@ func investigatedAlertInputs(incidents []IncidentState, deliveries []Delivery) (
 			names = append(names, nameByID[id])
 		}
 	}
-	return ids, names, count
+	return ids, names, count, known
 }
 
 // investigatedInputCount is the truthful number of investigation inputs a
-// reply may state: the exact recorded count when this projection carries one,
-// otherwise the identity list length — which is bounded, but is still
-// recorded identity rather than the eight-name display list. Never
+// reply may state: the exact recorded count when this projection positively
+// knows it, otherwise 0 — meaning UNKNOWN, never "no inputs". A bounded
+// identity list is never presented as an exact count (lead decision B, round
+// 2, 2026-09-09): accepted B2 persisted at most eight IDs and this candidate
+// at most sixty-four, and neither length proves the union was complete, so
+// legacy JSON without InvestigatedCountKnown reads as unknown. Never
 // Situation.Total, which counts current membership, not what executed.
 func investigatedInputCount(w model.WorkProjection) int {
-	if w.InvestigatedCount > 0 {
+	if w.InvestigatedCountKnown && w.InvestigatedCount > 0 {
 		return w.InvestigatedCount
 	}
-	return len(w.InvestigatedAlertIDs)
+	return 0
 }
 
 func briefingWorkCounts(incidents []IncidentState) (failed, pending, unavailable int) {
@@ -517,13 +538,24 @@ func findingFactsOf(a model.IncidentAnalysis) *model.FindingFacts {
 		Observations: append([]string(nil), a.Findings...),
 		AnalyzedAt:   a.AnalyzedAt,
 	}
-	if a.VerificationLimit != "" {
-		f.Unknowns = append(f.Unknowns, a.VerificationLimit)
-	}
-	if a.VerificationGaps > 0 {
-		f.Unknowns = append(f.Unknowns, fmt.Sprintf("%d verification checks unavailable or invalid", a.VerificationGaps))
-	}
+	f.Unknowns = verificationUnknowns(a.VerificationLimit, a.VerificationGaps)
 	return f
+}
+
+// verificationUnknowns is the one shared rendering of a recorded
+// verification limitation and gap count into FindingFacts.Unknowns, so an
+// analysis-overview finding and an EndedWork completion state the same
+// decision-relevant unknowns in the same words — never an invented "cause
+// unproven" boilerplate line.
+func verificationUnknowns(limit string, gaps int) []string {
+	var out []string
+	if limit != "" {
+		out = append(out, limit)
+	}
+	if gaps > 0 {
+		out = append(out, fmt.Sprintf("%d verification checks unavailable or invalid", gaps))
+	}
+	return out
 }
 
 // workNextStep is the actual recorded next step a candidate's reply may
@@ -589,14 +621,18 @@ func membersChangedCandidate(a, b *model.OperatorBriefing, priorAttention, atten
 // findingCandidates emits one useful_finding candidate per member Incident
 // whose analysis structurally changed (S4-04) — the same predicate
 // usefulAnalysisChanged uses for the legacy reply gate, so the two paths
-// can never disagree about what counts as a new finding.
+// can never disagree about what counts as a new finding. An analysis that
+// recorded no root cause is not a useful finding: its title is a name, not a
+// causal hypothesis (lead decision D, round 2, 2026-09-09), and an accepted
+// completion without a hypothesis is endedWorkCandidates' inconclusive
+// completion instead, never both.
 func findingCandidates(a, b *model.OperatorBriefing) []model.MaterialCandidate {
 	if b == nil {
 		return nil
 	}
 	var out []model.MaterialCandidate
 	for _, an := range b.Analyses {
-		if an.Summary == "" && an.Title == "" {
+		if an.Summary == "" {
 			continue
 		}
 		if analysisStructurallyChanged(findAnalysis(a, an.IncidentID), an) {
@@ -606,25 +642,118 @@ func findingCandidates(a, b *model.OperatorBriefing) []model.MaterialCandidate {
 	return out
 }
 
-// inconclusiveCompletionCandidate fires once when the aggregate work
-// disposition newly reaches WorkPhaseExhausted (S4-05: "Investigation ends
-// without a useful finding") — never repeated while it stays exhausted, and
-// never confused with a settled clean skip (S2-03's own disposition,
-// outside this candidate).
-func inconclusiveCompletionCandidate(a, b *model.OperatorBriefing) (model.MaterialCandidate, bool) {
-	if b == nil || b.Work.Phase != model.WorkPhaseExhausted {
+// endedWorkCandidates derives the completion candidates per-incident
+// provenance supports (S4-05, lead decision D, round 2, 2026-09-09): one
+// inconclusive_completion for each member schedule that NEWLY ended — by
+// stable incident/attempt/outcome identity against the prior committed
+// EndedWork, never by aggregate phase alone — with an accepted completion
+// that recorded no causal hypothesis, or with a typed exhaustion; plus one
+// useful_finding for a newly accepted result that DID record a hypothesis
+// but sits outside the top-three analysis overview findingCandidates
+// already covers. Quiet by construction for: clean skips (pre- or
+// post-claim), a schedule that ended with no attempt to attribute, an
+// accepted result whose evidence could not be matched to its own attempt
+// (unmatched evidence establishes neither a hypothesis nor its absence),
+// stale-input and owner-terminal outcomes (never promoted as an accepted
+// finding), a repeated reconciliation/reload of the same ended work, and any
+// prior transition whose ended work is unknown (legacy replay), where only
+// the aggregate exhaustion edge is reported and nothing is attributed to an
+// incident — never retrospective phantom completions.
+func endedWorkCandidates(a, b *model.OperatorBriefing) []model.MaterialCandidate {
+	if b == nil {
+		return nil
+	}
+	if a == nil || !a.Work.EndedWorkKnown || !b.Work.EndedWorkKnown {
+		return legacyExhaustionCandidate(a, b)
+	}
+	prior := make(map[string]bool, len(a.Work.EndedWork))
+	for _, o := range a.Work.EndedWork {
+		prior[endedWorkKey(o)] = true
+	}
+	var out []model.MaterialCandidate
+	for _, o := range b.Work.EndedWork {
+		if prior[endedWorkKey(o)] || o.SkipReason != "" || o.AttemptID == "" || o.ResultCode == "" {
+			continue
+		}
+		outcome := o
+		outcome.Finding = nil
+		if cand, ok := endedWorkCandidate(b, o, &outcome); ok {
+			out = append(out, cand)
+		}
+	}
+	return out
+}
+
+// endedWorkCandidate classifies one newly ended, attempt-bearing outcome —
+// see endedWorkCandidates for the full rule set.
+func endedWorkCandidate(b *model.OperatorBriefing, o model.IncidentWorkOutcome, outcome *model.IncidentWorkOutcome) (model.MaterialCandidate, bool) {
+	if o.Phase == model.WorkPhaseSettled {
+		if o.ResultCode != "success" || !o.EvidenceKnown || o.Finding == nil {
+			return model.MaterialCandidate{}, false
+		}
+		if o.Finding.Hypothesis != "" {
+			// A useful accepted result: never an inconclusive completion.
+			// findingCandidates already reports it when it is in the
+			// analysis overview; outside that bound it is reported here
+			// from its own matched evidence so it is not silently dropped.
+			if findAnalysis(b, o.IncidentID) != nil {
+				return model.MaterialCandidate{}, false
+			}
+			return model.MaterialCandidate{Kind: model.CandidateUsefulFinding, Finding: copyFindingFacts(o.Finding), Outcome: outcome, Next: workNextStep(b)}, true
+		}
+		return model.MaterialCandidate{Kind: model.CandidateInconclusiveCompletion, Finding: copyFindingFacts(o.Finding), Outcome: outcome, Next: workNextStep(b)}, true
+	}
+	if o.Phase != model.WorkPhaseExhausted {
 		return model.MaterialCandidate{}, false
+	}
+	switch o.ResultCode {
+	case "stale_membership", "stale_incident_input", "owner_terminal":
+		return model.MaterialCandidate{}, false
+	}
+	// A typed failure retained its result code and completion time, not a
+	// list of the checks it ran: the candidate states exactly that
+	// (EvidenceKnown false, no observations) rather than borrowing another
+	// incident's output.
+	return model.MaterialCandidate{
+		Kind:    model.CandidateInconclusiveCompletion,
+		Finding: &model.FindingFacts{IncidentID: o.IncidentID, AnalyzedAt: o.CompletedAt},
+		Outcome: outcome,
+		Next:    workNextStep(b),
+	}, true
+}
+
+// endedWorkKey is the stable identity two committed EndedWork records are
+// compared by: the incident, the attempt that ended it, and the outcome —
+// never phase alone, so a second completion for the same incident is a new
+// event and a reload of the same one is not.
+func endedWorkKey(o model.IncidentWorkOutcome) string {
+	return o.IncidentID + "\x00" + o.AttemptID + "\x00" + string(o.Phase) + "\x00" + o.ResultCode + "\x00" + o.SkipReason
+}
+
+func copyFindingFacts(f *model.FindingFacts) *model.FindingFacts {
+	if f == nil {
+		return nil
+	}
+	cp := *f
+	cp.Observations = append([]string(nil), f.Observations...)
+	cp.Unknowns = append([]string(nil), f.Unknowns...)
+	return &cp
+}
+
+// legacyExhaustionCandidate is the pre-provenance rule kept for a prior
+// transition whose ended work is unknown: fires once when the aggregate
+// disposition newly reaches WorkPhaseExhausted, carrying no Finding and no
+// Outcome because the aggregate names no member schedule and another
+// incident's analysis is not evidence of what the failed attempt checked
+// (R1 repair, lead review 2026-09-09).
+func legacyExhaustionCandidate(a, b *model.OperatorBriefing) []model.MaterialCandidate {
+	if b.Work.Phase != model.WorkPhaseExhausted {
+		return nil
 	}
 	if a != nil && a.Work.Phase == model.WorkPhaseExhausted {
-		return model.MaterialCandidate{}, false
+		return nil
 	}
-	// No Finding facts: the aggregate disposition does not name WHICH
-	// member schedule exhausted, and another incident's accepted analysis is
-	// not evidence of what the failed attempt checked (R1 repair, lead
-	// review 2026-09-09). The checks/limitation content this reply should
-	// carry needs the per-incident completion provenance recorded as a lead
-	// prerequisite; inventing it here would be a fabricated result.
-	return model.MaterialCandidate{Kind: model.CandidateInconclusiveCompletion, Next: model.NextStepFacts{Kind: model.NextStepWorkEnded}}, true
+	return []model.MaterialCandidate{{Kind: model.CandidateInconclusiveCompletion, Next: model.NextStepFacts{Kind: model.NextStepWorkEnded}}}
 }
 
 // waitReasonCode is the recorded obstacle code a contract carries, or ""
@@ -636,43 +765,56 @@ func waitReasonCode(r *model.WaitReason) string {
 	return string(*r)
 }
 
-// abilityChangedCandidate fires when the recorded investigation ability
-// newly blocks, blocks under a DIFFERENT recorded reason, or newly clears —
-// never a repeated, unchanged blocked cycle.
+// abilityChangedCandidates reports every recorded investigation-ability
+// change this cycle, as two INDEPENDENT facts that may both occur at once
+// (lead decision C, round 2, 2026-09-09 — a single precedence switch dropped
+// one through the other):
 //
-// The code always identifies the limitation this candidate actually reports:
-// the newly recorded obstacle when blocking, and the obstacle that was
-// reported BEFORE when clearing it. Taking the current contract's WaitReason
-// while clearing produced an empty (or unrelated) code, which B5 §5 can never
-// match against CommunicatedLimitationCodes — the capability-restored reply
-// could not name the obstacle it was removing (R4 repair, lead review
-// 2026-09-09). Next carries the actual recorded next step, so a resumed
-// investigation states its real checkpoint instead of nothing.
-func abilityChangedCandidate(a, b *model.OperatorBriefing, prior, current model.ActionContract) (model.MaterialCandidate, bool) {
-	limitation := func(code string, cleared bool) (model.MaterialCandidate, bool) {
+//   - the contract obstacle: newly blocked, blocked under a DIFFERENT
+//     recorded reason, or newly cleared — never a repeated, unchanged blocked
+//     cycle. The code always identifies the limitation actually reported:
+//     the newly recorded obstacle when blocking, and the obstacle reported
+//     BEFORE when clearing it, so B5 §5 can match it against
+//     CommunicatedLimitationCodes (R4 repair, lead review 2026-09-09);
+//   - the coverage gap: the recorded unavailable-investigation aggregate
+//     rising is a new limitation under the stable code
+//     LimitationInvestigationUnavailable, and that aggregate actually
+//     ending (positive -> zero) is its clearance. A partial fall claims no
+//     clearance while some unavailable work remains, and member removal is
+//     not proof a removed incident resumed — the code names the recorded
+//     aggregate, never a particular backend.
+//
+// Next carries the actual recorded next step, so a resumed investigation
+// states its real checkpoint instead of nothing; an obstacle clearing does
+// not itself prove execution resumed.
+func abilityChangedCandidates(a, b *model.OperatorBriefing, prior, current model.ActionContract) []model.MaterialCandidate {
+	limitation := func(code string, cleared bool) model.MaterialCandidate {
 		return model.MaterialCandidate{
 			Kind:       model.CandidateAbilityChanged,
 			Limitation: &model.LimitationFacts{Code: code, Cleared: cleared},
 			Next:       workNextStep(b),
-		}, true
+		}
 	}
+	var out []model.MaterialCandidate
 	priorBlocked, blocked := operatorBlocked(prior), operatorBlocked(current)
 	priorCode, code := waitReasonCode(prior.WaitReason), waitReasonCode(current.WaitReason)
 	switch {
 	case blocked && !priorBlocked:
-		return limitation(code, false)
+		out = append(out, limitation(code, false))
 	case blocked && priorBlocked && code != priorCode:
-		return limitation(code, false)
+		out = append(out, limitation(code, false))
 	case priorBlocked && !blocked:
-		return limitation(priorCode, true)
-	case a != nil && b != nil && b.Unavailable > a.Unavailable:
-		// A member investigation became unavailable while the contract
-		// itself stayed unblocked: a real coverage limitation with no
-		// WaitReason of its own, so it carries its own stable code rather
-		// than borrowing an unrelated one.
-		return limitation(model.LimitationInvestigationUnavailable, false)
+		out = append(out, limitation(priorCode, true))
 	}
-	return model.MaterialCandidate{}, false
+	if a != nil && b != nil {
+		switch {
+		case b.Unavailable > a.Unavailable:
+			out = append(out, limitation(model.LimitationInvestigationUnavailable, false))
+		case a.Unavailable > 0 && b.Unavailable == 0:
+			out = append(out, limitation(model.LimitationInvestigationUnavailable, true))
+		}
+	}
+	return out
 }
 
 // actionChangedCandidate distinguishes a recorded operator Action newly
@@ -740,14 +882,8 @@ func MaterialCandidates(prior *model.Transition, tr model.Transition) []model.Ma
 	}
 
 	out = append(out, findingCandidates(a, b)...)
-
-	if cand, ok := inconclusiveCompletionCandidate(a, b); ok {
-		out = append(out, cand)
-	}
-
-	if cand, ok := abilityChangedCandidate(a, b, prior.ActionContract, tr.ActionContract); ok {
-		out = append(out, cand)
-	}
+	out = append(out, endedWorkCandidates(a, b)...)
+	out = append(out, abilityChangedCandidates(a, b, prior.ActionContract, tr.ActionContract)...)
 
 	if cand, ok := actionChangedCandidate(prior.ActionContract.OperatorActionRequired, tr.ActionContract.OperatorActionRequired); ok {
 		out = append(out, cand)
@@ -758,10 +894,13 @@ func MaterialCandidates(prior *model.Transition, tr model.Transition) []model.Ma
 		// never the bounded display-name list length and never
 		// Situation.Total — slide 4's "investigating [recorded count] alerts"
 		// states a real count or none at all (R3 repair, lead review
-		// 2026-09-09).
+		// 2026-09-09). CountKnown qualifies it: a projection that cannot
+		// prove its union was complete reports an unknown count (0), which
+		// B4/B5 must not render as a number (lead decision B, round 2).
+		count := investigatedInputCount(b.Work)
 		out = append(out, model.MaterialCandidate{
 			Kind:    model.CandidateFirstExecutionAssurance,
-			Members: &model.MemberFacts{NowFiring: b.Work.InvestigatedNames, FiringCount: investigatedInputCount(b.Work), Total: b.Total},
+			Members: &model.MemberFacts{NowFiring: b.Work.InvestigatedNames, FiringCount: count, CountKnown: count > 0, Total: b.Total},
 			Next:    workNextStep(b),
 		})
 	}

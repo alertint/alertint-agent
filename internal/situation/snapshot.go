@@ -230,6 +230,40 @@ type TriageExecution struct {
 	AttemptNumber     int
 	StartedAt         time.Time
 	MemberDeliveryIDs []string
+
+	// ResultCode/OutputDigest/CompletedAt are the same row's durable
+	// completion columns (result_code, output_digest, completed_at) — empty/
+	// nil while the attempt is still in flight (lead decision D, round 2,
+	// 2026-09-09: existing attempt result identity, code and completion/
+	// digest metadata read by the same-transaction loader). Presentation and
+	// completion-provenance input only: no digest, hash, fact or assessment
+	// prompt reads them (TriageState.LatestAttempt remains the acute_finding
+	// fact's own, separately populated source).
+	ResultCode   string
+	OutputDigest string
+	CompletedAt  *time.Time
+
+	// Evidence is this attempt's accepted result, present ONLY when the
+	// Incident's current accepted output was positively matched to this
+	// attempt through OutputDigest (internal/store's
+	// loadMatchedCompletionEvidenceTx) — never joined on incident id alone,
+	// so a different attempt's output is never borrowed. Nil means evidence
+	// unavailable/unmatched, which establishes nothing about a hypothesis.
+	Evidence *TriageCompletionEvidence
+}
+
+// TriageCompletionEvidence is the bounded, matched accepted output of one
+// successful attempt, selected independently of the top-three analysis
+// overview so a completion outside that overview keeps its own provenance.
+// Hypothesis is the recorded root cause only — a positively loaded EMPTY
+// hypothesis is a real fact here (an accepted completion with no causal
+// finding), distinct from Evidence being nil.
+type TriageCompletionEvidence struct {
+	Hypothesis        string
+	Observations      []string
+	VerificationLimit string
+	VerificationGaps  int
+	JudgedAt          *time.Time
 }
 
 // TriageAttemptResult is the most recent completed incident_triage_attempts

@@ -427,9 +427,16 @@ func briefingInconclusiveLine(d *model.OperatorDelta) string {
 			continue
 		}
 		line := "Investigation inconclusive."
-		if c.Finding != nil && len(c.Finding.Observations) > 0 {
+		switch {
+		case c.Outcome != nil && !c.Outcome.EvidenceKnown:
+			// A typed exhaustion retained its result code and end time, not
+			// the checks it ran: state that limit rather than inventing
+			// checked sources or claiming what the evidence showed (lead
+			// decision D, round 2, 2026-09-09).
+			line += " The attempt ended with result " + briefingText(c.Outcome.ResultCode, 60) + "; the checks it ran were not retained, so no supporting observations can be stated."
+		case c.Finding != nil && len(c.Finding.Observations) > 0:
 			line += " " + briefingText(strings.Join(c.Finding.Observations, "; "), 300) + "; the available evidence did not establish a cause."
-		} else {
+		default:
 			line += " No supporting observations were recorded; the available evidence did not establish a cause."
 		}
 		// A recorded unknown is the decision-relevant half of an

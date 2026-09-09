@@ -382,3 +382,25 @@ func TestBriefingInconclusiveKeepsUnknownsAndRecordedNextStep(t *testing.T) {
 		t.Errorf("a delta with no candidate keeps the legacy wording: %s", legacy)
 	}
 }
+
+// Lead decision D (round 2, 2026-09-09): an exhaustion whose attempt retained
+// its result code but not the checks it ran must state that limit, never
+// invent checked sources or claim what the evidence showed.
+func TestBriefingInconclusiveStatesRetainedLimitWhenEvidenceUnknown(t *testing.T) {
+	line := briefingInconclusiveLine(&model.OperatorDelta{Candidates: []model.MaterialCandidate{{
+		Kind:    model.CandidateInconclusiveCompletion,
+		Finding: &model.FindingFacts{IncidentID: "inc-x"},
+		Outcome: &model.IncidentWorkOutcome{IncidentID: "inc-x", AttemptID: "a-5", Phase: model.WorkPhaseExhausted, ResultCode: "provider_error"},
+		Next:    model.NextStepFacts{Kind: model.NextStepStatusCheck},
+	}}})
+	// briefingText escapes the underscore for mrkdwn safety; the code is
+	// still legible, so match its stem.
+	for _, want := range []string{"Investigation inconclusive", "result provider", "were not retained", "No further analysis retry is scheduled"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("exhaustion line lost %q: %s", want, line)
+		}
+	}
+	if strings.Contains(line, "did not establish a cause") || strings.Contains(line, "No supporting observations were recorded") {
+		t.Errorf("unknown evidence must not be described as examined evidence: %s", line)
+	}
+}

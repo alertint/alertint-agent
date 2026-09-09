@@ -6,9 +6,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/situation"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
@@ -65,4 +68,82 @@ func loadSituationAnalysesTx(ctx context.Context, tx *sql.Tx, id string) ([]mode
 		out = append(out, model.BoundIncidentAnalysis(a))
 	}
 	return out, total, rows.Err()
+}
+
+// loadMatchedCompletionEvidenceTx reads incidentID's current accepted output
+// inside the same transaction and returns its bounded evidence ONLY when the
+// success completion digest recomputed over that output (findingOutputDigest,
+// the exact content completeSuccessTx recorded on the attempt row) equals
+// outputDigest — the positive attempt↔output match lead decision D (round 2,
+// 2026-09-09) requires before a completion's result may be attributed to an
+// attempt. Selected independently of loadSituationAnalysesTx's top-three
+// overview and its non-empty title/root-cause filter, so an accepted
+// completion with an EMPTY root cause (no causal hypothesis) is still a
+// positively loaded fact here rather than a missing analysis. Returns nil
+// evidence (never an error) when the Incident is not in an accepted state,
+// carries no output, or its output no longer reproduces the digest: evidence
+// unmatched, which establishes nothing. Raw output/enrichment are read only to
+// recompute the digest and select bounded fields; they never cross the
+// transaction. matched reports whether evidence was positively matched.
+func loadMatchedCompletionEvidenceTx(ctx context.Context, tx *sql.Tx, incidentID, outputDigest string) (ev *situation.TriageCompletionEvidence, matched bool, err error) {
+	var status string
+	var outputJSON, summary, rootCause, enrichment, judged sql.NullString
+	var confidence sql.NullFloat64
+	err = tx.QueryRowContext(ctx, `
+		SELECT status, output_json, summary, root_cause, confidence, enrichment_json, last_judged_at
+		FROM incidents WHERE id = ?`, incidentID).
+		Scan(&status, &outputJSON, &summary, &rootCause, &confidence, &enrichment, &judged)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("store: read incident completion evidence: %w", err)
+	}
+	if status != "analyzed" && status != "resolved" {
+		return nil, false, nil
+	}
+	recorded := findingOutputDigest(TriageFinding{
+		OutputJSON: outputJSON.String, Summary: summary.String, RootCause: rootCause.String,
+		Confidence: confidence.Float64, EnrichmentJSON: enrichment.String,
+	})
+	if recorded != outputDigest {
+		return nil, false, nil
+	}
+
+	ev = &situation.TriageCompletionEvidence{Hypothesis: strings.TrimSpace(rootCause.String)}
+	var output struct {
+		CorrelationFindings []string `json:"correlation_findings"`
+	}
+	if outputJSON.Valid && json.Unmarshal([]byte(outputJSON.String), &output) == nil {
+		ev.Observations = output.CorrelationFindings
+	}
+	var envelope struct {
+		Verification struct {
+			DegradationReason string `json:"degradation_reason"`
+			Rounds            []struct {
+				Queries []struct {
+					Outcome string `json:"outcome"`
+				} `json:"queries"`
+			} `json:"rounds"`
+		} `json:"verification"`
+	}
+	if enrichment.Valid && json.Unmarshal([]byte(enrichment.String), &envelope) == nil {
+		ev.VerificationLimit = envelope.Verification.DegradationReason
+		for _, r := range envelope.Verification.Rounds {
+			for _, q := range r.Queries {
+				if q.Outcome != "fetched" && q.Outcome != "empty" {
+					ev.VerificationGaps++
+				}
+			}
+		}
+	}
+	if judged.Valid {
+		at, err := time.Parse(time.RFC3339Nano, judged.String)
+		if err != nil {
+			return nil, false, fmt.Errorf("store: parse completion judgment time: %w", err)
+		}
+		at = at.UTC()
+		ev.JudgedAt = &at
+	}
+	return ev, true, nil
 }
