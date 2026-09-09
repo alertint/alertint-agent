@@ -76,6 +76,28 @@ type DeliveredHistory struct {
 	// ProjectedAction is the operator Action the same ordered fold leaves
 	// standing: nil once the last delivered-or-owed candidate withdraws it.
 	ProjectedAction *model.OperatorAction
+	// AssuranceSuperseded is the PRESENT-relevance answer for the start
+	// assurance, and the only field here that looks FORWARD from the reply
+	// being delivered: a later Transition that earns a reply of its own has
+	// already recorded a useful finding, an inconclusive completion or the
+	// Situation's terminal end, so "investigating" is no longer where the
+	// work is.
+	//
+	// It is deliberately not folded into the sets above, and it does not
+	// loosen their bound. A later correction may not rewrite what an
+	// earlier message was allowed to say about a limitation or an action:
+	// that ordering stays bounded strictly below the reply's own sequence.
+	// The assurance is a different kind of statement — it describes the
+	// present, so a present that has moved on makes it stale rather than
+	// wrong at the time.
+	//
+	// §5.3's commit-time supersession already retires a PURELY transient
+	// assurance row this way. A row that also carries material member or
+	// scope history is not disposable (R3), so the same overtaking
+	// vocabulary is applied to the candidate instead: the row still posts,
+	// and only its stale assurance is dropped (lead review round 3,
+	// 2026-09-09, R1).
+	AssuranceSuperseded bool
 }
 
 // limitationStanding reports whether code is left standing by the ordered
@@ -96,6 +118,14 @@ func (h DeliveredHistory) limitationStanding(code string) bool {
 // is still asked of the operator once every owed reply has landed.
 func (h DeliveredHistory) requestStanding() bool {
 	return h.ProjectedAction != nil
+}
+
+// assuranceStale reports whether the first-execution assurance no longer
+// belongs on the operator's screen. Two independent reasons, both fatal to
+// it: they have already seen it, or the work has visibly moved past merely
+// starting before this reply reached them (AssuranceSuperseded).
+func (h DeliveredHistory) assuranceStale() bool {
+	return h.AssuranceConveyed || h.AssuranceSuperseded
 }
 
 func containsString(list []string, s string) bool {
@@ -135,7 +165,11 @@ func ReplyEligible(cands []model.MaterialCandidate, h DeliveredHistory, rootPubl
 	for _, c := range cands {
 		switch c.Kind { //nolint:exhaustive // every other candidate kind is an unconditional structural fact B3 already decided; only these three carry a delivery-history-dependent eligibility rule.
 		case model.CandidateFirstExecutionAssurance:
-			if h.AssuranceConveyed {
+			// The one candidate whose eligibility looks FORWARD as well as
+			// back: an assurance still riding a retained mixed row after a
+			// finding, an inconclusive completion or the terminal end has
+			// been overtaken, and the row's other facts post without it.
+			if h.assuranceStale() {
 				continue
 			}
 		case model.CandidateAbilityChanged:

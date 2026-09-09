@@ -74,9 +74,10 @@ type DelivererStore interface {
 	GetDeliveryGap(ctx context.Context, gapGeneration string) (store.GapSnapshot, error)
 
 	// GetCommunicatedHistory reads what the operator has already been told,
-	// or is still owed, before the reply being delivered — the same
-	// DeliveredHistory the planner filtered against, re-read at delivery
-	// time so the outbound payload carries only the selected facts.
+	// what is still owed, and what has overtaken this reply since it was
+	// planned — the same DeliveredHistory the planner filtered against,
+	// re-read at delivery time so the outbound payload carries only the
+	// selected facts.
 	GetCommunicatedHistory(ctx context.Context, situationID string, beforeSequence int) (situation.DeliveredHistory, error)
 }
 
@@ -287,7 +288,12 @@ func (d *SituationDeliverer) deliverThreadAppend(ctx context.Context, intent mod
 //     included. A reply the planner earned through the supported symptoms
 //     fallback carries candidates delivered history may reject in full;
 //     posting the original instead published exactly the facts the
-//     selection had refused (lead review round 2, 2026-09-09, R1).
+//     selection had refused (lead review round 2, 2026-09-09, R1);
+//   - the re-read answers what has happened SINCE the reply was planned as
+//     well as before it. A retained start-plus-scope row delivered after a
+//     finding, an inconclusive completion or the terminal end keeps its
+//     material scope change and loses its overtaken assurance (lead review
+//     round 3, 2026-09-09, R1).
 //
 // The disposition for an empty selection is therefore explicit: the reply
 // is delivered narrowed. It still renders this Transition's own status,

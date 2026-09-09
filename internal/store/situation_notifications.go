@@ -746,6 +746,11 @@ const (
 //     correction planned meanwhile must survive (R5); and a queued
 //     clearance really does cancel a delivered appearance, so an obstacle
 //     recorded again behind it is news, not a duplicate (round 2, R2);
+//   - a Transition LATER than the reply being delivered, carrying a
+//     finding, an inconclusive completion or the terminal end and earning
+//     a reply of its own, has overtaken that reply's start assurance. This
+//     is the one forward-looking read, and it is asked only when the caller
+//     bounded the load to one reply (round 3, R1);
 //   - DELIVERED root_sync rows carry the assurance only through their own
 //     authority Transition's recorded Briefing.Work.ExecutionStarted
 //     (§5.2). The CURRENT Episode summary cannot answer this — the root
@@ -788,6 +793,15 @@ func loadCommunicatedHistoryTx(ctx context.Context, tx *sql.Tx, situationID stri
 		return out, err
 	}
 	out.ProjectedLimitationCodes, out.ProjectedAction = foldLimitationsAndAction(standing)
+
+	if beforeSequence > 0 {
+		// Only a bounded read is being asked about one particular reply, so
+		// only a bounded read has a reply to look forward from.
+		out.AssuranceSuperseded, err = assuranceOvertakenTx(ctx, tx, situationID, beforeSequence)
+		if err != nil {
+			return out, err
+		}
+	}
 
 	if rootPublished && !out.AssuranceConveyed {
 		roots, err := historyTransitionsTx(ctx, tx, situationID, `'root_sync'`, historyDelivered, beforeSequence)
@@ -869,6 +883,74 @@ func transitionConveysAssurance(tr situationmodel.Transition) bool {
 		return false
 	}
 	return tr.JournalKind == situationmodel.JournalInvestigationStarted
+}
+
+// assuranceOvertakenBy names the supersession reason a candidate kind
+// carries for a stale start assurance, if any. ONE vocabulary, shared by
+// §5.3's commit-time row supersession and the delivery-time candidate
+// check, so the two can never drift apart.
+func assuranceOvertakenBy(kind situationmodel.CandidateKind) (string, bool) {
+	switch kind { //nolint:exhaustive // every other candidate kind leaves the start assurance's own claim untouched; the default is the answer for all of them.
+	case situationmodel.CandidateTerminalEnd:
+		return SupersessionReasonTerminalEnd, true
+	case situationmodel.CandidateUsefulFinding, situationmodel.CandidateInconclusiveCompletion:
+		return SupersessionReasonFinding, true
+	default:
+		return "", false
+	}
+}
+
+// assuranceOvertakenTx reports whether the start assurance a reply at
+// afterSequence still carries has already been overtaken: a LATER
+// Transition earns a reply of its own — delivered or still owed — and that
+// Transition recorded a finding, an inconclusive completion or the
+// Situation's terminal end.
+//
+// §5.3 answers the same question at commit time and retires the whole row,
+// but only when every fact on it is the transient assurance. A row that
+// also carries material member or scope history is not disposable (R3), so
+// it survives to be delivered later; this read is how its assurance alone
+// is dropped at that point, leaving the material facts to post (lead review
+// round 3, 2026-09-09, R1).
+//
+// It is the only read in this file that looks forward. The limitation and
+// action folds stay bounded strictly BELOW the reply's own sequence,
+// because a later correction may not rewrite what an earlier message was
+// allowed to say. An assurance is a claim about the present, not a record
+// of the past, so the present is what decides it.
+func assuranceOvertakenTx(ctx context.Context, tx *sql.Tx, situationID string, afterSequence int) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT `+transitionColumns+`
+		FROM situation_transitions
+		WHERE situation_id = ? AND sequence > ? AND id IN (
+			SELECT transition_id FROM notification_intents
+			WHERE situation_id = ? AND effect_class IN (`+historyReplyClasses+`)
+			  AND status IN (`+historyStanding+`)
+		)
+		ORDER BY sequence ASC`, situationID, afterSequence, situationID)
+	if err != nil {
+		return false, fmt.Errorf("store: query overtaking transitions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	overtaken := false
+	for rows.Next() {
+		tr, err := scanTransition(rows)
+		if err != nil {
+			return false, fmt.Errorf("store: scan overtaking transition: %w", err)
+		}
+		if d := tr.Projection.OperatorDelta; d != nil {
+			for _, c := range d.Candidates {
+				if _, ok := assuranceOvertakenBy(c.Kind); ok {
+					overtaken = true
+				}
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("store: iterate overtaking transitions: %w", err)
+	}
+	return overtaken, nil
 }
 
 // foldLimitationsAndAction folds one sequence-ordered set of reply
@@ -999,10 +1081,12 @@ func purelyTransientAssurance(tr situationmodel.Transition) bool {
 	return true
 }
 
-// GetCommunicatedHistory reads what the operator has already been told, and
-// what will be standing once everything owed lands, for situationID —
-// bounded to replies whose Transition sequence is strictly below
-// beforeSequence (0 or less means unbounded).
+// GetCommunicatedHistory reads what the operator has already been told,
+// what will be standing once everything owed lands, and whether anything
+// has overtaken this reply's start assurance, for situationID. The first
+// two are bounded to replies whose Transition sequence is strictly below
+// beforeSequence (0 or less means unbounded); the third is the one
+// forward-looking question and is answered only for a bounded read.
 // The Slack deliverer calls it immediately before rendering one reply, so
 // the payload it posts carries exactly the facts ReplyEligible accepted
 // (B0 integration contract §4/§5; lead review 2026-09-09, R1).
@@ -1092,14 +1176,16 @@ outer:
 			continue
 		}
 		for _, c := range tr.Projection.OperatorDelta.Candidates {
-			switch c.Kind { //nolint:exhaustive // only these three candidate kinds ever overtake a stale assurance (§5.3); every other kind is irrelevant to this decision.
-			case situationmodel.CandidateTerminalEnd:
-				overtakingTransitionID, reason = tr.ID, SupersessionReasonTerminalEnd
+			overtakes, ok := assuranceOvertakenBy(c.Kind)
+			if !ok {
+				continue
+			}
+			if overtakes == SupersessionReasonTerminalEnd {
+				overtakingTransitionID, reason = tr.ID, overtakes
 				break outer
-			case situationmodel.CandidateUsefulFinding, situationmodel.CandidateInconclusiveCompletion:
-				if overtakingTransitionID == "" {
-					overtakingTransitionID, reason = tr.ID, SupersessionReasonFinding
-				}
+			}
+			if overtakingTransitionID == "" {
+				overtakingTransitionID, reason = tr.ID, overtakes
 			}
 		}
 	}
