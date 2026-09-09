@@ -275,8 +275,8 @@ func TestB5TrulyUnreportedObstacleClearanceStaysQuiet(t *testing.T) {
 	snDeliver(t, st, snClaimOne(t, st, now), "100.1", now.Add(time.Second))
 
 	h := b5r2History(t, st, id)
-	if len(h.OwedLimitationCodes) != 0 || len(h.CommunicatedLimitationCodes) != 0 {
-		t.Fatalf("fixture: nothing should be owed or communicated yet: %+v", h)
+	if len(h.ProjectedLimitationCodes) != 0 || len(h.CommunicatedLimitationCodes) != 0 {
+		t.Fatalf("fixture: nothing should be standing or communicated yet: %+v", h)
 	}
 }
 
@@ -316,7 +316,7 @@ func TestB5CommunicatedHistoryIsBoundedToWhatCameBefore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetCommunicatedHistory: %v", err)
 	}
-	if !containsCode(after.CommunicatedLimitationCodes, model.LimitationInvestigationUnavailable) {
+	if !containsUnavailable(after.CommunicatedLimitationCodes) {
 		t.Fatalf("the clearance reply must see the delivered obstacle as communicated: %+v", after)
 	}
 
@@ -330,21 +330,23 @@ func TestB5CommunicatedHistoryIsBoundedToWhatCameBefore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetCommunicatedHistory: %v", err)
 	}
-	if !containsCode(replay.CommunicatedLimitationCodes, model.LimitationInvestigationUnavailable) {
+	if !containsUnavailable(replay.CommunicatedLimitationCodes) {
 		t.Fatalf("a redelivery of the clearance must still see the obstacle it corrects: %+v", replay)
 	}
 	whole, err := st.GetCommunicatedHistory(ctx, id, 0)
 	if err != nil {
 		t.Fatalf("GetCommunicatedHistory: %v", err)
 	}
-	if containsCode(whole.CommunicatedLimitationCodes, model.LimitationInvestigationUnavailable) {
+	if containsUnavailable(whole.CommunicatedLimitationCodes) {
 		t.Fatalf("the unbounded net history must show the obstacle cleared: %+v", whole)
 	}
 }
 
-func containsCode(list []string, code string) bool {
+// containsUnavailable reports whether the folded set still carries the
+// coverage-limitation code these fixtures record.
+func containsUnavailable(list []string) bool {
 	for _, v := range list {
-		if v == code {
+		if v == model.LimitationInvestigationUnavailable {
 			return true
 		}
 	}

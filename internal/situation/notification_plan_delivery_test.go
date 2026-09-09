@@ -83,6 +83,19 @@ func TestReplyEligibleUnconditionalKinds(t *testing.T) {
 	}
 }
 
+// deliveredLimitation is the ordinary history for a limitation the
+// operator has been told about with nothing queued against it: delivered,
+// and therefore also still standing. The two are separate fields because
+// they answer different questions — a clearance already owed cancels the
+// standing appearance without changing what was communicated (lead review
+// round 2, 2026-09-09, R2).
+func deliveredLimitation(code string) DeliveredHistory {
+	return DeliveredHistory{
+		CommunicatedLimitationCodes: []string{code},
+		ProjectedLimitationCodes:    []string{code},
+	}
+}
+
 // 7/8: a NEWLY appearing limitation is eligible unless it is already (still)
 // communicated — defensive idempotency, since MaterialCandidates only fires
 // a fresh appearance on a genuine prior!=current diff.
@@ -93,7 +106,7 @@ func TestReplyEligibleAbilityChangedAppearing(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("a never-communicated limitation appearing must be eligible: %v", got)
 	}
-	got = ReplyEligible([]model.MaterialCandidate{cand}, DeliveredHistory{CommunicatedLimitationCodes: []string{"evidence_source_unavailable"}}, true)
+	got = ReplyEligible([]model.MaterialCandidate{cand}, deliveredLimitation("evidence_source_unavailable"), true)
 	if len(got) != 0 {
 		t.Fatalf("an already-communicated appearance must not be replanned: %v", got)
 	}
@@ -105,7 +118,7 @@ func TestReplyEligibleAbilityChangedAppearing(t *testing.T) {
 func TestReplyEligibleAbilityChangedClearing(t *testing.T) {
 	cand := model.MaterialCandidate{Kind: model.CandidateAbilityChanged, Limitation: &model.LimitationFacts{Code: "evidence_source_unavailable", Cleared: true}}
 
-	got := ReplyEligible([]model.MaterialCandidate{cand}, DeliveredHistory{CommunicatedLimitationCodes: []string{"evidence_source_unavailable"}}, true)
+	got := ReplyEligible([]model.MaterialCandidate{cand}, deliveredLimitation("evidence_source_unavailable"), true)
 	if len(got) != 1 {
 		t.Fatalf("clearing a communicated limitation must be eligible: %v", got)
 	}
@@ -116,7 +129,7 @@ func TestReplyEligibleAbilityChangedClearing(t *testing.T) {
 	// A distinct simultaneous limitation's own communicated state must not
 	// leak into this one (spec.md "Distinct simultaneous limitations remain
 	// independent").
-	got = ReplyEligible([]model.MaterialCandidate{cand}, DeliveredHistory{CommunicatedLimitationCodes: []string{"other_code"}}, true)
+	got = ReplyEligible([]model.MaterialCandidate{cand}, deliveredLimitation("other_code"), true)
 	if len(got) != 0 {
 		t.Fatalf("an unrelated communicated code must not clear this one: %v", got)
 	}
@@ -134,7 +147,7 @@ func TestReplyEligibleActionChanged(t *testing.T) {
 	if got := ReplyEligible([]model.MaterialCandidate{withdrawn}, DeliveredHistory{}, true); len(got) != 0 {
 		t.Fatalf("withdrawing a never-communicated action must not be eligible: %v", got)
 	}
-	if got := ReplyEligible([]model.MaterialCandidate{withdrawn}, DeliveredHistory{CommunicatedAction: &action}, true); len(got) != 1 {
+	if got := ReplyEligible([]model.MaterialCandidate{withdrawn}, DeliveredHistory{CommunicatedAction: &action, ProjectedAction: &action}, true); len(got) != 1 {
 		t.Fatalf("withdrawing a communicated action must be eligible: %v", got)
 	}
 	if got := ReplyEligible([]model.MaterialCandidate{introduced}, DeliveredHistory{}, true); len(got) != 1 {

@@ -283,9 +283,17 @@ func (d *SituationDeliverer) deliverThreadAppend(ctx context.Context, intent mod
 //   - a rejected candidate must not return through B4's legacy-boolean
 //     fallback, which fires exactly when no candidate of that kind rode the
 //     delta — so a kind rejected in full takes its legacy twin with it;
-//   - narrowing never empties a reply the planner earned. If nothing
-//     survives, the planned payload is delivered unchanged: an empty Slack
-//     message would be a worse answer than a redundant one.
+//   - the narrowing applies whatever survives, the empty selection
+//     included. A reply the planner earned through the supported symptoms
+//     fallback carries candidates delivered history may reject in full;
+//     posting the original instead published exactly the facts the
+//     selection had refused (lead review round 2, 2026-09-09, R1).
+//
+// The disposition for an empty selection is therefore explicit: the reply
+// is delivered narrowed. It still renders this Transition's own status,
+// next step and recorded action, and any earned legacy content the
+// selection does not govern — a changed symptom above all — so it is never
+// an empty Slack message; what it never carries is a rejected fact.
 //
 // The durable Transition is never mutated: the delta is copied first.
 func (d *SituationDeliverer) selectedTransition(ctx context.Context, intent model.NotificationIntent, tr model.Transition) (model.Transition, error) {
@@ -301,7 +309,7 @@ func (d *SituationDeliverer) selectedTransition(ctx context.Context, intent mode
 	// A reply is only ever delivered under an existing root, so the
 	// initial-publication rule cannot apply here.
 	eligible := situation.ReplyEligible(delta.Candidates, history, true)
-	if len(eligible) == 0 || len(eligible) == len(delta.Candidates) {
+	if len(eligible) == len(delta.Candidates) {
 		return tr, nil
 	}
 

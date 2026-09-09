@@ -139,7 +139,10 @@ func TestSituationDelivererKeepsACommunicatedObstaclesClearance(t *testing.T) {
 	fs := &fakeDelivererStore{transitions: map[string]model.Transition{tr.ID: tr},
 		rootOK: true, rootChannel: "C", rootTS: "100.1",
 		history: situation.DeliveredHistory{
-			CommunicatedLimitationCodes: []string{model.LimitationInvestigationUnavailable}}}
+			// Delivered, with nothing queued against it: the obstacle is
+			// both communicated and still standing.
+			CommunicatedLimitationCodes: []string{model.LimitationInvestigationUnavailable},
+			ProjectedLimitationCodes:    []string{model.LimitationInvestigationUnavailable}}}
 	api := &fakeSlackAPI{}
 	d := NewSituationDeliverer(fs, api, "C", func() time.Time { return now })
 	if _, err := d.Deliver(context.Background(), sdThreadIntent(model.EffectThreadAppend, tr.ID, tr.Sequence, now)); err != nil {
@@ -164,7 +167,12 @@ type dsOrderedStore struct {
 
 func (s *dsOrderedStore) GetCommunicatedHistory(_ context.Context, _ string, before int) (situation.DeliveredHistory, error) {
 	_ = before
-	return situation.DeliveredHistory{CommunicatedLimitationCodes: append([]string(nil), s.communicated...)}, nil
+	// Everything this deliverer has posted has landed and nothing is
+	// queued behind it, so the communicated set is also the standing one.
+	return situation.DeliveredHistory{
+		CommunicatedLimitationCodes: append([]string(nil), s.communicated...),
+		ProjectedLimitationCodes:    append([]string(nil), s.communicated...),
+	}, nil
 }
 
 func TestSituationDelivererDelayedObstacleIsFollowedByItsCorrection(t *testing.T) {

@@ -146,7 +146,9 @@ func TestReplyEligibleOwedObstacleKeepsItsClearance(t *testing.T) {
 	if got := ReplyEligible(clearing, DeliveredHistory{}, true); len(got) != 0 {
 		t.Fatalf("a genuinely unreported transient obstacle has nothing to correct: %v", rdKinds(got))
 	}
-	owed := DeliveredHistory{OwedLimitationCodes: []string{model.LimitationInvestigationUnavailable}}
+	// An obstacle that is owed but not yet delivered is standing: nothing
+	// queued behind it clears it.
+	owed := DeliveredHistory{ProjectedLimitationCodes: []string{model.LimitationInvestigationUnavailable}}
 	if got := ReplyEligible(clearing, owed, true); len(got) != 1 {
 		t.Fatalf("an obstacle still owed to the operator must keep its correction: %v", rdKinds(got))
 	}
@@ -156,7 +158,7 @@ func TestReplyEligibleOwedObstacleKeepsItsClearance(t *testing.T) {
 // queued must not be replanned as new while it waits.
 func TestReplyEligibleOwedObstacleSuppressesADuplicateAppearance(t *testing.T) {
 	appearing := []model.MaterialCandidate{rdLimitation(model.LimitationInvestigationUnavailable, false)}
-	owed := DeliveredHistory{OwedLimitationCodes: []string{model.LimitationInvestigationUnavailable}}
+	owed := DeliveredHistory{ProjectedLimitationCodes: []string{model.LimitationInvestigationUnavailable}}
 	if got := ReplyEligible(appearing, owed, true); len(got) != 0 {
 		t.Fatalf("an obstacle already queued must not be replanned as new: %v", rdKinds(got))
 	}
@@ -171,7 +173,7 @@ func TestReplyEligibleOwedActionKeepsItsWithdrawal(t *testing.T) {
 		t.Fatalf("nothing was ever requested, so nothing is withdrawn: %v", rdKinds(got))
 	}
 	action := model.OperatorActionInvestigateSituation
-	owed := DeliveredHistory{OwedAction: &action}
+	owed := DeliveredHistory{ProjectedAction: &action}
 	if got := ReplyEligible(withdrawal, owed, true); len(got) != 1 {
 		t.Fatalf("a request still owed to the operator must keep its withdrawal: %v", rdKinds(got))
 	}

@@ -59,41 +59,43 @@ type DeliveredHistory struct {
 	// introduced or revised, or nil once a delivered candidate withdraws it
 	// (or none has ever been communicated).
 	CommunicatedAction *model.OperatorAction
-	// OwedLimitationCodes is the set of LimitationFacts.Code values carried
-	// by a reply that is planned and still deliverable (pending,
-	// blocked_configuration or failed) but has NOT reached Slack yet. An
-	// obstacle waiting behind a delivery gap is not "unreported": it is
-	// still owed, and it WILL be published. A correction planned while it
-	// waits must therefore survive, or the stale obstacle lands with
-	// nothing behind it to correct it (lead review 2026-09-09, R5).
-	OwedLimitationCodes []string
-	// OwedAction is the operator Action introduced or revised by a reply
-	// that is still owed to the operator, for the same reason. Nil when the
-	// owed replies withdraw it or request nothing.
-	OwedAction *model.OperatorAction
+	// ProjectedLimitationCodes is the NET set of limitation codes left
+	// STANDING once every reply the operator has already seen AND every
+	// reply still owed to them (pending, blocked_configuration or failed)
+	// has landed: ONE fold in Transition-sequence order over both sets
+	// together, never two folds whose positive results are unioned.
+	//
+	// Both halves matter. An obstacle waiting behind a delivery gap is not
+	// "unreported" — it WILL be published, so a correction planned while it
+	// waits has to survive (R5). And a queued clearance really does cancel
+	// a delivered appearance, so the obstacle recorded AGAIN behind that
+	// clearance is news: a union could not express that, and suppressed the
+	// recurrence while the clearance stayed owed, leaving the operator's
+	// last word "coverage restored" (lead review round 2, 2026-09-09, R2).
+	ProjectedLimitationCodes []string
+	// ProjectedAction is the operator Action the same ordered fold leaves
+	// standing: nil once the last delivered-or-owed candidate withdraws it.
+	ProjectedAction *model.OperatorAction
 }
 
-// communicatedLimitation reports whether code is currently in h's
-// communicated set.
-func (h DeliveredHistory) communicatedLimitation(code string) bool {
-	return containsString(h.CommunicatedLimitationCodes, code)
+// limitationStanding reports whether code is left standing by the ordered
+// fold over everything delivered and everything still owed — the state the
+// operator ends up looking at once the queue drains. It is the only
+// question eligibility asks: a limitation still standing makes a repeated
+// appearance a duplicate and a clearing a real correction, and one no
+// longer standing makes the obstacle recorded again genuine news.
+//
+// The two halves of the history it is folded from stay separate on purpose.
+// CommunicatedLimitationCodes is what the operator HAS been told, which is
+// a different question and never a substitute for this one.
+func (h DeliveredHistory) limitationStanding(code string) bool {
+	return containsString(h.ProjectedLimitationCodes, code)
 }
 
-// limitationOnScreen reports whether the operator either already knows about
-// code or is going to: a delivered appearance, or one queued behind a
-// delivery gap that has not reached Slack yet. Both make a later clearing a
-// real correction, and both make a repeated appearance a duplicate.
-// Delivered-only was the incomplete boundary the lead's R5 exposed — a
-// stale obstacle published after its clearance had been dropped as
-// "unreported" leaves the operator with a limitation nothing ever corrects.
-func (h DeliveredHistory) limitationOnScreen(code string) bool {
-	return h.communicatedLimitation(code) || containsString(h.OwedLimitationCodes, code)
-}
-
-// requestOnScreen reports the same for a recorded operator action: one
-// already delivered, or one still owed.
-func (h DeliveredHistory) requestOnScreen() bool {
-	return h.CommunicatedAction != nil || h.OwedAction != nil
+// requestStanding reports the same for a recorded operator action: one that
+// is still asked of the operator once every owed reply has landed.
+func (h DeliveredHistory) requestStanding() bool {
+	return h.ProjectedAction != nil
 }
 
 func containsString(list []string, s string) bool {
@@ -140,27 +142,31 @@ func ReplyEligible(cands []model.MaterialCandidate, h DeliveredHistory, rootPubl
 			if c.Limitation == nil {
 				continue
 			}
-			onScreen := h.limitationOnScreen(c.Limitation.Code)
+			standing := h.limitationStanding(c.Limitation.Code)
 			if c.Limitation.Cleared {
-				if !onScreen {
+				if !standing {
 					// A genuinely unreported transient obstacle — never
-					// delivered and not waiting in the queue either — is not
-					// useful history (plan.md item 4): nothing was ever
-					// said, so there is nothing to correct.
+					// delivered, not waiting in the queue, and not left
+					// standing by anything owed — is not useful history
+					// (plan.md item 4): nothing was ever said, so there is
+					// nothing to correct.
 					continue
 				}
-			} else if onScreen {
+			} else if standing {
 				// Defensive idempotency: an appearance the operator already
-				// has, or is already owed, must not be replanned as new.
+				// has, or is already owed, must not be replanned as new. An
+				// appearance recorded after an owed clearance is NOT that
+				// case — the clearance leaves nothing standing.
 				continue
 			}
 		case model.CandidateActionChanged:
 			if c.Action == nil {
 				continue
 			}
-			if c.Action.Withdrawn && !h.requestOnScreen() {
-				// A withdrawal only corrects a request the operator has
-				// received or is still owed.
+			if c.Action.Withdrawn && !h.requestStanding() {
+				// A withdrawal only corrects a request that is actually
+				// still standing: one the operator has received, or is
+				// owed, and that nothing owed has withdrawn already.
 				continue
 			}
 		}

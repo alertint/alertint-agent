@@ -726,6 +726,11 @@ const (
 	historyReplyClasses = `'thread_append','broadcast_handoff'`
 	historyDelivered    = `'delivered'`
 	historyLive         = `'pending','blocked_configuration','failed'`
+	// historyStanding is the union the STANDING state is folded over, in
+	// one sequence-ordered pass: what the operator has seen plus what they
+	// are still owed. Folding the two families separately cannot express a
+	// queued correction of a delivered fact.
+	historyStanding = historyDelivered + `,` + historyLive
 )
 
 // loadDeliveredHistoryTx reads situationID's durable, delivery-aware
@@ -734,9 +739,13 @@ const (
 //
 //   - DELIVERED replies, folded in Transition-sequence order, are what the
 //     operator has actually been told;
-//   - LIVE replies (pending, blocked_configuration or failed) are what they
-//     are still owed — an obstacle waiting behind a delivery gap WILL be
-//     published, so a correction planned meanwhile must survive (R5);
+//   - DELIVERED and still-owed replies (pending, blocked_configuration or
+//     failed) folded TOGETHER, in one sequence-ordered pass, are what they
+//     will be looking at once the queue drains — the standing state. An
+//     obstacle waiting behind a delivery gap WILL be published, so a
+//     correction planned meanwhile must survive (R5); and a queued
+//     clearance really does cancel a delivered appearance, so an obstacle
+//     recorded again behind it is news, not a duplicate (round 2, R2);
 //   - DELIVERED root_sync rows carry the assurance only through their own
 //     authority Transition's recorded Briefing.Work.ExecutionStarted
 //     (§5.2). The CURRENT Episode summary cannot answer this — the root
@@ -774,11 +783,11 @@ func loadCommunicatedHistoryTx(ctx context.Context, tx *sql.Tx, situationID stri
 	}
 	out.CommunicatedLimitationCodes, out.CommunicatedAction = foldLimitationsAndAction(delivered)
 
-	live, err := historyTransitionsTx(ctx, tx, situationID, historyReplyClasses, historyLive, beforeSequence)
+	standing, err := historyTransitionsTx(ctx, tx, situationID, historyReplyClasses, historyStanding, beforeSequence)
 	if err != nil {
 		return out, err
 	}
-	out.OwedLimitationCodes, out.OwedAction = foldLimitationsAndAction(live)
+	out.ProjectedLimitationCodes, out.ProjectedAction = foldLimitationsAndAction(standing)
 
 	if rootPublished && !out.AssuranceConveyed {
 		roots, err := historyTransitionsTx(ctx, tx, situationID, `'root_sync'`, historyDelivered, beforeSequence)
@@ -864,7 +873,10 @@ func transitionConveysAssurance(tr situationmodel.Transition) bool {
 
 // foldLimitationsAndAction folds one sequence-ordered set of reply
 // Transitions into the NET limitation codes and operator action they leave
-// standing. Distinct codes stay independent.
+// standing. Distinct codes stay independent. Its two callers pass two
+// different sets — delivered only, and delivered together with still-owed —
+// and the ordering is what distinguishes them: a clearing only cancels an
+// appearance that comes before it.
 //
 // The fold reads every persisted candidate, not the subset the deliverer
 // selected, and still equals what actually rendered: ReplyEligible only ever
@@ -987,9 +999,10 @@ func purelyTransientAssurance(tr situationmodel.Transition) bool {
 	return true
 }
 
-// GetCommunicatedHistory reads what the operator has already been told —
-// or is still owed — for situationID, bounded to replies whose Transition
-// sequence is strictly below beforeSequence (0 or less means unbounded).
+// GetCommunicatedHistory reads what the operator has already been told, and
+// what will be standing once everything owed lands, for situationID —
+// bounded to replies whose Transition sequence is strictly below
+// beforeSequence (0 or less means unbounded).
 // The Slack deliverer calls it immediately before rendering one reply, so
 // the payload it posts carries exactly the facts ReplyEligible accepted
 // (B0 integration contract §4/§5; lead review 2026-09-09, R1).
