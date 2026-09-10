@@ -21,6 +21,32 @@ func briefingNextStep(t model.Transition, b *model.OperatorBriefing, deadline *t
 		return "Recovery could not be confirmed; tracking for this Situation has ended. No automatic retry or resumption is scheduled."
 	}
 	step := briefingWork(t.ActionContract, b, now)
+	// S1-05/S4-08 (§63): the recovery-pending lifecycle and outstanding
+	// investigation coexist, and only presentation can say both.
+	// deriveAlertINTBranch ranks EVERY triage phase and both Assessment
+	// retry phases above its own recovery-pending case, and
+	// ControllerState.TriagePhase is aggregateTriagePhase over the same
+	// member schedules BuildWorkProjection reduces — so a Situation
+	// confirming recovery while any work is outstanding always derives a
+	// work contract, and the branch that states the persisted grace
+	// deadline is unreachable for it. The deadline is a lifecycle fact,
+	// recorded on the transition that observed clearance and carried on the
+	// projection independently of which action the contract selected; it
+	// was reaching no operator at all in that state (canonical
+	// "recovery-with-work": "Recovery grace and investigation coexist.
+	// Lifecycle sets orientation; activity describes remaining work").
+	//
+	// The composition adds a clause; it changes no contract, decides no
+	// work and reorders no schedule. The work sentence below it is still
+	// the contract's own recorded truth, the status checkpoint still keeps
+	// its own clause, and a nil grace states no deadline rather than
+	// inventing one. A terminal lifecycle returned above, so nothing here
+	// can reopen an ended episode; a delivery-time superseded execution
+	// replaces this whole string in briefingJournalPresented, so a
+	// historical row gains no current promise from it either.
+	if t.Lifecycle == model.LifecycleRecoveryPending && !briefingRecoveryWatched(t.ActionContract) {
+		step = briefingRecoveryWatch(b.Work) + " " + step
+	}
 	if deadline == nil {
 		deadline = t.ActionContract.NextUpdateAt
 	}
@@ -91,17 +117,7 @@ func briefingWork(c model.ActionContract, b *model.OperatorBriefing, now time.Ti
 		}
 		return "Assessment is waiting; no retry time is recorded."
 	case model.AlertINTActionVerifyRecovery:
-		step := "Watching for sustained recovery"
-		if grace := b.Work.SourceGraceUntil; grace != nil {
-			// The recovery grace deadline is its OWN recorded time, distinct
-			// from the status checkpoint briefingNextStep appends below
-			// (canonical "recovery-with-work": "confirm recovery through
-			// [recorded grace deadline]; investigation status check at
-			// [recorded checkpoint]").
-			step += " through " + SlackDateToken(*grace, "{time}") + "."
-		} else {
-			step += "; the next check will reassess whether alerts remain clear."
-		}
+		step := briefingRecoveryWatch(b.Work)
 		if outstanding := briefingOutstandingWork(b, now); outstanding != "" {
 			step += " " + outstanding
 		}
@@ -134,6 +150,42 @@ func briefingWork(c model.ActionContract, b *model.OperatorBriefing, now time.Ti
 // alike (B0 §3; BuildWorkProjection). One executing schedule beside two
 // waiting ones is phase executing with three outstanding, so the count
 // proves how much work remains, never how much of it is running.
+// briefingRecoveryWatch states the observation the recovery-pending
+// lifecycle actually is, and the persisted deadline it runs to. The grace
+// deadline is its OWN recorded time, distinct from the status checkpoint
+// briefingNextStep appends and from every work time beside it (canonical
+// "recovery-with-work": "confirm recovery through [recorded grace deadline];
+// investigation status check at [recorded checkpoint]").
+//
+// A nil deadline says only what the record says: the observation is running
+// and the next check reassesses whether the alerts are still clear. Reading
+// a missing grace as an expiry, or borrowing the checkpoint for it, would
+// invent the one fact this sentence exists to state.
+func briefingRecoveryWatch(w model.WorkProjection) string {
+	const watching = "Watching for sustained recovery"
+	if grace := w.SourceGraceUntil; grace != nil {
+		return watching + " through " + SlackDateToken(*grace, "{time}") + "."
+	}
+	return watching + "; the next check will reassess whether alerts remain clear."
+}
+
+// briefingRecoveryWatched reports whether briefingWork's own verify_recovery
+// branch already stated the watch above, which is the one case where
+// composing it again would report a single recorded fact twice.
+func briefingRecoveryWatched(c model.ActionContract) bool {
+	if c.AlertINTAction == nil || c.AlertINTStatus == nil || *c.AlertINTAction != model.AlertINTActionVerifyRecovery {
+		return false
+	}
+	switch *c.AlertINTStatus {
+	case model.AlertINTStatusPlanned, model.AlertINTStatusRunning, model.AlertINTStatusWaiting:
+		return true
+	case model.AlertINTStatusBlocked, model.AlertINTStatusExhausted, model.AlertINTStatusComplete:
+		// briefingWork returns for these before the verify_recovery branch:
+		// they report an obstacle or an end, and state no watch of their own.
+	}
+	return false
+}
+
 func briefingOutstandingWork(b *model.OperatorBriefing, now time.Time) string {
 	w := b.Work
 	switch w.Phase {
@@ -144,12 +196,21 @@ func briefingOutstandingWork(b *model.OperatorBriefing, now time.Time) string {
 		return "An investigation is still running." + briefingOutstandingTotal(w)
 	case model.WorkPhaseRetryWait:
 		if at := w.RetryEligibleAt; at != nil {
-			// RetryEligibleAt is the EARLIEST recorded retry across the
-			// member schedules, so it dates one retry, not all of them.
+			// The waiting SCHEDULE is a triage back-off — this aggregate
+			// phase proves that much — but the TIME is not necessarily its
+			// own: RetryEligibleAt is the earliest of the member back-offs
+			// AND the committed Assessment-level retry
+			// (CommittedOperatorBriefing's overlay), and the projection
+			// records nothing that separates the two. Calling it an
+			// investigation retry asserted an owner the record cannot name
+			// (§63 correction), so the phase keeps its attribution and the
+			// instant loses one. Being the EARLIEST of several, it still
+			// dates ONE retry rather than all of them.
 			if w.RemainingIncidents == 1 {
-				return "One investigation retry is eligible at " + SlackDateToken(*at, "{time}") + "."
+				return "One investigation is waiting in back-off. " + briefingRetryEligibility("A recorded retry", *at, now)
 			}
-			return "The earliest investigation retry is eligible at " + SlackDateToken(*at, "{time}") + "." + briefingOutstandingTotal(w)
+			return "An investigation is waiting in back-off. " +
+				briefingRetryEligibility("The earliest recorded retry", *at, now) + briefingOutstandingTotal(w)
 		}
 		if w.RemainingIncidents == 1 {
 			return "One investigation is waiting in back-off; no retry time is recorded."
@@ -298,15 +359,25 @@ func briefingQueuedNotStarted(w model.WorkProjection) string {
 // stays silent: no back-off schedule and no assessment recorded a retry, and
 // the queued clause already carries this phase's actual wait.
 func briefingRecordedRetry(w model.WorkProjection, now time.Time) string {
-	at := w.RetryEligibleAt
-	if at == nil {
+	if w.RetryEligibleAt == nil {
 		return ""
 	}
-	when := SlackDateToken(*at, "{time}")
+	return " " + briefingRetryEligibility("A separately recorded retry", *w.RetryEligibleAt, now)
+}
+
+// briefingRetryEligibility states one recorded retry eligibility in the
+// tense the recorded instant actually supports, and leaves it unattributed:
+// eligibility is when a retry MAY be claimed, so a future instant is a
+// wait and a passed one is a fact, and neither is a promise that anything
+// runs then. subject carries only how many retries the caller's own
+// aggregate proves it speaks for — never whose retry it is, which
+// Work.RetryEligibleAt does not record.
+func briefingRetryEligibility(subject string, at, now time.Time) string {
+	when := SlackDateToken(at, "{time}")
 	if at.After(now) {
-		return " A separately recorded retry becomes eligible after " + when + "."
+		return subject + " becomes eligible after " + when + "."
 	}
-	return " A separately recorded retry is eligible as of " + when + "."
+	return subject + " is eligible as of " + when + "."
 }
 
 // briefingQueuedEligibility states what the record actually says about when

@@ -484,7 +484,9 @@ func TestRootSeparatesRetryGraceAndStatusTimes(t *testing.T) {
 	}
 	for _, want := range []string{
 		"sustained recovery through " + SlackDateToken(grace, "{time}"),
-		"retry is eligible at " + SlackDateToken(retry, "{time}"),
+		// §63: the same three distinct promises, with the retry clause no
+		// longer attributing a merged instant to the investigation.
+		"retry becomes eligible after " + SlackDateToken(retry, "{time}"),
 		"Next status check: " + SlackDateToken(checkpoint, "{time}"),
 	} {
 		if !strings.Contains(msg.Text, want) {
@@ -1066,8 +1068,9 @@ func TestRootRetryWaitDoesNotClaimASingleWaitingInvestigation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(msg.Text, "One investigation retry") {
+	if strings.Contains(msg.Text, "One investigation is waiting in back-off") {
 		t.Errorf("two outstanding schedules reported as one waiting retry:\n%s", msg.Text)
 	}
-	bcBothSurfaces(t, msg, "retry is eligible at "+SlackDateToken(retry, "{time}"), "2 member investigations have outstanding work")
+	bcBothSurfaces(t, msg, "The earliest recorded retry becomes eligible after "+SlackDateToken(retry, "{time}"),
+		"2 member investigations have outstanding work")
 }
