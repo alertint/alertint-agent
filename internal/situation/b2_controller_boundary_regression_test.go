@@ -35,7 +35,7 @@ import (
 func TestB2ControllerBackoffRetainsScopeAndDue(t *testing.T) {
 	f := newReplayFixture(t, "b2-controller-backoff")
 	defer f.close()
-	iid := f.setupReadyIncidentWithRequestedTriage("b2-controller-backoff", "HighLatency", "b2-controller-backoff-fp")
+	iid := f.setupReadyIncidentWithRequestedTriage("b2-controller-backoff", "b2-controller-backoff-fp")
 	sid := f.soleSituationID()
 	claim, err := f.st.ClaimIncidentTriageAttempt(f.ctx, iid, "b2-regression", f.clock.Now(), time.Minute)
 	if err != nil {

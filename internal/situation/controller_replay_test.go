@@ -279,16 +279,23 @@ func (f *replayFixture) setupDueSituation(group, alertname, fingerprint string) 
 	return f.soleSituationID()
 }
 
+// requestedTriageAlertName is the recorded alert name every
+// setupReadyIncidentWithRequestedTriage fixture posts; b2's own assertion on
+// WorkProjection.InvestigatedNames reads it back.
+const requestedTriageAlertName = "HighLatency"
+
 // setupReadyIncidentWithRequestedTriage boots f all the way through: POST ->
 // foundation drain -> mark ready -> one clean, uncrashed controller
 // convergence (a real accepting L2 client) so the owning Situation gets its
 // first authoritative Assessment and DecideTriage's own
 // DecisionReasonNoTrustworthyAssessment request decision moves the
 // Incident's durable schedule from awaiting_decision to pending, due now.
-// Shared by the boundary-6/7 (Triage-attempt) subtests.
-func (f *replayFixture) setupReadyIncidentWithRequestedTriage(group, alertname, fingerprint string) (incidentID string) {
+// Shared by the boundary-6/7 (Triage-attempt) subtests, which differentiate
+// their fixtures by group and fingerprint; the alert name is the same
+// recorded name in every one, so it is named here instead of passed in.
+func (f *replayFixture) setupReadyIncidentWithRequestedTriage(group, fingerprint string) (incidentID string) {
 	f.t.Helper()
-	f.postGroup(group, alertname, fingerprint)
+	f.postGroup(group, requestedTriageAlertName, fingerprint)
 	f.drainFoundation()
 	incidentID = f.soleIncidentID()
 	f.markReady(incidentID)
@@ -1455,7 +1462,7 @@ func testReplayRestartAfterCommitReusesWithoutRedispatch(t *testing.T) {
 // Boundary 6: after Triage attempt begin but before Acute Triage result.
 func testReplayCrashAfterTriageAttemptBeginBeforeResult(t *testing.T) {
 	f := newReplayFixture(t, "b6")
-	incID := f.setupReadyIncidentWithRequestedTriage("boundary6-group", "HighLatency", "fp-b6")
+	incID := f.setupReadyIncidentWithRequestedTriage("boundary6-group", "fp-b6")
 
 	f.clock.Advance(advanceMargin)
 	analyzer := crashingAnalyzer{boundary: "triage_attempt_begin_before_result"}
@@ -1519,7 +1526,7 @@ func testReplayCrashAfterTriageAttemptBeginBeforeResult(t *testing.T) {
 // Boundary 7: after Finding persistence but before worker return.
 func testReplayCrashAfterFindingPersistedBeforeWorkerReturn(t *testing.T) {
 	f := newReplayFixture(t, "b7")
-	incID := f.setupReadyIncidentWithRequestedTriage("boundary7-group", "HighLatency", "fp-b7")
+	incID := f.setupReadyIncidentWithRequestedTriage("boundary7-group", "fp-b7")
 
 	f.clock.Advance(advanceMargin)
 	successAnalyzer := &scriptedAnalyzer{fn: func(_ context.Context, claim situation.TriageAttemptClaim) (situation.AcuteResult, error) {

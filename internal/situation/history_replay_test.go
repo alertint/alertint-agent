@@ -1053,77 +1053,59 @@ func assertInvestigationReply(t *testing.T, st *store.Store, history string, ski
 	return strings.Join(rest, "\n")
 }
 
+// investigationOutcomeWant is the branch-dependent expectation set for one
+// S6 outcome. A crash strictly between DecideTriage's own decision commit
+// and the controller cycle that consumes its triage_skipped due reason can
+// split one uninterrupted cycle's real investigation into a crash run's
+// coverage-reuse skip (see assertInvestigationReply's doc comment) — the
+// Episode summary's own investigation_started flag and displayed latest
+// reason are real, truthful consequences of that different outcome, not a
+// fixed expectation either run should be forced to share.
+type investigationOutcomeWant struct {
+	pending, unavailable, analysis []int
+	status, summary                string
+	investigationStarted           bool
+	latestReason                   string
+}
+
+func investigationOutcomeWants(skipped bool) investigationOutcomeWant {
+	if skipped {
+		return investigationOutcomeWant{
+			pending: []int{1, 0, 0}, unavailable: []int{0, 1, 1}, analysis: []int{0, 0, 0},
+			status: "ready", summary: "",
+			investigationStarted: false,
+			latestReason:         string(situationmodel.ReasonTriageStateChanged),
+		}
+	}
+	return investigationOutcomeWant{
+		pending: []int{1, 1, 0}, unavailable: []int{0, 0, 0}, analysis: []int{0, 0, 1},
+		status: "analyzed", summary: "replay finding summary",
+		investigationStarted: true,
+		latestReason:         string(situationmodel.ReasonInvestigationConcluded),
+	}
+}
+
 func assertInvestigationOutcome(t *testing.T, st *store.Store, sid string, trs []situationmodel.Transition, skipped bool) {
 	t.Helper()
-	wantPending, wantUnavailable, wantAnalysis := []int{1, 1, 0}, []int{0, 0, 0}, []int{0, 0, 1}
-	wantStatus, wantSummary := "analyzed", "replay finding summary"
-	// A crash strictly between DecideTriage's own decision commit and the
-	// controller cycle that consumes its triage_skipped due reason can
-	// split one uninterrupted cycle's real investigation into a crash run's
-	// coverage-reuse skip (see assertInvestigationReply's doc comment) — the
-	// Episode summary's own investigation_started flag and displayed latest
-	// reason are real, truthful consequences of that different outcome, not
-	// a fixed expectation either run should be forced to share.
-	wantInvestigationStarted := true
-	wantLatestReason := string(situationmodel.ReasonInvestigationConcluded)
-	if skipped {
-		wantPending, wantUnavailable, wantAnalysis = []int{1, 0, 0}, []int{0, 1, 1}, []int{0, 0, 0}
-		wantStatus, wantSummary = "ready", ""
-		wantInvestigationStarted = false
-		wantLatestReason = string(situationmodel.ReasonTriageStateChanged)
-	}
-	var status, summary, phase string
-	err := st.DB().QueryRowContext(context.Background(), `
-		SELECT i.status, COALESCE(i.summary,''), COALESCE(t.phase,'') FROM situation_incidents si
-		JOIN incidents i ON i.id=si.incident_id LEFT JOIN incident_triage t ON t.incident_id=i.id
-		WHERE si.situation_id=?`, sid).Scan(&status, &summary, &phase)
-	if err != nil || status != wantStatus || summary != wantSummary || (skipped && phase != "skipped") {
-		t.Fatalf("persisted investigation outcome: status=%s summary=%q phase=%s err=%v", status, summary, phase, err)
-	}
+	want := investigationOutcomeWants(skipped)
+	assertPersistedInvestigationRow(t, st, sid, want, skipped)
+
 	for i, tr := range trs {
 		b := tr.Projection.Briefing
-		if tr.Sequence != i+1 || b == nil || b.Pending != wantPending[i] || b.Unavailable != wantUnavailable[i] || b.AnalysisCount != wantAnalysis[i] || len(b.Analyses) != wantAnalysis[i] {
+		if tr.Sequence != i+1 || b == nil || b.Pending != want.pending[i] || b.Unavailable != want.unavailable[i] || b.AnalysisCount != want.analysis[i] || len(b.Analyses) != want.analysis[i] {
 			t.Fatalf("sequence %d must freeze its actual authoritative work outcome: %+v", i+1, b)
 		}
 	}
-	// R5 repair (lead review round 2, 2026-09-09): assertInvestigationReply's
-	// cross-run comparison excludes S6's own sequence-2/3 transition lines —
-	// and canonicalTransitions never dumps Journal.Detail in the first
-	// place — so neither run's actual reason/journal-kind/headline/detail
-	// content for those two Transitions was ever checked. A deliberate
-	// mutant proved this: with a skip's real "Closed as a clean skip before
-	// any attempt was claimed" detail replaced by a false "Investigation
-	// completed successfully and proved the cause." sentence, the full
-	// replay suite still passed. These four values, captured from the
-	// actual real-store output of both real outcomes this scenario can
-	// produce, close that gap: a run that fabricates success/proof, drops
-	// the true clean-skip disclosure, or renders the wrong reason/journal
-	// kind for either sequence now fails here.
-	wantReason2, wantKind2 := situationmodel.ReasonInvestigationStarted, situationmodel.JournalInvestigationStarted
-	wantHeadline2, wantDetail2 := "AlertINT investigation started", "AlertINT action: run_acute_triage (planned)"
-	wantReason3, wantKind3 := situationmodel.ReasonInvestigationConcluded, situationmodel.JournalEvidenceConclusion
-	wantHeadline3, wantDetail3 := "AlertINT investigation concluded", "Elapsed duration is a statistical outlier against this group's own history."
-	if skipped {
-		wantReason2, wantKind2 = situationmodel.ReasonTriageStateChanged, situationmodel.JournalInvestigationChanged
-		wantHeadline2, wantDetail2 = "Acute Triage skipped", "Decision: "+situation.DecisionReasonCleanSkip
-		wantReason3, wantKind3 = situationmodel.ReasonTriageStateChanged, situationmodel.JournalInvestigationChanged
-		wantHeadline3, wantDetail3 = "Acute Triage skipped", "Closed as a clean skip before any attempt was claimed; no attempt was consumed."
-	}
-	if tr := trs[1]; tr.Reason != wantReason2 || tr.JournalKind != wantKind2 || tr.Journal.Headline != wantHeadline2 || tr.Journal.Detail != wantDetail2 {
-		t.Fatalf("sequence 2 (skipped=%v): reason=%q journal_kind=%q headline=%q detail=%q, want reason=%q journal_kind=%q headline=%q detail=%q",
-			skipped, tr.Reason, tr.JournalKind, tr.Journal.Headline, tr.Journal.Detail, wantReason2, wantKind2, wantHeadline2, wantDetail2)
-	}
-	if tr := trs[2]; tr.Reason != wantReason3 || tr.JournalKind != wantKind3 || tr.Journal.Headline != wantHeadline3 || tr.Journal.Detail != wantDetail3 {
-		t.Fatalf("sequence 3 (skipped=%v): reason=%q journal_kind=%q headline=%q detail=%q, want reason=%q journal_kind=%q headline=%q detail=%q",
-			skipped, tr.Reason, tr.JournalKind, tr.Journal.Headline, tr.Journal.Detail, wantReason3, wantKind3, wantHeadline3, wantDetail3)
-	}
+	assertInvestigationJournalContent(t, trs, skipped)
+
 	if skipped {
 		if trs[1].Projection.OperatorDelta == nil || !trs[1].Projection.OperatorDelta.AbilityLost {
 			t.Fatal("same-commit skip must persist its loss-of-analysis delta")
 		}
-	} else if d := trs[2].Projection.OperatorDelta; d == nil || len(d.Analyses) != 1 || d.Analyses[0].Title != wantSummary {
+	} else if d := trs[2].Projection.OperatorDelta; d == nil || len(d.Analyses) != 1 || d.Analyses[0].Title != want.summary {
 		t.Fatal("completed analysis must persist the useful finding in its earned reply")
 	}
+
 	view, err := st.GetSituationEpisodeView(context.Background(), sid)
 	if err != nil || view.Summary.Briefing == nil {
 		t.Fatalf("read investigation summary: %v", err)
@@ -1144,6 +1126,66 @@ func assertInvestigationOutcome(t *testing.T, st *store.Store, sid string, trs [
 	}
 	assertInvestigationTransitionShape(t, trs[1], skipped, wantAlertIntAction2)
 	assertInvestigationTransitionShape(t, trs[2], skipped, situationmodel.AlertINTActionMonitorSituation)
+	assertInvestigationEpisodeSummary(t, view, want, skipped)
+}
+
+// assertPersistedInvestigationRow checks the durable Incident row this
+// outcome left behind: its status, its summary, and — for the clean-skip
+// branch — its schedule's own skipped phase.
+func assertPersistedInvestigationRow(t *testing.T, st *store.Store, sid string, want investigationOutcomeWant, skipped bool) {
+	t.Helper()
+	var status, summary, phase string
+	err := st.DB().QueryRowContext(context.Background(), `
+		SELECT i.status, COALESCE(i.summary,''), COALESCE(t.phase,'') FROM situation_incidents si
+		JOIN incidents i ON i.id=si.incident_id LEFT JOIN incident_triage t ON t.incident_id=i.id
+		WHERE si.situation_id=?`, sid).Scan(&status, &summary, &phase)
+	if err != nil || status != want.status || summary != want.summary || (skipped && phase != "skipped") {
+		t.Fatalf("persisted investigation outcome: status=%s summary=%q phase=%s err=%v", status, summary, phase, err)
+	}
+}
+
+// assertInvestigationJournalContent pins the reason, journal kind, headline
+// and detail of S6's own sequence-2 and sequence-3 transitions.
+//
+// R5 repair (lead review round 2, 2026-09-09): assertInvestigationReply's
+// cross-run comparison excludes those two transition lines — and
+// canonicalTransitions never dumps Journal.Detail in the first place — so
+// neither run's actual reason/journal-kind/headline/detail content for them
+// was ever checked. A deliberate mutant proved this: with a skip's real
+// "Closed as a clean skip before any attempt was claimed" detail replaced by
+// a false "Investigation completed successfully and proved the cause."
+// sentence, the full replay suite still passed. These four values, captured
+// from the actual real-store output of both real outcomes this scenario can
+// produce, close that gap: a run that fabricates success/proof, drops the
+// true clean-skip disclosure, or renders the wrong reason/journal kind for
+// either sequence now fails here.
+func assertInvestigationJournalContent(t *testing.T, trs []situationmodel.Transition, skipped bool) {
+	t.Helper()
+	wantReason2, wantKind2 := situationmodel.ReasonInvestigationStarted, situationmodel.JournalInvestigationStarted
+	wantHeadline2, wantDetail2 := "AlertINT investigation started", "AlertINT action: run_acute_triage (planned)"
+	wantReason3, wantKind3 := situationmodel.ReasonInvestigationConcluded, situationmodel.JournalEvidenceConclusion
+	wantHeadline3, wantDetail3 := "AlertINT investigation concluded", "Elapsed duration is a statistical outlier against this group's own history."
+	if skipped {
+		wantReason2, wantKind2 = situationmodel.ReasonTriageStateChanged, situationmodel.JournalInvestigationChanged
+		wantHeadline2, wantDetail2 = "Acute Triage skipped", "Decision: "+situation.DecisionReasonCleanSkip
+		wantReason3, wantKind3 = situationmodel.ReasonTriageStateChanged, situationmodel.JournalInvestigationChanged
+		wantHeadline3, wantDetail3 = "Acute Triage skipped", "Closed as a clean skip before any attempt was claimed; no attempt was consumed."
+	}
+	if tr := trs[1]; tr.Reason != wantReason2 || tr.JournalKind != wantKind2 || tr.Journal.Headline != wantHeadline2 || tr.Journal.Detail != wantDetail2 {
+		t.Fatalf("sequence 2 (skipped=%v): reason=%q journal_kind=%q headline=%q detail=%q, want reason=%q journal_kind=%q headline=%q detail=%q",
+			skipped, tr.Reason, tr.JournalKind, tr.Journal.Headline, tr.Journal.Detail, wantReason2, wantKind2, wantHeadline2, wantDetail2)
+	}
+	if tr := trs[2]; tr.Reason != wantReason3 || tr.JournalKind != wantKind3 || tr.Journal.Headline != wantHeadline3 || tr.Journal.Detail != wantDetail3 {
+		t.Fatalf("sequence 3 (skipped=%v): reason=%q journal_kind=%q headline=%q detail=%q, want reason=%q journal_kind=%q headline=%q detail=%q",
+			skipped, tr.Reason, tr.JournalKind, tr.Journal.Headline, tr.Journal.Detail, wantReason3, wantKind3, wantHeadline3, wantDetail3)
+	}
+}
+
+// assertInvestigationEpisodeSummary checks every field of the episode
+// summary canonicalEpisode drops from cross-run comparison, plus the two
+// branch-dependent summary values.
+func assertInvestigationEpisodeSummary(t *testing.T, view store.SituationEpisodeView, want investigationOutcomeWant, skipped bool) {
+	t.Helper()
 	if view.Summary.Version != 3 || view.Summary.SourceTransitionSequence != 3 ||
 		view.Summary.CurrentAttention != situationmodel.AttentionObserve || view.Summary.PeakAttention != situationmodel.AttentionObserve ||
 		view.Summary.RecurrenceCount != 5 || view.Summary.InitialPublicationReason != string(situationmodel.ReasonFirstAuthoritativeState) ||
@@ -1154,12 +1196,12 @@ func assertInvestigationOutcome(t *testing.T, st *store.Store, sid string, trs [
 			view.Summary.RecurrenceCount, view.Summary.InitialPublicationReason, view.Summary.FinalOutcome, view.Summary.RemainingUncertainty,
 			len(view.Summary.InvestigationWork), len(view.Summary.RecordedOperatorContext))
 	}
-	if b := view.Summary.Briefing; b.Pending != 0 || b.Unavailable != wantUnavailable[2] || b.AnalysisCount != wantAnalysis[2] {
+	if b := view.Summary.Briefing; b.Pending != 0 || b.Unavailable != want.unavailable[2] || b.AnalysisCount != want.analysis[2] {
 		t.Fatalf("summary must retain the final persisted outcome: %+v", b)
 	}
-	if view.Summary.InvestigationStarted != wantInvestigationStarted || view.Summary.LatestMaterialReason != wantLatestReason {
+	if view.Summary.InvestigationStarted != want.investigationStarted || view.Summary.LatestMaterialReason != want.latestReason {
 		t.Fatalf("episode summary investigation_started=%v latest=%q, want %v/%q",
-			view.Summary.InvestigationStarted, view.Summary.LatestMaterialReason, wantInvestigationStarted, wantLatestReason)
+			view.Summary.InvestigationStarted, view.Summary.LatestMaterialReason, want.investigationStarted, want.latestReason)
 	}
 }
 

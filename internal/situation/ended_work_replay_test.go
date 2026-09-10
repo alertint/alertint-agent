@@ -67,7 +67,7 @@ func ewrCandidates(t *testing.T, f *replayFixture, sitID string, kind situationm
 // convergence nor a restart/replay repeats it.
 func TestReplayAcceptedCompletionWithoutHypothesisCommitsOneInconclusiveCandidate(t *testing.T) {
 	f := newReplayFixture(t, "ew")
-	incID := f.setupReadyIncidentWithRequestedTriage("ended-work-group", "HighLatency", "fp-ew")
+	incID := f.setupReadyIncidentWithRequestedTriage("ended-work-group", "fp-ew")
 	sitID := f.soleSituationID()
 
 	f.clock.Advance(advanceMargin)
