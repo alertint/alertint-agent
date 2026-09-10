@@ -72,7 +72,7 @@ func briefingWork(c model.ActionContract, b *model.OperatorBriefing, now time.Ti
 			if b.Work.Phase == model.WorkPhaseAwaitingDecision {
 				return briefingAwaitingDecision
 			}
-			return "Investigation is queued; it has not started yet." + briefingQueuedEligibility(b.Work, now)
+			return "Investigation is queued" + briefingQueuedNotStarted(b.Work) + briefingQueuedEligibility(b.Work, now)
 		}
 		if c.WaitReason != nil && *c.WaitReason == model.WaitReasonAcuteTriageBackoff {
 			return briefingRetry("Investigation", b.RetryAt, now)
@@ -155,7 +155,7 @@ func briefingOutstandingWork(b *model.OperatorBriefing, now time.Time) string {
 		}
 		return "An investigation is waiting in back-off; no retry time is recorded." + briefingOutstandingTotal(w)
 	case model.WorkPhaseQueued:
-		return "Investigation work is still outstanding; it has not started yet." +
+		return "Investigation work is still outstanding" + briefingQueuedNotStarted(w) +
 			briefingQueuedEligibility(w, now) + briefingOutstandingTotal(w)
 	case model.WorkPhaseAwaitingDecision:
 		// Queued outranks awaiting_decision in aggregateWorkPhase, so this
@@ -242,6 +242,30 @@ func briefingAlertCount(n int) string {
 // controller commits one when it next re-decides on this Situation's own
 // facts, which the status checkpoint beside this sentence already dates.
 const briefingAwaitingDecision = "Awaiting an investigation decision; no request is committed yet."
+
+// briefingQueuedNotStarted closes the queued sentence on both work
+// surfaces, and states that nothing has started ONLY when the projection
+// records no claimed attempt anywhere in this Situation.
+//
+// aggregateWorkPhase ranks a queued schedule above retry_wait once some
+// OTHER member schedule has executed, so an aggregate phase of queued
+// covers two different records: nothing in this Situation has ever run, and
+// one schedule is queued beside another that already claimed an attempt and
+// fell into back-off. The shared "it has not started yet" was false of the
+// second, denying execution the immutable attempts ledger recorded (repair,
+// lead renderer review 2026-09-10, contract §59).
+//
+// ExecutionStarted is a PAST fact, so it may only withdraw the denial, never
+// assert that work is running now. Nothing needs to be added in its place:
+// executing outranks queued in that same aggregation, so this phase already
+// proves no member schedule is currently in flight, and the eligibility
+// clause and outstanding total that follow still carry the actual wait.
+func briefingQueuedNotStarted(w model.WorkProjection) string {
+	if w.ExecutionStarted {
+		return "."
+	}
+	return "; it has not started yet."
+}
 
 // briefingQueuedEligibility states what the record actually says about when
 // queued work becomes claimable (slide 2 minimal: "queued analysis, with a

@@ -766,3 +766,136 @@ func TestBriefingWorkReadsTheBuiltProjectionNotTheContract(t *testing.T) {
 		}
 	})
 }
+
+// ----------------------------------------------------------------------
+// Mixed queued/back-off work (lead renderer review 2026-09-10, contract
+// §59): aggregateWorkPhase ranks a queued schedule above retry_wait once
+// some other member schedule has executed, so the queued phase also covers
+// a Situation whose immutable attempts ledger records a claimed attempt.
+// Both work surfaces denied that execution ever happened.
+//
+// ExecutionStarted is a past fact, so withdrawing the denial may not become
+// a claim that work is running now — and nothing needs to replace it, since
+// executing outranks queued in that same aggregation.
+// ----------------------------------------------------------------------
+
+func TestBriefingQueuedWorkDoesNotDenyRecordedExecution(t *testing.T) {
+	now := rsMustTime(t, "2026-09-10T12:00:00Z")
+	due := now.Add(time.Minute)
+	planned := func(w model.WorkProjection) string {
+		a, s := model.AlertINTActionRunAcuteTriage, model.AlertINTStatusPlanned
+		return briefingWork(model.ActionContract{AlertINTAction: &a, AlertINTStatus: &s}, &model.OperatorBriefing{Work: w}, now)
+	}
+	surfaces := func(w model.WorkProjection) map[string]string {
+		return map[string]string{
+			"activity": planned(w),
+			"recovery": briefingOutstandingWork(&model.OperatorBriefing{Work: w}, now),
+		}
+	}
+
+	t.Run("a queued schedule beside a back-off one denies no recorded attempt", func(t *testing.T) {
+		w := situation.BuildWorkProjection([]situation.IncidentState{
+			{ID: "queued", Triage: situation.TriageState{Phase: "pending", NextAt: &due}},
+			{ID: "retry", Triage: situation.TriageState{Phase: "backoff", Attempts: 1, NextAt: &due}},
+		}, nil, nil)
+		if !w.ExecutionStarted || w.Phase != model.WorkPhaseQueued || w.RemainingIncidents != 2 {
+			t.Fatalf("fixture built %+v, want a queued aggregate with a recorded attempt and two outstanding", w)
+		}
+		for surface, got := range surfaces(w) {
+			if strings.Contains(got, "has not started yet") {
+				t.Errorf("%s surface denies the attempt the ledger records:\n%s", surface, got)
+			}
+			// Withdrawing the denial is not permission to assert the
+			// opposite: the queued aggregate proves nothing is in flight.
+			for _, bad := range []string{"is running", "Investigating", "still running"} {
+				if strings.Contains(got, bad) {
+					t.Errorf("%s surface claims current execution from a past fact (%q):\n%s", surface, bad, got)
+				}
+			}
+			if !strings.Contains(got, "The earliest queued investigation becomes eligible after "+SlackDateToken(due, "{time}")) {
+				t.Errorf("%s surface lost the qualified queued eligibility:\n%s", surface, got)
+			}
+		}
+		if got := surfaces(w)["recovery"]; !strings.Contains(got, "Investigation work is still outstanding.") ||
+			!strings.Contains(got, "In total, 2 member investigations have outstanding work.") {
+			t.Errorf("the recovery surface lost its outstanding-work statement:\n%s", got)
+		}
+		if got := surfaces(w)["activity"]; !strings.Contains(got, "Investigation is queued.") {
+			t.Errorf("the activity surface lost the queued statement:\n%s", got)
+		}
+	})
+
+	t.Run("work that has never executed still says it has not started", func(t *testing.T) {
+		w := situation.BuildWorkProjection([]situation.IncidentState{
+			{ID: "queued", Triage: situation.TriageState{Phase: "pending", NextAt: &due}},
+		}, nil, nil)
+		if w.ExecutionStarted || w.Phase != model.WorkPhaseQueued {
+			t.Fatalf("fixture built %+v, want a queued aggregate with no recorded attempt", w)
+		}
+		for surface, got := range surfaces(w) {
+			if !strings.Contains(got, "it has not started yet.") {
+				t.Errorf("%s surface dropped a true not-started statement:\n%s", surface, got)
+			}
+			if !strings.Contains(got, SlackDateToken(due, "{time}")) {
+				t.Errorf("%s surface lost the recorded eligibility:\n%s", surface, got)
+			}
+		}
+	})
+
+	t.Run("one queued schedule that already claimed an attempt keeps its own time", func(t *testing.T) {
+		w := situation.BuildWorkProjection([]situation.IncidentState{
+			{ID: "requeued", Triage: situation.TriageState{Phase: "pending", Attempts: 1, NextAt: &due}},
+		}, nil, nil)
+		if !w.ExecutionStarted || w.RemainingIncidents != 1 {
+			t.Fatalf("fixture built %+v, want one outstanding schedule with a recorded attempt", w)
+		}
+		for surface, got := range surfaces(w) {
+			if strings.Contains(got, "has not started yet") {
+				t.Errorf("%s surface denies this schedule's own recorded attempt:\n%s", surface, got)
+			}
+			if !strings.Contains(got, "It becomes eligible after "+SlackDateToken(due, "{time}")) {
+				t.Errorf("%s surface lost the single schedule's recorded eligibility:\n%s", surface, got)
+			}
+		}
+	})
+}
+
+// TestBriefingRecoveryWithStartedWorkKeepsItsOwnTimes renders the mixed case
+// through the whole message rather than the two helpers, because the review
+// requires the grace deadline and the status checkpoint — both independent
+// of the work phase — to survive the correction on the rendered surface.
+func TestBriefingRecoveryWithStartedWorkKeepsItsOwnTimes(t *testing.T) {
+	now := rsMustTime(t, "2026-09-07T10:00:00Z")
+	due := now.Add(5 * time.Minute)
+	grace := now.Add(10 * time.Minute)
+	w := situation.BuildWorkProjection([]situation.IncidentState{
+		{ID: "queued", Triage: situation.TriageState{Phase: "pending", NextAt: &due}},
+		{ID: "retry", Triage: situation.TriageState{Phase: "backoff", Attempts: 1, NextAt: &due}},
+	}, &grace, nil)
+
+	in := briefingRootFixture(t, `{"briefing":{"scope":"checkout","firing":0,"total":2,"resolved":2}}`)
+	in.SourceTransition.ActionContract = rsMonitoringContract(in.Now.Add(time.Minute))
+	in.Summary.Briefing.Work = w
+	in.SourceTransition.Projection.Briefing = in.Summary.Briefing
+
+	root, err := RenderSituationRoot(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, out := range []string{root.Text, rsFallbackBlocksText(root)} {
+		if strings.Contains(out, "has not started yet") {
+			t.Errorf("the rendered surface denies the recorded attempt:\n%s", out)
+		}
+		for _, want := range []string{
+			"Watching for sustained recovery through " + SlackDateToken(grace, "{time}"),
+			"Investigation work is still outstanding.",
+			"The earliest queued investigation becomes eligible after " + SlackDateToken(due, "{time}"),
+			"In total, 2 member investigations have outstanding work.",
+			"Next status check: <!date^1788775260^",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("rendered surface lacks %q:\n%s", want, out)
+			}
+		}
+	}
+}
