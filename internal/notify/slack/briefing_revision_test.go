@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/situation"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
@@ -486,6 +487,11 @@ func TestBriefingActionAndNextStepClosedUnknownWithoutConcreteConcern(t *testing
 // example is "Analysis queued; eligible after [recorded readiness/due
 // condition]. This is not an execution guarantee." Before this repair the
 // line could only say the work had not started.
+//
+// P2-1/P2-3 (lead review of the final repairs, 2026-09-10): that repair
+// then had to separate two facts the contract's single "planned" status
+// collapses — an undecided schedule is not a queued request — and stop the
+// earliest queued eligibility from dating every outstanding investigation.
 // ----------------------------------------------------------------------
 
 func TestBriefingQueuedLineStatesRecordedEligibility(t *testing.T) {
@@ -494,38 +500,74 @@ func TestBriefingQueuedLineStatesRecordedEligibility(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		work      model.WorkProjection
-		want      string
-		forbidden string
+		want      []string
+		forbidden []string
 	}{
 		{
 			name: "not yet eligible states the recorded time",
-			work: model.WorkProjection{Phase: model.WorkPhaseQueued, QueuedEligibilityKnown: true, QueuedEligibleAt: &eligible},
-			want: "It becomes eligible after <!date^1788775500^",
+			work: model.WorkProjection{
+				Phase: model.WorkPhaseQueued, RemainingIncidents: 1,
+				QueuedEligibilityKnown: true, QueuedEligibleAt: &eligible,
+			},
+			want: []string{"Investigation is queued; it has not started yet.", "It becomes eligible after <!date^1788775500^"},
 		},
 		{
 			name: "already eligible says so as of the recorded time",
-			work: model.WorkProjection{Phase: model.WorkPhaseQueued, QueuedEligibilityKnown: true, QueuedEligibleAt: &past},
-			want: "It is eligible for a claim as of <!date^1788775020^",
+			work: model.WorkProjection{
+				Phase: model.WorkPhaseQueued, RemainingIncidents: 1,
+				QueuedEligibilityKnown: true, QueuedEligibleAt: &past,
+			},
+			want: []string{"Investigation is queued; it has not started yet.", "It is eligible for a claim as of <!date^1788775020^"},
 		},
 		{
 			name:      "queued with no recorded readiness time says that",
-			work:      model.WorkProjection{Phase: model.WorkPhaseQueued, QueuedEligibilityKnown: true},
-			want:      "No readiness time is recorded for it.",
-			forbidden: "eligible",
+			work:      model.WorkProjection{Phase: model.WorkPhaseQueued, RemainingIncidents: 1, QueuedEligibilityKnown: true},
+			want:      []string{"Investigation is queued; it has not started yet.", "No readiness time is recorded for it."},
+			forbidden: []string{"eligible"},
 		},
 		{
-			name:      "an undecided schedule states its actual waiting reason",
-			work:      model.WorkProjection{Phase: model.WorkPhaseAwaitingDecision, QueuedEligibilityKnown: true},
-			want:      "No investigation decision is committed yet",
-			forbidden: "eligible",
+			// Two outstanding schedules: the recorded time is the EARLIEST
+			// of them, so an unqualified "it" would date work the record
+			// never dated.
+			name: "the earliest of several queued times is qualified as one of them",
+			work: model.WorkProjection{
+				Phase: model.WorkPhaseQueued, RemainingIncidents: 2,
+				QueuedEligibilityKnown: true, QueuedEligibleAt: &eligible,
+			},
+			want:      []string{"The earliest queued investigation becomes eligible after <!date^1788775500^"},
+			forbidden: []string{"It becomes eligible"},
+		},
+		{
+			name: "an already-reached earliest time speaks for one schedule",
+			work: model.WorkProjection{
+				Phase: model.WorkPhaseQueued, RemainingIncidents: 2,
+				QueuedEligibilityKnown: true, QueuedEligibleAt: &past,
+			},
+			want:      []string{"At least one queued investigation is eligible for a claim as of <!date^1788775020^"},
+			forbidden: []string{"It is eligible for a claim"},
+		},
+		{
+			name:      "several queued schedules with no recorded time say so of all of them",
+			work:      model.WorkProjection{Phase: model.WorkPhaseQueued, RemainingIncidents: 2, QueuedEligibilityKnown: true},
+			want:      []string{"No readiness time is recorded for any queued investigation."},
+			forbidden: []string{"eligible", "recorded for it"},
+		},
+		{
+			// The defect P2-1 names: "planned" covers both dispositions, and
+			// reading it as queued asserted a request nothing committed —
+			// then denied it in the very next clause.
+			name:      "an undecided schedule states its wait and is never called queued",
+			work:      model.WorkProjection{Phase: model.WorkPhaseAwaitingDecision, RemainingIncidents: 1, QueuedEligibilityKnown: true},
+			want:      []string{"Awaiting an investigation decision; no request is committed yet."},
+			forbidden: []string{"queued", "eligible"},
 		},
 		{
 			// A transition predating the field recorded no eligibility at
 			// all. Unknown is not "eligible now": the line claims nothing.
 			name:      "a legacy projection claims nothing",
-			work:      model.WorkProjection{Phase: model.WorkPhaseQueued},
-			want:      "Investigation is queued; it has not started yet. Next status check:",
-			forbidden: "eligible",
+			work:      model.WorkProjection{Phase: model.WorkPhaseQueued, RemainingIncidents: 1},
+			want:      []string{"Investigation is queued; it has not started yet. Next status check:"},
+			forbidden: []string{"eligible"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -546,14 +588,15 @@ func TestBriefingQueuedLineStatesRecordedEligibility(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, out := range []string{root.Text, rsFallbackBlocksText(root), journal.Text} {
-				if !strings.Contains(out, "Investigation is queued; it has not started yet.") {
-					t.Errorf("lost the queued statement:\n%s", out)
+				for _, want := range tc.want {
+					if !strings.Contains(out, want) {
+						t.Errorf("queued line lacks %q:\n%s", want, out)
+					}
 				}
-				if !strings.Contains(out, tc.want) {
-					t.Errorf("queued line lacks %q:\n%s", tc.want, out)
-				}
-				if tc.forbidden != "" && strings.Contains(out, tc.forbidden) {
-					t.Errorf("queued line must not contain %q:\n%s", tc.forbidden, out)
+				for _, bad := range tc.forbidden {
+					if strings.Contains(out, bad) {
+						t.Errorf("queued line must not contain %q:\n%s", bad, out)
+					}
 				}
 				// Eligibility is a claim time, never a promise that
 				// execution or a reply happens then.
@@ -573,33 +616,61 @@ func TestBriefingQueuedLineStatesRecordedEligibility(t *testing.T) {
 }
 
 // TestBriefingRecoveryDisclosesQueuedEligibility covers the second place the
-// same "it has not started yet" sentence appears: the outstanding-work
-// disclosure a Situation confirming recovery carries. Leaving the recorded
-// eligibility off this one would reproduce G1 on a different surface.
+// same outstanding-work sentence appears: the disclosure a Situation
+// confirming recovery carries. Leaving the recorded eligibility off this one
+// would reproduce G1 on a different surface, and P2-2/P2-3 proved this
+// surface owes the same undecided wait and the same aggregate qualification
+// the activity line does.
 func TestBriefingRecoveryDisclosesQueuedEligibility(t *testing.T) {
+	eligible := rsMustTime(t, "2026-09-07T10:05:00Z")
 	past := rsMustTime(t, "2026-09-07T09:57:00Z")
 	for _, tc := range []struct {
 		name      string
 		work      model.WorkProjection
-		want      string
-		forbidden string
+		want      []string
+		forbidden []string
 	}{
 		{
-			name: "queued work discloses its recorded eligibility and the total",
+			name: "one queued schedule discloses its own recorded eligibility",
+			work: model.WorkProjection{
+				Phase: model.WorkPhaseQueued, RemainingIncidents: 1,
+				QueuedEligibilityKnown: true, QueuedEligibleAt: &past,
+			},
+			want:      []string{"it has not started yet. It is eligible for a claim as of <!date^1788775020^"},
+			forbidden: []string{"In total"},
+		},
+		{
+			name: "beside more outstanding work the earliest time speaks for one schedule",
 			work: model.WorkProjection{
 				Phase: model.WorkPhaseQueued, RemainingIncidents: 2,
 				QueuedEligibilityKnown: true, QueuedEligibleAt: &past,
 			},
-			want: "it has not started yet. It is eligible for a claim as of <!date^1788775020^",
+			want: []string{
+				"At least one queued investigation is eligible for a claim as of <!date^1788775020^",
+				"In total, 2 member investigations have outstanding work.",
+			},
+			forbidden: []string{"It is eligible for a claim"},
 		},
 		{
-			name: "an undecided schedule discloses no eligibility",
+			name: "a future earliest time is qualified the same way",
+			work: model.WorkProjection{
+				Phase: model.WorkPhaseQueued, RemainingIncidents: 2,
+				QueuedEligibilityKnown: true, QueuedEligibleAt: &eligible,
+			},
+			want:      []string{"The earliest queued investigation becomes eligible after <!date^1788775500^"},
+			forbidden: []string{"It becomes eligible"},
+		},
+		{
+			name: "an undecided schedule discloses the decision it waits on",
 			work: model.WorkProjection{
 				Phase: model.WorkPhaseAwaitingDecision, RemainingIncidents: 2,
 				QueuedEligibilityKnown: true,
 			},
-			want:      "Investigation work is still outstanding; it has not started yet. In total, 2",
-			forbidden: "eligible",
+			want: []string{
+				"Investigation work is still outstanding. Awaiting an investigation decision; no request is committed yet.",
+				"In total, 2 member investigations have outstanding work.",
+			},
+			forbidden: []string{"eligible", "queued"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -616,13 +687,82 @@ func TestBriefingRecoveryDisclosesQueuedEligibility(t *testing.T) {
 				if !strings.Contains(out, "Watching for sustained recovery") {
 					t.Fatalf("lost the recovery sentence:\n%s", out)
 				}
-				if !strings.Contains(out, tc.want) {
-					t.Errorf("recovery disclosure lacks %q:\n%s", tc.want, out)
+				for _, want := range tc.want {
+					if !strings.Contains(out, want) {
+						t.Errorf("recovery disclosure lacks %q:\n%s", want, out)
+					}
 				}
-				if tc.forbidden != "" && strings.Contains(out, tc.forbidden) {
-					t.Errorf("recovery disclosure must not contain %q:\n%s", tc.forbidden, out)
+				for _, bad := range tc.forbidden {
+					if strings.Contains(out, bad) {
+						t.Errorf("recovery disclosure must not contain %q:\n%s", bad, out)
+					}
 				}
 			}
 		})
 	}
+}
+
+// TestBriefingWorkReadsTheBuiltProjectionNotTheContract drives the same three
+// repairs through the REAL projection builder rather than a hand-written
+// WorkProjection, which is what the lead's saved probes at f2871df did: the
+// defects were only visible because BuildWorkProjection's own output, fed to
+// these renderers, contradicted itself. Wording is asserted semantically —
+// what the sentence may and may not claim — so the copy can be revised
+// without silently losing the fact.
+func TestBriefingWorkReadsTheBuiltProjectionNotTheContract(t *testing.T) {
+	now := rsMustTime(t, "2026-09-10T12:00:00Z")
+	early, late := now.Add(time.Minute), now.Add(time.Hour)
+	planned := func(w model.WorkProjection) string {
+		a, s := model.AlertINTActionRunAcuteTriage, model.AlertINTStatusPlanned
+		return briefingWork(model.ActionContract{AlertINTAction: &a, AlertINTStatus: &s}, &model.OperatorBriefing{Work: w}, now)
+	}
+
+	t.Run("an undecided schedule is not a queued request", func(t *testing.T) {
+		w := situation.BuildWorkProjection([]situation.IncidentState{
+			{ID: "undecided", Triage: situation.TriageState{Phase: "awaiting_decision"}},
+		}, nil, nil)
+		if w.Phase != model.WorkPhaseAwaitingDecision {
+			t.Fatalf("fixture built phase %s, want awaiting_decision", w.Phase)
+		}
+		for _, got := range []string{planned(w), briefingOutstandingWork(&model.OperatorBriefing{Work: w}, now)} {
+			if strings.Contains(got, "queued") {
+				t.Errorf("no request is committed, but the line claims a queue:\n%s", got)
+			}
+			if !strings.Contains(strings.ToLower(got), "decision") {
+				t.Errorf("the recorded waiting reason is missing:\n%s", got)
+			}
+		}
+	})
+
+	t.Run("the earliest of two queued times never dates both", func(t *testing.T) {
+		w := situation.BuildWorkProjection([]situation.IncidentState{
+			{ID: "early", Triage: situation.TriageState{Phase: "pending", NextAt: &early}},
+			{ID: "late", Triage: situation.TriageState{Phase: "pending", NextAt: &late}},
+		}, nil, nil)
+		if w.QueuedEligibleAt == nil || !w.QueuedEligibleAt.Equal(early) || w.RemainingIncidents != 2 {
+			t.Fatalf("fixture built %+v, want the earlier time and two outstanding", w)
+		}
+		for _, got := range []string{planned(w), briefingOutstandingWork(&model.OperatorBriefing{Work: w}, now)} {
+			if !strings.Contains(got, "earliest") && !strings.Contains(got, "At least one") {
+				t.Errorf("the earliest time is presented as aggregate eligibility:\n%s", got)
+			}
+			if strings.Contains(got, SlackDateToken(late, "{time}")) {
+				t.Errorf("only the earliest queued time is a recorded projection fact:\n%s", got)
+			}
+		}
+	})
+
+	t.Run("one queued schedule still states its own recorded eligibility", func(t *testing.T) {
+		w := situation.BuildWorkProjection([]situation.IncidentState{
+			{ID: "only", Triage: situation.TriageState{Phase: "pending", NextAt: &early}},
+		}, nil, nil)
+		for _, got := range []string{planned(w), briefingOutstandingWork(&model.OperatorBriefing{Work: w}, now)} {
+			if !strings.Contains(got, SlackDateToken(early, "{time}")) {
+				t.Errorf("a single queued schedule lost its recorded eligibility:\n%s", got)
+			}
+			if !strings.Contains(got, "not an execution guarantee") {
+				t.Errorf("eligibility must never read as a start promise:\n%s", got)
+			}
+		}
+	})
 }

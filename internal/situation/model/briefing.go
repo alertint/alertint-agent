@@ -293,6 +293,13 @@ type WorkProjection struct {
 	// that execution begins then and never evidence that anything started
 	// (G1 repair, lead final review 2026-09-10). nil means no queued
 	// schedule records one.
+	//
+	// EARLIEST, so beside more than one outstanding schedule this dates ONE
+	// queued investigation and never the aggregate — the same reading rule
+	// RetryEligibleAt below already carries. A renderer that attaches it to
+	// the outstanding-work total states a fact the projection never
+	// recorded (P2-3 repair, lead review of the final repairs,
+	// 2026-09-10).
 	QueuedEligibleAt *time.Time `json:"queued_eligible_at,omitempty"`
 	// QueuedEligibilityKnown is true on every projection built with the
 	// field above. False means a transition that predates it (legacy

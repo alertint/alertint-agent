@@ -61,6 +61,17 @@ func briefingWork(c model.ActionContract, b *model.OperatorBriefing, now time.Ti
 			return "Investigating" + briefingExecutionScope(b)
 		}
 		if *c.AlertINTStatus == model.AlertINTStatusPlanned {
+			// deriveAlertINTBranch collapses an undecided schedule and a
+			// committed-but-unclaimed one into the same "planned" contract
+			// status, so the populated Work phase — never the contract
+			// alone — decides which of the two this actually is (P2-1
+			// repair, lead review of the final repairs, 2026-09-10).
+			// Calling an undecided schedule queued asserted a request
+			// nothing had committed, and the eligibility clause then
+			// contradicted that first sentence in the same breath.
+			if b.Work.Phase == model.WorkPhaseAwaitingDecision {
+				return briefingAwaitingDecision
+			}
 			return "Investigation is queued; it has not started yet." + briefingQueuedEligibility(b.Work, now)
 		}
 		if c.WaitReason != nil && *c.WaitReason == model.WaitReasonAcuteTriageBackoff {
@@ -147,9 +158,13 @@ func briefingOutstandingWork(b *model.OperatorBriefing, now time.Time) string {
 		return "Investigation work is still outstanding; it has not started yet." +
 			briefingQueuedEligibility(w, now) + briefingOutstandingTotal(w)
 	case model.WorkPhaseAwaitingDecision:
-		// No decision has been committed yet, so no schedule carries a
-		// readiness time to state — awaiting a decision is not queued work.
-		return "Investigation work is still outstanding; it has not started yet." + briefingOutstandingTotal(w)
+		// Queued outranks awaiting_decision in aggregateWorkPhase, so this
+		// aggregate phase proves EVERY remaining schedule is undecided: the
+		// shared sentence is true of all of them, and none of them carries a
+		// readiness time to state. Reporting only "not started" withheld the
+		// one fact slide 4 asks this surface for — the actual wait (P2-2
+		// repair, lead review of the final repairs, 2026-09-10).
+		return "Investigation work is still outstanding. " + briefingAwaitingDecision + briefingOutstandingTotal(w)
 	case model.WorkPhaseCollecting, model.WorkPhaseSettled, model.WorkPhaseExhausted, model.WorkPhaseNone:
 		// No outstanding automatic work to disclose. A legacy projection
 		// (Phase "") falls through to the same silence: unknown work is not
@@ -220,6 +235,14 @@ func briefingAlertCount(n int) string {
 	return fmt.Sprintf("%d alerts", n)
 }
 
+// briefingAwaitingDecision is the one sentence both work surfaces use for a
+// ready Incident whose Triage schedule holds no committed request yet
+// (WorkPhaseAwaitingDecision). It states a recorded waiting reason, not a
+// queued request and not a promise that a decision is imminent: the
+// controller commits one when it next re-decides on this Situation's own
+// facts, which the status checkpoint beside this sentence already dates.
+const briefingAwaitingDecision = "Awaiting an investigation decision; no request is committed yet."
+
 // briefingQueuedEligibility states what the record actually says about when
 // queued work becomes claimable (slide 2 minimal: "queued analysis, with a
 // known readiness/due time or actual waiting reason"; the queued example's
@@ -228,32 +251,50 @@ func briefingAlertCount(n int) string {
 // and never evidence that execution began, so no branch here promises a
 // start (G1 repair, lead final review 2026-09-10).
 //
+// QueuedEligibleAt is the EARLIEST recorded eligibility across the queued
+// member schedules, so beside more than one outstanding investigation it
+// dates ONE of them and never the aggregate — the same rule
+// briefingOutstandingWork already applies to RetryEligibleAt. An
+// unqualified "it" there read as the moment all outstanding work becomes
+// eligible, which the record never said (P2-3 repair, lead review of the
+// final repairs, 2026-09-10). RemainingIncidents is the honest
+// discriminator even though it counts every outstanding schedule rather
+// than only the queued ones: above one, this sentence must not speak for
+// the whole count, and the qualified wording claims exactly one queued
+// schedule, which a non-nil earliest time proves.
+//
 // An unknown projection stays silent: a transition predating
 // QueuedEligibilityKnown recorded no eligibility at all, and reading its
 // missing time as "eligible now" would invent the fact slide 2 asks for.
+// An undecided schedule never reaches here — briefingAwaitingDecision is
+// its whole sentence — so nil here means a queued schedule that records no
+// time, and briefingNextStep's status checkpoint carries the timing.
 func briefingQueuedEligibility(w model.WorkProjection, now time.Time) string {
 	if !w.QueuedEligibilityKnown {
 		return ""
 	}
+	multiple := w.RemainingIncidents > 1
 	at := w.QueuedEligibleAt
 	if at == nil {
-		// The contract reads "planned" for an awaiting-decision schedule as
-		// well as a queued one (deriveAlertINTBranch collapses both), and an
-		// undecided schedule has no readiness time to state — that IS its
-		// waiting reason. Otherwise the schedule is queued but records no
-		// time, and briefingNextStep's status checkpoint carries the timing.
-		if w.Phase == model.WorkPhaseAwaitingDecision {
-			return " No investigation decision is committed yet, so it has no readiness time."
+		if multiple {
+			return " No readiness time is recorded for any queued investigation."
 		}
 		return " No readiness time is recorded for it."
-	}
-	if at.After(now) {
-		return " It becomes eligible after " + SlackDateToken(*at, "{time}") + "; eligibility is not an execution guarantee."
 	}
 	// "As of" covers both a schedule that became claimable earlier and one
 	// this very commit authorized, whose recorded eligibility is this
 	// transition's own instant.
-	return " It is eligible for a claim as of " + SlackDateToken(*at, "{time}") + "; eligibility is not an execution guarantee."
+	when := SlackDateToken(*at, "{time}")
+	const notAPromise = "; eligibility is not an execution guarantee."
+	switch {
+	case multiple && at.After(now):
+		return " The earliest queued investigation becomes eligible after " + when + notAPromise
+	case multiple:
+		return " At least one queued investigation is eligible for a claim as of " + when + notAPromise
+	case at.After(now):
+		return " It becomes eligible after " + when + notAPromise
+	}
+	return " It is eligible for a claim as of " + when + notAPromise
 }
 
 func briefingRetry(work string, at *time.Time, now time.Time) string {
