@@ -899,3 +899,257 @@ func TestBriefingRecoveryWithStartedWorkKeepsItsOwnTimes(t *testing.T) {
 		}
 	}
 }
+
+// briefingQueuedSurfaces renders both work surfaces that speak for a queued
+// aggregate: the activity line the planned acute-triage contract produces
+// (deriveAlertINTBranch folds a queued schedule into planned) and the
+// outstanding-work line the recovery branch appends.
+func briefingQueuedSurfaces(w model.WorkProjection, now time.Time) map[string]string {
+	a, s := model.AlertINTActionRunAcuteTriage, model.AlertINTStatusPlanned
+	return map[string]string{
+		"activity": briefingWork(model.ActionContract{AlertINTAction: &a, AlertINTStatus: &s}, &model.OperatorBriefing{Work: w}, now),
+		"recovery": briefingOutstandingWork(&model.OperatorBriefing{Work: w}, now),
+	}
+}
+
+// briefingRetryAttributions are the claims no work surface may make about
+// RetryEligibleAt: it is the earliest of the member triage back-offs and the
+// committed Assessment-level retry, and the projection separates neither, so
+// naming one of them or counting them asserts unrecorded provenance.
+var briefingRetryAttributions = []string{"investigation retry", "assessment retry", "Assessment retry", "retries"}
+
+// TestBriefingQueuedWorkDisclosesRecordedRetry pins the retry eligibility a
+// queued aggregate used to drop. aggregateWorkPhase ranks a queued schedule
+// above retry_wait once some other schedule has executed, and only the
+// retry_wait branch ever read RetryEligibleAt, so the back-off schedule's own
+// recorded retry time vanished from both work surfaces while the queued
+// readiness time beside it displayed (repair, lead mixed-work review
+// 2026-09-10, contract §61). Every fixture drives the real projection builder
+// so the aggregation, not a hand-written phase, is what puts the two records
+// in the same message.
+func TestBriefingQueuedWorkDisclosesRecordedRetry(t *testing.T) {
+	now := rsMustTime(t, "2026-09-10T12:00:00Z")
+	due, retry := now.Add(time.Minute), now.Add(9*time.Minute)
+
+	t.Run("a queued aggregate states the back-off schedule's own retry", func(t *testing.T) {
+		w := situation.BuildWorkProjection([]situation.IncidentState{
+			{ID: "inc-queued-77", Triage: situation.TriageState{Phase: "pending", NextAt: &due}},
+			{ID: "inc-backoff-88", Triage: situation.TriageState{Phase: "backoff", Attempts: 1, NextAt: &retry}},
+		}, nil, nil)
+		if w.Phase != model.WorkPhaseQueued || !w.ExecutionStarted || w.RemainingIncidents != 2 {
+			t.Fatalf("fixture built %+v, want a queued aggregate with a recorded attempt and two outstanding", w)
+		}
+		if w.QueuedEligibleAt == nil || !w.QueuedEligibleAt.Equal(due) || w.RetryEligibleAt == nil || !w.RetryEligibleAt.Equal(retry) {
+			t.Fatalf("fixture built %+v, want independently recorded queue %s and retry %s", w, due, retry)
+		}
+		for surface, got := range briefingQueuedSurfaces(w, now) {
+			// Both recorded times, each on its own clause: the queued one
+			// says when a claim may be made, the retry one when the schedule
+			// that already failed may run again.
+			if !strings.Contains(got, "The earliest queued investigation becomes eligible after "+SlackDateToken(due, "{time}")) {
+				t.Errorf("%s surface lost the queued readiness time:\n%s", surface, got)
+			}
+			if !strings.Contains(got, "A separately recorded retry becomes eligible after "+SlackDateToken(retry, "{time}")) {
+				t.Errorf("%s surface hides the recorded retry behind the queued aggregate:\n%s", surface, got)
+			}
+			// Disclosing a retry is not a claim that one is running, that it
+			// is guaranteed, or that it belongs to a named incident — and the
+			// attempt the ledger records still may not be denied.
+			bad := append([]string{"has not started yet", "is running", "Investigating", "still running", "inc-queued-77", "inc-backoff-88"}, briefingRetryAttributions...)
+			for _, claim := range bad {
+				if strings.Contains(got, claim) {
+					t.Errorf("%s surface claims %q, which the projection never recorded:\n%s", surface, claim, got)
+				}
+			}
+		}
+		if got := briefingQueuedSurfaces(w, now)["recovery"]; !strings.Contains(got, "In total, 2 member investigations have outstanding work.") {
+			t.Errorf("the recovery surface lost its outstanding-work total:\n%s", got)
+		}
+	})
+
+	// Two back-off schedules, so the clause must date the EARLIEST recorded
+	// retry rather than any of them, and must state an already-eligible time
+	// as a fact rather than a future promise.
+	t.Run("a retry already due is stated as eligible, not promised", func(t *testing.T) {
+		overdue := now.Add(-4 * time.Minute)
+		w := situation.BuildWorkProjection([]situation.IncidentState{
+			{ID: "inc-queued-77", Triage: situation.TriageState{Phase: "pending", NextAt: &due}},
+			{ID: "inc-backoff-88", Triage: situation.TriageState{Phase: "backoff", Attempts: 1, NextAt: &overdue}},
+			{ID: "inc-backoff-99", Triage: situation.TriageState{Phase: "backoff", Attempts: 2, NextAt: &retry}},
+		}, nil, nil)
+		if w.RetryEligibleAt == nil || !w.RetryEligibleAt.Equal(overdue) {
+			t.Fatalf("fixture built %+v, want the earliest of two retries, %s", w, overdue)
+		}
+		for surface, got := range briefingQueuedSurfaces(w, now) {
+			if !strings.Contains(got, "A separately recorded retry is eligible as of "+SlackDateToken(overdue, "{time}")) {
+				t.Errorf("%s surface misdates a retry that is already eligible:\n%s", surface, got)
+			}
+			if strings.Contains(got, "becomes eligible after "+SlackDateToken(overdue, "{time}")) {
+				t.Errorf("%s surface puts a past retry time in the future:\n%s", surface, got)
+			}
+			if strings.Contains(got, SlackDateToken(retry, "{time}")) {
+				t.Errorf("%s surface states the later retry, not the earliest recorded one:\n%s", surface, got)
+			}
+		}
+	})
+}
+
+// TestBriefingQueuedRetryDisclosureGuards covers the two records the
+// disclosure must NOT change: queued work with no recorded retry keeps the
+// wording it had, and a committed Assessment-level retry is stated without
+// being attributed to acute triage.
+func TestBriefingQueuedRetryDisclosureGuards(t *testing.T) {
+	now := rsMustTime(t, "2026-09-10T12:00:00Z")
+	due, retry := now.Add(time.Minute), now.Add(9*time.Minute)
+
+	t.Run("queued work with no recorded retry adds nothing", func(t *testing.T) {
+		w := situation.BuildWorkProjection([]situation.IncidentState{
+			{ID: "inc-queued-77", Triage: situation.TriageState{Phase: "pending", NextAt: &due}},
+		}, nil, nil)
+		if w.RetryEligibleAt != nil || w.ExecutionStarted {
+			t.Fatalf("fixture built %+v, want the ordinary never-executed single queue", w)
+		}
+		for surface, got := range briefingQueuedSurfaces(w, now) {
+			if strings.Contains(got, "retry") {
+				t.Errorf("%s surface invents a retry no schedule recorded:\n%s", surface, got)
+			}
+			if !strings.Contains(got, "it has not started yet.") ||
+				!strings.Contains(got, "It becomes eligible after "+SlackDateToken(due, "{time}")) {
+				t.Errorf("%s surface changed the unaffected single-queue wording:\n%s", surface, got)
+			}
+		}
+	})
+
+	t.Run("a queued schedule that already executed but records no retry adds nothing", func(t *testing.T) {
+		// The disclosure is triggered by a recorded retry, never by a recorded
+		// attempt: this schedule claimed one and fell back to queued, and the
+		// record still holds no retry time to state.
+		w := situation.BuildWorkProjection([]situation.IncidentState{
+			{ID: "inc-queued-77", Triage: situation.TriageState{Phase: "pending", Attempts: 1, NextAt: &due}},
+		}, nil, nil)
+		if w.RetryEligibleAt != nil || !w.ExecutionStarted {
+			t.Fatalf("fixture built %+v, want a claimed attempt and no recorded retry", w)
+		}
+		for surface, got := range briefingQueuedSurfaces(w, now) {
+			if strings.Contains(got, "retry") {
+				t.Errorf("%s surface reads a recorded attempt as a recorded retry:\n%s", surface, got)
+			}
+			if strings.Contains(got, "has not started yet") ||
+				!strings.Contains(got, "It becomes eligible after "+SlackDateToken(due, "{time}")) {
+				t.Errorf("%s surface changed the accepted single-queue wording:\n%s", surface, got)
+			}
+		}
+	})
+
+	t.Run("an assessment-level retry is disclosed without attributing it", func(t *testing.T) {
+		// CommittedOperatorBriefing overlays the committed Assessment retry
+		// (situations.retry_at) onto RetryEligibleAt after BuildWorkProjection
+		// returns, which is the only way this field can be populated while no
+		// triage attempt has been claimed: with ExecutionStarted false,
+		// aggregateWorkPhase ranks retry_wait above queued, so no member
+		// schedule in this record is in back-off.
+		w := situation.BuildWorkProjection([]situation.IncidentState{
+			{ID: "inc-queued-77", Triage: situation.TriageState{Phase: "pending", NextAt: &due}},
+		}, nil, nil)
+		w.RetryEligibleAt = &retry
+		if w.Phase != model.WorkPhaseQueued || w.ExecutionStarted {
+			t.Fatalf("fixture built %+v, want a queued aggregate with no claimed triage attempt", w)
+		}
+		for surface, got := range briefingQueuedSurfaces(w, now) {
+			if !strings.Contains(got, "A separately recorded retry becomes eligible after "+SlackDateToken(retry, "{time}")) {
+				t.Errorf("%s surface drops the committed assessment retry:\n%s", surface, got)
+			}
+			for _, claim := range briefingRetryAttributions {
+				if strings.Contains(got, claim) {
+					t.Errorf("%s surface attributes the retry to %q without provenance:\n%s", surface, claim, got)
+				}
+			}
+		}
+	})
+}
+
+// TestBriefingRootDisclosesRecordedRetryBesideQueuedWork renders the mixed
+// record through the whole message on both work surfaces, because the review
+// requires the disclosed retry to reach the operator in the fallback text AND
+// in the decoded Block Kit, and requires the three other recorded times —
+// queue readiness, the recovery grace deadline and the status checkpoint — to
+// stay on their own clauses. Every time in this fixture is distinct, so a
+// clause that borrowed another's value would fail rather than coincide.
+func TestBriefingRootDisclosesRecordedRetryBesideQueuedWork(t *testing.T) {
+	now := rsMustTime(t, "2026-09-07T10:00:00Z")
+	checkpoint := now.Add(time.Minute)
+	due := now.Add(5 * time.Minute)
+	retry := now.Add(9 * time.Minute)
+	grace := now.Add(12 * time.Minute)
+	mixed := func(graceUntil *time.Time) model.WorkProjection {
+		return situation.BuildWorkProjection([]situation.IncidentState{
+			{ID: "inc-queued-77", Triage: situation.TriageState{Phase: "pending", NextAt: &due}},
+			{ID: "inc-backoff-88", Triage: situation.TriageState{Phase: "backoff", Attempts: 1, NextAt: &retry}},
+		}, graceUntil, nil)
+	}
+	plannedTriage := func() model.ActionContract {
+		a, s := model.AlertINTActionRunAcuteTriage, model.AlertINTStatusPlanned
+		return model.ActionContract{
+			NextActor:      model.NextActorAlertINT,
+			AlertINTAction: &a,
+			AlertINTStatus: &s,
+			NextUpdateAt:   &checkpoint,
+			NextUpdateOn:   []model.NextUpdateOn{model.NextUpdateOnTriageOutcome},
+		}
+	}
+
+	for _, tc := range []struct {
+		name     string
+		contract model.ActionContract
+		work     model.WorkProjection
+		want     []string
+	}{
+		{
+			name:     "recovery",
+			contract: rsMonitoringContract(checkpoint),
+			work:     mixed(&grace),
+			want: []string{
+				"Watching for sustained recovery through " + SlackDateToken(grace, "{time}"),
+				"Investigation work is still outstanding.",
+				"The earliest queued investigation becomes eligible after " + SlackDateToken(due, "{time}"),
+				"A separately recorded retry becomes eligible after " + SlackDateToken(retry, "{time}"),
+				"In total, 2 member investigations have outstanding work.",
+				"Next status check: " + SlackDateToken(checkpoint, "{time}"),
+			},
+		},
+		{
+			name:     "activity",
+			contract: plannedTriage(),
+			work:     mixed(nil),
+			want: []string{
+				"Investigation is queued.",
+				"The earliest queued investigation becomes eligible after " + SlackDateToken(due, "{time}"),
+				"A separately recorded retry becomes eligible after " + SlackDateToken(retry, "{time}"),
+				"Next status check: " + SlackDateToken(checkpoint, "{time}"),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := briefingRootFixture(t, `{"briefing":{"scope":"checkout","firing":0,"total":2,"resolved":2}}`)
+			in.SourceTransition.ActionContract = tc.contract
+			in.ContractDeadlineAt = &checkpoint
+			in.Summary.Briefing.Work = tc.work
+			in.SourceTransition.Projection.Briefing = in.Summary.Briefing
+
+			root, err := RenderSituationRoot(in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for label, out := range map[string]string{"fallback text": root.Text, "block kit": rsFallbackBlocksText(root)} {
+				for _, want := range tc.want {
+					if !strings.Contains(out, want) {
+						t.Errorf("%s lacks %q:\n%s", label, want, out)
+					}
+				}
+				if strings.Contains(out, "has not started yet") {
+					t.Errorf("%s denies the recorded attempt:\n%s", label, out)
+				}
+			}
+		})
+	}
+}

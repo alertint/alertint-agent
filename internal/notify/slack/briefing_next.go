@@ -72,7 +72,8 @@ func briefingWork(c model.ActionContract, b *model.OperatorBriefing, now time.Ti
 			if b.Work.Phase == model.WorkPhaseAwaitingDecision {
 				return briefingAwaitingDecision
 			}
-			return "Investigation is queued" + briefingQueuedNotStarted(b.Work) + briefingQueuedEligibility(b.Work, now)
+			return "Investigation is queued" + briefingQueuedNotStarted(b.Work) +
+				briefingQueuedEligibility(b.Work, now) + briefingRecordedRetry(b.Work, now)
 		}
 		if c.WaitReason != nil && *c.WaitReason == model.WaitReasonAcuteTriageBackoff {
 			return briefingRetry("Investigation", b.RetryAt, now)
@@ -156,7 +157,7 @@ func briefingOutstandingWork(b *model.OperatorBriefing, now time.Time) string {
 		return "An investigation is waiting in back-off; no retry time is recorded." + briefingOutstandingTotal(w)
 	case model.WorkPhaseQueued:
 		return "Investigation work is still outstanding" + briefingQueuedNotStarted(w) +
-			briefingQueuedEligibility(w, now) + briefingOutstandingTotal(w)
+			briefingQueuedEligibility(w, now) + briefingRecordedRetry(w, now) + briefingOutstandingTotal(w)
 	case model.WorkPhaseAwaitingDecision:
 		// Queued outranks awaiting_decision in aggregateWorkPhase, so this
 		// aggregate phase proves EVERY remaining schedule is undecided: the
@@ -265,6 +266,47 @@ func briefingQueuedNotStarted(w model.WorkProjection) string {
 		return "."
 	}
 	return "; it has not started yet."
+}
+
+// briefingRecordedRetry discloses the retry the record actually holds beside
+// queued work (canonical slide 2 minimal, backoff node: the root must carry a
+// "Specific limitation and retry eligibility time, if recorded", and "Wait
+// until recorded retry eligibility ... Status checkpoint is separate").
+//
+// aggregateWorkPhase ranks a queued schedule ABOVE retry_wait once some other
+// member schedule has executed, and only the retry_wait branch ever read
+// RetryEligibleAt — so in exactly the mixed record the previous repair
+// described, the back-off schedule's own recorded retry time was dropped from
+// both work surfaces while the queued readiness time beside it displayed
+// (repair, lead mixed-work review 2026-09-10, contract §61).
+//
+// The clause is deliberately unattributed. RetryEligibleAt is the earliest of
+// the member triage back-offs AND the committed Assessment-level retry
+// (CommittedOperatorBriefing overlays situations.retry_at onto it), and the
+// projection records nothing that separates the two here, so calling this an
+// investigation retry would assert provenance nothing proves — that same
+// node's "Distinguish assessment retries from acute-triage retries" read
+// honestly rather than guessed. Being the EARLIEST of several, it dates ONE
+// retry: the indefinite article keeps it from speaking for every outstanding
+// schedule, and no count of retries and no incident identity is claimed.
+//
+// Eligibility is when a retry MAY be claimed, never a promise that one runs
+// then and never evidence that anything is running now — executing outranks
+// queued in that same aggregation, so this phase still proves no member
+// schedule is in flight. The queued readiness time, the recovery grace
+// deadline and the status checkpoint each keep their own clause. A nil time
+// stays silent: no back-off schedule and no assessment recorded a retry, and
+// the queued clause already carries this phase's actual wait.
+func briefingRecordedRetry(w model.WorkProjection, now time.Time) string {
+	at := w.RetryEligibleAt
+	if at == nil {
+		return ""
+	}
+	when := SlackDateToken(*at, "{time}")
+	if at.After(now) {
+		return " A separately recorded retry becomes eligible after " + when + "."
+	}
+	return " A separately recorded retry is eligible as of " + when + "."
 }
 
 // briefingQueuedEligibility states what the record actually says about when
