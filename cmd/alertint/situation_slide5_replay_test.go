@@ -8,10 +8,26 @@ package main
 // *store.Store on disk, the real situation.ControllerWorker deriving
 // lifecycle and work for itself, the real Acute Triage claim/completion
 // writers, the real notification worker, the real SituationDeliverer and
-// renderer, and the real internal/notify/slack client. The only fakes are
-// the two providers, both with call counters: the scripted Slack Web API
+// renderer, and the real internal/notify/slack client. Both providers are
+// faked, each with a call counter: the scripted Slack Web API
 // (fakeSlackServer, which records every request's text AND blocks) and the
 // L2 assessment client (e2eAssessmentClient.callCount).
+//
+// THE BOUNDARY, stated exactly (lead review round 2, 2026-09-10, finding
+// 2). This is a controlled integration test, not a whole-daemon run. The
+// test plays the parts that sit OUTSIDE the Situation controller: it
+// inserts the Incident and its alert-delivery membership links, enqueues
+// the situation_input_outbox rows a receiver would enqueue, and calls
+// store.ClaimIncidentTriageAttempt / CompleteIncidentTriageAttempt
+// directly. Those two are the real production writers, and their durable
+// effects — the frozen investigation input set, the attempt result, the
+// inputs they raise — are exactly what the controller then reads. But no
+// Acute Triage worker and no investigation provider runs here. So this
+// file is evidence about what the controller and the delivery path do with
+// a real execution record, NOT that an executor produces one. "Nothing is
+// injected" would be the wrong claim; the accurate one is that no
+// lifecycle, work projection, Operator contract, candidate, intent or
+// payload is injected — every one of those is derived by the product.
 //
 // The first B6 candidate proved the same narrative at the store's own
 // bookkeeping boundary (internal/store/situation_s5_replay_test.go): it
@@ -57,9 +73,11 @@ package main
 //     non-floor reason) is what authorizes publication at all.
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -275,6 +293,14 @@ type s5rOutcome struct {
 
 func (o s5rOutcome) rootWrites() int { return len(o.rootPosts) + len(o.rootEdits) }
 
+// all is every payload the segment actually put on the wire.
+func (o s5rOutcome) all() []e2eSlackCall {
+	out := make([]e2eSlackCall, 0, o.rootWrites()+len(o.replies))
+	out = append(out, o.rootPosts...)
+	out = append(out, o.rootEdits...)
+	return append(out, o.replies...)
+}
+
 // currentRoot is the last root write of the event: what the operator's one
 // main message now says.
 func (o s5rOutcome) currentRoot() (e2eSlackCall, bool) {
@@ -288,17 +314,37 @@ func (o s5rOutcome) currentRoot() (e2eSlackCall, bool) {
 }
 
 // runEvent runs one controller cycle plus its delivery at the current clock
-// and reports exactly what reached the fake provider, plus the model calls
-// each half consumed.
-func (r *s5rFixture) runEvent(label string) s5rOutcome {
+// and reports exactly what reached the fake provider. wantCycleCalls is the
+// model calls the controller half must consume, stated per event and
+// asserted rather than merely logged (lead review round 2, 2026-09-10,
+// finding 2). The delivery half must always consume none.
+func (r *s5rFixture) runEvent(label string, wantCycleCalls int) s5rOutcome {
 	r.t.Helper()
 	beforeCalls := r.l2.callCount()
 	r.drainController()
-	afterCycle := r.l2.callCount()
-	r.deliverNow()
-	afterDelivery := r.l2.callCount()
+	cycleCalls := r.l2.callCount() - beforeCalls
 
-	out := s5rOutcome{modelCalls: afterCycle - beforeCalls, deliverAdd: afterDelivery - afterCycle}
+	out := r.deliverSegment(label)
+	out.modelCalls = cycleCalls
+	if cycleCalls != wantCycleCalls {
+		r.t.Fatalf("%s: the controller cycle consumed %d model call(s), want exactly %d", label, cycleCalls, wantCycleCalls)
+	}
+	r.logOutcome(label, out)
+	return out
+}
+
+// deliverSegment runs delivery alone at the current clock and classifies
+// every payload that reached the provider since the last look. EVERY
+// delivery in this file goes through it, so no payload escapes the shared
+// per-payload checks and no delivery segment escapes its own zero-model-call
+// assertion — including the overtaken case's manual recovery segment, which
+// asserts its own event shape instead of calling assertEvent.
+func (r *s5rFixture) deliverSegment(label string) s5rOutcome {
+	r.t.Helper()
+	beforeCalls := r.l2.callCount()
+	r.deliverNow()
+	out := s5rOutcome{deliverAdd: r.l2.callCount() - beforeCalls}
+
 	all := r.slack.accepted()
 	for _, c := range all[r.seen:] {
 		switch {
@@ -316,8 +362,35 @@ func (r *s5rFixture) runEvent(label string) s5rOutcome {
 	if out.deliverAdd != 0 {
 		r.t.Fatalf("%s: delivery consumed %d model call(s); rendering a recorded Transition must consult no model", label, out.deliverAdd)
 	}
-	r.logOutcome(label, out)
+	r.assertPayloads(label, out.all())
 	return out
+}
+
+// drainCycle runs a controller cycle with no delivery behind it — the
+// segments that commit while the provider is unreachable — and asserts the
+// model calls it consumed.
+func (r *s5rFixture) drainCycle(label string, wantCycleCalls int) {
+	r.t.Helper()
+	beforeCalls := r.l2.callCount()
+	r.drainController()
+	if got := r.l2.callCount() - beforeCalls; got != wantCycleCalls {
+		r.t.Fatalf("%s: the controller cycle consumed %d model call(s), want exactly %d", label, got, wantCycleCalls)
+	}
+}
+
+// failedDeliveryRound runs one delivery round against an unreachable
+// provider. Nothing is accepted, so there is no payload to classify — but
+// the round must still consult no model.
+func (r *s5rFixture) failedDeliveryRound(label string) {
+	r.t.Helper()
+	beforeCalls := r.l2.callCount()
+	r.deliverRound()
+	if got := r.l2.callCount() - beforeCalls; got != 0 {
+		r.t.Fatalf("%s: a failed delivery round consumed %d model call(s), want none", label, got)
+	}
+	if accepted := r.slack.accepted(); len(accepted) != r.seen {
+		r.t.Fatalf("%s: the unreachable provider accepted %d call(s)", label, len(accepted)-r.seen)
+	}
 }
 
 // logOutcome prints the event's actual root and reply payloads. The B6
@@ -370,54 +443,130 @@ func (r *s5rFixture) assertEvent(label string, out s5rOutcome, want s5rExpect) {
 	if !ok {
 		r.t.Fatalf("%s: no root write at all", label)
 	}
+	// Blocks are what an operator's client actually renders; the fallback
+	// Text is a courtesy field. Every meaningful fact below is therefore
+	// asserted in BOTH (lead review round 2, 2026-09-10, finding 2).
+	rootBlocks := r.blockText(label+" root", root.Blocks)
 	if want.orientation != "" {
 		marker := "*▸ " + want.orientation + "*"
-		if !strings.Contains(root.Text, marker) {
-			r.t.Fatalf("%s: root orientation marker %q missing from:\n%s", label, marker, root.Text)
-		}
+		r.mustSay(label, "root", root, rootBlocks, marker)
 	}
 	for _, must := range want.rootMust {
-		if !strings.Contains(root.Text, must) {
-			r.t.Fatalf("%s: root is missing %q:\n%s", label, must, root.Text)
-		}
+		r.mustSay(label, "root", root, rootBlocks, must)
 	}
 	for _, never := range want.rootMustNot {
-		if strings.Contains(root.Text, never) {
-			r.t.Fatalf("%s: root must not contain %q:\n%s", label, never, root.Text)
-		}
-	}
-	// Blocks are what an operator actually reads; the fallback text alone
-	// would not prove the rendered message.
-	if strings.TrimSpace(root.Blocks) == "" || root.Blocks == "null" {
-		r.t.Fatalf("%s: root carried no blocks payload", label)
-	}
-	for _, c := range append(append([]e2eSlackCall{}, out.rootPosts...), out.replies...) {
-		if strings.TrimSpace(c.Blocks) == "" || c.Blocks == "null" {
-			r.t.Fatalf("%s: a delivered %s carried no blocks payload", label, c.Method)
-		}
+		r.mustNotSay(label, "root", root, rootBlocks, never)
 	}
 	if want.replies == 1 {
 		reply := out.replies[0]
 		if reply.ThreadTS != r.rootTS {
 			r.t.Fatalf("%s: reply thread_ts = %q, want the Situation's own root %q", label, reply.ThreadTS, r.rootTS)
 		}
+		replyBlocks := r.blockText(label+" reply", reply.Blocks)
 		for _, must := range want.replyMust {
-			if !strings.Contains(reply.Text, must) {
-				r.t.Fatalf("%s: reply is missing %q:\n%s", label, must, reply.Text)
-			}
+			r.mustSay(label, "reply", reply, replyBlocks, must)
 		}
 	}
-	// §7 (integration contract): this release renders the status-check
-	// fallback, never an unenforceable visible-reply promise.
-	// S5-03: and every bracketed placeholder in the illustrative target copy
-	// must have been replaced with recorded data, never shipped as copy.
-	for _, c := range append(append([]e2eSlackCall{}, out.rootPosts...), append(out.rootEdits, out.replies...)...) {
+}
+
+// mustSay requires want in the delivered fallback text AND in the decoded
+// Block Kit text of the same message.
+func (r *s5rFixture) mustSay(label, role string, c e2eSlackCall, blocks, want string) {
+	r.t.Helper()
+	if !strings.Contains(c.Text, want) {
+		r.t.Fatalf("%s: %s fallback text is missing %q:\n%s", label, role, want, c.Text)
+	}
+	if !strings.Contains(blocks, want) {
+		r.t.Fatalf("%s: %s renders without %q; the operator reads the blocks, not the fallback:\n%s", label, role, want, blocks)
+	}
+}
+
+// mustNotSay requires never in neither the fallback text nor the blocks.
+func (r *s5rFixture) mustNotSay(label, role string, c e2eSlackCall, blocks, never string) {
+	r.t.Helper()
+	if strings.Contains(c.Text, never) {
+		r.t.Fatalf("%s: %s fallback text must not contain %q:\n%s", label, role, never, c.Text)
+	}
+	if strings.Contains(blocks, never) {
+		r.t.Fatalf("%s: %s renders %q, which it must not:\n%s", label, role, never, blocks)
+	}
+}
+
+// assertPayloads applies the checks EVERY delivered message must pass,
+// whatever produced it: a real Block Kit payload; §7's rule that this
+// release renders the status-check fallback and never an unenforceable
+// visible-reply promise; and S5-03's rule that every bracketed placeholder
+// in the illustrative target copy was replaced with recorded data rather
+// than shipped as copy. deliverSegment runs it for every segment, so the
+// redundant and overtaken variants are covered as fully as the delivered
+// one even though they assert their own event shape.
+//
+// Absence of a placeholder is a negative control only. It shows no
+// illustrative token shipped; it is never evidence that the fact the token
+// stood for was populated. That is what the per-event rootMust/replyMust
+// assertions above, and the audit's own row-by-row map, are for.
+func (r *s5rFixture) assertPayloads(label string, calls []e2eSlackCall) {
+	r.t.Helper()
+	for _, c := range calls {
+		if strings.TrimSpace(c.Blocks) == "" || c.Blocks == "null" {
+			r.t.Fatalf("%s: a delivered %s carried no blocks payload", label, c.Method)
+		}
 		for _, bad := range []string{"update by", "Update by"} {
 			if strings.Contains(c.Text, bad) || strings.Contains(c.Blocks, bad) {
 				r.t.Fatalf("%s: delivered %s contains the unsupported promise %q:\n%s", label, c.Method, bad, c.Text)
 			}
 		}
 		r.assertNoPlaceholders(label, c)
+	}
+}
+
+// rendered is everything an operator could see on one message: the
+// fallback text and the decoded Block Kit text together. A must-NOT
+// assertion reads this, so unwanted copy is caught wherever it hides.
+func (r *s5rFixture) rendered(label string, c e2eSlackCall) string {
+	r.t.Helper()
+	return c.Text + "\n" + r.blockText(label, c.Blocks)
+}
+
+// blockText decodes one captured Block Kit payload into every text string
+// it carries, joined in a deterministic order. This is the operator-visible
+// rendering; assertions run against it, not only the fallback field.
+func (r *s5rFixture) blockText(label, blocks string) string {
+	r.t.Helper()
+	var decoded any
+	if err := json.Unmarshal([]byte(blocks), &decoded); err != nil {
+		r.t.Fatalf("%s: blocks payload is not valid JSON (%v):\n%s", label, err, blocks)
+	}
+	var b strings.Builder
+	s5rWalkText(decoded, &b)
+	return b.String()
+}
+
+// s5rWalkText collects every "text" string in a decoded Block Kit tree.
+// Object keys are visited in sorted order so the joined result never
+// depends on Go's map iteration order.
+func s5rWalkText(v any, b *strings.Builder) {
+	switch node := v.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(node))
+		for k := range node {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if k == "text" {
+				if s, ok := node[k].(string); ok {
+					b.WriteString(s)
+					b.WriteString("\n")
+					continue
+				}
+			}
+			s5rWalkText(node[k], b)
+		}
+	case []any:
+		for _, child := range node {
+			s5rWalkText(child, b)
+		}
 	}
 }
 
@@ -543,7 +692,7 @@ func TestS5ReplayDeliveredSequenceRendersEveryCanonicalEvent(t *testing.T) {
 	r := newS5RFixture(t, "group=s5r-delivered")
 
 	// Event 1 — 15:09:09 the first root arrives. No work has started.
-	ev1 := r.runEvent("event 1 · first root arrives")
+	ev1 := r.runEvent("event 1 · first root arrives", 1)
 	if len(ev1.rootPosts) != 1 {
 		t.Fatalf("event 1 posted %d root message(s), want exactly the initial overview", len(ev1.rootPosts))
 	}
@@ -558,9 +707,12 @@ func TestS5ReplayDeliveredSequenceRendersEveryCanonicalEvent(t *testing.T) {
 	})
 
 	// Event 2 — 15:10:33 the bounded investigation actually claims and starts.
+	// From here to event 4 the controller re-decides on already-assessed
+	// facts, so the expected model-call count for each is zero: the second
+	// argument to runEvent is that expectation, asserted for every event.
 	r.clock.advance(84 * time.Second)
 	claim := r.startInvestigation()
-	ev2 := r.runEvent("event 2 · investigation starts")
+	ev2 := r.runEvent("event 2 · investigation starts", 0)
 	r.assertEvent("event 2", ev2, s5rExpect{
 		lifecycle: "active", orientation: "Investigating", transitions: 2, replies: 1,
 		rootMust: []string{"Investigating 4 alerts for " + s5rScope, "Next status check:"},
@@ -573,7 +725,7 @@ func TestS5ReplayDeliveredSequenceRendersEveryCanonicalEvent(t *testing.T) {
 	// Event 3 — 15:10:58 the finding is persisted and earns its reply.
 	r.clock.advance(25 * time.Second)
 	r.publishFinding(claim.AttemptID)
-	ev3 := r.runEvent("event 3 · finding published")
+	ev3 := r.runEvent("event 3 · finding published", 0)
 	r.assertEvent("event 3", ev3, s5rExpect{
 		lifecycle: "active", orientation: "Monitoring", transitions: 3, replies: 1,
 		rootMust: []string{"pod crash to error spike to queue backlog", "Next status check:"},
@@ -585,7 +737,7 @@ func TestS5ReplayDeliveredSequenceRendersEveryCanonicalEvent(t *testing.T) {
 	r.clock.advance(31 * time.Second)
 	r.accept(s5rAlerts()[3], "resolved", r.clock.Now())
 	r.enqueueInput("membership_changed", "queue-clear")
-	ev4 := r.runEvent("event 4 · one of four clears")
+	ev4 := r.runEvent("event 4 · one of four clears", 0)
 	r.assertEvent("event 4", ev4, s5rExpect{
 		lifecycle: "active", orientation: "Monitoring", transitions: 4, replies: 1,
 		rootMust: []string{"3/4 alerts firing", "Next status check:"},
@@ -601,7 +753,7 @@ func TestS5ReplayDeliveredSequenceRendersEveryCanonicalEvent(t *testing.T) {
 		t.Fatalf("recorded checkpoint %s is not in the future; event 5 would not be a checkpoint tick", checkpoint)
 	}
 	r.advanceTo(checkpoint)
-	ev5 := r.runEvent("event 5 · quiet status checkpoint")
+	ev5 := r.runEvent("event 5 · quiet status checkpoint", 1)
 	r.assertEvent("event 5", ev5, s5rExpect{
 		// No new Transition: nothing material changed. The root is still
 		// refreshed in place, which is exactly what the slide claims.
@@ -616,12 +768,10 @@ func TestS5ReplayDeliveredSequenceRendersEveryCanonicalEvent(t *testing.T) {
 	if !strings.Contains(root5.Text, slackDateToken(refreshed)) {
 		t.Fatalf("event 5 root does not carry the refreshed checkpoint %s:\n%s", refreshed, root5.Text)
 	}
-	// The checkpoint IS the assessment cadence in this build, so reaching
-	// it consumes exactly one scheduled assessment — and nothing more. No
-	// second call is made to advance a clock or rewrite a qualifier.
-	if ev5.modelCalls != 1 {
-		t.Fatalf("event 5 consumed %d model call(s), want exactly the one scheduled assessment", ev5.modelCalls)
-	}
+	// The one model call runEvent asserted above IS the scheduled
+	// assessment this checkpoint exists to make; nothing more. No second
+	// call is made to advance a clock or rewrite a qualifier, and the
+	// delivery that follows makes none at all.
 
 	// Event 6 — 15:13:58 every monitored alert clears.
 	r.clock.advance(29 * time.Second)
@@ -629,7 +779,7 @@ func TestS5ReplayDeliveredSequenceRendersEveryCanonicalEvent(t *testing.T) {
 		r.accept(a, "resolved", r.clock.Now())
 	}
 	r.enqueueInput("membership_changed", "all-clear")
-	ev6 := r.runEvent("event 6 · all four clear")
+	ev6 := r.runEvent("event 6 · all four clear", 1)
 	grace := r.mustSituationTime("grace_until")
 	observed := r.mustSituationTime("recovery_observed_at")
 	if got := grace.Sub(observed); got != 2*time.Minute {
@@ -644,14 +794,14 @@ func TestS5ReplayDeliveredSequenceRendersEveryCanonicalEvent(t *testing.T) {
 	// Event 7 — 15:15:59 the persisted grace deadline expires. Nothing is
 	// forced: one cycle a second before expiry must still be confirming.
 	r.advanceTo(grace.Add(-time.Second))
-	pre := r.runEvent("event 7a · one second before the grace deadline")
+	pre := r.runEvent("event 7a · one second before the grace deadline", 1)
 	r.assertEvent("event 7a", pre, s5rExpect{
 		lifecycle: "recovery_pending", orientation: "Confirming recovery", transitions: 5, replies: 0,
 		rootMust: []string{slackDateToken(grace)},
 	})
 
 	r.advanceTo(grace.Add(3 * time.Second))
-	ev7 := r.runEvent("event 7 · recovery confirmed")
+	ev7 := r.runEvent("event 7 · recovery confirmed", 0)
 	terminal := r.mustSituationTime("terminal_at")
 	if terminal.Before(grace) {
 		t.Fatalf("terminal_at %s precedes the persisted grace deadline %s", terminal, grace)
@@ -665,8 +815,8 @@ func TestS5ReplayDeliveredSequenceRendersEveryCanonicalEvent(t *testing.T) {
 		replyMust: []string{"Recovery confirmed after the observation period",
 			"monitoring for this episode has ended"},
 	})
-	if strings.Contains(ev7.replies[0].Text, "Next status check:") {
-		t.Fatalf("the terminal reply promises another automatic check:\n%s", ev7.replies[0].Text)
+	if seen := r.rendered("event 7 reply", ev7.replies[0]); strings.Contains(seen, "Next status check:") {
+		t.Fatalf("the terminal reply promises another automatic check:\n%s", seen)
 	}
 
 	// S5-02, delivered case: five earned replies — the four R3 recorded
@@ -697,14 +847,14 @@ func TestS5ReplayRedundantFirstRootPostsNoAssurance(t *testing.T) {
 	// Publication is authorized but the provider is unreachable, so the
 	// awaiting root never actually posts.
 	r.slack.setScript(alwaysStatus(http.StatusServiceUnavailable, 0))
-	r.drainController()
-	r.deliverRound()
+	r.drainCycle("publication cycle · provider unreachable", 1)
+	r.failedDeliveryRound("publication delivery · provider unreachable")
 
 	r.clock.advance(84 * time.Second)
 	claim := r.startInvestigation()
-	r.drainController()
+	r.drainCycle("execution start cycle · provider unreachable", 0)
 	r.slack.setScript(alwaysOK)
-	first := r.runEvent("first root · execution already running")
+	first := r.runEvent("first root · execution already running", 0)
 	if len(first.rootPosts) != 1 {
 		t.Fatalf("first publication posted %d root message(s), want exactly 1%s", len(first.rootPosts), r.intentSummary())
 	}
@@ -713,29 +863,30 @@ func TestS5ReplayRedundantFirstRootPostsNoAssurance(t *testing.T) {
 		t.Fatalf("first publication also posted %d thread repl(y/ies); the initial root conveys execution itself:\n%s",
 			len(first.replies), first.replies[0].Text)
 	}
-	if !strings.Contains(first.rootPosts[0].Text, "Investigating 4 alerts for "+s5rScope) {
-		t.Fatalf("the first root does not itself convey the running investigation:\n%s", first.rootPosts[0].Text)
-	}
+	firstRoot := first.rootPosts[0]
+	r.mustSay("first root", "root", firstRoot, r.blockText("first root", firstRoot.Blocks),
+		"Investigating 4 alerts for "+s5rScope)
+	r.mustSay("first root", "root", firstRoot, r.blockText("first root", firstRoot.Blocks), "*\u25b8 Investigating*")
 
 	r.clock.advance(25 * time.Second)
 	r.publishFinding(claim.AttemptID)
-	r.runEvent("finding published")
+	r.runEvent("finding published", 0)
 
 	r.clock.advance(31 * time.Second)
 	r.accept(s5rAlerts()[3], "resolved", r.clock.Now())
 	r.enqueueInput("membership_changed", "queue-clear")
-	r.runEvent("one of four clears")
+	r.runEvent("one of four clears", 0)
 
 	r.clock.advance(29 * time.Second)
 	for _, a := range s5rAlerts()[:3] {
 		r.accept(a, "resolved", r.clock.Now())
 	}
 	r.enqueueInput("membership_changed", "all-clear")
-	r.runEvent("all four clear")
+	r.runEvent("all four clear", 1)
 
 	grace := r.mustSituationTime("grace_until")
 	r.advanceTo(grace.Add(3 * time.Second))
-	r.runEvent("recovery confirmed")
+	r.runEvent("recovery confirmed", 1)
 
 	if got := r.lifecycle(); got != "recovered" {
 		t.Fatalf("lifecycle = %s, want recovered", got)
@@ -778,7 +929,7 @@ func TestS5ReplayRedundantFirstRootPostsNoAssurance(t *testing.T) {
 func TestS5ReplayFindingOvertakesAnUndeliveredStart(t *testing.T) {
 	r := newS5RFixture(t, "group=s5r-overtaken")
 
-	ev1 := r.runEvent("event 1 · first root arrives")
+	ev1 := r.runEvent("event 1 · first root arrives", 1)
 	if len(ev1.rootPosts) != 1 {
 		t.Fatalf("event 1 posted %d root message(s), want 1", len(ev1.rootPosts))
 	}
@@ -789,8 +940,8 @@ func TestS5ReplayFindingOvertakesAnUndeliveredStart(t *testing.T) {
 	r.slack.setScript(alwaysStatus(http.StatusServiceUnavailable, 0))
 	r.clock.advance(84 * time.Second)
 	claim := r.startInvestigation()
-	r.drainController()
-	r.deliverRound()
+	r.drainCycle("execution start cycle · provider unreachable", 0)
+	r.failedDeliveryRound("execution start delivery · provider unreachable")
 	assuranceSeq := r.scalarInt(`SELECT MAX(sequence) FROM situation_transitions WHERE situation_id = ?`, r.sitID)
 	if got := r.intentStatus(assuranceSeq, "thread_append"); got != "pending" {
 		t.Fatalf("assurance reply status = %s before the finding, want pending", got)
@@ -799,7 +950,7 @@ func TestS5ReplayFindingOvertakesAnUndeliveredStart(t *testing.T) {
 	// The finding commits while both are still owed.
 	r.clock.advance(25 * time.Second)
 	r.publishFinding(claim.AttemptID)
-	r.drainController()
+	r.drainCycle("finding cycle · provider unreachable", 0)
 	findingSeq := r.scalarInt(`SELECT MAX(sequence) FROM situation_transitions WHERE situation_id = ?`, r.sitID)
 	if findingSeq <= assuranceSeq {
 		t.Fatalf("the finding did not commit its own Transition (sequences %d then %d)", assuranceSeq, findingSeq)
@@ -835,36 +986,35 @@ func TestS5ReplayFindingOvertakesAnUndeliveredStart(t *testing.T) {
 	// Slack returns. Only ONE root edit lands, and no stale start claim
 	// ever reaches the operator.
 	r.slack.setScript(alwaysOK)
-	r.seen = len(r.slack.accepted())
-	r.deliverNow()
-	after := r.slack.accepted()[r.seen:]
-	r.seen = len(r.slack.accepted())
-	var edits int
-	var replies []e2eSlackCall
-	for _, c := range after {
-		switch {
-		case c.Method == "chat.update":
-			edits++
-		case c.Method == "chat.postMessage" && c.ThreadTS == r.rootTS:
-			replies = append(replies, c)
-		}
-	}
-	if edits != 1 {
-		t.Fatalf("recovery delivered %d root edit(s), want exactly the finding's own", edits)
+	const settle = "provider returns · both owed messages settle"
+	out := r.deliverSegment(settle)
+	r.logOutcome(settle, out)
+	replies := out.replies
+	if len(out.rootEdits) != 1 || len(out.rootPosts) != 0 {
+		t.Fatalf("recovery delivered %d root edit(s) and %d root post(s), want exactly the finding's own edit",
+			len(out.rootEdits), len(out.rootPosts))
 	}
 	for _, c := range replies {
-		if strings.Contains(c.Text, "Investigating 4 alerts") {
-			t.Fatalf("a stale start claim reached the operator after the finding:\n%s", c.Text)
+		if c.ThreadTS != r.rootTS {
+			t.Fatalf("a settled reply landed on thread %q, not this Situation's root %q", c.ThreadTS, r.rootTS)
+		}
+	}
+	for _, c := range replies {
+		if seen := r.rendered(settle, c); strings.Contains(seen, "Investigating 4 alerts") {
+			t.Fatalf("a stale start claim reached the operator after the finding:\n%s", seen)
 		}
 	}
 	// The narrowed survivor states the supersession without claiming the
 	// root was refreshed (B5 round 6, contract §46/3).
 	var narrowed bool
 	for _, c := range replies {
+		seen := r.rendered(settle, c)
 		if strings.Contains(c.Text, "have been superseded; they are not current") {
 			narrowed = true
-			if strings.Contains(c.Text, "main message") {
-				t.Fatalf("the narrowed reply claims the main message is current:\n%s", c.Text)
+			r.mustSay(settle, "narrowed reply", c, r.blockText(settle, c.Blocks),
+				"have been superseded; they are not current")
+			if strings.Contains(seen, "main message") {
+				t.Fatalf("the narrowed reply claims the main message is current:\n%s", seen)
 			}
 		}
 	}
@@ -875,18 +1025,18 @@ func TestS5ReplayFindingOvertakesAnUndeliveredStart(t *testing.T) {
 	r.clock.advance(31 * time.Second)
 	r.accept(s5rAlerts()[3], "resolved", r.clock.Now())
 	r.enqueueInput("membership_changed", "queue-clear")
-	r.runEvent("one of four clears")
+	r.runEvent("one of four clears", 0)
 
 	r.clock.advance(29 * time.Second)
 	for _, a := range s5rAlerts()[:3] {
 		r.accept(a, "resolved", r.clock.Now())
 	}
 	r.enqueueInput("membership_changed", "all-clear")
-	r.runEvent("all four clear")
+	r.runEvent("all four clear", 1)
 
 	grace := r.mustSituationTime("grace_until")
 	r.advanceTo(grace.Add(3 * time.Second))
-	r.runEvent("recovery confirmed")
+	r.runEvent("recovery confirmed", 1)
 
 	if got := r.lifecycle(); got != "recovered" {
 		t.Fatalf("lifecycle = %s, want recovered", got)
