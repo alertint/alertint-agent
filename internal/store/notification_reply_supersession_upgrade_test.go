@@ -15,10 +15,18 @@ import (
 // Migration 0022 upgrade test (B0 integration contract §5.3/§6, E1): a
 // populated migration-21 database must relax notification_intents'
 // supersession CHECK to admit a live thread_append assurance alongside
-// root_sync, gain the investigation_started guard trigger, keep 0020's
+// root_sync, gain the thread supersession guard trigger, keep 0020's
 // live-only rule, preserve slack_delivery_gaps.recovery_notice_intent_id
-// across the rebuild, keep MaxSchemaVersion honest at 22, pass
-// PRAGMA foreign_key_check, and fabricate no rows.
+// across the rebuild, keep MaxSchemaVersion honest at the newest embedded
+// migration, pass PRAGMA foreign_key_check, and fabricate no rows.
+//
+// Open() applies the whole embedded chain, so the guard this exercises is
+// migration 0023's replacement (D1, lead review 2026-09-10), not 0022's
+// original. Both refuse this fixture's rows for the same reason and the
+// upgrade path is what is under test here; 0023's own before/after upgrade
+// is notification_assurance_candidate_guard_upgrade_test.go, and the two
+// guards' differing verdicts are
+// situation_assurance_candidate_parity_test.go.
 // ----------------------------------------------------------------------
 
 // seedMigration21ReplySupersessionFixture builds a database shaped like the
@@ -182,8 +190,8 @@ func TestNotificationReplySupersessionUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	if got != 22 {
-		t.Fatalf("MaxSchemaVersion = %d, want 22", got)
+	if got != 23 {
+		t.Fatalf("MaxSchemaVersion = %d, want 23", got)
 	}
 
 	assertNoForeignKeyViolations(ctx, t, st)
@@ -213,13 +221,15 @@ func TestNotificationReplySupersessionUpgrade(t *testing.T) {
 		t.Fatalf("supersede a pending assurance thread_append after 0022: %v", err)
 	}
 
-	// A pending thread_append whose OWN transition is not investigation_started
-	// may not — the new guard trigger.
+	// A pending thread_append that is not an assurance may not — the guard
+	// trigger. This fixture's row records no candidates at all, so both
+	// 0022's label rule and 0023's legacy fallback reach the same verdict
+	// through it: its journal_kind is evidence_conclusion.
 	if _, err := st.DB().ExecContext(ctx, `
 		UPDATE notification_intents SET status = 'superseded', supersession_reason = 'superseded_by_finding',
 		       replacement_intent_id = ?
-		WHERE id = ?`, deliveredAssuranceID, pendingOtherID); err == nil || !strings.Contains(err.Error(), "investigation_started") {
-		t.Fatalf("superseding a non-assurance thread_append = %v, want the new investigation_started guard's rejection", err)
+		WHERE id = ?`, deliveredAssuranceID, pendingOtherID); err == nil || !strings.Contains(err.Error(), "purely transient first_execution_assurance") {
+		t.Fatalf("superseding a non-assurance thread_append = %v, want the supersession guard's rejection", err)
 	}
 
 	// A DELIVERED assurance thread_append still may not — 0020's live-only

@@ -818,7 +818,7 @@ func loadCommunicatedHistoryTx(ctx context.Context, tx *sql.Tx, situationID stri
 		}
 	}
 
-	liveAssurance, err := liveTransientAssuranceIntentIDsTx(ctx, tx, situationID)
+	liveAssurance, err := liveTransientAssuranceIntentIDsTx(ctx, tx, situationID, 0)
 	if err != nil {
 		return out, err
 	}
@@ -1006,15 +1006,32 @@ func foldLimitationsAndAction(trs []situationmodel.Transition) ([]string, *situa
 // carries a member/scope change, a finding, an action or a limitation is
 // material history (ADR 0042/0052) and is not disposable, whatever its
 // journal label says (lead review 2026-09-09, R3).
-func liveTransientAssuranceIntentIDsTx(ctx context.Context, tx *sql.Tx, situationID string) ([]string, error) {
+//
+// purelyTransientAssurance is the ONE authority on that question (D1, lead
+// review 2026-09-10). Neither query below re-states it as a journal-kind
+// pre-filter: a second copy of the rule is exactly how D1 survived, since
+// the label and the recorded candidate list disagree on the canonical
+// planned-then-running order. The scan stays bounded by the live
+// thread_append set these Situations already own.
+//
+// beforeSequence, when positive, bounds eligibility to Transitions strictly
+// below it — the overtaking commit's own sequence, so an earlier reply can
+// never be retired by a later-sequenced one. 0 or less means unbounded.
+func liveTransientAssuranceIntentIDsTx(ctx context.Context, tx *sql.Tx, situationID string, beforeSequence int) ([]string, error) {
+	bound, joinBound := "", ""
+	boundArgs := []any{}
+	if beforeSequence > 0 {
+		bound, joinBound = " AND sequence < ?", " AND t.sequence < ?"
+		boundArgs = append(boundArgs, beforeSequence)
+	}
 	transient := map[string]bool{}
 	rows, err := tx.QueryContext(ctx, `
 		SELECT `+transitionColumns+`
 		FROM situation_transitions
-		WHERE situation_id = ? AND journal_kind = 'investigation_started' AND id IN (
+		WHERE situation_id = ?`+bound+` AND id IN (
 			SELECT transition_id FROM notification_intents
 			WHERE situation_id = ? AND effect_class = 'thread_append' AND status IN (`+historyLive+`)
-		)`, situationID, situationID)
+		)`, append(append([]any{situationID}, boundArgs...), situationID)...)
 	if err != nil {
 		return nil, fmt.Errorf("store: query live assurance transitions: %w", err)
 	}
@@ -1038,9 +1055,8 @@ func liveTransientAssuranceIntentIDsTx(ctx context.Context, tx *sql.Tx, situatio
 		FROM notification_intents i
 		JOIN situation_transitions t ON t.id = i.transition_id
 		WHERE i.situation_id = ? AND i.effect_class = 'thread_append'
-		  AND i.status IN (`+historyLive+`)
-		  AND t.journal_kind = 'investigation_started'
-		ORDER BY t.sequence ASC, i.id ASC`, situationID)
+		  AND i.status IN (`+historyLive+`)`+joinBound+`
+		ORDER BY t.sequence ASC, i.id ASC`, append([]any{situationID}, boundArgs...)...)
 	if err != nil {
 		return nil, fmt.Errorf("store: query live assurance intents: %w", err)
 	}
@@ -1062,16 +1078,27 @@ func liveTransientAssuranceIntentIDsTx(ctx context.Context, tx *sql.Tx, situatio
 }
 
 // purelyTransientAssurance reports whether every fact tr would put on
-// screen is the disposable start assurance. A legacy projection carrying no
-// candidate list at all keeps the original journal-label behavior, since
-// there is nothing else recorded to inspect.
+// screen is the disposable start assurance.
+//
+// B3's candidate list is the accepted fact — the same rule
+// transitionConveysAssurance already follows, for the same reason. The
+// investigation_started journal LABEL is consulted only for a legacy
+// projection that carries no candidate list at all, because that label
+// covers merely PLANNED triage (R2) and, on the canonical
+// planned-then-running order, is absent from the Transition that records
+// the real execution start: selectControllerReason reaches
+// ReasonInvestigationStarted only when the prior contract was not already
+// an investigation. Keying eligibility on the label therefore refused to
+// retire exactly the reply §5.3 exists to retire (D1, lead review
+// 2026-09-10).
+//
+// Migration 0023's notification_intents_thread_supersession_guard is this
+// predicate's SQL twin; situation_assurance_candidate_parity_test.go drives
+// both from the same JSON so they cannot drift.
 func purelyTransientAssurance(tr situationmodel.Transition) bool {
-	if tr.JournalKind != situationmodel.JournalInvestigationStarted {
-		return false
-	}
 	d := tr.Projection.OperatorDelta
 	if d == nil || len(d.Candidates) == 0 {
-		return true
+		return tr.JournalKind == situationmodel.JournalInvestigationStarted
 	}
 	for _, c := range d.Candidates {
 		if c.Kind != situationmodel.CandidateFirstExecutionAssurance {
@@ -1155,11 +1182,18 @@ const (
 //
 // A delivered assurance is material history (ADR 0042/0052) and untouched:
 // the live-status filter here is the same one 0020/0022 encode as a CHECK.
-// The journal-kind guard 0022 adds is NECESSARY, not sufficient — reason
-// precedence lets one Transition carry the start AND a member/scope change,
-// and that row's material history is not disposable. Only a row whose every
-// candidate is the transient assurance is superseded (lead review
-// 2026-09-09, R3).
+// Only a row whose every recorded candidate is the transient assurance is
+// superseded — reason precedence lets one Transition carry the start AND a
+// member/scope change, and that row's material history is not disposable
+// (lead review 2026-09-09, R3). Migration 0023's guard asks that same
+// question in SQL; 0022 asked the journal-label question instead, which is
+// the D1 failure (lead review 2026-09-10).
+//
+// Eligibility is additionally bounded to Transitions strictly BELOW the
+// overtaking one's sequence: a reply can only ever be retired by something
+// that came after it. The assurance candidate is emitted at most once per
+// Situation, so this narrows no behavior observed today; it makes the
+// ordering structural rather than incidental.
 //
 // A no-op when history carries no overtaking candidate, when no purely
 // transient live assurance exists, or when the overtaking Transition itself
@@ -1170,6 +1204,7 @@ func supersedeObsoleteAssuranceTx(ctx context.Context, tx *sql.Tx, situationID s
 		return nil
 	}
 	var overtakingTransitionID, reason string
+	var overtakingSequence int
 outer:
 	for _, tr := range history.Transitions {
 		if tr.Projection.OperatorDelta == nil {
@@ -1181,11 +1216,11 @@ outer:
 				continue
 			}
 			if overtakes == SupersessionReasonTerminalEnd {
-				overtakingTransitionID, reason = tr.ID, overtakes
+				overtakingTransitionID, overtakingSequence, reason = tr.ID, tr.Sequence, overtakes
 				break outer
 			}
 			if overtakingTransitionID == "" {
-				overtakingTransitionID, reason = tr.ID, overtakes
+				overtakingTransitionID, overtakingSequence, reason = tr.ID, tr.Sequence, overtakes
 			}
 		}
 	}
@@ -1205,7 +1240,7 @@ outer:
 		return nil
 	}
 
-	obsolete, err := liveTransientAssuranceIntentIDsTx(ctx, tx, situationID)
+	obsolete, err := liveTransientAssuranceIntentIDsTx(ctx, tx, situationID, overtakingSequence)
 	if err != nil {
 		return err
 	}

@@ -902,28 +902,33 @@ func TestS5ReplayRedundantFirstRootPostsNoAssurance(t *testing.T) {
 // still queued behind an unavailable provider. The "finding-supersedes-
 // start" Slack example.
 //
-// REPORTED DISCREPANCY D1 (product, not repaired here — B6 is an evaluator
-// and the owning chunk is B5/§5.3). On this real sequence the commit-time
-// obsolete-start supersession never fires, because it filters on
-// journal_kind = 'investigation_started' (migration 0022,
-// liveTransientAssuranceIntentIDsTx) while the controller records the
-// actual execution start as operator_contract_changed: selectControllerReason
-// only reaches ReasonInvestigationStarted when the PRIOR contract was not
-// already an investigation, and investigationCurrent treats
-// run_acute_triage/planned exactly like run_acute_triage/running. The
-// canonical R3 order requests triage in the publishing cycle ("analysis was
-// still pending/collecting") and starts it in the next one, so the guard's
-// own precondition is never met.
+// This was REPORTED DISCREPANCY D1 for two review rounds, and is now the
+// regression that keeps it repaired. On this real sequence the commit-time
+// obsolete-start supersession used to filter on journal_kind =
+// 'investigation_started' (migration 0022, liveTransientAssuranceIntentIDsTx)
+// while the controller records the actual execution start as
+// operator_contract_changed: selectControllerReason only reaches
+// ReasonInvestigationStarted when the PRIOR contract was not already an
+// investigation, and investigationCurrent treats run_acute_triage/planned
+// exactly like run_acute_triage/running. The canonical R3 order requests
+// triage in the publishing cycle ("analysis was still pending/collecting")
+// and starts it in the next one, so the guard's own precondition was never
+// met and the operator received one content-free start claim after the
+// finding that replaced it.
 //
-// What the operator actually sees is still safe, and this test pins that:
-// the stale ROOT edit is superseded normally (newer_root_projection), so
-// only the finding's root lands, and B5's delivery-time narrowing strips
-// the superseded start from the reply that does go out. The cost is one
-// extra content-free reply, so the illustrative "stays at four" count is
-// five here. The store-level regression that DOES reach the commit-time
-// path (internal/store/situation_s5_replay_test.go) keeps that mechanism
-// covered; it starts from a monitor_situation contract, which the canonical
-// event 1 does not.
+// Eligibility now reads the recorded first_execution_assurance candidate,
+// with the journal label kept only as the legacy fallback for a projection
+// carrying no candidate list at all — the same correction
+// transitionConveysAssurance already carried. Migration 0023 asks the same
+// question in SQL. What this test pins is the OPERATOR-VISIBLE outcome: the
+// stale root edit is superseded (newer_root_projection) so only the
+// finding's root lands, the stale start reply is superseded
+// (superseded_by_finding) so it never posts at all, and the Situation
+// finishes at the canonical four earned replies.
+//
+// internal/store/situation_obsolete_start_candidate_test.go is the store
+// half of the same repair, and internal/store/situation_s5_replay_test.go's
+// own overtaken test keeps the legacy monitor_situation label path covered.
 // ----------------------------------------------------------------------
 
 func TestS5ReplayFindingOvertakesAnUndeliveredStart(t *testing.T) {
@@ -976,15 +981,27 @@ func TestS5ReplayFindingOvertakesAnUndeliveredStart(t *testing.T) {
 		t.Fatalf("the superseded root names replacement %q, want the finding's own root intent %q",
 			staleRoot.Replacement, freshRoot.ID)
 	}
-	// D1 above: this row is still live at commit time. Asserted so the
-	// discrepancy is visible here and fails loudly the day it is repaired.
-	if reply.Status != "pending" {
-		t.Fatalf("assurance reply status = %s; §5.3 commit-time supersession now reaches the canonical order — "+
-			"reported discrepancy D1 is fixed, so update this expectation and the S5-02 self-check row", reply.Status)
+	// The D1 repair, at the boundary that matters: the stale start reply is
+	// retired in the finding's OWN fenced commit, before any provider is
+	// reachable, and names the finding's reply as what took its place.
+	findingReply := r.intentRow(findingSeq, "thread_append")
+	if reply.Status != "superseded" {
+		t.Fatalf("assurance reply status = %s, want superseded — §5.3 commit-time supersession must reach "+
+			"the canonical planned-then-running order (D1)%s", reply.Status, r.intentSummary())
+	}
+	if reply.Reason != "superseded_by_finding" {
+		t.Fatalf("the superseded start's reason = %q, want superseded_by_finding", reply.Reason)
+	}
+	if reply.Replacement != findingReply.ID {
+		t.Fatalf("the superseded start names replacement %q, want the finding's own reply %q",
+			reply.Replacement, findingReply.ID)
+	}
+	if reply.ID == findingReply.ID {
+		t.Fatalf("the start and finding reply assertions read the same intent row %q", reply.ID)
 	}
 
-	// Slack returns. Only ONE root edit lands, and no stale start claim
-	// ever reaches the operator.
+	// Slack returns. Only ONE root edit lands, and the stale start never
+	// reaches the operator in any form — not even narrowed.
 	r.slack.setScript(alwaysOK)
 	const settle = "provider returns · both owed messages settle"
 	out := r.deliverSegment(settle)
@@ -1004,22 +1021,21 @@ func TestS5ReplayFindingOvertakesAnUndeliveredStart(t *testing.T) {
 			t.Fatalf("a stale start claim reached the operator after the finding:\n%s", seen)
 		}
 	}
-	// The narrowed survivor states the supersession without claiming the
-	// root was refreshed (B5 round 6, contract §46/3).
-	var narrowed bool
-	for _, c := range replies {
-		seen := r.rendered(settle, c)
-		if strings.Contains(c.Text, "have been superseded; they are not current") {
-			narrowed = true
-			r.mustSay(settle, "narrowed reply", c, r.blockText(settle, c.Blocks),
-				"have been superseded; they are not current")
-			if strings.Contains(seen, "main message") {
-				t.Fatalf("the narrowed reply claims the main message is current:\n%s", seen)
-			}
-		}
+	// Exactly one reply settles, and it is the finding's own. There is no
+	// narrowed survivor to inspect any more: the row that would have
+	// carried it was retired at commit time, which is the whole point of
+	// the repair.
+	if len(replies) != 1 {
+		t.Fatalf("recovery delivered %d repl(y/ies), want exactly the finding's own%s", len(replies), r.intentSummary())
 	}
-	if !narrowed {
-		t.Fatalf("the overtaken assurance was delivered without the supersession statement: %d repl(y/ies)", len(replies))
+	settled := replies[0]
+	blocks := r.blockText(settle, settled.Blocks)
+	for _, want := range []string{"Pod restarts precede the error-rate spike", "Queue backlog follows the error spike"} {
+		r.mustSay(settle, "finding reply", settled, blocks, want)
+	}
+	if strings.Contains(r.rendered(settle, settled), "have been superseded; they are not current") {
+		t.Fatalf("a supersession notice still reached the operator; the stale start should never have posted:\n%s",
+			r.rendered(settle, settled))
 	}
 
 	r.clock.advance(31 * time.Second)
@@ -1041,14 +1057,12 @@ func TestS5ReplayFindingOvertakesAnUndeliveredStart(t *testing.T) {
 	if got := r.lifecycle(); got != "recovered" {
 		t.Fatalf("lifecycle = %s, want recovered", got)
 	}
-	// Five, not the illustrative four: D1 leaves the overtaken assurance
-	// deliverable, narrowed. The safety property (no stale start on screen)
-	// is asserted above; this count is the reported gap, not an expectation
-	// the slide endorses.
-	if got := r.deliveredReplies(); got != 5 {
-		t.Fatalf("delivered replies = %d, want the 5 this build actually posts "+
-			"(4 earned plus the narrowed overtaken assurance; the canonical target is 4 — see discrepancy D1)%s",
-			got, r.intentSummary())
+	// The canonical four, which is what the HTML's finding-supersedes-start
+	// and reply-path nodes call for: finding, partial recovery, all-clear,
+	// recovered. The overtaken start is not among them.
+	if got := r.deliveredReplies(); got != 4 {
+		t.Fatalf("delivered replies = %d, want 4 (finding, partial recovery, all-clear, recovered) — "+
+			"the overtaken start assurance must earn none%s", got, r.intentSummary())
 	}
 }
 

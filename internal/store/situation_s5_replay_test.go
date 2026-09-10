@@ -589,16 +589,20 @@ func TestS5ReplayRedundantFirstRootStaysAtFour(t *testing.T) {
 // it (§5.3). Illustrative target: "stays at four ... when that assurance
 // is ... superseded" (the "finding-supersedes-start" Slack example).
 //
-// SCOPE (lead review 2026-09-10). This fixture reaches the commit-time
-// supersession because its event 1 carries a monitor_situation contract, so
-// the execution start is recorded as ReasonInvestigationStarted and matches
-// migration 0022's journal-kind guard. The canonical R3 event 1 does not:
-// it publishes while Acute Triage is already REQUESTED ("analysis was still
-// pending/collecting"), and the real controller then records the start as
-// operator_contract_changed, which the guard does not match. That is
-// reported discrepancy D1; cmd/alertint's overtaken replay drives the
-// canonical order and pins what actually happens. This test remains the
-// coverage for the mechanism itself.
+// SCOPE (lead reviews 2026-09-10). This fixture's event 1 carries a
+// monitor_situation contract, so the execution start is recorded as
+// ReasonInvestigationStarted and wears the investigation_started journal
+// label. The canonical R3 event 1 does not: it publishes while Acute Triage
+// is already REQUESTED ("analysis was still pending/collecting"), and the
+// real controller then records the start as operator_contract_changed.
+// Keying supersession on that label was reported discrepancy D1, repaired
+// by reading the recorded first_execution_assurance candidate instead
+// (migration 0023). This test is deliberately UNCHANGED by that repair: it
+// is now the regression proving the label path did not break, since a
+// projection that records candidates never consults the label at all.
+// situation_obsolete_start_candidate_test.go covers the canonical order at
+// this layer, and cmd/alertint's overtaken replay covers what the operator
+// then reads.
 // ----------------------------------------------------------------------
 
 func TestS5ReplayFindingOvertakesUndeliveredStartStaysAtFour(t *testing.T) {

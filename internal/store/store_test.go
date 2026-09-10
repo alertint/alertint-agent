@@ -446,13 +446,14 @@ func TestMaxSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	// 0022_notification_reply_supersession.sql is the newest migration today.
-	// Plan 2 owns 0015/0016; Plan 3 owns 0017/0018 (spec.md "Persistence and
-	// migration ownership") plus 0019-0022 — 0017 and 0018 are final and are
-	// never edited, so a new migration is the only sanctioned way to extend
-	// them.
-	if got != 22 {
-		t.Errorf("MaxSchemaVersion = %d, want 22", got)
+	// 0023_assurance_supersession_by_candidate.sql is the newest migration
+	// today. Plan 2 owns 0015/0016; Plan 3 owns 0017/0018 (spec.md
+	// "Persistence and migration ownership") plus 0019-0023 — 0017 and 0018
+	// are final and are never edited, so a new migration is the only
+	// sanctioned way to extend them, which is exactly what 0023 does to
+	// 0022's supersession guard.
+	if got != 23 {
+		t.Errorf("MaxSchemaVersion = %d, want 23", got)
 	}
 }
 
