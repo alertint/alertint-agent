@@ -61,7 +61,7 @@ func briefingWork(c model.ActionContract, b *model.OperatorBriefing, now time.Ti
 			return "Investigating" + briefingExecutionScope(b)
 		}
 		if *c.AlertINTStatus == model.AlertINTStatusPlanned {
-			return "Investigation is queued; it has not started yet."
+			return "Investigation is queued; it has not started yet." + briefingQueuedEligibility(b.Work, now)
 		}
 		if c.WaitReason != nil && *c.WaitReason == model.WaitReasonAcuteTriageBackoff {
 			return briefingRetry("Investigation", b.RetryAt, now)
@@ -90,7 +90,7 @@ func briefingWork(c model.ActionContract, b *model.OperatorBriefing, now time.Ti
 		} else {
 			step += "; the next check will reassess whether alerts remain clear."
 		}
-		if outstanding := briefingOutstandingWork(b); outstanding != "" {
+		if outstanding := briefingOutstandingWork(b, now); outstanding != "" {
 			step += " " + outstanding
 		}
 		return step
@@ -122,7 +122,7 @@ func briefingWork(c model.ActionContract, b *model.OperatorBriefing, now time.Ti
 // alike (B0 §3; BuildWorkProjection). One executing schedule beside two
 // waiting ones is phase executing with three outstanding, so the count
 // proves how much work remains, never how much of it is running.
-func briefingOutstandingWork(b *model.OperatorBriefing) string {
+func briefingOutstandingWork(b *model.OperatorBriefing, now time.Time) string {
 	w := b.Work
 	switch w.Phase {
 	case model.WorkPhaseExecuting:
@@ -143,7 +143,12 @@ func briefingOutstandingWork(b *model.OperatorBriefing) string {
 			return "One investigation is waiting in back-off; no retry time is recorded."
 		}
 		return "An investigation is waiting in back-off; no retry time is recorded." + briefingOutstandingTotal(w)
-	case model.WorkPhaseQueued, model.WorkPhaseAwaitingDecision:
+	case model.WorkPhaseQueued:
+		return "Investigation work is still outstanding; it has not started yet." +
+			briefingQueuedEligibility(w, now) + briefingOutstandingTotal(w)
+	case model.WorkPhaseAwaitingDecision:
+		// No decision has been committed yet, so no schedule carries a
+		// readiness time to state — awaiting a decision is not queued work.
 		return "Investigation work is still outstanding; it has not started yet." + briefingOutstandingTotal(w)
 	case model.WorkPhaseCollecting, model.WorkPhaseSettled, model.WorkPhaseExhausted, model.WorkPhaseNone:
 		// No outstanding automatic work to disclose. A legacy projection
@@ -213,6 +218,42 @@ func briefingAlertCount(n int) string {
 		return "1 alert"
 	}
 	return fmt.Sprintf("%d alerts", n)
+}
+
+// briefingQueuedEligibility states what the record actually says about when
+// queued work becomes claimable (slide 2 minimal: "queued analysis, with a
+// known readiness/due time or actual waiting reason"; the queued example's
+// "eligible after [recorded readiness/due condition]"). Eligibility is the
+// moment a worker MAY claim the request, never a scheduled execution time
+// and never evidence that execution began, so no branch here promises a
+// start (G1 repair, lead final review 2026-09-10).
+//
+// An unknown projection stays silent: a transition predating
+// QueuedEligibilityKnown recorded no eligibility at all, and reading its
+// missing time as "eligible now" would invent the fact slide 2 asks for.
+func briefingQueuedEligibility(w model.WorkProjection, now time.Time) string {
+	if !w.QueuedEligibilityKnown {
+		return ""
+	}
+	at := w.QueuedEligibleAt
+	if at == nil {
+		// The contract reads "planned" for an awaiting-decision schedule as
+		// well as a queued one (deriveAlertINTBranch collapses both), and an
+		// undecided schedule has no readiness time to state — that IS its
+		// waiting reason. Otherwise the schedule is queued but records no
+		// time, and briefingNextStep's status checkpoint carries the timing.
+		if w.Phase == model.WorkPhaseAwaitingDecision {
+			return " No investigation decision is committed yet, so it has no readiness time."
+		}
+		return " No readiness time is recorded for it."
+	}
+	if at.After(now) {
+		return " It becomes eligible after " + SlackDateToken(*at, "{time}") + "; eligibility is not an execution guarantee."
+	}
+	// "As of" covers both a schedule that became claimable earlier and one
+	// this very commit authorized, whose recorded eligibility is this
+	// transition's own instant.
+	return " It is eligible for a claim as of " + SlackDateToken(*at, "{time}") + "; eligibility is not an execution guarantee."
 }
 
 func briefingRetry(work string, at *time.Time, now time.Time) string {

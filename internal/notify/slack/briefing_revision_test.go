@@ -479,3 +479,150 @@ func TestBriefingActionAndNextStepClosedUnknownWithoutConcreteConcern(t *testing
 		t.Errorf("a recorded concrete action must still earn an MCP request: %s", action)
 	}
 }
+
+// ----------------------------------------------------------------------
+// G1 (lead final review 2026-09-10): the queued activity line must state a
+// known readiness/due time or the actual waiting reason. Slide 2's queued
+// example is "Analysis queued; eligible after [recorded readiness/due
+// condition]. This is not an execution guarantee." Before this repair the
+// line could only say the work had not started.
+// ----------------------------------------------------------------------
+
+func TestBriefingQueuedLineStatesRecordedEligibility(t *testing.T) {
+	eligible := rsMustTime(t, "2026-09-07T10:05:00Z") // after the fixture's 10:00 now
+	past := rsMustTime(t, "2026-09-07T09:57:00Z")
+	for _, tc := range []struct {
+		name      string
+		work      model.WorkProjection
+		want      string
+		forbidden string
+	}{
+		{
+			name: "not yet eligible states the recorded time",
+			work: model.WorkProjection{Phase: model.WorkPhaseQueued, QueuedEligibilityKnown: true, QueuedEligibleAt: &eligible},
+			want: "It becomes eligible after <!date^1788775500^",
+		},
+		{
+			name: "already eligible says so as of the recorded time",
+			work: model.WorkProjection{Phase: model.WorkPhaseQueued, QueuedEligibilityKnown: true, QueuedEligibleAt: &past},
+			want: "It is eligible for a claim as of <!date^1788775020^",
+		},
+		{
+			name:      "queued with no recorded readiness time says that",
+			work:      model.WorkProjection{Phase: model.WorkPhaseQueued, QueuedEligibilityKnown: true},
+			want:      "No readiness time is recorded for it.",
+			forbidden: "eligible",
+		},
+		{
+			name:      "an undecided schedule states its actual waiting reason",
+			work:      model.WorkProjection{Phase: model.WorkPhaseAwaitingDecision, QueuedEligibilityKnown: true},
+			want:      "No investigation decision is committed yet",
+			forbidden: "eligible",
+		},
+		{
+			// A transition predating the field recorded no eligibility at
+			// all. Unknown is not "eligible now": the line claims nothing.
+			name:      "a legacy projection claims nothing",
+			work:      model.WorkProjection{Phase: model.WorkPhaseQueued},
+			want:      "Investigation is queued; it has not started yet. Next status check:",
+			forbidden: "eligible",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := briefingRootFixture(t, `{"briefing":{"scope":"checkout","firing":1,"total":1}}`)
+			c := rsMonitoringContract(in.Now.Add(time.Minute))
+			a, s := model.AlertINTActionRunAcuteTriage, model.AlertINTStatusPlanned
+			c.AlertINTAction, c.AlertINTStatus, c.WaitReason = &a, &s, nil
+			in.SourceTransition.ActionContract = c
+			in.Summary.Briefing.Work = tc.work
+			in.SourceTransition.Projection.Briefing = in.Summary.Briefing
+
+			root, err := RenderSituationRoot(in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			journal, err := RenderSituationJournal(in.SourceTransition)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, out := range []string{root.Text, rsFallbackBlocksText(root), journal.Text} {
+				if !strings.Contains(out, "Investigation is queued; it has not started yet.") {
+					t.Errorf("lost the queued statement:\n%s", out)
+				}
+				if !strings.Contains(out, tc.want) {
+					t.Errorf("queued line lacks %q:\n%s", tc.want, out)
+				}
+				if tc.forbidden != "" && strings.Contains(out, tc.forbidden) {
+					t.Errorf("queued line must not contain %q:\n%s", tc.forbidden, out)
+				}
+				// Eligibility is a claim time, never a promise that
+				// execution or a reply happens then.
+				for _, bad := range []string{"update by", "will start", "starts at"} {
+					if strings.Contains(strings.ToLower(out), bad) {
+						t.Errorf("queued line promises execution (%q):\n%s", bad, out)
+					}
+				}
+			}
+			// The status checkpoint is its own recorded time and must
+			// survive beside the eligibility.
+			if !strings.Contains(root.Text, "Next status check: <!date^1788775260^") {
+				t.Errorf("eligibility replaced the status checkpoint:\n%s", root.Text)
+			}
+		})
+	}
+}
+
+// TestBriefingRecoveryDisclosesQueuedEligibility covers the second place the
+// same "it has not started yet" sentence appears: the outstanding-work
+// disclosure a Situation confirming recovery carries. Leaving the recorded
+// eligibility off this one would reproduce G1 on a different surface.
+func TestBriefingRecoveryDisclosesQueuedEligibility(t *testing.T) {
+	past := rsMustTime(t, "2026-09-07T09:57:00Z")
+	for _, tc := range []struct {
+		name      string
+		work      model.WorkProjection
+		want      string
+		forbidden string
+	}{
+		{
+			name: "queued work discloses its recorded eligibility and the total",
+			work: model.WorkProjection{
+				Phase: model.WorkPhaseQueued, RemainingIncidents: 2,
+				QueuedEligibilityKnown: true, QueuedEligibleAt: &past,
+			},
+			want: "it has not started yet. It is eligible for a claim as of <!date^1788775020^",
+		},
+		{
+			name: "an undecided schedule discloses no eligibility",
+			work: model.WorkProjection{
+				Phase: model.WorkPhaseAwaitingDecision, RemainingIncidents: 2,
+				QueuedEligibilityKnown: true,
+			},
+			want:      "Investigation work is still outstanding; it has not started yet. In total, 2",
+			forbidden: "eligible",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := briefingRootFixture(t, `{"briefing":{"scope":"checkout","firing":0,"total":2,"resolved":2}}`)
+			in.SourceTransition.ActionContract = rsMonitoringContract(in.Now.Add(time.Minute))
+			in.Summary.Briefing.Work = tc.work
+			in.SourceTransition.Projection.Briefing = in.Summary.Briefing
+
+			root, err := RenderSituationRoot(in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, out := range []string{root.Text, rsFallbackBlocksText(root)} {
+				if !strings.Contains(out, "Watching for sustained recovery") {
+					t.Fatalf("lost the recovery sentence:\n%s", out)
+				}
+				if !strings.Contains(out, tc.want) {
+					t.Errorf("recovery disclosure lacks %q:\n%s", tc.want, out)
+				}
+				if tc.forbidden != "" && strings.Contains(out, tc.forbidden) {
+					t.Errorf("recovery disclosure must not contain %q:\n%s", tc.forbidden, out)
+				}
+			}
+		})
+	}
+}

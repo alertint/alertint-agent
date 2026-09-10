@@ -844,6 +844,7 @@ func BuildWorkProjection(incidents []IncidentState, graceUntil, statusCheckpoint
 	remaining := 0
 	skipReason := ""
 	var retryAt *time.Time
+	var queuedEligibleAt *time.Time
 	var ended []model.IncidentWorkOutcome
 
 	for _, inc := range incidents {
@@ -871,8 +872,24 @@ func BuildWorkProjection(incidents []IncidentState, graceUntil, statusCheckpoint
 			executionStarted = true
 		}
 		switch phase {
-		case model.WorkPhaseAwaitingDecision, model.WorkPhaseQueued, model.WorkPhaseExecuting, model.WorkPhaseRetryWait:
+		case model.WorkPhaseQueued:
 			remaining++
+			// A queued schedule's next_at IS its recorded eligibility: the
+			// moment the worker may claim the durable request. Carried so
+			// the queued activity line can state a readiness time instead
+			// of only "not started" (G1 repair, lead final review
+			// 2026-09-10). The earliest one dates the first schedule that
+			// becomes claimable, exactly as RetryEligibleAt dates the first
+			// retry — not all of them, and never an execution promise.
+			if inc.Triage.NextAt != nil && (queuedEligibleAt == nil || inc.Triage.NextAt.Before(*queuedEligibleAt)) {
+				queuedEligibleAt = inc.Triage.NextAt
+			}
+		case model.WorkPhaseAwaitingDecision, model.WorkPhaseExecuting, model.WorkPhaseRetryWait:
+			remaining++
+		case model.WorkPhaseCollecting, model.WorkPhaseSettled, model.WorkPhaseExhausted, model.WorkPhaseNone:
+			// No outstanding automatic work on this schedule. Settled and
+			// exhausted are handled below as ENDED work; collecting and
+			// none never had a schedule to run.
 		}
 		if phase == model.WorkPhaseRetryWait && inc.Triage.NextAt != nil {
 			if retryAt == nil || inc.Triage.NextAt.Before(*retryAt) {
@@ -895,11 +912,16 @@ func BuildWorkProjection(incidents []IncidentState, graceUntil, statusCheckpoint
 		ExecutionStarted:   executionStarted,
 		RemainingIncidents: remaining,
 		SkipReason:         skipReason,
-		RetryEligibleAt:    retryAt,
-		SourceGraceUntil:   graceUntil,
-		StatusCheckpointAt: statusCheckpointAt,
-		EndedWork:          ended,
-		EndedWorkKnown:     true,
+		QueuedEligibleAt:   queuedEligibleAt,
+		// Every projection built here records queued eligibility, whether or
+		// not any schedule is queued; only a transition predating the field
+		// reads unknown.
+		QueuedEligibilityKnown: true,
+		RetryEligibleAt:        retryAt,
+		SourceGraceUntil:       graceUntil,
+		StatusCheckpointAt:     statusCheckpointAt,
+		EndedWork:              ended,
+		EndedWorkKnown:         true,
 	}
 }
 

@@ -444,6 +444,19 @@ func committedBriefingInput(in SnapshotInput, decisions []TriageDecision) Snapsh
 		if d, ok := byIncident[inc.ID]; ok {
 			reason := d.DecisionReason
 			inc.Triage.DecisionReason = &reason
+			// The same commit that moves this schedule to pending also
+			// stamps its durable next_at with this cycle's instant
+			// (applyRequestFromAwaitingDecisionTx: next_at = now, anchored
+			// on canonicalCommitTime, which is the Reconcile now this
+			// DecidedAt was taken from). earliestTriageDue already treats a
+			// just-requested schedule as due at that same instant; the
+			// presentation copy carries it too, so the queued line states
+			// the eligibility the commit records instead of reporting none
+			// (G1 repair, lead final review 2026-09-10).
+			if phase == "pending" {
+				eligibleAt := d.DecidedAt.UTC()
+				inc.Triage.NextAt = &eligibleAt
+			}
 		}
 		inc.Triage.SkipReason = TriageSkipReason(inc.Triage)
 	}
@@ -711,30 +724,7 @@ func endedWorkCandidates(a, b *model.OperatorBriefing) []model.MaterialCandidate
 // see endedWorkCandidates for the full rule set.
 func endedWorkCandidate(a, b *model.OperatorBriefing, o model.IncidentWorkOutcome, outcome *model.IncidentWorkOutcome) (model.MaterialCandidate, bool) {
 	if o.Phase == model.WorkPhaseSettled {
-		if o.ResultCode != "success" || !o.EvidenceKnown || o.Finding == nil {
-			return model.MaterialCandidate{}, false
-		}
-		if o.Finding.Hypothesis != "" {
-			// A useful accepted result: never an inconclusive completion.
-			// findingCandidates already reports it when it is in the
-			// analysis overview; outside that bound it is reported here
-			// from its own matched evidence so it is not silently dropped.
-			if findAnalysis(b, o.IncidentID) != nil {
-				return model.MaterialCandidate{}, false
-			}
-			// The overview bound decides which PATH reports a useful
-			// result, never whether it is material: outside it the same
-			// structural rule applies against whatever this Incident's
-			// evidence was last known to be (R2 repair, lead review rounds 3
-			// and 4, 2026-09-09). A fresh attempt id, a later completion
-			// time and a rephrased hypothesis over identical retained checks
-			// are a repeat of a reported result, not a new finding.
-			if !findingStructurallyChanged(priorKnownFinding(a, o.IncidentID), o.Finding) {
-				return model.MaterialCandidate{}, false
-			}
-			return model.MaterialCandidate{Kind: model.CandidateUsefulFinding, Finding: candidateFinding(o.Finding), Outcome: outcome, Next: workNextStep(b)}, true
-		}
-		return model.MaterialCandidate{Kind: model.CandidateInconclusiveCompletion, Finding: candidateFinding(o.Finding), Outcome: outcome, Next: workNextStep(b)}, true
+		return settledWorkCandidate(a, b, o, outcome)
 	}
 	if o.Phase != model.WorkPhaseExhausted {
 		return model.MaterialCandidate{}, false
@@ -753,6 +743,37 @@ func endedWorkCandidate(a, b *model.OperatorBriefing, o model.IncidentWorkOutcom
 		Outcome: outcome,
 		Next:    workNextStep(b),
 	}, true
+}
+
+// settledWorkCandidate classifies one settled, attempt-bearing outcome: a
+// matched accepted result is either a useful finding or an inconclusive
+// completion, and anything without matched success evidence is neither.
+// Split out of endedWorkCandidate so each ended phase reads as one flat rule
+// set rather than a nested one.
+func settledWorkCandidate(a, b *model.OperatorBriefing, o model.IncidentWorkOutcome, outcome *model.IncidentWorkOutcome) (model.MaterialCandidate, bool) {
+	if o.ResultCode != "success" || !o.EvidenceKnown || o.Finding == nil {
+		return model.MaterialCandidate{}, false
+	}
+	if o.Finding.Hypothesis == "" {
+		return model.MaterialCandidate{Kind: model.CandidateInconclusiveCompletion, Finding: candidateFinding(o.Finding), Outcome: outcome, Next: workNextStep(b)}, true
+	}
+	// A useful accepted result: never an inconclusive completion.
+	// findingCandidates already reports it when it is in the analysis
+	// overview; outside that bound it is reported here from its own matched
+	// evidence so it is not silently dropped.
+	if findAnalysis(b, o.IncidentID) != nil {
+		return model.MaterialCandidate{}, false
+	}
+	// The overview bound decides which PATH reports a useful result, never
+	// whether it is material: outside it the same structural rule applies
+	// against whatever this Incident's evidence was last known to be (R2
+	// repair, lead review rounds 3 and 4, 2026-09-09). A fresh attempt id, a
+	// later completion time and a rephrased hypothesis over identical
+	// retained checks are a repeat of a reported result, not a new finding.
+	if !findingStructurallyChanged(priorKnownFinding(a, o.IncidentID), o.Finding) {
+		return model.MaterialCandidate{}, false
+	}
+	return model.MaterialCandidate{Kind: model.CandidateUsefulFinding, Finding: candidateFinding(o.Finding), Outcome: outcome, Next: workNextStep(b)}, true
 }
 
 // priorKnownFinding is the structured evidence the PRIOR transition already

@@ -702,8 +702,14 @@ func TestS5ReplayDeliveredSequenceRendersEveryCanonicalEvent(t *testing.T) {
 	}
 	r.assertEvent("event 1", ev1, s5rExpect{
 		lifecycle: "active", orientation: "Observed", transitions: 1, replies: 0,
-		rootMust:    []string{"4/4 alerts firing", "Next status check:", "has not started yet"},
-		rootMustNot: []string{"Investigating 4 alerts"},
+		// G1 (lead final review 2026-09-10): the queued line now states the
+		// eligibility this very commit recorded — 10:45:00, one second
+		// before the 10:45:01 status checkpoint, so the two recorded times
+		// are asserted as distinct tokens rather than one reused value.
+		rootMust: []string{"4/4 alerts firing", "has not started yet",
+			"It is eligible for a claim as of <!date^1788691500^",
+			"Next status check: <!date^1788691501^"},
+		rootMustNot: []string{"Investigating 4 alerts", "No readiness time is recorded"},
 	})
 
 	// Event 2 — 15:10:33 the bounded investigation actually claims and starts.

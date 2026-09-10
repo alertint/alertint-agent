@@ -283,6 +283,23 @@ type WorkProjection struct {
 	// excluded the work) — mapped from the durable decision_reason /
 	// clean-skip code, never guessed from display text.
 	SkipReason string `json:"skip_reason,omitempty"`
+	// QueuedEligibleAt is the earliest recorded eligibility across member
+	// Incidents whose Triage schedule is QUEUED: incident_triage.next_at,
+	// the moment the worker may claim the durable request
+	// (applyRequestFromAwaitingDecisionTx stamps it, and a request refresh
+	// preserves an existing back-off time rather than restarting it). It
+	// answers slide 2's "queued analysis, with a known readiness/due time
+	// or actual waiting reason" — an eligibility time only, never a promise
+	// that execution begins then and never evidence that anything started
+	// (G1 repair, lead final review 2026-09-10). nil means no queued
+	// schedule records one.
+	QueuedEligibleAt *time.Time `json:"queued_eligible_at,omitempty"`
+	// QueuedEligibilityKnown is true on every projection built with the
+	// field above. False means a transition that predates it (legacy
+	// replay): its queued eligibility is UNKNOWN rather than absent, so a
+	// renderer must never read the missing time as "eligible now". Same
+	// unknown-is-not-empty rule as EndedWorkKnown.
+	QueuedEligibilityKnown bool `json:"queued_eligibility_known,omitempty"`
 	// RetryEligibleAt is the earliest of the persisted retry_wait next_at
 	// across member Incidents' Triage schedules and the committed
 	// Assessment-level retry (situations.retry_at, ControllerCommit.RetryAt

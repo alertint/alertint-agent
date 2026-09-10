@@ -396,3 +396,95 @@ func TestDeriveOrientationFromWorkProjection(t *testing.T) {
 		})
 	}
 }
+
+// ----------------------------------------------------------------------
+// G1 (lead final review 2026-09-10): "Queued analysis, with a known
+// readiness/due time or actual waiting reason." A queued schedule's
+// incident_triage.next_at IS its recorded eligibility — the moment a worker
+// may claim it — and the projection carried only the retry_wait reading of
+// that column, so the queued activity line had nothing to state.
+// ----------------------------------------------------------------------
+
+func TestBuildWorkProjectionQueuedCarriesItsRecordedEligibility(t *testing.T) {
+	now := wpNow(t)
+	early := now.Add(30 * time.Second)
+	late := now.Add(5 * time.Minute)
+	inc := []IncidentState{
+		wpIncident("later", "pending", 0, &late, nil),
+		wpIncident("earlier", "pending", 0, &early, nil),
+	}
+	got := BuildWorkProjection(inc, nil, nil)
+	if !got.QueuedEligibilityKnown {
+		t.Fatal("QueuedEligibilityKnown = false on a projection this build produced")
+	}
+	if got.QueuedEligibleAt == nil || !got.QueuedEligibleAt.Equal(early) {
+		t.Fatalf("QueuedEligibleAt = %v, want the earliest queued eligibility %s", got.QueuedEligibleAt, early)
+	}
+	if got.RetryEligibleAt != nil {
+		t.Fatalf("RetryEligibleAt = %v, want nil — a queued schedule is not a retry", got.RetryEligibleAt)
+	}
+}
+
+// A retry_wait schedule's next_at is a RETRY time. The two eligibilities are
+// different facts about different states and neither may be read as the
+// other (S4-08: "retry eligibility is not an execution ETA").
+func TestBuildWorkProjectionRetryWaitIsNotQueuedEligibility(t *testing.T) {
+	now := wpNow(t)
+	retry := now.Add(4 * time.Minute)
+	inc := []IncidentState{wpIncident("i", "backoff", 2, &retry, nil)}
+	got := BuildWorkProjection(inc, nil, nil)
+	if got.QueuedEligibleAt != nil {
+		t.Fatalf("QueuedEligibleAt = %v, want nil — a backoff schedule is waiting on a retry, not a claim", got.QueuedEligibleAt)
+	}
+	if got.RetryEligibleAt == nil || !got.RetryEligibleAt.Equal(retry) {
+		t.Fatalf("RetryEligibleAt = %v, want %s", got.RetryEligibleAt, retry)
+	}
+	if !got.QueuedEligibilityKnown {
+		t.Fatal("QueuedEligibilityKnown = false — the field is recorded even when nothing is queued")
+	}
+}
+
+// An undecided schedule has no readiness time to record: that absence is the
+// waiting reason, not a missing fact.
+func TestBuildWorkProjectionAwaitingDecisionHasNoQueuedEligibility(t *testing.T) {
+	inc := []IncidentState{wpIncident("i", "awaiting_decision", 0, nil, nil)}
+	got := BuildWorkProjection(inc, nil, nil)
+	if got.QueuedEligibleAt != nil {
+		t.Fatalf("QueuedEligibleAt = %v, want nil before any decision is committed", got.QueuedEligibleAt)
+	}
+	if !got.QueuedEligibilityKnown {
+		t.Fatal("QueuedEligibilityKnown = false on a projection this build produced")
+	}
+}
+
+// TestCommittedBriefingInputCarriesTheRequestedEligibility pins the
+// presentation overlay against the durable write it copies: the same commit
+// that moves a schedule from awaiting_decision to pending stamps its next_at
+// with this cycle's instant, so the projection must not report "no readiness
+// time" for a schedule the transaction is recording one for.
+func TestCommittedBriefingInputCarriesTheRequestedEligibility(t *testing.T) {
+	now := wpNow(t)
+	in := SnapshotInput{Incidents: []IncidentState{wpIncident("i", "awaiting_decision", 0, nil, nil)}}
+	ds := []TriageDecision{{IncidentID: "i", Decision: TriageDecisionRequest, DecisionReason: "new_work", DecidedAt: now}}
+
+	committed := committedBriefingInput(in, ds)
+	if got := committed.Incidents[0].Triage.Phase; got != "pending" {
+		t.Fatalf("overlaid phase = %q, want pending", got)
+	}
+	at := committed.Incidents[0].Triage.NextAt
+	if at == nil || !at.Equal(now) {
+		t.Fatalf("overlaid NextAt = %v, want this cycle's instant %s — the same value applyRequestFromAwaitingDecisionTx writes", at, now)
+	}
+	w := BuildWorkProjection(committed.Incidents, nil, nil)
+	if w.QueuedEligibleAt == nil || !w.QueuedEligibleAt.Equal(now) {
+		t.Fatalf("QueuedEligibleAt = %v, want %s", w.QueuedEligibleAt, now)
+	}
+	// A refresh on an already-pending row keeps its own recorded time: the
+	// overlay must never restamp it (S2-02).
+	persisted := now.Add(-3 * time.Minute)
+	in2 := SnapshotInput{Incidents: []IncidentState{wpIncident("i", "pending", 0, &persisted, nil)}}
+	committed2 := committedBriefingInput(in2, []TriageDecision{{IncidentID: "i", Decision: TriageDecisionRequest, DecidedAt: now}})
+	if at := committed2.Incidents[0].Triage.NextAt; at == nil || !at.Equal(persisted) {
+		t.Fatalf("refreshed NextAt = %v, want the persisted %s", at, persisted)
+	}
+}
