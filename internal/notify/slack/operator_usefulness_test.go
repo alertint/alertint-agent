@@ -119,11 +119,11 @@ func TestOperatorUsefulnessBudgetReplyStatesReasonOnce(t *testing.T) {
 	}
 }
 
-func TestOperatorUsefulnessLongOverviewKeepsLastCheck(t *testing.T) {
+func TestOperatorUsefulnessLongThreadKeepsLastCheck(t *testing.T) {
 	b := bcBriefing()
 	b.Alerts = []model.BriefingAlert{{Name: "one", State: "resolved", SourceSummary: strings.Repeat("s", 240)}, {Name: "two", State: "resolved", SourceSummary: strings.Repeat("s", 240)}, {Name: "three", State: "resolved", SourceSummary: strings.Repeat("s", 240)}}
 	b.Analyses = []model.IncidentAnalysis{{Summary: strings.Repeat("h", 240), Observations: []string{strings.Repeat("o", 400)}, VerificationNotes: []string{strings.Repeat("a", 480), strings.Repeat("b", 480), strings.Repeat("c", 480), strings.Repeat("d", 480), "last check must reach operator"}}}
-	msg, err := RenderSituationRoot(bcRoot(t, model.LifecycleActive, model.AttentionUrgent, bcObserveMonitorContract(bcNow(t)), b))
+	msg, err := RenderSituationJournal(bcJournal(t, bcObserveMonitorContract(bcNow(t)), b, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,5 +139,51 @@ func TestOperatorUsefulnessTerminalClearanceWithoutCandidateNext(t *testing.T) {
 	_, got := briefingJournal(tr)
 	if strings.Contains(got, "limitation cleared") {
 		t.Fatal(got)
+	}
+}
+
+func TestCompactRootKeepsDetailsInThreadAndDatesEveryMessage(t *testing.T) {
+	b := bcBriefing()
+	b.Analyses = []model.IncidentAnalysis{{Title: "Payment failures affecting checkout", Summary: "Payment failures may explain checkout errors", Observations: []string{"unique source sample"}, VerificationNotes: []string{"unique missing check"}}}
+	b.AnalysisCount = 1
+	b.Work.Phase = model.WorkPhaseSettled
+	b.Alerts = []model.BriefingAlert{{Name: "Errors", State: "firing", SourceSummary: "Checkout error ratio: 50% over 1 minute"}}
+	in := bcRoot(t, model.LifecycleActive, model.AttentionUrgent, bcObserveMonitorContract(bcNow(t)), b)
+	in.Summary.EffectiveStartedAt = in.Now.Add(-90 * time.Second)
+	msg, err := RenderSituationRoot(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bcBothSurfaces(t, msg, "*Duration:* 1m30s")
+	bcBothSurfaces(t, msg, "Payment failures affecting checkout")
+	bcBothSurfaces(t, msg, "Analysis completed. Monitoring for changes.")
+	for _, unwanted := range []string{"unique source sample", "unique missing check", "Hypothesis:", "Impact unknown"} {
+		if strings.Contains(msg.Text, unwanted) {
+			t.Errorf("root contains %q: %s", unwanted, msg.Text)
+		}
+	}
+	tr := bcJournal(t, bcObserveMonitorContract(bcNow(t)), b, nil)
+	tr.Projection.EffectiveStartedAt = tr.CreatedAt.Add(-90 * time.Second)
+	reply, err := RenderSituationJournal(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bcBothSurfaces(t, reply, "unique missing check")
+	bcBothSurfaces(t, reply, "*Duration:* 1m30s")
+	headline, _ := briefingJournal(tr)
+	if strings.Contains(headline, "Payment failures") {
+		t.Fatal(headline)
+	}
+}
+
+func TestCompactRootDoesNotPromoteRetainedDraftToCompletion(t *testing.T) {
+	for _, reason := range []string{"llm_call_failed", "llm_response_invalid", "budget_deferred"} {
+		b := bcBriefing()
+		b.Work.Phase = model.WorkPhaseSettled
+		b.Analyses = []model.IncidentAnalysis{{Title: "Draft cause", VerificationLimit: reason}}
+		msg := renderBriefingRoot(bcRoot(t, model.LifecycleActive, model.AttentionUrgent, bcObserveMonitorContract(bcNow(t)), b))
+		if strings.Contains(msg.Text, "Analysis completed") {
+			t.Errorf("draft promoted for %s: %s", reason, msg.Text)
+		}
 	}
 }

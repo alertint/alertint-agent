@@ -707,7 +707,7 @@ func TestS5ReplayDeliveredSequenceRendersEveryCanonicalEvent(t *testing.T) {
 		// eligibility this very commit recorded — 10:45:00, one second
 		// before the 10:45:01 status checkpoint, so the two recorded times
 		// are asserted as distinct tokens rather than one reused value.
-		rootMust: []string{"4/4 alerts firing", "has not started yet",
+		rootMust: []string{"*Alerts:* 4", "has not started yet",
 			"It is eligible for a claim as of <!date^1788691500^",
 			"Next status check: <!date^1788691501^"},
 		rootMustNot: []string{"Investigating 4 alerts", "No readiness time is recorded"},
@@ -748,7 +748,7 @@ func TestS5ReplayDeliveredSequenceRendersEveryCanonicalEvent(t *testing.T) {
 	r.assertEvent("event 4", ev4, s5rExpect{
 		lifecycle: "active", orientation: "Monitoring", transitions: 4, replies: 1,
 		rootMust: []string{"3/4 alerts firing", "Next status check:"},
-		replyMust: []string{s5rQueueBacklog + " cleared", "*Cleared:* " + s5rQueueBacklog,
+		replyMust: []string{"*Cleared:* " + s5rQueueBacklog,
 			"*Still firing:* HighErrorRate, LatencyP99, PodCrashLooping"},
 	})
 
@@ -794,7 +794,7 @@ func TestS5ReplayDeliveredSequenceRendersEveryCanonicalEvent(t *testing.T) {
 	}
 	r.assertEvent("event 6", ev6, s5rExpect{
 		lifecycle: "recovery_pending", orientation: "Confirming recovery", transitions: 5, replies: 1,
-		rootMust:  []string{"4 alerts resolved", slackDateToken(grace)},
+		rootMust:  []string{"*Alerts:* 4 resolved", slackDateToken(grace)},
 		replyMust: []string{"Cleared:", slackDateToken(grace)},
 	})
 

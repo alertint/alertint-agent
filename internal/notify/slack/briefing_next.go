@@ -135,7 +135,7 @@ func briefingWork(c model.ActionContract, b *model.OperatorBriefing, now time.Ti
 	case model.AlertINTActionMonitorSituation:
 		step := "Monitoring alert changes."
 		if b.Work.Phase == model.WorkPhaseCollecting {
-			return "Collecting alert inputs before the investigation decision; monitoring alert changes."
+			return "Collecting incident context; analysis pending."
 		}
 		if b.Work.Phase == model.WorkPhaseSettled {
 			switch b.Work.SkipReason {
@@ -145,7 +145,9 @@ func briefingWork(c model.ActionContract, b *model.OperatorBriefing, now time.Ti
 				return "Investigation was skipped under the recorded eligibility policy. No investigation retry is scheduled; monitoring alert changes."
 			}
 		}
-		if briefingHasUncertainty(b) {
+		if briefingAnalysisCompleted(b) {
+			step = "Analysis completed. Monitoring for changes."
+		} else if briefingHasUncertainty(b) {
 			step += " No verification retry is recorded."
 		}
 		return step
@@ -565,4 +567,15 @@ func briefingBlockedReason(b *model.OperatorBriefing) string {
 	default:
 		return "Automatic analysis is blocked; the recorded reason has no operator explanation."
 	}
+}
+
+// Completion requires accepted evidence and no outstanding or unavailable member work.
+func briefingAnalysisCompleted(b *model.OperatorBriefing) bool {
+	for _, a := range b.Analyses {
+		switch a.VerificationLimit {
+		case "llm_call_failed", "llm_response_invalid", "budget_deferred":
+			return false
+		}
+	}
+	return b.Work.Phase == model.WorkPhaseSettled && len(b.Analyses) > 0 && b.Pending == 0 && b.Failed == 0 && b.Unavailable == 0
 }

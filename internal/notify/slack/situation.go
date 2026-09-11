@@ -170,7 +170,7 @@ func renderOrientationChain(o situation.Orientation) string {
 		phaseInvestigating      = "Investigating"
 		phaseMonitoring         = "Monitoring"
 		phaseConfirmingRecovery = "Confirming recovery"
-		phasePlaceholder        = "Outcome"
+		phasePlaceholder        = "Recovered"
 	)
 
 	var bold string

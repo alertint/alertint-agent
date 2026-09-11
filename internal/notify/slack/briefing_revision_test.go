@@ -20,7 +20,7 @@ func TestBriefingRevisionOverviewAndStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"🔴", "*Urgent · checkout · production — Hypothesis: Deployment crash cascade*", "*Hypothesis:*", "*Observed log sample:*", "Verification limited", "*AlertINT:*"} {
+	for _, want := range []string{"🔴", "*Urgent · checkout · production — Deployment crash cascade*", "*AlertINT:*"} {
 		if !strings.Contains(msg.Text, want) {
 			t.Errorf("missing %q:\n%s", want, msg.Text)
 		}
@@ -207,19 +207,21 @@ func TestBriefingRevisionInconclusiveEvidenceAndLongReplyKeepNextStep(t *testing
 // reduced relevance from the timestamp comparison alone.
 func TestBriefingRevisionStaleAloneDoesNotInvalidateHypothesis(t *testing.T) {
 	in := briefingRootFixture(t, `{"briefing":{"scope":"checkout","firing":1,"total":1,"analyses":[{"summary":"Deployment may explain errors","observations":["Restarts and errors began together"],"verification":"supported","stale":true,"analyzed_at":"2026-09-07T09:00:00Z"}]}}`)
-	root, err := RenderSituationRoot(in)
+	tr := in.SourceTransition
+	tr.Projection.Briefing = in.Summary.Briefing
+	root, err := RenderSituationJournal(tr)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, txt := range []string{root.Text, rsFallbackBlocksText(root)} {
-		if !strings.Contains(txt, "Earlier hypothesis") || !strings.Contains(txt, "Finding at") {
+		if !strings.Contains(txt, "Finding at") {
 			t.Errorf("stale finding lost its honest label or date: %s", txt)
 		}
 		if strings.Contains(txt, "limit relevance") {
 			t.Errorf("newer alert timestamp alone must not claim invalidated relevance: %s", txt)
 		}
 	}
-	tr := in.SourceTransition
+	tr = in.SourceTransition
 	tr.Projection.Briefing = in.Summary.Briefing
 	tr.Projection.OperatorDelta = &model.OperatorDelta{Analyses: in.Summary.Briefing.Analyses}
 	reply, err := RenderSituationJournal(tr)
