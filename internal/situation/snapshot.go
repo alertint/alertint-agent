@@ -270,6 +270,9 @@ type TriageExecution struct {
 // hypothesis is a real fact here (an accepted completion with no causal
 // finding), distinct from Evidence being nil.
 type TriageCompletionEvidence struct {
+	// SourceEvidence participates in presentation comparison only; generated
+	// Findings alone cannot identify changed source samples or verification checks.
+	SourceEvidence    []string
 	Hypothesis        string
 	Observations      []string
 	VerificationLimit string

@@ -960,7 +960,7 @@ func incidentWorkOutcome(inc IncidentState, phase model.WorkPhase) model.Inciden
 			// bounds above, so materiality compares the same fact the
 			// three-item analysis overview fingerprints (lead
 			// authorization, round 4, 2026-09-09).
-			EvidenceFingerprint: model.EvidenceFingerprint(ev.Observations, ev.VerificationLimit, ev.VerificationGaps),
+			EvidenceFingerprint: model.EvidenceFingerprint(ev.Observations, ev.VerificationLimit, ev.VerificationGaps, ev.SourceEvidence...),
 		}
 	}
 	return out

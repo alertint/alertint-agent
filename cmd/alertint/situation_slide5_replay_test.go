@@ -671,9 +671,10 @@ func (r *s5rFixture) publishFinding(attemptID string) {
 	res, err := r.st.CompleteIncidentTriageAttempt(r.ctx, attemptID, r.incidentID, store.TriageFinding{
 		OutputJSON: `{"correlation_findings":["Pod restarts precede the error-rate spike",` +
 			`"Queue backlog follows the error spike"]}`,
-		Summary:    "pod crash to error spike to queue backlog",
-		RootCause:  "Pod restarts in checkout drove the error spike and the queue backlog",
-		Confidence: 0.7, EvidencePackDigest: "sha256:s5r-evidence-1",
+		EnrichmentJSON: `{"logs":{"outcome":"fetched","lines":[{"timestamp":"2026-09-06T10:46:40Z","line":"Pod restarts precede the error-rate spike"},{"timestamp":"2026-09-06T10:46:45Z","line":"Queue backlog follows the error spike"}]}}`,
+		Summary:        "pod crash to error spike to queue backlog",
+		RootCause:      "Pod restarts in checkout drove the error spike and the queue backlog",
+		Confidence:     0.7, EvidencePackDigest: "sha256:s5r-evidence-1",
 	}, r.clock.Now())
 	if err != nil {
 		r.t.Fatalf("complete triage attempt: %v", err)

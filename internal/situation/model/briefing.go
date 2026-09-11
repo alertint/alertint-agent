@@ -17,6 +17,7 @@ type IncidentAnalysis struct {
 	IncidentID        string     `json:"incident_id"`
 	Title             string     `json:"title,omitempty"`
 	Summary           string     `json:"summary,omitempty"`
+	Observations      []string   `json:"observations,omitempty"`
 	Findings          []string   `json:"findings,omitempty"`
 	Verification      string     `json:"verification,omitempty"`
 	VerificationLimit string     `json:"verification_limit,omitempty"`
@@ -58,7 +59,7 @@ const (
 //
 // It is comparison provenance only: it never enters an assessment or reuse
 // digest, delivery history, dispatch authority or any schema.
-func EvidenceFingerprint(observations []string, verificationLimit string, verificationGaps int) string {
+func EvidenceFingerprint(observations []string, verificationLimit string, verificationGaps int, sourceEvidence ...string) string {
 	var b strings.Builder
 	for _, o := range observations {
 		o = normalizeEvidenceText(o)
@@ -80,6 +81,16 @@ func EvidenceFingerprint(observations []string, verificationLimit string, verifi
 	b.WriteString(limit)
 	b.WriteString("\x1eg:")
 	b.WriteString(strconv.Itoa(verificationGaps))
+	for _, fact := range sourceEvidence {
+		fact = normalizeEvidenceText(fact)
+		if fact == "" {
+			continue
+		}
+		b.WriteString("\x1es:")
+		b.WriteString(strconv.Itoa(len(fact)))
+		b.WriteString(":")
+		b.WriteString(fact)
+	}
 	sum := sha256.Sum256([]byte(b.String()))
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
@@ -99,6 +110,14 @@ func BoundIncidentAnalysis(a IncidentAnalysis) IncidentAnalysis {
 	a.Summary = briefingBound(a.Summary, 500)
 	a.Verification = briefingBound(a.Verification, 40)
 	a.VerificationLimit = briefingBound(a.VerificationLimit, 100)
+	observations := a.Observations
+	a.Observations = nil
+	for i, o := range observations {
+		if i == 2 {
+			break
+		}
+		a.Observations = append(a.Observations, briefingBound(o, 400))
+	}
 	notes := a.VerificationNotes
 	a.VerificationNotes = nil
 	for i, n := range notes {

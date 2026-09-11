@@ -188,20 +188,21 @@ func briefingInterpretation(a model.IncidentAnalysis) string {
 }
 
 func briefingEvidence(a model.IncidentAnalysis) []string {
-	lines := []string{"*Analysis notes (observations and inferences):*"}
+	lines := []string{"*Observed log samples:*"}
+	interpretation := "*Interpretation:*"
 	if a.VerificationLimit == "llm_call_failed" || a.VerificationLimit == "llm_response_invalid" || a.VerificationLimit == "budget_deferred" {
-		lines = []string{"*Retained draft — not reconciled with the verification results below:*"}
+		interpretation = "*Retained draft hypothesis (not reconciled with verification results):*"
 	}
-	for j, f := range a.Findings {
+	for j, f := range a.Observations {
 		if j == 3 {
 			break
 		}
 		lines = append(lines, "• "+briefingText(f, 300))
 	}
-	if len(a.Findings) == 0 {
+	if len(a.Observations) == 0 {
 		lines = []string{"*Observed:* No supporting observations were recorded; this does not establish that the service is healthy."}
 	}
-	return append(lines, "*Interpretation:* "+briefingText(briefingInterpretation(a), 300), "*Still unknown:* "+briefingUncertainty(a))
+	return append(lines, interpretation+" "+briefingText(briefingInterpretation(a), 300), "*Still unknown:* "+briefingUncertainty(a))
 }
 
 func briefingFinding(a model.IncidentAnalysis, historical bool) []string {
@@ -213,8 +214,8 @@ func briefingFinding(a model.IncidentAnalysis, historical bool) []string {
 		label = "*Earlier hypothesis:*"
 	}
 	lines := []string{label + " " + briefingText(briefingInterpretation(a), 240)}
-	if len(a.Findings) > 0 {
-		lines = append(lines, "*Analysis note:* "+briefingText(a.Findings[0], 180))
+	if len(a.Observations) > 0 {
+		lines = append(lines, "*Observed log sample:* "+briefingText(a.Observations[0], 180))
 	}
 	qualification := "Hypothesis; not a confirmed cause."
 	if a.Verification != "supported" || a.VerificationGaps > 0 || a.VerificationLimit != "" {
@@ -359,7 +360,9 @@ func renderBriefingRoot(in SituationRootInput) RenderedMessage {
 	}
 	analysis := briefingAnalysis(b, false)
 	lines := []string{title, phase, status, analysis, activity + action}
-	blocks := []slacklib.Block{sectionBlock(title), contextBlock(phase), contextBlock(status), sectionBlock(analysis), sectionBlock(activity + action)}
+	blocks := []slacklib.Block{sectionBlock(title), contextBlock(phase), contextBlock(status)}
+	blocks = append(blocks, briefingSections(analysis)...)
+	blocks = append(blocks, sectionBlock(activity+action))
 	if len(in.Summary.RecordedOperatorContext) > 0 {
 		note := "Recorded context: " + briefingText(in.Summary.RecordedOperatorContext[len(in.Summary.RecordedOperatorContext)-1], 160)
 		lines = append(lines, note)
@@ -502,7 +505,7 @@ func briefingJournalPresented(t model.Transition, executionSuperseded bool) (str
 		// Availability changes are explained once by the delta, not repeated
 		// as a copy of the root's current work inventory.
 		selected.Failed, selected.Pending, selected.Unavailable = 0, 0, 0
-		lines = append(lines, briefingDeltaLines(d, b)...)
+		lines = append(lines, briefingDeltaLines(d, b, t.Lifecycle.Terminal())...)
 		// A useful finding reported as a candidate alone still headlines as
 		// evidence: the overview-driven branch below cannot see it, because
 		// the bounded Analyses list is exactly what it fell outside of.
@@ -544,6 +547,20 @@ func briefingJournalPresented(t model.Transition, executionSuperseded bool) (str
 	if executionSuperseded && briefingExecutionClaimed(t) {
 		step = supersededExecutionStep
 	}
+	// A limitation candidate and the activity row can carry the exact same
+	// current contract. Keep it once, without erasing a candidate's distinct clock.
+	work := briefingWork(t.ActionContract, b, t.CreatedAt)
+	duplicate := work
+	if at := t.ActionContract.NextUpdateAt; at != nil {
+		duplicate += " " + briefingCandidateNext(model.NextStepFacts{Kind: model.NextStepStatusCheck, At: at})
+	}
+	compact := lines[:0]
+	for _, line := range lines {
+		if line != duplicate {
+			compact = append(compact, line)
+		}
+	}
+	lines = compact
 	lines = append(lines, "*AlertINT:* "+step)
 	if request := briefingAction(b, t); request != "" {
 		lines = append(lines, "*Action:* "+request)
@@ -579,7 +596,7 @@ func briefingReplyTitle(headline string, t model.Transition, b *model.OperatorBr
 	return headline + " · " + briefingTitleContext(b)
 }
 
-func briefingDeltaLines(d *model.OperatorDelta, b *model.OperatorBriefing) []string {
+func briefingDeltaLines(d *model.OperatorDelta, b *model.OperatorBriefing, terminal ...bool) []string {
 	lines := briefingMemberLines(d, b)
 	if d.SymptomsChanged {
 		lines = append(lines, "Observed symptoms: "+briefingSymptoms(d.PreviousSymptoms)+" → "+briefingSymptoms(b.Symptoms)+"; reassess the affected service.")
@@ -591,7 +608,7 @@ func briefingDeltaLines(d *model.OperatorDelta, b *model.OperatorBriefing) []str
 	// count behind it, a cleared obstacle that has no legacy boolean at
 	// all), so gating them on the old flags dropped the fact entirely
 	// (R1 repair, lead review 2026-09-09).
-	lines = append(lines, briefingAbilityChangeLines(d, b)...)
+	lines = append(lines, briefingAbilityChangeLines(d, b, terminal...)...)
 	if line := briefingActionChangeLine(d); line != "" {
 		lines = append(lines, line)
 	}
@@ -727,7 +744,7 @@ func briefingLegacyMemberLines(d *model.OperatorDelta, b *model.OperatorBriefing
 // newly unavailable analysis reported only the good news (R2 repair, lead
 // review round 2, 2026-09-09). Identical repeats of one fact still render
 // once.
-func briefingAbilityChangeLines(d *model.OperatorDelta, b *model.OperatorBriefing) []string {
+func briefingAbilityChangeLines(d *model.OperatorDelta, b *model.OperatorBriefing, terminal ...bool) []string {
 	var lines []string
 	seen := map[model.LimitationFacts]bool{}
 	candidate := false
@@ -741,7 +758,7 @@ func briefingAbilityChangeLines(d *model.OperatorDelta, b *model.OperatorBriefin
 		}
 		seen[*c.Limitation] = true
 		line := briefingLimitationLine(*c.Limitation)
-		if c.Limitation.Cleared && c.Next.Kind == model.NextStepTrackingEnded {
+		if c.Limitation.Cleared && (c.Next.Kind == model.NextStepTrackingEnded || (len(terminal) > 0 && terminal[0])) {
 			line = "This episode ended with an investigation limitation; automatic analysis did not resume."
 		} else if !c.Limitation.Cleared && c.Limitation.Code == string(model.WaitReasonAssessmentParked) && b.BlockedReason != "" {
 			line = briefingBlockedReason(b)
@@ -880,7 +897,7 @@ func briefingFindingCandidateLine(c model.MaterialCandidate) string {
 		parts = append(parts, "*Finding:* "+briefingText(f.Hypothesis, 240))
 	}
 	if len(f.Observations) > 0 {
-		parts = append(parts, "*Evidence:* "+briefingText(strings.Join(f.Observations, "; "), 300))
+		parts = append(parts, "*Evidence:* Investigator-reported notes, not independently confirmed: "+briefingText(strings.Join(f.Observations, "; "), 300))
 	} else {
 		parts = append(parts, "*Evidence:* No supporting observations were recorded; this does not establish that the service is healthy.")
 	}
@@ -1020,4 +1037,25 @@ func briefingSymptoms(symptoms []string) string {
 		return "none recorded"
 	}
 	return briefingText(strings.Join(symptoms, ", "), 240)
+}
+
+// Split selected evidence at line boundaries before Slack's section cap can
+// discard later check results. Each selected line has its own smaller bound.
+func briefingSections(text string) []slacklib.Block {
+	var blocks []slacklib.Block
+	var section string
+	for _, line := range strings.Split(text, "\n") {
+		if len(section)+len(line)+1 > 2800 && section != "" {
+			blocks = append(blocks, sectionBlock(section))
+			section = ""
+		}
+		if section != "" {
+			section += "\n"
+		}
+		section += line
+	}
+	if section != "" {
+		blocks = append(blocks, sectionBlock(section))
+	}
+	return blocks
 }

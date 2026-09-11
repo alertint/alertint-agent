@@ -463,7 +463,7 @@ func briefingDetailBlocks(detail string) []slacklib.Block {
 	var blocks []slacklib.Block
 	for _, part := range strings.Split(detail[:at], "\n\n") {
 		if part != "" {
-			blocks = append(blocks, sectionBlock(part))
+			blocks = append(blocks, briefingSections(part)...)
 		}
 	}
 	return append(blocks, sectionBlock(detail[at+1:]))

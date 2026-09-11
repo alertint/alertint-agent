@@ -123,7 +123,7 @@ type operatorOutcomeAnalyzer struct {
 func (a *operatorOutcomeAnalyzer) Analyze(_ context.Context, claim situation.TriageAttemptClaim) (situation.AcuteResult, error) {
 	a.calls++
 	a.run(claim)
-	return situation.AcuteResult{IncidentID: claim.IncidentID, EvidencePackDigest: "sha256:fake-backend", OutputJSON: json.RawMessage(`{"correlation_findings":["Payment errors recorded in logs"]}`), Summary: "Payment failure", RootCause: "Payment errors", Confidence: 0.7}, nil
+	return situation.AcuteResult{IncidentID: claim.IncidentID, EvidencePackDigest: "sha256:fake-backend", OutputJSON: json.RawMessage(`{"correlation_findings":["Payment errors recorded in logs"]}`), EnrichmentJSON: `{"logs":{"outcome":"fetched","lines":[{"timestamp":"2026-09-06T10:46:40Z","line":"Payment errors recorded in logs"}]}}`, Summary: "Payment failure", RootCause: "Payment errors", Confidence: 0.7}, nil
 }
 
 func runOperatorInvestigation(t *testing.T, r *s5rFixture) {

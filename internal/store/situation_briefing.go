@@ -68,7 +68,9 @@ func loadSituationAnalysesTx(ctx context.Context, tx *sql.Tx, id string) ([]mode
 			return nil, 0, fmt.Errorf("store: decode recorded analysis findings: %w", err)
 		}
 		a.VerificationNotes = selectedVerificationNotes(enrichment)
-		a.EvidenceFingerprint = model.EvidenceFingerprint(recorded, fullLimit, a.VerificationGaps)
+		a.Observations = selectedLogSamples(enrichment)
+		sourceEvidence := append(append([]string(nil), a.Observations...), a.VerificationNotes...)
+		a.EvidenceFingerprint = model.EvidenceFingerprint(recorded, fullLimit, a.VerificationGaps, sourceEvidence...)
 		if judged.Valid {
 			at, err := time.Parse(time.RFC3339Nano, judged.String)
 			if err != nil {
@@ -130,6 +132,7 @@ func loadMatchedCompletionEvidenceTx(ctx context.Context, tx *sql.Tx, incidentID
 	}
 
 	ev = &situation.TriageCompletionEvidence{Hypothesis: strings.TrimSpace(rootCause.String)}
+	ev.SourceEvidence = append(selectedLogSamples(enrichment.String), selectedVerificationNotes(enrichment.String)...)
 	var output struct {
 		CorrelationFindings []string `json:"correlation_findings"`
 	}
@@ -191,14 +194,17 @@ func selectedVerificationNotes(raw string) []string {
 			var note string
 			switch {
 			case q.Kind == "incidents_in_window" && q.Outcome == "fetched":
-				note = "Incident-window lookup: " + q.Result + ". A shared cause or relationship is unconfirmed."
+				note = "Incident-window lookup: " + boundedArtifactText(q.Result, 380) + ". A shared cause or relationship is unconfirmed."
 			case q.Outcome == "empty" || q.Outcome == "failed" || q.Outcome == "invalid" || q.Outcome == "degraded":
 				purpose := strings.Join(strings.Fields(q.Why), " ")
 				if purpose == "" {
 					purpose = "Verification check"
 				}
-				if len(purpose) > 160 {
-					purpose = purpose[:160]
+				if q.Kind == "up_ratio" {
+					purpose = "Peer service health"
+				}
+				if len(purpose) > 110 {
+					purpose = boundedArtifactText(purpose, 107) + "…"
 				}
 				if q.Outcome == "empty" {
 					note = purpose + ": returned no data; this check establishes neither health nor failure."
@@ -213,4 +219,39 @@ func selectedVerificationNotes(raw string) []string {
 		}
 	}
 	return notes
+}
+
+// A bounded, timestamped excerpt is an observation about a log sample, not
+// evidence that every request or user failed. Queries and the raw envelope stay
+// inside the transaction; Slack escapes each selected excerpt as untrusted text.
+func selectedLogSamples(raw string) []string {
+	var envelope struct {
+		Logs struct {
+			Outcome string `json:"outcome"`
+			Lines   []struct {
+				Timestamp string `json:"timestamp"`
+				Line      string `json:"line"`
+			} `json:"lines"`
+		} `json:"logs"`
+	}
+	if json.Unmarshal([]byte(raw), &envelope) != nil || envelope.Logs.Outcome != "fetched" {
+		return nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, line := range envelope.Logs.Lines {
+		if strings.TrimSpace(line.Line) == "" || seen[line.Line] {
+			continue
+		}
+		at, err := time.Parse(time.RFC3339Nano, line.Timestamp)
+		if err != nil {
+			continue
+		}
+		seen[line.Line] = true
+		out = append(out, "Log sample at "+at.UTC().Format("2006-01-02 15:04:05 UTC")+": "+boundedArtifactText(line.Line, 300))
+		if len(out) == 2 {
+			break
+		}
+	}
+	return out
 }

@@ -15,12 +15,12 @@ import (
 // These assertions catch a duplicated report, a low-contrast command, and a
 // status indicator that mistakes source clearance for confirmed recovery.
 func TestBriefingRevisionOverviewAndStatus(t *testing.T) {
-	in := briefingRootFixture(t, `{"briefing":{"scope":"checkout · production · internal-cluster","display_scope":"checkout · production","firing":4,"total":4,"critical":2,"analyses":[{"title":"Deployment crash cascade","summary":"The deployment may explain checkout failures.","findings":["Crashes followed deployment","SECOND OBSERVATION"],"verification":"supported","verification_gaps":1}]}}`)
+	in := briefingRootFixture(t, `{"briefing":{"scope":"checkout · production · internal-cluster","display_scope":"checkout · production","firing":4,"total":4,"critical":2,"analyses":[{"title":"Deployment crash cascade","summary":"The deployment may explain checkout failures.","observations":["Crashes followed deployment","SECOND OBSERVATION"],"verification":"supported","verification_gaps":1}]}}`)
 	msg, err := RenderSituationRoot(in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"🔴", "*Urgent · checkout · production — Hypothesis: Deployment crash cascade*", "*Hypothesis:*", "*Analysis note:*", "Verification limited", "*AlertINT:*"} {
+	for _, want := range []string{"🔴", "*Urgent · checkout · production — Hypothesis: Deployment crash cascade*", "*Hypothesis:*", "*Observed log sample:*", "Verification limited", "*AlertINT:*"} {
 		if !strings.Contains(msg.Text, want) {
 			t.Errorf("missing %q:\n%s", want, msg.Text)
 		}
@@ -100,14 +100,14 @@ func TestBriefingRevisionEvidenceAndPartialRecoveryReplies(t *testing.T) {
 		t.Fatalf("partial recovery must not repeat analysis or declare recovery: %s", msg.Text)
 	}
 	tr.Projection.OperatorDelta = nil
-	if err := json.Unmarshal([]byte(`{"operator_delta":{"analyses":[{"title":"Deployment crash cascade","summary":"Deployment may explain crashes.","findings":["Panic appears in payment logs","Errors rose after deployment"],"verification":"degraded","verification_gaps":1}]}}`), &tr.Projection); err != nil {
+	if err := json.Unmarshal([]byte(`{"operator_delta":{"analyses":[{"title":"Deployment crash cascade","summary":"Deployment may explain crashes.","observations":["Panic appears in payment logs","Errors rose after deployment"],"verification":"degraded","verification_gaps":1}]}}`), &tr.Projection); err != nil {
 		t.Fatal(err)
 	}
 	msg, err = RenderSituationJournal(tr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Evidence update", "*Analysis notes (observations and inferences):*", "• Panic appears", "• Errors rose", "*Interpretation:*", "*Still unknown:*", "*AlertINT:*"} {
+	for _, want := range []string{"Evidence update", "*Observed log samples:*", "• Panic appears", "• Errors rose", "*Interpretation:*", "*Still unknown:*", "*AlertINT:*"} {
 		if !strings.Contains(msg.Text, want) {
 			t.Errorf("evidence reply lacks %q:\n%s", want, msg.Text)
 		}
@@ -206,7 +206,7 @@ func TestBriefingRevisionInconclusiveEvidenceAndLongReplyKeepNextStep(t *testing
 // AnalyzedAt date and the honest "Earlier hypothesis" label; never claim
 // reduced relevance from the timestamp comparison alone.
 func TestBriefingRevisionStaleAloneDoesNotInvalidateHypothesis(t *testing.T) {
-	in := briefingRootFixture(t, `{"briefing":{"scope":"checkout","firing":1,"total":1,"analyses":[{"summary":"Deployment may explain errors","findings":["Restarts and errors began together"],"verification":"supported","stale":true,"analyzed_at":"2026-09-07T09:00:00Z"}]}}`)
+	in := briefingRootFixture(t, `{"briefing":{"scope":"checkout","firing":1,"total":1,"analyses":[{"summary":"Deployment may explain errors","observations":["Restarts and errors began together"],"verification":"supported","stale":true,"analyzed_at":"2026-09-07T09:00:00Z"}]}}`)
 	root, err := RenderSituationRoot(in)
 	if err != nil {
 		t.Fatal(err)

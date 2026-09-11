@@ -168,9 +168,9 @@ func TestJournalRendersCandidateOnlyInconclusiveCompletion(t *testing.T) {
 func TestJournalDoesNotDuplicateFindingCarriedByBothForms(t *testing.T) {
 	now := bcNow(t)
 	analysis := model.IncidentAnalysis{
-		IncidentID: "incident-in-overview",
-		Summary:    "Deployment rollout exhausted the connection pool",
-		Findings:   []string{"Pod events checked"},
+		IncidentID:   "incident-in-overview",
+		Summary:      "Deployment rollout exhausted the connection pool",
+		Observations: []string{"Pod events checked"},
 	}
 	d := &model.OperatorDelta{
 		Analyses: []model.IncidentAnalysis{analysis},

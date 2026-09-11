@@ -26,7 +26,7 @@ func TestOperatorBriefingShowsAnalysisAndCurrentStateWithoutControllerJargon(t *
 	sum.EvidenceConclusion = "Confirmed active critical source severity establishes deterministic floor"
 	sum.InvestigationWork = []string{"run_acute_triage (planned)"}
 	// Decode the wire projection to exercise backwards-compatible persisted JSON.
-	err := json.Unmarshal([]byte(`{"briefing":{"scope":"checkout · production","firing":0,"total":4,"analysis_count":1,"analyses":[{"incident_id":"private-id","title":"Checkout errors after deployment","summary":"The new deployment may have broken checkout.","findings":["Errors and restarts began together"],"verification":"degraded","analyzed_at":"2026-09-07T09:59:00Z"}]}}`), &sum)
+	err := json.Unmarshal([]byte(`{"briefing":{"scope":"checkout · production","firing":0,"total":4,"analysis_count":1,"analyses":[{"incident_id":"private-id","title":"Checkout errors after deployment","summary":"The new deployment may have broken checkout.","observations":["Errors and restarts began together"],"verification":"degraded","analyzed_at":"2026-09-07T09:59:00Z"}]}}`), &sum)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestBriefingStoredAnalysisFlowsThroughControllerAndReplay(t *testing.T) {
 	reconcile()
 	exec(`UPDATE incidents SET summary='Checkout errors after deployment',root_cause='Deployment may explain checkout errors',output_json=?,enrichment_json=?,last_judged_at=? WHERE id='briefing-incident'`,
 		`{"analysis_name":"Checkout errors after deployment","overall_issue":"Deployment may explain checkout errors","correlation_findings":["Restarts and errors began together"],"severity":"critical","confidence":0.8}`,
-		`{"verification":{"outcome":"supported","rounds":[{"queries":[{"outcome":"invalid"}]}]}}`, now.Add(time.Minute).Format(time.RFC3339Nano))
+		`{"logs":{"outcome":"fetched","lines":[{"timestamp":"2026-09-07T10:00:00Z","line":"Restarts and errors began together"}]},"verification":{"outcome":"supported","rounds":[{"queries":[{"outcome":"invalid"}]}]}}`, now.Add(time.Minute).Format(time.RFC3339Nano))
 	calls := client.calls
 	reconcile()
 	if client.calls != calls {
@@ -289,7 +289,7 @@ func TestBriefingRootHonestAnalysisAndIndependentHumanAction(t *testing.T) {
 }
 
 func TestBriefingRootBoundsEscapingPhaseAndPlainCommand(t *testing.T) {
-	in := briefingRootFixture(t, `{"briefing":{"scope":"checkout <!channel> & production","firing":1,"total":1,"analyses":[{"summary":"Suspected <@U123> deployment *problem*","findings":["Errors & restarts"]}]}}`)
+	in := briefingRootFixture(t, `{"briefing":{"scope":"checkout <!channel> & production","firing":1,"total":1,"analyses":[{"summary":"Suspected <@U123> deployment *problem*","observations":["Errors & restarts"]}]}}`)
 	msg, err := RenderSituationRoot(in)
 	if err != nil {
 		t.Fatal(err)
@@ -339,7 +339,7 @@ func TestBriefingRootBoundsEscapingPhaseAndPlainCommand(t *testing.T) {
 }
 
 func TestBriefingJournalCarriesUsefulAnalysisAndAttributedContext(t *testing.T) {
-	in := briefingRootFixture(t, `{"briefing":{"scope":"checkout","firing":1,"total":1,"analyses":[{"summary":"Deployment may explain errors","findings":["Restarts began with deployment"],"verification":"degraded"}]}}`)
+	in := briefingRootFixture(t, `{"briefing":{"scope":"checkout","firing":1,"total":1,"analyses":[{"summary":"Deployment may explain errors","observations":["Restarts began with deployment"],"verification":"degraded"}]}}`)
 	tr := in.SourceTransition
 	tr.Projection.Briefing = in.Summary.Briefing
 	tr.Reason = model.ReasonMaterialAssessmentChanged

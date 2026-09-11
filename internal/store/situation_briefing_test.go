@@ -839,3 +839,37 @@ func TestOperatorUsefulnessFreezesBudgetReason(t *testing.T) {
 		t.Fatal(string(raw))
 	}
 }
+
+func TestOperatorUsefulnessSelectsActualLogSamples(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 7, 10, 0, 0, 0, time.UTC)
+	sid := newSituationForGroup(t, st, "log-samples", now)
+	_, err := st.db.ExecContext(context.Background(), `UPDATE incidents SET status='analyzed',summary='Errors',root_cause='Possible token failure',output_json='{"correlation_findings":["all users failing"]}',enrichment_json=?,last_judged_at=? WHERE id='inc-log-samples'`, `{"logs":{"outcome":"fetched","query":"PRIVATE_QUERY","lines":[{"timestamp":"2026-09-07T10:00:00Z","line":"Payment request failed. Invalid token."}]}}`, now.Format(time.RFC3339Nano))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := claimSituation(t, st, sid, "logs", now)
+	in, err := st.LoadReconciliationInput(context.Background(), claim, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(in.Analyses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "Payment request failed. Invalid token.") || strings.Contains(string(raw), "PRIVATE_QUERY") {
+		t.Fatal(string(raw))
+	}
+	first := in.Analyses[0].EvidenceFingerprint
+	_, err = st.db.ExecContext(context.Background(), `UPDATE incidents SET enrichment_json=replace(enrichment_json,'Invalid token.','Gateway timeout.') WHERE id='inc-log-samples'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err := st.LoadReconciliationInput(context.Background(), claim, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == changed.Analyses[0].EvidenceFingerprint {
+		t.Fatal("changed source sample did not change evidence provenance")
+	}
+}

@@ -85,3 +85,59 @@ func TestOperatorUsefulnessAssuranceHasOneCheckpoint(t *testing.T) {
 		t.Fatalf("checkpoint repeated %d times: %s", n, msg.Text)
 	}
 }
+
+func TestOperatorUsefulnessGeneratedNotesAreNotSourceEvidence(t *testing.T) {
+	a := model.IncidentAnalysis{Summary: "A shared dependency may be failing", Findings: []string{"Every user is failing; no other service has alerts"}}
+	raw := `{"observations":["Log sample at 08:02 UTC: Payment request failed. Invalid token."]}`
+	if err := json.Unmarshal([]byte(raw), &a); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(briefingEvidence(a), "\n") + strings.Join(briefingFinding(a, false), "\n")
+	if strings.Contains(got, "Every user is failing") || !strings.Contains(got, "Log sample at") {
+		t.Fatal(got)
+	}
+}
+
+func TestOperatorUsefulnessBudgetReplyStatesReasonOnce(t *testing.T) {
+	b := bcBriefing()
+	b.BlockedReason = "budget_deferred"
+	now := bcNow(t)
+	next := now.Add(time.Minute)
+	c := bcObserveMonitorContract(next)
+	status := model.AlertINTStatusBlocked
+	reason := model.WaitReasonAssessmentParked
+	c.AlertINTStatus = &status
+	c.WaitReason = &reason
+	d := &model.OperatorDelta{Candidates: []model.MaterialCandidate{{Kind: model.CandidateAbilityChanged, Limitation: &model.LimitationFacts{Code: string(reason)}, Next: model.NextStepFacts{Kind: model.NextStepStatusCheck, At: &next}}}}
+	tr := bcJournal(t, c, b, d)
+	msg, err := RenderSituationJournal(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(msg.Text, "configured budget cannot admit"); n != 1 {
+		t.Fatalf("reason repeated %d times: %s", n, msg.Text)
+	}
+}
+
+func TestOperatorUsefulnessLongOverviewKeepsLastCheck(t *testing.T) {
+	b := bcBriefing()
+	b.Alerts = []model.BriefingAlert{{Name: "one", State: "resolved", SourceSummary: strings.Repeat("s", 240)}, {Name: "two", State: "resolved", SourceSummary: strings.Repeat("s", 240)}, {Name: "three", State: "resolved", SourceSummary: strings.Repeat("s", 240)}}
+	b.Analyses = []model.IncidentAnalysis{{Summary: strings.Repeat("h", 240), Observations: []string{strings.Repeat("o", 400)}, VerificationNotes: []string{strings.Repeat("a", 480), strings.Repeat("b", 480), strings.Repeat("c", 480), strings.Repeat("d", 480), "last check must reach operator"}}}
+	msg, err := RenderSituationRoot(bcRoot(t, model.LifecycleActive, model.AttentionUrgent, bcObserveMonitorContract(bcNow(t)), b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bcBothSurfaces(t, msg, "last check must reach operator")
+}
+
+func TestOperatorUsefulnessTerminalClearanceWithoutCandidateNext(t *testing.T) {
+	b := bcBriefing()
+	b.BlockedReason = "budget_deferred"
+	d := &model.OperatorDelta{Candidates: []model.MaterialCandidate{{Kind: model.CandidateAbilityChanged, Limitation: &model.LimitationFacts{Code: string(model.WaitReasonAssessmentParked), Cleared: true}}}}
+	tr := bcJournal(t, bcObserveMonitorContract(bcNow(t)), b, d)
+	tr.Lifecycle = model.LifecycleRecovered
+	_, got := briefingJournal(tr)
+	if strings.Contains(got, "limitation cleared") {
+		t.Fatal(got)
+	}
+}
