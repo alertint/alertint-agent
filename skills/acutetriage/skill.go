@@ -876,7 +876,7 @@ func (s *Skill) systemPrompt(decision rules.Decision, alertCount int) string {
 	}
 	if s.cfg.Rules != nil {
 		if t, ok := s.cfg.Rules.Template(name); ok {
-			return t
+			return t + "\n" + operatorEvidenceInstructions
 		}
 		s.logger.Warn("acutetriage: prompt template not found in any pack; using built-in", "template", name)
 	}
@@ -1101,7 +1101,11 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 				"finding ships capped and the card says the check did not complete (check your LLM setup)",
 				"incident", inc.ID, "verdict_version", g.Version, "err", err)
 		}
-		return s.degradedDraft(ctx, inc.ID, ar.raw, round, resp, g, DegradationLLMCallFailed)
+		reason := DegradationLLMCallFailed
+		if errors.Is(err, llm.ErrBudgetExhausted) {
+			reason = "budget_deferred"
+		}
+		return s.degradedDraft(ctx, inc.ID, ar.raw, round, resp, g, reason)
 	}
 	// Cache-engagement probe: call 2 always marks the shared prefix, so a zero
 	// cache read means the prefix is below the model's cacheable floor (benign,

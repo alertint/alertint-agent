@@ -798,3 +798,44 @@ func ewpAnalysis(t *testing.T, tr model.Transition, incidentID string) model.Inc
 	t.Fatalf("committed briefing carries no analysis for %s", incidentID)
 	return model.IncidentAnalysis{}
 }
+
+func TestOperatorUsefulnessStoredChecksReachBriefing(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 7, 10, 0, 0, 0, time.UTC)
+	sid := newSituationForGroup(t, st, "specific-checks", now)
+	_, err := st.db.ExecContext(context.Background(), `UPDATE incidents SET status='analyzed',summary='Frontend errors',root_cause='Isolated failure',output_json='{"correlation_findings":["Only frontend affected"]}',enrichment_json=?,last_judged_at=? WHERE id='inc-specific-checks'`,
+		`{"verification":{"outcome":"degraded","degradation_reason":"llm_call_failed","rounds":[{"queries":[{"kind":"promql","why":"Check payment errors","outcome":"empty","expr":"PRIVATE_QUERY"},{"kind":"incidents_in_window","outcome":"fetched","result":"2 incidents on other group keys (60m): service=payment; service=checkout"}]}]}}`, now.Format(time.RFC3339Nano))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := claimSituation(t, st, sid, "checks", now)
+	in, err := st.LoadReconciliationInput(context.Background(), claim, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(in.Analyses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Check payment errors", "no data", "service=payment", "relationship"} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("missing %q: %s", want, raw)
+		}
+	}
+	if strings.Contains(string(raw), "PRIVATE_QUERY") {
+		t.Fatal("raw query leaked")
+	}
+}
+
+func TestOperatorUsefulnessFreezesBudgetReason(t *testing.T) {
+	in := situation.SnapshotInput{}
+	in.ControllerParked.Reason = situation.ParkedReasonBudget
+	b := situation.BuildOperatorBriefing(in, model.LifecycleActive)
+	raw, err := json.Marshal(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"blocked_reason":"budget_deferred"`) {
+		t.Fatal(string(raw))
+	}
+}

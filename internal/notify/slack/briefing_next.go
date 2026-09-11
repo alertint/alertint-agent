@@ -15,7 +15,14 @@ import (
 // clock enters this mapping; historical replies use their recorded event time.
 func briefingNextStep(t model.Transition, b *model.OperatorBriefing, deadline *time.Time, now time.Time) string {
 	if t.Lifecycle == model.LifecycleRecovered {
-		return "Recovery confirmed after the observation period; monitoring for this episode has ended."
+		text := "Recovery confirmed after the observation period; monitoring for this episode has ended."
+		if b.BlockedReason != "" {
+			text += " Further analysis remained unavailable; investigation did not resume."
+			if b.BlockedReason == "budget_deferred" {
+				text += " The configured analysis budget remained a limitation."
+			}
+		}
+		return text
 	}
 	if t.Lifecycle == model.LifecycleClosedUnknown {
 		return "Recovery could not be confirmed; tracking for this Situation has ended. No automatic retry or resumption is scheduled."
@@ -69,6 +76,9 @@ func briefingWork(c model.ActionContract, b *model.OperatorBriefing, now time.Ti
 	if c.AlertINTStatus != nil {
 		switch *c.AlertINTStatus {
 		case model.AlertINTStatusBlocked:
+			if b.BlockedReason != "" {
+				return briefingBlockedReason(b)
+			}
 			return "Automatic work is blocked. No automatic retry is scheduled." + briefingResumeTriggers(c)
 		case model.AlertINTStatusExhausted:
 			return "Automatic attempts are exhausted. No automatic retry is scheduled." + briefingResumeTriggers(c)
@@ -535,4 +545,24 @@ func briefingAlertInventory(b *model.OperatorBriefing, memberNamesStated bool) [
 		lines = append(lines, fmt.Sprintf("%d additional alerts not listed; full list via MCP.", b.AlertsOmitted))
 	}
 	return lines
+}
+
+// The reason is frozen from the controller decision, never inferred from health.
+func briefingBlockedReason(b *model.OperatorBriefing) string {
+	switch b.BlockedReason {
+	case "budget_deferred":
+		text := "Automatic analysis is blocked: the configured budget cannot admit the next request."
+		if b.AssessmentRetryAt != nil {
+			return text + " Budget admission can be retried at " + SlackDateToken(*b.AssessmentRetryAt, "{time}") + "; this does not guarantee admission."
+		}
+		return text + " No automatic retry is scheduled; budget review is needed before further analysis can run."
+	case "dependency_exhausted":
+		return "Automatic analysis stopped after repeated dependency failures; it can resume when dependency recovery is recorded."
+	case "malformed_exhausted":
+		return "Automatic analysis stopped after repeated unusable responses; no automatic retry is scheduled for unchanged inputs."
+	case "policy_rejected", "capability_rejected":
+		return "Automatic analysis was rejected by the configured policy or available capabilities; no automatic retry is scheduled for unchanged inputs."
+	default:
+		return "Automatic analysis is blocked; the recorded reason has no operator explanation."
+	}
 }

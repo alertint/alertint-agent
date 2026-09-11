@@ -42,8 +42,11 @@ func briefingScope(b *model.OperatorBriefing) string {
 // Before analysis, source symptom names provide the descriptive fallback.
 func briefingSubject(b *model.OperatorBriefing) string {
 	for _, a := range b.Analyses {
+		if a.VerificationLimit == "llm_call_failed" || a.VerificationLimit == "llm_response_invalid" || a.VerificationLimit == "budget_deferred" {
+			continue
+		}
 		if strings.TrimSpace(a.Title) != "" {
-			return "Hypothesis: " + briefingText(a.Title, 140)
+			return "Hypothesis: " + briefingText(a.Title, 70)
 		}
 	}
 	var symptoms []string
@@ -125,7 +128,13 @@ func briefingAnalysis(b *model.OperatorBriefing, detailed bool) string {
 			break
 		}
 		if alert.SourceSummary != "" {
-			lines = append(lines, "Source report ("+briefingText(alert.Name, 120)+", "+briefingText(alert.State, 20)+"): "+briefingText(alert.SourceSummary, 240))
+			label := "Source report"
+			qualifier := ""
+			if alert.State == "resolved" {
+				label = "Historical source report"
+				qualifier = " (retained annotation, not a current measurement)"
+			}
+			lines = append(lines, label+" ("+briefingText(alert.Name, 120)+", "+briefingText(alert.State, 20)+"): "+briefingText(alert.SourceSummary, 240)+qualifier)
 		}
 	}
 	if len(b.Analyses) == 0 {
@@ -179,7 +188,10 @@ func briefingInterpretation(a model.IncidentAnalysis) string {
 }
 
 func briefingEvidence(a model.IncidentAnalysis) []string {
-	lines := []string{"*Observed*"}
+	lines := []string{"*Analysis notes (observations and inferences):*"}
+	if a.VerificationLimit == "llm_call_failed" || a.VerificationLimit == "llm_response_invalid" || a.VerificationLimit == "budget_deferred" {
+		lines = []string{"*Retained draft — not reconciled with the verification results below:*"}
+	}
 	for j, f := range a.Findings {
 		if j == 3 {
 			break
@@ -193,13 +205,16 @@ func briefingEvidence(a model.IncidentAnalysis) []string {
 }
 
 func briefingFinding(a model.IncidentAnalysis, historical bool) []string {
-	label := "*Likely cause:*"
+	label := "*Hypothesis:*"
+	if historical {
+		label = "*Historical hypothesis:*"
+	}
 	if a.Stale && !historical {
 		label = "*Earlier hypothesis:*"
 	}
 	lines := []string{label + " " + briefingText(briefingInterpretation(a), 240)}
 	if len(a.Findings) > 0 {
-		lines = append(lines, "*Supporting observations:* "+briefingText(a.Findings[0], 180))
+		lines = append(lines, "*Analysis note:* "+briefingText(a.Findings[0], 180))
 	}
 	qualification := "Hypothesis; not a confirmed cause."
 	if a.Verification != "supported" || a.VerificationGaps > 0 || a.VerificationLimit != "" {
@@ -210,16 +225,20 @@ func briefingFinding(a model.IncidentAnalysis, historical bool) []string {
 	// "Earlier hypothesis" label above and the analyzed-at date already say
 	// this finding predates the newest observation, honestly, without
 	// claiming its relevance is reduced.
-	return append(lines, qualification)
+	if a.VerificationLimit == "llm_call_failed" || a.VerificationLimit == "llm_response_invalid" || a.VerificationLimit == "budget_deferred" {
+		qualification += " Retained draft; not reconciled with verification results."
+	}
+	lines = append(lines, qualification)
+	for _, note := range a.VerificationNotes {
+		lines = append(lines, briefingText(note, 500))
+	}
+	return lines
 }
 
 func briefingUncertainty(a model.IncidentAnalysis) string {
 	parts := []string{"Causality remains unproven."}
 	if a.Verification == "supported" {
 		parts = append(parts, "Verification supports the hypothesis.")
-	}
-	if a.Verification == "revised" {
-		parts = append(parts, "Verification revised the hypothesis.")
 	}
 	if a.Verification == "" {
 		parts = append(parts, "verification not recorded.")
@@ -236,6 +255,9 @@ func briefingUncertainty(a model.IncidentAnalysis) string {
 	// S3-03: a Stale flip (a newer alert delivery, or a missing analysis
 	// time) is not itself evidence against the hypothesis — say nothing
 	// here rather than invent an invalidation claim from the timestamp.
+	for _, note := range a.VerificationNotes {
+		parts = append(parts, briefingText(note, 500))
+	}
 	return strings.Join(parts, " ")
 }
 
@@ -245,6 +267,8 @@ func briefingVerificationLimit(reason string) string {
 	switch reason {
 	case "verification_source_unavailable":
 		return "verification source unavailable"
+	case "budget_deferred":
+		return "verification review could not run because the configured analysis budget could not admit the request"
 	case "llm_call_failed":
 		return "verification review could not complete"
 	case "llm_response_invalid":
@@ -267,8 +291,7 @@ func briefingVerificationLimit(reason string) string {
 // recorded in front of an operator — including on the canonical
 // "investigation:exhausted" example, whose assumption is explicitly "no
 // separate human action requested" (R4 repair, lead review 2026-09-09).
-// The line itself stays present in every state; only its content changed,
-// so absence of a request is stated rather than left ambiguous.
+// Omit the row when there is no request or recorded withdrawal.
 //
 // Interface limit reported with this repair: model.OperatorAction is a
 // closed single-value enum (investigate_situation) carrying no affected
@@ -284,18 +307,7 @@ func briefingAction(b *model.OperatorBriefing, t model.Transition) string {
 	if withdrawn, action := briefingWithdrawnAction(t); withdrawn {
 		return "None required from on-call; the earlier request to " + briefingRequestSubject(action, scope) + " is no longer needed."
 	}
-	switch {
-	case t.Lifecycle == model.LifecycleClosedUnknown:
-		return "No operator action is recorded for on-call; recovery could not be confirmed."
-	case b.Total == 0:
-		return "No operator action is recorded for on-call; the current alert state is unavailable."
-	case b.Firing == 0 && b.Unknown == 0:
-		return "None required from on-call; alerts resolved."
-	}
-	// The generic close: true in every remaining state, and — unlike a
-	// work-status claim — it cannot contradict an exhausted or blocked
-	// schedule described elsewhere in the same message.
-	return "No operator action is recorded for on-call."
+	return ""
 }
 
 // briefingRequestSubject names one recorded OperatorAction code in operator
@@ -341,10 +353,13 @@ func renderBriefingRoot(in SituationRootInput) RenderedMessage {
 		status += fmt.Sprintf(" · %d active critical alert(s)", b.Critical)
 	}
 	activity := "*AlertINT:* " + briefingNextStep(t, b, in.ContractDeadlineAt, in.Now)
-	action := "*Action:* " + briefingAction(b, t)
+	action := ""
+	if request := briefingAction(b, t); request != "" {
+		action = "\n*Action:* " + request
+	}
 	analysis := briefingAnalysis(b, false)
-	lines := []string{title, phase, status, analysis, activity, action}
-	blocks := []slacklib.Block{sectionBlock(title), contextBlock(phase), contextBlock(status), sectionBlock(analysis), sectionBlock(activity + "\n" + action)}
+	lines := []string{title, phase, status, analysis, activity + action}
+	blocks := []slacklib.Block{sectionBlock(title), contextBlock(phase), contextBlock(status), sectionBlock(analysis), sectionBlock(activity + action)}
 	if len(in.Summary.RecordedOperatorContext) > 0 {
 		note := "Recorded context: " + briefingText(in.Summary.RecordedOperatorContext[len(in.Summary.RecordedOperatorContext)-1], 160)
 		lines = append(lines, note)
@@ -529,7 +544,10 @@ func briefingJournalPresented(t model.Transition, executionSuperseded bool) (str
 	if executionSuperseded && briefingExecutionClaimed(t) {
 		step = supersededExecutionStep
 	}
-	lines = append(lines, "*AlertINT:* "+step, "*Action:* "+briefingAction(b, t))
+	lines = append(lines, "*AlertINT:* "+step)
+	if request := briefingAction(b, t); request != "" {
+		lines = append(lines, "*Action:* "+request)
+	}
 	// Each bounded delta/evidence group gets its own section. Combining long
 	// alert names with evidence must not truncate the hypothesis qualification.
 	detail := strings.Join(lines, "\n\n")
@@ -723,6 +741,11 @@ func briefingAbilityChangeLines(d *model.OperatorDelta, b *model.OperatorBriefin
 		}
 		seen[*c.Limitation] = true
 		line := briefingLimitationLine(*c.Limitation)
+		if c.Limitation.Cleared && c.Next.Kind == model.NextStepTrackingEnded {
+			line = "This episode ended with an investigation limitation; automatic analysis did not resume."
+		} else if !c.Limitation.Cleared && c.Limitation.Code == string(model.WaitReasonAssessmentParked) && b.BlockedReason != "" {
+			line = briefingBlockedReason(b)
+		}
 		if next := briefingCandidateNext(c.Next); next != "" {
 			line += " " + next
 		}
@@ -882,9 +905,6 @@ func briefingAssuranceLine(d *model.OperatorDelta, b *model.OperatorBriefing) st
 			continue
 		}
 		line := "Investigating" + briefingInputScope(c.Members.CountKnown, c.Members.FiringCount, c.Members.NowFiring, briefingScope(b))
-		if next := briefingCandidateNext(c.Next); next != "" {
-			line += " " + next
-		}
 		return line
 	}
 	return ""

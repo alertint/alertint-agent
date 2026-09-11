@@ -129,7 +129,7 @@ func TestSituationDelivererFullyNarrowedReplyStatesItsOwnStatus(t *testing.T) {
 	if got := ds3Rejected(text); len(got) > 0 {
 		t.Fatalf("a fully narrowed reply published rejected facts: %v", got)
 	}
-	if !strings.Contains(text, "*AlertINT:*") || !strings.Contains(text, "*Action:*") {
+	if !strings.Contains(text, "*AlertINT:*") || !strings.Contains(text, "Next status check:") {
 		t.Fatalf("a narrowed reply must still carry its own status and next step:\n%s", text)
 	}
 }

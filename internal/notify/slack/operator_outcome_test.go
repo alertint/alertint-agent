@@ -16,7 +16,11 @@ func TestOperatorOutcomeNoRequestIsNotNoActionNeeded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bcBothSurfaces(t, msg, "No operator action is recorded")
+	for _, text := range []string{msg.Text, rsFallbackBlocksText(msg)} {
+		if strings.Contains(text, "*Action:*") {
+			t.Errorf("unrequested action row: %s", text)
+		}
+	}
 	if strings.Contains(msg.Text, "None required") {
 		t.Fatalf("unrecorded request became reassurance:\n%s", msg.Text)
 	}

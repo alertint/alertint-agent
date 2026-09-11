@@ -20,6 +20,7 @@ type IncidentAnalysis struct {
 	Findings          []string   `json:"findings,omitempty"`
 	Verification      string     `json:"verification,omitempty"`
 	VerificationLimit string     `json:"verification_limit,omitempty"`
+	VerificationNotes []string   `json:"verification_notes,omitempty"`
 	VerificationGaps  int        `json:"verification_gaps,omitempty"`
 	AnalyzedAt        *time.Time `json:"analyzed_at,omitempty"`
 	Stale             bool       `json:"stale,omitempty"`
@@ -98,6 +99,14 @@ func BoundIncidentAnalysis(a IncidentAnalysis) IncidentAnalysis {
 	a.Summary = briefingBound(a.Summary, 500)
 	a.Verification = briefingBound(a.Verification, 40)
 	a.VerificationLimit = briefingBound(a.VerificationLimit, 100)
+	notes := a.VerificationNotes
+	a.VerificationNotes = nil
+	for i, n := range notes {
+		if i == 5 {
+			break
+		}
+		a.VerificationNotes = append(a.VerificationNotes, briefingBound(n, 500))
+	}
 	a.EvidenceFingerprint = briefingBound(a.EvidenceFingerprint, 80)
 	findings := a.Findings
 	a.Findings = nil
@@ -140,23 +149,25 @@ type BriefingAlert struct {
 // OperatorBriefing travels only through the immutable publication projection.
 // A nil briefing on old projections preserves their legacy replay behavior.
 type OperatorBriefing struct {
-	Scope         string             `json:"scope"`
-	DisplayScope  string             `json:"display_scope,omitempty"`
-	Alerts        []BriefingAlert    `json:"alerts,omitempty"`
-	AlertsOmitted int                `json:"alerts_omitted,omitempty"`
-	RetryAt       *time.Time         `json:"retry_at,omitempty"`
-	Symptoms      []string           `json:"symptoms,omitempty"`
-	Firing        int                `json:"firing"`
-	Resolved      int                `json:"resolved"`
-	Unknown       int                `json:"unknown"`
-	Total         int                `json:"total"`
-	Critical      int                `json:"critical"`
-	AnalysisCount int                `json:"analysis_count"`
-	Failed        int                `json:"failed"`
-	Pending       int                `json:"pending"`
-	Unavailable   int                `json:"unavailable,omitempty"`
-	Analyses      []IncidentAnalysis `json:"analyses,omitempty"`
-	Historical    bool               `json:"historical,omitempty"`
+	BlockedReason     string             `json:"blocked_reason,omitempty"`
+	AssessmentRetryAt *time.Time         `json:"assessment_retry_at,omitempty"`
+	Scope             string             `json:"scope"`
+	DisplayScope      string             `json:"display_scope,omitempty"`
+	Alerts            []BriefingAlert    `json:"alerts,omitempty"`
+	AlertsOmitted     int                `json:"alerts_omitted,omitempty"`
+	RetryAt           *time.Time         `json:"retry_at,omitempty"`
+	Symptoms          []string           `json:"symptoms,omitempty"`
+	Firing            int                `json:"firing"`
+	Resolved          int                `json:"resolved"`
+	Unknown           int                `json:"unknown"`
+	Total             int                `json:"total"`
+	Critical          int                `json:"critical"`
+	AnalysisCount     int                `json:"analysis_count"`
+	Failed            int                `json:"failed"`
+	Pending           int                `json:"pending"`
+	Unavailable       int                `json:"unavailable,omitempty"`
+	Analyses          []IncidentAnalysis `json:"analyses,omitempty"`
+	Historical        bool               `json:"historical,omitempty"`
 
 	// Work is the aggregate, per-Situation acute-triage work disposition
 	// (B0 integration contract §3, accepted 2026-09-08): a coherent

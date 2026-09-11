@@ -34,7 +34,7 @@ func loadSituationAnalysesTx(ctx context.Context, tx *sql.Tx, id string) ([]mode
    (SELECT COUNT(*) FROM json_each(CASE WHEN json_valid(i.enrichment_json) THEN i.enrichment_json ELSE '{}' END,'$.verification.rounds') r,
      json_each(CASE WHEN r.type='object' THEN r.value ELSE '{}' END,'$.queries') q
      WHERE COALESCE(json_extract(CASE WHEN q.type='object' THEN q.value ELSE '{}' END,'$.outcome'),'') NOT IN ('fetched','empty')),
-   COUNT(*) OVER ()
+   COUNT(*) OVER (), COALESCE(i.enrichment_json,'{}')
  FROM situation_incidents si JOIN incidents i ON i.id=si.incident_id
  WHERE si.situation_id=? AND i.status IN ('analyzed','resolved')
    AND (COALESCE(i.summary,'')<>'' OR COALESCE(i.root_cause,'')<>'')
@@ -47,10 +47,10 @@ func loadSituationAnalysesTx(ctx context.Context, tx *sql.Tx, id string) ([]mode
 	var total int
 	for rows.Next() {
 		var a model.IncidentAnalysis
-		var findings, allFindings, fullLimit, last string
+		var findings, allFindings, fullLimit, last, enrichment string
 		var judged sql.NullString
 		if err := rows.Scan(&a.IncidentID, &a.Title, &a.Summary, &findings, &a.Verification, &a.VerificationLimit,
-			&allFindings, &fullLimit, &judged, &last, &a.VerificationGaps, &total); err != nil {
+			&allFindings, &fullLimit, &judged, &last, &a.VerificationGaps, &total, &enrichment); err != nil {
 			return nil, 0, fmt.Errorf("store: scan situation analysis: %w", err)
 		}
 		if err := json.Unmarshal([]byte(findings), &a.Findings); err != nil {
@@ -67,6 +67,7 @@ func loadSituationAnalysesTx(ctx context.Context, tx *sql.Tx, id string) ([]mode
 		if err := json.Unmarshal([]byte(allFindings), &recorded); err != nil {
 			return nil, 0, fmt.Errorf("store: decode recorded analysis findings: %w", err)
 		}
+		a.VerificationNotes = selectedVerificationNotes(enrichment)
 		a.EvidenceFingerprint = model.EvidenceFingerprint(recorded, fullLimit, a.VerificationGaps)
 		if judged.Valid {
 			at, err := time.Parse(time.RFC3339Nano, judged.String)
@@ -164,4 +165,52 @@ func loadMatchedCompletionEvidenceTx(ctx context.Context, tx *sql.Tx, incidentID
 		ev.JudgedAt = &at
 	}
 	return ev, true, nil
+}
+
+// Select operational check results; never export raw queries or parameters.
+func selectedVerificationNotes(raw string) []string {
+	var envelope struct {
+		Verification struct {
+			Rounds []struct {
+				Queries []struct {
+					Kind    string `json:"kind"`
+					Why     string `json:"why"`
+					Outcome string `json:"outcome"`
+					Result  string `json:"result"`
+				} `json:"queries"`
+			} `json:"rounds"`
+		} `json:"verification"`
+	}
+	if json.Unmarshal([]byte(raw), &envelope) != nil {
+		return nil
+	}
+	var notes []string
+	seen := map[string]bool{}
+	for _, r := range envelope.Verification.Rounds {
+		for _, q := range r.Queries {
+			var note string
+			switch {
+			case q.Kind == "incidents_in_window" && q.Outcome == "fetched":
+				note = "Incident-window lookup: " + q.Result + ". A shared cause or relationship is unconfirmed."
+			case q.Outcome == "empty" || q.Outcome == "failed" || q.Outcome == "invalid" || q.Outcome == "degraded":
+				purpose := strings.Join(strings.Fields(q.Why), " ")
+				if purpose == "" {
+					purpose = "Verification check"
+				}
+				if len(purpose) > 160 {
+					purpose = purpose[:160]
+				}
+				if q.Outcome == "empty" {
+					note = purpose + ": returned no data; this check establishes neither health nor failure."
+				} else {
+					note = purpose + ": check could not establish the requested fact (" + q.Outcome + ")."
+				}
+			}
+			if note != "" && !seen[note] {
+				notes = append(notes, note)
+				seen[note] = true
+			}
+		}
+	}
+	return notes
 }

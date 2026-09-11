@@ -20,7 +20,7 @@ func TestBriefingRevisionOverviewAndStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"🔴", "*Urgent · checkout · production — Hypothesis: Deployment crash cascade*", "*Likely cause:*", "*Supporting observations:*", "Verification limited", "*AlertINT:*", "*Action:*"} {
+	for _, want := range []string{"🔴", "*Urgent · checkout · production — Hypothesis: Deployment crash cascade*", "*Hypothesis:*", "*Analysis note:*", "Verification limited", "*AlertINT:*"} {
 		if !strings.Contains(msg.Text, want) {
 			t.Errorf("missing %q:\n%s", want, msg.Text)
 		}
@@ -91,7 +91,7 @@ func TestBriefingRevisionEvidenceAndPartialRecoveryReplies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Partial recovery", "3/4", "*Cleared:* Pod crash loop", "*Still firing:*", "High error rate", "High latency", "Queue backlog", "*AlertINT:*", "*Action:*", "<!date^"} {
+	for _, want := range []string{"Partial recovery", "3/4", "*Cleared:* Pod crash loop", "*Still firing:*", "High error rate", "High latency", "Queue backlog", "*AlertINT:*", "<!date^"} {
 		if !strings.Contains(msg.Text, want) {
 			t.Errorf("partial recovery lacks %q:\n%s", want, msg.Text)
 		}
@@ -107,7 +107,7 @@ func TestBriefingRevisionEvidenceAndPartialRecoveryReplies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Evidence update", "*Observed*", "• Panic appears", "• Errors rose", "*Interpretation:*", "*Still unknown:*", "*AlertINT:*", "*Action:*"} {
+	for _, want := range []string{"Evidence update", "*Analysis notes (observations and inferences):*", "• Panic appears", "• Errors rose", "*Interpretation:*", "*Still unknown:*", "*AlertINT:*"} {
 		if !strings.Contains(msg.Text, want) {
 			t.Errorf("evidence reply lacks %q:\n%s", want, msg.Text)
 		}
@@ -179,7 +179,7 @@ func TestBriefingRevisionInconclusiveEvidenceAndLongReplyKeepNextStep(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"No supporting observations were recorded", "does not establish that the service is healthy", "*Still unknown:*", "Monitoring alert changes", "No verification retry is recorded", "*Action:*"} {
+	for _, want := range []string{"No supporting observations were recorded", "does not establish that the service is healthy", "*Still unknown:*", "Monitoring alert changes", "No verification retry is recorded"} {
 		if !strings.Contains(msg.Text, want) {
 			t.Errorf("inconclusive result lost %q: %s", want, msg.Text)
 		}
@@ -194,7 +194,7 @@ func TestBriefingRevisionInconclusiveEvidenceAndLongReplyKeepNextStep(t *testing
 		t.Fatal(err)
 	}
 	blocks := rsFallbackBlocksText(msg)
-	for _, want := range []string{"First hypothesis", "Second hypothesis", "Third hypothesis", "*AlertINT:*", "*Action:*", "Next status check:"} {
+	for _, want := range []string{"First hypothesis", "Second hypothesis", "Third hypothesis", "*AlertINT:*", "Next status check:"} {
 		if !strings.Contains(blocks, want) {
 			t.Errorf("long evidence truncated %q: %s", want, blocks)
 		}
@@ -307,7 +307,7 @@ func TestBriefingRevisionVerificationChangeAndPartialAvailability(t *testing.T) 
 	tr := in.SourceTransition
 	tr.Projection.Briefing = in.Summary.Briefing
 	tr.Projection.OperatorDelta = &model.OperatorDelta{AbilityLost: true, Analyses: in.Summary.Briefing.Analyses}
-	for _, tc := range []struct{ verification, want string }{{"supported", "Verification supports the hypothesis"}, {"revised", "Verification revised the hypothesis"}} {
+	for _, tc := range []struct{ verification, want string }{{"supported", "Verification supports the hypothesis"}, {"revised", "Causality remains unproven"}} {
 		tr.Projection.OperatorDelta.Analyses[0].Verification = tc.verification
 		msg, err := RenderSituationJournal(tr)
 		if err != nil {
@@ -341,7 +341,7 @@ func TestBriefingRevisionCombinedDeltaPreservesEvidenceLimitations(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"New hypothesis", "verification source unavailable", "7 verification checks unavailable or invalid", "*Still firing:*", "*AlertINT:*", "*Action:*"} {
+	for _, want := range []string{"New hypothesis", "verification source unavailable", "7 verification checks unavailable or invalid", "*Still firing:*", "*AlertINT:*"} {
 		if !strings.Contains(rsFallbackBlocksText(msg), want) {
 			t.Errorf("combined update cut off %q: %s", want, rsFallbackBlocksText(msg))
 		}
@@ -461,8 +461,8 @@ func TestBriefingActionAndNextStepClosedUnknownWithoutConcreteConcern(t *testing
 	if strings.Contains(action, "check current service health") || strings.Contains(action, "via MCP") {
 		t.Errorf("closed_unknown without a recorded action must not invent an MCP/health request: %s", action)
 	}
-	if !strings.Contains(strings.ToLower(action), "on-call") {
-		t.Errorf("action has no audience: %s", action)
+	if action != "" {
+		t.Errorf("unrequested action: %s", action)
 	}
 
 	step := briefingNextStep(tr, in.Summary.Briefing, nil, in.Now)

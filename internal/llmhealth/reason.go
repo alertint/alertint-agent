@@ -59,6 +59,7 @@ type Reason string
 const (
 	ReasonOK                  Reason = "ok"
 	ReasonCanceled            Reason = "canceled"
+	ReasonBudgetDeferred      Reason = "budget_deferred"
 	ReasonTimeout             Reason = "timeout"
 	ReasonNetwork             Reason = "network"
 	ReasonRateLimited         Reason = "rate_limited"
@@ -120,6 +121,9 @@ func Classify(err error) Reason {
 	if err == nil {
 		return ReasonOK
 	}
+	if errors.Is(err, llm.ErrBudgetExhausted) {
+		return ReasonBudgetDeferred
+	}
 	if errors.Is(err, context.Canceled) {
 		return ReasonCanceled
 	}
@@ -168,7 +172,7 @@ func (r Reason) Class() Class {
 	switch r {
 	case ReasonOK:
 		return ClassOK
-	case ReasonCanceled:
+	case ReasonCanceled, ReasonBudgetDeferred:
 		return ClassIgnored
 	case ReasonRequestInvalid, ReasonSchemaViolation, ReasonResponseMalformed:
 		return ClassContent
@@ -188,6 +192,8 @@ func SafeDetail(err error) string {
 		return ""
 	case ReasonCanceled:
 		return "canceled"
+	case ReasonBudgetDeferred:
+		return "automatic analysis budget cannot admit this request"
 	case ReasonTimeout:
 		return "request timed out"
 	case ReasonNetwork:

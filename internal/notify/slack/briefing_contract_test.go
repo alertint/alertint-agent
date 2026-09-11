@@ -396,8 +396,8 @@ func TestRootActionOnlyFromRecordedRequest(t *testing.T) {
 			if hasRequest != tc.wantReq {
 				t.Errorf("recorded request %v, rendered request %v:\n%s", tc.wantReq, hasRequest, msg.Text)
 			}
-			if !strings.Contains(msg.Text, "*Action:*") {
-				t.Errorf("action line disappeared entirely:\n%s", msg.Text)
+			if strings.Contains(msg.Text, "*Action:*") != tc.wantReq {
+				t.Errorf("action row must match recorded request:\n%s", msg.Text)
 			}
 		})
 	}

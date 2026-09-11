@@ -22,7 +22,7 @@ import (
 // holds for the controller (B0 integration contract §2). Unknown is
 // reserved for a source state this tree cannot observe and is always 0.
 func BuildOperatorBriefing(in SnapshotInput, lifecycle model.Lifecycle) *model.OperatorBriefing {
-	b := &model.OperatorBriefing{Historical: lifecycle != model.LifecycleActive}
+	b := &model.OperatorBriefing{Historical: lifecycle != model.LifecycleActive, BlockedReason: in.ControllerParked.Reason, AssessmentRetryAt: in.Situation.RetryAt}
 	scopes, symptoms := map[string]bool{}, map[string]bool{}
 	displayScopes := map[string]bool{}
 	states := briefingAlertStates(in.Deliveries)
@@ -216,6 +216,10 @@ func briefingDisplayScope(labels map[string]string) string {
 func CommittedOperatorBriefing(in SnapshotInput, commit ControllerCommit) *model.OperatorBriefing {
 	in = committedBriefingInput(in, commit.TriageDecisions)
 	b := BuildOperatorBriefing(in, commit.Lifecycle)
+	if commit.Parked.Touch {
+		b.BlockedReason = commit.Parked.Reason
+	}
+	b.AssessmentRetryAt = commit.RetryAt
 	b.Work = BuildWorkProjection(in.Incidents, commit.GraceUntil, commit.Assessment.ActionContract.NextUpdateAt)
 	// R3 repair (lead review 2026-09-09): BuildWorkProjection's own
 	// 3-parameter shape is a pinned external test boundary (see its doc

@@ -63,8 +63,8 @@ func TestBriefingFollowupActionsUseRecordedState(t *testing.T) {
 			b.Firing, b.Resolved = 0, 1
 		}
 		got := briefingAction(&b, tr)
-		if !strings.Contains(strings.ToLower(got), "on-call") {
-			t.Errorf("action has no audience: %s", got)
+		if got != "" {
+			t.Errorf("unrequested action: %s", got)
 		}
 		for _, bad := range []string{"ownership", "Confirm service health if", "If users", "impact persists"} {
 			if strings.Contains(got, bad) {
@@ -72,7 +72,7 @@ func TestBriefingFollowupActionsUseRecordedState(t *testing.T) {
 			}
 		}
 		if lifecycle == model.LifecycleRecovered || lifecycle == model.LifecycleRecoveryPending {
-			if got != "None required from on-call; alerts resolved." {
+			if got != "" {
 				t.Errorf("clearance invents a follow-up: %s", got)
 			}
 		}

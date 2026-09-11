@@ -87,8 +87,8 @@ func TestReplySupersededExecutionDropsTheStaleActivityAndCheckpoint(t *testing.T
 		if !strings.Contains(text, "Affected scope changed from") {
 			t.Errorf("%s lost the retained row's material scope change", surface)
 		}
-		if !strings.Contains(text, "*Action:*") {
-			t.Errorf("%s lost the recorded operator action line", surface)
+		if strings.Contains(text, "*Action:*") {
+			t.Errorf("%s invented an operator action line", surface)
 		}
 		if strings.Contains(text, "*AlertINT:* Investigating") {
 			t.Errorf("%s still presents the superseded execution as current activity", surface)

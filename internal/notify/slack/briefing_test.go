@@ -232,7 +232,7 @@ func TestBriefingStoredAnalysisFlowsThroughControllerAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Likely cause", "Deployment may explain checkout errors", "Finding at", "resolved", "*▸ Recovered*"} {
+	for _, want := range []string{"hypothesis", "Deployment may explain checkout errors", "Finding at", "resolved", "*▸ Recovered*"} {
 		if !strings.Contains(root.Text, want) {
 			t.Errorf("terminal root lost %q: %s", want, root.Text)
 		}
@@ -273,7 +273,7 @@ func TestBriefingRootHonestAnalysisAndIndependentHumanAction(t *testing.T) {
 				// "Add a concrete Action: only when the operator contract
 				// requires one" forbids the health-check ask this assertion
 				// previously demanded.
-				for _, want := range []string{tc.want, "AlertINT:", "Action:", "No operator action is recorded for on-call", "Impact unknown"} {
+				for _, want := range []string{tc.want, "AlertINT:", "Impact unknown"} {
 					if !strings.Contains(txt, want) {
 						t.Errorf("missing %q: %s", want, txt)
 					}
@@ -375,7 +375,7 @@ func TestBriefingSupportedVerificationStillReportsInvalidQueries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Likely cause", "Verification limited", "cause unconfirmed"} {
+	for _, want := range []string{"Hypothesis", "Verification limited", "cause unconfirmed"} {
 		if !strings.Contains(rsFallbackBlocksText(msg), want) {
 			t.Errorf("lost verification qualification %q: %s", want, rsFallbackBlocksText(msg))
 		}
@@ -386,7 +386,7 @@ func TestBriefingSupportedVerificationStillReportsInvalidQueries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Causality remains unproven", "2 verification checks unavailable or invalid", "*AlertINT:*", "*Action:*"} {
+	for _, want := range []string{"Causality remains unproven", "2 verification checks unavailable or invalid", "*AlertINT:*"} {
 		if !strings.Contains(reply.Text, want) {
 			t.Errorf("structured evidence reply lost %q: %s", want, reply.Text)
 		}

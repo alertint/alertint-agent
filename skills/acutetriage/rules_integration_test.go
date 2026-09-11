@@ -83,3 +83,10 @@ func TestShortCircuitResponse_MatchesLLMSchema(t *testing.T) {
 		t.Errorf("every member alert must appear, got %d", len(resp.Alerts))
 	}
 }
+
+func TestOperatorUsefulnessPromptSeparatesInference(t *testing.T) {
+	s := &Skill{cfg: Config{}}
+	if !strings.Contains(s.systemPrompt(rules.Decision{}, 1), "Separate direct observations from hypotheses") {
+		t.Fatal("missing evidence-fidelity instruction")
+	}
+}
