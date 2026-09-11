@@ -84,7 +84,7 @@ func TestBriefingFollowupDescriptiveTitles(t *testing.T) {
 	in := briefingRootFixture(t, `{"briefing":{"scope":"checkout","firing":3,"resolved":1,"total":4,"symptoms":["Checkout errors","Pod crashes"],"analyses":[{"title":"Deployment crash cascade","summary":"Deployment may explain failures."}]}}`)
 	root := renderBriefingRoot(in)
 	title := strings.Split(root.Text, "\n")[0]
-	if !strings.Contains(title, "Deployment crash cascade") || !strings.Contains(title, "checkout") {
+	if strings.Contains(title, "Deployment crash cascade") || !strings.Contains(root.Text, "*Finding:* Deployment may explain failures.") || !strings.Contains(title, "checkout") {
 		t.Errorf("root title lacks qualified finding: %s", title)
 	}
 	tr := in.SourceTransition
@@ -103,7 +103,7 @@ func TestBriefingFollowupDescriptiveTitles(t *testing.T) {
 	}
 	in.Summary.Briefing.Analyses = nil
 	title = strings.Split(renderBriefingRoot(in).Text, "\n")[0]
-	if !strings.Contains(title, "Checkout errors, Pod crashes") {
+	if !strings.Contains(title, "checkout") {
 		t.Errorf("pre-analysis title loses observed symptoms: %s", title)
 	}
 	in.Summary.Briefing.Analyses = []model.IncidentAnalysis{{Title: "<@U123> *cause*\n" + strings.Repeat("\u754c", 300)}}

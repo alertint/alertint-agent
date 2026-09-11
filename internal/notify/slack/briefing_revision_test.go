@@ -20,7 +20,7 @@ func TestBriefingRevisionOverviewAndStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"🔴", "*Urgent · checkout · production — Deployment crash cascade*", "*AlertINT:*"} {
+	for _, want := range []string{"🔴", "*checkout · production*", "*AlertINT:*"} {
 		if !strings.Contains(msg.Text, want) {
 			t.Errorf("missing %q:\n%s", want, msg.Text)
 		}
@@ -34,24 +34,8 @@ func TestBriefingRevisionOverviewAndStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var blocks []struct {
-		Type string `json:"type"`
-		Text struct {
-			Text string `json:"text"`
-		} `json:"text"`
-	}
-	if err := json.Unmarshal(raw, &blocks); err != nil {
-		t.Fatal(err)
-	}
-	command := "get situation checkout-42 using alertint"
-	commandSection := false
-	for _, b := range blocks {
-		if b.Type == "section" && strings.Contains(b.Text.Text, "\n"+command) {
-			commandSection = true
-		}
-	}
-	if !commandSection {
-		t.Fatalf("copyable command must use normal body text: %s", raw)
+	if !strings.Contains(string(raw), "MCP: get situation checkout-42 using alertint") {
+		t.Fatal(string(raw))
 	}
 	for _, tc := range []struct {
 		lifecycle model.Lifecycle
@@ -107,7 +91,7 @@ func TestBriefingRevisionEvidenceAndPartialRecoveryReplies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Evidence update", "*Observed log samples:*", "• Panic appears", "• Errors rose", "*Interpretation:*", "*Still unknown:*", "*AlertINT:*"} {
+	for _, want := range []string{"Evidence update", "*Observed log samples:*", "• Panic appears", "• Errors rose", "*Interpretation:*", "*Verification:*", "*AlertINT:*"} {
 		if !strings.Contains(msg.Text, want) {
 			t.Errorf("evidence reply lacks %q:\n%s", want, msg.Text)
 		}
@@ -179,7 +163,7 @@ func TestBriefingRevisionInconclusiveEvidenceAndLongReplyKeepNextStep(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"No supporting observations were recorded", "does not establish that the service is healthy", "*Still unknown:*", "Monitoring alert changes", "No verification retry is recorded"} {
+	for _, want := range []string{"No supporting observations were recorded", "does not establish that the service is healthy", "*Verification:*", "Monitoring alert changes", "No verification retry is recorded"} {
 		if !strings.Contains(msg.Text, want) {
 			t.Errorf("inconclusive result lost %q: %s", want, msg.Text)
 		}

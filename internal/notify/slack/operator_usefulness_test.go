@@ -155,7 +155,7 @@ func TestCompactRootKeepsDetailsInThreadAndDatesEveryMessage(t *testing.T) {
 		t.Fatal(err)
 	}
 	bcBothSurfaces(t, msg, "*Duration:* 1m30s")
-	bcBothSurfaces(t, msg, "Payment failures affecting checkout")
+	bcBothSurfaces(t, msg, "Payment failures may explain checkout errors")
 	bcBothSurfaces(t, msg, "Analysis completed. Monitoring for changes.")
 	for _, unwanted := range []string{"unique source sample", "unique missing check", "Hypothesis:", "Impact unknown"} {
 		if strings.Contains(msg.Text, unwanted) {
@@ -186,4 +186,48 @@ func TestCompactRootDoesNotPromoteRetainedDraftToCompletion(t *testing.T) {
 			t.Errorf("draft promoted for %s: %s", reason, msg.Text)
 		}
 	}
+}
+
+func TestReadableEvidencePreservesCompleteChecksAndRootFinding(t *testing.T) {
+	b := bcBriefing()
+	note := strings.Repeat("Check the service latency and request error counts. ", 12) + "LAST COMPLETE CHECK: returned no data; this check establishes neither health nor failure."
+	b.Analyses = []model.IncidentAnalysis{{Title: "Checkout errors", Summary: "Payment failures may explain checkout errors.", VerificationNotes: []string{note, "Peer service health: returned no data; this check establishes neither health nor failure."}}}
+	in := bcRoot(t, model.LifecycleRecovered, model.AttentionUrgent, rsTerminalContract(), b)
+	msg, err := RenderSituationRoot(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bcBothSurfaces(t, msg, "*Finding:* Payment failures may explain checkout errors.")
+	reply, err := RenderSituationJournal(bcJournal(t, bcObserveMonitorContract(bcNow(t)), b, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bcBothSurfaces(t, reply, "LAST COMPLETE CHECK")
+	if strings.Count(reply.Text, "establishes neither health nor failure") > 1 {
+		t.Fatal(reply.Text)
+	}
+	if strings.Contains(reply.Text, "…") {
+		t.Fatal(reply.Text)
+	}
+}
+
+func TestReadableLongEvidenceSectionsDoNotTruncate(t *testing.T) {
+	text := briefingComplete(strings.Repeat("Latency < threshold & healthy. ", 180) + "END OF FULL CHECK")
+	msg := RenderedMessage{Blocks: briefingSections(text)}
+	if got := strings.ReplaceAll(rsFallbackBlocksText(msg), "\n", ""); !strings.Contains(got, "END OF FULL CHECK") || strings.Contains(got, truncationMarker) {
+		t.Fatal(got)
+	}
+}
+
+func TestReadableReplyKeepsActivityWithinSlackBlockBudget(t *testing.T) {
+	b := bcBriefing()
+	b.Analyses = []model.IncidentAnalysis{{Summary: strings.Repeat("A complete evidence sentence. ", 6000)}}
+	msg, err := RenderSituationJournal(bcJournal(t, bcObserveMonitorContract(bcNow(t)), b, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.Blocks) > 50 {
+		t.Fatalf("%d blocks exceed Slack limit", len(msg.Blocks))
+	}
+	bcBothSurfaces(t, msg, "*AlertINT:*")
 }

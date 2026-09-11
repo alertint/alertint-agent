@@ -14,6 +14,7 @@ import (
 // IncidentAnalysis is selected completed output, never a prompt or raw evidence
 // envelope. Missing provenance remains missing; verification is not causality.
 type IncidentAnalysis struct {
+	EvidenceSummary   string     `json:"evidence_summary,omitempty"`
 	IncidentID        string     `json:"incident_id"`
 	Title             string     `json:"title,omitempty"`
 	Summary           string     `json:"summary,omitempty"`
@@ -107,7 +108,7 @@ func normalizeEvidenceText(s string) string {
 func BoundIncidentAnalysis(a IncidentAnalysis) IncidentAnalysis {
 	a.IncidentID = briefingBound(a.IncidentID, 200)
 	a.Title = briefingBound(a.Title, 180)
-	a.Summary = briefingBound(a.Summary, 500)
+	a.Summary = completeBriefingText(a.Summary, 1500)
 	a.Verification = briefingBound(a.Verification, 40)
 	a.VerificationLimit = briefingBound(a.VerificationLimit, 100)
 	observations := a.Observations
@@ -116,15 +117,19 @@ func BoundIncidentAnalysis(a IncidentAnalysis) IncidentAnalysis {
 		if i == 2 {
 			break
 		}
-		a.Observations = append(a.Observations, briefingBound(o, 400))
+		a.Observations = append(a.Observations, completeBriefingText(o, 1500))
 	}
 	notes := a.VerificationNotes
 	a.VerificationNotes = nil
-	for i, n := range notes {
-		if i == 5 {
+	remaining := 6000
+	for _, n := range notes {
+		n = completeBriefingText(n, 2000)
+		if len(n) > remaining {
+			a.VerificationNotes = append(a.VerificationNotes, "Additional verification results are available via MCP.")
 			break
 		}
-		a.VerificationNotes = append(a.VerificationNotes, briefingBound(n, 500))
+		a.VerificationNotes = append(a.VerificationNotes, n)
+		remaining -= len(n)
 	}
 	a.EvidenceFingerprint = briefingBound(a.EvidenceFingerprint, 80)
 	findings := a.Findings
@@ -586,4 +591,14 @@ type MaterialCandidate struct {
 	// candidate's own Finding field, not duplicated here. Nil on every
 	// other candidate kind and on a legacy aggregate-only exhaustion edge.
 	Outcome *IncidentWorkOutcome `json:"outcome,omitempty"`
+}
+
+// Preserve complete selected prose; oversized entries are explicitly deferred,
+// never displayed as a severed sentence. These are publication-only limits.
+func completeBriefingText(s string, limit int) string {
+	s = normalizeEvidenceText(s)
+	if len(s) > limit {
+		return "This evidence detail exceeds the Slack briefing size; the complete text is available via MCP."
+	}
+	return s
 }

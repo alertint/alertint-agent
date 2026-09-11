@@ -35,7 +35,7 @@ func TestOperatorBriefingShowsAnalysisAndCurrentStateWithoutControllerJargon(t *
 		t.Fatal(err)
 	}
 	text := rsFallbackBlocksText(msg)
-	for _, want := range []string{"checkout", "production", "Checkout errors after deployment", "4", "resolved", "Next", "Duration"} {
+	for _, want := range []string{"checkout", "production", "The new deployment may have broken checkout.", "4", "resolved", "Next", "Duration"} {
 		if !strings.Contains(strings.ToLower(text), strings.ToLower(want)) {
 			t.Errorf("operator cannot find %q in:\n%s", want, text)
 		}
@@ -232,7 +232,7 @@ func TestBriefingStoredAnalysisFlowsThroughControllerAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Checkout errors after deployment", "Duration", "resolved", "*▸ Recovered*"} {
+	for _, want := range []string{"Deployment may explain checkout errors", "Duration", "resolved", "*▸ Recovered*"} {
 		if !strings.Contains(root.Text, want) {
 			t.Errorf("terminal root lost %q: %s", want, root.Text)
 		}
@@ -308,7 +308,7 @@ func TestBriefingRootBoundsEscapingPhaseAndPlainCommand(t *testing.T) {
 		}
 		found := false
 		for _, line := range strings.Split(body, "\n") {
-			if line == command {
+			if line == "MCP: "+command {
 				found = true
 			}
 		}

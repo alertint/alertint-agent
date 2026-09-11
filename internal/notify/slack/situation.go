@@ -456,17 +456,23 @@ func renderJournalEntry(t model.Transition, executionSuperseded bool) (RenderedM
 // Keep the operational next step outside bounded evidence sections: a long
 // investigation must never truncate the human action.
 func briefingDetailBlocks(detail string) []slacklib.Block {
-	at := strings.LastIndex(detail, "\n*AlertINT:*")
-	if at < 0 {
-		return []slacklib.Block{sectionBlock(detail)}
-	}
 	var blocks []slacklib.Block
-	for _, part := range strings.Split(detail[:at], "\n\n") {
-		if part != "" {
-			blocks = append(blocks, briefingSections(part)...)
-		}
+	at := strings.LastIndex(detail, "*AlertINT:*")
+	if at >= 0 {
+		blocks = append(briefingSections(strings.TrimSpace(detail[:at])), briefingSections(detail[at:])...)
+	} else {
+		blocks = briefingSections(detail)
 	}
-	return append(blocks, sectionBlock(detail[at+1:]))
+	if len(blocks) <= 47 {
+		return blocks
+	}
+	// Leave room for the title, delivery markers and timestamp. Defer the
+	// oversized evidence as a whole rather than cutting off a check mid-sentence.
+	notice := "Evidence exceeds Slack's message size. Complete investigation details are available via MCP."
+	if at := strings.LastIndex(detail, "*AlertINT:*"); at >= 0 {
+		return append([]slacklib.Block{sectionBlock(notice)}, briefingSections(detail[at:])...)
+	}
+	return []slacklib.Block{sectionBlock(notice)}
 }
 
 // ----------------------------------------------------------------------

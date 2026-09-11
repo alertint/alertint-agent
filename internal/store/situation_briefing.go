@@ -22,7 +22,7 @@ import (
 // loadMatchedCompletionEvidenceTx reads raw output only to recompute a digest.
 func loadSituationAnalysesTx(ctx context.Context, tx *sql.Tx, id string) ([]model.IncidentAnalysis, int, error) {
 	rows, err := tx.QueryContext(ctx, `
- SELECT i.id, substr(COALESCE(i.summary,''),1,181), substr(COALESCE(i.root_cause,''),1,501),
+ SELECT i.id, substr(COALESCE(i.summary,''),1,181), COALESCE(i.root_cause,''),
    (SELECT json_group_array(value) FROM (
      SELECT substr(value,1,401) AS value FROM json_each(CASE WHEN json_valid(i.output_json) THEN i.output_json ELSE '{}' END, '$.correlation_findings')
      WHERE type='text' LIMIT 3)),
@@ -68,6 +68,7 @@ func loadSituationAnalysesTx(ctx context.Context, tx *sql.Tx, id string) ([]mode
 			return nil, 0, fmt.Errorf("store: decode recorded analysis findings: %w", err)
 		}
 		a.VerificationNotes = selectedVerificationNotes(enrichment)
+		a.EvidenceSummary = selectedEvidenceSummary(enrichment)
 		a.Observations = selectedLogSamples(enrichment)
 		sourceEvidence := append(append([]string(nil), a.Observations...), a.VerificationNotes...)
 		a.EvidenceFingerprint = model.EvidenceFingerprint(recorded, fullLimit, a.VerificationGaps, sourceEvidence...)
@@ -194,7 +195,7 @@ func selectedVerificationNotes(raw string) []string {
 			var note string
 			switch {
 			case q.Kind == "incidents_in_window" && q.Outcome == "fetched":
-				note = "Incident-window lookup: " + boundedArtifactText(q.Result, 380) + ". A shared cause or relationship is unconfirmed."
+				note = "Incident-window lookup: " + strings.Join(strings.Fields(q.Result), " ") + ". A shared cause or relationship is unconfirmed."
 			case q.Outcome == "empty" || q.Outcome == "failed" || q.Outcome == "invalid" || q.Outcome == "degraded":
 				purpose := strings.Join(strings.Fields(q.Why), " ")
 				if purpose == "" {
@@ -202,9 +203,6 @@ func selectedVerificationNotes(raw string) []string {
 				}
 				if q.Kind == "up_ratio" {
 					purpose = "Peer service health"
-				}
-				if len(purpose) > 110 {
-					purpose = boundedArtifactText(purpose, 107) + "…"
 				}
 				if q.Outcome == "empty" {
 					note = purpose + ": returned no data; this check establishes neither health nor failure."
@@ -248,10 +246,51 @@ func selectedLogSamples(raw string) []string {
 			continue
 		}
 		seen[line.Line] = true
-		out = append(out, "Log sample at "+at.UTC().Format("2006-01-02 15:04:05 UTC")+": "+boundedArtifactText(line.Line, 300))
+		out = append(out, "Log sample at "+at.UTC().Format("2006-01-02 15:04:05 UTC")+": "+strings.Join(strings.Fields(line.Line), " "))
 		if len(out) == 2 {
 			break
 		}
 	}
 	return out
+}
+
+// Inventory describes the recorded collection, never its completeness or cause.
+func selectedEvidenceSummary(raw string) string {
+	var e struct {
+		Metrics struct {
+			Outcome   string            `json:"outcome"`
+			Snapshots []json.RawMessage `json:"snapshots"`
+		} `json:"metrics"`
+		Logs struct {
+			Outcome string            `json:"outcome"`
+			Lines   []json.RawMessage `json:"lines"`
+		} `json:"logs"`
+		Changes struct {
+			Outcome string            `json:"outcome"`
+			Events  []json.RawMessage `json:"events"`
+		} `json:"changes"`
+	}
+	if json.Unmarshal([]byte(raw), &e) != nil {
+		return ""
+	}
+	var parts []string
+	for _, s := range []struct {
+		name, outcome string
+		count         int
+	}{{"Metric samples", e.Metrics.Outcome, len(e.Metrics.Snapshots)}, {"Log lines", e.Logs.Outcome, len(e.Logs.Lines)}, {"Changes", e.Changes.Outcome, len(e.Changes.Events)}} {
+		switch s.outcome {
+		case "fetched":
+			if s.name == "Changes" {
+				parts = append(parts, "Changes: records returned")
+			} else {
+				parts = append(parts, fmt.Sprintf("%s: %d", s.name, s.count))
+			}
+		case "empty":
+			parts = append(parts, s.name+": none returned")
+		case "":
+		default:
+			parts = append(parts, s.name+": unavailable")
+		}
+	}
+	return strings.Join(parts, " · ")
 }

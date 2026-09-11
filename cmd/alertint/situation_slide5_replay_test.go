@@ -735,9 +735,9 @@ func TestS5ReplayDeliveredSequenceRendersEveryCanonicalEvent(t *testing.T) {
 	ev3 := r.runEvent("event 3 · finding published", 0)
 	r.assertEvent("event 3", ev3, s5rExpect{
 		lifecycle: "active", orientation: "Monitoring", transitions: 3, replies: 1,
-		rootMust: []string{"pod crash to error spike to queue backlog", "Next status check:"},
+		rootMust: []string{"Pod restarts in checkout drove the error spike", "Next status check:"},
 		replyMust: []string{"Pod restarts precede the error-rate spike",
-			"Queue backlog follows the error spike", "Still unknown:", "Next status check:"},
+			"Queue backlog follows the error spike", "Verification:", "Next status check:"},
 	})
 
 	// Event 4 — 15:11:29 QueueBacklog clears; three remain firing.

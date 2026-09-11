@@ -39,55 +39,21 @@ func briefingScope(b *model.OperatorBriefing) string {
 	return briefingText(scope, 100)
 }
 
-// Reuse persisted finding titles without a new model call.
-// Before analysis, source symptom names provide the descriptive fallback.
-func briefingSubject(b *model.OperatorBriefing) string {
-	for _, a := range b.Analyses {
-		if a.VerificationLimit == "llm_call_failed" || a.VerificationLimit == "llm_response_invalid" || a.VerificationLimit == "budget_deferred" {
-			continue
-		}
-		if strings.TrimSpace(a.Title) != "" {
-			return briefingText(strings.TrimPrefix(a.Title, "Hypothesis: "), 100)
-		}
-	}
-	var symptoms []string
-	for _, symptom := range b.Symptoms {
-		if strings.TrimSpace(symptom) != "" && symptom != "…" {
-			symptoms = append(symptoms, symptom)
-		}
-		if len(symptoms) == 2 {
-			break
-		}
-	}
-	if len(symptoms) > 0 {
-		return briefingText(strings.Join(symptoms, ", "), 140)
-	}
-	return ""
-}
-
-func briefingTitleContext(b *model.OperatorBriefing) string {
-	context := briefingScope(b)
-	if subject := briefingSubject(b); subject != "" {
-		context += " — " + subject
-	}
-	return context
-}
-
 // One color communicates overall status; phase styling remains bold-only.
-func briefingStatus(t model.Transition) (marker, label string) {
+func briefingStatus(t model.Transition) string {
 	switch {
 	case t.Lifecycle == model.LifecycleRecovered:
-		return "🟢", "Recovered"
+		return "🟢"
 	case t.Lifecycle == model.LifecycleClosedUnknown:
-		return "🔴", "Recovery unconfirmed"
+		return "🔴"
 	case t.Attention == model.AttentionUrgent:
-		return "🔴", "Urgent"
+		return "🔴"
 	case t.Attention == model.AttentionInvestigate || operatorWorkBlocked(t.ActionContract) || t.ActionContract.OperatorActionRequired != nil:
-		return "🔴", "Needs investigation"
+		return "🔴"
 	case t.Lifecycle == model.LifecycleRecoveryPending:
-		return "🔵", "Confirming recovery"
+		return "🔵"
 	default:
-		return "🔵", "Monitoring"
+		return "🔵"
 	}
 }
 
@@ -121,7 +87,7 @@ func briefingAnalysis(b *model.OperatorBriefing, detailed bool) string {
 				label = "Historical source report"
 				qualifier = " (retained annotation, not a current measurement)"
 			}
-			lines = append(lines, label+" ("+briefingText(alert.Name, 120)+", "+briefingText(alert.State, 20)+"): "+briefingText(alert.SourceSummary, 240)+qualifier)
+			lines = append(lines, label+" ("+briefingText(alert.Name, 120)+", "+briefingText(alert.State, 20)+"): "+briefingComplete(alert.SourceSummary)+qualifier)
 		}
 	}
 	if len(b.Analyses) == 0 {
@@ -175,21 +141,47 @@ func briefingInterpretation(a model.IncidentAnalysis) string {
 }
 
 func briefingEvidence(a model.IncidentAnalysis) []string {
-	lines := []string{"*Observed log samples:*"}
 	interpretation := "*Interpretation:*"
-	if a.VerificationLimit == "llm_call_failed" || a.VerificationLimit == "llm_response_invalid" || a.VerificationLimit == "budget_deferred" {
+	if briefingDraft(a) {
 		interpretation = "*Retained draft hypothesis (not reconciled with verification results):*"
 	}
-	for j, f := range a.Observations {
-		if j == 3 {
-			break
+	lines := []string{interpretation + " " + briefingComplete(briefingInterpretation(a))}
+	if a.EvidenceSummary != "" {
+		lines = append(lines, "\n*Evidence collected:* "+briefingComplete(a.EvidenceSummary))
+	}
+	if len(a.Observations) > 0 {
+		lines = append(lines, "\n*Observed log samples:*")
+		for _, f := range a.Observations {
+			lines = append(lines, "• "+briefingComplete(f))
 		}
-		lines = append(lines, "• "+briefingText(f, 300))
+	} else {
+		lines = append(lines, "\n*Observed:* No supporting observations were recorded; this does not establish that the service is healthy.")
 	}
-	if len(a.Observations) == 0 {
-		lines = []string{"*Observed:* No supporting observations were recorded; this does not establish that the service is healthy."}
+	brief := a
+	brief.VerificationNotes = nil
+	lines = append(lines, "\n*Verification:* "+briefingUncertainty(brief))
+	var empty, other []string
+	for _, note := range a.VerificationNotes {
+		const suffix = ": returned no data; this check establishes neither health nor failure."
+		if strings.HasSuffix(note, suffix) {
+			empty = append(empty, strings.TrimSuffix(note, suffix))
+		} else {
+			other = append(other, note)
+		}
 	}
-	return append(lines, interpretation+" "+briefingText(briefingInterpretation(a), 300), "*Still unknown:* "+briefingUncertainty(a))
+	if len(empty) > 0 {
+		lines = append(lines, fmt.Sprintf("\n*Checks returning no data (%d):* No data establishes neither health nor failure.", len(empty)))
+		for _, note := range empty {
+			lines = append(lines, "• "+briefingComplete(note))
+		}
+	}
+	if len(other) > 0 {
+		lines = append(lines, "\n*Other verification results:*")
+		for _, note := range other {
+			lines = append(lines, "• "+briefingComplete(note))
+		}
+	}
+	return lines
 }
 
 func briefingFinding(a model.IncidentAnalysis, historical bool) []string {
@@ -333,8 +325,8 @@ func renderBriefingRoot(in SituationRootInput) RenderedMessage {
 	b := in.Summary.Briefing
 	t := in.SourceTransition
 	orientation := situation.DeriveOrientation(in.Summary, t)
-	marker, label := briefingStatus(t)
-	title := drillPrefix(t.Drill) + marker + " *" + label + " · " + briefingTitleContext(b) + "*"
+	marker := briefingStatus(t)
+	title := drillPrefix(t.Drill) + marker + " *" + briefingScope(b) + "*"
 	phase := renderOrientationChain(orientation)
 	status := briefingRootAlerts(b)
 	if b.Critical > 0 {
@@ -345,14 +337,18 @@ func renderBriefingRoot(in SituationRootInput) RenderedMessage {
 	if request := briefingAction(b, t); request != "" {
 		action = "\n*Action:* " + request
 	}
-	analysis := ""
+	analysis := briefingRootFinding(b)
 	if t.Lifecycle.Terminal() && len(b.Analyses) == 0 {
 		analysis = "Analysis ended without a completed finding."
 	}
 	lines := []string{title, phase, status, analysis, activity + action}
-	blocks := []slacklib.Block{sectionBlock(title), contextBlock(phase), contextBlock(status)}
-	blocks = append(blocks, briefingSections(analysis)...)
-	blocks = append(blocks, sectionBlock(activity+action))
+	body := status
+	if analysis != "" {
+		body += "\n" + analysis
+	}
+	body += "\n" + activity + action
+	blocks := []slacklib.Block{sectionBlock(title), contextBlock(phase)}
+	blocks = append(blocks, briefingSections(body)...)
 	if len(in.Summary.RecordedOperatorContext) > 0 {
 		note := "Recorded context: " + briefingText(in.Summary.RecordedOperatorContext[len(in.Summary.RecordedOperatorContext)-1], 160)
 		lines = append(lines, note)
@@ -366,7 +362,7 @@ func renderBriefingRoot(in SituationRootInput) RenderedMessage {
 	blocks = append(blocks, contextBlock(line))
 	footer := briefingFooter(in.Summary)
 	lines = append(lines, footer)
-	blocks = append(blocks, sectionBlock(footer))
+	blocks = append(blocks, contextBlock(footer))
 	return RenderedMessage{Text: strings.Join(lines, "\n"), Blocks: blocks}
 }
 
@@ -375,7 +371,7 @@ func briefingFooter(s model.EpisodeSummary) string {
 	if handle == "" {
 		handle = s.SituationID
 	}
-	return "Investigate via MCP\nget situation " + briefingText(handle, 200) + " using alertint"
+	return "MCP: get situation " + briefingText(handle, 200) + " using alertint"
 }
 
 // ----------------------------------------------------------------------
@@ -477,7 +473,7 @@ func briefingJournal(t model.Transition) (string, string) {
 // contract describes has since been overtaken. See SituationReplyInput.
 func briefingJournalPresented(t model.Transition, executionSuperseded bool) (string, string) {
 	b := t.Projection.Briefing
-	headline := "Update"
+	headline := ""
 	switch t.Lifecycle {
 	case model.LifecycleRecoveryPending:
 		headline = "Recovery observed"
@@ -497,6 +493,9 @@ func briefingJournalPresented(t model.Transition, executionSuperseded bool) (str
 		// as a copy of the root's current work inventory.
 		selected.Failed, selected.Pending, selected.Unavailable = 0, 0, 0
 		lines = append(lines, briefingDeltaLines(d, b, t.Lifecycle.Terminal())...)
+		if t.Lifecycle == model.LifecycleActive && briefingAssuranceLine(d, b) != "" {
+			headline = "Investigation started"
+		}
 		// A useful finding reported as a candidate alone still headlines as
 		// evidence: the overview-driven branch below cannot see it, because
 		// the bounded Analyses list is exactly what it fell outside of.
@@ -519,7 +518,7 @@ func briefingJournalPresented(t model.Transition, executionSuperseded bool) (str
 	} else {
 		headline = briefingReplyTitle(headline, t, b)
 	}
-	marker, _ := briefingStatus(t)
+	marker := briefingStatus(t)
 	headline = marker + " " + headline
 	// A reply that already carries the initial execution assurance has
 	// stated the recorded count and names once; the activity line then says
@@ -566,6 +565,9 @@ func briefingJournalPresented(t model.Transition, executionSuperseded bool) (str
 func briefingReplyTitle(headline string, t model.Transition, b *model.OperatorBriefing) string {
 	if d := t.Projection.OperatorDelta; t.Lifecycle == model.LifecycleActive && d != nil && d.StateChanged && b.Firing < d.PreviousFiring && b.Firing > 0 {
 		return "Partial recovery · " + briefingState(b)
+	}
+	if headline == "" {
+		return briefingScope(b)
 	}
 	return headline + " · " + briefingScope(b)
 }
@@ -1053,6 +1055,20 @@ func briefingSections(text string) []slacklib.Block {
 	var blocks []slacklib.Block
 	var section string
 	for _, line := range strings.Split(text, "\n") {
+		for len(line) > 2800 {
+			if section != "" {
+				blocks = append(blocks, sectionBlock(section))
+				section = ""
+			}
+			chunk := boundedRunes(line, 2800)
+			if at := strings.LastIndex(chunk, " "); at > 1400 {
+				chunk = chunk[:at+1]
+			} else if amp := strings.LastIndex(chunk, "&"); amp > strings.LastIndex(chunk, ";") {
+				chunk = chunk[:amp]
+			}
+			blocks = append(blocks, sectionBlock(chunk))
+			line = line[len(chunk):]
+		}
 		if len(section)+len(line)+1 > 2800 && section != "" {
 			blocks = append(blocks, sectionBlock(section))
 			section = ""
