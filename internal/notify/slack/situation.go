@@ -411,6 +411,10 @@ func RenderSituationJournal(t model.Transition) (RenderedMessage, error) {
 // reaches exactly one sentence of the briefing body (see
 // briefingJournalPresented) and changes nothing else here.
 func renderJournalEntry(t model.Transition, executionSuperseded bool) (RenderedMessage, error) {
+	return renderJournalEntryKind(t, executionSuperseded, "")
+}
+
+func renderJournalEntryKind(t model.Transition, executionSuperseded bool, replyKind string) (RenderedMessage, error) {
 	if err := t.Validate(); err != nil {
 		return RenderedMessage{}, fmt.Errorf("slack: render situation journal: %w", err)
 	}
@@ -422,7 +426,11 @@ func renderJournalEntry(t model.Transition, executionSuperseded bool) (RenderedM
 	label, detail := t.Journal.Headline, t.Journal.Detail
 	fallback := prefix + label
 	if t.Projection.Briefing != nil {
-		label, detail = briefingJournalPresented(t, executionSuperseded)
+		if t.Projection.Briefing.Flow != nil {
+			label, detail = canonicalBriefingJournal(t, replyKind, executionSuperseded)
+		} else {
+			label, detail = briefingJournalPresented(t, executionSuperseded)
+		}
 		fallback = prefix + label + "\n" + detail
 	}
 	headline := prefix + "*" + label + "*"

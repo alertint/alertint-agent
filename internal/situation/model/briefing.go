@@ -139,7 +139,7 @@ func BoundIncidentAnalysis(a IncidentAnalysis) IncidentAnalysis {
 			break
 		}
 		if strings.TrimSpace(f) != "" {
-			a.Findings = append(a.Findings, briefingBound(f, 400))
+			a.Findings = append(a.Findings, completeBriefingText(f, 1500))
 		}
 	}
 	if a.AnalyzedAt != nil {
@@ -166,13 +166,65 @@ func briefingBound(s string, limit int) string {
 type BriefingAlert struct {
 	ID            string `json:"id"`
 	Name          string `json:"name"`
+	Service       string `json:"service,omitempty"`
+	Context       string `json:"context,omitempty"`
 	State         string `json:"state"`
 	SourceSummary string `json:"source_summary,omitempty"`
+}
+
+// OperatorFlow is the recorded timing and accounting needed by the canonical
+// operator presentation. Its containing pointer is nil on legacy projections.
+type OperatorFlow struct {
+	FirstReceivedAt             time.Time     `json:"first_received_at"`
+	CorrelationOpenedAt         time.Time     `json:"correlation_opened_at"`
+	CorrelationClosesAt         *time.Time    `json:"correlation_closes_at,omitempty"`
+	GroupKey                    string        `json:"group_key,omitempty"`
+	GroupingRule                string        `json:"grouping_rule,omitempty"`
+	InvestigationStartedAt      *time.Time    `json:"investigation_started_at,omitempty"`
+	InvestigationCompletedAt    *time.Time    `json:"investigation_completed_at,omitempty"`
+	InvestigationRuntimeSeconds *int64        `json:"investigation_runtime_seconds,omitempty"`
+	AnalysisUsage               AnalysisUsage `json:"analysis_usage"`
+	SourceChecks                []SourceCheck `json:"source_checks,omitempty"`
+}
+
+// AnalysisUsage keeps knownness separate from a real zero-token outcome.
+type AnalysisUsage struct {
+	Calls             int  `json:"calls"`
+	CallsKnown        bool `json:"calls_known"`
+	InputTokens       int  `json:"input_tokens"`
+	InputTokensKnown  bool `json:"input_tokens_known"`
+	OutputTokens      int  `json:"output_tokens"`
+	OutputTokensKnown bool `json:"output_tokens_known"`
+}
+
+type SourceCheckOutcome string
+
+const (
+	SourceCheckConfigured SourceCheckOutcome = "configured"
+	SourceCheckReturned   SourceCheckOutcome = "returned"
+	SourceCheckEmpty      SourceCheckOutcome = "empty"
+	SourceCheckFailed     SourceCheckOutcome = "failed"
+	SourceCheckSkipped    SourceCheckOutcome = "skipped"
+)
+
+// SourceCheck describes one named, recorded collection or verification check.
+// Counts are asserted only when their corresponding Known field is true.
+type SourceCheck struct {
+	Source       string             `json:"source"`
+	Check        string             `json:"check"`
+	Unit         string             `json:"unit,omitempty"`
+	Outcome      SourceCheckOutcome `json:"outcome"`
+	Calls        int                `json:"calls"`
+	CallsKnown   bool               `json:"calls_known"`
+	Records      int                `json:"records"`
+	RecordsKnown bool               `json:"records_known"`
+	Detail       string             `json:"detail,omitempty"`
 }
 
 // OperatorBriefing travels only through the immutable publication projection.
 // A nil briefing on old projections preserves their legacy replay behavior.
 type OperatorBriefing struct {
+	Flow              *OperatorFlow      `json:"flow,omitempty"`
 	BlockedReason     string             `json:"blocked_reason,omitempty"`
 	AssessmentRetryAt *time.Time         `json:"assessment_retry_at,omitempty"`
 	Scope             string             `json:"scope"`

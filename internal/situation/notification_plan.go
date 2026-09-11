@@ -379,16 +379,31 @@ func PlanNotificationIntents(in PublicationInput) ([]model.NotificationIntent, e
 		}
 	}
 
-	// Immutable journal entries, one per journaled Transition, in sequence
-	// order. Each Transition produces exactly ONE reply: the poked one is
-	// broadcast (a handoff edits the root and then creates one broadcast
-	// reply), every other one is a quiet thread entry. Both classes render
-	// the same stored journal data, so emitting both for one Transition
-	// would post it to Slack twice.
+	out = append(out, planJournalIntents(in, pokeSequence)...)
+
+	for i := range out {
+		if err := out[i].Validate(); err != nil {
+			return nil, fmt.Errorf("situation: planned notification intent %d: %w", i, err)
+		}
+	}
+	return out, nil
+}
+
+// planJournalIntents creates immutable journal entries in sequence order.
+// Canonical projections may split one Transition into separately retryable
+// analysis and recovery replies; legacy projections retain exactly one reply.
+// A poked Transition assigns the poke to its final reply; earlier split replies
+// remain quiet thread entries.
+func planJournalIntents(in PublicationInput, pokeSequence int) []model.NotificationIntent {
+	out := make([]model.NotificationIntent, 0, len(in.Transitions)+1)
 	for _, tr := range in.Transitions {
+		replyKinds := canonicalReplyKinds(in, tr)
 		// Legacy projections retain their original publication semantics on
 		// replay. Every newly reconciled projection carries a briefing.
-		if tr.Projection.Briefing != nil && !replyEligibleTransition(in, tr) {
+		if tr.Projection.Briefing != nil && tr.Projection.Briefing.Flow == nil && !replyEligibleTransition(in, tr) {
+			continue
+		}
+		if tr.Projection.Briefing != nil && tr.Projection.Briefing.Flow != nil && len(replyKinds) == 0 {
 			continue
 		}
 		poked := pokeSequence != 0 && tr.Sequence == pokeSequence
@@ -401,38 +416,91 @@ func PlanNotificationIntents(in PublicationInput) ([]model.NotificationIntent, e
 			// reason precedence must not hide newly useful analysis.
 			continue
 		}
-		if !poked {
-			out = append(out, newIntent(in, model.EffectThreadAppend, tr,
-				threadKey(model.EffectThreadAppend, in.Situation.ID, tr.Sequence)))
-			continue
+		if len(replyKinds) == 0 {
+			replyKinds = []model.NotificationReplyKind{model.ReplyLegacy}
 		}
-
-		priority := DeriveInterruptionPriority(tr)
-		broadcast := newIntent(in, model.EffectBroadcastHandoff, tr,
-			threadKey(model.EffectBroadcastHandoff, in.Situation.ID, tr.Sequence))
-		broadcast.MainChannelPoke = true
-		broadcast.InterruptionPriority = &priority
-		if MeetsSlackFloor(priority, in.SlackFloor) {
-			out = append(out, broadcast)
-			continue
-		}
-		// Below the operator's floor the poke is withheld as a durable
-		// decision, never an absent row — but the floor "never suppresses
-		// ... a non-broadcast journal entry", so the same Transition still
-		// gets its quiet thread entry. Only one of the two is ever
-		// delivered, so this is not the duplicate the branch above avoids.
-		broadcast.Status = model.IntentWithheld
-		out = append(out,
-			newIntent(in, model.EffectThreadAppend, tr, threadKey(model.EffectThreadAppend, in.Situation.ID, tr.Sequence)),
-			broadcast)
-	}
-
-	for i := range out {
-		if err := out[i].Validate(); err != nil {
-			return nil, fmt.Errorf("situation: planned notification intent %d: %w", i, err)
+		for i, kind := range replyKinds {
+			kindPoked := poked && i == len(replyKinds)-1
+			if !kindPoked {
+				out = append(out, newReplyIntent(in, model.EffectThreadAppend, tr, kind))
+				continue
+			}
+			priority := DeriveInterruptionPriority(tr)
+			broadcast := newReplyIntent(in, model.EffectBroadcastHandoff, tr, kind)
+			broadcast.MainChannelPoke = true
+			broadcast.InterruptionPriority = &priority
+			if MeetsSlackFloor(priority, in.SlackFloor) {
+				out = append(out, broadcast)
+				continue
+			}
+			broadcast.Status = model.IntentWithheld
+			out = append(out, newReplyIntent(in, model.EffectThreadAppend, tr, kind), broadcast)
 		}
 	}
-	return out, nil
+	return out
+}
+
+func canonicalReplyKinds(in PublicationInput, tr model.Transition) []model.NotificationReplyKind {
+	b := tr.Projection.Briefing
+	if b == nil || b.Flow == nil {
+		return nil
+	}
+	if !in.RootPublished && !in.RootPublicationOwed && b.Work.Phase == model.WorkPhaseCollecting &&
+		b.Flow.InvestigationStartedAt == nil && b.Firing > 0 {
+		return []model.NotificationReplyKind{model.ReplyCorrelationStarted}
+	}
+	facts := canonicalReplyFactsFor(tr)
+	var out []model.NotificationReplyKind
+	if in.RootPublished && facts.assurance && !facts.analysis && !facts.allClear && !facts.terminal && b.Flow.InvestigationStartedAt != nil {
+		out = append(out, model.ReplyInvestigationStarted)
+	}
+	if facts.analysis {
+		out = append(out, model.ReplyAnalysisCompleted)
+	}
+	if d := tr.Projection.OperatorDelta; d != nil && d.StateChanged && b.Firing > 0 && b.Firing < d.PreviousFiring {
+		out = append(out, model.ReplyPartialClearance)
+	}
+	if facts.allClear {
+		out = append(out, model.ReplyRecoveryObserved)
+	}
+	if facts.terminal && tr.Lifecycle == model.LifecycleRecovered {
+		out = append(out, model.ReplyRecovered)
+	}
+	if facts.terminal && tr.Lifecycle != model.LifecycleRecovered {
+		out = append(out, model.ReplyLegacy)
+	}
+	if len(out) == 0 && !facts.canonicalCandidate && replyEligibleTransition(in, tr) {
+		out = append(out, model.ReplyLegacy)
+	}
+	return out
+}
+
+type canonicalReplyFacts struct {
+	assurance          bool
+	analysis           bool
+	allClear           bool
+	terminal           bool
+	canonicalCandidate bool
+}
+
+func canonicalReplyFactsFor(tr model.Transition) canonicalReplyFacts {
+	var facts canonicalReplyFacts
+	if tr.Projection.OperatorDelta == nil {
+		return facts
+	}
+	for _, candidate := range tr.Projection.OperatorDelta.Candidates {
+		switch candidate.Kind { //nolint:exhaustive
+		case model.CandidateFirstExecutionAssurance:
+			facts.assurance, facts.canonicalCandidate = true, true
+		case model.CandidateUsefulFinding, model.CandidateInconclusiveCompletion:
+			facts.analysis, facts.canonicalCandidate = true, true
+		case model.CandidateAllClear:
+			facts.allClear, facts.canonicalCandidate = true, true
+		case model.CandidateTerminalEnd:
+			facts.terminal, facts.canonicalCandidate = true, true
+		}
+	}
+	return facts
 }
 
 func validatePublicationInput(in PublicationInput) error {
@@ -577,6 +645,16 @@ func newIntent(in PublicationInput, class model.EffectClass, subject model.Trans
 		Status:             model.IntentPending,
 		CreatedAt:          in.Now,
 	}
+}
+
+func newReplyIntent(in PublicationInput, class model.EffectClass, subject model.Transition, kind model.NotificationReplyKind) model.NotificationIntent {
+	key := threadKey(class, in.Situation.ID, subject.Sequence)
+	if kind != model.ReplyLegacy {
+		key = boundedText(key+":"+string(kind), maxHistoryIdentifier)
+	}
+	out := newIntent(in, class, subject, key)
+	out.ReplyKind = kind
+	return out
 }
 
 // intentIdentity derives a stable UUIDv5 from the fixed AlertINT namespace

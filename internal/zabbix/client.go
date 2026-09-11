@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/alertint/alertint-agent/internal/httpcount"
 )
 
 type Config struct {
@@ -90,6 +92,7 @@ func (c *Client) call(ctx context.Context, method string, params any, withAuth b
 	if withAuth {
 		req.Header.Set("Authorization", c.authHeader)
 	}
+	httpcount.Observe(ctx)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("zabbix request: %w", err)

@@ -304,7 +304,9 @@ type tokenUsage struct {
 func (c *Client) callWithRetry(ctx context.Context, system string, prompt llm.Prompt, maxRetries int) (json.RawMessage, tokenUsage, error) {
 	return llm.CallWithRetry(ctx, c.logger, maxRetries, c.cfg.BaseRetryDelay,
 		func(ctx context.Context) (json.RawMessage, tokenUsage, error) {
-			return c.doRequest(ctx, system, prompt)
+			raw, usage, err := c.doRequest(ctx, system, prompt)
+			llm.ObserveRequest(ctx, llm.Completion{Raw: raw, InputTokens: usage.input, OutputTokens: usage.output}, err)
+			return raw, usage, err
 		})
 }
 

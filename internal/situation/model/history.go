@@ -605,6 +605,30 @@ func (e EffectClass) Validate() error {
 		EffectRootSync, EffectThreadAppend, EffectBroadcastHandoff, EffectInstallationGapRecovery)
 }
 
+// NotificationReplyKind selects the immutable operator development rendered
+// by a reply intent. Legacy keeps pre-canonical transitions byte-compatible;
+// canonical transitions persist an explicit kind so one transition may owe
+// more than one independently retryable reply without re-deriving delivery
+// intent after a restart.
+type NotificationReplyKind string
+
+const (
+	ReplyLegacy               NotificationReplyKind = ""
+	ReplyCorrelationStarted   NotificationReplyKind = "correlation_started"
+	ReplyInvestigationStarted NotificationReplyKind = "investigation_started"
+	ReplyAnalysisCompleted    NotificationReplyKind = "analysis_completed"
+	ReplyPartialClearance     NotificationReplyKind = "partial_clearance"
+	ReplyRecoveryObserved     NotificationReplyKind = "recovery_observed"
+	ReplyRecovered            NotificationReplyKind = "recovered"
+)
+
+func (k NotificationReplyKind) Validate() error {
+	return validateEnum("notification_reply_kind", k,
+		ReplyLegacy, ReplyCorrelationStarted, ReplyInvestigationStarted,
+		ReplyAnalysisCompleted, ReplyPartialClearance, ReplyRecoveryObserved,
+		ReplyRecovered)
+}
+
 // IntentStatus is the closed lifecycle of one NotificationIntent.
 type IntentStatus string
 
@@ -632,6 +656,7 @@ type NotificationIntent struct {
 	ID                   string
 	IdempotencyKey       string
 	EffectClass          EffectClass
+	ReplyKind            NotificationReplyKind
 	SituationID          *string
 	TransitionID         *string
 	TransitionSequence   *int
@@ -747,6 +772,9 @@ func (n NotificationIntent) Validate() error {
 		return fmt.Errorf("notification_intent: idempotency_key exceeds %d bytes", maxIdentifierLength)
 	}
 	if err := n.EffectClass.Validate(); err != nil {
+		return fmt.Errorf("notification_intent: %w", err)
+	}
+	if err := n.ReplyKind.Validate(); err != nil {
 		return fmt.Errorf("notification_intent: %w", err)
 	}
 	if strings.TrimSpace(n.ClientMessageID) == "" {

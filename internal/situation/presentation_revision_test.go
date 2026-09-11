@@ -22,10 +22,22 @@ func TestPresentationRevisionPersistsNamedAlertFacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"display_scope":"checkout · production"`, `"alerts":[{"id":"delivery-1","name":"CheckoutErrors","state":"firing"}]`} {
+	for _, want := range []string{`"display_scope":"checkout · production"`, `"alerts":[{"id":"delivery-1","name":"CheckoutErrors","service":"checkout","context":"checkout","state":"firing"}]`} {
 		if !strings.Contains(string(raw), want) {
 			t.Errorf("persisted briefing missing %s: %s", want, raw)
 		}
+	}
+}
+
+func TestPresentationSourcesPreferRecordedOutcomeAndRetainSkippedInventory(t *testing.T) {
+	configured := []model.SourceCheck{
+		{Source: "Prometheus", Check: "collection", Outcome: model.SourceCheckConfigured, CallsKnown: true},
+		{Source: "Changes", Check: "collection", Outcome: model.SourceCheckSkipped, CallsKnown: true, RecordsKnown: true},
+	}
+	recorded := []model.SourceCheck{{Source: "Prometheus", Check: "collection", Outcome: model.SourceCheckEmpty, RecordsKnown: true}}
+	got := mergePresentationSourceChecks(configured, recorded)
+	if len(got) != 2 || got[0].Source != "Changes" || got[0].Outcome != model.SourceCheckSkipped || got[1].Outcome != model.SourceCheckEmpty {
+		t.Fatalf("merged source inventory = %+v", got)
 	}
 }
 
@@ -41,7 +53,7 @@ func presentationInput(t *testing.T, n int) SnapshotInput {
 	return in
 }
 
-func TestPresentationRevisionBoundedStableSelectionAndAssessmentIsolation(t *testing.T) {
+func TestPresentationRevisionCompleteStableSelectionAndAssessmentIsolation(t *testing.T) {
 	in := presentationInput(t, 10)
 	in.Deliveries[0].Labels["alertname"] = strings.Repeat("\u754c", 300)
 	before := BuildSnapshot(in)
@@ -50,8 +62,8 @@ func TestPresentationRevisionBoundedStableSelectionAndAssessmentIsolation(t *tes
 		t.Fatal(err)
 	}
 	b := BuildOperatorBriefing(in, model.LifecycleActive)
-	if len(b.Alerts) != 8 || b.AlertsOmitted != 2 || b.Total != 10 || b.Firing != 10 {
-		t.Fatalf("bounded selection must retain honest totals: %+v", b)
+	if len(b.Alerts) != 10 || b.AlertsOmitted != 0 || b.Total != 10 || b.Firing != 10 {
+		t.Fatalf("selection must retain every recognizable alert identity: %+v", b)
 	}
 	for i, a := range b.Alerts {
 		if a.ID != fmt.Sprintf("id-%02d", i) || len(a.Name) > 240 || a.State != "firing" {

@@ -113,7 +113,7 @@ func TestBriefingStoredAnalysisFlowsThroughControllerAndReplay(t *testing.T) {
 	countReplies := func() int {
 		t.Helper()
 		var n int
-		if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM notification_intents WHERE effect_class IN ('thread_append','broadcast_handoff')`).Scan(&n); err != nil {
+		if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM notification_intents WHERE effect_class IN ('thread_append','broadcast_handoff') AND reply_kind <> 'correlation_started'`).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
 		return n
@@ -159,7 +159,7 @@ func TestBriefingStoredAnalysisFlowsThroughControllerAndReplay(t *testing.T) {
 	}
 	t.Logf("representative active root:\n%s\nrepresentative meaningful reply:\n%s", root.Text, journal.Text)
 	for _, txt := range []string{journal.Text} {
-		for _, want := range []string{"Deployment may explain checkout errors", "Restarts and errors began together", "verification"} {
+		for _, want := range []string{"Restarts and errors began together", "verification"} {
 			if !strings.Contains(txt, want) {
 				t.Errorf("persisted Slack flow lost %q: %s", want, txt)
 			}
@@ -232,7 +232,7 @@ func TestBriefingStoredAnalysisFlowsThroughControllerAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Deployment may explain checkout errors", "Duration", "resolved", "*▸ Recovered*"} {
+	for _, want := range []string{"Restarts and errors began together", "Alert age at closure", "resolved", "*▸ Recovered*"} {
 		if !strings.Contains(root.Text, want) {
 			t.Errorf("terminal root lost %q: %s", want, root.Text)
 		}

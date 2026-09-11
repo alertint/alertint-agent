@@ -332,14 +332,14 @@ func (d *SituationDeliverer) selectedReply(ctx context.Context, intent model.Not
 		// Both callers reject an intent with no Situation identity before
 		// reaching here; that validation stays theirs, and this guard only
 		// keeps the read from being attempted without one.
-		return slack.SituationReplyInput{Transition: tr}, nil
+		return slack.SituationReplyInput{Transition: tr, ReplyKind: intent.ReplyKind}, nil
 	}
 	history, err := d.store.GetCommunicatedHistory(ctx, *intent.SituationID, tr.Sequence)
 	if err != nil {
 		return slack.SituationReplyInput{}, localDelivery("communicated_history_unavailable",
 			fmt.Errorf("cmd/alertint: situation deliverer: load communicated history: %w", err))
 	}
-	reply := slack.SituationReplyInput{Transition: tr, ExecutionSuperseded: history.AssuranceSuperseded}
+	reply := slack.SituationReplyInput{Transition: tr, ReplyKind: intent.ReplyKind, ExecutionSuperseded: history.AssuranceSuperseded}
 	delta := tr.Projection.OperatorDelta
 	if delta == nil || len(delta.Candidates) == 0 {
 		return reply, nil

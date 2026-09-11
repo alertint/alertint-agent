@@ -20,6 +20,31 @@ import (
 // controllerRuntime construction
 // ----------------------------------------------------------------------
 
+func TestConfiguredPresentationSourcesDistinguishConfiguredFromSkipped(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Prometheus.BaseURL = "http://prometheus.test"
+	off := false
+	cfg.Logs.Enabled = &off
+	cfg.Changes.Enrichment.Enabled = &off
+	cfg.Zabbix.API.Enabled = &off
+	checks := configuredPresentationSources(cfg)
+	bySource := map[string]model.SourceCheck{}
+	for _, check := range checks {
+		bySource[check.Source] = check
+	}
+	if got := bySource["Prometheus"]; got.Outcome != model.SourceCheckConfigured || got.CallsKnown || got.Calls != 0 || got.Detail == "" {
+		t.Fatalf("configured Prometheus = %+v", got)
+	}
+	for _, source := range []string{"Loki", "Changes", "Zabbix"} {
+		if got := bySource[source]; got.Outcome != model.SourceCheckSkipped || !got.CallsKnown || got.Calls != 0 || !got.RecordsKnown || got.Records != 0 || got.Detail != "Disabled by configuration" {
+			t.Errorf("skipped %s = %+v", source, got)
+		}
+	}
+	if _, ok := bySource["Sentry"]; ok {
+		t.Error("unconfigured Sentry was included")
+	}
+}
+
 func TestSituationControllerRuntimePanicsOnEmptyOwner(t *testing.T) {
 	st := newTestFoundationStore(t)
 	defer func() {

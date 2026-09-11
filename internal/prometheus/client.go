@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/alertint/alertint-agent/internal/httpcount"
 )
 
 // Client is a read-only Prometheus HTTP API v1 client.
@@ -138,6 +140,7 @@ func (c *Client) apiGet(ctx context.Context, path string, params url.Values) (js
 		req.Header["X-Scope-OrgID"] = []string{c.orgID}
 	}
 
+	httpcount.Observe(ctx)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("prometheus request: %w", err)

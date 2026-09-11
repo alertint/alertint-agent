@@ -56,6 +56,7 @@ import (
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/rules"
 	"github.com/alertint/alertint-agent/internal/sentry"
+	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/internal/zabbix"
 	"github.com/alertint/alertint-agent/packs"
@@ -453,7 +454,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	// dependency of its own — corCfg/correlator.New's signature carries none,
 	// and its only path to Acute Triage is via incidentSink{skill: skill}.
 	crt, err := buildControllerRuntime(st, llmClient, llmHealth, skill, cfg.Situations,
-		cfg.Notify.Slack.MinSeverity, cfg.Notify.Slack.RecurrenceMode, owner, auditor, logger)
+		cfg.Notify.Slack.MinSeverity, cfg.Notify.Slack.RecurrenceMode, owner, auditor, logger, configuredPresentationSources(cfg))
 	if err != nil {
 		return err
 	}
@@ -589,6 +590,37 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 	logger.Info("alertint stopped", slog.String("reason", "signal"))
 	return nil
+}
+
+func configuredPresentationSources(cfg *config.Config) []situationmodel.SourceCheck {
+	type source struct {
+		name    string
+		enabled bool
+		present bool
+	}
+	sources := []source{
+		{"Prometheus", cfg.PrometheusEnabled(), cfg.Prometheus.Enabled != nil || cfg.Prometheus.BaseURL != ""},
+		{"Loki", cfg.LogsEnabled(), cfg.Logs.Enabled != nil || cfg.Logs.Loki.BaseURL != ""},
+		{"Changes", cfg.ChangesEnrichmentEnabled(), cfg.Changes.Enrichment.Enabled != nil || cfg.Changes.Ingress.Enabled || cfg.Sentry.Releases.Enabled},
+		{"Sentry", cfg.Sentry.Issues.Enabled, cfg.Sentry.Issues.Enabled},
+		{"Zabbix", cfg.ZabbixAPIEnabled(), cfg.Zabbix.API.Enabled != nil || cfg.Zabbix.API.BaseURL != ""},
+	}
+	out := make([]situationmodel.SourceCheck, 0, len(sources))
+	for _, src := range sources {
+		if !src.present {
+			continue
+		}
+		outcome := situationmodel.SourceCheckConfigured
+		callsKnown := false
+		detail := "Configured; awaiting collection result"
+		if !src.enabled {
+			outcome = situationmodel.SourceCheckSkipped
+			callsKnown = true
+			detail = "Disabled by configuration"
+		}
+		out = append(out, situationmodel.SourceCheck{Source: src.name, Check: "collection", Outcome: outcome, CallsKnown: callsKnown, RecordsKnown: !src.enabled, Detail: detail})
+	}
+	return out
 }
 
 // receiverShutdown is foundationStopSequence's stop-receivers step: a

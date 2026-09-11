@@ -101,6 +101,10 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 	if err != nil {
 		return situation.SnapshotInput{}, err
 	}
+	presentationFacts, err := loadSituationPresentationFactsTx(ctx, tx, sit.ID)
+	if err != nil {
+		return situation.SnapshotInput{}, err
+	}
 
 	prior, err := loadPriorTerminalSituationsTx(ctx, tx, sit.GroupKey, sit.ID)
 	if err != nil {
@@ -152,6 +156,7 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 		Incidents:                   incidents,
 		Analyses:                    analyses,
 		AnalysisCount:               analysisCount,
+		PresentationFacts:           presentationFacts,
 		PriorSituations:             prior,
 		CurrentAssessment:           current,
 		Now:                         now.UTC(),

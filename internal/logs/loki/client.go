@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/httpcount"
 	"github.com/alertint/alertint-agent/internal/logs"
 )
 
@@ -248,6 +249,7 @@ func (c *Client) apiGet(ctx context.Context, path string, params url.Values) (js
 		req.Header["X-Scope-OrgID"] = []string{c.orgID}
 	}
 
+	httpcount.Observe(ctx)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("loki request: %w", err)

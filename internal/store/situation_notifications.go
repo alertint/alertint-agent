@@ -66,14 +66,18 @@ var ErrNewerRootProjectionPending = errors.New("store: a newer root projection i
 // which carries both a broadcast_handoff and a quiet thread_append at the
 // same sequence.
 const (
-	notificationRootFirst  = `(ni.effect_class <> 'root_sync')`
-	notificationClassRank  = `CASE ni.effect_class WHEN 'root_sync' THEN 0 WHEN 'thread_append' THEN 1 ELSE 2 END`
-	notificationQueueOrder = `root_first ASC, transition_sequence ASC, class_rank ASC, id ASC`
+	notificationRootFirst = `(ni.effect_class <> 'root_sync')`
+	notificationClassRank = `CASE ni.effect_class WHEN 'root_sync' THEN 0 WHEN 'thread_append' THEN 1 ELSE 2 END`
+	// A Transition may make analysis and clearance ready atomically. Their
+	// durable reply kinds split the effects; analysis leads when both exist,
+	// while an absent analysis row can never hold recovery.
+	notificationReplyRank  = `CASE ni.reply_kind WHEN 'analysis_completed' THEN 10 WHEN 'partial_clearance' THEN 20 WHEN 'recovery_observed' THEN 30 WHEN 'recovered' THEN 40 ELSE 0 END`
+	notificationQueueOrder = `root_first ASC, transition_sequence ASC, reply_rank ASC, class_rank ASC, id ASC`
 	notificationClaimOrder = `ORDER BY (gap_generation IS NULL) ASC, gap_generation ASC, situation_id ASC, ` + notificationQueueOrder
 	// notificationReloadOrder is notificationClaimOrder expressed directly
 	// against the table (alias ni), for the post-claim reload.
 	notificationReloadOrder = `ORDER BY (ni.gap_generation IS NULL) ASC, ni.gap_generation ASC, ni.situation_id ASC, ` +
-		notificationRootFirst + ` ASC, ni.transition_sequence ASC, ` + notificationClassRank + ` ASC, ni.id ASC`
+		notificationRootFirst + ` ASC, ni.transition_sequence ASC, ` + notificationReplyRank + ` ASC, ` + notificationClassRank + ` ASC, ni.id ASC`
 )
 
 // validateNotificationClaim rejects a claim that cannot fence anything.
@@ -262,13 +266,14 @@ const notificationClaimRankingQuery = `
 			       ni.transition_sequence AS transition_sequence,
 			       ` + notificationRootFirst + ` AS root_first,
 			       ` + notificationClassRank + ` AS class_rank,
+			       ` + notificationReplyRank + ` AS reply_rank,
 			       (ni.status = 'pending') AS claimable,
 			       (ni.claim_owner IS NULL OR ni.lease_expires_at <= ?) AS unleased,
 			       (ni.retry_at IS NULL OR ni.retry_at <= ?) AS due,
 			       (ni.requires_root = 0 OR (s.slack_channel IS NOT NULL AND s.slack_root_ts IS NOT NULL)) AS root_ready,
 			       ROW_NUMBER() OVER (
 			           PARTITION BY ni.situation_id
-			           ORDER BY ` + notificationRootFirst + ` ASC, ni.transition_sequence ASC, ` + notificationClassRank + ` ASC, ni.id ASC
+			           ORDER BY ` + notificationRootFirst + ` ASC, ni.transition_sequence ASC, ` + notificationReplyRank + ` ASC, ` + notificationClassRank + ` ASC, ni.id ASC
 			       ) AS rn
 			FROM notification_intents ni
 			LEFT JOIN situations s ON s.id = ni.situation_id
@@ -891,8 +896,12 @@ func transitionConveysAssurance(tr situationmodel.Transition) bool {
 // check, so the two can never drift apart.
 func assuranceOvertakenBy(kind situationmodel.CandidateKind) (string, bool) {
 	switch kind { //nolint:exhaustive // every other candidate kind leaves the start assurance's own claim untouched; the default is the answer for all of them.
+	case situationmodel.CandidateFirstExecutionAssurance:
+		return SupersessionReasonProgress, true
 	case situationmodel.CandidateTerminalEnd:
 		return SupersessionReasonTerminalEnd, true
+	case situationmodel.CandidateAllClear:
+		return SupersessionReasonRecovery, true
 	case situationmodel.CandidateUsefulFinding, situationmodel.CandidateInconclusiveCompletion:
 		return SupersessionReasonFinding, true
 	default:
@@ -1167,6 +1176,8 @@ func removeString(list []string, s string) []string {
 // SupersessionReasonNewerRootProjection is for a superseded root_sync.
 const (
 	SupersessionReasonFinding     = "superseded_by_finding"
+	SupersessionReasonProgress    = "superseded_by_progress"
+	SupersessionReasonRecovery    = "superseded_by_recovery"
 	SupersessionReasonTerminalEnd = "superseded_by_terminal_end"
 )
 
@@ -1203,10 +1214,33 @@ func supersedeObsoleteAssuranceTx(ctx context.Context, tx *sql.Tx, situationID s
 	if history == nil {
 		return nil
 	}
-	var overtakingTransitionID, reason string
-	var overtakingSequence int
+	overtakingTransitionID, overtakingSequence, reason := assuranceOvertakingTransition(history.Transitions)
+	correlationOnly := overtakingTransitionID == ""
+	if correlationOnly {
+		overtakingTransitionID, overtakingSequence = correlationOvertakingTransition(history.Transitions)
+		reason = SupersessionReasonProgress
+	}
+	if overtakingTransitionID == "" {
+		return nil
+	}
+
+	replacementID := notificationReplacementIntentID(history.Intents, overtakingTransitionID, correlationOnly)
+	if replacementID == "" {
+		return nil
+	}
+
+	obsolete, err := obsoleteTransientIntentIDsTx(ctx, tx, situationID, overtakingSequence, correlationOnly)
+	if err != nil {
+		return err
+	}
+	return supersedeNotificationIntentIDsTx(ctx, tx, situationID, replacementID, reason, obsolete)
+}
+
+func assuranceOvertakingTransition(transitions []situationmodel.Transition) (string, int, string) {
+	var transitionID, reason string
+	var sequence int
 outer:
-	for _, tr := range history.Transitions {
+	for _, tr := range transitions {
 		if tr.Projection.OperatorDelta == nil {
 			continue
 		}
@@ -1216,34 +1250,65 @@ outer:
 				continue
 			}
 			if overtakes == SupersessionReasonTerminalEnd {
-				overtakingTransitionID, overtakingSequence, reason = tr.ID, tr.Sequence, overtakes
+				transitionID, sequence, reason = tr.ID, tr.Sequence, overtakes
 				break outer
 			}
-			if overtakingTransitionID == "" {
-				overtakingTransitionID, overtakingSequence, reason = tr.ID, tr.Sequence, overtakes
+			if transitionID == "" {
+				transitionID, sequence, reason = tr.ID, tr.Sequence, overtakes
 			}
 		}
 	}
-	if overtakingTransitionID == "" {
-		return nil
-	}
+	return transitionID, sequence, reason
+}
 
-	var replacementID string
-	for _, in := range history.Intents {
-		if in.TransitionID != nil && *in.TransitionID == overtakingTransitionID &&
+func correlationOvertakingTransition(transitions []situationmodel.Transition) (string, int) {
+	for _, tr := range transitions {
+		b := tr.Projection.Briefing
+		if b == nil || b.Flow == nil || b.Flow.CorrelationClosesAt == nil ||
+			tr.CreatedAt.Before(*b.Flow.CorrelationClosesAt) || b.Work.Phase == situationmodel.WorkPhaseCollecting {
+			continue
+		}
+		return tr.ID, tr.Sequence
+	}
+	return "", 0
+}
+
+func notificationReplacementIntentID(intents []situationmodel.NotificationIntent, transitionID string, allowRoot bool) string {
+	for _, in := range intents {
+		if in.TransitionID != nil && *in.TransitionID == transitionID &&
 			(in.EffectClass == situationmodel.EffectThreadAppend || in.EffectClass == situationmodel.EffectBroadcastHandoff) {
-			replacementID = in.ID
-			break
+			return in.ID
 		}
 	}
-	if replacementID == "" {
-		return nil
+	if allowRoot {
+		for _, in := range intents {
+			if in.TransitionID != nil && *in.TransitionID == transitionID && in.EffectClass == situationmodel.EffectRootSync {
+				return in.ID
+			}
+		}
 	}
+	return ""
+}
 
-	obsolete, err := liveTransientAssuranceIntentIDsTx(ctx, tx, situationID, overtakingSequence)
-	if err != nil {
-		return err
+func obsoleteTransientIntentIDsTx(ctx context.Context, tx *sql.Tx, situationID string, beforeSequence int, correlationOnly bool) ([]string, error) {
+	var assurances []string
+	if !correlationOnly {
+		var err error
+		assurances, err = liveTransientAssuranceIntentIDsTx(ctx, tx, situationID, beforeSequence)
+		if err != nil {
+			return nil, err
+		}
 	}
+	correlations, err := liveTransientCorrelationIntentIDsTx(ctx, tx, situationID, beforeSequence)
+	if err != nil {
+		return nil, err
+	}
+	obsolete := make([]string, 0, len(assurances)+len(correlations))
+	obsolete = append(obsolete, assurances...)
+	return append(obsolete, correlations...), nil
+}
+
+func supersedeNotificationIntentIDsTx(ctx context.Context, tx *sql.Tx, situationID, replacementID, reason string, obsolete []string) error {
 	args := []any{reason, replacementID, situationID, replacementID}
 	placeholders := ""
 	for _, id := range obsolete {
@@ -1271,4 +1336,25 @@ outer:
 		return fmt.Errorf("store: supersede obsolete assurance: %w", err)
 	}
 	return nil
+}
+
+func liveTransientCorrelationIntentIDsTx(ctx context.Context, tx *sql.Tx, situationID string, beforeSequence int) ([]string, error) {
+	query := `SELECT id FROM notification_intents
+		WHERE situation_id = ? AND effect_class = 'thread_append'
+		  AND reply_kind = 'correlation_started' AND status IN (` + historyLive + `)`
+	args := []any{situationID}
+	if beforeSequence > 0 {
+		query += ` AND transition_sequence < ?`
+		args = append(args, beforeSequence)
+	}
+	query += ` ORDER BY transition_sequence ASC, id ASC`
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: query live correlation replies: %w", err)
+	}
+	ids, err := scanStringRows(rows)
+	if err != nil {
+		return nil, fmt.Errorf("store: read live correlation reply ids: %w", err)
+	}
+	return ids, nil
 }

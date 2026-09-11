@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -24,7 +25,7 @@ func loadSituationAnalysesTx(ctx context.Context, tx *sql.Tx, id string) ([]mode
 	rows, err := tx.QueryContext(ctx, `
  SELECT i.id, substr(COALESCE(i.summary,''),1,181), COALESCE(i.root_cause,''),
    (SELECT json_group_array(value) FROM (
-     SELECT substr(value,1,401) AS value FROM json_each(CASE WHEN json_valid(i.output_json) THEN i.output_json ELSE '{}' END, '$.correlation_findings')
+	 SELECT value FROM json_each(CASE WHEN json_valid(i.output_json) THEN i.output_json ELSE '{}' END, '$.correlation_findings')
      WHERE type='text' LIMIT 3)),
    substr(COALESCE(json_extract(CASE WHEN json_valid(i.enrichment_json) THEN i.enrichment_json ELSE '{}' END,'$.verification.outcome'),''),1,40),
    substr(COALESCE(json_extract(CASE WHEN json_valid(i.enrichment_json) THEN i.enrichment_json ELSE '{}' END,'$.verification.degradation_reason'),''),1,101),
@@ -235,6 +236,9 @@ func selectedLogSamples(raw string) []string {
 	if json.Unmarshal([]byte(raw), &envelope) != nil || envelope.Logs.Outcome != "fetched" {
 		return nil
 	}
+	sort.SliceStable(envelope.Logs.Lines, func(i, j int) bool {
+		return diagnosticLogScore(envelope.Logs.Lines[i].Line) > diagnosticLogScore(envelope.Logs.Lines[j].Line)
+	})
 	var out []string
 	seen := map[string]bool{}
 	for _, line := range envelope.Logs.Lines {
@@ -252,6 +256,16 @@ func selectedLogSamples(raw string) []string {
 		}
 	}
 	return out
+}
+
+func diagnosticLogScore(line string) int {
+	line = strings.ToLower(line)
+	for _, signal := range []string{"connection refused", "invalid token", "failed", "failure", "error", "exception", "timeout", "unavailable", "denied", "panic"} {
+		if strings.Contains(line, signal) {
+			return 1
+		}
+	}
+	return 0
 }
 
 // Inventory describes the recorded collection, never its completeness or cause.

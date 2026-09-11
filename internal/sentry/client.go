@@ -22,6 +22,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/alertint/alertint-agent/internal/httpcount"
 )
 
 // defaultTimeout matches the Prometheus/Loki clients.
@@ -198,6 +200,7 @@ func (c *Client) doGET(ctx context.Context, path string, query url.Values) (*htt
 		}
 		req.Header.Set("Authorization", c.authHeader)
 
+		httpcount.Observe(ctx)
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("sentry request: %w", err)

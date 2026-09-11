@@ -132,6 +132,85 @@ func TestBriefingSelectionReportsTotalCompletedAnalyses(t *testing.T) {
 	}
 }
 
+func TestCanonicalFlowLoadsDurableTimingUsageAndSourceOutcomes(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	first := time.Date(2026, 9, 11, 13, 27, 0, 0, time.UTC)
+	sid := seedReconcileSituation(t, st, "environment=lab,service=payment", first)
+	started, completed := first.Add(30*time.Second), first.Add(50*time.Second)
+
+	mustExecPresentation(t, st, ctx, `UPDATE incidents SET status='analyzed', summary='Payment failures', enrichment_json=?, last_judged_at=? WHERE id=?`,
+		`{"analysis_usage":{"calls":1,"calls_known":true,"input_tokens":120,"input_tokens_known":true,"output_tokens":30,"output_tokens_known":true},"metrics":{"outcome":"empty","snapshots":[],"request_attempts":2,"request_attempts_known":true},"logs":{"source":"loki","outcome":"failed","request_attempts":3,"request_attempts_known":true},"changes":{"outcome":"fetched","changes":[{}]},"verification":{"rounds":[{"queries":[{"kind":"promql","why":"errors by tier","outcome":"empty","request_attempts":1,"request_attempts_known":true}]}]}}`, canonicalTime(completed), "inc-environment=lab,service=payment")
+	mustExecPresentation(t, st, ctx, `INSERT INTO incident_triage_attempts
+		(id,incident_id,attempt_number,situation_id,decision_input_version,membership_digest,incident_input_digest,member_delivery_ids_json,started_at,result_code,output_digest,completed_at)
+		VALUES ('flow-attempt',?,1,?,1,'m','i','[]',?,'success','out',?)`, "inc-environment=lab,service=payment", sid, canonicalTime(started), canonicalTime(completed))
+	secondStarted, secondCompleted := first.Add(60*time.Second), first.Add(70*time.Second)
+	mustExecPresentation(t, st, ctx, `INSERT INTO incident_triage_attempts
+		(id,incident_id,attempt_number,situation_id,decision_input_version,membership_digest,incident_input_digest,member_delivery_ids_json,started_at,result_code,output_digest,completed_at)
+		VALUES ('flow-attempt-2',?,2,?,1,'m','i','[]',?,'success','out2',?)`, "inc-environment=lab,service=payment", sid, canonicalTime(secondStarted), canonicalTime(secondCompleted))
+
+	claim := claimSituation(t, st, sid, "canonical-flow", completed)
+	in, err := st.LoadReconciliationInput(ctx, claim, completed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := situation.BuildOperatorBriefing(in, model.LifecycleActive)
+	if b.Flow == nil {
+		t.Fatal("new projection omitted canonical flow facts")
+	}
+	if !b.Flow.FirstReceivedAt.Equal(first) || b.Flow.InvestigationStartedAt == nil || !b.Flow.InvestigationStartedAt.Equal(started) || b.Flow.InvestigationCompletedAt == nil || !b.Flow.InvestigationCompletedAt.Equal(secondCompleted) || b.Flow.InvestigationRuntimeSeconds == nil || *b.Flow.InvestigationRuntimeSeconds != 30 {
+		t.Fatalf("timing facts = %+v", b.Flow)
+	}
+	if u := b.Flow.AnalysisUsage; !u.CallsKnown || u.Calls != 1 || !u.InputTokensKnown || u.InputTokens != 120 || !u.OutputTokensKnown || u.OutputTokens != 30 {
+		t.Fatalf("usage = %+v", u)
+	}
+	assertCanonicalSourceChecks(t, b.Flow.SourceChecks)
+}
+
+func assertCanonicalSourceChecks(t *testing.T, checks []model.SourceCheck) {
+	t.Helper()
+	byCheck := map[string]model.SourceCheck{}
+	for _, check := range checks {
+		byCheck[check.Source+":"+check.Check] = check
+	}
+	for key, outcome := range map[string]model.SourceCheckOutcome{"Prometheus:collection": model.SourceCheckEmpty, "Loki:collection": model.SourceCheckFailed, "Changes:collection": model.SourceCheckReturned, "Prometheus:errors by tier": model.SourceCheckEmpty} {
+		if got, ok := byCheck[key]; !ok || got.Outcome != outcome {
+			t.Errorf("%s = %+v", key, got)
+		}
+	}
+	if got := byCheck["Prometheus:collection"]; !got.CallsKnown || got.Calls != 2 || !got.RecordsKnown || got.Records != 0 || got.Unit != "snapshots" {
+		t.Errorf("empty metrics accounting = %+v", got)
+	}
+	if got := byCheck["Loki:collection"]; !got.CallsKnown || got.Calls != 3 || got.RecordsKnown {
+		t.Errorf("failed logs fabricated counts = %+v", got)
+	}
+	if got := byCheck["Prometheus:errors by tier"]; !got.CallsKnown || got.Calls != 1 || got.RecordsKnown {
+		t.Errorf("verification accounting = %+v", got)
+	}
+}
+
+func mustExecPresentation(t *testing.T, st *Store, ctx context.Context, query string, args ...any) {
+	t.Helper()
+	if _, err := st.db.ExecContext(ctx, query, args...); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCanonicalFlowKeepsUnknownUsageUnknown(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 11, 13, 27, 0, 0, time.UTC)
+	sid := seedReconcileSituation(t, st, "usage-unknown", now)
+	claim := claimSituation(t, st, sid, "usage-unknown", now)
+	in, err := st.LoadReconciliationInput(context.Background(), claim, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := situation.BuildOperatorBriefing(in, model.LifecycleActive).Flow.AnalysisUsage
+	if u.CallsKnown || u.InputTokensKnown || u.OutputTokensKnown {
+		t.Fatalf("unknown tokens inferred as zero: %+v", u)
+	}
+}
+
 // B0 compatibility port: the coherent load carries each immutable delivery's
 // already-decoded labels into situation.Delivery.Labels (the same row
 // Severity/Drill are read from), so the briefing can name scope and alerts
@@ -844,7 +923,7 @@ func TestOperatorUsefulnessSelectsActualLogSamples(t *testing.T) {
 	st := newTestStore(t)
 	now := time.Date(2026, 9, 7, 10, 0, 0, 0, time.UTC)
 	sid := newSituationForGroup(t, st, "log-samples", now)
-	_, err := st.db.ExecContext(context.Background(), `UPDATE incidents SET status='analyzed',summary='Errors',root_cause='Possible token failure',output_json='{"correlation_findings":["all users failing"]}',enrichment_json=?,last_judged_at=? WHERE id='inc-log-samples'`, `{"logs":{"outcome":"fetched","query":"PRIVATE_QUERY","lines":[{"timestamp":"2026-09-07T10:00:00Z","line":"Payment request failed. Invalid token."}]}}`, now.Format(time.RFC3339Nano))
+	_, err := st.db.ExecContext(context.Background(), `UPDATE incidents SET status='analyzed',summary='Errors',root_cause='Possible token failure',output_json='{"correlation_findings":["all users failing"]}',enrichment_json=?,last_judged_at=? WHERE id='inc-log-samples'`, `{"logs":{"outcome":"fetched","query":"PRIVATE_QUERY","lines":[{"timestamp":"2026-09-07T10:00:02Z","line":"Order placed"},{"timestamp":"2026-09-07T10:00:01Z","line":"Confirmation email sent"},{"timestamp":"2026-09-07T10:00:00Z","line":"Payment request failed. Invalid token."}]}}`, now.Format(time.RFC3339Nano))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -859,6 +938,9 @@ func TestOperatorUsefulnessSelectsActualLogSamples(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), "Payment request failed. Invalid token.") || strings.Contains(string(raw), "PRIVATE_QUERY") {
 		t.Fatal(string(raw))
+	}
+	if len(in.Analyses[0].Observations) != 2 || !strings.Contains(in.Analyses[0].Observations[0], "failed") {
+		t.Fatalf("diagnostic samples were not prioritized: %v", in.Analyses[0].Observations)
 	}
 	first := in.Analyses[0].EvidenceFingerprint
 	_, err = st.db.ExecContext(context.Background(), `UPDATE incidents SET enrichment_json=replace(enrichment_json,'Invalid token.','Gateway timeout.') WHERE id='inc-log-samples'`)

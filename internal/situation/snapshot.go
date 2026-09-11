@@ -21,8 +21,11 @@ type SnapshotInput struct {
 	Deliveries []Delivery
 	Incidents  []IncidentState
 	// Analyses is publication-only prose; BuildSnapshot and all L2 hashes ignore it.
-	Analyses          []model.IncidentAnalysis
-	AnalysisCount     int // completed analyses before the bounded selection
+	Analyses      []model.IncidentAnalysis
+	AnalysisCount int // completed analyses before the bounded selection
+	// PresentationFacts is loaded from immutable attempt/call ledgers and
+	// persisted enrichment in the same transaction as the rest of this input.
+	PresentationFacts PresentationFacts
 	PriorSituations   []CompletedSituation
 	CurrentAssessment *AuthoritativeAssessment
 	Now               time.Time
@@ -94,6 +97,16 @@ type SnapshotInput struct {
 	// Transition/summary snapshot. Forwarded unchanged into
 	// PublicationInput.DeliveredHistory by buildHistory.
 	DeliveredHistory DeliveredHistory
+}
+
+// PresentationFacts contains only durable publication facts. Unknown values
+// retain explicit knownness in their model types rather than becoming zero.
+type PresentationFacts struct {
+	InvestigationStartedAt      *time.Time
+	InvestigationCompletedAt    *time.Time
+	InvestigationRuntimeSeconds *int64
+	AnalysisUsage               model.AnalysisUsage
+	SourceChecks                []model.SourceCheck
 }
 
 // ControllerParkedState is SnapshotInput's own read of the Situation's

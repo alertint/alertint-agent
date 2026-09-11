@@ -425,6 +425,11 @@ type ControllerConfig struct {
 	// Transition still exists and still edits the root's count. Neither
 	// ever re-pages the channel.
 	RecurrenceMode string
+
+	// PresentationSources is the process configuration snapshot used only to
+	// describe which evidence collectors are configured or explicitly skipped.
+	// Recorded collection results loaded from the store take precedence.
+	PresentationSources []model.SourceCheck
 }
 
 // Recurrence modes — the accepted values of notify.slack.recurrence_mode.
@@ -1510,6 +1515,7 @@ func (c *Controller) commit(ctx context.Context, claim Claim, basis historyBasis
 // durable history at all: a non-material reconciliation with no pending
 // operator artifact and no R4 deadline refresh due.
 func (c *Controller) buildHistory(claim Claim, basis historyBasis, commit ControllerCommit) (*HistoryCommit, error) {
+	basis.In.PresentationFacts.SourceChecks = mergePresentationSourceChecks(c.cfg.PresentationSources, basis.In.PresentationFacts.SourceChecks)
 	change := authoritativeChangeOf(claim, basis, commit)
 	publication := PublicationInput{
 		Situation:                   change.Situation,

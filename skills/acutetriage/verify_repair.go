@@ -180,7 +180,7 @@ func (s *Skill) repairModelPromQL(ctx context.Context, incidentID string, querie
 	// capability is reported in /health but never drives the rolled-up state
 	// (see llmhealth.CapabilityQueryRepair).
 	obs := s.cfg.Health.Begin(llmhealth.CapabilityQueryRepair, incidentID)
-	comp, callErr := s.llm.Complete(ctx, verificationRepairSystem, llm.Prompt{
+	comp, callErr := completeWithAnalysisUsage(ctx, s.llm, verificationRepairSystem, llm.Prompt{
 		Prefix:          repairPrompt(issues),
 		MaxOutputTokens: verificationRepairMaxOutputTokens,
 	}, []string{"queries"})

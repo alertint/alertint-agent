@@ -322,6 +322,9 @@ func operatorWorkBlocked(c model.ActionContract) bool {
 }
 
 func renderBriefingRoot(in SituationRootInput) RenderedMessage {
+	if in.Summary.Briefing.Flow != nil {
+		return renderCanonicalRoot(in)
+	}
 	b := in.Summary.Briefing
 	t := in.SourceTransition
 	orientation := situation.DeriveOrientation(in.Summary, t)
@@ -444,6 +447,7 @@ func briefingExecutionClaimed(t model.Transition) bool {
 // investigation in flight renders exactly as it always did.
 type SituationReplyInput struct {
 	Transition          model.Transition
+	ReplyKind           model.NotificationReplyKind
 	ExecutionSuperseded bool
 }
 
@@ -457,7 +461,7 @@ type SituationReplyInput struct {
 // RenderSituationJournal remains the entry point for every caller with no
 // delivery-time answer to give.
 func RenderSituationReply(in SituationReplyInput) (RenderedMessage, error) {
-	return renderJournalEntry(in.Transition, in.ExecutionSuperseded)
+	return renderJournalEntryKind(in.Transition, in.ExecutionSuperseded, string(in.ReplyKind))
 }
 
 // briefingJournal renders one reply from its Transition alone, exactly as
@@ -472,6 +476,9 @@ func briefingJournal(t model.Transition) (string, string) {
 // reply cannot derive from its own row: whether the automatic execution its
 // contract describes has since been overtaken. See SituationReplyInput.
 func briefingJournalPresented(t model.Transition, executionSuperseded bool) (string, string) {
+	if t.Projection.Briefing.Flow != nil {
+		return canonicalBriefingJournal(t, "", executionSuperseded)
+	}
 	b := t.Projection.Briefing
 	headline := ""
 	switch t.Lifecycle {

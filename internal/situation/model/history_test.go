@@ -53,6 +53,15 @@ func TestTransitionRelatedEnumsValidate(t *testing.T) {
 			bogus: EffectClass("bogus"),
 		},
 		{
+			name: "NotificationReplyKind",
+			valid: []enumValidator{
+				ReplyLegacy, ReplyCorrelationStarted, ReplyInvestigationStarted,
+				ReplyAnalysisCompleted, ReplyPartialClearance, ReplyRecoveryObserved,
+				ReplyRecovered,
+			},
+			bogus: NotificationReplyKind("bogus"),
+		},
+		{
 			name:  "IntentStatus",
 			valid: []enumValidator{IntentPending, IntentDelivered, IntentBlockedConfiguration, IntentFailed, IntentWithheld, IntentSuperseded},
 			bogus: IntentStatus("bogus"),

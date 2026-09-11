@@ -23,6 +23,7 @@ import (
 // reserved for a source state this tree cannot observe and is always 0.
 func BuildOperatorBriefing(in SnapshotInput, lifecycle model.Lifecycle) *model.OperatorBriefing {
 	b := &model.OperatorBriefing{Historical: lifecycle != model.LifecycleActive, BlockedReason: in.ControllerParked.Reason, AssessmentRetryAt: in.Situation.RetryAt}
+	b.Flow = buildOperatorFlow(in)
 	scopes, symptoms := map[string]bool{}, map[string]bool{}
 	displayScopes := map[string]bool{}
 	states := briefingAlertStates(in.Deliveries)
@@ -164,7 +165,8 @@ func newBriefingAlert(id, state string, labels map[string]string) briefingAlertC
 			context = append(context, value)
 		}
 	}
-	return briefingAlertCandidate{alert: model.BriefingAlert{ID: id, Name: name, State: state}, context: strings.Join(context, " · ")}
+	joinedContext := strings.Join(context, " · ")
+	return briefingAlertCandidate{alert: model.BriefingAlert{ID: id, Name: name, Service: briefingLabel(labels["service"], 80), Context: briefingLabel(joinedContext, 240), State: state}, context: joinedContext}
 }
 
 func selectBriefingAlerts(candidates []briefingAlertCandidate) ([]model.BriefingAlert, int) {
@@ -173,11 +175,8 @@ func selectBriefingAlerts(candidates []briefingAlertCandidate) ([]model.Briefing
 		names[c.alert.Name]++
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].alert.ID < candidates[j].alert.ID })
-	var alerts []model.BriefingAlert
-	for i, c := range candidates {
-		if i == 8 {
-			return alerts, len(candidates) - 8
-		}
+	alerts := make([]model.BriefingAlert, 0, len(candidates))
+	for _, c := range candidates {
 		if names[c.alert.Name] > 1 && c.context != "" {
 			c.alert.Name += " (" + c.context + ")"
 		}
@@ -185,6 +184,81 @@ func selectBriefingAlerts(candidates []briefingAlertCandidate) ([]model.Briefing
 		alerts = append(alerts, c.alert)
 	}
 	return alerts, 0
+}
+
+func buildOperatorFlow(in SnapshotInput) *model.OperatorFlow {
+	flow := &model.OperatorFlow{
+		FirstReceivedAt:             in.Situation.FirstReceivedAt.UTC(),
+		CorrelationOpenedAt:         in.Situation.FirstReceivedAt.UTC(),
+		GroupKey:                    briefingLabel(in.Situation.GroupKey, 500),
+		GroupingRule:                groupingRuleDescription(in.Situation.GroupKey),
+		InvestigationStartedAt:      briefingTimePtr(in.PresentationFacts.InvestigationStartedAt),
+		InvestigationCompletedAt:    briefingTimePtr(in.PresentationFacts.InvestigationCompletedAt),
+		InvestigationRuntimeSeconds: int64Ptr(in.PresentationFacts.InvestigationRuntimeSeconds),
+		AnalysisUsage:               in.PresentationFacts.AnalysisUsage,
+		SourceChecks:                append([]model.SourceCheck(nil), in.PresentationFacts.SourceChecks...),
+	}
+	for _, inc := range in.Incidents {
+		if inc.ReadyAt.IsZero() {
+			continue
+		}
+		at := inc.ReadyAt.UTC()
+		if flow.CorrelationClosesAt == nil || at.Before(*flow.CorrelationClosesAt) {
+			flow.CorrelationClosesAt = &at
+		}
+	}
+	return flow
+}
+
+func int64Ptr(in *int64) *int64 {
+	if in == nil {
+		return nil
+	}
+	v := *in
+	return &v
+}
+
+func briefingTimePtr(in *time.Time) *time.Time {
+	if in == nil {
+		return nil
+	}
+	at := in.UTC()
+	return &at
+}
+
+func groupingRuleDescription(groupKey string) string {
+	var keys []string
+	for _, part := range strings.Split(groupKey, ",") {
+		if key, _, ok := strings.Cut(strings.TrimSpace(part), "="); ok && strings.TrimSpace(key) != "" {
+			keys = append(keys, strings.TrimSpace(key))
+		}
+	}
+	if len(keys) == 0 {
+		return "Configured receiver grouping"
+	}
+	sort.Strings(keys)
+	return "Same configured " + strings.Join(keys, " and ")
+}
+
+func mergePresentationSourceChecks(configured, recorded []model.SourceCheck) []model.SourceCheck {
+	recordedIdentity := make(map[string]bool, len(recorded))
+	for _, check := range recorded {
+		recordedIdentity[check.Source+"\x00"+check.Check] = true
+	}
+	var out []model.SourceCheck
+	for _, check := range configured {
+		if !recordedIdentity[check.Source+"\x00"+check.Check] {
+			out = append(out, check)
+		}
+	}
+	out = append(out, recorded...)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Source != out[j].Source {
+			return out[i].Source < out[j].Source
+		}
+		return out[i].Check < out[j].Check
+	})
+	return out
 }
 
 func briefingDisplayScope(labels map[string]string) string {

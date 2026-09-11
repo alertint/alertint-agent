@@ -452,8 +452,8 @@ func TestMaxSchemaVersion(t *testing.T) {
 	// are final and are never edited, so a new migration is the only
 	// sanctioned way to extend them, which is exactly what 0023 does to
 	// 0022's supersession guard.
-	if got != 23 {
-		t.Errorf("MaxSchemaVersion = %d, want 23", got)
+	if got != 25 {
+		t.Errorf("MaxSchemaVersion = %d, want 25", got)
 	}
 }
 

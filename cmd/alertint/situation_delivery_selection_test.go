@@ -82,6 +82,22 @@ func TestSituationDelivererThreadAppendRendersOnlySelectedCandidates(t *testing.
 	dsAssertSelected(t, api)
 }
 
+func TestSituationDelivererCarriesDurableReplyKindToRenderer(t *testing.T) {
+	now := sdMustTime(t, "2026-09-11T10:00:00Z")
+	tr := dsSelectionTransition(t, now)
+	fs := &fakeDelivererStore{transitions: map[string]model.Transition{tr.ID: tr}, rootOK: true}
+	d := NewSituationDeliverer(fs, &fakeSlackAPI{}, "C", func() time.Time { return now })
+	intent := sdThreadIntent(model.EffectThreadAppend, tr.ID, tr.Sequence, now)
+	intent.ReplyKind = model.ReplyAnalysisCompleted
+	reply, err := d.selectedReply(context.Background(), intent, tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.ReplyKind != model.ReplyAnalysisCompleted {
+		t.Fatalf("renderer reply kind = %q, want %q", reply.ReplyKind, model.ReplyAnalysisCompleted)
+	}
+}
+
 // R1/2: the broadcast class renders the same selection — one rule, both
 // delivery classes.
 func TestSituationDelivererBroadcastRendersOnlySelectedCandidates(t *testing.T) {

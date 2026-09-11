@@ -79,11 +79,15 @@ func newControllerRuntime(
 	owner string,
 	auditSink situation.AuditSink,
 	logger *slog.Logger,
+	presentationSources ...[]model.SourceCheck,
 ) *controllerRuntime {
 	if strings.TrimSpace(owner) == "" {
 		panic("cmd/alertint: controller runtime requires a non-empty owner")
 	}
 	controllerCfg, workerCfg := situationsConfigToControllerConfig(cfg, slackInterruptionFloor(slackMinSeverity), recurrenceMode, owner)
+	if len(presentationSources) > 0 {
+		controllerCfg.PresentationSources = append([]model.SourceCheck(nil), presentationSources[0]...)
+	}
 
 	worker := situation.NewControllerWorker(st, st, assessClient, controllerCfg, workerCfg, nil, auditSink, logger)
 
@@ -124,12 +128,13 @@ func buildControllerRuntime(
 	owner string,
 	auditSink situation.AuditSink,
 	logger *slog.Logger,
+	presentationSources ...[]model.SourceCheck,
 ) (*controllerRuntime, error) {
 	assessClient, err := buildAssessmentClient(llmClient)
 	if err != nil {
 		return nil, fmt.Errorf("situation controller: %w", err)
 	}
-	crt := newControllerRuntime(st, assessClient, skill, cfg, slackMinSeverity, recurrenceMode, owner, auditSink, logger)
+	crt := newControllerRuntime(st, assessClient, skill, cfg, slackMinSeverity, recurrenceMode, owner, auditSink, logger, presentationSources...)
 	crt.SetDependencyRecoveryWaker(llmHealthDependencyWaker{tracker: llmHealth, st: st})
 	crt.SetAssessmentHealthObserver(llmHealthAssessmentObserver{tracker: llmHealth})
 	return crt, nil
