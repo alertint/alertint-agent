@@ -120,6 +120,14 @@ func briefingImpact(t model.Transition) string {
 
 func briefingAnalysis(b *model.OperatorBriefing, detailed bool) string {
 	var lines []string
+	for i, alert := range b.Alerts {
+		if i == 3 {
+			break
+		}
+		if alert.SourceSummary != "" {
+			lines = append(lines, "Source report ("+briefingText(alert.Name, 120)+", "+briefingText(alert.State, 20)+"): "+briefingText(alert.SourceSummary, 240))
+		}
+	}
 	if len(b.Analyses) == 0 {
 		if !detailed && len(b.Symptoms) > 0 {
 			lines = append(lines, "*Alerts:* "+briefingSymptoms(b.Symptoms))
@@ -278,16 +286,16 @@ func briefingAction(b *model.OperatorBriefing, t model.Transition) string {
 	}
 	switch {
 	case t.Lifecycle == model.LifecycleClosedUnknown:
-		return "None required from on-call; recovery could not be confirmed."
+		return "No operator action is recorded for on-call; recovery could not be confirmed."
 	case b.Total == 0:
-		return "None required from on-call; the current alert state is unavailable."
+		return "No operator action is recorded for on-call; the current alert state is unavailable."
 	case b.Firing == 0 && b.Unknown == 0:
 		return "None required from on-call; alerts resolved."
 	}
 	// The generic close: true in every remaining state, and — unlike a
 	// work-status claim — it cannot contradict an exhausted or blocked
 	// schedule described elsewhere in the same message.
-	return "None required from on-call; no operator action is recorded."
+	return "No operator action is recorded for on-call."
 }
 
 // briefingRequestSubject names one recorded OperatorAction code in operator

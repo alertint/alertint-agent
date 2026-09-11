@@ -37,7 +37,9 @@ func BuildOperatorBriefing(in SnapshotInput, lifecycle model.Lifecycle) *model.O
 			b.Resolved++
 		}
 		latest := s.latest
-		alerts = append(alerts, newBriefingAlert(id, alertState, latest.Labels))
+		candidate := newBriefingAlert(id, alertState, latest.Labels)
+		candidate.alert.SourceSummary = briefingLabel(latest.SourceSummary, 500)
+		alerts = append(alerts, candidate)
 		if display := briefingDisplayScope(latest.Labels); display != "" {
 			displayScopes[display] = true
 		}

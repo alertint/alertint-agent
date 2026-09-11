@@ -166,6 +166,9 @@ type Delivery struct {
 	// only: no digest, hash, fact, or assessment prompt reads it (see
 	// MaterialFactHash / IncidentInputDigest, which name their own fields).
 	Labels map[string]string
+
+	// SourceSummary is an immutable source annotation, for presentation only.
+	SourceSummary string
 }
 
 // TriageState is Acute Triage's durable per-Incident state, as far as this
@@ -243,7 +246,8 @@ type TriageExecution struct {
 	// nil while the attempt is still in flight (lead decision D, round 2,
 	// 2026-09-09: existing attempt result identity, code and completion/
 	// digest metadata read by the same-transaction loader). Presentation and
-	// completion-provenance input only: no digest, hash, fact or assessment
+	// completion-provenance input, also checked by the triage reuse gate: no
+	// digest, hash, fact or assessment
 	// prompt reads them (TriageState.LatestAttempt remains the acute_finding
 	// fact's own, separately populated source).
 	ResultCode   string

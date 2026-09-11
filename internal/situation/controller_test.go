@@ -401,6 +401,13 @@ func TestBriefingReviewCommittedSkipIsVisibleWithoutChangingAssessmentBasis(t *t
 	in := ctBaseSnapshotInput()
 	in.Now = ctBaseTime.Add(10 * time.Minute)
 	in.Incidents[0].Triage.Phase = "awaiting_decision"
+	// A skip fixture must now carry its own accepted investigation provenance.
+	ids := make([]string, 0, len(in.Deliveries))
+	for _, d := range in.Deliveries {
+		ids = append(ids, d.ID)
+	}
+	at := in.Now.Add(-time.Minute)
+	in.Incidents[0].Triage.LastExecution = &situation.TriageExecution{AttemptID: "accepted-1", ResultCode: "success", OutputDigest: "accepted-digest", CompletedAt: &at, MemberDeliveryIDs: ids, Evidence: &situation.TriageCompletionEvidence{Observations: []string{"Payment errors recorded in logs"}}}
 	snap := situation.BuildSnapshot(in)
 	in.CurrentAssessment = &situation.AuthoritativeAssessment{
 		ID: "assessment-prior", SituationID: "situation-1", InputVersion: 2,

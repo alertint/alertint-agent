@@ -134,6 +134,8 @@ func TestDecideTriageNewIncidentIdentityNeverProvesSkip(t *testing.T) {
 func TestDecideTriageSkipsOnlyWhenTrustworthyAssessmentExactlyCovers(t *testing.T) {
 	now := mustTime(t, "2026-09-01T12:05:00Z")
 	in := triageDecideInput(t)
+	// Coverage reuse requires accepted execution, not merely an assessment.
+	in.Incidents[0].Triage.LastExecution = acceptedExecutionForTest(in)
 	snap := BuildSnapshot(in)
 	prior := trustworthyPriorCovering(t, snap, in)
 	in.CurrentAssessment = &prior
@@ -161,6 +163,8 @@ func TestDecideTriageSkipsOnlyWhenTrustworthyAssessmentExactlyCovers(t *testing.
 func TestDecideTriageDeterministicCleanSkipIsFullyReproducible(t *testing.T) {
 	now := mustTime(t, "2026-09-01T12:05:00Z")
 	in := triageDecideInput(t)
+	// Coverage reuse requires accepted execution, not merely an assessment.
+	in.Incidents[0].Triage.LastExecution = acceptedExecutionForTest(in)
 	snap := BuildSnapshot(in)
 	prior := trustworthyPriorCovering(t, snap, in)
 	in.CurrentAssessment = &prior
@@ -413,4 +417,13 @@ func TestDecideTriageMultipleIncidentsEachJudgedIndependently(t *testing.T) {
 			t.Fatalf("decision for %s = %q, want request (no prior Assessment)", d.IncidentID, d.Decision)
 		}
 	}
+}
+
+func acceptedExecutionForTest(in SnapshotInput) *TriageExecution {
+	at := in.Now.Add(-time.Minute)
+	ids := make([]string, 0, len(in.Deliveries))
+	for _, d := range in.Deliveries {
+		ids = append(ids, d.ID)
+	}
+	return &TriageExecution{AttemptID: "accepted-1", ResultCode: "success", OutputDigest: "accepted-digest", CompletedAt: &at, MemberDeliveryIDs: ids, Evidence: &TriageCompletionEvidence{Observations: []string{"Payment errors recorded in logs"}}}
 }

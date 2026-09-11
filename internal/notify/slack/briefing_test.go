@@ -273,7 +273,7 @@ func TestBriefingRootHonestAnalysisAndIndependentHumanAction(t *testing.T) {
 				// "Add a concrete Action: only when the operator contract
 				// requires one" forbids the health-check ask this assertion
 				// previously demanded.
-				for _, want := range []string{tc.want, "AlertINT:", "Action:", "None required from on-call", "Impact unknown"} {
+				for _, want := range []string{tc.want, "AlertINT:", "Action:", "No operator action is recorded for on-call", "Impact unknown"} {
 					if !strings.Contains(txt, want) {
 						t.Errorf("missing %q: %s", want, txt)
 					}

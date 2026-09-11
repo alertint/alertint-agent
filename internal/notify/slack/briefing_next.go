@@ -124,6 +124,17 @@ func briefingWork(c model.ActionContract, b *model.OperatorBriefing, now time.Ti
 		return step
 	case model.AlertINTActionMonitorSituation:
 		step := "Monitoring alert changes."
+		if b.Work.Phase == model.WorkPhaseCollecting {
+			return "Collecting alert inputs before the investigation decision; monitoring alert changes."
+		}
+		if b.Work.Phase == model.WorkPhaseSettled {
+			switch b.Work.SkipReason {
+			case "prior_coverage":
+				return "Investigation was skipped because the recorded assessment already covered these alert inputs. No investigation retry is scheduled; monitoring alert changes."
+			case "eligibility_policy":
+				return "Investigation was skipped under the recorded eligibility policy. No investigation retry is scheduled; monitoring alert changes."
+			}
+		}
 		if briefingHasUncertainty(b) {
 			step += " No verification retry is recorded."
 		}

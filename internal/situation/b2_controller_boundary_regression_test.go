@@ -110,12 +110,9 @@ func TestB2AssessmentRetryDoesNotFabricateExecution(t *testing.T) {
 	}
 }
 
-// TestB2SameCommitCrashSkipProjectionIsTruthful proves a controller crash
-// strictly after commit, replayed against the "investigation" history
-// scenario, settles into a truthful coverage-reuse skip: no remaining work,
-// the actual "prior_coverage" reason, and ExecutionStarted false (a
-// pre-claim clean skip consumes no attempt).
-func TestB2SameCommitCrashSkipProjectionIsTruthful(t *testing.T) {
+// A recovered assessment must not suppress the first investigation after a
+// controller crash. The real attempt completes and its projection records it.
+func TestB2SameCommitCrashPreservesFirstInvestigation(t *testing.T) {
 	f := newHistoryFixture(t, "b2-same-commit-skip", crashPointCommitControllerAfterCommit, false)
 	defer f.close()
 	scenarioInvestigation().run(f)
@@ -128,8 +125,8 @@ func TestB2SameCommitCrashSkipProjectionIsTruthful(t *testing.T) {
 		t.Fatal("no persisted briefing")
 	}
 	work := v.Summary.Briefing.Work
-	if work.Phase != model.WorkPhaseSettled || work.RemainingIncidents != 0 || work.SkipReason != "prior_coverage" || work.ExecutionStarted {
-		t.Fatalf("untruthful skipped projection: %+v", work)
+	if work.Phase != model.WorkPhaseSettled || work.RemainingIncidents != 0 || work.SkipReason != "" || !work.ExecutionStarted {
+		t.Fatalf("missing completed investigation: %+v", work)
 	}
 }
 

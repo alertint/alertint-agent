@@ -378,7 +378,11 @@ func loadSituationDeliveriesTx(ctx context.Context, tx *sql.Tx, situationID stri
 	rows, err := tx.QueryContext(ctx, `
 		SELECT ad.id, iad.incident_id, ad.alert_id, ad.status, ad.payload_digest,
 		       ad.source_started_at, ad.started_at_basis, ad.source_resolved_at, ad.resolved_at_basis, ad.received_at,
-		       ad.labels_json
+		       ad.labels_json,
+               CASE WHEN json_type(ad.annotations_json, '$.summary') = 'text' AND trim(json_extract(ad.annotations_json, '$.summary')) <> ''
+                    THEN substr(json_extract(ad.annotations_json, '$.summary'), 1, 501)
+                    WHEN json_type(ad.annotations_json, '$.description') = 'text'
+                    THEN substr(json_extract(ad.annotations_json, '$.description'), 1, 501) ELSE '' END
 		FROM situation_incidents si
 		JOIN incident_alert_deliveries iad ON iad.incident_id = si.incident_id
 		JOIN alert_deliveries ad ON ad.id = iad.delivery_id
@@ -395,7 +399,7 @@ func loadSituationDeliveriesTx(ctx context.Context, tx *sql.Tx, situationID stri
 		var status, startedBasis, resolvedBasis, receivedAtStr, labelsJSON string
 		var sourceStarted, sourceResolved sql.NullString
 		if err := rows.Scan(&d.ID, &d.IncidentID, &d.AlertID, &status, &d.PayloadDigest,
-			&sourceStarted, &startedBasis, &sourceResolved, &resolvedBasis, &receivedAtStr, &labelsJSON); err != nil {
+			&sourceStarted, &startedBasis, &sourceResolved, &resolvedBasis, &receivedAtStr, &labelsJSON, &d.SourceSummary); err != nil {
 			return nil, fmt.Errorf("store: scan situation delivery: %w", err)
 		}
 		d.Status = situationmodel.DeliveryStatus(status)

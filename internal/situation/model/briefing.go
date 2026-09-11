@@ -131,9 +131,10 @@ func briefingBound(s string, limit int) string {
 // BriefingAlert keeps stable internal identity separate from bounded readable
 // names. State is firing, resolved or unknown, from the source lifecycle fold.
 type BriefingAlert struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	State string `json:"state"`
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	State         string `json:"state"`
+	SourceSummary string `json:"source_summary,omitempty"`
 }
 
 // OperatorBriefing travels only through the immutable publication projection.
