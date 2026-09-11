@@ -42,5 +42,17 @@ func briefingRootFinding(b *model.OperatorBriefing) string {
 		}
 		return label + " " + briefingComplete(summary) + " Cause not confirmed."
 	}
+	// A retained draft is not a reconciled finding. Its source observation is
+	// still useful independently of the draft's explanation.
+	for _, a := range b.Analyses {
+		if !briefingDraft(a) {
+			continue
+		}
+		for _, o := range a.Observations {
+			if strings.TrimSpace(o) != "" && len(briefingComplete(o)) <= 400 {
+				return "*Observed:* " + briefingComplete(o) + "; " + briefingVerificationLimit(a.VerificationLimit) + "."
+			}
+		}
+	}
 	return ""
 }

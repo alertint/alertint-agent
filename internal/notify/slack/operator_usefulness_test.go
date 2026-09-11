@@ -231,3 +231,17 @@ func TestReadableReplyKeepsActivityWithinSlackBlockBudget(t *testing.T) {
 	}
 	bcBothSurfaces(t, msg, "*AlertINT:*")
 }
+
+func TestReadableRootRetainsObservedFactWhenReviewWasBudgetBlocked(t *testing.T) {
+	b := bcBriefing()
+	b.Analyses = []model.IncidentAnalysis{{Title: "Every gold user fails", Summary: "Unsupported causal draft", Observations: []string{"Log sample at 10:16 UTC: Payment request failed. Invalid token."}, VerificationLimit: "budget_deferred"}}
+	msg, err := RenderSituationRoot(bcRoot(t, model.LifecycleRecovered, model.AttentionUrgent, rsTerminalContract(), b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bcBothSurfaces(t, msg, "Payment request failed. Invalid token.")
+	bcBothSurfaces(t, msg, "verification review")
+	if strings.Contains(msg.Text, "Unsupported causal draft") || strings.Contains(msg.Text, "Every gold user") {
+		t.Fatal(msg.Text)
+	}
+}
