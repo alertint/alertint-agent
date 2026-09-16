@@ -29,6 +29,7 @@ package correlator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -295,10 +296,20 @@ func (c *Correlator) recover(ctx context.Context) error {
 	return nil
 }
 
-// handleAlert places the alert into the correct collecting incident,
-// creating one if none exists yet for this group key.
-// For resolved alerts, links to the most recent incident with matching group key.
+// handleAlert places the alert into the correct incident. Resolved deliveries
+// first revisit every incident that already contains the alert; only an orphan
+// falls through to collecting-window and group-key selection.
 func (c *Correlator) handleAlert(ctx context.Context, a store.Alert) error {
+	if a.Status == "resolved" {
+		handled, err := c.handleResolvedMemberships(ctx, a)
+		if err != nil {
+			return err
+		}
+		if handled {
+			return nil
+		}
+	}
+
 	gk, overrideMiss := c.groupKeySelection(a)
 
 	inc, err := c.st.GetCollectingIncident(ctx, gk)
@@ -381,6 +392,29 @@ func (c *Correlator) handleAlert(ctx context.Context, a store.Alert) error {
 	return nil
 }
 
+// handleResolvedMemberships routes a resolved delivery through its durable
+// memberships before any collecting-window or group-key lookup can attach it
+// elsewhere. Every eligible membership is checked because an alert may
+// legitimately appear in more than one historical incident.
+func (c *Correlator) handleResolvedMemberships(ctx context.Context, a store.Alert) (bool, error) {
+	incidents, err := c.st.ListIncidentsByAlertID(ctx, a.ID)
+	if err != nil {
+		return false, fmt.Errorf("correlator: list alert memberships: %w", err)
+	}
+	if len(incidents) == 0 {
+		return false, nil
+	}
+
+	for i := range incidents {
+		inc := &incidents[i]
+		c.logger.Info("correlator: resolved alert routed through membership", "incident_id", inc.ID, "alert_id", a.ID, "group_key", inc.GroupKey, "status", inc.Status)
+		if inc.Status == "analyzed" || inc.Status == "ready" {
+			c.maybeResolveIncident(ctx, inc, inc.GroupKey)
+		}
+	}
+	return true, nil
+}
+
 // handleResolvedAlert tries to link a resolved alert (which has no collecting
 // incident) to the most recent incident for its group key. Returns (true, nil)
 // when the alert was linked and the caller should return early, (false, nil)
@@ -406,45 +440,25 @@ func (c *Correlator) handleResolvedAlert(ctx context.Context, a store.Alert, gk 
 	return true, nil
 }
 
-// maybeResolveIncident checks whether all alerts in inc are now resolved and,
-// if so, marks the incident resolved and fires the resolution notifier.
+// maybeResolveIncident atomically claims the eligible -> resolved transition
+// only when the incident has members and every member is resolved. The caller
+// that wins the transition owns the recovery notification.
 func (c *Correlator) maybeResolveIncident(ctx context.Context, inc *store.Incident, gk string) {
-	allResolved, checkErr := c.checkAllAlertsResolved(ctx, inc.ID)
-	c.logger.Debug("correlator: resolution check", "incident_id", inc.ID, "all_resolved", allResolved, "err", checkErr)
-	if checkErr != nil {
-		c.logger.Warn("correlator: resolution check failed", "incident_id", inc.ID, "err", checkErr)
+	resolved, resolveErr := c.st.ResolveIncidentIfAllMembersResolved(ctx, inc.ID)
+	if errors.Is(resolveErr, store.ErrNotFound) {
+		c.logger.Debug("correlator: incident not eligible for resolution", "incident_id", inc.ID, "incident_status", inc.Status)
 		return
 	}
-	if !allResolved {
-		return
-	}
-	if markErr := c.st.MarkIncidentResolved(ctx, inc.ID); markErr != nil {
-		c.logger.Warn("correlator: mark incident resolved failed", "incident_id", inc.ID, "incident_status", inc.Status, "err", markErr)
+	if resolveErr != nil {
+		c.logger.Warn("correlator: resolve incident failed", "incident_id", inc.ID, "incident_status", inc.Status, "err", resolveErr)
 		return
 	}
 	c.logger.Info("correlator: incident resolved - all alerts recovered", "incident_id", inc.ID, "group_key", gk)
 	if c.resolutionNotifier != nil {
-		if notifyErr := c.resolutionNotifier.OnIncidentResolved(ctx, *inc); notifyErr != nil {
+		if notifyErr := c.resolutionNotifier.OnIncidentResolved(ctx, *resolved); notifyErr != nil {
 			c.logger.Warn("correlator: resolution notify failed", "incident_id", inc.ID, "err", notifyErr)
 		}
 	}
-}
-
-// checkAllAlertsResolved returns true if all alerts in the incident are resolved.
-func (c *Correlator) checkAllAlertsResolved(ctx context.Context, incidentID string) (bool, error) {
-	alerts, err := c.st.GetIncidentAlerts(ctx, incidentID)
-	if err != nil {
-		return false, err
-	}
-	if len(alerts) == 0 {
-		return false, nil
-	}
-	for _, a := range alerts {
-		if a.Status != "resolved" {
-			return false, nil
-		}
-	}
-	return true, nil
 }
 
 // flushExpired marks every overdue collecting incident as ready, seeds its

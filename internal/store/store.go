@@ -503,6 +503,41 @@ func (s *Store) GetRecentIncidentByGroupKey(ctx context.Context, groupKey string
 	return scanIncidentFull(row)
 }
 
+// ListIncidentsByAlertID returns every incident that already contains alertID,
+// oldest first. The full incident shape lets recovery notifications preserve
+// the finding that belongs to each incident.
+func (s *Store) ListIncidentsByAlertID(ctx context.Context, alertID string) ([]Incident, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT i.id, i.group_key, i.status,
+		       i.first_alert_at, i.last_alert_at, i.ready_at, i.alert_count,
+		       COALESCE(i.summary,''), COALESCE(i.root_cause,''),
+		       COALESCE(i.confidence,0.0), COALESCE(i.output_json,''),
+		       COALESCE(i.enrichment_json,''),
+		       i.created_at, i.updated_at, i.last_judged_at
+		FROM incidents i
+		JOIN incident_alerts ia ON ia.incident_id = i.id
+		WHERE ia.alert_id = ?
+		ORDER BY i.created_at ASC, i.id ASC
+	`, alertID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list incidents by alert id: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var incidents []Incident
+	for rows.Next() {
+		inc, err := scanIncidentFull(rows)
+		if err != nil {
+			return nil, err
+		}
+		incidents = append(incidents, *inc)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: list incidents by alert id rows: %w", err)
+	}
+	return incidents, nil
+}
+
 // MarkIncidentReady transitions an incident from "collecting" to
 // "ready". Returns ErrNotFound if no such collecting incident exists.
 func (s *Store) MarkIncidentReady(ctx context.Context, incidentID string) error {
@@ -851,6 +886,74 @@ func (s *Store) MarkIncidentResolved(ctx context.Context, incidentID string) err
 	}
 
 	return tx.Commit()
+}
+
+// ResolveIncidentIfAllMembersResolved atomically transitions an eligible
+// incident only when it has at least one member and every current member is
+// resolved. It returns the full transitioned incident for the caller that owns
+// the recovery notification. ErrNotFound means the incident was ineligible,
+// still had a firing member, had no members, or another resolver already won.
+func (s *Store) ResolveIncidentIfAllMembersResolved(ctx context.Context, incidentID string) (*Incident, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("store: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	res, err := tx.ExecContext(ctx, `
+		UPDATE incidents
+		SET status     = 'resolved',
+		    updated_at = ?
+		WHERE id = ?
+		  AND status IN ('analyzed','ready')
+		  AND EXISTS (
+		      SELECT 1
+		      FROM incident_alerts ia
+		      WHERE ia.incident_id = incidents.id
+		  )
+		  AND NOT EXISTS (
+		      SELECT 1
+		      FROM incident_alerts ia
+		      JOIN alerts a ON a.id = ia.alert_id
+		      WHERE ia.incident_id = incidents.id
+		        AND a.status != 'resolved'
+		  )
+	`, now, incidentID)
+	if err != nil {
+		return nil, fmt.Errorf("store: resolve incident if all members resolved: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("store: resolve incident if all members resolved rows: %w", err)
+	}
+	if n == 0 {
+		return nil, ErrNotFound
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM incident_triage WHERE incident_id = ? AND phase != 'exhausted'
+	`, incidentID); err != nil {
+		return nil, fmt.Errorf("store: resolve incident if all members resolved: clear triage: %w", err)
+	}
+
+	inc, err := scanIncidentFull(tx.QueryRowContext(ctx, `
+		SELECT id, group_key, status,
+		       first_alert_at, last_alert_at, ready_at, alert_count,
+		       COALESCE(summary,''), COALESCE(root_cause,''),
+		       COALESCE(confidence,0.0), COALESCE(output_json,''),
+		       COALESCE(enrichment_json,''),
+		       created_at, updated_at, last_judged_at
+		FROM incidents
+		WHERE id = ?
+	`, incidentID))
+	if err != nil {
+		return nil, fmt.Errorf("store: resolve incident if all members resolved: load incident: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("store: resolve incident if all members resolved: commit: %w", err)
+	}
+	return inc, nil
 }
 
 // SetAlertRole sets the role column on an incident_alerts row.
