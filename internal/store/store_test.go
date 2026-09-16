@@ -308,6 +308,64 @@ func TestMarkIncidentResolved_RejectsCollecting(t *testing.T) {
 	}
 }
 
+func TestResolveIncidentIfAllMembersResolved(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	id := uuid.NewString()
+	if err := s.InsertIncident(ctx, Incident{
+		ID:           id,
+		GroupKey:     "service=api",
+		FirstAlertAt: now.Add(-time.Minute),
+		LastAlertAt:  now,
+		ReadyAt:      now,
+	}); err != nil {
+		t.Fatalf("insert incident: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE incidents SET status = 'analyzed' WHERE id = ?`, id); err != nil {
+		t.Fatalf("mark analyzed: %v", err)
+	}
+
+	addMember := func(fp, status string) Alert {
+		t.Helper()
+		a := Alert{
+			ID: uuid.NewString(), Fingerprint: fp, Status: status,
+			Labels: map[string]string{"service": "api"}, Annotations: map[string]string{},
+			StartsAt: now, ReceivedAt: now,
+		}
+		stored, err := s.UpsertAlertByFingerprint(ctx, a)
+		if err != nil {
+			t.Fatalf("upsert %s: %v", fp, err)
+		}
+		if err := s.AddAlertToIncident(ctx, id, stored.ID, now); err != nil {
+			t.Fatalf("add %s: %v", fp, err)
+		}
+		return stored
+	}
+	addMember("fp-resolved", "resolved")
+	firing := addMember("fp-firing", "firing")
+
+	if _, err := s.ResolveIncidentIfAllMembersResolved(ctx, id); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("partial recovery = %v, want ErrNotFound", err)
+	}
+	firing.Status = "resolved"
+	firing.ReceivedAt = now.Add(time.Minute)
+	if _, err := s.UpsertAlertByFingerprint(ctx, firing); err != nil {
+		t.Fatalf("resolve final member: %v", err)
+	}
+
+	resolved, err := s.ResolveIncidentIfAllMembersResolved(ctx, id)
+	if err != nil {
+		t.Fatalf("full recovery: %v", err)
+	}
+	if resolved.ID != id || resolved.Status != "resolved" {
+		t.Fatalf("resolved incident = %+v, want id %s with resolved status", resolved, id)
+	}
+	if _, err := s.ResolveIncidentIfAllMembersResolved(ctx, id); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second transition = %v, want ErrNotFound", err)
+	}
+}
+
 // TestIncidentMemberStatusCounts covers the batch recovery-signal query: it
 // tallies member alerts by status per incident in one round trip, omits unknown
 // ids, and handles the empty-id case.

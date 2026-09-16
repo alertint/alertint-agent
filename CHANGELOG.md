@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Resolved alert deliveries now revisit their existing incident memberships
+  before any collecting-window or group-key fallback. An older incident can
+  therefore reach `resolved` even when a newer incident shares its group key;
+  the transition checks every member atomically and only its winner publishes
+  the recovery notification. (#97)
 - Coordinated releases now keep Helm README badge labels, chart tests, and
   release-script fixtures aligned with the current versions, so the release
   metadata commit passes the normal `main` CI checks.
