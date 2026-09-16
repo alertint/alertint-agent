@@ -2,8 +2,8 @@ apiVersion: v2
 name: alertint-agent
 description: AI-powered alert-triage agent that correlates Alertmanager/Zabbix alerts into incidents, enriches them with Mimir/Loki/Sentry evidence, and produces LLM findings.
 type: application
-version: 0.2.1
-appVersion: "0.13.8"
+version: 0.2.2
+appVersion: "0.13.9"
 icon: https://raw.githubusercontent.com/alertint/alertint-agent/main/docs/assets/alertint-logo.svg
 home: https://alertint.com
 sources:
@@ -27,7 +27,7 @@ annotations:
   artifacthub.io/category: monitoring-logging
   artifacthub.io/images: |
     - name: alertint-agent
-      image: ghcr.io/alertint/alertint-agent:v0.13.8
+      image: ghcr.io/alertint/alertint-agent:v0.13.9
   artifacthub.io/links: |
     - name: Documentation
       url: https://alertint.com/docs/
