@@ -387,7 +387,7 @@ func TestRetainedDecisionEvidenceReceivesPermanentReferences(t *testing.T) {
 		t.Fatal(err)
 	}
 	var count int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM situation_observation_references WHERE owner_id='attempt-retained' AND permanent=1`).Scan(&count); err != nil || count != 2 {
+	if err := tx.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM situation_observation_references WHERE owner_id='attempt-retained' AND permanent=1`).Scan(&count); err != nil || count != 2 {
 		t.Fatalf("protected runs=%d err=%v, want2", count, err)
 	}
 }

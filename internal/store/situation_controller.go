@@ -2214,26 +2214,8 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 	// 9. Review F7 (ADR-0051): the decision evidence basis is protected
 	// permanently in this same transaction — a new authoritative attempt,
 	// a lifecycle change, and every Transition each pin the cycle's runs.
-	if commit.PreparationCycleID != "" {
-		commitTime := canonicalCommitTime(commit)
-		if newAssessmentID.Valid {
-			if err := insertPermanentObservationReferencesTx(ctx, tx, commit.PreparationCycleID, ObservationReferenceAssessmentAttempt, newAssessmentID.String, commitTime); err != nil {
-				return err
-			}
-		}
-		if current.Lifecycle != commit.Lifecycle {
-			owner := fmt.Sprintf("%s:v%d:%s", claim.Situation.ID, claim.Situation.InputVersion, commit.Lifecycle)
-			if err := insertPermanentObservationReferencesTx(ctx, tx, commit.PreparationCycleID, ObservationReferenceLifecycleDecision, owner, commitTime); err != nil {
-				return err
-			}
-		}
-		if commit.History != nil {
-			for _, tr := range commit.History.Transitions {
-				if err := insertPermanentObservationReferencesTx(ctx, tx, commit.PreparationCycleID, ObservationReferenceTransition, tr.ID, commitTime); err != nil {
-					return err
-				}
-			}
-		}
+	if err := pinControllerEvidenceTx(ctx, tx, claim, commit, current.Lifecycle, newAssessmentID); err != nil {
+		return err
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -2555,4 +2537,30 @@ func wakeOneDependencyRecoveredSituationTx(ctx context.Context, db *sql.DB, situ
 		return false, fmt.Errorf("store: commit wake dependency-recovered situation: %w", err)
 	}
 	return true, nil
+}
+
+func pinControllerEvidenceTx(ctx context.Context, tx *sql.Tx, claim situation.Claim, commit situation.ControllerCommit, previousLifecycle situationmodel.Lifecycle, newAssessmentID sql.NullString) error {
+	if commit.PreparationCycleID == "" {
+		return nil
+	}
+	commitTime := canonicalCommitTime(commit)
+	if newAssessmentID.Valid {
+		if err := insertPermanentObservationReferencesTx(ctx, tx, commit.PreparationCycleID, ObservationReferenceAssessmentAttempt, newAssessmentID.String, commitTime); err != nil {
+			return err
+		}
+	}
+	if previousLifecycle != commit.Lifecycle {
+		owner := fmt.Sprintf("%s:v%d:%s", claim.Situation.ID, claim.Situation.InputVersion, commit.Lifecycle)
+		if err := insertPermanentObservationReferencesTx(ctx, tx, commit.PreparationCycleID, ObservationReferenceLifecycleDecision, owner, commitTime); err != nil {
+			return err
+		}
+	}
+	if commit.History != nil {
+		for _, tr := range commit.History.Transitions {
+			if err := insertPermanentObservationReferencesTx(ctx, tx, commit.PreparationCycleID, ObservationReferenceTransition, tr.ID, commitTime); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

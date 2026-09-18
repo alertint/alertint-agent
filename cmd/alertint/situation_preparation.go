@@ -782,6 +782,7 @@ func (s *preparationSweep) Stop(ctx context.Context) error {
 // (review F24; plan.md: audit follows the corresponding durable write).
 type auditingPreparationStore struct {
 	*store.Store
+
 	auditor *audit.Auditor
 	logger  *slog.Logger
 }
