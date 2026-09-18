@@ -95,7 +95,7 @@ func TestS5ReplayRecoveryConfirmationStatesGraceWhileWorkIsOutstanding(t *testin
 	r.assertEvent("event 2", out, s5rExpect{
 		lifecycle: "recovery_pending", orientation: "Confirming recovery", transitions: 2, replies: 1,
 		rootMust: []string{
-			"Watching for sustained recovery through " + slackDateToken(grace),
+			"Watching for sustained recovery until " + slackDateToken(grace),
 			"Investigation is queued",
 			slackDateToken(readiness),
 			"Next status check: " + slackDateToken(checkpoint),

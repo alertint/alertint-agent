@@ -725,7 +725,7 @@ func TestS5ReplayDeliveredSequenceRendersEveryCanonicalEvent(t *testing.T) {
 		rootMust: []string{"Investigating 4 alerts for " + s5rScope, "Next status check:"},
 		// The one initial execution assurance: actual investigated count
 		// and names, never a Situation total (slide 4 · running).
-		replyMust: []string{"Investigating 4 alerts for " + s5rScope,
+		replyMust: []string{"Investigating 4 alerts",
 			"PodCrashLooping", "LatencyP99", "HighErrorRate", s5rQueueBacklog},
 	})
 
@@ -737,7 +737,7 @@ func TestS5ReplayDeliveredSequenceRendersEveryCanonicalEvent(t *testing.T) {
 		lifecycle: "active", orientation: "Monitoring", transitions: 3, replies: 1,
 		rootMust: []string{"Pod restarts precede the error-rate spike", "Next status check:"},
 		replyMust: []string{"Pod restarts precede the error-rate spike",
-			"Queue backlog follows the error spike", "Sources and check results:", "Next status check:"},
+			"Queue backlog follows the error spike", "Checks:", "Next status check:"},
 	})
 
 	// Event 4 — 15:11:29 QueueBacklog clears; three remain firing.
@@ -748,8 +748,8 @@ func TestS5ReplayDeliveredSequenceRendersEveryCanonicalEvent(t *testing.T) {
 	r.assertEvent("event 4", ev4, s5rExpect{
 		lifecycle: "active", orientation: "Monitoring", transitions: 4, replies: 1,
 		rootMust: []string{"*Alerts:* 3 firing · 1 resolved", "Next status check:"},
-		replyMust: []string{"*Newly resolved:* " + s5rQueueBacklog,
-			"*Still firing:* HighErrorRate · checkout; LatencyP99 · checkout; PodCrashLooping · checkout"},
+		replyMust: []string{"🔹 " + s5rQueueBacklog + " · checkout · just recovered",
+			"🔸 HighErrorRate · checkout · firing", "🔸 LatencyP99 · checkout · firing", "🔸 PodCrashLooping · checkout · firing"},
 	})
 
 	// Event 5 — 15:13:29 the recorded status checkpoint itself comes due,
@@ -795,8 +795,8 @@ func TestS5ReplayDeliveredSequenceRendersEveryCanonicalEvent(t *testing.T) {
 	r.assertEvent("event 6", ev6, s5rExpect{
 		lifecycle: "recovery_pending", orientation: "Confirming recovery", transitions: 5, replies: 1,
 		rootMust: []string{"*Alerts:* 0 firing · 4 resolved", slackDateToken(grace)},
-		replyMust: []string{"*Newly resolved:* HighErrorRate · checkout; LatencyP99 · checkout; PodCrashLooping · checkout",
-			"*Already resolved:* " + s5rQueueBacklog, slackDateToken(grace)},
+		replyMust: []string{"🔹 HighErrorRate · checkout · just recovered", "🔹 LatencyP99 · checkout · just recovered", "🔹 PodCrashLooping · checkout · just recovered",
+			"🔹 " + s5rQueueBacklog + " · checkout · resolved earlier", slackDateToken(grace)},
 	})
 
 	// Event 7 — 15:15:59 the persisted grace deadline expires. Nothing is
@@ -817,11 +817,11 @@ func TestS5ReplayDeliveredSequenceRendersEveryCanonicalEvent(t *testing.T) {
 	r.assertEvent("event 7", ev7, s5rExpect{
 		lifecycle: "recovered", orientation: "Recovered", transitions: 6, replies: 1,
 		rootMust: []string{"*Alerts:* 0 firing · 4 resolved",
-			"*Total time to confirmed recovery:*", "*Further details via MCP:*"},
+			"Recovery confirmed ·", "*MCP:*"},
 		// Tracking ended: no further automatic check is promised.
 		rootMustNot: []string{"Next status check:"},
-		replyMust: []string{"*Recovery confirmed:* The monitored alerts cleared and did not fire again during the 2m observation period.",
-			"Episode monitoring is complete.", "*Further details via MCP:*"},
+		replyMust: []string{"Alerts stayed clear for 2m. Monitoring ended.",
+			"*MCP:*"},
 	})
 	if seen := r.rendered("event 7 reply", ev7.replies[0]); strings.Contains(seen, "Next status check:") {
 		t.Fatalf("the terminal reply promises another automatic check:\n%s", seen)

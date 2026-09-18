@@ -955,3 +955,29 @@ func TestOperatorUsefulnessSelectsActualLogSamples(t *testing.T) {
 		t.Fatal("changed source sample did not change evidence provenance")
 	}
 }
+
+// Duplicate lookup rationales may collapse only when the executed scope matches.
+func TestPresentationChecksRetainQueryScopeForCompactDisplay(t *testing.T) {
+	raw := `{"verification":{"rounds":[{"at":"2026-09-17T16:52:04Z","queries":[{"kind":"incidents_in_window","params":{"window_minutes":60},"why":"is anything else firing?","outcome":"fetched","result":"same alerts"},{"kind":"incidents_in_window","params":{"window_minutes":60},"why":"Check for other service alerts","outcome":"fetched","result":"same alerts"},{"kind":"incidents_in_window","params":{"window_minutes":10},"why":"Check for other service alerts","outcome":"fetched","result":"same alerts"}]}]}}`
+	checks := presentationSourceChecks(raw)
+	if len(checks) != 3 {
+		t.Fatal(checks)
+	}
+	if checks[0].QueryScope == "" || checks[0].QueryScope != checks[1].QueryScope || checks[0].QueryScope == checks[2].QueryScope {
+		t.Fatal("scope identity does not distinguish windows", checks)
+	}
+	if checks[0].Kind != "incidents_in_window" {
+		t.Fatal("query kind missing")
+	}
+}
+
+func TestPresentationSourceChecksRetainExecutedExpression(t *testing.T) {
+	checks := presentationSourceChecks(`{"verification":{"rounds":[{"queries":[{"kind":"promql","expr":"rate(request_duration_seconds_sum[1m])","why":"Check whether slow requests explain errors","outcome":"empty"}]}]}}`)
+	raw, err := json.Marshal(checks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"query_expr":"rate(request_duration_seconds_sum[1m])"`) {
+		t.Fatalf("lost executed query identity: %s", raw)
+	}
+}
