@@ -4,6 +4,7 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -77,7 +78,7 @@ func loadInvestigationPresentationFactsTx(ctx context.Context, tx *sql.Tx, situa
 }
 
 func loadEnrichmentPresentationFactsTx(ctx context.Context, tx *sql.Tx, situationID string) (usage model.AnalysisUsage, sourceChecks []model.SourceCheck, err error) {
-	rows, err := tx.QueryContext(ctx, `SELECT i.status, COALESCE(i.enrichment_json,'') FROM situation_incidents si JOIN incidents i ON i.id=si.incident_id WHERE si.situation_id=? ORDER BY i.id`, situationID)
+	rows, err := tx.QueryContext(ctx, `SELECT i.id, i.status, COALESCE(i.enrichment_json,'') FROM situation_incidents si JOIN incidents i ON i.id=si.incident_id WHERE si.situation_id=? ORDER BY i.id`, situationID)
 	if err != nil {
 		return usage, nil, fmt.Errorf("store: load presentation sources: %w", err)
 	}
@@ -86,8 +87,8 @@ func loadEnrichmentPresentationFactsTx(ctx context.Context, tx *sql.Tx, situatio
 	usageSeen := false
 	usageUnknown := false
 	for rows.Next() {
-		var status, raw string
-		if err := rows.Scan(&status, &raw); err != nil {
+		var incidentID, status, raw string
+		if err := rows.Scan(&incidentID, &status, &raw); err != nil {
 			return usage, nil, err
 		}
 		if status == "analyzed" || status == "resolved" {
@@ -109,7 +110,10 @@ func loadEnrichmentPresentationFactsTx(ctx context.Context, tx *sql.Tx, situatio
 			}
 		}
 		for _, check := range presentationSourceChecks(raw) {
-			key := check.Source + "\x00" + check.Check + "\x00" + string(check.Outcome) + "\x00" + check.Unit + "\x00" + check.Detail
+			if check.QueryScope != "" {
+				check.QueryScope = incidentID + ":" + check.QueryScope
+			}
+			key := check.QueryScope + "\x00" + check.Source + "\x00" + check.Check + "\x00" + string(check.Outcome) + "\x00" + check.Unit + "\x00" + check.Detail
 			prior, ok := checks[key]
 			if !ok {
 				checks[key] = check
@@ -141,7 +145,13 @@ func loadEnrichmentPresentationFactsTx(ctx context.Context, tx *sql.Tx, situatio
 		if sourceChecks[i].Check != sourceChecks[j].Check {
 			return sourceChecks[i].Check < sourceChecks[j].Check
 		}
-		return sourceChecks[i].Outcome < sourceChecks[j].Outcome
+		if sourceChecks[i].Outcome != sourceChecks[j].Outcome {
+			return sourceChecks[i].Outcome < sourceChecks[j].Outcome
+		}
+		if sourceChecks[i].QueryScope != sourceChecks[j].QueryScope {
+			return sourceChecks[i].QueryScope < sourceChecks[j].QueryScope
+		}
+		return sourceChecks[i].Detail < sourceChecks[j].Detail
 	})
 	return usage, sourceChecks, nil
 }
@@ -197,13 +207,16 @@ func presentationSourceChecks(raw string) []model.SourceCheck {
 		} `json:"zabbix"`
 		Verification *struct {
 			Rounds []struct {
+				At      string `json:"at"`
 				Queries []struct {
-					Kind                 string `json:"kind"`
-					Why                  string `json:"why"`
-					Outcome              string `json:"outcome"`
-					Result               string `json:"result"`
-					RequestAttempts      int    `json:"request_attempts"`
-					RequestAttemptsKnown bool   `json:"request_attempts_known"`
+					Kind                 string         `json:"kind"`
+					Expr                 string         `json:"expr"`
+					Params               map[string]any `json:"params"`
+					Why                  string         `json:"why"`
+					Outcome              string         `json:"outcome"`
+					Result               string         `json:"result"`
+					RequestAttempts      int            `json:"request_attempts"`
+					RequestAttemptsKnown bool           `json:"request_attempts_known"`
 				} `json:"queries"`
 			} `json:"rounds"`
 		} `json:"verification"`
@@ -281,7 +294,8 @@ func presentationSourceChecks(raw string) []model.SourceCheck {
 				}
 				calls, callsKnown := q.RequestAttempts, q.RequestAttemptsKnown
 				detail := boundedSourceDetail(q.Result)
-				out = append(out, model.SourceCheck{Source: source, Check: check, Outcome: sourceOutcome(q.Outcome), Calls: calls, CallsKnown: callsKnown, Detail: detail})
+				scope := presentationQueryScope(round.At, q.Kind, q.Expr, q.Params, q.Result)
+				out = append(out, model.SourceCheck{Kind: q.Kind, QueryScope: scope, QueryExpr: q.Expr, Source: source, Check: check, Outcome: sourceOutcome(q.Outcome), Calls: calls, CallsKnown: callsKnown, Detail: detail})
 			}
 		}
 	}
@@ -327,4 +341,15 @@ func displaySource(source string) string {
 		return "Loki"
 	}
 	return strings.Join(strings.Fields(source), " ")
+}
+
+func presentationQueryScope(at, kind, expr string, params map[string]any, result string) string {
+	if at == "" || (expr == "" && len(params) == 0) {
+		return ""
+	}
+	encoded, err := json.Marshal(params)
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(at+"\x00"+kind+"\x00"+expr+"\x00"+string(encoded)+"\x00"+result)))
 }

@@ -109,14 +109,14 @@ func canonicalFinding(b *model.OperatorBriefing, assessment *model.AssessmentCon
 		}
 		for _, o := range a.Observations {
 			if s := canonicalShort(o, 320); s != "" && canonicalDiagnostic(o) {
-				return s, ""
+				return compactObservation(s), ""
 			}
 		}
 	}
 	if len(b.Analyses) > 0 {
 		for _, a := range b.Alerts {
 			if s := canonicalShort(a.SourceSummary, 300); s != "" {
-				return "Source reported: " + s, ""
+				return "Alert reported: " + s, ""
 			}
 		}
 	}
@@ -137,16 +137,32 @@ func canonicalCauseSupported(a *model.AssessmentConclusion) bool {
 	return a != nil && (a.Causality == model.CausalitySupported || a.Causality == model.CausalityOperatorConfirmed)
 }
 
+func canonicalRevisedTitle(b *model.OperatorBriefing) string {
+	// Use the same completed, reconciled diagnosis as the single-analysis
+	// Finding. Multiple analyses still require a scoped aggregate summary.
+	if len(b.Analyses) != 1 {
+		return ""
+	}
+	a := b.Analyses[0]
+	if a.Verification != "revised" || briefingDraft(a) {
+		return ""
+	}
+	if title := canonicalShort(strings.TrimSpace(a.Title), 180); title != "" {
+		return title
+	}
+	return canonicalShort(a.Summary, 180)
+}
+
 func canonicalSummary(b *model.OperatorBriefing, assessment *model.AssessmentConclusion) string {
+	if title := canonicalRevisedTitle(b); title != "" {
+		return title
+	}
 	_, title := canonicalFinding(b, assessment)
 	if title != "" {
 		return title
 	}
 	for _, a := range b.Alerts {
 		if summary := canonicalShort(a.SourceSummary, 180); summary != "" {
-			if b.Historical {
-				return "Earlier report: " + summary
-			}
 			return summary
 		}
 	}
@@ -175,17 +191,15 @@ func canonicalAlertName(a model.BriefingAlert) string {
 
 func canonicalMembers(b *model.OperatorBriefing) string {
 	var lines []string
-	for _, state := range []string{"firing", "resolved", "unknown"} {
-		var names []string
-		for _, a := range b.Alerts {
-			if a.State == state {
-				names = append(names, briefingComplete(canonicalAlertName(a)))
-			}
+	for _, a := range b.Alerts {
+		symbol, state := "·", "state unavailable"
+		switch a.State {
+		case "firing":
+			symbol, state = "🔸", "firing"
+		case "resolved":
+			symbol, state = "🔹", "resolved"
 		}
-		if len(names) > 0 {
-			label := map[string]string{"firing": "Firing", "resolved": "Resolved", "unknown": "State unavailable"}[state]
-			lines = append(lines, "*"+label+":* "+strings.Join(names, "; "))
-		}
+		lines = append(lines, symbol+" "+briefingComplete(canonicalAlertName(a))+" · "+state)
 	}
 	if b.AlertsOmitted > 0 {
 		lines = append(lines, fmt.Sprintf("%d further alert identities available via MCP.", b.AlertsOmitted))
@@ -292,7 +306,9 @@ func canonicalNext(t model.Transition, b *model.OperatorBriefing, now time.Time)
 		}
 		return "Correlation window closed; investigation is waiting to start."
 	}
-	return briefingNextStep(t, b, t.ActionContract.NextUpdateAt, now)
+	step := briefingNextStep(t, b, t.ActionContract.NextUpdateAt, now)
+	step = strings.Replace(step, "Analysis completed. Monitoring for changes.", "Monitoring alert changes.", 1)
+	return compactRecoveryDeadline(step, t, b)
 }
 
 func renderCanonicalRoot(in SituationRootInput) RenderedMessage {
@@ -306,7 +322,7 @@ func renderCanonicalRoot(in SituationRootInput) RenderedMessage {
 	if b.Unknown > 0 {
 		counts += fmt.Sprintf(" · %d unobserved", b.Unknown)
 	}
-	lines := []string{title, canonicalChain(phase), counts, canonicalMembers(b)}
+	lines := []string{title, canonicalChain(phase)}
 	finding, findingTitle := canonicalFinding(b, t.Projection.Assessment)
 	if len(finding) > 320 {
 		if short := canonicalShort(finding, 320); short != "" {
@@ -317,30 +333,36 @@ func renderCanonicalRoot(in SituationRootInput) RenderedMessage {
 			finding = ""
 		}
 	}
-	if finding != "" {
-		prefix := ""
-		if t.Lifecycle != model.LifecycleActive {
-			prefix = "During the incident: "
+	// A completed diagnosis leads a single-analysis root even when a log
+	// observation is available. Multi-analysis roots retain their scoped finding.
+	if len(b.Analyses) == 1 || finding == "" || strings.HasPrefix(finding, "Alert reported: ") {
+		if workingDiagnosis := canonicalWorkingDiagnosis(b); workingDiagnosis != "" {
+			finding = workingDiagnosis
 		}
-		lines = append(lines, "*Finding:* "+prefix+briefingComplete(finding))
-	} else if !t.Lifecycle.Terminal() && (b.Work.Phase == model.WorkPhaseCollecting || b.Work.Phase == model.WorkPhaseAwaitingDecision || b.Work.Phase == model.WorkPhaseQueued || b.Work.Phase == model.WorkPhaseExecuting) {
-		pending := "Pending investigation."
-		if b.Work.Phase == model.WorkPhaseExecuting {
-			pending = "Investigation running."
-		}
-		lines = append(lines, "*Finding:* "+pending+"\n*Cause:* "+pending)
 	}
+	if incomplete := canonicalIncompleteFinding(t, b); incomplete != "" {
+		lines = append(lines, incomplete)
+	} else if finding != "" {
+		lines = append(lines, canonicalFindingLine(finding, t.Lifecycle != model.LifecycleActive))
+	}
+
 	if !t.Lifecycle.Terminal() {
-		label := "*AlertINT:* "
-		if phase == "Correlating" {
-			label = "*Next:* "
-		}
-		lines = append(lines, label+canonicalNext(t, b, in.Now))
+		activity := canonicalNext(t, b, in.Now)
+		lines = append(lines, activity)
 	}
+	lines = append(lines, counts, canonicalMembers(b))
 	if action := briefingAction(b, t); action != "" {
 		lines = append(lines, "*Action:* "+action)
 	}
-	lines = append(lines, strings.Join(canonicalTimings(t, b, in.Summary.EffectiveStartedAt, in.Now, true), "\n"))
+	if t.Lifecycle == model.LifecycleRecovered {
+		end := in.Now
+		if t.Projection.TerminalAt != nil {
+			end = *t.Projection.TerminalAt
+		}
+		lines = append(lines, "Recovery confirmed · "+canonicalElapsed(b.Flow.FirstReceivedAt, end)+" after first receipt")
+	} else {
+		lines = append(lines, strings.Join(canonicalTimings(t, b, in.Summary.EffectiveStartedAt, in.Now, true), "\n"))
+	}
 	if t.Lifecycle.Terminal() {
 		lines = append(lines, canonicalMCP(in.Summary))
 	}
@@ -358,5 +380,26 @@ func canonicalMCP(s model.EpisodeSummary) string {
 	if id == "" {
 		id = s.SituationID
 	}
-	return "*Further details via MCP:* `get situation " + briefingText(id, 200) + " using alertint`"
+	return "*MCP:* `get situation " + briefingText(id, 200) + "`"
+}
+
+// Recovery describes alert state independently of whether an investigation
+// produced a usable result. Do not replace an earlier completed analysis with
+// the status of a later follow-up, or infer a particular failure from absence.
+func canonicalIncompleteFinding(t model.Transition, b *model.OperatorBriefing) string {
+	if !t.Lifecycle.Terminal() || (!b.Work.ExecutionStarted && b.BlockedReason == "") {
+		return ""
+	}
+	for _, a := range b.Analyses {
+		if !briefingDraft(a) {
+			return ""
+		}
+	}
+	if b.Flow.InvestigationCompletedAt != nil {
+		return ""
+	}
+	if b.BlockedReason == "budget_deferred" {
+		return "*Finding:* Investigation incomplete. The analysis budget was reached before a result was available."
+	}
+	return "*Finding:* Investigation incomplete. No completed analysis was available when monitoring ended."
 }

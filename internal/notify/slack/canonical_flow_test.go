@@ -35,7 +35,7 @@ func TestCanonicalRootCorrelationHasMembershipAndDeterministicClocks(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	bcBothSurfaces(t, msg, "Correlating · payments · lab", "Observed · *▸ Correlating* · Investigating · Monitoring · Confirming recovery · Recovered", "ServiceErrorRateHigh · payment", "ServiceErrorRateHigh · checkout", "DatabaseUnavailable · payments-db", "*Alert age:* 42s", "*Since first receipt:* 10s", "Start investigation in ~20s", "*Finding:* Pending investigation.")
+	bcBothSurfaces(t, msg, "Correlating · payments · lab", "Observed · *▸ Correlating* · Investigating · Monitoring · Confirming recovery · Recovered", "ServiceErrorRateHigh · payment", "ServiceErrorRateHigh · checkout", "DatabaseUnavailable · payments-db", "*Alert age:* 42s", "*Since first receipt:* 10s", "Start investigation in ~20s")
 	for _, unwanted := range []string{"Grouping rule:", "Sources:", "Duration:", "Cause not confirmed", "Hypothesis:"} {
 		if strings.Contains(msg.Text, unwanted) {
 			t.Errorf("root repeats detail %q: %s", unwanted, msg.Text)
@@ -67,7 +67,7 @@ func TestCanonicalRecoveredFreezesClocksRetainsResultAndUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bcBothSurfaces(t, msg, "Recovered · payments · lab — Database connection failures affected payment and checkout", "*Alert age at closure:* 1m55s", "30s after first receipt", "50s after first receipt", "*Investigation runtime:* 20s", "*Total time to confirmed recovery:* 1m45s from first receipt", "4 calls · 12,400 input / 1,850 output tokens", "Requests failed while connecting", "*Further details via MCP:*")
+	bcBothSurfaces(t, msg, "Recovered · payments · lab — Database connection failures affected payment and checkout", "Recovery confirmed · 1m45s after first receipt", "Requests failed while connecting", "*MCP:*")
 	for _, unwanted := range []string{"monitoring for this episode has ended", "Cause not confirmed", "Duration:", "Sources:"} {
 		if strings.Contains(msg.Text, unwanted) {
 			t.Errorf("unexpected recovered root content %q", unwanted)
@@ -109,8 +109,8 @@ func TestCanonicalAnalysisReplyOrdersResultsBeforeSourceDetails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bcBothSurfaces(t, msg, "🔴 Analysis completed", "*Finding:*", "*Sources and check results:*", "errors by customer tier", "0 series matched", "Loki", "400", "Unreachable after 2 attempts", "Changes", "Disabled for lab", "*AlertINT:*", "*Since first receipt:*")
-	if strings.Index(msg.Text, "*Finding:*") > strings.Index(msg.Text, "*Sources and check results:*") {
+	bcBothSurfaces(t, msg, "🔴 Analysis completed", "*Finding:*", "*Checks:*", "errors by customer tier", "0 series matched", "Loki", "400", "Unreachable after 2 attempts", "Changes", "Disabled for lab", "Monitoring alert changes.", "*Since first receipt:*")
+	if strings.Index(msg.Text, "*Finding:*") > strings.Index(msg.Text, "*Checks:*") {
 		t.Fatal("evidence precedes result")
 	}
 	for _, bad := range []string{"Causality remains unproven", "Cause not confirmed", "Open question:", "Duration:", "…"} {
@@ -130,7 +130,7 @@ func TestCanonicalFindingKeepsFailureSymptomWhenSamplesAreRoutine(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	bcBothSurfaces(t, msg, "*Finding:* Source reported: Payment error ratio 50% over 1 minute")
+	bcBothSurfaces(t, msg, "*Alert reported:* Payment error ratio 50% over 1 minute")
 	if strings.Contains(msg.Text, "order confirmation email sent") {
 		t.Fatal(msg.Text)
 	}
@@ -237,7 +237,7 @@ func TestCanonicalStartNamesActualFrozenInputs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bcBothSurfaces(t, msg, "*Investigation scope:*", "OldAlert · old-service")
+	bcBothSurfaces(t, msg, "*Investigated inputs:*", "OldAlert · old-service")
 }
 
 func TestCanonicalRecoveryNamesNewAndPriorClearance(t *testing.T) {
@@ -253,7 +253,7 @@ func TestCanonicalRecoveryNamesNewAndPriorClearance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bcBothSurfaces(t, msg, "*Newly resolved:* ServiceErrorRateHigh · payment; ServiceErrorRateHigh · checkout", "*Already resolved:* DatabaseUnavailable · payments-db")
+	bcBothSurfaces(t, msg, "🔹 ServiceErrorRateHigh · payment · just recovered", "🔹 ServiceErrorRateHigh · checkout · just recovered", "🔹 DatabaseUnavailable · payments-db · resolved earlier")
 }
 
 func TestCanonicalRootCountsUnobservedMembers(t *testing.T) {

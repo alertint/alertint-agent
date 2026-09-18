@@ -106,7 +106,7 @@ func runOperatorOutcome(t *testing.T, execute bool) {
 		if !strings.Contains(text, "payment") {
 			t.Errorf("%s changed affected service: %s", surface, text)
 		}
-		if !strings.Contains(text, "Recovery confirmed") {
+		if !strings.Contains(text, "Alerts stayed clear") {
 			t.Errorf("%s missing delivered recovery: %s", surface, text)
 		}
 	}

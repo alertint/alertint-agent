@@ -210,6 +210,11 @@ const (
 // SourceCheck describes one named, recorded collection or verification check.
 // Counts are asserted only when their corresponding Known field is true.
 type SourceCheck struct {
+	// Kind and QueryScope retain executed-query identity for display deduplication.
+	// Empty fields on historical projections prohibit scope-based consolidation.
+	Kind         string             `json:"kind,omitempty"`
+	QueryScope   string             `json:"query_scope,omitempty"`
+	QueryExpr    string             `json:"query_expr,omitempty"`
 	Source       string             `json:"source"`
 	Check        string             `json:"check"`
 	Unit         string             `json:"unit,omitempty"`

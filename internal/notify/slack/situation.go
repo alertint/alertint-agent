@@ -436,9 +436,12 @@ func renderJournalEntryKind(t model.Transition, executionSuperseded bool, replyK
 	headline := prefix + "*" + label + "*"
 	blocks := []slacklib.Block{sectionBlock(headline)}
 	if detail != "" {
-		if t.Projection.Briefing != nil {
+		switch {
+		case t.Projection.Briefing != nil && t.Projection.Briefing.Flow != nil:
+			blocks = append(blocks, canonicalDetailBlocks(detail, t.Lifecycle.Terminal())...)
+		case t.Projection.Briefing != nil:
 			blocks = append(blocks, briefingDetailBlocks(detail)...)
-		} else {
+		default:
 			blocks = append(blocks, sectionBlock(detail))
 		}
 	}

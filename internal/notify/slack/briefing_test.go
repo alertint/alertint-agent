@@ -232,7 +232,7 @@ func TestBriefingStoredAnalysisFlowsThroughControllerAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Restarts and errors began together", "Alert age at closure", "resolved", "*▸ Recovered*"} {
+	for _, want := range []string{"Restarts and errors began together", "Recovery confirmed", "resolved", "*▸ Recovered*"} {
 		if !strings.Contains(root.Text, want) {
 			t.Errorf("terminal root lost %q: %s", want, root.Text)
 		}

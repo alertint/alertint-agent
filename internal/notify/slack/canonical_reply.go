@@ -54,37 +54,48 @@ func canonicalSourceLines(checks []model.SourceCheck) []string {
 	if len(checks) == 0 {
 		return nil
 	}
-	lines := []string{"*Sources and check results:*"}
+	lines := []string{"*Checks:*"}
+	// Keep compact subjects, but distinguish expressions whose differences
+	// (for example thresholds) are not represented by the subject and scope.
+	queries := map[string]map[string]int{}
 	for _, c := range checks {
-		name := briefingComplete(c.Source)
-		if c.Check != "" {
-			name += " — " + briefingComplete(c.Check)
+		if c.Kind != "promql" || c.QueryExpr == "" {
+			continue
 		}
-		var parts []string
-		if c.CallsKnown {
-			parts = append(parts, fmt.Sprintf("%d calls", c.Calls))
+		key := c.Source + "\x00" + canonicalCheckName(c)
+		if queries[key] == nil {
+			queries[key] = map[string]int{}
 		}
-		if c.RecordsKnown {
-			parts = append(parts, fmt.Sprintf("%s %s returned", canonicalNumber(c.Records), canonicalSourceUnit(c.Unit)))
+		if queries[key][c.QueryExpr] == 0 {
+			queries[key][c.QueryExpr] = len(queries[key]) + 1
 		}
-		switch c.Outcome {
-		case model.SourceCheckConfigured:
-			parts = append(parts, "configured")
-		case model.SourceCheckEmpty:
-			parts = append(parts, "query succeeded; 0 matches")
-		case model.SourceCheckFailed:
-			parts = append(parts, "failed")
-		case model.SourceCheckSkipped:
-			parts = append(parts, "skipped")
-		case model.SourceCheckReturned:
-			if !c.RecordsKnown {
-				parts = append(parts, "data returned")
+	}
+	seen := map[string]bool{}
+	for _, c := range checks {
+		if c.QueryScope != "" && (c.Outcome == model.SourceCheckReturned || c.Outcome == model.SourceCheckEmpty) {
+			key := c.Source + "\x00" + c.Kind + "\x00" + c.QueryScope + "\x00" + string(c.Outcome) + "\x00" + c.Detail
+			if seen[key] {
+				continue
 			}
+			seen[key] = true
 		}
-		if c.Detail != "" {
-			parts = append(parts, briefingComplete(c.Detail))
+		switch c.Kind {
+		case "incidents_in_window":
+			c.Check = "Other alerts"
+			c.Detail = compactOtherAlerts(c.Detail)
+		case "up_ratio":
+			c.Check = "Peer health"
 		}
-		lines = append(lines, "• *"+name+":* "+strings.Join(parts, " · "))
+		name := briefingComplete(c.Source)
+		if c.Check != "" && c.Check != "collection" {
+			checkName := canonicalCheckName(c)
+			if refs := queries[c.Source+"\x00"+checkName]; c.Kind == "promql" && len(refs) > 1 {
+				checkName += fmt.Sprintf(" · check %d", refs[c.QueryExpr])
+			}
+			name += " — " + briefingComplete(checkName)
+		}
+		symbol, result := compactSourceResult(c)
+		lines = append(lines, symbol+" *"+name+":* "+briefingComplete(result))
 	}
 	return lines
 }
@@ -104,8 +115,12 @@ func canonicalAnalysisLines(b *model.OperatorBriefing, selected []model.Incident
 		if canonicalCauseSupported(assessment) && a.Verification == "supported" && !briefingDraft(a) && a.VerificationGaps == 0 && strings.TrimSpace(a.Summary) != "" {
 			finding = strings.TrimSpace(a.Summary)
 		}
+		label := "*Finding:* "
+		if diagnosis := canonicalWorkingDiagnosis(&single); diagnosis != "" {
+			finding = diagnosis
+		}
 		if finding != "" {
-			lines = append(lines, "*Finding:* "+briefingComplete(finding))
+			lines = append(lines, label+briefingComplete(finding))
 		}
 		// The response contract separates sourced factual findings from its
 		// causal hypothesis. A useful observation does not require a cause.
@@ -116,17 +131,26 @@ func canonicalAnalysisLines(b *model.OperatorBriefing, selected []model.Incident
 				}
 			}
 		}
-		if len(a.Observations) > 0 {
-			lines = append(lines, "*Supporting evidence:*")
-			for _, o := range a.Observations {
-				lines = append(lines, "• "+briefingComplete(o))
+		var evidence []string
+		seen := map[string]bool{strings.TrimSpace(finding): true}
+		for _, o := range a.Observations {
+			// Routine log samples remain available through MCP; they do not explain the alert.
+			o = canonicalEvidenceObservation(o)
+			if o != "" && !seen[o] {
+				evidence = append(evidence, "▪ "+briefingComplete(o))
+				seen[o] = true
 			}
+		}
+		if len(evidence) > 0 {
+			lines = append(lines, "*Evidence:*\n"+strings.Join(evidence, "\n"))
 		}
 		if a.VerificationLimit != "" {
 			lines = append(lines, "*Analysis result:* "+briefingVerificationLimit(a.VerificationLimit)+".")
 		}
 	}
-	lines = append(lines, canonicalSourceLines(b.Flow.SourceChecks)...)
+	if checks := canonicalSourceLines(b.Flow.SourceChecks); len(checks) > 0 {
+		lines = append(lines, strings.Join(checks, "\n"))
+	}
 	// Legacy analysis envelopes may have complete named check results without
 	// the new source accounting projection. Keep those results accessible.
 	if len(b.Flow.SourceChecks) == 0 {
@@ -198,34 +222,30 @@ func canonicalBriefingJournal(t model.Transition, kind string, executionSupersed
 		}
 		lines = append(lines, "*Collected alerts:*\n"+canonicalMembers(b))
 		if at := b.Flow.CorrelationClosesAt; at != nil {
-			lines = append(lines, "*Correlation window:* "+canonicalElapsed(b.Flow.CorrelationOpenedAt, *at)+" · closes at "+SlackDateToken(*at, "{time_secs}"))
+			lines = append(lines, "*Correlation window:* "+canonicalElapsed(b.Flow.CorrelationOpenedAt, *at))
 		}
 	case "investigation_started":
 		label = "Investigation started"
-		if b.Work.InvestigatedCountKnown {
-			lines = append(lines, fmt.Sprintf("*Investigation scope:* %d alert inputs.", b.Work.InvestigatedCount))
+
+		if checks := canonicalSourceLines(b.Flow.SourceChecks); len(checks) > 0 {
+			lines = append(lines, strings.Join(checks, "\n"))
 		}
-		lines = append(lines, "*Investigated inputs:* "+canonicalInvestigationNames(b))
-		if b.Flow.GroupKey != "" {
-			lines = append(lines, "*Correlation:* Grouped by `"+briefingComplete(b.Flow.GroupKey)+"`.")
-		}
-		lines = append(lines, canonicalSourceLines(b.Flow.SourceChecks)...)
 	case "analysis_completed":
 		label, lines = canonicalAnalysisReply(t, b)
 	case "partial_clearance":
 		label = "Partial clearance"
-		lines = append(lines, canonicalClearanceLines(t, b)...)
+		lines = append(lines, strings.Join(canonicalClearanceLines(t, b), "\n"))
 	case "recovery_observed":
 		label = "Recovery observed"
-		lines = append(lines, canonicalClearanceLines(t, b)...)
+		lines = append(lines, strings.Join(canonicalClearanceLines(t, b), "\n"))
 		lines = append(lines, fmt.Sprintf("*Remaining firing:* %d", b.Firing))
 	case "recovered":
 		label = "Recovered"
-		period := "the recovery observation period"
+		period := "the observation period"
 		if t.Projection.RecoveryObservedAt != nil && t.Projection.GraceUntil != nil {
-			period = "the " + canonicalElapsed(*t.Projection.RecoveryObservedAt, *t.Projection.GraceUntil) + " observation period"
+			period = canonicalElapsed(*t.Projection.RecoveryObservedAt, *t.Projection.GraceUntil)
 		}
-		lines = append(lines, "*Recovery confirmed:* The monitored alerts cleared and did not fire again during "+period+". Episode monitoring is complete.")
+		lines = append(lines, "Alerts stayed clear for "+period+". Monitoring ended.")
 	case "recovery_unconfirmed":
 		label = "Recovery unconfirmed"
 	default:
@@ -233,6 +253,7 @@ func canonicalBriefingJournal(t model.Transition, kind string, executionSupersed
 			lines = append(lines, briefingDeltaLines(d, b, t.Lifecycle.Terminal())...)
 		}
 	}
+	lines = canonicalPrependIncompleteFinding(t, b, lines)
 	if t.Reason == model.ReasonOperatorArtifactRecorded {
 		label = briefingComplete(t.Journal.AttributedActor) + ": " + briefingComplete(t.Journal.Headline)
 		lines = []string{briefingComplete(t.Journal.Detail)}
@@ -252,12 +273,18 @@ func canonicalBriefingJournal(t model.Transition, kind string, executionSupersed
 		if executionSuperseded && briefingExecutionClaimed(t) {
 			next = supersededExecutionStep
 		}
-		lines = append(lines, "*AlertINT:* "+next)
+		if kind == "investigation_started" && !executionSuperseded {
+			next = compactInvestigationStep(next, b)
+		}
+		if kind == "investigation_started" && !strings.HasPrefix(next, "Investigating") {
+			lines = append([]string{"*Investigated inputs:* " + canonicalInvestigationNames(b)}, lines...)
+		}
+		lines = append([]string{next}, lines...)
 	}
 	if request := briefingAction(b, t); request != "" {
 		lines = append(lines, "*Action:* "+request)
 	}
-	lines = append(lines, canonicalReplyTimings(t, b, kind)...)
+	lines = append(lines, strings.Join(canonicalReplyTimings(t, b, kind), "\n"))
 	if t.Lifecycle.Terminal() {
 		s := model.EpisodeSummary{SituationID: t.SituationID}
 		if t.Projection.PublicHandle != nil {
@@ -278,9 +305,12 @@ func canonicalReplyTimings(t model.Transition, b *model.OperatorBriefing, kind s
 		if t.Projection.TerminalAt != nil {
 			end = *t.Projection.TerminalAt
 		}
-		lines = append(lines, "*Confirmed:* "+SlackDateToken(end, "{time_secs}"), "*Total time from first receipt:* "+canonicalElapsed(b.Flow.FirstReceivedAt, end))
+		lines = append(lines, "*Confirmed:* "+SlackDateToken(end, "{time_secs}"))
+		lines = append(lines, canonicalTimings(t, b, t.Projection.EffectiveStartedAt, end, true)...)
 	default:
-		lines = append(lines, "*Since first receipt:* "+canonicalElapsed(b.Flow.FirstReceivedAt, t.CreatedAt))
+		if kind != "investigation_started" {
+			lines = append(lines, "*Since first receipt:* "+canonicalElapsed(b.Flow.FirstReceivedAt, t.CreatedAt))
+		}
 		if kind == "investigation_started" && b.Flow.InvestigationStartedAt != nil {
 			lines = append(lines, "*Started:* "+SlackDateToken(*b.Flow.InvestigationStartedAt, "{time_secs}")+" · *Response time:* "+canonicalElapsed(b.Flow.FirstReceivedAt, *b.Flow.InvestigationStartedAt)+" from first receipt")
 		}
@@ -338,12 +368,21 @@ func canonicalClearanceLines(t model.Transition, b *model.OperatorBriefing) []st
 	}
 	var lines []string
 	for _, entry := range []struct {
-		label string
-		names []string
-	}{{"Newly resolved", newly}, {"Already resolved", prior}, {"Still firing", firing}} {
-		if len(entry.names) > 0 {
-			lines = append(lines, "*"+entry.label+":* "+strings.Join(entry.names, "; "))
+		symbol, state string
+		names         []string
+	}{
+		{"🔹", "just recovered", newly}, {"🔹", "resolved earlier", prior}, {"🔸", "firing", firing},
+	} {
+		for _, name := range entry.names {
+			lines = append(lines, entry.symbol+" "+name+" · "+entry.state)
 		}
+	}
+	return lines
+}
+
+func canonicalPrependIncompleteFinding(t model.Transition, b *model.OperatorBriefing, lines []string) []string {
+	if incomplete := canonicalIncompleteFinding(t, b); incomplete != "" {
+		return append([]string{incomplete}, lines...)
 	}
 	return lines
 }
