@@ -256,16 +256,16 @@ func withheldByWallRun(p model.Plan, now time.Time) model.Run {
 // happened.
 type reservingRecorder struct {
 	store           PreparationStore
-	persistCtx      context.Context
+	persistCtx      context.Context //nolint:containedctx // Invocation-scoped parent deadline must survive the shorter connector I/O deadline.
 	fence           model.Fence
 	cycleID, planID string
 	clock           func() time.Time
 }
 
 func (rr *reservingRecorder) BeforeRequest(context.Context) (model.RequestReservation, error) {
-	return rr.store.ReserveObservationRequest(rr.persistCtx, rr.fence, rr.cycleID, rr.planID, rr.clock())
+	return rr.store.ReserveObservationRequest(rr.persistCtx, rr.fence, rr.cycleID, rr.planID, rr.clock()) //nolint:contextcheck // Use the caller's bounded persistence context, not the shorter connector I/O context.
 }
 
 func (rr *reservingRecorder) AfterRequest(_ context.Context, outcome model.RequestOutcome) error {
-	return rr.store.CompleteObservationRequest(rr.persistCtx, outcome)
+	return rr.store.CompleteObservationRequest(rr.persistCtx, outcome) //nolint:contextcheck // Record actual request outcomes even when the connector I/O deadline expired.
 }
