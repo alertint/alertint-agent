@@ -576,13 +576,13 @@ func insertNotificationIntentTx(ctx context.Context, tx *sql.Tx, n situationmode
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO notification_intents (
-			id, idempotency_key, effect_class, situation_id, transition_id, transition_sequence,
+			id, idempotency_key, effect_class, reply_kind, situation_id, transition_id, transition_sequence,
 			summary_version, gap_generation, requires_root, main_channel_poke, interruption_priority,
 			contract_deadline_at, client_message_id, status, claim_owner, claim_token, lease_expires_at,
 			attempt_count, last_error_class, retry_at, supersession_reason, replacement_intent_id,
 			delivered_as, channel, message_ts, created_at, delivered_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		n.ID, n.IdempotencyKey, string(n.EffectClass), nullableString(n.SituationID), nullableString(n.TransitionID),
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		n.ID, n.IdempotencyKey, string(n.EffectClass), string(n.ReplyKind), nullableString(n.SituationID), nullableString(n.TransitionID),
 		nullableInt(n.TransitionSequence), nullableInt(n.SummaryVersion), nullableString(n.GapGeneration),
 		boolToInt(n.RequiresRoot), boolToInt(n.MainChannelPoke), priority,
 		nullableTimePtr(n.ContractDeadlineAt), n.ClientMessageID, string(n.Status),
@@ -598,7 +598,7 @@ func insertNotificationIntentTx(ctx context.Context, tx *sql.Tx, n situationmode
 
 // notificationIntentColumns is the exact SELECT list scanNotificationIntent
 // consumes.
-const notificationIntentColumns = `id, idempotency_key, effect_class, situation_id, transition_id, transition_sequence,
+const notificationIntentColumns = `id, idempotency_key, effect_class, reply_kind, situation_id, transition_id, transition_sequence,
 	summary_version, gap_generation, requires_root, main_channel_poke, interruption_priority,
 	contract_deadline_at, client_message_id, status, claim_owner, claim_token, lease_expires_at,
 	attempt_count, last_error_class, retry_at, supersession_reason, replacement_intent_id,
@@ -606,13 +606,13 @@ const notificationIntentColumns = `id, idempotency_key, effect_class, situation_
 
 func scanNotificationIntent(row scanner) (situationmodel.NotificationIntent, error) {
 	var n situationmodel.NotificationIntent
-	var effectClass, status, clientMessageID, createdAt string
+	var effectClass, replyKind, status, clientMessageID, createdAt string
 	var situationID, transitionID, gapGeneration, priority, claimOwner sql.NullString
 	var lastErrorClass, supersessionReason, replacementID, deliveredAs, channel, messageTS sql.NullString
 	var contractDeadlineAt, leaseExpiresAt, retryAt, deliveredAt sql.NullString
 	var transitionSequence, summaryVersion sql.NullInt64
 	var requiresRoot, mainChannelPoke int
-	if err := row.Scan(&n.ID, &n.IdempotencyKey, &effectClass, &situationID, &transitionID, &transitionSequence,
+	if err := row.Scan(&n.ID, &n.IdempotencyKey, &effectClass, &replyKind, &situationID, &transitionID, &transitionSequence,
 		&summaryVersion, &gapGeneration, &requiresRoot, &mainChannelPoke, &priority,
 		&contractDeadlineAt, &clientMessageID, &status, &claimOwner, &n.ClaimToken, &leaseExpiresAt,
 		&n.AttemptCount, &lastErrorClass, &retryAt, &supersessionReason, &replacementID,
@@ -620,6 +620,7 @@ func scanNotificationIntent(row scanner) (situationmodel.NotificationIntent, err
 		return situationmodel.NotificationIntent{}, err
 	}
 	n.EffectClass = situationmodel.EffectClass(effectClass)
+	n.ReplyKind = situationmodel.NotificationReplyKind(replyKind)
 	n.Status = situationmodel.IntentStatus(status)
 	n.ClientMessageID = clientMessageID
 	n.RequiresRoot = requiresRoot == 1

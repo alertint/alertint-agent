@@ -6,6 +6,7 @@ import (
 	"sort"
 	"time"
 
+	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
@@ -17,9 +18,15 @@ import (
 // one coherent transaction — no external I/O, no derived/computed content.
 // now enters the pure layer through Now rather than a global clock.
 type SnapshotInput struct {
-	Situation         model.Situation
-	Deliveries        []Delivery
-	Incidents         []IncidentState
+	Situation  model.Situation
+	Deliveries []Delivery
+	Incidents  []IncidentState
+	// Analyses is publication-only prose; BuildSnapshot and all L2 hashes ignore it.
+	Analyses      []model.IncidentAnalysis
+	AnalysisCount int // completed analyses before the bounded selection
+	// PresentationFacts is loaded from immutable attempt/call ledgers and
+	// persisted enrichment in the same transaction as the rest of this input.
+	PresentationFacts PresentationFacts
 	PriorSituations   []CompletedSituation
 	CurrentAssessment *AuthoritativeAssessment
 	Now               time.Time
@@ -84,6 +91,24 @@ type SnapshotInput struct {
 	// artifact input for this Situation, ordered by (applied_input_version,
 	// occurred_at, id) exactly as R1 requires. Empty on an ordinary cycle.
 	PendingArtifacts []OperatorArtifactInput
+
+	// DeliveredHistory is B5's durable, delivery-aware context (B0
+	// integration contract §4/§5), read inside this same coherent
+	// transaction so ReplyEligible can never combine it with a stale
+	// Transition/summary snapshot. Forwarded unchanged into
+	// PublicationInput.DeliveredHistory by buildHistory.
+	Prepared         PreparedState
+	DeliveredHistory DeliveredHistory
+}
+
+// PresentationFacts contains only durable publication facts. Unknown values
+// retain explicit knownness in their model types rather than becoming zero.
+type PresentationFacts struct {
+	InvestigationStartedAt      *time.Time
+	InvestigationCompletedAt    *time.Time
+	InvestigationRuntimeSeconds *int64
+	AnalysisUsage               model.AnalysisUsage
+	SourceChecks                []model.SourceCheck
 }
 
 // ControllerParkedState is SnapshotInput's own read of the Situation's
@@ -146,6 +171,52 @@ type Delivery struct {
 	// immutable per-delivery labels rather than the mutable Alert
 	// projection.
 	Drill bool
+
+	// Labels is this delivery's immutable, already-decoded alert_deliveries.
+	// labels_json label set (B0 compatibility port, 2026-09-08). It exists
+	// so the operator briefing can select a descriptive scope and stable
+	// alert names from the same immutable per-delivery row Severity/Drill
+	// come from — the store layer decodes labels_json exactly once and this
+	// pure package still never parses JSON itself. It is presentation input
+	// only: no digest, hash, fact, or assessment prompt reads it (see
+	// MaterialFactHash / IncidentInputDigest, which name their own fields).
+	Labels map[string]string
+
+	// SourceSummary is an immutable source annotation, for presentation only.
+	SourceSummary string
+	// ---------------------------------------------------------------
+	// Plan 4 Task 6: immutable source identity and acquisition metadata,
+	// already stored on alert_deliveries by migration 0013 (ADR-0040) but
+	// never threaded through this pure package until now. Source lifecycle
+	// grace/deadline computation must use AcquisitionMode + the real
+	// PollIntervalSeconds, never StartedAtBasis/ResolvedAtBasis alone
+	// (spec.md R13 — a source API timestamp does not itself mean the
+	// receiver was a polling one).
+	// ---------------------------------------------------------------
+
+	// Source is the delivery's originating adapter name (e.g.
+	// "alertmanager", "zabbix") — alert_deliveries.source.
+	Source string
+	// EpisodeKey is the immutable alert_deliveries.source_episode_key this
+	// delivery belongs to.
+	EpisodeKey string
+	// SourceSignalID and SourceSignalVersion are the source adapter's own
+	// proven signal identity/version (alert_deliveries.source_signal_id/
+	// source_signal_version) — both independently possibly absent; never
+	// filled from a hash of the alert name or any other invented value.
+	SourceSignalID      *string
+	SourceSignalVersion *string
+	// AcquisitionMode and PollIntervalSeconds are this delivery's own
+	// proven acquisition mode ("webhook"|"poll") and, for poll, its real
+	// configured interval — alert_deliveries.acquisition_mode/
+	// poll_interval_seconds.
+	AcquisitionMode     string
+	PollIntervalSeconds int
+	// Labels is the delivery's immutable, already-decoded label set —
+	// needed to build a deterministic evidence Scope for this member
+	// without this pure package ever parsing labels_json itself (the store
+	// layer decodes it once, same convention as AlertID/Severity/Drill
+	// above).
 }
 
 // TriageState is Acute Triage's durable per-Incident state, as far as this
@@ -182,6 +253,79 @@ type TriageState struct {
 	// "no Finding yet" (a legitimate state for a pending/in-flight
 	// Incident), never as confirmed-empty evidence.
 	LatestAttempt *TriageAttemptResult
+
+	// ActiveAttempt is the current in_flight row named by current_attempt_id,
+	// and LastExecution is the most recent attempt row regardless of
+	// outcome (B0 integration contract §3) — both read by
+	// internal/store/situation_controller.go's loadSituationIncidentStatesTx
+	// from incident_triage_attempts (R1 repair, lead review 2026-09-09,
+	// narrow allowlist extension). LastExecution in particular survives a
+	// successful completion that deletes this Incident's incident_triage
+	// row entirely (triage_controller.go completeSuccessTx): Attempts
+	// resets to 0 (COALESCE default) once that row is gone, so
+	// BuildWorkProjection's ExecutionStarted also checks these two fields,
+	// never inferring execution from a request or decision alone.
+	ActiveAttempt *TriageExecution
+	LastExecution *TriageExecution
+
+	// SkipReason is this Incident's own mapped skip disposition — ""
+	// unless Phase == "skipped" — set by the presentation-copy overlay in
+	// committedBriefingInput from the exact decision this cycle committed
+	// (never a stale prior request reason under a newly skipped result).
+	// See WorkProjection.SkipReason for the Situation-level aggregate B3/B4
+	// actually consume.
+	SkipReason string
+}
+
+// TriageExecution is one incident_triage_attempts row's frozen claim-time
+// identity and inputs, as far as this package can express it today (B0
+// integration contract §3): the actual execution start plus the exact
+// member delivery IDs claimed with it, distinct from an Incident's current
+// (possibly since-changed) membership. See TriageState.ActiveAttempt/
+// LastExecution's doc comment for why this tree cannot yet populate one.
+type TriageExecution struct {
+	AttemptID         string
+	AttemptNumber     int
+	StartedAt         time.Time
+	MemberDeliveryIDs []string
+
+	// ResultCode/OutputDigest/CompletedAt are the same row's durable
+	// completion columns (result_code, output_digest, completed_at) — empty/
+	// nil while the attempt is still in flight (lead decision D, round 2,
+	// 2026-09-09: existing attempt result identity, code and completion/
+	// digest metadata read by the same-transaction loader). Presentation and
+	// completion-provenance input, also checked by the triage reuse gate: no
+	// digest, hash, fact or assessment
+	// prompt reads them (TriageState.LatestAttempt remains the acute_finding
+	// fact's own, separately populated source).
+	ResultCode   string
+	OutputDigest string
+	CompletedAt  *time.Time
+
+	// Evidence is this attempt's accepted result, present ONLY when the
+	// Incident's current accepted output was positively matched to this
+	// attempt through OutputDigest (internal/store's
+	// loadMatchedCompletionEvidenceTx) — never joined on incident id alone,
+	// so a different attempt's output is never borrowed. Nil means evidence
+	// unavailable/unmatched, which establishes nothing about a hypothesis.
+	Evidence *TriageCompletionEvidence
+}
+
+// TriageCompletionEvidence is the bounded, matched accepted output of one
+// successful attempt, selected independently of the top-three analysis
+// overview so a completion outside that overview keeps its own provenance.
+// Hypothesis is the recorded root cause only — a positively loaded EMPTY
+// hypothesis is a real fact here (an accepted completion with no causal
+// finding), distinct from Evidence being nil.
+type TriageCompletionEvidence struct {
+	// SourceEvidence participates in presentation comparison only; generated
+	// Findings alone cannot identify changed source samples or verification checks.
+	SourceEvidence    []string
+	Hypothesis        string
+	Observations      []string
+	VerificationLimit string
+	VerificationGaps  int
+	JudgedAt          *time.Time
 }
 
 // TriageAttemptResult is the most recent completed incident_triage_attempts
@@ -278,6 +422,9 @@ type Symptom struct {
 // proposal or derive a deterministic one, with stable hashes over only its
 // material content. BuildSnapshot is the sole producer.
 type Snapshot struct {
+	// Observations are the same bounded prepared evidence used by material
+	// identity. They remain separate from the local fact table's closed schema.
+	ObservationChecks   []ObservationCheck
 	SituationID         string
 	InputVersion        int
 	Lifecycle           model.Lifecycle
@@ -287,8 +434,21 @@ type Snapshot struct {
 	Symptoms            []Symptom
 	Incidents           []IncidentState
 	EligibleReasons     []model.ReasonCandidate
+	PriorAssessment     *model.Assessment
 	MaterialFactHash    string
 	AssessmentBasisHash string
+
+	// PreparationCycleID names the frozen preparation cycle this Snapshot
+	// was built from ("" when none): dispatch pins that basis permanently.
+	PreparationCycleID string
+	// Observations are the bounded, normalized connector facts of the
+	// current preparation cycle (Plan 4 review F2) — a separate collection
+	// from the closed Plan 2 store Facts above; CapabilityResults is the
+	// per-run result catalog, and Deferred lists the capability:subject
+	// reads this cycle could not admit.
+	Observations      []observationmodel.Fact
+	CapabilityResults []CapabilityResult
+	Deferred          []string
 }
 
 // Duration classes. Boundaries are half-open on the low end: subminute
@@ -388,23 +548,44 @@ func deriveSymptoms(deliveries []Delivery) []Symptom {
 // with no AlertID (test fixtures only) counts as its own Alert so it can
 // never be superseded by an unrelated row.
 func incidentSymptomStatus(deliveries []Delivery) model.DeliveryStatus {
-	latestByAlert := make(map[string]Delivery, len(deliveries))
-	for _, d := range deliveries {
-		alertKey := d.AlertID
-		if alertKey == "" {
-			alertKey = "delivery:" + d.ID
-		}
-		cur, ok := latestByAlert[alertKey]
-		if !ok || deliveryLess(cur, d) {
-			latestByAlert[alertKey] = d
-		}
-	}
-	for _, d := range latestByAlert {
+	for _, d := range latestDeliveryPerAlert(deliveries) {
 		if d.Status == model.DeliveryStatusFiring {
 			return model.DeliveryStatusFiring
 		}
 	}
 	return model.DeliveryStatusResolved
+}
+
+// alertKeyOf is the per-Alert identity every source-lifecycle fold groups
+// by: Delivery.AlertID (alert_deliveries.alert_id, NOT NULL), or the
+// delivery's own ID for a fixture without one, so an unrelated row can never
+// supersede it.
+func alertKeyOf(d Delivery) string {
+	if d.AlertID != "" {
+		return d.AlertID
+	}
+	return "delivery:" + d.ID
+}
+
+// latestDeliveryPerAlert is the ONE authoritative Plan 3 source fold: each
+// distinct Alert's chronologically latest delivery (deliveryLess' total
+// order), keyed by alertKeyOf. Lifecycle truth (incidentSymptomStatus →
+// deriveSymptoms → resolveLifecycle) and operator presentation
+// (BuildOperatorBriefing) both consume exactly this fold, so the counts an
+// operator sees can never disagree with the lifecycle the controller
+// commits (B0 integration contract §2). Plan 4's prepared-observation
+// reducer is not part of this tree; there is no "unobserved" state here —
+// a Plan 3 Alert is firing or resolved.
+func latestDeliveryPerAlert(deliveries []Delivery) map[string]Delivery {
+	latest := make(map[string]Delivery, len(deliveries))
+	for _, d := range deliveries {
+		key := alertKeyOf(d)
+		cur, ok := latest[key]
+		if !ok || deliveryLess(cur, d) {
+			latest[key] = d
+		}
+	}
+	return latest
 }
 
 // sortIncidentsByID returns a copy of incidents ordered by ID, never
@@ -426,8 +607,10 @@ func BuildSnapshot(in SnapshotInput) Snapshot {
 	eligible := EligibleReasons(in, symptoms, class)
 	materialHash := MaterialFactHash(in, symptoms, class)
 	basisHash := AssessmentBasisHash(in, materialHash, eligible)
+	observations, results := ProjectObservations(in.Prepared, in.Prepared.PlansByID, in.Now)
 
 	return Snapshot{
+		ObservationChecks:   preparedObservationChecks(in.Prepared),
 		SituationID:         in.Situation.ID,
 		InputVersion:        in.Situation.InputVersion,
 		Lifecycle:           in.Situation.Lifecycle,
@@ -437,7 +620,20 @@ func BuildSnapshot(in SnapshotInput) Snapshot {
 		Symptoms:            symptoms,
 		Incidents:           sortIncidentsByID(in.Incidents),
 		EligibleReasons:     eligible,
+		PriorAssessment:     priorAssessment(in.CurrentAssessment),
 		MaterialFactHash:    materialHash,
 		AssessmentBasisHash: basisHash,
+		PreparationCycleID:  in.Prepared.CycleID,
+		Observations:        observations,
+		CapabilityResults:   results,
+		Deferred:            in.Prepared.Deferred,
 	}
+}
+
+func priorAssessment(current *AuthoritativeAssessment) *model.Assessment {
+	if current == nil {
+		return nil
+	}
+	a := current.Assessment
+	return &a
 }

@@ -144,28 +144,93 @@ Slack presents one Situation root plus an immutable ordered journal instead
 (see [Slack](../notifications/slack.md#situation-owned-slack)). The two
 `AlertINT system` installation messages — LLM dependency health and
 Slack-delivery-gap recovery — are the only sanctioned exceptions.
-**Not yet wired, even on `state-controller`:** connector preparation for the
-controller's own evidence needs, durable Assessment/Triage artifacts beyond
-the bounded recent-attempt history, operator questions or judgments, and the
-final v0.14 cutover that would make this the only grouping/dispatch path.
+**Also on that branch:** before each reconcile cycle derives its Assessment,
+a fenced **evidence-preparation** pass plans and executes a bounded set of
+read-only capability checks — the same seven-capability catalog Phase 1's
+evidence pack draws from (local prior-Situation state, Prometheus, Loki,
+Sentry, Zabbix metric/problem history, change events) — against the
+Situation's own current member set, freezes the plan into a durable cycle
+before any physical request runs (so a crash mid-attempt retries the exact
+same frozen plan rather than minting a new one), and commits each
+capability's normalized result durably before the reconcile cycle reads it.
+Every physical request is bounded per cycle
+(`situations.preparation.max_source_calls_per_cycle`) and per wall clock
+(`situations.preparation.max_wall_seconds`, shared by both the lifecycle and
+assessment phases of one cycle) — see
+[Configuration: `situations`](../getting-started/configuration.md#situations).
+Alongside it, a durable **advisory semantic-profile** worker pool infers a
+bounded, closed-schema interpretation hint (subject/event kind, possible
+role, candidate scope, horizon tier, useful capabilities, uncertainty) for
+each distinct alert-generating source identity it has not already profiled,
+deduplicated so many deliveries sharing one identity create at most one
+inference job. A profile is advisory only: it can widen which capabilities
+get planned or how far back a read looks, but it can never assert that an
+alert is firing or resolved, grant investigative authority, create a
+Sufficient reason, resolve a sibling, or reach Slack directly — the
+[malicious-input case](scope-and-limits.md) this build defends against by
+construction. Profile inference and Situation Assessment share the same L0
+(profile) + L2 (Assessment) provider concurrency limiter
+(`situations.llm_concurrency`) with Assessment always winning a contested
+slot; at most one profile inference runs at a time regardless of
+`situations.semantic_profiles.workers`. An operator can read a profile's
+current head and version history, or submit a confirmed correction, over
+MCP (`alertint_get_semantic_profile`, `alertint_correct_semantic_profile`);
+a correction is append-only (a new immutable version, never an edit) and
+fans out to every matching nonterminal Situation. Unused per-run normalized
+detail (not current source-lifecycle evidence, not referenced by a
+dispatched or committed Assessment, not part of an open cycle) expires 10
+days after its own durable completion time — a fixed, non-configurable
+retention rule that never deletes the Run's own identity, digest, coverage,
+or accounting, and never touches an Alert delivery, Situation history,
+semantic profile, or request accounting.
+
+Source lifecycle folds from real, source-proven evidence, not a single
+receipt clock: each prepared observation carries its own acquisition mode
+(webhook or poll) and, when polling, the connector's own configured
+interval — never an inferred guess from the receipt timestamp alone. A
+webhook recovery gets a fixed recovery grace before the Situation may treat
+it as resolved; a polling recovery's grace is twice its own poll interval
+(clamped to 2–10 minutes), since a poll can only prove a state as current as
+its own last successful cycle. Every member alert also carries its own
+observation deadline — how long a Situation waits past its effective start
+before a still-unobserved member (never firing, never resolved) can no
+longer block closure — derived from the Situation's own duration class, so
+a long-running Situation is never closed out just because one source has
+gone quiet.
+
+**Not yet wired, even on `state-controller`:** durable Assessment/Triage
+artifacts beyond the bounded recent-attempt history, operator questions or
+judgments, expected-behaviour envelopes, and the final v0.14 cutover that
+would make this the only grouping/dispatch path.
 Everything in Phase 1 below Correlation — memory, evidence, triage,
 verification — still runs keyed off the Incident, unaffected by which
 Situation an Incident belongs to. There is no `state_controller_mode`,
 shadow-output path, or legacy/new runtime switch: one build runs one
 grouping/dispatch path, and one Slack writer, at a time.
 
-- **MCP tools:** `alertint_list_situations`, `alertint_get_situation` —
-  see [MCP clients](../integrations/mcp-clients.md)
-- **Config:** `situations.*` — see
+- **MCP tools:** `alertint_list_situations`, `alertint_get_situation`,
+  `alertint_list_situation_transitions`, `alertint_get_delivery_state`,
+  `alertint_list_observation_runs`, `alertint_get_semantic_profile`,
+  `alertint_correct_semantic_profile` — see
+  [MCP clients](../integrations/mcp-clients.md)
+- **Config:** `situations.*`, including `situations.preparation.*` and
+  `situations.semantic_profiles.*` — see
   [Configuration](../getting-started/configuration.md#situations)
 - **Observability:** every controller cycle, every consumed L2 dispatch
-  slot, and every consumed Acute Triage attempt is one OpenTelemetry span
+  slot, every consumed Acute Triage attempt, every evidence-preparation
+  phase call, every capability's own connector dispatch, and every
+  semantic-profile inference dispatch is one OpenTelemetry span
   (`situation.controller.reconcile`, `situation.assessment.dispatch`,
-  `incident.triage.attempt`) carrying only stable identity, digest, count,
-  closed result-class, and duration attributes — Situation/Incident/attempt
-  IDs, input version, material/basis hashes, membership/Incident-input/
-  evidence-pack digests, dispatch slot and attempt number — never a prompt,
-  proposal, provider body, or SQL text. Each span site also writes one
+  `incident.triage.attempt`, `situation.preparation`,
+  `situation.observation`, `semantic_profile.inference`) carrying only
+  stable identity, digest, count, closed result-class, and duration
+  attributes — Situation/Incident/attempt IDs, input version, material/basis
+  hashes, membership/Incident-input/evidence-pack digests, dispatch slot and
+  attempt number — never a prompt, proposal, provider body, or SQL text. The
+  audit log records the same preparation/profile events by durable ID —
+  cycle begun, inference call dispatched/completed, profile head advanced,
+  profile change delivered, and profile correction applied. Each span site
+  also writes one
   structured log line with the same identities plus the span's
   `trace_id`/`span_id`, and the audit log carries the same identities, so
   the three surfaces can be reconciled against each other and against the
@@ -181,8 +246,8 @@ grouping/dispatch path, and one Slack writer, at a time.
 - **stdout:** one `{"kind":"situation.transition",…}` line per committed
   Transition, deduplicated by `transition_id`; it means the change is
   durable, never that Slack has seen it
-- **Not yet:** connector preparation, Assessment/Triage artifacts beyond the
-  bounded recent-attempt history, operator questions or judgments,
+- **Not yet:** Assessment/Triage artifacts beyond the bounded recent-attempt
+  history, operator questions or judgments, expected-behaviour envelopes,
   OpenTelemetry metrics or logs export (traces only today), the final v0.14
   cutover
 

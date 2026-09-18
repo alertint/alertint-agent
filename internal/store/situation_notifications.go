@@ -66,14 +66,18 @@ var ErrNewerRootProjectionPending = errors.New("store: a newer root projection i
 // which carries both a broadcast_handoff and a quiet thread_append at the
 // same sequence.
 const (
-	notificationRootFirst  = `(ni.effect_class <> 'root_sync')`
-	notificationClassRank  = `CASE ni.effect_class WHEN 'root_sync' THEN 0 WHEN 'thread_append' THEN 1 ELSE 2 END`
-	notificationQueueOrder = `root_first ASC, transition_sequence ASC, class_rank ASC, id ASC`
+	notificationRootFirst = `(ni.effect_class <> 'root_sync')`
+	notificationClassRank = `CASE ni.effect_class WHEN 'root_sync' THEN 0 WHEN 'thread_append' THEN 1 ELSE 2 END`
+	// A Transition may make analysis and clearance ready atomically. Their
+	// durable reply kinds split the effects; analysis leads when both exist,
+	// while an absent analysis row can never hold recovery.
+	notificationReplyRank  = `CASE ni.reply_kind WHEN 'analysis_completed' THEN 10 WHEN 'partial_clearance' THEN 20 WHEN 'recovery_observed' THEN 30 WHEN 'recovered' THEN 40 ELSE 0 END`
+	notificationQueueOrder = `root_first ASC, transition_sequence ASC, reply_rank ASC, class_rank ASC, id ASC`
 	notificationClaimOrder = `ORDER BY (gap_generation IS NULL) ASC, gap_generation ASC, situation_id ASC, ` + notificationQueueOrder
 	// notificationReloadOrder is notificationClaimOrder expressed directly
 	// against the table (alias ni), for the post-claim reload.
 	notificationReloadOrder = `ORDER BY (ni.gap_generation IS NULL) ASC, ni.gap_generation ASC, ni.situation_id ASC, ` +
-		notificationRootFirst + ` ASC, ni.transition_sequence ASC, ` + notificationClassRank + ` ASC, ni.id ASC`
+		notificationRootFirst + ` ASC, ni.transition_sequence ASC, ` + notificationReplyRank + ` ASC, ` + notificationClassRank + ` ASC, ni.id ASC`
 )
 
 // validateNotificationClaim rejects a claim that cannot fence anything.
@@ -262,13 +266,14 @@ const notificationClaimRankingQuery = `
 			       ni.transition_sequence AS transition_sequence,
 			       ` + notificationRootFirst + ` AS root_first,
 			       ` + notificationClassRank + ` AS class_rank,
+			       ` + notificationReplyRank + ` AS reply_rank,
 			       (ni.status = 'pending') AS claimable,
 			       (ni.claim_owner IS NULL OR ni.lease_expires_at <= ?) AS unleased,
 			       (ni.retry_at IS NULL OR ni.retry_at <= ?) AS due,
 			       (ni.requires_root = 0 OR (s.slack_channel IS NOT NULL AND s.slack_root_ts IS NOT NULL)) AS root_ready,
 			       ROW_NUMBER() OVER (
 			           PARTITION BY ni.situation_id
-			           ORDER BY ` + notificationRootFirst + ` ASC, ni.transition_sequence ASC, ` + notificationClassRank + ` ASC, ni.id ASC
+			           ORDER BY ` + notificationRootFirst + ` ASC, ni.transition_sequence ASC, ` + notificationReplyRank + ` ASC, ` + notificationClassRank + ` ASC, ni.id ASC
 			       ) AS rn
 			FROM notification_intents ni
 			LEFT JOIN situations s ON s.id = ni.situation_id
@@ -713,4 +718,644 @@ func (s *Store) GetSituationRootCoordinates(ctx context.Context, situationID str
 		return "", "", false, nil
 	}
 	return channel.String, ts.String, true, nil
+}
+
+// ----------------------------------------------------------------------
+// B5: DeliveredHistory (B0 integration contract §4/§5)
+// ----------------------------------------------------------------------
+
+// Reply effect classes and the two intent-status families the delivery
+// history folds: what the operator has actually SEEN, and what is still
+// owed to them behind a delivery gap.
+const (
+	historyReplyClasses = `'thread_append','broadcast_handoff'`
+	historyDelivered    = `'delivered'`
+	historyLive         = `'pending','blocked_configuration','failed'`
+	// historyStanding is the union the STANDING state is folded over, in
+	// one sequence-ordered pass: what the operator has seen plus what they
+	// are still owed. Folding the two families separately cannot express a
+	// queued correction of a delivered fact.
+	historyStanding = historyDelivered + `,` + historyLive
+)
+
+// loadDeliveredHistoryTx reads situationID's durable, delivery-aware
+// context inside the caller's coherent transaction. Three reads, each
+// answering its own question and none standing in for another:
+//
+//   - DELIVERED replies, folded in Transition-sequence order, are what the
+//     operator has actually been told;
+//   - DELIVERED and still-owed replies (pending, blocked_configuration or
+//     failed) folded TOGETHER, in one sequence-ordered pass, are what they
+//     will be looking at once the queue drains — the standing state. An
+//     obstacle waiting behind a delivery gap WILL be published, so a
+//     correction planned meanwhile must survive (R5); and a queued
+//     clearance really does cancel a delivered appearance, so an obstacle
+//     recorded again behind it is news, not a duplicate (round 2, R2);
+//   - a Transition LATER than the reply being delivered, carrying a
+//     finding, an inconclusive completion or the terminal end and earning
+//     a reply of its own, has overtaken that reply's start assurance. This
+//     is the one forward-looking read, and it is asked only when the caller
+//     bounded the load to one reply (round 3, R1);
+//   - DELIVERED root_sync rows carry the assurance only through their own
+//     authority Transition's recorded Briefing.Work.ExecutionStarted
+//     (§5.2). The CURRENT Episode summary cannot answer this — the root
+//     edit that would show execution may still be queued — and
+//     EpisodeSummary.InvestigationStarted answers a different question
+//     again, since the legacy action-contract journal fold sets it for
+//     merely PLANNED triage (R2).
+//
+// rootPublished is SnapshotInput.RootPublished, already known to the
+// caller: when it is false no root has ever been delivered, so the
+// delivered-root read is skipped rather than run against a set that cannot
+// yet contain one.
+func loadDeliveredHistoryTx(ctx context.Context, tx *sql.Tx, situationID string, rootPublished bool) (situation.DeliveredHistory, error) {
+	return loadCommunicatedHistoryTx(ctx, tx, situationID, rootPublished, 0)
+}
+
+// loadCommunicatedHistoryTx is loadDeliveredHistoryTx with an optional
+// bound: beforeSequence, when positive, restricts every read to replies
+// whose own Transition sequence is strictly lower — the delivery-time
+// question "what did the operator have before THIS message?".
+func loadCommunicatedHistoryTx(ctx context.Context, tx *sql.Tx, situationID string, rootPublished bool, beforeSequence int) (situation.DeliveredHistory, error) {
+	var out situation.DeliveredHistory
+
+	delivered, err := historyTransitionsTx(ctx, tx, situationID, historyReplyClasses, historyDelivered, beforeSequence)
+	if err != nil {
+		return out, err
+	}
+	for _, tr := range delivered {
+		if tr.Sequence > out.LastDeliveredSequence {
+			out.LastDeliveredSequence = tr.Sequence
+		}
+		if transitionConveysAssurance(tr) {
+			out.AssuranceConveyed = true
+		}
+	}
+	out.CommunicatedLimitationCodes, out.CommunicatedAction = foldLimitationsAndAction(delivered)
+
+	standing, err := historyTransitionsTx(ctx, tx, situationID, historyReplyClasses, historyStanding, beforeSequence)
+	if err != nil {
+		return out, err
+	}
+	out.ProjectedLimitationCodes, out.ProjectedAction = foldLimitationsAndAction(standing)
+
+	if beforeSequence > 0 {
+		// Only a bounded read is being asked about one particular reply, so
+		// only a bounded read has a reply to look forward from.
+		out.AssuranceSuperseded, err = assuranceOvertakenTx(ctx, tx, situationID, beforeSequence)
+		if err != nil {
+			return out, err
+		}
+	}
+
+	if rootPublished && !out.AssuranceConveyed {
+		roots, err := historyTransitionsTx(ctx, tx, situationID, `'root_sync'`, historyDelivered, beforeSequence)
+		if err != nil {
+			return out, err
+		}
+		for _, tr := range roots {
+			// The delivered root VERSION's own work provenance: this
+			// Transition's briefing is what that summary version folded.
+			if b := tr.Projection.Briefing; b != nil && b.Work.ExecutionStarted {
+				out.AssuranceConveyed = true
+				break
+			}
+		}
+	}
+
+	liveAssurance, err := liveTransientAssuranceIntentIDsTx(ctx, tx, situationID, 0)
+	if err != nil {
+		return out, err
+	}
+	if len(liveAssurance) > 0 {
+		id := liveAssurance[0]
+		out.LiveAssuranceIntentID = &id
+	}
+	return out, nil
+}
+
+// historyTransitionsTx loads, in Transition-sequence order, every
+// Transition referenced by one of situationID's notification intents in the
+// given effect-class and status families. classes and statuses are
+// constant SQL literal lists owned by this file, never caller input.
+func historyTransitionsTx(ctx context.Context, tx *sql.Tx, situationID, classes, statuses string, beforeSequence int) ([]situationmodel.Transition, error) {
+	// #nosec G202 -- classes/statuses and transitionColumns are file-owned SQL constants; values are bound below.
+	query := `
+		SELECT ` + transitionColumns + `
+		FROM situation_transitions
+		WHERE situation_id = ? AND id IN (
+			SELECT transition_id FROM notification_intents
+			WHERE situation_id = ? AND effect_class IN (` + classes + `) AND status IN (` + statuses + `)
+		)`
+	args := []any{situationID, situationID}
+	if beforeSequence > 0 {
+		query += ` AND sequence < ?`
+		args = append(args, beforeSequence)
+	}
+	query += ` ORDER BY sequence ASC`
+
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: query notification history transitions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []situationmodel.Transition
+	for rows.Next() {
+		tr, err := scanTransition(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: scan notification history transition: %w", err)
+		}
+		out = append(out, tr)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate notification history transitions: %w", err)
+	}
+	return out, nil
+}
+
+// transitionConveysAssurance reports whether a reply rendered from tr told
+// the operator that execution actually began. B3's candidate list is the
+// accepted fact; the investigation_started journal LABEL is consulted only
+// for a legacy projection that carries no candidate list at all, because
+// that label also covers merely planned triage (R2).
+func transitionConveysAssurance(tr situationmodel.Transition) bool {
+	if d := tr.Projection.OperatorDelta; d != nil && len(d.Candidates) > 0 {
+		for _, c := range d.Candidates {
+			if c.Kind == situationmodel.CandidateFirstExecutionAssurance {
+				return true
+			}
+		}
+		return false
+	}
+	return tr.JournalKind == situationmodel.JournalInvestigationStarted
+}
+
+// assuranceOvertakenBy names the supersession reason a candidate kind
+// carries for a stale start assurance, if any. ONE vocabulary, shared by
+// §5.3's commit-time row supersession and the delivery-time candidate
+// check, so the two can never drift apart.
+func assuranceOvertakenBy(kind situationmodel.CandidateKind) (string, bool) {
+	switch kind { //nolint:exhaustive // every other candidate kind leaves the start assurance's own claim untouched; the default is the answer for all of them.
+	case situationmodel.CandidateFirstExecutionAssurance:
+		return SupersessionReasonProgress, true
+	case situationmodel.CandidateTerminalEnd:
+		return SupersessionReasonTerminalEnd, true
+	case situationmodel.CandidateAllClear:
+		return SupersessionReasonRecovery, true
+	case situationmodel.CandidateUsefulFinding, situationmodel.CandidateInconclusiveCompletion:
+		return SupersessionReasonFinding, true
+	default:
+		return "", false
+	}
+}
+
+// assuranceOvertakenTx reports whether the start assurance a reply at
+// afterSequence still carries has already been overtaken: a LATER
+// Transition earns a reply of its own — delivered or still owed — and that
+// Transition recorded a finding, an inconclusive completion or the
+// Situation's terminal end.
+//
+// §5.3 answers the same question at commit time and retires the whole row,
+// but only when every fact on it is the transient assurance. A row that
+// also carries material member or scope history is not disposable (R3), so
+// it survives to be delivered later; this read is how its assurance alone
+// is dropped at that point, leaving the material facts to post (lead review
+// round 3, 2026-09-09, R1).
+//
+// It is the only read in this file that looks forward. The limitation and
+// action folds stay bounded strictly BELOW the reply's own sequence,
+// because a later correction may not rewrite what an earlier message was
+// allowed to say. An assurance is a claim about the present, not a record
+// of the past, so the present is what decides it.
+func assuranceOvertakenTx(ctx context.Context, tx *sql.Tx, situationID string, afterSequence int) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT `+transitionColumns+`
+		FROM situation_transitions
+		WHERE situation_id = ? AND sequence > ? AND id IN (
+			SELECT transition_id FROM notification_intents
+			WHERE situation_id = ? AND effect_class IN (`+historyReplyClasses+`)
+			  AND status IN (`+historyStanding+`)
+		)
+		ORDER BY sequence ASC`, situationID, afterSequence, situationID)
+	if err != nil {
+		return false, fmt.Errorf("store: query overtaking transitions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	overtaken := false
+	for rows.Next() {
+		tr, err := scanTransition(rows)
+		if err != nil {
+			return false, fmt.Errorf("store: scan overtaking transition: %w", err)
+		}
+		if d := tr.Projection.OperatorDelta; d != nil {
+			for _, c := range d.Candidates {
+				if _, ok := assuranceOvertakenBy(c.Kind); ok {
+					overtaken = true
+				}
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("store: iterate overtaking transitions: %w", err)
+	}
+	return overtaken, nil
+}
+
+// foldLimitationsAndAction folds one sequence-ordered set of reply
+// Transitions into the NET limitation codes and operator action they leave
+// standing. Distinct codes stay independent. Its two callers pass two
+// different sets — delivered only, and delivered together with still-owed —
+// and the ordering is what distinguishes them: a clearing only cancels an
+// appearance that comes before it.
+//
+// The fold reads every persisted candidate, not the subset the deliverer
+// selected, and still equals what actually rendered: ReplyEligible only ever
+// drops a candidate whose fold here is a no-op against the same history —
+// a repeated appearance re-adds a code already present, a clearing with
+// nothing on screen removes a code that is absent, and a withdrawal with no
+// request outstanding clears an action already nil.
+func foldLimitationsAndAction(trs []situationmodel.Transition) ([]string, *situationmodel.OperatorAction) {
+	var codes []string
+	var action *situationmodel.OperatorAction
+	for _, tr := range trs {
+		if tr.Projection.OperatorDelta == nil {
+			continue
+		}
+		for _, c := range tr.Projection.OperatorDelta.Candidates {
+			switch c.Kind { //nolint:exhaustive // only these two kinds carry delivered-history state to fold; every other kind needs no running total here.
+			case situationmodel.CandidateAbilityChanged:
+				if c.Limitation == nil {
+					continue
+				}
+				if c.Limitation.Cleared {
+					codes = removeString(codes, c.Limitation.Code)
+				} else {
+					codes = appendMissingString(codes, c.Limitation.Code)
+				}
+			case situationmodel.CandidateActionChanged:
+				if c.Action == nil {
+					continue
+				}
+				if c.Action.Withdrawn {
+					action = nil
+				} else {
+					a := c.Action.Action
+					action = &a
+				}
+			}
+		}
+	}
+	return codes, action
+}
+
+// liveTransientAssuranceIntentIDsTx names the still-deliverable
+// thread_append replies whose own Transition is a PURELY transient start
+// assurance — the only replies §5.3 permits superseding. A row that also
+// carries a member/scope change, a finding, an action or a limitation is
+// material history (ADR 0042/0052) and is not disposable, whatever its
+// journal label says (lead review 2026-09-09, R3).
+//
+// purelyTransientAssurance is the ONE authority on that question (D1, lead
+// review 2026-09-10). Neither query below re-states it as a journal-kind
+// pre-filter: a second copy of the rule is exactly how D1 survived, since
+// the label and the recorded candidate list disagree on the canonical
+// planned-then-running order. The scan stays bounded by the live
+// thread_append set these Situations already own.
+//
+// beforeSequence, when positive, bounds eligibility to Transitions strictly
+// below it — the overtaking commit's own sequence, so an earlier reply can
+// never be retired by a later-sequenced one. 0 or less means unbounded.
+func liveTransientAssuranceIntentIDsTx(ctx context.Context, tx *sql.Tx, situationID string, beforeSequence int) ([]string, error) {
+	bound, joinBound := "", ""
+	boundArgs := []any{}
+	if beforeSequence > 0 {
+		bound, joinBound = " AND sequence < ?", " AND t.sequence < ?"
+		boundArgs = append(boundArgs, beforeSequence)
+	}
+	transient := map[string]bool{}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT `+transitionColumns+`
+		FROM situation_transitions
+		WHERE situation_id = ?`+bound+` AND id IN (
+			SELECT transition_id FROM notification_intents
+			WHERE situation_id = ? AND effect_class = 'thread_append' AND status IN (`+historyLive+`)
+		)`, append(append([]any{situationID}, boundArgs...), situationID)...)
+	if err != nil {
+		return nil, fmt.Errorf("store: query live assurance transitions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		tr, err := scanTransition(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: scan live assurance transition: %w", err)
+		}
+		transient[tr.ID] = purelyTransientAssurance(tr)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate live assurance transitions: %w", err)
+	}
+	if len(transient) == 0 {
+		return nil, nil
+	}
+
+	pairs, err := tx.QueryContext(ctx, `
+		SELECT i.id, i.transition_id
+		FROM notification_intents i
+		JOIN situation_transitions t ON t.id = i.transition_id
+		WHERE i.situation_id = ? AND i.effect_class = 'thread_append'
+		  AND i.status IN (`+historyLive+`)`+joinBound+`
+		ORDER BY t.sequence ASC, i.id ASC`, append([]any{situationID}, boundArgs...)...)
+	if err != nil {
+		return nil, fmt.Errorf("store: query live assurance intents: %w", err)
+	}
+	defer func() { _ = pairs.Close() }()
+	var out []string
+	for pairs.Next() {
+		var intentID, transitionID string
+		if err := pairs.Scan(&intentID, &transitionID); err != nil {
+			return nil, fmt.Errorf("store: scan live assurance intent: %w", err)
+		}
+		if transient[transitionID] {
+			out = append(out, intentID)
+		}
+	}
+	if err := pairs.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate live assurance intents: %w", err)
+	}
+	return out, nil
+}
+
+// purelyTransientAssurance reports whether every fact tr would put on
+// screen is the disposable start assurance.
+//
+// B3's candidate list is the accepted fact — the same rule
+// transitionConveysAssurance already follows, for the same reason. The
+// investigation_started journal LABEL is consulted only for a legacy
+// projection that carries no candidate list at all, because that label
+// covers merely PLANNED triage (R2) and, on the canonical
+// planned-then-running order, is absent from the Transition that records
+// the real execution start: selectControllerReason reaches
+// ReasonInvestigationStarted only when the prior contract was not already
+// an investigation. Keying eligibility on the label therefore refused to
+// retire exactly the reply §5.3 exists to retire (D1, lead review
+// 2026-09-10).
+//
+// Migration 0023's notification_intents_thread_supersession_guard is this
+// predicate's SQL twin; situation_assurance_candidate_parity_test.go drives
+// both from the same JSON so they cannot drift.
+func purelyTransientAssurance(tr situationmodel.Transition) bool {
+	d := tr.Projection.OperatorDelta
+	if d == nil || len(d.Candidates) == 0 {
+		return tr.JournalKind == situationmodel.JournalInvestigationStarted
+	}
+	for _, c := range d.Candidates {
+		if c.Kind != situationmodel.CandidateFirstExecutionAssurance {
+			return false
+		}
+	}
+	return true
+}
+
+// GetCommunicatedHistory reads what the operator has already been told,
+// what will be standing once everything owed lands, and whether anything
+// has overtaken this reply's start assurance, for situationID. The first
+// two are bounded to replies whose Transition sequence is strictly below
+// beforeSequence (0 or less means unbounded); the third is the one
+// forward-looking question and is answered only for a bounded read.
+// The Slack deliverer calls it immediately before rendering one reply, so
+// the payload it posts carries exactly the facts ReplyEligible accepted
+// (B0 integration contract §4/§5; lead review 2026-09-09, R1).
+func (s *Store) GetCommunicatedHistory(ctx context.Context, situationID string, beforeSequence int) (situation.DeliveredHistory, error) {
+	if strings.TrimSpace(situationID) == "" {
+		return situation.DeliveredHistory{}, errors.New("store: communicated history requires a situation id")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return situation.DeliveredHistory{}, fmt.Errorf("store: begin communicated history: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	h, err := loadCommunicatedHistoryTx(ctx, tx, situationID, true, beforeSequence)
+	if err != nil {
+		return situation.DeliveredHistory{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return situation.DeliveredHistory{}, fmt.Errorf("store: commit communicated history: %w", err)
+	}
+	return h, nil
+}
+
+// appendMissingString appends s to list if not already present.
+func appendMissingString(list []string, s string) []string {
+	for _, v := range list {
+		if v == s {
+			return list
+		}
+	}
+	return append(list, s)
+}
+
+// removeString returns list with every occurrence of s removed, preserving
+// order.
+func removeString(list []string, s string) []string {
+	out := make([]string, 0, len(list))
+	for _, v := range list {
+		if v != s {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// ----------------------------------------------------------------------
+// B5: obsolete-start supersession (B0 integration contract §5.3, E1)
+// ----------------------------------------------------------------------
+
+// Supersession reasons this store writes for a superseded thread_append —
+// the store's own closed vocabulary, the same way
+// SupersessionReasonNewerRootProjection is for a superseded root_sync.
+const (
+	SupersessionReasonFinding     = "superseded_by_finding"
+	SupersessionReasonProgress    = "superseded_by_progress"
+	SupersessionReasonRecovery    = "superseded_by_recovery"
+	SupersessionReasonTerminalEnd = "superseded_by_terminal_end"
+)
+
+// supersedeObsoleteAssuranceTx marks any still-live (pending,
+// blocked_configuration, or failed) first-execution-assurance thread_append
+// for situationID superseded when history's own just-committed Transitions
+// carry a useful_finding, inconclusive_completion or terminal_end
+// candidate — in the SAME fenced CommitController transaction this call
+// runs inside (B0 integration contract §5.3). Call it AFTER the commit's
+// own new reply intents are inserted (applyHistoryCommitTx), so the
+// replacement row this UPDATE points at already exists — no self-reference
+// FK deferral needed, unlike supersedeLiveRootSyncTx's same-statement case.
+//
+// A delivered assurance is material history (ADR 0042/0052) and untouched:
+// the live-status filter here is the same one 0020/0022 encode as a CHECK.
+// Only a row whose every recorded candidate is the transient assurance is
+// superseded — reason precedence lets one Transition carry the start AND a
+// member/scope change, and that row's material history is not disposable
+// (lead review 2026-09-09, R3). Migration 0023's guard asks that same
+// question in SQL; 0022 asked the journal-label question instead, which is
+// the D1 failure (lead review 2026-09-10).
+//
+// Eligibility is additionally bounded to Transitions strictly BELOW the
+// overtaking one's sequence: a reply can only ever be retired by something
+// that came after it. The assurance candidate is emitted at most once per
+// Situation, so this narrows no behavior observed today; it makes the
+// ordering structural rather than incidental.
+//
+// A no-op when history carries no overtaking candidate, when no purely
+// transient live assurance exists, or when the overtaking Transition itself
+// earned no reply (nothing has actually taken the assurance's place on
+// screen yet).
+func supersedeObsoleteAssuranceTx(ctx context.Context, tx *sql.Tx, situationID string, history *situation.HistoryCommit) error {
+	if history == nil {
+		return nil
+	}
+	overtakingTransitionID, overtakingSequence, reason := assuranceOvertakingTransition(history.Transitions)
+	correlationOnly := overtakingTransitionID == ""
+	if correlationOnly {
+		overtakingTransitionID, overtakingSequence = correlationOvertakingTransition(history.Transitions)
+		reason = SupersessionReasonProgress
+	}
+	if overtakingTransitionID == "" {
+		return nil
+	}
+
+	replacementID := notificationReplacementIntentID(history.Intents, overtakingTransitionID, correlationOnly)
+	if replacementID == "" {
+		return nil
+	}
+
+	obsolete, err := obsoleteTransientIntentIDsTx(ctx, tx, situationID, overtakingSequence, correlationOnly)
+	if err != nil {
+		return err
+	}
+	return supersedeNotificationIntentIDsTx(ctx, tx, situationID, replacementID, reason, obsolete)
+}
+
+func assuranceOvertakingTransition(transitions []situationmodel.Transition) (string, int, string) {
+	var transitionID, reason string
+	var sequence int
+outer:
+	for _, tr := range transitions {
+		if tr.Projection.OperatorDelta == nil {
+			continue
+		}
+		for _, c := range tr.Projection.OperatorDelta.Candidates {
+			overtakes, ok := assuranceOvertakenBy(c.Kind)
+			if !ok {
+				continue
+			}
+			if overtakes == SupersessionReasonTerminalEnd {
+				transitionID, sequence, reason = tr.ID, tr.Sequence, overtakes
+				break outer
+			}
+			if transitionID == "" {
+				transitionID, sequence, reason = tr.ID, tr.Sequence, overtakes
+			}
+		}
+	}
+	return transitionID, sequence, reason
+}
+
+func correlationOvertakingTransition(transitions []situationmodel.Transition) (string, int) {
+	for _, tr := range transitions {
+		b := tr.Projection.Briefing
+		if b == nil || b.Flow == nil || b.Flow.CorrelationClosesAt == nil ||
+			tr.CreatedAt.Before(*b.Flow.CorrelationClosesAt) || b.Work.Phase == situationmodel.WorkPhaseCollecting {
+			continue
+		}
+		return tr.ID, tr.Sequence
+	}
+	return "", 0
+}
+
+func notificationReplacementIntentID(intents []situationmodel.NotificationIntent, transitionID string, allowRoot bool) string {
+	for _, in := range intents {
+		if in.TransitionID != nil && *in.TransitionID == transitionID &&
+			(in.EffectClass == situationmodel.EffectThreadAppend || in.EffectClass == situationmodel.EffectBroadcastHandoff) {
+			return in.ID
+		}
+	}
+	if allowRoot {
+		for _, in := range intents {
+			if in.TransitionID != nil && *in.TransitionID == transitionID && in.EffectClass == situationmodel.EffectRootSync {
+				return in.ID
+			}
+		}
+	}
+	return ""
+}
+
+func obsoleteTransientIntentIDsTx(ctx context.Context, tx *sql.Tx, situationID string, beforeSequence int, correlationOnly bool) ([]string, error) {
+	var assurances []string
+	if !correlationOnly {
+		var err error
+		assurances, err = liveTransientAssuranceIntentIDsTx(ctx, tx, situationID, beforeSequence)
+		if err != nil {
+			return nil, err
+		}
+	}
+	correlations, err := liveTransientCorrelationIntentIDsTx(ctx, tx, situationID, beforeSequence)
+	if err != nil {
+		return nil, err
+	}
+	obsolete := make([]string, 0, len(assurances)+len(correlations))
+	obsolete = append(obsolete, assurances...)
+	return append(obsolete, correlations...), nil
+}
+
+func supersedeNotificationIntentIDsTx(ctx context.Context, tx *sql.Tx, situationID, replacementID, reason string, obsolete []string) error {
+	args := []any{reason, replacementID, situationID, replacementID}
+	placeholders := ""
+	for _, id := range obsolete {
+		if id == replacementID {
+			continue
+		}
+		if placeholders != "" {
+			placeholders += ","
+		}
+		placeholders += "?"
+		args = append(args, id)
+	}
+	if placeholders == "" {
+		return nil
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE notification_intents
+		SET status = 'superseded', supersession_reason = ?, replacement_intent_id = ?,
+		    claim_owner = NULL, lease_expires_at = NULL, retry_at = NULL
+		WHERE situation_id = ? AND effect_class = 'thread_append'
+		  AND status IN (`+historyLive+`)
+		  AND id != ?
+		  AND id IN (`+placeholders+`)`, args...); err != nil {
+		return fmt.Errorf("store: supersede obsolete assurance: %w", err)
+	}
+	return nil
+}
+
+func liveTransientCorrelationIntentIDsTx(ctx context.Context, tx *sql.Tx, situationID string, beforeSequence int) ([]string, error) {
+	query := `SELECT id FROM notification_intents
+		WHERE situation_id = ? AND effect_class = 'thread_append'
+		  AND reply_kind = 'correlation_started' AND status IN (` + historyLive + `)`
+	args := []any{situationID}
+	if beforeSequence > 0 {
+		query += ` AND transition_sequence < ?`
+		args = append(args, beforeSequence)
+	}
+	query += ` ORDER BY transition_sequence ASC, id ASC`
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: query live correlation replies: %w", err)
+	}
+	ids, err := scanStringRows(rows)
+	if err != nil {
+		return nil, fmt.Errorf("store: read live correlation reply ids: %w", err)
+	}
+	return ids, nil
 }

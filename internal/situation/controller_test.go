@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/llm"
+	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
 	"github.com/alertint/alertint-agent/internal/situation"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
@@ -27,6 +28,12 @@ type fakeControllerStore struct {
 
 	loadInput situation.SnapshotInput
 	loadErr   error
+	// loadInputs, when non-empty, overrides loadInput one call at a time (FIFO) —
+	// lets a Plan 4 Task 6 test simulate a preparer's reload returning freshly
+	// prepared evidence on the SECOND LoadReconciliationInput call within one
+	// Reconcile. Every pre-Task-6 test leaves this nil, so loadInput alone
+	// still answers every call exactly as before.
+	loadInputs []situation.SnapshotInput
 
 	factsAppended []model.Fact
 
@@ -70,6 +77,10 @@ func (f *fakeControllerStore) LoadReconciliationInput(ctx context.Context, claim
 	defer f.mu.Unlock()
 	f.order = append(f.order, "load")
 	in := f.loadInput
+	if len(f.loadInputs) > 0 {
+		in = f.loadInputs[0]
+		f.loadInputs = f.loadInputs[1:]
+	}
 	in.Now = now
 	return in, f.loadErr
 }
@@ -394,6 +405,59 @@ func TestControllerReconcileUnchangedTrustworthyBasisReusesWithZeroL2Calls(t *te
 	// the real-SQLite end-to-end reuse test in internal/store.
 	if commit.Attempt.WorkAttempt != 1 {
 		t.Fatalf("reuse commit work_attempt = %d, want 1 (migration 0015 requires >= 1; 0 violates the CHECK)", commit.Attempt.WorkAttempt)
+	}
+}
+
+func TestBriefingReviewCommittedSkipIsVisibleWithoutChangingAssessmentBasis(t *testing.T) {
+	in := ctBaseSnapshotInput()
+	in.Now = ctBaseTime.Add(10 * time.Minute)
+	in.Incidents[0].Triage.Phase = "awaiting_decision"
+	// A skip fixture must now carry its own accepted investigation provenance.
+	ids := make([]string, 0, len(in.Deliveries))
+	for _, d := range in.Deliveries {
+		ids = append(ids, d.ID)
+	}
+	at := in.Now.Add(-time.Minute)
+	in.Incidents[0].Triage.LastExecution = &situation.TriageExecution{AttemptID: "accepted-1", ResultCode: "success", OutputDigest: "accepted-digest", CompletedAt: &at, MemberDeliveryIDs: ids, Evidence: &situation.TriageCompletionEvidence{Observations: []string{"Payment errors recorded in logs"}}}
+	snap := situation.BuildSnapshot(in)
+	in.CurrentAssessment = &situation.AuthoritativeAssessment{
+		ID: "assessment-prior", SituationID: "situation-1", InputVersion: 2,
+		AssessmentBasisHash: snap.AssessmentBasisHash, MaterialFactHash: snap.MaterialFactHash,
+		Derivation: model.DerivationModelValidated,
+		Coverage:   []model.IncidentCoverage{{IncidentID: "incident-1", MembershipDigest: situation.MembershipDigest("incident-1", in.Deliveries), IncidentInputDigest: situation.IncidentInputDigest("incident-1", "group-1", in.Deliveries)}},
+		Assessment: model.Assessment{
+			SchemaVersion: model.AssessmentSchemaVersion, Persistence: model.PersistenceSustained,
+			Impact: model.ImpactSuspected, Novelty: model.NoveltyFamiliar, Causality: model.CausalityCorrelated,
+			Attention: model.AttentionObserve, Lifecycle: model.LifecycleActive,
+			EvidenceQuality: model.EvidenceQualityComplete, Cadence: model.CadenceSlow,
+			ActionContract: model.ActionContract{NextActor: model.NextActorNone, NextUpdateAt: &ctBaseTime},
+		},
+	}
+	st := &fakeControllerStore{loadInput: in}
+	client := &fakeAssessmentClient{}
+	if err := ctController(t, st, client).Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.commits) != 1 {
+		t.Fatalf("expected one controller commit, got %d", len(st.commits))
+	}
+	commit := st.commits[0]
+	if len(commit.TriageDecisions) != 1 || commit.TriageDecisions[0].Decision != situation.TriageDecisionSkip {
+		t.Fatalf("fixture must commit a clean skip: %+v", commit.TriageDecisions)
+	}
+	if commit.History == nil || commit.History.Summary == nil || len(commit.History.Transitions) == 0 {
+		t.Fatal("missing committed history")
+	}
+	for _, b := range []*model.OperatorBriefing{commit.History.Summary.Briefing, commit.History.Transitions[0].Projection.Briefing} {
+		if b == nil || b.Pending != 0 || b.Unavailable != 1 {
+			t.Errorf("same-commit skip still promises analysis: %+v", b)
+		}
+	}
+	if in.Incidents[0].Triage.Phase != "awaiting_decision" || st.loadInput.Incidents[0].Triage.Phase != "awaiting_decision" {
+		t.Fatal("presentation mutated coherent assessment input")
+	}
+	if client.calls != 0 || commit.MaterialFactHash != snap.MaterialFactHash || commit.Attempt.AssessmentBasisHash != snap.AssessmentBasisHash {
+		t.Fatal("presentation changed assessment basis or dispatched L2")
 	}
 }
 
@@ -1463,11 +1527,225 @@ func TestControllerReconcileLifecycleDeadlineDuringRecoveryReachesClosedUnknownW
 	}
 }
 
+// TestControllerReconcileFreshClearanceSurvivesGraceExpiryDespiteEpisodeAge
+// is R1's repair regression (lead review 2026-09-08, S1-03): pastDeadline is
+// computed from ObservationDeadlineAt(cur.EffectiveStartedAt, ...), which
+// never moves, so an old episode is permanently "past deadline" from the
+// moment recovery is first observed. Before this fix the RecoveryPending
+// branch checked pastDeadline ahead of grace expiry unconditionally, so an
+// old episode's very next reconcile after entering recovery_pending always
+// closed unknown — discarding a delivery that was actually received well
+// after the deadline (current, not stale). Drives two REAL Reconcile
+// cycles (Active -> RecoveryPending, then RecoveryPending -> grace expiry)
+// for both a young control and an eight-day-old episode, carrying the SAME
+// resolved delivery forward unchanged into the second cycle: episode age
+// alone, independent of the delivery's own receipt time, must never flip a
+// genuinely current clearance to closed_unknown.
+func TestControllerReconcileFreshClearanceSurvivesGraceExpiryDespiteEpisodeAge(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		age  time.Duration
+	}{
+		{"young_episode", time.Hour},
+		{"eight_day_old_episode", 8 * 24 * time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			start := ctBaseTime.Add(-tc.age)
+			firstNow := ctBaseTime
+
+			in := ctBaseSnapshotInput()
+			in.Now = firstNow
+			in.Situation.EffectiveStartedAt = start
+			in.Situation.EffectiveStartedAtBasis = model.SourceTimeBasisSourcePayload
+			delivery := ctDelivery("delivery-1", "incident-1", false, "warning")
+			delivery.ReceivedAt = firstNow
+			in.Deliveries = []situation.Delivery{delivery}
+
+			store1 := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
+			c1 := ctLifecycleController(store1, &fakeAssessmentClient{}, firstNow)
+			if err := c1.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+				t.Fatalf("first Reconcile: %v", err)
+			}
+			first := store1.commits[0]
+			if first.Lifecycle != model.LifecycleRecoveryPending {
+				t.Fatalf("first cycle lifecycle = %q, want recovery_pending", first.Lifecycle)
+			}
+			if first.RecoveryObservedAt == nil || first.GraceUntil == nil {
+				t.Fatalf("recovery_pending must carry recovery_observed_at and grace_until, got %+v", first)
+			}
+
+			secondNow := first.GraceUntil.Add(time.Second) // past grace expiry.
+
+			in2 := ctBaseSnapshotInput()
+			in2.Now = secondNow
+			in2.Situation.EffectiveStartedAt = start
+			in2.Situation.EffectiveStartedAtBasis = model.SourceTimeBasisSourcePayload
+			in2.Situation.Lifecycle = model.LifecycleRecoveryPending
+			in2.Situation.RecoveryObservedAt = first.RecoveryObservedAt
+			in2.Situation.GraceUntil = first.GraceUntil
+			in2.Deliveries = []situation.Delivery{delivery} // the exact same delivery, unchanged.
+
+			store2 := &fakeControllerStore{loadInput: in2, beginWorkAttempt: 1}
+			c2 := ctLifecycleController(store2, &fakeAssessmentClient{}, secondNow)
+			if err := c2.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+				t.Fatalf("second Reconcile: %v", err)
+			}
+			second := store2.commits[0]
+			if second.Lifecycle != model.LifecycleRecovered {
+				t.Fatalf("second cycle lifecycle = %q, want recovered (episode age=%s)", second.Lifecycle, tc.age)
+			}
+		})
+	}
+}
+
+// TestControllerReconcileFreshClearanceSurvivesDeadlineStraddle pins R1 for
+// S1-03 (lead reviews 2026-09-08, rounds 2 and 3): the clearance that
+// initiates grace remains valid through grace (canonical slide 1 allclear →
+// stable, "Grace expired and clearance still holds") regardless of (a) which
+// side of the episode's fixed observation deadline its receipt landed on and
+// (b) the ordinary ingestion/scheduling delay between that receipt and the
+// reconcile that stamps RecoveryObservedAt. A receipt necessarily precedes
+// the reconcile that consumes it; that ordering — and the deadline
+// happening to fall between the two — is not evidence of source silence.
+// Every combination must reach recovered at grace expiry on the strength of
+// the SAME single delivery, unchanged. The 30-second delay rows deliberately
+// put the receipt on the far side of the deadline from the reconcile.
+func TestControllerReconcileFreshClearanceSurvivesDeadlineStraddle(t *testing.T) {
+	deadline := ctBaseTime.Add(7 * 24 * time.Hour)
+	for _, side := range []struct {
+		name   string
+		offset time.Duration
+	}{
+		{"one_second_before_deadline", -time.Second},
+		{"one_second_after_deadline", time.Second},
+	} {
+		for _, delay := range []struct {
+			name string
+			d    time.Duration
+		}{
+			{"receipt_equals_reconcile", 0},
+			{"receipt_1ms_before_reconcile", time.Millisecond},
+			{"receipt_30s_before_reconcile", 30 * time.Second},
+		} {
+			t.Run(side.name+"/"+delay.name, func(t *testing.T) {
+				firstNow := deadline.Add(side.offset)
+
+				in := ctBaseSnapshotInput()
+				in.Now = firstNow
+				in.Situation.EffectiveStartedAt = deadline.Add(-7 * 24 * time.Hour)
+				in.Situation.EffectiveStartedAtBasis = model.SourceTimeBasisSourcePayload
+				delivery := ctDelivery("delivery-1", "incident-1", false, "warning")
+				delivery.ReceivedAt = firstNow.Add(-delay.d)
+				in.Deliveries = []situation.Delivery{delivery}
+
+				store1 := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
+				c1 := ctLifecycleController(store1, &fakeAssessmentClient{}, firstNow)
+				if err := c1.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+					t.Fatalf("first Reconcile: %v", err)
+				}
+				first := store1.commits[0]
+				if first.Lifecycle != model.LifecycleRecoveryPending {
+					t.Fatalf("first cycle lifecycle = %q, want recovery_pending", first.Lifecycle)
+				}
+				if first.RecoveryObservedAt == nil || first.GraceUntil == nil {
+					t.Fatalf("recovery_pending must carry recovery_observed_at and grace_until, got %+v", first)
+				}
+
+				secondNow := *first.GraceUntil // exactly at grace expiry.
+
+				in2 := ctBaseSnapshotInput()
+				in2.Now = secondNow
+				in2.Situation.EffectiveStartedAt = in.Situation.EffectiveStartedAt
+				in2.Situation.EffectiveStartedAtBasis = model.SourceTimeBasisSourcePayload
+				in2.Situation.Lifecycle = model.LifecycleRecoveryPending
+				in2.Situation.RecoveryObservedAt = first.RecoveryObservedAt
+				in2.Situation.GraceUntil = first.GraceUntil
+				in2.Deliveries = []situation.Delivery{delivery} // the exact same delivery, unchanged.
+
+				store2 := &fakeControllerStore{loadInput: in2, beginWorkAttempt: 1}
+				c2 := ctLifecycleController(store2, &fakeAssessmentClient{}, secondNow)
+				if err := c2.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+					t.Fatalf("second Reconcile: %v", err)
+				}
+				second := store2.commits[0]
+				if second.Lifecycle != model.LifecycleRecovered {
+					t.Fatalf("second cycle lifecycle = %q, want recovered (%s, %s)", second.Lifecycle, side.name, delay.name)
+				}
+			})
+		}
+	}
+}
+
+// TestControllerReconcileRecoveryPendingStaleClearanceClosesUnknownAfterObservationWindow
+// pins the negative side of the same S1-03 rule (canonical slide 1 loss-r:
+// "Do not interpret source silence as sustained recovery"; Plan-3 probe
+// grace_expiry_requires_current_clearance): past the episode's observation
+// deadline, a recovery_pending Situation whose newest delivery of ANY kind
+// is itself a full source-aware observation window old (7 days for the
+// long class) has lost lifecycle truth and closes unknown at grace expiry
+// with its recovery fields carried (Finding C2); a newest delivery one
+// second inside that window is still current and completes grace as
+// recovered. The window is the contract's own ObservationDeadlineDuration
+// for the class, measured from the source's last observation — not from
+// the episode's start, and not from the reconcile that stamped
+// RecoveryObservedAt.
+func TestControllerReconcileRecoveryPendingStaleClearanceClosesUnknownAfterObservationWindow(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		age  time.Duration
+		want model.Lifecycle
+	}{
+		{"newest_delivery_one_full_window_old", 7 * 24 * time.Hour, model.LifecycleClosedUnknown},
+		{"newest_delivery_one_second_inside_window", 7*24*time.Hour - time.Second, model.LifecycleRecovered},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := ctBaseTime.Add(9 * 24 * time.Hour) // episode nine days old: well past the long class's 7-day deadline.
+			recoveryObservedAt := now.Add(-2 * time.Minute)
+			graceUntil := now // exactly at grace expiry.
+
+			in := ctBaseSnapshotInput()
+			in.Now = now
+			in.Situation.EffectiveStartedAt = ctBaseTime
+			in.Situation.EffectiveStartedAtBasis = model.SourceTimeBasisSourcePayload
+			in.Situation.Lifecycle = model.LifecycleRecoveryPending
+			in.Situation.RecoveryObservedAt = &recoveryObservedAt
+			in.Situation.GraceUntil = &graceUntil
+			delivery := ctDelivery("delivery-1", "incident-1", false, "warning") // resolved, not firing.
+			delivery.ReceivedAt = now.Add(-tc.age)
+			in.Deliveries = []situation.Delivery{delivery}
+
+			store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
+			c := ctLifecycleController(store, &fakeAssessmentClient{}, now)
+			if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			commit := store.commits[0]
+			if commit.Lifecycle != tc.want {
+				t.Fatalf("lifecycle = %q, want %q (newest delivery %s old)", commit.Lifecycle, tc.want, tc.age)
+			}
+			if commit.RecoveryObservedAt == nil || !commit.RecoveryObservedAt.Equal(recoveryObservedAt) || commit.GraceUntil == nil || !commit.GraceUntil.Equal(graceUntil) {
+				t.Fatalf("recovery fields must be carried forward unchanged, got observed=%v grace=%v", commit.RecoveryObservedAt, commit.GraceUntil)
+			}
+			if tc.want == model.LifecycleClosedUnknown && commit.TerminalReason == nil {
+				t.Fatal("closed_unknown must carry a terminal reason")
+			}
+		})
+	}
+}
+
 // TestControllerReconcileLifecycleActiveReachesClosedUnknownWithoutRecoveryFields
 // covers the OTHER reachable closed_unknown path — straight from active, no
 // recovery ever observed — proving RecoveryObservedAt/GraceUntil correctly
 // stay nil (never fabricated) when the Situation never entered recovery at
 // all, alongside the C2 test above's carried-forward-non-nil case.
+//
+// S1-03 fix: the fixture must carry zero deliveries (no symptom at all), not
+// a resolved one — a genuinely observed all-clear is itself a recovery
+// signal (deriveSymptoms/AnyFiring), so resolveLifecycle now honors it ahead
+// of the deadline fallback ("known resolution does not become unknown from
+// age") and would instead reach recovery_pending. The previous fixture
+// supplied a resolved delivery while its own comment claimed "no recovery
+// ever observed" — exactly the priority bug S1-03 fixes.
 func TestControllerReconcileLifecycleActiveReachesClosedUnknownWithoutRecoveryFields(t *testing.T) {
 	effectiveStartedAt := ctBaseTime
 	now := effectiveStartedAt.Add(7*24*time.Hour + time.Minute) // just past the "long" class's 7-day deadline.
@@ -1477,7 +1755,7 @@ func TestControllerReconcileLifecycleActiveReachesClosedUnknownWithoutRecoveryFi
 	in.Situation.EffectiveStartedAt = effectiveStartedAt
 	in.Situation.EffectiveStartedAtBasis = model.SourceTimeBasisSourcePayload
 	in.Situation.Lifecycle = model.LifecycleActive
-	in.Deliveries = []situation.Delivery{ctDelivery("delivery-1", "incident-1", false, "warning")} // resolved, not firing, never recovered through the controller.
+	in.Deliveries = nil // no delivery ever received for this Situation: no recovery, no firing, no symptom at all.
 
 	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
 	c := ctLifecycleController(store, &fakeAssessmentClient{}, now)
@@ -1494,6 +1772,234 @@ func TestControllerReconcileLifecycleActiveReachesClosedUnknownWithoutRecoveryFi
 	}
 	if commit.TerminalAt == nil || commit.TerminalReason == nil {
 		t.Fatalf("closed_unknown must carry both terminal fields set, got TerminalAt=%v TerminalReason=%v", commit.TerminalAt, commit.TerminalReason)
+	}
+}
+
+// TestControllerReconcileExhaustedAssessmentDoesNotAlterLifecycleTransition
+// is S1-02's positive control: "LLM failure or budget exhaustion is
+// insufficient" to affect source lifecycle (slide 1 edge loss-a). This
+// drives Reconcile through the SAME steady-state "already exhausted, no
+// re-touch" path as TestControllerReconcileFiveWorkAttemptsExhaustedParksWithoutDispatch,
+// but with a resolved (not firing) delivery — resolveLifecycle's signature
+// (cur, in, snap, now) never receives Assessment/L2 state at all, so an
+// exhausted L2 must neither manufacture source recovery/closure nor block
+// the genuine recovery_pending transition a resolved delivery earns.
+func TestControllerReconcileExhaustedAssessmentDoesNotAlterLifecycleTransition(t *testing.T) {
+	in := ctBaseSnapshotInput()
+	in.Deliveries = []situation.Delivery{ctDelivery("delivery-1", "incident-1", false, "warning")} // resolved, not firing.
+	in.ControllerParked = situation.ControllerParkedState{
+		At: &ctBaseTime, Reason: situation.ParkedReasonDependency,
+		MaterialFactHash: situation.BuildSnapshot(in).MaterialFactHash,
+	}
+	store := &fakeControllerStore{loadInput: in, beginErr: situation.ErrControllerAttemptsExhausted}
+	client := &fakeAssessmentClient{}
+	c := ctController(t, store, client)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if client.calls != 0 {
+		t.Fatalf("CompleteOnce calls = %d, want 0 (exhausted must never dispatch)", client.calls)
+	}
+	if len(store.commits) != 1 {
+		t.Fatalf("commits = %d, want 1", len(store.commits))
+	}
+	commit := store.commits[0]
+	if commit.Lifecycle != model.LifecycleRecoveryPending {
+		t.Fatalf("lifecycle = %q, want recovery_pending: an exhausted L2 must not suppress a genuine source recovery observation", commit.Lifecycle)
+	}
+	if commit.RecoveryObservedAt == nil || commit.GraceUntil == nil {
+		t.Fatalf("recovery_pending must carry recovery_observed_at and grace_until, got %+v", commit)
+	}
+}
+
+// ----------------------------------------------------------------------
+// Plan 4 Task 6: EvidencePreparer wiring — Reconcile dispatches a bounded
+// preparation phase before deriving Snapshot/lifecycle, and its own
+// reload of durable state (never the in-memory receipt below) becomes the
+// authoritative basis. fakeEvidencePreparer never touches the store
+// itself: it only records which phase(s) it was asked to prepare, mirroring
+// how the real cmd/alertint adapter (Task 9) is the one that actually
+// persists Runs/Facts — the fake proves Reconcile's OWN gating/reload
+// contract in isolation from that adapter.
+// ----------------------------------------------------------------------
+
+type fakeEvidencePreparer struct {
+	mu     sync.Mutex
+	calls  []situation.PreparationRequest
+	err    error
+	result situation.PreparedState
+}
+
+func (f *fakeEvidencePreparer) Prepare(ctx context.Context, req situation.PreparationRequest) (situation.PreparedState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, req)
+	return f.result, f.err
+}
+
+func (f *fakeEvidencePreparer) phasesCalled() []observationmodel.Phase {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	phases := make([]observationmodel.Phase, len(f.calls))
+	for i, c := range f.calls {
+		phases[i] = c.Phase
+	}
+	return phases
+}
+
+// TestControllerReconcilePreparedEvidenceOverridesStaleLocalDeliveryOnReload
+// proves the two load-bearing halves of Task 6's control-flow contract at
+// once: the lifecycle-phase preparer is invoked before any lifecycle
+// resolution, and Reconcile's SECOND LoadReconciliationInput call (the
+// "reload", never the in-memory Prepare() receipt — preparation.go's own
+// doc comment) is what Reconcile actually reasons from. The fixture's
+// FIRST load still shows a firing Delivery (stale local truth); only the
+// RELOAD carries a durable preparation cycle whose source_lifecycle
+// evidence shows the one expected member fully resolved. A Situation still
+// reading its stale first load would stay active; reading the reload
+// correctly reaches recovery_pending.
+func TestControllerReconcilePreparedEvidenceOverridesStaleLocalDeliveryOnReload(t *testing.T) {
+	now := ctBaseTime.Add(5 * time.Minute)
+
+	firstLoad := ctBaseSnapshotInput() // one firing delivery — stale once prepared evidence lands.
+	firstLoad.Now = now
+
+	reloaded := firstLoad
+	reloaded.Prepared = situation.PreparedState{
+		CycleID:    "cycle-1",
+		Generation: 2,
+		Lifecycle: []situation.SourceObservation{
+			{AlertID: "delivery-1", EpisodeKey: "delivery-1:1", Source: "alertmanager", State: situation.SourceStateResolved,
+				ObservedAt: now, AcquisitionMode: "webhook", DeadlineAt: now.Add(24 * time.Hour)},
+		},
+	}
+
+	store := &fakeControllerStore{loadInput: firstLoad, loadInputs: []situation.SnapshotInput{firstLoad, reloaded}, beginWorkAttempt: 1}
+	c := ctLifecycleController(store, &fakeAssessmentClient{}, now)
+	preparer := &fakeEvidencePreparer{}
+	c.SetEvidencePreparer(preparer)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(store.commits) != 1 {
+		t.Fatalf("commits = %d, want 1", len(store.commits))
+	}
+	commit := store.commits[0]
+	if commit.Lifecycle != model.LifecycleRecoveryPending {
+		t.Fatalf("lifecycle = %q, want recovery_pending: the reload's prepared evidence (fully resolved), not the stale first load's firing delivery, must be authoritative", commit.Lifecycle)
+	}
+	if commit.PreparationCycleID != "cycle-1" || commit.PreparationGeneration != 2 {
+		t.Fatalf("PreparationCycleID/Generation = %q/%d, want cycle-1/2 (the reloaded cycle)", commit.PreparationCycleID, commit.PreparationGeneration)
+	}
+
+	// The Situation left ACTIVE only in the STALE first load — reading it
+	// correctly means resolveLifecycle never even runs before the reload,
+	// so the gate for the assessment phase must be decided from the
+	// RELOADED (recovery_pending) state: no assessment-phase prepare.
+	phases := preparer.phasesCalled()
+	if len(phases) != 1 || phases[0] != observationmodel.PhaseLifecycle {
+		t.Fatalf("preparer phases = %v, want exactly [lifecycle]: recovery_pending must skip the assessment phase", phases)
+	}
+}
+
+// TestControllerReconcilePreparerRunsAssessmentPhaseWhileStillActive proves
+// the OTHER half of the "if active" gate: when the reloaded prepared
+// evidence still leaves the Situation active (a mixed member set — one
+// resolved, one not yet past its own observation deadline — deliberately
+// NOT reachable in the pre-Plan-4 local-only model, which has no
+// "unobserved" state), the assessment-phase preparer call happens too, in
+// order, under the reloaded input.
+func TestControllerReconcilePreparerRunsAssessmentPhaseWhileStillActive(t *testing.T) {
+	now := ctBaseTime.Add(5 * time.Minute)
+
+	firstLoad := ctBaseSnapshotInput()
+	firstLoad.Now = now
+	a := ctDelivery("a", "incident-1", true, "warning")
+	a.AlertID = "alert-A"
+	b := ctDelivery("b", "incident-1", true, "warning")
+	b.AlertID = "alert-B"
+	firstLoad.Deliveries = []situation.Delivery{a, b}
+	firstLoad.Incidents[0].AlertCount = 2
+
+	reloaded := firstLoad
+	reloaded.Prepared = situation.PreparedState{
+		CycleID:    "cycle-1",
+		Generation: 1,
+		Lifecycle: []situation.SourceObservation{
+			{AlertID: "alert-A", State: situation.SourceStateResolved, ObservedAt: now, AcquisitionMode: "webhook", DeadlineAt: now.Add(24 * time.Hour)},
+			// alert-B carries NO observation at all this cycle and its
+			// deadline has not passed: genuinely unresolved uncertainty, not
+			// evidence of recovery — the Situation must stay active.
+		},
+	}
+
+	store := &fakeControllerStore{loadInput: firstLoad, loadInputs: []situation.SnapshotInput{firstLoad, reloaded}, beginWorkAttempt: 1}
+	client := &fakeAssessmentClient{responses: []func() (llm.OneShotCompletion, error){acceptedResponse(t)}}
+	c := ctLifecycleController(store, client, now)
+	preparer := &fakeEvidencePreparer{}
+	c.SetEvidencePreparer(preparer)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	commit := store.commits[0]
+	if commit.Lifecycle != model.LifecycleActive {
+		t.Fatalf("lifecycle = %q, want active: alert-B is genuinely unresolved (no observation, deadline not passed), not evidence of recovery", commit.Lifecycle)
+	}
+	phases := preparer.phasesCalled()
+	if len(phases) != 2 || phases[0] != observationmodel.PhaseLifecycle || phases[1] != observationmodel.PhaseAssessment {
+		t.Fatalf("preparer phases = %v, want [lifecycle assessment]", phases)
+	}
+}
+
+// TestControllerReconcileSkipsPreparerWhenNoneConfigured documents the
+// local-only compatibility guarantee every pre-Task-6 test already relies
+// on implicitly: a nil preparer (the default) makes Reconcile behave
+// exactly as it always did, and PreparationCycleID/Generation stay at
+// their zero values so CommitController's cycle-sealing step is a no-op.
+func TestControllerReconcileSkipsPreparerWhenNoneConfigured(t *testing.T) {
+	now := ctBaseTime.Add(5 * time.Minute)
+	in := ctBaseSnapshotInput()
+	in.Now = now
+
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
+	c := ctLifecycleController(store, &fakeAssessmentClient{}, now)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := len(store.commits[0].PreparationCycleID); got != 0 {
+		t.Fatalf("PreparationCycleID = %q, want empty with no preparer configured", store.commits[0].PreparationCycleID)
+	}
+	// Exactly one load (no reload): the preparer gate never ran at all.
+	if got := len(store.order); got == 0 || store.order[0] != "load" {
+		t.Fatalf("store.order = %v, want to start with a single load", store.order)
+	}
+}
+
+// TestControllerReconcilePreparerErrorStopsCycleWithoutCommit proves
+// plan.md's "store failures stop the cycle" rule: a hard error from
+// Prepare() (reserved for a durable STORE failure, never an ordinary
+// connector outage — those surface as PreparedState.Limitations instead)
+// must abort Reconcile before any commit, exactly like a
+// LoadReconciliationInput failure already does.
+func TestControllerReconcilePreparerErrorStopsCycleWithoutCommit(t *testing.T) {
+	now := ctBaseTime.Add(5 * time.Minute)
+	in := ctBaseSnapshotInput()
+	in.Now = now
+
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
+	c := ctLifecycleController(store, &fakeAssessmentClient{}, now)
+	preparer := &fakeEvidencePreparer{err: errors.New("store: durable failure")}
+	c.SetEvidencePreparer(preparer)
+
+	if err := c.Reconcile(context.Background(), ctBaseClaim()); err == nil {
+		t.Fatal("Reconcile: want an error when the preparer fails, got nil")
+	}
+	if len(store.commits) != 0 {
+		t.Fatalf("commits = %d, want 0: a preparer failure must stop the cycle before any commit", len(store.commits))
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -197,27 +198,21 @@ func (s *Store) LatestVerdictKinds(ctx context.Context, incidentIDs []string) (m
 // correction on it steers its own re-judgment). Returns nil, nil when the key
 // carries no verdict.
 //
-// The note subquery is bound to "AND a.created_at <= v.created_at": within
-// PersistVerdictCapture's transaction the annotation row is written strictly
-// before the verdict row's own created_at is stamped, so the capture's own
-// annotation always satisfies this bound and remains the newest-and-earliest
-// candidate. Without the bound, a later free-text alertint_incident_annotate
-// call of the same kind on the same incident would silently outrank and
-// replace the captured verdict's note here — annotations must stay pure
-// context with zero effect on triage.
+// Chronology is decided on parsed instants, never on the stored text. Times
+// are written with time.RFC3339Nano, which trims trailing zeros, so one
+// database holds ".2378Z", ".237872Z", ".1Z" and a bare "Z" side by side. A
+// shorter value's "Z" sorts above the next digit of a longer one, which makes
+// SQL text ordering disagree with real time exactly when two writes land
+// inside the same fraction of a second. That is why neither the candidate
+// ordering below nor capturedVerdictNote's bound is expressed in SQL.
 func (s *Store) GoverningVerdict(ctx context.Context, groupKey string, currentIsDrill bool) (*IncidentVerdict, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT v.id, v.incident_id, v.version, v.verdict, v.source, v.label_confidence,
 		       v.expectation_json, COALESCE(v.widened_json, ''), COALESCE(v.cause_category, ''),
-		       COALESCE((SELECT a.note FROM incident_annotations a
-		                 WHERE a.incident_id = v.incident_id AND a.kind = v.verdict
-		                   AND a.created_at <= v.created_at
-		                 ORDER BY a.created_at DESC, a.id DESC LIMIT 1), ''),
 		       v.created_at
 		FROM incident_verdicts v
 		JOIN incidents i ON i.id = v.incident_id
-		WHERE i.group_key = ?
-		ORDER BY v.created_at DESC, v.id DESC`, groupKey)
+		WHERE i.group_key = ?`, groupKey)
 	if err != nil {
 		return nil, fmt.Errorf("store: governing verdict: %w", err)
 	}
@@ -229,7 +224,7 @@ func (s *Store) GoverningVerdict(ctx context.Context, groupKey string, currentIs
 		var created string
 		if err := rows.Scan(&v.ID, &v.IncidentID, &v.Version, &v.Verdict, &v.Source,
 			&v.LabelConfidence, &v.ExpectationJSON, &v.WidenedJSON, &v.CauseCategory,
-			&v.Note, &created); err != nil {
+			&created); err != nil {
 			return nil, fmt.Errorf("store: governing verdict scan: %w", err)
 		}
 		if v.CreatedAt, err = time.Parse(time.RFC3339Nano, created); err != nil {
@@ -243,6 +238,14 @@ func (s *Store) GoverningVerdict(ctx context.Context, groupKey string, currentIs
 	if len(candidates) == 0 {
 		return nil, nil //nolint:nilnil // callers distinguish not-found by nil pointer, not sentinel
 	}
+	// Newest capture first; identical instants keep the newest stored row, the
+	// same tie-break the previous "created_at DESC, id DESC" clause applied.
+	sort.Slice(candidates, func(i, j int) bool {
+		if !candidates[i].CreatedAt.Equal(candidates[j].CreatedAt) {
+			return candidates[i].CreatedAt.After(candidates[j].CreatedAt)
+		}
+		return candidates[i].ID > candidates[j].ID
+	})
 	ids := make([]string, len(candidates))
 	for i := range candidates {
 		ids[i] = candidates[i].IncidentID
@@ -252,9 +255,72 @@ func (s *Store) GoverningVerdict(ctx context.Context, groupKey string, currentIs
 		return nil, fmt.Errorf("store: governing verdict drill flags: %w", err)
 	}
 	for i := range candidates {
-		if flags[candidates[i].IncidentID] == currentIsDrill {
-			return &candidates[i], nil
+		if flags[candidates[i].IncidentID] != currentIsDrill {
+			continue
 		}
+		governing := candidates[i]
+		if governing.Note, err = s.capturedVerdictNote(ctx, governing); err != nil {
+			return nil, err
+		}
+		return &governing, nil
 	}
 	return nil, nil //nolint:nilnil // callers distinguish not-found by nil pointer, not sentinel
+}
+
+// capturedVerdictNote returns the note the capture itself wrote: the newest
+// annotation of the verdict's own kind on its incident that is not later than
+// the verdict row.
+//
+// Within PersistVerdictCapture's transaction the annotation is written
+// strictly before the verdict row's created_at is stamped, so a capture's own
+// note always satisfies the bound. Without it, a later free-text
+// alertint_incident_annotate call of the same kind on the same incident would
+// silently outrank and replace the captured note here — annotations must stay
+// pure context with zero effect on triage.
+func (s *Store) capturedVerdictNote(ctx context.Context, v IncidentVerdict) (string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, note, created_at FROM incident_annotations
+		WHERE incident_id = ? AND kind = ?`, v.IncidentID, v.Verdict)
+	if err != nil {
+		return "", fmt.Errorf("store: governing verdict note: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var (
+		note  string
+		at    time.Time
+		id    int64
+		found bool
+	)
+	for rows.Next() {
+		var candidateID int64
+		var candidateNote, created string
+		if err := rows.Scan(&candidateID, &candidateNote, &created); err != nil {
+			return "", fmt.Errorf("store: governing verdict note scan: %w", err)
+		}
+		candidateAt, err := time.Parse(time.RFC3339Nano, created)
+		if err != nil {
+			return "", fmt.Errorf("store: governing verdict note parse created_at: %w", err)
+		}
+		if candidateAt.After(v.CreatedAt) {
+			continue // written after the capture: pure context, never the verdict's note
+		}
+		if found && !newerAnnotation(candidateAt, candidateID, at, id) {
+			continue
+		}
+		note, at, id, found = candidateNote, candidateAt, candidateID, true
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("store: governing verdict note rows: %w", err)
+	}
+	return note, nil
+}
+
+// newerAnnotation orders two annotations of one incident: later instant wins,
+// and identical instants keep the newest stored row.
+func newerAnnotation(aAt time.Time, aID int64, bAt time.Time, bID int64) bool {
+	if !aAt.Equal(bAt) {
+		return aAt.After(bAt)
+	}
+	return aID > bID
 }

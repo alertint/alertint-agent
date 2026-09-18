@@ -346,6 +346,7 @@ type triageAnalysis struct {
 // tail, or — for the Analyze path — from AfterCommit via
 // PostCommit.AuditRecords).
 func (s *Skill) analyzeCore(ctx context.Context, inc store.Incident, alerts []store.Alert, rejudge bool, trigger string, spanStart time.Time, recurrence string, replay *replayRun) (triageAnalysis, error) {
+	ctx, usage := withAnalysisUsage(ctx)
 	// Evaluate the rule engine: it may pick a specialized analysis template or
 	// short-circuit the LLM entirely for known issues (correct and consistent on
 	// a re-judgment too — a known-issue rule replacing an LLM finding).
@@ -417,10 +418,12 @@ func (s *Skill) analyzeCore(ctx context.Context, inc store.Incident, alerts []st
 
 	// enrichmentJSON is what a successful persist stores, including the
 	// log-enrichment snapshot so the evidence pack can replay exactly what the
-	// model saw (empty on the short-circuit / logs-disabled path → stored
-	// NULL). On a verification round this reflects call 2's finding (or the
+	// model saw, plus the model usage of this invocation. On a verification
+	// round this reflects call 2's finding (or the
 	// draft when call 2 was lost).
-	enrichmentJSON := marshalEnrichments(enrichmentSources(ar, ver), s.logger, inc.ID)
+	sources := enrichmentSources(ar, ver)
+	sources["analysis_usage"] = usage.snapshot()
+	enrichmentJSON := marshalEnrichments(sources, s.logger, inc.ID)
 	s.auditEnrichmentDigests(ctx, inc.ID, ar.metrics, ar.logs, ar.changes, ar.sentry, ar.zabbix)
 
 	return triageAnalysis{
@@ -816,7 +819,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 	}
 	system := s.systemPrompt(decision, len(alerts))
 	obs := s.cfg.Health.Begin(llmhealth.CapabilityTriageDraft, inc.ID)
-	comp, err := s.llm.Complete(ctx, system, llm.Prompt{
+	comp, err := completeWithAnalysisUsage(ctx, s.llm, system, llm.Prompt{
 		Prefix:      userPrompt,
 		CachePrefix: s.cfg.Verification.Enabled && s.cfg.PromptCaching,
 	}, RequiredKeys)
@@ -876,7 +879,7 @@ func (s *Skill) systemPrompt(decision rules.Decision, alertCount int) string {
 	}
 	if s.cfg.Rules != nil {
 		if t, ok := s.cfg.Rules.Template(name); ok {
-			return t
+			return t + "\n" + operatorEvidenceInstructions
 		}
 		s.logger.Warn("acutetriage: prompt template not found in any pack; using built-in", "template", name)
 	}
@@ -1084,7 +1087,7 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 	// Call 2: the byte-identical call-1 prefix + the draft + the computed round +
 	// the (moved) memory-verdict request. On any failure the draft stands.
 	obs := s.cfg.Health.Begin(llmhealth.CapabilityVerificationRejudge, inc.ID)
-	comp, err := s.llm.Complete(ctx, ar.system, llm.Prompt{
+	comp, err := completeWithAnalysisUsage(ctx, s.llm, ar.system, llm.Prompt{
 		Prefix:      ar.user,
 		Suffix:      callTwoContinuation(ar.raw, round, ar.memory),
 		CachePrefix: s.cfg.PromptCaching,
@@ -1101,7 +1104,11 @@ func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts
 				"finding ships capped and the card says the check did not complete (check your LLM setup)",
 				"incident", inc.ID, "verdict_version", g.Version, "err", err)
 		}
-		return s.degradedDraft(ctx, inc.ID, ar.raw, round, resp, g, DegradationLLMCallFailed)
+		reason := DegradationLLMCallFailed
+		if errors.Is(err, llm.ErrBudgetExhausted) {
+			reason = "budget_deferred"
+		}
+		return s.degradedDraft(ctx, inc.ID, ar.raw, round, resp, g, reason)
 	}
 	// Cache-engagement probe: call 2 always marks the shared prefix, so a zero
 	// cache read means the prefix is below the model's cacheable floor (benign,

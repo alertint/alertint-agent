@@ -919,9 +919,12 @@ func runHistoryScenario(t *testing.T, sc historyScenario) {
 			f := newHistoryFixture(t, sanitizeOwner(sc.name)+"-"+sanitizeOwner(string(boundary)), boundary, false)
 			sc.run(f)
 			got := assertConverged(t, f.st)
+			// Lab repair: crashes must preserve the same investigation, not
+			// excuse a no-analysis skip by deleting its history from comparison.
 			if got != want {
-				t.Fatalf("canonical history after crashing at %s differs from the uninterrupted run.\n--- uninterrupted ---\n%s\n--- after crash+replay ---\n%s", boundary, want, got)
+				t.Fatalf("canonical history after crash %s differs:\n--- reference ---\n%s\n--- replay ---\n%s", boundary, want, got)
 			}
+
 			if sc.assert != nil {
 				sc.assert(t, f.st)
 			}
@@ -1400,16 +1403,20 @@ func scenarioInvestigation() historyScenario {
 		},
 		assert: func(t *testing.T, st *store.Store) {
 			t.Helper()
-			requireReason(t, st, "investigation_started")
+			// Every crash path must still run the investigation once.
 			requireJournalKind(t, st, "investigation_started")
-			var started int
-			if err := st.DB().QueryRowContext(context.Background(),
-				`SELECT json_extract(summary_json,'$.investigation_started') FROM situation_episode_summaries
-				  WHERE situation_id = (SELECT id FROM situations ORDER BY created_at DESC, id DESC LIMIT 1)`).Scan(&started); err != nil {
-				t.Fatalf("read investigation_started: %v", err)
+			requireJournalKind(t, st, string(situationmodel.JournalEvidenceConclusion))
+			sid := scalarString(t, st, `SELECT id FROM situations WHERE group_key='group=hist-investigation' ORDER BY created_at DESC,id DESC LIMIT 1`)
+			view, err := st.GetSituationEpisodeView(context.Background(), sid)
+			if err != nil {
+				t.Fatal(err)
 			}
-			if started != 1 {
-				t.Fatal("the Episode summary does not record that investigation started")
+			b := view.Summary.Briefing
+			if b == nil || !b.Work.ExecutionStarted || b.AnalysisCount != 1 || b.Unavailable != 0 || b.Pending != 0 {
+				t.Fatalf("crash lost actual investigation: %+v", b)
+			}
+			if n := scalarInt(t, st, `SELECT COUNT(*) FROM incident_triage_attempts WHERE situation_id=? AND result_code='success'`, sid); n != 1 {
+				t.Fatalf("successful investigations=%d, want 1", n)
 			}
 		},
 	}

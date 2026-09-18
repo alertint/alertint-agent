@@ -3,6 +3,7 @@
 package situation
 
 import (
+	"strings"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/situation/model"
@@ -46,8 +47,10 @@ const (
 
 	// DecisionReasonCleanSkip is the only Decision=skip reason: one
 	// trustworthy Assessment exactly covers the unchanged material fact
-	// hash and current membership/Incident-input digests.
-	DecisionReasonCleanSkip = "clean_skip_unchanged_coverage"
+	// hash and current membership/Incident-input digests, and a matched
+	// accepted investigation covers those same inputs.
+	DecisionReasonCleanSkip               = "clean_skip_unchanged_coverage"
+	DecisionReasonNoMatchingInvestigation = "no_matching_accepted_investigation"
 )
 
 // needsTriageDecision reports whether inc requires a fresh DecideTriage
@@ -122,6 +125,10 @@ func decideOne(inc IncidentState, currentMembership, currentInputDigest string, 
 		return TriageDecisionRequest, DecisionReasonIncidentInputChanged, nil
 	}
 
+	if !acceptedInvestigationCovers(inc, in.Deliveries, currentMembership, currentInputDigest) {
+		return TriageDecisionRequest, DecisionReasonNoMatchingInvestigation, nil
+	}
+
 	id := prior.ID
 	return TriageDecisionSkip, DecisionReasonCleanSkip, &id
 }
@@ -168,4 +175,33 @@ func DecideTriage(snap Snapshot, in SnapshotInput, now time.Time) []TriageDecisi
 		})
 	}
 	return out
+}
+
+// An assessment observing an input is not evidence that Acute Triage ran.
+// Keep the assessment checks above, then require a matched accepted result
+// over these inputs. Missing/legacy provenance requests bounded work.
+func acceptedInvestigationCovers(inc IncidentState, deliveries []Delivery, membership, input string) bool {
+	e := inc.Triage.LastExecution
+	if e == nil || e.AttemptID == "" || e.ResultCode != "success" || e.OutputDigest == "" || e.CompletedAt == nil || e.Evidence == nil || len(e.MemberDeliveryIDs) == 0 {
+		return false
+	}
+	useful := strings.TrimSpace(e.Evidence.Hypothesis) != ""
+	for _, observation := range e.Evidence.Observations {
+		useful = useful || strings.TrimSpace(observation) != ""
+	}
+	if !useful {
+		return false
+	}
+	wanted := make(map[string]bool, len(e.MemberDeliveryIDs))
+	for _, id := range e.MemberDeliveryIDs {
+		wanted[id] = true
+	}
+	var claimed []Delivery
+	for _, d := range deliveries {
+		if d.IncidentID == inc.ID && wanted[d.ID] {
+			claimed = append(claimed, d)
+			delete(wanted, d.ID)
+		}
+	}
+	return len(wanted) == 0 && MembershipDigest(inc.ID, claimed) == membership && IncidentInputDigest(inc.ID, inc.GroupKey, claimed) == input
 }

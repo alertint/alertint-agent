@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/alertint/alertint-agent/internal/llm"
+	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
@@ -56,6 +59,10 @@ type AssessmentCall struct {
 	ProviderProfile                                   *string
 	InputVersion, RetryEpoch, WorkAttempt, CallNumber int
 	DispatchedAt                                      time.Time
+	// PreparationCycleID names the frozen preparation cycle whose evidence
+	// this dispatch reasons from ("" when no cycle exists); the store pins
+	// that basis permanently when the dispatch row commits (ADR-0051).
+	PreparationCycleID string
 }
 
 // AssessmentAttempt is one immutable Assessment outcome — a validated,
@@ -128,6 +135,17 @@ type TriageDecision struct {
 	DecidedAt                                               time.Time
 }
 
+// DecisionReasonEligibilityPolicyMinimumMembers is the store-initiated
+// clean-skip reason CleanSkipIncidentTriageBelowMinimumMembers records: an
+// eligibility policy (minimum member count), not exact prior coverage,
+// excluded this Incident's Acute Triage. Declared here (situation package,
+// this package's own closed vocabulary for decision_reason codes — the same
+// pattern DecisionReasonCleanSkip and the ParkedReason* codes use) so the
+// store can reference it without owning the meaning, and so
+// WorkProjection.SkipReason can tell coverage reuse apart from a policy
+// exclusion (S2-03).
+const DecisionReasonEligibilityPolicyMinimumMembers = "eligibility_policy_minimum_members"
+
 // ControllerCommit is everything one fenced CommitController transaction
 // commits together: the Assessment attempt and its content, the Triage
 // decisions sharing that commit, the projected lifecycle/Attention/
@@ -183,6 +201,9 @@ type ControllerCommit struct {
 	RetryAt            *time.Time
 	LastErrorClass     *string
 	Parked             ParkedState
+	// BudgetDeniedCallID refunds a proved-unsent first call in this same
+	// fenced commit. Its immutable call/outcome records remain intact.
+	BudgetDeniedCallID *string
 
 	// History is Plan 3 Task 5's addition: this reconciliation's immutable
 	// Transitions, the Episode summary folded across them, and every
@@ -193,6 +214,19 @@ type ControllerCommit struct {
 	// reconciliation with no pending artifact and no R4 deadline refresh
 	// due); the commit then behaves exactly as Plan 2's did.
 	History *HistoryCommit
+
+	// PreparationCycleID and PreparationGeneration are Plan 4 Task 2's
+	// addition: the frozen preparation cycle (if any) this reconciliation's
+	// evidence was prepared under. CommitController seals it in the SAME
+	// fenced transaction as the authoritative state above (spec.md:
+	// "CommitController seals the cycle and advances its generation in the
+	// existing authoritative transaction, even for reuse/fallback/
+	// schedule-only commits"). PreparationCycleID == "" means this cycle
+	// never began preparation at all (no EvidencePreparer configured, or a
+	// local-only compatibility path) — sealing is then a no-op, and the
+	// commit behaves exactly as it did before Plan 4.
+	PreparationCycleID    string
+	PreparationGeneration int64
 }
 
 // ParkedState is CommitController's explicit instruction for the
@@ -409,6 +443,11 @@ type ControllerConfig struct {
 	// Transition still exists and still edits the root's count. Neither
 	// ever re-pages the channel.
 	RecurrenceMode string
+
+	// PresentationSources is the process configuration snapshot used only to
+	// describe which evidence collectors are configured or explicitly skipped.
+	// Recorded collection results loaded from the store take precedence.
+	PresentationSources []model.SourceCheck
 }
 
 // Recurrence modes — the accepted values of notify.slack.recurrence_mode.
@@ -460,13 +499,14 @@ func (c ControllerConfig) withDefaults() ControllerConfig {
 // Controller is the fenced Situation controller: one Reconcile call performs
 // exactly one claimed Situation's reconciliation cycle end to end.
 type Controller struct {
-	store  ControllerStore
-	client AssessmentClient
-	cfg    ControllerConfig
-	clock  Clock
-	audit  AuditSink
-	health AssessmentHealthObserver
-	logger *slog.Logger
+	store    ControllerStore
+	client   AssessmentClient
+	cfg      ControllerConfig
+	clock    Clock
+	audit    AuditSink
+	health   AssessmentHealthObserver
+	logger   *slog.Logger
+	preparer EvidencePreparer
 }
 
 // SetAssessmentHealthObserver wires the installation LLM-health observer
@@ -536,6 +576,29 @@ func anyDeliveryResolved(deliveries []Delivery) bool {
 	return false
 }
 
+// sourceSilentThrough reports whether the source has been silent for a full
+// window ending at now: no delivery of ANY status (firing or resolved — any
+// contact at all) was received after now-window. This is S1-03's "current
+// authoritative clearance" test for a recovery_pending Situation that has
+// outlived its episode observation deadline (see resolveLifecycle's
+// RecoveryPending case): lifecycle truth is measured from the source's LAST
+// observation, so the clearance that initiated the current grace stays
+// current for as long as the contract's own observation window — never
+// merely because the reconcile that consumed it ran a little later than its
+// receipt, and never merely because the episode's fixed deadline fell
+// between the two. A receipt exactly window-old counts as silent, matching
+// pastDeadline's own inclusive comparison. An empty deliveries slice is
+// silence (nothing observed at all).
+func sourceSilentThrough(deliveries []Delivery, now time.Time, window time.Duration) bool {
+	cutoff := now.Add(-window)
+	for _, d := range deliveries {
+		if d.ReceivedAt.After(cutoff) {
+			return false
+		}
+	}
+	return true
+}
+
 // proposalFromAssessment rebuilds the L2-authored subset of an existing
 // Assessment as an AssessmentProposal — the same subset AssessmentProposal's
 // own Go struct carries (Lifecycle/ActionContract/Cadence deliberately
@@ -583,18 +646,58 @@ func retryBackoff(cfg RetryConfig, workAttempt int) time.Duration {
 	return d
 }
 
-// earliestTriageDue returns the earliest NextAt among incidents' pending or
-// backoff Triage rows, treating any Incident this cycle's decisions just
-// moved from awaiting_decision to pending as due immediately (now) — the
-// exact timing applyRequestFromAwaitingDecisionTx persists (next_at=now).
-// Returns nil when no Incident carries pending/backoff Triage work.
-func earliestTriageDue(incidents []IncidentState, decisions []TriageDecision, now time.Time) *time.Time {
-	freshlyRequested := make(map[string]bool, len(decisions))
+// decisionsByIncident indexes decisions by IncidentID for the one lookup
+// every effective-phase computation in this file needs — every cycle
+// commits at most one decision per Incident.
+func decisionsByIncident(decisions []TriageDecision) map[string]TriageDecision {
+	m := make(map[string]TriageDecision, len(decisions))
 	for _, d := range decisions {
-		if d.Decision == TriageDecisionRequest {
-			freshlyRequested[d.IncidentID] = true
-		}
+		m[d.IncidentID] = d
 	}
+	return m
+}
+
+// effectiveTriagePhase returns inc's Triage phase exactly as it will read
+// immediately after this cycle's decisions commit — the same transition
+// applyOneTriageDecisionTx performs (store/triage_controller.go), so a
+// projection built from it can never disagree with the transaction actually
+// committed (B0 integration contract §3; S2-02).
+//
+// Only a decision against an awaiting_decision row is a real phase move
+// (awaiting_decision -> pending on request, awaiting_decision -> skipped on
+// skip). A decision against an existing pending/backoff row is a REFRESH:
+// applyRefreshDecisionTx updates only the decision/digest columns and
+// deliberately leaves phase and next_at untouched, so a refreshed backoff
+// row is still backoff with its own persisted due time — never forced back
+// to "pending, due now" merely because a request decision exists this
+// cycle.
+func effectiveTriagePhase(inc IncidentState, decisions map[string]TriageDecision) string {
+	if inc.Triage.Phase != "awaiting_decision" {
+		return inc.Triage.Phase
+	}
+	d, ok := decisions[inc.ID]
+	if !ok {
+		return inc.Triage.Phase
+	}
+	switch d.Decision {
+	case TriageDecisionRequest:
+		return "pending"
+	case TriageDecisionSkip:
+		return "skipped"
+	default:
+		return inc.Triage.Phase
+	}
+}
+
+// earliestTriageDue returns the earliest NextAt among incidents' pending or
+// backoff Triage rows (using effectiveTriagePhase, so a refreshed backoff
+// row's persisted due time is preserved rather than overridden), treating
+// an Incident this cycle's decisions genuinely just moved from
+// awaiting_decision to pending as due immediately (now) — the exact timing
+// applyRequestFromAwaitingDecisionTx persists (next_at=now). Returns nil
+// when no Incident carries pending/backoff Triage work.
+func earliestTriageDue(incidents []IncidentState, decisions []TriageDecision, now time.Time) *time.Time {
+	byIncident := decisionsByIncident(decisions)
 
 	var earliest *time.Time
 	consider := func(t time.Time) {
@@ -603,11 +706,13 @@ func earliestTriageDue(incidents []IncidentState, decisions []TriageDecision, no
 		}
 	}
 	for _, inc := range incidents {
-		if freshlyRequested[inc.ID] {
-			consider(now)
-			continue
+		if inc.Triage.Phase == "awaiting_decision" {
+			if d, ok := byIncident[inc.ID]; ok && d.Decision == TriageDecisionRequest {
+				consider(now)
+				continue
+			}
 		}
-		switch inc.Triage.Phase {
+		switch effectiveTriagePhase(inc, byIncident) {
 		case "pending", "backoff":
 			if inc.Triage.NextAt != nil {
 				consider(*inc.Triage.NextAt)
@@ -619,27 +724,19 @@ func earliestTriageDue(incidents []IncidentState, decisions []TriageDecision, no
 	return earliest
 }
 
-// aggregateTriagePhase reduces every member Incident's Triage phase (as it
-// will read AFTER this cycle's decisions apply — a fresh request decision
-// moves an awaiting_decision row to pending) to the single closed TriagePhase
-// DeriveActionContract's priority list consumes: in_flight outranks
-// awaiting/pending, which outranks backoff, which outranks "no AlertINT
-// Triage work pending at all".
+// aggregateTriagePhase reduces every member Incident's Triage phase — as it
+// will read AFTER this cycle's decisions apply, via effectiveTriagePhase —
+// to the single closed TriagePhase DeriveActionContract's priority list
+// consumes: in_flight outranks awaiting/pending, which outranks backoff,
+// which outranks "no AlertINT Triage work pending at all". A committed skip
+// (effective phase "skipped") contributes to none of these buckets: it must
+// not still project as outstanding awaiting-decision work (S2-02).
 func aggregateTriagePhase(incidents []IncidentState, decisions []TriageDecision) TriagePhase {
-	freshlyRequested := make(map[string]bool, len(decisions))
-	for _, d := range decisions {
-		if d.Decision == TriageDecisionRequest {
-			freshlyRequested[d.IncidentID] = true
-		}
-	}
+	byIncident := decisionsByIncident(decisions)
 
 	hasInFlight, hasAwaiting, hasBackoff := false, false, false
 	for _, inc := range incidents {
-		phase := inc.Triage.Phase
-		if freshlyRequested[inc.ID] {
-			phase = "pending"
-		}
-		switch phase {
+		switch effectiveTriagePhase(inc, byIncident) {
 		case "in_flight":
 			hasInFlight = true
 		case "awaiting_decision", "pending":
@@ -658,6 +755,256 @@ func aggregateTriagePhase(incidents []IncidentState, decisions []TriageDecision)
 	default:
 		return TriagePhaseNone
 	}
+}
+
+// workPhaseOf maps one Incident's raw effective Triage phase string
+// (effectiveTriagePhase's return value) to the richer, closed
+// model.WorkPhase vocabulary S2-01/S2-02/S2-03/S2-07 need.
+func workPhaseOf(rawPhase string) model.WorkPhase {
+	switch rawPhase {
+	case "":
+		return model.WorkPhaseCollecting
+	case "awaiting_decision":
+		return model.WorkPhaseAwaitingDecision
+	case "pending":
+		return model.WorkPhaseQueued
+	case "in_flight":
+		return model.WorkPhaseExecuting
+	case "backoff":
+		return model.WorkPhaseRetryWait
+	case "skipped":
+		return model.WorkPhaseSettled
+	case "exhausted":
+		return model.WorkPhaseExhausted
+	default:
+		return model.WorkPhaseNone
+	}
+}
+
+// aggregateWorkPhase reduces every member Incident's WorkPhase to the
+// Situation-level disposition (B0 integration contract §3): executing
+// outranks everything; a queued Incident ranks above retry_wait only once
+// some OTHER Incident in this Situation has actually executed
+// (executionStarted) — otherwise queued/awaiting-decision work that has
+// never executed anywhere in this Situation ranks below retry_wait. Settled
+// work ranks below exhausted: a Situation is not "done" while it still has
+// a genuinely undecided/unstarted Incident, even if a sibling already
+// exhausted its own schedule (this mirrors the canonical HTML's
+// "exhausted-other-running" example: one exhausted plus one running still
+// aggregates to executing).
+func aggregateWorkPhase(phases []model.WorkPhase, executionStarted bool) model.WorkPhase {
+	has := func(p model.WorkPhase) bool {
+		for _, ph := range phases {
+			if ph == p {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case has(model.WorkPhaseExecuting):
+		return model.WorkPhaseExecuting
+	case has(model.WorkPhaseQueued) && executionStarted:
+		return model.WorkPhaseQueued
+	case has(model.WorkPhaseRetryWait):
+		return model.WorkPhaseRetryWait
+	case has(model.WorkPhaseQueued):
+		return model.WorkPhaseQueued
+	case has(model.WorkPhaseAwaitingDecision):
+		return model.WorkPhaseAwaitingDecision
+	case has(model.WorkPhaseExhausted):
+		return model.WorkPhaseExhausted
+	case has(model.WorkPhaseSettled):
+		return model.WorkPhaseSettled
+	case has(model.WorkPhaseCollecting):
+		return model.WorkPhaseCollecting
+	default:
+		return model.WorkPhaseNone
+	}
+}
+
+// TriageSkipReason maps t's recorded disposition to WorkProjection's closed
+// SkipReason vocabulary. "" unless t.Phase == "skipped": an unrecognized or
+// absent decision_reason under a skipped schedule reports "" rather than
+// guessing, so a caller can tell "genuinely unknown" apart from a mapped
+// value. Exported so internal/store's loadSituationIncidentStatesTx can
+// populate the same declared TriageState.SkipReason field a same-transaction
+// load reads (R6 repair, lead review round 2, 2026-09-09: §3 declares this
+// field on the same-transaction input, not only on the commit-cycle overlay
+// committedBriefingInput already applied for a phase move happening in the
+// current cycle).
+func TriageSkipReason(t TriageState) string {
+	if t.Phase != "skipped" {
+		return ""
+	}
+	if t.DecisionReason == nil {
+		return ""
+	}
+	switch *t.DecisionReason {
+	case DecisionReasonCleanSkip:
+		return "prior_coverage"
+	case DecisionReasonEligibilityPolicyMinimumMembers:
+		return "eligibility_policy"
+	default:
+		return ""
+	}
+}
+
+// BuildWorkProjection reduces incidents — already overlaid with this
+// cycle's committed decisions by committedBriefingInput, so their Triage
+// fields read exactly as they will after commit — to the single coherent
+// Situation-level WorkProjection B3/B4/B5 consume (B0 integration contract
+// §3; required outcome: "scope, reasons and deadlines have provenance and
+// are not guessed from display text"). graceUntil and statusCheckpointAt
+// are threaded straight through from this cycle's committed lifecycle
+// resolution and Operator contract; BuildWorkProjection derives nothing
+// about them itself. Assessment-level retry (situations.retry_at) is not an
+// input here — committedOperatorBriefing overlays it onto the returned
+// RetryEligibleAt, since this function's exact 3-parameter shape is a pinned
+// external test boundary (lead review 2026-09-09, R3).
+func BuildWorkProjection(incidents []IncidentState, graceUntil, statusCheckpointAt *time.Time) model.WorkProjection {
+	phases := make([]model.WorkPhase, 0, len(incidents))
+	executionStarted := false
+	remaining := 0
+	skipReason := ""
+	var retryAt *time.Time
+	var queuedEligibleAt *time.Time
+	var ended []model.IncidentWorkOutcome
+
+	for _, inc := range incidents {
+		// R1 repair (lead review 2026-09-09): a successful completion
+		// DELETES the incident_triage row (triage_controller.go
+		// completeSuccessTx), so a bare raw-phase=="" reads identically to
+		// an Incident that never reached "ready" unless the durable
+		// Incident.Status is also consulted. An analyzed Incident with no
+		// schedule is settled work, never "collecting" — the schedule
+		// closed because the investigation finished, not because it never
+		// began.
+		var phase model.WorkPhase
+		if inc.Triage.Phase == "" && inc.Status == "analyzed" {
+			phase = model.WorkPhaseSettled
+		} else {
+			phase = workPhaseOf(inc.Triage.Phase)
+		}
+		phases = append(phases, phase)
+		// ExecutionStarted must survive that same delete: Attempts resets to
+		// 0 (COALESCE default) once the row is gone, so LastExecution/
+		// ActiveAttempt — sourced from the immutable incident_triage_attempts
+		// ledger, which the delete never touches — are consulted too. Still
+		// never inferred from a request or decision alone (B0 §3).
+		if inc.Triage.Attempts > 0 || inc.Triage.LastExecution != nil || inc.Triage.ActiveAttempt != nil {
+			executionStarted = true
+		}
+		switch phase {
+		case model.WorkPhaseQueued:
+			remaining++
+			// A queued schedule's next_at IS its recorded eligibility: the
+			// moment the worker may claim the durable request. Carried so
+			// the queued activity line can state a readiness time instead
+			// of only "not started" (G1 repair, lead final review
+			// 2026-09-10). The earliest one dates the first schedule that
+			// becomes claimable, exactly as RetryEligibleAt dates the first
+			// retry — not all of them, and never an execution promise.
+			if inc.Triage.NextAt != nil && (queuedEligibleAt == nil || inc.Triage.NextAt.Before(*queuedEligibleAt)) {
+				queuedEligibleAt = inc.Triage.NextAt
+			}
+		case model.WorkPhaseAwaitingDecision, model.WorkPhaseExecuting, model.WorkPhaseRetryWait:
+			remaining++
+		case model.WorkPhaseCollecting, model.WorkPhaseSettled, model.WorkPhaseExhausted, model.WorkPhaseNone:
+			// No outstanding automatic work on this schedule. Settled and
+			// exhausted are handled below as ENDED work; collecting and
+			// none never had a schedule to run.
+		}
+		if phase == model.WorkPhaseRetryWait && inc.Triage.NextAt != nil {
+			if retryAt == nil || inc.Triage.NextAt.Before(*retryAt) {
+				retryAt = inc.Triage.NextAt
+			}
+		}
+		if phase == model.WorkPhaseSettled && skipReason == "" {
+			if reason := TriageSkipReason(inc.Triage); reason != "" {
+				skipReason = reason
+			}
+		}
+		if phase == model.WorkPhaseSettled || phase == model.WorkPhaseExhausted {
+			ended = append(ended, incidentWorkOutcome(inc, phase))
+		}
+	}
+	sort.Slice(ended, func(i, j int) bool { return ended[i].IncidentID < ended[j].IncidentID })
+
+	return model.WorkProjection{
+		Phase:              aggregateWorkPhase(phases, executionStarted),
+		ExecutionStarted:   executionStarted,
+		RemainingIncidents: remaining,
+		SkipReason:         skipReason,
+		QueuedEligibleAt:   queuedEligibleAt,
+		// Every projection built here records queued eligibility, whether or
+		// not any schedule is queued; only a transition predating the field
+		// reads unknown.
+		QueuedEligibilityKnown: true,
+		RetryEligibleAt:        retryAt,
+		SourceGraceUntil:       graceUntil,
+		StatusCheckpointAt:     statusCheckpointAt,
+		EndedWork:              ended,
+		EndedWorkKnown:         true,
+	}
+}
+
+// incidentWorkOutcome projects one ended member schedule's completion
+// provenance (lead decision D, round 2, 2026-09-09) from facts the
+// same-transaction load already carries: the schedule's own disposition,
+// the most recent attempt-ledger row that ended it (LastExecution — an
+// in-flight ActiveAttempt never ends a schedule), and that attempt's
+// positively matched accepted output. A schedule that ended with no attempt
+// ever claimed (a pre-claim clean skip; an Incident analyzed before the
+// attempt ledger) carries incident identity only, so nothing is ever
+// attributed to an execution that did not happen.
+func incidentWorkOutcome(inc IncidentState, phase model.WorkPhase) model.IncidentWorkOutcome {
+	out := model.IncidentWorkOutcome{
+		IncidentID: inc.ID,
+		Phase:      phase,
+		SkipReason: TriageSkipReason(inc.Triage),
+	}
+	exec := inc.Triage.LastExecution
+	if exec == nil || exec.CompletedAt == nil {
+		return out
+	}
+	out.AttemptID = exec.AttemptID
+	out.ResultCode = exec.ResultCode
+	completed := exec.CompletedAt.UTC()
+	out.CompletedAt = &completed
+	if ev := exec.Evidence; ev != nil {
+		out.EvidenceKnown = true
+		out.Finding = &model.FindingFacts{
+			IncidentID:   inc.ID,
+			Hypothesis:   boundedText(ev.Hypothesis, 500),
+			Observations: boundedEach(ev.Observations, model.CompletionObservationsBound, 400),
+			Unknowns:     verificationUnknowns(ev.VerificationLimit, ev.VerificationGaps),
+			AnalyzedAt:   ev.JudgedAt,
+			// Taken from the matched attempt's own evidence BEFORE the
+			// bounds above, so materiality compares the same fact the
+			// three-item analysis overview fingerprints (lead
+			// authorization, round 4, 2026-09-09).
+			EvidenceFingerprint: model.EvidenceFingerprint(ev.Observations, ev.VerificationLimit, ev.VerificationGaps, ev.SourceEvidence...),
+		}
+	}
+	return out
+}
+
+// boundedEach copies at most limit non-blank entries of in, each bounded to
+// width bytes — the per-record text bound EndedWork applies instead of a
+// list-level truncation that could drop a newly ended Incident.
+func boundedEach(in []string, limit, width int) []string {
+	var out []string
+	for _, s := range in {
+		if len(out) == limit {
+			break
+		}
+		if strings.TrimSpace(s) == "" {
+			continue
+		}
+		out = append(out, boundedText(s, width))
+	}
+	return out
 }
 
 // ----------------------------------------------------------------------
@@ -703,25 +1050,68 @@ type lifecycleResolution struct {
 // with it or the pairing check fails closed. closed_unknown reached FROM
 // active (no recovery ever observed) correctly leaves both nil instead, since
 // neither was ever set on this Situation.
-func (c *Controller) resolveLifecycle(cur model.Situation, in SnapshotInput, snap Snapshot, now time.Time) lifecycleResolution {
-	firing := AnyFiring(snap.Symptoms)
-	resolved := anyDeliveryResolved(in.Deliveries)
-	deadline := ObservationDeadlineAt(cur.EffectiveStartedAt, snap.DurationClass)
-	pastDeadline := !now.Before(deadline)
+// resolveLifecycle derives this cycle's lifecycle transition. When a
+// preparation cycle is durably underway for this input (in.Prepared.CycleID
+// != "" — set only by the reload after a real EvidencePreparer ran,
+// preparation.go's own doc comment), sl (this SAME cycle's
+// ReduceSourceLifecycle fold, computed by the caller from prepared source
+// observations and latest deliveries) REPLACES the pre-Plan-4 Delivery/Symptom
+// inference entirely (spec.md R13: source acquisition mode and interval,
+// never Delivery.StartedAtBasis alone). recoveryObserved marks "genuinely
+// have complete resolved evidence, begin the grace clock": in the prepared
+// world that is sl.AllResolved specifically, NOT sl.AnyResolved or the mere
+// existence of a cycle — a poll-provenance member that has simply not been
+// observed yet (no connector silence, no total preparation failure) must
+// never be mistaken for resolved (plan.md: "cannot... invent source state,
+// or remove a source failure"). A cycle whose lifecycle-phase evidence
+// turned up nothing at all and has no delivery truth (in.Prepared.CycleID
+// != "" but sl is its zero value) safely falls through to the "stay active" default
+// the pre-Plan-4 empty-Symptoms edge case already used, rather than reading
+// silence as recovery. In the local-only fallback (no cycle at all — every
+// pre-Task-6 fixture), recoveryObserved is len(snap.Symptoms) > 0, exactly
+// as before: this branch's behavior is byte-for-byte unchanged from
+// pre-Plan-4 Reconcile.
+func (c *Controller) resolveLifecycle(cur model.Situation, in SnapshotInput, snap Snapshot, sl SourceLifecycle, now time.Time) lifecycleResolution {
+	prepared := in.Prepared.CycleID != ""
+
+	var firing, resolved, pastDeadline, recoveryObserved bool
+	var graceDuration time.Duration
+	if prepared {
+		firing = sl.AnyFiring
+		resolved = sl.AnyResolved
+		pastDeadline = sl.ClosureDue
+		recoveryObserved = sl.AllResolved
+		graceDuration = sl.Grace
+	} else {
+		firing = AnyFiring(snap.Symptoms)
+		resolved = anyDeliveryResolved(in.Deliveries)
+		deadline := ObservationDeadlineAt(cur.EffectiveStartedAt, snap.DurationClass)
+		pastDeadline = !now.Before(deadline)
+		recoveryObserved = len(snap.Symptoms) > 0
+		graceDuration = RecoveryGraceDuration(in.Deliveries, c.cfg.WebhookRecoveryGrace, c.cfg.PollingIntervalSeconds)
+	}
 
 	switch cur.Lifecycle {
 	case model.LifecycleActive:
 		switch {
 		case firing:
 			return lifecycleResolution{Lifecycle: model.LifecycleActive}
+		case recoveryObserved:
+			// S1-03: a known resolution (every currently-tracked symptom
+			// already resolved, not merely absent) must not be discarded in
+			// favor of the deadline-driven closed_unknown fallback just
+			// because the Situation itself has been open a long time —
+			// "known resolution does not become unknown from age". Checked
+			// ahead of pastDeadline so a genuinely observed all-clear always
+			// starts recovery confirmation, even past the observation
+			// deadline.
+			lc, _ := AdvanceLifecycle(cur.Lifecycle, EventRecoveryObserved)
+			graceUntil := now.Add(graceDuration)
+			return lifecycleResolution{Lifecycle: lc, RecoveryObservedAt: timePtr(now), GraceUntil: timePtr(graceUntil)}
 		case pastDeadline:
 			reason := ClosedUnknownReason(cur.EffectiveStartedAtBasis, resolved)
 			lc, _ := AdvanceLifecycle(cur.Lifecycle, EventLifecycleUnobservable)
 			return lifecycleResolution{Lifecycle: lc, TerminalAt: timePtr(now), TerminalReason: terminalReasonPtr(reason)}
-		case len(snap.Symptoms) > 0:
-			lc, _ := AdvanceLifecycle(cur.Lifecycle, EventRecoveryObserved)
-			graceUntil := RecoveryGraceUntil(now, in.Deliveries, c.cfg.WebhookRecoveryGrace, c.cfg.PollingIntervalSeconds)
-			return lifecycleResolution{Lifecycle: lc, RecoveryObservedAt: timePtr(now), GraceUntil: timePtr(graceUntil)}
 		default:
 			return lifecycleResolution{Lifecycle: model.LifecycleActive}
 		}
@@ -730,20 +1120,50 @@ func (c *Controller) resolveLifecycle(cur model.Situation, in SnapshotInput, sna
 		case firing:
 			lc, _ := AdvanceLifecycle(cur.Lifecycle, EventRefired)
 			return lifecycleResolution{Lifecycle: lc}
-		case cur.GraceUntil != nil && !now.Before(*cur.GraceUntil):
-			lc, _ := AdvanceLifecycle(cur.Lifecycle, EventGraceExpired)
-			return lifecycleResolution{Lifecycle: lc, RecoveryObservedAt: cur.RecoveryObservedAt, GraceUntil: cur.GraceUntil, TerminalAt: timePtr(now)}
-		case pastDeadline:
-			// Finding C2 fix: cur.RecoveryObservedAt is already non-nil here
-			// (recovery_pending's own invariant) — migration 0014's recovery-
-			// field pairing CHECK is unconditional, so GraceUntil must be
-			// carried forward alongside it (cur.GraceUntil, the Situation's
-			// existing recorded grace deadline — mirroring the sibling
-			// grace-expiry branch above, which carries both fields for the
-			// same reason) or this commit fails closed against a real schema.
+		case pastDeadline && sourceSilentThrough(in.Deliveries, now, ObservationDeadlineDuration(snap.DurationClass)):
+			// S1-03 / R1 (lead reviews 2026-09-08, rounds 1–3): canonical
+			// slide 1 loss-r — "Clearance cannot remain established through
+			// the source-aware deadline. Do not interpret source silence as
+			// sustained recovery" — alongside allclear/stable — "Grace
+			// expired and clearance still holds". pastDeadline alone is
+			// episode AGE (anchored at EffectiveStartedAt, permanently true
+			// for an old episode) and must never veto a genuine grace-based
+			// recovery by itself: "known resolution does not become unknown
+			// from age". What loses lifecycle truth is SILENCE: the newest
+			// delivery of any kind is itself at least one full source-aware
+			// observation window old (ObservationDeadlineDuration for the
+			// class — the same versioned 2h/24h/7d table the deadline uses,
+			// here measured from the source's last observation instead of
+			// the episode's start). Two earlier repairs compared the
+			// receipt against a fixed INSTANT — first the episode deadline,
+			// then RecoveryObservedAt — and each let the very clearance that
+			// initiated grace land on the wrong side of it: a receipt one
+			// second before the deadline, or (unavoidably, since a receipt
+			// always precedes the reconcile that consumes it) one
+			// millisecond before RecoveryObservedAt, read as silence. Neither
+			// ordering is evidence about the source. Measuring the last
+			// observation's age against the window instead keeps that
+			// clearance current through any grace (at most 600s, far inside
+			// the smallest window) whatever ingestion or scheduling delay
+			// preceded its reconcile and wherever the deadline fell, while a
+			// clearance last heard from a whole window ago (Finding C2's
+			// episode-start delivery, the Plan-3 grace_expiry_requires_
+			// current_clearance probe's seven-day-old delivery, or a
+			// resolution nobody reconciled for eight days) still closes
+			// unknown. Firing precedence (the case above) and the Plan-3
+			// visibility limitation (E5: no detector, no source counts) are
+			// untouched. Finding C2 fix retained: cur.RecoveryObservedAt is
+			// already non-nil here (recovery_pending's own invariant) —
+			// migration 0014's recovery-field pairing CHECK is
+			// unconditional, so GraceUntil must be carried forward alongside
+			// it (cur.GraceUntil, the Situation's existing recorded grace
+			// deadline) or this commit fails closed against a real schema.
 			reason := ClosedUnknownReason(cur.EffectiveStartedAtBasis, resolved)
 			lc, _ := AdvanceLifecycle(cur.Lifecycle, EventLifecycleUnobservable)
 			return lifecycleResolution{Lifecycle: lc, RecoveryObservedAt: cur.RecoveryObservedAt, GraceUntil: cur.GraceUntil, TerminalAt: timePtr(now), TerminalReason: terminalReasonPtr(reason)}
+		case cur.GraceUntil != nil && !now.Before(*cur.GraceUntil):
+			lc, _ := AdvanceLifecycle(cur.Lifecycle, EventGraceExpired)
+			return lifecycleResolution{Lifecycle: lc, RecoveryObservedAt: cur.RecoveryObservedAt, GraceUntil: cur.GraceUntil, TerminalAt: timePtr(now)}
 		default:
 			return lifecycleResolution{Lifecycle: model.LifecycleRecoveryPending, RecoveryObservedAt: cur.RecoveryObservedAt, GraceUntil: cur.GraceUntil}
 		}
@@ -754,6 +1174,120 @@ func (c *Controller) resolveLifecycle(cur model.Situation, in SnapshotInput, sna
 		// value is handled explicitly above. Defensive fallback only.
 		return lifecycleResolution{Lifecycle: cur.Lifecycle, RecoveryObservedAt: cur.RecoveryObservedAt, GraceUntil: cur.GraceUntil, TerminalAt: cur.TerminalAt, TerminalReason: cur.TerminalReason}
 	}
+}
+
+// reduceSourceLifecycle folds prepared observations and authoritative latest
+// deliveries across in's expected member Alerts, or returns zero when no
+// preparation cycle exists yet for this input (in.Prepared.CycleID == "") —
+// resolveLifecycle's prepared branch only ever runs once a cycle exists, so
+// an unpopulated fold is never consulted in that case.
+func reduceSourceLifecycle(cfg ControllerConfig, in SnapshotInput, now time.Time) SourceLifecycle {
+	if in.Prepared.CycleID == "" {
+		return SourceLifecycle{}
+	}
+	latest := make(map[string]Delivery, len(in.Deliveries))
+	for _, d := range in.Deliveries {
+		id := d.AlertID
+		if id == "" {
+			id = "delivery:" + d.ID
+		}
+		cur, ok := latest[id]
+		newer := deliveryLess(cur, d)
+		// Preserve source-episode/receipt ordering, but never let an
+		// arbitrary row ID resolve a simultaneous firing observation.
+		if ok && sourceTimeKey(d).Equal(sourceTimeKey(cur)) && d.ReceivedAt.Equal(cur.ReceivedAt) && d.Status != cur.Status {
+			newer = d.Status == model.DeliveryStatusFiring
+		}
+		if !ok || newer {
+			latest[id] = d
+		}
+	}
+	observations := make([]SourceObservation, 0, len(in.Prepared.Lifecycle)+len(latest))
+	observations = append(observations, in.Prepared.Lifecycle...)
+	for id, d := range latest {
+		// Receipt time is when this delivery was observed, not this cycle's
+		// now: newer prepared source evidence must still supersede it.
+		deadline := d.ReceivedAt.Add(observationmodel.LifecycleHorizon(observationmodel.WidestHorizonTier(in.Prepared.ProfileGuidance)))
+		for _, observed := range in.Prepared.Lifecycle {
+			if observed.AlertID == id && observed.EpisodeKey == d.EpisodeKey && observed.ObservedAt.Equal(d.ReceivedAt) && !observed.DeadlineAt.IsZero() {
+				deadline = observed.DeadlineAt
+			}
+		}
+		observations = append(observations, SourceObservation{
+			AlertID: id, EpisodeKey: d.EpisodeKey, Source: d.Source, DeadlineAt: deadline,
+			State: string(d.Status), ObservedAt: d.ReceivedAt,
+			EventStartedAt: d.SourceStartedAt, EventResolvedAt: d.SourceResolvedAt,
+			AcquisitionMode: d.AcquisitionMode, PollIntervalSeconds: d.PollIntervalSeconds,
+		})
+	}
+	return ReduceSourceLifecycle(observations, expectedAlertIDs(in.Deliveries), now, cfg.WebhookRecoveryGrace)
+}
+
+// prepareLifecyclePhase runs the lifecycle-phase EvidencePreparer (plan.md's
+// control-flow contract: "if preparer configured and Situation nonterminal:
+// prepare lifecycle phase ... reload input for the selected cycle") and
+// returns the freshly reloaded input. A nil preparer, or an already-terminal
+// Situation, returns in unchanged — no prepare, no reload.
+func (c *Controller) prepareLifecyclePhase(ctx context.Context, claim Claim, in SnapshotInput, now time.Time) (SnapshotInput, error) {
+	if c.preparer == nil {
+		return in, nil
+	}
+	nonterminal := in.Situation.Lifecycle != model.LifecycleRecovered && in.Situation.Lifecycle != model.LifecycleClosedUnknown
+	if !nonterminal {
+		return in, nil
+	}
+	prepCtx, span := tracer().Start(ctx, SpanEvidencePreparation, trace.WithAttributes(
+		AttrSituationID.String(in.Situation.ID), AttrPreparationPhase.String(string(observationmodel.PhaseLifecycle)),
+	))
+	_, err := c.preparer.Prepare(prepCtx, PreparationRequest{Claim: claim, Input: in, Phase: observationmodel.PhaseLifecycle, Now: now})
+	if err != nil {
+		span.SetAttributes(AttrResultClass.String(PreparationResultError))
+		span.End()
+		return SnapshotInput{}, fmt.Errorf("situation: controller reconcile: prepare lifecycle phase: %w", err)
+	}
+	span.SetAttributes(AttrResultClass.String(PreparationResultCommitted))
+	span.End()
+	reloaded, err := c.store.LoadReconciliationInput(ctx, claim, now)
+	if err != nil {
+		return SnapshotInput{}, fmt.Errorf("situation: controller reconcile: reload after lifecycle preparation: %w", err)
+	}
+	return reloaded, nil
+}
+
+// prepareAssessmentPhaseIfActive is the "if active" half of plan.md's
+// control-flow contract: sl (this cycle's already-reduced source lifecycle,
+// unchanged by the lifecycle-phase reload above) decides whether the
+// Situation would resolve active — resolveLifecycle's prepared branch never
+// reads snap, so calling it with the zero Snapshot{} here, before
+// BuildSnapshot has run, is safe. Only then does the assessment-phase
+// preparer run, followed by its own reload and re-reduction (assessment
+// preparation never touches lifecycle evidence, but the reload IS a fresh
+// coherent read, so sl must be recomputed against it rather than reused). A
+// nil preparer, or a non-active gate, returns in/sl unchanged.
+func (c *Controller) prepareAssessmentPhaseIfActive(ctx context.Context, claim Claim, in SnapshotInput, sl SourceLifecycle, now time.Time) (SnapshotInput, SourceLifecycle, error) {
+	if c.preparer == nil {
+		return in, sl, nil
+	}
+	gate := c.resolveLifecycle(in.Situation, in, Snapshot{}, sl, now)
+	if gate.Lifecycle != model.LifecycleActive {
+		return in, sl, nil
+	}
+	prepCtx, span := tracer().Start(ctx, SpanEvidencePreparation, trace.WithAttributes(
+		AttrSituationID.String(in.Situation.ID), AttrPreparationPhase.String(string(observationmodel.PhaseAssessment)),
+	))
+	_, err := c.preparer.Prepare(prepCtx, PreparationRequest{Claim: claim, Input: in, Phase: observationmodel.PhaseAssessment, Now: now})
+	if err != nil {
+		span.SetAttributes(AttrResultClass.String(PreparationResultError))
+		span.End()
+		return SnapshotInput{}, SourceLifecycle{}, fmt.Errorf("situation: controller reconcile: prepare assessment phase: %w", err)
+	}
+	span.SetAttributes(AttrResultClass.String(PreparationResultCommitted))
+	span.End()
+	reloaded, err := c.store.LoadReconciliationInput(ctx, claim, now)
+	if err != nil {
+		return SnapshotInput{}, SourceLifecycle{}, fmt.Errorf("situation: controller reconcile: reload after assessment preparation: %w", err)
+	}
+	return reloaded, reduceSourceLifecycle(c.cfg, reloaded, now), nil
 }
 
 // ----------------------------------------------------------------------
@@ -901,6 +1435,8 @@ func outcomeErrorCodes(issues []ValidationIssue) []string {
 // provider response body, a URL with query parameters, or similar.
 func sanitizeTransportError(err error) string {
 	switch {
+	case errors.Is(err, llm.ErrBudgetExhausted) && errors.Is(err, llm.ErrRequestNotSent):
+		return BudgetDeferralErrorClass
 	case errors.Is(err, llm.ErrSchemaViolation):
 		return "schema_violation"
 	case errors.Is(err, llm.ErrResponseTruncated):
@@ -1147,6 +1683,7 @@ func (c *Controller) commit(ctx context.Context, claim Claim, basis historyBasis
 // durable history at all: a non-material reconciliation with no pending
 // operator artifact and no R4 deadline refresh due.
 func (c *Controller) buildHistory(claim Claim, basis historyBasis, commit ControllerCommit) (*HistoryCommit, error) {
+	basis.In.PresentationFacts.SourceChecks = mergePresentationSourceChecks(c.cfg.PresentationSources, basis.In.PresentationFacts.SourceChecks)
 	change := authoritativeChangeOf(claim, basis, commit)
 	publication := PublicationInput{
 		Situation:                   change.Situation,
@@ -1161,6 +1698,7 @@ func (c *Controller) buildHistory(claim Claim, basis historyBasis, commit Contro
 		RecurrenceRepliesOff:        c.cfg.RecurrenceMode == RecurrenceModeOff,
 		Drill:                       change.Drill,
 		Now:                         basis.Now,
+		DeliveredHistory:            basis.In.DeliveredHistory,
 	}
 	// R4: the root renders the committed nonterminal promise, captured here
 	// from the committed Operator contract — never from the Episode summary.
@@ -1219,6 +1757,7 @@ func authoritativeChangeOf(claim Claim, basis historyBasis, commit ControllerCom
 		// this commit's own lifecycle fields — the only thing the Episode
 		// fold may read.
 		Projection: model.ProjectionFacts{
+			Briefing:                CommittedOperatorBriefing(basis.In, commit),
 			PublicHandle:            sit.PublicHandle,
 			EffectiveStartedAt:      sit.EffectiveStartedAt,
 			EffectiveStartedAtBasis: sit.EffectiveStartedAtBasis,
@@ -1364,6 +1903,16 @@ func assessmentAuditKind(d model.AssessmentDerivation) (string, bool) {
 // requirement names — never a proposal, prompt, or provider body.
 func (c *Controller) auditCommitSuccess(ctx context.Context, claim Claim, commit ControllerCommit) {
 	situationID := claim.Situation.ID
+	if commit.PreparationCycleID != "" {
+		// Review F24: CommitController sealed this cycle in the same fenced
+		// transaction it just committed; audit that durable transition here,
+		// after the commit, with bounded identities only.
+		c.auditAppend(ctx, "situation.preparation.cycle_sealed", map[string]any{
+			"situation_id": situationID, "cycle_id": commit.PreparationCycleID,
+			"generation": commit.PreparationGeneration, "input_version": claim.Situation.InputVersion,
+			"lifecycle": string(commit.Lifecycle),
+		})
+	}
 	if commit.Attempt.ID != "" {
 		if kind, ok := assessmentAuditKind(commit.Attempt.Derivation); ok {
 			c.auditAppend(ctx, kind, map[string]any{
@@ -1569,6 +2118,22 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 		return fmt.Errorf("situation: controller reconcile: load: %w", err)
 	}
 
+	// Plan 4 Task 6: bounded evidence preparation, under this SAME attempt
+	// wall (ctx, already cancel-scoped to c.cfg.AttemptWall above) — plan.md's
+	// "attempt's child preparation wall." A nil preparer (every pre-Task-6
+	// fixture, and any build that has not wired cmd/alertint's production
+	// adapter yet) skips both phases below entirely: in.Prepared then stays
+	// whatever LoadReconciliationInput already read — its zero value for a
+	// nil preparer — so DeriveStoreFacts/BuildSnapshot/resolveLifecycle all
+	// take their pre-Plan-4 local-only path unchanged.
+	if in, err = c.prepareLifecyclePhase(ctx, claim, in, now); err != nil {
+		return err
+	}
+	sl := reduceSourceLifecycle(c.cfg, in, now)
+	if in, sl, err = c.prepareAssessmentPhaseIfActive(ctx, claim, in, sl, now); err != nil {
+		return err
+	}
+
 	// 2. Local fact derivation/append.
 	facts := DeriveStoreFacts(in)
 	if err := c.store.AppendSituationFacts(ctx, claim, facts); err != nil {
@@ -1582,7 +2147,7 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 	// derivation: DeriveAssessment reads state.Lifecycle == snap.Lifecycle,
 	// so a fresh transition this cycle discovers must already be reflected
 	// on snap before any derivation path runs.
-	lc := c.resolveLifecycle(in.Situation, in, snap, now)
+	lc := c.resolveLifecycle(in.Situation, in, snap, sl, now)
 	snap.Lifecycle = lc.Lifecycle
 
 	// 4. Pure Triage decisions.
@@ -1595,16 +2160,18 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 	basis := historyBasis{In: in, Snap: snap, Now: now}
 
 	base := ControllerCommit{
-		MaterialFactHash:    snap.MaterialFactHash,
-		AssessmentBasisHash: snap.AssessmentBasisHash,
-		EligibleReasons:     snap.EligibleReasons,
-		TriageDecisions:     triageDecisions,
-		Lifecycle:           lc.Lifecycle,
-		RecoveryObservedAt:  lc.RecoveryObservedAt,
-		GraceUntil:          lc.GraceUntil,
-		TerminalAt:          lc.TerminalAt,
-		TerminalReason:      lc.TerminalReason,
-		ConsumedDueReasons:  claim.Situation.DueReasons,
+		MaterialFactHash:      snap.MaterialFactHash,
+		AssessmentBasisHash:   snap.AssessmentBasisHash,
+		EligibleReasons:       snap.EligibleReasons,
+		TriageDecisions:       triageDecisions,
+		Lifecycle:             lc.Lifecycle,
+		RecoveryObservedAt:    lc.RecoveryObservedAt,
+		GraceUntil:            lc.GraceUntil,
+		TerminalAt:            lc.TerminalAt,
+		TerminalReason:        lc.TerminalReason,
+		ConsumedDueReasons:    claim.Situation.DueReasons,
+		PreparationCycleID:    in.Prepared.CycleID,
+		PreparationGeneration: in.Prepared.Generation,
 	}
 
 	// 5. Deterministic/reuse check — no L2 call, no work attempt consumed.
@@ -1643,6 +2210,10 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 	// only suppresses NEW semantic L2 work. If the basis has since changed,
 	// controllerParkBlocksDispatch returns false and this cycle proceeds
 	// exactly as if not parked, naturally lifting the park.
+	if in.ControllerParked.Reason == ParkedReasonBudget && (in.Situation.RetryAt == nil || now.Before(*in.Situation.RetryAt)) {
+		base.RetryAt = in.Situation.RetryAt
+		return c.commitBudgetDeferred(ctx, claim, basis, base, state, 0, 1)
+	}
 	if controllerParkBlocksDispatch(in.ControllerParked, snap.MaterialFactHash) {
 		return c.commitBlocked(ctx, claim, basis, base, state)
 	}
@@ -1745,7 +2316,16 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 	}
 	if disp.proposal != nil {
 		result := DeriveAssessment(*disp.proposal, snap, in, state, model.DerivationModelValidated, nil, now)
-		return c.commitResult(ctx, claim, basis, base, result, &disp.lastCallID, retryEpoch, workAttempt, disp.lastDuration)
+		return c.commitResult(ctx, claim, basis, base, result, &disp.lastCallID, retryEpoch, workAttempt, disp.lastDuration, disp.lastUsage)
+	}
+	if disp.budgetDeniedBeforeDispatch {
+		var deferred *llm.BudgetDeferredError
+		if errors.As(disp.transportErr, &deferred) {
+			base.RetryAt = deferred.RetryAt
+		}
+		base.BudgetDeniedCallID = &disp.lastCallID
+		base.Parked = ParkedState{Touch: true, At: now, Reason: ParkedReasonBudget}
+		return c.commitBudgetDeferred(ctx, claim, basis, base, state, retryEpoch, workAttempt)
 	}
 
 	// No accepted/contradicted result: classify the last outcome (using
@@ -1786,9 +2366,12 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 // when callID is non-nil (dispatchWorkBearing's own oneShot.Latency), or 0
 // for a no-call commit (reuse) — threaded straight through to
 // buildAuthoritativeAttempt.
-func (c *Controller) commitResult(ctx context.Context, claim Claim, basis historyBasis, base ControllerCommit, result AssessmentResult, callID *string, retryEpoch, workAttempt int, duration time.Duration) error {
+func (c *Controller) commitResult(ctx context.Context, claim Claim, basis historyBasis, base ControllerCommit, result AssessmentResult, callID *string, retryEpoch, workAttempt int, duration time.Duration, usage ...llm.Completion) error {
 	now := basis.Now
 	base.Attempt = buildAuthoritativeAttempt(claim.Situation.ID, result, callID, retryEpoch, workAttempt, duration, now)
+	if callID != nil && len(usage) > 0 {
+		setAssessmentUsage(&base.Attempt, usage[0])
+	}
 	base.Assessment = result.Assessment
 	base.Coverage = result.Coverage
 	base.Parked = ParkedState{Touch: true, Reason: ""}
@@ -1914,12 +2497,14 @@ func (c *Controller) fallbackOrPreserveBlocked(situationID string, snap Snapshot
 // for the caller to thread into whichever attempt row it ends up building
 // from this cycle's outcome (Task 9 fix round, Finding #4).
 type dispatchResult struct {
-	proposal       *model.AssessmentProposal
-	lastVR         *ValidationResult
-	lastCallID     string
-	lastDuration   time.Duration
-	correctionUsed bool
-	transportErr   error
+	budgetDeniedBeforeDispatch bool
+	lastUsage                  llm.Completion
+	proposal                   *model.AssessmentProposal
+	lastVR                     *ValidationResult
+	lastCallID                 string
+	lastDuration               time.Duration
+	correctionUsed             bool
+	transportErr               error
 }
 
 // dispatchWorkBearing runs one work-bearing controller attempt's L2 dispatch
@@ -1955,7 +2540,7 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 		call := AssessmentCall{
 			ID: callID, SituationID: claim.Situation.ID, MaterialFactHash: snap.MaterialFactHash,
 			InputVersion: snap.InputVersion, RetryEpoch: retryEpoch, WorkAttempt: workAttempt,
-			CallNumber: callNumber, DispatchedAt: now,
+			CallNumber: callNumber, DispatchedAt: now, PreparationCycleID: snap.PreparationCycleID,
 		}
 		if err := c.store.RecordAssessmentCall(ctx, claim, call); err != nil {
 			res.lastCallID = callID
@@ -1989,6 +2574,8 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 		// which would silently diverge from whatever the client itself
 		// determined.
 		started := model.ProviderRequestStarted(oneShot.RequestStarted)
+		res.budgetDeniedBeforeDispatch = callNumber == 1 && started == model.ProviderRequestStartedFalse &&
+			errors.Is(callErr, llm.ErrRequestNotSent) && errors.Is(callErr, llm.ErrBudgetExhausted)
 
 		var vr *ValidationResult
 		var transportErr error
@@ -1999,6 +2586,7 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 			vr = &v
 		}
 		res.lastVR, res.transportErr, res.lastCallID, res.lastDuration = vr, transportErr, callID, oneShot.Latency
+		res.lastUsage = oneShot.Completion
 
 		policy := ClassifyL2Outcome(vr, transportErr, res.correctionUsed)
 		// Installation LLM health observes the FINAL typed outcome — after
@@ -2027,6 +2615,7 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 
 		outcomeSequence := synthesizeSequence(snap.InputVersion, retryEpoch, workAttempt, callNumber)
 		outcome := buildOutcomeAttempt(claim.Situation.ID, callID, snap.InputVersion, retryEpoch, workAttempt, outcomeSequence, vr, transportErr, started, oneShot.Latency, now)
+		setAssessmentUsage(&outcome, oneShot.Completion)
 		// The outcome row is the durable record of an already-consumed
 		// dispatch slot, so it is written on a short detached context when
 		// the cycle's own context is already done (attempt wall expired, or

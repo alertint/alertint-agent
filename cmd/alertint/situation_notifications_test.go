@@ -182,6 +182,19 @@ type fakeDelivererStore struct {
 
 	gap    store.GapSnapshot
 	gapErr error
+
+	history    situation.DeliveredHistory
+	historyErr error
+}
+
+// GetCommunicatedHistory is B5's delivery-time read of what the operator
+// has already been told (or is still owed) before the reply being
+// delivered. The zero value means nothing communicated and nothing owed.
+func (f *fakeDelivererStore) GetCommunicatedHistory(context.Context, string, int) (situation.DeliveredHistory, error) {
+	if f.historyErr != nil {
+		return situation.DeliveredHistory{}, f.historyErr
+	}
+	return f.history, nil
 }
 
 func (f *fakeDelivererStore) GetSituationEpisodeView(context.Context, string) (store.SituationEpisodeView, error) {

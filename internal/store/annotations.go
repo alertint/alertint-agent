@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 	"unicode/utf8"
 )
@@ -161,12 +162,13 @@ func enqueueOperatorArtifactInputTx(ctx context.Context, tx *sql.Tx, incidentID,
 }
 
 // ListIncidentAnnotations returns every annotation of one incident,
-// newest-first.
+// newest-first by recorded instant (sortByInstantNewestFirst; SQL id order
+// only breaks ties).
 func (s *Store) ListIncidentAnnotations(ctx context.Context, incidentID string) ([]IncidentAnnotation, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, incident_id, kind, note, created_at
 		FROM incident_annotations WHERE incident_id = ?
-		ORDER BY created_at DESC, id DESC`, incidentID)
+		ORDER BY id DESC`, incidentID)
 	if err != nil {
 		return nil, fmt.Errorf("store: list annotations: %w", err)
 	}
@@ -183,7 +185,11 @@ func (s *Store) ListIncidentAnnotations(ctx context.Context, incidentID string) 
 		}
 		out = append(out, a)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sortByInstantNewestFirst(out, func(a IncidentAnnotation) time.Time { return a.CreatedAt })
+	return out, nil
 }
 
 // OperatorAnnotation is one recalled operator annotation for the human-locked
@@ -208,7 +214,7 @@ func (s *Store) OperatorAnnotations(ctx context.Context, groupKey string, curren
 		FROM incident_annotations a
 		JOIN incidents i ON i.id = a.incident_id
 		WHERE i.group_key = ?
-		ORDER BY a.created_at DESC, a.id DESC`,
+		ORDER BY a.id DESC`,
 		groupKey)
 	if err != nil {
 		return nil, fmt.Errorf("store: operator annotations: %w", err)
@@ -232,6 +238,7 @@ func (s *Store) OperatorAnnotations(ctx context.Context, groupKey string, curren
 	if len(all) == 0 {
 		return nil, nil
 	}
+	sortByInstantNewestFirst(all, func(a OperatorAnnotation) time.Time { return a.CreatedAt })
 
 	ids := make([]string, 0, len(all))
 	seen := make(map[string]bool, len(all))
@@ -252,4 +259,18 @@ func (s *Store) OperatorAnnotations(ctx context.Context, groupKey string, curren
 		}
 	}
 	return out, nil
+}
+
+// sortByInstantNewestFirst reorders rows newest-first on their parsed
+// instants, keeping the incoming order (SQL id DESC) for identical instants.
+//
+// Stored times are time.RFC3339Nano text, which trims trailing zeros, so one
+// table holds ".2378Z", ".237872Z", ".1Z" and a bare "Z" together. A shorter
+// value's "Z" sorts above the next digit of a longer one, so SQL text
+// ordering disagrees with real time exactly when two writes land inside the
+// same fraction of a second. Which notes reach a triage prompt depends on
+// this order (steering.go caps the list at maxHistoryNotes), so it is decided
+// here rather than by the database.
+func sortByInstantNewestFirst[T any](rows []T, at func(T) time.Time) {
+	sort.SliceStable(rows, func(i, j int) bool { return at(rows[i]).After(at(rows[j])) })
 }

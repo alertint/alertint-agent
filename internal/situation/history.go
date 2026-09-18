@@ -312,6 +312,7 @@ func controllerTransition(change AuthoritativeChange, reason model.TransitionRea
 		OccurredAt:      change.Now,
 	}, controllerEvidenceRefs(change))
 	tr.Actor = controllerActor(change, reason)
+	tr.Projection.OperatorDelta = buildOperatorDelta(change.PriorTransition, tr)
 	if class := ClassifyPoke(change.PriorTransition, tr); class != PokeNone {
 		priority := DeriveInterruptionPriority(tr)
 		tr.InterruptionPriority = &priority
@@ -578,7 +579,7 @@ func selectControllerReason(change AuthoritativeChange) (model.TransitionReason,
 	current := currentTuple(change)
 	previous := priorTuple(change)
 	triage := triageStateChanged(change)
-	if canonicalDigest(current) == canonicalDigest(previous) && !triage {
+	if canonicalDigest(current) == canonicalDigest(previous) && !triage && !operatorBriefingChanged(prior.Projection.Briefing, change.Projection.Briefing) {
 		return "", false
 	}
 
@@ -823,6 +824,9 @@ func ProjectEpisode(prior *model.EpisodeSummary, t model.Transition) (model.Epis
 	}
 
 	out.SourceTransitionSequence = t.Sequence
+	if t.Projection.Briefing != nil {
+		out.Briefing = t.Projection.Briefing
+	}
 	out.CurrentAttention = t.Attention
 	out.ActionContract = t.ActionContract
 	out.UpdatedAt = t.CreatedAt
@@ -1047,39 +1051,103 @@ func attentionRank(a model.Attention) int {
 type Orientation string
 
 const (
-	OrientationObserved        Orientation = "observed"
-	OrientationInvestigating   Orientation = "investigating"
-	OrientationMonitoring      Orientation = "monitoring"
-	OrientationRecovered       Orientation = "recovered"
-	OrientationClosedUncertain Orientation = "closed_uncertain"
+	OrientationObserved      Orientation = "observed"
+	OrientationInvestigating Orientation = "investigating"
+	OrientationMonitoring    Orientation = "monitoring"
+	// OrientationConfirmingRecovery is recovery_pending's own orientation
+	// (B0 integration contract §3 / S4-01): distinct from Monitoring so an
+	// operator can tell "still confirming recovery, refire could still
+	// interrupt it" apart from "no current investigation work remains".
+	OrientationConfirmingRecovery Orientation = "confirming_recovery"
+	OrientationRecovered          Orientation = "recovered"
+	OrientationClosedUncertain    Orientation = "closed_uncertain"
 )
 
-// DeriveOrientation reports which phase the root currently emphasizes,
-// from the accepted Transition and the folded Episode summary alone:
+// DeriveOrientation reports which phase the root currently emphasizes, from
+// the accepted Transition and the folded Episode summary alone:
 //
 //	Observed -> Investigating -> Monitoring -> Recovered
+//	Observed -> Investigating -> Confirming recovery -> Recovered
 //	Observed -> Investigating -> Closed uncertain
 //
-// A refire returns emphasis from Monitoring to Investigating (the summary
-// keeps InvestigationStarted), and a direct closed_unknown never invents
-// Monitoring. Which phases the rendered chain SHOWS — in particular whether
-// a closed_unknown chain includes Monitoring at all — additionally needs
-// the Situation's Transition history, which the Slack renderer reads.
+// Terminal lifecycle takes precedence, then Confirming recovery, then
+// actual aggregate work (spec.md's accepted operator contract) — never the
+// reverse. A refire with renewed investigation returns emphasis to
+// Investigating, and a direct closed_unknown never invents Monitoring.
+//
+// B2 (B0 integration contract §3) derives the active-lifecycle branch from
+// latest.Projection.Briefing.Work — a pure function of (Lifecycle,
+// WorkProjection), reachable through latest's existing two fields without
+// widening this function's signature. Nothing here reads publication or
+// delivery history: a delayed first root, or one this cycle has not yet
+// delivered, still reports the CURRENT committed truth, never an earlier
+// phase merely because Slack has not caught up (S1-05).
+//
+// A nil Briefing, or one whose Work is still its legacy zero value
+// (Work.Phase == ""), means latest predates this projection (a Transition
+// decoded from an old projection_json row, or a fixture that never set
+// Briefing) — DeriveOrientation falls back to the ported ActionContract
+// heuristic so historical replay is unaffected.
 func DeriveOrientation(summary model.EpisodeSummary, latest model.Transition) Orientation {
-	switch latest.Lifecycle { //nolint:exhaustive // active is the default branch, where Observed and Investigating are told apart.
+	switch latest.Lifecycle { //nolint:exhaustive // active is the default branch, where Observed/Investigating/Monitoring are told apart.
 	case model.LifecycleRecovered:
 		return OrientationRecovered
 	case model.LifecycleClosedUnknown:
 		return OrientationClosedUncertain
 	case model.LifecycleRecoveryPending:
-		return OrientationMonitoring
+		return OrientationConfirmingRecovery
 	default:
-		if summary.InvestigationStarted || investigationCurrent(latest.ActionContract) ||
-			latest.ActionContract.OperatorActionRequired != nil {
-			return OrientationInvestigating
+		b := latest.Projection.Briefing
+		if b == nil || b.Work.Phase == "" {
+			return legacyOrientation(summary, latest)
 		}
-		return OrientationObserved
+		switch b.Work.Phase { //nolint:exhaustive // collecting/none fall to the Observed default below.
+		case model.WorkPhaseExecuting, model.WorkPhaseRetryWait:
+			return OrientationInvestigating
+		case model.WorkPhaseQueued, model.WorkPhaseAwaitingDecision:
+			// R2 repair (lead review 2026-09-09): outstanding work after
+			// execution began — a stale completion restored awaiting_decision
+			// (completeStaleTx) while attempts remain spent, or a sibling
+			// Incident in this Situation already executed — is still
+			// Investigating (slide 4: "Investigating includes work that
+			// remains outstanding after it began"), never Observed. Only
+			// work that has genuinely never executed anywhere in this
+			// Situation reads as Observed.
+			if b.Work.ExecutionStarted {
+				return OrientationInvestigating
+			}
+			return OrientationObserved
+		case model.WorkPhaseSettled, model.WorkPhaseExhausted:
+			// Settled/exhausted outrank ExecutionStarted: a policy/coverage
+			// skip that never executed at all is still Monitoring once no
+			// work remains, per the canonical HTML's investigation:skip and
+			// skip-policy examples (lead review 2026-09-09 contract
+			// clarification) — "no execution -> Observed" applies to
+			// unstarted outstanding/collecting work, not a settled skip.
+			return OrientationMonitoring
+		default:
+			return OrientationObserved
+		}
 	}
+}
+
+// legacyOrientation is the ported ActionContract-sniffing heuristic
+// DeriveOrientation used before WorkProjection existed, preserved verbatim
+// for a Transition whose Briefing/Work predates this chunk (legacy replay).
+func legacyOrientation(summary model.EpisodeSummary, latest model.Transition) Orientation {
+	// A current monitoring contract outranks historical investigation.
+	// Attention can remain urgent while automation watches alert changes.
+	c := latest.ActionContract
+	if c.AlertINTAction != nil && c.AlertINTStatus != nil &&
+		(*c.AlertINTAction == model.AlertINTActionMonitorSituation || *c.AlertINTAction == model.AlertINTActionVerifyRecovery) &&
+		(*c.AlertINTStatus == model.AlertINTStatusWaiting || *c.AlertINTStatus == model.AlertINTStatusRunning || *c.AlertINTStatus == model.AlertINTStatusPlanned) {
+		return OrientationMonitoring
+	}
+	if summary.InvestigationStarted || investigationCurrent(latest.ActionContract) ||
+		latest.ActionContract.OperatorActionRequired != nil {
+		return OrientationInvestigating
+	}
+	return OrientationObserved
 }
 
 // ----------------------------------------------------------------------

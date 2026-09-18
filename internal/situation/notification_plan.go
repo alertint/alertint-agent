@@ -5,6 +5,7 @@ package situation
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,6 +19,235 @@ import (
 // derivation — Slack delivery never makes a second publication decision,
 // and nothing in this file renders Slack.
 // ----------------------------------------------------------------------
+
+// DeliveredHistory is the durable, delivery-aware context B5's ReplyEligible
+// needs to decide whether the operator has already effectively been told
+// something — never a second materiality decision (B0 integration contract
+// §4/§5). It is read inside LoadReconciliationInput's own transaction
+// (SnapshotInput.DeliveredHistory) and carried through to planning
+// unchanged (PublicationInput.DeliveredHistory).
+type DeliveredHistory struct {
+	// LastDeliveredSequence is the highest Transition sequence for which a
+	// reply (thread_append or broadcast_handoff) has actually DELIVERED, or
+	// 0 when none has.
+	LastDeliveredSequence int
+	// AssuranceConveyed is true once the operator has actually seen the
+	// first-execution assurance: a DELIVERED reply that carried a
+	// first_execution_assurance candidate, or a DELIVERED root_sync whose
+	// own authority Transition recorded Briefing.Work.ExecutionStarted
+	// (B0 integration contract §5.2 — "the delivered root version's own work
+	// provenance"). The CURRENT Episode summary answers a different
+	// question, since the root edit that would show execution may still be
+	// queued; EpisodeSummary.InvestigationStarted answers a third, since the
+	// legacy action-contract journal fold sets it for merely PLANNED triage
+	// (lead review 2026-09-09, R2).
+	AssuranceConveyed bool
+	// LiveAssuranceIntentID names a still-undelivered (pending,
+	// blocked_configuration, or failed) assurance reply intent, if one
+	// exists — informational; the actual obsolete-start supersession (§5.3)
+	// is a store-layer write inside CommitController's own fenced
+	// transaction, re-verified fresh rather than trusted from this earlier
+	// read.
+	LiveAssuranceIntentID *string
+	// CommunicatedLimitationCodes is the NET set of LimitationFacts.Code
+	// values currently communicated as active: a delivered ability_changed
+	// candidate's code enters this set on an uncleared appearance and
+	// leaves it on a delivered clearing, folded in Transition-sequence
+	// order. Distinct codes stay independent.
+	CommunicatedLimitationCodes []string
+	// CommunicatedAction is the operator Action most recently delivered as
+	// introduced or revised, or nil once a delivered candidate withdraws it
+	// (or none has ever been communicated).
+	CommunicatedAction *model.OperatorAction
+	// ProjectedLimitationCodes is the NET set of limitation codes left
+	// STANDING once every reply the operator has already seen AND every
+	// reply still owed to them (pending, blocked_configuration or failed)
+	// has landed: ONE fold in Transition-sequence order over both sets
+	// together, never two folds whose positive results are unioned.
+	//
+	// Both halves matter. An obstacle waiting behind a delivery gap is not
+	// "unreported" — it WILL be published, so a correction planned while it
+	// waits has to survive (R5). And a queued clearance really does cancel
+	// a delivered appearance, so the obstacle recorded AGAIN behind that
+	// clearance is news: a union could not express that, and suppressed the
+	// recurrence while the clearance stayed owed, leaving the operator's
+	// last word "coverage restored" (lead review round 2, 2026-09-09, R2).
+	ProjectedLimitationCodes []string
+	// ProjectedAction is the operator Action the same ordered fold leaves
+	// standing: nil once the last delivered-or-owed candidate withdraws it.
+	ProjectedAction *model.OperatorAction
+	// AssuranceSuperseded is the PRESENT-relevance answer for the start
+	// assurance, and the only field here that looks FORWARD from the reply
+	// being delivered: a later Transition that earns a reply of its own has
+	// already recorded a useful finding, an inconclusive completion or the
+	// Situation's terminal end, so "investigating" is no longer where the
+	// work is.
+	//
+	// It is deliberately not folded into the sets above, and it does not
+	// loosen their bound. A later correction may not rewrite what an
+	// earlier message was allowed to say about a limitation or an action:
+	// that ordering stays bounded strictly below the reply's own sequence.
+	// The assurance is a different kind of statement — it describes the
+	// present, so a present that has moved on makes it stale rather than
+	// wrong at the time.
+	//
+	// §5.3's commit-time supersession already retires a PURELY transient
+	// assurance row this way. A row that also carries material member or
+	// scope history is not disposable (R3), so the same overtaking
+	// vocabulary is applied to the candidate instead: the row still posts,
+	// and only its stale assurance is dropped (lead review round 3,
+	// 2026-09-09, R1).
+	AssuranceSuperseded bool
+}
+
+// limitationStanding reports whether code is left standing by the ordered
+// fold over everything delivered and everything still owed — the state the
+// operator ends up looking at once the queue drains. It is the only
+// question eligibility asks: a limitation still standing makes a repeated
+// appearance a duplicate and a clearing a real correction, and one no
+// longer standing makes the obstacle recorded again genuine news.
+//
+// The two halves of the history it is folded from stay separate on purpose.
+// CommunicatedLimitationCodes is what the operator HAS been told, which is
+// a different question and never a substitute for this one.
+func (h DeliveredHistory) limitationStanding(code string) bool {
+	return containsString(h.ProjectedLimitationCodes, code)
+}
+
+// requestStanding reports the same for a recorded operator action: one that
+// is still asked of the operator once every owed reply has landed.
+func (h DeliveredHistory) requestStanding() bool {
+	return h.ProjectedAction != nil
+}
+
+// assuranceStale reports whether the first-execution assurance no longer
+// belongs on the operator's screen. Two independent reasons, both fatal to
+// it: they have already seen it, or the work has visibly moved past merely
+// starting before this reply reached them (AssuranceSuperseded).
+func (h DeliveredHistory) assuranceStale() bool {
+	return h.AssuranceConveyed || h.AssuranceSuperseded
+}
+
+func containsString(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// ReplyEligible filters cands (B3's structural material-evidence facts, B0
+// integration contract §4) against delivered history, replacing
+// operatorReplyWarranted's whole-transition boolean for briefing-bearing
+// transitions inside PlanNotificationIntents/selectPoke. It never re-derives
+// materiality — every kind here is already a real structural fact — it only
+// decides whether the operator has effectively already been told (or, for a
+// clearing, ever told about the obstacle in the first place). rootPublished
+// is the Situation's root state BEFORE this commit (PublicationInput.
+// RootPublished): when false, this commit's own first root publication
+// conveys a fresh first_execution_assurance candidate itself, so no reply is
+// warranted for it (spec.md "If the first root already conveys this
+// assurance, do not echo it").
+//
+// That last rule is not special to the assurance. The canonical slide-4
+// gate states it for the whole reply decision — "Initial publication has no
+// duplicate reply" (gate), "Never echo the first root into its thread"
+// (root), "or no earlier root" (quiet path), "existing root" (reply path) —
+// because the first root renders the CURRENT truth, terminal outcome
+// included. So a commit that is itself the first publication earns no
+// reply for ANY candidate kind (lead review 2026-09-09, R4).
+func ReplyEligible(cands []model.MaterialCandidate, h DeliveredHistory, rootPublished bool) []model.MaterialCandidate {
+	if !rootPublished {
+		return nil
+	}
+	out := make([]model.MaterialCandidate, 0, len(cands))
+	for _, c := range cands {
+		switch c.Kind { //nolint:exhaustive // every other candidate kind is an unconditional structural fact B3 already decided; only these three carry a delivery-history-dependent eligibility rule.
+		case model.CandidateFirstExecutionAssurance:
+			// The one candidate whose eligibility looks FORWARD as well as
+			// back: an assurance still riding a retained mixed row after a
+			// finding, an inconclusive completion or the terminal end has
+			// been overtaken, and the row's other facts post without it.
+			if h.assuranceStale() {
+				continue
+			}
+		case model.CandidateAbilityChanged:
+			if c.Limitation == nil {
+				continue
+			}
+			standing := h.limitationStanding(c.Limitation.Code)
+			if c.Limitation.Cleared {
+				if !standing {
+					// A genuinely unreported transient obstacle — never
+					// delivered, not waiting in the queue, and not left
+					// standing by anything owed — is not useful history
+					// (plan.md item 4): nothing was ever said, so there is
+					// nothing to correct.
+					continue
+				}
+			} else if standing {
+				// Defensive idempotency: an appearance the operator already
+				// has, or is already owed, must not be replanned as new. An
+				// appearance recorded after an owed clearance is NOT that
+				// case — the clearance leaves nothing standing.
+				continue
+			}
+		case model.CandidateActionChanged:
+			if c.Action == nil {
+				continue
+			}
+			if c.Action.Withdrawn && !h.requestStanding() {
+				// A withdrawal only corrects a request that is actually
+				// still standing: one the operator has received, or is
+				// owed, and that nothing owed has withdrawn already.
+				continue
+			}
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// replyEligibleTransition reports whether tr (a briefing-bearing Transition)
+// earns a reply intent: at least one of its own persisted candidates
+// survives ReplyEligible against in's delivered history and root state. It
+// replaces operatorReplyWarranted's prose-equality gate for these
+// transitions (B0 integration contract §4); the eligible subset itself is
+// not persisted separately — B4 renders every candidate on the (already
+// materiality-filtered) Transition once it earns a reply.
+//
+// Reported gap, not worked around: B3's MaterialCandidates has no candidate
+// kind for a changed descriptive Symptoms list (title text) — every other
+// legacy operatorReplyWarranted signal (lifecycle, attention, action,
+// blocked, alert-state delta, analysis, scope/firing/resolved/unknown/total
+// counts, failed/unavailable increases) is now reachable through a
+// candidate kind, verified empirically against this package's full existing
+// suite, but a symptoms-only change is real, useful, delivery-independent
+// information with nowhere else to surface, so it keeps the narrow legacy
+// fallback here rather than silently going quiet. Adding a proper
+// CandidateKind for it is out of B5's allowlist (internal/situation/
+// briefing.go, model/briefing.go); this is the one residual escalation for
+// this handoff.
+func replyEligibleTransition(in PublicationInput, tr model.Transition) bool {
+	if !in.RootPublished {
+		// Initial publication has no duplicate reply — the symptoms
+		// fallback below included. The first root carries this commit's own
+		// truth already (R4).
+		return false
+	}
+	var cands []model.MaterialCandidate
+	if tr.Projection.OperatorDelta != nil {
+		cands = tr.Projection.OperatorDelta.Candidates
+	}
+	if len(ReplyEligible(cands, in.DeliveredHistory, in.RootPublished)) > 0 {
+		return true
+	}
+	if in.PriorTransition == nil || in.PriorTransition.Projection.Briefing == nil || tr.Projection.Briefing == nil {
+		return false
+	}
+	return !reflect.DeepEqual(in.PriorTransition.Projection.Briefing.Symptoms, tr.Projection.Briefing.Symptoms)
+}
 
 // PublicationInput is one committed reconciliation plus the delivery-side
 // context the publication decision needs.
@@ -52,6 +282,11 @@ type PublicationInput struct {
 	RecurrenceRepliesOff bool
 	Drill                bool
 	Now                  time.Time
+	// DeliveredHistory is the durable delivery-aware context ReplyEligible
+	// filters briefing-bearing candidates against (B5, B0 integration
+	// contract §4/§5). Zero value for a legacy (nil briefing) transition,
+	// which keeps the ported operatorReplyWarranted behavior untouched.
+	DeliveredHistory DeliveredHistory
 }
 
 // PlanNotificationIntents derives every durable Slack obligation one
@@ -144,48 +379,7 @@ func PlanNotificationIntents(in PublicationInput) ([]model.NotificationIntent, e
 		}
 	}
 
-	// Immutable journal entries, one per journaled Transition, in sequence
-	// order. Each Transition produces exactly ONE reply: the poked one is
-	// broadcast (a handoff edits the root and then creates one broadcast
-	// reply), every other one is a quiet thread entry. Both classes render
-	// the same stored journal data, so emitting both for one Transition
-	// would post it to Slack twice.
-	for _, tr := range in.Transitions {
-		poked := pokeSequence != 0 && tr.Sequence == pokeSequence
-		if tr.JournalKind == model.JournalNone && !poked {
-			continue
-		}
-		if tr.Reason == model.ReasonRecurrenceMilestone && in.RecurrenceRepliesOff {
-			// recurrence_mode: off keeps recurrence to the root's silent
-			// count update (the root_sync above); a milestone is never a
-			// poke, so nothing else is lost.
-			continue
-		}
-		if !poked {
-			out = append(out, newIntent(in, model.EffectThreadAppend, tr,
-				threadKey(model.EffectThreadAppend, in.Situation.ID, tr.Sequence)))
-			continue
-		}
-
-		priority := DeriveInterruptionPriority(tr)
-		broadcast := newIntent(in, model.EffectBroadcastHandoff, tr,
-			threadKey(model.EffectBroadcastHandoff, in.Situation.ID, tr.Sequence))
-		broadcast.MainChannelPoke = true
-		broadcast.InterruptionPriority = &priority
-		if MeetsSlackFloor(priority, in.SlackFloor) {
-			out = append(out, broadcast)
-			continue
-		}
-		// Below the operator's floor the poke is withheld as a durable
-		// decision, never an absent row — but the floor "never suppresses
-		// ... a non-broadcast journal entry", so the same Transition still
-		// gets its quiet thread entry. Only one of the two is ever
-		// delivered, so this is not the duplicate the branch above avoids.
-		broadcast.Status = model.IntentWithheld
-		out = append(out,
-			newIntent(in, model.EffectThreadAppend, tr, threadKey(model.EffectThreadAppend, in.Situation.ID, tr.Sequence)),
-			broadcast)
-	}
+	out = append(out, planJournalIntents(in, pokeSequence)...)
 
 	for i := range out {
 		if err := out[i].Validate(); err != nil {
@@ -193,6 +387,120 @@ func PlanNotificationIntents(in PublicationInput) ([]model.NotificationIntent, e
 		}
 	}
 	return out, nil
+}
+
+// planJournalIntents creates immutable journal entries in sequence order.
+// Canonical projections may split one Transition into separately retryable
+// analysis and recovery replies; legacy projections retain exactly one reply.
+// A poked Transition assigns the poke to its final reply; earlier split replies
+// remain quiet thread entries.
+func planJournalIntents(in PublicationInput, pokeSequence int) []model.NotificationIntent {
+	out := make([]model.NotificationIntent, 0, len(in.Transitions)+1)
+	for _, tr := range in.Transitions {
+		replyKinds := canonicalReplyKinds(in, tr)
+		// Legacy projections retain their original publication semantics on
+		// replay. Every newly reconciled projection carries a briefing.
+		if tr.Projection.Briefing != nil && tr.Projection.Briefing.Flow == nil && !replyEligibleTransition(in, tr) {
+			continue
+		}
+		if tr.Projection.Briefing != nil && tr.Projection.Briefing.Flow != nil && len(replyKinds) == 0 {
+			continue
+		}
+		poked := pokeSequence != 0 && tr.Sequence == pokeSequence
+		if tr.JournalKind == model.JournalNone && !poked {
+			continue
+		}
+		if tr.Projection.Briefing == nil && tr.Reason == model.ReasonRecurrenceMilestone && in.RecurrenceRepliesOff {
+			// Preserve the legacy recurrence filter. New projections use the
+			// semantic gate above: recurrence alone is quiet, but milestone
+			// reason precedence must not hide newly useful analysis.
+			continue
+		}
+		if len(replyKinds) == 0 {
+			replyKinds = []model.NotificationReplyKind{model.ReplyLegacy}
+		}
+		for i, kind := range replyKinds {
+			kindPoked := poked && i == len(replyKinds)-1
+			if !kindPoked {
+				out = append(out, newReplyIntent(in, model.EffectThreadAppend, tr, kind))
+				continue
+			}
+			priority := DeriveInterruptionPriority(tr)
+			broadcast := newReplyIntent(in, model.EffectBroadcastHandoff, tr, kind)
+			broadcast.MainChannelPoke = true
+			broadcast.InterruptionPriority = &priority
+			if MeetsSlackFloor(priority, in.SlackFloor) {
+				out = append(out, broadcast)
+				continue
+			}
+			broadcast.Status = model.IntentWithheld
+			out = append(out, newReplyIntent(in, model.EffectThreadAppend, tr, kind), broadcast)
+		}
+	}
+	return out
+}
+
+func canonicalReplyKinds(in PublicationInput, tr model.Transition) []model.NotificationReplyKind {
+	b := tr.Projection.Briefing
+	if b == nil || b.Flow == nil {
+		return nil
+	}
+	if !in.RootPublished && !in.RootPublicationOwed && b.Work.Phase == model.WorkPhaseCollecting &&
+		b.Flow.InvestigationStartedAt == nil && b.Firing > 0 {
+		return []model.NotificationReplyKind{model.ReplyCorrelationStarted}
+	}
+	facts := canonicalReplyFactsFor(tr)
+	var out []model.NotificationReplyKind
+	if in.RootPublished && facts.assurance && !facts.analysis && !facts.allClear && !facts.terminal && b.Flow.InvestigationStartedAt != nil {
+		out = append(out, model.ReplyInvestigationStarted)
+	}
+	if facts.analysis {
+		out = append(out, model.ReplyAnalysisCompleted)
+	}
+	if d := tr.Projection.OperatorDelta; d != nil && d.StateChanged && b.Firing > 0 && b.Firing < d.PreviousFiring {
+		out = append(out, model.ReplyPartialClearance)
+	}
+	if facts.allClear {
+		out = append(out, model.ReplyRecoveryObserved)
+	}
+	if facts.terminal && tr.Lifecycle == model.LifecycleRecovered {
+		out = append(out, model.ReplyRecovered)
+	}
+	if facts.terminal && tr.Lifecycle != model.LifecycleRecovered {
+		out = append(out, model.ReplyLegacy)
+	}
+	if len(out) == 0 && !facts.canonicalCandidate && replyEligibleTransition(in, tr) {
+		out = append(out, model.ReplyLegacy)
+	}
+	return out
+}
+
+type canonicalReplyFacts struct {
+	assurance          bool
+	analysis           bool
+	allClear           bool
+	terminal           bool
+	canonicalCandidate bool
+}
+
+func canonicalReplyFactsFor(tr model.Transition) canonicalReplyFacts {
+	var facts canonicalReplyFacts
+	if tr.Projection.OperatorDelta == nil {
+		return facts
+	}
+	for _, candidate := range tr.Projection.OperatorDelta.Candidates {
+		switch candidate.Kind { //nolint:exhaustive
+		case model.CandidateFirstExecutionAssurance:
+			facts.assurance, facts.canonicalCandidate = true, true
+		case model.CandidateUsefulFinding, model.CandidateInconclusiveCompletion:
+			facts.analysis, facts.canonicalCandidate = true, true
+		case model.CandidateAllClear:
+			facts.allClear, facts.canonicalCandidate = true, true
+		case model.CandidateTerminalEnd:
+			facts.terminal, facts.canonicalCandidate = true, true
+		}
+	}
+	return facts
 }
 
 func validatePublicationInput(in PublicationInput) error {
@@ -286,6 +594,9 @@ func selectPoke(in PublicationInput) (model.Transition, bool) {
 	found := false
 	for i := range in.Transitions {
 		tr := in.Transitions[i]
+		if tr.Projection.Briefing != nil && !replyEligibleTransition(in, tr) {
+			continue
+		}
 		// Every Transition is classified against the state BEFORE this
 		// commit, never against an earlier Transition of the same commit.
 		// An `operator_artifact_recorded` Transition copies this commit's
@@ -334,6 +645,16 @@ func newIntent(in PublicationInput, class model.EffectClass, subject model.Trans
 		Status:             model.IntentPending,
 		CreatedAt:          in.Now,
 	}
+}
+
+func newReplyIntent(in PublicationInput, class model.EffectClass, subject model.Transition, kind model.NotificationReplyKind) model.NotificationIntent {
+	key := threadKey(class, in.Situation.ID, subject.Sequence)
+	if kind != model.ReplyLegacy {
+		key = boundedText(key+":"+string(kind), maxHistoryIdentifier)
+	}
+	out := newIntent(in, class, subject, key)
+	out.ReplyKind = kind
+	return out
 }
 
 // intentIdentity derives a stable UUIDv5 from the fixed AlertINT namespace

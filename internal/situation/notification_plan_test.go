@@ -1116,6 +1116,62 @@ func TestPlanNotificationIntentsRecurrenceModeChangeGatedPostsAQuietMilestone(t 
 	}
 }
 
+// A recurrence milestone wins reason precedence even when the same commit
+// gains useful analysis. Mode off must not suppress that independently earned
+// update; legacy projections retain their original recurrence-only filter.
+func TestPlanNotificationIntentsRecurrenceModePreservesBriefingAnalysis(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		briefing, analysis bool
+		off                bool
+		wantReplies        int
+	}{
+		{name: "legacy off", off: true},
+		{name: "legacy change gated", wantReplies: 1},
+		{name: "briefing recurrence only off", briefing: true, off: true},
+		{name: "briefing recurrence only change gated", briefing: true},
+		{name: "milestone and analysis off", briefing: true, analysis: true, off: true, wantReplies: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := hsNext(t)
+			c.RecurrenceCount = 5
+			if tc.briefing {
+				old := &model.OperatorBriefing{Scope: "checkout", Firing: 1, Total: 1}
+				c.PriorTransition.Projection.Briefing = old
+				c.PriorSummary.Briefing = old
+				current := *old
+				if tc.analysis {
+					current.AnalysisCount = 1
+					current.Analyses = []model.IncidentAnalysis{{IncidentID: "incident-1", Summary: "Deployment may explain checkout errors", Findings: []string{"Errors began with deployment"}}}
+				}
+				c.Projection.Briefing = &current
+			}
+			trs, sum := hsCommitOf(t, c)
+			if len(trs) != 1 || trs[0].Reason != model.ReasonRecurrenceMilestone || sum.RecurrenceCount != 5 {
+				t.Fatalf("must exercise milestone precedence and persisted count: %+v", trs)
+			}
+			if tc.analysis && (sum.Briefing == nil || len(sum.Briefing.Analyses) != 1 || trs[0].Projection.OperatorDelta == nil || len(trs[0].Projection.OperatorDelta.Analyses) != 1) {
+				t.Fatal("same-commit useful analysis must survive in summary and reply delta")
+			}
+			in := hsPub(c, trs, sum)
+			in.RecurrenceRepliesOff = tc.off
+			got := hsPlan(t, in)
+			if roots := hsIntentsOfClass(got, model.EffectRootSync); len(roots) != 1 || roots[0].MainChannelPoke || roots[0].Status != model.IntentPending {
+				t.Fatalf("milestone must retain one quiet root update: %+v", roots)
+			}
+			replies := hsReplyIntents(got)
+			if len(replies) != tc.wantReplies {
+				t.Fatalf("earned replies=%d, want %d (milestone must not mask useful analysis)", len(replies), tc.wantReplies)
+			}
+			for _, reply := range replies {
+				if reply.EffectClass != model.EffectThreadAppend || reply.MainChannelPoke || !reply.RequiresRoot || reply.TransitionID == nil || *reply.TransitionID != trs[0].ID || reply.Status != model.IntentPending {
+					t.Fatalf("earned update must be one quiet reply to its authoritative transition: %+v", reply)
+				}
+			}
+		})
+	}
+}
+
 // TestPlanNotificationIntentsInternalWorkProgressNeverRepages is review
 // round 3's reproduction, kept verbatim in intent: production-derived
 // contracts for Triage starting and finishing, same human action, a poke

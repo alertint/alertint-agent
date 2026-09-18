@@ -180,13 +180,13 @@ func TestValidateAssessmentProposalRejectsUnknownLimitationCode(t *testing.T) {
 }
 
 // TestValidateAssessmentProposalAcceptsKnownLimitationCode is the positive
-// control: a proposal citing an actual plan2UnsupportedCapabilities code
+// control: a proposal citing an actual reservedUnsupportedCapabilities code
 // (facts.go) is accepted, not swept up by the new rejection.
 func TestValidateAssessmentProposalAcceptsKnownLimitationCode(t *testing.T) {
 	snap := snapshotFor(t, baseSnapshotInput(t))
 	call := callFor(snap)
 	p := validPlainProposal()
-	p.Limitations = []model.Limitation{{Code: "prometheus_unavailable", Detail: "Prometheus is not a Plan 2 fact producer."}}
+	p.Limitations = []model.Limitation{{Code: "semantic_profile_unavailable", Detail: "Semantic profile binding/correction authority is not available until Plan 5."}}
 	raw := marshalRaw(t, p)
 
 	got := ValidateAssessmentProposal(raw, snap, call, time.Now())

@@ -20,8 +20,9 @@ func situationsBaseYAML(t *testing.T) string {
 // TestSituationsDefaults locks in the exact Plan 2 controller surface: worker
 // count, reconcile poll, lease/heartbeat, webhook recovery grace, cadence
 // tiers, the fixed L2 call/work-attempt accounting, attempt wall, LLM
-// concurrency, and the retry range/jitter. Plan 3/4 settings (connector
-// concurrency, envelope review interval, max_l1_llm_calls, ...) are
+// concurrency, and the retry range/jitter — plus Plan 4's bounded evidence-
+// preparation and semantic-profile-worker defaults (spec.md "Defaults and
+// hard limits"). Plan 5 settings (envelope review interval, ...) remain
 // deliberately absent.
 func TestSituationsDefaults(t *testing.T) {
 	cfg := Defaults()
@@ -48,6 +49,12 @@ func TestSituationsDefaults(t *testing.T) {
 		{"retry.max_seconds", s.Retry.MaxSeconds, 300},
 		{"retry.jitter_percent", s.Retry.JitterPercent, 20},
 		{"slack.repage_cooldown_seconds", s.Slack.RepageCooldownSeconds, 900},
+		{"preparation.max_source_calls_per_cycle", s.Preparation.MaxSourceCallsPerCycle, 6},
+		{"preparation.max_wall_seconds", s.Preparation.MaxWallSeconds, 20},
+		{"preparation.refresh_seconds", s.Preparation.RefreshSeconds, 300},
+		{"semantic_profiles.workers", s.SemanticProfiles.Workers, 1},
+		{"semantic_profiles.max_attempts", s.SemanticProfiles.MaxAttempts, 3},
+		{"semantic_profiles.attempt_wall_seconds", s.SemanticProfiles.AttemptWallSeconds, 30},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -267,5 +274,157 @@ func TestNotifySlackMinSeverityIsInterruptionPriorityFloor(t *testing.T) {
 	}
 	if err := model.InterruptionPriority("critical").Validate(); err != nil {
 		t.Errorf("critical must be a valid Interruption priority: %v", err)
+	}
+}
+
+// TestLoad_SituationPreparationValidAndDefaults proves
+// situations.preparation fields load and override their defaults.
+func TestLoad_SituationPreparationValidAndDefaults(t *testing.T) {
+	yaml := situationsBaseYAML(t) + `
+situations:
+  preparation:
+    max_source_calls_per_cycle: 8
+    max_wall_seconds: 15
+    refresh_seconds: 120
+`
+	path := writeConfig(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	p := cfg.Situations.Preparation
+	if p.MaxSourceCallsPerCycle != 8 {
+		t.Errorf("max_source_calls_per_cycle = %d, want 8", p.MaxSourceCallsPerCycle)
+	}
+	if p.MaxWallSeconds != 15 {
+		t.Errorf("max_wall_seconds = %d, want 15", p.MaxWallSeconds)
+	}
+	if p.RefreshSeconds != 120 {
+		t.Errorf("refresh_seconds = %d, want 120", p.RefreshSeconds)
+	}
+}
+
+// TestLoad_SituationPreparationRejectsOutOfRange proves each Plan 4
+// preparation field's exact spec.md range (max_source_calls_per_cycle
+// 1-32, max_wall_seconds 1-30, refresh_seconds 60-3600) is enforced, not
+// silently clamped.
+func TestLoad_SituationPreparationRejectsOutOfRange(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+	}{
+		{"max_source_calls_per_cycle too low", "max_source_calls_per_cycle: 0"},
+		{"max_source_calls_per_cycle too high", "max_source_calls_per_cycle: 33"},
+		{"max_wall_seconds too low", "max_wall_seconds: 0"},
+		{"max_wall_seconds too high", "max_wall_seconds: 31"},
+		{"refresh_seconds too low", "refresh_seconds: 59"},
+		{"refresh_seconds too high", "refresh_seconds: 3601"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			yaml := situationsBaseYAML(t) + "situations:\n  preparation:\n    " + c.yaml + "\n"
+			path := writeConfig(t, yaml)
+			if _, err := Load(path); err == nil {
+				t.Fatalf("expected validation error for %s", c.name)
+			}
+		})
+	}
+}
+
+// TestLoad_SituationPreparationRejectsWallOverAttemptWall proves the
+// spec.md cross-field rule: preparation.max_wall_seconds must be strictly
+// less than situations.attempt_wall_seconds (the preparation wall is
+// bounded by the enclosing controller attempt's own wall).
+func TestLoad_SituationPreparationRejectsWallOverAttemptWall(t *testing.T) {
+	yaml := situationsBaseYAML(t) + `
+situations:
+  attempt_wall_seconds: 20
+  preparation:
+    max_wall_seconds: 20
+`
+	path := writeConfig(t, yaml)
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected error when preparation.max_wall_seconds >= situations.attempt_wall_seconds")
+	}
+}
+
+// TestLoad_SituationPreparationRejectsUnknownField proves strict decoding
+// covers the new preparation block too.
+func TestLoad_SituationPreparationRejectsUnknownField(t *testing.T) {
+	yaml := situationsBaseYAML(t) + `
+situations:
+  preparation:
+    bogus_field: 1
+`
+	path := writeConfig(t, yaml)
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected strict-decode error for unknown key under situations.preparation")
+	}
+}
+
+// TestLoad_SemanticProfilesValidAndDefaults proves
+// situations.semantic_profiles fields load and override their defaults.
+func TestLoad_SemanticProfilesValidAndDefaults(t *testing.T) {
+	yaml := situationsBaseYAML(t) + `
+situations:
+  semantic_profiles:
+    workers: 2
+    max_attempts: 5
+    attempt_wall_seconds: 45
+`
+	path := writeConfig(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	sp := cfg.Situations.SemanticProfiles
+	if sp.Workers != 2 {
+		t.Errorf("workers = %d, want 2", sp.Workers)
+	}
+	if sp.MaxAttempts != 5 {
+		t.Errorf("max_attempts = %d, want 5", sp.MaxAttempts)
+	}
+	if sp.AttemptWallSeconds != 45 {
+		t.Errorf("attempt_wall_seconds = %d, want 45", sp.AttemptWallSeconds)
+	}
+}
+
+// TestLoad_SemanticProfilesRejectsOutOfRange proves each Plan 4
+// semantic-profile field's exact spec.md range (workers 1-4, max_attempts
+// 1-5, attempt_wall_seconds 1-60) is enforced.
+func TestLoad_SemanticProfilesRejectsOutOfRange(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+	}{
+		{"workers too low", "workers: 0"},
+		{"workers too high", "workers: 5"},
+		{"max_attempts too low", "max_attempts: 0"},
+		{"max_attempts too high", "max_attempts: 6"},
+		{"attempt_wall_seconds too low", "attempt_wall_seconds: 0"},
+		{"attempt_wall_seconds too high", "attempt_wall_seconds: 61"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			yaml := situationsBaseYAML(t) + "situations:\n  semantic_profiles:\n    " + c.yaml + "\n"
+			path := writeConfig(t, yaml)
+			if _, err := Load(path); err == nil {
+				t.Fatalf("expected validation error for %s", c.name)
+			}
+		})
+	}
+}
+
+// TestLoad_SemanticProfilesRejectsUnknownField proves strict decoding
+// covers the new semantic_profiles block too.
+func TestLoad_SemanticProfilesRejectsUnknownField(t *testing.T) {
+	yaml := situationsBaseYAML(t) + `
+situations:
+  semantic_profiles:
+    bogus_field: 1
+`
+	path := writeConfig(t, yaml)
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected strict-decode error for unknown key under situations.semantic_profiles")
 	}
 }

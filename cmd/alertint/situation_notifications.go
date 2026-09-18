@@ -72,6 +72,13 @@ type DelivererStore interface {
 
 	// GetDeliveryGap reads one durable gap generation's rendering facts.
 	GetDeliveryGap(ctx context.Context, gapGeneration string) (store.GapSnapshot, error)
+
+	// GetCommunicatedHistory reads what the operator has already been told,
+	// what is still owed, and what has overtaken this reply since it was
+	// planned — the same DeliveredHistory the planner filtered against,
+	// re-read at delivery time so the outbound payload carries only the
+	// selected facts.
+	GetCommunicatedHistory(ctx context.Context, situationID string, beforeSequence int) (situation.DeliveredHistory, error)
 }
 
 // slackDeliveryAPI is exactly what SituationDeliverer calls on the narrow
@@ -242,7 +249,11 @@ func (d *SituationDeliverer) deliverThreadAppend(ctx context.Context, intent mod
 		return situation.NotificationDelivery{}, localDelivery("root_not_published",
 			fmt.Errorf("cmd/alertint: situation deliverer: situation %s has no delivered root to reply under", *intent.SituationID))
 	}
-	rendered, err := slack.RenderSituationJournal(tr)
+	reply, err := d.selectedReply(ctx, intent, tr)
+	if err != nil {
+		return situation.NotificationDelivery{}, err
+	}
+	rendered, err := slack.RenderSituationReply(reply)
 	if err != nil {
 		return situation.NotificationDelivery{}, invalidDelivery("render_failed",
 			fmt.Errorf("cmd/alertint: situation deliverer: render journal: %w", err))
@@ -258,6 +269,118 @@ func (d *SituationDeliverer) deliverThreadAppend(ctx context.Context, intent mod
 		return situation.NotificationDelivery{}, err
 	}
 	return situation.NotificationDelivery{Channel: res.Channel, MessageTS: res.TS, DeliveredAs: "thread"}, nil
+}
+
+// selectedReply reads this Situation's delivery history once, bounded to
+// replies below this Transition's own sequence, and returns the rendering
+// input that read produces: tr narrowed to the candidates the operator is
+// actually owed by THIS reply, plus the presentation fact below.
+//
+// ReplyEligible already made the narrowing decision at plan time against
+// the same durable history; re-reading it here is what carries the
+// decision through persistence, restart and both reply classes without a
+// second materiality judgement or a new persisted payload (B0 integration
+// contract §4/§5; lead review 2026-09-09, R1).
+//
+// Two rules keep the narrowing honest:
+//
+//   - a rejected candidate must not return through B4's legacy-boolean
+//     fallback, which fires exactly when no candidate of that kind rode the
+//     delta — so a kind rejected in full takes its legacy twin with it;
+//   - the narrowing applies whatever survives, the empty selection
+//     included. A reply the planner earned through the supported symptoms
+//     fallback carries candidates delivered history may reject in full;
+//     posting the original instead published exactly the facts the
+//     selection had refused (lead review round 2, 2026-09-09, R1);
+//   - the re-read answers what has happened SINCE the reply was planned as
+//     well as before it. A retained start-plus-scope row delivered after a
+//     finding, an inconclusive completion or the terminal end keeps its
+//     material scope change and loses its overtaken assurance (lead review
+//     round 3, 2026-09-09, R1).
+//
+// The disposition for an empty selection is therefore explicit: the reply
+// is delivered narrowed. It still renders this Transition's own status,
+// next step and recorded action, and any earned legacy content the
+// selection does not govern — a changed symptom above all — so it is never
+// an empty Slack message; what it never carries is a rejected fact.
+//
+// The same read answers a second, separate question the reply cannot ask
+// about itself: whether the automatic execution its own contract describes
+// has since been overtaken. That answer governs one rendered sentence, not
+// the selection — a reply that carries no candidate of its own can still
+// restate a superseded investigation as current, and the renderer decides
+// from this Transition's own contract whether it does (lead review round 4,
+// 2026-09-10, R1; slack.SituationReplyInput).
+//
+// That is why the read is unconditional and the SELECTION is not (lead
+// decisions 2026-09-10, §46/2). Every reply asks what the operator has
+// already been told — the canonical thread gate asks exactly that of every
+// reply, "Compare accepted information with what was already communicated"
+// — and only a reply that carries candidates has anything to narrow. A
+// recorded operator note or captured verdict carries this cycle's contract
+// verbatim and no candidate at all; gated on candidates, it skipped the
+// read and republished a superseded investigation with its old checkpoint.
+//
+// A read that fails leaves that question unanswered, and an unanswered
+// reply is not delivered: the attempt stops as a LOCAL retryable failure
+// with nothing sent, rather than posting the old contract on the strength
+// of a read that did not happen. The obligation survives for the retry.
+//
+// The durable Transition is never mutated: the delta is copied first.
+func (d *SituationDeliverer) selectedReply(ctx context.Context, intent model.NotificationIntent, tr model.Transition) (slack.SituationReplyInput, error) {
+	if intent.SituationID == nil {
+		// Both callers reject an intent with no Situation identity before
+		// reaching here; that validation stays theirs, and this guard only
+		// keeps the read from being attempted without one.
+		return slack.SituationReplyInput{Transition: tr, ReplyKind: intent.ReplyKind}, nil
+	}
+	history, err := d.store.GetCommunicatedHistory(ctx, *intent.SituationID, tr.Sequence)
+	if err != nil {
+		return slack.SituationReplyInput{}, localDelivery("communicated_history_unavailable",
+			fmt.Errorf("cmd/alertint: situation deliverer: load communicated history: %w", err))
+	}
+	reply := slack.SituationReplyInput{Transition: tr, ReplyKind: intent.ReplyKind, ExecutionSuperseded: history.AssuranceSuperseded}
+	delta := tr.Projection.OperatorDelta
+	if delta == nil || len(delta.Candidates) == 0 {
+		return reply, nil
+	}
+	// A reply is only ever delivered under an existing root, so the
+	// initial-publication rule cannot apply here.
+	eligible := situation.ReplyEligible(delta.Candidates, history, true)
+	if len(eligible) == len(delta.Candidates) {
+		return reply, nil
+	}
+
+	selected := *delta
+	selected.Candidates = eligible
+	if kindRejectedInFull(delta.Candidates, eligible, model.CandidateAbilityChanged) {
+		selected.AbilityLost = false
+	}
+	if kindRejectedInFull(delta.Candidates, eligible, model.CandidateActionChanged) {
+		selected.HumanRequestChanged = false
+	}
+	reply.Transition.Projection.OperatorDelta = &selected
+	return reply, nil
+}
+
+// kindRejectedInFull reports whether every candidate of kind was dropped —
+// the one case where B4 falls back to that kind's legacy boolean.
+func kindRejectedInFull(all, eligible []model.MaterialCandidate, kind model.CandidateKind) bool {
+	had := false
+	for _, c := range all {
+		if c.Kind == kind {
+			had = true
+		}
+	}
+	if !had {
+		return false
+	}
+	for _, c := range eligible {
+		if c.Kind == kind {
+			return false
+		}
+	}
+	return true
 }
 
 // deliverBroadcastHandoff optionally broadcasts a current handoff.
@@ -296,12 +419,15 @@ func (d *SituationDeliverer) deliverBroadcastHandoff(ctx context.Context, intent
 	// is asked to do (situation.HandoffStillCurrent).
 	current := situation.HandoffStillCurrent(tr, view.Summary)
 
-	renderTr := tr // a local copy: the durable ledger row is never mutated.
-	if !current {
-		renderTr.Journal.Delayed = true
-		renderTr.Journal.NoLongerCurrent = true
+	reply, err := d.selectedReply(ctx, intent, tr) // a local copy: the durable ledger row is never mutated.
+	if err != nil {
+		return situation.NotificationDelivery{}, err
 	}
-	rendered, err := slack.RenderSituationJournal(renderTr)
+	if !current {
+		reply.Transition.Journal.Delayed = true
+		reply.Transition.Journal.NoLongerCurrent = true
+	}
+	rendered, err := slack.RenderSituationReply(reply)
 	if err != nil {
 		return situation.NotificationDelivery{}, invalidDelivery("render_failed",
 			fmt.Errorf("cmd/alertint: situation deliverer: render journal: %w", err))

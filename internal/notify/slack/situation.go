@@ -59,21 +59,12 @@ type RenderedMessage struct {
 //
 // RecoveryEverObserved answers a question the source Transition alone
 // cannot always answer: whether a recovery_pending Transition occurred
-// anywhere earlier in this Situation's Transition ledger. It changes the
-// rendered chain only when SourceTransition is itself a closed_unknown
-// Transition reached directly from `active` with no recovery observation
-// of its OWN (Projection.RecoveryObservedAt nil) — a refire clears that
-// field on every Transition after it (internal/situation/controller.go's
-// resolveLifecycle, EventRefired branch), so a closed_unknown that follows
-// a refire cannot see the earlier recovery_pending phase through the
-// source Transition alone. DeriveOrientation's own doc comment names this
-// gap: "whether a closed_unknown chain includes Monitoring at all...
-// additionally needs the Situation's Transition history, which the Slack
-// renderer reads." Every other orientation decides the chain from
-// SourceTransition alone, so a caller may safely pass false when it has
-// not needed to scan the ledger (e.g. SourceTransition.Projection.
-// RecoveryObservedAt is already non-nil, or the Transition is not a
-// closed_unknown at all).
+// anywhere earlier in this Situation's Transition ledger. Earlier revisions
+// of the rendered phase chain hid Monitoring from a closed_unknown chain
+// unless this was true; the canonical revised slide 4 chain (S4-01) always
+// previews the full fixed roadmap regardless of history, so this field is
+// no longer read by rendering — kept only so cmd/alertint's existing caller
+// (outside this package's allowlist) keeps compiling unchanged.
 type SituationRootInput struct {
 	Summary              model.EpisodeSummary
 	SourceTransition     model.Transition
@@ -89,14 +80,16 @@ func RenderSituationRoot(in SituationRootInput) (RenderedMessage, error) {
 	if err := validateRootInput(in); err != nil {
 		return RenderedMessage{}, err
 	}
+	if in.Summary.Briefing != nil {
+		return renderBriefingRoot(in), nil
+	}
 
 	orientation := situation.DeriveOrientation(in.Summary, in.SourceTransition)
-	recoveryEverObserved := in.RecoveryEverObserved || in.SourceTransition.Projection.RecoveryObservedAt != nil
 	terminal := in.SourceTransition.Lifecycle.Terminal()
 
 	blocks := []slacklib.Block{
 		headerBlock(in.Summary, in.SourceTransition.Drill),
-		orientationBlock(orientation, recoveryEverObserved),
+		orientationBlock(orientation),
 	}
 
 	if terminal {
@@ -153,31 +146,34 @@ func headerBlock(s model.EpisodeSummary, drill bool) slacklib.Block {
 	return sectionBlock(drillPrefix(drill) + "*" + s.Title + "*")
 }
 
-func orientationBlock(o situation.Orientation, recoveryEverObserved bool) slacklib.Block {
-	return contextBlock(renderOrientationChain(o, recoveryEverObserved))
+func orientationBlock(o situation.Orientation) slacklib.Block {
+	return contextBlock(renderOrientationChain(o))
 }
 
-// renderOrientationChain renders the compact phase chain with exactly one
-// current phase emphasized (spec.md "Root and journal rendering"). The
-// nonterminal chains always preview the full roadmap — Monitoring and the
-// generic "Outcome" placeholder included — since an active Situation has
-// not yet learned whether it will ever be observed recovering. A terminal
-// chain instead reports what actually happened: Recovered always implies
-// Monitoring (AdvanceLifecycle only reaches `recovered` from
-// `recovery_pending`); closed_unknown includes Monitoring only when
-// recoveryEverObserved says the episode passed through it.
-func renderOrientationChain(o situation.Orientation, recoveryEverObserved bool) string {
+// phaseTrackingEnded is the canonical closed_unknown terminal phase name
+// (S4-01/S1-04): "tracking ended", never "Closed uncertain" — recovery was
+// never confirmed, but AlertINT itself stopped, and the chain must say so
+// in the same words the rest of the closed_unknown copy uses.
+const phaseTrackingEnded = "Tracking ended · recovery unconfirmed"
+
+// renderOrientationChain renders the fixed compact roadmap with exactly one
+// current position marked (canonical slide 4, S4-01: "Separators replace
+// arrows... Observed / Investigating / Monitoring / Confirming recovery /
+// actual terminal outcome"). Unlike the earlier arrow chain, this fixed
+// five-slot roadmap never conditionally omits a position from history: only
+// the marked position's own text and the terminal slot's actual outcome
+// name change — an operator reads the same static shape every time, "▸"
+// naming only the current position, never a completed-step or "now" claim.
+func renderOrientationChain(o situation.Orientation) string {
 	const (
-		phaseObserved      = "Observed"
-		phaseInvestigating = "Investigating"
-		phaseMonitoring    = "Monitoring"
-		phasePlaceholder   = "Outcome"
+		phaseObserved           = "Observed"
+		phaseInvestigating      = "Investigating"
+		phaseMonitoring         = "Monitoring"
+		phaseConfirmingRecovery = "Confirming recovery"
+		phasePlaceholder        = "Recovered"
 	)
 
-	outcome := phasePlaceholder
 	var bold string
-	showMonitoring := true
-
 	switch o {
 	case situation.OrientationObserved:
 		bold = phaseObserved
@@ -185,32 +181,31 @@ func renderOrientationChain(o situation.Orientation, recoveryEverObserved bool) 
 		bold = phaseInvestigating
 	case situation.OrientationMonitoring:
 		bold = phaseMonitoring
+	case situation.OrientationConfirmingRecovery:
+		bold = phaseConfirmingRecovery
 	case situation.OrientationRecovered:
-		outcome = "Recovered"
-		bold = outcome
+		bold = "Recovered"
 	case situation.OrientationClosedUncertain:
-		outcome = "Closed uncertain"
-		bold = outcome
-		showMonitoring = recoveryEverObserved
+		bold = phaseTrackingEnded
 	default:
 		bold = phaseObserved
 	}
 
-	phases := []string{phaseObserved, phaseInvestigating}
-	if showMonitoring {
-		phases = append(phases, phaseMonitoring)
+	outcome := phasePlaceholder
+	if bold == "Recovered" || bold == phaseTrackingEnded {
+		outcome = bold
 	}
-	phases = append(phases, outcome)
 
+	phases := []string{phaseObserved, phaseInvestigating, phaseMonitoring, phaseConfirmingRecovery, outcome}
 	rendered := make([]string, len(phases))
 	for i, p := range phases {
 		if p == bold {
-			rendered[i] = "*" + p + "*"
+			rendered[i] = "*▸ " + p + "*"
 		} else {
 			rendered[i] = p
 		}
 	}
-	return strings.Join(rendered, " → ")
+	return strings.Join(rendered, " · ")
 }
 
 // contractAndDeadlineBlock renders who acts next and what happens next and
@@ -375,11 +370,7 @@ func causalityLine(a *model.AssessmentConclusion) string {
 }
 
 func handleBlock(s model.EpisodeSummary) slacklib.Block {
-	handle := s.PublicHandle
-	if handle == "" {
-		handle = s.SituationID
-	}
-	return contextBlock(fmt.Sprintf(":robot_face: Situation `%s` · `get situation %s using alertint`", handle, handle))
+	return contextBlock(briefingFooter(s))
 }
 
 func rootFallback(s model.EpisodeSummary, o situation.Orientation, drill bool) string {
@@ -405,7 +396,25 @@ func drillPlainPrefix(drill bool) string {
 // that a broadcast handoff is no longer current renders from a local copy
 // of t with those two fields set — the stored ledger row itself is never
 // mutated.
+//
+// It is this file's entry point for every caller with no delivery-time
+// answer to give. RenderSituationReply is the same rendering plus one
+// presentation fact; both run the assembly below, so validation, fallback
+// text, block shape, staleness markers and the recorded instant have one
+// implementation and cannot drift apart.
 func RenderSituationJournal(t model.Transition) (RenderedMessage, error) {
+	return renderJournalEntry(t, false)
+}
+
+// renderJournalEntry is that one assembly. executionSuperseded is the
+// delivery-time presentation fact documented on SituationReplyInput: it
+// reaches exactly one sentence of the briefing body (see
+// briefingJournalPresented) and changes nothing else here.
+func renderJournalEntry(t model.Transition, executionSuperseded bool) (RenderedMessage, error) {
+	return renderJournalEntryKind(t, executionSuperseded, "")
+}
+
+func renderJournalEntryKind(t model.Transition, executionSuperseded bool, replyKind string) (RenderedMessage, error) {
 	if err := t.Validate(); err != nil {
 		return RenderedMessage{}, fmt.Errorf("slack: render situation journal: %w", err)
 	}
@@ -414,10 +423,27 @@ func RenderSituationJournal(t model.Transition) (RenderedMessage, error) {
 	}
 
 	prefix := drillPrefix(t.Drill)
-	headline := prefix + "*" + t.Journal.Headline + "*"
+	label, detail := t.Journal.Headline, t.Journal.Detail
+	fallback := prefix + label
+	if t.Projection.Briefing != nil {
+		if t.Projection.Briefing.Flow != nil {
+			label, detail = canonicalBriefingJournal(t, replyKind, executionSuperseded)
+		} else {
+			label, detail = briefingJournalPresented(t, executionSuperseded)
+		}
+		fallback = prefix + label + "\n" + detail
+	}
+	headline := prefix + "*" + label + "*"
 	blocks := []slacklib.Block{sectionBlock(headline)}
-	if t.Journal.Detail != "" {
-		blocks = append(blocks, sectionBlock(t.Journal.Detail))
+	if detail != "" {
+		switch {
+		case t.Projection.Briefing != nil && t.Projection.Briefing.Flow != nil:
+			blocks = append(blocks, canonicalDetailBlocks(detail, t.Lifecycle.Terminal())...)
+		case t.Projection.Briefing != nil:
+			blocks = append(blocks, briefingDetailBlocks(detail)...)
+		default:
+			blocks = append(blocks, sectionBlock(detail))
+		}
 	}
 
 	var markers []string
@@ -433,9 +459,31 @@ func RenderSituationJournal(t model.Transition) (RenderedMessage, error) {
 	blocks = append(blocks, contextBlock(SlackDateToken(t.Journal.OccurredAt, "{date_short} {time}")))
 
 	return RenderedMessage{
-		Text:   prefix + t.Journal.Headline,
+		Text:   fallback,
 		Blocks: blocks,
 	}, nil
+}
+
+// Keep the operational next step outside bounded evidence sections: a long
+// investigation must never truncate the human action.
+func briefingDetailBlocks(detail string) []slacklib.Block {
+	var blocks []slacklib.Block
+	at := strings.LastIndex(detail, "*AlertINT:*")
+	if at >= 0 {
+		blocks = append(briefingSections(strings.TrimSpace(detail[:at])), briefingSections(detail[at:])...)
+	} else {
+		blocks = briefingSections(detail)
+	}
+	if len(blocks) <= 47 {
+		return blocks
+	}
+	// Leave room for the title, delivery markers and timestamp. Defer the
+	// oversized evidence as a whole rather than cutting off a check mid-sentence.
+	notice := "Evidence exceeds Slack's message size. Complete investigation details are available via MCP."
+	if at := strings.LastIndex(detail, "*AlertINT:*"); at >= 0 {
+		return append([]slacklib.Block{sectionBlock(notice)}, briefingSections(detail[at:])...)
+	}
+	return []slacklib.Block{sectionBlock(notice)}
 }
 
 // ----------------------------------------------------------------------
@@ -546,10 +594,15 @@ func reasonLabel(reason string) string {
 
 // contractLine renders the compact Operator-contract action, e.g. "AlertINT
 // is running Acute Triage" or "Watching for sustained recovery." Monitoring
-// always reads as watching for recovery regardless of the underlying
-// contract's own fields — the phase itself already says why.
+// includes watching still-firing alerts; it does not itself imply clearance.
 func contractLine(o situation.Orientation, c model.ActionContract) string {
+	if o == situation.OrientationConfirmingRecovery {
+		return "Watching for sustained recovery"
+	}
 	if o == situation.OrientationMonitoring {
+		if c.AlertINTAction != nil && *c.AlertINTAction == model.AlertINTActionMonitorSituation {
+			return "Monitoring alert changes"
+		}
 		return "Watching for sustained recovery"
 	}
 	switch {

@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
 )
 
 // Change is the in-memory representation of a row in the changes table. A
@@ -123,6 +125,63 @@ func (s *Store) ChangesInWindow(ctx context.Context, start, end time.Time) ([]Ch
 	}
 	defer func() { _ = rows.Close() }()
 	return scanChangeRows(rows)
+}
+
+// ChangesInScopeWindow returns changes whose occurred_at is in [start, end]
+// AND whose labels_json is a superset of every (key, value) pair in labels
+// — a new scoped, limited query (spec.md: "ChangesInWindow is unbounded and
+// installation-wide; preparation uses a new scoped, limited query"), never
+// falling back to ChangesInWindow's own unscoped scan. Results are
+// newest-first, bounded by limit+1 rows so the caller can detect
+// truncation without a second COUNT query; the returned bool is true when
+// more matching rows exist than limit. An empty labels map is refused
+// (spec.md: "reject an empty selector before this query") — never treated
+// as "match everything".
+func (s *Store) ChangesInScopeWindow(ctx context.Context, labels map[string]string, start, end time.Time, limit int) ([]observationmodel.LocalChange, bool, error) {
+	if len(labels) == 0 {
+		return nil, false, errors.New("store: changes scope requires at least one label")
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+	selectorJSON, err := json.Marshal(labels)
+	if err != nil {
+		return nil, false, fmt.Errorf("store: marshal changes scope selector: %w", err)
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT c.id, c.source, c.kind, c.title, c.labels_json, c.version, c.link, c.occurred_at, c.received_at
+		FROM changes AS c
+		WHERE c.occurred_at >= ? AND c.occurred_at <= ?
+		  AND NOT EXISTS (
+		    SELECT 1 FROM json_each(?) AS required
+		    WHERE NOT EXISTS (
+		      SELECT 1 FROM json_each(c.labels_json) AS actual
+		      WHERE actual.key = required.key AND actual.value = required.value
+		    )
+		  )
+		ORDER BY c.occurred_at DESC, c.id DESC LIMIT ?`,
+		start.UTC().Format(time.RFC3339Nano), end.UTC().Format(time.RFC3339Nano), string(selectorJSON), limit+1)
+	if err != nil {
+		return nil, false, fmt.Errorf("store: changes in scope window: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	scanned, err := scanChangeRows(rows)
+	if err != nil {
+		return nil, false, err
+	}
+	truncated := len(scanned) > limit
+	if truncated {
+		scanned = scanned[:limit]
+	}
+	out := make([]observationmodel.LocalChange, len(scanned))
+	for i, c := range scanned {
+		out[i] = observationmodel.LocalChange{
+			ID: c.ID, Source: c.Source, Kind: c.Kind, Title: c.Title,
+			Labels: c.Labels, Version: c.Version, Link: c.Link, OccurredAt: c.OccurredAt,
+		}
+	}
+	return out, truncated, nil
 }
 
 // PruneChanges deletes changes whose occurred_at is strictly before the cutoff.

@@ -279,16 +279,23 @@ func (f *replayFixture) setupDueSituation(group, alertname, fingerprint string) 
 	return f.soleSituationID()
 }
 
+// requestedTriageAlertName is the recorded alert name every
+// setupReadyIncidentWithRequestedTriage fixture posts; b2's own assertion on
+// WorkProjection.InvestigatedNames reads it back.
+const requestedTriageAlertName = "HighLatency"
+
 // setupReadyIncidentWithRequestedTriage boots f all the way through: POST ->
 // foundation drain -> mark ready -> one clean, uncrashed controller
 // convergence (a real accepting L2 client) so the owning Situation gets its
 // first authoritative Assessment and DecideTriage's own
 // DecisionReasonNoTrustworthyAssessment request decision moves the
 // Incident's durable schedule from awaiting_decision to pending, due now.
-// Shared by the boundary-6/7 (Triage-attempt) subtests.
-func (f *replayFixture) setupReadyIncidentWithRequestedTriage(group, alertname, fingerprint string) (incidentID string) {
+// Shared by the boundary-6/7 (Triage-attempt) subtests, which differentiate
+// their fixtures by group and fingerprint; the alert name is the same
+// recorded name in every one, so it is named here instead of passed in.
+func (f *replayFixture) setupReadyIncidentWithRequestedTriage(group, fingerprint string) (incidentID string) {
 	f.t.Helper()
-	f.postGroup(group, alertname, fingerprint)
+	f.postGroup(group, requestedTriageAlertName, fingerprint)
 	f.drainFoundation()
 	incidentID = f.soleIncidentID()
 	f.markReady(incidentID)
@@ -1455,7 +1462,7 @@ func testReplayRestartAfterCommitReusesWithoutRedispatch(t *testing.T) {
 // Boundary 6: after Triage attempt begin but before Acute Triage result.
 func testReplayCrashAfterTriageAttemptBeginBeforeResult(t *testing.T) {
 	f := newReplayFixture(t, "b6")
-	incID := f.setupReadyIncidentWithRequestedTriage("boundary6-group", "HighLatency", "fp-b6")
+	incID := f.setupReadyIncidentWithRequestedTriage("boundary6-group", "fp-b6")
 
 	f.clock.Advance(advanceMargin)
 	analyzer := crashingAnalyzer{boundary: "triage_attempt_begin_before_result"}
@@ -1519,7 +1526,7 @@ func testReplayCrashAfterTriageAttemptBeginBeforeResult(t *testing.T) {
 // Boundary 7: after Finding persistence but before worker return.
 func testReplayCrashAfterFindingPersistedBeforeWorkerReturn(t *testing.T) {
 	f := newReplayFixture(t, "b7")
-	incID := f.setupReadyIncidentWithRequestedTriage("boundary7-group", "HighLatency", "fp-b7")
+	incID := f.setupReadyIncidentWithRequestedTriage("boundary7-group", "fp-b7")
 
 	f.clock.Advance(advanceMargin)
 	successAnalyzer := &scriptedAnalyzer{fn: func(_ context.Context, claim situation.TriageAttemptClaim) (situation.AcuteResult, error) {
@@ -1629,4 +1636,82 @@ func testReplayConcurrentInputRaisesNewDueReason(t *testing.T) {
 	}
 	assertL2CallCeiling(t, f.st, sitID)
 	assertIdempotentReconverge(f, sitID, freshClient, analyzer, after)
+}
+
+// TestControllerRealStoreFreshClearanceSurvivesDeadlineStraddle is the
+// real-store (HTTP receiver → correlator → controller → SQLite) counterpart
+// of TestControllerReconcileFreshClearanceSurvivesDeadlineStraddle, proving
+// the S1-03 R1 repair survives real ingestion, correlation and durable
+// persistence of every field involved (effective_started_at,
+// recovery_observed_at, grace_until) on both sides of the episode deadline
+// AND with the delivery's receipt strictly before the reconcile that
+// consumes it (lead review round 3: receipt necessarily precedes its
+// consuming reconcile; that ordering is not source silence).
+//
+// ingress.NewAlertReceiver hardcodes real wall-clock received_at with no
+// clock-injection point (a pre-existing, out-of-allowlist limitation — see
+// this package's other real-store lifecycle tests), so real execution and
+// this fixture's independently-advanceable fake clock do not share a
+// timeline once the fake clock has been advanced. Exactly like the
+// backdated effective_started_at technique the lead's own corrected
+// TestLeadB1FreshClearanceRealStore probe uses, this test additionally
+// SQL-patches the just-ingested delivery's received_at onto the SAME
+// fake-clock timeline as the backdated deadline — at the reconcile instant
+// or a chosen delay before it — so the real pipeline exercises the exact
+// straddle and delay geometry the reducer test proves.
+func TestControllerRealStoreFreshClearanceSurvivesDeadlineStraddle(t *testing.T) {
+	for _, side := range []struct {
+		name   string
+		offset time.Duration
+	}{
+		{"one_second_before_deadline", -time.Second},
+		{"one_second_after_deadline", time.Second},
+	} {
+		for _, delay := range []struct {
+			name string
+			d    time.Duration
+		}{
+			{"receipt_equals_reconcile", 0},
+			{"receipt_1ms_before_reconcile", time.Millisecond},
+			{"receipt_30s_before_reconcile", 30 * time.Second},
+		} {
+			t.Run(side.name+"/"+delay.name, func(t *testing.T) {
+				f := newHistoryFixture(t, "b1r1-straddle-"+side.name+"-"+delay.name, "", false)
+				f.openWarrantedSituation("straddle", "fp-straddle")
+				f.converge()
+				assertLifecycle(t, f.st, "active")
+
+				// The entry reconcile's fake "now" (left unadvanced) must
+				// equal deadline+offset, exactly mirroring the reducer test.
+				base := f.clock.Now()
+				deadline := base.Add(-side.offset)
+				effectiveStartedAt := deadline.Add(-7 * 24 * time.Hour)
+				if _, err := f.st.DB().ExecContext(f.ctx,
+					`UPDATE situations SET effective_started_at = ? WHERE lifecycle = 'active'`,
+					effectiveStartedAt.UTC().Format(time.RFC3339Nano)); err != nil {
+					t.Fatalf("backdate effective_started_at: %v", err)
+				}
+
+				f.postAlert("straddle", "HighLatency", "fp-straddle", "resolved", "warning")
+				if _, err := f.st.DB().ExecContext(f.ctx,
+					`UPDATE alert_deliveries SET received_at = ? WHERE status = 'resolved'`,
+					base.Add(-delay.d).UTC().Format(time.RFC3339Nano)); err != nil {
+					t.Fatalf("pin resolved delivery received_at onto the fake-clock timeline: %v", err)
+				}
+
+				f.oneRound()
+				assertLifecycle(t, f.st, "recovery_pending")
+
+				graceUntilRaw := scalarString(t, f.st, `SELECT grace_until FROM situations WHERE lifecycle = 'recovery_pending'`)
+				graceUntil, err := time.Parse(time.RFC3339Nano, graceUntilRaw)
+				if err != nil {
+					t.Fatalf("parse grace_until %q: %v", graceUntilRaw, err)
+				}
+				f.clock.Advance(graceUntil.Sub(base))
+
+				f.oneRound() // no new delivery: the SAME receipt must still hold, whichever side of the deadline it landed on and however far ahead of its reconcile it arrived.
+				assertLifecycle(t, f.st, "recovered")
+			})
+		}
+	}
 }

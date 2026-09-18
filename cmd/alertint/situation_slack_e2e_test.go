@@ -58,6 +58,12 @@ type e2eSlackCall struct {
 	Broadcast   bool
 	TS          string
 	Text        string
+	// Blocks is the request's own "blocks" array, re-encoded as JSON
+	// exactly as it arrived. The fallback Text alone cannot show what an
+	// operator actually reads, so B6's rendered seven-event replay asserts
+	// on this too (lead B6 review 2026-09-10, finding 1: "captured fake
+	// Slack text/blocks").
+	Blocks string
 	// Accepted is false when the fake decided to reject or drop this call;
 	// a dropped call still counts as one the PROVIDER saw, which is the
 	// whole point of the uncertain-response case.
@@ -140,6 +146,7 @@ func (f *fakeSlackServer) handle(w http.ResponseWriter, r *http.Request) {
 			call.Broadcast, _ = payload["reply_broadcast"].(bool)
 			call.TS, _ = payload["ts"].(string)
 			call.Text, _ = payload["text"].(string)
+			call.Blocks = encodedBlocks(payload["blocks"])
 		}
 	}
 
@@ -193,6 +200,19 @@ func (f *fakeSlackServer) handle(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w, `{"ok":true,"channel":%q,"ts":%q}`, e2eChannel, ts)
 	}
+}
+
+// encodedBlocks re-encodes one request's "blocks" array as it arrived, or
+// returns "" when the request carried none.
+func encodedBlocks(blocks any) string {
+	if blocks == nil {
+		return ""
+	}
+	encoded, err := json.Marshal(blocks)
+	if err != nil {
+		return ""
+	}
+	return string(encoded)
 }
 
 func (f *fakeSlackServer) snapshot() []e2eSlackCall {
@@ -297,6 +317,10 @@ type e2eAssessmentClient struct {
 	mu          sync.Mutex
 	attention   model.Attention
 	claimReason bool
+	// calls counts every CompleteOnce this fake provider was actually
+	// asked to answer — the provider-side model-call counter B6's replay
+	// reads to prove a quiet cycle and a delivery round consult no model.
+	calls int
 }
 
 func (c *e2eAssessmentClient) steer(attention model.Attention, claimReason bool) {
@@ -305,8 +329,16 @@ func (c *e2eAssessmentClient) steer(attention model.Attention, claimReason bool)
 	c.mu.Unlock()
 }
 
+// callCount reports how many model calls this fake provider has answered.
+func (c *e2eAssessmentClient) callCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
 func (c *e2eAssessmentClient) CompleteOnce(_ context.Context, _ string, prompt llm.Prompt, _ []string) (llm.OneShotCompletion, error) {
 	c.mu.Lock()
+	c.calls++
 	attention, claimReason := c.attention, c.claimReason
 	c.mu.Unlock()
 
@@ -407,10 +439,19 @@ func (f *e2eFixture) seedQuiet(groupKey string) string {
 }
 
 // controllerCycle drains every due Situation through the real controller
-// worker at the current clock.
+// worker one minute from now.
 func (f *e2eFixture) controllerCycle() int {
 	f.t.Helper()
 	f.clock.advance(time.Minute)
+	return f.drainController()
+}
+
+// drainController runs the real controller worker at the CURRENT clock,
+// without moving it. B6's replay sets each event's instant itself, so the
+// implicit one-minute step controllerCycle takes would shift every
+// canonical offset it is asserting against.
+func (f *e2eFixture) drainController() int {
+	f.t.Helper()
 	cw := situation.NewControllerWorker(f.st, f.st, f.l2,
 		situation.ControllerConfig{SlackFloor: f.slackFloor, RecurrenceMode: f.recurrenceMode},
 		situation.ControllerWorkerConfig{Owner: e2eOwner + ":controller", Now: f.clock.Now},
@@ -1511,7 +1552,7 @@ func (f *e2eFixture) refire(groupKey string, n int) {
 	}
 }
 
-func TestSituationSlackE2ERecurrenceMilestoneStaysInThread(t *testing.T) {
+func TestSituationSlackE2ERecurrenceMilestoneOnlyKeepsRootCurrent(t *testing.T) {
 	f := newE2EFixture(t)
 	f.slack.setScript(alwaysOK)
 	// seed's five prior episodes put the live Situation at recurrence 5 —
@@ -1550,12 +1591,12 @@ func TestSituationSlackE2ERecurrenceMilestoneStaysInThread(t *testing.T) {
 			broadcasts++
 		}
 	}
-	if rootEdits != 1 || threadReplies != 1 || broadcasts != 0 {
-		t.Fatalf("milestone delivery = %d root edit(s), %d quiet thread reply(ies), %d channel message(s); want 1, 1, 0: a milestone stays in the owning thread and never re-pages%s",
+	if rootEdits != 1 || threadReplies != 0 || broadcasts != 0 {
+		t.Fatalf("milestone delivery = %d root edit(s), %d quiet thread reply(ies), %d channel message(s); want 1, 0, 0: a count alone updates the root and remains audit-only%s",
 			rootEdits, threadReplies, broadcasts, f.intentSummary())
 	}
-	if !strings.Contains(f.slack.accepted()[len(f.slack.accepted())-1].Text, "Recurrence milestone") {
-		t.Fatalf("the milestone reply does not render the milestone: %q", f.slack.accepted()[len(f.slack.accepted())-1].Text)
+	if f.slack.accepted()[len(f.slack.accepted())-1].Method != "chat.update" {
+		t.Fatal("the recurrence count must end with a quiet update to the owning root")
 	}
 }
 
@@ -1591,5 +1632,32 @@ func TestSituationSlackE2ERecurrenceModeOffEditsTheRootOnly(t *testing.T) {
 	if rootEdits != 1 || posts != 0 {
 		t.Fatalf("recurrence_mode off delivered %d root edit(s) and %d post(s); want 1 and 0: only the silent count update%s",
 			rootEdits, posts, f.intentSummary())
+	}
+}
+
+// TestSituationSlackE2ENeverRendersAnUnsupportedUpdatePromise is B5's own
+// silence test for §7 (B0 integration contract): this minimal release
+// chose the status-check fallback, so no rendered root or reply may ever
+// contain "update by"/"Update by" wording through the REAL delivery path —
+// real store, real controller, real notification worker, real renderer,
+// only the Slack Web API faked. B4 already pins this at the renderer-unit
+// level (TestBriefingNextStepStatusCheckIsNeverAPromise); this is the
+// end-to-end proof over actual delivered payloads.
+func TestSituationSlackE2ENeverRendersAnUnsupportedUpdatePromise(t *testing.T) {
+	f := newE2EFixture(t)
+	f.slack.setScript(alwaysOK)
+	f.seed("group=e2e-no-update-promise")
+	f.deliverUntilQuiet(12)
+
+	calls := f.slack.accepted()
+	if len(calls) == 0 {
+		t.Fatal("seed produced no delivered Slack calls to check")
+	}
+	for _, c := range calls {
+		for _, bad := range []string{"update by", "Update by"} {
+			if strings.Contains(c.Text, bad) {
+				t.Fatalf("delivered %s payload contains unsupported promise wording %q: %s", c.Method, bad, c.Text)
+			}
+		}
 	}
 }

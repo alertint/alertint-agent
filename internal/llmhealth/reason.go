@@ -50,6 +50,22 @@ const (
 	// DependencyRecoveryWaker doc comment for the identical import-cycle
 	// constraint).
 	CapabilityAssessment Capability = "assessment"
+	// CapabilitySemanticProfile is Plan 4 Task 8's own advisory
+	// semantic-profile inference dispatch (internal/semanticprofile.Worker,
+	// via the same one-shot CompleteOnce boundary) — a real generation
+	// against the same shared primary provider/model as triage_draft and
+	// assessment (spec.md: "Register semantic_profile with installation LLM
+	// health as a shared-primary inference capability"). Unlike
+	// triage_draft/assessment it never drives the rolled-up state to
+	// Unavailable — a profile is advisory-only, so its own outage degrades
+	// the installation without declaring the core loop down (see
+	// Tracker.aggregate's own doc comment, the same treatment
+	// verification_rejudge already gets). Wired from cmd/alertint, never
+	// from internal/semanticprofile itself — that package must never import
+	// internal/llmhealth (the identical import-cycle constraint
+	// internal/situation/controller_worker.go's own DependencyRecoveryWaker
+	// doc comment documents for CapabilityAssessment).
+	CapabilitySemanticProfile Capability = "semantic_profile"
 )
 
 // Reason names why one call outcome was recorded, from success through every
@@ -59,6 +75,7 @@ type Reason string
 const (
 	ReasonOK                  Reason = "ok"
 	ReasonCanceled            Reason = "canceled"
+	ReasonBudgetDeferred      Reason = "budget_deferred"
 	ReasonTimeout             Reason = "timeout"
 	ReasonNetwork             Reason = "network"
 	ReasonRateLimited         Reason = "rate_limited"
@@ -120,6 +137,9 @@ func Classify(err error) Reason {
 	if err == nil {
 		return ReasonOK
 	}
+	if errors.Is(err, llm.ErrBudgetExhausted) {
+		return ReasonBudgetDeferred
+	}
 	if errors.Is(err, context.Canceled) {
 		return ReasonCanceled
 	}
@@ -168,7 +188,7 @@ func (r Reason) Class() Class {
 	switch r {
 	case ReasonOK:
 		return ClassOK
-	case ReasonCanceled:
+	case ReasonCanceled, ReasonBudgetDeferred:
 		return ClassIgnored
 	case ReasonRequestInvalid, ReasonSchemaViolation, ReasonResponseMalformed:
 		return ClassContent
@@ -188,6 +208,8 @@ func SafeDetail(err error) string {
 		return ""
 	case ReasonCanceled:
 		return "canceled"
+	case ReasonBudgetDeferred:
+		return "automatic analysis budget cannot admit this request"
 	case ReasonTimeout:
 		return "request timed out"
 	case ReasonNetwork:

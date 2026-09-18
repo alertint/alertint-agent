@@ -97,6 +97,14 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 	if err != nil {
 		return situation.SnapshotInput{}, err
 	}
+	analyses, analysisCount, err := loadSituationAnalysesTx(ctx, tx, sit.ID)
+	if err != nil {
+		return situation.SnapshotInput{}, err
+	}
+	presentationFacts, err := loadSituationPresentationFactsTx(ctx, tx, sit.ID)
+	if err != nil {
+		return situation.SnapshotInput{}, err
+	}
 
 	prior, err := loadPriorTerminalSituationsTx(ctx, tx, sit.GroupKey, sit.ID)
 	if err != nil {
@@ -133,6 +141,19 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 	if err != nil {
 		return situation.SnapshotInput{}, err
 	}
+	deliveredHistory, err := loadDeliveredHistoryTx(ctx, tx, sit.ID, publication.rootPublished)
+	if err != nil {
+		return situation.SnapshotInput{}, err
+	}
+
+	// Plan 4 Task 6: the current preparation cycle's durably reloaded state
+	// (Runs/Facts, frozen profile guidance, source lifecycle observations) —
+	// read fresh inside this SAME coherent transaction. See
+	// SnapshotInput.Prepared's own doc comment.
+	prepared, err := loadPreparedStateTx(ctx, tx, sit.ID, now)
+	if err != nil {
+		return situation.SnapshotInput{}, err
+	}
 
 	if err := tx.Commit(); err != nil {
 		return situation.SnapshotInput{}, fmt.Errorf("store: commit load reconciliation input: %w", err)
@@ -142,6 +163,9 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 		Situation:                   sit,
 		Deliveries:                  deliveries,
 		Incidents:                   incidents,
+		Analyses:                    analyses,
+		AnalysisCount:               analysisCount,
+		PresentationFacts:           presentationFacts,
 		PriorSituations:             prior,
 		CurrentAssessment:           current,
 		Now:                         now.UTC(),
@@ -154,6 +178,8 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 		LastDeliveredRootDeadlineAt: publication.lastDeliveredRootDeadlineAt,
 		LastMainChannelPokeAt:       publication.lastMainChannelPokeAt,
 		PendingArtifacts:            artifacts,
+		DeliveredHistory:            deliveredHistory,
+		Prepared:                    prepared,
 	}, nil
 }
 
@@ -367,7 +393,12 @@ func loadSituationDeliveriesTx(ctx context.Context, tx *sql.Tx, situationID stri
 	rows, err := tx.QueryContext(ctx, `
 		SELECT ad.id, iad.incident_id, ad.alert_id, ad.status, ad.payload_digest,
 		       ad.source_started_at, ad.started_at_basis, ad.source_resolved_at, ad.resolved_at_basis, ad.received_at,
-		       ad.labels_json
+		       ad.labels_json, ad.source, ad.source_episode_key, ad.source_signal_id, ad.source_signal_version,
+		       ad.acquisition_mode, ad.poll_interval_seconds,
+               CASE WHEN json_type(ad.annotations_json, '$.summary') = 'text' AND trim(json_extract(ad.annotations_json, '$.summary')) <> ''
+                    THEN substr(json_extract(ad.annotations_json, '$.summary'), 1, 501)
+                    WHEN json_type(ad.annotations_json, '$.description') = 'text'
+                    THEN substr(json_extract(ad.annotations_json, '$.description'), 1, 501) ELSE '' END
 		FROM situation_incidents si
 		JOIN incident_alert_deliveries iad ON iad.incident_id = si.incident_id
 		JOIN alert_deliveries ad ON ad.id = iad.delivery_id
@@ -382,10 +413,18 @@ func loadSituationDeliveriesTx(ctx context.Context, tx *sql.Tx, situationID stri
 	for rows.Next() {
 		var d situation.Delivery
 		var status, startedBasis, resolvedBasis, receivedAtStr, labelsJSON string
-		var sourceStarted, sourceResolved sql.NullString
+		var sourceStarted, sourceResolved, signalID, signalVersion sql.NullString
 		if err := rows.Scan(&d.ID, &d.IncidentID, &d.AlertID, &status, &d.PayloadDigest,
-			&sourceStarted, &startedBasis, &sourceResolved, &resolvedBasis, &receivedAtStr, &labelsJSON); err != nil {
+			&sourceStarted, &startedBasis, &sourceResolved, &resolvedBasis, &receivedAtStr,
+			&labelsJSON, &d.Source, &d.EpisodeKey, &signalID, &signalVersion,
+			&d.AcquisitionMode, &d.PollIntervalSeconds, &d.SourceSummary); err != nil {
 			return nil, fmt.Errorf("store: scan situation delivery: %w", err)
+		}
+		if signalID.Valid {
+			d.SourceSignalID = &signalID.String
+		}
+		if signalVersion.Valid {
+			d.SourceSignalVersion = &signalVersion.String
 		}
 		d.Status = situationmodel.DeliveryStatus(status)
 		d.StartedAtBasis = situationmodel.SourceTimeBasis(startedBasis)
@@ -413,6 +452,7 @@ func loadSituationDeliveriesTx(ctx context.Context, tx *sql.Tx, situationID stri
 		}
 		d.Severity = labels["severity"]
 		d.Drill = labels[DrillMarkerLabel] == DrillMarkerValue
+		d.Labels = labels
 		out = append(out, d)
 	}
 	if err := rows.Err(); err != nil {
@@ -423,16 +463,23 @@ func loadSituationDeliveriesTx(ctx context.Context, tx *sql.Tx, situationID stri
 
 // loadSituationIncidentStatesTx reads every current member Incident of
 // situationID plus its current incident_triage row (LEFT JOIN: an Incident
-// that has never reached "ready" has none — TriageState.Phase stays "") and
-// its recurrence-collapse occurrence count (incident_occurrences), the
-// durable fact behind the Situation's recurrence milestones.
+// that has never reached "ready" has none — TriageState.Phase stays ""),
+// its recurrence-collapse occurrence count (incident_occurrences), and its
+// frozen attempt-ledger provenance (ActiveAttempt/LastExecution, via
+// loadSituationTriageExecutionsTx — B0 integration contract §3, R1 repair
+// 2026-09-09): a successful completion DELETES the incident_triage row
+// (triage_controller.go completeSuccessTx) so phase/attempts alone cannot
+// tell "analyzed with a closed schedule" apart from "never reached ready";
+// the attempt ledger survives that delete and is the only durable source
+// left. Every other settlement (exhausted/skipped) keeps its incident_triage
+// row, so this join is read unconditionally rather than only when Phase=="".
 func loadSituationIncidentStatesTx(ctx context.Context, tx *sql.Tx, situationID string) ([]situation.IncidentState, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT i.id, i.group_key, i.status, i.first_alert_at, i.last_alert_at, i.ready_at, i.alert_count,
 		       COALESCE(t.phase, ''), COALESCE(t.attempts, 0), t.next_at,
 		       t.decision, t.decision_reason, t.decision_input_version,
 		       t.material_fact_hash, t.membership_digest, t.incident_input_digest,
-		       t.assessment_id, t.decided_at,
+		       t.assessment_id, t.decided_at, t.current_attempt_id,
 		       (SELECT COUNT(*) FROM incident_occurrences o WHERE o.incident_id = i.id)
 		FROM situation_incidents si
 		JOIN incidents i ON i.id = si.incident_id
@@ -445,16 +492,21 @@ func loadSituationIncidentStatesTx(ctx context.Context, tx *sql.Tx, situationID 
 	defer func() { _ = rows.Close() }()
 
 	out := []situation.IncidentState{}
+	// activeAttemptID names, per incident id, the in_flight row's own
+	// current_attempt_id — read alongside the main scan so the second
+	// (attempt-ledger) query below can tell ActiveAttempt apart from an
+	// older LastExecution without a further round trip.
+	activeAttemptID := make(map[string]string)
 	for rows.Next() {
 		var st situation.IncidentState
 		var firstStr, lastStr, readyStr string
-		var nextAt, decision, decisionReason, materialHash, membershipDigest, incidentInputDigest, assessmentID, decidedAt sql.NullString
+		var nextAt, decision, decisionReason, materialHash, membershipDigest, incidentInputDigest, assessmentID, decidedAt, currentAttemptID sql.NullString
 		var decisionInputVersion sql.NullInt64
 		if err := rows.Scan(&st.ID, &st.GroupKey, &st.Status, &firstStr, &lastStr, &readyStr, &st.AlertCount,
 			&st.Triage.Phase, &st.Triage.Attempts, &nextAt,
 			&decision, &decisionReason, &decisionInputVersion,
 			&materialHash, &membershipDigest, &incidentInputDigest,
-			&assessmentID, &decidedAt, &st.Occurrences); err != nil {
+			&assessmentID, &decidedAt, &currentAttemptID, &st.Occurrences); err != nil {
 			return nil, fmt.Errorf("store: scan situation incident state: %w", err)
 		}
 
@@ -476,6 +528,16 @@ func loadSituationIncidentStatesTx(ctx context.Context, tx *sql.Tx, situationID 
 		}
 		st.Triage.Decision = stringPtr(decision)
 		st.Triage.DecisionReason = stringPtr(decisionReason)
+		// R6 repair (lead review round 2, 2026-09-09): populate the same
+		// declared TriageState.SkipReason field committedBriefingInput's
+		// current-cycle overlay sets, from this row's own durable
+		// phase/decision_reason — needed here because a schedule already
+		// committed 'skipped' in an EARLIER cycle takes committedBriefingInput's
+		// early continue (its phase never moves this cycle) and would
+		// otherwise leave SkipReason at its zero value forever, even though
+		// BuildWorkProjection's own aggregate reads DecisionReason directly and
+		// so was never wrong.
+		st.Triage.SkipReason = situation.TriageSkipReason(st.Triage)
 		st.Triage.MaterialFactHash = stringPtr(materialHash)
 		st.Triage.MembershipDigest = stringPtr(membershipDigest)
 		st.Triage.IncidentInputDigest = stringPtr(incidentInputDigest)
@@ -484,10 +546,107 @@ func loadSituationIncidentStatesTx(ctx context.Context, tx *sql.Tx, situationID 
 			v := int(decisionInputVersion.Int64)
 			st.Triage.DecisionInputVersion = &v
 		}
+		if st.Triage.Phase == "in_flight" && currentAttemptID.Valid {
+			activeAttemptID[st.ID] = currentAttemptID.String
+		}
 		out = append(out, st)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("store: iterate situation incident states: %w", err)
+	}
+
+	incidentIDs := make([]string, len(out))
+	for i, st := range out {
+		incidentIDs[i] = st.ID
+	}
+	executions, err := loadSituationTriageExecutionsTx(ctx, tx, incidentIDs)
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		attempts := executions[out[i].ID]
+		if len(attempts) == 0 {
+			continue
+		}
+		last := attempts[len(attempts)-1] // ordered ascending by attempt_number
+		// Lead decision D (round 2, 2026-09-09): a successful last attempt's
+		// accepted output is matched to THAT attempt through its recorded
+		// output digest, read in this same transaction and independently of
+		// the top-three analysis overview — never joined on incident id alone.
+		if last.ResultCode == string(TriageCompletionSuccess) && last.OutputDigest != "" {
+			evidence, matched, err := loadMatchedCompletionEvidenceTx(ctx, tx, out[i].ID, last.OutputDigest)
+			if err != nil {
+				return nil, err
+			}
+			if matched {
+				last.Evidence = evidence
+			}
+		}
+		out[i].Triage.LastExecution = &last
+		if activeID, ok := activeAttemptID[out[i].ID]; ok {
+			for j := range attempts {
+				if attempts[j].AttemptID == activeID {
+					out[i].Triage.ActiveAttempt = &attempts[j]
+					break
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
+// loadSituationTriageExecutionsTx reads every incident_triage_attempts row
+// belonging to incidentIDs — the frozen claim-time attempt identity, start
+// time, and exact member delivery IDs claimed with it (B0 integration
+// contract §3's TriageExecution) — ordered per incident by attempt_number
+// ascending, so the caller can take the last entry as LastExecution
+// (surviving even a completion that later deletes the incident_triage
+// schedule row, R1 repair 2026-09-09) and match current_attempt_id against
+// it for ActiveAttempt. Returns an empty map for an empty incidentIDs (never
+// queries with an empty IN (...)).
+func loadSituationTriageExecutionsTx(ctx context.Context, tx *sql.Tx, incidentIDs []string) (map[string][]situation.TriageExecution, error) {
+	out := make(map[string][]situation.TriageExecution, len(incidentIDs))
+	if len(incidentIDs) == 0 {
+		return out, nil
+	}
+	placeholders, args := inPlaceholders(incidentIDs)
+	rows, err := tx.QueryContext(ctx, `
+		SELECT incident_id, id, attempt_number, started_at, member_delivery_ids_json,
+		       COALESCE(result_code, ''), COALESCE(output_digest, ''), completed_at
+		FROM incident_triage_attempts
+		WHERE incident_id IN (`+placeholders+`)
+		ORDER BY incident_id ASC, attempt_number ASC`, args...) // #nosec G202 -- placeholders is a fixed "?,?,..." run built from len(incidentIDs); every value is bound
+	if err != nil {
+		return nil, fmt.Errorf("store: load situation triage executions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var incidentID, attemptID, startedStr, memberJSON, resultCode, outputDigest string
+		var attemptNumber int
+		var completedAt sql.NullString
+		if err := rows.Scan(&incidentID, &attemptID, &attemptNumber, &startedStr, &memberJSON, &resultCode, &outputDigest, &completedAt); err != nil {
+			return nil, fmt.Errorf("store: scan situation triage execution: %w", err)
+		}
+		started, err := time.Parse(time.RFC3339Nano, startedStr)
+		if err != nil {
+			return nil, fmt.Errorf("store: parse triage attempt started_at: %w", err)
+		}
+		completed, err := timePtr(completedAt)
+		if err != nil {
+			return nil, err
+		}
+		var memberDeliveryIDs []string
+		if err := json.Unmarshal([]byte(memberJSON), &memberDeliveryIDs); err != nil {
+			return nil, fmt.Errorf("store: unmarshal triage attempt member delivery ids: %w", err)
+		}
+		out[incidentID] = append(out[incidentID], situation.TriageExecution{
+			AttemptID: attemptID, AttemptNumber: attemptNumber, StartedAt: started, MemberDeliveryIDs: memberDeliveryIDs,
+			ResultCode: resultCode, OutputDigest: outputDigest, CompletedAt: completed,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate situation triage executions: %w", err)
 	}
 	return out, nil
 }
@@ -806,6 +965,12 @@ func (s *Store) RecordAssessmentCall(ctx context.Context, claim situation.Claim,
 		return err
 	}
 	if err := insertAssessmentCallTx(ctx, tx, call); err != nil {
+		return err
+	}
+	// Review F7: a dispatched attempt (even one later rejected) protects
+	// its complete evidence basis permanently, in the same transaction that
+	// consumes the dispatch slot.
+	if err := insertPermanentObservationReferencesTx(ctx, tx, call.PreparationCycleID, ObservationReferenceAssessmentAttempt, call.ID, call.DispatchedAt); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -1907,6 +2072,9 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 	if err != nil {
 		return err
 	}
+	if err := refundBudgetDeniedAttemptTx(ctx, tx, claim, commit); err != nil {
+		return err
+	}
 
 	// 1. Insert the new authoritative attempt (if any) and its coverage.
 	newAssessmentID, err := commitAuthoritativeAttemptTx(ctx, tx, claim.Situation.ID, commit)
@@ -2024,6 +2192,29 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 	// with the rest of the commit, so a Situation's history and its
 	// authoritative state can never diverge.
 	if err := applyHistoryCommitTx(ctx, tx, claim.Situation.ID, commit.History, canonicalCommitTime(commit)); err != nil {
+		return err
+	}
+
+	// 8. B5 (§5.3, E1): obsolete-start supersession, in this SAME fenced
+	// transaction and after the step above so the replacement reply row it
+	// may point at already exists.
+	if err := supersedeObsoleteAssuranceTx(ctx, tx, claim.Situation.ID, commit.History); err != nil {
+		return err
+	}
+
+	// 8. Plan 4 Task 2: seal this cycle's preparation (if any) in the SAME
+	// fenced transaction, even for a reuse/fallback/schedule-only commit —
+	// spec.md's "CommitController seals the cycle and advances its
+	// generation in the existing authoritative transaction." A commit with
+	// no preparation cycle (PreparationCycleID == "") is a no-op here.
+	if err := sealPreparationCycleTx(ctx, tx, claim.Situation.ID, commit.PreparationCycleID, canonicalCommitTime(commit)); err != nil {
+		return err
+	}
+
+	// 9. Review F7 (ADR-0051): the decision evidence basis is protected
+	// permanently in this same transaction — a new authoritative attempt,
+	// a lifecycle change, and every Transition each pin the cycle's runs.
+	if err := pinControllerEvidenceTx(ctx, tx, claim, commit, current.Lifecycle, newAssessmentID); err != nil {
 		return err
 	}
 
@@ -2346,4 +2537,30 @@ func wakeOneDependencyRecoveredSituationTx(ctx context.Context, db *sql.DB, situ
 		return false, fmt.Errorf("store: commit wake dependency-recovered situation: %w", err)
 	}
 	return true, nil
+}
+
+func pinControllerEvidenceTx(ctx context.Context, tx *sql.Tx, claim situation.Claim, commit situation.ControllerCommit, previousLifecycle situationmodel.Lifecycle, newAssessmentID sql.NullString) error {
+	if commit.PreparationCycleID == "" {
+		return nil
+	}
+	commitTime := canonicalCommitTime(commit)
+	if newAssessmentID.Valid {
+		if err := insertPermanentObservationReferencesTx(ctx, tx, commit.PreparationCycleID, ObservationReferenceAssessmentAttempt, newAssessmentID.String, commitTime); err != nil {
+			return err
+		}
+	}
+	if previousLifecycle != commit.Lifecycle {
+		owner := fmt.Sprintf("%s:v%d:%s", claim.Situation.ID, claim.Situation.InputVersion, commit.Lifecycle)
+		if err := insertPermanentObservationReferencesTx(ctx, tx, commit.PreparationCycleID, ObservationReferenceLifecycleDecision, owner, commitTime); err != nil {
+			return err
+		}
+	}
+	if commit.History != nil {
+		for _, tr := range commit.History.Transitions {
+			if err := insertPermanentObservationReferencesTx(ctx, tx, commit.PreparationCycleID, ObservationReferenceTransition, tr.ID, commitTime); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

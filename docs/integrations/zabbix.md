@@ -288,6 +288,21 @@ Show CPU history for web01 over the last 2 hours.
 List open problems on db-primary with severity at least high.
 ```
 
+### Situation evidence preparation (`state-controller` branch)
+
+The same `zabbix.api` connector also backs two of the seven bounded
+capabilities the Situation controller's own evidence-preparation pass can
+plan: `zabbix_metric_range` (a bounded metric-history read) and
+`zabbix_problem_history` (a bounded open-problems read) — see
+[Architecture: Situation foundation and
+controller](../concepts/architecture.md#3a-situation-foundation-and-controller).
+Planned reads are subject to the same per-cycle physical-request cap and
+wall-clock budget as every other capability
+(`situations.preparation.max_source_calls_per_cycle`,
+`situations.preparation.max_wall_seconds` — see
+[Configuration: `situations`](../getting-started/configuration.md#situations)),
+never a separate, uncapped Zabbix-specific budget.
+
 ## Verification
 
 With `zabbix.api` configured, the [verification round](../concepts/verification-round.md)

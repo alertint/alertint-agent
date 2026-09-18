@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Optional shared LLM call and cumulative token limits, persisted across
+  restarts and enforced before generation requests, including retries.
+  Both limits default to unlimited; see the configuration guide for accounting
+  and recovery semantics.
+
+### Fixed
+
+- Situation assessments carry the prior semantic judgment into the prompt and
+  no longer let the static capability-limitation set churn the material fact
+  hash, so unchanged evidence reuses the existing assessment instead of
+  repeatedly calling the LLM.
+- A first assessment call the shared budget denies before dispatch defers the
+  Situation until the budget's own retry time without spending an inference
+  attempt; provider usage (including cache tokens) is recorded on attempts.
+- Situation Slack briefings show stored triage findings, current alert state,
+  verification limits, and separate human and AlertINT next steps. Recovery
+  retains qualified historical analysis; replies report meaningful changes
+  while routine controller work remains in the audit history.
+  Compact roots use overall-status indicators and copyable MCP commands;
+  structured evidence and named alert changes stay in the thread. Each update
+  distinguishes the next status check from an actually scheduled work retry.
+- Situation assessments reuse unchanged evidence across staggered observation
+  schedules instead of repeatedly calling the LLM. Stale, failed, and incomplete
+  checks remain explicit evidence gaps.
+- Source recovery deliveries now participate in Situation lifecycle evaluation,
+  with episode ordering that prevents an old resolution from closing a new firing.
+- Assessment usage includes cache tokens; hourly budget refusals defer work
+  without consuming an inference attempt when no request was sent.
+
 ## [0.13.6] - 2026-09-01
 
 ### Added
