@@ -332,8 +332,8 @@ func (w *Worker) processOne(ctx context.Context, claim profilemodel.JobClaim) er
 		return fmt.Errorf("semanticprofile: reserve inference call: %w", err)
 	}
 	// Audited immediately after the reservation durably commits — the
-	// dispatch slot is spent whether or not the physical call below ever
-	// starts, mirroring situation.Controller's own
+	// dispatch slot is provisionally spent before the physical call starts.
+	// Only a proved-unsent budget denial can refund it, mirroring the controller's
 	// "situation.assessment_call_dispatched" ordering.
 	w.auditAppend(ctx, "semantic_profile.call_dispatched", map[string]any{
 		"signature": claim.Signature, "job_id": claim.JobID, "call_id": callID, "attempt": attempt,
@@ -372,7 +372,11 @@ func (w *Worker) processOne(ctx context.Context, claim profilemodel.JobClaim) er
 		result, classifyErr = classifyCompletion(oneShot, callErr, w.cfg.Provider)
 		obs.Finish(classifyErr)
 	}
-	span.SetAttributes(AttrResultClass.String(result.Outcome))
+	resultClass := result.Outcome
+	if result.BudgetDeferred {
+		resultClass = profilemodel.ErrorClassBudgetDeferred
+	}
+	span.SetAttributes(AttrResultClass.String(resultClass))
 	span.End()
 
 	cancel()
@@ -383,7 +387,9 @@ func (w *Worker) processOne(ctx context.Context, claim profilemodel.JobClaim) er
 	}
 
 	var retryAt *time.Time
-	if result.Outcome != profilemodel.InferenceOutcomeAccepted {
+	if result.BudgetDeferred {
+		retryAt = result.BudgetRetryAt
+	} else if result.Outcome != profilemodel.InferenceOutcomeAccepted {
 		at := now.Add(retryBackoff(w.cfg.Retry, attempt))
 		retryAt = &at
 	}
@@ -401,7 +407,7 @@ func (w *Worker) processOne(ctx context.Context, claim profilemodel.JobClaim) er
 	// separate.
 	w.auditAppend(ctx, "semantic_profile.call_completed", map[string]any{
 		"signature": claim.Signature, "job_id": claim.JobID, "call_id": callID,
-		"outcome": commit.Outcome, "job_status": commit.JobStatus,
+		"outcome": commit.Outcome, "job_status": commit.JobStatus, "error_class": commit.ErrorClass,
 	})
 	if commit.HeadAdvanced {
 		w.auditAppend(ctx, "semantic_profile.head_advanced", map[string]any{
@@ -431,6 +437,13 @@ func classifyCompletion(oneShot llm.OneShotCompletion, callErr error, provider s
 	}
 	if callErr != nil {
 		base.Outcome = profilemodel.InferenceOutcomeFailed
+		if oneShot.RequestStarted == llm.RequestStartStatusFalse && errors.Is(callErr, llm.ErrRequestNotSent) && errors.Is(callErr, llm.ErrBudgetExhausted) {
+			base.BudgetDeferred = true
+			var deferred *llm.BudgetDeferredError
+			if errors.As(callErr, &deferred) {
+				base.BudgetRetryAt = deferred.RetryAt
+			}
+		}
 		return base, callErr
 	}
 	profile, err := ParseProfile(oneShot.Raw)

@@ -207,6 +207,7 @@ type JobClaim struct {
 
 // JobState is the bounded, read-only current state of one signature's
 // inference job, for History.
+// Attempt counts consumed calls after any proved-unsent budget refunds.
 type JobState struct {
 	ID string
 
@@ -217,7 +218,8 @@ type JobState struct {
 }
 
 // Dispatch is an immutable call reservation with its optional durable outcome.
-// Missing outcomes retain unknown request/usage state after a crash.
+// Missing outcomes retain unknown request/usage state after a crash. Attempt
+// is the immutable reservation ordinal, including refunded budget denials.
 type Dispatch struct {
 	ID                string     `json:"id"`
 	JobID             string     `json:"job_id"`
@@ -256,7 +258,7 @@ const (
 	InferenceOutcomeStale     = "stale"
 )
 
-// Error classes — the closed two-value classification persisted on an
+// Error classes persisted on an
 // inference job from its LAST non-accepted outcome (cleared by a healthy
 // one). Only a dependency-exhausted job is ever re-armed by a newer durable
 // healthy LLM generation; a content-exhausted one (the model answered, but
@@ -264,8 +266,9 @@ const (
 // an operator correction, since the provider recovering says nothing about
 // the response content improving.
 const (
-	ErrorClassDependency = "dependency"
-	ErrorClassContent    = "content"
+	ErrorClassDependency     = "dependency"
+	ErrorClassContent        = "content"
+	ErrorClassBudgetDeferred = "budget_deferred"
 )
 
 // ErrorClassForOutcome maps one non-accepted inference outcome onto its
@@ -288,6 +291,11 @@ func ErrorClassForOutcome(outcome string) string {
 // whether the request physically started, and bounded usage/provenance
 // metadata. It never carries a raw provider response.
 type InferenceResult struct {
+	// BudgetDeferred is set only for an explicitly proved-unsent budget denial.
+	// A nil BudgetRetryAt needs operator action, not immediate polling.
+	BudgetDeferred bool
+	BudgetRetryAt  *time.Time
+
 	Profile           *Profile
 	Outcome           string
 	RequestStarted    string // "true" | "false" | "unknown"

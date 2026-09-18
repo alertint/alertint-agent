@@ -934,6 +934,7 @@ func (s *Store) ClaimSemanticInferenceJob(ctx context.Context, owner string, now
 		SELECT id, signature_key, frozen_input_json, frozen_input_digest, expected_head_version, attempt, token
 		FROM semantic_profile_inference_jobs
 		WHERE status = 'pending' AND (retry_at IS NULL OR retry_at <= ?)
+ AND (COALESCE(error_class,'') != 'budget_deferred' OR retry_at IS NOT NULL)
 		ORDER BY created_at ASC, id ASC LIMIT 1`, canonicalTime(now)).
 		Scan(&id, &signatureKey, &frozenInputJSON, &frozenInputDigest, &expectedHeadVersion, &attempt, &token)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -953,7 +954,8 @@ func (s *Store) ClaimSemanticInferenceJob(ctx context.Context, owner string, now
 	leaseExpiresAt := now.Add(lease)
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE semantic_profile_inference_jobs
-		SET status = 'running', owner = ?, token = ?, lease_expires_at = ?, retry_at = NULL
+		SET status = 'running', owner = ?, token = ?, lease_expires_at = ?, retry_at = NULL,
+ error_class = CASE WHEN error_class = 'budget_deferred' THEN NULL ELSE error_class END
 		WHERE id = ?`, owner, newToken, canonicalTime(leaseExpiresAt), id); err != nil {
 		return profilemodel.JobClaim{}, false, fmt.Errorf("store: claim semantic inference job: %w", err)
 	}
@@ -1016,10 +1018,16 @@ func (s *Store) ReserveSemanticInferenceCall(ctx context.Context, jobID, owner s
 	}
 
 	newAttempt := attempt + 1
+	// Immutable call ordinals never rewind when a proved-unsent budget denial
+	// refunds the job's consumed-attempt counter.
+	var ordinal int
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(attempt),0)+1 FROM semantic_profile_calls WHERE job_id=?`, jobID).Scan(&ordinal); err != nil {
+		return "", 0, err
+	}
 	callID := uuid.NewString()
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO semantic_profile_calls (id, job_id, attempt, dispatched_at) VALUES (?, ?, ?, ?)`,
-		callID, jobID, newAttempt, canonicalTime(now)); err != nil {
+		callID, jobID, ordinal, canonicalTime(now)); err != nil {
 		return "", 0, fmt.Errorf("store: insert semantic inference call: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
@@ -1077,6 +1085,17 @@ func (s *Store) CompleteSemanticInference(ctx context.Context, callID, owner str
 	}
 	if status != "running" || !rowOwner.Valid || rowOwner.String != owner || rowToken != token {
 		return profilemodel.InferenceCommit{}, profilemodel.ErrLeaseLost
+	}
+
+	if result.BudgetDeferred {
+		commit, err := completeBudgetDeferredProfileTx(ctx, tx, callID, jobID, result, now)
+		if err != nil {
+			return profilemodel.InferenceCommit{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return profilemodel.InferenceCommit{}, err
+		}
+		return commit, nil
 	}
 
 	commit := profilemodel.InferenceCommit{Outcome: result.Outcome, JobStatus: profilemodel.JobStateComplete}
