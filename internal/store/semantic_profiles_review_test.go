@@ -267,7 +267,7 @@ func completeOneSemanticAttempt(t *testing.T, st *Store, owner string, now time.
 		result.RequestStarted = "true"
 	}
 	retryAt := now.Add(time.Minute)
-	if err := st.CompleteSemanticInference(ctx, callID, claim.Owner, claim.Token, result, now, &retryAt); err != nil {
+	if _, err := st.CompleteSemanticInference(ctx, callID, claim.Owner, claim.Token, result, now, &retryAt); err != nil {
 		t.Fatalf("complete as %s with %s: %v", owner, outcome, err)
 	}
 	return claim

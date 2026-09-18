@@ -35,7 +35,7 @@ import (
 type ProfileStore interface {
 	ClaimSemanticInferenceJob(ctx context.Context, owner string, now time.Time, lease time.Duration) (profilemodel.JobClaim, bool, error)
 	ReserveSemanticInferenceCall(ctx context.Context, jobID, owner string, token int64, now time.Time) (string, int, error)
-	CompleteSemanticInference(ctx context.Context, callID, owner string, token int64, result profilemodel.InferenceResult, now time.Time, retryAt *time.Time) error
+	CompleteSemanticInference(ctx context.Context, callID, owner string, token int64, result profilemodel.InferenceResult, now time.Time, retryAt *time.Time) (profilemodel.InferenceCommit, error)
 	ExtendSemanticInferenceJobLease(ctx context.Context, jobID, owner string, token int64, now time.Time, lease time.Duration) error
 }
 
@@ -387,22 +387,25 @@ func (w *Worker) processOne(ctx context.Context, claim profilemodel.JobClaim) er
 		at := now.Add(retryBackoff(w.cfg.Retry, attempt))
 		retryAt = &at
 	}
-	if err := w.store.CompleteSemanticInference(ctx, callID, claim.Owner, claim.Token, result, w.cfg.Now(), retryAt); err != nil {
+	commit, err := w.store.CompleteSemanticInference(ctx, callID, claim.Owner, claim.Token, result, w.cfg.Now(), retryAt)
+	if err != nil {
 		return fmt.Errorf("semanticprofile: complete inference: %w", err)
 	}
-	// Audited from the worker's OWN pre-CAS classification of result.Outcome
-	// — the durable outcome CompleteSemanticInference actually committed may
-	// differ (an accepted result downgraded to stale by a winning
-	// correction/sibling job), which is by design not a worker- or
-	// health-visible distinction (spec.md's "stale-CAS-loss is healthy
-	// transport"). The true persisted outcome, including any such downgrade,
-	// always remains readable from semantic_profile_call_outcomes itself.
+	// Audited from what the store actually COMMITTED, never from the
+	// worker's own pre-CAS classification: an accepted result a winning
+	// correction/sibling job downgraded to stale is recorded as stale, and
+	// head_advanced is emitted only when this commit really moved the head
+	// (naming the version it moved to). Health was already observed above
+	// from the transport classification alone — a stale CAS loss stays
+	// healthy transport (spec.md), which is exactly why the two are
+	// separate.
 	w.auditAppend(ctx, "semantic_profile.call_completed", map[string]any{
-		"signature": claim.Signature, "job_id": claim.JobID, "call_id": callID, "outcome": result.Outcome,
+		"signature": claim.Signature, "job_id": claim.JobID, "call_id": callID,
+		"outcome": commit.Outcome, "job_status": commit.JobStatus,
 	})
-	if result.Outcome == profilemodel.InferenceOutcomeAccepted {
+	if commit.HeadAdvanced {
 		w.auditAppend(ctx, "semantic_profile.head_advanced", map[string]any{
-			"signature": claim.Signature, "job_id": claim.JobID,
+			"signature": claim.Signature, "job_id": claim.JobID, "version_id": commit.VersionID, "version": commit.Version,
 		})
 	}
 	return nil

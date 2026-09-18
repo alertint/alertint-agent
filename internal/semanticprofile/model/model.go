@@ -208,16 +208,38 @@ type JobClaim struct {
 // JobState is the bounded, read-only current state of one signature's
 // inference job, for History.
 type JobState struct {
+	ID string
+
 	Status     string
 	Attempt    int
 	RetryAt    *time.Time
 	ErrorClass *string
 }
 
-// History is GetSemanticProfile's bounded read result: the current head
-// (nil if none exists yet), a bounded page of prior versions, the job's
-// current state (nil if no job exists), and a cursor for the next page.
+// Dispatch is an immutable call reservation with its optional durable outcome.
+// Missing outcomes retain unknown request/usage state after a crash.
+type Dispatch struct {
+	ID                string     `json:"id"`
+	JobID             string     `json:"job_id"`
+	Attempt           int        `json:"attempt"`
+	DispatchedAt      time.Time  `json:"dispatched_at"`
+	Outcome           string     `json:"outcome"`
+	RequestStarted    string     `json:"request_started"`
+	UsageInputTokens  *int       `json:"usage_input_tokens"`
+	UsageOutputTokens *int       `json:"usage_output_tokens"`
+	Provider          string     `json:"provider"`
+	Model             string     `json:"model"`
+	CompletedAt       *time.Time `json:"completed_at"`
+}
+
+// History contains a coherent head, version page, latest job and bounded
+// immutable dispatch ledger with lifetime counts. NextCursor pages versions.
 type History struct {
+	Dispatches           []Dispatch
+	DispatchCount        int
+	UnknownDispatchCount int
+	DispatchesTruncated  bool
+
 	Current    *Version
 	Versions   []Version
 	Job        *JobState
@@ -274,6 +296,43 @@ type InferenceResult struct {
 	Provider          string
 	Model             string
 	PromptVersion     int
+}
+
+// InferenceCommit is CompleteSemanticInference's durable result — what the
+// store actually committed, which may differ from what the worker reported
+// (an accepted result is downgraded to InferenceOutcomeStale when the
+// signature's head advanced first). Audit and telemetry must describe THIS,
+// never the pre-commit classification; identities only, never content.
+type InferenceCommit struct {
+	// Outcome is the committed call outcome: accepted, stale, rejected,
+	// malformed, or failed.
+	Outcome string
+	// JobStatus is the job's state after this commit: complete, pending
+	// (retry scheduled), or exhausted.
+	JobStatus string
+	// HeadAdvanced is true only when this commit created a new Version and
+	// moved the signature's head to it; VersionID/Version identify it then.
+	HeadAdvanced bool
+	VersionID    string
+	Version      int
+	// ErrorClass is the class persisted on the job by this commit ("" for a
+	// healthy outcome).
+	ErrorClass string
+}
+
+// ChangeDelivery is one DeliverSemanticProfileChangesDetailed page: the
+// head-change outbox row it advanced, the version it announces, and every
+// Situation it woke in that transaction — bounded identities for the
+// caller's own audit emission. SituationIDs is empty (and ChangeID "") when
+// no change was due.
+type ChangeDelivery struct {
+	ChangeID     string
+	SignatureKey string
+	VersionID    string
+	SituationIDs []string
+	// Acknowledged is true when this page reached every remaining match and
+	// the outbox row was acknowledged.
+	Acknowledged bool
 }
 
 // ErrVersionConflict is returned by CorrectSemanticProfile when

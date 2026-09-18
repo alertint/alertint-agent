@@ -635,9 +635,9 @@ func (s *Store) CorrectSemanticProfile(ctx context.Context, c profilemodel.Corre
 // history for alertint_get_semantic_profile: its current head (nil when no
 // version has ever been committed — a signature that has only ever had
 // inference jobs run/fail), a bounded page of ALL its immutable versions
-// newest-first, and its current LIVE inference job state (nil when no job
-// is pending/running — the partial unique index on
-// semantic_profile_inference_jobs guarantees at most one). limit is
+// newest-first, its live or latest terminal inference job, and immutable
+// dispatch counts plus the latest 100 calls. All reads share one transaction.
+// limit is
 // clamped to [1,100], defaulting to 20; cursor resumes strictly below the
 // last page's oldest version number.
 func (s *Store) GetSemanticProfile(ctx context.Context, signatureKey, cursor string, limit int) (profilemodel.History, error) {
@@ -648,8 +648,13 @@ func (s *Store) GetSemanticProfile(ctx context.Context, signatureKey, cursor str
 		limit = 100
 	}
 
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return profilemodel.History{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
 	var currentVersion int
-	err := s.db.QueryRowContext(ctx, `SELECT current_version FROM semantic_profile_heads WHERE signature_key = ?`, signatureKey).Scan(&currentVersion)
+	err = tx.QueryRowContext(ctx, `SELECT current_version FROM semantic_profile_heads WHERE signature_key = ?`, signatureKey).Scan(&currentVersion)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return profilemodel.History{}, fmt.Errorf("store: read semantic profile head: %w", err)
 	}
@@ -670,7 +675,7 @@ func (s *Store) GetSemanticProfile(ctx context.Context, signatureKey, cursor str
 	query += ` ORDER BY version DESC LIMIT ?`
 	args = append(args, limit+1)
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return profilemodel.History{}, fmt.Errorf("store: query semantic profile versions: %w", err)
 	}
@@ -703,19 +708,26 @@ func (s *Store) GetSemanticProfile(ctx context.Context, signatureKey, cursor str
 
 	var current *profilemodel.Version
 	if currentVersion > 0 {
-		v, err := s.loadSemanticProfileVersionByNumber(ctx, signatureKey, currentVersion)
+		v, err := loadSemanticProfileVersionByNumber(ctx, tx, signatureKey, currentVersion)
 		if err != nil {
 			return profilemodel.History{}, err
 		}
 		current = &v
 	}
 
-	job, err := s.loadLiveSemanticInferenceJobState(ctx, signatureKey)
+	job, err := loadSemanticInferenceJobState(ctx, tx, signatureKey)
 	if err != nil {
 		return profilemodel.History{}, err
 	}
 
-	return profilemodel.History{Current: current, Versions: versions, Job: job, NextCursor: nextCursor}, nil
+	history := profilemodel.History{Current: current, Versions: versions, Job: job, NextCursor: nextCursor}
+	if err := loadSemanticDispatches(ctx, tx, signatureKey, &history); err != nil {
+		return profilemodel.History{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return profilemodel.History{}, err
+	}
+	return history, nil
 }
 
 // scanSemanticProfileVersionRow scans one semantic_profile_versions row (id,
@@ -751,8 +763,8 @@ func scanSemanticProfileVersionRow(rows *sql.Rows, signatureKey string) (profile
 // its (signature_key, version) unique key — used to resolve the head's
 // current version directly rather than relying on it appearing inside
 // whatever bounded page GetSemanticProfile's caller happened to request.
-func (s *Store) loadSemanticProfileVersionByNumber(ctx context.Context, signatureKey string, version int) (profilemodel.Version, error) {
-	row := s.db.QueryRowContext(ctx, `
+func loadSemanticProfileVersionByNumber(ctx context.Context, tx *sql.Tx, signatureKey string, version int) (profilemodel.Version, error) {
+	row := tx.QueryRowContext(ctx, `
 		SELECT id, version, schema_version, prompt_version, semantic_input_digest, origin, provider, model,
 		       usage_input_tokens, usage_output_tokens, profile_json, created_at, asserted_by
 		FROM semantic_profile_versions WHERE signature_key = ? AND version = ?`, signatureKey, version)
@@ -780,25 +792,22 @@ func (s *Store) loadSemanticProfileVersionByNumber(ctx context.Context, signatur
 	}, nil
 }
 
-// loadLiveSemanticInferenceJobState reads signatureKey's current
-// pending/running job, if one exists — the partial unique index on
-// semantic_profile_inference_jobs guarantees at most one such row per
-// signature, so no ordering/limit is needed to pick "the" live job.
-func (s *Store) loadLiveSemanticInferenceJobState(ctx context.Context, signatureKey string) (*profilemodel.JobState, error) {
-	row := s.db.QueryRowContext(ctx, `
-		SELECT status, attempt, retry_at, error_class FROM semantic_profile_inference_jobs
-		WHERE signature_key = ? AND status IN ('pending', 'running')`, signatureKey)
-	var status string
+// loadSemanticInferenceJobState selects the live job, or the latest terminal job.
+func loadSemanticInferenceJobState(ctx context.Context, tx *sql.Tx, signatureKey string) (*profilemodel.JobState, error) {
+	row := tx.QueryRowContext(ctx, `
+		SELECT id, status, attempt, retry_at, error_class FROM semantic_profile_inference_jobs
+		WHERE signature_key = ? ORDER BY (status IN ('pending','running')) DESC, created_at DESC, id DESC LIMIT 1`, signatureKey)
+	var id, status string
 	var attempt int
 	var retryAt, errorClass sql.NullString
-	err := row.Scan(&status, &attempt, &retryAt, &errorClass)
+	err := row.Scan(&id, &status, &attempt, &retryAt, &errorClass)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil //nolint:nilnil // no live pending/running job is a legitimate, common outcome, not an error
+		return nil, nil //nolint:nilnil // no inference job is a legitimate, common outcome, not an error
 	}
 	if err != nil {
 		return nil, fmt.Errorf("store: read live semantic inference job: %w", err)
 	}
-	state := &profilemodel.JobState{Status: status, Attempt: attempt}
+	state := &profilemodel.JobState{ID: id, Status: status, Attempt: attempt}
 	if retryAt.Valid {
 		t, err := time.Parse(time.RFC3339Nano, retryAt.String)
 		if err != nil {
@@ -1038,11 +1047,15 @@ func (s *Store) ReserveSemanticInferenceCall(ctx context.Context, jobID, owner s
 // response) is persisted on the job so a later durable healthy generation
 // can re-arm dependency exhaustion and only that. A healthy outcome clears
 // the class. retryAt is ignored for an accepted (or downgraded-to-stale)
-// outcome, and may be nil for a final (exhausting) non-accepted one.
-func (s *Store) CompleteSemanticInference(ctx context.Context, callID, owner string, token int64, result profilemodel.InferenceResult, now time.Time, retryAt *time.Time) error {
+// outcome, and may be nil for a final (exhausting) non-accepted one. The
+// returned InferenceCommit describes what was actually committed — the
+// durable outcome (stale when downgraded), the job's resulting status,
+// and whether/which version the head advanced to — so the worker audits
+// the commit rather than its own pre-CAS classification.
+func (s *Store) CompleteSemanticInference(ctx context.Context, callID, owner string, token int64, result profilemodel.InferenceResult, now time.Time, retryAt *time.Time) (profilemodel.InferenceCommit, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("store: begin complete semantic inference: %w", err)
+		return profilemodel.InferenceCommit{}, fmt.Errorf("store: begin complete semantic inference: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -1057,76 +1070,77 @@ func (s *Store) CompleteSemanticInference(ctx context.Context, callID, owner str
 		WHERE c.id = ?`, callID).
 		Scan(&jobID, &signatureKey, &rowOwner, &rowToken, &status, &attempt, &attemptBudget)
 	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("store: complete semantic inference: call %s: %w", callID, ErrNotFound)
+		return profilemodel.InferenceCommit{}, fmt.Errorf("store: complete semantic inference: call %s: %w", callID, ErrNotFound)
 	}
 	if err != nil {
-		return fmt.Errorf("store: read semantic inference call for completion: %w", err)
+		return profilemodel.InferenceCommit{}, fmt.Errorf("store: read semantic inference call for completion: %w", err)
 	}
 	if status != "running" || !rowOwner.Valid || rowOwner.String != owner || rowToken != token {
-		return profilemodel.ErrLeaseLost
+		return profilemodel.InferenceCommit{}, profilemodel.ErrLeaseLost
 	}
 
-	outcome := result.Outcome
-	newJobStatus := profilemodel.JobStateComplete
+	commit := profilemodel.InferenceCommit{Outcome: result.Outcome, JobStatus: profilemodel.JobStateComplete}
 	var newRetryAt any
 	switch result.Outcome {
 	case profilemodel.InferenceOutcomeAccepted:
 		var headExists int
 		herr := tx.QueryRowContext(ctx, `SELECT 1 FROM semantic_profile_heads WHERE signature_key = ?`, signatureKey).Scan(&headExists)
 		if herr != nil && !errors.Is(herr, sql.ErrNoRows) {
-			return fmt.Errorf("store: check semantic profile head for completion: %w", herr)
+			return profilemodel.InferenceCommit{}, fmt.Errorf("store: check semantic profile head for completion: %w", herr)
 		}
 		if herr == nil {
-			outcome = profilemodel.InferenceOutcomeStale // the expected head is no longer absent — a correction or a sibling job already won.
+			commit.Outcome = profilemodel.InferenceOutcomeStale // the expected head is no longer absent — a correction or a sibling job already won.
 		} else {
-			if err := commitAcceptedInferenceTx(ctx, tx, jobID, signatureKey, *result.Profile, result, now); err != nil {
-				return err
+			versionID, version, err := commitAcceptedInferenceTx(ctx, tx, jobID, signatureKey, *result.Profile, result, now)
+			if err != nil {
+				return profilemodel.InferenceCommit{}, err
 			}
+			commit.HeadAdvanced, commit.VersionID, commit.Version = true, versionID, version
 		}
 	default:
 		if attempt >= attemptBudget {
-			newJobStatus = profilemodel.JobStateExhausted
+			commit.JobStatus = profilemodel.JobStateExhausted
 		} else {
-			newJobStatus = profilemodel.JobStatePending
+			commit.JobStatus = profilemodel.JobStatePending
 			if retryAt != nil {
 				newRetryAt = canonicalTime(*retryAt)
 			}
 		}
 	}
 	var errorClass any
-	if class := profilemodel.ErrorClassForOutcome(outcome); class != "" {
-		errorClass = class
+	if commit.ErrorClass = profilemodel.ErrorClassForOutcome(commit.Outcome); commit.ErrorClass != "" {
+		errorClass = commit.ErrorClass
 	}
 
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO semantic_profile_call_outcomes (
 			call_id, outcome, request_started, usage_input_tokens, usage_output_tokens, provider, model, completed_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		callID, outcome, result.RequestStarted, result.UsageInputTokens, result.UsageOutputTokens,
+		callID, commit.Outcome, result.RequestStarted, result.UsageInputTokens, result.UsageOutputTokens,
 		result.Provider, result.Model, canonicalTime(now)); err != nil {
-		return fmt.Errorf("store: insert semantic inference call outcome: %w", err)
+		return profilemodel.InferenceCommit{}, fmt.Errorf("store: insert semantic inference call outcome: %w", err)
 	}
 
-	if newJobStatus == profilemodel.JobStatePending {
+	if commit.JobStatus == profilemodel.JobStatePending {
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE semantic_profile_inference_jobs
 			SET status = ?, owner = NULL, lease_expires_at = NULL, retry_at = ?, error_class = ?
-			WHERE id = ?`, newJobStatus, newRetryAt, errorClass, jobID); err != nil {
-			return fmt.Errorf("store: return semantic inference job to pending: %w", err)
+			WHERE id = ?`, commit.JobStatus, newRetryAt, errorClass, jobID); err != nil {
+			return profilemodel.InferenceCommit{}, fmt.Errorf("store: return semantic inference job to pending: %w", err)
 		}
 	} else {
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE semantic_profile_inference_jobs
 			SET status = ?, owner = NULL, lease_expires_at = NULL, error_class = ?
-			WHERE id = ?`, newJobStatus, errorClass, jobID); err != nil {
-			return fmt.Errorf("store: finish semantic inference job: %w", err)
+			WHERE id = ?`, commit.JobStatus, errorClass, jobID); err != nil {
+			return profilemodel.InferenceCommit{}, fmt.Errorf("store: finish semantic inference job: %w", err)
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("store: commit complete semantic inference: %w", err)
+		return profilemodel.InferenceCommit{}, fmt.Errorf("store: commit complete semantic inference: %w", err)
 	}
-	return nil
+	return commit, nil
 }
 
 // dependencyExhaustedSemanticJobRearmLimit bounds one
@@ -1248,29 +1262,45 @@ func (s *Store) RearmDependencyExhaustedSemanticJobs(ctx context.Context, health
 // Situation still loads the current head at its own next reconcile
 // (spec.md: "must either be included or load the new head itself"). Returns
 // the number of Situations woken this call — 0 when no change is currently
-// due for another page.
+// due for another page. It is a thin wrapper over
+// DeliverSemanticProfileChangesDetailed for callers that only need the
+// count.
 func (s *Store) DeliverSemanticProfileChanges(ctx context.Context, now time.Time, batchSize int) (int, error) {
+	delivery, err := s.DeliverSemanticProfileChangesDetailed(ctx, now, batchSize)
+	if err != nil {
+		return 0, err
+	}
+	return len(delivery.SituationIDs), nil
+}
+
+// DeliverSemanticProfileChangesDetailed is DeliverSemanticProfileChanges
+// returning the bounded identities of what one page actually delivered —
+// the change/version it announced and every Situation it woke — so the
+// caller's audit trail can name them rather than only a count. A zero
+// ChangeDelivery (empty ChangeID) means no change was due.
+func (s *Store) DeliverSemanticProfileChangesDetailed(ctx context.Context, now time.Time, batchSize int) (profilemodel.ChangeDelivery, error) {
 	if batchSize <= 0 {
 		batchSize = 100
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("store: begin deliver semantic profile changes: %w", err)
+		return profilemodel.ChangeDelivery{}, fmt.Errorf("store: begin deliver semantic profile changes: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var changeID, signatureKey string
+	var changeID, signatureKey, versionID string
 	var cursor sql.NullString
 	err = tx.QueryRowContext(ctx, `
-		SELECT id, signature_key, fan_out_cursor FROM semantic_profile_changes
-		WHERE acknowledged = 0 ORDER BY id ASC LIMIT 1`).Scan(&changeID, &signatureKey, &cursor)
+		SELECT id, signature_key, version_id, fan_out_cursor FROM semantic_profile_changes
+		WHERE acknowledged = 0 ORDER BY id ASC LIMIT 1`).Scan(&changeID, &signatureKey, &versionID, &cursor)
 	if errors.Is(err, sql.ErrNoRows) {
-		return 0, nil
+		return profilemodel.ChangeDelivery{}, nil
 	}
 	if err != nil {
-		return 0, fmt.Errorf("store: query due semantic profile change: %w", err)
+		return profilemodel.ChangeDelivery{}, fmt.Errorf("store: query due semantic profile change: %w", err)
 	}
+	delivery := profilemodel.ChangeDelivery{ChangeID: changeID, SignatureKey: signatureKey, VersionID: versionID}
 
 	rows, err := tx.QueryContext(ctx, `
 		SELECT DISTINCT s.id
@@ -1285,41 +1315,43 @@ func (s *Store) DeliverSemanticProfileChanges(ctx context.Context, now time.Time
 		ORDER BY s.id ASC LIMIT ?`,
 		changeID, signatureKey, cursor, cursor, batchSize)
 	if err != nil {
-		return 0, fmt.Errorf("store: query semantic profile change fan-out page: %w", err)
+		return profilemodel.ChangeDelivery{}, fmt.Errorf("store: query semantic profile change fan-out page: %w", err)
 	}
 	ids, err := scanStringRows(rows)
 	if err != nil {
-		return 0, fmt.Errorf("store: read semantic profile change fan-out page: %w", err)
+		return profilemodel.ChangeDelivery{}, fmt.Errorf("store: read semantic profile change fan-out page: %w", err)
 	}
 
 	for _, situationID := range ids {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO semantic_profile_change_deliveries (change_id, situation_id, delivered_at)
 			VALUES (?, ?, ?)`, changeID, situationID, canonicalTime(now)); err != nil {
-			return 0, fmt.Errorf("store: record semantic profile change delivery: %w", err)
+			return profilemodel.ChangeDelivery{}, fmt.Errorf("store: record semantic profile change delivery: %w", err)
 		}
 		if err := wakeSituationForSemanticProfileChangeTx(ctx, tx, situationID, now); err != nil {
-			return 0, err
+			return profilemodel.ChangeDelivery{}, err
 		}
 	}
 
 	if len(ids) > 0 {
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE semantic_profile_changes SET fan_out_cursor = ? WHERE id = ?`, ids[len(ids)-1], changeID); err != nil {
-			return 0, fmt.Errorf("store: advance semantic profile change fan-out cursor: %w", err)
+			return profilemodel.ChangeDelivery{}, fmt.Errorf("store: advance semantic profile change fan-out cursor: %w", err)
 		}
 	}
 	if len(ids) < batchSize {
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE semantic_profile_changes SET acknowledged = 1 WHERE id = ?`, changeID); err != nil {
-			return 0, fmt.Errorf("store: acknowledge exhausted semantic profile change: %w", err)
+			return profilemodel.ChangeDelivery{}, fmt.Errorf("store: acknowledge exhausted semantic profile change: %w", err)
 		}
+		delivery.Acknowledged = true
 	}
 
 	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("store: commit deliver semantic profile changes: %w", err)
+		return profilemodel.ChangeDelivery{}, fmt.Errorf("store: commit deliver semantic profile changes: %w", err)
 	}
-	return len(ids), nil
+	delivery.SituationIDs = ids
+	return delivery, nil
 }
 
 // wakeSituationForSemanticProfileChangeTx invalidates situationID's frozen
@@ -1366,23 +1398,24 @@ func wakeSituationForSemanticProfileChangeTx(ctx context.Context, tx *sql.Tx, si
 // Version, advances the signature's head, and enqueues its change-outbox
 // row — the SAME three writes CorrectSemanticProfile makes for a
 // correction, since both are "a new head advancement" (spec.md: "Head
-// advancement and a profile-change outbox row commit together").
-func commitAcceptedInferenceTx(ctx context.Context, tx *sql.Tx, jobID, signatureKey string, profile profilemodel.Profile, result profilemodel.InferenceResult, now time.Time) error {
+// advancement and a profile-change outbox row commit together"). Returns
+// the new Version's id and number.
+func commitAcceptedInferenceTx(ctx context.Context, tx *sql.Tx, jobID, signatureKey string, profile profilemodel.Profile, result profilemodel.InferenceResult, now time.Time) (string, int, error) {
 	var currentVersion int
 	err := tx.QueryRowContext(ctx, `SELECT current_version FROM semantic_profile_heads WHERE signature_key = ?`, signatureKey).Scan(&currentVersion)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("store: read current semantic profile head for inference: %w", err)
+		return "", 0, fmt.Errorf("store: read current semantic profile head for inference: %w", err)
 	}
 	newVersion := currentVersion + 1
 
 	var frozenInputDigest string
 	if err := tx.QueryRowContext(ctx, `SELECT frozen_input_digest FROM semantic_profile_inference_jobs WHERE id = ?`, jobID).Scan(&frozenInputDigest); err != nil {
-		return fmt.Errorf("store: read frozen input digest for inference job %s: %w", jobID, err)
+		return "", 0, fmt.Errorf("store: read frozen input digest for inference job %s: %w", jobID, err)
 	}
 
 	profileJSON, err := json.Marshal(profile)
 	if err != nil {
-		return fmt.Errorf("store: marshal inferred profile: %w", err)
+		return "", 0, fmt.Errorf("store: marshal inferred profile: %w", err)
 	}
 	versionID := uuid.NewString()
 	createdAt := canonicalTime(now)
@@ -1393,7 +1426,7 @@ func commitAcceptedInferenceTx(ctx context.Context, tx *sql.Tx, jobID, signature
 		) VALUES (?, ?, ?, ?, ?, ?, 'inferred', ?, ?, ?, ?, ?, ?)`,
 		versionID, signatureKey, newVersion, profilemodel.ProfileSchemaVersion, result.PromptVersion, frozenInputDigest,
 		result.Provider, result.Model, result.UsageInputTokens, result.UsageOutputTokens, string(profileJSON), createdAt); err != nil {
-		return fmt.Errorf("store: insert inferred semantic profile version: %w", err)
+		return "", 0, fmt.Errorf("store: insert inferred semantic profile version: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO semantic_profile_heads (signature_key, current_version, version_id, updated_at)
@@ -1401,12 +1434,12 @@ func commitAcceptedInferenceTx(ctx context.Context, tx *sql.Tx, jobID, signature
 		ON CONFLICT(signature_key) DO UPDATE SET current_version = excluded.current_version,
 			version_id = excluded.version_id, updated_at = excluded.updated_at`,
 		signatureKey, newVersion, versionID, createdAt); err != nil {
-		return fmt.Errorf("store: advance semantic profile head for inference: %w", err)
+		return "", 0, fmt.Errorf("store: advance semantic profile head for inference: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO semantic_profile_changes (id, signature_key, version_id, created_at)
 		VALUES (?, ?, ?, ?)`, uuid.NewString(), signatureKey, versionID, createdAt); err != nil {
-		return fmt.Errorf("store: enqueue semantic profile change for inference: %w", err)
+		return "", 0, fmt.Errorf("store: enqueue semantic profile change for inference: %w", err)
 	}
-	return nil
+	return versionID, newVersion, nil
 }

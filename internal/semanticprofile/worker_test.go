@@ -34,6 +34,10 @@ type fakeProfileStore struct {
 
 	completeCalls []profilemodel.InferenceResult
 	completeErr   error
+	// completeCommit, when non-nil, is returned verbatim from
+	// CompleteSemanticInference (a store that downgraded the result); by
+	// default the fake commits exactly what the worker reported.
+	completeCommit *profilemodel.InferenceCommit
 
 	extendCalls int
 	extendErr   error
@@ -72,11 +76,54 @@ func (f *fakeProfileStore) ReserveSemanticInferenceCall(ctx context.Context, job
 	return id, attempt, nil
 }
 
-func (f *fakeProfileStore) CompleteSemanticInference(ctx context.Context, callID, owner string, token int64, result profilemodel.InferenceResult, now time.Time, retryAt *time.Time) error {
+func (f *fakeProfileStore) CompleteSemanticInference(ctx context.Context, callID, owner string, token int64, result profilemodel.InferenceResult, now time.Time, retryAt *time.Time) (profilemodel.InferenceCommit, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.completeCalls = append(f.completeCalls, result)
-	return f.completeErr
+	if f.completeErr != nil {
+		return profilemodel.InferenceCommit{}, f.completeErr
+	}
+	if f.completeCommit != nil {
+		return *f.completeCommit, nil
+	}
+	commit := profilemodel.InferenceCommit{Outcome: result.Outcome, JobStatus: profilemodel.JobStateComplete}
+	if result.Outcome == profilemodel.InferenceOutcomeAccepted {
+		commit.HeadAdvanced, commit.VersionID, commit.Version = true, "version-"+callID, 1
+	} else {
+		commit.JobStatus = profilemodel.JobStatePending
+	}
+	return commit, nil
+}
+
+// fakeAuditSink records every Append the worker emits.
+type fakeAuditSink struct {
+	mu      sync.Mutex
+	entries []fakeAuditEntry
+}
+
+type fakeAuditEntry struct {
+	kind    string
+	payload map[string]any
+}
+
+func (s *fakeAuditSink) Append(_ context.Context, _ string, kind string, payload any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, _ := payload.(map[string]any)
+	s.entries = append(s.entries, fakeAuditEntry{kind: kind, payload: p})
+	return nil
+}
+
+func (s *fakeAuditSink) ofKind(kind string) []fakeAuditEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []fakeAuditEntry
+	for _, e := range s.entries {
+		if e.kind == kind {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 func (f *fakeProfileStore) ExtendSemanticInferenceJobLease(ctx context.Context, jobID, owner string, token int64, now time.Time, lease time.Duration) error {
@@ -263,6 +310,60 @@ func TestWorkerRunOnceMalformedResponseRecordsMalformedAndUnhealthy(t *testing.T
 	if !errors.Is(health.finished[0], semanticprofile.ErrProfileMalformed) {
 		t.Fatalf("health error = %v, want it to wrap semanticprofile.ErrProfileMalformed", health.finished[0])
 	}
+}
+
+// TestWorkerAuditsCommittedOutcomeNotPreCASClassification (F24): when the
+// store downgrades an accepted result to stale (a correction won the head
+// first), the audit trail records stale and emits NO head_advanced — while
+// health still sees a healthy call — and a genuinely committed acceptance
+// audits head_advanced with the version the head moved to.
+func TestWorkerAuditsCommittedOutcomeNotPreCASClassification(t *testing.T) {
+	profile := validProfileJSON(t)
+	acceptedResponse := func() (llm.OneShotCompletion, error) { //nolint:unparam // required fakeCompletionClient response signature
+		return llm.OneShotCompletion{Completion: llm.Completion{Raw: profile, Model: "claude"}, RequestStarted: llm.RequestStartStatusTrue}, nil
+	}
+
+	t.Run("stale downgrade", func(t *testing.T) {
+		claim := testClaim("job-stale", "sig-stale", frozenInputJSON(t))
+		store := &fakeProfileStore{
+			claims:         []profilemodel.JobClaim{claim},
+			completeCommit: &profilemodel.InferenceCommit{Outcome: profilemodel.InferenceOutcomeStale, JobStatus: profilemodel.JobStateComplete},
+		}
+		client := &fakeCompletionClient{responses: []func() (llm.OneShotCompletion, error){acceptedResponse}}
+		health := &fakeHealthObserver{}
+		audit := &fakeAuditSink{}
+		w := newTestWorker(store, client, health, llm.NewInferenceLimiter(2))
+		w.SetAuditSink(audit)
+		if _, err := w.RunOnce(context.Background()); err != nil {
+			t.Fatalf("RunOnce: %v", err)
+		}
+		completed := audit.ofKind("semantic_profile.call_completed")
+		if len(completed) != 1 || completed[0].payload["outcome"] != profilemodel.InferenceOutcomeStale {
+			t.Fatalf("call_completed audit = %+v, want exactly one with outcome stale (the COMMITTED outcome)", completed)
+		}
+		if advanced := audit.ofKind("semantic_profile.head_advanced"); len(advanced) != 0 {
+			t.Fatalf("head_advanced audit = %+v, want none: the head did not move", advanced)
+		}
+		if len(health.finished) != 1 || health.finished[0] != nil {
+			t.Fatalf("health.finished = %v, want one nil (a stale CAS loss is healthy transport)", health.finished)
+		}
+	})
+
+	t.Run("committed acceptance", func(t *testing.T) {
+		claim := testClaim("job-won", "sig-won", frozenInputJSON(t))
+		store := &fakeProfileStore{claims: []profilemodel.JobClaim{claim}}
+		client := &fakeCompletionClient{responses: []func() (llm.OneShotCompletion, error){acceptedResponse}}
+		audit := &fakeAuditSink{}
+		w := newTestWorker(store, client, nil, llm.NewInferenceLimiter(2))
+		w.SetAuditSink(audit)
+		if _, err := w.RunOnce(context.Background()); err != nil {
+			t.Fatalf("RunOnce: %v", err)
+		}
+		advanced := audit.ofKind("semantic_profile.head_advanced")
+		if len(advanced) != 1 || advanced[0].payload["version_id"] != "version-call-1" || advanced[0].payload["version"] != 1 {
+			t.Fatalf("head_advanced audit = %+v, want exactly one naming version-call-1 / 1", advanced)
+		}
+	})
 }
 
 // TestParseAndValidateProfileWrapErrProfileMalformed (F15) pins the
