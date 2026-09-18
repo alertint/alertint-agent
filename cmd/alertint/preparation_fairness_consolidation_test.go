@@ -101,17 +101,7 @@ func TestProductionPreparerFairnessAcrossRoundsAndRestart(t *testing.T) {
 		if optional != 1 {
 			t.Fatalf("round%d optional admissions=%d want1", round, optional)
 		}
-		var allocationJSON string
-		if err := st.DB().QueryRowContext(ctx, `SELECT allocation_json FROM situation_preparation_cycles WHERE id=?`, receipt.CycleID).Scan(&allocationJSON); err != nil {
-			t.Fatal(err)
-		}
-		var allocation om.PhaseAllocation
-		if err := json.Unmarshal([]byte(allocationJSON), &allocation); err != nil {
-			t.Fatal(err)
-		}
-		if len(allocation.Deferred) == 0 {
-			t.Fatalf("round%d must explicitly defer excess reads", round)
-		}
+		assertFairnessDeferred(t, ctx, st, receipt.CycleID, round)
 		var creditBefore int
 		if err := st.DB().QueryRowContext(ctx, `SELECT investigation_credit FROM situations WHERE id=?`, sitID).Scan(&creditBefore); err != nil {
 			t.Fatal(err)
@@ -156,5 +146,20 @@ func TestProductionPreparerFairnessAcrossRoundsAndRestart(t *testing.T) {
 	}
 	if len(served) != 8 {
 		t.Fatalf("lifecycle subjects served=%d want8 across bounded rounds", len(served))
+	}
+}
+
+func assertFairnessDeferred(t *testing.T, ctx context.Context, st *store.Store, cycleID string, round int) {
+	t.Helper()
+	var allocationJSON string
+	if err := st.DB().QueryRowContext(ctx, `SELECT allocation_json FROM situation_preparation_cycles WHERE id=?`, cycleID).Scan(&allocationJSON); err != nil {
+		t.Fatal(err)
+	}
+	var allocation om.PhaseAllocation
+	if err := json.Unmarshal([]byte(allocationJSON), &allocation); err != nil {
+		t.Fatal(err)
+	}
+	if len(allocation.Deferred) == 0 {
+		t.Fatalf("round%d must explicitly defer excess reads", round)
 	}
 }

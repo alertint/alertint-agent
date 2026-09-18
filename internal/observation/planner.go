@@ -207,21 +207,13 @@ func BuildPlans(in PlannerInput) ([]model.Plan, Allocation, error) {
 	if alloc.OptionalPlanID != "" && in.PreparationWall > 0 {
 		alloc.OptionalWallMilliseconds = (in.PreparationWall / 3).Milliseconds()
 	}
-	admitted := append(local, alloc.Admitted...)
+	admitted := append([]Candidate(nil), local...)
+	admitted = append(admitted, alloc.Admitted...)
 
 	// A deferred candidate with a retained prior run is still projected by
 	// explicit reuse; only a deferred candidate with nothing to reuse is a
 	// bare deferral.
-	var bareDeferred []Candidate
-	for _, c := range alloc.Deferred {
-		if c.ReuseRunID != "" {
-			c.Tier = model.TierReuse
-			c.Optional = false
-			reuse = append(reuse, c)
-			continue
-		}
-		bareDeferred = append(bareDeferred, c)
-	}
+	reuse, bareDeferred := splitDeferredCandidates(reuse, alloc.Deferred)
 	admitted = append(admitted, reuse...)
 	sortByTierThenKey(admitted)
 
@@ -470,4 +462,19 @@ func candidateToPlan(c Candidate) model.Plan {
 		p.MaxRequests = 0
 	}
 	return p
+}
+
+// splitDeferredCandidates preserves retained evidence for deferred reads.
+func splitDeferredCandidates(reuse, deferred []Candidate) ([]Candidate, []Candidate) {
+	var bareDeferred []Candidate
+	for _, c := range deferred {
+		if c.ReuseRunID != "" {
+			c.Tier = model.TierReuse
+			c.Optional = false
+			reuse = append(reuse, c)
+			continue
+		}
+		bareDeferred = append(bareDeferred, c)
+	}
+	return reuse, bareDeferred
 }
