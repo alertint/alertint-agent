@@ -168,6 +168,71 @@ func TestCall2FailureDegradesOnly(t *testing.T) {
 	}
 }
 
+// TestCapabilitySemanticProfileDrivesDegradedLikeVerificationRejudge proves
+// Plan 4 Task 8's own wiring: semantic_profile is reported and rolled up
+// (unlike memory_classifier/query_repair) but only into Degraded, never
+// Unavailable — a profile is advisory-only, so its own outage must not
+// declare the installation's core loop down.
+func TestCapabilitySemanticProfileDrivesDegradedLikeVerificationRejudge(t *testing.T) {
+	tr := newTrackerOnly(t)
+	tr.Begin(llmhealth.CapabilitySemanticProfile, "sig-1").Finish(context.DeadlineExceeded)
+	if s := tr.Snapshot(); s.State != llmhealth.StateDegraded || s.Reason != llmhealth.ReasonTimeout {
+		t.Fatalf("%+v", s)
+	}
+	tr.Begin(llmhealth.CapabilityMemoryClassifier, "sig-2").Finish(nil) // a classifier success never clears a primary failure.
+	if s := tr.Snapshot(); s.State != llmhealth.StateDegraded {
+		t.Fatalf("classifier success cleared a semantic_profile failure: %+v", s)
+	}
+	tr.Begin(llmhealth.CapabilitySemanticProfile, "sig-1").Finish(nil)
+	if s := tr.Snapshot(); s.State != llmhealth.StateHealthy {
+		t.Fatalf("%+v", s)
+	}
+}
+
+// TestCapabilitySemanticProfileParticipatesInSharedPrimaryRecovery proves
+// semantic_profile is a full shared-primary member in both directions: an
+// Assessment success clears its dependency failure, and its own success
+// clears an Assessment dependency failure.
+func TestCapabilitySemanticProfileParticipatesInSharedPrimaryRecovery(t *testing.T) {
+	tr := newTrackerOnly(t)
+	tr.Begin(llmhealth.CapabilitySemanticProfile, "sig-1").Finish(err503)
+	if s := tr.Snapshot(); s.State != llmhealth.StateDegraded {
+		t.Fatalf("after semantic_profile dependency failure: %+v", s)
+	}
+	tr.Begin(llmhealth.CapabilityAssessment, "").Finish(nil)
+	s := tr.Snapshot()
+	if s.State != llmhealth.StateHealthy {
+		t.Fatalf("an assessment success must clear a semantic_profile dependency failure: %+v", s)
+	}
+	if cs := capSnap(t, s, llmhealth.CapabilitySemanticProfile); !cs.Healthy {
+		t.Fatalf("semantic_profile must be healthy again: %+v", cs)
+	}
+
+	// Symmetric: a semantic_profile success clears an Assessment dependency failure.
+	tr.Begin(llmhealth.CapabilityAssessment, "").Finish(err503)
+	if s := tr.Snapshot(); s.State != llmhealth.StateUnavailable {
+		t.Fatalf("after assessment dependency failure: %+v", s)
+	}
+	tr.Begin(llmhealth.CapabilitySemanticProfile, "sig-2").Finish(nil)
+	if s := tr.Snapshot(); s.State != llmhealth.StateHealthy {
+		t.Fatalf("a semantic_profile success must clear an assessment dependency failure: %+v", s)
+	}
+}
+
+// TestCapabilitySemanticProfileProbeSuccessNeverClearsIt: plan.md's own
+// "a successful probe never clears inference failure".
+func TestCapabilitySemanticProfileProbeSuccessNeverClearsIt(t *testing.T) {
+	tr := newTrackerOnly(t)
+	tr.Begin(llmhealth.CapabilitySemanticProfile, "sig-1").Finish(err503)
+	if s := tr.Snapshot(); s.State != llmhealth.StateDegraded {
+		t.Fatalf("after semantic_profile failure: %+v", s)
+	}
+	tr.ObserveProbe(llm.ProbeResult{Outcome: llm.ProbeOK, Method: "GET", Path: "/health"})
+	if s := tr.Snapshot(); s.State != llmhealth.StateDegraded {
+		t.Fatalf("a probe success must not clear a real semantic_profile inference failure: %+v", s)
+	}
+}
+
 // TestSharedPrimarySuccessClearsDependencyFailuresAcrossCapabilities pins
 // the lab-F10 rule: the capabilities served by the shared primary client
 // (triage_draft, assessment, verification_rejudge, query_repair) recover

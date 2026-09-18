@@ -291,6 +291,18 @@ func (s *Server) handleGetSituation(ctx context.Context, req mcplib.CallToolRequ
 	if err != nil {
 		return errResult("failed to get situation history"), nil
 	}
+	// Plan 4 (review F23): the current preparation cycle's bounded
+	// projection — frozen plans, run outcomes, request ledger, profile
+	// versions/guidance — or an explicit null before any cycle exists.
+	prep, hasPrep, err := s.st.GetSituationPreparationView(ctx, sit.ID)
+	if err != nil {
+		return errResult("failed to get situation preparation state"), nil
+	}
+	if hasPrep {
+		payload["preparation"] = prep
+	} else {
+		payload["preparation"] = nil
+	}
 	if history.Episode == nil {
 		payload["episode"] = nil
 	} else {

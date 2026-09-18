@@ -178,6 +178,9 @@ func TestGetSituationByIDExactContract(t *testing.T) {
 		// R2: recorded after closure, never journaled — an empty array here,
 		// never null, for a Situation nothing was written against post-hoc.
 		"artifacts_recorded_after_closure",
+		// Plan 4 (review F23): the current preparation cycle's bounded
+		// projection — explicit null before any cycle exists.
+		"preparation",
 	}
 	if len(payload) != len(wantKeys) {
 		t.Fatalf("payload has %d keys, want exactly %d: %+v", len(payload), len(wantKeys), payload)

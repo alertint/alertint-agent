@@ -146,6 +146,15 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 		return situation.SnapshotInput{}, err
 	}
 
+	// Plan 4 Task 6: the current preparation cycle's durably reloaded state
+	// (Runs/Facts, frozen profile guidance, source lifecycle observations) —
+	// read fresh inside this SAME coherent transaction. See
+	// SnapshotInput.Prepared's own doc comment.
+	prepared, err := loadPreparedStateTx(ctx, tx, sit.ID, now)
+	if err != nil {
+		return situation.SnapshotInput{}, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return situation.SnapshotInput{}, fmt.Errorf("store: commit load reconciliation input: %w", err)
 	}
@@ -170,6 +179,7 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 		LastMainChannelPokeAt:       publication.lastMainChannelPokeAt,
 		PendingArtifacts:            artifacts,
 		DeliveredHistory:            deliveredHistory,
+		Prepared:                    prepared,
 	}, nil
 }
 
@@ -383,7 +393,8 @@ func loadSituationDeliveriesTx(ctx context.Context, tx *sql.Tx, situationID stri
 	rows, err := tx.QueryContext(ctx, `
 		SELECT ad.id, iad.incident_id, ad.alert_id, ad.status, ad.payload_digest,
 		       ad.source_started_at, ad.started_at_basis, ad.source_resolved_at, ad.resolved_at_basis, ad.received_at,
-		       ad.labels_json,
+		       ad.labels_json, ad.source, ad.source_episode_key, ad.source_signal_id, ad.source_signal_version,
+		       ad.acquisition_mode, ad.poll_interval_seconds,
                CASE WHEN json_type(ad.annotations_json, '$.summary') = 'text' AND trim(json_extract(ad.annotations_json, '$.summary')) <> ''
                     THEN substr(json_extract(ad.annotations_json, '$.summary'), 1, 501)
                     WHEN json_type(ad.annotations_json, '$.description') = 'text'
@@ -402,10 +413,18 @@ func loadSituationDeliveriesTx(ctx context.Context, tx *sql.Tx, situationID stri
 	for rows.Next() {
 		var d situation.Delivery
 		var status, startedBasis, resolvedBasis, receivedAtStr, labelsJSON string
-		var sourceStarted, sourceResolved sql.NullString
+		var sourceStarted, sourceResolved, signalID, signalVersion sql.NullString
 		if err := rows.Scan(&d.ID, &d.IncidentID, &d.AlertID, &status, &d.PayloadDigest,
-			&sourceStarted, &startedBasis, &sourceResolved, &resolvedBasis, &receivedAtStr, &labelsJSON, &d.SourceSummary); err != nil {
+			&sourceStarted, &startedBasis, &sourceResolved, &resolvedBasis, &receivedAtStr,
+			&labelsJSON, &d.Source, &d.EpisodeKey, &signalID, &signalVersion,
+			&d.AcquisitionMode, &d.PollIntervalSeconds, &d.SourceSummary); err != nil {
 			return nil, fmt.Errorf("store: scan situation delivery: %w", err)
+		}
+		if signalID.Valid {
+			d.SourceSignalID = &signalID.String
+		}
+		if signalVersion.Valid {
+			d.SourceSignalVersion = &signalVersion.String
 		}
 		d.Status = situationmodel.DeliveryStatus(status)
 		d.StartedAtBasis = situationmodel.SourceTimeBasis(startedBasis)
@@ -946,6 +965,12 @@ func (s *Store) RecordAssessmentCall(ctx context.Context, claim situation.Claim,
 		return err
 	}
 	if err := insertAssessmentCallTx(ctx, tx, call); err != nil {
+		return err
+	}
+	// Review F7: a dispatched attempt (even one later rejected) protects
+	// its complete evidence basis permanently, in the same transaction that
+	// consumes the dispatch slot.
+	if err := insertPermanentObservationReferencesTx(ctx, tx, call.PreparationCycleID, ObservationReferenceAssessmentAttempt, call.ID, call.DispatchedAt); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -2176,6 +2201,40 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 	// may point at already exists.
 	if err := supersedeObsoleteAssuranceTx(ctx, tx, claim.Situation.ID, commit.History); err != nil {
 		return err
+	}
+
+	// 8. Plan 4 Task 2: seal this cycle's preparation (if any) in the SAME
+	// fenced transaction, even for a reuse/fallback/schedule-only commit —
+	// spec.md's "CommitController seals the cycle and advances its
+	// generation in the existing authoritative transaction." A commit with
+	// no preparation cycle (PreparationCycleID == "") is a no-op here.
+	if err := sealPreparationCycleTx(ctx, tx, claim.Situation.ID, commit.PreparationCycleID, canonicalCommitTime(commit)); err != nil {
+		return err
+	}
+
+	// 9. Review F7 (ADR-0051): the decision evidence basis is protected
+	// permanently in this same transaction — a new authoritative attempt,
+	// a lifecycle change, and every Transition each pin the cycle's runs.
+	if commit.PreparationCycleID != "" {
+		commitTime := canonicalCommitTime(commit)
+		if newAssessmentID.Valid {
+			if err := insertPermanentObservationReferencesTx(ctx, tx, commit.PreparationCycleID, ObservationReferenceAssessmentAttempt, newAssessmentID.String, commitTime); err != nil {
+				return err
+			}
+		}
+		if current.Lifecycle != commit.Lifecycle {
+			owner := fmt.Sprintf("%s:v%d:%s", claim.Situation.ID, claim.Situation.InputVersion, commit.Lifecycle)
+			if err := insertPermanentObservationReferencesTx(ctx, tx, commit.PreparationCycleID, ObservationReferenceLifecycleDecision, owner, commitTime); err != nil {
+				return err
+			}
+		}
+		if commit.History != nil {
+			for _, tr := range commit.History.Transitions {
+				if err := insertPermanentObservationReferencesTx(ctx, tx, commit.PreparationCycleID, ObservationReferenceTransition, tr.ID, commitTime); err != nil {
+					return err
+				}
+			}
+		}
 	}
 
 	if err := tx.Commit(); err != nil {

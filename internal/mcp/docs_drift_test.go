@@ -75,6 +75,12 @@ func TestDriftGate_ToolsDocumented(t *testing.T) {
 	addTool(t16.Name)
 	t17, _ := s.toolGetDeliveryState()
 	addTool(t17.Name)
+	t18, _ := s.toolListObservationRuns()
+	addTool(t18.Name)
+	t19, _ := s.toolGetSemanticProfile()
+	addTool(t19.Name)
+	t20, _ := s.toolCorrectSemanticProfile()
+	addTool(t20.Name)
 
 	documented := documentedToolNames(t)
 

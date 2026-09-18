@@ -96,6 +96,19 @@ logs:
   #     service: app
   #     instance: ""
 
+# Proactive Situation preparation / advisory semantic profiles: bounded
+# read-only evidence gathering plus a durable advisory-inference worker.
+# Optional — the values below are the shipped defaults.
+situations:
+  preparation:
+    max_source_calls_per_cycle: 6
+    max_wall_seconds: 20
+    refresh_seconds: 300
+  semantic_profiles:
+    workers: 1
+    max_attempts: 3
+    attempt_wall_seconds: 30
+
 log_level: info
 # Log output format: auto | console | json.
 #   console — human-readable, colorized lines (this is what CLICOLOR_FORCE in

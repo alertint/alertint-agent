@@ -3,6 +3,7 @@
 package situation
 
 import (
+	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
 	"sort"
 	"time"
 
@@ -96,6 +97,7 @@ type SnapshotInput struct {
 	// transaction so ReplyEligible can never combine it with a stale
 	// Transition/summary snapshot. Forwarded unchanged into
 	// PublicationInput.DeliveredHistory by buildHistory.
+	Prepared         PreparedState
 	DeliveredHistory DeliveredHistory
 }
 
@@ -182,6 +184,39 @@ type Delivery struct {
 
 	// SourceSummary is an immutable source annotation, for presentation only.
 	SourceSummary string
+	// ---------------------------------------------------------------
+	// Plan 4 Task 6: immutable source identity and acquisition metadata,
+	// already stored on alert_deliveries by migration 0013 (ADR-0040) but
+	// never threaded through this pure package until now. Source lifecycle
+	// grace/deadline computation must use AcquisitionMode + the real
+	// PollIntervalSeconds, never StartedAtBasis/ResolvedAtBasis alone
+	// (spec.md R13 — a source API timestamp does not itself mean the
+	// receiver was a polling one).
+	// ---------------------------------------------------------------
+
+	// Source is the delivery's originating adapter name (e.g.
+	// "alertmanager", "zabbix") — alert_deliveries.source.
+	Source string
+	// EpisodeKey is the immutable alert_deliveries.source_episode_key this
+	// delivery belongs to.
+	EpisodeKey string
+	// SourceSignalID and SourceSignalVersion are the source adapter's own
+	// proven signal identity/version (alert_deliveries.source_signal_id/
+	// source_signal_version) — both independently possibly absent; never
+	// filled from a hash of the alert name or any other invented value.
+	SourceSignalID      *string
+	SourceSignalVersion *string
+	// AcquisitionMode and PollIntervalSeconds are this delivery's own
+	// proven acquisition mode ("webhook"|"poll") and, for poll, its real
+	// configured interval — alert_deliveries.acquisition_mode/
+	// poll_interval_seconds.
+	AcquisitionMode     string
+	PollIntervalSeconds int
+	// Labels is the delivery's immutable, already-decoded label set —
+	// needed to build a deterministic evidence Scope for this member
+	// without this pure package ever parsing labels_json itself (the store
+	// layer decodes it once, same convention as AlertID/Severity/Drill
+	// above).
 }
 
 // TriageState is Acute Triage's durable per-Incident state, as far as this
@@ -399,6 +434,18 @@ type Snapshot struct {
 	PriorAssessment     *model.Assessment
 	MaterialFactHash    string
 	AssessmentBasisHash string
+
+	// PreparationCycleID names the frozen preparation cycle this Snapshot
+	// was built from ("" when none): dispatch pins that basis permanently.
+	PreparationCycleID string
+	// Observations are the bounded, normalized connector facts of the
+	// current preparation cycle (Plan 4 review F2) — a separate collection
+	// from the closed Plan 2 store Facts above; CapabilityResults is the
+	// per-run result catalog, and Deferred lists the capability:subject
+	// reads this cycle could not admit.
+	Observations      []observationmodel.Fact
+	CapabilityResults []CapabilityResult
+	Deferred          []string
 }
 
 // Duration classes. Boundaries are half-open on the low end: subminute
@@ -557,6 +604,7 @@ func BuildSnapshot(in SnapshotInput) Snapshot {
 	eligible := EligibleReasons(in, symptoms, class)
 	materialHash := MaterialFactHash(in, symptoms, class)
 	basisHash := AssessmentBasisHash(in, materialHash, eligible)
+	observations, results := ProjectObservations(in.Prepared, in.Prepared.PlansByID, in.Now)
 
 	return Snapshot{
 		SituationID:         in.Situation.ID,
@@ -571,6 +619,10 @@ func BuildSnapshot(in SnapshotInput) Snapshot {
 		PriorAssessment:     priorAssessment(in.CurrentAssessment),
 		MaterialFactHash:    materialHash,
 		AssessmentBasisHash: basisHash,
+		PreparationCycleID:  in.Prepared.CycleID,
+		Observations:        observations,
+		CapabilityResults:   results,
+		Deferred:            in.Prepared.Deferred,
 	}
 }
 

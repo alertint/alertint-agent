@@ -447,6 +447,7 @@ func (t *Tracker) markCapabilityHealthy(capability Capability, now time.Time) {
 // failure (spec: "probe success cannot erase a real inference failure").
 var sharedPrimaryCapabilities = []Capability{
 	CapabilityTriageDraft, CapabilityAssessment, CapabilityVerificationRejudge, CapabilityQueryRepair,
+	CapabilitySemanticProfile,
 }
 
 func isSharedPrimaryCapability(capability Capability) bool {
@@ -553,21 +554,29 @@ func (t *Tracker) recordContentFailure(capability Capability, subject string, re
 
 // aggregate computes the rolled-up state and the reason/detail of the first
 // unhealthy capability in priority order — triage_draft, assessment, and
-// probe drive unavailable, verification_rejudge alone drives degraded, and
-// this order coincides exactly with the priority the state itself implies.
-// triage_draft and assessment are treated as peers (spec.md: "LLM health
-// remains one installation-level capability state fed by real Acute Triage
-// and Assessment outcomes") — both are primary, first-class model
-// capabilities the product's core loop depends on (Acute Triage judges
-// Incidents, the Situation controller's L2 dispatch judges Situations), so
-// either one failing means the installation is genuinely unavailable, not
-// merely degraded. memory_classifier and query_repair are reported per
+// probe drive unavailable, verification_rejudge and semantic_profile alone
+// drive degraded, and this order coincides exactly with the priority the
+// state itself implies. triage_draft and assessment are treated as peers
+// (spec.md: "LLM health remains one installation-level capability state fed
+// by real Acute Triage and Assessment outcomes") — both are primary,
+// first-class model capabilities the product's core loop depends on (Acute
+// Triage judges Incidents, the Situation controller's L2 dispatch judges
+// Situations), so either one failing means the installation is genuinely
+// unavailable, not merely degraded. semantic_profile is a real,
+// regularly-succeeding shared-primary capability (unlike query_repair's
+// opportunistic-only successes) but is advisory-only (Plan 4: it never
+// gates or blocks Situation lifecycle), so it gets verification_rejudge's
+// own treatment — reported and rolled up, but only into Degraded, never
+// Unavailable. memory_classifier and query_repair are reported per
 // capability only: a repair success happens only when the model proposes
 // invalid PromQL, so no normal-path success could ever clear a repair
 // failure — driving the aggregate from it would leave the installation
 // degraded indefinitely.
 func (t *Tracker) aggregate() (State, string, string) {
-	order := []Capability{CapabilityTriageDraft, CapabilityAssessment, CapabilityProbe, CapabilityVerificationRejudge}
+	order := []Capability{
+		CapabilityTriageDraft, CapabilityAssessment, CapabilityProbe,
+		CapabilityVerificationRejudge, CapabilitySemanticProfile,
+	}
 	for _, capability := range order {
 		c, ok := t.caps[capability]
 		if !ok || c.Healthy {

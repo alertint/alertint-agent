@@ -42,6 +42,10 @@ var migrationsFS embed.FS
 // Store is the agent's persistence handle.
 type Store struct {
 	db *sql.DB
+
+	// semanticProfileMaxAttempts is Plan 4 Task 7's own injected config
+	// value — see SetSemanticProfileMaxAttempts.
+	semanticProfileMaxAttempts int
 }
 
 // Open opens (or creates) a SQLite database at path and applies all

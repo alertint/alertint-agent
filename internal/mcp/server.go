@@ -118,6 +118,16 @@ func NewServer(cfg Config, st *store.Store, auditor *audit.Auditor) *Server {
 	// rather than erroring.
 	ms.AddTool(s.toolListSituationTransitions())
 	ms.AddTool(s.toolGetDeliveryState())
+	// Plan 4 Task 9: bounded evidence-preparation/semantic-profile views.
+	// Always registered alongside the Situation tools above — preparation/
+	// profile state exists (possibly empty) regardless of which source
+	// connectors are configured, so there is no connector to gate these on
+	// either. alertint_correct_semantic_profile is this plan's only new
+	// write path — additive and audit-chained, exactly like the two
+	// server_feedback.go write tools.
+	ms.AddTool(s.toolListObservationRuns())
+	ms.AddTool(s.toolGetSemanticProfile())
+	ms.AddTool(s.toolCorrectSemanticProfile())
 
 	// Log passthrough tool, registered only when a log source is configured.
 	// Named after the active backend (loki_query_range) so multiple sources can

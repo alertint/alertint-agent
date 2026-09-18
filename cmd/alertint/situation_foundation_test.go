@@ -221,6 +221,89 @@ func TestFoundationSequenceControllerRecoveryErrorPreventsReceiversStarting(t *t
 	assertTrace(t, tr.snapshot(), want)
 }
 
+// TestFoundationSequenceOrdersPreparationPhase proves Plan 4 Task 9's own
+// two additional optional phases sit exactly where their doc comments
+// claim: preparation recovery after controller recovery and before
+// notification recovery, preparation worker start after the controller/
+// Triage workers and before notification workers.
+func TestFoundationSequenceOrdersPreparationPhase(t *testing.T) {
+	tr := &tracer{}
+	seq := tracedFoundationSequence(tr)
+	seq.recoverPreparationWork = func(context.Context) error {
+		tr.add("recover_preparation_work")
+		return nil
+	}
+	seq.startPreparationWorkers = func(context.Context) {
+		tr.add("start_preparation_workers")
+	}
+
+	if err := seq.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	want := []string{
+		"recover_leases", "drain_deliveries", "drain_inputs", "reconstruct_incidents",
+		"triage_migration_backfill", "recover_interrupted_assessment_calls",
+		"recover_interrupted_triage_attempts", "enforce_triage_startup_horizon",
+		"recover_preparation_work",
+		"recover_notification_claims", "schedule_situations_missing_first_transition",
+		"validate_slack_configuration", "reactivate_configuration_blocked",
+		"supersede_stale_roots_and_resume_replay",
+		"start_correlator", "start_input_worker", "start_dispatch_worker",
+		"start_controller_worker", "start_triage_worker",
+		"start_preparation_workers",
+		"start_notification_worker", "start_transition_stream_worker",
+		"start_receivers",
+	}
+	assertTrace(t, tr.snapshot(), want)
+}
+
+// TestFoundationStopSequenceOrdersPreparationPhase mirrors the shutdown
+// side: preparation work joins the drain loop, and preparation workers stop
+// right after the controller/Triage workers, before the foundation's own
+// dispatch/input workers.
+func TestFoundationStopSequenceOrdersPreparationPhase(t *testing.T) {
+	tr := &tracer{}
+	seq := foundationStopSequence{
+		stopReceivers:  func() error { tr.add("stop_receivers"); return nil },
+		stopCorrelator: func() { tr.add("stop_correlator") },
+		drainFoundationWork: func(context.Context) (int, error) {
+			tr.add("drain_foundation_work")
+			return 0, nil
+		},
+		drainControllerWork: func(context.Context) (int, error) {
+			tr.add("drain_controller_work")
+			return 0, nil
+		},
+		drainPreparationWork: func(context.Context) (int, error) {
+			tr.add("drain_preparation_work")
+			return 0, nil
+		},
+		stopControllerWorkers: func(context.Context) error {
+			tr.add("stop_controller_worker")
+			return nil
+		},
+		stopPreparationWorkers: func(context.Context) error {
+			tr.add("stop_preparation_workers")
+			return nil
+		},
+		stopWorkers: func(context.Context) error {
+			tr.add("stop_dispatch_worker")
+			return nil
+		},
+	}
+
+	if err := seq.run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	want := []string{
+		"stop_receivers", "stop_correlator",
+		"drain_foundation_work", "drain_controller_work", "drain_preparation_work",
+		"stop_controller_worker", "stop_preparation_workers", "stop_dispatch_worker",
+	}
+	assertTrace(t, tr.snapshot(), want)
+}
+
 // ----------------------------------------------------------------------
 // foundationStopSequence: shutdown ordering
 // ----------------------------------------------------------------------
