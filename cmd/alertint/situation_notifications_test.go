@@ -185,6 +185,13 @@ type fakeDelivererStore struct {
 
 	history    situation.DeliveredHistory
 	historyErr error
+
+	judgment    *store.SituationJudgmentView
+	judgmentErr error
+}
+
+func (f *fakeDelivererStore) GetCurrentSituationJudgment(context.Context, string, time.Time) (*store.SituationJudgmentView, error) {
+	return f.judgment, f.judgmentErr
 }
 
 // GetCommunicatedHistory is B5's delivery-time read of what the operator
@@ -379,6 +386,36 @@ func TestSituationDelivererRootSyncRejectsStaleSummaryVersion(t *testing.T) {
 	}
 }
 
+func TestSituationDelivererRootSyncRejectsRetiredExpectedAuthority(t *testing.T) {
+	started := sdMustTime(t, "2026-09-05T09:00:00Z")
+	now := sdMustTime(t, "2026-09-05T10:00:00Z")
+	deadline := now.Add(time.Hour)
+	contract := sdRunningTriageContract(deadline)
+	briefing := &model.OperatorBriefing{Scope: "db-prod-1", Work: model.WorkProjection{Phase: model.WorkPhaseSettled}}
+	briefing.ExpectedJudgment = &model.ExpectedJudgmentProjection{Revision: 4, AssertedOperator: "Janis", ValidUntil: deadline}
+	tr := sdTransition(4, model.LifecycleActive, contract, model.ReasonOperatorContractChanged,
+		model.JournalOperatorContractChanged, model.JournalData{Headline: "Expected", OccurredAt: started},
+		model.ProjectionFacts{Briefing: briefing, EffectiveStartedAt: started, EffectiveStartedAtBasis: model.SourceTimeBasisSourcePayload}, now)
+	summary := sdSummary(4, contract, started, now)
+	summary.Briefing = briefing
+	fs := &fakeDelivererStore{
+		episode: store.SituationEpisodeView{Summary: summary, SourceTransition: tr},
+		judgment: &store.SituationJudgmentView{
+			Judgment:      model.SituationJudgment{Revision: 4},
+			Applicability: model.JudgmentApplicability{Reason: model.JudgmentExpired},
+		},
+	}
+	api := &fakeSlackAPI{}
+	d := NewSituationDeliverer(fs, api, "C-default", func() time.Time { return now })
+
+	if _, err := d.Deliver(context.Background(), sdRootSyncIntent(tr.ID, 4, &deadline, now)); err == nil {
+		t.Fatal("Deliver() error = nil, want retired expected authority rejected")
+	}
+	if len(api.posts)+len(api.updates) != 0 {
+		t.Fatal("retired expected authority reached Slack")
+	}
+}
+
 // ----------------------------------------------------------------------
 // thread_append
 // ----------------------------------------------------------------------
@@ -417,6 +454,30 @@ func TestSituationDelivererThreadAppendPostsUnderRoot(t *testing.T) {
 	}
 	if !strings.Contains(api.posts[0].Text, "AlertINT investigation started") {
 		t.Fatalf("posted text = %q, want the Transition's own headline", api.posts[0].Text)
+	}
+}
+
+func TestSituationDelivererDelayedExpectedThreadMarksDecisionInactive(t *testing.T) {
+	occurred := sdMustTime(t, "2026-09-05T09:15:00Z")
+	now := occurred.Add(time.Hour)
+	until := occurred.Add(30 * time.Minute)
+	briefing := &model.OperatorBriefing{Scope: "db-prod-1", ExpectedJudgment: &model.ExpectedJudgmentProjection{Revision: 1, AssertedOperator: "Janis", ValidUntil: until}}
+	tr := sdTransition(5, model.LifecycleActive, sdRunningTriageContract(now.Add(time.Hour)),
+		model.ReasonOperatorContractChanged, model.JournalOperatorContractChanged,
+		model.JournalData{Headline: "Expected", AttributedActor: "Janis", JudgmentChange: model.JudgmentChangeRecorded, JudgmentValidUntil: &until, OccurredAt: occurred},
+		model.ProjectionFacts{Briefing: briefing, EffectiveStartedAt: occurred, EffectiveStartedAtBasis: model.SourceTimeBasisSourcePayload}, occurred)
+	fs := &fakeDelivererStore{
+		transitions: map[string]model.Transition{tr.ID: tr}, rootOK: true, rootChannel: "C-existing", rootTS: "50.5",
+		judgment: &store.SituationJudgmentView{Judgment: model.SituationJudgment{Revision: 1}, Applicability: model.JudgmentApplicability{Reason: model.JudgmentExpired}},
+	}
+	api := &fakeSlackAPI{postResult: slack.MessageResult{Channel: "C-existing", TS: "60.6"}}
+	d := NewSituationDeliverer(fs, api, "C-default", func() time.Time { return now })
+
+	if _, err := d.Deliver(context.Background(), sdThreadIntent(model.EffectThreadAppend, tr.ID, tr.Sequence, now)); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.posts) != 1 || !strings.Contains(api.posts[0].Text, "This decision is no longer active.") {
+		t.Fatalf("delayed thread = %#v", api.posts)
 	}
 }
 

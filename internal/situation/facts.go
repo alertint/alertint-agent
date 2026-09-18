@@ -49,7 +49,9 @@ const (
 	// time, run ID, generation, or reservation count).
 	// Bumped to 4 for static capability limitations, then 5 for the coherent
 	// retained evidence view and explicit run outcome/coverage materiality.
-	materialFactHashSchemaVersion = 6
+	// Bumped to 7 when episode judgments became available and the former
+	// operator_judgment_unavailable limitation left the material fact set.
+	materialFactHashSchemaVersion = 7
 
 	// assessmentBasisHashSchemaVersion is bumped to 3 (Task 5): the carried-
 	// forward InputVersion-instability bug documented on
@@ -60,8 +62,9 @@ const (
 	// Bumped again to 4 (Plan 4 Task 6): embeds the new
 	// materialFactHashSchemaVersion-3 MaterialFactHash output plus the
 	// bumped assessmentValidatorVersion.
-	// Bumped to 6 to embed the coherent evidence hash schema version 5.
-	assessmentBasisHashSchemaVersion = 7
+	// Bumped to 6 to embed the coherent evidence hash schema version 5, and
+	// to 8 to embed material-fact schema 7.
+	assessmentBasisHashSchemaVersion = 8
 
 	// assessmentValidatorVersion tracks ValidateAssessmentProposal's rule
 	// set. Bumped to 2 (Plan 4 Task 6): reservedUnsupportedCapabilities
@@ -103,9 +106,9 @@ const capabilityLimitationSubject = "plan2"
 // logs, Sentry, Zabbix history, changes, and store_read are now real Plan 4
 // fact producers with dynamic per-cycle capability_result facts (Task 6
 // integration) — they are never blanket-"unavailable" limitations a model
-// may cite anymore. Only what remains genuinely unreachable until Plan 5
-// stays in this closed set: semantic-profile binding/correction authority,
-// Signal bindings, expected-behaviour envelopes, and operator judgments. It
+// may cite anymore. Only what remains outside this MVP stays in this closed
+// set: semantic-profile binding/correction authority, Signal bindings, and
+// reusable expected-behaviour envelopes. It
 // is controller/configuration state, not input-derived, so it is the same
 // for every Situation in this build — a package var (not const) only so
 // tests can prove MaterialFactHash actually threads it through; production
@@ -114,7 +117,6 @@ var reservedUnsupportedCapabilities = []model.Limitation{
 	{Code: "semantic_profile_unavailable", Detail: "Semantic profile binding/correction authority is not available until Plan 5."},
 	{Code: "signal_binding_unavailable", Detail: "Signal bindings are not available until Plan 5."},
 	{Code: "envelope_unavailable", Detail: "Expected-behaviour envelopes are not available until Plan 5."},
-	{Code: "operator_judgment_unavailable", Detail: "Operator judgments are not available until Plan 5."},
 }
 
 // DeriveStoreFacts reduces in into the closed set of Plan 2 fact kinds:

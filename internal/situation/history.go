@@ -80,12 +80,14 @@ type AuthoritativeChange struct {
 	EvidenceRefs     []string
 	// Incidents is Plan 2's per-Incident state including IncidentState.Triage
 	// (R7); TriageDecisions is this cycle's Plan 2 request/skip decisions.
-	Incidents         []IncidentState
-	TriageDecisions   []TriageDecision
-	RecurrenceCount   int
-	OperatorArtifacts []OperatorArtifactInput // R1: every applied-and-unjournaled artifact, in order
-	Drill             bool
-	Now               time.Time
+	Incidents                   []IncidentState
+	TriageDecisions             []TriageDecision
+	RecurrenceCount             int
+	OperatorArtifacts           []OperatorArtifactInput // R1: every applied-and-unjournaled artifact, in order
+	Drill                       bool
+	Now                         time.Time
+	Judgment                    *model.SituationJudgment
+	JudgmentApplicabilityReason model.JudgmentApplicabilityReason
 }
 
 // OperatorArtifactInput is one applied-and-unjournaled durable operator
@@ -150,7 +152,7 @@ func BuildTransitions(change AuthoritativeChange) ([]model.Transition, error) {
 		return nil, err
 	}
 
-	out := make([]model.Transition, 0, len(change.OperatorArtifacts)+1)
+	out := make([]model.Transition, 0, len(change.OperatorArtifacts)+2)
 	base := 0
 	if change.PriorTransition != nil {
 		base = change.PriorTransition.Sequence
@@ -166,6 +168,11 @@ func BuildTransitions(change AuthoritativeChange) ([]model.Transition, error) {
 
 	if reason, material := selectControllerReason(change); material {
 		out = append(out, controllerTransition(change, reason, base+1+len(out)))
+		if reason != model.ReasonOperatorContractChanged {
+			if _, _, changed := expectedJudgmentJournal(change); changed {
+				out = append(out, judgmentTransition(change, base+1+len(out)))
+			}
+		}
 	}
 
 	for i := range out {
@@ -312,6 +319,23 @@ func controllerTransition(change AuthoritativeChange, reason model.TransitionRea
 		OccurredAt:      change.Now,
 	}, controllerEvidenceRefs(change))
 	tr.Actor = controllerActor(change, reason)
+	if journal, actor, ok := expectedJudgmentJournal(change); ok && reason == model.ReasonOperatorContractChanged {
+		tr.Journal = journal
+		tr.Actor = actor
+	}
+	tr.Projection.OperatorDelta = buildOperatorDelta(change.PriorTransition, tr)
+	if class := ClassifyPoke(change.PriorTransition, tr); class != PokeNone {
+		priority := DeriveInterruptionPriority(tr)
+		tr.InterruptionPriority = &priority
+	}
+	return tr
+}
+
+func judgmentTransition(change AuthoritativeChange, sequence int) model.Transition {
+	journal, actor, _ := expectedJudgmentJournal(change)
+	tr := newTransition(change, sequence, model.ReasonOperatorContractChanged, "",
+		model.JournalOperatorContractChanged, journal, controllerEvidenceRefs(change))
+	tr.Actor = actor
 	tr.Projection.OperatorDelta = buildOperatorDelta(change.PriorTransition, tr)
 	if class := ClassifyPoke(change.PriorTransition, tr); class != PokeNone {
 		priority := DeriveInterruptionPriority(tr)
@@ -579,6 +603,7 @@ func selectControllerReason(change AuthoritativeChange) (model.TransitionReason,
 	current := currentTuple(change)
 	previous := priorTuple(change)
 	triage := triageStateChanged(change)
+	judgmentChanged := expectedJudgmentProjectionChanged(prior.Projection.Briefing, change.Projection.Briefing)
 	if canonicalDigest(current) == canonicalDigest(previous) && !triage && !operatorBriefingChanged(prior.Projection.Briefing, change.Projection.Briefing) {
 		return "", false
 	}
@@ -603,6 +628,8 @@ func selectControllerReason(change AuthoritativeChange) (model.TransitionReason,
 		return model.ReasonInvestigationStarted, true
 	case current.Attention != previous.Attention:
 		return model.ReasonAttentionChanged, true
+	case judgmentChanged:
+		return model.ReasonOperatorContractChanged, true
 	case current.Contract != previous.Contract:
 		return model.ReasonOperatorContractChanged, true
 	case current.RecurrenceMilestone != previous.RecurrenceMilestone:
@@ -613,6 +640,62 @@ func selectControllerReason(change AuthoritativeChange) (model.TransitionReason,
 		// Whatever is left in the tuple is the Assessment's own conclusion.
 		return model.ReasonMaterialAssessmentChanged, true
 	}
+}
+
+func expectedJudgmentProjectionChanged(prior, current *model.OperatorBriefing) bool {
+	var a, b *model.ExpectedJudgmentProjection
+	if prior != nil {
+		a = prior.ExpectedJudgment
+	}
+	if current != nil {
+		b = current.ExpectedJudgment
+	}
+	return canonicalDigest(a) != canonicalDigest(b)
+}
+
+func expectedJudgmentJournal(change AuthoritativeChange) (model.JournalData, model.TransitionActor, bool) {
+	if change.PriorTransition == nil || !expectedJudgmentProjectionChanged(change.PriorTransition.Projection.Briefing, change.Projection.Briefing) {
+		return model.JournalData{}, "", false
+	}
+	var prior, current *model.ExpectedJudgmentProjection
+	if change.PriorTransition.Projection.Briefing != nil {
+		prior = change.PriorTransition.Projection.Briefing.ExpectedJudgment
+	}
+	if change.Projection.Briefing != nil {
+		current = change.Projection.Briefing.ExpectedJudgment
+	}
+	j := model.JournalData{OccurredAt: change.Now, ActionStatus: contractActionStatus(change.Assessment.ActionContract)}
+	actor := model.ActorDeterministicController
+	if current != nil {
+		j.JudgmentValidUntil = &current.ValidUntil
+		j.AttributedActor = current.AssertedOperator
+		actor = model.ActorAttributedOperator
+		switch {
+		case change.Judgment != nil && change.Judgment.Operation == model.JudgmentOperationReplace:
+			j.JudgmentChange, j.Headline = model.JudgmentChangeReplaced, "Expected condition updated"
+		case change.Judgment != nil && change.Judgment.Operation == model.JudgmentOperationRestore:
+			j.JudgmentChange, j.Headline = model.JudgmentChangeRestored, "Expected condition restored"
+		default:
+			j.JudgmentChange, j.Headline = model.JudgmentChangeRecorded, "Current condition marked expected"
+		}
+		j.Detail = "Monitoring continues."
+		return j, actor, true
+	}
+	if prior != nil {
+		j.JudgmentValidUntil = &prior.ValidUntil
+	}
+	if prior != nil && change.Judgment != nil && change.Judgment.Operation == model.JudgmentOperationRevoke && change.Judgment.Revision > prior.Revision {
+		j.JudgmentChange, j.Headline = model.JudgmentChangeRevoked, "Expectedness withdrawn"
+		j.AttributedActor = change.Judgment.AssertedOperator
+		j.JudgmentValidUntil = nil
+		actor = model.ActorAttributedOperator
+	} else if change.JudgmentApplicabilityReason == model.JudgmentExpired {
+		j.JudgmentChange, j.Headline = model.JudgmentChangeExpired, "Expectedness expired"
+	} else {
+		j.JudgmentChange, j.Headline = model.JudgmentChangeInvalidated, "Expectedness no longer applies"
+	}
+	j.Detail = "Normal assessment resumes."
+	return j, actor, true
 }
 
 // investigationCurrent reports whether the Operator contract currently

@@ -309,6 +309,20 @@ func (s *Server) handleGetSituation(ctx context.Context, req mcplib.CallToolRequ
 		payload["episode"] = history.Episode
 	}
 	payload["slack_delivery"] = history.Delivery
+	judgment, err := s.st.GetCurrentSituationJudgment(ctx, sit.ID, s.currentTime())
+	if err != nil {
+		return errResult("failed to get situation judgment"), nil
+	}
+	payload["judgment_version"] = 0
+	payload["active_judgment"] = nil
+	payload["judgment_applicability"] = nil
+	if judgment != nil {
+		payload["judgment_version"] = judgment.Judgment.Revision
+		payload["judgment_applicability"] = judgment.Applicability
+		if judgment.Applicability.Applicable {
+			payload["active_judgment"] = judgment.Judgment
+		}
+	}
 	// R2: recorded after closure, never journaled, never lost. An empty
 	// array, never null — "none" is an answer, not an absence.
 	payload["artifacts_recorded_after_closure"] = history.Artifacts

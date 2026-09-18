@@ -30,6 +30,11 @@ type SnapshotInput struct {
 	PriorSituations   []CompletedSituation
 	CurrentAssessment *AuthoritativeAssessment
 	Now               time.Time
+	// Judgment is the current immutable head, if any. Applicability is
+	// evaluated against this same coherent input and Now; expired/revoked
+	// heads remain history but carry no current authority.
+	Judgment              *model.SituationJudgment
+	JudgmentApplicability model.JudgmentApplicability
 
 	// ControllerParked is the Situation's current controller_parked_at/
 	// controller_parked_reason projection, plus the material fact hash the

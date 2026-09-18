@@ -345,6 +345,9 @@ func renderCanonicalRoot(in SituationRootInput) RenderedMessage {
 	} else if finding != "" {
 		lines = append(lines, canonicalFindingLine(finding, t.Lifecycle != model.LifecycleActive))
 	}
+	if j := b.ExpectedJudgment; j != nil {
+		lines = append(lines, "*Operator:* Expected until "+SlackDateToken(j.ValidUntil, "{time}")+" · "+briefingText(j.AssertedOperator, 120))
+	}
 
 	if !t.Lifecycle.Terminal() {
 		activity := canonicalNext(t, b, in.Now)

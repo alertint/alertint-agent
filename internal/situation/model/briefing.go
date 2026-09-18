@@ -229,26 +229,27 @@ type SourceCheck struct {
 // OperatorBriefing travels only through the immutable publication projection.
 // A nil briefing on old projections preserves their legacy replay behavior.
 type OperatorBriefing struct {
-	Flow              *OperatorFlow      `json:"flow,omitempty"`
-	BlockedReason     string             `json:"blocked_reason,omitempty"`
-	AssessmentRetryAt *time.Time         `json:"assessment_retry_at,omitempty"`
-	Scope             string             `json:"scope"`
-	DisplayScope      string             `json:"display_scope,omitempty"`
-	Alerts            []BriefingAlert    `json:"alerts,omitempty"`
-	AlertsOmitted     int                `json:"alerts_omitted,omitempty"`
-	RetryAt           *time.Time         `json:"retry_at,omitempty"`
-	Symptoms          []string           `json:"symptoms,omitempty"`
-	Firing            int                `json:"firing"`
-	Resolved          int                `json:"resolved"`
-	Unknown           int                `json:"unknown"`
-	Total             int                `json:"total"`
-	Critical          int                `json:"critical"`
-	AnalysisCount     int                `json:"analysis_count"`
-	Failed            int                `json:"failed"`
-	Pending           int                `json:"pending"`
-	Unavailable       int                `json:"unavailable,omitempty"`
-	Analyses          []IncidentAnalysis `json:"analyses,omitempty"`
-	Historical        bool               `json:"historical,omitempty"`
+	Flow              *OperatorFlow               `json:"flow,omitempty"`
+	BlockedReason     string                      `json:"blocked_reason,omitempty"`
+	AssessmentRetryAt *time.Time                  `json:"assessment_retry_at,omitempty"`
+	Scope             string                      `json:"scope"`
+	DisplayScope      string                      `json:"display_scope,omitempty"`
+	Alerts            []BriefingAlert             `json:"alerts,omitempty"`
+	AlertsOmitted     int                         `json:"alerts_omitted,omitempty"`
+	RetryAt           *time.Time                  `json:"retry_at,omitempty"`
+	Symptoms          []string                    `json:"symptoms,omitempty"`
+	Firing            int                         `json:"firing"`
+	Resolved          int                         `json:"resolved"`
+	Unknown           int                         `json:"unknown"`
+	Total             int                         `json:"total"`
+	Critical          int                         `json:"critical"`
+	AnalysisCount     int                         `json:"analysis_count"`
+	Failed            int                         `json:"failed"`
+	Pending           int                         `json:"pending"`
+	Unavailable       int                         `json:"unavailable,omitempty"`
+	Analyses          []IncidentAnalysis          `json:"analyses,omitempty"`
+	Historical        bool                        `json:"historical,omitempty"`
+	ExpectedJudgment  *ExpectedJudgmentProjection `json:"expected_judgment,omitempty"`
 
 	// Work is the aggregate, per-Situation acute-triage work disposition
 	// (B0 integration contract §3, accepted 2026-09-08): a coherent

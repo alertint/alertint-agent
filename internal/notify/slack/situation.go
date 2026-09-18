@@ -421,6 +421,9 @@ func renderJournalEntryKind(t model.Transition, executionSuperseded bool, replyK
 	if t.JournalKind == model.JournalNone {
 		return RenderedMessage{}, errors.New("slack: render situation journal: transition carries no journal entry")
 	}
+	if t.Journal.JudgmentChange != "" {
+		return renderExpectedJudgmentJournal(t), nil
+	}
 
 	prefix := drillPrefix(t.Drill)
 	label, detail := t.Journal.Headline, t.Journal.Detail
@@ -462,6 +465,32 @@ func renderJournalEntryKind(t model.Transition, executionSuperseded bool, replyK
 		Text:   fallback,
 		Blocks: blocks,
 	}, nil
+}
+
+func renderExpectedJudgmentJournal(t model.Transition) RenderedMessage {
+	actor := briefingText(t.Journal.AttributedActor, 120)
+	var text string
+	switch t.Journal.JudgmentChange {
+	case model.JudgmentChangeRecorded:
+		text = actor + " marked the current condition as expected until " + SlackDateToken(*t.Journal.JudgmentValidUntil, "{time}") + ". Monitoring continues."
+	case model.JudgmentChangeReplaced:
+		text = actor + " updated the expected condition until " + SlackDateToken(*t.Journal.JudgmentValidUntil, "{time}") + ". Monitoring continues."
+	case model.JudgmentChangeRestored:
+		text = actor + " restored expectedness until " + SlackDateToken(*t.Journal.JudgmentValidUntil, "{time}") + ". Monitoring continues."
+	case model.JudgmentChangeRevoked:
+		text = actor + " withdrew expectedness. Normal assessment resumes."
+	case model.JudgmentChangeExpired:
+		text = "Expectedness expired. Normal assessment resumes."
+	default:
+		text = "Expectedness no longer applies because the current condition changed. Normal assessment resumes."
+	}
+	if action := t.ActionContract.OperatorActionRequired; action != nil {
+		text += " Operator action required: " + humanizeOperatorAction(*action) + "."
+	}
+	if t.Journal.NoLongerCurrent {
+		text += " This decision is no longer active."
+	}
+	return RenderedMessage{Text: text, Blocks: []slacklib.Block{sectionBlock(text), contextBlock(SlackDateToken(t.Journal.OccurredAt, "{date_short} {time}"))}}
 }
 
 // Keep the operational next step outside bounded evidence sections: a long

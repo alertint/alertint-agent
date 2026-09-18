@@ -14,10 +14,10 @@ expectations.
 
 ## Design principles
 
-- **Read-only by design** — **AlertINT** observes and reports. It never
-  touches your infrastructure, so teams can adopt it without risk. The one
-  write an agent can make is feedback into AlertINT's own incident record —
-  additive, audit-chained, local.
+- **Read-only toward your systems** — **AlertINT** observes and reports. It
+  never touches your infrastructure. MCP writes only local, audit-chained
+  AlertINT state: feedback into AlertINT's own incident record,
+  semantic-profile corrections, and explicit time-bounded Situation judgments.
 - **Self-hosted and local** — your alert data and incident context stay on
   your machine.
 - **Fair Source** — the runtime and all baseline and community packs are
@@ -40,8 +40,9 @@ lands, will be gated behind explicit operator approval flows.
 
 Every accepted alert delivery is now immutable and durably queued, and the
 Incidents it produces are grouped under a durable per-exact-group
-**Situation** — visible read-only through the `alertint_list_situations`
-and `alertint_get_situation` MCP tools (see [Architecture: Situation
+**Situation** — visible through the `alertint_list_situations`
+and `alertint_get_situation` MCP tools, with explicit version-fenced local
+judgment commands (see [Architecture: Situation
 foundation and controller](architecture.md#3a-situation-foundation-and-controller),
 [MCP clients](../integrations/mcp-clients.md)). Be precise about what that
 is and isn't:
@@ -78,7 +79,9 @@ is and isn't:
   a sibling, or reach Slack directly.
 - **Is not (yet), even on `state-controller`:** durable Assessment/Triage
   artifacts beyond the bounded recent-attempt history exposed over MCP,
-  operator questions, Situation judgments, or expected-behaviour envelopes.
+  automatic operator questions, or reusable expected-behaviour envelopes.
+  The episode-scoped judgment only covers one Situation's current typed facts
+  until a deadline; it is not a reusable rule or schedule.
   `alertint_get_situation` reads `assessment: null` and
   `operator_contract: null`, honestly, for any Situation the controller has
   not yet reconciled at least once — never a fabricated placeholder.

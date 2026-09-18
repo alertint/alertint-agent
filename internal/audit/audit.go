@@ -61,6 +61,27 @@ func (a *Auditor) withClock(now func() time.Time) *Auditor {
 // JSON-marshalable value; it is normalized into canonical JSON before
 // hashing so the same logical payload always produces the same hash.
 func (a *Auditor) Append(ctx context.Context, actor, kind string, payload any) error {
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("audit: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := a.AppendTx(ctx, tx, actor, kind, payload, a.now().UTC()); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("audit: commit: %w", err)
+	}
+	return nil
+}
+
+// AppendTx appends one hash-chained row inside the caller's transaction.
+// It lets a domain write and its audit evidence commit or roll back together.
+// The caller owns commit/rollback and supplies the authoritative event time.
+func (a *Auditor) AppendTx(ctx context.Context, tx *sql.Tx, actor, kind string, payload any, at time.Time) error {
+	if tx == nil {
+		return errors.New("audit: append tx requires a transaction")
+	}
 	if err := validateAppendArgs(actor, kind); err != nil {
 		return err
 	}
@@ -69,19 +90,13 @@ func (a *Auditor) Append(ctx context.Context, actor, kind string, payload any) e
 		return fmt.Errorf("audit: canonicalize payload: %w", err)
 	}
 
-	tx, err := a.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("audit: begin tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
 	var prev sql.NullString
 	row := tx.QueryRowContext(ctx, `SELECT hash FROM audit_log ORDER BY seq DESC LIMIT 1`)
 	if err := row.Scan(&prev); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("audit: read prev_hash: %w", err)
 	}
 
-	ts := a.now().UTC().Format(time.RFC3339Nano)
+	ts := at.UTC().Format(time.RFC3339Nano)
 	hash := computeHash(ts, actor, kind, canonical, prev.String)
 
 	var prevArg any
@@ -94,9 +109,6 @@ func (a *Auditor) Append(ctx context.Context, actor, kind string, payload any) e
 		VALUES (?, ?, ?, ?, ?, ?)
 	`, ts, actor, kind, string(canonical), prevArg, hash); err != nil {
 		return fmt.Errorf("audit: insert row: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("audit: commit: %w", err)
 	}
 	return nil
 }

@@ -194,14 +194,16 @@ func (k JournalKind) Validate() error {
 // JournalData is the bounded, immutable render payload for one Transition's
 // journal entry. It never carries unbounded operator-authored prose.
 type JournalData struct {
-	Headline        string    `json:"headline"`
-	Detail          string    `json:"detail,omitempty"`
-	AttributedActor string    `json:"attributed_actor,omitempty"`
-	ActionStatus    string    `json:"action_status,omitempty"`
-	RecurrenceCount int       `json:"recurrence_count,omitempty"`
-	Delayed         bool      `json:"delayed,omitempty"`
-	NoLongerCurrent bool      `json:"no_longer_current,omitempty"`
-	OccurredAt      time.Time `json:"occurred_at"`
+	Headline           string         `json:"headline"`
+	Detail             string         `json:"detail,omitempty"`
+	AttributedActor    string         `json:"attributed_actor,omitempty"`
+	ActionStatus       string         `json:"action_status,omitempty"`
+	RecurrenceCount    int            `json:"recurrence_count,omitempty"`
+	Delayed            bool           `json:"delayed,omitempty"`
+	NoLongerCurrent    bool           `json:"no_longer_current,omitempty"`
+	OccurredAt         time.Time      `json:"occurred_at"`
+	JudgmentChange     JudgmentChange `json:"judgment_change,omitempty"`
+	JudgmentValidUntil *time.Time     `json:"judgment_valid_until,omitempty"`
 }
 
 // Validate checks JournalData's bounded lengths and its required, UTC
@@ -224,6 +226,20 @@ func (j JournalData) Validate() error {
 	}
 	if err := requireNonZeroUTC("occurred_at", j.OccurredAt); err != nil {
 		return fmt.Errorf("journal_data: %w", err)
+	}
+	if j.JudgmentValidUntil != nil {
+		if err := requireNonZeroUTC("judgment_valid_until", *j.JudgmentValidUntil); err != nil {
+			return fmt.Errorf("journal_data: %w", err)
+		}
+	}
+	switch j.JudgmentChange {
+	case "", JudgmentChangeRecorded, JudgmentChangeReplaced, JudgmentChangeRevoked,
+		JudgmentChangeRestored, JudgmentChangeExpired, JudgmentChangeInvalidated:
+	default:
+		return fmt.Errorf("journal_data: unknown judgment_change %q", j.JudgmentChange)
+	}
+	if (j.JudgmentChange == JudgmentChangeRecorded || j.JudgmentChange == JudgmentChangeReplaced || j.JudgmentChange == JudgmentChangeRestored) && j.JudgmentValidUntil == nil {
+		return errors.New("journal_data: active expected judgment change requires valid_until")
 	}
 	return nil
 }

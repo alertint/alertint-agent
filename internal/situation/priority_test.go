@@ -340,6 +340,39 @@ func TestInterruptionPriorityArtifactsNeverPoke(t *testing.T) {
 	}
 }
 
+func TestSelectPokeKeepsConcurrentUrgentTransitionAheadOfJudgmentJournal(t *testing.T) {
+	change := hsNext(t)
+	until := change.Now.Add(2 * time.Hour)
+	change.PriorTransition.Projection.Briefing = &model.OperatorBriefing{ExpectedJudgment: &model.ExpectedJudgmentProjection{
+		Revision: 1, AssertedOperator: "Janis", ValidUntil: until,
+	}}
+	change.Projection.Briefing = nil
+	change.Situation.Attention = model.AttentionUrgent
+	change.Assessment.Attention = model.AttentionUrgent
+	change.Judgment = &model.SituationJudgment{
+		Revision: 1, Operation: model.JudgmentOperationRecord,
+		AssertedOperator: "Janis", ValidUntil: until,
+	}
+	change.JudgmentApplicabilityReason = model.JudgmentSeverityChanged
+
+	transitions, err := BuildTransitions(change)
+	if err != nil {
+		t.Fatalf("BuildTransitions: %v", err)
+	}
+	if len(transitions) != 2 || transitions[0].Reason != model.ReasonAttentionChanged ||
+		transitions[1].Journal.JudgmentChange != model.JudgmentChangeInvalidated {
+		t.Fatalf("transitions = %+v, want urgent state transition then judgment invalidation", transitions)
+	}
+
+	poke, ok := selectPoke(PublicationInput{Transitions: transitions, PriorTransition: change.PriorTransition})
+	if !ok {
+		t.Fatal("concurrent urgent change did not select a poke")
+	}
+	if poke.ID != transitions[0].ID {
+		t.Fatalf("selected judgment journal %s instead of urgent state transition %s", poke.ID, transitions[0].ID)
+	}
+}
+
 // ----------------------------------------------------------------------
 // Handoff revalidation (review round 1, R1-F5).
 // ----------------------------------------------------------------------

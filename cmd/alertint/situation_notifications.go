@@ -79,6 +79,10 @@ type DelivererStore interface {
 	// re-read at delivery time so the outbound payload carries only the
 	// selected facts.
 	GetCommunicatedHistory(ctx context.Context, situationID string, beforeSequence int) (situation.DeliveredHistory, error)
+
+	// GetCurrentSituationJudgment revalidates time-bounded authority at the
+	// actual send instant so queued delivery cannot reassert a retired decision.
+	GetCurrentSituationJudgment(ctx context.Context, situationID string, now time.Time) (*store.SituationJudgmentView, error)
 }
 
 // slackDeliveryAPI is exactly what SituationDeliverer calls on the narrow
@@ -179,6 +183,17 @@ func (d *SituationDeliverer) deliverRootSync(ctx context.Context, intent model.N
 			fmt.Errorf("cmd/alertint: situation deliverer: intent names summary version %d, current is %d",
 				*intent.SummaryVersion, view.Summary.Version))
 	}
+	if briefing := view.Summary.Briefing; briefing != nil && briefing.ExpectedJudgment != nil {
+		current, err := d.store.GetCurrentSituationJudgment(ctx, *intent.SituationID, d.now().UTC())
+		if err != nil {
+			return situation.NotificationDelivery{}, localDelivery("judgment_revalidation_unavailable",
+				fmt.Errorf("cmd/alertint: situation deliverer: revalidate expected judgment: %w", err))
+		}
+		if current == nil || !current.Applicability.Applicable || current.Judgment.Revision != briefing.ExpectedJudgment.Revision {
+			return situation.NotificationDelivery{}, localDelivery("stale_expected_judgment",
+				errors.New("cmd/alertint: situation deliverer: root carries retired expected judgment"))
+		}
+	}
 
 	recoveryEverObserved, err := d.recoveryEverObserved(ctx, view)
 	if err != nil {
@@ -240,6 +255,18 @@ func (d *SituationDeliverer) deliverThreadAppend(ctx context.Context, intent mod
 		return situation.NotificationDelivery{}, localDelivery("transition_unavailable",
 			fmt.Errorf("cmd/alertint: situation deliverer: load transition: %w", err))
 	}
+	if judgmentChangeCarriesAuthority(tr.Journal.JudgmentChange) {
+		current, err := d.store.GetCurrentSituationJudgment(ctx, *intent.SituationID, d.now().UTC())
+		if err != nil {
+			return situation.NotificationDelivery{}, localDelivery("judgment_revalidation_unavailable",
+				fmt.Errorf("cmd/alertint: situation deliverer: revalidate expected judgment thread: %w", err))
+		}
+		projected := tr.Projection.Briefing
+		if current == nil || !current.Applicability.Applicable || projected == nil || projected.ExpectedJudgment == nil ||
+			current.Judgment.Revision != projected.ExpectedJudgment.Revision {
+			tr.Journal.NoLongerCurrent = true
+		}
+	}
 	channel, rootTS, ok, err := d.store.GetSituationRootCoordinates(ctx, *intent.SituationID)
 	if err != nil {
 		return situation.NotificationDelivery{}, localDelivery("root_coordinates_unavailable",
@@ -269,6 +296,15 @@ func (d *SituationDeliverer) deliverThreadAppend(ctx context.Context, intent mod
 		return situation.NotificationDelivery{}, err
 	}
 	return situation.NotificationDelivery{Channel: res.Channel, MessageTS: res.TS, DeliveredAs: "thread"}, nil
+}
+
+func judgmentChangeCarriesAuthority(change model.JudgmentChange) bool {
+	switch change {
+	case model.JudgmentChangeRecorded, model.JudgmentChangeReplaced, model.JudgmentChangeRestored:
+		return true
+	default:
+		return false
+	}
 }
 
 // selectedReply reads this Situation's delivery history once, bounded to

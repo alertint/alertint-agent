@@ -26,6 +26,68 @@ func canonicalFixture(t *testing.T) *model.OperatorBriefing {
 	return &b
 }
 
+func TestCanonicalRootShowsExpectedJudgmentAfterFinding(t *testing.T) {
+	b := canonicalFixture(t)
+	b.Work.Phase = model.WorkPhaseSettled
+	b.Analyses = []model.IncidentAnalysis{{Title: "Reconciliation job is driving CPU load", Summary: "Sustained CPU load on db-prod-1.", Findings: []string{"CPU load remains elevated on db-prod-1."}, Verification: "supported"}}
+	until := bcNow(t).Add(time.Hour)
+	b.ExpectedJudgment = &model.ExpectedJudgmentProjection{Revision: 2, AssertedOperator: "Janis", ValidUntil: until}
+	in := bcRoot(t, model.LifecycleActive, model.AttentionInvestigate, bcObserveMonitorContract(bcNow(t)), b)
+	msg, err := RenderSituationRoot(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "*Operator:* Expected until " + SlackDateToken(until, "{time}") + " · Janis"
+	if !strings.Contains(msg.Text, want) {
+		t.Fatalf("root missing %q:\n%s", want, msg.Text)
+	}
+	titleAt := strings.Index(msg.Text, "Monitoring · payments · lab")
+	statusAt := strings.Index(msg.Text, "Observed · Correlating")
+	findingAt := strings.Index(msg.Text, "*Finding:*")
+	operatorAt := strings.Index(msg.Text, "*Operator:*")
+	if !(titleAt >= 0 && titleAt < statusAt && statusAt < findingAt && findingAt < operatorAt) {
+		t.Fatalf("root order title=%d status=%d finding=%d operator=%d:\n%s", titleAt, statusAt, findingAt, operatorAt, msg.Text)
+	}
+}
+
+func TestExpectedJudgmentThreadTransitionsAreAttributedAndTruthful(t *testing.T) {
+	b := canonicalFixture(t)
+	until := bcNow(t).Add(time.Hour)
+	tr := bcJournal(t, bcObserveMonitorContract(bcNow(t)), b, nil)
+	tr.Journal.JudgmentChange = model.JudgmentChangeRecorded
+	tr.Journal.AttributedActor = "Janis"
+	tr.Journal.JudgmentValidUntil = &until
+	msg, err := RenderSituationJournal(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "Janis marked the current condition as expected until " + SlackDateToken(until, "{time}") + ". Monitoring continues."
+	if !strings.Contains(msg.Text, want) {
+		t.Fatalf("thread = %q, want %q", msg.Text, want)
+	}
+
+	tr.Journal.JudgmentChange = model.JudgmentChangeRevoked
+	tr.Journal.JudgmentValidUntil = nil
+	msg, err = RenderSituationJournal(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(msg.Text, "Janis withdrew expectedness. Normal assessment resumes.") {
+		t.Fatal(msg.Text)
+	}
+
+	action := model.OperatorActionInvestigateSituation
+	tr.ActionContract.NextActor = model.NextActorOperator
+	tr.ActionContract.OperatorActionRequired = &action
+	msg, err = RenderSituationJournal(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(msg.Text, "Operator action required: investigate this Situation.") {
+		t.Fatalf("withdrawal handoff = %q, want the resumed operator action", msg.Text)
+	}
+}
+
 // Losing the phase, names or receipt clock makes distinct incidents indistinguishable.
 func TestCanonicalRootCorrelationHasMembershipAndDeterministicClocks(t *testing.T) {
 	b := canonicalFixture(t)

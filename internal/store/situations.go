@@ -390,6 +390,9 @@ func (s *Store) ApplySituationInput(ctx context.Context, claim SituationClaim) e
 	if err := attachSituationMembershipTx(ctx, tx, outcome.situationID, row.incidentID, now); err != nil {
 		return err
 	}
+	if err := persistObservedSituationJudgmentInvalidationTx(ctx, tx, outcome.situationID, now); err != nil {
+		return fmt.Errorf("store: invalidate situation judgment from observed input: %w", err)
+	}
 	journalState := "not_applicable"
 	if isOperatorArtifactKind(row.kind) {
 		journalState = "pending"
