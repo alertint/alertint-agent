@@ -12,6 +12,15 @@ import (
 	profilemodel "github.com/alertint/alertint-agent/internal/semanticprofile/model"
 )
 
+// ErrProfileMalformed is wrapped by every ParseProfile/ValidateProfile
+// failure: the bytes were obtained, but they are not a closed-schema
+// Profile (undecodable JSON, duplicate or unknown keys, a bound violated).
+// It is the CONTENT-class marker the cmd/alertint health adapter maps onto
+// llmhealth.ErrResponseMalformed (this package never imports
+// internal/llmhealth): a malformed profile is one bad answer, never
+// evidence that the provider itself is unreachable.
+var ErrProfileMalformed = errors.New("semanticprofile: malformed profile")
+
 // ParseProfile decodes raw JSON into a Profile, failing closed on anything
 // spec.md requires rejected outright rather than silently accepted or
 // truncated: duplicate object keys (a naive json.Unmarshal keeps only the
@@ -21,8 +30,16 @@ import (
 // any bound ValidateProfile itself enforces. This is the one path both the
 // inference worker (Task 8, parsing model output) and the MCP correction
 // handler (Task 9, parsing operator input) must use; neither may unmarshal
-// profile JSON any other way.
+// profile JSON any other way. Every failure wraps ErrProfileMalformed.
 func ParseProfile(raw []byte) (profilemodel.Profile, error) {
+	p, err := parseProfile(raw)
+	if err != nil {
+		return profilemodel.Profile{}, malformed(err)
+	}
+	return p, nil
+}
+
+func parseProfile(raw []byte) (profilemodel.Profile, error) {
 	if err := rejectDuplicateKeys(raw); err != nil {
 		return profilemodel.Profile{}, err
 	}
@@ -35,17 +52,32 @@ func ParseProfile(raw []byte) (profilemodel.Profile, error) {
 	if dec.More() {
 		return profilemodel.Profile{}, errors.New("semanticprofile: trailing content after profile json")
 	}
-	if err := ValidateProfile(p); err != nil {
-		return profilemodel.Profile{}, err
+	return p, validateProfile(p)
+}
+
+// malformed wraps err with ErrProfileMalformed exactly once — an error that
+// already carries the sentinel (validateProfile's own failures reached
+// through ParseProfile) is returned unchanged.
+func malformed(err error) error {
+	if errors.Is(err, ErrProfileMalformed) {
+		return err
 	}
-	return p, nil
+	return fmt.Errorf("%w: %w", ErrProfileMalformed, err)
 }
 
 // ValidateProfile enforces every closed-schema bound spec.md's "Durable
 // semantic-profile inference" section requires: non-empty, bounded meaning
 // fields; array caps; the closed horizon-tier and capability-name
-// vocabularies; and the whole-profile size cap. It never mutates p.
+// vocabularies; and the whole-profile size cap. It never mutates p. Every
+// failure wraps ErrProfileMalformed.
 func ValidateProfile(p profilemodel.Profile) error {
+	if err := validateProfile(p); err != nil {
+		return malformed(err)
+	}
+	return nil
+}
+
+func validateProfile(p profilemodel.Profile) error {
 	for _, f := range []struct {
 		name, value string
 	}{

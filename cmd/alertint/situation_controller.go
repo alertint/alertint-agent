@@ -608,8 +608,29 @@ type llmHealthProfileObservation struct {
 	obs *llmhealth.Observation
 }
 
+// Finish maps the worker's classification onto the error shape
+// llmhealth.Classify reads (profileHealthError) before recording it.
 func (o llmHealthProfileObservation) Finish(err error) {
-	o.obs.Finish(err)
+	o.obs.Finish(profileHealthError(err))
+}
+
+// profileHealthError is the semantic-profile sibling of
+// assessmentHealthError: nil stays nil (a healthy call, including a
+// stale CAS loss), a malformed/invalid profile (semanticprofile.
+// ErrProfileMalformed — the model answered, outside the closed schema)
+// becomes the content-class llmhealth.ErrResponseMalformed so one bad
+// signature never flips installation health on its own, and every other
+// error is the real transport/provider failure, forwarded as-is for
+// dependency classification. The original malformed error text (which
+// may echo response keys) is deliberately not carried into health.
+func profileHealthError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, semanticprofile.ErrProfileMalformed) {
+		return fmt.Errorf("%w: semantic profile response did not parse as the closed profile schema", llmhealth.ErrResponseMalformed)
+	}
+	return err
 }
 
 // buildAssessmentClient resolves the controller's own one-shot,
@@ -640,7 +661,12 @@ func buildAssessmentClient(client acutetriage.LLMClient) (situation.AssessmentCl
 // new retry epoch once the dependency is actually healthy again), so this
 // no-ops (0, nil) whenever the tracker does not currently report healthy —
 // the store primitive's own outageGeneration<=0 guard is a second,
-// independent line of defense, not relied on alone.
+// independent line of defense, not relied on alone. The same durable
+// healthy generation, under the same guard, also re-arms
+// dependency-exhausted semantic-profile inference jobs once
+// (store.RearmDependencyExhaustedSemanticJobs) right after the Situation
+// wake: the profile worker shares the primary client, so its
+// dependency-class exhaustion recovers on exactly the same evidence.
 type llmHealthDependencyWaker struct {
 	tracker *llmhealth.Tracker
 	st      *store.Store
@@ -651,5 +677,12 @@ func (w llmHealthDependencyWaker) WakeDependencyRecoveredSituations(ctx context.
 	if snap.State != llmhealth.StateHealthy {
 		return 0, nil
 	}
-	return w.st.WakeDependencyRecoveredSituations(ctx, snap.OutageGeneration, now)
+	woken, err := w.st.WakeDependencyRecoveredSituations(ctx, snap.OutageGeneration, now)
+	if err != nil {
+		return woken, err
+	}
+	if _, err := w.st.RearmDependencyExhaustedSemanticJobs(ctx, snap.OutageGeneration, now); err != nil {
+		return woken, fmt.Errorf("cmd/alertint: rearm dependency-exhausted semantic jobs: %w", err)
+	}
+	return woken, nil
 }

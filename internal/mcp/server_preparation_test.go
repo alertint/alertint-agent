@@ -404,3 +404,48 @@ func TestCorrectSemanticProfileAuditsTheCorrection(t *testing.T) {
 		t.Fatalf("audit rows = %d, want 1", count)
 	}
 }
+
+func TestGetSemanticProfileToolPreservesTerminalAndCrashLedger(t *testing.T) {
+	st := newMCPStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	for _, status := range []string{"complete", "exhausted"} {
+		if _, err := st.DB().ExecContext(ctx, `INSERT INTO semantic_profile_inference_jobs
+ (id,signature_key,frozen_input_json,frozen_input_digest,status,attempt,max_attempts,created_at)
+ VALUES (?,?,'{}',?, ?,2,2,?)`, status, status, status, status, now.Format(time.RFC3339Nano)); err != nil {
+			t.Fatal(err)
+		}
+		for i, id := range []string{status + "-completed", status + "-crash"} {
+			if _, err := st.DB().ExecContext(ctx, `INSERT INTO semantic_profile_calls(id,job_id,attempt,dispatched_at) VALUES(?,?,?,?)`, id, status, i+1, now.Format(time.RFC3339Nano)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := st.DB().ExecContext(ctx, `INSERT INTO semantic_profile_call_outcomes(call_id,outcome,request_started,usage_input_tokens,usage_output_tokens,provider,model,completed_at)
+ VALUES (?,'failed','true',11,7,'test','model',?)`, status+"-completed", now.Format(time.RFC3339Nano)); err != nil {
+			t.Fatal(err)
+		}
+		s := NewServer(Config{}, st, audit.New(st.DB()))
+		res, err := s.handleGetSemanticProfile(ctx, reqWith(map[string]any{"signature": status}))
+		if err != nil || res.IsError {
+			t.Fatalf("tool: %v %+v", err, res)
+		}
+		var payload struct {
+			Profiles []semanticProfileHistoryRow `json:"profiles"`
+		}
+		if err := json.Unmarshal([]byte(resultText(t, res)), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if len(payload.Profiles) != 1 {
+			t.Fatalf("profiles=%+v", payload)
+		}
+		h := payload.Profiles[0]
+		if h.Job == nil || h.Job.ID != status || h.Job.Status != status || h.DispatchCount != 2 || h.UnknownDispatchCount != 1 || len(h.Dispatches) != 2 {
+			t.Fatalf("lost durable job/ledger: %+v", h)
+		}
+		for _, d := range h.Dispatches {
+			if d.ID == status+"-crash" && (d.Outcome != "reserved" || d.RequestStarted != "unknown" || d.UsageInputTokens != nil || d.CompletedAt != nil) {
+				t.Fatalf("invented crash outcome: %+v", d)
+			}
+		}
+	}
+}

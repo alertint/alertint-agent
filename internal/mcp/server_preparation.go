@@ -206,6 +206,7 @@ func semanticProfileVersionRowFrom(v profilemodel.Version) semanticProfileVersio
 }
 
 type semanticProfileJobRow struct {
+	ID         string     `json:"id"`
 	Status     string     `json:"status"`
 	Attempt    int        `json:"attempt"`
 	RetryAt    *time.Time `json:"retry_at"`
@@ -213,6 +214,11 @@ type semanticProfileJobRow struct {
 }
 
 type semanticProfileHistoryRow struct {
+	Dispatches           []profilemodel.Dispatch `json:"dispatches"`
+	DispatchCount        int                     `json:"dispatch_count"`
+	UnknownDispatchCount int                     `json:"unknown_dispatch_count"`
+	DispatchesTruncated  bool                    `json:"dispatches_truncated"`
+
 	Signature  string                      `json:"signature"`
 	Current    *semanticProfileVersionRow  `json:"current"`
 	Versions   []semanticProfileVersionRow `json:"versions"`
@@ -221,7 +227,7 @@ type semanticProfileHistoryRow struct {
 }
 
 func semanticProfileHistoryRowFrom(signature string, h profilemodel.History) semanticProfileHistoryRow {
-	row := semanticProfileHistoryRow{Signature: signature, NextCursor: h.NextCursor}
+	row := semanticProfileHistoryRow{Signature: signature, NextCursor: h.NextCursor, Dispatches: h.Dispatches, DispatchCount: h.DispatchCount, UnknownDispatchCount: h.UnknownDispatchCount, DispatchesTruncated: h.DispatchesTruncated}
 	if h.Current != nil {
 		cur := semanticProfileVersionRowFrom(*h.Current)
 		row.Current = &cur
@@ -231,7 +237,7 @@ func semanticProfileHistoryRowFrom(signature string, h profilemodel.History) sem
 		row.Versions = append(row.Versions, semanticProfileVersionRowFrom(v))
 	}
 	if h.Job != nil {
-		row.Job = &semanticProfileJobRow{Status: h.Job.Status, Attempt: h.Job.Attempt, RetryAt: h.Job.RetryAt, ErrorClass: h.Job.ErrorClass}
+		row.Job = &semanticProfileJobRow{ID: h.Job.ID, Status: h.Job.Status, Attempt: h.Job.Attempt, RetryAt: h.Job.RetryAt, ErrorClass: h.Job.ErrorClass}
 	}
 	return row
 }

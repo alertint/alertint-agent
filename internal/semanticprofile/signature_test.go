@@ -3,11 +3,44 @@
 package semanticprofile
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
 	profilemodel "github.com/alertint/alertint-agent/internal/semanticprofile/model"
 )
+
+// TestSignatureMissReasonIsBoundedAndTyped (F22) pins the closed miss
+// vocabulary: every refusal BuildSignature can produce maps onto a bounded
+// class string, and the oversize-key error never carries the key itself.
+func TestSignatureMissReasonIsBoundedAndTyped(t *testing.T) {
+	longKey := strings.Repeat("k", profilemodel.MaxSignatureKeyChars+1)
+	_, keyErr := BuildSignature(profilemodel.SignatureInput{Source: "alertmanager", LabelKeys: []string{longKey}})
+	if !errors.Is(keyErr, profilemodel.ErrSignatureKeyTooLong) {
+		t.Fatalf("oversize key err = %v, want ErrSignatureKeyTooLong", keyErr)
+	}
+	if strings.Contains(keyErr.Error(), longKey) {
+		t.Fatal("the oversize key must never be carried in the error text")
+	}
+	_, sourceErr := BuildSignature(profilemodel.SignatureInput{})
+	if !errors.Is(sourceErr, profilemodel.ErrSignatureMissingSource) {
+		t.Fatalf("missing source err = %v, want ErrSignatureMissingSource", sourceErr)
+	}
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{nil, ""},
+		{keyErr, SignatureMissKeyTooLong},
+		{sourceErr, SignatureMissMissingSource},
+		{profilemodel.ErrOversizeSignatureMaterial, SignatureMissOversizeMaterial},
+		{errors.New("anything else"), SignatureMissUnsupported},
+	} {
+		if got := SignatureMissReason(tc.err); got != tc.want {
+			t.Errorf("SignatureMissReason(%v) = %q, want %q", tc.err, got, tc.want)
+		}
+	}
+}
 
 func TestBuildSignatureProvenPairIsStableAndDistinctFromIDOnly(t *testing.T) {
 	withVersion := profilemodel.SignatureInput{Source: "zabbix", ProvenSignalID: "trigger-42", ProvenVersion: "3"}

@@ -331,9 +331,9 @@ func seedRunningInferenceJob(t *testing.T, st *Store, id, signatureKey string, a
 	if _, err := st.db.ExecContext(context.Background(), `
 		INSERT INTO semantic_profile_inference_jobs (
 			id, signature_key, frozen_input_json, frozen_input_digest, expected_head_version,
-			status, attempt, max_attempts, owner, token, lease_expires_at, created_at
-		) VALUES (?, ?, '{}', ?, 0, 'running', ?, ?, 'owner-a', 1, ?, ?)`,
-		id, signatureKey, "digest-"+id, attempt, maxAttempts, leaseExpiresAt, canonicalTime(now)); err != nil {
+			status, attempt, max_attempts, attempt_budget, owner, token, lease_expires_at, created_at
+		) VALUES (?, ?, '{}', ?, 0, 'running', ?, ?, ?, 'owner-a', 1, ?, ?)`,
+		id, signatureKey, "digest-"+id, attempt, maxAttempts, maxAttempts, leaseExpiresAt, canonicalTime(now)); err != nil {
 		t.Fatalf("seed running inference job %s: %v", id, err)
 	}
 }
@@ -424,9 +424,9 @@ func seedPendingInferenceJob(t *testing.T, st *Store, id, signatureKey string, m
 	if _, err := st.db.ExecContext(context.Background(), `
 		INSERT INTO semantic_profile_inference_jobs (
 			id, signature_key, frozen_input_json, frozen_input_digest, expected_head_version,
-			status, attempt, max_attempts, retry_at, created_at
-		) VALUES (?, ?, '{}', ?, 0, 'pending', 0, ?, ?, ?)`,
-		id, signatureKey, "digest-"+id, maxAttempts, retryAtStr, canonicalTime(now)); err != nil {
+			status, attempt, max_attempts, attempt_budget, retry_at, created_at
+		) VALUES (?, ?, '{}', ?, 0, 'pending', 0, ?, ?, ?, ?)`,
+		id, signatureKey, "digest-"+id, maxAttempts, maxAttempts, retryAtStr, canonicalTime(now)); err != nil {
 		t.Fatalf("seed pending inference job %s: %v", id, err)
 	}
 }
@@ -693,7 +693,7 @@ func TestCompleteSemanticInferenceAcceptedCreatesVersionAndHead(t *testing.T) {
 		Provider: "anthropic", Model: "claude", UsageInputTokens: 100, UsageOutputTokens: 20,
 		PromptVersion: profilemodel.PromptVersion,
 	}
-	if err := st.CompleteSemanticInference(context.Background(), callID, claim.Owner, claim.Token, result, now, nil); err != nil {
+	if _, err := st.CompleteSemanticInference(context.Background(), callID, claim.Owner, claim.Token, result, now, nil); err != nil {
 		t.Fatalf("CompleteSemanticInference: %v", err)
 	}
 
@@ -755,10 +755,14 @@ func TestCompleteSemanticInferenceLateAcceptedAfterCorrectionRecordsStale(t *tes
 		CandidateScope: []string{"service"}, HorizonTier: "minutes",
 	}
 	result := profilemodel.InferenceResult{Profile: &profile, Outcome: profilemodel.InferenceOutcomeAccepted, RequestStarted: "true"}
-	if err := st.CompleteSemanticInference(context.Background(), callID, claim.Owner, claim.Token, result, now, nil); err != nil {
+	commit, err := st.CompleteSemanticInference(context.Background(), callID, claim.Owner, claim.Token, result, now, nil)
+	if err != nil {
 		t.Fatalf("CompleteSemanticInference: %v", err)
 	}
 
+	if commit.Outcome != profilemodel.InferenceOutcomeStale || commit.HeadAdvanced || commit.VersionID != "" {
+		t.Fatalf("incorrect durable audit result: %+v", commit)
+	}
 	var outcome string
 	if err := st.db.QueryRowContext(context.Background(), `SELECT outcome FROM semantic_profile_call_outcomes WHERE call_id = ?`, callID).Scan(&outcome); err != nil {
 		t.Fatalf("read call outcome: %v", err)
@@ -798,7 +802,7 @@ func TestCompleteSemanticInferenceRejectedRetriesUntilExhausted(t *testing.T) {
 	}
 	retryAt := now.Add(time.Minute)
 	result := profilemodel.InferenceResult{Outcome: profilemodel.InferenceOutcomeMalformed, RequestStarted: "true"}
-	if err := st.CompleteSemanticInference(context.Background(), callID, claim.Owner, claim.Token, result, now, &retryAt); err != nil {
+	if _, err := st.CompleteSemanticInference(context.Background(), callID, claim.Owner, claim.Token, result, now, &retryAt); err != nil {
 		t.Fatalf("CompleteSemanticInference: %v", err)
 	}
 	status, ownerSet := getJobStatus(t, st, claim.JobID)
@@ -815,7 +819,7 @@ func TestCompleteSemanticInferenceRejectedRetriesUntilExhausted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second reserve: %v", err)
 	}
-	if err := st.CompleteSemanticInference(context.Background(), callID2, claim2.Owner, claim2.Token, result, now.Add(2*time.Minute), nil); err != nil {
+	if _, err := st.CompleteSemanticInference(context.Background(), callID2, claim2.Owner, claim2.Token, result, now.Add(2*time.Minute), nil); err != nil {
 		t.Fatalf("second CompleteSemanticInference: %v", err)
 	}
 	status2, _ := getJobStatus(t, st, claim2.JobID)
@@ -1335,5 +1339,85 @@ func TestListSituationSemanticSignaturesReturnsDistinctKeysAcrossDeliveries(t *t
 	}
 	if len(keys) != 2 {
 		t.Fatalf("keys = %v, want 2 distinct signatures", keys)
+	}
+}
+
+func TestSemanticProfileHistoryRetainsTerminalAndUnknownDispatches(t *testing.T) {
+	for _, outcome := range []string{"accepted", "failed", "crashed"} {
+		t.Run(outcome, func(t *testing.T) {
+			st := newTestStore(t)
+			ctx := context.Background()
+			now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+			seedPendingInferenceJob(t, st, "job-history", "sig:history", 1, nil, now)
+			claim, _, err := st.ClaimSemanticInferenceJob(ctx, "worker", now, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			callID, _, err := st.ReserveSemanticInferenceCall(ctx, claim.JobID, claim.Owner, claim.Token, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantStatus := "running"
+			if outcome != "crashed" {
+				result := profilemodel.InferenceResult{PromptVersion: profilemodel.PromptVersion, Outcome: outcome, RequestStarted: "true", UsageInputTokens: 11, UsageOutputTokens: 7, Provider: "test", Model: "model"}
+				if outcome == "accepted" {
+					result.Profile = &profilemodel.Profile{SubjectKind: "service", EventKind: "availability", PossibleRole: "symptom", CandidateScope: []string{"service"}, HorizonTier: "hours"}
+					wantStatus = "complete"
+				} else {
+					wantStatus = "exhausted"
+				}
+				if _, err := st.CompleteSemanticInference(ctx, callID, claim.Owner, claim.Token, result, now, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			h, err := st.GetSemanticProfile(ctx, claim.Signature, "", 20)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if h.Job == nil || h.Job.Status != wantStatus {
+				t.Fatalf("job=%+v, want %s", h.Job, wantStatus)
+			}
+			view := h
+			if view.DispatchCount != 1 || len(view.Dispatches) != 1 {
+				t.Fatalf("missing durable ledger: %+v", h)
+			}
+			d := view.Dispatches[0]
+			if d.ID != callID {
+				t.Fatalf("call ID=%s", d.ID)
+			}
+			if outcome == "crashed" {
+				if view.UnknownDispatchCount != 1 || d.Outcome != "reserved" || d.RequestStarted != "unknown" || d.UsageInputTokens != nil {
+					t.Fatalf("crash fabricated outcome: %+v", h)
+				}
+			} else if d.Outcome != outcome || d.UsageInputTokens == nil || *d.UsageInputTokens != 11 {
+				t.Fatalf("lost completed outcome: %+v", h)
+			}
+		})
+	}
+}
+
+func TestSemanticProfileHistoryBoundsDispatchesWithoutLosingCounts(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	seedPendingInferenceJob(t, st, "many-calls", "many-calls", 200, nil, now)
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 101; i++ {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO semantic_profile_calls(id,job_id,attempt,dispatched_at) VALUES(?,'many-calls',?,?)`, fmt.Sprintf("call-%03d", i), i, canonicalTime(now.Add(time.Duration(i)*time.Second))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	h, err := st.GetSemanticProfile(ctx, "many-calls", "", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.DispatchCount != 101 || h.UnknownDispatchCount != 101 || len(h.Dispatches) != 100 || !h.DispatchesTruncated || h.Dispatches[0].ID != "call-101" {
+		t.Fatalf("bounded history=%+v", h)
 	}
 }

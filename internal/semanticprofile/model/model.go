@@ -208,16 +208,38 @@ type JobClaim struct {
 // JobState is the bounded, read-only current state of one signature's
 // inference job, for History.
 type JobState struct {
+	ID string
+
 	Status     string
 	Attempt    int
 	RetryAt    *time.Time
 	ErrorClass *string
 }
 
-// History is GetSemanticProfile's bounded read result: the current head
-// (nil if none exists yet), a bounded page of prior versions, the job's
-// current state (nil if no job exists), and a cursor for the next page.
+// Dispatch is an immutable call reservation with its optional durable outcome.
+// Missing outcomes retain unknown request/usage state after a crash.
+type Dispatch struct {
+	ID                string     `json:"id"`
+	JobID             string     `json:"job_id"`
+	Attempt           int        `json:"attempt"`
+	DispatchedAt      time.Time  `json:"dispatched_at"`
+	Outcome           string     `json:"outcome"`
+	RequestStarted    string     `json:"request_started"`
+	UsageInputTokens  *int       `json:"usage_input_tokens"`
+	UsageOutputTokens *int       `json:"usage_output_tokens"`
+	Provider          string     `json:"provider"`
+	Model             string     `json:"model"`
+	CompletedAt       *time.Time `json:"completed_at"`
+}
+
+// History contains a coherent head, version page, latest job and bounded
+// immutable dispatch ledger with lifetime counts. NextCursor pages versions.
 type History struct {
+	Dispatches           []Dispatch
+	DispatchCount        int
+	UnknownDispatchCount int
+	DispatchesTruncated  bool
+
 	Current    *Version
 	Versions   []Version
 	Job        *JobState
@@ -234,6 +256,33 @@ const (
 	InferenceOutcomeStale     = "stale"
 )
 
+// Error classes — the closed two-value classification persisted on an
+// inference job from its LAST non-accepted outcome (cleared by a healthy
+// one). Only a dependency-exhausted job is ever re-armed by a newer durable
+// healthy LLM generation; a content-exhausted one (the model answered, but
+// outside the closed schema) is re-armed only by a changed frozen input or
+// an operator correction, since the provider recovering says nothing about
+// the response content improving.
+const (
+	ErrorClassDependency = "dependency"
+	ErrorClassContent    = "content"
+)
+
+// ErrorClassForOutcome maps one non-accepted inference outcome onto its
+// persisted error class: a transport/provider failure is dependency-class;
+// a malformed or rejected response is content-class. It returns "" for
+// accepted and stale (no failure at all).
+func ErrorClassForOutcome(outcome string) string {
+	switch outcome {
+	case InferenceOutcomeFailed:
+		return ErrorClassDependency
+	case InferenceOutcomeMalformed, InferenceOutcomeRejected:
+		return ErrorClassContent
+	default:
+		return ""
+	}
+}
+
 // InferenceResult is one dispatched attempt's outcome: an optional validated
 // Profile (present only for InferenceOutcomeAccepted), the closed outcome,
 // whether the request physically started, and bounded usage/provenance
@@ -249,6 +298,43 @@ type InferenceResult struct {
 	PromptVersion     int
 }
 
+// InferenceCommit is CompleteSemanticInference's durable result — what the
+// store actually committed, which may differ from what the worker reported
+// (an accepted result is downgraded to InferenceOutcomeStale when the
+// signature's head advanced first). Audit and telemetry must describe THIS,
+// never the pre-commit classification; identities only, never content.
+type InferenceCommit struct {
+	// Outcome is the committed call outcome: accepted, stale, rejected,
+	// malformed, or failed.
+	Outcome string
+	// JobStatus is the job's state after this commit: complete, pending
+	// (retry scheduled), or exhausted.
+	JobStatus string
+	// HeadAdvanced is true only when this commit created a new Version and
+	// moved the signature's head to it; VersionID/Version identify it then.
+	HeadAdvanced bool
+	VersionID    string
+	Version      int
+	// ErrorClass is the class persisted on the job by this commit ("" for a
+	// healthy outcome).
+	ErrorClass string
+}
+
+// ChangeDelivery is one DeliverSemanticProfileChangesDetailed page: the
+// head-change outbox row it advanced, the version it announces, and every
+// Situation it woke in that transaction — bounded identities for the
+// caller's own audit emission. SituationIDs is empty (and ChangeID "") when
+// no change was due.
+type ChangeDelivery struct {
+	ChangeID     string
+	SignatureKey string
+	VersionID    string
+	SituationIDs []string
+	// Acknowledged is true when this page reached every remaining match and
+	// the outbox row was acknowledged.
+	Acknowledged bool
+}
+
 // ErrVersionConflict is returned by CorrectSemanticProfile when
 // Correction.ExpectedVersion no longer matches the current head (a stale
 // CAS).
@@ -259,6 +345,16 @@ var ErrVersionConflict = errors.New("semanticprofile: expected version does not 
 // refused outright, per spec.md, rather than silently truncated into a
 // collision.
 var ErrOversizeSignatureMaterial = errors.New("semanticprofile: signature material exceeds size bound")
+
+// ErrSignatureMissingSource is returned by BuildSignature when the input
+// names no source at all — no advisory identity can be derived.
+var ErrSignatureMissingSource = errors.New("semanticprofile: signature requires a source")
+
+// ErrSignatureKeyTooLong is returned by BuildSignature when a label or
+// annotation KEY exceeds MaxSignatureKeyChars — refused outright rather
+// than truncated into a collision. The offending key is never carried in
+// the error.
+var ErrSignatureKeyTooLong = errors.New("semanticprofile: signature key exceeds length bound")
 
 // ErrLeaseLost is returned by profile-store methods when a caller's
 // owner/token no longer matches the live job claim.
