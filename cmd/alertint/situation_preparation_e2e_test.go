@@ -247,11 +247,12 @@ func (f *fakePrometheusServer) requestCount() int32 { return f.reqs.Load() }
 // ----------------------------------------------------------------------
 
 type prepE2ELLM struct {
-	mu             sync.Mutex
-	profileCalls   int
-	assessCalls    int
-	failProfile    bool
-	failAssessment bool
+	mu                sync.Mutex
+	profileCalls      int
+	assessCalls       int
+	assessmentPrompts []string
+	failProfile       bool
+	failAssessment    bool
 }
 
 func (c *prepE2ELLM) CompleteOnce(_ context.Context, _ string, prompt llm.Prompt, _ []string) (llm.OneShotCompletion, error) {
@@ -278,6 +279,7 @@ func (c *prepE2ELLM) CompleteOnce(_ context.Context, _ string, prompt llm.Prompt
 	}
 
 	c.assessCalls++
+	c.assessmentPrompts = append(c.assessmentPrompts, prompt.Text())
 	if c.failAssessment {
 		return llm.OneShotCompletion{RequestStarted: llm.RequestStartStatusFalse}, fmt.Errorf("prep e2e: simulated assessment transport failure")
 	}
@@ -390,6 +392,25 @@ func TestPreparationE2EFullPipelineFromHTTPAlertToProfileHeadAndMCPReads(t *test
 	}
 	if runCount == 0 {
 		t.Fatal("no observation runs committed for the Situation")
+	}
+	// Prove nonempty prepared connector data crossed the actual model boundary,
+	// not merely that an HTTP request happened and a run was persisted.
+	var factID string
+	if err := f.st.DB().QueryRowContext(f.ctx, `SELECT id FROM situation_observation_facts
+		WHERE kind='metric_summary' AND result_status='confirmed_value' LIMIT 1`).Scan(&factID); err != nil {
+		t.Fatalf("nonempty metric evidence: %v", err)
+	}
+	llmClient.mu.Lock()
+	prompts := append([]string(nil), llmClient.assessmentPrompts...)
+	llmClient.mu.Unlock()
+	evidenceReachedModel := false
+	for _, prompt := range prompts {
+		if strings.Contains(prompt, factID) && strings.Contains(prompt, `"metric_summary"`) {
+			evidenceReachedModel = true
+		}
+	}
+	if !evidenceReachedModel {
+		t.Fatal("persisted nonempty metric fact absent from actual Assessment prompts")
 	}
 
 	// The profile job dispatched, the shared fake LLM answered it, and a
