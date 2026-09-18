@@ -290,21 +290,53 @@ func (c *Client) MetricHistory(ctx context.Context, host, itemKey string, from, 
 	return c.fetchSeries(ctx, item, from, to, limit, rpc)
 }
 
-// MetricHistoryBounded is MetricHistory with a per-physical-request hook
-// threaded through item resolution and the final history/trend request —
-// every real request this call can make, individually reservable by a
-// caller in internal/observation/connectors — over the bounded transport
-// path (decoded body capped at model.MaxDecodedResponseBytes).
+// MetricHistoryBounded is the proactive preparation path's MetricHistory:
+// exactly two physical requests — one EXACT item.get (never the legacy
+// fuzzy substring fallback, which could substitute an unrelated item) and
+// one history.get/trend.get — each individually reservable through
+// before/after by a caller in internal/observation/connectors, over the
+// bounded transport path (decoded body capped at
+// model.MaxDecodedResponseBytes). The item must be proven to belong to
+// host (selectHosts linkage); a missing or foreign item is ErrNotFound.
 func (c *Client) MetricHistoryBounded(ctx context.Context, host, itemKey string, from, to time.Time, limit int,
 	before func() error, after func(started bool, err error)) (Series, error) {
 	rpc := func(ctx context.Context, method string, params any, out any) error {
 		return c.callInstrumented(ctx, method, params, out, before, after)
 	}
-	item, err := c.resolveItem(ctx, host, itemKey, rpc)
+	item, err := c.lookupItemLinked(ctx, host, itemKey, rpc)
 	if err != nil {
 		return Series{}, err
 	}
 	return c.fetchSeries(ctx, item, from, to, limit, rpc)
+}
+
+// lookupItemLinked runs one exact-filter item.get scoped to host and
+// returns the item only when the source proves the linkage: the request
+// carries the host filter, and the response's selectHosts data must
+// name the requested host (and agree with the item's own
+// hostid). No match, or a mismatch, is ErrNotFound — never a fuzzy
+// substitute.
+func (c *Client) lookupItemLinked(ctx context.Context, host, key string, rpc rpcFunc) (zItem, error) {
+	params := map[string]any{
+		"output":      []string{"itemid", "hostid", "value_type", "name", "units"},
+		"host":        host,
+		"filter":      map[string]string{"key_": key},
+		"selectHosts": []string{"hostid", "host"},
+		"limit":       1,
+	}
+	var items []zItem
+	if err := rpc(ctx, "item.get", params, &items); err != nil {
+		return zItem{}, err
+	}
+	if len(items) == 0 {
+		return zItem{}, fmt.Errorf("zabbix: no item with exact key %q on host %q: %w", key, host, ErrNotFound)
+	}
+	item := items[0]
+	hostID, ok := hostRefFor(item.Hosts, host)
+	if !ok || hostID == "" || item.ItemID == "" || (item.HostID != "" && hostID != item.HostID) {
+		return zItem{}, fmt.Errorf("zabbix: item %q (key %q) is not linked to host %q: %w", item.ItemID, key, host, ErrNotFound)
+	}
+	return item, nil
 }
 
 // fetchSeries issues the one history.get (or trend.get, for windows older

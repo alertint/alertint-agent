@@ -91,18 +91,43 @@ func TestZabbixMetricExecutorNotFoundIsUnresolved(t *testing.T) {
 	}
 }
 
-func TestZabbixMetricExecutorHostFallsBackToSubjectID(t *testing.T) {
+// TestZabbixMetricExecutorEmptyHostIsUnresolvedNeverSubjectID pins F17:
+// a plan without a proven host is unresolvable — Scope.SubjectID is never
+// substituted, and no request is reserved.
+func TestZabbixMetricExecutorEmptyHostIsUnresolvedNeverSubjectID(t *testing.T) {
 	client := &fakeZabbixMetricClient{series: zabbix.Series{}}
 	e := &ZabbixMetricExecutor{Client: client}
 	plan := planWithParams(zabbixMetricParameters{ItemKey: "system.cpu.util"}) // no host
 	plan.Scope.SubjectID = "web01"
+	rec := &capturingRecorder{}
 
-	run, err := e.Execute(context.Background(), plan, &noopRecorder{})
+	run, err := e.Execute(context.Background(), plan, rec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if run.Status != "confirmed_empty" {
-		t.Fatalf("status = %q, want confirmed_empty (host fell back to SubjectID)", run.Status)
+	if run.Status != "vocabulary_unresolved" {
+		t.Fatalf("status = %q, want vocabulary_unresolved (never a SubjectID fallback)", run.Status)
+	}
+	if rec.reservations != 0 || client.gotLimit != 0 {
+		t.Fatal("an unresolvable plan must reserve and dispatch nothing")
+	}
+}
+
+// TestZabbixProblemExecutorEmptyHostIsUnresolvedNeverSubjectID is the
+// problem-history twin of the test above.
+func TestZabbixProblemExecutorEmptyHostIsUnresolvedNeverSubjectID(t *testing.T) {
+	e := &ZabbixProblemExecutor{Client: &fakeZabbixProblemClient{}}
+	plan := testStorePlan()
+	plan.Scope.SubjectID = "web01"
+	plan.Parameters = mustMarshal(zabbixProblemParameters{TriggerID: "18422"}) // no host
+	rec := &capturingRecorder{}
+
+	run, err := e.Execute(context.Background(), plan, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != "vocabulary_unresolved" || rec.reservations != 0 {
+		t.Fatalf("status = %q reservations = %d, want vocabulary_unresolved with nothing reserved", run.Status, rec.reservations)
 	}
 }
 

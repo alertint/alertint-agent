@@ -52,7 +52,7 @@ func TestProblemHistory_RefusesOversizedDecodedBody(t *testing.T) {
 func TestMetricHistoryBounded_RefusesOversizedDecodedBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if readRPC(r).Method == "item.get" {
-			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[{"itemid":"100","value_type":"0"}],"id":1}`))
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[{"itemid":"100","value_type":"0","hosts":[{"hostid":"10","host":"web01"}]}],"id":1}`))
 			return
 		}
 		_, _ = w.Write(oversizedRPCBody())

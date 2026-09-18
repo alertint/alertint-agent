@@ -26,16 +26,28 @@ type SentryClient interface {
 		before func() error, after func(started bool, err error)) (sentry.IssuePage, error)
 }
 
+// sentryParameters is sentry_issues' own typed Plan.Parameters shape: the
+// planner-resolved configured project slug and (optional) environment.
+// When present with a project it is authoritative; the ProjectEnv scope
+// callback is only the fallback for a plan that carries none.
+type sentryParameters struct {
+	Project     string `json:"project"`
+	Environment string `json:"environment,omitempty"`
+}
+
 // SentryExecutor implements observation.Executor for sentry_issues: the
-// existing configured service-to-project/environment mapping, bounded
+// planner's typed project/environment parameters (or, absent those, the
+// existing configured service-to-project/environment mapping), bounded
 // issue-summary fetch with pagination/truncation metadata, and the
 // existing exception/message privacy switch (IncludeMessage) — never
 // Issue.Title, which embeds the message unconditionally.
 type SentryExecutor struct {
 	Client SentryClient
-	// ProjectEnv resolves scope to its configured Sentry project/environment;
-	// ok=false means no mapping exists for this scope (unresolvable, never a
-	// broad fallback to an arbitrary project).
+	// ProjectEnv resolves scope to its configured Sentry project/environment
+	// when Plan.Parameters carries no project; ok=false means no mapping
+	// exists for this scope (unresolvable, never a broad fallback to an
+	// arbitrary project). Scope.Labels carries only allowlisted selector
+	// labels, never alert-only ones such as alertname/severity.
 	ProjectEnv     func(scope model.Scope) (project, env string, ok bool)
 	IncludeMessage bool
 	Clock          func() time.Time
@@ -48,13 +60,33 @@ func (e *SentryExecutor) clock() time.Time {
 	return time.Now().UTC()
 }
 
+// resolveProjectEnv reads the typed parameters first and falls back to the
+// scope mapping only when they carry no project. Malformed parameters are
+// unresolvable, never silently ignored.
+func (e *SentryExecutor) resolveProjectEnv(plan model.Plan) (project, env string, ok bool) {
+	if len(plan.Parameters) > 0 {
+		var params sentryParameters
+		if err := json.Unmarshal(plan.Parameters, &params); err != nil {
+			return "", "", false
+		}
+		if params.Project != "" {
+			return params.Project, params.Environment, true
+		}
+	}
+	if e.ProjectEnv == nil {
+		return "", "", false
+	}
+	project, env, ok = e.ProjectEnv(plan.Scope)
+	if !ok || project == "" {
+		return "", "", false
+	}
+	return project, env, true
+}
+
 func (e *SentryExecutor) Execute(ctx context.Context, plan model.Plan, recorder observation.RequestRecorder) (model.Run, error) {
 	now := e.clock()
-	if e.ProjectEnv == nil {
-		return unresolvedRun(plan, now), nil
-	}
-	project, env, ok := e.ProjectEnv(plan.Scope)
-	if !ok || project == "" {
+	project, env, ok := e.resolveProjectEnv(plan)
+	if !ok {
 		return unresolvedRun(plan, now), nil
 	}
 

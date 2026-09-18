@@ -37,7 +37,7 @@ func TestProblemHistoryResolvesRecoveryClock(t *testing.T) {
 		switch {
 		case call.Method == "event.get" && call.Params["value"] != nil:
 			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":[
-				{"eventid":"18422","objectid":"18422","clock":"1788714000","r_eventid":"20",
+				{"eventid":"18422","objectid":"18422","hosts":[{"hostid":"10","host":"web01"}],"clock":"1788714000","r_eventid":"20",
 				 "severity":"3","acknowledged":"0","suppressed":"0","cause_eventid":"0","tags":[]}
 			]}`))
 		case call.Method == "event.get":
@@ -82,7 +82,7 @@ func TestProblemHistoryMissingRecoveryEventIsUnknown(t *testing.T) {
 		switch {
 		case call.Params["value"] != nil:
 			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":[
-				{"eventid":"1","objectid":"1","clock":"1788714000","r_eventid":"99",
+				{"eventid":"1","objectid":"1","hosts":[{"hostid":"10","host":"web01"}],"clock":"1788714000","r_eventid":"99",
 				 "severity":"2","acknowledged":"0","suppressed":"0","cause_eventid":"0"}
 			]}`))
 		default:
@@ -115,7 +115,7 @@ func TestProblemHistoryMissingRecoveryEventIsUnknown(t *testing.T) {
 func TestProblemHistoryStillOngoingWithoutRecoveryEvent(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":[
-			{"eventid":"1","objectid":"1","clock":"1788714000","r_eventid":"0",
+			{"eventid":"1","objectid":"1","hosts":[{"hostid":"10","host":"web01"}],"clock":"1788714000","r_eventid":"0",
 			 "severity":"3","acknowledged":"0","suppressed":"0","cause_eventid":"0"}
 		]}`))
 	}))
@@ -143,9 +143,9 @@ func TestProblemHistoryTruncatesAtLimit(t *testing.T) {
 			t.Fatalf("limit sent = %d, want 3 (2+1 overflow sentinel)", limit)
 		}
 		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":[
-			{"eventid":"1","objectid":"1","clock":"1","r_eventid":"0"},
-			{"eventid":"2","objectid":"1","clock":"2","r_eventid":"0"},
-			{"eventid":"3","objectid":"1","clock":"3","r_eventid":"0"}
+			{"eventid":"1","objectid":"1","hosts":[{"hostid":"10","host":"web01"}],"clock":"1","r_eventid":"0"},
+			{"eventid":"2","objectid":"1","hosts":[{"hostid":"10","host":"web01"}],"clock":"2","r_eventid":"0"},
+			{"eventid":"3","objectid":"1","hosts":[{"hostid":"10","host":"web01"}],"clock":"3","r_eventid":"0"}
 		]}`))
 	}))
 	defer srv.Close()
@@ -166,7 +166,7 @@ func TestProblemHistoryTruncatesAtLimit(t *testing.T) {
 func TestProblemHistoryBudgetExhaustedDuringRecoveryLookupPreservesPrimaryResult(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":[
-			{"eventid":"1","objectid":"1","clock":"1788714000","r_eventid":"20",
+			{"eventid":"1","objectid":"1","hosts":[{"hostid":"10","host":"web01"}],"clock":"1788714000","r_eventid":"20",
 			 "severity":"3","acknowledged":"0","suppressed":"0","cause_eventid":"0"}
 		]}`))
 	}))

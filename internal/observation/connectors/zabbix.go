@@ -34,10 +34,11 @@ type ZabbixProblemClient interface {
 // zabbixMetricParameters is zabbix_metric_range's own typed
 // Plan.Parameters shape: the exact adapter-resolved technical host and
 // item key from the source trigger's items — never a model-invented
-// metric key. Host falls back to Scope.SubjectID when omitted (still
-// code-derived, never model-authored); ItemKey has no fallback.
+// metric key. BOTH are required: a plan without a proven host is
+// unresolvable, never a Scope.SubjectID guess that could read another
+// host's item (F17).
 type zabbixMetricParameters struct {
-	Host    string `json:"host,omitempty"`
+	Host    string `json:"host"`
 	ItemKey string `json:"item_key"`
 }
 
@@ -64,13 +65,13 @@ func (e *ZabbixMetricExecutor) Execute(ctx context.Context, plan model.Plan, rec
 		}
 	}
 	host := params.Host
-	if host == "" {
-		host = plan.Scope.SubjectID
-	}
 	if host == "" || params.ItemKey == "" {
 		return unresolvedRun(plan, now), nil
 	}
 
+	// Two reservations: the exact item.get, then history.get/trend.get. A
+	// second reservation denied by budget surfaces as withheld_by_budget
+	// below, with the first request still honestly accounted for.
 	before, after, budgetExhausted := requestHooks(ctx, recorder, e.clock)
 	limit := plan.Limit
 	if limit <= 0 {
@@ -119,9 +120,10 @@ func (e *ZabbixMetricExecutor) Execute(ctx context.Context, plan model.Plan, rec
 }
 
 // zabbixProblemParameters is zabbix_problem_history's own typed
-// Plan.Parameters shape: exact member host/trigger identifiers.
+// Plan.Parameters shape: exact member host/trigger identifiers. Host and
+// TriggerID are both required — there is no Scope.SubjectID fallback (F17).
 type zabbixProblemParameters struct {
-	Host        string `json:"host,omitempty"`
+	Host        string `json:"host"`
 	TriggerID   string `json:"trigger_id"`
 	SeverityMin string `json:"severity_min,omitempty"`
 }
@@ -149,13 +151,13 @@ func (e *ZabbixProblemExecutor) Execute(ctx context.Context, plan model.Plan, re
 		}
 	}
 	host := params.Host
-	if host == "" {
-		host = plan.Scope.SubjectID
-	}
 	if host == "" || params.TriggerID == "" {
 		return unresolvedRun(plan, now), nil
 	}
 
+	// Up to two reservations: the primary event.get and the batched
+	// recovery-clock lookup; the client degrades a budget-denied second
+	// request to recovery_unknown rather than losing the primary evidence.
 	before, after, budgetExhausted := requestHooks(ctx, recorder, e.clock)
 	limit := plan.Limit
 	if limit <= 0 {
@@ -173,6 +175,10 @@ func (e *ZabbixProblemExecutor) Execute(ctx context.Context, plan model.Plan, re
 		return model.Run{}, fmt.Errorf("connectors: zabbix problem history: %w", err)
 	}
 
+	if result.ForeignRowsDropped > 0 && len(result.Episodes) == 0 {
+		return unresolvedRun(plan, now), nil
+	}
+
 	// Canonical order (newest event id first) before hashing (F28). The
 	// client already applied its own limit+1 truncation under the source's
 	// clock/eventid sort.
@@ -184,17 +190,22 @@ func (e *ZabbixProblemExecutor) Execute(ctx context.Context, plan model.Plan, re
 	if err != nil {
 		return model.Run{}, fmt.Errorf("connectors: marshal zabbix episodes: %w", err)
 	}
-	omitted := len(episodes) - kept
+	omittedSourceRows := result.ForeignRowsDropped
 	if result.Truncated {
-		omitted++ // the overflow sentinel row: at least one more episode exists
+		// The overflow sentinel can itself be an unlinked row. Count it
+		// once: these counts are a lower bound on omitted source rows.
+		omittedSourceRows = max(omittedSourceRows, 1)
 	}
 	var extra []string
+	if result.ForeignRowsDropped > 0 {
+		extra = append(extra, "source_scope_unverified")
+	}
 	if result.UnresolvedRecoveryCount > 0 {
 		extra = append(extra, limitationRecoveryUnknown)
 	}
 	return boundedRun(plan, now, boundedResult{
-		Kind: "problem_episode", Value: value, Returned: kept, Omitted: omitted,
-		Truncated: result.Truncated || !result.Complete, Capped: kept < len(episodes),
+		Kind: "problem_episode", Value: value, Returned: kept, Omitted: len(episodes) - kept + omittedSourceRows,
+		Truncated: result.Truncated || !result.Complete || result.ForeignRowsDropped > 0, Capped: kept < len(episodes),
 		ExtraLimitations: extra, ExpiresAt: expiresAt,
 	}), nil
 }

@@ -16,15 +16,17 @@ import (
 )
 
 type fakeSentryClient struct {
-	page          sentry.IssuePage
-	err           error
-	physicalCalls int
-	gotLimit      int
+	page               sentry.IssuePage
+	err                error
+	physicalCalls      int
+	gotLimit           int
+	gotProject, gotEnv string
 }
 
 func (f *fakeSentryClient) ListIssuesBounded(ctx context.Context, project, env string, start, end time.Time, query string, limit int,
 	before func() error, after func(started bool, err error)) (sentry.IssuePage, error) {
 	f.gotLimit = limit
+	f.gotProject, f.gotEnv = project, env
 	if err := before(); err != nil {
 		return sentry.IssuePage{}, err
 	}
@@ -104,6 +106,86 @@ func TestSentryExecutorUnresolvedWithoutMapping(t *testing.T) {
 	}
 	if run.Status != "vocabulary_unresolved" {
 		t.Fatalf("status = %q, want vocabulary_unresolved", run.Status)
+	}
+}
+
+// TestSentryExecutorReadsTypedParametersFirst proves the planner's typed
+// {"project","environment"} parameters are authoritative: they are used
+// even with no scope mapping configured, and they override one when both
+// exist.
+func TestSentryExecutorReadsTypedParametersFirst(t *testing.T) {
+	plan := testStorePlan()
+	plan.Parameters = mustMarshal(sentryParameters{Project: "payments", Environment: "staging"})
+
+	t.Run("no scope mapping", func(t *testing.T) {
+		client := &fakeSentryClient{page: sentry.IssuePage{Issues: []sentry.Issue{{ID: "1"}}}}
+		run, err := (&SentryExecutor{Client: client}).Execute(context.Background(), plan, &noopRecorder{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if run.Status != model.ResultConfirmedValue || client.gotProject != "payments" || client.gotEnv != "staging" {
+			t.Fatalf("status=%q project=%q env=%q, want the typed parameters used", run.Status, client.gotProject, client.gotEnv)
+		}
+	})
+	t.Run("overrides scope mapping", func(t *testing.T) {
+		client := &fakeSentryClient{}
+		e := &SentryExecutor{Client: client, ProjectEnv: mappedProjectEnv("checkout", "prod")}
+		if _, err := e.Execute(context.Background(), plan, &noopRecorder{}); err != nil {
+			t.Fatal(err)
+		}
+		if client.gotProject != "payments" || client.gotEnv != "staging" {
+			t.Fatalf("project=%q env=%q, want the typed parameters over the scope mapping", client.gotProject, client.gotEnv)
+		}
+	})
+	t.Run("empty environment allowed", func(t *testing.T) {
+		client := &fakeSentryClient{}
+		p := testStorePlan()
+		p.Parameters = []byte(`{"project":"payments","environment":""}`)
+		run, err := (&SentryExecutor{Client: client}).Execute(context.Background(), p, &noopRecorder{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if run.Status != model.ResultConfirmedEmpty || client.gotProject != "payments" || client.gotEnv != "" {
+			t.Fatalf("status=%q project=%q env=%q", run.Status, client.gotProject, client.gotEnv)
+		}
+	})
+}
+
+// TestSentryExecutorFallsBackToScopeMappingWithoutProjectParameter proves
+// parameters that carry no project defer to the configured mapping, and
+// that no project from either source is the existing unresolved run.
+func TestSentryExecutorFallsBackToScopeMappingWithoutProjectParameter(t *testing.T) {
+	plan := testStorePlan()
+	plan.Parameters = []byte(`{"environment":"staging"}`)
+
+	client := &fakeSentryClient{}
+	e := &SentryExecutor{Client: client, ProjectEnv: mappedProjectEnv("checkout", "prod")}
+	if _, err := e.Execute(context.Background(), plan, &noopRecorder{}); err != nil {
+		t.Fatal(err)
+	}
+	if client.gotProject != "checkout" || client.gotEnv != "prod" {
+		t.Fatalf("project=%q env=%q, want the scope mapping as fallback", client.gotProject, client.gotEnv)
+	}
+
+	rec := &capturingRecorder{}
+	run, err := (&SentryExecutor{Client: &fakeSentryClient{}}).Execute(context.Background(), plan, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != model.ResultVocabularyUnresolved || rec.reservations != 0 {
+		t.Fatalf("status=%q reservations=%d, want vocabulary_unresolved with nothing reserved", run.Status, rec.reservations)
+	}
+}
+
+func TestSentryExecutorMalformedParametersUnresolved(t *testing.T) {
+	plan := testStorePlan()
+	plan.Parameters = []byte(`{"project":`)
+	run, err := (&SentryExecutor{Client: &fakeSentryClient{}, ProjectEnv: mappedProjectEnv("checkout", "prod")}).Execute(context.Background(), plan, &noopRecorder{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != model.ResultVocabularyUnresolved {
+		t.Fatalf("status = %q, want vocabulary_unresolved for malformed parameters", run.Status)
 	}
 }
 
