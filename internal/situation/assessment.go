@@ -383,6 +383,15 @@ func DeriveEvidenceQuality(snap Snapshot) model.EvidenceQuality {
 			confirmed++
 		}
 	}
+	for _, f := range snap.Observations {
+		if !f.Material {
+			continue
+		}
+		total++
+		if f.Freshness == "fresh" && (f.ResultStatus == "confirmed_value" || f.ResultStatus == "confirmed_empty") {
+			confirmed++
+		}
+	}
 	switch {
 	case total == 0 || confirmed == 0:
 		return model.EvidenceQualityInsufficient

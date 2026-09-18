@@ -839,6 +839,7 @@ func loadCommunicatedHistoryTx(ctx context.Context, tx *sql.Tx, situationID stri
 // given effect-class and status families. classes and statuses are
 // constant SQL literal lists owned by this file, never caller input.
 func historyTransitionsTx(ctx context.Context, tx *sql.Tx, situationID, classes, statuses string, beforeSequence int) ([]situationmodel.Transition, error) {
+	// #nosec G202 -- classes/statuses and transitionColumns are file-owned SQL constants; values are bound below.
 	query := `
 		SELECT ` + transitionColumns + `
 		FROM situation_transitions

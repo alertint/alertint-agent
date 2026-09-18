@@ -2072,7 +2072,6 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 	if err != nil {
 		return err
 	}
-
 	if err := refundBudgetDeniedAttemptTx(ctx, tx, claim, commit); err != nil {
 		return err
 	}

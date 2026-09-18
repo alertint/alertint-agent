@@ -15,8 +15,8 @@ import (
 )
 
 // ----------------------------------------------------------------------
-// Migration 0023 upgrade test: a populated migration-21 database (the
-// schema as it existed before Plan 4) must upgrade through 0022/0023
+// Plan 4 upgrade test: a populated migration-21 database (the
+// schema as it existed before Plan 4) must upgrade through 0026–0030
 // without disturbing existing deliveries, source identity, the
 // notification queue, foreign keys, or the audit hash chain — plan.md
 // Task 7: "Populate the full migration-21 fixture, migrate through 23,
@@ -147,12 +147,12 @@ func TestSemanticProfilesUpgradeMigration21Database(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	if got != 26 {
-		t.Fatalf("MaxSchemaVersion = %d, want 26", got)
+	if got != 30 {
+		t.Fatalf("MaxSchemaVersion = %d, want 30", got)
 	}
 	var version int
-	if err := st.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 26 {
-		t.Fatalf("applied schema version = %d (err=%v), want 26", version, err)
+	if err := st.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 30 {
+		t.Fatalf("applied schema version = %d (err=%v), want 30", version, err)
 	}
 	var fkViolations int
 	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_foreign_key_check`).Scan(&fkViolations); err != nil || fkViolations != 0 {

@@ -3,10 +3,10 @@
 package situation
 
 import (
-	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
 	"sort"
 	"time"
 
+	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
@@ -422,6 +422,9 @@ type Symptom struct {
 // proposal or derive a deterministic one, with stable hashes over only its
 // material content. BuildSnapshot is the sole producer.
 type Snapshot struct {
+	// Observations are the same bounded prepared evidence used by material
+	// identity. They remain separate from the local fact table's closed schema.
+	ObservationChecks   []ObservationCheck
 	SituationID         string
 	InputVersion        int
 	Lifecycle           model.Lifecycle
@@ -607,6 +610,7 @@ func BuildSnapshot(in SnapshotInput) Snapshot {
 	observations, results := ProjectObservations(in.Prepared, in.Prepared.PlansByID, in.Now)
 
 	return Snapshot{
+		ObservationChecks:   preparedObservationChecks(in.Prepared),
 		SituationID:         in.Situation.ID,
 		InputVersion:        in.Situation.InputVersion,
 		Lifecycle:           in.Situation.Lifecycle,

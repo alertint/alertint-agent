@@ -30,6 +30,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Compact roots use overall-status indicators and copyable MCP commands;
   structured evidence and named alert changes stay in the thread. Each update
   distinguishes the next status check from an actually scheduled work retry.
+- Situation assessments reuse unchanged evidence across staggered observation
+  schedules instead of repeatedly calling the LLM. Stale, failed, and incomplete
+  checks remain explicit evidence gaps.
+- Source recovery deliveries now participate in Situation lifecycle evaluation,
+  with episode ordering that prevents an old resolution from closing a new firing.
+- Assessment usage includes cache tokens; hourly budget refusals defer work
+  without consuming an inference attempt when no request was sent.
 
 ## [0.13.6] - 2026-09-01
 

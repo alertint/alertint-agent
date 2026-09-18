@@ -72,7 +72,7 @@ func ProjectObservations(prepared PreparedState, planCapabilities map[string]obs
 			LimitationCodes: append([]string(nil), run.LimitationCodes...),
 			Reused:          run.ReusedFromRunID != nil,
 		})
-		for _, f := range run.Facts {
+		for _, f := range preparedObservationFacts(PreparedState{Runs: []observationmodel.Run{run}}) {
 			if f.Kind == "source_lifecycle" {
 				continue // lifecycle evidence is the controller's, never the model's
 			}

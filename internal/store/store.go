@@ -101,6 +101,18 @@ func buildDSN(dbPath string) string {
 // ascending version order, each inside its own transaction, with the
 // applied version recorded in schema_migrations.
 func (s *Store) migrate(ctx context.Context) error {
+	// Pre-release Plan 4 used versions 22–26 for evidence tables. Those
+	// numbers now belong to the shipped operator migrations. Refuse the
+	// ambiguous legacy lineage before applying any schema changes.
+	var legacyPlan4 bool
+	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS (
+		SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'situation_preparation_cycles'
+	) AND NOT EXISTS (SELECT 1 FROM pragma_table_info('notification_intents') WHERE name = 'reply_kind')`).Scan(&legacyPlan4); err != nil {
+		return fmt.Errorf("store: inspect migration lineage: %w", err)
+	}
+	if legacyPlan4 {
+		return fmt.Errorf("store: unsupported pre-release Plan 4 migration lineage: preserve this database and use a fresh database or the operator migration lineage")
+	}
 	if _, err := s.db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version    INTEGER PRIMARY KEY,

@@ -72,7 +72,7 @@ func newPrepE2EFixture(t *testing.T) *prepE2EFixture {
 	}
 	f := &prepE2EFixture{
 		t: t, ctx: ctx, path: path, st: st, owner: "prep-e2e",
-		clock: &e2eClock{now: time.Date(2026, 9, 7, 10, 0, 0, 0, time.UTC)},
+		clock: &e2eClock{now: time.Now().UTC()},
 	}
 	f.srv = f.newHost(st)
 	t.Cleanup(func() { f.srv.Close() })

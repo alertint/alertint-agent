@@ -1054,8 +1054,8 @@ type lifecycleResolution struct {
 // preparation cycle is durably underway for this input (in.Prepared.CycleID
 // != "" — set only by the reload after a real EvidencePreparer ran,
 // preparation.go's own doc comment), sl (this SAME cycle's
-// ReduceSourceLifecycle fold, computed by the caller from
-// in.Prepared.Lifecycle) REPLACES the pre-Plan-4 local-only Delivery/Symptom
+// ReduceSourceLifecycle fold, computed by the caller from prepared source
+// observations and latest deliveries) REPLACES the pre-Plan-4 Delivery/Symptom
 // inference entirely (spec.md R13: source acquisition mode and interval,
 // never Delivery.StartedAtBasis alone). recoveryObserved marks "genuinely
 // have complete resolved evidence, begin the grace clock": in the prepared
@@ -1064,8 +1064,8 @@ type lifecycleResolution struct {
 // observed yet (no connector silence, no total preparation failure) must
 // never be mistaken for resolved (plan.md: "cannot... invent source state,
 // or remove a source failure"). A cycle whose lifecycle-phase evidence
-// turned up nothing at all (in.Prepared.CycleID != "" but sl is its zero
-// value) therefore safely falls through to the SAME "stay active" default
+// turned up nothing at all and has no delivery truth (in.Prepared.CycleID
+// != "" but sl is its zero value) safely falls through to the "stay active" default
 // the pre-Plan-4 empty-Symptoms edge case already used, rather than reading
 // silence as recovery. In the local-only fallback (no cycle at all — every
 // pre-Task-6 fixture), recoveryObserved is len(snap.Symptoms) > 0, exactly
@@ -1176,16 +1176,51 @@ func (c *Controller) resolveLifecycle(cur model.Situation, in SnapshotInput, sna
 	}
 }
 
-// reduceSourceLifecycle folds in.Prepared.Lifecycle across in's expected
-// member Alerts, or returns the zero SourceLifecycle when no preparation
-// cycle exists yet for this input (in.Prepared.CycleID == "") —
+// reduceSourceLifecycle folds prepared observations and authoritative latest
+// deliveries across in's expected member Alerts, or returns zero when no
+// preparation cycle exists yet for this input (in.Prepared.CycleID == "") —
 // resolveLifecycle's prepared branch only ever runs once a cycle exists, so
 // an unpopulated fold is never consulted in that case.
 func reduceSourceLifecycle(cfg ControllerConfig, in SnapshotInput, now time.Time) SourceLifecycle {
 	if in.Prepared.CycleID == "" {
 		return SourceLifecycle{}
 	}
-	return ReduceSourceLifecycle(in.Prepared.Lifecycle, expectedAlertIDs(in.Deliveries), now, cfg.WebhookRecoveryGrace)
+	latest := make(map[string]Delivery, len(in.Deliveries))
+	for _, d := range in.Deliveries {
+		id := d.AlertID
+		if id == "" {
+			id = "delivery:" + d.ID
+		}
+		cur, ok := latest[id]
+		newer := deliveryLess(cur, d)
+		// Preserve source-episode/receipt ordering, but never let an
+		// arbitrary row ID resolve a simultaneous firing observation.
+		if ok && sourceTimeKey(d).Equal(sourceTimeKey(cur)) && d.ReceivedAt.Equal(cur.ReceivedAt) && d.Status != cur.Status {
+			newer = d.Status == model.DeliveryStatusFiring
+		}
+		if !ok || newer {
+			latest[id] = d
+		}
+	}
+	observations := make([]SourceObservation, 0, len(in.Prepared.Lifecycle)+len(latest))
+	observations = append(observations, in.Prepared.Lifecycle...)
+	for id, d := range latest {
+		// Receipt time is when this delivery was observed, not this cycle's
+		// now: newer prepared source evidence must still supersede it.
+		deadline := d.ReceivedAt.Add(observationmodel.LifecycleHorizon(observationmodel.WidestHorizonTier(in.Prepared.ProfileGuidance)))
+		for _, observed := range in.Prepared.Lifecycle {
+			if observed.AlertID == id && observed.EpisodeKey == d.EpisodeKey && observed.ObservedAt.Equal(d.ReceivedAt) && !observed.DeadlineAt.IsZero() {
+				deadline = observed.DeadlineAt
+			}
+		}
+		observations = append(observations, SourceObservation{
+			AlertID: id, EpisodeKey: d.EpisodeKey, Source: d.Source, DeadlineAt: deadline,
+			State: string(d.Status), ObservedAt: d.ReceivedAt,
+			EventStartedAt: d.SourceStartedAt, EventResolvedAt: d.SourceResolvedAt,
+			AcquisitionMode: d.AcquisitionMode, PollIntervalSeconds: d.PollIntervalSeconds,
+		})
+	}
+	return ReduceSourceLifecycle(observations, expectedAlertIDs(in.Deliveries), now, cfg.WebhookRecoveryGrace)
 }
 
 // prepareLifecyclePhase runs the lifecycle-phase EvidencePreparer (plan.md's
