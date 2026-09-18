@@ -551,9 +551,14 @@ func newPreparationRuntime(
 	}
 	sweeps := []*preparationSweep{
 		newPreparationSweep("semantic_profile_fanout", 10*time.Second, func(ctx context.Context, now time.Time) (int, error) {
-			n, err := st.DeliverSemanticProfileChanges(ctx, now, 100)
-			if err == nil && n > 0 && auditor != nil {
-				_ = auditor.Append(ctx, preparationAuditActor, "semantic_profile.change_delivered", map[string]any{"delivered_count": n})
+			delivery, err := st.DeliverSemanticProfileChangesDetailed(ctx, now, 100)
+			n := len(delivery.SituationIDs)
+			if err == nil && delivery.ChangeID != "" && auditor != nil {
+				_ = auditor.Append(ctx, preparationAuditActor, "semantic_profile.change_delivered", map[string]any{
+					"change_id": delivery.ChangeID, "signature_key": delivery.SignatureKey,
+					"version_id": delivery.VersionID, "situation_ids": delivery.SituationIDs,
+					"delivered_count": n, "acknowledged": delivery.Acknowledged,
+				})
 			}
 			return n, err
 		}, now, logger),
