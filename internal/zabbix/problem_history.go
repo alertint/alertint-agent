@@ -31,13 +31,30 @@ type ProblemEpisode struct {
 }
 
 // ProblemHistoryResult is ProblemHistory's bounded result: bounded episodes,
-// whether the window was fully covered, and how many resolved episodes
-// could not have their recovery time confirmed.
+// whether the window was fully covered, how many resolved episodes could
+// not have their recovery time confirmed, and how many source rows were
+// dropped because they did not provably reference the requested trigger
+// and host.
 type ProblemHistoryResult struct {
 	Episodes                []ProblemEpisode
 	Complete                bool
 	Truncated               bool
 	UnresolvedRecoveryCount int
+	ForeignRowsDropped      int
+}
+
+// eventRow is the event.get row shape ProblemHistory reads.
+type eventRow struct {
+	EventID      string     `json:"eventid"`
+	ObjectID     string     `json:"objectid"`
+	Clock        string     `json:"clock"`
+	REventID     string     `json:"r_eventid"`
+	Severity     string     `json:"severity"`
+	Acknowledged string     `json:"acknowledged"`
+	Suppressed   string     `json:"suppressed"`
+	CauseEventID string     `json:"cause_eventid"`
+	Tags         []KV       `json:"tags"`
+	Hosts        []zHostRef `json:"hosts"`
 }
 
 // ProblemHistory returns host+triggerID's bounded problem/recovery episode
@@ -49,6 +66,11 @@ type ProblemHistoryResult struct {
 // those episodes to RecoveryUnknown rather than failing the whole call —
 // spec.md: "a request budget exhausted between problem and recovery
 // lookup" must not lose the already-fetched primary evidence.
+//
+// Linkage is verified, never assumed: a returned row must reference the
+// requested trigger (objectid) and the requested host through selectHosts;
+// any other row is dropped and counted in
+// ForeignRowsDropped.
 func (c *Client) ProblemHistory(ctx context.Context, host, triggerID string, start, end time.Time, severityMin string, limit int,
 	before func() error, after func(started bool, err error)) (ProblemHistoryResult, error) {
 	if limit <= 0 {
@@ -57,32 +79,27 @@ func (c *Client) ProblemHistory(ctx context.Context, host, triggerID string, sta
 	params := map[string]any{
 		"source": 0, "object": 0, "objectids": []string{triggerID}, "value": 1,
 		"problem_time_from": start.UTC().Unix(), "problem_time_till": end.UTC().Unix(),
-		"output":     []string{"eventid", "objectid", "clock", "r_eventid", "severity", "acknowledged", "suppressed", "cause_eventid"},
-		"selectTags": "extend",
-		"sortfield":  []string{"clock", "eventid"}, "sortorder": "DESC",
+		"output":      []string{"eventid", "objectid", "clock", "r_eventid", "severity", "acknowledged", "suppressed", "cause_eventid"},
+		"selectTags":  "extend",
+		"selectHosts": []string{"hostid", "host"},
+		"sortfield":   []string{"clock", "eventid"}, "sortorder": "DESC",
 		"limit": limit + 1,
 	}
 	if severityMin != "" {
 		params["severities"] = severitiesFrom(severityMin)
 	}
 
-	var rows []struct {
-		EventID      string `json:"eventid"`
-		ObjectID     string `json:"objectid"`
-		Clock        string `json:"clock"`
-		REventID     string `json:"r_eventid"`
-		Severity     string `json:"severity"`
-		Acknowledged string `json:"acknowledged"`
-		Suppressed   string `json:"suppressed"`
-		CauseEventID string `json:"cause_eventid"`
-		Tags         []KV   `json:"tags"`
-	}
-	if err := c.callInstrumented(ctx, "event.get", params, true, &rows, before, after); err != nil {
+	var rows []eventRow
+	if err := c.callInstrumented(ctx, "event.get", params, &rows, before, after); err != nil {
 		return ProblemHistoryResult{}, err
 	}
 
+	// The overflow sentinel is judged on what the source returned: more than
+	// limit rows means the window holds more than we can persist, whether or
+	// not every returned row survives the linkage check below.
 	truncated := len(rows) > limit
-	if truncated {
+	rows, dropped := linkedEventRows(rows, triggerID, host)
+	if len(rows) > limit {
 		rows = rows[:limit]
 	}
 
@@ -100,7 +117,7 @@ func (c *Client) ProblemHistory(ctx context.Context, host, triggerID string, sta
 		}
 		if err := c.callInstrumented(ctx, "event.get", map[string]any{
 			"output": []string{"eventid", "clock"}, "eventids": recoveryIDs,
-		}, true, &recRows, before, after); err == nil {
+		}, &recRows, before, after); err == nil {
 			for _, rr := range recRows {
 				recoveryClocks[rr.EventID] = unixStr(rr.Clock)
 			}
@@ -113,8 +130,9 @@ func (c *Client) ProblemHistory(ctx context.Context, host, triggerID string, sta
 	unresolvedRecoveryCount := 0
 	episodes := make([]ProblemEpisode, 0, len(rows))
 	for _, r := range rows {
+		hostID, _ := hostRefFor(r.Hosts, host)
 		ep := ProblemEpisode{
-			EventID: r.EventID, TriggerID: r.ObjectID, HostID: host,
+			EventID: r.EventID, TriggerID: r.ObjectID, HostID: hostID,
 			Start: unixStr(r.Clock), Severity: r.Severity,
 			Acknowledged: r.Acknowledged == "1", Suppressed: r.Suppressed == "1" || r.Suppressed == "true",
 			Tags: r.Tags, CauseEventID: r.CauseEventID,
@@ -134,9 +152,29 @@ func (c *Client) ProblemHistory(ctx context.Context, host, triggerID string, sta
 	}
 
 	return ProblemHistoryResult{
-		Episodes: episodes, Complete: !truncated, Truncated: truncated,
-		UnresolvedRecoveryCount: unresolvedRecoveryCount,
+		Episodes: episodes, Complete: !truncated && dropped == 0, Truncated: truncated,
+		UnresolvedRecoveryCount: unresolvedRecoveryCount, ForeignRowsDropped: dropped,
 	}, nil
+}
+
+// linkedEventRows keeps only the rows that reference triggerID and prove
+// their host linkage with selectHosts, returning them and the count of
+// rows dropped.
+func linkedEventRows(rows []eventRow, triggerID, host string) ([]eventRow, int) {
+	kept := make([]eventRow, 0, len(rows))
+	dropped := 0
+	for _, r := range rows {
+		if r.ObjectID != triggerID {
+			dropped++
+			continue
+		}
+		if id, ok := hostRefFor(r.Hosts, host); !ok || id == "" {
+			dropped++
+			continue
+		}
+		kept = append(kept, r)
+	}
+	return kept, dropped
 }
 
 // EventLifecycleResult is EventLifecycle's affirmative state/timing for one
@@ -163,7 +201,7 @@ func (c *Client) EventLifecycle(ctx context.Context, eventID string,
 	}
 	if err := c.callInstrumented(ctx, "event.get", map[string]any{
 		"output": []string{"eventid", "clock", "r_eventid"}, "eventids": []string{eventID},
-	}, true, &rows, before, after); err != nil {
+	}, &rows, before, after); err != nil {
 		return EventLifecycleResult{}, err
 	}
 	if len(rows) == 0 {
@@ -182,7 +220,7 @@ func (c *Client) EventLifecycle(ctx context.Context, eventID string,
 	}
 	if err := c.callInstrumented(ctx, "event.get", map[string]any{
 		"output": []string{"clock"}, "eventids": []string{r.REventID},
-	}, true, &recRows, before, after); err == nil && len(recRows) > 0 {
+	}, &recRows, before, after); err == nil && len(recRows) > 0 {
 		t := unixStr(recRows[0].Clock)
 		result.Recovery = &t
 	} else {

@@ -5,6 +5,7 @@ package sentry
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -12,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	model "github.com/alertint/alertint-agent/internal/observation/model"
 )
 
 // defaultIssueQuery is the fixed issue-search filter for Spec 2 (KTD4). A
@@ -323,8 +326,11 @@ func (c *Client) ListIssuesBounded(ctx context.Context, project, env string, sta
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRespBody))
+	body, err := readBounded(resp.Body, model.MaxDecodedResponseBytes)
 	if err != nil {
+		if errors.Is(err, ErrResponseTooLarge) {
+			return IssuePage{}, err
+		}
 		return IssuePage{}, fmt.Errorf("sentry: read issues: %w", err)
 	}
 	var issues []Issue

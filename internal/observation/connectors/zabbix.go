@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/observation"
@@ -32,10 +34,11 @@ type ZabbixProblemClient interface {
 // zabbixMetricParameters is zabbix_metric_range's own typed
 // Plan.Parameters shape: the exact adapter-resolved technical host and
 // item key from the source trigger's items — never a model-invented
-// metric key. Host falls back to Scope.SubjectID when omitted (still
-// code-derived, never model-authored); ItemKey has no fallback.
+// metric key. BOTH are required: a plan without a proven host is
+// unresolvable, never a Scope.SubjectID guess that could read another
+// host's item (F17).
 type zabbixMetricParameters struct {
-	Host    string `json:"host,omitempty"`
+	Host    string `json:"host"`
 	ItemKey string `json:"item_key"`
 }
 
@@ -62,19 +65,22 @@ func (e *ZabbixMetricExecutor) Execute(ctx context.Context, plan model.Plan, rec
 		}
 	}
 	host := params.Host
-	if host == "" {
-		host = plan.Scope.SubjectID
-	}
 	if host == "" || params.ItemKey == "" {
 		return unresolvedRun(plan, now), nil
 	}
 
-	before, after, budgetExhausted := zabbixHooks(ctx, recorder, e.clock)
+	// Two reservations: the exact item.get, then history.get/trend.get. A
+	// second reservation denied by budget surfaces as withheld_by_budget
+	// below, with the first request still honestly accounted for.
+	before, after, budgetExhausted := requestHooks(ctx, recorder, e.clock)
 	limit := plan.Limit
 	if limit <= 0 {
 		limit = 100
 	}
-	series, err := e.Client.MetricHistoryBounded(ctx, host, params.ItemKey, plan.Start, plan.End, limit, before, after)
+	expiresAt := now.Add(model.MaxWindowHoursMetricsLogs * time.Hour)
+	// limit+1: one overflow sentinel row proves "more than limit" without
+	// ever treating the hard cap itself as completeness (F20).
+	series, err := e.Client.MetricHistoryBounded(ctx, host, params.ItemKey, plan.Start, plan.End, limit+1, before, after)
 	if err != nil {
 		if *budgetExhausted {
 			return withheldRun(plan, now), nil
@@ -82,37 +88,42 @@ func (e *ZabbixMetricExecutor) Execute(ctx context.Context, plan model.Plan, rec
 		if errors.Is(err, zabbix.ErrNotFound) {
 			return unresolvedRun(plan, now), nil
 		}
+		if isResponseTooLarge(err) {
+			return responseTooLargeRun(plan, now, expiresAt), nil
+		}
 		return model.Run{}, fmt.Errorf("connectors: zabbix metric history: %w", err)
 	}
 
-	status := model.ResultConfirmedEmpty
-	if len(series.Points) > 0 {
-		status = model.ResultConfirmedValue
-	}
-	value, err := json.Marshal(series)
+	// Canonical order (newest clock first, then value) before truncation and
+	// hashing (F28): trend.get has no sort parameter at all.
+	points := slices.Clone(series.Points)
+	slices.SortFunc(points, func(a, b zabbix.SeriesPoint) int {
+		if c := b.Clock.Compare(a.Clock); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Value, b.Value)
+	})
+	points, omitted, truncated := truncateToLimit(points, limit)
+
+	value, kept, err := fitFactValue(len(points), func(n int) ([]byte, error) {
+		bounded := series
+		bounded.Points = points[:n]
+		return json.Marshal(bounded)
+	})
 	if err != nil {
 		return model.Run{}, fmt.Errorf("connectors: marshal zabbix series: %w", err)
 	}
-	expiresAt := now.Add(model.MaxWindowHoursMetricsLogs * time.Hour)
-	fact := model.Fact{
-		ID: factID(plan.ID, "metric_summary", value), RunID: "run:" + plan.ID,
-		Kind: "metric_summary", Subject: plan.Scope.SubjectID, Digest: digestOf(value),
-		SchemaVersion: model.FactSchemaVersion, Value: value,
-		ResultStatus: status, Freshness: model.FreshnessFresh,
-		ObservedAt: now, ExpiresAt: expiresAt, Material: true,
-	}
-	return model.Run{
-		ID: "run:" + plan.ID, CycleID: plan.CycleID, PlanID: plan.ID, Status: status,
-		Coverage:   model.Coverage{Start: plan.Start, End: plan.End, Complete: true, Returned: len(series.Points)},
-		Facts:      []model.Fact{fact},
-		ObservedAt: now, ExpiresAt: expiresAt,
-	}, nil
+	return boundedRun(plan, now, boundedResult{
+		Kind: "metric_summary", Value: value, Returned: kept, Omitted: omitted + len(points) - kept,
+		Truncated: truncated, Capped: kept < len(points), ExpiresAt: expiresAt,
+	}), nil
 }
 
 // zabbixProblemParameters is zabbix_problem_history's own typed
-// Plan.Parameters shape: exact member host/trigger identifiers.
+// Plan.Parameters shape: exact member host/trigger identifiers. Host and
+// TriggerID are both required — there is no Scope.SubjectID fallback (F17).
 type zabbixProblemParameters struct {
-	Host        string `json:"host,omitempty"`
+	Host        string `json:"host"`
 	TriggerID   string `json:"trigger_id"`
 	SeverityMin string `json:"severity_min,omitempty"`
 }
@@ -140,95 +151,71 @@ func (e *ZabbixProblemExecutor) Execute(ctx context.Context, plan model.Plan, re
 		}
 	}
 	host := params.Host
-	if host == "" {
-		host = plan.Scope.SubjectID
-	}
 	if host == "" || params.TriggerID == "" {
 		return unresolvedRun(plan, now), nil
 	}
 
-	before, after, budgetExhausted := zabbixHooks(ctx, recorder, e.clock)
+	// Up to two reservations: the primary event.get and the batched
+	// recovery-clock lookup; the client degrades a budget-denied second
+	// request to recovery_unknown rather than losing the primary evidence.
+	before, after, budgetExhausted := requestHooks(ctx, recorder, e.clock)
 	limit := plan.Limit
 	if limit <= 0 {
 		limit = 20
 	}
+	expiresAt := now.Add(model.MaxWindowDaysHistory * 24 * time.Hour)
 	result, err := e.Client.ProblemHistory(ctx, host, params.TriggerID, plan.Start, plan.End, params.SeverityMin, limit, before, after)
 	if err != nil {
 		if *budgetExhausted {
 			return withheldRun(plan, now), nil
 		}
+		if isResponseTooLarge(err) {
+			return responseTooLargeRun(plan, now, expiresAt), nil
+		}
 		return model.Run{}, fmt.Errorf("connectors: zabbix problem history: %w", err)
 	}
 
-	status := model.ResultConfirmedEmpty
-	if len(result.Episodes) > 0 {
-		status = model.ResultConfirmedValue
-	}
-	if result.Truncated {
-		status = model.ResultTruncated
+	if result.ForeignRowsDropped > 0 && len(result.Episodes) == 0 {
+		return unresolvedRun(plan, now), nil
 	}
 
-	value, err := json.Marshal(result.Episodes)
+	// Canonical order (newest event id first) before hashing (F28). The
+	// client already applied its own limit+1 truncation under the source's
+	// clock/eventid sort.
+	episodes := slices.Clone(result.Episodes)
+	slices.SortFunc(episodes, func(a, b zabbix.ProblemEpisode) int { return compareIDs(b.EventID, a.EventID) })
+	value, kept, err := fitFactValue(len(episodes), func(n int) ([]byte, error) {
+		return json.Marshal(episodes[:n])
+	})
 	if err != nil {
 		return model.Run{}, fmt.Errorf("connectors: marshal zabbix episodes: %w", err)
 	}
-	expiresAt := now.Add(model.MaxWindowDaysHistory * 24 * time.Hour)
-	fact := model.Fact{
-		ID: factID(plan.ID, "problem_episode", value), RunID: "run:" + plan.ID,
-		Kind: "problem_episode", Subject: plan.Scope.SubjectID, Digest: digestOf(value),
-		SchemaVersion: model.FactSchemaVersion, Value: value,
-		ResultStatus: status, Freshness: model.FreshnessFresh,
-		ObservedAt: now, ExpiresAt: expiresAt, Material: true,
-	}
-
-	var limitationCodes []string
+	omittedSourceRows := result.ForeignRowsDropped
 	if result.Truncated {
-		limitationCodes = append(limitationCodes, "truncated")
+		// The overflow sentinel can itself be an unlinked row. Count it
+		// once: these counts are a lower bound on omitted source rows.
+		omittedSourceRows = max(omittedSourceRows, 1)
+	}
+	var extra []string
+	if result.ForeignRowsDropped > 0 {
+		extra = append(extra, "source_scope_unverified")
 	}
 	if result.UnresolvedRecoveryCount > 0 {
-		limitationCodes = append(limitationCodes, "recovery_unknown")
+		extra = append(extra, limitationRecoveryUnknown)
 	}
-	return model.Run{
-		ID: "run:" + plan.ID, CycleID: plan.CycleID, PlanID: plan.ID, Status: status,
-		Coverage:        model.Coverage{Start: plan.Start, End: plan.End, Complete: result.Complete, Returned: len(result.Episodes)},
-		Facts:           []model.Fact{fact},
-		LimitationCodes: limitationCodes,
-		ObservedAt:      now, ExpiresAt: expiresAt,
-	}, nil
+	return boundedRun(plan, now, boundedResult{
+		Kind: "problem_episode", Value: value, Returned: kept, Omitted: len(episodes) - kept + omittedSourceRows,
+		Truncated: result.Truncated || !result.Complete || result.ForeignRowsDropped > 0, Capped: kept < len(episodes),
+		ExtraLimitations: extra, ExpiresAt: expiresAt,
+	}), nil
 }
 
-// zabbixHooks builds a before/after pair bridging observation.RequestRecorder
-// into the zabbix client's own before()/after(started, err) instrumentation
-// shape, shared by both Zabbix executors. The returned bool pointer is set
-// true if any BeforeRequest call fails with model.ErrBudgetExhausted, so
-// the caller can distinguish "withheld by budget" from a real transport
-// failure after the client call returns.
+// limitationRecoveryUnknown marks a problem-history run in which at least
+// one resolved episode's recovery clock could not be confirmed.
+const limitationRecoveryUnknown = "recovery_unknown"
+
+// zabbixHooks is requestHooks under its original Zabbix-specific name,
+// kept for the existing hook tests.
 func zabbixHooks(ctx context.Context, recorder observation.RequestRecorder, clock func() time.Time) (func() error, func(started bool, err error), *bool) {
-	var lastReservationID string
-	budgetExhausted := new(bool)
-	before := func() error {
-		r, err := recorder.BeforeRequest(ctx)
-		if err != nil {
-			if errors.Is(err, model.ErrBudgetExhausted) {
-				*budgetExhausted = true
-			}
-			return err
-		}
-		lastReservationID = r.ID
-		return nil
-	}
-	after := func(started bool, callErr error) {
-		code := "ok"
-		s := model.RequestStartedTrue
-		if callErr != nil {
-			code = "transport_failure"
-		}
-		if !started {
-			s = model.RequestStartedFalse
-		}
-		_ = recorder.AfterRequest(ctx, model.RequestOutcome{
-			ReservationID: lastReservationID, RequestStarted: s, Code: code, CompletedAt: clock(),
-		})
-	}
-	return before, after, budgetExhausted
+	return requestHooks(ctx, recorder, clock)
 }

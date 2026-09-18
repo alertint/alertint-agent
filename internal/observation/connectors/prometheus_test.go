@@ -5,12 +5,16 @@ package connectors
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 
+	model "github.com/alertint/alertint-agent/internal/observation/model"
 	"github.com/alertint/alertint-agent/internal/prometheus"
 )
 
@@ -105,6 +109,43 @@ func TestPrometheusExecutorTruncatesOverLimit(t *testing.T) {
 	if len(run.LimitationCodes) == 0 {
 		t.Fatal("expected a truncated limitation code")
 	}
+	if run.Coverage.Complete || run.Coverage.Returned != 2 || run.Coverage.Omitted < 1 {
+		t.Fatalf("coverage = %+v, want incomplete with 2 returned and the sentinel counted as omitted", run.Coverage)
+	}
+}
+
+// TestPrometheusSeriesPermutationIsImmaterial proves F28: the same series
+// set in a different source order yields the same summary bytes, so the
+// same fact digest and id.
+func TestPrometheusSeriesPermutationIsImmaterial(t *testing.T) {
+	a := json.RawMessage(`{"resultType":"matrix","result":[{"metric":{"service":"a"},"values":[[1,"1"]]},{"metric":{"service":"b"},"values":[[1,"2"]]},{"metric":{"env":"x","service":"a"},"values":[[1,"3"]]}]}`)
+	b := json.RawMessage(`{"resultType":"matrix","result":[{"metric":{"env":"x","service":"a"},"values":[[1,"3"]]},{"metric":{"service":"b"},"values":[[1,"2"]]},{"metric":{"service":"a"},"values":[[1,"1"]]}]}`)
+	sa, _, err := summarizePrometheusMatrix(a, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, _, err := summarizePrometheusMatrix(b, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	va, err := json.Marshal(sa)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vb, err := json.Marshal(sb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digestOf(va) != digestOf(vb) {
+		t.Fatalf("same series set changes evidence digest after permutation: %s vs %s", digestOf(va), digestOf(vb))
+	}
+	// Truncation also picks the same prefix regardless of source order.
+	ta, _, _ := summarizePrometheusMatrix(a, 2)
+	tb, _, _ := summarizePrometheusMatrix(b, 2)
+	if len(ta.Series) != 2 || canonicalLabelIdentity(ta.Series[0].Labels) != canonicalLabelIdentity(tb.Series[0].Labels) ||
+		canonicalLabelIdentity(ta.Series[1].Labels) != canonicalLabelIdentity(tb.Series[1].Labels) {
+		t.Fatalf("truncation kept a different prefix under permutation: %+v vs %+v", ta.Series, tb.Series)
+	}
 }
 
 func TestPrometheusExecutorRejectsNonfiniteSamples(t *testing.T) {
@@ -149,5 +190,98 @@ func TestPrometheusExecutorUnresolvedWithoutScopeLabels(t *testing.T) {
 	}
 	if run.Status != "vocabulary_unresolved" {
 		t.Fatalf("status = %q, want vocabulary_unresolved", run.Status)
+	}
+}
+
+// TestPrometheusExecutorOversizedResponseIsTruncatedWithoutData proves an
+// over-cap decoded body (F10) becomes a truncated, incomplete,
+// response_too_large run with no facts — never an error, never partial data
+// — and that the one physical request's outcome is recorded with the
+// response_too_large code.
+func TestPrometheusExecutorOversizedResponseIsTruncatedWithoutData(t *testing.T) {
+	pad := strings.Repeat("x", model.MaxDecodedResponseBytes)
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[],"pad":"` + pad + `"}}`))
+	}))
+	defer srv.Close()
+
+	e := &PrometheusExecutor{Client: prometheus.NewClient(prometheus.Config{BaseURL: srv.URL, TimeoutSeconds: 5})}
+	plan := testStorePlan()
+	plan.Scope.Labels = map[string]string{"service": "checkout"}
+	rec := &capturingRecorder{}
+
+	run, err := e.Execute(context.Background(), plan, rec)
+	if err != nil {
+		t.Fatalf("an over-limit response is a limitation, not an execution error: %v", err)
+	}
+	if requests.Load() != 1 || rec.reservations != 1 {
+		t.Fatalf("physical=%d reservations=%d, want 1/1", requests.Load(), rec.reservations)
+	}
+	if got := rec.codes(); len(got) != 1 || got[0] != "response_too_large" {
+		t.Fatalf("outcome codes = %v, want [response_too_large]", got)
+	}
+	if run.Status != model.ResultTruncated || run.Coverage.Complete {
+		t.Fatalf("run status=%q complete=%v, want truncated/incomplete", run.Status, run.Coverage.Complete)
+	}
+	if len(run.LimitationCodes) != 1 || run.LimitationCodes[0] != "response_too_large" {
+		t.Fatalf("limitation codes = %v, want [response_too_large]", run.LimitationCodes)
+	}
+	if len(run.Facts) != 0 {
+		t.Fatalf("facts = %d, want none: no data from an unbounded response may be persisted", len(run.Facts))
+	}
+}
+
+// TestPrometheusExecutorCapsFactBytes proves a fact is never emitted above
+// model.MaxFactBytes: series are dropped deterministically from the tail
+// of the canonical order, the run reports fact_bytes_capped, and coverage
+// records the omission.
+func TestPrometheusExecutorCapsFactBytes(t *testing.T) {
+	// 60 series x ~500 bytes of labels each: far over the 16 KiB cap, well
+	// under the request limit (plan.Limit = 80).
+	var sb strings.Builder
+	sb.WriteString(`{"status":"success","data":{"resultType":"matrix","result":[`)
+	for i := 0; i < 60; i++ {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		fmt.Fprintf(&sb, `{"metric":{"instance":"i%02d","pad":"%s"},"values":[[1,"1"]]}`, i, strings.Repeat("p", 480))
+	}
+	sb.WriteString(`]}}`)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(sb.String()))
+	}))
+	defer srv.Close()
+
+	e := &PrometheusExecutor{Client: prometheus.NewClient(prometheus.Config{BaseURL: srv.URL, TimeoutSeconds: 5})}
+	plan := testStorePlan()
+	plan.Scope.Labels = map[string]string{"service": "checkout"}
+	plan.Limit = 80
+
+	run, err := e.Execute(context.Background(), plan, &noopRecorder{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(run.Facts) != 1 || len(run.Facts[0].Value) > model.MaxFactBytes {
+		t.Fatalf("fact value = %d bytes, must never exceed %d", len(run.Facts[0].Value), model.MaxFactBytes)
+	}
+	if run.Status != model.ResultTruncated || run.Coverage.Complete {
+		t.Fatalf("status=%q complete=%v, want truncated/incomplete when the fact was capped", run.Status, run.Coverage.Complete)
+	}
+	if !slices.Contains(run.LimitationCodes, "fact_bytes_capped") {
+		t.Fatalf("limitation codes = %v, want fact_bytes_capped", run.LimitationCodes)
+	}
+	if run.Coverage.Returned+run.Coverage.Omitted != 60 || run.Coverage.Omitted < 1 {
+		t.Fatalf("coverage returned=%d omitted=%d, want them to sum to 60 with omitted >= 1", run.Coverage.Returned, run.Coverage.Omitted)
+	}
+	var summary metricSummary
+	if err := json.Unmarshal(run.Facts[0].Value, &summary); err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Series) != run.Coverage.Returned {
+		t.Fatalf("persisted series = %d, coverage returned = %d", len(summary.Series), run.Coverage.Returned)
 	}
 }

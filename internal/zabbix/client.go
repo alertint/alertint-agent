@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,7 +19,22 @@ import (
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/httpcount"
+	model "github.com/alertint/alertint-agent/internal/observation/model"
 )
+
+// ErrResponseTooLarge is returned by the bounded (proactive preparation)
+// request path — every callInstrumented dispatch — when the DECODED
+// response body exceeds model.MaxDecodedResponseBytes. The excess is never
+// read into memory. Callers classify it with errors.Is.
+var ErrResponseTooLarge = errors.New("zabbix: response exceeds the bounded decoded-body limit")
+
+// ErrRedirectRefused is returned by the bounded (proactive preparation)
+// request path — every callInstrumented dispatch — when the frontend
+// answers 3xx. Following a redirect would be a second physical request
+// (a re-POST of the JSON-RPC body) outside the one durable reservation
+// that wrapped this call, so the bounded path never follows one. Callers
+// classify it with errors.Is.
+var ErrRedirectRefused = errors.New("zabbix: redirect refused on the bounded request path")
 
 type Config struct {
 	BaseURL              string // Zabbix frontend; "/api_jsonrpc.php" is appended
@@ -29,8 +45,12 @@ type Config struct {
 }
 
 type Client struct {
-	endpoint         string
-	httpClient       *http.Client
+	endpoint   string
+	httpClient *http.Client
+	// boundedHTTP is httpClient with redirects disabled — the transport the
+	// bounded (proactive) callInstrumented path uses so one reservation is
+	// exactly one physical request.
+	boundedHTTP      *http.Client
 	authHeader       string
 	historyRetention time.Duration
 	flapWindow       time.Duration
@@ -49,13 +69,24 @@ func NewClient(cfg Config) *Client {
 	if fw <= 0 {
 		fw = 24
 	}
+	httpClient := &http.Client{Timeout: timeout}
 	return &Client{
 		endpoint:         strings.TrimRight(cfg.BaseURL, "/") + "/api_jsonrpc.php",
-		httpClient:       &http.Client{Timeout: timeout},
+		httpClient:       httpClient,
+		boundedHTTP:      noRedirectClient(httpClient),
 		authHeader:       "Bearer " + cfg.APIToken,
 		historyRetention: time.Duration(hr) * 24 * time.Hour,
 		flapWindow:       time.Duration(fw) * time.Hour,
 	}
+}
+
+// noRedirectClient returns a shallow copy of base whose redirect policy
+// hands every 3xx back as the final response (http.ErrUseLastResponse)
+// instead of issuing a further, unreserved physical request.
+func noRedirectClient(base *http.Client) *http.Client {
+	cp := *base
+	cp.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &cp
 }
 
 // FlapWindow exposes the configured flap look-back for callers computing "since".
@@ -76,20 +107,35 @@ type rpcError struct {
 
 // call issues one JSON-RPC method and unmarshals result into out. withAuth=false
 // for apiinfo.version (which needs no token). A non-nil error object → Go error.
+// This is the legacy (Acute Triage / MCP) path: its body read is unbounded.
 func (c *Client) call(ctx context.Context, method string, params any, withAuth bool, out any) error {
-	return c.callInstrumented(ctx, method, params, withAuth, out, nil, nil)
+	return c.rpc(ctx, method, params, withAuth, out, nil, nil, false)
 }
 
 // callInstrumented is call with a per-physical-request hook, for the
 // proactive preparation path: before is called immediately before the one
 // physical HTTP request this method issues (a non-nil error aborts before
 // it is made); after reports its outcome immediately once it completes.
-// Both may be nil (call's own uninstrumented behavior). Every Zabbix
-// *.get call this package makes — including a secondary item/recovery
-// lookup — goes through this one method, so every physical dispatch is
-// individually reservable by a caller in internal/observation/connectors.
-func (c *Client) callInstrumented(ctx context.Context, method string, params any, withAuth bool, out any,
+// Both may be nil. Every Zabbix *.get call the proactive path makes —
+// including a secondary item/recovery lookup — goes through this one
+// method, so every physical dispatch is individually reservable by a
+// caller in internal/observation/connectors. Unlike call, its decoded
+// response body is capped at model.MaxDecodedResponseBytes
+// (ErrResponseTooLarge past it). Every proactive call is an authenticated
+// *.get, so there is no withAuth switch here.
+func (c *Client) callInstrumented(ctx context.Context, method string, params any, out any,
 	before func() error, after func(started bool, err error)) error {
+	return c.rpc(ctx, method, params, true, out, before, after, true)
+}
+
+// rpcFunc is the one-method shape MetricHistory (legacy, call) and
+// MetricHistoryBounded (proactive, callInstrumented with hooks) each bind
+// so the shared item/history/trend request code is written once.
+type rpcFunc func(ctx context.Context, method string, params any, out any) error
+
+// rpc is the shared JSON-RPC body behind call and callInstrumented.
+func (c *Client) rpc(ctx context.Context, method string, params any, withAuth bool, out any,
+	before func() error, after func(started bool, err error), bounded bool) error {
 	if params == nil {
 		params = map[string]any{}
 	}
@@ -116,8 +162,12 @@ func (c *Client) callInstrumented(ctx context.Context, method string, params any
 	if withAuth {
 		req.Header.Set("Authorization", c.authHeader)
 	}
+	httpClient := c.httpClient
+	if bounded {
+		httpClient = c.boundedHTTP
+	}
 	httpcount.Observe(ctx)
-	resp, err := c.httpClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		if after != nil {
 			after(true, err)
@@ -125,10 +175,24 @@ func (c *Client) callInstrumented(ctx context.Context, method string, params any
 		return fmt.Errorf("zabbix request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(resp.Body)
+	if bounded && resp.StatusCode >= 300 && resp.StatusCode <= 399 {
+		if after != nil {
+			after(true, ErrRedirectRefused)
+		}
+		return ErrRedirectRefused
+	}
+	var body []byte
+	if bounded {
+		body, err = readBounded(resp.Body, model.MaxDecodedResponseBytes)
+	} else {
+		body, err = io.ReadAll(resp.Body)
+	}
 	if err != nil {
 		if after != nil {
 			after(true, err)
+		}
+		if errors.Is(err, ErrResponseTooLarge) {
+			return err
 		}
 		return fmt.Errorf("zabbix: read response: %w", err)
 	}
@@ -168,21 +232,19 @@ func (c *Client) APIVersion(ctx context.Context) (string, error) {
 	return v, nil
 }
 
-// resolveItemInstrumented looks up an item's id + value_type by host
-// (technical name) + key, with a per-physical-request hook threaded
-// through both lookups (both may be nil for uninstrumented use). It tries
-// an EXACT key match first, falling back to a fuzzy substring search only
-// when no exact item exists — so an unambiguous key (e.g. system.cpu.util)
-// is never shadowed by an unrelated longer key that happens to
-// substring-match it (e.g. system.cpu.util[,iowait]) under a bare `search`.
-func (c *Client) resolveItemInstrumented(ctx context.Context, host, key string,
-	before func() error, after func(started bool, err error)) (zItem, error) {
-	item, ok, err := c.lookupItemInstrumented(ctx, host, key, false, before, after)
+// resolveItem looks up an item's id + value_type by host (technical name) +
+// key over rpc. It tries an EXACT key match first, falling back to a fuzzy
+// substring search only when no exact item exists — so an unambiguous key
+// (e.g. system.cpu.util) is never shadowed by an unrelated longer key that
+// happens to substring-match it (e.g. system.cpu.util[,iowait]) under a
+// bare `search`. Legacy (MetricHistory) path only.
+func (c *Client) resolveItem(ctx context.Context, host, key string, rpc rpcFunc) (zItem, error) {
+	item, ok, err := c.lookupItem(ctx, host, key, false, rpc)
 	if err != nil {
 		return zItem{}, err
 	}
 	if !ok {
-		item, ok, err = c.lookupItemInstrumented(ctx, host, key, true, before, after)
+		item, ok, err = c.lookupItem(ctx, host, key, true, rpc)
 		if err != nil {
 			return zItem{}, err
 		}
@@ -193,10 +255,8 @@ func (c *Client) resolveItemInstrumented(ctx context.Context, host, key string,
 	return item, nil
 }
 
-// lookupItemInstrumented runs one item.get, exact (filter) or fuzzy
-// (search) on key_.
-func (c *Client) lookupItemInstrumented(ctx context.Context, host, key string, fuzzy bool,
-	before func() error, after func(started bool, err error)) (zItem, bool, error) {
+// lookupItem runs one item.get, exact (filter) or fuzzy (search) on key_.
+func (c *Client) lookupItem(ctx context.Context, host, key string, fuzzy bool, rpc rpcFunc) (zItem, bool, error) {
 	params := map[string]any{
 		"output": []string{"itemid", "value_type", "name", "units"},
 		"host":   host,
@@ -208,7 +268,7 @@ func (c *Client) lookupItemInstrumented(ctx context.Context, host, key string, f
 		params["filter"] = map[string]string{"key_": key}
 	}
 	var items []zItem
-	if err := c.callInstrumented(ctx, "item.get", params, true, &items, before, after); err != nil {
+	if err := rpc(ctx, "item.get", params, &items); err != nil {
 		return zItem{}, false, err
 	}
 	if len(items) == 0 {
@@ -222,19 +282,69 @@ func (c *Client) lookupItemInstrumented(ctx context.Context, host, key string, f
 // for floats under the default history=3) and falls back to trends for windows
 // older than the configured history retention.
 func (c *Client) MetricHistory(ctx context.Context, host, itemKey string, from, to time.Time, limit int) (Series, error) {
-	return c.MetricHistoryBounded(ctx, host, itemKey, from, to, limit, nil, nil)
-}
-
-// MetricHistoryBounded is MetricHistory with a per-physical-request hook
-// threaded through item resolution (up to two lookups) and the final
-// history/trend request — every real request this call can make,
-// individually reservable by a caller in internal/observation/connectors.
-func (c *Client) MetricHistoryBounded(ctx context.Context, host, itemKey string, from, to time.Time, limit int,
-	before func() error, after func(started bool, err error)) (Series, error) {
-	item, err := c.resolveItemInstrumented(ctx, host, itemKey, before, after)
+	rpc := func(ctx context.Context, method string, params any, out any) error {
+		return c.call(ctx, method, params, true, out)
+	}
+	item, err := c.resolveItem(ctx, host, itemKey, rpc)
 	if err != nil {
 		return Series{}, err
 	}
+	return c.fetchSeries(ctx, item, from, to, limit, rpc)
+}
+
+// MetricHistoryBounded is the proactive preparation path's MetricHistory:
+// exactly two physical requests — one EXACT item.get (never the legacy
+// fuzzy substring fallback, which could substitute an unrelated item) and
+// one history.get/trend.get — each individually reservable through
+// before/after by a caller in internal/observation/connectors, over the
+// bounded transport path (decoded body capped at
+// model.MaxDecodedResponseBytes). The item must be proven to belong to
+// host (selectHosts linkage); a missing or foreign item is ErrNotFound.
+func (c *Client) MetricHistoryBounded(ctx context.Context, host, itemKey string, from, to time.Time, limit int,
+	before func() error, after func(started bool, err error)) (Series, error) {
+	rpc := func(ctx context.Context, method string, params any, out any) error {
+		return c.callInstrumented(ctx, method, params, out, before, after)
+	}
+	item, err := c.lookupItemLinked(ctx, host, itemKey, rpc)
+	if err != nil {
+		return Series{}, err
+	}
+	return c.fetchSeries(ctx, item, from, to, limit, rpc)
+}
+
+// lookupItemLinked runs one exact-filter item.get scoped to host and
+// returns the item only when the source proves the linkage: the request
+// carries the host filter, and the response's selectHosts data must
+// name the requested host (and agree with the item's own
+// hostid). No match, or a mismatch, is ErrNotFound — never a fuzzy
+// substitute.
+func (c *Client) lookupItemLinked(ctx context.Context, host, key string, rpc rpcFunc) (zItem, error) {
+	params := map[string]any{
+		"output":      []string{"itemid", "hostid", "value_type", "name", "units"},
+		"host":        host,
+		"filter":      map[string]string{"key_": key},
+		"selectHosts": []string{"hostid", "host"},
+		"limit":       1,
+	}
+	var items []zItem
+	if err := rpc(ctx, "item.get", params, &items); err != nil {
+		return zItem{}, err
+	}
+	if len(items) == 0 {
+		return zItem{}, fmt.Errorf("zabbix: no item with exact key %q on host %q: %w", key, host, ErrNotFound)
+	}
+	item := items[0]
+	hostID, ok := hostRefFor(item.Hosts, host)
+	if !ok || hostID == "" || item.ItemID == "" || (item.HostID != "" && hostID != item.HostID) {
+		return zItem{}, fmt.Errorf("zabbix: item %q (key %q) is not linked to host %q: %w", item.ItemID, key, host, ErrNotFound)
+	}
+	return item, nil
+}
+
+// fetchSeries issues the one history.get (or trend.get, for windows older
+// than the configured history retention) that reads item's values over
+// [from,to] via rpc, and normalizes the rows into a Series.
+func (c *Client) fetchSeries(ctx context.Context, item zItem, from, to time.Time, limit int, rpc rpcFunc) (Series, error) {
 	if time.Since(from) > c.historyRetention {
 		var rows []struct {
 			Clock    string `json:"clock"`
@@ -242,13 +352,13 @@ func (c *Client) MetricHistoryBounded(ctx context.Context, host, itemKey string,
 			ValueMin string `json:"value_min"`
 			ValueMax string `json:"value_max"`
 		}
-		if err := c.callInstrumented(ctx, "trend.get", map[string]any{
+		if err := rpc(ctx, "trend.get", map[string]any{
 			"output":    "extend",
 			"itemids":   item.ItemID,
 			"time_from": from.Unix(),
 			"time_till": to.Unix(),
 			"limit":     limit,
-		}, true, &rows, before, after); err != nil {
+		}, &rows); err != nil {
 			return Series{}, err
 		}
 		pts := make([]SeriesPoint, 0, len(rows))
@@ -262,7 +372,7 @@ func (c *Client) MetricHistoryBounded(ctx context.Context, host, itemKey string,
 		Clock string `json:"clock"`
 		Value string `json:"value"`
 	}
-	if err := c.callInstrumented(ctx, "history.get", map[string]any{
+	if err := rpc(ctx, "history.get", map[string]any{
 		"output":    "extend",
 		"history":   item.ValueType, // the fix: resolved type, not default 3
 		"itemids":   item.ItemID,
@@ -271,7 +381,7 @@ func (c *Client) MetricHistoryBounded(ctx context.Context, host, itemKey string,
 		"sortfield": "clock",
 		"sortorder": "DESC",
 		"limit":     limit,
-	}, true, &rows, before, after); err != nil {
+	}, &rows); err != nil {
 		return Series{}, err
 	}
 	pts := make([]SeriesPoint, 0, len(rows))
@@ -380,6 +490,23 @@ func (c *Client) hostIDs(ctx context.Context, host string) ([]string, error) {
 		return nil, fmt.Errorf("zabbix: no host matching %q: %w", host, ErrNotFound)
 	}
 	return ids, nil
+}
+
+// readBounded reads at most limit bytes of the (already transport-decoded)
+// body, reading limit+1 through an io.LimitReader so an over-limit body is
+// detected without buffering the remainder (ErrResponseTooLarge). Go's
+// http.Transport transparently gunzips a body it negotiated itself (the
+// client never sets Accept-Encoding), so the cap applies to the DECODED
+// stream, never the compressed wire size.
+func readBounded(r io.Reader, limit int64) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, ErrResponseTooLarge
+	}
+	return body, nil
 }
 
 func unixStr(s string) time.Time {

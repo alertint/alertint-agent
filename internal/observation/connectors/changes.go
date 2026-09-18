@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/observation"
@@ -57,36 +59,31 @@ func (e *ChangesExecutor) Execute(ctx context.Context, plan model.Plan, _ observ
 		return model.Run{}, fmt.Errorf("connectors: changes in scope window: %w", err)
 	}
 
-	status := model.ResultConfirmedEmpty
-	if len(changes) > 0 {
-		status = model.ResultConfirmedValue
+	// Canonical order (newest first, then id) before hashing (F28); an empty
+	// ledger marshals as "[]", never "null".
+	changes = slices.Clone(changes)
+	if changes == nil {
+		changes = []model.LocalChange{}
 	}
-	if truncated {
-		status = model.ResultTruncated
-	}
-
-	value, err := json.Marshal(changes)
+	slices.SortFunc(changes, func(a, b model.LocalChange) int {
+		if c := b.OccurredAt.Compare(a.OccurredAt); c != 0 {
+			return c
+		}
+		return strings.Compare(a.ID, b.ID)
+	})
+	value, kept, err := fitFactValue(len(changes), func(n int) ([]byte, error) {
+		return json.Marshal(changes[:n])
+	})
 	if err != nil {
 		return model.Run{}, fmt.Errorf("connectors: marshal changes: %w", err)
 	}
-	expiresAt := now.Add(model.MaxWindowDaysHistory * 24 * time.Hour)
-	fact := model.Fact{
-		ID: factID(plan.ID, "change_event", value), RunID: "run:" + plan.ID,
-		Kind: "change_event", Subject: plan.Scope.SubjectID, Digest: digestOf(value),
-		SchemaVersion: model.FactSchemaVersion, Value: value,
-		ResultStatus: status, Freshness: model.FreshnessFresh,
-		ObservedAt: now, ExpiresAt: expiresAt, Material: true,
-	}
-
-	var limitationCodes []string
+	omitted := len(changes) - kept
 	if truncated {
-		limitationCodes = []string{"truncated"}
+		omitted++ // the store reported more rows than the limit
 	}
-	return model.Run{
-		ID: "run:" + plan.ID, CycleID: plan.CycleID, PlanID: plan.ID, Status: status,
-		Coverage:        model.Coverage{Start: plan.Start, End: plan.End, Complete: !truncated, Returned: len(changes)},
-		Facts:           []model.Fact{fact},
-		LimitationCodes: limitationCodes,
-		ObservedAt:      now, ExpiresAt: expiresAt,
-	}, nil
+	return boundedRun(plan, now, boundedResult{
+		Kind: "change_event", Value: value, Returned: kept, Omitted: omitted,
+		Truncated: truncated, Capped: kept < len(changes),
+		ExpiresAt: now.Add(model.MaxWindowDaysHistory * 24 * time.Hour),
+	}), nil
 }
