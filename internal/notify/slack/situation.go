@@ -476,13 +476,29 @@ func renderExpectedJudgmentJournal(t model.Transition) RenderedMessage {
 	case model.JudgmentChangeReplaced:
 		text = actor + " updated the expected condition until " + SlackDateToken(*t.Journal.JudgmentValidUntil, "{time}") + ". Monitoring continues."
 	case model.JudgmentChangeRestored:
-		text = actor + " restored expectedness until " + SlackDateToken(*t.Journal.JudgmentValidUntil, "{time}") + ". Monitoring continues."
+		text = actor + " marked the current condition as expected again until " + SlackDateToken(*t.Journal.JudgmentValidUntil, "{time}") + ". Monitoring continues."
 	case model.JudgmentChangeRevoked:
-		text = actor + " withdrew expectedness. Normal assessment resumes."
+		text = actor + " ended the expected-until decision. Normal assessment resumes."
 	case model.JudgmentChangeExpired:
-		text = "Expectedness expired. Normal assessment resumes."
+		if t.Journal.JudgmentValidUntil != nil {
+			text = "The expected-until decision ended at " + SlackDateToken(*t.Journal.JudgmentValidUntil, "{time}") + " as scheduled. Normal assessment resumes."
+		} else {
+			text = "The expected-until decision reached its scheduled end time. Normal assessment resumes."
+		}
 	default:
-		text = "Expectedness no longer applies because the current condition changed. Normal assessment resumes."
+		reason := strings.TrimSuffix(strings.TrimSpace(t.Journal.Detail), ".")
+		if reason == "Normal assessment resumes" {
+			reason = ""
+		}
+		if strings.HasPrefix(reason, "The ") {
+			reason = "the " + strings.TrimPrefix(reason, "The ")
+		} else if strings.HasPrefix(reason, "A ") {
+			reason = "a " + strings.TrimPrefix(reason, "A ")
+		}
+		if reason == "" {
+			reason = "the current condition changed"
+		}
+		text = "The expected-until decision no longer applies because " + reason + ". Normal assessment resumes."
 	}
 	if action := t.ActionContract.OperatorActionRequired; action != nil {
 		text += " Operator action required: " + humanizeOperatorAction(*action) + "."

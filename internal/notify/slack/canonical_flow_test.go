@@ -72,7 +72,7 @@ func TestExpectedJudgmentThreadTransitionsAreAttributedAndTruthful(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(msg.Text, "Janis withdrew expectedness. Normal assessment resumes.") {
+	if !strings.Contains(msg.Text, "Janis ended the expected-until decision. Normal assessment resumes.") {
 		t.Fatal(msg.Text)
 	}
 
@@ -85,6 +85,59 @@ func TestExpectedJudgmentThreadTransitionsAreAttributedAndTruthful(t *testing.T)
 	}
 	if !strings.Contains(msg.Text, "Operator action required: investigate this Situation.") {
 		t.Fatalf("withdrawal handoff = %q, want the resumed operator action", msg.Text)
+	}
+}
+
+func TestExpectedJudgmentThreadExplainsWhyDecisionEnded(t *testing.T) {
+	until := bcNow(t).Add(time.Hour)
+	base := bcJournal(t, bcObserveMonitorContract(bcNow(t)), canonicalFixture(t), nil)
+	base.Journal.JudgmentValidUntil = &until
+
+	cases := []struct {
+		name   string
+		change model.JudgmentChange
+		detail string
+		want   string
+	}{
+		{
+			name:   "scheduled end",
+			change: model.JudgmentChangeExpired,
+			detail: "The scheduled end time was reached.",
+			want:   "The expected-until decision ended at " + SlackDateToken(until, "{time}") + " as scheduled. Normal assessment resumes.",
+		},
+		{
+			name:   "criticality",
+			change: model.JudgmentChangeInvalidated,
+			detail: "A critical alert is now firing.",
+			want:   "The expected-until decision no longer applies because a critical alert is now firing. Normal assessment resumes.",
+		},
+		{
+			name:   "changed symptoms",
+			change: model.JudgmentChangeInvalidated,
+			detail: "The active symptoms changed.",
+			want:   "The expected-until decision no longer applies because the active symptoms changed. Normal assessment resumes.",
+		},
+		{
+			name:   "legacy transition without concrete reason",
+			change: model.JudgmentChangeInvalidated,
+			detail: "Normal assessment resumes.",
+			want:   "The expected-until decision no longer applies because the current condition changed. Normal assessment resumes.",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := base
+			tr.Journal.JudgmentChange = tc.change
+			tr.Journal.Detail = tc.detail
+			msg, err := RenderSituationJournal(tr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(msg.Text, tc.want) {
+				t.Fatalf("thread = %q, want %q", msg.Text, tc.want)
+			}
+		})
 	}
 }
 

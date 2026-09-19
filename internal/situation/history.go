@@ -685,17 +685,47 @@ func expectedJudgmentJournal(change AuthoritativeChange) (model.JournalData, mod
 		j.JudgmentValidUntil = &prior.ValidUntil
 	}
 	if prior != nil && change.Judgment != nil && change.Judgment.Operation == model.JudgmentOperationRevoke && change.Judgment.Revision > prior.Revision {
-		j.JudgmentChange, j.Headline = model.JudgmentChangeRevoked, "Expectedness withdrawn"
+		j.JudgmentChange, j.Headline = model.JudgmentChangeRevoked, "Expected-until decision ended"
 		j.AttributedActor = change.Judgment.AssertedOperator
 		j.JudgmentValidUntil = nil
 		actor = model.ActorAttributedOperator
 	} else if change.JudgmentApplicabilityReason == model.JudgmentExpired {
-		j.JudgmentChange, j.Headline = model.JudgmentChangeExpired, "Expectedness expired"
+		j.JudgmentChange, j.Headline = model.JudgmentChangeExpired, "Expected-until deadline reached"
+		j.Detail = "The scheduled end time was reached."
 	} else {
-		j.JudgmentChange, j.Headline = model.JudgmentChangeInvalidated, "Expectedness no longer applies"
+		j.JudgmentChange, j.Headline = model.JudgmentChangeInvalidated, "Expected-until decision no longer applies"
+		j.Detail = expectedJudgmentInvalidationDetail(change)
 	}
-	j.Detail = "Normal assessment resumes."
+	if j.Detail == "" {
+		j.Detail = "Normal assessment resumes."
+	}
 	return j, actor, true
+}
+
+func expectedJudgmentInvalidationDetail(change AuthoritativeChange) string {
+	switch change.JudgmentApplicabilityReason {
+	case model.JudgmentUrgent:
+		if change.Projection.Briefing != nil && change.Projection.Briefing.Critical > 0 {
+			return "A critical alert is now firing."
+		}
+		return "The Situation now requires urgent attention."
+	case model.JudgmentScopeChanged:
+		return "The affected scope changed."
+	case model.JudgmentSymptomsChanged:
+		return "The active symptoms changed."
+	case model.JudgmentSeverityChanged:
+		return "The alert severity changed."
+	case model.JudgmentImpactChanged:
+		return "The assessed impact changed."
+	case model.JudgmentSourceSignatureChanged:
+		return "The source identity or version changed."
+	case model.JudgmentEvidenceMissing:
+		return "The evidence needed to keep the decision active is no longer available."
+	case model.JudgmentSituationTerminal:
+		return "The Situation ended."
+	default:
+		return "The current condition changed."
+	}
 }
 
 // investigationCurrent reports whether the Operator contract currently

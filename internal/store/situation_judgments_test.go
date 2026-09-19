@@ -289,7 +289,11 @@ func TestSituationJudgmentInvalidationCannotSilentlyRevive(t *testing.T) {
 func TestChangedSourceInputInvalidatesBeforeTransientConditionClears(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
-	now := time.Date(2026, 9, 18, 20, 10, 0, 0, time.UTC)
+	// ApplySituationInput evaluates observed invalidation against the real
+	// transaction clock. Keep this fixture current so its one-hour decision
+	// cannot expire merely because the calendar moved past the original test
+	// date.
+	now := time.Now().UTC().Truncate(time.Second)
 	sitID := judgmentSituationFixture(t, st, now)
 	sit, _ := st.GetSituation(ctx, sitID)
 	if _, err := st.WriteSituationJudgment(ctx, audit.New(st.DB()), recordJudgmentRequest(sit, now, "observed-change")); err != nil {

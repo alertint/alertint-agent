@@ -266,6 +266,51 @@ func TestExpectedJudgmentCreatesOnlyMeaningfulHistoryTransitions(t *testing.T) {
 	if len(got) != 1 || got[0].Journal.JudgmentChange != model.JudgmentChangeExpired || got[0].Actor != model.ActorDeterministicController {
 		t.Fatalf("expiry transition = %+v", got)
 	}
+	if got[0].Journal.Detail != "The scheduled end time was reached." {
+		t.Fatalf("expiry reason = %q", got[0].Journal.Detail)
+	}
+}
+
+func TestExpectedJudgmentInvalidationRecordsConcreteReason(t *testing.T) {
+	until := hsNow(t).Add(2 * time.Hour)
+	prior := &model.ExpectedJudgmentProjection{Revision: 1, AssertedOperator: "Janis", ValidUntil: until}
+
+	cases := []struct {
+		name     string
+		reason   model.JudgmentApplicabilityReason
+		critical int
+		want     string
+	}{
+		{"critical alert", model.JudgmentUrgent, 1, "A critical alert is now firing."},
+		{"independently urgent", model.JudgmentUrgent, 0, "The Situation now requires urgent attention."},
+		{"scope", model.JudgmentScopeChanged, 0, "The affected scope changed."},
+		{"symptoms", model.JudgmentSymptomsChanged, 0, "The active symptoms changed."},
+		{"severity", model.JudgmentSeverityChanged, 0, "The alert severity changed."},
+		{"impact", model.JudgmentImpactChanged, 0, "The assessed impact changed."},
+		{"source signature", model.JudgmentSourceSignatureChanged, 0, "The source identity or version changed."},
+		{"evidence", model.JudgmentEvidenceMissing, 0, "The evidence needed to keep the decision active is no longer available."},
+		{"terminal", model.JudgmentSituationTerminal, 0, "The Situation ended."},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			change := hsNext(t)
+			change.PriorTransition.Projection.Briefing = &model.OperatorBriefing{ExpectedJudgment: prior}
+			change.Projection.Briefing = &model.OperatorBriefing{Critical: tc.critical}
+			change.Judgment = &model.SituationJudgment{Revision: 1, Operation: model.JudgmentOperationRecord, AssertedOperator: "Janis", ValidUntil: until}
+			change.JudgmentApplicabilityReason = tc.reason
+			got, err := BuildTransitions(change)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != 1 || got[0].Journal.JudgmentChange != model.JudgmentChangeInvalidated {
+				t.Fatalf("invalidation transition = %+v", got)
+			}
+			if got[0].Journal.Detail != tc.want {
+				t.Fatalf("reason = %q, want %q", got[0].Journal.Detail, tc.want)
+			}
+		})
+	}
 }
 
 func TestExpectedJudgmentWithdrawalIsAttributed(t *testing.T) {
