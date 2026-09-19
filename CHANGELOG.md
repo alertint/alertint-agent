@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Operators can mark a Situation's current non-critical condition as expected
+  until a set time, replace, withdraw, or restore that decision through MCP,
+  and see the decision and any reason it ended in Slack.
 - Optional shared LLM call and cumulative token limits, persisted across
   restarts and enforced before generation requests, including retries.
   Both limits default to unlimited; see the configuration guide for accounting
