@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	_ "time/tzdata" // scratch deployments still need IANA schedule resolution
 
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
