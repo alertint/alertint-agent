@@ -26,7 +26,8 @@ var (
 	ErrExpectedBehaviorStale           = errors.New("store: expected behavior authority changed")
 )
 
-// ExpectedBehaviorWrite is one explicitly confirmed, version-fenced command.
+// ExpectedBehaviorWrite is one explicitly confirmed, version-fenced command
+// under ADR-0047 and ADR-0054.
 type ExpectedBehaviorWrite struct {
 	Operation              model.ExpectedBehaviorOperation
 	EnvelopeID             string

@@ -16,6 +16,7 @@ import (
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
+// MCP owns expected-schedule maintenance and review under ADR-0054.
 func (s *Server) toolExpectedBehaviorPrepare() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 	return mcplib.NewTool("alertint_expected_behavior_prepare",
 		mcplib.WithDescription("Prepare fresh exact Zabbix current-state proof for proposed reusable expected-schedule bindings. This creates no authority."),

@@ -13,7 +13,7 @@ import (
 )
 
 // ExpectedBehaviorSignal is one exact current source observation available
-// to the pure reusable-schedule evaluator.
+// to ADR-0054's pure reusable-schedule evaluator.
 type ExpectedBehaviorSignal struct {
 	SourceInstanceID string
 	Host             string

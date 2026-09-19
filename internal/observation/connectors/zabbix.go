@@ -31,8 +31,8 @@ type ZabbixProblemClient interface {
 		before func() error, after func(started bool, err error)) (zabbix.ProblemHistoryResult, error)
 }
 
-// ZabbixSourceDefinitionClient is the bounded boundary used to observe the
-// current effective rule configuration alongside problem history.
+// ZabbixSourceDefinitionClient is ADR-0053's bounded boundary for current
+// effective rule configuration. It stays separate from historical event truth.
 type ZabbixSourceDefinitionClient interface {
 	SourceRuleVersionBounded(ctx context.Context, sourceInstanceID, host, triggerID string,
 		before func() error, after func(started bool, err error)) (zabbix.SourceRuleDefinition, error)

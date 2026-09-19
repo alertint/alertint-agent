@@ -13,6 +13,7 @@ import (
 	"strings"
 )
 
+// SourceVersionAlgorithm identifies ADR-0053's current-definition digest.
 const SourceVersionAlgorithm = "zabbix-trigger-effective-v1"
 
 type definitionUnavailableError struct{ reason string }

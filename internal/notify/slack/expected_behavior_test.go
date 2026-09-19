@@ -58,12 +58,12 @@ func TestExpectedBehaviorStoppedReasonsAndWithdrawalUseSimpleText(t *testing.T) 
 	tr.Journal.ExpectedBehaviorReason = model.ExpectedBehaviorReasonPrimaryDefinitionChanged
 	tr.Journal.Detail = "The Zabbix rule changed."
 	msg, err = RenderSituationJournal(tr)
-	if err != nil || msg.Text != "The expected schedule no longer applies because the zabbix rule changed. Normal assessment resumes." {
+	if err != nil || msg.Text != "The expected schedule no longer applies because the Zabbix rule changed. Normal assessment resumes." {
 		t.Fatalf("stopped=%q err=%v", msg.Text, err)
 	}
 	tr.Journal.Detail = "AlertINT cannot verify the Zabbix rule."
 	msg, _ = RenderSituationJournal(tr)
-	if !strings.Contains(msg.Text, "because alertint cannot verify the zabbix rule") {
+	if !strings.Contains(msg.Text, "because AlertINT cannot verify the Zabbix rule") {
 		t.Fatal(msg.Text)
 	}
 }

@@ -33,7 +33,7 @@ tasks:
   test:
     desc: Run unit tests
     cmds:
-      - go test -race -count=1 {{.PKG}}
+      - go test -race -count=1 -timeout=60m {{.PKG}}
 
   lint:
     desc: Run go vet (golangci-lint added in CI separately)

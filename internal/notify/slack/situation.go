@@ -495,7 +495,13 @@ func renderExpectedBehaviorJournal(t model.Transition) RenderedMessage {
 		if reason == "" {
 			reason = "The current condition no longer matches the schedule."
 		}
-		text = "The expected schedule no longer applies because " + strings.ToLower(strings.TrimSuffix(reason, ".")) + ". Normal assessment resumes."
+		reason = strings.TrimSuffix(reason, ".")
+		if strings.HasPrefix(reason, "The ") {
+			reason = "the " + strings.TrimPrefix(reason, "The ")
+		} else if strings.HasPrefix(reason, "A ") {
+			reason = "a " + strings.TrimPrefix(reason, "A ")
+		}
+		text = "The expected schedule no longer applies because " + reason + ". Normal assessment resumes."
 	default:
 		text = "The expected schedule changed."
 	}

@@ -14,9 +14,9 @@ import (
 	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
 )
 
-// ZabbixSourceObservationView is the durable current source-definition head
-// exposed to reconciliation and MCP. A stale view deliberately clears the
-// version and reports expired so it cannot be mistaken for current authority.
+// ZabbixSourceObservationView is ADR-0053's durable current source-definition
+// head exposed to reconciliation and MCP. A stale view deliberately clears
+// the version and reports expired so it cannot be mistaken for current authority.
 type ZabbixSourceObservationView struct {
 	Definition observationmodel.SourceDefinitionObservation `json:"definition"`
 	ObservedAt time.Time                                    `json:"observed_at"`

@@ -18,7 +18,8 @@ const expectedBehaviorResolverVersion = 1
 
 var expectedBehaviorIdentifier = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 
-// ValidateExpectedBehaviorPolicy validates the complete writable policy body.
+// ValidateExpectedBehaviorPolicy validates ADR-0054's complete, source-bound
+// writable policy body.
 func ValidateExpectedBehaviorPolicy(policy model.ExpectedBehaviorPolicy, confirmedAt time.Time) error {
 	scope := policy.Scope
 	if strings.TrimSpace(scope.GroupKey) == "" || strings.TrimSpace(scope.Host) == "" ||

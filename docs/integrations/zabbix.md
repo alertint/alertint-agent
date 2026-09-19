@@ -48,6 +48,12 @@ export ALERTINT_ZABBIX_WEBHOOK_TOKEN="$(openssl rand -hex 24)"
 
 See the [configuration reference](../getting-started/configuration.md#zabbix).
 
+For an existing Zabbix ingress, set `instance_id` during a quiet window after
+all earlier events have resolved. Adding or changing it creates a new source
+namespace, so a later `RESOLVED` webhook cannot attach to a `PROBLEM` received
+under the previous fingerprint. AlertINT does not rewrite open alerts across
+installation identities.
+
 ## Zabbix media type (copy-paste)
 
 Prefer importing? [`examples/zabbix-media-type.yaml`](https://github.com/alertint/alertint-agent/blob/main/examples/zabbix-media-type.yaml)
