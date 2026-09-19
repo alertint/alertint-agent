@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/observation"
 	model "github.com/alertint/alertint-agent/internal/observation/model"
 	"github.com/alertint/alertint-agent/internal/zabbix"
 )
@@ -136,6 +137,25 @@ type fakeZabbixProblemClient struct {
 	err    error
 }
 
+type fakeZabbixSourceDefinitionClient struct {
+	definition zabbix.SourceRuleDefinition
+	err        error
+	calls      int
+}
+
+func (f *fakeZabbixSourceDefinitionClient) SourceRuleVersionBounded(_ context.Context, _, _, _ string,
+	before func() error, after func(started bool, err error)) (zabbix.SourceRuleDefinition, error) {
+	f.calls++
+	if f.err != nil {
+		return zabbix.SourceRuleDefinition{}, f.err
+	}
+	if err := before(); err != nil {
+		return zabbix.SourceRuleDefinition{}, err
+	}
+	after(true, nil)
+	return f.definition, nil
+}
+
 func (f *fakeZabbixProblemClient) ProblemHistory(ctx context.Context, host, triggerID string, start, end time.Time, severityMin string, limit int,
 	before func() error, after func(started bool, err error)) (zabbix.ProblemHistoryResult, error) {
 	if err := before(); err != nil {
@@ -175,6 +195,105 @@ func TestZabbixProblemExecutorConfirmedValueWithRecoveryUnknownLimitation(t *tes
 	}
 	if !found {
 		t.Fatal("expected a recovery_unknown limitation code")
+	}
+}
+
+func TestZabbixProblemExecutorRecordsCurrentSourceDefinition(t *testing.T) {
+	problem := &fakeZabbixProblemClient{result: zabbix.ProblemHistoryResult{Complete: true}}
+	definition := &fakeZabbixSourceDefinitionClient{definition: zabbix.SourceRuleDefinition{
+		Source: "zabbix", InstanceID: "prod-zbx", RuleID: "18422", Host: "web01", EndpointID: "sha256:endpoint",
+		RuleVersionEvidence: zabbix.RuleVersionEvidence{Algorithm: zabbix.SourceVersionAlgorithm, Version: "sha256:version", ComponentDigests: map[string]string{"logic": "sha256:logic"}, TriggerIDs: []string{"18422"}, ItemIDs: []string{"22"}},
+	}}
+	e := &ZabbixProblemExecutor{Client: problem, SourceDefinition: definition}
+	plan := testStorePlan()
+	plan.Capability = "zabbix_problem_history"
+	plan.Parameters = mustMarshal(zabbixProblemParameters{Host: "web01", TriggerID: "18422", SourceInstanceID: "prod-zbx", FreshForSeconds: 300})
+
+	run, err := e.Execute(context.Background(), plan, &noopRecorder{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if definition.calls != 1 {
+		t.Fatalf("definition calls = %d", definition.calls)
+	}
+	var sourceFact *model.Fact
+	for i := range run.Facts {
+		if run.Facts[i].Kind == "source_definition" {
+			sourceFact = &run.Facts[i]
+		}
+	}
+	if sourceFact == nil {
+		t.Fatalf("facts = %+v, want source_definition", run.Facts)
+	}
+	var value map[string]any
+	if err := json.Unmarshal(sourceFact.Value, &value); err != nil {
+		t.Fatal(err)
+	}
+	if value["available"] != true || value["instance_id"] != "prod-zbx" || value["version"] != "sha256:version" {
+		t.Fatalf("source definition = %v", value)
+	}
+	if got := sourceFact.ExpiresAt.Sub(sourceFact.ObservedAt); got != 5*time.Minute {
+		t.Fatalf("freshness = %v, want 5m", got)
+	}
+}
+
+func TestZabbixProblemExecutorRecordsUnavailableSourceDefinition(t *testing.T) {
+	problem := &fakeZabbixProblemClient{result: zabbix.ProblemHistoryResult{Complete: true}}
+	definition := &fakeZabbixSourceDefinitionClient{err: errors.New("API denied")}
+	e := &ZabbixProblemExecutor{Client: problem, SourceDefinition: definition}
+	plan := testStorePlan()
+	plan.Capability = "zabbix_problem_history"
+	plan.Parameters = mustMarshal(zabbixProblemParameters{Host: "web01", TriggerID: "18422", SourceInstanceID: "prod-zbx", FreshForSeconds: 300})
+
+	run, err := e.Execute(context.Background(), plan, &noopRecorder{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var value map[string]any
+	for _, fact := range run.Facts {
+		if fact.Kind == "source_definition" {
+			if err := json.Unmarshal(fact.Value, &value); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if value["available"] != false || value["unavailable_reason"] != "api_unavailable" {
+		t.Fatalf("source definition = %v", value)
+	}
+}
+
+func TestZabbixProblemExecutorPreservesSourceDefinitionWhenHistoryFails(t *testing.T) {
+	problem := &fakeZabbixProblemClient{err: errors.New("problem history API denied")}
+	definition := &fakeZabbixSourceDefinitionClient{err: errors.New("definition API denied")}
+	e := &ZabbixProblemExecutor{Client: problem, SourceDefinition: definition}
+	plan := testStorePlan()
+	plan.Capability = "zabbix_problem_history"
+	plan.Parameters = mustMarshal(zabbixProblemParameters{Host: "web01", TriggerID: "18422", SourceInstanceID: "prod-zbx", FreshForSeconds: 300})
+
+	run, err := e.Execute(context.Background(), plan, &noopRecorder{})
+	if err == nil {
+		t.Fatal("Execute returned nil error for a transport failure")
+	}
+	var durable *observation.FailedRunWithEvidenceError
+	if !errors.As(err, &durable) {
+		t.Fatalf("error = %T, want FailedRunWithEvidenceError", err)
+	}
+	if run.Status != model.ResultFailed {
+		t.Fatalf("status = %q, want failed", run.Status)
+	}
+	if !slices.Contains(run.LimitationCodes, "execution_failed") {
+		t.Fatalf("limitation codes = %v, want execution_failed", run.LimitationCodes)
+	}
+	var value map[string]any
+	for _, fact := range run.Facts {
+		if fact.Kind == "source_definition" {
+			if err := json.Unmarshal(fact.Value, &value); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if value["available"] != false || value["unavailable_reason"] != "api_unavailable" {
+		t.Fatalf("source definition = %v, want independently preserved unavailability", value)
 	}
 }
 

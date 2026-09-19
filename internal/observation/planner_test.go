@@ -61,10 +61,11 @@ func TestBuildPlansDeterministicForFixedInput(t *testing.T) {
 // is assessment-phase corroboration, so each phase yields exactly one plan.
 func TestBuildPlansDerivesZabbixParametersFromMemberLabels(t *testing.T) {
 	anchor := time.Date(2026, 9, 6, 17, 0, 0, 0, time.UTC)
+	instanceID := "prod-zbx"
 	in := PlannerInput{
-		Anchor: anchor, GroupKey: "service=checkout", Phase: model.PhaseAssessment,
+		Anchor: anchor, GroupKey: "service=checkout", Phase: model.PhaseAssessment, RefreshInterval: 5 * time.Minute,
 		Members: []MemberSubject{
-			{SubjectID: "host-a", Source: "zabbix", Labels: map[string]string{
+			{SubjectID: "host-a", Source: "zabbix", SourceInstanceID: &instanceID, Labels: map[string]string{
 				"host": "db-01", "zabbix_trigger_id": "trigger-123", "item_key": "vfs.fs.size[/,pfree]",
 			}},
 		},
@@ -115,13 +116,15 @@ func TestBuildPlansDerivesZabbixParametersFromMemberLabels(t *testing.T) {
 		t.Fatalf("zabbix_problem_history phase = %q, want lifecycle", problemPlan.Phase)
 	}
 	var problemParams struct {
-		Host      string `json:"host"`
-		TriggerID string `json:"trigger_id"`
+		Host             string `json:"host"`
+		TriggerID        string `json:"trigger_id"`
+		SourceInstanceID string `json:"source_instance_id"`
+		FreshForSeconds  int    `json:"fresh_for_seconds"`
 	}
 	if err := json.Unmarshal(problemPlan.Parameters, &problemParams); err != nil {
 		t.Fatalf("unmarshal zabbix_problem_history parameters: %v (raw=%s)", err, problemPlan.Parameters)
 	}
-	if problemParams.TriggerID != "trigger-123" || problemParams.Host != "db-01" {
+	if problemParams.TriggerID != "trigger-123" || problemParams.Host != "db-01" || problemParams.SourceInstanceID != "prod-zbx" || problemParams.FreshForSeconds != 300 {
 		t.Fatalf("zabbix_problem_history parameters = %+v, want host db-01 + trigger id", problemParams)
 	}
 }

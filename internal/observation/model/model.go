@@ -352,6 +352,27 @@ type Fact struct {
 	Material                         bool
 }
 
+// SourceDefinitionObservation is one bounded observation of the current
+// effective configuration behind an ingested source rule. Available=false
+// carries a closed reason instead of stale or partial configuration. This is
+// current API truth and never claims to reconstruct the historical rule that
+// emitted an earlier event.
+type SourceDefinitionObservation struct {
+	Source            string            `json:"source"`
+	InstanceID        string            `json:"instance_id,omitempty"`
+	RuleID            string            `json:"rule_id"`
+	Host              string            `json:"host"`
+	EndpointID        string            `json:"endpoint_id,omitempty"`
+	Available         bool              `json:"available"`
+	VersionAlgorithm  string            `json:"version_algorithm,omitempty"`
+	Version           string            `json:"version,omitempty"`
+	UnavailableReason string            `json:"unavailable_reason,omitempty"`
+	ComponentDigests  map[string]string `json:"component_digests,omitempty"`
+	TriggerIDs        []string          `json:"trigger_ids,omitempty"`
+	ItemIDs           []string          `json:"item_ids,omitempty"`
+	HistoricalProven  bool              `json:"historical_version_proven"`
+}
+
 // Run is one completed (or explicitly limited/failed) execution of a Plan:
 // its normalized Facts, coverage, and any limitation codes. CompletedAt is
 // the store's own durable completion clock — the retention anchor (ADR-0051)

@@ -33,13 +33,16 @@ const JudgmentTrustAuthenticatedMCP JudgmentTrustDomain = "authenticated_mcp"
 // identity and payload digests are deliberately absent so routine telemetry
 // repeats do not invalidate authority.
 type ExpectedJudgmentSymptom struct {
-	AlertID             string            `json:"alert_id"`
-	Source              string            `json:"source"`
-	EpisodeKey          string            `json:"episode_key"`
-	SourceSignalID      *string           `json:"source_signal_id"`
-	SourceSignalVersion *string           `json:"source_signal_version"`
-	Severity            string            `json:"severity"`
-	IdentityLabels      map[string]string `json:"identity_labels"`
+	AlertID                     string            `json:"alert_id"`
+	Source                      string            `json:"source"`
+	EpisodeKey                  string            `json:"episode_key"`
+	SourceSignalID              *string           `json:"source_signal_id"`
+	SourceSignalVersion         *string           `json:"source_signal_version"`
+	SourceInstanceID            *string           `json:"source_instance_id,omitempty"`
+	ObservedSourceInstanceID    *string           `json:"observed_source_instance_id,omitempty"`
+	ObservedSourceConfigVersion *string           `json:"observed_source_config_version,omitempty"`
+	Severity                    string            `json:"severity"`
+	IdentityLabels              map[string]string `json:"identity_labels"`
 }
 
 // ExpectedJudgmentCoverage is the server-derived applicability predicate for

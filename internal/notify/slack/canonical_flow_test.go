@@ -45,7 +45,7 @@ func TestCanonicalRootShowsExpectedJudgmentAfterFinding(t *testing.T) {
 	statusAt := strings.Index(msg.Text, "Observed · Correlating")
 	findingAt := strings.Index(msg.Text, "*Finding:*")
 	operatorAt := strings.Index(msg.Text, "*Operator:*")
-	if !(titleAt >= 0 && titleAt < statusAt && statusAt < findingAt && findingAt < operatorAt) {
+	if titleAt < 0 || titleAt >= statusAt || statusAt >= findingAt || findingAt >= operatorAt {
 		t.Fatalf("root order title=%d status=%d finding=%d operator=%d:\n%s", titleAt, statusAt, findingAt, operatorAt, msg.Text)
 	}
 }

@@ -186,6 +186,25 @@ type controllerStateRow struct {
 	LastErrorClass *string    `json:"last_error_class"`
 }
 
+type sourceProvenanceRow struct {
+	Source                  string            `json:"source"`
+	InstanceID              string            `json:"instance_id,omitempty"`
+	RuleID                  string            `json:"rule_id"`
+	Host                    string            `json:"host"`
+	EndpointID              string            `json:"endpoint_id,omitempty"`
+	Available               bool              `json:"available"`
+	VersionAlgorithm        string            `json:"version_algorithm,omitempty"`
+	Version                 string            `json:"version,omitempty"`
+	UnavailableReason       string            `json:"unavailable_reason,omitempty"`
+	ComponentDigests        map[string]string `json:"component_digests,omitempty"`
+	TriggerIDs              []string          `json:"trigger_ids,omitempty"`
+	ItemIDs                 []string          `json:"item_ids,omitempty"`
+	ObservedAt              time.Time         `json:"observed_at"`
+	ExpiresAt               time.Time         `json:"expires_at"`
+	Freshness               string            `json:"freshness"`
+	HistoricalVersionProven bool              `json:"historical_version_proven"`
+}
+
 func controllerStateRowFrom(r store.ControllerRetryState) controllerStateRow {
 	return controllerStateRow{
 		RetryEpoch: r.RetryEpoch, WorkAttempts: r.WorkAttempts, ParkedAt: r.ParkedAt,
@@ -309,7 +328,8 @@ func (s *Server) handleGetSituation(ctx context.Context, req mcplib.CallToolRequ
 		payload["episode"] = history.Episode
 	}
 	payload["slack_delivery"] = history.Delivery
-	judgment, err := s.st.GetCurrentSituationJudgment(ctx, sit.ID, s.currentTime())
+	currentReadAt := s.currentTime()
+	judgment, err := s.st.GetCurrentSituationJudgment(ctx, sit.ID, currentReadAt)
 	if err != nil {
 		return errResult("failed to get situation judgment"), nil
 	}
@@ -323,6 +343,23 @@ func (s *Server) handleGetSituation(ctx context.Context, req mcplib.CallToolRequ
 			payload["active_judgment"] = judgment.Judgment
 		}
 	}
+	sourceViews, err := s.st.GetCurrentZabbixSourceObservations(ctx, sit.ID, currentReadAt)
+	if err != nil {
+		return errResult("failed to get source provenance"), nil
+	}
+	sourceRows := make([]sourceProvenanceRow, 0, len(sourceViews))
+	for _, view := range sourceViews {
+		definition := view.Definition
+		sourceRows = append(sourceRows, sourceProvenanceRow{
+			Source: definition.Source, InstanceID: definition.InstanceID, RuleID: definition.RuleID, Host: definition.Host,
+			EndpointID: definition.EndpointID, Available: definition.Available, VersionAlgorithm: definition.VersionAlgorithm,
+			Version: definition.Version, UnavailableReason: definition.UnavailableReason,
+			ComponentDigests: definition.ComponentDigests, TriggerIDs: definition.TriggerIDs, ItemIDs: definition.ItemIDs,
+			ObservedAt: view.ObservedAt, ExpiresAt: view.ExpiresAt, Freshness: view.Freshness,
+			HistoricalVersionProven: definition.HistoricalProven,
+		})
+	}
+	payload["source_provenance"] = sourceRows
 	// R2: recorded after closure, never journaled, never lost. An empty
 	// array, never null — "none" is an answer, not an absence.
 	payload["artifacts_recorded_after_closure"] = history.Artifacts

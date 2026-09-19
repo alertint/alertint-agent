@@ -302,9 +302,10 @@ func judgmentChangeCarriesAuthority(change model.JudgmentChange) bool {
 	switch change {
 	case model.JudgmentChangeRecorded, model.JudgmentChangeReplaced, model.JudgmentChangeRestored:
 		return true
-	default:
+	case model.JudgmentChangeRevoked, model.JudgmentChangeExpired, model.JudgmentChangeInvalidated, "":
 		return false
 	}
+	return false
 }
 
 // selectedReply reads this Situation's delivery history once, bounded to

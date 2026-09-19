@@ -9,6 +9,8 @@ package zabbix
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,6 +41,7 @@ var ErrRedirectRefused = errors.New("zabbix: redirect refused on the bounded req
 type Config struct {
 	BaseURL              string // Zabbix frontend; "/api_jsonrpc.php" is appended
 	APIToken             string
+	InstanceID           string
 	TimeoutSeconds       int
 	HistoryRetentionDays int
 	FlapWindowHours      int
@@ -46,6 +49,8 @@ type Config struct {
 
 type Client struct {
 	endpoint   string
+	endpointID string
+	instanceID string
 	httpClient *http.Client
 	// boundedHTTP is httpClient with redirects disabled — the transport the
 	// bounded (proactive) callInstrumented path uses so one reservation is
@@ -70,8 +75,12 @@ func NewClient(cfg Config) *Client {
 		fw = 24
 	}
 	httpClient := &http.Client{Timeout: timeout}
+	endpoint := strings.TrimRight(cfg.BaseURL, "/") + "/api_jsonrpc.php"
+	sum := sha256.Sum256([]byte(endpoint))
 	return &Client{
-		endpoint:         strings.TrimRight(cfg.BaseURL, "/") + "/api_jsonrpc.php",
+		endpoint:         endpoint,
+		endpointID:       "sha256:" + hex.EncodeToString(sum[:]),
+		instanceID:       strings.TrimSpace(cfg.InstanceID),
 		httpClient:       httpClient,
 		boundedHTTP:      noRedirectClient(httpClient),
 		authHeader:       "Bearer " + cfg.APIToken,

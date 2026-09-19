@@ -74,26 +74,36 @@ func ParseZabbix(body []byte) (ZabbixEvent, error) {
 // zabbixReceiver wraps ParseZabbix → map → durable acceptance → wake,
 // mirroring alertReceiver. One webhook delivery carries one event.
 type zabbixReceiver struct {
-	store  *store.Store
-	wake   DeliveryWake
-	token  []byte
-	logger *slog.Logger
-	now    func() time.Time
-	newID  func() string
+	store      *store.Store
+	instanceID string
+	wake       DeliveryWake
+	token      []byte
+	logger     *slog.Logger
+	now        func() time.Time
+	newID      func() string
 }
 
 // NewZabbixReceiver builds the Zabbix receiver. wake may be nil.
 func NewZabbixReceiver(st *store.Store, token string, wake DeliveryWake, logger *slog.Logger) Receiver {
+	return NewZabbixReceiverWithInstance(st, token, "", wake, logger)
+}
+
+// NewZabbixReceiverWithInstance binds accepted webhooks to the configured
+// Zabbix installation. The legacy constructor records no instance so older
+// configurations remain explicitly unknown rather than gaining a fabricated
+// identity.
+func NewZabbixReceiverWithInstance(st *store.Store, token, instanceID string, wake DeliveryWake, logger *slog.Logger) Receiver {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &zabbixReceiver{
-		store:  st,
-		wake:   wake,
-		token:  []byte(token),
-		logger: logger,
-		now:    func() time.Time { return time.Now().UTC() },
-		newID:  uuid.NewString,
+		store:      st,
+		instanceID: strings.TrimSpace(instanceID),
+		wake:       wake,
+		token:      []byte(token),
+		logger:     logger,
+		now:        func() time.Time { return time.Now().UTC() },
+		newID:      uuid.NewString,
 	}
 }
 
@@ -118,7 +128,7 @@ func (r *zabbixReceiver) Ingest(ctx context.Context, body []byte) (Summary, erro
 		slog.String("host", ev.Host),
 	)
 
-	startedAt, err := r.episodeStart(ctx, "zabbix:"+ev.EventID)
+	startedAt, err := r.episodeStart(ctx, r.episodeKey(ev.EventID))
 	if err != nil {
 		return Summary{}, err // → 503 (already a *DurabilityError)
 	}
@@ -134,6 +144,13 @@ func (r *zabbixReceiver) Ingest(ctx context.Context, body []byte) (Summary, erro
 	}
 
 	return Summary{Kind: "alert.received", Audit: zabbixAuditRecord(ev)}, nil
+}
+
+func (r *zabbixReceiver) episodeKey(eventID string) string {
+	if r.instanceID == "" {
+		return "zabbix:" + eventID
+	}
+	return "zabbix:" + r.instanceID + ":" + eventID
 }
 
 // episodeStart resolves the SourceStartedAt this delivery must use: the
@@ -226,7 +243,7 @@ func (r *zabbixReceiver) toStoreAlert(ev ZabbixEvent, startsAt time.Time) store.
 
 	a := store.Alert{
 		ID:          r.newID(),
-		Fingerprint: "zabbix:" + ev.EventID,
+		Fingerprint: r.episodeKey(ev.EventID),
 		Labels:      labels,
 		Annotations: annotations,
 		StartsAt:    startsAt, // receipt-based by design, preserved across later deliveries — never parsed from clock (ADR-0031)
@@ -243,11 +260,12 @@ func (r *zabbixReceiver) toStoreAlert(ev ZabbixEvent, startsAt time.Time) store.
 }
 
 // toDeliveryInput maps one Zabbix event to its immutable delivery. The
-// source episode identity is zabbix:<event_id> only — trigger_id identifies
-// the source signal (SignalID), never the episode, and never doubles as a
-// SignalVersion: the webhook cannot prove the trigger configuration version,
-// so that field stays unavailable rather than synthesized (Plan 4 may derive
-// it later from bounded Zabbix API configuration reads). Neither
+// source episode and delivery identities include the configured installation
+// when one is available, so identical event IDs from different installations
+// remain distinct. trigger_id identifies the source signal (SignalID), never
+// the episode, and never doubles as a SignalVersion: the webhook cannot prove
+// the trigger configuration version, which is observed independently through
+// bounded Zabbix API reads. Neither
 // SourceStartedAt nor SourceResolvedAt is ever payload-derived — ADR-0031
 // forbids parsing clock/recovery_clock — so both bases are receipt_fallback
 // (or missing, before a resolution has been observed at all).
@@ -257,13 +275,22 @@ func (r *zabbixReceiver) toDeliveryInput(ev ZabbixEvent, alert store.Alert) stor
 		signalID = &id
 	}
 	eventID := ev.EventID
+	var instanceID *string
+	if r.instanceID != "" {
+		v := r.instanceID
+		instanceID = &v
+	}
+	deliveryNamespace := "zabbix-delivery"
+	if r.instanceID != "" {
+		deliveryNamespace += ":" + r.instanceID
+	}
 
 	input := store.DeliveryInput{
-		ID:               payloadDigest("zabbix-delivery", ev),
+		ID:               payloadDigest(deliveryNamespace, ev),
 		Alert:            alert,
 		Source:           "zabbix",
 		SourceEventID:    &eventID,
-		SourceEpisodeKey: "zabbix:" + ev.EventID,
+		SourceEpisodeKey: r.episodeKey(ev.EventID),
 		SourceStartedAt:  timePtr(alert.StartsAt),
 		StartedAtBasis:   situationmodel.SourceTimeBasisReceiptFallback,
 		ResolvedAtBasis:  situationmodel.SourceTimeBasisMissing,
@@ -272,6 +299,7 @@ func (r *zabbixReceiver) toDeliveryInput(ev ZabbixEvent, alert store.Alert) stor
 		),
 		PayloadDigest: payloadDigest("zabbix-payload", ev),
 		SourceProvenance: store.SourceProvenance{
+			InstanceID:      instanceID,
 			SignalID:        signalID,
 			GeneratorURL:    ev.GeneratorURL,
 			AcquisitionMode: store.SourceAcquisitionWebhook,

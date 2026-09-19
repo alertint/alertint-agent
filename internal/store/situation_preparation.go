@@ -781,10 +781,16 @@ func (s *Store) CommitObservationRun(ctx context.Context, f observationmodel.Fen
 		return fmt.Errorf("store: insert observation run: %w", err)
 	}
 
+	sourceDefinitionChanged := false
 	for _, fact := range run.Facts {
 		if err := insertObservationFactTx(ctx, tx, run.ID, fact); err != nil {
 			return err
 		}
+		changed, err := insertZabbixSourceObservationTx(ctx, tx, cycle.situationID, run.ID, fact, now)
+		if err != nil {
+			return err
+		}
+		sourceDefinitionChanged = sourceDefinitionChanged || changed
 	}
 
 	refID := "ref:open_cycle:" + run.ID
@@ -804,6 +810,21 @@ func (s *Store) CommitObservationRun(ctx context.Context, f observationmodel.Fen
 		}
 		if err := admitRefreshTx(ctx, tx, f.SituationID, cycle, run.CycleID, scope, planCapability, run.ID); err != nil {
 			return err
+		}
+	}
+	if sourceDefinitionChanged {
+		if err := persistObservedSituationJudgmentInvalidationTx(ctx, tx, cycle.situationID, now); err != nil {
+			return fmt.Errorf("store: invalidate judgment for zabbix source change: %w", err)
+		}
+		if err := mergeSituationDueReasonTx(ctx, tx, cycle.situationID, situationmodel.DueSourceProvenanceChanged, now); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE situations
+			SET next_assessment_at=CASE WHEN next_assessment_at > ? THEN ? ELSE next_assessment_at END, updated_at=?
+			WHERE id=? AND lifecycle IN ('active','recovery_pending')`,
+			canonicalTime(now), canonicalTime(now), canonicalTime(now), cycle.situationID); err != nil {
+			return fmt.Errorf("store: wake situation for zabbix source change: %w", err)
 		}
 	}
 
@@ -1611,8 +1632,17 @@ func (s *Store) AccrueInvestigationCredit(ctx context.Context, situationID strin
 // adapter); this decode path is exercised here by direct fixture only,
 // exactly like RecoveryGraceDuration's own not-yet-reachable polling branch.
 func loadPreparedStateTx(ctx context.Context, tx *sql.Tx, situationID string, now time.Time) (situation.PreparedState, error) {
+	sourceViews, err := loadCurrentZabbixSourceObservationsTx(ctx, tx, situationID, now)
+	if err != nil {
+		return situation.PreparedState{}, err
+	}
+	sourceDefinitions := make([]observationmodel.SourceDefinitionObservation, 0, len(sourceViews))
+	for _, view := range sourceViews {
+		sourceDefinitions = append(sourceDefinitions, view.Definition)
+	}
+	base := situation.PreparedState{SourceDefinitions: sourceDefinitions, LoadedAt: now.UTC()}
 	var cycleID sql.NullString
-	err := tx.QueryRowContext(ctx, `SELECT current_preparation_cycle_id FROM situations WHERE id = ?`, situationID).Scan(&cycleID)
+	err = tx.QueryRowContext(ctx, `SELECT current_preparation_cycle_id FROM situations WHERE id = ?`, situationID).Scan(&cycleID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return situation.PreparedState{}, ErrNotFound
 	}
@@ -1620,7 +1650,7 @@ func loadPreparedStateTx(ctx context.Context, tx *sql.Tx, situationID string, no
 		return situation.PreparedState{}, fmt.Errorf("store: read current preparation cycle pointer: %w", err)
 	}
 	if !cycleID.Valid || cycleID.String == "" {
-		return situation.PreparedState{}, nil
+		return base, nil
 	}
 
 	var generation int64
@@ -1648,7 +1678,7 @@ func loadPreparedStateTx(ctx context.Context, tx *sql.Tx, situationID string, no
 	// prepared state (review F16): the controller sees "no cycle yet" and
 	// prepares afresh rather than reasoning from a superseded projection.
 	if cycleInputVersion != situationInputVersion {
-		return situation.PreparedState{}, nil
+		return base, nil
 	}
 	var allocation observationmodel.PhaseAllocation
 	if err := json.Unmarshal([]byte(allocationJSON), &allocation); err != nil {
@@ -1685,7 +1715,7 @@ func loadPreparedStateTx(ctx context.Context, tx *sql.Tx, situationID string, no
 	return situation.PreparedState{
 		CycleID: cycleID.String, Generation: generation,
 		Runs: runs, ProfileVersionIDs: profileVersionIDs, ProfileGuidance: profileGuidance,
-		Lifecycle: lifecycle, Deferred: allocation.Deferred, PlansByID: plansByID, LoadedAt: now.UTC(),
+		Lifecycle: lifecycle, SourceDefinitions: sourceDefinitions, Deferred: allocation.Deferred, PlansByID: plansByID, LoadedAt: now.UTC(),
 	}, nil
 }
 

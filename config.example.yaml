@@ -201,6 +201,9 @@ changes:
 #             zabbix_host_problems MCP tools. Presence-based: setting
 #             base_url turns it on. See docs/integrations/zabbix.md.
 zabbix:
+  # Stable non-secret name for this Zabbix installation. Use the same value
+  # for ingress and API; changing it creates a new source identity.
+  instance_id: prod-zbx-eu
   ingress:
     enabled: false
     webhook_token_env: ALERTINT_ZABBIX_WEBHOOK_TOKEN   # bearer token Zabbix presents to /webhook/zabbix

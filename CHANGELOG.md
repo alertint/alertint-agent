@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Zabbix installations and trigger rules can carry stable source identity and
+  bounded current configuration-version evidence into Situation preparation
+  and MCP. Missing, expired, unsupported, or inconsistent evidence stays
+  explicitly unavailable, and material rule changes invalidate covered
+  expectedness without changing lifecycle or Slack layout.
 - Operators can mark a Situation's current non-critical condition as expected
   until a set time, replace, withdraw, or restore that decision through MCP,
   and see the decision and any reason it ended in Slack.

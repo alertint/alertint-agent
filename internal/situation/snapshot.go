@@ -211,6 +211,9 @@ type Delivery struct {
 	// filled from a hash of the alert name or any other invented value.
 	SourceSignalID      *string
 	SourceSignalVersion *string
+	// SourceInstanceID is the stable, non-secret installation identity
+	// recorded by the source adapter for this immutable delivery.
+	SourceInstanceID *string
 	// AcquisitionMode and PollIntervalSeconds are this delivery's own
 	// proven acquisition mode ("webhook"|"poll") and, for poll, its real
 	// configured interval — alert_deliveries.acquisition_mode/

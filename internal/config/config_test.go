@@ -238,6 +238,21 @@ func TestZabbixAPIDefaults(t *testing.T) {
 	}
 }
 
+func TestZabbixInstanceIDValidation(t *testing.T) {
+	cfg := Defaults()
+	cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
+	cfg.LLM.APIKeyEnv = "ANTHROPIC_API_KEY"
+	cfg.Alertmanager.WebhookTokenEnv = "ALERTINT_WEBHOOK_TOKEN"
+	cfg.Zabbix.InstanceID = "prod zabbix"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "zabbix: instance_id") {
+		t.Fatalf("want instance_id validation error, got %v", err)
+	}
+	cfg.Zabbix.InstanceID = "prod-zbx.eu_1"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid instance id: %v", err)
+	}
+}
+
 func TestDefaultGroupLabelsUseReceiverGrouping(t *testing.T) {
 	cfg := Defaults()
 	if len(cfg.Correlator.GroupLabels) != 0 {

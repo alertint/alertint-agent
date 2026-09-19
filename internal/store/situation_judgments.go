@@ -31,7 +31,7 @@ type AuditTx = *sql.Tx
 
 // JudgmentAuditAppender writes the audit row inside the judgment transaction.
 type JudgmentAuditAppender interface {
-	AppendTx(context.Context, *sql.Tx, string, string, any, time.Time) error
+	AppendTx(ctx context.Context, tx *sql.Tx, actor, kind string, payload any, at time.Time) error
 }
 
 // SituationJudgmentWrite is the fenced MCP command shape shared by record,
@@ -59,6 +59,7 @@ type SituationJudgmentView struct {
 	Applicability model.JudgmentApplicability `json:"applicability"`
 }
 
+//nolint:gocyclo // version fence, immutable revision, wake, and audit must remain one atomic transaction
 func (s *Store) WriteSituationJudgment(ctx context.Context, auditor JudgmentAuditAppender, req SituationJudgmentWrite) (SituationJudgmentWriteResult, error) {
 	if auditor == nil {
 		return SituationJudgmentWriteResult{}, errors.New("store: situation judgment requires an atomic auditor")
@@ -169,7 +170,10 @@ func (s *Store) WriteSituationJudgment(ctx context.Context, auditor JudgmentAudi
 
 	due := mergeDueReason(in.Situation.DueReasons, model.DueOperatorJudgment)
 	due = mergeDueReason(due, model.DueJudgmentBoundary)
-	dueJSON, _ := json.Marshal(due)
+	dueJSON, err := json.Marshal(due)
+	if err != nil {
+		return SituationJudgmentWriteResult{}, fmt.Errorf("store: marshal situation judgment due reasons: %w", err)
+	}
 	res, err := tx.ExecContext(ctx, `
 		UPDATE situations SET input_version=input_version+1, next_assessment_at=?, due_reasons_json=?,
 			lease_owner=NULL, lease_expires_at=NULL, retry_at=NULL, updated_at=?
@@ -298,9 +302,7 @@ func readSituationJudgmentInvalidationTx(ctx context.Context, tx *sql.Tx, situat
 	return model.JudgmentApplicabilityReason(reason.String), reason.Valid, nil
 }
 
-type rowScanner interface{ Scan(...any) error }
-
-func scanSituationJudgment(row rowScanner) (persistedJudgment, error) {
+func scanSituationJudgment(row scanner) (persistedJudgment, error) {
 	var p persistedJudgment
 	var operation, state, trust, validUntil, coverageJSON, createdAt string
 	if err := row.Scan(&p.judgment.ID, &p.judgment.SituationID, &p.judgment.Revision, &operation, &state, &p.judgment.AssertedOperator, &trust, &p.judgment.RequestID, &p.requestHash, &p.resultInputVersion, &validUntil, &coverageJSON, &createdAt); err != nil {
@@ -333,7 +335,11 @@ func loadSituationJudgmentInputTx(ctx context.Context, tx *sql.Tx, situationID s
 	if err != nil {
 		return situation.SnapshotInput{}, err
 	}
-	return situation.SnapshotInput{Situation: sit, Deliveries: deliveries, CurrentAssessment: assessment, Now: now.UTC()}, nil
+	prepared, err := loadPreparedStateTx(ctx, tx, situationID, now)
+	if err != nil {
+		return situation.SnapshotInput{}, err
+	}
+	return situation.SnapshotInput{Situation: sit, Deliveries: deliveries, CurrentAssessment: assessment, Prepared: prepared, Now: now.UTC()}, nil
 }
 
 func (s *Store) GetCurrentSituationJudgment(ctx context.Context, situationID string, now time.Time) (*SituationJudgmentView, error) {
@@ -416,7 +422,7 @@ func persistSituationJudgmentInvalidationTx(ctx context.Context, tx *sql.Tx, sit
 	if commit.JudgmentRevision == 0 || commit.JudgmentApplicable {
 		return nil
 	}
-	switch commit.JudgmentApplicabilityReason {
+	switch commit.JudgmentApplicabilityReason { //nolint:exhaustive // every unlisted material reason follows the persistence path below
 	case "", model.JudgmentApplicable, model.JudgmentExpired, model.JudgmentRevoked, model.JudgmentSituationTerminal:
 		return nil
 	}
@@ -450,7 +456,7 @@ func persistObservedSituationJudgmentInvalidationTx(ctx context.Context, tx *sql
 	if app.Applicable {
 		return nil
 	}
-	switch app.Reason {
+	switch app.Reason { //nolint:exhaustive // every unlisted material reason follows the persistence path below
 	case "", model.JudgmentApplicable, model.JudgmentExpired, model.JudgmentRevoked, model.JudgmentSituationTerminal:
 		return nil
 	}

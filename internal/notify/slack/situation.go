@@ -485,7 +485,7 @@ func renderExpectedJudgmentJournal(t model.Transition) RenderedMessage {
 		} else {
 			text = "The expected-until decision reached its scheduled end time. Normal assessment resumes."
 		}
-	default:
+	case model.JudgmentChangeInvalidated:
 		reason := strings.TrimSuffix(strings.TrimSpace(t.Journal.Detail), ".")
 		if reason == "Normal assessment resumes" {
 			reason = ""
@@ -499,6 +499,8 @@ func renderExpectedJudgmentJournal(t model.Transition) RenderedMessage {
 			reason = "the current condition changed"
 		}
 		text = "The expected-until decision no longer applies because " + reason + ". Normal assessment resumes."
+	default:
+		text = "The expected-until decision no longer applies because the current condition changed. Normal assessment resumes."
 	}
 	if action := t.ActionContract.OperatorActionRequired; action != nil {
 		text += " Operator action required: " + humanizeOperatorAction(*action) + "."

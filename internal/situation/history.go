@@ -684,7 +684,7 @@ func expectedJudgmentJournal(change AuthoritativeChange) (model.JournalData, mod
 	if prior != nil {
 		j.JudgmentValidUntil = &prior.ValidUntil
 	}
-	if prior != nil && change.Judgment != nil && change.Judgment.Operation == model.JudgmentOperationRevoke && change.Judgment.Revision > prior.Revision {
+	if prior != nil && change.Judgment != nil && change.Judgment.Operation == model.JudgmentOperationRevoke && change.Judgment.Revision > prior.Revision { //nolint:gocritic // ordered judgment precedence is clearer as the existing if/else chain
 		j.JudgmentChange, j.Headline = model.JudgmentChangeRevoked, "Expected-until decision ended"
 		j.AttributedActor = change.Judgment.AssertedOperator
 		j.JudgmentValidUntil = nil
@@ -723,6 +723,8 @@ func expectedJudgmentInvalidationDetail(change AuthoritativeChange) string {
 		return "The evidence needed to keep the decision active is no longer available."
 	case model.JudgmentSituationTerminal:
 		return "The Situation ended."
+	case model.JudgmentApplicable, model.JudgmentExpired, model.JudgmentRevoked:
+		return "The current condition changed."
 	default:
 		return "The current condition changed."
 	}

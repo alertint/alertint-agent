@@ -107,6 +107,7 @@ pull source (read-only context enrichment + `zabbix_metric_history` /
 
 | Field | Type | Default | Description |
 |---|---|---|---|
+| `instance_id` | string | — | Stable non-secret installation ID shared by ingress and API, up to 64 letters, digits, `.`, `_`, or `-`. Required for trusted rule-version observations; changing it creates a different source identity. Existing rows remain unknown. |
 | `ingress.enabled` | bool | `false` | Mount `POST /webhook/zabbix` on `receivers.address` |
 | `ingress.webhook_token_env` | string | — | **Required when `ingress.enabled`.** Env var name holding the Zabbix webhook bearer token |
 | `api.enabled` | bool | auto | Fetch the Zabbix context at triage time and register the two `zabbix_*` MCP tools. Omitted = **on automatically** when `api.base_url` is set; set `false` to force off. |

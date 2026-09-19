@@ -257,7 +257,7 @@ func membersFromDeliveries(in situation.SnapshotInput, selectorKeys []string, ho
 	for _, k := range keys {
 		d := latest[k]
 		members = append(members, observation.MemberSubject{
-			SubjectID: k, Source: d.Source, Labels: d.Labels, SelectorLabels: selectorLabels(d.Labels, selectorKeys),
+			SubjectID: k, Source: d.Source, SourceInstanceID: d.SourceInstanceID, Labels: d.Labels, SelectorLabels: selectorLabels(d.Labels, selectorKeys),
 			ObservationDeadlineAt: d.ReceivedAt.UTC().Add(horizon), RecoveryGraceUntil: in.Situation.GraceUntil,
 			Firing: d.Status == situationmodel.DeliveryStatusFiring,
 		})
@@ -356,7 +356,7 @@ func capabilityDescriptorsFromConfig(cfg *config.Config) []observation.Capabilit
 		// trend read: two physical requests (review F17).
 		descs = append(descs,
 			observation.CapabilityDescriptor{Capability: model.CapabilityZabbixMetricRange, DefaultWindow: time.Hour, DefaultLimit: 100, MaxRequestsHint: 2},
-			observation.CapabilityDescriptor{Capability: model.CapabilityZabbixProblemHist, DefaultWindow: 24 * time.Hour, DefaultLimit: 20, MaxRequestsHint: 2},
+			observation.CapabilityDescriptor{Capability: model.CapabilityZabbixProblemHist, DefaultWindow: 24 * time.Hour, DefaultLimit: 20, MaxRequestsHint: 6},
 		)
 	}
 	return descs
@@ -409,7 +409,7 @@ func executorsFromClients(st *store.Store, prom *promclient.Client, lokiClient *
 	}
 	if zbxClient != nil {
 		execs[model.CapabilityZabbixMetricRange] = &connectors.ZabbixMetricExecutor{Client: zbxClient, Clock: now}
-		execs[model.CapabilityZabbixProblemHist] = &connectors.ZabbixProblemExecutor{Client: zbxClient, Clock: now}
+		execs[model.CapabilityZabbixProblemHist] = &connectors.ZabbixProblemExecutor{Client: zbxClient, SourceDefinition: zbxClient, Clock: now}
 	}
 	return execs
 }

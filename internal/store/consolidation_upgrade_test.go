@@ -65,7 +65,10 @@ func TestConsolidationPreservesPopulatedOperatorDatabase(t *testing.T) {
 	exec(`INSERT INTO llm_health_capabilities(capability,healthy,reason_code,content_subjects,updated_at)
 		VALUES ('triage_draft',0,'content','["incident-one","incident-two"]',?)`, canonicalTime(time.Now().UTC()))
 	queries := []string{
-		`SELECT * FROM alert_deliveries ORDER BY id`,
+		`SELECT id,alert_id,source,source_event_id,source_episode_key,status,labels_json,annotations_json,
+			starts_at,ends_at,source_started_at,source_resolved_at,started_at_basis,resolved_at_basis,
+			receiver_grouping_identity,payload_digest,source_signal_id,source_signal_version,generator_url,
+			acquisition_mode,poll_interval_seconds,received_at FROM alert_deliveries ORDER BY id`,
 		`SELECT * FROM situation_transitions ORDER BY id`,
 		`SELECT * FROM notification_intents ORDER BY id`,
 		`SELECT id,lifecycle,slack_channel,slack_root_ts FROM situations ORDER BY id`,

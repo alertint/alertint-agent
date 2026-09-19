@@ -34,6 +34,7 @@ the 7.0 macro and JSON-RPC API documentation.
 
 ```yaml
 zabbix:
+  instance_id: prod-zbx-eu                    # stable non-secret installation identity
   ingress:
     enabled: false
     webhook_token_env: ALERTINT_ZABBIX_WEBHOOK_TOKEN   # bearer token Zabbix presents to /webhook/zabbix
@@ -147,7 +148,7 @@ through and close out the incident.
 
 | Alert field | Source | Notes |
 |---|---|---|
-| Fingerprint | `event_id` | Namespaced `zabbix:<event_id>`, stable across the `PROBLEM`→`RESOLVED` pair, so the resolution dedups onto the same alert row. |
+| Fingerprint | `event_id` | With `instance_id`, namespaced `zabbix:<instance_id>:<event_id>`; legacy installations without it retain `zabbix:<event_id>`. Stable across the `PROBLEM`→`RESOLVED` pair, so the resolution dedups onto the same alert row. |
 | Status | `status` | `PROBLEM` → firing, `RESOLVED` → resolved. |
 | Timestamps | receipt time | `StartsAt`/`EndsAt` are stamped when AlertINT receives the webhook, never parsed from `clock`/`recovery_clock` — those expand in the Zabbix server's own timezone with no UTC offset in the string, which would silently skew timestamps that anchor enrichment windows. The raw `clock`/`recovery_clock` strings still ride along as annotations for reference. |
 | `alertname` label | `trigger_name` | Aligns with Alertmanager's grouping vocabulary. |
@@ -202,6 +203,7 @@ probe) — it never mutates Zabbix state.
 
 ```yaml
 zabbix:
+  instance_id: prod-zbx-eu                    # same identity used by ingress
   api:
     # enabled: false                       # uncomment to force OFF even when base_url is set
     base_url: https://zbx.example.com      # Zabbix frontend root; /api_jsonrpc.php is appended
@@ -302,6 +304,32 @@ wall-clock budget as every other capability
 `situations.preparation.max_wall_seconds` — see
 [Configuration: `situations`](../getting-started/configuration.md#situations)),
 never a separate, uncapped Zabbix-specific budget.
+
+When both `instance_id` and `zabbix.api` are configured, the problem-history
+read also observes the trigger's current effective configuration. AlertINT
+hashes a documented, versioned canonical form of the expanded firing and
+recovery expressions, severity/enabled state, tags and host scope, direct
+trigger dependencies, referenced item definitions, and preprocessing steps.
+It stores only the resulting version and bounded component digests, not raw
+expressions or a configuration dump.
+
+`alertint_get_situation` exposes this under `source_provenance`, including the
+installation and rule IDs, version algorithm/value, observation and expiry
+times, and freshness. If the read is incomplete, unsupported, unavailable, or
+expired, the current entry contains an explicit `unavailable_reason` and no
+usable version. An older successful value remains history and is never used as
+the current answer.
+
+The supported rule surface currently accepts direct trigger dependencies and
+Zabbix agent, Zabbix agent active, trapper, internal, and calculated items.
+Nested dependencies, dependent or other unsupported item types, unresolved
+macros, oversized dependency/item sets, ambiguous rows, and inconsistent
+double reads are reported unavailable. The observation describes current API
+truth only: Zabbix 7.0 does not provide the historical configuration revision
+that produced an older event, so AlertINT never stamps this version onto the
+immutable delivery as event-time proof. Refresh follows the Situation evidence
+cadence (normally five minutes), so edits and change-then-revert activity
+between observations cannot be reconstructed.
 
 ## Verification
 

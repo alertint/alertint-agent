@@ -59,7 +59,7 @@ type fakeExecutor struct {
 func (f *fakeExecutor) Execute(ctx context.Context, plan model.Plan, recorder RequestRecorder) (model.Run, error) {
 	f.calls++
 	if f.err != nil {
-		return model.Run{}, f.err
+		return f.run, f.err
 	}
 	if _, err := recorder.BeforeRequest(ctx); err != nil {
 		return model.Run{}, err
@@ -150,6 +150,25 @@ func TestRunPhaseExecutorFailureCommitsFailedRunAndContinues(t *testing.T) {
 	}
 	if !foundFailed || !foundOK {
 		t.Fatalf("expected both a failed run and the ok run, got %+v", store.committed)
+	}
+}
+
+func TestRunPhaseExecutorFailurePreservesIndependentEvidence(t *testing.T) {
+	plan := model.Plan{ID: "plan-fail", CycleID: "cycle-1", Capability: model.CapabilityZabbixProblemHist, Phase: model.PhaseAssessment, Start: time.Now(), End: time.Now()}
+	fact := model.Fact{ID: "fact-source", RunID: "run-fail", Kind: "source_definition", ResultStatus: model.ResultUnavailable}
+	run := model.Run{
+		ID: "run-fail", CycleID: "cycle-1", PlanID: "plan-fail", Status: model.ResultFailed,
+		Coverage: model.Coverage{Start: plan.Start, End: plan.End}, Facts: []model.Fact{fact},
+	}
+	store := &fakePreparationStore{hasRun: map[string]bool{}}
+	exec := &fakeExecutor{run: run, err: &FailedRunWithEvidenceError{Err: errors.New("history unavailable")}}
+	r := NewRunner(store, map[model.Capability]Executor{model.CapabilityZabbixProblemHist: exec}, nil)
+
+	if err := r.RunPhase(context.Background(), model.Fence{}, testCycle(plan), model.PhaseAssessment); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.committed) != 1 || len(store.committed[0].Facts) != 1 || store.committed[0].Facts[0].ID != "fact-source" {
+		t.Fatalf("committed = %+v, want failed run with independently acquired fact", store.committed)
 	}
 }
 
