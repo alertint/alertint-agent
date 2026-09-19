@@ -73,17 +73,18 @@ type SituationJudgment struct {
 type JudgmentApplicabilityReason string
 
 const (
-	JudgmentApplicable             JudgmentApplicabilityReason = "applicable"
-	JudgmentExpired                JudgmentApplicabilityReason = "expired"
-	JudgmentRevoked                JudgmentApplicabilityReason = "revoked"
-	JudgmentSituationTerminal      JudgmentApplicabilityReason = "situation_terminal"
-	JudgmentScopeChanged           JudgmentApplicabilityReason = "scope_changed"
-	JudgmentSymptomsChanged        JudgmentApplicabilityReason = "symptoms_changed"
-	JudgmentSeverityChanged        JudgmentApplicabilityReason = "severity_changed"
-	JudgmentImpactChanged          JudgmentApplicabilityReason = "impact_changed"
-	JudgmentSourceSignatureChanged JudgmentApplicabilityReason = "source_signature_changed"
-	JudgmentEvidenceMissing        JudgmentApplicabilityReason = "evidence_missing"
-	JudgmentUrgent                 JudgmentApplicabilityReason = "urgent"
+	JudgmentApplicable                  JudgmentApplicabilityReason = "applicable"
+	JudgmentExpired                     JudgmentApplicabilityReason = "expired"
+	JudgmentRevoked                     JudgmentApplicabilityReason = "revoked"
+	JudgmentSituationTerminal           JudgmentApplicabilityReason = "situation_terminal"
+	JudgmentScopeChanged                JudgmentApplicabilityReason = "scope_changed"
+	JudgmentSymptomsChanged             JudgmentApplicabilityReason = "symptoms_changed"
+	JudgmentSeverityChanged             JudgmentApplicabilityReason = "severity_changed"
+	JudgmentImpactChanged               JudgmentApplicabilityReason = "impact_changed"
+	JudgmentSourceSignatureChanged      JudgmentApplicabilityReason = "source_signature_changed"
+	JudgmentSourceDefinitionUnavailable JudgmentApplicabilityReason = "source_definition_unavailable"
+	JudgmentEvidenceMissing             JudgmentApplicabilityReason = "evidence_missing"
+	JudgmentUrgent                      JudgmentApplicabilityReason = "urgent"
 )
 
 type JudgmentApplicability struct {

@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded current configuration-version evidence into Situation preparation
   and MCP. Missing, expired, unsupported, or inconsistent evidence stays
   explicitly unavailable, and material rule changes invalidate covered
-  expectedness without changing lifecycle or Slack layout.
+  expectedness without changing lifecycle.
 - Operators can mark a Situation's current non-critical condition as expected
   until a set time, replace, withdraw, or restore that decision through MCP,
   and see the decision and any reason it ended in Slack.
@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Situation Slack roots keep completed-analysis timing and token usage in the
+  analysis thread, and distinguish an unavailable source rule definition from
+  a rule whose identity or version changed.
 - Situation assessments carry the prior semantic judgment into the prompt and
   no longer let the static capability-limitation set churn the material fact
   hash, so unchanged evidence reuses the existing assessment instead of

@@ -245,14 +245,14 @@ func canonicalNumber(n int) string {
 	return s
 }
 
-func canonicalTimings(t model.Transition, b *model.OperatorBriefing, start, end time.Time, root bool) []string {
+func canonicalTimings(t model.Transition, b *model.OperatorBriefing, start, end time.Time, includeAge, includeAnalysis bool) []string {
 	f := b.Flow
 	terminal := t.Lifecycle.Terminal()
 	if terminal && t.Projection.TerminalAt != nil {
 		end = *t.Projection.TerminalAt
 	}
 	var lines []string
-	if root {
+	if includeAge {
 		label := "Alert age"
 		if terminal {
 			label += " at closure"
@@ -269,7 +269,7 @@ func canonicalTimings(t model.Transition, b *model.OperatorBriefing, start, end 
 	if f.InvestigationStartedAt != nil {
 		lines = append(lines, "*Investigation started:* "+canonicalElapsed(f.FirstReceivedAt, *f.InvestigationStartedAt)+" after first receipt")
 	}
-	if f.InvestigationCompletedAt != nil {
+	if includeAnalysis && f.InvestigationCompletedAt != nil {
 		line := "*Analysis completed:* " + canonicalElapsed(f.FirstReceivedAt, *f.InvestigationCompletedAt) + " after first receipt"
 		if f.InvestigationStartedAt != nil {
 			runtime := canonicalElapsed(*f.InvestigationStartedAt, *f.InvestigationCompletedAt)
@@ -287,7 +287,7 @@ func canonicalTimings(t model.Transition, b *model.OperatorBriefing, start, end 
 		}
 		lines = append(lines, "*"+label+":* "+canonicalElapsed(f.FirstReceivedAt, end)+" from first receipt")
 	}
-	if f.InvestigationCompletedAt != nil || terminal {
+	if includeAnalysis && (f.InvestigationCompletedAt != nil || terminal) {
 		if usage := canonicalUsage(f.AnalysisUsage); usage != "" {
 			lines = append(lines, usage)
 		}
@@ -364,7 +364,7 @@ func renderCanonicalRoot(in SituationRootInput) RenderedMessage {
 		}
 		lines = append(lines, "Recovery confirmed · "+canonicalElapsed(b.Flow.FirstReceivedAt, end)+" after first receipt")
 	} else {
-		lines = append(lines, strings.Join(canonicalTimings(t, b, in.Summary.EffectiveStartedAt, in.Now, true), "\n"))
+		lines = append(lines, strings.Join(canonicalTimings(t, b, in.Summary.EffectiveStartedAt, in.Now, true, false), "\n"))
 	}
 	if t.Lifecycle.Terminal() {
 		lines = append(lines, canonicalMCP(in.Summary))

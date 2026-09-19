@@ -719,6 +719,8 @@ func expectedJudgmentInvalidationDetail(change AuthoritativeChange) string {
 		return "The assessed impact changed."
 	case model.JudgmentSourceSignatureChanged:
 		return "The source identity or version changed."
+	case model.JudgmentSourceDefinitionUnavailable:
+		return "AlertINT can no longer verify the source rule definition."
 	case model.JudgmentEvidenceMissing:
 		return "The evidence needed to keep the decision active is no longer available."
 	case model.JudgmentSituationTerminal:

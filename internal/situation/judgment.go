@@ -136,8 +136,14 @@ func EvaluateExpectedJudgment(j model.SituationJudgment, in SnapshotInput, now t
 		if cur.Source != covered.Source || cur.EpisodeKey != covered.EpisodeKey ||
 			!equalStringPtr(cur.SourceSignalID, covered.SourceSignalID) ||
 			!equalStringPtr(cur.SourceSignalVersion, covered.SourceSignalVersion) ||
-			!equalStringPtr(cur.SourceInstanceID, covered.SourceInstanceID) ||
-			!equalStringPtr(cur.ObservedSourceInstanceID, covered.ObservedSourceInstanceID) ||
+			!equalStringPtr(cur.SourceInstanceID, covered.SourceInstanceID) {
+			return result(model.JudgmentSourceSignatureChanged)
+		}
+		if (covered.ObservedSourceInstanceID != nil || covered.ObservedSourceConfigVersion != nil) &&
+			(cur.ObservedSourceInstanceID == nil || cur.ObservedSourceConfigVersion == nil) {
+			return result(model.JudgmentSourceDefinitionUnavailable)
+		}
+		if !equalStringPtr(cur.ObservedSourceInstanceID, covered.ObservedSourceInstanceID) ||
 			!equalStringPtr(cur.ObservedSourceConfigVersion, covered.ObservedSourceConfigVersion) {
 			return result(model.JudgmentSourceSignatureChanged)
 		}

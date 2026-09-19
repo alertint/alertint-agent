@@ -288,6 +288,7 @@ func TestExpectedJudgmentInvalidationRecordsConcreteReason(t *testing.T) {
 		{"severity", model.JudgmentSeverityChanged, 0, "The alert severity changed."},
 		{"impact", model.JudgmentImpactChanged, 0, "The assessed impact changed."},
 		{"source signature", model.JudgmentSourceSignatureChanged, 0, "The source identity or version changed."},
+		{"source definition unavailable", model.JudgmentSourceDefinitionUnavailable, 0, "AlertINT can no longer verify the source rule definition."},
 		{"evidence", model.JudgmentEvidenceMissing, 0, "The evidence needed to keep the decision active is no longer available."},
 		{"terminal", model.JudgmentSituationTerminal, 0, "The Situation ended."},
 	}

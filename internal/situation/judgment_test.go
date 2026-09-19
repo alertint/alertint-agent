@@ -87,8 +87,8 @@ func TestExpectedJudgmentApplicabilityTracksCurrentZabbixRuleVersion(t *testing.
 		Source: "zabbix", InstanceID: "prod-zbx", RuleID: "18422", Available: false,
 		UnavailableReason: "api_unavailable",
 	}}
-	if got := EvaluateExpectedJudgment(judgment, unavailable, in.Now); got.Applicable || got.Reason != model.JudgmentSourceSignatureChanged {
-		t.Fatalf("unavailable current rule version = %+v, want source_signature_changed", got)
+	if got := EvaluateExpectedJudgment(judgment, unavailable, in.Now); got.Applicable || got.Reason != model.JudgmentSourceDefinitionUnavailable {
+		t.Fatalf("unavailable current rule version = %+v, want source_definition_unavailable", got)
 	}
 }
 

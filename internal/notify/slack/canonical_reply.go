@@ -299,14 +299,14 @@ func canonicalReplyTimings(t model.Transition, b *model.OperatorBriefing, kind s
 	var lines []string
 	switch {
 	case kind == "analysis_completed":
-		lines = append(lines, canonicalTimings(t, b, t.Projection.EffectiveStartedAt, t.CreatedAt, false)...)
+		lines = append(lines, canonicalTimings(t, b, t.Projection.EffectiveStartedAt, t.CreatedAt, false, true)...)
 	case t.Lifecycle.Terminal():
 		end := t.CreatedAt
 		if t.Projection.TerminalAt != nil {
 			end = *t.Projection.TerminalAt
 		}
 		lines = append(lines, "*Confirmed:* "+SlackDateToken(end, "{time_secs}"))
-		lines = append(lines, canonicalTimings(t, b, t.Projection.EffectiveStartedAt, end, true)...)
+		lines = append(lines, canonicalTimings(t, b, t.Projection.EffectiveStartedAt, end, true, true)...)
 	default:
 		if kind != "investigation_started" {
 			lines = append(lines, "*Since first receipt:* "+canonicalElapsed(b.Flow.FirstReceivedAt, t.CreatedAt))
