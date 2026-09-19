@@ -35,10 +35,17 @@ func TestExpectedBehaviorStoppedReasonsAndWithdrawalUseSimpleText(t *testing.T) 
 	tr.Journal.ExpectedBehaviorChange = model.ExpectedBehaviorChangeWithdrawn
 	tr.Journal.AttributedActor = "Janis"
 	msg, err := RenderSituationJournal(tr)
-	if err != nil || msg.Text != "Janis withdrew the expected schedule. Normal assessment resumes." {
+	if err != nil || msg.Text != "Janis removed the expected schedule. Normal assessment resumes." {
 		t.Fatalf("withdrawal=%q err=%v", msg.Text, err)
 	}
+	boundary := bcNow(t).Add(time.Hour)
 	tr.Journal.ExpectedBehaviorChange = model.ExpectedBehaviorChangeApplied
+	tr.Journal.ExpectedBehaviorBoundary = &boundary
+	msg, err = RenderSituationJournal(tr)
+	wantApplied := "This condition matches Janis's expected schedule until " + SlackDateToken(boundary, "{time}") + ". Monitoring continues."
+	if err != nil || msg.Text != wantApplied {
+		t.Fatalf("applied=%q want=%q err=%v", msg.Text, wantApplied, err)
+	}
 	tr.Journal.NoLongerCurrent = true
 	msg, err = RenderSituationJournal(tr)
 	if err != nil || !strings.Contains(msg.Text, "This schedule is no longer active.") {

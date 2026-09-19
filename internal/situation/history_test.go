@@ -271,6 +271,22 @@ func TestExpectedJudgmentCreatesOnlyMeaningfulHistoryTransitions(t *testing.T) {
 	}
 }
 
+func TestExpectedScheduleMatchIsAControllerTransitionAttributedToItsOwner(t *testing.T) {
+	change := hsNext(t)
+	boundary := change.Now.Add(time.Hour)
+	change.Projection.Briefing = &model.OperatorBriefing{ExpectedBehavior: &model.ExpectedBehaviorProjection{
+		EnvelopeID: "envelope-1", Version: 1, AssertedOperator: "Janis",
+		Disposition: model.ExpectedBehaviorDispositionMatched, Reason: model.ExpectedBehaviorReasonMatched, Boundary: &boundary,
+	}}
+	got, err := BuildTransitions(change)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Actor != model.ActorDeterministicController || got[0].Journal.AttributedActor != "Janis" || got[0].Journal.ExpectedBehaviorBoundary == nil {
+		t.Fatalf("schedule transition = %+v", got)
+	}
+}
+
 func TestExpectedJudgmentInvalidationRecordsConcreteReason(t *testing.T) {
 	until := hsNow(t).Add(2 * time.Hour)
 	prior := &model.ExpectedJudgmentProjection{Revision: 1, AssertedOperator: "Janis", ValidUntil: until}

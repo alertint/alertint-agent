@@ -50,10 +50,9 @@ import (
 // a situation.NotificationDeliverer, and *store.Store satisfies both this
 // file's reader contract and the worker's whole durable contract.
 var (
-	_ situation.NotificationDeliverer           = (*SituationDeliverer)(nil)
-	_ situation.ExpectedBehaviorReviewDeliverer = (*SituationDeliverer)(nil)
-	_ DelivererStore                            = (*store.Store)(nil)
-	_ situation.NotificationStore               = (*store.Store)(nil)
+	_ situation.NotificationDeliverer = (*SituationDeliverer)(nil)
+	_ DelivererStore                  = (*store.Store)(nil)
+	_ situation.NotificationStore     = (*store.Store)(nil)
 )
 
 // DelivererStore is exactly what SituationDeliverer reads. The first three
@@ -145,23 +144,6 @@ func (d *SituationDeliverer) Deliver(ctx context.Context, intent model.Notificat
 		return situation.NotificationDelivery{}, classifyDeliveryError(err)
 	}
 	return delivery, nil
-}
-
-// DeliverExpectedBehaviorReview posts one standalone review card. The
-// durable review ledger owns retries and advances its clock only after this
-// call is acknowledged.
-func (d *SituationDeliverer) DeliverExpectedBehaviorReview(ctx context.Context, intent situation.ExpectedBehaviorReviewIntent) (situation.NotificationDelivery, error) {
-	rendered, err := slack.RenderExpectedBehaviorReview(intent)
-	if err != nil {
-		return situation.NotificationDelivery{}, invalidDelivery("render_failed", err)
-	}
-	res, err := d.api.PostMessage(ctx, slack.PostMessageRequest{
-		Channel: d.channel, Text: rendered.Text, Blocks: rendered.Blocks, ClientMsgID: intent.ID,
-	})
-	if err != nil {
-		return situation.NotificationDelivery{}, classifyDeliveryError(err)
-	}
-	return situation.NotificationDelivery{Channel: res.Channel, MessageTS: res.TS, DeliveredAs: "root"}, nil
 }
 
 // deliver is Deliver's undecorated body: it renders and sends, and returns
@@ -1068,11 +1050,10 @@ func buildSituationSlackWorker(cfg *config.Config, st *store.Store, owner string
 			// (plan.md: "Plan 3 adds no duplicate notification knobs"); Poll,
 			// Batch, the retry schedule, and the five-minute gap threshold are
 			// the protocol's own constants, not operator knobs.
-			Owner:                              owner + ":notifications",
-			Lease:                              time.Duration(cfg.Situations.LeaseSeconds) * time.Second,
-			Heartbeat:                          time.Duration(cfg.Situations.HeartbeatSeconds) * time.Second,
-			Poll:                               time.Duration(cfg.Situations.ReconcilePollSeconds) * time.Second,
-			ExpectedBehaviorReviewIntervalDays: cfg.Situations.ExpectedBehavior.ReviewReminderIntervalDays,
+			Owner:     owner + ":notifications",
+			Lease:     time.Duration(cfg.Situations.LeaseSeconds) * time.Second,
+			Heartbeat: time.Duration(cfg.Situations.HeartbeatSeconds) * time.Second,
+			Poll:      time.Duration(cfg.Situations.ReconcilePollSeconds) * time.Second,
 		},
 		func() time.Time { return time.Now().UTC() }, logger)
 	worker.SetAuditSink(auditSink)

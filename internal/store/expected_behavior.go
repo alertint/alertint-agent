@@ -62,6 +62,26 @@ type ExpectedBehaviorListFilter struct {
 	IncludeInactive  bool
 }
 
+type ExpectedBehaviorReviewOverview struct {
+	Status string     `json:"status"`
+	DueAt  *time.Time `json:"due_at,omitempty"`
+}
+
+type ExpectedBehaviorUsageOverview struct {
+	MatchCount    int        `json:"match_count"`
+	LastMatchedAt *time.Time `json:"last_matched_at,omitempty"`
+}
+
+// ExpectedBehaviorOverview keeps the low-attention Slack view small while
+// making schedule authority, review state, and usage inspectable through MCP.
+type ExpectedBehaviorOverview struct {
+	model.ExpectedBehaviorHead
+
+	AuthorityState string                         `json:"authority_state"`
+	Review         ExpectedBehaviorReviewOverview `json:"review"`
+	Usage          ExpectedBehaviorUsageOverview  `json:"usage"`
+}
+
 // WriteExpectedBehavior appends one immutable revision, advances its head,
 // appends audit, and wakes exactly affected open Situations in one transaction.
 //
@@ -173,9 +193,6 @@ func (s *Store) WriteExpectedBehavior(ctx context.Context, auditor JudgmentAudit
 		headScope = priorHead.Scope
 	}
 	if hasHead {
-		if err := supersedeExpectedBehaviorReviewsTx(ctx, tx, envelopeID); err != nil {
-			return ExpectedBehaviorWriteResult{}, fmt.Errorf("store: supersede expected behavior reviews: %w", err)
-		}
 		res, err := tx.ExecContext(ctx, `
 			UPDATE expected_behavior_envelope_heads SET revision_id=?,version=?,state=?,group_key=?,source=?,source_instance_id=?,
 				host=?,primary_trigger_id=?,primary_trigger_version=?,invalidated_at=NULL,invalidation_reason=NULL,updated_at=?
@@ -484,6 +501,42 @@ func (s *Store) GetExpectedBehavior(ctx context.Context, envelopeID string) (mod
 	return head, tx.Commit()
 }
 
+func (s *Store) GetExpectedBehaviorOverview(ctx context.Context, envelopeID string, now time.Time) (ExpectedBehaviorOverview, error) {
+	head, err := s.GetExpectedBehavior(ctx, envelopeID)
+	if err != nil {
+		return ExpectedBehaviorOverview{}, err
+	}
+	overview := ExpectedBehaviorOverview{ExpectedBehaviorHead: head, AuthorityState: string(head.State)}
+	switch {
+	case head.InvalidatedAt != nil:
+		overview.AuthorityState, overview.Review.Status = "invalidated", "invalidated"
+	case head.State == model.ExpectedBehaviorStateRevoked:
+		overview.Review.Status = "inactive"
+	case head.Policy != nil:
+		due := head.Policy.ReviewDueAt.UTC()
+		overview.Review.DueAt = &due
+		if !now.UTC().Before(due) {
+			overview.Review.Status = "due"
+		} else {
+			overview.Review.Status = "current"
+		}
+	}
+	var lastMatched sql.NullString
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT situation_id),MAX(evaluated_at)
+		FROM expected_behavior_evaluations WHERE chosen_envelope_id=? AND chosen_version=? AND disposition='matched'`,
+		envelopeID, head.Version).Scan(&overview.Usage.MatchCount, &lastMatched); err != nil {
+		return ExpectedBehaviorOverview{}, fmt.Errorf("store: read expected behavior usage: %w", err)
+	}
+	if lastMatched.Valid {
+		parsed, err := time.Parse(time.RFC3339Nano, lastMatched.String)
+		if err != nil {
+			return ExpectedBehaviorOverview{}, err
+		}
+		overview.Usage.LastMatchedAt = &parsed
+	}
+	return overview, nil
+}
+
 func (s *Store) ListExpectedBehaviorHistory(ctx context.Context, envelopeID string, afterVersion, limit int) ([]model.ExpectedBehaviorRevision, error) {
 	if limit < 1 || limit > 101 {
 		limit = 100
@@ -503,6 +556,33 @@ func (s *Store) ListExpectedBehaviorHistory(ctx context.Context, envelopeID stri
 			return nil, err
 		}
 		out = append(out, p.revision)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListExpectedBehaviorSystemEvents(ctx context.Context, envelopeID string) ([]model.ExpectedBehaviorSystemEvent, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,envelope_id,envelope_version,kind,reason,evidence_json,created_at
+		FROM expected_behavior_system_events WHERE envelope_id=? ORDER BY created_at,id`, envelopeID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := []model.ExpectedBehaviorSystemEvent{}
+	for rows.Next() {
+		var event model.ExpectedBehaviorSystemEvent
+		var reason, evidenceJSON, createdAt string
+		if err := rows.Scan(&event.ID, &event.EnvelopeID, &event.EnvelopeVersion, &event.Kind, &reason, &evidenceJSON, &createdAt); err != nil {
+			return nil, err
+		}
+		event.Reason = model.ExpectedBehaviorInvalidationReason(reason)
+		if err := json.Unmarshal([]byte(evidenceJSON), &event.Evidence); err != nil {
+			return nil, err
+		}
+		event.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, event)
 	}
 	return out, rows.Err()
 }

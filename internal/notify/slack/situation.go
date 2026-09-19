@@ -474,14 +474,22 @@ func renderExpectedBehaviorJournal(t model.Transition) RenderedMessage {
 	actor := briefingText(t.Journal.AttributedActor, 120)
 	var text string
 	switch t.Journal.ExpectedBehaviorChange {
-	case model.ExpectedBehaviorChangeApplied:
-		text = actor + " confirmed an expected schedule. Monitoring continues."
-	case model.ExpectedBehaviorChangeUpdated:
-		text = actor + " updated the expected schedule. Monitoring continues."
-	case model.ExpectedBehaviorChangeRestored:
-		text = actor + " restored the expected schedule. Monitoring continues."
+	case model.ExpectedBehaviorChangeApplied, model.ExpectedBehaviorChangeUpdated, model.ExpectedBehaviorChangeRestored:
+		owner := "an operator's"
+		if actor != "" {
+			owner = actor + "'s"
+		}
+		text = "This condition matches " + owner + " expected schedule"
+		if t.Journal.ExpectedBehaviorBoundary != nil {
+			text += " until " + SlackDateToken(*t.Journal.ExpectedBehaviorBoundary, "{time}")
+		}
+		text += ". Monitoring continues."
 	case model.ExpectedBehaviorChangeWithdrawn:
-		text = actor + " withdrew the expected schedule. Normal assessment resumes."
+		if actor == "" {
+			text = "The expected schedule was removed. Normal assessment resumes."
+		} else {
+			text = actor + " removed the expected schedule. Normal assessment resumes."
+		}
 	case model.ExpectedBehaviorChangeStopped:
 		reason := strings.TrimSpace(t.Journal.Detail)
 		if reason == "" {
@@ -490,9 +498,6 @@ func renderExpectedBehaviorJournal(t model.Transition) RenderedMessage {
 		text = "The expected schedule no longer applies because " + strings.ToLower(strings.TrimSuffix(reason, ".")) + ". Normal assessment resumes."
 	default:
 		text = "The expected schedule changed."
-	}
-	if actor == "" && (t.Journal.ExpectedBehaviorChange == model.ExpectedBehaviorChangeApplied || t.Journal.ExpectedBehaviorChange == model.ExpectedBehaviorChangeUpdated || t.Journal.ExpectedBehaviorChange == model.ExpectedBehaviorChangeRestored) {
-		text = "The expected schedule applies. Monitoring continues."
 	}
 	if t.Journal.NoLongerCurrent {
 		text += " This schedule is no longer active."

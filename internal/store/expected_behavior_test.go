@@ -239,6 +239,39 @@ func TestInvalidateExpectedBehaviorIsAtomicMonotonicAndWakesScope(t *testing.T) 
 		t.Fatalf("repeat invalidation = changed %v, err %v", changed, err)
 	}
 	assertTableCount(t, st.DB(), "expected_behavior_system_events", 1)
+	events, err := st.ListExpectedBehaviorSystemEvents(context.Background(), created.Revision.EnvelopeID)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("system events = %+v, %v", events, err)
+	}
+	if events[0].EnvelopeVersion != 1 || events[0].Reason != situationmodel.ExpectedBehaviorPrimaryDefinitionChanged || events[0].Evidence["observed_version"] != "sha256:v2" {
+		t.Fatalf("invalidation event = %+v", events[0])
+	}
+}
+
+func TestExpectedBehaviorOverviewCountsDistinctSituations(t *testing.T) {
+	st := newTestStore(t)
+	f := newExpectedBehaviorFixture(t, st)
+	created, err := st.WriteExpectedBehavior(context.Background(), audit.New(st.DB()), f.confirmRequest(t, st, "overview-count-confirm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		_, err = st.DB().ExecContext(context.Background(), `INSERT INTO expected_behavior_evaluations
+			(id,situation_id,situation_input_version,disposition,reason,chosen_envelope_id,chosen_version,evaluation_json,basis_hash,evaluated_at)
+			VALUES (?,?,?,?,?,?,?,?,?,?)`,
+			"usage-evaluation-"+string(rune('a'+i)), f.situationID, i+1, "matched", "matched", created.Revision.EnvelopeID, 1,
+			`{"disposition":"matched","candidates":[]}`, "usage-basis-"+string(rune('a'+i)), canonicalTime(f.now.Add(time.Duration(i)*time.Minute)))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	overview, err := st.GetExpectedBehaviorOverview(context.Background(), created.Revision.EnvelopeID, f.policy.ReviewDueAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overview.Usage.MatchCount != 1 || overview.Review.Status != "due" {
+		t.Fatalf("overview = %+v", overview)
+	}
 }
 
 func TestCommitExpectedBehaviorEvaluationFencesEnvelopeAndSituationVersions(t *testing.T) {

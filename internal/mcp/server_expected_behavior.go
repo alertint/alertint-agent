@@ -60,14 +60,14 @@ func (s *Server) toolExpectedBehaviorRestore() (mcplib.Tool, mcpserver.ToolHandl
 }
 
 func (s *Server) toolGetExpectedBehavior() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	return mcplib.NewTool("alertint_get_expected_behavior", mcplib.WithDescription("Get one reusable expected schedule's current head."), mcplib.WithString("envelope_id", mcplib.Required())), s.handleGetExpectedBehavior
+	return mcplib.NewTool("alertint_get_expected_behavior", mcplib.WithDescription("Get one reusable expected schedule's current authority, review status, and usage."), mcplib.WithString("envelope_id", mcplib.Required())), s.handleGetExpectedBehavior
 }
 func (s *Server) toolListExpectedBehaviors() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	return mcplib.NewTool("alertint_list_expected_behaviors", mcplib.WithDescription("List reusable expected schedule heads."),
-		mcplib.WithString("group_key"), mcplib.WithString("source_instance_id"), mcplib.WithString("trigger_id"), mcplib.WithBoolean("include_inactive"), mcplib.WithInteger("limit")), s.handleListExpectedBehaviors
+	return mcplib.NewTool("alertint_list_expected_behaviors", mcplib.WithDescription("List reusable expected schedules with current authority, review status, and usage."),
+		mcplib.WithString("group_key"), mcplib.WithString("source_instance_id"), mcplib.WithString("trigger_id"), mcplib.WithString("review_status"), mcplib.WithBoolean("include_inactive"), mcplib.WithInteger("limit")), s.handleListExpectedBehaviors
 }
 func (s *Server) toolListExpectedBehaviorHistory() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	return mcplib.NewTool("alertint_list_expected_behavior_history", mcplib.WithDescription("List one reusable expected schedule's immutable operator revisions oldest first."),
+	return mcplib.NewTool("alertint_list_expected_behavior_history", mcplib.WithDescription("List one reusable expected schedule's immutable operator revisions and source invalidation events."),
 		mcplib.WithString("envelope_id", mcplib.Required()), mcplib.WithInteger("cursor_version"), mcplib.WithInteger("limit")), s.handleListExpectedBehaviorHistory
 }
 
@@ -151,23 +151,42 @@ func expectedBehaviorWriteError(err error) string {
 }
 
 func (s *Server) handleGetExpectedBehavior(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
-	head, err := s.st.GetExpectedBehavior(ctx, strings.TrimSpace(mcplib.ParseString(req, "envelope_id", "")))
+	overview, err := s.st.GetExpectedBehaviorOverview(ctx, strings.TrimSpace(mcplib.ParseString(req, "envelope_id", "")), s.now().UTC())
 	if err != nil {
 		return errResult("expected schedule not found"), nil
 	}
-	return mcplib.NewToolResultJSON(head)
+	return mcplib.NewToolResultJSON(overview)
 }
 
 func (s *Server) handleListExpectedBehaviors(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 	limit := mcplib.ParseInt(req, "limit", 50)
+	if limit < 1 || limit > 100 {
+		limit = 50
+	}
+	reviewStatus := strings.TrimSpace(mcplib.ParseString(req, "review_status", ""))
+	includeInactive := mcplib.ParseBoolean(req, "include_inactive", false) || reviewStatus == "inactive" || reviewStatus == "invalidated"
 	heads, err := s.st.ListExpectedBehaviors(ctx, store.ExpectedBehaviorListFilter{
 		GroupKey: mcplib.ParseString(req, "group_key", ""), SourceInstanceID: mcplib.ParseString(req, "source_instance_id", ""),
-		TriggerID: mcplib.ParseString(req, "trigger_id", ""), IncludeInactive: mcplib.ParseBoolean(req, "include_inactive", false),
-	}, limit)
+		TriggerID: mcplib.ParseString(req, "trigger_id", ""), IncludeInactive: includeInactive,
+	}, 100)
 	if err != nil {
 		return errResult("failed to list expected schedules"), nil
 	}
-	return mcplib.NewToolResultJSON(map[string]any{"expected_behaviors": heads})
+	overviews := make([]store.ExpectedBehaviorOverview, 0, min(limit, len(heads)))
+	for _, head := range heads {
+		overview, err := s.st.GetExpectedBehaviorOverview(ctx, head.EnvelopeID, s.now().UTC())
+		if err != nil {
+			return errResult("failed to list expected schedules"), nil
+		}
+		if reviewStatus != "" && overview.Review.Status != reviewStatus {
+			continue
+		}
+		overviews = append(overviews, overview)
+		if len(overviews) == limit {
+			break
+		}
+	}
+	return mcplib.NewToolResultJSON(map[string]any{"expected_behaviors": overviews})
 }
 
 func (s *Server) handleListExpectedBehaviorHistory(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
@@ -185,7 +204,11 @@ func (s *Server) handleListExpectedBehaviorHistory(ctx context.Context, req mcpl
 		revisions = revisions[:limit]
 		next = map[string]int{"version": revisions[len(revisions)-1].Version}
 	}
-	return mcplib.NewToolResultJSON(map[string]any{"envelope_id": id, "revisions": revisions, "next_cursor": next})
+	events, err := s.st.ListExpectedBehaviorSystemEvents(ctx, id)
+	if err != nil {
+		return errResult("failed to list expected schedule history"), nil
+	}
+	return mcplib.NewToolResultJSON(map[string]any{"envelope_id": id, "revisions": revisions, "system_events": events, "next_cursor": next})
 }
 
 type expectedBehaviorConditionsMCP struct {

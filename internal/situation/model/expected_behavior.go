@@ -121,6 +121,18 @@ type ExpectedBehaviorHead struct {
 	UpdatedAt          time.Time                          `json:"updated_at"`
 }
 
+// ExpectedBehaviorSystemEvent records a source-proven authority change that
+// was not authored by an operator revision.
+type ExpectedBehaviorSystemEvent struct {
+	ID              string                             `json:"id"`
+	EnvelopeID      string                             `json:"envelope_id"`
+	EnvelopeVersion int                                `json:"envelope_version"`
+	Kind            string                             `json:"kind"`
+	Reason          ExpectedBehaviorInvalidationReason `json:"reason"`
+	Evidence        map[string]any                     `json:"evidence"`
+	CreatedAt       time.Time                          `json:"created_at"`
+}
+
 // ExpectedBehaviorOccurrence freezes one resolved wall-clock occurrence.
 type ExpectedBehaviorOccurrence struct {
 	OwningLocalDate  string    `json:"owning_local_date"`

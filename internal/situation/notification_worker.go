@@ -347,9 +347,6 @@ type NotificationWorkerConfig struct {
 	GapThreshold time.Duration
 	// Rand is the [0,1) source the retry jitter reads. Default rand.Float64.
 	Rand func() float64
-	// ExpectedBehaviorReviewIntervalDays enables durable standalone review
-	// reminders. Zero leaves the optional path disabled.
-	ExpectedBehaviorReviewIntervalDays int
 }
 
 func (c NotificationWorkerConfig) withDefaults() NotificationWorkerConfig {
@@ -565,58 +562,7 @@ func (w *NotificationWorker) RunOnce(ctx context.Context) (int, error) {
 		w.processOne(ctx, claim)
 		handled++
 	}
-	if err := w.runExpectedBehaviorReviews(ctx, now, &handled); err != nil {
-		return handled, err
-	}
 	return handled, nil
-}
-
-func (w *NotificationWorker) runExpectedBehaviorReviews(ctx context.Context, now time.Time, handled *int) error {
-	if w.cfg.ExpectedBehaviorReviewIntervalDays == 0 {
-		return nil
-	}
-	st, storeOK := w.store.(ExpectedBehaviorReviewStore)
-	deliverer, delivererOK := w.deliverer.(ExpectedBehaviorReviewDeliverer)
-	if !storeOK || !delivererOK {
-		return nil
-	}
-	if _, err := st.PlanExpectedBehaviorReviews(ctx, now, w.cfg.ExpectedBehaviorReviewIntervalDays); err != nil {
-		return fmt.Errorf("situation: plan expected behavior reviews: %w", err)
-	}
-	if _, err := st.RecoverExpiredExpectedBehaviorReviewClaims(ctx, now); err != nil {
-		return fmt.Errorf("situation: recover expected behavior review claims: %w", err)
-	}
-	remaining := w.cfg.Batch - *handled
-	if remaining <= 0 {
-		return nil
-	}
-	claims, err := st.ClaimExpectedBehaviorReviews(ctx, w.cfg.Owner, now, w.cfg.Lease, remaining)
-	if err != nil {
-		return fmt.Errorf("situation: claim expected behavior reviews: %w", err)
-	}
-	for _, claim := range claims {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		delivery, deliverErr := deliverer.DeliverExpectedBehaviorReview(ctx, claim.Intent)
-		writeCtx, cancel := detachedWriteContext()
-		if deliverErr == nil {
-			err = st.MarkExpectedBehaviorReviewDelivered(writeCtx, claim, delivery, w.now().UTC()) //nolint:contextcheck // acknowledgement must survive a canceled delivery context.
-			if err == nil {
-				_ = w.store.ObserveSlackSuccess(writeCtx, w.now().UTC()) //nolint:contextcheck // same detached acknowledgement transaction.
-			}
-		} else {
-			_, code, retryAfter := classifyDeliveryFailure(deliverErr)
-			delay := notificationRetryDelay(claim.Intent.AttemptCount, retryAfter, w.cfg.RetryInitial, w.cfg.RetryMax, w.cfg.JitterFraction, w.cfg.Rand())
-			err = st.RetryExpectedBehaviorReview(writeCtx, claim, code, w.now().UTC().Add(delay)) //nolint:contextcheck // retry state must survive cancellation.
-		}
-		cancel()
-		if err != nil && !errors.Is(err, ErrNotificationClaimLost) {
-			return fmt.Errorf("situation: acknowledge expected behavior review: %w", err)
-		}
-		(*handled)++
-	}
-	return nil
 }
 
 // advanceGapState drives the gap lifecycle for one round: probe while a
