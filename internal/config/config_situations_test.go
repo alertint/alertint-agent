@@ -49,7 +49,7 @@ func TestSituationsDefaults(t *testing.T) {
 		{"retry.max_seconds", s.Retry.MaxSeconds, 300},
 		{"retry.jitter_percent", s.Retry.JitterPercent, 20},
 		{"slack.repage_cooldown_seconds", s.Slack.RepageCooldownSeconds, 900},
-		{"preparation.max_source_calls_per_cycle", s.Preparation.MaxSourceCallsPerCycle, 6},
+		{"preparation.max_source_calls_per_cycle", s.Preparation.MaxSourceCallsPerCycle, 8},
 		{"preparation.max_wall_seconds", s.Preparation.MaxWallSeconds, 20},
 		{"preparation.refresh_seconds", s.Preparation.RefreshSeconds, 300},
 		{"semantic_profiles.workers", s.SemanticProfiles.Workers, 1},

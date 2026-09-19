@@ -101,7 +101,7 @@ logs:
 # Optional — the values below are the shipped defaults.
 situations:
   preparation:
-    max_source_calls_per_cycle: 6
+    max_source_calls_per_cycle: 8
     max_wall_seconds: 20
     refresh_seconds: 300
   semantic_profiles:

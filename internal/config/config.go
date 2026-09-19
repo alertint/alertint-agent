@@ -714,7 +714,7 @@ func Defaults() Config {
 				RepageCooldownSeconds: 900,
 			},
 			Preparation: SituationPreparationConfig{
-				MaxSourceCallsPerCycle: 6,
+				MaxSourceCallsPerCycle: 8,
 				MaxWallSeconds:         20,
 				RefreshSeconds:         300,
 			},

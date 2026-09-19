@@ -196,6 +196,13 @@ func BuildPlans(in PlannerInput) ([]model.Plan, Allocation, error) {
 			case c.TimeSensitive:
 				c.Tier = model.TierTimeSensitive
 				timeSensitive = append(timeSensitive, c)
+			case phase == model.PhaseLifecycle:
+				// Profiles advise investigation only. They cannot demote a
+				// source-lifecycle read into the optional pool, where a large
+				// bounded read could repeatedly lose its refresh turn to
+				// smaller assessment plans.
+				c.Tier = model.TierRoutine
+				routine = append(routine, c)
 			case suggested[capability] && !in.RecoveryPending:
 				c.Optional = true
 				c.Tier = model.TierOptional

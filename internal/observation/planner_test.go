@@ -261,6 +261,47 @@ func TestBuildPlansProfileSuggestedCapabilityBecomesOptional(t *testing.T) {
 	}
 }
 
+func TestBuildPlansProfileCannotReclassifyLifecycleReadAsOptional(t *testing.T) {
+	anchor := time.Date(2026, 9, 19, 13, 0, 0, 0, time.UTC)
+	instanceID := "lab-zbx"
+	in := PlannerInput{
+		Anchor: anchor, GroupKey: "host=db-01", RefreshInterval: time.Minute,
+		Members: []MemberSubject{{
+			SubjectID: "zabbix:lab-zbx:event-1", Source: "zabbix", SourceInstanceID: &instanceID,
+			Labels: map[string]string{"host": "db-01", "zabbix_trigger_id": "1001", "item_key": "system.cpu.load"},
+		}},
+		Configured: []CapabilityDescriptor{
+			{Capability: model.CapabilityZabbixMetricRange, DefaultWindow: time.Hour, DefaultLimit: 100, MaxRequestsHint: 2},
+			{Capability: model.CapabilityZabbixProblemHist, DefaultWindow: 24 * time.Hour, DefaultLimit: 20, MaxRequestsHint: 6},
+		},
+		ProfileGuidance: []model.ProfileGuidance{{UsefulCapabilities: []model.Capability{
+			model.CapabilityZabbixMetricRange, model.CapabilityZabbixProblemHist,
+		}}},
+		CycleCap: 8, InvestigationCredit: 100,
+	}
+
+	plans, alloc, err := BuildPlans(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plans) != 2 {
+		t.Fatalf("plans = %+v, want the optional metric read and routine lifecycle read", plans)
+	}
+	byCapability := make(map[model.Capability]model.Plan, len(plans))
+	for _, plan := range plans {
+		byCapability[plan.Capability] = plan
+	}
+	if got := byCapability[model.CapabilityZabbixMetricRange].Tier; got != model.TierOptional {
+		t.Fatalf("zabbix metric tier = %q, want optional", got)
+	}
+	if got := byCapability[model.CapabilityZabbixProblemHist].Tier; got != model.TierRoutine {
+		t.Fatalf("zabbix problem-history tier = %q, want routine lifecycle", got)
+	}
+	if alloc.OptionalRequests != 2 || alloc.RoutineLifecycleRequests != 6 {
+		t.Fatalf("allocation = %+v, want 2 optional and 6 routine lifecycle requests", alloc.PhaseAllocation)
+	}
+}
+
 func TestBuildPlansRejectsEmptyMembers(t *testing.T) {
 	anchor := time.Date(2026, 9, 6, 17, 0, 0, 0, time.UTC)
 	in := basicInput(anchor)

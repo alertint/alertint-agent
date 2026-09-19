@@ -251,7 +251,7 @@ sentry:
 # configuration.md#situations.
 situations:
   preparation:
-    max_source_calls_per_cycle: 6   # physical connector requests per preparation cycle (1-32)
+    max_source_calls_per_cycle: 8   # physical connector requests per preparation cycle (1-32)
     max_wall_seconds: 20            # wall-clock budget for one preparation attempt (1-30; must be < situations.attempt_wall_seconds)
     refresh_seconds: 300            # minimum re-check cadence per subject/capability (60-3600)
   semantic_profiles:
