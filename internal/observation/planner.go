@@ -409,6 +409,10 @@ func capabilityParameters(in PlannerInput, capability model.Capability, member M
 			SourceInstanceID string `json:"source_instance_id,omitempty"`
 			FreshForSeconds  int    `json:"fresh_for_seconds,omitempty"`
 		}{Host: host, TriggerID: triggerID, SourceInstanceID: dereferenceString(member.SourceInstanceID), FreshForSeconds: int(in.RefreshInterval.Seconds())})
+	case model.CapabilityZabbixProblemState:
+		// Reusable-schedule validation constructs this exact-rule plan from
+		// typed operator bindings after the general planner has run.
+		return nil, nil
 	case model.CapabilitySentryIssues:
 		project, env := sentryProjectEnv(labels)
 		if project == "" {
@@ -465,6 +469,8 @@ func windowCapFor(capability model.Capability) (time.Duration, bool) {
 	case model.CapabilityZabbixProblemHist, model.CapabilityChangeEvents, model.CapabilitySentryIssues:
 		return model.MaxWindowDaysHistory * 24 * time.Hour, true
 	case model.CapabilityStoreRead:
+		return 0, false
+	case model.CapabilityZabbixProblemState:
 		return 0, false
 	default:
 		return 0, false

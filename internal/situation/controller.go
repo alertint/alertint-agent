@@ -234,6 +234,7 @@ type ControllerCommit struct {
 	JudgmentApplicable          bool
 	JudgmentApplicabilityReason model.JudgmentApplicabilityReason
 	JudgmentCheckedAt           time.Time
+	ExpectedBehaviorEvaluation  *model.ExpectedBehaviorEvaluation
 }
 
 // ParkedState is CommitController's explicit instruction for the
@@ -1647,6 +1648,12 @@ func (c *Controller) commit(ctx context.Context, claim Claim, basis historyBasis
 	startedAt := time.Now()
 	checkedAt := c.clock().UTC()
 	applyExpectedJudgment(&commit, basis.In, checkedAt)
+	if basis.In.ExpectedBehavior != nil {
+		evaluation := *basis.In.ExpectedBehavior
+		RefreshExpectedBehaviorEvaluationForCommit(&evaluation, commit.Attention == model.AttentionUrgent || commit.Assessment.Attention == model.AttentionUrgent, checkedAt)
+		commit.ExpectedBehaviorEvaluation = &evaluation
+		ApplyExpectedBehaviorAuthority(&commit, &evaluation)
+	}
 	c.finalizeCheckpoint(&commit, checkedAt)
 	history, err := c.buildHistory(claim, basis, commit)
 	if err != nil {
@@ -1797,6 +1804,7 @@ func authoritativeChangeOf(claim Claim, basis historyBasis, commit ControllerCom
 		Now:                         basis.Now,
 		Judgment:                    basis.In.Judgment,
 		JudgmentApplicabilityReason: commit.JudgmentApplicabilityReason,
+		ExpectedBehaviorEvaluation:  commit.ExpectedBehaviorEvaluation,
 	}
 	switch {
 	case commit.Attempt.ID != "":

@@ -104,11 +104,11 @@ func (s *Store) WriteExpectedBehavior(ctx context.Context, auditor JudgmentAudit
 	hasHead := false
 	if envelopeID != "" {
 		priorHead, err = readExpectedBehaviorHeadTx(ctx, tx, envelopeID)
-		if errors.Is(err, ErrNotFound) {
-			err = nil
-		} else if err != nil {
+		switch {
+		case errors.Is(err, ErrNotFound):
+		case err != nil:
 			return ExpectedBehaviorWriteResult{}, err
-		} else {
+		default:
 			hasHead = true
 		}
 	}
@@ -173,6 +173,9 @@ func (s *Store) WriteExpectedBehavior(ctx context.Context, auditor JudgmentAudit
 		headScope = priorHead.Scope
 	}
 	if hasHead {
+		if err := supersedeExpectedBehaviorReviewsTx(ctx, tx, envelopeID); err != nil {
+			return ExpectedBehaviorWriteResult{}, fmt.Errorf("store: supersede expected behavior reviews: %w", err)
+		}
 		res, err := tx.ExecContext(ctx, `
 			UPDATE expected_behavior_envelope_heads SET revision_id=?,version=?,state=?,group_key=?,source=?,source_instance_id=?,
 				host=?,primary_trigger_id=?,primary_trigger_version=?,invalidated_at=NULL,invalidation_reason=NULL,updated_at=?
@@ -309,10 +312,39 @@ func verifyExpectedBehaviorSourceTx(ctx context.Context, tx *sql.Tx, req Expecte
 			*symptom.ObservedSourceConfigVersion == policy.Scope.PrimaryTriggerVersion &&
 			symptom.IdentityLabels["host"] == policy.Scope.Host &&
 			symptom.IdentityLabels["zabbix_trigger_id"] == policy.Scope.PrimaryTriggerID {
-			return nil
+			return verifyExpectedBehaviorValidationTx(ctx, tx, req)
 		}
 	}
 	return fmt.Errorf("%w: primary binding is not proven by the source judgment", ErrExpectedBehaviorNotAllowed)
+}
+
+func verifyExpectedBehaviorValidationTx(ctx context.Context, tx *sql.Tx, req ExpectedBehaviorWrite) error {
+	policy := req.Policy
+	bindings := append(append(append([]model.ExpectedBehaviorBinding{}, policy.Conditions.RequiredCompanions...), policy.Conditions.AllowedCompanions...), policy.Conditions.ForbiddenSignals...)
+	_, digest, err := canonicalExpectedBehaviorBindings(bindings)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrExpectedBehaviorNotAllowed, err)
+	}
+	if len(bindings) == 0 {
+		if req.ValidationID != "" {
+			return fmt.Errorf("%w: validation is unnecessary without additional bindings", ErrExpectedBehaviorNotAllowed)
+		}
+		return nil
+	}
+	if strings.TrimSpace(req.ValidationID) == "" {
+		return fmt.Errorf("%w: fresh binding validation is required", ErrExpectedBehaviorNotAllowed)
+	}
+	validation, err := scanExpectedBehaviorValidation(tx.QueryRowContext(ctx, expectedBehaviorValidationSelect+` WHERE v.id=?`, req.ValidationID))
+	if err != nil {
+		return fmt.Errorf("%w: binding validation not found", ErrExpectedBehaviorNotAllowed)
+	}
+	if validation.SituationID != req.SituationID || validation.SituationInputVersion != req.SituationInputVersion || validation.BindingDigest != digest || validation.Status != model.ExpectedBehaviorValidationReady || !req.Now.Before(validation.ExpiresAt) {
+		return fmt.Errorf("%w: binding validation is stale, unavailable, or for different bindings", ErrExpectedBehaviorNotAllowed)
+	}
+	if err := validateExpectedBehaviorObservations(validation.Bindings, validation.Observations, req.Now); err != nil {
+		return fmt.Errorf("%w: %v", ErrExpectedBehaviorNotAllowed, err)
+	}
+	return nil
 }
 
 func expectedBehaviorRequestHash(req ExpectedBehaviorWrite) (string, error) {
@@ -351,15 +383,19 @@ func wakeExpectedBehaviorGroupsTx(ctx context.Context, tx *sql.Tx, groups []stri
 		if err != nil {
 			return nil, fmt.Errorf("store: list expected behavior wake targets: %w", err)
 		}
+		defer func() { _ = rows.Close() }()
 		type target struct{ id, dueJSON string }
 		var targets []target
 		for rows.Next() {
 			var target target
 			if err := rows.Scan(&target.id, &target.dueJSON); err != nil {
-				_ = rows.Close()
 				return nil, err
 			}
 			targets = append(targets, target)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
 		}
 		if err := rows.Close(); err != nil {
 			return nil, err
@@ -370,7 +406,10 @@ func wakeExpectedBehaviorGroupsTx(ctx context.Context, tx *sql.Tx, groups []stri
 				return nil, fmt.Errorf("store: unmarshal expected behavior wake reasons: %w", err)
 			}
 			due = mergeDueReason(due, model.DueEnvelopeChanged)
-			encoded, _ := json.Marshal(due)
+			encoded, err := json.Marshal(due)
+			if err != nil {
+				return nil, fmt.Errorf("store: marshal expected behavior wake reasons: %w", err)
+			}
 			if _, err := tx.ExecContext(ctx, `UPDATE situations SET input_version=input_version+1,next_assessment_at=?,due_reasons_json=?,lease_owner=NULL,lease_expires_at=NULL,retry_at=NULL,updated_at=? WHERE id=? AND lifecycle IN ('active','recovery_pending')`,
 				canonicalTime(now), string(encoded), canonicalTime(now), target.id); err != nil {
 				return nil, fmt.Errorf("store: wake situation for expected behavior: %w", err)
@@ -470,6 +509,14 @@ func (s *Store) ListExpectedBehaviorHistory(ctx context.Context, envelopeID stri
 
 // ListExpectedBehaviors returns current heads in stable envelope order.
 func (s *Store) ListExpectedBehaviors(ctx context.Context, filter ExpectedBehaviorListFilter, limit int) ([]model.ExpectedBehaviorHead, error) {
+	return listExpectedBehaviorHeads(ctx, s.db, filter, limit)
+}
+
+func listExpectedBehaviorHeadsTx(ctx context.Context, tx *sql.Tx, filter ExpectedBehaviorListFilter, limit int) ([]model.ExpectedBehaviorHead, error) {
+	return listExpectedBehaviorHeads(ctx, tx, filter, limit)
+}
+
+func listExpectedBehaviorHeads(ctx context.Context, db dbQuerier, filter ExpectedBehaviorListFilter, limit int) ([]model.ExpectedBehaviorHead, error) {
 	if limit < 1 || limit > 101 {
 		limit = 100
 	}
@@ -498,7 +545,7 @@ func (s *Store) ListExpectedBehaviors(ctx context.Context, filter ExpectedBehavi
 	}
 	query += ` ORDER BY h.envelope_id LIMIT ?`
 	args = append(args, limit)
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("store: list expected behavior heads: %w", err)
 	}
@@ -603,10 +650,11 @@ func (s *Store) CommitExpectedBehaviorEvaluation(ctx context.Context, evaluation
 		if err != nil || head.Version != candidate.Version {
 			return model.ExpectedBehaviorEvaluation{}, ErrExpectedBehaviorStale
 		}
-	}
-	encoded, err := json.Marshal(evaluation)
-	if err != nil {
-		return model.ExpectedBehaviorEvaluation{}, err
+		inactiveExpected := candidate.Status == model.ExpectedBehaviorNotCandidate &&
+			(candidate.Reason == model.ExpectedBehaviorReasonRevoked || candidate.Reason == model.ExpectedBehaviorReasonInvalidated)
+		if inactiveExpected != (head.State == model.ExpectedBehaviorStateRevoked || head.InvalidatedAt != nil) {
+			return model.ExpectedBehaviorEvaluation{}, ErrExpectedBehaviorStale
+		}
 	}
 	var priorJSON string
 	var priorID string
@@ -626,7 +674,10 @@ func (s *Store) CommitExpectedBehaviorEvaluation(ctx context.Context, evaluation
 		return model.ExpectedBehaviorEvaluation{}, err
 	}
 	evaluation.ID = uuid.NewString()
-	encoded, _ = json.Marshal(evaluation)
+	encoded, err := json.Marshal(evaluation)
+	if err != nil {
+		return model.ExpectedBehaviorEvaluation{}, err
+	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO expected_behavior_evaluations (
 			id,situation_id,situation_input_version,disposition,reason,chosen_envelope_id,chosen_version,evaluation_json,basis_hash,evaluated_at
@@ -647,8 +698,54 @@ func (s *Store) CommitExpectedBehaviorEvaluation(ctx context.Context, evaluation
 	return evaluation, nil
 }
 
+func commitExpectedBehaviorEvaluationTx(ctx context.Context, tx *sql.Tx, situationID string, inputVersion int, evaluation *model.ExpectedBehaviorEvaluation) error {
+	if evaluation == nil {
+		return nil
+	}
+	if evaluation.SituationID != situationID || evaluation.SituationVersion != inputVersion || evaluation.BasisHash == "" || evaluation.EvaluatedAt.IsZero() {
+		return ErrExpectedBehaviorStale
+	}
+	for _, candidate := range evaluation.Candidates {
+		head, err := readExpectedBehaviorHeadTx(ctx, tx, candidate.EnvelopeID)
+		if err != nil || head.Version != candidate.Version {
+			return ErrExpectedBehaviorStale
+		}
+		inactiveExpected := candidate.Status == model.ExpectedBehaviorNotCandidate &&
+			(candidate.Reason == model.ExpectedBehaviorReasonRevoked || candidate.Reason == model.ExpectedBehaviorReasonInvalidated)
+		if inactiveExpected != (head.State == model.ExpectedBehaviorStateRevoked || head.InvalidatedAt != nil) {
+			return ErrExpectedBehaviorStale
+		}
+	}
+	var priorID string
+	err := tx.QueryRowContext(ctx, `SELECT id FROM expected_behavior_evaluations WHERE situation_id=? AND basis_hash=?`, situationID, evaluation.BasisHash).Scan(&priorID)
+	if err == nil {
+		_, err = tx.ExecContext(ctx, `INSERT INTO expected_behavior_evaluation_heads (situation_id,evaluation_id,updated_at) VALUES (?,?,?) ON CONFLICT(situation_id) DO UPDATE SET evaluation_id=excluded.evaluation_id,updated_at=excluded.updated_at`, situationID, priorID, canonicalTime(evaluation.EvaluatedAt))
+		return err
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	evaluation.ID = uuid.NewString()
+	raw, err := json.Marshal(evaluation)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO expected_behavior_evaluations (id,situation_id,situation_input_version,disposition,reason,chosen_envelope_id,chosen_version,evaluation_json,basis_hash,evaluated_at) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		evaluation.ID, situationID, inputVersion, evaluation.Disposition, nullIfEmpty(string(evaluation.Reason)), nullIfEmpty(evaluation.ChosenEnvelopeID), nullIfZero(evaluation.ChosenVersion), string(raw), evaluation.BasisHash, canonicalTime(evaluation.EvaluatedAt)); err != nil {
+		return fmt.Errorf("store: insert controller expected behavior evaluation: %w", err)
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO expected_behavior_evaluation_heads (situation_id,evaluation_id,updated_at) VALUES (?,?,?) ON CONFLICT(situation_id) DO UPDATE SET evaluation_id=excluded.evaluation_id,updated_at=excluded.updated_at`, situationID, evaluation.ID, canonicalTime(evaluation.EvaluatedAt))
+	return err
+}
+
 // GetCurrentExpectedBehaviorEvaluation returns one Situation's committed head.
 func (s *Store) GetCurrentExpectedBehaviorEvaluation(ctx context.Context, situationID string) (model.ExpectedBehaviorEvaluation, bool, error) {
+	return s.GetCurrentExpectedBehaviorEvaluationAt(ctx, situationID, time.Time{})
+}
+
+// GetCurrentExpectedBehaviorEvaluationAt rechecks the mutable head and
+// time/evidence boundaries before presenting current authority.
+func (s *Store) GetCurrentExpectedBehaviorEvaluationAt(ctx context.Context, situationID string, now time.Time) (model.ExpectedBehaviorEvaluation, bool, error) {
 	var id, raw string
 	err := s.db.QueryRowContext(ctx, `
 		SELECT e.id,e.evaluation_json FROM expected_behavior_evaluation_heads h
@@ -664,6 +761,46 @@ func (s *Store) GetCurrentExpectedBehaviorEvaluation(ctx context.Context, situat
 		return model.ExpectedBehaviorEvaluation{}, false, err
 	}
 	evaluation.ID = id
+	for _, candidate := range evaluation.Candidates {
+		head, err := s.GetExpectedBehavior(ctx, candidate.EnvelopeID)
+		if err != nil || head.Version != candidate.Version {
+			return model.ExpectedBehaviorEvaluation{}, false, nil
+		}
+		inactiveExpected := candidate.Status == model.ExpectedBehaviorNotCandidate &&
+			(candidate.Reason == model.ExpectedBehaviorReasonRevoked || candidate.Reason == model.ExpectedBehaviorReasonInvalidated)
+		if inactiveExpected != (head.State == model.ExpectedBehaviorStateRevoked || head.InvalidatedAt != nil) {
+			return model.ExpectedBehaviorEvaluation{}, false, nil
+		}
+	}
+	if !now.IsZero() && evaluation.Disposition == model.ExpectedBehaviorDispositionMatched { //nolint:nestif // current authority rechecks both time and every evidence reference.
+		if evaluation.Occurrence == nil || !now.Before(evaluation.Occurrence.Boundary) {
+			evaluation.Disposition = model.ExpectedBehaviorDispositionViolated
+			evaluation.Reason = model.ExpectedBehaviorReasonDurationExceeded
+			if evaluation.Occurrence != nil && evaluation.Occurrence.Boundary.Equal(evaluation.Occurrence.End) {
+				evaluation.Reason = model.ExpectedBehaviorReasonOutsideSchedule
+			}
+			evaluation.ChosenEnvelopeID, evaluation.ChosenVersion = "", 0
+		}
+		for _, candidate := range evaluation.Candidates {
+			if candidate.Status != model.ExpectedBehaviorMatched {
+				continue
+			}
+			for _, factID := range candidate.EvidenceRefs {
+				var expiresAt string
+				if err := s.db.QueryRowContext(ctx, `SELECT expires_at FROM situation_observation_facts WHERE id=?`, factID).Scan(&expiresAt); err != nil {
+					evaluation.Disposition, evaluation.Reason = model.ExpectedBehaviorDispositionAuthorityUnavailable, model.ExpectedBehaviorReasonObservationUnavailable
+					evaluation.ChosenEnvelopeID, evaluation.ChosenVersion = "", 0
+					break
+				}
+				expires, err := time.Parse(time.RFC3339Nano, expiresAt)
+				if err != nil || !now.Before(expires) {
+					evaluation.Disposition, evaluation.Reason = model.ExpectedBehaviorDispositionAuthorityUnavailable, model.ExpectedBehaviorReasonObservationUnavailable
+					evaluation.ChosenEnvelopeID, evaluation.ChosenVersion = "", 0
+					break
+				}
+			}
+		}
+	}
 	return evaluation, true, nil
 }
 

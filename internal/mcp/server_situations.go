@@ -360,6 +360,15 @@ func (s *Server) handleGetSituation(ctx context.Context, req mcplib.CallToolRequ
 		})
 	}
 	payload["source_provenance"] = sourceRows
+	evaluation, hasEvaluation, err := s.st.GetCurrentExpectedBehaviorEvaluationAt(ctx, sit.ID, currentReadAt)
+	if err != nil {
+		return errResult("failed to get current expected schedule state"), nil
+	}
+	if hasEvaluation {
+		payload["expected_behavior"] = evaluation
+	} else {
+		payload["expected_behavior"] = nil
+	}
 	// R2: recorded after closure, never journaled, never lost. An empty
 	// array, never null — "none" is an answer, not an absence.
 	payload["artifacts_recorded_after_closure"] = history.Artifacts

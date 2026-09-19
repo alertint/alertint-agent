@@ -487,7 +487,7 @@ func TestExecutorsFromClientsOmitsUnconfiguredCapabilitiesAndAlwaysIncludesLocal
 	if _, ok := execs[model.CapabilityChangeEvents]; !ok {
 		t.Fatal("change_events executor missing even though it needs no external client")
 	}
-	for _, c := range []model.Capability{model.CapabilityPrometheusQuery, model.CapabilityLokiQuery, model.CapabilitySentryIssues, model.CapabilityZabbixMetricRange, model.CapabilityZabbixProblemHist} {
+	for _, c := range []model.Capability{model.CapabilityPrometheusQuery, model.CapabilityLokiQuery, model.CapabilitySentryIssues, model.CapabilityZabbixMetricRange, model.CapabilityZabbixProblemHist, model.CapabilityZabbixProblemState} {
 		if _, ok := execs[c]; ok {
 			t.Fatalf("executor registered for %s with a nil client, want it omitted", c)
 		}

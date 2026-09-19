@@ -38,6 +38,96 @@ type ZabbixSourceDefinitionClient interface {
 		before func() error, after func(started bool, err error)) (zabbix.SourceRuleDefinition, error)
 }
 
+// ZabbixProblemStateClient is the bounded current-state boundary.
+type ZabbixProblemStateClient interface {
+	ProblemStateBounded(ctx context.Context, host, triggerID string,
+		before func() error, after func(started bool, err error)) (zabbix.ProblemState, error)
+}
+
+type zabbixProblemStateParameters struct {
+	Host             string `json:"host"`
+	TriggerID        string `json:"trigger_id"`
+	TriggerVersion   string `json:"trigger_version"`
+	SourceInstanceID string `json:"source_instance_id,omitempty"`
+	FreshForSeconds  int    `json:"fresh_for_seconds,omitempty"`
+}
+
+// ZabbixProblemStateExecutor normalizes one exact current problem state.
+type ZabbixProblemStateExecutor struct {
+	Client           ZabbixProblemStateClient
+	SourceDefinition ZabbixSourceDefinitionClient
+	Clock            func() time.Time
+}
+
+func (e *ZabbixProblemStateExecutor) clock() time.Time {
+	if e.Clock != nil {
+		return e.Clock()
+	}
+	return time.Now().UTC()
+}
+
+func (e *ZabbixProblemStateExecutor) Execute(ctx context.Context, plan model.Plan, recorder observation.RequestRecorder) (model.Run, error) {
+	now := e.clock()
+	var params zabbixProblemStateParameters
+	if err := json.Unmarshal(plan.Parameters, &params); err != nil || params.Host == "" || params.TriggerID == "" || params.TriggerVersion == "" {
+		return unresolvedRun(plan, now), nil
+	}
+	before, after, budgetExhausted := requestHooks(ctx, recorder, e.clock)
+	if e.SourceDefinition == nil || params.SourceInstanceID == "" {
+		return unresolvedRun(plan, now), nil
+	}
+	definition, definitionErr := e.SourceDefinition.SourceRuleVersionBounded(ctx, params.SourceInstanceID, params.Host, params.TriggerID, before, after)
+	if definitionErr != nil {
+		if *budgetExhausted {
+			return withheldRun(plan, now), nil
+		}
+		return zabbixProblemStateUnavailableRun(plan, now, "source_definition_unavailable"), nil
+	}
+	state, err := e.Client.ProblemStateBounded(ctx, params.Host, params.TriggerID, before, after)
+	if err != nil {
+		if *budgetExhausted {
+			return withheldRun(plan, now), nil
+		}
+		if errors.Is(err, zabbix.ErrNotFound) {
+			return unresolvedRun(plan, now), nil
+		}
+		if isResponseTooLarge(err) {
+			return responseTooLargeRun(plan, now, now.Add(5*time.Minute)), nil
+		}
+		return model.Run{}, fmt.Errorf("connectors: zabbix problem state: %w", err)
+	}
+	presence := model.ProblemPresenceAbsent
+	if state.Presence == zabbix.ProblemPresent {
+		presence = model.ProblemPresencePresent
+	}
+	value, err := json.Marshal(model.ZabbixProblemStateObservation{
+		SourceInstanceID: params.SourceInstanceID, Host: params.Host, TriggerID: params.TriggerID,
+		TriggerVersion: definition.Version, Presence: presence, EventIDs: state.EventIDs,
+	})
+	if err != nil {
+		return model.Run{}, err
+	}
+	freshFor := time.Duration(params.FreshForSeconds) * time.Second
+	if freshFor <= 0 {
+		freshFor = 5 * time.Minute
+	}
+	returned := 0
+	if presence == model.ProblemPresencePresent {
+		returned = 1
+	}
+	return boundedRun(plan, now, boundedResult{
+		Kind: "zabbix_problem_state", Value: value, Returned: returned, ExpiresAt: now.Add(freshFor),
+	}), nil
+}
+
+func zabbixProblemStateUnavailableRun(plan model.Plan, now time.Time, limitation string) model.Run {
+	return model.Run{
+		ID: "run:" + plan.ID, CycleID: plan.CycleID, PlanID: plan.ID, Status: model.ResultUnavailable,
+		Coverage:        model.Coverage{Start: plan.Start, End: plan.End, Complete: false},
+		LimitationCodes: []string{limitation}, ObservedAt: now, ExpiresAt: now.Add(5 * time.Minute),
+	}
+}
+
 // zabbixMetricParameters is zabbix_metric_range's own typed
 // Plan.Parameters shape: the exact adapter-resolved technical host and
 // item key from the source trigger's items — never a model-invented

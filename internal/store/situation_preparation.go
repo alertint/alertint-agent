@@ -309,11 +309,11 @@ func insertObservationPlanTx(ctx context.Context, tx *sql.Tx, cycleID string, p 
 	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO situation_observation_plans (
-			id, cycle_id, capability, phase, scope_json, parameters_json,
+			id, cycle_id, capability, capability_v2, phase, scope_json, parameters_json,
 			start_at, end_at, eligible_at, limit_count, max_requests, purpose,
 			reconsider_on_json, stop_on_json, created_at, tier, reuse_run_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		p.ID, cycleID, string(p.Capability), string(p.Phase), string(scopeJSON), string(params),
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.ID, cycleID, storedObservationCapability(p.Capability), string(p.Capability), string(p.Phase), string(scopeJSON), string(params),
 		canonicalTime(p.Start), canonicalTime(p.End), canonicalTime(p.EligibleAt),
 		p.Limit, p.MaxRequests, p.Purpose, string(reconsiderJSON), string(stopOnJSON), createdAt,
 		planTier(p), nullableString(optionalString(p.ReuseRunID)))
@@ -321,6 +321,13 @@ func insertObservationPlanTx(ctx context.Context, tx *sql.Tx, cycleID string, p 
 		return fmt.Errorf("store: insert observation plan: %w", err)
 	}
 	return nil
+}
+
+func storedObservationCapability(capability observationmodel.Capability) string {
+	if capability == observationmodel.CapabilityZabbixProblemState {
+		return string(observationmodel.CapabilityZabbixProblemHist)
+	}
+	return string(capability)
 }
 
 // planTier resolves the persisted tier for p: an explicit tier, else local
@@ -445,7 +452,7 @@ func loadCycleByKeyTx(ctx context.Context, tx *sql.Tx, situationID string, input
 
 func loadObservationPlansTx(ctx context.Context, tx *sql.Tx, cycleID string) ([]observationmodel.Plan, error) {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, capability, phase, scope_json, parameters_json, start_at, end_at, eligible_at,
+		SELECT id, COALESCE(capability_v2,capability), phase, scope_json, parameters_json, start_at, end_at, eligible_at,
 		       limit_count, max_requests, purpose, reconsider_on_json, stop_on_json, tier, reuse_run_id
 		FROM situation_observation_plans WHERE cycle_id = ? ORDER BY id`, cycleID)
 	if err != nil {
@@ -534,7 +541,7 @@ func (s *Store) ReserveObservationRequest(ctx context.Context, f observationmode
 
 	var planMaxRequests int
 	var planTier, planCapability, planScopeJSON string
-	if err := tx.QueryRowContext(ctx, `SELECT max_requests, tier, capability, scope_json FROM situation_observation_plans WHERE id = ? AND cycle_id = ?`, planID, cycleID).
+	if err := tx.QueryRowContext(ctx, `SELECT max_requests, tier, COALESCE(capability_v2,capability), scope_json FROM situation_observation_plans WHERE id = ? AND cycle_id = ?`, planID, cycleID).
 		Scan(&planMaxRequests, &planTier, &planCapability, &planScopeJSON); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return observationmodel.RequestReservation{}, fmt.Errorf("store: unknown plan %q in cycle %q", planID, cycleID)
@@ -736,7 +743,7 @@ func (s *Store) CommitObservationRun(ctx context.Context, f observationmodel.Fen
 
 	var planMaxRequests int
 	var planTier, planCapability, planScopeJSON string
-	if err := tx.QueryRowContext(ctx, `SELECT max_requests, tier, capability, scope_json FROM situation_observation_plans WHERE id = ? AND cycle_id = ?`, run.PlanID, run.CycleID).
+	if err := tx.QueryRowContext(ctx, `SELECT max_requests, tier, COALESCE(capability_v2,capability), scope_json FROM situation_observation_plans WHERE id = ? AND cycle_id = ?`, run.PlanID, run.CycleID).
 		Scan(&planMaxRequests, &planTier, &planCapability, &planScopeJSON); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("store: unknown plan %q in cycle %q", run.PlanID, run.CycleID)
@@ -1209,7 +1216,7 @@ func buildRunRecord(ctx context.Context, db dbQuerier, id, cycleID, planID, stat
 
 	record := observationmodel.RunRecord{Run: run, DetailState: observationmodel.DetailStateRetained}
 	var capability, subjectJSON, phase, tier string
-	if err := db.QueryRowContext(ctx, `SELECT capability, json_extract(scope_json, '$.subject_id'), phase, tier FROM situation_observation_plans WHERE id = ?`, planID).
+	if err := db.QueryRowContext(ctx, `SELECT COALESCE(capability_v2,capability), json_extract(scope_json, '$.subject_id'), phase, tier FROM situation_observation_plans WHERE id = ?`, planID).
 		Scan(&capability, &subjectJSON, &phase, &tier); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return observationmodel.RunRecord{}, fmt.Errorf("store: load run plan identity: %w", err)
 	}
@@ -1953,7 +1960,7 @@ func (s *Store) GetSituationPreparationView(ctx context.Context, situationID str
 	}
 
 	rows, err := tx.QueryContext(ctx, `
-		SELECT p.id, p.capability, json_extract(p.scope_json, '$.subject_id'), p.phase, p.tier, p.reuse_run_id,
+		SELECT p.id, COALESCE(p.capability_v2,p.capability), json_extract(p.scope_json, '$.subject_id'), p.phase, p.tier, p.reuse_run_id,
 		       r.id, r.status, e.expired_at,
 		       (SELECT COUNT(*) FROM situation_observation_requests q WHERE q.plan_id = p.id),
 		       (SELECT COUNT(*) FROM situation_observation_requests q JOIN situation_observation_request_outcomes o ON o.reservation_id = q.id WHERE q.plan_id = p.id)

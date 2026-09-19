@@ -1,0 +1,118 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package situation
+
+import (
+	"testing"
+	"time"
+
+	"github.com/alertint/alertint-agent/internal/situation/model"
+)
+
+func evaluatorHead(id string) model.ExpectedBehaviorHead {
+	return model.ExpectedBehaviorHead{
+		EnvelopeID: id, Version: 1, State: model.ExpectedBehaviorStateActive, AssertedOperator: "Janis",
+		Policy: &model.ExpectedBehaviorPolicy{
+			Scope: model.ExpectedBehaviorScope{GroupKey: "host=db-01", Source: "zabbix", SourceInstanceID: "prod-zbx", Host: "db-01", PrimaryTriggerID: "100", PrimaryTriggerVersion: "v1"},
+			Conditions: model.ExpectedBehaviorConditions{
+				Workload: "reconciliation", MaxDurationMinutes: 55,
+				Schedule: model.ExpectedBehaviorSchedule{Days: []model.ExpectedBehaviorWeekday{model.ExpectedBehaviorMonday}, LocalStart: "22:00", LocalEnd: "23:30", Timezone: "Europe/Riga", StartToleranceMinutes: 10},
+			},
+		},
+	}
+}
+
+func evaluatorInput(heads ...model.ExpectedBehaviorHead) ExpectedBehaviorInput {
+	started := time.Date(2026, 9, 21, 19, 5, 0, 0, time.UTC)
+	return ExpectedBehaviorInput{
+		SituationID: "sit-1", SituationVersion: 3, GroupKey: "host=db-01", Now: started.Add(10 * time.Minute), PrimaryStartedAt: started,
+		Source: "zabbix", SourceInstanceID: "prod-zbx", Host: "db-01", PrimaryTriggerID: "100", PrimaryVersion: "v1", Heads: heads,
+	}
+}
+
+func TestEvaluateExpectedBehaviorsMatchWinsAcrossAlternatives(t *testing.T) {
+	violated := evaluatorHead("env-a")
+	violated.Policy.Conditions.RequiredCompanions = []model.ExpectedBehaviorBinding{{Role: "lag", Source: "zabbix", SourceInstanceID: "prod-zbx", Host: "db-01", TriggerID: "200", TriggerVersion: "v1"}}
+	matched := evaluatorHead("env-b")
+	in := evaluatorInput(violated, matched)
+	in.Observations = []ExpectedBehaviorSignal{{SourceInstanceID: "prod-zbx", Host: "db-01", TriggerID: "200", TriggerVersion: "v1", Presence: "absent", ExpiresAt: in.Now.Add(time.Minute)}}
+	got := EvaluateExpectedBehaviors(in)
+	if got.Disposition != model.ExpectedBehaviorDispositionMatched || got.ChosenEnvelopeID != "env-b" {
+		t.Fatalf("evaluation=%+v", got)
+	}
+}
+
+func TestEvaluateExpectedBehaviorsCriticalAlwaysWins(t *testing.T) {
+	in := evaluatorInput(evaluatorHead("env-a"))
+	in.HasCriticalFiring = true
+	got := EvaluateExpectedBehaviors(in)
+	if got.Disposition != model.ExpectedBehaviorDispositionViolated || got.Reason != model.ExpectedBehaviorReasonUrgent {
+		t.Fatalf("evaluation=%+v", got)
+	}
+}
+
+func TestEvaluateExpectedBehaviorsUnknownBeatsAllViolated(t *testing.T) {
+	missing := evaluatorHead("env-a")
+	missing.Policy.Conditions.RequiredCompanions = []model.ExpectedBehaviorBinding{{Role: "lag", Source: "zabbix", SourceInstanceID: "prod-zbx", Host: "db-01", TriggerID: "200", TriggerVersion: "v1"}}
+	changed := evaluatorHead("env-b")
+	changed.Policy.Scope.PrimaryTriggerVersion = "v0"
+	got := EvaluateExpectedBehaviors(evaluatorInput(missing, changed))
+	if got.Disposition != model.ExpectedBehaviorDispositionAuthorityUnavailable || got.Reason != model.ExpectedBehaviorReasonObservationUnavailable {
+		t.Fatalf("evaluation=%+v", got)
+	}
+}
+
+func TestEvaluateExpectedBehaviorsRequiredForbiddenAndUnexpected(t *testing.T) {
+	head := evaluatorHead("env-a")
+	head.Policy.Conditions.RequiredCompanions = []model.ExpectedBehaviorBinding{{Role: "lag", Source: "zabbix", SourceInstanceID: "prod-zbx", Host: "db-01", TriggerID: "200", TriggerVersion: "v1"}}
+	head.Policy.Conditions.ForbiddenSignals = []model.ExpectedBehaviorBinding{{Role: "backup_failed", Source: "zabbix", SourceInstanceID: "prod-zbx", Host: "db-01", TriggerID: "300", TriggerVersion: "v1"}}
+	in := evaluatorInput(head)
+	in.Observations = []ExpectedBehaviorSignal{
+		{SourceInstanceID: "prod-zbx", Host: "db-01", TriggerID: "200", TriggerVersion: "v1", Presence: "present", ExpiresAt: in.Now.Add(time.Minute)},
+		{SourceInstanceID: "prod-zbx", Host: "db-01", TriggerID: "300", TriggerVersion: "v1", Presence: "absent", ExpiresAt: in.Now.Add(time.Minute)},
+	}
+	if got := EvaluateExpectedBehaviors(in); got.Disposition != model.ExpectedBehaviorDispositionMatched {
+		t.Fatalf("match=%+v", got)
+	}
+	in.Observations[1].Presence = "present"
+	if got := EvaluateExpectedBehaviors(in); got.Reason != model.ExpectedBehaviorReasonForbiddenPresent {
+		t.Fatalf("forbidden=%+v", got)
+	}
+	in.Observations[1].Presence = "absent"
+	in.FiringSignals = []ExpectedBehaviorSignal{{SourceInstanceID: "prod-zbx", Host: "db-01", TriggerID: "999", TriggerVersion: "v1", Presence: "present"}}
+	if got := EvaluateExpectedBehaviors(in); got.Reason != model.ExpectedBehaviorReasonUnexpectedSymptom {
+		t.Fatalf("unexpected=%+v", got)
+	}
+}
+
+func TestEvaluateExpectedBehaviorsOptionalCompanionMayBeAbsentButMustBeProvenWhenFiring(t *testing.T) {
+	head := evaluatorHead("env-a")
+	head.Policy.Conditions.AllowedCompanions = []model.ExpectedBehaviorBinding{{Role: "backup", Source: "zabbix", SourceInstanceID: "prod-zbx", Host: "db-01", TriggerID: "400", TriggerVersion: "v1"}}
+	in := evaluatorInput(head)
+	if got := EvaluateExpectedBehaviors(in); got.Disposition != model.ExpectedBehaviorDispositionMatched {
+		t.Fatalf("absent optional companion = %+v", got)
+	}
+	in.FiringSignals = []ExpectedBehaviorSignal{{SourceInstanceID: "prod-zbx", Host: "db-01", TriggerID: "400", Presence: "present"}}
+	if got := EvaluateExpectedBehaviors(in); got.Disposition != model.ExpectedBehaviorDispositionAuthorityUnavailable {
+		t.Fatalf("unproven firing optional companion = %+v", got)
+	}
+	in.Observations = []ExpectedBehaviorSignal{{SourceInstanceID: "prod-zbx", Host: "db-01", TriggerID: "400", TriggerVersion: "v1", Presence: "present", ExpiresAt: in.Now.Add(time.Minute)}}
+	if got := EvaluateExpectedBehaviors(in); got.Disposition != model.ExpectedBehaviorDispositionMatched {
+		t.Fatalf("proven firing optional companion = %+v", got)
+	}
+}
+
+func TestExpectedBehaviorBasisHashStableAndOverlayOnlyClearsOperatorRequest(t *testing.T) {
+	in := evaluatorInput(evaluatorHead("env-a"))
+	a, b := EvaluateExpectedBehaviors(in), EvaluateExpectedBehaviors(in)
+	if a.BasisHash == "" || a.BasisHash != b.BasisHash {
+		t.Fatalf("basis hashes %q %q", a.BasisHash, b.BasisHash)
+	}
+	action := model.OperatorAction("acknowledge")
+	alertintAction := model.AlertINTAction("monitor")
+	commit := ControllerCommit{Lifecycle: model.LifecycleActive, Attention: model.AttentionObserve, Assessment: model.Assessment{Attention: model.AttentionObserve, ActionContract: model.ActionContract{OperatorActionRequired: &action, AlertINTAction: &alertintAction, NextActor: model.NextActorOperator}}}
+	ApplyExpectedBehaviorAuthority(&commit, &a)
+	if commit.Assessment.ActionContract.OperatorActionRequired != nil || commit.Assessment.ActionContract.NextActor != model.NextActorAlertINT || commit.Assessment.ActionContract.NextUpdateAt == nil {
+		t.Fatalf("commit=%+v", commit)
+	}
+}

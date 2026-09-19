@@ -86,18 +86,13 @@ func TestTransitionRelatedEnumsValidate(t *testing.T) {
 	}
 }
 
-// TestTransitionActorValidate proves Plan 3 accepts exactly
-// deterministic_controller, llm, and attributed_operator, and rejects
-// operator_policy even though it is a defined TransitionActor constant
-// (reserved for Plan 5; spec.md "Domain model").
+// TestTransitionActorValidate proves the closed actor vocabulary, including
+// Plan 5's attributed reusable-policy authority.
 func TestTransitionActorValidate(t *testing.T) {
-	for _, a := range []TransitionActor{ActorDeterministicController, ActorLLM, ActorAttributedOperator} {
+	for _, a := range []TransitionActor{ActorDeterministicController, ActorLLM, ActorAttributedOperator, ActorOperatorPolicy} {
 		if err := a.Validate(); err != nil {
 			t.Errorf("valid actor %q: unexpected error: %v", a, err)
 		}
-	}
-	if err := ActorOperatorPolicy.Validate(); err == nil {
-		t.Error("operator_policy: want error in Plan 3, got nil")
 	}
 	if err := TransitionActor("bogus").Validate(); err == nil {
 		t.Error("bogus actor: want error, got nil")
@@ -430,7 +425,6 @@ func TestTransitionValidate(t *testing.T) {
 		{"bad journal_kind", func(tr *Transition) { tr.JournalKind = JournalKind("bogus") }},
 		{"invalid journal", func(tr *Transition) { tr.Journal.OccurredAt = time.Time{} }},
 		{"invalid projection", func(tr *Transition) { tr.Projection.EffectiveStartedAt = time.Time{} }},
-		{"operator_policy actor rejected", func(tr *Transition) { tr.Actor = ActorOperatorPolicy }},
 		{"bad actor", func(tr *Transition) { tr.Actor = TransitionActor("bogus") }},
 		{"evidence_refs over max count", func(tr *Transition) {
 			refs := make([]string, maxEvidenceRefs+1)

@@ -250,6 +250,7 @@ type OperatorBriefing struct {
 	Analyses          []IncidentAnalysis          `json:"analyses,omitempty"`
 	Historical        bool                        `json:"historical,omitempty"`
 	ExpectedJudgment  *ExpectedJudgmentProjection `json:"expected_judgment,omitempty"`
+	ExpectedBehavior  *ExpectedBehaviorProjection `json:"expected_behavior,omitempty"`
 
 	// Work is the aggregate, per-Situation acute-triage work disposition
 	// (B0 integration contract §3, accepted 2026-09-08): a coherent

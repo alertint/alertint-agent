@@ -130,8 +130,8 @@ func TestNotificationBlockedIndexUpgrade_AddsThePartialIndexAndFabricatesNothing
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	if got != 33 {
-		t.Fatalf("MaxSchemaVersion = %d, want 33", got)
+	if got != 35 {
+		t.Fatalf("MaxSchemaVersion = %d, want 35", got)
 	}
 
 	var indexSQL string

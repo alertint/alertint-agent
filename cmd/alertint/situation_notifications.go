@@ -50,9 +50,10 @@ import (
 // a situation.NotificationDeliverer, and *store.Store satisfies both this
 // file's reader contract and the worker's whole durable contract.
 var (
-	_ situation.NotificationDeliverer = (*SituationDeliverer)(nil)
-	_ DelivererStore                  = (*store.Store)(nil)
-	_ situation.NotificationStore     = (*store.Store)(nil)
+	_ situation.NotificationDeliverer           = (*SituationDeliverer)(nil)
+	_ situation.ExpectedBehaviorReviewDeliverer = (*SituationDeliverer)(nil)
+	_ DelivererStore                            = (*store.Store)(nil)
+	_ situation.NotificationStore               = (*store.Store)(nil)
 )
 
 // DelivererStore is exactly what SituationDeliverer reads. The first three
@@ -83,6 +84,10 @@ type DelivererStore interface {
 	// GetCurrentSituationJudgment revalidates time-bounded authority at the
 	// actual send instant so queued delivery cannot reassert a retired decision.
 	GetCurrentSituationJudgment(ctx context.Context, situationID string, now time.Time) (*store.SituationJudgmentView, error)
+}
+
+type expectedBehaviorDeliveryStore interface {
+	GetCurrentExpectedBehaviorEvaluationAt(ctx context.Context, situationID string, now time.Time) (model.ExpectedBehaviorEvaluation, bool, error)
 }
 
 // slackDeliveryAPI is exactly what SituationDeliverer calls on the narrow
@@ -142,6 +147,23 @@ func (d *SituationDeliverer) Deliver(ctx context.Context, intent model.Notificat
 	return delivery, nil
 }
 
+// DeliverExpectedBehaviorReview posts one standalone review card. The
+// durable review ledger owns retries and advances its clock only after this
+// call is acknowledged.
+func (d *SituationDeliverer) DeliverExpectedBehaviorReview(ctx context.Context, intent situation.ExpectedBehaviorReviewIntent) (situation.NotificationDelivery, error) {
+	rendered, err := slack.RenderExpectedBehaviorReview(intent)
+	if err != nil {
+		return situation.NotificationDelivery{}, invalidDelivery("render_failed", err)
+	}
+	res, err := d.api.PostMessage(ctx, slack.PostMessageRequest{
+		Channel: d.channel, Text: rendered.Text, Blocks: rendered.Blocks, ClientMsgID: intent.ID,
+	})
+	if err != nil {
+		return situation.NotificationDelivery{}, classifyDeliveryError(err)
+	}
+	return situation.NotificationDelivery{Channel: res.Channel, MessageTS: res.TS, DeliveredAs: "root"}, nil
+}
+
 // deliver is Deliver's undecorated body: it renders and sends, and returns
 // raw errors that Deliver classifies on the way out.
 func (d *SituationDeliverer) deliver(ctx context.Context, intent model.NotificationIntent) (situation.NotificationDelivery, error) {
@@ -192,6 +214,20 @@ func (d *SituationDeliverer) deliverRootSync(ctx context.Context, intent model.N
 		if current == nil || !current.Applicability.Applicable || current.Judgment.Revision != briefing.ExpectedJudgment.Revision {
 			return situation.NotificationDelivery{}, localDelivery("stale_expected_judgment",
 				errors.New("cmd/alertint: situation deliverer: root carries retired expected judgment"))
+		}
+	}
+	if briefing := view.Summary.Briefing; briefing != nil && briefing.ExpectedBehavior != nil && briefing.ExpectedBehavior.Disposition == model.ExpectedBehaviorDispositionMatched {
+		reader, ok := d.store.(expectedBehaviorDeliveryStore)
+		if !ok {
+			return situation.NotificationDelivery{}, localDelivery("expected_behavior_revalidation_unavailable", errors.New("cmd/alertint: situation deliverer cannot revalidate expected schedule"))
+		}
+		current, found, err := reader.GetCurrentExpectedBehaviorEvaluationAt(ctx, *intent.SituationID, d.now().UTC())
+		if err != nil {
+			return situation.NotificationDelivery{}, localDelivery("expected_behavior_revalidation_unavailable", fmt.Errorf("cmd/alertint: revalidate expected schedule: %w", err))
+		}
+		projected := briefing.ExpectedBehavior
+		if !found || current.Disposition != model.ExpectedBehaviorDispositionMatched || current.ChosenEnvelopeID != projected.EnvelopeID || current.ChosenVersion != projected.Version {
+			return situation.NotificationDelivery{}, localDelivery("stale_expected_behavior", errors.New("cmd/alertint: situation root carries retired expected schedule"))
 		}
 	}
 
@@ -267,6 +303,17 @@ func (d *SituationDeliverer) deliverThreadAppend(ctx context.Context, intent mod
 			tr.Journal.NoLongerCurrent = true
 		}
 	}
+	if expectedBehaviorChangeCarriesAuthority(tr.Journal.ExpectedBehaviorChange) {
+		reader, ok := d.store.(expectedBehaviorDeliveryStore)
+		projected := tr.Projection.Briefing
+		if !ok || projected == nil || projected.ExpectedBehavior == nil {
+			tr.Journal.NoLongerCurrent = true
+		} else if current, found, err := reader.GetCurrentExpectedBehaviorEvaluationAt(ctx, *intent.SituationID, d.now().UTC()); err != nil {
+			return situation.NotificationDelivery{}, localDelivery("expected_behavior_revalidation_unavailable", fmt.Errorf("cmd/alertint: revalidate expected schedule thread: %w", err))
+		} else if !found || current.Disposition != model.ExpectedBehaviorDispositionMatched || current.ChosenEnvelopeID != projected.ExpectedBehavior.EnvelopeID || current.ChosenVersion != projected.ExpectedBehavior.Version {
+			tr.Journal.NoLongerCurrent = true
+		}
+	}
 	channel, rootTS, ok, err := d.store.GetSituationRootCoordinates(ctx, *intent.SituationID)
 	if err != nil {
 		return situation.NotificationDelivery{}, localDelivery("root_coordinates_unavailable",
@@ -303,6 +350,16 @@ func judgmentChangeCarriesAuthority(change model.JudgmentChange) bool {
 	case model.JudgmentChangeRecorded, model.JudgmentChangeReplaced, model.JudgmentChangeRestored:
 		return true
 	case model.JudgmentChangeRevoked, model.JudgmentChangeExpired, model.JudgmentChangeInvalidated, "":
+		return false
+	}
+	return false
+}
+
+func expectedBehaviorChangeCarriesAuthority(change model.ExpectedBehaviorChange) bool {
+	switch change {
+	case model.ExpectedBehaviorChangeApplied, model.ExpectedBehaviorChangeUpdated, model.ExpectedBehaviorChangeRestored:
+		return true
+	case model.ExpectedBehaviorChangeWithdrawn, model.ExpectedBehaviorChangeStopped, "":
 		return false
 	}
 	return false
@@ -1011,10 +1068,11 @@ func buildSituationSlackWorker(cfg *config.Config, st *store.Store, owner string
 			// (plan.md: "Plan 3 adds no duplicate notification knobs"); Poll,
 			// Batch, the retry schedule, and the five-minute gap threshold are
 			// the protocol's own constants, not operator knobs.
-			Owner:     owner + ":notifications",
-			Lease:     time.Duration(cfg.Situations.LeaseSeconds) * time.Second,
-			Heartbeat: time.Duration(cfg.Situations.HeartbeatSeconds) * time.Second,
-			Poll:      time.Duration(cfg.Situations.ReconcilePollSeconds) * time.Second,
+			Owner:                              owner + ":notifications",
+			Lease:                              time.Duration(cfg.Situations.LeaseSeconds) * time.Second,
+			Heartbeat:                          time.Duration(cfg.Situations.HeartbeatSeconds) * time.Second,
+			Poll:                               time.Duration(cfg.Situations.ReconcilePollSeconds) * time.Second,
+			ExpectedBehaviorReviewIntervalDays: cfg.Situations.ExpectedBehavior.ReviewReminderIntervalDays,
 		},
 		func() time.Time { return time.Now().UTC() }, logger)
 	worker.SetAuditSink(auditSink)

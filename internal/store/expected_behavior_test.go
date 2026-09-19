@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -279,6 +280,46 @@ func TestCommitExpectedBehaviorEvaluationFencesEnvelopeAndSituationVersions(t *t
 	}
 }
 
+func TestExpectedBehaviorBoundaryExpiresAfterRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "expected-restart.db")
+	st, err := Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newExpectedBehaviorFixture(t, st)
+	created, err := st.WriteExpectedBehavior(context.Background(), audit.New(st.DB()), f.confirmRequest(t, st, "expected-restart-confirm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sit, err := st.GetSituation(context.Background(), f.situationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundary := f.now.Add(time.Hour)
+	evaluation := situationmodel.ExpectedBehaviorEvaluation{
+		SituationID: f.situationID, SituationVersion: sit.InputVersion, Disposition: situationmodel.ExpectedBehaviorDispositionMatched,
+		Reason: situationmodel.ExpectedBehaviorReasonMatched, ChosenEnvelopeID: created.Revision.EnvelopeID, ChosenVersion: 1,
+		Occurrence: &situationmodel.ExpectedBehaviorOccurrence{Start: f.now, End: boundary, Boundary: boundary},
+		Candidates: []situationmodel.ExpectedBehaviorCandidate{{EnvelopeID: created.Revision.EnvelopeID, Version: 1, Status: situationmodel.ExpectedBehaviorMatched, Reason: situationmodel.ExpectedBehaviorReasonMatched}},
+		BasisHash:  "sha256:restart-boundary", EvaluatedAt: f.now,
+	}
+	if _, err := st.CommitExpectedBehaviorEvaluation(context.Background(), evaluation); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err = Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	current, found, err := st.GetCurrentExpectedBehaviorEvaluationAt(context.Background(), f.situationID, boundary)
+	if err != nil || !found || current.Disposition != situationmodel.ExpectedBehaviorDispositionViolated || current.ChosenEnvelopeID != "" {
+		t.Fatalf("current after restart/boundary = %+v, found=%v err=%v", current, found, err)
+	}
+}
+
 func TestListExpectedBehaviorsFiltersInactiveHeads(t *testing.T) {
 	st := newTestStore(t)
 	fixture := newExpectedBehaviorFixture(t, st)
@@ -335,11 +376,12 @@ func TestConcurrentExpectedBehaviorReplacementAllowsOneWriter(t *testing.T) {
 	success, conflict := 0, 0
 	for range 2 {
 		err := <-errs
-		if err == nil {
+		switch {
+		case err == nil:
 			success++
-		} else if errors.Is(err, ErrExpectedBehaviorVersionConflict) || errors.Is(err, ErrSituationVersionConflict) {
+		case errors.Is(err, ErrExpectedBehaviorVersionConflict) || errors.Is(err, ErrSituationVersionConflict):
 			conflict++
-		} else {
+		default:
 			t.Fatalf("unexpected writer error: %v", err)
 		}
 	}
@@ -352,7 +394,10 @@ func cloneExpectedBehaviorPolicy(in *situationmodel.ExpectedBehaviorPolicy) *sit
 	if in == nil {
 		return nil
 	}
-	b, _ := json.Marshal(in)
+	b, err := json.Marshal(in)
+	if err != nil {
+		return nil
+	}
 	var out situationmodel.ExpectedBehaviorPolicy
 	_ = json.Unmarshal(b, &out)
 	return &out

@@ -162,6 +162,10 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 	if err != nil {
 		return situation.SnapshotInput{}, err
 	}
+	expectedHeads, err := listExpectedBehaviorHeadsTx(ctx, tx, ExpectedBehaviorListFilter{GroupKey: sit.GroupKey, IncludeInactive: true}, 100)
+	if err != nil {
+		return situation.SnapshotInput{}, err
+	}
 
 	if err := tx.Commit(); err != nil {
 		return situation.SnapshotInput{}, fmt.Errorf("store: commit load reconciliation input: %w", err)
@@ -188,6 +192,7 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 		PendingArtifacts:            artifacts,
 		DeliveredHistory:            deliveredHistory,
 		Prepared:                    prepared,
+		ExpectedBehaviorHeads:       expectedHeads,
 	}
 	if hasJudgment {
 		in.Judgment = &judgment
@@ -195,6 +200,10 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 		if judgmentInvalidated {
 			in.JudgmentApplicability = situationmodel.JudgmentApplicability{Reason: judgmentInvalidation}
 		}
+	}
+	if len(expectedHeads) > 0 && !sit.Lifecycle.Terminal() {
+		evaluation := situation.EvaluateExpectedBehaviors(expectedBehaviorInputFromSnapshot(in, expectedHeads))
+		in.ExpectedBehavior = &evaluation
 	}
 	return in, nil
 }
@@ -2094,6 +2103,9 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 	if err := persistSituationJudgmentInvalidationTx(ctx, tx, claim.Situation.ID, commit); err != nil {
 		return fmt.Errorf("store: persist situation judgment invalidation: %w", err)
 	}
+	if err := commitExpectedBehaviorEvaluationTx(ctx, tx, claim.Situation.ID, claim.Situation.InputVersion, commit.ExpectedBehaviorEvaluation); err != nil {
+		return err
+	}
 
 	proj, err := readCurrentControllerProjectionTx(ctx, tx, claim.Situation.ID)
 	if err != nil {
@@ -2135,6 +2147,9 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 	remainingDueReasons := subtractDueReasonsStore(proj.dueReasons, claim.Situation.DueReasons)
 	if commit.JudgmentApplicable {
 		remainingDueReasons = mergeDueReason(remainingDueReasons, situationmodel.DueJudgmentBoundary)
+	}
+	if commit.ExpectedBehaviorEvaluation != nil && commit.ExpectedBehaviorEvaluation.Disposition == situationmodel.ExpectedBehaviorDispositionMatched {
+		remainingDueReasons = mergeDueReason(remainingDueReasons, situationmodel.DueEnvelopeBoundary)
 	}
 	dueReasonsJSON, err := json.Marshal(remainingDueReasons)
 	if err != nil {

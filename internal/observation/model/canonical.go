@@ -112,7 +112,7 @@ func windowCapFor(capability Capability) (time.Duration, bool) {
 	switch capability {
 	case CapabilityPrometheusQuery, CapabilityLokiQuery, CapabilityZabbixMetricRange:
 		return MaxWindowHoursMetricsLogs * time.Hour, true
-	case CapabilityZabbixProblemHist, CapabilityChangeEvents, CapabilitySentryIssues:
+	case CapabilityZabbixProblemHist, CapabilityZabbixProblemState, CapabilityChangeEvents, CapabilitySentryIssues:
 		return MaxWindowDaysHistory * 24 * time.Hour, true
 	case CapabilityStoreRead:
 		return 0, false

@@ -123,6 +123,15 @@ func NewServer(cfg Config, st *store.Store, auditor *audit.Auditor) *Server {
 	ms.AddTool(s.toolRevokeSituationExpected())
 	ms.AddTool(s.toolRestoreSituationExpected())
 	ms.AddTool(s.toolListSituationJudgments())
+	ms.AddTool(s.toolExpectedBehaviorPrepare())
+	ms.AddTool(s.toolGetExpectedBehaviorValidation())
+	ms.AddTool(s.toolExpectedBehaviorConfirm())
+	ms.AddTool(s.toolExpectedBehaviorReplace())
+	ms.AddTool(s.toolExpectedBehaviorRevoke())
+	ms.AddTool(s.toolExpectedBehaviorRestore())
+	ms.AddTool(s.toolGetExpectedBehavior())
+	ms.AddTool(s.toolListExpectedBehaviors())
+	ms.AddTool(s.toolListExpectedBehaviorHistory())
 	// Plan 4 Task 9: bounded evidence-preparation/semantic-profile views.
 	// Always registered alongside the Situation tools above — preparation/
 	// profile state exists (possibly empty) regardless of which source

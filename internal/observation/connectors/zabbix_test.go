@@ -137,6 +137,58 @@ type fakeZabbixProblemClient struct {
 	err    error
 }
 
+type fakeZabbixProblemStateClient struct {
+	state zabbix.ProblemState
+	err   error
+}
+
+func (f *fakeZabbixProblemStateClient) ProblemStateBounded(_ context.Context, _, _ string,
+	before func() error, after func(bool, error)) (zabbix.ProblemState, error) {
+	if err := before(); err != nil {
+		return zabbix.ProblemState{}, err
+	}
+	after(true, f.err)
+	return f.state, f.err
+}
+
+func TestZabbixProblemStateExecutorNormalizesConfirmedAbsence(t *testing.T) {
+	client := &fakeZabbixProblemStateClient{state: zabbix.ProblemState{Presence: zabbix.ProblemAbsent}}
+	definition := &fakeZabbixSourceDefinitionClient{definition: zabbix.SourceRuleDefinition{RuleVersionEvidence: zabbix.RuleVersionEvidence{Version: "sha256:observed"}}}
+	executor := &ZabbixProblemStateExecutor{Client: client, SourceDefinition: definition, Clock: func() time.Time { return time.Unix(100, 0).UTC() }}
+	plan := testStorePlan()
+	plan.Capability = model.CapabilityZabbixProblemState
+	plan.Parameters = mustMarshal(zabbixProblemStateParameters{Host: "db-prod-1", TriggerID: "18491", TriggerVersion: "sha256:v1", SourceInstanceID: "prod-zbx"})
+	run, err := executor.Execute(context.Background(), plan, &noopRecorder{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != model.ResultConfirmedEmpty || len(run.Facts) != 1 || run.Facts[0].Kind != "zabbix_problem_state" {
+		t.Fatalf("run = %+v", run)
+	}
+	var fact model.ZabbixProblemStateObservation
+	if err := json.Unmarshal(run.Facts[0].Value, &fact); err != nil {
+		t.Fatal(err)
+	}
+	if fact.Presence != model.ProblemPresenceAbsent || fact.TriggerVersion != "sha256:observed" {
+		t.Fatalf("fact = %+v", fact)
+	}
+}
+
+func TestZabbixProblemStateExecutorBudgetDeferralIsUnknown(t *testing.T) {
+	client := &fakeZabbixProblemStateClient{state: zabbix.ProblemState{Presence: zabbix.ProblemAbsent}}
+	executor := &ZabbixProblemStateExecutor{Client: client, SourceDefinition: &fakeZabbixSourceDefinitionClient{definition: zabbix.SourceRuleDefinition{RuleVersionEvidence: zabbix.RuleVersionEvidence{Version: "sha256:v1"}}}}
+	plan := testStorePlan()
+	plan.Capability = model.CapabilityZabbixProblemState
+	plan.Parameters = mustMarshal(zabbixProblemStateParameters{Host: "db-prod-1", TriggerID: "18491", TriggerVersion: "sha256:v1", SourceInstanceID: "prod-zbx"})
+	run, err := executor.Execute(context.Background(), plan, &budgetExhaustedRecorder{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != model.ResultWithheldByBudget {
+		t.Fatalf("status = %q, want withheld_by_budget", run.Status)
+	}
+}
+
 type fakeZabbixSourceDefinitionClient struct {
 	definition zabbix.SourceRuleDefinition
 	err        error

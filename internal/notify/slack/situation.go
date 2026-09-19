@@ -424,6 +424,9 @@ func renderJournalEntryKind(t model.Transition, executionSuperseded bool, replyK
 	if t.Journal.JudgmentChange != "" {
 		return renderExpectedJudgmentJournal(t), nil
 	}
+	if t.Journal.ExpectedBehaviorChange != "" {
+		return renderExpectedBehaviorJournal(t), nil
+	}
 
 	prefix := drillPrefix(t.Drill)
 	label, detail := t.Journal.Headline, t.Journal.Detail
@@ -465,6 +468,36 @@ func renderJournalEntryKind(t model.Transition, executionSuperseded bool, replyK
 		Text:   fallback,
 		Blocks: blocks,
 	}, nil
+}
+
+func renderExpectedBehaviorJournal(t model.Transition) RenderedMessage {
+	actor := briefingText(t.Journal.AttributedActor, 120)
+	var text string
+	switch t.Journal.ExpectedBehaviorChange {
+	case model.ExpectedBehaviorChangeApplied:
+		text = actor + " confirmed an expected schedule. Monitoring continues."
+	case model.ExpectedBehaviorChangeUpdated:
+		text = actor + " updated the expected schedule. Monitoring continues."
+	case model.ExpectedBehaviorChangeRestored:
+		text = actor + " restored the expected schedule. Monitoring continues."
+	case model.ExpectedBehaviorChangeWithdrawn:
+		text = actor + " withdrew the expected schedule. Normal assessment resumes."
+	case model.ExpectedBehaviorChangeStopped:
+		reason := strings.TrimSpace(t.Journal.Detail)
+		if reason == "" {
+			reason = "The current condition no longer matches the schedule."
+		}
+		text = "The expected schedule no longer applies because " + strings.ToLower(strings.TrimSuffix(reason, ".")) + ". Normal assessment resumes."
+	default:
+		text = "The expected schedule changed."
+	}
+	if actor == "" && (t.Journal.ExpectedBehaviorChange == model.ExpectedBehaviorChangeApplied || t.Journal.ExpectedBehaviorChange == model.ExpectedBehaviorChangeUpdated || t.Journal.ExpectedBehaviorChange == model.ExpectedBehaviorChangeRestored) {
+		text = "The expected schedule applies. Monitoring continues."
+	}
+	if t.Journal.NoLongerCurrent {
+		text += " This schedule is no longer active."
+	}
+	return RenderedMessage{Text: text, Blocks: []slacklib.Block{sectionBlock(text), contextBlock(SlackDateToken(t.Journal.OccurredAt, "{date_short} {time}"))}}
 }
 
 func renderExpectedJudgmentJournal(t model.Transition) RenderedMessage {

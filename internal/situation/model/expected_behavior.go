@@ -199,3 +199,64 @@ type ExpectedBehaviorEvaluation struct {
 	BasisHash        string                      `json:"basis_hash,omitempty"`
 	EvaluatedAt      time.Time                   `json:"evaluated_at,omitempty"`
 }
+
+// ExpectedBehaviorValidationStatus is the current state of one bounded
+// binding-validation request. Stale is derived at read time when its
+// Situation input fence has moved; it is never persisted as if a worker had
+// completed the request.
+type ExpectedBehaviorValidationStatus string
+
+const (
+	ExpectedBehaviorValidationPending     ExpectedBehaviorValidationStatus = "pending"
+	ExpectedBehaviorValidationReady       ExpectedBehaviorValidationStatus = "ready"
+	ExpectedBehaviorValidationStale       ExpectedBehaviorValidationStatus = "stale"
+	ExpectedBehaviorValidationUnavailable ExpectedBehaviorValidationStatus = "unavailable"
+)
+
+// ExpectedBehaviorBindingObservation is the fresh, exact current-state
+// proof for one proposed binding.
+type ExpectedBehaviorBindingObservation struct {
+	Binding      ExpectedBehaviorBinding `json:"binding"`
+	Presence     string                  `json:"presence"`
+	EvidenceRefs []string                `json:"evidence_refs"`
+	ObservedAt   time.Time               `json:"observed_at"`
+	ExpiresAt    time.Time               `json:"expires_at"`
+}
+
+// ExpectedBehaviorValidation is a non-authoritative preparation receipt.
+// Only a ready, unexpired receipt at the current Situation input version can
+// be consumed by a later confirmed operator write.
+type ExpectedBehaviorValidation struct {
+	ID                    string                               `json:"id"`
+	SituationID           string                               `json:"situation_id"`
+	SituationInputVersion int                                  `json:"situation_input_version"`
+	BindingDigest         string                               `json:"binding_digest"`
+	Bindings              []ExpectedBehaviorBinding            `json:"bindings"`
+	Status                ExpectedBehaviorValidationStatus     `json:"status"`
+	Observations          []ExpectedBehaviorBindingObservation `json:"observations"`
+	UnavailableReason     string                               `json:"unavailable_reason,omitempty"`
+	ExpiresAt             time.Time                            `json:"expires_at"`
+	CreatedAt             time.Time                            `json:"created_at"`
+	UpdatedAt             time.Time                            `json:"updated_at"`
+}
+
+// ExpectedBehaviorProjection is the compact immutable publication view.
+type ExpectedBehaviorProjection struct {
+	EnvelopeID       string                      `json:"envelope_id"`
+	Version          int                         `json:"version"`
+	AssertedOperator string                      `json:"asserted_operator"`
+	Workload         string                      `json:"workload,omitempty"`
+	Disposition      ExpectedBehaviorDisposition `json:"disposition"`
+	Reason           ExpectedBehaviorReason      `json:"reason,omitempty"`
+	Boundary         *time.Time                  `json:"boundary,omitempty"`
+}
+
+type ExpectedBehaviorChange string
+
+const (
+	ExpectedBehaviorChangeApplied   ExpectedBehaviorChange = "applied"
+	ExpectedBehaviorChangeUpdated   ExpectedBehaviorChange = "updated"
+	ExpectedBehaviorChangeWithdrawn ExpectedBehaviorChange = "withdrawn"
+	ExpectedBehaviorChangeRestored  ExpectedBehaviorChange = "restored"
+	ExpectedBehaviorChangeStopped   ExpectedBehaviorChange = "stopped"
+)

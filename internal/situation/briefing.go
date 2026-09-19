@@ -296,6 +296,35 @@ func CommittedOperatorBriefing(in SnapshotInput, commit ControllerCommit) *model
 			ValidUntil: in.Judgment.ValidUntil.UTC(),
 		}
 	}
+	if evaluation := commit.ExpectedBehaviorEvaluation; evaluation != nil && len(evaluation.Candidates) > 0 { //nolint:nestif // aggregate precedence and chosen-candidate projection stay together.
+		candidate := evaluation.Candidates[0]
+		if evaluation.ChosenEnvelopeID != "" {
+			for _, current := range evaluation.Candidates {
+				if current.EnvelopeID == evaluation.ChosenEnvelopeID {
+					candidate = current
+					break
+				}
+			}
+		}
+		projection := &model.ExpectedBehaviorProjection{
+			EnvelopeID: candidate.EnvelopeID, Version: candidate.Version,
+			Disposition: evaluation.Disposition, Reason: evaluation.Reason,
+		}
+		if evaluation.Occurrence != nil {
+			boundary := evaluation.Occurrence.Boundary.UTC()
+			projection.Boundary = &boundary
+		}
+		for _, head := range in.ExpectedBehaviorHeads {
+			if head.EnvelopeID == candidate.EnvelopeID {
+				projection.AssertedOperator = head.AssertedOperator
+				if head.Policy != nil {
+					projection.Workload = head.Policy.Conditions.Workload
+				}
+				break
+			}
+		}
+		b.ExpectedBehavior = projection
+	}
 	if commit.Parked.Touch {
 		b.BlockedReason = commit.Parked.Reason
 	}

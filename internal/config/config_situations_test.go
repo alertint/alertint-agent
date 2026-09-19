@@ -22,8 +22,7 @@ func situationsBaseYAML(t *testing.T) string {
 // tiers, the fixed L2 call/work-attempt accounting, attempt wall, LLM
 // concurrency, and the retry range/jitter — plus Plan 4's bounded evidence-
 // preparation and semantic-profile-worker defaults (spec.md "Defaults and
-// hard limits"). Plan 5 settings (envelope review interval, ...) remain
-// deliberately absent.
+// hard limits") and Plan 5's bounded envelope review interval.
 func TestSituationsDefaults(t *testing.T) {
 	cfg := Defaults()
 	s := cfg.Situations
@@ -55,6 +54,7 @@ func TestSituationsDefaults(t *testing.T) {
 		{"semantic_profiles.workers", s.SemanticProfiles.Workers, 1},
 		{"semantic_profiles.max_attempts", s.SemanticProfiles.MaxAttempts, 3},
 		{"semantic_profiles.attempt_wall_seconds", s.SemanticProfiles.AttemptWallSeconds, 30},
+		{"expected_behavior.review_reminder_interval_days", s.ExpectedBehavior.ReviewReminderIntervalDays, 30},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -122,6 +122,10 @@ func TestSituationsValidation(t *testing.T) {
 		{"max_work_attempts_per_input above fixed value", func(s *SituationsConfig) { s.MaxWorkAttemptsPerInput = 6 }, true},
 		{"slack.repage_cooldown_seconds zero", func(s *SituationsConfig) { s.Slack.RepageCooldownSeconds = 0 }, true},
 		{"slack.repage_cooldown_seconds negative", func(s *SituationsConfig) { s.Slack.RepageCooldownSeconds = -1 }, true},
+		{"review reminder interval zero", func(s *SituationsConfig) { s.ExpectedBehavior.ReviewReminderIntervalDays = 0 }, true},
+		{"review reminder interval 366", func(s *SituationsConfig) { s.ExpectedBehavior.ReviewReminderIntervalDays = 366 }, true},
+		{"review reminder interval 1", func(s *SituationsConfig) { s.ExpectedBehavior.ReviewReminderIntervalDays = 1 }, false},
+		{"review reminder interval 365", func(s *SituationsConfig) { s.ExpectedBehavior.ReviewReminderIntervalDays = 365 }, false},
 	}
 
 	for _, tc := range cases {

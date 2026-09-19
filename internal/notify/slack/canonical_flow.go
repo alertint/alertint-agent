@@ -348,6 +348,9 @@ func renderCanonicalRoot(in SituationRootInput) RenderedMessage {
 	if j := b.ExpectedJudgment; j != nil {
 		lines = append(lines, "*Operator:* Expected until "+SlackDateToken(j.ValidUntil, "{time}")+" · "+briefingText(j.AssertedOperator, 120))
 	}
+	if expected := b.ExpectedBehavior; expected != nil && expected.Disposition == model.ExpectedBehaviorDispositionMatched && expected.Boundary != nil {
+		lines = append(lines, "*Operator:* Expected schedule applies until "+SlackDateToken(*expected.Boundary, "{time}")+" · "+briefingText(expected.AssertedOperator, 120))
+	}
 
 	if !t.Lifecycle.Terminal() {
 		activity := canonicalNext(t, b, in.Now)

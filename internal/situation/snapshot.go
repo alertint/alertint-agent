@@ -35,6 +35,10 @@ type SnapshotInput struct {
 	// heads remain history but carry no current authority.
 	Judgment              *model.SituationJudgment
 	JudgmentApplicability model.JudgmentApplicability
+	// ExpectedBehavior is the reusable schedule evaluation derived from this
+	// same coherent Situation, envelope-head, and prepared-evidence read.
+	ExpectedBehavior      *model.ExpectedBehaviorEvaluation
+	ExpectedBehaviorHeads []model.ExpectedBehaviorHead
 
 	// ControllerParked is the Situation's current controller_parked_at/
 	// controller_parked_reason projection, plus the material fact hash the

@@ -132,6 +132,11 @@ type SituationsConfig struct {
 	Slack                       SituationSlackConfig       `yaml:"slack"`
 	Preparation                 SituationPreparationConfig `yaml:"preparation"`
 	SemanticProfiles            SemanticProfilesConfig     `yaml:"semantic_profiles"`
+	ExpectedBehavior            ExpectedBehaviorConfig     `yaml:"expected_behavior"`
+}
+
+type ExpectedBehaviorConfig struct {
+	ReviewReminderIntervalDays int `yaml:"review_reminder_interval_days"`
 }
 
 // SituationPreparationConfig is Plan 4's bounded evidence-preparation
@@ -718,6 +723,7 @@ func Defaults() Config {
 				MaxWallSeconds:         20,
 				RefreshSeconds:         300,
 			},
+			ExpectedBehavior: ExpectedBehaviorConfig{ReviewReminderIntervalDays: 30},
 			SemanticProfiles: SemanticProfilesConfig{
 				Workers:            1,
 				MaxAttempts:        3,
@@ -1159,6 +1165,9 @@ func (c *Config) validateSituations() []string {
 		{"situations.retry.min_seconds", s.Retry.MinSeconds},
 		{"situations.retry.max_seconds", s.Retry.MaxSeconds},
 		{"situations.slack.repage_cooldown_seconds", s.Slack.RepageCooldownSeconds},
+	}
+	if days := s.ExpectedBehavior.ReviewReminderIntervalDays; days < 1 || days > 365 {
+		errs = append(errs, "situations.expected_behavior.review_reminder_interval_days must be between 1 and 365")
 	}
 	for _, p := range positive {
 		if p.v <= 0 {

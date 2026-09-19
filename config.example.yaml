@@ -250,6 +250,8 @@ sentry:
 # default, shown here for discoverability. See docs/getting-started/
 # configuration.md#situations.
 situations:
+  expected_behavior:
+    review_reminder_interval_days: 30 # standalone reminder cadence; reminders do not expire schedule authority
   preparation:
     max_source_calls_per_cycle: 8   # physical connector requests per preparation cycle (1-32)
     max_wall_seconds: 20            # wall-clock budget for one preparation attempt (1-30; must be < situations.attempt_wall_seconds)
