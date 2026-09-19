@@ -113,6 +113,7 @@ type ExpectedBehaviorHead struct {
 	RevisionID         string                             `json:"revision_id"`
 	Version            int                                `json:"version"`
 	State              ExpectedBehaviorState              `json:"state"`
+	Scope              ExpectedBehaviorScope              `json:"scope"`
 	Policy             *ExpectedBehaviorPolicy            `json:"policy,omitempty"`
 	AssertedOperator   string                             `json:"asserted_operator"`
 	InvalidatedAt      *time.Time                         `json:"invalidated_at,omitempty"`
