@@ -31,7 +31,7 @@ func TestExpectedBehaviorRootRetainsFindingOrderAndAddsCompactContext(t *testing
 
 func TestExpectedBehaviorStoppedReasonsAndWithdrawalUseSimpleText(t *testing.T) {
 	tr := bcJournal(t, bcObserveMonitorContract(bcNow(t)), canonicalFixture(t), nil)
-	tr.Actor = model.ActorOperatorPolicy
+	tr.Actor = model.ActorAttributedOperator
 	tr.Journal.ExpectedBehaviorChange = model.ExpectedBehaviorChangeWithdrawn
 	tr.Journal.AttributedActor = "Janis"
 	msg, err := RenderSituationJournal(tr)

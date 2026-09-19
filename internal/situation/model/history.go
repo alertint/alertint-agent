@@ -157,7 +157,7 @@ const (
 // rejected here.
 func (a TransitionActor) Validate() error {
 	return validateEnum("transition_actor", a,
-		ActorDeterministicController, ActorLLM, ActorAttributedOperator, ActorOperatorPolicy)
+		ActorDeterministicController, ActorLLM, ActorAttributedOperator)
 }
 
 // JournalKind is the closed shape of the immutable journal-render data a

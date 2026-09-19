@@ -701,7 +701,7 @@ func expectedBehaviorJournal(change AuthoritativeChange) (model.JournalData, mod
 		j.ExpectedBehaviorBoundary = current.Boundary
 	}
 	if current != nil && current.Disposition == model.ExpectedBehaviorDispositionMatched {
-		actor = model.ActorOperatorPolicy
+		actor = model.ActorAttributedOperator
 		switch {
 		case prior == nil:
 			j.ExpectedBehaviorChange, j.Headline = model.ExpectedBehaviorChangeApplied, "Expected schedule applied"
@@ -719,7 +719,7 @@ func expectedBehaviorJournal(change AuthoritativeChange) (model.JournalData, mod
 	if current != nil && current.Reason == model.ExpectedBehaviorReasonRevoked {
 		j.ExpectedBehaviorChange, j.Headline = model.ExpectedBehaviorChangeWithdrawn, "Expected schedule withdrawn"
 		j.AttributedActor = current.AssertedOperator
-		actor = model.ActorOperatorPolicy
+		actor = model.ActorAttributedOperator
 	} else {
 		j.ExpectedBehaviorChange, j.Headline = model.ExpectedBehaviorChangeStopped, "Expected schedule no longer applies"
 		j.Detail = expectedBehaviorReasonDetail(j.ExpectedBehaviorReason)
