@@ -139,6 +139,24 @@ func TestPlanNotificationIntentsInitialRoot(t *testing.T) {
 	}
 }
 
+func TestPlanNotificationIntentsExpectedBehaviorChangeGetsThreadReply(t *testing.T) {
+	c := hsChange(t)
+	trs, sum := hsCommitOf(t, c)
+	if len(trs) != 1 {
+		t.Fatalf("transitions = %d, want 1", len(trs))
+	}
+	trs[0].Reason = model.ReasonOperatorContractChanged
+	trs[0].JournalKind = model.JournalOperatorContractChanged
+	trs[0].Journal.ExpectedBehaviorChange = model.ExpectedBehaviorChangeApplied
+	trs[0].Journal.AttributedActor = "Janis"
+	trs[0].Projection.Briefing = &model.OperatorBriefing{}
+
+	replies := hsReplyIntents(hsPlan(t, hsPub(c, trs, sum)))
+	if len(replies) != 1 || replies[0].TransitionID == nil || *replies[0].TransitionID != trs[0].ID {
+		t.Fatalf("expected-schedule replies = %+v, want one reply for transition %q", replies, trs[0].ID)
+	}
+}
+
 func TestPlanNotificationIntentsLaterRootSyncIsNotAPoke(t *testing.T) {
 	c := hsNext(t)
 	hsUseReason(&c, reasonCodeDurationOutlier)
