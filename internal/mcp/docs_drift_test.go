@@ -81,6 +81,16 @@ func TestDriftGate_ToolsDocumented(t *testing.T) {
 	addTool(t19.Name)
 	t20, _ := s.toolCorrectSemanticProfile()
 	addTool(t20.Name)
+	t21, _ := s.toolRecordSituationExpected()
+	addTool(t21.Name)
+	t22, _ := s.toolReplaceSituationExpected()
+	addTool(t22.Name)
+	t23, _ := s.toolRevokeSituationExpected()
+	addTool(t23.Name)
+	t24, _ := s.toolRestoreSituationExpected()
+	addTool(t24.Name)
+	t25, _ := s.toolListSituationJudgments()
+	addTool(t25.Name)
 
 	documented := documentedToolNames(t)
 

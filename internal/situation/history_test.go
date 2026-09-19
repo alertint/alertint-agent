@@ -223,6 +223,141 @@ func hsNext(t *testing.T) AuthoritativeChange {
 	return next
 }
 
+func TestExpectedJudgmentCreatesOnlyMeaningfulHistoryTransitions(t *testing.T) {
+	until := hsNow(t).Add(2 * time.Hour)
+	projection := &model.ExpectedJudgmentProjection{Revision: 1, AssertedOperator: "Janis", ValidUntil: until}
+
+	recorded := hsNext(t)
+	recorded.Projection.Briefing = &model.OperatorBriefing{ExpectedJudgment: projection}
+	recorded.Judgment = &model.SituationJudgment{Revision: 1, Operation: model.JudgmentOperationRecord, AssertedOperator: "Janis", ValidUntil: until}
+	recorded.JudgmentApplicabilityReason = model.JudgmentApplicable
+	got, err := BuildTransitions(recorded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Reason != model.ReasonOperatorContractChanged || got[0].Journal.JudgmentChange != model.JudgmentChangeRecorded || got[0].Actor != model.ActorAttributedOperator {
+		t.Fatalf("record transition = %+v", got)
+	}
+	if !replyEligibleTransition(PublicationInput{RootPublished: true, PriorTransition: recorded.PriorTransition}, got[0]) {
+		t.Fatal("recorded judgment did not earn its one thread transition")
+	}
+
+	unchanged := hsNext(t)
+	unchanged.PriorTransition.Projection.Briefing = &model.OperatorBriefing{ExpectedJudgment: projection}
+	unchanged.Projection.Briefing = &model.OperatorBriefing{ExpectedJudgment: projection}
+	unchanged.Judgment = recorded.Judgment
+	unchanged.JudgmentApplicabilityReason = model.JudgmentApplicable
+	got, err = BuildTransitions(unchanged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("unchanged telemetry created transitions: %+v", got)
+	}
+
+	expired := hsNext(t)
+	expired.PriorTransition.Projection.Briefing = &model.OperatorBriefing{ExpectedJudgment: projection}
+	expired.Judgment = recorded.Judgment
+	expired.JudgmentApplicabilityReason = model.JudgmentExpired
+	got, err = BuildTransitions(expired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Journal.JudgmentChange != model.JudgmentChangeExpired || got[0].Actor != model.ActorDeterministicController {
+		t.Fatalf("expiry transition = %+v", got)
+	}
+	if got[0].Journal.Detail != "The scheduled end time was reached." {
+		t.Fatalf("expiry reason = %q", got[0].Journal.Detail)
+	}
+}
+
+func TestExpectedJudgmentInvalidationRecordsConcreteReason(t *testing.T) {
+	until := hsNow(t).Add(2 * time.Hour)
+	prior := &model.ExpectedJudgmentProjection{Revision: 1, AssertedOperator: "Janis", ValidUntil: until}
+
+	cases := []struct {
+		name     string
+		reason   model.JudgmentApplicabilityReason
+		critical int
+		want     string
+	}{
+		{"critical alert", model.JudgmentUrgent, 1, "A critical alert is now firing."},
+		{"independently urgent", model.JudgmentUrgent, 0, "The Situation now requires urgent attention."},
+		{"scope", model.JudgmentScopeChanged, 0, "The affected scope changed."},
+		{"symptoms", model.JudgmentSymptomsChanged, 0, "The active symptoms changed."},
+		{"severity", model.JudgmentSeverityChanged, 0, "The alert severity changed."},
+		{"impact", model.JudgmentImpactChanged, 0, "The assessed impact changed."},
+		{"source signature", model.JudgmentSourceSignatureChanged, 0, "The source identity or version changed."},
+		{"evidence", model.JudgmentEvidenceMissing, 0, "The evidence needed to keep the decision active is no longer available."},
+		{"terminal", model.JudgmentSituationTerminal, 0, "The Situation ended."},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			change := hsNext(t)
+			change.PriorTransition.Projection.Briefing = &model.OperatorBriefing{ExpectedJudgment: prior}
+			change.Projection.Briefing = &model.OperatorBriefing{Critical: tc.critical}
+			change.Judgment = &model.SituationJudgment{Revision: 1, Operation: model.JudgmentOperationRecord, AssertedOperator: "Janis", ValidUntil: until}
+			change.JudgmentApplicabilityReason = tc.reason
+			got, err := BuildTransitions(change)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != 1 || got[0].Journal.JudgmentChange != model.JudgmentChangeInvalidated {
+				t.Fatalf("invalidation transition = %+v", got)
+			}
+			if got[0].Journal.Detail != tc.want {
+				t.Fatalf("reason = %q, want %q", got[0].Journal.Detail, tc.want)
+			}
+		})
+	}
+}
+
+func TestExpectedJudgmentWithdrawalIsAttributed(t *testing.T) {
+	until := hsNow(t).Add(2 * time.Hour)
+	prior := &model.ExpectedJudgmentProjection{Revision: 1, AssertedOperator: "Janis", ValidUntil: until}
+	change := hsNext(t)
+	change.PriorTransition.Projection.Briefing = &model.OperatorBriefing{ExpectedJudgment: prior}
+	change.Judgment = &model.SituationJudgment{Revision: 2, Operation: model.JudgmentOperationRevoke, AssertedOperator: "Janis", ValidUntil: until}
+	change.JudgmentApplicabilityReason = model.JudgmentRevoked
+	got, err := BuildTransitions(change)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Journal.JudgmentChange != model.JudgmentChangeRevoked || got[0].Journal.AttributedActor != "Janis" || got[0].Actor != model.ActorAttributedOperator {
+		t.Fatalf("withdrawal transition = %+v", got)
+	}
+}
+
+func TestExpectedJudgmentChangeDoesNotReplaceConcurrentRecoveryJournal(t *testing.T) {
+	until := hsNow(t).Add(2 * time.Hour)
+	prior := &model.ExpectedJudgmentProjection{Revision: 1, AssertedOperator: "Janis", ValidUntil: until}
+	change := hsNext(t)
+	change.PriorTransition.Projection.Briefing = &model.OperatorBriefing{ExpectedJudgment: prior}
+	change.Situation.Lifecycle = model.LifecycleRecoveryPending
+	change.Assessment.Lifecycle = model.LifecycleRecoveryPending
+	change.Situation.RecoveryObservedAt = timePtr(change.Now)
+	change.Projection.RecoveryObservedAt = timePtr(change.Now)
+	change.Projection.GraceUntil = timePtr(change.Now.Add(10 * time.Minute))
+	change.Projection.Briefing = &model.OperatorBriefing{}
+	change.Judgment = &model.SituationJudgment{Revision: 2, Operation: model.JudgmentOperationRevoke, AssertedOperator: "Janis", ValidUntil: until}
+	change.JudgmentApplicabilityReason = model.JudgmentRevoked
+
+	got, err := BuildTransitions(change)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("transitions = %+v, want recovery plus judgment", got)
+	}
+	if got[0].Reason != model.ReasonRecoveryObserved || got[0].JournalKind != model.JournalRecoveryPending || got[0].Journal.JudgmentChange != "" {
+		t.Fatalf("recovery transition was overwritten: %+v", got[0])
+	}
+	if got[1].Reason != model.ReasonOperatorContractChanged || got[1].Journal.JudgmentChange != model.JudgmentChangeRevoked || got[1].Journal.AttributedActor != "Janis" {
+		t.Fatalf("judgment transition missing: %+v", got[1])
+	}
+}
+
 func hsArtifact(id, kind string, occurredAt time.Time) OperatorArtifactInput {
 	a := OperatorArtifactInput{
 		InputID:             id,

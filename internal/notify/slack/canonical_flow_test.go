@@ -26,6 +26,121 @@ func canonicalFixture(t *testing.T) *model.OperatorBriefing {
 	return &b
 }
 
+func TestCanonicalRootShowsExpectedJudgmentAfterFinding(t *testing.T) {
+	b := canonicalFixture(t)
+	b.Work.Phase = model.WorkPhaseSettled
+	b.Analyses = []model.IncidentAnalysis{{Title: "Reconciliation job is driving CPU load", Summary: "Sustained CPU load on db-prod-1.", Findings: []string{"CPU load remains elevated on db-prod-1."}, Verification: "supported"}}
+	until := bcNow(t).Add(time.Hour)
+	b.ExpectedJudgment = &model.ExpectedJudgmentProjection{Revision: 2, AssertedOperator: "Janis", ValidUntil: until}
+	in := bcRoot(t, model.LifecycleActive, model.AttentionInvestigate, bcObserveMonitorContract(bcNow(t)), b)
+	msg, err := RenderSituationRoot(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "*Operator:* Expected until " + SlackDateToken(until, "{time}") + " · Janis"
+	if !strings.Contains(msg.Text, want) {
+		t.Fatalf("root missing %q:\n%s", want, msg.Text)
+	}
+	titleAt := strings.Index(msg.Text, "Monitoring · payments · lab")
+	statusAt := strings.Index(msg.Text, "Observed · Correlating")
+	findingAt := strings.Index(msg.Text, "*Finding:*")
+	operatorAt := strings.Index(msg.Text, "*Operator:*")
+	if !(titleAt >= 0 && titleAt < statusAt && statusAt < findingAt && findingAt < operatorAt) {
+		t.Fatalf("root order title=%d status=%d finding=%d operator=%d:\n%s", titleAt, statusAt, findingAt, operatorAt, msg.Text)
+	}
+}
+
+func TestExpectedJudgmentThreadTransitionsAreAttributedAndTruthful(t *testing.T) {
+	b := canonicalFixture(t)
+	until := bcNow(t).Add(time.Hour)
+	tr := bcJournal(t, bcObserveMonitorContract(bcNow(t)), b, nil)
+	tr.Journal.JudgmentChange = model.JudgmentChangeRecorded
+	tr.Journal.AttributedActor = "Janis"
+	tr.Journal.JudgmentValidUntil = &until
+	msg, err := RenderSituationJournal(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "Janis marked the current condition as expected until " + SlackDateToken(until, "{time}") + ". Monitoring continues."
+	if !strings.Contains(msg.Text, want) {
+		t.Fatalf("thread = %q, want %q", msg.Text, want)
+	}
+
+	tr.Journal.JudgmentChange = model.JudgmentChangeRevoked
+	tr.Journal.JudgmentValidUntil = nil
+	msg, err = RenderSituationJournal(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(msg.Text, "Janis ended the expected-until decision. Normal assessment resumes.") {
+		t.Fatal(msg.Text)
+	}
+
+	action := model.OperatorActionInvestigateSituation
+	tr.ActionContract.NextActor = model.NextActorOperator
+	tr.ActionContract.OperatorActionRequired = &action
+	msg, err = RenderSituationJournal(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(msg.Text, "Operator action required: investigate this Situation.") {
+		t.Fatalf("withdrawal handoff = %q, want the resumed operator action", msg.Text)
+	}
+}
+
+func TestExpectedJudgmentThreadExplainsWhyDecisionEnded(t *testing.T) {
+	until := bcNow(t).Add(time.Hour)
+	base := bcJournal(t, bcObserveMonitorContract(bcNow(t)), canonicalFixture(t), nil)
+	base.Journal.JudgmentValidUntil = &until
+
+	cases := []struct {
+		name   string
+		change model.JudgmentChange
+		detail string
+		want   string
+	}{
+		{
+			name:   "scheduled end",
+			change: model.JudgmentChangeExpired,
+			detail: "The scheduled end time was reached.",
+			want:   "The expected-until decision ended at " + SlackDateToken(until, "{time}") + " as scheduled. Normal assessment resumes.",
+		},
+		{
+			name:   "criticality",
+			change: model.JudgmentChangeInvalidated,
+			detail: "A critical alert is now firing.",
+			want:   "The expected-until decision no longer applies because a critical alert is now firing. Normal assessment resumes.",
+		},
+		{
+			name:   "changed symptoms",
+			change: model.JudgmentChangeInvalidated,
+			detail: "The active symptoms changed.",
+			want:   "The expected-until decision no longer applies because the active symptoms changed. Normal assessment resumes.",
+		},
+		{
+			name:   "legacy transition without concrete reason",
+			change: model.JudgmentChangeInvalidated,
+			detail: "Normal assessment resumes.",
+			want:   "The expected-until decision no longer applies because the current condition changed. Normal assessment resumes.",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := base
+			tr.Journal.JudgmentChange = tc.change
+			tr.Journal.Detail = tc.detail
+			msg, err := RenderSituationJournal(tr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(msg.Text, tc.want) {
+				t.Fatalf("thread = %q, want %q", msg.Text, tc.want)
+			}
+		})
+	}
+}
+
 // Losing the phase, names or receipt clock makes distinct incidents indistinguishable.
 func TestCanonicalRootCorrelationHasMembershipAndDeterministicClocks(t *testing.T) {
 	b := canonicalFixture(t)

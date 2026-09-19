@@ -227,6 +227,13 @@ type ControllerCommit struct {
 	// commit behaves exactly as it did before Plan 4.
 	PreparationCycleID    string
 	PreparationGeneration int64
+	// JudgmentRevision fences this result against the immutable judgment
+	// head loaded with the reconciliation input. CheckedAt closes the race
+	// where authority expires while model work is in flight.
+	JudgmentRevision            int
+	JudgmentApplicable          bool
+	JudgmentApplicabilityReason model.JudgmentApplicabilityReason
+	JudgmentCheckedAt           time.Time
 }
 
 // ParkedState is CommitController's explicit instruction for the
@@ -1638,6 +1645,9 @@ type historyBasis struct {
 // Situation stays due.
 func (c *Controller) commit(ctx context.Context, claim Claim, basis historyBasis, commit ControllerCommit) error {
 	startedAt := time.Now()
+	checkedAt := c.clock().UTC()
+	applyExpectedJudgment(&commit, basis.In, checkedAt)
+	c.finalizeCheckpoint(&commit, checkedAt)
 	history, err := c.buildHistory(claim, basis, commit)
 	if err != nil {
 		c.logger.Error("situation: controller history derivation failed",
@@ -1781,10 +1791,12 @@ func authoritativeChangeOf(claim Claim, basis historyBasis, commit ControllerCom
 		// alone is fixed for a Situation's whole lifetime (one nonterminal
 		// Situation per group), so occurrences are what let a milestone
 		// actually be reached while it is open (review round 1, R1-F6).
-		RecurrenceCount:   recurrenceCountOf(basis.In),
-		OperatorArtifacts: basis.In.PendingArtifacts,
-		Drill:             situationDrill(basis.In),
-		Now:               basis.Now,
+		RecurrenceCount:             recurrenceCountOf(basis.In),
+		OperatorArtifacts:           basis.In.PendingArtifacts,
+		Drill:                       situationDrill(basis.In),
+		Now:                         basis.Now,
+		Judgment:                    basis.In.Judgment,
+		JudgmentApplicabilityReason: commit.JudgmentApplicabilityReason,
 	}
 	switch {
 	case commit.Attempt.ID != "":

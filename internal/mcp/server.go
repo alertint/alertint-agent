@@ -9,9 +9,8 @@
 // Default endpoint: http://host:9912/mcp
 // Auth: Bearer token (constant-time compare, same pattern as the webhook).
 //
-// Read-only toward your systems, always; feedback writes (the two
-// alertint_incident_* write tools) land only in AlertINT's own incident
-// state, additive and audit-chained.
+// Read-only toward your systems, always. MCP mutations land only in
+// AlertINT's own local state and are versioned or additive and audit-chained.
 package mcp
 
 import (
@@ -84,13 +83,14 @@ type Server struct {
 	st      *store.Store
 	auditor *audit.Auditor
 	handler http.Handler
+	now     func() time.Time
 }
 
 // NewServer builds the MCP server with the always-on incident/alert/audit tools
 // registered, plus the optional source tools (Prometheus, logs, changes, Sentry)
 // each gated on its connector being configured.
 func NewServer(cfg Config, st *store.Store, auditor *audit.Auditor) *Server {
-	s := &Server{cfg: cfg, st: st, auditor: auditor}
+	s := &Server{cfg: cfg, st: st, auditor: auditor, now: time.Now}
 
 	ms := mcpserver.NewMCPServer("AlertINT", "1.0.0",
 		mcpserver.WithToolCapabilities(false),
@@ -118,6 +118,11 @@ func NewServer(cfg Config, st *store.Store, auditor *audit.Auditor) *Server {
 	// rather than erroring.
 	ms.AddTool(s.toolListSituationTransitions())
 	ms.AddTool(s.toolGetDeliveryState())
+	ms.AddTool(s.toolRecordSituationExpected())
+	ms.AddTool(s.toolReplaceSituationExpected())
+	ms.AddTool(s.toolRevokeSituationExpected())
+	ms.AddTool(s.toolRestoreSituationExpected())
+	ms.AddTool(s.toolListSituationJudgments())
 	// Plan 4 Task 9: bounded evidence-preparation/semantic-profile views.
 	// Always registered alongside the Situation tools above — preparation/
 	// profile state exists (possibly empty) regardless of which source
@@ -165,6 +170,13 @@ func NewServer(cfg Config, st *store.Store, auditor *audit.Auditor) *Server {
 // Handler returns the http.Handler to mount on an http.Server.
 func (s *Server) Handler() http.Handler { return s.handler }
 
+func (s *Server) currentTime() time.Time {
+	if s.now == nil {
+		return time.Now().UTC()
+	}
+	return s.now().UTC()
+}
+
 // withBearerAuth wraps h with constant-time bearer token verification.
 func (s *Server) withBearerAuth(next http.Handler) http.Handler {
 	token := []byte(s.cfg.Token)
@@ -179,8 +191,9 @@ func (s *Server) withBearerAuth(next http.Handler) http.Handler {
 }
 
 // -----------------------------------------------------------------------------
-// Tool definitions (read-only toward operator systems; write-back tools live
-// in server_feedback.go)
+// Tool definitions (read-only toward operator systems; local write-back
+// tools live in server_feedback.go, server_preparation.go and
+// server_judgments.go)
 // -----------------------------------------------------------------------------
 
 func (s *Server) toolListIncidents() (mcplib.Tool, mcpserver.ToolHandlerFunc) {

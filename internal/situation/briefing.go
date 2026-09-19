@@ -290,6 +290,12 @@ func briefingDisplayScope(labels map[string]string) string {
 func CommittedOperatorBriefing(in SnapshotInput, commit ControllerCommit) *model.OperatorBriefing {
 	in = committedBriefingInput(in, commit.TriageDecisions)
 	b := BuildOperatorBriefing(in, commit.Lifecycle)
+	if commit.JudgmentApplicable && in.Judgment != nil {
+		b.ExpectedJudgment = &model.ExpectedJudgmentProjection{
+			Revision: in.Judgment.Revision, AssertedOperator: in.Judgment.AssertedOperator,
+			ValidUntil: in.Judgment.ValidUntil.UTC(),
+		}
+	}
 	if commit.Parked.Touch {
 		b.BlockedReason = commit.Parked.Reason
 	}

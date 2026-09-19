@@ -115,6 +115,14 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 	if err != nil {
 		return situation.SnapshotInput{}, err
 	}
+	judgment, hasJudgment, err := readSituationJudgmentHeadTx(ctx, tx, sit.ID)
+	if err != nil {
+		return situation.SnapshotInput{}, err
+	}
+	judgmentInvalidation, judgmentInvalidated, err := readSituationJudgmentInvalidationTx(ctx, tx, sit.ID)
+	if err != nil {
+		return situation.SnapshotInput{}, err
+	}
 
 	parked, err := readControllerParkedStateTx(ctx, tx, sit.ID)
 	if err != nil {
@@ -159,7 +167,7 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 		return situation.SnapshotInput{}, fmt.Errorf("store: commit load reconciliation input: %w", err)
 	}
 
-	return situation.SnapshotInput{
+	in := situation.SnapshotInput{
 		Situation:                   sit,
 		Deliveries:                  deliveries,
 		Incidents:                   incidents,
@@ -180,7 +188,15 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 		PendingArtifacts:            artifacts,
 		DeliveredHistory:            deliveredHistory,
 		Prepared:                    prepared,
-	}, nil
+	}
+	if hasJudgment {
+		in.Judgment = &judgment
+		in.JudgmentApplicability = situation.EvaluateExpectedJudgment(judgment, in, now.UTC())
+		if judgmentInvalidated {
+			in.JudgmentApplicability = situationmodel.JudgmentApplicability{Reason: judgmentInvalidation}
+		}
+	}
+	return in, nil
 }
 
 // publicationContext is the Slack-delivery side of one coherent load: what
@@ -2067,6 +2083,12 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 	if current.InputVersion != claim.Situation.InputVersion {
 		return ErrSituationVersionConflict
 	}
+	if err := verifySituationJudgmentFenceTx(ctx, tx, claim.Situation.ID, commit); err != nil {
+		return err
+	}
+	if err := persistSituationJudgmentInvalidationTx(ctx, tx, claim.Situation.ID, commit); err != nil {
+		return fmt.Errorf("store: persist situation judgment invalidation: %w", err)
+	}
 
 	proj, err := readCurrentControllerProjectionTx(ctx, tx, claim.Situation.ID)
 	if err != nil {
@@ -2106,6 +2128,9 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 
 	// 5. Due reasons: subtract only what claim itself consumed.
 	remainingDueReasons := subtractDueReasonsStore(proj.dueReasons, claim.Situation.DueReasons)
+	if commit.JudgmentApplicable {
+		remainingDueReasons = mergeDueReason(remainingDueReasons, situationmodel.DueJudgmentBoundary)
+	}
 	dueReasonsJSON, err := json.Marshal(remainingDueReasons)
 	if err != nil {
 		return fmt.Errorf("store: marshal remaining due reasons: %w", err)

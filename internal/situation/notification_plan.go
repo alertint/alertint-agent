@@ -236,6 +236,9 @@ func replyEligibleTransition(in PublicationInput, tr model.Transition) bool {
 		// truth already (R4).
 		return false
 	}
+	if tr.Journal.JudgmentChange != "" {
+		return true
+	}
 	var cands []model.MaterialCandidate
 	if tr.Projection.OperatorDelta != nil {
 		cands = tr.Projection.OperatorDelta.Candidates
@@ -587,8 +590,10 @@ func planDeadlineRefresh(in PublicationInput) ([]model.NotificationIntent, error
 // selectPoke returns the one Transition in this commit that may create a
 // new main-channel poke, applying spec's closed list of permitted poke
 // classes and the configured repage cooldown for the one class it gates.
-// When several qualify, the highest-priority (then latest) wins: a commit
-// interrupts the channel at most once.
+// When several qualify, the highest-priority (then earliest) wins: a commit
+// interrupts the channel at most once. State transitions precede their
+// judgment journal sibling, so an equal-priority judgment entry cannot hide
+// the escalation that invalidated it.
 func selectPoke(in PublicationInput) (model.Transition, bool) {
 	var best model.Transition
 	found := false
@@ -614,7 +619,7 @@ func selectPoke(in PublicationInput) (model.Transition, bool) {
 		if class.CooldownApplies() && !cooldownElapsed(in) {
 			continue
 		}
-		if !found || !DeriveInterruptionPriority(tr).Less(DeriveInterruptionPriority(best)) {
+		if !found || DeriveInterruptionPriority(best).Less(DeriveInterruptionPriority(tr)) {
 			best = tr
 			found = true
 		}
