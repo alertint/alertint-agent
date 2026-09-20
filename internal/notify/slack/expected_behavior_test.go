@@ -66,4 +66,9 @@ func TestExpectedBehaviorStoppedReasonsAndWithdrawalUseSimpleText(t *testing.T) 
 	if !strings.Contains(msg.Text, "because AlertINT cannot verify the Zabbix rule") {
 		t.Fatal(msg.Text)
 	}
+	tr.Journal.Detail = "An unexpected alert is firing."
+	msg, _ = RenderSituationJournal(tr)
+	if !strings.Contains(msg.Text, "because an unexpected alert is firing") {
+		t.Fatal(msg.Text)
+	}
 }
