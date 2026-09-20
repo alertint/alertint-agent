@@ -129,7 +129,7 @@ func TestB5StandingHistorySurvivesARestart(t *testing.T) {
 	now := time.Date(2026, 9, 9, 10, 0, 0, 0, time.UTC)
 	path := filepath.Join(t.TempDir(), "b5r3-restart.db")
 
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestB5StandingHistorySurvivesARestart(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	reopened, err := Open(ctx, path)
+	reopened, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}

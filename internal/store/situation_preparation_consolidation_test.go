@@ -23,7 +23,7 @@ import (
 func TestConsolidationPreparationReservationSurvivesActualRestart(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "restart.db")
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func TestConsolidationPreparationReservationSurvivesActualRestart(t *testing.T) 
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
-	st, err = Open(ctx, path)
+	st, err = openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestConsolidationPreparationReservationSurvivesActualRestart(t *testing.T) 
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
-	st, err = Open(ctx, path)
+	st, err = openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +120,7 @@ func consolidationRun(name string, cycle observationmodel.Cycle, now time.Time) 
 func TestConsolidationRetentionBatchesRestartAndProtectedReads(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "retention.db")
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +208,7 @@ func TestConsolidationRetentionBatchesRestartAndProtectedReads(t *testing.T) {
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
-	st, err = Open(ctx, path)
+	st, err = openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +260,7 @@ func TestConsolidationRetentionBatchesRestartAndProtectedReads(t *testing.T) {
 func TestConsolidationInvestigationCreditChurnAndRestart(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "credit.db")
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +279,7 @@ func TestConsolidationInvestigationCreditChurnAndRestart(t *testing.T) {
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
-	st, err = Open(ctx, path)
+	st, err = openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}

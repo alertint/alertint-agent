@@ -371,7 +371,7 @@ func TestAcceptDeliveriesPersistsAcrossFileBackedCloseReopen(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "durable.db")
 
-	st, err := Open(ctx, dbPath)
+	st, err := openTestStoreWithMigrations(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -385,7 +385,7 @@ func TestAcceptDeliveriesPersistsAcrossFileBackedCloseReopen(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	reopened, err := Open(ctx, dbPath)
+	reopened, err := openTestStoreWithMigrations(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -752,16 +752,7 @@ func TestMarkIncidentReadyWithSituationInputRejectsTerminalIncident(t *testing.T
 
 func newFileTestStore(t *testing.T) *Store {
 	t.Helper()
-	st, err := Open(context.Background(), filepath.Join(t.TempDir(), "alertint.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := st.Close(); err != nil {
-			t.Error(err)
-		}
-	})
-	return st
+	return newTestStore(t)
 }
 
 func acceptSameGroupFixtures(t *testing.T, st *Store, ids []string, now time.Time) {

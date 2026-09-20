@@ -15,20 +15,13 @@ import (
 	"github.com/alertint/alertint-agent/internal/store/storetest"
 )
 
-func newTestStore(t *testing.T) *Store {
-	t.Helper()
+func TestOpen_AppliesEmbeddedMigrations(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(ctx, ":memory:")
+	s, err := openTestStoreWithMigrations(ctx, filepath.Join(t.TempDir(), "migration.db"))
 	if err != nil {
-		t.Fatalf("Open(:memory:): %v", err)
+		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	return s
-}
-
-func TestOpen_AppliesEmbeddedMigrations(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
 
 	rows, err := s.db.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`)
 	if err != nil {
@@ -86,7 +79,7 @@ func TestMigrate_IsIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 
-	first, err := Open(ctx, dbPath)
+	first, err := openTestStoreWithMigrations(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("first Open: %v", err)
 	}
@@ -94,7 +87,7 @@ func TestMigrate_IsIdempotent(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	second, err := Open(ctx, dbPath)
+	second, err := openTestStoreWithMigrations(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("second Open: %v", err)
 	}
@@ -110,6 +103,57 @@ func TestMigrate_IsIdempotent(t *testing.T) {
 	}
 	if count != len(embedded) {
 		t.Errorf("schema_migrations rows = %d, want %d (one per embedded migration) after re-open", count, len(embedded))
+	}
+}
+
+func TestNewTestStoreUsesIndependentMigratedCopies(t *testing.T) {
+	ctx := context.Background()
+	first := newTestStore(t)
+	second := newTestStore(t)
+
+	databasePath := func(st *Store) string {
+		t.Helper()
+		var path string
+		if err := st.db.QueryRowContext(ctx, `SELECT file FROM pragma_database_list WHERE name = 'main'`).Scan(&path); err != nil {
+			t.Fatalf("read test database path: %v", err)
+		}
+		return path
+	}
+	firstPath := databasePath(first)
+	secondPath := databasePath(second)
+	if firstPath == "" || secondPath == "" {
+		t.Fatalf("test stores must be file-backed copies, got %q and %q", firstPath, secondPath)
+	}
+	if firstPath == secondPath {
+		t.Fatalf("test stores share database %q", firstPath)
+	}
+
+	now := time.Now().UTC()
+	if _, err := first.UpsertAlertByFingerprint(ctx, Alert{
+		ID:          uuid.NewString(),
+		Fingerprint: "copy-isolation",
+		Status:      "firing",
+		Labels:      map[string]string{},
+		Annotations: map[string]string{},
+		StartsAt:    now,
+		ReceivedAt:  now,
+	}); err != nil {
+		t.Fatalf("write first test store: %v", err)
+	}
+	if _, err := second.GetAlertByFingerprint(ctx, "copy-isolation"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second test store observed first store write: %v", err)
+	}
+
+	var migrationCount int
+	if err := second.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&migrationCount); err != nil {
+		t.Fatalf("count copied migrations: %v", err)
+	}
+	migrations, err := loadMigrations()
+	if err != nil {
+		t.Fatalf("load migrations: %v", err)
+	}
+	if migrationCount != len(migrations) {
+		t.Fatalf("copied migration count = %d, want %d", migrationCount, len(migrations))
 	}
 }
 

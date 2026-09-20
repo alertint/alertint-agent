@@ -315,7 +315,7 @@ func TestCommitExpectedBehaviorEvaluationFencesEnvelopeAndSituationVersions(t *t
 
 func TestExpectedBehaviorBoundaryExpiresAfterRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "expected-restart.db")
-	st, err := Open(context.Background(), path)
+	st, err := openTestStoreWithMigrations(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +342,7 @@ func TestExpectedBehaviorBoundaryExpiresAfterRestart(t *testing.T) {
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
-	st, err = Open(context.Background(), path)
+	st, err = openTestStoreWithMigrations(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}

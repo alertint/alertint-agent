@@ -191,7 +191,7 @@ func b5r4RestartSelection(t *testing.T, group string, later *model.OperatorBrief
 	now := time.Date(2026, 9, 9, 10, 0, 0, 0, time.UTC)
 	path := filepath.Join(t.TempDir(), group+".db")
 
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -203,7 +203,7 @@ func b5r4RestartSelection(t *testing.T, group string, later *model.OperatorBrief
 		t.Fatalf("Close: %v", err)
 	}
 
-	reopened, err := Open(ctx, path)
+	reopened, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}

@@ -10,11 +10,7 @@ import (
 
 func TestChanges_InsertQueryPrune(t *testing.T) {
 	ctx := context.Background()
-	st, err := Open(ctx, ":memory:")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer func() { _ = st.Close() }()
+	st := newTestStore(t)
 
 	base := time.Date(2026, 6, 18, 10, 0, 0, 0, time.UTC)
 	mk := func(id string, mins int) Change {
@@ -64,11 +60,7 @@ func TestChanges_InsertQueryPrune(t *testing.T) {
 
 func TestChangesInScopeWindow_ScopedAndBounded(t *testing.T) {
 	ctx := context.Background()
-	st, err := Open(ctx, ":memory:")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer func() { _ = st.Close() }()
+	st := newTestStore(t)
 
 	base := time.Date(2026, 6, 18, 10, 0, 0, 0, time.UTC)
 	mk := func(id, service, env string, mins int) Change {
@@ -127,11 +119,7 @@ func TestChangesInScopeWindow_ScopedAndBounded(t *testing.T) {
 
 func TestChangesInScopeWindow_RejectsEmptySelector(t *testing.T) {
 	ctx := context.Background()
-	st, err := Open(ctx, ":memory:")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer func() { _ = st.Close() }()
+	st := newTestStore(t)
 
 	if _, _, err := st.ChangesInScopeWindow(ctx, nil, time.Now().Add(-time.Hour), time.Now(), 10); err == nil {
 		t.Fatal("expected error for empty selector")
@@ -140,8 +128,7 @@ func TestChangesInScopeWindow_RejectsEmptySelector(t *testing.T) {
 
 func TestInsertChange_Validation(t *testing.T) {
 	ctx := context.Background()
-	st, _ := Open(ctx, ":memory:")
-	defer func() { _ = st.Close() }()
+	st := newTestStore(t)
 
 	now := time.Now().UTC()
 	bad := Change{Source: "x", Title: "t", Labels: map[string]string{"a": "b"}, OccurredAt: now, ReceivedAt: now}

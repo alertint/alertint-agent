@@ -173,7 +173,7 @@ func TestNotificationReplySupersessionUpgrade(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "migration21-reply-supersession.db")
 	pendingAssuranceID, pendingOtherID, deliveredAssuranceID, gapID := seedMigration21ReplySupersessionFixture(t, path)
 
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatalf("open upgraded store: %v", err)
 	}

@@ -113,7 +113,7 @@ func TestNotificationBlockedIndexUpgrade_AddsThePartialIndexAndFabricatesNothing
 	path := filepath.Join(t.TempDir(), "migration18-blocked-index.db")
 	situationID := seedMigration18BlockedIndexFixture(t, path)
 
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatalf("open upgraded store: %v", err)
 	}

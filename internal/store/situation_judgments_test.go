@@ -363,7 +363,7 @@ func TestSituationJudgmentExpirySurvivesRestartAndRemainsDue(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "judgment-restart.db")
 	now := time.Date(2026, 9, 18, 20, 10, 0, 0, time.UTC)
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,7 +377,7 @@ func TestSituationJudgmentExpirySurvivesRestartAndRemainsDue(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reopened, err := Open(ctx, path)
+	reopened, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}

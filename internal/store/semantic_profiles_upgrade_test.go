@@ -137,7 +137,7 @@ func TestSemanticProfilesUpgradeMigration21Database(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "upgrade-23.db")
 	deliveryID, situationID := seedMigration21SemanticProfilesFixture(t, path)
 
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatalf("open (apply migrations 0022/0023): %v", err)
 	}

@@ -17,7 +17,7 @@ import (
 func TestCommitObservationRunPublishesCurrentZabbixSourceDefinition(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "source-restart.db")
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestCommitObservationRunPublishesCurrentZabbixSourceDefinition(t *testing.T
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
-	st, err = Open(ctx, path)
+	st, err = openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}

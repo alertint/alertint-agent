@@ -177,7 +177,7 @@ func TestIncidentTriageSurvivesRestart(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "triage.db")
 
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestIncidentTriageSurvivesRestart(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	reopened, err := Open(ctx, path)
+	reopened, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}

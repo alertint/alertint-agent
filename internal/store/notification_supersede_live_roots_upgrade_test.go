@@ -109,7 +109,7 @@ func TestNotificationSupersedeLiveRootsUpgrade(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "upgrade-20.db")
 	blockedRootID, deliveredRootID := seedMigration19SupersedeFixture(t, path)
 
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatalf("open (apply migration 0020): %v", err)
 	}
@@ -203,7 +203,7 @@ func TestNotificationUpgradeCoalescesOlderBlockedRootBeforeClaims(t *testing.T) 
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}

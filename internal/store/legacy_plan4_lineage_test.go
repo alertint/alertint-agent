@@ -23,7 +23,7 @@ func TestLegacyPlan4LineageRefusedBeforeMigration(t *testing.T) {
 	if _, err := db.ExecContext(ctx, `CREATE TABLE situation_preparation_cycles(id TEXT); CREATE TABLE notification_intents(id TEXT); CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT); INSERT INTO schema_migrations VALUES(22,'legacy');`); err != nil {
 		t.Fatal(err)
 	}
-	_, err = Open(ctx, path)
+	_, err = openTestStoreWithMigrations(ctx, path)
 	if err == nil || !strings.Contains(err.Error(), "unsupported pre-release Plan 4") {
 		t.Fatalf("Open error=%v", err)
 	}

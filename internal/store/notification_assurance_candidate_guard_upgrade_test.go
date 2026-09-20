@@ -229,7 +229,7 @@ func TestAssuranceCandidateGuardUpgrade(t *testing.T) {
 	}
 
 	// ---- upgrade ----
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatalf("open upgraded store: %v", err)
 	}

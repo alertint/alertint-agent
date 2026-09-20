@@ -84,7 +84,7 @@ func TestConsolidationPreservesPopulatedOperatorDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		st, err := Open(ctx, path)
+		st, err := openTestStoreWithMigrations(ctx, path)
 		if err != nil {
 			t.Fatal(err)
 		}
