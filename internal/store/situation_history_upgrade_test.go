@@ -129,7 +129,7 @@ func TestSituationHistoryUpgrade_CreatesStrictTablesAndBumpsSchemaVersion(t *tes
 	path := filepath.Join(t.TempDir(), "migration16-history.db")
 	nonterminalID, terminalID := seedMigration16HistoryFixture(t, path)
 
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatalf("open upgraded store: %v", err)
 	}
@@ -172,7 +172,7 @@ func TestSituationHistoryUpgrade_ExistingSituationsRemainReadableWithZeroHistory
 	path := filepath.Join(t.TempDir(), "migration16-history-readable.db")
 	nonterminalID, terminalID := seedMigration16HistoryFixture(t, path)
 
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatalf("open upgraded store: %v", err)
 	}

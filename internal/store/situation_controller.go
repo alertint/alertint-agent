@@ -162,6 +162,10 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 	if err != nil {
 		return situation.SnapshotInput{}, err
 	}
+	expectedHeads, err := listExpectedBehaviorHeadsTx(ctx, tx, ExpectedBehaviorListFilter{GroupKey: sit.GroupKey, IncludeInactive: true}, 100)
+	if err != nil {
+		return situation.SnapshotInput{}, err
+	}
 
 	if err := tx.Commit(); err != nil {
 		return situation.SnapshotInput{}, fmt.Errorf("store: commit load reconciliation input: %w", err)
@@ -188,6 +192,7 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 		PendingArtifacts:            artifacts,
 		DeliveredHistory:            deliveredHistory,
 		Prepared:                    prepared,
+		ExpectedBehaviorHeads:       expectedHeads,
 	}
 	if hasJudgment {
 		in.Judgment = &judgment
@@ -195,6 +200,10 @@ func (s *Store) LoadReconciliationInput(ctx context.Context, claim situation.Cla
 		if judgmentInvalidated {
 			in.JudgmentApplicability = situationmodel.JudgmentApplicability{Reason: judgmentInvalidation}
 		}
+	}
+	if len(expectedHeads) > 0 && !sit.Lifecycle.Terminal() {
+		evaluation := situation.EvaluateExpectedBehaviors(expectedBehaviorInputFromSnapshot(in, expectedHeads))
+		in.ExpectedBehavior = &evaluation
 	}
 	return in, nil
 }
@@ -409,7 +418,7 @@ func loadSituationDeliveriesTx(ctx context.Context, tx *sql.Tx, situationID stri
 	rows, err := tx.QueryContext(ctx, `
 		SELECT ad.id, iad.incident_id, ad.alert_id, ad.status, ad.payload_digest,
 		       ad.source_started_at, ad.started_at_basis, ad.source_resolved_at, ad.resolved_at_basis, ad.received_at,
-		       ad.labels_json, ad.source, ad.source_episode_key, ad.source_signal_id, ad.source_signal_version,
+		       ad.labels_json, ad.source, ad.source_episode_key, ad.source_instance_id, ad.source_signal_id, ad.source_signal_version,
 		       ad.acquisition_mode, ad.poll_interval_seconds,
                CASE WHEN json_type(ad.annotations_json, '$.summary') = 'text' AND trim(json_extract(ad.annotations_json, '$.summary')) <> ''
                     THEN substr(json_extract(ad.annotations_json, '$.summary'), 1, 501)
@@ -429,15 +438,18 @@ func loadSituationDeliveriesTx(ctx context.Context, tx *sql.Tx, situationID stri
 	for rows.Next() {
 		var d situation.Delivery
 		var status, startedBasis, resolvedBasis, receivedAtStr, labelsJSON string
-		var sourceStarted, sourceResolved, signalID, signalVersion sql.NullString
+		var sourceStarted, sourceResolved, sourceInstanceID, signalID, signalVersion sql.NullString
 		if err := rows.Scan(&d.ID, &d.IncidentID, &d.AlertID, &status, &d.PayloadDigest,
 			&sourceStarted, &startedBasis, &sourceResolved, &resolvedBasis, &receivedAtStr,
-			&labelsJSON, &d.Source, &d.EpisodeKey, &signalID, &signalVersion,
+			&labelsJSON, &d.Source, &d.EpisodeKey, &sourceInstanceID, &signalID, &signalVersion,
 			&d.AcquisitionMode, &d.PollIntervalSeconds, &d.SourceSummary); err != nil {
 			return nil, fmt.Errorf("store: scan situation delivery: %w", err)
 		}
 		if signalID.Valid {
 			d.SourceSignalID = &signalID.String
+		}
+		if sourceInstanceID.Valid {
+			d.SourceInstanceID = &sourceInstanceID.String
 		}
 		if signalVersion.Valid {
 			d.SourceSignalVersion = &signalVersion.String
@@ -2062,6 +2074,8 @@ func subtractDueReasonsStore(current, consumed []situationmodel.DueReason) []sit
 // next_assessment_at to SQL min(current, commit.NextAssessmentAt); and
 // clears the lease. It never partially commits: every failure path returns
 // before calling tx.Commit, so the deferred Rollback undoes everything.
+//
+//nolint:gocyclo // the single transaction deliberately keeps all fenced controller projections atomic
 func (s *Store) CommitController(ctx context.Context, claim situation.Claim, commit situation.ControllerCommit) error {
 	if strings.TrimSpace(claim.Situation.ID) == "" || strings.TrimSpace(claim.ClaimOwner) == "" || claim.ClaimToken <= 0 {
 		return errors.New("store: commit controller requires a complete claim")
@@ -2088,6 +2102,9 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 	}
 	if err := persistSituationJudgmentInvalidationTx(ctx, tx, claim.Situation.ID, commit); err != nil {
 		return fmt.Errorf("store: persist situation judgment invalidation: %w", err)
+	}
+	if err := commitExpectedBehaviorEvaluationTx(ctx, tx, claim.Situation.ID, claim.Situation.InputVersion, commit.ExpectedBehaviorEvaluation); err != nil {
+		return err
 	}
 
 	proj, err := readCurrentControllerProjectionTx(ctx, tx, claim.Situation.ID)
@@ -2130,6 +2147,9 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 	remainingDueReasons := subtractDueReasonsStore(proj.dueReasons, claim.Situation.DueReasons)
 	if commit.JudgmentApplicable {
 		remainingDueReasons = mergeDueReason(remainingDueReasons, situationmodel.DueJudgmentBoundary)
+	}
+	if commit.ExpectedBehaviorEvaluation != nil && commit.ExpectedBehaviorEvaluation.Disposition == situationmodel.ExpectedBehaviorDispositionMatched {
+		remainingDueReasons = mergeDueReason(remainingDueReasons, situationmodel.DueEnvelopeBoundary)
 	}
 	dueReasonsJSON, err := json.Marshal(remainingDueReasons)
 	if err != nil {

@@ -735,7 +735,7 @@ func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor,
 		if err != nil {
 			return nil, nil, err
 		}
-		receivers = append(receivers, ingress.NewZabbixReceiver(st, token, wake, logger))
+		receivers = append(receivers, ingress.NewZabbixReceiverWithInstance(st, token, cfg.Zabbix.InstanceID, wake, logger))
 	}
 
 	if len(receivers) == 0 {
@@ -1041,6 +1041,7 @@ func newZabbixClient(cfg *config.Config, logger *slog.Logger) (*zabbix.Client, e
 	client := zabbix.NewClient(zabbix.Config{
 		BaseURL:              cfg.Zabbix.API.BaseURL,
 		APIToken:             token,
+		InstanceID:           cfg.Zabbix.InstanceID,
 		TimeoutSeconds:       cfg.Zabbix.API.TimeoutSeconds,
 		HistoryRetentionDays: cfg.Zabbix.API.HistoryRetentionDays,
 		FlapWindowHours:      cfg.Zabbix.API.FlapWindowHours,

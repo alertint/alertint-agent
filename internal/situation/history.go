@@ -88,6 +88,7 @@ type AuthoritativeChange struct {
 	Now                         time.Time
 	Judgment                    *model.SituationJudgment
 	JudgmentApplicabilityReason model.JudgmentApplicabilityReason
+	ExpectedBehaviorEvaluation  *model.ExpectedBehaviorEvaluation
 }
 
 // OperatorArtifactInput is one applied-and-unjournaled durable operator
@@ -166,9 +167,12 @@ func BuildTransitions(change AuthoritativeChange) ([]model.Transition, error) {
 		out = append(out, tr)
 	}
 
-	if reason, material := selectControllerReason(change); material {
+	if reason, material := selectControllerReason(change); material { //nolint:nestif // one material transition assembles its journal and effects together.
 		out = append(out, controllerTransition(change, reason, base+1+len(out)))
 		if reason != model.ReasonOperatorContractChanged {
+			if _, _, changed := expectedBehaviorJournal(change); changed {
+				out = append(out, expectedBehaviorTransition(change, base+1+len(out)))
+			}
 			if _, _, changed := expectedJudgmentJournal(change); changed {
 				out = append(out, judgmentTransition(change, base+1+len(out)))
 			}
@@ -323,6 +327,10 @@ func controllerTransition(change AuthoritativeChange, reason model.TransitionRea
 		tr.Journal = journal
 		tr.Actor = actor
 	}
+	if journal, actor, ok := expectedBehaviorJournal(change); ok && reason == model.ReasonOperatorContractChanged {
+		tr.Journal = journal
+		tr.Actor = actor
+	}
 	tr.Projection.OperatorDelta = buildOperatorDelta(change.PriorTransition, tr)
 	if class := ClassifyPoke(change.PriorTransition, tr); class != PokeNone {
 		priority := DeriveInterruptionPriority(tr)
@@ -341,6 +349,15 @@ func judgmentTransition(change AuthoritativeChange, sequence int) model.Transiti
 		priority := DeriveInterruptionPriority(tr)
 		tr.InterruptionPriority = &priority
 	}
+	return tr
+}
+
+func expectedBehaviorTransition(change AuthoritativeChange, sequence int) model.Transition {
+	journal, actor, _ := expectedBehaviorJournal(change)
+	tr := newTransition(change, sequence, model.ReasonOperatorContractChanged, "",
+		model.JournalOperatorContractChanged, journal, controllerEvidenceRefs(change))
+	tr.Actor = actor
+	tr.Projection.OperatorDelta = buildOperatorDelta(change.PriorTransition, tr)
 	return tr
 }
 
@@ -604,6 +621,7 @@ func selectControllerReason(change AuthoritativeChange) (model.TransitionReason,
 	previous := priorTuple(change)
 	triage := triageStateChanged(change)
 	judgmentChanged := expectedJudgmentProjectionChanged(prior.Projection.Briefing, change.Projection.Briefing)
+	expectedBehaviorChanged := expectedBehaviorProjectionChanged(prior.Projection.Briefing, change.Projection.Briefing)
 	if canonicalDigest(current) == canonicalDigest(previous) && !triage && !operatorBriefingChanged(prior.Projection.Briefing, change.Projection.Briefing) {
 		return "", false
 	}
@@ -628,7 +646,7 @@ func selectControllerReason(change AuthoritativeChange) (model.TransitionReason,
 		return model.ReasonInvestigationStarted, true
 	case current.Attention != previous.Attention:
 		return model.ReasonAttentionChanged, true
-	case judgmentChanged:
+	case judgmentChanged || expectedBehaviorChanged:
 		return model.ReasonOperatorContractChanged, true
 	case current.Contract != previous.Contract:
 		return model.ReasonOperatorContractChanged, true
@@ -651,6 +669,86 @@ func expectedJudgmentProjectionChanged(prior, current *model.OperatorBriefing) b
 		b = current.ExpectedJudgment
 	}
 	return canonicalDigest(a) != canonicalDigest(b)
+}
+
+func expectedBehaviorProjectionChanged(prior, current *model.OperatorBriefing) bool {
+	var a, b *model.ExpectedBehaviorProjection
+	if prior != nil {
+		a = prior.ExpectedBehavior
+	}
+	if current != nil {
+		b = current.ExpectedBehavior
+	}
+	return canonicalDigest(a) != canonicalDigest(b)
+}
+
+func expectedBehaviorJournal(change AuthoritativeChange) (model.JournalData, model.TransitionActor, bool) {
+	if change.PriorTransition == nil || !expectedBehaviorProjectionChanged(change.PriorTransition.Projection.Briefing, change.Projection.Briefing) {
+		return model.JournalData{}, "", false
+	}
+	var prior, current *model.ExpectedBehaviorProjection
+	if change.PriorTransition.Projection.Briefing != nil {
+		prior = change.PriorTransition.Projection.Briefing.ExpectedBehavior
+	}
+	if change.Projection.Briefing != nil {
+		current = change.Projection.Briefing.ExpectedBehavior
+	}
+	j := model.JournalData{OccurredAt: change.Now, ActionStatus: contractActionStatus(change.Assessment.ActionContract)}
+	actor := model.ActorDeterministicController
+	if current != nil {
+		j.AttributedActor = current.AssertedOperator
+		j.ExpectedBehaviorReason = current.Reason
+		j.ExpectedBehaviorBoundary = current.Boundary
+	}
+	if current != nil && current.Disposition == model.ExpectedBehaviorDispositionMatched {
+		switch {
+		case prior == nil:
+			j.ExpectedBehaviorChange, j.Headline = model.ExpectedBehaviorChangeApplied, "Expected schedule applied"
+		case prior.Disposition != model.ExpectedBehaviorDispositionMatched:
+			j.ExpectedBehaviorChange, j.Headline = model.ExpectedBehaviorChangeRestored, "Expected schedule restored"
+		default:
+			j.ExpectedBehaviorChange, j.Headline = model.ExpectedBehaviorChangeUpdated, "Expected schedule updated"
+		}
+		j.Detail = "Monitoring continues."
+		return j, actor, true
+	}
+	if prior == nil {
+		return model.JournalData{}, "", false
+	}
+	if current != nil && current.Reason == model.ExpectedBehaviorReasonRevoked {
+		j.ExpectedBehaviorChange, j.Headline = model.ExpectedBehaviorChangeWithdrawn, "Expected schedule withdrawn"
+		j.AttributedActor = current.AssertedOperator
+		actor = model.ActorAttributedOperator
+	} else {
+		j.ExpectedBehaviorChange, j.Headline = model.ExpectedBehaviorChangeStopped, "Expected schedule no longer applies"
+		j.Detail = expectedBehaviorReasonDetail(j.ExpectedBehaviorReason)
+	}
+	return j, actor, true
+}
+
+func expectedBehaviorReasonDetail(reason model.ExpectedBehaviorReason) string {
+	switch reason { //nolint:exhaustive // unmatched codes use the safe generic explanation below.
+	case model.ExpectedBehaviorReasonPrimaryDefinitionChanged, model.ExpectedBehaviorReasonBindingDefinitionChanged:
+		return "The Zabbix rule changed."
+	case model.ExpectedBehaviorReasonDefinitionUnavailable, model.ExpectedBehaviorReasonObservationUnavailable, model.ExpectedBehaviorReasonBudgetDeferred:
+		return "AlertINT cannot verify the Zabbix rule."
+	case model.ExpectedBehaviorReasonOutsideSchedule, model.ExpectedBehaviorReasonStartOutsideTolerance:
+		return "The condition is outside the scheduled time."
+	case model.ExpectedBehaviorReasonDurationExceeded:
+		return "The condition ran longer than the schedule allows."
+	case model.ExpectedBehaviorReasonRequiredMissing:
+		return "A required companion condition is missing."
+	case model.ExpectedBehaviorReasonUnexpectedSymptom:
+		return "An unexpected alert is firing."
+	case model.ExpectedBehaviorReasonForbiddenPresent:
+		return "A forbidden condition is firing."
+	case model.ExpectedBehaviorReasonUrgent:
+		return "The Situation is critical or requires urgent attention."
+	case model.ExpectedBehaviorReasonInvalidated:
+		return "The schedule was invalidated by a source change."
+	default:
+		return "The current condition no longer matches the schedule."
+	}
 }
 
 func expectedJudgmentJournal(change AuthoritativeChange) (model.JournalData, model.TransitionActor, bool) {
@@ -684,7 +782,7 @@ func expectedJudgmentJournal(change AuthoritativeChange) (model.JournalData, mod
 	if prior != nil {
 		j.JudgmentValidUntil = &prior.ValidUntil
 	}
-	if prior != nil && change.Judgment != nil && change.Judgment.Operation == model.JudgmentOperationRevoke && change.Judgment.Revision > prior.Revision {
+	if prior != nil && change.Judgment != nil && change.Judgment.Operation == model.JudgmentOperationRevoke && change.Judgment.Revision > prior.Revision { //nolint:gocritic // ordered judgment precedence is clearer as the existing if/else chain
 		j.JudgmentChange, j.Headline = model.JudgmentChangeRevoked, "Expected-until decision ended"
 		j.AttributedActor = change.Judgment.AssertedOperator
 		j.JudgmentValidUntil = nil
@@ -719,10 +817,14 @@ func expectedJudgmentInvalidationDetail(change AuthoritativeChange) string {
 		return "The assessed impact changed."
 	case model.JudgmentSourceSignatureChanged:
 		return "The source identity or version changed."
+	case model.JudgmentSourceDefinitionUnavailable:
+		return "AlertINT can no longer verify the source rule definition."
 	case model.JudgmentEvidenceMissing:
 		return "The evidence needed to keep the decision active is no longer available."
 	case model.JudgmentSituationTerminal:
 		return "The Situation ended."
+	case model.JudgmentApplicable, model.JudgmentExpired, model.JudgmentRevoked:
+		return "The current condition changed."
 	default:
 		return "The current condition changed."
 	}

@@ -1289,7 +1289,7 @@ func TestNotificationReactivationRetiresAnOlderBlockedRootBehindADeliveredOne(t 
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "reactivate-delivered.db")
 	blockedRootID, deliveredRootID := seedMigration19SupersedeFixture(t, path)
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}

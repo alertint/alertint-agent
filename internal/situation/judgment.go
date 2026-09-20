@@ -23,6 +23,12 @@ func DeriveExpectedJudgmentCoverage(in SnapshotInput) (model.ExpectedJudgmentCov
 		return model.ExpectedJudgmentCoverage{}, errors.New("situation: expected judgment requires a current assessment")
 	}
 	latest := latestDeliveryPerAlert(in.Deliveries)
+	definitions := make(map[string]observationDefinition)
+	for _, definition := range in.Prepared.SourceDefinitions {
+		definitions[sourceDefinitionKey(definition.InstanceID, definition.RuleID)] = observationDefinition{
+			available: definition.Available, instanceID: definition.InstanceID, version: definition.Version,
+		}
+	}
 	covered := make([]model.ExpectedJudgmentSymptom, 0, len(latest))
 	for _, d := range latest {
 		if d.Status != model.DeliveryStatusFiring {
@@ -35,11 +41,18 @@ func DeriveExpectedJudgmentCoverage(in SnapshotInput) (model.ExpectedJudgmentCov
 			}
 			labels[k] = v
 		}
-		covered = append(covered, model.ExpectedJudgmentSymptom{
+		symptom := model.ExpectedJudgmentSymptom{
 			AlertID: d.AlertID, Source: d.Source, EpisodeKey: d.EpisodeKey,
 			SourceSignalID: cloneString(d.SourceSignalID), SourceSignalVersion: cloneString(d.SourceSignalVersion),
-			Severity: d.Severity, IdentityLabels: labels,
-		})
+			SourceInstanceID: cloneString(d.SourceInstanceID), Severity: d.Severity, IdentityLabels: labels,
+		}
+		if d.Source == "zabbix" && d.SourceInstanceID != nil {
+			if definition, ok := definitions[sourceDefinitionKey(*d.SourceInstanceID, d.Labels["zabbix_trigger_id"])]; ok && definition.available {
+				symptom.ObservedSourceInstanceID = stringPtr(definition.instanceID)
+				symptom.ObservedSourceConfigVersion = stringPtr(definition.version)
+			}
+		}
+		covered = append(covered, symptom)
 	}
 	if len(covered) == 0 {
 		return model.ExpectedJudgmentCoverage{}, errors.New("situation: expected judgment requires at least one firing symptom")
@@ -54,6 +67,21 @@ func DeriveExpectedJudgmentCoverage(in SnapshotInput) (model.ExpectedJudgmentCov
 		Scope: in.Situation.GroupKey, Impact: in.CurrentAssessment.Assessment.Impact,
 		Symptoms: covered, EvidenceRefs: refs,
 	}, nil
+}
+
+type observationDefinition struct {
+	available  bool
+	instanceID string
+	version    string
+}
+
+func sourceDefinitionKey(instanceID, ruleID string) string { return instanceID + "\x00" + ruleID }
+
+func stringPtr(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
 }
 
 func cloneString(in *string) *string {
@@ -107,7 +135,16 @@ func EvaluateExpectedJudgment(j model.SituationJudgment, in SnapshotInput, now t
 		}
 		if cur.Source != covered.Source || cur.EpisodeKey != covered.EpisodeKey ||
 			!equalStringPtr(cur.SourceSignalID, covered.SourceSignalID) ||
-			!equalStringPtr(cur.SourceSignalVersion, covered.SourceSignalVersion) {
+			!equalStringPtr(cur.SourceSignalVersion, covered.SourceSignalVersion) ||
+			!equalStringPtr(cur.SourceInstanceID, covered.SourceInstanceID) {
+			return result(model.JudgmentSourceSignatureChanged)
+		}
+		if (covered.ObservedSourceInstanceID != nil || covered.ObservedSourceConfigVersion != nil) &&
+			(cur.ObservedSourceInstanceID == nil || cur.ObservedSourceConfigVersion == nil) {
+			return result(model.JudgmentSourceDefinitionUnavailable)
+		}
+		if !equalStringPtr(cur.ObservedSourceInstanceID, covered.ObservedSourceInstanceID) ||
+			!equalStringPtr(cur.ObservedSourceConfigVersion, covered.ObservedSourceConfigVersion) {
 			return result(model.JudgmentSourceSignatureChanged)
 		}
 	}

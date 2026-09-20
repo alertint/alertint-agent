@@ -173,7 +173,7 @@ func TestNotificationReplySupersessionUpgrade(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "migration21-reply-supersession.db")
 	pendingAssuranceID, pendingOtherID, deliveredAssuranceID, gapID := seedMigration21ReplySupersessionFixture(t, path)
 
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatalf("open upgraded store: %v", err)
 	}
@@ -190,8 +190,8 @@ func TestNotificationReplySupersessionUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	if got != 31 {
-		t.Fatalf("MaxSchemaVersion = %d, want 31", got)
+	if got != 35 {
+		t.Fatalf("MaxSchemaVersion = %d, want 35", got)
 	}
 
 	assertNoForeignKeyViolations(ctx, t, st)

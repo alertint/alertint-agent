@@ -20,7 +20,7 @@ import (
 func TestControllerBudgetDeferralResumesWithoutSpendingAttempts(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "budget-resume.db")
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func TestControllerBudgetDeferralResumesWithoutSpendingAttempts(t *testing.T) {
 			if err := st.Close(); err != nil {
 				t.Fatal(err)
 			}
-			st, err = Open(ctx, path)
+			st, err = openTestStoreWithMigrations(ctx, path)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -127,7 +127,7 @@ func (c *budgetGuardAssessmentClient) CompleteOnce(ctx context.Context, _ string
 func TestControllerBudgetUnknownUsageRequiresManualRecovery(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "budget-unknown.db")
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +157,7 @@ func TestControllerBudgetUnknownUsageRequiresManualRecovery(t *testing.T) {
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
-	st, err = Open(ctx, path)
+	st, err = openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}

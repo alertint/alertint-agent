@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
@@ -47,6 +48,47 @@ func TestExpectedJudgmentApplicabilityIgnoresUnchangedTelemetryRepeats(t *testin
 	got := EvaluateExpectedJudgment(judgment, in, in.Now.Add(2*time.Minute))
 	if !got.Applicable || got.Reason != model.JudgmentApplicable {
 		t.Fatalf("applicability = %+v, want applicable unchanged repeat", got)
+	}
+}
+
+func TestExpectedJudgmentApplicabilityTracksCurrentZabbixRuleVersion(t *testing.T) {
+	in, _ := expectedJudgmentFixture(t)
+	in.Deliveries[0].Source = "zabbix"
+	in.Deliveries[0].SourceInstanceID = stringPtrOf("prod-zbx")
+	in.Deliveries[0].Labels["zabbix_trigger_id"] = "18422"
+	in.Prepared.SourceDefinitions = []observationmodel.SourceDefinitionObservation{{
+		Source: "zabbix", InstanceID: "prod-zbx", RuleID: "18422", Available: true,
+		VersionAlgorithm: "zabbix-trigger-effective-v1", Version: "sha256:v1",
+	}}
+	coverage, err := DeriveExpectedJudgmentCoverage(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	judgment := model.SituationJudgment{State: model.JudgmentStateExpected, ValidUntil: in.Now.Add(time.Hour), Coverage: coverage}
+
+	repeat := in
+	repeat.Deliveries = append([]Delivery(nil), in.Deliveries...)
+	repeat.Deliveries[0].ID = "repeat-delivery"
+	if got := EvaluateExpectedJudgment(judgment, repeat, in.Now); !got.Applicable {
+		t.Fatalf("unchanged current rule version = %+v, want applicable", got)
+	}
+
+	changed := in
+	changed.Prepared.SourceDefinitions = []observationmodel.SourceDefinitionObservation{{
+		Source: "zabbix", InstanceID: "prod-zbx", RuleID: "18422", Available: true,
+		VersionAlgorithm: "zabbix-trigger-effective-v1", Version: "sha256:v2",
+	}}
+	if got := EvaluateExpectedJudgment(judgment, changed, in.Now); got.Applicable || got.Reason != model.JudgmentSourceSignatureChanged {
+		t.Fatalf("changed current rule version = %+v, want source_signature_changed", got)
+	}
+
+	unavailable := in
+	unavailable.Prepared.SourceDefinitions = []observationmodel.SourceDefinitionObservation{{
+		Source: "zabbix", InstanceID: "prod-zbx", RuleID: "18422", Available: false,
+		UnavailableReason: "api_unavailable",
+	}}
+	if got := EvaluateExpectedJudgment(judgment, unavailable, in.Now); got.Applicable || got.Reason != model.JudgmentSourceDefinitionUnavailable {
+		t.Fatalf("unavailable current rule version = %+v, want source_definition_unavailable", got)
 	}
 }
 

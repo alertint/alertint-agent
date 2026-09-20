@@ -9,16 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Zabbix installations and trigger rules can carry stable source identity and
+  bounded current configuration-version evidence into Situation preparation
+  and MCP. Missing, expired, unsupported, or inconsistent evidence stays
+  explicitly unavailable, and material rule changes invalidate covered
+  expectedness without changing lifecycle.
 - Operators can mark a Situation's current non-critical condition as expected
   until a set time, replace, withdraw, or restore that decision through MCP,
   and see the decision and any reason it ended in Slack.
+- Operators can promote an active expected-until decision into a reusable
+  Zabbix expected schedule. Exact installation, host, trigger-version,
+  schedule, duration, and companion-signal checks determine each match;
+  MCP owns confirmation, revision, withdrawal, restoration, review, usage,
+  and history while Slack shows only the schedule's effect on a Situation.
 - Optional shared LLM call and cumulative token limits, persisted across
   restarts and enforced before generation requests, including retries.
   Both limits default to unlimited; see the configuration guide for accounting
   and recovery semantics.
 
+### Changed
+
+- The default Situation preparation request budget increases from six to eight
+  physical source calls per cycle, allowing the bounded Zabbix rule and problem
+  reads to run alongside the largest protected investigation.
+- Configured Zabbix installation identities now namespace delivery and alert
+  fingerprints as `zabbix:<instance_id>:<event_id>`. Installations without an
+  `instance_id` retain the legacy `zabbix:<event_id>` identity.
+
 ### Fixed
 
+- Situation Slack roots keep completed-analysis timing and token usage in the
+  analysis thread, and distinguish an unavailable source rule definition from
+  a rule whose identity or version changed.
 - Situation assessments carry the prior semantic judgment into the prompt and
   no longer let the static capability-limitation set churn the material fact
   hash, so unchanged evidence reuses the existing assessment instead of

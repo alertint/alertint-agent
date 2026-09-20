@@ -83,7 +83,7 @@ func migration12Fixture(t *testing.T) string {
 func TestSituationFoundationUpgradesMigration12Database(t *testing.T) {
 	ctx := context.Background()
 	path := migration12Fixture(t)
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}

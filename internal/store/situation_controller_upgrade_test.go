@@ -95,7 +95,7 @@ func migration14Fixture(t *testing.T) string {
 func TestSituationControllerSchemaUpgradesMigration14Database(t *testing.T) {
 	ctx := context.Background()
 	path := migration14Fixture(t)
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}

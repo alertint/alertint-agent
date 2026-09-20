@@ -86,10 +86,8 @@ func TestTransitionRelatedEnumsValidate(t *testing.T) {
 	}
 }
 
-// TestTransitionActorValidate proves Plan 3 accepts exactly
-// deterministic_controller, llm, and attributed_operator, and rejects
-// operator_policy even though it is a defined TransitionActor constant
-// (reserved for Plan 5; spec.md "Domain model").
+// TestTransitionActorValidate proves the closed actor vocabulary. Reusable
+// policies retain their explicitly attributed operator within this model.
 func TestTransitionActorValidate(t *testing.T) {
 	for _, a := range []TransitionActor{ActorDeterministicController, ActorLLM, ActorAttributedOperator} {
 		if err := a.Validate(); err != nil {
@@ -97,7 +95,7 @@ func TestTransitionActorValidate(t *testing.T) {
 		}
 	}
 	if err := ActorOperatorPolicy.Validate(); err == nil {
-		t.Error("operator_policy: want error in Plan 3, got nil")
+		t.Error("operator_policy: want error for the parked actor, got nil")
 	}
 	if err := TransitionActor("bogus").Validate(); err == nil {
 		t.Error("bogus actor: want error, got nil")

@@ -109,7 +109,7 @@ func TestNotificationSupersedeLiveRootsUpgrade(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "upgrade-20.db")
 	blockedRootID, deliveredRootID := seedMigration19SupersedeFixture(t, path)
 
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatalf("open (apply migration 0020): %v", err)
 	}
@@ -119,12 +119,12 @@ func TestNotificationSupersedeLiveRootsUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	if got != 31 {
-		t.Fatalf("MaxSchemaVersion = %d, want 31", got)
+	if got != 35 {
+		t.Fatalf("MaxSchemaVersion = %d, want 35", got)
 	}
 	var version int
-	if err := st.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 31 {
-		t.Fatalf("applied schema version = %d (err=%v), want 31", version, err)
+	if err := st.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 35 {
+		t.Fatalf("applied schema version = %d (err=%v), want 35", version, err)
 	}
 	var fkViolations int
 	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_foreign_key_check`).Scan(&fkViolations); err != nil || fkViolations != 0 {
@@ -203,7 +203,7 @@ func TestNotificationUpgradeCoalescesOlderBlockedRootBeforeClaims(t *testing.T) 
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}

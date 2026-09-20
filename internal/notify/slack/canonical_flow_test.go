@@ -45,7 +45,7 @@ func TestCanonicalRootShowsExpectedJudgmentAfterFinding(t *testing.T) {
 	statusAt := strings.Index(msg.Text, "Observed · Correlating")
 	findingAt := strings.Index(msg.Text, "*Finding:*")
 	operatorAt := strings.Index(msg.Text, "*Operator:*")
-	if !(titleAt >= 0 && titleAt < statusAt && statusAt < findingAt && findingAt < operatorAt) {
+	if titleAt < 0 || titleAt >= statusAt || statusAt >= findingAt || findingAt >= operatorAt {
 		t.Fatalf("root order title=%d status=%d finding=%d operator=%d:\n%s", titleAt, statusAt, findingAt, operatorAt, msg.Text)
 	}
 }
@@ -138,6 +138,20 @@ func TestExpectedJudgmentThreadExplainsWhyDecisionEnded(t *testing.T) {
 				t.Fatalf("thread = %q, want %q", msg.Text, tc.want)
 			}
 		})
+	}
+}
+
+func TestExpectedJudgmentThreadExplainsUnavailableSourceDefinition(t *testing.T) {
+	tr := bcJournal(t, bcObserveMonitorContract(bcNow(t)), canonicalFixture(t), nil)
+	tr.Journal.JudgmentChange = model.JudgmentChangeInvalidated
+	tr.Journal.Detail = "AlertINT can no longer verify the source rule definition."
+	msg, err := RenderSituationJournal(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "The expected-until decision no longer applies because AlertINT can no longer verify the source rule definition. Normal assessment resumes."
+	if !strings.Contains(msg.Text, want) {
+		t.Fatalf("thread = %q, want %q", msg.Text, want)
 	}
 }
 

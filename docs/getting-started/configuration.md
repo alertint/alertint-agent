@@ -107,6 +107,7 @@ pull source (read-only context enrichment + `zabbix_metric_history` /
 
 | Field | Type | Default | Description |
 |---|---|---|---|
+| `instance_id` | string | — | Stable non-secret installation ID shared by ingress and API, up to 64 letters, digits, `.`, `_`, or `-`. Required for trusted rule-version observations; changing it creates a different source identity. Existing rows remain unknown. |
 | `ingress.enabled` | bool | `false` | Mount `POST /webhook/zabbix` on `receivers.address` |
 | `ingress.webhook_token_env` | string | — | **Required when `ingress.enabled`.** Env var name holding the Zabbix webhook bearer token |
 | `api.enabled` | bool | auto | Fetch the Zabbix context at triage time and register the two `zabbix_*` MCP tools. Omitted = **on automatically** when `api.base_url` is set; set `false` to force off. |
@@ -280,7 +281,7 @@ A released binary built from `main` does not read this section at all.
 | `retry.max_seconds` | int | `300` | Ceiling of the controller's transient-failure retry backoff. |
 | `retry.jitter_percent` | int | `20` | Jitter fraction (±) applied to the computed backoff, so concurrently-parked Situations don't all retry in lockstep. |
 | `slack.repage_cooldown_seconds` | int | `900` | How long a *materially changed required action* must wait after a delivered main-channel interruption before it may create another one. It gates exactly that one case: a first publication, newly crossed criticality, newly urgent attention, and an operator hand-off all bypass it, because a cooldown must never swallow an escalation. |
-| `preparation.max_source_calls_per_cycle` | int | `6` | Physical connector requests (store, Prometheus, Zabbix, Loki, Sentry, changes) one preparation cycle may spend, including retries and secondary lookups. Accepts 1-32. |
+| `preparation.max_source_calls_per_cycle` | int | `8` | Physical connector requests (store, Prometheus, Zabbix, Loki, Sentry, changes) one preparation cycle may spend, including retries and secondary lookups. Eight lets the bounded six-request Zabbix rule/history read fit beside the largest protected two-request investigation. Accepts 1-32. |
 | `preparation.max_wall_seconds` | int | `20` | Wall-clock budget for one preparation attempt (both lifecycle and assessment reads share it). Accepts 1-30 and must be strictly less than `attempt_wall_seconds`. |
 | `preparation.refresh_seconds` | int | `300` | Minimum re-check cadence for an unchanged subject/capability — a re-delivery or controller retry cannot bypass it. Accepts 60-3600. |
 | `semantic_profiles.workers` | int | `1` | Inference-worker goroutines polling for due advisory-profile jobs. Accepts 1-4; they share the same L0+L2 primary-LLM concurrency limiter as Assessment calls, so at most one profile inference ever runs at a time regardless of this value. |

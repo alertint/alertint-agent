@@ -147,6 +147,19 @@ func (p *productionPreparer) Prepare(ctx context.Context, req situation.Preparat
 	if err != nil {
 		return situation.PreparedState{}, fmt.Errorf("cmd/alertint: build observation plans: %w", err)
 	}
+	pendingValidations, err := p.st.ListPendingExpectedBehaviorValidations(ctx, sit.ID, sit.InputVersion, req.Now)
+	if err != nil {
+		return situation.PreparedState{}, fmt.Errorf("cmd/alertint: load expected behavior validations: %w", err)
+	}
+	plans, err = appendExpectedBehaviorValidationPlans(plans, pendingValidations, sit.GroupKey, req.Now)
+	if err != nil {
+		return situation.PreparedState{}, fmt.Errorf("cmd/alertint: plan expected behavior validation: %w", err)
+	}
+	expectedHeads, err := p.st.ListExpectedBehaviors(ctx, store.ExpectedBehaviorListFilter{GroupKey: sit.GroupKey}, 100)
+	if err != nil {
+		return situation.PreparedState{}, fmt.Errorf("cmd/alertint: load expected behavior heads: %w", err)
+	}
+	plans = appendExpectedBehaviorSchedulePlans(plans, expectedHeads, sit.GroupKey, req.Now)
 
 	// Every nonterminal reconcile freezes (or reloads) its cycle — even a
 	// phase whose plan set is entirely reuse projections — so the current
@@ -173,11 +186,126 @@ func (p *productionPreparer) Prepare(ctx context.Context, req situation.Preparat
 		p.auditRefusal(ctx, sit.ID, string(req.Phase), "run_phase", err)
 		return situation.PreparedState{}, fmt.Errorf("cmd/alertint: run preparation phase: %w", err)
 	}
+	if req.Phase == model.PhaseAssessment && len(pendingValidations) > 0 {
+		if err := p.st.CompleteExpectedBehaviorValidationsFromCycle(ctx, fence, cycle, req.Now); err != nil {
+			p.auditRefusal(ctx, sit.ID, string(req.Phase), "complete_expected_behavior_validation", err)
+			return situation.PreparedState{}, fmt.Errorf("cmd/alertint: complete expected behavior validation: %w", err)
+		}
+	}
+	if req.Phase == model.PhaseAssessment {
+		invalidated, err := p.invalidateChangedExpectedBehaviors(ctx, req.Claim, req.Now)
+		if err != nil {
+			return situation.PreparedState{}, err
+		}
+		if invalidated {
+			return situation.PreparedState{}, store.ErrSituationVersionConflict
+		}
+	}
 	p.auditAppend(ctx, "situation.preparation.phase_completed", map[string]any{
 		"situation_id": sit.ID, "cycle_id": cycle.ID, "generation": cycle.Generation, "phase": string(req.Phase),
 	})
 
 	return situation.PreparedState{CycleID: cycle.ID, Generation: cycle.Generation}, nil
+}
+
+func (p *productionPreparer) invalidateChangedExpectedBehaviors(ctx context.Context, claim situation.Claim, now time.Time) (bool, error) {
+	if p.auditor == nil {
+		return false, nil
+	}
+	in, err := p.st.LoadReconciliationInput(ctx, claim, now)
+	if err != nil || in.ExpectedBehavior == nil {
+		return false, err
+	}
+	invalidated := false
+	for _, candidate := range in.ExpectedBehavior.Candidates {
+		var reason situationmodel.ExpectedBehaviorInvalidationReason
+		switch candidate.Reason { //nolint:exhaustive // only proven definition changes permanently invalidate an envelope.
+		case situationmodel.ExpectedBehaviorReasonPrimaryDefinitionChanged:
+			reason = situationmodel.ExpectedBehaviorPrimaryDefinitionChanged
+		case situationmodel.ExpectedBehaviorReasonBindingDefinitionChanged:
+			reason = situationmodel.ExpectedBehaviorBindingDefinitionChanged
+		default:
+			continue
+		}
+		changed, err := p.st.InvalidateExpectedBehavior(ctx, p.auditor, candidate.EnvelopeID, candidate.Version, reason, map[string]any{
+			"situation_id": claim.Situation.ID, "evidence_refs": candidate.EvidenceRefs,
+		}, now)
+		if err != nil && !errors.Is(err, store.ErrExpectedBehaviorVersionConflict) && !errors.Is(err, store.ErrExpectedBehaviorStale) {
+			return invalidated, fmt.Errorf("cmd/alertint: invalidate changed expected behavior: %w", err)
+		}
+		invalidated = invalidated || changed
+	}
+	return invalidated, nil
+}
+
+const expectedBehaviorValidationPurposePrefix = "expected_behavior_validation:"
+
+func appendExpectedBehaviorValidationPlans(plans []model.Plan, validations []situationmodel.ExpectedBehaviorValidation, groupKey string, now time.Time) ([]model.Plan, error) {
+	for _, validation := range validations {
+		for _, binding := range validation.Bindings {
+			if len(plans) >= model.MaxPlansPerCycle {
+				return plans, nil
+			}
+			parameters, err := json.Marshal(map[string]any{
+				"host": binding.Host, "trigger_id": binding.TriggerID, "trigger_version": binding.TriggerVersion,
+				"source_instance_id": binding.SourceInstanceID, "fresh_for_seconds": 300,
+			})
+			if err != nil {
+				return nil, err
+			}
+			plans = append(plans, model.Plan{
+				Capability: model.CapabilityZabbixProblemState, Phase: model.PhaseAssessment,
+				Scope:      model.Scope{GroupKey: groupKey, Source: "zabbix", SubjectID: validation.ID + ":" + binding.Role},
+				Parameters: parameters, Start: now.UTC(), End: now.UTC(), EligibleAt: now.UTC(),
+				Limit: 1, MaxRequests: 6, Purpose: expectedBehaviorValidationPurposePrefix + validation.ID + ":" + binding.Role,
+				Tier: model.TierTimeSensitive, ReconsiderOn: []string{"situation_input_changed", "validation_expired"},
+			})
+		}
+	}
+	return plans, nil
+}
+
+func appendExpectedBehaviorSchedulePlans(plans []model.Plan, heads []situationmodel.ExpectedBehaviorHead, groupKey string, now time.Time) []model.Plan {
+	seen := make(map[string]bool)
+	for _, plan := range plans {
+		if plan.Capability == model.CapabilityZabbixProblemState {
+			var params map[string]any
+			if json.Unmarshal(plan.Parameters, &params) == nil {
+				seen[fmt.Sprint(params["source_instance_id"])+"\x00"+fmt.Sprint(params["host"])+"\x00"+fmt.Sprint(params["trigger_id"])] = true
+			}
+		}
+	}
+	for _, head := range heads {
+		if head.Policy == nil {
+			continue
+		}
+		bindings := append(append(append([]situationmodel.ExpectedBehaviorBinding{}, head.Policy.Conditions.RequiredCompanions...), head.Policy.Conditions.AllowedCompanions...), head.Policy.Conditions.ForbiddenSignals...)
+		for _, binding := range bindings {
+			key := binding.SourceInstanceID + "\x00" + binding.Host + "\x00" + binding.TriggerID
+			if seen[key] {
+				continue
+			}
+			if len(plans) >= model.MaxPlansPerCycle {
+				return plans
+			}
+			params, err := json.Marshal(map[string]any{
+				"host": binding.Host, "trigger_id": binding.TriggerID, "trigger_version": binding.TriggerVersion,
+				"source_instance_id": binding.SourceInstanceID, "fresh_for_seconds": 300,
+			})
+			if err != nil {
+				continue
+			}
+			plans = append(plans, model.Plan{
+				Capability: model.CapabilityZabbixProblemState, Phase: model.PhaseAssessment,
+				Scope:      model.Scope{GroupKey: groupKey, Source: "zabbix", SubjectID: "expected:" + binding.SourceInstanceID + ":" + binding.Host + ":" + binding.TriggerID},
+				Parameters: params, Start: now.UTC(), End: now.UTC(), EligibleAt: now.UTC(), Limit: 1, MaxRequests: 6,
+				Purpose: "expected_behavior_evaluation", Tier: model.TierTimeSensitive,
+				ReconsiderOn: []string{"situation_input_changed", "envelope_changed", "observation_expired"},
+			})
+			seen[key] = true
+		}
+	}
+	return plans
 }
 
 // auditRefusal records a fenced preparation write the store refused
@@ -257,7 +385,7 @@ func membersFromDeliveries(in situation.SnapshotInput, selectorKeys []string, ho
 	for _, k := range keys {
 		d := latest[k]
 		members = append(members, observation.MemberSubject{
-			SubjectID: k, Source: d.Source, Labels: d.Labels, SelectorLabels: selectorLabels(d.Labels, selectorKeys),
+			SubjectID: k, Source: d.Source, SourceInstanceID: d.SourceInstanceID, Labels: d.Labels, SelectorLabels: selectorLabels(d.Labels, selectorKeys),
 			ObservationDeadlineAt: d.ReceivedAt.UTC().Add(horizon), RecoveryGraceUntil: in.Situation.GraceUntil,
 			Firing: d.Status == situationmodel.DeliveryStatusFiring,
 		})
@@ -356,7 +484,7 @@ func capabilityDescriptorsFromConfig(cfg *config.Config) []observation.Capabilit
 		// trend read: two physical requests (review F17).
 		descs = append(descs,
 			observation.CapabilityDescriptor{Capability: model.CapabilityZabbixMetricRange, DefaultWindow: time.Hour, DefaultLimit: 100, MaxRequestsHint: 2},
-			observation.CapabilityDescriptor{Capability: model.CapabilityZabbixProblemHist, DefaultWindow: 24 * time.Hour, DefaultLimit: 20, MaxRequestsHint: 2},
+			observation.CapabilityDescriptor{Capability: model.CapabilityZabbixProblemHist, DefaultWindow: 24 * time.Hour, DefaultLimit: 20, MaxRequestsHint: 6},
 		)
 	}
 	return descs
@@ -409,7 +537,8 @@ func executorsFromClients(st *store.Store, prom *promclient.Client, lokiClient *
 	}
 	if zbxClient != nil {
 		execs[model.CapabilityZabbixMetricRange] = &connectors.ZabbixMetricExecutor{Client: zbxClient, Clock: now}
-		execs[model.CapabilityZabbixProblemHist] = &connectors.ZabbixProblemExecutor{Client: zbxClient, Clock: now}
+		execs[model.CapabilityZabbixProblemHist] = &connectors.ZabbixProblemExecutor{Client: zbxClient, SourceDefinition: zbxClient, Clock: now}
+		execs[model.CapabilityZabbixProblemState] = &connectors.ZabbixProblemStateExecutor{Client: zbxClient, SourceDefinition: zbxClient, Clock: now}
 	}
 	return execs
 }

@@ -135,7 +135,7 @@ func TestTriageUpgrade_V0134ReadyIncidentsBecomeAwaitingDecision(t *testing.T) {
 		{id: otherID, groupKey: "service=other", readyAt: now.Add(-10 * time.Minute)},
 	})
 
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatalf("open upgraded store: %v", err)
 	}
@@ -312,7 +312,7 @@ func openIncidentTriageControllerUpgradeFixture(t *testing.T) *Store {
 	}
 	seedMigration14TriageFixture(t, path, rows)
 
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatalf("open upgraded store: %v", err)
 	}

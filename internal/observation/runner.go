@@ -4,6 +4,7 @@ package observation
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -28,9 +29,32 @@ type RequestRecorder interface {
 // for every physical request the underlying connector actually makes
 // (including retries and secondary lookups). It returns a fully-formed Run
 // ready for CommitObservationRun — never partial state the runner must
-// finish assembling.
+// finish assembling. A connector that completes independent evidence before
+// a later operation fails may return that failed Run with a
+// FailedRunWithEvidenceError so the runner commits the evidence.
 type Executor interface {
 	Execute(ctx context.Context, plan model.Plan, recorder RequestRecorder) (model.Run, error)
+}
+
+// FailedRunWithEvidenceError marks a fully formed failed Run whose facts were
+// acquired independently of the operation that failed. The runner commits the
+// returned Run instead of replacing it with an empty failed result.
+type FailedRunWithEvidenceError struct {
+	Err error
+}
+
+func (e *FailedRunWithEvidenceError) Error() string {
+	if e == nil || e.Err == nil {
+		return "observation: execution failed after acquiring evidence"
+	}
+	return e.Err.Error()
+}
+
+func (e *FailedRunWithEvidenceError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
 }
 
 // PreparationStore is the narrow persistence boundary Runner depends on —
@@ -181,6 +205,10 @@ func (r *Runner) runOne(ctx, ioCtx context.Context, f model.Fence, cycle model.C
 	run, err := executor.Execute(ioCtx, p, recorder)
 	if err != nil {
 		span.SetAttributes(AttrResultClass.String(string(model.ResultFailed)))
+		var evidenceErr *FailedRunWithEvidenceError
+		if errors.As(err, &evidenceErr) {
+			return run
+		}
 		return failedRun(p, r.clock())
 	}
 	span.SetAttributes(AttrResultClass.String(string(run.Status)))

@@ -929,15 +929,24 @@ func TestGrade_RepeatCallRegrades(t *testing.T) {
 	}
 }
 
-// blockingLLM holds every completion until its ctx is canceled.
+// blockingLLM holds every completion until its ctx is canceled and, when set,
+// until release allows the canceled call to return.
 type blockingLLM struct {
-	started chan struct{}
-	once    sync.Once
+	started  chan struct{}
+	once     sync.Once
+	canceled chan struct{}
+	release  <-chan struct{}
 }
 
 func (b *blockingLLM) Complete(ctx context.Context, _ string, _ llm.Prompt, _ []string) (llm.Completion, error) {
 	b.once.Do(func() { close(b.started) })
 	<-ctx.Done()
+	if b.canceled != nil {
+		close(b.canceled)
+	}
+	if b.release != nil {
+		<-b.release
+	}
 	return llm.Completion{}, ctx.Err()
 }
 
@@ -959,7 +968,9 @@ func TestCaptureEngineCloseJoinsGrading(t *testing.T) {
 	}
 	cfg := verifyConfig(prom)
 	cfg.Health = tr
-	gradeLLM := &blockingLLM{started: make(chan struct{})}
+	canceled := make(chan struct{})
+	release := make(chan struct{})
+	gradeLLM := &blockingLLM{started: make(chan struct{}), canceled: canceled, release: release}
 	eng := acutetriage.NewCaptureEngine(acutetriage.New(cfg, st, gradeLLM, audit.New(st.DB()), notify.NewMulti(nil, &fakeAnnotationSink{}), nil))
 
 	type outcome struct {
@@ -979,18 +990,34 @@ func TestCaptureEngineCloseJoinsGrading(t *testing.T) {
 		t.Fatalf("in_flight during grading = %d, want 1: a grading call must fence the idle probe", n)
 	}
 
-	cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	if err := eng.Close(cctx); err != nil {
-		t.Fatalf("Close: %v", err)
+	closed := make(chan error, 1)
+	go func() {
+		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		closed <- eng.Close(cctx)
+	}()
+	<-canceled
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned (%v) while the canceled grade was still running", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not return once grading stopped")
 	}
 	select {
 	case o := <-got:
 		if o.err != nil || !o.res.ReplayFailed {
 			t.Fatalf("after Close: err=%v res=%+v, want a captured verdict with replay_failed", o.err, o.res)
 		}
-	default:
-		t.Fatal("Close returned while the grade was still running")
+	case <-time.After(2 * time.Second):
+		t.Fatal("capture caller did not receive the completed operation")
 	}
 	snap := tr.Snapshot()
 	if snap.InFlight != 0 || snap.LastRealSuccessAt != nil || len(snap.Capabilities) != 0 {
@@ -1107,8 +1134,8 @@ func TestCaptureEngineCloseWaitsForThePersistPhase(t *testing.T) {
 		if o.err != nil || !o.res.ReplayFailed || o.res.Version != 1 {
 			t.Fatalf("operation overlapping Close: err=%v res=%+v, want the verdict persisted (v1) and only the grade refused", o.err, o.res)
 		}
-	default:
-		t.Fatal("Close returned before the operation did")
+	case <-time.After(2 * time.Second):
+		t.Fatal("capture caller did not receive the completed operation")
 	}
 	select {
 	case <-gradeLLM.started:

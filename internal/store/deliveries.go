@@ -25,13 +25,15 @@ const (
 	SourceAcquisitionPoll    SourceAcquisitionMode = "poll"
 )
 
-// SourceProvenance binds one immutable delivery to the reusable source
-// signal whose lifecycle owns envelope authority. SignalID and SignalVersion
-// are nil unless the Receiver can prove them from the source payload itself
-// — never synthesized from an event ID, Alert fingerprint, wall clock, UUID,
-// or a generic source/schema fallback. Unavailable provenance is honest
-// durable state; it grants no envelope authority.
+// SourceProvenance binds one immutable delivery to its source installation
+// and reusable signal. InstanceID is nil unless ingress was configured with a
+// stable non-secret installation identity. SignalID and SignalVersion are nil
+// unless the Receiver can prove them from the source payload itself — never
+// synthesized from an event ID, Alert fingerprint, wall clock, UUID, or a
+// generic source/schema fallback. Unavailable provenance is honest durable
+// state; it grants no envelope authority.
 type SourceProvenance struct {
+	InstanceID          *string
 	SignalID            *string
 	SignalVersion       *string
 	GeneratorURL        string
@@ -967,18 +969,37 @@ func insertDeliveryTx(ctx context.Context, tx *sql.Tx, p preparedDelivery, a Ale
 			labels_json, annotations_json, starts_at, ends_at,
 			source_started_at, source_resolved_at, started_at_basis, resolved_at_basis,
 			receiver_grouping_identity, payload_digest,
-			source_signal_id, source_signal_version, generator_url, acquisition_mode, poll_interval_seconds,
+			source_instance_id, source_signal_id, source_signal_version, generator_url, acquisition_mode, poll_interval_seconds,
 			received_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		d.ID, a.ID, d.Source, nullableString(d.SourceEventID), d.SourceEpisodeKey, d.Alert.Status,
 		p.labelsJSON, p.annosJSON, p.startsAt, p.endsAt,
 		p.startedAt, p.resolvedAt, string(d.StartedAtBasis), string(d.ResolvedAtBasis),
 		d.ReceiverGroupingIdentity, d.PayloadDigest,
-		nullableString(d.SourceProvenance.SignalID), nullableString(d.SourceProvenance.SignalVersion),
+		nullableString(d.SourceProvenance.InstanceID), nullableString(d.SourceProvenance.SignalID), nullableString(d.SourceProvenance.SignalVersion),
 		d.SourceProvenance.GeneratorURL, string(d.SourceProvenance.AcquisitionMode), d.SourceProvenance.PollIntervalSeconds,
 		p.receivedAt,
 	)
+	// Upgrade fixtures deliberately run current code against a populated
+	// pre-0032 schema before applying this migration. Store.Open migrates
+	// first in production, but the fixture path must still seed old rows.
+	if isMissingSourceInstanceColumn(err) {
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO alert_deliveries (
+				id, alert_id, source, source_event_id, source_episode_key, status,
+				labels_json, annotations_json, starts_at, ends_at,
+				source_started_at, source_resolved_at, started_at_basis, resolved_at_basis,
+				receiver_grouping_identity, payload_digest,
+				source_signal_id, source_signal_version, generator_url, acquisition_mode, poll_interval_seconds,
+				received_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, d.ID, a.ID, d.Source, nullableString(d.SourceEventID), d.SourceEpisodeKey, d.Alert.Status,
+			p.labelsJSON, p.annosJSON, p.startsAt, p.endsAt, p.startedAt, p.resolvedAt,
+			string(d.StartedAtBasis), string(d.ResolvedAtBasis), d.ReceiverGroupingIdentity, d.PayloadDigest,
+			nullableString(d.SourceProvenance.SignalID), nullableString(d.SourceProvenance.SignalVersion),
+			d.SourceProvenance.GeneratorURL, string(d.SourceProvenance.AcquisitionMode), d.SourceProvenance.PollIntervalSeconds, p.receivedAt)
+	}
 	if err != nil {
 		return AlertDelivery{}, fmt.Errorf("store: insert alert delivery: %w", err)
 	}
@@ -1184,7 +1205,7 @@ const deliverySelect = `
 SELECT ad.id, ad.alert_id, ad.source, ad.source_event_id, ad.source_episode_key, ad.status,
        ad.labels_json, ad.annotations_json, ad.starts_at, ad.ends_at, ad.source_started_at, ad.source_resolved_at,
        ad.started_at_basis, ad.resolved_at_basis, ad.receiver_grouping_identity, ad.payload_digest,
-       ad.source_signal_id, ad.source_signal_version, ad.generator_url, ad.acquisition_mode, ad.poll_interval_seconds,
+       ad.source_instance_id, ad.source_signal_id, ad.source_signal_version, ad.generator_url, ad.acquisition_mode, ad.poll_interval_seconds,
        ad.received_at, a.fingerprint
 FROM alert_deliveries ad JOIN alerts a ON a.id = ad.alert_id`
 
@@ -1192,7 +1213,7 @@ const dispatchSelect = `
 SELECT d.delivery_id, ad.alert_id, ad.source, ad.source_event_id, ad.source_episode_key, ad.status,
        ad.labels_json, ad.annotations_json, ad.starts_at, ad.ends_at, ad.source_started_at, ad.source_resolved_at,
        ad.started_at_basis, ad.resolved_at_basis, ad.receiver_grouping_identity, ad.payload_digest,
-       ad.source_signal_id, ad.source_signal_version, ad.generator_url, ad.acquisition_mode, ad.poll_interval_seconds,
+       ad.source_instance_id, ad.source_signal_id, ad.source_signal_version, ad.generator_url, ad.acquisition_mode, ad.poll_interval_seconds,
        ad.received_at, a.fingerprint,
        d.status, d.lease_owner, d.lease_expires_at, d.claim_token, d.attempt_count, d.last_error_class, d.retry_at, d.applied_at
 FROM alert_delivery_dispatches d
@@ -1202,6 +1223,10 @@ JOIN alerts a ON a.id = ad.alert_id`
 func getDeliveryTx(ctx context.Context, tx *sql.Tx, id string) (AlertDelivery, error) {
 	row := tx.QueryRowContext(ctx, deliverySelect+` WHERE ad.id = ?`, id)
 	d, err := scanDelivery(row)
+	if isMissingSourceInstanceColumn(err) {
+		legacySelect := strings.Replace(deliverySelect, "ad.source_instance_id, ", "NULL, ", 1)
+		d, err = scanDelivery(tx.QueryRowContext(ctx, legacySelect+` WHERE ad.id = ?`, id))
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return AlertDelivery{}, ErrNotFound
 	}
@@ -1209,6 +1234,15 @@ func getDeliveryTx(ctx context.Context, tx *sql.Tx, id string) (AlertDelivery, e
 		return AlertDelivery{}, fmt.Errorf("store: read delivery: %w", err)
 	}
 	return d, nil
+}
+
+func isMissingSourceInstanceColumn(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "no such column: ad.source_instance_id") ||
+		strings.Contains(message, "no column named source_instance_id")
 }
 
 // GetAlertDeliveries returns the immutable AlertDelivery rows — each
@@ -1270,10 +1304,10 @@ func (s *Store) GetAlertDeliveries(ctx context.Context, deliveryIDs []string) ([
 // rawDeliveryFields holds the string-typed columns shared by deliverySelect
 // and dispatchSelect, scanned before being parsed/typed by hydrateDelivery.
 type rawDeliveryFields struct {
-	sourceEvent, alertEnds, sourceStarted, sourceResolved, signalID, signalVersion sql.NullString
-	status, labels, annotations, startsAt, startedBasis, resolvedBasis             string
-	generatorURL, acquisitionMode, receivedAt                                      string
-	pollInterval                                                                   int
+	sourceEvent, alertEnds, sourceStarted, sourceResolved, instanceID, signalID, signalVersion sql.NullString
+	status, labels, annotations, startsAt, startedBasis, resolvedBasis                         string
+	generatorURL, acquisitionMode, receivedAt                                                  string
+	pollInterval                                                                               int
 }
 
 // deliveryScanDest returns the Scan destinations for the deliverySelect
@@ -1284,7 +1318,7 @@ func deliveryScanDest(dest *AlertDelivery, r *rawDeliveryFields) []any {
 		&dest.ID, &dest.Alert.ID, &dest.Source, &r.sourceEvent, &dest.SourceEpisodeKey, &r.status,
 		&r.labels, &r.annotations, &r.startsAt, &r.alertEnds, &r.sourceStarted, &r.sourceResolved,
 		&r.startedBasis, &r.resolvedBasis, &dest.ReceiverGroupingIdentity, &dest.PayloadDigest,
-		&r.signalID, &r.signalVersion, &r.generatorURL, &r.acquisitionMode, &r.pollInterval,
+		&r.instanceID, &r.signalID, &r.signalVersion, &r.generatorURL, &r.acquisitionMode, &r.pollInterval,
 		&r.receivedAt, &dest.Alert.Fingerprint,
 	}
 }
@@ -1322,6 +1356,7 @@ func hydrateDelivery(d *AlertDelivery, r rawDeliveryFields) error {
 	d.StartedAtBasis = situationmodel.SourceTimeBasis(r.startedBasis)
 	d.ResolvedAtBasis = situationmodel.SourceTimeBasis(r.resolvedBasis)
 	d.SourceProvenance = SourceProvenance{
+		InstanceID:          stringPtr(r.instanceID),
 		SignalID:            stringPtr(r.signalID),
 		SignalVersion:       stringPtr(r.signalVersion),
 		GeneratorURL:        r.generatorURL,

@@ -87,7 +87,7 @@ type Allocation struct {
 func allocateFairly(cycleCap int, credit int, timeSensitive, optional, routine []Candidate) Allocation {
 	sortByDeadlineThenLastServed(timeSensitive)
 	sortByLastServed(optional)
-	sortByLastServed(routine)
+	sortRoutineByPhaseThenLastServed(routine)
 
 	var admitted, deferred []Candidate
 	used := 0
@@ -167,6 +167,18 @@ func sortByDeadlineThenLastServed(cs []Candidate) {
 
 func sortByLastServed(cs []Candidate) {
 	sort.SliceStable(cs, func(i, j int) bool {
+		if !cs[i].LastServedAt.Equal(cs[j].LastServedAt) {
+			return cs[i].LastServedAt.Before(cs[j].LastServedAt)
+		}
+		return candidateKey(cs[i]) < candidateKey(cs[j])
+	})
+}
+
+func sortRoutineByPhaseThenLastServed(cs []Candidate) {
+	sort.SliceStable(cs, func(i, j int) bool {
+		if cs[i].Phase != cs[j].Phase {
+			return cs[i].Phase == model.PhaseLifecycle
+		}
 		if !cs[i].LastServedAt.Equal(cs[j].LastServedAt) {
 			return cs[i].LastServedAt.Before(cs[j].LastServedAt)
 		}

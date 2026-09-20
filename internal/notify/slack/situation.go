@@ -424,6 +424,9 @@ func renderJournalEntryKind(t model.Transition, executionSuperseded bool, replyK
 	if t.Journal.JudgmentChange != "" {
 		return renderExpectedJudgmentJournal(t), nil
 	}
+	if t.Journal.ExpectedBehaviorChange != "" {
+		return renderExpectedBehaviorJournal(t), nil
+	}
 
 	prefix := drillPrefix(t.Drill)
 	label, detail := t.Journal.Headline, t.Journal.Detail
@@ -467,6 +470,50 @@ func renderJournalEntryKind(t model.Transition, executionSuperseded bool, replyK
 	}, nil
 }
 
+func renderExpectedBehaviorJournal(t model.Transition) RenderedMessage {
+	actor := briefingText(t.Journal.AttributedActor, 120)
+	var text string
+	switch t.Journal.ExpectedBehaviorChange {
+	case model.ExpectedBehaviorChangeApplied, model.ExpectedBehaviorChangeUpdated, model.ExpectedBehaviorChangeRestored:
+		owner := "an operator's"
+		if actor != "" {
+			owner = actor + "'s"
+		}
+		text = "This condition matches " + owner + " expected schedule"
+		if t.Journal.ExpectedBehaviorBoundary != nil {
+			text += " until " + SlackDateToken(*t.Journal.ExpectedBehaviorBoundary, "{time}")
+		}
+		text += ". Monitoring continues."
+	case model.ExpectedBehaviorChangeWithdrawn:
+		if actor == "" {
+			text = "The expected schedule was removed. Normal assessment resumes."
+		} else {
+			text = actor + " removed the expected schedule. Normal assessment resumes."
+		}
+	case model.ExpectedBehaviorChangeStopped:
+		reason := strings.TrimSpace(t.Journal.Detail)
+		if reason == "" {
+			reason = "The current condition no longer matches the schedule."
+		}
+		reason = strings.TrimSuffix(reason, ".")
+		switch {
+		case strings.HasPrefix(reason, "The "):
+			reason = "the " + strings.TrimPrefix(reason, "The ")
+		case strings.HasPrefix(reason, "A "):
+			reason = "a " + strings.TrimPrefix(reason, "A ")
+		case strings.HasPrefix(reason, "An "):
+			reason = "an " + strings.TrimPrefix(reason, "An ")
+		}
+		text = "The expected schedule no longer applies because " + reason + ". Normal assessment resumes."
+	default:
+		text = "The expected schedule changed."
+	}
+	if t.Journal.NoLongerCurrent {
+		text += " This schedule is no longer active."
+	}
+	return RenderedMessage{Text: text, Blocks: []slacklib.Block{sectionBlock(text), contextBlock(SlackDateToken(t.Journal.OccurredAt, "{date_short} {time}"))}}
+}
+
 func renderExpectedJudgmentJournal(t model.Transition) RenderedMessage {
 	actor := briefingText(t.Journal.AttributedActor, 120)
 	var text string
@@ -485,7 +532,7 @@ func renderExpectedJudgmentJournal(t model.Transition) RenderedMessage {
 		} else {
 			text = "The expected-until decision reached its scheduled end time. Normal assessment resumes."
 		}
-	default:
+	case model.JudgmentChangeInvalidated:
 		reason := strings.TrimSuffix(strings.TrimSpace(t.Journal.Detail), ".")
 		if reason == "Normal assessment resumes" {
 			reason = ""
@@ -499,6 +546,8 @@ func renderExpectedJudgmentJournal(t model.Transition) RenderedMessage {
 			reason = "the current condition changed"
 		}
 		text = "The expected-until decision no longer applies because " + reason + ". Normal assessment resumes."
+	default:
+		text = "The expected-until decision no longer applies because the current condition changed. Normal assessment resumes."
 	}
 	if action := t.ActionContract.OperatorActionRequired; action != nil {
 		text += " Operator action required: " + humanizeOperatorAction(*action) + "."

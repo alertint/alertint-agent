@@ -107,7 +107,7 @@ func TestSituationNotificationsUpgrade_CreatesStrictTablesAndBumpsSchemaVersion(
 	path := filepath.Join(t.TempDir(), "migration17-notifications.db")
 	seedMigration17NotificationsFixture(t, path)
 
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatalf("open upgraded store: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestSituationNotificationsUpgrade_ExistingSituationsGainNoSlackRoot(t *test
 	path := filepath.Join(t.TempDir(), "migration17-notifications-readable.db")
 	pendingID, retryID, terminalID := seedMigration17NotificationsFixture(t, path)
 
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatalf("open upgraded store: %v", err)
 	}

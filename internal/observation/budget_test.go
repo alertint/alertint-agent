@@ -95,6 +95,47 @@ func TestAllocateFairlyRoutineLeastRecentlyServedFirst(t *testing.T) {
 	}
 }
 
+func TestAllocateFairlyAdmitsRoutineLifecycleBeforeAssessment(t *testing.T) {
+	now := time.Now()
+	problemHistory := candidate("zabbix:lab:trigger-1", model.CapabilityZabbixProblemHist, 6, now)
+	problemHistory.Phase = model.PhaseLifecycle
+	routine := []Candidate{
+		candidate("zabbix:lab:trigger-1", model.CapabilityPrometheusQuery, 1, now),
+		candidate("zabbix:lab:trigger-1", model.CapabilityLokiQuery, 2, now),
+		candidate("zabbix:lab:trigger-1", model.CapabilityZabbixMetricRange, 2, now),
+		problemHistory,
+	}
+	for i := range routine[:3] {
+		routine[i].Phase = model.PhaseAssessment
+	}
+
+	alloc := allocateFairly(6, 0, nil, nil, routine)
+	if len(alloc.Admitted) != 1 || alloc.Admitted[0].Capability != model.CapabilityZabbixProblemHist {
+		t.Fatalf("admitted = %+v, want the six-request lifecycle source read", alloc.Admitted)
+	}
+	if alloc.RoutineLifecycleRequests != 6 {
+		t.Fatalf("routine lifecycle requests = %d, want 6", alloc.RoutineLifecycleRequests)
+	}
+}
+
+func TestAllocateFairlyFitsProtectedOptionalAndZabbixLifecycleAtDefaultCap(t *testing.T) {
+	now := time.Now()
+	optional := []Candidate{candidate("zabbix:lab:trigger-1", model.CapabilityZabbixMetricRange, 2, now)}
+	optional[0].Phase = model.PhaseAssessment
+	problemHistory := candidate("zabbix:lab:trigger-1", model.CapabilityZabbixProblemHist, 6, now)
+	problemHistory.Phase = model.PhaseLifecycle
+	routineAssessment := candidate("zabbix:lab:trigger-1", model.CapabilityPrometheusQuery, 1, now.Add(-time.Minute))
+	routineAssessment.Phase = model.PhaseAssessment
+
+	alloc := allocateFairly(8, 6, nil, optional, []Candidate{routineAssessment, problemHistory})
+	if len(alloc.Admitted) != 2 || alloc.Admitted[0].Capability != model.CapabilityZabbixMetricRange || alloc.Admitted[1].Capability != model.CapabilityZabbixProblemHist {
+		t.Fatalf("admitted = %+v, want protected optional followed by the Zabbix lifecycle read", alloc.Admitted)
+	}
+	if alloc.OptionalRequests != 2 || alloc.RoutineLifecycleRequests != 6 {
+		t.Fatalf("allocation = %+v, want 2 optional and 6 routine lifecycle requests", alloc.PhaseAllocation)
+	}
+}
+
 func TestAccrualDueRules(t *testing.T) {
 	now := time.Now()
 	if !AccrualDue(nil, now, time.Minute) {

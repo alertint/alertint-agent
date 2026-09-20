@@ -9,6 +9,8 @@ package zabbix
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,6 +41,7 @@ var ErrRedirectRefused = errors.New("zabbix: redirect refused on the bounded req
 type Config struct {
 	BaseURL              string // Zabbix frontend; "/api_jsonrpc.php" is appended
 	APIToken             string
+	InstanceID           string
 	TimeoutSeconds       int
 	HistoryRetentionDays int
 	FlapWindowHours      int
@@ -46,6 +49,8 @@ type Config struct {
 
 type Client struct {
 	endpoint   string
+	endpointID string
+	instanceID string
 	httpClient *http.Client
 	// boundedHTTP is httpClient with redirects disabled — the transport the
 	// bounded (proactive) callInstrumented path uses so one reservation is
@@ -70,8 +75,12 @@ func NewClient(cfg Config) *Client {
 		fw = 24
 	}
 	httpClient := &http.Client{Timeout: timeout}
+	endpoint := strings.TrimRight(cfg.BaseURL, "/") + "/api_jsonrpc.php"
+	sum := sha256.Sum256([]byte(endpoint))
 	return &Client{
-		endpoint:         strings.TrimRight(cfg.BaseURL, "/") + "/api_jsonrpc.php",
+		endpoint:         endpoint,
+		endpointID:       "sha256:" + hex.EncodeToString(sum[:]),
+		instanceID:       strings.TrimSpace(cfg.InstanceID),
 		httpClient:       httpClient,
 		boundedHTTP:      noRedirectClient(httpClient),
 		authHeader:       "Bearer " + cfg.APIToken,
@@ -442,6 +451,47 @@ func (c *Client) OpenProblems(ctx context.Context, host string, sel ProblemSelec
 		return nil, err
 	}
 	return c.openProblemsCall(ctx, "hostids", hostids, sel)
+}
+
+// ProblemStateBounded reads whether one exact trigger is currently open on
+// one exact technical host. An empty, complete problem.get is proof of
+// absence; transport, identity, and decoding failures remain errors.
+func (c *Client) ProblemStateBounded(ctx context.Context, host, triggerID string,
+	before func() error, after func(started bool, err error),
+) (ProblemState, error) {
+	if host == "" || triggerID == "" {
+		return ProblemState{}, ErrNotFound
+	}
+	var hosts []struct {
+		HostID string `json:"hostid"`
+	}
+	if err := c.callInstrumented(ctx, "host.get", map[string]any{
+		"output": []string{"hostid"}, "filter": map[string][]string{"host": {host}},
+	}, &hosts, before, after); err != nil {
+		return ProblemState{}, err
+	}
+	if len(hosts) != 1 || hosts[0].HostID == "" {
+		return ProblemState{}, ErrNotFound
+	}
+	var rows []struct {
+		EventID string `json:"eventid"`
+	}
+	if err := c.callInstrumented(ctx, "problem.get", map[string]any{
+		"output": []string{"eventid"}, "hostids": []string{hosts[0].HostID}, "objectids": []string{triggerID},
+		"recent": false, "sortfield": []string{"eventid"}, "sortorder": "DESC", "limit": 2,
+	}, &rows, before, after); err != nil {
+		return ProblemState{}, err
+	}
+	if len(rows) == 0 {
+		return ProblemState{Presence: ProblemAbsent}, nil
+	}
+	eventIDs := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if row.EventID != "" {
+			eventIDs = append(eventIDs, row.EventID)
+		}
+	}
+	return ProblemState{Presence: ProblemPresent, EventIDs: eventIDs}, nil
 }
 
 // HostGroups resolves group names to ids and host counts (hostgroup.get with

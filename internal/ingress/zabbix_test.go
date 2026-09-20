@@ -161,6 +161,55 @@ func TestZabbixReceiver_MapsProblemToFiringAlert(t *testing.T) {
 	}
 }
 
+func TestZabbixReceiverWithInstanceNamespacesEventAndPersistsInstallation(t *testing.T) {
+	st := newTestStore(t)
+	r := NewZabbixReceiverWithInstance(st, "tok", "prod-zbx", nil, slog.Default())
+	body := []byte(`{"event_id":"9134","status":"PROBLEM","severity":"Warning","nseverity":"2","host":"db01","trigger_id":"22713","trigger_name":"CPU load"}`)
+	if _, err := r.Ingest(context.Background(), body); err != nil {
+		t.Fatal(err)
+	}
+
+	alert, err := st.GetAlertByFingerprint(context.Background(), "zabbix:prod-zbx:9134")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if alert.Fingerprint != "zabbix:prod-zbx:9134" {
+		t.Fatalf("fingerprint = %q", alert.Fingerprint)
+	}
+	claims := claimAll(t, st)
+	if len(claims) != 1 {
+		t.Fatalf("claims = %d, want 1", len(claims))
+	}
+	d := claims[0].Delivery
+	if d.SourceEpisodeKey != "zabbix:prod-zbx:9134" {
+		t.Fatalf("episode key = %q", d.SourceEpisodeKey)
+	}
+	if d.SourceProvenance.InstanceID == nil || *d.SourceProvenance.InstanceID != "prod-zbx" {
+		t.Fatalf("instance id = %#v", d.SourceProvenance.InstanceID)
+	}
+}
+
+func TestZabbixReceiverWithInstanceNamespacesDeliveryID(t *testing.T) {
+	st := newTestStore(t)
+	body := []byte(`{"event_id":"9134","status":"PROBLEM","severity":"Warning","nseverity":"2","host":"db01","trigger_id":"22713","trigger_name":"CPU load"}`)
+
+	for _, instanceID := range []string{"prod-zbx-a", "prod-zbx-b"} {
+		r := NewZabbixReceiverWithInstance(st, "tok", instanceID, nil, slog.Default())
+		if _, err := r.Ingest(context.Background(), body); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	assertTableCount(t, st.DB(), "alert_deliveries", 2)
+	claims := claimAll(t, st)
+	if len(claims) != 2 {
+		t.Fatalf("claims = %d, want one delivery from each installation", len(claims))
+	}
+	if claims[0].Delivery.ID == claims[1].Delivery.ID {
+		t.Fatalf("delivery IDs match across installations: %q", claims[0].Delivery.ID)
+	}
+}
+
 func TestZabbixReceiverHandsOffPerHostIdentityAcrossResolution(t *testing.T) {
 	st := newTestStore(t)
 	r := NewZabbixReceiver(st, "tok", nil, slog.Default())

@@ -85,6 +85,10 @@ type DelivererStore interface {
 	GetCurrentSituationJudgment(ctx context.Context, situationID string, now time.Time) (*store.SituationJudgmentView, error)
 }
 
+type expectedBehaviorDeliveryStore interface {
+	GetCurrentExpectedBehaviorEvaluationAt(ctx context.Context, situationID string, now time.Time) (model.ExpectedBehaviorEvaluation, bool, error)
+}
+
 // slackDeliveryAPI is exactly what SituationDeliverer calls on the narrow
 // Slack Web API client (internal/notify/slack.Client already satisfies
 // it). Narrowed to an interface so tests can inject a fake without an
@@ -194,6 +198,20 @@ func (d *SituationDeliverer) deliverRootSync(ctx context.Context, intent model.N
 				errors.New("cmd/alertint: situation deliverer: root carries retired expected judgment"))
 		}
 	}
+	if briefing := view.Summary.Briefing; briefing != nil && briefing.ExpectedBehavior != nil && briefing.ExpectedBehavior.Disposition == model.ExpectedBehaviorDispositionMatched {
+		reader, ok := d.store.(expectedBehaviorDeliveryStore)
+		if !ok {
+			return situation.NotificationDelivery{}, localDelivery("expected_behavior_revalidation_unavailable", errors.New("cmd/alertint: situation deliverer cannot revalidate expected schedule"))
+		}
+		current, found, err := reader.GetCurrentExpectedBehaviorEvaluationAt(ctx, *intent.SituationID, d.now().UTC())
+		if err != nil {
+			return situation.NotificationDelivery{}, localDelivery("expected_behavior_revalidation_unavailable", fmt.Errorf("cmd/alertint: revalidate expected schedule: %w", err))
+		}
+		projected := briefing.ExpectedBehavior
+		if !found || current.Disposition != model.ExpectedBehaviorDispositionMatched || current.ChosenEnvelopeID != projected.EnvelopeID || current.ChosenVersion != projected.Version {
+			return situation.NotificationDelivery{}, localDelivery("stale_expected_behavior", errors.New("cmd/alertint: situation root carries retired expected schedule"))
+		}
+	}
 
 	recoveryEverObserved, err := d.recoveryEverObserved(ctx, view)
 	if err != nil {
@@ -267,6 +285,17 @@ func (d *SituationDeliverer) deliverThreadAppend(ctx context.Context, intent mod
 			tr.Journal.NoLongerCurrent = true
 		}
 	}
+	if expectedBehaviorChangeCarriesAuthority(tr.Journal.ExpectedBehaviorChange) {
+		reader, ok := d.store.(expectedBehaviorDeliveryStore)
+		projected := tr.Projection.Briefing
+		if !ok || projected == nil || projected.ExpectedBehavior == nil {
+			tr.Journal.NoLongerCurrent = true
+		} else if current, found, err := reader.GetCurrentExpectedBehaviorEvaluationAt(ctx, *intent.SituationID, d.now().UTC()); err != nil {
+			return situation.NotificationDelivery{}, localDelivery("expected_behavior_revalidation_unavailable", fmt.Errorf("cmd/alertint: revalidate expected schedule thread: %w", err))
+		} else if !found || current.Disposition != model.ExpectedBehaviorDispositionMatched || current.ChosenEnvelopeID != projected.ExpectedBehavior.EnvelopeID || current.ChosenVersion != projected.ExpectedBehavior.Version {
+			tr.Journal.NoLongerCurrent = true
+		}
+	}
 	channel, rootTS, ok, err := d.store.GetSituationRootCoordinates(ctx, *intent.SituationID)
 	if err != nil {
 		return situation.NotificationDelivery{}, localDelivery("root_coordinates_unavailable",
@@ -302,9 +331,20 @@ func judgmentChangeCarriesAuthority(change model.JudgmentChange) bool {
 	switch change {
 	case model.JudgmentChangeRecorded, model.JudgmentChangeReplaced, model.JudgmentChangeRestored:
 		return true
-	default:
+	case model.JudgmentChangeRevoked, model.JudgmentChangeExpired, model.JudgmentChangeInvalidated, "":
 		return false
 	}
+	return false
+}
+
+func expectedBehaviorChangeCarriesAuthority(change model.ExpectedBehaviorChange) bool {
+	switch change {
+	case model.ExpectedBehaviorChangeApplied, model.ExpectedBehaviorChangeUpdated, model.ExpectedBehaviorChangeRestored:
+		return true
+	case model.ExpectedBehaviorChangeWithdrawn, model.ExpectedBehaviorChangeStopped, "":
+		return false
+	}
+	return false
 }
 
 // selectedReply reads this Situation's delivery history once, bounded to

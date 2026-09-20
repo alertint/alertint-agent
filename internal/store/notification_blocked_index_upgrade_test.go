@@ -113,7 +113,7 @@ func TestNotificationBlockedIndexUpgrade_AddsThePartialIndexAndFabricatesNothing
 	path := filepath.Join(t.TempDir(), "migration18-blocked-index.db")
 	situationID := seedMigration18BlockedIndexFixture(t, path)
 
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatalf("open upgraded store: %v", err)
 	}
@@ -130,8 +130,8 @@ func TestNotificationBlockedIndexUpgrade_AddsThePartialIndexAndFabricatesNothing
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	if got != 31 {
-		t.Fatalf("MaxSchemaVersion = %d, want 31", got)
+	if got != 35 {
+		t.Fatalf("MaxSchemaVersion = %d, want 35", got)
 	}
 
 	var indexSQL string

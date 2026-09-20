@@ -61,10 +61,11 @@ func TestBuildPlansDeterministicForFixedInput(t *testing.T) {
 // is assessment-phase corroboration, so each phase yields exactly one plan.
 func TestBuildPlansDerivesZabbixParametersFromMemberLabels(t *testing.T) {
 	anchor := time.Date(2026, 9, 6, 17, 0, 0, 0, time.UTC)
+	instanceID := "prod-zbx"
 	in := PlannerInput{
-		Anchor: anchor, GroupKey: "service=checkout", Phase: model.PhaseAssessment,
+		Anchor: anchor, GroupKey: "service=checkout", Phase: model.PhaseAssessment, RefreshInterval: 5 * time.Minute,
 		Members: []MemberSubject{
-			{SubjectID: "host-a", Source: "zabbix", Labels: map[string]string{
+			{SubjectID: "host-a", Source: "zabbix", SourceInstanceID: &instanceID, Labels: map[string]string{
 				"host": "db-01", "zabbix_trigger_id": "trigger-123", "item_key": "vfs.fs.size[/,pfree]",
 			}},
 		},
@@ -115,13 +116,15 @@ func TestBuildPlansDerivesZabbixParametersFromMemberLabels(t *testing.T) {
 		t.Fatalf("zabbix_problem_history phase = %q, want lifecycle", problemPlan.Phase)
 	}
 	var problemParams struct {
-		Host      string `json:"host"`
-		TriggerID string `json:"trigger_id"`
+		Host             string `json:"host"`
+		TriggerID        string `json:"trigger_id"`
+		SourceInstanceID string `json:"source_instance_id"`
+		FreshForSeconds  int    `json:"fresh_for_seconds"`
 	}
 	if err := json.Unmarshal(problemPlan.Parameters, &problemParams); err != nil {
 		t.Fatalf("unmarshal zabbix_problem_history parameters: %v (raw=%s)", err, problemPlan.Parameters)
 	}
-	if problemParams.TriggerID != "trigger-123" || problemParams.Host != "db-01" {
+	if problemParams.TriggerID != "trigger-123" || problemParams.Host != "db-01" || problemParams.SourceInstanceID != "prod-zbx" || problemParams.FreshForSeconds != 300 {
 		t.Fatalf("zabbix_problem_history parameters = %+v, want host db-01 + trigger id", problemParams)
 	}
 }
@@ -255,6 +258,47 @@ func TestBuildPlansProfileSuggestedCapabilityBecomesOptional(t *testing.T) {
 	}
 	if alloc.OptionalRequests == 0 {
 		t.Fatal("expected the profile-suggested capability to be admitted as optional")
+	}
+}
+
+func TestBuildPlansProfileCannotReclassifyLifecycleReadAsOptional(t *testing.T) {
+	anchor := time.Date(2026, 9, 19, 13, 0, 0, 0, time.UTC)
+	instanceID := "lab-zbx"
+	in := PlannerInput{
+		Anchor: anchor, GroupKey: "host=db-01", RefreshInterval: time.Minute,
+		Members: []MemberSubject{{
+			SubjectID: "zabbix:lab-zbx:event-1", Source: "zabbix", SourceInstanceID: &instanceID,
+			Labels: map[string]string{"host": "db-01", "zabbix_trigger_id": "1001", "item_key": "system.cpu.load"},
+		}},
+		Configured: []CapabilityDescriptor{
+			{Capability: model.CapabilityZabbixMetricRange, DefaultWindow: time.Hour, DefaultLimit: 100, MaxRequestsHint: 2},
+			{Capability: model.CapabilityZabbixProblemHist, DefaultWindow: 24 * time.Hour, DefaultLimit: 20, MaxRequestsHint: 6},
+		},
+		ProfileGuidance: []model.ProfileGuidance{{UsefulCapabilities: []model.Capability{
+			model.CapabilityZabbixMetricRange, model.CapabilityZabbixProblemHist,
+		}}},
+		CycleCap: 8, InvestigationCredit: 100,
+	}
+
+	plans, alloc, err := BuildPlans(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plans) != 2 {
+		t.Fatalf("plans = %+v, want the optional metric read and routine lifecycle read", plans)
+	}
+	byCapability := make(map[model.Capability]model.Plan, len(plans))
+	for _, plan := range plans {
+		byCapability[plan.Capability] = plan
+	}
+	if got := byCapability[model.CapabilityZabbixMetricRange].Tier; got != model.TierOptional {
+		t.Fatalf("zabbix metric tier = %q, want optional", got)
+	}
+	if got := byCapability[model.CapabilityZabbixProblemHist].Tier; got != model.TierRoutine {
+		t.Fatalf("zabbix problem-history tier = %q, want routine lifecycle", got)
+	}
+	if alloc.OptionalRequests != 2 || alloc.RoutineLifecycleRequests != 6 {
+		t.Fatalf("allocation = %+v, want 2 optional and 6 routine lifecycle requests", alloc.PhaseAllocation)
 	}
 }
 

@@ -172,6 +172,8 @@ func TestGetSituationByIDExactContract(t *testing.T) {
 		"assessment_derivation", "material_fact_hash", "assessment_basis_hash",
 		"eligible_reasons", "recent_attempts", "controller_state",
 		"judgment_version", "active_judgment", "judgment_applicability",
+		"source_provenance",
+		"expected_behavior",
 		// Plan 3 Task 9 additions: the current Episode summary read
 		// coherently with its source Transition (explicit null before any
 		// Transition exists) and the Situation's whole Slack presence.

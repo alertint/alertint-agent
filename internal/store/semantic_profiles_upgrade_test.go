@@ -137,7 +137,7 @@ func TestSemanticProfilesUpgradeMigration21Database(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "upgrade-23.db")
 	deliveryID, situationID := seedMigration21SemanticProfilesFixture(t, path)
 
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatalf("open (apply migrations 0022/0023): %v", err)
 	}
@@ -147,12 +147,12 @@ func TestSemanticProfilesUpgradeMigration21Database(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	if got != 31 {
-		t.Fatalf("MaxSchemaVersion = %d, want 31", got)
+	if got != 35 {
+		t.Fatalf("MaxSchemaVersion = %d, want 35", got)
 	}
 	var version int
-	if err := st.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 31 {
-		t.Fatalf("applied schema version = %d (err=%v), want 31", version, err)
+	if err := st.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 35 {
+		t.Fatalf("applied schema version = %d (err=%v), want 35", version, err)
 	}
 	var fkViolations int
 	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_foreign_key_check`).Scan(&fkViolations); err != nil || fkViolations != 0 {

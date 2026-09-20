@@ -14,19 +14,20 @@ import (
 	"time"
 )
 
-// Capability is the closed seven-name proactive evidence-source vocabulary
+// Capability is the closed proactive evidence-source vocabulary
 // (spec.md "Deterministic planning and connector contracts"). No other value
 // is ever planned or persisted.
 type Capability string
 
 const (
-	CapabilityStoreRead         Capability = "store_read"
-	CapabilityPrometheusQuery   Capability = "prometheus_query"
-	CapabilityZabbixMetricRange Capability = "zabbix_metric_range"
-	CapabilityZabbixProblemHist Capability = "zabbix_problem_history"
-	CapabilityLokiQuery         Capability = "loki_query"
-	CapabilitySentryIssues      Capability = "sentry_issues"
-	CapabilityChangeEvents      Capability = "change_events"
+	CapabilityStoreRead          Capability = "store_read"
+	CapabilityPrometheusQuery    Capability = "prometheus_query"
+	CapabilityZabbixMetricRange  Capability = "zabbix_metric_range"
+	CapabilityZabbixProblemHist  Capability = "zabbix_problem_history"
+	CapabilityZabbixProblemState Capability = "zabbix_problem_state"
+	CapabilityLokiQuery          Capability = "loki_query"
+	CapabilitySentryIssues       Capability = "sentry_issues"
+	CapabilityChangeEvents       Capability = "change_events"
 )
 
 // Capabilities is the closed, ordered set every planner/validator/prompt
@@ -36,12 +37,13 @@ var Capabilities = []Capability{
 	CapabilityPrometheusQuery,
 	CapabilityZabbixMetricRange,
 	CapabilityZabbixProblemHist,
+	CapabilityZabbixProblemState,
 	CapabilityLokiQuery,
 	CapabilitySentryIssues,
 	CapabilityChangeEvents,
 }
 
-// ValidCapability reports whether c is one of the closed seven capability
+// ValidCapability reports whether c is one of the closed capability
 // names.
 func ValidCapability(c Capability) bool {
 	for _, v := range Capabilities {
@@ -350,6 +352,47 @@ type Fact struct {
 	ObservedAt, ExpiresAt            time.Time
 	EvidenceRefs                     []string
 	Material                         bool
+}
+
+// SourceDefinitionObservation is one bounded observation of the current
+// effective configuration behind an ingested source rule. Available=false
+// carries a closed reason instead of stale or partial configuration. This is
+// current API truth and never claims to reconstruct the historical rule that
+// emitted an earlier event.
+type SourceDefinitionObservation struct {
+	Source            string            `json:"source"`
+	InstanceID        string            `json:"instance_id,omitempty"`
+	RuleID            string            `json:"rule_id"`
+	Host              string            `json:"host"`
+	EndpointID        string            `json:"endpoint_id,omitempty"`
+	Available         bool              `json:"available"`
+	VersionAlgorithm  string            `json:"version_algorithm,omitempty"`
+	Version           string            `json:"version,omitempty"`
+	UnavailableReason string            `json:"unavailable_reason,omitempty"`
+	ComponentDigests  map[string]string `json:"component_digests,omitempty"`
+	TriggerIDs        []string          `json:"trigger_ids,omitempty"`
+	ItemIDs           []string          `json:"item_ids,omitempty"`
+	HistoricalProven  bool              `json:"historical_version_proven"`
+}
+
+// ProblemPresence is the exact current state of one Zabbix trigger.
+type ProblemPresence string
+
+const (
+	ProblemPresencePresent ProblemPresence = "present"
+	ProblemPresenceAbsent  ProblemPresence = "absent"
+	ProblemPresenceUnknown ProblemPresence = "unknown"
+)
+
+// ZabbixProblemStateObservation is one bounded current-state fact bound to
+// the configuration version separately proven for the same rule.
+type ZabbixProblemStateObservation struct {
+	SourceInstanceID string          `json:"source_instance_id"`
+	Host             string          `json:"host"`
+	TriggerID        string          `json:"trigger_id"`
+	TriggerVersion   string          `json:"trigger_version"`
+	Presence         ProblemPresence `json:"presence"`
+	EventIDs         []string        `json:"event_ids,omitempty"`
 }
 
 // Run is one completed (or explicitly limited/failed) execution of a Plan:

@@ -56,6 +56,20 @@ type Problem struct {
 	Tags       []KV      `json:"tags,omitempty"`
 }
 
+// ProblemPresence is the current state of one exact host/trigger binding.
+type ProblemPresence string
+
+const (
+	ProblemPresent ProblemPresence = "present"
+	ProblemAbsent  ProblemPresence = "absent"
+)
+
+// ProblemState is a bounded exact problem.get result.
+type ProblemState struct {
+	Presence ProblemPresence `json:"presence"`
+	EventIDs []string        `json:"event_ids,omitempty"`
+}
+
 type KV struct {
 	Tag   string `json:"tag"`
 	Value string `json:"value"`

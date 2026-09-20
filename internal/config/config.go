@@ -389,8 +389,9 @@ type ChangesIngressConfig struct {
 // sub-roles: Ingress is the push Receiver; API is the pull Source (context
 // enrichment + MCP tools).
 type ZabbixConfig struct {
-	Ingress ZabbixIngressConfig `yaml:"ingress"`
-	API     ZabbixAPIConfig     `yaml:"api,omitempty"`
+	InstanceID string              `yaml:"instance_id,omitempty"`
+	Ingress    ZabbixIngressConfig `yaml:"ingress"`
+	API        ZabbixAPIConfig     `yaml:"api,omitempty"`
 }
 
 // ZabbixIngressConfig enables the POST /webhook/zabbix receiver. Receivers use
@@ -713,7 +714,7 @@ func Defaults() Config {
 				RepageCooldownSeconds: 900,
 			},
 			Preparation: SituationPreparationConfig{
-				MaxSourceCallsPerCycle: 6,
+				MaxSourceCallsPerCycle: 8,
 				MaxWallSeconds:         20,
 				RefreshSeconds:         300,
 			},
@@ -837,6 +838,7 @@ func (c *Config) validate(offline bool) error {
 	errs = append(errs, c.validateCorrelator()...)
 	errs = append(errs, c.validateNotify()...)
 	errs = append(errs, c.validatePrometheus()...)
+	errs = append(errs, c.validateZabbixInstance()...)
 	errs = append(errs, c.validateZabbixAPI()...)
 	errs = append(errs, c.validateLogs()...)
 	errs = append(errs, c.validateSentry()...)
@@ -1369,6 +1371,18 @@ func (c *Config) validateZabbixAPI() []string {
 		errs = append(errs, "zabbix: api: host_label is required when enabled")
 	}
 	return errs
+}
+
+var zabbixInstanceIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+func (c *Config) validateZabbixInstance() []string {
+	if c.Zabbix.InstanceID == "" {
+		return nil
+	}
+	if !zabbixInstanceIDRe.MatchString(c.Zabbix.InstanceID) {
+		return []string{"zabbix: instance_id must be 1-64 characters using letters, numbers, '.', '_' or '-'"}
+	}
+	return nil
 }
 
 func (c *Config) validateLogs() []string {

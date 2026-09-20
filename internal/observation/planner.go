@@ -18,6 +18,10 @@ import (
 type MemberSubject struct {
 	SubjectID string
 	Source    string
+	// SourceInstanceID is the immutable installation identity recorded by
+	// ingress for this member's latest delivery. It is never inferred from
+	// endpoint configuration or labels.
+	SourceInstanceID *string
 	// Labels is the member's full immutable delivery label set — used only
 	// to derive typed, capability-specific plan parameters (Zabbix host/
 	// item/trigger, Sentry project/environment), never as a query selector.
@@ -192,6 +196,13 @@ func BuildPlans(in PlannerInput) ([]model.Plan, Allocation, error) {
 			case c.TimeSensitive:
 				c.Tier = model.TierTimeSensitive
 				timeSensitive = append(timeSensitive, c)
+			case phase == model.PhaseLifecycle:
+				// Profiles advise investigation only. They cannot demote a
+				// source-lifecycle read into the optional pool, where a large
+				// bounded read could repeatedly lose its refresh turn to
+				// smaller assessment plans.
+				c.Tier = model.TierRoutine
+				routine = append(routine, c)
 			case suggested[capability] && !in.RecoveryPending:
 				c.Optional = true
 				c.Tier = model.TierOptional
@@ -341,7 +352,7 @@ func buildCandidate(in PlannerInput, m MemberSubject, subject string, capability
 	if phase == model.PhaseLifecycle {
 		purpose = "lifecycle_watch"
 	}
-	params, err := capabilityParameters(in, capability, m.Labels, horizonTier)
+	params, err := capabilityParameters(in, capability, m, horizonTier)
 	if err != nil {
 		return Candidate{}, err
 	}
@@ -371,7 +382,8 @@ type storeReadParameters struct {
 // (skills/acutetriage/sentry.go's sentryScope conventions); store_read
 // needs the group identity. A capability with no label to offer gets nil
 // Parameters, and the connector then honestly reports vocabulary_unresolved.
-func capabilityParameters(in PlannerInput, capability model.Capability, labels map[string]string, horizonTier string) (json.RawMessage, error) {
+func capabilityParameters(in PlannerInput, capability model.Capability, member MemberSubject, horizonTier string) (json.RawMessage, error) {
+	labels := member.Labels
 	switch capability {
 	case model.CapabilityStoreRead:
 		return json.Marshal(storeReadParameters{
@@ -392,9 +404,15 @@ func capabilityParameters(in PlannerInput, capability model.Capability, labels m
 			return nil, nil
 		}
 		return json.Marshal(struct {
-			Host      string `json:"host"`
-			TriggerID string `json:"trigger_id"`
-		}{Host: host, TriggerID: triggerID})
+			Host             string `json:"host"`
+			TriggerID        string `json:"trigger_id"`
+			SourceInstanceID string `json:"source_instance_id,omitempty"`
+			FreshForSeconds  int    `json:"fresh_for_seconds,omitempty"`
+		}{Host: host, TriggerID: triggerID, SourceInstanceID: dereferenceString(member.SourceInstanceID), FreshForSeconds: int(in.RefreshInterval.Seconds())})
+	case model.CapabilityZabbixProblemState:
+		// Reusable-schedule validation constructs this exact-rule plan from
+		// typed operator bindings after the general planner has run.
+		return nil, nil
 	case model.CapabilitySentryIssues:
 		project, env := sentryProjectEnv(labels)
 		if project == "" {
@@ -409,6 +427,13 @@ func capabilityParameters(in PlannerInput, capability model.Capability, labels m
 	default:
 		return nil, nil
 	}
+}
+
+func dereferenceString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 // sentryProjectEnv applies skills/acutetriage/sentry.go's own label-key
@@ -444,6 +469,8 @@ func windowCapFor(capability model.Capability) (time.Duration, bool) {
 	case model.CapabilityZabbixProblemHist, model.CapabilityChangeEvents, model.CapabilitySentryIssues:
 		return model.MaxWindowDaysHistory * 24 * time.Hour, true
 	case model.CapabilityStoreRead:
+		return 0, false
+	case model.CapabilityZabbixProblemState:
 		return 0, false
 	default:
 		return 0, false

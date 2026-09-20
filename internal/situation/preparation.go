@@ -38,6 +38,10 @@ type PreparedState struct {
 	ProfileGuidance   []observationmodel.ProfileGuidance
 	NextRefreshAt     *time.Time
 	Lifecycle         []SourceObservation
+	// SourceDefinitions is the durable current head for source-rule
+	// configuration observations. Unavailable heads are retained explicitly;
+	// callers must never fall back to an older successful version.
+	SourceDefinitions []observationmodel.SourceDefinitionObservation
 	Limitations       []model.Limitation
 	// Deferred lists the capability:subject reads this cycle could not
 	// admit under its request cap or credit (frozen in the cycle's

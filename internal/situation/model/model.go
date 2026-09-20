@@ -101,24 +101,25 @@ const (
 type DueReason string
 
 const (
-	DueIncidentCreated        DueReason = "incident_created"
-	DueMembershipChanged      DueReason = "membership_changed"
-	DueNewSymptom             DueReason = "new_symptom"
-	DueAlertResolved          DueReason = "alert_resolved"
-	DueAlertRefired           DueReason = "alert_refired"
-	DueDurationMilestone      DueReason = "duration_milestone"
-	DueConnectorHealthChanged DueReason = "connector_health_changed"
-	DueSemanticProfileChanged DueReason = "semantic_profile_changed"
-	DueTriageChanged          DueReason = "triage_changed"
-	DueOperatorJudgment       DueReason = "operator_judgment"
-	DueEnvelopeChanged        DueReason = "envelope_changed"
-	DueEnvelopeBoundary       DueReason = "envelope_boundary"
-	DueJudgmentBoundary       DueReason = "judgment_boundary"
-	DueManualReassessment     DueReason = "manual_reassessment"
-	DueRecoveryGraceExpired   DueReason = "recovery_grace_expired"
-	DueObservationDeadline    DueReason = "observation_deadline"
-	DueRetry                  DueReason = "retry_due"
-	DueUpgradeReconstruction  DueReason = "upgrade_reconstruction"
+	DueIncidentCreated         DueReason = "incident_created"
+	DueMembershipChanged       DueReason = "membership_changed"
+	DueNewSymptom              DueReason = "new_symptom"
+	DueAlertResolved           DueReason = "alert_resolved"
+	DueAlertRefired            DueReason = "alert_refired"
+	DueDurationMilestone       DueReason = "duration_milestone"
+	DueConnectorHealthChanged  DueReason = "connector_health_changed"
+	DueSourceProvenanceChanged DueReason = "source_provenance_changed"
+	DueSemanticProfileChanged  DueReason = "semantic_profile_changed"
+	DueTriageChanged           DueReason = "triage_changed"
+	DueOperatorJudgment        DueReason = "operator_judgment"
+	DueEnvelopeChanged         DueReason = "envelope_changed"
+	DueEnvelopeBoundary        DueReason = "envelope_boundary"
+	DueJudgmentBoundary        DueReason = "judgment_boundary"
+	DueManualReassessment      DueReason = "manual_reassessment"
+	DueRecoveryGraceExpired    DueReason = "recovery_grace_expired"
+	DueObservationDeadline     DueReason = "observation_deadline"
+	DueRetry                   DueReason = "retry_due"
+	DueUpgradeReconstruction   DueReason = "upgrade_reconstruction"
 	// DueOperatorArtifactRecorded marks a Situation due because a durable
 	// operator artifact input (an attributed annotation or a Captured
 	// verdict) was applied and awaits journaling (R5). It is distinct from
@@ -134,7 +135,7 @@ const (
 func (d DueReason) Validate() error {
 	return validateEnum("due_reason", d,
 		DueIncidentCreated, DueMembershipChanged, DueNewSymptom, DueAlertResolved, DueAlertRefired,
-		DueDurationMilestone, DueConnectorHealthChanged, DueSemanticProfileChanged, DueTriageChanged,
+		DueDurationMilestone, DueConnectorHealthChanged, DueSourceProvenanceChanged, DueSemanticProfileChanged, DueTriageChanged,
 		DueOperatorJudgment, DueEnvelopeChanged, DueEnvelopeBoundary, DueJudgmentBoundary,
 		DueManualReassessment, DueRecoveryGraceExpired, DueObservationDeadline, DueRetry,
 		DueUpgradeReconstruction, DueOperatorArtifactRecorded)

@@ -31,6 +31,103 @@ type ZabbixProblemClient interface {
 		before func() error, after func(started bool, err error)) (zabbix.ProblemHistoryResult, error)
 }
 
+// ZabbixSourceDefinitionClient is ADR-0053's bounded boundary for current
+// effective rule configuration. It stays separate from historical event truth.
+type ZabbixSourceDefinitionClient interface {
+	SourceRuleVersionBounded(ctx context.Context, sourceInstanceID, host, triggerID string,
+		before func() error, after func(started bool, err error)) (zabbix.SourceRuleDefinition, error)
+}
+
+// ZabbixProblemStateClient is the bounded current-state boundary.
+type ZabbixProblemStateClient interface {
+	ProblemStateBounded(ctx context.Context, host, triggerID string,
+		before func() error, after func(started bool, err error)) (zabbix.ProblemState, error)
+}
+
+type zabbixProblemStateParameters struct {
+	Host             string `json:"host"`
+	TriggerID        string `json:"trigger_id"`
+	TriggerVersion   string `json:"trigger_version"`
+	SourceInstanceID string `json:"source_instance_id,omitempty"`
+	FreshForSeconds  int    `json:"fresh_for_seconds,omitempty"`
+}
+
+// ZabbixProblemStateExecutor normalizes one exact current problem state.
+type ZabbixProblemStateExecutor struct {
+	Client           ZabbixProblemStateClient
+	SourceDefinition ZabbixSourceDefinitionClient
+	Clock            func() time.Time
+}
+
+func (e *ZabbixProblemStateExecutor) clock() time.Time {
+	if e.Clock != nil {
+		return e.Clock()
+	}
+	return time.Now().UTC()
+}
+
+func (e *ZabbixProblemStateExecutor) Execute(ctx context.Context, plan model.Plan, recorder observation.RequestRecorder) (model.Run, error) {
+	now := e.clock()
+	var params zabbixProblemStateParameters
+	if err := json.Unmarshal(plan.Parameters, &params); err != nil || params.Host == "" || params.TriggerID == "" || params.TriggerVersion == "" {
+		return unresolvedRun(plan, now), nil
+	}
+	before, after, budgetExhausted := requestHooks(ctx, recorder, e.clock)
+	if e.SourceDefinition == nil || params.SourceInstanceID == "" {
+		return unresolvedRun(plan, now), nil
+	}
+	definition, definitionErr := e.SourceDefinition.SourceRuleVersionBounded(ctx, params.SourceInstanceID, params.Host, params.TriggerID, before, after)
+	if definitionErr != nil {
+		if *budgetExhausted {
+			return withheldRun(plan, now), nil
+		}
+		return zabbixProblemStateUnavailableRun(plan, now, "source_definition_unavailable"), nil
+	}
+	state, err := e.Client.ProblemStateBounded(ctx, params.Host, params.TriggerID, before, after)
+	if err != nil {
+		if *budgetExhausted {
+			return withheldRun(plan, now), nil
+		}
+		if errors.Is(err, zabbix.ErrNotFound) {
+			return unresolvedRun(plan, now), nil
+		}
+		if isResponseTooLarge(err) {
+			return responseTooLargeRun(plan, now, now.Add(5*time.Minute)), nil
+		}
+		return model.Run{}, fmt.Errorf("connectors: zabbix problem state: %w", err)
+	}
+	presence := model.ProblemPresenceAbsent
+	if state.Presence == zabbix.ProblemPresent {
+		presence = model.ProblemPresencePresent
+	}
+	value, err := json.Marshal(model.ZabbixProblemStateObservation{
+		SourceInstanceID: params.SourceInstanceID, Host: params.Host, TriggerID: params.TriggerID,
+		TriggerVersion: definition.Version, Presence: presence, EventIDs: state.EventIDs,
+	})
+	if err != nil {
+		return model.Run{}, err
+	}
+	freshFor := time.Duration(params.FreshForSeconds) * time.Second
+	if freshFor <= 0 {
+		freshFor = 5 * time.Minute
+	}
+	returned := 0
+	if presence == model.ProblemPresencePresent {
+		returned = 1
+	}
+	return boundedRun(plan, now, boundedResult{
+		Kind: "zabbix_problem_state", Value: value, Returned: returned, ExpiresAt: now.Add(freshFor),
+	}), nil
+}
+
+func zabbixProblemStateUnavailableRun(plan model.Plan, now time.Time, limitation string) model.Run {
+	return model.Run{
+		ID: "run:" + plan.ID, CycleID: plan.CycleID, PlanID: plan.ID, Status: model.ResultUnavailable,
+		Coverage:        model.Coverage{Start: plan.Start, End: plan.End, Complete: false},
+		LimitationCodes: []string{limitation}, ObservedAt: now, ExpiresAt: now.Add(5 * time.Minute),
+	}
+}
+
 // zabbixMetricParameters is zabbix_metric_range's own typed
 // Plan.Parameters shape: the exact adapter-resolved technical host and
 // item key from the source trigger's items — never a model-invented
@@ -123,16 +220,19 @@ func (e *ZabbixMetricExecutor) Execute(ctx context.Context, plan model.Plan, rec
 // Plan.Parameters shape: exact member host/trigger identifiers. Host and
 // TriggerID are both required — there is no Scope.SubjectID fallback (F17).
 type zabbixProblemParameters struct {
-	Host        string `json:"host"`
-	TriggerID   string `json:"trigger_id"`
-	SeverityMin string `json:"severity_min,omitempty"`
+	Host             string `json:"host"`
+	TriggerID        string `json:"trigger_id"`
+	SeverityMin      string `json:"severity_min,omitempty"`
+	SourceInstanceID string `json:"source_instance_id,omitempty"`
+	FreshForSeconds  int    `json:"fresh_for_seconds,omitempty"`
 }
 
 // ZabbixProblemExecutor implements observation.Executor for
 // zabbix_problem_history.
 type ZabbixProblemExecutor struct {
-	Client ZabbixProblemClient
-	Clock  func() time.Time
+	Client           ZabbixProblemClient
+	SourceDefinition ZabbixSourceDefinitionClient
+	Clock            func() time.Time
 }
 
 func (e *ZabbixProblemExecutor) clock() time.Time {
@@ -155,10 +255,12 @@ func (e *ZabbixProblemExecutor) Execute(ctx context.Context, plan model.Plan, re
 		return unresolvedRun(plan, now), nil
 	}
 
-	// Up to two reservations: the primary event.get and the batched
-	// recovery-clock lookup; the client degrades a budget-denied second
-	// request to recovery_unknown rather than losing the primary evidence.
+	// Up to six reservations: four (or five with direct dependencies) for a
+	// consistent source-definition snapshot, then the primary event.get and
+	// optional recovery-clock lookup. Every request shares this plan's one
+	// durable budget.
 	before, after, budgetExhausted := requestHooks(ctx, recorder, e.clock)
+	sourceFact, sourceLimitation := e.sourceDefinitionFact(ctx, plan, params, before, after, budgetExhausted)
 	limit := plan.Limit
 	if limit <= 0 {
 		limit = 20
@@ -167,16 +269,17 @@ func (e *ZabbixProblemExecutor) Execute(ctx context.Context, plan model.Plan, re
 	result, err := e.Client.ProblemHistory(ctx, host, params.TriggerID, plan.Start, plan.End, params.SeverityMin, limit, before, after)
 	if err != nil {
 		if *budgetExhausted {
-			return withheldRun(plan, now), nil
+			return appendSourceDefinition(withheldRun(plan, now), sourceFact, sourceLimitation), nil
 		}
 		if isResponseTooLarge(err) {
-			return responseTooLargeRun(plan, now, expiresAt), nil
+			return appendSourceDefinition(responseTooLargeRun(plan, now, expiresAt), sourceFact, sourceLimitation), nil
 		}
-		return model.Run{}, fmt.Errorf("connectors: zabbix problem history: %w", err)
+		failed := appendSourceDefinition(zabbixProblemHistoryFailedRun(plan, now), sourceFact, sourceLimitation)
+		return failed, &observation.FailedRunWithEvidenceError{Err: fmt.Errorf("connectors: zabbix problem history: %w", err)}
 	}
 
 	if result.ForeignRowsDropped > 0 && len(result.Episodes) == 0 {
-		return unresolvedRun(plan, now), nil
+		return appendSourceDefinition(unresolvedRun(plan, now), sourceFact, sourceLimitation), nil
 	}
 
 	// Canonical order (newest event id first) before hashing (F28). The
@@ -203,11 +306,94 @@ func (e *ZabbixProblemExecutor) Execute(ctx context.Context, plan model.Plan, re
 	if result.UnresolvedRecoveryCount > 0 {
 		extra = append(extra, limitationRecoveryUnknown)
 	}
-	return boundedRun(plan, now, boundedResult{
+	return appendSourceDefinition(boundedRun(plan, now, boundedResult{
 		Kind: "problem_episode", Value: value, Returned: kept, Omitted: len(episodes) - kept + omittedSourceRows,
 		Truncated: result.Truncated || !result.Complete || result.ForeignRowsDropped > 0, Capped: kept < len(episodes),
 		ExtraLimitations: extra, ExpiresAt: expiresAt,
-	}), nil
+	}), sourceFact, sourceLimitation), nil
+}
+
+func zabbixProblemHistoryFailedRun(plan model.Plan, now time.Time) model.Run {
+	return model.Run{
+		ID: "run:" + plan.ID, CycleID: plan.CycleID, PlanID: plan.ID, Status: model.ResultFailed,
+		Coverage:        model.Coverage{Start: plan.Start, End: plan.End, Complete: false},
+		LimitationCodes: []string{"execution_failed"},
+		ObservedAt:      now, ExpiresAt: now.Add(model.MaxWindowHoursMetricsLogs * time.Hour),
+	}
+}
+
+func (e *ZabbixProblemExecutor) sourceDefinitionFact(ctx context.Context, plan model.Plan, params zabbixProblemParameters,
+	before func() error, after func(bool, error), budgetExhausted *bool) (*model.Fact, string) {
+	if e.SourceDefinition == nil {
+		return nil, ""
+	}
+	freshFor := time.Duration(params.FreshForSeconds) * time.Second
+	if freshFor <= 0 {
+		freshFor = 5 * time.Minute
+	}
+	observation := model.SourceDefinitionObservation{
+		Source: "zabbix", InstanceID: params.SourceInstanceID, RuleID: params.TriggerID,
+		Host: params.Host, HistoricalProven: false,
+	}
+	if params.SourceInstanceID == "" {
+		observation.UnavailableReason = "delivery_instance_unknown"
+	} else {
+		definition, err := e.SourceDefinition.SourceRuleVersionBounded(ctx, params.SourceInstanceID, params.Host, params.TriggerID, before, after)
+		if err == nil {
+			observation.Available = true
+			observation.EndpointID = definition.EndpointID
+			observation.VersionAlgorithm = definition.Algorithm
+			observation.Version = definition.Version
+			observation.ComponentDigests = definition.ComponentDigests
+			observation.TriggerIDs = definition.TriggerIDs
+			observation.ItemIDs = definition.ItemIDs
+		} else if reason, ok := zabbix.DefinitionUnavailableReason(err); ok {
+			observation.UnavailableReason = reason
+		} else {
+			switch {
+			case *budgetExhausted:
+				observation.UnavailableReason = "withheld_by_budget"
+			case isResponseTooLarge(err):
+				observation.UnavailableReason = "response_too_large"
+			case errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled):
+				observation.UnavailableReason = "timeout"
+			default:
+				observation.UnavailableReason = "api_unavailable"
+			}
+		}
+	}
+	value, err := json.Marshal(observation)
+	if err != nil {
+		return nil, "source_definition_encoding_failed"
+	}
+	status := model.ResultUnavailable
+	if observation.Available {
+		status = model.ResultConfirmedValue
+	}
+	observedAt := e.clock()
+	fact := &model.Fact{
+		ID: factID(plan.ID, "source_definition", value), RunID: "run:" + plan.ID,
+		Kind: "source_definition", Subject: plan.Scope.SubjectID, Digest: digestOf(value),
+		SchemaVersion: model.FactSchemaVersion, Value: value, ResultStatus: status,
+		Freshness: model.FreshnessFresh, ObservedAt: observedAt, ExpiresAt: observedAt.Add(freshFor), Material: true,
+	}
+	if observation.Available {
+		return fact, ""
+	}
+	return fact, "source_definition_" + observation.UnavailableReason
+}
+
+func appendSourceDefinition(run model.Run, fact *model.Fact, limitation string) model.Run {
+	if fact != nil {
+		run.Facts = append(run.Facts, *fact)
+		if fact.ExpiresAt.After(run.ExpiresAt) {
+			run.ExpiresAt = fact.ExpiresAt
+		}
+	}
+	if limitation != "" {
+		run.LimitationCodes = append(run.LimitationCodes, limitation)
+	}
+	return run
 }
 
 // limitationRecoveryUnknown marks a problem-history run in which at least

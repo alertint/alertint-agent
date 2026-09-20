@@ -11,11 +11,7 @@ import (
 
 func TestConnectorState_TableIsStrict(t *testing.T) {
 	ctx := context.Background()
-	st, err := Open(ctx, ":memory:")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer func() { _ = st.Close() }()
+	st := newTestStore(t)
 
 	var ddl string
 	if err := st.DB().QueryRowContext(ctx,
@@ -30,8 +26,7 @@ func TestConnectorState_TableIsStrict(t *testing.T) {
 
 func TestConnectorState_SaveLoadRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	st, _ := Open(ctx, ":memory:")
-	defer func() { _ = st.Close() }()
+	st := newTestStore(t)
 
 	// Missing name → ("", false, nil).
 	if v, found, err := st.LoadConnectorState(ctx, "sentry-releases"); err != nil || found || v != "" {
@@ -73,8 +68,7 @@ func sentryChange(id string, occurred time.Time) Change {
 
 func TestInsertChangesAndAdvanceWatermark_AtomicCommit(t *testing.T) {
 	ctx := context.Background()
-	st, _ := Open(ctx, ":memory:")
-	defer func() { _ = st.Close() }()
+	st := newTestStore(t)
 
 	base := time.Date(2026, 6, 25, 10, 0, 0, 0, time.UTC)
 	batch := []Change{
@@ -105,8 +99,7 @@ func TestInsertChangesAndAdvanceWatermark_AtomicCommit(t *testing.T) {
 // InsertChange path stays strict (covered separately).
 func TestInsertChangesAndAdvanceWatermark_DuplicateIDIsNoOpNotError(t *testing.T) {
 	ctx := context.Background()
-	st, _ := Open(ctx, ":memory:")
-	defer func() { _ = st.Close() }()
+	st := newTestStore(t)
 
 	base := time.Date(2026, 6, 25, 10, 0, 0, 0, time.UTC)
 	// A change already persisted by an earlier cycle.
@@ -142,8 +135,7 @@ func TestInsertChangesAndAdvanceWatermark_DuplicateIDIsNoOpNotError(t *testing.T
 
 func TestInsertChangesAndAdvanceWatermark_RollsBackOnBadChange(t *testing.T) {
 	ctx := context.Background()
-	st, _ := Open(ctx, ":memory:")
-	defer func() { _ = st.Close() }()
+	st := newTestStore(t)
 
 	// Seed an existing watermark so we can prove it does NOT advance on failure.
 	const seed = `{"last_emitted_at":"2026-06-25T09:00:00Z","boundary_event_ids":[]}`
@@ -177,8 +169,7 @@ func TestInsertChangesAndAdvanceWatermark_RollsBackOnBadChange(t *testing.T) {
 // logical change written through each path must produce identical column values.
 func TestSharedInsertPath_ByteIdenticalRows(t *testing.T) {
 	ctx := context.Background()
-	st, _ := Open(ctx, ":memory:")
-	defer func() { _ = st.Close() }()
+	st := newTestStore(t)
 
 	at := time.Date(2026, 6, 25, 10, 0, 0, 0, time.UTC)
 	viaDB := sentryChange("via-db", at)

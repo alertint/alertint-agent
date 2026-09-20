@@ -116,6 +116,42 @@ func TestCompactRecoveredMovesMetadataToReply(t *testing.T) {
 	}
 }
 
+func TestCompactActiveRootMovesAnalysisMetadataToReply(t *testing.T) {
+	b := canonicalFixture(t)
+	b.Work.Phase = model.WorkPhaseSettled
+	b.Analyses = []model.IncidentAnalysis{{Title: "Database load explained", Summary: "The scheduled reconciliation job explains the load."}}
+	started := b.Flow.FirstReceivedAt.Add(37 * time.Second)
+	completed := b.Flow.FirstReceivedAt.Add(51 * time.Second)
+	runtimeSeconds := int64(13)
+	b.Flow.InvestigationStartedAt = &started
+	b.Flow.InvestigationCompletedAt = &completed
+	b.Flow.InvestigationRuntimeSeconds = &runtimeSeconds
+	b.Flow.AnalysisUsage = model.AnalysisUsage{
+		CallsKnown: true, Calls: 2,
+		InputTokensKnown: true, InputTokens: 4400,
+		OutputTokensKnown: true, OutputTokens: 1205,
+	}
+	in := bcRoot(t, model.LifecycleActive, model.AttentionObserve, bcObserveMonitorContract(bcNow(t)), b)
+	root, err := RenderSituationRoot(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, unwanted := range []string{"Analysis completed", "Investigation runtime", "Analysis usage"} {
+		if strings.Contains(root.Text, unwanted) {
+			t.Fatalf("%q still on active root:\n%s", unwanted, root.Text)
+		}
+	}
+	reply, err := RenderSituationReply(SituationReplyInput{Transition: in.SourceTransition, ReplyKind: model.ReplyAnalysisCompleted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bcBothSurfaces(t, reply,
+		"*Analysis completed:* 51s after first receipt",
+		"*Investigation runtime:* 13s",
+		"*Analysis usage:* 2 calls · 4,400 input / 1,205 output tokens",
+	)
+}
+
 func TestCompactCanonicalSupersededStartRetainsFrozenScope(t *testing.T) {
 	b := canonicalFixture(t)
 	b.Work.Phase = model.WorkPhaseExecuting

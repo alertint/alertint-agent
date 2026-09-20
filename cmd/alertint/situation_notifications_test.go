@@ -186,12 +186,19 @@ type fakeDelivererStore struct {
 	history    situation.DeliveredHistory
 	historyErr error
 
-	judgment    *store.SituationJudgmentView
-	judgmentErr error
+	judgment              *store.SituationJudgmentView
+	judgmentErr           error
+	expectedBehavior      model.ExpectedBehaviorEvaluation
+	expectedBehaviorFound bool
+	expectedBehaviorErr   error
 }
 
 func (f *fakeDelivererStore) GetCurrentSituationJudgment(context.Context, string, time.Time) (*store.SituationJudgmentView, error) {
 	return f.judgment, f.judgmentErr
+}
+
+func (f *fakeDelivererStore) GetCurrentExpectedBehaviorEvaluationAt(context.Context, string, time.Time) (model.ExpectedBehaviorEvaluation, bool, error) {
+	return f.expectedBehavior, f.expectedBehaviorFound, f.expectedBehaviorErr
 }
 
 // GetCommunicatedHistory is B5's delivery-time read of what the operator
@@ -413,6 +420,31 @@ func TestSituationDelivererRootSyncRejectsRetiredExpectedAuthority(t *testing.T)
 	}
 	if len(api.posts)+len(api.updates) != 0 {
 		t.Fatal("retired expected authority reached Slack")
+	}
+}
+
+func TestSituationDelivererRootSyncRejectsExpiredExpectedSchedule(t *testing.T) {
+	started := sdMustTime(t, "2026-09-05T09:00:00Z")
+	now := sdMustTime(t, "2026-09-05T10:00:00Z")
+	deadline := now.Add(time.Hour)
+	contract := sdRunningTriageContract(deadline)
+	boundary := now.Add(-time.Minute)
+	briefing := &model.OperatorBriefing{Scope: "db-prod-1", Work: model.WorkProjection{Phase: model.WorkPhaseSettled},
+		ExpectedBehavior: &model.ExpectedBehaviorProjection{EnvelopeID: "env-1", Version: 2, AssertedOperator: "Janis", Disposition: model.ExpectedBehaviorDispositionMatched, Boundary: &boundary}}
+	tr := sdTransition(5, model.LifecycleActive, contract, model.ReasonOperatorContractChanged,
+		model.JournalOperatorContractChanged, model.JournalData{Headline: "Expected schedule", OccurredAt: started},
+		model.ProjectionFacts{Briefing: briefing, EffectiveStartedAt: started, EffectiveStartedAtBasis: model.SourceTimeBasisSourcePayload}, now)
+	summary := sdSummary(5, contract, started, now)
+	summary.Briefing = briefing
+	fs := &fakeDelivererStore{episode: store.SituationEpisodeView{Summary: summary, SourceTransition: tr}}
+	api := &fakeSlackAPI{}
+	d := NewSituationDeliverer(fs, api, "C-default", func() time.Time { return now })
+
+	if _, err := d.Deliver(context.Background(), sdRootSyncIntent(tr.ID, 5, &deadline, now)); err == nil {
+		t.Fatal("Deliver() error = nil, want expired schedule authority rejected")
+	}
+	if len(api.posts)+len(api.updates) != 0 {
+		t.Fatal("expired expected schedule reached Slack")
 	}
 }
 

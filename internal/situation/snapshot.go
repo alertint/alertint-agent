@@ -35,6 +35,10 @@ type SnapshotInput struct {
 	// heads remain history but carry no current authority.
 	Judgment              *model.SituationJudgment
 	JudgmentApplicability model.JudgmentApplicability
+	// ExpectedBehavior is the reusable schedule evaluation derived from this
+	// same coherent Situation, envelope-head, and prepared-evidence read.
+	ExpectedBehavior      *model.ExpectedBehaviorEvaluation
+	ExpectedBehaviorHeads []model.ExpectedBehaviorHead
 
 	// ControllerParked is the Situation's current controller_parked_at/
 	// controller_parked_reason projection, plus the material fact hash the
@@ -211,6 +215,9 @@ type Delivery struct {
 	// filled from a hash of the alert name or any other invented value.
 	SourceSignalID      *string
 	SourceSignalVersion *string
+	// SourceInstanceID is the stable, non-secret installation identity
+	// recorded by the source adapter for this immutable delivery.
+	SourceInstanceID *string
 	// AcquisitionMode and PollIntervalSeconds are this delivery's own
 	// proven acquisition mode ("webhook"|"poll") and, for poll, its real
 	// configured interval — alert_deliveries.acquisition_mode/

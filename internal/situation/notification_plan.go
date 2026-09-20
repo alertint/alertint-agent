@@ -236,7 +236,7 @@ func replyEligibleTransition(in PublicationInput, tr model.Transition) bool {
 		// truth already (R4).
 		return false
 	}
-	if tr.Journal.JudgmentChange != "" {
+	if tr.Journal.JudgmentChange != "" || tr.Journal.ExpectedBehaviorChange != "" {
 		return true
 	}
 	var cands []model.MaterialCandidate

@@ -200,7 +200,10 @@ func TestSituationCurrentReadNeverPresentsExpiredAuthority(t *testing.T) {
 	if payload["active_judgment"] != nil {
 		t.Fatalf("expired authority presented: %#v", payload["active_judgment"])
 	}
-	app := payload["judgment_applicability"].(map[string]any)
+	app, ok := payload["judgment_applicability"].(map[string]any)
+	if !ok {
+		t.Fatalf("judgment_applicability = %#v, want object", payload["judgment_applicability"])
+	}
 	if app["reason"] != "expired" {
 		t.Fatalf("applicability = %#v", app)
 	}
