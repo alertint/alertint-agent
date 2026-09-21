@@ -72,11 +72,15 @@ type LLMHealthReader interface {
 	Snapshot() llmhealth.Snapshot
 }
 
+type auditAppender interface {
+	Append(ctx context.Context, actor, kind string, payload any) error
+}
+
 // Server is the inbound webhook host. Construct with New; mount Handler() on an
 // http.Server bound to receivers.address.
 type Server struct {
 	store     *store.Store
-	auditor   *audit.Auditor
+	auditor   auditAppender
 	receivers []Receiver
 	logger    *slog.Logger
 	health    *health.Registry
@@ -131,10 +135,12 @@ func (s *Server) Handler() http.Handler {
 }
 
 // handleReceiver returns the shared pipeline for one receiver: auth →
-// Content-Type guard → cap → read → Ingest → audit → 204. Ingest failures
+// Content-Type guard → cap → read → Ingest → 204 → audit. Ingest failures
 // map to 400 (invalid payload) or 503 (durability failure, via
-// *DurabilityError); the audit append happens only after Ingest has already
-// durably committed, so it can never change a successful response.
+// *DurabilityError). Once Ingest has durably committed, the 204 is flushed
+// before the best-effort audit append, so that response cannot be delayed or
+// changed by the append. The handler still completes the bounded append before
+// returning; a subsequent request on the same connection may wait for it.
 func (s *Server) handleReceiver(r Receiver) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		ctx := req.Context()
@@ -175,13 +181,19 @@ func (s *Server) handleReceiver(r Receiver) http.HandlerFunc {
 			return
 		}
 
-		if appendErr := s.auditor.Append(ctx, r.Name(), sum.Kind, sum.Audit); appendErr != nil {
+		w.WriteHeader(http.StatusNoContent)
+		if flushErr := http.NewResponseController(w).Flush(); flushErr != nil && !errors.Is(flushErr, http.ErrNotSupported) {
+			s.logger.Warn("flush durable acceptance response", "err", flushErr)
+		}
+
+		auditCtx, cancelAudit := context.WithTimeout(context.WithoutCancel(ctx), DefaultWriteTimeout)
+		defer cancelAudit()
+		if appendErr := s.auditor.Append(auditCtx, r.Name(), sum.Kind, sum.Audit); appendErr != nil {
 			s.logger.Error("audit append failed",
 				slog.String("kind", sum.Kind),
 				slog.String("err", appendErr.Error()),
 			)
 		}
-		w.WriteHeader(http.StatusNoContent)
 	}
 }
 

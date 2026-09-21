@@ -153,14 +153,8 @@ func TestChangeReceiver_PersistsAndAudits(t *testing.T) {
 		t.Fatal("change route must not invoke the alert receiver's wake")
 	}
 
-	// Audit row recorded under kind=change.received.
-	var n int
-	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_log WHERE kind='change.received'`).Scan(&n); err != nil {
-		t.Fatalf("count audit: %v", err)
-	}
-	if n != 1 {
-		t.Fatalf("change.received audit rows = %d, want 1", n)
-	}
+	// The response is flushed before the best-effort audit append completes.
+	waitForLoadCount(t, st, `SELECT COUNT(*) FROM audit_log WHERE kind='change.received'`, 1)
 
 	// Per-route token isolation: alert token must not authorize the change route.
 	req2, _ := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/webhook/change", strings.NewReader(body))

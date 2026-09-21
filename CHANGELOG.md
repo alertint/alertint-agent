@@ -43,6 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Inbound webhooks now flush `204` as soon as their durable state commits,
+  without making that response wait for the best-effort audit append. The
+  bounded audit write continues after client disconnects; persistence failures
+  still return retryable `503` responses before any acknowledgement.
 - Preserve the released 0.13.x migration sequence when upgrading to the
   state-controller schema, including durable alert intake. Databases created
   with the conflicting prerelease numbering are rejected before migration;

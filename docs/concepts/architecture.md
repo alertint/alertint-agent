@@ -61,6 +61,12 @@ anything is written; a payload that's valid but can't be durably
 persisted returns `503` so a well-behaved sender retries — nothing is
 ever silently dropped or acknowledged without being on disk.
 
+The audit row is best effort and follows this acceptance boundary. A sender
+may observe `204` before that row becomes readable; the bounded append keeps
+running if the client disconnects. The append still completes in the request
+handler, so a client reusing the same HTTP connection may wait for it before
+the server reads that connection's next request.
+
 This same content digest has a consequence worth naming for a repeat-capable
 sender: because the delivery id is derived purely from the normalized
 payload (never from a receipt timestamp), a genuine repeat whose payload is
