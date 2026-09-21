@@ -12,25 +12,25 @@ import (
 )
 
 // ----------------------------------------------------------------------
-// Migration 0022 upgrade test (B0 integration contract §5.3/§6, E1): a
-// populated migration-21 database must relax notification_intents'
+// Migration 0023 upgrade test (B0 integration contract §5.3/§6, E1): a
+// populated migration-22 database must relax notification_intents'
 // supersession CHECK to admit a live thread_append assurance alongside
-// root_sync, gain the thread supersession guard trigger, keep 0020's
+// root_sync, gain the thread supersession guard trigger, keep 0021's
 // live-only rule, preserve slack_delivery_gaps.recovery_notice_intent_id
 // across the rebuild, keep MaxSchemaVersion honest at the newest embedded
 // migration, pass PRAGMA foreign_key_check, and fabricate no rows.
 //
 // Open() applies the whole embedded chain, so the guard this exercises is
-// migration 0023's replacement (D1, lead review 2026-09-10), not 0022's
+// migration 0024's replacement (D1, lead review 2026-09-10), not 0023's
 // original. Both refuse this fixture's rows for the same reason and the
-// upgrade path is what is under test here; 0023's own before/after upgrade
+// upgrade path is what is under test here; 0024's own before/after upgrade
 // is notification_assurance_candidate_guard_upgrade_test.go, and the two
 // guards' differing verdicts are
 // situation_assurance_candidate_parity_test.go.
 // ----------------------------------------------------------------------
 
-// seedMigration21ReplySupersessionFixture builds a database shaped like the
-// schema immediately before 0022 (every embedded migration through 21) and
+// seedMigration22ReplySupersessionFixture builds a database shaped like the
+// schema immediately before 0023 (every embedded migration through 22) and
 // seeds one Situation with two Transitions — one investigation_started
 // (the assurance), one an ordinary evidence_conclusion — three
 // notification_intents rows (a pending assurance thread_append, a pending
@@ -38,7 +38,7 @@ import (
 // one slack_delivery_gaps row whose recovery_notice_intent_id points at the
 // delivered row, so the upgrade is exercised over real ledger rows and a
 // real cross-table FK, not an empty table.
-func seedMigration21ReplySupersessionFixture(t *testing.T, path string) (pendingAssuranceID, pendingOtherID, deliveredAssuranceID, gapID string) {
+func seedMigration22ReplySupersessionFixture(t *testing.T, path string) (pendingAssuranceID, pendingOtherID, deliveredAssuranceID, gapID string) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -62,7 +62,7 @@ func seedMigration21ReplySupersessionFixture(t *testing.T, path string) (pending
 	}
 	fixture := &Store{db: db}
 	for _, m := range migrations {
-		if m.version > 21 {
+		if m.version > 22 {
 			continue
 		}
 		if err := fixture.applyMigration(ctx, m); err != nil {
@@ -170,8 +170,8 @@ func seedMigration21ReplySupersessionFixture(t *testing.T, path string) (pending
 
 func TestNotificationReplySupersessionUpgrade(t *testing.T) {
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "migration21-reply-supersession.db")
-	pendingAssuranceID, pendingOtherID, deliveredAssuranceID, gapID := seedMigration21ReplySupersessionFixture(t, path)
+	path := filepath.Join(t.TempDir(), "migration22-reply-supersession.db")
+	pendingAssuranceID, pendingOtherID, deliveredAssuranceID, gapID := seedMigration22ReplySupersessionFixture(t, path)
 
 	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
@@ -180,18 +180,18 @@ func TestNotificationReplySupersessionUpgrade(t *testing.T) {
 	defer func() { _ = st.Close() }()
 
 	var applied int
-	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 22`).Scan(&applied); err != nil {
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 23`).Scan(&applied); err != nil {
 		t.Fatal(err)
 	}
 	if applied != 1 {
-		t.Fatalf("migration 22 applied count = %d, want 1", applied)
+		t.Fatalf("migration 23 applied count = %d, want 1", applied)
 	}
 	got, err := MaxSchemaVersion()
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	if got != 35 {
-		t.Fatalf("MaxSchemaVersion = %d, want 35", got)
+	if got != 36 {
+		t.Fatalf("MaxSchemaVersion = %d, want 36", got)
 	}
 
 	assertNoForeignKeyViolations(ctx, t, st)
@@ -218,12 +218,12 @@ func TestNotificationReplySupersessionUpgrade(t *testing.T) {
 		UPDATE notification_intents SET status = 'superseded', supersession_reason = 'superseded_by_finding',
 		       replacement_intent_id = ?
 		WHERE id = ?`, pendingOtherID, pendingAssuranceID); err != nil {
-		t.Fatalf("supersede a pending assurance thread_append after 0022: %v", err)
+		t.Fatalf("supersede a pending assurance thread_append after 0023: %v", err)
 	}
 
 	// A pending thread_append that is not an assurance may not — the guard
 	// trigger. This fixture's row records no candidates at all, so both
-	// 0022's label rule and 0023's legacy fallback reach the same verdict
+	// 0023's label rule and 0024's legacy fallback reach the same verdict
 	// through it: its journal_kind is evidence_conclusion.
 	if _, err := st.DB().ExecContext(ctx, `
 		UPDATE notification_intents SET status = 'superseded', supersession_reason = 'superseded_by_finding',
@@ -232,7 +232,7 @@ func TestNotificationReplySupersessionUpgrade(t *testing.T) {
 		t.Fatalf("superseding a non-assurance thread_append = %v, want the supersession guard's rejection", err)
 	}
 
-	// A DELIVERED assurance thread_append still may not — 0020's live-only
+	// A DELIVERED assurance thread_append still may not — 0021's live-only
 	// rule, unchanged and now also covering thread_append.
 	if _, err := st.DB().ExecContext(ctx, `
 		UPDATE notification_intents SET status = 'superseded', supersession_reason = 'superseded_by_finding',

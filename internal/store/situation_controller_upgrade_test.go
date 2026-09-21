@@ -13,20 +13,20 @@ import (
 )
 
 // ----------------------------------------------------------------------
-// Migration-14 upgrade: 0015's ALTER TABLE additions to `situations` and
+// Migration-15 upgrade: 0016's ALTER TABLE additions to `situations` and
 // its new tables must land cleanly on top of a populated Plan 1 database.
 // ----------------------------------------------------------------------
 
-// migration14Fixture builds a file-backed database with only migrations
-// 1-14 applied (the schema as it existed immediately before this task's
-// 0015/0016), seeds one Alert, one operational Incident, and one active
+// migration15Fixture builds a file-backed database with only migrations
+// 1-15 applied (the schema as it existed immediately before this task's
+// 0016/0017), seeds one Alert, one operational Incident, and one active
 // Situation, and returns the file path so a caller can reopen it with the
-// current Open and observe 0015/0016 land cleanly on pre-existing data.
-func migration14Fixture(t *testing.T) string {
+// current Open and observe 0016/0017 land cleanly on pre-existing data.
+func migration15Fixture(t *testing.T) string {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
-	path := filepath.Join(dir, "migration14.db")
+	path := filepath.Join(dir, "migration15.db")
 
 	db, err := sql.Open("sqlite", buildDSN(path))
 	if err != nil {
@@ -49,7 +49,7 @@ func migration14Fixture(t *testing.T) string {
 	}
 	fixture := &Store{db: db}
 	for _, m := range all {
-		if m.version > 14 {
+		if m.version > 15 {
 			continue
 		}
 		if err := fixture.applyMigration(ctx, m); err != nil {
@@ -87,14 +87,14 @@ func migration14Fixture(t *testing.T) string {
 	return path
 }
 
-// TestSituationControllerSchemaUpgradesMigration14Database is the brief's
-// upgrade test: opening a migration-14 database with the current Open must
-// apply 0015 and 0016 without disturbing rows that predate them, and the
+// TestSituationControllerSchemaUpgradesMigration15Database is the brief's
+// upgrade test: opening a migration-15 database with the current Open must
+// apply 0016 and 0017 without disturbing rows that predate them, and the
 // new situations columns must default to "no Assessment yet" on the
 // pre-existing row. PRAGMA foreign_key_check must report no violations.
-func TestSituationControllerSchemaUpgradesMigration14Database(t *testing.T) {
+func TestSituationControllerSchemaUpgradesMigration15Database(t *testing.T) {
 	ctx := context.Background()
-	path := migration14Fixture(t)
+	path := migration15Fixture(t)
 	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)
@@ -102,7 +102,7 @@ func TestSituationControllerSchemaUpgradesMigration14Database(t *testing.T) {
 	defer func() { _ = st.Close() }()
 
 	var versions int
-	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version IN (15,16)`).Scan(&versions); err != nil {
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version IN (16,17)`).Scan(&versions); err != nil {
 		t.Fatal(err)
 	}
 	if versions != 2 {
@@ -144,7 +144,7 @@ func TestSituationControllerSchemaUpgradesMigration14Database(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------
-// Direct constraint/trigger tests for 0015's new tables.
+// Direct constraint/trigger tests for 0016's new tables.
 // ----------------------------------------------------------------------
 
 func insertSituationFact(ctx context.Context, s *Store, id, situationID, kind string) error {

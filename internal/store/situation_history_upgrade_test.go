@@ -14,24 +14,24 @@ import (
 )
 
 // ----------------------------------------------------------------------
-// Step 1: migration 0017 upgrade tests — a populated Plan 2 (migration 16)
-// fixture must gain the new STRICT tables, land migration 17 in
+// Step 1: migration 0018 upgrade tests — a populated Plan 2 (migration 17)
+// fixture must gain the new STRICT tables, land migration 18 in
 // schema_migrations, pass PRAGMA foreign_key_check, and acquire zero
 // fabricated Transition history for its pre-existing nonterminal/terminal
 // Situations.
 // ----------------------------------------------------------------------
 
-// seedMigration16HistoryFixture builds a database file shaped like the
-// schema immediately before this task's 0017 (every embedded migration
-// through version 16 only, so situation_transitions/situation_episode_
+// seedMigration17HistoryFixture builds a database file shaped like the
+// schema immediately before this task's 0018 (every embedded migration
+// through version 17 only, so situation_transitions/situation_episode_
 // summaries/situation_transition_stream do not exist yet and
-// situation_input_outbox still has its pre-0017 shape) and seeds one
+// situation_input_outbox still has its pre-0018 shape) and seeds one
 // nonterminal ("active") and one terminal ("closed_unknown") Situation,
 // each owning one Incident and one already-"applied" situation_input_outbox
 // row — entirely by direct SQL, since the current ApplySituationInput now
-// references 0017-only columns (applied_input_version, journal_state) that
+// references 0018-only columns (applied_input_version, journal_state) that
 // do not exist at this schema version.
-func seedMigration16HistoryFixture(t *testing.T, path string) (nonterminalID, terminalID string) {
+func seedMigration17HistoryFixture(t *testing.T, path string) (nonterminalID, terminalID string) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -56,7 +56,7 @@ func seedMigration16HistoryFixture(t *testing.T, path string) (nonterminalID, te
 	}
 	fixture := &Store{db: db}
 	for _, m := range migrations {
-		if m.version > 16 {
+		if m.version > 17 {
 			continue
 		}
 		if err := fixture.applyMigration(ctx, m); err != nil {
@@ -112,9 +112,9 @@ func seedMigration16HistoryFixture(t *testing.T, path string) (nonterminalID, te
 }
 
 // TestSituationHistoryUpgrade_CreatesStrictTablesAndBumpsSchemaVersion is
-// the brief's literal Step 1 test: opening a migration-16 database with the
-// current Open must apply 0017, create its three new STRICT tables, land
-// migration 17 in schema_migrations, pass PRAGMA foreign_key_check, and
+// the brief's literal Step 1 test: opening a migration-17 database with the
+// current Open must apply 0018, create its three new STRICT tables, land
+// migration 18 in schema_migrations, pass PRAGMA foreign_key_check, and
 // leave the fixture's pre-existing nonterminal/terminal Situations with zero
 // Transitions.
 //
@@ -122,12 +122,12 @@ func seedMigration16HistoryFixture(t *testing.T, path string) (nonterminalID, te
 // that is a global fact about every embedded migration, owned by
 // store_test.go's dedicated TestMaxSchemaVersion, not by any one migration's
 // own upgrade test — asserting an exact global max here would go stale the
-// moment a later task (0018 onward) adds another migration, exactly as
-// happened once Task 3 landed 0018.
+// moment a later task (0019 onward) adds another migration, exactly as
+// happened once Task 3 landed 0019.
 func TestSituationHistoryUpgrade_CreatesStrictTablesAndBumpsSchemaVersion(t *testing.T) {
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "migration16-history.db")
-	nonterminalID, terminalID := seedMigration16HistoryFixture(t, path)
+	path := filepath.Join(t.TempDir(), "migration17-history.db")
+	nonterminalID, terminalID := seedMigration17HistoryFixture(t, path)
 
 	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
@@ -136,11 +136,11 @@ func TestSituationHistoryUpgrade_CreatesStrictTablesAndBumpsSchemaVersion(t *tes
 	defer func() { _ = st.Close() }()
 
 	var applied int
-	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 17`).Scan(&applied); err != nil {
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 18`).Scan(&applied); err != nil {
 		t.Fatal(err)
 	}
 	if applied != 1 {
-		t.Fatalf("migration 17 applied count = %d, want 1", applied)
+		t.Fatalf("migration 18 applied count = %d, want 1", applied)
 	}
 
 	for _, table := range []string{"situation_transitions", "situation_episode_summaries", "situation_transition_stream"} {
@@ -169,8 +169,8 @@ func TestSituationHistoryUpgrade_CreatesStrictTablesAndBumpsSchemaVersion(t *tes
 // pointer — this migration never invents a Transition to fill that gap.
 func TestSituationHistoryUpgrade_ExistingSituationsRemainReadableWithZeroHistory(t *testing.T) {
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "migration16-history-readable.db")
-	nonterminalID, terminalID := seedMigration16HistoryFixture(t, path)
+	path := filepath.Join(t.TempDir(), "migration17-history-readable.db")
+	nonterminalID, terminalID := seedMigration17HistoryFixture(t, path)
 
 	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {

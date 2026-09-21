@@ -1,0 +1,15 @@
+{
+  "0001_init.sql": "ed569e5ba1648d1880ee75db7aed9b9e1bf5c84d799348c71643eebef99e24ec",
+  "0002_incidents_add_resolved_status.sql": "1e4b1337edf6f756c771565b64d76f48c92e70f57ff10d3d3a8a2951802a32bd",
+  "0003_incidents_slack_thread.sql": "25dfc302e1d21efa57438350235f244d11b456cee343decf322b0cd8ef548a85",
+  "0004_incidents_enrichment.sql": "9e8a9328a685492cf8dc1eece5db737c4bc4b450433dc4ea58129f55750cd54f",
+  "0005_changes.sql": "13bb4aca63f114388d9470c4c15456f99d48a0325eadf8f40ee496922282704c",
+  "0006_enrichment_envelope.sql": "b563586de3cc1e7e7cb9d647eff9ea10f6bd3cd844c2b038433e9c4c5e54ab89",
+  "0007_connector_state.sql": "87ee01e062810af0cc42471e1b03562f3a281fef03527d3cb9edd03d156834db",
+  "0008_incident_occurrences.sql": "6557a364cf6c5e8ac836426e4d051a6d70dae1417cbd280e807c6adbb7c5f18c",
+  "0009_memory_recall.sql": "4e0991556cad0dc4c4a49ec3fba3d305ffcdf6f9214e58fd36150a916e63505b",
+  "0010_feedback_capture.sql": "c84a98db1edd83a0f2fcf6d44e6c82a0fbaef4bc0f65dd72b7df1149203b1da6",
+  "0011_incident_triage.sql": "89c764294947f8ca1eda776b7d210f9fe512fdc8d8d63b5d1c9c17532c4f679c",
+  "0012_llm_health.sql": "ea5706e99e75c4b445ae83b57416f9528216819598b84e569c8403689b2d480f",
+  "0013_audit_log_kind_ts_idx.sql": "d322e7c316ff30ca5fb322432e8ca85494222b8b863b622c3d370d1c041404bd"
+}

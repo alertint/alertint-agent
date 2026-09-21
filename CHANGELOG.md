@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve the released 0.13.x migration sequence when upgrading to the
+  state-controller schema, including durable alert intake. Databases created
+  with the conflicting prerelease numbering are rejected before migration;
+  preserve them and restore a released-version backup or use a fresh test database.
 - Situation Slack roots keep completed-analysis timing and token usage in the
   analysis thread, and distinguish an unavailable source rule definition from
   a rule whose identity or version changed.

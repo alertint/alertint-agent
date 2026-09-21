@@ -19,7 +19,7 @@ import (
 func TestConsolidationPreservesPopulatedOperatorDatabase(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "operator-upgrade.db")
-	deliveryID, situationID := seedMigration21SemanticProfilesFixture(t, path)
+	deliveryID, situationID := seedMigration22SemanticProfilesFixture(t, path)
 	db, err := sql.Open("sqlite", buildDSN(path))
 	if err != nil {
 		t.Fatal(err)
@@ -34,7 +34,7 @@ func TestConsolidationPreservesPopulatedOperatorDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, m := range migrations {
-		if m.version > 21 && m.version <= 25 && !applied[m.version] {
+		if m.version > 22 && m.version <= 26 && !applied[m.version] {
 			if err := fixture.applyMigration(ctx, m); err != nil {
 				t.Fatalf("operator migration %d: %v", m.version, err)
 			}

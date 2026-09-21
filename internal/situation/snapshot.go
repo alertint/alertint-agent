@@ -342,7 +342,7 @@ type TriageCompletionEvidence struct {
 
 // TriageAttemptResult is the most recent completed incident_triage_attempts
 // row's normalized result for one Incident. Its fields mirror that table's
-// completion columns exactly (migration 0016_incident_triage_controller.sql:
+// completion columns exactly (migration 0017_incident_triage_controller.sql:
 // result_code, output_digest, finding_id, evidence_pack_digest,
 // completed_at) — the row's frozen claim-time identity/digest columns
 // belong to the store's own attempt ledger, not this snapshot-facing

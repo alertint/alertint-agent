@@ -14,14 +14,14 @@ import (
 )
 
 // ----------------------------------------------------------------------
-// Migration 0020 upgrade test: a populated migration-19 database must have
+// Migration 0021 upgrade test: a populated migration-20 database must have
 // its supersession trigger replaced (a blocked or failed root projection
 // may now be superseded by a newer one; a delivered one still may not),
 // keep MaxSchemaVersion honest at 20, pass PRAGMA foreign_key_check, and
 // fabricate no rows.
 // ----------------------------------------------------------------------
 
-func seedMigration19SupersedeFixture(t *testing.T, path string) (blockedRootID, deliveredRootID string) {
+func seedMigration20SupersedeFixture(t *testing.T, path string) (blockedRootID, deliveredRootID string) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -45,7 +45,7 @@ func seedMigration19SupersedeFixture(t *testing.T, path string) (blockedRootID, 
 	}
 	fixture := &Store{db: db}
 	for _, m := range migrations {
-		if m.version > 19 {
+		if m.version > 20 {
 			continue
 		}
 		if err := fixture.applyMigration(ctx, m); err != nil {
@@ -107,11 +107,11 @@ func nullIf(cond bool, value string) any {
 func TestNotificationSupersedeLiveRootsUpgrade(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "upgrade-20.db")
-	blockedRootID, deliveredRootID := seedMigration19SupersedeFixture(t, path)
+	blockedRootID, deliveredRootID := seedMigration20SupersedeFixture(t, path)
 
 	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
-		t.Fatalf("open (apply migration 0020): %v", err)
+		t.Fatalf("open (apply migration 0021): %v", err)
 	}
 	defer func() { _ = st.Close() }()
 
@@ -119,12 +119,12 @@ func TestNotificationSupersedeLiveRootsUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	if got != 35 {
-		t.Fatalf("MaxSchemaVersion = %d, want 35", got)
+	if got != 36 {
+		t.Fatalf("MaxSchemaVersion = %d, want 36", got)
 	}
 	var version int
-	if err := st.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 35 {
-		t.Fatalf("applied schema version = %d (err=%v), want 35", version, err)
+	if err := st.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 36 {
+		t.Fatalf("applied schema version = %d (err=%v), want 36", version, err)
 	}
 	var fkViolations int
 	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_foreign_key_check`).Scan(&fkViolations); err != nil || fkViolations != 0 {
@@ -143,14 +143,14 @@ func TestNotificationSupersedeLiveRootsUpgrade(t *testing.T) {
 		UPDATE notification_intents SET status = 'superseded', supersession_reason = 'newer_root_projection',
 		       replacement_intent_id = ?, last_error_class = NULL
 		WHERE id = ?`, deliveredRootID, blockedRootID); err != nil {
-		t.Fatalf("supersede a blocked root after 0020: %v", err)
+		t.Fatalf("supersede a blocked root after 0021: %v", err)
 	}
 	// A delivered one still may not.
 	if _, err := st.db.ExecContext(ctx, `
 		UPDATE notification_intents SET status = 'superseded', supersession_reason = 'newer_root_projection',
 		       replacement_intent_id = ?, delivered_as = NULL, channel = NULL, message_ts = NULL, delivered_at = NULL
 		WHERE id = ?`, blockedRootID, deliveredRootID); err == nil || !strings.Contains(err.Error(), "live root_sync") {
-		t.Fatalf("superseding a delivered root = %v, want the 0020 trigger's rejection", err)
+		t.Fatalf("superseding a delivered root = %v, want the 0021 trigger's rejection", err)
 	}
 }
 
@@ -187,7 +187,7 @@ func supersessionTriggerNames(t *testing.T, st *Store) string {
 func TestNotificationUpgradeCoalescesOlderBlockedRootBeforeClaims(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "review-upgrade.db")
-	blocked, _ := seedMigration19SupersedeFixture(t, path)
+	blocked, _ := seedMigration20SupersedeFixture(t, path)
 	db, err := sql.Open("sqlite", buildDSN(path))
 	if err != nil {
 		t.Fatal(err)

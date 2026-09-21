@@ -13,13 +13,13 @@ import (
 )
 
 // ----------------------------------------------------------------------
-// Migration 0023 upgrade test (D1, lead reviews 2026-09-10 rounds 2 and 3):
-// a populated migration-22 database must swap
+// Migration 0024 upgrade test (D1, lead reviews 2026-09-10 rounds 2 and 3):
+// a populated migration-23 database must swap
 // notification_intents_thread_supersession_guard for the candidate-based
 // one, keep every other trigger, index, CHECK and row exactly as it found
 // them, pass PRAGMA foreign_key_check, and change the guard's verdict in
-// BOTH directions — admitting the pure assurance 0022 refused, and
-// refusing the mixed material row 0022's unconditional label rule admitted.
+// BOTH directions — admitting the pure assurance 0023 refused, and
+// refusing the mixed material row 0023's unconditional label rule admitted.
 //
 // The before/after verdicts are taken from the SAME database, seconds
 // apart, so "the guard changed" is measured rather than asserted.
@@ -31,51 +31,51 @@ type assuranceGuardRow struct {
 	name           string
 	journalKind    string
 	projectionJSON string
-	// under0022 is what 0022's `journal_kind = 'investigation_started'`
-	// rule permits; under0023 is what the candidate rule permits.
-	under0022 bool
-	under0023 bool
-	intentID  string
+	// underLabelGuard is what 0023's `journal_kind = 'investigation_started'`
+	// rule permits; underCandidateGuard is what the candidate rule permits.
+	underLabelGuard     bool
+	underCandidateGuard bool
+	intentID            string
 }
 
 func assuranceGuardRows() []assuranceGuardRow {
 	return []assuranceGuardRow{
 		{
-			name:           "the D1 row: a pure assurance journalled operator_contract_changed",
-			journalKind:    "operator_contract_changed",
-			projectionJSON: `{"operator_delta":{"candidates":[{"kind":"first_execution_assurance"}]}}`,
-			under0022:      false,
-			under0023:      true,
+			name:                "the D1 row: a pure assurance journalled operator_contract_changed",
+			journalKind:         "operator_contract_changed",
+			projectionJSON:      `{"operator_delta":{"candidates":[{"kind":"first_execution_assurance"}]}}`,
+			underLabelGuard:     false,
+			underCandidateGuard: true,
 		},
 		{
-			name:           "mixed material journalled investigation_started",
-			journalKind:    "investigation_started",
-			projectionJSON: `{"operator_delta":{"candidates":[{"kind":"first_execution_assurance"},{"kind":"members_changed"}]}}`,
-			under0022:      true,
-			under0023:      false,
+			name:                "mixed material journalled investigation_started",
+			journalKind:         "investigation_started",
+			projectionJSON:      `{"operator_delta":{"candidates":[{"kind":"first_execution_assurance"},{"kind":"members_changed"}]}}`,
+			underLabelGuard:     true,
+			underCandidateGuard: false,
 		},
 		{
-			name:           "a legacy projection with no candidate list, journalled investigation_started",
-			journalKind:    "investigation_started",
-			projectionJSON: `{}`,
-			under0022:      true,
-			under0023:      true,
+			name:                "a legacy projection with no candidate list, journalled investigation_started",
+			journalKind:         "investigation_started",
+			projectionJSON:      `{}`,
+			underLabelGuard:     true,
+			underCandidateGuard: true,
 		},
 		{
-			name:           "an ordinary finding reply",
-			journalKind:    "evidence_conclusion",
-			projectionJSON: `{"operator_delta":{"candidates":[{"kind":"useful_finding"}]}}`,
-			under0022:      false,
-			under0023:      false,
+			name:                "an ordinary finding reply",
+			journalKind:         "evidence_conclusion",
+			projectionJSON:      `{"operator_delta":{"candidates":[{"kind":"useful_finding"}]}}`,
+			underLabelGuard:     false,
+			underCandidateGuard: false,
 		},
 	}
 }
 
-// seedMigration22AssuranceGuardFixture builds a database at exactly schema
-// 22 and seeds one Situation with a Transition and a live pending
+// seedMigration23AssuranceGuardFixture builds a database at exactly schema
+// 23 and seeds one Situation with a Transition and a live pending
 // thread_append for every row above, plus one delivered reply to point
 // replacements at.
-func seedMigration22AssuranceGuardFixture(t *testing.T, path string, rows []assuranceGuardRow) (replacementID string) {
+func seedMigration23AssuranceGuardFixture(t *testing.T, path string, rows []assuranceGuardRow) (replacementID string) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -97,7 +97,7 @@ func seedMigration22AssuranceGuardFixture(t *testing.T, path string, rows []assu
 	}
 	fixture := &Store{db: db}
 	for _, m := range migrations {
-		if m.version > 22 {
+		if m.version > 23 {
 			continue
 		}
 		if err := fixture.applyMigration(ctx, m); err != nil {
@@ -199,9 +199,9 @@ func guardTriggerSQL(ctx context.Context, t *testing.T, db *sql.DB) string {
 
 func TestAssuranceCandidateGuardUpgrade(t *testing.T) {
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "migration22-assurance-guard.db")
+	path := filepath.Join(t.TempDir(), "migration23-assurance-guard.db")
 	rows := assuranceGuardRows()
-	replacementID := seedMigration22AssuranceGuardFixture(t, path, rows)
+	replacementID := seedMigration23AssuranceGuardFixture(t, path, rows)
 
 	// ---- before: schema 22, the journal-label guard ----
 	before, err := sql.Open("sqlite", buildDSN(path))
@@ -210,11 +210,11 @@ func TestAssuranceCandidateGuardUpgrade(t *testing.T) {
 	}
 	beforeSQL := guardTriggerSQL(ctx, t, before)
 	if !strings.Contains(beforeSQL, "investigation_started transition") {
-		t.Fatalf("the seeded database is not carrying 0022's guard:\n%s", beforeSQL)
+		t.Fatalf("the seeded database is not carrying 0023's guard:\n%s", beforeSQL)
 	}
 	for _, r := range rows {
-		if got := guardPermits(ctx, t, before, r.intentID, replacementID); got != r.under0022 {
-			t.Errorf("before the upgrade, 0022's guard permits %q = %v, want %v", r.name, got, r.under0022)
+		if got := guardPermits(ctx, t, before, r.intentID, replacementID); got != r.underLabelGuard {
+			t.Errorf("before the upgrade, 0023's guard permits %q = %v, want %v", r.name, got, r.underLabelGuard)
 		}
 	}
 	var seededIntents, seededTransitions int
@@ -236,29 +236,29 @@ func TestAssuranceCandidateGuardUpgrade(t *testing.T) {
 	defer func() { _ = st.Close() }()
 
 	var applied int
-	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 23`).Scan(&applied); err != nil {
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 24`).Scan(&applied); err != nil {
 		t.Fatal(err)
 	}
 	if applied != 1 {
-		t.Fatalf("migration 23 applied count = %d, want 1", applied)
+		t.Fatalf("migration 24 applied count = %d, want 1", applied)
 	}
 	assertNoForeignKeyViolations(ctx, t, st)
 
 	// ---- after: the candidate guard, same database, same rows ----
 	afterSQL := guardTriggerSQL(ctx, t, st.DB())
 	if !strings.Contains(afterSQL, "purely transient first_execution_assurance") {
-		t.Fatalf("0023 did not install its own guard:\n%s", afterSQL)
+		t.Fatalf("0024 did not install its own guard:\n%s", afterSQL)
 	}
 	if strings.Contains(afterSQL, "NEW.transition_id AND tr.journal_kind = 'investigation_started'") {
-		t.Fatalf("0023 left 0022's unconditional label rule in place:\n%s", afterSQL)
+		t.Fatalf("0024 left 0023's unconditional label rule in place:\n%s", afterSQL)
 	}
 	for _, r := range rows {
-		if got := guardPermits(ctx, t, st.DB(), r.intentID, replacementID); got != r.under0023 {
-			t.Errorf("after the upgrade, 0023's guard permits %q = %v, want %v", r.name, got, r.under0023)
+		if got := guardPermits(ctx, t, st.DB(), r.intentID, replacementID); got != r.underCandidateGuard {
+			t.Errorf("after the upgrade, 0024's guard permits %q = %v, want %v", r.name, got, r.underCandidateGuard)
 		}
 	}
 
-	// Nothing was rebuilt, rewritten or fabricated: 0023 is a trigger swap.
+	// Nothing was rebuilt, rewritten or fabricated: 0024 is a trigger swap.
 	var intents, transitions int
 	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM notification_intents`).Scan(&intents); err != nil {
 		t.Fatal(err)
@@ -278,7 +278,7 @@ func TestAssuranceCandidateGuardUpgrade(t *testing.T) {
 	if strings.Contains(statuses, "superseded") {
 		t.Fatalf("the upgrade itself superseded a row: statuses = %s", statuses)
 	}
-	// Every journal_kind the fixture recorded survived verbatim: 0023
+	// Every journal_kind the fixture recorded survived verbatim: 0024
 	// relabels nothing.
 	var kinds string
 	if err := st.DB().QueryRowContext(ctx, `
@@ -290,8 +290,8 @@ func TestAssuranceCandidateGuardUpgrade(t *testing.T) {
 		t.Fatalf("journal kinds after upgrade = %s, want the seeded %s", kinds, want)
 	}
 
-	// 0020's live-only rule and 0018's immutability rules survived the
-	// trigger swap: 0023 drops exactly one trigger.
+	// 0021's live-only rule and 0019's immutability rules survived the
+	// trigger swap: 0024 drops exactly one trigger.
 	for _, name := range []string{
 		"notification_intents_transition_guard",
 		"notification_intents_identity_immutable",
@@ -319,14 +319,14 @@ func TestAssuranceCandidateGuardOnAFreshDatabase(t *testing.T) {
 
 	text := guardTriggerSQL(ctx, t, st.DB())
 	if !strings.Contains(text, "purely transient first_execution_assurance") {
-		t.Fatalf("a fresh database does not carry 0023's guard:\n%s", text)
+		t.Fatalf("a fresh database does not carry 0024's guard:\n%s", text)
 	}
 	var applied int
-	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 23`).Scan(&applied); err != nil {
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 24`).Scan(&applied); err != nil {
 		t.Fatal(err)
 	}
 	if applied != 1 {
-		t.Fatalf("migration 23 applied count on a fresh database = %d, want 1", applied)
+		t.Fatalf("migration 24 applied count on a fresh database = %d, want 1", applied)
 	}
 
 	situationID := "sit-fresh-guard"
@@ -343,8 +343,8 @@ func TestAssuranceCandidateGuardOnAFreshDatabase(t *testing.T) {
 		intentID := seedAssuranceParityRow(ctx, t, st, situationID, i+2, assuranceParityCase{
 			name: r.name, journalKind: r.journalKind, projectionJSON: r.projectionJSON,
 		})
-		if got := guardPermits(ctx, t, st.DB(), intentID, replacementID); got != r.under0023 {
-			t.Errorf("on a fresh database the guard permits %q = %v, want %v", r.name, got, r.under0023)
+		if got := guardPermits(ctx, t, st.DB(), intentID, replacementID); got != r.underCandidateGuard {
+			t.Errorf("on a fresh database the guard permits %q = %v, want %v", r.name, got, r.underCandidateGuard)
 		}
 	}
 }

@@ -22,7 +22,7 @@ import (
 
 // ----------------------------------------------------------------------
 // Task 6: gate the shipped Acute Triage schedule behind the controller's
-// B+ decision (migration 0016_incident_triage_controller.sql is the binding
+// B+ decision (migration 0017_incident_triage_controller.sql is the binding
 // schema ground truth) and fence every attempt claim/completion by both
 // membership_digest and incident_input_digest. This file extends
 // triage.go's shipped five-attempt schedule methods; it does not replace
