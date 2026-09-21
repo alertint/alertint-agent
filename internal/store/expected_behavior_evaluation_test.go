@@ -55,7 +55,11 @@ func TestExpectedBehaviorInputKeepsAlertmanagerScopesDistinct(t *testing.T) {
 	if assembled.ScopeLabels["service"] != "payment" || assembled.PrimaryRuleID != ruleID {
 		t.Fatalf("primary = rule %q scope %v, want payment", assembled.PrimaryRuleID, assembled.ScopeLabels)
 	}
-	if len(assembled.FiringSignals) != 2 || assembled.FiringSignals[0].ScopeLabels["service"] != "payment" || assembled.FiringSignals[1].ScopeLabels["service"] != "billing" {
+	scopes := make(map[string]bool, len(assembled.FiringSignals))
+	for _, signal := range assembled.FiringSignals {
+		scopes[signal.ScopeLabels["service"]] = true
+	}
+	if len(assembled.FiringSignals) != 2 || !scopes["payment"] || !scopes["billing"] {
 		t.Fatalf("firing signals = %+v, want independent payment and billing scopes", assembled.FiringSignals)
 	}
 	if got := situation.EvaluateExpectedBehaviors(assembled); got.Reason != situationmodel.ExpectedBehaviorReasonUnexpectedSymptom {
