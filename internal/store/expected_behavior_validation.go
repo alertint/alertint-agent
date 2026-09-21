@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"sort"
 	"strings"
@@ -190,7 +191,7 @@ func (s *Store) CompleteExpectedBehaviorValidation(ctx context.Context, id, situ
 	status := model.ExpectedBehaviorValidationReady
 	if unavailableReason != "" {
 		status = model.ExpectedBehaviorValidationUnavailable
-		observations = nil
+		observations = []model.ExpectedBehaviorBindingObservation{}
 	} else if err := validateExpectedBehaviorObservations(v.Bindings, observations, now); err != nil {
 		return v, err
 	}
@@ -270,7 +271,7 @@ func (s *Store) CompleteExpectedBehaviorValidationsFromCycle(ctx context.Context
 				if err := json.Unmarshal(fact.Value, &observed); err != nil {
 					return fmt.Errorf("store: decode expected behavior validation fact: %w", err)
 				}
-				if !observed.Available || observed.InstanceID != binding.SourceInstanceID || observed.ProducerID != binding.ProducerID || observed.RuleID != binding.RuleID || observed.Version != binding.RuleVersion {
+				if !observed.Available || observed.InstanceID != binding.SourceInstanceID || observed.ProducerID != binding.ProducerID || observed.RuleID != binding.RuleID || observed.Version != binding.RuleVersion || !maps.Equal(observed.ScopeLabels, binding.ScopeLabels) {
 					unavailable = "binding_identity_changed"
 					break
 				}

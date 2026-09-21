@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 
@@ -377,7 +378,7 @@ func verifyAlertmanagerExpectedBehaviorSourceTx(ctx context.Context, tx *sql.Tx,
 		}
 		for _, view := range views {
 			def := view.Definition
-			if def.Source == "alertmanager" && def.InstanceID == policy.Scope.SourceInstanceID && def.ProducerID == policy.Scope.ProducerID && def.RuleID == policy.Scope.PrimaryRuleID && def.Version == policy.Scope.PrimaryRuleVersion && def.Available && def.Presence == "present" {
+			if def.Source == "alertmanager" && def.InstanceID == policy.Scope.SourceInstanceID && def.ProducerID == policy.Scope.ProducerID && def.RuleID == policy.Scope.PrimaryRuleID && def.Version == policy.Scope.PrimaryRuleVersion && maps.Equal(def.ScopeLabels, policy.Scope.ScopeLabels) && def.Available && def.Presence == "present" {
 				return verifyExpectedBehaviorValidationTx(ctx, tx, req)
 			}
 		}

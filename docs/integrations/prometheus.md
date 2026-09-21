@@ -82,6 +82,12 @@ Prometheus has active `alert_relabel_configs`. AlertINT does not infer a rule
 from `generatorURL`, `externalURL`, alert name, or fingerprint. Current rule
 reads never claim which version produced an older webhook delivery.
 
+Prometheus reports alerts in both `pending` and `firing` states from its rules
+API. AlertINT treats either state as current presence for this source proof:
+the exact scoped alert is active in Prometheus. This proof does not create a
+firing alert in AlertINT; the authenticated Alertmanager webhook remains the
+firing signal that opens or updates a Situation.
+
 ## Prometheus connector — live metric context
 
 ### How it works
