@@ -12,18 +12,18 @@ import (
 )
 
 // ----------------------------------------------------------------------
-// Migration 0019 upgrade test: a populated migration-18 database must gain
+// Migration 0020 upgrade test: a populated migration-19 database must gain
 // exactly one partial index, keep MaxSchemaVersion honest at 19, pass
 // PRAGMA foreign_key_check, fabricate no rows, and actually make the
 // blocked-configuration backlog count stop scanning the whole ledger.
 // ----------------------------------------------------------------------
 
-// seedMigration18BlockedIndexFixture builds a database shaped like the
-// schema immediately before 0019 (every embedded migration through 18) and
+// seedMigration19BlockedIndexFixture builds a database shaped like the
+// schema immediately before 0020 (every embedded migration through 19) and
 // seeds one Situation with one Transition and three notification intents —
 // one pending, one delivered, one blocked_configuration — so the upgrade is
 // exercised over real ledger rows rather than an empty table.
-func seedMigration18BlockedIndexFixture(t *testing.T, path string) (situationID string) {
+func seedMigration19BlockedIndexFixture(t *testing.T, path string) (situationID string) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -48,7 +48,7 @@ func seedMigration18BlockedIndexFixture(t *testing.T, path string) (situationID 
 	}
 	fixture := &Store{db: db}
 	for _, m := range migrations {
-		if m.version > 18 {
+		if m.version > 19 {
 			continue
 		}
 		if err := fixture.applyMigration(ctx, m); err != nil {
@@ -104,14 +104,14 @@ func seedMigration18BlockedIndexFixture(t *testing.T, path string) (situationID 
 }
 
 // TestNotificationBlockedIndexUpgrade_AddsThePartialIndexAndFabricatesNothing
-// is migration 0019's own upgrade test: opening a migration-18 database
+// is migration 0020's own upgrade test: opening a migration-19 database
 // applies it, the head becomes 19, the partial index exists with exactly
 // the predicate the blocked-configuration count reads, foreign keys still
 // check, and not one ledger row is invented or lost.
 func TestNotificationBlockedIndexUpgrade_AddsThePartialIndexAndFabricatesNothing(t *testing.T) {
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "migration18-blocked-index.db")
-	situationID := seedMigration18BlockedIndexFixture(t, path)
+	path := filepath.Join(t.TempDir(), "migration19-blocked-index.db")
+	situationID := seedMigration19BlockedIndexFixture(t, path)
 
 	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
@@ -120,18 +120,18 @@ func TestNotificationBlockedIndexUpgrade_AddsThePartialIndexAndFabricatesNothing
 	defer func() { _ = st.Close() }()
 
 	var applied int
-	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 19`).Scan(&applied); err != nil {
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 20`).Scan(&applied); err != nil {
 		t.Fatal(err)
 	}
 	if applied != 1 {
-		t.Fatalf("migration 19 applied count = %d, want 1", applied)
+		t.Fatalf("migration 20 applied count = %d, want 1", applied)
 	}
 	got, err := MaxSchemaVersion()
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	if got != 35 {
-		t.Fatalf("MaxSchemaVersion = %d, want 35", got)
+	if got != 36 {
+		t.Fatalf("MaxSchemaVersion = %d, want 36", got)
 	}
 
 	var indexSQL string

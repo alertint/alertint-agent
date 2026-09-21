@@ -102,7 +102,7 @@ func buildDSN(dbPath string) string {
 // applied version recorded in schema_migrations.
 func (s *Store) migrate(ctx context.Context) error {
 	// Pre-release Plan 4 used versions 22–26 for evidence tables. Those
-	// numbers now belong to the shipped operator migrations. Refuse the
+	// numbers were reused by the operator migrations. Refuse the
 	// ambiguous legacy lineage before applying any schema changes.
 	var legacyPlan4 bool
 	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS (
@@ -112,6 +112,30 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	if legacyPlan4 {
 		return fmt.Errorf("store: unsupported pre-release Plan 4 migration lineage: preserve this database and use a fresh database or the operator migration lineage")
+	}
+	// Released v0.13.9 owns version 13 (the audit index). Earlier
+	// state-controller builds reused it for the delivery ledger. Never
+	// reinterpret that prerelease lineage or continue a partially failed
+	// upgrade from it: inspect before applying any schema changes.
+	var hasMigrationLedger bool
+	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS (
+		SELECT 1 FROM sqlite_schema WHERE type='table' AND name='schema_migrations'
+	)`).Scan(&hasMigrationLedger); err != nil {
+		return fmt.Errorf("store: inspect migration ledger: %w", err)
+	}
+	if hasMigrationLedger {
+		var incompatible bool
+		if err := s.db.QueryRowContext(ctx, `SELECT
+			(EXISTS (SELECT 1 FROM schema_migrations WHERE version=13)
+			 AND NOT EXISTS (SELECT 1 FROM sqlite_schema WHERE type='index' AND name='audit_log_kind_ts_idx'))
+			OR (EXISTS (SELECT 1 FROM schema_migrations WHERE version>=14)
+			 AND NOT EXISTS (SELECT 1 FROM sqlite_schema WHERE type='table' AND name='alert_deliveries'))
+		`).Scan(&incompatible); err != nil {
+			return fmt.Errorf("store: inspect state-controller migration lineage: %w", err)
+		}
+		if incompatible {
+			return fmt.Errorf("store: unsupported pre-release state-controller migration lineage: preserve this database; restore a backup from the released 0.13.x version or use a fresh database for pre-release testing")
+		}
 	}
 	if _, err := s.db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (

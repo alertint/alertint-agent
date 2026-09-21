@@ -93,9 +93,9 @@ func triagePhaseFor(t *testing.T, st *Store, incidentID string) TriagePhase {
 // v0.13.4-shaped database (migrations 0001-0010 only, no incident_triage
 // table at all) with legacy "ready" incidents seeded directly by SQL, then
 // opens it through Store.Open — which applies every migration through
-// 0016 in one pass.
+// 0017 in one pass.
 //
-// What this proves: migration 0016's own upgrade backfill ("ready Incident
+// What this proves: migration 0017's own upgrade backfill ("ready Incident
 // with no Triage row" -> awaiting_decision at attempt zero, spec's Upgrade
 // mapping table) closes the one-time, v0.13.4-vintage gap at migration
 // time — a pre-existing "ready"-without-schedule row present in a database
@@ -116,7 +116,7 @@ func triagePhaseFor(t *testing.T, st *Store, incidentID string) TriagePhase {
 // MarkIncidentReadyWithSituationInput and SeedIncidentTriage as two
 // separate, non-transactional store calls, and if the second fails right
 // after the first commits, the Incident is left "ready" with no triage
-// row, otherwise invisible to every later scan. Migration 0016's backfill
+// row, otherwise invisible to every later scan. Migration 0017's backfill
 // runs exactly once, at DB-upgrade time; it cannot repair an Incident that
 // enters this state during live operation afterward — only the
 // still-running reconciliation loop can, which is precisely why it keeps
@@ -146,7 +146,7 @@ func TestTriageUpgrade_V0134ReadyIncidentsBecomeAwaitingDecision(t *testing.T) {
 		t.Fatalf("list legacy: %v", err)
 	}
 	if len(legacy) != 0 {
-		t.Fatalf("legacy ready incidents = %d, want 0 (migration 0016 already scheduled every one)", len(legacy))
+		t.Fatalf("legacy ready incidents = %d, want 0 (migration 0017 already scheduled every one)", len(legacy))
 	}
 
 	for _, id := range []string{recentID, staleID, otherID} {
@@ -166,14 +166,14 @@ func TestTriageUpgrade_V0134ReadyIncidentsBecomeAwaitingDecision(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------
-// Migration-14 -> 0015/0016 upgrade: the controller-gated incident_triage
+// Migration-15 -> 0016/0017 upgrade: the controller-gated incident_triage
 // rebuild must preserve every pre-existing schedulable/terminal row exactly
 // and create awaiting_decision only for a ready Incident that never
 // acquired a schedule row (spec: "Upgrade mapping for the existing Acute
 // Triage schedule").
 // ----------------------------------------------------------------------
 
-// legacyTriageRow describes one pre-0016 incident_triage row (old schema:
+// legacyTriageRow describes one pre-0017 incident_triage row (old schema:
 // incident_id, phase, attempts, next_at, started_at, last_error_code,
 // last_error_detail, updated_at) to seed directly by SQL, plus the
 // incidents.status the owning Incident must carry.
@@ -189,12 +189,12 @@ type legacyTriageRow struct {
 	lastErrorDetail any
 }
 
-// seedMigration14TriageFixture builds a database file shaped like the
-// schema immediately before this task's 0015/0016 — every embedded
-// migration through version 14 only, so incident_triage still has its
+// seedMigration15TriageFixture builds a database file shaped like the
+// schema immediately before this task's 0016/0017 — every embedded
+// migration through version 15 only, so incident_triage still has its
 // 0011 shape with no awaiting_decision phase or controller metadata — and
 // seeds the given legacy rows plus their owning incidents directly by SQL.
-func seedMigration14TriageFixture(t *testing.T, path string, rows []legacyTriageRow) {
+func seedMigration15TriageFixture(t *testing.T, path string, rows []legacyTriageRow) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -219,7 +219,7 @@ func seedMigration14TriageFixture(t *testing.T, path string, rows []legacyTriage
 	}
 	fixture := &Store{db: db}
 	for _, m := range migrations {
-		if m.version > 14 {
+		if m.version > 15 {
 			continue
 		}
 		if err := fixture.applyMigration(ctx, m); err != nil {
@@ -279,25 +279,25 @@ func legacyTriageRowFor(t *testing.T, st *Store, incidentID string) legacyTriage
 }
 
 // incidentTriageControllerUpgradeFixtureTimes are the fixed timestamps the
-// shared migration-14 triage fixture seeds and asserts against.
+// shared migration-15 triage fixture seeds and asserts against.
 var (
 	incidentTriageControllerUpgradeNow     = time.Date(2026, 9, 1, 9, 0, 0, 0, time.UTC).Format(time.RFC3339Nano)
 	incidentTriageControllerUpgradeStarted = time.Date(2026, 9, 1, 8, 55, 0, 0, time.UTC).Format(time.RFC3339Nano)
 )
 
 // openIncidentTriageControllerUpgradeFixture builds and opens a fresh
-// migration-14 database seeded with one incident_triage row per
+// migration-15 database seeded with one incident_triage row per
 // pre-upgrade phase (pending, backoff, in_flight, skipped, exhausted), one
 // analyzed Incident with a persisted Finding and no triage row, and one
 // ready Incident that never acquired a schedule row — then opens it
-// through Store.Open, which applies 0015/0016 in the same pass. Each test
+// through Store.Open, which applies 0016/0017 in the same pass. Each test
 // below gets its own isolated copy so per-case assertions stay simple
 // (TestIncidentTriageControllerUpgrade itself, split into independent
 // functions below, previously tripped gocyclo by combining every case).
 func openIncidentTriageControllerUpgradeFixture(t *testing.T) *Store {
 	t.Helper()
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "migration14-triage.db")
+	path := filepath.Join(t.TempDir(), "migration15-triage.db")
 	now := incidentTriageControllerUpgradeNow
 	started := incidentTriageControllerUpgradeStarted
 
@@ -310,7 +310,7 @@ func openIncidentTriageControllerUpgradeFixture(t *testing.T) *Store {
 		{incidentID: "inc-analyzed", groupKey: "g-analyzed", incidentStatus: "analyzed"}, // Finding already persisted; no triage row at all.
 		{incidentID: "inc-ready-no-row", groupKey: "g-ready-no-row", incidentStatus: "ready"},
 	}
-	seedMigration14TriageFixture(t, path, rows)
+	seedMigration15TriageFixture(t, path, rows)
 
 	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
@@ -320,7 +320,7 @@ func openIncidentTriageControllerUpgradeFixture(t *testing.T) *Store {
 	return st
 }
 
-// TestIncidentTriageControllerUpgrade_ForeignKeysIntact proves the 0016
+// TestIncidentTriageControllerUpgrade_ForeignKeysIntact proves the 0017
 // rebuild leaves no dangling foreign key across the upgraded database.
 func TestIncidentTriageControllerUpgrade_ForeignKeysIntact(t *testing.T) {
 	st := openIncidentTriageControllerUpgradeFixture(t)
@@ -328,7 +328,7 @@ func TestIncidentTriageControllerUpgrade_ForeignKeysIntact(t *testing.T) {
 }
 
 // TestIncidentTriageControllerUpgrade_PendingPreservesPhaseAttemptsDue
-// proves migration 0016 preserves a pending row's phase, attempts, and due
+// proves migration 0017 preserves a pending row's phase, attempts, and due
 // time exactly, with no started_at/error fields spuriously introduced.
 func TestIncidentTriageControllerUpgrade_PendingPreservesPhaseAttemptsDue(t *testing.T) {
 	st := openIncidentTriageControllerUpgradeFixture(t)
@@ -342,7 +342,7 @@ func TestIncidentTriageControllerUpgrade_PendingPreservesPhaseAttemptsDue(t *tes
 }
 
 // TestIncidentTriageControllerUpgrade_BackoffPreservesPhaseAttemptsDueError
-// proves migration 0016 preserves a backoff row's phase, attempts, due
+// proves migration 0017 preserves a backoff row's phase, attempts, due
 // time, and bounded error classification exactly.
 func TestIncidentTriageControllerUpgrade_BackoffPreservesPhaseAttemptsDueError(t *testing.T) {
 	st := openIncidentTriageControllerUpgradeFixture(t)
@@ -356,7 +356,7 @@ func TestIncidentTriageControllerUpgrade_BackoffPreservesPhaseAttemptsDueError(t
 }
 
 // TestIncidentTriageControllerUpgrade_InFlightPreservesPhaseAttemptsStarted
-// proves migration 0016 leaves an in_flight row's phase, attempts, and
+// proves migration 0017 leaves an in_flight row's phase, attempts, and
 // started_at untouched — Task 6 startup recovery, not this migration, owns
 // turning it into an interrupted attempt or a completed one.
 func TestIncidentTriageControllerUpgrade_InFlightPreservesPhaseAttemptsStarted(t *testing.T) {
@@ -368,7 +368,7 @@ func TestIncidentTriageControllerUpgrade_InFlightPreservesPhaseAttemptsStarted(t
 }
 
 // TestIncidentTriageControllerUpgrade_SkippedPreservesTerminalJudgment
-// proves migration 0016 retains a skipped row's terminal clean judgment.
+// proves migration 0017 retains a skipped row's terminal clean judgment.
 func TestIncidentTriageControllerUpgrade_SkippedPreservesTerminalJudgment(t *testing.T) {
 	st := openIncidentTriageControllerUpgradeFixture(t)
 	s := legacyTriageRowFor(t, st, "inc-skipped")
@@ -378,7 +378,7 @@ func TestIncidentTriageControllerUpgrade_SkippedPreservesTerminalJudgment(t *tes
 }
 
 // TestIncidentTriageControllerUpgrade_ExhaustedPreservesTerminalFailure
-// proves migration 0016 retains an exhausted row's terminal failure.
+// proves migration 0017 retains an exhausted row's terminal failure.
 func TestIncidentTriageControllerUpgrade_ExhaustedPreservesTerminalFailure(t *testing.T) {
 	st := openIncidentTriageControllerUpgradeFixture(t)
 	s := legacyTriageRowFor(t, st, "inc-exhausted")
@@ -458,7 +458,7 @@ func assertNoForeignKeyViolations(ctx context.Context, t *testing.T, st *Store) 
 }
 
 // ----------------------------------------------------------------------
-// Direct constraint/trigger tests for 0016's new incident_triage columns
+// Direct constraint/trigger tests for 0017's new incident_triage columns
 // and the incident_triage_attempts ledger.
 // ----------------------------------------------------------------------
 

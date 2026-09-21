@@ -11,23 +11,23 @@ import (
 )
 
 // ----------------------------------------------------------------------
-// Step 5: migration 0018 upgrade tests — a populated migration-17 fixture
+// Step 5: migration 0019 upgrade tests — a populated migration-18 fixture
 // (Task 2's history schema already applied) must gain the new STRICT
 // tables and MaxSchemaVersion 18, pass PRAGMA foreign_key_check, gain
 // NULL slack_channel/slack_root_ts on every existing situations row, and
 // acquire zero fabricated notification_intents/slack_delivery_gaps rows.
 // ----------------------------------------------------------------------
 
-// seedMigration17NotificationsFixture builds a database file shaped like
-// the schema immediately before this task's 0018 (every embedded
-// migration through version 17 only, so notification_intents/
+// seedMigration18NotificationsFixture builds a database file shaped like
+// the schema immediately before this task's 0019 (every embedded
+// migration through version 18 only, so notification_intents/
 // slack_delivery_state/slack_delivery_gaps and situations.slack_channel/
 // slack_root_ts do not exist yet) and seeds three Situations covering the
 // states the brief's Step 5 names: one nonterminal with pending controller
 // work (a due, unclaimed reconciliation), one carrying blocked/retry state
 // (a claimed-and-failed lease with a scheduled retry), and one terminal —
-// entirely by direct SQL, since this fixture predates 0018's columns.
-func seedMigration17NotificationsFixture(t *testing.T, path string) (pendingID, retryID, terminalID string) {
+// entirely by direct SQL, since this fixture predates 0019's columns.
+func seedMigration18NotificationsFixture(t *testing.T, path string) (pendingID, retryID, terminalID string) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -52,7 +52,7 @@ func seedMigration17NotificationsFixture(t *testing.T, path string) (pendingID, 
 	}
 	fixture := &Store{db: db}
 	for _, m := range migrations {
-		if m.version > 17 {
+		if m.version > 18 {
 			continue
 		}
 		if err := fixture.applyMigration(ctx, m); err != nil {
@@ -97,15 +97,15 @@ func seedMigration17NotificationsFixture(t *testing.T, path string) (pendingID, 
 }
 
 // TestSituationNotificationsUpgrade_CreatesStrictTablesAndBumpsSchemaVersion
-// is the brief's literal Step 5 test: opening a migration-17 database with
-// the current Open must apply 0018, create its new STRICT tables, bump
+// is the brief's literal Step 5 test: opening a migration-18 database with
+// the current Open must apply 0019, create its new STRICT tables, bump
 // MaxSchemaVersion to 18, pass PRAGMA foreign_key_check, seed exactly one
 // slack_delivery_state row, and fabricate zero notification_intents or
 // slack_delivery_gaps rows.
 func TestSituationNotificationsUpgrade_CreatesStrictTablesAndBumpsSchemaVersion(t *testing.T) {
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "migration17-notifications.db")
-	seedMigration17NotificationsFixture(t, path)
+	path := filepath.Join(t.TempDir(), "migration18-notifications.db")
+	seedMigration18NotificationsFixture(t, path)
 
 	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
@@ -114,14 +114,14 @@ func TestSituationNotificationsUpgrade_CreatesStrictTablesAndBumpsSchemaVersion(
 	defer func() { _ = st.Close() }()
 
 	var applied int
-	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 18`).Scan(&applied); err != nil {
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 19`).Scan(&applied); err != nil {
 		t.Fatal(err)
 	}
 	if applied != 1 {
-		t.Fatalf("migration 18 applied count = %d, want 1", applied)
+		t.Fatalf("migration 19 applied count = %d, want 1", applied)
 	}
 
-	// This test owns "0018 landed", not "0018 is the head": the head number
+	// This test owns "0019 landed", not "0019 is the head": the head number
 	// itself is TestMaxSchemaVersion's, and later migrations may follow.
 	got, err := MaxSchemaVersion()
 	if err != nil {
@@ -172,14 +172,14 @@ func TestSituationNotificationsUpgrade_CreatesStrictTablesAndBumpsSchemaVersion(
 }
 
 // TestSituationNotificationsUpgrade_ExistingSituationsGainNoSlackRoot
-// proves every pre-0018 Situation — pending controller work, blocked/retry
+// proves every pre-0019 Situation — pending controller work, blocked/retry
 // state, and terminal — remains fully readable after the upgrade, with
 // NULL slack_channel/slack_root_ts: this migration never invents a
 // published root, and it preserves in-flight retry/attempt state exactly.
 func TestSituationNotificationsUpgrade_ExistingSituationsGainNoSlackRoot(t *testing.T) {
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "migration17-notifications-readable.db")
-	pendingID, retryID, terminalID := seedMigration17NotificationsFixture(t, path)
+	path := filepath.Join(t.TempDir(), "migration18-notifications-readable.db")
+	pendingID, retryID, terminalID := seedMigration18NotificationsFixture(t, path)
 
 	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {

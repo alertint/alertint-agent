@@ -15,16 +15,16 @@ import (
 )
 
 // ----------------------------------------------------------------------
-// Plan 4 upgrade test: a populated migration-21 database (the
-// schema as it existed before Plan 4) must upgrade through 0026–0030
+// Plan 4 upgrade test: a populated migration-22 database (the
+// schema as it existed before Plan 4) must upgrade through 0027–0031
 // without disturbing existing deliveries, source identity, the
 // notification queue, foreign keys, or the audit hash chain — plan.md
-// Task 7: "Populate the full migration-21 fixture, migrate through 23,
+// Task 7: "Populate the full migration-22 fixture, migrate through the evidence migrations,
 // verify old rows, source identity, notification queue state, foreign
 // keys and audit chain."
 // ----------------------------------------------------------------------
 
-func seedMigration21SemanticProfilesFixture(t *testing.T, path string) (deliveryID, situationID string) {
+func seedMigration22SemanticProfilesFixture(t *testing.T, path string) (deliveryID, situationID string) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -48,7 +48,7 @@ func seedMigration21SemanticProfilesFixture(t *testing.T, path string) (delivery
 	}
 	fixture := &Store{db: db}
 	for _, m := range migrations {
-		if m.version > 21 {
+		if m.version > 22 {
 			continue
 		}
 		if err := fixture.applyMigration(ctx, m); err != nil {
@@ -132,14 +132,14 @@ func seedMigration21SemanticProfilesFixture(t *testing.T, path string) (delivery
 	return deliveryID, situationID
 }
 
-func TestSemanticProfilesUpgradeMigration21Database(t *testing.T) {
+func TestSemanticProfilesUpgradeMigration22Database(t *testing.T) {
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "upgrade-23.db")
-	deliveryID, situationID := seedMigration21SemanticProfilesFixture(t, path)
+	path := filepath.Join(t.TempDir(), "evidence-upgrade.db")
+	deliveryID, situationID := seedMigration22SemanticProfilesFixture(t, path)
 
 	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
-		t.Fatalf("open (apply migrations 0022/0023): %v", err)
+		t.Fatalf("open (apply pending migrations): %v", err)
 	}
 	defer func() { _ = st.Close() }()
 
@@ -147,12 +147,12 @@ func TestSemanticProfilesUpgradeMigration21Database(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	if got != 35 {
-		t.Fatalf("MaxSchemaVersion = %d, want 35", got)
+	if got != 36 {
+		t.Fatalf("MaxSchemaVersion = %d, want 36", got)
 	}
 	var version int
-	if err := st.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 35 {
-		t.Fatalf("applied schema version = %d (err=%v), want 35", version, err)
+	if err := st.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 36 {
+		t.Fatalf("applied schema version = %d (err=%v), want 36", version, err)
 	}
 	var fkViolations int
 	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_foreign_key_check`).Scan(&fkViolations); err != nil || fkViolations != 0 {

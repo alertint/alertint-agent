@@ -80,3 +80,23 @@ nothing misleading ever exists.
   fail by design (and `task release` makes this impossible).
 - Don't edit the release body by hand afterwards; fix `CHANGELOG.md`
   instead and re-run the release if it matters.
+
+## State-controller database cutover
+
+Released v0.13.9 owns migration `0013_audit_log_kind_ts_idx.sql`.
+State-controller migrations start at `0014_alert_delivery_ledger.sql` and
+currently end at `0036_expected_behavior_reviews.sql`. Released migration
+files must retain their numbers and contents; a pinned release-prefix test
+checks this alongside the populated v0.13.9 upgrade regression.
+
+Take a database backup before upgrading an existing installation. Old
+state-controller prerelease databases that used `0013` for the delivery
+ledger are incompatible with the corrected sequence. Startup rejects that
+lineage before applying migrations. Preserve the database and either restore
+a backup from the released 0.13.x binary or use a fresh database for a lab/RC.
+Do not edit `schema_migrations` by hand to bypass the check. A database left
+partially migrated by an earlier failed release-to-prerelease upgrade must
+also be restored from its released-version backup.
+
+Validate the corrected upgrade path before distributing an RC or using one
+for issue #99 acceptance. Fresh-database tests alone do not cover upgrades.

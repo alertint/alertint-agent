@@ -1288,7 +1288,7 @@ func TestNotificationClaimQueryUsesTheLiveIndex(t *testing.T) {
 func TestNotificationReactivationRetiresAnOlderBlockedRootBehindADeliveredOne(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "reactivate-delivered.db")
-	blockedRootID, deliveredRootID := seedMigration19SupersedeFixture(t, path)
+	blockedRootID, deliveredRootID := seedMigration20SupersedeFixture(t, path)
 	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)

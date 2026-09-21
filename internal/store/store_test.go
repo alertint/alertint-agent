@@ -490,14 +490,9 @@ func TestMaxSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	// 0023_assurance_supersession_by_candidate.sql is the newest migration
-	// today. Plan 2 owns 0015/0016; Plan 3 owns 0017/0018 (spec.md
-	// "Persistence and migration ownership") plus 0019-0023 — 0017 and 0018
-	// are final and are never edited, so a new migration is the only
-	// sanctioned way to extend them, which is exactly what 0023 does to
-	// 0022's supersession guard.
-	if got != 35 {
-		t.Errorf("MaxSchemaVersion = %d, want 35", got)
+	// Released migration 0013 precedes the state-controller migrations.
+	if got != 36 {
+		t.Errorf("MaxSchemaVersion = %d, want 36", got)
 	}
 }
 

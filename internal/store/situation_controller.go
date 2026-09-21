@@ -1349,7 +1349,7 @@ func insertAssessmentAttemptTx(ctx context.Context, tx *sql.Tx, p preparedAttemp
 // real BeginControllerAttempt call would independently compute the SAME
 // (retry_epoch, work_attempt, call_number) coordinates, colliding on
 // situation_assessment_calls' own UNIQUE index
-// (migration 0015_situation_controller.sql) — see this fix's own commit
+// (migration 0016_situation_controller.sql) — see this fix's own commit
 // message for the full root-cause writeup.
 //
 // Like RecoverExpiredFoundationLeases and ListInterruptedIncidentTriage,

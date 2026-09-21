@@ -13,10 +13,10 @@ import (
 )
 
 // migration12Fixture builds a file-backed database with only migrations
-// 1-12 applied (the schema as it existed before this slice's 0013/0014),
+// 1-12 applied (the schema as it existed before this slice's 0014/0015),
 // seeds one Alert and one operational Incident, and returns the file path
 // so a caller can reopen it with the current Open and observe the
-// upgrade to 13/14 land cleanly on top of pre-existing data.
+// upgrade to the current schema land cleanly on top of pre-existing data.
 func migration12Fixture(t *testing.T) string {
 	t.Helper()
 	ctx := context.Background()
@@ -79,7 +79,7 @@ func migration12Fixture(t *testing.T) string {
 
 // TestSituationFoundationUpgradesMigration12Database is the brief's upgrade
 // test: opening a migration-12 database with the current Open must apply
-// 0013 and 0014 without disturbing rows that predate them.
+// 0014 and 0015 without disturbing rows that predate them.
 func TestSituationFoundationUpgradesMigration12Database(t *testing.T) {
 	ctx := context.Background()
 	path := migration12Fixture(t)
@@ -90,7 +90,7 @@ func TestSituationFoundationUpgradesMigration12Database(t *testing.T) {
 	defer func() { _ = st.Close() }()
 
 	var versions int
-	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version IN (13,14)`).Scan(&versions); err != nil {
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version IN (14,15)`).Scan(&versions); err != nil {
 		t.Fatal(err)
 	}
 	if versions != 2 {
@@ -107,12 +107,12 @@ func TestSituationFoundationUpgradesMigration12Database(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------
-// Direct constraint tests for migrations 0013/0014.
+// Direct constraint tests for migrations 0014/0015.
 // ----------------------------------------------------------------------
 
 // insertOperationalIncident inserts an incident row (status='collecting')
 // purely as an FK anchor for the tests below; each caller must use a
-// distinct groupKey since 0013 enforces one collecting incident per group.
+// distinct groupKey since 0014 enforces one collecting incident per group.
 func insertOperationalIncident(ctx context.Context, t *testing.T, s *Store, id, groupKey string) {
 	t.Helper()
 	now := time.Now().UTC()
