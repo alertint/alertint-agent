@@ -47,7 +47,8 @@ func DeriveExpectedJudgmentCoverage(in SnapshotInput) (model.ExpectedJudgmentCov
 			SourceInstanceID: cloneString(d.SourceInstanceID), Severity: d.Severity, IdentityLabels: labels,
 		}
 		if d.Source == "zabbix" && d.SourceInstanceID != nil {
-			if definition, ok := definitions[sourceDefinitionKey(*d.SourceInstanceID, d.Labels["zabbix_trigger_id"])]; ok && definition.available {
+			ruleID := d.Labels["zabbix_trigger_id"]
+			if definition, ok := definitions[sourceDefinitionKey(*d.SourceInstanceID, ruleID)]; ok && definition.available {
 				symptom.ObservedSourceInstanceID = stringPtr(definition.instanceID)
 				symptom.ObservedSourceConfigVersion = stringPtr(definition.version)
 			}

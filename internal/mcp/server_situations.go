@@ -191,6 +191,10 @@ type sourceProvenanceRow struct {
 	InstanceID              string            `json:"instance_id,omitempty"`
 	RuleID                  string            `json:"rule_id"`
 	Host                    string            `json:"host"`
+	ProducerID              string            `json:"producer_id,omitempty"`
+	RuleGroup               string            `json:"rule_group,omitempty"`
+	Presence                string            `json:"presence,omitempty"`
+	ScopeLabels             map[string]string `json:"scope_labels,omitempty"`
 	EndpointID              string            `json:"endpoint_id,omitempty"`
 	Available               bool              `json:"available"`
 	VersionAlgorithm        string            `json:"version_algorithm,omitempty"`
@@ -355,6 +359,7 @@ func (s *Server) handleGetSituation(ctx context.Context, req mcplib.CallToolRequ
 			EndpointID: definition.EndpointID, Available: definition.Available, VersionAlgorithm: definition.VersionAlgorithm,
 			Version: definition.Version, UnavailableReason: definition.UnavailableReason,
 			ComponentDigests: definition.ComponentDigests, TriggerIDs: definition.TriggerIDs, ItemIDs: definition.ItemIDs,
+			ProducerID: definition.ProducerID, RuleGroup: definition.RuleGroup, Presence: definition.Presence, ScopeLabels: definition.ScopeLabels,
 			ObservedAt: view.ObservedAt, ExpiresAt: view.ExpiresAt, Freshness: view.Freshness,
 			HistoricalVersionProven: definition.HistoricalProven,
 		})

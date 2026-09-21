@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -116,6 +117,209 @@ func TestWriteExpectedBehaviorConfirmIsAtomicVersionedAndIdempotent(t *testing.T
 	changed.Policy.Conditions.MaxDurationMinutes++
 	if _, err := st.WriteExpectedBehavior(context.Background(), audit.New(st.DB()), changed); !errors.Is(err, ErrExpectedBehaviorRequestConflict) {
 		t.Fatalf("changed replay error = %v, want request conflict", err)
+	}
+}
+
+func TestWriteExpectedBehaviorConfirmsAlertmanagerScheduleFromCurrentRuleProof(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 21, 19, 5, 0, 0, time.UTC)
+	d := deliveryFixture("delivery-am-judgment", "fp-am-judgment", now)
+	d.Source, d.SourceEpisodeKey = "alertmanager", "alertmanager:prod-am:fp-am-judgment:"+now.Format(time.RFC3339Nano)
+	d.Alert.Labels = map[string]string{"alertname": "ReconciliationLoad", "service": "payment", "severity": "warning"}
+	instanceID, ruleID := "prod-am", "prometheus:prod-prom:jobs:ReconciliationLoad"
+	d.SourceProvenance.InstanceID, d.SourceProvenance.SignalID = &instanceID, &ruleID
+	if _, err := st.AcceptDeliveries(ctx, []DeliveryInput{d}); err != nil {
+		t.Fatal(err)
+	}
+	insertIncidentAndDeliveryInput(t, st, "incident-am-judgment", "input-am-judgment", "service=payment", d.ID, now)
+	inputClaim := claimOneInput(t, st, "input-am-worker", now)
+	if err := st.ApplySituationInput(ctx, inputClaim); err != nil {
+		t.Fatal(err)
+	}
+	situationID := listSituations(t, st)[0].ID
+	assessment := validAssessmentFixture()
+	assessment.Impact = situationmodel.ImpactSuspected
+	if _, err := st.db.ExecContext(ctx, `INSERT INTO situation_assessment_attempts (id,situation_id,sequence,input_version,work_attempt,status,derivation,provider_request_started,material_fact_hash,assessment_json,created_at,completed_at) VALUES ('am-assessment',?,1,1,1,'authoritative','deterministic_controller','false','sha256:am',?,?,?)`, situationID, mustJSON(t, assessment), canonicalTime(now), canonicalTime(now)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE situations SET current_assessment_id='am-assessment',attention='investigate' WHERE id=?`, situationID); err != nil {
+		t.Fatal(err)
+	}
+	claim := claimSituation(t, st, situationID, "am-proof", now)
+	fence := observationmodel.Fence{SituationID: situationID, InputVersion: claim.Situation.InputVersion, Owner: claim.ClaimOwner, Token: claim.ClaimToken}
+	plan := testPlan(now)
+	plan.Capability, plan.Scope.Source, plan.Purpose = observationmodel.CapabilityPrometheusQuery, "alertmanager", "alertmanager_rule_definition"
+	plan.Parameters = json.RawMessage(`{"source_instance_id":"prod-am","producer_id":"prod-prom","group":"jobs","rule":"ReconciliationLoad","scope_labels":{"service":"payment"}}`)
+	cycle, err := st.BeginPreparation(ctx, fence, observationmodel.CycleDraft{Anchor: now, ConfigDigest: "cfg-am", RefreshInterval: 5 * time.Minute, Plans: []observationmodel.Plan{plan}}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := observationmodel.SourceDefinitionObservation{Source: "alertmanager", InstanceID: instanceID, ProducerID: "prod-prom", RuleGroup: "jobs", RuleID: ruleID, Host: "service=payment", EndpointID: "prod-prom", Available: true, VersionAlgorithm: "prometheus-alerting-rule-effective-v1", Version: "sha256:v1", Presence: "present", ScopeLabels: map[string]string{"service": "payment"}}
+	value := json.RawMessage(mustJSON(t, definition))
+	run := observationmodel.Run{ID: "run:am-proof", CycleID: cycle.ID, PlanID: cycle.Draft.Plans[0].ID, Status: observationmodel.ResultConfirmedValue, Coverage: observationmodel.Coverage{Start: plan.Start, End: plan.End, Complete: true, Returned: 1}, Facts: []observationmodel.Fact{{ID: "fact:am-proof", RunID: "run:am-proof", Kind: "source_definition", Subject: "am-rule", Digest: "sha256:am-proof", SchemaVersion: observationmodel.FactSchemaVersion, Value: value, ResultStatus: observationmodel.ResultConfirmedValue, Freshness: observationmodel.FreshnessFresh, ObservedAt: now, ExpiresAt: now.Add(5 * time.Minute), Material: true}}, ObservedAt: now, ExpiresAt: now.Add(5 * time.Minute)}
+	if err := st.CommitObservationRun(ctx, fence, run, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ReleaseSituationClaim(ctx, claim.Situation, now); err != nil {
+		t.Fatal(err)
+	}
+	sit, _ := st.GetSituation(ctx, situationID)
+	judgment, err := st.WriteSituationJudgment(ctx, audit.New(st.DB()), SituationJudgmentWrite{Operation: situationmodel.JudgmentOperationRecord, SituationID: situationID, SituationInputVersion: sit.InputVersion, ExpectedJudgmentVersion: 0, RequestID: "am-judgment", AssertedOperator: "Janis", Confirmed: true, ValidUntil: now.Add(4 * time.Hour), Now: now.Add(time.Second)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := judgment.Judgment.Coverage.Symptoms[0].ObservedSourceConfigVersion; got != nil {
+		t.Fatalf("historical delivery version = %q, want unknown", *got)
+	}
+	sit, _ = st.GetSituation(ctx, situationID)
+	policy := situationmodel.ExpectedBehaviorPolicy{Scope: situationmodel.ExpectedBehaviorScope{GroupKey: "service=payment", Source: "alertmanager", SourceInstanceID: instanceID, ProducerID: "prod-prom", ScopeLabels: map[string]string{"service": "payment"}, PrimaryRuleID: ruleID, PrimaryRuleVersion: "sha256:v1", RuleGroup: "jobs", RuleName: "ReconciliationLoad"}, Conditions: situationmodel.ExpectedBehaviorConditions{Workload: "nightly_reconciliation", Schedule: situationmodel.ExpectedBehaviorSchedule{Days: []situationmodel.ExpectedBehaviorWeekday{situationmodel.ExpectedBehaviorMonday}, LocalStart: "22:00", LocalEnd: "23:00", Timezone: "Europe/Riga", StartToleranceMinutes: 10}, MaxDurationMinutes: 55}, ReviewDueAt: now.Add(30 * 24 * time.Hour)}
+	result, err := st.WriteExpectedBehavior(ctx, audit.New(st.DB()), ExpectedBehaviorWrite{Operation: situationmodel.ExpectedBehaviorOperationConfirm, SourceJudgmentID: judgment.Judgment.ID, SituationID: situationID, SituationInputVersion: sit.InputVersion, ExpectedCurrentVersion: 0, RequestID: "am-confirm", AssertedOperator: "Janis", Confirmed: true, Policy: &policy, Now: now.Add(2 * time.Second)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Head.Scope.Source != "alertmanager" || result.Head.Scope.PrimaryRuleID != ruleID {
+		t.Fatalf("head = %+v", result.Head)
+	}
+	listed, err := st.ListExpectedBehaviors(ctx, ExpectedBehaviorListFilter{Source: "alertmanager", RuleID: ruleID}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].EnvelopeID != result.Head.EnvelopeID {
+		t.Fatalf("alertmanager-filtered schedules = %+v", listed)
+	}
+	if got, err := st.ListExpectedBehaviors(ctx, ExpectedBehaviorListFilter{Source: "zabbix", RuleID: ruleID}, 10); err != nil || len(got) != 0 {
+		t.Fatalf("wrong-source schedules = %+v, %v", got, err)
+	}
+	claim = claimSituation(t, st, situationID, "am-evaluate", now.Add(3*time.Second))
+	reconciliation, err := st.LoadReconciliationInput(ctx, claim, now.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reconciliation.ExpectedBehavior == nil || reconciliation.ExpectedBehavior.Disposition != situationmodel.ExpectedBehaviorDispositionMatched {
+		t.Fatalf("evaluation = %+v", reconciliation.ExpectedBehavior)
+	}
+	assertRevokedAlertmanagerScope(t, st, result.Head.EnvelopeID, ruleID, now.Add(4*time.Second))
+}
+
+func TestWriteExpectedBehaviorRejectsAlertmanagerProofFromDifferentScope(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 21, 19, 5, 0, 0, time.UTC)
+	d := deliveryFixture("delivery-am-billing", "fp-am-billing", now)
+	d.Source, d.SourceEpisodeKey = "alertmanager", "alertmanager:prod-am:fp-am-billing:"+now.Format(time.RFC3339Nano)
+	d.Alert.Labels = map[string]string{"alertname": "ReconciliationLoad", "service": "billing", "severity": "warning"}
+	instanceID, ruleID := "prod-am", "prometheus:prod-prom:jobs:ReconciliationLoad"
+	d.SourceProvenance.InstanceID, d.SourceProvenance.SignalID = &instanceID, &ruleID
+	if _, err := st.AcceptDeliveries(ctx, []DeliveryInput{d}); err != nil {
+		t.Fatal(err)
+	}
+	insertIncidentAndDeliveryInput(t, st, "incident-am-billing", "input-am-billing", "service=billing", d.ID, now)
+	inputClaim := claimOneInput(t, st, "input-am-billing-worker", now)
+	if err := st.ApplySituationInput(ctx, inputClaim); err != nil {
+		t.Fatal(err)
+	}
+	situationID := listSituations(t, st)[0].ID
+	assessment := validAssessmentFixture()
+	assessment.Impact = situationmodel.ImpactSuspected
+	if _, err := st.db.ExecContext(ctx, `INSERT INTO situation_assessment_attempts (id,situation_id,sequence,input_version,work_attempt,status,derivation,provider_request_started,material_fact_hash,assessment_json,created_at,completed_at) VALUES ('am-billing-assessment',?,1,1,1,'authoritative','deterministic_controller','false','sha256:am-billing',?,?,?)`, situationID, mustJSON(t, assessment), canonicalTime(now), canonicalTime(now)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE situations SET current_assessment_id='am-billing-assessment',attention='investigate' WHERE id=?`, situationID); err != nil {
+		t.Fatal(err)
+	}
+
+	claim := claimSituation(t, st, situationID, "am-payment-proof", now)
+	fence := observationmodel.Fence{SituationID: situationID, InputVersion: claim.Situation.InputVersion, Owner: claim.ClaimOwner, Token: claim.ClaimToken}
+	plan := testPlan(now)
+	plan.Capability, plan.Scope.Source, plan.Purpose = observationmodel.CapabilityPrometheusQuery, "alertmanager", "alertmanager_rule_definition"
+	plan.Parameters = json.RawMessage(`{"source_instance_id":"prod-am","producer_id":"prod-prom","group":"jobs","rule":"ReconciliationLoad","scope_labels":{"service":"payment"}}`)
+	cycle, err := st.BeginPreparation(ctx, fence, observationmodel.CycleDraft{Anchor: now, ConfigDigest: "cfg-am-payment", RefreshInterval: 5 * time.Minute, Plans: []observationmodel.Plan{plan}}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := observationmodel.SourceDefinitionObservation{
+		Source: "alertmanager", InstanceID: instanceID, ProducerID: "prod-prom", RuleGroup: "jobs", RuleID: ruleID,
+		Host: "service=payment", EndpointID: "prod-prom", Available: true,
+		VersionAlgorithm: "prometheus-alerting-rule-effective-v1", Version: "sha256:v1", Presence: "present",
+		ScopeLabels: map[string]string{"service": "payment"},
+	}
+	run := observationmodel.Run{
+		ID: "run:am-payment-proof", CycleID: cycle.ID, PlanID: cycle.Draft.Plans[0].ID, Status: observationmodel.ResultConfirmedValue,
+		Coverage: observationmodel.Coverage{Start: plan.Start, End: plan.End, Complete: true, Returned: 1},
+		Facts: []observationmodel.Fact{{
+			ID: "fact:am-payment-proof", RunID: "run:am-payment-proof", Kind: "source_definition", Subject: ruleID,
+			Digest: "sha256:am-payment-proof", SchemaVersion: observationmodel.FactSchemaVersion, Value: json.RawMessage(mustJSON(t, definition)),
+			ResultStatus: observationmodel.ResultConfirmedValue, Freshness: observationmodel.FreshnessFresh,
+			ObservedAt: now, ExpiresAt: now.Add(5 * time.Minute), Material: true,
+		}},
+		ObservedAt: now, ExpiresAt: now.Add(5 * time.Minute),
+	}
+	if err := st.CommitObservationRun(ctx, fence, run, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ReleaseSituationClaim(ctx, claim.Situation, now); err != nil {
+		t.Fatal(err)
+	}
+
+	sit, err := st.GetSituation(ctx, situationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	judgment, err := st.WriteSituationJudgment(ctx, audit.New(st.DB()), SituationJudgmentWrite{
+		Operation: situationmodel.JudgmentOperationRecord, SituationID: situationID, SituationInputVersion: sit.InputVersion,
+		ExpectedJudgmentVersion: 0, RequestID: "am-billing-judgment", AssertedOperator: "Janis", Confirmed: true,
+		ValidUntil: now.Add(4 * time.Hour), Now: now.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sit, err = st.GetSituation(ctx, situationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := situationmodel.ExpectedBehaviorPolicy{
+		Scope: situationmodel.ExpectedBehaviorScope{
+			GroupKey: "service=billing", Source: "alertmanager", SourceInstanceID: instanceID, ProducerID: "prod-prom",
+			ScopeLabels: map[string]string{"service": "billing"}, PrimaryRuleID: ruleID, PrimaryRuleVersion: "sha256:v1",
+			RuleGroup: "jobs", RuleName: "ReconciliationLoad",
+		},
+		Conditions: situationmodel.ExpectedBehaviorConditions{
+			Workload:           "nightly_reconciliation",
+			Schedule:           situationmodel.ExpectedBehaviorSchedule{Days: []situationmodel.ExpectedBehaviorWeekday{situationmodel.ExpectedBehaviorMonday}, LocalStart: "22:00", LocalEnd: "23:00", Timezone: "Europe/Riga", StartToleranceMinutes: 10},
+			MaxDurationMinutes: 55,
+		},
+		ReviewDueAt: now.Add(30 * 24 * time.Hour),
+	}
+	_, err = st.WriteExpectedBehavior(ctx, audit.New(st.DB()), ExpectedBehaviorWrite{
+		Operation: situationmodel.ExpectedBehaviorOperationConfirm, SourceJudgmentID: judgment.Judgment.ID,
+		SituationID: situationID, SituationInputVersion: sit.InputVersion, ExpectedCurrentVersion: 0,
+		RequestID: "am-billing-confirm", AssertedOperator: "Janis", Confirmed: true, Policy: &policy, Now: now.Add(2 * time.Second),
+	})
+	if !errors.Is(err, ErrExpectedBehaviorNotAllowed) || !strings.Contains(err.Error(), "current Alertmanager rule proof is unavailable") {
+		t.Fatalf("confirm error = %v, want unavailable current proof for billing scope", err)
+	}
+}
+
+func assertRevokedAlertmanagerScope(t *testing.T, st *Store, envelopeID, ruleID string, now time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := st.WriteExpectedBehavior(ctx, audit.New(st.DB()), ExpectedBehaviorWrite{
+		Operation: situationmodel.ExpectedBehaviorOperationRevoke, EnvelopeID: envelopeID,
+		ExpectedCurrentVersion: 1, RequestID: "am-revoke", AssertedOperator: "Janis", Confirmed: true, Now: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	revoked, err := st.GetExpectedBehavior(ctx, envelopeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revoked.Scope.Source != "alertmanager" || revoked.Scope.ProducerID != "prod-prom" || revoked.Scope.PrimaryRuleID != ruleID || revoked.Scope.ScopeLabels["service"] != "payment" {
+		t.Fatalf("revoked Alertmanager scope = %+v", revoked.Scope)
+	}
+	listed, err := st.ListExpectedBehaviors(ctx, ExpectedBehaviorListFilter{Source: "alertmanager", RuleID: ruleID, IncludeInactive: true}, 10)
+	if err != nil || len(listed) != 1 || listed[0].Scope.Source != "alertmanager" || listed[0].Scope.ScopeLabels["service"] != "payment" {
+		t.Fatalf("revoked Alertmanager list = %+v, %v", listed, err)
 	}
 }
 

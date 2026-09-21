@@ -4,10 +4,12 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
 
+	observationmodel "github.com/alertint/alertint-agent/internal/observation/model"
 	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 )
 
@@ -116,5 +118,68 @@ func TestExpectedBehaviorValidationRejectsDuplicateBindingAndExpires(t *testing.
 	got, err := st.GetExpectedBehaviorValidation(context.Background(), v.ID, now.Add(time.Minute))
 	if err != nil || got.Status != situationmodel.ExpectedBehaviorValidationUnavailable || got.UnavailableReason != "validation_expired" {
 		t.Fatalf("got=%+v err=%v", got, err)
+	}
+}
+
+func TestCompleteExpectedBehaviorValidationRejectsAlertmanagerProofFromDifferentScope(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 21, 19, 0, 0, 0, time.UTC)
+	situationID := newSituationForGroup(t, st, "service=billing", now)
+	sit := getSituationByID(t, st, situationID)
+	ruleID := "prometheus:prod-prom:jobs:ReconciliationLoad"
+	binding := situationmodel.ExpectedBehaviorBinding{
+		Role: "billing_load", Source: "alertmanager", SourceInstanceID: "prod-am", ProducerID: "prod-prom",
+		RuleID: ruleID, RuleVersion: "sha256:v1", RuleGroup: "jobs", RuleName: "ReconciliationLoad",
+		ScopeLabels: map[string]string{"service": "billing"},
+	}
+	validation, err := st.PrepareExpectedBehaviorValidation(ctx, ExpectedBehaviorValidationPrepare{
+		SituationID: situationID, SituationInputVersion: sit.InputVersion, Bindings: []situationmodel.ExpectedBehaviorBinding{binding},
+		Now: now, FreshFor: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := claimSituation(t, st, situationID, "am-binding-proof", now.Add(time.Second))
+	fence := observationmodel.Fence{SituationID: situationID, InputVersion: claim.Situation.InputVersion, Owner: claim.ClaimOwner, Token: claim.ClaimToken}
+	plan := testPlan(now)
+	plan.Capability, plan.Scope.Source = observationmodel.CapabilityPrometheusQuery, "alertmanager"
+	plan.Purpose = "expected_behavior_validation:" + validation.ID + ":" + binding.Role
+	cycle, err := st.BeginPreparation(ctx, fence, observationmodel.CycleDraft{
+		Anchor: now, ConfigDigest: "cfg-am-binding", RefreshInterval: 5 * time.Minute, Plans: []observationmodel.Plan{plan},
+	}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := observationmodel.SourceDefinitionObservation{
+		Source: "alertmanager", InstanceID: "prod-am", ProducerID: "prod-prom", RuleGroup: "jobs", RuleID: ruleID,
+		Host: "service=payment", EndpointID: "prod-prom", Available: true,
+		VersionAlgorithm: "prometheus-alerting-rule-effective-v1", Version: "sha256:v1", Presence: "present",
+		ScopeLabels: map[string]string{"service": "payment"},
+	}
+	runID := "run:" + cycle.Draft.Plans[0].ID
+	run := observationmodel.Run{
+		ID: runID, CycleID: cycle.ID, PlanID: cycle.Draft.Plans[0].ID, Status: observationmodel.ResultConfirmedValue,
+		Coverage: observationmodel.Coverage{Start: plan.Start, End: plan.End, Complete: true, Returned: 1},
+		Facts: []observationmodel.Fact{{
+			ID: "fact:am-binding-payment", RunID: runID, Kind: "source_definition", Subject: ruleID,
+			Digest: "sha256:am-binding-payment", SchemaVersion: observationmodel.FactSchemaVersion, Value: json.RawMessage(mustJSON(t, definition)),
+			ResultStatus: observationmodel.ResultConfirmedValue, Freshness: observationmodel.FreshnessFresh,
+			ObservedAt: now.Add(time.Second), ExpiresAt: now.Add(5 * time.Minute), Material: true,
+		}},
+		ObservedAt: now.Add(time.Second), ExpiresAt: now.Add(5 * time.Minute),
+	}
+	if err := st.CommitObservationRun(ctx, fence, run, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CompleteExpectedBehaviorValidationsFromCycle(ctx, fence, cycle, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetExpectedBehaviorValidation(ctx, validation.ID, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != situationmodel.ExpectedBehaviorValidationUnavailable || got.UnavailableReason != "binding_identity_changed" {
+		t.Fatalf("validation = %+v, want unavailable binding_identity_changed", got)
 	}
 }

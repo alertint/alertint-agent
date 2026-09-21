@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"maps"
 	"sort"
 	"time"
 
@@ -23,6 +24,10 @@ type ExpectedBehaviorSignal struct {
 	EvidenceRefs     []string
 	ObservedAt       time.Time
 	ExpiresAt        time.Time
+	ProducerID       string
+	ScopeLabels      map[string]string
+	RuleID           string
+	RuleVersion      string
 }
 
 // ExpectedBehaviorInput contains only coherent durable facts. It performs no
@@ -43,6 +48,11 @@ type ExpectedBehaviorInput struct {
 	FiringSignals       []ExpectedBehaviorSignal
 	Observations        []ExpectedBehaviorSignal
 	Heads               []model.ExpectedBehaviorHead
+	ProducerID          string
+	ScopeLabels         map[string]string
+	PrimaryRuleID       string
+	PrimaryRuleVersion  string
+	PrimaryPresence     string
 }
 
 // EvaluateExpectedBehaviors evaluates same-scope alternatives in stable
@@ -63,6 +73,7 @@ func EvaluateExpectedBehaviors(in ExpectedBehaviorInput) model.ExpectedBehaviorE
 		if candidate.Status == model.ExpectedBehaviorMatched {
 			evaluation.Disposition, evaluation.Reason = model.ExpectedBehaviorDispositionMatched, candidate.Reason
 			evaluation.ChosenEnvelopeID, evaluation.ChosenVersion, evaluation.Occurrence = candidate.EnvelopeID, candidate.Version, candidate.Occurrence
+			evaluation.EvidenceExpiresAt = candidate.EvidenceExpiresAt
 			evaluation.BasisHash = expectedBehaviorBasisHash(evaluation)
 			return evaluation
 		}
@@ -101,17 +112,49 @@ func evaluateExpectedBehaviorCandidate(in ExpectedBehaviorInput, head model.Expe
 		return set(model.ExpectedBehaviorNotCandidate, model.ExpectedBehaviorReasonInvalidated)
 	}
 	scope := head.Policy.Scope
-	if scope.GroupKey != in.GroupKey || scope.Source != in.Source || scope.SourceInstanceID != in.SourceInstanceID || scope.Host != in.Host || scope.PrimaryTriggerID != in.PrimaryTriggerID {
+	if scope.GroupKey != in.GroupKey || scope.Source != in.Source || scope.SourceInstanceID != in.SourceInstanceID || !expectedBehaviorScopeMatches(scope, in) {
 		return set(model.ExpectedBehaviorNotCandidate, model.ExpectedBehaviorReasonScopeMismatch)
 	}
 	if in.HasCriticalFiring || in.IndependentlyUrgent {
 		return set(model.ExpectedBehaviorViolated, model.ExpectedBehaviorReasonUrgent)
 	}
-	if in.PrimaryVersion == "" {
+	primaryVersion := in.PrimaryVersion
+	if scope.Source == "alertmanager" {
+		primaryVersion = in.PrimaryRuleVersion
+	}
+	if primaryVersion == "" {
 		return set(model.ExpectedBehaviorAuthorityUnavailable, model.ExpectedBehaviorReasonDefinitionUnavailable)
 	}
-	if scope.PrimaryTriggerVersion != in.PrimaryVersion {
+	wantVersion := scope.PrimaryTriggerVersion
+	if scope.Source == "alertmanager" {
+		wantVersion = scope.PrimaryRuleVersion
+	}
+	if wantVersion != primaryVersion {
 		return set(model.ExpectedBehaviorViolated, model.ExpectedBehaviorReasonPrimaryDefinitionChanged)
+	}
+	var evidenceBoundary time.Time
+	if scope.Source == "alertmanager" && in.PrimaryPresence != "present" {
+		if in.PrimaryPresence == "unknown" || in.PrimaryPresence == "" {
+			return set(model.ExpectedBehaviorAuthorityUnavailable, model.ExpectedBehaviorReasonObservationUnavailable)
+		}
+		return set(model.ExpectedBehaviorViolated, model.ExpectedBehaviorReasonPrimaryMissing)
+	}
+	if scope.Source == "alertmanager" {
+		foundPrimary := false
+		for _, signal := range in.FiringSignals {
+			if signal.SourceInstanceID == in.SourceInstanceID && signal.ProducerID == in.ProducerID && signal.RuleID == in.PrimaryRuleID && maps.Equal(signal.ScopeLabels, in.ScopeLabels) {
+				foundPrimary = true
+				if !signal.ExpiresAt.After(in.Now) {
+					return set(model.ExpectedBehaviorAuthorityUnavailable, model.ExpectedBehaviorReasonObservationUnavailable)
+				}
+				c.EvidenceRefs = append(c.EvidenceRefs, signal.EvidenceRefs...)
+				evidenceBoundary = signal.ExpiresAt
+				break
+			}
+		}
+		if !foundPrimary {
+			return set(model.ExpectedBehaviorAuthorityUnavailable, model.ExpectedBehaviorReasonObservationUnavailable)
+		}
 	}
 	occurrence, err := ResolveExpectedBehaviorOccurrence(head.Policy.Conditions.Schedule, head.Policy.Conditions.MaxDurationMinutes, in.PrimaryStartedAt)
 	if err != nil {
@@ -127,20 +170,23 @@ func evaluateExpectedBehaviorCandidate(in ExpectedBehaviorInput, head model.Expe
 
 	observed := make(map[string]ExpectedBehaviorSignal, len(in.Observations))
 	for _, signal := range in.Observations {
-		observed[expectedBehaviorSignalKey(signal.SourceInstanceID, signal.Host, signal.TriggerID)] = signal
+		observed[expectedBehaviorSignalIdentity(signal)] = signal
 	}
 	allowed := map[string]bool{}
 	for _, binding := range append(append(append([]model.ExpectedBehaviorBinding{}, head.Policy.Conditions.RequiredCompanions...), head.Policy.Conditions.AllowedCompanions...), head.Policy.Conditions.ForbiddenSignals...) {
 		allowed[expectedBehaviorBindingSignalKey(binding)] = true
 	}
 	for _, binding := range append(append([]model.ExpectedBehaviorBinding{}, head.Policy.Conditions.RequiredCompanions...), head.Policy.Conditions.ForbiddenSignals...) {
-		key := expectedBehaviorSignalKey(binding.SourceInstanceID, binding.Host, binding.TriggerID)
+		key := expectedBehaviorBindingSignalKey(binding)
 		observation, ok := observed[key]
 		if !ok || observation.Presence == "unknown" || !observation.ExpiresAt.After(in.Now) {
 			return set(model.ExpectedBehaviorAuthorityUnavailable, model.ExpectedBehaviorReasonObservationUnavailable)
 		}
 		c.EvidenceRefs = append(c.EvidenceRefs, observation.EvidenceRefs...)
-		if observation.TriggerVersion != binding.TriggerVersion {
+		if evidenceBoundary.IsZero() || observation.ExpiresAt.Before(evidenceBoundary) {
+			evidenceBoundary = observation.ExpiresAt
+		}
+		if expectedBehaviorSignalVersion(observation) != expectedBehaviorBindingVersion(binding) {
 			return set(model.ExpectedBehaviorViolated, model.ExpectedBehaviorReasonBindingDefinitionChanged)
 		}
 	}
@@ -154,7 +200,10 @@ func evaluateExpectedBehaviorCandidate(in ExpectedBehaviorInput, head model.Expe
 			continue
 		}
 		c.EvidenceRefs = append(c.EvidenceRefs, observation.EvidenceRefs...)
-		if observation.TriggerVersion != binding.TriggerVersion {
+		if evidenceBoundary.IsZero() || observation.ExpiresAt.Before(evidenceBoundary) {
+			evidenceBoundary = observation.ExpiresAt
+		}
+		if expectedBehaviorSignalVersion(observation) != expectedBehaviorBindingVersion(binding) {
 			return set(model.ExpectedBehaviorViolated, model.ExpectedBehaviorReasonBindingDefinitionChanged)
 		}
 	}
@@ -169,8 +218,9 @@ func evaluateExpectedBehaviorCandidate(in ExpectedBehaviorInput, head model.Expe
 		}
 	}
 	for _, signal := range in.FiringSignals {
-		key := expectedBehaviorSignalKey(signal.SourceInstanceID, signal.Host, signal.TriggerID)
-		if signal.TriggerID == in.PrimaryTriggerID && signal.SourceInstanceID == in.SourceInstanceID && signal.Host == in.Host {
+		key := expectedBehaviorSignalIdentity(signal)
+		if (in.Source == "zabbix" && signal.TriggerID == in.PrimaryTriggerID && signal.SourceInstanceID == in.SourceInstanceID && signal.Host == in.Host) ||
+			(in.Source == "alertmanager" && signal.RuleID == in.PrimaryRuleID && signal.SourceInstanceID == in.SourceInstanceID && signal.ProducerID == in.ProducerID && maps.Equal(signal.ScopeLabels, in.ScopeLabels)) {
 			continue
 		}
 		if !allowed[key] {
@@ -179,12 +229,16 @@ func evaluateExpectedBehaviorCandidate(in ExpectedBehaviorInput, head model.Expe
 	}
 	sort.Strings(c.EvidenceRefs)
 	c.EvidenceRefs = compactExpectedBehaviorStrings(c.EvidenceRefs)
+	if !evidenceBoundary.IsZero() {
+		boundary := evidenceBoundary.UTC()
+		c.EvidenceExpiresAt = &boundary
+	}
 	return set(model.ExpectedBehaviorMatched, model.ExpectedBehaviorReasonMatched)
 }
 
 func expectedBehaviorSignalFiring(signals []ExpectedBehaviorSignal, key string) bool {
 	for _, signal := range signals {
-		if expectedBehaviorSignalKey(signal.SourceInstanceID, signal.Host, signal.TriggerID) == key {
+		if expectedBehaviorSignalIdentity(signal) == key {
 			return true
 		}
 	}
@@ -195,7 +249,45 @@ func expectedBehaviorSignalKey(instance, host, trigger string) string {
 	return instance + "\x00" + host + "\x00" + trigger
 }
 func expectedBehaviorBindingSignalKey(binding model.ExpectedBehaviorBinding) string {
+	if binding.Source == "alertmanager" {
+		return binding.SourceInstanceID + "\x00" + binding.ProducerID + "\x00" + binding.RuleID + "\x00" + canonicalExpectedBehaviorLabels(binding.ScopeLabels)
+	}
 	return expectedBehaviorSignalKey(binding.SourceInstanceID, binding.Host, binding.TriggerID)
+}
+
+func expectedBehaviorSignalIdentity(signal ExpectedBehaviorSignal) string {
+	if signal.RuleID != "" {
+		return signal.SourceInstanceID + "\x00" + signal.ProducerID + "\x00" + signal.RuleID + "\x00" + canonicalExpectedBehaviorLabels(signal.ScopeLabels)
+	}
+	return expectedBehaviorSignalKey(signal.SourceInstanceID, signal.Host, signal.TriggerID)
+}
+
+func expectedBehaviorSignalVersion(signal ExpectedBehaviorSignal) string {
+	if signal.RuleVersion != "" {
+		return signal.RuleVersion
+	}
+	return signal.TriggerVersion
+}
+func expectedBehaviorBindingVersion(binding model.ExpectedBehaviorBinding) string {
+	if binding.RuleVersion != "" {
+		return binding.RuleVersion
+	}
+	return binding.TriggerVersion
+}
+
+func expectedBehaviorScopeMatches(scope model.ExpectedBehaviorScope, in ExpectedBehaviorInput) bool {
+	if scope.Source == "alertmanager" {
+		return scope.ProducerID == in.ProducerID && scope.PrimaryRuleID == in.PrimaryRuleID && maps.Equal(scope.ScopeLabels, in.ScopeLabels)
+	}
+	return scope.Host == in.Host && scope.PrimaryTriggerID == in.PrimaryTriggerID
+}
+
+func canonicalExpectedBehaviorLabels(labels map[string]string) string {
+	raw, err := json.Marshal(labels)
+	if err != nil {
+		panic("situation: marshal expected behavior labels: " + err.Error())
+	}
+	return string(raw)
 }
 
 func expectedBehaviorBasisHash(evaluation model.ExpectedBehaviorEvaluation) string {
@@ -235,8 +327,11 @@ func ApplyExpectedBehaviorAuthority(commit *ControllerCommit, evaluation *model.
 	} else {
 		c.NextActor = model.NextActorNone
 	}
-	if c.NextUpdateAt == nil || evaluation.Occurrence.Boundary.Before(*c.NextUpdateAt) {
-		boundary := evaluation.Occurrence.Boundary.UTC()
+	boundary := evaluation.Occurrence.Boundary.UTC()
+	if evaluation.EvidenceExpiresAt != nil && evaluation.EvidenceExpiresAt.Before(boundary) {
+		boundary = evaluation.EvidenceExpiresAt.UTC()
+	}
+	if c.NextUpdateAt == nil || boundary.Before(*c.NextUpdateAt) {
 		c.NextUpdateAt = &boundary
 	}
 }
@@ -248,7 +343,8 @@ func RefreshExpectedBehaviorEvaluationForCommit(evaluation *model.ExpectedBehavi
 		return
 	}
 	evaluation.EvaluatedAt = now.UTC()
-	if urgent {
+	switch {
+	case urgent:
 		evaluation.Disposition, evaluation.Reason = model.ExpectedBehaviorDispositionViolated, model.ExpectedBehaviorReasonUrgent
 		evaluation.ChosenEnvelopeID, evaluation.ChosenVersion, evaluation.Occurrence = "", 0, nil
 		for i := range evaluation.Candidates {
@@ -257,7 +353,10 @@ func RefreshExpectedBehaviorEvaluationForCommit(evaluation *model.ExpectedBehavi
 				evaluation.Candidates[i].Reason = model.ExpectedBehaviorReasonUrgent
 			}
 		}
-	} else if evaluation.Disposition == model.ExpectedBehaviorDispositionMatched && evaluation.Occurrence != nil && !now.Before(evaluation.Occurrence.Boundary) {
+	case evaluation.Disposition == model.ExpectedBehaviorDispositionMatched && evaluation.EvidenceExpiresAt != nil && !now.Before(*evaluation.EvidenceExpiresAt):
+		evaluation.Disposition, evaluation.Reason = model.ExpectedBehaviorDispositionAuthorityUnavailable, model.ExpectedBehaviorReasonObservationUnavailable
+		evaluation.ChosenEnvelopeID, evaluation.ChosenVersion = "", 0
+	case evaluation.Disposition == model.ExpectedBehaviorDispositionMatched && evaluation.Occurrence != nil && !now.Before(evaluation.Occurrence.Boundary):
 		evaluation.Disposition = model.ExpectedBehaviorDispositionViolated
 		if evaluation.Occurrence.Boundary.Equal(evaluation.Occurrence.End) {
 			evaluation.Reason = model.ExpectedBehaviorReasonOutsideSchedule

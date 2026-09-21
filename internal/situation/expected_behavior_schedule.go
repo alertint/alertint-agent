@@ -22,13 +22,20 @@ var expectedBehaviorIdentifier = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 // writable policy body.
 func ValidateExpectedBehaviorPolicy(policy model.ExpectedBehaviorPolicy, confirmedAt time.Time) error {
 	scope := policy.Scope
-	if strings.TrimSpace(scope.GroupKey) == "" || strings.TrimSpace(scope.Host) == "" ||
-		strings.TrimSpace(scope.SourceInstanceID) == "" || strings.TrimSpace(scope.PrimaryTriggerID) == "" ||
-		strings.TrimSpace(scope.PrimaryTriggerVersion) == "" {
-		return errors.New("expected behavior: scope requires group, installation, host, trigger, and version")
+	if strings.TrimSpace(scope.GroupKey) == "" || strings.TrimSpace(scope.SourceInstanceID) == "" {
+		return errors.New("expected behavior: scope requires group and installation")
 	}
-	if scope.Source != "zabbix" {
-		return errors.New("expected behavior: source must be zabbix")
+	switch scope.Source {
+	case "zabbix":
+		if strings.TrimSpace(scope.Host) == "" || strings.TrimSpace(scope.PrimaryTriggerID) == "" || strings.TrimSpace(scope.PrimaryTriggerVersion) == "" {
+			return errors.New("expected behavior: zabbix scope requires host, trigger, and version")
+		}
+	case "alertmanager":
+		if strings.TrimSpace(scope.ProducerID) == "" || strings.TrimSpace(scope.PrimaryRuleID) == "" || strings.TrimSpace(scope.PrimaryRuleVersion) == "" || strings.TrimSpace(scope.RuleGroup) == "" || strings.TrimSpace(scope.RuleName) == "" || len(scope.ScopeLabels) == 0 {
+			return errors.New("expected behavior: alertmanager scope requires producer, rule, version, and labels")
+		}
+	default:
+		return errors.New("expected behavior: source must be zabbix or alertmanager")
 	}
 	if !expectedBehaviorIdentifier.MatchString(policy.Conditions.Workload) {
 		return errors.New("expected behavior: workload must be a lowercase identifier of at most 64 characters")
@@ -42,7 +49,7 @@ func ValidateExpectedBehaviorPolicy(policy model.ExpectedBehaviorPolicy, confirm
 	if policy.ReviewDueAt.IsZero() || !policy.ReviewDueAt.After(confirmedAt) {
 		return errors.New("expected behavior: review_due_at must be later than confirmation")
 	}
-	primaryKey := expectedBehaviorBindingKey(scope.SourceInstanceID, scope.Host, scope.PrimaryTriggerID)
+	primaryKey := expectedBehaviorScopeBindingKey(scope)
 	roles := make(map[string]struct{})
 	bindings := make(map[string]struct{})
 	sets := [][]model.ExpectedBehaviorBinding{
@@ -59,7 +66,7 @@ func ValidateExpectedBehaviorPolicy(policy model.ExpectedBehaviorPolicy, confirm
 				return fmt.Errorf("expected behavior: role %q is reused", binding.Role)
 			}
 			roles[binding.Role] = struct{}{}
-			key := expectedBehaviorBindingKey(binding.SourceInstanceID, binding.Host, binding.TriggerID)
+			key := expectedBehaviorBindingSignalKey(binding)
 			if key == primaryKey {
 				return errors.New("expected behavior: primary trigger cannot be a companion or forbidden signal")
 			}
@@ -76,14 +83,29 @@ func validateExpectedBehaviorBinding(binding model.ExpectedBehaviorBinding) erro
 	if !expectedBehaviorIdentifier.MatchString(binding.Role) {
 		return errors.New("expected behavior: binding role must be a lowercase identifier of at most 64 characters")
 	}
-	if binding.Source != "zabbix" {
-		return errors.New("expected behavior: binding source must be zabbix")
+	if strings.TrimSpace(binding.SourceInstanceID) == "" {
+		return errors.New("expected behavior: binding requires installation")
 	}
-	if strings.TrimSpace(binding.SourceInstanceID) == "" || strings.TrimSpace(binding.Host) == "" ||
-		strings.TrimSpace(binding.TriggerID) == "" || strings.TrimSpace(binding.TriggerVersion) == "" {
-		return errors.New("expected behavior: binding requires installation, host, trigger, and version")
+	switch binding.Source {
+	case "zabbix":
+		if strings.TrimSpace(binding.Host) == "" || strings.TrimSpace(binding.TriggerID) == "" || strings.TrimSpace(binding.TriggerVersion) == "" {
+			return errors.New("expected behavior: zabbix binding requires host, trigger, and version")
+		}
+	case "alertmanager":
+		if strings.TrimSpace(binding.ProducerID) == "" || strings.TrimSpace(binding.RuleID) == "" || strings.TrimSpace(binding.RuleVersion) == "" || strings.TrimSpace(binding.RuleGroup) == "" || strings.TrimSpace(binding.RuleName) == "" || len(binding.ScopeLabels) == 0 {
+			return errors.New("expected behavior: alertmanager binding requires producer, rule, version, and labels")
+		}
+	default:
+		return errors.New("expected behavior: binding source must be zabbix or alertmanager")
 	}
 	return nil
+}
+
+func expectedBehaviorScopeBindingKey(scope model.ExpectedBehaviorScope) string {
+	if scope.Source == "alertmanager" {
+		return scope.SourceInstanceID + "\x00" + scope.ProducerID + "\x00" + scope.PrimaryRuleID + "\x00" + canonicalExpectedBehaviorLabels(scope.ScopeLabels)
+	}
+	return expectedBehaviorBindingKey(scope.SourceInstanceID, scope.Host, scope.PrimaryTriggerID)
 }
 
 func expectedBehaviorBindingKey(instanceID, host, triggerID string) string {

@@ -30,6 +30,12 @@ func hsNow(t *testing.T) time.Time {
 	return mustTime(t, "2026-09-06T10:00:00Z")
 }
 
+func TestExpectedBehaviorReasonDetailNamesPrometheusRule(t *testing.T) {
+	if got := expectedBehaviorReasonDetail(model.ExpectedBehaviorReasonPrimaryDefinitionChanged, "alertmanager"); got != "The Prometheus rule changed." {
+		t.Fatalf("detail = %q", got)
+	}
+}
+
 // hsRunningTriageContract is a valid nonterminal Operator contract in which
 // AlertINT is currently running Acute Triage.
 func hsRunningTriageContract(next time.Time) model.ActionContract {

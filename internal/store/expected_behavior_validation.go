@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -189,7 +191,7 @@ func (s *Store) CompleteExpectedBehaviorValidation(ctx context.Context, id, situ
 	status := model.ExpectedBehaviorValidationReady
 	if unavailableReason != "" {
 		status = model.ExpectedBehaviorValidationUnavailable
-		observations = nil
+		observations = []model.ExpectedBehaviorBindingObservation{}
 	} else if err := validateExpectedBehaviorObservations(v.Bindings, observations, now); err != nil {
 		return v, err
 	}
@@ -226,7 +228,7 @@ func (s *Store) CompleteExpectedBehaviorValidation(ctx context.Context, id, situ
 // observation runs into validation receipts. The runs remain the evidence
 // source; the receipt only records their fact identities and normalized
 // current-state values.
-func (s *Store) CompleteExpectedBehaviorValidationsFromCycle(ctx context.Context, fence observationmodel.Fence, cycle observationmodel.Cycle, now time.Time) error {
+func (s *Store) CompleteExpectedBehaviorValidationsFromCycle(ctx context.Context, fence observationmodel.Fence, cycle observationmodel.Cycle, now time.Time) error { //nolint:gocyclo // ordered validation gates must preserve precise unavailable reasons.
 	validations, err := s.ListPendingExpectedBehaviorValidations(ctx, fence.SituationID, fence.InputVersion, now)
 	if err != nil {
 		return err
@@ -256,7 +258,27 @@ func (s *Store) CompleteExpectedBehaviorValidationsFromCycle(ctx context.Context
 				break
 			}
 			fact := record.Run.Facts[0]
-			if fact.Kind != "zabbix_problem_state" || fact.Freshness != observationmodel.FreshnessFresh || !fact.ExpiresAt.After(now) {
+			if fact.Freshness != observationmodel.FreshnessFresh || !fact.ExpiresAt.After(now) {
+				unavailable = "observation_unavailable"
+				break
+			}
+			if binding.Source == "alertmanager" {
+				if fact.Kind != "source_definition" {
+					unavailable = "observation_unavailable"
+					break
+				}
+				var observed observationmodel.SourceDefinitionObservation
+				if err := json.Unmarshal(fact.Value, &observed); err != nil {
+					return fmt.Errorf("store: decode expected behavior validation fact: %w", err)
+				}
+				if !observed.Available || observed.InstanceID != binding.SourceInstanceID || observed.ProducerID != binding.ProducerID || observed.RuleID != binding.RuleID || observed.Version != binding.RuleVersion || !maps.Equal(observed.ScopeLabels, binding.ScopeLabels) {
+					unavailable = "binding_identity_changed"
+					break
+				}
+				byRole[binding.Role] = model.ExpectedBehaviorBindingObservation{Binding: binding, Presence: observed.Presence, EvidenceRefs: []string{fact.ID}, ObservedAt: fact.ObservedAt, ExpiresAt: fact.ExpiresAt}
+				continue
+			}
+			if fact.Kind != "zabbix_problem_state" {
 				unavailable = "observation_unavailable"
 				break
 			}
@@ -347,14 +369,33 @@ func canonicalExpectedBehaviorBindings(bindings []model.ExpectedBehaviorBinding)
 	out := append([]model.ExpectedBehaviorBinding{}, bindings...)
 	sort.Slice(out, func(i, j int) bool {
 		a, b := out[i], out[j]
-		return a.Role+"\x00"+a.SourceInstanceID+"\x00"+a.Host+"\x00"+a.TriggerID+"\x00"+a.TriggerVersion < b.Role+"\x00"+b.SourceInstanceID+"\x00"+b.Host+"\x00"+b.TriggerID+"\x00"+b.TriggerVersion
+		aRaw, _ := json.Marshal(a)
+		bRaw, _ := json.Marshal(b)
+		return string(aRaw) < string(bRaw)
 	})
 	seenRoles, seenBindings := map[string]bool{}, map[string]bool{}
 	for _, b := range out {
-		if strings.TrimSpace(b.Role) == "" || b.Source != "zabbix" || strings.TrimSpace(b.SourceInstanceID) == "" || strings.TrimSpace(b.Host) == "" || strings.TrimSpace(b.TriggerID) == "" || strings.TrimSpace(b.TriggerVersion) == "" {
-			return nil, "", errors.New("store: validation bindings require role and exact Zabbix installation, host, trigger, and version")
+		if strings.TrimSpace(b.Role) == "" || strings.TrimSpace(b.SourceInstanceID) == "" {
+			return nil, "", errors.New("store: validation bindings require role and exact source identity")
 		}
 		key := b.SourceInstanceID + "\x00" + b.Host + "\x00" + b.TriggerID
+		switch b.Source {
+		case "zabbix":
+			if b.Host == "" || b.TriggerID == "" || b.TriggerVersion == "" {
+				return nil, "", errors.New("store: validation bindings require exact Zabbix host, trigger, and version")
+			}
+		case "alertmanager":
+			if b.ProducerID == "" || b.RuleID == "" || b.RuleVersion == "" || b.RuleGroup == "" || b.RuleName == "" || len(b.ScopeLabels) == 0 {
+				return nil, "", errors.New("store: validation bindings require exact Alertmanager producer, rule, scope, and version")
+			}
+			scope, err := json.Marshal(b.ScopeLabels)
+			if err != nil {
+				return nil, "", fmt.Errorf("store: encode validation binding scope: %w", err)
+			}
+			key = b.SourceInstanceID + "\x00" + b.ProducerID + "\x00" + b.RuleID + "\x00" + string(scope)
+		default:
+			return nil, "", errors.New("store: validation bindings require a supported source")
+		}
 		if seenRoles[b.Role] || seenBindings[key] {
 			return nil, "", errors.New("store: validation bindings must have unique roles and source identities")
 		}
@@ -384,7 +425,7 @@ func validateExpectedBehaviorObservations(bindings []model.ExpectedBehaviorBindi
 	}
 	for _, binding := range bindings {
 		observation, ok := byRole[binding.Role]
-		if !ok || observation.Binding != binding {
+		if !ok || !reflect.DeepEqual(observation.Binding, binding) {
 			return errors.New("store: validation observation does not match proposed binding")
 		}
 	}

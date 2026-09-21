@@ -10,10 +10,12 @@ import (
 	"math"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/observation"
 	model "github.com/alertint/alertint-agent/internal/observation/model"
+	"github.com/alertint/alertint-agent/internal/prometheus"
 )
 
 // PrometheusClient is the narrow bounded-query boundary
@@ -21,6 +23,20 @@ import (
 // it via QueryRangeBounded.
 type PrometheusClient interface {
 	QueryRangeBounded(ctx context.Context, expr string, start, end time.Time, step time.Duration, limit int) (json.RawMessage, error)
+}
+
+type PrometheusRuleClient interface {
+	RuleDefinitionObservedBounded(ctx context.Context, producerID, group, rule string, scope map[string]string,
+		before func() error, after func(bool, error)) (prometheus.RuleDefinition, error)
+}
+
+type prometheusRuleParameters struct {
+	SourceInstanceID string            `json:"source_instance_id"`
+	ProducerID       string            `json:"producer_id"`
+	Group            string            `json:"group"`
+	Rule             string            `json:"rule"`
+	ScopeLabels      map[string]string `json:"scope_labels"`
+	FreshForSeconds  int               `json:"fresh_for_seconds"`
 }
 
 // PrometheusExecutor implements observation.Executor for prometheus_query:
@@ -41,6 +57,9 @@ func (e *PrometheusExecutor) clock() time.Time {
 
 func (e *PrometheusExecutor) Execute(ctx context.Context, plan model.Plan, recorder observation.RequestRecorder) (model.Run, error) {
 	now := e.clock()
+	if plan.Scope.Source == "alertmanager" && (plan.Purpose == "alertmanager_rule_definition" || strings.HasPrefix(plan.Purpose, "expected_behavior_validation:")) {
+		return e.executeRuleDefinition(ctx, plan, recorder, now)
+	}
 	expr, err := buildPromQLSelector(plan.Scope)
 	if err != nil {
 		return unresolvedRun(plan, now), nil
@@ -92,6 +111,42 @@ func (e *PrometheusExecutor) Execute(ctx context.Context, plan model.Plan, recor
 		Kind: "metric_summary", Value: value, Returned: kept, Omitted: omitted,
 		Truncated: truncated, Capped: kept < len(summary.Series), ExpiresAt: expiresAt,
 	}), nil
+}
+
+func (e *PrometheusExecutor) executeRuleDefinition(ctx context.Context, plan model.Plan, recorder observation.RequestRecorder, now time.Time) (model.Run, error) {
+	var params prometheusRuleParameters
+	if json.Unmarshal(plan.Parameters, &params) != nil || params.SourceInstanceID == "" || params.ProducerID == "" || params.Group == "" || params.Rule == "" {
+		return unresolvedRun(plan, now), nil
+	}
+	client, ok := e.Client.(PrometheusRuleClient)
+	if !ok {
+		return unresolvedRun(plan, now), nil
+	}
+	before, after, budgetExhausted := requestHooks(ctx, recorder, e.clock)
+	definition, execErr := client.RuleDefinitionObservedBounded(ctx, params.ProducerID, params.Group, params.Rule, params.ScopeLabels, before, after)
+	freshFor := time.Duration(params.FreshForSeconds) * time.Second
+	if freshFor <= 0 {
+		freshFor = 5 * time.Minute
+	}
+	observation := model.SourceDefinitionObservation{Source: "alertmanager", InstanceID: params.SourceInstanceID,
+		RuleID: definition.RuleID, Host: canonicalLabelIdentity(params.ScopeLabels), EndpointID: params.ProducerID, ProducerID: params.ProducerID, RuleGroup: params.Group,
+		Available: definition.Available, VersionAlgorithm: definition.VersionAlgorithm, Version: definition.Version,
+		UnavailableReason: definition.UnavailableReason, HistoricalProven: false, Presence: definition.Presence, ScopeLabels: params.ScopeLabels}
+	if execErr != nil {
+		if *budgetExhausted {
+			return withheldRun(plan, now), nil
+		}
+		observation.Available = false
+		observation.VersionAlgorithm = ""
+		observation.Version = ""
+		observation.Presence = "unknown"
+		observation.UnavailableReason = "api_unavailable"
+	}
+	value, err := json.Marshal(observation)
+	if err != nil {
+		return model.Run{}, err
+	}
+	return boundedRun(plan, now, boundedResult{Kind: "source_definition", Value: value, Returned: 1, ExpiresAt: now.Add(freshFor)}), nil
 }
 
 func withheldRun(plan model.Plan, now time.Time) model.Run {

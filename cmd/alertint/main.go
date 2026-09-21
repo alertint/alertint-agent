@@ -721,7 +721,12 @@ func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor,
 		if err != nil {
 			return nil, nil, err
 		}
-		receivers = append(receivers, ingress.NewAlertReceiver(st, token, wake, logger))
+		provenance := ingress.AlertmanagerProvenanceConfig{InstanceID: cfg.Alertmanager.InstanceID}
+		for _, mapping := range cfg.Alertmanager.Rules {
+			provenance.Rules = append(provenance.Rules, ingress.AlertmanagerRuleMapping{AlertName: mapping.AlertName,
+				ProducerID: cfg.Prometheus.InstanceID, Group: mapping.Group, Rule: mapping.Rule, ScopeLabels: mapping.ScopeLabels})
+		}
+		receivers = append(receivers, ingress.NewAlertReceiverWithProvenance(st, token, provenance, wake, logger))
 	}
 	if cfg.Changes.Ingress.Enabled {
 		token, err := cfg.ChangesWebhookToken()

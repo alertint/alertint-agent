@@ -222,6 +222,37 @@ func testProductionPreparer(st *store.Store, exec observation.Executor, prepCfg 
 	}
 }
 
+func TestAlertmanagerRulePlanningDeduplicatesScheduleAndFiringDelivery(t *testing.T) {
+	now := time.Date(2026, 9, 21, 22, 0, 0, 0, time.UTC)
+	instanceID := "prod-am"
+	ruleID := "prometheus:prod-prom:jobs:ReconciliationLoad"
+	binding := situationmodel.ExpectedBehaviorBinding{
+		Role: "billing", Source: "alertmanager", SourceInstanceID: instanceID, ProducerID: "prod-prom",
+		RuleID: ruleID, RuleVersion: "sha256:v1", RuleGroup: "jobs", RuleName: "ReconciliationLoad",
+		ScopeLabels: map[string]string{"service": "billing"},
+	}
+	policy := situationmodel.ExpectedBehaviorPolicy{Conditions: situationmodel.ExpectedBehaviorConditions{AllowedCompanions: []situationmodel.ExpectedBehaviorBinding{binding}}}
+	head := situationmodel.ExpectedBehaviorHead{Policy: &policy}
+	plans := appendExpectedBehaviorSchedulePlans(nil, []situationmodel.ExpectedBehaviorHead{head}, "services", now)
+	if len(plans) != 1 {
+		t.Fatalf("schedule plans = %d, want 1", len(plans))
+	}
+	p := &productionPreparer{
+		alertmanagerInstanceID: instanceID,
+		prometheusProducerID:   "prod-prom",
+		alertmanagerRules: map[string]config.AlertmanagerRuleMappingConfig{
+			ruleID: {AlertName: "ReconciliationLoad", Group: "jobs", Rule: "ReconciliationLoad", ScopeLabels: []string{"service"}},
+		},
+	}
+	plans = p.appendAlertmanagerRulePlans(plans, situation.SnapshotInput{Deliveries: []situation.Delivery{{
+		ID: "delivery-billing", Status: situationmodel.DeliveryStatusFiring, Source: "alertmanager", SourceInstanceID: &instanceID,
+		SourceSignalID: &ruleID, Labels: map[string]string{"alertname": "ReconciliationLoad", "service": "billing"},
+	}}}, "services", now)
+	if len(plans) != 1 {
+		t.Fatalf("plans = %d, want one shared Prometheus read for the schedule binding and firing delivery", len(plans))
+	}
+}
+
 // TestProductionPreparerAppliesSharedMaxWallSecondsDeadline proves Prepare
 // derives its own bounded ctx deadline from req.Now + prepCfg.MaxWallSeconds
 // (spec.md: the preparation wall is "shared by both the lifecycle and
