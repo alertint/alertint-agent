@@ -1425,6 +1425,9 @@ func (c *Config) validateAlertmanagerProvenance() []string {
 			errs = append(errs, fmt.Sprintf("alertmanager.rules[%d] requires alert_name, group, rule, and scope_labels", i))
 			continue
 		}
+		if mapping.AlertName != strings.TrimSpace(mapping.AlertName) {
+			errs = append(errs, fmt.Sprintf("alertmanager.rules[%d].alert_name must not have surrounding whitespace", i))
+		}
 		if seen[mapping.AlertName] {
 			errs = append(errs, fmt.Sprintf("alertmanager.rules[%d].alert_name %q is duplicated", i, mapping.AlertName))
 		}

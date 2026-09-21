@@ -212,10 +212,11 @@ func (s *Store) WriteExpectedBehavior(ctx context.Context, auditor JudgmentAudit
 		res, err := tx.ExecContext(ctx, `
 			UPDATE expected_behavior_envelope_heads SET revision_id=?,version=?,state=?,group_key=?,source=?,source_instance_id=?,
 				host=?,primary_trigger_id=?,primary_trigger_version=?,invalidated_at=NULL,invalidation_reason=NULL,updated_at=?,
-				source_v2=?,producer_id=?,primary_rule_id=?,primary_rule_version=?,scope_labels_json=?
+				source_v2=?,producer_id=?,primary_rule_id=?,primary_rule_version=?,rule_group=?,rule_name=?,scope_labels_json=?
 			WHERE envelope_id=? AND version=?`, revision.ID, version, state, headScope.GroupKey, compatSource,
 			headScope.SourceInstanceID, compatHost, compatRuleID, compatVersion,
-			canonicalTime(req.Now), sourceV2, nullIfEmpty(headScope.ProducerID), nullIfEmpty(headScope.PrimaryRuleID), nullIfEmpty(headScope.PrimaryRuleVersion), string(scopeLabelsJSON), envelopeID, actualVersion)
+			canonicalTime(req.Now), sourceV2, nullIfEmpty(headScope.ProducerID), nullIfEmpty(headScope.PrimaryRuleID), nullIfEmpty(headScope.PrimaryRuleVersion),
+			nullIfEmpty(headScope.RuleGroup), nullIfEmpty(headScope.RuleName), string(scopeLabelsJSON), envelopeID, actualVersion)
 		if err != nil {
 			return ExpectedBehaviorWriteResult{}, fmt.Errorf("store: advance expected behavior head: %w", err)
 		}
@@ -225,9 +226,10 @@ func (s *Store) WriteExpectedBehavior(ctx context.Context, auditor JudgmentAudit
 	} else if _, err := tx.ExecContext(ctx, `
 		INSERT INTO expected_behavior_envelope_heads (
 			envelope_id,revision_id,version,state,group_key,source,source_instance_id,host,primary_trigger_id,primary_trigger_version,updated_at,
-			source_v2,producer_id,primary_rule_id,primary_rule_version,scope_labels_json
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, envelopeID, revision.ID, version, state, headScope.GroupKey, compatSource,
-		headScope.SourceInstanceID, compatHost, compatRuleID, compatVersion, canonicalTime(req.Now), sourceV2, nullIfEmpty(headScope.ProducerID), nullIfEmpty(headScope.PrimaryRuleID), nullIfEmpty(headScope.PrimaryRuleVersion), string(scopeLabelsJSON)); err != nil {
+			source_v2,producer_id,primary_rule_id,primary_rule_version,rule_group,rule_name,scope_labels_json
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, envelopeID, revision.ID, version, state, headScope.GroupKey, compatSource,
+		headScope.SourceInstanceID, compatHost, compatRuleID, compatVersion, canonicalTime(req.Now), sourceV2, nullIfEmpty(headScope.ProducerID), nullIfEmpty(headScope.PrimaryRuleID),
+		nullIfEmpty(headScope.PrimaryRuleVersion), nullIfEmpty(headScope.RuleGroup), nullIfEmpty(headScope.RuleName), string(scopeLabelsJSON)); err != nil {
 		return ExpectedBehaviorWriteResult{}, fmt.Errorf("store: create expected behavior head: %w", err)
 	}
 
@@ -523,7 +525,8 @@ func scanExpectedBehaviorRevision(row scanner) (persistedExpectedBehaviorRevisio
 func readExpectedBehaviorHeadTx(ctx context.Context, tx *sql.Tx, envelopeID string) (model.ExpectedBehaviorHead, error) {
 	head, err := scanExpectedBehaviorHead(tx.QueryRowContext(ctx, `
 		SELECT h.envelope_id,h.revision_id,h.version,h.state,h.group_key,h.source,h.source_instance_id,h.host,
-		       h.primary_trigger_id,h.primary_trigger_version,r.policy_json,r.asserted_operator,
+		       h.primary_trigger_id,h.primary_trigger_version,h.source_v2,h.producer_id,h.primary_rule_id,h.primary_rule_version,
+		       h.rule_group,h.rule_name,h.scope_labels_json,r.policy_json,r.asserted_operator,
 		       h.invalidated_at,h.invalidation_reason,h.updated_at
 		FROM expected_behavior_envelope_heads h
 		JOIN expected_behavior_envelope_revisions r ON r.id=h.revision_id
@@ -651,7 +654,8 @@ func listExpectedBehaviorHeads(ctx context.Context, db dbQuerier, filter Expecte
 	}
 	query := `
 		SELECT h.envelope_id,h.revision_id,h.version,h.state,h.group_key,h.source,h.source_instance_id,h.host,
-		       h.primary_trigger_id,h.primary_trigger_version,r.policy_json,r.asserted_operator,
+		       h.primary_trigger_id,h.primary_trigger_version,h.source_v2,h.producer_id,h.primary_rule_id,h.primary_rule_version,
+		       h.rule_group,h.rule_name,h.scope_labels_json,r.policy_json,r.asserted_operator,
 		       h.invalidated_at,h.invalidation_reason,h.updated_at
 		FROM expected_behavior_envelope_heads h
 		JOIN expected_behavior_envelope_revisions r ON r.id=h.revision_id
@@ -944,14 +948,28 @@ func (s *Store) GetCurrentExpectedBehaviorEvaluationAt(ctx context.Context, situ
 func scanExpectedBehaviorHead(row scanner) (model.ExpectedBehaviorHead, error) {
 	var head model.ExpectedBehaviorHead
 	var state, updatedAt string
+	var sourceV2, producerID, primaryRuleID, primaryRuleVersion, ruleGroup, ruleName sql.NullString
 	var policyJSON, invalidatedAt, invalidationReason sql.NullString
+	var scopeLabelsJSON string
 	if err := row.Scan(&head.EnvelopeID, &head.RevisionID, &head.Version, &state,
 		&head.Scope.GroupKey, &head.Scope.Source, &head.Scope.SourceInstanceID, &head.Scope.Host,
-		&head.Scope.PrimaryTriggerID, &head.Scope.PrimaryTriggerVersion, &policyJSON, &head.AssertedOperator,
+		&head.Scope.PrimaryTriggerID, &head.Scope.PrimaryTriggerVersion, &sourceV2, &producerID, &primaryRuleID, &primaryRuleVersion,
+		&ruleGroup, &ruleName, &scopeLabelsJSON, &policyJSON, &head.AssertedOperator,
 		&invalidatedAt, &invalidationReason, &updatedAt); err != nil {
 		return head, err
 	}
 	head.State = model.ExpectedBehaviorState(state)
+	if sourceV2.Valid {
+		head.Scope.Source = sourceV2.String
+		head.Scope.ProducerID = producerID.String
+		head.Scope.PrimaryRuleID = primaryRuleID.String
+		head.Scope.PrimaryRuleVersion = primaryRuleVersion.String
+		head.Scope.RuleGroup = ruleGroup.String
+		head.Scope.RuleName = ruleName.String
+		if err := json.Unmarshal([]byte(scopeLabelsJSON), &head.Scope.ScopeLabels); err != nil {
+			return head, fmt.Errorf("store: unmarshal expected behavior scope labels: %w", err)
+		}
+	}
 	if policyJSON.Valid {
 		head.Policy = &model.ExpectedBehaviorPolicy{}
 		if err := json.Unmarshal([]byte(policyJSON.String), head.Policy); err != nil {

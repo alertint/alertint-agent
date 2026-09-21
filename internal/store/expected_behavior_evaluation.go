@@ -18,9 +18,10 @@ func expectedBehaviorInputFromSnapshot(in situation.SnapshotInput, heads []model
 		Now: in.Now, PrimaryStartedAt: in.Situation.EffectiveStartedAt, Heads: heads,
 		IndependentlyUrgent: in.Situation.Attention == model.AttentionUrgent || (in.CurrentAssessment != nil && in.CurrentAssessment.Assessment.Attention == model.AttentionUrgent),
 	}
-	definitions := make(map[string]observationmodel.SourceDefinitionObservation)
+	definitions := make(map[string][]observationmodel.SourceDefinitionObservation)
 	for _, definition := range in.Prepared.SourceDefinitions {
-		definitions[definition.InstanceID+"\x00"+definition.RuleID] = definition
+		key := definition.InstanceID + "\x00" + definition.RuleID
+		definitions[key] = append(definitions[key], definition)
 	}
 	latest := latestExpectedBehaviorDeliveries(in.Deliveries)
 	var primary *situation.Delivery
@@ -33,7 +34,7 @@ func expectedBehaviorInputFromSnapshot(in situation.SnapshotInput, heads []model
 		if delivery.Source == "alertmanager" && delivery.SourceSignalID != nil {
 			ruleID = *delivery.SourceSignalID
 		}
-		definition := definitions[*delivery.SourceInstanceID+"\x00"+ruleID]
+		definition := expectedBehaviorDefinitionForDelivery(definitions[*delivery.SourceInstanceID+"\x00"+ruleID], delivery)
 		version := ""
 		if definition.Available {
 			version = definition.Version
@@ -96,6 +97,30 @@ func expectedBehaviorInputFromSnapshot(in situation.SnapshotInput, heads []model
 		}
 	}
 	return out
+}
+
+func expectedBehaviorDefinitionForDelivery(definitions []observationmodel.SourceDefinitionObservation, delivery situation.Delivery) observationmodel.SourceDefinitionObservation {
+	var matched observationmodel.SourceDefinitionObservation
+	found := false
+	for _, definition := range definitions {
+		if delivery.Source == "alertmanager" {
+			scopeMatches := len(definition.ScopeLabels) > 0
+			for key, value := range definition.ScopeLabels {
+				if delivery.Labels[key] != value {
+					scopeMatches = false
+					break
+				}
+			}
+			if !scopeMatches {
+				continue
+			}
+		}
+		if found {
+			return observationmodel.SourceDefinitionObservation{}
+		}
+		matched, found = definition, true
+	}
+	return matched
 }
 
 func latestExpectedBehaviorDeliveries(deliveries []situation.Delivery) []situation.Delivery {

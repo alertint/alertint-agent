@@ -171,6 +171,19 @@ func TestValidate_AlertmanagerProvenanceRequiresExactPrometheusMapping(t *testin
 	}
 }
 
+func TestValidate_AlertmanagerProvenanceRejectsPaddedAlertName(t *testing.T) {
+	cfg := Defaults()
+	cfg.Alertmanager.WebhookTokenEnv = "ALERTINT_WEBHOOK_TOKEN"
+	cfg.LLM.APIKeyEnv = "ANTHROPIC_API_KEY"
+	cfg.Alertmanager.InstanceID = "prod-am"
+	cfg.Prometheus.InstanceID = "prod-prom"
+	cfg.Prometheus.BaseURL = "http://prometheus:9090"
+	cfg.Alertmanager.Rules = []AlertmanagerRuleMappingConfig{{AlertName: " ReconciliationLoad ", Group: "jobs", Rule: "ReconciliationLoad", ScopeLabels: []string{"service"}}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "alert_name must not have surrounding whitespace") {
+		t.Fatalf("Validate = %v, want explicit padded alert_name error", err)
+	}
+}
+
 func TestLoad_ExplicitEmptyGroupLabelsUsesReceiverGrouping(t *testing.T) {
 	yaml := strings.Replace(minimalValidYAML,
 		`group_labels: ["cluster", "namespace", "service"]`, `group_labels: []`, 1)

@@ -4,10 +4,43 @@ package prometheus
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 )
+
+func TestRuleDefinitionObservedBoundedDoesNotSettleWhenReservationFails(t *testing.T) {
+	rules := `{"status":"success","data":{"groups":[{"name":"jobs","interval":15,"rules":[{"type":"alerting","name":"Load","query":"up == 0","labels":{},"alerts":[]}]}]}}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(rules))
+	}))
+	defer server.Close()
+
+	reservationErr := errors.New("reservation denied")
+	beforeCalls := 0
+	afterCalls := 0
+	_, err := NewClient(Config{BaseURL: server.URL}).RuleDefinitionObservedBounded(context.Background(), "prod-prom", "jobs", "Load", nil,
+		func() error {
+			beforeCalls++
+			if beforeCalls == 2 {
+				return reservationErr
+			}
+			return nil
+		},
+		func(started bool, err error) {
+			afterCalls++
+			if !started || err != nil {
+				t.Fatalf("settled request = started %v err %v, want the successful first request", started, err)
+			}
+		})
+	if !errors.Is(err, reservationErr) {
+		t.Fatalf("error = %v, want reservation failure", err)
+	}
+	if beforeCalls != 2 || afterCalls != 1 {
+		t.Fatalf("before calls = %d, after calls = %d; failed reservation must not settle an earlier request", beforeCalls, afterCalls)
+	}
+}
 
 func TestRuleDefinitionBoundedStableAcrossRuntimeChurnAndChangesOnDefinitionEdit(t *testing.T) {
 	body := `{"status":"success","data":{"groups":[{"name":"jobs","file":"/etc/rules.yml","interval":15,"limit":0,"evaluationTime":9.1,"lastEvaluation":"2026-09-21T00:00:00Z","rules":[{"type":"alerting","name":"ReconciliationLoad","query":"cpu_load > 5","duration":60,"keepFiringFor":0,"labels":{"severity":"warning","service":"payment"},"annotations":{"summary":"busy"},"health":"ok","evaluationTime":3.2,"lastEvaluation":"2026-09-21T00:00:00Z","alerts":[{"labels":{"alertname":"ReconciliationLoad","service":"payment","instance":"db-1"},"state":"firing","activeAt":"2026-09-21T00:00:00Z","value":"6"}]}]}]}}`

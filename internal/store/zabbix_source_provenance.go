@@ -24,11 +24,15 @@ type ZabbixSourceObservationView struct {
 	Freshness  string                                       `json:"freshness"`
 }
 
-func sourceObservationKey(instanceID, ruleID string) string {
+func sourceObservationKey(source, instanceID, ruleID, scopeLabelsJSON string) string {
 	if instanceID == "" {
-		return "unknown:" + ruleID
+		instanceID = "unknown"
 	}
-	return instanceID + ":" + ruleID
+	key := instanceID + ":" + ruleID
+	if source == "alertmanager" {
+		key += ":" + scopeLabelsJSON
+	}
+	return key
 }
 
 //nolint:gocyclo // atomic validation, immutable insert, and head advance are one fail-closed transaction boundary
@@ -75,7 +79,7 @@ func insertZabbixSourceObservationTx(ctx context.Context, tx *sql.Tx, situationI
 	if string(scopeLabels) == "null" {
 		scopeLabels = []byte("{}")
 	}
-	key := sourceObservationKey(definition.InstanceID, definition.RuleID)
+	key := sourceObservationKey(definition.Source, definition.InstanceID, definition.RuleID, string(scopeLabels))
 	observationID := definition.Source + "-source:" + fact.ID
 
 	var priorDigest, priorObservedAt string

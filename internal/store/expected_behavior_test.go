@@ -198,6 +198,29 @@ func TestWriteExpectedBehaviorConfirmsAlertmanagerScheduleFromCurrentRuleProof(t
 	if reconciliation.ExpectedBehavior == nil || reconciliation.ExpectedBehavior.Disposition != situationmodel.ExpectedBehaviorDispositionMatched {
 		t.Fatalf("evaluation = %+v", reconciliation.ExpectedBehavior)
 	}
+	assertRevokedAlertmanagerScope(t, st, result.Head.EnvelopeID, ruleID, now.Add(4*time.Second))
+}
+
+func assertRevokedAlertmanagerScope(t *testing.T, st *Store, envelopeID, ruleID string, now time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := st.WriteExpectedBehavior(ctx, audit.New(st.DB()), ExpectedBehaviorWrite{
+		Operation: situationmodel.ExpectedBehaviorOperationRevoke, EnvelopeID: envelopeID,
+		ExpectedCurrentVersion: 1, RequestID: "am-revoke", AssertedOperator: "Janis", Confirmed: true, Now: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	revoked, err := st.GetExpectedBehavior(ctx, envelopeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revoked.Scope.Source != "alertmanager" || revoked.Scope.ProducerID != "prod-prom" || revoked.Scope.PrimaryRuleID != ruleID || revoked.Scope.ScopeLabels["service"] != "payment" {
+		t.Fatalf("revoked Alertmanager scope = %+v", revoked.Scope)
+	}
+	listed, err := st.ListExpectedBehaviors(ctx, ExpectedBehaviorListFilter{Source: "alertmanager", RuleID: ruleID, IncludeInactive: true}, 10)
+	if err != nil || len(listed) != 1 || listed[0].Scope.Source != "alertmanager" || listed[0].Scope.ScopeLabels["service"] != "payment" {
+		t.Fatalf("revoked Alertmanager list = %+v, %v", listed, err)
+	}
 }
 
 func TestWriteExpectedBehaviorAuditFailureRollsBackRevisionAndWake(t *testing.T) {

@@ -155,6 +155,69 @@ func sourceObservationHistoryCount(t *testing.T, st *Store, situationID string) 
 	return count
 }
 
+func TestAlertmanagerSourceHeadsKeepScopesIndependent(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 21, 20, 0, 0, 0, time.UTC)
+	situationID := newSituationForGroup(t, st, "service=payments", now)
+	claim := claimSituation(t, st, situationID, "alertmanager-scopes", now)
+	fence := observationmodel.Fence{SituationID: situationID, InputVersion: claim.Situation.InputVersion, Owner: claim.ClaimOwner, Token: claim.ClaimToken}
+	ruleID := "prometheus:prod-prom:jobs:ReconciliationLoad"
+
+	plans := make([]observationmodel.Plan, 0, 2)
+	for _, service := range []string{"payment", "billing"} {
+		plan := testPlan(now)
+		plan.Scope.Source = "alertmanager"
+		plan.Scope.SubjectID = "rule:" + service
+		plan.Scope.Labels = map[string]string{"service": service}
+		plan.Purpose = "alertmanager_rule_definition"
+		plan.Parameters = json.RawMessage(`{"source_instance_id":"prod-am","producer_id":"prod-prom","group":"jobs","rule":"ReconciliationLoad","scope_labels":{"service":"` + service + `"}}`)
+		plans = append(plans, plan)
+	}
+	cycle, err := st.BeginPreparation(ctx, fence, observationmodel.CycleDraft{Anchor: now, ConfigDigest: "cfg-alertmanager-scopes", RefreshInterval: 5 * time.Minute, Plans: plans}, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i, service := range []string{"payment", "billing"} {
+		observedAt := now.Add(time.Duration(i) * time.Second)
+		definition := observationmodel.SourceDefinitionObservation{
+			Source: "alertmanager", InstanceID: "prod-am", ProducerID: "prod-prom", RuleGroup: "jobs", RuleID: ruleID,
+			Host: "service=" + service, EndpointID: "prod-prom", Available: true,
+			VersionAlgorithm: "prometheus-alerting-rule-effective-v1", Version: "sha256:v1", Presence: "present",
+			ScopeLabels: map[string]string{"service": service},
+		}
+		runID, factID := "run:scope:"+service, "fact:scope:"+service
+		run := observationmodel.Run{
+			ID: runID, CycleID: cycle.ID, PlanID: cycle.Draft.Plans[i].ID, Status: observationmodel.ResultConfirmedValue,
+			Coverage: observationmodel.Coverage{Start: plans[i].Start, End: plans[i].End, Complete: true, Returned: 1},
+			Facts: []observationmodel.Fact{{ID: factID, RunID: runID, Kind: "source_definition", Subject: ruleID,
+				Digest: "sha256:" + service, SchemaVersion: observationmodel.FactSchemaVersion, Value: json.RawMessage(mustJSON(t, definition)),
+				ResultStatus: observationmodel.ResultConfirmedValue, Freshness: observationmodel.FreshnessFresh,
+				ObservedAt: observedAt, ExpiresAt: observedAt.Add(5 * time.Minute), Material: true}},
+			ObservedAt: observedAt, ExpiresAt: observedAt.Add(5 * time.Minute),
+		}
+		if err := st.CommitObservationRun(ctx, fence, run, observedAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	heads, err := st.GetCurrentZabbixSourceObservations(ctx, situationID, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(heads) != 2 {
+		t.Fatalf("current observation heads = %d, want one per rule scope: %+v", len(heads), heads)
+	}
+	got := map[string]bool{}
+	for _, head := range heads {
+		got[head.Definition.ScopeLabels["service"]] = true
+	}
+	if !got["payment"] || !got["billing"] {
+		t.Fatalf("current scopes = %v, want payment and billing", got)
+	}
+}
+
 func TestZabbixSourceHeadIgnoresUnchangedRepeatAndAtomicallyInvalidatesChangedRule(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)

@@ -217,6 +217,25 @@ func (p *productionPreparer) appendAlertmanagerRulePlans(plans []model.Plan, in 
 		return plans
 	}
 	seen := map[string]bool{}
+	for _, plan := range plans {
+		if plan.Capability != model.CapabilityPrometheusQuery || plan.Purpose != "alertmanager_rule_definition" {
+			continue
+		}
+		var params struct {
+			SourceInstanceID string            `json:"source_instance_id"`
+			ProducerID       string            `json:"producer_id"`
+			Group            string            `json:"group"`
+			Rule             string            `json:"rule"`
+			ScopeLabels      map[string]string `json:"scope_labels"`
+		}
+		if json.Unmarshal(plan.Parameters, &params) != nil {
+			continue
+		}
+		ruleID := "prometheus:" + params.ProducerID + ":" + params.Group + ":" + params.Rule
+		if key, err := alertmanagerRulePlanKey(params.SourceInstanceID, params.ProducerID, ruleID, params.ScopeLabels); err == nil {
+			seen[key] = true
+		}
+	}
 	for _, delivery := range in.Deliveries {
 		if delivery.Source != "alertmanager" || delivery.Status != situationmodel.DeliveryStatusFiring || delivery.SourceInstanceID == nil || *delivery.SourceInstanceID != p.alertmanagerInstanceID || delivery.SourceSignalID == nil {
 			continue
@@ -238,11 +257,10 @@ func (p *productionPreparer) appendAlertmanagerRulePlans(plans []model.Plan, in 
 		if !complete {
 			continue
 		}
-		encodedScope, err := json.Marshal(scope)
+		key, err := alertmanagerRulePlanKey(p.alertmanagerInstanceID, p.prometheusProducerID, *delivery.SourceSignalID, scope)
 		if err != nil {
 			continue
 		}
-		key := *delivery.SourceSignalID + "\x00" + string(encodedScope)
 		if seen[key] || len(plans) >= model.MaxPlansPerCycle {
 			continue
 		}
@@ -257,6 +275,14 @@ func (p *productionPreparer) appendAlertmanagerRulePlans(plans []model.Plan, in 
 		seen[key] = true
 	}
 	return plans
+}
+
+func alertmanagerRulePlanKey(instanceID, producerID, ruleID string, scope map[string]string) (string, error) {
+	encodedScope, err := json.Marshal(scope)
+	if err != nil {
+		return "", err
+	}
+	return instanceID + "\x00" + producerID + "\x00" + ruleID + "\x00" + string(encodedScope), nil
 }
 
 func (p *productionPreparer) invalidateChangedExpectedBehaviors(ctx context.Context, claim situation.Claim, now time.Time) (bool, error) {
@@ -329,13 +355,18 @@ func appendExpectedBehaviorSchedulePlans(plans []model.Plan, heads []situationmo
 			}
 		}
 		if plan.Capability == model.CapabilityPrometheusQuery && plan.Purpose == "alertmanager_rule_definition" {
-			var params map[string]any
+			var params struct {
+				SourceInstanceID string            `json:"source_instance_id"`
+				ProducerID       string            `json:"producer_id"`
+				Group            string            `json:"group"`
+				Rule             string            `json:"rule"`
+				ScopeLabels      map[string]string `json:"scope_labels"`
+			}
 			if json.Unmarshal(plan.Parameters, &params) == nil {
-				scope, err := json.Marshal(params["scope_labels"])
-				if err != nil {
-					continue
+				ruleID := "prometheus:" + params.ProducerID + ":" + params.Group + ":" + params.Rule
+				if key, err := alertmanagerRulePlanKey(params.SourceInstanceID, params.ProducerID, ruleID, params.ScopeLabels); err == nil {
+					seen[key] = true
 				}
-				seen[fmt.Sprint(params["source_instance_id"])+"\x00"+fmt.Sprint(params["producer_id"])+"\x00prometheus:"+fmt.Sprint(params["producer_id"])+":"+fmt.Sprint(params["group"])+":"+fmt.Sprint(params["rule"])+"\x00"+string(scope)] = true
 			}
 		}
 	}
@@ -347,11 +378,11 @@ func appendExpectedBehaviorSchedulePlans(plans []model.Plan, heads []situationmo
 		for _, binding := range bindings {
 			key := binding.SourceInstanceID + "\x00" + binding.Host + "\x00" + binding.TriggerID
 			if binding.Source == "alertmanager" {
-				scope, err := json.Marshal(binding.ScopeLabels)
+				var err error
+				key, err = alertmanagerRulePlanKey(binding.SourceInstanceID, binding.ProducerID, binding.RuleID, binding.ScopeLabels)
 				if err != nil {
 					continue
 				}
-				key = binding.SourceInstanceID + "\x00" + binding.ProducerID + "\x00" + binding.RuleID + "\x00" + string(scope)
 			}
 			if seen[key] {
 				continue

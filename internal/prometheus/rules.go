@@ -43,7 +43,6 @@ func (c *Client) RuleDefinitionObservedBounded(ctx context.Context, producerID, 
 	result := RuleDefinition{ProducerID: producerID, Group: groupName, Rule: ruleName,
 		RuleID: "prometheus:" + producerID + ":" + groupName + ":" + ruleName, Presence: "unknown", ScopeLabels: scope}
 	if err := before(); err != nil {
-		after(false, err)
 		return result, err
 	}
 	raw, err := c.apiGetBounded(ctx, "/api/v1/rules", url.Values{})
@@ -52,7 +51,6 @@ func (c *Client) RuleDefinitionObservedBounded(ctx context.Context, producerID, 
 		return result, err
 	}
 	if err := before(); err != nil {
-		after(false, err)
 		return result, err
 	}
 	configRaw, configErr := c.apiGetBounded(ctx, "/api/v1/status/config", nil)
