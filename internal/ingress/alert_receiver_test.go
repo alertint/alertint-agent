@@ -150,6 +150,43 @@ func TestAlertmanagerReceiverFallsBackToFingerprintIdentity(t *testing.T) {
 	}
 }
 
+func TestAlertmanagerReceiverNamespacesInstallationsAndRecordsConfiguredRuleIdentity(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Now().UTC()
+	payload := AlertmanagerPayload{Version: "4", Status: "firing", Alerts: []AlertmanagerAlert{{
+		Status: "firing", Labels: map[string]string{"alertname": "ReconciliationLoad", "service": "payment"},
+		StartsAt: now, Fingerprint: "same-fingerprint",
+	}}}
+	mapping := AlertmanagerRuleMapping{AlertName: "ReconciliationLoad", ProducerID: "lab-prometheus", Group: "lab-stack", Rule: "ReconciliationLoad", ScopeLabels: []string{"service"}}
+	for _, instance := range []string{"am-east", "am-west"} {
+		r := NewAlertReceiverWithProvenance(st, "token", AlertmanagerProvenanceConfig{InstanceID: instance, Rules: []AlertmanagerRuleMapping{mapping}}, nil, nil)
+		if _, err := r.Ingest(context.Background(), mustMarshal(t, payload)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claims := claimAll(t, st)
+	if len(claims) != 2 {
+		t.Fatalf("deliveries = %d, want 2", len(claims))
+	}
+	seen := map[string]bool{}
+	for _, claim := range claims {
+		p := claim.Delivery.SourceProvenance
+		if p.InstanceID == nil || p.SignalID == nil || p.SignalVersion != nil {
+			t.Fatalf("provenance = %+v, want installation and rule identity without historical version", p)
+		}
+		seen[*p.InstanceID] = true
+		if got, want := *p.SignalID, "prometheus:lab-prometheus:lab-stack:ReconciliationLoad"; got != want {
+			t.Fatalf("signal id = %q, want %q", got, want)
+		}
+		if want := "alertmanager:" + *p.InstanceID + ":same-fingerprint:" + now.Format(time.RFC3339Nano); claim.Delivery.SourceEpisodeKey != want {
+			t.Fatalf("episode key = %q, want %q", claim.Delivery.SourceEpisodeKey, want)
+		}
+	}
+	if !seen["am-east"] || !seen["am-west"] {
+		t.Fatalf("installation identities = %v", seen)
+	}
+}
+
 // TestAlertmanagerReceiverFiringAndResolvedHaveDistinctIDsStableEpisodeKey
 // proves the durable ledger records a firing member and its later
 // resolution as two immutable deliveries sharing one source episode.

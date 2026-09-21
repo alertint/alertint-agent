@@ -40,8 +40,8 @@ func insertZabbixSourceObservationTx(ctx context.Context, tx *sql.Tx, situationI
 	if err := json.Unmarshal(fact.Value, &definition); err != nil {
 		return false, fmt.Errorf("store: decode zabbix source definition fact: %w", err)
 	}
-	if definition.Source != "zabbix" || strings.TrimSpace(definition.RuleID) == "" || strings.TrimSpace(definition.Host) == "" {
-		return false, errors.New("store: zabbix source definition requires source, rule, and host")
+	if (definition.Source != "zabbix" && definition.Source != "alertmanager") || strings.TrimSpace(definition.RuleID) == "" || (definition.Source == "zabbix" && strings.TrimSpace(definition.Host) == "") {
+		return false, errors.New("store: source definition requires a supported source and rule identity")
 	}
 	if definition.HistoricalProven {
 		return false, errors.New("store: current zabbix source observation cannot claim historical proof")
@@ -68,8 +68,15 @@ func insertZabbixSourceObservationTx(ctx context.Context, tx *sql.Tx, situationI
 	if err != nil {
 		return false, fmt.Errorf("store: encode zabbix source item ids: %w", err)
 	}
+	scopeLabels, err := json.Marshal(definition.ScopeLabels)
+	if err != nil {
+		return false, fmt.Errorf("store: encode source scope labels: %w", err)
+	}
+	if string(scopeLabels) == "null" {
+		scopeLabels = []byte("{}")
+	}
 	key := sourceObservationKey(definition.InstanceID, definition.RuleID)
-	observationID := "zabbix-source:" + fact.ID
+	observationID := definition.Source + "-source:" + fact.ID
 
 	var priorDigest, priorObservedAt string
 	err = tx.QueryRowContext(ctx, `
@@ -99,12 +106,14 @@ func insertZabbixSourceObservationTx(ctx context.Context, tx *sql.Tx, situationI
 		INSERT INTO zabbix_source_observations (
 			id,fact_id,run_id,situation_id,source_key,source_instance_id,rule_id,host,endpoint_id,
 			available,version_algorithm,version_value,unavailable_reason,content_digest,
-			component_digests_json,trigger_ids_json,item_ids_json,observed_at,expires_at
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			component_digests_json,trigger_ids_json,item_ids_json,observed_at,expires_at,
+			source,producer_id,rule_group,presence,scope_labels_json
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		observationID, fact.ID, runID, situationID, key, nullableText(definition.InstanceID), definition.RuleID,
 		definition.Host, nullableText(definition.EndpointID), boolToInt(definition.Available), nullableText(definition.VersionAlgorithm),
 		nullableText(definition.Version), nullableText(definition.UnavailableReason), fact.Digest, string(components),
-		string(triggerIDs), string(itemIDs), canonicalTime(fact.ObservedAt), canonicalTime(fact.ExpiresAt)); err != nil {
+		string(triggerIDs), string(itemIDs), canonicalTime(fact.ObservedAt), canonicalTime(fact.ExpiresAt),
+		definition.Source, nullableText(definition.ProducerID), nullableText(definition.RuleGroup), nullableText(definition.Presence), string(scopeLabels)); err != nil {
 		return false, fmt.Errorf("store: insert zabbix source observation: %w", err)
 	}
 	if !advanceHead {
@@ -136,8 +145,9 @@ func nullableText(value string) any {
 
 func loadCurrentZabbixSourceObservationsTx(ctx context.Context, tx *sql.Tx, situationID string, now time.Time) ([]ZabbixSourceObservationView, error) {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT o.source_instance_id,o.rule_id,o.host,o.endpoint_id,o.available,o.version_algorithm,o.version_value,
-		       o.unavailable_reason,o.component_digests_json,o.trigger_ids_json,o.item_ids_json,o.observed_at,o.expires_at
+		SELECT o.fact_id,o.source_instance_id,o.rule_id,o.host,o.endpoint_id,o.available,o.version_algorithm,o.version_value,
+		       o.unavailable_reason,o.component_digests_json,o.trigger_ids_json,o.item_ids_json,o.observed_at,o.expires_at,
+		       o.source,o.producer_id,o.rule_group,o.presence,o.scope_labels_json
 		FROM zabbix_source_observation_heads h
 		JOIN zabbix_source_observations o ON o.id=h.observation_id
 		WHERE h.situation_id=? ORDER BY o.source_key`, situationID)
@@ -147,11 +157,11 @@ func loadCurrentZabbixSourceObservationsTx(ctx context.Context, tx *sql.Tx, situ
 	defer func() { _ = rows.Close() }()
 	var out []ZabbixSourceObservationView
 	for rows.Next() {
-		var instanceID, endpointID, algorithm, version, reason sql.NullString
-		var ruleID, host, componentsJSON, triggerIDsJSON, itemIDsJSON, observedAt, expiresAt string
+		var instanceID, endpointID, algorithm, version, reason, producerID, ruleGroup, presence sql.NullString
+		var factID, ruleID, host, componentsJSON, triggerIDsJSON, itemIDsJSON, observedAt, expiresAt, source, scopeLabelsJSON string
 		var available int
-		if err := rows.Scan(&instanceID, &ruleID, &host, &endpointID, &available, &algorithm, &version, &reason,
-			&componentsJSON, &triggerIDsJSON, &itemIDsJSON, &observedAt, &expiresAt); err != nil {
+		if err := rows.Scan(&factID, &instanceID, &ruleID, &host, &endpointID, &available, &algorithm, &version, &reason,
+			&componentsJSON, &triggerIDsJSON, &itemIDsJSON, &observedAt, &expiresAt, &source, &producerID, &ruleGroup, &presence, &scopeLabelsJSON); err != nil {
 			return nil, fmt.Errorf("store: scan current zabbix source observation: %w", err)
 		}
 		observed, err := time.Parse(time.RFC3339Nano, observedAt)
@@ -163,9 +173,13 @@ func loadCurrentZabbixSourceObservationsTx(ctx context.Context, tx *sql.Tx, situ
 			return nil, fmt.Errorf("store: parse zabbix source expires_at: %w", err)
 		}
 		definition := observationmodel.SourceDefinitionObservation{
-			Source: "zabbix", InstanceID: instanceID.String, RuleID: ruleID, Host: host, EndpointID: endpointID.String,
+			Source: source, InstanceID: instanceID.String, RuleID: ruleID, Host: host, EndpointID: endpointID.String,
 			Available: available == 1, VersionAlgorithm: algorithm.String, Version: version.String,
-			UnavailableReason: reason.String, HistoricalProven: false,
+			UnavailableReason: reason.String, HistoricalProven: false, ProducerID: producerID.String, RuleGroup: ruleGroup.String, Presence: presence.String,
+			EvidenceRefs: []string{factID}, ObservedAt: observed, ExpiresAt: expires,
+		}
+		if err := json.Unmarshal([]byte(scopeLabelsJSON), &definition.ScopeLabels); err != nil {
+			return nil, fmt.Errorf("store: decode source scope labels: %w", err)
 		}
 		if err := json.Unmarshal([]byte(componentsJSON), &definition.ComponentDigests); err != nil {
 			return nil, fmt.Errorf("store: decode zabbix source component digests: %w", err)

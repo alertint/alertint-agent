@@ -58,8 +58,10 @@ type persistedExpectedBehaviorRevision struct {
 // ExpectedBehaviorListFilter selects current envelope heads.
 type ExpectedBehaviorListFilter struct {
 	GroupKey         string
+	Source           string
 	SourceInstanceID string
 	TriggerID        string
+	RuleID           string
 	IncludeInactive  bool
 }
 
@@ -193,13 +195,27 @@ func (s *Store) WriteExpectedBehavior(ctx context.Context, auditor JudgmentAudit
 	} else {
 		headScope = priorHead.Scope
 	}
+	compatSource, compatHost, compatRuleID, compatVersion := headScope.Source, headScope.Host, headScope.PrimaryTriggerID, headScope.PrimaryTriggerVersion
+	var sourceV2 any
+	if headScope.Source == "alertmanager" {
+		compatSource, compatHost, compatRuleID, compatVersion = "zabbix", "alertmanager", headScope.PrimaryRuleID, headScope.PrimaryRuleVersion
+		sourceV2 = "alertmanager"
+	}
+	scopeLabelsJSON, err := json.Marshal(headScope.ScopeLabels)
+	if err != nil {
+		return ExpectedBehaviorWriteResult{}, fmt.Errorf("store: marshal expected behavior scope labels: %w", err)
+	}
+	if string(scopeLabelsJSON) == "null" {
+		scopeLabelsJSON = []byte("{}")
+	}
 	if hasHead {
 		res, err := tx.ExecContext(ctx, `
 			UPDATE expected_behavior_envelope_heads SET revision_id=?,version=?,state=?,group_key=?,source=?,source_instance_id=?,
-				host=?,primary_trigger_id=?,primary_trigger_version=?,invalidated_at=NULL,invalidation_reason=NULL,updated_at=?
-			WHERE envelope_id=? AND version=?`, revision.ID, version, state, headScope.GroupKey, headScope.Source,
-			headScope.SourceInstanceID, headScope.Host, headScope.PrimaryTriggerID, headScope.PrimaryTriggerVersion,
-			canonicalTime(req.Now), envelopeID, actualVersion)
+				host=?,primary_trigger_id=?,primary_trigger_version=?,invalidated_at=NULL,invalidation_reason=NULL,updated_at=?,
+				source_v2=?,producer_id=?,primary_rule_id=?,primary_rule_version=?,scope_labels_json=?
+			WHERE envelope_id=? AND version=?`, revision.ID, version, state, headScope.GroupKey, compatSource,
+			headScope.SourceInstanceID, compatHost, compatRuleID, compatVersion,
+			canonicalTime(req.Now), sourceV2, nullIfEmpty(headScope.ProducerID), nullIfEmpty(headScope.PrimaryRuleID), nullIfEmpty(headScope.PrimaryRuleVersion), string(scopeLabelsJSON), envelopeID, actualVersion)
 		if err != nil {
 			return ExpectedBehaviorWriteResult{}, fmt.Errorf("store: advance expected behavior head: %w", err)
 		}
@@ -208,9 +224,10 @@ func (s *Store) WriteExpectedBehavior(ctx context.Context, auditor JudgmentAudit
 		}
 	} else if _, err := tx.ExecContext(ctx, `
 		INSERT INTO expected_behavior_envelope_heads (
-			envelope_id,revision_id,version,state,group_key,source,source_instance_id,host,primary_trigger_id,primary_trigger_version,updated_at
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?)`, envelopeID, revision.ID, version, state, headScope.GroupKey, headScope.Source,
-		headScope.SourceInstanceID, headScope.Host, headScope.PrimaryTriggerID, headScope.PrimaryTriggerVersion, canonicalTime(req.Now)); err != nil {
+			envelope_id,revision_id,version,state,group_key,source,source_instance_id,host,primary_trigger_id,primary_trigger_version,updated_at,
+			source_v2,producer_id,primary_rule_id,primary_rule_version,scope_labels_json
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, envelopeID, revision.ID, version, state, headScope.GroupKey, compatSource,
+		headScope.SourceInstanceID, compatHost, compatRuleID, compatVersion, canonicalTime(req.Now), sourceV2, nullIfEmpty(headScope.ProducerID), nullIfEmpty(headScope.PrimaryRuleID), nullIfEmpty(headScope.PrimaryRuleVersion), string(scopeLabelsJSON)); err != nil {
 		return ExpectedBehaviorWriteResult{}, fmt.Errorf("store: create expected behavior head: %w", err)
 	}
 
@@ -322,6 +339,9 @@ func verifyExpectedBehaviorSourceTx(ctx context.Context, tx *sql.Tx, req Expecte
 	if judgment.Coverage.Scope != policy.Scope.GroupKey {
 		return fmt.Errorf("%w: policy group does not match source judgment", ErrExpectedBehaviorNotAllowed)
 	}
+	if policy.Scope.Source == "alertmanager" {
+		return verifyAlertmanagerExpectedBehaviorSourceTx(ctx, tx, req, judgment)
+	}
 	for _, symptom := range judgment.Coverage.Symptoms {
 		if symptom.Source != "zabbix" || symptom.ObservedSourceInstanceID == nil || symptom.ObservedSourceConfigVersion == nil {
 			continue
@@ -332,6 +352,34 @@ func verifyExpectedBehaviorSourceTx(ctx context.Context, tx *sql.Tx, req Expecte
 			symptom.IdentityLabels["zabbix_trigger_id"] == policy.Scope.PrimaryTriggerID {
 			return verifyExpectedBehaviorValidationTx(ctx, tx, req)
 		}
+	}
+	return fmt.Errorf("%w: primary binding is not proven by the source judgment", ErrExpectedBehaviorNotAllowed)
+}
+
+func verifyAlertmanagerExpectedBehaviorSourceTx(ctx context.Context, tx *sql.Tx, req ExpectedBehaviorWrite, judgment model.SituationJudgment) error {
+	policy := req.Policy
+	for _, symptom := range judgment.Coverage.Symptoms {
+		if symptom.Source != "alertmanager" || symptom.SourceInstanceID == nil || *symptom.SourceInstanceID != policy.Scope.SourceInstanceID || symptom.SourceSignalID == nil || *symptom.SourceSignalID != policy.Scope.PrimaryRuleID {
+			continue
+		}
+		labelsMatch := true
+		for key, value := range policy.Scope.ScopeLabels {
+			labelsMatch = labelsMatch && symptom.IdentityLabels[key] == value
+		}
+		if !labelsMatch {
+			continue
+		}
+		views, err := loadCurrentZabbixSourceObservationsTx(ctx, tx, req.SituationID, req.Now)
+		if err != nil {
+			return err
+		}
+		for _, view := range views {
+			def := view.Definition
+			if def.Source == "alertmanager" && def.InstanceID == policy.Scope.SourceInstanceID && def.ProducerID == policy.Scope.ProducerID && def.RuleID == policy.Scope.PrimaryRuleID && def.Version == policy.Scope.PrimaryRuleVersion && def.Available && def.Presence == "present" {
+				return verifyExpectedBehaviorValidationTx(ctx, tx, req)
+			}
+		}
+		return fmt.Errorf("%w: current Alertmanager rule proof is unavailable", ErrExpectedBehaviorNotAllowed)
 	}
 	return fmt.Errorf("%w: primary binding is not proven by the source judgment", ErrExpectedBehaviorNotAllowed)
 }
@@ -616,6 +664,10 @@ func listExpectedBehaviorHeads(ctx context.Context, db dbQuerier, filter Expecte
 		query += ` AND h.group_key=?`
 		args = append(args, filter.GroupKey)
 	}
+	if filter.Source != "" {
+		query += ` AND COALESCE(h.source_v2,h.source)=?`
+		args = append(args, filter.Source)
+	}
 	if filter.SourceInstanceID != "" {
 		query += ` AND h.source_instance_id=?`
 		args = append(args, filter.SourceInstanceID)
@@ -623,6 +675,10 @@ func listExpectedBehaviorHeads(ctx context.Context, db dbQuerier, filter Expecte
 	if filter.TriggerID != "" {
 		query += ` AND h.primary_trigger_id=?`
 		args = append(args, filter.TriggerID)
+	}
+	if filter.RuleID != "" {
+		query += ` AND COALESCE(h.primary_rule_id,h.primary_trigger_id)=?`
+		args = append(args, filter.RuleID)
 	}
 	query += ` ORDER BY h.envelope_id LIMIT ?`
 	args = append(args, limit)
@@ -901,6 +957,7 @@ func scanExpectedBehaviorHead(row scanner) (model.ExpectedBehaviorHead, error) {
 		if err := json.Unmarshal([]byte(policyJSON.String), head.Policy); err != nil {
 			return head, err
 		}
+		head.Scope = head.Policy.Scope
 	}
 	if invalidatedAt.Valid {
 		parsed, err := time.Parse(time.RFC3339Nano, invalidatedAt.String)

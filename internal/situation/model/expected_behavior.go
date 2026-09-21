@@ -44,24 +44,36 @@ const (
 	ExpectedBehaviorSunday    ExpectedBehaviorWeekday = "sun"
 )
 
-// ExpectedBehaviorScope binds reusable authority to one proven Zabbix rule.
+// ExpectedBehaviorScope binds reusable authority to one proven source rule.
 type ExpectedBehaviorScope struct {
-	GroupKey              string `json:"group_key"`
-	Source                string `json:"source"`
-	SourceInstanceID      string `json:"source_instance_id"`
-	Host                  string `json:"host"`
-	PrimaryTriggerID      string `json:"primary_trigger_id"`
-	PrimaryTriggerVersion string `json:"primary_trigger_version"`
+	GroupKey              string            `json:"group_key"`
+	Source                string            `json:"source"`
+	SourceInstanceID      string            `json:"source_instance_id"`
+	Host                  string            `json:"host"`
+	PrimaryTriggerID      string            `json:"primary_trigger_id"`
+	PrimaryTriggerVersion string            `json:"primary_trigger_version"`
+	ProducerID            string            `json:"producer_id,omitempty"`
+	ScopeLabels           map[string]string `json:"scope_labels,omitempty"`
+	PrimaryRuleID         string            `json:"primary_rule_id,omitempty"`
+	PrimaryRuleVersion    string            `json:"primary_rule_version,omitempty"`
+	RuleGroup             string            `json:"rule_group,omitempty"`
+	RuleName              string            `json:"rule_name,omitempty"`
 }
 
-// ExpectedBehaviorBinding is one exact companion or forbidden Zabbix rule.
+// ExpectedBehaviorBinding is one exact companion or forbidden source rule.
 type ExpectedBehaviorBinding struct {
-	Role             string `json:"role"`
-	Source           string `json:"source"`
-	SourceInstanceID string `json:"source_instance_id"`
-	Host             string `json:"host"`
-	TriggerID        string `json:"trigger_id"`
-	TriggerVersion   string `json:"trigger_version"`
+	Role             string            `json:"role"`
+	Source           string            `json:"source"`
+	SourceInstanceID string            `json:"source_instance_id"`
+	Host             string            `json:"host"`
+	TriggerID        string            `json:"trigger_id"`
+	TriggerVersion   string            `json:"trigger_version"`
+	ProducerID       string            `json:"producer_id,omitempty"`
+	ScopeLabels      map[string]string `json:"scope_labels,omitempty"`
+	RuleID           string            `json:"rule_id,omitempty"`
+	RuleVersion      string            `json:"rule_version,omitempty"`
+	RuleGroup        string            `json:"rule_group,omitempty"`
+	RuleName         string            `json:"rule_name,omitempty"`
 }
 
 // ExpectedBehaviorSchedule is a wall-clock schedule in one IANA timezone.
@@ -170,6 +182,7 @@ const (
 	ExpectedBehaviorReasonStartOutsideTolerance    ExpectedBehaviorReason = "start_outside_tolerance"
 	ExpectedBehaviorReasonDurationExceeded         ExpectedBehaviorReason = "duration_exceeded"
 	ExpectedBehaviorReasonRequiredMissing          ExpectedBehaviorReason = "required_companion_missing"
+	ExpectedBehaviorReasonPrimaryMissing           ExpectedBehaviorReason = "primary_signal_absent"
 	ExpectedBehaviorReasonObservationUnavailable   ExpectedBehaviorReason = "observation_unavailable"
 	ExpectedBehaviorReasonUnexpectedSymptom        ExpectedBehaviorReason = "unexpected_symptom"
 	ExpectedBehaviorReasonForbiddenPresent         ExpectedBehaviorReason = "forbidden_signal_present"
@@ -179,12 +192,13 @@ const (
 
 // ExpectedBehaviorCandidate preserves each alternative's explanation.
 type ExpectedBehaviorCandidate struct {
-	EnvelopeID   string                          `json:"envelope_id"`
-	Version      int                             `json:"version"`
-	Status       ExpectedBehaviorCandidateStatus `json:"status"`
-	Reason       ExpectedBehaviorReason          `json:"reason"`
-	Occurrence   *ExpectedBehaviorOccurrence     `json:"occurrence,omitempty"`
-	EvidenceRefs []string                        `json:"evidence_refs,omitempty"`
+	EnvelopeID        string                          `json:"envelope_id"`
+	Version           int                             `json:"version"`
+	Status            ExpectedBehaviorCandidateStatus `json:"status"`
+	Reason            ExpectedBehaviorReason          `json:"reason"`
+	Occurrence        *ExpectedBehaviorOccurrence     `json:"occurrence,omitempty"`
+	EvidenceRefs      []string                        `json:"evidence_refs,omitempty"`
+	EvidenceExpiresAt *time.Time                      `json:"evidence_expires_at,omitempty"`
 }
 
 // ExpectedBehaviorDisposition is the aggregate authority result.
@@ -199,17 +213,18 @@ const (
 
 // ExpectedBehaviorEvaluation is the immutable aggregate evaluation payload.
 type ExpectedBehaviorEvaluation struct {
-	ID               string                      `json:"id,omitempty"`
-	SituationID      string                      `json:"situation_id,omitempty"`
-	SituationVersion int                         `json:"situation_input_version,omitempty"`
-	Disposition      ExpectedBehaviorDisposition `json:"disposition"`
-	Reason           ExpectedBehaviorReason      `json:"reason,omitempty"`
-	ChosenEnvelopeID string                      `json:"chosen_envelope_id,omitempty"`
-	ChosenVersion    int                         `json:"chosen_version,omitempty"`
-	Occurrence       *ExpectedBehaviorOccurrence `json:"occurrence,omitempty"`
-	Candidates       []ExpectedBehaviorCandidate `json:"candidates"`
-	BasisHash        string                      `json:"basis_hash,omitempty"`
-	EvaluatedAt      time.Time                   `json:"evaluated_at,omitempty"`
+	ID                string                      `json:"id,omitempty"`
+	SituationID       string                      `json:"situation_id,omitempty"`
+	SituationVersion  int                         `json:"situation_input_version,omitempty"`
+	Disposition       ExpectedBehaviorDisposition `json:"disposition"`
+	Reason            ExpectedBehaviorReason      `json:"reason,omitempty"`
+	ChosenEnvelopeID  string                      `json:"chosen_envelope_id,omitempty"`
+	ChosenVersion     int                         `json:"chosen_version,omitempty"`
+	Occurrence        *ExpectedBehaviorOccurrence `json:"occurrence,omitempty"`
+	EvidenceExpiresAt *time.Time                  `json:"evidence_expires_at,omitempty"`
+	Candidates        []ExpectedBehaviorCandidate `json:"candidates"`
+	BasisHash         string                      `json:"basis_hash,omitempty"`
+	EvaluatedAt       time.Time                   `json:"evaluated_at,omitempty"`
 }
 
 // ExpectedBehaviorValidationStatus is the current state of one bounded
@@ -261,6 +276,7 @@ type ExpectedBehaviorProjection struct {
 	Disposition      ExpectedBehaviorDisposition `json:"disposition"`
 	Reason           ExpectedBehaviorReason      `json:"reason,omitempty"`
 	Boundary         *time.Time                  `json:"boundary,omitempty"`
+	Source           string                      `json:"source,omitempty"`
 }
 
 type ExpectedBehaviorChange string

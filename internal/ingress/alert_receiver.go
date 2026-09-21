@@ -68,26 +68,50 @@ func ParseAlertmanager(body []byte) (AlertmanagerPayload, error) {
 
 // alertReceiver wraps ParseAlertmanager → durable acceptance → wake.
 type alertReceiver struct {
-	store  *store.Store
-	wake   DeliveryWake
-	token  []byte
-	logger *slog.Logger
-	now    func() time.Time
-	newID  func() string
+	store      *store.Store
+	wake       DeliveryWake
+	token      []byte
+	logger     *slog.Logger
+	now        func() time.Time
+	newID      func() string
+	provenance AlertmanagerProvenanceConfig
+}
+
+// AlertmanagerRuleMapping is one explicit authenticated ingress-to-producer
+// binding. Webhook URLs and alert fingerprints never establish this trust.
+type AlertmanagerRuleMapping struct {
+	AlertName   string
+	ProducerID  string
+	Group       string
+	Rule        string
+	ScopeLabels []string
+}
+
+type AlertmanagerProvenanceConfig struct {
+	InstanceID string
+	Rules      []AlertmanagerRuleMapping
 }
 
 // NewAlertReceiver builds the Alertmanager receiver. wake may be nil.
 func NewAlertReceiver(st *store.Store, token string, wake DeliveryWake, logger *slog.Logger) Receiver {
+	return NewAlertReceiverWithProvenance(st, token, AlertmanagerProvenanceConfig{}, wake, logger)
+}
+
+// NewAlertReceiverWithProvenance enables explicitly configured installation
+// and rule identity while preserving the legacy unproven receiver behavior
+// when cfg is empty.
+func NewAlertReceiverWithProvenance(st *store.Store, token string, cfg AlertmanagerProvenanceConfig, wake DeliveryWake, logger *slog.Logger) Receiver {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &alertReceiver{
-		store:  st,
-		wake:   wake,
-		token:  []byte(token),
-		logger: logger,
-		now:    func() time.Time { return time.Now().UTC() },
-		newID:  uuid.NewString,
+		store:      st,
+		wake:       wake,
+		token:      []byte(token),
+		logger:     logger,
+		now:        func() time.Time { return time.Now().UTC() },
+		newID:      uuid.NewString,
+		provenance: cfg,
 	}
 }
 
@@ -197,20 +221,30 @@ func (r *alertReceiver) buildDeliveryInputs(payload AlertmanagerPayload) ([]stor
 			Alert:       raw,
 		}
 
+		deliveryNamespace := "alertmanager-delivery"
+		episodePrefix := "alertmanager:"
+		if r.provenance.InstanceID != "" {
+			deliveryNamespace += ":" + r.provenance.InstanceID
+			episodePrefix += r.provenance.InstanceID + ":"
+		}
 		input := store.DeliveryInput{
-			ID:                       payloadDigest("alertmanager-delivery", member),
+			ID:                       payloadDigest(deliveryNamespace, member),
 			Alert:                    alert,
 			Source:                   "alertmanager",
-			SourceEpisodeKey:         "alertmanager:" + alert.Fingerprint + ":" + alert.StartsAt.UTC().Format(time.RFC3339Nano),
+			SourceEpisodeKey:         episodePrefix + alert.Fingerprint + ":" + alert.StartsAt.UTC().Format(time.RFC3339Nano),
 			SourceStartedAt:          timePtr(alert.StartsAt),
 			StartedAtBasis:           situationmodel.SourceTimeBasisSourcePayload,
 			ResolvedAtBasis:          situationmodel.SourceTimeBasisMissing,
 			ReceiverGroupingIdentity: grouping.Ensure(grouping.RenderLabels(payload.GroupLabels), alert.Labels, alert.Fingerprint),
 			PayloadDigest:            payloadDigest("alertmanager-payload", member),
 			SourceProvenance: store.SourceProvenance{
+				InstanceID:      stringPointer(r.provenance.InstanceID),
 				GeneratorURL:    raw.GeneratorURL,
 				AcquisitionMode: store.SourceAcquisitionWebhook,
 			},
+		}
+		if mapping, ok := r.ruleMapping(alert.Labels["alertname"]); ok {
+			input.SourceProvenance.SignalID = stringPointer("prometheus:" + mapping.ProducerID + ":" + mapping.Group + ":" + mapping.Rule)
 		}
 		if alert.Status == "resolved" && alert.EndsAt != nil {
 			input.SourceResolvedAt = timePtr(*alert.EndsAt)
@@ -219,6 +253,22 @@ func (r *alertReceiver) buildDeliveryInputs(payload AlertmanagerPayload) ([]stor
 		inputs = append(inputs, input)
 	}
 	return inputs, nil
+}
+
+func (r *alertReceiver) ruleMapping(alertName string) (AlertmanagerRuleMapping, bool) {
+	for _, mapping := range r.provenance.Rules {
+		if mapping.AlertName == alertName {
+			return mapping, true
+		}
+	}
+	return AlertmanagerRuleMapping{}, false
+}
+
+func stringPointer(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
 }
 
 func (r *alertReceiver) toStoreAlert(a AlertmanagerAlert) (store.Alert, error) {

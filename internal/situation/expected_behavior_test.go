@@ -22,6 +22,25 @@ func evaluatorHead(id string) model.ExpectedBehaviorHead {
 	}
 }
 
+func TestEvaluateExpectedBehaviors_AlertmanagerRuleVersionAndScope(t *testing.T) {
+	now := time.Date(2026, 9, 21, 22, 5, 0, 0, time.UTC)
+	policy := model.ExpectedBehaviorPolicy{Scope: model.ExpectedBehaviorScope{GroupKey: "service=payment", Source: "alertmanager", SourceInstanceID: "prod-am", ProducerID: "prod-prom", ScopeLabels: map[string]string{"service": "payment"}, PrimaryRuleID: "prometheus:prod-prom:jobs:ReconciliationLoad", PrimaryRuleVersion: "sha256:v1"}, Conditions: model.ExpectedBehaviorConditions{Workload: "nightly_reconciliation", Schedule: model.ExpectedBehaviorSchedule{Days: []model.ExpectedBehaviorWeekday{model.ExpectedBehaviorMonday}, LocalStart: "22:00", LocalEnd: "23:00", Timezone: "UTC", StartToleranceMinutes: 10}, MaxDurationMinutes: 55}, ReviewDueAt: now.Add(24 * time.Hour)}
+	head := model.ExpectedBehaviorHead{EnvelopeID: "env-am", Version: 1, State: model.ExpectedBehaviorStateActive, Scope: policy.Scope, Policy: &policy}
+	in := ExpectedBehaviorInput{SituationID: "sit", SituationVersion: 1, GroupKey: "service=payment", Now: now, PrimaryStartedAt: now.Add(-5 * time.Minute), Source: "alertmanager", SourceInstanceID: "prod-am", ProducerID: "prod-prom", ScopeLabels: map[string]string{"service": "payment"}, PrimaryRuleID: policy.Scope.PrimaryRuleID, PrimaryRuleVersion: "sha256:v1", PrimaryPresence: "present", Heads: []model.ExpectedBehaviorHead{head}, FiringSignals: []ExpectedBehaviorSignal{{SourceInstanceID: "prod-am", ProducerID: "prod-prom", RuleID: policy.Scope.PrimaryRuleID, RuleVersion: "sha256:v1", ScopeLabels: map[string]string{"service": "payment"}, Presence: "present", ExpiresAt: now.Add(time.Minute), EvidenceRefs: []string{"fact:rule"}}}}
+	if got := EvaluateExpectedBehaviors(in); got.Disposition != model.ExpectedBehaviorDispositionMatched || got.Occurrence == nil || !got.Occurrence.Boundary.Equal(time.Date(2026, 9, 21, 22, 55, 0, 0, time.UTC)) || got.EvidenceExpiresAt == nil || !got.EvidenceExpiresAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("evaluation = %+v", got)
+	}
+	in.PrimaryRuleVersion = "sha256:v2"
+	if got := EvaluateExpectedBehaviors(in); got.Reason != model.ExpectedBehaviorReasonPrimaryDefinitionChanged {
+		t.Fatalf("changed evaluation = %+v", got)
+	}
+	in.PrimaryRuleVersion = "sha256:v1"
+	in.ScopeLabels = map[string]string{"service": "checkout"}
+	if got := EvaluateExpectedBehaviors(in); got.Reason != model.ExpectedBehaviorReasonScopeMismatch {
+		t.Fatalf("scope evaluation = %+v", got)
+	}
+}
+
 func evaluatorInput(heads ...model.ExpectedBehaviorHead) ExpectedBehaviorInput {
 	started := time.Date(2026, 9, 21, 19, 5, 0, 0, time.UTC)
 	return ExpectedBehaviorInput{
@@ -114,5 +133,24 @@ func TestExpectedBehaviorBasisHashStableAndOverlayOnlyClearsOperatorRequest(t *t
 	ApplyExpectedBehaviorAuthority(&commit, &a)
 	if commit.Assessment.ActionContract.OperatorActionRequired != nil || commit.Assessment.ActionContract.NextActor != model.NextActorAlertINT || commit.Assessment.ActionContract.NextUpdateAt == nil {
 		t.Fatalf("commit=%+v", commit)
+	}
+}
+
+func TestApplyExpectedBehaviorAuthorityChecksFreshEvidenceBeforeScheduleBoundary(t *testing.T) {
+	now := time.Date(2026, 9, 21, 22, 5, 0, 0, time.UTC)
+	scheduleBoundary, evidenceBoundary := now.Add(time.Hour), now.Add(time.Minute)
+	evaluation := model.ExpectedBehaviorEvaluation{
+		Disposition:       model.ExpectedBehaviorDispositionMatched,
+		Occurrence:        &model.ExpectedBehaviorOccurrence{Boundary: scheduleBoundary},
+		EvidenceExpiresAt: &evidenceBoundary,
+	}
+	commit := ControllerCommit{Lifecycle: model.LifecycleActive, Attention: model.AttentionObserve, Assessment: model.Assessment{Attention: model.AttentionObserve}}
+	ApplyExpectedBehaviorAuthority(&commit, &evaluation)
+	if got := commit.Assessment.ActionContract.NextUpdateAt; got == nil || !got.Equal(evidenceBoundary) {
+		t.Fatalf("next update = %v, want %v", got, evidenceBoundary)
+	}
+	RefreshExpectedBehaviorEvaluationForCommit(&evaluation, false, evidenceBoundary)
+	if evaluation.Disposition != model.ExpectedBehaviorDispositionAuthorityUnavailable || evaluation.Reason != model.ExpectedBehaviorReasonObservationUnavailable {
+		t.Fatalf("expired evaluation = %+v", evaluation)
 	}
 }

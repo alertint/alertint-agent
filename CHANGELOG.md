@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Alertmanager deliveries can carry configured installation and exact
+  Prometheus producer/rule identity. Bounded current rule evidence enables the
+  existing reusable expected-schedule flow for proven Alertmanager conditions;
+  missing, ambiguous, stale, relabeled, or dependency-incomplete evidence
+  grants no reusable authority.
 - Zabbix installations and trigger rules can carry stable source identity and
   bounded current configuration-version evidence into Situation preparation
   and MCP. Missing, expired, unsupported, or inconsistent evidence stays

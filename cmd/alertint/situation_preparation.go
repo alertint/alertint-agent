@@ -69,7 +69,10 @@ type productionPreparer struct {
 	// an abstract interface guarded by a nil check; here it is the concrete
 	// *audit.Auditor cmd/alertint already always constructs, so a nil value
 	// only ever occurs in a test that deliberately omits it).
-	auditor *audit.Auditor
+	auditor                *audit.Auditor
+	alertmanagerInstanceID string
+	prometheusProducerID   string
+	alertmanagerRules      map[string]config.AlertmanagerRuleMappingConfig
 }
 
 // Prepare runs one bounded phase: coherently derive this Situation's
@@ -160,6 +163,7 @@ func (p *productionPreparer) Prepare(ctx context.Context, req situation.Preparat
 		return situation.PreparedState{}, fmt.Errorf("cmd/alertint: load expected behavior heads: %w", err)
 	}
 	plans = appendExpectedBehaviorSchedulePlans(plans, expectedHeads, sit.GroupKey, req.Now)
+	plans = p.appendAlertmanagerRulePlans(plans, req.Input, sit.GroupKey, req.Now)
 
 	// Every nonterminal reconcile freezes (or reloads) its cycle — even a
 	// phase whose plan set is entirely reuse projections — so the current
@@ -208,6 +212,53 @@ func (p *productionPreparer) Prepare(ctx context.Context, req situation.Preparat
 	return situation.PreparedState{CycleID: cycle.ID, Generation: cycle.Generation}, nil
 }
 
+func (p *productionPreparer) appendAlertmanagerRulePlans(plans []model.Plan, in situation.SnapshotInput, groupKey string, now time.Time) []model.Plan {
+	if p.alertmanagerInstanceID == "" || p.prometheusProducerID == "" {
+		return plans
+	}
+	seen := map[string]bool{}
+	for _, delivery := range in.Deliveries {
+		if delivery.Source != "alertmanager" || delivery.Status != situationmodel.DeliveryStatusFiring || delivery.SourceInstanceID == nil || *delivery.SourceInstanceID != p.alertmanagerInstanceID || delivery.SourceSignalID == nil {
+			continue
+		}
+		mapping, ok := p.alertmanagerRules[*delivery.SourceSignalID]
+		if !ok {
+			continue
+		}
+		scope := map[string]string{}
+		complete := true
+		for _, label := range mapping.ScopeLabels {
+			value := delivery.Labels[label]
+			if value == "" {
+				complete = false
+				break
+			}
+			scope[label] = value
+		}
+		if !complete {
+			continue
+		}
+		encodedScope, err := json.Marshal(scope)
+		if err != nil {
+			continue
+		}
+		key := *delivery.SourceSignalID + "\x00" + string(encodedScope)
+		if seen[key] || len(plans) >= model.MaxPlansPerCycle {
+			continue
+		}
+		params, err := json.Marshal(map[string]any{"source_instance_id": p.alertmanagerInstanceID, "producer_id": p.prometheusProducerID, "group": mapping.Group, "rule": mapping.Rule, "scope_labels": scope, "fresh_for_seconds": 300})
+		if err != nil {
+			continue
+		}
+		plans = append(plans, model.Plan{Capability: model.CapabilityPrometheusQuery, Phase: model.PhaseAssessment,
+			Scope: model.Scope{GroupKey: groupKey, Source: "alertmanager", SubjectID: "rule:" + key, Labels: scope}, Parameters: params,
+			Start: now.UTC(), End: now.UTC(), EligibleAt: now.UTC(), Limit: 1, MaxRequests: 2, Purpose: "alertmanager_rule_definition",
+			Tier: model.TierTimeSensitive, ReconsiderOn: []string{"situation_input_changed", "envelope_changed", "observation_expired"}})
+		seen[key] = true
+	}
+	return plans
+}
+
 func (p *productionPreparer) invalidateChangedExpectedBehaviors(ctx context.Context, claim situation.Claim, now time.Time) (bool, error) {
 	if p.auditor == nil {
 		return false, nil
@@ -246,18 +297,21 @@ func appendExpectedBehaviorValidationPlans(plans []model.Plan, validations []sit
 			if len(plans) >= model.MaxPlansPerCycle {
 				return plans, nil
 			}
-			parameters, err := json.Marshal(map[string]any{
-				"host": binding.Host, "trigger_id": binding.TriggerID, "trigger_version": binding.TriggerVersion,
-				"source_instance_id": binding.SourceInstanceID, "fresh_for_seconds": 300,
-			})
+			capability, maxRequests := model.CapabilityZabbixProblemState, 6
+			parametersBody := map[string]any{"host": binding.Host, "trigger_id": binding.TriggerID, "trigger_version": binding.TriggerVersion, "source_instance_id": binding.SourceInstanceID, "fresh_for_seconds": 300}
+			if binding.Source == "alertmanager" {
+				capability, maxRequests = model.CapabilityPrometheusQuery, 2
+				parametersBody = map[string]any{"source_instance_id": binding.SourceInstanceID, "producer_id": binding.ProducerID, "group": binding.RuleGroup, "rule": binding.RuleName, "scope_labels": binding.ScopeLabels, "fresh_for_seconds": 300}
+			}
+			parameters, err := json.Marshal(parametersBody)
 			if err != nil {
 				return nil, err
 			}
 			plans = append(plans, model.Plan{
-				Capability: model.CapabilityZabbixProblemState, Phase: model.PhaseAssessment,
-				Scope:      model.Scope{GroupKey: groupKey, Source: "zabbix", SubjectID: validation.ID + ":" + binding.Role},
+				Capability: capability, Phase: model.PhaseAssessment,
+				Scope:      model.Scope{GroupKey: groupKey, Source: binding.Source, SubjectID: validation.ID + ":" + binding.Role},
 				Parameters: parameters, Start: now.UTC(), End: now.UTC(), EligibleAt: now.UTC(),
-				Limit: 1, MaxRequests: 6, Purpose: expectedBehaviorValidationPurposePrefix + validation.ID + ":" + binding.Role,
+				Limit: 1, MaxRequests: maxRequests, Purpose: expectedBehaviorValidationPurposePrefix + validation.ID + ":" + binding.Role,
 				Tier: model.TierTimeSensitive, ReconsiderOn: []string{"situation_input_changed", "validation_expired"},
 			})
 		}
@@ -274,6 +328,16 @@ func appendExpectedBehaviorSchedulePlans(plans []model.Plan, heads []situationmo
 				seen[fmt.Sprint(params["source_instance_id"])+"\x00"+fmt.Sprint(params["host"])+"\x00"+fmt.Sprint(params["trigger_id"])] = true
 			}
 		}
+		if plan.Capability == model.CapabilityPrometheusQuery && plan.Purpose == "alertmanager_rule_definition" {
+			var params map[string]any
+			if json.Unmarshal(plan.Parameters, &params) == nil {
+				scope, err := json.Marshal(params["scope_labels"])
+				if err != nil {
+					continue
+				}
+				seen[fmt.Sprint(params["source_instance_id"])+"\x00"+fmt.Sprint(params["producer_id"])+"\x00prometheus:"+fmt.Sprint(params["producer_id"])+":"+fmt.Sprint(params["group"])+":"+fmt.Sprint(params["rule"])+"\x00"+string(scope)] = true
+			}
+		}
 	}
 	for _, head := range heads {
 		if head.Policy == nil {
@@ -282,24 +346,34 @@ func appendExpectedBehaviorSchedulePlans(plans []model.Plan, heads []situationmo
 		bindings := append(append(append([]situationmodel.ExpectedBehaviorBinding{}, head.Policy.Conditions.RequiredCompanions...), head.Policy.Conditions.AllowedCompanions...), head.Policy.Conditions.ForbiddenSignals...)
 		for _, binding := range bindings {
 			key := binding.SourceInstanceID + "\x00" + binding.Host + "\x00" + binding.TriggerID
+			if binding.Source == "alertmanager" {
+				scope, err := json.Marshal(binding.ScopeLabels)
+				if err != nil {
+					continue
+				}
+				key = binding.SourceInstanceID + "\x00" + binding.ProducerID + "\x00" + binding.RuleID + "\x00" + string(scope)
+			}
 			if seen[key] {
 				continue
 			}
 			if len(plans) >= model.MaxPlansPerCycle {
 				return plans
 			}
-			params, err := json.Marshal(map[string]any{
-				"host": binding.Host, "trigger_id": binding.TriggerID, "trigger_version": binding.TriggerVersion,
-				"source_instance_id": binding.SourceInstanceID, "fresh_for_seconds": 300,
-			})
+			capability, maxRequests, purpose := model.CapabilityZabbixProblemState, 6, "expected_behavior_evaluation"
+			parametersBody := map[string]any{"host": binding.Host, "trigger_id": binding.TriggerID, "trigger_version": binding.TriggerVersion, "source_instance_id": binding.SourceInstanceID, "fresh_for_seconds": 300}
+			if binding.Source == "alertmanager" {
+				capability, maxRequests, purpose = model.CapabilityPrometheusQuery, 2, "alertmanager_rule_definition"
+				parametersBody = map[string]any{"source_instance_id": binding.SourceInstanceID, "producer_id": binding.ProducerID, "group": binding.RuleGroup, "rule": binding.RuleName, "scope_labels": binding.ScopeLabels, "fresh_for_seconds": 300}
+			}
+			params, err := json.Marshal(parametersBody)
 			if err != nil {
 				continue
 			}
 			plans = append(plans, model.Plan{
-				Capability: model.CapabilityZabbixProblemState, Phase: model.PhaseAssessment,
-				Scope:      model.Scope{GroupKey: groupKey, Source: "zabbix", SubjectID: "expected:" + binding.SourceInstanceID + ":" + binding.Host + ":" + binding.TriggerID},
-				Parameters: params, Start: now.UTC(), End: now.UTC(), EligibleAt: now.UTC(), Limit: 1, MaxRequests: 6,
-				Purpose: "expected_behavior_evaluation", Tier: model.TierTimeSensitive,
+				Capability: capability, Phase: model.PhaseAssessment,
+				Scope:      model.Scope{GroupKey: groupKey, Source: binding.Source, SubjectID: "expected:" + key},
+				Parameters: params, Start: now.UTC(), End: now.UTC(), EligibleAt: now.UTC(), Limit: 1, MaxRequests: maxRequests,
+				Purpose: purpose, Tier: model.TierTimeSensitive,
 				ReconsiderOn: []string{"situation_input_changed", "envelope_changed", "observation_expired"},
 			})
 			seen[key] = true
@@ -645,7 +719,9 @@ func newPreparationRuntime(
 	runner := observation.NewRunner(&auditingPreparationStore{Store: st, auditor: auditor, logger: logger}, execs, now)
 	preparer := &productionPreparer{
 		st: st, runner: runner, capabilities: descs, selectorKeys: selectorKeysFromConfig(cfg),
-		configDigest: preparationConfigDigest(descs, prepCfg), prepCfg: prepCfg, logger: logger, auditor: auditor,
+		configDigest: preparationConfigDigest(descs, prepCfg) + ":" + alertmanagerProvenanceDigest(cfg), prepCfg: prepCfg, logger: logger, auditor: auditor,
+		alertmanagerInstanceID: cfg.Alertmanager.InstanceID, prometheusProducerID: cfg.Prometheus.InstanceID,
+		alertmanagerRules: alertmanagerRuleMap(cfg),
 	}
 
 	profileCfg := cfg.Situations.SemanticProfiles
@@ -701,6 +777,27 @@ func newPreparationRuntime(
 
 	rt := &preparationRuntime{st: st, workers: workers, sweeps: sweeps, logger: logger}
 	return rt, preparer, nil
+}
+
+func alertmanagerRuleMap(cfg *config.Config) map[string]config.AlertmanagerRuleMappingConfig {
+	out := make(map[string]config.AlertmanagerRuleMappingConfig, len(cfg.Alertmanager.Rules))
+	for _, mapping := range cfg.Alertmanager.Rules {
+		id := "prometheus:" + cfg.Prometheus.InstanceID + ":" + mapping.Group + ":" + mapping.Rule
+		out[id] = mapping
+	}
+	return out
+}
+
+func alertmanagerProvenanceDigest(cfg *config.Config) string {
+	raw, err := json.Marshal(struct { //nolint:musttag // private hash input only; field names are part of the local digest contract.
+		AlertmanagerInstanceID, PrometheusInstanceID string
+		Rules                                        []config.AlertmanagerRuleMappingConfig
+	}{cfg.Alertmanager.InstanceID, cfg.Prometheus.InstanceID, cfg.Alertmanager.Rules})
+	if err != nil {
+		panic(fmt.Sprintf("cmd/alertint: marshal Alertmanager provenance digest: %v", err))
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }
 
 // llmProviderName names the shared primary provider for durably recorded

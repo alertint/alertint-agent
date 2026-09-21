@@ -19,7 +19,7 @@ import (
 // MCP owns expected-schedule maintenance and review under ADR-0054.
 func (s *Server) toolExpectedBehaviorPrepare() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 	return mcplib.NewTool("alertint_expected_behavior_prepare",
-		mcplib.WithDescription("Prepare fresh exact Zabbix current-state proof for proposed reusable expected-schedule bindings. This creates no authority."),
+		mcplib.WithDescription("Prepare fresh exact source current-state proof for proposed reusable expected-schedule bindings. This creates no authority."),
 		mcplib.WithString("situation_id", mcplib.Required()), mcplib.WithNumber("situation_input_version", mcplib.Required()),
 		mcplib.WithArray("required_companions"), mcplib.WithArray("allowed_companions"), mcplib.WithArray("forbidden_signals"),
 	), s.handleExpectedBehaviorPrepare
@@ -31,7 +31,7 @@ func (s *Server) toolGetExpectedBehaviorValidation() (mcplib.Tool, mcpserver.Too
 
 func expectedBehaviorWriteTool(name, verb string, policy bool) mcplib.Tool {
 	opts := []mcplib.ToolOption{
-		mcplib.WithDescription(verb + " one explicitly confirmed reusable Zabbix expected schedule. Monitoring, investigation, lifecycle, and recovery remain unchanged."),
+		mcplib.WithDescription(verb + " one explicitly confirmed reusable expected schedule. Monitoring, investigation, lifecycle, and recovery remain unchanged."),
 		mcplib.WithString("envelope_id"), mcplib.WithNumber("expected_current_version", mcplib.Required()),
 		mcplib.WithString("request_id", mcplib.Required()), mcplib.WithString("asserted_operator", mcplib.Required()),
 		mcplib.WithBoolean("operator_confirmed", mcplib.Required()),
@@ -65,7 +65,7 @@ func (s *Server) toolGetExpectedBehavior() (mcplib.Tool, mcpserver.ToolHandlerFu
 }
 func (s *Server) toolListExpectedBehaviors() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 	return mcplib.NewTool("alertint_list_expected_behaviors", mcplib.WithDescription("List reusable expected schedules with current authority, review status, and usage."),
-		mcplib.WithString("group_key"), mcplib.WithString("source_instance_id"), mcplib.WithString("trigger_id"), mcplib.WithString("review_status"), mcplib.WithBoolean("include_inactive"), mcplib.WithInteger("limit")), s.handleListExpectedBehaviors
+		mcplib.WithString("group_key"), mcplib.WithString("source"), mcplib.WithString("source_instance_id"), mcplib.WithString("trigger_id"), mcplib.WithString("rule_id"), mcplib.WithString("review_status"), mcplib.WithBoolean("include_inactive"), mcplib.WithInteger("limit")), s.handleListExpectedBehaviors
 }
 func (s *Server) toolListExpectedBehaviorHistory() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 	return mcplib.NewTool("alertint_list_expected_behavior_history", mcplib.WithDescription("List one reusable expected schedule's immutable operator revisions and source invalidation events."),
@@ -140,8 +140,6 @@ func expectedBehaviorWriteError(err error) string {
 		return "stale Situation, judgment, validation, or schedule version — re-read current state and retry"
 	case errors.Is(err, store.ErrExpectedBehaviorRequestConflict):
 		return "request_id was already used with different arguments; use the original arguments or a new request_id"
-	case errors.Is(err, store.ErrExpectedBehaviorNotAllowed) && strings.Contains(err.Error(), "source must be zabbix"):
-		return "reusable expected schedules currently support Zabbix only"
 	case errors.Is(err, store.ErrExpectedBehaviorNotAllowed) && strings.Contains(err.Error(), "urgent"):
 		return "the current Situation is urgent or critical and cannot use an expected schedule"
 	case errors.Is(err, store.ErrExpectedBehaviorNotAllowed):
@@ -167,8 +165,9 @@ func (s *Server) handleListExpectedBehaviors(ctx context.Context, req mcplib.Cal
 	reviewStatus := strings.TrimSpace(mcplib.ParseString(req, "review_status", ""))
 	includeInactive := mcplib.ParseBoolean(req, "include_inactive", false) || reviewStatus == "inactive" || reviewStatus == "invalidated"
 	heads, err := s.st.ListExpectedBehaviors(ctx, store.ExpectedBehaviorListFilter{
-		GroupKey: mcplib.ParseString(req, "group_key", ""), SourceInstanceID: mcplib.ParseString(req, "source_instance_id", ""),
-		TriggerID: mcplib.ParseString(req, "trigger_id", ""), IncludeInactive: includeInactive,
+		GroupKey: mcplib.ParseString(req, "group_key", ""), Source: mcplib.ParseString(req, "source", ""),
+		SourceInstanceID: mcplib.ParseString(req, "source_instance_id", ""), TriggerID: mcplib.ParseString(req, "trigger_id", ""),
+		RuleID: mcplib.ParseString(req, "rule_id", ""), IncludeInactive: includeInactive,
 	}, 100)
 	if err != nil {
 		return errResult("failed to list expected schedules"), nil
@@ -249,7 +248,7 @@ func expectedBehaviorBindingsFromRequest(req mcplib.CallToolRequest) ([]model.Ex
 		if raw := mcplib.ParseArgument(req, name, nil); raw != nil {
 			encoded, err := json.Marshal(raw)
 			if err != nil || json.Unmarshal(encoded, &bindings) != nil {
-				return nil, errors.New(name + " must be an array of exact Zabbix bindings")
+				return nil, errors.New(name + " must be an array of exact source bindings")
 			}
 		}
 		out = append(out, bindings...)

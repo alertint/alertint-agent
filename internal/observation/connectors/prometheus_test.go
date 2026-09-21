@@ -13,10 +13,38 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	model "github.com/alertint/alertint-agent/internal/observation/model"
 	"github.com/alertint/alertint-agent/internal/prometheus"
 )
+
+func TestPrometheusRuleDefinitionAPIFailureProducesDurableUnavailableFact(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	now := time.Date(2026, 9, 21, 20, 0, 0, 0, time.UTC)
+	e := &PrometheusExecutor{Client: prometheus.NewClient(prometheus.Config{BaseURL: srv.URL, TimeoutSeconds: 5}), Clock: func() time.Time { return now }}
+	plan := testStorePlan()
+	plan.Capability, plan.Scope.Source, plan.Purpose = model.CapabilityPrometheusQuery, "alertmanager", "alertmanager_rule_definition"
+	plan.Parameters = json.RawMessage(`{"source_instance_id":"prod-am","producer_id":"prod-prom","group":"jobs","rule":"Load","scope_labels":{"service":"payment"}}`)
+	run, err := e.Execute(context.Background(), plan, &noopRecorder{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(run.Facts) != 1 || run.Facts[0].Kind != "source_definition" {
+		t.Fatalf("facts = %+v", run.Facts)
+	}
+	var got model.SourceDefinitionObservation
+	if err := json.Unmarshal(run.Facts[0].Value, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Available || got.UnavailableReason != "api_unavailable" || got.Presence != "unknown" {
+		t.Fatalf("observation = %+v", got)
+	}
+}
 
 func TestPrometheusExecutorSendsExactSelectorAndOverflowLimit(t *testing.T) {
 	var requests atomic.Int32

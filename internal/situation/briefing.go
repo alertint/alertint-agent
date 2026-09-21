@@ -317,6 +317,7 @@ func CommittedOperatorBriefing(in SnapshotInput, commit ControllerCommit) *model
 		for _, head := range in.ExpectedBehaviorHeads {
 			if head.EnvelopeID == candidate.EnvelopeID {
 				projection.AssertedOperator = head.AssertedOperator
+				projection.Source = head.Scope.Source
 				if head.Policy != nil {
 					projection.Workload = head.Policy.Conditions.Workload
 				}

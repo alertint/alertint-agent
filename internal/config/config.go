@@ -236,6 +236,7 @@ type VerificationConfig struct {
 // honored either way. Resolve it via Config.PrometheusEnabled, never directly.
 type PrometheusConfig struct {
 	Enabled             *bool  `yaml:"enabled,omitempty"`
+	InstanceID          string `yaml:"instance_id,omitempty"`
 	BaseURL             string `yaml:"base_url"`
 	BearerTokenEnv      string `yaml:"bearer_token_env,omitempty"`
 	OrgID               string `yaml:"org_id,omitempty"` // optional X-Scope-OrgID (multi-tenant Mimir/Cortex only)
@@ -358,8 +359,20 @@ type MCPConfig struct {
 // AlertmanagerConfig configures the inbound Alertmanager webhook receiver. Its
 // listen address is the shared receivers.address (see ReceiversConfig).
 type AlertmanagerConfig struct {
-	Enabled         bool   `yaml:"enabled"`
-	WebhookTokenEnv string `yaml:"webhook_token_env"`
+	Enabled         bool                            `yaml:"enabled"`
+	WebhookTokenEnv string                          `yaml:"webhook_token_env"`
+	InstanceID      string                          `yaml:"instance_id,omitempty"`
+	Rules           []AlertmanagerRuleMappingConfig `yaml:"rules,omitempty"`
+}
+
+// AlertmanagerRuleMappingConfig binds one authenticated webhook alert name to
+// one exact rule in the configured Prometheus producer. ScopeLabels names the
+// alert labels whose values form reusable schedule scope.
+type AlertmanagerRuleMappingConfig struct {
+	AlertName   string   `yaml:"alert_name"`
+	Group       string   `yaml:"group"`
+	Rule        string   `yaml:"rule"`
+	ScopeLabels []string `yaml:"scope_labels"`
 }
 
 // ReceiversConfig holds settings shared by every inbound webhook receiver. The
@@ -839,6 +852,7 @@ func (c *Config) validate(offline bool) error {
 	errs = append(errs, c.validateNotify()...)
 	errs = append(errs, c.validatePrometheus()...)
 	errs = append(errs, c.validateZabbixInstance()...)
+	errs = append(errs, c.validateAlertmanagerProvenance()...)
 	errs = append(errs, c.validateZabbixAPI()...)
 	errs = append(errs, c.validateLogs()...)
 	errs = append(errs, c.validateSentry()...)
@@ -1383,6 +1397,47 @@ func (c *Config) validateZabbixInstance() []string {
 		return []string{"zabbix: instance_id must be 1-64 characters using letters, numbers, '.', '_' or '-'"}
 	}
 	return nil
+}
+
+func (c *Config) validateAlertmanagerProvenance() []string {
+	if c.Alertmanager.InstanceID == "" && len(c.Alertmanager.Rules) == 0 && c.Prometheus.InstanceID == "" {
+		return nil
+	}
+	var errs []string
+	if c.Alertmanager.InstanceID != "" && !zabbixInstanceIDRe.MatchString(c.Alertmanager.InstanceID) {
+		errs = append(errs, "alertmanager.instance_id must be 1-64 characters using letters, numbers, '.', '_' or '-'")
+	}
+	if c.Prometheus.InstanceID != "" && !zabbixInstanceIDRe.MatchString(c.Prometheus.InstanceID) {
+		errs = append(errs, "prometheus.instance_id must be 1-64 characters using letters, numbers, '.', '_' or '-'")
+	}
+	if len(c.Alertmanager.Rules) > 0 && c.Alertmanager.InstanceID == "" {
+		errs = append(errs, "alertmanager.instance_id is required when alertmanager.rules are configured")
+	}
+	if len(c.Alertmanager.Rules) > 0 && c.Prometheus.InstanceID == "" {
+		errs = append(errs, "prometheus.instance_id is required when alertmanager.rules are configured")
+	}
+	if len(c.Alertmanager.Rules) > 0 && !c.PrometheusEnabled() {
+		errs = append(errs, "prometheus must be enabled with base_url when alertmanager.rules are configured")
+	}
+	seen := map[string]bool{}
+	for i, mapping := range c.Alertmanager.Rules {
+		if strings.TrimSpace(mapping.AlertName) == "" || strings.TrimSpace(mapping.Group) == "" || strings.TrimSpace(mapping.Rule) == "" || len(mapping.ScopeLabels) == 0 {
+			errs = append(errs, fmt.Sprintf("alertmanager.rules[%d] requires alert_name, group, rule, and scope_labels", i))
+			continue
+		}
+		if seen[mapping.AlertName] {
+			errs = append(errs, fmt.Sprintf("alertmanager.rules[%d].alert_name %q is duplicated", i, mapping.AlertName))
+		}
+		seen[mapping.AlertName] = true
+		labels := map[string]bool{}
+		for _, label := range mapping.ScopeLabels {
+			if !selectorLabelNameRe.MatchString(label) || labels[label] {
+				errs = append(errs, fmt.Sprintf("alertmanager.rules[%d].scope_labels contains invalid or duplicate label %q", i, label))
+			}
+			labels[label] = true
+		}
+	}
+	return errs
 }
 
 func (c *Config) validateLogs() []string {

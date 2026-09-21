@@ -721,23 +721,33 @@ func expectedBehaviorJournal(change AuthoritativeChange) (model.JournalData, mod
 		actor = model.ActorAttributedOperator
 	} else {
 		j.ExpectedBehaviorChange, j.Headline = model.ExpectedBehaviorChangeStopped, "Expected schedule no longer applies"
-		j.Detail = expectedBehaviorReasonDetail(j.ExpectedBehaviorReason)
+		source := prior.Source
+		if current != nil && current.Source != "" {
+			source = current.Source
+		}
+		j.Detail = expectedBehaviorReasonDetail(j.ExpectedBehaviorReason, source)
 	}
 	return j, actor, true
 }
 
-func expectedBehaviorReasonDetail(reason model.ExpectedBehaviorReason) string {
+func expectedBehaviorReasonDetail(reason model.ExpectedBehaviorReason, source string) string {
+	ruleName := "Zabbix rule"
+	if source == "alertmanager" {
+		ruleName = "Prometheus rule"
+	}
 	switch reason { //nolint:exhaustive // unmatched codes use the safe generic explanation below.
 	case model.ExpectedBehaviorReasonPrimaryDefinitionChanged, model.ExpectedBehaviorReasonBindingDefinitionChanged:
-		return "The Zabbix rule changed."
+		return "The " + ruleName + " changed."
 	case model.ExpectedBehaviorReasonDefinitionUnavailable, model.ExpectedBehaviorReasonObservationUnavailable, model.ExpectedBehaviorReasonBudgetDeferred:
-		return "AlertINT cannot verify the Zabbix rule."
+		return "AlertINT cannot verify the " + ruleName + "."
 	case model.ExpectedBehaviorReasonOutsideSchedule, model.ExpectedBehaviorReasonStartOutsideTolerance:
 		return "The condition is outside the scheduled time."
 	case model.ExpectedBehaviorReasonDurationExceeded:
 		return "The condition ran longer than the schedule allows."
 	case model.ExpectedBehaviorReasonRequiredMissing:
 		return "A required companion condition is missing."
+	case model.ExpectedBehaviorReasonPrimaryMissing:
+		return "Prometheus no longer reports this condition as active."
 	case model.ExpectedBehaviorReasonUnexpectedSymptom:
 		return "An unexpected alert is firing."
 	case model.ExpectedBehaviorReasonForbiddenPresent:

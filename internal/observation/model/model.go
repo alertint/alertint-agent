@@ -373,6 +373,13 @@ type SourceDefinitionObservation struct {
 	TriggerIDs        []string          `json:"trigger_ids,omitempty"`
 	ItemIDs           []string          `json:"item_ids,omitempty"`
 	HistoricalProven  bool              `json:"historical_version_proven"`
+	ProducerID        string            `json:"producer_id,omitempty"`
+	RuleGroup         string            `json:"rule_group,omitempty"`
+	Presence          string            `json:"presence,omitempty"`
+	ScopeLabels       map[string]string `json:"scope_labels,omitempty"`
+	EvidenceRefs      []string          `json:"-"`
+	ObservedAt        time.Time         `json:"-"`
+	ExpiresAt         time.Time         `json:"-"`
 }
 
 // ProblemPresence is the exact current state of one Zabbix trigger.

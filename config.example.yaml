@@ -4,6 +4,16 @@ receivers:
 alertmanager:
   enabled: true
   webhook_token_env: ALERTINT_WEBHOOK_TOKEN   # name of the env var holding the bearer token
+  # Stable non-secret installation identity. Configure during a quiet window;
+  # changing it creates a new delivery/episode namespace.
+  # instance_id: prod-alertmanager-eu
+  # Explicit mappings enable reusable expected schedules. Unmapped alerts
+  # continue through ordinary triage without reusable authority.
+  # rules:
+  #   - alert_name: ReconciliationLoad
+  #     group: batch-jobs
+  #     rule: ReconciliationLoad
+  #     scope_labels: [service]
 
 storage:
   sqlite_path: ./alertint-agent.db
@@ -140,6 +150,8 @@ rules:
 # and exposes read-only PromQL MCP tools. Presence-based: setting base_url
 # turns it ON automatically.
 prometheus:
+  # Stable non-secret producer identity used with alertmanager.rules.
+  # instance_id: prod-prometheus-eu
   # base_url: http://localhost:9090            # set this and Prometheus enrichment turns ON automatically
   # enabled: false                              # uncomment to force OFF even when base_url is set
   # bearer_token_env: PROMETHEUS_BEARER_TOKEN   # only if Prometheus requires auth
