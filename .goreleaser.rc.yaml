@@ -97,4 +97,4 @@ release:
   footer: |
     ---
 
-    **Full Changelog**: https://github.com/alertint/alertint-agent/compare/{{ .PreviousTag }}...{{ .Tag }}
+    **Full Changelog**: https://github.com/alertint/alertint-agent/compare/v0.13.9...{{ .Tag }}

@@ -55,6 +55,7 @@ func TestRCGoReleaserConfigCannotPublishStableAliases(t *testing.T) {
 		`ghcr.io/alertint/alertint-agent:{{ .Tag }}-arm64`,
 		`ghcr.io/alertint/alertint-agent:{{ .Tag }}`,
 		"make_latest: false",
+		"compare/v0.13.9...{{ .Tag }}",
 	} {
 		if !strings.Contains(rc, want) {
 			t.Errorf("RC config omits %q", want)
