@@ -94,6 +94,24 @@ variable; do not put its value in `config.toml`.
 For a hosted **AlertINT** instance, replace `http://localhost:9912/mcp` in the
 command or configuration with its HTTPS MCP endpoint.
 
+### Install the Situation investigation skill
+
+The repository includes a client-side Codex skill that turns a Situation or
+Slack card reference into a short, record-backed operator brief. From a
+checked-out release, install it for the current user:
+
+```bash
+mkdir -p ~/.codex/skills
+cp -R client-skills/alertint-situation-investigation ~/.codex/skills/
+```
+
+Restart Codex so it discovers the skill, then ask it to investigate an
+AlertINT Situation ID, public handle, or Slack card. The skill contains no
+token or server address; it uses the `alertint` MCP connection configured
+above. Remove `~/.codex/skills/alertint-situation-investigation` to uninstall
+it. Install the skill from the same AlertINT release as the server when
+upgrading so its workflow and tool names stay aligned.
+
 ## Cursor
 
 Merge into `~/.cursor/mcp.json` (create if absent), then restart Cursor
@@ -161,12 +179,14 @@ restart Windsurf and check **Settings → MCP Servers**:
 | `alertint_list_observation_runs` | Page one Situation's bounded evidence-preparation runs, oldest first: each capability read's immutable result status, coverage, and normalized facts — or an explicit `detail_state: "expired"` once its 10-day unused-detail retention window has passed, never a fabricated or reconstructed value. Page with `next_cursor`. Never returns a raw connector request, provider response, or claim owner/token. |
 | `alertint_get_semantic_profile` | Get one or more advisory semantic profiles: current head, a bounded page of immutable version history (newest first — model inferences and operator corrections alike), and the current live inference job state, if any. Pass exactly one of `signature` (from a Situation's evidence references) or a Situation (`id`/`handle`) — a Situation may resolve to more than one distinct signature when its deliveries span sources with different proven identity. Advisory content never asserts source state or bypasses proven identity. |
 | `alertint_correct_semantic_profile` | Record an operator-confirmed correction to one advisory semantic profile — always append-only: creates a new immutable version, advances the head, and atomically enqueues its change for fan-out to every matching nonterminal Situation. Requires `signature`, `expected_version` (the current head version; `0` only to create a missing head), a structured `profile`, `confirm: true`, and a non-empty `asserted_by`. A stale `expected_version` is refused, never silently retried — re-read with `alertint_get_semantic_profile` first. A correction never asserts source state, bypasses proven identity, or widens the observation horizon downward. |
-| `prometheus_query` | Instant PromQL query against the connected Prometheus (requires Prometheus enabled). |
-| `prometheus_query_range` | Range PromQL query with auto-stepped resolution (requires Prometheus enabled). |
+| `prometheus_query` | Instant PromQL query against Prometheus. This tool is always registered; a call reports an explicit error when Prometheus is not configured. |
+| `prometheus_query_range` | Range PromQL query with auto-stepped resolution. This tool is always registered; discovery alone does not prove configuration or reachability. |
 | `loki_query_range` | Range-query the configured log backend using its native query language (requires a log source enabled). |
 | `alertint_recent_changes` | List recent deploys/releases/PRs matching a label selector (requires change enrichment enabled). |
 | `sentry_issues_list` | List live, distilled Sentry issues for a project (+ optional environment) by status (`unresolved`/`resolved`/`ignored`); requires the Sentry Error source enabled. |
 | `sentry_issues_trace` | Return full distilled stacktraces (`file:line`, function, `in_app`) for up to 10 Sentry issue ids; requires the Sentry Error source enabled. |
+| `zabbix_metric_history` | Read bounded metric history or trends for an explicit Zabbix host and item key; registered only when the Zabbix API source is configured. |
+| `zabbix_host_problems` | List currently open Zabbix problems for an explicit host and optional severity floor; registered only when the Zabbix API source is configured. |
 | `alertint_incident_annotate` | Attach a permanent, age-stamped operator note to an incident — context for the next investigator; never affects triage or memory recall. In v0.14 it is also journalled, attributed to the operator, into the owning Situation's Slack thread in the same transaction — as recorded context, never as a change to the assessment, the attention level, or publication authority, and never as proof that anyone touched the operated system. |
 | `alertint_incident_capture_verdict` | Capture an operator-confirmed correction or confirmation as a replayable, graded record. A correction steers the next triage of its failure group (tested against live evidence, ruling-gated — never blended in) and demotes the corrected prior from strong recall; a confirmation retires steering. In v0.14 it is separately attributed in the owning Situation's journal and keeps exactly the authority it already had — no more. |
 
@@ -220,8 +240,35 @@ applied. A write against a Situation that was already closed when it landed
 is visible through the incident's own history and the audit log only. No old
 Incident Slack card is resurrected or rewritten in any of these cases.
 
-Read-only toward your systems, always; feedback writes (the last two tools
-above) land only in AlertINT's own incident state, additive and
-audit-chained. Every other tool reads local **AlertINT** state; the
-Prometheus tools additionally issue queries to the configured Prometheus
-instance — see [Prometheus](prometheus.md).
+The MCP server's initialize response repeats the compact investigation rules,
+and `tools/list` marks every tool with read-only, destructive, idempotent and
+open-world hints. These annotations help clients present the surface; they are
+not an authorization boundary.
+
+Local writes include notes and verdicts, episode expected-until decisions,
+reusable expected schedules, their preparation records, and semantic-profile
+corrections. Incident notes and verdicts land only in AlertINT's own incident
+state; the other writes land in the corresponding AlertINT Situation,
+schedule, or semantic-profile state. All remain audit-chained or
+revisioned, but still require explicit operator authorization. Each confirmed
+write keeps its existing confirmation and optimistic-version checks. Live
+Prometheus, log, Sentry and Zabbix reads query their configured external
+systems with the scope and time supplied by the caller. Change reads and all
+other inspection tools read persisted AlertINT state.
+
+## Connection check and concise investigation output
+
+At first setup, on explicit request, or after a connection failure, verify MCP
+initialization, discover tools, and run one bounded state read such as
+`alertint_list_situations` with a small limit. Report configured/available,
+queried successfully, failed and not checked separately. Logs, changes,
+Sentry and Zabbix tools are conditionally registered, so their presence means
+the MCP capability is enabled but does not prove reachability. Prometheus
+tools are unconditional, so their presence does not prove even configuration.
+Do not probe every connector merely to populate a health table.
+
+Default investigation answers to **Finding / Evidence / Now / Next**, followed
+by up to three useful numbered read options supported by discovered tools.
+**Next** is AlertINT's recorded action and deadline, separate from proposed
+operator work. When no Finding is supported, say **Finding: Insufficient
+evidence —** and name the specific missing or failed evidence.

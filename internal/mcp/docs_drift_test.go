@@ -3,19 +3,18 @@
 package mcp
 
 import (
-	"context"
 	"os"
 	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/alertint/alertint-agent/internal/audit"
-	"github.com/alertint/alertint-agent/internal/store"
 )
 
 const (
 	mcpClientsDocPath     = "../../docs/integrations/mcp-clients.md"
 	scopeAndLimitsDocPath = "../../docs/concepts/scope-and-limits.md"
+	clientSkillPath       = "../../client-skills/alertint-situation-investigation/SKILL.md"
 	availableToolsHeading = "## Available tools"
 	toolNameCellPattern   = "`([a-z_]+)`"
 )
@@ -27,90 +26,17 @@ const (
 // repo had no MCP tool↔docs gate before ADR-0027; modeled on
 // internal/config/docs_drift_test.go.
 func TestDriftGate_ToolsDocumented(t *testing.T) {
-	st, err := store.Open(context.Background(), ":memory:")
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	defer func() { _ = st.Close() }()
+	st := newMCPStore(t)
 
 	cfg := sentryMCPConfig(&fakeSentryReader{}, true)
 	cfg.Logs = &spySource{}
 	cfg.ChangesEnabled = true
-	s := &Server{cfg: cfg, st: st, auditor: audit.New(st.DB())}
-
+	cfg.Zabbix = &fakeZabbixMCP{}
+	s := NewServer(cfg, st, audit.New(st.DB()))
 	names := map[string]bool{}
-	addTool := func(name string) { names[name] = true }
-
-	t1, _ := s.toolListIncidents()
-	addTool(t1.Name)
-	t2, _ := s.toolGetIncident()
-	addTool(t2.Name)
-	t3, _ := s.toolSearchAlerts()
-	addTool(t3.Name)
-	t4, _ := s.toolGetEvidencePack()
-	addTool(t4.Name)
-	t5, _ := s.toolVerifyAudit()
-	addTool(t5.Name)
-	t6, _ := s.toolPrometheusQuery()
-	addTool(t6.Name)
-	t7, _ := s.toolPrometheusQueryRange()
-	addTool(t7.Name)
-	t8, _ := s.toolLogsQueryRange()
-	addTool(t8.Name)
-	t9, _ := s.toolRecentChanges()
-	addTool(t9.Name)
-	t10, _ := s.toolSentryIssuesList()
-	addTool(t10.Name)
-	t11, _ := s.toolSentryIssuesTrace()
-	addTool(t11.Name)
-	t12, _ := s.toolIncidentAnnotate()
-	addTool(t12.Name)
-	t13, _ := s.toolIncidentCaptureVerdict()
-	addTool(t13.Name)
-	t14, _ := s.toolListSituations()
-	addTool(t14.Name)
-	t15, _ := s.toolGetSituation()
-	addTool(t15.Name)
-	t16, _ := s.toolListSituationTransitions()
-	addTool(t16.Name)
-	t17, _ := s.toolGetDeliveryState()
-	addTool(t17.Name)
-	t18, _ := s.toolListObservationRuns()
-	addTool(t18.Name)
-	t19, _ := s.toolGetSemanticProfile()
-	addTool(t19.Name)
-	t20, _ := s.toolCorrectSemanticProfile()
-	addTool(t20.Name)
-	t21, _ := s.toolRecordSituationExpected()
-	addTool(t21.Name)
-	t22, _ := s.toolReplaceSituationExpected()
-	addTool(t22.Name)
-	t23, _ := s.toolRevokeSituationExpected()
-	addTool(t23.Name)
-	t24, _ := s.toolRestoreSituationExpected()
-	addTool(t24.Name)
-	t25, _ := s.toolListSituationJudgments()
-	addTool(t25.Name)
-	t26, _ := s.toolExpectedBehaviorPrepare()
-	addTool(t26.Name)
-	t27, _ := s.toolGetExpectedBehaviorValidation()
-	addTool(t27.Name)
-	t28, _ := s.toolExpectedBehaviorConfirm()
-	addTool(t28.Name)
-	t29, _ := s.toolExpectedBehaviorReplace()
-	addTool(t29.Name)
-	t30, _ := s.toolExpectedBehaviorRevoke()
-	addTool(t30.Name)
-	t31, _ := s.toolExpectedBehaviorRestore()
-	addTool(t31.Name)
-	t32, _ := s.toolGetExpectedBehavior()
-	addTool(t32.Name)
-	t33, _ := s.toolListExpectedBehaviors()
-	addTool(t33.Name)
-	t34, _ := s.toolListExpectedBehaviorHistory()
-	addTool(t34.Name)
-	t35, _ := s.toolUsageStats()
-	addTool(t35.Name)
+	for name := range listedTools(t, s) {
+		names[name] = true
+	}
 
 	documented := documentedToolNames(t)
 
@@ -122,6 +48,26 @@ func TestDriftGate_ToolsDocumented(t *testing.T) {
 	for name := range documented {
 		if !names[name] {
 			t.Errorf("doc row %q in %s names a tool that is not registered", name, mcpClientsDocPath)
+		}
+	}
+}
+
+func TestDriftGate_ClientSkillUsesRegisteredTools(t *testing.T) {
+	b, err := os.ReadFile(clientSkillPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", clientSkillPath, err)
+	}
+	st := newMCPStore(t)
+	cfg := sentryMCPConfig(&fakeSentryReader{}, true)
+	cfg.Logs = &spySource{}
+	cfg.ChangesEnabled = true
+	cfg.Zabbix = &fakeZabbixMCP{}
+	registered := listedTools(t, NewServer(cfg, st, audit.New(st.DB())))
+
+	toolRef := regexp.MustCompile("`((?:alertint|prometheus|loki|sentry|zabbix)_[a-z_]+)`")
+	for _, match := range toolRef.FindAllStringSubmatch(string(b), -1) {
+		if _, ok := registered[match[1]]; !ok {
+			t.Errorf("%s references unregistered tool %q", clientSkillPath, match[1])
 		}
 	}
 }

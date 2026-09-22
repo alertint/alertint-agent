@@ -79,11 +79,12 @@ type Config struct {
 // Server is the AlertINT MCP HTTP server. Construct with NewServer; start
 // by passing Handler() to an http.Server on the configured addr.
 type Server struct {
-	cfg     Config
-	st      *store.Store
-	auditor *audit.Auditor
-	handler http.Handler
-	now     func() time.Time
+	cfg      Config
+	st       *store.Store
+	auditor  *audit.Auditor
+	protocol *mcpserver.MCPServer
+	handler  http.Handler
+	now      func() time.Time
 }
 
 // NewServer builds the MCP server with the always-on incident/alert/audit tools
@@ -94,7 +95,9 @@ func NewServer(cfg Config, st *store.Store, auditor *audit.Auditor) *Server {
 
 	ms := mcpserver.NewMCPServer("AlertINT", "1.0.0",
 		mcpserver.WithToolCapabilities(false),
+		mcpserver.WithInstructions(serverInstructions),
 	)
+	s.protocol = ms
 
 	ms.AddTool(s.toolListIncidents())
 	ms.AddTool(s.toolGetIncident())
@@ -207,7 +210,7 @@ func (s *Server) withBearerAuth(next http.Handler) http.Handler {
 // -----------------------------------------------------------------------------
 
 func (s *Server) toolListIncidents() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_list_incidents",
+	tool := newTool("alertint_list_incidents",
 		mcplib.WithDescription("List recent AlertINT incidents, newest first. "+
 			"Each incident groups one or more related alerts with an AI finding. "+
 			"Rows with drill=true are synthetic drills fired by `alertint drill`, not real incidents."),
@@ -219,7 +222,7 @@ func (s *Server) toolListIncidents() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 }
 
 func (s *Server) toolGetIncident() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_get_incident",
+	tool := newTool("alertint_get_incident",
 		mcplib.WithDescription("Get full details for one incident: member alerts with their roles, "+
 			"AI finding (analysis name, overall issue, correlation findings, severity, confidence), "+
 			"and raw LLM output JSON. drill=true marks a synthetic drill fired by `alertint drill`, "+
@@ -233,7 +236,7 @@ func (s *Server) toolGetIncident() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 }
 
 func (s *Server) toolSearchAlerts() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_search_alerts",
+	tool := newTool("alertint_search_alerts",
 		mcplib.WithDescription("Search stored alerts. All parameters are optional. "+
 			"Returns alerts ordered by received_at descending."),
 		mcplib.WithString("since",
@@ -259,7 +262,7 @@ func (s *Server) toolSearchAlerts() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 }
 
 func (s *Server) toolGetEvidencePack() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_get_evidence_pack",
+	tool := newTool("alertint_get_evidence_pack",
 		mcplib.WithDescription("Return the compact evidence pack for an incident — the same "+
 			"structured context that the acute-triage skill passed to the LLM: shared labels, "+
 			"alert timeline, severity distribution, and top annotations."),
@@ -272,7 +275,7 @@ func (s *Server) toolGetEvidencePack() (mcplib.Tool, mcpserver.ToolHandlerFunc) 
 }
 
 func (s *Server) toolVerifyAudit() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_verify_audit",
+	tool := newTool("alertint_verify_audit",
 		mcplib.WithDescription("Walk the hash-chained audit log and verify tamper-evidence. "+
 			"Returns the number of rows checked and whether the chain is intact."),
 	)
@@ -280,7 +283,7 @@ func (s *Server) toolVerifyAudit() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 }
 
 func (s *Server) toolUsageStats() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_usage_stats",
+	tool := newTool("alertint_usage_stats",
 		mcplib.WithDescription("Operational usage summary over a time window: alert deliveries and alerts received, "+
 			"LLM call/token volume (with a per-model breakdown), new Slack Situation cards and withheld channel pokes, "+
 			"incident analyses completed and triage exhaustions. Aggregated from the audit log; read-only."),
@@ -789,7 +792,7 @@ func (s *Server) handleUsageStats(ctx context.Context, req mcplib.CallToolReques
 }
 
 func (s *Server) toolPrometheusQuery() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("prometheus_query",
+	tool := newTool("prometheus_query",
 		mcplib.WithDescription("Execute an instant PromQL query against the connected Prometheus. "+
 			"Returns the current value(s) for the expression. "+
 			"Use this to check live metric values during incident investigation."),
@@ -805,7 +808,7 @@ func (s *Server) toolPrometheusQuery() (mcplib.Tool, mcpserver.ToolHandlerFunc) 
 }
 
 func (s *Server) toolPrometheusQueryRange() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("prometheus_query_range",
+	tool := newTool("prometheus_query_range",
 		mcplib.WithDescription("Execute a range PromQL query and return a time-series matrix. "+
 			"Use this to see how a metric evolved over time around an incident."),
 		mcplib.WithString("expr",
@@ -961,7 +964,7 @@ func (s *Server) toolLogsQueryRange() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 	desc := fmt.Sprintf("Range-query the configured log backend (%s) using its native query language (LogQL). "+
 		"Use this to drill into or around an incident: widen the time window, change the label selector, "+
 		"or grep for new patterns. Read-only.", s.cfg.Logs.Name())
-	tool := mcplib.NewTool(name,
+	tool := newTool(name,
 		mcplib.WithDescription(desc),
 		mcplib.WithString("query",
 			mcplib.Description("Native query in the backend's language (LogQL for loki), e.g. {app=\"api\"} |= \"panic\"."),
@@ -1037,7 +1040,7 @@ func (s *Server) handleLogsQueryRange(ctx context.Context, req mcplib.CallToolRe
 }
 
 func (s *Server) toolRecentChanges() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_recent_changes",
+	tool := newTool("alertint_recent_changes",
 		mcplib.WithDescription("List recent change events (deploys, config edits, flag flips) "+
 			"newest-first. Use this to answer \"what changed?\" during investigation — widen the "+
 			"window or pivot services. Read-only."),

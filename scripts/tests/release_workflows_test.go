@@ -99,6 +99,9 @@ func TestReleaseArchivesIncludeSituationWorkflowGuide(t *testing.T) {
 		if !strings.Contains(body, "docs/concepts/situation-workflow.html") {
 			t.Errorf("%s omits the standalone Situation workflow guide", name)
 		}
+		if !strings.Contains(body, "client-skills/**/*") {
+			t.Errorf("%s omits the client investigation skill", name)
+		}
 	}
 }
 

@@ -35,7 +35,7 @@ import (
 // ----------------------------------------------------------------------
 
 func (s *Server) toolListObservationRuns() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_list_observation_runs",
+	tool := newTool("alertint_list_observation_runs",
 		mcplib.WithDescription("Page one Situation's bounded evidence-preparation runs, oldest first: each "+
 			"capability read's immutable result status, coverage, and normalized facts (or an explicit "+
 			"detail_state=\"expired\" once its 10-day unused-detail retention window has passed — never a "+
@@ -164,7 +164,7 @@ func (s *Server) handleListObservationRuns(ctx context.Context, req mcplib.CallT
 // ----------------------------------------------------------------------
 
 func (s *Server) toolGetSemanticProfile() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_get_semantic_profile",
+	tool := newTool("alertint_get_semantic_profile",
 		mcplib.WithDescription("Get one or more advisory semantic profiles: current head, a bounded page of "+
 			"immutable version history (newest first — model inferences and operator corrections alike), and "+
 			"the current live inference job state, if any. Pass exactly one of signature (from a Situation's "+
@@ -290,7 +290,7 @@ func (s *Server) handleGetSemanticProfile(ctx context.Context, req mcplib.CallTo
 // ----------------------------------------------------------------------
 
 func (s *Server) toolCorrectSemanticProfile() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_correct_semantic_profile",
+	tool := newTool("alertint_correct_semantic_profile",
 		mcplib.WithDescription("Record an operator-confirmed correction to one advisory semantic profile — "+
 			"always append-only: creates a new immutable version and advances the head, atomically enqueuing "+
 			"its change for fan-out to every matching nonterminal Situation. NEVER call this without an "+

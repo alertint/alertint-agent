@@ -19,7 +19,7 @@ func situationExpectedTool(name, verb string, deadline bool) mcplib.Tool {
 	opts := []mcplib.ToolOption{
 		mcplib.WithDescription(verb + " one explicitly confirmed, episode-scoped decision that the current non-critical Situation condition is expected. " +
 			"The command is version-fenced, audit-chained, and wakes reconciliation. Re-read with alertint_get_situation before calling. " +
-			"It does not change lifecycle, stop monitoring, cancel investigation, or claim recovery."),
+			"NEVER call without explicit operator instruction or confirmation. It does not change lifecycle, stop monitoring, cancel investigation, or claim recovery."),
 		mcplib.WithString("situation_id", mcplib.Description("Situation ID from alertint_get_situation."), mcplib.Required()),
 		mcplib.WithNumber("situation_input_version", mcplib.Description("Current input_version from alertint_get_situation."), mcplib.Required()),
 		mcplib.WithNumber("expected_judgment_version", mcplib.Description("Current judgment_version from alertint_get_situation; 0 when none exists."), mcplib.Required()),
@@ -30,7 +30,7 @@ func situationExpectedTool(name, verb string, deadline bool) mcplib.Tool {
 	if deadline {
 		opts = append(opts, mcplib.WithString("valid_until", mcplib.Description("Future RFC3339 deadline with timezone; no indefinite default."), mcplib.Required()))
 	}
-	return mcplib.NewTool(name, opts...)
+	return newTool(name, opts...)
 }
 
 func (s *Server) toolRecordSituationExpected() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
@@ -50,7 +50,7 @@ func (s *Server) toolRestoreSituationExpected() (mcplib.Tool, mcpserver.ToolHand
 }
 
 func (s *Server) toolListSituationJudgments() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_list_situation_judgments",
+	tool := newTool("alertint_list_situation_judgments",
 		mcplib.WithDescription("List one Situation's immutable expectedness revisions oldest first. This is history; use alertint_get_situation for current authority."),
 		mcplib.WithString("situation_id", mcplib.Description("Situation ID."), mcplib.Required()),
 		mcplib.WithInteger("limit", mcplib.Description("Maximum revisions to return (1-100, default 50).")),

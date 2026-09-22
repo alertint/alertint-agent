@@ -35,7 +35,7 @@ import (
 )
 
 func (s *Server) toolListSituations() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_list_situations",
+	tool := newTool("alertint_list_situations",
 		mcplib.WithDescription("List durable Situations, most recently updated first. A Situation is "+
 			"the exact-group lineage that durably owns one or more Incidents. This is a bounded summary — "+
 			"lifecycle/attention/scheduling fields and due reasons only, no Assessment or controller "+
@@ -48,7 +48,7 @@ func (s *Server) toolListSituations() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 }
 
 func (s *Server) toolGetSituation() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_get_situation",
+	tool := newTool("alertint_get_situation",
 		mcplib.WithDescription("Get one Situation by id or public handle: its immutable member Incidents "+
 			"(with each one's current Triage decision/phase/attempts/due time/covered digests), current "+
 			"authoritative Assessment and derivation, current Operator contract, material/Assessment-basis "+
@@ -424,7 +424,7 @@ const (
 )
 
 func (s *Server) toolListSituationTransitions() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_list_situation_transitions",
+	tool := newTool("alertint_list_situation_transitions",
 		mcplib.WithDescription("Page one Situation's immutable Transition journal, oldest first. A Transition "+
 			"is one authoritative material change: its lifecycle/attention, operator contract, transition reason, "+
 			"journal kind and bounded journal entry, evidence references, actor, and drill marker. History is never "+
@@ -441,7 +441,7 @@ func (s *Server) toolListSituationTransitions() (mcplib.Tool, mcpserver.ToolHand
 }
 
 func (s *Server) toolGetDeliveryState() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_get_delivery_state",
+	tool := newTool("alertint_get_delivery_state",
 		mcplib.WithDescription("Get the installation-level Situation Slack delivery state: the continuous-failure "+
 			"window, the durable Slack configuration generation and how many effects are blocked on it, the current "+
 			"Delivery-gap generation with its status/age and replay backlog, retries and outcomes by effect class, "+

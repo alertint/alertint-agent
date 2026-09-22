@@ -18,20 +18,20 @@ import (
 
 // MCP owns expected-schedule maintenance and review under ADR-0054.
 func (s *Server) toolExpectedBehaviorPrepare() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	return mcplib.NewTool("alertint_expected_behavior_prepare",
-		mcplib.WithDescription("Prepare fresh exact source current-state proof for proposed reusable expected-schedule bindings. This creates no authority."),
+	return newTool("alertint_expected_behavior_prepare",
+		mcplib.WithDescription("Prepare fresh exact source current-state proof for proposed reusable expected-schedule bindings. This creates no authority, but persists validation work; call it only when the operator has explicitly asked to prepare a reusable schedule."),
 		mcplib.WithString("situation_id", mcplib.Required()), mcplib.WithNumber("situation_input_version", mcplib.Required()),
 		mcplib.WithArray("required_companions"), mcplib.WithArray("allowed_companions"), mcplib.WithArray("forbidden_signals"),
 	), s.handleExpectedBehaviorPrepare
 }
 
 func (s *Server) toolGetExpectedBehaviorValidation() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	return mcplib.NewTool("alertint_get_expected_behavior_validation", mcplib.WithDescription("Read one reusable expected-schedule binding validation."), mcplib.WithString("validation_id", mcplib.Required())), s.handleGetExpectedBehaviorValidation
+	return newTool("alertint_get_expected_behavior_validation", mcplib.WithDescription("Read one reusable expected-schedule binding validation."), mcplib.WithString("validation_id", mcplib.Required())), s.handleGetExpectedBehaviorValidation
 }
 
 func expectedBehaviorWriteTool(name, verb string, policy bool) mcplib.Tool {
 	opts := []mcplib.ToolOption{
-		mcplib.WithDescription(verb + " one explicitly confirmed reusable expected schedule. Monitoring, investigation, lifecycle, and recovery remain unchanged."),
+		mcplib.WithDescription(verb + " one explicitly confirmed reusable expected schedule. NEVER call without explicit operator instruction or confirmation. Monitoring, investigation, lifecycle, and recovery remain unchanged."),
 		mcplib.WithString("envelope_id"), mcplib.WithNumber("expected_current_version", mcplib.Required()),
 		mcplib.WithString("request_id", mcplib.Required()), mcplib.WithString("asserted_operator", mcplib.Required()),
 		mcplib.WithBoolean("operator_confirmed", mcplib.Required()),
@@ -44,7 +44,7 @@ func expectedBehaviorWriteTool(name, verb string, policy bool) mcplib.Tool {
 			mcplib.WithString("review_due_at", mcplib.Required()),
 		)
 	}
-	return mcplib.NewTool(name, opts...)
+	return newTool(name, opts...)
 }
 
 func (s *Server) toolExpectedBehaviorConfirm() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
@@ -61,14 +61,14 @@ func (s *Server) toolExpectedBehaviorRestore() (mcplib.Tool, mcpserver.ToolHandl
 }
 
 func (s *Server) toolGetExpectedBehavior() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	return mcplib.NewTool("alertint_get_expected_behavior", mcplib.WithDescription("Get one reusable expected schedule's current authority, review status, and usage."), mcplib.WithString("envelope_id", mcplib.Required())), s.handleGetExpectedBehavior
+	return newTool("alertint_get_expected_behavior", mcplib.WithDescription("Get one reusable expected schedule's current authority, review status, and usage."), mcplib.WithString("envelope_id", mcplib.Required())), s.handleGetExpectedBehavior
 }
 func (s *Server) toolListExpectedBehaviors() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	return mcplib.NewTool("alertint_list_expected_behaviors", mcplib.WithDescription("List reusable expected schedules with current authority, review status, and usage."),
+	return newTool("alertint_list_expected_behaviors", mcplib.WithDescription("List reusable expected schedules with current authority, review status, and usage."),
 		mcplib.WithString("group_key"), mcplib.WithString("source"), mcplib.WithString("source_instance_id"), mcplib.WithString("trigger_id"), mcplib.WithString("rule_id"), mcplib.WithString("review_status"), mcplib.WithBoolean("include_inactive"), mcplib.WithInteger("limit")), s.handleListExpectedBehaviors
 }
 func (s *Server) toolListExpectedBehaviorHistory() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	return mcplib.NewTool("alertint_list_expected_behavior_history", mcplib.WithDescription("List one reusable expected schedule's immutable operator revisions and source invalidation events."),
+	return newTool("alertint_list_expected_behavior_history", mcplib.WithDescription("List one reusable expected schedule's immutable operator revisions and source invalidation events."),
 		mcplib.WithString("envelope_id", mcplib.Required()), mcplib.WithInteger("cursor_version"), mcplib.WithInteger("limit")), s.handleListExpectedBehaviorHistory
 }
 
