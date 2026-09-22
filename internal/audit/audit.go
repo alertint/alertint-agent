@@ -239,18 +239,14 @@ func (a *Auditor) UsageStats(ctx context.Context, since, until time.Time) (Usage
 }
 
 type tsWindowPred struct {
-	sql  string
 	args []any
 }
-
-const tsNormalizedCol = `(substr(ts, 1, 19) || '.' || substr(ltrim(rtrim(substr(ts, 20), 'Z'), '.') || '000000000', 1, 9))`
 
 func tsWindow(since, until time.Time) tsWindowPred {
 	const exactLayout = "2006-01-02T15:04:05.000000000"
 	const coarseLayout = "2006-01-02T15:04:05"
 	since, until = since.UTC(), until.UTC()
 	return tsWindowPred{
-		sql: `ts >= ? AND ts < ? AND ` + tsNormalizedCol + ` >= ? AND ` + tsNormalizedCol + ` < ?`,
 		args: []any{
 			since.Truncate(time.Second).Format(coarseLayout),
 			until.Truncate(time.Second).Add(time.Second).Format(coarseLayout),
@@ -262,7 +258,10 @@ func tsWindow(since, until time.Time) tsWindowPred {
 func (a *Auditor) scanUsageCounts(ctx context.Context, w tsWindowPred, out *UsageStats) error {
 	rows, err := a.db.QueryContext(ctx, `
 		SELECT actor, kind, COUNT(*) FROM audit_log
-		WHERE `+w.sql+` GROUP BY actor, kind`, w.args...)
+		WHERE ts >= ? AND ts < ?
+		  AND (substr(ts, 1, 19) || '.' || substr(ltrim(rtrim(substr(ts, 20), 'Z'), '.') || '000000000', 1, 9)) >= ?
+		  AND (substr(ts, 1, 19) || '.' || substr(ltrim(rtrim(substr(ts, 20), 'Z'), '.') || '000000000', 1, 9)) < ?
+		GROUP BY actor, kind`, w.args...)
 	if err != nil {
 		return fmt.Errorf("audit: usage stats counts: %w", err)
 	}
@@ -288,7 +287,10 @@ func (a *Auditor) scanUsageCounts(ctx context.Context, w tsWindowPred, out *Usag
 func (a *Auditor) scanIntakeAndSlack(ctx context.Context, w tsWindowPred, out *UsageStats) error {
 	if err := a.db.QueryRowContext(ctx, `
 		SELECT COUNT(*), COALESCE(SUM(COALESCE(json_extract(payload_json, '$.alert_count'), 1)), 0)
-		FROM audit_log WHERE kind = 'alert.received' AND `+w.sql, w.args...).
+		FROM audit_log WHERE kind = 'alert.received'
+		  AND ts >= ? AND ts < ?
+		  AND (substr(ts, 1, 19) || '.' || substr(ltrim(rtrim(substr(ts, 20), 'Z'), '.') || '000000000', 1, 9)) >= ?
+		  AND (substr(ts, 1, 19) || '.' || substr(ltrim(rtrim(substr(ts, 20), 'Z'), '.') || '000000000', 1, 9)) < ?`, w.args...).
 		Scan(&out.AlertDeliveries, &out.AlertsReceived); err != nil {
 		return fmt.Errorf("audit: usage stats alert intake: %w", err)
 	}
@@ -300,7 +302,9 @@ func (a *Auditor) scanIntakeAndSlack(ctx context.Context, w tsWindowPred, out *U
 		       OR (kind = 'situation.notification.delivered'
 		           AND json_extract(payload_json, '$.effect_class') = 'root_sync'
 		           AND json_extract(payload_json, '$.new_root') = 1))
-		  AND `+w.sql, w.args...).Scan(&out.SlackCardsPosted); err != nil {
+		  AND ts >= ? AND ts < ?
+		  AND (substr(ts, 1, 19) || '.' || substr(ltrim(rtrim(substr(ts, 20), 'Z'), '.') || '000000000', 1, 9)) >= ?
+		  AND (substr(ts, 1, 19) || '.' || substr(ltrim(rtrim(substr(ts, 20), 'Z'), '.') || '000000000', 1, 9)) < ?`, w.args...).Scan(&out.SlackCardsPosted); err != nil {
 		return fmt.Errorf("audit: usage stats slack cards: %w", err)
 	}
 	var situationWithheld int
@@ -308,7 +312,9 @@ func (a *Auditor) scanIntakeAndSlack(ctx context.Context, w tsWindowPred, out *U
 		SELECT COUNT(*) FROM audit_log
 		WHERE kind = 'situation.notification.withheld'
 		  AND json_extract(payload_json, '$.main_channel_poke') = 1
-		  AND `+w.sql, w.args...).Scan(&situationWithheld); err != nil {
+		  AND ts >= ? AND ts < ?
+		  AND (substr(ts, 1, 19) || '.' || substr(ltrim(rtrim(substr(ts, 20), 'Z'), '.') || '000000000', 1, 9)) >= ?
+		  AND (substr(ts, 1, 19) || '.' || substr(ltrim(rtrim(substr(ts, 20), 'Z'), '.') || '000000000', 1, 9)) < ?`, w.args...).Scan(&situationWithheld); err != nil {
 		return fmt.Errorf("audit: usage stats withheld notifications: %w", err)
 	}
 	out.SlackSkipped += situationWithheld
@@ -326,7 +332,10 @@ type llmResponsePayload struct {
 func (a *Auditor) scanLLMUsage(ctx context.Context, w tsWindowPred, out *UsageStats) error {
 	rows, err := a.db.QueryContext(ctx, `
 		SELECT actor, payload_json FROM audit_log
-		WHERE kind = 'llm.response' AND `+w.sql, w.args...)
+		WHERE kind = 'llm.response'
+		  AND ts >= ? AND ts < ?
+		  AND (substr(ts, 1, 19) || '.' || substr(ltrim(rtrim(substr(ts, 20), 'Z'), '.') || '000000000', 1, 9)) >= ?
+		  AND (substr(ts, 1, 19) || '.' || substr(ltrim(rtrim(substr(ts, 20), 'Z'), '.') || '000000000', 1, 9)) < ?`, w.args...)
 	if err != nil {
 		return fmt.Errorf("audit: usage stats llm scan: %w", err)
 	}
