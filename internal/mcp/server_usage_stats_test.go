@@ -37,15 +37,24 @@ func TestHandleUsageStatsAggregatesCurrentAuditVocabulary(t *testing.T) {
 	if err := json.Unmarshal([]byte(resultText(t, res)), &payload); err != nil {
 		t.Fatalf("payload not JSON: %v", err)
 	}
-	alerts := payload["alerts"].(map[string]any)
+	alerts, ok := payload["alerts"].(map[string]any)
+	if !ok {
+		t.Fatalf("alerts = %T, want object", payload["alerts"])
+	}
 	if alerts["deliveries"] != float64(1) || alerts["received"] != float64(2) {
 		t.Errorf("alerts = %v", alerts)
 	}
-	slack := payload["slack"].(map[string]any)
+	slack, ok := payload["slack"].(map[string]any)
+	if !ok {
+		t.Fatalf("slack = %T, want object", payload["slack"])
+	}
 	if slack["cards_posted"] != float64(1) || slack["skipped"] != float64(1) {
 		t.Errorf("slack = %v", slack)
 	}
-	incidents := payload["incidents"].(map[string]any)
+	incidents, ok := payload["incidents"].(map[string]any)
+	if !ok {
+		t.Fatalf("incidents = %T, want object", payload["incidents"])
+	}
 	if incidents["analyzed"] != float64(1) || incidents["triage_exhausted"] != float64(1) {
 		t.Errorf("incidents = %v", incidents)
 	}
