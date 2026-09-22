@@ -33,7 +33,7 @@ const piiNotice = "AlertINT does not ingest event-level PII (local variables, re
 // scope, beyond the triage top-K and across resolved/ignored statuses. The agent
 // reads project/environment from the evidence pack's persisted sentry enrichment.
 func (s *Server) toolSentryIssuesList() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("sentry_issues_list",
+	tool := newTool("sentry_issues_list",
 		mcplib.WithDescription("List distilled Sentry issues for a project scope — live, beyond the triage "+
 			"top-K cap, and across statuses. Use during investigation to see what is erroring now or whether "+
 			"an error was already resolved/muted. Read-only; returns only the distilled exception shape "+
@@ -66,7 +66,7 @@ func (s *Server) toolSentryIssuesList() (mcplib.Tool, mcpserver.ToolHandlerFunc)
 // toolSentryIssuesTrace is the depth tool: the full exception stacktrace for one or
 // more issue ids (e.g. the evidence pack's corroborating ids, or ids from the list).
 func (s *Server) toolSentryIssuesTrace() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("sentry_issues_trace",
+	tool := newTool("sentry_issues_trace",
 		mcplib.WithDescription("Return the full exception stacktrace for one or more Sentry issue ids — every "+
 			"frame with file:line, function, and an in_app flag, plus the latest event's timestamp. Use to see "+
 			"where code is failing beyond the single in-app line the evidence pack carried. Read-only; returns "+

@@ -1,5 +1,9 @@
 # Releasing
 
+The v0.14 operator lifecycle is summarized in the standalone
+[Situation workflow](docs/concepts/situation-workflow.html). Review it with
+the RC changelog when validating operator-facing behavior.
+
 The GitHub Release body **is** the `CHANGELOG.md` section for the version
 being released. The release workflow extracts it and refuses to publish a
 tag whose section is missing — so the changelog roll always happens
@@ -12,6 +16,64 @@ tag whose section is missing — so the changelog roll always happens
 
 There is no version constant in the source — the binary version comes from
 the git tag via ldflags.
+
+## Release candidates
+
+Release candidates are explicitly opt-in and are cut from the reviewed
+`state-controller` line. They do not use the normal stable-release command,
+which switches to `main`.
+
+1. On a release-preparation branch, roll and review the candidate notes:
+
+   ```bash
+   task release:prep VERSION=0.14.0-rc1
+   task release:notes VERSION=0.14.0-rc1
+   ```
+
+2. Merge the release-preparation PR into `state-controller` after all required
+   checks pass. Record its full 40-character commit SHA.
+
+3. From a clean checkout at that exact commit, validate the publication
+   without changing anything:
+
+   ```bash
+   task release:rc -- 0.14.0-rc1 <full-candidate-sha> --dry-run
+   ```
+
+4. After explicit publication approval, run the same command without
+   `--dry-run`. It does not switch branches or create a commit. It creates the
+   immutable `v0.14.0-rc1` tag only when `HEAD`, the expected SHA, the
+   changelog section, and tag availability all agree.
+
+   ```bash
+   task release:rc -- 0.14.0-rc1 <full-candidate-sha>
+   ```
+
+The tag workflow selects `.goreleaser.rc.yaml`. It marks the GitHub release as
+a prerelease, refuses latest-release promotion, and publishes only these image
+tags:
+
+```text
+ghcr.io/alertint/alertint-agent:v0.14.0-rc1-amd64
+ghcr.io/alertint/alertint-agent:v0.14.0-rc1-arm64
+ghcr.io/alertint/alertint-agent:v0.14.0-rc1
+```
+
+It never writes `latest`, `latest-amd64`, or `latest-arm64`. RC publication
+does not publish a Helm chart or change chart defaults. To evaluate the RC with
+an existing supported chart, set the image tag explicitly:
+
+```bash
+helm upgrade --install alertint oci://ghcr.io/alertint/charts/alertint-agent \
+  --version <installed-chart-version> \
+  --set image.tag=v0.14.0-rc1
+```
+
+Before installing an RC over an existing database, create and retain a
+consistent backup with the old binary. Rollback means stopping the RC,
+preserving its migrated database separately, restoring that backup, and then
+starting the old binary. Never open an RC-migrated database with the old
+binary. See [Backup & restore](docs/getting-started/backup-restore.md).
 
 ## Cutting a release
 
@@ -85,7 +147,7 @@ nothing misleading ever exists.
 
 Released v0.13.9 owns migration `0013_audit_log_kind_ts_idx.sql`.
 State-controller migrations start at `0014_alert_delivery_ledger.sql` and
-currently end at `0036_expected_behavior_reviews.sql`. Released migration
+currently end at `0037_alertmanager_source_provenance.sql`. Released migration
 files must retain their numbers and contents; a pinned release-prefix test
 checks this alongside the populated v0.13.9 upgrade regression.
 

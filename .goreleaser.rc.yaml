@@ -41,13 +41,14 @@ checksum:
   name_template: SHA256SUMS
   algorithm: sha256
 
+# Release candidates publish only immutable, explicitly versioned image tags.
+# Stable aliases remain owned by .goreleaser.yaml.
 dockers:
   - id: alertint-amd64
     goos: linux
     goarch: amd64
     image_templates:
       - "ghcr.io/alertint/alertint-agent:{{ .Tag }}-amd64"
-      - "ghcr.io/alertint/alertint-agent:latest-amd64"
     dockerfile: Dockerfile.goreleaser
     build_flag_templates:
       - "--platform=linux/amd64"
@@ -61,7 +62,6 @@ dockers:
     goarch: arm64
     image_templates:
       - "ghcr.io/alertint/alertint-agent:{{ .Tag }}-arm64"
-      - "ghcr.io/alertint/alertint-agent:latest-arm64"
     dockerfile: Dockerfile.goreleaser
     build_flag_templates:
       - "--platform=linux/arm64"
@@ -75,11 +75,6 @@ docker_manifests:
     image_templates:
       - "ghcr.io/alertint/alertint-agent:{{ .Tag }}-amd64"
       - "ghcr.io/alertint/alertint-agent:{{ .Tag }}-arm64"
-
-  - name_template: "ghcr.io/alertint/alertint-agent:latest"
-    image_templates:
-      - "ghcr.io/alertint/alertint-agent:latest-amd64"
-      - "ghcr.io/alertint/alertint-agent:latest-arm64"
 
 changelog:
   use: github
@@ -98,14 +93,10 @@ release:
     name: alertint-agent
   name_template: "v{{ .Version }}"
   draft: false
-  prerelease: auto
-  # The body comes from CHANGELOG.md via --release-notes (see
-  # .github/workflows/release.yml). mode: replace makes that stick even when
-  # the release already exists — e.g. published from the GitHub UI, which
-  # pre-creates the release (with UI-generated notes) before the tag-push
-  # workflow runs; the default keep-existing would silently keep that body.
+  prerelease: true
+  make_latest: false
   mode: replace
   footer: |
     ---
 
-    **Full Changelog**: https://github.com/alertint/alertint-agent/compare/{{ .PreviousTag }}...{{ .Tag }}
+    **Full Changelog**: https://github.com/alertint/alertint-agent/compare/v0.13.9...{{ .Tag }}

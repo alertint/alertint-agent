@@ -138,3 +138,25 @@ jobs:
         run: |
           go install github.com/google/go-licenses@latest
           go-licenses check ./... --disallowed_types=forbidden,restricted
+
+  release-scripts:
+    name: release contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.6"
+
+      - name: Test release scripts
+        run: |
+          bash scripts/tests/release-rc-test.sh
+          go test ./scripts/tests
+
+      - name: Validate GoReleaser configurations
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: check .goreleaser.yaml .goreleaser.rc.yaml

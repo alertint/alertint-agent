@@ -245,7 +245,7 @@ func (d *SituationDeliverer) deliverRootSync(ctx context.Context, intent model.N
 		if err != nil {
 			return situation.NotificationDelivery{}, err
 		}
-		return situation.NotificationDelivery{Channel: res.Channel, MessageTS: res.TS, DeliveredAs: "root"}, nil
+		return situation.NotificationDelivery{Channel: res.Channel, MessageTS: res.TS, DeliveredAs: "root", NewRoot: true}, nil
 	}
 	res, err := d.api.UpdateMessage(ctx, slack.UpdateMessageRequest{
 		Channel:     channel,

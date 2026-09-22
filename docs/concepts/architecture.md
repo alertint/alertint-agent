@@ -12,6 +12,10 @@ Everything below runs inside a single `alertint serve` process with local
 SQLite state — one binary, one config file, no external dependencies to
 install.
 
+For an operator-focused view of the complete v0.14 lifecycle, including
+recovery, expected maintenance and retry boundaries, open the standalone
+[Situation workflow](situation-workflow.html).
+
 Two feedback loops close on the triage step, and both are why the same
 condition doesn't get the same wrong answer twice: the **verification round**
 makes each analysis falsify its own draft before the finding persists, and an
@@ -115,22 +119,14 @@ here too: storm collapse, known-issue short-circuits, and prompt selection.
 Every correlated delivery also feeds a **Situation** — a durable record
 that owns one or more Incidents under one exact group key across restarts,
 so a fresh firing of the same group finds its durable history waiting
-rather than starting from nothing. In a released binary nothing closes a
-Situation: a group's Situation stays active indefinitely and keeps owning
-that group's later Incidents, so a re-fire after a prior resolution feeds
-the same Situation (or collapses into the judged Incident as an
-occurrence). The episode-boundary machinery — a closed Situation refusing
-new work, a fresh linked Situation opening in its place — is enforced at
-the storage layer there and becomes observable on the `state-controller`
-branch, where the controller does terminate an episode (recovered, or
-closed with uncertainty once the lifecycle-observation deadline expires)
-and a later firing opens a fresh linked Situation.
+rather than starting from nothing. In v0.14, the controller can terminate
+an episode as recovered, or close it with uncertainty once the lifecycle
+observation deadline expires. A terminal Situation refuses new work; a
+later firing opens a fresh Situation linked to the prior episode.
 
-**Honest status:** the durable Situation foundation *and* a fenced
-Situation controller are real, integration-tested work landing on the
-`state-controller` integration branch — not yet the `main`-branch default a
-released binary runs. On that branch: local Store facts (durability,
-correlation, exact-group grouping) are wired end to end, and so is the
+The durable Situation foundation and fenced Situation controller are wired
+end to end in the v0.14 release line. Local Store facts (durability,
+correlation, exact-group grouping) feed the
 "B+" Acute Triage gate — every ready Incident is durably `awaiting_decision`
 until the controller's own fenced cycle requests, skips, or leaves it
 parked, and only a requested decision ever dispatches the triage skill (see
@@ -139,7 +135,7 @@ cycle derives one authoritative Assessment (material facts, an
 operator-facing Attention level, and a bounded action contract) and is
 visible read-only through MCP (`alertint_list_situations`,
 `alertint_get_situation`) once it has run at least once for a Situation.
-Also on that branch, every authoritative material change now commits one
+Every authoritative material change commits one
 **immutable Transition** and one version of a **current Episode summary** in
 the same fenced transaction as the state it describes, together with every
 notification intent that change warrants — and the Situation delivery worker
@@ -150,7 +146,7 @@ Slack presents one Situation root plus an immutable ordered journal instead
 (see [Slack](../notifications/slack.md#situation-owned-slack)). The two
 `AlertINT system` installation messages — LLM dependency health and
 Slack-delivery-gap recovery — are the only sanctioned exceptions.
-**Also on that branch:** before each reconcile cycle derives its Assessment,
+Before each reconcile cycle derives its Assessment,
 a fenced **evidence-preparation** pass plans and executes a bounded set of
 read-only capability checks — the same seven-capability catalog Phase 1's
 evidence pack draws from (local prior-Situation state, Prometheus, Loki,
@@ -204,10 +200,10 @@ longer block closure — derived from the Situation's own duration class, so
 a long-running Situation is never closed out just because one source has
 gone quiet.
 
-**Not yet wired, even on `state-controller`:** durable Assessment/Triage
-artifacts beyond the bounded recent-attempt history, operator questions or
-judgments, expected-behaviour envelopes, and the final v0.14 cutover that
-would make this the only grouping/dispatch path.
+Operator expected-until judgments and reusable expected schedules are
+versioned, auditable Situation records controlled through MCP. They can change
+assessment and Slack context, but never source state, investigation work,
+budgets, lifecycle, or recovery.
 Everything in Phase 1 below Correlation — memory, evidence, triage,
 verification — still runs keyed off the Incident, unaffected by which
 Situation an Incident belongs to. There is no `state_controller_mode`,
@@ -217,7 +213,8 @@ grouping/dispatch path, and one Slack writer, at a time.
 - **MCP tools:** `alertint_list_situations`, `alertint_get_situation`,
   `alertint_list_situation_transitions`, `alertint_get_delivery_state`,
   `alertint_list_observation_runs`, `alertint_get_semantic_profile`,
-  `alertint_correct_semantic_profile` — see
+  `alertint_correct_semantic_profile`, Situation judgment tools, and expected
+  schedule tools — see
   [MCP clients](../integrations/mcp-clients.md)
 - **Config:** `situations.*`, including `situations.preparation.*` and
   `situations.semantic_profiles.*` — see
@@ -252,18 +249,16 @@ grouping/dispatch path, and one Slack writer, at a time.
 - **stdout:** one `{"kind":"situation.transition",…}` line per committed
   Transition, deduplicated by `transition_id`; it means the change is
   durable, never that Slack has seen it
-- **Not yet:** Assessment/Triage artifacts beyond the bounded recent-attempt
-  history, operator questions or judgments, expected-behaviour envelopes,
-  OpenTelemetry metrics or logs export (traces only today), the final v0.14
-  cutover
+- **Not included:** Assessment/Triage artifacts beyond the bounded
+  recent-attempt history, automatic operator questions, and OpenTelemetry
+  metrics or logs export (traces only today)
 
 ### 4. Memory
 
 Before spending an analysis, **AlertINT** checks whether it has seen this
 condition before. A re-fire of an already-analyzed group key inside the
-collapse horizon attaches as an **occurrence** — no second LLM call; a
-released binary edits the Incident card in place. On the `state-controller`
-branch the attach moves the owning Situation's recurrence count (closed
+collapse horizon attaches as an **occurrence** — no second LLM call. In v0.14
+the attach moves the owning Situation's recurrence count (closed
 predecessors plus its own re-fires): the root shows `recurred ×N`, and a
 crossed milestone rung is one quiet reply in the Situation's thread — never a
 channel message. A genuinely new incident whose key matches a past
@@ -274,8 +269,8 @@ memory](incident-memory.md).
 - **Collapse:** occurrence attach, no LLM call. An escalation trigger
   (severity rise, new alert type, cadence spike, occurrence/time ceiling) is
   durably recorded on the occurrence, but nothing currently acts on it —
-  automatic re-judgment on that trigger is a Situation controller obligation,
-  not yet-shipped behavior. See [incident memory](incident-memory.md#recurrence-collapse).
+  automatic re-judgment on that trigger remains outside this release. See
+  [incident memory](incident-memory.md#recurrence-collapse).
 - **Recall:** distilled prior findings, recurrence count, cadence
 
 ### 5. Evidence pack
@@ -321,14 +316,8 @@ confidence. See [verification round](verification-round.md).
 
 ### 8. Outbound notification
 
-The final finding — the post-verification judgment, not the draft — is
-emitted as one JSON line on stdout and, in a released binary, posted to a
-Slack channel. When all alerts recover, that build updates the original
-Slack message in-place (🔴 → ✅) and posts a short resolution note in the
-thread.
-
-On the `state-controller` branch this Incident-keyed Slack path is removed
-from runtime assembly entirely: the finding still reaches stdout, and Slack
+The final finding — the post-verification judgment, not the draft — reaches
+the durable Situation history and the configured stdout stream. In v0.14 Slack
 is written only by the Situation delivery worker described in
 [3a](#3a-situation-foundation-and-controller) — one root per Situation plus
 an immutable ordered journal, from durable intents that retry indefinitely
@@ -426,8 +415,7 @@ collecting  →  ready  →  processing  →  analyzed
 - `collecting`: window is open, alerts arriving.
 - `ready`: window expired; a durable **triage schedule** — phase, attempt
   count, next-due time, attempt-start time, bounded last-error — is seeded
-  for the incident, one row per incident. On the `state-controller`
-  integration branch (see [Situation foundation and
+  for the incident, one row per incident. In v0.14 (see [Situation foundation and
   controller](#3a-situation-foundation-and-controller) above), that
   schedule starts in phase `awaiting_decision` and only dispatches to the
   triage skill once the owning Situation's controller has recorded a

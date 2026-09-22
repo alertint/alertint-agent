@@ -258,6 +258,55 @@ func TestAppend_RollbackLeavesNoRow(t *testing.T) {
 	_ = fmt.Sprintf("%v", err)
 }
 
+func TestUsageStats_PreservesLegacyAndSituationOperatorCounts(t *testing.T) {
+	a, _, ctx := newAuditor(t)
+	base := time.Date(2026, 9, 22, 10, 0, 0, 0, time.UTC)
+	step := 0
+	a = a.withClock(func() time.Time {
+		ts := base.Add(time.Duration(step) * time.Minute)
+		step++
+		return ts
+	})
+	appendRow := func(actor, kind string, payload any) {
+		t.Helper()
+		if err := a.Append(ctx, actor, kind, payload); err != nil {
+			t.Fatalf("append %s/%s: %v", actor, kind, err)
+		}
+	}
+
+	appendRow("alertmanager", "alert.received", map[string]any{"alert_count": 3})
+	appendRow("llm.anthropic", "llm.response", map[string]any{
+		"model": "claude-x", "input_tokens": 100, "output_tokens": 20,
+	})
+	appendRow("notify.slack", "notify.sent", map[string]any{"event": "firing"})
+	appendRow("situation.notification_worker", "situation.notification.delivered", map[string]any{
+		"effect_class": "root_sync", "new_root": true,
+	})
+	appendRow("situation.notification_worker", "situation.notification.delivered", map[string]any{
+		"effect_class": "root_sync", "new_root": false,
+	})
+	appendRow("situation.controller", "situation.notification.withheld", map[string]any{"main_channel_poke": true})
+	appendRow("skill:acute-triage", "incident.analyzed", nil)
+	appendRow("correlator", "incident.triage_exhausted", nil)
+
+	got, err := a.UsageStats(ctx, base, base.Add(20*time.Minute))
+	if err != nil {
+		t.Fatalf("UsageStats: %v", err)
+	}
+	if got.AlertDeliveries != 1 || got.AlertsReceived != 3 {
+		t.Errorf("alerts = deliveries:%d received:%d, want 1/3", got.AlertDeliveries, got.AlertsReceived)
+	}
+	if got.LLMCalls != 1 || got.LLMInputTokens != 100 || got.LLMOutputTokens != 20 {
+		t.Errorf("llm = calls:%d input:%d output:%d", got.LLMCalls, got.LLMInputTokens, got.LLMOutputTokens)
+	}
+	if got.SlackCardsPosted != 2 || got.SlackSkipped != 1 {
+		t.Errorf("slack = cards:%d skipped:%d, want 2/1", got.SlackCardsPosted, got.SlackSkipped)
+	}
+	if got.IncidentsAnalyzed != 1 || got.IncidentsTriageExhausted != 1 {
+		t.Errorf("incidents = analyzed:%d exhausted:%d, want 1/1", got.IncidentsAnalyzed, got.IncidentsTriageExhausted)
+	}
+}
+
 // ----------------------------------------------------------------------
 // Plan 3 Task 9: the Situation history/delivery event catalog
 // ----------------------------------------------------------------------

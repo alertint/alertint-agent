@@ -585,6 +585,16 @@ func (c *Correlator) ApplyDelivery(ctx context.Context, claim store.AlertDispatc
 // recurrence-collapse branches in that order, falling back to a fresh
 // Incident only when none of them claims the delivery.
 func (c *Correlator) applyDeliveryPlan(ctx context.Context, claim store.AlertDispatch, a store.Alert, gk string, overrideMiss bool) error {
+	if a.Status == "resolved" {
+		handled, err := c.applyResolvedMembershipDeliveryPlan(ctx, claim, a)
+		if err != nil {
+			return err
+		}
+		if handled {
+			return nil
+		}
+	}
+
 	inc, err := c.st.GetCollectingIncident(ctx, gk)
 	if err != nil && err != store.ErrNotFound {
 		return fmt.Errorf("correlator: get collecting incident for delivery: %w", err)
@@ -629,6 +639,36 @@ func (c *Correlator) applyDeliveryPlan(ctx context.Context, claim store.AlertDis
 		return fmt.Errorf("correlator: apply delivery to incident: %w", err)
 	}
 	return nil
+}
+
+// applyResolvedMembershipDeliveryPlan routes a recovery through the newest
+// nonterminal Incident that already contains its Alert. The immutable
+// delivery ledger has one owner, so the current membership wins before any
+// group-key fallback can attach the recovery to an unrelated open window.
+func (c *Correlator) applyResolvedMembershipDeliveryPlan(ctx context.Context, claim store.AlertDispatch, a store.Alert) (bool, error) {
+	inc, err := c.st.GetCurrentIncidentByAlertID(ctx, a.ID)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("correlator: get current incident membership for resolved delivery: %w", err)
+	}
+	result, err := c.applyExistingIncidentDeliveryPlan(ctx, claim, *inc, "membership_changed", true)
+	if errors.Is(err, store.ErrIncidentOwnerNotCollapsible) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("correlator: apply resolved membership delivery: %w", err)
+	}
+	c.logger.Info("correlator: resolved delivery routed through membership",
+		"incident_id", result.Incident.ID, "delivery_id", claim.Delivery.ID,
+		"alert_id", a.ID, "group_key", result.Incident.GroupKey, "status", result.Incident.Status)
+	if result.Resolved && c.resolutionNotifier != nil {
+		if notifyErr := c.resolutionNotifier.OnIncidentResolved(ctx, *inc); notifyErr != nil {
+			c.logger.Warn("correlator: resolution notify failed", "incident_id", result.Incident.ID, "err", notifyErr)
+		}
+	}
+	return true, nil
 }
 
 // applyExistingIncidentDeliveryPlan attaches a delivery to an Incident the

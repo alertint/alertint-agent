@@ -72,6 +72,10 @@ type NotificationDelivery struct {
 	Channel     string
 	MessageTS   string
 	DeliveredAs string // root | thread | broadcast | delayed_thread | system
+	// NewRoot is true only when this delivery posted a new top-level Situation
+	// card. Root edits keep it false so usage accounting measures operator
+	// interruptions rather than projection refreshes.
+	NewRoot bool
 }
 
 // SlackDeliveryState is the bounded installation-level Slack delivery health
@@ -860,6 +864,7 @@ func (w *NotificationWorker) acknowledgeDelivered(ctx context.Context, claim Not
 		payload["delivered_as"] = delivery.DeliveredAs
 		payload["channel"] = delivery.Channel
 		payload["message_ts"] = delivery.MessageTS
+		payload["new_root"] = delivery.NewRoot
 		w.auditAppend(ctx, auditKindNotificationDelivered, payload)
 		w.logger.Info("situation: notification delivered",
 			append([]any{"intent_id", claim.Intent.ID, "effect_class", string(claim.Intent.EffectClass),

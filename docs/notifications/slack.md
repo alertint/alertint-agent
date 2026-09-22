@@ -8,15 +8,15 @@ slug: "slack"
 
 # Slack
 
-**AlertINT** posts to one Slack channel over the bot-token Web API. What it
-posts depends on which build you run:
+**AlertINT** posts to one Slack channel over the bot-token Web API. The
+presentation changed in v0.14:
 
 | Build | What Slack shows | Written by |
 |---|---|---|
-| Released binary (from `main`) | One **Incident card** per analyzed incident, edited in place on resolve, with a thread for detail | the Incident notification path |
-| `state-controller` integration branch | One **Situation root** per Situation, edited in place, with an immutable ordered journal thread | the Situation delivery worker — the *only* Slack writer on that branch |
+| v0.13.x | One **Incident card** per analyzed incident, edited in place on resolve, with a thread for detail | the legacy Incident notification path |
+| v0.14 | One **Situation root** per Situation, edited in place, with an immutable ordered journal thread | the Situation delivery worker — the only per-Situation Slack writer |
 
-On the integration branch the Incident-keyed card, its resolve edit, and its
+In v0.14 the Incident-keyed card, its resolve edit, and its
 recurrence replies are **gone**: runtime assembly no longer wires any
 Incident-shaped Slack call at all. The two exceptions are installation-level
 `AlertINT system` messages, described at the end of this page.
@@ -70,8 +70,7 @@ incident to a teammate scrolling past.
 
 ## Situation-owned Slack
 
-**Integration-branch behaviour, not yet the `main`-branch default.** This is
-what a binary built from the `state-controller` branch posts. See
+This is the v0.14 Slack contract. See
 [Architecture: Situation foundation and
 controller](../concepts/architecture.md#3a-situation-foundation-and-controller)
 for where it sits in the pipeline.
@@ -307,9 +306,8 @@ and the transition ID is the stable identity to key on.
 
 ## Incident cards
 
-**Released-binary behaviour (builds from `main`).** On the integration branch
-this whole surface is removed; everything below is what a released binary
-does today.
+**Legacy v0.13.x behavior.** This whole surface is removed in v0.14; the
+details below remain for operators comparing an upgrade.
 
 When an incident fires, **AlertINT** posts a brief main-channel message (name
 + root cause) and immediately posts the full analysis — severity, confidence,
@@ -418,7 +416,7 @@ notify:
 - `off` — recurrence never posts replies; the card's occurrence count still
   updates in place, silently.
 
-On the `state-controller` branch recurrence is owned by the Situation. A
+In v0.14 recurrence is owned by the Situation. A
 Situation's recurrence count is the number of *closed* Situations that
 preceded it in the same group **plus** every re-fire that attached to one of
 its member incidents as an occurrence, so the count moves while the Situation
@@ -429,7 +427,7 @@ records a `recurrence_milestone` Transition, edits its root, and — under
 root edit still happens and no reply is posted. A milestone never re-pages
 the channel, and a quiet Situation (one that never published) has no Slack
 recurrence trace at all. The `why:` real-world-change replies above are a
-released-binary feature; on this branch a real-world change reaches Slack as
+v0.13.x feature; in v0.14 a real-world change reaches Slack as
 the material Transition it is (a severity rise raises Attention, a new
 symptom changes the assessment), not as a recurrence reply.
 
