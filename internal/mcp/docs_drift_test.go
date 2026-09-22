@@ -109,6 +109,8 @@ func TestDriftGate_ToolsDocumented(t *testing.T) {
 	addTool(t33.Name)
 	t34, _ := s.toolListExpectedBehaviorHistory()
 	addTool(t34.Name)
+	t35, _ := s.toolUsageStats()
+	addTool(t35.Name)
 
 	documented := documentedToolNames(t)
 

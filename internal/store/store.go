@@ -549,6 +549,32 @@ func (s *Store) GetRecentIncidentByGroupKey(ctx context.Context, groupKey string
 	return scanIncidentFull(row)
 }
 
+// GetCurrentIncidentByAlertID returns the newest nonterminal Incident that
+// already contains alertID. Resolution deliveries use this membership before
+// group-key routing so an unrelated collecting Incident cannot claim them.
+// A terminal Situation is excluded even when its legacy Incident row was not
+// moved to a terminal status; terminal episodes never accept later input.
+func (s *Store) GetCurrentIncidentByAlertID(ctx context.Context, alertID string) (*Incident, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT i.id, i.group_key, i.status,
+		       i.first_alert_at, i.last_alert_at, i.ready_at, i.alert_count,
+		       COALESCE(i.summary,''), COALESCE(i.root_cause,''),
+		       COALESCE(i.confidence,0.0), COALESCE(i.output_json,''),
+		       COALESCE(i.enrichment_json,''),
+		       i.created_at, i.updated_at, i.last_judged_at
+		FROM incidents i
+		JOIN incident_alerts ia ON ia.incident_id = i.id
+		LEFT JOIN situation_incidents si ON si.incident_id = i.id
+		LEFT JOIN situations s ON s.id = si.situation_id
+		WHERE ia.alert_id = ?
+		  AND i.status NOT IN ('resolved', 'failed')
+		  AND (s.id IS NULL OR s.lifecycle NOT IN ('recovered', 'closed_unknown'))
+		ORDER BY i.created_at DESC, i.id DESC
+		LIMIT 1
+	`, alertID)
+	return scanIncidentFull(row)
+}
+
 // MarkIncidentReady transitions an incident from "collecting" to
 // "ready". Returns ErrNotFound if no such collecting incident exists.
 func (s *Store) MarkIncidentReady(ctx context.Context, incidentID string) error {

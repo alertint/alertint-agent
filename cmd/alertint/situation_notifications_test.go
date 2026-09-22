@@ -321,7 +321,7 @@ func TestSituationDelivererRootSyncPostsFirstRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Deliver() error = %v", err)
 	}
-	if got != (situation.NotificationDelivery{Channel: "C-root", MessageTS: "100.1", DeliveredAs: "root"}) {
+	if got != (situation.NotificationDelivery{Channel: "C-root", MessageTS: "100.1", DeliveredAs: "root", NewRoot: true}) {
 		t.Fatalf("Deliver() = %+v, want the posted root coordinates", got)
 	}
 	if len(api.posts) != 1 || len(api.updates) != 0 {
@@ -359,7 +359,7 @@ func TestSituationDelivererRootSyncUpdatesExistingRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Deliver() error = %v", err)
 	}
-	if got.DeliveredAs != "root" || got.Channel != "C-existing" || got.MessageTS != "50.5" {
+	if got.DeliveredAs != "root" || got.Channel != "C-existing" || got.MessageTS != "50.5" || got.NewRoot {
 		t.Fatalf("Deliver() = %+v, want the existing root's own coordinates echoed back", got)
 	}
 	if len(api.updates) != 1 || len(api.posts) != 0 {

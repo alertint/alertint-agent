@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -183,6 +184,193 @@ func (a *Auditor) Verify(ctx context.Context) (*VerifyReport, error) {
 		return nil, fmt.Errorf("audit: iterate rows: %w", err)
 	}
 	return report, nil
+}
+
+// UsageStats is the stable operational summary exposed by
+// alertint_usage_stats over the half-open window [Since, Until). All values
+// come from append-only audit history rather than mutable projections.
+type UsageStats struct {
+	Since, Until time.Time
+
+	AlertDeliveries int
+	AlertsReceived  int
+
+	LLMCalls               int
+	LLMInputTokens         int64
+	LLMOutputTokens        int64
+	LLMCacheCreationTokens int64
+	LLMCacheReadTokens     int64
+	LLMByModel             []ModelUsage
+
+	SlackCardsPosted int
+	SlackSkipped     int
+
+	IncidentsAnalyzed        int
+	IncidentsTriageExhausted int
+}
+
+// ModelUsage is one provider/model breakdown within UsageStats.
+type ModelUsage struct {
+	Provider            string `json:"provider"`
+	Model               string `json:"model"`
+	Calls               int    `json:"calls"`
+	InputTokens         int64  `json:"input_tokens"`
+	OutputTokens        int64  `json:"output_tokens"`
+	CacheCreationTokens int64  `json:"cache_creation_tokens"`
+	CacheReadTokens     int64  `json:"cache_read_tokens"`
+}
+
+// UsageStats aggregates operational counters from the audit log. It accepts
+// both the pre-Situation Slack audit vocabulary and the current Situation
+// notification ledger so upgrades preserve the full requested window.
+func (a *Auditor) UsageStats(ctx context.Context, since, until time.Time) (UsageStats, error) {
+	out := UsageStats{Since: since.UTC(), Until: until.UTC()}
+	w := tsWindow(since, until)
+	if err := a.scanUsageCounts(ctx, w, &out); err != nil {
+		return UsageStats{}, err
+	}
+	if err := a.scanIntakeAndSlack(ctx, w, &out); err != nil {
+		return UsageStats{}, err
+	}
+	if err := a.scanLLMUsage(ctx, w, &out); err != nil {
+		return UsageStats{}, err
+	}
+	return out, nil
+}
+
+type tsWindowPred struct {
+	sql  string
+	args []any
+}
+
+const tsNormalizedCol = `(substr(ts, 1, 19) || '.' || substr(ltrim(rtrim(substr(ts, 20), 'Z'), '.') || '000000000', 1, 9))`
+
+func tsWindow(since, until time.Time) tsWindowPred {
+	const exactLayout = "2006-01-02T15:04:05.000000000"
+	const coarseLayout = "2006-01-02T15:04:05"
+	since, until = since.UTC(), until.UTC()
+	return tsWindowPred{
+		sql: `ts >= ? AND ts < ? AND ` + tsNormalizedCol + ` >= ? AND ` + tsNormalizedCol + ` < ?`,
+		args: []any{
+			since.Truncate(time.Second).Format(coarseLayout),
+			until.Truncate(time.Second).Add(time.Second).Format(coarseLayout),
+			since.Format(exactLayout), until.Format(exactLayout),
+		},
+	}
+}
+
+func (a *Auditor) scanUsageCounts(ctx context.Context, w tsWindowPred, out *UsageStats) error {
+	rows, err := a.db.QueryContext(ctx, `
+		SELECT actor, kind, COUNT(*) FROM audit_log
+		WHERE `+w.sql+` GROUP BY actor, kind`, w.args...)
+	if err != nil {
+		return fmt.Errorf("audit: usage stats counts: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var actor, kind string
+		var n int
+		if err := rows.Scan(&actor, &kind, &n); err != nil {
+			return fmt.Errorf("audit: usage stats scan: %w", err)
+		}
+		switch {
+		case actor == "notify.slack" && kind == "notify.skipped":
+			out.SlackSkipped += n
+		case kind == "incident.analyzed":
+			out.IncidentsAnalyzed = n
+		case kind == "incident.triage_exhausted":
+			out.IncidentsTriageExhausted = n
+		}
+	}
+	return rows.Err()
+}
+
+func (a *Auditor) scanIntakeAndSlack(ctx context.Context, w tsWindowPred, out *UsageStats) error {
+	if err := a.db.QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(SUM(COALESCE(json_extract(payload_json, '$.alert_count'), 1)), 0)
+		FROM audit_log WHERE kind = 'alert.received' AND `+w.sql, w.args...).
+		Scan(&out.AlertDeliveries, &out.AlertsReceived); err != nil {
+		return fmt.Errorf("audit: usage stats alert intake: %w", err)
+	}
+	if err := a.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM audit_log
+		WHERE kind IN ('notify.sent', 'situation.notification.delivered')
+		  AND ((actor = 'notify.slack' AND kind = 'notify.sent'
+		        AND COALESCE(json_extract(payload_json, '$.new_card'), json_extract(payload_json, '$.event') = 'firing') = 1)
+		       OR (kind = 'situation.notification.delivered'
+		           AND json_extract(payload_json, '$.effect_class') = 'root_sync'
+		           AND json_extract(payload_json, '$.new_root') = 1))
+		  AND `+w.sql, w.args...).Scan(&out.SlackCardsPosted); err != nil {
+		return fmt.Errorf("audit: usage stats slack cards: %w", err)
+	}
+	var situationWithheld int
+	if err := a.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM audit_log
+		WHERE kind = 'situation.notification.withheld'
+		  AND json_extract(payload_json, '$.main_channel_poke') = 1
+		  AND `+w.sql, w.args...).Scan(&situationWithheld); err != nil {
+		return fmt.Errorf("audit: usage stats withheld notifications: %w", err)
+	}
+	out.SlackSkipped += situationWithheld
+	return nil
+}
+
+type llmResponsePayload struct {
+	Model                    string `json:"model"`
+	InputTokens              int64  `json:"input_tokens"`
+	OutputTokens             int64  `json:"output_tokens"`
+	CacheCreationInputTokens int64  `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int64  `json:"cache_read_input_tokens"`
+}
+
+func (a *Auditor) scanLLMUsage(ctx context.Context, w tsWindowPred, out *UsageStats) error {
+	rows, err := a.db.QueryContext(ctx, `
+		SELECT actor, payload_json FROM audit_log
+		WHERE kind = 'llm.response' AND `+w.sql, w.args...)
+	if err != nil {
+		return fmt.Errorf("audit: usage stats llm scan: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	byModel := map[[2]string]*ModelUsage{}
+	for rows.Next() {
+		var actor, payload string
+		if err := rows.Scan(&actor, &payload); err != nil {
+			return fmt.Errorf("audit: usage stats llm row scan: %w", err)
+		}
+		var p llmResponsePayload
+		if err := json.Unmarshal([]byte(payload), &p); err != nil {
+			continue
+		}
+		out.LLMCalls++
+		out.LLMInputTokens += p.InputTokens
+		out.LLMOutputTokens += p.OutputTokens
+		out.LLMCacheCreationTokens += p.CacheCreationInputTokens
+		out.LLMCacheReadTokens += p.CacheReadInputTokens
+		key := [2]string{actor, p.Model}
+		row := byModel[key]
+		if row == nil {
+			row = &ModelUsage{Provider: actor, Model: p.Model}
+			byModel[key] = row
+		}
+		row.Calls++
+		row.InputTokens += p.InputTokens
+		row.OutputTokens += p.OutputTokens
+		row.CacheCreationTokens += p.CacheCreationInputTokens
+		row.CacheReadTokens += p.CacheReadInputTokens
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("audit: usage stats llm iterate: %w", err)
+	}
+	for _, row := range byModel {
+		out.LLMByModel = append(out.LLMByModel, *row)
+	}
+	sort.Slice(out.LLMByModel, func(i, j int) bool {
+		if out.LLMByModel[i].Provider != out.LLMByModel[j].Provider {
+			return out.LLMByModel[i].Provider < out.LLMByModel[j].Provider
+		}
+		return out.LLMByModel[i].Model < out.LLMByModel[j].Model
+	})
+	return nil
 }
 
 // computeHash returns the hex-encoded SHA-256 of the chained input.

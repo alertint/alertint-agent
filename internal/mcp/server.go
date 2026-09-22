@@ -101,6 +101,7 @@ func NewServer(cfg Config, st *store.Store, auditor *audit.Auditor) *Server {
 	ms.AddTool(s.toolSearchAlerts())
 	ms.AddTool(s.toolGetEvidencePack())
 	ms.AddTool(s.toolVerifyAudit())
+	ms.AddTool(s.toolUsageStats())
 	ms.AddTool(s.toolPrometheusQuery())
 	ms.AddTool(s.toolPrometheusQueryRange())
 	ms.AddTool(s.toolIncidentAnnotate())
@@ -276,6 +277,17 @@ func (s *Server) toolVerifyAudit() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 			"Returns the number of rows checked and whether the chain is intact."),
 	)
 	return tool, s.handleVerifyAudit
+}
+
+func (s *Server) toolUsageStats() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
+	tool := mcplib.NewTool("alertint_usage_stats",
+		mcplib.WithDescription("Operational usage summary over a time window: alert deliveries and alerts received, "+
+			"LLM call/token volume (with a per-model breakdown), new Slack Situation cards and withheld channel pokes, "+
+			"incident analyses completed and triage exhaustions. Aggregated from the audit log; read-only."),
+		mcplib.WithString("since", mcplib.Description("Window start (RFC3339). Defaults to 24h before now.")),
+		mcplib.WithString("until", mcplib.Description("Window end (RFC3339). Defaults to now.")),
+	)
+	return tool, s.handleUsageStats
 }
 
 // -----------------------------------------------------------------------------
@@ -726,6 +738,52 @@ func (s *Server) handleVerifyAudit(ctx context.Context, _ mcplib.CallToolRequest
 	result, err := mcplib.NewToolResultJSON(resp)
 	if err != nil {
 		return errResult("failed to serialize audit result: " + err.Error()), nil
+	}
+	return result, nil
+}
+
+func (s *Server) handleUsageStats(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	now := s.now().UTC()
+	until := now
+	since := now.Add(-24 * time.Hour)
+	if raw := mcplib.ParseString(req, "since", ""); raw != "" {
+		parsed, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return errResult("invalid since: must be RFC3339 (e.g. 2026-06-05T14:00:00Z)"), nil
+		}
+		since = parsed
+	}
+	if raw := mcplib.ParseString(req, "until", ""); raw != "" {
+		parsed, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return errResult("invalid until: must be RFC3339"), nil
+		}
+		until = parsed
+	}
+	if !since.Before(until) {
+		return errResult("since must be before until"), nil
+	}
+	stats, err := s.auditor.UsageStats(ctx, since, until)
+	if err != nil {
+		return errResult("failed to aggregate usage stats: " + err.Error()), nil
+	}
+
+	payload := map[string]any{
+		"window": map[string]any{"since": since, "until": until},
+		"alerts": map[string]any{"deliveries": stats.AlertDeliveries, "received": stats.AlertsReceived},
+		"llm": map[string]any{
+			"calls": stats.LLMCalls, "input_tokens": stats.LLMInputTokens, "output_tokens": stats.LLMOutputTokens,
+			"cache_creation_tokens": stats.LLMCacheCreationTokens, "cache_read_tokens": stats.LLMCacheReadTokens,
+			"by_model": stats.LLMByModel,
+		},
+		"slack": map[string]any{"cards_posted": stats.SlackCardsPosted, "skipped": stats.SlackSkipped},
+		"incidents": map[string]any{
+			"analyzed": stats.IncidentsAnalyzed, "triage_exhausted": stats.IncidentsTriageExhausted,
+		},
+	}
+	result, err := mcplib.NewToolResultJSON(payload)
+	if err != nil {
+		return errResult("failed to serialize usage stats: " + err.Error()), nil
 	}
 	return result, nil
 }

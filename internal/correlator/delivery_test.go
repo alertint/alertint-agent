@@ -518,6 +518,41 @@ func TestApplyDelivery_ResolvedDeliveryResolvesIncidentAndNotifies(t *testing.T)
 	}
 }
 
+func TestApplyDelivery_ResolvedMemberRoutesBeforeUnrelatedCollectingIncident(t *testing.T) {
+	st := openStore(t)
+	c := New(Config{}, st, NopIncidentSink{}, nil)
+	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+
+	target := firingAlert("fp-target", "DiskFull", "warning", now.Add(-time.Hour), false)
+	seedJudged(t, st, "inc_target", "analyzed", now.Add(-time.Hour), now.Add(-50*time.Minute), target)
+
+	unrelated := firingAlert("fp-unrelated", "HighLatency", "warning", now.Add(-5*time.Minute), false)
+	seedJudged(t, st, "inc_collecting", "analyzed", now.Add(-5*time.Minute), now.Add(-4*time.Minute), unrelated)
+	if _, err := st.DB().ExecContext(context.Background(), `UPDATE incidents SET status = 'collecting' WHERE id = 'inc_collecting'`); err != nil {
+		t.Fatalf("make unrelated incident collecting: %v", err)
+	}
+
+	claim := claimOneDelivery(t, st, deliveryInputFor("d1", "fp-target", gkAPI, "resolved", now), now)
+	if err := c.ApplyDelivery(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+
+	resolved, err := st.GetIncidentByID(context.Background(), "inc_target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Status != "resolved" {
+		t.Fatalf("target incident status = %q, want resolved", resolved.Status)
+	}
+	collecting, err := st.GetIncidentByID(context.Background(), "inc_collecting")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if collecting.Status != "collecting" || collecting.AlertCount != 1 {
+		t.Fatalf("unrelated collecting incident = %+v, want collecting with one member", collecting)
+	}
+}
+
 func TestApplyDelivery_ResolvedDeliveryWithNoPriorIncidentOpensFresh(t *testing.T) {
 	st := openStore(t)
 	c := New(Config{}, st, NopIncidentSink{}, nil)

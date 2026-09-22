@@ -8,6 +8,10 @@ slug: "mcp-clients"
 
 # MCP clients
 
+The standalone [Situation workflow](../concepts/situation-workflow.html)
+shows how MCP records relate to durable intake, Slack, recovery, and expected
+maintenance in v0.14.
+
 **AlertINT** runs a persistent MCP Streamable HTTP server on port 9912,
 started inside `alertint serve` whenever the `ALERTINT_MCP_TOKEN` env var
 is set (presence-based; `mcp.enabled: false` forces it off). Any MCP-capable
@@ -135,6 +139,7 @@ restart Windsurf and check **Settings → MCP Servers**:
 | `alertint_search_alerts` | Search raw alerts by label key and value. |
 | `alertint_get_evidence_pack` | Get the evidence pack and Prometheus metrics for an incident. |
 | `alertint_verify_audit` | Verify the hash-chained audit log and report any tampering. |
+| `alertint_usage_stats` | Summarize alert intake, LLM tokens, new Slack Situation cards, withheld channel pokes, completed analyses, and triage exhaustion over a time window. |
 | `alertint_list_situations` | List durable Situations — the exact-group lineage that durably owns one or more Incidents — most recently updated first. A bounded summary: lifecycle/attention/scheduling fields and due reasons only, no Assessment or controller detail (use `alertint_get_situation` for that) and no Slack presence. |
 | `alertint_get_situation` | Get one Situation by id or public handle, including controller state, current `input_version`, `judgment_version`, and `active_judgment`. Expired, withdrawn, invalidated, urgent, or terminal judgments return `active_judgment: null` with their typed `judgment_applicability`; immutable history remains available separately. Also carries the current Episode summary, Slack delivery state, and post-closure artifacts. |
 | `alertint_list_situation_transitions` | Page one Situation's immutable Transition journal, oldest first. Each Transition is one authoritative material change: lifecycle/attention, operator contract, transition reason, journal kind and bounded journal entry, evidence references, actor, and drill marker. History is never reconstructed from current state — a Situation with no Transition yet returns an empty array. Page with the returned `next_cursor`, a stable `(sequence, id)` position rather than an offset. |
@@ -143,14 +148,14 @@ restart Windsurf and check **Settings → MCP Servers**:
 | `alertint_revoke_situation_expected` | Withdraw current expectedness. Monitoring and lifecycle continue; normal assessment resumes. |
 | `alertint_restore_situation_expected` | Explicitly restore a withdrawn judgment against fresh current facts and a new future deadline. It never silently revives an older revision. |
 | `alertint_list_situation_judgments` | Page one Situation's immutable judgment revision history, oldest first. Continue with the returned `next_cursor.revision` as `cursor_revision`. Historical rows are not current authority; use `alertint_get_situation` for that. |
-| `alertint_expected_behavior_prepare` | Prepare fresh exact Zabbix current-state proof for proposed required, allowed, and forbidden bindings. Preparation creates no authority. |
+| `alertint_expected_behavior_prepare` | Prepare fresh exact Zabbix or Alertmanager current-state proof for proposed required, allowed, and forbidden bindings. Preparation creates no authority. |
 | `alertint_get_expected_behavior_validation` | Read one prepared binding-validation request and its current pending, ready, stale, or unavailable result. |
-| `alertint_expected_behavior_confirm` | Promote one explicitly confirmed Situation judgment into a reusable Zabbix expected schedule. Requires exact source scope/version, a bounded schedule and duration, review date, current Situation version, and optional prepared binding proof. |
+| `alertint_expected_behavior_confirm` | Promote one explicitly confirmed Situation judgment into a reusable expected schedule. Requires exact source scope/version, a bounded schedule and duration, review date, current Situation version, and optional prepared binding proof. |
 | `alertint_expected_behavior_replace` | Replace an existing reusable expected schedule under an optimistic envelope-version check. |
 | `alertint_expected_behavior_revoke` | Withdraw a reusable expected schedule. Monitoring and source-owned recovery continue. |
 | `alertint_expected_behavior_restore` | Restore a withdrawn schedule as a new, freshly proven revision; it does not silently revive old authority. |
 | `alertint_get_expected_behavior` | Read one schedule's current active, withdrawn, or invalidated head. |
-| `alertint_list_expected_behaviors` | List current schedule heads, optionally filtered by exact group, Zabbix installation, trigger, and active state. |
+| `alertint_list_expected_behaviors` | List current schedule heads, optionally filtered by exact group, source installation, rule, and active state. |
 | `alertint_list_expected_behavior_history` | Page one schedule's immutable operator revision history oldest first. |
 | `alertint_get_delivery_state` | Get the installation-level Situation Slack delivery state: the continuous-failure window, the durable Slack configuration generation and how many effects are blocked on it, the current Delivery-gap generation with its status/age and replay backlog, retries and outcomes by effect class, how many outcomes Slack never confirmed either way, and the stdout Transition-stream backlog. Bounded counts and closed codes only — never a token, a Slack response, or a provider error body. |
 | `alertint_list_observation_runs` | Page one Situation's bounded evidence-preparation runs, oldest first: each capability read's immutable result status, coverage, and normalized facts — or an explicit `detail_state: "expired"` once its 10-day unused-detail retention window has passed, never a fabricated or reconstructed value. Page with `next_cursor`. Never returns a raw connector request, provider response, or claim owner/token. |
@@ -162,8 +167,47 @@ restart Windsurf and check **Settings → MCP Servers**:
 | `alertint_recent_changes` | List recent deploys/releases/PRs matching a label selector (requires change enrichment enabled). |
 | `sentry_issues_list` | List live, distilled Sentry issues for a project (+ optional environment) by status (`unresolved`/`resolved`/`ignored`); requires the Sentry Error source enabled. |
 | `sentry_issues_trace` | Return full distilled stacktraces (`file:line`, function, `in_app`) for up to 10 Sentry issue ids; requires the Sentry Error source enabled. |
-| `alertint_incident_annotate` | Attach a permanent, age-stamped operator note to an incident — context for the next investigator; never affects triage or memory recall. On the `state-controller` branch it is also journalled, attributed to the operator, into the owning Situation's Slack thread in the same transaction — as recorded context, never as a change to the assessment, the attention level, or publication authority, and never as proof that anyone touched the operated system. |
-| `alertint_incident_capture_verdict` | Capture an operator-confirmed correction or confirmation as a replayable, graded record. A correction steers the next triage of its failure group (tested against live evidence, ruling-gated — never blended in) and demotes the corrected prior from strong recall; a confirmation retires steering. On the `state-controller` branch it is separately attributed in the owning Situation's journal and keeps exactly the authority it already had — no more. |
+| `alertint_incident_annotate` | Attach a permanent, age-stamped operator note to an incident — context for the next investigator; never affects triage or memory recall. In v0.14 it is also journalled, attributed to the operator, into the owning Situation's Slack thread in the same transaction — as recorded context, never as a change to the assessment, the attention level, or publication authority, and never as proof that anyone touched the operated system. |
+| `alertint_incident_capture_verdict` | Capture an operator-confirmed correction or confirmation as a replayable, graded record. A correction steers the next triage of its failure group (tested against live evidence, ruling-gated — never blended in) and demotes the corrected prior from strong recall; a confirmation retires steering. In v0.14 it is separately attributed in the owning Situation's journal and keeps exactly the authority it already had — no more. |
+
+## Explain a Situation from records
+
+Start with current state, then read history. This keeps an agent from using
+today's configuration to invent what was true earlier.
+
+```json
+alertint_get_situation {"handle":"SIT-2026-0142"}
+alertint_list_situation_transitions {"situation_id":"sit-0142"}
+alertint_list_observation_runs {"situation_id":"sit-0142"}
+alertint_get_delivery_state {}
+alertint_list_expected_behavior_history {"envelope_id":"env-nightly-payments"}
+```
+
+For the question **“Why did this stop being expected, and why has it not
+recovered?”**, a grounded answer should look like this:
+
+> The Situation is currently **Active / Monitoring**. Expected schedule
+> `env-nightly-payments` version 3 stopped applying at `2026-09-22T22:41:08Z`.
+> Transition `tr-0187` records reason `source_identity_or_version_changed`,
+> and observation run `obs-0441` records the newly proven source rule version.
+> It has not recovered because alert delivery `del-9921` still records one
+> member firing at `2026-09-22T22:42:03Z`; recovery grace therefore has not
+> started. Slack delivery is healthy according to the current installation
+> delivery state.
+
+The identifiers and times above are illustrative; use the returned records in
+the actual answer. Separate these parts explicitly:
+
+- **Current state:** lifecycle, attention, current source state, current
+  judgment/schedule applicability, and the recorded next checkpoint.
+- **Historical decision:** the immutable transition or schedule-history row
+  that states what changed, when, who acted, and the typed reason.
+- **Evidence:** the observation or delivery record supporting the conclusion,
+  including whether it succeeded, was empty, unavailable, unsupported, stale,
+  or expired.
+- **Missing history:** say “AlertINT has no recorded transition/schedule
+  history for that claim.” Do not reconstruct a past rule version or reason
+  from current configuration.
 
 Both feedback writes land whether or not a Situation currently owns the
 incident. With **no current owner** — none was ever assigned, or the owner
