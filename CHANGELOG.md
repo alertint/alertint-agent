@@ -33,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restarts and enforced before generation requests, including retries.
   Both limits default to unlimited; see the configuration guide for accounting
   and recovery semantics.
+- MCP clients receive compact Situation-investigation guidance and accurate
+  read/write/external-access hints for every registered tool. Release archives
+  include a Codex skill that explains current state, recorded history, evidence
+  gaps, AlertINT's next action, and authorized follow-up without inventing
+  missing source history.
 
 ### Changed
 
