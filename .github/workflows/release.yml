@@ -24,6 +24,19 @@ jobs:
       - name: Extract release notes from CHANGELOG.md
         run: ./scripts/release-notes.sh "${GITHUB_REF_NAME}" > /tmp/release-notes.md
 
+      - name: Select release configuration
+        id: release-config
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc[1-9][0-9]*$ ]]; then
+            echo "config=.goreleaser.rc.yaml" >>"$GITHUB_OUTPUT"
+          elif [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "config=.goreleaser.yaml" >>"$GITHUB_OUTPUT"
+          else
+            echo "unsupported release tag: ${GITHUB_REF_NAME}" >&2
+            exit 64
+          fi
+
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
@@ -47,6 +60,6 @@ jobs:
         uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"
-          args: release --clean --release-notes /tmp/release-notes.md
+          args: release --clean --config ${{ steps.release-config.outputs.config }} --release-notes /tmp/release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

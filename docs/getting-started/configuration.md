@@ -201,9 +201,8 @@ Incident memory stops an unchanged, already-analyzed condition from being
 re-triaged as brand new every time it re-fires. When an alert whose group key
 matches an already-analyzed incident fires again inside the collapse horizon,
 it attaches as a lightweight occurrence instead of minting a new incident and
-spending another LLM call — a released binary edits the Incident card in place
-to `recurred ×N`. On the `state-controller` branch the attach feeds the owning
-Situation's recurrence count (its closed predecessors plus its own re-fires);
+spending another LLM call. In v0.14 the attach feeds the owning Situation's
+recurrence count (its closed predecessors plus its own re-fires);
 the root shows `recurred ×N`, and crossing a milestone rung records a
 `recurrence_milestone` Transition with one quiet thread reply (see
 [Slack](../notifications/slack.md#recurrence-resurfacing)). This is
@@ -256,12 +255,9 @@ specific to your environment; see
 
 ## `situations`
 
-**Integration-branch config, not yet the `main`-branch default.** This
-section configures the fenced Situation controller and the "B+" Acute
-Triage gate — durable, integration-tested work landing on the
-`state-controller` branch (see [Architecture: Situation foundation and
+This section configures the v0.14 fenced Situation controller and the "B+"
+Acute Triage gate (see [Architecture: Situation foundation and
 controller](../concepts/architecture.md#3a-situation-foundation-and-controller)).
-A released binary built from `main` does not read this section at all.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -326,8 +322,7 @@ behavior.
 
 ## `telemetry`
 
-**Integration-branch config, not yet the `main`-branch default.** The
-operator-configured observability boundary. Disabled by default: the agent
+The operator-configured observability boundary. Disabled by default: the agent
 installs no exporter and no telemetry leaves the process; the OpenTelemetry
 spans the Situation controller and Acute Triage worker emit (see
 [Architecture: Situation foundation and
@@ -396,11 +391,11 @@ starts when the aggregate LLM dependency state first becomes `degraded` or
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `stdout` | bool | `true` | Deliver the finding to **stdout** as one JSON line. The full JSON is verbose detail: it is written **only at `--log-level=debug`** (consistently, in every format). At `info` the sink is still active — a send is confirmed on the `notified` line — but no JSON is written; the result shows as the one-line `finding` summary instead. Recommended to leave on. |
-| `slack.enabled` | bool | `false` | Turn on Slack delivery. In a released binary this posts a Block Kit Incident card, updated in-place on resolve; on the `state-controller` branch it turns on the Situation delivery worker — the only Slack writer there — which posts one Situation root plus an immutable ordered journal thread. |
+| `slack.enabled` | bool | `false` | Turn on Slack delivery. In v0.14 this enables the Situation delivery worker, which posts one Situation root plus an immutable ordered journal thread. |
 | `slack.bot_token_env` | string | — | Required when `slack.enabled: true`. Env var name holding the Slack bot token (`xoxb-…`, requires the `chat:write` scope; no history-read scope is ever requested) |
 | `slack.channel` | string | — | Required when `slack.enabled: true`. Channel name (e.g. `#alerts`) or ID (e.g. `C1234567890`) |
-| `slack.min_severity` | string | `low` | The channel-noise floor (`low` \| `medium` \| `high`); stdout always emits regardless. In a released binary it compares against the finding's severity, and an incident suppressed at firing is also suppressed at resolution. On the `state-controller` branch it is the minimum **interruption priority** a *new* main-channel interruption must meet — never alert severity and never a model claim; `critical` always passes, a withheld interruption is durably recorded, and the floor never suppresses Situation state, MCP history, a root edit, or a journal reply. The default posts everything. |
-| `slack.recurrence_mode` | string | `change-gated` | How a recurring incident resurfaces in its thread: `change-gated` posts a thread reply only on a real-world change (severity rise, new symptom, faster cadence) or a milestone (×5/×10/×25/×50/×100, then every ×100) — replies stay in the thread, nothing extra is sent to the channel; `off` keeps recurrence to a silent card count-bump. On the `state-controller` branch the setting governs the owning Situation's milestone replies: `change-gated` posts one quiet reply in the Situation thread when the recurrence count crosses a rung, `off` keeps only the silent root edit; the `why:` change replies are released-binary only. See [Slack](../notifications/slack.md) for details. |
+| `slack.min_severity` | string | `low` | The minimum **interruption priority** a new main-channel interruption must meet — never alert severity and never a model claim. `critical` always passes; a withheld interruption is durably recorded; the floor never suppresses Situation state, MCP history, a root edit, or a journal reply. The default posts everything. |
+| `slack.recurrence_mode` | string | `change-gated` | Controls Situation recurrence milestone replies: `change-gated` posts one quiet thread reply at ×5/×10/×25/×50/×100 and then every ×100; `off` keeps only the silent root edit. Neither mode re-pages the channel. |
 
 At startup the agent logs one `notifiers ready` line listing the active sinks
 (and the Slack channel) so you can see where findings will go. Every analysis
@@ -419,7 +414,7 @@ finding: a recurrence attach (`"kind":"occurrence"`), an operator annotation
 (`"kind":"triage_exhausted"`, carrying the incident id, attempt count, and the
 last error).
 
-On the `state-controller` branch the stdout stream additionally emits one
+The v0.14 stdout stream additionally emits one
 `{"kind":"situation.transition","version":1,…}` line for every committed
 Situation Transition — identities, closed codes, hashes, counts, and instants
 only, never prose. That line means the change is **durably committed**; it

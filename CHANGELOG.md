@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0-rc1] - 2026-09-22
+
 ### Added
 
 - Alertmanager deliveries can carry configured installation and exact
@@ -34,6 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Release candidates use a separate, commit-pinned publication command and
+  publish only versioned archives and container tags. They do not move stable
+  `latest` aliases or change Helm chart defaults.
 - The default Situation preparation request budget increases from six to eight
   physical source calls per cycle, allowing the bounded Zabbix rule and problem
   reads to run alongside the largest protected investigation.
@@ -43,6 +48,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve the released `alertint_usage_stats` MCP tool across the Situation
+  controller branch integration. It now counts new Situation roots and
+  withheld channel pokes while continuing to read legacy notification rows.
+- Resolved deliveries follow the alert's current nonterminal Incident
+  membership before group-key fallback, so an unrelated collecting Incident
+  cannot claim the recovery.
 - Inbound webhooks now flush `204` as soon as their durable state commits,
   without making that response wait for the best-effort audit append. The
   bounded audit write continues after client disconnects; persistence failures
@@ -75,6 +86,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with episode ordering that prevents an old resolution from closing a new firing.
 - Assessment usage includes cache tokens; hourly budget refusals defer work
   without consuming an inference attempt when no request was sent.
+
+## [0.13.9] - 2026-09-16
+
+### Added
+
+- New read-only MCP tool `alertint_usage_stats` reports an operational usage
+  summary over a time window: alert deliveries and alerts received, LLM
+  call/token volume with a per-model breakdown, Slack cards posted (new
+  incident cards only) and skipped, incident analyses completed and triage
+  exhaustions. Every counter is derived from the audit log, so historical
+  windows stay stable as new deliveries arrive. Slack `notify.sent` audit
+  rows now carry `new_card` so a resolved card posted for a never-notified
+  incident counts as a card; migration 0013 adds a composite `(kind, ts)`
+  audit-log index so windowed reads walk only the window.
+
+### Changed
+
+- Docs: new [Kubernetes (Helm)](docs/getting-started/kubernetes.md) page
+  covering the Artifact Hub listing (verified publisher), signature
+  verification, the values schema and a production values layout; the
+  README and Quickstart point at it.
+
+### Fixed
+
+- Resolved alert deliveries now revisit their existing incident memberships
+  before any collecting-window or group-key fallback. An older incident can
+  therefore reach `resolved` even when a newer incident shares its group key;
+  the transition checks every member atomically and only its winner publishes
+  the recovery notification. (#97)
+- Coordinated releases now keep Helm README badge labels, chart tests, and
+  release-script fixtures aligned with the current versions, so the release
+  metadata commit passes the normal `main` CI checks.
+
+## [0.13.8] - 2026-09-04
+
+### Added
+
+- Release automation now publishes the official Helm chart to GHCR as an OCI
+  artifact after each application image release. Application and chart
+  versions remain independent, while the normal `task release` command updates
+  both; `task release:chart` handles chart-only releases and the initial chart
+  publication.
+
+### Fixed
+
+- A recurrence attached to an already-resolved incident now reopens that
+  incident for recovery tracking, so resolving the recurrence updates the
+  existing Slack card back to `resolved`. Duplicate resolved deliveries remain
+  silent. (#81)
+
+## [0.13.7] - 2026-09-02
+
+### Fixed
+
+- A recovery arriving while initial triage is in flight no longer produces two
+  independent `resolved` notifications. Acute triage now claims the incident's
+  existing resolution transition before publishing its model-severity finding;
+  whichever resolution path loses that atomic claim stays silent. (#76)
 
 ## [0.13.6] - 2026-09-01
 
@@ -823,7 +892,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single static binary** — pure-Go SQLite (no CGO), no external runtime dependencies.
   Multi-platform builds: `linux/amd64`, `linux/arm64`, `darwin/arm64`.
 
-[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.13.6...HEAD
+[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.14.0-rc1...HEAD
+[0.14.0-rc1]: https://github.com/alertint/alertint-agent/compare/v0.13.9...v0.14.0-rc1
+[0.13.9]: https://github.com/alertint/alertint-agent/compare/v0.13.8...v0.13.9
+[0.13.8]: https://github.com/alertint/alertint-agent/compare/v0.13.7...v0.13.8
+[0.13.7]: https://github.com/alertint/alertint-agent/compare/v0.13.6...v0.13.7
 [0.13.6]: https://github.com/alertint/alertint-agent/compare/v0.13.5...v0.13.6
 [0.13.5]: https://github.com/alertint/alertint-agent/compare/v0.13.4...v0.13.5
 [0.13.4]: https://github.com/alertint/alertint-agent/compare/v0.13.3...v0.13.4

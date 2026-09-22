@@ -140,6 +140,11 @@ tasks:
     cmds:
       - ./scripts/release.sh {{.CLI_ARGS}}
 
+  release:rc:
+    desc: "Publish a reviewed release candidate without switching branches, e.g. task release:rc -- 0.14.0-rc1 <full-sha>"
+    cmds:
+      - ./scripts/release-rc.sh {{.CLI_ARGS}}
+
   release:prep:
     desc: "Roll CHANGELOG [Unreleased] into a version section before tagging, e.g. `task release:prep VERSION=0.7.0` (see RELEASING.md)"
     cmds:
@@ -149,6 +154,13 @@ tasks:
     desc: "Preview the release body for a version from CHANGELOG.md, e.g. `task release:notes VERSION=0.6.0`"
     cmds:
       - ./scripts/release-notes.sh "{{.VERSION}}"
+
+  release:test:
+    desc: Test stable and release-candidate packaging contracts
+    cmds:
+      - bash scripts/tests/release-rc-test.sh
+      - go test ./scripts/tests
+      - goreleaser check .goreleaser.yaml .goreleaser.rc.yaml
 
   tidy:
     desc: Run go mod tidy

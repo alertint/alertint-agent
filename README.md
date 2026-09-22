@@ -57,8 +57,8 @@ The whole pipeline — receivers, correlation, the evidence pack, both loops, an
 the MCP surface — is diagrammed and walked through step by step in
 **[Architecture](https://alertint.com/docs/concepts/architecture)**.
 
-On the `state-controller` integration branch (not the released default), a
-durable **Situation** owns each failure group's history: every authoritative
+In the v0.14 release line, a durable **Situation** owns each failure group's
+history: every authoritative
 material change commits one immutable transition and one version of a current
 episode summary, and Slack shows one evolving Situation root plus an
 immutable ordered journal thread instead of a per-incident card. Delivery is
@@ -66,6 +66,8 @@ driven from durable intents that retry indefinitely, open a visible gap after
 five continuous minutes of Slack failure, and replay every affected episode
 in order once Slack returns — see
 **[Slack](https://alertint.com/docs/notifications/slack)**.
+The standalone [Situation workflow](docs/concepts/situation-workflow.html)
+shows the full operator path without requiring a documentation build.
 
 ## Documentation
 

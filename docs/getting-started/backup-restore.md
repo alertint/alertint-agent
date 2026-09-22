@@ -57,6 +57,36 @@ Restore is safe by construction:
   the DB path. If a restore is interrupted mid-swap, the previous
   database is intact at `<db>.pre-restore`: rename it back and retry.
 
+## Upgrade and rollback
+
+Create the backup with the version you are currently running, before starting
+the new binary:
+
+```bash
+alertint backup --db /data/alertint-agent.db /backups/pre-upgrade.backup.db
+```
+
+Keep that file outside the live database path. Start the new version against
+the live database and let it apply its forward migrations. Verify normal reads
+and intake before removing the backup.
+
+Rollback is a restore operation because older binaries do not understand the
+new schema:
+
+1. Stop the new AlertINT process.
+2. Preserve the migrated database separately for diagnosis.
+3. Restore `pre-upgrade.backup.db` with the old binary's `alertint restore`.
+4. Start the old binary and verify reads and fresh intake.
+
+Do not point an older binary at the migrated database. Alerts accepted after
+the pre-upgrade backup are outside the rollback recovery point, and Slack
+messages already delivered cannot be undone.
+
+The v0.14 release line also rejects databases created by old, conflicting
+state-controller prereleases before changing them. Preserve such a database
+and restore a released v0.13.x backup or use a fresh database for RC testing;
+do not edit `schema_migrations` by hand.
+
 After installing, restore verifies the audit chain of the restored
 database (a failure is reported loudly but does not abort — the file is
 the operator's choice) and appends a `db.restore_applied` row to the
