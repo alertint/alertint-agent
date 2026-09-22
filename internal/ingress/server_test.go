@@ -135,14 +135,8 @@ func TestPost_HappyPath_204_PersistsAndAudits(t *testing.T) {
 		t.Errorf("alert not persisted as expected: %+v", got)
 	}
 
-	// One audit row was appended.
-	var n int
-	if err := h.store.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM audit_log WHERE kind='alert.received'`).Scan(&n); err != nil {
-		t.Fatalf("count: %v", err)
-	}
-	if n != 1 {
-		t.Errorf("audit row count = %d, want 1", n)
-	}
+	// The response is flushed before the best-effort audit append completes.
+	waitForLoadCount(t, h.store, `SELECT COUNT(*) FROM audit_log WHERE kind='alert.received'`, 1)
 
 	// wake fired exactly once for the durably-accepted delivery.
 	if got := h.wakeCalls(); got != 1 {
@@ -174,11 +168,7 @@ func TestPost_MultipleAlerts_OneAuditRow_AllPersisted(t *testing.T) {
 		}
 	}
 
-	var n int
-	_ = h.store.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM audit_log WHERE kind='alert.received'`).Scan(&n)
-	if n != 1 {
-		t.Errorf("audit rows = %d, want 1 per call", n)
-	}
+	waitForLoadCount(t, h.store, `SELECT COUNT(*) FROM audit_log WHERE kind='alert.received'`, 1)
 
 	// One wake per POST, not one per member alert.
 	if got := h.wakeCalls(); got != 1 {
@@ -471,6 +461,176 @@ func TestPost_HappyPath_204_QueryableFromSecondConnection(t *testing.T) {
 	}
 }
 
+type blockingAuditAppender struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (a *blockingAuditAppender) Append(context.Context, string, string, any) error {
+	close(a.entered)
+	<-a.release
+	return nil
+}
+
+type contextAwareAuditAppender struct {
+	entered chan struct{}
+	release chan struct{}
+	done    chan error
+}
+
+type cancelingReceiver struct {
+	cancel context.CancelFunc
+}
+
+func (r *cancelingReceiver) Route() string { return "POST /webhook/cancel" }
+func (r *cancelingReceiver) Name() string  { return "cancel" }
+func (r *cancelingReceiver) Token() []byte { return []byte(testToken) }
+func (r *cancelingReceiver) Ingest(context.Context, []byte) (Summary, error) {
+	r.cancel()
+	return Summary{Kind: "cancel.received", Audit: map[string]any{}}, nil
+}
+
+func (a *contextAwareAuditAppender) Append(ctx context.Context, _ string, _ string, _ any) error {
+	close(a.entered)
+	select {
+	case <-a.release:
+		a.done <- nil
+		return nil
+	case <-ctx.Done():
+		a.done <- ctx.Err()
+		return ctx.Err()
+	}
+}
+
+// TestPost_AcknowledgesAfterDurableCommitWithoutWaitingForAudit proves the
+// HTTP acceptance boundary ends at the durable delivery commit. The audit
+// append is deliberately blocked after that commit; the sender must still
+// observe 204 while the append remains blocked.
+func TestPost_AcknowledgesAfterDurableCommitWithoutWaitingForAudit(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "audit-boundary.db")
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	blockedAudit := &blockingAuditAppender{entered: make(chan struct{}), release: make(chan struct{})}
+
+	host, err := New(Options{
+		Store:     st,
+		Auditor:   audit.New(st.DB()),
+		Receivers: []Receiver{NewAlertReceiver(st, testToken, nil, nil)},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	host.auditor = blockedAudit
+	srv := httptest.NewServer(host.Handler())
+	t.Cleanup(srv.Close)
+
+	type result struct {
+		status int
+		err    error
+	}
+	done := make(chan result, 1)
+	body := mustMarshal(t, samplePayload())
+	go func() {
+		req, reqErr := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL+"/webhook/alertmanager", bytes.NewReader(body))
+		if reqErr != nil {
+			done <- result{err: reqErr}
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+testToken)
+		resp, doErr := srv.Client().Do(req)
+		if doErr != nil {
+			done <- result{err: doErr}
+			return
+		}
+		_ = resp.Body.Close()
+		done <- result{status: resp.StatusCode}
+	}()
+
+	select {
+	case <-blockedAudit.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the post-commit audit append")
+	}
+
+	var got result
+	acknowledgedWhileLocked := false
+	select {
+	case got = <-done:
+		acknowledgedWhileLocked = true
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(blockedAudit.release)
+	if !acknowledgedWhileLocked {
+		got = <-done
+		t.Fatalf("204 waited for the post-commit audit append; eventual response = status %d, err %v", got.status, got.err)
+	}
+	if got.err != nil || got.status != http.StatusNoContent {
+		t.Fatalf("response = status %d, err %v; want 204", got.status, got.err)
+	}
+}
+
+func TestPost_AuditContinuesAfterAcceptedRequestIsCanceled(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "audit-context.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	auditor := &contextAwareAuditAppender{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		done:    make(chan error, 1),
+	}
+	requestCtx, cancelRequest := context.WithCancel(ctx)
+	host, err := New(Options{
+		Store:     st,
+		Auditor:   audit.New(st.DB()),
+		Receivers: []Receiver{&cancelingReceiver{cancel: cancelRequest}},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	host.auditor = auditor
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, "/webhook/cancel", bytes.NewReader([]byte("{}")))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	recorder := httptest.NewRecorder()
+	handled := make(chan struct{})
+	go func() {
+		host.Handler().ServeHTTP(recorder, req)
+		close(handled)
+	}()
+	select {
+	case <-auditor.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("audit append did not start")
+	}
+
+	select {
+	case auditErr := <-auditor.done:
+		t.Fatalf("request cancellation stopped accepted delivery audit: %v", auditErr)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(auditor.release)
+	if auditErr := <-auditor.done; auditErr != nil {
+		t.Fatalf("detached audit append: %v", auditErr)
+	}
+	<-handled
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", recorder.Code)
+	}
+}
+
 func TestPost_EmptyAlertList_204AndAuditRow(t *testing.T) {
 	h := newHarness(t)
 	p := samplePayload()
@@ -481,11 +641,7 @@ func TestPost_EmptyAlertList_204AndAuditRow(t *testing.T) {
 	if resp.StatusCode != http.StatusNoContent {
 		t.Errorf("status = %d, want 204", resp.StatusCode)
 	}
-	var n int
-	_ = h.store.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM audit_log WHERE kind='alert.received'`).Scan(&n)
-	if n != 1 {
-		t.Errorf("audit rows = %d, want 1", n)
-	}
+	waitForLoadCount(t, h.store, `SELECT COUNT(*) FROM audit_log WHERE kind='alert.received'`, 1)
 }
 
 // TestPost_WebhookReceivedLine verifies one INFO "webhook received" line per
