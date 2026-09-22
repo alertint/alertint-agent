@@ -32,6 +32,7 @@ archives:
       - config.example.yaml
       - examples/**/*
       - docs/*.md
+      - docs/concepts/situation-workflow.html
       - LICENSE
       - README.md
 

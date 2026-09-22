@@ -93,6 +93,15 @@ func TestRCGoReleaserConfigKeepsStableBuildAndArchiveContract(t *testing.T) {
 	}
 }
 
+func TestReleaseArchivesIncludeSituationWorkflowGuide(t *testing.T) {
+	for _, name := range []string{".goreleaser.yaml", ".goreleaser.rc.yaml"} {
+		body := string(repoFile(t, name))
+		if !strings.Contains(body, "docs/concepts/situation-workflow.html") {
+			t.Errorf("%s omits the standalone Situation workflow guide", name)
+		}
+	}
+}
+
 func TestReleaseWorkflowSelectsRCConfigAndHasNoChartPublication(t *testing.T) {
 	wf := workflow(t, "release.yml")
 	jobs := mapping(t, wf["jobs"], "jobs")
