@@ -22,17 +22,29 @@ under the [`memory`](../getting-started/configuration.md#memory) config block.
 
 When a firing alert's group key matches an already-analyzed incident and lands
 inside the **collapse horizon**, AlertINT attaches it as an **occurrence** of
-that incident instead of minting a new one and spending another analysis. The
-incident's Slack card edits in place — `recurred ×N · last HH:MM` — and a JSON
-occurrence line is written to stdout. No second LLM call.
+that incident instead of minting a new one and spending another analysis. In a
+released binary the incident's Slack card edits in place — `recurred ×N ·
+last HH:MM`. On the `state-controller` branch the attach moves the owning
+Situation's recurrence count (its closed predecessors plus its own re-fires):
+the root shows `recurred ×N`, and a crossed milestone rung records a
+`recurrence_milestone` Transition with one quiet reply in the Situation's
+thread. Either way a JSON occurrence line is written to stdout. No second LLM
+call.
 
 The horizon is two clocks: a sliding attach window (default 30 minutes from the
 last occurrence) and a hard ceiling on the time since the last analysis (default
-4 hours). A **re-judgment** — a fresh analysis whose finding replaces the old one
-in place — runs only when an escalation trigger fires: a severity rise, a new
-alert type joining the incident, a cadence spike, or a time/occurrence ceiling.
-The occurrence ledger is what makes "how often, and since when?" answerable, so
-the recurrence count and cadence a recall shows are computed facts, never guesses.
+4 hours). Every attach is stamped with why it collapsed rather than opening a
+fresh incident: a plain repeat (`none`) or an **escalation trigger** — a
+severity rise, a new alert type joining the incident, a cadence spike, or a
+time/occurrence ceiling. That trigger is durably recorded on the occurrence
+row today, but nothing currently acts on it: **re-judgment** — a fresh
+analysis, triggered automatically by an escalation, whose finding replaces the
+old one in place — is not wired to the durable delivery pipeline. Consuming
+the recorded trigger to re-judge automatically is an explicit obligation for
+the upcoming Situation controller, not currently shipped behavior. The
+occurrence ledger is what makes "how often, and since when?" answerable
+regardless, so the recurrence count and cadence a recall shows are computed
+facts, never guesses.
 
 ## Memory recall
 
@@ -94,8 +106,11 @@ on every recurrence, and live evidence can retire it. A **confirmation** verdict
 retires steering — it records that the machine's conclusion is right.
 
 Notes written with `alertint_incident_annotate` are context for the next
-investigator: they render on the incident's Slack thread (history line plus
-a bounded notes list) and in MCP incident reads (`operator_history`),
+investigator: in a released binary they render on the incident's Slack thread
+(history line plus a bounded notes list); on the `state-controller` branch
+they are journalled instead as one attributed `operator_note` entry in the
+owning Situation's thread, and only while a nonterminal Situation owns the
+incident. Either way they appear in MCP incident reads (`operator_history`),
 permanent and age-stamped, and never enter the triage prompt or influence
 recall.
 

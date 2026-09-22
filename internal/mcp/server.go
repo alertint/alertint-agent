@@ -9,9 +9,8 @@
 // Default endpoint: http://host:9912/mcp
 // Auth: Bearer token (constant-time compare, same pattern as the webhook).
 //
-// Read-only toward your systems, always; feedback writes (the two
-// alertint_incident_* write tools) land only in AlertINT's own incident
-// state, additive and audit-chained.
+// Read-only toward your systems, always. MCP mutations land only in
+// AlertINT's own local state and are versioned or additive and audit-chained.
 package mcp
 
 import (
@@ -80,21 +79,25 @@ type Config struct {
 // Server is the AlertINT MCP HTTP server. Construct with NewServer; start
 // by passing Handler() to an http.Server on the configured addr.
 type Server struct {
-	cfg     Config
-	st      *store.Store
-	auditor *audit.Auditor
-	handler http.Handler
+	cfg      Config
+	st       *store.Store
+	auditor  *audit.Auditor
+	protocol *mcpserver.MCPServer
+	handler  http.Handler
+	now      func() time.Time
 }
 
 // NewServer builds the MCP server with the always-on incident/alert/audit tools
 // registered, plus the optional source tools (Prometheus, logs, changes, Sentry)
 // each gated on its connector being configured.
 func NewServer(cfg Config, st *store.Store, auditor *audit.Auditor) *Server {
-	s := &Server{cfg: cfg, st: st, auditor: auditor}
+	s := &Server{cfg: cfg, st: st, auditor: auditor, now: time.Now}
 
 	ms := mcpserver.NewMCPServer("AlertINT", "1.0.0",
 		mcpserver.WithToolCapabilities(false),
+		mcpserver.WithInstructions(serverInstructions),
 	)
+	s.protocol = ms
 
 	ms.AddTool(s.toolListIncidents())
 	ms.AddTool(s.toolGetIncident())
@@ -106,6 +109,43 @@ func NewServer(cfg Config, st *store.Store, auditor *audit.Auditor) *Server {
 	ms.AddTool(s.toolPrometheusQueryRange())
 	ms.AddTool(s.toolIncidentAnnotate())
 	ms.AddTool(s.toolIncidentCaptureVerdict())
+
+	// Read-only Situation foundation views (Task 9): always registered when
+	// MCP is enabled, unlike the source tools below — there is no connector
+	// to gate them on. Neither tool creates a judgment, note, verdict,
+	// envelope, Assessment, or reassessment request.
+	ms.AddTool(s.toolListSituations())
+	ms.AddTool(s.toolGetSituation())
+	// Plan 3 Task 9: the two bounded read-only history/delivery surfaces.
+	// Always registered alongside the two above — there is no connector to
+	// gate them on, and a Situation with no history yet answers honestly
+	// rather than erroring.
+	ms.AddTool(s.toolListSituationTransitions())
+	ms.AddTool(s.toolGetDeliveryState())
+	ms.AddTool(s.toolRecordSituationExpected())
+	ms.AddTool(s.toolReplaceSituationExpected())
+	ms.AddTool(s.toolRevokeSituationExpected())
+	ms.AddTool(s.toolRestoreSituationExpected())
+	ms.AddTool(s.toolListSituationJudgments())
+	ms.AddTool(s.toolExpectedBehaviorPrepare())
+	ms.AddTool(s.toolGetExpectedBehaviorValidation())
+	ms.AddTool(s.toolExpectedBehaviorConfirm())
+	ms.AddTool(s.toolExpectedBehaviorReplace())
+	ms.AddTool(s.toolExpectedBehaviorRevoke())
+	ms.AddTool(s.toolExpectedBehaviorRestore())
+	ms.AddTool(s.toolGetExpectedBehavior())
+	ms.AddTool(s.toolListExpectedBehaviors())
+	ms.AddTool(s.toolListExpectedBehaviorHistory())
+	// Plan 4 Task 9: bounded evidence-preparation/semantic-profile views.
+	// Always registered alongside the Situation tools above — preparation/
+	// profile state exists (possibly empty) regardless of which source
+	// connectors are configured, so there is no connector to gate these on
+	// either. alertint_correct_semantic_profile is this plan's only new
+	// write path — additive and audit-chained, exactly like the two
+	// server_feedback.go write tools.
+	ms.AddTool(s.toolListObservationRuns())
+	ms.AddTool(s.toolGetSemanticProfile())
+	ms.AddTool(s.toolCorrectSemanticProfile())
 
 	// Log passthrough tool, registered only when a log source is configured.
 	// Named after the active backend (loki_query_range) so multiple sources can
@@ -143,6 +183,13 @@ func NewServer(cfg Config, st *store.Store, auditor *audit.Auditor) *Server {
 // Handler returns the http.Handler to mount on an http.Server.
 func (s *Server) Handler() http.Handler { return s.handler }
 
+func (s *Server) currentTime() time.Time {
+	if s.now == nil {
+		return time.Now().UTC()
+	}
+	return s.now().UTC()
+}
+
 // withBearerAuth wraps h with constant-time bearer token verification.
 func (s *Server) withBearerAuth(next http.Handler) http.Handler {
 	token := []byte(s.cfg.Token)
@@ -157,12 +204,13 @@ func (s *Server) withBearerAuth(next http.Handler) http.Handler {
 }
 
 // -----------------------------------------------------------------------------
-// Tool definitions (read-only toward operator systems; write-back tools live
-// in server_feedback.go)
+// Tool definitions (read-only toward operator systems; local write-back
+// tools live in server_feedback.go, server_preparation.go and
+// server_judgments.go)
 // -----------------------------------------------------------------------------
 
 func (s *Server) toolListIncidents() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_list_incidents",
+	tool := newTool("alertint_list_incidents",
 		mcplib.WithDescription("List recent AlertINT incidents, newest first. "+
 			"Each incident groups one or more related alerts with an AI finding. "+
 			"Rows with drill=true are synthetic drills fired by `alertint drill`, not real incidents."),
@@ -174,7 +222,7 @@ func (s *Server) toolListIncidents() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 }
 
 func (s *Server) toolGetIncident() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_get_incident",
+	tool := newTool("alertint_get_incident",
 		mcplib.WithDescription("Get full details for one incident: member alerts with their roles, "+
 			"AI finding (analysis name, overall issue, correlation findings, severity, confidence), "+
 			"and raw LLM output JSON. drill=true marks a synthetic drill fired by `alertint drill`, "+
@@ -188,7 +236,7 @@ func (s *Server) toolGetIncident() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 }
 
 func (s *Server) toolSearchAlerts() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_search_alerts",
+	tool := newTool("alertint_search_alerts",
 		mcplib.WithDescription("Search stored alerts. All parameters are optional. "+
 			"Returns alerts ordered by received_at descending."),
 		mcplib.WithString("since",
@@ -214,7 +262,7 @@ func (s *Server) toolSearchAlerts() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 }
 
 func (s *Server) toolGetEvidencePack() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_get_evidence_pack",
+	tool := newTool("alertint_get_evidence_pack",
 		mcplib.WithDescription("Return the compact evidence pack for an incident — the same "+
 			"structured context that the acute-triage skill passed to the LLM: shared labels, "+
 			"alert timeline, severity distribution, and top annotations."),
@@ -227,7 +275,7 @@ func (s *Server) toolGetEvidencePack() (mcplib.Tool, mcpserver.ToolHandlerFunc) 
 }
 
 func (s *Server) toolVerifyAudit() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_verify_audit",
+	tool := newTool("alertint_verify_audit",
 		mcplib.WithDescription("Walk the hash-chained audit log and verify tamper-evidence. "+
 			"Returns the number of rows checked and whether the chain is intact."),
 	)
@@ -235,17 +283,12 @@ func (s *Server) toolVerifyAudit() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 }
 
 func (s *Server) toolUsageStats() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_usage_stats",
+	tool := newTool("alertint_usage_stats",
 		mcplib.WithDescription("Operational usage summary over a time window: alert deliveries and alerts received, "+
-			"LLM call/token volume (with a per-model breakdown), Slack cards posted (new incident cards only; edits "+
-			"and thread replies excluded) and skipped, incident analyses completed and triage exhaustions. "+
-			"Aggregated from the audit log — a usage snapshot, not a billing meter. Read-only."),
-		mcplib.WithString("since",
-			mcplib.Description("Window start (RFC3339). Defaults to 24h before now."),
-		),
-		mcplib.WithString("until",
-			mcplib.Description("Window end (RFC3339). Defaults to now."),
-		),
+			"LLM call/token volume (with a per-model breakdown), new Slack Situation cards and withheld channel pokes, "+
+			"incident analyses completed and triage exhaustions. Aggregated from the audit log; read-only."),
+		mcplib.WithString("since", mcplib.Description("Window start (RFC3339). Defaults to 24h before now.")),
+		mcplib.WithString("until", mcplib.Description("Window end (RFC3339). Defaults to now.")),
 	)
 	return tool, s.handleUsageStats
 }
@@ -703,75 +746,44 @@ func (s *Server) handleVerifyAudit(ctx context.Context, _ mcplib.CallToolRequest
 }
 
 func (s *Server) handleUsageStats(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
-	now := time.Now().UTC()
+	now := s.now().UTC()
 	until := now
 	since := now.Add(-24 * time.Hour)
-
-	if sinceStr := mcplib.ParseString(req, "since", ""); sinceStr != "" {
-		t, err := time.Parse(time.RFC3339, sinceStr)
+	if raw := mcplib.ParseString(req, "since", ""); raw != "" {
+		parsed, err := time.Parse(time.RFC3339, raw)
 		if err != nil {
 			return errResult("invalid since: must be RFC3339 (e.g. 2026-06-05T14:00:00Z)"), nil
 		}
-		since = t
+		since = parsed
 	}
-	if untilStr := mcplib.ParseString(req, "until", ""); untilStr != "" {
-		t, err := time.Parse(time.RFC3339, untilStr)
+	if raw := mcplib.ParseString(req, "until", ""); raw != "" {
+		parsed, err := time.Parse(time.RFC3339, raw)
 		if err != nil {
 			return errResult("invalid until: must be RFC3339"), nil
 		}
-		until = t
+		until = parsed
 	}
 	if !since.Before(until) {
 		return errResult("since must be before until"), nil
 	}
-
 	stats, err := s.auditor.UsageStats(ctx, since, until)
 	if err != nil {
 		return errResult("failed to aggregate usage stats: " + err.Error()), nil
 	}
 
-	type modelUsageRow struct {
-		Provider            string `json:"provider"`
-		Model               string `json:"model"`
-		Calls               int    `json:"calls"`
-		InputTokens         int64  `json:"input_tokens"`
-		OutputTokens        int64  `json:"output_tokens"`
-		CacheCreationTokens int64  `json:"cache_creation_tokens"`
-		CacheReadTokens     int64  `json:"cache_read_tokens"`
-	}
-	byModel := make([]modelUsageRow, 0, len(stats.LLMByModel))
-	for _, m := range stats.LLMByModel {
-		byModel = append(byModel, modelUsageRow{
-			Provider: m.Provider, Model: m.Model, Calls: m.Calls,
-			InputTokens: m.InputTokens, OutputTokens: m.OutputTokens,
-			CacheCreationTokens: m.CacheCreationTokens, CacheReadTokens: m.CacheReadTokens,
-		})
-	}
-
 	payload := map[string]any{
 		"window": map[string]any{"since": since, "until": until},
-		"alerts": map[string]any{
-			"deliveries": stats.AlertDeliveries,
-			"received":   stats.AlertsReceived,
-		},
+		"alerts": map[string]any{"deliveries": stats.AlertDeliveries, "received": stats.AlertsReceived},
 		"llm": map[string]any{
-			"calls":                 stats.LLMCalls,
-			"input_tokens":          stats.LLMInputTokens,
-			"output_tokens":         stats.LLMOutputTokens,
-			"cache_creation_tokens": stats.LLMCacheCreationTokens,
-			"cache_read_tokens":     stats.LLMCacheReadTokens,
-			"by_model":              byModel,
+			"calls": stats.LLMCalls, "input_tokens": stats.LLMInputTokens, "output_tokens": stats.LLMOutputTokens,
+			"cache_creation_tokens": stats.LLMCacheCreationTokens, "cache_read_tokens": stats.LLMCacheReadTokens,
+			"by_model": stats.LLMByModel,
 		},
-		"slack": map[string]any{
-			"cards_posted": stats.SlackCardsPosted,
-			"skipped":      stats.SlackSkipped,
-		},
+		"slack": map[string]any{"cards_posted": stats.SlackCardsPosted, "skipped": stats.SlackSkipped},
 		"incidents": map[string]any{
-			"analyzed":         stats.IncidentsAnalyzed,
-			"triage_exhausted": stats.IncidentsTriageExhausted,
+			"analyzed": stats.IncidentsAnalyzed, "triage_exhausted": stats.IncidentsTriageExhausted,
 		},
 	}
-
 	result, err := mcplib.NewToolResultJSON(payload)
 	if err != nil {
 		return errResult("failed to serialize usage stats: " + err.Error()), nil
@@ -780,7 +792,7 @@ func (s *Server) handleUsageStats(ctx context.Context, req mcplib.CallToolReques
 }
 
 func (s *Server) toolPrometheusQuery() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("prometheus_query",
+	tool := newTool("prometheus_query",
 		mcplib.WithDescription("Execute an instant PromQL query against the connected Prometheus. "+
 			"Returns the current value(s) for the expression. "+
 			"Use this to check live metric values during incident investigation."),
@@ -796,7 +808,7 @@ func (s *Server) toolPrometheusQuery() (mcplib.Tool, mcpserver.ToolHandlerFunc) 
 }
 
 func (s *Server) toolPrometheusQueryRange() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("prometheus_query_range",
+	tool := newTool("prometheus_query_range",
 		mcplib.WithDescription("Execute a range PromQL query and return a time-series matrix. "+
 			"Use this to see how a metric evolved over time around an incident."),
 		mcplib.WithString("expr",
@@ -952,7 +964,7 @@ func (s *Server) toolLogsQueryRange() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
 	desc := fmt.Sprintf("Range-query the configured log backend (%s) using its native query language (LogQL). "+
 		"Use this to drill into or around an incident: widen the time window, change the label selector, "+
 		"or grep for new patterns. Read-only.", s.cfg.Logs.Name())
-	tool := mcplib.NewTool(name,
+	tool := newTool(name,
 		mcplib.WithDescription(desc),
 		mcplib.WithString("query",
 			mcplib.Description("Native query in the backend's language (LogQL for loki), e.g. {app=\"api\"} |= \"panic\"."),
@@ -1028,7 +1040,7 @@ func (s *Server) handleLogsQueryRange(ctx context.Context, req mcplib.CallToolRe
 }
 
 func (s *Server) toolRecentChanges() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_recent_changes",
+	tool := newTool("alertint_recent_changes",
 		mcplib.WithDescription("List recent change events (deploys, config edits, flag flips) "+
 			"newest-first. Use this to answer \"what changed?\" during investigation — widen the "+
 			"window or pivot services. Read-only."),

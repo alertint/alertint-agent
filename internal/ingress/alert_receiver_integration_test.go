@@ -6,23 +6,24 @@ import (
 	"context"
 	"testing"
 	"time"
-
-	"github.com/alertint/alertint-agent/internal/correlator"
 )
 
-func TestAlertmanagerReceiverToIncidentUsesEnvelopeGrouping(t *testing.T) {
+// TestAlertmanagerReceiverEnvelopeGroupingReachesDispatchQueue proves the
+// receiver-to-Situation-controller handoff surface this task actually owns:
+// envelope grouping identity flows from the parsed payload all the way
+// through one durable AcceptDeliveries commit into the pending dispatch
+// queue, with exactly one wake for the whole envelope. The receiver no
+// longer hands alerts to the correlator directly (that direct
+// Receiver-to-Correlator.Accept wiring is removed by this task); a later
+// task's durable dispatch worker claims these pending dispatches and drives
+// actual Incident/Situation correlation, so this test stops at the boundary
+// this task is responsible for.
+func TestAlertmanagerReceiverEnvelopeGroupingReachesDispatchQueue(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
-	c := correlator.New(correlator.Config{
-		WindowSeconds: 60,
-		TickInterval:  20 * time.Millisecond,
-	}, st, correlator.NopIncidentSink{}, nil)
-	if err := c.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-	defer c.Stop()
+	var wakes int
+	r := NewAlertReceiver(st, "token", func() { wakes++ }, nil)
 
-	r := NewAlertReceiver(st, "token", c.Accept, nil)
 	now := time.Now().UTC()
 	payload := AlertmanagerPayload{
 		Version:     "4",
@@ -46,24 +47,18 @@ func TestAlertmanagerReceiverToIncidentUsesEnvelopeGrouping(t *testing.T) {
 	if _, err := r.Ingest(ctx, mustMarshal(t, payload)); err != nil {
 		t.Fatal(err)
 	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		incs, err := st.ListCollectingIncidents(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(incs) == 1 && incs[0].AlertCount == 2 {
-			if got, want := incs[0].GroupKey, "tenant=acme,workload=checkout"; got != want {
-				t.Fatalf("Incident group key = %q, want %q", got, want)
-			}
-			if incs[0].GroupKey == "" {
-				t.Fatal("Incident group key must not be empty")
-			}
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+	if wakes != 1 {
+		t.Fatalf("wake calls = %d, want 1 for the whole envelope", wakes)
 	}
-	incs, _ := st.ListCollectingIncidents(ctx)
-	t.Fatalf("Receiver-to-Incident grouping did not converge: %+v", incs)
+
+	claims := claimAll(t, st)
+	if len(claims) != 2 {
+		t.Fatalf("claimed dispatches = %d, want 2", len(claims))
+	}
+	const wantIdentity = "tenant=acme,workload=checkout"
+	for _, c := range claims {
+		if got := c.Delivery.ReceiverGroupingIdentity; got != wantIdentity {
+			t.Fatalf("dispatch grouping identity = %q, want %q", got, wantIdentity)
+		}
+	}
 }

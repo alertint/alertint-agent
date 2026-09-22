@@ -53,6 +53,8 @@ const responseFormatHint = `set llm.response_format: "off" if your runtime does 
 
 // Config holds tunables for the openai-compatible client.
 type Config struct {
+	// Budget is the installation-wide durable guard; nil preserves unlimited behavior.
+	Budget *llm.Budget
 	// BaseURL is the endpoint root, already normalized by internal/config
 	// (no trailing slash or /v1). Required.
 	BaseURL string
@@ -116,7 +118,7 @@ func New(cfg Config, auditor *audit.Auditor, logger *slog.Logger) *Client {
 	}
 	return &Client{
 		cfg:      cfg,
-		http:     &http.Client{Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second},
+		http:     &http.Client{Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second, Transport: cfg.Budget.Transport(nil)},
 		auditor:  auditor,
 		logger:   logger,
 		now:      func() time.Time { return time.Now().UTC() },
@@ -157,7 +159,7 @@ func (c *Client) Complete(
 		})
 	}
 
-	raw, usage, err := c.callWithRetry(ctx, systemPrompt, prompt)
+	raw, usage, err := c.callWithRetry(ctx, systemPrompt, prompt, MaxRetries)
 	latency := c.now().Sub(start)
 
 	if c.auditor != nil {
@@ -180,6 +182,64 @@ func (c *Client) Complete(
 		InputTokens:  usage.input,
 		OutputTokens: usage.output,
 		Latency:      latency,
+	}
+	if err != nil {
+		return comp, err
+	}
+	if err := llm.ValidateKeys(raw, requiredKeys); err != nil {
+		return comp, err
+	}
+	return comp, nil
+}
+
+// CompleteOnce is Complete's one-shot counterpart, for callers that must
+// bypass the client's hidden HTTP retry loop without changing Complete's own
+// shipped retry behavior (Plan 2's Situation controller — see
+// internal/llm/anthropic's CompleteOnce doc comment for the full rationale,
+// identical here). It shares doRequest/callWithRetry with Complete, calling
+// callWithRetry with maxRetries=0, and classifies the outcome into
+// RequestStartStatus via llm.ClassifyRequestStart.
+func (c *Client) CompleteOnce(
+	ctx context.Context,
+	systemPrompt string, prompt llm.Prompt,
+	requiredKeys []string,
+) (llm.OneShotCompletion, error) {
+	start := c.now()
+
+	reqHash := llm.PromptHash(systemPrompt, prompt.Text())
+	if c.auditor != nil {
+		_ = c.auditor.Append(ctx, "llm.openaicompat", "llm.request", map[string]any{
+			"model":       c.cfg.Model,
+			"prompt_hash": reqHash,
+		})
+	}
+
+	raw, usage, err := c.callWithRetry(ctx, systemPrompt, prompt, 0)
+	latency := c.now().Sub(start)
+
+	if c.auditor != nil {
+		payload := map[string]any{
+			"model":         c.cfg.Model,
+			"prompt_hash":   reqHash,
+			"latency_ms":    latency.Milliseconds(),
+			"input_tokens":  usage.input,
+			"output_tokens": usage.output,
+		}
+		if err != nil {
+			payload["error"] = err.Error()
+		}
+		_ = c.auditor.Append(ctx, "llm.openaicompat", "llm.response", payload)
+	}
+
+	comp := llm.OneShotCompletion{
+		Completion: llm.Completion{
+			Raw:          raw,
+			Model:        c.cfg.Model,
+			InputTokens:  usage.input,
+			OutputTokens: usage.output,
+			Latency:      latency,
+		},
+		RequestStarted: llm.ClassifyRequestStart(err),
 	}
 	if err != nil {
 		return comp, err
@@ -238,11 +298,15 @@ type tokenUsage struct {
 
 // callWithRetry executes the HTTP request through the shared llm.CallWithRetry
 // backoff loop, retrying on 429 and any 5xx (wrapped by doRequest as
-// llm.RetryableError) up to MaxRetries times.
-func (c *Client) callWithRetry(ctx context.Context, system string, prompt llm.Prompt) (json.RawMessage, tokenUsage, error) {
-	return llm.CallWithRetry(ctx, c.logger, MaxRetries, c.cfg.BaseRetryDelay,
+// llm.RetryableError) up to maxRetries times. Complete calls this with
+// MaxRetries; CompleteOnce calls it with 0 — see anthropic's callWithRetry
+// doc comment for the shared rationale.
+func (c *Client) callWithRetry(ctx context.Context, system string, prompt llm.Prompt, maxRetries int) (json.RawMessage, tokenUsage, error) {
+	return llm.CallWithRetry(ctx, c.logger, maxRetries, c.cfg.BaseRetryDelay,
 		func(ctx context.Context) (json.RawMessage, tokenUsage, error) {
-			return c.doRequest(ctx, system, prompt)
+			raw, usage, err := c.doRequest(ctx, system, prompt)
+			llm.ObserveRequest(ctx, llm.Completion{Raw: raw, InputTokens: usage.input, OutputTokens: usage.output}, err)
+			return raw, usage, err
 		})
 }
 
@@ -268,12 +332,12 @@ func (c *Client) doRequest(ctx context.Context, system string, prompt llm.Prompt
 	}
 	encoded, err := json.Marshal(body)
 	if err != nil {
-		return nil, tokenUsage{}, fmt.Errorf("llm: marshal request: %w", err)
+		return nil, tokenUsage{}, fmt.Errorf("%w: marshal request: %w", llm.ErrRequestNotSent, err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(encoded))
 	if err != nil {
-		return nil, tokenUsage{}, fmt.Errorf("llm: build request: %w", err)
+		return nil, tokenUsage{}, fmt.Errorf("%w: build request: %w", llm.ErrRequestNotSent, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if c.cfg.APIKey != "" {

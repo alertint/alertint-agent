@@ -5,6 +5,7 @@ package sentry
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -12,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	model "github.com/alertint/alertint-agent/internal/observation/model"
 )
 
 // defaultIssueQuery is the fixed issue-search filter for Spec 2 (KTD4). A
@@ -284,6 +287,58 @@ func (c *Client) ListIssues(ctx context.Context, project, env string, start, end
 		return nil, fmt.Errorf("sentry: decode issues: %w", err)
 	}
 	return issues, nil
+}
+
+// IssuePage is one bounded page of ListIssuesBounded's result: the decoded
+// issues plus whether the API's own Link header reports more pages
+// available. spec.md says ListIssues discards pagination metadata; this
+// adds a bounded result API instead of treating its first page as complete.
+type IssuePage struct {
+	Issues  []Issue
+	HasMore bool
+}
+
+// ListIssuesBounded is ListIssues with response pagination/truncation
+// metadata and per-physical-attempt request instrumentation (including
+// retries) via before/after — both may be nil for uninstrumented use.
+// limit bounds the requested page size (Sentry's own "limit" query param);
+// 0 leaves it unset (provider default).
+func (c *Client) ListIssuesBounded(ctx context.Context, project, env string, start, end time.Time, query string, limit int,
+	before func() error, after func(started bool, err error)) (IssuePage, error) {
+	if strings.TrimSpace(query) == "" {
+		query = defaultIssueQuery
+	}
+	q := url.Values{}
+	q.Set("query", query)
+	q.Set("sort", "date")
+	q.Set("start", start.UTC().Format(time.RFC3339))
+	q.Set("end", end.UTC().Format(time.RFC3339))
+	if env != "" {
+		q.Set("environment", env)
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	path := "/api/0/projects/" + url.PathEscape(c.org) + "/" + url.PathEscape(project) + "/issues/"
+	resp, err := c.doGETInstrumented(ctx, path, q, before, after)
+	if err != nil {
+		return IssuePage{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := readBounded(resp.Body, model.MaxDecodedResponseBytes)
+	if err != nil {
+		if errors.Is(err, ErrResponseTooLarge) {
+			return IssuePage{}, err
+		}
+		return IssuePage{}, fmt.Errorf("sentry: read issues: %w", err)
+	}
+	var issues []Issue
+	if err := json.Unmarshal(body, &issues); err != nil {
+		return IssuePage{}, fmt.Errorf("sentry: decode issues: %w", err)
+	}
+	_, hasMore := parseLinkNext(resp.Header.Get("Link"))
+	return IssuePage{Issues: issues, HasMore: hasMore}, nil
 }
 
 // IssueStatus is the safe-by-shape projection of a Sentry issue-detail response

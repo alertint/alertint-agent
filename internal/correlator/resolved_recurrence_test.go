@@ -10,220 +10,164 @@ import (
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
-type resolutionRecorder struct {
-	calls []store.Incident
+func setDeliveryEpisode(in *store.DeliveryInput, started time.Time, resolved *time.Time) {
+	in.SourceStartedAt = &started
+	in.SourceResolvedAt = resolved
+	in.SourceEpisodeKey = "alertmanager:" + in.Alert.Fingerprint + ":" + started.UTC().Format(time.RFC3339Nano)
 }
 
-func (r *resolutionRecorder) OnIncidentResolved(_ context.Context, inc store.Incident) error {
-	r.calls = append(r.calls, inc)
-	return nil
-}
-
-func TestResolvedRecurrenceNotifiesWhenItResolvesAgain(t *testing.T) {
+func TestApplyDeliveryRecoveryReachesEveryOpenMembershipWithOneOwner(t *testing.T) {
 	st := openStore(t)
-	c, _ := newCorrelatorFor(t, st)
-	resolved := &resolutionRecorder{}
-	c.SetResolutionNotifier(resolved)
+	c := New(Config{}, st, NopIncidentSink{}, nil)
 	ctx := context.Background()
-	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	shared := firingAlert("fp-shared", "DiskFull", "warning", now.Add(-20*time.Minute), false)
 
-	original := firingAlert("fp-original", "DiskFull", "warning", now.Add(-5*time.Minute), false)
-	seedJudged(t, st, "inc_1", "analyzed", original.ReceivedAt, now.Add(-10*time.Minute), original)
+	seedJudged(t, st, "inc-older", "analyzed", now.Add(-20*time.Minute), now.Add(-15*time.Minute), shared)
+	seedJudged(t, st, "inc-newer", "analyzed", now.Add(-10*time.Minute), now.Add(-5*time.Minute), shared)
 
-	resolve := func(a store.Alert, at time.Time) store.Alert {
-		t.Helper()
-		a.Status = "resolved"
-		a.ReceivedAt = at
-		stored, err := st.UpsertAlertByFingerprint(ctx, a)
+	in := deliveryInputFor("d-resolve", shared.Fingerprint, gkAPI, "resolved", now)
+	started, ended := now.Add(-20*time.Minute), now.Add(-time.Minute)
+	setDeliveryEpisode(&in, started, &ended)
+	claim := claimOneDelivery(t, st, in, now)
+	if err := c.ApplyDelivery(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, incidentID := range []string{"inc-older", "inc-newer"} {
+		inc, err := st.GetIncidentByID(ctx, incidentID)
 		if err != nil {
-			t.Fatalf("upsert resolved %s: %v", a.Fingerprint, err)
+			t.Fatal(err)
 		}
-		if err := c.handleAlert(ctx, stored); err != nil {
-			t.Fatalf("handle resolved %s: %v", a.Fingerprint, err)
+		if inc.Status != "resolved" {
+			t.Errorf("%s status = %q, want resolved", incidentID, inc.Status)
 		}
-		return stored
+		var inputs int
+		if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM situation_input_outbox WHERE incident_id=?`, incidentID).Scan(&inputs); err != nil {
+			t.Fatal(err)
+		}
+		if inputs != 1 {
+			t.Errorf("%s recovery inputs = %d, want 1", incidentID, inputs)
+		}
 	}
 
-	resolve(original, now)
-	if got := len(resolved.calls); got != 1 {
-		t.Fatalf("resolution notifications after initial recovery = %d, want 1", got)
+	var owners int
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM incident_alert_deliveries WHERE delivery_id='d-resolve'`).Scan(&owners); err != nil {
+		t.Fatal(err)
+	}
+	if owners != 1 {
+		t.Fatalf("delivery owners = %d, want exactly 1", owners)
+	}
+}
+
+func TestApplyDeliveryRefireReopensOnlyNonterminalEpisodeAndRecoversAgain(t *testing.T) {
+	st := openStore(t)
+	c := New(Config{}, st, NopIncidentSink{}, nil)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 22, 13, 0, 0, 0, time.UTC)
+	originalStart := now.Add(-10 * time.Minute)
+	member := firingAlert("fp-refire", "DiskFull", "warning", originalStart, false)
+	seedJudged(t, st, "inc-refire", "analyzed", originalStart, now.Add(-5*time.Minute), member)
+	if _, err := st.DB().ExecContext(ctx, `
+		INSERT INTO incident_triage (incident_id, phase, attempts, updated_at)
+		VALUES ('inc-refire', 'backoff', 1, ?)`, now.UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
 	}
 
-	recurrence := original
-	recurrence.ReceivedAt = now.Add(time.Minute)
-	recurrence, err := st.UpsertAlertByFingerprint(ctx, recurrence)
-	if err != nil {
-		t.Fatalf("upsert recurrence: %v", err)
+	firstResolvedAt := now.Add(-time.Minute)
+	first := deliveryInputFor("d-first-resolve", member.Fingerprint, gkAPI, "resolved", now)
+	setDeliveryEpisode(&first, originalStart, &firstResolvedAt)
+	if err := c.ApplyDelivery(ctx, claimOneDelivery(t, st, first, now)); err != nil {
+		t.Fatal(err)
 	}
-	if err := c.handleAlert(ctx, recurrence); err != nil {
-		t.Fatalf("handle recurrence: %v", err)
+	var triageRows int
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM incident_triage WHERE incident_id='inc-refire'`).Scan(&triageRows); err != nil {
+		t.Fatal(err)
 	}
-	reopened, err := st.GetIncidentByID(ctx, "inc_1")
-	if err != nil {
-		t.Fatalf("get reopened incident: %v", err)
-	}
-	if reopened.Status != "analyzed" {
-		t.Fatalf("incident status after recurrence = %q, want analyzed", reopened.Status)
+	if triageRows != 0 {
+		t.Fatalf("triage rows after recovery = %d, want 0", triageRows)
 	}
 
-	resolve(recurrence, now.Add(2*time.Minute))
-	if got := len(resolved.calls); got != 2 {
-		t.Fatalf("resolution notifications after recurrence recovery = %d, want 2", got)
+	refireStart := now.Add(time.Minute)
+	refire := deliveryInputFor("d-refire", member.Fingerprint, gkAPI, "firing", refireStart)
+	setDeliveryEpisode(&refire, refireStart, nil)
+	if err := c.ApplyDelivery(ctx, claimOneDelivery(t, st, refire, refireStart)); err != nil {
+		t.Fatal(err)
 	}
-	inc, err := st.GetIncidentByID(ctx, "inc_1")
+	inc, err := st.GetIncidentByID(ctx, "inc-refire")
 	if err != nil {
-		t.Fatalf("get incident: %v", err)
+		t.Fatal(err)
+	}
+	if inc.Status != "analyzed" {
+		t.Fatalf("status after refire = %q, want analyzed", inc.Status)
+	}
+
+	secondResolvedAt := refireStart.Add(time.Minute)
+	second := deliveryInputFor("d-second-resolve", member.Fingerprint, gkAPI, "resolved", secondResolvedAt)
+	setDeliveryEpisode(&second, refireStart, &secondResolvedAt)
+	if err := c.ApplyDelivery(ctx, claimOneDelivery(t, st, second, secondResolvedAt)); err != nil {
+		t.Fatal(err)
+	}
+	inc, err = st.GetIncidentByID(ctx, "inc-refire")
+	if err != nil {
+		t.Fatal(err)
 	}
 	if inc.Status != "resolved" {
-		t.Fatalf("incident status after recurrence recovery = %q, want resolved", inc.Status)
+		t.Fatalf("status after refire recovery = %q, want resolved", inc.Status)
 	}
 
-	resolve(recurrence, now.Add(3*time.Minute))
-	if got := len(resolved.calls); got != 2 {
-		t.Fatalf("resolution notifications after duplicate resolved delivery = %d, want 2", got)
+	duplicate := deliveryInputFor("d-duplicate-resolve", member.Fingerprint, gkAPI, "resolved", secondResolvedAt.Add(time.Second))
+	setDeliveryEpisode(&duplicate, refireStart, &secondResolvedAt)
+	if err := c.ApplyDelivery(ctx, claimOneDelivery(t, st, duplicate, duplicate.Alert.ReceivedAt)); err != nil {
+		t.Fatal(err)
+	}
+	var transitions int
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM situation_input_outbox WHERE incident_id='inc-refire' AND kind='incident_resolved'`).Scan(&transitions); err != nil {
+		t.Fatal(err)
+	}
+	if transitions != 2 {
+		t.Fatalf("logical recovery transitions = %d, want 2 (one per episode)", transitions)
 	}
 }
 
-func TestResolvedMemberRoutesBeforeNewerCollectingIncident(t *testing.T) {
+func TestApplyDeliveryDelayedOlderRecoveryCannotCloseNewerFiringEpisode(t *testing.T) {
 	st := openStore(t)
-	c, _ := newCorrelatorFor(t, st)
-	resolved := &resolutionRecorder{}
-	c.SetResolutionNotifier(resolved)
+	c := New(Config{}, st, NopIncidentSink{}, nil)
 	ctx := context.Background()
-	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 9, 22, 14, 0, 0, 0, time.UTC)
+	oldStart := now
+	member := firingAlert("fp-delayed", "DiskFull", "warning", oldStart, false)
+	seedJudged(t, st, "inc-delayed", "analyzed", oldStart, now.Add(100*time.Millisecond), member)
 
-	member := firingAlert("fp-older-member", "DiskFull", "warning", now.Add(-20*time.Minute), false)
-	seedJudged(t, st, "inc_older", "analyzed", now.Add(-20*time.Minute), now.Add(-15*time.Minute), member)
-
-	newerMember := firingAlert("fp-newer-member", "HighLatency", "warning", now.Add(-5*time.Minute), false)
-	seedJudged(t, st, "inc_newer", "analyzed", now.Add(-5*time.Minute), now.Add(-4*time.Minute), newerMember)
-	if _, err := st.DB().ExecContext(ctx, `UPDATE incidents SET status = 'collecting' WHERE id = 'inc_newer'`); err != nil {
-		t.Fatalf("make newer incident collecting: %v", err)
+	// RFC3339Nano strings have variable-width fractional seconds. Keep both
+	// episodes inside one second so this test also proves source chronology is
+	// chronological rather than lexicographic.
+	newStart := now.Add(500 * time.Millisecond)
+	refire := deliveryInputFor("d-new-firing", member.Fingerprint, gkAPI, "firing", newStart)
+	setDeliveryEpisode(&refire, newStart, nil)
+	if err := c.ApplyDelivery(ctx, claimOneDelivery(t, st, refire, newStart)); err != nil {
+		t.Fatal(err)
 	}
 
-	member.Status = "resolved"
-	member.ReceivedAt = now
-	stored, err := st.UpsertAlertByFingerprint(ctx, member)
+	oldEnd := now.Add(250 * time.Millisecond)
+	delayed := deliveryInputFor("d-old-resolved", member.Fingerprint, gkAPI, "resolved", now.Add(time.Second))
+	setDeliveryEpisode(&delayed, oldStart, &oldEnd)
+	if err := c.ApplyDelivery(ctx, claimOneDelivery(t, st, delayed, delayed.Alert.ReceivedAt)); err != nil {
+		t.Fatal(err)
+	}
+
+	inc, err := st.GetIncidentByID(ctx, "inc-delayed")
 	if err != nil {
-		t.Fatalf("upsert resolved member: %v", err)
+		t.Fatal(err)
 	}
-	if err := c.handleAlert(ctx, stored); err != nil {
-		t.Fatalf("handle resolved member: %v", err)
+	if inc.Status != "analyzed" {
+		t.Fatalf("status after delayed older recovery = %q, want analyzed", inc.Status)
 	}
-
-	older, err := st.GetIncidentByID(ctx, "inc_older")
-	if err != nil {
-		t.Fatalf("get older incident: %v", err)
+	var resolvedInputs int
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM situation_input_outbox WHERE incident_id='inc-delayed' AND kind='incident_resolved'`).Scan(&resolvedInputs); err != nil {
+		t.Fatal(err)
 	}
-	if older.Status != "resolved" {
-		t.Errorf("older incident status = %q, want resolved", older.Status)
-	}
-	newer, err := st.GetIncidentByID(ctx, "inc_newer")
-	if err != nil {
-		t.Fatalf("get newer incident: %v", err)
-	}
-	if newer.Status != "collecting" {
-		t.Errorf("newer incident status = %q, want collecting", newer.Status)
-	}
-	if got := memberCount(t, st, "inc_newer"); got != 1 {
-		t.Errorf("newer incident member count = %d, want 1", got)
-	}
-	if got := len(resolved.calls); got != 1 {
-		t.Fatalf("resolution notifications = %d, want 1", got)
-	}
-	if got := resolved.calls[0].ID; got != "inc_older" {
-		t.Errorf("resolved incident notification = %q, want inc_older", got)
-	}
-	if got := resolved.calls[0].Status; got != "resolved" {
-		t.Errorf("resolution notification status = %q, want resolved", got)
-	}
-}
-
-func TestResolvedAlertChecksEveryExistingMembership(t *testing.T) {
-	st := openStore(t)
-	c, _ := newCorrelatorFor(t, st)
-	resolved := &resolutionRecorder{}
-	c.SetResolutionNotifier(resolved)
-	ctx := context.Background()
-	now := time.Date(2026, 9, 16, 13, 0, 0, 0, time.UTC)
-
-	shared := firingAlert("fp-shared-member", "DiskFull", "warning", now.Add(-20*time.Minute), false)
-	seedJudged(t, st, "inc_older", "analyzed", now.Add(-20*time.Minute), now.Add(-15*time.Minute), shared)
-	seedJudged(t, st, "inc_newer", "analyzed", now.Add(-10*time.Minute), now.Add(-5*time.Minute), shared)
-	stillFiring := firingAlert("fp-still-firing", "HighLatency", "warning", now.Add(-9*time.Minute), false)
-	storedFiring, err := st.UpsertAlertByFingerprint(ctx, stillFiring)
-	if err != nil {
-		t.Fatalf("upsert firing member: %v", err)
-	}
-	if err := st.AddAlertToIncident(ctx, "inc_newer", storedFiring.ID, storedFiring.ReceivedAt); err != nil {
-		t.Fatalf("add firing member: %v", err)
-	}
-
-	shared.Status = "resolved"
-	shared.ReceivedAt = now
-	stored, err := st.UpsertAlertByFingerprint(ctx, shared)
-	if err != nil {
-		t.Fatalf("upsert resolved shared member: %v", err)
-	}
-	if err := c.handleAlert(ctx, stored); err != nil {
-		t.Fatalf("handle resolved shared member: %v", err)
-	}
-
-	older, err := st.GetIncidentByID(ctx, "inc_older")
-	if err != nil {
-		t.Fatalf("get older incident: %v", err)
-	}
-	newer, err := st.GetIncidentByID(ctx, "inc_newer")
-	if err != nil {
-		t.Fatalf("get newer incident: %v", err)
-	}
-	if older.Status != "resolved" {
-		t.Errorf("older incident status = %q, want resolved", older.Status)
-	}
-	if newer.Status != "analyzed" {
-		t.Errorf("newer incident status = %q, want analyzed while another member fires", newer.Status)
-	}
-	if got := len(resolved.calls); got != 1 {
-		t.Fatalf("resolution notifications = %d, want 1", got)
-	}
-	if got := resolved.calls[0].ID; got != "inc_older" {
-		t.Errorf("resolved incident notification = %q, want inc_older", got)
-	}
-}
-
-func TestOrphanResolvedAlertFallsBackToRecentGroupIncident(t *testing.T) {
-	st := openStore(t)
-	c, _ := newCorrelatorFor(t, st)
-	resolved := &resolutionRecorder{}
-	c.SetResolutionNotifier(resolved)
-	ctx := context.Background()
-	now := time.Date(2026, 9, 16, 14, 0, 0, 0, time.UTC)
-
-	existing := firingAlert("fp-existing-resolved", "DiskFull", "warning", now.Add(-10*time.Minute), false)
-	existing.Status = "resolved"
-	seedJudged(t, st, "inc_existing", "analyzed", now.Add(-10*time.Minute), now.Add(-5*time.Minute), existing)
-
-	orphan := firingAlert("fp-orphan-resolved", "HighLatency", "warning", now, false)
-	orphan.Status = "resolved"
-	stored, err := st.UpsertAlertByFingerprint(ctx, orphan)
-	if err != nil {
-		t.Fatalf("upsert orphan resolved alert: %v", err)
-	}
-	if err := c.handleAlert(ctx, stored); err != nil {
-		t.Fatalf("handle orphan resolved alert: %v", err)
-	}
-
-	inc, err := st.GetIncidentByID(ctx, "inc_existing")
-	if err != nil {
-		t.Fatalf("get existing incident: %v", err)
-	}
-	if inc.Status != "resolved" {
-		t.Errorf("existing incident status = %q, want resolved", inc.Status)
-	}
-	if got := memberCount(t, st, "inc_existing"); got != 2 {
-		t.Errorf("existing incident member count = %d, want 2", got)
-	}
-	if got := len(resolved.calls); got != 1 {
-		t.Fatalf("resolution notifications = %d, want 1", got)
+	if resolvedInputs != 0 {
+		t.Fatalf("incident_resolved inputs = %d, want 0", resolvedInputs)
 	}
 }

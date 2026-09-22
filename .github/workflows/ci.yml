@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, state-controller]
 
 permissions:
   contents: read
@@ -25,14 +25,23 @@ jobs:
           check-latest: false
 
       - name: Test release scripts
-        run: bash scripts/tests/release-scripts-test.sh
+        run: |
+          bash scripts/tests/release-scripts-test.sh
+          bash scripts/tests/release-rc-test.sh
 
       - name: Test release workflows
         run: go test ./scripts/tests
 
+      - name: Validate GoReleaser configurations
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: check .goreleaser.yaml .goreleaser.rc.yaml
+
   test:
     name: test (${{ matrix.os }} / ${{ matrix.goarch }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -72,7 +81,7 @@ jobs:
         env:
           GOOS: ""
           GOARCH: ""
-        run: go test -race -count=1 ./...
+        run: go test -race -count=1 -timeout=60m ./...
 
       - name: Vet
         env:

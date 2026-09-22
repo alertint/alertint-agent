@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 	"unicode/utf8"
 )
@@ -45,7 +46,12 @@ func validateAnnotation(kind, note string) error {
 }
 
 // InsertIncidentAnnotation appends one annotation row. Returns ErrNotFound
-// when the incident does not exist.
+// when the incident does not exist. Task 8: in the SAME transaction, when
+// the Incident currently belongs to a nonterminal Situation, this also
+// enqueues exactly one operator_annotation_recorded situation_input_outbox
+// row referencing the new annotation — see enqueueOperatorArtifactInputTx.
+// With no owner at all (or an already-terminal one), only the annotation is
+// persisted; it stays visible through Incident MCP/audit either way.
 func (s *Store) InsertIncidentAnnotation(ctx context.Context, incidentID, kind, note string) (*IncidentAnnotation, error) {
 	if err := validateAnnotation(kind, note); err != nil {
 		return nil, err
@@ -57,6 +63,10 @@ func (s *Store) InsertIncidentAnnotation(ctx context.Context, incidentID, kind, 
 	defer func() { _ = tx.Rollback() }()
 	a, err := insertAnnotationTx(ctx, tx, incidentID, kind, note)
 	if err != nil {
+		return nil, err
+	}
+	idempotencyKey := fmt.Sprintf("operator-annotation:%d", a.ID)
+	if err := enqueueOperatorArtifactInputTx(ctx, tx, incidentID, "operator_annotation_recorded", idempotencyKey, a.ID, nil, a.CreatedAt); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -90,13 +100,75 @@ func insertAnnotationTx(ctx context.Context, tx *sql.Tx, incidentID, kind, note 
 	return &IncidentAnnotation{ID: id, IncidentID: incidentID, Kind: kind, Note: note, CreatedAt: now}, nil
 }
 
+// enqueueOperatorArtifactInputTx atomically enqueues one situation_input_outbox
+// row for a durable operator artifact — an attributed annotation
+// (kind="operator_annotation_recorded", annotationID set, verdictID nil) or
+// a Captured verdict (kind="captured_verdict_recorded", verdictID set,
+// annotationID nil) — that the caller already persisted earlier in this
+// SAME transaction (insertAnnotationTx / PersistVerdictCapture's verdict
+// insert). Shared by both InsertIncidentAnnotation and PersistVerdictCapture
+// (verdicts.go).
+//
+// It enqueues ONLY when incidentID currently belongs to a Situation whose
+// lifecycle is nonterminal right now: an Incident with no owning Situation
+// at all keeps the artifact visible only through Incident MCP/audit (no
+// outbox row at all — situation_incidents' link is permanent once made, so
+// situationOwnerForIncidentTx alone cannot tell "never owned" from "owned by
+// a since-terminalized Situation", hence the separate lifecycle check
+// below), and an Incident whose owner has ALREADY reached a terminal
+// lifecycle gets none either — enqueuing there would be pure waste, since
+// ApplySituationInput's R2 owner-terminal handling could never journal it.
+// R2 exists for the genuine RACE where the owner terminalizes strictly
+// BETWEEN this enqueue and the input worker's later apply, which this
+// write-time check neither needs to nor can prevent.
+//
+// idempotencyKey must be derived deterministically from the artifact's own
+// row id (see callers) so a retried enqueue for the exact same annotation/
+// verdict never creates a second input: ON CONFLICT(idempotency_key) DO
+// NOTHING mirrors insertTriageSituationInputTx's own idempotency convention
+// (triage_controller.go) and ApplyCorrelatedDelivery's outbox insert
+// (deliveries.go).
+func enqueueOperatorArtifactInputTx(ctx context.Context, tx *sql.Tx, incidentID, kind, idempotencyKey string, annotationID, verdictID any, occurredAt time.Time) error {
+	ownerID, err := situationOwnerForIncidentTx(ctx, tx, incidentID)
+	if err != nil {
+		return err
+	}
+	if ownerID == "" {
+		return nil
+	}
+	lifecycle, _, err := situationLifecycleAndVersionTx(ctx, tx, ownerID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	if lifecycle.Terminal() {
+		return nil
+	}
+	var groupKey string
+	if err := tx.QueryRowContext(ctx, `SELECT group_key FROM incidents WHERE id = ?`, incidentID).Scan(&groupKey); err != nil {
+		return fmt.Errorf("store: read incident group key for %s: %w", kind, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO situation_input_outbox
+			(id, idempotency_key, incident_id, kind, group_key, occurred_at, status, annotation_id, verdict_id, journal_state)
+		VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, 'pending')
+		ON CONFLICT(idempotency_key) DO NOTHING`,
+		"situation-input:"+idempotencyKey, idempotencyKey, incidentID, kind, groupKey, canonicalTime(occurredAt), annotationID, verdictID); err != nil {
+		return fmt.Errorf("store: enqueue %s situation input: %w", kind, err)
+	}
+	return nil
+}
+
 // ListIncidentAnnotations returns every annotation of one incident,
-// newest-first.
+// newest-first by recorded instant (sortByInstantNewestFirst; SQL id order
+// only breaks ties).
 func (s *Store) ListIncidentAnnotations(ctx context.Context, incidentID string) ([]IncidentAnnotation, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, incident_id, kind, note, created_at
 		FROM incident_annotations WHERE incident_id = ?
-		ORDER BY created_at DESC, id DESC`, incidentID)
+		ORDER BY id DESC`, incidentID)
 	if err != nil {
 		return nil, fmt.Errorf("store: list annotations: %w", err)
 	}
@@ -113,7 +185,11 @@ func (s *Store) ListIncidentAnnotations(ctx context.Context, incidentID string) 
 		}
 		out = append(out, a)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sortByInstantNewestFirst(out, func(a IncidentAnnotation) time.Time { return a.CreatedAt })
+	return out, nil
 }
 
 // OperatorAnnotation is one recalled operator annotation for the human-locked
@@ -138,7 +214,7 @@ func (s *Store) OperatorAnnotations(ctx context.Context, groupKey string, curren
 		FROM incident_annotations a
 		JOIN incidents i ON i.id = a.incident_id
 		WHERE i.group_key = ?
-		ORDER BY a.created_at DESC, a.id DESC`,
+		ORDER BY a.id DESC`,
 		groupKey)
 	if err != nil {
 		return nil, fmt.Errorf("store: operator annotations: %w", err)
@@ -162,6 +238,7 @@ func (s *Store) OperatorAnnotations(ctx context.Context, groupKey string, curren
 	if len(all) == 0 {
 		return nil, nil
 	}
+	sortByInstantNewestFirst(all, func(a OperatorAnnotation) time.Time { return a.CreatedAt })
 
 	ids := make([]string, 0, len(all))
 	seen := make(map[string]bool, len(all))
@@ -182,4 +259,18 @@ func (s *Store) OperatorAnnotations(ctx context.Context, groupKey string, curren
 		}
 	}
 	return out, nil
+}
+
+// sortByInstantNewestFirst reorders rows newest-first on their parsed
+// instants, keeping the incoming order (SQL id DESC) for identical instants.
+//
+// Stored times are time.RFC3339Nano text, which trims trailing zeros, so one
+// table holds ".2378Z", ".237872Z", ".1Z" and a bare "Z" together. A shorter
+// value's "Z" sorts above the next digit of a longer one, so SQL text
+// ordering disagrees with real time exactly when two writes land inside the
+// same fraction of a second. Which notes reach a triage prompt depends on
+// this order (steering.go caps the list at maxHistoryNotes), so it is decided
+// here rather than by the database.
+func sortByInstantNewestFirst[T any](rows []T, at func(T) time.Time) {
+	sort.SliceStable(rows, func(i, j int) bool { return at(rows[i]).After(at(rows[j])) })
 }

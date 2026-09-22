@@ -23,7 +23,7 @@ type zabbixClient interface {
 
 // toolZabbixMetricHistory reads a Zabbix item's metric history for a host.
 func (s *Server) toolZabbixMetricHistory() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("zabbix_metric_history",
+	tool := newTool("zabbix_metric_history",
 		mcplib.WithDescription("Read a Zabbix item's metric history for a host (raw history or hourly "+
 			"trends for older windows; the 'source' field says which). Inputs: host (technical name), "+
 			"item_key, optional start/end RFC3339, optional limit."),
@@ -50,7 +50,7 @@ func (s *Server) toolZabbixMetricHistory() (mcplib.Tool, mcpserver.ToolHandlerFu
 
 // toolZabbixHostProblems lists currently-open Zabbix problems on a host.
 func (s *Server) toolZabbixHostProblems() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("zabbix_host_problems",
+	tool := newTool("zabbix_host_problems",
 		mcplib.WithDescription("List currently-open Zabbix problems on a host, with severity, tags, "+
 			"duration, ack/suppression state. Inputs: host, optional severity_min 0..5."),
 		mcplib.WithString("host",

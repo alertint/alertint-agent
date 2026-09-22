@@ -9,6 +9,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/httpcount"
 	"github.com/alertint/alertint-agent/internal/logs"
 	"github.com/alertint/alertint-agent/internal/store"
 )
@@ -26,8 +27,10 @@ type LogEnrichment struct {
 	Note   string      `json:"note,omitempty"`  // why Lines is empty (queried-empty / timeout / error / no-selector)
 	// SpanStart is the requested window start before any max_window_minutes
 	// clamp; zero when no clamp applied. Lets the prompt say "recent-only".
-	SpanStart time.Time `json:"span_start,omitzero"`
-	Outcome   Outcome   `json:"outcome,omitempty"` // fetched / empty / no_selector / failed (R8)
+	SpanStart            time.Time `json:"span_start,omitzero"`
+	Outcome              Outcome   `json:"outcome,omitempty"` // fetched / empty / no_selector / failed (R8)
+	RequestAttempts      int       `json:"request_attempts,omitempty"`
+	RequestAttemptsKnown bool      `json:"request_attempts_known,omitempty"`
 }
 
 // LogParams carries the generic enrichment tunables from config (the logs
@@ -60,13 +63,19 @@ type LogParams struct {
 // "loki fetched" line and the three absence breadcrumbs) stands alone. The Loki
 // client itself stays logger-free and incident-unaware: this generic layer owns
 // the meaning and the logging (ADR 0004 / ADR 0002).
-func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []store.Alert, first, last time.Time, incidentID string, logger *slog.Logger) *LogEnrichment {
+func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []store.Alert, first, last time.Time, incidentID string, logger *slog.Logger) (out *LogEnrichment) {
 	if src == nil {
 		return nil
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
+	ctx, requestCounter := httpcount.WithCounter(ctx)
+	defer func() {
+		if out != nil && requestCounter.Attempts() > 0 {
+			out.RequestAttempts, out.RequestAttemptsKnown = requestCounter.Attempts(), true
+		}
+	}()
 	source := src.Name()
 	rangeLabel := fmt.Sprintf("%dm", params.DefaultRangeMinutes)
 	start := first.Add(-time.Duration(params.DefaultRangeMinutes) * time.Minute)
@@ -98,12 +107,13 @@ func FetchLogs(ctx context.Context, src logs.Source, params LogParams, alerts []
 		logger.Info("acutetriage: logs: empty selector — no usable log labels for this incident",
 			"source", source, "shared_labels", shared, "incident", incidentID)
 		return &LogEnrichment{
-			Source:    source,
-			Start:     start,
-			End:       end,
-			SpanStart: spanStart,
-			Note:      "no usable log selector for this incident (shared labels: " + shared + ")",
-			Outcome:   OutcomeNoSelector,
+			Source:               source,
+			Start:                start,
+			End:                  end,
+			SpanStart:            spanStart,
+			Note:                 "no usable log selector for this incident (shared labels: " + shared + ")",
+			Outcome:              OutcomeNoSelector,
+			RequestAttemptsKnown: true,
 		}
 	}
 

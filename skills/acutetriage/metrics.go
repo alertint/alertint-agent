@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/httpcount"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -361,11 +362,13 @@ type metricQuerier interface {
 // Outcome makes fetched / queried-empty / no-selector / backend-failed
 // distinguishable in logs, the audit trail, and the notification card (R4/R8).
 type MetricEnrichment struct {
-	At        time.Time        `json:"at"`
-	Selector  string           `json:"selector,omitempty"`  // rendered matcher(s) that ran (breadcrumb/replay)
-	Snapshots []MetricSnapshot `json:"snapshots,omitempty"` // ranked, capped
-	Note      string           `json:"note,omitempty"`      // why Snapshots is empty
-	Outcome   Outcome          `json:"outcome,omitempty"`
+	At                   time.Time        `json:"at"`
+	Selector             string           `json:"selector,omitempty"`  // rendered matcher(s) that ran (breadcrumb/replay)
+	Snapshots            []MetricSnapshot `json:"snapshots,omitempty"` // ranked, capped
+	Note                 string           `json:"note,omitempty"`      // why Snapshots is empty
+	Outcome              Outcome          `json:"outcome,omitempty"`
+	RequestAttempts      int              `json:"request_attempts,omitempty"`
+	RequestAttemptsKnown bool             `json:"request_attempts_known,omitempty"`
 }
 
 // FetchMetrics queries Prometheus for the incident's series at time t using the
@@ -385,13 +388,19 @@ type MetricEnrichment struct {
 // TimeoutSeconds. A scope that is reachable-but-slow yields OutcomeDegraded, kept
 // distinct from a genuine outage (OutcomeFailed) so a self-inflicted timeout does
 // not read as "unreachable" or cap confidence.
-func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, alerts []store.Alert, t time.Time, incidentID string, logger *slog.Logger) *MetricEnrichment {
+func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, alerts []store.Alert, t time.Time, incidentID string, logger *slog.Logger) (out *MetricEnrichment) {
 	if prom == nil {
 		return nil
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
+	ctx, requestCounter := httpcount.WithCounter(ctx)
+	defer func() {
+		if out != nil && requestCounter.Attempts() > 0 {
+			out.RequestAttempts, out.RequestAttemptsKnown = requestCounter.Attempts(), true
+		}
+	}()
 
 	shared := buildMetricSelector(alerts, params.ExtraSelectorLabels)
 	logDroppedSelectorKeys(ctx, logger, "metrics", alerts, params.ExtraSelectorLabels, incidentID)
@@ -428,7 +437,7 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 	if len(scopes) == 0 {
 		logger.Info("acutetriage: metrics: no usable selector for this incident",
 			"shared_labels", formatLabels(sharedLabels(alerts)), "incident", incidentID)
-		return &MetricEnrichment{At: t, Note: "no usable metric selector for this incident", Outcome: OutcomeNoSelector}
+		return &MetricEnrichment{At: t, Note: "no usable metric selector for this incident", Outcome: OutcomeNoSelector, RequestAttemptsKnown: true}
 	}
 
 	fetchCtx, cancel := context.WithTimeout(ctx, time.Duration(params.TimeoutSeconds)*time.Second)

@@ -11,6 +11,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/httpcount"
 	"github.com/alertint/alertint-agent/internal/sentry"
 	"github.com/alertint/alertint-agent/internal/store"
 )
@@ -87,14 +88,16 @@ const (
 // value is both rendered into the prompt and stored, so the evidence pack
 // replays exactly what the LLM saw. Mirrors LogEnrichment / ChangeEnrichment.
 type SentryEnrichment struct {
-	Project     string            `json:"project"`
-	Environment string            `json:"environment,omitempty"`
-	Start       time.Time         `json:"start"`
-	End         time.Time         `json:"end"`
-	Issues      []SentryIssueView `json:"issues,omitempty"`
-	MoreCount   int               `json:"more_count,omitempty"` // matches beyond the top-K cap (R8)
-	Note        string            `json:"note,omitempty"`       // zero-match / unknown-project / degraded
-	Outcome     SentryOutcome     `json:"outcome,omitempty"`    // structured fetch result (KTD1)
+	Project              string            `json:"project"`
+	Environment          string            `json:"environment,omitempty"`
+	Start                time.Time         `json:"start"`
+	End                  time.Time         `json:"end"`
+	Issues               []SentryIssueView `json:"issues,omitempty"`
+	MoreCount            int               `json:"more_count,omitempty"` // matches beyond the top-K cap (R8)
+	Note                 string            `json:"note,omitempty"`       // zero-match / unknown-project / degraded
+	Outcome              SentryOutcome     `json:"outcome,omitempty"`    // structured fetch result (KTD1)
+	RequestAttempts      int               `json:"request_attempts,omitempty"`
+	RequestAttemptsKnown bool              `json:"request_attempts_known,omitempty"`
 
 	// Reconciliation is the zero-LLM cross-source verdict (matched / infra-only),
 	// computed at the triage seam by reconcile() and set only on a conclusive look
@@ -146,13 +149,19 @@ const (
 // tell "looked, found nothing / project unknown / backend failed" from "never
 // looked". It never blocks or fails triage. incidentID rides every outcome line
 // (ADR-0004).
-func FetchSentry(ctx context.Context, r SentryReader, params SentryParams, alerts []store.Alert, first, last time.Time, incidentID string, logger *slog.Logger) *SentryEnrichment {
+func FetchSentry(ctx context.Context, r SentryReader, params SentryParams, alerts []store.Alert, first, last time.Time, incidentID string, logger *slog.Logger) (out *SentryEnrichment) {
 	if !params.Enabled || r == nil {
 		return nil
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
+	ctx, requestCounter := httpcount.WithCounter(ctx)
+	defer func() {
+		if out != nil && requestCounter.Attempts() > 0 {
+			out.RequestAttempts, out.RequestAttemptsKnown = requestCounter.Attempts(), true
+		}
+	}()
 
 	shared := sharedLabels(alerts)
 	project, env := sentryScope(shared)

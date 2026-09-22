@@ -4,6 +4,16 @@ receivers:
 alertmanager:
   enabled: true
   webhook_token_env: ALERTINT_WEBHOOK_TOKEN   # name of the env var holding the bearer token
+  # Stable non-secret installation identity. Configure during a quiet window;
+  # changing it creates a new delivery/episode namespace.
+  # instance_id: prod-alertmanager-eu
+  # Explicit mappings enable reusable expected schedules. Unmapped alerts
+  # continue through ordinary triage without reusable authority.
+  # rules:
+  #   - alert_name: ReconciliationLoad
+  #     group: batch-jobs
+  #     rule: ReconciliationLoad
+  #     scope_labels: [service]
 
 storage:
   sqlite_path: ./alertint-agent.db
@@ -14,6 +24,41 @@ llm:
   model: claude-sonnet-5                      # default: strongest reasoning in its price class
   # model: claude-haiku-4-5                   # faster + cheaper alternative for cost-sensitive setups
   timeout_seconds: 120                        # whole-request LLM timeout; local endpoints typically want 300
+
+  # Shared runaway guard: all generation workloads, models and controller
+  # cycles using this database. Each retry/redirected POST reserves separately
+  # BEFORE dispatch; non-generating metadata/health GETs are excluded.
+  budget:
+    calls_per_hour: 0                         # 0 = unlimited; e.g. 30 for a bounded lab
+    total_tokens: 0                           # 0 = unlimited; e.g. 100000 for a bounded lab
+  # Calls use the preceding rolling 60 minutes (not clock-hour buckets).
+  # Tokens have NO time reset. State survives restart in connector_state under
+  # llm.budget.v1. Accounting starts when either limit is enabled; historical
+  # audit rows and traffic while both limits are zero are not backfilled.
+  # Each POST reserves encoded request bytes + max_tokens + 1024 for framing.
+  # Concurrent reservations are allowed when their combined allowances fit.
+  # Valid usage replaces the allowance with input + output + Anthropic cache
+  # creation/read tokens. OpenAI prompt/completion totals already include
+  # cached/reasoning tokens, so their detail fields are not counted twice.
+  # Errors with unknown usage (including missing/invalid usage or >512 KiB
+  # responses) retain the allowance and latch unknown: future token-budgeted
+  # dispatch fails closed. Crash/unsettled reservations remain fully charged,
+  # without automatic refund. Database failures prevent dispatch/refund.
+  # Exhaustion returns an actionable inference error. For call exhaustion,
+  # wait for the rolling window; for known token exhaustion, review and raise
+  # total_tokens or reduce prompt/output size. Unknown usage requires manual
+  # reconciliation of provider usage and llm.budget.v1 with the agent stopped;
+  # raising the limit alone cannot clear it. No automatic reset/recovery tool.
+  # Situation assessments deferred by an hourly limit retry at its expiry,
+  # without spending an inference attempt for a proved-unsent denial. A
+  # token/unknown-usage deferral has no automatic retry. After reconciling the
+  # budget, affected budget_deferred Situations also require explicit reviewed
+  # database rearming while stopped; current MCP Situation tools are read-only.
+  # Do not clear unrelated parks, actual attempt counts, or provider charges.
+  # This is a conservative text-request allowance, not an exact tokenizer or
+  # dollar cap. A compatible server with extra hidden input, inaccurate usage,
+  # or an ignored output cap can exceed it; reported overruns fail explicitly
+  # and remain charged. Preserve the database to preserve the budget.
 
   # Self-hosted alternative — any OpenAI-compatible endpoint (SGLang, vLLM,
   # Ollama, LM Studio). See docs/integrations/openai-compatible.md.
@@ -64,6 +109,19 @@ health:
   llm_idle_probe_after_seconds: 300  # default: probe after 5 minutes without a completed real LLM call
   broadcast_after_seconds: 300       # default: notify after 5 continuous unhealthy minutes
 
+# Operator-configured observability boundary. Off by default: no exporter is
+# installed and no telemetry leaves the process. Enabling it exports the
+# Situation controller / Acute Triage spans (identities, digests, counts,
+# durations — never prompts, proposals, or provider bodies) over OTLP.
+telemetry:
+  otlp:
+    enabled: false
+    endpoint: ""             # collector host:port (TLS unless insecure) or URL with scheme; required when enabled
+    protocol: grpc           # grpc | http
+    insecure: false          # plaintext transport for a bare host:port endpoint
+    service_name: alertint-agent
+    timeout_seconds: 10
+
 notify:
   stdout: true             # always emit one JSON line per finding to stdout
   slack:
@@ -92,6 +150,8 @@ rules:
 # and exposes read-only PromQL MCP tools. Presence-based: setting base_url
 # turns it ON automatically.
 prometheus:
+  # Stable non-secret producer identity used with alertmanager.rules.
+  # instance_id: prod-prometheus-eu
   # base_url: http://localhost:9090            # set this and Prometheus enrichment turns ON automatically
   # enabled: false                              # uncomment to force OFF even when base_url is set
   # bearer_token_env: PROMETHEUS_BEARER_TOKEN   # only if Prometheus requires auth
@@ -153,6 +213,9 @@ changes:
 #             zabbix_host_problems MCP tools. Presence-based: setting
 #             base_url turns it on. See docs/integrations/zabbix.md.
 zabbix:
+  # Stable non-secret name for this Zabbix installation. Use the same value
+  # for ingress and API; changing it creates a new source identity.
+  instance_id: prod-zbx-eu
   ingress:
     enabled: false
     webhook_token_env: ALERTINT_ZABBIX_WEBHOOK_TOKEN   # bearer token Zabbix presents to /webhook/zabbix
@@ -189,6 +252,24 @@ sentry:
     max_issues: 3                            # top issues rendered (the K of the 1+K budget)
     fetch_timeout_seconds: 15                # bounds the WHOLE 1+K fetch
     include_message: true                    # include the exception message across prompt/SQLite/MCP
+
+# Proactive Situation preparation and advisory semantic profiles. Bounded,
+# read-only evidence gathering from the configured connectors above (store,
+# Prometheus, Zabbix, Loki, Sentry, changes) feeds each Situation's next
+# Assessment; a separate durable worker infers advisory profiles that can
+# only widen which capabilities/horizon are checked, never assert lifecycle
+# or policy. Entirely optional — every field below is already the shipped
+# default, shown here for discoverability. See docs/getting-started/
+# configuration.md#situations.
+situations:
+  preparation:
+    max_source_calls_per_cycle: 8   # physical connector requests per preparation cycle (1-32)
+    max_wall_seconds: 20            # wall-clock budget for one preparation attempt (1-30; must be < situations.attempt_wall_seconds)
+    refresh_seconds: 300            # minimum re-check cadence per subject/capability (60-3600)
+  semantic_profiles:
+    workers: 1                      # inference worker goroutines polling for due jobs (1-4; shares the L0+L2 LLM limiter — at most one profile call runs at a time)
+    max_attempts: 3                 # durable attempts before a job exhausts (1-5)
+    attempt_wall_seconds: 30        # wall-clock budget for one inference attempt (1-60)
 
 log_level: info            # debug | info | warn | error
 log_format: auto           # auto | console | json (auto → console on a TTY, json otherwise)

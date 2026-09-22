@@ -32,6 +32,8 @@ archives:
       - config.example.yaml
       - examples/**/*
       - docs/*.md
+      - docs/concepts/situation-workflow.html
+      - client-skills/**/*
       - LICENSE
       - README.md
 

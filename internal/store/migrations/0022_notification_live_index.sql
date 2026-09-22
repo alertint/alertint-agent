@@ -1,0 +1,21 @@
+-- SPDX-License-Identifier: FSL-1.1-ALv2
+--
+-- One partial index, no schema change: the notification worker's claim
+-- poll ranks every LIVE intent — pending, blocked_configuration, failed —
+-- per Situation (migration 0020 / review round 1 made blocked and failed
+-- rows hold their Situation's queue head), and 0018's claim index covers
+-- only `status = 'pending'`. Without this index the once-per-second poll
+-- scanned the whole append-only ledger before ranking (review round 2,
+-- R2-F3), the exact unbounded growth 0019 was added to stop for the
+-- blocked-count read.
+--
+-- The WHERE clause is spelled exactly as the claim query's predicate so
+-- SQLite's partial-index implication matches it verbatim. Live rows are
+-- bounded work (they resolve to delivered/superseded/withheld); resolved
+-- history is excluded from the index and never read by the poll.
+--
+-- This migration adds no table, no column, and no row: it fabricates
+-- nothing for any Situation that predates it.
+-- ----------------------------------------------------------------------
+CREATE INDEX notification_intents_live_idx ON notification_intents(status, situation_id, transition_sequence, id)
+    WHERE status IN ('pending', 'blocked_configuration', 'failed');

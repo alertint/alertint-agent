@@ -14,10 +14,10 @@ expectations.
 
 ## Design principles
 
-- **Read-only by design** — **AlertINT** observes and reports. It never
-  touches your infrastructure, so teams can adopt it without risk. The one
-  write an agent can make is feedback into AlertINT's own incident record —
-  additive, audit-chained, local.
+- **Read-only toward your systems** — **AlertINT** observes and reports. It
+  never touches your infrastructure. MCP writes only local, audit-chained
+  AlertINT state: feedback into AlertINT's own incident record,
+  semantic-profile corrections, and explicit time-bounded Situation judgments.
 - **Self-hosted and local** — your alert data and incident context stay on
   your machine.
 - **Fair Source** — the runtime and all baseline and community packs are
@@ -35,6 +35,60 @@ expectations.
 re-route alerts, run scripts or runbooks, or page ticketing systems for
 you. Several of these are natural future directions — remediation, if it
 lands, will be gated behind explicit operator approval flows.
+
+## Durable Situation foundation and controller
+
+Every accepted alert delivery is now immutable and durably queued, and the
+Incidents it produces are grouped under a durable per-exact-group
+**Situation** — visible through the `alertint_list_situations`
+and `alertint_get_situation` MCP tools, with explicit version-fenced local
+judgment commands (see [Architecture: Situation
+foundation and controller](architecture.md#3a-situation-foundation-and-controller),
+[MCP clients](../integrations/mcp-clients.md)). Be precise about what that
+is and isn't:
+
+- **Is:** durable delivery acceptance and dispatch, crash-safe correlation,
+  and durable exact-group Situation grouping across restarts — all visible
+  read-only over MCP. In v0.14, a fenced Situation controller is wired:
+  local Store facts feed one authoritative
+  Assessment and operator-facing Attention/action contract per reconcile
+  cycle, and the "B+" Acute Triage gate durably holds every ready Incident
+  at `awaiting_decision` until that controller requests, skips, or leaves
+  it parked — nothing dispatches to the triage skill on its own.
+  The controller also commits an **immutable Transition** and a versioned
+  **Episode summary** for every authoritative material change, in the same
+  fenced transaction as the state itself, and makes the Situation delivery
+  worker the only Slack writer in runtime assembly: Slack shows one
+  Situation root plus an immutable ordered journal, delivered from durable
+  intents that retry indefinitely, and no Incident-shaped card, resolve
+  edit, or recurrence reply is reachable there any more. Local delivery
+  intent is idempotent across crashes and restarts; **external delivery is
+  at-least-once**, so an uncertain Slack response followed by a retry can
+  rarely leave a duplicate message in the channel (AlertINT requests no
+  history-read scope and never reads the channel back to reconcile).
+  A fenced evidence-preparation pass plans and executes
+  a bounded set of read-only capability checks ahead of each Assessment, and
+  a durable advisory semantic-profile worker infers a bounded interpretation
+  hint per distinct alert source identity — both read-only over MCP
+  (`alertint_list_observation_runs`, `alertint_get_semantic_profile`,
+  `alertint_correct_semantic_profile`). A profile is **advisory only**: it
+  can widen which capabilities get planned, never assert firing/resolved
+  state, grant investigative authority, create a Sufficient reason, resolve
+  a sibling, or reach Slack directly.
+- **Also is:** versioned expected-until judgments for one Situation and
+  reusable expected schedules for exactly proven Zabbix or Alertmanager rule
+  scope. They affect assessment and presentation only; monitoring,
+  investigation, lifecycle and source-owned recovery continue.
+- **Is not:** durable Assessment/Triage artifacts beyond the bounded
+  recent-attempt history exposed over MCP, automatic operator questions,
+  generic policy editors, or schedules inferred from webhook labels alone.
+  `alertint_get_situation` reads `assessment: null` and
+  `operator_contract: null`, honestly, for any Situation the controller has
+  not yet reconciled at least once — never a fabricated placeholder.
+- **No mode switch:** there is no `state_controller_mode`, shadow-output
+  path, or legacy/new runtime toggle to configure — one build runs one
+  grouping/dispatch path, and one Slack writer, at a time. There is no dual
+  or shadow notification mode.
 
 ## Known weaknesses
 

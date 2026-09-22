@@ -210,3 +210,18 @@ func TestShutdownCancelDuringCall1LeavesHealthy(t *testing.T) {
 		t.Fatalf("shutdown cancel must leave no trace: %+v", s)
 	}
 }
+
+func TestCall2BudgetDenialPreservesReasonWithoutDependencyFailure(t *testing.T) {
+	ctx, st, tr, inc := healthFixture(t)
+	seq := &scriptedLLM{responses: []scriptResp{{raw: draftResp(t, "disk", "disk full", 0.8, nil)}, {err: &llm.BudgetDeferredError{Message: "allowance"}}}}
+	sk := acutetriage.New(acutetriage.Config{MinAlerts: 1, Health: tr, Verification: verifyOn}, st, seq, nil, nil, nil)
+	if err := sk.Run(ctx, inc); err != nil {
+		t.Fatal(err)
+	}
+	if _, reason := verificationEnvelope(t, st, inc.ID); reason != "budget_deferred" {
+		t.Fatalf("reason=%q", reason)
+	}
+	if tr.Snapshot().Reason == llmhealth.ReasonNetwork {
+		t.Fatal("budget denial became network failure")
+	}
+}

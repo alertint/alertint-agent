@@ -3,10 +3,10 @@
 // Package ingress implements the inbound webhook host. The host owns the
 // cross-cutting concerns shared by every inbound source — per-route bearer
 // auth (constant-time), the 1 MiB body cap, the JSON Content-Type guard, the
-// audit row, GET /health, and the never-5xx contract. Each Receiver owns parse
-// + persist + hand-off for ITS OWN payload type and its own sink. Alertmanager
-// alerts route to the correlator; change events route to the change store and
-// never touch the correlator.
+// audit row, GET /health, and the 400/503/204 durability boundary: HTTP 204
+// means the payload is durably accepted, invalid input is 400, and a failure
+// to durably persist an otherwise-valid payload is 503. Each Receiver owns
+// parse + validate + durable acceptance for ITS OWN payload type.
 package ingress
 
 import (
@@ -40,15 +40,19 @@ const (
 )
 
 // Receiver is one inbound webhook source mounted on the shared host. The host
-// owns auth, the cap, the Content-Type guard, the audit row, and never-5xx; the
-// receiver owns parse + persist + hand-off for its OWN payload type.
+// owns auth, the cap, the Content-Type guard, and the audit row; the receiver
+// owns parse + validate + durable acceptance for its OWN payload type.
 type Receiver interface {
 	Route() string // e.g. "POST /webhook/alertmanager"
 	Name() string  // audit/log actor label: "alertmanager" | "change"
 	Token() []byte // per-route bearer token
-	// Ingest parses, persists, and hands off the body. A returned error maps to
-	// HTTP 400 (bad payload); it must NEVER be used for downstream/persist
-	// failures (those are logged and swallowed, so the host still answers 204).
+	// Ingest parses, validates, and durably persists the body. A plain
+	// returned error means the payload itself is invalid and maps to HTTP
+	// 400. An error that unwraps to a *DurabilityError means the payload was
+	// valid but could not be durably persisted, and maps to HTTP 503 so a
+	// well-behaved sender retries. Only HTTP 204 means the payload is
+	// durably accepted — nothing after a successful Ingest call (including
+	// the audit append) can turn the response into anything else.
 	Ingest(ctx context.Context, body []byte) (Summary, error)
 }
 
@@ -68,11 +72,15 @@ type LLMHealthReader interface {
 	Snapshot() llmhealth.Snapshot
 }
 
+type auditAppender interface {
+	Append(ctx context.Context, actor, kind string, payload any) error
+}
+
 // Server is the inbound webhook host. Construct with New; mount Handler() on an
 // http.Server bound to receivers.address.
 type Server struct {
 	store     *store.Store
-	auditor   *audit.Auditor
+	auditor   auditAppender
 	receivers []Receiver
 	logger    *slog.Logger
 	health    *health.Registry
@@ -127,7 +135,12 @@ func (s *Server) Handler() http.Handler {
 }
 
 // handleReceiver returns the shared pipeline for one receiver: auth →
-// Content-Type guard → cap → read → Ingest → audit → 204. Never 5xx.
+// Content-Type guard → cap → read → Ingest → 204 → audit. Ingest failures
+// map to 400 (invalid payload) or 503 (durability failure, via
+// *DurabilityError). Once Ingest has durably committed, the 204 is flushed
+// before the best-effort audit append, so that response cannot be delayed or
+// changed by the append. The handler still completes the bounded append before
+// returning; a subsequent request on the same connection may wait for it.
 func (s *Server) handleReceiver(r Receiver) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		ctx := req.Context()
@@ -155,18 +168,32 @@ func (s *Server) handleReceiver(r Receiver) http.HandlerFunc {
 
 		sum, err := r.Ingest(ctx, body)
 		if err != nil {
-			// Bad payload only — never downstream failures. 400, never 5xx.
+			var durable *DurabilityError
+			if errors.As(err, &durable) {
+				// The payload was valid but could not be durably persisted.
+				// Use a fixed public message: the wrapped error can carry
+				// raw driver text (e.g. a file path) that must never reach
+				// the caller.
+				http.Error(w, "delivery could not be persisted; retry later", http.StatusServiceUnavailable)
+				return
+			}
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		if appendErr := s.auditor.Append(ctx, r.Name(), sum.Kind, sum.Audit); appendErr != nil {
+		w.WriteHeader(http.StatusNoContent)
+		if flushErr := http.NewResponseController(w).Flush(); flushErr != nil && !errors.Is(flushErr, http.ErrNotSupported) {
+			s.logger.Warn("flush durable acceptance response", "err", flushErr)
+		}
+
+		auditCtx, cancelAudit := context.WithTimeout(context.WithoutCancel(ctx), DefaultWriteTimeout)
+		defer cancelAudit()
+		if appendErr := s.auditor.Append(auditCtx, r.Name(), sum.Kind, sum.Audit); appendErr != nil {
 			s.logger.Error("audit append failed",
 				slog.String("kind", sum.Kind),
 				slog.String("err", appendErr.Error()),
 			)
 		}
-		w.WriteHeader(http.StatusNoContent)
 	}
 }
 

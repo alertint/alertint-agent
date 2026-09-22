@@ -56,17 +56,52 @@ type Problem struct {
 	Tags       []KV      `json:"tags,omitempty"`
 }
 
+// ProblemPresence is the current state of one exact host/trigger binding.
+type ProblemPresence string
+
+const (
+	ProblemPresent ProblemPresence = "present"
+	ProblemAbsent  ProblemPresence = "absent"
+)
+
+// ProblemState is a bounded exact problem.get result.
+type ProblemState struct {
+	Presence ProblemPresence `json:"presence"`
+	EventIDs []string        `json:"event_ids,omitempty"`
+}
+
 type KV struct {
 	Tag   string `json:"tag"`
 	Value string `json:"value"`
 }
 
-// zItem is the item.get shape we read.
+// zItem is the item.get shape we read. HostID and Hosts are populated only
+// by the proactive exact-linked lookup (selectHosts), which uses them to
+// prove the item belongs to the requested host.
 type zItem struct {
-	ItemID    string `json:"itemid"`
-	ValueType string `json:"value_type"` // 0 float,1 char,2 log,3 uint,4 text,5 binary
-	Name      string `json:"name"`
-	Units     string `json:"units"`
+	ItemID    string     `json:"itemid"`
+	HostID    string     `json:"hostid"`
+	ValueType string     `json:"value_type"` // 0 float,1 char,2 log,3 uint,4 text,5 binary
+	Name      string     `json:"name"`
+	Units     string     `json:"units"`
+	Hosts     []zHostRef `json:"hosts"`
+}
+
+// zHostRef is the selectHosts ["hostid","host"] shape on items and events.
+type zHostRef struct {
+	HostID string `json:"hostid"`
+	Host   string `json:"host"`
+}
+
+// hostRefFor returns the hostid of the ref whose technical host name is
+// host, and whether any ref matched. An empty ref list matches nothing.
+func hostRefFor(refs []zHostRef, host string) (string, bool) {
+	for _, h := range refs {
+		if h.Host == host {
+			return h.HostID, true
+		}
+	}
+	return "", false
 }
 
 // Operator is the trigger-config knowledge (trigger.get + flap count).

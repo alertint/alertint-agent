@@ -15,6 +15,7 @@ package sentry
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,7 +23,24 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/alertint/alertint-agent/internal/httpcount"
 )
+
+// ErrResponseTooLarge is returned by the bounded (proactive preparation)
+// request path when the DECODED response body exceeds
+// observation/model.MaxDecodedResponseBytes — a much tighter cap than the legacy
+// maxRespBody below, because one reserved preparation request must never
+// allocate more than the fixed versioned limit. The excess is never read
+// into memory. Callers classify it with errors.Is.
+var ErrResponseTooLarge = errors.New("sentry: response exceeds the bounded decoded-body limit")
+
+// ErrRedirectRefused is returned by the bounded (proactive preparation)
+// request path when the source answers 3xx. Following a redirect would be
+// a second physical request outside the one durable reservation that
+// wrapped this attempt, so the bounded path never follows one; a 3xx is
+// also never retried. Callers classify it with errors.Is.
+var ErrRedirectRefused = errors.New("sentry: redirect refused on the bounded request path")
 
 // defaultTimeout matches the Prometheus/Loki clients.
 const defaultTimeout = 10 * time.Second
@@ -73,7 +91,11 @@ type Client struct {
 	baseURL    string
 	org        string
 	httpClient *http.Client
-	authHeader string
+	// boundedHTTP is httpClient with redirects disabled — the transport the
+	// bounded (proactive) methods use so one reservation is exactly one
+	// physical request.
+	boundedHTTP *http.Client
+	authHeader  string
 
 	// clk and maxRetries are overridable by same-package tests for
 	// deterministic rate-limit/backoff coverage without real sleeps.
@@ -99,14 +121,25 @@ func NewClient(cfg Config) *Client {
 	if timeout == 0 {
 		timeout = defaultTimeout
 	}
+	httpClient := &http.Client{Timeout: timeout}
 	return &Client{
-		baseURL:    strings.TrimRight(cfg.BaseURL, "/"),
-		org:        cfg.Org,
-		httpClient: &http.Client{Timeout: timeout},
-		authHeader: "Bearer " + cfg.Token,
-		clk:        realClock{},
-		maxRetries: defaultMaxRetries,
+		baseURL:     strings.TrimRight(cfg.BaseURL, "/"),
+		org:         cfg.Org,
+		httpClient:  httpClient,
+		boundedHTTP: noRedirectClient(httpClient),
+		authHeader:  "Bearer " + cfg.Token,
+		clk:         realClock{},
+		maxRetries:  defaultMaxRetries,
 	}
+}
+
+// noRedirectClient returns a shallow copy of base whose redirect policy
+// hands every 3xx back as the final response (http.ErrUseLastResponse)
+// instead of issuing a further, unreserved physical request.
+func noRedirectClient(base *http.Client) *http.Client {
+	cp := *base
+	cp.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &cp
 }
 
 // BaseURL returns the host-root base URL the client was built with (used by the
@@ -183,7 +216,32 @@ func (c *Client) ListDeploys(ctx context.Context, project, version string) ([]De
 // returns a typed *APIError carrying the status. The caller owns Body.Close on
 // success.
 func (c *Client) doGET(ctx context.Context, path string, query url.Values) (*http.Response, error) {
+	return c.doGETLoop(ctx, path, query, nil, nil, false)
+}
+
+// doGETInstrumented is doGET with a per-physical-attempt hook, for the
+// proactive preparation path (spec.md: "Existing ... Sentry retry behavior
+// must participate in reservation accounting, not hide requests inside one
+// apparent call"): before is called immediately before EACH physical
+// attempt, including 429/5xx retries — a non-nil error aborts before that
+// attempt is made; after reports each attempt's outcome immediately once
+// it completes. Both may be nil. Unlike doGET it never follows a redirect
+// (ErrRedirectRefused, reported through after and never retried), so each
+// before/after pair is exactly one physical request.
+func (c *Client) doGETInstrumented(ctx context.Context, path string, query url.Values,
+	before func() error, after func(started bool, err error)) (*http.Response, error) {
+	return c.doGETLoop(ctx, path, query, before, after, true)
+}
+
+// doGETLoop is the shared retry loop behind doGET (bounded=false: legacy
+// redirect-following transport) and doGETInstrumented (bounded=true).
+func (c *Client) doGETLoop(ctx context.Context, path string, query url.Values,
+	before func() error, after func(started bool, err error), bounded bool) (*http.Response, error) {
 	target := c.baseURL + path
+	httpClient := c.httpClient
+	if bounded {
+		httpClient = c.boundedHTTP
+	}
 	if enc := query.Encode(); enc != "" {
 		target += "?" + enc
 	}
@@ -192,18 +250,41 @@ func (c *Client) doGET(ctx context.Context, path string, query url.Values) (*htt
 	// retries exhausted, or cancelled mid-backoff), so there is no reachable
 	// post-loop exit to handle.
 	for attempt := 0; ; attempt++ {
+		if before != nil {
+			if err := before(); err != nil {
+				return nil, err
+			}
+		}
+
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 		if err != nil {
+			if after != nil {
+				after(false, err)
+			}
 			return nil, err
 		}
 		req.Header.Set("Authorization", c.authHeader)
 
-		resp, err := c.httpClient.Do(req)
+		httpcount.Observe(ctx)
+		resp, err := httpClient.Do(req)
 		if err != nil {
+			if after != nil {
+				after(true, err)
+			}
 			return nil, fmt.Errorf("sentry request: %w", err)
 		}
 		if resp.StatusCode == http.StatusOK {
+			if after != nil {
+				after(true, nil)
+			}
 			return resp, nil
+		}
+		if bounded && resp.StatusCode >= 300 && resp.StatusCode <= 399 {
+			_ = resp.Body.Close()
+			if after != nil {
+				after(true, ErrRedirectRefused)
+			}
+			return nil, ErrRedirectRefused
 		}
 
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrBody))
@@ -212,7 +293,13 @@ func (c *Client) doGET(ctx context.Context, path string, query url.Values) (*htt
 		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
 		if !retryable || attempt >= c.maxRetries {
 			_ = resp.Body.Close()
+			if after != nil {
+				after(true, apiErr)
+			}
 			return nil, apiErr
+		}
+		if after != nil {
+			after(true, apiErr)
 		}
 
 		delay := c.backoffDelay(resp, attempt)
@@ -318,6 +405,23 @@ func linkAttr(seg, name string) string {
 		return ""
 	}
 	return rest[:j]
+}
+
+// readBounded reads at most limit bytes of the (already transport-decoded)
+// body, reading limit+1 through an io.LimitReader so an over-limit body is
+// detected without buffering the remainder (ErrResponseTooLarge). Go's
+// http.Transport transparently gunzips a body it negotiated itself (the
+// client never sets Accept-Encoding), so the cap applies to the DECODED
+// stream, never the compressed wire size.
+func readBounded(r io.Reader, limit int64) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, ErrResponseTooLarge
+	}
+	return body, nil
 }
 
 // snippet returns a short single-line excerpt of a response body for errors.

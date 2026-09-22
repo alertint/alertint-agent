@@ -25,6 +25,7 @@ import (
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/rules"
 	"github.com/alertint/alertint-agent/internal/sentry"
+	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/skills/acutetriage"
 	"github.com/google/uuid"
@@ -110,6 +111,58 @@ func insertTestAlert(t *testing.T, st *store.Store, ctx context.Context, inciden
 		t.Fatalf("add alert to incident: %v", err)
 	}
 	return a
+}
+
+// insertTestAlertDelivery inserts one immutable AlertDelivery (alerts +
+// alert_deliveries + the incident_alerts/incident_alert_deliveries
+// attachment links, mirroring a real correlation write) and returns the
+// resulting Alert projection plus the delivery's own immutable id — the
+// frozen identity a TriageAttemptClaim.MemberDeliveryIDs entry names. Task
+// 7's Analyze reads member content through this delivery id set (Finding #1
+// of the Task 7 fix round); insertTestAlert's bare legacy alerts/
+// incident_alerts write has no alert_deliveries row for a claim to freeze
+// at all, so every test that drives Analyze directly (via a
+// TriageAttemptClaim) must use this helper instead.
+func insertTestAlertDelivery(t *testing.T, st *store.Store, ctx context.Context, incidentID, fp string, labels, annotations map[string]string) (store.Alert, string) {
+	t.Helper()
+	now := time.Now().UTC()
+	deliveryID := "delivery-" + fp
+	di := store.DeliveryInput{
+		ID: deliveryID,
+		Alert: store.Alert{
+			ID:          "alert-" + fp,
+			Fingerprint: fp,
+			Status:      "firing",
+			Labels:      labels,
+			Annotations: annotations,
+			StartsAt:    now,
+			ReceivedAt:  now,
+		},
+		Source:                   "alertmanager",
+		SourceEpisodeKey:         "alertmanager:" + fp + ":" + now.Format(time.RFC3339Nano),
+		StartedAtBasis:           situationmodel.SourceTimeBasisSourcePayload,
+		ResolvedAtBasis:          situationmodel.SourceTimeBasisMissing,
+		ReceiverGroupingIdentity: "group:" + fp,
+		PayloadDigest:            "sha256:" + deliveryID,
+		SourceProvenance:         store.SourceProvenance{AcquisitionMode: store.SourceAcquisitionWebhook},
+	}
+	dels, err := st.AcceptDeliveries(ctx, []store.DeliveryInput{di})
+	if err != nil || len(dels) != 1 {
+		t.Fatalf("accept delivery: %v (%d)", err, len(dels))
+	}
+	delivery := dels[0]
+
+	if _, err := st.DB().ExecContext(ctx, `
+		INSERT OR IGNORE INTO incident_alerts (incident_id, alert_id, created_at) VALUES (?, ?, ?)`,
+		incidentID, delivery.Alert.ID, now.Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("attach incident alert: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `
+		INSERT INTO incident_alert_deliveries (incident_id, delivery_id, created_at) VALUES (?, ?, ?)`,
+		incidentID, delivery.ID, now.Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("link incident alert delivery: %v", err)
+	}
+	return delivery.Alert, delivery.ID
 }
 
 // validLLMResponse builds a minimal valid llmResponse JSON for the given alert IDs.

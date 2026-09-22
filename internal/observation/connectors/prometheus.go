@@ -1,0 +1,264 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package connectors
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/alertint/alertint-agent/internal/observation"
+	model "github.com/alertint/alertint-agent/internal/observation/model"
+	"github.com/alertint/alertint-agent/internal/prometheus"
+)
+
+// PrometheusClient is the narrow bounded-query boundary
+// PrometheusExecutor depends on; *prometheus.Client structurally satisfies
+// it via QueryRangeBounded.
+type PrometheusClient interface {
+	QueryRangeBounded(ctx context.Context, expr string, start, end time.Time, step time.Duration, limit int) (json.RawMessage, error)
+}
+
+type PrometheusRuleClient interface {
+	RuleDefinitionObservedBounded(ctx context.Context, producerID, group, rule string, scope map[string]string,
+		before func() error, after func(bool, error)) (prometheus.RuleDefinition, error)
+}
+
+type prometheusRuleParameters struct {
+	SourceInstanceID string            `json:"source_instance_id"`
+	ProducerID       string            `json:"producer_id"`
+	Group            string            `json:"group"`
+	Rule             string            `json:"rule"`
+	ScopeLabels      map[string]string `json:"scope_labels"`
+	FreshForSeconds  int               `json:"fresh_for_seconds"`
+}
+
+// PrometheusExecutor implements observation.Executor for prometheus_query:
+// a deterministic selector built from the frozen plan's scope (never a
+// generator-URL target, never a model-authored query), summarized with
+// bounded, deterministic statistics — never a raw matrix persisted verbatim.
+type PrometheusExecutor struct {
+	Client PrometheusClient
+	Clock  func() time.Time
+}
+
+func (e *PrometheusExecutor) clock() time.Time {
+	if e.Clock != nil {
+		return e.Clock()
+	}
+	return time.Now().UTC()
+}
+
+func (e *PrometheusExecutor) Execute(ctx context.Context, plan model.Plan, recorder observation.RequestRecorder) (model.Run, error) {
+	now := e.clock()
+	if plan.Scope.Source == "alertmanager" && (plan.Purpose == "alertmanager_rule_definition" || strings.HasPrefix(plan.Purpose, "expected_behavior_validation:")) {
+		return e.executeRuleDefinition(ctx, plan, recorder, now)
+	}
+	expr, err := buildPromQLSelector(plan.Scope)
+	if err != nil {
+		return unresolvedRun(plan, now), nil
+	}
+
+	reservation, err := recorder.BeforeRequest(ctx)
+	if err != nil {
+		if errors.Is(err, model.ErrBudgetExhausted) {
+			return withheldRun(plan, now), nil
+		}
+		return model.Run{}, fmt.Errorf("connectors: reserve prometheus request: %w", err)
+	}
+
+	limit := plan.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	raw, execErr := e.Client.QueryRangeBounded(ctx, expr, plan.Start, plan.End, 0, limit+1)
+
+	if outcomeErr := recorder.AfterRequest(ctx, model.RequestOutcome{
+		ReservationID: reservation.ID, RequestStarted: model.RequestStartedTrue, Code: outcomeCode(execErr), CompletedAt: e.clock(),
+	}); outcomeErr != nil {
+		return model.Run{}, fmt.Errorf("connectors: record prometheus outcome: %w", outcomeErr)
+	}
+	expiresAt := now.Add(model.MaxWindowHoursMetricsLogs * time.Hour)
+	if execErr != nil {
+		if isResponseTooLarge(execErr) {
+			return responseTooLargeRun(plan, now, expiresAt), nil
+		}
+		return model.Run{}, fmt.Errorf("connectors: prometheus query: %w", execErr)
+	}
+
+	summary, truncated, err := summarizePrometheusMatrix(raw, limit)
+	if err != nil {
+		return model.Run{}, fmt.Errorf("connectors: parse prometheus response: %w", err)
+	}
+
+	value, kept, err := fitFactValue(len(summary.Series), func(n int) ([]byte, error) {
+		return json.Marshal(metricSummary{Series: summary.Series[:n]})
+	})
+	if err != nil {
+		return model.Run{}, fmt.Errorf("connectors: marshal metric summary: %w", err)
+	}
+	omitted := len(summary.Series) - kept
+	if truncated {
+		omitted++ // the overflow sentinel series: at least one more exists
+	}
+	return boundedRun(plan, now, boundedResult{
+		Kind: "metric_summary", Value: value, Returned: kept, Omitted: omitted,
+		Truncated: truncated, Capped: kept < len(summary.Series), ExpiresAt: expiresAt,
+	}), nil
+}
+
+func (e *PrometheusExecutor) executeRuleDefinition(ctx context.Context, plan model.Plan, recorder observation.RequestRecorder, now time.Time) (model.Run, error) {
+	var params prometheusRuleParameters
+	if json.Unmarshal(plan.Parameters, &params) != nil || params.SourceInstanceID == "" || params.ProducerID == "" || params.Group == "" || params.Rule == "" {
+		return unresolvedRun(plan, now), nil
+	}
+	client, ok := e.Client.(PrometheusRuleClient)
+	if !ok {
+		return unresolvedRun(plan, now), nil
+	}
+	before, after, budgetExhausted := requestHooks(ctx, recorder, e.clock)
+	definition, execErr := client.RuleDefinitionObservedBounded(ctx, params.ProducerID, params.Group, params.Rule, params.ScopeLabels, before, after)
+	freshFor := time.Duration(params.FreshForSeconds) * time.Second
+	if freshFor <= 0 {
+		freshFor = 5 * time.Minute
+	}
+	observation := model.SourceDefinitionObservation{Source: "alertmanager", InstanceID: params.SourceInstanceID,
+		RuleID: definition.RuleID, Host: canonicalLabelIdentity(params.ScopeLabels), EndpointID: params.ProducerID, ProducerID: params.ProducerID, RuleGroup: params.Group,
+		Available: definition.Available, VersionAlgorithm: definition.VersionAlgorithm, Version: definition.Version,
+		UnavailableReason: definition.UnavailableReason, HistoricalProven: false, Presence: definition.Presence, ScopeLabels: params.ScopeLabels}
+	if execErr != nil {
+		if *budgetExhausted {
+			return withheldRun(plan, now), nil
+		}
+		observation.Available = false
+		observation.VersionAlgorithm = ""
+		observation.Version = ""
+		observation.Presence = "unknown"
+		observation.UnavailableReason = "api_unavailable"
+	}
+	value, err := json.Marshal(observation)
+	if err != nil {
+		return model.Run{}, err
+	}
+	return boundedRun(plan, now, boundedResult{Kind: "source_definition", Value: value, Returned: 1, ExpiresAt: now.Add(freshFor)}), nil
+}
+
+func withheldRun(plan model.Plan, now time.Time) model.Run {
+	return model.Run{
+		ID: "run:" + plan.ID, CycleID: plan.CycleID, PlanID: plan.ID, Status: model.ResultWithheldByBudget,
+		Coverage:        model.Coverage{Start: plan.Start, End: plan.End, Complete: false},
+		LimitationCodes: []string{"withheld_by_budget"},
+		ObservedAt:      now, ExpiresAt: now.Add(24 * time.Hour),
+	}
+}
+
+// buildPromQLSelector deterministically builds an exact-match PromQL
+// selector from scope's labels — sorted for a stable, reproducible
+// expression string, using only configured label keys/values already
+// resolved onto the plan; never a generator URL or free-form annotation
+// text. An empty label set is unresolvable (spec.md: "An unresolved or
+// ambiguous scope produces vocabulary_unresolved, without a broad
+// fallback").
+func buildPromQLSelector(scope model.Scope) (string, error) {
+	if len(scope.Labels) == 0 {
+		return "", fmt.Errorf("connectors: prometheus scope has no labels to select on")
+	}
+	keys := make([]string, 0, len(scope.Labels))
+	for k := range scope.Labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	matchers := make([]string, 0, len(keys))
+	for _, k := range keys {
+		matchers = append(matchers, fmt.Sprintf("%s=%q", k, scope.Labels[k]))
+	}
+	expr := "{"
+	for i, m := range matchers {
+		if i > 0 {
+			expr += ","
+		}
+		expr += m
+	}
+	expr += "}"
+	return expr, nil
+}
+
+// metricSummary is the bounded, deterministic statistics shape persisted
+// for prometheus_query — never a raw matrix (spec.md: "Persist series
+// summaries, sample coverage and finite-value checks, not raw matrices").
+type metricSummary struct {
+	Series []seriesSummary `json:"series"`
+}
+
+type seriesSummary struct {
+	Labels      map[string]string `json:"labels"`
+	SampleCount int               `json:"sample_count"`
+	FiniteCount int               `json:"finite_count"`
+	Min         float64           `json:"min,omitempty"`
+	Max         float64           `json:"max,omitempty"`
+	Last        float64           `json:"last,omitempty"`
+	AllFinite   bool              `json:"all_finite"`
+}
+
+func summarizePrometheusMatrix(raw json.RawMessage, limit int) (metricSummary, bool, error) {
+	var payload struct {
+		ResultType string `json:"resultType"`
+		Result     []struct {
+			Metric map[string]string `json:"metric"`
+			Values [][2]any          `json:"values"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return metricSummary{}, false, fmt.Errorf("decode matrix: %w", err)
+	}
+
+	// Canonical order before truncation and hashing: a source-side
+	// permutation of the same series must never change which series are
+	// kept or the resulting fact digest (F28).
+	sort.SliceStable(payload.Result, func(i, j int) bool {
+		return canonicalLabelIdentity(payload.Result[i].Metric) < canonicalLabelIdentity(payload.Result[j].Metric)
+	})
+	series, _, truncated := truncateToLimit(payload.Result, limit)
+
+	out := metricSummary{Series: make([]seriesSummary, 0, len(series))}
+	for _, s := range series {
+		summary := seriesSummary{Labels: s.Metric, AllFinite: true}
+		var lo, hi, last float64
+		first := true
+		for _, sample := range s.Values {
+			summary.SampleCount++
+			valStr, ok := sample[1].(string)
+			if !ok {
+				summary.AllFinite = false
+				continue
+			}
+			v, err := strconv.ParseFloat(valStr, 64)
+			if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+				summary.AllFinite = false
+				continue
+			}
+			summary.FiniteCount++
+			if first {
+				lo, hi = v, v
+				first = false
+			} else {
+				if v < lo {
+					lo = v
+				}
+				if v > hi {
+					hi = v
+				}
+			}
+			last = v
+		}
+		summary.Min, summary.Max, summary.Last = lo, hi, last
+		out.Series = append(out.Series, summary)
+	}
+	return out, truncated, nil
+}

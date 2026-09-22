@@ -12,6 +12,10 @@ Everything below runs inside a single `alertint serve` process with local
 SQLite state — one binary, one config file, no external dependencies to
 install.
 
+For an operator-focused view of the complete v0.14 lifecycle, including
+recovery, expected maintenance and retry boundaries, open the standalone
+[Situation workflow](situation-workflow.html).
+
 Two feedback loops close on the triage step, and both are why the same
 condition doesn't get the same wrong answer twice: the **verification round**
 makes each analysis falsify its own draft before the finding persists, and an
@@ -45,13 +49,55 @@ instead of pushed.
   `changes.ingress.webhook_token_env`)
 - **No custom format required** on any of them
 
-### 2. Persistence and deduplication
+### 2. Durable acceptance and deduplication
 
-Received alerts are written to local state (SQLite). Duplicate firings of
-the same alert fingerprint are collapsed — one record per logical alert.
+Received alerts are written to local state (SQLite) as an immutable,
+append-only delivery — the receiver acknowledges the sender (`204`) only
+once that delivery *and* a pending dispatch record for it have committed
+together in one transaction. Duplicate firings of the same alert
+fingerprint still collapse to one record in the latest-wins `alerts`
+projection, but the underlying delivery ledger keeps every accepted
+delivery, so a replayed webhook (the same sender retrying, or a restart
+resending an unacknowledged batch) is recognized by its deterministic
+content digest and resolves to the same delivery — a safe no-op, never a
+duplicate. A structurally invalid payload is rejected `400` before
+anything is written; a payload that's valid but can't be durably
+persisted returns `503` so a well-behaved sender retries — nothing is
+ever silently dropped or acknowledged without being on disk.
+
+The audit row is best effort and follows this acceptance boundary. A sender
+may observe `204` before that row becomes readable; the bounded append keeps
+running if the client disconnects. The append still completes in the request
+handler, so a client reusing the same HTTP connection may wait for it before
+the server reads that connection's next request.
+
+This same content digest has a consequence worth naming for a repeat-capable
+sender: because the delivery id is derived purely from the normalized
+payload (never from a receipt timestamp), a genuine repeat whose payload is
+byte-identical to one already accepted — a Zabbix escalation step resending
+the same macros, for example — resolves to the *same* delivery, not a new
+one. The repeat is deduped exactly as intended, but it also does not slide
+the collapse window forward the way current main's `last_seen`/`received_at`
+touch used to for such a sender: an identical resend is invisible to the
+collapse horizon rather than extending it. A sender whose repeats carry even
+one changed byte (a refreshed timestamp field, an incremented counter) is
+unaffected — that produces a distinct digest and a distinct delivery as
+before.
+
+A background worker drains the pending-dispatch queue and hands each
+delivery to the Correlator below. This closes the crash window a receiver
+POST used to leave open between accepting an alert and correlating it: if
+the agent restarts before a dispatch is claimed, or after it's claimed but
+before correlation commits, the delivery is still on disk and is claimed
+and correlated again on the next drain — startup runs this drain to
+completion before accepting new inbound traffic (see "Situation
+foundation" below).
 
 - **Storage:** local SQLite, configurable path
-- **Dedup key:** alert fingerprint
+- **Dedup key:** alert fingerprint (`alerts` projection); delivery content
+  digest (durable delivery ledger)
+- **Durability boundary:** `204` = delivery + dispatch committed; `400` =
+  rejected, nothing written; `503` = valid but not yet durable, retry
 
 ### 3. Correlation
 
@@ -68,18 +114,170 @@ here too: storm collapse, known-issue short-circuits, and prompt selection.
 - **Grouping identity:** Receiver default; optional `correlator.group_labels` override
 - **Window:** `correlator.window_seconds`, default 90 s
 
+### 3a. Situation foundation and controller
+
+Every correlated delivery also feeds a **Situation** — a durable record
+that owns one or more Incidents under one exact group key across restarts,
+so a fresh firing of the same group finds its durable history waiting
+rather than starting from nothing. In v0.14, the controller can terminate
+an episode as recovered, or close it with uncertainty once the lifecycle
+observation deadline expires. A terminal Situation refuses new work; a
+later firing opens a fresh Situation linked to the prior episode.
+
+Recovery follows Alert membership rather than whichever group happens to be
+collecting when the recovery arrives. One durable delivery remains the owner,
+while every relevant nonterminal Incident projection sees the same applied
+source history. A re-fire during recovery grace keeps the Situation active and
+returns it to investigation. A delayed resolution from an older source episode
+cannot close a newer firing episode.
+
+The durable Situation foundation and fenced Situation controller are wired
+end to end in the v0.14 release line. Local Store facts (durability,
+correlation, exact-group grouping) feed the
+"B+" Acute Triage gate — every ready Incident is durably `awaiting_decision`
+until the controller's own fenced cycle requests, skips, or leaves it
+parked, and only a requested decision ever dispatches the triage skill (see
+["ready" in Incident lifecycle](#incident-lifecycle) below). Every reconcile
+cycle derives one authoritative Assessment (material facts, an
+operator-facing Attention level, and a bounded action contract) and is
+visible read-only through MCP (`alertint_list_situations`,
+`alertint_get_situation`) once it has run at least once for a Situation.
+Every authoritative material change commits one
+**immutable Transition** and one version of a **current Episode summary** in
+the same fenced transaction as the state it describes, together with every
+notification intent that change warrants — and the Situation delivery worker
+is the **only** Slack writer in runtime assembly. The Incident-keyed Slack
+card, its resolve edit, and its recurrence replies described in
+[Outbound notification](#8-outbound-notification) below are removed there;
+Slack presents one Situation root plus an immutable ordered journal instead
+(see [Slack](../notifications/slack.md#situation-owned-slack)). The two
+`AlertINT system` installation messages — LLM dependency health and
+Slack-delivery-gap recovery — are the only sanctioned exceptions.
+Before each reconcile cycle derives its Assessment,
+a fenced **evidence-preparation** pass plans and executes a bounded set of
+read-only capability checks — the same seven-capability catalog Phase 1's
+evidence pack draws from (local prior-Situation state, Prometheus, Loki,
+Sentry, Zabbix metric/problem history, change events) — against the
+Situation's own current member set, freezes the plan into a durable cycle
+before any physical request runs (so a crash mid-attempt retries the exact
+same frozen plan rather than minting a new one), and commits each
+capability's normalized result durably before the reconcile cycle reads it.
+Every physical request is bounded per cycle
+(`situations.preparation.max_source_calls_per_cycle`) and per wall clock
+(`situations.preparation.max_wall_seconds`, shared by both the lifecycle and
+assessment phases of one cycle) — see
+[Configuration: `situations`](../getting-started/configuration.md#situations).
+Alongside it, a durable **advisory semantic-profile** worker pool infers a
+bounded, closed-schema interpretation hint (subject/event kind, possible
+role, candidate scope, horizon tier, useful capabilities, uncertainty) for
+each distinct alert-generating source identity it has not already profiled,
+deduplicated so many deliveries sharing one identity create at most one
+inference job. A profile is advisory only: it can widen which capabilities
+get planned or how far back a read looks, but it can never assert that an
+alert is firing or resolved, grant investigative authority, create a
+Sufficient reason, resolve a sibling, or reach Slack directly — the
+[malicious-input case](scope-and-limits.md) this build defends against by
+construction. Profile inference and Situation Assessment share the same L0
+(profile) + L2 (Assessment) provider concurrency limiter
+(`situations.llm_concurrency`) with Assessment always winning a contested
+slot; at most one profile inference runs at a time regardless of
+`situations.semantic_profiles.workers`. An operator can read a profile's
+current head and version history, or submit a confirmed correction, over
+MCP (`alertint_get_semantic_profile`, `alertint_correct_semantic_profile`);
+a correction is append-only (a new immutable version, never an edit) and
+fans out to every matching nonterminal Situation. Unused per-run normalized
+detail (not current source-lifecycle evidence, not referenced by a
+dispatched or committed Assessment, not part of an open cycle) expires 10
+days after its own durable completion time — a fixed, non-configurable
+retention rule that never deletes the Run's own identity, digest, coverage,
+or accounting, and never touches an Alert delivery, Situation history,
+semantic profile, or request accounting.
+
+Source lifecycle folds from real, source-proven evidence, not a single
+receipt clock: each prepared observation carries its own acquisition mode
+(webhook or poll) and, when polling, the connector's own configured
+interval — never an inferred guess from the receipt timestamp alone. A
+webhook recovery gets a fixed recovery grace before the Situation may treat
+it as resolved; a polling recovery's grace is twice its own poll interval
+(clamped to 2–10 minutes), since a poll can only prove a state as current as
+its own last successful cycle. Every member alert also carries its own
+observation deadline — how long a Situation waits past its effective start
+before a still-unobserved member (never firing, never resolved) can no
+longer block closure — derived from the Situation's own duration class, so
+a long-running Situation is never closed out just because one source has
+gone quiet.
+
+Operator expected-until judgments and reusable expected schedules are
+versioned, auditable Situation records controlled through MCP. They can change
+assessment and Slack context, but never source state, investigation work,
+budgets, lifecycle, or recovery.
+Everything in Phase 1 below Correlation — memory, evidence, triage,
+verification — still runs keyed off the Incident, unaffected by which
+Situation an Incident belongs to. There is no `state_controller_mode`,
+shadow-output path, or legacy/new runtime switch: one build runs one
+grouping/dispatch path, and one Slack writer, at a time.
+
+- **MCP tools:** `alertint_list_situations`, `alertint_get_situation`,
+  `alertint_list_situation_transitions`, `alertint_get_delivery_state`,
+  `alertint_list_observation_runs`, `alertint_get_semantic_profile`,
+  `alertint_correct_semantic_profile`, Situation judgment tools, and expected
+  schedule tools — see
+  [MCP clients](../integrations/mcp-clients.md)
+- **Config:** `situations.*`, including `situations.preparation.*` and
+  `situations.semantic_profiles.*` — see
+  [Configuration](../getting-started/configuration.md#situations)
+- **Observability:** every controller cycle, every consumed L2 dispatch
+  slot, every consumed Acute Triage attempt, every evidence-preparation
+  phase call, every capability's own connector dispatch, and every
+  semantic-profile inference dispatch is one OpenTelemetry span
+  (`situation.controller.reconcile`, `situation.assessment.dispatch`,
+  `incident.triage.attempt`, `situation.preparation`,
+  `situation.observation`, `semantic_profile.inference`) carrying only
+  stable identity, digest, count, closed result-class, and duration
+  attributes — Situation/Incident/attempt IDs, input version, material/basis
+  hashes, membership/Incident-input/evidence-pack digests, dispatch slot and
+  attempt number — never a prompt, proposal, provider body, or SQL text. The
+  audit log records the same preparation/profile events by durable ID —
+  cycle begun, inference call dispatched/completed, profile head advanced,
+  profile change delivered, and profile correction applied. Each span site
+  also writes one
+  structured log line with the same identities plus the span's
+  `trace_id`/`span_id`, and the audit log carries the same identities, so
+  the three surfaces can be reconciled against each other and against the
+  store by identity. Spans go through the OpenTelemetry global tracer
+  provider, which is a no-op unless the operator enables the OTLP trace
+  exporter under
+  [`telemetry.otlp`](../getting-started/configuration.md#telemetry) —
+  no telemetry leaves the process by default.
+- **Slack:** one root per published Situation plus an immutable ordered
+  journal, delivered from durable intents with indefinite retry, five-minute
+  Delivery gaps, and complete recovery replay — see
+  [Slack](../notifications/slack.md#situation-owned-slack)
+- **stdout:** one `{"kind":"situation.transition",…}` line per committed
+  Transition, deduplicated by `transition_id`; it means the change is
+  durable, never that Slack has seen it
+- **Not included:** Assessment/Triage artifacts beyond the bounded
+  recent-attempt history, automatic operator questions, and OpenTelemetry
+  metrics or logs export (traces only today)
+
 ### 4. Memory
 
 Before spending an analysis, **AlertINT** checks whether it has seen this
 condition before. A re-fire of an already-analyzed group key inside the
-collapse horizon attaches as an **occurrence** — the Slack card edits in
-place, no second LLM call. A genuinely new incident whose key matches a past
+collapse horizon attaches as an **occurrence** — no second LLM call. In v0.14
+the attach moves the owning Situation's recurrence count (closed
+predecessors plus its own re-fires): the root shows `recurred ×N`, and a
+crossed milestone rung is one quiet reply in the Situation's thread — never a
+channel message. A genuinely new incident whose key matches a past
 analysis gets the prior finding **recalled** into its prompt as a past
 hypothesis, never as evidence. See [incident
 memory](incident-memory.md).
 
-- **Collapse:** occurrence attach, no LLM call; re-judgment only on an
-  escalation trigger
+- **Collapse:** occurrence attach, no LLM call. An escalation trigger
+  (severity rise, new alert type, cadence spike, occurrence/time ceiling) is
+  durably recorded on the occurrence, but nothing currently acts on it —
+  automatic re-judgment on that trigger remains outside this release. See
+  [incident memory](incident-memory.md#recurrence-collapse).
 - **Recall:** distilled prior findings, recurrence count, cadence
 
 ### 5. Evidence pack
@@ -125,13 +323,17 @@ confidence. See [verification round](verification-round.md).
 
 ### 8. Outbound notification
 
-The final finding — the post-verification judgment, not the draft — is
-emitted as one JSON line on stdout and, when configured, posted to a Slack
-channel. When all alerts recover, **AlertINT** updates the original Slack
-message in-place (🔴 → ✅) and posts a short resolution note in the thread.
+The final finding — the post-verification judgment, not the draft — reaches
+the durable Situation history and the configured stdout stream. In v0.14 Slack
+is written only by the Situation delivery worker described in
+[3a](#3a-situation-foundation-and-controller) — one root per Situation plus
+an immutable ordered journal, from durable intents that retry indefinitely
+(see [Slack](../notifications/slack.md#situation-owned-slack)). Nothing
+in this build posts an Incident-shaped card, thread reply, or recurrence
+reply any more.
 
 - **Method:** stdout (always available) and Slack Bot Token API
-  (`chat.postMessage` / `chat.update`)
+  (`chat.postMessage` / `chat.update`), written by exactly one path
 
 ## Phase 2 — Investigate
 
@@ -220,8 +422,12 @@ collecting  →  ready  →  processing  →  analyzed
 - `collecting`: window is open, alerts arriving.
 - `ready`: window expired; a durable **triage schedule** — phase, attempt
   count, next-due time, attempt-start time, bounded last-error — is seeded
-  for the incident, one row per incident, and it dispatches to the triage
-  skill.
+  for the incident, one row per incident. In v0.14 (see [Situation foundation and
+  controller](#3a-situation-foundation-and-controller) above), that
+  schedule starts in phase `awaiting_decision` and only dispatches to the
+  triage skill once the owning Situation's controller has recorded a
+  `request` decision against it — a `skip` decision, or the Situation
+  staying parked, leaves it undispatched instead.
 - `processing`: the transition to `processing` happens *before* the triage
   skill is called and is a real in-flight lease, not a display value — a
   crash mid-call is distinguishable from a clean run. If the skill errors
@@ -269,29 +475,48 @@ A recurrence of an `analyzed` incident attaches as an occurrence rather than
 minting a new row — the lifecycle above describes one incident, not one
 firing.
 
-**Honest limitation:** the triage *schedule* is durable, but the Correlator's
-own alert queue is not. A Receiver persists an alert to the store before
-handing it to the Correlator, but that handoff itself is a bounded in-memory
-channel, and the triage skill call runs synchronously inside the single
-Correlator loop — correlation pauses for its duration, and a crash between
-persisting an alert and its handoff can still lose that handoff. A durable
-Receiver-to-Correlator delivery ledger and/or an asynchronous triage worker
-are a separate, future architecture item.
+The triage *schedule* is durable, and so is the path that feeds it: a
+Receiver no longer hands an alert to the Correlator directly through an
+in-memory channel — it durably accepts the delivery (see "Durable
+acceptance and deduplication" above), and a background worker, on its own
+schedule, claims and correlates it. A crash at any point between accepting
+a delivery and correlating it loses nothing; the pending dispatch is still
+on disk and is picked up on the next drain, at startup or otherwise.
+
+**Honest limitation:** the triage skill call itself still runs
+synchronously inside the Correlator's own fixed-window-flush/retry loop —
+that loop pauses for the duration of a triage call, exactly as before this
+foundation shipped. That loop is a separate goroutine from the
+delivery-dispatch worker above, so a slow triage call no longer blocks new
+deliveries from being correlated — but triage dispatch itself is still one
+call at a time. An asynchronous triage worker is a separate, future
+architecture item.
 
 ## LLM dependency health
 
 The configured LLM is an installation-level dependency, observed below Acute
 Triage rather than owned by any Incident or Situation. Each distinct use of
-the LLM — the triage draft (Call 1), the bounded PromQL query repair, the
-verification re-judgment (Call 2), the optional memory classifier, and the
-idle probe — is its own **LLM capability**, cleared only by its own success:
+the LLM — the triage draft (Call 1), the Situation assessment, the bounded
+PromQL query repair, the verification re-judgment (Call 2), the optional
+memory classifier, and the idle probe — is its own **LLM capability**:
 
-- A `triage_draft` failure makes the installation `unavailable`; a
-  `verification_rejudge` failure makes it `degraded` while drafts continue
-  to ship. `memory_classifier` and `query_repair` (the one bounded PromQL
-  repair call before Call 2) are reported independently and never change
-  the rolled-up state — a repair only runs when the model proposed invalid
-  PromQL, so its success could never be relied on to clear a failure.
+- A `triage_draft` or `assessment` failure makes the installation
+  `unavailable`; a `verification_rejudge` failure makes it `degraded` while
+  drafts continue to ship. `memory_classifier` and `query_repair` (the one
+  bounded PromQL repair call before Call 2) are reported independently and
+  never change the rolled-up state — a repair only runs when the model
+  proposed invalid PromQL, so its success could never be relied on to clear
+  a failure.
+- A content-class failure (the model's output for that use is unusable,
+  corroborated across two Incidents) is cleared only by that capability's
+  own success. A dependency-class failure (timeout, network, provider
+  error) on any capability served by the shared primary client —
+  `triage_draft`, `assessment`, `verification_rejudge`, `query_repair` — is
+  cleared by a real success on any of those four, because that success
+  proves the shared transport and provider are back; the capability that
+  was not called keeps its own last-success time. A `memory_classifier`
+  success never clears them, and their success never clears the classifier
+  (it may run on a separate model).
 - After five idle minutes with zero in-flight calls, a strictly
   non-generating metadata `GET` probes reachability — never a completion,
   never a prompt. A dependency-class probe failure also makes the
@@ -342,8 +567,10 @@ or the `alertint_verify_audit` MCP tool.
 - **No silent config drift** — unknown YAML keys are rejected at load time.
 - **No inline secrets** — all secret values come from env vars named by
   config fields.
-- **No 5xx to a sender** — ingress always returns 2xx or 4xx; errors are
-  logged, not propagated upstream to Alertmanager or Zabbix.
+- **5xx only means "retry me"** — ingress returns `503` exclusively when a
+  structurally valid payload could not be durably persisted (e.g. SQLite
+  unavailable), so a well-behaved sender retries the exact same body; a
+  payload ingress has decided to reject is always `4xx`, never `5xx`.
 - **Single binary, SQLite state** — no external dependencies to install.
 - **Read-only outward** — every connector issues queries only. The single
   write path is an operator verdict, and it writes to **AlertINT**'s own

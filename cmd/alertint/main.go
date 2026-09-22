@@ -30,8 +30,11 @@ import (
 	"os/signal"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/backup"
@@ -48,12 +51,12 @@ import (
 	"github.com/alertint/alertint-agent/internal/logs/loki"
 	internalmcp "github.com/alertint/alertint-agent/internal/mcp"
 	"github.com/alertint/alertint-agent/internal/notify"
-	notifyresolution "github.com/alertint/alertint-agent/internal/notify/resolution"
 	notifyslack "github.com/alertint/alertint-agent/internal/notify/slack"
 	notifystdout "github.com/alertint/alertint-agent/internal/notify/stdout"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/rules"
 	"github.com/alertint/alertint-agent/internal/sentry"
+	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/internal/zabbix"
 	"github.com/alertint/alertint-agent/packs"
@@ -167,6 +170,16 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 
 	logConfigWarnings(logger, cfg)
 
+	// Operator-configured observability boundary: an OTLP trace exporter
+	// only when telemetry.otlp is enabled, otherwise nothing is installed
+	// and every span stays a no-op. Deferred so the final flush runs after
+	// the foundation stop sequence below has ended its last span.
+	stopTelemetry, err := startTelemetry(ctx, cfg, resolveVersion(), logger)
+	if err != nil {
+		return err
+	}
+	defer stopTelemetry()
+
 	applyServeOverrides(cfg, *receiversAddr, *mcpAddr)
 
 	st, stagedInfo, err := openStoreWithStagedRestore(ctx, cfg.Storage.SQLitePath, logger)
@@ -196,9 +209,10 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	llmClient := buildLLMClient(cfg, apiKey, auditor, logger)
+	llmBudget := llm.NewBudget(st, cfg.LLM.Budget)
+	llmClient := buildLLMClient(cfg, apiKey, auditor, logger, llmBudget)
 
-	classifierClient := buildClassifierClient(cfg, apiKey, auditor, logger)
+	classifierClient := buildClassifierClient(cfg, apiKey, auditor, logger, llmBudget)
 
 	notifier, llmSystemPublisher := buildNotifier(cfg, st, auditor, logger, strings.EqualFold(level, "debug"))
 
@@ -374,18 +388,99 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 		OccurrenceCap:   cfg.Memory.OccurrenceCap,
 		Lookback:        time.Duration(cfg.Memory.LookbackDays) * 24 * time.Hour,
 	}
-	cor := correlator.New(corCfg, st, incidentSink{skill: skill}, logger)
+	cor := correlator.New(corCfg, st, productionIncidentSink(), logger)
 
-	cor.SetResolutionNotifier(notifyresolution.New(notifier, st))
-	cor.SetAuditor(auditor)
-	cor.SetRejudger(skill)
-	cor.SetOccurrenceNotifier(notifier)
-	cor.SetTriageFailureNotifier(notifier)
+	// Task 8: production wires NO notifier onto the Correlator at all any
+	// more — not SetTriageFailureNotifier here, and not
+	// SetResolutionNotifier/SetOccurrenceNotifier inside startCorrelator
+	// below either. The Situation notification worker (Task 6/7) is now the
+	// sole production Slack writer; the Correlator's own
+	// ResolutionNotifier/OccurrenceNotifier/TriageFailureNotifier setters
+	// stay real Go shape (this package's own tests, and
+	// internal/correlator's, keep exercising them with fakes) but are never
+	// handed a live instance here. Each domain outcome's durable Situation
+	// input (incident_resolved, membership_changed for an occurrence
+	// attach, triage_exhausted) is written directly by domain logic inside
+	// the relevant atomic store commit — see correlator.go's own doc
+	// comments on the three interfaces — so leaving all three unwired loses
+	// no durable history, only the retired Incident-card Slack/stdout
+	// fan-out.
+	//
+	// The Correlator has no analyzer/LLM seam at all — no IncidentSink
+	// beyond the no-op one and no re-judgment runner (Plan 2 Task 7) —
+	// see TestProductionCorrelatorHasNoAcuteTriageDispatchDependency.
+	// SetAuditor IS still wired — inside startCorrelator below, alongside
+	// this comment's former SetResolutionNotifier/SetOccurrenceNotifier
+	// neighbors — because it alone remains reachable from ApplyDelivery's
+	// durable-dispatch path.
 
-	if err := cor.Start(ctx); err != nil {
-		return fmt.Errorf("correlator start: %w", err)
+	// stopCorrelator is called exactly once, however runServe exits: inline,
+	// in the right relative position, by foundationStopSequence on the
+	// normal shutdown path below, or — for every earlier return between here
+	// and there (a receivers/MCP wiring error, etc.) — by this defer acting
+	// as the safety net it always has been. sync.Once makes it safe to be
+	// both.
+	var corStopOnce sync.Once
+	stopCorrelator := func() { corStopOnce.Do(cor.Stop) }
+	defer stopCorrelator()
+
+	// The durable Situation foundation runtime (Task 8): the dispatch and
+	// input workers Tasks 6-7 built, plus the Reconstructor that converges
+	// durable state before either worker, or Receivers, ever runs. owner is
+	// this process's own lease identity, minted once — every worker this
+	// process runs (foundation's dispatch/input, and the Situation
+	// controller/Triage workers below) derives its own stable lease-owner
+	// suffix from this SAME identity, so no two workers from the same
+	// process can ever fence each other's claims.
+	owner := "alertint-" + uuid.NewString()
+	rt := newFoundationRuntime(st, cor, owner, logger)
+
+	// The Situation controller runtime (Task 9): the Situation controller
+	// worker (Reconcile) and the Acute Triage worker Tasks 7-8 built, plus
+	// the startup-only recovery/backfill pass both depend on having already
+	// run. assessClient is the controller's own one-shot, provider-neutral
+	// L2 boundary — the SAME configured provider client Acute Triage uses
+	// (buildLLMClient/llmClient), NOT wrapped in llmClient's own hidden-retry
+	// Complete method, and wrapped with the installation LLM-health observer
+	// (buildAssessmentClient). skill (already constructed above) structurally
+	// satisfies situation.AcuteAnalyzer/AfterCommitter/ExhaustionNotifier all
+	// three, so the Triage worker dispatches through the SAME refactored
+	// Acute Triage skill instance — never a second, separately-constructed
+	// one — while the unmodified `skill` variable used by incidentSink above
+	// keeps driving the Correlator's own tick-triggered compatibility path
+	// unchanged. Existing Acute Triage still receives the ordinary
+	// retry-capable llmClient (acutetriage.Config's own Config, unchanged);
+	// the Correlator itself (cor, constructed above) receives no LLM
+	// dependency of its own — corCfg/correlator.New's signature carries none,
+	// and its only path to Acute Triage is via incidentSink{skill: skill}.
+	crt, err := buildControllerRuntime(st, llmClient, llmHealth, skill, cfg.Situations,
+		cfg.Notify.Slack.MinSeverity, cfg.Notify.Slack.RecurrenceMode, owner, auditor, logger, configuredPresentationSources(cfg))
+	if err != nil {
+		return err
 	}
-	defer cor.Stop()
+
+	// The bounded evidence-preparation runtime (Plan 4 Task 9): the
+	// concrete EvidencePreparer adapter — injected into the SAME controller
+	// crt drives, so every Reconcile cycle prepares real evidence through it
+	// — the semantic-profile inference workers, and the bounded profile-
+	// change/backfill/detail-cleanup sweeps. Extracted into
+	// buildPreparationRuntime (mirroring buildControllerRuntime's own
+	// extraction, and — see that function's own doc comment — panicking
+	// instead of returning a third "impossible in production" error) to
+	// keep runServe's own golangci-lint gocyclo complexity under the repo's
+	// threshold (Task 9 fix round, Finding #3's own established
+	// convention).
+	prt := buildPreparationRuntime(st, cfg, owner, llmClient, llmHealth, prom, logSrc, sentryClient, zbxClient, crt, auditor, logger)
+
+	// The Situation notification runtime (Plan 3 Task 9): the single
+	// reachable Situation Slack writer (present only when Situation Slack is
+	// actually configured — buildSituationNotificationRuntime) plus the
+	// stdout Transition-stream worker, which always runs because the
+	// authoritative outward state stream is not Slack-gated. Its own
+	// startup-only recovery pass (spec.md startup steps 2-6) runs after
+	// Plan 2's controller recovery and before the Correlator, and both its
+	// workers stop LAST, outside the shutdown drain rounds (R6).
+	nrt := buildSituationNotificationRuntime(cfg, st, auditor, owner, logger)
 
 	// Probe enabled integrations in the background: quickly (with backoff)
 	// while one is failing — at startup a co-deployed dependency may still
@@ -393,8 +488,69 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	// Results are cached for GET /health.
 	healthReg := buildHealthChecks(cfg, prom, logSrc, sentryClient, zbxClient)
 	go healthReg.Watch(ctx, logger)
-	recvSrv, recvErrCh, err := startReceivers(cfg, st, auditor, cor, healthReg, llmHealth, logger)
-	if err != nil {
+
+	var recvSrv *http.Server
+	var recvErrCh <-chan error
+	startupSeq := foundationSequence{
+		reconstruct: func(ctx context.Context) error {
+			return runFoundationReconstruction(ctx, rt, logger)
+		},
+		// Task 9: Triage migration backfill, interrupted Assessment-call/
+		// Triage-attempt recovery, and the one-hour startup horizon — all
+		// startup-only, zero-outward-effect primitives that must run before
+		// any worker resumes claiming controller/Triage work, exactly like
+		// foundation reconstruction above.
+		backfillAndRecoverControllerWork: func(ctx context.Context) error {
+			return runControllerRecovery(ctx, crt, logger)
+		},
+		// Plan 4 Task 9: release stranded semantic-inference job leases and
+		// backfill any missed delivery-to-signature attachment — startup-only,
+		// zero-outward-effect, positioned right after controller recovery
+		// (the preparer it recovers state for is injected into that SAME
+		// controller) and before notification recovery.
+		recoverPreparationWork: prt.Recover,
+		// Plan 3 Task 9: recover abandoned notification/stream claims,
+		// schedule Situations whose durable history is missing or whose root
+		// projection is stale, validate the Slack configuration and record
+		// its generation, reactivate configuration-blocked effects, and
+		// resume an interrupted gap replay — all startup-only and all
+		// publication-free, exactly like the two recovery passes above.
+		recoverNotificationWork: func(ctx context.Context) error {
+			return runNotificationRecovery(ctx, nrt, logger)
+		},
+		// SetAuditor is wired here — between reconstruct and cor.Start, never
+		// before — because it is synchronously reachable from ApplyDelivery's
+		// durable-dispatch path (a queued retry attach appends
+		// triage_member_attached; a queued firing delivery that collapses
+		// into a recurrence occurrence appends occurrence_attached).
+		// Wiring it before reconstruction would let a plain crash-and-restart
+		// with ordinary queued webhook traffic append audit rows from
+		// reconstruction: exactly the outward effect the spec's
+		// "reconstruction invokes no notifier, audit callback, ..."
+		// acceptance forbids. The Setter's own doc comment requires only
+		// "after New, before Start", so this ordering is legal; the
+		// Correlator's loop itself isn't running yet either.
+		//
+		// Task 8: SetResolutionNotifier/SetOccurrenceNotifier are NOT called
+		// here (or anywhere in production) any more — see the comment above
+		// cor's construction. Their durable Situation inputs are written
+		// directly by ApplyCorrelatedDelivery, in the same atomic commit
+		// this dispatch path already runs, independent of any notifier.
+		startCorrelator: func(ctx context.Context) error {
+			cor.SetAuditor(auditor)
+			return cor.Start(ctx)
+		},
+		startWorkers:             rt.Start,
+		startControllerWorkers:   crt.Start,
+		startPreparationWorkers:  prt.Start,
+		startNotificationWorkers: nrt.Start,
+		startReceivers: func() error {
+			var err error
+			recvSrv, recvErrCh, err = startReceivers(cfg, st, auditor, healthReg, llmHealth, rt.WakeDispatch, logger)
+			return err
+		},
+	}
+	if err := startupSeq.run(ctx); err != nil {
 		return err
 	}
 
@@ -420,11 +576,35 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), ingress.DefaultShutdownTimeout)
 	defer cancel()
-	if recvSrv != nil {
-		if err := recvSrv.Shutdown(shutdownCtx); err != nil {
-			logger.Error("receivers graceful shutdown failed", slog.String("err", err.Error()))
-		}
+
+	// Receivers; stop/flush the Correlator's fixed-window production; drain
+	// foundation delivery/input work and due controller/Triage work — and
+	// the inputs the latter produces — in rounds until a round handles
+	// nothing; then stop the controller/Triage workers (crt.Stop) and the
+	// foundation workers (rt.Stop: dispatch, then input). See
+	// foundationStopSequence's own doc comment for why the Correlator stops
+	// before the drain (its ticker is the one producer that could otherwise
+	// commit fresh durable work after the drain has finished) and why the
+	// drain is a loop. stopCorrelator is the same sync.Once-guarded call the
+	// defer above falls back to on every other exit path.
+	stopSeq := foundationStopSequence{
+		stopReceivers:          receiverShutdown(shutdownCtx, recvSrv),
+		stopCorrelator:         stopCorrelator,
+		drainFoundationWork:    rt.Drain,
+		drainControllerWork:    crt.Drain,
+		drainPreparationWork:   prt.Drain,
+		stopControllerWorkers:  crt.Stop,
+		stopPreparationWorkers: prt.Stop,
+		stopWorkers:            rt.Stop,
+		// R6, last and outside the drain rounds: one bounded final delivery
+		// and stdout pass under the shutdown context, then claim release. An
+		// unreachable Slack delays the pass, it never holds the process.
+		stopNotificationWorkers: nrt.Stop,
 	}
+	if err := stopSeq.run(shutdownCtx); err != nil {
+		logger.Error("situation foundation shutdown failed", slog.String("err", err.Error()))
+	}
+
 	if mcpHTTPSrv != nil {
 		if err := mcpHTTPSrv.Shutdown(shutdownCtx); err != nil {
 			logger.Error("MCP graceful shutdown failed", slog.String("err", err.Error()))
@@ -432,6 +612,49 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	}
 	logger.Info("alertint stopped", slog.String("reason", "signal"))
 	return nil
+}
+
+func configuredPresentationSources(cfg *config.Config) []situationmodel.SourceCheck {
+	type source struct {
+		name    string
+		enabled bool
+		present bool
+	}
+	sources := []source{
+		{"Prometheus", cfg.PrometheusEnabled(), cfg.Prometheus.Enabled != nil || cfg.Prometheus.BaseURL != ""},
+		{"Loki", cfg.LogsEnabled(), cfg.Logs.Enabled != nil || cfg.Logs.Loki.BaseURL != ""},
+		{"Changes", cfg.ChangesEnrichmentEnabled(), cfg.Changes.Enrichment.Enabled != nil || cfg.Changes.Ingress.Enabled || cfg.Sentry.Releases.Enabled},
+		{"Sentry", cfg.Sentry.Issues.Enabled, cfg.Sentry.Issues.Enabled},
+		{"Zabbix", cfg.ZabbixAPIEnabled(), cfg.Zabbix.API.Enabled != nil || cfg.Zabbix.API.BaseURL != ""},
+	}
+	out := make([]situationmodel.SourceCheck, 0, len(sources))
+	for _, src := range sources {
+		if !src.present {
+			continue
+		}
+		outcome := situationmodel.SourceCheckConfigured
+		callsKnown := false
+		detail := "Configured; awaiting collection result"
+		if !src.enabled {
+			outcome = situationmodel.SourceCheckSkipped
+			callsKnown = true
+			detail = "Disabled by configuration"
+		}
+		out = append(out, situationmodel.SourceCheck{Source: src.name, Check: "collection", Outcome: outcome, CallsKnown: callsKnown, RecordsKnown: !src.enabled, Detail: detail})
+	}
+	return out
+}
+
+// receiverShutdown is foundationStopSequence's stop-receivers step: a
+// graceful Shutdown of the receivers HTTP server bounded by ctx, or a no-op
+// when no receiver was started (nil server).
+func receiverShutdown(ctx context.Context, srv *http.Server) func() error {
+	return func() error {
+		if srv == nil {
+			return nil
+		}
+		return srv.Shutdown(ctx)
+	}
 }
 
 // stopLLMHealthRunner stops the LLM health runner — its final delivery pass
@@ -486,15 +709,24 @@ func pruneChangesAtStartup(ctx context.Context, cfg *config.Config, st *store.St
 
 // startReceivers starts the inbound webhook host when at least one receiver is
 // enabled. The host also serves GET /health. Returns (nil, nil, nil) when no
-// receiver is enabled — the nil error channel never fires in runServe's select.
-func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor, cor *correlator.Correlator, healthReg *health.Registry, llmHealth ingress.LLMHealthReader, logger *slog.Logger) (*http.Server, <-chan error, error) {
+// receiver is enabled — the nil error channel never fires in runServe's
+// select. wake is the durable dispatch worker's wake callback
+// (foundationRuntime.WakeDispatch) — a latency optimization only, safe to
+// pass nil (both Alertmanager and Zabbix receivers already tolerate a nil
+// DeliveryWake): the dispatch worker polls its durable queue regardless.
+func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor, healthReg *health.Registry, llmHealth ingress.LLMHealthReader, wake ingress.DeliveryWake, logger *slog.Logger) (*http.Server, <-chan error, error) {
 	var receivers []ingress.Receiver
 	if cfg.Alertmanager.Enabled {
 		token, err := cfg.WebhookToken()
 		if err != nil {
 			return nil, nil, err
 		}
-		receivers = append(receivers, ingress.NewAlertReceiver(st, token, cor.Accept, logger))
+		provenance := ingress.AlertmanagerProvenanceConfig{InstanceID: cfg.Alertmanager.InstanceID}
+		for _, mapping := range cfg.Alertmanager.Rules {
+			provenance.Rules = append(provenance.Rules, ingress.AlertmanagerRuleMapping{AlertName: mapping.AlertName,
+				ProducerID: cfg.Prometheus.InstanceID, Group: mapping.Group, Rule: mapping.Rule, ScopeLabels: mapping.ScopeLabels})
+		}
+		receivers = append(receivers, ingress.NewAlertReceiverWithProvenance(st, token, provenance, wake, logger))
 	}
 	if cfg.Changes.Ingress.Enabled {
 		token, err := cfg.ChangesWebhookToken()
@@ -508,7 +740,7 @@ func startReceivers(cfg *config.Config, st *store.Store, auditor *audit.Auditor,
 		if err != nil {
 			return nil, nil, err
 		}
-		receivers = append(receivers, ingress.NewZabbixReceiver(st, token, cor.Accept, logger))
+		receivers = append(receivers, ingress.NewZabbixReceiverWithInstance(st, token, cfg.Zabbix.InstanceID, wake, logger))
 	}
 
 	if len(receivers) == 0 {
@@ -814,6 +1046,7 @@ func newZabbixClient(cfg *config.Config, logger *slog.Logger) (*zabbix.Client, e
 	client := zabbix.NewClient(zabbix.Config{
 		BaseURL:              cfg.Zabbix.API.BaseURL,
 		APIToken:             token,
+		InstanceID:           cfg.Zabbix.InstanceID,
 		TimeoutSeconds:       cfg.Zabbix.API.TimeoutSeconds,
 		HistoryRetentionDays: cfg.Zabbix.API.HistoryRetentionDays,
 		FlapWindowHours:      cfg.Zabbix.API.FlapWindowHours,
@@ -975,11 +1208,14 @@ func buildHealthChecks(cfg *config.Config, prom *promclient.Client, logSrc logs.
 //   - stdout: always an active sink when notify.stdout is set, so a send is
 //     confirmed (notified · stdout=ok) at INFO. Its verbose full JSON line is
 //     written only at debug level (consistently, in every format).
-//   - slack: when enabled and a bot token resolves.
 //
-// buildNotifier also returns the llmhealth.Publisher for the installation's
-// one system-message surface: the same Slack *Notifier when Slack is wired,
-// else nil (LLM dependency health then lives in state/audit/logs only).
+// Task 8: Slack is never registered into this Incident fan-out any more —
+// the Situation notification worker (Task 6/7) is the sole production Slack
+// writer for anything Incident-shaped now (findings, resolutions, occurrence
+// attaches, annotations/Captured verdicts). buildNotifier still constructs
+// the concrete Slack *Notifier and returns it as the llmhealth.Publisher
+// below when Slack is enabled and its bot token resolves — that remaining
+// production Slack use (ADR-0042/0046 System messages) is unaffected.
 func buildNotifier(cfg *config.Config, st *store.Store, auditor *audit.Auditor, logger *slog.Logger, debug bool) (*notify.Multi, llmhealth.Publisher) {
 	var nn []notify.Notifier
 	var sinks []string
@@ -991,9 +1227,11 @@ func buildNotifier(cfg *config.Config, st *store.Store, auditor *audit.Auditor, 
 	}
 	if cfg.Notify.Slack.Enabled {
 		if token, err := cfg.SlackBotToken(); err == nil && token != "" {
+			// Constructed for the System-message surface only
+			// (ADR-0042/0046, the llmhealth.Publisher return below) — never
+			// appended to nn: an Incident Slack card or thread reply is the
+			// Situation notification worker's job now, not this fan-out's.
 			slackNotifier := notifyslack.New(token, cfg.Notify.Slack.Channel, cfg.Notify.Slack.MinSeverity, cfg.Notify.Slack.RecurrenceMode, st, auditor)
-			nn = append(nn, slackNotifier)
-			sinks = append(sinks, "slack")
 			slackWired = true
 			publisher = slackNotifier
 		}
@@ -1016,11 +1254,11 @@ func llmProviderIsOpenAI(cfg *config.Config) bool {
 
 // buildLLMClient constructs the triage LLM client for the configured
 // provider. Exactly one provider serves an install (ADR-0026).
-func buildLLMClient(cfg *config.Config, apiKey string, auditor *audit.Auditor, logger *slog.Logger) acutetriage.LLMClient {
+func buildLLMClient(cfg *config.Config, apiKey string, auditor *audit.Auditor, logger *slog.Logger, budget ...*llm.Budget) acutetriage.LLMClient {
 	if llmProviderIsOpenAI(cfg) {
-		return llmopenai.New(llmopenaiCfg(cfg, apiKey, cfg.LLM.TimeoutSeconds, cfg.LLM.Model, cfg.LLM.MaxTokens), auditor, logger)
+		return llmopenai.New(llmopenaiCfg(cfg, apiKey, cfg.LLM.TimeoutSeconds, cfg.LLM.Model, cfg.LLM.MaxTokens, budget...), auditor, logger)
 	}
-	return llmanthropic.New(llmanthropicCfg(cfg), auditor, logger)
+	return llmanthropic.New(llmanthropicCfg(cfg, budget...), auditor, logger)
 }
 
 // buildLLMProber type-asserts the primary LLM client into an llm.Prober for
@@ -1039,8 +1277,9 @@ func buildLLMProber(cfg *config.Config, client acutetriage.LLMClient, logger *sl
 
 // llmopenaiCfg builds an openaicompat.Config; model/maxTokens/timeout are
 // parameters because the classifier client reuses this with its own values.
-func llmopenaiCfg(cfg *config.Config, apiKey string, timeoutSeconds int, model string, maxTokens int) llmopenai.Config {
+func llmopenaiCfg(cfg *config.Config, apiKey string, timeoutSeconds int, model string, maxTokens int, budget ...*llm.Budget) llmopenai.Config {
 	return llmopenai.Config{
+		Budget:          configuredLLMBudget(cfg, budget),
 		BaseURL:         cfg.LLM.BaseURL,
 		APIKey:          apiKey,
 		Model:           model,
@@ -1064,7 +1303,7 @@ const classifierThinkingMaxTokens = 8192
 // serve, and requesting the Haiku constant there would 404 every call,
 // silently poisoning the ADR-0018 graduation evidence with fail-open
 // "unsure" verdicts. Returns a true nil interface when the mode is off.
-func buildClassifierClient(cfg *config.Config, apiKey string, auditor *audit.Auditor, logger *slog.Logger) acutetriage.LLMClient {
+func buildClassifierClient(cfg *config.Config, apiKey string, auditor *audit.Auditor, logger *slog.Logger, budget ...*llm.Budget) acutetriage.LLMClient {
 	if !cfg.Memory.Classifier.Enabled() {
 		return nil
 	}
@@ -1081,13 +1320,14 @@ func buildClassifierClient(cfg *config.Config, apiKey string, auditor *audit.Aud
 		if cfg.LLM.Thinking {
 			maxTokens = classifierThinkingMaxTokens
 		}
-		return llmopenai.New(llmopenaiCfg(cfg, apiKey, cfg.Memory.Classifier.TimeoutSeconds, cfg.LLM.Model, maxTokens), auditor, logger)
+		return llmopenai.New(llmopenaiCfg(cfg, apiKey, cfg.Memory.Classifier.TimeoutSeconds, cfg.LLM.Model, maxTokens, budget...), auditor, logger)
 	}
 	logger.Info("memory shadow classifier enabled",
 		slog.String("mode", string(cfg.Memory.Classifier.Mode)),
 		slog.String("model", acutetriage.ClassifierModel),
 	)
 	return llmanthropic.New(llmanthropic.Config{
+		Budget:         configuredLLMBudget(cfg, budget),
 		APIKey:         apiKey,
 		Model:          acutetriage.ClassifierModel,
 		TimeoutSeconds: cfg.Memory.Classifier.TimeoutSeconds,
@@ -1095,9 +1335,10 @@ func buildClassifierClient(cfg *config.Config, apiKey string, auditor *audit.Aud
 }
 
 // llmanthropicCfg builds an llm/anthropic.Config from the loaded config.
-func llmanthropicCfg(cfg *config.Config) llmanthropic.Config {
+func llmanthropicCfg(cfg *config.Config, budget ...*llm.Budget) llmanthropic.Config {
 	key, _ := cfg.LLMAPIKey()
 	return llmanthropic.Config{
+		Budget:         configuredLLMBudget(cfg, budget),
 		APIKey:         key,
 		Model:          cfg.LLM.Model,
 		MaxTokens:      cfg.LLM.MaxTokens,
@@ -1105,13 +1346,19 @@ func llmanthropicCfg(cfg *config.Config) llmanthropic.Config {
 	}
 }
 
-// incidentSink wraps an acutetriage.Skill as a correlator.IncidentSink.
-type incidentSink struct {
-	skill *acutetriage.Skill
-}
-
-func (s incidentSink) OnIncidentReady(ctx context.Context, inc store.Incident) error {
-	return s.skill.Run(ctx, inc)
+// productionIncidentSink is the only IncidentSink production ever hands the
+// Correlator: a no-op. Acute Triage dispatch belongs to the Triage worker
+// (internal/situation.TriageWorker) polling the gated incident_triage
+// schedule; the Correlator owns grouping, readiness, and attachment only
+// and must carry no analyzer/LLM dispatch dependency at all — not even a
+// dormant one. An earlier wiring passed a Skill-backed sink here (whose
+// callback called Skill.Run); the Correlator never invoked it after Task 7,
+// but a live LLM dependency handed to a component that must have none is a
+// wiring bug regardless of whether it is reachable, and one refactor away
+// from becoming a second dispatch path. TestProductionCorrelatorHasNoAcuteTriageDispatchDependency
+// pins this.
+func productionIncidentSink() correlator.IncidentSink {
+	return correlator.NopIncidentSink{}
 }
 
 // buildLogger constructs the runtime logger applying precedence
