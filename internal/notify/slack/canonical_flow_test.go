@@ -31,13 +31,13 @@ func TestCanonicalRootShowsExpectedJudgmentAfterFinding(t *testing.T) {
 	b.Work.Phase = model.WorkPhaseSettled
 	b.Analyses = []model.IncidentAnalysis{{Title: "Reconciliation job is driving CPU load", Summary: "Sustained CPU load on db-prod-1.", Findings: []string{"CPU load remains elevated on db-prod-1."}, Verification: "supported"}}
 	until := bcNow(t).Add(time.Hour)
-	b.ExpectedJudgment = &model.ExpectedJudgmentProjection{Revision: 2, AssertedOperator: "Janis", ValidUntil: until}
+	b.ExpectedJudgment = &model.ExpectedJudgmentProjection{Revision: 2, AssertedOperator: "default", ValidUntil: until}
 	in := bcRoot(t, model.LifecycleActive, model.AttentionInvestigate, bcObserveMonitorContract(bcNow(t)), b)
 	msg, err := RenderSituationRoot(in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "*Operator:* Expected until " + SlackDateToken(until, "{time}") + " · Janis"
+	want := "*Operator:* Expected until " + SlackDateToken(until, "{time}") + " · default"
 	if !strings.Contains(msg.Text, want) {
 		t.Fatalf("root missing %q:\n%s", want, msg.Text)
 	}
@@ -55,13 +55,13 @@ func TestExpectedJudgmentThreadTransitionsAreAttributedAndTruthful(t *testing.T)
 	until := bcNow(t).Add(time.Hour)
 	tr := bcJournal(t, bcObserveMonitorContract(bcNow(t)), b, nil)
 	tr.Journal.JudgmentChange = model.JudgmentChangeRecorded
-	tr.Journal.AttributedActor = "Janis"
+	tr.Journal.AttributedActor = "default"
 	tr.Journal.JudgmentValidUntil = &until
 	msg, err := RenderSituationJournal(tr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "Janis marked the current condition as expected until " + SlackDateToken(until, "{time}") + ". Monitoring continues."
+	want := "default marked the current condition as expected until " + SlackDateToken(until, "{time}") + ". Monitoring continues."
 	if !strings.Contains(msg.Text, want) {
 		t.Fatalf("thread = %q, want %q", msg.Text, want)
 	}
@@ -72,7 +72,7 @@ func TestExpectedJudgmentThreadTransitionsAreAttributedAndTruthful(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(msg.Text, "Janis ended the expected-until decision. Normal assessment resumes.") {
+	if !strings.Contains(msg.Text, "default ended the expected-until decision. Normal assessment resumes.") {
 		t.Fatal(msg.Text)
 	}
 

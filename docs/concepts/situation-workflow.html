@@ -72,8 +72,8 @@
 <div class="callout example">
   <h3>Nightly reconciliation raises CPU load</h3>
   <p><strong>22:07</strong> — Alertmanager sends a firing alert for <code>service=payments</code>. AlertINT commits it, opens a Situation, gathers evidence, and publishes the Finding.</p>
-  <p><strong>22:12</strong> — Janis marks the current condition expected until 23:00. Slack adds: <strong>Operator: Expected until 11:00 PM · Janis</strong>. Investigation and monitoring continue.</p>
-  <p><strong>22:30</strong> — The same condition repeats unchanged. It remains covered without asking Janis again.</p>
+  <p><strong>22:12</strong> — John marks the current condition expected until 23:00. Slack adds: <strong>Operator: Expected until 11:00 PM · John</strong>. Investigation and monitoring continue.</p>
+  <p><strong>22:30</strong> — The same condition repeats unchanged. It remains covered without asking John again.</p>
   <p><strong>22:41</strong> — The source rule changes. The decision stops applying. The thread says: <strong>The expected-until decision no longer applies because the source rule changed. Normal assessment resumes.</strong></p>
   <p><strong>22:50</strong> — The source clears. AlertINT enters Confirming recovery. Only after the stored grace period passes with the alert still clear does the Situation become Recovered.</p>
   <p><strong>23:20</strong> — A later firing opens a new linked Situation. It inherits history, not expectedness authority.</p>

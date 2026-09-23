@@ -53,7 +53,7 @@ func newExpectedBehaviorFixture(t *testing.T, st *Store) expectedBehaviorFixture
 	judgment, err := st.WriteSituationJudgment(ctx, audit.New(st.DB()), SituationJudgmentWrite{
 		Operation: situationmodel.JudgmentOperationRecord, SituationID: situationID,
 		SituationInputVersion: sit.InputVersion, ExpectedJudgmentVersion: 0,
-		RequestID: "expected-behavior-source-judgment", AssertedOperator: "Janis", Confirmed: true,
+		RequestID: "expected-behavior-source-judgment", AssertedOperator: "default", Confirmed: true,
 		ValidUntil: now.Add(4 * time.Hour), Now: now.Add(time.Second),
 	})
 	if err != nil {
@@ -88,7 +88,7 @@ func (f expectedBehaviorFixture) confirmRequest(t *testing.T, st *Store, request
 	return ExpectedBehaviorWrite{
 		Operation:        situationmodel.ExpectedBehaviorOperationConfirm,
 		SourceJudgmentID: f.judgmentID, SituationID: f.situationID, SituationInputVersion: sit.InputVersion,
-		ExpectedCurrentVersion: 0, RequestID: requestID, AssertedOperator: "Janis", Confirmed: true,
+		ExpectedCurrentVersion: 0, RequestID: requestID, AssertedOperator: "default", Confirmed: true,
 		Policy: &f.policy, Now: f.now,
 	}
 }
@@ -165,7 +165,7 @@ func TestWriteExpectedBehaviorConfirmsAlertmanagerScheduleFromCurrentRuleProof(t
 		t.Fatal(err)
 	}
 	sit, _ := st.GetSituation(ctx, situationID)
-	judgment, err := st.WriteSituationJudgment(ctx, audit.New(st.DB()), SituationJudgmentWrite{Operation: situationmodel.JudgmentOperationRecord, SituationID: situationID, SituationInputVersion: sit.InputVersion, ExpectedJudgmentVersion: 0, RequestID: "am-judgment", AssertedOperator: "Janis", Confirmed: true, ValidUntil: now.Add(4 * time.Hour), Now: now.Add(time.Second)})
+	judgment, err := st.WriteSituationJudgment(ctx, audit.New(st.DB()), SituationJudgmentWrite{Operation: situationmodel.JudgmentOperationRecord, SituationID: situationID, SituationInputVersion: sit.InputVersion, ExpectedJudgmentVersion: 0, RequestID: "am-judgment", AssertedOperator: "default", Confirmed: true, ValidUntil: now.Add(4 * time.Hour), Now: now.Add(time.Second)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +174,7 @@ func TestWriteExpectedBehaviorConfirmsAlertmanagerScheduleFromCurrentRuleProof(t
 	}
 	sit, _ = st.GetSituation(ctx, situationID)
 	policy := situationmodel.ExpectedBehaviorPolicy{Scope: situationmodel.ExpectedBehaviorScope{GroupKey: "service=payment", Source: "alertmanager", SourceInstanceID: instanceID, ProducerID: "prod-prom", ScopeLabels: map[string]string{"service": "payment"}, PrimaryRuleID: ruleID, PrimaryRuleVersion: "sha256:v1", RuleGroup: "jobs", RuleName: "ReconciliationLoad"}, Conditions: situationmodel.ExpectedBehaviorConditions{Workload: "nightly_reconciliation", Schedule: situationmodel.ExpectedBehaviorSchedule{Days: []situationmodel.ExpectedBehaviorWeekday{situationmodel.ExpectedBehaviorMonday}, LocalStart: "22:00", LocalEnd: "23:00", Timezone: "Europe/Riga", StartToleranceMinutes: 10}, MaxDurationMinutes: 55}, ReviewDueAt: now.Add(30 * 24 * time.Hour)}
-	result, err := st.WriteExpectedBehavior(ctx, audit.New(st.DB()), ExpectedBehaviorWrite{Operation: situationmodel.ExpectedBehaviorOperationConfirm, SourceJudgmentID: judgment.Judgment.ID, SituationID: situationID, SituationInputVersion: sit.InputVersion, ExpectedCurrentVersion: 0, RequestID: "am-confirm", AssertedOperator: "Janis", Confirmed: true, Policy: &policy, Now: now.Add(2 * time.Second)})
+	result, err := st.WriteExpectedBehavior(ctx, audit.New(st.DB()), ExpectedBehaviorWrite{Operation: situationmodel.ExpectedBehaviorOperationConfirm, SourceJudgmentID: judgment.Judgment.ID, SituationID: situationID, SituationInputVersion: sit.InputVersion, ExpectedCurrentVersion: 0, RequestID: "am-confirm", AssertedOperator: "default", Confirmed: true, Policy: &policy, Now: now.Add(2 * time.Second)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +268,7 @@ func TestWriteExpectedBehaviorRejectsAlertmanagerProofFromDifferentScope(t *test
 	}
 	judgment, err := st.WriteSituationJudgment(ctx, audit.New(st.DB()), SituationJudgmentWrite{
 		Operation: situationmodel.JudgmentOperationRecord, SituationID: situationID, SituationInputVersion: sit.InputVersion,
-		ExpectedJudgmentVersion: 0, RequestID: "am-billing-judgment", AssertedOperator: "Janis", Confirmed: true,
+		ExpectedJudgmentVersion: 0, RequestID: "am-billing-judgment", AssertedOperator: "default", Confirmed: true,
 		ValidUntil: now.Add(4 * time.Hour), Now: now.Add(time.Second),
 	})
 	if err != nil {
@@ -294,7 +294,7 @@ func TestWriteExpectedBehaviorRejectsAlertmanagerProofFromDifferentScope(t *test
 	_, err = st.WriteExpectedBehavior(ctx, audit.New(st.DB()), ExpectedBehaviorWrite{
 		Operation: situationmodel.ExpectedBehaviorOperationConfirm, SourceJudgmentID: judgment.Judgment.ID,
 		SituationID: situationID, SituationInputVersion: sit.InputVersion, ExpectedCurrentVersion: 0,
-		RequestID: "am-billing-confirm", AssertedOperator: "Janis", Confirmed: true, Policy: &policy, Now: now.Add(2 * time.Second),
+		RequestID: "am-billing-confirm", AssertedOperator: "default", Confirmed: true, Policy: &policy, Now: now.Add(2 * time.Second),
 	})
 	if !errors.Is(err, ErrExpectedBehaviorNotAllowed) || !strings.Contains(err.Error(), "current Alertmanager rule proof is unavailable") {
 		t.Fatalf("confirm error = %v, want unavailable current proof for billing scope", err)
@@ -306,7 +306,7 @@ func assertRevokedAlertmanagerScope(t *testing.T, st *Store, envelopeID, ruleID 
 	ctx := context.Background()
 	if _, err := st.WriteExpectedBehavior(ctx, audit.New(st.DB()), ExpectedBehaviorWrite{
 		Operation: situationmodel.ExpectedBehaviorOperationRevoke, EnvelopeID: envelopeID,
-		ExpectedCurrentVersion: 1, RequestID: "am-revoke", AssertedOperator: "Janis", Confirmed: true, Now: now,
+		ExpectedCurrentVersion: 1, RequestID: "am-revoke", AssertedOperator: "default", Confirmed: true, Now: now,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +362,7 @@ func TestWriteExpectedBehaviorReplaceRevokeRestoreKeepsImmutableHistory(t *testi
 
 	revoke := ExpectedBehaviorWrite{
 		Operation: situationmodel.ExpectedBehaviorOperationRevoke, EnvelopeID: first.Revision.EnvelopeID,
-		ExpectedCurrentVersion: 2, RequestID: "expected-history-revoke", AssertedOperator: "Janis", Confirmed: true,
+		ExpectedCurrentVersion: 2, RequestID: "expected-history-revoke", AssertedOperator: "default", Confirmed: true,
 		Now: fixture.now.Add(2 * time.Minute),
 	}
 	third, err := st.WriteExpectedBehavior(context.Background(), audit.New(st.DB()), revoke)
@@ -408,7 +408,7 @@ func TestWriteExpectedBehaviorRejectsStaleSituationJudgmentAndEnvelopeVersions(t
 	}
 	revoke := ExpectedBehaviorWrite{
 		Operation: situationmodel.ExpectedBehaviorOperationRevoke, EnvelopeID: first.Revision.EnvelopeID,
-		ExpectedCurrentVersion: 2, RequestID: "expected-stale-envelope", AssertedOperator: "Janis", Confirmed: true,
+		ExpectedCurrentVersion: 2, RequestID: "expected-stale-envelope", AssertedOperator: "default", Confirmed: true,
 		Now: fixture.now.Add(time.Minute),
 	}
 	if _, err := st.WriteExpectedBehavior(context.Background(), audit.New(st.DB()), revoke); !errors.Is(err, ErrExpectedBehaviorVersionConflict) {
@@ -504,7 +504,7 @@ func TestCommitExpectedBehaviorEvaluationFencesEnvelopeAndSituationVersions(t *t
 
 	revoke := ExpectedBehaviorWrite{
 		Operation: situationmodel.ExpectedBehaviorOperationRevoke, EnvelopeID: created.Revision.EnvelopeID,
-		ExpectedCurrentVersion: 1, RequestID: "expected-evaluation-revoke", AssertedOperator: "Janis", Confirmed: true,
+		ExpectedCurrentVersion: 1, RequestID: "expected-evaluation-revoke", AssertedOperator: "default", Confirmed: true,
 		Now: fixture.now.Add(2 * time.Minute),
 	}
 	if _, err := st.WriteExpectedBehavior(context.Background(), audit.New(st.DB()), revoke); err != nil {
@@ -570,7 +570,7 @@ func TestListExpectedBehaviorsFiltersInactiveHeads(t *testing.T) {
 	}
 	revoke := ExpectedBehaviorWrite{
 		Operation: situationmodel.ExpectedBehaviorOperationRevoke, EnvelopeID: created.Revision.EnvelopeID,
-		ExpectedCurrentVersion: 1, RequestID: "expected-list-revoke", AssertedOperator: "Janis", Confirmed: true,
+		ExpectedCurrentVersion: 1, RequestID: "expected-list-revoke", AssertedOperator: "default", Confirmed: true,
 		Now: fixture.now.Add(time.Minute),
 	}
 	if _, err := st.WriteExpectedBehavior(context.Background(), audit.New(st.DB()), revoke); err != nil {

@@ -46,7 +46,7 @@ func judgmentArgs(situationID string, situationVersion, judgmentVersion int, req
 	return map[string]any{
 		"situation_id": situationID, "situation_input_version": situationVersion,
 		"expected_judgment_version": judgmentVersion, "request_id": requestID,
-		"asserted_operator": "Janis", "confirmed": true, "valid_until": until.Format(time.RFC3339),
+		"asserted_operator": "default", "confirmed": true, "valid_until": until.Format(time.RFC3339),
 	}
 }
 
@@ -83,7 +83,7 @@ func TestSituationExpectedMCPRecordReadIdempotencyAndHistory(t *testing.T) {
 	if err := json.Unmarshal([]byte(resultText(t, res)), &recorded); err != nil {
 		t.Fatal(err)
 	}
-	if recorded.Judgment.Revision != 1 || recorded.Judgment.AssertedOperator != "Janis" || recorded.IdempotentReplay {
+	if recorded.Judgment.Revision != 1 || recorded.Judgment.AssertedOperator != "default" || recorded.IdempotentReplay {
 		t.Fatalf("recorded = %+v", recorded)
 	}
 
@@ -105,7 +105,7 @@ func TestSituationExpectedMCPRecordReadIdempotencyAndHistory(t *testing.T) {
 	var payload map[string]any
 	_ = json.Unmarshal([]byte(resultText(t, current)), &payload)
 	active, ok := payload["active_judgment"].(map[string]any)
-	if !ok || active["asserted_operator"] != "Janis" || payload["judgment_version"] != float64(1) {
+	if !ok || active["asserted_operator"] != "default" || payload["judgment_version"] != float64(1) {
 		t.Fatalf("current judgment = %#v version=%v", payload["active_judgment"], payload["judgment_version"])
 	}
 

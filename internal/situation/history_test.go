@@ -231,11 +231,11 @@ func hsNext(t *testing.T) AuthoritativeChange {
 
 func TestExpectedJudgmentCreatesOnlyMeaningfulHistoryTransitions(t *testing.T) {
 	until := hsNow(t).Add(2 * time.Hour)
-	projection := &model.ExpectedJudgmentProjection{Revision: 1, AssertedOperator: "Janis", ValidUntil: until}
+	projection := &model.ExpectedJudgmentProjection{Revision: 1, AssertedOperator: "default", ValidUntil: until}
 
 	recorded := hsNext(t)
 	recorded.Projection.Briefing = &model.OperatorBriefing{ExpectedJudgment: projection}
-	recorded.Judgment = &model.SituationJudgment{Revision: 1, Operation: model.JudgmentOperationRecord, AssertedOperator: "Janis", ValidUntil: until}
+	recorded.Judgment = &model.SituationJudgment{Revision: 1, Operation: model.JudgmentOperationRecord, AssertedOperator: "default", ValidUntil: until}
 	recorded.JudgmentApplicabilityReason = model.JudgmentApplicable
 	got, err := BuildTransitions(recorded)
 	if err != nil {
@@ -281,21 +281,21 @@ func TestExpectedScheduleMatchIsAControllerTransitionAttributedToItsOwner(t *tes
 	change := hsNext(t)
 	boundary := change.Now.Add(time.Hour)
 	change.Projection.Briefing = &model.OperatorBriefing{ExpectedBehavior: &model.ExpectedBehaviorProjection{
-		EnvelopeID: "envelope-1", Version: 1, AssertedOperator: "Janis",
+		EnvelopeID: "envelope-1", Version: 1, AssertedOperator: "default",
 		Disposition: model.ExpectedBehaviorDispositionMatched, Reason: model.ExpectedBehaviorReasonMatched, Boundary: &boundary,
 	}}
 	got, err := BuildTransitions(change)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].Actor != model.ActorDeterministicController || got[0].Journal.AttributedActor != "Janis" || got[0].Journal.ExpectedBehaviorBoundary == nil {
+	if len(got) != 1 || got[0].Actor != model.ActorDeterministicController || got[0].Journal.AttributedActor != "default" || got[0].Journal.ExpectedBehaviorBoundary == nil {
 		t.Fatalf("schedule transition = %+v", got)
 	}
 }
 
 func TestExpectedJudgmentInvalidationRecordsConcreteReason(t *testing.T) {
 	until := hsNow(t).Add(2 * time.Hour)
-	prior := &model.ExpectedJudgmentProjection{Revision: 1, AssertedOperator: "Janis", ValidUntil: until}
+	prior := &model.ExpectedJudgmentProjection{Revision: 1, AssertedOperator: "default", ValidUntil: until}
 
 	cases := []struct {
 		name     string
@@ -320,7 +320,7 @@ func TestExpectedJudgmentInvalidationRecordsConcreteReason(t *testing.T) {
 			change := hsNext(t)
 			change.PriorTransition.Projection.Briefing = &model.OperatorBriefing{ExpectedJudgment: prior}
 			change.Projection.Briefing = &model.OperatorBriefing{Critical: tc.critical}
-			change.Judgment = &model.SituationJudgment{Revision: 1, Operation: model.JudgmentOperationRecord, AssertedOperator: "Janis", ValidUntil: until}
+			change.Judgment = &model.SituationJudgment{Revision: 1, Operation: model.JudgmentOperationRecord, AssertedOperator: "default", ValidUntil: until}
 			change.JudgmentApplicabilityReason = tc.reason
 			got, err := BuildTransitions(change)
 			if err != nil {
@@ -338,23 +338,23 @@ func TestExpectedJudgmentInvalidationRecordsConcreteReason(t *testing.T) {
 
 func TestExpectedJudgmentWithdrawalIsAttributed(t *testing.T) {
 	until := hsNow(t).Add(2 * time.Hour)
-	prior := &model.ExpectedJudgmentProjection{Revision: 1, AssertedOperator: "Janis", ValidUntil: until}
+	prior := &model.ExpectedJudgmentProjection{Revision: 1, AssertedOperator: "default", ValidUntil: until}
 	change := hsNext(t)
 	change.PriorTransition.Projection.Briefing = &model.OperatorBriefing{ExpectedJudgment: prior}
-	change.Judgment = &model.SituationJudgment{Revision: 2, Operation: model.JudgmentOperationRevoke, AssertedOperator: "Janis", ValidUntil: until}
+	change.Judgment = &model.SituationJudgment{Revision: 2, Operation: model.JudgmentOperationRevoke, AssertedOperator: "default", ValidUntil: until}
 	change.JudgmentApplicabilityReason = model.JudgmentRevoked
 	got, err := BuildTransitions(change)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].Journal.JudgmentChange != model.JudgmentChangeRevoked || got[0].Journal.AttributedActor != "Janis" || got[0].Actor != model.ActorAttributedOperator {
+	if len(got) != 1 || got[0].Journal.JudgmentChange != model.JudgmentChangeRevoked || got[0].Journal.AttributedActor != "default" || got[0].Actor != model.ActorAttributedOperator {
 		t.Fatalf("withdrawal transition = %+v", got)
 	}
 }
 
 func TestExpectedJudgmentChangeDoesNotReplaceConcurrentRecoveryJournal(t *testing.T) {
 	until := hsNow(t).Add(2 * time.Hour)
-	prior := &model.ExpectedJudgmentProjection{Revision: 1, AssertedOperator: "Janis", ValidUntil: until}
+	prior := &model.ExpectedJudgmentProjection{Revision: 1, AssertedOperator: "default", ValidUntil: until}
 	change := hsNext(t)
 	change.PriorTransition.Projection.Briefing = &model.OperatorBriefing{ExpectedJudgment: prior}
 	change.Situation.Lifecycle = model.LifecycleRecoveryPending
@@ -363,7 +363,7 @@ func TestExpectedJudgmentChangeDoesNotReplaceConcurrentRecoveryJournal(t *testin
 	change.Projection.RecoveryObservedAt = timePtr(change.Now)
 	change.Projection.GraceUntil = timePtr(change.Now.Add(10 * time.Minute))
 	change.Projection.Briefing = &model.OperatorBriefing{}
-	change.Judgment = &model.SituationJudgment{Revision: 2, Operation: model.JudgmentOperationRevoke, AssertedOperator: "Janis", ValidUntil: until}
+	change.Judgment = &model.SituationJudgment{Revision: 2, Operation: model.JudgmentOperationRevoke, AssertedOperator: "default", ValidUntil: until}
 	change.JudgmentApplicabilityReason = model.JudgmentRevoked
 
 	got, err := BuildTransitions(change)
@@ -376,7 +376,7 @@ func TestExpectedJudgmentChangeDoesNotReplaceConcurrentRecoveryJournal(t *testin
 	if got[0].Reason != model.ReasonRecoveryObserved || got[0].JournalKind != model.JournalRecoveryPending || got[0].Journal.JudgmentChange != "" {
 		t.Fatalf("recovery transition was overwritten: %+v", got[0])
 	}
-	if got[1].Reason != model.ReasonOperatorContractChanged || got[1].Journal.JudgmentChange != model.JudgmentChangeRevoked || got[1].Journal.AttributedActor != "Janis" {
+	if got[1].Reason != model.ReasonOperatorContractChanged || got[1].Journal.JudgmentChange != model.JudgmentChangeRevoked || got[1].Journal.AttributedActor != "default" {
 		t.Fatalf("judgment transition missing: %+v", got[1])
 	}
 }

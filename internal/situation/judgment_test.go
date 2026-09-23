@@ -32,7 +32,7 @@ func expectedJudgmentFixture(t *testing.T) (SnapshotInput, model.SituationJudgme
 	return in, model.SituationJudgment{
 		ID: "judgment-1", SituationID: in.Situation.ID, Revision: 1,
 		Operation: model.JudgmentOperationRecord, State: model.JudgmentStateExpected,
-		AssertedOperator: "Janis", TrustDomain: model.JudgmentTrustAuthenticatedMCP,
+		AssertedOperator: "default", TrustDomain: model.JudgmentTrustAuthenticatedMCP,
 		ValidUntil: in.Now.Add(time.Hour), Coverage: coverage,
 	}
 }
