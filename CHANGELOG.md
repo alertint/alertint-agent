@@ -7,12 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.14.0-rc2] - 2026-09-23
+## [0.14.0-rc3] - 2026-09-23
 
 ### Fixed
 
-- Container images now provide a writable temporary directory for SQLite
-  migrations when upgrading an existing v0.13.x database.
+- Make the published container image's temporary directory writable by its
+  non-root runtime user. The release workflow now opens a fresh SQLite database
+  in both published Linux images before reporting success.
+
+## [0.14.0-rc2] - 2026-09-23
+
+### Known issue
+
+- The intended image fix did not survive publication: the published RC2 image
+  still needs a writable `/tmp` mount to upgrade a v0.13.x database. Helm
+  chart 0.2.3 supplies that mount by default; default Docker upgrades should
+  use a later candidate.
 
 ## [0.14.0-rc1] - 2026-09-22
 
@@ -912,7 +922,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single static binary** — pure-Go SQLite (no CGO), no external runtime dependencies.
   Multi-platform builds: `linux/amd64`, `linux/arm64`, `darwin/arm64`.
 
-[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.14.0-rc2...HEAD
+[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.14.0-rc3...HEAD
+[0.14.0-rc3]: https://github.com/alertint/alertint-agent/compare/v0.14.0-rc2...v0.14.0-rc3
 [0.14.0-rc2]: https://github.com/alertint/alertint-agent/compare/v0.14.0-rc1...v0.14.0-rc2
 [0.14.0-rc1]: https://github.com/alertint/alertint-agent/compare/v0.13.9...v0.14.0-rc1
 [0.13.9]: https://github.com/alertint/alertint-agent/compare/v0.13.8...v0.13.9

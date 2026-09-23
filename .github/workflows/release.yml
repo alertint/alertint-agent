@@ -68,6 +68,16 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # Test the registry artifact, not a local Docker build: RC2's local
+      # image had a writable /tmp, but the published image did not.
+      - name: Smoke-test published images without a temporary mount
+        run: |
+          for platform in linux/amd64 linux/arm64; do
+            timeout 3m docker run --rm --pull=always --platform "$platform" \
+              "ghcr.io/alertint/alertint-agent:${GITHUB_REF_NAME}" \
+              verify-audit --db /data/release-smoke.db
+          done
+
   publish-chart:
     name: publish Helm chart
     needs: release
