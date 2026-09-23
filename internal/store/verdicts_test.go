@@ -5,6 +5,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -210,5 +211,210 @@ func TestGoverningVerdict_DrillParity(t *testing.T) {
 	// drill triage sees it
 	if v, err := s.GoverningVerdict(ctx, "service=checkout", true); err != nil || v == nil || v.IncidentID != "inc-d" {
 		t.Fatalf("drill read must see the drill verdict, got %+v, %v", v, err)
+	}
+}
+
+// ----------------------------------------------------------------------
+// Task 8: atomic write-back — PersistVerdictCapture enqueues exactly one
+// captured_verdict_recorded situation input (never an
+// operator_annotation_recorded one, even though it also writes a matching
+// incident_annotations row internally), under the same active/no-owner/
+// terminal-owner rules as annotations_test.go's InsertIncidentAnnotation
+// coverage. situationOwnedIncident/situationIDForIncident/
+// terminalizeSituation/countOutboxRows are defined in annotations_test.go
+// (same package).
+// ----------------------------------------------------------------------
+
+// TestPersistVerdictCapture_EnqueuesCapturedVerdictRecordedWhenOwnerActive
+// proves Step 3's core contract and that the existing governing-verdict/
+// Triage effect is unchanged: LatestIncidentVerdict/GoverningVerdict still
+// see the captured verdict exactly as before — the new outbox row is a pure
+// addition, not a substitute for the verdict/annotation rows themselves.
+func TestPersistVerdictCapture_EnqueuesCapturedVerdictRecordedWhenOwnerActive(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	id := situationOwnedIncident(t, s, "service=verdict-active")
+
+	v, ann, err := s.PersistVerdictCapture(ctx, VerdictCapture{
+		IncidentID: id, Verdict: "correction",
+		Source: VerdictSourceHuman, LabelConfidence: 1,
+		ExpectationJSON: `{"must_not_conclude":["AZ outage"]}`,
+		AnnotationNote:  "corrected: not AZ outage",
+	})
+	if err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+
+	if n := countOutboxRows(t, s, id, "captured_verdict_recorded"); n != 1 {
+		t.Fatalf("captured_verdict_recorded inputs = %d, want 1", n)
+	}
+	// Never a separate operator_annotation_recorded input for the same
+	// event: PersistVerdictCapture's internal annotation write is not itself
+	// a plain-annotate write-back.
+	if n := countOutboxRows(t, s, id, "operator_annotation_recorded"); n != 0 {
+		t.Fatalf("operator_annotation_recorded inputs = %d, want 0 (captured verdict must not also enqueue an annotation input)", n)
+	}
+	var verdictID int64
+	var status, journalState string
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT verdict_id, status, journal_state FROM situation_input_outbox
+		WHERE incident_id = ? AND kind = 'captured_verdict_recorded'`, id).
+		Scan(&verdictID, &status, &journalState); err != nil {
+		t.Fatal(err)
+	}
+	if verdictID != v.ID {
+		t.Fatalf("verdict_id = %d, want %d (the exact verdict this call persisted)", verdictID, v.ID)
+	}
+	if status != "pending" || journalState != "pending" {
+		t.Fatalf("status=%q journal_state=%q, want pending/pending", status, journalState)
+	}
+
+	// Existing governing-verdict/Triage effect is unchanged.
+	latest, err := s.LatestIncidentVerdict(ctx, id)
+	if err != nil || latest == nil || latest.Version != 1 || latest.Verdict != "correction" {
+		t.Fatalf("latest verdict unaffected: %+v, %v", latest, err)
+	}
+	gov, err := s.GoverningVerdict(ctx, "service=verdict-active", false)
+	if err != nil || gov == nil || gov.IncidentID != id {
+		t.Fatalf("governing verdict unaffected: %+v, %v", gov, err)
+	}
+	if ann.Kind != "correction" {
+		t.Fatalf("matching annotation row unaffected: %+v", ann)
+	}
+}
+
+// TestPersistVerdictCapture_NoEnqueueWithoutOwner mirrors
+// TestInsertIncidentAnnotation_NoEnqueueWithoutOwner for the verdict path.
+func TestPersistVerdictCapture_NoEnqueueWithoutOwner(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	id := readyIncident(t, s, "service=verdict-unowned")
+
+	if _, _, err := s.PersistVerdictCapture(ctx, VerdictCapture{
+		IncidentID: id, Verdict: "correction",
+		Source: VerdictSourceHuman, LabelConfidence: 1,
+		ExpectationJSON: `{}`, AnnotationNote: "note",
+	}); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	if v, err := s.LatestIncidentVerdict(ctx, id); err != nil || v == nil {
+		t.Fatalf("verdict must still be visible: v=%+v err=%v", v, err)
+	}
+	if n := countOutboxRows(t, s, id, "captured_verdict_recorded"); n != 0 {
+		t.Fatalf("captured_verdict_recorded inputs = %d, want 0 (no owner at all)", n)
+	}
+}
+
+// TestPersistVerdictCapture_NoEnqueueForTerminalOwner mirrors
+// TestInsertIncidentAnnotation_NoEnqueueForTerminalOwner for the verdict
+// path.
+func TestPersistVerdictCapture_NoEnqueueForTerminalOwner(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	id := situationOwnedIncident(t, s, "service=verdict-terminal")
+	situationID := situationIDForIncident(t, s, id)
+	terminalizeSituation(t, s, situationID, time.Now().UTC().Add(time.Hour))
+
+	if _, _, err := s.PersistVerdictCapture(ctx, VerdictCapture{
+		IncidentID: id, Verdict: "correction",
+		Source: VerdictSourceHuman, LabelConfidence: 1,
+		ExpectationJSON: `{}`, AnnotationNote: "note",
+	}); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	if v, err := s.LatestIncidentVerdict(ctx, id); err != nil || v == nil {
+		t.Fatalf("verdict must still be visible: v=%+v err=%v", v, err)
+	}
+	if n := countOutboxRows(t, s, id, "captured_verdict_recorded"); n != 0 {
+		t.Fatalf("captured_verdict_recorded inputs = %d, want 0 (owner already terminal at write time)", n)
+	}
+}
+
+// TestPersistVerdictCapture_RetrySameVerdictIDIsIdempotent mirrors
+// TestInsertIncidentAnnotation_RetrySameAnnotationIDIsIdempotent for the
+// verdict path's own idempotency-key derivation.
+func TestPersistVerdictCapture_RetrySameVerdictIDIsIdempotent(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	id := situationOwnedIncident(t, s, "service=verdict-retry")
+	verdictID, err := insertVerdictRow(ctx, s, id, 1)
+	if err != nil {
+		t.Fatalf("seed verdict: %v", err)
+	}
+	idempotencyKey := fmt.Sprintf("captured-verdict:%d", verdictID)
+
+	for i := 0; i < 2; i++ {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := enqueueOperatorArtifactInputTx(ctx, tx, id, "captured_verdict_recorded", idempotencyKey, nil, verdictID, time.Now().UTC()); err != nil {
+			t.Fatalf("enqueue attempt %d: %v", i, err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := countOutboxRows(t, s, id, "captured_verdict_recorded"); n != 1 {
+		t.Fatalf("captured_verdict_recorded inputs after retry = %d, want 1 (idempotent replay)", n)
+	}
+}
+
+// TestPersistVerdictCapture_R2RaceOwnerTerminalizesBeforeApply mirrors
+// TestInsertIncidentAnnotation_R2RaceOwnerTerminalizesBeforeApply for the
+// verdict path's full round trip through Task 2's already-implemented
+// ApplySituationInput R2 handling.
+func TestPersistVerdictCapture_R2RaceOwnerTerminalizesBeforeApply(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	id := situationOwnedIncident(t, s, "service=verdict-r2-race")
+	situationID := situationIDForIncident(t, s, id)
+
+	v, _, err := s.PersistVerdictCapture(ctx, VerdictCapture{
+		IncidentID: id, Verdict: "correction",
+		Source: VerdictSourceHuman, LabelConfidence: 1,
+		ExpectationJSON: `{}`, AnnotationNote: "note",
+	})
+	if err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	before := getSituationByID(t, s, situationID)
+
+	terminalizeSituation(t, s, situationID, time.Now().UTC().Add(time.Hour))
+
+	claim := claimOneInput(t, s, "input-worker", time.Now().UTC().Add(2*time.Hour))
+	if err := s.ApplySituationInput(ctx, claim); err != nil {
+		t.Fatalf("apply artifact input to now-terminal owner: %v", err)
+	}
+
+	after := getSituationByID(t, s, situationID)
+	if after.InputVersion != before.InputVersion {
+		t.Fatalf("input_version changed: before %d, after %d, want unchanged", before.InputVersion, after.InputVersion)
+	}
+
+	var journalState string
+	var verdictID int64
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT journal_state, verdict_id FROM situation_input_outbox
+		WHERE incident_id = ? AND kind = 'captured_verdict_recorded'`, id).Scan(&journalState, &verdictID); err != nil {
+		t.Fatal(err)
+	}
+	if journalState != "owner_terminal" {
+		t.Fatalf("journal_state = %q, want owner_terminal", journalState)
+	}
+	if verdictID != v.ID {
+		t.Fatalf("verdict_id = %d, want %d", verdictID, v.ID)
+	}
+
+	var transitions int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM situation_transitions WHERE situation_id = ?`, situationID).Scan(&transitions); err != nil {
+		t.Fatal(err)
+	}
+	if transitions != 0 {
+		t.Fatalf("situation_transitions for %s = %d, want 0 (owner_terminal is never journaled)", situationID, transitions)
+	}
+
+	if latest, err := s.LatestIncidentVerdict(ctx, id); err != nil || latest == nil {
+		t.Fatalf("verdict must remain visible via Incident MCP/audit: latest=%+v err=%v", latest, err)
 	}
 }

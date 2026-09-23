@@ -63,8 +63,8 @@ func TestDecideAttach_SeverityRise(t *testing.T) {
 	in.incomingSeverityRank = 4 // critical
 	in.baselineSeverityRank = 2 // warning
 	got := decideAttach(in)
-	if got.action != actionRejudge || got.trigger != "severity" {
-		t.Fatalf("got %v/%q, want actionRejudge/severity", got.action, got.trigger)
+	if got.action != actionEscalate || got.trigger != "severity" {
+		t.Fatalf("got %v/%q, want actionEscalate/severity", got.action, got.trigger)
 	}
 }
 
@@ -73,8 +73,8 @@ func TestDecideAttach_NewAlertname(t *testing.T) {
 	in := baseInputs(now)
 	in.incomingAlertname = "OOMKilled"
 	got := decideAttach(in)
-	if got.action != actionRejudge || got.trigger != "new_alertname" {
-		t.Fatalf("got %v/%q, want actionRejudge/new_alertname", got.action, got.trigger)
+	if got.action != actionEscalate || got.trigger != "new_alertname" {
+		t.Fatalf("got %v/%q, want actionEscalate/new_alertname", got.action, got.trigger)
 	}
 }
 
@@ -89,8 +89,8 @@ func TestDecideAttach_CadenceTrigger(t *testing.T) {
 	}
 	in.lastActivity = last // inside Clock A
 	got := decideAttach(in)
-	if got.action != actionRejudge || got.trigger != "cadence" {
-		t.Fatalf("got %v/%q, want actionRejudge/cadence", got.action, got.trigger)
+	if got.action != actionEscalate || got.trigger != "cadence" {
+		t.Fatalf("got %v/%q, want actionEscalate/cadence", got.action, got.trigger)
 	}
 }
 
@@ -111,8 +111,8 @@ func TestDecideAttach_OccurrenceCap(t *testing.T) {
 	in := baseInputs(now)
 	in.occurrencesSinceJudged = 99 // this attach would be the 100th
 	got := decideAttach(in)
-	if got.action != actionRejudge || got.trigger != "cap" {
-		t.Fatalf("got %v/%q, want actionRejudge/cap", got.action, got.trigger)
+	if got.action != actionEscalate || got.trigger != "cap" {
+		t.Fatalf("got %v/%q, want actionEscalate/cap", got.action, got.trigger)
 	}
 }
 
@@ -121,8 +121,8 @@ func TestDecideAttach_ClockBCeiling(t *testing.T) {
 	in := baseInputs(now)
 	in.lastJudgedAt = now.Add(-5 * time.Hour) // > 4h ceiling
 	got := decideAttach(in)
-	if got.action != actionRejudge || got.trigger != "ceiling" {
-		t.Fatalf("got %v/%q, want actionRejudge/ceiling", got.action, got.trigger)
+	if got.action != actionEscalate || got.trigger != "ceiling" {
+		t.Fatalf("got %v/%q, want actionEscalate/ceiling", got.action, got.trigger)
 	}
 }
 

@@ -32,6 +32,8 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite" // registers driver name "sqlite"
+
+	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 )
 
 //go:embed migrations/*.sql
@@ -40,6 +42,10 @@ var migrationsFS embed.FS
 // Store is the agent's persistence handle.
 type Store struct {
 	db *sql.DB
+
+	// semanticProfileMaxAttempts is Plan 4 Task 7's own injected config
+	// value — see SetSemanticProfileMaxAttempts.
+	semanticProfileMaxAttempts int
 }
 
 // Open opens (or creates) a SQLite database at path and applies all
@@ -95,6 +101,42 @@ func buildDSN(dbPath string) string {
 // ascending version order, each inside its own transaction, with the
 // applied version recorded in schema_migrations.
 func (s *Store) migrate(ctx context.Context) error {
+	// Pre-release Plan 4 used versions 22–26 for evidence tables. Those
+	// numbers were reused by the operator migrations. Refuse the
+	// ambiguous legacy lineage before applying any schema changes.
+	var legacyPlan4 bool
+	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS (
+		SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'situation_preparation_cycles'
+	) AND NOT EXISTS (SELECT 1 FROM pragma_table_info('notification_intents') WHERE name = 'reply_kind')`).Scan(&legacyPlan4); err != nil {
+		return fmt.Errorf("store: inspect migration lineage: %w", err)
+	}
+	if legacyPlan4 {
+		return fmt.Errorf("store: unsupported pre-release Plan 4 migration lineage: preserve this database and use a fresh database or the operator migration lineage")
+	}
+	// Released v0.13.9 owns version 13 (the audit index). Earlier
+	// state-controller builds reused it for the delivery ledger. Never
+	// reinterpret that prerelease lineage or continue a partially failed
+	// upgrade from it: inspect before applying any schema changes.
+	var hasMigrationLedger bool
+	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS (
+		SELECT 1 FROM sqlite_schema WHERE type='table' AND name='schema_migrations'
+	)`).Scan(&hasMigrationLedger); err != nil {
+		return fmt.Errorf("store: inspect migration ledger: %w", err)
+	}
+	if hasMigrationLedger {
+		var incompatible bool
+		if err := s.db.QueryRowContext(ctx, `SELECT
+			(EXISTS (SELECT 1 FROM schema_migrations WHERE version=13)
+			 AND NOT EXISTS (SELECT 1 FROM sqlite_schema WHERE type='index' AND name='audit_log_kind_ts_idx'))
+			OR (EXISTS (SELECT 1 FROM schema_migrations WHERE version>=14)
+			 AND NOT EXISTS (SELECT 1 FROM sqlite_schema WHERE type='table' AND name='alert_deliveries'))
+		`).Scan(&incompatible); err != nil {
+			return fmt.Errorf("store: inspect state-controller migration lineage: %w", err)
+		}
+		if incompatible {
+			return fmt.Errorf("store: unsupported pre-release state-controller migration lineage: preserve this database; restore a backup from the released 0.13.x version or use a fresh database for pre-release testing")
+		}
+	}
 	if _, err := s.db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version    INTEGER PRIMARY KEY,
@@ -269,8 +311,12 @@ type Alert struct {
 	Role string
 }
 
-// ErrNotFound is returned when a lookup finds no matching row.
-var ErrNotFound = errors.New("store: not found")
+// ErrNotFound is situationmodel.ErrNotFound, relocated there to break
+// internal/situation's former import of internal/store: internal/situation
+// compares an ApplySituationInput failure against this exact value via
+// errors.Is, so it must be one shared value both packages can see without
+// either importing the other. See internal/situation/model/foundation.go.
+var ErrNotFound = situationmodel.ErrNotFound
 
 // UpsertAlertByFingerprint inserts the alert or, if a row with the same
 // fingerprint already exists, updates it in place ("latest wins"). The
@@ -503,11 +549,13 @@ func (s *Store) GetRecentIncidentByGroupKey(ctx context.Context, groupKey string
 	return scanIncidentFull(row)
 }
 
-// ListIncidentsByAlertID returns every incident that already contains alertID,
-// oldest first. The full incident shape lets recovery notifications preserve
-// the finding that belongs to each incident.
-func (s *Store) ListIncidentsByAlertID(ctx context.Context, alertID string) ([]Incident, error) {
-	rows, err := s.db.QueryContext(ctx, `
+// GetCurrentIncidentByAlertID returns the newest nonterminal Incident that
+// already contains alertID. Resolution deliveries use this membership before
+// group-key routing so an unrelated collecting Incident cannot claim them.
+// A terminal Situation is excluded even when its legacy Incident row was not
+// moved to a terminal status; terminal episodes never accept later input.
+func (s *Store) GetCurrentIncidentByAlertID(ctx context.Context, alertID string) (*Incident, error) {
+	row := s.db.QueryRowContext(ctx, `
 		SELECT i.id, i.group_key, i.status,
 		       i.first_alert_at, i.last_alert_at, i.ready_at, i.alert_count,
 		       COALESCE(i.summary,''), COALESCE(i.root_cause,''),
@@ -516,26 +564,15 @@ func (s *Store) ListIncidentsByAlertID(ctx context.Context, alertID string) ([]I
 		       i.created_at, i.updated_at, i.last_judged_at
 		FROM incidents i
 		JOIN incident_alerts ia ON ia.incident_id = i.id
+		LEFT JOIN situation_incidents si ON si.incident_id = i.id
+		LEFT JOIN situations s ON s.id = si.situation_id
 		WHERE ia.alert_id = ?
-		ORDER BY i.created_at ASC, i.id ASC
+		  AND i.status NOT IN ('resolved', 'failed')
+		  AND (s.id IS NULL OR s.lifecycle NOT IN ('recovered', 'closed_unknown'))
+		ORDER BY i.created_at DESC, i.id DESC
+		LIMIT 1
 	`, alertID)
-	if err != nil {
-		return nil, fmt.Errorf("store: list incidents by alert id: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	var incidents []Incident
-	for rows.Next() {
-		inc, err := scanIncidentFull(rows)
-		if err != nil {
-			return nil, err
-		}
-		incidents = append(incidents, *inc)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("store: list incidents by alert id rows: %w", err)
-	}
-	return incidents, nil
+	return scanIncidentFull(row)
 }
 
 // MarkIncidentReady transitions an incident from "collecting" to
@@ -886,74 +923,6 @@ func (s *Store) MarkIncidentResolved(ctx context.Context, incidentID string) err
 	}
 
 	return tx.Commit()
-}
-
-// ResolveIncidentIfAllMembersResolved atomically transitions an eligible
-// incident only when it has at least one member and every current member is
-// resolved. It returns the full transitioned incident for the caller that owns
-// the recovery notification. ErrNotFound means the incident was ineligible,
-// still had a firing member, had no members, or another resolver already won.
-func (s *Store) ResolveIncidentIfAllMembersResolved(ctx context.Context, incidentID string) (*Incident, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("store: begin tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	res, err := tx.ExecContext(ctx, `
-		UPDATE incidents
-		SET status     = 'resolved',
-		    updated_at = ?
-		WHERE id = ?
-		  AND status IN ('analyzed','ready')
-		  AND EXISTS (
-		      SELECT 1
-		      FROM incident_alerts ia
-		      WHERE ia.incident_id = incidents.id
-		  )
-		  AND NOT EXISTS (
-		      SELECT 1
-		      FROM incident_alerts ia
-		      JOIN alerts a ON a.id = ia.alert_id
-		      WHERE ia.incident_id = incidents.id
-		        AND a.status != 'resolved'
-		  )
-	`, now, incidentID)
-	if err != nil {
-		return nil, fmt.Errorf("store: resolve incident if all members resolved: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return nil, fmt.Errorf("store: resolve incident if all members resolved rows: %w", err)
-	}
-	if n == 0 {
-		return nil, ErrNotFound
-	}
-
-	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM incident_triage WHERE incident_id = ? AND phase != 'exhausted'
-	`, incidentID); err != nil {
-		return nil, fmt.Errorf("store: resolve incident if all members resolved: clear triage: %w", err)
-	}
-
-	inc, err := scanIncidentFull(tx.QueryRowContext(ctx, `
-		SELECT id, group_key, status,
-		       first_alert_at, last_alert_at, ready_at, alert_count,
-		       COALESCE(summary,''), COALESCE(root_cause,''),
-		       COALESCE(confidence,0.0), COALESCE(output_json,''),
-		       COALESCE(enrichment_json,''),
-		       created_at, updated_at, last_judged_at
-		FROM incidents
-		WHERE id = ?
-	`, incidentID))
-	if err != nil {
-		return nil, fmt.Errorf("store: resolve incident if all members resolved: load incident: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("store: resolve incident if all members resolved: commit: %w", err)
-	}
-	return inc, nil
 }
 
 // SetAlertRole sets the role column on an incident_alerts row.

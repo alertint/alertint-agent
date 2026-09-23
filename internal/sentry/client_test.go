@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/alertint/alertint-agent/internal/httpcount"
 )
 
 // fakeClock is a deterministic clock for backoff tests: Sleep records the
@@ -197,11 +199,15 @@ func TestClient_RateLimitBacksOffThenSucceeds(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv, clk)
-	if _, _, err := c.ListReleases(context.Background(), nil, ""); err != nil {
+	ctx, requestCounter := httpcount.WithCounter(context.Background())
+	if _, _, err := c.ListReleases(ctx, nil, ""); err != nil {
 		t.Fatalf("ListReleases after backoff: %v", err)
 	}
 	if hits != 2 {
 		t.Errorf("server hits = %d, want 2 (one 429 + one retry)", hits)
+	}
+	if got := requestCounter.Attempts(); got != 2 {
+		t.Errorf("observed request attempts = %d, want 2", got)
 	}
 	if clk.sleepCount() != 1 {
 		t.Fatalf("sleeps = %d, want 1", clk.sleepCount())

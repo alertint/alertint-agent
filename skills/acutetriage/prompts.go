@@ -37,6 +37,10 @@ The response must conform exactly to this schema:
 }
 
 Rules:
+- analysis_name is the channel headline: summarize the final overall_issue in one short sentence (at most 80 characters). Preserve causal qualifiers such as "likely" or "may"; never make the title more certain than the finding. Revise it when verification changes the finding. Omit "Earlier report", time windows, and percentages unless essential to identify the issue.
+- Separate direct observations from hypotheses: correlation_findings must state only facts visible in the supplied evidence, with their source and scope. Put possible causes and interpretations in overall_issue.
+- Sampled errors do not establish uniform failure across users. Alerts on other group keys in the incident-window lookup rule out claims that no other services have alerts; a shared cause remains unconfirmed.
+- Reconcile every draft claim with the verification results before retaining it. Remove or qualify contradicted scope claims.
 - severity must be one of: "low", "medium", or "high" based on business impact and urgency.
 - confidence is a float in [0.0, 1.0] reflecting how certain you are about the correlation and root cause.
 - Focus on explaining HOW alerts are connected and WHY they belong to the same incident.
@@ -707,3 +711,10 @@ func formatLabels(m map[string]string) string {
 	}
 	return strings.Join(parts, ",")
 }
+
+// Applied to pack-selected prompts as well as the built-in fallback.
+const operatorEvidenceInstructions = `- Separate direct observations from hypotheses: correlation_findings must state only facts visible in the supplied evidence, with their source and scope. Put possible causes and interpretations in overall_issue.
+- analysis_name is the channel headline: summarize the final overall_issue in one short sentence (at most 80 characters). Preserve causal qualifiers such as "likely" or "may"; never make the title more certain than the finding. Revise it when verification changes the finding. Omit "Earlier report", time windows, and percentages unless essential to identify the issue.
+- Sampled errors do not establish uniform failure across users. Alerts on other group keys in the incident-window lookup rule out claims that no other services have alerts; a shared cause remains unconfirmed.
+- Reconcile every draft claim with the verification results before retaining it. Remove or qualify contradicted scope claims.
+`

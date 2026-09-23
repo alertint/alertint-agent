@@ -147,6 +147,43 @@ storage:
 	}
 }
 
+func TestValidate_AlertmanagerProvenanceRequiresExactPrometheusMapping(t *testing.T) {
+	cfg := Defaults()
+	cfg.Alertmanager.WebhookTokenEnv = "ALERTINT_WEBHOOK_TOKEN"
+	cfg.LLM.APIKeyEnv = "ANTHROPIC_API_KEY"
+	cfg.Alertmanager.InstanceID = "prod-am"
+	cfg.Prometheus.InstanceID = "prod-prom"
+	cfg.Prometheus.BaseURL = "http://prometheus:9090"
+	cfg.Alertmanager.Rules = []AlertmanagerRuleMappingConfig{{AlertName: "ReconciliationLoad", Group: "jobs", Rule: "ReconciliationLoad", ScopeLabels: []string{"service"}}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate configured mapping: %v", err)
+	}
+
+	cfg.Prometheus.InstanceID = ""
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "prometheus.instance_id") {
+		t.Fatalf("Validate = %v, want prometheus.instance_id error", err)
+	}
+
+	cfg.Prometheus.InstanceID = "prod-prom"
+	cfg.Prometheus.BaseURL = ""
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "prometheus must be enabled") {
+		t.Fatalf("Validate = %v, want enabled Prometheus error", err)
+	}
+}
+
+func TestValidate_AlertmanagerProvenanceRejectsPaddedAlertName(t *testing.T) {
+	cfg := Defaults()
+	cfg.Alertmanager.WebhookTokenEnv = "ALERTINT_WEBHOOK_TOKEN"
+	cfg.LLM.APIKeyEnv = "ANTHROPIC_API_KEY"
+	cfg.Alertmanager.InstanceID = "prod-am"
+	cfg.Prometheus.InstanceID = "prod-prom"
+	cfg.Prometheus.BaseURL = "http://prometheus:9090"
+	cfg.Alertmanager.Rules = []AlertmanagerRuleMappingConfig{{AlertName: " ReconciliationLoad ", Group: "jobs", Rule: "ReconciliationLoad", ScopeLabels: []string{"service"}}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "alert_name must not have surrounding whitespace") {
+		t.Fatalf("Validate = %v, want explicit padded alert_name error", err)
+	}
+}
+
 func TestLoad_ExplicitEmptyGroupLabelsUsesReceiverGrouping(t *testing.T) {
 	yaml := strings.Replace(minimalValidYAML,
 		`group_labels: ["cluster", "namespace", "service"]`, `group_labels: []`, 1)
@@ -235,6 +272,21 @@ func TestZabbixAPIDefaults(t *testing.T) {
 	if a.TimeoutSeconds != 10 || a.DefaultRangeMinutes != 60 ||
 		a.HistoryRetentionDays != 7 || a.FlapWindowHours != 24 || a.HostLabel != "host" {
 		t.Fatalf("defaults wrong: %+v", a)
+	}
+}
+
+func TestZabbixInstanceIDValidation(t *testing.T) {
+	cfg := Defaults()
+	cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "agent.db")
+	cfg.LLM.APIKeyEnv = "ANTHROPIC_API_KEY"
+	cfg.Alertmanager.WebhookTokenEnv = "ALERTINT_WEBHOOK_TOKEN"
+	cfg.Zabbix.InstanceID = "prod zabbix"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "zabbix: instance_id") {
+		t.Fatalf("want instance_id validation error, got %v", err)
+	}
+	cfg.Zabbix.InstanceID = "prod-zbx.eu_1"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid instance id: %v", err)
 	}
 }
 

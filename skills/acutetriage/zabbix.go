@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/httpcount"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/internal/zabbix"
 )
@@ -55,9 +56,11 @@ type ZabbixContext struct {
 	// Outcome is the context-level roll-up (worst class wins: failed >
 	// degraded > fetched; no_selector when no class was applicable) — it feeds
 	// the Evidence line. Per-class specifics go in Note.
-	Outcome   Outcome   `json:"outcome,omitempty"`
-	Note      string    `json:"note,omitempty"`
-	FetchedAt time.Time `json:"fetched_at"`
+	Outcome              Outcome   `json:"outcome,omitempty"`
+	Note                 string    `json:"note,omitempty"`
+	FetchedAt            time.Time `json:"fetched_at"`
+	RequestAttempts      int       `json:"request_attempts,omitempty"`
+	RequestAttemptsKnown bool      `json:"request_attempts_known,omitempty"`
 }
 
 // ZabbixOperatorView is class 1 — operator knowledge from the trigger config.
@@ -102,10 +105,16 @@ type ZabbixProblemView struct {
 // in this same pipeline call and can seed its own HostContext cache from it
 // instead of re-fetching, well within Zabbix's staleness tolerance; nil/empty
 // whenever Class 2 didn't run or didn't succeed.
-func FetchZabbixContext(ctx context.Context, client ZabbixReader, params ZabbixParams, alerts []store.Alert, t time.Time, incidentID string, logger *slog.Logger) (*ZabbixContext, map[string]zabbix.Topology) {
+func FetchZabbixContext(ctx context.Context, client ZabbixReader, params ZabbixParams, alerts []store.Alert, t time.Time, incidentID string, logger *slog.Logger) (out *ZabbixContext, topology map[string]zabbix.Topology) {
 	if client == nil {
 		return nil, nil
 	}
+	ctx, requestCounter := httpcount.WithCounter(ctx)
+	defer func() {
+		if out != nil && requestCounter.Attempts() > 0 {
+			out.RequestAttempts, out.RequestAttemptsKnown = requestCounter.Attempts(), true
+		}
+	}()
 	hostLabel := params.HostLabel
 	if hostLabel == "" {
 		hostLabel = "host"
@@ -127,6 +136,7 @@ func FetchZabbixContext(ctx context.Context, client ZabbixReader, params ZabbixP
 	if triggerID == "" && eventID == "" && host == "" {
 		z.Outcome = OutcomeNoSelector
 		z.Note = "no zabbix identity on this incident (no trigger id, event id, or host label)"
+		z.RequestAttemptsKnown = true
 		return z, nil
 	}
 

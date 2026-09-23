@@ -247,6 +247,9 @@ func TestReplayIncident_HermeticFullPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload after replay: %v", err)
 	}
+	if after.EnrichmentJSON != before.EnrichmentJSON {
+		t.Fatal("replay changed persisted evidence or analysis usage")
+	}
 	if after.OutputJSON != before.OutputJSON || after.Summary != before.Summary ||
 		after.RootCause != before.RootCause || after.Confidence != before.Confidence {
 		t.Errorf("store finding changed by replay:\nbefore=%+v\nafter=%+v", before, after)

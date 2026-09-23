@@ -18,13 +18,14 @@ import (
 )
 
 func (s *Server) toolIncidentAnnotate() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_incident_annotate",
+	tool := newTool("alertint_incident_annotate",
 		mcplib.WithDescription("Attach an operator note to an incident — human context "+
 			"for the next investigator, shown in the incident's history (Slack card and "+
 			"MCP reads), permanent and age-stamped. Notes never influence triage or "+
 			"memory recall; to correct or confirm a finding with machine effect, use "+
 			"alertint_incident_capture_verdict. Writes land only in AlertINT's own "+
-			"incident state, audit-chained — never in your systems."),
+			"incident state, audit-chained — never in your systems. NEVER call this without an explicit "+
+			"human instruction to record the note."),
 		mcplib.WithString("incident_id", mcplib.Description("Incident ID from alertint_list_incidents."), mcplib.Required()),
 		mcplib.WithString("kind", mcplib.Description("correction | observation"), mcplib.Required()),
 		mcplib.WithString("note", mcplib.Description("Free text, max 2000 chars."), mcplib.Required()),
@@ -55,7 +56,7 @@ func (s *Server) handleIncidentAnnotate(ctx context.Context, req mcplib.CallTool
 }
 
 func (s *Server) toolIncidentCaptureVerdict() (mcplib.Tool, mcpserver.ToolHandlerFunc) {
-	tool := mcplib.NewTool("alertint_incident_capture_verdict",
+	tool := newTool("alertint_incident_capture_verdict",
 		mcplib.WithDescription("Capture an operator-confirmed verdict for an incident — a correction or a "+
 			"confirmation — as a replayable, graded record. NEVER call this without an explicit human "+
 			"confirmation of the verdict. Persists the verdict + annotation first (a grading failure "+

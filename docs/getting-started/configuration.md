@@ -107,6 +107,7 @@ pull source (read-only context enrichment + `zabbix_metric_history` /
 
 | Field | Type | Default | Description |
 |---|---|---|---|
+| `instance_id` | string | — | Stable non-secret installation ID shared by ingress and API, up to 64 letters, digits, `.`, `_`, or `-`. Required for trusted rule-version observations; changing it creates a different source identity. Existing rows remain unknown. |
 | `ingress.enabled` | bool | `false` | Mount `POST /webhook/zabbix` on `receivers.address` |
 | `ingress.webhook_token_env` | string | — | **Required when `ingress.enabled`.** Env var name holding the Zabbix webhook bearer token |
 | `api.enabled` | bool | auto | Fetch the Zabbix context at triage time and register the two `zabbix_*` MCP tools. Omitted = **on automatically** when `api.base_url` is set; set `false` to force off. |
@@ -124,6 +125,17 @@ pull source (read-only context enrichment + `zabbix_metric_history` /
 |---|---|---|---|
 | `sqlite_path` | string | `./alertint-agent.db` | Path to the SQLite database file. The directory must be writable. |
 
+### Schema upgrades and rollback
+
+Every `alertint serve` start applies any pending embedded schema
+migrations to the configured database before accepting inbound traffic.
+Take a live backup ([Backup & restore](backup-restore.md)) before
+upgrading to a new AlertINT release. Rolling back a schema upgrade means
+restoring that pre-upgrade backup — there is no in-place schema-downgrade
+path, and starting an older binary against an already-upgraded database
+is unsupported: an older binary does not understand the newer schema and
+its behavior against it is undefined.
+
 ## `llm`
 
 | Field | Type | Default | Description |
@@ -137,6 +149,16 @@ pull source (read-only context enrichment + `zabbix_metric_history` /
 | `thinking` | bool | `false` | `openai-compatible` only: opt a hybrid-reasoning model into thinking. Requires `max_tokens` 8000–16000 or triage fails with the truncation error |
 | `reasoning_effort` | string | — | `openai-compatible` only, requires `thinking: true`: sent as `chat_template_kwargs.reasoning_effort` alongside `enable_thinking`. Model-specific values (e.g. Qwen3.8: `xhigh`/`medium`/`low`), passed through unvalidated; empty omits the field and leaves the model/server default in effect |
 | `timeout_seconds` | int | `120` | Whole-request LLM timeout, either provider. Local endpoints under storm concurrency typically need ~300 |
+| `budget.calls_per_hour` | int | `0` | Shared ceiling on generation HTTP attempts in the preceding rolling 60 minutes, including retries; `0` is unlimited. Reservations commit before dispatch and survive restart in `connector_state` under `llm.budget.v1`. Metadata/health GETs are excluded. |
+| `budget.total_tokens` | int | `0` | Shared cumulative token ceiling with no time reset; `0` is unlimited. Each concurrent request reserves encoded request bytes + output cap + 1024, then settles to reported usage including cache tokens (without double-counting OpenAI detail fields). Unknown usage retains the charge and blocks further token-budgeted calls pending manual reconciliation; crashes retain unresolved allowances. Accounting begins when either limit is enabled, without historical backfill. This conservative text allowance cannot guarantee an exact cap for arbitrary compatible servers; reported overruns return an error. See `config.example.yaml` for recovery and limit semantics. |
+
+Situation assessments deferred by the hourly limit retry admission at its expiry;
+proved-unsent denials do not consume inference attempts. Token/unknown-usage
+deferrals require manual recovery: reconcile the budget with the agent stopped,
+then explicitly rearm the affected `budget_deferred` Situations through reviewed
+database maintenance. Current MCP Situation tools are read-only. Restarting or
+raising limits alone does not clear these parks or unknown usage; preserve actual
+attempt counts, provider charges, and unrelated parks.
 
 This is the model that triages your incidents and writes the finding
 summaries, so every dispatched incident consumes LLM tokens — Anthropic API
@@ -144,8 +166,8 @@ tokens on the default provider, or your own compute on a self-hosted
 `openai-compatible` endpoint. The Sonnet default gives the strongest
 analysis in its price class; set `model: claude-haiku-4-5` to cut
 per-incident cost when volume matters more than finding depth. Keep an eye
-on your spend in the Anthropic console — the agent does not yet meter or
-cap usage (budget tracking is planned).
+on your spend in the provider console and configure finite limits above for
+the shared guard; both limits default to `0` (unlimited).
 
 `max_tokens` bounds the finding reply. The finding JSON lists every member
 alert, so a very large correlated incident can exceed the default and truncate
@@ -178,16 +200,20 @@ context for the analysis — at the cost of a slower first finding.
 Incident memory stops an unchanged, already-analyzed condition from being
 re-triaged as brand new every time it re-fires. When an alert whose group key
 matches an already-analyzed incident fires again inside the collapse horizon,
-it attaches as a lightweight occurrence — the incident's Slack card edits to
-`recurred ×N` — instead of minting a new incident and spending another LLM
-call. This is deterministic, free, and always on; there is no enable switch,
-only the knobs below.
+it attaches as a lightweight occurrence instead of minting a new incident and
+spending another LLM call. In v0.14 the attach feeds the owning Situation's
+recurrence count (its closed predecessors plus its own re-fires);
+the root shows `recurred ×N`, and crossing a milestone rung records a
+`recurrence_milestone` Transition with one quiet thread reply (see
+[Slack](../notifications/slack.md#recurrence-resurfacing)). This is
+deterministic, free, and always on; there is no enable switch, only the knobs
+below.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `attach_window_minutes` | int | `30` | Clock A. A re-fire within this many minutes of the last occurrence attaches instead of re-triaging. A longer window collapses more aggressively. |
-| `judgment_ceiling_hours` | int | `4` | Clock B. A steady flapper that never pauses would slide Clock A forever; once this long has passed since the last analysis, the next re-fire forces a fresh re-judgment (with the accumulated history) even while still collapsing. |
-| `occurrence_cap` | int | `100` | Backstop trigger: force a re-judgment after this many occurrences have attached since the last analysis, regardless of the clocks. |
+| `judgment_ceiling_hours` | int | `4` | Clock B. A steady flapper that never pauses would slide Clock A forever; once this long has passed since the last analysis, the next re-fire is durably recorded as an escalation trigger (with the accumulated history) even while still collapsing. Acting on that trigger to force a fresh re-judgment automatically is not yet wired into the durable delivery pipeline — see [incident memory](../concepts/incident-memory.md#recurrence-collapse). |
+| `occurrence_cap` | int | `100` | Backstop: durably records an escalation trigger after this many occurrences have attached since the last analysis, regardless of the clocks. Not yet acted on automatically — see [incident memory](../concepts/incident-memory.md#recurrence-collapse). |
 | `lookback_days` | int | `90` | How long occurrence rows are retained and how far back recurrence counts and cadence are computed. Older occurrences are pruned on the correlator's normal flush cycle. |
 | `classifier.mode` | string | `off` | Shadow classifier (see below). `off` makes no extra LLM call; `shadow` runs a small fuzzy-match call and records every verdict in the audit log while the recall render stays unchanged; `on` lets a graduated match tag the recall. **Quote the value** — bare `off`/`on` are YAML booleans. |
 | `classifier.timeout_seconds` | int | `10` | Seconds-scale timeout for the classifier's own Haiku call. Only used when `mode` is `shadow` or `on`. |
@@ -227,6 +253,112 @@ specific to your environment; see
 | `verification.max_rounds` | int | `1` | Reserved for future multi-round verification; values greater than 1 are rejected. Today only `1` is supported. |
 | `extra_selector_labels` | list | — | Extra alert-label keys (topology labels like `cluster` or `region`) added to the built-in selector allowlist (`namespace, service, job, pod, container, instance`) used to build metric/log enrichment queries and the verification floor's peer scope. Extras join every query and are never dropped by fallback queries. Use topology labels, not identity labels. |
 
+## `situations`
+
+This section configures the v0.14 fenced Situation controller and the "B+"
+Acute Triage gate (see [Architecture: Situation foundation and
+controller](../concepts/architecture.md#3a-situation-foundation-and-controller)).
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `workers` | int | `2` | How many claimed Situations one controller poll reconciles concurrently. |
+| `reconcile_poll_seconds` | int | `1` | How often the controller's background loop wakes on its own, absent an earlier wake from a fresh Situation input. |
+| `lease_seconds` | int | `300` | How long a claimed Situation's lease is held before another poll may reclaim it as expired — shared by the controller and the Acute Triage attempt claim. |
+| `heartbeat_seconds` | int | `30` | How often a claimed Situation's (or Triage attempt's) lease is renewed while work is still running. |
+| `webhook_recovery_grace_seconds` | int | `120` | Fixed recovery-grace/observation-deadline base for a webhook (or receipt-fallback) delivery — how long a Situation waits past its last firing symptom before a lifecycle transition (recovered / closed-unknown) is considered. |
+| `cadence.fast_seconds` | int | `60` | Reconsideration tempo for a Situation in the fast cadence tier (urgent Attention, recovery pending, or AlertINT work durably running): how far past a reconcile the next self-scheduled checkpoint lands when nothing earlier is due. |
+| `cadence.normal_seconds` | int | `300` | Reconsideration tempo for the normal cadence tier (Attention `investigate`). |
+| `cadence.slow_seconds` | int | `900` | Reconsideration tempo for the slow cadence tier (active observe, waiting, blocked, or parked). Must satisfy `fast_seconds < normal_seconds < slow_seconds`; the loader rejects any other ordering. |
+| `max_l2_calls_per_attempt` | int | `2` | Durable L2 (Situation Assessment) provider-dispatch slots one controller work attempt may consume: the draft call plus at most one immediate malformed-shape correction. Shipped as a config key so the wire shape documents the ceiling; any value other than `2` is rejected — not tunable in this build. |
+| `max_work_attempts_per_input` | int | `5` | Durable controller attempts one unchanged Situation input may consume before semantic work parks. Any value other than `5` is rejected — not tunable in this build. |
+| `attempt_wall_seconds` | int | `180` | Wall-clock budget for one controller reconcile cycle. |
+| `llm_concurrency` | int | `2` | Global semaphore bounding concurrent L2 provider calls across every Situation the controller is reconciling at once. |
+| `retry.min_seconds` | int | `5` | Floor of the controller's transient-failure retry backoff (exponential from here, capped at `retry.max_seconds`). |
+| `retry.max_seconds` | int | `300` | Ceiling of the controller's transient-failure retry backoff. |
+| `retry.jitter_percent` | int | `20` | Jitter fraction (±) applied to the computed backoff, so concurrently-parked Situations don't all retry in lockstep. |
+| `slack.repage_cooldown_seconds` | int | `900` | How long a *materially changed required action* must wait after a delivered main-channel interruption before it may create another one. It gates exactly that one case: a first publication, newly crossed criticality, newly urgent attention, and an operator hand-off all bypass it, because a cooldown must never swallow an escalation. |
+| `preparation.max_source_calls_per_cycle` | int | `8` | Physical connector requests (store, Prometheus, Zabbix, Loki, Sentry, changes) one preparation cycle may spend, including retries and secondary lookups. Eight lets the bounded six-request Zabbix rule/history read fit beside the largest protected two-request investigation. Accepts 1-32. |
+| `preparation.max_wall_seconds` | int | `20` | Wall-clock budget for one preparation attempt (both lifecycle and assessment reads share it). Accepts 1-30 and must be strictly less than `attempt_wall_seconds`. |
+| `preparation.refresh_seconds` | int | `300` | Minimum re-check cadence for an unchanged subject/capability — a re-delivery or controller retry cannot bypass it. Accepts 60-3600. |
+| `semantic_profiles.workers` | int | `1` | Inference-worker goroutines polling for due advisory-profile jobs. Accepts 1-4; they share the same L0+L2 primary-LLM concurrency limiter as Assessment calls, so at most one profile inference ever runs at a time regardless of this value. |
+| `semantic_profiles.max_attempts` | int | `3` | Durable attempts one inference job may spend before it exhausts. Accepts 1-5. |
+| `semantic_profiles.attempt_wall_seconds` | int | `30` | Wall-clock budget for one inference attempt's model dispatch. Accepts 1-60. |
+
+Preparation and semantic-profile evidence never write to Slack, grant
+policy authority, or assert source lifecycle on their own — see
+[Architecture: bounded evidence preparation](../concepts/architecture.md)
+and [Scope and limits](../concepts/scope-and-limits.md).
+
+Slack delivery adds no other knobs. Retry timing (exponential 5 s → 5 min
+with jitter, honouring a longer Slack `Retry-After`), batch size, and the
+five-minute Delivery-gap threshold are protocol constants, and the delivery
+worker reuses `lease_seconds`, `heartbeat_seconds`, and
+`reconcile_poll_seconds` above. There is deliberately **no attempt ceiling
+and no dead-letter setting**: a valid effect retries indefinitely, and a
+definite configuration rejection blocks durably instead of being discarded
+(see [Slack](../notifications/slack.md#delivery-durable-intent-indefinite-retry-at-least-once)).
+
+Cadence is persisted scheduling machinery, not card content — it only
+widens or narrows how soon the controller next reconciles a nonterminal
+Situation; there is no `off` setting, and the tier itself is never chosen
+by the model. The controller's own checkpoint is the earliest of
+`now + cadence`, the next Acute Triage due time, a pending Assessment
+retry, recovery-grace expiry, the lifecycle observation deadline, or a
+concurrently persisted earlier checkpoint — so a shorter cadence can only
+make the controller look again sooner, never later than those.
+
+`max_l2_calls_per_attempt` and `max_work_attempts_per_input` are
+deliberately fixed. There is no `situations.budgets.max_l1_llm_calls` (or
+any other L1/Acute-Triage call-budget) key in this section — Acute Triage
+keeps its own, already-documented five-attempt schedule (see
+[`triage`](#triage) above and [Incident
+lifecycle](../concepts/architecture.md#incident-lifecycle)); the controller
+introduces no separate, parallel budget for it. A one-hour startup horizon
+that closes out any Situation-owned Triage schedule row still overdue an
+hour past boot is enforced automatically and is not configurable here —
+see [Incident lifecycle: Restart
+recovery](../concepts/architecture.md#incident-lifecycle) for that
+behavior.
+
+## `telemetry`
+
+The operator-configured observability boundary. Disabled by default: the agent
+installs no exporter and no telemetry leaves the process; the OpenTelemetry
+spans the Situation controller and Acute Triage worker emit (see
+[Architecture: Situation foundation and
+controller](../concepts/architecture.md#3a-situation-foundation-and-controller))
+stay inert. Enabling it installs an OTLP trace exporter pointed at your
+collector. Spans carry only stable identities, digests, counts, closed result
+classes, and durations — never a prompt, proposal, provider response, SQL
+text, or secret — so what leaves is correlation keys, not content.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `otlp.enabled` | bool | `false` | Install the OTLP trace exporter. Leave off to send nothing anywhere. |
+| `otlp.endpoint` | string | — | Collector address. A bare `host:port` (e.g. `otel-collector:4317`) uses TLS unless `otlp.insecure` is set; a URL with a scheme (e.g. `http://otel-collector:4318`) decides TLS by its scheme. Required when enabled. |
+| `otlp.protocol` | string | `grpc` | `grpc` or `http` (OTLP/HTTP with protobuf). |
+| `otlp.insecure` | bool | `false` | Plaintext transport for a bare `host:port` endpoint (a lab or in-cluster collector without TLS). |
+| `otlp.service_name` | string | `alertint-agent` | The resource `service.name` your backend groups spans under. `OTEL_RESOURCE_ATTRIBUTES` in the environment is merged in as well, so `service.namespace` / `deployment.environment.name` need no config key. |
+| `otlp.timeout_seconds` | int | `10` | Per export batch. Also bounds the final flush at shutdown. |
+
+Spans are exported in batches from a background goroutine; ending a span
+never blocks the controller, and no export ever runs inside a database
+transaction. A collector that is unreachable is an export-time warning in
+the log, never a startup failure. Each span site also writes one structured
+log line (`situation: controller reconcile`, `situation: assessment
+dispatch`, `situation: triage worker: attempt finished`) carrying the same
+identities plus `trace_id`/`span_id`, so a log line, its span, and the
+audit rows for the same cycle reconcile by identity.
+
+```yaml
+telemetry:
+  otlp:
+    enabled: true
+    endpoint: otel-collector:4317
+    protocol: grpc
+    insecure: true
+```
+
 ## `health`
 
 Installation dependency health for the LLM. Real triage calls are the primary
@@ -259,11 +391,11 @@ starts when the aggregate LLM dependency state first becomes `degraded` or
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `stdout` | bool | `true` | Deliver the finding to **stdout** as one JSON line. The full JSON is verbose detail: it is written **only at `--log-level=debug`** (consistently, in every format). At `info` the sink is still active — a send is confirmed on the `notified` line — but no JSON is written; the result shows as the one-line `finding` summary instead. Recommended to leave on. |
-| `slack.enabled` | bool | `false` | Post a Block Kit message to a Slack channel via the bot-token API (message updated in-place on resolve) |
-| `slack.bot_token_env` | string | — | Required when `slack.enabled: true`. Env var name holding the Slack bot token (`xoxb-…`, requires the `chat:write` scope) |
+| `slack.enabled` | bool | `false` | Turn on Slack delivery. In v0.14 this enables the Situation delivery worker, which posts one Situation root plus an immutable ordered journal thread. |
+| `slack.bot_token_env` | string | — | Required when `slack.enabled: true`. Env var name holding the Slack bot token (`xoxb-…`, requires the `chat:write` scope; no history-read scope is ever requested) |
 | `slack.channel` | string | — | Required when `slack.enabled: true`. Channel name (e.g. `#alerts`) or ID (e.g. `C1234567890`) |
-| `slack.min_severity` | string | `low` | Findings below this severity (`low` \| `medium` \| `high`) are not posted to Slack; stdout always emits. An incident suppressed at firing is also suppressed at resolution. The default posts everything. |
-| `slack.recurrence_mode` | string | `change-gated` | How a recurring incident resurfaces in its thread: `change-gated` posts a thread reply only on a real-world change (severity rise, new symptom, faster cadence) or a milestone (×5/×10/×25/×50/×100, then every ×100) — replies stay in the thread, nothing extra is sent to the channel; `off` keeps recurrence to a silent card count-bump. See [Slack](../notifications/slack.md) for details. |
+| `slack.min_severity` | string | `low` | The minimum **interruption priority** a new main-channel interruption must meet — never alert severity and never a model claim. `critical` always passes; a withheld interruption is durably recorded; the floor never suppresses Situation state, MCP history, a root edit, or a journal reply. The default posts everything. |
+| `slack.recurrence_mode` | string | `change-gated` | Controls Situation recurrence milestone replies: `change-gated` posts one quiet thread reply at ×5/×10/×25/×50/×100 and then every ×100; `off` keeps only the silent root edit. Neither mode re-pages the channel. |
 
 At startup the agent logs one `notifiers ready` line listing the active sinks
 (and the Slack channel) so you can see where findings will go. Every analysis
@@ -281,6 +413,15 @@ finding: a recurrence attach (`"kind":"occurrence"`), an operator annotation
 (`"kind":"annotation"`), and an incident whose triage failed on every retry
 (`"kind":"triage_exhausted"`, carrying the incident id, attempt count, and the
 last error).
+
+The v0.14 stdout stream additionally emits one
+`{"kind":"situation.transition","version":1,…}` line for every committed
+Situation Transition — identities, closed codes, hashes, counts, and instants
+only, never prose. That line means the change is **durably committed**; it
+never implies Slack delivery, and a quiet or floor-withheld Situation still
+emits it. **Deduplicate by `transition_id`**: a consumer that restarts, or
+reads a replayed stream, may legitimately see the same transition line more
+than once.
 
 See [Slack](../notifications/slack.md) for the full setup walkthrough.
 

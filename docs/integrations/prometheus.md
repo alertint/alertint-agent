@@ -52,6 +52,42 @@ Notes:
   route with `continue: true` instead of replacing your top-level
   receiver.
 
+### Reusable expected schedules
+
+Reusable schedules need stable, non-secret installation and producer
+identities plus an explicit rule mapping in the AlertINT configuration:
+
+```yaml
+alertmanager:
+  instance_id: prod-alertmanager-eu
+  rules:
+    - alert_name: ReconciliationLoad
+      group: batch-jobs
+      rule: ReconciliationLoad
+      scope_labels: [service]
+prometheus:
+  instance_id: prod-prometheus-eu
+```
+
+This binds the authenticated webhook route to one exact Prometheus
+producer/group/rule and scope. Unmapped alerts continue through normal triage.
+The Prometheus connector must be enabled with `base_url`. Configure or change
+the Alertmanager identity during a quiet window because it creates a new
+delivery and episode namespace; changing the producer identity creates a new
+rule scope for reusable schedules.
+
+Reusable authority is unavailable when the mapped rule is missing or
+ambiguous, its definition cannot be read, it depends on a recording rule, or
+Prometheus has active `alert_relabel_configs`. AlertINT does not infer a rule
+from `generatorURL`, `externalURL`, alert name, or fingerprint. Current rule
+reads never claim which version produced an older webhook delivery.
+
+Prometheus reports alerts in both `pending` and `firing` states from its rules
+API. AlertINT treats either state as current presence for this source proof:
+the exact scoped alert is active in Prometheus. This proof does not create a
+firing alert in AlertINT; the authenticated Alertmanager webhook remains the
+firing signal that opens or updates a Situation.
+
 ## Prometheus connector — live metric context
 
 ### How it works

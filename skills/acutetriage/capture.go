@@ -14,7 +14,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/alertint/alertint-agent/internal/notify"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -123,11 +122,19 @@ type AnnotateResult struct {
 	Demoted      bool
 }
 
-// Annotate stores a kind+note annotation, audits, and fans out the annotation
-// event (Slack thread reply + stdout line). Notes speak to the next
-// investigator only (channel split, ADR-0028 as amended): an annotation pulls
-// no lever — no recall demotion, no marks floor. Machine effect belongs to
-// verdict capture. The finding row is never touched.
+// Annotate stores a kind+note annotation and audits it. Notes speak to the
+// next investigator only (channel split, ADR-0028 as amended): an annotation
+// pulls no lever — no recall demotion, no marks floor. Machine effect
+// belongs to verdict capture. The finding row is never touched.
+//
+// Task 8: this no longer fans the event out to a notifier itself (the
+// removed notifyAnnotation) — InsertIncidentAnnotation's own transaction now
+// atomically enqueues a durable operator_annotation_recorded Situation input
+// whenever the Incident belongs to a nonterminal Situation, and the
+// Situation controller/notification worker (Task 6/7) is the sole surface
+// that presents it. With no owning Situation, the annotation stays visible
+// only through Incident MCP/audit — exactly like before, minus the direct
+// Slack/stdout fan-out.
 func (e *CaptureEngine) Annotate(ctx context.Context, req AnnotateRequest) (*AnnotateResult, error) {
 	if req.Kind != "correction" && req.Kind != "observation" {
 		return nil, fmt.Errorf("acutetriage: annotate: kind %q not in {correction, observation} (confirmation is written by capture only)", req.Kind)
@@ -158,27 +165,7 @@ func (e *CaptureEngine) Annotate(ctx context.Context, req AnnotateRequest) (*Ann
 			return nil, fmt.Errorf("acutetriage: annotate: audit: %w", err)
 		}
 	}
-	e.notifyAnnotation(ctx, inc, req.Kind, req.Note, 0)
 	return &AnnotateResult{AnnotationID: ann.ID, Demoted: false}, nil
-}
-
-// notifyAnnotation fans the event out when the notifier supports it.
-// Best-effort: a sink failure never fails the write that already landed.
-func (e *CaptureEngine) notifyAnnotation(ctx context.Context, inc *store.Incident, kind, note string, verdictVersion int) {
-	sink, ok := e.sk.notifier.(interface {
-		OnAnnotation(ctx context.Context, ev notify.AnnotationEvent) error
-	})
-	if !ok || e.sk.notifier == nil {
-		return
-	}
-	drill := false
-	if alerts, err := e.sk.st.GetIncidentAlerts(ctx, inc.ID); err == nil {
-		drill = isDrill(alerts)
-	}
-	_ = sink.OnAnnotation(ctx, notify.AnnotationEvent{
-		IncidentID: inc.ID, GroupKey: inc.GroupKey, Kind: kind, Note: note,
-		VerdictVersion: verdictVersion, Drill: drill,
-	})
 }
 
 // maxWidenQueries bounds one capture call's live widening fetches (D10).
@@ -250,7 +237,7 @@ func (e *CaptureEngine) CaptureVerdict(ctx context.Context, req CaptureRequest) 
 	verdictRow := latest
 	needsPersist := latest == nil || latest.ExpectationJSON != expJSON || latest.Verdict != req.Verdict || len(newExprs) > 0
 	if needsPersist {
-		v, persistWarnings, err := e.persistCapture(ctx, req, exp, expJSON, inc, priorWidened, newExprs)
+		v, persistWarnings, err := e.persistCapture(ctx, req, exp, expJSON, priorWidened, newExprs)
 		if err != nil {
 			return nil, err
 		}
@@ -277,9 +264,14 @@ func (e *CaptureEngine) CaptureVerdict(ctx context.Context, req CaptureRequest) 
 
 // persistCapture runs the persist phase (D7/D9): widen the not-yet-frozen
 // exprs live once, merge with what's already frozen, write the verdict +
-// annotation + demotion atomically, audit, and fan out the annotation event.
+// annotation + demotion atomically, and audit. Task 8: PersistVerdictCapture's
+// own transaction now atomically enqueues a durable captured_verdict_recorded
+// Situation input whenever the Incident belongs to a nonterminal Situation —
+// this method no longer fans the event out to a notifier itself (the removed
+// notifyAnnotation call); the Situation controller/notification worker owns
+// presentation.
 func (e *CaptureEngine) persistCapture(ctx context.Context, req CaptureRequest, exp Expectation, expJSON string,
-	inc *store.Incident, priorWidened []VerificationQuery, newExprs []string,
+	priorWidened []VerificationQuery, newExprs []string,
 ) (*store.IncidentVerdict, []string, error) {
 	fetched, warnings := e.widen(ctx, req.IncidentID, newExprs)
 	merged := make([]VerificationQuery, 0, len(priorWidened)+len(fetched))
@@ -319,7 +311,6 @@ func (e *CaptureEngine) persistCapture(ctx context.Context, req CaptureRequest, 
 			return nil, nil, fmt.Errorf("acutetriage: capture: audit: %w", err)
 		}
 	}
-	e.notifyAnnotation(ctx, inc, req.Verdict, note, v.Version)
 	return v, warnings, nil
 }
 

@@ -3,19 +3,18 @@
 package mcp
 
 import (
-	"context"
 	"os"
 	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/alertint/alertint-agent/internal/audit"
-	"github.com/alertint/alertint-agent/internal/store"
 )
 
 const (
 	mcpClientsDocPath     = "../../docs/integrations/mcp-clients.md"
 	scopeAndLimitsDocPath = "../../docs/concepts/scope-and-limits.md"
+	clientSkillPath       = "../../client-skills/alertint-situation-investigation/SKILL.md"
 	availableToolsHeading = "## Available tools"
 	toolNameCellPattern   = "`([a-z_]+)`"
 )
@@ -27,48 +26,17 @@ const (
 // repo had no MCP tool↔docs gate before ADR-0027; modeled on
 // internal/config/docs_drift_test.go.
 func TestDriftGate_ToolsDocumented(t *testing.T) {
-	st, err := store.Open(context.Background(), ":memory:")
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	defer func() { _ = st.Close() }()
+	st := newMCPStore(t)
 
 	cfg := sentryMCPConfig(&fakeSentryReader{}, true)
 	cfg.Logs = &spySource{}
 	cfg.ChangesEnabled = true
-	s := &Server{cfg: cfg, st: st, auditor: audit.New(st.DB())}
-
+	cfg.Zabbix = &fakeZabbixMCP{}
+	s := NewServer(cfg, st, audit.New(st.DB()))
 	names := map[string]bool{}
-	addTool := func(name string) { names[name] = true }
-
-	t1, _ := s.toolListIncidents()
-	addTool(t1.Name)
-	t2, _ := s.toolGetIncident()
-	addTool(t2.Name)
-	t3, _ := s.toolSearchAlerts()
-	addTool(t3.Name)
-	t4, _ := s.toolGetEvidencePack()
-	addTool(t4.Name)
-	t5, _ := s.toolVerifyAudit()
-	addTool(t5.Name)
-	t6, _ := s.toolPrometheusQuery()
-	addTool(t6.Name)
-	t7, _ := s.toolPrometheusQueryRange()
-	addTool(t7.Name)
-	t8, _ := s.toolLogsQueryRange()
-	addTool(t8.Name)
-	t9, _ := s.toolRecentChanges()
-	addTool(t9.Name)
-	t10, _ := s.toolSentryIssuesList()
-	addTool(t10.Name)
-	t11, _ := s.toolSentryIssuesTrace()
-	addTool(t11.Name)
-	t12, _ := s.toolIncidentAnnotate()
-	addTool(t12.Name)
-	t13, _ := s.toolIncidentCaptureVerdict()
-	addTool(t13.Name)
-	t14, _ := s.toolUsageStats()
-	addTool(t14.Name)
+	for name := range listedTools(t, s) {
+		names[name] = true
+	}
 
 	documented := documentedToolNames(t)
 
@@ -80,6 +48,26 @@ func TestDriftGate_ToolsDocumented(t *testing.T) {
 	for name := range documented {
 		if !names[name] {
 			t.Errorf("doc row %q in %s names a tool that is not registered", name, mcpClientsDocPath)
+		}
+	}
+}
+
+func TestDriftGate_ClientSkillUsesRegisteredTools(t *testing.T) {
+	b, err := os.ReadFile(clientSkillPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", clientSkillPath, err)
+	}
+	st := newMCPStore(t)
+	cfg := sentryMCPConfig(&fakeSentryReader{}, true)
+	cfg.Logs = &spySource{}
+	cfg.ChangesEnabled = true
+	cfg.Zabbix = &fakeZabbixMCP{}
+	registered := listedTools(t, NewServer(cfg, st, audit.New(st.DB())))
+
+	toolRef := regexp.MustCompile("`((?:alertint|prometheus|loki|sentry|zabbix)_[a-z_]+)`")
+	for _, match := range toolRef.FindAllStringSubmatch(string(b), -1) {
+		if _, ok := registered[match[1]]; !ok {
+			t.Errorf("%s references unregistered tool %q", clientSkillPath, match[1])
 		}
 	}
 }

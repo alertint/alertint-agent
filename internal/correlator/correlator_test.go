@@ -7,7 +7,6 @@ import (
 	"context"
 	"log/slog"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -16,29 +15,37 @@ import (
 	"github.com/google/uuid"
 )
 
-// captureSink records every incident delivered to OnIncidentReady.
-type captureSink struct {
-	mu        sync.Mutex
-	incidents []store.Incident
-}
-
-func (s *captureSink) OnIncidentReady(_ context.Context, inc store.Incident) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.incidents = append(s.incidents, inc)
+// waitForReadyIncidents polls the store until at least n incidents have
+// reached status "ready" (or the timeout elapses), then returns every ready
+// incident found (ListRecentIncidents order: newest first). Task 7 moved
+// Acute Triage dispatch out of the Correlator tick entirely, into a
+// dedicated internal/situation.TriageWorker — the Correlator's own
+// IncidentSink is never invoked anymore, so "ready" (durably observable via
+// the store) is now this file's proxy for "the window closed and
+// MarkIncidentReadyWithSituationInput committed", replacing the old
+// captureSink-based waits.
+func waitForReadyIncidents(t *testing.T, st *store.Store, n int, timeout time.Duration) []store.Incident {
+	t.Helper()
+	ctx := context.Background()
+	var ready []store.Incident
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		incs, err := st.ListRecentIncidents(ctx, 200)
+		if err == nil {
+			ready = ready[:0]
+			for _, inc := range incs {
+				if inc.Status == "ready" {
+					ready = append(ready, inc)
+				}
+			}
+			if len(ready) >= n {
+				return ready
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d ready incidents, got %d", n, len(ready))
 	return nil
-}
-
-func (s *captureSink) len() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.incidents)
-}
-
-func (s *captureSink) get(i int) store.Incident {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.incidents[i]
 }
 
 // newTestStore opens an in-memory SQLite store.
@@ -260,18 +267,16 @@ func TestEmptyReceiverIdentityFallsBackWithoutEmptyIncidentKey(t *testing.T) {
 }
 
 // TestSingleAlertPath verifies that a single alert creates a collecting
-// incident and, after the window, the sink receives it durably dispatched
-// (status "processing" — a real in-flight lease, R1).
+// incident and, after the window, the incident durably transitions to
+// ready. Task 7: Acute Triage dispatch itself now runs from a separate
+// durable internal/situation.TriageWorker, not the Correlator tick, so
+// there is no "processing" in-flight lease to observe here anymore — ready
+// is the terminal state a Correlator tick alone produces.
 func TestSingleAlertPath(t *testing.T) {
 	st := newTestStore(t)
-	sink := &captureSink{}
 
-	cfg := correlator.Config{WindowSeconds: 0, TickInterval: 20 * time.Millisecond}
-	cfg.WindowSeconds = 0 // will default to 60 — override below via a short window
-	// Use 1-second window so the test completes quickly.
-	cfg.WindowSeconds = 1
-
-	c := startCorrelator(t, cfg, st, sink)
+	cfg := correlator.Config{WindowSeconds: 1, TickInterval: 20 * time.Millisecond}
+	c := startCorrelator(t, cfg, st, correlator.NopIncidentSink{})
 
 	a := newAlert("fp-1", map[string]string{"alertname": "Foo", "env": "test"}, time.Now())
 	if _, err := st.UpsertAlertByFingerprint(context.Background(), a); err != nil {
@@ -281,21 +286,10 @@ func TestSingleAlertPath(t *testing.T) {
 		t.Fatalf("accept: %v", err)
 	}
 
-	// Wait up to 3 s for the incident to become ready.
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if sink.len() > 0 {
-			break
-		}
-		time.Sleep(30 * time.Millisecond)
-	}
-
-	if sink.len() == 0 {
-		t.Fatal("expected incident to be flushed to sink; none received")
-	}
-	inc := sink.get(0)
-	if inc.Status != "processing" {
-		t.Errorf("incident status = %q, want processing", inc.Status)
+	ready := waitForReadyIncidents(t, st, 1, 3*time.Second)
+	inc := ready[0]
+	if inc.Status != "ready" {
+		t.Errorf("incident status = %q, want ready", inc.Status)
 	}
 	if inc.AlertCount < 1 {
 		t.Errorf("incident alert_count = %d, want >= 1", inc.AlertCount)
@@ -306,10 +300,9 @@ func TestSingleAlertPath(t *testing.T) {
 // label sets land in the same collecting incident.
 func TestBurstGroupsSameKey(t *testing.T) {
 	st := newTestStore(t)
-	sink := &captureSink{}
 
 	cfg := correlator.Config{WindowSeconds: 2, TickInterval: 20 * time.Millisecond}
-	c := startCorrelator(t, cfg, st, sink)
+	c := startCorrelator(t, cfg, st, correlator.NopIncidentSink{})
 	ctx := context.Background()
 
 	labels := map[string]string{"alertname": "Disk", "host": "web1"}
@@ -325,21 +318,12 @@ func TestBurstGroupsSameKey(t *testing.T) {
 		}
 	}
 
-	// Wait for window to close.
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if sink.len() > 0 {
-			break
-		}
-		time.Sleep(30 * time.Millisecond)
+	ready := waitForReadyIncidents(t, st, 1, 5*time.Second)
+	if len(ready) != 1 {
+		t.Fatalf("expected 1 incident, got %d", len(ready))
 	}
-
-	if sink.len() != 1 {
-		t.Fatalf("expected 1 incident, got %d", sink.len())
-	}
-	inc := sink.get(0)
-	if inc.AlertCount != 5 {
-		t.Errorf("alert_count = %d, want 5", inc.AlertCount)
+	if ready[0].AlertCount != 5 {
+		t.Errorf("alert_count = %d, want 5", ready[0].AlertCount)
 	}
 }
 
@@ -347,10 +331,9 @@ func TestBurstGroupsSameKey(t *testing.T) {
 // different label sets create separate incidents.
 func TestDifferentGroupKeysSeparateIncidents(t *testing.T) {
 	st := newTestStore(t)
-	sink := &captureSink{}
 
 	cfg := correlator.Config{WindowSeconds: 1, TickInterval: 20 * time.Millisecond, GroupLabels: []string{"host"}}
-	c := startCorrelator(t, cfg, st, sink)
+	c := startCorrelator(t, cfg, st, correlator.NopIncidentSink{})
 	ctx := context.Background()
 
 	now := time.Now()
@@ -364,16 +347,9 @@ func TestDifferentGroupKeysSeparateIncidents(t *testing.T) {
 		}
 	}
 
-	deadline := time.Now().Add(4 * time.Second)
-	for time.Now().Before(deadline) {
-		if sink.len() >= 3 {
-			break
-		}
-		time.Sleep(30 * time.Millisecond)
-	}
-
-	if sink.len() != 3 {
-		t.Fatalf("expected 3 incidents, got %d", sink.len())
+	ready := waitForReadyIncidents(t, st, 3, 4*time.Second)
+	if len(ready) != 3 {
+		t.Fatalf("expected 3 incidents, got %d", len(ready))
 	}
 }
 
@@ -381,10 +357,9 @@ func TestDifferentGroupKeysSeparateIncidents(t *testing.T) {
 // alert ID only count once in alert_count.
 func TestDuplicateFingerprint(t *testing.T) {
 	st := newTestStore(t)
-	sink := &captureSink{}
 
 	cfg := correlator.Config{WindowSeconds: 1, TickInterval: 20 * time.Millisecond}
-	c := startCorrelator(t, cfg, st, sink)
+	c := startCorrelator(t, cfg, st, correlator.NopIncidentSink{})
 	ctx := context.Background()
 
 	a := newAlert("fp-dup", map[string]string{"alertname": "Dup"}, time.Now())
@@ -399,18 +374,8 @@ func TestDuplicateFingerprint(t *testing.T) {
 		}
 	}
 
-	deadline := time.Now().Add(4 * time.Second)
-	for time.Now().Before(deadline) {
-		if sink.len() > 0 {
-			break
-		}
-		time.Sleep(30 * time.Millisecond)
-	}
-
-	if sink.len() == 0 {
-		t.Fatal("no incident flushed")
-	}
-	inc := sink.get(0)
+	ready := waitForReadyIncidents(t, st, 1, 4*time.Second)
+	inc := ready[0]
 	// incident_alerts has PK (incident_id, alert_id) so the second
 	// INSERT OR IGNORE is a no-op, but alert_count is incremented twice.
 	// The correlator does not special-case this at the Accept level;
@@ -423,10 +388,10 @@ func TestDuplicateFingerprint(t *testing.T) {
 }
 
 // TestStartupRecovery verifies that a Correlator started after a
-// collecting incident already exists in the store will still flush it.
+// collecting incident already exists in the store will still flush it to
+// ready.
 func TestStartupRecovery(t *testing.T) {
 	st := newTestStore(t)
-	sink := &captureSink{}
 	ctx := context.Background()
 
 	// Manually insert a collecting incident that is already overdue.
@@ -454,29 +419,18 @@ func TestStartupRecovery(t *testing.T) {
 
 	// Start correlator — should discover and flush the overdue incident.
 	cfg := correlator.Config{WindowSeconds: 60, TickInterval: 20 * time.Millisecond}
-	startCorrelator(t, cfg, st, sink)
+	startCorrelator(t, cfg, st, correlator.NopIncidentSink{})
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if sink.len() > 0 {
-			break
-		}
-		time.Sleep(30 * time.Millisecond)
-	}
-
-	if sink.len() == 0 {
-		t.Fatal("startup recovery: overdue incident not flushed")
-	}
+	waitForReadyIncidents(t, st, 1, 2*time.Second)
 }
 
 // TestWindowResetAfterFlush verifies that a new alert arriving after
 // the first window flushes opens a fresh incident for the same group key.
 func TestWindowResetAfterFlush(t *testing.T) {
 	st := newTestStore(t)
-	sink := &captureSink{}
 
 	cfg := correlator.Config{WindowSeconds: 1, TickInterval: 20 * time.Millisecond}
-	c := startCorrelator(t, cfg, st, sink)
+	c := startCorrelator(t, cfg, st, correlator.NopIncidentSink{})
 	ctx := context.Background()
 
 	labels := map[string]string{"alertname": "Reset"}
@@ -489,16 +443,7 @@ func TestWindowResetAfterFlush(t *testing.T) {
 	}
 
 	// Wait for first window to close.
-	deadline := time.Now().Add(4 * time.Second)
-	for time.Now().Before(deadline) {
-		if sink.len() >= 1 {
-			break
-		}
-		time.Sleep(30 * time.Millisecond)
-	}
-	if sink.len() < 1 {
-		t.Fatal("first incident not flushed")
-	}
+	waitForReadyIncidents(t, st, 1, 4*time.Second)
 
 	// Send a second alert — should open a new incident.
 	a2 := newAlert(uuid.NewString(), labels, time.Now())
@@ -509,22 +454,14 @@ func TestWindowResetAfterFlush(t *testing.T) {
 		t.Fatalf("accept a2: %v", err)
 	}
 
-	deadline = time.Now().Add(4 * time.Second)
-	for time.Now().Before(deadline) {
-		if sink.len() >= 2 {
-			break
-		}
-		time.Sleep(30 * time.Millisecond)
-	}
-
-	if sink.len() < 2 {
-		t.Fatalf("expected 2 incidents after window reset, got %d", sink.len())
+	ready := waitForReadyIncidents(t, st, 2, 4*time.Second)
+	if len(ready) < 2 {
+		t.Fatalf("expected 2 incidents after window reset, got %d", len(ready))
 	}
 	// Each incident should have exactly 1 alert.
 	for i := 0; i < 2; i++ {
-		inc := sink.get(i)
-		if inc.AlertCount < 1 {
-			t.Errorf("incident[%d].alert_count = %d, want >= 1", i, inc.AlertCount)
+		if ready[i].AlertCount < 1 {
+			t.Errorf("incident[%d].alert_count = %d, want >= 1", i, ready[i].AlertCount)
 		}
 	}
 }
@@ -538,9 +475,8 @@ func TestWindowResetAfterFlush(t *testing.T) {
 // firing — not a resolution-detection bug.
 func TestIncidentResolvesWhenAllMembersResolve(t *testing.T) {
 	st := newTestStore(t)
-	sink := &captureSink{}
 	cfg := correlator.Config{WindowSeconds: 1, TickInterval: 20 * time.Millisecond}
-	c := startCorrelator(t, cfg, st, sink)
+	c := startCorrelator(t, cfg, st, correlator.NopIncidentSink{})
 	ctx := context.Background()
 
 	labels := map[string]string{"alertname": "Cascade", "cluster": "prod"}
@@ -556,18 +492,12 @@ func TestIncidentResolvesWhenAllMembersResolve(t *testing.T) {
 		}
 	}
 
-	// Window flushes → incident dispatched. The sink observes it while
-	// Status is durably "processing" (the in-flight lease taken before the
-	// sink is called); dispatchTriage only returns it to "ready" (phase
-	// "skipped", a clean skip since captureSink never persists a Finding)
-	// after the sink call returns. Wait for that settled state rather than
-	// racing sink.len() > 0 against the correlator's own goroutine.
-	waitFor(t, func() bool { return sink.len() > 0 }, 3*time.Second, "incident dispatched")
-	incID := sink.get(0).ID
-	waitFor(t, func() bool {
-		g, e := st.GetIncidentByID(ctx, incID)
-		return e == nil && g != nil && g.Status == "ready"
-	}, 3*time.Second, "incident settled to ready after clean-skip dispatch")
+	// Window flushes → MarkIncidentReadyWithSituationInput commits → the
+	// incident lands directly on "ready" (Task 7: Acute Triage dispatch no
+	// longer runs from the Correlator tick at all, so there is no
+	// intervening "processing" lease to observe here).
+	readyIncs := waitForReadyIncidents(t, st, 1, 3*time.Second)
+	incID := readyIncs[0].ID
 	ready, err := st.GetIncidentByID(ctx, incID)
 	if err != nil {
 		t.Fatalf("get ready incident: %v", err)
@@ -616,4 +546,47 @@ func TestIncidentResolvesWhenAllMembersResolve(t *testing.T) {
 	if !final.UpdatedAt.After(ready.UpdatedAt) {
 		t.Errorf("updated_at did not advance on resolution: ready=%v resolved=%v", ready.UpdatedAt, final.UpdatedAt)
 	}
+}
+
+// poisonSink fails the test if OnIncidentReady is ever called. It is used
+// as the Correlator's IncidentSink to prove a production-path guarantee:
+// with Acute Triage dispatch moved out of the Correlator tick entirely
+// (Task 7 — into a dedicated internal/situation.TriageWorker), a window
+// flush never reaches the sink at all, and therefore never reaches an LLM —
+// the only path that historically called one. t.Errorf (not t.Fatalf) is
+// used because OnIncidentReady may run on the Correlator's own background
+// goroutine, and only Fail/Error (not FailNow, which backs Fatal) are safe
+// to call from a goroutine other than the test's own.
+type poisonSink struct{ t *testing.T }
+
+func (p poisonSink) OnIncidentReady(_ context.Context, inc store.Incident) error {
+	p.t.Errorf("correlator: IncidentSink.OnIncidentReady called for incident %s — Acute Triage dispatch must not run from the Correlator tick", inc.ID)
+	return nil
+}
+
+// TestFlushExpired_MakesNoModelCalls is the production-path proof named in
+// the Task 7 brief: a normal window flush that carries an incident all the
+// way to "ready" — and lets several more ticks pass afterward, to catch a
+// delayed dispatch, not just a race won at the first instant — never
+// invokes IncidentSink.OnIncidentReady, and therefore makes zero model
+// calls.
+func TestFlushExpired_MakesNoModelCalls(t *testing.T) {
+	st := newTestStore(t)
+	cfg := correlator.Config{WindowSeconds: 1, TickInterval: 20 * time.Millisecond}
+	c := startCorrelator(t, cfg, st, poisonSink{t})
+	ctx := context.Background()
+
+	a := newAlert("fp-poison", map[string]string{"alertname": "Poison"}, time.Now())
+	if _, err := st.UpsertAlertByFingerprint(ctx, a); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if err := c.Accept(ctx, a); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+
+	waitForReadyIncidents(t, st, 1, 3*time.Second)
+	// Give several more ticks a chance to run, proving sustained silence —
+	// not just a race the test happened to win before any tick could reach
+	// a (now-removed) dispatch call.
+	time.Sleep(200 * time.Millisecond)
 }

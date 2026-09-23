@@ -51,6 +51,60 @@ func TestCall_SurfacesJSONRPCError(t *testing.T) {
 	}
 }
 
+func TestProblemStateBoundedUsesExactHostAndTriggerAndProvesAbsence(t *testing.T) {
+	var problemParams map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			Method string         `json:"method"`
+			Params map[string]any `json:"params"`
+		}
+		_ = json.Unmarshal(body, &req)
+		switch req.Method {
+		case "host.get":
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[{"hostid":"42"}],"id":1}`))
+		case "problem.get":
+			problemParams = req.Params
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[],"id":1}`))
+		}
+	}))
+	defer srv.Close()
+	client := zabbix.NewClient(zabbix.Config{BaseURL: srv.URL, APIToken: "token"})
+	requests := 0
+	got, err := client.ProblemStateBounded(context.Background(), "db-prod-1", "18491",
+		func() error { requests++; return nil }, func(bool, error) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Presence != zabbix.ProblemAbsent || requests != 2 {
+		t.Fatalf("state = %+v requests=%d, want absent and two bounded requests", got, requests)
+	}
+	if fmt.Sprint(problemParams["objectids"]) != "[18491]" || fmt.Sprint(problemParams["hostids"]) != "[42]" {
+		t.Fatalf("problem.get params = %+v, want exact objectids/hostids", problemParams)
+	}
+}
+
+func TestProblemStateBoundedReportsPresent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			Method string `json:"method"`
+		}
+		_ = json.Unmarshal(body, &req)
+		if req.Method == "host.get" {
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[{"hostid":"42"}],"id":1}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[{"eventid":"9001"}],"id":1}`))
+	}))
+	defer srv.Close()
+	client := zabbix.NewClient(zabbix.Config{BaseURL: srv.URL, APIToken: "token"})
+	got, err := client.ProblemStateBounded(context.Background(), "db-prod-1", "18491", nil, nil)
+	if err != nil || got.Presence != zabbix.ProblemPresent || len(got.EventIDs) != 1 || got.EventIDs[0] != "9001" {
+		t.Fatalf("state = %+v, err=%v", got, err)
+	}
+}
+
 func TestMetricHistory_ResolvesValueTypeForFloat(t *testing.T) {
 	var gotHistoryParam string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -14,8 +14,8 @@ version="${version#v}"
 changelog="${2:-CHANGELOG.md}"
 repo_url="https://github.com/alertint/alertint-agent"
 
-if ! printf '%s' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-  echo "release-prep: version must be x.y.z (got \"$version\") — pass it explicitly: task release:prep VERSION=0.7.0" >&2
+if ! printf '%s' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-rc[1-9][0-9]*)?$'; then
+  echo "release-prep: version must be x.y.z or x.y.z-rcN (got \"$version\") — pass it explicitly: task release:prep VERSION=0.14.0-rc1" >&2
   exit 64
 fi
 

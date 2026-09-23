@@ -26,6 +26,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/alertint/alertint-agent/internal/llm"
 	"github.com/alertint/alertint-agent/internal/logs"
 	"gopkg.in/yaml.v3"
 )
@@ -52,8 +53,32 @@ type Config struct {
 	Memory       MemoryConfig       `yaml:"memory"`
 	Triage       TriageConfig       `yaml:"triage,omitempty"`
 	Health       HealthConfig       `yaml:"health"`
+	Situations   SituationsConfig   `yaml:"situations"`
+	Telemetry    TelemetryConfig    `yaml:"telemetry,omitempty"`
 	LogLevel     string             `yaml:"log_level"`
 	LogFormat    string             `yaml:"log_format"`
+}
+
+// TelemetryConfig is the operator-configured observability boundary. With
+// telemetry.otlp.enabled false (the default) the agent installs no exporter
+// and no telemetry leaves the process: the OpenTelemetry spans the Situation
+// controller and Acute Triage worker emit stay no-ops. Enabling it installs
+// an OTLP trace exporter (internal/telemetry) pointed at the configured
+// collector. Spans carry only stable identities, digests, counts, result
+// classes, and durations — never prompts, proposals, provider bodies, SQL
+// text, or secrets — so the boundary is about egress consent, not content.
+type TelemetryConfig struct {
+	OTLP OTLPConfig `yaml:"otlp"`
+}
+
+// OTLPConfig configures the OTLP trace exporter.
+type OTLPConfig struct {
+	Enabled        bool   `yaml:"enabled"`         // install the exporter (default false)
+	Endpoint       string `yaml:"endpoint"`        // collector address: host:port, or a URL whose scheme decides TLS; required when enabled
+	Protocol       string `yaml:"protocol"`        // grpc | http (OTLP/HTTP protobuf); default grpc
+	Insecure       bool   `yaml:"insecure"`        // plaintext transport for a bare host:port endpoint
+	ServiceName    string `yaml:"service_name"`    // resource service.name; default alertint-agent
+	TimeoutSeconds int    `yaml:"timeout_seconds"` // per export batch; default 10
 }
 
 // HealthConfig tunes installation-level dependency health (today: the LLM).
@@ -64,6 +89,112 @@ type Config struct {
 type HealthConfig struct {
 	LLMIdleProbeAfterSeconds int `yaml:"llm_idle_probe_after_seconds"`
 	BroadcastAfterSeconds    int `yaml:"broadcast_after_seconds"`
+}
+
+// situationsMaxL2CallsPerAttempt and situationsMaxWorkAttemptsPerInput are
+// the Plan 2 situation controller's fixed L2 call/attempt accounting
+// (doctopus spec 02-controller-triage-coordination "L2 call and attempt
+// accounting"): two L2 provider calls per controller attempt, five durable
+// controller attempts per unchanged input. They are shipped as configuration
+// keys (so the wire shape documents the ceiling) but validateSituations
+// rejects any other value — Plan 2 does not make them tunable.
+const (
+	situationsMaxL2CallsPerAttempt    = 2
+	situationsMaxWorkAttemptsPerInput = 5
+)
+
+// SituationsConfig configures the Plan 2 situation controller: worker
+// concurrency, the reconcile poll interval, Situation claim lease/heartbeat
+// timing, the webhook source recovery grace, internal cadence tiers, the
+// fixed L2 call/work-attempt ceiling, the per-attempt wall clock, the shared
+// L2 provider semaphore, and bounded retry/jitter — plus Plan 3's single
+// Slack policy setting (Slack, SituationSlackConfig) and Plan 4's bounded
+// evidence-preparation and semantic-profile-worker surfaces (Preparation,
+// SemanticProfiles). It carries no other settings: no L1 call budget,
+// connector concurrency, or envelope review interval. In particular, Plan 2
+// deliberately never adds situations.budgets.max_l1_llm_calls (spec.md
+// 02-controller-triage-coordination "Attempt identity and completion": Acute
+// Triage keeps its shipped five-attempt schedule; a parsed budget with no
+// distinct consuming behavior would be removed rather than shipped unused)
+// — strict YAML decoding rejects it outright as an unknown field.
+type SituationsConfig struct {
+	Workers                     int                        `yaml:"workers"`
+	ReconcilePollSeconds        int                        `yaml:"reconcile_poll_seconds"`
+	LeaseSeconds                int                        `yaml:"lease_seconds"`
+	HeartbeatSeconds            int                        `yaml:"heartbeat_seconds"`
+	WebhookRecoveryGraceSeconds int                        `yaml:"webhook_recovery_grace_seconds"`
+	Cadence                     SituationsCadenceConfig    `yaml:"cadence"`
+	MaxL2CallsPerAttempt        int                        `yaml:"max_l2_calls_per_attempt"`
+	MaxWorkAttemptsPerInput     int                        `yaml:"max_work_attempts_per_input"`
+	AttemptWallSeconds          int                        `yaml:"attempt_wall_seconds"`
+	LLMConcurrency              int                        `yaml:"llm_concurrency"`
+	Retry                       SituationsRetryConfig      `yaml:"retry"`
+	Slack                       SituationSlackConfig       `yaml:"slack"`
+	Preparation                 SituationPreparationConfig `yaml:"preparation"`
+	SemanticProfiles            SemanticProfilesConfig     `yaml:"semantic_profiles"`
+}
+
+// SituationPreparationConfig is Plan 4's bounded evidence-preparation
+// surface: the physical connector-request cap per preparation cycle, the
+// wall-clock budget for the whole preparation attempt (shared by both the
+// lifecycle and assessment phases), and the per-subject/capability refresh
+// cadence (spec.md "Defaults and hard limits"). This is intentionally
+// small — the many hard caps (16 plans/cycle, 100 facts/run, window
+// ceilings, the one-third investigative-fairness credit rule, ...) are
+// fixed in internal/observation/model, never configurable.
+type SituationPreparationConfig struct {
+	MaxSourceCallsPerCycle int `yaml:"max_source_calls_per_cycle"`
+	MaxWallSeconds         int `yaml:"max_wall_seconds"`
+	RefreshSeconds         int `yaml:"refresh_seconds"`
+}
+
+// SemanticProfilesConfig bounds the durable advisory semantic-inference
+// worker: how many worker goroutines poll for due jobs (Workers shares the
+// L0+L2 primary-LLM concurrency limiter with Assessment calls — at most one
+// profile slot is ever used regardless of this value), how many durable
+// attempts one job may spend before exhausting, and the wall-clock budget
+// for a single attempt's model dispatch.
+type SemanticProfilesConfig struct {
+	Workers            int `yaml:"workers"`
+	MaxAttempts        int `yaml:"max_attempts"`
+	AttemptWallSeconds int `yaml:"attempt_wall_seconds"`
+}
+
+// SituationSlackConfig is Plan 3's only Situation-Slack policy setting: how
+// long a warranted required-action change must wait after a delivered
+// main-channel poke before it may create another one (the repage cooldown
+// in "a materially changed required action after the configured cooldown",
+// spec.md "Publication authority and Interruption priority"). Every other
+// Slack delivery behavior — retry timing, lease/heartbeat, batch size,
+// attempt accounting — reuses Plan 2's existing situations.retry/lease/
+// heartbeat settings and NotificationWorkerConfig's fixed spec constants;
+// Plan 3 adds no duplicate notification knobs, no attempt ceiling (delivery
+// retries indefinitely), and no Slack channel-history or
+// read-before-redrive reconciliation setting.
+type SituationSlackConfig struct {
+	RepageCooldownSeconds int `yaml:"repage_cooldown_seconds"`
+}
+
+// SituationsCadenceConfig sizes the controller's internal fast/normal/slow
+// reconsideration tempo (model.Cadence). Cadence is persisted machinery, not
+// card content: it only widens or narrows how soon the controller next
+// reconciles a nonterminal Situation. These three values are live
+// configuration — cmd/alertint maps them onto situation.ControllerConfig.
+// Cadence, and internal/situation's contract derivation reads them for
+// next_update_at — with the plan's executable defaults of 60/300/900
+// seconds and a strict fast < normal < slow ordering enforced at load.
+type SituationsCadenceConfig struct {
+	FastSeconds   int `yaml:"fast_seconds"`
+	NormalSeconds int `yaml:"normal_seconds"`
+	SlowSeconds   int `yaml:"slow_seconds"`
+}
+
+// SituationsRetryConfig bounds the controller/store transient-error retry
+// range and its jitter fraction.
+type SituationsRetryConfig struct {
+	MinSeconds    int `yaml:"min_seconds"`
+	MaxSeconds    int `yaml:"max_seconds"`
+	JitterPercent int `yaml:"jitter_percent"`
 }
 
 // RulesConfig configures rule pack loading. The embedded baseline pack is
@@ -105,6 +236,7 @@ type VerificationConfig struct {
 // honored either way. Resolve it via Config.PrometheusEnabled, never directly.
 type PrometheusConfig struct {
 	Enabled             *bool  `yaml:"enabled,omitempty"`
+	InstanceID          string `yaml:"instance_id,omitempty"`
 	BaseURL             string `yaml:"base_url"`
 	BearerTokenEnv      string `yaml:"bearer_token_env,omitempty"`
 	OrgID               string `yaml:"org_id,omitempty"` // optional X-Scope-OrgID (multi-tenant Mimir/Cortex only)
@@ -227,8 +359,20 @@ type MCPConfig struct {
 // AlertmanagerConfig configures the inbound Alertmanager webhook receiver. Its
 // listen address is the shared receivers.address (see ReceiversConfig).
 type AlertmanagerConfig struct {
-	Enabled         bool   `yaml:"enabled"`
-	WebhookTokenEnv string `yaml:"webhook_token_env"`
+	Enabled         bool                            `yaml:"enabled"`
+	WebhookTokenEnv string                          `yaml:"webhook_token_env"`
+	InstanceID      string                          `yaml:"instance_id,omitempty"`
+	Rules           []AlertmanagerRuleMappingConfig `yaml:"rules,omitempty"`
+}
+
+// AlertmanagerRuleMappingConfig binds one authenticated webhook alert name to
+// one exact rule in the configured Prometheus producer. ScopeLabels names the
+// alert labels whose values form reusable schedule scope.
+type AlertmanagerRuleMappingConfig struct {
+	AlertName   string   `yaml:"alert_name"`
+	Group       string   `yaml:"group"`
+	Rule        string   `yaml:"rule"`
+	ScopeLabels []string `yaml:"scope_labels"`
 }
 
 // ReceiversConfig holds settings shared by every inbound webhook receiver. The
@@ -258,8 +402,9 @@ type ChangesIngressConfig struct {
 // sub-roles: Ingress is the push Receiver; API is the pull Source (context
 // enrichment + MCP tools).
 type ZabbixConfig struct {
-	Ingress ZabbixIngressConfig `yaml:"ingress"`
-	API     ZabbixAPIConfig     `yaml:"api,omitempty"`
+	InstanceID string              `yaml:"instance_id,omitempty"`
+	Ingress    ZabbixIngressConfig `yaml:"ingress"`
+	API        ZabbixAPIConfig     `yaml:"api,omitempty"`
 }
 
 // ZabbixIngressConfig enables the POST /webhook/zabbix receiver. Receivers use
@@ -305,9 +450,10 @@ type StorageConfig struct {
 
 // LLMConfig configures the LLM provider used by skills.
 type LLMConfig struct {
-	Provider  string `yaml:"provider"`
-	APIKeyEnv string `yaml:"api_key_env"`
-	Model     string `yaml:"model"`
+	Budget    llm.BudgetLimits `yaml:"budget"`
+	Provider  string           `yaml:"provider"`
+	APIKeyEnv string           `yaml:"api_key_env"`
+	Model     string           `yaml:"model"`
 	// MaxTokens is the output-token ceiling for the triage reply. The finding
 	// schema emits one entry per member alert, so a large correlated incident
 	// needs well over the old 1024 default or the JSON is truncated mid-object
@@ -557,6 +703,48 @@ func Defaults() Config {
 			LLMIdleProbeAfterSeconds: 300,
 			BroadcastAfterSeconds:    300,
 		},
+		Situations: SituationsConfig{
+			Workers:                     2,
+			ReconcilePollSeconds:        1,
+			LeaseSeconds:                300,
+			HeartbeatSeconds:            30,
+			WebhookRecoveryGraceSeconds: 120,
+			Cadence: SituationsCadenceConfig{
+				FastSeconds:   60,
+				NormalSeconds: 300,
+				SlowSeconds:   900,
+			},
+			MaxL2CallsPerAttempt:    situationsMaxL2CallsPerAttempt,
+			MaxWorkAttemptsPerInput: situationsMaxWorkAttemptsPerInput,
+			AttemptWallSeconds:      180,
+			LLMConcurrency:          2,
+			Retry: SituationsRetryConfig{
+				MinSeconds:    5,
+				MaxSeconds:    300,
+				JitterPercent: 20,
+			},
+			Slack: SituationSlackConfig{
+				RepageCooldownSeconds: 900,
+			},
+			Preparation: SituationPreparationConfig{
+				MaxSourceCallsPerCycle: 8,
+				MaxWallSeconds:         20,
+				RefreshSeconds:         300,
+			},
+			SemanticProfiles: SemanticProfilesConfig{
+				Workers:            1,
+				MaxAttempts:        3,
+				AttemptWallSeconds: 30,
+			},
+		},
+		Telemetry: TelemetryConfig{
+			OTLP: OTLPConfig{
+				Enabled:        false,
+				Protocol:       "grpc",
+				ServiceName:    "alertint-agent",
+				TimeoutSeconds: 10,
+			},
+		},
 		LogLevel:  "info",
 		LogFormat: "auto",
 	}
@@ -663,6 +851,8 @@ func (c *Config) validate(offline bool) error {
 	errs = append(errs, c.validateCorrelator()...)
 	errs = append(errs, c.validateNotify()...)
 	errs = append(errs, c.validatePrometheus()...)
+	errs = append(errs, c.validateZabbixInstance()...)
+	errs = append(errs, c.validateAlertmanagerProvenance()...)
 	errs = append(errs, c.validateZabbixAPI()...)
 	errs = append(errs, c.validateLogs()...)
 	errs = append(errs, c.validateSentry()...)
@@ -671,6 +861,8 @@ func (c *Config) validate(offline bool) error {
 	errs = append(errs, c.validateHealth()...)
 	errs = append(errs, c.validateTriageSelector()...)
 	errs = append(errs, c.validateMemory()...)
+	errs = append(errs, c.validateSituations()...)
+	errs = append(errs, c.validateTelemetry()...)
 	if !offline {
 		errs = append(errs, c.validateRules()...)
 	}
@@ -759,6 +951,12 @@ func (c *Config) validateStorage(offline bool) []string {
 
 func (c *Config) validateLLM() []string {
 	var errs []string
+	if c.LLM.Budget.CallsPerHour < 0 {
+		errs = append(errs, "llm.budget.calls_per_hour must be >= 0 (0 means unlimited)")
+	}
+	if c.LLM.Budget.TotalTokens < 0 {
+		errs = append(errs, "llm.budget.total_tokens must be >= 0 (0 means unlimited)")
+	}
 	provider := strings.ToLower(c.LLM.Provider)
 	switch provider {
 	case "anthropic":
@@ -948,6 +1146,151 @@ func (c *Config) validateMemory() []string {
 	return errs
 }
 
+// validateSituations checks the Plan 2 situation controller surface:
+// positive durations/concurrency, a lease heartbeat strictly shorter than
+// the lease it renews, a jitter fraction in [0,100], and the fixed L2
+// call/work-attempt ceiling (situationsMaxL2CallsPerAttempt,
+// situationsMaxWorkAttemptsPerInput) — Plan 2 does not make either tunable,
+// so any other configured value is rejected rather than silently accepted.
+func (c *Config) validateSituations() []string {
+	var errs []string
+	s := c.Situations
+
+	positive := []struct {
+		name string
+		v    int
+	}{
+		{"situations.workers", s.Workers},
+		{"situations.reconcile_poll_seconds", s.ReconcilePollSeconds},
+		{"situations.lease_seconds", s.LeaseSeconds},
+		{"situations.heartbeat_seconds", s.HeartbeatSeconds},
+		{"situations.webhook_recovery_grace_seconds", s.WebhookRecoveryGraceSeconds},
+		{"situations.cadence.fast_seconds", s.Cadence.FastSeconds},
+		{"situations.cadence.normal_seconds", s.Cadence.NormalSeconds},
+		{"situations.cadence.slow_seconds", s.Cadence.SlowSeconds},
+		{"situations.attempt_wall_seconds", s.AttemptWallSeconds},
+		{"situations.llm_concurrency", s.LLMConcurrency},
+		{"situations.retry.min_seconds", s.Retry.MinSeconds},
+		{"situations.retry.max_seconds", s.Retry.MaxSeconds},
+		{"situations.slack.repage_cooldown_seconds", s.Slack.RepageCooldownSeconds},
+	}
+	for _, p := range positive {
+		if p.v <= 0 {
+			errs = append(errs, fmt.Sprintf("%s must be > 0", p.name))
+		}
+	}
+
+	if s.Cadence.FastSeconds > 0 && s.Cadence.NormalSeconds > 0 && s.Cadence.SlowSeconds > 0 &&
+		(s.Cadence.FastSeconds >= s.Cadence.NormalSeconds || s.Cadence.NormalSeconds >= s.Cadence.SlowSeconds) {
+		errs = append(errs, fmt.Sprintf(
+			"situations.cadence must order fast_seconds < normal_seconds < slow_seconds (got %d/%d/%d)",
+			s.Cadence.FastSeconds, s.Cadence.NormalSeconds, s.Cadence.SlowSeconds))
+	}
+
+	if s.HeartbeatSeconds > 0 && s.LeaseSeconds > 0 && s.HeartbeatSeconds >= s.LeaseSeconds {
+		errs = append(errs, fmt.Sprintf(
+			"situations.heartbeat_seconds (%d) must be shorter than situations.lease_seconds (%d)",
+			s.HeartbeatSeconds, s.LeaseSeconds))
+	}
+
+	if s.Retry.JitterPercent < 0 || s.Retry.JitterPercent > 100 {
+		errs = append(errs, fmt.Sprintf("situations.retry.jitter_percent (%d) must be between 0 and 100", s.Retry.JitterPercent))
+	}
+
+	if s.MaxL2CallsPerAttempt != situationsMaxL2CallsPerAttempt {
+		errs = append(errs, fmt.Sprintf(
+			"situations.max_l2_calls_per_attempt must be %d (fixed L2 call accounting; not yet tunable)",
+			situationsMaxL2CallsPerAttempt))
+	}
+	if s.MaxWorkAttemptsPerInput != situationsMaxWorkAttemptsPerInput {
+		errs = append(errs, fmt.Sprintf(
+			"situations.max_work_attempts_per_input must be %d (fixed work-attempt accounting; not yet tunable)",
+			situationsMaxWorkAttemptsPerInput))
+	}
+
+	errs = append(errs, c.validateSituationPreparation()...)
+	errs = append(errs, c.validateSemanticProfiles()...)
+
+	return errs
+}
+
+// validateSituationPreparation checks Plan 4's bounded evidence-preparation
+// surface (spec.md "Defaults and hard limits"): max_source_calls_per_cycle
+// in [1,32], max_wall_seconds in [1,30] and strictly less than
+// situations.attempt_wall_seconds (the preparation wall is bounded by the
+// enclosing controller attempt's own wall), and refresh_seconds in
+// [60,3600].
+func (c *Config) validateSituationPreparation() []string {
+	var errs []string
+	p := c.Situations.Preparation
+
+	if p.MaxSourceCallsPerCycle < 1 || p.MaxSourceCallsPerCycle > 32 {
+		errs = append(errs, fmt.Sprintf(
+			"situations.preparation.max_source_calls_per_cycle (%d) must be between 1 and 32", p.MaxSourceCallsPerCycle))
+	}
+	if p.MaxWallSeconds < 1 || p.MaxWallSeconds > 30 {
+		errs = append(errs, fmt.Sprintf(
+			"situations.preparation.max_wall_seconds (%d) must be between 1 and 30", p.MaxWallSeconds))
+	}
+	if p.MaxWallSeconds > 0 && c.Situations.AttemptWallSeconds > 0 && p.MaxWallSeconds >= c.Situations.AttemptWallSeconds {
+		errs = append(errs, fmt.Sprintf(
+			"situations.preparation.max_wall_seconds (%d) must be less than situations.attempt_wall_seconds (%d)",
+			p.MaxWallSeconds, c.Situations.AttemptWallSeconds))
+	}
+	if p.RefreshSeconds < 60 || p.RefreshSeconds > 3600 {
+		errs = append(errs, fmt.Sprintf(
+			"situations.preparation.refresh_seconds (%d) must be between 60 and 3600", p.RefreshSeconds))
+	}
+	return errs
+}
+
+// validateSemanticProfiles checks Plan 4's durable advisory-inference
+// worker surface: workers in [1,4] (sharing the L0+L2 primary limiter — at
+// most one profile slot is ever used regardless of this value), max_attempts
+// in [1,5], and attempt_wall_seconds in [1,60].
+func (c *Config) validateSemanticProfiles() []string {
+	var errs []string
+	sp := c.Situations.SemanticProfiles
+
+	if sp.Workers < 1 || sp.Workers > 4 {
+		errs = append(errs, fmt.Sprintf("situations.semantic_profiles.workers (%d) must be between 1 and 4", sp.Workers))
+	}
+	if sp.MaxAttempts < 1 || sp.MaxAttempts > 5 {
+		errs = append(errs, fmt.Sprintf("situations.semantic_profiles.max_attempts (%d) must be between 1 and 5", sp.MaxAttempts))
+	}
+	if sp.AttemptWallSeconds < 1 || sp.AttemptWallSeconds > 60 {
+		errs = append(errs, fmt.Sprintf(
+			"situations.semantic_profiles.attempt_wall_seconds (%d) must be between 1 and 60", sp.AttemptWallSeconds))
+	}
+	return errs
+}
+
+// validateTelemetry checks the OTLP exporter block. Shape errors (an unknown
+// protocol, a non-positive timeout) are reported even while disabled, so a
+// block an operator has typed out is validated before the day it is switched
+// on; the endpoint itself is required only once enabled.
+func (c *Config) validateTelemetry() []string {
+	var errs []string
+	o := c.Telemetry.OTLP
+	switch o.Protocol {
+	case "grpc", "http":
+	default:
+		errs = append(errs, fmt.Sprintf("telemetry.otlp.protocol %q must be one of grpc, http", o.Protocol))
+	}
+	if o.TimeoutSeconds <= 0 {
+		errs = append(errs, "telemetry.otlp.timeout_seconds must be > 0")
+	}
+	if o.Enabled {
+		if strings.TrimSpace(o.Endpoint) == "" {
+			errs = append(errs, "telemetry.otlp.endpoint is required when telemetry.otlp.enabled is true (collector host:port or URL)")
+		}
+		if strings.TrimSpace(o.ServiceName) == "" {
+			errs = append(errs, "telemetry.otlp.service_name must not be empty when telemetry.otlp.enabled is true")
+		}
+	}
+	return errs
+}
+
 // volatileGroupLabels are per-instance identity labels that churn on every pod
 // restart or job run, so a verbatim group_key rarely repeats. Grouping on one
 // means recurrence collapse and recall (which key off group_key) seldom match.
@@ -1040,6 +1383,62 @@ func (c *Config) validateZabbixAPI() []string {
 	}
 	if strings.TrimSpace(c.Zabbix.API.HostLabel) == "" {
 		errs = append(errs, "zabbix: api: host_label is required when enabled")
+	}
+	return errs
+}
+
+var zabbixInstanceIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+func (c *Config) validateZabbixInstance() []string {
+	if c.Zabbix.InstanceID == "" {
+		return nil
+	}
+	if !zabbixInstanceIDRe.MatchString(c.Zabbix.InstanceID) {
+		return []string{"zabbix: instance_id must be 1-64 characters using letters, numbers, '.', '_' or '-'"}
+	}
+	return nil
+}
+
+func (c *Config) validateAlertmanagerProvenance() []string {
+	if c.Alertmanager.InstanceID == "" && len(c.Alertmanager.Rules) == 0 && c.Prometheus.InstanceID == "" {
+		return nil
+	}
+	var errs []string
+	if c.Alertmanager.InstanceID != "" && !zabbixInstanceIDRe.MatchString(c.Alertmanager.InstanceID) {
+		errs = append(errs, "alertmanager.instance_id must be 1-64 characters using letters, numbers, '.', '_' or '-'")
+	}
+	if c.Prometheus.InstanceID != "" && !zabbixInstanceIDRe.MatchString(c.Prometheus.InstanceID) {
+		errs = append(errs, "prometheus.instance_id must be 1-64 characters using letters, numbers, '.', '_' or '-'")
+	}
+	if len(c.Alertmanager.Rules) > 0 && c.Alertmanager.InstanceID == "" {
+		errs = append(errs, "alertmanager.instance_id is required when alertmanager.rules are configured")
+	}
+	if len(c.Alertmanager.Rules) > 0 && c.Prometheus.InstanceID == "" {
+		errs = append(errs, "prometheus.instance_id is required when alertmanager.rules are configured")
+	}
+	if len(c.Alertmanager.Rules) > 0 && !c.PrometheusEnabled() {
+		errs = append(errs, "prometheus must be enabled with base_url when alertmanager.rules are configured")
+	}
+	seen := map[string]bool{}
+	for i, mapping := range c.Alertmanager.Rules {
+		if strings.TrimSpace(mapping.AlertName) == "" || strings.TrimSpace(mapping.Group) == "" || strings.TrimSpace(mapping.Rule) == "" || len(mapping.ScopeLabels) == 0 {
+			errs = append(errs, fmt.Sprintf("alertmanager.rules[%d] requires alert_name, group, rule, and scope_labels", i))
+			continue
+		}
+		if mapping.AlertName != strings.TrimSpace(mapping.AlertName) {
+			errs = append(errs, fmt.Sprintf("alertmanager.rules[%d].alert_name must not have surrounding whitespace", i))
+		}
+		if seen[mapping.AlertName] {
+			errs = append(errs, fmt.Sprintf("alertmanager.rules[%d].alert_name %q is duplicated", i, mapping.AlertName))
+		}
+		seen[mapping.AlertName] = true
+		labels := map[string]bool{}
+		for _, label := range mapping.ScopeLabels {
+			if !selectorLabelNameRe.MatchString(label) || labels[label] {
+				errs = append(errs, fmt.Sprintf("alertmanager.rules[%d].scope_labels contains invalid or duplicate label %q", i, label))
+			}
+			labels[label] = true
+		}
 	}
 	return errs
 }

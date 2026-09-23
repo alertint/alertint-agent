@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AlertINT v0.14.0-rc1 Situation workflow</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--ink:#18212f;--muted:#5c6879;--line:#cdd4df;--blue:#245fce;--bluebg:#edf4ff;--green:#257a4a;--greenbg:#edf8f1;--amber:#9a5d00;--amberbg:#fff7e5;--red:#a33333;--redbg:#fff0f0}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1117;--card:#161b22;--ink:#e6edf3;--muted:#9da9b8;--line:#3b4654;--blue:#82adff;--bluebg:#14233a;--green:#72d49a;--greenbg:#132a20;--amber:#f3bd67;--amberbg:#302514;--red:#ff9191;--redbg:#321b1e}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}main{width:min(1180px,100%);margin:auto;padding:30px 22px 70px}h1{font-size:clamp(28px,4vw,42px);line-height:1.1;margin:0}h2{margin:42px 0 10px;font-size:23px}h3{font-size:16px;margin:0 0 5px}p{max-width:88ch}.lede,.muted{color:var(--muted)}code{background:color-mix(in srgb,var(--line) 35%,transparent);padding:1px 5px;border-radius:4px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace}.legend{display:flex;flex-wrap:wrap;gap:14px;margin:20px 0}.legend span{font-size:13px;color:var(--muted)}.legend i{display:inline-block;width:12px;height:12px;margin-right:6px;border-radius:3px;vertical-align:-1px}.flow{display:grid;grid-template-columns:repeat(5,1fr);gap:22px;margin-top:18px}.step{position:relative;min-height:155px;padding:14px;border:1px solid var(--line);border-top:4px solid var(--blue);border-radius:10px;background:var(--card)}.step:not(:last-child)::after{content:"→";position:absolute;right:-20px;top:58px;color:var(--muted);font-size:22px}.step p{font-size:13px;color:var(--muted);margin:5px 0}.step strong{color:var(--ink)}.small{font-size:12px}.routes,.states,.two{display:grid;gap:12px}.routes{grid-template-columns:repeat(4,1fr)}.two{grid-template-columns:repeat(2,1fr)}.route,.state,.callout{padding:14px;border:1px solid var(--line);border-radius:10px;background:var(--card)}.route.good,.state.good{border-left:4px solid var(--green)}.route.warn,.state.warn{border-left:4px solid var(--amber)}.route.bad,.state.bad{border-left:4px solid var(--red)}.route p,.state p{margin:4px 0;color:var(--muted);font-size:13px}.states{grid-template-columns:repeat(4,1fr)}.state{position:relative;min-height:135px}.state:not(:last-child)::after{content:"→";position:absolute;right:-13px;top:54px;color:var(--muted);background:var(--bg);padding:0 2px}.overlay{border:2px solid var(--amber);background:var(--amberbg);padding:16px;border-radius:11px}.overlay h3{color:var(--amber)}.example{border-left:5px solid var(--blue);background:var(--bluebg)}table{width:100%;border-collapse:collapse;background:var(--card);font-size:13px}th,td{padding:9px;border-top:1px solid var(--line);vertical-align:top;text-align:left}th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}.badge{display:inline-block;padding:2px 7px;border-radius:999px;background:var(--bluebg);color:var(--blue);font-size:11px;font-weight:700}.foot{margin-top:44px;padding-top:14px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}@media(max-width:850px){.flow,.routes,.states,.two{grid-template-columns:1fr}.step:not(:last-child)::after,.state:not(:last-child)::after{content:"↓";right:50%;top:auto;bottom:-24px;background:none}.step,.state{min-height:auto}}
+</style>
+</head>
+<body><main>
+<header>
+  <span class="badge">v0.14.0-rc1</span>
+  <h1>How AlertINT handles a Situation</h1>
+  <p class="lede">One operator view from durable alert receipt to investigation, expected maintenance, recovery, and recurrence. Expectedness changes assessment; it never changes what the monitoring source says.</p>
+  <div class="legend" role="group" aria-label="Legend"><span><i style="background:var(--blue)"></i>normal flow</span><span><i style="background:var(--green)"></i>confirmed outcome</span><span><i style="background:var(--amber)"></i>decision or waiting boundary</span><span><i style="background:var(--red)"></i>retry or uncertainty</span></div>
+</header>
+
+<section>
+<h2>1. From webhook to operator view</h2>
+<div class="flow">
+  <article class="step"><h3>1 · Receive</h3><p>Alertmanager or Zabbix sends one alert or a batch.</p><p><strong>204</strong> only after the delivery and pending dispatch are committed. Invalid input gets 400; unavailable storage gets retryable 503.</p></article>
+  <article class="step"><h3>2 · Group</h3><p>A retry with the same delivery identity is a no-op. A new delivery joins or opens an Incident by the receiver grouping identity.</p><p>A terminal Situation is never reopened; later firing starts a linked Situation.</p></article>
+  <article class="step"><h3>3 · Observe</h3><p>Bounded source checks gather current evidence. Each result says present, absent, unsupported, unavailable, or stale.</p><p>Failures remain visible and retry on their durable schedule.</p></article>
+  <article class="step"><h3>4 · Assess</h3><p>Deterministic lifecycle rules run first. Acute Triage and Situation assessment run only when due and within their persisted budgets.</p><p>Stale results cannot overwrite newer state.</p></article>
+  <article class="step"><h3>5 · Present</h3><p>Slack has one root per Situation: title, lifecycle/status, then Finding. Meaningful transitions go to its thread.</p><p>MCP exposes current records, transitions, evidence, delivery state, and operator decisions.</p></article>
+</div>
+</section>
+
+<section>
+<h2>2. Lifecycle and recovery</h2>
+<div class="states">
+  <article class="state"><h3>Active</h3><p>At least one monitored condition is firing, or investigation work is still relevant. Repeated unchanged telemetry does not create a new episode.</p></article>
+  <article class="state warn"><h3>Confirming recovery</h3><p>All required source states are clear. The persisted grace period must finish while clearance remains authoritative.</p></article>
+  <article class="state good"><h3>Recovered</h3><p>Terminal. Monitored alerts stayed clear through grace. Monitoring for this episode ends.</p></article>
+  <article class="state good"><h3>New linked Situation</h3><p>A later firing after a terminal end gets a new root and links to prior history. The old Situation stays immutable.</p></article>
+</div>
+<div class="routes" style="margin-top:12px">
+  <article class="route warn"><h3>Refire during grace</h3><p>Return to Active, name the refiring alert, and resume the actual current action. Do not claim a new triage run unless one is scheduled.</p></article>
+  <article class="route bad"><h3>Source truth disappears</h3><p>Missing truth never proves recovery. If the lifecycle deadline expires without fresh authoritative firing, the Situation can end as <strong>Closed unknown</strong>.</p></article>
+  <article class="route bad"><h3>Work fails</h3><p>Retries and final limitations remain explicit. Investigation failure alone does not fabricate a Finding or recover the Situation.</p></article>
+  <article class="route good"><h3>Monitoring continues</h3><p>Routine checks update durable state without posting heartbeat messages. Slack changes only for operator-relevant transitions.</p></article>
+</div>
+</section>
+
+<section>
+<h2>3. Expected maintenance is a separate decision</h2>
+<div class="overlay">
+  <h3>Expectedness overlays the active condition</h3>
+  <p>An operator may mark the current non-critical condition expected until a time, or confirm a reusable schedule for an exactly proven source rule and scope. The Finding stays visible. Monitoring, evidence collection, investigation, source recovery, and recovery grace continue normally.</p>
+  <div class="routes">
+    <article class="route"><h3>Still applies</h3><p>Same proven rule, scope, condition, and allowed urgency. Unchanged repeats do not ask for the same decision again.</p></article>
+    <article class="route warn"><h3>Stops applying</h3><p>Expiry, withdrawal, changed rule/scope/condition, criticality, or independent urgency restores normal assessment. Slack states the reason.</p></article>
+    <article class="route bad"><h3>No authority</h3><p>Missing, stale, ambiguous, or unsupported source proof cannot grant a reusable schedule.</p></article>
+    <article class="route good"><h3>Recovery stays source-owned</h3><p>Expectedness never clears an alert. Only authoritative source clearance plus the existing grace period can recover the Situation.</p></article>
+  </div>
+</div>
+</section>
+
+<section>
+<h2>4. What the operator sees</h2>
+<div class="two">
+  <article class="callout"><h3>Slack</h3><p><strong>Root:</strong> current lifecycle/status, Finding, operator expectedness when applicable, next real checkpoint, and alert summary.</p><p><strong>Thread:</strong> investigation result, expectedness applied/stopped/removed, material alert changes, recovery confirmation, and delivery-gap recovery. Technical schedule IDs and routine review machinery stay in MCP.</p></article>
+  <article class="callout"><h3>MCP</h3><p>Use current reads to answer “what is true now?” Use transition and judgment/history reads to answer “what changed, when, and why?” Current configuration must never be used to invent historical source versions.</p><p>Delivery and observation reads show whether evidence was absent, unavailable, unsupported, stale, or successfully empty.</p></article>
+</div>
+</section>
+
+<section>
+<h2>5. Worked example</h2>
+<div class="callout example">
+  <h3>Nightly reconciliation raises CPU load</h3>
+  <p><strong>22:07</strong> — Alertmanager sends a firing alert for <code>service=payments</code>. AlertINT commits it, opens a Situation, gathers evidence, and publishes the Finding.</p>
+  <p><strong>22:12</strong> — John marks the current condition expected until 23:00. Slack adds: <strong>Operator: Expected until 11:00 PM · John</strong>. Investigation and monitoring continue.</p>
+  <p><strong>22:30</strong> — The same condition repeats unchanged. It remains covered without asking John again.</p>
+  <p><strong>22:41</strong> — The source rule changes. The decision stops applying. The thread says: <strong>The expected-until decision no longer applies because the source rule changed. Normal assessment resumes.</strong></p>
+  <p><strong>22:50</strong> — The source clears. AlertINT enters Confirming recovery. Only after the stored grace period passes with the alert still clear does the Situation become Recovered.</p>
+  <p><strong>23:20</strong> — A later firing opens a new linked Situation. It inherits history, not expectedness authority.</p>
+</div>
+</section>
+
+<section>
+<h2>6. Failure and retry boundaries</h2>
+<table>
+<thead><tr><th>Boundary</th><th>What is durable</th><th>What happens next</th><th>Operator meaning</th></tr></thead>
+<tbody>
+<tr><td>Webhook 204</td><td>Immutable delivery and pending dispatch</td><td>Workers can resume after restart</td><td>Accepted work is on disk</td></tr>
+<tr><td>Dispatch/input lease</td><td>Attempt and fenced owner</td><td>Expired work is reclaimed safely</td><td>No duplicate logical transition from a retry</td></tr>
+<tr><td>Evidence unavailable</td><td>Typed result and freshness</td><td>Retry at the recorded checkpoint</td><td>Unknown stays different from clear</td></tr>
+<tr><td>Assessment result</td><td>Input version and evidence identity</td><td>Stale completion is rejected</td><td>Newer facts keep authority</td></tr>
+<tr><td>Slack failure</td><td>Notification intent and attempt</td><td>Retry; report a delivery gap when sustained</td><td>The Situation remains queryable in MCP</td></tr>
+<tr><td>Expectedness boundary</td><td>Versioned decision, evaluation, and history</td><td>Re-evaluate on time, evidence, or urgency change</td><td>No hidden suppression or fabricated recovery</td></tr>
+</tbody>
+</table>
+</section>
+
+<p class="foot">Standalone operator reference for AlertINT v0.14.0-rc1. It describes the candidate’s canonical minimal lifecycle and Situation-owned Slack flow. It requires no network connection or documentation build.</p>
+</main></body></html>

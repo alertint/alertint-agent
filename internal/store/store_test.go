@@ -11,22 +11,17 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/alertint/alertint-agent/internal/store/storetest"
 )
 
-func newTestStore(t *testing.T) *Store {
-	t.Helper()
+func TestOpen_AppliesEmbeddedMigrations(t *testing.T) {
 	ctx := context.Background()
-	s, err := Open(ctx, ":memory:")
+	s, err := openTestStoreWithMigrations(ctx, filepath.Join(t.TempDir(), "migration.db"))
 	if err != nil {
-		t.Fatalf("Open(:memory:): %v", err)
+		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	return s
-}
-
-func TestOpen_AppliesEmbeddedMigrations(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
 
 	rows, err := s.db.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`)
 	if err != nil {
@@ -35,13 +30,30 @@ func TestOpen_AppliesEmbeddedMigrations(t *testing.T) {
 	defer func() { _ = rows.Close() }()
 
 	want := map[string]bool{
-		"alerts":                  false,
-		"audit_log":               false,
-		"incident_alerts":         false,
-		"incidents":               false,
-		"schema_migrations":       false,
-		"llm_health":              false,
-		"llm_health_capabilities": false,
+		"alerts":                        false,
+		"audit_log":                     false,
+		"incident_alerts":               false,
+		"incidents":                     false,
+		"schema_migrations":             false,
+		"llm_health":                    false,
+		"llm_health_capabilities":       false,
+		"alert_deliveries":              false,
+		"alert_delivery_dispatches":     false,
+		"incident_alert_deliveries":     false,
+		"situations":                    false,
+		"situation_incidents":           false,
+		"situation_input_outbox":        false,
+		"situation_facts":               false,
+		"situation_assessment_calls":    false,
+		"situation_assessment_attempts": false,
+		"situation_assessment_coverage": false,
+		"incident_triage_attempts":      false,
+		"situation_transitions":         false,
+		"situation_episode_summaries":   false,
+		"situation_transition_stream":   false,
+		"notification_intents":          false,
+		"slack_delivery_state":          false,
+		"slack_delivery_gaps":           false,
 	}
 	for rows.Next() {
 		var name string
@@ -67,7 +79,7 @@ func TestMigrate_IsIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 
-	first, err := Open(ctx, dbPath)
+	first, err := openTestStoreWithMigrations(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("first Open: %v", err)
 	}
@@ -75,7 +87,7 @@ func TestMigrate_IsIdempotent(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	second, err := Open(ctx, dbPath)
+	second, err := openTestStoreWithMigrations(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("second Open: %v", err)
 	}
@@ -91,6 +103,57 @@ func TestMigrate_IsIdempotent(t *testing.T) {
 	}
 	if count != len(embedded) {
 		t.Errorf("schema_migrations rows = %d, want %d (one per embedded migration) after re-open", count, len(embedded))
+	}
+}
+
+func TestNewTestStoreUsesIndependentMigratedCopies(t *testing.T) {
+	ctx := context.Background()
+	first := newTestStore(t)
+	second := newTestStore(t)
+
+	databasePath := func(st *Store) string {
+		t.Helper()
+		var path string
+		if err := st.db.QueryRowContext(ctx, `SELECT file FROM pragma_database_list WHERE name = 'main'`).Scan(&path); err != nil {
+			t.Fatalf("read test database path: %v", err)
+		}
+		return path
+	}
+	firstPath := databasePath(first)
+	secondPath := databasePath(second)
+	if firstPath == "" || secondPath == "" {
+		t.Fatalf("test stores must be file-backed copies, got %q and %q", firstPath, secondPath)
+	}
+	if firstPath == secondPath {
+		t.Fatalf("test stores share database %q", firstPath)
+	}
+
+	now := time.Now().UTC()
+	if _, err := first.UpsertAlertByFingerprint(ctx, Alert{
+		ID:          uuid.NewString(),
+		Fingerprint: "copy-isolation",
+		Status:      "firing",
+		Labels:      map[string]string{},
+		Annotations: map[string]string{},
+		StartsAt:    now,
+		ReceivedAt:  now,
+	}); err != nil {
+		t.Fatalf("write first test store: %v", err)
+	}
+	if _, err := second.GetAlertByFingerprint(ctx, "copy-isolation"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second test store observed first store write: %v", err)
+	}
+
+	var migrationCount int
+	if err := second.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&migrationCount); err != nil {
+		t.Fatalf("count copied migrations: %v", err)
+	}
+	migrations, err := loadMigrations()
+	if err != nil {
+		t.Fatalf("load migrations: %v", err)
+	}
+	if migrationCount != len(migrations) {
+		t.Fatalf("copied migration count = %d, want %d", migrationCount, len(migrations))
 	}
 }
 
@@ -308,64 +371,6 @@ func TestMarkIncidentResolved_RejectsCollecting(t *testing.T) {
 	}
 }
 
-func TestResolveIncidentIfAllMembersResolved(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
-	id := uuid.NewString()
-	if err := s.InsertIncident(ctx, Incident{
-		ID:           id,
-		GroupKey:     "service=api",
-		FirstAlertAt: now.Add(-time.Minute),
-		LastAlertAt:  now,
-		ReadyAt:      now,
-	}); err != nil {
-		t.Fatalf("insert incident: %v", err)
-	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE incidents SET status = 'analyzed' WHERE id = ?`, id); err != nil {
-		t.Fatalf("mark analyzed: %v", err)
-	}
-
-	addMember := func(fp, status string) Alert {
-		t.Helper()
-		a := Alert{
-			ID: uuid.NewString(), Fingerprint: fp, Status: status,
-			Labels: map[string]string{"service": "api"}, Annotations: map[string]string{},
-			StartsAt: now, ReceivedAt: now,
-		}
-		stored, err := s.UpsertAlertByFingerprint(ctx, a)
-		if err != nil {
-			t.Fatalf("upsert %s: %v", fp, err)
-		}
-		if err := s.AddAlertToIncident(ctx, id, stored.ID, now); err != nil {
-			t.Fatalf("add %s: %v", fp, err)
-		}
-		return stored
-	}
-	addMember("fp-resolved", "resolved")
-	firing := addMember("fp-firing", "firing")
-
-	if _, err := s.ResolveIncidentIfAllMembersResolved(ctx, id); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("partial recovery = %v, want ErrNotFound", err)
-	}
-	firing.Status = "resolved"
-	firing.ReceivedAt = now.Add(time.Minute)
-	if _, err := s.UpsertAlertByFingerprint(ctx, firing); err != nil {
-		t.Fatalf("resolve final member: %v", err)
-	}
-
-	resolved, err := s.ResolveIncidentIfAllMembersResolved(ctx, id)
-	if err != nil {
-		t.Fatalf("full recovery: %v", err)
-	}
-	if resolved.ID != id || resolved.Status != "resolved" {
-		t.Fatalf("resolved incident = %+v, want id %s with resolved status", resolved, id)
-	}
-	if _, err := s.ResolveIncidentIfAllMembersResolved(ctx, id); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("second transition = %v, want ErrNotFound", err)
-	}
-}
-
 // TestIncidentMemberStatusCounts covers the batch recovery-signal query: it
 // tallies member alerts by status per incident in one round trip, omits unknown
 // ids, and handles the empty-id case.
@@ -485,9 +490,9 @@ func TestMaxSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MaxSchemaVersion: %v", err)
 	}
-	// 0011_incident_triage.sql exists today; the floor only ratchets up.
-	if got < 11 {
-		t.Errorf("MaxSchemaVersion = %d, want >= 11", got)
+	// Released migration 0013 precedes the state-controller migrations.
+	if got != 38 {
+		t.Errorf("MaxSchemaVersion = %d, want 38", got)
 	}
 }
 
@@ -556,7 +561,7 @@ func TestMarkIncidentResolved_ClearsTriageRow(t *testing.T) {
 	incID := readyIncident(t, s, "service=resolve-clears")
 	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
 
-	if err := s.SeedIncidentTriage(ctx, incID, now); err != nil {
+	if err := storetest.SeedIncidentTriage(ctx, s.db, incID, now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.BeginIncidentTriage(ctx, incID, now); err != nil {

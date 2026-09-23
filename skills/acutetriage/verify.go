@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/httpcount"
 	promclient "github.com/alertint/alertint-agent/internal/prometheus"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/internal/zabbix"
@@ -59,13 +60,15 @@ const (
 
 // VerificationQuery is one planned/executed query, persisted verbatim (R8/R10).
 type VerificationQuery struct {
-	Kind    string         `json:"kind"`
-	Source  string         `json:"source"` // "model" | "floor" | "capture" | "operator"
-	Expr    string         `json:"expr,omitempty"`
-	Params  map[string]any `json:"params,omitempty"`
-	Why     string         `json:"why,omitempty"`
-	Outcome Outcome        `json:"outcome,omitempty"` // fetched|empty|degraded|failed (evidence.go)
-	Result  string         `json:"result,omitempty"`  // rendered text, byte-identical to prompt (R8)
+	Kind                 string         `json:"kind"`
+	Source               string         `json:"source"` // "model" | "floor" | "capture" | "operator"
+	Expr                 string         `json:"expr,omitempty"`
+	Params               map[string]any `json:"params,omitempty"`
+	Why                  string         `json:"why,omitempty"`
+	Outcome              Outcome        `json:"outcome,omitempty"` // fetched|empty|degraded|failed (evidence.go)
+	Result               string         `json:"result,omitempty"`  // rendered text, byte-identical to prompt (R8)
+	RequestAttempts      int            `json:"request_attempts,omitempty"`
+	RequestAttemptsKnown bool           `json:"request_attempts_known,omitempty"`
 }
 
 // VerificationRound is one executed round (R8).
@@ -345,6 +348,7 @@ type liveExecutor struct {
 }
 
 func (e *liveExecutor) execute(ctx context.Context, q *VerificationQuery) {
+	ctx, requestCounter := httpcount.WithCounter(ctx)
 	switch q.Kind {
 	case kindZabbixReachability:
 		e.zv.runReachability(ctx, q)
@@ -352,6 +356,11 @@ func (e *liveExecutor) execute(ctx context.Context, q *VerificationQuery) {
 		e.zv.runNeighborProblems(ctx, q)
 	default:
 		runOneQuery(ctx, e.prom, e.state, q, e.inc, e.now, e.maxSeries, e.logger)
+	}
+	if n := requestCounter.Attempts(); n > 0 {
+		q.RequestAttempts, q.RequestAttemptsKnown = n, true
+	} else if q.Outcome == OutcomeInvalid {
+		q.RequestAttemptsKnown = true
 	}
 }
 
@@ -395,7 +404,7 @@ func runVerification(ctx context.Context, prom metricQuerier, zbx ZabbixReader, 
 func runVerificationWith(ctx context.Context, exec queryExecutor, params VerificationParams,
 	floor []VerificationQuery, draft DraftRef, operatorQueries, modelQueries []VerificationQuery, now time.Time,
 ) *VerificationRound {
-	queries := make([]VerificationQuery, 0, len(floor)+len(operatorQueries)+len(modelQueries))
+	queries := make([]VerificationQuery, 0) //nolint:prealloc // Summing slice lengths can overflow; append grows safely.
 	queries = append(queries, floor...)
 	queries = append(queries, operatorQueries...)
 	queries = append(queries, modelQueries...)

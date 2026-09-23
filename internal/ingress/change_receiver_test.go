@@ -108,15 +108,15 @@ func TestChangeReceiver_PersistsAndAudits(t *testing.T) {
 	defer func() { _ = st.Close() }()
 	auditor := audit.New(st.DB())
 
-	// A sink that must NEVER be called by the change route.
-	alertSinkCalled := false
-	sink := func(context.Context, store.Alert) error { alertSinkCalled = true; return nil }
+	// A wake that must NEVER be invoked by the change route.
+	alertWakeCalled := false
+	wake := func() { alertWakeCalled = true }
 
 	host, err := New(Options{
 		Store:   st,
 		Auditor: auditor,
 		Receivers: []Receiver{
-			NewAlertReceiver(st, "alert-tok", sink, slog.Default()),
+			NewAlertReceiver(st, "alert-tok", wake, slog.Default()),
 			NewChangeReceiver(st, "change-tok", 30, slog.Default()),
 		},
 		Logger: slog.Default(),
@@ -149,18 +149,12 @@ func TestChangeReceiver_PersistsAndAudits(t *testing.T) {
 	if len(got) != 1 || got[0].ID == "" {
 		t.Fatalf("want 1 stored change with stamped ID, got %#v", got)
 	}
-	if alertSinkCalled {
-		t.Fatal("change route must not invoke the alert sink / correlator")
+	if alertWakeCalled {
+		t.Fatal("change route must not invoke the alert receiver's wake")
 	}
 
-	// Audit row recorded under kind=change.received.
-	var n int
-	if err := st.DB().QueryRow(`SELECT COUNT(*) FROM audit_log WHERE kind='change.received'`).Scan(&n); err != nil {
-		t.Fatalf("count audit: %v", err)
-	}
-	if n != 1 {
-		t.Fatalf("change.received audit rows = %d, want 1", n)
-	}
+	// The response is flushed before the best-effort audit append completes.
+	waitForLoadCount(t, st, `SELECT COUNT(*) FROM audit_log WHERE kind='change.received'`, 1)
 
 	// Per-route token isolation: alert token must not authorize the change route.
 	req2, _ := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/webhook/change", strings.NewReader(body))

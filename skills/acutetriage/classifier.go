@@ -85,7 +85,7 @@ func Classify(ctx context.Context, client LLMClient, currentKey string, candidat
 	}
 
 	user := classifierUserPrompt(currentKey, candidate)
-	comp, err := client.Complete(ctx, classifierSystemPrompt, llm.Prompt{Prefix: user}, classifierRequiredKeys)
+	comp, err := completeWithAnalysisUsage(ctx, client, classifierSystemPrompt, llm.Prompt{Prefix: user}, classifierRequiredKeys)
 	res.Tokens = comp.InputTokens + comp.OutputTokens
 	if err != nil {
 		// res.Verdict already holds VerdictUnsureError; only a timeout refines it.

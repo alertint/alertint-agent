@@ -7,6 +7,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0-rc1] - 2026-09-22
+
+### Added
+
+- Alertmanager deliveries can carry configured installation and exact
+  Prometheus producer/rule identity. Bounded current rule evidence enables the
+  existing reusable expected-schedule flow for proven Alertmanager conditions;
+  missing, ambiguous, stale, relabeled, or dependency-incomplete evidence
+  grants no reusable authority.
+- Zabbix installations and trigger rules can carry stable source identity and
+  bounded current configuration-version evidence into Situation preparation
+  and MCP. Missing, expired, unsupported, or inconsistent evidence stays
+  explicitly unavailable, and material rule changes invalidate covered
+  expectedness without changing lifecycle.
+- Operators can mark a Situation's current non-critical condition as expected
+  until a set time, replace, withdraw, or restore that decision through MCP,
+  and see the decision and any reason it ended in Slack.
+- Operators can promote an active expected-until decision into a reusable
+  Zabbix expected schedule. Exact installation, host, trigger-version,
+  schedule, duration, and companion-signal checks determine each match;
+  MCP owns confirmation, revision, withdrawal, restoration, review, usage,
+  and history while Slack shows only the schedule's effect on a Situation.
+- Optional shared LLM call and cumulative token limits, persisted across
+  restarts and enforced before generation requests, including retries.
+  Both limits default to unlimited; see the configuration guide for accounting
+  and recovery semantics.
+- MCP clients receive compact Situation-investigation guidance and accurate
+  read/write/external-access hints for every registered tool. Release archives
+  include a Codex skill that explains current state, recorded history, evidence
+  gaps, AlertINT's next action, and authorized follow-up without inventing
+  missing source history.
+
+### Changed
+
+- Release candidates use a separate, commit-pinned publication command and
+  publish only versioned archives and container tags. They do not move stable
+  `latest` aliases or change Helm chart defaults.
+- The default Situation preparation request budget increases from six to eight
+  physical source calls per cycle, allowing the bounded Zabbix rule and problem
+  reads to run alongside the largest protected investigation.
+- Configured Zabbix installation identities now namespace delivery and alert
+  fingerprints as `zabbix:<instance_id>:<event_id>`. Installations without an
+  `instance_id` retain the legacy `zabbix:<event_id>` identity.
+
+### Fixed
+
+- Linked recurrence starts with its own delivery history instead of inheriting
+  closed-episode deliveries that share an Alert identity. Recovery authority
+  lookups now use an indexed chronological path as retained history grows.
+- Preserve the released `alertint_usage_stats` MCP tool across the Situation
+  controller branch integration. It now counts new Situation roots and
+  withheld channel pokes while continuing to read legacy notification rows.
+- Resolved deliveries follow the alert's current nonterminal Incident
+  membership before group-key fallback, so an unrelated collecting Incident
+  cannot claim the recovery.
+- Inbound webhooks now flush `204` as soon as their durable state commits,
+  without making that response wait for the best-effort audit append. The
+  bounded audit write continues after client disconnects; persistence failures
+  still return retryable `503` responses before any acknowledgement.
+- Preserve the released 0.13.x migration sequence when upgrading to the
+  state-controller schema, including durable alert intake. Databases created
+  with the conflicting prerelease numbering are rejected before migration;
+  preserve them and restore a released-version backup or use a fresh test database.
+- Situation Slack roots keep completed-analysis timing and token usage in the
+  analysis thread, and distinguish an unavailable source rule definition from
+  a rule whose identity or version changed.
+- Situation assessments carry the prior semantic judgment into the prompt and
+  no longer let the static capability-limitation set churn the material fact
+  hash, so unchanged evidence reuses the existing assessment instead of
+  repeatedly calling the LLM.
+- A first assessment call the shared budget denies before dispatch defers the
+  Situation until the budget's own retry time without spending an inference
+  attempt; provider usage (including cache tokens) is recorded on attempts.
+- Situation Slack briefings show stored triage findings, current alert state,
+  verification limits, and separate human and AlertINT next steps. Recovery
+  retains qualified historical analysis; replies report meaningful changes
+  while routine controller work remains in the audit history.
+  Compact roots use overall-status indicators and copyable MCP commands;
+  structured evidence and named alert changes stay in the thread. Each update
+  distinguishes the next status check from an actually scheduled work retry.
+- Situation assessments reuse unchanged evidence across staggered observation
+  schedules instead of repeatedly calling the LLM. Stale, failed, and incomplete
+  checks remain explicit evidence gaps.
+- Source recovery deliveries now reach every relevant open membership. A
+  re-fire during recovery grace stays in the same Situation, while firing
+  after terminal closure opens a linked new Situation; episode ordering keeps
+  a delayed old resolution from closing the newer firing episode.
+- Assessment usage includes cache tokens; hourly budget refusals defer work
+  without consuming an inference attempt when no request was sent.
+
 ## [0.13.9] - 2026-09-16
 
 ### Added
@@ -812,7 +902,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single static binary** — pure-Go SQLite (no CGO), no external runtime dependencies.
   Multi-platform builds: `linux/amd64`, `linux/arm64`, `darwin/arm64`.
 
-[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.13.9...HEAD
+[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.14.0-rc1...HEAD
+[0.14.0-rc1]: https://github.com/alertint/alertint-agent/compare/v0.13.9...v0.14.0-rc1
 [0.13.9]: https://github.com/alertint/alertint-agent/compare/v0.13.8...v0.13.9
 [0.13.8]: https://github.com/alertint/alertint-agent/compare/v0.13.7...v0.13.8
 [0.13.7]: https://github.com/alertint/alertint-agent/compare/v0.13.6...v0.13.7

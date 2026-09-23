@@ -28,6 +28,50 @@ The versions do not need to match. For example, application `0.14.0` can ship
 in chart `0.1.1`. The chart's `appVersion` records `0.14.0`; its `version`
 remains `0.1.1`.
 
+## Release candidates
+
+Release candidates are explicitly opt-in and are cut from a reviewed commit on
+`main`. They use the same integrated source as the next stable release, while a
+separate GoReleaser configuration prevents prerelease tags from moving stable
+aliases or publishing a Helm chart.
+
+1. Prepare and review the candidate changelog on a branch:
+
+   ```bash
+   task release:prep VERSION=0.14.0-rc1
+   task release:notes VERSION=0.14.0-rc1
+   ```
+
+2. Merge that preparation into `main`, wait for all required checks, and record
+   the resulting full 40-character commit SHA.
+
+3. From a clean checkout at that exact commit, validate without publishing:
+
+   ```bash
+   task release:rc -- 0.14.0-rc1 <full-candidate-sha> --dry-run
+   ```
+
+4. After explicit publication approval, run the same command without
+   `--dry-run`. It creates `v0.14.0-rc1` only when `HEAD`, the expected SHA, the
+   changelog section and tag availability all agree.
+
+The RC workflow publishes only versioned archives and image tags. It marks the
+GitHub release as a prerelease, does not move `latest`, `latest-amd64` or
+`latest-arm64`, and skips chart publication. Evaluate it with the existing
+supported chart by overriding the image tag explicitly:
+
+```bash
+helm upgrade --install alertint oci://ghcr.io/alertint/charts/alertint-agent \
+  --version 0.2.2 \
+  --set image.tag=v0.14.0-rc1
+```
+
+Before installing an RC over an existing database, create and retain a
+consistent backup with the old binary. Rollback means stopping the RC,
+preserving its migrated database separately, restoring that backup and then
+starting the old binary. Never open an RC-migrated database with the old
+binary. See [Backup & restore](docs/getting-started/backup-restore.md).
+
 ## Normal application release
 
 1. Check `[Unreleased]` in `CHANGELOG.md`. Every merged feature should already
@@ -169,6 +213,22 @@ installable; it is discovery metadata, not part of cutting releases.
 For a reviewed chart-only fallback, run
 `task release:chart:prep VERSION=0.1.2`, commit the three chart metadata files,
 merge them, then tag the merged commit with `chart-v0.1.2`.
+
+## State-controller database cutover
+
+Released v0.13.9 owns migration `0013_audit_log_kind_ts_idx.sql`.
+State-controller migrations start at `0014_alert_delivery_ledger.sql` and end
+at `0038_alert_delivery_authority_index.sql`. Released migration files retain
+their numbers and contents; pinned-prefix and populated-upgrade tests enforce
+this.
+
+Old prerelease databases that used migration `0013` for the delivery ledger
+are incompatible with the corrected sequence. Startup rejects that lineage
+before applying migrations. Preserve the database and either restore a backup
+from the released 0.13.x binary or use a fresh database for a lab/RC. Do not
+edit `schema_migrations` by hand. A database left partially migrated by an
+earlier failed release-to-prerelease upgrade must also be restored from its
+released-version backup.
 
 ## Don'ts
 
