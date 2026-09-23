@@ -22,9 +22,13 @@ import (
 // disabled.
 func TestStartExportsSpansOverOTLPHTTPAndRestoresGlobalOnShutdown(t *testing.T) {
 	var traceRequests atomic.Int32
+	var rootRequests atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && r.URL.Path == "/v1/traces" {
 			traceRequests.Add(1)
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/" {
+			rootRequests.Add(1)
 		}
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -56,10 +60,37 @@ func TestStartExportsSpansOverOTLPHTTPAndRestoresGlobalOnShutdown(t *testing.T) 
 		t.Fatalf("shutdown: %v", err)
 	}
 	if got := traceRequests.Load(); got < 1 {
-		t.Fatalf("OTLP /v1/traces requests = %d, want >= 1 (shutdown must flush the batch)", got)
+		t.Fatalf("OTLP /v1/traces requests = %d, root requests = %d; want >= 1 trace request on shutdown", got, rootRequests.Load())
 	}
 	if otel.GetTracerProvider() != before {
 		t.Fatal("shutdown did not restore the previous global tracer provider")
+	}
+}
+
+func TestStartPreservesExplicitOTLPHTTPTracePath(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/custom/traces" {
+			requests.Add(1)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	shutdown, err := telemetry.Start(ctx, telemetry.Options{
+		Endpoint: srv.URL + "/custom/traces", Protocol: telemetry.ProtocolHTTP, Timeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	_, span := otel.Tracer("test").Start(ctx, "explicit-trace-path")
+	span.End()
+	if err := shutdown(ctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("POST /custom/traces requests = %d, want 1", got)
 	}
 }
 

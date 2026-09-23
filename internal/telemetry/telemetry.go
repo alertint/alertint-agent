@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"strings"
 	"time"
 
@@ -132,7 +133,16 @@ func newExporter(ctx context.Context, o Options) (*otlptrace.Exporter, error) {
 	case ProtocolHTTP:
 		opts := []otlptracehttp.Option{otlptracehttp.WithTimeout(o.Timeout)}
 		if hasScheme {
-			opts = append(opts, otlptracehttp.WithEndpointURL(o.Endpoint))
+			endpoint, err := url.Parse(o.Endpoint)
+			if err != nil {
+				return nil, fmt.Errorf("telemetry: invalid otlp endpoint URL: %w", err)
+			}
+			// OpenTelemetry 1.46 sends a pathless WithEndpointURL to /.
+			// Preserve our existing collector URL behavior for trace exports.
+			if endpoint.Path == "" {
+				endpoint.Path = "/v1/traces"
+			}
+			opts = append(opts, otlptracehttp.WithEndpointURL(endpoint.String()))
 		} else {
 			opts = append(opts, otlptracehttp.WithEndpoint(o.Endpoint))
 			if o.Insecure {
