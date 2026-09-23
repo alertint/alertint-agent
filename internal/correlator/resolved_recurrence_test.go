@@ -60,7 +60,7 @@ func TestApplyDeliveryRecoveryReachesEveryOpenMembershipWithOneOwner(t *testing.
 	}
 }
 
-func TestApplyDeliveryRefireReopensOnlyNonterminalEpisodeAndRecoversAgain(t *testing.T) {
+func TestApplyDeliveryRefireReopensIncidentAndRecoversAgain(t *testing.T) {
 	st := openStore(t)
 	c := New(Config{}, st, NopIncidentSink{}, nil)
 	ctx := context.Background()

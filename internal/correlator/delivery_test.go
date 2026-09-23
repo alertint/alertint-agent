@@ -571,6 +571,57 @@ func TestApplyDelivery_ResolvedDeliveryWithNoPriorIncidentOpensFresh(t *testing.
 	}
 }
 
+func TestApplyDelivery_OrphanRecoveryJoinsRecentGroupIncident(t *testing.T) {
+	st := openStore(t)
+	c := New(Config{}, st, NopIncidentSink{}, nil)
+	resolved := &captureResolutionNotifier{}
+	c.SetResolutionNotifier(resolved)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 23, 14, 0, 0, 0, time.UTC)
+
+	member := firingAlert("fp-existing", "DiskFull", "warning", now.Add(-10*time.Minute), false)
+	member.Status = "resolved"
+	seedJudged(t, st, "inc-existing", "analyzed", now.Add(-10*time.Minute), now.Add(-5*time.Minute), member)
+	prior := deliveryInputFor("d-existing-recovery", member.Fingerprint, gkAPI, "resolved", now.Add(-5*time.Minute))
+	if _, err := st.AcceptDeliveries(ctx, []store.DeliveryInput{prior}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `INSERT INTO incident_alert_deliveries (incident_id, delivery_id, created_at) VALUES ('inc-existing', ?, ?)`,
+		prior.ID, now.Add(-5*time.Minute).UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `UPDATE alert_delivery_dispatches SET status='applied', applied_at=? WHERE delivery_id=?`,
+		now.Add(-5*time.Minute).UTC().Format(time.RFC3339Nano), prior.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	claim := claimOneDelivery(t, st, deliveryInputFor("d-orphan-recovery", "fp-orphan", gkAPI, "resolved", now), now)
+	if err := c.ApplyDelivery(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+
+	inc, err := st.GetIncidentByID(ctx, "inc-existing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inc.Status != "resolved" || inc.AlertCount != 2 {
+		t.Fatalf("recent group incident = %+v, want resolved with two members", inc)
+	}
+	var owner string
+	if err := st.DB().QueryRowContext(ctx, `SELECT incident_id FROM incident_alert_deliveries WHERE delivery_id='d-orphan-recovery'`).Scan(&owner); err != nil {
+		t.Fatal(err)
+	}
+	if owner != "inc-existing" {
+		t.Fatalf("orphan recovery owner = %q, want recent group incident", owner)
+	}
+	if kinds := situationInputKinds(t, st, "inc-existing"); len(kinds) != 1 || kinds[0] != "incident_resolved" {
+		t.Fatalf("recovery inputs = %v, want [incident_resolved]", kinds)
+	}
+	if resolved.count() != 1 {
+		t.Fatalf("resolution notifications = %d, want 1", resolved.count())
+	}
+}
+
 func TestApplyDelivery_InvalidDeliveryRejected(t *testing.T) {
 	st := openStore(t)
 	c := New(Config{}, st, NopIncidentSink{}, nil)
