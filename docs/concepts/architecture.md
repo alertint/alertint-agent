@@ -13,8 +13,8 @@ SQLite state — one binary, one config file, no external dependencies to
 install.
 
 For an operator-focused view of the complete v0.14 lifecycle, including
-recovery, expected maintenance and retry boundaries, open the standalone
-[Situation workflow](situation-workflow.html).
+recovery, expected maintenance and retry boundaries, see the
+[Situation workflow](situation-workflow.md).
 
 Two feedback loops close on the triage step, and both are why the same
 condition doesn't get the same wrong answer twice: the **verification round**

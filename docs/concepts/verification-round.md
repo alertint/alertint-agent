@@ -2,7 +2,7 @@
 title: "Verification round"
 description: "How AlertINT falsifies its own draft verdict — a deterministic floor plus targeted checks — before a finding persists."
 section: "Concepts"
-order: 5
+order: 6
 slug: "verification-round"
 ---
 

@@ -8,7 +8,7 @@ slug: "mcp-clients"
 
 # MCP clients
 
-The standalone [Situation workflow](../concepts/situation-workflow.html)
+The [Situation workflow](../concepts/situation-workflow.md)
 shows how MCP records relate to durable intake, Slack, recovery, and expected
 maintenance in v0.14.
 

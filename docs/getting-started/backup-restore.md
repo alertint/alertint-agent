@@ -100,24 +100,33 @@ install to a new host: copy a backup over, restore, start the agent.
 
 ## Staged restore (Kubernetes)
 
-Stopping a pod to run a command against its volume is awkward. Instead,
-stage the backup file next to the database and restart: at startup —
-before it opens the store — the agent applies a file found at the exact
-path `<db>.restore` using the same swap logic as offline restore.
-
-Backup (live, no downtime):
+The Helm chart runs a **Deployment** with one replica and a persistent volume.
+Create a consistent backup on that volume while the agent is running. The
+default Deployment name for a `my-alertint` Helm release is
+`my-alertint-alertint-agent`; use your actual name if overridden:
 
 ```bash
-kubectl exec alertint-0 -- alertint backup --db /data/alertint-agent.db /data/snap.backup.db
-kubectl cp alertint-0:/data/snap.backup.db ./snap.backup.db
+kubectl exec deployment/my-alertint-alertint-agent -c alertint-agent -- \
+  /alertint backup --db /data/alertint-agent.db /data/pre-upgrade.backup.db
 ```
 
-Restore (one restart — no scale-to-zero, no helper Job):
+**Export that backup outside the cluster before upgrading.** Use your PVC
+snapshot/backup process or a temporary helper pod that mounts the claim. The
+published AlertINT container is distroless and has no `tar`, so `kubectl cp`
+directly from its pod does not work. A backup left only on the same PVC is not
+enough for rollback after a volume failure. Check that the exported file is
+present and readable before changing the image.
 
-```bash
-kubectl cp ./snap.backup.db alertint-0:/data/alertint-agent.db.restore
-kubectl rollout restart statefulset/alertint
-```
+To restore, stop the agent Deployment, preserve the migrated database, and
+place the old backup on its PVC at the exact path
+`/data/alertint-agent.db.restore` using your storage workflow or a temporary
+helper pod. Remove the helper before restarting the Deployment. Start the
+**old binary** with that staged file: at startup, before opening the store,
+AlertINT applies it using the same swap logic as offline restore. If you use
+Helm, set the image tag back to the old version in your reviewed values file
+and upgrade the release; do not start the old image against the migrated
+database without staging the restore first. The chart's Deployment uses
+`Recreate`, so it does not start a second agent against the same database.
 
 The staging file is consumed on success, so a crash-looping pod can never
 re-apply an old restore. If the staged file fails the admission check,
