@@ -36,12 +36,20 @@ whole service is healthy. For implementation detail, see
 
 ## Lifecycle: what happened to the monitored alerts?
 
+![Situation lifecycle: Active, Recovery pending, Recovered, Tracking ended without confirmed recovery, and a later new linked episode. Investigation requests and findings return separately without changing source lifecycle.](../assets/situation-lifecycle.svg)
+
+[Open the lifecycle diagram at full size](../assets/situation-lifecycle.svg).
+**A** requests investigation; **B** returns a Finding or work disposition to
+the same active Situation. Neither handoff changes source recovery state.
+The diagram's **Tracking ended · recovery unconfirmed** box is the operator
+wording for the terminal `Closed unknown` lifecycle state.
+
 | State | Operator meaning | Next step |
 |---|---|---|
 | Active | The episode is still open. Firing alerts, changed evidence, and investigation can affect the current assessment. | Keep monitoring and do only work that is actually due. |
-| Confirming recovery | All required alerts have authoritative clearance, but the stored grace period is still running. | Observe through that period; a refire returns to Active. |
+| Recovery pending (shown as Confirming recovery) | All required alerts have authoritative clearance, but the stored grace period is still running. | Observe through that period; a refire returns to Active. |
 | Recovered | Monitored alerts stayed clear through the grace period. This Situation is terminal. | Tracking for this episode ends. |
-| Closed unknown | Required source truth could not be established before the lifecycle deadline. Recovery was **not** proven. This Situation is terminal. | State the uncertainty and end tracking for this episode. |
+| Closed unknown (shown as Tracking ended) | Required source truth could not be established before the lifecycle deadline. Recovery was **not** proven. This Situation is terminal. | State the uncertainty and end tracking for this episode. |
 
 An investigation failure cannot recover or close a Situation by itself. A
 missing recovery event cannot be counted as clearance. After either terminal
