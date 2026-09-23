@@ -15,7 +15,9 @@ COPY --from=prep /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 # (e.g. for the SQLite store) are writable without manual chown.
 COPY --from=prep --chown=65532:65532 /data /data
 # The published image must work without an operator-supplied /tmp mount.
-COPY --from=prep --chmod=1777 /runtime-tmp /tmp
+# The release builder can create this empty destination as 0755; ownership
+# still makes it writable by the non-root runtime user.
+COPY --from=prep --chown=65532:65532 --chmod=1777 /runtime-tmp /tmp
 
 # Run as the conventional non-root UID (distroless "nonroot").
 USER 65532:65532

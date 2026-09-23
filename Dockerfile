@@ -23,7 +23,9 @@ COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build --chown=65532:65532 /data /data
 # SQLite migrations and some queries use temporary files. The image must
 # provide /tmp even when no operator-supplied mount is present.
-COPY --from=build --chmod=1777 /runtime-tmp /tmp
+# Own the directory as well as setting its mode: the release image builder
+# created an empty /tmp as 0755 despite --chmod, so mode alone is insufficient.
+COPY --from=build --chown=65532:65532 --chmod=1777 /runtime-tmp /tmp
 
 # Run as the conventional non-root UID (distroless "nonroot").
 USER 65532:65532
