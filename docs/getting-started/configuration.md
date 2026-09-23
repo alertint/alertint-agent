@@ -335,7 +335,7 @@ text, or secret — so what leaves is correlation keys, not content.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `otlp.enabled` | bool | `false` | Install the OTLP trace exporter. Leave off to send nothing anywhere. |
-| `otlp.endpoint` | string | — | Collector address. A bare `host:port` (e.g. `otel-collector:4317`) uses TLS unless `otlp.insecure` is set; a URL with a scheme (e.g. `http://otel-collector:4318`) decides TLS by its scheme. Required when enabled. |
+| `otlp.endpoint` | string | — | Collector address. A bare `host:port` (e.g. `otel-collector:4317`) uses TLS unless `otlp.insecure` is set; a URL with a scheme (e.g. `http://otel-collector:4318`) decides TLS by its scheme. For HTTP, a URL without a path sends traces to `/v1/traces`; an explicit path is used unchanged. Required when enabled. |
 | `otlp.protocol` | string | `grpc` | `grpc` or `http` (OTLP/HTTP with protobuf). |
 | `otlp.insecure` | bool | `false` | Plaintext transport for a bare `host:port` endpoint (a lab or in-cluster collector without TLS). |
 | `otlp.service_name` | string | `alertint-agent` | The resource `service.name` your backend groups spans under. `OTEL_RESOURCE_ATTRIBUTES` in the environment is merged in as well, so `service.namespace` / `deployment.environment.name` need no config key. |

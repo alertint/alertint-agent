@@ -53,6 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Update OpenTelemetry and gRPC to patched security releases while keeping
+  pathless OTLP/HTTP collector URLs on `/v1/traces`; explicit trace paths stay
+  unchanged.
 - Linked recurrence starts with its own delivery history instead of inheriting
   closed-episode deliveries that share an Alert identity. Recovery authority
   lookups now use an indexed chronological path as retained history grows.
