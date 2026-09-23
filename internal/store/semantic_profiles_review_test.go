@@ -185,6 +185,24 @@ func TestClaimSemanticInferenceJobReclaimsLeaseExpiredAfterStartup(t *testing.T)
 	}
 }
 
+func TestClaimSemanticInferenceJobKeepsLeaseUntilFractionalExpiry(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	seedPendingInferenceJob(t, st, "job-lease-ns", "sig:lease-ns", 3, nil, now)
+	first, found, err := st.ClaimSemanticInferenceJob(ctx, "worker-a", now, time.Nanosecond)
+	if err != nil || !found {
+		t.Fatalf("first claim: found=%v err=%v", found, err)
+	}
+	if _, found, err := st.ClaimSemanticInferenceJob(ctx, "worker-b", now, time.Minute); err != nil || found {
+		t.Fatalf("lease reclaimed before expiry: found=%v err=%v", found, err)
+	}
+	second, found, err := st.ClaimSemanticInferenceJob(ctx, "worker-b", now.Add(time.Nanosecond), time.Minute)
+	if err != nil || !found || second.JobID != first.JobID || second.Token <= first.Token {
+		t.Fatalf("lease not reclaimed at expiry: found=%v first=%+v second=%+v err=%v", found, first, second, err)
+	}
+}
+
 // TestClaimSemanticInferenceJobExhaustsFinalReservationCrashOnReclaim
 // (F13): a lease that expires after the job's LAST reserved call is
 // recovered as exhausted by the claim path — exactly RecoverSemanticInference's

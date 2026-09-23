@@ -429,11 +429,20 @@ const expiredSemanticInferenceLeaseReclaimLimit = 100
 // expired lease, so a heartbeat that renewed the lease between the read
 // and the write is never clobbered. Returns the number of jobs released.
 func releaseExpiredSemanticInferenceLeasesTx(ctx context.Context, tx *sql.Tx, now time.Time, limit int) (int, error) {
+	// RFC3339Nano's optional fractional digits do not sort chronologically
+	// as TEXT within a second. Compare the whole-second prefix first, then
+	// its zero-padded nine-digit fraction before the bounded LIMIT.
+	second := now.UTC().Format("2006-01-02T15:04:05")
+	fraction := fmt.Sprintf("%09d", now.Nanosecond())
 	query := `
 		SELECT id, attempt, attempt_budget, lease_expires_at FROM semantic_profile_inference_jobs
-		WHERE status = 'running' AND lease_expires_at <= ?
+		WHERE status = 'running' AND (
+			lease_expires_at < ? OR
+			(substr(lease_expires_at,1,19) = ? AND
+			 substr(replace(substr(lease_expires_at,21),'Z','') || '000000000',1,9) <= ?)
+		)
 		ORDER BY lease_expires_at ASC, id ASC`
-	args := []any{canonicalTime(now)}
+	args := []any{second, second, fraction}
 	if limit > 0 {
 		query += ` LIMIT ?`
 		args = append(args, limit)
@@ -930,14 +939,45 @@ func (s *Store) ClaimSemanticInferenceJob(ctx context.Context, owner string, now
 
 	var id, signatureKey, frozenInputJSON, frozenInputDigest string
 	var expectedHeadVersion, attempt, token int
-	err = tx.QueryRowContext(ctx, `
-		SELECT id, signature_key, frozen_input_json, frozen_input_digest, expected_head_version, attempt, token
+	// RFC3339Nano omits trailing fractional zeroes, so its TEXT order can
+	// put a future retry before now within the same second. The indexed upper
+	// bound admits that whole second; Go makes the exact due-time decision.
+	upperSecond := now.UTC().Truncate(time.Second).Add(time.Second).Format("2006-01-02T15:04:05")
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, signature_key, frozen_input_json, frozen_input_digest, expected_head_version, attempt, token, retry_at
 		FROM semantic_profile_inference_jobs
-		WHERE status = 'pending' AND (retry_at IS NULL OR retry_at <= ?)
+		WHERE status = 'pending' AND (retry_at IS NULL OR retry_at < ?)
  AND (COALESCE(error_class,'') != 'budget_deferred' OR retry_at IS NOT NULL)
-		ORDER BY created_at ASC, id ASC LIMIT 1`, canonicalTime(now)).
-		Scan(&id, &signatureKey, &frozenInputJSON, &frozenInputDigest, &expectedHeadVersion, &attempt, &token)
-	if errors.Is(err, sql.ErrNoRows) {
+		ORDER BY created_at ASC, id ASC`, upperSecond)
+	if err != nil {
+		return profilemodel.JobClaim{}, false, fmt.Errorf("store: query due semantic inference jobs: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	found := false
+	for rows.Next() {
+		var retryAt sql.NullString
+		if err := rows.Scan(&id, &signatureKey, &frozenInputJSON, &frozenInputDigest, &expectedHeadVersion, &attempt, &token, &retryAt); err != nil {
+			return profilemodel.JobClaim{}, false, fmt.Errorf("store: scan due semantic inference job: %w", err)
+		}
+		if retryAt.Valid {
+			due, err := time.Parse(time.RFC3339Nano, retryAt.String)
+			if err != nil {
+				return profilemodel.JobClaim{}, false, fmt.Errorf("store: parse semantic inference job retry_at: %w", err)
+			}
+			if due.After(now) {
+				continue
+			}
+		}
+		found = true
+		break
+	}
+	if err := rows.Err(); err != nil {
+		return profilemodel.JobClaim{}, false, fmt.Errorf("store: iterate due semantic inference jobs: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return profilemodel.JobClaim{}, false, fmt.Errorf("store: close due semantic inference jobs query: %w", err)
+	}
+	if !found {
 		// Nothing claimable, but the expired-lease release above (an
 		// exhausted final-reservation crash, or a job that became pending
 		// yet not due) must still commit durably.
@@ -945,9 +985,6 @@ func (s *Store) ClaimSemanticInferenceJob(ctx context.Context, owner string, now
 			return profilemodel.JobClaim{}, false, fmt.Errorf("store: commit claim semantic inference job (none due): %w", err)
 		}
 		return profilemodel.JobClaim{}, false, nil
-	}
-	if err != nil {
-		return profilemodel.JobClaim{}, false, fmt.Errorf("store: query due semantic inference job: %w", err)
 	}
 
 	newToken := token + 1

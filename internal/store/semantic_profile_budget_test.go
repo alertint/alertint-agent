@@ -36,7 +36,9 @@ func (c *budgetProfileClient) CompleteOnce(context.Context, string, llm.Prompt, 
 func TestProfileBudgetDenialPreservesAttemptAndResumesWithoutHealthRecovery(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
-	now := time.Now().UTC()
+	// A one-nanosecond fractional retry makes the just-before-boundary poll
+	// deterministic; RFC3339Nano text ordering used to admit it early.
+	now := time.Date(2026, 9, 7, 9, 0, 0, 1, time.UTC)
 	seedPendingInferenceJob(t, st, "budget-job", "budget-signature", 1, nil, now)
 	retry := now.Add(time.Hour)
 	client := &budgetProfileClient{started: llm.RequestStartStatusFalse, retryAt: &retry, denied: true}

@@ -470,6 +470,26 @@ func TestClaimSemanticInferenceJobSkipsJobsNotYetDue(t *testing.T) {
 	}
 }
 
+func TestClaimSemanticInferenceJobOrdersFractionalRetryTimesChronologically(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
+	future := now.Add(time.Nanosecond)
+	// RFC3339Nano removes trailing zeroes. Its text representation of
+	// 09:00:00.000000001Z sorts before 09:00:00Z, although it is later.
+	seedPendingInferenceJob(t, st, "a-future", "sig:future-ns", 3, &future, now)
+	seedPendingInferenceJob(t, st, "b-due", "sig:due-ns", 3, nil, now)
+
+	claim, found, err := st.ClaimSemanticInferenceJob(ctx, "worker-a", now, time.Minute)
+	if err != nil || !found || claim.JobID != "b-due" {
+		t.Fatalf("claim before retry boundary: found=%v job=%q err=%v, want b-due", found, claim.JobID, err)
+	}
+	claim, found, err = st.ClaimSemanticInferenceJob(ctx, "worker-b", future, time.Minute)
+	if err != nil || !found || claim.JobID != "a-future" {
+		t.Fatalf("claim at retry boundary: found=%v job=%q err=%v, want a-future", found, claim.JobID, err)
+	}
+}
+
 func TestClaimSemanticInferenceJobReturnsFalseWhenNoneDue(t *testing.T) {
 	st := newTestStore(t)
 	now := time.Date(2026, 9, 7, 9, 0, 0, 0, time.UTC)
