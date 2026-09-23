@@ -1233,7 +1233,7 @@ func (s *Skill) auditVerificationPlanned(ctx context.Context, inc store.Incident
 	if s.auditor == nil {
 		return
 	}
-	plan := make([]VerificationQuery, 0, len(floor)+len(operatorQ)+len(modelQ))
+	plan := make([]VerificationQuery, 0)
 	plan = append(plan, floor...)
 	plan = append(plan, operatorQ...)
 	plan = append(plan, modelQ...)

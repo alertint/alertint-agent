@@ -404,7 +404,7 @@ func runVerification(ctx context.Context, prom metricQuerier, zbx ZabbixReader, 
 func runVerificationWith(ctx context.Context, exec queryExecutor, params VerificationParams,
 	floor []VerificationQuery, draft DraftRef, operatorQueries, modelQueries []VerificationQuery, now time.Time,
 ) *VerificationRound {
-	queries := make([]VerificationQuery, 0, len(floor)+len(operatorQueries)+len(modelQueries))
+	queries := make([]VerificationQuery, 0)
 	queries = append(queries, floor...)
 	queries = append(queries, operatorQueries...)
 	queries = append(queries, modelQueries...)
