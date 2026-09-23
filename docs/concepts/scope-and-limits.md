@@ -2,7 +2,7 @@
 title: "Scope and limits"
 description: "Where AlertINT does well, where it doesn't, and known weaknesses."
 section: "Concepts"
-order: 3
+order: 2
 slug: "scope-and-limits"
 ---
 

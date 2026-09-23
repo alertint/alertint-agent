@@ -12,9 +12,8 @@ Everything below runs inside a single `alertint serve` process with local
 SQLite state — one binary, one config file, no external dependencies to
 install.
 
-For an operator-focused view of the complete v0.14 lifecycle, including
-recovery, expected maintenance and retry boundaries, see the
-[Situation workflow](situation-workflow.md).
+For the visual, clickable lifecycle map and its investigation handoff, open
+the [Situation workflow](https://alertint.com/situation-workflow).
 
 Two feedback loops close on the triage step, and both are why the same
 condition doesn't get the same wrong answer twice: the **verification round**
@@ -116,149 +115,21 @@ here too: storm collapse, known-issue short-circuits, and prompt selection.
 
 ### 3a. Situation foundation and controller
 
-Every correlated delivery also feeds a **Situation** — a durable record
-that owns one or more Incidents under one exact group key across restarts,
-so a fresh firing of the same group finds its durable history waiting
-rather than starting from nothing. In v0.14, the controller can terminate
-an episode as recovered, or close it with uncertainty once the lifecycle
-observation deadline expires. A terminal Situation refuses new work; a
-later firing opens a fresh Situation linked to the prior episode.
+A **Situation** tracks a group of related alerts across restarts. Source
+clearance and the recovery grace period determine whether it recovers. If
+recovery cannot be confirmed before the observation deadline, tracking ends
+with uncertainty. A later firing starts a new Situation linked to the old
+one. Investigation and operator expectedness never manufacture recovery.
 
-Recovery follows Alert membership rather than whichever group happens to be
-collecting when the recovery arrives. One durable delivery remains the owner,
-while every relevant nonterminal Incident projection sees the same applied
-source history. A re-fire during recovery grace keeps the Situation active and
-returns it to investigation. A delayed resolution from an older source episode
-cannot close a newer firing episode.
+The controller records each material change and its Slack notification
+intent together. One Situation root shows the current Finding and status;
+thread replies record meaningful changes. Explore the
+[clickable Situation workflow](https://alertint.com/situation-workflow) for
+the lifecycle, investigation handoff, guards, and operator-visible result.
 
-The durable Situation foundation and fenced Situation controller are wired
-end to end in the v0.14 release line. Local Store facts (durability,
-correlation, exact-group grouping) feed the
-"B+" Acute Triage gate — every ready Incident is durably `awaiting_decision`
-until the controller's own fenced cycle requests, skips, or leaves it
-parked, and only a requested decision ever dispatches the triage skill (see
-["ready" in Incident lifecycle](#incident-lifecycle) below). Every reconcile
-cycle derives one authoritative Assessment (material facts, an
-operator-facing Attention level, and a bounded action contract) and is
-visible read-only through MCP (`alertint_list_situations`,
-`alertint_get_situation`) once it has run at least once for a Situation.
-Every authoritative material change commits one
-**immutable Transition** and one version of a **current Episode summary** in
-the same fenced transaction as the state it describes, together with every
-notification intent that change warrants — and the Situation delivery worker
-is the **only** Slack writer in runtime assembly. The Incident-keyed Slack
-card, its resolve edit, and its recurrence replies described in
-[Outbound notification](#8-outbound-notification) below are removed there;
-Slack presents one Situation root plus an immutable ordered journal instead
-(see [Slack](../notifications/slack.md#situation-owned-slack)). The two
-`AlertINT system` installation messages — LLM dependency health and
-Slack-delivery-gap recovery — are the only sanctioned exceptions.
-Before each reconcile cycle derives its Assessment,
-a fenced **evidence-preparation** pass plans and executes a bounded set of
-read-only capability checks — the same seven-capability catalog Phase 1's
-evidence pack draws from (local prior-Situation state, Prometheus, Loki,
-Sentry, Zabbix metric/problem history, change events) — against the
-Situation's own current member set, freezes the plan into a durable cycle
-before any physical request runs (so a crash mid-attempt retries the exact
-same frozen plan rather than minting a new one), and commits each
-capability's normalized result durably before the reconcile cycle reads it.
-Every physical request is bounded per cycle
-(`situations.preparation.max_source_calls_per_cycle`) and per wall clock
-(`situations.preparation.max_wall_seconds`, shared by both the lifecycle and
-assessment phases of one cycle) — see
-[Configuration: `situations`](../getting-started/configuration.md#situations).
-Alongside it, a durable **advisory semantic-profile** worker pool infers a
-bounded, closed-schema interpretation hint (subject/event kind, possible
-role, candidate scope, horizon tier, useful capabilities, uncertainty) for
-each distinct alert-generating source identity it has not already profiled,
-deduplicated so many deliveries sharing one identity create at most one
-inference job. A profile is advisory only: it can widen which capabilities
-get planned or how far back a read looks, but it can never assert that an
-alert is firing or resolved, grant investigative authority, create a
-Sufficient reason, resolve a sibling, or reach Slack directly — the
-[malicious-input case](scope-and-limits.md) this build defends against by
-construction. Profile inference and Situation Assessment share the same L0
-(profile) + L2 (Assessment) provider concurrency limiter
-(`situations.llm_concurrency`) with Assessment always winning a contested
-slot; at most one profile inference runs at a time regardless of
-`situations.semantic_profiles.workers`. An operator can read a profile's
-current head and version history, or submit a confirmed correction, over
-MCP (`alertint_get_semantic_profile`, `alertint_correct_semantic_profile`);
-a correction is append-only (a new immutable version, never an edit) and
-fans out to every matching nonterminal Situation. Unused per-run normalized
-detail (not current source-lifecycle evidence, not referenced by a
-dispatched or committed Assessment, not part of an open cycle) expires 10
-days after its own durable completion time — a fixed, non-configurable
-retention rule that never deletes the Run's own identity, digest, coverage,
-or accounting, and never touches an Alert delivery, Situation history,
-semantic profile, or request accounting.
-
-Source lifecycle folds from real, source-proven evidence, not a single
-receipt clock: each prepared observation carries its own acquisition mode
-(webhook or poll) and, when polling, the connector's own configured
-interval — never an inferred guess from the receipt timestamp alone. A
-webhook recovery gets a fixed recovery grace before the Situation may treat
-it as resolved; a polling recovery's grace is twice its own poll interval
-(clamped to 2–10 minutes), since a poll can only prove a state as current as
-its own last successful cycle. Every member alert also carries its own
-observation deadline — how long a Situation waits past its effective start
-before a still-unobserved member (never firing, never resolved) can no
-longer block closure — derived from the Situation's own duration class, so
-a long-running Situation is never closed out just because one source has
-gone quiet.
-
-Operator expected-until judgments and reusable expected schedules are
-versioned, auditable Situation records controlled through MCP. They can change
-assessment and Slack context, but never source state, investigation work,
-budgets, lifecycle, or recovery.
-Everything in Phase 1 below Correlation — memory, evidence, triage,
-verification — still runs keyed off the Incident, unaffected by which
-Situation an Incident belongs to. There is no `state_controller_mode`,
-shadow-output path, or legacy/new runtime switch: one build runs one
-grouping/dispatch path, and one Slack writer, at a time.
-
-- **MCP tools:** `alertint_list_situations`, `alertint_get_situation`,
-  `alertint_list_situation_transitions`, `alertint_get_delivery_state`,
-  `alertint_list_observation_runs`, `alertint_get_semantic_profile`,
-  `alertint_correct_semantic_profile`, Situation judgment tools, and expected
-  schedule tools — see
-  [MCP clients](../integrations/mcp-clients.md)
-- **Config:** `situations.*`, including `situations.preparation.*` and
-  `situations.semantic_profiles.*` — see
-  [Configuration](../getting-started/configuration.md#situations)
-- **Observability:** every controller cycle, every consumed L2 dispatch
-  slot, every consumed Acute Triage attempt, every evidence-preparation
-  phase call, every capability's own connector dispatch, and every
-  semantic-profile inference dispatch is one OpenTelemetry span
-  (`situation.controller.reconcile`, `situation.assessment.dispatch`,
-  `incident.triage.attempt`, `situation.preparation`,
-  `situation.observation`, `semantic_profile.inference`) carrying only
-  stable identity, digest, count, closed result-class, and duration
-  attributes — Situation/Incident/attempt IDs, input version, material/basis
-  hashes, membership/Incident-input/evidence-pack digests, dispatch slot and
-  attempt number — never a prompt, proposal, provider body, or SQL text. The
-  audit log records the same preparation/profile events by durable ID —
-  cycle begun, inference call dispatched/completed, profile head advanced,
-  profile change delivered, and profile correction applied. Each span site
-  also writes one
-  structured log line with the same identities plus the span's
-  `trace_id`/`span_id`, and the audit log carries the same identities, so
-  the three surfaces can be reconciled against each other and against the
-  store by identity. Spans go through the OpenTelemetry global tracer
-  provider, which is a no-op unless the operator enables the OTLP trace
-  exporter under
-  [`telemetry.otlp`](../getting-started/configuration.md#telemetry) —
-  no telemetry leaves the process by default.
-- **Slack:** one root per published Situation plus an immutable ordered
-  journal, delivered from durable intents with indefinite retry, five-minute
-  Delivery gaps, and complete recovery replay — see
-  [Slack](../notifications/slack.md#situation-owned-slack)
-- **stdout:** one `{"kind":"situation.transition",…}` line per committed
-  Transition, deduplicated by `transition_id`; it means the change is
-  durable, never that Slack has seen it
-- **Not included:** Assessment/Triage artifacts beyond the bounded
-  recent-attempt history, automatic operator questions, and OpenTelemetry
-  metrics or logs export (traces only today)
+For implementation details, see [Situation configuration](../getting-started/configuration.md#situations),
+[MCP tools](../integrations/mcp-clients.md), and
+[Situation-owned Slack](../notifications/slack.md#situation-owned-slack).
 
 ### 4. Memory
 
