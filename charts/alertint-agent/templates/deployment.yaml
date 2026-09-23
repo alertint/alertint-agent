@@ -1,4 +1,10 @@
 {{- include "alertint-agent.validateSecret" . }}
+{{- $customTmpMount := false }}
+{{- range .Values.extraVolumeMounts }}
+  {{- if eq .mountPath "/tmp" }}
+    {{- $customTmpMount = true }}
+  {{- end }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -97,6 +103,10 @@ spec:
               readOnly: true
             - name: data
               mountPath: {{ .Values.persistence.mountPath }}
+            {{- if not $customTmpMount }}
+            - name: runtime-tmp
+              mountPath: /tmp
+            {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -113,6 +123,10 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- if not $customTmpMount }}
+        - name: runtime-tmp
+          emptyDir: {}
+        {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

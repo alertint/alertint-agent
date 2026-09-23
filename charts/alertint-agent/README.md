@@ -88,6 +88,10 @@ notifications, not higher availability. Restart handling
 (`strategy.type: Recreate`) and persistence are built around this
 single-writer assumption.
 
+The chart mounts an ephemeral `/tmp` volume for SQLite temporary work, even
+with the default read-only root filesystem. If you already provide a `/tmp`
+mount through `extraVolumeMounts`, the chart keeps yours instead.
+
 ## Maintainers
 
 | Name | Email | Url |
