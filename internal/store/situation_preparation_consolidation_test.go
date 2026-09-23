@@ -301,15 +301,21 @@ func TestConsolidationProfileWorkQueriesUseIndexes(t *testing.T) {
 	st := newTestStore(t)
 	now := time.Now().UTC()
 	signatureDeliveryFixture(t, st, "query-plan", "service=query-plan", now)
+	second := now.Format("2006-01-02T15:04:05")
+	upperSecond := now.Truncate(time.Second).Add(time.Second).Format("2006-01-02T15:04:05")
 	tests := []struct {
 		name, query, want string
 		args              []any
 	}{
-		{"due", `SELECT id, signature_key, frozen_input_json, frozen_input_digest, expected_head_version, attempt, token
- FROM semantic_profile_inference_jobs WHERE status = 'pending' AND (retry_at IS NULL OR retry_at <= ?)
- ORDER BY created_at ASC, id ASC LIMIT 1`, "SEARCH semantic_profile_inference_jobs USING INDEX", []any{canonicalTime(now)}},
+		{"due", `SELECT id, signature_key, frozen_input_json, frozen_input_digest, expected_head_version, attempt, token, retry_at
+ FROM semantic_profile_inference_jobs WHERE status = 'pending' AND (retry_at IS NULL OR retry_at < ?)
+ AND (COALESCE(error_class,'') != 'budget_deferred' OR retry_at IS NOT NULL)
+ ORDER BY created_at ASC, id ASC`, "SEARCH semantic_profile_inference_jobs USING INDEX", []any{upperSecond}},
 		{"lease", `SELECT id, attempt, attempt_budget, lease_expires_at FROM semantic_profile_inference_jobs
- WHERE status = 'running' AND lease_expires_at <= ? ORDER BY lease_expires_at ASC, id ASC LIMIT 100`, "SEARCH semantic_profile_inference_jobs USING INDEX", []any{canonicalTime(now)}},
+ WHERE status = 'running' AND (lease_expires_at < ? OR
+ (substr(lease_expires_at,1,19) = ? AND
+  substr(replace(substr(lease_expires_at,21),'Z','') || '000000000',1,9) <= ?))
+ ORDER BY lease_expires_at ASC, id ASC LIMIT 100`, "SEARCH semantic_profile_inference_jobs USING INDEX", []any{second, second, fmt.Sprintf("%09d", now.Nanosecond())}},
 		{"outbox", `SELECT id, signature_key, version_id, fan_out_cursor FROM semantic_profile_changes
  WHERE acknowledged = 0 ORDER BY id ASC LIMIT 1`, "semantic_profile_changes_pending_idx", nil},
 		{"followers", `SELECT DISTINCT s.id FROM delivery_semantic_signatures dss
