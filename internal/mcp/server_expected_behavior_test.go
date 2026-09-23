@@ -97,13 +97,13 @@ func TestExpectedBehaviorReadsExposeReviewUsageAndInvalidationHistory(t *testing
 	}
 	if _, err := st.DB().ExecContext(context.Background(), `INSERT INTO situation_judgments
 		(id,situation_id,revision,operation,state,asserted_operator,trust_domain,request_id,request_hash,result_input_version,valid_until,coverage_json,created_at)
-		VALUES (?,?,1,'record','expected','Janis','authenticated_mcp','mcp-read-judgment','hash',?,?,?,?)`,
+		VALUES (?,?,1,'record','expected','default','authenticated_mcp','mcp-read-judgment','hash',?,?,?,?)`,
 		judgmentID, situationID, sit.InputVersion, now.Add(time.Hour).Format(time.RFC3339Nano), `{}`, now.Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.DB().ExecContext(context.Background(), `INSERT INTO expected_behavior_envelope_revisions
 		(id,envelope_id,version,operation,state,policy_json,source_judgment_id,source_situation_id,asserted_operator,trust_domain,request_id,request_hash,expected_previous_version,created_at)
-		VALUES ('revision-expected-read',?,1,'confirm','active',?,?,?,'Janis','authenticated_mcp','mcp-read-confirm','hash',0,?)`,
+		VALUES ('revision-expected-read',?,1,'confirm','active',?,?,?,'default','authenticated_mcp','mcp-read-confirm','hash',0,?)`,
 		envelopeID, string(policyJSON), judgmentID, situationID, now.Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestExpectedBehaviorReadsExposeReviewUsageAndInvalidationHistory(t *testing
 	}
 	if _, err := st.DB().ExecContext(context.Background(), `INSERT INTO expected_behavior_envelope_revisions
 		(id,envelope_id,version,operation,state,policy_json,source_judgment_id,source_situation_id,asserted_operator,trust_domain,request_id,request_hash,expected_previous_version,created_at)
-		VALUES ('revision-expected-read-restored',?,2,'restore','active',?,?,?,'Janis','authenticated_mcp','mcp-read-restore','hash-restore',1,?)`,
+		VALUES ('revision-expected-read-restored',?,2,'restore','active',?,?,?,'default','authenticated_mcp','mcp-read-restore','hash-restore',1,?)`,
 		envelopeID, string(policyJSON), judgmentID, situationID, now.Add(2*time.Minute).Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}

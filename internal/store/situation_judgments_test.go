@@ -64,7 +64,7 @@ func recordJudgmentRequest(sit model.Situation, now time.Time, requestID string)
 	return SituationJudgmentWrite{
 		Operation: model.JudgmentOperationRecord, SituationID: sit.ID,
 		SituationInputVersion: sit.InputVersion, ExpectedJudgmentVersion: 0,
-		RequestID: requestID, AssertedOperator: "Janis", Confirmed: true,
+		RequestID: requestID, AssertedOperator: "default", Confirmed: true,
 		ValidUntil: now.Add(time.Hour), Now: now,
 	}
 }
@@ -142,7 +142,7 @@ func TestSituationJudgmentReplaceRevokeRestoreAndStaleFences(t *testing.T) {
 	}
 
 	stale := SituationJudgmentWrite{Operation: model.JudgmentOperationReplace, SituationID: sitID,
-		SituationInputVersion: sit.InputVersion, ExpectedJudgmentVersion: 1, RequestID: "stale", AssertedOperator: "Janis",
+		SituationInputVersion: sit.InputVersion, ExpectedJudgmentVersion: 1, RequestID: "stale", AssertedOperator: "default",
 		Confirmed: true, ValidUntil: now.Add(2 * time.Hour), Now: now.Add(time.Minute)}
 	if _, err := st.WriteSituationJudgment(context.Background(), auditor, stale); !errors.Is(err, ErrSituationVersionConflict) {
 		t.Fatalf("stale input error = %v", err)
@@ -159,7 +159,7 @@ func TestSituationJudgmentReplaceRevokeRestoreAndStaleFences(t *testing.T) {
 	current, _ = st.GetSituation(context.Background(), sitID)
 	revoke := SituationJudgmentWrite{Operation: model.JudgmentOperationRevoke, SituationID: sitID,
 		SituationInputVersion: current.InputVersion, ExpectedJudgmentVersion: 2, RequestID: "revoke",
-		AssertedOperator: "Janis", Confirmed: true, Now: now.Add(2 * time.Minute)}
+		AssertedOperator: "default", Confirmed: true, Now: now.Add(2 * time.Minute)}
 	third, err := st.WriteSituationJudgment(context.Background(), auditor, revoke)
 	if err != nil || third.Judgment.Revision != 3 || third.Judgment.State != model.JudgmentStateRevoked {
 		t.Fatalf("revoke = %+v, %v", third, err)
@@ -168,7 +168,7 @@ func TestSituationJudgmentReplaceRevokeRestoreAndStaleFences(t *testing.T) {
 	current, _ = st.GetSituation(context.Background(), sitID)
 	restore := SituationJudgmentWrite{Operation: model.JudgmentOperationRestore, SituationID: sitID,
 		SituationInputVersion: current.InputVersion, ExpectedJudgmentVersion: 3, RequestID: "restore",
-		AssertedOperator: "Janis", Confirmed: true, ValidUntil: now.Add(3 * time.Hour), Now: now.Add(3 * time.Minute)}
+		AssertedOperator: "default", Confirmed: true, ValidUntil: now.Add(3 * time.Hour), Now: now.Add(3 * time.Minute)}
 	fourth, err := st.WriteSituationJudgment(context.Background(), auditor, restore)
 	if err != nil || fourth.Judgment.Revision != 4 || fourth.Judgment.State != model.JudgmentStateExpected {
 		t.Fatalf("restore = %+v, %v", fourth, err)
@@ -275,7 +275,7 @@ func TestSituationJudgmentInvalidationCannotSilentlyRevive(t *testing.T) {
 	replace := SituationJudgmentWrite{
 		Operation: model.JudgmentOperationReplace, SituationID: sitID,
 		SituationInputVersion: current.InputVersion, ExpectedJudgmentVersion: 1,
-		RequestID: "monotonic-replace", AssertedOperator: "Janis", Confirmed: true,
+		RequestID: "monotonic-replace", AssertedOperator: "default", Confirmed: true,
 		ValidUntil: now.Add(2 * time.Hour), Now: now.Add(2 * time.Minute),
 	}
 	if _, err := st.WriteSituationJudgment(context.Background(), auditor, replace); err != nil {

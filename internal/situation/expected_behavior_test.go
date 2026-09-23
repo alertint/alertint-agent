@@ -11,7 +11,7 @@ import (
 
 func evaluatorHead(id string) model.ExpectedBehaviorHead {
 	return model.ExpectedBehaviorHead{
-		EnvelopeID: id, Version: 1, State: model.ExpectedBehaviorStateActive, AssertedOperator: "Janis",
+		EnvelopeID: id, Version: 1, State: model.ExpectedBehaviorStateActive, AssertedOperator: "default",
 		Policy: &model.ExpectedBehaviorPolicy{
 			Scope: model.ExpectedBehaviorScope{GroupKey: "host=db-01", Source: "zabbix", SourceInstanceID: "prod-zbx", Host: "db-01", PrimaryTriggerID: "100", PrimaryTriggerVersion: "v1"},
 			Conditions: model.ExpectedBehaviorConditions{

@@ -15,12 +15,12 @@ func TestExpectedBehaviorRootRetainsFindingOrderAndAddsCompactContext(t *testing
 	b.Work.Phase = model.WorkPhaseSettled
 	b.Analyses = []model.IncidentAnalysis{{Title: "Reconciliation job is driving CPU load", Findings: []string{"CPU load remains elevated on db-prod-1."}, Verification: "supported"}}
 	boundary := bcNow(t).Add(time.Hour)
-	b.ExpectedBehavior = &model.ExpectedBehaviorProjection{EnvelopeID: "env-1", Version: 1, AssertedOperator: "Janis", Disposition: model.ExpectedBehaviorDispositionMatched, Boundary: &boundary}
+	b.ExpectedBehavior = &model.ExpectedBehaviorProjection{EnvelopeID: "env-1", Version: 1, AssertedOperator: "default", Disposition: model.ExpectedBehaviorDispositionMatched, Boundary: &boundary}
 	msg, err := RenderSituationRoot(bcRoot(t, model.LifecycleActive, model.AttentionInvestigate, bcObserveMonitorContract(bcNow(t)), b))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "*Operator:* Expected schedule applies until " + SlackDateToken(boundary, "{time}") + " · Janis"
+	want := "*Operator:* Expected schedule applies until " + SlackDateToken(boundary, "{time}") + " · default"
 	if !strings.Contains(msg.Text, want) {
 		t.Fatalf("root missing %q:\n%s", want, msg.Text)
 	}
@@ -33,9 +33,9 @@ func TestExpectedBehaviorStoppedReasonsAndWithdrawalUseSimpleText(t *testing.T) 
 	tr := bcJournal(t, bcObserveMonitorContract(bcNow(t)), canonicalFixture(t), nil)
 	tr.Actor = model.ActorAttributedOperator
 	tr.Journal.ExpectedBehaviorChange = model.ExpectedBehaviorChangeWithdrawn
-	tr.Journal.AttributedActor = "Janis"
+	tr.Journal.AttributedActor = "default"
 	msg, err := RenderSituationJournal(tr)
-	if err != nil || msg.Text != "*Expected schedule · Removed*\n*Operator:* Janis\n*AlertINT:* Normal assessment resumes." {
+	if err != nil || msg.Text != "*Expected schedule · Removed*\n*Operator:* default\n*AlertINT:* Normal assessment resumes." {
 		t.Fatalf("withdrawal=%q err=%v", msg.Text, err)
 	}
 	boundary := bcNow(t).Add(time.Hour)
@@ -43,7 +43,7 @@ func TestExpectedBehaviorStoppedReasonsAndWithdrawalUseSimpleText(t *testing.T) 
 	tr.Journal.ExpectedBehaviorBoundary = &boundary
 	tr.Projection.Briefing.ExpectedBehavior = &model.ExpectedBehaviorProjection{Workload: "nightly_reconciliation"}
 	msg, err = RenderSituationJournal(tr)
-	wantApplied := "*Expected schedule · Applies*\n*Why:* Current condition matches the schedule for nightly reconciliation.\n*Until:* " + SlackDateToken(boundary, "{time}") + " · *Operator:* Janis\n*AlertINT:* Monitoring continues."
+	wantApplied := "*Expected schedule · Applies*\n*Why:* Current condition matches the schedule for nightly reconciliation.\n*Until:* " + SlackDateToken(boundary, "{time}") + " · *Operator:* default\n*AlertINT:* Monitoring continues."
 	if err != nil || msg.Text != wantApplied {
 		t.Fatalf("applied=%q want=%q err=%v", msg.Text, wantApplied, err)
 	}
@@ -73,7 +73,7 @@ func TestExpectedBehaviorStoppedReasonsAndWithdrawalUseSimpleText(t *testing.T) 
 		t.Fatal(msg.Text)
 	}
 	tr.Journal.ExpectedBehaviorChange = model.ExpectedBehaviorChangeUpdated
-	tr.Journal.AttributedActor = "Janis"
+	tr.Journal.AttributedActor = "default"
 	msg, _ = RenderSituationJournal(tr)
 	if !strings.Contains(msg.Text, "*Expected schedule · Updated*") || !strings.Contains(msg.Text, "*New end:* "+SlackDateToken(boundary, "{time}")) {
 		t.Fatalf("updated = %q", msg.Text)

@@ -399,7 +399,7 @@ func TestSituationDelivererRootSyncRejectsRetiredExpectedAuthority(t *testing.T)
 	deadline := now.Add(time.Hour)
 	contract := sdRunningTriageContract(deadline)
 	briefing := &model.OperatorBriefing{Scope: "db-prod-1", Work: model.WorkProjection{Phase: model.WorkPhaseSettled}}
-	briefing.ExpectedJudgment = &model.ExpectedJudgmentProjection{Revision: 4, AssertedOperator: "Janis", ValidUntil: deadline}
+	briefing.ExpectedJudgment = &model.ExpectedJudgmentProjection{Revision: 4, AssertedOperator: "default", ValidUntil: deadline}
 	tr := sdTransition(4, model.LifecycleActive, contract, model.ReasonOperatorContractChanged,
 		model.JournalOperatorContractChanged, model.JournalData{Headline: "Expected", OccurredAt: started},
 		model.ProjectionFacts{Briefing: briefing, EffectiveStartedAt: started, EffectiveStartedAtBasis: model.SourceTimeBasisSourcePayload}, now)
@@ -430,7 +430,7 @@ func TestSituationDelivererRootSyncRejectsExpiredExpectedSchedule(t *testing.T) 
 	contract := sdRunningTriageContract(deadline)
 	boundary := now.Add(-time.Minute)
 	briefing := &model.OperatorBriefing{Scope: "db-prod-1", Work: model.WorkProjection{Phase: model.WorkPhaseSettled},
-		ExpectedBehavior: &model.ExpectedBehaviorProjection{EnvelopeID: "env-1", Version: 2, AssertedOperator: "Janis", Disposition: model.ExpectedBehaviorDispositionMatched, Boundary: &boundary}}
+		ExpectedBehavior: &model.ExpectedBehaviorProjection{EnvelopeID: "env-1", Version: 2, AssertedOperator: "default", Disposition: model.ExpectedBehaviorDispositionMatched, Boundary: &boundary}}
 	tr := sdTransition(5, model.LifecycleActive, contract, model.ReasonOperatorContractChanged,
 		model.JournalOperatorContractChanged, model.JournalData{Headline: "Expected schedule", OccurredAt: started},
 		model.ProjectionFacts{Briefing: briefing, EffectiveStartedAt: started, EffectiveStartedAtBasis: model.SourceTimeBasisSourcePayload}, now)
@@ -493,10 +493,10 @@ func TestSituationDelivererDelayedExpectedThreadMarksDecisionInactive(t *testing
 	occurred := sdMustTime(t, "2026-09-05T09:15:00Z")
 	now := occurred.Add(time.Hour)
 	until := occurred.Add(30 * time.Minute)
-	briefing := &model.OperatorBriefing{Scope: "db-prod-1", ExpectedJudgment: &model.ExpectedJudgmentProjection{Revision: 1, AssertedOperator: "Janis", ValidUntil: until}}
+	briefing := &model.OperatorBriefing{Scope: "db-prod-1", ExpectedJudgment: &model.ExpectedJudgmentProjection{Revision: 1, AssertedOperator: "default", ValidUntil: until}}
 	tr := sdTransition(5, model.LifecycleActive, sdRunningTriageContract(now.Add(time.Hour)),
 		model.ReasonOperatorContractChanged, model.JournalOperatorContractChanged,
-		model.JournalData{Headline: "Expected", AttributedActor: "Janis", JudgmentChange: model.JudgmentChangeRecorded, JudgmentValidUntil: &until, OccurredAt: occurred},
+		model.JournalData{Headline: "Expected", AttributedActor: "default", JudgmentChange: model.JudgmentChangeRecorded, JudgmentValidUntil: &until, OccurredAt: occurred},
 		model.ProjectionFacts{Briefing: briefing, EffectiveStartedAt: occurred, EffectiveStartedAtBasis: model.SourceTimeBasisSourcePayload}, occurred)
 	fs := &fakeDelivererStore{
 		transitions: map[string]model.Transition{tr.ID: tr}, rootOK: true, rootChannel: "C-existing", rootTS: "50.5",

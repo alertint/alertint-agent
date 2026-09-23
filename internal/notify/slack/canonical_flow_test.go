@@ -31,13 +31,13 @@ func TestCanonicalRootShowsExpectedJudgmentAfterFinding(t *testing.T) {
 	b.Work.Phase = model.WorkPhaseSettled
 	b.Analyses = []model.IncidentAnalysis{{Title: "Reconciliation job is driving CPU load", Summary: "Sustained CPU load on db-prod-1.", Findings: []string{"CPU load remains elevated on db-prod-1."}, Verification: "supported"}}
 	until := bcNow(t).Add(time.Hour)
-	b.ExpectedJudgment = &model.ExpectedJudgmentProjection{Revision: 2, AssertedOperator: "Janis", ValidUntil: until}
+	b.ExpectedJudgment = &model.ExpectedJudgmentProjection{Revision: 2, AssertedOperator: "default", ValidUntil: until}
 	in := bcRoot(t, model.LifecycleActive, model.AttentionInvestigate, bcObserveMonitorContract(bcNow(t)), b)
 	msg, err := RenderSituationRoot(in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "*Operator:* Expected until " + SlackDateToken(until, "{time}") + " · Janis"
+	want := "*Operator:* Expected until " + SlackDateToken(until, "{time}") + " · default"
 	if !strings.Contains(msg.Text, want) {
 		t.Fatalf("root missing %q:\n%s", want, msg.Text)
 	}
@@ -55,13 +55,13 @@ func TestExpectedJudgmentThreadTransitionsAreAttributedAndTruthful(t *testing.T)
 	until := bcNow(t).Add(time.Hour)
 	tr := bcJournal(t, bcObserveMonitorContract(bcNow(t)), b, nil)
 	tr.Journal.JudgmentChange = model.JudgmentChangeRecorded
-	tr.Journal.AttributedActor = "Janis"
+	tr.Journal.AttributedActor = "default"
 	tr.Journal.JudgmentValidUntil = &until
 	msg, err := RenderSituationJournal(tr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "*Expected until · Recorded*\n*Until:* " + SlackDateToken(until, "{time}") + " · *Operator:* Janis\n*AlertINT:* Monitoring continues."
+	want := "*Expected until · Recorded*\n*Until:* " + SlackDateToken(until, "{time}") + " · *Operator:* default\n*AlertINT:* Monitoring continues."
 	if !strings.Contains(msg.Text, want) {
 		t.Fatalf("thread = %q, want %q", msg.Text, want)
 	}
@@ -69,8 +69,8 @@ func TestExpectedJudgmentThreadTransitionsAreAttributedAndTruthful(t *testing.T)
 		change model.JudgmentChange
 		want   string
 	}{
-		{model.JudgmentChangeReplaced, "*Expected until · Updated*\n*New end:* " + SlackDateToken(until, "{time}") + " · *Operator:* Janis\n*AlertINT:* Monitoring continues."},
-		{model.JudgmentChangeRestored, "*Expected until · Restored*\n*Until:* " + SlackDateToken(until, "{time}") + " · *Operator:* Janis\n*AlertINT:* Monitoring continues."},
+		{model.JudgmentChangeReplaced, "*Expected until · Updated*\n*New end:* " + SlackDateToken(until, "{time}") + " · *Operator:* default\n*AlertINT:* Monitoring continues."},
+		{model.JudgmentChangeRestored, "*Expected until · Restored*\n*Until:* " + SlackDateToken(until, "{time}") + " · *Operator:* default\n*AlertINT:* Monitoring continues."},
 	} {
 		tr.Journal.JudgmentChange = tc.change
 		msg, err = RenderSituationJournal(tr)
@@ -85,7 +85,7 @@ func TestExpectedJudgmentThreadTransitionsAreAttributedAndTruthful(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(msg.Text, "*Expected until · Removed*\n*Operator:* Janis\n*AlertINT:* Normal assessment resumes.") {
+	if !strings.Contains(msg.Text, "*Expected until · Removed*\n*Operator:* default\n*AlertINT:* Normal assessment resumes.") {
 		t.Fatal(msg.Text)
 	}
 

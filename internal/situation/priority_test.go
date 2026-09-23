@@ -344,14 +344,14 @@ func TestSelectPokeKeepsConcurrentUrgentTransitionAheadOfJudgmentJournal(t *test
 	change := hsNext(t)
 	until := change.Now.Add(2 * time.Hour)
 	change.PriorTransition.Projection.Briefing = &model.OperatorBriefing{ExpectedJudgment: &model.ExpectedJudgmentProjection{
-		Revision: 1, AssertedOperator: "Janis", ValidUntil: until,
+		Revision: 1, AssertedOperator: "default", ValidUntil: until,
 	}}
 	change.Projection.Briefing = nil
 	change.Situation.Attention = model.AttentionUrgent
 	change.Assessment.Attention = model.AttentionUrgent
 	change.Judgment = &model.SituationJudgment{
 		Revision: 1, Operation: model.JudgmentOperationRecord,
-		AssertedOperator: "Janis", ValidUntil: until,
+		AssertedOperator: "default", ValidUntil: until,
 	}
 	change.JudgmentApplicabilityReason = model.JudgmentSeverityChanged
 

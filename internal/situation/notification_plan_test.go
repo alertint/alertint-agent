@@ -148,7 +148,7 @@ func TestPlanNotificationIntentsExpectedBehaviorChangeGetsThreadReply(t *testing
 	trs[0].Reason = model.ReasonOperatorContractChanged
 	trs[0].JournalKind = model.JournalOperatorContractChanged
 	trs[0].Journal.ExpectedBehaviorChange = model.ExpectedBehaviorChangeApplied
-	trs[0].Journal.AttributedActor = "Janis"
+	trs[0].Journal.AttributedActor = "default"
 	trs[0].Projection.Briefing = &model.OperatorBriefing{}
 
 	replies := hsReplyIntents(hsPlan(t, hsPub(c, trs, sum)))
