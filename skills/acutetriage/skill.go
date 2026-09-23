@@ -1233,7 +1233,7 @@ func (s *Skill) auditVerificationPlanned(ctx context.Context, inc store.Incident
 	if s.auditor == nil {
 		return
 	}
-	plan := make([]VerificationQuery, 0)
+	plan := make([]VerificationQuery, 0) //nolint:prealloc // Summing slice lengths can overflow; append grows safely.
 	plan = append(plan, floor...)
 	plan = append(plan, operatorQ...)
 	plan = append(plan, modelQ...)
