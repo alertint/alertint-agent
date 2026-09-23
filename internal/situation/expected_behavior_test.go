@@ -81,6 +81,45 @@ func TestEvaluateExpectedBehaviorsUnknownBeatsAllViolated(t *testing.T) {
 	}
 }
 
+func TestExpectedBehaviorExplanationUsesLatestNotApplicableSchedule(t *testing.T) {
+	old := evaluatorHead("env-a")
+	old.UpdatedAt = time.Date(2026, 9, 22, 19, 0, 0, 0, time.UTC)
+	old.InvalidatedAt = &old.UpdatedAt
+	newer := evaluatorHead("env-b")
+	newer.UpdatedAt = old.UpdatedAt.Add(time.Hour)
+	newer.State = model.ExpectedBehaviorStateRevoked
+	newer.Policy = nil
+	for _, tc := range []struct {
+		name string
+		head model.ExpectedBehaviorHead
+		want model.ExpectedBehaviorReason
+	}{
+		{name: "withdrawn", head: newer, want: model.ExpectedBehaviorReasonRevoked},
+		{name: "active but out of scope", head: func() model.ExpectedBehaviorHead {
+			head := newer
+			head.State = model.ExpectedBehaviorStateActive
+			head.Policy = evaluatorHead("env-b").Policy
+			head.Policy.Scope.Host = "other-host"
+			return head
+		}(), want: model.ExpectedBehaviorReasonScopeMismatch},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := evaluatorInput(old, tc.head)
+			got := EvaluateExpectedBehaviors(in)
+			if got.Disposition != model.ExpectedBehaviorDispositionNotApplicable || got.Reason != tc.want {
+				t.Fatalf("evaluation = %+v, want %s", got, tc.want)
+			}
+			if got.Candidates[0].EnvelopeID != "env-a" || got.Candidates[1].EnvelopeID != "env-b" {
+				t.Fatalf("candidate order changed: %+v", got.Candidates)
+			}
+			briefing := CommittedOperatorBriefing(SnapshotInput{ExpectedBehaviorHeads: in.Heads}, ControllerCommit{ExpectedBehaviorEvaluation: &got})
+			if briefing.ExpectedBehavior == nil || briefing.ExpectedBehavior.EnvelopeID != "env-b" || briefing.ExpectedBehavior.Reason != tc.want {
+				t.Fatalf("operator explanation = %+v, want env-b/%s", briefing.ExpectedBehavior, tc.want)
+			}
+		})
+	}
+}
+
 func TestEvaluateExpectedBehaviorsRequiredForbiddenAndUnexpected(t *testing.T) {
 	head := evaluatorHead("env-a")
 	head.Policy.Conditions.RequiredCompanions = []model.ExpectedBehaviorBinding{{Role: "lag", Source: "zabbix", SourceInstanceID: "prod-zbx", Host: "db-01", TriggerID: "200", TriggerVersion: "v1"}}

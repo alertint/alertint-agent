@@ -93,10 +93,32 @@ func EvaluateExpectedBehaviors(in ExpectedBehaviorInput) model.ExpectedBehaviorE
 		}
 	}
 	if len(evaluation.Candidates) > 0 {
-		evaluation.Reason = evaluation.Candidates[0].Reason
+		evaluation.Reason = latestNotApplicableCandidate(evaluation.Candidates, heads).Reason
 	}
 	evaluation.BasisHash = expectedBehaviorBasisHash(evaluation)
 	return evaluation
+}
+
+// When no schedule can apply, explain the most recent schedule change. The
+// candidate order remains stable for evaluation and persisted evidence.
+func latestNotApplicableCandidate(candidates []model.ExpectedBehaviorCandidate, heads []model.ExpectedBehaviorHead) model.ExpectedBehaviorCandidate {
+	selected := candidates[0]
+	updated := time.Time{}
+	for _, head := range heads {
+		if head.EnvelopeID == selected.EnvelopeID {
+			updated = head.UpdatedAt
+			break
+		}
+	}
+	for _, candidate := range candidates[1:] {
+		for _, head := range heads {
+			if head.EnvelopeID == candidate.EnvelopeID && head.UpdatedAt.After(updated) {
+				selected, updated = candidate, head.UpdatedAt
+				break
+			}
+		}
+	}
+	return selected
 }
 
 func evaluateExpectedBehaviorCandidate(in ExpectedBehaviorInput, head model.ExpectedBehaviorHead) model.ExpectedBehaviorCandidate { //nolint:gocyclo // ordered safety gates intentionally remain visible in one pure evaluator.

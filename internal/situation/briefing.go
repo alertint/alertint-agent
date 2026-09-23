@@ -298,7 +298,9 @@ func CommittedOperatorBriefing(in SnapshotInput, commit ControllerCommit) *model
 	}
 	if evaluation := commit.ExpectedBehaviorEvaluation; evaluation != nil && len(evaluation.Candidates) > 0 { //nolint:nestif // aggregate precedence and chosen-candidate projection stay together.
 		candidate := evaluation.Candidates[0]
-		if evaluation.ChosenEnvelopeID != "" {
+		if evaluation.Disposition == model.ExpectedBehaviorDispositionNotApplicable {
+			candidate = latestNotApplicableCandidate(evaluation.Candidates, in.ExpectedBehaviorHeads)
+		} else if evaluation.ChosenEnvelopeID != "" {
 			for _, current := range evaluation.Candidates {
 				if current.EnvelopeID == evaluation.ChosenEnvelopeID {
 					candidate = current
