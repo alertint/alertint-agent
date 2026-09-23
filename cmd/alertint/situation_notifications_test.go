@@ -508,7 +508,7 @@ func TestSituationDelivererDelayedExpectedThreadMarksDecisionInactive(t *testing
 	if _, err := d.Deliver(context.Background(), sdThreadIntent(model.EffectThreadAppend, tr.ID, tr.Sequence, now)); err != nil {
 		t.Fatal(err)
 	}
-	if len(api.posts) != 1 || !strings.Contains(api.posts[0].Text, "This decision is no longer active.") {
+	if len(api.posts) != 1 || !strings.Contains(api.posts[0].Text, "*Current status:* This decision no longer applies; check the Situation.") {
 		t.Fatalf("delayed thread = %#v", api.posts)
 	}
 }
@@ -1195,5 +1195,10 @@ func TestSituationDelivererAnnotationDoesNotInvalidateUnchangedHandoff(t *testin
 	}
 	if got.DeliveredAs != "broadcast" {
 		t.Fatalf("annotation with identical Attention/lifecycle/operator action suppressed a still-current handoff: delivered_as=%s", got.DeliveredAs)
+	}
+	if len(api.posts) != 1 || !strings.Contains(api.posts[0].Text, "Update in existing Situation thread") ||
+		strings.Contains(api.posts[0].Text, "Open the thread") ||
+		!strings.Contains(api.posts[0].Text, "*Action now:* Investigate this Situation.") {
+		t.Fatalf("broadcast handoff should be a compact thread update: %+v", api.posts)
 	}
 }

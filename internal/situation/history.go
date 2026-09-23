@@ -693,6 +693,14 @@ func expectedBehaviorJournal(change AuthoritativeChange) (model.JournalData, mod
 	if change.Projection.Briefing != nil {
 		current = change.Projection.Briefing.ExpectedBehavior
 	}
+	// A schedule that was not applying to this Situation cannot "stop"
+	// applying merely because its unavailable/invalidated reason changed.
+	// Keep those reasons in the durable evaluation and MCP history without
+	// spending a Slack reply. An operator removal remains visible.
+	if prior != nil && prior.Disposition != model.ExpectedBehaviorDispositionMatched &&
+		(current == nil || (current.Disposition != model.ExpectedBehaviorDispositionMatched && current.Reason != model.ExpectedBehaviorReasonRevoked)) {
+		return model.JournalData{}, "", false
+	}
 	j := model.JournalData{OccurredAt: change.Now, ActionStatus: contractActionStatus(change.Assessment.ActionContract)}
 	actor := model.ActorDeterministicController
 	if current != nil {

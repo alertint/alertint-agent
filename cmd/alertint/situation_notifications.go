@@ -504,6 +504,9 @@ func (d *SituationDeliverer) deliverBroadcastHandoff(ctx context.Context, intent
 		reply.Transition.Journal.NoLongerCurrent = true
 	}
 	rendered, err := slack.RenderSituationReply(reply)
+	if current {
+		rendered, err = slack.RenderSituationHandoff(reply)
+	}
 	if err != nil {
 		return situation.NotificationDelivery{}, invalidDelivery("render_failed",
 			fmt.Errorf("cmd/alertint: situation deliverer: render journal: %w", err))

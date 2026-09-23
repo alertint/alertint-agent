@@ -35,20 +35,21 @@ func TestExpectedBehaviorStoppedReasonsAndWithdrawalUseSimpleText(t *testing.T) 
 	tr.Journal.ExpectedBehaviorChange = model.ExpectedBehaviorChangeWithdrawn
 	tr.Journal.AttributedActor = "Janis"
 	msg, err := RenderSituationJournal(tr)
-	if err != nil || msg.Text != "Janis removed the expected schedule. Normal assessment resumes." {
+	if err != nil || msg.Text != "*Expected schedule · Removed*\n*Operator:* Janis\n*AlertINT:* Normal assessment resumes." {
 		t.Fatalf("withdrawal=%q err=%v", msg.Text, err)
 	}
 	boundary := bcNow(t).Add(time.Hour)
 	tr.Journal.ExpectedBehaviorChange = model.ExpectedBehaviorChangeApplied
 	tr.Journal.ExpectedBehaviorBoundary = &boundary
+	tr.Projection.Briefing.ExpectedBehavior = &model.ExpectedBehaviorProjection{Workload: "nightly_reconciliation"}
 	msg, err = RenderSituationJournal(tr)
-	wantApplied := "This condition matches Janis's expected schedule until " + SlackDateToken(boundary, "{time}") + ". Monitoring continues."
+	wantApplied := "*Expected schedule · Applies*\n*Why:* Current condition matches the schedule for nightly reconciliation.\n*Until:* " + SlackDateToken(boundary, "{time}") + " · *Operator:* Janis\n*AlertINT:* Monitoring continues."
 	if err != nil || msg.Text != wantApplied {
 		t.Fatalf("applied=%q want=%q err=%v", msg.Text, wantApplied, err)
 	}
 	tr.Journal.NoLongerCurrent = true
 	msg, err = RenderSituationJournal(tr)
-	if err != nil || !strings.Contains(msg.Text, "This schedule is no longer active.") {
+	if err != nil || !strings.Contains(msg.Text, "*Current status:* This schedule no longer applies; check the Situation.") {
 		t.Fatalf("stale applied=%q err=%v", msg.Text, err)
 	}
 	tr.Actor = model.ActorDeterministicController
@@ -58,17 +59,28 @@ func TestExpectedBehaviorStoppedReasonsAndWithdrawalUseSimpleText(t *testing.T) 
 	tr.Journal.ExpectedBehaviorReason = model.ExpectedBehaviorReasonPrimaryDefinitionChanged
 	tr.Journal.Detail = "The Zabbix rule changed."
 	msg, err = RenderSituationJournal(tr)
-	if err != nil || msg.Text != "The expected schedule no longer applies because the Zabbix rule changed. Normal assessment resumes." {
+	if err != nil || msg.Text != "*Expected schedule · No longer applies*\n*Why:* The Zabbix rule changed.\n*AlertINT:* Normal assessment resumes." {
 		t.Fatalf("stopped=%q err=%v", msg.Text, err)
 	}
 	tr.Journal.Detail = "AlertINT cannot verify the Zabbix rule."
 	msg, _ = RenderSituationJournal(tr)
-	if !strings.Contains(msg.Text, "because AlertINT cannot verify the Zabbix rule") {
+	if !strings.Contains(msg.Text, "*Why:* AlertINT cannot verify the Zabbix rule.") {
 		t.Fatal(msg.Text)
 	}
 	tr.Journal.Detail = "An unexpected alert is firing."
 	msg, _ = RenderSituationJournal(tr)
-	if !strings.Contains(msg.Text, "because an unexpected alert is firing") {
+	if !strings.Contains(msg.Text, "*Why:* An unexpected alert is firing.") {
 		t.Fatal(msg.Text)
+	}
+	tr.Journal.ExpectedBehaviorChange = model.ExpectedBehaviorChangeUpdated
+	tr.Journal.AttributedActor = "Janis"
+	msg, _ = RenderSituationJournal(tr)
+	if !strings.Contains(msg.Text, "*Expected schedule · Updated*") || !strings.Contains(msg.Text, "*New end:* "+SlackDateToken(boundary, "{time}")) {
+		t.Fatalf("updated = %q", msg.Text)
+	}
+	tr.Journal.ExpectedBehaviorChange = model.ExpectedBehaviorChangeRestored
+	msg, _ = RenderSituationJournal(tr)
+	if !strings.Contains(msg.Text, "*Expected schedule · Applies again*") || !strings.Contains(msg.Text, "*Why:* Current condition matches the schedule again.") {
+		t.Fatalf("restored = %q", msg.Text)
 	}
 }

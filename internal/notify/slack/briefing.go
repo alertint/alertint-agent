@@ -464,6 +464,41 @@ func RenderSituationReply(in SituationReplyInput) (RenderedMessage, error) {
 	return renderJournalEntryKind(in.Transition, in.ExecutionSuperseded, string(in.ReplyKind))
 }
 
+// RenderSituationHandoff is the short channel copy of a reply broadcast.
+// The complete Finding and timeline stay under the existing root.
+func RenderSituationHandoff(in SituationReplyInput) (RenderedMessage, error) {
+	if _, err := RenderSituationReply(in); err != nil {
+		return RenderedMessage{}, err
+	}
+	t := in.Transition
+	heading := "↪ *Update in existing Situation thread*"
+	if b := t.Projection.Briefing; b != nil {
+		if scope := briefingScope(b); scope != "" {
+			heading += " · " + scope
+		}
+	}
+	why := "Operator attention is needed."
+	if d := t.Projection.OperatorDelta; d != nil {
+		if n := len(d.NewFiringAlerts); n > 0 {
+			why = fmt.Sprintf("New alerts: %d", n)
+			if d.AttentionIncreased {
+				why += " (urgency)"
+			}
+			why += "."
+		} else if d.AttentionIncreased {
+			why = "Urgency increased."
+		}
+	}
+	lines := []string{heading, "*Why:* " + why}
+	if action := t.ActionContract.OperatorActionRequired; action != nil {
+		lines = append(lines, "*Action now:* "+sentenceAction(*action))
+	} else {
+		lines = append(lines, "*AlertINT:* Assessing the changed condition.")
+	}
+	text := strings.Join(lines, "\n")
+	return RenderedMessage{Text: text, Blocks: []slacklib.Block{sectionBlock(text), contextBlock(SlackDateToken(t.Journal.OccurredAt, "{date_short} {time}"))}}, nil
+}
+
 // briefingJournal renders one reply from its Transition alone, exactly as
 // that Transition recorded itself. Production reaches the body through
 // renderJournalEntry; this name survives for the renderer tests that read

@@ -472,90 +472,127 @@ func renderJournalEntryKind(t model.Transition, executionSuperseded bool, replyK
 
 func renderExpectedBehaviorJournal(t model.Transition) RenderedMessage {
 	actor := briefingText(t.Journal.AttributedActor, 120)
-	var text string
+	var lines []string
 	switch t.Journal.ExpectedBehaviorChange {
-	case model.ExpectedBehaviorChangeApplied, model.ExpectedBehaviorChangeUpdated, model.ExpectedBehaviorChangeRestored:
-		owner := "an operator's"
-		if actor != "" {
-			owner = actor + "'s"
+	case model.ExpectedBehaviorChangeApplied:
+		lines = append(lines, "*Expected schedule · Applies*")
+		why := "Current condition matches the confirmed schedule."
+		if t.Projection.Briefing != nil && t.Projection.Briefing.ExpectedBehavior != nil {
+			if workload := briefingText(strings.ReplaceAll(t.Projection.Briefing.ExpectedBehavior.Workload, "_", " "), 120); workload != "" {
+				why = "Current condition matches the schedule for " + workload + "."
+			}
 		}
-		text = "This condition matches " + owner + " expected schedule"
-		if t.Journal.ExpectedBehaviorBoundary != nil {
-			text += " until " + SlackDateToken(*t.Journal.ExpectedBehaviorBoundary, "{time}")
+		lines = append(lines, "*Why:* "+why)
+		lines = append(lines, expectedScheduleEndLine(t.Journal.ExpectedBehaviorBoundary, actor, false))
+		lines = append(lines, "*AlertINT:* Monitoring continues.")
+	case model.ExpectedBehaviorChangeUpdated:
+		lines = append(lines, "*Expected schedule · Updated*")
+		if t.Projection.Briefing != nil && t.Projection.Briefing.ExpectedBehavior != nil {
+			if workload := briefingText(strings.ReplaceAll(t.Projection.Briefing.ExpectedBehavior.Workload, "_", " "), 120); workload != "" {
+				lines = append(lines, "*For:* "+workload)
+			}
 		}
-		text += ". Monitoring continues."
+		lines = append(lines, expectedScheduleEndLine(t.Journal.ExpectedBehaviorBoundary, actor, true))
+		lines = append(lines, "*AlertINT:* Monitoring continues.")
+	case model.ExpectedBehaviorChangeRestored:
+		lines = append(lines, "*Expected schedule · Applies again*", "*Why:* Current condition matches the schedule again.")
+		lines = append(lines, expectedScheduleEndLine(t.Journal.ExpectedBehaviorBoundary, actor, false))
+		lines = append(lines, "*AlertINT:* Monitoring continues.")
 	case model.ExpectedBehaviorChangeWithdrawn:
-		if actor == "" {
-			text = "The expected schedule was removed. Normal assessment resumes."
-		} else {
-			text = actor + " removed the expected schedule. Normal assessment resumes."
+		lines = append(lines, "*Expected schedule · Removed*")
+		if actor != "" {
+			lines = append(lines, "*Operator:* "+actor)
 		}
+		lines = append(lines, "*AlertINT:* Normal assessment resumes.")
 	case model.ExpectedBehaviorChangeStopped:
 		reason := strings.TrimSpace(t.Journal.Detail)
 		if reason == "" {
 			reason = "The current condition no longer matches the schedule."
 		}
-		reason = strings.TrimSuffix(reason, ".")
-		switch {
-		case strings.HasPrefix(reason, "The "):
-			reason = "the " + strings.TrimPrefix(reason, "The ")
-		case strings.HasPrefix(reason, "A "):
-			reason = "a " + strings.TrimPrefix(reason, "A ")
-		case strings.HasPrefix(reason, "An "):
-			reason = "an " + strings.TrimPrefix(reason, "An ")
+		if !strings.HasSuffix(reason, ".") {
+			reason += "."
 		}
-		text = "The expected schedule no longer applies because " + reason + ". Normal assessment resumes."
+		lines = append(lines, "*Expected schedule · No longer applies*", "*Why:* "+reason, "*AlertINT:* Normal assessment resumes.")
 	default:
-		text = "The expected schedule changed."
+		lines = append(lines, "*Expected schedule · Changed*")
+	}
+	if action := t.ActionContract.OperatorActionRequired; action != nil && !t.Journal.NoLongerCurrent {
+		lines = append(lines, "*Action:* "+sentenceAction(*action))
 	}
 	if t.Journal.NoLongerCurrent {
-		text += " This schedule is no longer active."
+		lines = append(lines, "*Current status:* This schedule no longer applies; check the Situation.")
 	}
+	text := strings.Join(lines, "\n")
 	return RenderedMessage{Text: text, Blocks: []slacklib.Block{sectionBlock(text), contextBlock(SlackDateToken(t.Journal.OccurredAt, "{date_short} {time}"))}}
+}
+
+func expectedScheduleEndLine(boundary *time.Time, actor string, updated bool) string {
+	label := "*Until:* "
+	if updated {
+		label = "*New end:* "
+	}
+	if boundary == nil {
+		label += "time unavailable"
+	} else {
+		label += SlackDateToken(*boundary, "{time}")
+	}
+	if actor != "" {
+		label += " · *Operator:* " + actor
+	}
+	return label
 }
 
 func renderExpectedJudgmentJournal(t model.Transition) RenderedMessage {
 	actor := briefingText(t.Journal.AttributedActor, 120)
-	var text string
+	var lines []string
 	switch t.Journal.JudgmentChange {
 	case model.JudgmentChangeRecorded:
-		text = actor + " marked the current condition as expected until " + SlackDateToken(*t.Journal.JudgmentValidUntil, "{time}") + ". Monitoring continues."
+		lines = append(lines, "*Expected until · Recorded*", expectedScheduleEndLine(t.Journal.JudgmentValidUntil, actor, false), "*AlertINT:* Monitoring continues.")
 	case model.JudgmentChangeReplaced:
-		text = actor + " updated the expected condition until " + SlackDateToken(*t.Journal.JudgmentValidUntil, "{time}") + ". Monitoring continues."
+		lines = append(lines, "*Expected until · Updated*", expectedScheduleEndLine(t.Journal.JudgmentValidUntil, actor, true), "*AlertINT:* Monitoring continues.")
 	case model.JudgmentChangeRestored:
-		text = actor + " marked the current condition as expected again until " + SlackDateToken(*t.Journal.JudgmentValidUntil, "{time}") + ". Monitoring continues."
+		lines = append(lines, "*Expected until · Restored*", expectedScheduleEndLine(t.Journal.JudgmentValidUntil, actor, false), "*AlertINT:* Monitoring continues.")
 	case model.JudgmentChangeRevoked:
-		text = actor + " ended the expected-until decision. Normal assessment resumes."
+		lines = append(lines, "*Expected until · Removed*")
+		if actor != "" {
+			lines = append(lines, "*Operator:* "+actor)
+		}
+		lines = append(lines, "*AlertINT:* Normal assessment resumes.")
 	case model.JudgmentChangeExpired:
+		lines = append(lines, "*Expected until · Ended*")
 		if t.Journal.JudgmentValidUntil != nil {
-			text = "The expected-until decision ended at " + SlackDateToken(*t.Journal.JudgmentValidUntil, "{time}") + " as scheduled. Normal assessment resumes."
+			lines = append(lines, "*Why:* Reached the scheduled end at "+SlackDateToken(*t.Journal.JudgmentValidUntil, "{time}")+".")
 		} else {
-			text = "The expected-until decision reached its scheduled end time. Normal assessment resumes."
+			lines = append(lines, "*Why:* Reached the scheduled end time.")
 		}
+		lines = append(lines, "*AlertINT:* Normal assessment resumes.")
 	case model.JudgmentChangeInvalidated:
-		reason := strings.TrimSuffix(strings.TrimSpace(t.Journal.Detail), ".")
-		if reason == "Normal assessment resumes" {
-			reason = ""
+		reason := strings.TrimSpace(t.Journal.Detail)
+		if reason == "" || reason == "Normal assessment resumes." {
+			reason = "The current condition changed."
+		} else if !strings.HasSuffix(reason, ".") {
+			reason += "."
 		}
-		if strings.HasPrefix(reason, "The ") {
-			reason = "the " + strings.TrimPrefix(reason, "The ")
-		} else if strings.HasPrefix(reason, "A ") {
-			reason = "a " + strings.TrimPrefix(reason, "A ")
-		}
-		if reason == "" {
-			reason = "the current condition changed"
-		}
-		text = "The expected-until decision no longer applies because " + reason + ". Normal assessment resumes."
+		lines = append(lines, "*Expected until · No longer applies*", "*Why:* "+reason, "*AlertINT:* Normal assessment resumes.")
 	default:
-		text = "The expected-until decision no longer applies because the current condition changed. Normal assessment resumes."
+		lines = append(lines, "*Expected until · No longer applies*", "*Why:* The current condition changed.", "*AlertINT:* Normal assessment resumes.")
 	}
-	if action := t.ActionContract.OperatorActionRequired; action != nil {
-		text += " Operator action required: " + humanizeOperatorAction(*action) + "."
+	if action := t.ActionContract.OperatorActionRequired; action != nil && !t.Journal.NoLongerCurrent {
+		lines = append(lines, "*Action:* "+sentenceAction(*action))
 	}
 	if t.Journal.NoLongerCurrent {
-		text += " This decision is no longer active."
+		lines = append(lines, "*Current status:* This decision no longer applies; check the Situation.")
 	}
+	text := strings.Join(lines, "\n")
 	return RenderedMessage{Text: text, Blocks: []slacklib.Block{sectionBlock(text), contextBlock(SlackDateToken(t.Journal.OccurredAt, "{date_short} {time}"))}}
+}
+
+func sentenceAction(action model.OperatorAction) string {
+	text := humanizeOperatorAction(action)
+	if text == "" {
+		return "Review this Situation."
+	}
+	return strings.ToUpper(text[:1]) + text[1:] + "."
 }
 
 // Keep the operational next step outside bounded evidence sections: a long

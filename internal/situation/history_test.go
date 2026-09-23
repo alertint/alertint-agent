@@ -293,6 +293,30 @@ func TestExpectedScheduleMatchIsAControllerTransitionAttributedToItsOwner(t *tes
 	}
 }
 
+func TestExpectedScheduleDoesNotAnnounceNeverAppliedStatusChurn(t *testing.T) {
+	change := hsNext(t)
+	change.PriorTransition.Projection.Briefing = &model.OperatorBriefing{ExpectedBehavior: &model.ExpectedBehaviorProjection{
+		EnvelopeID: "old-schedule", Disposition: model.ExpectedBehaviorDispositionViolated, Reason: model.ExpectedBehaviorReasonUrgent,
+	}}
+	change.Projection.Briefing = &model.OperatorBriefing{ExpectedBehavior: &model.ExpectedBehaviorProjection{
+		EnvelopeID: "old-schedule", Disposition: model.ExpectedBehaviorDispositionNotApplicable, Reason: model.ExpectedBehaviorReasonInvalidated,
+	}}
+	if journal, _, ok := expectedBehaviorJournal(change); ok {
+		t.Fatalf("never-applied schedule earned a Slack journal: %+v", journal)
+	}
+
+	change.PriorTransition.Projection.Briefing.ExpectedBehavior.Disposition = model.ExpectedBehaviorDispositionMatched
+	if journal, _, ok := expectedBehaviorJournal(change); !ok || journal.ExpectedBehaviorChange != model.ExpectedBehaviorChangeStopped {
+		t.Fatalf("applied schedule must explain why it stopped: %+v, ok=%v", journal, ok)
+	}
+
+	change.PriorTransition.Projection.Briefing.ExpectedBehavior.Disposition = model.ExpectedBehaviorDispositionAuthorityUnavailable
+	change.Projection.Briefing.ExpectedBehavior.Reason = model.ExpectedBehaviorReasonRevoked
+	if journal, _, ok := expectedBehaviorJournal(change); !ok || journal.ExpectedBehaviorChange != model.ExpectedBehaviorChangeWithdrawn {
+		t.Fatalf("operator removal must remain visible: %+v, ok=%v", journal, ok)
+	}
+}
+
 func TestExpectedJudgmentInvalidationRecordsConcreteReason(t *testing.T) {
 	until := hsNow(t).Add(2 * time.Hour)
 	prior := &model.ExpectedJudgmentProjection{Revision: 1, AssertedOperator: "Janis", ValidUntil: until}

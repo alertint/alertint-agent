@@ -61,9 +61,22 @@ func TestExpectedJudgmentThreadTransitionsAreAttributedAndTruthful(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "Janis marked the current condition as expected until " + SlackDateToken(until, "{time}") + ". Monitoring continues."
+	want := "*Expected until · Recorded*\n*Until:* " + SlackDateToken(until, "{time}") + " · *Operator:* Janis\n*AlertINT:* Monitoring continues."
 	if !strings.Contains(msg.Text, want) {
 		t.Fatalf("thread = %q, want %q", msg.Text, want)
+	}
+	for _, tc := range []struct {
+		change model.JudgmentChange
+		want   string
+	}{
+		{model.JudgmentChangeReplaced, "*Expected until · Updated*\n*New end:* " + SlackDateToken(until, "{time}") + " · *Operator:* Janis\n*AlertINT:* Monitoring continues."},
+		{model.JudgmentChangeRestored, "*Expected until · Restored*\n*Until:* " + SlackDateToken(until, "{time}") + " · *Operator:* Janis\n*AlertINT:* Monitoring continues."},
+	} {
+		tr.Journal.JudgmentChange = tc.change
+		msg, err = RenderSituationJournal(tr)
+		if err != nil || !strings.Contains(msg.Text, tc.want) {
+			t.Fatalf("%s thread = %q, want %q, err = %v", tc.change, msg.Text, tc.want, err)
+		}
 	}
 
 	tr.Journal.JudgmentChange = model.JudgmentChangeRevoked
@@ -72,7 +85,7 @@ func TestExpectedJudgmentThreadTransitionsAreAttributedAndTruthful(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(msg.Text, "Janis ended the expected-until decision. Normal assessment resumes.") {
+	if !strings.Contains(msg.Text, "*Expected until · Removed*\n*Operator:* Janis\n*AlertINT:* Normal assessment resumes.") {
 		t.Fatal(msg.Text)
 	}
 
@@ -83,8 +96,13 @@ func TestExpectedJudgmentThreadTransitionsAreAttributedAndTruthful(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(msg.Text, "Operator action required: investigate this Situation.") {
+	if !strings.Contains(msg.Text, "*Action:* Investigate this Situation.") {
 		t.Fatalf("withdrawal handoff = %q, want the resumed operator action", msg.Text)
+	}
+	tr.Journal.NoLongerCurrent = true
+	msg, err = RenderSituationJournal(tr)
+	if err != nil || strings.Contains(msg.Text, "*Action:*") || !strings.Contains(msg.Text, "*Current status:* This decision no longer applies") {
+		t.Fatalf("stale withdrawal must not present an old action: %q, err=%v", msg.Text, err)
 	}
 }
 
@@ -103,25 +121,25 @@ func TestExpectedJudgmentThreadExplainsWhyDecisionEnded(t *testing.T) {
 			name:   "scheduled end",
 			change: model.JudgmentChangeExpired,
 			detail: "The scheduled end time was reached.",
-			want:   "The expected-until decision ended at " + SlackDateToken(until, "{time}") + " as scheduled. Normal assessment resumes.",
+			want:   "*Expected until · Ended*\n*Why:* Reached the scheduled end at " + SlackDateToken(until, "{time}") + ".\n*AlertINT:* Normal assessment resumes.",
 		},
 		{
 			name:   "criticality",
 			change: model.JudgmentChangeInvalidated,
 			detail: "A critical alert is now firing.",
-			want:   "The expected-until decision no longer applies because a critical alert is now firing. Normal assessment resumes.",
+			want:   "*Expected until · No longer applies*\n*Why:* A critical alert is now firing.\n*AlertINT:* Normal assessment resumes.",
 		},
 		{
 			name:   "changed symptoms",
 			change: model.JudgmentChangeInvalidated,
 			detail: "The active symptoms changed.",
-			want:   "The expected-until decision no longer applies because the active symptoms changed. Normal assessment resumes.",
+			want:   "*Expected until · No longer applies*\n*Why:* The active symptoms changed.\n*AlertINT:* Normal assessment resumes.",
 		},
 		{
 			name:   "legacy transition without concrete reason",
 			change: model.JudgmentChangeInvalidated,
 			detail: "Normal assessment resumes.",
-			want:   "The expected-until decision no longer applies because the current condition changed. Normal assessment resumes.",
+			want:   "*Expected until · No longer applies*\n*Why:* The current condition changed.\n*AlertINT:* Normal assessment resumes.",
 		},
 	}
 
@@ -149,7 +167,7 @@ func TestExpectedJudgmentThreadExplainsUnavailableSourceDefinition(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "The expected-until decision no longer applies because AlertINT can no longer verify the source rule definition. Normal assessment resumes."
+	want := "*Expected until · No longer applies*\n*Why:* AlertINT can no longer verify the source rule definition.\n*AlertINT:* Normal assessment resumes."
 	if !strings.Contains(msg.Text, want) {
 		t.Fatalf("thread = %q, want %q", msg.Text, want)
 	}
