@@ -381,25 +381,27 @@ func attachCorrelatedDeliveryTx(ctx context.Context, tx *sql.Tx, incidentID, del
 // historical/open Incident; all of those memberships consume the Alert's
 // applied delivery history. Source start precedes receipt time so a delayed
 // recovery from an older episode cannot close a newer firing episode.
+const unresolvedIncidentMembersQuery = `
+	SELECT COUNT(*)
+	FROM incident_alerts AS ia
+	WHERE ia.incident_id = ?
+	  AND COALESCE((
+		SELECT ad.status
+		FROM alert_deliveries AS ad
+		JOIN incident_alert_deliveries AS owner ON owner.delivery_id = ad.id
+		WHERE ad.alert_id = ia.alert_id
+		ORDER BY
+		  (substr(COALESCE(ad.source_started_at, ad.received_at), 1, 19) || '.' ||
+		   substr(ltrim(rtrim(substr(COALESCE(ad.source_started_at, ad.received_at), 20), 'Z'), '.') || '000000000', 1, 9)) DESC,
+		  (substr(ad.received_at, 1, 19) || '.' ||
+		   substr(ltrim(rtrim(substr(ad.received_at, 20), 'Z'), '.') || '000000000', 1, 9)) DESC,
+		  ad.id DESC
+		LIMIT 1
+	  ), 'firing') <> 'resolved'`
+
 func unresolvedIncidentMembersTx(ctx context.Context, tx *sql.Tx, incidentID string) (int, error) {
 	var count int
-	err := tx.QueryRowContext(ctx, `
-		SELECT COUNT(*)
-		FROM incident_alerts AS ia
-		WHERE ia.incident_id = ?
-		  AND COALESCE((
-			SELECT ad.status
-			FROM alert_deliveries AS ad
-			JOIN incident_alert_deliveries AS owner ON owner.delivery_id = ad.id
-			WHERE ad.alert_id = ia.alert_id
-			ORDER BY
-			  (substr(COALESCE(ad.source_started_at, ad.received_at), 1, 19) || '.' ||
-			   substr(ltrim(rtrim(substr(COALESCE(ad.source_started_at, ad.received_at), 20), 'Z'), '.') || '000000000', 1, 9)) DESC,
-			  (substr(ad.received_at, 1, 19) || '.' ||
-			   substr(ltrim(rtrim(substr(ad.received_at, 20), 'Z'), '.') || '000000000', 1, 9)) DESC,
-			  ad.id DESC
-			LIMIT 1
-		  ), 'firing') <> 'resolved'`, incidentID).Scan(&count)
+	err := tx.QueryRowContext(ctx, unresolvedIncidentMembersQuery, incidentID).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("store: count unresolved correlated incident members: %w", err)
 	}

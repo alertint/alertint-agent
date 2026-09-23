@@ -414,6 +414,10 @@ func readControllerParkedStateTx(ctx context.Context, tx *sql.Tx, situationID st
 // is internal/situation's job via internal/severity.Rank, not this store
 // layer's) and whether the Drill marker
 // (store.DrillMarkerLabel=store.DrillMarkerValue) is set (Delivery.Drill).
+// A shared Alert delivery joins an Incident's view only when its immutable
+// ownership link was created at or after that Incident membership. This keeps
+// terminal predecessor history out of a linked recurrence while preserving a
+// delivery accepted early and correlated after the membership was created.
 func loadSituationDeliveriesTx(ctx context.Context, tx *sql.Tx, situationID string) ([]situation.Delivery, error) {
 	rows, err := tx.QueryContext(ctx, `
 		WITH mapped_deliveries(incident_id, delivery_id) AS (
@@ -436,6 +440,10 @@ func loadSituationDeliveriesTx(ctx context.Context, tx *sql.Tx, situationID stri
 			JOIN alert_deliveries shared ON shared.alert_id = ia.alert_id
 			JOIN incident_alert_deliveries owner ON owner.delivery_id = shared.id
 			WHERE si.situation_id = ?
+			  AND (substr(owner.created_at, 1, 19) || '.' ||
+			       substr(ltrim(rtrim(substr(owner.created_at, 20), 'Z'), '.') || '000000000', 1, 9)) >=
+			      (substr(ia.created_at, 1, 19) || '.' ||
+			       substr(ltrim(rtrim(substr(ia.created_at, 20), 'Z'), '.') || '000000000', 1, 9))
 			  AND (s.terminal_at IS NULL OR
 			       (substr(shared.received_at, 1, 19) || '.' ||
 			        substr(ltrim(rtrim(substr(shared.received_at, 20), 'Z'), '.') || '000000000', 1, 9)) <=

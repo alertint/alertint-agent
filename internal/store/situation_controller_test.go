@@ -1379,6 +1379,130 @@ func TestLoadSituationDeliveriesKeepsTerminalEpisodeFrozenAfterLinkedRecurrence(
 	}
 }
 
+func TestLoadSituationDeliveriesNewSituationStartsAtItsOwnMembership(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 23, 9, 0, 0, 0, time.UTC)
+	original := deliveryFixture("delivery-closed-episode", "fp-reused-alert", now)
+	accepted, err := st.AcceptDeliveries(ctx, []DeliveryInput{original})
+	if err != nil {
+		t.Fatal(err)
+	}
+	alertID := accepted[0].Alert.ID
+	insertIncidentAndDeliveryInput(t, st, "incident-closed-episode", "input-closed-episode", "service=reused", original.ID, now)
+	if _, err := st.DB().ExecContext(ctx, `INSERT INTO incident_alerts (incident_id,alert_id,created_at) VALUES (?,?,?)`,
+		"incident-closed-episode", alertID, canonicalTime(now)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ApplySituationInput(ctx, claimOneInput(t, st, "closed-worker", now)); err != nil {
+		t.Fatal(err)
+	}
+	var closedSituationID string
+	if err := st.DB().QueryRowContext(ctx, `SELECT situation_id FROM situation_incidents WHERE incident_id='incident-closed-episode'`).Scan(&closedSituationID); err != nil {
+		t.Fatal(err)
+	}
+	closedAt := now.Add(5 * time.Minute)
+	recoveryObservedAt := closedAt.Add(-time.Minute)
+	if _, err := st.DB().ExecContext(ctx, `
+		UPDATE situations SET lifecycle='recovery_pending', recovery_observed_at=?, grace_until=?, updated_at=? WHERE id=?`,
+		canonicalTime(recoveryObservedAt), canonicalTime(closedAt), canonicalTime(recoveryObservedAt), closedSituationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `
+		UPDATE situations SET lifecycle='recovered', terminal_at=?, terminal_reason=NULL, updated_at=? WHERE id=?`,
+		canonicalTime(closedAt), canonicalTime(closedAt), closedSituationID); err != nil {
+		t.Fatal(err)
+	}
+
+	recurrenceAt := closedAt.Add(time.Minute)
+	recurrence := deliveryFixture("delivery-new-episode", "fp-reused-alert", recurrenceAt)
+	if _, err := st.AcceptDeliveries(ctx, []DeliveryInput{recurrence}); err != nil {
+		t.Fatal(err)
+	}
+	insertIncidentAndDeliveryInput(t, st, "incident-new-episode", "input-new-episode", "service=reused", recurrence.ID, recurrenceAt)
+	if _, err := st.DB().ExecContext(ctx, `INSERT INTO incident_alerts (incident_id,alert_id,created_at) VALUES (?,?,?)`,
+		"incident-new-episode", alertID, canonicalTime(recurrenceAt)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ApplySituationInput(ctx, claimOneInput(t, st, "recurrence-worker", recurrenceAt)); err != nil {
+		t.Fatal(err)
+	}
+	var newSituationID string
+	if err := st.DB().QueryRowContext(ctx, `SELECT situation_id FROM situation_incidents WHERE incident_id='incident-new-episode'`).Scan(&newSituationID); err != nil {
+		t.Fatal(err)
+	}
+	if newSituationID == closedSituationID {
+		t.Fatal("recurrence joined the terminal Situation instead of opening a linked successor")
+	}
+
+	tx, err := st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	deliveries, err := loadSituationDeliveriesTx(ctx, tx, newSituationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 1 || deliveries[0].ID != recurrence.ID {
+		t.Fatalf("new Situation deliveries = %+v, want only %s from its own membership", deliveries, recurrence.ID)
+	}
+}
+
+func TestLoadSituationDeliveriesIncludesQueuedDeliveryLinkedAfterMembership(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 23, 11, 0, 0, 0, time.UTC)
+	first := deliveryFixture("delivery-membership-owner", "fp-queued-shared", now)
+	queued := deliveryFixture("delivery-queued-shared", "fp-queued-shared", now.Add(time.Second))
+	accepted, err := st.AcceptDeliveries(ctx, []DeliveryInput{first, queued})
+	if err != nil {
+		t.Fatal(err)
+	}
+	alertID := accepted[0].Alert.ID
+	membershipAt := now.Add(time.Minute)
+	insertIncidentAndDeliveryInput(t, st, "incident-membership-owner", "input-membership-owner", "service=queued", first.ID, membershipAt)
+	if _, err := st.DB().ExecContext(ctx, `INSERT INTO incident_alerts (incident_id,alert_id,created_at) VALUES (?,?,?)`,
+		"incident-membership-owner", alertID, canonicalTime(membershipAt)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ApplySituationInput(ctx, claimOneInput(t, st, "membership-worker", membershipAt)); err != nil {
+		t.Fatal(err)
+	}
+	var situationID string
+	if err := st.DB().QueryRowContext(ctx, `SELECT situation_id FROM situation_incidents WHERE incident_id='incident-membership-owner'`).Scan(&situationID); err != nil {
+		t.Fatal(err)
+	}
+
+	// The delivery was accepted before this membership existed but was not
+	// correlated until afterwards. Its ownership-link time, rather than its
+	// receipt time, places it inside this membership's history.
+	linkAt := membershipAt.Add(time.Second)
+	if err := st.InsertIncident(ctx, Incident{
+		ID: "incident-queued-owner", GroupKey: "other=queued",
+		FirstAlertAt: linkAt, LastAlertAt: linkAt, ReadyAt: linkAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `INSERT INTO incident_alert_deliveries (incident_id,delivery_id,created_at) VALUES (?,?,?)`,
+		"incident-queued-owner", queued.ID, canonicalTime(linkAt)); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	deliveries, err := loadSituationDeliveriesTx(ctx, tx, situationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 2 || deliveries[0].ID != first.ID || deliveries[1].ID != queued.ID {
+		t.Fatalf("Situation deliveries = %+v, want owned %s and later-linked %s", deliveries, first.ID, queued.ID)
+	}
+}
+
 func TestLoadReconciliationInputUnknownSituationReturnsErrNotFound(t *testing.T) {
 	st := newTestStore(t)
 	claim := situation.Claim{Situation: situationmodel.Situation{ID: "does-not-exist"}, ClaimOwner: "controller-a", ClaimToken: 1}

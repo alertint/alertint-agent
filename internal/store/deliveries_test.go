@@ -83,6 +83,73 @@ func TestAcceptDeliveriesIsAtomicAndIdempotent(t *testing.T) {
 	assertTableCount(t, st.DB(), "alert_delivery_dispatches", 2)
 }
 
+func TestUnresolvedIncidentMembersUsesAlertAuthorityIndex(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 23, 10, 0, 0, 0, time.UTC)
+
+	deliveries := make([]DeliveryInput, 1000)
+	for i := range deliveries {
+		deliveries[i] = deliveryFixture(fmt.Sprintf("authority-history-%04d", i), "fp-authority-history", now.Add(time.Duration(i)*time.Second))
+	}
+	accepted, err := st.AcceptDeliveries(ctx, deliveries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accepted) != len(deliveries) {
+		t.Fatalf("accepted deliveries = %d, want %d", len(accepted), len(deliveries))
+	}
+	if err := st.InsertIncident(ctx, Incident{
+		ID: "incident-authority-history", GroupKey: "authority-history",
+		FirstAlertAt: now, LastAlertAt: now, ReadyAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `INSERT INTO incident_alerts (incident_id,alert_id,created_at) VALUES (?,?,?)`,
+		"incident-authority-history", accepted[0].Alert.ID, canonicalTime(now)); err != nil {
+		t.Fatal(err)
+	}
+	for _, delivery := range accepted {
+		if _, err := st.DB().ExecContext(ctx, `INSERT INTO incident_alert_deliveries (incident_id,delivery_id,created_at) VALUES (?,?,?)`,
+			"incident-authority-history", delivery.ID, canonicalTime(delivery.ReceivedAt)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows, err := st.DB().QueryContext(ctx, "EXPLAIN QUERY PLAN "+unresolvedIncidentMembersQuery, "incident-authority-history")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var plan string
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan += detail + "\n"
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan, "alert_deliveries_alert_authority_idx") {
+		t.Fatalf("authoritative member lookup still scans retained delivery history:\n%s", plan)
+	}
+	if strings.Contains(plan, "SCAN ad") || strings.Contains(plan, "USE TEMP B-TREE FOR ORDER BY") {
+		t.Fatalf("authoritative member lookup still scans or sorts retained delivery history:\n%s", plan)
+	}
+
+	tx, err := st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if got, err := unresolvedIncidentMembersTx(ctx, tx, "incident-authority-history"); err != nil || got != 1 {
+		t.Fatalf("unresolved members = %d, err=%v; want 1", got, err)
+	}
+}
+
 func TestAcceptDeliveriesDuplicateIDIgnoresMutatedAlert(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()

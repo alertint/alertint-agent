@@ -218,7 +218,7 @@ merge them, then tag the merged commit with `chart-v0.1.2`.
 
 Released v0.13.9 owns migration `0013_audit_log_kind_ts_idx.sql`.
 State-controller migrations start at `0014_alert_delivery_ledger.sql` and end
-at `0037_alertmanager_source_provenance.sql`. Released migration files retain
+at `0038_alert_delivery_authority_index.sql`. Released migration files retain
 their numbers and contents; pinned-prefix and populated-upgrade tests enforce
 this.
 

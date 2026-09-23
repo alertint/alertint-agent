@@ -53,6 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Linked recurrence starts with its own delivery history instead of inheriting
+  closed-episode deliveries that share an Alert identity. Recovery authority
+  lookups now use an indexed chronological path as retained history grows.
 - Preserve the released `alertint_usage_stats` MCP tool across the Situation
   controller branch integration. It now counts new Situation roots and
   withheld channel pokes while continuing to read legacy notification rows.
