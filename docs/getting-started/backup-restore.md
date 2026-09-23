@@ -59,6 +59,9 @@ Restore is safe by construction:
 
 ## Upgrade and rollback
 
+For a step-by-step v0.13.9 to v0.14.0-rc1 container walkthrough, including
+the RC's writable `/tmp` requirement, see [Upgrade to v0.14.0-rc1](upgrade-0-14-rc1.md).
+
 Create the backup with the version you are currently running, before starting
 the new binary:
 
