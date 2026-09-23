@@ -20,13 +20,13 @@ func seedTestJudgmentAndEnvelope(t *testing.T, st *store.Store, auditor *audit.A
 	if _, err := st.DB().Exec(`INSERT INTO situation_judgments (
 			id, situation_id, judged_input_version, covered_fact_hash, covered_symptoms_json, covered_impact_json,
 			judgment, basis, evidence_refs_json, authenticated_as, asserted_operator, created_at
-		) VALUES (?, ?, 1, 'sha256:test', '[]', '[]', 'expected_this_episode', 'operator_knowledge', '[]', 'slack:U1', 'janis', ?)`,
+		) VALUES (?, ?, 1, 'sha256:test', '[]', '[]', 'expected_this_episode', 'operator_knowledge', '[]', 'slack:U1', 'default', ?)`,
 		"j-"+situationID, situationID, ts); err != nil {
 		t.Fatal(err)
 	}
 	confirmation := model.EnvelopeConfirmation{
 		SourceJudgmentID: "j-" + situationID, ExpectedCurrentVersion: 0, Scope: model.EnvelopeScope{GroupKey: groupKey},
-		ReviewDueAt: now.Add(30 * 24 * time.Hour), OperatorConfirmed: true, ConfirmedBy: "janis",
+		ReviewDueAt: now.Add(30 * 24 * time.Hour), OperatorConfirmed: true, ConfirmedBy: "default",
 	}
 	v, err := st.ConfirmEnvelope(context.Background(), confirmation, "slack:U1", now, auditor,
 		[]store.SituationPolicyAuditEvent{{Kind: "envelope.confirmed", Payload: map[string]any{"ok": true}}})
@@ -62,13 +62,13 @@ func TestHandleExpectedBehaviorConfirmDelegatesToCommand(t *testing.T) {
 		"scope":              map[string]any{"group_key": "host=db-1", "source": "zabbix", "trigger_id": "18422"},
 		"conditions":         map[string]any{"required_companion_signals": []any{"database_lock"}},
 		"review_due_at":      "2026-11-20T00:00:00Z",
-		"operator_confirmed": true, "confirmed_by": "janis",
+		"operator_confirmed": true, "confirmed_by": "default",
 	}))
 	if err != nil || res.IsError {
 		t.Fatalf("err=%v result=%s", err, resultText(t, res))
 	}
 	if fake.lastConfirm.SourceJudgmentID != "j-1" || fake.lastConfirm.Scope.GroupKey != "host=db-1" ||
-		len(fake.lastConfirm.Conditions.RequiredCompanionSignals) != 1 || fake.lastConfirm.ConfirmedBy != "janis" {
+		len(fake.lastConfirm.Conditions.RequiredCompanionSignals) != 1 || fake.lastConfirm.ConfirmedBy != "default" {
 		t.Fatalf("confirmation=%+v", fake.lastConfirm)
 	}
 	if fake.lastConfirm.ReviewDueAt.IsZero() {
@@ -82,7 +82,7 @@ func TestHandleExpectedBehaviorConfirmDelegatesToCommand(t *testing.T) {
 func TestHandleExpectedBehaviorConfirmRequiresScopeAndReviewDate(t *testing.T) {
 	s := newMCPServer(t)
 	res, err := s.handleExpectedBehaviorConfirm(context.Background(), reqWith(map[string]any{
-		"source_judgment_id": "j-1", "expected_current_version": 0, "operator_confirmed": true, "confirmed_by": "janis",
+		"source_judgment_id": "j-1", "expected_current_version": 0, "operator_confirmed": true, "confirmed_by": "default",
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -99,7 +99,7 @@ func TestHandleExpectedBehaviorRevokeDelegatesToCommand(t *testing.T) {
 
 	res, err := s.handleExpectedBehaviorRevoke(context.Background(), reqWith(map[string]any{
 		"envelope_id": "env-1", "expected_current_version": 1, "reason": "trigger retired",
-		"operator_confirmed": true, "confirmed_by": "janis",
+		"operator_confirmed": true, "confirmed_by": "default",
 	}))
 	if err != nil || res.IsError {
 		t.Fatalf("err=%v result=%s", err, resultText(t, res))
@@ -115,7 +115,7 @@ func TestHandleExpectedBehaviorRevokeDelegatesToCommand(t *testing.T) {
 func TestHandleExpectedBehaviorRevokeRequiresReason(t *testing.T) {
 	s := newMCPServer(t)
 	res, err := s.handleExpectedBehaviorRevoke(context.Background(), reqWith(map[string]any{
-		"envelope_id": "env-1", "expected_current_version": 1, "operator_confirmed": true, "confirmed_by": "janis",
+		"envelope_id": "env-1", "expected_current_version": 1, "operator_confirmed": true, "confirmed_by": "default",
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -141,7 +141,7 @@ func TestHandleExpectedBehaviorConfirmRejectsUnconfirmedOrMissingAttribution(t *
 		unconfirmed[k] = v
 	}
 	unconfirmed["operator_confirmed"] = false
-	unconfirmed["confirmed_by"] = "janis"
+	unconfirmed["confirmed_by"] = "default"
 	if res, err := s.handleExpectedBehaviorConfirm(context.Background(), reqWith(unconfirmed)); err != nil || !res.IsError {
 		t.Fatalf("expected an error result for operator_confirmed=false, err=%v", err)
 	}
@@ -168,7 +168,7 @@ func TestHandleExpectedBehaviorRevokeRejectsUnconfirmedOrMissingAttribution(t *t
 
 	res, err := s.handleExpectedBehaviorRevoke(context.Background(), reqWith(map[string]any{
 		"envelope_id": "env-1", "expected_current_version": 1, "reason": "trigger retired",
-		"operator_confirmed": false, "confirmed_by": "janis",
+		"operator_confirmed": false, "confirmed_by": "default",
 	}))
 	if err != nil || !res.IsError {
 		t.Fatalf("expected an error result for operator_confirmed=false, err=%v", err)

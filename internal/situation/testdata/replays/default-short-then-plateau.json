@@ -1,5 +1,5 @@
 {
-  "description": "A critical delivery crosses the floor within its first minute (duration class short) and publishes. The operator janis records an expected-this-episode judgment against that exact view. The same symptom keeps firing unchanged for the next forty minutes (duration class plateaus to long); the floor re-fires on the same evidence and only edits the existing root — the judgment steers no deterministic outcome here, but is durably recorded and carried into the next L2 prompt.",
+  "description": "A critical delivery crosses the floor within its first minute (duration class short) and publishes. The default operator records an expected-this-episode judgment against that exact view. The same symptom keeps firing unchanged for the next forty minutes (duration class plateaus to long); the floor re-fires on the same evidence and only edits the existing root — the judgment steers no deterministic outcome here, but is durably recorded and carried into the next L2 prompt.",
   "rounds": [
     {
       "advance_seconds": 30,
@@ -15,7 +15,7 @@
         {"id": "primary-db-unreachable", "lifecycle": "firing", "severity": "critical"}
       ],
       "judgments": [
-        {"judgment": "expected_this_episode", "basis": "operator_knowledge", "asserted_operator": "janis"}
+        {"judgment": "expected_this_episode", "basis": "operator_knowledge", "asserted_operator": "default"}
       ]
     }
   ],

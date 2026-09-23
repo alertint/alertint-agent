@@ -249,12 +249,12 @@ func TestHandleSituationJudgmentRecordDelegatesToCommand(t *testing.T) {
 
 	res, err := s.handleSituationJudgmentRecord(context.Background(), reqWith(map[string]any{
 		"situation": "sit-1", "judgment": "expected_this_episode", "basis": "operator_knowledge",
-		"operator_confirmed": true, "confirmed_by": "janis",
+		"operator_confirmed": true, "confirmed_by": "default",
 	}))
 	if err != nil || res.IsError {
 		t.Fatalf("err=%v result=%s", err, resultText(t, res))
 	}
-	if fake.lastJudgmentReq.Situation != "sit-1" || fake.lastJudgmentReq.ConfirmedBy != "janis" || !fake.lastJudgmentReq.OperatorConfirmed {
+	if fake.lastJudgmentReq.Situation != "sit-1" || fake.lastJudgmentReq.ConfirmedBy != "default" || !fake.lastJudgmentReq.OperatorConfirmed {
 		t.Fatalf("judgment request=%+v", fake.lastJudgmentReq)
 	}
 	out := resultText(t, res)
@@ -266,7 +266,7 @@ func TestHandleSituationJudgmentRecordDelegatesToCommand(t *testing.T) {
 func TestHandleSituationJudgmentRecordRequiresSituation(t *testing.T) {
 	s := newMCPServer(t)
 	res, err := s.handleSituationJudgmentRecord(context.Background(), reqWith(map[string]any{
-		"judgment": "expected_this_episode", "basis": "operator_knowledge", "operator_confirmed": true, "confirmed_by": "janis",
+		"judgment": "expected_this_episode", "basis": "operator_knowledge", "operator_confirmed": true, "confirmed_by": "default",
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -283,7 +283,7 @@ func TestHandleSituationJudgmentRecordRejectsUnconfirmed(t *testing.T) {
 
 	res, err := s.handleSituationJudgmentRecord(context.Background(), reqWith(map[string]any{
 		"situation": "sit-1", "judgment": "expected_this_episode", "basis": "operator_knowledge",
-		"operator_confirmed": false, "confirmed_by": "janis",
+		"operator_confirmed": false, "confirmed_by": "default",
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -323,7 +323,7 @@ func TestHandleSituationJudgmentRecordRejectsInvalidJudgmentAndBasisEnums(t *tes
 
 	res, err := s.handleSituationJudgmentRecord(context.Background(), reqWith(map[string]any{
 		"situation": "sit-1", "judgment": "definitely_bad", "basis": "operator_knowledge",
-		"operator_confirmed": true, "confirmed_by": "janis",
+		"operator_confirmed": true, "confirmed_by": "default",
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -334,7 +334,7 @@ func TestHandleSituationJudgmentRecordRejectsInvalidJudgmentAndBasisEnums(t *tes
 
 	res, err = s.handleSituationJudgmentRecord(context.Background(), reqWith(map[string]any{
 		"situation": "sit-1", "judgment": "expected_this_episode", "basis": "gut_feeling",
-		"operator_confirmed": true, "confirmed_by": "janis",
+		"operator_confirmed": true, "confirmed_by": "default",
 	}))
 	if err != nil {
 		t.Fatal(err)

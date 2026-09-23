@@ -33,7 +33,7 @@ func TestBuildSnapshotSanitizesProhibitedNoise(t *testing.T) {
 		ID: "judgment:a", SituationID: "s-1", JudgedInputVersion: 3, CoveredFactHash: "sha256:covered",
 		CoveredSymptoms: []string{"cpu"}, CoveredImpact: []string{"availability"}, Judgment: model.JudgmentUnexpected,
 		Basis: model.JudgmentBasisOperatorKnowledge, Workload: &workload, ValidUntil: &validUntil,
-		EvidenceRefs: []string{"fact:cpu"}, AuthenticatedAs: "installation-token", AssertedOperator: "janis",
+		EvidenceRefs: []string{"fact:cpu"}, AuthenticatedAs: "installation-token", AssertedOperator: "default",
 		CreatedAt: time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC),
 	}}
 	input.Envelope = &model.EnvelopeEvaluation{ID: "evaluation:a", EnvelopeID: "envelope:1", EnvelopeVersion: 2,
@@ -74,7 +74,7 @@ func TestMaterialFactHashIgnoresJudgmentAuditMetadata(t *testing.T) {
 		ID: "judgment:a", SituationID: "s-1", JudgedInputVersion: 3, CoveredFactHash: "sha256:covered",
 		CoveredSymptoms: []string{"cpu"}, CoveredImpact: []string{"availability"}, Judgment: model.JudgmentUnexpected,
 		Basis: model.JudgmentBasisOperatorKnowledge, Workload: &workloadA, EvidenceRefs: []string{"fact:cpu"},
-		AuthenticatedAs: "token:a", AssertedOperator: "janis", CreatedAt: time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC),
+		AuthenticatedAs: "token:a", AssertedOperator: "default", CreatedAt: time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC),
 	}}
 	second.Judgments = []model.Judgment{{
 		ID: "judgment:b", SituationID: "another", JudgedInputVersion: 99, CoveredFactHash: "sha256:covered",

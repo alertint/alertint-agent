@@ -37,11 +37,11 @@ func TestSignatureNormalizesUppercaseSHA256Prefix(t *testing.T) {
 func TestCorrectRejectsStaleHeadAndForbiddenFields(t *testing.T) {
 	svc, st := newService(t)
 	current := seedProfile(t, st, "zabbix:trigger=18422:template=sha256:923b", 1)
-	_, err := svc.Correct(context.Background(), Correction{Signature: current.SignatureKey, ExpectedVersion: 0, Confirmed: true, ConfirmedBy: "janis"})
+	_, err := svc.Correct(context.Background(), Correction{Signature: current.SignatureKey, ExpectedVersion: 0, Confirmed: true, ConfirmedBy: "default"})
 	if !errors.Is(err, ErrVersionConflict) {
 		t.Fatalf("err=%v", err)
 	}
-	_, err = svc.Correct(context.Background(), Correction{Signature: current.SignatureKey, ExpectedVersion: 1, Confirmed: true, ConfirmedBy: "janis", Raw: json.RawMessage(`{"attention":"urgent"}`)})
+	_, err = svc.Correct(context.Background(), Correction{Signature: current.SignatureKey, ExpectedVersion: 1, Confirmed: true, ConfirmedBy: "default", Raw: json.RawMessage(`{"attention":"urgent"}`)})
 	if err == nil || !strings.Contains(err.Error(), "unknown field attention") {
 		t.Fatalf("err=%v", err)
 	}
@@ -63,7 +63,7 @@ func TestInferIfMissingCachesValidatedProfile(t *testing.T) {
 func TestCorrectAuditsRejectedStaleWriteWithoutRawProfile(t *testing.T) {
 	svc, st := newService(t)
 	current := seedProfile(t, st, "zabbix:trigger=18422:template=sha256:923b", 1)
-	_, err := svc.Correct(context.Background(), Correction{Signature: current.SignatureKey, ExpectedVersion: 0, Confirmed: true, ConfirmedBy: "janis"})
+	_, err := svc.Correct(context.Background(), Correction{Signature: current.SignatureKey, ExpectedVersion: 0, Confirmed: true, ConfirmedBy: "default"})
 	if !errors.Is(err, ErrVersionConflict) {
 		t.Fatalf("err=%v", err)
 	}
@@ -71,7 +71,7 @@ func TestCorrectAuditsRejectedStaleWriteWithoutRawProfile(t *testing.T) {
 	if err := st.DB().QueryRowContext(context.Background(), `SELECT kind, payload_json FROM audit_log ORDER BY seq DESC LIMIT 1`).Scan(&kind, &payload); err != nil {
 		t.Fatal(err)
 	}
-	if kind != "semantic_profile.correction_rejected" || strings.Contains(payload, "janis") || strings.Contains(payload, "profile") {
+	if kind != "semantic_profile.correction_rejected" || strings.Contains(payload, "default") || strings.Contains(payload, "profile") {
 		t.Fatalf("audit = %q %s", kind, payload)
 	}
 }
@@ -116,11 +116,11 @@ func TestDecodeProfileRejectsOversizedRawAndCollections(t *testing.T) {
 func TestCorrectRetainsAttributionAndDurablyHandsOffProfileChange(t *testing.T) {
 	svc, st := newService(t)
 	current := seedProfile(t, st, "zabbix:trigger=18422:template=sha256:923b", 1)
-	updated, err := svc.Correct(context.Background(), Correction{Signature: current.SignatureKey, ExpectedVersion: 1, Confirmed: true, ConfirmedBy: "janis", Raw: validProfileJSON()})
+	updated, err := svc.Correct(context.Background(), Correction{Signature: current.SignatureKey, ExpectedVersion: 1, Confirmed: true, ConfirmedBy: "default", Raw: validProfileJSON()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if updated.AssertedBy != "janis" {
+	if updated.AssertedBy != "default" {
 		t.Fatalf("asserted attribution = %q", updated.AssertedBy)
 	}
 	changes, err := st.SemanticProfileChanges(context.Background(), 10)
@@ -131,7 +131,7 @@ func TestCorrectRetainsAttributionAndDurablyHandsOffProfileChange(t *testing.T) 
 	if err := st.DB().QueryRowContext(context.Background(), `SELECT payload_json FROM audit_log WHERE kind = 'semantic_profile.corrected' ORDER BY seq DESC LIMIT 1`).Scan(&payload); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(payload, `"asserted_by":"janis"`) || strings.Contains(payload, string(validProfileJSON())) {
+	if !strings.Contains(payload, `"asserted_by":"default"`) || strings.Contains(payload, string(validProfileJSON())) {
 		t.Fatalf("correction audit=%s", payload)
 	}
 }
@@ -139,7 +139,7 @@ func TestCorrectRetainsAttributionAndDurablyHandsOffProfileChange(t *testing.T) 
 func TestCorrectionSurfacesRequiredRejectedAuditFailure(t *testing.T) {
 	base := &failingAuditStore{history: &profilemodel.History{SignatureKey: "zabbix:test", CurrentVersion: 1, Versions: []profilemodel.ProfileVersion{{SignatureKey: "zabbix:test", Version: 1}}}}
 	svc := New(base, staticLLM{}, "semantic-profile-v1", "configured-model", failingAuditSink{})
-	_, err := svc.Correct(context.Background(), Correction{Signature: "zabbix:test", ExpectedVersion: 0, Confirmed: true, ConfirmedBy: "janis"})
+	_, err := svc.Correct(context.Background(), Correction{Signature: "zabbix:test", ExpectedVersion: 0, Confirmed: true, ConfirmedBy: "default"})
 	if !errors.Is(err, errAuditUnavailable) {
 		t.Fatalf("err=%v", err)
 	}
@@ -153,7 +153,7 @@ func TestSuccessfulAuditFailureRollsBackProfileAndOutbox(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 	seedProfile(t, st, "zabbix:trigger=18422:template=sha256:923b", 1)
 	svc := New(st, staticLLM{}, "semantic-profile-v1", "configured-model", failingTransactionalAuditSink{})
-	_, err = svc.Correct(context.Background(), Correction{Signature: "zabbix:trigger=18422:template=sha256:923b", ExpectedVersion: 1, Confirmed: true, ConfirmedBy: "janis", Raw: validProfileJSON()})
+	_, err = svc.Correct(context.Background(), Correction{Signature: "zabbix:trigger=18422:template=sha256:923b", ExpectedVersion: 1, Confirmed: true, ConfirmedBy: "default", Raw: validProfileJSON()})
 	if !errors.Is(err, errAuditUnavailable) {
 		t.Fatalf("err=%v", err)
 	}

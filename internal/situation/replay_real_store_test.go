@@ -60,7 +60,7 @@ var realStoreExcluded = map[string]string{
 		"silently ignores every fixture's advance_seconds field) — not SnapshotInput.Symptoms, and not " +
 		"LoadReconciliationInput. Giving this driver a shared fake clock keyed to advance_seconds (mirroring " +
 		"replay_test.go) is the fix, but it is out of this task's ruled scope: it would also newly apply to other " +
-		"currently-passing multi-round fixtures with their own large final-round advance_seconds (janis-short-then-" +
+		"currently-passing multi-round fixtures with their own large final-round advance_seconds (default-short-then-" +
 		"plateau.json: 2400s; envelope-duration-violation.json: 1800s), which needs its own verification pass this " +
 		"task did not scope. Reported, not fixed.",
 }

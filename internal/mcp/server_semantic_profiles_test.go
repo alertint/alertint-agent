@@ -122,12 +122,12 @@ func TestHandleSemanticProfileCorrectDelegatesToCommand(t *testing.T) {
 			"possible_role": "symptom", "candidate_scope": []any{"host"}, "horizon_tier": "hours",
 			"useful_capabilities": []any{"zabbix_metric_range"}, "uncertainty": []any{"workload unknown"},
 		},
-		"confirmed": true, "confirmed_by": "janis",
+		"confirmed": true, "confirmed_by": "default",
 	}))
 	if err != nil || res.IsError {
 		t.Fatalf("err=%v result=%s", err, resultText(t, res))
 	}
-	if fake.lastCorrection.Signature != "sig-1" || fake.lastCorrection.ExpectedVersion != 1 || !fake.lastCorrection.Confirmed || fake.lastCorrection.ConfirmedBy != "janis" {
+	if fake.lastCorrection.Signature != "sig-1" || fake.lastCorrection.ExpectedVersion != 1 || !fake.lastCorrection.Confirmed || fake.lastCorrection.ConfirmedBy != "default" {
 		t.Fatalf("correction=%+v", fake.lastCorrection)
 	}
 	if out := resultText(t, res); !strings.Contains(out, "profile-3") {
@@ -138,7 +138,7 @@ func TestHandleSemanticProfileCorrectDelegatesToCommand(t *testing.T) {
 func TestHandleSemanticProfileCorrectRequiresSignature(t *testing.T) {
 	s := newMCPServer(t)
 	res, err := s.handleSemanticProfileCorrect(context.Background(), reqWith(map[string]any{
-		"expected_version": 1, "profile": map[string]any{}, "confirmed": true, "confirmed_by": "janis",
+		"expected_version": 1, "profile": map[string]any{}, "confirmed": true, "confirmed_by": "default",
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -159,7 +159,7 @@ func TestHandleSemanticProfileCorrectRejectsUnconfirmedOrMissingAttribution(t *t
 	}
 
 	res, err := s.handleSemanticProfileCorrect(context.Background(), reqWith(map[string]any{
-		"signature": "sig-1", "expected_version": 1, "profile": profile, "confirmed": false, "confirmed_by": "janis",
+		"signature": "sig-1", "expected_version": 1, "profile": profile, "confirmed": false, "confirmed_by": "default",
 	}))
 	if err != nil || !res.IsError {
 		t.Fatalf("expected an error result for confirmed=false, err=%v", err)

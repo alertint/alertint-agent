@@ -484,13 +484,13 @@ func TestRejectedJudgmentAuditCarriesAttribution(t *testing.T) {
 	insertSituationFixture(t, s, "s-judge-attr", "host=db-attr", "", situationmodel.LifecycleActive, now)
 
 	req := testJudgmentRequest("s-judge-attr")
-	req.ConfirmedBy = "janis"
-	_, err := s.RecordJudgment(ctx, testJudgmentSnapshot("s-judge-attr", 2), req, "slack:U-janis", now, auditor, testAuditEvents("judgment.recorded"))
+	req.ConfirmedBy = "default"
+	_, err := s.RecordJudgment(ctx, testJudgmentSnapshot("s-judge-attr", 2), req, "slack:U-default", now, auditor, testAuditEvents("judgment.recorded"))
 	if !errors.Is(err, ErrSituationVersionConflict) {
 		t.Fatalf("err=%v, want version conflict", err)
 	}
 	payload := lastAuditPayload(t, s)
-	if payload["authenticated_as"] != "slack:U-janis" || payload["asserted_operator"] != "janis" {
+	if payload["authenticated_as"] != "slack:U-default" || payload["asserted_operator"] != "default" {
 		t.Fatalf("rejected judgment audit payload=%+v, missing attribution", payload)
 	}
 }
@@ -518,13 +518,13 @@ func TestRejectedEnvelopeConfirmAuditCarriesAttribution(t *testing.T) {
 	confirmation := situationmodel.EnvelopeConfirmation{
 		SourceJudgmentID: j.ID, ExpectedCurrentVersion: 1, // stale: no version has ever been confirmed yet
 		Scope: situationmodel.EnvelopeScope{GroupKey: "host=db-attr2"}, ReviewDueAt: now.Add(30 * 24 * time.Hour),
-		OperatorConfirmed: true, ConfirmedBy: "janis",
+		OperatorConfirmed: true, ConfirmedBy: "default",
 	}
-	if _, err := s.ConfirmEnvelope(ctx, confirmation, "slack:U-janis", now, auditor, testAuditEvents("envelope.confirmed")); !errors.Is(err, ErrVersionConflict) {
+	if _, err := s.ConfirmEnvelope(ctx, confirmation, "slack:U-default", now, auditor, testAuditEvents("envelope.confirmed")); !errors.Is(err, ErrVersionConflict) {
 		t.Fatalf("err=%v, want version conflict", err)
 	}
 	payload := lastAuditPayload(t, s)
-	if payload["authenticated_as"] != "slack:U-janis" || payload["asserted_operator"] != "janis" {
+	if payload["authenticated_as"] != "slack:U-default" || payload["asserted_operator"] != "default" {
 		t.Fatalf("rejected envelope confirm (head resolve) audit payload=%+v, missing attribution", payload)
 	}
 
@@ -533,13 +533,13 @@ func TestRejectedEnvelopeConfirmAuditCarriesAttribution(t *testing.T) {
 	secondConfirmation := situationmodel.EnvelopeConfirmation{
 		SourceJudgmentID: secondJudgmentID, ExpectedCurrentVersion: 0, // stale: head is already at version 1
 		Scope: situationmodel.EnvelopeScope{GroupKey: "host=db-attr2-second"}, ReviewDueAt: now.Add(30 * 24 * time.Hour),
-		OperatorConfirmed: true, ConfirmedBy: "janis",
+		OperatorConfirmed: true, ConfirmedBy: "default",
 	}
-	if _, err := s.ConfirmEnvelope(ctx, secondConfirmation, "slack:U-janis", now, auditor, testAuditEvents("envelope.confirmed")); !errors.Is(err, ErrVersionConflict) {
+	if _, err := s.ConfirmEnvelope(ctx, secondConfirmation, "slack:U-default", now, auditor, testAuditEvents("envelope.confirmed")); !errors.Is(err, ErrVersionConflict) {
 		t.Fatalf("err=%v, want version conflict", err)
 	}
 	payload = lastAuditPayload(t, s)
-	if payload["authenticated_as"] != "slack:U-janis" || payload["asserted_operator"] != "janis" || payload["source_judgment_id"] != secondJudgmentID {
+	if payload["authenticated_as"] != "slack:U-default" || payload["asserted_operator"] != "default" || payload["source_judgment_id"] != secondJudgmentID {
 		t.Fatalf("rejected envelope confirm (existing head, stale version) audit payload=%+v, missing attribution", payload)
 	}
 }
@@ -554,12 +554,12 @@ func TestRejectedEnvelopeRevokeAuditCarriesAttribution(t *testing.T) {
 	insertSituationFixture(t, s, "s-env-attr3", "host=db-attr3", "", situationmodel.LifecycleActive, now)
 	_, envelopeID := confirmTestEnvelope(t, s, ctx, auditor, "s-env-attr3", "host=db-attr3", now)
 
-	revocation := situationmodel.EnvelopeRevocation{EnvelopeID: envelopeID, ExpectedCurrentVersion: 99, Reason: "stale", OperatorConfirmed: true, ConfirmedBy: "janis"}
-	if _, err := s.RevokeEnvelope(ctx, revocation, "slack:U-janis", now, auditor, testAuditEvents("envelope.revoked")); !errors.Is(err, ErrVersionConflict) {
+	revocation := situationmodel.EnvelopeRevocation{EnvelopeID: envelopeID, ExpectedCurrentVersion: 99, Reason: "stale", OperatorConfirmed: true, ConfirmedBy: "default"}
+	if _, err := s.RevokeEnvelope(ctx, revocation, "slack:U-default", now, auditor, testAuditEvents("envelope.revoked")); !errors.Is(err, ErrVersionConflict) {
 		t.Fatalf("err=%v, want version conflict", err)
 	}
 	payload := lastAuditPayload(t, s)
-	if payload["authenticated_as"] != "slack:U-janis" || payload["asserted_operator"] != "janis" {
+	if payload["authenticated_as"] != "slack:U-default" || payload["asserted_operator"] != "default" {
 		t.Fatalf("rejected envelope revoke audit payload=%+v, missing attribution", payload)
 	}
 }
