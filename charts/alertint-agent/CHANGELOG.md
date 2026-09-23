@@ -9,6 +9,12 @@ and this chart adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+### Fixed
+
+- Mount writable temporary storage at `/tmp` by default, including when the
+  container root filesystem is read-only. Existing custom `/tmp` mounts stay
+  in place without duplication.
+
 ## [0.2.2] - 2026-09-16
 
 

@@ -2,7 +2,7 @@
 # Used by GoReleaser — the binary is pre-built and injected by GoReleaser;
 # this stage only packages it into the final image.
 FROM golang:1.26-alpine AS prep
-RUN mkdir -p /data
+RUN mkdir -p /data /runtime-tmp && chmod 1777 /runtime-tmp
 
 FROM scratch
 
@@ -14,6 +14,8 @@ COPY --from=prep /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 # /data ships owned by the runtime user so named volumes mounted there
 # (e.g. for the SQLite store) are writable without manual chown.
 COPY --from=prep --chown=65532:65532 /data /data
+# The published image must work without an operator-supplied /tmp mount.
+COPY --from=prep --chmod=1777 /runtime-tmp /tmp
 
 # Run as the conventional non-root UID (distroless "nonroot").
 USER 65532:65532

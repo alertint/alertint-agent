@@ -8,6 +8,47 @@ set:
   secret.data.ALERTINT_WEBHOOK_TOKEN: x
   secret.data.ANTHROPIC_API_KEY: x
 tests:
+  - it: provides writable temporary storage with a read-only root filesystem
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem
+          value: true
+        template: deployment.yaml
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: runtime-tmp
+            mountPath: /tmp
+        template: deployment.yaml
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: runtime-tmp
+            emptyDir: {}
+        template: deployment.yaml
+
+  - it: preserves an existing custom temporary mount without duplicating its path
+    set:
+      extraVolumeMounts:
+        - name: custom-tmp
+          mountPath: /tmp
+      extraVolumes:
+        - name: custom-tmp
+          emptyDir: {}
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: runtime-tmp
+            mountPath: /tmp
+        template: deployment.yaml
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: runtime-tmp
+            emptyDir: {}
+        template: deployment.yaml
+
   - it: defaults the image tag to a v-prefixed AppVersion
     chart:
       appVersion: "9.8.7"

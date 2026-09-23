@@ -36,9 +36,5 @@ annotations:
     - name: Releasing
       url: https://github.com/alertint/alertint-agent/blob/main/RELEASING.md
   artifacthub.io/changes: |
-    - kind: added
-      description: values.schema.json validates values on install, upgrade, lint and template
-    - kind: added
-      description: Artifact Hub listing metadata (icon, license, container image, links, category)
-    - kind: added
-      description: Chart releases are signed with cosign (keyless, GitHub Actions OIDC)
+    - kind: fixed
+      description: Mount writable temporary storage for SQLite with read-only root filesystems
