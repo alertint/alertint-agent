@@ -86,8 +86,8 @@ driven from durable intents that retry indefinitely, open a visible gap after
 five continuous minutes of Slack failure, and replay every affected episode
 in order once Slack returns — see
 **[Slack](https://alertint.com/docs/notifications/slack)**.
-The standalone [Situation workflow](docs/concepts/situation-workflow.html)
-shows the full operator path without requiring a documentation build.
+The [Situation workflow](https://alertint.com/situation-workflow)
+shows the lifecycle and investigation handoff visually.
 
 ## Documentation
 

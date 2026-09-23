@@ -8,9 +8,8 @@ slug: "mcp-clients"
 
 # MCP clients
 
-The standalone [Situation workflow](../concepts/situation-workflow.html)
-shows how MCP records relate to durable intake, Slack, recovery, and expected
-maintenance in v0.14.
+The [Situation workflow](https://alertint.com/situation-workflow)
+shows the lifecycle and investigation handoff visually.
 
 **AlertINT** runs a persistent MCP Streamable HTTP server on port 9912,
 started inside `alertint serve` whenever the `ALERTINT_MCP_TOKEN` env var
