@@ -15,7 +15,7 @@ Please report vulnerabilities **privately** — do not open a public issue.
 
 - Use GitHub private vulnerability reporting: **Security → Report a
   vulnerability** on this repository, or
-- email **ernests.knavins@gmail.com** with subject `[alertint security]`.
+- email **ernests@alertint.com** with subject `[alertint security]`.
 
 You can expect an acknowledgement within **72 hours** and a status update
 within **14 days**. Please include reproduction steps and the affected
