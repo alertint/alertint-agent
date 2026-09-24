@@ -2,7 +2,7 @@
 title: "FAQ"
 description: "Frequently asked questions about AlertINT."
 section: "Concepts"
-order: 3
+order: 4
 slug: "faq"
 ---
 

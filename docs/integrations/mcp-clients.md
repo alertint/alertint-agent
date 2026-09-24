@@ -8,7 +8,7 @@ slug: "mcp-clients"
 
 # MCP clients
 
-The [Situation workflow](https://alertint.com/situation-workflow)
+The [Situation workflow](../concepts/situation-workflow.md)
 shows the lifecycle and investigation handoff visually.
 
 **AlertINT** runs a persistent MCP Streamable HTTP server on port 9912,
