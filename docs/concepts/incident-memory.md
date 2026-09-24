@@ -2,7 +2,7 @@
 title: "Incident memory"
 description: "How AlertINT remembers recurring conditions — collapsing repeats and recalling prior findings into new analyses."
 section: "Concepts"
-order: 4
+order: 5
 slug: "incident-memory"
 ---
 

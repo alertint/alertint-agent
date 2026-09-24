@@ -13,7 +13,7 @@ SQLite state — one binary, one config file, no external dependencies to
 install.
 
 For the visual, clickable lifecycle map and its investigation handoff, open
-the [Situation workflow](https://alertint.com/situation-workflow).
+the [Situation workflow](situation-workflow.md).
 
 Two feedback loops close on the triage step, and both are why the same
 condition doesn't get the same wrong answer twice: the **verification round**
@@ -124,7 +124,7 @@ one. Investigation and operator expectedness never manufacture recovery.
 The controller records each material change and its Slack notification
 intent together. One Situation root shows the current Finding and status;
 thread replies record meaningful changes. Explore the
-[clickable Situation workflow](https://alertint.com/situation-workflow) for
+[clickable Situation workflow](situation-workflow.md) for
 the lifecycle, investigation handoff, guards, and operator-visible result.
 
 For implementation details, see [Situation configuration](../getting-started/configuration.md#situations),
