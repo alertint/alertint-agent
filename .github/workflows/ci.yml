@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   release-scripts:
     name: release contracts
@@ -75,9 +79,17 @@ jobs:
 
       # Tests run only on native architectures (cross-compiled binaries can't
       # execute on the runner). The linux/arm64 matrix entry validates that
-      # the cross-compile target stays green.
+      # the cross-compile target stays green. PRs get fast feedback; main
+      # retains the full race-detector run after each merge.
       - name: Test
-        if: ${{ !(matrix.os == 'linux' && matrix.goarch == 'arm64') }}
+        if: ${{ github.event_name == 'pull_request' && !(matrix.os == 'linux' && matrix.goarch == 'arm64') }}
+        env:
+          GOOS: ""
+          GOARCH: ""
+        run: go test -count=1 -timeout=60m ./...
+
+      - name: Race test
+        if: ${{ github.event_name == 'push' && !(matrix.os == 'linux' && matrix.goarch == 'arm64') }}
         env:
           GOOS: ""
           GOARCH: ""
