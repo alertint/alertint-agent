@@ -51,15 +51,69 @@ func supersedeAssessmentID(t *testing.T, f *prepE2EFixture) sql.NullString {
 }
 
 func drainSupersedeFoundation(f *prepE2EFixture) {
+	drainSupersedeFoundationWithPreempter(f, nil)
+}
+
+func drainSupersedeFoundationWithPreempter(f *prepE2EFixture, preempter situation.Preempter) {
 	f.t.Helper()
 	cor := correlator.New(correlator.Config{WindowSeconds: 60}, f.st, nil, nil)
 	dispatch := correlator.NewDispatchWorker(f.st, cor, correlator.WorkerConfig{Owner: f.owner + ":dispatch"}, nil)
 	inputs := situation.NewInputWorker(f.st, situation.WorkerConfig{Owner: f.owner + ":input", Now: f.clock.Now}, nil)
+	inputs.SetPreempter(preempter)
 	if _, err := dispatch.Drain(f.ctx); err != nil {
 		f.t.Fatalf("dispatch drain: %v", err)
 	}
 	if _, err := inputs.Drain(f.ctx); err != nil {
 		f.t.Fatalf("input drain: %v", err)
+	}
+}
+
+func TestControllerSupersededRunReturnsBeforeL2Release(t *testing.T) {
+	f := newPrepE2EFixture(t)
+	client := &supersedeE2ELLM{inCall: make(chan struct{}), release: make(chan struct{})}
+	cw := situation.NewControllerWorker(f.st, f.st, client,
+		situation.ControllerConfig{}, situation.ControllerWorkerConfig{Owner: f.owner + ":controller", Now: f.clock.Now},
+		f.clock.Now, audit.New(f.st.DB()), slog.New(slog.DiscardHandler))
+
+	f.postAlert("preempt-e2e", "HighErrorRate", "fp-0")
+	drainSupersedeFoundation(f)
+	f.markReady(f.soleIncidentID())
+	if _, err := cw.Drain(f.ctx); err != nil {
+		t.Fatalf("baseline controller drain: %v", err)
+	}
+	baseline := supersedeAssessmentID(t, f)
+	if !baseline.Valid {
+		t.Fatal("baseline assessment was not committed")
+	}
+	client.armed = true
+	f.postAlert("preempt-e2e", "HighErrorRate", "fp-1")
+	drainSupersedeFoundation(f)
+	f.clock.advance(time.Second)
+	done := make(chan error, 1)
+	go func() {
+		_, err := cw.RunOnce(f.ctx)
+		done <- err
+	}()
+	select {
+	case <-client.inCall:
+	case <-time.After(10 * time.Second):
+		t.Fatal("controller run did not reach L2")
+	}
+
+	f.postAlert("preempt-e2e", "HighErrorRate", "fp-2")
+	drainSupersedeFoundationWithPreempter(f, cw)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("superseded RunOnce: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		close(client.release)
+		<-done
+		t.Fatal("superseded run waited for L2 release instead of canceling")
+	}
+	if current := supersedeAssessmentID(t, f); current != baseline {
+		t.Fatalf("superseded run changed assessment from %v to %v", baseline, current)
 	}
 }
 
