@@ -169,11 +169,11 @@ func TestTelemetrySpansCarryIdentityDigestsAndCountsNeverPayloads(t *testing.T) 
 }
 
 // TestTelemetryReconcileSpanClassifiesCommitFailureAsStaleNotError proves a
-// fenced-commit rejection (a stale claim) is reported as commit_failed —
+// fenced-commit rejection (a stale claim) is reported as superseded —
 // spec.md's "the controller fails closed and the newer input remains due"
 // is an expected race, not an error class — and that the error text is
 // never attached to the span.
-func TestTelemetryReconcileSpanClassifiesCommitFailureAsStaleNotError(t *testing.T) {
+func TestTelemetryReconcileSpanClassifiesLostClaimAsSuperseded(t *testing.T) {
 	exporter := installSpanRecorder(t)
 
 	in := ctBaseSnapshotInput()
@@ -188,8 +188,8 @@ func TestTelemetryReconcileSpanClassifiesCommitFailureAsStaleNotError(t *testing
 	if len(reconciles) != 1 {
 		t.Fatalf("reconcile spans = %d, want 1", len(reconciles))
 	}
-	if got := attrValue(t, reconciles[0], situation.AttrResultClass).AsString(); got != situation.ReconcileResultCommitFailed {
-		t.Fatalf("result class = %q, want commit_failed", got)
+	if got := attrValue(t, reconciles[0], situation.AttrResultClass).AsString(); got != "superseded" {
+		t.Fatalf("result class = %q, want superseded", got)
 	}
 	if len(reconciles[0].Events) != 0 {
 		t.Fatalf("span events = %v, want none — error text is never recorded", reconciles[0].Events)

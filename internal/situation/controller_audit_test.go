@@ -27,11 +27,15 @@ import (
 // ----------------------------------------------------------------------
 
 type fakeAuditSink struct {
-	kinds    []string
-	payloads []any
+	kinds              []string
+	payloads           []any
+	requireLiveContext bool
 }
 
-func (s *fakeAuditSink) Append(_ context.Context, _actor, kind string, payload any) error {
+func (s *fakeAuditSink) Append(ctx context.Context, _actor, kind string, payload any) error {
+	if s.requireLiveContext && ctx.Err() != nil {
+		return ctx.Err()
+	}
 	s.kinds = append(s.kinds, kind)
 	s.payloads = append(s.payloads, payload)
 	return nil
@@ -159,6 +163,43 @@ func TestControllerReconcileAuditsAssessmentStaleOnStaleClaimAfterAcceptedCall(t
 	}
 	if audit.has("situation.assessment_failed") {
 		t.Fatalf("audit kinds = %v, want no assessment_failed: the model call itself succeeded", audit.kinds)
+	}
+}
+
+func TestControllerReconcileSupersededCallRetainsStaleOutcomeAcrossCancellation(t *testing.T) {
+	for _, when := range []string{"after commit", "before commit", "during stale append"} {
+		t.Run(when, func(t *testing.T) {
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(nil)
+			store := &fakeControllerStore{
+				loadInput: ctBaseSnapshotInput(), beginWorkAttempt: 1,
+				commitErr: model.ErrSituationLeaseLost, outcomeRequireLiveContext: true,
+			}
+			switch when {
+			case "before commit":
+				store.commitFn = func(situation.ControllerCommit) error {
+					cancel(model.ErrSituationLeaseLost)
+					return context.Canceled
+				}
+			case "during stale append":
+				store.outcomeOnCall = func() { cancel(model.ErrSituationLeaseLost) }
+			}
+			audit := &fakeAuditSink{requireLiveContext: true}
+			client := &fakeAssessmentClient{responses: []func() (llm.OneShotCompletion, error){acceptedResponse(t)}}
+			c := ctControllerWithAudit(t, store, client, audit)
+			if err := c.Reconcile(ctx, ctBaseClaim()); err == nil {
+				t.Fatal("lost claim must be returned")
+			}
+			if len(store.outcomeCalls) != 1 || store.outcomeCalls[0].Status != "stale" {
+				t.Fatalf("stale outcomes = %+v, want one", store.outcomeCalls)
+			}
+			if !audit.has("situation.assessment_stale") {
+				t.Fatalf("audit kinds = %v, want assessment_stale", audit.kinds)
+			}
+			if audit.has("situation.controller.commit_failed") {
+				t.Fatalf("audit kinds = %v, want no commit_failed", audit.kinds)
+			}
+		})
 	}
 }
 

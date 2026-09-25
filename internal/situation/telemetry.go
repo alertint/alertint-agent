@@ -212,12 +212,15 @@ func AuditKindsEmittedHere() []string {
 }
 
 // Closed result classes for SpanControllerReconcile's AttrResultClass.
+// Superseded means the claim lost its lease to newer input or another claim;
+// commit_failed is reserved for genuine commit failures.
 // SpanAssessmentDispatch uses L2Outcome values; SpanTriageAttempt uses the
 // Triage completion outcomes plus clean_skip/backoff/exhausted/lease_lost
 // and the *_failed store-write classes.
 const (
 	ReconcileResultCommitted    = "committed"
 	ReconcileResultCommitFailed = "commit_failed"
+	ReconcileResultSuperseded   = "superseded"
 	ReconcileResultError        = "error"
 )
 

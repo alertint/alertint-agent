@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A Situation reconcile superseded by a newer input is now recorded as
+  `superseded` (INFO) instead of a failed commit. The controller heartbeat
+  retries transient store errors while its lease is still valid (#117).
+
 ## [0.14.0-rc3] - 2026-09-23
 
 ### Fixed

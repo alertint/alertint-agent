@@ -3,9 +3,12 @@
 package situation_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +18,52 @@ import (
 	"github.com/alertint/alertint-agent/internal/situation"
 	"github.com/alertint/alertint-agent/internal/situation/model"
 )
+
+func TestControllerReconcileClassifiesLostClaimsAsSuperseded(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		loadErr        error
+		commitErr      error
+		cancelAtCommit bool
+		wantClass      string
+		wantErrLog     bool
+	}{
+		{name: "commit fence", commitErr: model.ErrSituationLeaseLost, wantClass: "superseded"},
+		{name: "wrapped preparation fence", loadErr: fmt.Errorf("cmd/alertint: begin preparation: %w", model.ErrSituationLeaseLost), wantClass: "superseded"},
+		{name: "heartbeat cancellation during commit", cancelAtCommit: true, wantClass: "superseded"},
+		{name: "store failure", commitErr: errors.New("disk I/O"), wantClass: "commit_failed", wantErrLog: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&buf, nil))
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(nil)
+			store := &fakeControllerStore{loadInput: ctFloorSnapshotInput(), loadErr: tc.loadErr, commitErr: tc.commitErr}
+			if tc.cancelAtCommit {
+				store.commitFn = func(situation.ControllerCommit) error {
+					cancel(model.ErrSituationLeaseLost)
+					return context.Canceled
+				}
+			}
+			c := situation.NewController(store, &fakeAssessmentClient{}, situation.ControllerConfig{},
+				func() time.Time { return ctBaseTime.Add(10 * time.Minute) }, nil, logger)
+			if err := c.Reconcile(ctx, ctBaseClaim()); err == nil {
+				t.Fatal("Reconcile must return the failed claim or store error")
+			}
+			lines := linesWithMsg(jsonLogLines(t, &buf), "situation: controller reconcile")
+			if len(lines) != 1 {
+				t.Fatalf("reconcile lines = %d, want 1", len(lines))
+			}
+			if got := lines[0]["result_class"]; got != tc.wantClass {
+				t.Fatalf("result_class = %v, want %s", got, tc.wantClass)
+			}
+			_, hasErr := lines[0]["err"]
+			if hasErr != tc.wantErrLog {
+				t.Fatalf("reconcile err attribute present = %t, want %t", hasErr, tc.wantErrLog)
+			}
+		})
+	}
+}
 
 // --------------------------------------------------------------------------
 // Fakes. Controller's dependencies are narrow, situation-native interfaces
@@ -44,8 +93,10 @@ type fakeControllerStore struct {
 	recordCalls []situation.AssessmentCall
 	recordErr   error
 
-	outcomeCalls []situation.AssessmentAttempt
-	outcomeErr   error
+	outcomeCalls              []situation.AssessmentAttempt
+	outcomeErr                error
+	outcomeOnCall             func()
+	outcomeRequireLiveContext bool
 
 	lastTrustworthy *situation.AuthoritativeAssessment
 
@@ -59,6 +110,7 @@ type fakeControllerStore struct {
 	claimFn      func(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]situation.Claim, error)
 	extendCalls  []situation.Claim
 	extendErr    error
+	extendFn     func(context.Context, int) error
 	releaseCalls []releaseControllerWorkCall
 	releaseErr   error
 }
@@ -112,6 +164,12 @@ func (f *fakeControllerStore) RecordAssessmentCall(ctx context.Context, claim si
 func (f *fakeControllerStore) AppendAssessmentOutcome(ctx context.Context, attempt situation.AssessmentAttempt) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.outcomeOnCall != nil {
+		f.outcomeOnCall()
+	}
+	if f.outcomeRequireLiveContext && ctx.Err() != nil {
+		return ctx.Err()
+	}
 	f.outcomeCalls = append(f.outcomeCalls, attempt)
 	f.order = append(f.order, "append_outcome")
 	return f.outcomeErr
@@ -159,9 +217,15 @@ func (f *fakeControllerStore) ClaimControllerWork(ctx context.Context, owner str
 
 func (f *fakeControllerStore) ExtendControllerLease(ctx context.Context, claim situation.Claim, now time.Time, lease time.Duration) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.extendCalls = append(f.extendCalls, claim)
-	return f.extendErr
+	call := len(f.extendCalls)
+	fn := f.extendFn
+	err := f.extendErr
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, call)
+	}
+	return err
 }
 
 func (f *fakeControllerStore) ReleaseControllerWork(ctx context.Context, claim situation.Claim, now time.Time, retryAt *time.Time, errorClass *string) error {

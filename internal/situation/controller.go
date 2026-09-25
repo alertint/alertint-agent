@@ -1630,15 +1630,10 @@ type historyBasis struct {
 // commit derives this reconciliation's durable history from the
 // authoritative result Plan 2 just finished building, attaches it to the
 // same ControllerCommit, and calls c.store.CommitController — one fenced,
-// all-or-nothing transaction. It logs/audits the outcome, including a
-// stale-claim failure, which Reconcile treats as a clean, expected race
-// (spec.md: "the controller fails closed and the newer input remains due")
-// rather than an unexpected error. commit_failed is a supplementary
-// diagnostic event beyond spec.md's own named 13-event taxonomy ("Audit
-// events cover AT LEAST" that list) — kept because a commit failure (most
-// commonly a stale-claim race) is operationally worth its own audit trail
-// distinct from any of the 13 named events, none of which name a
-// whole-commit failure.
+// all-or-nothing transaction. It records genuine commit failures; a
+// stale-claim failure is classified by Reconcile as an expected supersede
+// (spec.md: "the controller fails closed and the newer input remains due").
+// Genuine commit failures still emit the supplementary commit_failed audit.
 //
 // A history-derivation failure aborts the cycle BEFORE any write: a
 // Situation's authoritative state must never land without the history that
@@ -1668,6 +1663,9 @@ func (c *Controller) commit(ctx context.Context, claim Claim, basis historyBasis
 
 	err = c.store.CommitController(ctx, claim, commit)
 	if err != nil {
+		if superseded(ctx, err) {
+			return &commitFailedError{err: err}
+		}
 		c.logger.Warn("situation: controller commit failed", "situation_id", claim.Situation.ID, "err", err)
 		c.auditAppend(ctx, "situation.controller.commit_failed", map[string]any{
 			"situation_id": claim.Situation.ID, "error": err.Error(),
@@ -2101,6 +2099,8 @@ func (c *Controller) Reconcile(ctx context.Context, claim Claim) error {
 	switch {
 	case err == nil:
 		class = ReconcileResultCommitted
+	case superseded(ctx, err):
+		class = ReconcileResultSuperseded
 	case errors.As(err, &commitFailed):
 		class = ReconcileResultCommitFailed
 	default:
@@ -2119,11 +2119,18 @@ func (c *Controller) Reconcile(ctx context.Context, claim Claim) error {
 		"situation_id", claim.Situation.ID, "input_version", claim.Situation.InputVersion,
 		"result_class", class, "duration_ms", durationMS,
 	}, spanLogAttrs(span)...)
-	if err != nil {
+	if err != nil && class != ReconcileResultSuperseded {
 		attrs = append(attrs, "err", err)
 	}
 	c.logger.Info("situation: controller reconcile", attrs...)
 	return err
+}
+
+// superseded reports that this cycle lost its claim to a newer Situation
+// input or a competing claim after expiry.
+func superseded(ctx context.Context, err error) bool {
+	return errors.Is(err, model.ErrSituationLeaseLost) ||
+		errors.Is(context.Cause(ctx), model.ErrSituationLeaseLost)
 }
 
 func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
@@ -2401,6 +2408,8 @@ func (c *Controller) commitResult(ctx context.Context, claim Claim, basis histor
 	c.finalizeCheckpoint(&base, now)
 	err := c.commit(ctx, claim, basis, base)
 	if err != nil && callID != nil {
+		writeCtx, writeCancel := detachedWriteContext()
+		defer writeCancel()
 		// spec.md: "A stale proposal/attempt is retained as `stale` but
 		// changes no projection, Triage state, lifecycle, or outward
 		// effect." A concurrent Situation input invalidated the claim
@@ -2413,7 +2422,7 @@ func (c *Controller) commitResult(ctx context.Context, claim Claim, basis histor
 		// already fenced-rejected, could not accept it as authoritative
 		// even if asked to).
 		stale := buildStaleOutcome(base.Attempt, *callID)
-		if appendErr := c.store.AppendAssessmentOutcome(ctx, stale); appendErr != nil {
+		if appendErr := c.store.AppendAssessmentOutcome(writeCtx, stale); appendErr != nil { //nolint:contextcheck // stale records must survive cancellation of the reconcile context
 			c.logger.Error("situation: controller: append stale outcome after commit failure",
 				"situation_id", claim.Situation.ID, "call_id", *callID, "err", appendErr)
 		}
@@ -2427,7 +2436,7 @@ func (c *Controller) commitResult(ctx context.Context, claim Claim, basis histor
 		// regardless of whether the durable stale-outcome append above
 		// itself succeeded — audit is best-effort and never gates or
 		// repeats the already-completed model work.
-		c.auditAppend(ctx, "situation.assessment_stale", map[string]any{
+		c.auditAppend(writeCtx, "situation.assessment_stale", map[string]any{ //nolint:contextcheck // the audit shares the detached stale-record write context
 			"situation_id": claim.Situation.ID, "call_id": *callID, "attempt_id": stale.ID,
 			"input_version":            stale.InputVersion,
 			"provider_request_started": string(*stale.ProviderRequestStarted),
