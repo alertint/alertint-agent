@@ -37,6 +37,7 @@ type InputStore interface {
 	ClaimSituationInputs(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]model.SituationClaim, error)
 	ApplySituationInput(ctx context.Context, claim model.SituationClaim) error
 	RetrySituationInput(ctx context.Context, claim model.SituationClaim, class string, retryAt time.Time, terminal bool) error
+	DeferSituationInput(ctx context.Context, claim model.SituationClaim, retryAt time.Time) error
 }
 
 // WorkerConfig controls InputWorker's claim lease, schedule, batch size,
@@ -136,8 +137,9 @@ func NewInputWorker(store InputStore, cfg WorkerConfig, logger *slog.Logger) *In
 // 4s, ... doubling with each attempt, capped at five minutes so a
 // long-stuck dependency does not push a retry arbitrarily far out.
 const (
-	inputRetryBase = time.Second
-	inputRetryCap  = 5 * time.Minute
+	inputRetryBase  = time.Second
+	inputRetryCap   = 5 * time.Minute
+	inputDeferDelay = time.Second
 )
 
 // inputRetryBackoff returns the delay before a failed claim's next attempt,
@@ -177,9 +179,18 @@ func inputErrorClass(err error) (class string, terminal bool) {
 	}
 }
 
+type applyOutcome int
+
+const (
+	applyHandled applyOutcome = iota
+	applyDeferred
+	applyStop
+)
+
 // RunOnce claims at most cfg.Batch due situation inputs and applies them
 // sequentially, returning how many it handled (committed, terminally
-// failed, or scheduled for retry). A claim whose ApplySituationInput call
+// failed, or scheduled for retry). A protected input is deferred and not
+// counted as handled. A claim whose ApplySituationInput call
 // fails with context cancellation or model.ErrSituationLeaseLost is neither
 // counted nor written back — RunOnce stops the round immediately and
 // returns that error, since continuing to claim or apply more work under a
@@ -196,30 +207,40 @@ func (w *InputWorker) RunOnce(ctx context.Context) (int, error) {
 
 	handled := 0
 	for _, claim := range claims {
-		stop, err := w.applyOne(ctx, claim)
-		if stop {
+		outcome, err := w.applyOne(ctx, claim)
+		if outcome == applyStop {
 			return handled, err
 		}
-		handled++
+		if outcome == applyHandled {
+			handled++
+		}
 	}
 	return handled, nil
 }
 
 // applyOne applies one claimed input and, on failure, classifies and writes
-// back its retry/terminal outcome. stop is true only for context
+// back its retry/terminal outcome. applyStop is returned only for context
 // cancellation or a lost lease — cases where RunOnce must not keep claiming
 // or applying further work, and must not attempt to rewrite this claim (the
 // lease already moved on, or the caller is shutting down).
-func (w *InputWorker) applyOne(ctx context.Context, claim model.SituationClaim) (stop bool, err error) {
+func (w *InputWorker) applyOne(ctx context.Context, claim model.SituationClaim) (applyOutcome, error) {
 	applyErr := w.store.ApplySituationInput(ctx, claim)
 	if applyErr == nil {
-		return false, nil
+		return applyHandled, nil
+	}
+	if errors.Is(applyErr, model.ErrSituationProtected) {
+		if derr := w.store.DeferSituationInput(ctx, claim, w.cfg.Now().Add(inputDeferDelay)); derr != nil {
+			w.logger.Error("situation: input defer failed", "input_id", claim.ID, "err", derr)
+		} else {
+			w.logger.Debug("situation: input deferred; Situation run protected", "input_id", claim.ID)
+		}
+		return applyDeferred, nil
 	}
 
 	if errors.Is(applyErr, context.Canceled) || errors.Is(applyErr, context.DeadlineExceeded) || errors.Is(applyErr, model.ErrSituationLeaseLost) {
 		w.logger.Warn("situation: input worker round stopped",
 			"input_id", claim.ID, "attempt", claim.AttemptCount, "err", applyErr)
-		return true, applyErr
+		return applyStop, applyErr
 	}
 
 	class, terminal := inputErrorClass(applyErr)
@@ -239,12 +260,12 @@ func (w *InputWorker) applyOne(ctx context.Context, claim model.SituationClaim) 
 		// abandoning it.
 		w.logger.Error("situation: input retry write-back failed",
 			"input_id", claim.ID, "attempt", claim.AttemptCount, "class", class, "err", rerr)
-		return false, nil
+		return applyHandled, nil
 	}
 
 	w.logger.Warn("situation: input apply failed",
 		"input_id", claim.ID, "attempt", claim.AttemptCount, "class", class, "terminal", terminal, "err", applyErr)
-	return false, nil
+	return applyHandled, nil
 }
 
 // Drain runs RunOnce repeatedly until a round handles zero items (the

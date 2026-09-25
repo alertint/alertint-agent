@@ -738,6 +738,10 @@ func (f *countingInputStore) ApplySituationInput(context.Context, store.Situatio
 	return nil
 }
 
+func (f *countingInputStore) DeferSituationInput(context.Context, store.SituationClaim, time.Time) error {
+	return nil
+}
+
 func (f *countingInputStore) RetrySituationInput(context.Context, store.SituationClaim, string, time.Time, bool) error {
 	return nil
 }
