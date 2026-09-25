@@ -200,22 +200,28 @@ const (
 // regardless — a single input's outcome, terminal or not, is never grounds
 // to abandon the rest of the batch.
 func (w *InputWorker) RunOnce(ctx context.Context) (int, error) {
+	handled, _, err := w.runOnce(ctx)
+	return handled, err
+}
+
+func (w *InputWorker) runOnce(ctx context.Context) (handled, deferred int, err error) {
 	claims, err := w.store.ClaimSituationInputs(ctx, w.cfg.Owner, w.cfg.Now(), w.cfg.Lease, w.cfg.Batch)
 	if err != nil {
-		return 0, fmt.Errorf("situation: claim situation inputs: %w", err)
+		return 0, 0, fmt.Errorf("situation: claim situation inputs: %w", err)
 	}
 
-	handled := 0
 	for _, claim := range claims {
 		outcome, err := w.applyOne(ctx, claim)
-		if outcome == applyStop {
-			return handled, err
-		}
-		if outcome == applyHandled {
+		switch outcome {
+		case applyStop:
+			return handled, deferred, err
+		case applyHandled:
 			handled++
+		case applyDeferred:
+			deferred++
 		}
 	}
-	return handled, nil
+	return handled, deferred, nil
 }
 
 // applyOne applies one claimed input and, on failure, classifies and writes
@@ -268,21 +274,21 @@ func (w *InputWorker) applyOne(ctx context.Context, claim model.SituationClaim) 
 	return applyHandled, nil
 }
 
-// Drain runs RunOnce repeatedly until a round handles zero items (the
-// outbox is caught up) or a round returns an error. It returns the total
-// handled across every round.
+// Drain claims rounds until a round finds no due inputs or returns an error.
+// Deferred inputs count as claimed for continuation, but not as handled in
+// the returned total. Their retry time keeps them out of later rounds.
 func (w *InputWorker) Drain(ctx context.Context) (int, error) {
 	total := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return total, err
 		}
-		n, err := w.RunOnce(ctx)
-		total += n
+		handled, deferred, err := w.runOnce(ctx)
+		total += handled
 		if err != nil {
 			return total, err
 		}
-		if n == 0 {
+		if handled+deferred == 0 {
 			return total, nil
 		}
 	}
