@@ -89,6 +89,26 @@ func isOperatorArtifactKind(kind string) bool {
 // situation_input_outbox claim/apply/retry (Task 7)
 // ----------------------------------------------------------------------
 
+const claimSituationInputsQuery = `
+		UPDATE situation_input_outbox
+		SET status = 'claimed', lease_owner = ?, lease_expires_at = ?,
+		    claim_token = claim_token + 1, attempt_count = attempt_count + 1
+		WHERE id IN (
+			SELECT id FROM situation_input_outbox
+			WHERE ((status = 'pending' AND (retry_at IS NULL OR retry_at <= ?))
+			   OR (status = 'claimed' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))
+			  AND group_key NOT IN (
+				SELECT group_key FROM situations
+				-- Only open Situations hold controller leases; this uses situations_due_idx.
+				WHERE lifecycle IN ('active','recovery_pending')
+				  AND lease_protected = 1 AND lease_owner IS NOT NULL AND lease_expires_at > ?
+			  )
+			ORDER BY occurred_at ASC, id ASC
+			LIMIT ?
+		)
+		RETURNING id
+	`
+
 // ClaimSituationInputs leases due situation_input_outbox rows — pending rows
 // never claimed, or claimed rows whose lease has expired — in one atomic
 // transaction. Claiming increments both claim_token (fencing every prior
@@ -118,23 +138,7 @@ func (s *Store) ClaimSituationInputs(ctx context.Context, owner string, now time
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	rows, err := tx.QueryContext(ctx, `
-		UPDATE situation_input_outbox
-		SET status = 'claimed', lease_owner = ?, lease_expires_at = ?,
-		    claim_token = claim_token + 1, attempt_count = attempt_count + 1
-		WHERE id IN (
-			SELECT id FROM situation_input_outbox
-			WHERE ((status = 'pending' AND (retry_at IS NULL OR retry_at <= ?))
-			   OR (status = 'claimed' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))
-			  AND group_key NOT IN (
-				SELECT group_key FROM situations
-				WHERE lease_protected = 1 AND lease_owner IS NOT NULL AND lease_expires_at > ?
-			  )
-			ORDER BY occurred_at ASC, id ASC
-			LIMIT ?
-		)
-		RETURNING id
-	`, owner, leaseExpires, nowStr, nowStr, nowStr, limit)
+	rows, err := tx.QueryContext(ctx, claimSituationInputsQuery, owner, leaseExpires, nowStr, nowStr, nowStr, limit)
 	if err != nil {
 		return nil, fmt.Errorf("store: claim situation inputs: %w", err)
 	}

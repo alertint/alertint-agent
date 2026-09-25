@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -431,6 +432,35 @@ func TestProtectedGroupInputsAreNotClaimed(t *testing.T) {
 	}
 	if otherStatus != "applied" {
 		t.Fatalf("other input status = %q, want applied", otherStatus)
+	}
+}
+
+func TestClaimSituationInputsScansOnlyOpenSituations(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	rows, err := st.db.QueryContext(ctx, `EXPLAIN QUERY PLAN `+claimSituationInputsQuery,
+		"input-worker", "2026-09-25T12:05:00Z", "2026-09-25T12:00:00Z",
+		"2026-09-25T12:00:00Z", "2026-09-25T12:00:00Z", 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var plan []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan = append(plan, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	for _, detail := range plan {
+		if strings.Contains(detail, "SCAN situations") && !strings.Contains(detail, "USING INDEX") {
+			t.Fatalf("input claim scans all Situation history: %s\n%s", detail, strings.Join(plan, "\n"))
+		}
 	}
 }
 
