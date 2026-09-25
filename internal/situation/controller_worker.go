@@ -542,7 +542,7 @@ func (w *ControllerWorker) heartbeatLoop(ctx context.Context, cancel context.Can
 			} else {
 				extendCtx, extendCancel = context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 			}
-			err := w.store.ExtendControllerLease(extendCtx, claim, now, w.cfg.Lease) //nolint:contextcheck // by design: renewal must survive a reconcile cancellation
+			err := w.store.ExtendControllerLease(extendCtx, claim, now, w.cfg.Lease)
 			extendCancel()
 			switch {
 			case err == nil:
