@@ -465,13 +465,16 @@ func controllerWorkerRetryBackoff(attempt int) time.Duration {
 // event already carries err.Error() for diagnosis — see Controller.commit).
 const controllerReconcileFailedErrorClass = "controller_reconcile_failed"
 
+var errLeaseUnconfirmed = errors.New("situation: controller lease could not be renewed before expiry")
+
 // processOne runs claim's Reconcile cycle with a fenced lease heartbeat. On
-// any Reconcile failure it releases the lease early — CommitController's
-// own successful commit already clears it; a failure before ever reaching
-// CommitController (or CommitController's own fenced rejection) otherwise
-// leaves the lease held until it expires on its own, needlessly delaying
-// the next attempt. Finding I2: the release also pushes next_assessment_at/
-// retry_at forward by a bounded typed backoff (controllerWorkerRetryBackoff)
+// a superseded claim it leaves the newer owner/input untouched. On other
+// Reconcile failures it releases the lease early — CommitController's
+// own successful commit already clears it; a genuine failure before or at
+// CommitController otherwise leaves the lease held until it expires,
+// needlessly delaying the next attempt. Finding I2: the release also pushes
+// next_assessment_at/retry_at forward by a bounded typed backoff
+// (controllerWorkerRetryBackoff)
 // so a persistently-failing Situation is not instantly re-claimable — without
 // this, Drain would spin at 100% CPU reclaiming the same always-failing
 // Situation on every round. This backoff-carrying release is safe even for a
@@ -480,61 +483,84 @@ const controllerReconcileFailedErrorClass = "controller_reconcile_failed"
 // matches zero rows in that case — same as a plain release already would —
 // so the backoff write is a no-op rather than clobbering the newer claimant.
 func (w *ControllerWorker) processOne(ctx context.Context, claim Claim) {
-	reconcileCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	reconcileCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 
-	var leaseLost atomic.Bool
 	hbDone := make(chan struct{})
-	go w.heartbeatLoop(reconcileCtx, cancel, claim, &leaseLost, hbDone)
+	go w.heartbeatLoop(reconcileCtx, cancel, claim, hbDone)
 
 	err := w.controller.Reconcile(reconcileCtx, claim)
 
-	cancel()
+	cancel(nil)
 	<-hbDone
 
-	if leaseLost.Load() {
-		w.logger.Warn("situation: controller worker: lease lost mid-reconcile; abandoning",
-			"situation_id", claim.Situation.ID)
+	if err == nil {
 		return
 	}
-	if err != nil {
-		w.logger.Warn("situation: controller worker: reconcile failed", "situation_id", claim.Situation.ID, "err", err)
-		releaseCtx, releaseCancel := detachedControllerWorkerContext()
-		defer releaseCancel()
-		now := w.cfg.Now()
-		retryAt := now.Add(controllerWorkerRetryBackoff(claim.Situation.AttemptCount))
-		errClass := controllerReconcileFailedErrorClass
-		if rerr := w.store.ReleaseControllerWork(releaseCtx, claim, now, &retryAt, &errClass); rerr != nil && !errors.Is(rerr, model.ErrSituationLeaseLost) { //nolint:contextcheck // by design: releaseCtx is detachedControllerWorkerContext, independent of the possibly-canceled reconcile context
-			w.logger.Error("situation: controller worker: release after failed reconcile failed",
-				"situation_id", claim.Situation.ID, "err", rerr)
-		}
+	if superseded(reconcileCtx, err) {
+		return
+	}
+	w.logger.Warn("situation: controller worker: reconcile failed", "situation_id", claim.Situation.ID, "err", err)
+	releaseCtx, releaseCancel := detachedControllerWorkerContext()
+	defer releaseCancel()
+	now := w.cfg.Now()
+	retryAt := now.Add(controllerWorkerRetryBackoff(claim.Situation.AttemptCount))
+	errClass := controllerReconcileFailedErrorClass
+	if rerr := w.store.ReleaseControllerWork(releaseCtx, claim, now, &retryAt, &errClass); rerr != nil && !errors.Is(rerr, model.ErrSituationLeaseLost) { //nolint:contextcheck // by design: releaseCtx is detachedControllerWorkerContext, independent of the possibly-canceled reconcile context
+		w.logger.Error("situation: controller worker: release after failed reconcile failed",
+			"situation_id", claim.Situation.ID, "err", rerr)
 	}
 }
 
 // heartbeatLoop renews claim's lease every cfg.Heartbeat until ctx is done.
-// If a renewal ever fails, it marks leaseLost and cancels cancel so the
-// in-flight Reconcile call is abandoned rather than allowed to keep
-// running (and later commit) under a lease it no longer holds.
-func (w *ControllerWorker) heartbeatLoop(ctx context.Context, cancel context.CancelFunc, claim Claim, leaseLost *atomic.Bool, done chan<- struct{}) {
+// A lost fence cancels with its cause. Other errors are retried only while
+// the last confirmed lease has time for another heartbeat.
+func (w *ControllerWorker) heartbeatLoop(ctx context.Context, cancel context.CancelCauseFunc, claim Claim, done chan<- struct{}) {
 	defer close(done)
 
 	ticker := time.NewTicker(w.cfg.Heartbeat)
 	defer ticker.Stop()
+	var leaseUntil time.Time
+	hasBudget := claim.Situation.LeaseExpiresAt != nil
+	if hasBudget {
+		leaseUntil = *claim.Situation.LeaseExpiresAt
+	}
+	failures := 0
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			extendCtx, extendCancel := detachedControllerWorkerContext()
-			err := w.store.ExtendControllerLease(extendCtx, claim, w.cfg.Now(), w.cfg.Lease) //nolint:contextcheck // by design: extendCtx is detachedControllerWorkerContext, independent of the possibly-canceled reconcile context
+			now := w.cfg.Now()
+			var extendCtx context.Context
+			var extendCancel context.CancelFunc
+			if hasBudget && leaseUntil.After(now) && leaseUntil.Before(now.Add(10*time.Second)) {
+				// Use the absolute deadline: a timeout created after reading
+				// now can otherwise run a little past the confirmed lease.
+				extendCtx, extendCancel = context.WithDeadline(context.Background(), leaseUntil)
+			} else {
+				extendCtx, extendCancel = detachedControllerWorkerContext()
+			}
+			err := w.store.ExtendControllerLease(extendCtx, claim, now, w.cfg.Lease) //nolint:contextcheck // by design: renewal must survive a reconcile cancellation
 			extendCancel()
-			if err != nil {
-				w.logger.Warn("situation: controller worker: heartbeat lease extend failed; canceling reconcile",
-					"situation_id", claim.Situation.ID, "err", err)
-				leaseLost.Store(true)
-				cancel()
+			switch {
+			case err == nil:
+				leaseUntil, hasBudget, failures = now.Add(w.cfg.Lease), true, 0
+			case errors.Is(err, model.ErrSituationLeaseLost):
+				w.logger.Debug("situation: controller worker: lease lost to a newer input or claim",
+					"situation_id", claim.Situation.ID)
+				cancel(model.ErrSituationLeaseLost)
 				return
+			case !hasBudget || !w.cfg.Now().Add(w.cfg.Heartbeat).Before(leaseUntil):
+				w.logger.Warn("situation: controller worker: lease renewal failing; canceling reconcile before the lease lapses",
+					"situation_id", claim.Situation.ID, "failures", failures+1, "lease_until", leaseUntil, "err", err)
+				cancel(errLeaseUnconfirmed)
+				return
+			default:
+				failures++
+				w.logger.Warn("situation: controller worker: heartbeat lease extend failed; retrying",
+					"situation_id", claim.Situation.ID, "failures", failures, "lease_until", leaseUntil, "err", err)
 			}
 		}
 	}

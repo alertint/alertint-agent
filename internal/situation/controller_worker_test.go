@@ -3,8 +3,10 @@
 package situation_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/llm"
 	"github.com/alertint/alertint-agent/internal/situation"
+	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
 // --------------------------------------------------------------------------
@@ -266,7 +269,7 @@ func TestControllerWorkerLeaseLossCancelsReconcileAndAbandonsWithoutRelease(t *t
 		claimFn: func(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]situation.Claim, error) {
 			return []situation.Claim{claim}, nil
 		},
-		extendErr: errors.New("lease lost"),
+		extendErr: model.ErrSituationLeaseLost,
 		commitFn: func(situation.ControllerCommit) error {
 			// Never actually reached in this scenario (see below); present
 			// only so a bug that DOES reach it fails loudly instead of
@@ -292,7 +295,9 @@ func TestControllerWorkerLeaseLossCancelsReconcileAndAbandonsWithoutRelease(t *t
 	store.loadInput = in2
 	store.beginWorkAttempt = 1
 
-	w := situation.NewControllerWorker(store, store, client, situation.ControllerConfig{}, cfg, nil, nil, nil)
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	w := situation.NewControllerWorker(store, store, client, situation.ControllerConfig{}, cfg, nil, nil, logger)
 
 	done := make(chan struct{})
 	go func() {
@@ -314,6 +319,231 @@ func TestControllerWorkerLeaseLossCancelsReconcileAndAbandonsWithoutRelease(t *t
 	if len(store.snapshotReleaseCalls()) != 0 {
 		t.Fatal("a lease already lost mid-reconcile must not be independently released — the abandon path owns it")
 	}
+	lines := jsonLogLines(t, &buf)
+	reconciles := linesWithMsg(lines, "situation: controller reconcile")
+	if len(reconciles) != 1 || reconciles[0]["result_class"] != "superseded" {
+		t.Fatalf("reconcile lines = %v, want one superseded result", reconciles)
+	}
+	for _, line := range lines {
+		if line["level"] == "WARN" {
+			t.Fatalf("superseded heartbeat emitted warning: %v", line)
+		}
+	}
+}
+
+func TestControllerWorkerSupersededCommitDoesNotRelease(t *testing.T) {
+	claim := ctClaimFor("situation-superseded", "worker-a", 1)
+	expires := time.Now().UTC().Add(time.Minute)
+	claim.Situation.LeaseExpiresAt = &expires
+	store := &fakeControllerStore{
+		loadInput: ctFloorSnapshotInput(), commitErr: model.ErrSituationLeaseLost,
+		claimFn: func(context.Context, string, time.Time, time.Duration, int) ([]situation.Claim, error) {
+			return []situation.Claim{claim}, nil
+		},
+	}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	w := situation.NewControllerWorker(store, store, &fakeAssessmentClient{}, situation.ControllerConfig{}, newWorkerConfig("worker-a"), nil, nil, logger)
+	if _, err := w.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if got := store.snapshotReleaseCalls(); len(got) != 0 {
+		t.Fatalf("release calls = %+v, want none for a lost claim", got)
+	}
+	lines := jsonLogLines(t, &buf)
+	if got := linesWithMsg(lines, "situation: controller worker: reconcile failed"); len(got) != 0 {
+		t.Fatalf("failure warnings = %v, want none", got)
+	}
+	if got := linesWithMsg(lines, "situation: controller reconcile"); len(got) != 1 || got[0]["result_class"] != "superseded" {
+		t.Fatalf("reconcile lines = %v, want one superseded result", got)
+	}
+}
+
+func TestControllerWorkerHeartbeatRetriesTransientExtendError(t *testing.T) {
+	claim := ctClaimFor("situation-retry", "worker-a", 1)
+	expires := time.Now().UTC().Add(300 * time.Millisecond)
+	claim.Situation.LeaseExpiresAt = &expires
+	store := &fakeControllerStore{
+		loadInput: ctBaseSnapshotInput(), beginWorkAttempt: 1,
+		claimFn: func(context.Context, string, time.Time, time.Duration, int) ([]situation.Claim, error) {
+			return []situation.Claim{claim}, nil
+		},
+		extendFn: func(_ context.Context, call int) error {
+			if call == 1 {
+				return errors.New("database is locked")
+			}
+			return nil
+		},
+	}
+	accepted := acceptedResponse(t)
+	client := &fakeAssessmentClient{ctxFn: func(ctx context.Context) (llm.OneShotCompletion, error) {
+		select {
+		case <-time.After(70 * time.Millisecond):
+			return accepted()
+		case <-ctx.Done():
+			return llm.OneShotCompletion{}, ctx.Err()
+		}
+	}}
+	cfg := newWorkerConfig("worker-a")
+	cfg.Heartbeat = 10 * time.Millisecond
+	cfg.Lease = 300 * time.Millisecond
+	w := situation.NewControllerWorker(store, store, client, situation.ControllerConfig{}, cfg, nil, nil, nil)
+	if _, err := w.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if got := len(store.snapshotCommits()); got != 1 {
+		t.Fatalf("commits = %d, want one after transient extend failure", got)
+	}
+	if got := store.snapshotExtendCalls(); got < 2 {
+		t.Fatalf("extends = %d, want retry", got)
+	}
+	if got := store.snapshotReleaseCalls(); len(got) != 0 {
+		t.Fatalf("release calls = %+v, want none", got)
+	}
+}
+
+func TestControllerWorkerHeartbeatCancelsBeforeLeaseLapses(t *testing.T) {
+	claim := ctClaimFor("situation-unconfirmed", "worker-a", 1)
+	expires := time.Now().UTC().Add(50 * time.Millisecond)
+	claim.Situation.LeaseExpiresAt = &expires
+	store := &fakeControllerStore{
+		loadInput: ctBaseSnapshotInput(), beginWorkAttempt: 1,
+		claimFn: func(context.Context, string, time.Time, time.Duration, int) ([]situation.Claim, error) {
+			return []situation.Claim{claim}, nil
+		},
+		extendErr: errors.New("database is locked"),
+	}
+	client := &fakeAssessmentClient{ctxFn: func(ctx context.Context) (llm.OneShotCompletion, error) {
+		<-ctx.Done()
+		return llm.OneShotCompletion{}, ctx.Err()
+	}}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	cfg := newWorkerConfig("worker-a")
+	cfg.Heartbeat = 10 * time.Millisecond
+	cfg.Lease = 50 * time.Millisecond
+	w := situation.NewControllerWorker(store, store, client, situation.ControllerConfig{}, cfg, nil, nil, logger)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := w.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("RunOnce stopped on parent deadline: %v", ctx.Err())
+	}
+	lines := linesWithMsg(jsonLogLines(t, &buf), "situation: controller reconcile")
+	if len(lines) != 1 || lines[0]["result_class"] == "committed" || lines[0]["result_class"] == "superseded" {
+		t.Fatalf("reconcile lines = %v, want a real failure", lines)
+	}
+	if got := store.snapshotExtendCalls(); got < 2 {
+		t.Fatalf("extends = %d, want retry before cancellation", got)
+	}
+	releases := store.snapshotReleaseCalls()
+	if len(releases) != 1 || releases[0].RetryAt == nil {
+		t.Fatalf("release calls = %+v, want one with backoff", releases)
+	}
+}
+
+func TestControllerWorkerHeartbeatWithoutLeaseExpiryHasNoRetryBudget(t *testing.T) {
+	claim := ctClaimFor("situation-no-expiry", "worker-a", 1)
+	store := &fakeControllerStore{
+		loadInput: ctBaseSnapshotInput(), beginWorkAttempt: 1,
+		claimFn: func(context.Context, string, time.Time, time.Duration, int) ([]situation.Claim, error) {
+			return []situation.Claim{claim}, nil
+		},
+		extendErr: errors.New("database is locked"),
+	}
+	client := &fakeAssessmentClient{ctxFn: func(ctx context.Context) (llm.OneShotCompletion, error) {
+		<-ctx.Done()
+		return llm.OneShotCompletion{}, ctx.Err()
+	}}
+	cfg := newWorkerConfig("worker-a")
+	cfg.Heartbeat = 10 * time.Millisecond
+	w := situation.NewControllerWorker(store, store, client, situation.ControllerConfig{}, cfg, nil, nil, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := w.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("RunOnce stopped on parent deadline: %v", ctx.Err())
+	}
+	if got := store.snapshotExtendCalls(); got != 1 {
+		t.Fatalf("extends = %d, want cancellation on first failure without expiry", got)
+	}
+	if got := store.snapshotReleaseCalls(); len(got) != 1 {
+		t.Fatalf("release calls = %+v, want one", got)
+	}
+}
+
+func TestControllerWorkerHeartbeatBatchWaitedClaimHasReducedBudget(t *testing.T) {
+	claim := ctClaimFor("situation-waited", "worker-a", 1)
+	expires := time.Now().UTC().Add(15 * time.Millisecond)
+	claim.Situation.LeaseExpiresAt = &expires
+	store := &fakeControllerStore{
+		loadInput: ctBaseSnapshotInput(), beginWorkAttempt: 1,
+		claimFn: func(context.Context, string, time.Time, time.Duration, int) ([]situation.Claim, error) {
+			return []situation.Claim{claim}, nil
+		},
+		extendErr: errors.New("database is locked"),
+	}
+	client := &fakeAssessmentClient{ctxFn: func(ctx context.Context) (llm.OneShotCompletion, error) {
+		<-ctx.Done()
+		return llm.OneShotCompletion{}, ctx.Err()
+	}}
+	cfg := newWorkerConfig("worker-a")
+	cfg.Heartbeat = 10 * time.Millisecond
+	w := situation.NewControllerWorker(store, store, client, situation.ControllerConfig{}, cfg, nil, nil, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := w.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("RunOnce stopped on parent deadline: %v", ctx.Err())
+	}
+	if got := store.snapshotExtendCalls(); got != 1 {
+		t.Fatalf("extends = %d, want one failed renewal for waited claim", got)
+	}
+	if got := store.snapshotReleaseCalls(); len(got) != 1 {
+		t.Fatalf("release calls = %+v, want one", got)
+	}
+}
+
+func TestControllerWorkerHeartbeatExtendBoundedByRemainingLease(t *testing.T) {
+	claim := ctClaimFor("situation-bound", "worker-a", 1)
+	expires := time.Now().UTC().Add(50 * time.Millisecond)
+	claim.Situation.LeaseExpiresAt = &expires
+	var sawDeadline time.Time
+	store := &fakeControllerStore{
+		loadInput: ctBaseSnapshotInput(), beginWorkAttempt: 1,
+		claimFn: func(context.Context, string, time.Time, time.Duration, int) ([]situation.Claim, error) {
+			return []situation.Claim{claim}, nil
+		},
+		extendFn: func(ctx context.Context, _ int) error {
+			sawDeadline, _ = ctx.Deadline()
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	client := &fakeAssessmentClient{ctxFn: func(ctx context.Context) (llm.OneShotCompletion, error) {
+		<-ctx.Done()
+		return llm.OneShotCompletion{}, ctx.Err()
+	}}
+	cfg := newWorkerConfig("worker-a")
+	cfg.Heartbeat = 10 * time.Millisecond
+	w := situation.NewControllerWorker(store, store, client, situation.ControllerConfig{}, cfg, nil, nil, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := w.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("RunOnce stopped on parent deadline: %v", ctx.Err())
+	}
+	if sawDeadline.IsZero() || sawDeadline.After(expires) {
+		t.Fatalf("extend deadline = %v, want no later than lease expiry %v", sawDeadline, expires)
+	}
 }
 
 func TestControllerWorkerReleasesOnReconcileFailure(t *testing.T) {
@@ -329,7 +559,10 @@ func TestControllerWorkerReleasesOnReconcileFailure(t *testing.T) {
 	cfg := newWorkerConfig("worker-a")
 	fixedNow := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
 	cfg.Now = func() time.Time { return fixedNow }
-	w := situation.NewControllerWorker(store, store, &fakeAssessmentClient{}, situation.ControllerConfig{}, cfg, nil, nil, nil)
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	audit := &fakeAuditSink{}
+	w := situation.NewControllerWorker(store, store, &fakeAssessmentClient{}, situation.ControllerConfig{}, cfg, nil, audit, logger)
 
 	if _, err := w.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
@@ -349,6 +582,12 @@ func TestControllerWorkerReleasesOnReconcileFailure(t *testing.T) {
 	}
 	if releases[0].ErrorClass == nil || *releases[0].ErrorClass == "" {
 		t.Fatal("release after a failed Reconcile must record a bounded error class")
+	}
+	if !audit.has("situation.controller.commit_failed") {
+		t.Fatalf("audit kinds = %v, want commit_failed for a genuine store failure", audit.kinds)
+	}
+	if got := linesWithMsg(jsonLogLines(t, &buf), "situation: controller commit failed"); len(got) != 1 || got[0]["level"] != "WARN" {
+		t.Fatalf("commit failure lines = %v, want one WARN", got)
 	}
 }
 
