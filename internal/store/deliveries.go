@@ -1137,8 +1137,6 @@ func insertDeliveryTx(ctx context.Context, tx *sql.Tx, p preparedDelivery, a Ale
 // pre-flight conflict scan already ruled the analogous per-package
 // WorkerConfig duplication intentional rather than something to unify across
 // the two claim mechanisms.
-//
-//nolint:dupl // mirrors ClaimSituationInputs deliberately; see doc comment above
 func (s *Store) ClaimAlertDispatches(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]AlertDispatch, error) {
 	if strings.TrimSpace(owner) == "" || lease <= 0 || limit <= 0 {
 		return nil, errors.New("store: dispatch claim requires owner, positive lease, and positive limit")

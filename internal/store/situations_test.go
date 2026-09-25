@@ -302,11 +302,11 @@ func TestClaimProtectsAfterTwoSupersedes(t *testing.T) {
 
 func TestProtectedClaimDefersJoin(t *testing.T) {
 	st, situationID, now := twoSupersedesFixture(t)
+	insertIncidentAndInput(t, st, "inc-guard-held", "input-guard-held", "service=due", now)
+	inputClaim := claimOneInput(t, st, "input-worker", now)
 	claimGuardTestSituation(t, st, now)
 	before := getSituationByID(t, st, situationID)
 	membersBefore := listSituationIncidentIDs(t, st, situationID)
-	insertIncidentAndInput(t, st, "inc-guard-held", "input-guard-held", "service=due", now)
-	inputClaim := claimOneInput(t, st, "input-worker", now)
 	if err := st.ApplySituationInput(context.Background(), inputClaim); !errors.Is(err, ErrSituationProtected) {
 		t.Fatalf("protected apply error = %v, want ErrSituationProtected", err)
 	}
@@ -379,6 +379,7 @@ func TestHeldInputBatchDoesNotBlockAnotherSituation(t *testing.T) {
 
 type countingDeferStore struct {
 	*Store
+
 	deferCalls int
 }
 
@@ -525,9 +526,9 @@ func TestDeferSituationInputGivesBackTheAttempt(t *testing.T) {
 
 func TestCommitResetsStreakAndProtection(t *testing.T) {
 	st, situationID, now := twoSupersedesFixture(t)
-	claimed := claimGuardTestSituation(t, st, now)
 	insertIncidentAndInput(t, st, "inc-guard-after-commit", "input-guard-after-commit", "service=due", now)
 	inputClaim := claimOneInput(t, st, "input-worker", now)
+	claimed := claimGuardTestSituation(t, st, now)
 	if err := st.ApplySituationInput(context.Background(), inputClaim); !errors.Is(err, ErrSituationProtected) {
 		t.Fatalf("apply before protected commit = %v, want protected", err)
 	}

@@ -95,14 +95,15 @@ func isOperatorArtifactKind(kind string) bool {
 // lease holder out) and attempt_count. Rows are claimed and returned in
 // deterministic (occurred_at, id) order. Claiming never applies anything;
 // callers apply claimed work only after this transaction commits.
+// Inputs for a group with a live protected controller lease are skipped until
+// that lease is committed, released, or expires. ApplySituationInput still
+// rejects a claim made just before its Situation became protected.
 //
 // This deliberately mirrors ClaimAlertDispatches' claim shape one table over
 // (situation_input_outbox vs. alert_delivery_dispatches); this plan's own
 // pre-flight conflict scan already ruled the analogous per-package
 // WorkerConfig duplication intentional rather than something to unify across
 // the two claim mechanisms.
-//
-//nolint:dupl // mirrors ClaimAlertDispatches deliberately; see doc comment above
 func (s *Store) ClaimSituationInputs(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]SituationClaim, error) {
 	if strings.TrimSpace(owner) == "" || lease <= 0 || limit <= 0 {
 		return nil, errors.New("store: situation input claim requires owner, positive lease, and positive limit")
@@ -123,13 +124,17 @@ func (s *Store) ClaimSituationInputs(ctx context.Context, owner string, now time
 		    claim_token = claim_token + 1, attempt_count = attempt_count + 1
 		WHERE id IN (
 			SELECT id FROM situation_input_outbox
-			WHERE (status = 'pending' AND (retry_at IS NULL OR retry_at <= ?))
-			   OR (status = 'claimed' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+			WHERE ((status = 'pending' AND (retry_at IS NULL OR retry_at <= ?))
+			   OR (status = 'claimed' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))
+			  AND group_key NOT IN (
+				SELECT group_key FROM situations
+				WHERE lease_protected = 1 AND lease_owner IS NOT NULL AND lease_expires_at > ?
+			  )
 			ORDER BY occurred_at ASC, id ASC
 			LIMIT ?
 		)
 		RETURNING id
-	`, owner, leaseExpires, nowStr, nowStr, limit)
+	`, owner, leaseExpires, nowStr, nowStr, nowStr, limit)
 	if err != nil {
 		return nil, fmt.Errorf("store: claim situation inputs: %w", err)
 	}
