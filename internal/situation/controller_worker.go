@@ -538,9 +538,9 @@ func (w *ControllerWorker) heartbeatLoop(ctx context.Context, cancel context.Can
 			if hasBudget && leaseUntil.After(now) && leaseUntil.Before(now.Add(10*time.Second)) {
 				// Use the absolute deadline: a timeout created after reading
 				// now can otherwise run a little past the confirmed lease.
-				extendCtx, extendCancel = context.WithDeadline(context.Background(), leaseUntil)
+				extendCtx, extendCancel = context.WithDeadline(context.WithoutCancel(ctx), leaseUntil)
 			} else {
-				extendCtx, extendCancel = detachedControllerWorkerContext()
+				extendCtx, extendCancel = context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 			}
 			err := w.store.ExtendControllerLease(extendCtx, claim, now, w.cfg.Lease) //nolint:contextcheck // by design: renewal must survive a reconcile cancellation
 			extendCancel()

@@ -511,10 +511,12 @@ func TestControllerWorkerHeartbeatBatchWaitedClaimHasReducedBudget(t *testing.T)
 }
 
 func TestControllerWorkerHeartbeatExtendBoundedByRemainingLease(t *testing.T) {
+	type renewalContextKey struct{}
 	claim := ctClaimFor("situation-bound", "worker-a", 1)
 	expires := time.Now().UTC().Add(50 * time.Millisecond)
 	claim.Situation.LeaseExpiresAt = &expires
 	var sawDeadline time.Time
+	var sawContextValue any
 	store := &fakeControllerStore{
 		loadInput: ctBaseSnapshotInput(), beginWorkAttempt: 1,
 		claimFn: func(context.Context, string, time.Time, time.Duration, int) ([]situation.Claim, error) {
@@ -522,6 +524,7 @@ func TestControllerWorkerHeartbeatExtendBoundedByRemainingLease(t *testing.T) {
 		},
 		extendFn: func(ctx context.Context, _ int) error {
 			sawDeadline, _ = ctx.Deadline()
+			sawContextValue = ctx.Value(renewalContextKey{})
 			<-ctx.Done()
 			return ctx.Err()
 		},
@@ -533,7 +536,7 @@ func TestControllerWorkerHeartbeatExtendBoundedByRemainingLease(t *testing.T) {
 	cfg := newWorkerConfig("worker-a")
 	cfg.Heartbeat = 10 * time.Millisecond
 	w := situation.NewControllerWorker(store, store, client, situation.ControllerConfig{}, cfg, nil, nil, nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.WithValue(context.Background(), renewalContextKey{}, "trace-context"), 2*time.Second)
 	defer cancel()
 	if _, err := w.RunOnce(ctx); err != nil {
 		t.Fatalf("RunOnce: %v", err)
@@ -543,6 +546,9 @@ func TestControllerWorkerHeartbeatExtendBoundedByRemainingLease(t *testing.T) {
 	}
 	if sawDeadline.IsZero() || sawDeadline.After(expires) {
 		t.Fatalf("extend deadline = %v, want no later than lease expiry %v", sawDeadline, expires)
+	}
+	if sawContextValue != "trace-context" {
+		t.Fatalf("extend context value = %v, want trace-context", sawContextValue)
 	}
 }
 
