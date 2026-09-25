@@ -102,6 +102,8 @@ const (
 	AttrSituationID            = attribute.Key("alertint.situation.id")
 	AttrIncidentID             = attribute.Key("alertint.incident.id")
 	AttrInputVersion           = attribute.Key("alertint.situation.input_version")
+	AttrSupersedeStreak        = attribute.Key("alertint.situation.supersede_streak")
+	AttrLeaseProtected         = attribute.Key("alertint.situation.lease_protected")
 	AttrAttemptID              = attribute.Key("alertint.attempt.id")
 	AttrAssessmentCallID       = attribute.Key("alertint.assessment.call_id")
 	AttrRetryEpoch             = attribute.Key("alertint.assessment.retry_epoch")

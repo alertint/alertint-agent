@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/situation"
 	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 )
 
@@ -215,6 +217,366 @@ func dueSituationFixture(t *testing.T) (*Store, string, time.Time) {
 		t.Fatalf("situations = %+v, want exactly 1", sits)
 	}
 	return st, sits[0].ID, now
+}
+
+func TestSituationSupersedeGuardColumnsDefaultClear(t *testing.T) {
+	st, situationID, _ := dueSituationFixture(t)
+	var streak, protected int
+	if err := st.db.QueryRowContext(context.Background(), `
+		SELECT supersede_streak, lease_protected FROM situations WHERE id = ?`, situationID).Scan(&streak, &protected); err != nil {
+		t.Fatalf("read supersede guard columns: %v", err)
+	}
+	if streak != 0 || protected != 0 {
+		t.Fatalf("new Situation guard = (%d, %d), want (0, 0)", streak, protected)
+	}
+}
+
+func applyGuardTestInput(t *testing.T, st *Store, incidentID, inputID string, now time.Time) {
+	t.Helper()
+	insertIncidentAndInput(t, st, incidentID, inputID, "service=due", now)
+	claim := claimOneInput(t, st, "input-worker", now)
+	if err := st.ApplySituationInput(context.Background(), claim); err != nil {
+		t.Fatalf("apply input %s: %v", inputID, err)
+	}
+}
+
+func claimGuardTestSituation(t *testing.T, st *Store, now time.Time) situationmodel.Situation {
+	t.Helper()
+	claims, err := st.ClaimDueSituations(context.Background(), "controller", now, time.Minute, 1)
+	if err != nil {
+		t.Fatalf("claim due Situation: %v", err)
+	}
+	if len(claims) != 1 {
+		t.Fatalf("claimed %d Situations, want one", len(claims))
+	}
+	return claims[0]
+}
+
+func TestJoinCountsSupersededLiveClaims(t *testing.T) {
+	st, situationID, _ := dueSituationFixture(t)
+	now := time.Now().UTC().Add(2 * time.Second)
+	claimGuardTestSituation(t, st, now)
+	applyGuardTestInput(t, st, "inc-guard-1", "input-guard-1", now)
+	first := getSituationByID(t, st, situationID)
+	if first.SupersedeStreak != 1 || first.LeaseOwner != nil {
+		t.Fatalf("after first live claim lost: streak=%d lease=%v, want 1 and nil", first.SupersedeStreak, first.LeaseOwner)
+	}
+	applyGuardTestInput(t, st, "inc-guard-2", "input-guard-2", now)
+	if got := getSituationByID(t, st, situationID).SupersedeStreak; got != 1 {
+		t.Fatalf("second input during same claim: streak=%d, want 1", got)
+	}
+	claimGuardTestSituation(t, st, now)
+	applyGuardTestInput(t, st, "inc-guard-3", "input-guard-3", now)
+	if got := getSituationByID(t, st, situationID).SupersedeStreak; got != 2 {
+		t.Fatalf("after second live claim lost: streak=%d, want 2", got)
+	}
+	applyGuardTestInput(t, st, "inc-guard-4", "input-guard-4", now)
+	if got := getSituationByID(t, st, situationID).SupersedeStreak; got != 2 {
+		t.Fatalf("unclaimed input: streak=%d, want 2", got)
+	}
+}
+
+func twoSupersedesFixture(t *testing.T) (*Store, string, time.Time) {
+	t.Helper()
+	st, situationID, _ := dueSituationFixture(t)
+	now := time.Now().UTC().Add(2 * time.Second)
+	claimGuardTestSituation(t, st, now)
+	applyGuardTestInput(t, st, "inc-guard-a", "input-guard-a", now)
+	claimGuardTestSituation(t, st, now)
+	applyGuardTestInput(t, st, "inc-guard-b", "input-guard-b", now)
+	if got := getSituationByID(t, st, situationID).SupersedeStreak; got != 2 {
+		t.Fatalf("fixture streak=%d, want 2", got)
+	}
+	return st, situationID, now
+}
+
+func TestClaimProtectsAfterTwoSupersedes(t *testing.T) {
+	st, situationID, now := twoSupersedesFixture(t)
+	claim := claimGuardTestSituation(t, st, now)
+	if claim.ID != situationID || !claim.LeaseProtected {
+		t.Fatalf("claim Situation=%s protected=%v, want %s and true", claim.ID, claim.LeaseProtected, situationID)
+	}
+	if got := getSituationByID(t, st, situationID); !got.LeaseProtected {
+		t.Fatal("durable lease protection is false after guarded claim")
+	}
+}
+
+func TestProtectedClaimDefersJoin(t *testing.T) {
+	st, situationID, now := twoSupersedesFixture(t)
+	insertIncidentAndInput(t, st, "inc-guard-held", "input-guard-held", "service=due", now)
+	inputClaim := claimOneInput(t, st, "input-worker", now)
+	claimGuardTestSituation(t, st, now)
+	before := getSituationByID(t, st, situationID)
+	membersBefore := listSituationIncidentIDs(t, st, situationID)
+	if err := st.ApplySituationInput(context.Background(), inputClaim); !errors.Is(err, ErrSituationProtected) {
+		t.Fatalf("protected apply error = %v, want ErrSituationProtected", err)
+	}
+	after := getSituationByID(t, st, situationID)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("protected Situation changed: before=%+v after=%+v", before, after)
+	}
+	if got := listSituationIncidentIDs(t, st, situationID); !reflect.DeepEqual(got, membersBefore) {
+		t.Fatalf("protected membership changed: before=%v after=%v", membersBefore, got)
+	}
+	var status string
+	if err := st.db.QueryRowContext(context.Background(), `SELECT status FROM situation_input_outbox WHERE id = ?`, inputClaim.ID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "claimed" {
+		t.Fatalf("protected input status = %q, want claimed", status)
+	}
+}
+
+func TestHeldInputBatchDoesNotBlockAnotherSituation(t *testing.T) {
+	st, _, now := twoSupersedesFixture(t)
+	claimGuardTestSituation(t, st, now)
+
+	for i := range 16 {
+		insertIncidentAndInput(t, st,
+			fmt.Sprintf("inc-held-%02d", i), fmt.Sprintf("input-held-%02d", i), "service=due", now)
+	}
+	insertIncidentAndInput(t, st, "inc-other", "input-other", "service=other", now.Add(time.Second))
+
+	worker := situation.NewInputWorker(st, situation.WorkerConfig{
+		Owner: "input-worker", Now: func() time.Time { return now.Add(2 * time.Second) },
+	}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if handled, err := worker.Drain(ctx); err != nil || handled != 1 {
+		t.Fatalf("drain = (%d, %v), want (1, nil)", handled, err)
+	}
+
+	rows, err := st.db.QueryContext(ctx, `
+		SELECT id, status, attempt_count FROM situation_input_outbox
+		WHERE id LIKE 'input-held-%' OR id = 'input-other'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	held := 0
+	otherApplied := false
+	for rows.Next() {
+		var id, status string
+		var attempts int
+		if err := rows.Scan(&id, &status, &attempts); err != nil {
+			t.Fatal(err)
+		}
+		if id == "input-other" {
+			otherApplied = status == "applied" && attempts == 1
+			continue
+		}
+		if status != "pending" || attempts != 0 {
+			t.Fatalf("held input %s = (%s, %d), want (pending, 0)", id, status, attempts)
+		}
+		held++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if held != 16 || !otherApplied {
+		t.Fatalf("held = %d, other applied = %v; want 16 and true", held, otherApplied)
+	}
+}
+
+type countingDeferStore struct {
+	*Store
+
+	deferCalls int
+}
+
+func (s *countingDeferStore) DeferSituationInput(ctx context.Context, claim SituationClaim, retryAt time.Time) error {
+	s.deferCalls++
+	return s.Store.DeferSituationInput(ctx, claim, retryAt)
+}
+
+func TestProtectedGroupInputsAreNotClaimed(t *testing.T) {
+	st, _, now := twoSupersedesFixture(t)
+	claimGuardTestSituation(t, st, now)
+	for i := range 16 {
+		insertIncidentAndInput(t, st,
+			fmt.Sprintf("inc-unclaimed-%02d", i), fmt.Sprintf("input-unclaimed-%02d", i), "service=due", now)
+	}
+	insertIncidentAndInput(t, st, "inc-unclaimed-other", "input-unclaimed-other", "service=other", now.Add(time.Second))
+
+	clock := now.Add(2 * time.Second)
+	counting := &countingDeferStore{Store: st}
+	worker := situation.NewInputWorker(counting, situation.WorkerConfig{
+		Owner: "input-worker", Now: func() time.Time { return clock },
+	}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if handled, err := worker.Drain(ctx); err != nil || handled != 1 {
+		t.Fatalf("first drain = (%d, %v), want (1, nil)", handled, err)
+	}
+	clock = clock.Add(2 * time.Second)
+	if handled, err := worker.Drain(ctx); err != nil || handled != 0 {
+		t.Fatalf("second drain = (%d, %v), want (0, nil)", handled, err)
+	}
+	if counting.deferCalls != 0 {
+		t.Fatalf("defer calls = %d, want 0", counting.deferCalls)
+	}
+	var unclaimed int
+	if err := st.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM situation_input_outbox
+		WHERE id LIKE 'input-unclaimed-%' AND id != 'input-unclaimed-other'
+		  AND status = 'pending' AND claim_token = 0`,
+	).Scan(&unclaimed); err != nil {
+		t.Fatal(err)
+	}
+	if unclaimed != 16 {
+		t.Fatalf("unclaimed protected inputs = %d, want 16", unclaimed)
+	}
+	var otherStatus string
+	if err := st.db.QueryRowContext(ctx, `SELECT status FROM situation_input_outbox WHERE id = 'input-unclaimed-other'`).Scan(&otherStatus); err != nil {
+		t.Fatal(err)
+	}
+	if otherStatus != "applied" {
+		t.Fatalf("other input status = %q, want applied", otherStatus)
+	}
+}
+
+func TestClaimSituationInputsScansOnlyOpenSituations(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	rows, err := st.db.QueryContext(ctx, `EXPLAIN QUERY PLAN `+claimSituationInputsQuery,
+		"input-worker", "2026-09-25T12:05:00Z", "2026-09-25T12:00:00Z",
+		"2026-09-25T12:00:00Z", "2026-09-25T12:00:00Z", 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var plan []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan = append(plan, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	for _, detail := range plan {
+		if strings.Contains(detail, "SCAN situations") && !strings.Contains(detail, "USING INDEX") {
+			t.Fatalf("input claim scans all Situation history: %s\n%s", detail, strings.Join(plan, "\n"))
+		}
+	}
+}
+
+func TestReleaseClearsProtectionKeepsStreak(t *testing.T) {
+	for _, backoff := range []bool{false, true} {
+		name := "plain"
+		if backoff {
+			name = "with_backoff"
+		}
+		t.Run(name, func(t *testing.T) {
+			st, situationID, now := twoSupersedesFixture(t)
+			claimed := claimGuardTestSituation(t, st, now)
+			claim := situation.Claim{Situation: claimed, ClaimOwner: "controller", ClaimToken: claimed.ClaimToken}
+			var retryAt *time.Time
+			if backoff {
+				at := now.Add(5 * time.Second)
+				retryAt = &at
+			}
+			if err := st.ReleaseControllerWork(context.Background(), claim, now, retryAt, nil); err != nil {
+				t.Fatalf("release protected controller claim: %v", err)
+			}
+			got := getSituationByID(t, st, situationID)
+			if got.LeaseProtected || got.LeaseOwner != nil || got.SupersedeStreak != 2 {
+				t.Fatalf("after release: protected=%v lease=%v streak=%d, want false, nil, 2", got.LeaseProtected, got.LeaseOwner, got.SupersedeStreak)
+			}
+		})
+	}
+}
+
+func TestExpiredProtectedLeaseDoesNotHold(t *testing.T) {
+	st, situationID, now := twoSupersedesFixture(t)
+	claimGuardTestSituation(t, st, now)
+	before := getSituationByID(t, st, situationID)
+	expiredAt := time.Now().UTC().Add(-time.Second)
+	if _, err := st.db.ExecContext(context.Background(), `UPDATE situations SET lease_expires_at = ? WHERE id = ?`, canonicalTime(expiredAt), situationID); err != nil {
+		t.Fatal(err)
+	}
+	applyGuardTestInput(t, st, "inc-guard-expired", "input-guard-expired", now)
+	after := getSituationByID(t, st, situationID)
+	if after.InputVersion != before.InputVersion+1 || after.SupersedeStreak != 2 || after.LeaseProtected || after.LeaseOwner != nil {
+		t.Fatalf("expired lease join: version=%d streak=%d protected=%v owner=%v, want version=%d streak=2 protected=false owner=nil",
+			after.InputVersion, after.SupersedeStreak, after.LeaseProtected, after.LeaseOwner, before.InputVersion+1)
+	}
+}
+
+func TestDeferSituationInputGivesBackTheAttempt(t *testing.T) {
+	st := newTestStore(t)
+	base := time.Now().UTC().Add(2 * time.Second)
+	insertIncidentAndInput(t, st, "inc-deferred", "input-deferred", "service=deferred", base)
+	if _, err := st.db.ExecContext(context.Background(), `UPDATE situation_input_outbox SET last_error_class = 'earlier_failure' WHERE id = 'input-deferred'`); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 20 {
+		now := base.Add(time.Duration(i) * 2 * time.Second)
+		claim := claimOneInput(t, st, "input-worker", now)
+		if claim.AttemptCount != 1 {
+			t.Fatalf("defer cycle %d claim attempt=%d, want 1", i, claim.AttemptCount)
+		}
+		if i == 0 {
+			wrong := claim
+			wrong.LeaseOwner = "other-worker"
+			if err := st.DeferSituationInput(context.Background(), wrong, now.Add(time.Second)); !errors.Is(err, ErrSituationLeaseLost) {
+				t.Fatalf("wrong owner defer error=%v, want lease lost", err)
+			}
+			wrong = claim
+			wrong.ClaimToken++
+			if err := st.DeferSituationInput(context.Background(), wrong, now.Add(time.Second)); !errors.Is(err, ErrSituationLeaseLost) {
+				t.Fatalf("wrong token defer error=%v, want lease lost", err)
+			}
+		}
+		retryAt := now.Add(time.Second)
+		if err := st.DeferSituationInput(context.Background(), claim, retryAt); err != nil {
+			t.Fatalf("defer cycle %d: %v", i, err)
+		}
+		var status, retryStr string
+		var attempts int
+		var lastError, leaseOwner sql.NullString
+		if err := st.db.QueryRowContext(context.Background(), `
+			SELECT status, attempt_count, retry_at, last_error_class, lease_owner
+			FROM situation_input_outbox WHERE id = ?`, claim.ID).Scan(&status, &attempts, &retryStr, &lastError, &leaseOwner); err != nil {
+			t.Fatal(err)
+		}
+		if status != "pending" || attempts != 0 || retryStr != canonicalTime(retryAt) || !lastError.Valid || lastError.String != "earlier_failure" || leaseOwner.Valid {
+			t.Fatalf("defer cycle %d: status=%s attempts=%d retry=%s last_error=%v owner=%v", i, status, attempts, retryStr, lastError, leaseOwner)
+		}
+		if i == 0 {
+			if err := st.DeferSituationInput(context.Background(), claim, retryAt); !errors.Is(err, ErrSituationLeaseLost) {
+				t.Fatalf("stale defer error=%v, want lease lost", err)
+			}
+		}
+	}
+}
+
+func TestCommitResetsStreakAndProtection(t *testing.T) {
+	st, situationID, now := twoSupersedesFixture(t)
+	insertIncidentAndInput(t, st, "inc-guard-after-commit", "input-guard-after-commit", "service=due", now)
+	inputClaim := claimOneInput(t, st, "input-worker", now)
+	claimed := claimGuardTestSituation(t, st, now)
+	if err := st.ApplySituationInput(context.Background(), inputClaim); !errors.Is(err, ErrSituationProtected) {
+		t.Fatalf("apply before protected commit = %v, want protected", err)
+	}
+	controllerClaim := situation.Claim{Situation: claimed, ClaimOwner: "controller", ClaimToken: claimed.ClaimToken}
+	if err := st.CommitController(context.Background(), controllerClaim, basicControllerCommit(situationID, claimed.InputVersion, now)); err != nil {
+		t.Fatalf("commit protected claim: %v", err)
+	}
+	afterCommit := getSituationByID(t, st, situationID)
+	if afterCommit.SupersedeStreak != 0 || afterCommit.LeaseProtected || afterCommit.LeaseOwner != nil {
+		t.Fatalf("after commit: streak=%d protected=%v owner=%v, want 0, false, nil", afterCommit.SupersedeStreak, afterCommit.LeaseProtected, afterCommit.LeaseOwner)
+	}
+	if err := st.ApplySituationInput(context.Background(), inputClaim); err != nil {
+		t.Fatalf("apply formerly held input: %v", err)
+	}
+	afterInput := getSituationByID(t, st, situationID)
+	if afterInput.InputVersion != afterCommit.InputVersion+1 {
+		t.Fatalf("after held input: version=%d, want %d", afterInput.InputVersion, afterCommit.InputVersion+1)
+	}
 }
 
 // ----------------------------------------------------------------------

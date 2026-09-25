@@ -57,8 +57,8 @@ func TestAlertDeliveryAuthorityIndexUpgradePreservesRetainedHistory(t *testing.T
 	if err := upgraded.DB().QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 38 {
-		t.Fatalf("schema version = %d, want 38", version)
+	if version != 39 {
+		t.Fatalf("schema version = %d, want 39", version)
 	}
 	if err := upgraded.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name='alert_deliveries_alert_authority_idx'`).Scan(&indexCount); err != nil {
 		t.Fatal(err)

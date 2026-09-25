@@ -3,8 +3,11 @@
 package situation
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -41,6 +44,11 @@ type inputStoreSpy struct {
 	retryAt       time.Time
 	retryTerminal bool
 	retryErr      error
+
+	deferCalled bool
+	deferClaim  model.SituationClaim
+	deferAt     time.Time
+	deferErr    error
 }
 
 func (s *inputStoreSpy) ClaimSituationInputs(_ context.Context, _ string, _ time.Time, _ time.Duration, _ int) ([]model.SituationClaim, error) {
@@ -74,6 +82,15 @@ func (s *inputStoreSpy) RetrySituationInput(_ context.Context, claim model.Situa
 	s.retryAt = retryAt
 	s.retryTerminal = terminal
 	return s.retryErr
+}
+
+func (s *inputStoreSpy) DeferSituationInput(_ context.Context, claim model.SituationClaim, retryAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deferCalled = true
+	s.deferClaim = claim
+	s.deferAt = retryAt
+	return s.deferErr
 }
 
 func (s *inputStoreSpy) setClaims(claims []model.SituationClaim) {
@@ -113,6 +130,41 @@ func TestInputWorkerSuccessNeedsNoCompletionCall(t *testing.T) {
 	}
 	if st.retryCalled {
 		t.Fatalf("RetrySituationInput must not be called on success: %+v", st)
+	}
+}
+
+func TestInputWorkerProtectedInputIsDeferredWithoutHandlingOrWarning(t *testing.T) {
+	for _, deferFails := range []bool{false, true} {
+		name := "deferred"
+		if deferFails {
+			name = "defer_write_failed"
+		}
+		t.Run(name, func(t *testing.T) {
+			claim := inputClaim("protected-input", 1)
+			st := &inputStoreSpy{claims: []model.SituationClaim{claim}, applyFn: func(model.SituationClaim) error { return model.ErrSituationProtected }}
+			if deferFails {
+				st.deferErr = errors.New("defer write unavailable")
+			}
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&logs, nil))
+			w := NewInputWorker(st, WorkerConfig{Owner: "worker-a", Now: fixedClock}, logger)
+			handled, err := w.RunOnce(context.Background())
+			if err != nil || handled != 0 {
+				t.Fatalf("run = %d, %v; want 0, nil", handled, err)
+			}
+			if !st.deferCalled || st.deferClaim.ID != claim.ID || !st.deferAt.Equal(fixedClock().Add(time.Second)) {
+				t.Fatalf("defer call = (%v, %s, %s), want claim and +1s", st.deferCalled, st.deferClaim.ID, st.deferAt)
+			}
+			if st.retryCalled {
+				t.Fatal("protected input used the failure retry path")
+			}
+			if strings.Contains(logs.String(), `"level":"WARN"`) {
+				t.Fatalf("protected input logged WARN: %s", logs.String())
+			}
+			if deferFails && !strings.Contains(logs.String(), `"level":"ERROR"`) {
+				t.Fatalf("failed defer write did not log ERROR: %s", logs.String())
+			}
+		})
 	}
 }
 

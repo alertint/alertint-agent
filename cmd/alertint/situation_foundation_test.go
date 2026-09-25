@@ -619,6 +619,86 @@ func TestFoundationRuntimeDrainOnEmptyStoreIsANoOp(t *testing.T) {
 	}
 }
 
+func TestFoundationReconstructionDefersInputBehindCrashedProtectedLease(t *testing.T) {
+	f := newPrepE2EFixture(t)
+	f.postAlert("protected-startup", "HighErrorRate", "first")
+	f.drainFoundation()
+	f.markReady(f.soleIncidentID())
+	situationID := f.soleSituationID()
+	before, err := f.st.GetSituation(f.ctx, situationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.st.DB().ExecContext(f.ctx, `
+		UPDATE situations SET lease_owner = 'crashed-controller', claim_token = claim_token + 1,
+			lease_expires_at = ?, lease_protected = 1, supersede_streak = 2
+		WHERE id = ?`, time.Now().UTC().Add(5*time.Minute).Format(time.RFC3339Nano), situationID)
+	if err != nil {
+		t.Fatalf("seed protected lease: %v", err)
+	}
+	_, err = f.st.DB().ExecContext(f.ctx, `
+		INSERT INTO situation_input_outbox
+			(id, idempotency_key, incident_id, kind, group_key, occurred_at, status)
+		VALUES ('startup-held', 'startup-held', ?, 'triage_retry_changed',
+			'group=protected-startup', ?, 'pending')`,
+		f.soleIncidentID(), time.Now().UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		t.Fatalf("seed pending input: %v", err)
+	}
+	f.reopen() // the process holding the protected lease has gone away
+	cor := correlator.New(correlator.Config{WindowSeconds: 60}, f.st, nil, nil)
+	rt := newFoundationRuntime(f.st, cor, "restarted-process", slog.Default())
+	ctx, cancel := context.WithTimeout(f.ctx, 5*time.Second)
+	defer cancel()
+	if _, err := rt.Reconstruct(ctx); err != nil {
+		t.Fatalf("reconstruct with protected lease: %v", err)
+	}
+	if _, err := rt.Drain(ctx); err != nil {
+		t.Fatalf("drain with protected lease: %v", err)
+	}
+	var pending, failed int
+	if err := f.st.DB().QueryRowContext(ctx, `
+		SELECT COUNT(*) FILTER (WHERE status = 'pending'), COUNT(*) FILTER (WHERE status = 'failed')
+		FROM situation_input_outbox WHERE group_key = 'group=protected-startup'`).Scan(&pending, &failed); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 1 || failed != 0 {
+		t.Fatalf("input state after reconstruction: pending=%d failed=%d, want 1 and 0", pending, failed)
+	}
+	current, err := f.st.GetSituation(ctx, situationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.InputVersion != before.InputVersion {
+		t.Fatalf("input applied before protected lease expired: version=%d, want %d", current.InputVersion, before.InputVersion)
+	}
+	_, err = f.st.DB().ExecContext(ctx, `
+		UPDATE situations SET lease_expires_at = ? WHERE id = ?`,
+		time.Now().UTC().Add(-time.Second).Format(time.RFC3339Nano), situationID)
+	if err != nil {
+		t.Fatalf("expire protected lease: %v", err)
+	}
+	_, err = f.st.DB().ExecContext(ctx, `
+		UPDATE situation_input_outbox SET retry_at = ? WHERE status = 'pending' AND group_key = 'group=protected-startup'`,
+		time.Now().UTC().Add(-time.Second).Format(time.RFC3339Nano))
+	if err != nil {
+		t.Fatalf("make deferred input due: %v", err)
+	}
+	if _, err := rt.Drain(ctx); err != nil {
+		t.Fatalf("drain after lease expiry: %v", err)
+	}
+	if _, err := rt.Drain(ctx); err != nil {
+		t.Fatalf("second drain after lease expiry: %v", err)
+	}
+	after, err := f.st.GetSituation(ctx, situationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.InputVersion != before.InputVersion+1 {
+		t.Fatalf("input version after expiry and two drains = %d, want %d", after.InputVersion, before.InputVersion+1)
+	}
+}
+
 func TestNewFoundationRuntimePanicsOnEmptyOwner(t *testing.T) {
 	st := newTestFoundationStore(t)
 	cor := correlator.New(correlator.Config{}, st, nil, nil)
@@ -735,6 +815,10 @@ func (f *countingInputStore) ClaimSituationInputs(context.Context, string, time.
 }
 
 func (f *countingInputStore) ApplySituationInput(context.Context, store.SituationClaim) error {
+	return nil
+}
+
+func (f *countingInputStore) DeferSituationInput(context.Context, store.SituationClaim, time.Time) error {
 	return nil
 }
 

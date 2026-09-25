@@ -34,6 +34,8 @@ type SituationClaim = situationmodel.SituationClaim
 // the other. See internal/situation/model/foundation.go.
 var ErrSituationLeaseLost = situationmodel.ErrSituationLeaseLost
 
+var ErrSituationProtected = situationmodel.ErrSituationProtected
+
 // ErrSituationVersionConflict means a Situation's input_version advanced
 // between the moment a caller last observed it and the moment it tried to
 // commit against that observed version — distinct from ErrSituationLeaseLost,
@@ -87,20 +89,41 @@ func isOperatorArtifactKind(kind string) bool {
 // situation_input_outbox claim/apply/retry (Task 7)
 // ----------------------------------------------------------------------
 
+const claimSituationInputsQuery = `
+		UPDATE situation_input_outbox
+		SET status = 'claimed', lease_owner = ?, lease_expires_at = ?,
+		    claim_token = claim_token + 1, attempt_count = attempt_count + 1
+		WHERE id IN (
+			SELECT id FROM situation_input_outbox
+			WHERE ((status = 'pending' AND (retry_at IS NULL OR retry_at <= ?))
+			   OR (status = 'claimed' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))
+			  AND group_key NOT IN (
+				SELECT group_key FROM situations
+				-- Only open Situations hold controller leases; this uses situations_due_idx.
+				WHERE lifecycle IN ('active','recovery_pending')
+				  AND lease_protected = 1 AND lease_owner IS NOT NULL AND lease_expires_at > ?
+			  )
+			ORDER BY occurred_at ASC, id ASC
+			LIMIT ?
+		)
+		RETURNING id
+	`
+
 // ClaimSituationInputs leases due situation_input_outbox rows — pending rows
 // never claimed, or claimed rows whose lease has expired — in one atomic
 // transaction. Claiming increments both claim_token (fencing every prior
 // lease holder out) and attempt_count. Rows are claimed and returned in
 // deterministic (occurred_at, id) order. Claiming never applies anything;
 // callers apply claimed work only after this transaction commits.
+// Inputs for a group with a live protected controller lease are skipped until
+// that lease is committed, released, or expires. ApplySituationInput still
+// rejects a claim made just before its Situation became protected.
 //
 // This deliberately mirrors ClaimAlertDispatches' claim shape one table over
 // (situation_input_outbox vs. alert_delivery_dispatches); this plan's own
 // pre-flight conflict scan already ruled the analogous per-package
 // WorkerConfig duplication intentional rather than something to unify across
 // the two claim mechanisms.
-//
-//nolint:dupl // mirrors ClaimAlertDispatches deliberately; see doc comment above
 func (s *Store) ClaimSituationInputs(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]SituationClaim, error) {
 	if strings.TrimSpace(owner) == "" || lease <= 0 || limit <= 0 {
 		return nil, errors.New("store: situation input claim requires owner, positive lease, and positive limit")
@@ -115,19 +138,7 @@ func (s *Store) ClaimSituationInputs(ctx context.Context, owner string, now time
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	rows, err := tx.QueryContext(ctx, `
-		UPDATE situation_input_outbox
-		SET status = 'claimed', lease_owner = ?, lease_expires_at = ?,
-		    claim_token = claim_token + 1, attempt_count = attempt_count + 1
-		WHERE id IN (
-			SELECT id FROM situation_input_outbox
-			WHERE (status = 'pending' AND (retry_at IS NULL OR retry_at <= ?))
-			   OR (status = 'claimed' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
-			ORDER BY occurred_at ASC, id ASC
-			LIMIT ?
-		)
-		RETURNING id
-	`, owner, leaseExpires, nowStr, nowStr, limit)
+	rows, err := tx.QueryContext(ctx, claimSituationInputsQuery, owner, leaseExpires, nowStr, nowStr, nowStr, limit)
 	if err != nil {
 		return nil, fmt.Errorf("store: claim situation inputs: %w", err)
 	}
@@ -232,6 +243,40 @@ func (s *Store) RetrySituationInput(ctx context.Context, claim SituationClaim, c
 	n, err := res.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("store: count retried situation input: %w", err)
+	}
+	if n != 1 {
+		return ErrSituationLeaseLost
+	}
+	return nil
+}
+
+// DeferSituationInput returns a claimed input to pending while a protected
+// controller run holds its Situation. This is a scheduling delay, so it gives
+// back the claim attempt and preserves the prior error class. The same
+// owner/token fence as RetrySituationInput prevents a stale worker from
+// changing a newer claim. A deferred input may apply after a newer input;
+// Situation joins merge due reasons and earliest times without depending on
+// input order. Operator artifacts deferred together may be journaled in a
+// different order from their occurrence times.
+func (s *Store) DeferSituationInput(ctx context.Context, claim SituationClaim, retryAt time.Time) error {
+	if strings.TrimSpace(claim.ID) == "" || strings.TrimSpace(claim.LeaseOwner) == "" || claim.ClaimToken <= 0 {
+		return errors.New("store: situation input defer requires a complete claim")
+	}
+	if retryAt.IsZero() {
+		return errors.New("store: situation input defer time is required")
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE situation_input_outbox
+		SET status = 'pending', lease_owner = NULL, lease_expires_at = NULL,
+		    retry_at = ?, attempt_count = MAX(attempt_count - 1, 0)
+		WHERE id = ? AND status = 'claimed' AND lease_owner = ? AND claim_token = ?`,
+		canonicalTime(retryAt), claim.ID, claim.LeaseOwner, claim.ClaimToken)
+	if err != nil {
+		return fmt.Errorf("store: defer situation input: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: count deferred situation input: %w", err)
 	}
 	if n != 1 {
 		return ErrSituationLeaseLost
@@ -633,6 +678,14 @@ func joinSituationTx(ctx context.Context, tx *sql.Tx, situationID string, startA
 	if err != nil {
 		return 0, err
 	}
+	live := current.LeaseOwner != nil && current.LeaseExpiresAt != nil && current.LeaseExpiresAt.After(now)
+	if live && current.LeaseProtected {
+		return 0, ErrSituationProtected
+	}
+	streak := current.SupersedeStreak
+	if live {
+		streak++
+	}
 
 	newStart := earlierTime(current.EffectiveStartedAt, startAt)
 	newBasis := mergeBasis(current.EffectiveStartedAtBasis, basis)
@@ -651,10 +704,11 @@ func joinSituationTx(ctx context.Context, tx *sql.Tx, situationID string, startA
 		    effective_started_at = ?, effective_started_at_basis = ?,
 		    first_received_at = ?, next_assessment_at = ?, due_reasons_json = ?,
 		    lease_owner = NULL, lease_expires_at = NULL,
+		    supersede_streak = ?, lease_protected = 0,
 		    updated_at = ?
 		WHERE id = ? AND input_version = ?`,
 		canonicalTime(newStart), string(newBasis), canonicalTime(newFirstReceived), canonicalTime(newNextAssessment), string(dueReasonsJSON),
-		canonicalTime(now), situationID, current.InputVersion)
+		streak, canonicalTime(now), situationID, current.InputVersion)
 	if err != nil {
 		return 0, fmt.Errorf("store: update situation: %w", err)
 	}
@@ -757,7 +811,7 @@ const situationSelect = `
 	       opened_at, effective_started_at, effective_started_at_basis, first_received_at,
 	       last_lifecycle_observed_at, recovery_observed_at, grace_until, terminal_at, terminal_reason,
 	       next_assessment_at, due_reasons_json, lease_owner, lease_expires_at, claim_token, attempt_count,
-	       last_error_class, retry_at, created_at, updated_at
+	       supersede_streak, lease_protected, last_error_class, retry_at, created_at, updated_at
 	FROM situations`
 
 func scanSituation(s scanner) (situationmodel.Situation, error) {
@@ -768,12 +822,14 @@ func scanSituation(s scanner) (situationmodel.Situation, error) {
 		lifecycle, attention, effStartedBasis                                          string
 		openedAtStr, effStartedStr, firstReceivedStr, lastLifecycleStr                 string
 		nextAssessmentStr, createdStr, updatedStr, dueReasonsJSON                      string
+		protected                                                                      int
 	)
 	if err := s.Scan(
 		&sit.ID, &previousID, &sit.GroupKey, &publicHandle, &lifecycle, &attention, &sit.InputVersion,
 		&openedAtStr, &effStartedStr, &effStartedBasis, &firstReceivedStr,
 		&lastLifecycleStr, &recoveryObservedStr, &graceUntilStr, &terminalAtStr, &terminalReasonStr,
 		&nextAssessmentStr, &dueReasonsJSON, &leaseOwner, &leaseExpiresStr, &sit.ClaimToken, &sit.AttemptCount,
+		&sit.SupersedeStreak, &protected,
 		&lastErrorClass, &retryAtStr, &createdStr, &updatedStr,
 	); err != nil {
 		return situationmodel.Situation{}, err
@@ -785,6 +841,7 @@ func scanSituation(s scanner) (situationmodel.Situation, error) {
 	sit.PreviousSituationID = stringPtr(previousID)
 	sit.PublicHandle = stringPtr(publicHandle)
 	sit.LeaseOwner = stringPtr(leaseOwner)
+	sit.LeaseProtected = protected == 1
 	sit.LastErrorClass = stringPtr(lastErrorClass)
 	if tr := stringPtr(terminalReasonStr); tr != nil {
 		reason := situationmodel.TerminalReason(*tr)
@@ -849,6 +906,8 @@ func getSituationTx(ctx context.Context, tx *sql.Tx, id string) (situationmodel.
 	return sit, nil
 }
 
+const situationSupersedeGuardAfter = 2
+
 // ClaimDueSituations leases due Situations — nonterminal ("active" or
 // "recovery_pending") rows whose next_assessment_at or retry_at has arrived,
 // and that are not already held under an unexpired lease — in one atomic
@@ -872,7 +931,8 @@ func (s *Store) ClaimDueSituations(ctx context.Context, owner string, now time.T
 
 	rows, err := tx.QueryContext(ctx, `
 		UPDATE situations
-		SET lease_owner = ?, lease_expires_at = ?, claim_token = claim_token + 1, attempt_count = attempt_count + 1
+		SET lease_owner = ?, lease_expires_at = ?, claim_token = claim_token + 1, attempt_count = attempt_count + 1,
+		    lease_protected = CASE WHEN supersede_streak >= ? THEN 1 ELSE 0 END
 		WHERE id IN (
 			SELECT id FROM situations
 			WHERE lifecycle IN ('active','recovery_pending')
@@ -882,7 +942,7 @@ func (s *Store) ClaimDueSituations(ctx context.Context, owner string, now time.T
 			LIMIT ?
 		)
 		RETURNING id
-	`, owner, leaseExpires, nowStr, nowStr, nowStr, limit)
+	`, owner, leaseExpires, situationSupersedeGuardAfter, nowStr, nowStr, nowStr, limit)
 	if err != nil {
 		return nil, fmt.Errorf("store: claim due situations: %w", err)
 	}
@@ -938,7 +998,8 @@ func (s *Store) ReleaseSituationClaim(ctx context.Context, claim situationmodel.
 		return errors.New("store: release situation claim requires a complete claim")
 	}
 	res, err := s.db.ExecContext(ctx, `
-		UPDATE situations SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+		UPDATE situations SET lease_owner = NULL, lease_expires_at = NULL,
+		    lease_protected = 0, updated_at = ?
 		WHERE id = ? AND lease_owner = ? AND claim_token = ?`,
 		canonicalTime(now.UTC()), claim.ID, *claim.LeaseOwner, claim.ClaimToken)
 	if err != nil {

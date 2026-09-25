@@ -2097,6 +2097,8 @@ func (c *Controller) Reconcile(ctx context.Context, claim Claim) error {
 	ctx, span := tracer().Start(ctx, SpanControllerReconcile, trace.WithAttributes(
 		AttrSituationID.String(claim.Situation.ID),
 		AttrInputVersion.Int(claim.Situation.InputVersion),
+		AttrSupersedeStreak.Int(claim.Situation.SupersedeStreak),
+		AttrLeaseProtected.Bool(claim.Situation.LeaseProtected),
 	))
 	defer span.End()
 	err := c.reconcile(ctx, claim)
@@ -2123,6 +2125,7 @@ func (c *Controller) Reconcile(ctx context.Context, claim Claim) error {
 	// reconcile against each other and against the store.
 	attrs := append([]any{
 		"situation_id", claim.Situation.ID, "input_version", claim.Situation.InputVersion,
+		"supersede_streak", claim.Situation.SupersedeStreak, "protected", claim.Situation.LeaseProtected,
 		"result_class", class, "duration_ms", durationMS,
 	}, spanLogAttrs(span)...)
 	if err != nil && class != ReconcileResultSuperseded {
