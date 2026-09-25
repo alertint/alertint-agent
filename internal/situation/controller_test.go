@@ -1295,6 +1295,34 @@ func TestControllerReconcilePendingTriageIdlesAtCadence(t *testing.T) {
 	}
 }
 
+func TestControllerReconcileMixedTriageDueHonorsFutureBackoff(t *testing.T) {
+	now := ctBaseTime.Add(10 * time.Minute)
+	pastDue := now.Add(-10 * time.Second)
+	futureBackoff := now.Add(20 * time.Second)
+	in := ctBaseSnapshotInput()
+	in.Incidents[0].Triage = situation.TriageState{Phase: "pending", NextAt: &pastDue}
+	backingOff := ctIncident("incident-2")
+	backingOff.Triage = situation.TriageState{Phase: "backoff", NextAt: &futureBackoff}
+	in.Incidents = append(in.Incidents, backingOff)
+	in.Deliveries = append(in.Deliveries, ctDelivery("delivery-2", "incident-2", true, "warning"))
+	store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
+	client := &fakeAssessmentClient{responses: []func() (llm.OneShotCompletion, error){acceptedResponse(t)}}
+	controller := ctLifecycleController(store, client, now)
+	if err := controller.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(store.commits) != 1 {
+		t.Fatalf("commits = %d, want 1", len(store.commits))
+	}
+	commit := store.commits[0]
+	if !commit.NextAssessmentAt.Equal(futureBackoff) {
+		t.Fatalf("NextAssessmentAt = %v, want the future backoff checkpoint %v", commit.NextAssessmentAt, futureBackoff)
+	}
+	if !slices.Contains(commit.Assessment.ActionContract.NextUpdateOn, model.NextUpdateOnTriageOutcome) {
+		t.Fatalf("next_update_on = %v, want triage_outcome", commit.Assessment.ActionContract.NextUpdateOn)
+	}
+}
+
 // --------------------------------------------------------------------------
 // Lifecycle transition tests (Finding C2 + the brief's originally-requested
 // coverage). resolveLifecycle is unexported, so these drive it through

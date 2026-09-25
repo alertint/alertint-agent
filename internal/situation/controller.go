@@ -697,20 +697,19 @@ func effectiveTriagePhase(inc IncidentState, decisions map[string]TriageDecision
 	}
 }
 
-// earliestTriageDue returns the earliest NextAt among incidents' pending or
-// backoff Triage rows (using effectiveTriagePhase, so a refreshed backoff
-// row's persisted due time is preserved rather than overridden), treating
-// an Incident this cycle's decisions genuinely just moved from
-// awaiting_decision to pending as due immediately (now) — the exact timing
-// applyRequestFromAwaitingDecisionTx persists (next_at=now). Returns nil
-// when no Incident carries pending/backoff Triage work.
-func earliestTriageDue(incidents []IncidentState, decisions []TriageDecision, now time.Time) *time.Time {
+// triageDueTimes returns the earliest due time for the triage_outcome promise
+// and the earliest future due time for next_update_at. A past-due pending
+// Incident must not hide another Incident's future backoff checkpoint.
+// Awaiting-decision Requests become pending at now, matching the store writer.
+func triageDueTimes(incidents []IncidentState, decisions []TriageDecision, now time.Time) (earliest, future *time.Time) {
 	byIncident := decisionsByIncident(decisions)
 
-	var earliest *time.Time
 	consider := func(t time.Time) {
 		if earliest == nil || t.Before(*earliest) {
 			earliest = timePtr(t)
+		}
+		if t.After(now) && (future == nil || t.Before(*future)) {
+			future = timePtr(t)
 		}
 	}
 	for _, inc := range incidents {
@@ -729,6 +728,11 @@ func earliestTriageDue(incidents []IncidentState, decisions []TriageDecision, no
 			}
 		}
 	}
+	return earliest, future
+}
+
+func earliestTriageDue(incidents []IncidentState, decisions []TriageDecision, now time.Time) *time.Time {
+	earliest, _ := triageDueTimes(incidents, decisions, now)
 	return earliest
 }
 
@@ -1605,10 +1609,12 @@ func (c *Controller) buildControllerState(snap Snapshot, in SnapshotInput, lc li
 			deadline = &d
 		}
 	}
+	triageDueAt, futureTriageDueAt := triageDueTimes(snap.Incidents, triageDecisions, now)
 	return ControllerState{
 		Tempo:                          c.cfg.Cadence,
 		TriagePhase:                    aggregateTriagePhase(snap.Incidents, triageDecisions),
-		TriageDueAt:                    earliestTriageDue(snap.Incidents, triageDecisions, now),
+		TriageDueAt:                    triageDueAt,
+		FutureTriageDueAt:              futureTriageDueAt,
 		RecoveryGraceUntil:             lc.GraceUntil,
 		LifecycleObservationDeadlineAt: deadline,
 	}

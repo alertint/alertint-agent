@@ -113,12 +113,13 @@ type ControllerState struct {
 	// (60/300/900s) — see CadenceTempo.
 	Tempo CadenceTempo
 
-	// TriageDueAt, SemanticRetryAt, RecoveryGraceUntil,
-	// LifecycleObservationDeadlineAt, and EarliestPersistedCheckpoint are
-	// candidate reconsideration times DeriveActionContract's next_update_at
-	// picks the earliest nonterminal one from — never computed here. Any
-	// combination may be nil.
+	// TriageDueAt retains the earliest Triage due time for the
+	// triage_outcome promise, even when already due. FutureTriageDueAt
+	// retains the earliest future Triage checkpoint across all Incidents,
+	// so one overdue Incident cannot hide another's backoff time.
+	// Other fields are controller reconsideration checkpoints. Any may be nil.
 	TriageDueAt                    *time.Time
+	FutureTriageDueAt              *time.Time
 	SemanticRetryAt                *time.Time
 	RecoveryGraceUntil             *time.Time
 	LifecycleObservationDeadlineAt *time.Time
@@ -295,9 +296,13 @@ func nextUpdateAt(state ControllerState, cadence model.Cadence, now time.Time) t
 	// A due Triage checkpoint is the triage worker's move. Each transition
 	// appends a Situation input that wakes the controller, so retaining a past
 	// due time here would recreate F8's one-second hot loop. Keep TriageDueAt
-	// in nextUpdateOn: the next update still follows the Triage outcome.
+	// in nextUpdateOn: the next update still follows the Triage outcome. A
+	// separate future checkpoint preserves another Incident's backoff time.
 	if state.TriageDueAt != nil && state.TriageDueAt.After(now) {
 		candidates = append(candidates, state.TriageDueAt)
+	}
+	if state.FutureTriageDueAt != nil && state.FutureTriageDueAt.After(now) {
+		candidates = append(candidates, state.FutureTriageDueAt)
 	}
 	for _, t := range candidates {
 		if t != nil && t.Before(earliest) {
