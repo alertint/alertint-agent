@@ -2232,6 +2232,7 @@ func (s *Store) CommitController(ctx context.Context, claim situation.Claim, com
 			next_assessment_at = ?,
 			retry_at = ?, last_error_class = ?,
 			lease_owner = NULL, lease_expires_at = NULL,
+			supersede_streak = 0, lease_protected = 0,
 			updated_at = ?
 		WHERE id = ? AND lease_owner = ? AND claim_token = ? AND input_version = ?`,
 		string(commit.Lifecycle), string(commit.Attention),
@@ -2482,7 +2483,7 @@ func (s *Store) ReleaseControllerWork(ctx context.Context, claim situation.Claim
 
 	res, err := tx.ExecContext(ctx, `
 		UPDATE situations SET
-			lease_owner = NULL, lease_expires_at = NULL,
+			lease_owner = NULL, lease_expires_at = NULL, lease_protected = 0,
 			retry_at = ?, last_error_class = ?,
 			next_assessment_at = ?,
 			updated_at = ?
