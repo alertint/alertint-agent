@@ -220,6 +220,25 @@ type ControllerWorker struct {
 	doneCh chan struct{}
 
 	startOnce sync.Once
+
+	mu       sync.Mutex
+	inflight map[string]inflightRun
+}
+
+type inflightRun struct {
+	token  int64
+	cancel context.CancelCauseFunc
+}
+
+// Preempt cancels the in-flight reconcile for situationID only when it still
+// uses claimToken. A stale or unknown token has no effect.
+func (w *ControllerWorker) Preempt(situationID string, claimToken int64) {
+	w.mu.Lock()
+	run, ok := w.inflight[situationID]
+	w.mu.Unlock()
+	if ok && run.token == claimToken {
+		run.cancel(model.ErrSituationLeaseLost)
+	}
 }
 
 // SetDependencyRecoveryWaker wires the pre-poll dependency-recovery wake
@@ -289,6 +308,7 @@ func NewControllerWorker(
 		wakeCh:       make(chan struct{}, 1),
 		stopCh:       make(chan struct{}),
 		doneCh:       make(chan struct{}),
+		inflight:     make(map[string]inflightRun),
 	}
 }
 
@@ -485,6 +505,9 @@ var errLeaseUnconfirmed = errors.New("situation: controller lease could not be r
 func (w *ControllerWorker) processOne(ctx context.Context, claim Claim) {
 	reconcileCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
+	w.mu.Lock()
+	w.inflight[claim.Situation.ID] = inflightRun{token: claim.ClaimToken, cancel: cancel}
+	w.mu.Unlock()
 
 	hbDone := make(chan struct{})
 	go w.heartbeatLoop(reconcileCtx, cancel, claim, hbDone)
@@ -493,6 +516,11 @@ func (w *ControllerWorker) processOne(ctx context.Context, claim Claim) {
 
 	cancel(nil)
 	<-hbDone
+	w.mu.Lock()
+	if run, ok := w.inflight[claim.Situation.ID]; ok && run.token == claim.ClaimToken {
+		delete(w.inflight, claim.Situation.ID)
+	}
+	w.mu.Unlock()
 
 	if err == nil {
 		return

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -328,6 +329,63 @@ func TestControllerWorkerLeaseLossCancelsReconcileAndAbandonsWithoutRelease(t *t
 		if line["level"] == "WARN" {
 			t.Fatalf("superseded heartbeat emitted warning: %v", line)
 		}
+	}
+}
+
+func TestControllerWorkerPreemptCancelsOnlyMatchingClaim(t *testing.T) {
+	claim := ctClaimFor("situation-preempt", "worker-a", 7)
+	expires := time.Now().UTC().Add(time.Minute)
+	claim.Situation.LeaseExpiresAt = &expires
+	store := &fakeControllerStore{
+		loadInput: ctBaseSnapshotInput(), beginWorkAttempt: 1,
+		claimFn: func(context.Context, string, time.Time, time.Duration, int) ([]situation.Claim, error) {
+			return []situation.Claim{claim}, nil
+		},
+	}
+	inCall := make(chan struct{})
+	client := &fakeAssessmentClient{ctxFn: func(ctx context.Context) (llm.OneShotCompletion, error) {
+		close(inCall)
+		<-ctx.Done()
+		return llm.OneShotCompletion{}, ctx.Err()
+	}}
+	var logs bytes.Buffer
+	w := situation.NewControllerWorker(store, store, client, situation.ControllerConfig{}, newWorkerConfig("worker-a"), nil, nil,
+		slog.New(slog.NewJSONHandler(&logs, nil)))
+	done := make(chan error, 1)
+	go func() {
+		_, err := w.RunOnce(context.Background())
+		done <- err
+	}()
+	select {
+	case <-inCall:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconcile did not reach L2")
+	}
+
+	w.Preempt(claim.Situation.ID, claim.ClaimToken+1)
+	w.Preempt("unknown-situation", claim.ClaimToken)
+	select {
+	case err := <-done:
+		t.Fatalf("stale or unknown preempt ended reconcile: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	w.Preempt(claim.Situation.ID, claim.ClaimToken)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RunOnce: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("matching preempt did not cancel blocked reconcile promptly")
+	}
+	if calls := store.snapshotReleaseCalls(); len(calls) != 0 {
+		t.Fatalf("release after preempt = %+v, want none", calls)
+	}
+	if got := linesWithMsg(jsonLogLines(t, &logs), "situation: controller reconcile"); len(got) != 1 || got[0]["result_class"] != "superseded" {
+		t.Fatalf("reconcile result = %v, want one superseded", got)
+	}
+	if n := reflect.ValueOf(w).Elem().FieldByName("inflight").Len(); n != 0 {
+		t.Fatalf("in-flight registry after RunOnce = %d, want empty", n)
 	}
 }
 
