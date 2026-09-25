@@ -326,6 +326,57 @@ func TestProtectedClaimDefersJoin(t *testing.T) {
 	}
 }
 
+func TestHeldInputBatchDoesNotBlockAnotherSituation(t *testing.T) {
+	st, _, now := twoSupersedesFixture(t)
+	claimGuardTestSituation(t, st, now)
+
+	for i := range 16 {
+		insertIncidentAndInput(t, st,
+			fmt.Sprintf("inc-held-%02d", i), fmt.Sprintf("input-held-%02d", i), "service=due", now)
+	}
+	insertIncidentAndInput(t, st, "inc-other", "input-other", "service=other", now.Add(time.Second))
+
+	worker := situation.NewInputWorker(st, situation.WorkerConfig{
+		Owner: "input-worker", Now: func() time.Time { return now.Add(2 * time.Second) },
+	}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if handled, err := worker.Drain(ctx); err != nil || handled != 1 {
+		t.Fatalf("drain = (%d, %v), want (1, nil)", handled, err)
+	}
+
+	rows, err := st.db.QueryContext(ctx, `
+		SELECT id, status, attempt_count FROM situation_input_outbox
+		WHERE id LIKE 'input-held-%' OR id = 'input-other'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	held := 0
+	otherApplied := false
+	for rows.Next() {
+		var id, status string
+		var attempts int
+		if err := rows.Scan(&id, &status, &attempts); err != nil {
+			t.Fatal(err)
+		}
+		if id == "input-other" {
+			otherApplied = status == "applied" && attempts == 1
+			continue
+		}
+		if status != "pending" || attempts != 0 {
+			t.Fatalf("held input %s = (%s, %d), want (pending, 0)", id, status, attempts)
+		}
+		held++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if held != 16 || !otherApplied {
+		t.Fatalf("held = %d, other applied = %v; want 16 and true", held, otherApplied)
+	}
+}
+
 func TestReleaseClearsProtectionKeepsStreak(t *testing.T) {
 	for _, backoff := range []bool{false, true} {
 		name := "plain"
