@@ -377,6 +377,62 @@ func TestHeldInputBatchDoesNotBlockAnotherSituation(t *testing.T) {
 	}
 }
 
+type countingDeferStore struct {
+	*Store
+	deferCalls int
+}
+
+func (s *countingDeferStore) DeferSituationInput(ctx context.Context, claim SituationClaim, retryAt time.Time) error {
+	s.deferCalls++
+	return s.Store.DeferSituationInput(ctx, claim, retryAt)
+}
+
+func TestProtectedGroupInputsAreNotClaimed(t *testing.T) {
+	st, _, now := twoSupersedesFixture(t)
+	claimGuardTestSituation(t, st, now)
+	for i := range 16 {
+		insertIncidentAndInput(t, st,
+			fmt.Sprintf("inc-unclaimed-%02d", i), fmt.Sprintf("input-unclaimed-%02d", i), "service=due", now)
+	}
+	insertIncidentAndInput(t, st, "inc-unclaimed-other", "input-unclaimed-other", "service=other", now.Add(time.Second))
+
+	clock := now.Add(2 * time.Second)
+	counting := &countingDeferStore{Store: st}
+	worker := situation.NewInputWorker(counting, situation.WorkerConfig{
+		Owner: "input-worker", Now: func() time.Time { return clock },
+	}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if handled, err := worker.Drain(ctx); err != nil || handled != 1 {
+		t.Fatalf("first drain = (%d, %v), want (1, nil)", handled, err)
+	}
+	clock = clock.Add(2 * time.Second)
+	if handled, err := worker.Drain(ctx); err != nil || handled != 0 {
+		t.Fatalf("second drain = (%d, %v), want (0, nil)", handled, err)
+	}
+	if counting.deferCalls != 0 {
+		t.Fatalf("defer calls = %d, want 0", counting.deferCalls)
+	}
+	var unclaimed int
+	if err := st.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM situation_input_outbox
+		WHERE id LIKE 'input-unclaimed-%' AND id != 'input-unclaimed-other'
+		  AND status = 'pending' AND claim_token = 0`,
+	).Scan(&unclaimed); err != nil {
+		t.Fatal(err)
+	}
+	if unclaimed != 16 {
+		t.Fatalf("unclaimed protected inputs = %d, want 16", unclaimed)
+	}
+	var otherStatus string
+	if err := st.db.QueryRowContext(ctx, `SELECT status FROM situation_input_outbox WHERE id = 'input-unclaimed-other'`).Scan(&otherStatus); err != nil {
+		t.Fatal(err)
+	}
+	if otherStatus != "applied" {
+		t.Fatalf("other input status = %q, want applied", otherStatus)
+	}
+}
+
 func TestReleaseClearsProtectionKeepsStreak(t *testing.T) {
 	for _, backoff := range []bool{false, true} {
 		name := "plain"
