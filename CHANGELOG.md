@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A Situation receiving a steady stream of new alerts now still updates:
+  after two runs are superseded by new inputs, the next run finishes before
+  further inputs are applied.
 - A Situation waiting for its Triage to start no longer re-assesses every ~2
   seconds; it waits for the Triage outcome or its normal cadence.
 - A Situation reconcile superseded by a newer input is now recorded as

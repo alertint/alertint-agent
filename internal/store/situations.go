@@ -245,7 +245,10 @@ func (s *Store) RetrySituationInput(ctx context.Context, claim SituationClaim, c
 // controller run holds its Situation. This is a scheduling delay, so it gives
 // back the claim attempt and preserves the prior error class. The same
 // owner/token fence as RetrySituationInput prevents a stale worker from
-// changing a newer claim.
+// changing a newer claim. A deferred input may apply after a newer input;
+// Situation joins merge due reasons and earliest times without depending on
+// input order. Operator artifacts deferred together may be journaled in a
+// different order from their occurrence times.
 func (s *Store) DeferSituationInput(ctx context.Context, claim SituationClaim, retryAt time.Time) error {
 	if strings.TrimSpace(claim.ID) == "" || strings.TrimSpace(claim.LeaseOwner) == "" || claim.ClaimToken <= 0 {
 		return errors.New("store: situation input defer requires a complete claim")
