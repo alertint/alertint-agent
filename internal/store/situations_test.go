@@ -1018,6 +1018,37 @@ func TestApplySituationInputClearsControllerLeaseFencingStaleRelease(t *testing.
 	}
 }
 
+func TestApplySituationInputResultReportsOnlyLiveSupersededClaim(t *testing.T) {
+	st, situationID, _ := dueSituationFixture(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	insertIncidentAndInput(t, st, "inc-idle", "input-idle", "service=due", now)
+	idleClaim := claimOneInput(t, st, "input-worker", now)
+	idleResult, err := st.ApplySituationInputResult(ctx, idleClaim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idleResult.SituationID != situationID || idleResult.InputVersion != 2 || idleResult.SupersededClaimToken != 0 {
+		t.Fatalf("idle apply result = %+v, want situation %s, version 2, no superseded token", idleResult, situationID)
+	}
+
+	controllerClaims, err := st.ClaimDueSituations(ctx, "controller", now, 5*time.Minute, 1)
+	if err != nil || len(controllerClaims) != 1 {
+		t.Fatalf("claim due situation: %v, %v", controllerClaims, err)
+	}
+	controllerToken := controllerClaims[0].ClaimToken
+	insertIncidentAndInput(t, st, "inc-live", "input-live", "service=due", now.Add(time.Second))
+	liveClaim := claimOneInput(t, st, "input-worker", now.Add(time.Second))
+	liveResult, err := st.ApplySituationInputResult(ctx, liveClaim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if liveResult.SituationID != situationID || liveResult.InputVersion != 3 || liveResult.SupersededClaimToken != controllerToken {
+		t.Fatalf("live apply result = %+v, want situation %s, version 3, superseded token %d", liveResult, situationID, controllerToken)
+	}
+}
+
 // ----------------------------------------------------------------------
 // Step 5 (R1/R2): ApplySituationInput's handling of the two durable
 // operator artifact input kinds.
