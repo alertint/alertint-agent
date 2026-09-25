@@ -217,6 +217,18 @@ func dueSituationFixture(t *testing.T) (*Store, string, time.Time) {
 	return st, sits[0].ID, now
 }
 
+func TestSituationSupersedeGuardColumnsDefaultClear(t *testing.T) {
+	st, situationID, _ := dueSituationFixture(t)
+	var streak, protected int
+	if err := st.db.QueryRowContext(context.Background(), `
+		SELECT supersede_streak, lease_protected FROM situations WHERE id = ?`, situationID).Scan(&streak, &protected); err != nil {
+		t.Fatalf("read supersede guard columns: %v", err)
+	}
+	if streak != 0 || protected != 0 {
+		t.Fatalf("new Situation guard = (%d, %d), want (0, 0)", streak, protected)
+	}
+}
+
 // ----------------------------------------------------------------------
 // dueReasonForInputKind
 // ----------------------------------------------------------------------

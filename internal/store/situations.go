@@ -34,6 +34,8 @@ type SituationClaim = situationmodel.SituationClaim
 // the other. See internal/situation/model/foundation.go.
 var ErrSituationLeaseLost = situationmodel.ErrSituationLeaseLost
 
+var ErrSituationProtected = situationmodel.ErrSituationProtected
+
 // ErrSituationVersionConflict means a Situation's input_version advanced
 // between the moment a caller last observed it and the moment it tried to
 // commit against that observed version — distinct from ErrSituationLeaseLost,
@@ -757,7 +759,7 @@ const situationSelect = `
 	       opened_at, effective_started_at, effective_started_at_basis, first_received_at,
 	       last_lifecycle_observed_at, recovery_observed_at, grace_until, terminal_at, terminal_reason,
 	       next_assessment_at, due_reasons_json, lease_owner, lease_expires_at, claim_token, attempt_count,
-	       last_error_class, retry_at, created_at, updated_at
+	       supersede_streak, lease_protected, last_error_class, retry_at, created_at, updated_at
 	FROM situations`
 
 func scanSituation(s scanner) (situationmodel.Situation, error) {
@@ -768,12 +770,14 @@ func scanSituation(s scanner) (situationmodel.Situation, error) {
 		lifecycle, attention, effStartedBasis                                          string
 		openedAtStr, effStartedStr, firstReceivedStr, lastLifecycleStr                 string
 		nextAssessmentStr, createdStr, updatedStr, dueReasonsJSON                      string
+		protected                                                                      int
 	)
 	if err := s.Scan(
 		&sit.ID, &previousID, &sit.GroupKey, &publicHandle, &lifecycle, &attention, &sit.InputVersion,
 		&openedAtStr, &effStartedStr, &effStartedBasis, &firstReceivedStr,
 		&lastLifecycleStr, &recoveryObservedStr, &graceUntilStr, &terminalAtStr, &terminalReasonStr,
 		&nextAssessmentStr, &dueReasonsJSON, &leaseOwner, &leaseExpiresStr, &sit.ClaimToken, &sit.AttemptCount,
+		&sit.SupersedeStreak, &protected,
 		&lastErrorClass, &retryAtStr, &createdStr, &updatedStr,
 	); err != nil {
 		return situationmodel.Situation{}, err
@@ -785,6 +789,7 @@ func scanSituation(s scanner) (situationmodel.Situation, error) {
 	sit.PreviousSituationID = stringPtr(previousID)
 	sit.PublicHandle = stringPtr(publicHandle)
 	sit.LeaseOwner = stringPtr(leaseOwner)
+	sit.LeaseProtected = protected == 1
 	sit.LastErrorClass = stringPtr(lastErrorClass)
 	if tr := stringPtr(terminalReasonStr); tr != nil {
 		reason := situationmodel.TerminalReason(*tr)

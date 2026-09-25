@@ -178,6 +178,8 @@ type Situation struct {
 	LeaseExpiresAt          *time.Time      `json:"lease_expires_at,omitempty"`
 	ClaimToken              int64           `json:"claim_token"`
 	AttemptCount            int             `json:"attempt_count"`
+	SupersedeStreak         int             `json:"supersede_streak"`
+	LeaseProtected          bool            `json:"lease_protected"`
 	LastErrorClass          *string         `json:"last_error_class,omitempty"`
 	RetryAt                 *time.Time      `json:"retry_at,omitempty"`
 	CreatedAt               time.Time       `json:"created_at"`

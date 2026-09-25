@@ -41,6 +41,10 @@ var ErrNotFound = errors.New("store: not found")
 // must discard the stale claim, not retry with it, on receiving this error.
 var ErrSituationLeaseLost = errors.New("store: situation lease lost")
 
+// ErrSituationProtected asks the input worker to return its outbox claim to
+// pending while the current controller lease is guarded against supersession.
+var ErrSituationProtected = errors.New("store: situation run protected; input deferred")
+
 // SituationInput is one durable, deterministically-idempotent fact destined
 // for the situation_input_outbox — the only channel through which a
 // correlation-side mutation (a correlated delivery, an Incident's ready
