@@ -281,17 +281,25 @@ func actorFor(operatorRequired *model.OperatorAction, alertAction *model.AlertIN
 }
 
 // nextUpdateAt is the earliest of now+cadence and every non-nil candidate
-// checkpoint in state (spec.md: "the earliest of now + cadence, Triage due
-// time, L2 retry time, recovery-grace expiry, lifecycle-observation
-// deadline, or any concurrently persisted earlier checkpoint"), clamped
-// forward to at least minNextUpdateLead past now so an already-due candidate
-// still satisfies the contract's future-time requirement.
+// checkpoint in state (spec.md: "the earliest of now + cadence, a Triage due
+// time only while it is still ahead, L2 retry time, recovery-grace expiry,
+// lifecycle-observation deadline, or any concurrently persisted earlier
+// checkpoint"), clamped forward to at least minNextUpdateLead past now so an
+// already-due controller checkpoint still satisfies the future-time contract.
 func nextUpdateAt(state ControllerState, cadence model.Cadence, now time.Time) time.Time {
 	earliest := now.Add(state.Tempo.Interval(cadence))
-	for _, t := range []*time.Time{
-		state.TriageDueAt, state.SemanticRetryAt, state.RecoveryGraceUntil,
+	candidates := []*time.Time{
+		state.SemanticRetryAt, state.RecoveryGraceUntil,
 		state.LifecycleObservationDeadlineAt, state.EarliestPersistedCheckpoint,
-	} {
+	}
+	// A due Triage checkpoint is the triage worker's move. Each transition
+	// appends a Situation input that wakes the controller, so retaining a past
+	// due time here would recreate F8's one-second hot loop. Keep TriageDueAt
+	// in nextUpdateOn: the next update still follows the Triage outcome.
+	if state.TriageDueAt != nil && state.TriageDueAt.After(now) {
+		candidates = append(candidates, state.TriageDueAt)
+	}
+	for _, t := range candidates {
 		if t != nil && t.Before(earliest) {
 			earliest = *t
 		}

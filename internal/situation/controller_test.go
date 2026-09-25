@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -1241,6 +1242,56 @@ func TestControllerReconcileTriageRequestAndAssessmentShareOneCommit(t *testing.
 	}
 	if commit.TriageDecisions[0].Decision != situation.TriageDecisionRequest {
 		t.Fatalf("decision = %q, want request (no trustworthy Assessment exists yet)", commit.TriageDecisions[0].Decision)
+	}
+}
+
+func TestControllerReconcilePendingTriageIdlesAtCadence(t *testing.T) {
+	now := ctBaseTime.Add(10 * time.Minute)
+	due := func(at time.Time) *time.Time { return &at }
+	for _, tc := range []struct {
+		name         string
+		phase        string
+		nextAt       *time.Time
+		wantUpdateAt time.Time
+		wantRequest  bool
+	}{
+		{"past due pending", "pending", due(now.Add(-10 * time.Second)), now.Add(900 * time.Second), false},
+		{"future pending", "pending", due(now.Add(20 * time.Second)), now.Add(20 * time.Second), false},
+		{"request this cycle", "awaiting_decision", nil, now.Add(900 * time.Second), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := ctBaseSnapshotInput()
+			in.Incidents[0].Triage.Phase = tc.phase
+			in.Incidents[0].Triage.NextAt = tc.nextAt
+			store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
+			client := &fakeAssessmentClient{responses: []func() (llm.OneShotCompletion, error){acceptedResponse(t)}}
+			controller := ctLifecycleController(store, client, now)
+			if err := controller.Reconcile(context.Background(), ctBaseClaim()); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			if len(store.commits) != 1 {
+				t.Fatalf("commits = %d, want 1", len(store.commits))
+			}
+			commit := store.commits[0]
+			if commit.Attention != model.AttentionObserve || commit.Assessment.Cadence != model.CadenceSlow {
+				t.Fatalf("attention/cadence = %q/%q, want observe/slow", commit.Attention, commit.Assessment.Cadence)
+			}
+			if !commit.NextAssessmentAt.Equal(tc.wantUpdateAt) {
+				t.Fatalf("NextAssessmentAt = %v, want %v", commit.NextAssessmentAt, tc.wantUpdateAt)
+			}
+			contract := commit.Assessment.ActionContract
+			if contract.NextUpdateAt == nil || !contract.NextUpdateAt.Equal(tc.wantUpdateAt) {
+				t.Fatalf("next_update_at = %v, want %v", contract.NextUpdateAt, tc.wantUpdateAt)
+			}
+			if !slices.Contains(contract.NextUpdateOn, model.NextUpdateOnTriageOutcome) {
+				t.Fatalf("next_update_on = %v, want triage_outcome", contract.NextUpdateOn)
+			}
+			if tc.wantRequest {
+				if len(commit.TriageDecisions) != 1 || commit.TriageDecisions[0].Decision != situation.TriageDecisionRequest {
+					t.Fatalf("TriageDecisions = %v, want one Request", commit.TriageDecisions)
+				}
+			}
+		})
 	}
 }
 

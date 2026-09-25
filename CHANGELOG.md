@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A Situation waiting for its Triage to start no longer re-assesses every ~2
+  seconds; it waits for the Triage outcome or its normal cadence.
 - A Situation reconcile superseded by a newer input is now recorded as
   `superseded` (INFO) instead of a failed commit. The controller heartbeat
   retries transient store errors while its lease is still valid (#117).

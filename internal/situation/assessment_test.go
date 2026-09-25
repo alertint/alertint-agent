@@ -686,6 +686,43 @@ func TestDeriveActionContractNextUpdateAtIsEarliestCandidateAndClampsPastOverdue
 	mustValidActionContract(t, cOverdue, false, now)
 }
 
+func TestNextUpdateAtIgnoresPastDueTriageCheckpoint(t *testing.T) {
+	now := mustTime(t, "2026-09-01T12:00:00Z")
+	for _, tc := range []struct {
+		name         string
+		attention    model.Attention
+		triagePhase  TriagePhase
+		triageDue    time.Time
+		wantCadence  model.Cadence
+		wantInterval time.Duration
+		wantUpdateAt time.Time
+	}{
+		{"past due observe", model.AttentionObserve, TriagePhaseAwaitingDecision, now.Add(-5 * time.Second), model.CadenceSlow, 900 * time.Second, now.Add(900 * time.Second)},
+		{"due now observe", model.AttentionObserve, TriagePhaseAwaitingDecision, now, model.CadenceSlow, 900 * time.Second, now.Add(900 * time.Second)},
+		{"future observe", model.AttentionObserve, TriagePhaseAwaitingDecision, now.Add(20 * time.Second), model.CadenceSlow, 900 * time.Second, now.Add(20 * time.Second)},
+		{"future backoff", model.AttentionObserve, TriagePhaseBackoff, now.Add(20 * time.Second), model.CadenceSlow, 900 * time.Second, now.Add(20 * time.Second)},
+		{"past due urgent", model.AttentionUrgent, TriagePhaseAwaitingDecision, now.Add(-5 * time.Second), model.CadenceFast, 60 * time.Second, now.Add(60 * time.Second)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := ControllerState{
+				Lifecycle: model.LifecycleActive, Attention: tc.attention,
+				TriagePhase: tc.triagePhase, TriageDueAt: &tc.triageDue,
+			}
+			cadence := DeriveCadence(state)
+			if cadence != tc.wantCadence || state.Tempo.Interval(cadence) != tc.wantInterval {
+				t.Fatalf("cadence = %q (%v), want %q (%v)", cadence, state.Tempo.Interval(cadence), tc.wantCadence, tc.wantInterval)
+			}
+			contract := DeriveActionContract(state, cadence, now)
+			if contract.NextUpdateAt == nil || !contract.NextUpdateAt.Equal(tc.wantUpdateAt) {
+				t.Fatalf("next_update_at = %v, want %v", contract.NextUpdateAt, tc.wantUpdateAt)
+			}
+			if len(contract.NextUpdateOn) != 1 || contract.NextUpdateOn[0] != model.NextUpdateOnTriageOutcome {
+				t.Fatalf("next_update_on = %v, want exactly [triage_outcome]", contract.NextUpdateOn)
+			}
+		})
+	}
+}
+
 func TestDeriveActionContractNextUpdateOnNamesPresentCandidatesOnly(t *testing.T) {
 	now := mustTime(t, "2026-09-01T12:00:00Z")
 	due := now.Add(time.Hour)

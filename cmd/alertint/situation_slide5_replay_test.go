@@ -701,15 +701,18 @@ func TestS5ReplayDeliveredSequenceRendersEveryCanonicalEvent(t *testing.T) {
 	if _, ts := r.rootCoordinates(r.sitID); ts != r.rootTS {
 		t.Fatalf("durable root ts = %q, want the posted %q", ts, r.rootTS)
 	}
+	queuedAt := r.clock.Now()
+	statusAt := queuedAt.Add(15 * time.Minute) // observe + pending Triage derives the slow 900s cadence.
+	if got := r.mustSituationTime("next_assessment_at"); !got.Equal(statusAt) {
+		t.Fatalf("queued next_assessment_at = %v, want slow cadence at %v", got, statusAt)
+	}
 	r.assertEvent("event 1", ev1, s5rExpect{
 		lifecycle: "active", orientation: "Observed", transitions: 1, replies: 0,
-		// G1 (lead final review 2026-09-10): the queued line now states the
-		// eligibility this very commit recorded — 10:45:00, one second
-		// before the 10:45:01 status checkpoint, so the two recorded times
-		// are asserted as distinct tokens rather than one reused value.
+		// The queue is claimable now; the controller's next status check
+		// follows the slow cadence while the triage worker has not claimed it.
 		rootMust: []string{"*Alerts:* 4", "has not started yet",
-			"It is eligible for a claim as of <!date^1788691500^",
-			"Next status check: <!date^1788691501^"},
+			"It is eligible for a claim as of " + slackDateToken(queuedAt),
+			"Next status check: " + slackDateToken(statusAt)},
 		rootMustNot: []string{"Investigating 4 alerts", "No readiness time is recorded"},
 	})
 
