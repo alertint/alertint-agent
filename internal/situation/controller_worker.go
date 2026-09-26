@@ -200,13 +200,13 @@ func (c *semaphoreAssessmentClient) CompleteOnce(ctx context.Context, systemProm
 	return c.completeAfterAcquire(ctx, systemPrompt, prompt, requiredKeys)
 }
 
+type assessmentShutdownContextKey struct{}
+
 // completeAfterAcquire keeps a started provider call alive when a direct
 // writer takes the lease mid-call. Under Plan 04 outbox inputs are held from
 // dispatch, so only direct writers can cause that lease loss. Waiting for
 // the response settles real token usage before the reconcile releases its
 // inference slot; shutdown and the attempt wall still cancel the call.
-type assessmentShutdownContextKey struct{}
-
 func (c *semaphoreAssessmentClient) completeAfterAcquire(ctx context.Context, systemPrompt string, prompt llm.Prompt, requiredKeys []string) (llm.OneShotCompletion, error) {
 	if err := ctx.Err(); err != nil {
 		return llm.OneShotCompletion{RequestStarted: llm.RequestStartStatusFalse}, err
