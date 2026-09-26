@@ -252,6 +252,147 @@ func claimGuardTestSituation(t *testing.T, st *Store, now time.Time) situationmo
 	return claims[0]
 }
 
+func dispatchGuardTestClaim(t *testing.T, st *Store, now time.Time) situation.Claim {
+	t.Helper()
+	claimed := claimGuardTestSituation(t, st, now)
+	return situation.Claim{Situation: claimed, ClaimOwner: "controller", ClaimToken: claimed.ClaimToken}
+}
+
+func dispatchGuardTestCall(t *testing.T, st *Store, claim situation.Claim, id string, now time.Time) {
+	t.Helper()
+	if err := st.RecordAssessmentCall(context.Background(), claim,
+		callFixture(id, claim.Situation.ID, claim.Situation.InputVersion, 1, 1, now)); err != nil {
+		t.Fatalf("record assessment call: %v", err)
+	}
+}
+
+func TestRecordAssessmentCallProtectsLease(t *testing.T) {
+	st, situationID, _ := dueSituationFixture(t)
+	now := time.Now().UTC().Add(2 * time.Second)
+	claim := dispatchGuardTestClaim(t, st, now)
+	if claim.Situation.LeaseProtected {
+		t.Fatal("first claim unexpectedly protected")
+	}
+	insertIncidentAndInput(t, st, "inc-dispatch-held", "input-dispatch-held", "service=due", now)
+	inputClaim := claimOneInput(t, st, "input-worker", now)
+	dispatchGuardTestCall(t, st, claim, "call-dispatch-held", now)
+	before := getSituationByID(t, st, situationID)
+	if !before.LeaseProtected {
+		t.Fatal("dispatch did not protect the live lease")
+	}
+	if err := st.ApplySituationInput(context.Background(), inputClaim); !errors.Is(err, ErrSituationProtected) {
+		t.Fatalf("apply during call = %v, want protected", err)
+	}
+	if after := getSituationByID(t, st, situationID); !reflect.DeepEqual(after, before) {
+		t.Fatalf("protected lease changed: before=%+v after=%+v", before, after)
+	}
+	insertIncidentAndInput(t, st, "inc-dispatch-skipped", "input-dispatch-skipped", "service=due", now)
+	claims, err := st.ClaimSituationInputs(context.Background(), "input-worker", now, time.Minute, 16)
+	if err != nil || len(claims) != 0 {
+		t.Fatalf("claim protected group inputs = (%d, %v), want none", len(claims), err)
+	}
+	var token int64
+	if err := st.db.QueryRowContext(context.Background(), `SELECT claim_token FROM situation_input_outbox WHERE id = 'input-dispatch-skipped'`).Scan(&token); err != nil || token != 0 {
+		t.Fatalf("skipped input claim token = (%d, %v), want 0", token, err)
+	}
+}
+
+func TestRecordAssessmentCallAfterSupersedeDoesNotProtect(t *testing.T) {
+	st, situationID, _ := dueSituationFixture(t)
+	now := time.Now().UTC().Add(2 * time.Second)
+	claim := dispatchGuardTestClaim(t, st, now)
+	applyGuardTestInput(t, st, "inc-before-dispatch", "input-before-dispatch", now)
+	err := st.RecordAssessmentCall(context.Background(), claim,
+		callFixture("call-after-supersede", situationID, claim.Situation.InputVersion, 1, 1, now))
+	if !errors.Is(err, situationmodel.ErrSituationLeaseLost) {
+		t.Fatalf("record after supersede = %v, want lease lost", err)
+	}
+	if got := getSituationByID(t, st, situationID); got.LeaseProtected {
+		t.Fatal("stale dispatch protected lease")
+	}
+	var count int
+	if err := st.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM situation_assessment_calls WHERE id = 'call-after-supersede'`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("stale call rows = (%d, %v), want 0", count, err)
+	}
+	newClaim := dispatchGuardTestClaim(t, st, now)
+	dispatchGuardTestCall(t, st, newClaim, "call-after-new-claim", now)
+	if !getSituationByID(t, st, situationID).LeaseProtected {
+		t.Fatal("new valid dispatch did not protect its own lease")
+	}
+}
+
+func TestDispatchProtectionEndsWithCommitAndRelease(t *testing.T) {
+	st, situationID, _ := dueSituationFixture(t)
+	now := time.Now().UTC().Add(2 * time.Second)
+	claim := dispatchGuardTestClaim(t, st, now)
+	insertIncidentAndInput(t, st, "inc-after-dispatch", "input-after-dispatch", "service=due", now)
+	inputClaim := claimOneInput(t, st, "input-worker", now)
+	dispatchGuardTestCall(t, st, claim, "call-before-commit", now)
+	if !getSituationByID(t, st, situationID).LeaseProtected {
+		t.Fatal("dispatch did not protect lease before commit")
+	}
+	if err := st.CommitController(context.Background(), claim, basicControllerCommit(situationID, claim.Situation.InputVersion, now)); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if got := getSituationByID(t, st, situationID); got.LeaseProtected {
+		t.Fatal("commit left dispatch protection")
+	}
+	if err := st.ApplySituationInput(context.Background(), inputClaim); err != nil {
+		t.Fatalf("apply after commit: %v", err)
+	}
+	if got := getSituationByID(t, st, situationID).InputVersion; got != claim.Situation.InputVersion+1 {
+		t.Fatalf("input version after commit = %d, want %d", got, claim.Situation.InputVersion+1)
+	}
+
+	st2, id2, _ := dueSituationFixture(t)
+	claim2 := dispatchGuardTestClaim(t, st2, now)
+	dispatchGuardTestCall(t, st2, claim2, "call-before-release", now)
+	if !getSituationByID(t, st2, id2).LeaseProtected {
+		t.Fatal("dispatch did not protect lease before release")
+	}
+	streak := getSituationByID(t, st2, id2).SupersedeStreak
+	if err := st2.ReleaseControllerWork(context.Background(), claim2, now, nil, nil); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if got := getSituationByID(t, st2, id2); got.LeaseProtected || got.SupersedeStreak != streak {
+		t.Fatalf("released state = protected:%v streak:%d, want false and %d", got.LeaseProtected, got.SupersedeStreak, streak)
+	}
+}
+
+func TestHeartbeatKeepsDispatchProtection(t *testing.T) {
+	st, id, _ := dueSituationFixture(t)
+	now := time.Now().UTC().Add(2 * time.Second)
+	claim := dispatchGuardTestClaim(t, st, now)
+	dispatchGuardTestCall(t, st, claim, "call-before-heartbeat", now)
+	if err := st.ExtendControllerLease(context.Background(), claim, now.Add(time.Second), time.Minute); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	if !getSituationByID(t, st, id).LeaseProtected {
+		t.Fatal("heartbeat cleared dispatch protection")
+	}
+}
+
+func TestExpiredDispatchProtectionDoesNotHold(t *testing.T) {
+	st, id, _ := dueSituationFixture(t)
+	now := time.Now().UTC().Add(2 * time.Second)
+	claim := dispatchGuardTestClaim(t, st, now)
+	dispatchGuardTestCall(t, st, claim, "call-before-expiry", now)
+	if !getSituationByID(t, st, id).LeaseProtected {
+		t.Fatal("dispatch did not protect lease before expiry")
+	}
+	if _, err := st.db.ExecContext(context.Background(), `UPDATE situations SET lease_expires_at = ? WHERE id = ?`, canonicalTime(time.Now().UTC().Add(-time.Second)), id); err != nil {
+		t.Fatalf("expire lease: %v", err)
+	}
+	insertIncidentAndInput(t, st, "inc-after-expiry", "input-after-expiry", "service=due", now)
+	inputClaim := claimOneInput(t, st, "input-worker", now)
+	if err := st.ApplySituationInput(context.Background(), inputClaim); err != nil {
+		t.Fatalf("apply after lease expiry: %v", err)
+	}
+	if got := getSituationByID(t, st, id); got.InputVersion != claim.Situation.InputVersion+1 || got.LeaseProtected {
+		t.Fatalf("expired protection state = version:%d protected:%v", got.InputVersion, got.LeaseProtected)
+	}
+}
+
 func TestJoinCountsSupersededLiveClaims(t *testing.T) {
 	st, situationID, _ := dueSituationFixture(t)
 	now := time.Now().UTC().Add(2 * time.Second)
