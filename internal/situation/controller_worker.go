@@ -205,6 +205,8 @@ func (c *semaphoreAssessmentClient) CompleteOnce(ctx context.Context, systemProm
 // dispatch, so only direct writers can cause that lease loss. Waiting for
 // the response settles real token usage before the reconcile releases its
 // inference slot; shutdown and the attempt wall still cancel the call.
+type assessmentShutdownContextKey struct{}
+
 func (c *semaphoreAssessmentClient) completeAfterAcquire(ctx context.Context, systemPrompt string, prompt llm.Prompt, requiredKeys []string) (llm.OneShotCompletion, error) {
 	if err := ctx.Err(); err != nil {
 		return llm.OneShotCompletion{RequestStarted: llm.RequestStartStatusFalse}, err
@@ -224,6 +226,13 @@ func (c *semaphoreAssessmentClient) completeAfterAcquire(ctx context.Context, sy
 		}
 	})
 	defer stop()
+	// A lease-loss cancellation is the reconcile context's final cause. Keep
+	// observing the worker's parent separately so a later shutdown can still
+	// abort a provider call that was allowed to settle after lease loss.
+	if shutdownCtx, ok := ctx.Value(assessmentShutdownContextKey{}).(context.Context); ok {
+		stopShutdown := context.AfterFunc(shutdownCtx, cancel)
+		defer stopShutdown()
+	}
 	return c.inner.CompleteOnce(providerCtx, systemPrompt, prompt, requiredKeys)
 }
 
@@ -530,7 +539,7 @@ var errLeaseUnconfirmed = errors.New("situation: controller lease could not be r
 // matches zero rows in that case — same as a plain release already would —
 // so the backoff write is a no-op rather than clobbering the newer claimant.
 func (w *ControllerWorker) processOne(ctx context.Context, claim Claim) {
-	reconcileCtx, cancel := context.WithCancelCause(ctx)
+	reconcileCtx, cancel := context.WithCancelCause(context.WithValue(ctx, assessmentShutdownContextKey{}, ctx))
 	defer cancel(nil)
 	w.mu.Lock()
 	w.inflight[claim.Situation.ID] = inflightRun{token: claim.ClaimToken, cancel: cancel}

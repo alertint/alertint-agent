@@ -350,6 +350,51 @@ func TestControllerWorkerLeaseLossWaitsForCallAndAbandonsWithoutRelease(t *testi
 	}
 }
 
+func TestControllerWorkerShutdownAfterLeaseLossAbortsStartedCall(t *testing.T) {
+	claim := ctClaimFor("situation-lease-loss-shutdown", "worker-a", 8)
+	store := &fakeControllerStore{
+		loadInput: ctBaseSnapshotInput(), beginWorkAttempt: 1,
+		claimFn: func(context.Context, string, time.Time, time.Duration, int) ([]situation.Claim, error) {
+			return []situation.Claim{claim}, nil
+		},
+	}
+	entered := make(chan struct{})
+	providerCanceled := make(chan struct{})
+	client := &fakeAssessmentClient{ctxFn: func(ctx context.Context) (llm.OneShotCompletion, error) {
+		close(entered)
+		<-ctx.Done()
+		close(providerCanceled)
+		return llm.OneShotCompletion{RequestStarted: llm.RequestStartStatusUnknown}, ctx.Err()
+	}}
+	w := situation.NewControllerWorker(store, store, client, situation.ControllerConfig{}, newWorkerConfig("worker-a"), nil, nil, nil)
+	ctx, shutdown := context.WithCancel(context.Background())
+	defer shutdown()
+	done := make(chan struct{})
+	go func() { _, _ = w.RunOnce(ctx); close(done) }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("provider did not start")
+	}
+	w.Preempt(claim.Situation.ID, claim.ClaimToken)
+	select {
+	case <-providerCanceled:
+		t.Fatal("lease loss alone aborted the started provider call")
+	case <-time.After(50 * time.Millisecond):
+	}
+	shutdown()
+	select {
+	case <-providerCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not abort provider after lease loss")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not finish after shutdown")
+	}
+}
+
 func TestControllerWorkerPreemptWaitsForStartedCallSettlement(t *testing.T) {
 	claim := ctClaimFor("situation-preempt", "worker-a", 7)
 	expires := time.Now().UTC().Add(time.Minute)

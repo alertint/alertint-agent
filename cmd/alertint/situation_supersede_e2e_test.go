@@ -287,6 +287,7 @@ func TestControllerGuardStillProtectsFromClaim(t *testing.T) {
 	if before.SupersedeStreak != 2 {
 		t.Fatalf("supersede streak = %d, want 2", before.SupersedeStreak)
 	}
+	beforeAssessment := supersedeAssessmentID(t, f)
 	done := make(chan error, 1)
 	go func() { _, err := cw.RunOnce(f.ctx); done <- err }()
 	select {
@@ -318,6 +319,10 @@ func TestControllerGuardStillProtectsFromClaim(t *testing.T) {
 	}
 	if calls := client.base.callCount(); calls != baselineCalls+1 {
 		t.Fatalf("guarded L2 calls = %d, want 1", calls-baselineCalls)
+	}
+	guardedAssessment := supersedeAssessmentID(t, f)
+	if !guardedAssessment.Valid || guardedAssessment == beforeAssessment {
+		t.Fatalf("guarded run did not commit: before=%v after=%v", beforeAssessment, guardedAssessment)
 	}
 	if !strings.Contains(logs.String(), `"protected_from":"claim"`) {
 		t.Fatal("guarded run did not log protected_from=claim")
