@@ -261,16 +261,17 @@ func TestControllerWorkerHeartbeatExtendsLeaseDuringSlowReconcile(t *testing.T) 
 	}
 }
 
-func TestControllerWorkerLeaseLossCancelsReconcileAndAbandonsWithoutRelease(t *testing.T) {
+func TestControllerWorkerLeaseLossWaitsForCallAndAbandonsWithoutRelease(t *testing.T) {
 	in := ctFloorSnapshotInput()
 	claim := ctClaimFor("situation-leaselost", "worker-a", 1)
 	commitCanceled := make(chan struct{})
+	lost := make(chan struct{})
 	store := &fakeControllerStore{
 		loadInput: in,
 		claimFn: func(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]situation.Claim, error) {
 			return []situation.Claim{claim}, nil
 		},
-		extendErr: model.ErrSituationLeaseLost,
+		extendFn: func(context.Context, int) error { close(lost); return model.ErrSituationLeaseLost },
 		commitFn: func(situation.ControllerCommit) error {
 			// Never actually reached in this scenario (see below); present
 			// only so a bug that DOES reach it fails loudly instead of
@@ -281,15 +282,21 @@ func TestControllerWorkerLeaseLossCancelsReconcileAndAbandonsWithoutRelease(t *t
 	}
 	cfg := newWorkerConfig("worker-a")
 	cfg.Heartbeat = 10 * time.Millisecond
-	// A client whose CompleteOnce blocks on the REAL context Reconcile
-	// passed it, until that context is canceled by the heartbeat's own
-	// lease-loss abandon path — this Situation has no deterministic floor
-	// (non-critical severity), so Reconcile must dispatch L2 work and
-	// therefore actually calls CompleteOnce, giving the heartbeat loss a
-	// real in-flight call to cancel.
+	// A direct writer can take a lease during a started L2 call. The
+	// heartbeat notices, but the provider's usage must settle before this
+	// reconcile reports superseded.
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	finish := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(finish)
+	accepted := acceptedResponse(t)
 	client := &fakeAssessmentClient{ctxFn: func(ctx context.Context) (llm.OneShotCompletion, error) {
-		<-ctx.Done()
-		return llm.OneShotCompletion{}, ctx.Err()
+		select {
+		case <-release:
+			return accepted()
+		case <-ctx.Done():
+			return llm.OneShotCompletion{RequestStarted: llm.RequestStartStatusUnknown}, ctx.Err()
+		}
 	}}
 
 	in2 := ctBaseSnapshotInput() // non-critical: no deterministic floor, forces L2 dispatch.
@@ -307,9 +314,20 @@ func TestControllerWorkerLeaseLossCancelsReconcileAndAbandonsWithoutRelease(t *t
 	}()
 
 	select {
+	case <-lost:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat did not detect lease loss")
+	}
+	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("RunOnce never returned after lease loss")
+		t.Fatal("RunOnce returned before provider settled")
+	case <-time.After(200 * time.Millisecond):
+	}
+	finish()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("RunOnce did not return after settlement")
 	}
 
 	select {
@@ -332,7 +350,7 @@ func TestControllerWorkerLeaseLossCancelsReconcileAndAbandonsWithoutRelease(t *t
 	}
 }
 
-func TestControllerWorkerPreemptCancelsOnlyMatchingClaim(t *testing.T) {
+func TestControllerWorkerPreemptWaitsForStartedCallSettlement(t *testing.T) {
 	claim := ctClaimFor("situation-preempt", "worker-a", 7)
 	expires := time.Now().UTC().Add(time.Minute)
 	claim.Situation.LeaseExpiresAt = &expires
@@ -343,10 +361,19 @@ func TestControllerWorkerPreemptCancelsOnlyMatchingClaim(t *testing.T) {
 		},
 	}
 	inCall := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	finish := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(finish)
+	accepted := acceptedResponse(t)
 	client := &fakeAssessmentClient{ctxFn: func(ctx context.Context) (llm.OneShotCompletion, error) {
 		close(inCall)
-		<-ctx.Done()
-		return llm.OneShotCompletion{}, ctx.Err()
+		select {
+		case <-release:
+			return accepted()
+		case <-ctx.Done():
+			return llm.OneShotCompletion{RequestStarted: llm.RequestStartStatusUnknown}, ctx.Err()
+		}
 	}}
 	var logs bytes.Buffer
 	w := situation.NewControllerWorker(store, store, client, situation.ControllerConfig{}, newWorkerConfig("worker-a"), nil, nil,
@@ -372,11 +399,20 @@ func TestControllerWorkerPreemptCancelsOnlyMatchingClaim(t *testing.T) {
 	w.Preempt(claim.Situation.ID, claim.ClaimToken)
 	select {
 	case err := <-done:
+		t.Fatalf("RunOnce returned before started call settled: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	finish()
+	select {
+	case err := <-done:
 		if err != nil {
 			t.Fatalf("RunOnce: %v", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("matching preempt did not cancel blocked reconcile promptly")
+		t.Fatal("RunOnce did not finish after provider settled")
+	}
+	if got := store.snapshotCommits(); len(got) != 0 {
+		t.Fatalf("superseded run committed: %+v", got)
 	}
 	if calls := store.snapshotReleaseCalls(); len(calls) != 0 {
 		t.Fatalf("release after preempt = %+v, want none", calls)

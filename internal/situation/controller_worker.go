@@ -188,7 +188,7 @@ func (c *semaphoreAssessmentClient) CompleteOnce(ctx context.Context, systemProm
 			return llm.OneShotCompletion{RequestStarted: llm.RequestStartStatusFalse}, err
 		}
 		defer release()
-		return c.inner.CompleteOnce(ctx, systemPrompt, prompt, requiredKeys)
+		return c.completeAfterAcquire(ctx, systemPrompt, prompt, requiredKeys)
 	}
 
 	select {
@@ -197,7 +197,34 @@ func (c *semaphoreAssessmentClient) CompleteOnce(ctx context.Context, systemProm
 		return llm.OneShotCompletion{RequestStarted: llm.RequestStartStatusFalse}, ctx.Err()
 	}
 	defer func() { <-c.sem }()
-	return c.inner.CompleteOnce(ctx, systemPrompt, prompt, requiredKeys)
+	return c.completeAfterAcquire(ctx, systemPrompt, prompt, requiredKeys)
+}
+
+// completeAfterAcquire keeps a started provider call alive when a direct
+// writer takes the lease mid-call. Under Plan 04 outbox inputs are held from
+// dispatch, so only direct writers can cause that lease loss. Waiting for
+// the response settles real token usage before the reconcile releases its
+// inference slot; shutdown and the attempt wall still cancel the call.
+func (c *semaphoreAssessmentClient) completeAfterAcquire(ctx context.Context, systemPrompt string, prompt llm.Prompt, requiredKeys []string) (llm.OneShotCompletion, error) {
+	if err := ctx.Err(); err != nil {
+		return llm.OneShotCompletion{RequestStarted: llm.RequestStartStatusFalse}, err
+	}
+	providerCtx := context.WithoutCancel(ctx)
+	var cancel context.CancelFunc
+	if deadline, ok := ctx.Deadline(); ok {
+		providerCtx, cancel = context.WithDeadline(providerCtx, deadline)
+	} else {
+		providerCtx, cancel = context.WithCancel(providerCtx)
+	}
+	defer cancel()
+	stop := context.AfterFunc(ctx, func() {
+		cause := context.Cause(ctx)
+		if !errors.Is(cause, model.ErrSituationLeaseLost) && !errors.Is(cause, context.DeadlineExceeded) {
+			cancel()
+		}
+	})
+	defer stop()
+	return c.inner.CompleteOnce(providerCtx, systemPrompt, prompt, requiredKeys)
 }
 
 // ControllerWorker polls due Situations (ControllerWorkStore.
