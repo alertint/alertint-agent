@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Declined provider responses (4xx, 503, 529) no longer latch a capped LLM
+  budget and now reach clients with their real status. Existing latches still
+  need the manual recovery in the configuration guide.
 - A reconcile superseded by a new input is now cancelled immediately, before
   it spends an LLM call.
 - Once a Situation's LLM call has started, new inputs wait for it and are

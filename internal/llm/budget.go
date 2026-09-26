@@ -14,11 +14,13 @@ import (
 	"math"
 	"net/http"
 	"slices"
+	"strconv"
 	"time"
 )
 
 var ErrBudgetExhausted = errors.New("llm: shared budget exhausted")
 var ErrBudgetUsageUnknown = errors.New("llm: budget usage unknown; inspect provider usage and persisted llm.budget.v1 state before recovery")
+var errResponseTokenOverflow = errors.New("llm: response token count overflow")
 
 // BudgetLimits apply to all generation attempts sharing a store, across
 // workloads, retries and restarts. Zero means unlimited for that dimension.
@@ -34,8 +36,9 @@ type BudgetStore interface {
 
 // Budget reserves a conservative token allowance and one rolling-hour call
 // atomically before each HTTP generation attempt. Successful usage settlement
-// refunds unused allowance; ambiguous outcomes keep the charge and latch an
-// unknown-usage block for finite token budgets. Unsettled crash reservations
+// refunds unused allowance; declined requests settle to reported usage or zero.
+// Ambiguous outcomes keep the charge and latch an unknown-usage block for
+// finite token budgets. Unsettled crash reservations
 // remain charged across restart, but do not exclude other affordable calls.
 type Budget struct {
 	store  BudgetStore
@@ -50,11 +53,13 @@ func NewBudget(store BudgetStore, limits BudgetLimits) *Budget {
 }
 
 type budgetState struct {
-	Version int              `json:"version"`
-	Calls   []time.Time      `json:"calls"`
-	Tokens  int64            `json:"tokens"`
-	Pending map[string]int64 `json:"pending"`
-	Unknown bool             `json:"unknown"`
+	Version       int              `json:"version"`
+	Calls         []time.Time      `json:"calls"`
+	Tokens        int64            `json:"tokens"`
+	Pending       map[string]int64 `json:"pending"`
+	Unknown       bool             `json:"unknown"`
+	UnknownReason string           `json:"unknown_reason,omitempty"`
+	UnknownAt     string           `json:"unknown_at,omitempty"`
 }
 
 func (b *Budget) update(ctx context.Context, fn func(*budgetState) error) error {
@@ -116,22 +121,7 @@ func (t *budgetTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, fmt.Errorf("%w: reserve LLM budget: %w", ErrRequestNotSent, err)
 	}
 	resp, dispatchErr := t.base.RoundTrip(req)
-	var used int64
-	var usageErr error
-	if dispatchErr == nil && resp != nil {
-		var body []byte
-		body, usageErr = io.ReadAll(io.LimitReader(resp.Body, 512*1024+1))
-		_ = resp.Body.Close()
-		resp.Body = io.NopCloser(bytes.NewReader(body))
-		if len(body) > 512*1024 {
-			usageErr = fmt.Errorf("%w: response exceeds 512 KiB", ErrBudgetUsageUnknown)
-		}
-		if usageErr == nil {
-			used, usageErr = responseTokens(body)
-		}
-	} else {
-		usageErr = ErrBudgetUsageUnknown
-	}
+	used, unknownReason, usageErr := settlementUsage(resp, dispatchErr)
 	// Settlement must outlive a canceled HTTP context, but remain bounded. If
 	// persistence fails, the committed allowance remains charged.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(req.Context()), 5*time.Second)
@@ -144,13 +134,13 @@ func (t *budgetTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 		delete(state.Pending, id)
 		if usageErr != nil {
-			state.Unknown = true
+			latchUnknown(state, unknownReason, b.now())
 			return nil
 		}
 		state.Tokens -= reserved
 		if used > math.MaxInt64-state.Tokens {
 			state.Tokens = math.MaxInt64
-			state.Unknown = true
+			latchUnknown(state, "usage_overflow", b.now())
 		} else {
 			state.Tokens += used
 		}
@@ -170,7 +160,7 @@ func (t *budgetTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 		return nil, fmt.Errorf("%w: %w: provider usage exceeded llm.budget.total_tokens=%d; inspect provider accounting before raising the limit", ErrResponseInvalid, ErrBudgetExhausted, b.limits.TotalTokens)
 	}
-	if usageErr != nil && (dispatchErr == nil && resp != nil && resp.StatusCode == http.StatusOK || b.limits.TotalTokens > 0) {
+	if usageErr != nil && (dispatchErr == nil && resp != nil && resp.StatusCode == http.StatusOK || dispatchErr != nil && b.limits.TotalTokens > 0) {
 		if resp != nil {
 			_ = resp.Body.Close()
 		}
@@ -182,10 +172,55 @@ func (t *budgetTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, dispatchErr
 }
 
+func settlementUsage(resp *http.Response, dispatchErr error) (int64, string, error) {
+	if dispatchErr != nil || resp == nil {
+		return 0, "transport_error", ErrBudgetUsageUnknown
+	}
+	declined := resp.StatusCode >= 400 && resp.StatusCode < 500 || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == 529
+	body, usageErr := io.ReadAll(io.LimitReader(resp.Body, 512*1024+1))
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	if !declined && resp.StatusCode != http.StatusOK {
+		// A gateway may have generated and billed even when it reports an
+		// error with usage. Keep the reservation for ambiguous statuses.
+		return 0, fmt.Sprintf("http_%d", resp.StatusCode), ErrBudgetUsageUnknown
+	}
+	if len(body) > 512*1024 {
+		usageErr = fmt.Errorf("%w: response exceeds 512 KiB", ErrBudgetUsageUnknown)
+	}
+	var used int64
+	if usageErr == nil {
+		used, usageErr = responseTokens(body)
+	}
+	if declined {
+		if usageErr != nil {
+			return 0, "", nil
+		}
+		return used, "", nil
+	}
+	if errors.Is(usageErr, errResponseTokenOverflow) {
+		return 0, "usage_overflow", usageErr
+	}
+	return used, "no_usage", usageErr
+}
+
+func latchUnknown(state *budgetState, reason string, at time.Time) {
+	if state.Unknown {
+		return
+	}
+	state.Unknown = true
+	state.UnknownReason = reason
+	state.UnknownAt = at.UTC().Format(time.RFC3339)
+}
+
 func (b *Budget) reserve(ctx context.Context, id string, allowance int64) error {
 	return b.update(ctx, func(state *budgetState) error {
 		if b.limits.TotalTokens > 0 && state.Unknown {
-			return &BudgetDeferredError{Message: "llm.budget.total_tokens has unknown usage; inspect provider usage and llm.budget.v1 before recovery"}
+			message := "llm.budget.total_tokens has unknown usage; inspect provider usage and llm.budget.v1 before recovery"
+			if state.UnknownReason != "" && state.UnknownAt != "" {
+				message += fmt.Sprintf("; since %s (%s)", state.UnknownAt, state.UnknownReason)
+			}
+			return &BudgetDeferredError{Message: message}
 		}
 		now := b.now().UTC()
 		live := state.Calls[:0]
@@ -267,8 +302,17 @@ func responseTokens(raw []byte) (int64, error) {
 			continue
 		}
 		var count *int64
-		if err := json.Unmarshal(raw, &count); err != nil || count == nil || *count < 0 || *count > math.MaxInt64-total {
+		if err := json.Unmarshal(raw, &count); err != nil {
+			if _, parseErr := strconv.ParseInt(string(raw), 10, 64); errors.Is(parseErr, strconv.ErrRange) {
+				return 0, errors.Join(ErrBudgetUsageUnknown, errResponseTokenOverflow)
+			}
 			return 0, ErrBudgetUsageUnknown
+		}
+		if count == nil || *count < 0 {
+			return 0, ErrBudgetUsageUnknown
+		}
+		if *count > math.MaxInt64-total {
+			return 0, errors.Join(ErrBudgetUsageUnknown, errResponseTokenOverflow)
 		}
 		total += *count
 	}
