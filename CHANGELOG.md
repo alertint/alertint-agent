@@ -9,8 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A reconcile superseded by a new input is now cancelled immediately instead
-  of running to completion.
+- A reconcile superseded by a new input is now cancelled immediately, before
+  it spends an LLM call.
+- Once a Situation's LLM call has started, new inputs wait for it and are
+  applied right after it commits, so no paid call is discarded.
+- A run whose lease is taken mid-call lets the call finish, so the token
+  budget records real usage instead of latching unknown.
 - A Situation receiving a steady stream of new alerts now still updates:
   after two runs are superseded by new inputs, the next run finishes before
   further inputs are applied.
