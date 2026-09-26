@@ -72,6 +72,15 @@ type SituationClaim struct {
 	AttemptCount int
 }
 
+// SituationInputApplied describes the committed result of applying one input.
+// SupersededClaimToken is nonzero only when that input cleared a live
+// controller claim; callers may use it to cancel that exact in-flight run.
+type SituationInputApplied struct {
+	SituationID          string
+	InputVersion         int
+	SupersededClaimToken int64
+}
+
 // LeaseRecovery reports how many rows RecoverExpiredFoundationLeases moved
 // from an expired claim back to unclaimed, per fenced table.
 type LeaseRecovery struct {

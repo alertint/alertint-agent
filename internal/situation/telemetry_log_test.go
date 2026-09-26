@@ -15,6 +15,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/llm"
 	"github.com/alertint/alertint-agent/internal/situation"
+	"github.com/alertint/alertint-agent/internal/situation/model"
 )
 
 // jsonLogLines parses every JSON line a slog.JSONHandler wrote into buf.
@@ -75,6 +76,61 @@ func requireKeys(t *testing.T, line map[string]any, keys ...string) {
 	}
 }
 
+func TestControllerReconcileLogShowsProtectionSource(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		reuse         bool
+		claimGuard    bool
+		wantSource    string
+		wantProtected bool
+	}{
+		{name: "dispatch", wantSource: "dispatch", wantProtected: true},
+		{name: "claim", claimGuard: true, wantSource: "claim", wantProtected: true},
+		{name: "reuse", reuse: true, wantSource: "none", wantProtected: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			in := ctBaseSnapshotInput()
+			if tc.reuse {
+				in.Now = ctBaseTime.Add(10 * time.Minute)
+				snap := situation.BuildSnapshot(in)
+				in.CurrentAssessment = &situation.AuthoritativeAssessment{
+					ID: "prior", SituationID: in.Situation.ID,
+					AssessmentBasisHash: snap.AssessmentBasisHash, MaterialFactHash: snap.MaterialFactHash,
+					InputVersion: 2, Derivation: model.DerivationModelValidated,
+					Assessment: model.Assessment{
+						SchemaVersion: model.AssessmentSchemaVersion, Persistence: model.PersistenceSustained,
+						Impact: model.ImpactSuspected, Novelty: model.NoveltyFamiliar, Causality: model.CausalityCorrelated,
+						Attention: model.AttentionObserve, Lifecycle: model.LifecycleActive,
+						EvidenceQuality: model.EvidenceQualityComplete, Cadence: model.CadenceSlow,
+						ActionContract: model.ActionContract{NextActor: model.NextActorNone, NextUpdateAt: &ctBaseTime},
+					},
+				}
+			}
+			store := &fakeControllerStore{loadInput: in, beginWorkAttempt: 1}
+			client := &fakeAssessmentClient{responses: []func() (llm.OneShotCompletion, error){acceptedResponse(t)}}
+			logger := slog.New(slog.NewJSONHandler(&buf, nil))
+			controller := situation.NewController(store, client, situation.ControllerConfig{},
+				func() time.Time { return ctBaseTime.Add(10 * time.Minute) }, nil, logger)
+			claim := ctBaseClaim()
+			claim.Situation.LeaseProtected = tc.claimGuard
+			if err := controller.Reconcile(context.Background(), claim); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			lines := linesWithMsg(jsonLogLines(t, &buf), "situation: controller reconcile")
+			if len(lines) != 1 {
+				t.Fatalf("reconcile lines = %d", len(lines))
+			}
+			if source := lines[0]["protected_from"]; source != tc.wantSource {
+				t.Fatalf("protected_from = %v, want %s", source, tc.wantSource)
+			}
+			if protected := lines[0]["protected"]; protected != tc.wantProtected {
+				t.Fatalf("protected = %v, want %v", protected, tc.wantProtected)
+			}
+		})
+	}
+}
+
 // TestTelemetryReconcileAndDispatchLogLinesCarrySpanIdentity proves the
 // structured log lines the controller writes per cycle and per consumed
 // dispatch slot carry the same stable identities the spans do (spec.md:
@@ -114,6 +170,18 @@ func TestTelemetryReconcileAndDispatchLogLinesCarrySpanIdentity(t *testing.T) {
 	rs := spanByID(t, spans, stringAttr(t, r, "span_id"))
 	if rs.Name != situation.SpanControllerReconcile {
 		t.Fatalf("reconcile line span_id resolves to span %q, want %q", rs.Name, situation.SpanControllerReconcile)
+	}
+	if r["protected_from"] != "dispatch" || r["protected"] != true {
+		t.Fatalf("dispatch protection log = (%v, %v), want (dispatch, true)", r["protected_from"], r["protected"])
+	}
+	spanProtectedFrom := ""
+	for _, attr := range rs.Attributes {
+		if attr.Key == situation.AttrProtectedFrom {
+			spanProtectedFrom = attr.Value.AsString()
+		}
+	}
+	if spanProtectedFrom != "dispatch" {
+		t.Fatalf("reconcile span protected_from = %q, want dispatch", spanProtectedFrom)
 	}
 	if rs.SpanContext.TraceID().String() != r["trace_id"] {
 		t.Fatalf("reconcile line trace_id = %v, want the span's %s", r["trace_id"], rs.SpanContext.TraceID())

@@ -458,6 +458,7 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	rt.inputs.SetPreempter(crt.worker)
 
 	// The bounded evidence-preparation runtime (Plan 4 Task 9): the
 	// concrete EvidencePreparer adapter — injected into the SAME controller

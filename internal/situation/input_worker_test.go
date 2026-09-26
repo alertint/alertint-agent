@@ -36,7 +36,8 @@ type inputStoreSpy struct {
 
 	claimCalls int
 
-	applyFn func(claim model.SituationClaim) error
+	applyFn     func(claim model.SituationClaim) error
+	applyResult model.SituationInputApplied
 
 	retryCalled   bool
 	retryClaim    model.SituationClaim
@@ -66,11 +67,24 @@ func (s *inputStoreSpy) ClaimSituationInputs(_ context.Context, _ string, _ time
 	return out, nil
 }
 
-func (s *inputStoreSpy) ApplySituationInput(_ context.Context, claim model.SituationClaim) error {
+func (s *inputStoreSpy) ApplySituationInputResult(_ context.Context, claim model.SituationClaim) (model.SituationInputApplied, error) {
 	if s.applyFn != nil {
-		return s.applyFn(claim)
+		if err := s.applyFn(claim); err != nil {
+			return model.SituationInputApplied{}, err
+		}
 	}
-	return nil
+	return s.applyResult, nil
+}
+
+type preemptCall struct {
+	situationID string
+	token       int64
+}
+
+type recordingPreempter struct{ calls []preemptCall }
+
+func (p *recordingPreempter) Preempt(situationID string, token int64) {
+	p.calls = append(p.calls, preemptCall{situationID, token})
 }
 
 func (s *inputStoreSpy) RetrySituationInput(_ context.Context, claim model.SituationClaim, class string, retryAt time.Time, terminal bool) error {
@@ -130,6 +144,42 @@ func TestInputWorkerSuccessNeedsNoCompletionCall(t *testing.T) {
 	}
 	if st.retryCalled {
 		t.Fatalf("RetrySituationInput must not be called on success: %+v", st)
+	}
+}
+
+func TestInputWorkerPreemptsOnlyAfterSupersedingApply(t *testing.T) {
+	st := &inputStoreSpy{
+		claims: []model.SituationClaim{inputClaim("i1", 1)},
+		applyResult: model.SituationInputApplied{
+			SituationID: "situation-1", InputVersion: 3, SupersededClaimToken: 17,
+		},
+	}
+	p := &recordingPreempter{}
+	w := NewInputWorker(st, WorkerConfig{Owner: "worker-a", Now: fixedClock}, nil)
+	w.SetPreempter(p)
+	if handled, err := w.RunOnce(context.Background()); err != nil || handled != 1 {
+		t.Fatalf("run = %d, %v, want 1, nil", handled, err)
+	}
+	if len(p.calls) != 1 || p.calls[0] != (preemptCall{"situation-1", 17}) {
+		t.Fatalf("preempt calls = %+v, want one exact situation/token pair", p.calls)
+	}
+
+	st.setClaims([]model.SituationClaim{inputClaim("i2", 1)})
+	st.applyResult.SupersededClaimToken = 0
+	if handled, err := w.RunOnce(context.Background()); err != nil || handled != 1 {
+		t.Fatalf("idle run = %d, %v, want 1, nil", handled, err)
+	}
+	if len(p.calls) != 1 {
+		t.Fatalf("idle apply preempted: %+v", p.calls)
+	}
+
+	st.setClaims([]model.SituationClaim{inputClaim("i3", 1)})
+	st.applyFn = func(model.SituationClaim) error { return model.ErrSituationProtected }
+	if handled, err := w.RunOnce(context.Background()); err != nil || handled != 0 {
+		t.Fatalf("protected run = %d, %v, want 0, nil", handled, err)
+	}
+	if len(p.calls) != 1 {
+		t.Fatalf("deferred input preempted: %+v", p.calls)
 	}
 }
 

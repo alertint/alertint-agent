@@ -13,6 +13,7 @@ import (
 
 	"github.com/alertint/alertint-agent/internal/correlator"
 	"github.com/alertint/alertint-agent/internal/situation"
+	"github.com/alertint/alertint-agent/internal/situation/model"
 	"github.com/alertint/alertint-agent/internal/store"
 )
 
@@ -814,8 +815,8 @@ func (f *countingInputStore) ClaimSituationInputs(context.Context, string, time.
 	return nil, nil
 }
 
-func (f *countingInputStore) ApplySituationInput(context.Context, store.SituationClaim) error {
-	return nil
+func (f *countingInputStore) ApplySituationInputResult(context.Context, store.SituationClaim) (model.SituationInputApplied, error) {
+	return model.SituationInputApplied{}, nil
 }
 
 func (f *countingInputStore) DeferSituationInput(context.Context, store.SituationClaim, time.Time) error {

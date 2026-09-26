@@ -17,7 +17,7 @@ import (
 // Durable situation input drain (Task 7)
 //
 // InputWorker claims durably queued Situation inputs (Store.ClaimSituationInputs)
-// and applies each one through Store.ApplySituationInput, one claim at a
+// and applies each one through Store.ApplySituationInputResult, one claim at a
 // time. Nothing runs this worker yet — a later task wires it into the
 // process runtime.
 //
@@ -35,9 +35,14 @@ import (
 // *store.Store itself, so one interface covers the whole dependency.
 type InputStore interface {
 	ClaimSituationInputs(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]model.SituationClaim, error)
-	ApplySituationInput(ctx context.Context, claim model.SituationClaim) error
+	ApplySituationInputResult(ctx context.Context, claim model.SituationClaim) (model.SituationInputApplied, error)
 	RetrySituationInput(ctx context.Context, claim model.SituationClaim, class string, retryAt time.Time, terminal bool) error
 	DeferSituationInput(ctx context.Context, claim model.SituationClaim, retryAt time.Time) error
+}
+
+// Preempter cancels a controller run whose claim a committed input cleared.
+type Preempter interface {
+	Preempt(situationID string, claimToken int64)
 }
 
 // WorkerConfig controls InputWorker's claim lease, schedule, batch size,
@@ -104,15 +109,22 @@ func (c WorkerConfig) withDefaults() WorkerConfig {
 // directly (e.g. by tests, or a one-shot CLI drain) without ever calling
 // Start.
 type InputWorker struct {
-	store  InputStore
-	cfg    WorkerConfig
-	logger *slog.Logger
+	store     InputStore
+	cfg       WorkerConfig
+	logger    *slog.Logger
+	preempter Preempter
 
 	wakeCh chan struct{}
 	stopCh chan struct{}
 	doneCh chan struct{}
 
 	startOnce sync.Once
+}
+
+// SetPreempter wires the controller worker before the input worker starts.
+// Nil leaves preemption disabled.
+func (w *InputWorker) SetPreempter(p Preempter) {
+	w.preempter = p
 }
 
 // NewInputWorker creates an InputWorker. Passing nil for logger falls back
@@ -161,7 +173,7 @@ func inputRetryBackoff(attempt int) time.Duration {
 	return d
 }
 
-// inputErrorClass maps an ApplySituationInput failure to the stable
+// inputErrorClass maps an ApplySituationInputResult failure to the stable
 // lowercase identifier RetrySituationInput persists, and whether it is
 // terminal. model.ErrNotFound (the referenced Incident, or a delivery it
 // claims to own, genuinely does not exist) is a permanent local dead
@@ -190,7 +202,7 @@ const (
 // RunOnce claims at most cfg.Batch due situation inputs and applies them
 // sequentially, returning how many it handled (committed, terminally
 // failed, or scheduled for retry). A protected input is deferred and not
-// counted as handled. A claim whose ApplySituationInput call
+// counted as handled. A claim whose ApplySituationInputResult call
 // fails with context cancellation or model.ErrSituationLeaseLost is neither
 // counted nor written back — RunOnce stops the round immediately and
 // returns that error, since continuing to claim or apply more work under a
@@ -230,8 +242,11 @@ func (w *InputWorker) runOnce(ctx context.Context) (handled, deferred int, err e
 // or applying further work, and must not attempt to rewrite this claim (the
 // lease already moved on, or the caller is shutting down).
 func (w *InputWorker) applyOne(ctx context.Context, claim model.SituationClaim) (applyOutcome, error) {
-	applyErr := w.store.ApplySituationInput(ctx, claim)
+	result, applyErr := w.store.ApplySituationInputResult(ctx, claim)
 	if applyErr == nil {
+		if w.preempter != nil && result.SupersededClaimToken > 0 {
+			w.preempter.Preempt(result.SituationID, result.SupersededClaimToken)
+		}
 		return applyHandled, nil
 	}
 	if errors.Is(applyErr, model.ErrSituationProtected) {

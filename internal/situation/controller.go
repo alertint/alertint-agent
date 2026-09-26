@@ -2094,14 +2094,25 @@ func (c *Controller) auditHistoryCommit(ctx context.Context, claim Claim, histor
 // ownership diagram (plan.md Task 8) for the exact order this mirrors.
 func (c *Controller) Reconcile(ctx context.Context, claim Claim) error {
 	startedAt := time.Now()
+	protectedFrom := "none"
+	if claim.Situation.LeaseProtected {
+		protectedFrom = "claim"
+	}
 	ctx, span := tracer().Start(ctx, SpanControllerReconcile, trace.WithAttributes(
 		AttrSituationID.String(claim.Situation.ID),
 		AttrInputVersion.Int(claim.Situation.InputVersion),
 		AttrSupersedeStreak.Int(claim.Situation.SupersedeStreak),
 		AttrLeaseProtected.Bool(claim.Situation.LeaseProtected),
+		AttrProtectedFrom.String(protectedFrom),
 	))
 	defer span.End()
-	err := c.reconcile(ctx, claim)
+	dispatchRecorded := false
+	err := c.reconcile(ctx, claim, &dispatchRecorded)
+	if dispatchRecorded && protectedFrom == "none" {
+		protectedFrom = "dispatch"
+	}
+	protected := claim.Situation.LeaseProtected || dispatchRecorded
+	span.SetAttributes(AttrLeaseProtected.Bool(protected), AttrProtectedFrom.String(protectedFrom))
 	var commitFailed *commitFailedError
 	class := ReconcileResultError
 	switch {
@@ -2125,7 +2136,8 @@ func (c *Controller) Reconcile(ctx context.Context, claim Claim) error {
 	// reconcile against each other and against the store.
 	attrs := append([]any{
 		"situation_id", claim.Situation.ID, "input_version", claim.Situation.InputVersion,
-		"supersede_streak", claim.Situation.SupersedeStreak, "protected", claim.Situation.LeaseProtected,
+		"supersede_streak", claim.Situation.SupersedeStreak, "protected", protected,
+		"protected_from", protectedFrom,
 		"result_class", class, "duration_ms", durationMS,
 	}, spanLogAttrs(span)...)
 	if err != nil && class != ReconcileResultSuperseded {
@@ -2142,7 +2154,7 @@ func superseded(ctx context.Context, err error) bool {
 		errors.Is(context.Cause(ctx), model.ErrSituationLeaseLost)
 }
 
-func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
+func (c *Controller) reconcile(ctx context.Context, claim Claim, dispatchRecorded *bool) error {
 	ctx, cancel := context.WithTimeout(ctx, c.cfg.AttemptWall)
 	defer cancel()
 	now := c.clock()
@@ -2344,7 +2356,7 @@ func (c *Controller) reconcile(ctx context.Context, claim Claim) error {
 	}
 	freshEpoch := workAttempt == 1
 
-	disp, err := c.dispatchWorkBearing(ctx, claim, snap, retryEpoch, workAttempt, now)
+	disp, err := c.dispatchWorkBearing(ctx, claim, snap, retryEpoch, workAttempt, now, dispatchRecorded)
 	if err != nil {
 		// The loop's own durable bookkeeping failed (see dispatchWorkBearing):
 		// nothing further may be derived, audited, or committed this cycle.
@@ -2566,7 +2578,7 @@ type dispatchResult struct {
 // corresponding durable write, never precedes it). The call row stays
 // without an outcome, which crash recovery will surface truthfully as
 // interrupted rather than as an outcome audit claims but SQLite lacks.
-func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap Snapshot, retryEpoch, workAttempt int, now time.Time) (dispatchResult, error) {
+func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap Snapshot, retryEpoch, workAttempt int, now time.Time, dispatchRecorded *bool) (dispatchResult, error) {
 	var res dispatchResult
 	prompt, err := BuildAssessmentPrompt(snap)
 	if err != nil {
@@ -2584,6 +2596,7 @@ func (c *Controller) dispatchWorkBearing(ctx context.Context, claim Claim, snap 
 			res.lastCallID = callID
 			return res, fmt.Errorf("situation: record assessment call: %w", err)
 		}
+		*dispatchRecorded = true
 		c.auditAppend(ctx, "situation.assessment_call_dispatched", map[string]any{
 			"situation_id": claim.Situation.ID, "call_id": callID, "call_number": callNumber,
 			"input_version": snap.InputVersion, "retry_epoch": retryEpoch, "work_attempt": workAttempt,
