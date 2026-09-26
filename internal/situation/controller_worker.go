@@ -230,7 +230,7 @@ func (c *semaphoreAssessmentClient) completeAfterAcquire(ctx context.Context, sy
 	// observing the worker's parent separately so a later shutdown can still
 	// abort a provider call that was allowed to settle after lease loss.
 	if shutdownCtx, ok := ctx.Value(assessmentShutdownContextKey{}).(context.Context); ok {
-		stopShutdown := context.AfterFunc(shutdownCtx, cancel)
+		stopShutdown := context.AfterFunc(shutdownCtx, cancel) //nolint:contextcheck // independent cancellation is required after the reconcile context's lease-loss cause is fixed
 		defer stopShutdown()
 	}
 	return c.inner.CompleteOnce(providerCtx, systemPrompt, prompt, requiredKeys)
