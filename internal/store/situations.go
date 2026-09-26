@@ -336,43 +336,51 @@ func readSituationInputTx(ctx context.Context, tx *sql.Tx, id string) (situation
 // journal_state='pending' for an artifact kind or 'not_applicable' for
 // every other kind (R1).
 func (s *Store) ApplySituationInput(ctx context.Context, claim SituationClaim) error {
+	_, err := s.ApplySituationInputResult(ctx, claim)
+	return err
+}
+
+// ApplySituationInputResult applies an input and reports the controller claim
+// it superseded, if any. The result is returned only after the transaction
+// commits, so callers can safely preempt that exact in-flight run.
+func (s *Store) ApplySituationInputResult(ctx context.Context, claim SituationClaim) (situationmodel.SituationInputApplied, error) {
 	if strings.TrimSpace(claim.ID) == "" || strings.TrimSpace(claim.LeaseOwner) == "" || claim.ClaimToken <= 0 {
-		return errors.New("store: apply situation input requires a complete claim")
+		return situationmodel.SituationInputApplied{}, errors.New("store: apply situation input requires a complete claim")
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("store: begin apply situation input: %w", err)
+		return situationmodel.SituationInputApplied{}, fmt.Errorf("store: begin apply situation input: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
 	row, err := readSituationInputTx(ctx, tx, claim.ID)
 	if err != nil {
-		return err
+		return situationmodel.SituationInputApplied{}, err
 	}
 	if row.status == "applied" {
 		// Idempotent replay: this exact input already attached to its
 		// Situation and there is nothing left to do.
-		return nil
+		return situationmodel.SituationInputApplied{}, nil
 	}
 	if row.status != "claimed" || row.leaseOwner == nil || *row.leaseOwner != claim.LeaseOwner || row.claimToken != claim.ClaimToken {
-		return ErrSituationLeaseLost
+		return situationmodel.SituationInputApplied{}, ErrSituationLeaseLost
 	}
 
 	dueReason, err := dueReasonForInputKind(row.kind)
 	if err != nil {
-		return err
+		return situationmodel.SituationInputApplied{}, err
 	}
 
 	var incidentGroupKey string
 	if err := tx.QueryRowContext(ctx, `SELECT group_key FROM incidents WHERE id = ?`, row.incidentID).Scan(&incidentGroupKey); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return ErrNotFound
+			return situationmodel.SituationInputApplied{}, ErrNotFound
 		}
-		return fmt.Errorf("store: read situation input incident: %w", err)
+		return situationmodel.SituationInputApplied{}, fmt.Errorf("store: read situation input incident: %w", err)
 	}
 	if incidentGroupKey != row.groupKey {
-		return fmt.Errorf("store: situation input %s group key mismatch: incident has %q, input has %q", row.id, incidentGroupKey, row.groupKey)
+		return situationmodel.SituationInputApplied{}, fmt.Errorf("store: situation input %s group key mismatch: incident has %q, input has %q", row.id, incidentGroupKey, row.groupKey)
 	}
 
 	if row.deliveryID != nil {
@@ -381,16 +389,16 @@ func (s *Store) ApplySituationInput(ctx context.Context, claim SituationClaim) e
 			SELECT 1 FROM incident_alert_deliveries WHERE incident_id = ? AND delivery_id = ?`,
 			row.incidentID, *row.deliveryID).Scan(&exists)
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("store: situation input %s: delivery %s is not owned by incident %s", row.id, *row.deliveryID, row.incidentID)
+			return situationmodel.SituationInputApplied{}, fmt.Errorf("store: situation input %s: delivery %s is not owned by incident %s", row.id, *row.deliveryID, row.incidentID)
 		}
 		if err != nil {
-			return fmt.Errorf("store: verify situation input delivery ownership: %w", err)
+			return situationmodel.SituationInputApplied{}, fmt.Errorf("store: verify situation input delivery ownership: %w", err)
 		}
 	}
 
 	startAt, basis, receivedAt, err := sourceTimesForInputTx(ctx, tx, row.deliveryID, row.occurredAt)
 	if err != nil {
-		return err
+		return situationmodel.SituationInputApplied{}, err
 	}
 
 	now := time.Now().UTC()
@@ -408,16 +416,16 @@ func (s *Store) ApplySituationInput(ctx context.Context, claim SituationClaim) e
 	// terminal-only episodes").
 	semanticAttachment, err := mapSituationInputDeliverySemanticSignatureTx(ctx, tx, row.deliveryID, now)
 	if err != nil {
-		return err
+		return situationmodel.SituationInputApplied{}, err
 	}
 	outcome, err := resolveAndApplySituationTx(ctx, tx, row, startAt, basis, receivedAt, dueReason, now)
 	if err != nil {
-		return err
+		return situationmodel.SituationInputApplied{}, err
 	}
 	// The owner is transactionally known now: admit the missing-profile job
 	// only when that owner is nonterminal.
 	if err := s.admitSemanticProfileInferenceForOwnerTx(ctx, tx, semanticAttachment, outcome, now); err != nil {
-		return err
+		return situationmodel.SituationInputApplied{}, err
 	}
 
 	if outcome.ownerTerminal {
@@ -427,25 +435,34 @@ func (s *Store) ApplySituationInput(ctx context.Context, claim SituationClaim) e
 		// situationOwnerForIncidentTx already found this exact Incident
 		// attached to this exact Situation.
 		if err := markSituationInputAppliedTx(ctx, tx, row.id, claim.LeaseOwner, claim.ClaimToken, outcome.situationID, outcome.inputVersion, "owner_terminal", now); err != nil {
-			return err
+			return situationmodel.SituationInputApplied{}, err
 		}
-		return tx.Commit()
+		if err := tx.Commit(); err != nil {
+			return situationmodel.SituationInputApplied{}, err
+		}
+		return situationmodel.SituationInputApplied{SituationID: outcome.situationID, InputVersion: outcome.inputVersion}, nil
 	}
 
 	if err := attachSituationMembershipTx(ctx, tx, outcome.situationID, row.incidentID, now); err != nil {
-		return err
+		return situationmodel.SituationInputApplied{}, err
 	}
 	if err := persistObservedSituationJudgmentInvalidationTx(ctx, tx, outcome.situationID, now); err != nil {
-		return fmt.Errorf("store: invalidate situation judgment from observed input: %w", err)
+		return situationmodel.SituationInputApplied{}, fmt.Errorf("store: invalidate situation judgment from observed input: %w", err)
 	}
 	journalState := "not_applicable"
 	if isOperatorArtifactKind(row.kind) {
 		journalState = "pending"
 	}
 	if err := markSituationInputAppliedTx(ctx, tx, row.id, claim.LeaseOwner, claim.ClaimToken, outcome.situationID, outcome.inputVersion, journalState, now); err != nil {
-		return err
+		return situationmodel.SituationInputApplied{}, err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return situationmodel.SituationInputApplied{}, err
+	}
+	return situationmodel.SituationInputApplied{
+		SituationID: outcome.situationID, InputVersion: outcome.inputVersion,
+		SupersededClaimToken: outcome.supersededClaimToken,
+	}, nil
 }
 
 // sourceTimesForInputTx resolves the (effectiveStart, basis, receivedAt)
@@ -497,9 +514,10 @@ func sourceTimesForInputTx(ctx context.Context, tx *sql.Tx, deliveryID *string, 
 // owner-terminal outcome — the terminal owner's own unchanged current
 // version), and whether R2's owner-terminal short-circuit fired.
 type situationApplyOutcome struct {
-	situationID   string
-	inputVersion  int
-	ownerTerminal bool // R2: kind is an artifact kind and the resolved owner is already terminal
+	situationID          string
+	inputVersion         int
+	supersededClaimToken int64
+	ownerTerminal        bool // R2: kind is an artifact kind and the resolved owner is already terminal
 }
 
 // resolveAndApplySituationTx implements the owner-selection precedence: an
@@ -544,11 +562,11 @@ func resolveAndApplySituationTx(ctx context.Context, tx *sql.Tx, row situationIn
 	}
 
 	if situationID != "" {
-		version, err := joinSituationTx(ctx, tx, situationID, startAt, basis, receivedAt, dueReason, row.occurredAt, now)
+		version, token, err := joinSituationTx(ctx, tx, situationID, startAt, basis, receivedAt, dueReason, row.occurredAt, now)
 		if err != nil {
 			return situationApplyOutcome{}, err
 		}
-		return situationApplyOutcome{situationID: situationID, inputVersion: version}, nil
+		return situationApplyOutcome{situationID: situationID, inputVersion: version, supersededClaimToken: token}, nil
 	}
 
 	newID, err := createSituationTx(ctx, tx, row.groupKey, startAt, basis, receivedAt, dueReason, row.occurredAt, now)
@@ -672,19 +690,21 @@ func earlierTime(a, b time.Time) time.Time {
 // holds a lease_owner/claim_token pair that can no longer match once
 // lease_owner goes NULL here, fencing it out of committing a decision based
 // on stale input_version data. Returns the resulting (post-increment)
-// input_version.
-func joinSituationTx(ctx context.Context, tx *sql.Tx, situationID string, startAt time.Time, basis situationmodel.SourceTimeBasis, receivedAt time.Time, dueReason situationmodel.DueReason, occurredAt, now time.Time) (int, error) {
+// input_version and the cleared live claim's token, if any.
+func joinSituationTx(ctx context.Context, tx *sql.Tx, situationID string, startAt time.Time, basis situationmodel.SourceTimeBasis, receivedAt time.Time, dueReason situationmodel.DueReason, occurredAt, now time.Time) (int, int64, error) {
 	current, err := getSituationTx(ctx, tx, situationID)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	live := current.LeaseOwner != nil && current.LeaseExpiresAt != nil && current.LeaseExpiresAt.After(now)
 	if live && current.LeaseProtected {
-		return 0, ErrSituationProtected
+		return 0, 0, ErrSituationProtected
 	}
 	streak := current.SupersedeStreak
+	var supersededToken int64
 	if live {
 		streak++
+		supersededToken = current.ClaimToken
 	}
 
 	newStart := earlierTime(current.EffectiveStartedAt, startAt)
@@ -695,7 +715,7 @@ func joinSituationTx(ctx context.Context, tx *sql.Tx, situationID string, startA
 
 	dueReasonsJSON, err := json.Marshal(newDueReasons)
 	if err != nil {
-		return 0, fmt.Errorf("store: marshal situation due reasons: %w", err)
+		return 0, 0, fmt.Errorf("store: marshal situation due reasons: %w", err)
 	}
 
 	res, err := tx.ExecContext(ctx, `
@@ -710,16 +730,16 @@ func joinSituationTx(ctx context.Context, tx *sql.Tx, situationID string, startA
 		canonicalTime(newStart), string(newBasis), canonicalTime(newFirstReceived), canonicalTime(newNextAssessment), string(dueReasonsJSON),
 		streak, canonicalTime(now), situationID, current.InputVersion)
 	if err != nil {
-		return 0, fmt.Errorf("store: update situation: %w", err)
+		return 0, 0, fmt.Errorf("store: update situation: %w", err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return 0, fmt.Errorf("store: count updated situation: %w", err)
+		return 0, 0, fmt.Errorf("store: count updated situation: %w", err)
 	}
 	if n != 1 {
-		return 0, ErrSituationVersionConflict
+		return 0, 0, ErrSituationVersionConflict
 	}
-	return current.InputVersion + 1, nil
+	return current.InputVersion + 1, supersededToken, nil
 }
 
 // createSituationTx inserts a brand-new active "observe" Situation at

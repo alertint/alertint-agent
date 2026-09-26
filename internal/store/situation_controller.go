@@ -1024,6 +1024,22 @@ func (s *Store) RecordAssessmentCall(ctx context.Context, claim situation.Claim,
 	if err := verifyClaimTx(ctx, tx, claim); err != nil {
 		return err
 	}
+	// Plan 04: only open Situations hold controller claims. Protect this live
+	// lease in the dispatch transaction so outbox inputs wait until commit or
+	// release, and no paid call is discarded because of a new input.
+	res, err := tx.ExecContext(ctx, `UPDATE situations SET lease_protected = 1
+		WHERE id = ? AND lease_owner = ? AND claim_token = ?`,
+		claim.Situation.ID, claim.ClaimOwner, claim.ClaimToken)
+	if err != nil {
+		return fmt.Errorf("store: protect assessment call lease: %w", err)
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: count protected assessment call lease: %w", err)
+	}
+	if changed == 0 {
+		return situationmodel.ErrSituationLeaseLost
+	}
 	if err := insertAssessmentCallTx(ctx, tx, call); err != nil {
 		return err
 	}

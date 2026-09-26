@@ -188,7 +188,7 @@ func (c *semaphoreAssessmentClient) CompleteOnce(ctx context.Context, systemProm
 			return llm.OneShotCompletion{RequestStarted: llm.RequestStartStatusFalse}, err
 		}
 		defer release()
-		return c.inner.CompleteOnce(ctx, systemPrompt, prompt, requiredKeys)
+		return c.completeAfterAcquire(ctx, systemPrompt, prompt, requiredKeys)
 	}
 
 	select {
@@ -197,7 +197,43 @@ func (c *semaphoreAssessmentClient) CompleteOnce(ctx context.Context, systemProm
 		return llm.OneShotCompletion{RequestStarted: llm.RequestStartStatusFalse}, ctx.Err()
 	}
 	defer func() { <-c.sem }()
-	return c.inner.CompleteOnce(ctx, systemPrompt, prompt, requiredKeys)
+	return c.completeAfterAcquire(ctx, systemPrompt, prompt, requiredKeys)
+}
+
+type assessmentShutdownContextKey struct{}
+
+// completeAfterAcquire keeps a started provider call alive when a direct
+// writer takes the lease mid-call. Under Plan 04 outbox inputs are held from
+// dispatch, so only direct writers can cause that lease loss. Waiting for
+// the response settles real token usage before the reconcile releases its
+// inference slot; shutdown and the attempt wall still cancel the call.
+func (c *semaphoreAssessmentClient) completeAfterAcquire(ctx context.Context, systemPrompt string, prompt llm.Prompt, requiredKeys []string) (llm.OneShotCompletion, error) {
+	if err := ctx.Err(); err != nil {
+		return llm.OneShotCompletion{RequestStarted: llm.RequestStartStatusFalse}, err
+	}
+	providerCtx := context.WithoutCancel(ctx)
+	var cancel context.CancelFunc
+	if deadline, ok := ctx.Deadline(); ok {
+		providerCtx, cancel = context.WithDeadline(providerCtx, deadline)
+	} else {
+		providerCtx, cancel = context.WithCancel(providerCtx)
+	}
+	defer cancel()
+	stop := context.AfterFunc(ctx, func() {
+		cause := context.Cause(ctx)
+		if !errors.Is(cause, model.ErrSituationLeaseLost) && !errors.Is(cause, context.DeadlineExceeded) {
+			cancel()
+		}
+	})
+	defer stop()
+	// A lease-loss cancellation is the reconcile context's final cause. Keep
+	// observing the worker's parent separately so a later shutdown can still
+	// abort a provider call that was allowed to settle after lease loss.
+	if shutdownCtx, ok := ctx.Value(assessmentShutdownContextKey{}).(context.Context); ok {
+		stopShutdown := context.AfterFunc(shutdownCtx, cancel) //nolint:contextcheck // independent cancellation is required after the reconcile context's lease-loss cause is fixed
+		defer stopShutdown()
+	}
+	return c.inner.CompleteOnce(providerCtx, systemPrompt, prompt, requiredKeys)
 }
 
 // ControllerWorker polls due Situations (ControllerWorkStore.
@@ -220,6 +256,25 @@ type ControllerWorker struct {
 	doneCh chan struct{}
 
 	startOnce sync.Once
+
+	mu       sync.Mutex
+	inflight map[string]inflightRun
+}
+
+type inflightRun struct {
+	token  int64
+	cancel context.CancelCauseFunc
+}
+
+// Preempt cancels the in-flight reconcile for situationID only when it still
+// uses claimToken. A stale or unknown token has no effect.
+func (w *ControllerWorker) Preempt(situationID string, claimToken int64) {
+	w.mu.Lock()
+	run, ok := w.inflight[situationID]
+	w.mu.Unlock()
+	if ok && run.token == claimToken {
+		run.cancel(model.ErrSituationLeaseLost)
+	}
 }
 
 // SetDependencyRecoveryWaker wires the pre-poll dependency-recovery wake
@@ -289,6 +344,7 @@ func NewControllerWorker(
 		wakeCh:       make(chan struct{}, 1),
 		stopCh:       make(chan struct{}),
 		doneCh:       make(chan struct{}),
+		inflight:     make(map[string]inflightRun),
 	}
 }
 
@@ -483,8 +539,11 @@ var errLeaseUnconfirmed = errors.New("situation: controller lease could not be r
 // matches zero rows in that case — same as a plain release already would —
 // so the backoff write is a no-op rather than clobbering the newer claimant.
 func (w *ControllerWorker) processOne(ctx context.Context, claim Claim) {
-	reconcileCtx, cancel := context.WithCancelCause(ctx)
+	reconcileCtx, cancel := context.WithCancelCause(context.WithValue(ctx, assessmentShutdownContextKey{}, ctx))
 	defer cancel(nil)
+	w.mu.Lock()
+	w.inflight[claim.Situation.ID] = inflightRun{token: claim.ClaimToken, cancel: cancel}
+	w.mu.Unlock()
 
 	hbDone := make(chan struct{})
 	go w.heartbeatLoop(reconcileCtx, cancel, claim, hbDone)
@@ -493,6 +552,11 @@ func (w *ControllerWorker) processOne(ctx context.Context, claim Claim) {
 
 	cancel(nil)
 	<-hbDone
+	w.mu.Lock()
+	if run, ok := w.inflight[claim.Situation.ID]; ok && run.token == claim.ClaimToken {
+		delete(w.inflight, claim.Situation.ID)
+	}
+	w.mu.Unlock()
 
 	if err == nil {
 		return
