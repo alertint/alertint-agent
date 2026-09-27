@@ -180,11 +180,6 @@ func settlementUsage(resp *http.Response, dispatchErr error) (int64, string, err
 	body, usageErr := io.ReadAll(io.LimitReader(resp.Body, 512*1024+1))
 	_ = resp.Body.Close()
 	resp.Body = io.NopCloser(bytes.NewReader(body))
-	if !declined && resp.StatusCode != http.StatusOK {
-		// A gateway may have generated and billed even when it reports an
-		// error with usage. Keep the reservation for ambiguous statuses.
-		return 0, fmt.Sprintf("http_%d", resp.StatusCode), ErrBudgetUsageUnknown
-	}
 	if len(body) > 512*1024 {
 		usageErr = fmt.Errorf("%w: response exceeds 512 KiB", ErrBudgetUsageUnknown)
 	}
@@ -195,6 +190,14 @@ func settlementUsage(resp *http.Response, dispatchErr error) (int64, string, err
 	if declined {
 		if usageErr != nil {
 			return 0, "", nil
+		}
+		return used, "", nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		// A non-declined error may still be billed. Settle reported usage;
+		// latch the status only when usage cannot be determined.
+		if usageErr != nil {
+			return 0, fmt.Sprintf("http_%d", resp.StatusCode), usageErr
 		}
 		return used, "", nil
 	}

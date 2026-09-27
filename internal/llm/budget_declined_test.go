@@ -163,17 +163,7 @@ func TestBudgetAmbiguousStatusPassesThroughAndLatches(t *testing.T) {
 			}
 			_ = resp.Body.Close()
 			state := readBudgetState(t, st)
-			if !state.Unknown || state.Tokens == 0 || len(state.Pending) != 0 || state.UnknownReason != fmt.Sprintf("http_%d", tc.status) {
-				t.Fatalf("state = %+v", state)
-			}
-			if tc.status == 502 {
-				if state.UnknownReason != "http_502" {
-					t.Fatalf("reason = %q", state.UnknownReason)
-				}
-				if _, err := time.Parse(time.RFC3339, state.UnknownAt); err != nil {
-					t.Fatalf("unknown_at = %q: %v", state.UnknownAt, err)
-				}
-			}
+			assertAmbiguousStatusState(t, tc.name, tc.status, state)
 			if err := st.Close(); err != nil {
 				t.Fatal(err)
 			}
@@ -186,6 +176,12 @@ func TestBudgetAmbiguousStatusPassesThroughAndLatches(t *testing.T) {
 			if resp != nil {
 				_ = resp.Body.Close()
 			}
+			if tc.name == "500_with_usage" {
+				if err != nil || resp == nil || resp.StatusCode != tc.status || calls != 2 {
+					t.Fatalf("restart = %v, %v; calls=%d, want provider response after restart", resp, err, calls)
+				}
+				return
+			}
 			var deferred *llm.BudgetDeferredError
 			if resp != nil || !errors.As(err, &deferred) || calls != 1 {
 				t.Fatalf("restart = %v, %v; calls=%d", resp, err, calls)
@@ -194,6 +190,24 @@ func TestBudgetAmbiguousStatusPassesThroughAndLatches(t *testing.T) {
 				t.Fatalf("deferred error = %q", deferred.Error())
 			}
 		})
+	}
+}
+
+func assertAmbiguousStatusState(t *testing.T, name string, status int, state observedBudgetState) {
+	t.Helper()
+	if name == "500_with_usage" {
+		if state.Tokens != 8 || state.Unknown || len(state.Pending) != 0 || state.UnknownReason != "" || state.UnknownAt != "" {
+			t.Fatalf("state = %+v; want 8 settled tokens and no latch", state)
+		}
+		return
+	}
+	if !state.Unknown || state.Tokens == 0 || len(state.Pending) != 0 || state.UnknownReason != fmt.Sprintf("http_%d", status) {
+		t.Fatalf("state = %+v; want status latch", state)
+	}
+	if status == 502 {
+		if _, err := time.Parse(time.RFC3339, state.UnknownAt); err != nil {
+			t.Fatalf("unknown_at = %q: %v", state.UnknownAt, err)
+		}
 	}
 }
 
