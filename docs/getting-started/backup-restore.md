@@ -59,8 +59,8 @@ Restore is safe by construction:
 
 ## Upgrade and rollback
 
-For a step-by-step v0.13.9 to v0.14.0-rc3 container walkthrough, see
-[Upgrade to v0.14.0-rc3](upgrade-0-14-rc3.md).
+For a step-by-step v0.13.9 to v0.14.0 container walkthrough, see
+[Upgrade to v0.14.0](upgrade-0-14.md).
 
 Create the backup with the version you are currently running, before starting
 the new binary:
