@@ -92,6 +92,13 @@ changelog:
       - Merge pull request
       - Merge branch
 
+# Stable notes compare against the previous stable release, so release
+# candidate and Helm chart tags are never the footer's previous tag.
+git:
+  ignore_tags:
+    - "*-rc*"
+    - "chart-*"
+
 release:
   github:
     owner: alertint

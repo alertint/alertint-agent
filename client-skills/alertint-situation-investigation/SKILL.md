@@ -10,7 +10,7 @@ changed, and what AlertINT will do next. Keep current state, historical
 decisions, and new live observations distinct.
 
 The canonical workflow and tool reference is the
-[AlertINT MCP client guide](https://github.com/alertint/alertint-agent/blob/v0.14.0-rc1/docs/integrations/mcp-clients.md#explain-a-situation-from-records).
+[AlertINT MCP client guide](https://github.com/alertint/alertint-agent/blob/v0.14.0/docs/integrations/mcp-clients.md#explain-a-situation-from-records).
 
 ## Resolve the reference
 

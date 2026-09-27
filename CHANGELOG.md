@@ -7,47 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- Declined provider responses (4xx, 503, 529) no longer latch a capped LLM
-  budget and now reach clients with their real status. Existing latches still
-  need the manual recovery in the configuration guide.
-- A reconcile superseded by a new input is now cancelled immediately, before
-  it spends an LLM call.
-- Once a Situation's LLM call has started, new inputs wait for it and are
-  applied right after it commits, so no paid call is discarded.
-- A run whose lease is taken mid-call lets the call finish, so the token
-  budget records real usage instead of latching unknown.
-- A Situation receiving a steady stream of new alerts now still updates:
-  after two runs are superseded by new inputs, the next run finishes before
-  further inputs are applied.
-- A Situation waiting for its Triage to start no longer re-assesses every ~2
-  seconds; it waits for the Triage outcome or its normal cadence.
-- A Situation reconcile superseded by a newer input is now recorded as
-  `superseded` (INFO) instead of a failed commit. The controller heartbeat
-  retries transient store errors while its lease is still valid (#117).
-
-## [0.14.0-rc3] - 2026-09-23
-
-### Fixed
-
-- Make the published container image's temporary directory writable by its
-  non-root runtime user. The release workflow now opens a fresh SQLite database
-  in both published Linux images before reporting success.
-
-## [0.14.0-rc2] - 2026-09-23
-
-### Known issue
-
-- The intended image fix did not survive publication: the published RC2 image
-  still needs a writable `/tmp` mount to upgrade a v0.13.x database. Helm
-  chart 0.2.3 supplies that mount by default; default Docker upgrades should
-  use a later candidate.
-
-## [0.14.0-rc1] - 2026-09-22
-
 ### Added
 
+- A durable Situation now owns each failure group's history. Every
+  authoritative material change commits one immutable transition and one
+  version of a current episode summary, and Slack shows one evolving Situation
+  root plus an ordered journal thread instead of a per-Incident card. See the
+  [Situation workflow](https://alertint.com/docs/concepts/situation-workflow).
 - Alertmanager deliveries can carry configured installation and exact
   Prometheus producer/rule identity. Bounded current rule evidence enables the
   existing reusable expected-schedule flow for proven Alertmanager conditions;
@@ -78,6 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Upgrading migrates the SQLite database in place when the new binary starts,
+  and v0.13.x cannot use the migrated database. Back up with v0.13.9 first; see
+  [Upgrade from v0.13.9 to v0.14.0](https://github.com/alertint/alertint-agent/blob/v0.14.0/docs/getting-started/upgrade-0-14.md).
 - Release candidates use a separate, commit-pinned publication command and
   publish only versioned archives and container tags. They do not move stable
   `latest` aliases or change Helm chart defaults.
@@ -90,6 +59,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Declined provider responses (4xx, 503, 529) no longer latch a capped LLM
+  budget and now reach clients with their real status. Existing latches still
+  need the manual recovery in the configuration guide.
+- A reconcile superseded by a new input is now cancelled immediately, before
+  it spends an LLM call.
+- Once a Situation's LLM call has started, new inputs wait for it and are
+  applied right after it commits, so no paid call is discarded.
+- A run whose lease is taken mid-call lets the call finish, so the token
+  budget records real usage instead of latching unknown.
+- A Situation receiving a steady stream of new alerts now still updates:
+  after two runs are superseded by new inputs, the next run finishes before
+  further inputs are applied.
+- A Situation waiting for its Triage to start no longer re-assesses every ~2
+  seconds; it waits for the Triage outcome or its normal cadence.
+- A Situation reconcile superseded by a newer input is now recorded as
+  `superseded` (INFO) instead of a failed commit. The controller heartbeat
+  retries transient store errors while its lease is still valid (#117).
+- Make the published container image's temporary directory writable by its
+  non-root runtime user. The release workflow now opens a fresh SQLite database
+  in both published Linux images before reporting success.
+- Stable release notes link the full changelog from the previous stable
+  release instead of the latest release-candidate or Helm chart tag.
 - Update OpenTelemetry and gRPC to patched security releases while keeping
   pathless OTLP/HTTP collector URLs on `/v1/traces`; explicit trace paths stay
   unchanged.
@@ -942,10 +933,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single static binary** — pure-Go SQLite (no CGO), no external runtime dependencies.
   Multi-platform builds: `linux/amd64`, `linux/arm64`, `darwin/arm64`.
 
-[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.14.0-rc3...HEAD
-[0.14.0-rc3]: https://github.com/alertint/alertint-agent/compare/v0.14.0-rc2...v0.14.0-rc3
-[0.14.0-rc2]: https://github.com/alertint/alertint-agent/compare/v0.14.0-rc1...v0.14.0-rc2
-[0.14.0-rc1]: https://github.com/alertint/alertint-agent/compare/v0.13.9...v0.14.0-rc1
+[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.13.9...HEAD
 [0.13.9]: https://github.com/alertint/alertint-agent/compare/v0.13.8...v0.13.9
 [0.13.8]: https://github.com/alertint/alertint-agent/compare/v0.13.7...v0.13.8
 [0.13.7]: https://github.com/alertint/alertint-agent/compare/v0.13.6...v0.13.7

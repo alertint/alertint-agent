@@ -36,5 +36,5 @@ annotations:
     - name: Releasing
       url: https://github.com/alertint/alertint-agent/blob/main/RELEASING.md
   artifacthub.io/changes: |
-    - kind: fixed
-      description: Mount writable temporary storage for SQLite with read-only root filesystems
+    - kind: changed
+      description: Update the default alertint-agent image to v0.14.0

@@ -1,25 +1,25 @@
 ---
-title: "Upgrade from v0.13.9 to v0.14.0-rc3"
-description: "Back up v0.13.9, upgrade the same SQLite database to the 0.14 release candidate, verify it, and know how to roll back."
+title: "Upgrade from v0.13.9 to v0.14.0"
+description: "Back up v0.13.9, upgrade the same SQLite database to v0.14.0, verify it, and know how to roll back."
 section: "Getting started"
 order: 5
-slug: "upgrade-0-14-rc3"
+slug: "upgrade-0-14"
 ---
 
-# Upgrade from v0.13.9 to v0.14.0-rc3
+# Upgrade from v0.13.9 to v0.14.0
 
-This is a release-candidate test, not a stable upgrade. These steps are for a
-released v0.13.9 installation; if you run another v0.13.x version, check its
-upgrade notes first. Keep one AlertINT process on the database at a time. The
-new binary migrates the existing database when it starts; the old binary
-cannot use the migrated database. Make a [live-safe backup](backup-restore.md)
-with v0.13.9 first and keep a copy outside the container or pod. Plan a short
-ingress interruption while the single agent container or pod restarts.
+These steps are for a released v0.13.9 installation; if you run another
+v0.13.x version, check its upgrade notes first. Keep one AlertINT process on
+the database at a time. The new binary migrates the existing database when it
+starts; the old binary cannot use the migrated database. Make a
+[live-safe backup](backup-restore.md) with v0.13.9 first and keep a copy
+outside the container or pod. Plan a short ingress interruption while the
+single agent container or pod restarts.
 
-RC3 has a writable temporary directory for its non-root runtime user. Chart
-0.2.3 also mounts temporary storage with a read-only root filesystem. No
-special `/tmp` mount is needed for the RC3 Docker image. The SQLite database
-itself stays on the persistent `/data` volume.
+The v0.14.0 image has a writable temporary directory for its non-root runtime
+user, and chart 0.2.4 also mounts temporary storage with a read-only root
+filesystem. No special `/tmp` mount is needed. The SQLite database itself stays
+on the persistent `/data` volume.
 
 ## Docker Compose walkthrough
 
@@ -41,23 +41,24 @@ volume, and webhook routing. Substitute your database path if it differs.
    out of the Docker volume so it survives a container or volume mistake.
    Keep any existing scheduled backups running after the upgrade.
 
-2. Create `docker/rc3.local.yaml` with an explicit image tag:
+2. Create `docker/upgrade.local.yaml` with an explicit image tag, so the
+   upgrade and any rollback name the version they run:
 
    ```yaml
    services:
      agent:
-       image: ghcr.io/alertint/alertint-agent:v0.14.0-rc3
+       image: ghcr.io/alertint/alertint-agent:v0.14.0
    ```
 
 3. Replace only the agent container. Compose keeps its existing data volume:
 
    ```bash
    docker compose --env-file .env -f docker/docker-compose.yaml \
-     -f docker/rc3.local.yaml up -d --no-deps agent
+     -f docker/upgrade.local.yaml up -d --no-deps agent
    ```
 
 4. Check the result before normal traffic resumes: `version` must print
-   `0.14.0-rc3`; the agent must be healthy; audit verification must pass.
+   `0.14.0`; the agent must be healthy; audit verification must pass.
    Confirm existing Incidents and findings are still readable through MCP.
    Send one identifiable test alert through your configured source and check
    its Situation in MCP and, if enabled, its Slack root and thread. Clear the
@@ -66,35 +67,29 @@ volume, and webhook routing. Substitute your database path if it differs.
 
    ```bash
    docker compose --env-file .env -f docker/docker-compose.yaml \
-     -f docker/rc3.local.yaml ps agent
+     -f docker/upgrade.local.yaml ps agent
    docker compose --env-file .env -f docker/docker-compose.yaml \
-     -f docker/rc3.local.yaml exec -T agent /alertint version
+     -f docker/upgrade.local.yaml exec -T agent /alertint version
    docker compose --env-file .env -f docker/docker-compose.yaml \
-     -f docker/rc3.local.yaml exec -T agent \
+     -f docker/upgrade.local.yaml exec -T agent \
      /alertint verify-audit --db /data/alertint-agent.db
    ```
 
-## Kubernetes with chart 0.2.3
+## Kubernetes with chart 0.2.4
 
-The chart still defaults to v0.13.9. Back up the running database and export
-the backup outside the cluster using your PVC backup method; the
+Chart 0.2.4 defaults to v0.14.0. Back up the running database and export the
+backup outside the cluster using your PVC backup method; the
 [Kubernetes backup guide](backup-restore.md#staged-restore-kubernetes) explains
 the chart's distroless-container constraint. Preserve your current Helm values
-and Secret. Pin the RC image explicitly in your reviewed values file before
-`helm upgrade`:
+and Secret. If your values file pins `image.tag`, set it to `v0.14.0` or remove
+it before `helm upgrade`.
 
-```yaml
-image:
-  tag: v0.14.0-rc3
-```
-
-Use chart version `0.2.3`; it provides `/tmp` automatically and uses a
-single-replica Recreate deployment. Pass your reviewed values file (including
-the image tag) to Helm and wait for the rollout:
+Chart 0.2.4 provides `/tmp` automatically and uses a single-replica Recreate
+deployment. Pass your reviewed values file to Helm and wait for the rollout:
 
 ```bash
 helm upgrade my-alertint oci://ghcr.io/alertint/charts/alertint-agent \
-  --version 0.2.3 -f values.yaml
+  --version 0.2.4 -f values.yaml
 kubectl rollout status deployment/my-alertint-alertint-agent
 ```
 
@@ -105,25 +100,25 @@ walkthrough. Do not deploy a second replica against the same database.
 
 ## If you need to roll back
 
-Stop RC3 and preserve its migrated database for diagnosis. Restore the
+Stop v0.14.0 and preserve its migrated database for diagnosis. Restore the
 pre-upgrade backup with the **v0.13.9 binary**, then start v0.13.9. For the
 Compose example above, keep the agent stopped while restoring from the
 backup still on the data volume:
 
 ```bash
 docker compose --env-file .env -f docker/docker-compose.yaml \
-  -f docker/rc3.local.yaml stop agent
+  -f docker/upgrade.local.yaml stop agent
 ```
 
-Change the `image` value under `services.agent` in `docker/rc3.local.yaml` to
-`ghcr.io/alertint/alertint-agent:v0.13.9`, then run:
+Change the `image` value under `services.agent` in `docker/upgrade.local.yaml`
+to `ghcr.io/alertint/alertint-agent:v0.13.9`, then run:
 
 ```bash
 docker compose --env-file .env -f docker/docker-compose.yaml \
-  -f docker/rc3.local.yaml run --rm --no-deps --entrypoint /alertint agent \
+  -f docker/upgrade.local.yaml run --rm --no-deps --entrypoint /alertint agent \
   restore --db /data/alertint-agent.db /data/pre-upgrade-v0139.backup.db
 docker compose --env-file .env -f docker/docker-compose.yaml \
-  -f docker/rc3.local.yaml up -d --no-deps agent
+  -f docker/upgrade.local.yaml up -d --no-deps agent
 ```
 
 For Kubernetes, use the [staged-restore
