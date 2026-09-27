@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -130,6 +131,22 @@ func TestRCGoReleaserConfigKeepsStableBuildAndArchiveContract(t *testing.T) {
 	for _, key := range []string{"project_name", "before", "builds", "archives", "checksum", "changelog"} {
 		if !reflect.DeepEqual(rc[key], stable[key]) {
 			t.Errorf("RC config %s differs from stable config", key)
+		}
+	}
+}
+
+func TestStableGoReleaserFooterSkipsRCAndChartTags(t *testing.T) {
+	var stable struct {
+		Git struct {
+			IgnoreTags []string `yaml:"ignore_tags"`
+		} `yaml:"git"`
+	}
+	if err := yaml.Unmarshal(repoFile(t, ".goreleaser.yaml"), &stable); err != nil {
+		t.Fatalf("parse .goreleaser.yaml: %v", err)
+	}
+	for _, want := range []string{"*-rc*", "chart-*"} {
+		if !slices.Contains(stable.Git.IgnoreTags, want) {
+			t.Errorf("stable config git.ignore_tags = %q, want %q", stable.Git.IgnoreTags, want)
 		}
 	}
 }
