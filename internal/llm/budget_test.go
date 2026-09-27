@@ -160,7 +160,6 @@ func TestBudgetUnknownUsageRemainsBlockedAfterRestart(t *testing.T) {
 		{"oversized", `{"usage":{"input_tokens":1,"output_tokens":1}}` + strings.Repeat(" ", 512*1024), 200, nil},
 		{"overflow", `{"usage":{"input_tokens":9223372036854775807,"output_tokens":2}}`, 200, nil},
 		{"zero", `{"usage":{"input_tokens":0,"output_tokens":0}}`, 200, nil},
-		{"rate limit", `{}`, 429, nil},
 		{"timeout", "", 0, context.DeadlineExceeded},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

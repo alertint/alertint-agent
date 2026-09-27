@@ -4,17 +4,21 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/alertint/alertint-agent/internal/llm"
+	"github.com/alertint/alertint-agent/internal/llm/openaicompat"
 	"github.com/alertint/alertint-agent/internal/situation"
+	situationmodel "github.com/alertint/alertint-agent/internal/situation/model"
 )
 
 func TestControllerBudgetDeferralResumesWithoutSpendingAttempts(t *testing.T) {
@@ -183,6 +187,80 @@ func TestControllerBudgetUnknownUsageRequiresManualRecovery(t *testing.T) {
 	}
 	if client.calls != 2 || providerCalls != 1 {
 		t.Fatalf("manual block auto-retried: client=%d provider=%d", client.calls, providerCalls)
+	}
+}
+
+func TestControllerBudget429RetriesWithoutCorrectionOrPark(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	id := seedReconcileSituation(t, st, "budget-429", now.Add(-2*time.Hour))
+	proposal, err := acceptedProposalResponse(t)()
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(map[string]any{
+		"choices": []map[string]any{{"message": map[string]any{"content": string(proposal.Raw)}, "finish_reason": "stop"}},
+		"usage":   map[string]int{"prompt_tokens": 2, "completion_tokens": 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	providerCalls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		providerCalls++
+		if providerCalls == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+	client := openaicompat.New(openaicompat.Config{BaseURL: srv.URL, Budget: llm.NewBudget(st, llm.BudgetLimits{TotalTokens: 100000})}, nil, nil)
+	controller := situation.NewController(st, client, situation.ControllerConfig{}, func() time.Time { return now }, nil, nil)
+	if err := controller.Reconcile(ctx, claimSituation(t, st, id, "budget-429-first", now)); err != nil {
+		t.Fatal(err)
+	}
+	var calls int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM situation_assessment_calls WHERE situation_id = ?`, id).Scan(&calls); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || providerCalls != 1 {
+		t.Fatalf("first reconcile calls: ledger=%d provider=%d, want 1 each", calls, providerCalls)
+	}
+	sit := getSituationByID(t, st, id)
+	if sit.LastErrorClass == nil || *sit.LastErrorClass != "rate_limited" || sit.RetryAt == nil {
+		t.Fatalf("first reconcile status: class=%v retry=%v", sit.LastErrorClass, sit.RetryAt)
+	}
+	var raw []byte
+	if err := st.db.QueryRowContext(ctx, `SELECT value FROM connector_state WHERE name = 'llm.budget.v1'`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var budget struct {
+		Unknown bool `json:"unknown"`
+	}
+	if err := json.Unmarshal(raw, &budget); err != nil {
+		t.Fatal(err)
+	}
+	if budget.Unknown {
+		t.Fatalf("429 latched budget: %s", raw)
+	}
+	now = sit.RetryAt.Add(time.Second)
+	if err := controller.Reconcile(ctx, claimSituation(t, st, id, "budget-429-retry", now)); err != nil {
+		t.Fatal(err)
+	}
+	if providerCalls != 2 {
+		t.Fatalf("provider calls after retry = %d, want 2", providerCalls)
+	}
+	current := currentAssessmentID(t, st, id)
+	var derivation string
+	if err := st.db.QueryRowContext(ctx, `SELECT derivation FROM situation_assessment_attempts WHERE id = ?`, current).Scan(&derivation); err != nil {
+		t.Fatal(err)
+	}
+	if derivation != string(situationmodel.DerivationModelValidated) {
+		t.Fatalf("retry derivation = %q", derivation)
 	}
 }
 

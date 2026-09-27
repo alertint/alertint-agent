@@ -42,7 +42,9 @@ llm:
   # cached/reasoning tokens, so their detail fields are not counted twice.
   # Errors with unknown usage (including missing/invalid usage or >512 KiB
   # responses) retain the allowance and latch unknown: future token-budgeted
-  # dispatch fails closed. Crash/unsettled reservations remain fully charged,
+  # dispatch fails closed. Declined requests (4xx, 503, 529) settle to reported
+  # usage or zero without latching; llm.budget.v1 records the first unknown
+  # cause and time. Crash/unsettled reservations remain fully charged,
   # without automatic refund. Database failures prevent dispatch/refund.
   # Exhaustion returns an actionable inference error. For call exhaustion,
   # wait for the rolling window; for known token exhaustion, review and raise
