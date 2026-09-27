@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-28
+
 ### Added
 
 - A durable Situation now owns each failure group's history. Every
@@ -933,7 +935,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single static binary** — pure-Go SQLite (no CGO), no external runtime dependencies.
   Multi-platform builds: `linux/amd64`, `linux/arm64`, `darwin/arm64`.
 
-[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.13.9...HEAD
+[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/alertint/alertint-agent/compare/v0.13.9...v0.14.0
 [0.13.9]: https://github.com/alertint/alertint-agent/compare/v0.13.8...v0.13.9
 [0.13.8]: https://github.com/alertint/alertint-agent/compare/v0.13.7...v0.13.8
 [0.13.7]: https://github.com/alertint/alertint-agent/compare/v0.13.6...v0.13.7
