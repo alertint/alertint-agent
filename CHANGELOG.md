@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-09-29
+
 ### Fixed
 
 - Situation root cards and correlation replies bound long alert lists, show
@@ -941,7 +943,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Single static binary** — pure-Go SQLite (no CGO), no external runtime dependencies.
   Multi-platform builds: `linux/amd64`, `linux/arm64`, `darwin/arm64`.
 
-[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/alertint/alertint-agent/compare/v0.14.1...HEAD
+[0.14.1]: https://github.com/alertint/alertint-agent/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/alertint/alertint-agent/compare/v0.13.9...v0.14.0
 [0.13.9]: https://github.com/alertint/alertint-agent/compare/v0.13.8...v0.13.9
 [0.13.8]: https://github.com/alertint/alertint-agent/compare/v0.13.7...v0.13.8
