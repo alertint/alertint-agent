@@ -54,3 +54,26 @@ func TestRootCompactFallbackBoundsWholeMessage(t *testing.T) {
 	}
 	bcBothSurfaces(t, msg, "Slack message limit reached", "Monitoring alert changes", "get situation")
 }
+
+func TestCorrelationReplyBoundsManyAlertIdentities(t *testing.T) {
+	b := canonicalFixture(t)
+	b.Alerts = nil
+	for i := 0; i < 60; i++ {
+		b.Alerts = append(b.Alerts, model.BriefingAlert{
+			ID: fmt.Sprintf("alert-%02d", i), Name: fmt.Sprintf("Alert-%02d-%s", i, strings.Repeat("x", 70)), State: "firing",
+		})
+	}
+	b.Firing, b.Total = 60, 60
+	tr := bcJournal(t, bcObserveMonitorContract(bcNow(t)), b, nil)
+	msg, err := RenderSituationReply(SituationReplyInput{Transition: tr, ReplyKind: model.ReplyCorrelationStarted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.Text) > 4000 || len(msg.Blocks) > 50 {
+		t.Fatalf("oversized reply: text=%d bytes blocks=%d", len(msg.Text), len(msg.Blocks))
+	}
+	bcBothSurfaces(t, msg, "Alert-00", "55 more", "Slack message limit reached", "get situation")
+	if strings.Contains(msg.Text, "Alert-59") {
+		t.Fatal("reply must leave omitted identities to MCP")
+	}
+}

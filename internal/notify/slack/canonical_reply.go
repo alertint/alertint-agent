@@ -220,7 +220,15 @@ func canonicalBriefingJournal(t model.Transition, kind string, executionSupersed
 		if b.Flow.GroupKey != "" {
 			lines = append(lines, "*Current group:* `"+briefingComplete(b.Flow.GroupKey)+"`")
 		}
-		lines = append(lines, "*Collected alerts:*\n"+canonicalMembers(b))
+		members, omitted := canonicalRootMembers(b)
+		lines = append(lines, "*Collected alerts:*\n"+members)
+		if omitted {
+			s := model.EpisodeSummary{SituationID: t.SituationID}
+			if t.Projection.PublicHandle != nil {
+				s.PublicHandle = *t.Projection.PublicHandle
+			}
+			lines = append(lines, canonicalMCP(s))
+		}
 		if at := b.Flow.CorrelationClosesAt; at != nil {
 			lines = append(lines, "*Correlation window:* "+canonicalElapsed(b.Flow.CorrelationOpenedAt, *at))
 		}

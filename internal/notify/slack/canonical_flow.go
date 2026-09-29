@@ -207,8 +207,8 @@ func canonicalMembers(b *model.OperatorBriefing) string {
 	return strings.Join(lines, "\n")
 }
 
-// The root is edited in place, so every edit has to fit Slack's whole-message
-// limit. The journal keeps its own historical member selection unchanged.
+// Root cards and correlation replies both fit Slack's whole-message limit by
+// showing a short member sample and directing operators to MCP for the rest.
 func canonicalRootMembers(b *model.OperatorBriefing) (string, bool) {
 	const shown = 5
 	var lines []string
