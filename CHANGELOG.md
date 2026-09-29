@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Situation root cards bound the alert list and whole Slack payload, show
+- Situation root cards and correlation replies bound long alert lists, show
   where to retrieve omitted alerts in MCP, and automatically retry current
   roots previously rejected with `msg_too_long` once on upgrade.
 

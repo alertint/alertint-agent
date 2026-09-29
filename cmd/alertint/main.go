@@ -35,7 +35,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	slacklib "github.com/slack-go/slack"
 
 	"github.com/alertint/alertint-agent/internal/audit"
 	"github.com/alertint/alertint-agent/internal/backup"
@@ -1234,11 +1233,6 @@ func buildNotifier(cfg *config.Config, st *store.Store, auditor *audit.Auditor, 
 			// appended to nn: an Incident Slack card or thread reply is the
 			// Situation notification worker's job now, not this fan-out's.
 			slackNotifier := notifyslack.New(token, cfg.Notify.Slack.Channel, cfg.Notify.Slack.MinSeverity, cfg.Notify.Slack.RecurrenceMode, st, auditor)
-			if cfg.Notify.Slack.APIBaseURL != "" {
-				slackNotifier = notifyslack.NewWithClient(slacklib.New(token,
-					slacklib.OptionAPIURL(strings.TrimRight(cfg.Notify.Slack.APIBaseURL, "/")+"/")),
-					cfg.Notify.Slack.Channel, cfg.Notify.Slack.MinSeverity, cfg.Notify.Slack.RecurrenceMode, st, auditor)
-			}
 			slackWired = true
 			publisher = slackNotifier
 		}

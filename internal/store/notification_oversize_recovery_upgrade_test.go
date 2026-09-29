@@ -16,7 +16,7 @@ import (
 func TestUpgradeRetriesCurrentOversizedRootOnce(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "oversized-root.db")
-	st, err := Open(ctx, path)
+	st, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +40,7 @@ func TestUpgradeRetriesCurrentOversizedRootOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	upgraded, err := Open(ctx, path)
+	upgraded, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestUpgradeRetriesCurrentOversizedRootOnce(t *testing.T) {
 	if err := upgraded.Close(); err != nil {
 		t.Fatal(err)
 	}
-	restarted, err := Open(ctx, path)
+	restarted, err := openTestStoreWithMigrations(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}

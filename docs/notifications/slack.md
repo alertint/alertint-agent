@@ -94,9 +94,10 @@ A published Situation owns exactly **one** main-channel message — its
 The root shows up to five distinct alert identities. When there are more,
 it states the omitted count and says “Slack message limit reached for this
 card; see the full list in MCP.” The complete list remains in the Situation
-record. A final check keeps the entire root under Slack's 4,000-byte text
-and 50-block limits; unusually long source text produces a compact card with
-the current status, next action, and MCP lookup.
+record. A final check keeps the entire root under our 4,000-byte text bound
+and the 50-block limit; unusually long source text produces a compact card
+with the current status, next action, and MCP lookup. Correlation replies
+also show a short alert sample and point to MCP when the list is longer.
 
 Journal entries are created for first publication, material investigation
 changes and conclusions, operator-contract changes, recovery pending,
