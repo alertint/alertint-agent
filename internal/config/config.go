@@ -567,6 +567,7 @@ type SlackConfig struct {
 	Enabled     bool   `yaml:"enabled"`
 	BotTokenEnv string `yaml:"bot_token_env"` // env var holding the xoxb- bot token
 	Channel     string `yaml:"channel"`       // e.g. "#alerts" or "C1234567890"
+	APIBaseURL  string `yaml:"api_base_url"`  // optional trusted Slack API endpoint; used by isolated labs
 	MinSeverity string `yaml:"min_severity"`  // low | medium | high (default low = post everything)
 	// RecurrenceMode gates how recurrence-collapse re-fires resurface in Slack
 	// (ADR-0020): "change-gated" (default) posts thread replies for
@@ -1324,6 +1325,12 @@ func (c *Config) validateNotify() []string {
 		}
 		if strings.TrimSpace(c.Notify.Slack.Channel) == "" {
 			errs = append(errs, "notify.slack.channel is required when slack is enabled")
+		}
+		if raw := strings.TrimSpace(c.Notify.Slack.APIBaseURL); raw != "" {
+			u, err := url.Parse(raw)
+			if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+				errs = append(errs, "notify.slack.api_base_url must be an http(s) URL without credentials, query, or fragment")
+			}
 		}
 		if !validSeverity(c.Notify.Slack.MinSeverity) {
 			errs = append(errs, fmt.Sprintf("notify.slack.min_severity %q must be one of low, medium, high", c.Notify.Slack.MinSeverity))

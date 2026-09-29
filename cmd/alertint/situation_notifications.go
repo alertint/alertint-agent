@@ -1045,7 +1045,7 @@ func buildSituationSlackWorker(cfg *config.Config, st *store.Store, owner string
 			"Situation Slack delivery stays off and durable effects are retained")
 		return nil, nil
 	}
-	api := slack.NewClient(slack.Config{BotToken: token})
+	api := slack.NewClient(slack.Config{BotToken: token, BaseURL: cfg.Notify.Slack.APIBaseURL})
 	deliverer := NewSituationDeliverer(st, api, cfg.Notify.Slack.Channel, func() time.Time { return time.Now().UTC() })
 	worker := situation.NewNotificationWorker(st, deliverer,
 		situation.NotificationWorkerConfig{

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Situation root cards bound the alert list and whole Slack payload, show
+  where to retrieve omitted alerts in MCP, and automatically retry current
+  roots previously rejected with `msg_too_long` once on upgrade.
+
 ## [0.14.0] - 2026-09-28
 
 ### Added

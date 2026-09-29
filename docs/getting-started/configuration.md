@@ -394,6 +394,7 @@ starts when the aggregate LLM dependency state first becomes `degraded` or
 | `slack.enabled` | bool | `false` | Turn on Slack delivery. In v0.14 this enables the Situation delivery worker, which posts one Situation root plus an immutable ordered journal thread. |
 | `slack.bot_token_env` | string | — | Required when `slack.enabled: true`. Env var name holding the Slack bot token (`xoxb-…`, requires the `chat:write` scope; no history-read scope is ever requested) |
 | `slack.channel` | string | — | Required when `slack.enabled: true`. Channel name (e.g. `#alerts`) or ID (e.g. `C1234567890`) |
+| `slack.api_base_url` | URL | Slack Web API | Optional override for a trusted Slack-compatible endpoint, used by isolated labs. Both Situation and system messages use it. The bot token is sent to this endpoint, so use only a server you control. |
 | `slack.min_severity` | string | `low` | The minimum **interruption priority** a new main-channel interruption must meet — never alert severity and never a model claim. `critical` always passes; a withheld interruption is durably recorded; the floor never suppresses Situation state, MCP history, a root edit, or a journal reply. The default posts everything. |
 | `slack.recurrence_mode` | string | `change-gated` | Controls Situation recurrence milestone replies: `change-gated` posts one quiet thread reply at ×5/×10/×25/×50/×100 and then every ×100; `off` keeps only the silent root edit. Neither mode re-pages the channel. |
 

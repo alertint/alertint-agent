@@ -32,6 +32,8 @@ import (
 // a visible marker").
 const (
 	maxSectionChars        = 3000
+	maxRootTextBytes       = 4000
+	maxRootBlocks          = 50
 	maxRenderedListEntries = 5
 	truncationMarker       = "… [truncated]"
 )
@@ -81,7 +83,7 @@ func RenderSituationRoot(in SituationRootInput) (RenderedMessage, error) {
 		return RenderedMessage{}, err
 	}
 	if in.Summary.Briefing != nil {
-		return renderBriefingRoot(in), nil
+		return boundedRoot(in, renderBriefingRoot(in)), nil
 	}
 
 	orientation := situation.DeriveOrientation(in.Summary, in.SourceTransition)
@@ -108,10 +110,42 @@ func RenderSituationRoot(in SituationRootInput) (RenderedMessage, error) {
 	}
 	blocks = append(blocks, handleBlock(in.Summary))
 
-	return RenderedMessage{
+	return boundedRoot(in, RenderedMessage{
 		Text:   rootFallback(in.Summary, orientation, in.SourceTransition.Drill),
 		Blocks: blocks,
-	}, nil
+	}), nil
+}
+
+// boundedRoot is the last check before either chat.postMessage or chat.update.
+// A compact card retains the current state, next action and MCP handle when
+// unusually long source data defeats the normal root's bounds.
+func boundedRoot(in SituationRootInput, rendered RenderedMessage) RenderedMessage {
+	if len(rendered.Text) <= maxRootTextBytes && len(rendered.Blocks) <= maxRootBlocks {
+		return rendered
+	}
+	lines := []string{
+		drillPrefix(in.SourceTransition.Drill) + "*Situation:* " + briefingText(in.Summary.Title, 180),
+		"*Status:* " + string(in.SourceTransition.Lifecycle) + " · " + string(in.SourceTransition.Attention),
+	}
+	if b := in.Summary.Briefing; b != nil {
+		lines = append(lines, fmt.Sprintf("*Alerts:* %d firing · %d resolved · %d unobserved", b.Firing, b.Resolved, b.Unknown))
+		if finding, _ := canonicalFinding(b, in.SourceTransition.Projection.Assessment); finding != "" {
+			lines = append(lines, "*Finding:* "+briefingText(finding, 240))
+		}
+		lines = append(lines, fmt.Sprintf("%d more — Slack message limit reached for this card; see the full list in MCP.", len(b.Alerts)+b.AlertsOmitted))
+	} else {
+		lines = append(lines, "Slack message limit reached for this card; see the full Situation in MCP.")
+	}
+	lines = append(lines, "*Next:* "+briefingText(contractLine(situation.DeriveOrientation(in.Summary, in.SourceTransition), in.SourceTransition.ActionContract), 220))
+	if in.ContractDeadlineAt != nil {
+		lines = append(lines, "*Next update:* "+RenderDeadline(*in.ContractDeadlineAt, in.Now))
+	}
+	lines = append(lines, canonicalMCP(in.Summary))
+	blocks := make([]slacklib.Block, 0, len(lines))
+	for _, line := range lines {
+		blocks = append(blocks, sectionBlock(line))
+	}
+	return RenderedMessage{Text: strings.Join(lines, "\n\n"), Blocks: blocks}
 }
 
 func validateRootInput(in SituationRootInput) error {
