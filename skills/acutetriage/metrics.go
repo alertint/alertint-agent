@@ -375,13 +375,15 @@ type metricQuerier interface {
 // Outcome makes fetched / queried-empty / no-selector / backend-failed
 // distinguishable in logs, the audit trail, and the notification card (R4/R8).
 type MetricEnrichment struct {
-	At                   time.Time        `json:"at"`
-	Selector             string           `json:"selector,omitempty"`  // rendered matcher(s) that ran (breadcrumb/replay)
-	Snapshots            []MetricSnapshot `json:"snapshots,omitempty"` // ranked, capped
-	Note                 string           `json:"note,omitempty"`      // why Snapshots is empty
-	Outcome              Outcome          `json:"outcome,omitempty"`
-	RequestAttempts      int              `json:"request_attempts,omitempty"`
-	RequestAttemptsKnown bool             `json:"request_attempts_known,omitempty"`
+	At                   time.Time         `json:"at"`
+	Selector             string            `json:"selector,omitempty"` // rendered matcher(s) that ran (breadcrumb/replay)
+	RuleExprs            []string          `json:"rule_exprs,omitempty"`
+	LabelMap             map[string]string `json:"label_map,omitempty"`
+	Snapshots            []MetricSnapshot  `json:"snapshots,omitempty"` // ranked, capped
+	Note                 string            `json:"note,omitempty"`      // why Snapshots is empty
+	Outcome              Outcome           `json:"outcome,omitempty"`
+	RequestAttempts      int               `json:"request_attempts,omitempty"`
+	RequestAttemptsKnown bool              `json:"request_attempts_known,omitempty"`
 }
 
 // FetchMetrics queries Prometheus for the incident's series at time t using the
@@ -401,7 +403,9 @@ type MetricEnrichment struct {
 // TimeoutSeconds. A scope that is reachable-but-slow yields OutcomeDegraded, kept
 // distinct from a genuine outage (OutcomeFailed) so a self-inflicted timeout does
 // not read as "unreachable" or cap confidence.
-func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, alerts []store.Alert, t time.Time, incidentID string, logger *slog.Logger) (out *MetricEnrichment) {
+//
+//nolint:gocyclo // Rule-expression and selector queries share one bounded fetch and outcome decision.
+func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, ruleExprs []string, alerts []store.Alert, t time.Time, incidentID string, logger *slog.Logger) (out *MetricEnrichment) {
 	if prom == nil {
 		return nil
 	}
@@ -414,12 +418,94 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 			out.RequestAttempts, out.RequestAttemptsKnown = requestCounter.Attempts(), true
 		}
 	}()
+	fetchCtx, cancel := context.WithTimeout(ctx, time.Duration(params.TimeoutSeconds)*time.Second)
+	defer cancel()
 
 	shared := buildMetricSelector(alerts, params.ExtraSelectorLabels)
 	logDroppedSelectorKeys(ctx, logger, "metrics", alerts, params.ExtraSelectorLabels, incidentID)
+	memberPairs := memberLabelPairs(alerts)
+	var snapshots []MetricSnapshot
+	learned := make(map[string]map[string]bool)
+	ambiguous := make(map[string]bool)
+	var perRule time.Duration
+	if len(ruleExprs) > 0 {
+		perRule = time.Duration(params.TimeoutSeconds) * time.Second / 2 / time.Duration(len(ruleExprs))
+	}
+	for _, expr := range ruleExprs {
+		ruleCtx, ruleCancel := context.WithTimeout(fetchCtx, perRule)
+		data, err := prom.QueryInstant(ruleCtx, expr, t, params.MaxSeries)
+		ruleCancel()
+		if err != nil {
+			logger.Warn("acutetriage: metrics: alert rule query failed", "err", err, "incident", incidentID)
+			continue
+		}
+		var result struct {
+			ResultType string `json:"resultType"`
+			Result     []struct {
+				Metric map[string]string `json:"metric"`
+				Value  [2]any            `json:"value"`
+			} `json:"result"`
+		}
+		if json.Unmarshal(data, &result) != nil || result.ResultType != "vector" {
+			continue
+		}
+		joined := result.Result[:0]
+		for _, series := range result.Result {
+			matchesAlert := true
+			for key, value := range series.Metric {
+				if key != "__name__" && !memberPairs[key+"\x00"+value] {
+					matchesAlert = false
+					break
+				}
+			}
+			if !matchesAlert {
+				continue
+			}
+			for source, values := range shared {
+				if len(values) != 1 {
+					continue
+				}
+				var match string
+				for target, value := range series.Metric {
+					if target != "__name__" && value == values[0] {
+						if match != "" {
+							ambiguous[source] = true
+						}
+						match = target
+					}
+				}
+				if match != "" {
+					if learned[source] == nil {
+						learned[source] = make(map[string]bool)
+					}
+					learned[source][match] = true
+				}
+			}
+			if series.Metric["__name__"] == "" {
+				series.Metric["__name__"] = "alert_rule_expr"
+			}
+			joined = append(joined, series)
+		}
+		result.Result = joined
+		filtered, err := json.Marshal(result)
+		if err == nil {
+			snapshots = append(snapshots, rankSeries(filtered, memberPairs, maxSnapshotsPerScope)...)
+		}
+	}
+	labelMap := make(map[string]string)
+	for source, targets := range learned {
+		if !ambiguous[source] && len(targets) == 1 {
+			for target := range targets {
+				labelMap[source] = target
+			}
+		}
+	}
+	for source, target := range params.LabelMap {
+		labelMap[source] = target
+	}
 	extraSel := extraSelectorValues(shared, params.ExtraSelectorLabels)
-	primary := renderPromMatcher(translateSelector(shared, params.LabelMap))
-	physicalFallback := renderPhysicalCore(shared, params.ExtraSelectorLabels, params.LabelMap)
+	primary := renderPromMatcher(translateSelector(shared, labelMap))
+	physicalFallback := renderPhysicalCore(shared, params.ExtraSelectorLabels, labelMap)
 
 	// Ordered, deduped scope list: primary first (it alone gets the retry), then
 	// the per-instance supplements not already equal to the primary, capped at
@@ -431,7 +517,7 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 		scopes = append(scopes, primary)
 		seen[primary] = true
 	}
-	supplements := instanceSupplements(alerts, extraSel, params.LabelMap)
+	supplements := instanceSupplements(alerts, extraSel, labelMap)
 	added := 0
 	for _, sup := range supplements {
 		if seen[sup] {
@@ -447,29 +533,27 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 		added++
 	}
 
-	if len(scopes) == 0 {
+	if len(scopes) == 0 && len(snapshots) == 0 {
 		logger.Info("acutetriage: metrics: no usable selector for this incident",
 			"shared_labels", formatLabels(sharedLabels(alerts)), "incident", incidentID)
-		return &MetricEnrichment{At: t, Note: "no usable metric selector for this incident", Outcome: OutcomeNoSelector, RequestAttemptsKnown: true}
+		return &MetricEnrichment{At: t, RuleExprs: ruleExprs, LabelMap: labelMap, Note: "no usable metric selector for this incident", Outcome: OutcomeNoSelector, RequestAttemptsKnown: true}
 	}
-
-	fetchCtx, cancel := context.WithTimeout(ctx, time.Duration(params.TimeoutSeconds)*time.Second)
-	defer cancel()
 
 	// Give each scope its own slice of the budget: a slow query then times out on
 	// its own sub-deadline instead of consuming the whole budget and starving the
 	// remaining scopes into a false "backend failed" (the storm cascade). The
 	// outer fetchCtx still caps total added latency at ~TimeoutSeconds; this only
 	// shares that budget out so no single scope can monopolize it.
-	perScope := time.Duration(params.TimeoutSeconds) * time.Second / time.Duration(len(scopes))
+	var perScope time.Duration
+	if len(scopes) > 0 {
+		perScope = time.Duration(params.TimeoutSeconds) * time.Second / time.Duration(len(scopes))
+	}
 	queryScope := func(scope string) (json.RawMessage, error) {
 		scopeCtx, scopeCancel := context.WithTimeout(fetchCtx, perScope)
 		defer scopeCancel()
 		return prom.QueryInstant(scopeCtx, scope, t, params.MaxSeries)
 	}
 
-	memberPairs := memberLabelPairs(alerts)
-	var snapshots []MetricSnapshot
 	// Track the two failure kinds apart: a per-scope deadline (backend reachable
 	// but slow) is a self-inflicted timeout, distinct from a genuine outage
 	// (connection refused / DNS / non-200). classify records each.
@@ -507,7 +591,7 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 	}
 	snapshots = dedupeSnapshots(snapshots)
 
-	enr := &MetricEnrichment{At: t, Selector: strings.Join(scopes, ", ")}
+	enr := &MetricEnrichment{At: t, Selector: strings.Join(scopes, ", "), RuleExprs: ruleExprs, LabelMap: labelMap}
 	switch {
 	case len(snapshots) > 0:
 		enr.Snapshots = snapshots

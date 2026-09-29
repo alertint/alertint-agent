@@ -1412,6 +1412,39 @@ func (s *Store) GetAlertDeliveries(ctx context.Context, deliveryIDs []string) ([
 	return out, nil
 }
 
+// GeneratorURLsForAlerts returns each alert's latest non-empty generator URL.
+// The URL is stored evidence; callers must not contact its host.
+func (s *Store) GeneratorURLsForAlerts(ctx context.Context, alertIDs []string) (map[string]string, error) {
+	out := make(map[string]string)
+	if len(alertIDs) == 0 {
+		return out, nil
+	}
+	idsJSON, err := json.Marshal(alertIDs)
+	if err != nil {
+		return nil, fmt.Errorf("store: marshal alert ids: %w", err)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT alert_id, generator_url FROM alert_deliveries
+		WHERE alert_id IN (SELECT value FROM json_each(?)) AND generator_url <> ''
+		ORDER BY received_at DESC, id DESC`, string(idsJSON))
+	if err != nil {
+		return nil, fmt.Errorf("store: read generator urls: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var id, generatorURL string
+		if err := rows.Scan(&id, &generatorURL); err != nil {
+			return nil, fmt.Errorf("store: scan generator url: %w", err)
+		}
+		if _, exists := out[id]; !exists {
+			out[id] = generatorURL
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate generator urls: %w", err)
+	}
+	return out, nil
+}
+
 // rawDeliveryFields holds the string-typed columns shared by deliverySelect
 // and dispatchSelect, scanned before being parsed/typed by hydrateDelivery.
 type rawDeliveryFields struct {

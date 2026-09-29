@@ -92,6 +92,14 @@ firing signal that opens or updates a Situation.
 
 ### How it works
 
+For alerts fired by Prometheus rules, AlertINT reads the rule expression from
+Alertmanager's stored `generatorURL` query string and runs it unchanged against
+the configured Prometheus. It never contacts the URL's host. Matching series
+provide metric evidence and can reveal the series label corresponding to an
+alert label; a configured `label_map` always takes precedence. This evidence
+read applies only to Prometheus-rule alerts and does not establish reusable
+source authority from the URL.
+
 When an incident is ready for analysis, **AlertINT** builds a generic
 PromQL selector from the alert group's shared labels — the same
 allowlist logs use (`namespace`, `service`, `job`, `pod`, `container`,

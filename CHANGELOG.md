@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Triage can read and run a Prometheus alert's stored rule expression to obtain
+  metric evidence and learn a matching series label for the incident.
 - Prometheus `label_map` translates alert labels to metric series labels in
   evidence and verification queries.
 

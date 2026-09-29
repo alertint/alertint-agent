@@ -182,7 +182,7 @@ func TestParentScope_NoExtras_Unchanged(t *testing.T) {
 func TestFetchMetrics_RetryKeepsExtra(t *testing.T) {
 	q := &fakeProm{}
 	params := MetricParams{TimeoutSeconds: 5, ExtraSelectorLabels: []string{"cluster"}}
-	FetchMetrics(context.Background(), q, params, clusterAlerts(), time.Now(), "inc-1", nil)
+	FetchMetrics(context.Background(), q, params, nil, clusterAlerts(), time.Now(), "inc-1", nil)
 	if len(q.calls) != 2 {
 		t.Fatalf("want primary + retry, got %d queries: %v", len(q.calls), q.calls)
 	}

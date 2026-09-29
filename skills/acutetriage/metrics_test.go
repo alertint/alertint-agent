@@ -320,7 +320,7 @@ func TestFetchMetrics_K8sSelectorFetches(t *testing.T) {
 			s(map[string]string{"__name__": "cpu", "namespace": "checkout", "pod": "api-7f9x"}, "0.9"),
 		),
 	}}
-	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, alerts, time.Now(), "inc1", nil)
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, nil, alerts, time.Now(), "inc1", nil)
 	if enr == nil || enr.Outcome != OutcomeFetched || len(enr.Snapshots) != 1 {
 		t.Fatalf("want fetched with 1 snapshot, got %+v", enr)
 	}
@@ -331,9 +331,79 @@ func TestFetchMetrics_LabelMapUsesSeriesLabel(t *testing.T) {
 	f := &fakeProm{responses: map[string]json.RawMessage{
 		`{service_name="payment"}`: vector(s(map[string]string{"__name__": "service:span_error_ratio:5m", "service_name": "payment"}, "0.54")),
 	}}
-	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5, LabelMap: map[string]string{"service": "service_name"}}, alerts, time.Now(), "payment", nil)
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5, LabelMap: map[string]string{"service": "service_name"}}, nil, alerts, time.Now(), "payment", nil)
 	if len(f.calls) != 1 || f.calls[0] != `{service_name="payment"}` || enr.Outcome != OutcomeFetched {
 		t.Fatalf("calls = %v, enrichment = %+v", f.calls, enr)
+	}
+}
+
+func TestFetchMetrics_RuleExpressionLearnsLabelMap(t *testing.T) {
+	alerts := []store.Alert{alert(map[string]string{"service": "payment", "service_name": "payment"})}
+	f := &fakeProm{responses: map[string]json.RawMessage{
+		case014RuleExpr:            vector(s(map[string]string{"__name__": "service:span_error_ratio:5m", "service_name": "payment"}, "0.54")),
+		`{service_name="payment"}`: vector(s(map[string]string{"__name__": "payment_requests_total", "service_name": "payment"}, "42")),
+	}}
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, []string{case014RuleExpr}, alerts, time.Now(), "payment", nil)
+	if len(f.calls) < 2 || f.calls[0] != case014RuleExpr || f.calls[1] != `{service_name="payment"}` {
+		t.Fatalf("queries = %v", f.calls)
+	}
+	if enr.Outcome != OutcomeFetched || len(enr.Snapshots) != 2 || enr.Snapshots[0].Metric != "service:span_error_ratio:5m" {
+		t.Fatalf("enrichment = %+v", enr)
+	}
+	if len(enr.RuleExprs) != 1 || enr.RuleExprs[0] != case014RuleExpr || enr.LabelMap["service"] != "service_name" {
+		t.Fatalf("rule metadata = %+v", enr)
+	}
+	frozenJSON, err := json.Marshal(enr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frozen MetricEnrichment
+	if err := json.Unmarshal(frozenJSON, &frozen); err != nil {
+		t.Fatal(err)
+	}
+	floor := composeFloor(VerificationParams{HasPromQL: true, LabelMap: frozen.LabelMap}, "", alerts)
+	if floor[0].Expr != `{service_name="payment"}` {
+		t.Fatalf("frozen learned map did not reach floor: %+v", floor)
+	}
+}
+
+func TestFetchMetrics_RuleExpressionJoinAndLearning(t *testing.T) {
+	alerts := []store.Alert{alert(map[string]string{"service": "payment", "service_name": "payment", "region": "eu"})}
+	f := &fakeProm{responses: map[string]json.RawMessage{
+		"up": vector(
+			s(map[string]string{"service_name": "payment"}, "1"),
+			s(map[string]string{"__name__": "wrong_region", "service_name": "payment", "region": "us"}, "2"),
+		),
+	}}
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5, LabelMap: map[string]string{"service": "manual"}}, []string{"up"}, alerts, time.Now(), "payment", nil)
+	if len(enr.Snapshots) != 1 || enr.Snapshots[0].Metric != "alert_rule_expr" {
+		t.Fatalf("joined snapshots = %+v", enr.Snapshots)
+	}
+	if enr.LabelMap["service"] != "manual" {
+		t.Fatalf("manual map lost: %v", enr.LabelMap)
+	}
+}
+
+func TestFetchMetrics_RuleExpressionEmptyDoesNotLearn(t *testing.T) {
+	alerts := []store.Alert{alert(map[string]string{"service": "payment"})}
+	f := &fakeProm{fail: map[string]bool{"bad_metric": true}}
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, []string{"up", "bad_metric"}, alerts, time.Now(), "payment", nil)
+	if len(enr.Snapshots) != 0 || len(enr.LabelMap) != 0 || enr.Outcome != OutcomeEmpty {
+		t.Fatalf("empty rule results changed fetch: %+v", enr)
+	}
+}
+
+func TestFetchMetrics_RuleExpressionAmbiguousLabelDoesNotLearn(t *testing.T) {
+	alerts := []store.Alert{alert(map[string]string{"service": "payment", "service_name": "payment", "team": "payment"})}
+	f := &fakeProm{responses: map[string]json.RawMessage{
+		"up": vector(s(map[string]string{"__name__": "up", "service_name": "payment", "team": "payment"}, "1")),
+	}}
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, []string{"up"}, alerts, time.Now(), "payment", nil)
+	if _, ok := enr.LabelMap["service"]; ok {
+		t.Fatalf("ambiguous match learned a map: %v", enr.LabelMap)
+	}
+	if f.calls[1] != `{service="payment"}` {
+		t.Fatalf("scope changed after ambiguous rule result: %v", f.calls)
 	}
 }
 
@@ -346,7 +416,7 @@ func TestFetchMetrics_PhysicalCoreRetry(t *testing.T) {
 			s(map[string]string{"__name__": "cpu", "namespace": "checkout", "pod": "api-7f9x"}, "0.9"),
 		),
 	}}
-	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, alerts, time.Now(), "inc1", nil)
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, nil, alerts, time.Now(), "inc1", nil)
 	if enr.Outcome != OutcomeFetched || len(enr.Snapshots) != 1 {
 		t.Fatalf("physical-core retry should recover metrics, got %+v", enr)
 	}
@@ -366,7 +436,7 @@ func TestFetchMetrics_AlertBookkeepingTriggersPhysicalCoreRetry(t *testing.T) {
 			s(map[string]string{"__name__": "service:span_error_ratio:5m", "service_name": "payment"}, "0.54"),
 		),
 	}}
-	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5, ExtraSelectorLabels: []string{"service_name"}}, alerts, time.Now(), "payment", nil)
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5, ExtraSelectorLabels: []string{"service_name"}}, nil, alerts, time.Now(), "payment", nil)
 	if len(f.calls) != 2 || f.calls[0] != `{service="payment",service_name="payment"}` || f.calls[1] != `{service_name="payment"}` {
 		t.Fatalf("want primary then physical-core fallback, got calls %v", f.calls)
 	}
@@ -386,7 +456,7 @@ func TestFetchMetrics_AlertBookkeepingWithoutFallbackIsEmpty(t *testing.T) {
 			s(map[string]string{"__name__": "ALERTS_FOR_STATE", "service": "payment"}, "123"),
 		),
 	}}
-	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, alerts, time.Now(), "payment", nil)
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, nil, alerts, time.Now(), "payment", nil)
 	if len(f.calls) != 1 || f.calls[0] != `{service="payment"}` {
 		t.Fatalf("want only the primary scope, got calls %v", f.calls)
 	}
@@ -407,7 +477,7 @@ func TestFetchMetrics_MixedMembersKeepInstanceSupplement(t *testing.T) {
 			s(map[string]string{"__name__": "node_load1", "instance": "db-01:9100"}, "4"),
 		),
 	}}
-	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, alerts, time.Now(), "inc1", nil)
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, nil, alerts, time.Now(), "inc1", nil)
 	if enr.Outcome != OutcomeFetched || len(enr.Snapshots) != 1 {
 		t.Fatalf("instance supplement should be queried, got %+v; calls=%v", enr, f.calls)
 	}
@@ -422,7 +492,7 @@ func TestFetchMetrics_CapsInstanceSupplements(t *testing.T) {
 		alerts = append(alerts, alert(map[string]string{"namespace": "n", "instance": string(rune('a' + i))}))
 	}
 	f := &fakeProm{}
-	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, alerts, time.Now(), "inc1", nil)
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, nil, alerts, time.Now(), "inc1", nil)
 	if enr == nil {
 		t.Fatal("nil enrichment")
 	}
@@ -451,7 +521,7 @@ func TestFetchMetrics_PerScopeDeadlinePreventsStarvation(t *testing.T) {
 			`{instance="n2"}`: vector(s(map[string]string{"__name__": "node_load1", "instance": "n2"}, "2")),
 		},
 	}
-	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 1}, alerts, time.Now(), "inc1", nil)
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 1}, nil, alerts, time.Now(), "inc1", nil)
 	if len(f.calls) != 3 {
 		t.Fatalf("all three scopes must be attempted, got calls=%v", f.calls)
 	}
@@ -466,7 +536,7 @@ func TestFetchMetrics_PassesMaxSeriesToQuerier(t *testing.T) {
 	// selector can never dump an unbounded node-series payload.
 	alerts := []store.Alert{alert(map[string]string{"namespace": "n", "instance": "db-01:9100"})}
 	f := &fakeProm{}
-	FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5, MaxSeries: 200}, alerts, time.Now(), "i", nil)
+	FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5, MaxSeries: 200}, nil, alerts, time.Now(), "i", nil)
 	if len(f.limits) == 0 {
 		t.Fatal("no queries ran")
 	}
@@ -483,7 +553,7 @@ func TestFetchMetrics_TimeoutIsDegraded(t *testing.T) {
 	// finding must not be treated as "Prometheus unreachable".
 	alerts := []store.Alert{alert(map[string]string{"namespace": "n"})}
 	f := &fakeProm{slow: map[string]bool{`{namespace="n"}`: true}}
-	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 1}, alerts, time.Now(), "i", nil)
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 1}, nil, alerts, time.Now(), "i", nil)
 	if enr.Outcome != OutcomeDegraded {
 		t.Fatalf("timeout under load must be degraded, got %q", enr.Outcome)
 	}
@@ -498,7 +568,7 @@ func TestFetchMetrics_HardErrorBeatsTimeout(t *testing.T) {
 		fail: map[string]bool{`{instance="db-01:9100",namespace="n"}`: true}, // primary: hard down
 		slow: map[string]bool{`{instance="db-01:9100"}`: true},               // supplement: slow
 	}
-	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 1}, alerts, time.Now(), "i", nil)
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 1}, nil, alerts, time.Now(), "i", nil)
 	if enr.Outcome != OutcomeFailed {
 		t.Fatalf("hard error must win over timeout, got %q", enr.Outcome)
 	}
@@ -507,26 +577,26 @@ func TestFetchMetrics_HardErrorBeatsTimeout(t *testing.T) {
 func TestFetchMetrics_Outcomes(t *testing.T) {
 	now := time.Now()
 	// no usable selector.
-	enr := FetchMetrics(context.Background(), &fakeProm{}, MetricParams{TimeoutSeconds: 5},
+	enr := FetchMetrics(context.Background(), &fakeProm{}, MetricParams{TimeoutSeconds: 5}, nil,
 		[]store.Alert{alert(map[string]string{"alertname": "X"})}, now, "i", nil)
 	if enr.Outcome != OutcomeNoSelector {
 		t.Errorf("want no_selector, got %q", enr.Outcome)
 	}
 	// queried, empty.
-	enr = FetchMetrics(context.Background(), &fakeProm{}, MetricParams{TimeoutSeconds: 5},
+	enr = FetchMetrics(context.Background(), &fakeProm{}, MetricParams{TimeoutSeconds: 5}, nil,
 		[]store.Alert{alert(map[string]string{"namespace": "n"})}, now, "i", nil)
 	if enr.Outcome != OutcomeEmpty {
 		t.Errorf("want empty, got %q", enr.Outcome)
 	}
 	// backend failed (every scope errors).
 	f := &fakeProm{fail: map[string]bool{`{namespace="n"}`: true}}
-	enr = FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5},
+	enr = FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, nil,
 		[]store.Alert{alert(map[string]string{"namespace": "n"})}, now, "i", nil)
 	if enr.Outcome != OutcomeFailed {
 		t.Errorf("want failed, got %q", enr.Outcome)
 	}
 	// nil querier → nil enrichment (never looked).
-	if FetchMetrics(context.Background(), nil, MetricParams{TimeoutSeconds: 5}, nil, now, "i", nil) != nil {
+	if FetchMetrics(context.Background(), nil, MetricParams{TimeoutSeconds: 5}, nil, nil, now, "i", nil) != nil {
 		t.Error("nil querier must yield nil enrichment")
 	}
 }
@@ -540,7 +610,7 @@ func TestFetchMetrics_PartialFailureIsNotGenuineEmpty(t *testing.T) {
 	alerts := []store.Alert{alert(map[string]string{"namespace": "n", "instance": "db-01:9100"})}
 	// Primary errors; the supplement succeeds but matches nothing (default vector()).
 	f := &fakeProm{fail: map[string]bool{`{instance="db-01:9100",namespace="n"}`: true}}
-	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, alerts, now, "i", nil)
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, nil, alerts, now, "i", nil)
 	if enr.Outcome != OutcomeFailed {
 		t.Fatalf("partial failure must report failed, got %q (%+v); calls=%v", enr.Outcome, enr, f.calls)
 	}

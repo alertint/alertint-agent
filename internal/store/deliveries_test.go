@@ -41,6 +41,33 @@ func deliveryFixture(id, fingerprint string, now time.Time) DeliveryInput {
 	}
 }
 
+func TestGeneratorURLsForAlerts(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	if got, err := st.GeneratorURLsForAlerts(ctx, nil); err != nil || len(got) != 0 {
+		t.Fatalf("empty IDs: got %v, err %v", got, err)
+	}
+	now := time.Date(2026, 9, 29, 10, 0, 0, 0, time.UTC)
+	first := deliveryFixture("rule-old", "rule-fp", now)
+	first.SourceProvenance.GeneratorURL = "http://prom/graph?g0.expr=old_metric"
+	latest := deliveryFixture("rule-new", "rule-fp", now.Add(time.Minute))
+	latest.SourceProvenance.GeneratorURL = "http://prom/graph?g0.expr=new_metric"
+	blank := deliveryFixture("rule-blank", "rule-fp", now.Add(2*time.Minute))
+	other := deliveryFixture("rule-other", "other-fp", now)
+	other.SourceProvenance.GeneratorURL = "http://prom/graph?g0.expr=other_metric"
+	if _, err := st.AcceptDeliveries(ctx, []DeliveryInput{first, latest, blank, other}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GeneratorURLsForAlerts(ctx, []string{first.Alert.ID, other.Alert.ID, "unknown"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{first.Alert.ID: latest.SourceProvenance.GeneratorURL, other.Alert.ID: other.SourceProvenance.GeneratorURL}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("urls = %v, want %v", got, want)
+	}
+}
+
 func assertTableCount(t *testing.T, db *sql.DB, table string, want int) {
 	t.Helper()
 	var got int

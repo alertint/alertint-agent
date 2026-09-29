@@ -770,6 +770,7 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		zbxSeed    map[string]zabbix.Topology
 		memory     *MemoryEnrichment
 	)
+	//nolint:nestif // Live-only rule URL lookup stays beside the other live enrichment reads.
 	if replay != nil {
 		// Frozen inputs (persist-as-rendered envelope): no live fetch, no
 		// reconcile/disposition/classifier — the sections replay exactly as the
@@ -785,7 +786,26 @@ func (s *Skill) analysis(ctx context.Context, inc store.Incident, alerts []store
 		zbx = replay.frozen.Zabbix
 		memory = replay.frozen.Memory
 	} else {
-		metrics = FetchMetrics(ctx, s.promQuerier(), s.cfg.MetricParams, alerts, spanStart, inc.ID, s.logger)
+		var exprs []string
+		if s.st != nil {
+			ids := make([]string, 0, len(alerts))
+			for _, alert := range alerts {
+				ids = append(ids, alert.ID)
+			}
+			urlsByAlert, err := s.st.GeneratorURLsForAlerts(ctx, ids)
+			if err != nil {
+				s.logger.Warn("acutetriage: metrics: read alert rule urls failed", "err", err, "incident", inc.ID)
+			} else {
+				urls := make([]string, 0, len(urlsByAlert))
+				for _, alert := range alerts {
+					if url := urlsByAlert[alert.ID]; url != "" {
+						urls = append(urls, url)
+					}
+				}
+				exprs = ruleExpressions(urls)
+			}
+		}
+		metrics = FetchMetrics(ctx, s.promQuerier(), s.cfg.MetricParams, exprs, alerts, spanStart, inc.ID, s.logger)
 		// Best-effort log enrichment: never blocks or fails triage. end=now so a
 		// still-firing incident captures the freshest lines around analysis time.
 		enrichment = FetchLogs(ctx, s.cfg.LogSource, s.cfg.LogParams, alerts, spanStart, time.Now().UTC(), inc.ID, s.logger)
@@ -1050,6 +1070,16 @@ func (s *Skill) verifyParams() VerificationParams {
 func (s *Skill) verifyAndRejudge(ctx context.Context, inc store.Incident, alerts []store.Alert, ar analysisResult, resp llmResponse, replay *replayRun) (json.RawMessage, llmResponse, *VerificationEnrichment) {
 	draft := DraftRef{RootCause: resp.OverallIssue, Confidence: resp.Confidence}
 	vp := s.verifyParams()
+	if ar.metrics != nil {
+		merged := make(map[string]string, len(ar.metrics.LabelMap)+len(vp.LabelMap))
+		for source, target := range ar.metrics.LabelMap {
+			merged[source] = target
+		}
+		for source, target := range vp.LabelMap {
+			merged[source] = target
+		}
+		vp.LabelMap = merged
+	}
 	floor := composeFloor(vp, s.cfg.ZabbixParams.HostLabel, alerts)
 	modelQ := parseVerificationPlan(ar.raw, vp, s.logger, inc.ID)
 	// One bounded batch repair of the model's own invalid PromQL, before

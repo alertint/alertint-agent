@@ -392,6 +392,9 @@ func renderMetrics(b *strings.Builder, m *MetricEnrichment) {
 	if m == nil {
 		return
 	}
+	for _, expr := range m.RuleExprs {
+		fmt.Fprintf(b, "\nAlert rule expression: %s", expr)
+	}
 	if len(m.Snapshots) > 0 {
 		b.WriteString("\n\nLive metrics (Prometheus, at incident time):")
 		for _, s := range m.Snapshots {

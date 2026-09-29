@@ -85,9 +85,12 @@ func TestUserPrompt_FailedMetricsStillAnnotationsOnly(t *testing.T) {
 
 func TestRenderMetrics_SeriesAndNote(t *testing.T) {
 	var b strings.Builder
-	renderMetrics(&b, &MetricEnrichment{Outcome: OutcomeFetched, Snapshots: []MetricSnapshot{
+	renderMetrics(&b, &MetricEnrichment{Outcome: OutcomeFetched, RuleExprs: []string{"up"}, Snapshots: []MetricSnapshot{
 		{Series: `{namespace="checkout",pod="api-7f9x"}`, Metric: "cpu", Value: "0.9"},
 	}})
+	if strings.Count(b.String(), "Alert rule expression: up") != 1 || strings.Index(b.String(), "Alert rule expression: up") > strings.Index(b.String(), "cpu{") {
+		t.Errorf("rule expression should precede snapshots once: %q", b.String())
+	}
 	if !strings.Contains(b.String(), `cpu{namespace="checkout",pod="api-7f9x"} = 0.9`) {
 		t.Errorf("metric line missing: %q", b.String())
 	}
