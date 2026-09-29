@@ -220,15 +220,7 @@ func canonicalBriefingJournal(t model.Transition, kind string, executionSupersed
 		if b.Flow.GroupKey != "" {
 			lines = append(lines, "*Current group:* `"+briefingComplete(b.Flow.GroupKey)+"`")
 		}
-		members, omitted := canonicalRootMembers(b)
-		lines = append(lines, "*Collected alerts:*\n"+members)
-		if omitted {
-			s := model.EpisodeSummary{SituationID: t.SituationID}
-			if t.Projection.PublicHandle != nil {
-				s.PublicHandle = *t.Projection.PublicHandle
-			}
-			lines = append(lines, canonicalMCP(s))
-		}
+		lines = append(lines, canonicalCollectedAlertLines(t, b)...)
 		if at := b.Flow.CorrelationClosesAt; at != nil {
 			lines = append(lines, "*Correlation window:* "+canonicalElapsed(b.Flow.CorrelationOpenedAt, *at))
 		}
@@ -301,6 +293,19 @@ func canonicalBriefingJournal(t model.Transition, kind string, executionSupersed
 		lines = append(lines, canonicalMCP(s))
 	}
 	return heading, strings.Join(lines, "\n\n")
+}
+
+func canonicalCollectedAlertLines(t model.Transition, b *model.OperatorBriefing) []string {
+	members, omitted := canonicalRootMembers(b)
+	lines := []string{"*Collected alerts:*\n" + members}
+	if omitted {
+		s := model.EpisodeSummary{SituationID: t.SituationID}
+		if t.Projection.PublicHandle != nil {
+			s.PublicHandle = *t.Projection.PublicHandle
+		}
+		lines = append(lines, canonicalMCP(s))
+	}
+	return lines
 }
 
 func canonicalReplyTimings(t model.Transition, b *model.OperatorBriefing, kind string) []string {
