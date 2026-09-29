@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Situations with many distinct alerts no longer get stuck retrying with
+  `value exceeds 16384 bytes`. The redundant lifecycle copy is removed, and
+  oversized past findings and prior situations are trimmed and marked
+  truncated. Stuck Situations resume on their next retry after upgrade.
+
 ## [0.14.1] - 2026-09-29
 
 ### Fixed

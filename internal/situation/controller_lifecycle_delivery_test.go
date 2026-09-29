@@ -4,6 +4,7 @@ package situation_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -52,6 +53,49 @@ func TestControllerLifecyclePreparedCycleDeliveryResolutionClosesAfterGrace(t *t
 	closed := reconcileDeliveryLifecycle(t, in, *first.GraceUntil)
 	if closed.Lifecycle != model.LifecycleRecovered || closed.TerminalAt == nil || !closed.TerminalAt.Equal(*first.GraceUntil) || closed.TerminalReason != nil {
 		t.Fatalf("clean grace expiry must recover: lifecycle=%s terminal=%v reason=%v", closed.Lifecycle, closed.TerminalAt, closed.TerminalReason)
+	}
+}
+
+func TestControllerLifecycleKeepsReceiptOrderPick(t *testing.T) {
+	start := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
+	resolvedAt := start.Add(4 * time.Minute)
+	in := ctBaseSnapshotInput()
+	in.Prepared = situation.PreparedState{CycleID: "cycle-receipt-order", Generation: 1}
+	d1 := ctDelivery("firing", "incident-1", true, "warning")
+	d1.AlertID, d1.SourceStartedAt, d1.ReceivedAt = "member-1", &start, start.Add(time.Minute)
+	d2 := ctDelivery("resolved", "incident-1", false, "warning")
+	d2.AlertID, d2.SourceResolvedAt, d2.ReceivedAt = "member-1", &resolvedAt, start.Add(5*time.Minute)
+	in.Deliveries = []situation.Delivery{d1, d2}
+	got := reconcileDeliveryLifecycle(t, in, d2.ReceivedAt)
+	if got.Lifecycle != model.LifecycleRecoveryPending {
+		t.Fatalf("lifecycle = %s, want recovery_pending from latest received delivery", got.Lifecycle)
+	}
+}
+
+func TestControllerLifecycleLargeGroupWithoutCopy(t *testing.T) {
+	now := ctBaseTime.Add(5 * time.Minute)
+	for _, firingMember := range []bool{false, true} {
+		t.Run(fmt.Sprintf("firing_member=%v", firingMember), func(t *testing.T) {
+			in := ctBaseSnapshotInput()
+			in.Prepared = situation.PreparedState{CycleID: "cycle-large-group", Generation: 1}
+			in.Deliveries = make([]situation.Delivery, 500)
+			for i := range in.Deliveries {
+				id := fmt.Sprintf("alert-%03d", i)
+				in.Deliveries[i] = ctDelivery(id, "incident-1", false, "warning")
+				in.Deliveries[i].ReceivedAt = now.Add(-time.Minute)
+			}
+			if firingMember {
+				in.Deliveries[0].Status = model.DeliveryStatusFiring
+			}
+			want := model.LifecycleRecoveryPending
+			if firingMember {
+				want = model.LifecycleActive
+			}
+			got := reconcileDeliveryLifecycle(t, in, now)
+			if got.Lifecycle != want {
+				t.Fatalf("lifecycle = %s, want %s with 500 alerts", got.Lifecycle, want)
+			}
+		})
 	}
 }
 
