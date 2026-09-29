@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -136,6 +138,79 @@ func TestStoreReadExecutorConfirmedEmptyWithNoRows(t *testing.T) {
 	}
 	if len(run.Facts) != 0 {
 		t.Fatalf("facts = %d, want 0", len(run.Facts))
+	}
+}
+
+func TestStoreReadExecutorOmitsLifecycleCopy(t *testing.T) {
+	store := &fakeLocalStore{}
+	for i := 0; i < 500; i++ {
+		store.lifecycle = append(store.lifecycle, model.SourceLifecycleObservation{
+			AlertID: fmt.Sprintf("alert-%03d", i), State: "firing",
+			ObservedAt:      time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC),
+			AcquisitionMode: "webhook", DeadlineAt: time.Date(2026, 9, 2, 10, 0, 0, 0, time.UTC),
+		})
+	}
+	plan := testStorePlan()
+	plan.Phase = model.PhaseLifecycle
+	plan.Parameters = json.RawMessage(`{"group_key":"service=checkout","situation_id":"situation-1"}`)
+	run, err := (&StoreReadExecutor{Store: store}).Execute(context.Background(), plan, &noopRecorder{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fact := range run.Facts {
+		if fact.Kind == "source_lifecycle" {
+			t.Fatal("store_read emitted a source_lifecycle copy")
+		}
+	}
+	if err := model.ValidateRun(run); err != nil {
+		t.Fatalf("run must fit persistence limits: %v", err)
+	}
+}
+
+func TestStoreReadExecutorBoundsFindingsFact(t *testing.T) {
+	store := &fakeLocalStore{}
+	for i := 0; i < 20; i++ {
+		store.findings = append(store.findings, model.LocalFinding{
+			IncidentID: fmt.Sprintf("incident-%02d", i),
+			AnalyzedAt: time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC).Add(-time.Duration(i) * time.Minute),
+			Summary:    strings.Repeat("s", 2048), RootCause: strings.Repeat("r", 2048),
+		})
+	}
+	run, err := (&StoreReadExecutor{Store: store}).Execute(context.Background(), testStorePlan(), &noopRecorder{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fact := range run.Facts {
+		if len(fact.Value) > model.MaxFactBytes {
+			t.Fatalf("fact value = %d bytes, cap = %d", len(fact.Value), model.MaxFactBytes)
+		}
+	}
+	if err := model.ValidateRun(run); err != nil {
+		t.Fatalf("run must fit persistence limits: %v", err)
+	}
+	if run.Status != model.ResultTruncated || run.Coverage.Complete {
+		t.Fatalf("status = %q, complete = %v; want truncated and incomplete", run.Status, run.Coverage.Complete)
+	}
+	if len(run.LimitationCodes) != 1 || run.LimitationCodes[0] != "fact_bytes_capped" {
+		t.Fatalf("limitation codes = %v, want fact_bytes_capped", run.LimitationCodes)
+	}
+	if len(run.Facts) != 1 || run.Coverage.Returned != 1 {
+		t.Fatalf("facts = %d, returned = %d; want one findings fact", len(run.Facts), run.Coverage.Returned)
+	}
+	var kept []model.LocalFinding
+	if err := json.Unmarshal(run.Facts[0].Value, &kept); err != nil {
+		t.Fatal(err)
+	}
+	if len(kept) == 0 || len(kept) >= len(store.findings) {
+		t.Fatalf("kept %d of %d findings, want a nonempty prefix", len(kept), len(store.findings))
+	}
+	if run.Coverage.Omitted != len(store.findings)-len(kept) {
+		t.Fatalf("omitted = %d, want %d", run.Coverage.Omitted, len(store.findings)-len(kept))
+	}
+	for i, finding := range kept {
+		if finding.IncidentID != store.findings[i].IncidentID {
+			t.Fatalf("kept[%d] = %q, want newest %q", i, finding.IncidentID, store.findings[i].IncidentID)
+		}
 	}
 }
 
