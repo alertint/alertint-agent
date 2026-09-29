@@ -50,7 +50,7 @@ func TestInstanceSupplements_PerUniqueInstance(t *testing.T) {
 		alert(map[string]string{"instance": "db-01:9100", "job": "node"}), // dup
 		alert(map[string]string{"instance": "10.0.0.2:9100"}),
 	}
-	got := instanceSupplements(alerts, nil)
+	got := instanceSupplements(alerts, nil, nil)
 	// One matcher per UNIQUE instance, each a bare {instance="X"} (AE7).
 	want := []string{`{instance="db-01:9100"}`, `{instance="10.0.0.2:9100"}`}
 	if len(got) != len(want) {
@@ -70,11 +70,11 @@ func TestInstanceSupplements_PerUniqueInstance(t *testing.T) {
 func TestRenderPhysicalCore_DropsLogicalKeys(t *testing.T) {
 	// service is logical and exists on no series → physical-core drops it (AE8).
 	shared := map[string][]string{"namespace": {"checkout"}, "pod": {"api-7f9x"}, "service": {"checkout-api"}}
-	if got := renderPhysicalCore(shared, nil); got != `{namespace="checkout",pod="api-7f9x"}` {
+	if got := renderPhysicalCore(shared, nil, nil); got != `{namespace="checkout",pod="api-7f9x"}` {
 		t.Errorf("got %q", got)
 	}
 	// No logical key → no distinct retry.
-	if got := renderPhysicalCore(map[string][]string{"namespace": {"checkout"}}, nil); got != "" {
+	if got := renderPhysicalCore(map[string][]string{"namespace": {"checkout"}}, nil, nil); got != "" {
 		t.Errorf("no-logical-key must yield empty retry, got %q", got)
 	}
 }
@@ -323,6 +323,17 @@ func TestFetchMetrics_K8sSelectorFetches(t *testing.T) {
 	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, alerts, time.Now(), "inc1", nil)
 	if enr == nil || enr.Outcome != OutcomeFetched || len(enr.Snapshots) != 1 {
 		t.Fatalf("want fetched with 1 snapshot, got %+v", enr)
+	}
+}
+
+func TestFetchMetrics_LabelMapUsesSeriesLabel(t *testing.T) {
+	alerts := []store.Alert{alert(map[string]string{"service": "payment"})}
+	f := &fakeProm{responses: map[string]json.RawMessage{
+		`{service_name="payment"}`: vector(s(map[string]string{"__name__": "service:span_error_ratio:5m", "service_name": "payment"}, "0.54")),
+	}}
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5, LabelMap: map[string]string{"service": "service_name"}}, alerts, time.Now(), "payment", nil)
+	if len(f.calls) != 1 || f.calls[0] != `{service_name="payment"}` || enr.Outcome != OutcomeFetched {
+		t.Fatalf("calls = %v, enrichment = %+v", f.calls, enr)
 	}
 }
 

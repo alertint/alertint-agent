@@ -235,14 +235,15 @@ type VerificationConfig struct {
 // an omitted key (nil) means "on when base_url is set", an explicit value is
 // honored either way. Resolve it via Config.PrometheusEnabled, never directly.
 type PrometheusConfig struct {
-	Enabled             *bool  `yaml:"enabled,omitempty"`
-	InstanceID          string `yaml:"instance_id,omitempty"`
-	BaseURL             string `yaml:"base_url"`
-	BearerTokenEnv      string `yaml:"bearer_token_env,omitempty"`
-	OrgID               string `yaml:"org_id,omitempty"` // optional X-Scope-OrgID (multi-tenant Mimir/Cortex only)
-	TimeoutSeconds      int    `yaml:"timeout_seconds"`
-	DefaultRangeMinutes int    `yaml:"default_range_minutes"`
-	MaxSeries           int    `yaml:"max_series"` // server-side per-query series cap for metric enrichment
+	Enabled             *bool             `yaml:"enabled,omitempty"`
+	InstanceID          string            `yaml:"instance_id,omitempty"`
+	BaseURL             string            `yaml:"base_url"`
+	BearerTokenEnv      string            `yaml:"bearer_token_env,omitempty"`
+	OrgID               string            `yaml:"org_id,omitempty"` // optional X-Scope-OrgID (multi-tenant Mimir/Cortex only)
+	TimeoutSeconds      int               `yaml:"timeout_seconds"`
+	DefaultRangeMinutes int               `yaml:"default_range_minutes"`
+	MaxSeries           int               `yaml:"max_series"`          // server-side per-query series cap for metric enrichment
+	LabelMap            map[string]string `yaml:"label_map,omitempty"` // alert-label key → series-label key ("" = drop)
 }
 
 // LogsConfig configures the optional log-enrichment connector. When enabled,
@@ -1340,8 +1341,13 @@ func (c *Config) validateNotify() []string {
 
 func (c *Config) validatePrometheus() []string {
 	var errs []string
+	for key, value := range c.Prometheus.LabelMap {
+		if !selectorLabelNameRe.MatchString(key) || (value != "" && !selectorLabelNameRe.MatchString(value)) {
+			errs = append(errs, fmt.Sprintf("prometheus: label_map: %q: invalid label name (must match [a-zA-Z_][a-zA-Z0-9_]*)", key))
+		}
+	}
 	if !c.PrometheusEnabled() {
-		return nil
+		return errs
 	}
 	if strings.TrimSpace(c.Prometheus.BaseURL) == "" {
 		errs = append(errs, "prometheus.base_url is required when prometheus is enabled")

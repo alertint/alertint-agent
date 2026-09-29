@@ -129,6 +129,21 @@ The built-in allowlist is:
 
 `namespace`, `service`, `job`, `pod`, `container`, `instance`
 
+If an alert uses a different label name from its metric series, map the alert
+label to the series label with `prometheus.label_map`. For example, OTel series
+may use `service_name` while the alert uses `service`:
+
+```yaml
+prometheus:
+  label_map:
+    service: service_name
+```
+
+This makes the evidence selector and verification floor use
+`{service_name="payment"}` for an alert labeled `service=payment`. An empty
+target drops a label. The floor's `up` ratio still needs `up` to carry the
+mapped label to compare the intended peers.
+
 #### Multi-cluster setups: `triage.extra_selector_labels`
 
 If one Prometheus/Mimir serves alerts from more than one cluster, `cluster`
@@ -242,6 +257,7 @@ prometheus:
   # org_id: tenant-1                         # only for multi-tenant Mimir/Cortex
   timeout_seconds: 10                        # default
   default_range_minutes: 60                  # default
+  # label_map: {service: service_name}       # alert label → metric series label
 ```
 
 Enablement is presence-based: setting `base_url` turns the connector on
@@ -264,6 +280,7 @@ Querier component, not a Sidecar or Store Gateway.
 | `org_id` | Optional. Tenant/org ID sent as the `X-Scope-OrgID` header on every query — required by multi-tenant Grafana Mimir and Cortex. Omit for vanilla Prometheus. |
 | `timeout_seconds` | HTTP timeout for Prometheus queries. Default: `10`. |
 | `default_range_minutes` | Default lookback window for range queries. Default: `60`. |
+| `label_map` | Optional alert-label to series-label names for evidence and verification queries; `""` drops a label. |
 
 ### Authentication
 

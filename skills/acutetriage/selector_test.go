@@ -37,6 +37,46 @@ func TestAllowedSelectorKeys_ExtendsBuiltins(t *testing.T) {
 	}
 }
 
+func TestTranslateSelector(t *testing.T) {
+	sel := map[string][]string{"service": {"payment", "checkout"}, "service_name": {"payment"}, "job": {"api"}}
+	want := map[string][]string{"service_name": {"checkout", "payment"}}
+	got := translateSelector(sel, map[string]string{"service": "service_name", "job": ""})
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("translateSelector = %v, want %v", got, want)
+	}
+	cloned := translateSelector(sel, nil)
+	if !reflect.DeepEqual(cloned, sel) {
+		t.Fatalf("nil map changed selector: %v", cloned)
+	}
+	cloned["service"][0] = "changed"
+	if sel["service"][0] == "changed" {
+		t.Fatal("translation aliased input values")
+	}
+}
+
+func TestRenderPhysicalCore_KeepsMappedSource(t *testing.T) {
+	shared := map[string][]string{"service": {"payment"}, "job": {"api"}}
+	got := renderPhysicalCore(shared, nil, map[string]string{"service": "service_name"})
+	if got != `{service_name="payment"}` {
+		t.Fatalf("physical core = %q", got)
+	}
+}
+
+func TestRenderPhysicalCore_KeepsMappedTarget(t *testing.T) {
+	shared := map[string][]string{"service": {"payment"}, "job": {"api"}, "namespace": {"prod"}, "noise": {"x"}}
+	got := renderPhysicalCore(shared, nil, map[string]string{"service": "job"})
+	if got != `{job=~"api|payment",namespace="prod"}` {
+		t.Fatalf("physical core = %q", got)
+	}
+}
+
+func TestParentScope_LabelMap(t *testing.T) {
+	got := parentScope([]store.Alert{alertWithLabels(map[string]string{"service": "payment"})}, nil, map[string]string{"service": "service_name"})
+	if got != `{service_name="payment"}` {
+		t.Fatalf("parent scope = %q", got)
+	}
+}
+
 func TestBuildMetricSelector_ExtraIncluded(t *testing.T) {
 	sel := buildMetricSelector(clusterAlerts(), []string{"cluster"})
 	if !reflect.DeepEqual(sel["cluster"], []string{"eu-west"}) {
@@ -67,7 +107,7 @@ func TestRenderPhysicalCore_KeepsExtras(t *testing.T) {
 		"namespace": {"payments"},
 		"service":   {"checkout"}, // logical: shed by the retry
 	}
-	got := renderPhysicalCore(shared, []string{"cluster"})
+	got := renderPhysicalCore(shared, []string{"cluster"}, nil)
 	want := `{cluster="eu-west",namespace="payments"}`
 	if got != want {
 		t.Fatalf("got %q want %q", got, want)
@@ -78,7 +118,7 @@ func TestRenderPhysicalCore_NoLogicalKey_NoRetry(t *testing.T) {
 	// Nothing to shed (cluster is an extra, namespace physical) → "" means
 	// "retry would equal the primary, skip it".
 	shared := map[string][]string{"cluster": {"eu-west"}, "namespace": {"payments"}}
-	if got := renderPhysicalCore(shared, []string{"cluster"}); got != "" {
+	if got := renderPhysicalCore(shared, []string{"cluster"}, nil); got != "" {
 		t.Fatalf("want no-op retry, got %q", got)
 	}
 }
@@ -87,7 +127,7 @@ func TestInstanceSupplements_ExtrasANDed(t *testing.T) {
 	alerts := []store.Alert{
 		{Labels: map[string]string{"instance": "10.0.4.7:9100", "cluster": "eu-west"}},
 	}
-	got := instanceSupplements(alerts, map[string][]string{"cluster": {"eu-west"}})
+	got := instanceSupplements(alerts, map[string][]string{"cluster": {"eu-west"}}, nil)
 	want := []string{`{cluster="eu-west",instance="10.0.4.7:9100"}`}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v want %v", got, want)
@@ -98,10 +138,17 @@ func TestInstanceSupplements_NoExtras_Bare(t *testing.T) {
 	alerts := []store.Alert{
 		{Labels: map[string]string{"instance": "10.0.4.7:9100"}},
 	}
-	got := instanceSupplements(alerts, nil)
+	got := instanceSupplements(alerts, nil, nil)
 	want := []string{`{instance="10.0.4.7:9100"}`}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v want %v", got, want)
+	}
+}
+
+func TestInstanceSupplements_DroppedInstanceHasNoEmptyQuery(t *testing.T) {
+	alerts := []store.Alert{alertWithLabels(map[string]string{"instance": "db-01:9100"})}
+	if got := instanceSupplements(alerts, nil, map[string]string{"instance": ""}); len(got) != 0 {
+		t.Fatalf("dropped instance produced supplement %v", got)
 	}
 }
 
@@ -115,7 +162,7 @@ func TestExtraSelectorValues_PicksOnlyExtras(t *testing.T) {
 }
 
 func TestParentScope_ExtraIncluded(t *testing.T) {
-	got := parentScope(clusterAlerts(), []string{"cluster"})
+	got := parentScope(clusterAlerts(), []string{"cluster"}, nil)
 	want := `{cluster="eu-west",namespace="payments",service="checkout"}`
 	if got != want {
 		t.Fatalf("got %q want %q", got, want)
@@ -123,7 +170,7 @@ func TestParentScope_ExtraIncluded(t *testing.T) {
 }
 
 func TestParentScope_NoExtras_Unchanged(t *testing.T) {
-	got := parentScope(clusterAlerts(), nil)
+	got := parentScope(clusterAlerts(), nil, nil)
 	want := `{namespace="payments",service="checkout"}`
 	if got != want {
 		t.Fatalf("got %q want %q", got, want)

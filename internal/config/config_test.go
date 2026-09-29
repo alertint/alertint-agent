@@ -1299,3 +1299,44 @@ prometheus:
 		}
 	})
 }
+
+func TestLoad_PrometheusLabelMap(t *testing.T) {
+	yaml := strings.Replace(minimalValidYAML, "./alertint-agent.db", filepath.Join(t.TempDir(), "agent.db"), 1) + `
+prometheus:
+  base_url: http://localhost:9090
+  label_map:
+    service: service_name
+    job: ""
+`
+	cfg, err := Load(writeConfig(t, yaml))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Prometheus.LabelMap["service"] != "service_name" || cfg.Prometheus.LabelMap["job"] != "" {
+		t.Fatalf("label_map = %v", cfg.Prometheus.LabelMap)
+	}
+}
+
+func TestValidate_PrometheusLabelMap(t *testing.T) {
+	for _, tc := range []struct {
+		name, key, value, want string
+	}{
+		{"invalid key", "bad-key", "service_name", `prometheus: label_map: "bad-key": invalid label name (must match [a-zA-Z_][a-zA-Z0-9_]*)`},
+		{"invalid value", "service", "bad-value", `prometheus: label_map: "service": invalid label name (must match [a-zA-Z_][a-zA-Z0-9_]*)`},
+		{"drop", "job", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Defaults()
+			cfg.Prometheus.BaseURL = "http://localhost:9090"
+			cfg.Prometheus.LabelMap = map[string]string{tc.key: tc.value}
+			err := cfg.validatePrometheus()
+			if tc.want == "" {
+				if len(err) != 0 {
+					t.Fatalf("validatePrometheus = %v, want no errors", err)
+				}
+			} else if len(err) != 1 || err[0] != tc.want {
+				t.Fatalf("validatePrometheus = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}

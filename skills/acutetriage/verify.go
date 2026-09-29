@@ -38,6 +38,7 @@ type VerificationParams struct {
 	// ExtraSelectorLabels joins the floor's peer scope (ADR-0035): a peer
 	// ratio computed across the operator's partitions is not a peer ratio.
 	ExtraSelectorLabels []string
+	LabelMap            map[string]string
 	// HasPromQL / HasZabbix are presence flags stamped by the skill
 	// (verifyParams()), never parsed from config: they select which floor
 	// sources contribute (ADR-0034) and which query kinds the model may be
@@ -174,7 +175,7 @@ var broadScopeKeys = []string{"namespace", "service", "job"}
 // shared, so a host-only alert yields "" (unscoped — the caller falls back to
 // a global ratio) rather than a matcher that is really just the incident's
 // own target.
-func parentScope(alerts []store.Alert, extras []string) string {
+func parentScope(alerts []store.Alert, extras []string, labelMap map[string]string) string {
 	shared := sharedLabelValues(alerts)
 	scope := map[string][]string{}
 	for _, k := range mergeSelectorKeys(broadScopeKeys, extras) {
@@ -182,7 +183,7 @@ func parentScope(alerts []store.Alert, extras []string) string {
 			scope[k] = vs
 		}
 	}
-	return renderPromMatcher(scope)
+	return renderPromMatcher(translateSelector(scope, labelMap))
 }
 
 // composeFloor assembles the deterministic floor from the applicable floor
@@ -193,7 +194,7 @@ func parentScope(alerts []store.Alert, extras []string) string {
 func composeFloor(p VerificationParams, hostLabel string, alerts []store.Alert) []VerificationQuery {
 	var qs []VerificationQuery
 	if p.HasPromQL {
-		qs = append(qs, VerificationQuery{Kind: kindUpRatio, Source: "floor", Expr: parentScope(alerts, p.ExtraSelectorLabels),
+		qs = append(qs, VerificationQuery{Kind: kindUpRatio, Source: "floor", Expr: parentScope(alerts, p.ExtraSelectorLabels, p.LabelMap),
 			Why: "peer-scope health: is the wider world up?"})
 	}
 	if p.HasZabbix {

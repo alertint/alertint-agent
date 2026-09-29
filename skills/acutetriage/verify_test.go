@@ -133,7 +133,7 @@ func TestParentScopeBroadKeys(t *testing.T) {
 	alerts := []store.Alert{alertWithLabels(map[string]string{
 		"namespace": "paysvc-sandbox-staging", "pod": "stolon-0", "instance": "10.0.0.1:9100",
 	})}
-	if got := parentScope(alerts, nil); got != `{namespace="paysvc-sandbox-staging"}` {
+	if got := parentScope(alerts, nil, nil); got != `{namespace="paysvc-sandbox-staging"}` {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -141,7 +141,7 @@ func TestParentScopeBroadKeys(t *testing.T) {
 // Host-only alert → unscoped global ratio (spec R2).
 func TestParentScopeInstanceOnlyIsUnscoped(t *testing.T) {
 	alerts := []store.Alert{alertWithLabels(map[string]string{"instance": "10.0.0.1:9100"})}
-	if got := parentScope(alerts, nil); got != "" {
+	if got := parentScope(alerts, nil, nil); got != "" {
 		t.Fatalf("want unscoped, got %q", got)
 	}
 }

@@ -128,7 +128,7 @@ func extraSelectorValues(shared map[string][]string, extras []string) map[string
 // machines. extraSel empty (no extras configured or none shared) keeps the
 // pre-existing bare shape. The no-regression guard holds: the member alert
 // carries the extra label itself, so its own series still match.
-func instanceSupplements(alerts []store.Alert, extraSel map[string][]string) []string {
+func instanceSupplements(alerts []store.Alert, extraSel map[string][]string, labelMap map[string]string) []string {
 	instances := uniqueInstances(alerts)
 	out := make([]string, 0, len(instances))
 	for _, inst := range instances {
@@ -136,7 +136,9 @@ func instanceSupplements(alerts []store.Alert, extraSel map[string][]string) []s
 		for k, vs := range extraSel {
 			sel[k] = vs
 		}
-		out = append(out, renderPromMatcher(sel))
+		if matcher := renderPromMatcher(translateSelector(sel, labelMap)); matcher != "" {
+			out = append(out, matcher)
+		}
 	}
 	return out
 }
@@ -148,15 +150,20 @@ func instanceSupplements(alerts []store.Alert, extraSel map[string][]string) []s
 // that alerting rules attach but that exist on no series. Returns "" when the
 // shared selector has no built-in logical key — a retry would then equal the
 // primary, so there is nothing to rescue.
-func renderPhysicalCore(shared map[string][]string, extras []string) string {
+func renderPhysicalCore(shared map[string][]string, extras []string, labelMap map[string]string) string {
 	extraSet := make(map[string]bool, len(extras))
 	for _, k := range extras {
 		extraSet[k] = true
 	}
+	for _, target := range labelMap {
+		if target != "" {
+			extraSet[target] = true
+		}
+	}
 	core := make(map[string][]string)
 	hasLogical := false
 	for k, vs := range shared {
-		if metricPhysicalKeys[k] || extraSet[k] {
+		if metricPhysicalKeys[k] || extraSet[k] || labelMap[k] != "" {
 			core[k] = vs
 		} else {
 			hasLogical = true
@@ -165,7 +172,7 @@ func renderPhysicalCore(shared map[string][]string, extras []string) string {
 	if !hasLogical {
 		return ""
 	}
-	return renderPromMatcher(core)
+	return renderPromMatcher(translateSelector(core, labelMap))
 }
 
 // memberLabelPairs collects every non-empty (key,value) label pair across all
@@ -351,6 +358,7 @@ type MetricParams struct {
 	TimeoutSeconds      int
 	MaxSeries           int      // server-side per-query series cap (0 = unbounded)
 	ExtraSelectorLabels []string // operator-configured allowlist extension (ADR-0035)
+	LabelMap            map[string]string
 }
 
 // metricQuerier is the narrow read surface FetchMetrics needs. *prometheus.Client
@@ -410,8 +418,8 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 	shared := buildMetricSelector(alerts, params.ExtraSelectorLabels)
 	logDroppedSelectorKeys(ctx, logger, "metrics", alerts, params.ExtraSelectorLabels, incidentID)
 	extraSel := extraSelectorValues(shared, params.ExtraSelectorLabels)
-	primary := renderPromMatcher(shared)
-	physicalFallback := renderPhysicalCore(shared, params.ExtraSelectorLabels)
+	primary := renderPromMatcher(translateSelector(shared, params.LabelMap))
+	physicalFallback := renderPhysicalCore(shared, params.ExtraSelectorLabels, params.LabelMap)
 
 	// Ordered, deduped scope list: primary first (it alone gets the retry), then
 	// the per-instance supplements not already equal to the primary, capped at
@@ -423,7 +431,7 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 		scopes = append(scopes, primary)
 		seen[primary] = true
 	}
-	supplements := instanceSupplements(alerts, extraSel)
+	supplements := instanceSupplements(alerts, extraSel, params.LabelMap)
 	added := 0
 	for _, sup := range supplements {
 		if seen[sup] {
