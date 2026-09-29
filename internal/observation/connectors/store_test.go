@@ -19,7 +19,6 @@ var errBoom = errors.New("boom")
 type fakeLocalStore struct {
 	situations []model.LocalSituationSummary
 	findings   []model.LocalFinding
-	lifecycle  []model.SourceLifecycleObservation
 	err        error
 }
 
@@ -35,13 +34,6 @@ func (f *fakeLocalStore) RecentFindingsForGroup(ctx context.Context, groupKey st
 		return nil, f.err
 	}
 	return f.findings, nil
-}
-
-func (f *fakeLocalStore) SourceLifecycleObservations(ctx context.Context, situationID, horizonTier string) ([]model.SourceLifecycleObservation, error) {
-	if f.err != nil {
-		return nil, f.err
-	}
-	return f.lifecycle, nil
 }
 
 type noopRecorder struct{ calls int }
@@ -143,13 +135,6 @@ func TestStoreReadExecutorConfirmedEmptyWithNoRows(t *testing.T) {
 
 func TestStoreReadExecutorOmitsLifecycleCopy(t *testing.T) {
 	store := &fakeLocalStore{}
-	for i := 0; i < 500; i++ {
-		store.lifecycle = append(store.lifecycle, model.SourceLifecycleObservation{
-			AlertID: fmt.Sprintf("alert-%03d", i), State: "firing",
-			ObservedAt:      time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC),
-			AcquisitionMode: "webhook", DeadlineAt: time.Date(2026, 9, 2, 10, 0, 0, 0, time.UTC),
-		})
-	}
 	plan := testStorePlan()
 	plan.Phase = model.PhaseLifecycle
 	plan.Parameters = json.RawMessage(`{"group_key":"service=checkout","situation_id":"situation-1"}`)

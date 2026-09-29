@@ -1188,20 +1188,25 @@ func (c *Controller) resolveLifecycle(cur model.Situation, in SnapshotInput, sna
 	}
 }
 
-// reduceSourceLifecycle folds prepared observations and authoritative latest
-// deliveries across in's expected member Alerts, or returns zero when no
-// preparation cycle exists yet for this input (in.Prepared.CycleID == "") —
-// resolveLifecycle's prepared branch only ever runs once a cycle exists, so
-// an unpopulated fold is never consulted in that case.
+// reduceSourceLifecycle folds prepared observations and each member's latest
+// deliveries by receive time and source episode time. The receive-time pick
+// preserves the former store_read lifecycle copy's selection when source
+// start time is missing. A missing preparation cycle returns zero; the
+// prepared branch of resolveLifecycle never consults that unpopulated fold.
 func reduceSourceLifecycle(cfg ControllerConfig, in SnapshotInput, now time.Time) SourceLifecycle {
 	if in.Prepared.CycleID == "" {
 		return SourceLifecycle{}
 	}
 	latest := make(map[string]Delivery, len(in.Deliveries))
+	receiptLatest := make(map[string]Delivery, len(in.Deliveries))
 	for _, d := range in.Deliveries {
 		id := d.AlertID
 		if id == "" {
 			id = "delivery:" + d.ID
+		}
+		received, receivedOK := receiptLatest[id]
+		if !receivedOK || d.ReceivedAt.After(received.ReceivedAt) || (d.ReceivedAt.Equal(received.ReceivedAt) && d.ID > received.ID) {
+			receiptLatest[id] = d
 		}
 		cur, ok := latest[id]
 		newer := deliveryLess(cur, d)
@@ -1214,9 +1219,7 @@ func reduceSourceLifecycle(cfg ControllerConfig, in SnapshotInput, now time.Time
 			latest[id] = d
 		}
 	}
-	observations := make([]SourceObservation, 0, len(in.Prepared.Lifecycle)+len(latest))
-	observations = append(observations, in.Prepared.Lifecycle...)
-	for id, d := range latest {
+	toObservation := func(id string, d Delivery) SourceObservation {
 		// Receipt time is when this delivery was observed, not this cycle's
 		// now: newer prepared source evidence must still supersede it.
 		deadline := d.ReceivedAt.Add(observationmodel.LifecycleHorizon(observationmodel.WidestHorizonTier(in.Prepared.ProfileGuidance)))
@@ -1225,12 +1228,22 @@ func reduceSourceLifecycle(cfg ControllerConfig, in SnapshotInput, now time.Time
 				deadline = observed.DeadlineAt
 			}
 		}
-		observations = append(observations, SourceObservation{
+		return SourceObservation{
 			AlertID: id, EpisodeKey: d.EpisodeKey, Source: d.Source, DeadlineAt: deadline,
 			State: string(d.Status), ObservedAt: d.ReceivedAt,
 			EventStartedAt: d.SourceStartedAt, EventResolvedAt: d.SourceResolvedAt,
 			AcquisitionMode: d.AcquisitionMode, PollIntervalSeconds: d.PollIntervalSeconds,
-		})
+		}
+	}
+	observations := make([]SourceObservation, 0, len(in.Prepared.Lifecycle)+len(receiptLatest)+len(latest))
+	observations = append(observations, in.Prepared.Lifecycle...)
+	for id, d := range receiptLatest {
+		observations = append(observations, toObservation(id, d))
+	}
+	for id, d := range latest {
+		if receiptLatest[id].ID != d.ID {
+			observations = append(observations, toObservation(id, d))
+		}
 	}
 	return ReduceSourceLifecycle(observations, expectedAlertIDs(in.Deliveries), now, cfg.WebhookRecoveryGrace)
 }

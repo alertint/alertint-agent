@@ -456,27 +456,6 @@ type RunRecord struct {
 	RequestsUnknown   int
 }
 
-// SourceLifecycleObservation is one member Alert's authoritative lifecycle
-// observation as the store_read lifecycle phase emits it (fact kind
-// "source_lifecycle", Value = JSON array of these). Its JSON shape is
-// exactly internal/situation.SourceObservation's, so the controller's
-// reload decodes it without this package ever importing internal/situation.
-type SourceLifecycleObservation struct {
-	AlertID             string     `json:"alert_id"`
-	EpisodeKey          string     `json:"episode_key"`
-	Source              string     `json:"source"`
-	State               string     `json:"state"`
-	ObservedAt          time.Time  `json:"observed_at"`
-	EventStartedAt      *time.Time `json:"event_started_at,omitempty"`
-	EventResolvedAt     *time.Time `json:"event_resolved_at,omitempty"`
-	TimeBasis           string     `json:"time_basis,omitempty"`
-	AcquisitionMode     string     `json:"acquisition_mode"`
-	PollIntervalSeconds int        `json:"poll_interval_seconds,omitempty"`
-	DeadlineAt          time.Time  `json:"deadline_at"`
-	HorizonTier         string     `json:"horizon_tier,omitempty"`
-	EvidenceRefs        []string   `json:"evidence_refs,omitempty"`
-}
-
 // Lifecycle horizon tiers (spec.md "Normalized evidence and lifecycle"):
 // the default unknown horizon is 24 h; a profile may widen to hours (24 h)
 // or days (7 d), never shorten the baseline.
