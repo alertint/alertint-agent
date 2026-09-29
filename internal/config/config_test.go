@@ -108,6 +108,15 @@ func TestLoad_MinimalValidConfig(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsSlackAPIBaseURL(t *testing.T) {
+	yaml := strings.Replace(minimalValidYAML, "./alertint-agent.db", filepath.Join(t.TempDir(), "agent.db"), 1)
+	yaml = strings.Replace(yaml, "    enabled: false", "    enabled: true\n    bot_token_env: SLACK_BOT_TOKEN\n    channel: C-test\n    api_base_url: http://example.test", 1)
+	_, err := Load(writeConfig(t, yaml))
+	if err == nil || !strings.Contains(err.Error(), "api_base_url") {
+		t.Fatalf("Load = %v, want unknown Slack API URL key", err)
+	}
+}
+
 func TestLoad_AppliesDefaultsForOmittedFields(t *testing.T) {
 	yaml := `
 receivers:

@@ -91,6 +91,14 @@ A published Situation owns exactly **one** main-channel message — its
   change, rendered from that change alone — never from the newest state.
   Entries are non-broadcast replies: they stay in the thread.
 
+The root shows up to five distinct alert identities. When there are more,
+it states the omitted count and says “Slack message limit reached for this
+card; see the full list in MCP.” The complete list remains in the Situation
+record. A final check keeps the entire root under our 4,000-byte text bound
+and the 50-block limit; unusually long source text produces a compact card
+with the current status, next action, and MCP lookup. Correlation replies
+also show a short alert sample and point to MCP when the list is longer.
+
 Journal entries are created for first publication, material investigation
 changes and conclusions, operator-contract changes, recovery pending,
 recovery refire, recovery, closure with uncertainty, and operator
@@ -195,13 +203,21 @@ database transaction open across a Slack call.
   commonest way to reach it
   is to **delete a Situation's root message in Slack by hand**: every later
   edit of that root then comes back `message_not_found`, and the root effect
-  parks in `failed`. It is never retried on its own, and effects that wait
+  parks in `failed`. It is not retried on its own, and effects that wait
   on that root stay pending behind it rather than failing in a chain.
   `failed` effects are visible in the durable ledger and over MCP alongside
   every other delivery outcome, so a Situation that stops updating in Slack
   is diagnosable rather than silent.
 
-  **Honest limitation:** redriving a `failed` effect is a Store operation
+  **Oversized-root upgrade recovery:** the first start with the bounded root
+  renderer returns a current `root_sync` that previously failed with
+  `msg_too_long` to the ordinary delivery queue. It keeps the same intent
+  identity and attempt history. Other failed intents stay failed; a newer
+  root projection supersedes an older failed root as usual. The upgrade
+  requeue runs once per database, so a new `msg_too_long` after the upgrade
+  remains visible as a failure rather than looping forever.
+
+  **Honest limitation:** redriving any other `failed` effect is a Store operation
   (`RedriveFailedNotificationIntent`) with **no operator-facing command in
   front of it yet** — recovering one today means direct database access or a
   small program against the Store, not a CLI flag. Deleting a Situation's

@@ -207,6 +207,34 @@ func canonicalMembers(b *model.OperatorBriefing) string {
 	return strings.Join(lines, "\n")
 }
 
+// Root cards and correlation replies both fit Slack's whole-message limit by
+// showing a short member sample and directing operators to MCP for the rest.
+func canonicalRootMembers(b *model.OperatorBriefing) (string, bool) {
+	const shown = 5
+	var lines []string
+	for i, a := range b.Alerts {
+		if i == shown {
+			break
+		}
+		symbol, state := "·", "state unavailable"
+		switch a.State {
+		case "firing":
+			symbol, state = "🔸", "firing"
+		case "resolved":
+			symbol, state = "🔹", "resolved"
+		}
+		lines = append(lines, symbol+" "+briefingText(canonicalAlertName(a), 180)+" · "+state)
+	}
+	omitted := b.AlertsOmitted
+	if len(b.Alerts) > shown {
+		omitted += len(b.Alerts) - shown
+	}
+	if omitted > 0 {
+		lines = append(lines, fmt.Sprintf("%d more — Slack message limit reached for this card; see the full list in MCP.", omitted))
+	}
+	return strings.Join(lines, "\n"), omitted > 0
+}
+
 func canonicalElapsed(start, end time.Time) string {
 	if start.IsZero() || end.IsZero() {
 		return "unavailable"
@@ -356,7 +384,8 @@ func renderCanonicalRoot(in SituationRootInput) RenderedMessage {
 		activity := canonicalNext(t, b, in.Now)
 		lines = append(lines, activity)
 	}
-	lines = append(lines, counts, canonicalMembers(b))
+	members, omitted := canonicalRootMembers(b)
+	lines = append(lines, counts, members)
 	if action := briefingAction(b, t); action != "" {
 		lines = append(lines, "*Action:* "+action)
 	}
@@ -369,7 +398,7 @@ func renderCanonicalRoot(in SituationRootInput) RenderedMessage {
 	} else {
 		lines = append(lines, strings.Join(canonicalTimings(t, b, in.Summary.EffectiveStartedAt, in.Now, true, false), "\n"))
 	}
-	if t.Lifecycle.Terminal() {
+	if t.Lifecycle.Terminal() || omitted {
 		lines = append(lines, canonicalMCP(in.Summary))
 	}
 	var blocks []slacklib.Block
