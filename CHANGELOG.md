@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Prometheus alert bookkeeping series no longer count as metric evidence or
+  prevent a physical-core retry from finding application metrics.
+
 ## [0.14.1] - 2026-09-29
 
 ### Fixed

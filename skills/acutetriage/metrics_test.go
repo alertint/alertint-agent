@@ -87,6 +87,19 @@ func s(metric map[string]string, val string) map[string]any {
 	return map[string]any{"metric": metric, "value": []any{0.0, val}}
 }
 
+func TestRankSeries_ExcludesAlertBookkeepingOnly(t *testing.T) {
+	raw := vector(
+		s(map[string]string{"__name__": "ALERTS", "service": "payment"}, "1"),
+		s(map[string]string{"__name__": "ALERTS_FOR_STATE", "service": "payment"}, "123"),
+		s(map[string]string{"__name__": "ALERTS_x", "service": "payment"}, "2"),
+		s(map[string]string{"__name__": "service:span_error_ratio:5m", "service": "payment"}, "0.54"),
+	)
+	got := rankSeries(raw, memberLabelPairs([]store.Alert{alert(map[string]string{"service": "payment"})}), 10)
+	if len(got) != 2 || got[0].Metric != "ALERTS_x" || got[1].Metric != "service:span_error_ratio:5m" {
+		t.Fatalf("want real series and ALERTS_x only, got %+v", got)
+	}
+}
+
 func TestRankSeries_OverlapPreferredWithDeterministicTiebreak(t *testing.T) {
 	// A member carries pod=api-7f9x; series also carrying that pod outrank
 	// unrelated same-namespace series (AE11). System metrics are filtered.
@@ -325,6 +338,49 @@ func TestFetchMetrics_PhysicalCoreRetry(t *testing.T) {
 	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, alerts, time.Now(), "inc1", nil)
 	if enr.Outcome != OutcomeFetched || len(enr.Snapshots) != 1 {
 		t.Fatalf("physical-core retry should recover metrics, got %+v", enr)
+	}
+}
+
+func TestFetchMetrics_AlertBookkeepingTriggersPhysicalCoreRetry(t *testing.T) {
+	alerts := []store.Alert{alert(map[string]string{
+		"alertname": "ServiceErrorRateHigh", "service": "payment",
+		"service_name": "payment", "severity": "critical",
+	})}
+	f := &fakeProm{responses: map[string]json.RawMessage{
+		`{service="payment",service_name="payment"}`: vector(
+			s(map[string]string{"__name__": "ALERTS", "service": "payment", "service_name": "payment"}, "1"),
+			s(map[string]string{"__name__": "ALERTS_FOR_STATE", "service": "payment", "service_name": "payment"}, "123"),
+		),
+		`{service_name="payment"}`: vector(
+			s(map[string]string{"__name__": "service:span_error_ratio:5m", "service_name": "payment"}, "0.54"),
+		),
+	}}
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5, ExtraSelectorLabels: []string{"service_name"}}, alerts, time.Now(), "payment", nil)
+	if len(f.calls) != 2 || f.calls[0] != `{service="payment",service_name="payment"}` || f.calls[1] != `{service_name="payment"}` {
+		t.Fatalf("want primary then physical-core fallback, got calls %v", f.calls)
+	}
+	if enr.Outcome != OutcomeFetched || len(enr.Snapshots) != 1 || enr.Snapshots[0].Metric != "service:span_error_ratio:5m" {
+		t.Fatalf("want only the real metric as fetched evidence, got %+v", enr)
+	}
+}
+
+func TestFetchMetrics_AlertBookkeepingWithoutFallbackIsEmpty(t *testing.T) {
+	alerts := []store.Alert{alert(map[string]string{
+		"alertname": "ServiceErrorRateHigh", "service": "payment",
+		"service_name": "payment", "severity": "critical",
+	})}
+	f := &fakeProm{responses: map[string]json.RawMessage{
+		`{service="payment"}`: vector(
+			s(map[string]string{"__name__": "ALERTS", "service": "payment"}, "1"),
+			s(map[string]string{"__name__": "ALERTS_FOR_STATE", "service": "payment"}, "123"),
+		),
+	}}
+	enr := FetchMetrics(context.Background(), f, MetricParams{TimeoutSeconds: 5}, alerts, time.Now(), "payment", nil)
+	if len(f.calls) != 1 || f.calls[0] != `{service="payment"}` {
+		t.Fatalf("want only the primary scope, got calls %v", f.calls)
+	}
+	if enr.Outcome != OutcomeEmpty || enr.Note != "no metric series matched the incident selector" || len(enr.Snapshots) != 0 {
+		t.Fatalf("want empty outcome and no alert bookkeeping evidence, got %+v", enr)
 	}
 }
 

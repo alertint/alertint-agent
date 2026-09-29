@@ -26,6 +26,10 @@ var metricPhysicalKeys = map[string]bool{
 	"namespace": true, "pod": true, "container": true, "instance": true,
 }
 
+var alertBookkeepingMetrics = map[string]bool{
+	"ALERTS": true, "ALERTS_FOR_STATE": true,
+}
+
 // buildMetricSelector builds the incident's generic metric selector: for each
 // allowlisted label key present with a value on EVERY member alert, the distinct
 // values that key takes across members, unioned. This is exactly the log-selector
@@ -189,8 +193,9 @@ type MetricSnapshot struct {
 }
 
 // rankSeries parses a Prometheus instant-vector data blob (the "data" field of
-// the API envelope), filters system metrics, and returns at most limit snapshots
-// ranked by (overlap desc, metric asc, numeric-value desc within family,
+// the API envelope), filters system metrics and alert bookkeeping series, and
+// returns at most limit snapshots ranked by (overlap desc, metric asc,
+// numeric-value desc within family,
 // series-identity asc) — a total, response-order-independent order (R5/R11,
 // ADR-0025). overlap counts a series' (k,v) label pairs (excluding __name__)
 // that a member alert also carries.
@@ -215,7 +220,7 @@ func rankSeries(raw json.RawMessage, memberPairs map[string]bool, limit int) []M
 	cands := make([]cand, 0, len(d.Result))
 	for _, r := range d.Result {
 		name := r.Metric["__name__"]
-		if name == "" || isSystemMetric(name) {
+		if name == "" || isSystemMetric(name) || alertBookkeepingMetrics[name] {
 			continue
 		}
 		val, ok := r.Value[1].(string)
@@ -479,7 +484,8 @@ func FetchMetrics(ctx context.Context, prom metricQuerier, params MetricParams, 
 			continue
 		}
 		ranked := rankSeries(data, memberPairs, maxSnapshotsPerScope)
-		// R9 physical-core rescue — primary scope only, when it matched nothing and
+		// R9 physical-core rescue — primary scope only, when no usable series
+		// remain (including when only alert bookkeeping series matched) and
 		// dropping the logical keys yields a distinct selector.
 		if i == 0 && scope == primary && len(ranked) == 0 && physicalFallback != "" && physicalFallback != primary {
 			data2, err2 := queryScope(physicalFallback)
