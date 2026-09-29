@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Findings with no fetched model or operator metric checks identify their cause
+  as unconfirmed in the stored headline and Finding.
+
 ### Fixed
 
 - Prometheus alert bookkeeping series no longer count as metric evidence or

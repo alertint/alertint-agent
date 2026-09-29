@@ -76,6 +76,10 @@ the draft, revise; don't defend it. The result is the finding that persists —
 confidence caps and the memory verdict apply to this final judgment, not the
 draft.
 
+When a metric source is configured and verification runs but no model or
+operator metric check returns data, the stored headline and Finding begin with
+"Unconfirmed". The raw model reply remains available unchanged.
+
 ### Locally invalid PromQL
 
 Every PromQL check this pipeline runs is parsed locally before it can

@@ -565,6 +565,78 @@ func TestAnyUnfetched_IncidentsInWindowOnlyCountsAsUnfetched(t *testing.T) {
 	}
 }
 
+func TestCauseUnconfirmed(t *testing.T) {
+	case014 := &VerificationEnrichment{Rounds: []VerificationRound{{Queries: []VerificationQuery{
+		{Source: "model", Kind: kindPromQL, Outcome: OutcomeEmpty},
+		{Source: "model", Kind: kindPromQL, Outcome: OutcomeEmpty},
+		{Source: "model", Kind: kindPromQL, Outcome: OutcomeEmpty},
+		{Source: "model", Kind: kindIncidentsInWindow, Outcome: OutcomeFetched},
+		{Source: "floor", Kind: kindUpRatio, Outcome: OutcomeEmpty},
+		{Source: "floor", Kind: kindIncidentsInWindow, Outcome: OutcomeFetched},
+	}}}}
+	tests := []struct {
+		name            string
+		ver             *VerificationEnrichment
+		hasMetricSource bool
+		want            bool
+	}{
+		{"case-014", case014, true, true},
+		{"model metric fetched", &VerificationEnrichment{Rounds: []VerificationRound{{Queries: []VerificationQuery{
+			{Source: "model", Kind: kindPromQL, Outcome: OutcomeFetched},
+		}}}}, true, false},
+		{"operator metric fetched", &VerificationEnrichment{Rounds: []VerificationRound{{Queries: []VerificationQuery{
+			{Source: "operator", Kind: kindPromQL, Outcome: OutcomeFetched},
+		}}}}, true, false},
+		{"floor up ratio alone does not test cause", &VerificationEnrichment{Rounds: []VerificationRound{{Queries: []VerificationQuery{
+			{Source: "floor", Kind: kindUpRatio, Outcome: OutcomeFetched},
+		}}}}, true, true},
+		{"no verification", nil, true, false},
+		{"no metric source", case014, false, false},
+		{"degraded with nothing fetched", &VerificationEnrichment{Outcome: "degraded", Rounds: []VerificationRound{{Queries: []VerificationQuery{
+			{Source: "model", Kind: kindPromQL, Outcome: OutcomeDegraded},
+			{Source: "floor", Kind: kindUpRatio, Outcome: OutcomeFailed},
+		}}}}, true, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := causeUnconfirmed(tc.ver, tc.hasMetricSource); got != tc.want {
+				t.Errorf("causeUnconfirmed = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLabelUnconfirmedCause(t *testing.T) {
+	tests := []struct {
+		name         string
+		analysisName string
+		overallIssue string
+		wantName     string
+		wantIssue    string
+	}{
+		{"plain", "Payment token failure", "auth defect", "Unconfirmed: Payment token failure", "Unconfirmed (no metric check returned data): auth defect"},
+		{"already labeled any case", "UNCONFIRMED: Payment token failure", "Unconfirmed (no metric check returned data): auth defect", "UNCONFIRMED: Payment token failure", "Unconfirmed (no metric check returned data): auth defect"},
+		{"one field labeled", "Unconfirmed: Payment token failure", "auth defect", "Unconfirmed: Payment token failure", "Unconfirmed (no metric check returned data): auth defect"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := llmResponse{
+				AnalysisName: tc.analysisName, OverallIssue: tc.overallIssue,
+				Severity: "high", Confidence: 0.68,
+				CorrelationFindings: []string{"checkout also failing"},
+				MemoryVerdict:       "silent", OperatorRuling: json.RawMessage(`{"ruling":"unverifiable"}`),
+			}
+			want := resp
+			want.AnalysisName, want.OverallIssue = tc.wantName, tc.wantIssue
+			labelUnconfirmedCause(&resp)
+			labelUnconfirmedCause(&resp)
+			if !reflect.DeepEqual(resp, want) {
+				t.Errorf("labeled response = %+v, want %+v", resp, want)
+			}
+		})
+	}
+}
+
 func TestVerificationLive(t *testing.T) {
 	if verificationLive(nil) {
 		t.Fatal("nil enrichment must not be live")

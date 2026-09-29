@@ -415,6 +415,10 @@ func (s *Skill) analyzeCore(ctx context.Context, inc store.Incident, alerts []st
 	// it passed nil — only this deterministic post-call cap sees verification).
 	s.applyEvidenceCap(&resp, decision, ar.metrics, ar.logs, ar.changes, ar.sentry, ar.zabbix, ver, inc.ID)
 	s.applySteeringCap(&resp, governingOf(ar.memory), ver, inc.ID)
+	if vp := s.verifyParams(); causeUnconfirmed(ver, vp.HasPromQL || vp.HasZabbix) {
+		labelUnconfirmedCause(&resp)
+		s.logger.Info("acutetriage: cause unconfirmed: no metric check returned data", "incident", inc.ID)
+	}
 
 	// enrichmentJSON is what a successful persist stores, including the
 	// log-enrichment snapshot so the evidence pack can replay exactly what the

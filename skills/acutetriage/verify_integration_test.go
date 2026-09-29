@@ -242,6 +242,45 @@ func verifyConfig(prom *promclient.Client) acutetriage.Config {
 	}
 }
 
+func TestUnconfirmedCauseLabelsStoredFindingWithoutChangingModelOutput(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	inc := insertTestIncident(t, st, ctx)
+	insertTestAlert(t, st, ctx, inc.ID, "fp-payment", map[string]string{
+		"alertname": "ServiceErrorRateHigh", "service": "payment", "severity": "critical",
+	})
+
+	final := callTwoResp(t, "Payment token failure", "payment auth defect affecting gold-tier users", 0.68, "")
+	scripted := &scriptedLLM{responses: []scriptResp{
+		{raw: draftResp(t, "Payment token failure", "payment auth defect affecting gold-tier users", 0.82, []map[string]any{
+			{"kind": "promql", "expr": "payment_requests_total", "why": "check traffic"},
+			{"kind": "promql", "expr": "payment_error_rate", "why": "check failures"},
+			{"kind": "promql", "expr": "payment_token_failures_total", "why": "check tokens"},
+		})},
+		{raw: final},
+	}}
+	prom := promServer(t, func(string) (int, string) { return 200, vectorEmpty })
+	skill := acutetriage.New(verifyConfig(prom), st, scripted, nil, nil, nil)
+	if err := skill.Run(ctx, inc); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	f := readFinding(t, st, inc.ID)
+	var summary string
+	if err := st.DB().QueryRowContext(ctx, `SELECT summary FROM incidents WHERE id = ?`, inc.ID).Scan(&summary); err != nil {
+		t.Fatalf("read summary: %v", err)
+	}
+	if want := "Unconfirmed: Payment token failure"; summary != want {
+		t.Errorf("summary = %q, want %q", summary, want)
+	}
+	if want := "Unconfirmed (no metric check returned data): payment auth defect affecting gold-tier users"; f.rootCause != want {
+		t.Errorf("root_cause = %q, want %q", f.rootCause, want)
+	}
+	if f.output != string(final) {
+		t.Errorf("output_json changed: got %q, want byte-identical %q", f.output, final)
+	}
+}
+
 // strongRecallReader returns a reader whose exact-key recall folds one strong
 // prior pointing at priorID, so a call-2 memory_verdict routes marks onto it.
 func strongRecallReader(priorID string) *stubMemoryReader {

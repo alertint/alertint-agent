@@ -96,6 +96,34 @@ type VerificationEnrichment struct {
 	DegradationReason string `json:"degradation_reason,omitempty"`
 }
 
+// causeUnconfirmed reports whether verification ran with a configured metric
+// source but no model or operator check of the proposed cause returned data.
+// The floor and incidents_in_window do not test the cause itself.
+func causeUnconfirmed(ver *VerificationEnrichment, hasMetricSource bool) bool {
+	if ver == nil || !hasMetricSource {
+		return false
+	}
+	for _, round := range ver.Rounds {
+		for _, q := range round.Queries {
+			if (q.Source == "model" || q.Source == "operator") && q.Kind != kindIncidentsInWindow && q.Outcome == OutcomeFetched {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// labelUnconfirmedCause qualifies the stored headline and Finding. The raw
+// model response remains unchanged for output_json and its attempt digest.
+func labelUnconfirmedCause(resp *llmResponse) {
+	if !strings.HasPrefix(strings.ToLower(resp.AnalysisName), "unconfirmed") {
+		resp.AnalysisName = "Unconfirmed: " + resp.AnalysisName
+	}
+	if !strings.HasPrefix(strings.ToLower(resp.OverallIssue), "unconfirmed") {
+		resp.OverallIssue = "Unconfirmed (no metric check returned data): " + resp.OverallIssue
+	}
+}
+
 // Degradation reasons for a degraded VerificationEnrichment.Outcome: the
 // re-judge call itself failed, it replied but the typed decode failed, or
 // the deterministic floor could not fetch even though call 2 succeeded.
