@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Loki evidence includes selected entry attributes in error and comparison
+  lines, with bounded values, cardinality preference, and byte accounting.
 - Loki triage compares filtered failure lines with a small sample of lines the
   default error filter excluded, marking absent message attributes inconclusive.
 - Triage can read and run a Prometheus alert's stored rule expression to obtain
@@ -20,15 +22,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A triage cause stays unconfirmed unless the model cites one fetched check
   that tested it; the cited result is stored with verification evidence.
-- Metric evidence compares selector series with values 15 minutes earlier,
-  ranks changed series first, and caps histogram count and sum together.
+- Metric evidence ranks cumulative counters by changes in their increases
+  across two 15-minute intervals, handles resets, and renders both increases.
+  Gauges still compare values 15 minutes earlier; histogram count and sum
+  share a family cap.
 - Findings with no fetched model or operator metric checks identify their cause
   as unconfirmed in the stored headline and Finding.
 
 ### Fixed
 
-- Findings naming a group absent from comparison logs identify that claim as
-  unconfirmed, and the log summary no longer implies exclusivity from zero matches.
+- Claims naming a value absent from comparison messages are marked unconfirmed
+  only when the same text uses "only" or "exclusively"; no comparison sample
+  means no affected-group check. The log summary does not imply exclusivity
+  from zero matches.
+- PromQL checks that only repeat alert-rule metrics with a matching member-alert
+  label no longer confirm a cause; label mapping is respected.
+- Loki comparison queries request 20 entries before deduplication and retain
+  up to 10 unique lines, preserving samples when streams duplicate entries.
 - Duplicate Loki entries with the same timestamp and text count once in evidence.
 - Recovery assessments keep rejected proposals visible for diagnosis and leave
   LLM health healthy after policy or capability rejections.

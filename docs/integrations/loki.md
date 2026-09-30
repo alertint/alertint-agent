@@ -83,12 +83,25 @@ When an incident is ready for analysis, AlertINT:
 4. Merges lines across all matching streams, sorts them **newest-first**, caps
    them, and appends a *Recent logs* section to the prompt.
 
-When the default error filter returns lines, AlertINT also samples up to 10
-lines that filter excluded, using the same selector, window, and deadline. It
-compares `key=value` tokens in message text only. If an attribute is absent
-from comparison messages, the affected group is unknown and a finding naming
-that value is marked Unconfirmed. Stream labels are not available in this
-sample. Custom line filters do not trigger this sample.
+When the default error filter returns lines, AlertINT also samples lines that
+filter excluded, using the same selector, window, and deadline. It requests 20
+entries, removes duplicates with the same timestamp and message, and keeps the
+first 10 unique lines. Custom line filters do not trigger this sample.
+
+Both sections include useful entry attributes returned in Loki's `stream` map,
+rendered after each message as `{key=value, key=value}`. Attribute selection
+uses the error and comparison lines together: constant fields are omitted,
+including shared resource labels. Numeric values, long hex or UUID identifiers,
+multi-line values, and values over 64 bytes are omitted. Up to eight attributes
+per line are kept, preferring keys with fewer distinct values, then key order.
+Absent attributes count as a distinct value. Attributes count toward the log
+byte cap and are persisted with the selected lines.
+
+The deterministic comparison still reads `key=value` tokens in message text
+only. When a comparison sample exists but its messages lack an attribute, the
+affected group is unknown. A claim naming that value is marked Unconfirmed only
+when the same headline, finding, or correlation entry also uses the whole word
+"only" or "exclusively" (case-insensitive).
 
 The exact lines the model saw are **persisted with the finding** and replayed
 verbatim by the `alertint_get_evidence_pack` MCP tool — even after Loki
