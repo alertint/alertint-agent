@@ -440,7 +440,11 @@ func parseStreams(raw json.RawMessage) ([]logs.Line, error) {
 		return nil, fmt.Errorf("loki: decode streams: %w", err)
 	}
 	var out []logs.Line
-	seen := make(map[logs.Line]bool)
+	type lineKey struct {
+		timestamp time.Time
+		message   string
+	}
+	seen := make(map[lineKey]bool)
 	for _, s := range d.Result {
 		for _, v := range s.Values {
 			if len(v) < 2 {
@@ -450,12 +454,12 @@ func parseStreams(raw json.RawMessage) ([]logs.Line, error) {
 			if err != nil {
 				continue // skip malformed timestamps rather than fail the whole fetch
 			}
-			key := logs.Line{Timestamp: ts, Line: v[1]}
+			key := lineKey{timestamp: ts, message: v[1]}
 			if seen[key] {
 				continue
 			}
 			seen[key] = true
-			out = append(out, key)
+			out = append(out, logs.Line{Timestamp: ts, Line: v[1], Attrs: s.Stream})
 		}
 	}
 	sort.SliceStable(out, func(i, j int) bool {

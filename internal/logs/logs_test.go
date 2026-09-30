@@ -132,3 +132,25 @@ func TestAllowedSelectorKeys_ExcludesAlertMetadata(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalize_AttributesSurviveAndCountTowardByteCap(t *testing.T) {
+	var in []Line
+	if err := json.Unmarshal([]byte(`[
+ {"line":"one","attrs":{"group":"gold"}},
+ {"line":"two","attrs":{"group":"silver"}}
+ ]`), &in); err != nil {
+		t.Fatal(err)
+	}
+	// "one {group=gold}" is 16 bytes; adding the next 18 bytes exceeds 30.
+	out := Normalize(in, 30, MaxLineChars)
+	if len(out) != 1 {
+		t.Fatalf("attribute bytes were ignored: %d lines", len(out))
+	}
+	encoded, err := json.Marshal(out[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"attrs":{"group":"gold"}`) {
+		t.Fatalf("attributes lost: %s", encoded)
+	}
+}

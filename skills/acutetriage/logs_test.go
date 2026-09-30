@@ -491,3 +491,55 @@ func TestRenderLogs_ClampDisclosedWhenEmpty(t *testing.T) {
 		t.Errorf("empty-result prompt must keep the missing-evidence guidance, got %q", out)
 	}
 }
+
+func TestFetchLogs_SelectsAttributesAcrossErrorAndComparisonLines(t *testing.T) {
+	var entries []logs.Line
+	raw := `[
+ {"line":"Error one","attrs":{"service_name":"api","resource":"same","outcome":"failure","trace_id":"abcdef0123456789abcdef0123456789","span_id":"abcdef0123456789","transactionId":"123","multiline":"a\nb","long":"` + strings.Repeat("x", 65) + `","overflow":"1e999","decimal":"1.5"}},
+ {"line":"Error two","attrs":{"service_name":"api","resource":"same","outcome":"failure","trace_id":"bbbbbb0123456789abcdef0123456789","span_id":"bbbbbb0123456789","transactionId":"456","multiline":"b\rc","long":"` + strings.Repeat("y", 65) + `","overflow":"2e999","decimal":"2.5"}},
+ {"line":"Transaction complete.","attrs":{"service_name":"api","resource":"same","outcome":"success","loyalty_level":"gold","trace_id":"cccccc0123456789abcdef0123456789","span_id":"cccccc0123456789","transactionId":"01234567-89ab-cdef-0123-456789abcdef"}},
+ {"line":"Transaction complete.","attrs":{"service_name":"api","resource":"same","outcome":"success","loyalty_level":"silver","trace_id":"dddddd0123456789abcdef0123456789","span_id":"dddddd0123456789","transactionId":"fedcba98-7654-3210-fedc-ba9876543210"}}
+ ]`
+	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+		t.Fatal(err)
+	}
+	src := &fakeContrastSource{fakeSource: &fakeSource{name: "loki", fetched: logs.Fetched{Lines: entries[:2], Filtered: true}}, contrast: logs.Fetched{Lines: entries[2:]}}
+	e := FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 5, MaxLines: 50}, alertsWith(map[string]string{"service": "api"}), time.Now(), time.Now(), "inc", nil)
+	var b strings.Builder
+	renderLogs(&b, e)
+	text := b.String()
+	for _, want := range []string{"Error one {outcome=failure}", "Error two {outcome=failure}", "Transaction complete. {loyalty_level=gold, outcome=success}", "Transaction complete. {loyalty_level=silver, outcome=success}"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("missing %q in %s", want, text)
+		}
+	}
+	for _, key := range []string{"service_name=", "resource=", "trace_id=", "span_id=", "transactionId=", "multiline=", "long=", "decimal=", "overflow="} {
+		if strings.Contains(text, key) {
+			t.Errorf("unhelpful attribute %q in %s", key, text)
+		}
+	}
+	if got := contrastSummary(e.Lines, e.Contrast); len(got) != 0 {
+		t.Fatalf("attributes must not enter message token comparison: %v", got)
+	}
+	if got := inconclusiveTokens(e.Lines, e.Contrast); len(got) != 0 {
+		t.Fatalf("attributes must not enter missing-token comparison: %v", got)
+	}
+}
+
+func TestFetchLogs_AttributeLimitPrefersFewerDistinctValuesThenKey(t *testing.T) {
+	var entries []logs.Line
+	if err := json.Unmarshal([]byte(`[
+ {"line":"one","attrs":{"z":"red","a":"red","b":"red","c":"red","d":"red","e":"red","f":"red","g":"red","h":"red","i":"red"}},
+ {"line":"two","attrs":{"z":"blue","a":"blue","b":"blue","c":"blue","d":"blue","e":"blue","f":"blue","g":"blue","h":"blue","i":"blue"}},
+ {"line":"three","attrs":{"z":"blue","a":"green","b":"green","c":"green","d":"green","e":"green","f":"green","g":"green","h":"green","i":"green"}}
+ ]`), &entries); err != nil {
+		t.Fatal(err)
+	}
+	src := &fakeSource{name: "loki", fetched: logs.Fetched{Lines: entries}}
+	e := FetchLogs(context.Background(), src, LogParams{DefaultRangeMinutes: 15, TimeoutSeconds: 5, MaxLines: 50}, alertsWith(map[string]string{"service": "api"}), time.Now(), time.Now(), "inc", nil)
+	var b strings.Builder
+	renderLogs(&b, e)
+	if !strings.Contains(b.String(), "one {a=red, b=red, c=red, d=red, e=red, f=red, g=red, z=red}") || strings.Contains(b.String(), "h=") || strings.Contains(b.String(), "i=") {
+		t.Fatal(b.String())
+	}
+}

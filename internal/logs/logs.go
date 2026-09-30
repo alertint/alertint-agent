@@ -14,6 +14,8 @@ package logs
 import (
 	"context"
 	"encoding/json"
+	"sort"
+	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -54,8 +56,9 @@ type ContrastSource interface {
 
 // Line is a single normalized log line with its timestamp.
 type Line struct {
-	Timestamp time.Time `json:"timestamp"`
-	Line      string    `json:"line"`
+	Timestamp time.Time         `json:"timestamp"`
+	Line      string            `json:"line"`
+	Attrs     map[string]string `json:"attrs,omitempty"`
 }
 
 // Fetched is the result of FetchRecent: the lines plus the provider's native
@@ -118,11 +121,12 @@ func Normalize(in []Line, maxBytes, lineMaxChars int) []Line {
 		text := truncateRunes(ln.Line, lineMaxChars)
 		// Always keep the first (newest) line; otherwise stop as soon as adding
 		// this line would push the running total past the byte cap.
-		if i > 0 && total+len(text) > maxBytes {
+		size := len(text) + len(FormatAttrs(ln.Attrs))
+		if i > 0 && total+size > maxBytes {
 			break
 		}
-		total += len(text)
-		out = append(out, Line{Timestamp: ln.Timestamp, Line: text})
+		total += size
+		out = append(out, Line{Timestamp: ln.Timestamp, Line: text, Attrs: ln.Attrs})
 	}
 	return out
 }
@@ -134,4 +138,27 @@ func truncateRunes(s string, limit int) string {
 		return s
 	}
 	return string([]rune(s)[:limit])
+}
+
+// FormatAttrs renders the bounded attributes appended to a log message.
+// Normalize uses the same rendering to account for their prompt bytes.
+func FormatAttrs(attrs map[string]string) string {
+	if len(attrs) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(attrs))
+	for key := range attrs {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteString(" {")
+	for i, key := range keys {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(key + "=" + attrs[key])
+	}
+	b.WriteByte('}')
+	return b.String()
 }

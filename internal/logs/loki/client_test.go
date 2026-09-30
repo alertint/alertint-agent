@@ -528,3 +528,24 @@ func TestQueryRange_DefaultsDirectionBackward(t *testing.T) {
 		t.Errorf("limit should be omitted when 0, got %q", rec.limits[0])
 	}
 }
+
+func TestParseStreams_PreservesFirstAttributesWhenDeduplicating(t *testing.T) {
+	raw := json.RawMessage(`{"resultType":"streams","result":[
+ {"stream":{"service_name":"api","loyalty_level":"gold"},"values":[["1718630591000000000","Transaction complete."]]},
+ {"stream":{"service_name":"api","loyalty_level":"silver"},"values":[["1718630591000000000","Transaction complete."]]}
+ ]}`)
+	lines, err := parseStreams(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != 1 {
+		t.Fatalf("duplicate streams produced %d lines", len(lines))
+	}
+	encoded, err := json.Marshal(lines[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"attrs":{"loyalty_level":"gold","service_name":"api"}`) {
+		t.Fatalf("first stream attributes lost: %s", encoded)
+	}
+}

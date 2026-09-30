@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alertint/alertint-agent/internal/logs"
 	"github.com/alertint/alertint-agent/internal/store"
 	"github.com/alertint/alertint-agent/internal/zabbix"
 )
@@ -666,12 +667,12 @@ func renderLogs(b *strings.Builder, e *LogEnrichment) {
 			fmt.Fprintf(b, "\n\nRecent logs (%s, most recent first, around incident time):", e.Source)
 		}
 		for _, ln := range e.Lines {
-			fmt.Fprintf(b, "\n  %s  %s", ln.Timestamp.UTC().Format(time.RFC3339), ln.Line)
+			fmt.Fprintf(b, "\n  %s  %s", ln.Timestamp.UTC().Format(time.RFC3339), ln.Line+logs.FormatAttrs(ln.Attrs))
 		}
 		if len(e.Contrast) > 0 {
 			b.WriteString("\nComparison sample (lines the error filter excluded, same selector and window):")
 			for _, ln := range e.Contrast {
-				fmt.Fprintf(b, "\n  %s  %s", ln.Timestamp.UTC().Format(time.RFC3339), ln.Line)
+				fmt.Fprintf(b, "\n  %s  %s", ln.Timestamp.UTC().Format(time.RFC3339), ln.Line+logs.FormatAttrs(ln.Attrs))
 			}
 			for _, line := range contrastSummary(e.Lines, e.Contrast) {
 				b.WriteString("\n  " + line)
